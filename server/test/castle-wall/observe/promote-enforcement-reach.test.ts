@@ -560,18 +560,47 @@ describe("F2: gate-scoped rules never suppress a candidate (scope-aware conserva
     ).toBe(true);
   });
 
-  it("R2(b): candidatePromotedAwaitingRearm marks exactly the gate-scoped (uids-only) coverage", () => {
-    // The listing marker: gate-scoped coverage => promoted, awaiting re-arm.
-    expect(candidatePromotedAwaitingRearm([allowRule({ uids: [GATE_UID] })], row)).toBe(true);
+  it("R2(b)+L2: candidatePromotedAwaitingRearm marks exactly the OBSERVE-PROMOTED, current-gate-uid coverage", () => {
+    const promotedRule = (scope: AllowlistRule["scope"]): AllowlistRule => ({
+      ...allowRule(scope),
+      id: `${OBSERVE_PROMOTED_RULE_ID_PREFIX}abc123def456`,
+    });
+    // The listing marker: an observe-promoted rule bound to the CURRENT gate
+    // uid => promoted, awaiting re-arm.
+    expect(candidatePromotedAwaitingRearm([promotedRule({ uids: [GATE_UID] })], row, GATE_UID)).toBe(true);
+    // L2: a PROVISIONED gate-uid endpoint rule covering the same destination
+    // is not a promotion and must never mark a never-promoted row.
+    expect(
+      candidatePromotedAwaitingRearm(
+        [{ ...allowRule({ uids: [GATE_UID] }), id: "provisioned-hermes-abc123def456" }],
+        row,
+        GATE_UID,
+      ),
+    ).toBe(false);
+    // L2: a rule bound to a STALE gate uid is one the next re-arm will not
+    // serve; claiming "awaiting re-arm" for it would be false.
+    expect(candidatePromotedAwaitingRearm([promotedRule({ uids: [GATE_UID + 7] })], row, GATE_UID)).toBe(
+      false,
+    );
     // A template-scoped rule covers the agent directly (not awaiting anything).
-    expect(candidatePromotedAwaitingRearm([allowRule({ template_ids: ["claude-code"] })], row)).toBe(false);
+    expect(
+      candidatePromotedAwaitingRearm([promotedRule({ template_ids: ["claude-code"] })], row, GATE_UID),
+    ).toBe(false);
     // A mixed scope reaches the agent via the template axis: not "awaiting".
     expect(
-      candidatePromotedAwaitingRearm([allowRule({ template_ids: ["claude-code"], uids: [GATE_UID] })], row),
+      candidatePromotedAwaitingRearm(
+        [promotedRule({ template_ids: ["claude-code"], uids: [GATE_UID] })],
+        row,
+        GATE_UID,
+      ),
     ).toBe(false);
-    // A gate-scoped rule for a DIFFERENT destination marks nothing.
+    // A qualifying rule for a DIFFERENT destination marks nothing.
     expect(
-      candidatePromotedAwaitingRearm([allowRule({ uids: [GATE_UID] })], candidate("other.example.com")),
+      candidatePromotedAwaitingRearm(
+        [promotedRule({ uids: [GATE_UID] })],
+        candidate("other.example.com"),
+        GATE_UID,
+      ),
     ).toBe(false);
   });
 });
@@ -786,6 +815,15 @@ describe("round-3 R4/R5: the REAL CLI promote path (approved end to end)", () =>
     );
     expect(listCode).toBe(0);
     expect(listOut.text()).toContain("promoted, awaiting re-arm");
+
+    // L2: scripted consumers see the same marking as an additive JSON field.
+    const jsonOut = new Capture();
+    const jsonCode = await runObserveCandidates(
+      ["--no-refresh", "--json", "--fortress", fortress.fortressPath],
+      { out: jsonOut, err: new Capture(), env: { SANCTUARY_RECOVERY_KEY: fortress.recoveryKey } },
+    );
+    expect(jsonCode).toBe(0);
+    expect(jsonOut.text()).toContain('"promoted_awaiting_rearm": true');
   });
 
   it("control: an approved COARSE promote removes the candidate rows (the shipped behavior, unchanged)", async () => {

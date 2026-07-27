@@ -114,6 +114,7 @@
 
 import type { AllowlistRule } from "../allowlist/schema.js";
 import { ruleProtocolMatches, ruleScopeCoversAgent } from "../allowlist/match.js";
+import { OBSERVE_PROMOTED_RULE_ID_PREFIX } from "../constants.js";
 import { ipMatches, cidrMatches } from "../allowlist/ip-cidr.js";
 import type { RuleMatch } from "../allowlist/schema.js";
 import type { VerifiedChainConsumer } from "../../operational/audit-log.js";
@@ -315,27 +316,38 @@ export function candidateCurrentlyAllowed(
 }
 
 /**
- * Round-3 R2(b): true iff this row's destination is covered by a GATE-scoped
- * (uids-only, unconditional) allow in the verified ruleset -- i.e. the row
- * was promoted on an exclusive-routing fortress and is awaiting the re-arm
- * that loads the gate daemon's destination snapshot. Such a rule NEVER
- * suppresses the row (F2: uids-only does not cover the agent), so without
- * this marker the candidates listing could not tell "promoted, awaiting
- * re-arm" from "never promoted". Destination legs are the SAME exact-match
- * helpers `candidateCurrentlyAllowed` uses, so the two verdicts cannot
- * drift. Purely informational: no suppression, no pruning.
+ * Round-3 R2(b): true iff this row's destination is covered by an
+ * OBSERVE-PROMOTED, gate-scoped, unconditional allow in the verified ruleset
+ * -- i.e. the row was promoted on THIS exclusive-routing fortress and is
+ * awaiting the re-arm that loads the gate daemon's destination snapshot.
+ * Such a rule NEVER suppresses the row (F2: uids-only does not cover the
+ * agent), so without this marker the candidates listing could not tell
+ * "promoted, awaiting re-arm" from "never promoted".
+ *
+ * Round-3 L2 tightening (the over-marking direction): the covering rule must
+ * (a) carry the `derived-observe-` id prefix -- a provisioned gate-uid
+ * endpoint rule covering the same destination is NOT a promotion and must
+ * not mark a never-promoted row -- and (b) be scoped to exactly the CURRENT
+ * marker's gate uid (`gateUid`): a rule bound to a STALE gate uid is one the
+ * next re-arm will not serve, so claiming "awaiting re-arm" for it would be
+ * false. Destination legs are the SAME exact-match helpers
+ * `candidateCurrentlyAllowed` uses, so the two verdicts cannot drift.
+ * Purely informational: no suppression, no pruning.
  */
 export function candidatePromotedAwaitingRearm(
   rules: readonly AllowlistRule[],
   row: Pick<CandidateObservation, "host" | "ip" | "port" | "protocol">,
+  gateUid: number,
 ): boolean {
   return rules.some(
     (rule) =>
       rule.disposition === "allow" &&
+      rule.id.startsWith(OBSERVE_PROMOTED_RULE_ID_PREFIX) &&
       rule.time_window === undefined &&
-      (rule.scope?.uids?.length ?? 0) > 0 &&
-      (rule.scope?.agent_ids?.length ?? 0) === 0 &&
-      (rule.scope?.template_ids?.length ?? 0) === 0 &&
+      rule.scope?.uids?.length === 1 &&
+      rule.scope.uids[0] === gateUid &&
+      (rule.scope.agent_ids?.length ?? 0) === 0 &&
+      (rule.scope.template_ids?.length ?? 0) === 0 &&
       ruleProtocolMatches(rule.match.protocol, row.protocol) &&
       portAxisAdmits(rule.match.port, row.port) &&
       allowDestinationExact(rule.match, row),

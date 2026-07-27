@@ -442,8 +442,43 @@ export async function runObserveCandidates(
     a.first_seen < b.first_seen ? -1 : a.first_seen > b.first_seen ? 1 : 0,
   );
 
+  // Round-3 R2(b): on an exclusive-routing fortress, a candidate whose
+  // destination is already covered by an observe-promoted, CURRENT-gate-uid
+  // scoped rule was promoted and is awaiting the re-arm that loads the gate's
+  // rules snapshot (F2 deliberately keeps such rows visible; without this
+  // marking they were indistinguishable from never-promoted rows). Computed
+  // before BOTH output modes so scripted `--json` consumers see it too
+  // (round-3 L2: additive `promoted_awaiting_rearm` field, present only when
+  // true). Best-effort: a malformed marker or unverifiable allowlist skips
+  // the marking with a warning (the listing itself still works; promote
+  // refuses loud on the same states).
+  let awaitingRearmRules: readonly AllowlistRule[] = [];
+  let awaitingRearmGateUid: number | null = null;
+  if (candidates.length > 0) {
+    try {
+      const marker = await loadExclusiveRoutingMarker(boot.fortressPath);
+      if (marker !== null) {
+        const allowlist = await readAllowlistForRefresh(boot.fortressPath);
+        if (allowlist.status === "ok") {
+          awaitingRearmRules = allowlist.rules;
+          awaitingRearmGateUid = marker.gate_uid;
+        } else {
+          write(err, "Warning: could not read the verified allowlist; the promoted-awaiting-re-arm marking is unavailable for this listing.\n");
+        }
+      }
+    } catch {
+      write(err, "Warning: the exclusive-routing marker is unreadable; the promoted-awaiting-re-arm marking is unavailable for this listing.\n");
+    }
+  }
+  const isAwaitingRearm = (candidate: CandidateObservation): boolean =>
+    awaitingRearmGateUid !== null &&
+    candidatePromotedAwaitingRearm(awaitingRearmRules, candidate, awaitingRearmGateUid);
+
   if (json) {
-    write(out, JSON.stringify(candidates, null, 2) + "\n");
+    const rows = candidates.map((candidate) =>
+      isAwaitingRearm(candidate) ? { ...candidate, promoted_awaiting_rearm: true } : candidate,
+    );
+    write(out, JSON.stringify(rows, null, 2) + "\n");
     return 0;
   }
 
@@ -455,37 +490,12 @@ export async function runObserveCandidates(
     return 0;
   }
 
-  // Round-3 R2(b): on an exclusive-routing fortress, a candidate whose
-  // destination is already covered by a GATE-scoped promoted rule was
-  // promoted and is awaiting the re-arm that loads the gate's rules snapshot
-  // (F2 deliberately keeps such rows visible; without this marking they were
-  // indistinguishable from never-promoted rows). Best-effort: a malformed
-  // marker or unverifiable allowlist skips the marking with a warning (the
-  // listing itself still works; promote refuses loud on the same states).
-  let awaitingRearmRules: readonly AllowlistRule[] = [];
-  try {
-    const marker = await loadExclusiveRoutingMarker(boot.fortressPath);
-    if (marker !== null) {
-      const allowlist = await readAllowlistForRefresh(boot.fortressPath);
-      if (allowlist.status === "ok") {
-        awaitingRearmRules = allowlist.rules;
-      } else {
-        write(err, "Warning: could not read the verified allowlist; the promoted-awaiting-re-arm marking is unavailable for this listing.\n");
-      }
-    }
-  } catch {
-    write(err, "Warning: the exclusive-routing marker is unreadable; the promoted-awaiting-re-arm marking is unavailable for this listing.\n");
-  }
-
   const col = (value: string, width: number): string => `${value.padEnd(width)}  `;
   write(out, `${col("Destination", 22)}${col("Agent", 15)}${col("Times", 5)}${col("First seen", 20)}${col("Last seen", 20)}Note\n`);
   for (const candidate of candidates) {
     const notes: string[] = [];
     if (candidate.exfil_risk) notes.push("EXFIL-RISK, not pre-selected");
-    if (
-      awaitingRearmRules.length > 0 &&
-      candidatePromotedAwaitingRearm(awaitingRearmRules, candidate)
-    ) {
+    if (isAwaitingRearm(candidate)) {
       notes.push("promoted, awaiting re-arm");
     }
     write(
@@ -598,7 +608,18 @@ function fortressExclusiveFileLock(
           await handle.close();
         }
         return async () => {
-          await rm(lockPath, { force: true });
+          try {
+            await rm(lockPath, { force: true });
+          } catch (releaseError) {
+            // Round-3 L1: never let a failed unlink throw over the caller's
+            // real outcome (a completed promote/refresh must not report as
+            // failed). Name the stranded lock so the operator can remove it
+            // before the next run reports it held.
+            process.stderr.write(
+              `Warning: could not remove the lock file ${lockPath} (${(releaseError as Error).message}). ` +
+                "The operation itself completed; remove the file manually or the next run will report it as held.\n",
+            );
+          }
         };
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
@@ -1271,7 +1292,10 @@ export async function runObservePromote(
   if (outcome.status === "denied") {
     write(
       err,
-      `Denied: promote was not approved (${outcome.reason}). Nothing changed; the selected destinations stay blocked.\n`,
+      `Denied: promote was not approved (${outcome.reason}). Nothing changed` +
+        (selection.length > 0
+          ? "; the selected destinations stay blocked.\n"
+          : "; no rules were re-scoped.\n"),
     );
     return 1;
   }

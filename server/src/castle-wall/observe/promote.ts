@@ -409,7 +409,20 @@ export async function promoteCandidates(
       if (existing.disposition !== "allow") continue;
       if (promotableIds.has(existing.id)) continue; // the candidate-driven rewrite covers it
       if (ruleScopesEqual(existing.scope, wantScope)) continue;
-      const rescoped: AllowlistRule = { ...existing, scope: { uids: [routing.gate_uid] } };
+      // Round-3 cosmetic: the coarse-era description should not survive a
+      // gate re-scope unannotated; append the same gate-binding note the
+      // fresh exclusive synthesis carries (guarded against double-append).
+      const gateNote =
+        " Exclusive routing: bound to the sanctuary-gate principal (S5-0 uids scope); the agent transits the gate.";
+      const description =
+        existing.description !== undefined && !existing.description.includes(gateNote.trim())
+          ? existing.description + gateNote
+          : existing.description;
+      const rescoped: AllowlistRule = {
+        ...existing,
+        ...(description !== undefined ? { description } : {}),
+        scope: { uids: [routing.gate_uid] },
+      };
       // A rescope that fails validation is dropped, never signed; with a
       // marker-validated positive gate uid this cannot happen in practice.
       if (validateRule(rescoped).length === 0) rescopeRules.push(rescoped);
@@ -600,6 +613,19 @@ export async function promoteCandidates(
       publish: publishResult,
     };
   } finally {
-    if (releasePublishLock) await releasePublishLock();
+    // Releasing is best-effort, mirroring the refresh lock (refresh.ts): a
+    // release failure must never mask the real promote outcome -- by this
+    // point publish() may have SUCCEEDED, and throwing here would report a
+    // live, re-signed manifest as a failed promote (round-3 L1). A stranded
+    // lockfile surfaces on the next promote as publish_in_progress with the
+    // holder guidance; the CLI's lock factory additionally notes the failure
+    // on stderr with the lock path.
+    if (releasePublishLock) {
+      try {
+        await releasePublishLock();
+      } catch {
+        // Deliberately swallowed; see above.
+      }
+    }
   }
 }
