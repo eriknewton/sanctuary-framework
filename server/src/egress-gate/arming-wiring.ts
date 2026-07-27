@@ -110,6 +110,7 @@ import {
 } from "./release-barrier.js";
 import {
   GATE_ORACLE_PUBLIC_KEY_PATH,
+  buildGateDaemonPlistContent,
   egressGateDaemonLabel,
   egressGateDaemonLogPaths,
   egressGateDaemonPlistPath,
@@ -119,7 +120,7 @@ import {
   egressGateRuntimeUidDirPath,
   gateDaemonLogDirForHome,
   parseEgressGateRuntimeState,
-  renderEgressGateDaemonPlist,
+  resolveGateDaemonArgvPrefix,
   type EgressGateRuntimeState,
 } from "./gate-daemon.js";
 import {
@@ -921,23 +922,26 @@ async function productionBringUp(
     await (lastBinding as GateBinding).release();
   }
   const label = egressGateDaemonLabel(input.agentUid);
-  const plistPath = egressGateDaemonPlistPath(input.agentUid);
-  await writeFile(
-    plistPath,
-    renderEgressGateDaemonPlist({
-      agentUid: input.agentUid,
-      gateAccount: state.gateAccountName,
-      gateHomeDirectory: input.gateHomeDirectory,
-      programArguments: [
-        ...input.gateDaemonArgvPrefix,
-        "castle-wall",
-        "egress-gate-daemon",
-        `--agent-uid=${input.agentUid}`,
-      ],
-      fortressPath: input.fortressPath,
-    }),
-    { mode: 0o644 },
-  );
+  // ONE builder shared with the boot self-heal (buildGateDaemonPlistContent):
+  // it unifies the SUBCOMMAND SUFFIX + plist RENDER (byte-identical to the prior
+  // inline render; guarded by test). It does NOT unify the interpreter PREFIX --
+  // install passes the persisted `--binary` (input.gateDaemonArgvPrefix), boot
+  // re-derives from the live process; both go through resolveGateDaemonArgvPrefix
+  // so argv[0] is always absolute, but the two prefixes are resolved
+  // independently by design (see buildGateDaemonPlistContent).
+  const { plistPath, plistContent } = buildGateDaemonPlistContent({
+    agentUid: input.agentUid,
+    gateAccount: state.gateAccountName,
+    gateHomeDirectory: input.gateHomeDirectory,
+    gateDaemonArgvPrefix: input.gateDaemonArgvPrefix,
+    fortressPath: input.fortressPath,
+  });
+  // Atomic tmp+rename (PR #994 review LOW-2): the gate plist is a final path
+  // launchd re-reads, so write it the same way this function writes its other
+  // daemon-read finals (policy/rules/marker above) and the boot self-heal
+  // below -- launchd never sees a torn file, and a failed write leaves the old
+  // plist intact (the barrier parks fail-closed).
+  await atomicRootWrite(plistPath, plistContent, 0o644);
   // FIX-ROUND-4 BLOCKER (2026-07-25, hardware-proven N=2). The gate plist argv
   // is unchanged (`--agent-uid` only; the gate reads its port/generation from
   // committed state), so on a repair/rotation the OLD gate daemon is still
@@ -3423,6 +3427,8 @@ export interface ExclusiveEgressBootSupervisorInternals {
   oracleRefreshMaxAbandonedAttempts?: number;
   /** TEST-ONLY: make the stuck-transition threshold deterministic and fast. */
   oracleRefreshStuckThreshold?: number;
+  /** Boot gate-plist self-heal writer (default: atomic root write, 0o644). */
+  writeGateDaemonPlist?: (plistPath: string, plistContent: string) => Promise<void>;
 }
 
 /**
@@ -3566,6 +3572,10 @@ export async function startExclusiveEgressBootSupervisor(input: {
       loadExclusiveRoutingMarker(fortressPath));
   const ensureRuntimeFs = internals.ensureRuntimeFs ?? ensureExclusiveEgressRuntimeFs;
   const ensureGateHomeLayout = internals.ensureGateHomeLayout ?? ensureGateAccountHomeLayout;
+  const writeGateDaemonPlist =
+    internals.writeGateDaemonPlist ??
+    (async (plistPath: string, plistContent: string): Promise<void> =>
+      atomicRootWrite(plistPath, plistContent, 0o644));
 
   let listing: BootRegistryListing;
   try {
@@ -3819,6 +3829,71 @@ export async function startExclusiveEgressBootSupervisor(input: {
           } catch (auditErr) {
             input.print(
               `[castle-wall] boot: uid ${agentUid} could not record gate home layout failure audit ` +
+                `(${(auditErr as Error).message}); the release barrier will still verify and park fail-closed`,
+            );
+          }
+        }
+        // BOOT SELF-HEAL (2026-07-23): re-render + atomically overwrite THIS
+        // agent's gate-daemon plist with an ABSOLUTE-interpreter argv BEFORE
+        // bootstrapping it. A host armed on a pre-#986 dist wrote a bare
+        // `node` / `/usr/bin/env node` argv into this on-disk plist;
+        // `bootstrapGateDaemonForBoot` only relaunches the EXISTING plist and
+        // builds no argv, so without this the boot daemon relaunches the broken
+        // interpreter every reboot (`env: node: No such file or directory`) ->
+        // the gate never publishes runtime state -> the barrier parks the agent
+        // forever, and the only remedy is a manual `--repair-egress-gate`. At
+        // boot `process.execPath` is THIS (absolute) boot daemon's node, so
+        // `resolveGateDaemonArgvPrefix()` (no persisted --binary here) yields an
+        // absolute prefix, and `renderEgressGateDaemonPlist` throws unless argv[0]
+        // is absolute (fail-closed backstop). The interpreter PREFIX is re-derived
+        // HERE from the live boot process -- NOT unified with the install prefix
+        // by the shared builder (that only unifies the suffix + render); this
+        // independent re-derivation is the #986 property: the healed argv[0] is
+        // whatever absolute node is CURRENTLY running the boot daemon, so it
+        // self-corrects across a node upgrade. UNCONDITIONAL + idempotent:
+        // rewriting an already-correct plist is a no-op in effect; rewriting a
+        // stale one heals it. (LOW-1, accepted: argv[0]=process.execPath is at
+        // PARITY with the install path via the shared builder -- if it is a
+        // versioned Homebrew Cellar node path, a later `brew upgrade node` can
+        // re-brick it, but fail-CLOSED (parked, never open); the boot daemon's
+        // own PATH-robust mitigation is out of scope for this fix.) Never disrupt
+        // boot: any failure is LOUD and audited and we STILL run the gate-daemon
+        // reload below (the release barrier verifies + parks fail-closed on its
+        // own), mirroring the gate-home-layout handling above. Post-#1027
+        // composition: the reload below is the bootout->settle->bootstrap->
+        // kickstart chokepoint, so the plist healed HERE is what launchd
+        // actually loads in the SAME boot -- and if the self-heal failed and
+        // the stale argv cannot publish runtime state,
+        // `bootstrapGateDaemonForBoot` throws and the barrier parks HARD via
+        // `gateDaemonBootstrapFailure`.
+        try {
+          const { plistPath, plistContent } = buildGateDaemonPlistContent({
+            agentUid,
+            gateAccount: ctx.gateAccount,
+            gateHomeDirectory: ctx.gateHomeDirectory,
+            gateDaemonArgvPrefix: resolveGateDaemonArgvPrefix(),
+            fortressPath: entry.fortress_path,
+          });
+          await writeGateDaemonPlist(plistPath, plistContent);
+        } catch (err) {
+          const reason = (err as Error).message;
+          input.print(
+            `[castle-wall] boot: uid ${agentUid} gate plist self-heal failed (${reason}); ` +
+              "the release barrier will verify and park fail-closed. " +
+              `Repair: ${EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE}`,
+          );
+          try {
+            await input.audit("exclusive_egress_gate_plist_self_heal_failed", {
+              agent_uid: agentUid,
+              gate_account: ctx.gateAccount,
+              gate_uid: ctx.gateUid,
+              gate_home_directory: ctx.gateHomeDirectory,
+              reason,
+              barrier_continues_fail_closed: true,
+            });
+          } catch (auditErr) {
+            input.print(
+              `[castle-wall] boot: uid ${agentUid} could not record gate plist self-heal failure audit ` +
                 `(${(auditErr as Error).message}); the release barrier will still verify and park fail-closed`,
             );
           }

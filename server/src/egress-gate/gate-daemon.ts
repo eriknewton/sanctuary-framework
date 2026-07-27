@@ -313,6 +313,84 @@ ${logXml}\t<key>RunAtLoad</key>
 `;
 }
 
+/**
+ * Resolve the argv prefix that launches the exclusive-egress gate daemon.
+ *
+ * The gate daemon runs as the confined gate service account, whose launchd
+ * PATH has no `node`. Both a supplied `--binary` path and the fallback CLI
+ * path are `.js` entrypoints carrying a `#!/usr/bin/env node` shebang, which
+ * fails with `env: node: No such file or directory` under that account and
+ * crashes the daemon at startup (the "D9" gate-daemon crash proven on
+ * hardware 2026-07-21, fixed by #986). Pinning `process.execPath` (an absolute
+ * interpreter) makes the launch independent of the account's PATH.
+ *
+ * SINGLE CHOKEPOINT for all THREE gate-daemon plist producers -- install +
+ * repair (`wrap/auto-provision.ts`, which re-exports this) AND the boot
+ * self-heal (`arming-wiring.ts` `startExclusiveEgressBootSupervisor`) -- so no
+ * call site can ever emit a bare shebang-dependent argv[0]: every producer
+ * prepends `process.execPath`, which Node guarantees absolute. Note this makes
+ * argv[0] ABSOLUTE at every site; it does NOT make the resolved prefix
+ * IDENTICAL across sites -- install passes the persisted `--binary`, boot
+ * passes nothing and re-derives from live `process.argv` -- see the callers.
+ * At boot `process.execPath` is the boot daemon's own absolute node, so the
+ * healed prefix is correct + account-PATH-independent there too.
+ *
+ * PACKAGING ASSUMPTION (accepted, latent -- PR #994 review LOW-3): the fallback
+ * branch `[process.execPath, process.argv[1] ?? "sanctuary"]` is correct only
+ * for a NODE-SHEBANG-SCRIPT distribution, where `process.argv[1]` at boot
+ * re-materialises the CLI script path. A future single-executable (SEA/pkg)
+ * build would make `process.execPath` the binary and `process.argv[1]` the
+ * subcommand token, yielding a corrupt argv -- but that packaging would ALSO
+ * break the install path today, so it is latent, not live; and the `?? "sanctuary"`
+ * relative fallback is itself fail-closed (a relative argv[0] the renderer
+ * rejects, or a relative script that crashes the gate -> the barrier parks).
+ */
+export function resolveGateDaemonArgvPrefix(cliBinary?: string): string[] {
+  return cliBinary !== undefined && cliBinary.length > 0
+    ? [process.execPath, cliBinary]
+    : [process.execPath, process.argv[1] ?? "sanctuary"];
+}
+
+/** The fixed gate-daemon subcommand argv suffix (after the interpreter prefix). */
+function gateDaemonProgramSuffix(agentUid: number): string[] {
+  return ["castle-wall", "egress-gate-daemon", `--agent-uid=${agentUid}`];
+}
+
+/**
+ * Build one agent's gate-daemon plist: the destination path plus the rendered
+ * plist CONTENT, from the SAME inputs the install path uses.
+ *
+ * ONE builder for BOTH the install bring-up (`arming-wiring.ts`
+ * `productionBringUp`) and the boot self-heal (`startExclusiveEgressBootSupervisor`),
+ * so the two can never drift on the SUBCOMMAND SUFFIX
+ * ({@link gateDaemonProgramSuffix}) or the plist RENDER. It does NOT unify the
+ * interpreter PREFIX: that is resolved independently per site by
+ * {@link resolveGateDaemonArgvPrefix} (install: the persisted `--binary`; boot:
+ * live `process.execPath`), by design -- at boot the prefix self-corrects to
+ * the boot daemon's own absolute node (the #986 property). What IS guaranteed
+ * everywhere: {@link renderEgressGateDaemonPlist} throws unless
+ * `programArguments[0]` is absolute -- the fail-closed backstop that keeps a
+ * bare-`node`/`env node` argv off disk.
+ */
+export function buildGateDaemonPlistContent(input: {
+  agentUid: number;
+  gateAccount: string;
+  gateHomeDirectory: string;
+  gateDaemonArgvPrefix: string[];
+  fortressPath: string;
+}): { plistPath: string; plistContent: string } {
+  return {
+    plistPath: egressGateDaemonPlistPath(input.agentUid),
+    plistContent: renderEgressGateDaemonPlist({
+      agentUid: input.agentUid,
+      gateAccount: input.gateAccount,
+      gateHomeDirectory: input.gateHomeDirectory,
+      programArguments: [...input.gateDaemonArgvPrefix, ...gateDaemonProgramSuffix(input.agentUid)],
+      fortressPath: input.fortressPath,
+    }),
+  };
+}
+
 /** Injected dependencies for {@link runEgressGateDaemon} (tests are host-free). */
 export interface EgressGateDaemonDeps {
   /** The confined agent uid this daemon serves. */
