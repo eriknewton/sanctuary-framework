@@ -314,6 +314,34 @@ export function candidateCurrentlyAllowed(
   );
 }
 
+/**
+ * Round-3 R2(b): true iff this row's destination is covered by a GATE-scoped
+ * (uids-only, unconditional) allow in the verified ruleset -- i.e. the row
+ * was promoted on an exclusive-routing fortress and is awaiting the re-arm
+ * that loads the gate daemon's destination snapshot. Such a rule NEVER
+ * suppresses the row (F2: uids-only does not cover the agent), so without
+ * this marker the candidates listing could not tell "promoted, awaiting
+ * re-arm" from "never promoted". Destination legs are the SAME exact-match
+ * helpers `candidateCurrentlyAllowed` uses, so the two verdicts cannot
+ * drift. Purely informational: no suppression, no pruning.
+ */
+export function candidatePromotedAwaitingRearm(
+  rules: readonly AllowlistRule[],
+  row: Pick<CandidateObservation, "host" | "ip" | "port" | "protocol">,
+): boolean {
+  return rules.some(
+    (rule) =>
+      rule.disposition === "allow" &&
+      rule.time_window === undefined &&
+      (rule.scope?.uids?.length ?? 0) > 0 &&
+      (rule.scope?.agent_ids?.length ?? 0) === 0 &&
+      (rule.scope?.template_ids?.length ?? 0) === 0 &&
+      ruleProtocolMatches(rule.match.protocol, row.protocol) &&
+      portAxisAdmits(rule.match.port, row.port) &&
+      allowDestinationExact(rule.match, row),
+  );
+}
+
 /** ASCII-only lowercase (parity with the Rust daemon's `to_ascii_lowercase`; JS `toLowerCase` also folds non-ASCII, which the daemon does not). */
 function asciiLower(value: string): string {
   return value.replace(/[A-Z]/g, (c) => c.toLowerCase());

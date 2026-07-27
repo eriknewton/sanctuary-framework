@@ -29,6 +29,7 @@ export { flowEventsFromAuditEntries, flowEventFromAuditEntry } from "./adapter.j
 export {
   refreshCandidatesFromAudit,
   candidateCurrentlyAllowed,
+  candidatePromotedAwaitingRearm,
   inProcessRefreshLock,
 } from "./refresh.js";
 export type {

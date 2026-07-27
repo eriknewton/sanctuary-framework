@@ -13,7 +13,10 @@
 import { createHash } from "node:crypto";
 import net from "node:net";
 
-import { CASTLE_WALL_SCHEMA_VERSION_V1 } from "../constants.js";
+import {
+  CASTLE_WALL_SCHEMA_VERSION_V1,
+  OBSERVE_PROMOTED_RULE_ID_PREFIX,
+} from "../constants.js";
 import { validateRule, type AllowlistRule, type RuleMatch, type RuleScope } from "../allowlist/schema.js";
 import {
   DEFAULT_OBSERVE_GRANULARITY,
@@ -88,15 +91,13 @@ export function widenableRegisteredDomain(host: string): string | null {
 }
 
 /**
- * The id prefix EVERY observe-promoted rule carries (provenance marker,
- * mirroring provisioning's `provisioned-<harness>-` convention). NOTE
- * (fix-round F4): this prefix is NOT an ownership claim -- the CLI
+ * The observe-promoted rule id prefix, re-exported from `../constants.ts`
+ * (the single source; the allowlist layer's exclusive-routing remedy text
+ * also consumes it there). NOT an ownership claim (fix-round F4): the CLI
  * publisher's orphan-cleanup owns files by MEMBERSHIP in the previous
- * promote-signed manifest, never by name, so an operator-authored
- * `derived-observe-*.json` in the shared rules directory is never deleted
- * by a promote.
+ * promote-signed manifest, never by name.
  */
-export const OBSERVE_PROMOTED_RULE_ID_PREFIX = "derived-observe-";
+export { OBSERVE_PROMOTED_RULE_ID_PREFIX } from "../constants.js";
 
 function stableCandidateRuleId(
   observation: CandidateObservation,

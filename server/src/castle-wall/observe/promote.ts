@@ -39,9 +39,11 @@
  * promoting the rest of a clean selection (CI DoD test 2).
  */
 
-import type { AllowlistRule, RuleMatch, RuleScope } from "../allowlist/schema.js";
+import { validateRule, type AllowlistRule, type RuleMatch, type RuleScope } from "../allowlist/schema.js";
 import type { AgentOrigin, OperatorBaseline } from "../allowlist/manifest.js";
+import { OBSERVE_PROMOTED_RULE_ID_PREFIX } from "../constants.js";
 import { synthesizeCandidateRule, type PromoteRouting } from "./synthesize.js";
+import type { RefreshLock } from "./refresh.js";
 import {
   DEFAULT_OBSERVE_GRANULARITY,
   type CandidateObservation,
@@ -170,6 +172,21 @@ export interface PromoteDeps {
    * ABORTS with `routing_changed` and publishes nothing.
    */
   reresolveRouting?: () => Promise<PromoteRouting>;
+  /**
+   * Round-3 R1 (concurrent-promote lost update): a CROSS-PROCESS mutual
+   * exclusion held across the publish-time verified re-read, the digest
+   * compare-and-set, AND the publish + orphan-cleanup. The CAS alone cannot
+   * close the window in which two approved promotes both re-read the same
+   * manifest digest and then publish in turn: the second rename silently
+   * drops the first's rule from the signed manifest (and its file, via the
+   * ownership ledger). Same contract as the refresh's `RefreshLock`:
+   * `acquire()` returns a release fn, or null when another holder exists --
+   * in which case the promote ABORTS with `publish_in_progress` and
+   * publishes NOTHING (fail toward not publishing, never toward
+   * clobbering). The CLI wires an O_EXCL fortress lockfile
+   * (`observePromoteFileLock`); the lock is never broken automatically.
+   */
+  publishLock?: RefreshLock;
 }
 
 export type PromoteDroppedReason = "not_found" | "failed_validation";
@@ -202,6 +219,27 @@ export type PromoteOutcome =
        */
       status: "routing_changed";
       reason: string;
+      dropped: Array<{ key: string; reason: PromoteDroppedReason }>;
+    }
+  | {
+      /**
+       * Round-3 R1: another promote holds this fortress's publish lock.
+       * Nothing changed; wait for it and re-run.
+       */
+      status: "publish_in_progress";
+      dropped: Array<{ key: string; reason: PromoteDroppedReason }>;
+    }
+  | {
+      /**
+       * Round-3 R2: every selected candidate is ALREADY in the verified
+       * manifest with the current-mode scope, and nothing needs re-scoping.
+       * Deliberately decided BEFORE the Tier-1 gate fires (a no-op needs no
+       * approval ceremony) and without a pointless re-sign. The CLI copy
+       * must not claim the destination is unreachable: on an exclusive
+       * fortress that already re-armed, the gate is serving these rules.
+       */
+      status: "already_promoted";
+      promotedKeys: string[];
       dropped: Array<{ key: string; reason: PromoteDroppedReason }>;
     }
   | {
@@ -349,14 +387,64 @@ export async function promoteCandidates(
     promotable.push({ key: row.key, observation, rule });
   }
 
-  if (promotable.length === 0) {
+  // ── Round-3 R3(i): stale-scope rescue for ORPHANED promoted rules ───────
+  // Production reality: a coarse promote REMOVES its candidate, so when the
+  // fortress later arms exclusive routing, the stale template/agent-scoped
+  // promoted rule bricks every compose (fail-closed) with NO pending
+  // candidate left to drive the F3 rewrite -- no product path out. On an
+  // exclusive fortress, promote therefore also offers to re-scope EVERY
+  // verified observe-promoted allow whose scope disagrees with the gate
+  // principal, candidate or not, under the same Tier-1 gate. Exact-prefix
+  // observe rules only (never another producer's rules), and only the scope
+  // changes (same id => same signed match). The coarse direction has no
+  // orphan rescue: a gate-scoped orphan under coarse composes fine (dead but
+  // inert), and its original template cannot be reconstructed from the rule.
+  const routing = deps.routing ?? { mode: "coarse" };
+  const rescopeRules: AllowlistRule[] = [];
+  if (routing.mode === "exclusive") {
+    const promotableIds = new Set(promotable.map((row) => row.rule.id));
+    const wantScope: RuleScope = { uids: [routing.gate_uid] };
+    for (const existing of basisRules) {
+      if (!existing.id.startsWith(OBSERVE_PROMOTED_RULE_ID_PREFIX)) continue;
+      if (existing.disposition !== "allow") continue;
+      if (promotableIds.has(existing.id)) continue; // the candidate-driven rewrite covers it
+      if (ruleScopesEqual(existing.scope, wantScope)) continue;
+      const rescoped: AllowlistRule = { ...existing, scope: { uids: [routing.gate_uid] } };
+      // A rescope that fails validation is dropped, never signed; with a
+      // marker-validated positive gate uid this cannot happen in practice.
+      if (validateRule(rescoped).length === 0) rescopeRules.push(rescoped);
+    }
+  }
+
+  if (promotable.length === 0 && rescopeRules.length === 0) {
     // Nothing to approve, nothing to publish. Deliberately does NOT call
     // `deps.approve` -- there is nothing valid for a human to approve.
     return { status: "no_candidates", dropped };
   }
 
+  // ── Round-3 R2(c): every selected candidate already signed as it would ──
+  // be signed now => a no-op. Decided BEFORE the Tier-1 gate (no approval
+  // ceremony for nothing) and WITHOUT a pointless re-sign. Only when no
+  // rescope work is pending either.
+  const basisById = new Map(basisRules.map((rule) => [rule.id, rule]));
+  const allAlreadyPromoted =
+    promotable.length > 0 &&
+    promotable.every((row) => {
+      const existing = basisById.get(row.rule.id);
+      return existing !== undefined && ruleScopesEqual(existing.scope, row.rule.scope);
+    });
+  if (allAlreadyPromoted && rescopeRules.length === 0) {
+    return {
+      status: "already_promoted",
+      promotedKeys: promotable.map((row) => row.key),
+      dropped,
+    };
+  }
+
   // ── Approval context: the SYNTHESIZED effective matches (FIX 3) ─────────
-  // Each `rule_N` is the exact match+scope that will be signed if approved.
+  // Each `rule_N` is the exact match+scope that will be signed if approved;
+  // each `rescope_N` is an existing promoted rule whose scope will be
+  // rewritten to the gate principal (R3 -- the human sees the re-scope too).
   const approvalContext: Record<string, unknown> = { candidate_count: promotable.length };
   const shown = promotable.slice(0, MAX_APPROVAL_RULE_LINES);
   shown.forEach((row, i) => {
@@ -364,6 +452,17 @@ export async function promoteCandidates(
   });
   if (promotable.length > shown.length) {
     approvalContext["rules_omitted"] = `${promotable.length - shown.length} more (run promote with a smaller selection to review each)`;
+  }
+  if (rescopeRules.length > 0) {
+    approvalContext["rescope_count"] = rescopeRules.length;
+    const shownRescopes = rescopeRules.slice(0, MAX_APPROVAL_RULE_LINES);
+    shownRescopes.forEach((rule, i) => {
+      approvalContext[`rescope_${i + 1}`] =
+        `re-scope existing ${rule.id} to ${describeEffectiveRule(rule.match, rule.scope)}`;
+    });
+    if (rescopeRules.length > shownRescopes.length) {
+      approvalContext["rescopes_omitted"] = `${rescopeRules.length - shownRescopes.length} more`;
+    }
   }
 
   const approval = await deps.approve("castle_wall_observe_promote", approvalContext);
@@ -403,80 +502,104 @@ export async function promoteCandidates(
     }
   }
 
-  // ── Publish-time re-read + verify + compare-and-set (FIX 1 + FIX 2) ─────
-  // Re-verify the on-disk manifest AFTER approval (approval may block on
-  // human input). If it no longer verifies, or if its digest changed since
-  // the basis we approved against, ABORT and fail closed -- never publish a
-  // stale merged set that could drop a concurrently-added rule.
-  const atPublish = await deps.readVerifiedManifest();
-  if (atPublish.status === "tampered") {
-    return { status: "tampered_manifest", reason: atPublish.reason, dropped };
-  }
-  if (digestOf(atPublish) !== basisDigest) {
-    return { status: "manifest_changed", dropped };
-  }
-  const currentRules = verifiedRulesOf(atPublish);
-  // Carry the signature-VERIFIED manifest-level descriptors forward from the
-  // SAME verified publish-time read the rules come from -- never raw on-disk
-  // bytes -- so the re-signed manifest preserves them (#897 P1). This rides the
-  // identical laundering-safe path as the rules: `atPublish` is only `ok` after
-  // the pinned-key signature + per-rule verification, and the descriptors live
-  // under that signature, so a planted descriptor breaks the signature and
-  // lands in the `tampered` abort above rather than getting re-signed.
-  const descriptors = verifiedDescriptorsOf(atPublish);
-
-  // Merge: the VERIFIED carry-forward rules first, then the freshly
-  // synthesized + validated added rules whose id is not already present.
-  // Both sides are trustworthy (currentRules are cryptographically verified;
-  // addedRules are validateRule-clean). Ids are content-derived over the
-  // MATCH inputs (granularity, template/agent, host/ip, port, protocol) but
-  // deliberately NOT over the routing mode, so an id collision means
-  // identical match content -- with possibly a DIFFERENT scope when the
-  // fortress's routing mode changed since the rule was first promoted.
-  //
-  // Fix-round F3 (mode-transition residue): a same-id carry-forward rule
-  // whose scope disagrees with the current routing resolution is REWRITTEN
-  // to the freshly synthesized rule (the human just approved exactly that
-  // effective match+scope in the Tier-1 context above). Silently keeping the
-  // stale rule while reporting success left a template-scoped rule
-  // agent-reachable forever after an exclusive arm (reload-bricking), and a
-  // gate-scoped rule dead forever after a coarse restore -- with no product
-  // path to repair either. A same-id rule whose scope already agrees is kept
-  // as-is (idempotent re-promote).
-  const existingIds = new Set(currentRules.map((rule) => rule.id));
-  // Defensive: the publish-time set must be digest-equal to the basis, so
-  // basisIds and existingIds agree; kept distinct only to make the invariant
-  // explicit for a future reader.
-  void basisIds;
-  const promotableById = new Map(promotable.map((row) => [row.rule.id, row.rule]));
-  const rewrittenRules: AllowlistRule[] = [];
-  const carriedRules = currentRules.map((existing) => {
-    const fresh = promotableById.get(existing.id);
-    if (!fresh || ruleScopesEqual(existing.scope, fresh.scope)) return existing;
-    rewrittenRules.push(fresh);
-    return fresh;
-  });
-  const addedRules = promotable.filter((row) => !existingIds.has(row.rule.id)).map((row) => row.rule);
-  const mergedRules = [...carriedRules, ...addedRules];
-  const publishResult = await deps.publish(mergedRules, descriptors);
-
-  for (const row of promotable) {
-    if (!deps.auditPromotedCandidate) continue;
-    try {
-      await deps.auditPromotedCandidate({ key: row.key, rule_id: row.rule.id, candidate: row.observation });
-    } catch {
-      // Best-effort: the manifest is already published. A throw here must
-      // never surface as "promote failed" once the access-widening step
-      // (publish) has already succeeded.
+  // ── Round-3 R1: the cross-process publish lock ──────────────────────────
+  // Held across the publish-time re-read, the digest CAS, and the publish +
+  // orphan-cleanup. Without it, two approved promotes can both pass the CAS
+  // against the same digest and then publish in turn -- the second rename
+  // silently drops the first's rule from the signed manifest. Contended =>
+  // abort loud with nothing published; the lock is never broken here.
+  let releasePublishLock: (() => Promise<void>) | null = null;
+  if (deps.publishLock) {
+    releasePublishLock = await deps.publishLock.acquire();
+    if (releasePublishLock === null) {
+      return { status: "publish_in_progress", dropped };
     }
   }
+  try {
+    // ── Publish-time re-read + verify + compare-and-set (FIX 1 + FIX 2) ───
+    // Re-verify the on-disk manifest AFTER approval (approval may block on
+    // human input). If it no longer verifies, or if its digest changed since
+    // the basis we approved against, ABORT and fail closed -- never publish a
+    // stale merged set that could drop a concurrently-added rule.
+    const atPublish = await deps.readVerifiedManifest();
+    if (atPublish.status === "tampered") {
+      return { status: "tampered_manifest", reason: atPublish.reason, dropped };
+    }
+    if (digestOf(atPublish) !== basisDigest) {
+      return { status: "manifest_changed", dropped };
+    }
+    const currentRules = verifiedRulesOf(atPublish);
+    // Carry the signature-VERIFIED manifest-level descriptors forward from
+    // the SAME verified publish-time read the rules come from -- never raw
+    // on-disk bytes -- so the re-signed manifest preserves them (#897 P1).
+    // This rides the identical laundering-safe path as the rules: `atPublish`
+    // is only `ok` after the pinned-key signature + per-rule verification,
+    // and the descriptors live under that signature, so a planted descriptor
+    // breaks the signature and lands in the `tampered` abort above rather
+    // than getting re-signed.
+    const descriptors = verifiedDescriptorsOf(atPublish);
 
-  return {
-    status: "promoted",
-    promotedKeys: promotable.map((row) => row.key),
-    addedRules,
-    rewrittenRules,
-    dropped,
-    publish: publishResult,
-  };
+    // Merge: the VERIFIED carry-forward rules first, then the freshly
+    // synthesized + validated added rules whose id is not already present.
+    // Both sides are trustworthy (currentRules are cryptographically
+    // verified; addedRules are validateRule-clean). Ids are content-derived
+    // over the MATCH inputs (granularity, template/agent, host/ip, port,
+    // protocol) but deliberately NOT over the routing mode, so an id
+    // collision means identical match content -- with possibly a DIFFERENT
+    // scope when the fortress's routing mode changed since the rule was
+    // first promoted.
+    //
+    // Fix-round F3 (mode-transition residue): a same-id carry-forward rule
+    // whose scope disagrees with the current routing resolution is REWRITTEN
+    // to the freshly synthesized rule (the human just approved exactly that
+    // effective match+scope in the Tier-1 context above). Round-3 R3 extends
+    // the same rewrite to the CANDIDATE-LESS rescope set computed above. A
+    // same-id rule whose scope already agrees is kept as-is (idempotent
+    // re-promote).
+    const existingIds = new Set(currentRules.map((rule) => rule.id));
+    // Defensive: the publish-time set must be digest-equal to the basis, so
+    // basisIds and existingIds agree; kept distinct only to make the
+    // invariant explicit for a future reader.
+    void basisIds;
+    const promotableById = new Map(promotable.map((row) => [row.rule.id, row.rule]));
+    const rescopeById = new Map(rescopeRules.map((rule) => [rule.id, rule]));
+    const rewrittenRules: AllowlistRule[] = [];
+    const carriedRules = currentRules.map((existing) => {
+      const fresh = promotableById.get(existing.id) ?? rescopeById.get(existing.id);
+      if (!fresh || ruleScopesEqual(existing.scope, fresh.scope)) return existing;
+      rewrittenRules.push(fresh);
+      return fresh;
+    });
+    const addedRules = promotable
+      .filter((row) => !existingIds.has(row.rule.id))
+      .map((row) => row.rule);
+    const mergedRules = [...carriedRules, ...addedRules];
+    const publishResult = await deps.publish(mergedRules, descriptors);
+
+    for (const row of promotable) {
+      if (!deps.auditPromotedCandidate) continue;
+      try {
+        await deps.auditPromotedCandidate({
+          key: row.key,
+          rule_id: row.rule.id,
+          candidate: row.observation,
+        });
+      } catch {
+        // Best-effort: the manifest is already published. A throw here must
+        // never surface as "promote failed" once the access-widening step
+        // (publish) has already succeeded.
+      }
+    }
+
+    return {
+      status: "promoted",
+      promotedKeys: promotable.map((row) => row.key),
+      addedRules,
+      rewrittenRules,
+      dropped,
+      publish: publishResult,
+    };
+  } finally {
+    if (releasePublishLock) await releasePublishLock();
+  }
 }

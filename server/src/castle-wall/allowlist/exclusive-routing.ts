@@ -76,6 +76,7 @@
  * as-gate-uid / as-agent-uid legs, never this library.
  */
 
+import { OBSERVE_PROMOTED_RULE_ID_PREFIX } from "../constants.js";
 import type { AllowlistRule, RuleScope } from "./schema.js";
 import {
   DERIVED_GATE_RULE_ID,
@@ -387,15 +388,27 @@ export function assertExclusiveRoutingComposition(
     // 4. Direct off-box allow: agent-reachable => violation (this includes
     // the derived DNS rule when its parent union reaches the agent).
     if (allowRuleScopeReachesAgent(rule.scope, principals)) {
+      // 2026-07-27 round-3 R3(ii): an observe-PROMOTED rule with a
+      // pre-exclusive (template/agent) scope has a PRODUCT recovery path;
+      // name it here, because this error is exactly what the operator sees
+      // when a coarse-era promoted rule bricks the exclusive compose, and
+      // the generic residue advice ("republish the provisioned rules")
+      // does not apply to it.
+      const observeRemedy = rule.id.startsWith(OBSERVE_PROMOTED_RULE_ID_PREFIX)
+        ? " Remedy: this is an observe-promoted rule from before exclusive routing was armed; run" +
+          " 'sanctuary castle-wall observe promote --all' on this fortress (it re-scopes stale promoted" +
+          " rules to the gate principal under the same Tier-1 approval, even with no pending candidates)," +
+          " or discard it by deleting its file from policy/egress/rules/."
+        : "";
       violations.push({
         rule_id: rule.id,
         reason:
-          rule.id === DERIVED_DNS_RULE_ID
+          (rule.id === DERIVED_DNS_RULE_ID
             ? "the derived DNS allow's parent-scope union reaches the agent " +
               "(an agent-reachable hostname allow exists; the agent must have NO direct DNS - the gate resolves)"
             : scopeIsAll(rule.scope)
               ? "unscoped allow (scope: {} covers every wrapped agent) grants the agent a direct off-box endpoint"
-              : "scope covers the confined agent (uids/agent_ids/template_ids axis names it)",
+              : "scope covers the confined agent (uids/agent_ids/template_ids axis names it)") + observeRemedy,
       });
       continue;
     }

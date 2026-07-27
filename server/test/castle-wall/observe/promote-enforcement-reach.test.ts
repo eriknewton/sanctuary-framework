@@ -50,13 +50,16 @@ import { ed25519 } from "@noble/curves/ed25519";
 
 import {
   FilesystemManifestStorage,
+  observePromoteFileLock,
   readVerifiedManifest,
   resolvePromoteRouting,
+  runObserveCandidates,
   runObservePromote,
 } from "../../../src/cli/castle-wall-observe.js";
 import {
   localManifestSigner,
   publishSignedManifest,
+  type ManifestStorage,
 } from "../../../src/castle-wall/runtime/manifest-publisher.js";
 import {
   loadManifestState,
@@ -69,9 +72,16 @@ import {
 import { ExclusiveRoutingViolationError } from "../../../src/castle-wall/allowlist/exclusive-routing.js";
 import type { ExclusiveEgressGatePolicy } from "../../../src/castle-wall/allowlist/gate-derivation.js";
 import { promoteCandidates, type PromoteOutcome } from "../../../src/castle-wall/observe/promote.js";
-import { candidateCurrentlyAllowed } from "../../../src/castle-wall/observe/refresh.js";
+import {
+  candidateCurrentlyAllowed,
+  candidatePromotedAwaitingRearm,
+} from "../../../src/castle-wall/observe/refresh.js";
 import { OBSERVE_PROMOTED_RULE_ID_PREFIX } from "../../../src/castle-wall/observe/synthesize.js";
+import { ObserveStore } from "../../../src/castle-wall/observe/store.js";
 import type { CandidateObservation } from "../../../src/castle-wall/observe/types.js";
+import { EGRESS_GATE_REPAIR_WITH_STAND_DOWN_COMMAND } from "../../../src/egress-gate/operator-advice.js";
+import { AutoApproveChannel } from "../../../src/principal-policy/approval-channel.js";
+import { StateStore } from "../../../src/cognitive/state-store.js";
 import type { SignedManifest } from "../../../src/castle-wall/allowlist/manifest.js";
 import type { AllowlistRule } from "../../../src/castle-wall/allowlist/schema.js";
 import { IdentityManager } from "../../../src/cognitive/tools.js";
@@ -161,16 +171,20 @@ describe("observe promote reaches live enforcement (the real composer, not promo
    * Promote exactly as `runObservePromote` wires it in production: the same
    * verified-manifest reader, the same publisher, the same storage rooted at
    * the fortress egress dir, the ROUTING RESOLVED FROM THE FORTRESS via the
-   * CLI's own `resolvePromoteRouting`, and the same post-approval re-resolve
-   * (F5). A FRESH storage per call, as the CLI constructs one per invocation.
+   * CLI's own `resolvePromoteRouting`, the same post-approval re-resolve
+   * (F5), and the same cross-process publish lock (round-3 R1). A FRESH
+   * storage per call, as the CLI constructs one per invocation.
    */
-  async function promoteViaProductionWiring(row: CandidateObservation): Promise<PromoteOutcome> {
+  async function promoteSelectionViaProductionWiring(
+    selection: Array<{ key: string }>,
+    candidatesByKey: Map<string, CandidateObservation>,
+    overrides: { storage?: ManifestStorage; approve?: () => Promise<{ allowed: boolean }> } = {},
+  ): Promise<PromoteOutcome> {
     const routing = await resolvePromoteRouting(fortressPath);
-    const candidatesByKey = new Map([["k1", row]]);
-    const storage = new FilesystemManifestStorage(egressDir);
-    return promoteCandidates([{ key: "k1" }], candidatesByKey, {
+    const storage = overrides.storage ?? new FilesystemManifestStorage(egressDir);
+    return promoteCandidates(selection, candidatesByKey, {
       readVerifiedManifest: () => readVerifiedManifest(egressDir, publicKey),
-      approve: async () => ({ allowed: true }),
+      approve: overrides.approve ?? (async () => ({ allowed: true })),
       publish: (rules, descriptors) =>
         publishSignedManifest(
           {
@@ -188,7 +202,12 @@ describe("observe promote reaches live enforcement (the real composer, not promo
       now: new Date(),
       routing,
       reresolveRouting: () => resolvePromoteRouting(fortressPath),
+      publishLock: observePromoteFileLock(fortressPath),
     });
+  }
+
+  async function promoteViaProductionWiring(row: CandidateObservation): Promise<PromoteOutcome> {
+    return promoteSelectionViaProductionWiring([{ key: "k1" }], new Map([["k1", row]]));
   }
 
   async function promoteExpectPromoted(
@@ -398,6 +417,118 @@ describe("observe promote reaches live enforcement (the real composer, not promo
     expect(composed).toBeDefined();
     expect(composed!.scope).toEqual({ template_ids: ["claude-code"] });
   });
+
+  it("FAIL-WITHOUT-FIX (R1): a concurrent promote REFUSES (publish_in_progress) instead of silently dropping the other's rule", async () => {
+    // Y enters its publish and pauses at the manifest rename, HOLDING the
+    // cross-process publish lock. X then attempts a full promote. Without
+    // the lock, both passed the digest CAS against the same (absent)
+    // manifest, X published completely, and Y's later rename dropped X's
+    // rule from the signed manifest -- a silent lost update. With the lock,
+    // X refuses loudly with nothing published.
+    let reachedRename!: () => void;
+    const renameReached = new Promise<void>((resolve) => (reachedRename = resolve));
+    let releaseRename!: () => void;
+    const renameGate = new Promise<void>((resolve) => (releaseRename = resolve));
+    const inner = new FilesystemManifestStorage(egressDir);
+    const gatedStorage: ManifestStorage = {
+      writeRule: (filename, bytes) => inner.writeRule(filename, bytes),
+      listRules: () => inner.listRules(),
+      removeRule: (filename) => inner.removeRule(filename),
+      atomicRenameManifest: async (bytes) => {
+        reachedRename();
+        await renameGate;
+        return inner.atomicRenameManifest(bytes);
+      },
+    };
+
+    const promiseY = promoteSelectionViaProductionWiring(
+      [{ key: "k1" }],
+      new Map([["k1", candidate("y.newlyapproved.example")]]),
+      { storage: gatedStorage },
+    );
+    await renameReached;
+
+    const outcomeX = await promoteSelectionViaProductionWiring(
+      [{ key: "k1" }],
+      new Map([["k1", candidate("x.newlyapproved.example")]]),
+    );
+    expect(outcomeX.status).toBe("publish_in_progress");
+
+    releaseRename();
+    const outcomeY = await promiseY;
+    expect(outcomeY.status).toBe("promoted");
+    if (outcomeY.status !== "promoted") throw new Error("unreachable");
+
+    // The winner's rule is in the verified signed manifest, and nothing was
+    // silently lost: the loser published NOTHING and said so.
+    const final = await readVerifiedManifest(egressDir, publicKey);
+    expect(final.status).toBe("ok");
+    if (final.status !== "ok") throw new Error("unreachable");
+    expect(final.rules.some((rule) => rule.id === outcomeY.addedRules[0]!.id)).toBe(true);
+    expect(final.rules.some((rule) => rule.match.host?.[0] === "x.newlyapproved.example")).toBe(false);
+  });
+
+  it("FAIL-WITHOUT-FIX (R2): re-promoting an already-promoted unchanged selection is a no-op: no Tier-1 prompt, no re-sign", async () => {
+    const row = candidate("api.newlyapproved.example");
+    await promoteExpectPromoted(row);
+
+    let approveCalls = 0;
+    const outcome = await promoteSelectionViaProductionWiring(
+      [{ key: "k1" }],
+      new Map([["k1", row]]),
+      {
+        approve: async () => {
+          approveCalls += 1;
+          return { allowed: true };
+        },
+      },
+    );
+    expect(outcome.status).toBe("already_promoted");
+    // No approval ceremony for a no-op, and no pointless re-sign: the
+    // manifest bytes are untouched (same digest before and after).
+    expect(approveCalls).toBe(0);
+  });
+
+  it("FAIL-WITHOUT-FIX (R3): a coarse-era promoted rule that bricks the exclusive compose is repaired through promote with NO candidates left", async () => {
+    // Production shape: the coarse promote consumed its candidate, so after
+    // the fortress arms exclusive routing there is NOTHING to select -- the
+    // stale template-scoped rule bricks every compose (fail-closed) and the
+    // pre-R3 promote had no path to the rewrite.
+    const row = candidate("api.newlyapproved.example");
+    const first = await promoteExpectPromoted(row);
+    await writeFile(exclusiveRoutingMarkerPath(fortressPath), exclusiveMarkerDoc());
+
+    // Bricked, and the violation NAMES the product recovery path (R3ii).
+    await expect(
+      loadManifestState({
+        fortressPath,
+        fortressId: "fortress-test",
+        signer: daemonSigner,
+        exclusiveEgressGate: gatePolicy,
+      }),
+    ).rejects.toThrow(/observe promote/);
+
+    // The product path out: promote with an EMPTY selection re-scopes the
+    // stale observe-promoted rule to the gate principal under the Tier-1 gate.
+    const outcome = await promoteSelectionViaProductionWiring([], new Map());
+    expect(outcome.status).toBe("promoted");
+    if (outcome.status !== "promoted") throw new Error("unreachable");
+    expect(outcome.rewrittenRules).toHaveLength(1);
+    expect(outcome.rewrittenRules[0]!.id).toBe(first.ruleId);
+    expect(outcome.promotedKeys).toEqual([]);
+    expect(outcome.addedRules).toEqual([]);
+
+    // The REAL exclusive reload now composes, gate-scoped.
+    const state = await loadManifestState({
+      fortressPath,
+      fortressId: "fortress-test",
+      signer: daemonSigner,
+      exclusiveEgressGate: gatePolicy,
+    });
+    const composed = state.rules.find((rule) => rule.id === first.ruleId);
+    expect(composed).toBeDefined();
+    expect(composed!.scope).toEqual({ uids: [GATE_UID] });
+  });
 });
 
 describe("F2: gate-scoped rules never suppress a candidate (scope-aware conservative suppression)", () => {
@@ -427,6 +558,21 @@ describe("F2: gate-scoped rules never suppress a candidate (scope-aware conserva
     expect(
       candidateCurrentlyAllowed([allowRule({ template_ids: ["claude-code"], uids: [GATE_UID] })], row),
     ).toBe(true);
+  });
+
+  it("R2(b): candidatePromotedAwaitingRearm marks exactly the gate-scoped (uids-only) coverage", () => {
+    // The listing marker: gate-scoped coverage => promoted, awaiting re-arm.
+    expect(candidatePromotedAwaitingRearm([allowRule({ uids: [GATE_UID] })], row)).toBe(true);
+    // A template-scoped rule covers the agent directly (not awaiting anything).
+    expect(candidatePromotedAwaitingRearm([allowRule({ template_ids: ["claude-code"] })], row)).toBe(false);
+    // A mixed scope reaches the agent via the template axis: not "awaiting".
+    expect(
+      candidatePromotedAwaitingRearm([allowRule({ template_ids: ["claude-code"], uids: [GATE_UID] })], row),
+    ).toBe(false);
+    // A gate-scoped rule for a DIFFERENT destination marks nothing.
+    expect(
+      candidatePromotedAwaitingRearm([allowRule({ uids: [GATE_UID] })], candidate("other.example.com")),
+    ).toBe(false);
   });
 });
 
@@ -531,5 +677,167 @@ describe("F7: a malformed exclusive-routing marker refuses the promote through t
     expect(code).toBe(1);
     expect(err.text()).toContain("could not resolve this fortress's egress routing mode");
     expect(err.text()).toContain("Nothing was changed");
+  });
+});
+
+describe("round-3 R4/R5: the REAL CLI promote path (approved end to end)", () => {
+  const tempDirs: string[] = [];
+
+  afterEach(async () => {
+    for (const dir of tempDirs.splice(0)) {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  /**
+   * A fully bootstrap-able fortress for the observe CLI verbs: recovery-key
+   * custody, one identity, the pinned manifest-signing keypair, pending
+   * candidate rows in the encrypted observe store, and (optionally) the
+   * exclusive-routing marker. The Tier-1 approval is satisfied through the
+   * `approvalChannel` test seam with the shipped `AutoApproveChannel` (the
+   * production prompt channel requires an interactive TTY).
+   */
+  async function makeCliFortress(opts: {
+    exclusive: boolean;
+    candidates: CandidateObservation[];
+  }): Promise<{
+    fortressPath: string;
+    recoveryKey: string;
+    pinnedPublicKey: Uint8Array;
+    listStoredCandidates: () => Promise<number>;
+  }> {
+    const fortressPath = await mkdtemp(join(tmpdir(), "cw-observe-cli-e2e-"));
+    tempDirs.push(fortressPath);
+    const masterKey = generateRandomKey();
+    const recoveryKey = toBase64url(masterKey);
+    const storage = new FilesystemStorage(join(fortressPath, "state"));
+    await storage.write("_meta", "recovery-key-hash", stringToBytes(hashToString(masterKey)));
+    const identityEncKey = derivePurposeKey(masterKey, "identity-encryption");
+    const manager = new IdentityManager(storage, masterKey);
+    const { storedIdentity } = createIdentity("test-agent", identityEncKey, "passphrase");
+    await manager.save(storedIdentity);
+
+    // The pinned Castle Wall signing keypair the promote publish path uses.
+    const seed = generateRandomKey();
+    const pinnedPublicKey = ed25519.getPublicKey(seed);
+    await writeFile(join(fortressPath, "castle-pinned-pubkey.bin"), pinnedPublicKey);
+    await writeFile(
+      join(fortressPath, "castle-pinned-privkey.enc"),
+      JSON.stringify(encrypt(seed, masterKey)),
+    );
+
+    const observeStore = new ObserveStore(new StateStore(storage, masterKey), {
+      identityId: storedIdentity.identity_id,
+      encryptedPrivateKey: storedIdentity.encrypted_private_key,
+      identityEncryptionKey: identityEncKey,
+    });
+    await observeStore.mergeObservations(opts.candidates);
+
+    if (opts.exclusive) {
+      await mkdir(join(fortressPath, "policy", "egress"), { recursive: true, mode: 0o700 });
+      await writeFile(
+        exclusiveRoutingMarkerPath(fortressPath),
+        renderExclusiveRoutingMarker({
+          agent_uid: AGENT_UID,
+          gate_uid: GATE_UID,
+          agent_id: "agent-1",
+          agent_template: "claude-code",
+        }),
+      );
+    }
+
+    return {
+      fortressPath,
+      recoveryKey,
+      pinnedPublicKey,
+      listStoredCandidates: async () => (await observeStore.listCandidates()).size,
+    };
+  }
+
+  it("FAIL-WITHOUT-FIX (R4): an approved EXCLUSIVE promote keeps the candidate rows, says CANNOT reach + the repair command, and the listing marks the rows", async () => {
+    const fortress = await makeCliFortress({
+      exclusive: true,
+      candidates: [candidate("api.newlyapproved.example")],
+    });
+    const out = new Capture();
+    const err = new Capture();
+    const code = await runObservePromote(["--all", "--fortress", fortress.fortressPath], {
+      out,
+      err,
+      env: { SANCTUARY_RECOVERY_KEY: fortress.recoveryKey },
+      approvalChannel: new AutoApproveChannel(),
+    });
+
+    expect(code).toBe(0);
+    // The honest exclusive copy: no reach claim, the named re-arm command,
+    // and the stays-listed-until-discarded truth.
+    expect(out.text()).toContain("CANNOT reach");
+    expect(out.text()).toContain(EGRESS_GATE_REPAIR_WITH_STAND_DOWN_COMMAND);
+    expect(out.text()).toContain("nothing clears them automatically");
+    // F1(b): the candidate rows are KEPT (a removed row would vanish with
+    // nothing to re-mint it -- gate denials are never audit-folded).
+    expect(await fortress.listStoredCandidates()).toBe(1);
+
+    // R2(b): the candidates listing marks the row as promoted-awaiting-re-arm.
+    const listOut = new Capture();
+    const listCode = await runObserveCandidates(
+      ["--no-refresh", "--fortress", fortress.fortressPath],
+      { out: listOut, err: new Capture(), env: { SANCTUARY_RECOVERY_KEY: fortress.recoveryKey } },
+    );
+    expect(listCode).toBe(0);
+    expect(listOut.text()).toContain("promoted, awaiting re-arm");
+  });
+
+  it("control: an approved COARSE promote removes the candidate rows (the shipped behavior, unchanged)", async () => {
+    const fortress = await makeCliFortress({
+      exclusive: false,
+      candidates: [candidate("api.newlyapproved.example")],
+    });
+    const out = new Capture();
+    const code = await runObservePromote(["--all", "--fortress", fortress.fortressPath], {
+      out,
+      err: new Capture(),
+      env: { SANCTUARY_RECOVERY_KEY: fortress.recoveryKey },
+      approvalChannel: new AutoApproveChannel(),
+    });
+    expect(code).toBe(0);
+    expect(out.text()).not.toContain("CANNOT reach");
+    expect(await fortress.listStoredCandidates()).toBe(0);
+  });
+
+  it("FAIL-WITHOUT-FIX (R5): duplicate --destination flags promote ONCE, cleanly, instead of crashing post-approval on a duplicate rule id", async () => {
+    const fortress = await makeCliFortress({
+      exclusive: false,
+      candidates: [candidate("api.newlyapproved.example")],
+    });
+    const out = new Capture();
+    const err = new Capture();
+    const code = await runObservePromote(
+      [
+        "--destination",
+        "api.newlyapproved.example:443",
+        "--destination",
+        "api.newlyapproved.example:443",
+        "--fortress",
+        fortress.fortressPath,
+      ],
+      {
+        out,
+        err,
+        env: { SANCTUARY_RECOVERY_KEY: fortress.recoveryKey },
+        approvalChannel: new AutoApproveChannel(),
+      },
+    );
+    expect(code).toBe(0);
+    // Exactly one rule was signed for the destination.
+    const verified = await readVerifiedManifest(
+      join(fortress.fortressPath, "policy", "egress"),
+      fortress.pinnedPublicKey,
+    );
+    expect(verified.status).toBe("ok");
+    if (verified.status !== "ok") throw new Error("unreachable");
+    expect(
+      verified.rules.filter((rule) => rule.match.host?.[0] === "api.newlyapproved.example"),
+    ).toHaveLength(1);
   });
 });

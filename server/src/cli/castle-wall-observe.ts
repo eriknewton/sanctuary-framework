@@ -63,12 +63,14 @@ import {
   type ManifestStorage,
 } from "../castle-wall/runtime/manifest-publisher.js";
 import type { SignedManifest } from "../castle-wall/allowlist/manifest.js";
+import type { AllowlistRule } from "../castle-wall/allowlist/schema.js";
 import {
   verifyManifestSignature,
   verifyAndParseRules,
 } from "../castle-wall/allowlist/parse.js";
 import {
   ObserveStore,
+  candidatePromotedAwaitingRearm,
   promoteCandidates,
   refreshCandidatesFromAudit,
   type CandidateObservation,
@@ -97,6 +99,14 @@ export interface ObserveCommandContext {
   out?: Writable;
   err?: Writable;
   env?: NodeJS.ProcessEnv;
+  /**
+   * TEST SEAM ONLY (round-3 R4): overrides the Tier-1 approval channel so the
+   * approved-promote CLI paths (candidate retention, exclusive copy) are
+   * testable end to end -- the production prompt channel requires an
+   * interactive TTY and always denies otherwise. Not reachable from argv;
+   * production callers never set it.
+   */
+  approvalChannel?: ApprovalChannel;
 }
 
 function write(stream: Writable, text: string): void {
@@ -162,8 +172,9 @@ Commands:
                a running daemon applies them on its next policy reload.
                On an exclusive-routing fortress the gate daemon applies
                promoted destinations at the next re-arm (for example
-               ${EGRESS_GATE_REPAIR_WITH_STAND_DOWN_COMMAND}), and the
-               destinations stay listed as pending until then.
+               ${EGRESS_GATE_REPAIR_WITH_STAND_DOWN_COMMAND}); the
+               destinations stay listed (promoted, awaiting re-arm)
+               until you discard them after re-arming.
   discard      Drop selected (or all) candidates without promoting them.
 
 Run "sanctuary castle-wall observe <command> --help" for command-specific options.
@@ -444,16 +455,45 @@ export async function runObserveCandidates(
     return 0;
   }
 
+  // Round-3 R2(b): on an exclusive-routing fortress, a candidate whose
+  // destination is already covered by a GATE-scoped promoted rule was
+  // promoted and is awaiting the re-arm that loads the gate's rules snapshot
+  // (F2 deliberately keeps such rows visible; without this marking they were
+  // indistinguishable from never-promoted rows). Best-effort: a malformed
+  // marker or unverifiable allowlist skips the marking with a warning (the
+  // listing itself still works; promote refuses loud on the same states).
+  let awaitingRearmRules: readonly AllowlistRule[] = [];
+  try {
+    const marker = await loadExclusiveRoutingMarker(boot.fortressPath);
+    if (marker !== null) {
+      const allowlist = await readAllowlistForRefresh(boot.fortressPath);
+      if (allowlist.status === "ok") {
+        awaitingRearmRules = allowlist.rules;
+      } else {
+        write(err, "Warning: could not read the verified allowlist; the promoted-awaiting-re-arm marking is unavailable for this listing.\n");
+      }
+    }
+  } catch {
+    write(err, "Warning: the exclusive-routing marker is unreadable; the promoted-awaiting-re-arm marking is unavailable for this listing.\n");
+  }
+
   const col = (value: string, width: number): string => `${value.padEnd(width)}  `;
   write(out, `${col("Destination", 22)}${col("Agent", 15)}${col("Times", 5)}${col("First seen", 20)}${col("Last seen", 20)}Note\n`);
   for (const candidate of candidates) {
-    const note = candidate.exfil_risk ? "EXFIL-RISK, not pre-selected" : "";
+    const notes: string[] = [];
+    if (candidate.exfil_risk) notes.push("EXFIL-RISK, not pre-selected");
+    if (
+      awaitingRearmRules.length > 0 &&
+      candidatePromotedAwaitingRearm(awaitingRearmRules, candidate)
+    ) {
+      notes.push("promoted, awaiting re-arm");
+    }
     write(
       out,
       `${col(destinationLabel(candidate), 22)}${col(candidate.agent_template, 15)}${col(
         String(candidate.times_seen),
         5,
-      )}${col(candidate.first_seen, 20)}${col(candidate.last_seen, 20)}${note}\n`,
+      )}${col(candidate.first_seen, 20)}${col(candidate.last_seen, 20)}${notes.join("; ")}\n`,
     );
   }
   write(
@@ -465,6 +505,9 @@ export async function runObserveCandidates(
 
 /** Lockfile basename for the cross-process refresh mutual exclusion (Codex gate BLOCKER; see castle-wall/observe/refresh.ts guarantee 2). Lives directly under the fortress root (mode 0700). */
 const OBSERVE_REFRESH_LOCK_FILE = ".observe-refresh.lock";
+
+/** Lockfile basename for the cross-process PROMOTE publish mutual exclusion (round-3 R1; see castle-wall/observe/promote.ts `publishLock`). Lives directly under the fortress root, beside the refresh lock. */
+const OBSERVE_PROMOTE_LOCK_FILE = ".observe-promote.lock";
 
 /** True iff `pid` names a live process this user could signal (mirrors the audit write-lock's stale-holder detection in operational/audit-log.ts). */
 function isLockHolderAlive(pid: number): boolean {
@@ -517,7 +560,31 @@ export function observeRefreshFileLock(
   fortressPath: string,
   onContention?: (holderDescription: string) => void,
 ): RefreshLock {
-  const lockPath = join(fortressPath, OBSERVE_REFRESH_LOCK_FILE);
+  return fortressExclusiveFileLock(join(fortressPath, OBSERVE_REFRESH_LOCK_FILE), onContention);
+}
+
+/**
+ * Cross-process PROMOTE publish lock (round-3 R1): the same O_EXCL,
+ * never-auto-broken discipline as the refresh lock, on its own lockfile.
+ * Held by `promoteCandidates` across the publish-time verified re-read, the
+ * digest compare-and-set, and the publish + orphan-cleanup, so two approved
+ * promotes can never both pass the CAS against the same digest and then
+ * clobber each other's rename (the second silently dropping the first's rule
+ * from the signed manifest). The loser aborts loud (`publish_in_progress`)
+ * with nothing published.
+ */
+export function observePromoteFileLock(
+  fortressPath: string,
+  onContention?: (holderDescription: string) => void,
+): RefreshLock {
+  return fortressExclusiveFileLock(join(fortressPath, OBSERVE_PROMOTE_LOCK_FILE), onContention);
+}
+
+/** Shared O_EXCL fortress lockfile implementation behind both locks above. */
+function fortressExclusiveFileLock(
+  lockPath: string,
+  onContention?: (holderDescription: string) => void,
+): RefreshLock {
   return {
     async acquire() {
       try {
@@ -1011,6 +1078,16 @@ export async function runObservePromote(
   const candidatesByKey = await boot.observeStore.listCandidates();
   const granularity = granularityFlag as ObserveGranularity | undefined;
   const selection: PromoteSelectionRow[] = [];
+  // Round-3 R5: a repeated `--destination X --destination X` (or overlapping
+  // matches) must select each candidate row ONCE. Duplicate selection rows
+  // synthesized two same-id rules, and the publisher's duplicate-rule-id
+  // guard then threw AFTER approval (an unhandled crash, nothing published).
+  const selectedKeys = new Set<string>();
+  const pushSelection = (key: string): void => {
+    if (selectedKeys.has(key)) return;
+    selectedKeys.add(key);
+    selection.push({ key, granularity });
+  };
 
   if (all) {
     for (const [key, candidate] of candidatesByKey) {
@@ -1021,10 +1098,10 @@ export async function runObservePromote(
         );
         continue;
       }
-      selection.push({ key, granularity });
+      pushSelection(key);
     }
   } else {
-    for (const destination of destinations) {
+    for (const destination of [...new Set(destinations)]) {
       const matches = [...candidatesByKey.entries()].filter(
         ([, candidate]) => destinationLabel(candidate) === destination,
       );
@@ -1051,14 +1128,24 @@ export async function runObservePromote(
           );
           continue;
         }
-        selection.push({ key, granularity });
+        pushSelection(key);
       }
     }
   }
 
   if (selection.length === 0) {
-    write(out, "Nothing selected to promote.\n");
-    return 0;
+    if (routing.mode !== "exclusive") {
+      write(out, "Nothing selected to promote.\n");
+      return 0;
+    }
+    // Round-3 R3: on an exclusive fortress an EMPTY selection still proceeds,
+    // because promote is the product path that re-scopes stale (pre-exclusive)
+    // promoted rules to the gate principal -- and the coarse-era promote
+    // REMOVED its candidates, so the bricked state has nothing to select.
+    write(
+      out,
+      "No pending candidates selected; checking for promoted rules that need re-scoping to this fortress's exclusive routing.\n",
+    );
   }
 
   const egressDir = join(boot.fortressPath, "policy", "egress");
@@ -1074,8 +1161,14 @@ export async function runObservePromote(
 
   const policy = await loadPrincipalPolicy(boot.fortressPath);
   const baseline = new BaselineTracker(boot.storage, boot.masterKey);
-  const channel = new CastleWallObservePromptApprovalChannel();
+  const channel = ctx.approvalChannel ?? new CastleWallObservePromptApprovalChannel();
   const gate = new ApprovalGate(policy, baseline, channel, boot.auditLog);
+
+  // Round-3 R1: cross-process publish lock (see promote.ts `publishLock`).
+  let promoteLockHolder = "";
+  const publishLock = observePromoteFileLock(boot.fortressPath, (holder) => {
+    promoteLockHolder = holder;
+  });
 
   const outcome = await promoteCandidates(selection, candidatesByKey, {
     readVerifiedManifest: () => readVerifiedManifest(egressDir, pinnedPublicKey),
@@ -1119,12 +1212,44 @@ export async function runObservePromote(
     // marker after it returns so a mode flip in that window aborts instead of
     // signing rules scoped for the fortress as it no longer is.
     reresolveRouting: () => resolvePromoteRouting(boot.fortressPath),
+    publishLock,
   });
 
   if (outcome.status === "no_candidates") {
+    if (selection.length === 0) {
+      // The exclusive-mode empty-selection rescope check (round-3 R3) found
+      // nothing needing re-scope: an honest no-op, not an error.
+      write(out, "Nothing to promote, and no promoted rules need re-scoping.\n");
+      return 0;
+    }
     write(err, "No valid candidates to promote (not found, or the synthesized rule failed validation).\n");
     for (const dropped of outcome.dropped) write(err, `  ${dropped.key}: ${dropped.reason}\n`);
     return 1;
+  }
+  if (outcome.status === "publish_in_progress") {
+    write(
+      err,
+      "Error: another `observe promote` is publishing to this fortress" +
+        (promoteLockHolder ? ` (${promoteLockHolder})` : "") +
+        ". Nothing was changed (a concurrent publish could silently drop the other promote's rules). " +
+        "Wait for it to finish and re-run. This lock is never broken automatically.\n",
+    );
+    return 1;
+  }
+  if (outcome.status === "already_promoted") {
+    write(
+      out,
+      "The selected destination(s) are already in your wall's signed ruleset with the current-mode scope; nothing needed re-signing.\n",
+    );
+    if (routing.mode === "exclusive") {
+      write(
+        out,
+        "If you have re-armed since promoting, the gate is already serving them; remove the rows with " +
+          "`sanctuary castle-wall observe discard`. If you have not re-armed yet, re-arm to apply them " +
+          `(for example: ${EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE}).\n`,
+      );
+    }
+    return 0;
   }
   if (outcome.status === "tampered_manifest") {
     write(
@@ -1165,37 +1290,41 @@ export async function runObservePromote(
   // gate denials are not folded into the audit chain, and a removed row would
   // therefore vanish with nothing to re-mint it -- reporting "done" for a
   // destination the agent still cannot reach (the original defect's shape).
-  // The row leaves the list when the operator discards it, or is pruned by a
-  // future refresh only when a rule that actually covers the agent's
-  // enforcement path exists.
+  // Round-3 R2: NOTHING clears these rows automatically -- no composable
+  // rule can cover the agent's direct path on an exclusive fortress (that is
+  // exactly what the compose-time assertion forbids), so the refresh prune
+  // can never fire for them. The row leaves the list when the OPERATOR
+  // discards it after re-arming; the listing marks it "promoted, awaiting
+  // re-arm" and the copy below says so plainly.
   if (routing.mode !== "exclusive") {
     for (const key of outcome.promotedKeys) {
       await boot.observeStore.removeCandidate(key);
     }
   }
 
-  write(
-    out,
-    `Added ${outcome.addedRules.length} allow rule(s). Your wall's manifest was re-signed and republished to the rule source the enforcement daemons read.\n`,
-  );
+  const summary: string[] = [];
+  if (outcome.addedRules.length > 0) summary.push(`added ${outcome.addedRules.length} allow rule(s)`);
   if (outcome.rewrittenRules.length > 0) {
-    write(
-      out,
-      `Updated ${outcome.rewrittenRules.length} previously promoted rule(s) whose scope no longer matched this ` +
-        `fortress's routing mode; they were re-signed with the current-mode scope.\n`,
+    summary.push(
+      `re-scoped ${outcome.rewrittenRules.length} existing promoted rule(s) to this fortress's routing mode`,
     );
   }
+  write(
+    out,
+    `Promote complete: ${summary.join(" and ")}. Your wall's manifest was re-signed and republished to the rule source the enforcement daemons read.\n`,
+  );
   if (routing.mode === "exclusive") {
     write(
       out,
-      "This fortress runs exclusive routing: the new rule(s) are bound to the sanctuary-gate principal (your agent's only sanctioned off-box path is the gate).\n",
+      "This fortress runs exclusive routing: the rule(s) are bound to the sanctuary-gate principal (your agent's only sanctioned off-box path is the gate).\n",
     );
     write(
       out,
       "IMPORTANT: the running gate daemon loads its destination rules only when the gate is armed, so your agent " +
         "CANNOT reach the approved destination(s) yet. Re-arm to apply them, for example: " +
-        `${EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE}. Until then the destination(s) stay listed in ` +
-        "`observe candidates` as pending.\n",
+        `${EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE}. The destination(s) stay listed in ` +
+        "`observe candidates` (marked as promoted, awaiting re-arm); nothing clears them automatically. " +
+        "Once the re-armed gate is serving them, remove them with `sanctuary castle-wall observe discard`.\n",
     );
   } else {
     write(
