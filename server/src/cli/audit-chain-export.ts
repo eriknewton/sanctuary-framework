@@ -20,7 +20,17 @@ import { basename, join } from "node:path";
 import type { StorageBackend } from "../storage/interface.js";
 import { bytesToString } from "../core/encoding.js";
 import type { PersistedAuditEnvelopeV2 } from "../operational/audit-log.js";
-import type { AuditCheckpointRecord } from "../audit/chain.js";
+// G1 (post-#969 sweep re-gate): the checkpoint shape predicate and the
+// control-key allowlist are imported from the PURE, dependency-free
+// `audit/checkpoint-shape.ts` shared with the runtime audit log. This
+// module's no-server-runtime-imports posture survives (the shared module
+// imports nothing), and the hand-duplicated validator that had drifted
+// WEAKER than the runtime's (letting a record missing schema_version /
+// signature_algorithm / payload_encoding export uncounted) is gone.
+import {
+  AUDIT_CHECKPOINT_NAMESPACE_CONTROL_KEYS,
+  isAuditCheckpointRecord,
+} from "../audit/checkpoint-shape.js";
 import { lockdownBanner, readLockdownStatus } from "../lockdown/status.js";
 import { homeFortressPath } from "../paths.js";
 
@@ -41,23 +51,18 @@ export const AUDIT_EXPORT_SPLIT_ESTABLISHED_META_KEY =
   "audit-store-split-established-v1";
 // F-2 (dry-bar sweep 2026-07-27): the CLOSED allowlist of legitimate
 // NON-EXPORT control records that live in `_audit_checkpoints` under fixed
-// keys. These literals byte-match `operational/audit-log.ts`
-// (`AUDIT_HEAD_ANCHOR_KEY`, `AUDIT_EPOCH_KEYS_KEY`); duplicated here because
-// this raw exporter deliberately avoids server-runtime imports. Only a record
-// under one of THESE keys may be skipped without counting: the P1-A fix's
-// shape-based "not a recognized checkpoint, so a control record" arm could not
-// discriminate a control record from a checkpoint-keyed record failing strict
-// validation, so a parse-valid-but-malformed checkpoint vanished from the
-// export with `checkpointsSkipped` still 0 and the evidence pack signed the
-// export as complete or empty. A NEW control record added to this namespace
-// MUST be added here in the same PR, exactly like the master-rotation
-// classifier's closed set (`core/master-rotation.ts` `convertAuditAnchors`);
-// otherwise a healthy fortress discloses a false INCOMPLETE, which is loud and
-// fail-closed rather than silently flattering.
-export const AUDIT_EXPORT_CONTROL_KEYS: readonly string[] = [
-  "__head_anchor",
-  "__custody_epoch_keys",
-];
+// keys. Only a record under one of THESE keys may be skipped without
+// counting: the P1-A fix's shape-based "not a recognized checkpoint, so a
+// control record" arm could not discriminate a control record from a
+// checkpoint-keyed record failing strict validation, so a
+// parse-valid-but-malformed checkpoint vanished from the export with
+// `checkpointsSkipped` still 0 and the evidence pack signed the export as
+// complete or empty. G1/G5: the list is now DEFINED in the shared pure
+// `audit/checkpoint-shape.ts` (one sync mechanism with the audit log's own
+// key constants, no duplicated literals); this alias keeps the exporter's
+// public name stable.
+export const AUDIT_EXPORT_CONTROL_KEYS: readonly string[] =
+  AUDIT_CHECKPOINT_NAMESPACE_CONTROL_KEYS;
 
 /** Record types in a JSONL export file. */
 export type ExportRecord =
@@ -436,7 +441,16 @@ export function resolveAuditStoragePath(path: string): string {
   return basename(path) === "state" ? path : join(path, "state");
 }
 
-// --- Type guards (duplicated from audit-log.ts to avoid server-runtime imports) ---
+// --- Type guards ---
+//
+// G1: `isAuditCheckpointRecord` is IMPORTED from the shared pure
+// `audit/checkpoint-shape.ts` (see the import block); the local duplicate
+// that had drifted weaker than the runtime's is deleted. The two guards
+// below remain local duplicates of `audit-log.ts` internals (this exporter
+// must not import the server runtime). Their drift risk errs toward
+// INCLUSION, not silent disappearance: a record accepted here but rejected
+// by the runtime is still present in the export for a downstream verifier to
+// reject, so the evidence pack's counts stay honest.
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
@@ -453,25 +467,6 @@ function isPersistedAuditEnvelopeV2(value: unknown): value is PersistedAuditEnve
     typeof value.entry_hash === "string" &&
     typeof value.timestamp === "string" &&
     typeof value.encrypted_payload_bytes === "string"
-  );
-}
-
-function isAuditCheckpointRecord(value: unknown): value is AuditCheckpointRecord {
-  return (
-    isRecord(value) &&
-    (value.checkpoint_kind === "audit-checkpoint" ||
-      value.checkpoint_kind === "legacy-anchor") &&
-    typeof value.checkpoint_sequence === "number" &&
-    Number.isSafeInteger(value.checkpoint_sequence) &&
-    typeof value.from_sequence === "number" &&
-    Number.isSafeInteger(value.from_sequence) &&
-    typeof value.root_hash === "string" &&
-    typeof value.previous_checkpoint_sequence === "number" &&
-    Number.isSafeInteger(value.previous_checkpoint_sequence) &&
-    typeof value.signed_at === "string" &&
-    (typeof value.signer_kid === "string" || value.signer_kid === null) &&
-    (typeof value.signature === "string" || value.signature === null) &&
-    typeof value.unsigned === "boolean"
   );
 }
 

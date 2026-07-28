@@ -520,12 +520,17 @@ function incompleteNote(sourceLabel: string, reason: string): string {
  * characters in a PERSISTED string field before it enters a rendered table
  * row. The hub agent registry is a plaintext file, so a field can carry a `|`
  * or a newline that would break the table structure (or smuggle a fabricated
- * row) into the signed report. Pipes are escaped, newlines collapse to a
- * space; everything else renders as-is.
+ * row) into the signed report. Backslashes are escaped FIRST (G4: otherwise a
+ * crafted `\|` becomes `\\|`, an escaped backslash followed by a LIVE cell
+ * delimiter), then pipes; newlines collapse to a space; everything else
+ * renders as-is.
  */
 function mdCell(value: string | number | undefined, fallback = "-"): string {
   if (value === undefined) return fallback;
-  const text = String(value).replace(/\r?\n|\r/g, " ").replace(/\|/g, "\\|");
+  const text = String(value)
+    .replace(/\\/g, "\\\\")
+    .replace(/\r?\n|\r/g, " ")
+    .replace(/\|/g, "\\|");
   return text.length > 0 ? text : fallback;
 }
 
@@ -1394,14 +1399,18 @@ function renderVerification(
       "absent from the manifest is NOT covered by these signatures and must " +
       "not be relied on, even if it looks like a valid Sanctuary artifact and " +
       "verifies on its own: it may be left over from a different reporting " +
-      "period. The ONLY exception is inert operating-system metadata the " +
-      "generator verifies and ignores: " +
+      "period. The ONLY exception is the operating-system metadata set the " +
+      "generator ignores: " +
       IGNORED_OS_METADATA_LABEL +
-      ". An AppleDouble `._*` entry is ignored ONLY when its name pairs with " +
-      "one of the pack's own filenames AND the file begins with the " +
-      "AppleDouble magic bytes; the generator refuses to write beside any " +
-      "other `._*` file, so one present here was added after generation and " +
-      "is a reconciliation failure. Any other file, hidden or not, is a " +
+      ". An AppleDouble `._*` entry is ignored ONLY when the generator's " +
+      "checks pass: its name pairs with one of the pack's own filenames, the " +
+      "file begins with the AppleDouble signature and version bytes, and it " +
+      "is within a small size bound. Those checks bound what such a file can " +
+      "be, but they do NOT prove its content is inert: an exempted `._*` " +
+      "file is OUTSIDE the pack's signed claims, so do not rely on its " +
+      "content. The generator refuses to write beside any `._*` file that " +
+      "fails those checks, so one present here was added after generation " +
+      "and is a reconciliation failure. Any other file, hidden or not, is a " +
       "reconciliation failure.",
     "4. (Optional) Verify the manifest's own `manifest_signature`. Reproduce the " +
       "canonical body EXACTLY: take the manifest JSON, DROP the " +

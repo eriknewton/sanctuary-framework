@@ -59,6 +59,23 @@ const APPLEDOUBLE_PREFIX = "._";
 export const APPLEDOUBLE_MAGIC: readonly number[] = [0x00, 0x05, 0x16, 0x07];
 
 /**
+ * G3: the AppleDouble version field (0x00020000, version 2), bytes 4..8 of
+ * every fork macOS writes (version 1 is a 1980s-era format no shipping macOS
+ * emits). Checked alongside the magic so a planted file must forge the full
+ * 8-byte header, not 4 bytes.
+ */
+export const APPLEDOUBLE_VERSION_2: readonly number[] = [0x00, 0x02, 0x00, 0x00];
+
+/**
+ * G3: size bound on an exempted fork. Real `._*` companions of the pack's own
+ * Markdown/JSON/PDF files carry Finder info + extended attributes, typically
+ * about 4 KiB; 1 MiB is generous headroom. The bound caps how much planted
+ * content a header-forged file could smuggle inside the DISCLOSED exemption;
+ * anything larger is treated as pack-relevant and refused.
+ */
+export const MAX_APPLEDOUBLE_FORK_BYTES = 1024 * 1024;
+
+/**
  * Human-readable rendering of the ignored set for the SIGNED section-1 recipe,
  * so the auditor is told the EXACT set the generator ignores rather than an
  * open-ended "hidden files". Derived from {@link IGNORED_OS_METADATA} so the
@@ -66,7 +83,8 @@ export const APPLEDOUBLE_MAGIC: readonly number[] = [0x00, 0x05, 0x16, 0x07];
  */
 export const IGNORED_OS_METADATA_LABEL: string =
   IGNORED_OS_METADATA.map((n) => `\`${n}\``).join(", ") +
-  ", and verified AppleDouble `._*` resource forks of the pack's own filenames";
+  ", and AppleDouble `._*` resource forks that pair with the pack's own " +
+  "filenames and pass the generator's AppleDouble header and size checks";
 
 /**
  * The data-fork name a `._*` entry claims to be the resource fork of
@@ -99,20 +117,30 @@ export function isPackRelevantEntry(
 }
 
 /**
- * CONTENT verification for an AppleDouble fork candidate: true only when the
- * file's first four bytes are the AppleDouble magic. Fails toward "not a fork"
- * (pack-relevant, so refused) on any read error or short file: a file that
- * cannot be verified as inert metadata must never be silently exempted from
- * the signed claims (the could-not-look state is not the verified state).
+ * CONTENT check for an AppleDouble fork candidate: true only when the file's
+ * first eight bytes are the AppleDouble magic followed by the version-2
+ * field, AND the file is within {@link MAX_APPLEDOUBLE_FORK_BYTES}. Fails
+ * toward "not a fork" (pack-relevant, so refused) on any read error or short
+ * file: a file that cannot be checked must never be silently exempted from
+ * the signed claims (the could-not-look state is not the checked state).
+ *
+ * HONESTY BOUND (G3): this is a header-and-size CHECK, not proof the content
+ * is inert. A forged 8-byte header inside the size bound still passes; the
+ * signed section-1 recipe therefore describes exactly these checks and tells
+ * the auditor an exempted `._*` file is outside the pack's signed claims,
+ * rather than asserting it "carries no evidentiary content".
  */
-async function hasAppleDoubleMagic(filePath: string): Promise<boolean> {
+async function passesAppleDoubleHeaderCheck(filePath: string): Promise<boolean> {
+  const expected = [...APPLEDOUBLE_MAGIC, ...APPLEDOUBLE_VERSION_2];
   let handle;
   try {
     handle = await open(filePath, "r");
-    const buf = new Uint8Array(APPLEDOUBLE_MAGIC.length);
+    const stat = await handle.stat();
+    if (!stat.isFile() || stat.size > MAX_APPLEDOUBLE_FORK_BYTES) return false;
+    const buf = new Uint8Array(expected.length);
     const { bytesRead } = await handle.read(buf, 0, buf.length, 0);
-    if (bytesRead < APPLEDOUBLE_MAGIC.length) return false;
-    return APPLEDOUBLE_MAGIC.every((b, i) => buf[i] === b);
+    if (bytesRead < expected.length) return false;
+    return expected.every((b, i) => buf[i] === b);
   } catch {
     return false;
   } finally {
@@ -123,8 +151,8 @@ async function hasAppleDoubleMagic(filePath: string): Promise<boolean> {
 /**
  * List the entries of `dirPath` the pack's signed claims range over: the
  * directory listing minus the closed {@link IGNORED_OS_METADATA} set and minus
- * VERIFIED AppleDouble forks of the pack's own filenames (name pairing AND
- * magic-byte check). A `._*` entry that fails either check is INCLUDED, so the
+ * AppleDouble forks of the pack's own filenames that pass the header-and-size
+ * check. A `._*` entry that fails either check is INCLUDED, so the
  * writer's foreign-file refusal and post-write reconciliation treat it exactly
  * like any other pack-relevant file.
  */
@@ -143,7 +171,7 @@ export async function listPackRelevantEntries(
     // candidates must ALSO carry the AppleDouble magic to stay exempt.
     const dataName = appleDoubleDataName(name);
     if (dataName === null) continue;
-    if (await hasAppleDoubleMagic(join(dirPath, name))) continue;
+    if (await passesAppleDoubleHeaderCheck(join(dirPath, name))) continue;
     relevant.push(name);
   }
   return relevant;

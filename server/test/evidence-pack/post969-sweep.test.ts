@@ -31,7 +31,15 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -42,7 +50,7 @@ import { derivePurposeKey } from "../../src/core/key-derivation.js";
 import { createIdentity } from "../../src/core/identity.js";
 import type { StoredIdentity } from "../../src/core/identity.js";
 import { IdentityManager } from "../../src/cognitive/tools.js";
-import { AuditLog } from "../../src/operational/audit-log.js";
+import { AuditLog, AUDIT_EPOCH_KEYS_KEY } from "../../src/operational/audit-log.js";
 import type { AuditEntry } from "../../src/operational/audit-log.js";
 import {
   exportAuditChain,
@@ -55,7 +63,11 @@ import {
   writePackDirectory,
 } from "../../src/evidence-pack/cli.js";
 import { buildInventorySnapshot } from "../../src/evidence-pack/inventory.js";
-import { APPLEDOUBLE_MAGIC } from "../../src/evidence-pack/pack-files.js";
+import {
+  APPLEDOUBLE_MAGIC,
+  APPLEDOUBLE_VERSION_2,
+  MAX_APPLEDOUBLE_FORK_BYTES,
+} from "../../src/evidence-pack/pack-files.js";
 import {
   buildEvidencePack,
   MANIFEST_FILENAME,
@@ -270,6 +282,52 @@ describe("F-1: a corrupt local-agents.json is a disclosed read failure, never 'N
     expect(report).toContain("evil\\|agent injected-row");
     expect(report).not.toContain("evil|agent\ninjected-row");
   });
+
+  // FAIL-WITHOUT-FIX (G4, re-gate round 2): with pipes escaped but not
+  // backslashes, a crafted backslash-pipe pair rendered as an ESCAPED
+  // backslash followed by a LIVE `|` delimiter, shifting cells within the row.
+  it("G4: a crafted backslash-pipe field cannot re-arm the cell delimiter", async () => {
+    const root = await tmpDir("sanctuary-post969-g4-");
+    writePersistedLocalAgents(root, [
+      // agent_id carries a literal backslash followed by a pipe.
+      agentRecord({ agent_id: "evil\\|shift" }),
+    ]);
+    const report = reportText(packWithAgentsFrom(root));
+    // Backslash escaped FIRST, then the pipe: three backslashes + pipe in the
+    // artifact, so both characters are inert.
+    expect(report).toContain("evil\\\\\\|shift");
+  });
+
+  // FAIL-WITHOUT-FIX (G2, re-gate round 2; both lenses): the strict reader's
+  // `existsSync` gate returned false for EVERY failure, so a permission-denied
+  // `state/_hub` directory read as "absent" -> ok+[] -> the definitive signed
+  // census line over a registry whose existence was never determined.
+  it.skipIf(typeof process.getuid === "function" && process.getuid() === 0)(
+    "G2: an unreadable state/_hub directory is a disclosed read failure, never a verified-empty census",
+    async () => {
+      const root = await tmpDir("sanctuary-post969-g2-");
+      const hubDir = join(root, "state", "_hub");
+      await mkdir(hubDir, { recursive: true });
+      await writeFile(
+        join(hubDir, "local-agents.json"),
+        '{"version":"1.1","agents":[]}',
+        "utf-8"
+      );
+      await chmod(hubDir, 0o000);
+      try {
+        const source = readHubAgentsSource(root);
+        expect(source.ok).toBe(false);
+        expect(source.records).toEqual([]);
+        const report = reportText(packWithAgentsFrom(root));
+        expect(report).not.toContain(DEFINITIVE);
+        expect(report).toContain(
+          "could not be read for this period, so this section is INCOMPLETE"
+        );
+      } finally {
+        await chmod(hubDir, 0o700);
+      }
+    }
+  );
 });
 
 // ── F-2: malformed checkpoint records are COUNTED, never silently dropped ────
@@ -315,6 +373,54 @@ describe("F-2: a parse-valid but shape-invalid audit checkpoint is counted and f
     if (out.audit_chain.status === "read_failed") {
       expect(out.audit_chain.reason).toMatch(/skipped/i);
     }
+  });
+
+  // FAIL-WITHOUT-FIX (G1, re-gate round 2, Codex): the exporter's
+  // hand-duplicated validator had drifted WEAKER than the runtime's, so a
+  // record missing schema_version, signature_algorithm, and payload_encoding
+  // (numeric sequences and string hashes present) EXPORTED uncounted and the
+  // pack could sign a populated export over it. The shared pure predicate in
+  // audit/checkpoint-shape.ts closes the drift structurally.
+  it("G1: a checkpoint missing schema_version/signature_algorithm/payload_encoding is counted, never exported", async () => {
+    const f = await freshFortress();
+    const driftedShape = {
+      checkpoint_kind: "audit-checkpoint",
+      checkpoint_sequence: 1,
+      from_sequence: 1,
+      // Even a well-formed 64-hex hash: the missing fields alone must fail it.
+      root_hash: "a".repeat(64),
+      previous_checkpoint_sequence: 0,
+      signed_at: "2026-07-01T00:00:00.000Z",
+      signer_kid: null,
+      signature: null,
+      unsigned: true,
+    };
+    await f.storage.write(
+      AUDIT_EXPORT_CHECKPOINT_NAMESPACE,
+      "audit-checkpoint-00000000000000000001",
+      enc.encode(JSON.stringify(driftedShape))
+    );
+    const chunks: string[] = [];
+    const sink = new Writable({
+      write(chunk, _enc2, cb) {
+        chunks.push(String(chunk));
+        cb();
+      },
+    });
+    const summary = await exportAuditChain(f.storage, sink);
+    expect(summary.checkpointsListed).toBe(1);
+    expect(summary.checkpointsExported).toBe(0);
+    expect(summary.checkpointsSkipped).toBe(1);
+    // The malformed record did NOT ship in the export bytes.
+    expect(chunks.join("")).toBe("");
+
+    const out = await gatherDiscreteExports(f.storage, f.key, "fortress-1", GEN_AT);
+    expect(out.audit_chain.status).toBe("read_failed");
+  });
+
+  it("G5: the control-key allowlist carries the audit log's own epoch-keys key (one shared definition)", () => {
+    expect(AUDIT_EXPORT_CONTROL_KEYS).toContain(AUDIT_EPOCH_KEYS_KEY);
+    expect(AUDIT_EXPORT_CONTROL_KEYS).toContain("__custody_epoch_keys");
   });
 
   it("an unrecognized non-control key with a parse-valid record is counted too (closed allowlist)", async () => {
@@ -414,16 +520,52 @@ describe("F-3: planted `._*` files are refused; only verified forks of the pack'
     expect(await readFile(join(dir, "._00_pack_manifest.json"))).toEqual(fork);
   });
 
-  it("the SIGNED recipe no longer asserts unverified `._*` files carry no evidentiary content", () => {
+  // FAIL-WITHOUT-FIX (G3a, re-gate round 2): a 4-byte magic forgery passed the
+  // round-1 check; the header check now also requires the AppleDouble
+  // version-2 field.
+  it("G3: refuses a fake fork forging only the 4 magic bytes (no version field)", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "sanctuary-post969-g3a-"));
+    dirs.push(dir);
+    await writeFile(
+      join(dir, "._transparency-bundle.json"),
+      Buffer.concat([
+        Buffer.from(APPLEDOUBLE_MAGIC),
+        Buffer.from("planted content, not a version field"),
+      ])
+    );
+    await expect(writePackDirectory(dir, simplePack())).rejects.toThrow(
+      /did not write/
+    );
+    expect(await readdir(dir)).toEqual(["._transparency-bundle.json"]);
+  });
+
+  it("G3: refuses a header-forged fork exceeding the size bound", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "sanctuary-post969-g3b-"));
+    dirs.push(dir);
+    await writeFile(
+      join(dir, "._transparency-bundle.json"),
+      Buffer.concat([
+        Buffer.from([...APPLEDOUBLE_MAGIC, ...APPLEDOUBLE_VERSION_2]),
+        Buffer.alloc(MAX_APPLEDOUBLE_FORK_BYTES),
+      ])
+    );
+    await expect(writePackDirectory(dir, simplePack())).rejects.toThrow(
+      /did not write/
+    );
+    expect(await readdir(dir)).toEqual(["._transparency-bundle.json"]);
+  });
+
+  it("the SIGNED recipe claims exactly what the checks prove, and nothing more (G3b honesty)", () => {
     const report = reportText(simplePack());
     // The blanket unverified claim is gone...
-    expect(report).not.toContain(
-      "which the generator ignores and which carries no evidentiary content"
-    );
-    // ...replaced by the verified, narrowed rule the enforcement actually applies.
+    expect(report).not.toContain("carries no evidentiary content");
+    // ...replaced by the checked, narrowed rule the enforcement actually
+    // applies, plus the explicit bound on what the checks do NOT prove.
     expect(report).toContain(
-      "verified AppleDouble `._*` resource forks of the pack's own filenames"
+      "pass the generator's AppleDouble header and size checks"
     );
-    expect(report).toContain("AppleDouble magic bytes");
+    expect(report).toContain("AppleDouble signature and version bytes");
+    expect(report).toContain("do NOT prove its content is inert");
+    expect(report).toContain("OUTSIDE the pack's signed claims");
   });
 });

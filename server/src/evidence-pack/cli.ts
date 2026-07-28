@@ -290,12 +290,15 @@ export function readHubAgentsSource(
           "only, deliberately NOT included in the pack): " +
           `${read.cause instanceof Error ? read.cause.message : String(read.cause ?? "none")}`
       );
+      // G2: no existence claim. An unreadable parent directory means the
+      // registry's very existence is undetermined, so the reason states only
+      // what was proved: the read did not complete.
       return {
         ok: false,
         records: [],
         reason:
-          "the hub agent registry file was present but could not be used " +
-          `for a census claim (${read.reason}), so no claim is made from it`,
+          "the hub agent registry could not be used for a census claim " +
+          `(${read.reason}), so no claim is made from it`,
       };
     }
   }

@@ -109,7 +109,10 @@ export type StrictLocalAgentsRead =
   | { status: "unreadable"; reason: string; cause?: unknown };
 
 /** Fixed, host-independent unreadable classifications (safe for signed prose). */
-const UNREADABLE_IO = "the registry file exists but could not be read";
+// G2: does NOT claim the file exists. A non-ENOENT read failure (for example
+// a permission-denied parent directory) means existence itself could not be
+// determined, only that the read did not complete.
+const UNREADABLE_IO = "the registry file could not be read";
 const UNREADABLE_JSON = "the registry file is not valid JSON";
 const UNREADABLE_SHAPE =
   "the registry file does not match the persisted hub registry shape";
@@ -152,11 +155,19 @@ export function readPersistedLocalAgentsStrict(
   storagePath: string,
 ): StrictLocalAgentsRead {
   const filePath = localAgentsFilePath(storagePath);
-  if (!existsSync(filePath)) return { status: "absent" };
+  // G2 (post-#969 sweep re-gate): NO existsSync gate. `existsSync` returns
+  // false for EVERY failure, not just absence, so an unreadable parent
+  // directory (EACCES on `state/_hub`) reported "absent" and minted the
+  // definitive verified-empty census. Attempt the read and classify by errno:
+  // only a true not-there (ENOENT, or ENOTDIR when a path component is not a
+  // directory) is "absent"; every other failure is UNREADABLE and must be
+  // disclosed, never signed over.
   let raw: string;
   try {
     raw = readFileSync(filePath, "utf8");
   } catch (cause) {
+    const code = (cause as NodeJS.ErrnoException | null)?.code;
+    if (code === "ENOENT" || code === "ENOTDIR") return { status: "absent" };
     return { status: "unreadable", reason: UNREADABLE_IO, cause };
   }
   let parsed: unknown;

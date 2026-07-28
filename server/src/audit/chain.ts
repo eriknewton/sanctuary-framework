@@ -4,9 +4,28 @@ import { verify as verifyIdentitySignature } from "../core/identity.js";
 
 export const AUDIT_CHAIN_GENESIS = "GENESIS";
 export const AUDIT_CHAIN_SCHEMA_VERSION = 2;
-export const AUDIT_CHECKPOINT_SCHEMA_VERSION = 1;
 export const AUDIT_CHECKPOINT_DOMAIN = "sanctuary.audit-checkpoint.v1";
 export const AUDIT_CHECKPOINT_DOMAIN_PREFIX = `${AUDIT_CHECKPOINT_DOMAIN}\n`;
+
+// G1 (post-#969 sweep re-gate): the checkpoint record shape, its schema
+// version, the strict shape predicate, and the `_audit_checkpoints`
+// control-key constants moved to the PURE, dependency-free
+// `checkpoint-shape.ts` so the raw CLI exporter (which must not import the
+// server runtime) and the runtime audit log share ONE definition instead of
+// hand-duplicated copies that drifted. Re-exported here so existing importers
+// are unchanged.
+export {
+  AUDIT_CHECKPOINT_SCHEMA_VERSION,
+  AUDIT_CHECKPOINT_NAMESPACE_CONTROL_KEYS,
+  AUDIT_EPOCH_KEYS_KEY,
+  AUDIT_HEAD_ANCHOR_KEY,
+  isAuditCheckpointRecord,
+} from "./checkpoint-shape.js";
+export type {
+  AuditCheckpointRecord,
+  AuditCheckpointSigningPayload,
+} from "./checkpoint-shape.js";
+import type { AuditCheckpointSigningPayload } from "./checkpoint-shape.js";
 
 export interface AuditEntryHashInput {
   sequence: number;
@@ -16,29 +35,9 @@ export interface AuditEntryHashInput {
   schema_version: number;
 }
 
-export interface AuditCheckpointSigningPayload {
-  checkpoint_kind: "audit-checkpoint" | "legacy-anchor";
-  checkpoint_sequence: number;
-  from_sequence: number;
-  root_hash: string;
-  previous_checkpoint_sequence: number;
-  signed_at: string;
-}
-
 export interface AuditCheckpointSignature {
   signer_kid: string;
   signature: string;
-  public_key?: string;
-}
-
-export interface AuditCheckpointRecord extends AuditCheckpointSigningPayload {
-  schema_version: typeof AUDIT_CHECKPOINT_SCHEMA_VERSION;
-  signer_kid: string | null;
-  signature: string | null;
-  signature_algorithm: "Ed25519" | null;
-  payload_encoding: "domain-separated-canonical-json-v1";
-  unsigned: boolean;
-  unsigned_reason?: string;
   public_key?: string;
 }
 
