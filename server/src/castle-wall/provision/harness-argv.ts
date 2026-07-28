@@ -13,11 +13,20 @@
  * Hermes-related egress). v1 = headless agent runtime only; this module resolves
  * ONLY that argv, never a GUI app path.
  *
- * The runnable Hermes tree lives under `~/.hermes/hermes-agent`; after re-home
- * the LaunchDaemon needs an absolute interpreter that can import both
- * `hermes_cli` (from that source tree) and every compiled dependency in the
- * venv, otherwise launchd accepts the job but it crash-loops before a stable
- * pid exists.
+ * Preferred layout: the runnable Hermes tree lives under
+ * `~/.hermes/hermes-agent`; after re-home the LaunchDaemon needs an absolute
+ * interpreter that can import both `hermes_cli` (from that source tree) and
+ * every compiled dependency in the venv, otherwise launchd accepts the job but
+ * it crash-loops before a stable pid exists.
+ *
+ * FIX F-PIPX (Mini2 first real install 2026-07-27). Hermes's documented
+ * install path can be `pipx install hermes-agent`, which creates no
+ * `~/.hermes/hermes-agent` source tree at all. The fallback now probes the
+ * operator's pipx venv (`PIPX_HOME` / `PIPX_BIN_DIR`, default
+ * `~/.local/pipx/venvs/hermes-agent`) and accepts it only when the venv
+ * interpreter can import `hermes_cli` from its own site-packages. The launched
+ * process still gets `HOME=<agentHome>`, so secrets/config remain re-homed to
+ * the confined account while code import comes from pipx.
  *
  * FIX F-INTERP (HIGH, Mini1 confined-Hermes drill 2026-07-26). This module
  * used to hard-prefer a SYSTEM python and pair it with the venv's
@@ -58,6 +67,8 @@
  * args -- validation is the daemon module's job, not duplicated here.
  */
 
+import { dirname } from "node:path";
+
 import { harnessLaunchSpec, type HarnessLaunchSpec } from "../../egress-gate/harness-daemon.js";
 
 /** A CPython feature version, as reported by the interpreter itself. */
@@ -70,6 +81,8 @@ export interface InterpreterVersion {
 export interface HarnessArgvOps {
   /** True when `path` exists and is readable enough to resolve. Never used to decide executability. */
   pathExists(path: string): Promise<boolean>;
+  /** Resolve symlinks for a path, or `undefined` when the path cannot be resolved. */
+  realpath(path: string): Promise<string | undefined>;
   /**
    * Execute `path` AS `uid` and return the CPython feature version it reports,
    * or `undefined` when that uid cannot execute it at all (missing, not
@@ -81,6 +94,14 @@ export interface HarnessArgvOps {
    * the two can never be inferred from each other.
    */
   probeInterpreterAsUid(path: string, uid: number): Promise<InterpreterVersion | undefined>;
+  /**
+   * Execute `path` AS `uid` and prove it can import `hermes_cli` with the
+   * supplied import roots inserted into `sys.path`, returning the imported
+   * package origin on success. This is a capability probe, not an existence
+   * probe: a candidate that cannot import the package it will launch is not a
+   * candidate.
+   */
+  probeHermesCliImportAsUid(path: string, uid: number, pythonPathEntries: readonly string[]): Promise<string | undefined>;
 }
 
 /**
@@ -96,9 +117,26 @@ export interface ResolvedHarnessArgv {
   launch: HarnessLaunchSpec;
 }
 
+type PipxResolutionEnv = Readonly<{
+  PIPX_HOME?: string;
+  PIPX_BIN_DIR?: string;
+  HOME?: string;
+}>;
+
 export interface ResolveHermesGatewayArgvOptions {
   /** Dedicated account home after re-home, e.g. /var/sanctuary-agents/sanctuary-hermes. */
   agentHome: string;
+  /**
+   * The sudo operator's real home directory, used to expand pipx defaults.
+   * When omitted, pipx probing falls back to `env.HOME` and then `agentHome`.
+   */
+  operatorHome?: string;
+  /**
+   * Environment used only for pipx discovery (`PIPX_HOME`, `PIPX_BIN_DIR`,
+   * and `HOME`). Injectable so tests can use temp-dir pipx fixtures without
+   * observing the developer machine.
+   */
+  env?: PipxResolutionEnv;
   /**
    * The uid the harness LaunchDaemon will run as. Every interpreter candidate
    * is probed AS this uid, because "root can execute it" is not the question
@@ -118,16 +156,21 @@ export interface ResolveHermesGatewayArgvOptions {
  */
 export const SYSTEM_PYTHON3_CANDIDATES = ["/opt/homebrew/bin/python3", "/usr/local/bin/python3", "/usr/bin/python3"];
 
-const VENV_SITE_PACKAGES_CANDIDATES = [
-  "venv/lib/python3.14/site-packages",
-  "venv/lib/python3.13/site-packages",
-  "venv/lib/python3.12/site-packages",
-  "venv/lib/python3.11/site-packages",
-  "venv/lib/python3.10/site-packages",
+const PYTHON_SITE_PACKAGES_RELATIVES = [
+  "lib/python3.14/site-packages",
+  "lib/python3.13/site-packages",
+  "lib/python3.12/site-packages",
+  "lib/python3.11/site-packages",
+  "lib/python3.10/site-packages",
 ];
+
+const VENV_SITE_PACKAGES_CANDIDATES = PYTHON_SITE_PACKAGES_RELATIVES.map((rel) => `venv/${rel}`);
 
 /** The venv's own interpreter, relative to the re-homed Hermes runtime tree. */
 const VENV_PYTHON_RELATIVE = "venv/bin/python";
+const PIPX_HERMES_PACKAGE = "hermes-agent";
+const PIPX_HERMES_COMMAND = "hermes";
+const PIPX_VENV_PYTHON_RELATIVE = "bin/python";
 
 /**
  * The one-liner the version probe executes. `-I` (isolated) is deliberate:
@@ -139,6 +182,31 @@ const VENV_PYTHON_RELATIVE = "venv/bin/python";
 export const INTERPRETER_VERSION_PROBE_SOURCE = 'import sys; print("%d.%d" % sys.version_info[:2])';
 
 /**
+ * Render the importability probe for `hermes_cli`. The probe mutates
+ * `sys.path` inside isolated mode instead of trusting inherited PYTHONPATH,
+ * so the caller controls exactly which source tree or site-packages directory
+ * is being measured.
+ */
+export function renderHermesCliImportProbeSource(pythonPathEntries: readonly string[]): string {
+  return [
+    "import importlib.util, sys",
+    `for entry in reversed(${JSON.stringify([...pythonPathEntries])}):`,
+    "    if entry and entry not in sys.path:",
+    "        sys.path.insert(0, entry)",
+    "spec = importlib.util.find_spec('hermes_cli')",
+    "if spec is None:",
+    "    raise SystemExit(42)",
+    "origin = spec.origin or ''",
+    "if not origin:",
+    "    module = __import__('hermes_cli')",
+    "    origin = getattr(module, '__file__', '') or ''",
+    "if not origin:",
+    "    raise SystemExit(43)",
+    "print(origin)",
+  ].join("\n");
+}
+
+/**
  * Parse the `major.minor` line the probe prints. Pure + strict: anything that
  * is not exactly two non-negative integers reads as "no version" (which the
  * caller treats as "this interpreter could not be measured", fail-closed),
@@ -148,6 +216,12 @@ export function parseInterpreterVersion(stdout: string): InterpreterVersion | un
   const match = /^\s*(\d+)\.(\d+)\s*$/.exec(stdout);
   if (match === null) return undefined;
   return { major: Number(match[1]), minor: Number(match[2]) };
+}
+
+/** Parse the import probe's single absolute origin path. Any extra output fails closed. */
+export function parseHermesCliImportProbeOutput(stdout: string): string | undefined {
+  const match = /^\s*(\/[^\n\r]+)\s*$/.exec(stdout);
+  return match?.[1];
 }
 
 /**
@@ -170,8 +244,142 @@ function renderVersion(v: InterpreterVersion): string {
   return `${v.major}.${v.minor}`;
 }
 
+function stripTrailingSlashes(path: string): string {
+  return path.replace(/\/+$/, "");
+}
+
+function isPathAtOrWithin(path: string, base: string): boolean {
+  const normalizedBase = stripTrailingSlashes(base);
+  return path === normalizedBase || path.startsWith(`${normalizedBase}/`);
+}
+
+function expandHomePath(path: string, home: string): string | undefined {
+  if (path.startsWith("/")) return stripTrailingSlashes(path);
+  if (path === "~") return stripTrailingSlashes(home);
+  if (path.startsWith("~/")) return `${stripTrailingSlashes(home)}${path.slice(1)}`;
+  return undefined;
+}
+
+interface PipxCandidate {
+  readonly source: string;
+  readonly venvDir: string;
+  readonly python: string;
+}
+
+interface PipxProbePlan {
+  readonly candidates: readonly PipxCandidate[];
+  readonly probePaths: readonly string[];
+  readonly rejections: readonly string[];
+}
+
+async function buildPipxProbePlan(
+  ops: HarnessArgvOps,
+  operatorHome: string,
+  env: PipxResolutionEnv,
+): Promise<PipxProbePlan> {
+  const candidates = new Map<string, PipxCandidate>();
+  const probePaths: string[] = [];
+  const rejections: string[] = [];
+  const addVenv = (source: string, venvDir: string): void => {
+    const normalizedVenv = stripTrailingSlashes(venvDir);
+    if (!normalizedVenv.startsWith("/")) {
+      rejections.push(`${source} resolved to non-absolute pipx venv path ${normalizedVenv}`);
+      return;
+    }
+    if (candidates.has(normalizedVenv)) return;
+    const python = `${normalizedVenv}/${PIPX_VENV_PYTHON_RELATIVE}`;
+    candidates.set(normalizedVenv, { source, venvDir: normalizedVenv, python });
+    probePaths.push(python);
+  };
+
+  const home = stripTrailingSlashes(operatorHome);
+  const pipxHomeSource = env.PIPX_HOME === undefined ? "default PIPX_HOME" : "PIPX_HOME";
+  const pipxHome =
+    env.PIPX_HOME === undefined
+      ? `${home}/.local/pipx`
+      : expandHomePath(env.PIPX_HOME, home);
+  if (pipxHome === undefined) {
+    rejections.push(`PIPX_HOME=${env.PIPX_HOME} is not an absolute or home-relative path`);
+  } else {
+    addVenv(`${pipxHomeSource} (${pipxHome})`, `${pipxHome}/venvs/${PIPX_HERMES_PACKAGE}`);
+  }
+
+  if (env.PIPX_BIN_DIR !== undefined) {
+    const pipxBinDir = expandHomePath(env.PIPX_BIN_DIR, home);
+    if (pipxBinDir === undefined) {
+      rejections.push(`PIPX_BIN_DIR=${env.PIPX_BIN_DIR} is not an absolute or home-relative path`);
+    } else {
+      const commandPath = `${pipxBinDir}/${PIPX_HERMES_COMMAND}`;
+      probePaths.push(commandPath);
+      const resolvedCommand = await ops.realpath(commandPath);
+      if (resolvedCommand === undefined) {
+        rejections.push(`${commandPath} did not resolve to a pipx command`);
+      } else if (resolvedCommand.endsWith(`/${PIPX_VENV_PYTHON_RELATIVE.replace("python", PIPX_HERMES_COMMAND)}`)) {
+        addVenv(`PIPX_BIN_DIR command (${commandPath} -> ${resolvedCommand})`, dirname(dirname(resolvedCommand)));
+      } else {
+        rejections.push(`${commandPath} resolved to ${resolvedCommand}, not a pipx venv command`);
+      }
+    }
+  }
+
+  return { candidates: [...candidates.values()], probePaths, rejections };
+}
+
+async function resolvePipxHermesRuntime(
+  ops: HarnessArgvOps,
+  input: {
+    agentHome: string;
+    agentUid: number;
+    operatorHome: string;
+    env: PipxResolutionEnv;
+  },
+): Promise<
+  | { resolved: ResolvedHarnessArgv; probePaths: readonly string[] }
+  | { resolved?: undefined; probePaths: readonly string[]; rejections: readonly string[] }
+> {
+  const plan = await buildPipxProbePlan(ops, input.operatorHome, input.env);
+  const pipxRejections = [...plan.rejections];
+  const probePaths = [...plan.probePaths];
+  for (const candidate of plan.candidates) {
+    const version = await ops.probeInterpreterAsUid(candidate.python, input.agentUid);
+    if (version === undefined) {
+      pipxRejections.push(`${candidate.python} (${candidate.source}) could not be executed as uid ${input.agentUid}`);
+      continue;
+    }
+    const sitePackages = `${candidate.venvDir}/lib/python${renderVersion(version)}/site-packages`;
+    probePaths.push(sitePackages);
+    const importOrigin = await ops.probeHermesCliImportAsUid(candidate.python, input.agentUid, [sitePackages]);
+    if (importOrigin === undefined) {
+      pipxRejections.push(`${candidate.python} could not import hermes_cli from ${sitePackages}`);
+      continue;
+    }
+    if (!isPathAtOrWithin(importOrigin, `${sitePackages}/hermes_cli`)) {
+      pipxRejections.push(
+        `${candidate.python} imported hermes_cli from ${importOrigin}, not from the pipx site-packages at ${sitePackages}`,
+      );
+      continue;
+    }
+    return {
+      resolved: {
+        harnessId: "hermes",
+        launch: harnessLaunchSpec({
+          programArguments: [candidate.python, "-m", "hermes_cli.main", "gateway", "run", "--accept-hooks"],
+          environment: {
+            HERMES_ACCEPT_HOOKS: "1",
+            HOME: input.agentHome,
+            PYTHONPATH: sitePackages,
+          },
+        }),
+      },
+      probePaths,
+    };
+  }
+  return { probePaths, rejections: pipxRejections };
+}
+
 /**
- * Resolve the Hermes gateway's absolute argv from the re-homed runtime tree.
+ * Resolve the Hermes gateway's absolute argv from the re-homed runtime tree,
+ * falling back to the operator's pipx hermes-agent venv.
  *
  * Preference order, each step a measurement:
  *   1. the venv's OWN interpreter, when the agent uid can execute it. It is
@@ -179,6 +387,8 @@ function renderVersion(v: InterpreterVersion): string {
  *      is the only branch that needs no version reasoning.
  *   2. a system interpreter whose self-reported version EQUALS the venv
  *      site-packages version, paired with those site-packages on PYTHONPATH.
+ *   3. a pipx venv interpreter whose own site-packages can import
+ *      `hermes_cli`.
  *
  * Fail closed (throws) when neither holds: a guessed interpreter may bootstrap
  * cleanly under launchd and then crash-loop, which is exactly the failure this
@@ -198,94 +408,126 @@ export async function resolveHermesGatewayArgv(
   const agentHome = options.agentHome.replace(/\/+$/, "");
   const hermesAgentDir = `${agentHome}/.hermes/hermes-agent`;
   const mainModule = `${hermesAgentDir}/hermes_cli/main.py`;
-  if (!(await ops.pathExists(mainModule))) {
-    throw new Error(
-      `Could not resolve the re-homed Hermes runtime for the gateway (checked ${mainModule}). ` +
-        "Refusing to install the harness daemon with a guessed global python/module path.",
-    );
-  }
+  const rehomedLayout = `${mainModule} plus ${hermesAgentDir}/${VENV_PYTHON_RELATIVE}`;
 
   // Why each rejected candidate was rejected, so a refusal names the actual
   // host condition instead of a generic "could not resolve".
   const rejections: string[] = [];
-
-  // 1. The venv's own interpreter, IF the agent uid can run it. Capability,
-  //    not existence: the pre-fix code assumed this was unreachable and never
-  //    checked, which is the whole of F-INTERP.
+  const rehomedRuntimePresent = await ops.pathExists(mainModule);
   const venvPython = `${hermesAgentDir}/${VENV_PYTHON_RELATIVE}`;
-  const venvVersion = await ops.probeInterpreterAsUid(venvPython, agentUid);
-  if (venvVersion !== undefined) {
-    return {
-      harnessId: "hermes",
-      launch: harnessLaunchSpec({
-        programArguments: [venvPython, "-m", "hermes_cli.main", "gateway", "run", "--accept-hooks"],
-        // The venv interpreter puts its OWN site-packages on sys.path, so
-        // PYTHONPATH carries only the source tree `hermes_cli` lives in.
-        environment: {
-          HERMES_ACCEPT_HOOKS: "1",
-          HOME: agentHome,
-          PYTHONPATH: hermesAgentDir,
-        },
-      }),
-    };
-  }
-  rejections.push(`${venvPython} could not be executed as uid ${agentUid}`);
 
-  // 2. A system interpreter, but ONLY one whose ABI matches the venv it would
-  //    be pointed at.
-  const sitePackages = await firstExisting(
-    ops,
-    VENV_SITE_PACKAGES_CANDIDATES.map((rel) => `${hermesAgentDir}/${rel}`),
-  );
-  if (sitePackages === undefined) {
-    throw new Error(
-      `Could not resolve an interpreter for the Hermes gateway: the venv interpreter is not executable by the ` +
-        `agent uid (${rejections.join("; ")}) and no re-homed site-packages directory exists under ` +
-        `${hermesAgentDir}/venv/lib. Refusing to install the harness daemon with a guessed global python/module path. ` +
-        `Repair the re-homed Hermes runtime (reinstall Hermes as the operator, then re-run 'sudo sanctuary protect --hermes').`,
-    );
-  }
-  const requiredVersion = parseVenvSitePackagesVersion(sitePackages);
-  if (requiredVersion === undefined) {
-    // Unreachable through VENV_SITE_PACKAGES_CANDIDATES, kept as a fail-closed
-    // guard: an unparseable site-packages path means the ABI is UNKNOWN, and
-    // an unknown ABI must never be paired with a system interpreter.
-    throw new Error(
-      `Could not determine the CPython ABI of the re-homed site-packages at ${sitePackages}; ` +
-        "refusing to pair it with a system interpreter (an ABI mismatch crash-loops the harness under launchd).",
-    );
-  }
-  for (const candidate of SYSTEM_PYTHON3_CANDIDATES) {
-    const version = await ops.probeInterpreterAsUid(candidate, agentUid);
-    if (version === undefined) {
-      rejections.push(`${candidate} could not be executed as uid ${agentUid}`);
-      continue;
-    }
-    if (!sameVersion(version, requiredVersion)) {
+  if (rehomedRuntimePresent) {
+    // 1. The venv's own interpreter, IF the agent uid can run it and import
+    //    `hermes_cli` from the re-homed source tree. Capability, not
+    //    existence: the pre-fix code assumed this was unreachable and never
+    //    checked, which is the whole of F-INTERP.
+    const venvVersion = await ops.probeInterpreterAsUid(venvPython, agentUid);
+    if (venvVersion !== undefined) {
+      const importOrigin = await ops.probeHermesCliImportAsUid(venvPython, agentUid, [hermesAgentDir]);
+      if (importOrigin !== undefined && isPathAtOrWithin(importOrigin, `${hermesAgentDir}/hermes_cli`)) {
+        return {
+          harnessId: "hermes",
+          launch: harnessLaunchSpec({
+            programArguments: [venvPython, "-m", "hermes_cli.main", "gateway", "run", "--accept-hooks"],
+            // The venv interpreter puts its OWN site-packages on sys.path, so
+            // PYTHONPATH carries only the source tree `hermes_cli` lives in.
+            environment: {
+              HERMES_ACCEPT_HOOKS: "1",
+              HOME: agentHome,
+              PYTHONPATH: hermesAgentDir,
+            },
+          }),
+        };
+      }
       rejections.push(
-        `${candidate} is Python ${renderVersion(version)} but the re-homed site-packages at ${sitePackages} ` +
-          `are Python ${renderVersion(requiredVersion)} (C-extension ABI mismatch)`,
+        importOrigin === undefined
+          ? `${venvPython} could not import hermes_cli from ${hermesAgentDir}`
+          : `${venvPython} imported hermes_cli from ${importOrigin}, not from ${hermesAgentDir}/hermes_cli`,
       );
-      continue;
+    } else {
+      rejections.push(`${venvPython} could not be executed as uid ${agentUid}`);
     }
-    return {
-      harnessId: "hermes",
-      launch: harnessLaunchSpec({
-        programArguments: [candidate, "-m", "hermes_cli.main", "gateway", "run", "--accept-hooks"],
-        environment: {
-          HERMES_ACCEPT_HOOKS: "1",
-          HOME: agentHome,
-          PYTHONPATH: `${hermesAgentDir}:${sitePackages}`,
-        },
-      }),
-    };
+
+    // 2. A system interpreter, but ONLY one whose ABI matches the venv it
+    //    would be pointed at and can import `hermes_cli` from this runtime.
+    const sitePackages = await firstExisting(
+      ops,
+      VENV_SITE_PACKAGES_CANDIDATES.map((rel) => `${hermesAgentDir}/${rel}`),
+    );
+    if (sitePackages === undefined) {
+      rejections.push(`no re-homed site-packages directory exists under ${hermesAgentDir}/venv/lib`);
+    } else {
+      const requiredVersion = parseVenvSitePackagesVersion(sitePackages);
+      if (requiredVersion === undefined) {
+        // Unreachable through VENV_SITE_PACKAGES_CANDIDATES, kept as a
+        // fail-closed guard: an unparseable site-packages path means the ABI
+        // is UNKNOWN, and an unknown ABI must never be paired with a system
+        // interpreter.
+        rejections.push(
+          `could not determine the CPython ABI of the re-homed site-packages at ${sitePackages}; ` +
+            "refusing to pair it with a system interpreter",
+        );
+      } else {
+        for (const candidate of SYSTEM_PYTHON3_CANDIDATES) {
+          const version = await ops.probeInterpreterAsUid(candidate, agentUid);
+          if (version === undefined) {
+            rejections.push(`${candidate} could not be executed as uid ${agentUid}`);
+            continue;
+          }
+          if (!sameVersion(version, requiredVersion)) {
+            rejections.push(
+              `${candidate} is Python ${renderVersion(version)} but the re-homed site-packages at ${sitePackages} ` +
+                `are Python ${renderVersion(requiredVersion)} (C-extension ABI mismatch)`,
+            );
+            continue;
+          }
+          const importOrigin = await ops.probeHermesCliImportAsUid(candidate, agentUid, [
+            hermesAgentDir,
+            sitePackages,
+          ]);
+          if (importOrigin === undefined) {
+            rejections.push(`${candidate} could not import hermes_cli from ${hermesAgentDir}:${sitePackages}`);
+            continue;
+          }
+          if (!isPathAtOrWithin(importOrigin, `${hermesAgentDir}/hermes_cli`)) {
+            rejections.push(
+              `${candidate} imported hermes_cli from ${importOrigin}, not from ${hermesAgentDir}/hermes_cli`,
+            );
+            continue;
+          }
+          return {
+            harnessId: "hermes",
+            launch: harnessLaunchSpec({
+              programArguments: [candidate, "-m", "hermes_cli.main", "gateway", "run", "--accept-hooks"],
+              environment: {
+                HERMES_ACCEPT_HOOKS: "1",
+                HOME: agentHome,
+                PYTHONPATH: `${hermesAgentDir}:${sitePackages}`,
+              },
+            }),
+          };
+        }
+      }
+    }
+  } else {
+    rejections.push(`re-homed Hermes runtime entrypoint not found at ${mainModule}`);
   }
+
+  const env = options.env ?? process.env;
+  const operatorHome = stripTrailingSlashes(options.operatorHome ?? env.HOME ?? agentHome);
+  const pipx = await resolvePipxHermesRuntime(ops, { agentHome, agentUid, operatorHome, env });
+  if (pipx.resolved !== undefined) return pipx.resolved;
+  rejections.push(...pipx.rejections);
+
   throw new Error(
-    `No interpreter usable by the confined Hermes gateway could be resolved as uid ${agentUid}: ` +
-      `${rejections.join("; ")}. Refusing to install the harness daemon with an interpreter that would ` +
-      `crash-loop under launchd. Fix: install a Python ${renderVersion(requiredVersion)} interpreter the agent uid ` +
-      `can execute, or reinstall Hermes as the operator so its venv interpreter is re-homed onto the account, ` +
-      `then re-run 'sudo sanctuary protect --hermes'.`,
+    `No Hermes gateway runtime usable by uid ${agentUid} could be resolved. Acceptable layouts: ` +
+      `re-homed runtime (${rehomedLayout}); pipx runtime (` +
+      `${operatorHome}/.local/pipx/venvs/${PIPX_HERMES_PACKAGE}/${PIPX_VENV_PYTHON_RELATIVE} or ` +
+      `PIPX_HOME/venvs/${PIPX_HERMES_PACKAGE}/${PIPX_VENV_PYTHON_RELATIVE}, with hermes_cli importable from ` +
+      `that venv's site-packages). Pipx probe paths tried: ${pipx.probePaths.join(", ") || "(none)"}. ` +
+      `Rejections: ${rejections.join("; ")}. Refusing to install the harness daemon with a guessed global ` +
+      `python/module path. Repair the re-homed Hermes runtime or install Hermes with pipx, then re-run ` +
+      `'sudo sanctuary protect --hermes'.`,
   );
 }
 
@@ -313,6 +555,28 @@ export function interpreterVersionProbeArgv(uid: number, interpreterPath: string
   return {
     file: "/usr/bin/sudo",
     args: ["-n", "-u", `#${uid}`, interpreterPath, "-I", "-c", INTERPRETER_VERSION_PROBE_SOURCE],
+  };
+}
+
+/**
+ * The argv for one as-uid `hermes_cli` importability probe. Pure + exported
+ * so tests can pin that this probe stays isolated and uid-scoped like the
+ * version probe.
+ */
+export function hermesCliImportProbeArgv(
+  uid: number,
+  interpreterPath: string,
+  pythonPathEntries: readonly string[],
+): { file: string; args: string[] } {
+  if (!Number.isSafeInteger(uid) || uid <= 0) {
+    throw new Error(`as-uid hermes_cli import probe requires a positive integer uid, got ${String(uid)}`);
+  }
+  if (!interpreterPath.startsWith("/")) {
+    throw new Error(`as-uid hermes_cli import probe requires an absolute interpreter path, got ${interpreterPath}`);
+  }
+  return {
+    file: "/usr/bin/sudo",
+    args: ["-n", "-u", `#${uid}`, interpreterPath, "-I", "-c", renderHermesCliImportProbeSource(pythonPathEntries)],
   };
 }
 
@@ -524,6 +788,14 @@ export function realHarnessArgvOps(): HarnessArgvOps {
         return false;
       }
     },
+    realpath: async (path) => {
+      const { realpath } = await import("node:fs/promises");
+      try {
+        return await realpath(path);
+      } catch {
+        return undefined;
+      }
+    },
     probeInterpreterAsUid: async (path, uid) => {
       let argv: { file: string; args: string[] };
       try {
@@ -538,6 +810,17 @@ export function realHarnessArgvOps(): HarnessArgvOps {
       const stdout = await runInterpreterProbeBounded(argv, INTERPRETER_PROBE_TIMEOUT_MS);
       if (stdout === undefined) return undefined;
       return parseInterpreterVersion(stdout);
+    },
+    probeHermesCliImportAsUid: async (path, uid, pythonPathEntries) => {
+      let argv: { file: string; args: string[] };
+      try {
+        argv = hermesCliImportProbeArgv(uid, path, pythonPathEntries);
+      } catch {
+        return undefined;
+      }
+      const stdout = await runInterpreterProbeBounded(argv, INTERPRETER_PROBE_TIMEOUT_MS);
+      if (stdout === undefined) return undefined;
+      return parseHermesCliImportProbeOutput(stdout);
     },
   };
 }

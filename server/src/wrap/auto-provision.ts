@@ -1366,6 +1366,7 @@ export async function runAutoProvisionForWrap(
         const resolved = await resolveHermesGatewayArgv(realHarnessArgvOps(), {
           agentHome: newAccountHome,
           agentUid: uid,
+          operatorHome,
         });
         const harnessLogDir = resolveHarnessDaemonLogDir(newAccountHome);
         await mkdir(harnessLogDir, { recursive: true, mode: 0o700 });
@@ -3163,6 +3164,7 @@ export async function runEgressGateRepairForCli(options: {
     const resolved = await resolveHermesGatewayArgv(realHarnessArgvOps(), {
       agentHome: newAccountHome,
       agentUid,
+      operatorHome: operatorIdentity.home,
     });
     harnessLaunch = resolved.launch;
   } catch (err) {
@@ -3411,6 +3413,7 @@ export async function runEgressGateUnprotectForCli(options: {
     const resolved = await resolveHermesGatewayArgv(realHarnessArgvOps(), {
       agentHome: newAccountHome,
       agentUid,
+      operatorHome: operatorIdentity.home,
     });
     harnessLaunch = resolved.launch;
   } catch (err) {

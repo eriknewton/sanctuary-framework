@@ -99,20 +99,12 @@ const HERMES_LITERAL_CLASSIFICATIONS: readonly HermesLiteralClassification[] = [
     reason: "the provisioning orchestrator is reached from the Hermes-gated auto-provision path",
   },
   {
-    // FIX F-INTERP (2026-07-26): both refusals name the Hermes reinstall +
-    // re-protect path, because the fault is a re-homed Hermes runtime whose
-    // interpreter the agent uid cannot use.
+    // FIX F-PIPX (2026-07-27): the Hermes runtime resolver accepts either
+    // the legacy re-homed tree or a measured pipx install, so the remaining
+    // command literal is still Hermes-scoped by construction.
     file: "server/src/castle-wall/provision/harness-argv.ts",
     scope: "resolveHermesGatewayArgv",
-    snippet: "Repair the re-homed Hermes runtime (reinstall Hermes as the operator, then re-run 'sudo sanctuary protect --hermes').",
-    exact: true,
-    expectedCount: 1,
-    reason: "harness-argv resolves ONLY the Hermes gateway; its refusals are Hermes-scoped by construction",
-  },
-  {
-    file: "server/src/castle-wall/provision/harness-argv.ts",
-    scope: "resolveHermesGatewayArgv",
-    snippet: "then re-run 'sudo sanctuary protect --hermes'.",
+    snippet: "'sudo sanctuary protect --hermes'.",
     exact: true,
     expectedCount: 1,
     reason: "harness-argv resolves ONLY the Hermes gateway; its refusals are Hermes-scoped by construction",

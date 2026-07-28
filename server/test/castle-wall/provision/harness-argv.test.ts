@@ -12,18 +12,32 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync, chmodSync, existsSync } from "node:fs";
+import {
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  symlinkSync,
+  realpathSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+import { execFileSync } from "node:child_process";
 
 import {
   resolveHermesGatewayArgv,
   interpreterVersionProbeArgv,
+  hermesCliImportProbeArgv,
   parseInterpreterVersion,
+  parseHermesCliImportProbeOutput,
   parseVenvSitePackagesVersion,
   runInterpreterProbeBounded,
   INTERPRETER_VERSION_PROBE_SOURCE,
+  renderHermesCliImportProbeSource,
   type HarnessArgvOps,
   type InterpreterVersion,
 } from "../../../src/castle-wall/provision/harness-argv.js";
@@ -48,9 +62,96 @@ function mockOps(
 ): HarnessArgvOps {
   return {
     pathExists: async (path) => existing.has(path),
+    realpath: async () => undefined,
     probeInterpreterAsUid: async (path, uid) =>
       uid === AGENT_UID ? runnableAsAgent[path] : undefined,
+    probeHermesCliImportAsUid: async (path, uid, pythonPathEntries) => {
+      if (uid !== AGENT_UID || runnableAsAgent[path] === undefined) return undefined;
+      for (const entry of pythonPathEntries) {
+        if (entry === hermesAgentDir && existing.has(mainModule)) {
+          return `${hermesAgentDir}/hermes_cli/__init__.py`;
+        }
+        if (existing.has(`${entry}/hermes_cli/__init__.py`)) {
+          return `${entry}/hermes_cli/__init__.py`;
+        }
+        if (existing.has(`${entry}/hermes_cli/main.py`)) {
+          return `${entry}/hermes_cli/main.py`;
+        }
+      }
+      return undefined;
+    },
   };
+}
+
+function fixturePythonPath(): string {
+  const stdout = execFileSync(
+    "/usr/bin/env",
+    ["python3", "-I", "-c", "import os, sys; print(os.path.realpath(sys.executable))"],
+    { encoding: "utf8" },
+  );
+  const python = stdout.trim();
+  if (!python.startsWith("/")) throw new Error(`fixture python path is not absolute: ${python}`);
+  return python;
+}
+
+function fixturePythonVersion(python: string): InterpreterVersion {
+  const stdout = execFileSync(python, ["-I", "-c", INTERPRETER_VERSION_PROBE_SOURCE], { encoding: "utf8" });
+  const version = parseInterpreterVersion(stdout);
+  if (version === undefined) throw new Error(`fixture python did not report a parseable version: ${stdout}`);
+  return version;
+}
+
+function tempFixtureOps(): HarnessArgvOps {
+  return {
+    pathExists: async (path) => existsSync(path),
+    realpath: async (path) => {
+      try {
+        return realpathSync(path);
+      } catch {
+        return undefined;
+      }
+    },
+    probeInterpreterAsUid: async (path, uid) => {
+      if (uid !== AGENT_UID) return undefined;
+      const stdout = await runInterpreterProbeBounded(
+        { file: path, args: ["-I", "-c", INTERPRETER_VERSION_PROBE_SOURCE] },
+        5_000,
+      );
+      if (stdout === undefined) return undefined;
+      return parseInterpreterVersion(stdout);
+    },
+    probeHermesCliImportAsUid: async (path, uid, pythonPathEntries) => {
+      if (uid !== AGENT_UID) return undefined;
+      const stdout = await runInterpreterProbeBounded(
+        { file: path, args: ["-I", "-c", renderHermesCliImportProbeSource(pythonPathEntries)] },
+        5_000,
+      );
+      if (stdout === undefined) return undefined;
+      return parseHermesCliImportProbeOutput(stdout);
+    },
+  };
+}
+
+function writePipxHermesFixture(input: {
+  venvDir: string;
+  python: string;
+  withHermesCli: boolean;
+}): { venvPython: string; sitePackages: string } {
+  const version = fixturePythonVersion(input.python);
+  const binDir = join(input.venvDir, "bin");
+  const sitePackages = join(input.venvDir, "lib", `python${version.major}.${version.minor}`, "site-packages");
+  mkdirSync(binDir, { recursive: true });
+  mkdirSync(sitePackages, { recursive: true });
+  const venvPythonPath = join(binDir, "python");
+  symlinkSync(input.python, venvPythonPath);
+  writeFileSync(join(binDir, "hermes"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+  if (input.withHermesCli) {
+    const packageDir = join(sitePackages, "hermes_cli");
+    mkdirSync(packageDir, { recursive: true });
+    writeFileSync(join(packageDir, "__init__.py"), "");
+    writeFileSync(join(packageDir, "main.py"), "def main():\n    return None\n");
+  }
+  return { venvPython: venvPythonPath, sitePackages };
 }
 
 describe("castle-wall/provision/harness-argv", () => {
@@ -127,10 +228,15 @@ describe("castle-wall/provision/harness-argv", () => {
       const seen: Array<{ path: string; uid: number }> = [];
       const ops: HarnessArgvOps = {
         pathExists: async (path) => new Set([mainModule, sitePackages, venvPython]).has(path),
+        realpath: async () => undefined,
         probeInterpreterAsUid: async (path, uid) => {
           seen.push({ path, uid });
           return path === venvPython ? { major: 3, minor: 11 } : undefined;
         },
+        probeHermesCliImportAsUid: async (path, uid, pythonPathEntries) =>
+          path === venvPython && uid === AGENT_UID && pythonPathEntries.includes(hermesAgentDir)
+            ? `${hermesAgentDir}/hermes_cli/__init__.py`
+            : undefined,
       };
       await resolveHermesGatewayArgv(ops, { agentHome, agentUid: AGENT_UID });
       expect(seen).toEqual([{ path: venvPython, uid: AGENT_UID }]);
@@ -196,6 +302,104 @@ describe("castle-wall/provision/harness-argv", () => {
     });
   });
 
+  describe("pipx Hermes runtime fallback", () => {
+    it("REGRESSION: resolves a standard pipx hermes-agent venv when the re-homed source tree is absent", async () => {
+      const root = mkdtempSync(join(tmpdir(), "pipx-hermes-default-"));
+      try {
+        const operatorHome = join(root, "operator");
+        const pipxVenv = join(operatorHome, ".local", "pipx", "venvs", "hermes-agent");
+        const fixture = writePipxHermesFixture({
+          venvDir: pipxVenv,
+          python: fixturePythonPath(),
+          withHermesCli: true,
+        });
+
+        const resolved = await resolveHermesGatewayArgv(tempFixtureOps(), {
+          agentHome,
+          agentUid: AGENT_UID,
+          operatorHome,
+          env: {},
+        });
+
+        expect(resolved.harnessId).toBe("hermes");
+        expect(resolved.launch.programArguments).toEqual([
+          fixture.venvPython,
+          "-m",
+          "hermes_cli.main",
+          "gateway",
+          "run",
+          "--accept-hooks",
+        ]);
+        expect(resolved.launch.environment).toEqual({
+          HERMES_ACCEPT_HOOKS: "1",
+          HOME: agentHome,
+          PYTHONPATH: fixture.sitePackages,
+        });
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    }, 20_000);
+
+    it("respects PIPX_BIN_DIR by following the hermes command symlink back to its pipx venv", async () => {
+      const root = mkdtempSync(join(tmpdir(), "pipx-hermes-bindir-"));
+      try {
+        const operatorHome = join(root, "operator");
+        const pipxVenv = join(root, "custom-pipx-store", "venvs", "hermes-agent");
+        const fixture = writePipxHermesFixture({
+          venvDir: pipxVenv,
+          python: fixturePythonPath(),
+          withHermesCli: true,
+        });
+        const binDir = join(root, "custom-bin");
+        mkdirSync(binDir, { recursive: true });
+        symlinkSync(join(pipxVenv, "bin", "hermes"), join(binDir, "hermes"));
+
+        const resolved = await resolveHermesGatewayArgv(tempFixtureOps(), {
+          agentHome,
+          agentUid: AGENT_UID,
+          operatorHome,
+          env: { PIPX_HOME: join(root, "empty-pipx-home"), PIPX_BIN_DIR: binDir },
+        });
+
+        const canonicalVenv = dirname(dirname(realpathSync(join(binDir, "hermes"))));
+        expect(resolved.launch.programArguments[0]).toBe(join(canonicalVenv, "bin", "python"));
+        expect(resolved.launch.environment.PYTHONPATH).toBe(
+          join(canonicalVenv, "lib", dirname(fixture.sitePackages).split("/").pop()!, "site-packages"),
+        );
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    }, 20_000);
+
+    it("fail-closed: a pipx venv without importable hermes_cli does not resolve on layout existence alone", async () => {
+      const root = mkdtempSync(join(tmpdir(), "pipx-hermes-no-import-"));
+      try {
+        const operatorHome = join(root, "operator");
+        const pipxVenv = join(operatorHome, ".local", "pipx", "venvs", "hermes-agent");
+        const fixture = writePipxHermesFixture({
+          venvDir: pipxVenv,
+          python: fixturePythonPath(),
+          withHermesCli: false,
+        });
+
+        await expect(
+          resolveHermesGatewayArgv(tempFixtureOps(), {
+            agentHome,
+            agentUid: AGENT_UID,
+            operatorHome,
+            env: {},
+          }),
+        ).rejects.toThrow(
+          new RegExp(
+            `Acceptable layouts: .*re-homed runtime .*pipx runtime .*Pipx probe paths tried: .*${fixture.venvPython.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}.*${fixture.sitePackages.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}.*could not import hermes_cli`,
+          ),
+        );
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    }, 20_000);
+  });
+
   describe("the as-uid probe surface", () => {
     it("builds a sudo -n -u '#uid' argv running the interpreter in isolated mode", () => {
       const { file, args } = interpreterVersionProbeArgv(503, "/opt/homebrew/bin/python3");
@@ -211,6 +415,14 @@ describe("castle-wall/provision/harness-argv", () => {
       ]);
     });
 
+    it("builds a sudo -n -u '#uid' argv for the hermes_cli import probe in isolated mode", () => {
+      const { file, args } = hermesCliImportProbeArgv(503, "/opt/homebrew/bin/python3", ["/opt/hermes"]);
+      expect(file).toBe("/usr/bin/sudo");
+      expect(args.slice(0, 6)).toEqual(["-n", "-u", "#503", "/opt/homebrew/bin/python3", "-I", "-c"]);
+      expect(args[6]).toContain("find_spec('hermes_cli')");
+      expect(args[6]).toContain('"/opt/hermes"');
+    });
+
     it("refuses a non-positive uid or a relative interpreter path", () => {
       expect(() => interpreterVersionProbeArgv(0, "/usr/bin/python3")).toThrow(/positive integer uid/);
       expect(() => interpreterVersionProbeArgv(503, "python3")).toThrow(/absolute interpreter path/);
@@ -222,6 +434,14 @@ describe("castle-wall/provision/harness-argv", () => {
       expect(parseInterpreterVersion("Python 3.11.15")).toBeUndefined();
       expect(parseInterpreterVersion("3.11\nwarning: something")).toBeUndefined();
       expect(parseInterpreterVersion("")).toBeUndefined();
+    });
+
+    it("parses only a single absolute hermes_cli origin line", () => {
+      expect(parseHermesCliImportProbeOutput("/x/site-packages/hermes_cli/__init__.py\n")).toBe(
+        "/x/site-packages/hermes_cli/__init__.py",
+      );
+      expect(parseHermesCliImportProbeOutput("relative/hermes_cli/__init__.py\n")).toBeUndefined();
+      expect(parseHermesCliImportProbeOutput("/x/hermes_cli/__init__.py\nwarning")).toBeUndefined();
     });
 
     it("reads the ABI version out of a venv site-packages path", () => {
