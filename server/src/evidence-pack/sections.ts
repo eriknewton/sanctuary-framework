@@ -1503,7 +1503,13 @@ function renderVerification(
         "```",
         "",
         "The export carries encrypted payload bytes only (no plaintext content " +
-          "is exposed)." +
+          "is exposed). Scope of that offline check: the verifier recomputes " +
+          "entry hashes, chain linkage, and checkpoint signatures, and checks " +
+          "rotation anchors for shape and linkage ONLY. A rotation anchor's " +
+          "authenticity MAC is keyed by the fortress custody key, so the " +
+          "offline tool cannot and does not prove anchor authenticity; the " +
+          "exported anchor carries its mac field so the fortress runtime, " +
+          "which holds that key, can check it." +
           // D11-2: this file spans the whole retained log, so a reader
           // comparing its record count against the in-quarter totals stated
           // elsewhere would otherwise conclude the report understates.

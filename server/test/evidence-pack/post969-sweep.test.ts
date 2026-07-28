@@ -75,7 +75,13 @@ import {
   type AuditReadData,
   type BuildEvidencePackDeps,
 } from "../../src/evidence-pack/generate.js";
-import { populated, type ReadOutcome } from "../../src/evidence-pack/read-outcome.js";
+import {
+  emptyVerified,
+  populated,
+  type ReadOutcome,
+} from "../../src/evidence-pack/read-outcome.js";
+import { verifyAuditChainContent } from "../../src/cli/audit-chain-verify.js";
+import { toBase64url } from "../../src/core/encoding.js";
 import type {
   EvidencePack,
   EvidencePackInput,
@@ -467,6 +473,124 @@ describe("F-2: a parse-valid but shape-invalid audit checkpoint is counted and f
 
     const out = await gatherDiscreteExports(f.storage, f.key, "fortress-1", GEN_AT);
     expect(out.audit_chain.status).toBe("populated");
+  });
+});
+
+// ── R3: rotation anchors need the runtime's SHAPE (incl. mac), and the ───────
+// ── offline verifier is honest about what it does not prove ──────────────────
+
+describe("R3: a mac-less rotation anchor is counted corrupt, and the exported anchor carries its mac", () => {
+  const enc = new TextEncoder();
+  const GEN_AT = "2026-07-27T00:00:00.000Z";
+  const MARKER = "__sanctuary_audit_rotation_anchor_v1";
+
+  async function freshFortress() {
+    const root = await tmpDir("sanctuary-post969-r3-");
+    const statePath = join(root, "state");
+    const storage = new FilesystemStorage(statePath);
+    const key = generateRandomKey();
+    return { root, statePath, storage, key };
+  }
+
+  function collectExport() {
+    const chunks: string[] = [];
+    const sink = new Writable({
+      write(chunk, _enc2, cb) {
+        chunks.push(String(chunk));
+        cb();
+      },
+    });
+    return { chunks, sink };
+  }
+
+  // FAIL-WITHOUT-FIX (R3, Codex): the exporter's local anchor guard required
+  // marker + data only, NO mac, while the runtime requires and MAC-verifies
+  // mac. A forged mac-less anchor consistent with a truncated suffix was
+  // rejected by the runtime yet exported UNSKIPPED, and the standalone
+  // verifier (linkage-only) could PASS it end to end.
+  it("Codex repro: a forged marker+data anchor with no mac is counted skipped and forces read_failed", async () => {
+    const f = await freshFortress();
+    await f.storage.write(
+      AUDIT_EXPORT_CHECKPOINT_NAMESPACE,
+      "__rotation_anchor",
+      enc.encode(
+        JSON.stringify({
+          [MARKER]: true,
+          data: { base_sequence: 5, base_prev_hash: "f".repeat(64) },
+        })
+      )
+    );
+    const { chunks, sink } = collectExport();
+    const summary = await exportAuditChain(f.storage, sink);
+    expect(summary.checkpointsListed).toBe(1);
+    expect(summary.checkpointsExported).toBe(0);
+    expect(summary.checkpointsSkipped).toBe(1);
+    // The forged anchor shipped zero export bytes.
+    expect(chunks.join("")).toBe("");
+
+    const out = await gatherDiscreteExports(f.storage, f.key, "fortress-1", GEN_AT);
+    expect(out.audit_chain.status).toBe("read_failed");
+  });
+
+  it("a shape-complete anchor exports WITH its mac, so a key-holding verifier can check authenticity", async () => {
+    const f = await freshFortress();
+    // Fixture mirrors the runtime writer's envelope byte layout (marker +
+    // data + unpadded-base64url mac); authenticity is deliberately NOT the
+    // exporter's claim, so any well-formed mac exercises the path.
+    const mac = toBase64url(new Uint8Array(32).fill(7));
+    await f.storage.write(
+      AUDIT_EXPORT_CHECKPOINT_NAMESPACE,
+      "__rotation_anchor",
+      enc.encode(
+        JSON.stringify({
+          [MARKER]: true,
+          data: { base_sequence: 5, base_prev_hash: "f".repeat(64) },
+          mac,
+        })
+      )
+    );
+    const { chunks, sink } = collectExport();
+    const summary = await exportAuditChain(f.storage, sink);
+    expect(summary.checkpointsExported).toBe(1);
+    expect(summary.checkpointsSkipped).toBe(0);
+    const record = JSON.parse(chunks.join("").trim());
+    expect(record.type).toBe("rotation_anchor");
+    expect(record.mac).toBe(mac);
+
+    // The standalone verifier parses the mac-bearing anchor without complaint
+    // and stamps the honesty bound into its report.
+    const report = verifyAuditChainContent(chunks.join(""));
+    expect(
+      report.findings.filter(
+        (fi) => fi.kind === "malformed_input" || fi.kind === "schema_error"
+      )
+    ).toEqual([]);
+    expect(report.rotation_anchor_scope).toContain(
+      "does not prove the anchor is authentic"
+    );
+    expect(report.rotation_anchor_scope).toContain("fortress runtime");
+  });
+
+  it("the signed section-10 prose states the offline anchor check's bound (linkage and shape, not authenticity)", () => {
+    const pack = buildEvidencePack(
+      {
+        ...input(),
+        discrete_exports: {
+          transparency: emptyVerified(),
+          audit_chain: populated('{"type":"entry"}\n'),
+          anchor: emptyVerified(),
+        },
+      },
+      deps()
+    );
+    const report = reportText(pack);
+    expect(report).toContain(
+      "checks rotation anchors for shape and linkage ONLY"
+    );
+    expect(report).toContain(
+      "cannot and does not prove anchor authenticity"
+    );
+    expect(report).toContain("the fortress runtime, which holds that key");
   });
 });
 

@@ -19,11 +19,14 @@ export {
   AUDIT_CHECKPOINT_NAMESPACE_CONTROL_KEYS,
   AUDIT_EPOCH_KEYS_KEY,
   AUDIT_HEAD_ANCHOR_KEY,
+  AUDIT_ROTATION_ANCHOR_MARKER,
   isAuditCheckpointRecord,
+  isAuditRotationAnchorEnvelope,
 } from "./checkpoint-shape.js";
 export type {
   AuditCheckpointRecord,
   AuditCheckpointSigningPayload,
+  AuditRotationAnchorEnvelope,
 } from "./checkpoint-shape.js";
 import type { AuditCheckpointSigningPayload } from "./checkpoint-shape.js";
 

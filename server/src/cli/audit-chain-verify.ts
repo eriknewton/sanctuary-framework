@@ -10,6 +10,12 @@
  *   3. Checkpoint root hash recomputation
  *   4. Checkpoint Ed25519 signature verification
  *   5. Legacy-anchor soundness
+ *   6. Rotation-anchor LINKAGE and shape ONLY. The anchor's authenticity MAC
+ *      is keyed from the fortress custody (master) key, which this standalone
+ *      verifier deliberately does not hold, so it does NOT and CANNOT prove a
+ *      rotation anchor is authentic; only the fortress runtime can verify the
+ *      MAC (the export carries it for exactly that purpose). The report states
+ *      this bound in `rotation_anchor_scope`.
  *
  * STANDALONE PROPERTY: This module imports only @noble/curves, @noble/hashes,
  * and Node builtins (node:fs, node:crypto). It does NOT import from any
@@ -169,6 +175,13 @@ export interface RotationAnchorExportRecord {
   type: "rotation_anchor";
   base_sequence: number;
   base_prev_hash: string;
+  /**
+   * The anchor's custody-keyed MAC (unpadded base64url), present in exports
+   * from re-gate round 3 on; optional so pre-existing export files still
+   * parse. This verifier does NOT check it (no custody key); it is carried
+   * for a key-holding verifier (the fortress runtime).
+   */
+  mac?: string;
 }
 
 export type ExportRecord =
@@ -208,7 +221,24 @@ export interface VerifyReport {
   checkpoints_verified: number;
   legacy_anchors_verified: number;
   findings: RecordFinding[];
+  /**
+   * Re-gate round 3 (honesty): the fixed statement of what this tool does and
+   * does not prove about rotation anchors, printed in every report so a PASS
+   * can never be read as proof of anchor authenticity.
+   */
+  rotation_anchor_scope: string;
 }
+
+/**
+ * The honest bound on what a PASS means for rotation anchors, stamped into
+ * every report (see {@link VerifyReport.rotation_anchor_scope}).
+ */
+export const ROTATION_ANCHOR_SCOPE =
+  "Rotation anchors are checked for shape and chain linkage ONLY. An anchor's " +
+  "authenticity MAC is keyed from the fortress custody key, which this " +
+  "standalone tool does not hold, so a PASS does not prove the anchor is " +
+  "authentic; MAC verification requires the fortress runtime (the exported " +
+  "anchor carries its mac field for that purpose).";
 
 // ---- Core verification logic (pure, no I/O) ---------------------------------
 
@@ -252,6 +282,7 @@ export function verifyAuditChainRecords(
       entries_verified: 0,
       checkpoints_verified: 0,
       legacy_anchors_verified: 0,
+    rotation_anchor_scope: ROTATION_ANCHOR_SCOPE,
       findings: [
         {
           kind: "empty_input",
@@ -440,6 +471,7 @@ export function verifyAuditChainRecords(
     entries_verified: entries.length,
     checkpoints_verified: checkpoints.length,
     legacy_anchors_verified: legacyAnchors.length,
+    rotation_anchor_scope: ROTATION_ANCHOR_SCOPE,
     findings,
   };
 }
@@ -467,6 +499,7 @@ export function emptyInputReport(): VerifyReport {
     entries_verified: 0,
     checkpoints_verified: 0,
     legacy_anchors_verified: 0,
+    rotation_anchor_scope: ROTATION_ANCHOR_SCOPE,
     findings: [
       {
         kind: "empty_input",
@@ -483,6 +516,7 @@ export function malformedInputReport(err: unknown): VerifyReport {
     entries_verified: 0,
     checkpoints_verified: 0,
     legacy_anchors_verified: 0,
+    rotation_anchor_scope: ROTATION_ANCHOR_SCOPE,
     findings: [
       {
         kind: "malformed_input",

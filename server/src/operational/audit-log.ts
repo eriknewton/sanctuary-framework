@@ -31,6 +31,8 @@ import {
   AUDIT_CHECKPOINT_SCHEMA_VERSION,
   AUDIT_EPOCH_KEYS_KEY,
   AUDIT_HEAD_ANCHOR_KEY,
+  AUDIT_ROTATION_ANCHOR_MARKER,
+  isAuditRotationAnchorEnvelope,
   type AuditCheckpointRecord,
   type AuditCheckpointSignature,
   type AuditCheckpointSigningPayload,
@@ -283,9 +285,9 @@ const AUDIT_HEAD_ANCHOR_ESTABLISHED_KEY = "audit-head-anchor-established-v1";
 // separate build and out of scope for the mint unblock.
 const AUDIT_POST_SPLIT_SUFFIX_ESTABLISHED_KEY =
   "audit-post-split-suffix-established-v1";
-// Distinctive envelope marker so a MAC'd rotation anchor is unambiguously
-// distinguished from a bare/marker-stripped record (mirrors F1's state-meta MAC).
-const AUDIT_ROTATION_ANCHOR_MARKER = "__sanctuary_audit_rotation_anchor_v1";
+// AUDIT_ROTATION_ANCHOR_MARKER ("__sanctuary_audit_rotation_anchor_v1") is
+// imported from the pure shared `audit/checkpoint-shape.ts` (re-gate round 3)
+// so this runtime's anchor shape and the raw CLI exporter's cannot drift.
 const AUDIT_HEAD_ANCHOR_MARKER = "__sanctuary_audit_head_anchor_v1";
 // Domain-separated MAC over the rotation-anchor record. The anchor records the
 // authenticated lowest-surviving sequence + its prev_hash after a prune, so a
@@ -2616,21 +2618,18 @@ export class AuditLog {
       return { status: "absent" };
     }
 
-    const data = parsed.data;
-    const mac = parsed.mac;
-    if (
-      !isRecord(data) ||
-      typeof mac !== "string" ||
-      typeof data.base_sequence !== "number" ||
-      !Number.isSafeInteger(data.base_sequence) ||
-      data.base_sequence <= 0 ||
-      typeof data.base_prev_hash !== "string"
-    ) {
+    // Re-gate round 3: the structural arm is the SHARED shape predicate
+    // (marker + data + well-formed mac string), so this runtime and the raw
+    // CLI exporter cannot drift apart on what a rotation anchor looks like.
+    // The MAC VERIFICATION below stays here: only this runtime holds the
+    // custody-derived MAC key.
+    if (!isAuditRotationAnchorEnvelope(parsed)) {
       return { status: "invalid" };
     }
+    const data = parsed.data;
     let providedMac: Uint8Array;
     try {
-      providedMac = fromBase64url(mac);
+      providedMac = fromBase64url(parsed.mac);
     } catch {
       return { status: "invalid" };
     }

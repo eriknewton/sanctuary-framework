@@ -30,6 +30,7 @@ import type { PersistedAuditEnvelopeV2 } from "../operational/audit-log.js";
 import {
   AUDIT_CHECKPOINT_NAMESPACE_CONTROL_KEYS,
   isAuditCheckpointRecord,
+  isAuditRotationAnchorEnvelope,
 } from "../audit/checkpoint-shape.js";
 import { lockdownBanner, readLockdownStatus } from "../lockdown/status.js";
 import { homeFortressPath } from "../paths.js";
@@ -113,6 +114,16 @@ export interface RotationAnchorExportRecord {
   type: "rotation_anchor";
   base_sequence: number;
   base_prev_hash: string;
+  /**
+   * Re-gate round 3: the anchor's master-key MAC (unpadded base64url), carried
+   * so a verifier that DOES hold the custody key (the fortress runtime, or a
+   * future audited-verify mode) can check anchor authenticity. Including it
+   * leaks nothing: an HMAC-SHA256 output over data already present in this
+   * export is a PRF output, computationally independent of the key, and is
+   * useless to anyone without that key. The standalone offline verifier does
+   * NOT verify it (it has no key) and says so in its report.
+   */
+  mac: string;
 }
 
 /**
@@ -229,11 +240,20 @@ export async function exportAuditChain(
       checkpointsSkipped++;
       continue;
     }
-    if (isRotationAnchorRecord(parsed)) {
+    // Re-gate round 3: the SHARED rotation-anchor shape predicate (marker +
+    // data + well-formed mac). The old local guard accepted marker + data with
+    // NO mac requirement, which was NOT inclusion-safe: the standalone
+    // verifier checks anchor linkage only, so a forged mac-less anchor
+    // consistent with a truncated suffix exported unskipped and could PASS
+    // external verification while the runtime rejected it. A `__rotation_anchor`
+    // record failing this shape now falls through to the counted-skip arm
+    // below (it is not a control key), forcing the pack's read_failed.
+    if (isAuditRotationAnchorEnvelope(parsed)) {
       const record: RotationAnchorExportRecord = {
         type: "rotation_anchor",
         base_sequence: parsed.data.base_sequence,
         base_prev_hash: parsed.data.base_prev_hash,
+        mac: parsed.mac,
       };
       out.write(JSON.stringify(record) + "\n");
       checkpointsExported++;
@@ -443,14 +463,19 @@ export function resolveAuditStoragePath(path: string): string {
 
 // --- Type guards ---
 //
-// G1: `isAuditCheckpointRecord` is IMPORTED from the shared pure
-// `audit/checkpoint-shape.ts` (see the import block); the local duplicate
-// that had drifted weaker than the runtime's is deleted. The two guards
-// below remain local duplicates of `audit-log.ts` internals (this exporter
-// must not import the server runtime). Their drift risk errs toward
-// INCLUSION, not silent disappearance: a record accepted here but rejected
-// by the runtime is still present in the export for a downstream verifier to
-// reject, so the evidence pack's counts stay honest.
+// G1 + re-gate round 3: `isAuditCheckpointRecord` AND
+// `isAuditRotationAnchorEnvelope` are IMPORTED from the shared pure
+// `audit/checkpoint-shape.ts` (see the import block); both local duplicates
+// had drifted weaker than the runtime's and are deleted. The round-2 claim
+// that looser-guard drift here "errs toward inclusion and is therefore safe"
+// was adjudicated TRUE for the envelope guard ONLY: the standalone verifier
+// recomputes every entry hash, so an entry accepted loosely still fails
+// downstream verification. It was FALSE for the rotation anchor: the
+// verifier checks anchor LINKAGE only (it cannot check the custody-keyed
+// MAC), so a loosely-accepted forged anchor could pass external verification
+// end to end. The one guard below stays a local duplicate (this exporter
+// must not import the server runtime), and it is in the hash-recomputed,
+// inclusion-safe class.
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
@@ -470,19 +495,9 @@ function isPersistedAuditEnvelopeV2(value: unknown): value is PersistedAuditEnve
   );
 }
 
-function isRotationAnchorRecord(
-  value: unknown
-): value is { data: { base_sequence: number; base_prev_hash: string } } {
-  return (
-    isRecord(value) &&
-    value.__sanctuary_audit_rotation_anchor_v1 === true &&
-    isRecord(value.data) &&
-    typeof value.data.base_sequence === "number" &&
-    Number.isSafeInteger(value.data.base_sequence) &&
-    value.data.base_sequence > 0 &&
-    typeof value.data.base_prev_hash === "string"
-  );
-}
+// isRotationAnchorRecord deleted (re-gate round 3): replaced by the shared
+// `isAuditRotationAnchorEnvelope` from `audit/checkpoint-shape.ts`, which
+// additionally requires the well-formed `mac` field the runtime requires.
 
 function flagValue(argv: string[], name: string): string | undefined {
   const index = argv.indexOf(name);

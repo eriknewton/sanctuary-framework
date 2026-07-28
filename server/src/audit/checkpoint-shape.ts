@@ -87,6 +87,66 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
 }
 
+// ── Rotation anchor (F3) shape ───────────────────────────────────────
+
+/**
+ * Distinctive envelope marker of the MAC-authenticated rotation anchor
+ * (`__rotation_anchor`). Byte-matches the writer in
+ * `operational/audit-log.ts` `writeRotationAnchor`; a LIVE at-rest token,
+ * never edit the value.
+ */
+export const AUDIT_ROTATION_ANCHOR_MARKER =
+  "__sanctuary_audit_rotation_anchor_v1";
+
+/**
+ * The persisted rotation-anchor envelope. `mac` is UNCONDITIONALLY required:
+ * the marker and the master-key MAC shipped together in the same F3 envelope
+ * format, so no legitimate writer has ever produced a marker-bearing record
+ * without one (there is NO legacy mac-less arm; the runtime treats a
+ * marker-STRIPPED record as an untrusted no-anchor and a marker-bearing
+ * record with a missing or malformed mac as INVALID).
+ */
+export interface AuditRotationAnchorEnvelope {
+  data: { base_sequence: number; base_prev_hash: string };
+  mac: string;
+}
+
+/** Unpadded base64url alphabet, exactly what the runtime's `toBase64url` emits. */
+const BASE64URL_UNPADDED_RE = /^[A-Za-z0-9_-]+$/;
+
+/**
+ * THE rotation-anchor SHAPE predicate, shared by the runtime audit log and
+ * the raw CLI exporter (re-gate round 3): the exporter's local duplicate had
+ * drifted to marker + data only, with NO mac requirement, while the runtime
+ * requires and MAC-verifies `mac`. That drift was NOT inclusion-safe: the
+ * standalone verifier checks anchor linkage only, so a forged mac-less anchor
+ * consistent with a truncated suffix was rejected by the runtime yet exported
+ * unskipped and could PASS external verification. This predicate checks the
+ * full persisted SHAPE including a well-formed (unpadded-base64url) mac
+ * string. It deliberately does NOT verify the MAC itself: the MAC is keyed
+ * from the fortress custody (master) key, which neither the exporter nor the
+ * standalone verifier holds; cryptographic anchor authenticity is checkable
+ * only by the fortress runtime.
+ */
+export function isAuditRotationAnchorEnvelope(
+  value: unknown
+): value is AuditRotationAnchorEnvelope & Record<string, unknown> {
+  if (!isRecord(value) || value[AUDIT_ROTATION_ANCHOR_MARKER] !== true) {
+    return false;
+  }
+  const data = value.data;
+  const mac = value.mac;
+  return (
+    isRecord(data) &&
+    typeof data.base_sequence === "number" &&
+    Number.isSafeInteger(data.base_sequence) &&
+    data.base_sequence > 0 &&
+    typeof data.base_prev_hash === "string" &&
+    typeof mac === "string" &&
+    BASE64URL_UNPADDED_RE.test(mac)
+  );
+}
+
 /**
  * THE checkpoint shape predicate: strict, and identical for every consumer by
  * construction (this is the only definition). Requires the full persisted
