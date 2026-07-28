@@ -87,6 +87,7 @@ import {
   type AutoProvisionSummary,
 } from "./auto-provision.js";
 import type {
+  DisarmNePreferenceOutcome,
   ProvisionFlowOutcome,
   ProvisionFlowShutdownStatus,
 } from "../castle-wall/provision/index.js";
@@ -174,7 +175,14 @@ import { runProvisionPin } from "../cli/castle-wall.js";
 type ProcessShutdownCleanup = (signal?: NodeJS.Signals) => void | Promise<void>;
 
 const processShutdownCleanups = new Set<ProcessShutdownCleanup>();
+const processShutdownEscalationReporters = new Set<() => ProvisionFlowShutdownStatus>();
 let processShutdownListenersInstalled = false;
+
+function printShutdownEscalationWarning(line: string): void {
+  // SAFETY: stderr is the operator-facing signal-shutdown channel; this prints
+  // fixed residual-state metadata and recovery guidance, never secrets.
+  console.error(line);
+}
 
 // FIX (N1-1 corrected, 2026-07-27): every registered cleanup starts an async
 // operation (Castle Wall daemon teardown, tenant-runtime unlink, audit-log
@@ -227,17 +235,11 @@ const SIGNAL_EXIT_CODE: Partial<Record<NodeJS.Signals, number>> = {
   SIGTERM: 128 + 15,
 };
 
-// FIX (N1-1 second-signal, 2026-07-27): `process.on` (not `once`) means a
-// repeat SIGINT/SIGTERM -- the habitual operator response to a process that
-// does not die instantly -- re-enters this handler while the first call is
-// still mid-await on `runProcessShutdownCleanups()`. Without a latch, the
-// second call sees the cleanup set already drained (cleared synchronously by
-// the first call), so its own `Promise.allSettled([])` resolves on the very
-// next microtask and it calls `process.exit()` immediately -- racing ahead
-// of, and abandoning, the first call's in-flight cleanups (audit flush,
-// Castle Wall stop, tenant-runtime unlink). Latch the in-flight promise so a
-// repeat signal joins the SAME run instead of starting a second, empty one;
-// only the call that started the run performs the exit.
+// FIX (N1-1 second-signal, 2026-07-27; tightened 2026-07-28): `process.on`
+// (not `once`) means a repeat SIGINT/SIGTERM re-enters this handler while the
+// first call is mid-await. The first signal attempts graceful cleanup; a second
+// signal means the operator wants the process gone now, so it exits promptly
+// instead of joining a long rollback wait.
 let processShutdownInFlight: Promise<void> | undefined;
 
 /** Exported for the seam: unit-test the exit code without sending real signals. */
@@ -245,7 +247,28 @@ export async function handleProcessShutdownSignal(
   signal: NodeJS.Signals,
 ): Promise<void> {
   if (processShutdownInFlight) {
-    await processShutdownInFlight;
+    const reports = [...processShutdownEscalationReporters].map((reporter) => {
+      try {
+        return reporter();
+      } catch {
+        return undefined;
+      }
+    }).filter((report): report is ProvisionFlowShutdownStatus => report !== undefined);
+    if (reports.length === 0) {
+      printShutdownEscalationWarning(
+        `  WARNING: received ${signal} while shutdown cleanup is still in flight; exiting now. ` +
+          "Some rollback work may still be incomplete. Re-run 'sudo sanctuary protect --hermes' before assuming recovery.",
+      );
+    } else {
+      for (const status of reports) {
+        printShutdownEscalationWarning(
+          `  WARNING: received ${signal} while shutdown cleanup is still in flight; exiting now. ` +
+            `Current stage: ${status.stage}. Residual state: ${status.residualState}. ` +
+            `Recover with: ${status.recoveryCommand}. Do not assume a clean rollback.`,
+        );
+      }
+    }
+    process.exit(SIGNAL_EXIT_CODE[signal] ?? 128);
     return;
   }
   processShutdownInFlight = runProcessShutdownCleanups(signal);
@@ -279,8 +302,10 @@ const AUTO_PROVISION_SHUTDOWN_RESTORE_OPERATION_SLOTS = 2;
  * Signal shutdown waits for in-flight provisioning rollback across the host
  * operations it can actually await: harness daemon bootout, policy daemon
  * teardown, egress daemon reload, re-home file restore, and stood-down harness
- * restore. Each slot is anchored to the existing launchctl host-operation
- * budget rather than a new standalone timeout.
+ * restore. First signal worst case is 75s; a second SIGINT/SIGTERM escalates
+ * and exits promptly with the latest residual-state warning instead of waiting
+ * for this budget. Each slot is anchored to the existing launchctl
+ * host-operation budget rather than a new standalone timeout.
  */
 export const AUTO_PROVISION_SHUTDOWN_DEADLINE_MS =
   LAUNCHCTL_TIMEOUT_MS *
@@ -1862,7 +1887,30 @@ export function protectionClaimFromAutoProvisionSummary(
     : protectionStateClaimFromObservation(observation);
 }
 
-function autoProvisionCeilingFromSummary(
+function disarmOutcomeProtectionCeiling(
+  outcome: DisarmNePreferenceOutcome,
+  reason: string,
+): ProtectionStateClaim | undefined {
+  switch (outcome) {
+    case "corroborated_off":
+      return protectionStateClaimFromObservation({
+        state: "unprotected",
+        basis: "disarm_observed_off",
+        reasons: [reason],
+      });
+    case "save_accepted_inconclusive":
+    case "fail_open_deadman":
+      return protectionStateClaimFromObservation({
+        state: "unknown",
+        basis: "provision_outcome_not_observation",
+        reasons: [reason],
+      });
+    default:
+      return assertNeverDisarmNePreferenceOutcome(outcome);
+  }
+}
+
+export function autoProvisionCeilingFromSummary(
   summary: AutoProvisionSummary,
 ): ProtectionStateClaim | undefined {
   if (!summary.ran || summary.outcome === undefined) return undefined;
@@ -1902,13 +1950,11 @@ function autoProvisionCeilingFromSummary(
         });
       }
       if (outcome.disarmObservedOff === true) {
-        return protectionStateClaimFromObservation({
-          state: "unprotected",
-          basis: "disarm_observed_off",
-          reasons: [outcome.reason],
-        });
+        return disarmOutcomeProtectionCeiling("corroborated_off", outcome.reason);
       }
-      return undefined;
+      return "disarmOutcome" in outcome && outcome.disarmOutcome !== undefined
+        ? disarmOutcomeProtectionCeiling(outcome.disarmOutcome, outcome.reason)
+        : undefined;
     case "armed":
     case "armed-exclusive":
     case "armed-rollback-failed":
@@ -1924,6 +1970,12 @@ function autoProvisionCeilingFromSummary(
 function assertNeverProvisionFlowOutcome(outcome: never): never {
   throw new Error(
     `Unhandled ProvisionFlowOutcome kind in wrap protection claim path: ${JSON.stringify(outcome)}`,
+  );
+}
+
+function assertNeverDisarmNePreferenceOutcome(outcome: never): never {
+  throw new Error(
+    `Unhandled DisarmNePreferenceOutcome in wrap protection claim ceiling: ${JSON.stringify(outcome)}`,
   );
 }
 
@@ -2089,6 +2141,7 @@ async function maybeRunAutoProvisionForWrap(
   const shutdownAbort = new AbortController();
   const shutdownStatus = createAutoProvisionShutdownStatusTracker();
   let provisionPromise: Promise<AutoProvisionSummary> | undefined;
+  processShutdownEscalationReporters.add(shutdownStatus.current);
   const unregisterProvisionShutdownCleanup = registerProcessShutdownCleanup(async (signal) => {
     if (provisionPromise === undefined) {
       if (!shutdownAbort.signal.aborted) shutdownAbort.abort("process shutdown before provisioning started");
@@ -2160,6 +2213,7 @@ async function maybeRunAutoProvisionForWrap(
     return { ran: true };
   } finally {
     unregisterProvisionShutdownCleanup();
+    processShutdownEscalationReporters.delete(shutdownStatus.current);
   }
 }
 
@@ -2231,16 +2285,20 @@ export function renderAutoProvisionOutcomeLines(summary: AutoProvisionSummary): 
           `then investigate before re-running 'sanctuary protect --hermes'.`,
       ];
     case "shutdown-after-arm-rolled-back":
-      if (outcome.wallMayBeArmed === true) {
+      if (outcome.wallMayBeArmed === true || outcome.disarmOutcome !== "corroborated_off") {
+        const disarmState =
+          outcome.disarmOutcome === "save_accepted_inconclusive"
+            ? "the disable save was accepted, but the status re-read was inconclusive"
+            : "the disarm was NOT corroborated cleanly";
         return [
-          `  WARNING: SIGINT/SIGTERM arrived after Castle Wall armed; automatic shutdown rollback ran, but the disarm was NOT corroborated cleanly ` +
+          `  WARNING: SIGINT/SIGTERM arrived after Castle Wall armed; automatic shutdown rollback ran, but ${disarmState} ` +
             `(${outcome.reason}). Do not assume the wall is off. Check with 'sanctuary castle-wall status' and run ` +
             `'sudo sanctuary castle-wall disable' if it is still enabled.`,
         ];
       }
       return [
         `  Note: SIGINT/SIGTERM arrived after Castle Wall armed; automatic shutdown rollback fast-disarmed before exit ` +
-          `(${outcome.reason}). The re-home was not reversed; enforcement came down` +
+          `(${outcome.reason}). The re-home was not reversed; the wall was not observed armed after rollback` +
           `${outcome.egressRestoredToPreRunState ? " and the provisioned egress rules were restored to their pre-run state" : ""}. ` +
           `Re-run 'sanctuary protect --hermes' when you are ready to arm again.`,
       ];
@@ -2415,13 +2473,30 @@ function abortedProvisionLines(outcome: Extract<ProvisionFlowOutcome, { kind: "a
   ];
 }
 
-function renderAutoProvisionOutcome(summary: AutoProvisionSummary): void {
-  for (const line of renderAutoProvisionOutcomeLines(summary)) {
-    // SAFETY: stderr is the operator-facing CLI channel for this subcommand;
-    // every line comes from renderAutoProvisionOutcomeLines, which interpolates
-    // only outcome metadata (stage / reason / uid / backup paths this process
-    // itself wrote) -- never secrets or key material.
-    console.error(line);
+function printAutoProvisionOutcomeLineToStderr(line: string): void {
+  // SAFETY: stderr is the operator-facing CLI channel for this subcommand; the
+  // caller supplies rendered outcome metadata only, never secrets.
+  console.error(line);
+}
+
+export function renderAutoProvisionOutcome(
+  summary: AutoProvisionSummary,
+  print: (line: string) => void = printAutoProvisionOutcomeLineToStderr,
+): void {
+  try {
+    for (const line of renderAutoProvisionOutcomeLines(summary)) {
+      // SAFETY: stderr is the operator-facing CLI channel for this subcommand;
+      // every line comes from renderAutoProvisionOutcomeLines, which interpolates
+      // only outcome metadata (stage / reason / uid / backup paths this process
+      // itself wrote) -- never secrets or key material.
+      print(line);
+    }
+  } catch (err) {
+    print(
+      `  WARNING: automatic account provisioning completed with an outcome the CLI renderer could not display ` +
+        `(${err instanceof Error ? err.message : String(err)}). Re-run 'sudo sanctuary protect --hermes' or inspect ` +
+        `the Castle Wall status before assuming protection state.`,
+    );
   }
 }
 

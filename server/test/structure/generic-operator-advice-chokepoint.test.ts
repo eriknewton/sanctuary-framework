@@ -253,6 +253,22 @@ const HERMES_LITERAL_CLASSIFICATIONS: readonly HermesLiteralClassification[] = [
   },
   {
     file: "server/src/wrap/cli.ts",
+    scope: "handleProcessShutdownSignal",
+    snippet: "Some rollback work may still be incomplete. Re-run 'sudo sanctuary protect --hermes' before assuming recovery.",
+    exact: true,
+    expectedCount: 1,
+    reason: "second-signal fallback guidance is inside protect auto-provisioning shutdown cleanup",
+  },
+  {
+    file: "server/src/wrap/cli.ts",
+    scope: "renderAutoProvisionOutcome",
+    snippet: "). Re-run 'sudo sanctuary protect --hermes' or inspect ",
+    exact: true,
+    expectedCount: 1,
+    reason: "guarded auto-provision render fallback is inside the Hermes protect surface",
+  },
+  {
+    file: "server/src/wrap/cli.ts",
     scope: "renderAutoProvisionOutcomeLines",
     snippet: "Re-run 'sanctuary protect --hermes' once the per-endpoint failures",
     expectedCount: 1,

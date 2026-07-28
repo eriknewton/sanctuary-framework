@@ -824,11 +824,14 @@ export type ProvisionFlowOutcome =
        * observed", never "off".
        */
       disarmObservedOff?: true;
+      /** Raw NE rollback result when this abort actually called `disarm()`. */
+      disarmOutcome?: DisarmNePreferenceOutcome;
     }
   | {
       kind: "armed-then-rolled-back";
       uid: number;
       reason: string;
+      disarmOutcome: DisarmNePreferenceOutcome;
       disarmObservedOff?: true;
     }
   | { kind: "armed-rollback-failed"; uid: number; reason: string; disarmError: string }
@@ -845,6 +848,7 @@ export type ProvisionFlowOutcome =
       reason: string;
       egressRestoredToPreRunState: boolean;
       wallMayBeArmed?: true;
+      disarmOutcome: DisarmNePreferenceOutcome;
       disarmObservedOff?: true;
     }
   /**
@@ -869,6 +873,7 @@ export type ProvisionFlowOutcome =
        * either could not be confirmed (the outcome carries the loud note).
        */
       egressRestoredToPreRunState: boolean;
+      disarmOutcome: DisarmNePreferenceOutcome;
       disarmObservedOff?: true;
     }
   /**
@@ -1024,13 +1029,15 @@ async function rollbackAfterArmForShutdown(
   });
   let disarmObservedOff = false;
   let wallMayBeArmed = false;
-  let disarmOutcome: "fast-disarmed" | "disarm-uncorroborated" = "fast-disarmed";
+  let nePreferenceOutcome: DisarmNePreferenceOutcome;
+  let auditDisarmOutcome: "fast-disarmed" | "disarm-uncorroborated" = "fast-disarmed";
   try {
     const disarmResult = await ops.disarm();
-    disarmObservedOff = disarmOutcomeObservedOff(disarmResult.nePreferenceOutcome);
-    if (!disarmOutcomeAllowsFreshDaemonTeardown(disarmResult.nePreferenceOutcome)) {
+    nePreferenceOutcome = disarmResult.nePreferenceOutcome;
+    disarmObservedOff = disarmOutcomeObservedOff(nePreferenceOutcome);
+    if (!disarmOutcomeAllowsFreshDaemonTeardown(nePreferenceOutcome)) {
       wallMayBeArmed = true;
-      disarmOutcome = "disarm-uncorroborated";
+      auditDisarmOutcome = "disarm-uncorroborated";
     }
   } catch (disarmErr) {
     await auditEgressRefusalBestEffort(ops, ctx, uid, {
@@ -1048,7 +1055,7 @@ async function rollbackAfterArmForShutdown(
   const restoreNote = await restoreEgressBestEffort(ops, egressProvisionedThisRun);
   await auditEgressRefusalBestEffort(ops, ctx, uid, {
     stage,
-    disarm_outcome: disarmOutcome,
+    disarm_outcome: auditDisarmOutcome,
     egress_rules_restored_to_pre_run_state: restoreNote === "",
   });
   return {
@@ -1062,6 +1069,7 @@ async function rollbackAfterArmForShutdown(
       egressRestoreReasonSuffix(restoreNote),
     egressRestoredToPreRunState: restoreNote === "",
     wallMayBeArmed: wallMayBeArmed ? true : undefined,
+    disarmOutcome: nePreferenceOutcome,
     disarmObservedOff: disarmObservedOff ? true : undefined,
   };
 }
@@ -1078,10 +1086,21 @@ async function coarseOnlyShutdownBeforeExclusiveOutcome(
     recoveryCommand: EGRESS_GATE_REPAIR_WITH_STAND_DOWN_COMMAND,
   });
   const cleanupErrors: string[] = [];
+  let coarseCompositionRestored = false;
+  try {
+    await ops.exclusiveEgress!.restoreCoarseComposition(
+      `shutdown requested (${shutdownReason(ctx)}) before exclusive egress armed`,
+    );
+    coarseCompositionRestored = true;
+  } catch (err) {
+    cleanupErrors.push(`coarse composition restore failed: ${(err as Error).message}`);
+  }
   let harness: HarnessDisposition | undefined;
   try {
-    await ops.exclusiveEgress!.startHarnessCoarse();
-    harness = startedCoarseDisposition();
+    if (coarseCompositionRestored) {
+      await ops.exclusiveEgress!.startHarnessCoarse();
+      harness = startedCoarseDisposition();
+    }
   } catch (err) {
     cleanupErrors.push(
       `coarse harness start failed (this run did not start the agent): ${(err as Error).message}`,
@@ -1101,10 +1120,10 @@ async function coarseOnlyShutdownBeforeExclusiveOutcome(
   return {
     kind: "exclusive-egress-unarmed-coarse-active",
     uid,
-    stage: "bring-up",
+    stage: "release",
     reason:
       `shutdown requested (${shutdownReason(ctx)}) after coarse Castle Wall enforcement was verified and before exclusive egress armed; preserving proven-live coarse enforcement instead of disarming it.`,
-    coarseCompositionRestored: true,
+    coarseCompositionRestored,
     harness,
     cleanupErrors,
   };
@@ -1129,8 +1148,8 @@ async function auditEgressRefusalBestEffort(
 }
 
 /**
- * Outcomes after which the harness is NOT owed a restore, because the
- * exclusive-egress stage has taken ownership of it:
+ * Outcome classifier for cases where the harness is NOT owed a restore,
+ * because the exclusive-egress stage has taken ownership of it:
  *   - `armed-exclusive` / `armed-exclusive-repark-failed`: the release barrier
  *     started the agent under a committed generation. Restoring the PRE-run
  *     plist here would tear a correctly-confined agent back to coarse.
@@ -1142,15 +1161,35 @@ async function auditEgressRefusalBestEffort(
  *     The suppression is right; what round 4 fixed is the CLAIM attached to
  *     it, which used to say "parked" regardless.
  *
- * Deliberately an ALLOW-LIST of "already handled", not a deny-list of aborts:
- * a new abort kind added later defaults to restoring, which is the safe
- * direction. Getting on this list has to be a deliberate act.
+ * Deliberately exhaustive: a new outcome kind must choose whether it owns the
+ * harness, and an `exclusive-egress-unarmed-coarse-active` outcome only owns it
+ * when the coarse harness was actually started.
  */
-const OUTCOMES_THAT_OWN_THE_HARNESS: ReadonlySet<string> = new Set([
-  "armed-exclusive",
-  "armed-exclusive-repark-failed",
-  "exclusive-egress-unarmed-coarse-active",
-]);
+function outcomeOwnsHarness(outcome: ProvisionFlowOutcome): boolean {
+  switch (outcome.kind) {
+    case "armed-exclusive":
+    case "armed-exclusive-repark-failed":
+      return true;
+    case "exclusive-egress-unarmed-coarse-active":
+      return outcome.harness.disposition === "started-coarse";
+    case "skipped-already-dedicated":
+    case "skipped-non-tty-cooperative-only":
+    case "declined-by-operator":
+    case "armed":
+    case "aborted":
+    case "armed-then-rolled-back":
+    case "armed-rollback-failed":
+    case "shutdown-after-arm-rolled-back":
+    case "egress-unprovisioned-rolled-back":
+      return false;
+    default:
+      return assertNeverProvisionFlowOutcome(outcome);
+  }
+}
+
+function assertNeverProvisionFlowOutcome(outcome: never): never {
+  throw new Error(`Unhandled ProvisionFlowOutcome kind: ${JSON.stringify(outcome)}`);
+}
 
 /**
  * Run the full one-flow orchestration. Every fail-closed branch below is
@@ -1189,7 +1228,7 @@ export async function runProvisionFlow(
     if (standDown.owed) await restoreStoodDownHarnessQuietly(ops);
     throw err;
   }
-  if (!standDown.owed || OUTCOMES_THAT_OWN_THE_HARNESS.has(outcome.kind)) {
+  if (!standDown.owed || outcomeOwnsHarness(outcome)) {
     return outcome;
   }
   reportShutdownStatus(ctx, {
@@ -1264,10 +1303,20 @@ async function restoreStoodDownHarnessOrWeakenedClaim(
  * previous state" there is false in a way that matters: the restarted harness
  * may not find its credentials.
  */
-const OUTCOMES_THAT_KEEP_THE_REHOME: ReadonlySet<string> = new Set([
-  "armed-rollback-failed",
-  "shutdown-after-arm-rolled-back",
-]);
+const OUTCOMES_THAT_KEEP_THE_REHOME = {
+  "skipped-already-dedicated": false,
+  "skipped-non-tty-cooperative-only": false,
+  "declined-by-operator": false,
+  armed: false,
+  aborted: false,
+  "armed-then-rolled-back": true,
+  "armed-rollback-failed": true,
+  "shutdown-after-arm-rolled-back": true,
+  "egress-unprovisioned-rolled-back": true,
+  "armed-exclusive": false,
+  "armed-exclusive-repark-failed": false,
+  "exclusive-egress-unarmed-coarse-active": false,
+} as const satisfies Readonly<Record<ProvisionFlowOutcome["kind"], boolean>>;
 
 /**
  * The operator-facing sentence about the restore, built ONLY from observed
@@ -1312,7 +1361,7 @@ function harnessRestoreNote(
     problems: string[];
     runState?: RunStateAdvice;
   },
-  outcomeKind: string,
+  outcomeKind: ProvisionFlowOutcome["kind"],
 ): string {
   if (!restore.restored) {
     // `runState` is absent EXACTLY when none is owed -- i.e. nothing was
@@ -1333,7 +1382,7 @@ function harnessRestoreNote(
     : restore.wasRunning
       ? "was put back"
       : "was put back; it was not running before this run, and this run did not start it";
-  const scope = OUTCOMES_THAT_KEEP_THE_REHOME.has(outcomeKind)
+  const scope = OUTCOMES_THAT_KEEP_THE_REHOME[outcomeKind]
     ? " NOTE: the re-home was deliberately NOT reversed on this outcome, so the harness is back but its " +
       "secrets remain on the dedicated account. This is not a return to your previous state."
     : "";
@@ -1509,6 +1558,9 @@ async function runProvisionFlowSteps(
 
   const proceed = await ops.confirm("Proceed with account creation and arming? [y/N] ", ctx.shutdownSignal);
   if (!proceed) {
+    if (shutdownRequested(ctx)) {
+      return shutdownBeforeRehomeOutcome(ctx, "shutdown-at-confirm", false);
+    }
     return { kind: "declined-by-operator" };
   }
   if (shutdownRequested(ctx)) {
@@ -2059,15 +2111,15 @@ async function runProvisionFlowSteps(
     let tearDownPolicyDaemon = false;
     let wallMayBeArmed = false;
     let disarmObservedOff = false;
+    let nePreferenceOutcome: DisarmNePreferenceOutcome | undefined;
     let disarmNote: string | undefined;
     if (policyDaemonFreshlyInstalled) {
       try {
         const disarmResult = await ops.disarm();
-        if (disarmOutcomeAllowsFreshDaemonTeardown(disarmResult.nePreferenceOutcome)) {
+        nePreferenceOutcome = disarmResult.nePreferenceOutcome;
+        if (disarmOutcomeAllowsFreshDaemonTeardown(nePreferenceOutcome)) {
           tearDownPolicyDaemon = true;
-          disarmObservedOff = disarmOutcomeObservedOff(
-            disarmResult.nePreferenceOutcome,
-          );
+          disarmObservedOff = disarmOutcomeObservedOff(nePreferenceOutcome);
           disarmNote = disarmObservedOff
             ? "The content filter was observed disabled as part of this rollback; confirm current state with 'sanctuary castle-wall status'."
             : "The content-filter disable save was accepted during rollback, but status corroboration was inconclusive; observe live state before relying on it.";
@@ -2118,6 +2170,7 @@ async function runProvisionFlowSteps(
       // P0 honesty gap: when the filter may still be armed (disarm could not
       // confirm), the CLI must NOT render a clean "rolled back; re-run" line.
       wallMayBeArmed: wallMayBeArmed ? true : undefined,
+      ...(nePreferenceOutcome !== undefined ? { disarmOutcome: nePreferenceOutcome } : {}),
       disarmObservedOff: disarmObservedOff ? true : undefined,
       rehomeAttempted: rehomeResults.some((r) => r.status === "moved"),
       accountCreated,
@@ -2168,12 +2221,12 @@ async function runProvisionFlowSteps(
     // entirely, the CLI's generic catch swallowed it into NO outcome, and
     // the wrap's own success banner still printed over an ARMED wall with a
     // FAILED rollback. Catch it and return a distinct, loud outcome instead.
+    let nePreferenceOutcome: DisarmNePreferenceOutcome;
     let disarmObservedOff: boolean;
     try {
       const disarmResult = await ops.disarm();
-      disarmObservedOff = disarmOutcomeObservedOff(
-        disarmResult.nePreferenceOutcome,
-      );
+      nePreferenceOutcome = disarmResult.nePreferenceOutcome;
+      disarmObservedOff = disarmOutcomeObservedOff(nePreferenceOutcome);
     } catch (disarmErr) {
       return {
         kind: "armed-rollback-failed",
@@ -2193,6 +2246,7 @@ async function runProvisionFlowSteps(
       kind: "armed-then-rolled-back",
       uid,
       reason: `${baseReason} Fast-disarmed rather than leave a bricked agent.${egressRestoreReasonSuffix(restoreNote)}`,
+      disarmOutcome: nePreferenceOutcome,
       disarmObservedOff: disarmObservedOff ? true : undefined,
     };
   }
@@ -2232,13 +2286,13 @@ async function runProvisionFlowSteps(
       `and must NOT reach the negative control; anything less confines the agent into ` +
       `non-functionality or proves nothing about confinement.`;
     let disarmed: boolean;
+    let nePreferenceOutcome: DisarmNePreferenceOutcome;
     let disarmObservedOff: boolean;
     try {
       const disarmResult = await ops.disarm();
       disarmed = true;
-      disarmObservedOff = disarmOutcomeObservedOff(
-        disarmResult.nePreferenceOutcome,
-      );
+      nePreferenceOutcome = disarmResult.nePreferenceOutcome;
+      disarmObservedOff = disarmOutcomeObservedOff(nePreferenceOutcome);
     } catch (disarmErr) {
       await ops.auditEgress(EGRESS_PROVISION_REFUSED_AUDIT_OP, {
         stage: "post-arm-as-uid-verify",
@@ -2270,6 +2324,7 @@ async function runProvisionFlowSteps(
       uid,
       reason: `${egressBaseReason} Fast-disarmed rather than leave a bricked-or-unconfined agent.${egressRestoreReasonSuffix(restoreNote)}`,
       egressRestoredToPreRunState: disarmed && restoreNote === "",
+      disarmOutcome: nePreferenceOutcome,
       disarmObservedOff: disarmObservedOff ? true : undefined,
     };
   }

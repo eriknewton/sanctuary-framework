@@ -1811,7 +1811,7 @@ export const CLAIM_SITES: Record<ClaimSiteId, ClaimSiteDeclaration> = {
     file: `${CW}/orchestrate.ts`,
     symbol: "coarseOnlyShutdownBeforeExclusiveOutcome",
     claim:
-      "the already-verified coarse composition is preserved when shutdown lands before exclusive egress mutates it",
+      "the coarse composition was restored through the audited fallback before the shutdown-preserved coarse outcome was returned",
     basis: "observed",
     layer: "compute",
     branches: "single",
@@ -1974,7 +1974,7 @@ export const CLAIM_LITERAL_COUNTS: Readonly<Record<string, number>> = {
   // pid-liveness probe result for the lock-holder description; not a
   // protection claim.
   [`${CW}/lockfile.ts`]: 1,
-  [`${CW}/orchestrate.ts`]: 11,
+  [`${CW}/orchestrate.ts`]: 12,
   [`${CW}/policy-daemon.ts`]: 0,
   [`${CW}/rehome.ts`]: 0,
   [`${CW}/uid-gate.ts`]: 2,

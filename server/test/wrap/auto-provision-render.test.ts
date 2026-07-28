@@ -10,7 +10,8 @@
 
 import { describe, it, expect, vi } from "vitest";
 import {
-  protectionClaimFromAutoProvisionSummary,
+  autoProvisionCeilingFromSummary,
+  renderAutoProvisionOutcome,
   renderAutoProvisionOutcomeLines,
 } from "../../src/wrap/cli.js";
 import {
@@ -38,6 +39,22 @@ describe("wrap/cli renderAutoProvisionOutcomeLines", () => {
   it("not-ran or no-outcome -> no lines", () => {
     expect(lines({ ran: false })).toEqual([]);
     expect(lines({ ran: true })).toEqual([]);
+  });
+
+  it("R8: guarded printer reports an unrenderable outcome instead of throwing past wrap success", () => {
+    // Fails with the R8 fix reverted: the `never` default throw from
+    // renderAutoProvisionOutcomeLines propagates out of the printer.
+    const printed: string[] = [];
+    expect(() =>
+      renderAutoProvisionOutcome(
+        {
+          ran: true,
+          outcome: { kind: "future-outcome", reason: "new branch" } as unknown as AutoProvisionSummary["outcome"],
+        },
+        (line) => printed.push(line),
+      ),
+    ).not.toThrow();
+    expect(printed.join("\n")).toMatch(/could not display/i);
   });
 
   it("armed -> a single quiet confirmation with the uid", () => {
@@ -127,6 +144,7 @@ describe("wrap/cli renderAutoProvisionOutcomeLines", () => {
           "shutdown requested (SIGTERM) at shutdown-after-arm; fast-disarmed before exit rather than leave an unverified armed wall. WARNING: disarm reported success as a dead-man lever but did NOT save the NE preference disabled; the wall may still be enabled at the preference level.",
         egressRestoredToPreRunState: true,
         wallMayBeArmed: true,
+        disarmOutcome: "fail_open_deadman",
       },
     });
     expect(out[0]).toMatch(/^ {2}WARNING:/);
@@ -135,19 +153,93 @@ describe("wrap/cli renderAutoProvisionOutcomeLines", () => {
     expect(out[0]).not.toMatch(/still runs under its dedicated, re-homed account/);
   });
 
-  it("F1: shutdown rollback observed off contributes an unprotected claim instead of leaving the probe uncapped", () => {
-    const claim = protectionClaimFromAutoProvisionSummary({
+  it("R9: shutdown rollback with save-accepted-inconclusive does not claim an observed disarm", () => {
+    // Fails with the R9 fix reverted: the render used the clean fast-disarm
+    // note even though the NE outcome type says this is never an observation.
+    const out = lines({
+      ran: true,
+      outcome: {
+        kind: "shutdown-after-arm-rolled-back",
+        uid: 503,
+        reason: "disable save accepted but status reread was inconclusive",
+        egressRestoredToPreRunState: true,
+        disarmOutcome: "save_accepted_inconclusive",
+      },
+    });
+    expect(out[0]).toMatch(/^ {2}WARNING:/);
+    expect(out[0]).toMatch(/status re-read was inconclusive/);
+    expect(out[0]).not.toMatch(/fast-disarmed before exit/);
+    expect(out[0]).not.toMatch(/enforcement came down/);
+  });
+
+  it("F1: shutdown rollback observed off contributes an unprotected CEILING instead of leaving the probe uncapped", () => {
+    // Fails with the R3 fix reverted: the ceiling path would return undefined,
+    // so a green probe could pass through after rollback.
+    const claim = autoProvisionCeilingFromSummary({
       ran: true,
       outcome: {
         kind: "shutdown-after-arm-rolled-back",
         uid: 503,
         reason: "shutdown rollback observed the wall off",
         egressRestoredToPreRunState: true,
+        disarmOutcome: "corroborated_off",
         disarmObservedOff: true,
       },
     });
     expect(claim?.state).toBe("unprotected");
     expect(claim?.basis).toBe("disarm_observed_off");
+  });
+
+  it("F1: shutdown rollback wallMayBeArmed contributes an unknown CEILING instead of leaving the probe uncapped", () => {
+    // Fails with the R3 fix reverted: the ceiling path would return undefined,
+    // allowing a bounded green probe to become a protected banner.
+    const claim = autoProvisionCeilingFromSummary({
+      ran: true,
+      outcome: {
+        kind: "shutdown-after-arm-rolled-back",
+        uid: 503,
+        reason: "dead-man disarm did not save the NE preference disabled",
+        egressRestoredToPreRunState: true,
+        wallMayBeArmed: true,
+        disarmOutcome: "fail_open_deadman",
+      },
+    });
+    expect(claim?.state).toBe("unknown");
+    expect(claim?.basis).toBe("provision_outcome_not_observation");
+  });
+
+  it("R1: save-accepted-but-inconclusive disarm contributes an unknown CEILING, never an uncapped protected claim", () => {
+    // Fails with the R1 fix reverted: `save_accepted_inconclusive` carries
+    // neither disarmObservedOff nor wallMayBeArmed, so the ceiling was undefined.
+    const claim = autoProvisionCeilingFromSummary({
+      ran: true,
+      outcome: {
+        kind: "shutdown-after-arm-rolled-back",
+        uid: 503,
+        reason: "disable save accepted but status reread was inconclusive",
+        egressRestoredToPreRunState: true,
+        disarmOutcome: "save_accepted_inconclusive",
+      },
+    });
+    expect(claim?.state).toBe("unknown");
+    expect(claim?.basis).toBe("provision_outcome_not_observation");
+  });
+
+  it("safe-direction: aborted wallMayBeArmed now contributes an unknown CEILING", () => {
+    // Fails if the safe-direction R3 change is reverted: the aborted kind would
+    // be uncapped and could print protected over an inconclusive arm-abort.
+    const claim = autoProvisionCeilingFromSummary({
+      ran: true,
+      outcome: {
+        kind: "aborted",
+        stage: "arm",
+        reason: "arm returned nonzero after enabling the host app preference",
+        rolledBack: true,
+        wallMayBeArmed: true,
+      },
+    });
+    expect(claim?.state).toBe("unknown");
+    expect(claim?.basis).toBe("provision_outcome_not_observation");
   });
 
   it("aborted rolledBack:true (no daemon issue) -> soft Note frame with retry", () => {

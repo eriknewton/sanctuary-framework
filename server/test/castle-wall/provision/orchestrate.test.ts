@@ -317,7 +317,10 @@ describe("castle-wall/provision/orchestrate", () => {
       ops,
     );
 
-    expect(result).toEqual({ kind: "declined-by-operator" });
+    // Fails with the R5 fix reverted: a signal-aborted confirm was mislabeled
+    // as `{kind:"declined-by-operator"}` even though the operator killed it.
+    expect(result).toMatchObject({ kind: "aborted", stage: "shutdown-at-confirm" });
+    expect((result as { reason: string }).reason).toMatch(/shutdown requested/i);
     expect(ops.createAccount).not.toHaveBeenCalled();
   });
 
@@ -2193,6 +2196,9 @@ describe("castle-wall/provision/orchestrate", () => {
         runReleaseSequence: vi.fn(async () => ({ kind: "released" as const, generation_id: COMMITTED.generation_id })),
         restoreCoarseComposition: vi.fn(async () => undefined),
         startHarnessCoarse: vi.fn(async () => undefined),
+        assessHarnessParked: vi.fn(async () => assessHarnessParked({
+          probe: { harnessStatus: async () => PARKED_STATUS, sleepMs: async () => undefined },
+        })),
         audit: vi.fn(async () => undefined),
         print: vi.fn(),
       };
@@ -2261,6 +2267,9 @@ describe("castle-wall/provision/orchestrate", () => {
       const postArmResult = await runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), postArm);
       expect(postArmResult.kind).toBe("armed-then-rolled-back");
       expect(postArm.restoreStoodDownHarness).toHaveBeenCalledTimes(1);
+      // Fails with the R2 exhaustive record reverted: this sibling return kind
+      // restored the harness but omitted the re-home-still-dedicated warning.
+      expect(String((postArmResult as { reason: string }).reason)).toMatch(/re-home was deliberately NOT reversed/i);
 
       const asUid = stoodDownOps({
         verifyAgentEgressAfterArm: vi.fn(async () => ({
@@ -2271,6 +2280,9 @@ describe("castle-wall/provision/orchestrate", () => {
       const asUidResult = await runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), asUid);
       expect(asUidResult.kind).toBe("egress-unprovisioned-rolled-back");
       expect(asUid.restoreStoodDownHarness).toHaveBeenCalledTimes(1);
+      // Fails with the R2 exhaustive record reverted for the second sibling
+      // rollback outcome that bypasses `teardownDaemonAndRestore`.
+      expect(String((asUidResult as { reason: string }).reason)).toMatch(/not a return to your previous state/i);
     });
 
     it("F4: a shutdown after verified as-uid egress but before exclusive arm preserves coarse enforcement", async () => {
@@ -2294,14 +2306,50 @@ describe("castle-wall/provision/orchestrate", () => {
 
       expect(result).toMatchObject({
         kind: "exclusive-egress-unarmed-coarse-active",
-        stage: "bring-up",
+        stage: "release",
         coarseCompositionRestored: true,
       });
       expect((result as { reason: string }).reason).toMatch(/preserving proven-live coarse enforcement/);
       expect(ops.disarm).not.toHaveBeenCalled();
       expect(ops.restoreProvisionedEgressToPreRunState).not.toHaveBeenCalled();
+      expect(exclusive.restoreCoarseComposition).toHaveBeenCalledTimes(1);
       expect(exclusive.startHarnessCoarse).toHaveBeenCalledTimes(1);
       expect(ops.restoreStoodDownHarness).not.toHaveBeenCalled();
+    });
+
+    it("R6: shutdown-before-exclusive restores the stood-down agent if coarse harness restart throws", async () => {
+      const shutdown = new AbortController();
+      const exclusive = exclusiveOps();
+      exclusive.startHarnessCoarse = vi.fn(async () => {
+        throw new Error("launchctl bootstrap exited 5");
+      });
+      const ops = stoodDownOps({
+        exclusiveEgress: exclusive,
+        auditEgress: vi.fn(async (operation: string) => {
+          if (operation === "egress_provisioned") {
+            shutdown.abort("SIGTERM");
+          }
+        }),
+      });
+
+      const result = await runProvisionFlow(
+        { ...baseCtx({ fineGrainedDeclared: true }), shutdownSignal: shutdown.signal } as ProvisionFlowContext & {
+          shutdownSignal: AbortSignal;
+        },
+        ops,
+      );
+
+      // Fails with the R6 fix reverted: the outcome kind suppressed the
+      // harness-restore chokepoint even when the coarse restart threw.
+      expect(result).toMatchObject({
+        kind: "exclusive-egress-unarmed-coarse-active",
+        stage: "release",
+        coarseCompositionRestored: true,
+        harness: { disposition: "not-started" },
+      });
+      expect(exclusive.startHarnessCoarse).toHaveBeenCalledTimes(1);
+      expect(ops.restoreStoodDownHarness).toHaveBeenCalledTimes(1);
+      expect(String((result as { reason: string }).reason)).toMatch(/stood down was restarted/i);
     });
 
     it("restores the agent when the barrier assertion rejects a non-parked install", async () => {

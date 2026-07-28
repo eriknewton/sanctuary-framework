@@ -4,12 +4,11 @@
  *
  *   1. SIGINT/SIGTERM handlers must exit after cleanups run, and a repeat
  *      signal (a plain listener suppresses Node's default "exit on signal"
- *      action, and the habitual double Ctrl-C) must join the SAME in-flight
- *      cleanup run rather than racing ahead with an already-drained,
- *      trivially-resolved cleanup set. Without the exit, `sanctuary protect`
- *      and the standalone dashboard survived a plain `kill` and drills
- *      needed `kill -9`; without the latch, a second signal could abandon
- *      the first signal's in-flight audit-flush / Castle Wall teardown.
+ *      action) waits for cleanup, while a repeat signal escalates and exits
+ *      promptly with residual-state guidance. Without the exit, `sanctuary
+ *      protect` and the standalone dashboard survived a plain `kill` and
+ *      drills needed `kill -9`; without escalation, a second signal could
+ *      leave the operator staring at a 75s rollback wait.
  *   2. CORRECTED 2026-07-27: a declined step-2 arm confirm must NOT exit
  *      the process. `declined-by-operator` is only ever returned when the
  *      run is interactive (a non-interactive run gets the distinct
@@ -46,6 +45,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
+  AUTO_PROVISION_SHUTDOWN_DEADLINE_MS,
   handleProcessShutdownSignal,
   registerProcessShutdownCleanup,
   runWrap,
@@ -233,30 +233,36 @@ describe("handleProcessShutdownSignal (wrap/cli.ts) exits after cleanups", () =>
     expect(exitSpy).toHaveBeenCalledWith(143);
   });
 
-  // FIX (N1-1 second-signal, 2026-07-27 harden-loop): `process.on` (not
-  // `once`) lets a repeat SIGINT/SIGTERM -- the habitual double Ctrl-C --
-  // re-enter this handler while the first call is still mid-await on its
-  // cleanups. Pre-fix, the second call saw the cleanup set already drained
-  // by the first call, so its own `Promise.allSettled([])` resolved
-  // immediately and it called `process.exit()` right away, racing ahead of
-  // the first call's still-in-flight cleanup (abandoning it, same class of
-  // bug the await-fix above closes for a SINGLE signal).
-  it("a repeat signal while cleanups are in flight joins the same run instead of racing ahead", async () => {
+  it("R4: a repeat signal while cleanup is in flight escalates to immediate exit", async () => {
+    const cleanupEntered = deferred<void>();
+    const finishCleanup = deferred<void>();
     let cleanupSettled = false;
     registerProcessShutdownCleanup(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 10));
+      cleanupEntered.resolve();
+      await finishCleanup.promise;
       cleanupSettled = true;
     });
+    const stderrSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
-    const first = handleProcessShutdownSignal("SIGTERM");
-    const second = handleProcessShutdownSignal("SIGINT");
-    await Promise.all([first, second]);
+    try {
+      const first = handleProcessShutdownSignal("SIGTERM");
+      await cleanupEntered.promise;
+      await handleProcessShutdownSignal("SIGINT");
 
-    expect(cleanupSettled).toBe(true);
-    // Only the call that started the run exits; the joining repeat signal
-    // must not race ahead with an empty, already-drained cleanup set.
-    expect(exitSpy).toHaveBeenCalledTimes(1);
-    expect(exitSpy).toHaveBeenCalledWith(143);
+      // Fails with the R4 fix reverted: the second signal awaited the first
+      // cleanup promise, so this assertion would not run until finishCleanup.
+      expect(cleanupSettled).toBe(false);
+      expect(exitSpy).toHaveBeenCalledWith(130);
+      expect(stderrSpy.mock.calls.flat().join("\n")).toMatch(/cleanup is still in flight/);
+
+      finishCleanup.resolve();
+      await first;
+      expect(cleanupSettled).toBe(true);
+      expect(exitSpy).toHaveBeenCalledWith(143);
+    } finally {
+      finishCleanup.resolve();
+      stderrSpy.mockRestore();
+    }
   });
 
   // FIX (harden-loop, late-registration drop): nothing stops `runWrap`'s
@@ -345,6 +351,11 @@ describe("runWrap: SIGTERM during in-flight provisioning waits for rollback or a
       ...overrides,
     };
   }
+
+  it("R4: pins the first-signal rollback-completeness budget at 75 seconds", () => {
+    // Fails if the R4 constant changes without updating the declared worst case.
+    expect(AUTO_PROVISION_SHUTDOWN_DEADLINE_MS).toBe(75_000);
+  });
 
   it("a real SIGTERM while provision-egress is in flight waits for runProvisionFlow's egress restore before exit", async () => {
     const provisionEntered = deferred<void>();
@@ -473,6 +484,76 @@ describe("runWrap: SIGTERM during in-flight provisioning waits for rollback or a
       expect(printed).toMatch(/shutdown rollback is in flight/);
       expect(printed).toMatch(/re-homed files may be mid-restore/);
       expect(printed).toMatch(/sudo sanctuary protect --hermes/);
+    } finally {
+      finishProvisionEgress.resolve();
+      releaseProvision();
+      await Promise.race([runPromise, sleepMs(50)]);
+    }
+  });
+
+  it("R4: a second signal abandons the auto-provision wait and reports current residual state", async () => {
+    const provisionEntered = deferred<void>();
+    const finishProvisionEgress = deferred<void>();
+    const rollbackEntered = deferred<void>();
+    const finishRollback = deferred<{ restored: true; reloadOk: true; problems: [] }>();
+    let released = false;
+    const releaseProvision = () => {
+      if (released) return;
+      released = true;
+      finishRollback.resolve({ restored: true, reloadOk: true, problems: [] });
+    };
+    const ops = signalProvisionOps({
+      provisionEgress: vi.fn(async () => {
+        provisionEntered.resolve();
+        await finishProvisionEgress.promise;
+        return {
+          ok: true as const,
+          ruleIds: ["provisioned-hermes-abc123def456"],
+          checks: [{ name: "LLM (Venice)", host: "api.venice.ai", port: 443, allowed: true }],
+          dnsRulePresent: true,
+        };
+      }),
+      restoreProvisionedEgressToPreRunState: vi.fn(async () => {
+        rollbackEntered.resolve();
+        return finishRollback.promise;
+      }),
+    });
+    const runAutoProvisionForWrap = vi.fn(async (input: unknown): Promise<AutoProvisionSummary> => {
+      const provisionInput = input as {
+        shutdownSignal?: AbortSignal;
+        onShutdownStatus?: (status: unknown) => void;
+      };
+      const outcome = await runProvisionFlow(
+        signalProvisionCtx(provisionInput.shutdownSignal, provisionInput.onShutdownStatus),
+        ops,
+      );
+      return { ran: true, outcome };
+    });
+
+    const runPromise = runWrap(
+      { hermes: true, noOpen: true, noDashboard: true },
+      deps({ runAutoProvisionForWrap }),
+    ).catch(() => undefined);
+
+    try {
+      await vi.waitFor(() => expect(runAutoProvisionForWrap).toHaveBeenCalledTimes(1), { timeout: 5000 });
+      await provisionEntered.promise;
+      const first = handleProcessShutdownSignal("SIGTERM");
+      finishProvisionEgress.resolve();
+      await rollbackEntered.promise;
+      await handleProcessShutdownSignal("SIGINT");
+
+      // Fails with the R4 fix reverted: the second signal joined the 75s
+      // rollback wait and never printed the residual state immediately.
+      expect(exitSpy).toHaveBeenCalledWith(130);
+      const printed = stderrSpy.mock.calls.flat().join("\n");
+      expect(printed).toMatch(/received SIGINT while shutdown cleanup is still in flight/i);
+      expect(printed).toMatch(/rollback-shutdown-after-provision-egress/);
+      expect(printed).toMatch(/shutdown rollback is in flight/);
+      expect(printed).toMatch(/sudo sanctuary protect --hermes/);
+
+      releaseProvision();
+      await first;
     } finally {
       finishProvisionEgress.resolve();
       releaseProvision();
