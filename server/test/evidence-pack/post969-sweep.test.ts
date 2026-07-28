@@ -45,6 +45,7 @@ import { join } from "node:path";
 
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
+import { isAuditRotationAnchorEnvelope } from "../../src/audit/checkpoint-shape.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import { derivePurposeKey } from "../../src/core/key-derivation.js";
 import { createIdentity } from "../../src/core/identity.js";
@@ -81,7 +82,7 @@ import {
   type ReadOutcome,
 } from "../../src/evidence-pack/read-outcome.js";
 import { verifyAuditChainContent } from "../../src/cli/audit-chain-verify.js";
-import { toBase64url } from "../../src/core/encoding.js";
+import { bytesToString, toBase64url } from "../../src/core/encoding.js";
 import type {
   EvidencePack,
   EvidencePackInput,
@@ -569,6 +570,82 @@ describe("R3: a mac-less rotation anchor is counted corrupt, and the exported an
       "does not prove the anchor is authentic"
     );
     expect(report.rotation_anchor_scope).toContain("fortress runtime");
+  });
+
+  // FAIL-WITHOUT-FIX (R4, final verify): the round-3 mac check was
+  // alphabet-only, so `mac: "A"` (or any impossible-length or
+  // non-round-tripping string) passed the shape and exported unskipped while
+  // the runtime rejected it at MAC compare. The predicate now accepts EXACTLY
+  // the strings the legitimate writer can emit: canonical unpadded base64url
+  // of a 32-byte HMAC-SHA256 (length 43, final char's unused low bits zero).
+  it("R4: non-canonical mac strings (impossible length, padded, non-round-tripping) are counted skipped and force read_failed", async () => {
+    const goodMac = toBase64url(new Uint8Array(32).fill(7));
+    expect(goodMac).toHaveLength(43);
+    const badMacs: Array<[string, string]> = [
+      ["alphabet-valid but impossible length", "A"],
+      ["padded base64 of 32 bytes", `${goodMac}=`],
+      ["length 44", `${goodMac}A`],
+      // 43 chars, alphabet-valid, but the final char's 2 unused low bits are
+      // set ("B" = index 1), so it does not round-trip through decode/encode.
+      ["43 chars but non-round-tripping final char", `${goodMac.slice(0, 42)}B`],
+    ];
+    for (const [label, mac] of badMacs) {
+      const f = await freshFortress();
+      await f.storage.write(
+        AUDIT_EXPORT_CHECKPOINT_NAMESPACE,
+        "__rotation_anchor",
+        enc.encode(
+          JSON.stringify({
+            [MARKER]: true,
+            data: { base_sequence: 5, base_prev_hash: "f".repeat(64) },
+            mac,
+          })
+        )
+      );
+      const { chunks, sink } = collectExport();
+      const summary = await exportAuditChain(f.storage, sink);
+      expect(summary.checkpointsSkipped, label).toBe(1);
+      expect(summary.checkpointsExported, label).toBe(0);
+      expect(chunks.join(""), label).toBe("");
+      const out = await gatherDiscreteExports(f.storage, f.key, "fortress-1", GEN_AT);
+      expect(out.audit_chain.status, label).toBe("read_failed");
+    }
+  });
+
+  it("R4: a REAL runtime-written rotation anchor passes the shared predicate and exports unskipped with its mac", async () => {
+    // Drive the runtime's own rotation path: append past maxEntries so
+    // maybeRotate prunes a prefix and writeRotationAnchor persists the anchor.
+    const storage = new MemoryStorage();
+    const masterKey = generateRandomKey();
+    const writer = new AuditLog(storage, masterKey, { maxEntries: 5 });
+    for (let i = 0; i < 12; i++) {
+      await writer.appendCritical({
+        layer: "l1",
+        operation: `op-${i}`,
+        identity_id: "id-1",
+        result: "success",
+      });
+    }
+    await writer.flush();
+    const raw = await storage.read(AUDIT_EXPORT_CHECKPOINT_NAMESPACE, "__rotation_anchor");
+    expect(raw).not.toBeNull();
+    const anchor = JSON.parse(bytesToString(raw!)) as { mac: string };
+    // The no-legitimate-anchor-miscounted guarantee, empirically: the shared
+    // predicate accepts what the real writer wrote.
+    expect(isAuditRotationAnchorEnvelope(anchor)).toBe(true);
+
+    const { chunks, sink } = collectExport();
+    const summary = await exportAuditChain(storage, sink);
+    expect(summary.checkpointsSkipped).toBe(0);
+    expect(summary.entriesSkipped).toBe(0);
+    const anchorLines = chunks
+      .join("")
+      .trim()
+      .split("\n")
+      .map((l) => JSON.parse(l) as { type: string; mac?: string })
+      .filter((r) => r.type === "rotation_anchor");
+    expect(anchorLines).toHaveLength(1);
+    expect(anchorLines[0]!.mac).toBe(anchor.mac);
   });
 
   it("the signed section-10 prose states the offline anchor check's bound (linkage and shape, not authenticity)", () => {

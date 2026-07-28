@@ -2619,7 +2619,7 @@ export class AuditLog {
     }
 
     // Re-gate round 3: the structural arm is the SHARED shape predicate
-    // (marker + data + well-formed mac string), so this runtime and the raw
+    // (marker + data + canonical 43-char base64url mac), so this runtime and the raw
     // CLI exporter cannot drift apart on what a rotation anchor looks like.
     // The MAC VERIFICATION below stays here: only this runtime holds the
     // custody-derived MAC key.

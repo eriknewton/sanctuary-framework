@@ -115,7 +115,8 @@ export interface RotationAnchorExportRecord {
   base_sequence: number;
   base_prev_hash: string;
   /**
-   * Re-gate round 3: the anchor's master-key MAC (unpadded base64url), carried
+   * Re-gate round 3: the anchor's master-key MAC (canonical 43-char unpadded
+   * base64url of the 32-byte HMAC-SHA256), carried
    * so a verifier that DOES hold the custody key (the fortress runtime, or a
    * future audited-verify mode) can check anchor authenticity. Including it
    * leaks nothing: an HMAC-SHA256 output over data already present in this
@@ -241,7 +242,8 @@ export async function exportAuditChain(
       continue;
     }
     // Re-gate round 3: the SHARED rotation-anchor shape predicate (marker +
-    // data + well-formed mac). The old local guard accepted marker + data with
+    // data + a canonical 43-char base64url mac, the only strings the legitimate
+    // writer can emit). The old local guard accepted marker + data with
     // NO mac requirement, which was NOT inclusion-safe: the standalone
     // verifier checks anchor linkage only, so a forged mac-less anchor
     // consistent with a truncated suffix exported unskipped and could PASS
@@ -497,7 +499,8 @@ function isPersistedAuditEnvelopeV2(value: unknown): value is PersistedAuditEnve
 
 // isRotationAnchorRecord deleted (re-gate round 3): replaced by the shared
 // `isAuditRotationAnchorEnvelope` from `audit/checkpoint-shape.ts`, which
-// additionally requires the well-formed `mac` field the runtime requires.
+// additionally requires `mac` to be a canonical 43-char base64url encoding
+// of the 32-byte MAC, the only strings the legitimate writer can emit.
 
 function flagValue(argv: string[], name: string): string | undefined {
   const index = argv.indexOf(name);

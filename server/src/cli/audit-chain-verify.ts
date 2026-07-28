@@ -176,7 +176,8 @@ export interface RotationAnchorExportRecord {
   base_sequence: number;
   base_prev_hash: string;
   /**
-   * The anchor's custody-keyed MAC (unpadded base64url), present in exports
+   * The anchor's custody-keyed MAC (canonical 43-char unpadded base64url of
+   * the 32-byte HMAC-SHA256), present in exports
    * from re-gate round 3 on; optional so pre-existing export files still
    * parse. This verifier does NOT check it (no custody key); it is carried
    * for a key-holding verifier (the fortress runtime).

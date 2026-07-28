@@ -111,8 +111,21 @@ export interface AuditRotationAnchorEnvelope {
   mac: string;
 }
 
-/** Unpadded base64url alphabet, exactly what the runtime's `toBase64url` emits. */
-const BASE64URL_UNPADDED_RE = /^[A-Za-z0-9_-]+$/;
+/**
+ * The EXACT set of strings the legitimate anchor writer can emit as `mac`
+ * (re-gate round 4): `toBase64url` of the 32-byte HMAC-SHA256. 32 bytes are
+ * 256 bits; unpadded base64url carries 6 bits per character, so the canonical
+ * encoding is EXACTLY ceil(256/6) = 43 characters, and the final character
+ * carries the last 4 payload bits plus 2 zero pad bits. Canonical
+ * (round-tripping, per the repo's base64url definition in
+ * `core/encoding.ts`) therefore means: length exactly 43, base64url alphabet
+ * with no padding, and a final character whose symbol index is divisible by 4
+ * (its unused low 2 bits are zero), i.e. one of "AEIMQUYcgkosw048". An
+ * alphabet-only check was not enough: `mac: "A"` (impossible length) or a
+ * 43-char non-round-tripping string passed the shape while the runtime
+ * rejected it at MAC compare, re-opening the export-unskipped hole.
+ */
+const ROTATION_ANCHOR_MAC_RE = /^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$/;
 
 /**
  * THE rotation-anchor SHAPE predicate, shared by the runtime audit log and
@@ -122,11 +135,13 @@ const BASE64URL_UNPADDED_RE = /^[A-Za-z0-9_-]+$/;
  * standalone verifier checks anchor linkage only, so a forged mac-less anchor
  * consistent with a truncated suffix was rejected by the runtime yet exported
  * unskipped and could PASS external verification. This predicate checks the
- * full persisted SHAPE including a well-formed (unpadded-base64url) mac
- * string. It deliberately does NOT verify the MAC itself: the MAC is keyed
- * from the fortress custody (master) key, which neither the exporter nor the
- * standalone verifier holds; cryptographic anchor authenticity is checkable
- * only by the fortress runtime.
+ * full persisted SHAPE, requiring `mac` to be exactly a canonical 43-char
+ * base64url encoding of a 32-byte MAC (see {@link ROTATION_ANCHOR_MAC_RE}),
+ * the only strings the legitimate writer can emit. It deliberately does NOT
+ * verify the MAC itself: the MAC is keyed from the fortress custody (master)
+ * key, which neither the exporter nor the standalone verifier holds;
+ * cryptographic anchor authenticity is checkable only by the fortress
+ * runtime.
  */
 export function isAuditRotationAnchorEnvelope(
   value: unknown
@@ -143,7 +158,7 @@ export function isAuditRotationAnchorEnvelope(
     data.base_sequence > 0 &&
     typeof data.base_prev_hash === "string" &&
     typeof mac === "string" &&
-    BASE64URL_UNPADDED_RE.test(mac)
+    ROTATION_ANCHOR_MAC_RE.test(mac)
   );
 }
 
