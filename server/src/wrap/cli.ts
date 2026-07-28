@@ -29,7 +29,6 @@
  *   the advanced path; most operators want Layer 1.
  */
 
-import { rmSync } from "node:fs";
 import { writeFile, readFile, mkdir, access, lstat } from "node:fs/promises";
 import { dirname, join, resolve as resolvePath } from "node:path";
 import { Writable } from "node:stream";
@@ -90,7 +89,7 @@ import type {
   DisarmNePreferenceOutcome,
   ProvisionFlowOutcome,
 } from "../castle-wall/provision/index.js";
-import { PROVISION_LOCK_PATH, ProvisionLockHeldError } from "../castle-wall/provision/index.js";
+import { ProvisionLockHeldError } from "../castle-wall/provision/index.js";
 import { harnessDispositionSentence } from "../egress-gate/parked-claim.js";
 import {
   EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE,
@@ -179,7 +178,6 @@ let autoProvisionMutationInFlight = false;
 let autoProvisionSignalRefusedOnce = false;
 let autoProvisionPendingShutdownSignal: NodeJS.Signals | undefined;
 let pendingAutoProvisionWasExclusiveEgress = false;
-let autoProvisionLockReleaseOwedForForcedExit = false;
 let processShutdownRequestedSignal: NodeJS.Signals | undefined;
 
 const AUTO_PROVISION_SIGNAL_RECOVERY_COMMAND =
@@ -187,10 +185,10 @@ const AUTO_PROVISION_SIGNAL_RECOVERY_COMMAND =
 
 function autoProvisionSignalRecoveryGuidance(input?: { exclusiveEgress?: boolean }): string {
   const staleLockGuidance =
-    "If recovery reports the provision lock is still held, verify no 'sanctuary protect' process is running, then remove /var/run/sanctuary-provision.lock and retry.";
+    "The provision lock is released on forced exit; only an abrupt process death outside the exit path should leave it stranded, and recovery will report that separately.";
   return input?.exclusiveEgress === true
-    ? `After checking the machine state, use the matching recovery command at an interactive terminal: ${AUTO_PROVISION_SIGNAL_RECOVERY_COMMAND} if account creation or re-home did not reach exclusive-egress gate generation; ${EGRESS_GATE_REPAIR_WITH_STAND_DOWN_COMMAND} if an exclusive-egress gate generation exists. ${staleLockGuidance}`
-    : `Recover from an interactive terminal with: ${AUTO_PROVISION_SIGNAL_RECOVERY_COMMAND}. ${staleLockGuidance}`;
+    ? `after checking the machine state, use the matching recovery command: ${AUTO_PROVISION_SIGNAL_RECOVERY_COMMAND} from an interactive terminal if account creation or re-home did not reach exclusive-egress gate generation; ${EGRESS_GATE_REPAIR_WITH_STAND_DOWN_COMMAND} if an exclusive-egress gate generation exists. ${staleLockGuidance}`
+    : `recover from an interactive terminal with: ${AUTO_PROVISION_SIGNAL_RECOVERY_COMMAND}. ${staleLockGuidance}`;
 }
 
 export function renderAutoProvisionSignalRefusal(
@@ -201,7 +199,7 @@ export function renderAutoProvisionSignalRefusal(
     `  WARNING: received ${signal} while account provisioning is mid-flight. ` +
     "Exiting now could leave this machine half-provisioned, so this shutdown request will be honored after provisioning closes. " +
     "Press Ctrl-C again (or send the signal again) to exit immediately anyway. " +
-    `If manual recovery is needed: ${autoProvisionSignalRecoveryGuidance(input)} ` +
+    `If manual recovery is needed, ${autoProvisionSignalRecoveryGuidance(input)} ` +
     "Before changing state, check whether Castle Wall is armed; only run 'sudo sanctuary castle-wall disable' if it is enforcing over a half-provisioned agent."
   );
 }
@@ -217,7 +215,7 @@ export function renderAutoProvisionForcedExitWarning(
   return (
     `  WARNING: ${repeatDescription}; exiting now. ` +
     "Provisioning was interrupted mid-flight, no rollback was attempted, and the machine may be in a partial state. " +
-    "Some shutdown records may be missing, Castle Wall teardown did not run, and the provision lock may remain. " +
+    "Some shutdown records may be missing, Castle Wall teardown did not run, and a provision lock can remain only after an abrupt process death outside the exit path. " +
     `${autoProvisionSignalRecoveryGuidance(input)} ` +
     "Before changing state, check whether Castle Wall is armed; only run 'sudo sanctuary castle-wall disable' if it is enforcing over a half-provisioned agent."
   );
@@ -241,7 +239,6 @@ export function __resetProcessShutdownStateForTest(): void {
   autoProvisionSignalRefusedOnce = false;
   autoProvisionPendingShutdownSignal = undefined;
   pendingAutoProvisionWasExclusiveEgress = false;
-  autoProvisionLockReleaseOwedForForcedExit = false;
   processShutdownInFlight = undefined;
   processShutdownRequestedSignal = undefined;
   processShutdownRepeatSignalCount = 0;
@@ -382,7 +379,6 @@ function closeAutoProvisionMutationWindow(): NodeJS.Signals | undefined {
   autoProvisionMutationInFlight = false;
   autoProvisionSignalRefusedOnce = false;
   pendingAutoProvisionWasExclusiveEgress = false;
-  autoProvisionLockReleaseOwedForForcedExit = false;
   const deferredSignal = autoProvisionPendingShutdownSignal;
   autoProvisionPendingShutdownSignal = undefined;
   return deferredSignal;
@@ -402,18 +398,7 @@ function tryOpenAutoProvisionMutationWindow(options: WrapOptions): boolean {
   autoProvisionSignalRefusedOnce = false;
   autoProvisionPendingShutdownSignal = undefined;
   pendingAutoProvisionWasExclusiveEgress = options.exclusiveEgress === true;
-  autoProvisionLockReleaseOwedForForcedExit = true;
   return true;
-}
-
-function releaseProvisionLockBeforeForcedExit(): void {
-  if (!autoProvisionLockReleaseOwedForForcedExit) return;
-  autoProvisionLockReleaseOwedForForcedExit = false;
-  try {
-    rmSync(PROVISION_LOCK_PATH, { force: true });
-  } catch {
-    /* best-effort: forced-exit recovery guidance covers a remaining stale lock */
-  }
 }
 
 /** Exported for the seam: unit-test the exit code without sending real signals. */
@@ -437,10 +422,10 @@ export async function handleProcessShutdownSignal(
       exclusiveEgress: pendingAutoProvisionWasExclusiveEgress,
       firstSignal: autoProvisionPendingShutdownSignal,
     }));
+    const exitSignal = autoProvisionPendingShutdownSignal ?? signal;
     autoProvisionPendingShutdownSignal = undefined;
-    releaseProvisionLockBeforeForcedExit();
     processShutdownExitIssued = true;
-    process.exit(SIGNAL_EXIT_CODE[signal] ?? 128);
+    process.exit(SIGNAL_EXIT_CODE[exitSignal] ?? 128);
     return;
   }
   autoProvisionSignalRefusedOnce = false;
@@ -2226,65 +2211,69 @@ async function maybeRunAutoProvisionForWrap(
   }
   const runner = deps.runAutoProvisionForWrap ?? runAutoProvisionForWrap;
   let mutationWindowOpened = false;
+  let deferredSignal: NodeJS.Signals | undefined;
   let summary: AutoProvisionSummary;
   try {
-    summary = await runner({
-      isTty: process.stdin.isTTY === true,
-      preAnsweredProvision: options.provisionAgentAccount,
-      cliBinary: resolveAutoProvisionCliBinary(options),
-      stopTransientCastleWallDaemon,
-      beforeFirstMutation: () => {
-        mutationWindowOpened = tryOpenAutoProvisionMutationWindow(options);
-        return mutationWindowOpened;
-      },
-      // S5-6: fine-grained (exclusive-egress) provisioning mode.
-      exclusiveEgress: options.exclusiveEgress,
-      // SAFETY: stderr is the operator-facing CLI channel for this
-      // subcommand; this prints the plan-and-print + progress lines from
-      // the auto-provision flow (account plan, re-home summary, arm
-      // result), never secrets or key material.
-      print: (line) => console.error(`  ${line}`),
-    });
-  } catch (err) {
-    // FIX (round 5 / R8-2): a held provision lock means the flow body NEVER
-    // ran (another `sanctuary protect` is mid-provision), so this run mutated
-    // NOTHING. Classify it honestly -- the generic "may have PARTIALLY applied"
-    // warning below would falsely tell the operator to consider disarming a
-    // wall this run never touched.
-    if (err instanceof ProvisionLockHeldError) {
-      // SAFETY: stderr is the operator-facing CLI channel; a fixed, safe
-      // string plus the lock error message (a lock-path only, no secrets).
-      console.error(
-        `  Note: another 'sanctuary protect' provisioning run is already in progress (${(err as Error).message}); ` +
-          `this run made NO account, re-home, or Castle Wall changes. If a protect process is actually running, wait for it to finish; ` +
-          `if not, remove the stale lock file named above and re-run if needed.`,
-      );
-      summary = { ran: true };
-    } else {
-      // FIX (round 5, item N5): a throw reaching here can surface AFTER
-      // privileged side effects already landed -- e.g. `withProvisionLock`'s
-      // finally re-throws a non-ENOENT lock-release error even when
-      // `runProvisionFlow` already created the account, re-homed the secrets, or
-      // ARMED the wall. The pre-fix copy asserted provisioning "did not
-      // complete" and told the operator to blindly re-run, which is wrong (and
-      // unsafe) if the wall is in fact armed over a half-provisioned agent. The
-      // catch cannot know how far the flow got, so it must not claim a
-      // completion state: warn that it may have PARTIALLY applied and that the
-      // armed state must be checked before re-running.
-      //
-      // SAFETY: stderr / stdout is the operator-facing CLI channel for this
-      // subcommand; never surface secrets or key material here.
-      console.error(
-        `  WARNING: automatic account provisioning raised an error (${(err as Error).message}). ` +
-          `It may have PARTIALLY applied -- the dedicated account, the re-home, or an armed Castle Wall could ` +
-          `already be in place. The cooperative wrap above still applies. Do NOT assume nothing happened: check ` +
-          `whether Castle Wall is armed before re-running, and run 'sudo sanctuary castle-wall disable' if it is ` +
-          `enforcing over a half-provisioned agent.`,
-      );
-      summary = { ran: true };
+    try {
+      summary = await runner({
+        isTty: process.stdin.isTTY === true,
+        preAnsweredProvision: options.provisionAgentAccount,
+        cliBinary: resolveAutoProvisionCliBinary(options),
+        stopTransientCastleWallDaemon,
+        beforeFirstMutation: () => {
+          mutationWindowOpened = tryOpenAutoProvisionMutationWindow(options);
+          return mutationWindowOpened;
+        },
+        // S5-6: fine-grained (exclusive-egress) provisioning mode.
+        exclusiveEgress: options.exclusiveEgress,
+        // SAFETY: stderr is the operator-facing CLI channel for this
+        // subcommand; this prints the plan-and-print + progress lines from
+        // the auto-provision flow (account plan, re-home summary, arm
+        // result), never secrets or key material.
+        print: (line) => console.error(`  ${line}`),
+      });
+    } catch (err) {
+      // FIX (round 5 / R8-2): a held provision lock means the flow body NEVER
+      // ran (another `sanctuary protect` is mid-provision), so this run mutated
+      // NOTHING. Classify it honestly -- the generic "may have PARTIALLY applied"
+      // warning below would falsely tell the operator to consider disarming a
+      // wall this run never touched.
+      if (err instanceof ProvisionLockHeldError) {
+        // SAFETY: stderr is the operator-facing CLI channel; a fixed, safe
+        // string plus the lock error message (a lock-path only, no secrets).
+        console.error(
+          `  Note: another 'sanctuary protect' provisioning run is already in progress (${(err as Error).message}); ` +
+            `this run made NO account, re-home, or Castle Wall changes. If a protect process is actually running, wait for it to finish; ` +
+            `if not, remove the stale lock file named above and re-run if needed.`,
+        );
+        summary = { ran: true };
+      } else {
+        // FIX (round 5, item N5): a throw reaching here can surface AFTER
+        // privileged side effects already landed -- e.g. `withProvisionLock`'s
+        // finally re-throws a non-ENOENT lock-release error even when
+        // `runProvisionFlow` already created the account, re-homed the secrets, or
+        // ARMED the wall. The pre-fix copy asserted provisioning "did not
+        // complete" and told the operator to blindly re-run, which is wrong (and
+        // unsafe) if the wall is in fact armed over a half-provisioned agent. The
+        // catch cannot know how far the flow got, so it must not claim a
+        // completion state: warn that it may have PARTIALLY applied and that the
+        // armed state must be checked before re-running.
+        //
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this
+        // subcommand; never surface secrets or key material here.
+        console.error(
+          `  WARNING: automatic account provisioning raised an error (${(err as Error).message}). ` +
+            `It may have PARTIALLY applied -- the dedicated account, the re-home, or an armed Castle Wall could ` +
+            `already be in place. The cooperative wrap above still applies. Do NOT assume nothing happened: check ` +
+            `whether Castle Wall is armed before re-running, and run 'sudo sanctuary castle-wall disable' if it is ` +
+            `enforcing over a half-provisioned agent.`,
+        );
+        summary = { ran: true };
+      }
     }
+  } finally {
+    deferredSignal = mutationWindowOpened ? closeAutoProvisionMutationWindow() : undefined;
   }
-  const deferredSignal = mutationWindowOpened ? closeAutoProvisionMutationWindow() : undefined;
   return { summary, deferredSignal };
 }
 
@@ -2696,6 +2685,7 @@ export async function runWrap(
     let mutationWindowOpened = false;
     let deferredSignal: NodeJS.Signals | undefined;
     let code = 2;
+    let thrown: unknown;
     try {
       code = await runEgressGateRepairForCli({
         isTty: process.stdin.isTTY === true,
@@ -2707,10 +2697,13 @@ export async function runWrap(
           return mutationWindowOpened;
         },
       });
+    } catch (err) {
+      thrown = err;
     } finally {
       deferredSignal = mutationWindowOpened ? closeAutoProvisionMutationWindow() : undefined;
     }
     await exitAfterDeferredAutoProvisionSignal(deferredSignal);
+    if (thrown !== undefined) throw thrown;
     process.exit(code);
   }
 
@@ -2723,6 +2716,7 @@ export async function runWrap(
     let mutationWindowOpened = false;
     let deferredSignal: NodeJS.Signals | undefined;
     let code = 2;
+    let thrown: unknown;
     try {
       code = await runEgressGateUnprotectForCli({
         standDownAgent: options.standDownAgent === true,
@@ -2732,10 +2726,13 @@ export async function runWrap(
           return mutationWindowOpened;
         },
       });
+    } catch (err) {
+      thrown = err;
     } finally {
       deferredSignal = mutationWindowOpened ? closeAutoProvisionMutationWindow() : undefined;
     }
     await exitAfterDeferredAutoProvisionSignal(deferredSignal);
+    if (thrown !== undefined) throw thrown;
     process.exit(code);
   }
 

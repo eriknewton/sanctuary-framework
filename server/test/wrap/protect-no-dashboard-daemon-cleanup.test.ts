@@ -121,6 +121,7 @@ describe("protect --hermes --no-dashboard transient Castle Wall cleanup", () => 
     expect(castleWallMocks.startMacOSCastleWallDaemon).toHaveBeenCalledTimes(1);
     expect(runAutoProvisionForWrap).toHaveBeenCalledTimes(1);
     expect(castleWallMocks.stop).toHaveBeenCalledTimes(1);
+    expect(__processShutdownCleanupCountForTest()).toBe(0);
   });
 
   it("registers the --no-dashboard audit flush during setup, then unregisters it after the explicit flush", async () => {

@@ -38,12 +38,13 @@ import {
   vi,
 } from "vitest";
 import { spawn } from "node:child_process";
-import { cp, mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
+  __processShutdownCleanupCountForTest,
   __resetProcessShutdownStateForTest,
   handleProcessShutdownSignal,
   PROCESS_SHUTDOWN_REPEAT_SIGNAL_GRACE_MS,
@@ -57,6 +58,7 @@ import {
   __registerStandaloneProcessCleanupForTest,
   __resetStandaloneShutdownStateForTest,
   handleStandaloneShutdownSignal,
+  startStandaloneDashboard,
 } from "../../src/dashboard-standalone.js";
 import type { AutoProvisionSummary } from "../../src/wrap/auto-provision.js";
 import {
@@ -68,6 +70,8 @@ import {
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const fixturesDir = join(__dirname, "..", "harness", "fixtures");
 const wrapCliModuleUrl = pathToFileURL(join(__dirname, "..", "..", "src", "wrap", "cli.ts")).href;
+const wrapCliSourcePath = join(__dirname, "..", "..", "src", "wrap", "cli.ts");
+const autoProvisionSourcePath = join(__dirname, "..", "..", "src", "wrap", "auto-provision.ts");
 
 function sleepMs(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -110,6 +114,19 @@ async function runNodeSignalScript(script: string): Promise<{
 }
 
 // ── Fix 1: signal handlers must exit ─────────────────────────────────────
+
+describe("provision forced-exit lock ownership", () => {
+  it("does not carry a CLI-side raw provision-lock unlink; ownership-tracked realLockOps owns exit cleanup", async () => {
+    const cliSource = await readFile(wrapCliSourcePath, "utf8");
+    const autoProvisionSource = await readFile(autoProvisionSourcePath, "utf8");
+
+    expect(cliSource).not.toContain("releaseProvisionLockBeforeForcedExit");
+    expect(cliSource).not.toContain("rmSync(PROVISION_LOCK_PATH");
+    expect(cliSource).not.toContain("autoProvisionLockReleaseOwedForForcedExit");
+    expect(autoProvisionSource).toContain("if (heldLockPath === undefined) return;");
+    expect(autoProvisionSource).toContain("unlinkSync(heldLockPath)");
+  });
+});
 
 describe("handleProcessShutdownSignal (wrap/cli.ts) exits after cleanups", () => {
   let exitSpy: ReturnType<typeof vi.spyOn>;
@@ -226,7 +243,7 @@ describe("handleProcessShutdownSignal (wrap/cli.ts) exits after cleanups", () =>
     }
   });
 
-  it("repeat non-provisioning signals are bounded: the second waits one grace window, the third exits immediately", async () => {
+  it("repeat non-provisioning mixed signals are bounded and preserve the first signal's exit code", async () => {
     vi.useFakeTimers();
     const cleanupEntered = deferred<void>();
     registerProcessShutdownCleanup(async () => {
@@ -238,11 +255,11 @@ describe("handleProcessShutdownSignal (wrap/cli.ts) exits after cleanups", () =>
       void handleProcessShutdownSignal("SIGTERM");
       await cleanupEntered.promise;
 
-      const second = handleProcessShutdownSignal("SIGTERM");
+      const second = handleProcessShutdownSignal("SIGINT");
       await vi.advanceTimersByTimeAsync(PROCESS_SHUTDOWN_REPEAT_SIGNAL_GRACE_MS - 1);
       expect(exitSpy).not.toHaveBeenCalled();
 
-      await handleProcessShutdownSignal("SIGTERM");
+      await handleProcessShutdownSignal("SIGINT");
       expect(exitSpy).toHaveBeenCalledWith(143);
       expect(exitSpy).toHaveBeenCalledTimes(1);
 
@@ -342,6 +359,27 @@ describe("runWrap: signals during in-flight provisioning refuse once, then force
     };
   }
 
+  function fakeDashboardDeps(overrides: Partial<RunWrapDeps> = {}): RunWrapDeps {
+    const fakeHandle = {
+      url: "http://127.0.0.1:3501",
+      port: 3501,
+      host: "127.0.0.1",
+      mode: "co-located",
+      stop: vi.fn(async () => {}),
+      publish: () => {},
+      publishActivity: () => {},
+      publishApproval: () => {},
+      updateSources: () => {},
+      setV11Bindings: () => {},
+      setV11LoopbackAutoAuth: () => {},
+      createSessionUrl: () => "http://127.0.0.1:3501/session",
+    };
+    return deps({
+      startDashboard: vi.fn(async () => fakeHandle as never),
+      ...overrides,
+    });
+  }
+
   function neverSettlingProvisionRunner(): {
     entered: Promise<void>;
     finish: () => void;
@@ -411,7 +449,7 @@ describe("runWrap: signals during in-flight provisioning refuse once, then force
     }
   });
 
-  it("a second SIGTERM during provisioning exits promptly without waiting for provisioning", async () => {
+  it("a second mixed signal during provisioning exits promptly with the first signal's code", async () => {
     const provision = neverSettlingProvisionRunner();
     const runPromise = runWrap(
       { hermes: true, noOpen: true, noDashboard: true },
@@ -427,13 +465,13 @@ describe("runWrap: signals during in-flight provisioning refuse once, then force
         ),
       );
 
-      await handleProcessShutdownSignal("SIGTERM");
+      await handleProcessShutdownSignal("SIGINT");
       await vi.waitFor(() => expect(exitSpy).toHaveBeenCalledWith(143), { timeout: 250 });
 
       // Fails if the non-provisioning latch is reused here: the second signal
       // waits for the never-settling provisioning promise and does not exit.
       expect(stderrSpy.mock.calls.flat().join("\n")).toContain(
-        renderAutoProvisionForcedExitWarning("SIGTERM"),
+        renderAutoProvisionForcedExitWarning("SIGINT", { firstSignal: "SIGTERM" }),
       );
     } finally {
       provision.finish();
@@ -471,6 +509,31 @@ describe("runWrap: signals during in-flight provisioning refuse once, then force
     }
   });
 
+  it("closes the provisioning mutation window in a finally even when error reporting throws", async () => {
+    stderrSpy.mockImplementation((message?: unknown) => {
+      if (String(message).includes("automatic account provisioning raised an error")) {
+        throw new Error("console-failed");
+      }
+    });
+    const runAutoProvisionForWrap = vi.fn(async (options): Promise<AutoProvisionSummary> => {
+      await options.beforeFirstMutation?.();
+      throw new Error("runner-failed");
+    });
+
+    await expect(
+      runWrap(
+        { hermes: true, noOpen: true, noDashboard: true },
+        deps({ runAutoProvisionForWrap }),
+      ),
+    ).rejects.toThrow("console-failed");
+
+    await handleProcessShutdownSignal("SIGTERM");
+    expect(exitSpy).toHaveBeenCalledWith(143);
+    expect(stderrSpy.mock.calls.flat().join("\n")).not.toContain(
+      "account provisioning is mid-flight",
+    );
+  });
+
   it("the forced-exit warning is honest about residual state and never claims rollback restored anything", async () => {
     const warning = renderAutoProvisionForcedExitWarning("SIGTERM");
 
@@ -478,9 +541,11 @@ describe("runWrap: signals during in-flight provisioning refuse once, then force
     expect(warning).toContain("machine may be in a partial state");
     expect(warning).toContain("Some shutdown records may be missing");
     expect(warning).toContain("Castle Wall teardown did not run");
-    expect(warning).toContain("provision lock may remain");
+    expect(warning).toContain("a provision lock can remain only after an abrupt process death outside the exit path");
     expect(warning).toContain("sudo sanctuary protect --hermes --provision-agent-account");
-    expect(warning).toContain("/var/run/sanctuary-provision.lock");
+    expect(warning).toContain("The provision lock is released on forced exit");
+    expect(warning).not.toContain("If manual recovery is needed: Recover from an interactive terminal with:");
+    expect(warning).not.toContain("verify no 'sanctuary protect' process is running");
     expect(warning).toContain("sudo sanctuary castle-wall disable");
     expect(warning).not.toContain("filter_stopped");
     expect(warning).not.toContain("shutdown audit flush");
@@ -491,9 +556,11 @@ describe("runWrap: signals during in-flight provisioning refuse once, then force
   it("exclusive-egress signal recovery names the repair verb and stand-down acknowledgement", () => {
     const warning = renderAutoProvisionForcedExitWarning("SIGTERM", { exclusiveEgress: true });
 
-    expect(warning).toContain("After checking the machine state");
+    expect(warning).toContain("after checking the machine state");
     expect(warning).toContain("sudo sanctuary protect --hermes --provision-agent-account");
     expect(warning).toContain("sudo sanctuary protect --repair-egress-gate --stand-down-agent");
+    expect(warning).toContain("sudo sanctuary protect --hermes --provision-agent-account from an interactive terminal");
+    expect(warning).not.toContain("repair-egress-gate --stand-down-agent from an interactive terminal");
     expect(warning).toContain("sudo sanctuary castle-wall disable");
     expect(warning).toContain("exclusive-egress gate generation exists");
   });
@@ -550,7 +617,29 @@ describe("runWrap: signals during in-flight provisioning refuse once, then force
     expect(result.stderr).toContain(renderAutoProvisionSignalRefusal("SIGTERM"));
   });
 
-  it("an isolated real second SIGTERM during provisioning exits promptly", async () => {
+  it("the dashboard branch renders provisioning outcome before honoring a deferred signal", async () => {
+    const runAutoProvisionForWrap = vi.fn(async (options): Promise<AutoProvisionSummary> => {
+      await options.beforeFirstMutation?.();
+      await handleProcessShutdownSignal("SIGTERM");
+      return { ran: true, outcome: { kind: "armed", uid: 503 } };
+    });
+    exitSpy.mockImplementation(((code?: number) => {
+      throw new Error(`process.exit:${code ?? 0}`);
+    }) as never);
+
+    await expect(
+      runWrap(
+        { hermes: true, noOpen: true },
+        fakeDashboardDeps({ runAutoProvisionForWrap }),
+      ),
+    ).rejects.toThrow("process.exit:143");
+
+    const printed = stderrSpy.mock.calls.flat().join("\n");
+    expect(printed).toContain(renderAutoProvisionSignalRefusal("SIGTERM"));
+    expect(printed).toContain("Dedicated agent account provisioned and Castle Wall armed (uid 503)");
+  });
+
+  it("an isolated real mixed second signal during provisioning exits promptly with the first signal's code", async () => {
     const result = await runNodeSignalScript(`
       const {
         __setAutoProvisionMutationInFlightForTest,
@@ -562,7 +651,7 @@ describe("runWrap: signals during in-flight provisioning refuse once, then force
       process.kill(process.pid, "SIGTERM");
       setTimeout(() => {
         console.log("sending-second");
-        process.kill(process.pid, "SIGTERM");
+        process.kill(process.pid, "SIGINT");
       }, 30);
       setTimeout(() => process.exit(99), 1000);
     `);
@@ -572,7 +661,7 @@ describe("runWrap: signals during in-flight provisioning refuse once, then force
     expect(result.code).toBe(143);
     expect(result.stdout).toContain("sending-second");
     expect(result.stderr).toContain(renderAutoProvisionSignalRefusal("SIGTERM"));
-    expect(result.stderr).toContain(renderAutoProvisionForcedExitWarning("SIGTERM"));
+    expect(result.stderr).toContain(renderAutoProvisionForcedExitWarning("SIGINT", { firstSignal: "SIGTERM" }));
   });
 
   it("shutdown already in flight prevents the provisioning mutation window from opening", async () => {
@@ -636,6 +725,22 @@ describe("handleStandaloneShutdownSignal (dashboard-standalone.ts) exits after c
   it("exits with 143 (128 + SIGTERM=15) on SIGTERM", async () => {
     await handleStandaloneShutdownSignal("SIGTERM");
     expect(exitSpy).toHaveBeenCalledWith(143);
+  });
+
+  it("startStandaloneDashboard installs shutdown listeners before early boot failures", async () => {
+    await expect(
+      startStandaloneDashboard({
+        tenant: "missing",
+        discoveryOptions: {
+          home: tmpdir(),
+          root: join(tmpdir(), "sanctuary-no-tenants"),
+          env: {},
+        },
+      }),
+    ).rejects.toThrow(/did not match any wrapped tenant/);
+
+    expect(process.listeners("SIGTERM")).toContain(handleStandaloneShutdownSignal);
+    expect(process.listeners("SIGINT")).toContain(handleStandaloneShutdownSignal);
   });
 
   // FIX (N1-1 second-signal, 2026-07-27 harden-loop): same latch as
@@ -733,6 +838,7 @@ describe("runWrap: declined step-2 arm confirm does not exit, matching the accep
   });
 
   afterEach(async () => {
+    __resetProcessShutdownStateForTest();
     stderrSpy.mockRestore();
     exitSpy.mockRestore();
     clearHermesParityHook();
@@ -805,6 +911,7 @@ describe("runWrap: declined step-2 arm confirm does not exit, matching the accep
 
     expect(stopSpy).not.toHaveBeenCalled();
     expect(exitSpy).not.toHaveBeenCalled();
+    expect(__processShutdownCleanupCountForTest()).toBe(1);
   });
 });
 
