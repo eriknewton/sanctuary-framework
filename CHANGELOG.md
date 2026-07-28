@@ -4,7 +4,19 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
-## [1.7.1] - 2026-07-27
+## [1.7.2] - 2026-07-27
+
+Patch release: fixes the release pipeline so the signed macOS Castle Wall app can actually launch. No server-side code changes.
+
+The CI-built macOS app attached to v1.7.0 and v1.7.1 was signed and notarized but could not launch on any Mac. The binaries claim restricted entitlements (system extension install plus the NetworkExtension content filter provider), and macOS AMFI refuses to spawn a restricted-entitlement binary whose bundle carries no embedded provisioning profile. The local operator build embedded two profiles (one in the outer app, one in the nested system extension bundle) from files on the build machine; the CI workflow had no copy of either, and the build script's missing-profile branch only warned and continued. Signing, notarization, stapling, and spctl all pass on such a bundle, so nothing in the pipeline caught it.
+
+### Release pipeline
+
+- **The provisioning profiles are committed to the repo (`castle-wall-macos/signing/`) and embedded in CI builds before signing.** A provisioning profile is not a secret: it ships inside every distributed app and cannot sign anything. The build script now resolves profiles from an explicit override, the operator's local copy, or the repo copies, and a missing profile is a hard build failure in wrapped mode instead of a warning, because the output could never launch (#1035).
+- **Fail-closed launchability assertions run before notarization.** A new `verify-embedded-profiles.sh` asserts that both embedded profile placements exist, that every restricted entitlement the signed binaries claim is covered by the embedded profile's grant, and that `codesign --verify --deep --strict` passes; each failure names exactly what is missing. The release workflow and the local wrapped build both run it (#1035).
+- **A launch smoke test runs on the CI runner after signing and stapling.** It direct-executes the host binary under a watchdog and fails loudly on a signal death or exec refusal (the AMFI kill measured on the v1.7.1 asset is an instant SIGKILL, exit 137). The test proves the shipped bundle spawns and executes application code on a stock macOS runner; it does not prove filter enforcement, system extension activation, or a GUI launch (#1035).
+
+
 
 Patch release: completes the exclusive-egress gate path that shipped in v1.7.0, the first signed and notarized macOS release. No new capability.
 

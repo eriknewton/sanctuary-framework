@@ -215,6 +215,37 @@ jobs:
           bash scripts/build-wrapped.sh
           bash scripts/build-signed.sh --wrapped --allow-unnotarized
 
+      # Fail-closed launchability assertions, BEFORE notarization spends time
+      # and an Apple round-trip on a bundle that cannot launch.
+      #
+      # Why: the v1.7.0 and v1.7.1 release assets were signed and notarized
+      # but could not launch on any Mac. Their binaries claim restricted
+      # entitlements (com.apple.developer.system-extension.install plus the
+      # networkextension content-filter provider), and AMFI refuses to spawn
+      # a restricted-entitlement binary whose bundle has no
+      # Contents/embedded.provisionprofile ("Launchd job spawn failed", RBS
+      # error 5). Signing, notarization, spctl, and stapler ALL pass on such
+      # a bundle; none of them checks for the profile. These assertions do.
+      #
+      # The profiles now live in the repo at castle-wall-macos/signing/ and
+      # are embedded by build-signed.sh before codesign seals the bundle. A
+      # provisioning profile is NOT a secret: it ships inside every
+      # distributed app, readable by anyone who downloads the release zip,
+      # and cannot sign anything.
+      #
+      # The script asserts, each failure naming exactly what is missing:
+      #   1. Contents/embedded.provisionprofile exists in the outer app;
+      #   2. the nested .systemextension has its own embedded profile
+      #      (the working local build carries both);
+      #   3. every restricted entitlement the signed binaries claim is
+      #      covered by the embedded profile's grant (security cms -D +
+      #      plist comparison);
+      #   4. codesign --verify --deep --strict passes (a profile copied in
+      #      AFTER signing breaks the seal and fails here).
+      - name: Assert embedded provisioning profiles and entitlement coverage
+        working-directory: castle-wall-macos
+        run: bash scripts/verify-embedded-profiles.sh build/Sanctuary-CastleWall.app
+
       # Ordering matters and was wrong before: the uploaded artifact used to be a
       # zip taken BEFORE `stapler staple`, so Apple held the ticket while the
       # shipped bundle did not carry it. That bundle passes `spctl` on a machine
@@ -249,6 +280,88 @@ jobs:
 
           # Artifact zip is produced from the STAPLED bundle.
           ditto -c -k --keepParent build/Sanctuary-CastleWall.app build/Sanctuary-CastleWall.app.zip
+
+      # Launch smoke test: prove the exact bundle we ship can be SPAWNED.
+      #
+      # Mechanism: direct-exec the host binary in `--headless status` mode
+      # (built for no-WindowServer contexts) under a watchdog. An AMFI spawn
+      # refusal kills the process with SIGKILL before main() ever runs and
+      # produces no output; measured on the broken v1.7.1 asset this is an
+      # instant exit 137. So the classification is:
+      #   - killed by a signal (exit >= 128) or exec failure (126/127):
+      #     FAIL loudly with the signal/exit diagnosis. This is the
+      #     v1.7.0/v1.7.1 defect class.
+      #   - any controlled exit (0-4, the headless CLI contract codes): PASS.
+      #     AMFI refusal can never produce a controlled exit, so reaching
+      #     main() and returning a contract code proves spawnability.
+      #   - still alive after the watchdog cap: it spawned and ran; kill it
+      #     and PASS.
+      #
+      # What this proves and does not prove: it proves the signed, stapled
+      # bundle passes the AMFI entitlement/profile check and executes our
+      # code on a stock macOS runner - the exact check that killed
+      # v1.7.0/v1.7.1. It does NOT prove filter enforcement, system
+      # extension activation (needs one-time console consent), or a full
+      # LaunchServices GUI launch (a CI runner has no interactive login
+      # session to test that in); those remain hardware-drill territory.
+      - name: Launch smoke test (spawnability, fail closed)
+        working-directory: castle-wall-macos
+        run: |
+          set -uo pipefail
+          BIN="build/Sanctuary-CastleWall.app/Contents/MacOS/CastleWallHostApp"
+          test -x "$BIN" || { echo "::error::smoke test: host binary missing at $BIN"; exit 1; }
+
+          "$BIN" --headless status > "$RUNNER_TEMP/smoke-out.txt" 2> "$RUNNER_TEMP/smoke-err.txt" &
+          pid=$!
+
+          # 3-second watchdog window: AMFI kills are effectively instant.
+          early_death=false
+          for _ in $(seq 1 30); do
+            kill -0 "$pid" 2>/dev/null || { early_death=true; break; }
+            sleep 0.1
+          done
+
+          we_killed=false
+          if [ "$early_death" = false ]; then
+            # Survived the spawn window. Allow up to 35 more seconds for the
+            # headless status call (30s internal timeout) to exit on its own,
+            # then reap it ourselves.
+            for _ in $(seq 1 350); do
+              kill -0 "$pid" 2>/dev/null || break
+              sleep 0.1
+            done
+            if kill -0 "$pid" 2>/dev/null; then
+              we_killed=true
+              kill -9 "$pid" 2>/dev/null || true
+            fi
+          fi
+
+          set +e
+          wait "$pid"
+          status=$?
+          set -e
+
+          echo "--- stdout ---"; cat "$RUNNER_TEMP/smoke-out.txt" || true
+          echo "--- stderr ---"; cat "$RUNNER_TEMP/smoke-err.txt" || true
+
+          if [ "$we_killed" = true ]; then
+            echo "smoke test PASS: process spawned and was still running at the watchdog cap (killed by the test, not the OS)."
+            exit 0
+          fi
+          if [ "$status" -ge 128 ]; then
+            sig=$((status - 128))
+            echo "::error::smoke test FAIL: host binary died from signal $sig (exit $status). Signal 9 within the spawn window is the AMFI kill that shipped in v1.7.0/v1.7.1 (restricted entitlements without an embedded provisioning profile)."
+            exit 1
+          fi
+          if [ "$status" -eq 126 ] || [ "$status" -eq 127 ]; then
+            echo "::error::smoke test FAIL: host binary could not be executed at all (exit $status)."
+            exit 1
+          fi
+          if [ "$status" -le 4 ]; then
+            echo "smoke test PASS: controlled exit $status (headless CLI contract code); the process spawned and executed application code."
+          else
+            echo "smoke test PASS on spawnability: controlled exit $status (outside the 0-4 contract range, logged for the record); the process spawned and executed application code."
+          fi
 
       - name: Upload signed artifact
         uses: actions/upload-artifact@v7
