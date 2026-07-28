@@ -3132,7 +3132,8 @@ export async function runEgressGateRepairUnderProvisionLock(
       // plus the lock error message (a lock-path only, no secrets).
       print(
         `Repair refused: another 'sanctuary protect' provisioning run is already in progress ` +
-          `(${(err as Error).message}); this run made NO changes. Wait for it to finish, then re-run.`,
+          `(${(err as Error).message}); this run made NO changes. If a protect process is actually running, wait for it to finish; ` +
+          `if not, remove the stale lock file named above and re-run.`,
       );
       return { locked: false };
     }
@@ -3159,6 +3160,7 @@ export async function runEgressGateRepairForCli(options: {
   cliBinary?: string;
   getuid?: () => number;
   resolveOperatorIdentity?: () => Promise<OperatorIdentity | undefined>;
+  beforeFirstMutation?: () => boolean | Promise<boolean>;
 }): Promise<number> {
   // SAFETY: stderr is the operator-facing CLI channel for this subcommand;
   // this is only the default when no `print` override is supplied (the CLI
@@ -3234,6 +3236,10 @@ export async function runEgressGateRepairForCli(options: {
   // unprotect (`withUnprotectLock`) paths take, so arm, repair, and unprotect
   // are genuinely mutually exclusive. See {@link runEgressGateRepairUnderProvisionLock}
   // for the rationale and the no-self-deadlock argument.
+  if (options.beforeFirstMutation !== undefined && !(await options.beforeFirstMutation())) {
+    print("Repair did not start because shutdown is already in flight; no exclusive-egress changes were made.");
+    return 2;
+  }
   const locked = await runEgressGateRepairUnderProvisionLock(
     () =>
       runEgressGateRepair(
@@ -3378,6 +3384,7 @@ export async function runEgressGateUnprotectForCli(options: {
   standDownAgent?: boolean;
   getuid?: () => number;
   resolveOperatorIdentity?: () => Promise<OperatorIdentity | undefined>;
+  beforeFirstMutation?: () => boolean | Promise<boolean>;
 }): Promise<number> {
   // SAFETY: stderr is the operator-facing CLI channel for this subcommand;
   // this is only the default when no `print` override is supplied (the CLI
@@ -3409,6 +3416,10 @@ export async function runEgressGateUnprotectForCli(options: {
   const accountOps = realAccountProvisionOps();
   const agentUid = await accountOps.lookupAccountUid(accountName);
   if (agentUid === undefined || agentUid === null) {
+    if (options.beforeFirstMutation !== undefined && !(await options.beforeFirstMutation())) {
+      print("Unprotect did not start because shutdown is already in flight; no exclusive-egress changes were made.");
+      return 2;
+    }
     // FIX F3 (adversarial review, 2026-07-26): "nothing to unprotect" was FALSE
     // whenever the account went away while the fortress kept its
     // exclusive-routing files (a drill teardown, a restored fortress, an
@@ -3482,6 +3493,10 @@ export async function runEgressGateUnprotectForCli(options: {
     accountOps,
     ...(options.cliBinary !== undefined ? { cliBinary: options.cliBinary } : {}),
   });
+  if (options.beforeFirstMutation !== undefined && !(await options.beforeFirstMutation())) {
+    print("Unprotect did not start because shutdown is already in flight; no exclusive-egress changes were made.");
+    return 2;
+  }
   const outcome = await runEgressGateUnprotect(
     { agentUid },
     withExplicitStandDownAgent(createUnprotectExclusiveEgressOps(wiring), print, "--unprotect-egress-gate"),

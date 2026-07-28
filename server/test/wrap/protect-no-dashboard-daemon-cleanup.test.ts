@@ -24,7 +24,14 @@ vi.mock("../../src/castle-wall/runtime/index.js", () => ({
   isLinuxProducerSignedActivationRequested: () => false,
 }));
 
-import { runWrap, type RunWrapDeps } from "../../src/wrap/cli.js";
+import {
+  __processShutdownCleanupCountForTest,
+  __resetProcessShutdownStateForTest,
+  handleProcessShutdownSignal,
+  runWrap,
+  type RunWrapDeps,
+} from "../../src/wrap/cli.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
 import type { AutoProvisionSummary } from "../../src/wrap/auto-provision.js";
 import {
   agreeingHermesParity,
@@ -34,6 +41,17 @@ import {
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const fixturesDir = join(__dirname, "..", "harness", "fixtures");
+
+function deferred<T = void>(): {
+  promise: Promise<T>;
+  resolve: (value?: T | PromiseLike<T>) => void;
+} {
+  let resolve!: (value?: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((res) => {
+    resolve = res;
+  });
+  return { promise, resolve };
+}
 
 describe("protect --hermes --no-dashboard transient Castle Wall cleanup", () => {
   let tmpHome: string;
@@ -64,6 +82,7 @@ describe("protect --hermes --no-dashboard transient Castle Wall cleanup", () => 
   });
 
   afterEach(async () => {
+    __resetProcessShutdownStateForTest();
     vi.restoreAllMocks();
     clearHermesParityHook();
     if (originalHome === undefined) delete process.env.HOME;
@@ -102,5 +121,58 @@ describe("protect --hermes --no-dashboard transient Castle Wall cleanup", () => 
     expect(castleWallMocks.startMacOSCastleWallDaemon).toHaveBeenCalledTimes(1);
     expect(runAutoProvisionForWrap).toHaveBeenCalledTimes(1);
     expect(castleWallMocks.stop).toHaveBeenCalledTimes(1);
+  });
+
+  it("registers the --no-dashboard audit flush during setup, then unregisters it after the explicit flush", async () => {
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation(((
+      _code?: number,
+    ) => undefined) as never);
+    const flushSpy = vi.spyOn(AuditLog.prototype, "flush");
+    const registeredFlushEntered = deferred();
+    const releaseRegisteredFlush = deferred();
+    let flushCalls = 0;
+    let blockedRegisteredFlush = false;
+    flushSpy.mockImplementation(async function (
+    ): Promise<void> {
+      flushCalls += 1;
+      if (!blockedRegisteredFlush && __processShutdownCleanupCountForTest() > 0) {
+        blockedRegisteredFlush = true;
+        registeredFlushEntered.resolve();
+        await releaseRegisteredFlush.promise;
+      }
+    });
+    const runAutoProvisionForWrap = vi.fn(async (): Promise<AutoProvisionSummary> => ({
+      ran: true,
+      outcome: {
+        kind: "aborted",
+        stage: "root-check",
+        reason: "auto-provisioning requires root; re-run with sudo.",
+        rolledBack: false,
+        rehomeAttempted: false,
+      },
+    }));
+    const deps: RunWrapDeps = {
+      runAutoProvisionForWrap,
+      startDashboard: vi.fn(),
+      openBrowser: vi.fn(async () => undefined),
+      resolvePassphrase: async () => ({
+        value: "test-passphrase",
+        location: "test-keychain",
+        source: "generated",
+      }),
+    };
+
+    const run = runWrap({ hermes: true, noOpen: true, noDashboard: true }, deps);
+    await registeredFlushEntered.promise;
+    const flushCallsBeforeSignal = flushCalls;
+
+    await handleProcessShutdownSignal("SIGTERM");
+
+    expect(exitSpy).toHaveBeenCalledWith(143);
+    expect(flushCalls).toBeGreaterThan(flushCallsBeforeSignal);
+
+    releaseRegisteredFlush.resolve();
+    await run;
+    expect(__processShutdownCleanupCountForTest()).toBe(0);
   });
 });

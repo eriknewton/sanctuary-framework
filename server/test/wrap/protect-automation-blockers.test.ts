@@ -46,6 +46,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   __resetProcessShutdownStateForTest,
   handleProcessShutdownSignal,
+  PROCESS_SHUTDOWN_REPEAT_SIGNAL_GRACE_MS,
   registerProcessShutdownCleanup,
   renderAutoProvisionForcedExitWarning,
   renderAutoProvisionSignalRefusal,
@@ -120,6 +121,7 @@ describe("handleProcessShutdownSignal (wrap/cli.ts) exits after cleanups", () =>
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     __resetProcessShutdownStateForTest();
     exitSpy.mockRestore();
   });
@@ -132,6 +134,19 @@ describe("handleProcessShutdownSignal (wrap/cli.ts) exits after cleanups", () =>
   it("exits with 143 (128 + SIGTERM=15) on SIGTERM", async () => {
     await handleProcessShutdownSignal("SIGTERM");
     expect(exitSpy).toHaveBeenCalledWith(143);
+  });
+
+  it("runWrap installs shutdown listeners immediately, before any cleanup registration or early validation exit", async () => {
+    exitSpy.mockImplementationOnce(((code?: number) => {
+      throw new Error(`process.exit:${code ?? 0}`);
+    }) as never);
+
+    await expect(
+      runWrap({ noOpen: true, noDashboard: true, devDist: "/definitely/not/a/sanctuary-cli.js" }),
+    ).rejects.toThrow("process.exit:2");
+
+    expect(process.listeners("SIGTERM")).toContain(handleProcessShutdownSignal);
+    expect(process.listeners("SIGINT")).toContain(handleProcessShutdownSignal);
   });
 
   // FIX (N1-1 corrected, 2026-07-27): the handler must AWAIT every
@@ -208,6 +223,34 @@ describe("handleProcessShutdownSignal (wrap/cli.ts) exits after cleanups", () =>
     } finally {
       finishCleanup.resolve();
       stderrSpy.mockRestore();
+    }
+  });
+
+  it("repeat non-provisioning signals are bounded: the second waits one grace window, the third exits immediately", async () => {
+    vi.useFakeTimers();
+    const cleanupEntered = deferred<void>();
+    registerProcessShutdownCleanup(async () => {
+      cleanupEntered.resolve();
+      await new Promise<void>(() => {});
+    });
+
+    try {
+      void handleProcessShutdownSignal("SIGTERM");
+      await cleanupEntered.promise;
+
+      const second = handleProcessShutdownSignal("SIGTERM");
+      await vi.advanceTimersByTimeAsync(PROCESS_SHUTDOWN_REPEAT_SIGNAL_GRACE_MS - 1);
+      expect(exitSpy).not.toHaveBeenCalled();
+
+      await handleProcessShutdownSignal("SIGTERM");
+      expect(exitSpy).toHaveBeenCalledWith(143);
+      expect(exitSpy).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(1);
+      await second;
+      expect(exitSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
     }
   });
 
@@ -431,22 +474,35 @@ describe("runWrap: signals during in-flight provisioning refuse once, then force
   it("the forced-exit warning is honest about residual state and never claims rollback restored anything", async () => {
     const warning = renderAutoProvisionForcedExitWarning("SIGTERM");
 
-    expect(warning).toContain("rollback did NOT run");
+    expect(warning).toContain("no rollback was attempted");
     expect(warning).toContain("machine may be in a partial state");
-    expect(warning).toContain("audit trail may be incomplete");
+    expect(warning).toContain("Some shutdown records may be missing");
     expect(warning).toContain("Castle Wall teardown did not run");
-    expect(warning).toContain("filter_stopped close record may be missing");
+    expect(warning).toContain("provision lock may remain");
     expect(warning).toContain("sudo sanctuary protect --hermes --provision-agent-account");
+    expect(warning).toContain("/var/run/sanctuary-provision.lock");
     expect(warning).toContain("sudo sanctuary castle-wall disable");
+    expect(warning).not.toContain("filter_stopped");
+    expect(warning).not.toContain("shutdown audit flush");
+    expect(warning).not.toContain("audit trail may be incomplete");
     expect(warning).not.toMatch(/fast-disarmed|rollback ran|rollback was observed|restored/i);
   });
 
   it("exclusive-egress signal recovery names the repair verb and stand-down acknowledgement", () => {
     const warning = renderAutoProvisionForcedExitWarning("SIGTERM", { exclusiveEgress: true });
 
+    expect(warning).toContain("After checking the machine state");
+    expect(warning).toContain("sudo sanctuary protect --hermes --provision-agent-account");
     expect(warning).toContain("sudo sanctuary protect --repair-egress-gate --stand-down-agent");
     expect(warning).toContain("sudo sanctuary castle-wall disable");
-    expect(warning).not.toContain("sudo sanctuary protect --hermes --provision-agent-account");
+    expect(warning).toContain("exclusive-egress gate generation exists");
+  });
+
+  it("mixed provisioning repeat-signal copy names the earlier signal instead of saying the new signal happened again", () => {
+    const warning = renderAutoProvisionForcedExitWarning("SIGTERM", { firstSignal: "SIGINT" });
+
+    expect(warning).toContain("after an earlier SIGINT");
+    expect(warning).not.toContain("received SIGTERM again");
   });
 
   it("an isolated real kill during provisioning is deferred and exits after provisioning closes", async () => {
@@ -490,6 +546,7 @@ describe("runWrap: signals during in-flight provisioning refuse once, then force
     expect(result.code).toBe(143);
     expect(result.stdout).toContain("mutation-entered");
     expect(result.stdout).toContain("provisioning-finished");
+    expect(result.stderr).toContain("Dedicated agent account provisioned and Castle Wall armed (uid 503)");
     expect(result.stderr).toContain(renderAutoProvisionSignalRefusal("SIGTERM"));
   });
 
@@ -566,6 +623,7 @@ describe("handleStandaloneShutdownSignal (dashboard-standalone.ts) exits after c
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     __resetStandaloneShutdownStateForTest();
     exitSpy.mockRestore();
   });
@@ -612,6 +670,30 @@ describe("handleStandaloneShutdownSignal (dashboard-standalone.ts) exits after c
     expect(firstSettled).toBe(true);
     expect(lateSettled).toBe(true);
     expect(exitSpy).toHaveBeenCalledWith(143);
+  });
+
+  it("repeat standalone signals are bounded: the second waits one grace window, the third exits immediately", async () => {
+    vi.useFakeTimers();
+    const cleanupEntered = deferred<void>();
+    __registerStandaloneProcessCleanupForTest(async () => {
+      cleanupEntered.resolve();
+      await new Promise(() => {});
+    });
+
+    void handleStandaloneShutdownSignal("SIGTERM");
+    await cleanupEntered.promise;
+
+    const second = handleStandaloneShutdownSignal("SIGINT");
+    await vi.advanceTimersByTimeAsync(PROCESS_SHUTDOWN_REPEAT_SIGNAL_GRACE_MS - 1);
+    expect(exitSpy).not.toHaveBeenCalled();
+
+    await handleStandaloneShutdownSignal("SIGINT");
+    expect(exitSpy).toHaveBeenCalledWith(143);
+    expect(exitSpy).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(1);
+    await second;
+    expect(exitSpy).toHaveBeenCalledTimes(1);
   });
 });
 

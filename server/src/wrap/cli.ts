@@ -29,6 +29,7 @@
  *   the advanced path; most operators want Layer 1.
  */
 
+import { rmSync } from "node:fs";
 import { writeFile, readFile, mkdir, access, lstat } from "node:fs/promises";
 import { dirname, join, resolve as resolvePath } from "node:path";
 import { Writable } from "node:stream";
@@ -89,7 +90,7 @@ import type {
   DisarmNePreferenceOutcome,
   ProvisionFlowOutcome,
 } from "../castle-wall/provision/index.js";
-import { ProvisionLockHeldError } from "../castle-wall/provision/index.js";
+import { PROVISION_LOCK_PATH, ProvisionLockHeldError } from "../castle-wall/provision/index.js";
 import { harnessDispositionSentence } from "../egress-gate/parked-claim.js";
 import {
   EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE,
@@ -178,15 +179,18 @@ let autoProvisionMutationInFlight = false;
 let autoProvisionSignalRefusedOnce = false;
 let autoProvisionPendingShutdownSignal: NodeJS.Signals | undefined;
 let pendingAutoProvisionWasExclusiveEgress = false;
+let autoProvisionLockReleaseOwedForForcedExit = false;
 let processShutdownRequestedSignal: NodeJS.Signals | undefined;
 
 const AUTO_PROVISION_SIGNAL_RECOVERY_COMMAND =
   "sudo sanctuary protect --hermes --provision-agent-account";
 
-function autoProvisionSignalRecoveryCommand(input?: { exclusiveEgress?: boolean }): string {
+function autoProvisionSignalRecoveryGuidance(input?: { exclusiveEgress?: boolean }): string {
+  const staleLockGuidance =
+    "If recovery reports the provision lock is still held, verify no 'sanctuary protect' process is running, then remove /var/run/sanctuary-provision.lock and retry.";
   return input?.exclusiveEgress === true
-    ? EGRESS_GATE_REPAIR_WITH_STAND_DOWN_COMMAND
-    : AUTO_PROVISION_SIGNAL_RECOVERY_COMMAND;
+    ? `After checking the machine state, use the matching recovery command at an interactive terminal: ${AUTO_PROVISION_SIGNAL_RECOVERY_COMMAND} if account creation or re-home did not reach exclusive-egress gate generation; ${EGRESS_GATE_REPAIR_WITH_STAND_DOWN_COMMAND} if an exclusive-egress gate generation exists. ${staleLockGuidance}`
+    : `Recover from an interactive terminal with: ${AUTO_PROVISION_SIGNAL_RECOVERY_COMMAND}. ${staleLockGuidance}`;
 }
 
 export function renderAutoProvisionSignalRefusal(
@@ -197,21 +201,25 @@ export function renderAutoProvisionSignalRefusal(
     `  WARNING: received ${signal} while account provisioning is mid-flight. ` +
     "Exiting now could leave this machine half-provisioned, so this shutdown request will be honored after provisioning closes. " +
     "Press Ctrl-C again (or send the signal again) to exit immediately anyway. " +
-    `If manual recovery is needed, run: ${autoProvisionSignalRecoveryCommand(input)}. ` +
-    "Before re-running, check whether Castle Wall is armed and run 'sudo sanctuary castle-wall disable' if it is enforcing over a half-provisioned agent."
+    `If manual recovery is needed: ${autoProvisionSignalRecoveryGuidance(input)} ` +
+    "Before changing state, check whether Castle Wall is armed; only run 'sudo sanctuary castle-wall disable' if it is enforcing over a half-provisioned agent."
   );
 }
 
 export function renderAutoProvisionForcedExitWarning(
   signal: NodeJS.Signals,
-  input?: { exclusiveEgress?: boolean },
+  input?: { exclusiveEgress?: boolean; firstSignal?: NodeJS.Signals },
 ): string {
+  const repeatDescription =
+    input?.firstSignal !== undefined && input.firstSignal !== signal
+      ? `received ${signal} while account provisioning is still mid-flight after an earlier ${input.firstSignal}`
+      : `received ${signal} again while account provisioning is still mid-flight`;
   return (
-    `  WARNING: received ${signal} again while account provisioning is still mid-flight; exiting now. ` +
-    "Provisioning was interrupted mid-flight, its rollback did NOT run, and the machine may be in a partial state. " +
-    "The audit trail may be incomplete, shutdown audit flush was abandoned, Castle Wall teardown did not run, and the filter_stopped close record may be missing. " +
-    `Recover with: ${autoProvisionSignalRecoveryCommand(input)}. ` +
-    "Before re-running, check whether Castle Wall is armed and run 'sudo sanctuary castle-wall disable' if it is enforcing over a half-provisioned agent."
+    `  WARNING: ${repeatDescription}; exiting now. ` +
+    "Provisioning was interrupted mid-flight, no rollback was attempted, and the machine may be in a partial state. " +
+    "Some shutdown records may be missing, Castle Wall teardown did not run, and the provision lock may remain. " +
+    `${autoProvisionSignalRecoveryGuidance(input)} ` +
+    "Before changing state, check whether Castle Wall is armed; only run 'sudo sanctuary castle-wall disable' if it is enforcing over a half-provisioned agent."
   );
 }
 
@@ -233,9 +241,21 @@ export function __resetProcessShutdownStateForTest(): void {
   autoProvisionSignalRefusedOnce = false;
   autoProvisionPendingShutdownSignal = undefined;
   pendingAutoProvisionWasExclusiveEgress = false;
+  autoProvisionLockReleaseOwedForForcedExit = false;
   processShutdownInFlight = undefined;
   processShutdownRequestedSignal = undefined;
+  processShutdownRepeatSignalCount = 0;
+  processShutdownExitIssued = false;
   processShutdownCleanups.clear();
+  process.removeListener("SIGINT", handleProcessShutdownSignal);
+  process.removeListener("SIGTERM", handleProcessShutdownSignal);
+  process.removeListener("exit", runProcessShutdownCleanups);
+  processShutdownListenersInstalled = false;
+}
+
+export function __processShutdownCleanupCountForTest(): number {
+  assertWrapCliTestHookAllowed("__processShutdownCleanupCountForTest");
+  return processShutdownCleanups.size;
 }
 
 function assertWrapCliTestHookAllowed(name: string): void {
@@ -298,6 +318,22 @@ const SIGNAL_EXIT_CODE: Partial<Record<NodeJS.Signals, number>> = {
 // mid-await. Outside the provisioning mutation window, repeat signals join the
 // same cleanup promise so audit flush / Castle Wall teardown are not abandoned.
 let processShutdownInFlight: Promise<void> | undefined;
+let processShutdownRepeatSignalCount = 0;
+let processShutdownExitIssued = false;
+export const PROCESS_SHUTDOWN_REPEAT_SIGNAL_GRACE_MS = 1_000;
+
+function waitForProcessShutdownGrace(
+  promise: Promise<void>,
+  ms: number,
+): Promise<"settled" | "timeout"> {
+  return new Promise((resolve) => {
+    const timeout = setTimeout(() => resolve("timeout"), ms);
+    promise.finally(() => {
+      clearTimeout(timeout);
+      resolve("settled");
+    });
+  });
+}
 
 export function installProcessShutdownListeners(): void {
   if (processShutdownListenersInstalled) return;
@@ -308,9 +344,26 @@ export function installProcessShutdownListeners(): void {
 }
 
 async function runProcessShutdownForSignal(signal: NodeJS.Signals): Promise<void> {
+  if (processShutdownExitIssued) return;
   processShutdownRequestedSignal ??= signal;
   if (processShutdownInFlight) {
-    await processShutdownInFlight;
+    processShutdownRepeatSignalCount += 1;
+    const exitCode = SIGNAL_EXIT_CODE[processShutdownRequestedSignal] ?? 128;
+    if (processShutdownRepeatSignalCount >= 2) {
+      processShutdownExitIssued = true;
+      processShutdownRequestedSignal = undefined;
+      process.exit(exitCode);
+      return;
+    }
+    const result = await waitForProcessShutdownGrace(
+      processShutdownInFlight,
+      PROCESS_SHUTDOWN_REPEAT_SIGNAL_GRACE_MS,
+    );
+    if (result === "timeout" && !processShutdownExitIssued) {
+      processShutdownExitIssued = true;
+      processShutdownRequestedSignal = undefined;
+      process.exit(exitCode);
+    }
     return;
   }
   processShutdownInFlight = runProcessShutdownCleanups();
@@ -318,20 +371,21 @@ async function runProcessShutdownForSignal(signal: NodeJS.Signals): Promise<void
     await processShutdownInFlight;
   } finally {
     processShutdownInFlight = undefined;
+    processShutdownRepeatSignalCount = 0;
   }
+  if (processShutdownExitIssued) return;
+  processShutdownExitIssued = true;
   process.exit(SIGNAL_EXIT_CODE[signal] ?? 128);
-  processShutdownRequestedSignal = undefined;
 }
 
-async function closeAutoProvisionMutationWindow(): Promise<void> {
+function closeAutoProvisionMutationWindow(): NodeJS.Signals | undefined {
   autoProvisionMutationInFlight = false;
   autoProvisionSignalRefusedOnce = false;
   pendingAutoProvisionWasExclusiveEgress = false;
+  autoProvisionLockReleaseOwedForForcedExit = false;
   const deferredSignal = autoProvisionPendingShutdownSignal;
   autoProvisionPendingShutdownSignal = undefined;
-  if (deferredSignal !== undefined) {
-    await runProcessShutdownForSignal(deferredSignal);
-  }
+  return deferredSignal;
 }
 
 function tryOpenAutoProvisionMutationWindow(options: WrapOptions): boolean {
@@ -348,7 +402,18 @@ function tryOpenAutoProvisionMutationWindow(options: WrapOptions): boolean {
   autoProvisionSignalRefusedOnce = false;
   autoProvisionPendingShutdownSignal = undefined;
   pendingAutoProvisionWasExclusiveEgress = options.exclusiveEgress === true;
+  autoProvisionLockReleaseOwedForForcedExit = true;
   return true;
+}
+
+function releaseProvisionLockBeforeForcedExit(): void {
+  if (!autoProvisionLockReleaseOwedForForcedExit) return;
+  autoProvisionLockReleaseOwedForForcedExit = false;
+  try {
+    rmSync(PROVISION_LOCK_PATH, { force: true });
+  } catch {
+    /* best-effort: forced-exit recovery guidance covers a remaining stale lock */
+  }
 }
 
 /** Exported for the seam: unit-test the exit code without sending real signals. */
@@ -370,8 +435,11 @@ export async function handleProcessShutdownSignal(
     // names only the signal and recovery command, never secrets.
     console.error(renderAutoProvisionForcedExitWarning(signal, {
       exclusiveEgress: pendingAutoProvisionWasExclusiveEgress,
+      firstSignal: autoProvisionPendingShutdownSignal,
     }));
     autoProvisionPendingShutdownSignal = undefined;
+    releaseProvisionLockBeforeForcedExit();
+    processShutdownExitIssued = true;
     process.exit(SIGNAL_EXIT_CODE[signal] ?? 128);
     return;
   }
@@ -2152,14 +2220,15 @@ async function maybeRunAutoProvisionForWrap(
   options: WrapOptions,
   deps: RunWrapDeps,
   stopTransientCastleWallDaemon?: () => Promise<void>,
-): Promise<AutoProvisionSummary> {
+): Promise<{ summary: AutoProvisionSummary; deferredSignal?: NodeJS.Signals }> {
   if (agentConfig.platform !== "hermes" || options.dryRun) {
-    return { ran: false };
+    return { summary: { ran: false } };
   }
   const runner = deps.runAutoProvisionForWrap ?? runAutoProvisionForWrap;
   let mutationWindowOpened = false;
+  let summary: AutoProvisionSummary;
   try {
-    return await runner({
+    summary = await runner({
       isTty: process.stdin.isTTY === true,
       preAnsweredProvision: options.provisionAgentAccount,
       cliBinary: resolveAutoProvisionCliBinary(options),
@@ -2187,35 +2256,43 @@ async function maybeRunAutoProvisionForWrap(
       // string plus the lock error message (a lock-path only, no secrets).
       console.error(
         `  Note: another 'sanctuary protect' provisioning run is already in progress (${(err as Error).message}); ` +
-          `this run made NO account, re-home, or Castle Wall changes. Wait for it to finish, then re-run if needed.`,
+          `this run made NO account, re-home, or Castle Wall changes. If a protect process is actually running, wait for it to finish; ` +
+          `if not, remove the stale lock file named above and re-run if needed.`,
       );
-      return { ran: true };
+      summary = { ran: true };
+    } else {
+      // FIX (round 5, item N5): a throw reaching here can surface AFTER
+      // privileged side effects already landed -- e.g. `withProvisionLock`'s
+      // finally re-throws a non-ENOENT lock-release error even when
+      // `runProvisionFlow` already created the account, re-homed the secrets, or
+      // ARMED the wall. The pre-fix copy asserted provisioning "did not
+      // complete" and told the operator to blindly re-run, which is wrong (and
+      // unsafe) if the wall is in fact armed over a half-provisioned agent. The
+      // catch cannot know how far the flow got, so it must not claim a
+      // completion state: warn that it may have PARTIALLY applied and that the
+      // armed state must be checked before re-running.
+      //
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this
+      // subcommand; never surface secrets or key material here.
+      console.error(
+        `  WARNING: automatic account provisioning raised an error (${(err as Error).message}). ` +
+          `It may have PARTIALLY applied -- the dedicated account, the re-home, or an armed Castle Wall could ` +
+          `already be in place. The cooperative wrap above still applies. Do NOT assume nothing happened: check ` +
+          `whether Castle Wall is armed before re-running, and run 'sudo sanctuary castle-wall disable' if it is ` +
+          `enforcing over a half-provisioned agent.`,
+      );
+      summary = { ran: true };
     }
-    // FIX (round 5, item N5): a throw reaching here can surface AFTER
-    // privileged side effects already landed -- e.g. `withProvisionLock`'s
-    // finally re-throws a non-ENOENT lock-release error even when
-    // `runProvisionFlow` already created the account, re-homed the secrets, or
-    // ARMED the wall. The pre-fix copy asserted provisioning "did not
-    // complete" and told the operator to blindly re-run, which is wrong (and
-    // unsafe) if the wall is in fact armed over a half-provisioned agent. The
-    // catch cannot know how far the flow got, so it must not claim a
-    // completion state: warn that it may have PARTIALLY applied and that the
-    // armed state must be checked before re-running.
-    //
-    // SAFETY: stderr / stdout is the operator-facing CLI channel for this
-    // subcommand; never surface secrets or key material here.
-    console.error(
-      `  WARNING: automatic account provisioning raised an error (${(err as Error).message}). ` +
-        `It may have PARTIALLY applied -- the dedicated account, the re-home, or an armed Castle Wall could ` +
-        `already be in place. The cooperative wrap above still applies. Do NOT assume nothing happened: check ` +
-        `whether Castle Wall is armed before re-running, and run 'sudo sanctuary castle-wall disable' if it is ` +
-        `enforcing over a half-provisioned agent.`,
-    );
-    return { ran: true };
-  } finally {
-    if (mutationWindowOpened) {
-      await closeAutoProvisionMutationWindow();
-    }
+  }
+  const deferredSignal = mutationWindowOpened ? closeAutoProvisionMutationWindow() : undefined;
+  return { summary, deferredSignal };
+}
+
+async function exitAfterDeferredAutoProvisionSignal(
+  deferredSignal: NodeJS.Signals | undefined,
+): Promise<void> {
+  if (deferredSignal !== undefined) {
+    await runProcessShutdownForSignal(deferredSignal);
   }
 }
 
@@ -2616,12 +2693,24 @@ export async function runWrap(
   // interactive `--override-transient-pf-rules`).
   if (options.repairEgressGate === true) {
     const { runEgressGateRepairForCli } = await import("./auto-provision.js");
-    const code = await runEgressGateRepairForCli({
-      isTty: process.stdin.isTTY === true,
-      overrideTransientPfRules: options.overrideTransientPfRules === true,
-      standDownAgent: options.standDownAgent === true,
-      cliBinary: resolveAutoProvisionCliBinary(options),
-    });
+    let mutationWindowOpened = false;
+    let deferredSignal: NodeJS.Signals | undefined;
+    let code = 2;
+    try {
+      code = await runEgressGateRepairForCli({
+        isTty: process.stdin.isTTY === true,
+        overrideTransientPfRules: options.overrideTransientPfRules === true,
+        standDownAgent: options.standDownAgent === true,
+        cliBinary: resolveAutoProvisionCliBinary(options),
+        beforeFirstMutation: () => {
+          mutationWindowOpened = tryOpenAutoProvisionMutationWindow(options);
+          return mutationWindowOpened;
+        },
+      });
+    } finally {
+      deferredSignal = mutationWindowOpened ? closeAutoProvisionMutationWindow() : undefined;
+    }
+    await exitAfterDeferredAutoProvisionSignal(deferredSignal);
     process.exit(code);
   }
 
@@ -2631,10 +2720,22 @@ export async function runWrap(
   // live and the anchor flushes only when the last agent leaves).
   if (options.unprotectEgressGate === true) {
     const { runEgressGateUnprotectForCli } = await import("./auto-provision.js");
-    const code = await runEgressGateUnprotectForCli({
-      standDownAgent: options.standDownAgent === true,
-      cliBinary: resolveAutoProvisionCliBinary(options),
-    });
+    let mutationWindowOpened = false;
+    let deferredSignal: NodeJS.Signals | undefined;
+    let code = 2;
+    try {
+      code = await runEgressGateUnprotectForCli({
+        standDownAgent: options.standDownAgent === true,
+        cliBinary: resolveAutoProvisionCliBinary(options),
+        beforeFirstMutation: () => {
+          mutationWindowOpened = tryOpenAutoProvisionMutationWindow(options);
+          return mutationWindowOpened;
+        },
+      });
+    } finally {
+      deferredSignal = mutationWindowOpened ? closeAutoProvisionMutationWindow() : undefined;
+    }
+    await exitAfterDeferredAutoProvisionSignal(deferredSignal);
     process.exit(code);
   }
 
@@ -3940,7 +4041,7 @@ export async function runWrap(
     let ndAuditLog: AuditLog | undefined;
     let ndAuditStorage: FilesystemStorage | undefined;
     let ndAuditMasterKey: Uint8Array | undefined;
-
+    let unregisterNoDashboardAuditFlush: (() => void) | undefined;
     // v1.3.0 (WWWWW, NNN regression): --no-dashboard wraps previously
     // skipped identity bootstrap because the creation lived after the
     // dashboard startup path. Derive the master key and create a default
@@ -3957,7 +4058,7 @@ export async function runWrap(
         ndAuditMasterKey = ndDerived.key;
         ndAuditLog = new AuditLog(ndStorage, ndDerived.key);
         const flushNoDashboardAuditLogOnShutdown = ndAuditLog;
-        registerProcessShutdownCleanup(async () => {
+        unregisterNoDashboardAuditFlush = registerProcessShutdownCleanup(async () => {
           try {
             await flushNoDashboardAuditLogOnShutdown.flush();
           } catch {
@@ -4001,6 +4102,7 @@ export async function runWrap(
           });
         }
         await ndAuditLog.flush();
+        unregisterNoDashboardAuditFlush?.();
       } catch (err) {
         // SAFETY: stderr / stdout is the operator-facing CLI channel.
         console.error(
@@ -4017,13 +4119,15 @@ export async function runWrap(
     // arm the wall. Runs AFTER, never blocking, the cooperative wrap: a
     // decline / non-TTY skip / mid-flow abort here never reverts anything
     // already done above (fix H4 -- the cooperative wrap always completes).
-    const autoProvisionSummary = await maybeRunAutoProvisionForWrap(
+    const autoProvisionRun = await maybeRunAutoProvisionForWrap(
       agentConfig,
       options,
       deps,
       stopTransientCastleWallDaemonForAutoProvision,
     );
+    const autoProvisionSummary = autoProvisionRun.summary;
     renderAutoProvisionOutcome(autoProvisionSummary);
+    await exitAfterDeferredAutoProvisionSignal(autoProvisionRun.deferredSignal);
     bestEffortUpsertLocalAgentProtectionSubject({
       storagePath,
       record: localAgentRecord,
@@ -4074,6 +4178,7 @@ export async function runWrap(
   let wrapAuditLog: AuditLog | undefined;
   let wrapAuditStorage: FilesystemStorage | undefined;
   let wrapAuditMasterKey: Uint8Array | undefined;
+  let unregisterWrapAuditFlush: (() => void) | undefined;
 
   // Start the dashboard in-process.
   const authToken = generateAuthToken();
@@ -4165,7 +4270,7 @@ export async function runWrap(
       // once, so this is harmless alongside the explicit `flush()` calls on
       // the normal-completion exit paths below.
       const flushAuditLogOnShutdown = wrapAuditLog;
-      registerProcessShutdownCleanup(async () => {
+      unregisterWrapAuditFlush = registerProcessShutdownCleanup(async () => {
         try {
           await flushAuditLogOnShutdown.flush();
         } catch {
@@ -4359,13 +4464,15 @@ export async function runWrap(
   // Auto-provision Step 2 (Build 1): see the matching call + comment in the
   // --no-dashboard branch above. Runs after the cooperative wrap (config +
   // identity + dashboard) has fully completed; never reverts it.
-  const autoProvisionSummary = await maybeRunAutoProvisionForWrap(
+  const autoProvisionRun = await maybeRunAutoProvisionForWrap(
     agentConfig,
     options,
     deps,
     stopTransientCastleWallDaemonForAutoProvision,
   );
+  const autoProvisionSummary = autoProvisionRun.summary;
   renderAutoProvisionOutcome(autoProvisionSummary);
+  await exitAfterDeferredAutoProvisionSignal(autoProvisionRun.deferredSignal);
   bestEffortUpsertLocalAgentProtectionSubject({
     storagePath,
     record: localAgentRecord,
@@ -4447,6 +4554,7 @@ export async function runWrap(
 
   if (wrapAuditLog) {
     await wrapAuditLog.flush();
+    unregisterWrapAuditFlush?.();
   }
 
   const castleWallProtectionClaim = await resolveWrapProtectionClaim({

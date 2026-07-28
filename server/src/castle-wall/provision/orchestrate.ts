@@ -1032,11 +1032,15 @@ function outcomeKeepsRehome(outcome: ProvisionFlowOutcome): boolean {
     case "skipped-non-tty-cooperative-only":
     case "declined-by-operator":
       return false;
-    case "exclusive-egress-unarmed-coarse-active":
     case "armed":
     case "armed-then-rolled-back":
     case "armed-rollback-failed":
     case "egress-unprovisioned-rolled-back":
+      // The final three labels below are unreachable here by construction:
+      // OUTCOMES_THAT_OWN_THE_HARNESS exits before any restore note is built.
+      // Keep the cases explicit so the switch remains exhaustive without
+      // implying their re-home wording can currently be rendered by this helper.
+    case "exclusive-egress-unarmed-coarse-active":
     case "armed-exclusive":
     case "armed-exclusive-repark-failed":
       return true;

@@ -34,6 +34,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
+  __resetProcessShutdownStateForTest,
   parseWrapArgs,
   runWrap,
   type RunWrapDeps,
@@ -90,6 +91,7 @@ describe("runWrap: maybeRunAutoProvisionForWrap gating", () => {
   });
 
   afterEach(async () => {
+    __resetProcessShutdownStateForTest();
     stderrSpy.mockRestore();
     clearHermesParityHook();
     if (originalHome === undefined) delete process.env.HOME;
@@ -167,6 +169,23 @@ describe("runWrap: maybeRunAutoProvisionForWrap gating", () => {
     const runAutoProvisionForWrap = vi.fn(async (): Promise<AutoProvisionSummary> => ({ ran: true }));
     await runWrap(options({ hermes: true, dryRun: true }), baseDeps({ runAutoProvisionForWrap }));
     expect(runAutoProvisionForWrap).not.toHaveBeenCalled();
+  });
+
+  it("installs SIGINT/SIGTERM shutdown listeners at runWrap entry, including dry-run paths", async () => {
+    await installHermesFixture();
+    setTty(true);
+    const processOnSpy = vi.spyOn(process, "on");
+    const runAutoProvisionForWrap = vi.fn(async (): Promise<AutoProvisionSummary> => ({ ran: true }));
+
+    try {
+      await runWrap(options({ hermes: true, dryRun: true }), baseDeps({ runAutoProvisionForWrap }));
+
+      expect(processOnSpy).toHaveBeenCalledWith("SIGINT", expect.any(Function));
+      expect(processOnSpy).toHaveBeenCalledWith("SIGTERM", expect.any(Function));
+      expect(runAutoProvisionForWrap).not.toHaveBeenCalled();
+    } finally {
+      processOnSpy.mockRestore();
+    }
   });
 
   it("passes isTty from process.stdin.isTTY and preAnsweredProvision from options.provisionAgentAccount through unchanged", async () => {
@@ -265,6 +284,8 @@ describe("runWrap: maybeRunAutoProvisionForWrap gating", () => {
     // Honest: another provisioning run is in progress; THIS run changed nothing.
     expect(printed).toMatch(/another 'sanctuary protect' provisioning run is already in progress/);
     expect(printed).toMatch(/made NO account, re-home, or Castle Wall changes/);
+    expect(printed).toMatch(/if not, remove the stale lock file named above and re-run if needed/);
+    expect(printed).not.toMatch(/Wait for it to finish, then re-run if needed/);
     // Must NOT emit the partial-apply / disarm warning for a lock-held no-op.
     expect(printed).not.toMatch(/may have PARTIALLY applied/);
   });

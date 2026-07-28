@@ -308,6 +308,21 @@ describe("castle-wall/provision/orchestrate", () => {
     expect(ops.createAccount).not.toHaveBeenCalled();
   });
 
+  it("opens the shutdown-protected mutation window only after confirm accepts, and before account creation", async () => {
+    const ops = happyPathOps({
+      confirm: vi.fn(async () => true),
+      beforeFirstMutation: vi.fn(async () => true),
+    });
+
+    await runProvisionFlow(baseCtx(), ops);
+
+    const confirmOrder = (ops.confirm as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0]!;
+    const windowOrder = (ops.beforeFirstMutation as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0]!;
+    const createOrder = (ops.createAccount as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0]!;
+    expect(confirmOrder).toBeLessThan(windowOrder);
+    expect(windowOrder).toBeLessThan(createOrder);
+  });
+
   it("fail-closed: account creation failure aborts before re-home, no rollback needed (nothing moved yet)", async () => {
     const ops = happyPathOps({
       createAccount: vi.fn(async () => {
@@ -1295,6 +1310,25 @@ describe("castle-wall/provision/orchestrate", () => {
       const orderConfirm = (ops.confirm as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0]!;
       const printCalls = (ops.print as ReturnType<typeof vi.fn>).mock.invocationCallOrder;
       expect(Math.min(...printCalls)).toBeLessThan(orderConfirm);
+    });
+
+    it("the shutdown/mutation window opens only AFTER the Tier-1 confirm completes", async () => {
+      const ops = happyPathOps({
+        confirm: vi.fn(async () => true),
+        beforeFirstMutation: vi.fn(async () => false),
+      });
+      const result = await runProvisionFlow(baseCtx(), ops);
+
+      expect(result).toMatchObject({
+        kind: "aborted",
+        stage: "shutdown-in-flight",
+      });
+      const orderConfirm = (ops.confirm as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0]!;
+      const orderBeforeMutation = (ops.beforeFirstMutation as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0]!;
+      expect(orderConfirm).toBeLessThan(orderBeforeMutation);
+      expect(ops.createAccount).not.toHaveBeenCalled();
+      expect(ops.rehome).not.toHaveBeenCalled();
+      expect(ops.arm).not.toHaveBeenCalled();
     });
 
     it("armed-then-rolled-back (post-arm DNS/credential re-check failure) also scrubs the provisioned rules", async () => {

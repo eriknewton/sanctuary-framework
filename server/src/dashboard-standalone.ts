@@ -149,13 +149,44 @@ const STANDALONE_SIGNAL_EXIT_CODE: Partial<Record<NodeJS.Signals, number>> = {
 // abandoning the first call's in-flight cleanups. Join the same in-flight
 // run instead of starting a second, empty one.
 let standaloneShutdownInFlight: Promise<void> | undefined;
+let standaloneShutdownRepeatSignalCount = 0;
+let standaloneShutdownRequestedSignal: NodeJS.Signals | undefined;
+let standaloneShutdownExitIssued = false;
+const STANDALONE_SHUTDOWN_REPEAT_SIGNAL_GRACE_MS = 1_000;
+
+function waitForStandaloneShutdownGrace(
+  promise: Promise<void>,
+  ms: number,
+): Promise<"settled" | "timeout"> {
+  return new Promise((resolve) => {
+    const timeout = setTimeout(() => resolve("timeout"), ms);
+    promise.finally(() => {
+      clearTimeout(timeout);
+      resolve("settled");
+    });
+  });
+}
 
 /** Exported for the seam: unit-test the exit code without sending real signals. */
 export async function handleStandaloneShutdownSignal(
   signal: NodeJS.Signals,
 ): Promise<void> {
+  if (standaloneShutdownExitIssued) return;
+  standaloneShutdownRequestedSignal ??= signal;
   if (standaloneShutdownInFlight) {
-    await standaloneShutdownInFlight;
+    standaloneShutdownRepeatSignalCount += 1;
+    const exitCode = STANDALONE_SIGNAL_EXIT_CODE[standaloneShutdownRequestedSignal] ?? 128;
+    const result =
+      standaloneShutdownRepeatSignalCount >= 2
+        ? "timeout"
+        : await waitForStandaloneShutdownGrace(
+            standaloneShutdownInFlight,
+            STANDALONE_SHUTDOWN_REPEAT_SIGNAL_GRACE_MS,
+          );
+    if (result === "timeout" && !standaloneShutdownExitIssued) {
+      standaloneShutdownExitIssued = true;
+      process.exit(exitCode);
+    }
     return;
   }
   standaloneShutdownInFlight = runStandaloneSignalCleanups();
@@ -163,8 +194,19 @@ export async function handleStandaloneShutdownSignal(
     await standaloneShutdownInFlight;
   } finally {
     standaloneShutdownInFlight = undefined;
+    standaloneShutdownRepeatSignalCount = 0;
   }
+  if (standaloneShutdownExitIssued) return;
+  standaloneShutdownExitIssued = true;
   process.exit(STANDALONE_SIGNAL_EXIT_CODE[signal] ?? 128);
+}
+
+function installStandaloneProcessListeners(): void {
+  if (standaloneProcessListenersInstalled) return;
+  standaloneProcessListenersInstalled = true;
+  process.on("SIGINT", handleStandaloneShutdownSignal);
+  process.on("SIGTERM", handleStandaloneShutdownSignal);
+  process.on("exit", runStandaloneExitCleanups);
 }
 
 function registerStandaloneProcessCleanup(
@@ -175,12 +217,7 @@ function registerStandaloneProcessCleanup(
   if (options.runOnExit === true) {
     standaloneExitCleanups.add(cleanup);
   }
-  if (!standaloneProcessListenersInstalled) {
-    standaloneProcessListenersInstalled = true;
-    process.on("SIGINT", handleStandaloneShutdownSignal);
-    process.on("SIGTERM", handleStandaloneShutdownSignal);
-    process.on("exit", runStandaloneExitCleanups);
-  }
+  installStandaloneProcessListeners();
 }
 
 export function __registerStandaloneProcessCleanupForTest(
@@ -196,6 +233,13 @@ export function __resetStandaloneShutdownStateForTest(): void {
   standaloneSignalCleanups.clear();
   standaloneExitCleanups.clear();
   standaloneShutdownInFlight = undefined;
+  standaloneShutdownRepeatSignalCount = 0;
+  standaloneShutdownRequestedSignal = undefined;
+  standaloneShutdownExitIssued = false;
+  process.removeListener("SIGINT", handleStandaloneShutdownSignal);
+  process.removeListener("SIGTERM", handleStandaloneShutdownSignal);
+  process.removeListener("exit", runStandaloneExitCleanups);
+  standaloneProcessListenersInstalled = false;
 }
 
 function assertStandaloneTestHookAllowed(name: string): void {
@@ -357,6 +401,8 @@ export function renderTenantDiscoveryHint(tenants: TenantDescriptor[]): string {
 export async function startStandaloneDashboard(
   options: StandaloneDashboardOptions = {}
 ): Promise<DashboardApprovalChannel> {
+  installStandaloneProcessListeners();
+
   // Force dashboard enabled for this mode
   process.env.SANCTUARY_DASHBOARD_ENABLED = "true";
 
