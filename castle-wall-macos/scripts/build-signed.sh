@@ -64,8 +64,31 @@ EXECUTABLE_NAME="CastleWallExtension"
 INFO_PLIST="${PKG_DIR}/Sources/CastleWallExtension/Info.plist"
 ENTITLEMENTS="${PKG_DIR}/Sources/CastleWallExtension/CastleWallExtension.entitlements"
 HOST_ENTITLEMENTS="${PKG_DIR}/Sources/CastleWallHostApp/CastleWallHostApp.entitlements"
-PROVISIONING_PROFILE="${PROVISIONING_PROFILE:-${HOME}/Documents/Sanctuary_Castle_Wall_macOS.provisionprofile}"
-EXT_PROVISIONING_PROFILE="${EXT_PROVISIONING_PROFILE:-${HOME}/Documents/Sanctuary_Castle_Wall_Extension.provisionprofile}"
+# Provisioning profiles for the restricted entitlements. Resolution order:
+# explicit env override, then the operator's ~/Documents copy (legacy local
+# layout), then the repo-committed copies under signing/. The repo copies are
+# NOT secrets: a provisioning profile ships inside every distributed app at
+# Contents/embedded.provisionprofile, readable by anyone who downloads the
+# release zip. It contains only public certificate data and the entitlement
+# grant; it cannot sign anything. Committing it is what lets CI produce a
+# launchable bundle (the v1.7.0/v1.7.1 CI builds omitted it and AMFI refused
+# to spawn them).
+REPO_PROVISIONING_PROFILE="${PKG_DIR}/signing/castle-wall-devid.provisionprofile"
+REPO_EXT_PROVISIONING_PROFILE="${PKG_DIR}/signing/castle-wall-extension-devid.provisionprofile"
+if [ -z "${PROVISIONING_PROFILE:-}" ]; then
+    if [ -f "${HOME}/Documents/Sanctuary_Castle_Wall_macOS.provisionprofile" ]; then
+        PROVISIONING_PROFILE="${HOME}/Documents/Sanctuary_Castle_Wall_macOS.provisionprofile"
+    else
+        PROVISIONING_PROFILE="${REPO_PROVISIONING_PROFILE}"
+    fi
+fi
+if [ -z "${EXT_PROVISIONING_PROFILE:-}" ]; then
+    if [ -f "${HOME}/Documents/Sanctuary_Castle_Wall_Extension.provisionprofile" ]; then
+        EXT_PROVISIONING_PROFILE="${HOME}/Documents/Sanctuary_Castle_Wall_Extension.provisionprofile"
+    else
+        EXT_PROVISIONING_PROFILE="${REPO_EXT_PROVISIONING_PROFILE}"
+    fi
+fi
 WRAPPED=false
 ALLOW_UNNOTARIZED=false
 WRAPPED_APP_DIR="${WRAPPED_APP_DIR:-${PKG_DIR}/build/Sanctuary-CastleWall.app}"
@@ -289,27 +312,41 @@ if [ "${WRAPPED}" = true ]; then
         exit 1
     fi
 
-    if [ -f "${PROVISIONING_PROFILE}" ]; then
-        echo "[build-signed]     embedding provisioning profile"
-        cp "${PROVISIONING_PROFILE}" "${WRAPPED_APP_DIR}/Contents/embedded.provisionprofile"
-        # F2: profiles copied from ~/Documents carry com.apple.quarantine, which
-        # survives into the signed sysext and causes a first-attempt
-        # codeSignatureInvalid (SIP protects the files after signing, so it
-        # cannot be stripped later). Strip it before signing; ignore if absent.
-        xattr -d com.apple.quarantine "${WRAPPED_APP_DIR}/Contents/embedded.provisionprofile" 2>/dev/null || true
-    else
-        echo "[build-signed] WARNING: no provisioning profile at ${PROVISIONING_PROFILE}" >&2
-        echo "[build-signed]          restricted entitlements will fail AMFI without a profile" >&2
+    # A wrapped bundle whose binaries claim restricted entitlements
+    # (com.apple.developer.system-extension.install, networkextension
+    # provider) but carry no embedded.provisionprofile is REFUSED BY AMFI at
+    # spawn on every end-user Mac ("Launchd job spawn failed", RBS error 5).
+    # The v1.7.0 and v1.7.1 release assets shipped exactly that way because
+    # this branch used to warn and continue. A missing profile is therefore
+    # fatal in wrapped mode: there is no configuration in which the output
+    # would be launchable.
+    if [ ! -f "${PROVISIONING_PROFILE}" ]; then
+        echo "[build-signed] ERROR: host provisioning profile not found at ${PROVISIONING_PROFILE}" >&2
+        echo "[build-signed]        A wrapped bundle without Contents/embedded.provisionprofile is" >&2
+        echo "[build-signed]        killed by AMFI at spawn (restricted entitlements, no profile)." >&2
+        echo "[build-signed]        Repo copy: ${REPO_PROVISIONING_PROFILE}; override with PROVISIONING_PROFILE=<path>." >&2
+        exit 1
+    fi
+    if [ ! -f "${EXT_PROVISIONING_PROFILE}" ]; then
+        echo "[build-signed] ERROR: extension provisioning profile not found at ${EXT_PROVISIONING_PROFILE}" >&2
+        echo "[build-signed]        The nested .systemextension claims the content-filter provider" >&2
+        echo "[build-signed]        entitlement and needs its own Contents/embedded.provisionprofile." >&2
+        echo "[build-signed]        Repo copy: ${REPO_EXT_PROVISIONING_PROFILE}; override with EXT_PROVISIONING_PROFILE=<path>." >&2
+        exit 1
     fi
 
-    if [ -f "${EXT_PROVISIONING_PROFILE}" ]; then
-        echo "[build-signed]     embedding extension provisioning profile"
-        cp "${EXT_PROVISIONING_PROFILE}" "${INNER_SYSTEM_EXTENSION}/Contents/embedded.provisionprofile"
-        # F2: same quarantine strip for the extension profile (see above).
-        xattr -d com.apple.quarantine "${INNER_SYSTEM_EXTENSION}/Contents/embedded.provisionprofile" 2>/dev/null || true
-    else
-        echo "[build-signed] WARNING: no extension provisioning profile at ${EXT_PROVISIONING_PROFILE}" >&2
-    fi
+    echo "[build-signed]     embedding provisioning profile (${PROVISIONING_PROFILE})"
+    cp "${PROVISIONING_PROFILE}" "${WRAPPED_APP_DIR}/Contents/embedded.provisionprofile"
+    # F2: profiles copied from ~/Documents carry com.apple.quarantine, which
+    # survives into the signed sysext and causes a first-attempt
+    # codeSignatureInvalid (SIP protects the files after signing, so it
+    # cannot be stripped later). Strip it before signing; ignore if absent.
+    xattr -d com.apple.quarantine "${WRAPPED_APP_DIR}/Contents/embedded.provisionprofile" 2>/dev/null || true
+
+    echo "[build-signed]     embedding extension provisioning profile (${EXT_PROVISIONING_PROFILE})"
+    cp "${EXT_PROVISIONING_PROFILE}" "${INNER_SYSTEM_EXTENSION}/Contents/embedded.provisionprofile"
+    # F2: same quarantine strip for the extension profile (see above).
+    xattr -d com.apple.quarantine "${INNER_SYSTEM_EXTENSION}/Contents/embedded.provisionprofile" 2>/dev/null || true
 
     echo "[build-signed]     signing inner .systemextension with Developer ID"
     codesign \
@@ -357,6 +394,14 @@ if [ "${WRAPPED}" = true ]; then
 
     echo "[build-signed]     verifying wrapped .app signature"
     codesign --verify --deep --strict "${WRAPPED_APP_DIR}"
+
+    # Fail-closed launchability assertions (profile presence at both
+    # placements, entitlement coverage, seal integrity). The release workflow
+    # runs the same script before notarizing; running it here too means a
+    # local wrapped build can never silently produce the v1.7.0/v1.7.1
+    # AMFI-dead bundle either.
+    echo "[build-signed]     asserting embedded provisioning profiles"
+    bash "${PKG_DIR}/scripts/verify-embedded-profiles.sh" "${WRAPPED_APP_DIR}"
     echo "[build-signed] wrapped signed bundle: ${WRAPPED_APP_DIR}"
 
     # Notarization. An app bundling a LaunchDaemon will leave SMAppService stuck
