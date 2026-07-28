@@ -1133,7 +1133,28 @@ describe("round-3 R4/R5: the REAL CLI promote path (approved end to end)", () =>
     expect(parsed.pending_candidates).toEqual({ determinable: false });
   });
 
-  it("FAIL-WITHOUT-FIX (F1): a root-owned-style unreadable boot-audit directory names sudo as the remedy", async () => {
+  it("FAIL-WITHOUT-FIX (status --json): no-refresh status marks master-audit unread instead of reporting a definitive zero", async () => {
+    const fortress = await makeCliFortress({ exclusive: false, candidates: [] });
+
+    const out = new Capture();
+    const code = await runObserveStatus(
+      ["--json", "--fortress", fortress.fortressPath],
+      { out, err: new Capture(), env: { SANCTUARY_RECOVERY_KEY: fortress.recoveryKey } },
+    );
+    expect(code).toBe(0);
+    const parsed = JSON.parse(out.text()) as {
+      source_state: { status: string; sources: Array<{ status: string; source_id: string }> };
+      pending_candidates: { determinable: boolean; count?: number };
+    };
+    expect(parsed.source_state.status).toBe("cannot_see");
+    expect(parsed.source_state.sources).toContainEqual(
+      expect.objectContaining({ status: "unread", source_id: "master-audit" }),
+    );
+    expect(parsed.pending_candidates).toEqual({ determinable: false });
+  });
+
+  it("FAIL-WITHOUT-FIX (F1): a root-owned-style unreadable boot-audit directory does not name sudo observe as the remedy", async () => {
+    if (process.getuid?.() === 0) return;
     const fortress = await makeCliFortress({ exclusive: false, candidates: [] });
     const auditDir = join(fortress.fortressPath, "boot-audit");
     await mkdir(join(auditDir, "0123456789abcdef"), { recursive: true, mode: 0o700 });
@@ -1149,9 +1170,8 @@ describe("round-3 R4/R5: the REAL CLI promote path (approved end to end)", () =>
       expect(out.text()).toContain("Observe cannot say whether there are candidates");
       expect(out.text()).toContain("boot-audit");
       expect(out.text()).toContain("root-owned");
-      expect(out.text()).toContain(
-        `sudo sanctuary castle-wall observe candidates --fortress ${fortress.fortressPath}`,
-      );
+      expect(out.text()).toContain("no safe read-only remedy exists in this build");
+      expect(out.text()).not.toContain("sudo sanctuary castle-wall observe candidates");
       expect(out.text()).not.toContain("No candidates.");
     } finally {
       await chmod(auditDir, 0o700);
@@ -1204,7 +1224,7 @@ describe("round-3 R4/R5: the REAL CLI promote path (approved end to end)", () =>
     expect(JSON.parse(statusOut.text()).pending_candidates).toEqual({ determinable: false });
   });
 
-  it("FAIL-WITHOUT-FIX (F11): observe candidates refreshes a real boot-token-derived on-disk boot-audit segment", async () => {
+  it("FAIL-WITHOUT-FIX (F11 withdrawn): observe candidates does not fold a real boot-token-derived on-disk boot-audit segment", async () => {
     const fortress = await makeCliFortress({ exclusive: false, candidates: [] });
     const token = generateBootToken();
     const tokenPath = join(fortress.fortressPath, "test-boot-token.bin");
@@ -1250,22 +1270,36 @@ describe("round-3 R4/R5: the REAL CLI promote path (approved end to end)", () =>
     expect(code).toBe(0);
     const parsed = JSON.parse(out.text()) as {
       source_state: { status: string; sources: Array<{ status: string; source_id: string; folded_events?: number }> };
-      candidates: { determinable: boolean; items?: CandidateObservation[] };
+      candidates: { determinable: boolean; items?: CandidateObservation[]; visible_items?: CandidateObservation[] };
     };
-    expect(parsed.source_state.status).toBe("readable");
+    expect(parsed.source_state.status).toBe("cannot_see");
     expect(parsed.source_state.sources).toContainEqual(
       expect.objectContaining({
-        status: "read",
+        status: "unread",
         source_id: expect.stringMatching(/^boot-audit:/),
-        folded_events: 1,
       }),
     );
-    expect(parsed.candidates.determinable).toBe(true);
-    expect(parsed.candidates.items?.[0]?.host).toBe("boot-cli.example.com");
-    expect(await fortress.listStoredCandidates()).toBe(1);
+    expect(parsed.source_state.sources).toContainEqual(
+      expect.objectContaining({ status: "read", source_id: "master-audit" }),
+    );
+    expect(parsed.candidates).toEqual({ determinable: false, visible_items: [] });
+    expect(await fortress.listStoredCandidates()).toBe(0);
   });
 
-  it("F-OBSNOINPUT B: coarse mode with a readable empty source still says No candidates", async () => {
+  it("F-OBSNOINPUT B: coarse mode after refreshing a readable empty master source still says No candidates", async () => {
+    const fortress = await makeCliFortress({ exclusive: false, candidates: [] });
+
+    const out = new Capture();
+    const code = await runObserveCandidates(
+      ["--fortress", fortress.fortressPath],
+      { out, err: new Capture(), env: { SANCTUARY_RECOVERY_KEY: fortress.recoveryKey } },
+    );
+    expect(code).toBe(0);
+    expect(out.text()).toContain("No candidates.");
+    expect(out.text()).not.toContain("cannot see");
+  });
+
+  it("FAIL-WITHOUT-FIX (--no-refresh): candidates marks master-audit unread instead of reporting a definitive zero", async () => {
     const fortress = await makeCliFortress({ exclusive: false, candidates: [] });
 
     const out = new Capture();
@@ -1274,8 +1308,62 @@ describe("round-3 R4/R5: the REAL CLI promote path (approved end to end)", () =>
       { out, err: new Capture(), env: { SANCTUARY_RECOVERY_KEY: fortress.recoveryKey } },
     );
     expect(code).toBe(0);
-    expect(out.text()).toContain("No candidates.");
-    expect(out.text()).not.toContain("cannot see");
+    expect(out.text()).toContain("Observe cannot say whether there are candidates");
+    expect(out.text()).toContain("- master-audit: this command path did not refresh the master audit chain");
+    expect(out.text()).not.toContain("No candidates.");
+  });
+
+  it("FAIL-WITHOUT-FIX (F3): a rotated boot-audit segment is classified as superseded, not permanent cannot-see", async () => {
+    const fortress = await makeCliFortress({ exclusive: false, candidates: [] });
+    const token = generateBootToken();
+    const tokenPath = join(fortress.fortressPath, "test-boot-token.bin");
+    await persistBootToken(token, { path: tokenPath });
+    await mkdir(join(fortress.fortressPath, "boot-audit", "0123456789abcdef"), {
+      recursive: true,
+      mode: 0o700,
+    });
+
+    const out = new Capture();
+    const code = await runObserveCandidates(
+      ["--json", "--fortress", fortress.fortressPath],
+      {
+        out,
+        err: new Capture(),
+        env: { SANCTUARY_RECOVERY_KEY: fortress.recoveryKey },
+        bootTokenPath: tokenPath,
+      },
+    );
+    expect(code).toBe(0);
+    const parsed = JSON.parse(out.text()) as {
+      source_state: { status: string; sources: Array<{ status: string; source_id: string; reason?: string }> };
+      candidates: { determinable: boolean; items?: CandidateObservation[] };
+    };
+    expect(parsed.source_state.status).toBe("readable");
+    expect(parsed.source_state.sources).toContainEqual(
+      expect.objectContaining({
+        status: "superseded",
+        source_id: "boot-audit:0123456789abcdef",
+        reason: expect.stringContaining("previous boot token"),
+      }),
+    );
+    expect(parsed.candidates).toEqual({ determinable: true, items: [] });
+
+    const humanOut = new Capture();
+    const humanCode = await runObserveCandidates(
+      ["--fortress", fortress.fortressPath],
+      {
+        out: humanOut,
+        err: new Capture(),
+        env: { SANCTUARY_RECOVERY_KEY: fortress.recoveryKey },
+        bootTokenPath: tokenPath,
+      },
+    );
+    expect(humanCode).toBe(0);
+    expect(humanOut.text()).toContain("Ignored superseded audit source(s):");
+    expect(humanOut.text()).toContain(
+      "- boot-audit:0123456789abcdef: this boot-audit segment was written with a previous boot token and is ignored by the current boot-token fingerprint",
+    );
+    expect(humanOut.text()).toContain("No candidates.");
   });
 
   it("FAIL-WITHOUT-FIX (R4): an approved EXCLUSIVE promote keeps the candidate rows, says CANNOT reach + the repair command, and the listing marks the rows", async () => {

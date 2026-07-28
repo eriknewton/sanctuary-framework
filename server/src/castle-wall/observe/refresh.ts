@@ -140,9 +140,9 @@ export interface RefreshAuditSource {
   source_id: FoldWatermarkSourceId;
   /**
    * `error` preserves the historical master-chain contract: verification
-   * failure aborts the refresh. `undetermined` is for optional side segments
-   * such as boot-audit: the segment contributes nothing unless it verifies,
-   * and the caller must disclose that its contents were not determined.
+   * failure aborts the refresh. `undetermined` is for a caller-supplied
+   * optional source: the source contributes nothing unless it verifies, and
+   * the caller must disclose that its contents were not determined.
    */
   failure_mode?: "error" | "undetermined";
   undetermined_reason?: string;
@@ -205,13 +205,7 @@ export type RefreshAllowlistRead =
 
 export interface RefreshDeps {
   auditLog: { streamVerifiedChain(consumer: VerifiedChainConsumer): Promise<void> };
-  auditSources?: readonly RefreshAuditSource[];
-  /**
-   * Source ids known to be obsolete for this refresh. The CLI uses this to
-   * collect boot-audit watermark records after boot-token rotation, once the
-   * current token has identified the live segment.
-   */
-  staleWatermarkSourceIds?: readonly FoldWatermarkSourceId[];
+  auditSource?: RefreshAuditSource;
   store: RefreshCandidateStore;
   readAllowlist: () => Promise<RefreshAllowlistRead>;
   /** Mutual exclusion across concurrent refreshes (Codex gate BLOCKER; see {@link RefreshLock}). */
@@ -509,81 +503,45 @@ async function runRefresh(deps: RefreshDeps): Promise<RefreshOutcome> {
     return { status: "allowlist_unverified", reason: allowlist.reason };
   }
 
-  const sources =
-    deps.auditSources && deps.auditSources.length > 0
-      ? deps.auditSources
-      : [
-          {
-            source_id: MASTER_AUDIT_WATERMARK_SOURCE_ID,
-            failure_mode: "error" as const,
-            streamVerifiedChain: (consumer: VerifiedChainConsumer) =>
-              deps.auditLog.streamVerifiedChain(consumer),
-          },
-        ];
-
-  const sourceResults: RefreshSourceResult[] = [];
   const persistedBefore = await deps.store.listCandidates();
-  const readableSources: Array<Extract<SourceRead, { status: "read" }>> = [];
-
-  for (const source of sources) {
-    const sourceId = source.source_id;
-    const watermark = await deps.store.getFoldWatermark(sourceId);
-    const read = await readRefreshSource(deps, source, sourceId, watermark);
-    if (read.status === "undetermined") {
-      sourceResults.push(read);
-      continue;
-    }
-    readableSources.push(read);
+  const source =
+    deps.auditSource ?? {
+      source_id: MASTER_AUDIT_WATERMARK_SOURCE_ID,
+      failure_mode: "error" as const,
+      streamVerifiedChain: (consumer: VerifiedChainConsumer) =>
+        deps.auditLog.streamVerifiedChain(consumer),
+    };
+  const watermark = await deps.store.getFoldWatermark(source.source_id);
+  const read = await readRefreshSource(deps, source, source.source_id, watermark);
+  if (read.status === "undetermined") {
+    return {
+      status: "refreshed",
+      mode: "incremental",
+      folded_events: 0,
+      suppressed_allowed: 0,
+      removed_now_allowed: 0,
+      sources: [read],
+    };
   }
 
-  const masterReviewTimestamp = latestMasterReviewTimestamp(readableSources);
-  let totalFolded = 0;
-  let totalSuppressedAllowed = 0;
-  let anyRecompute = false;
-  const allReplacements: CandidateObservation[] = [];
-  const allMints: CandidateObservation[] = [];
-  const allMerges: CandidateObservation[] = [];
-  const watermarkWrites: Array<{ source_id: FoldWatermarkSourceId; watermark: FoldWatermark }> = [];
+  const plan = planRefreshSource(
+    read,
+    allowlist.rules,
+    persistedBefore,
+    deps.now,
+  );
 
-  for (const read of readableSources) {
-    const plan = planRefreshSource(
-      read,
-      allowlist.rules,
-      persistedBefore,
-      masterReviewTimestamp,
-      deps.now,
-    );
-    sourceResults.push(plan.result);
-    totalFolded += plan.result.folded_events;
-    totalSuppressedAllowed += plan.result.suppressed_allowed;
-    if (plan.result.mode === "recompute") anyRecompute = true;
-    allReplacements.push(...plan.replacements);
-    allMints.push(...plan.mints);
-    allMerges.push(...plan.merges);
-    if (plan.watermark) {
-      watermarkWrites.push({ source_id: read.source_id, watermark: plan.watermark });
-    }
-  }
-
-  if (allReplacements.length > 0 || allMints.length > 0) {
-    const replacementRows = mergeCandidateObservations(new Map(), allReplacements);
-    const mintRows = mergeCandidateObservations(new Map(), allMints).values();
+  if (plan.replacements.length > 0 || plan.mints.length > 0) {
+    const replacementRows = mergeCandidateObservations(new Map(), plan.replacements);
+    const mintRows = mergeCandidateObservations(new Map(), plan.mints).values();
     await deps.store.replaceObservations([...replacementRows.values(), ...mintRows]);
   }
 
-  if (allMerges.length > 0) {
-    for (const { source_id, watermark } of watermarkWrites) {
-      await deps.store.setFoldWatermark(watermark, source_id);
-    }
-    await deps.store.mergeObservations(allMerges);
-  } else {
-    for (const { source_id, watermark } of watermarkWrites) {
-      await deps.store.setFoldWatermark(watermark, source_id);
-    }
+  if (plan.watermark) {
+    await deps.store.setFoldWatermark(plan.watermark, read.source_id);
   }
-
-  if (deps.staleWatermarkSourceIds && deps.staleWatermarkSourceIds.length > 0) {
-    await deps.store.deleteFoldWatermarks?.(deps.staleWatermarkSourceIds);
+  if (plan.merges.length > 0) {
+    await deps.store.mergeObservations(plan.merges);
   }
 
   // ── Allowlist prune over the PERSISTED set: a pending candidate whose
@@ -602,11 +560,11 @@ async function runRefresh(deps: RefreshDeps): Promise<RefreshOutcome> {
 
   return {
     status: "refreshed",
-    mode: anyRecompute ? "recompute" : "incremental",
-    folded_events: totalFolded,
-    suppressed_allowed: totalSuppressedAllowed,
+    mode: plan.result.mode,
+    folded_events: plan.result.folded_events,
+    suppressed_allowed: plan.result.suppressed_allowed,
     removed_now_allowed: removedNowAllowed,
-    sources: sourceResults,
+    sources: [plan.result],
   };
 }
 
@@ -686,7 +644,7 @@ async function readRefreshSource(
       source_id: sourceId,
       reason:
         source.undetermined_reason ??
-        "This boot-audit segment could not be verified or decrypted, so observe did not fold it.",
+        "This optional audit source could not be verified or decrypted, so observe did not fold it.",
     };
   }
 
@@ -703,22 +661,10 @@ async function readRefreshSource(
   };
 }
 
-function latestMasterReviewTimestamp(reads: readonly SourceRead[]): string | null {
-  let latest: string | null = null;
-  for (const read of reads) {
-    if (read.status !== "read" || read.source_id !== MASTER_AUDIT_WATERMARK_SOURCE_ID) continue;
-    if (read.lastReviewTimestamp && (latest === null || read.lastReviewTimestamp > latest)) {
-      latest = read.lastReviewTimestamp;
-    }
-  }
-  return latest;
-}
-
 function planRefreshSource(
   read: Extract<SourceRead, { status: "read" }>,
   rules: readonly AllowlistRule[],
   persistedBefore: ReadonlyMap<string, CandidateObservation>,
-  masterReviewTimestamp: string | null,
   now: Date,
 ): SourcePlan {
   const watermark = read.watermark;
@@ -793,8 +739,7 @@ function planRefreshSource(
     const sourcePostReview = sourceReviewSequence === null
       ? read.events
       : read.events.filter((item) => item.sequence > sourceReviewSequence);
-    const reviewBoundTimestamp =
-      read.source_id === MASTER_AUDIT_WATERMARK_SOURCE_ID ? read.lastReviewTimestamp : masterReviewTimestamp;
+    const reviewBoundTimestamp = read.lastReviewTimestamp;
     const postReviewEvents = (reviewBoundTimestamp === null
       ? sourcePostReview
       : sourcePostReview.filter((item) => item.entry.timestamp > reviewBoundTimestamp)

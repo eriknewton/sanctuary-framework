@@ -77,7 +77,6 @@ import {
   type ObserveGranularity,
   type PromoteRouting,
   type PromoteSelectionRow,
-  type RefreshAuditSource,
   type RefreshAllowlistRead,
   type RefreshLock,
   type RefreshSourceResult,
@@ -94,7 +93,6 @@ import {
 import { egressPolicyWriterLock } from "../castle-wall/provision/lockfile.js";
 import { loadFortressProducerKey } from "../castle-wall/runtime/producer-signature.js";
 import {
-  deriveSafeModeAuditKey,
   readBootToken,
   safeModeAuditStoragePath,
 } from "../castle-wall/boot/boot-token.js";
@@ -166,6 +164,7 @@ type CandidateSourceStatus =
   | { status: "read"; source_id: string; folded_events?: number }
   | { status: "unread"; source_id: string; reason: string }
   | { status: "undetermined"; source_id: string; reason: string }
+  | { status: "superseded"; source_id: string; reason: string }
   | { status: "unwired"; source_id: "fine_grained_gate"; reason: string };
 
 type CandidateSourceState =
@@ -179,8 +178,12 @@ function shellArg(value: string): string {
   return /^[A-Za-z0-9_/:=.,@%+-]+$/.test(value) ? value : `'${value.replace(/'/g, "'\\''")}'`;
 }
 
-function observeCommandFor(command: "status" | "candidates", fortressPath: string, sudo = false): string {
-  return `${sudo ? "sudo " : ""}sanctuary castle-wall observe ${command} --fortress ${shellArg(fortressPath)}`;
+function observeCommandFor(command: "status" | "candidates", fortressPath: string): string {
+  return `sanctuary castle-wall observe ${command} --fortress ${shellArg(fortressPath)}`;
+}
+
+function masterAuditUnreadReason(fortressPath: string): string {
+  return `this command path did not refresh the master audit chain; run: ${observeCommandFor("candidates", fortressPath)}`;
 }
 
 function fineGrainedGateCannotSeeMessage(fortressPath: string): string {
@@ -210,7 +213,6 @@ type BootAuditSegmentList =
 
 async function listBootAuditSegmentNames(
   fortressPath: string,
-  remedyCommand: string,
 ): Promise<BootAuditSegmentList> {
   try {
     const entries = await readdir(join(fortressPath, "boot-audit"), { withFileTypes: true });
@@ -226,7 +228,8 @@ async function listBootAuditSegmentNames(
     if (isAccessDenied(error)) {
       return {
         status: "access-denied",
-        reason: `the boot-audit directory is root-owned and cannot be read by this process; re-run: ${remedyCommand}`,
+        reason:
+          "the boot-audit directory is root-owned and cannot be read by this process; no safe read-only remedy exists in this build",
       };
     }
     return {
@@ -236,32 +239,28 @@ async function listBootAuditSegmentNames(
   }
 }
 
-async function buildBootAuditSources(
+async function inspectBootAuditSegments(
   fortressPath: string,
-  opts: { bootTokenPath?: string; remedyCommand: string },
+  opts: { bootTokenPath?: string },
 ): Promise<{
-  sources: RefreshAuditSource[];
-  initialStatuses: CandidateSourceStatus[];
-  staleWatermarkSourceIds: string[];
+  statuses: CandidateSourceStatus[];
 }> {
-  const segmentList = await listBootAuditSegmentNames(fortressPath, opts.remedyCommand);
-  const initialStatuses: CandidateSourceStatus[] = [];
-  if (segmentList.status === "absent") return { sources: [], initialStatuses, staleWatermarkSourceIds: [] };
+  const segmentList = await listBootAuditSegmentNames(fortressPath);
+  const statuses: CandidateSourceStatus[] = [];
+  if (segmentList.status === "absent") return { statuses };
   if (segmentList.status !== "ok") {
     return {
-      sources: [],
-      initialStatuses: [
+      statuses: [
         {
           status: "undetermined" as const,
           source_id: "boot-audit",
           reason: segmentList.reason,
         },
       ],
-      staleWatermarkSourceIds: [],
     };
   }
   const segmentNames = segmentList.names;
-  if (segmentNames.length === 0) return { sources: [], initialStatuses, staleWatermarkSourceIds: [] };
+  if (segmentNames.length === 0) return { statuses };
 
   let tokenRead: Awaited<ReturnType<typeof readBootToken>>;
   let tokenReadFailureReason: string | null = null;
@@ -269,52 +268,45 @@ async function buildBootAuditSources(
     tokenRead = await readBootToken(opts.bootTokenPath ? { path: opts.bootTokenPath } : {});
   } catch (error) {
     tokenReadFailureReason = isAccessDenied(error)
-      ? `the root-owned boot token cannot be read by this process; re-run: ${opts.remedyCommand}`
+      ? "the root-owned boot token cannot be read by this process"
       : `the boot token could not be read by this process (${(error as Error).message})`;
     tokenRead = { status: "not-found" };
   }
   if (tokenRead.status !== "ok") {
     const reason = `${
       tokenReadFailureReason ?? bootTokenReadReason(tokenRead.status)
-    }, so this boot-audit segment cannot be decrypted`;
+    }, so this boot-audit segment cannot be decrypted by this command`;
     return {
-      sources: [],
-      initialStatuses: segmentNames.map((name) => ({
+      statuses: segmentNames.map((name) => ({
         status: "undetermined" as const,
         source_id: `boot-audit:${name}`,
         reason,
       })),
-      staleWatermarkSourceIds: [],
     };
   }
 
-  const safeModeAuditKey = deriveSafeModeAuditKey(tokenRead.token);
   const currentPath = safeModeAuditStoragePath(fortressPath, tokenRead.token);
   const currentFingerprint = basename(currentPath);
-  const sources: RefreshAuditSource[] = [];
-  const staleWatermarkSourceIds: string[] = [];
 
   for (const name of segmentNames) {
     if (name !== currentFingerprint) {
-      initialStatuses.push({
-        status: "undetermined",
+      statuses.push({
+        status: "superseded",
         source_id: `boot-audit:${name}`,
-        reason: "this boot-audit segment was written with a different boot token, so observe cannot decrypt it",
+        reason:
+          "this boot-audit segment was written with a previous boot token and is ignored by the current boot-token fingerprint",
       });
-      staleWatermarkSourceIds.push(`boot-audit:${name}`);
       continue;
     }
-    sources.push({
+    statuses.push({
+      status: "unread",
       source_id: `boot-audit:${name}`,
-      failure_mode: "undetermined",
-      undetermined_reason:
-        "this boot-audit segment could not be verified or decrypted, so observe did not fold it",
-      streamVerifiedChain: (consumer) =>
-        new AuditLog(new FilesystemStorage(currentPath), safeModeAuditKey).streamVerifiedChain(consumer),
+      reason:
+        "this boot-audit segment is written by the root boot daemon; this command discovers it but does not read or fold it. Boot-audit folding is deferred until observe stores per-source candidate contributions",
     });
   }
 
-  return { sources, initialStatuses, staleWatermarkSourceIds };
+  return { statuses };
 }
 
 async function detectFineGrainedGateSource(fortressPath: string): Promise<CandidateSourceStatus | null> {
@@ -353,6 +345,16 @@ function writeSourceStateDetails(out: Writable, sourceState: CandidateSourceStat
   }
 }
 
+function writeReadableSourceNotes(out: Writable, sourceState: CandidateSourceState): void {
+  if (sourceState.status !== "readable") return;
+  const superseded = sourceState.sources.filter((source) => source.status === "superseded");
+  if (superseded.length === 0) return;
+  write(out, "Ignored superseded audit source(s):\n");
+  for (const source of superseded) {
+    write(out, `- ${source.source_id}: ${source.reason}\n`);
+  }
+}
+
 function sourceStatusesFromRefresh(
   initialStatuses: CandidateSourceStatus[],
   refreshSources: readonly RefreshSourceResult[],
@@ -380,17 +382,12 @@ async function inspectCandidateSources(
   opts: { bootTokenPath?: string; command: "status" | "candidates" },
 ): Promise<CandidateSourceState> {
   const gateSource = await detectFineGrainedGateSource(fortressPath);
-  const bootSources = await buildBootAuditSources(fortressPath, {
+  const bootSources = await inspectBootAuditSegments(fortressPath, {
     bootTokenPath: opts.bootTokenPath,
-    remedyCommand: observeCommandFor(opts.command, fortressPath, true),
   });
   const statuses: CandidateSourceStatus[] = [
-    ...bootSources.initialStatuses,
-    ...bootSources.sources.map((source) => ({
-      status: "unread" as const,
-      source_id: source.source_id,
-      reason: `this boot-audit segment has not been folded in this command path; run: ${observeCommandFor("candidates", fortressPath)}`,
-    })),
+    { status: "unread", source_id: "master-audit", reason: masterAuditUnreadReason(fortressPath) },
+    ...bootSources.statuses,
     ...(gateSource ? [gateSource] : []),
   ];
   return sourceStateFromStatuses(statuses, fortressPath);
@@ -667,23 +664,13 @@ export async function runObserveCandidates(
     // minted -- and is pruned if present. See castle-wall/observe/refresh.ts.
     let outcome;
     let lockHolderDescription = "";
-    const bootAudit = await buildBootAuditSources(boot.fortressPath, {
+    const bootAudit = await inspectBootAuditSegments(boot.fortressPath, {
       bootTokenPath: ctx.bootTokenPath,
-      remedyCommand: observeCommandFor("candidates", boot.fortressPath, true),
     });
     const gateSource = await detectFineGrainedGateSource(boot.fortressPath);
     try {
       outcome = await refreshCandidatesFromAudit({
         auditLog: boot.auditLog,
-        auditSources: [
-          {
-            source_id: "master-audit",
-            failure_mode: "error",
-            streamVerifiedChain: (consumer) => boot.auditLog.streamVerifiedChain(consumer),
-          },
-          ...bootAudit.sources,
-        ],
-        staleWatermarkSourceIds: bootAudit.staleWatermarkSourceIds,
         store: boot.observeStore,
         readAllowlist: () => readAllowlistForRefresh(boot.fortressPath),
         lock: observeRefreshFileLock(boot.fortressPath, (holder) => {
@@ -728,7 +715,8 @@ export async function runObserveCandidates(
       );
     }
     sourceState = sourceStateFromStatuses([
-      ...sourceStatusesFromRefresh(bootAudit.initialStatuses, outcome.sources),
+      ...sourceStatusesFromRefresh([], outcome.sources),
+      ...bootAudit.statuses,
       ...(gateSource ? [gateSource] : []),
     ], boot.fortressPath);
   } else {
@@ -802,6 +790,7 @@ export async function runObserveCandidates(
       writeSourceStateDetails(out, sourceState);
       return 0;
     }
+    if (sourceState) writeReadableSourceNotes(out, sourceState);
     write(
       out,
       "No candidates. Turn on observe mode (`sanctuary castle-wall observe start`), run your agent, then re-run this command.\n",
@@ -813,6 +802,8 @@ export async function runObserveCandidates(
     write(out, `${sourceState.message}\n`);
     writeSourceStateDetails(out, sourceState);
     write(out, "Showing only candidates that were already recorded from sources observe can read.\n\n");
+  } else if (sourceState) {
+    writeReadableSourceNotes(out, sourceState);
   }
 
   const col = (value: string, width: number): string => `${value.padEnd(width)}  `;

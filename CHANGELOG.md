@@ -9,6 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 ### Changed
 
 - `sanctuary castle-wall observe candidates --json` now returns `candidates` as a determinability object: `{ "determinable": true, "items": [...] }` when every source is readable, or `{ "determinable": false, "visible_items": [...] }` when observe cannot see one or more candidate sources. This documents the PR #1038 contract change and prevents consumers from reading a plain empty array as a definitive zero while `source_state.status` is `cannot_see`.
+- `sanctuary castle-wall observe status --json` now reports the same `source_state` determinability contract as `candidates --json`; when the command has not refreshed an audit source, `pending_candidates` is `{ "determinable": false }` rather than a definitive zero.
 
 ## [1.7.2] - 2026-07-27
 
