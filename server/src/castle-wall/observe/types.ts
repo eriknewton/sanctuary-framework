@@ -181,3 +181,10 @@ export interface FoldWatermark {
   entry_hash: string;
   updated_at: string;
 }
+
+/**
+ * Stable identity for one audit chain consumed by observe refresh. Watermarks
+ * are keyed by this value, so a position in the master-key chain can never be
+ * interpreted as a position in a boot-token-keyed segment.
+ */
+export type FoldWatermarkSourceId = string;

@@ -33,6 +33,7 @@ import {
   candidateKeyDigest,
   type CandidateObservation,
   type FoldWatermark,
+  type FoldWatermarkSourceId,
   type ObserveModeState,
 } from "./types.js";
 
@@ -45,8 +46,10 @@ export interface ObserveWriteIdentity {
 
 const STATE_KEY = "state";
 const FOLD_WATERMARK_KEY = "fold-watermark";
+const FOLD_WATERMARK_KEY_PREFIX = "fold-watermark:";
 const CANDIDATE_KEY_PREFIX = "candidate:";
 const PAGE_SIZE = 100;
+export const MASTER_AUDIT_WATERMARK_SOURCE_ID = "master-audit" as const;
 
 export class ObserveStore {
   constructor(
@@ -88,8 +91,13 @@ export class ObserveStore {
    * semantics" (the one-time heal for stores the pre-watermark additive
    * re-fold inflated).
    */
-  async getFoldWatermark(): Promise<FoldWatermark | null> {
-    const result = await this.stateStore.read(OBSERVE_NAMESPACE, FOLD_WATERMARK_KEY);
+  private foldWatermarkKey(sourceId: FoldWatermarkSourceId): string {
+    if (sourceId === MASTER_AUDIT_WATERMARK_SOURCE_ID) return FOLD_WATERMARK_KEY;
+    return `${FOLD_WATERMARK_KEY_PREFIX}${candidateKeyDigest(sourceId)}`;
+  }
+
+  async getFoldWatermark(sourceId: FoldWatermarkSourceId = MASTER_AUDIT_WATERMARK_SOURCE_ID): Promise<FoldWatermark | null> {
+    const result = await this.stateStore.read(OBSERVE_NAMESPACE, this.foldWatermarkKey(sourceId));
     if (!result) return null;
     const parsed = JSON.parse(result.value) as FoldWatermark;
     if (
@@ -109,8 +117,11 @@ export class ObserveStore {
   }
 
   /** Persist the fold watermark. Written by the refresh chokepoint ONLY after a fold pass committed cleanly. */
-  async setFoldWatermark(watermark: FoldWatermark): Promise<void> {
-    await this.put(FOLD_WATERMARK_KEY, watermark);
+  async setFoldWatermark(
+    watermark: FoldWatermark,
+    sourceId: FoldWatermarkSourceId = MASTER_AUDIT_WATERMARK_SOURCE_ID,
+  ): Promise<void> {
+    await this.put(this.foldWatermarkKey(sourceId), watermark);
   }
 
   /** Storage key for a given candidate dedup key. Hashed so an operator-supplied host string can never itself become an unsafe StateStore key. */

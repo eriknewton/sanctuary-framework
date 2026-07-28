@@ -20,6 +20,7 @@ export type {
   CandidateObservation,
   ObserveModeState,
   FoldWatermark,
+  FoldWatermarkSourceId,
 } from "./types.js";
 
 export { flagExfilRisk, foldObservations, mergeCandidateObservations } from "./fold.js";
@@ -39,6 +40,7 @@ export type {
   RefreshDeps,
   RefreshLock,
   RefreshOutcome,
+  RefreshSourceResult,
 } from "./refresh.js";
 
 export {
@@ -51,7 +53,7 @@ export {
 } from "./synthesize.js";
 export type { SynthesizeCandidateRulesResult, PromoteRouting } from "./synthesize.js";
 
-export { ObserveStore } from "./store.js";
+export { ObserveStore, MASTER_AUDIT_WATERMARK_SOURCE_ID } from "./store.js";
 export type { ObserveWriteIdentity } from "./store.js";
 
 export { promoteCandidates, describeEffectiveRule, ruleScopesEqual } from "./promote.js";

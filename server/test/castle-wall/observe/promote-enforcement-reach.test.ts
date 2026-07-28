@@ -55,6 +55,7 @@ import {
   resolvePromoteRouting,
   runObserveCandidates,
   runObservePromote,
+  runObserveStatus,
 } from "../../../src/cli/castle-wall-observe.js";
 import {
   localManifestSigner,
@@ -1038,6 +1039,46 @@ describe("round-3 R4/R5: the REAL CLI promote path (approved end to end)", () =>
       listStoredCandidates: async () => (await observeStore.listCandidates()).size,
     };
   }
+
+  it("F-OBSNOINPUT B: exclusive mode with no observable gate source says cannot see, not No candidates", async () => {
+    const fortress = await makeCliFortress({ exclusive: true, candidates: [] });
+
+    const out = new Capture();
+    const code = await runObserveCandidates(
+      ["--no-refresh", "--fortress", fortress.fortressPath],
+      { out, err: new Capture(), env: { SANCTUARY_RECOVERY_KEY: fortress.recoveryKey } },
+    );
+    expect(code).toBe(0);
+    expect(out.text()).toContain("Observe cannot see the gate's denials in fine-grained mode.");
+    expect(out.text()).toContain("Add missing destinations to the allow-list directly, then re-arm the gate.");
+    expect(out.text()).not.toContain("No candidates.");
+
+    const statusOut = new Capture();
+    const statusCode = await runObserveStatus(
+      ["--json", "--fortress", fortress.fortressPath],
+      { out: statusOut, err: new Capture(), env: { SANCTUARY_RECOVERY_KEY: fortress.recoveryKey } },
+    );
+    expect(statusCode).toBe(0);
+    const parsed = JSON.parse(statusOut.text()) as {
+      source_state: { status: string };
+      pending_candidates: { determinable: boolean; count?: number };
+    };
+    expect(parsed.source_state.status).toBe("cannot_see");
+    expect(parsed.pending_candidates).toEqual({ determinable: false });
+  });
+
+  it("F-OBSNOINPUT B: coarse mode with a readable empty source still says No candidates", async () => {
+    const fortress = await makeCliFortress({ exclusive: false, candidates: [] });
+
+    const out = new Capture();
+    const code = await runObserveCandidates(
+      ["--no-refresh", "--fortress", fortress.fortressPath],
+      { out, err: new Capture(), env: { SANCTUARY_RECOVERY_KEY: fortress.recoveryKey } },
+    );
+    expect(code).toBe(0);
+    expect(out.text()).toContain("No candidates.");
+    expect(out.text()).not.toContain("cannot see");
+  });
 
   it("FAIL-WITHOUT-FIX (R4): an approved EXCLUSIVE promote keeps the candidate rows, says CANNOT reach + the repair command, and the listing marks the rows", async () => {
     const fortress = await makeCliFortress({

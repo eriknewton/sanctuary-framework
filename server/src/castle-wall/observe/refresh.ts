@@ -120,7 +120,14 @@ import type { RuleMatch } from "../allowlist/schema.js";
 import type { VerifiedChainConsumer } from "../../operational/audit-log.js";
 import { flowEventFromAuditEntry } from "./adapter.js";
 import { foldObservations } from "./fold.js";
-import { candidateKey, type CandidateObservation, type FlowObservationEvent, type FoldWatermark } from "./types.js";
+import {
+  candidateKey,
+  type CandidateObservation,
+  type FlowObservationEvent,
+  type FoldWatermark,
+  type FoldWatermarkSourceId,
+} from "./types.js";
+import { MASTER_AUDIT_WATERMARK_SOURCE_ID } from "./store.js";
 
 /** The observe review-action audit operations (written by the CLI's discard/promote verbs onto the SAME verified chain the fold streams). Their chain position bounds what a recompute may MINT (module doc, guarantee 3). */
 const OBSERVE_REVIEW_OPERATIONS: ReadonlySet<string> = new Set([
@@ -130,13 +137,22 @@ const OBSERVE_REVIEW_OPERATIONS: ReadonlySet<string> = new Set([
 
 /** Narrow audit surface the refresh needs; `AuditLog` satisfies it. Strict verification is the contract: the stream throws on a chain-integrity failure, so a refresh never folds over an unverified chain. */
 export interface RefreshAuditSource {
+  source_id?: FoldWatermarkSourceId;
+  /**
+   * `error` preserves the historical master-chain contract: verification
+   * failure aborts the refresh. `undetermined` is for optional side segments
+   * such as boot-audit: the segment contributes nothing unless it verifies,
+   * and the caller must disclose that its contents were not determined.
+   */
+  failure_mode?: "error" | "undetermined";
+  undetermined_reason?: string;
   streamVerifiedChain(consumer: VerifiedChainConsumer): Promise<void>;
 }
 
 /** Narrow candidate-store surface the refresh needs; `ObserveStore` satisfies it. */
 export interface RefreshCandidateStore {
-  getFoldWatermark(): Promise<FoldWatermark | null>;
-  setFoldWatermark(watermark: FoldWatermark): Promise<void>;
+  getFoldWatermark(sourceId?: FoldWatermarkSourceId): Promise<FoldWatermark | null>;
+  setFoldWatermark(watermark: FoldWatermark, sourceId?: FoldWatermarkSourceId): Promise<void>;
   listCandidates(): Promise<Map<string, CandidateObservation>>;
   mergeObservations(observations: readonly CandidateObservation[]): Promise<void>;
   replaceObservations(observations: readonly CandidateObservation[]): Promise<void>;
@@ -188,6 +204,7 @@ export type RefreshAllowlistRead =
 
 export interface RefreshDeps {
   auditLog: RefreshAuditSource;
+  auditSources?: readonly RefreshAuditSource[];
   store: RefreshCandidateStore;
   readAllowlist: () => Promise<RefreshAllowlistRead>;
   /** Mutual exclusion across concurrent refreshes (Codex gate BLOCKER; see {@link RefreshLock}). */
@@ -202,10 +219,20 @@ export interface RefreshDeps {
   subjectFortressId?: string | null;
 }
 
+export type RefreshSourceResult =
+  | {
+      status: "read";
+      source_id: string;
+      mode: "incremental" | "recompute";
+      folded_events: number;
+      suppressed_allowed: number;
+    }
+  | { status: "undetermined"; source_id: string; reason: string };
+
 export type RefreshOutcome =
   | {
       status: "refreshed";
-      /** `incremental`: folded only entries past the valid watermark, merged additively. `recompute`: no valid watermark -- replayed retained history with replace-existing/mint-post-review semantics (the heal path). */
+      /** `incremental`: every readable source used its valid watermark. `recompute`: at least one readable source had no valid watermark and replayed retained history with replace-existing/mint-post-review semantics (the heal path). */
       mode: "incremental" | "recompute";
       /** Denied-flow events this pass actually folded. */
       folded_events: number;
@@ -213,6 +240,8 @@ export type RefreshOutcome =
       suppressed_allowed: number;
       /** Persisted candidate rows removed because the verified allowlist now permits them. */
       removed_now_allowed: number;
+      /** Per-source read result. `undetermined` is never treated as verified-empty. */
+      sources: RefreshSourceResult[];
     }
   | { status: "allowlist_unverified"; reason: string }
   | { status: "refresh_in_progress" };
@@ -473,7 +502,74 @@ async function runRefresh(deps: RefreshDeps): Promise<RefreshOutcome> {
     return { status: "allowlist_unverified", reason: allowlist.reason };
   }
 
-  const watermark = await deps.store.getFoldWatermark();
+  const sources =
+    deps.auditSources && deps.auditSources.length > 0
+      ? deps.auditSources
+      : [
+          {
+            source_id: MASTER_AUDIT_WATERMARK_SOURCE_ID,
+            failure_mode: "error" as const,
+            streamVerifiedChain: (consumer: VerifiedChainConsumer) =>
+              deps.auditLog.streamVerifiedChain(consumer),
+          },
+        ];
+
+  const sourceResults: RefreshSourceResult[] = [];
+  let totalFolded = 0;
+  let totalSuppressedAllowed = 0;
+  let anyRecompute = false;
+
+  for (const source of sources) {
+    const sourceId = source.source_id ?? MASTER_AUDIT_WATERMARK_SOURCE_ID;
+    try {
+      const result = await runRefreshSource(deps, source, sourceId, allowlist.rules);
+      sourceResults.push(result);
+      totalFolded += result.folded_events;
+      totalSuppressedAllowed += result.suppressed_allowed;
+      if (result.mode === "recompute") anyRecompute = true;
+    } catch (error) {
+      if (source.failure_mode !== "undetermined") throw error;
+      sourceResults.push({
+        status: "undetermined",
+        source_id: sourceId,
+        reason:
+          source.undetermined_reason ??
+          "This boot-audit segment could not be verified or decrypted, so observe did not fold it.",
+      });
+    }
+  }
+
+  // ── Allowlist prune over the PERSISTED set: a pending candidate whose
+  // destination the operator's verified policy now permits is removed (the
+  // same safe direction as `observe discard`; never adds a rule). Runs even
+  // when nothing new folded, so a promote in another template/session is
+  // reconciled on the very next refresh. ──
+  let removedNowAllowed = 0;
+  const persisted = await deps.store.listCandidates();
+  for (const [key, candidate] of persisted) {
+    if (candidateCurrentlyAllowed(allowlist.rules, candidate)) {
+      await deps.store.removeCandidate(key);
+      removedNowAllowed += 1;
+    }
+  }
+
+  return {
+    status: "refreshed",
+    mode: anyRecompute ? "recompute" : "incremental",
+    folded_events: totalFolded,
+    suppressed_allowed: totalSuppressedAllowed,
+    removed_now_allowed: removedNowAllowed,
+    sources: sourceResults,
+  };
+}
+
+async function runRefreshSource(
+  deps: RefreshDeps,
+  source: RefreshAuditSource,
+  sourceId: FoldWatermarkSourceId,
+  rules: readonly AllowlistRule[],
+): Promise<Extract<RefreshSourceResult, { status: "read" }>> {
+  const watermark = await deps.store.getFoldWatermark(sourceId);
 
   // ── Single verified pass over the chain (buffered writes: nothing below
   // touches the store until the stream has returned clean). ──
@@ -482,7 +578,7 @@ async function runRefresh(deps: RefreshDeps): Promise<RefreshOutcome> {
   let headHash: string | null = null;
   let hashAtWatermark: string | null = null;
   let lastReviewSequence: number | null = null;
-  await deps.auditLog.streamVerifiedChain({
+  await source.streamVerifiedChain({
     onEntry: ({ sequence, entry_hash, entry }) => {
       if (headSequence === null || sequence > headSequence) {
         headSequence = sequence;
@@ -548,7 +644,7 @@ async function runRefresh(deps: RefreshDeps): Promise<RefreshOutcome> {
 
   const keepFiltered = (folded: readonly CandidateObservation[], into: CandidateObservation[]): void => {
     for (const row of folded) {
-      if (candidateCurrentlyAllowed(allowlist.rules, row)) {
+      if (candidateCurrentlyAllowed(rules, row)) {
         suppressedAllowed += 1;
         continue;
       }
@@ -569,7 +665,7 @@ async function runRefresh(deps: RefreshDeps): Promise<RefreshOutcome> {
       folded_through_sequence: chainHead,
       entry_hash: headHash,
       updated_at: deps.now.toISOString(),
-    });
+    }, sourceId);
   };
 
   if (recompute) {
@@ -613,25 +709,11 @@ async function runRefresh(deps: RefreshDeps): Promise<RefreshOutcome> {
     await deps.store.mergeObservations(kept);
   }
 
-  // ── Allowlist prune over the PERSISTED set: a pending candidate whose
-  // destination the operator's verified policy now permits is removed (the
-  // same safe direction as `observe discard`; never adds a rule). Runs even
-  // when nothing new folded, so a promote in another template/session is
-  // reconciled on the very next refresh. ──
-  let removedNowAllowed = 0;
-  const persisted = await deps.store.listCandidates();
-  for (const [key, candidate] of persisted) {
-    if (candidateCurrentlyAllowed(allowlist.rules, candidate)) {
-      await deps.store.removeCandidate(key);
-      removedNowAllowed += 1;
-    }
-  }
-
   return {
-    status: "refreshed",
+    status: "read",
+    source_id: sourceId,
     mode: recompute ? "recompute" : "incremental",
     folded_events: foldedCount,
     suppressed_allowed: suppressedAllowed,
-    removed_now_allowed: removedNowAllowed,
   };
 }
