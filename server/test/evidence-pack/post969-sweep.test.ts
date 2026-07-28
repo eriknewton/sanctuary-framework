@@ -1,0 +1,429 @@
+/**
+ * Sanctuary MCP Server - Evidence Pack: post-#969 sweep regressions (F-1/F-2/F-3)
+ *
+ * Copyright 2026 Erik Newton
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Dry-bar sweep 2026-07-27 (fresh Codex lens over main 7ded8d8f), three
+ * confirmed findings, one shared shape: an UNDETERMINED state (corrupt file,
+ * malformed record, unverified planted file) collapsing into a DEFINITIVE
+ * signed claim (verified-empty census, complete/empty export, "carries no
+ * evidentiary content").
+ *
+ *  - F-1: the hub agent registry reader is best-effort BY PINNED DESIGN
+ *    (corruption -> [] for the dashboard consumer), so the pack minted the
+ *    definitive `empty_verified` "No wrapped AI harnesses are recorded"
+ *    witness over a corrupt plaintext file. The pack now consumes a STRICT
+ *    reader that reports absent / ok / unreadable distinctly.
+ *  - F-2: a parse-valid but shape-invalid `_audit_checkpoints` record hit the
+ *    P1-A "legitimate control record" skip arm uncounted, so the pack signed
+ *    the audit-chain export as complete or definitively empty over a
+ *    malformed checkpoint. The skip is now KEY-AWARE.
+ *  - F-3: ANY `._*` name was exempt from the foreign-file refusal, so a
+ *    planted `._counsel-notes.md` survived unmanifested while the SIGNED
+ *    recipe said it carried no evidentiary content. The exemption now
+ *    requires name pairing with a pack filename AND the AppleDouble magic.
+ *
+ * TEST RULE (from the sweep spec): the far side is the REAL pack outcome path
+ * fed by REAL corrupt state on disk -- the shipped strict reader over a real
+ * file, the shipped exporter over a real FilesystemStorage fortress -- never a
+ * mock of the reader.
+ */
+
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import { MemoryStorage } from "../../src/storage/memory.js";
+import { FilesystemStorage } from "../../src/storage/filesystem.js";
+import { generateRandomKey } from "../../src/core/random.js";
+import { derivePurposeKey } from "../../src/core/key-derivation.js";
+import { createIdentity } from "../../src/core/identity.js";
+import type { StoredIdentity } from "../../src/core/identity.js";
+import { IdentityManager } from "../../src/cognitive/tools.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
+import type { AuditEntry } from "../../src/operational/audit-log.js";
+import {
+  exportAuditChain,
+  AUDIT_EXPORT_CHECKPOINT_NAMESPACE,
+  AUDIT_EXPORT_CONTROL_KEYS,
+} from "../../src/cli/audit-chain-export.js";
+import {
+  gatherDiscreteExports,
+  readHubAgentsSource,
+  writePackDirectory,
+} from "../../src/evidence-pack/cli.js";
+import { buildInventorySnapshot } from "../../src/evidence-pack/inventory.js";
+import { APPLEDOUBLE_MAGIC } from "../../src/evidence-pack/pack-files.js";
+import {
+  buildEvidencePack,
+  MANIFEST_FILENAME,
+  REPORT_FILENAME,
+  type AuditReadData,
+  type BuildEvidencePackDeps,
+} from "../../src/evidence-pack/generate.js";
+import { populated, type ReadOutcome } from "../../src/evidence-pack/read-outcome.js";
+import type {
+  EvidencePack,
+  EvidencePackInput,
+  InventorySnapshot,
+  RetentionFacts,
+} from "../../src/evidence-pack/types.js";
+import {
+  localAgentsFilePath,
+  writePersistedLocalAgents,
+} from "../../src/hub/agent-registry-persistence.js";
+import type { LocalAgentRecord } from "../../src/contracts/v1.1/local-agent-records.js";
+import { Writable } from "node:stream";
+
+// ── shared fixtures ──────────────────────────────────────────────────
+
+let masterKey: Uint8Array;
+let signer: StoredIdentity;
+
+beforeEach(async () => {
+  masterKey = generateRandomKey(32);
+  const storage = new MemoryStorage();
+  const identityManager = new IdentityManager(storage, masterKey);
+  const identityEncKey = derivePurposeKey(masterKey, "identity-encryption");
+  const { storedIdentity } = createIdentity("post969-law", identityEncKey, "pw");
+  await identityManager.save(storedIdentity);
+  const primary = identityManager.getDefault();
+  if (!primary) throw new Error("fixture: no primary identity");
+  signer = primary;
+});
+
+const dirs: string[] = [];
+afterEach(async () => {
+  for (const d of dirs.splice(0)) {
+    await rm(d, { recursive: true, force: true }).catch(() => undefined);
+  }
+});
+
+async function tmpDir(prefix: string): Promise<string> {
+  const d = await mkdtemp(join(tmpdir(), prefix));
+  dirs.push(d);
+  return d;
+}
+
+function entry(timestamp: string, operation: string): AuditEntry {
+  return {
+    timestamp,
+    layer: "l2",
+    operation,
+    identity_id: "agent-a",
+    result: "success",
+  };
+}
+
+const RETENTION: RetentionFacts = {
+  max_entries: 100_000,
+  retained_total: 1,
+  max_total_size_bytes: 100 * 1024 * 1024,
+  retained_total_size_bytes: 100,
+  ever_pruned: false,
+  earliest_retained_at: "2026-04-02T10:00:00.000Z",
+  daemon_store: { status: "absent", included_entry_count: 0 },
+};
+
+function deps(): BuildEvidencePackDeps {
+  const audit: ReadOutcome<AuditReadData> = populated({
+    entries: [entry("2026-04-02T10:00:00.000Z", "gate_allow:x")],
+    retention: RETENTION,
+  });
+  return { audit, signer, masterKey };
+}
+
+function input(over: Partial<EvidencePackInput> = {}): EvidencePackInput {
+  return {
+    firm_name: "Post969 Test Law LLP",
+    quarter: { year: 2026, quarter: 2 },
+    generated_at_override: "2026-07-27T00:00:00.000Z",
+    custody: populated({
+      custody_mode: "passphrase",
+      outbound_denied_by_default: populated(true),
+    }),
+    ...over,
+  };
+}
+
+function reportText(pack: EvidencePack): string {
+  const report = pack.files.find((f) => f.filename === REPORT_FILENAME);
+  if (!report) throw new Error("expected a report file");
+  return report.content;
+}
+
+/** Render a pack whose agents inventory came from the REAL on-disk registry read. */
+function packWithAgentsFrom(fortressRoot: string): EvidencePack {
+  const snapshot: InventorySnapshot = buildInventorySnapshot({
+    agents: readHubAgentsSource(fortressRoot),
+    proxyServers: { ok: true, records: [] },
+    observedDestinations: { ok: true, records: [] },
+  });
+  return buildEvidencePack({ ...input(), inventory: snapshot }, deps());
+}
+
+function agentRecord(over: Partial<LocalAgentRecord> = {}): LocalAgentRecord {
+  return {
+    version: "1.1",
+    agent_id: "agent-x",
+    identity_id: "id-1",
+    harness: "claude_code",
+    model_provider: {
+      vendor: "anthropic",
+      model_id: "claude-opus-4",
+      runs_locally: false,
+    },
+    policy_id: "pol-1",
+    status: "active",
+    budget_summary: { last_refreshed_at: "2026-07-01T00:00:00.000Z" },
+    last_activity_at: "2026-07-10T00:00:00.000Z",
+    wrapped_at: "2026-06-15T00:00:00.000Z",
+    capabilities: {
+      can_pause: true,
+      can_resume: true,
+      can_restart: true,
+      can_unwrap: true,
+      can_lockdown: true,
+      can_chat: true,
+      can_change_template: true,
+    },
+    ...over,
+  };
+}
+
+// ── F-1: corrupt hub registry must never sign a verified-empty census ────────
+
+describe("F-1: a corrupt local-agents.json is a disclosed read failure, never 'No wrapped AI harnesses are recorded'", () => {
+  const DEFINITIVE = "No wrapped AI harnesses are recorded";
+
+  async function fortressWithRegistryBytes(content: string): Promise<string> {
+    const root = await tmpDir("sanctuary-post969-f1-");
+    const filePath = localAgentsFilePath(root);
+    await mkdir(join(root, "state", "_hub"), { recursive: true });
+    await writeFile(filePath, content, "utf-8");
+    return root;
+  }
+
+  // FAIL-WITHOUT-FIX: on pre-fix main the best-effort reader mapped each of
+  // these real on-disk corruptions to ok+[] and the signed report rendered the
+  // definitive census line.
+  const CORRUPTIONS: Array<[string, string]> = [
+    ["invalid JSON", "{ not json at all"],
+    ["agents not an array", '{"version":"1.1","agents":"not-an-array"}'],
+    ["truncated file", '{"version":"1.1","agents":[{"agent_'],
+    [
+      "parse-valid but wrong record shape",
+      '{"version":"1.1","agents":[{"agent_id":42}]}',
+    ],
+    ["wrong top-level version", '{"version":"9.9","agents":[]}'],
+  ];
+
+  for (const [label, bytes] of CORRUPTIONS) {
+    it(`${label}: read_failed at the source AND the incomplete note in the signed report`, async () => {
+      const root = await fortressWithRegistryBytes(bytes);
+      const source = readHubAgentsSource(root);
+      expect(source.ok).toBe(false);
+      expect(source.records).toEqual([]);
+      // Host-independent reason: no tmp path, no home dir.
+      expect(source.reason).toBeDefined();
+      expect(source.reason).not.toContain(root);
+      expect(source.reason).not.toContain(tmpdir());
+
+      const report = reportText(packWithAgentsFrom(root));
+      expect(report).not.toContain(DEFINITIVE);
+      expect(report).toContain(
+        "could not be read for this period, so this section is INCOMPLETE"
+      );
+      expect(report).toContain("NOT a statement that none exist");
+    });
+  }
+
+  it("an ABSENT registry file is still an honest verified-empty (the definitive line survives)", async () => {
+    const root = await tmpDir("sanctuary-post969-f1-absent-");
+    const source = readHubAgentsSource(root);
+    expect(source).toEqual({ ok: true, records: [] });
+    const report = reportText(packWithAgentsFrom(root));
+    expect(report).toContain(DEFINITIVE);
+  });
+
+  it("a VALID registry written by the shipped writer renders its rows (populated path intact)", async () => {
+    const root = await tmpDir("sanctuary-post969-f1-valid-");
+    writePersistedLocalAgents(root, [agentRecord()]);
+    const source = readHubAgentsSource(root);
+    expect(source.ok).toBe(true);
+    expect(source.records).toHaveLength(1);
+    const report = reportText(packWithAgentsFrom(root));
+    expect(report).toContain("agent-x");
+    expect(report).not.toContain(DEFINITIVE);
+  });
+
+  it("probe-10: Markdown-hostile persisted fields are neutralized before the signed table", async () => {
+    const root = await tmpDir("sanctuary-post969-f1-md-");
+    writePersistedLocalAgents(root, [
+      agentRecord({ agent_id: "evil|agent\ninjected-row" }),
+    ]);
+    const report = reportText(packWithAgentsFrom(root));
+    // Pipe escaped, newline collapsed: the field cannot terminate its cell or
+    // fabricate a new table row in the signed report.
+    expect(report).toContain("evil\\|agent injected-row");
+    expect(report).not.toContain("evil|agent\ninjected-row");
+  });
+});
+
+// ── F-2: malformed checkpoint records are COUNTED, never silently dropped ────
+
+describe("F-2: a parse-valid but shape-invalid audit checkpoint is counted and forces read_failed", () => {
+  const enc = new TextEncoder();
+  const GEN_AT = "2026-07-27T00:00:00.000Z";
+
+  async function freshFortress() {
+    const root = await tmpDir("sanctuary-post969-f2-");
+    const statePath = join(root, "state");
+    const storage = new FilesystemStorage(statePath);
+    const key = generateRandomKey();
+    return { root, statePath, storage, key };
+  }
+
+  // FAIL-WITHOUT-FIX: on pre-fix main this record hit the uncounted control-
+  // record skip arm; checkpointsSkipped stayed 0 and the pack rendered the
+  // export as definitively empty.
+  it("the sweep repro: _audit empty + one malformed checkpoint record is NOT 'the audit-chain export was empty'", async () => {
+    const f = await freshFortress();
+    await f.storage.write(
+      AUDIT_EXPORT_CHECKPOINT_NAMESPACE,
+      "audit-checkpoint-00000000000000000001",
+      enc.encode(
+        '{"checkpoint_kind":"audit-checkpoint","checkpoint_sequence":"not-a-number"}'
+      )
+    );
+    const chunks: string[] = [];
+    const sink = new Writable({
+      write(chunk, _enc2, cb) {
+        chunks.push(String(chunk));
+        cb();
+      },
+    });
+    const summary = await exportAuditChain(f.storage, sink);
+    expect(summary.checkpointsListed).toBe(1);
+    expect(summary.checkpointsExported).toBe(0);
+    expect(summary.checkpointsSkipped).toBe(1);
+
+    const out = await gatherDiscreteExports(f.storage, f.key, "fortress-1", GEN_AT);
+    expect(out.audit_chain.status).toBe("read_failed");
+    if (out.audit_chain.status === "read_failed") {
+      expect(out.audit_chain.reason).toMatch(/skipped/i);
+    }
+  });
+
+  it("an unrecognized non-control key with a parse-valid record is counted too (closed allowlist)", async () => {
+    const f = await freshFortress();
+    await f.storage.write(
+      AUDIT_EXPORT_CHECKPOINT_NAMESPACE,
+      "sneaky-note",
+      enc.encode('{"note":"planted"}')
+    );
+    const summary = await exportAuditChain(f.storage, new Writable({
+      write(_c, _e, cb) {
+        cb();
+      },
+    }));
+    expect(summary.checkpointsSkipped).toBe(1);
+  });
+
+  it("P1-A regression: a healthy fortress with a REAL __head_anchor control record still exports with zero skipped", async () => {
+    const f = await freshFortress();
+    const auditLog = new AuditLog(f.storage, f.key);
+    await auditLog.appendCritical({
+      layer: "l1",
+      operation: "healthy-op",
+      identity_id: "agent-a",
+      result: "success",
+    });
+    await auditLog.flush();
+    // Control for the control: prove the head-anchor control record actually
+    // exists in the namespace this test claims to exercise, so a future
+    // storage-layout change cannot turn this into a vacuous pass.
+    const keys = (await f.storage.list(AUDIT_EXPORT_CHECKPOINT_NAMESPACE)).map(
+      (m) => m.key
+    );
+    expect(keys).toContain("__head_anchor");
+    expect(AUDIT_EXPORT_CONTROL_KEYS).toContain("__head_anchor");
+
+    const summary = await exportAuditChain(f.storage, new Writable({
+      write(_c, _e, cb) {
+        cb();
+      },
+    }));
+    expect(summary.checkpointsSkipped).toBe(0);
+    expect(summary.entriesSkipped).toBe(0);
+
+    const out = await gatherDiscreteExports(f.storage, f.key, "fortress-1", GEN_AT);
+    expect(out.audit_chain.status).toBe("populated");
+  });
+});
+
+// ── F-3: the AppleDouble exemption is verified, not name-pattern-trusted ─────
+
+describe("F-3: planted `._*` files are refused; only verified forks of the pack's own files are exempt", () => {
+  function simplePack(): EvidencePack {
+    return buildEvidencePack(input(), deps());
+  }
+
+  // FAIL-WITHOUT-FIX: on pre-fix main writePackDirectory resolved and the
+  // planted Markdown survived beside the pack, unmanifested, while the signed
+  // recipe said ignored `._*` files carry no evidentiary content.
+  it("refuses to write beside a planted `._counsel-notes.md` (unpaired name)", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "sanctuary-post969-f3-"));
+    dirs.push(dir);
+    await writeFile(join(dir, "._counsel-notes.md"), "# privileged notes\n", "utf-8");
+    await expect(writePackDirectory(dir, simplePack())).rejects.toThrow(
+      /did not write/
+    );
+    // Fail-closed: nothing written, the operator's file untouched.
+    expect(await readdir(dir)).toEqual(["._counsel-notes.md"]);
+  });
+
+  it("refuses a fake fork that pairs with a pack filename but lacks the AppleDouble magic", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "sanctuary-post969-f3-fake-"));
+    dirs.push(dir);
+    // Name-paired with the conditional transparency export, content is JSON:
+    // exactly the smuggling shape the name-pattern exemption allowed.
+    await writeFile(
+      join(dir, "._transparency-bundle.json"),
+      '{"planted":"evidence-like content"}',
+      "utf-8"
+    );
+    await expect(writePackDirectory(dir, simplePack())).rejects.toThrow(
+      /did not write/
+    );
+    expect(await readdir(dir)).toEqual(["._transparency-bundle.json"]);
+  });
+
+  it("still tolerates a GENUINE AppleDouble fork of a pack file (magic verified), so the tool stays usable", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "sanctuary-post969-f3-real-"));
+    dirs.push(dir);
+    const fork = Buffer.from([...APPLEDOUBLE_MAGIC, 0x00, 0x02, 0x00, 0x00]);
+    await writeFile(join(dir, "._00_pack_manifest.json"), fork);
+    await expect(writePackDirectory(dir, simplePack())).resolves.toBeUndefined();
+    const after = await readdir(dir);
+    expect(after).toContain("._00_pack_manifest.json");
+    expect(after).toContain(MANIFEST_FILENAME);
+    // Sanity: the fork bytes were not swept or rewritten.
+    expect(await readFile(join(dir, "._00_pack_manifest.json"))).toEqual(fork);
+  });
+
+  it("the SIGNED recipe no longer asserts unverified `._*` files carry no evidentiary content", () => {
+    const report = reportText(simplePack());
+    // The blanket unverified claim is gone...
+    expect(report).not.toContain(
+      "which the generator ignores and which carries no evidentiary content"
+    );
+    // ...replaced by the verified, narrowed rule the enforcement actually applies.
+    expect(report).toContain(
+      "verified AppleDouble `._*` resource forks of the pack's own filenames"
+    );
+    expect(report).toContain("AppleDouble magic bytes");
+  });
+});

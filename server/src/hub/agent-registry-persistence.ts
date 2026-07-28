@@ -66,6 +66,14 @@ export function localAgentsFilePath(storagePath: string): string {
  * returns an empty list; parse errors return an empty list (the fortress
  * is still functional, just without prior wrap-state restored). The
  * caller is responsible for any logging/diagnostic surfacing.
+ *
+ * CONSUMER BOUND (F-1, dry-bar sweep 2026-07-27): best-effort is correct for
+ * the hub-restore consumer ONLY (a corrupted file degrades the dashboard's
+ * agent list rather than blocking the fortress). It is WRONG for any consumer
+ * that turns "zero records" into an attestation: an empty return here cannot
+ * distinguish "read to completion, genuinely empty" from "corrupt file". An
+ * attesting consumer (the evidence pack's inventory census) MUST use
+ * {@link readPersistedLocalAgentsStrict} instead.
  */
 export function readPersistedLocalAgents(
   storagePath: string,
@@ -80,6 +88,97 @@ export function readPersistedLocalAgents(
   } catch {
     return [];
   }
+}
+
+/**
+ * The strict read outcome for an ATTESTING consumer (F-1). Three states,
+ * deliberately not collapsible into each other:
+ *  - `absent`: the registry file does not exist. An honest empty candidate
+ *    (nothing has ever been wrapped, or the fortress is fresh).
+ *  - `ok`: the file exists, parsed, and matched the persisted shape; `agents`
+ *    are the records (possibly an empty array, which IS a verified empty).
+ *  - `unreadable`: the file exists but could not be read, did not parse, or
+ *    did not match the persisted shape. `reason` is a FIXED, host-independent
+ *    classification safe for a signed artifact; `cause` (when present) is the
+ *    raw error for operator-console diagnostics ONLY and must never reach a
+ *    delivered pack.
+ */
+export type StrictLocalAgentsRead =
+  | { status: "absent" }
+  | { status: "ok"; agents: LocalAgentRecord[] }
+  | { status: "unreadable"; reason: string; cause?: unknown };
+
+/** Fixed, host-independent unreadable classifications (safe for signed prose). */
+const UNREADABLE_IO = "the registry file exists but could not be read";
+const UNREADABLE_JSON = "the registry file is not valid JSON";
+const UNREADABLE_SHAPE =
+  "the registry file does not match the persisted hub registry shape";
+
+/**
+ * Validate the fields of a persisted record that an attesting consumer
+ * actually renders and sorts on (agent_id, harness, wrapped_at, status, and
+ * the optional model_provider vendor/model_id). Deliberately NOT a full
+ * `LocalAgentRecord` validation: over-validating fields the census never
+ * touches would turn a benign writer evolution into a false read-failure
+ * disclosure on a healthy fortress (the mirror defect).
+ */
+function isRenderableLocalAgentRecord(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const r = value as Record<string, unknown>;
+  if (typeof r.agent_id !== "string" || r.agent_id.length === 0) return false;
+  if (typeof r.harness !== "string") return false;
+  if (typeof r.wrapped_at !== "string") return false;
+  if (typeof r.status !== "string") return false;
+  if (r.model_provider !== undefined) {
+    const mp = r.model_provider as Record<string, unknown> | null;
+    if (!mp || typeof mp !== "object" || Array.isArray(mp)) return false;
+    if (typeof mp.vendor !== "string" || typeof mp.model_id !== "string") {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * STRICT read of the persisted hub agent records, for consumers that turn the
+ * result into an attestation (F-1, dry-bar sweep 2026-07-27). Unlike the
+ * best-effort {@link readPersistedLocalAgents}, this never conflates "could
+ * not read or parse" with "verified empty": a corrupt, truncated, or
+ * wrong-shape file is reported as `unreadable`, so an evidence artifact can
+ * disclose a read failure instead of signing a definitive "none recorded"
+ * census over a file it could not actually use. Never throws.
+ */
+export function readPersistedLocalAgentsStrict(
+  storagePath: string,
+): StrictLocalAgentsRead {
+  const filePath = localAgentsFilePath(storagePath);
+  if (!existsSync(filePath)) return { status: "absent" };
+  let raw: string;
+  try {
+    raw = readFileSync(filePath, "utf8");
+  } catch (cause) {
+    return { status: "unreadable", reason: UNREADABLE_IO, cause };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (cause) {
+    return { status: "unreadable", reason: UNREADABLE_JSON, cause };
+  }
+  if (
+    !parsed ||
+    typeof parsed !== "object" ||
+    Array.isArray(parsed) ||
+    (parsed as Record<string, unknown>).version !== PERSISTED_VERSION ||
+    !Array.isArray((parsed as Record<string, unknown>).agents)
+  ) {
+    return { status: "unreadable", reason: UNREADABLE_SHAPE };
+  }
+  const agents = (parsed as { agents: unknown[] }).agents;
+  if (!agents.every(isRenderableLocalAgentRecord)) {
+    return { status: "unreadable", reason: UNREADABLE_SHAPE };
+  }
+  return { status: "ok", agents: agents as LocalAgentRecord[] };
 }
 
 /**

@@ -50,7 +50,11 @@ import {
   type ReadOutcome,
 } from "../../src/evidence-pack/read-outcome.js";
 import { diagnoseHistoryGap } from "../../src/evidence-pack/history-attribution.js";
-import { isPackRelevantEntry } from "../../src/evidence-pack/pack-files.js";
+import {
+  APPLEDOUBLE_MAGIC,
+  isPackRelevantEntry,
+} from "../../src/evidence-pack/pack-files.js";
+import { PACK_FILENAMES } from "../../src/evidence-pack/generate.js";
 import type {
   EvidencePack,
   EvidencePackInput,
@@ -458,7 +462,13 @@ describe("D11 X-1: hidden pack-relevant files cannot ship unmanifested", () => {
 
   it("still tolerates inert OS metadata, so the tool stays usable", async () => {
     await writeFile(join(dir, ".DS_Store"), "\u0000binary", "utf-8");
-    await writeFile(join(dir, "._01_evidence_pack.md"), "applefork", "utf-8");
+    // F-3: a GENUINE AppleDouble fork of one of the pack's own files (correct
+    // magic bytes). A `._*` file without the magic is no longer tolerated; see
+    // the post-#969 sweep tests.
+    await writeFile(
+      join(dir, "._01_evidence_pack.md"),
+      Buffer.from([...APPLEDOUBLE_MAGIC, 0x00, 0x02, 0x00, 0x00])
+    );
     await expect(writePackDirectory(dir, simplePack())).resolves.toBeUndefined();
     const after = await readdir(dir);
     expect(after).toContain(".DS_Store");
@@ -471,14 +481,14 @@ describe("D11 X-1: hidden pack-relevant files cannot ship unmanifested", () => {
     // Everything the writer ignores must be named in the signed recipe, or the
     // report tells the auditor to flag a file the generator deliberately left.
     for (const name of [".DS_Store", ".localized", "Thumbs.db", "desktop.ini"]) {
-      expect(isPackRelevantEntry(name)).toBe(false);
+      expect(isPackRelevantEntry(name, PACK_FILENAMES)).toBe(false);
       expect(text).toContain(name);
     }
     // And the recipe tells the auditor to look for hidden files at all.
     expect(text).toContain("ls -a");
     expect(text).toContain("Any other file, hidden or not");
     // A hidden Markdown file is NOT exempt.
-    expect(isPackRelevantEntry(".counsel-notes.md")).toBe(true);
+    expect(isPackRelevantEntry(".counsel-notes.md", PACK_FILENAMES)).toBe(true);
   });
 });
 

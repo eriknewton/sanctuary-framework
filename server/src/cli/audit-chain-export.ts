@@ -39,6 +39,25 @@ export const AUDIT_EXPORT_DAEMON_NAMESPACE = "_audit-daemon";
 // toward "present" only over-requires --operator-only, which is fail-closed.
 export const AUDIT_EXPORT_SPLIT_ESTABLISHED_META_KEY =
   "audit-store-split-established-v1";
+// F-2 (dry-bar sweep 2026-07-27): the CLOSED allowlist of legitimate
+// NON-EXPORT control records that live in `_audit_checkpoints` under fixed
+// keys. These literals byte-match `operational/audit-log.ts`
+// (`AUDIT_HEAD_ANCHOR_KEY`, `AUDIT_EPOCH_KEYS_KEY`); duplicated here because
+// this raw exporter deliberately avoids server-runtime imports. Only a record
+// under one of THESE keys may be skipped without counting: the P1-A fix's
+// shape-based "not a recognized checkpoint, so a control record" arm could not
+// discriminate a control record from a checkpoint-keyed record failing strict
+// validation, so a parse-valid-but-malformed checkpoint vanished from the
+// export with `checkpointsSkipped` still 0 and the evidence pack signed the
+// export as complete or empty. A NEW control record added to this namespace
+// MUST be added here in the same PR, exactly like the master-rotation
+// classifier's closed set (`core/master-rotation.ts` `convertAuditAnchors`);
+// otherwise a healthy fortress discloses a false INCOMPLETE, which is loud and
+// fail-closed rather than silently flattering.
+export const AUDIT_EXPORT_CONTROL_KEYS: readonly string[] = [
+  "__head_anchor",
+  "__custody_epoch_keys",
+];
 
 /** Record types in a JSONL export file. */
 export type ExportRecord =
@@ -117,10 +136,12 @@ export interface AuditChainExportSummary {
   /** Checkpoint/anchor records successfully written to the export. */
   checkpointsExported: number;
   /**
-   * Checkpoint/anchor records LISTED but skipped as GENUINE CORRUPTION: unreadable
-   * at read time or invalid JSON. A record that PARSES but is not a recognized
-   * checkpoint / anchor is a legitimate non-export control record (e.g. the
-   * `__head_anchor` head pointer) and is NOT counted here.
+   * Checkpoint/anchor records LISTED but skipped as GENUINE CORRUPTION:
+   * unreadable at read time, invalid JSON, or (F-2) parse-valid under a
+   * checkpoint/anchor or unrecognized key while failing strict validation.
+   * Records under the CLOSED control-key allowlist
+   * ({@link AUDIT_EXPORT_CONTROL_KEYS}, e.g. the `__head_anchor` head pointer)
+   * are legitimate non-export control records and are NOT counted here.
    */
   checkpointsSkipped: number;
 }
@@ -214,12 +235,21 @@ export async function exportAuditChain(
       continue;
     }
     if (!isAuditCheckpointRecord(parsed)) {
-      // A record that PARSED but is not a checkpoint / legacy-anchor / rotation-
-      // anchor is a legitimate NON-EXPORT control record that lives in this
-      // namespace (e.g. the `__head_anchor` head pointer), NOT corruption. It was
-      // always silently skipped by design and must NOT be counted as a skipped
-      // corrupt record (doing so would false-positive a `read_failed` on every
-      // healthy fortress). Only unreadable / invalid-JSON records above count.
+      // F-2 (dry-bar sweep 2026-07-27): the skip is KEY-AWARE. A record under a
+      // key on the CLOSED control allowlist (`__head_anchor`,
+      // `__custody_epoch_keys`) is a legitimate NON-EXPORT control record, NOT
+      // corruption; it is skipped uncounted so a healthy fortress never
+      // false-positives a `read_failed` (the P1-A fix, which this preserves).
+      // Any OTHER key whose record parses but fails strict validation is a
+      // malformed checkpoint/anchor (writer schema drift, corruption, or a
+      // foreign blob) and MUST be counted: the P1-A shape-only arm could not
+      // tell the two apart, so a parse-valid-but-malformed checkpoint vanished
+      // from the export while `checkpointsSkipped` stayed 0 and the evidence
+      // pack signed the export as complete or definitively empty.
+      if (AUDIT_EXPORT_CONTROL_KEYS.includes(meta.key)) {
+        continue;
+      }
+      checkpointsSkipped++;
       continue;
     }
 

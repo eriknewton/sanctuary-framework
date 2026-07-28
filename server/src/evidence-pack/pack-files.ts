@@ -12,10 +12,23 @@
  * unusable on a machine whose file browser has opened the delivery folder), but
  * a conscious tradeoff that breaks an honesty claim is still a defect.
  *
+ * F-3 (dry-bar sweep 2026-07-27): the round-11 fix closed the open-ended
+ * dotfile exemption to a named set but left the AppleDouble `._*` prefix
+ * open-ended, so a planted `._counsel-notes.md` still shipped unmanifested
+ * while the signed recipe told the auditor it "carries no evidentiary
+ * content". The exemption is now VERIFIED, not name-pattern-trusted: a `._*`
+ * entry is exempt only when (a) its data-fork name pairs with one of the
+ * pack's own filenames AND (b) the file actually begins with the AppleDouble
+ * magic bytes. Any other `._*` file is pack-relevant and refused or reconciled
+ * exactly like a visible file.
+ *
  * Both the enforcement (`writePackDirectory`) and the prose (`renderVerification`)
- * now read from this module. Widening the exemption widens what the signed
+ * read from this module. Widening the exemption widens what the signed
  * report tells the auditor to ignore, in the same edit, by construction.
  */
+
+import { open, readdir } from "node:fs/promises";
+import { join } from "node:path";
 
 /**
  * Inert operating-system / file-browser metadata the pack's claims deliberately
@@ -34,8 +47,16 @@ export const IGNORED_OS_METADATA: readonly string[] = [
   "desktop.ini",
 ];
 
-/** AppleDouble resource forks (`._01_evidence_pack.md` and friends). */
+/** AppleDouble resource-fork name prefix (`._01_evidence_pack.md` and friends). */
 const APPLEDOUBLE_PREFIX = "._";
+
+/**
+ * The AppleDouble on-disk magic number (0x00051607, big-endian), the first four
+ * bytes of every genuine `._*` resource-fork companion file. A UTF-8 Markdown or
+ * JSON file smuggled under a `._` name does not begin with these bytes, which is
+ * what lets the writer tell a real fork from planted evidence-like content.
+ */
+export const APPLEDOUBLE_MAGIC: readonly number[] = [0x00, 0x05, 0x16, 0x07];
 
 /**
  * Human-readable rendering of the ignored set for the SIGNED section-1 recipe,
@@ -45,15 +66,85 @@ const APPLEDOUBLE_PREFIX = "._";
  */
 export const IGNORED_OS_METADATA_LABEL: string =
   IGNORED_OS_METADATA.map((n) => `\`${n}\``).join(", ") +
-  ", and AppleDouble `._*` resource forks";
+  ", and verified AppleDouble `._*` resource forks of the pack's own filenames";
 
 /**
- * True for a directory entry the pack's claims range over. Only the closed
- * {@link IGNORED_OS_METADATA} set (plus AppleDouble forks) is exempt; every
- * other name, hidden or not, is pack-relevant.
+ * The data-fork name a `._*` entry claims to be the resource fork of
+ * (`._01_evidence_pack.md` -> `01_evidence_pack.md`), or null when the name is
+ * not AppleDouble-shaped at all.
  */
-export function isPackRelevantEntry(name: string): boolean {
+export function appleDoubleDataName(name: string): string | null {
+  if (!name.startsWith(APPLEDOUBLE_PREFIX)) return null;
+  const dataName = name.slice(APPLEDOUBLE_PREFIX.length);
+  return dataName.length > 0 ? dataName : null;
+}
+
+/**
+ * NAME-LEVEL classification: true for a directory entry the pack's claims range
+ * over. Only the closed {@link IGNORED_OS_METADATA} set and AppleDouble fork
+ * names PAIRED WITH one of `packFilenames` are exempt at the name level; every
+ * other name, hidden or not, is pack-relevant. F-3: an exempt-named fork
+ * candidate must ADDITIONALLY carry the AppleDouble magic bytes to stay exempt;
+ * {@link listPackRelevantEntries} performs that content check, so callers with
+ * a real directory must use it rather than this name-only predicate.
+ */
+export function isPackRelevantEntry(
+  name: string,
+  packFilenames: readonly string[]
+): boolean {
   if (IGNORED_OS_METADATA.includes(name)) return false;
-  if (name.startsWith(APPLEDOUBLE_PREFIX)) return false;
+  const dataName = appleDoubleDataName(name);
+  if (dataName !== null && packFilenames.includes(dataName)) return false;
   return true;
+}
+
+/**
+ * CONTENT verification for an AppleDouble fork candidate: true only when the
+ * file's first four bytes are the AppleDouble magic. Fails toward "not a fork"
+ * (pack-relevant, so refused) on any read error or short file: a file that
+ * cannot be verified as inert metadata must never be silently exempted from
+ * the signed claims (the could-not-look state is not the verified state).
+ */
+async function hasAppleDoubleMagic(filePath: string): Promise<boolean> {
+  let handle;
+  try {
+    handle = await open(filePath, "r");
+    const buf = new Uint8Array(APPLEDOUBLE_MAGIC.length);
+    const { bytesRead } = await handle.read(buf, 0, buf.length, 0);
+    if (bytesRead < APPLEDOUBLE_MAGIC.length) return false;
+    return APPLEDOUBLE_MAGIC.every((b, i) => buf[i] === b);
+  } catch {
+    return false;
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
+}
+
+/**
+ * List the entries of `dirPath` the pack's signed claims range over: the
+ * directory listing minus the closed {@link IGNORED_OS_METADATA} set and minus
+ * VERIFIED AppleDouble forks of the pack's own filenames (name pairing AND
+ * magic-byte check). A `._*` entry that fails either check is INCLUDED, so the
+ * writer's foreign-file refusal and post-write reconciliation treat it exactly
+ * like any other pack-relevant file.
+ */
+export async function listPackRelevantEntries(
+  dirPath: string,
+  packFilenames: readonly string[]
+): Promise<string[]> {
+  const names = await readdir(dirPath);
+  const relevant: string[] = [];
+  for (const name of names) {
+    if (isPackRelevantEntry(name, packFilenames)) {
+      relevant.push(name);
+      continue;
+    }
+    // Name-level exempt. Metadata-set names are exempt outright; fork-named
+    // candidates must ALSO carry the AppleDouble magic to stay exempt.
+    const dataName = appleDoubleDataName(name);
+    if (dataName === null) continue;
+    if (await hasAppleDoubleMagic(join(dirPath, name))) continue;
+    relevant.push(name);
+  }
+  return relevant;
 }

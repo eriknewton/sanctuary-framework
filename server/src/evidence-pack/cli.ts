@@ -15,7 +15,7 @@
  * NOT LEGAL ADVICE. The generated pack is a technical artifact.
  */
 
-import { mkdir, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { Writable } from "node:stream";
 import { createSanctuaryServer } from "../index.js";
@@ -30,7 +30,7 @@ import {
 } from "../operational/audit-store-split.js";
 import { fortressRanAuditStoreSplitMigration } from "../cli/audit-chain-export.js";
 import { fortressIdFromStoragePath } from "../dashboard/v1_1/wiring.js";
-import { isPackRelevantEntry } from "./pack-files.js";
+import { listPackRelevantEntries } from "./pack-files.js";
 import {
   anchorReceiptsPresentOnDisk,
   buildAnchorsExport,
@@ -42,7 +42,7 @@ import { StateStore } from "../cognitive/state-store.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
 import { ObserveStore } from "../castle-wall/observe/index.js";
 import type { CandidateObservation } from "../castle-wall/observe/types.js";
-import { readPersistedLocalAgents } from "../hub/agent-registry-persistence.js";
+import { readPersistedLocalAgentsStrict } from "../hub/agent-registry-persistence.js";
 import type { LocalAgentRecord } from "../contracts/v1.1/local-agent-records.js";
 import { SovereigntyProfileStore } from "../sovereignty-profile.js";
 import { readPersistedCheckpoints } from "../transparency/emitter.js";
@@ -159,6 +159,14 @@ function readFailureReason(lead: string, cause: unknown): string {
 // "every file" means. Anything hidden but NOT on that list -- any `.md`,
 // `.json`, `.jsonl`, or any other unrecognized dotfile -- is pack-relevant and
 // is refused or reconciled exactly like a visible file.
+//
+// F-3 (dry-bar sweep 2026-07-27): the AppleDouble arm of that exemption was
+// still an open-ended NAME PATTERN (`._*`), so a planted `._counsel-notes.md`
+// survived beside the pack, unmanifested, while the signed recipe claimed it
+// carried no evidentiary content. The exemption is now VERIFIED per entry in
+// `listPackRelevantEntries`: a `._*` file is exempt only when it pairs with one
+// of the pack's own filenames AND begins with the AppleDouble magic bytes;
+// anything else under that prefix is refused or reconciled like any other file.
 
 /**
  * Write the pack so the output directory ends up containing EXACTLY this run's
@@ -179,7 +187,7 @@ export async function writePackDirectory(
   ]);
 
   await mkdir(outputDir, { recursive: true });
-  const before = (await readdir(outputDir)).filter(isPackRelevantEntry);
+  const before = await listPackRelevantEntries(outputDir, PACK_FILENAMES);
 
   const foreign = before.filter((name) => !PACK_FILENAMES.includes(name));
   if (foreign.length > 0) {
@@ -218,7 +226,7 @@ export async function writePackDirectory(
   // Reconcile: prove the shipped directory IS the pack. This is the step the
   // report's section-1 verification recipe now tells the auditor to repeat, so
   // the generator must not ship a directory that would fail it.
-  const after = (await readdir(outputDir)).filter(isPackRelevantEntry);
+  const after = await listPackRelevantEntries(outputDir, PACK_FILENAMES);
   const unexpected = after.filter((name) => !expected.has(name));
   const missing = [...expected].filter((name) => !after.includes(name));
   if (unexpected.length > 0 || missing.length > 0) {
@@ -246,6 +254,53 @@ export async function writePackDirectory(
  * renders a failed read as an affirmative census claim (slice-2 MED-2 / HIGH-1).
  * Never establishes a live connection during pack generation.
  */
+/**
+ * F-1 (dry-bar sweep 2026-07-27): the pack's read of the plaintext hub agent
+ * registry. The hub's own `readPersistedLocalAgents` is BEST-EFFORT by pinned
+ * design (a corrupt file degrades the dashboard rather than blocking the
+ * fortress), so it maps parse/schema corruption to `[]` and never throws --
+ * which, consumed naively, minted the definitive `empty_verified` census
+ * witness ("No wrapped AI harnesses are recorded ...") over a corrupt file.
+ * This function is the pack's consumption boundary: it routes through the
+ * STRICT reader, so file-absent stays an honest verified-empty candidate while
+ * unreadable/unparseable/wrong-shape files become a disclosed read failure the
+ * renderer can never turn into a definitive "none". Exported so the pinned
+ * tests can drive the REAL pack outcome path from a real corrupt file on disk.
+ */
+export function readHubAgentsSource(
+  storagePath: string
+): InventorySourceRead<LocalAgentRecord> {
+  const read = readPersistedLocalAgentsStrict(storagePath);
+  switch (read.status) {
+    case "absent":
+      // No registry file has ever been written: an honest verified-empty
+      // candidate (nothing wrapped), NOT a read failure.
+      return { ok: true, records: [] };
+    case "ok":
+      return { ok: true, records: read.agents };
+    case "unreadable": {
+      // Operator gets the raw diagnostic on the local console (never in the
+      // pack); the firm-facing reason is the strict reader's FIXED,
+      // host-independent classification.
+      // SAFETY: stderr/console is the operator-facing CLI channel; this mirrors
+      // readFailureReason and is deliberately NOT part of the delivered pack.
+      console.error(
+        "[sanctuary evidence-pack] the hub agent registry could not be used " +
+          `for the census: ${read.reason}. Local diagnostic (operator console ` +
+          "only, deliberately NOT included in the pack): " +
+          `${read.cause instanceof Error ? read.cause.message : String(read.cause ?? "none")}`
+      );
+      return {
+        ok: false,
+        records: [],
+        reason:
+          "the hub agent registry file was present but could not be used " +
+          `for a census claim (${read.reason}), so no claim is made from it`,
+      };
+    }
+  }
+}
+
 async function gatherInventory(
   config: SanctuaryConfig,
   storage: StorageBackend,
@@ -254,8 +309,10 @@ async function gatherInventory(
 ): Promise<InventorySnapshot> {
   const agents: InventorySourceRead<LocalAgentRecord> = (() => {
     try {
-      return { ok: true, records: readPersistedLocalAgents(config.storage_path) };
+      return readHubAgentsSource(config.storage_path);
     } catch (e) {
+      // The strict reader is designed never to throw; this arm is defence in
+      // depth so an unforeseen failure still discloses instead of aborting.
       return {
         ok: false,
         records: [],
