@@ -29,12 +29,17 @@ import {
   AUDIT_CHAIN_GENESIS,
   AUDIT_CHAIN_SCHEMA_VERSION,
   AUDIT_CHECKPOINT_SCHEMA_VERSION,
+  AUDIT_EPOCH_KEYS_KEY,
+  AUDIT_HEAD_ANCHOR_KEY,
+  AUDIT_ROTATION_ANCHOR_MARKER,
+  isAuditRotationAnchorEnvelope,
   type AuditCheckpointRecord,
   type AuditCheckpointSignature,
   type AuditCheckpointSigningPayload,
   canonicalJson,
   computeAuditEntryHash,
   computeAuditRoot,
+  isAuditCheckpointRecord,
   sha256Hex,
   verifyCheckpointSignature,
 } from "../audit/chain.js";
@@ -248,7 +253,9 @@ const AUDIT_CHECKPOINT_NAMESPACE = "_audit_checkpoints";
 // fixed key that does NOT match the `audit-checkpoint-`/`legacy-anchor-` prefixes
 // the checkpoint readers list on, so it never collides with those scans.
 const AUDIT_ROTATION_ANCHOR_KEY = "__rotation_anchor";
-const AUDIT_HEAD_ANCHOR_KEY = "__head_anchor";
+// AUDIT_HEAD_ANCHOR_KEY ("__head_anchor") is imported from the pure shared
+// `audit/checkpoint-shape.ts` (G1/G5) so this runtime and the raw CLI
+// exporter's control-key allowlist cannot drift.
 const AUDIT_HEAD_ANCHOR_ESTABLISHED_KEY = "audit-head-anchor-established-v1";
 // F2 Option A (Finding 1, adversarial gate 2026-07-15): an OPERATOR-provenance
 // marker that records "the operator has written at least one POST-SPLIT suffix
@@ -278,9 +285,9 @@ const AUDIT_HEAD_ANCHOR_ESTABLISHED_KEY = "audit-head-anchor-established-v1";
 // separate build and out of scope for the mint unblock.
 const AUDIT_POST_SPLIT_SUFFIX_ESTABLISHED_KEY =
   "audit-post-split-suffix-established-v1";
-// Distinctive envelope marker so a MAC'd rotation anchor is unambiguously
-// distinguished from a bare/marker-stripped record (mirrors F1's state-meta MAC).
-const AUDIT_ROTATION_ANCHOR_MARKER = "__sanctuary_audit_rotation_anchor_v1";
+// AUDIT_ROTATION_ANCHOR_MARKER ("__sanctuary_audit_rotation_anchor_v1") is
+// imported from the pure shared `audit/checkpoint-shape.ts` (re-gate round 3)
+// so this runtime's anchor shape and the raw CLI exporter's cannot drift.
 const AUDIT_HEAD_ANCHOR_MARKER = "__sanctuary_audit_head_anchor_v1";
 // Domain-separated MAC over the rotation-anchor record. The anchor records the
 // authenticated lowest-surviving sequence + its prev_hash after a prune, so a
@@ -411,7 +418,11 @@ const AUDIT_STORE_SPLIT_ESTABLISHED_MAC_DOMAIN =
 // master AND the ciphertext can still read pre-rotation audit metadata
 // (operation names/results — never key material, per CLAUDE.md #6). That is
 // the price of keeping the chain externally verifiable across rotation.
-export const AUDIT_EPOCH_KEYS_KEY = "__custody_epoch_keys";
+// G1/G5 (post-#969 sweep re-gate): the key literal now lives in the pure
+// shared `audit/checkpoint-shape.ts` (one definition for this runtime AND the
+// raw CLI exporter's control-key allowlist); re-exported here so existing
+// importers (master rotation, tests) are unchanged.
+export { AUDIT_EPOCH_KEYS_KEY };
 const AUDIT_EPOCH_KEYS_MARKER = "__sanctuary_audit_epoch_keys_v1";
 const AUDIT_EPOCH_MAC_DOMAIN = "sanctuary.audit-epoch-keys.v1\n";
 const AUDIT_EPOCH_WRAP_PURPOSE = "audit-epoch-wrap";
@@ -2607,21 +2618,18 @@ export class AuditLog {
       return { status: "absent" };
     }
 
-    const data = parsed.data;
-    const mac = parsed.mac;
-    if (
-      !isRecord(data) ||
-      typeof mac !== "string" ||
-      typeof data.base_sequence !== "number" ||
-      !Number.isSafeInteger(data.base_sequence) ||
-      data.base_sequence <= 0 ||
-      typeof data.base_prev_hash !== "string"
-    ) {
+    // Re-gate round 3: the structural arm is the SHARED shape predicate
+    // (marker + data + canonical 43-char base64url mac), so this runtime and the raw
+    // CLI exporter cannot drift apart on what a rotation anchor looks like.
+    // The MAC VERIFICATION below stays here: only this runtime holds the
+    // custody-derived MAC key.
+    if (!isAuditRotationAnchorEnvelope(parsed)) {
       return { status: "invalid" };
     }
+    const data = parsed.data;
     let providedMac: Uint8Array;
     try {
-      providedMac = fromBase64url(mac);
+      providedMac = fromBase64url(parsed.mac);
     } catch {
       return { status: "invalid" };
     }
@@ -5435,29 +5443,12 @@ function isPersistedAuditEnvelopeV2(
   );
 }
 
-function isAuditCheckpointRecord(value: unknown): value is AuditCheckpointRecord {
-  return (
-    isRecord(value) &&
-    value.schema_version === AUDIT_CHECKPOINT_SCHEMA_VERSION &&
-    (value.checkpoint_kind === "audit-checkpoint" ||
-      value.checkpoint_kind === "legacy-anchor") &&
-    typeof value.checkpoint_sequence === "number" &&
-    Number.isSafeInteger(value.checkpoint_sequence) &&
-    typeof value.from_sequence === "number" &&
-    Number.isSafeInteger(value.from_sequence) &&
-    typeof value.root_hash === "string" &&
-    /^[0-9a-f]{64}$/.test(value.root_hash) &&
-    typeof value.previous_checkpoint_sequence === "number" &&
-    Number.isSafeInteger(value.previous_checkpoint_sequence) &&
-    typeof value.signed_at === "string" &&
-    (typeof value.signer_kid === "string" || value.signer_kid === null) &&
-    (typeof value.signature === "string" || value.signature === null) &&
-    (value.signature_algorithm === "Ed25519" ||
-      value.signature_algorithm === null) &&
-    value.payload_encoding === "domain-separated-canonical-json-v1" &&
-    typeof value.unsigned === "boolean"
-  );
-}
+// isAuditCheckpointRecord moved to the pure shared `audit/checkpoint-shape.ts`
+// (G1, post-#969 sweep re-gate) and is imported above: the raw CLI exporter's
+// hand-duplicated copy had drifted WEAKER than this runtime's (no
+// schema_version / signature_algorithm / payload_encoding / root_hash-hex
+// checks), so a malformed checkpoint could export uncounted. One shared
+// definition makes that drift structurally impossible.
 
 function checkpointPayload(
   checkpoint: AuditCheckpointRecord

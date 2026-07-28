@@ -515,12 +515,31 @@ function incompleteNote(sourceLabel: string, reason: string): string {
   );
 }
 
+/**
+ * F-1 probe-10 (dry-bar sweep 2026-07-27): neutralize Markdown-table control
+ * characters in a PERSISTED string field before it enters a rendered table
+ * row. The hub agent registry is a plaintext file, so a field can carry a `|`
+ * or a newline that would break the table structure (or smuggle a fabricated
+ * row) into the signed report. Backslashes are escaped FIRST (G4: otherwise a
+ * crafted `\|` becomes `\\|`, an escaped backslash followed by a LIVE cell
+ * delimiter), then pipes; newlines collapse to a space; everything else
+ * renders as-is.
+ */
+function mdCell(value: string | number | undefined, fallback = "-"): string {
+  if (value === undefined) return fallback;
+  const text = String(value)
+    .replace(/\\/g, "\\\\")
+    .replace(/\r?\n|\r/g, " ")
+    .replace(/\|/g, "\\|");
+  return text.length > 0 ? text : fallback;
+}
+
 function agentTable(rows: InventoryAgentRow[]): string[] {
   const out = ["| Agent | Harness | Model | Wrapped | Status |", "|---|---|---|---|---|"];
   for (const a of rows) {
     const model = [a.model_vendor, a.model_id].filter(Boolean).join(" / ") || "-";
     out.push(
-      `| ${a.agent_id} | ${a.harness} | ${model} | ${a.wrapped_at ?? "-"} | ${a.status ?? "-"} |`
+      `| ${mdCell(a.agent_id)} | ${mdCell(a.harness)} | ${mdCell(model)} | ${mdCell(a.wrapped_at)} | ${mdCell(a.status)} |`
     );
   }
   return out;
@@ -531,7 +550,7 @@ function mcpTable(rows: InventoryMcpServerRow[]): string[] {
   for (const s of rows) {
     const enabled = s.enabled === undefined ? "-" : s.enabled ? "yes" : "no";
     out.push(
-      `| ${s.name} | ${s.transport ?? "-"} | ${enabled} | ${s.connection_state ?? "-"} | ${s.tool_count ?? "-"} |`
+      `| ${mdCell(s.name)} | ${mdCell(s.transport)} | ${enabled} | ${mdCell(s.connection_state)} | ${mdCell(s.tool_count)} |`
     );
   }
   return out;
@@ -702,7 +721,7 @@ function destinationTable(
   for (const d of rows) {
     const riskClass = d.exfil_risk ? "elevated (review)" : "standard";
     out.push(
-      `| ${d.host} | ${d.port ?? "-"} | ${d.protocol ?? "-"} | ${d.times_seen ?? "-"} | ${riskClass} |`
+      `| ${mdCell(d.host)} | ${mdCell(d.port)} | ${mdCell(d.protocol)} | ${mdCell(d.times_seen)} | ${riskClass} |`
     );
   }
   return out;
@@ -1380,10 +1399,19 @@ function renderVerification(
       "absent from the manifest is NOT covered by these signatures and must " +
       "not be relied on, even if it looks like a valid Sanctuary artifact and " +
       "verifies on its own: it may be left over from a different reporting " +
-      "period. The ONLY exception is inert operating-system metadata, which " +
-      "the generator ignores and which carries no evidentiary content: " +
+      "period. The ONLY exception is the operating-system metadata set the " +
+      "generator ignores: " +
       IGNORED_OS_METADATA_LABEL +
-      ". Any other file, hidden or not, is a reconciliation failure.",
+      ". An AppleDouble `._*` entry is ignored ONLY when the generator's " +
+      "checks pass: its name pairs with one of the pack's own filenames, the " +
+      "file begins with the AppleDouble signature and version bytes, and it " +
+      "is within a small size bound. Those checks bound what such a file can " +
+      "be, but they do NOT prove its content is inert: an exempted `._*` " +
+      "file is OUTSIDE the pack's signed claims, so do not rely on its " +
+      "content. The generator refuses to write beside any `._*` file that " +
+      "fails those checks, so one present here was added after generation " +
+      "and is a reconciliation failure. Any other file, hidden or not, is a " +
+      "reconciliation failure.",
     "4. (Optional) Verify the manifest's own `manifest_signature`. Reproduce the " +
       "canonical body EXACTLY: take the manifest JSON, DROP the " +
       "`manifest_signature` field, sort ALL object keys recursively in ASCII " +
@@ -1475,7 +1503,13 @@ function renderVerification(
         "```",
         "",
         "The export carries encrypted payload bytes only (no plaintext content " +
-          "is exposed)." +
+          "is exposed). Scope of that offline check: the verifier recomputes " +
+          "entry hashes, chain linkage, and checkpoint signatures, and checks " +
+          "rotation anchors for shape and linkage ONLY. A rotation anchor's " +
+          "authenticity MAC is keyed by the fortress custody key, so the " +
+          "offline tool cannot and does not prove anchor authenticity; the " +
+          "exported anchor carries its mac field so the fortress runtime, " +
+          "which holds that key, can check it." +
           // D11-2: this file spans the whole retained log, so a reader
           // comparing its record count against the in-quarter totals stated
           // elsewhere would otherwise conclude the report understates.

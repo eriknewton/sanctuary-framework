@@ -20,7 +20,18 @@ import { basename, join } from "node:path";
 import type { StorageBackend } from "../storage/interface.js";
 import { bytesToString } from "../core/encoding.js";
 import type { PersistedAuditEnvelopeV2 } from "../operational/audit-log.js";
-import type { AuditCheckpointRecord } from "../audit/chain.js";
+// G1 (post-#969 sweep re-gate): the checkpoint shape predicate and the
+// control-key allowlist are imported from the PURE, dependency-free
+// `audit/checkpoint-shape.ts` shared with the runtime audit log. This
+// module's no-server-runtime-imports posture survives (the shared module
+// imports nothing), and the hand-duplicated validator that had drifted
+// WEAKER than the runtime's (letting a record missing schema_version /
+// signature_algorithm / payload_encoding export uncounted) is gone.
+import {
+  AUDIT_CHECKPOINT_NAMESPACE_CONTROL_KEYS,
+  isAuditCheckpointRecord,
+  isAuditRotationAnchorEnvelope,
+} from "../audit/checkpoint-shape.js";
 import { lockdownBanner, readLockdownStatus } from "../lockdown/status.js";
 import { homeFortressPath } from "../paths.js";
 
@@ -39,6 +50,20 @@ export const AUDIT_EXPORT_DAEMON_NAMESPACE = "_audit-daemon";
 // toward "present" only over-requires --operator-only, which is fail-closed.
 export const AUDIT_EXPORT_SPLIT_ESTABLISHED_META_KEY =
   "audit-store-split-established-v1";
+// F-2 (dry-bar sweep 2026-07-27): the CLOSED allowlist of legitimate
+// NON-EXPORT control records that live in `_audit_checkpoints` under fixed
+// keys. Only a record under one of THESE keys may be skipped without
+// counting: the P1-A fix's shape-based "not a recognized checkpoint, so a
+// control record" arm could not discriminate a control record from a
+// checkpoint-keyed record failing strict validation, so a
+// parse-valid-but-malformed checkpoint vanished from the export with
+// `checkpointsSkipped` still 0 and the evidence pack signed the export as
+// complete or empty. G1/G5: the list is now DEFINED in the shared pure
+// `audit/checkpoint-shape.ts` (one sync mechanism with the audit log's own
+// key constants, no duplicated literals); this alias keeps the exporter's
+// public name stable.
+export const AUDIT_EXPORT_CONTROL_KEYS: readonly string[] =
+  AUDIT_CHECKPOINT_NAMESPACE_CONTROL_KEYS;
 
 /** Record types in a JSONL export file. */
 export type ExportRecord =
@@ -89,6 +114,17 @@ export interface RotationAnchorExportRecord {
   type: "rotation_anchor";
   base_sequence: number;
   base_prev_hash: string;
+  /**
+   * Re-gate round 3: the anchor's master-key MAC (canonical 43-char unpadded
+   * base64url of the 32-byte HMAC-SHA256), carried
+   * so a verifier that DOES hold the custody key (the fortress runtime, or a
+   * future audited-verify mode) can check anchor authenticity. Including it
+   * leaks nothing: an HMAC-SHA256 output over data already present in this
+   * export is a PRF output, computationally independent of the key, and is
+   * useless to anyone without that key. The standalone offline verifier does
+   * NOT verify it (it has no key) and says so in its report.
+   */
+  mac: string;
 }
 
 /**
@@ -117,10 +153,12 @@ export interface AuditChainExportSummary {
   /** Checkpoint/anchor records successfully written to the export. */
   checkpointsExported: number;
   /**
-   * Checkpoint/anchor records LISTED but skipped as GENUINE CORRUPTION: unreadable
-   * at read time or invalid JSON. A record that PARSES but is not a recognized
-   * checkpoint / anchor is a legitimate non-export control record (e.g. the
-   * `__head_anchor` head pointer) and is NOT counted here.
+   * Checkpoint/anchor records LISTED but skipped as GENUINE CORRUPTION:
+   * unreadable at read time, invalid JSON, or (F-2) parse-valid under a
+   * checkpoint/anchor or unrecognized key while failing strict validation.
+   * Records under the CLOSED control-key allowlist
+   * ({@link AUDIT_EXPORT_CONTROL_KEYS}, e.g. the `__head_anchor` head pointer)
+   * are legitimate non-export control records and are NOT counted here.
    */
   checkpointsSkipped: number;
 }
@@ -203,23 +241,42 @@ export async function exportAuditChain(
       checkpointsSkipped++;
       continue;
     }
-    if (isRotationAnchorRecord(parsed)) {
+    // Re-gate round 3: the SHARED rotation-anchor shape predicate (marker +
+    // data + a canonical 43-char base64url mac, the only strings the legitimate
+    // writer can emit). The old local guard accepted marker + data with
+    // NO mac requirement, which was NOT inclusion-safe: the standalone
+    // verifier checks anchor linkage only, so a forged mac-less anchor
+    // consistent with a truncated suffix exported unskipped and could PASS
+    // external verification while the runtime rejected it. A `__rotation_anchor`
+    // record failing this shape now falls through to the counted-skip arm
+    // below (it is not a control key), forcing the pack's read_failed.
+    if (isAuditRotationAnchorEnvelope(parsed)) {
       const record: RotationAnchorExportRecord = {
         type: "rotation_anchor",
         base_sequence: parsed.data.base_sequence,
         base_prev_hash: parsed.data.base_prev_hash,
+        mac: parsed.mac,
       };
       out.write(JSON.stringify(record) + "\n");
       checkpointsExported++;
       continue;
     }
     if (!isAuditCheckpointRecord(parsed)) {
-      // A record that PARSED but is not a checkpoint / legacy-anchor / rotation-
-      // anchor is a legitimate NON-EXPORT control record that lives in this
-      // namespace (e.g. the `__head_anchor` head pointer), NOT corruption. It was
-      // always silently skipped by design and must NOT be counted as a skipped
-      // corrupt record (doing so would false-positive a `read_failed` on every
-      // healthy fortress). Only unreadable / invalid-JSON records above count.
+      // F-2 (dry-bar sweep 2026-07-27): the skip is KEY-AWARE. A record under a
+      // key on the CLOSED control allowlist (`__head_anchor`,
+      // `__custody_epoch_keys`) is a legitimate NON-EXPORT control record, NOT
+      // corruption; it is skipped uncounted so a healthy fortress never
+      // false-positives a `read_failed` (the P1-A fix, which this preserves).
+      // Any OTHER key whose record parses but fails strict validation is a
+      // malformed checkpoint/anchor (writer schema drift, corruption, or a
+      // foreign blob) and MUST be counted: the P1-A shape-only arm could not
+      // tell the two apart, so a parse-valid-but-malformed checkpoint vanished
+      // from the export while `checkpointsSkipped` stayed 0 and the evidence
+      // pack signed the export as complete or definitively empty.
+      if (AUDIT_EXPORT_CONTROL_KEYS.includes(meta.key)) {
+        continue;
+      }
+      checkpointsSkipped++;
       continue;
     }
 
@@ -406,7 +463,21 @@ export function resolveAuditStoragePath(path: string): string {
   return basename(path) === "state" ? path : join(path, "state");
 }
 
-// --- Type guards (duplicated from audit-log.ts to avoid server-runtime imports) ---
+// --- Type guards ---
+//
+// G1 + re-gate round 3: `isAuditCheckpointRecord` AND
+// `isAuditRotationAnchorEnvelope` are IMPORTED from the shared pure
+// `audit/checkpoint-shape.ts` (see the import block); both local duplicates
+// had drifted weaker than the runtime's and are deleted. The round-2 claim
+// that looser-guard drift here "errs toward inclusion and is therefore safe"
+// was adjudicated TRUE for the envelope guard ONLY: the standalone verifier
+// recomputes every entry hash, so an entry accepted loosely still fails
+// downstream verification. It was FALSE for the rotation anchor: the
+// verifier checks anchor LINKAGE only (it cannot check the custody-keyed
+// MAC), so a loosely-accepted forged anchor could pass external verification
+// end to end. The one guard below stays a local duplicate (this exporter
+// must not import the server runtime), and it is in the hash-recomputed,
+// inclusion-safe class.
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
@@ -426,38 +497,10 @@ function isPersistedAuditEnvelopeV2(value: unknown): value is PersistedAuditEnve
   );
 }
 
-function isAuditCheckpointRecord(value: unknown): value is AuditCheckpointRecord {
-  return (
-    isRecord(value) &&
-    (value.checkpoint_kind === "audit-checkpoint" ||
-      value.checkpoint_kind === "legacy-anchor") &&
-    typeof value.checkpoint_sequence === "number" &&
-    Number.isSafeInteger(value.checkpoint_sequence) &&
-    typeof value.from_sequence === "number" &&
-    Number.isSafeInteger(value.from_sequence) &&
-    typeof value.root_hash === "string" &&
-    typeof value.previous_checkpoint_sequence === "number" &&
-    Number.isSafeInteger(value.previous_checkpoint_sequence) &&
-    typeof value.signed_at === "string" &&
-    (typeof value.signer_kid === "string" || value.signer_kid === null) &&
-    (typeof value.signature === "string" || value.signature === null) &&
-    typeof value.unsigned === "boolean"
-  );
-}
-
-function isRotationAnchorRecord(
-  value: unknown
-): value is { data: { base_sequence: number; base_prev_hash: string } } {
-  return (
-    isRecord(value) &&
-    value.__sanctuary_audit_rotation_anchor_v1 === true &&
-    isRecord(value.data) &&
-    typeof value.data.base_sequence === "number" &&
-    Number.isSafeInteger(value.data.base_sequence) &&
-    value.data.base_sequence > 0 &&
-    typeof value.data.base_prev_hash === "string"
-  );
-}
+// isRotationAnchorRecord deleted (re-gate round 3): replaced by the shared
+// `isAuditRotationAnchorEnvelope` from `audit/checkpoint-shape.ts`, which
+// additionally requires `mac` to be a canonical 43-char base64url encoding
+// of the 32-byte MAC, the only strings the legitimate writer can emit.
 
 function flagValue(argv: string[], name: string): string | undefined {
   const index = argv.indexOf(name);

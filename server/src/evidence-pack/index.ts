@@ -94,7 +94,10 @@ export {
   type HistoryGapDiagnosis,
 } from "./history-attribution.js";
 export {
+  appleDoubleDataName,
   isPackRelevantEntry,
+  listPackRelevantEntries,
+  APPLEDOUBLE_MAGIC,
   IGNORED_OS_METADATA,
   IGNORED_OS_METADATA_LABEL,
 } from "./pack-files.js";
