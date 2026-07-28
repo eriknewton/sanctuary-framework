@@ -124,6 +124,14 @@ export class ObserveStore {
     await this.put(this.foldWatermarkKey(sourceId), watermark);
   }
 
+  /** Delete watermark records for audit sources known to be obsolete (for example, rotated boot-audit segments). */
+  async deleteFoldWatermarks(sourceIds: readonly FoldWatermarkSourceId[]): Promise<void> {
+    for (const sourceId of sourceIds) {
+      if (sourceId === MASTER_AUDIT_WATERMARK_SOURCE_ID) continue;
+      await this.stateStore.delete(OBSERVE_NAMESPACE, this.foldWatermarkKey(sourceId));
+    }
+  }
+
   /** Storage key for a given candidate dedup key. Hashed so an operator-supplied host string can never itself become an unsafe StateStore key. */
   private storageKeyFor(key: string): string {
     return `${CANDIDATE_KEY_PREFIX}${candidateKeyDigest(key)}`;

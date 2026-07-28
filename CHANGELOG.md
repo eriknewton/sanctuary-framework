@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## Unreleased
+
+### Changed
+
+- `sanctuary castle-wall observe candidates --json` now returns `candidates` as a determinability object: `{ "determinable": true, "items": [...] }` when every source is readable, or `{ "determinable": false, "visible_items": [...] }` when observe cannot see one or more candidate sources. This documents the PR #1038 contract change and prevents consumers from reading a plain empty array as a definitive zero while `source_state.status` is `cannot_see`.
+
 ## [1.7.2] - 2026-07-27
 
 Patch release: fixes the release pipeline so the signed macOS Castle Wall app can actually launch. No server-side code changes.

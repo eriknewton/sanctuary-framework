@@ -41,7 +41,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
@@ -103,10 +103,33 @@ import { generateRandomKey } from "../../../src/core/random.js";
 import { hashToString } from "../../../src/core/hashing.js";
 import { stringToBytes, toBase64url } from "../../../src/core/encoding.js";
 import { encrypt } from "../../../src/core/encryption.js";
+import { AuditLog } from "../../../src/operational/audit-log.js";
+import {
+  CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY,
+  CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
+  CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY,
+  CASTLE_WALL_PRODUCER_KID_DETAIL_KEY,
+  CASTLE_WALL_PRODUCER_SIG_DETAIL_KEY,
+  CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1,
+  CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY,
+  CASTLE_WALL_SCHEMA_VERSION_V1,
+} from "../../../src/castle-wall/constants.js";
+import {
+  deriveSafeModeAuditKey,
+  generateBootToken,
+  persistBootToken,
+  safeModeAuditStoragePath,
+} from "../../../src/castle-wall/boot/boot-token.js";
+import {
+  producerSigningBytes,
+  resolveProducerPubKeyPath,
+} from "../../../src/castle-wall/runtime/producer-signature.js";
+import { fortressIdFromStoragePath } from "../../../src/dashboard/v1_1/wiring.js";
 
 const AGENT_UID = 601;
 const GATE_UID = 602;
 const GATE_PORT = 48620;
+const PRODUCER_SIGNED_AT_MS = 1_777_777_777_777;
 
 const gatePolicy: ExclusiveEgressGatePolicy = { agent_uid: AGENT_UID, gate_port: GATE_PORT };
 
@@ -124,6 +147,48 @@ function candidate(host: string): CandidateObservation {
     last_seen: "2026-07-27T01:00:00Z",
     would_be_disposition: "denied",
     exfil_risk: false,
+  };
+}
+
+function signedBlockedDetails(input: {
+  producerPrivateKey: Uint8Array;
+  seq: number;
+  timestamp: string;
+  identityId: string;
+  host: string;
+  ip: string;
+}): Record<string, unknown> {
+  const details = {
+    agent_id: "agent-1",
+    agent_template: "claude-code",
+    dest_host: input.host,
+    dest_ip: input.ip,
+    dest_port: 443,
+    dest_protocol: "tcp",
+    decision_provenance: "default_deny",
+  };
+  const body = JSON.stringify({
+    timestamp: input.timestamp,
+    layer: "l1",
+    operation: "egress_blocked",
+    identity_id: input.identityId,
+    result: "failure",
+    details,
+  });
+  const sig = ed25519.sign(
+    producerSigningBytes(body, PRODUCER_SIGNED_AT_MS, input.seq),
+    input.producerPrivateKey,
+  );
+  return {
+    ...details,
+    seq: input.seq,
+    [CASTLE_WALL_PRODUCER_SIG_DETAIL_KEY]: toBase64url(sig),
+    [CASTLE_WALL_PRODUCER_KID_DETAIL_KEY]:
+      CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1,
+    [CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY]: body,
+    [CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY]: PRODUCER_SIGNED_AT_MS,
+    [CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY]:
+      CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
   };
 }
 
@@ -1050,7 +1115,8 @@ describe("round-3 R4/R5: the REAL CLI promote path (approved end to end)", () =>
     );
     expect(code).toBe(0);
     expect(out.text()).toContain("Observe cannot see the gate's denials in fine-grained mode.");
-    expect(out.text()).toContain("Add missing destinations to the allow-list directly, then re-arm the gate.");
+    expect(out.text()).toContain("sanctuary castle-wall observe promote --destination <host:port>");
+    expect(out.text()).toContain(EGRESS_GATE_REPAIR_WITH_STAND_DOWN_COMMAND);
     expect(out.text()).not.toContain("No candidates.");
 
     const statusOut = new Capture();
@@ -1065,6 +1131,138 @@ describe("round-3 R4/R5: the REAL CLI promote path (approved end to end)", () =>
     };
     expect(parsed.source_state.status).toBe("cannot_see");
     expect(parsed.pending_candidates).toEqual({ determinable: false });
+  });
+
+  it("FAIL-WITHOUT-FIX (F1): a root-owned-style unreadable boot-audit directory names sudo as the remedy", async () => {
+    const fortress = await makeCliFortress({ exclusive: false, candidates: [] });
+    const auditDir = join(fortress.fortressPath, "boot-audit");
+    await mkdir(join(auditDir, "0123456789abcdef"), { recursive: true, mode: 0o700 });
+    await chmod(auditDir, 0o000);
+
+    try {
+      const out = new Capture();
+      const code = await runObserveCandidates(
+        ["--no-refresh", "--fortress", fortress.fortressPath],
+        { out, err: new Capture(), env: { SANCTUARY_RECOVERY_KEY: fortress.recoveryKey } },
+      );
+      expect(code).toBe(0);
+      expect(out.text()).toContain("Observe cannot say whether there are candidates");
+      expect(out.text()).toContain("boot-audit");
+      expect(out.text()).toContain("root-owned");
+      expect(out.text()).toContain(
+        `sudo sanctuary castle-wall observe candidates --fortress ${fortress.fortressPath}`,
+      );
+      expect(out.text()).not.toContain("No candidates.");
+    } finally {
+      await chmod(auditDir, 0o700);
+    }
+  });
+
+  it("FAIL-WITHOUT-FIX (F4/F9): a readable but unrefreshed boot-audit source makes counts and JSON candidates non-determinable", async () => {
+    const fortress = await makeCliFortress({ exclusive: false, candidates: [] });
+    const token = generateBootToken();
+    const tokenPath = join(fortress.fortressPath, "test-boot-token.bin");
+    await persistBootToken(token, { path: tokenPath });
+    await mkdir(safeModeAuditStoragePath(fortress.fortressPath, token), {
+      recursive: true,
+      mode: 0o700,
+    });
+
+    const out = new Capture();
+    const code = await runObserveCandidates(
+      ["--no-refresh", "--json", "--fortress", fortress.fortressPath],
+      {
+        out,
+        err: new Capture(),
+        env: { SANCTUARY_RECOVERY_KEY: fortress.recoveryKey },
+        bootTokenPath: tokenPath,
+      },
+    );
+    expect(code).toBe(0);
+    const parsed = JSON.parse(out.text()) as {
+      source_state: { status: string; sources: Array<{ status: string; source_id: string }> };
+      candidates: { determinable: boolean; visible_items?: CandidateObservation[]; items?: CandidateObservation[] };
+    };
+    expect(parsed.source_state.status).toBe("cannot_see");
+    expect(parsed.source_state.sources).toContainEqual(
+      expect.objectContaining({ status: "unread", source_id: expect.stringMatching(/^boot-audit:/) }),
+    );
+    expect(parsed.candidates).toEqual({ determinable: false, visible_items: [] });
+    expect(Array.isArray(parsed.candidates)).toBe(false);
+
+    const statusOut = new Capture();
+    const statusCode = await runObserveStatus(
+      ["--json", "--fortress", fortress.fortressPath],
+      {
+        out: statusOut,
+        err: new Capture(),
+        env: { SANCTUARY_RECOVERY_KEY: fortress.recoveryKey },
+        bootTokenPath: tokenPath,
+      },
+    );
+    expect(statusCode).toBe(0);
+    expect(JSON.parse(statusOut.text()).pending_candidates).toEqual({ determinable: false });
+  });
+
+  it("FAIL-WITHOUT-FIX (F11): observe candidates refreshes a real boot-token-derived on-disk boot-audit segment", async () => {
+    const fortress = await makeCliFortress({ exclusive: false, candidates: [] });
+    const token = generateBootToken();
+    const tokenPath = join(fortress.fortressPath, "test-boot-token.bin");
+    await persistBootToken(token, { path: tokenPath });
+
+    const producerPrivateKey = ed25519.utils.randomPrivateKey();
+    const producerPublicKey = ed25519.getPublicKey(producerPrivateKey);
+    await mkdir(join(fortress.fortressPath, "policy", "egress"), {
+      recursive: true,
+      mode: 0o700,
+    });
+    await writeFile(resolveProducerPubKeyPath(fortress.fortressPath), producerPublicKey);
+
+    const bootLog = new AuditLog(
+      new FilesystemStorage(safeModeAuditStoragePath(fortress.fortressPath, token)),
+      deriveSafeModeAuditKey(token),
+    );
+    const timestamp = "2026-07-27T12:00:00.000Z";
+    await bootLog.appendCritical({
+      layer: "l1",
+      operation: "egress_blocked",
+      identity_id: `${fortressIdFromStoragePath(fortress.fortressPath)}/uid-${AGENT_UID}`,
+      result: "failure",
+      timestamp,
+      details: signedBlockedDetails({
+        producerPrivateKey,
+        seq: 1,
+        timestamp,
+        identityId: `${fortressIdFromStoragePath(fortress.fortressPath)}/uid-${AGENT_UID}`,
+        host: "boot-cli.example.com",
+        ip: "198.51.100.88",
+      }),
+    });
+
+    const out = new Capture();
+    const code = await runObserveCandidates(["--json", "--fortress", fortress.fortressPath], {
+      out,
+      err: new Capture(),
+      env: { SANCTUARY_RECOVERY_KEY: fortress.recoveryKey },
+      bootTokenPath: tokenPath,
+    });
+
+    expect(code).toBe(0);
+    const parsed = JSON.parse(out.text()) as {
+      source_state: { status: string; sources: Array<{ status: string; source_id: string; folded_events?: number }> };
+      candidates: { determinable: boolean; items?: CandidateObservation[] };
+    };
+    expect(parsed.source_state.status).toBe("readable");
+    expect(parsed.source_state.sources).toContainEqual(
+      expect.objectContaining({
+        status: "read",
+        source_id: expect.stringMatching(/^boot-audit:/),
+        folded_events: 1,
+      }),
+    );
+    expect(parsed.candidates.determinable).toBe(true);
+    expect(parsed.candidates.items?.[0]?.host).toBe("boot-cli.example.com");
+    expect(await fortress.listStoredCandidates()).toBe(1);
   });
 
   it("F-OBSNOINPUT B: coarse mode with a readable empty source still says No candidates", async () => {

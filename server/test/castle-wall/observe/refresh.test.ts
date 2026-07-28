@@ -145,12 +145,14 @@ function makeHarness(): Harness {
 async function appendReviewMarker(
   auditLog: AuditLog,
   operation: "castle_wall_observe_discard" | "castle_wall_observe_promote",
+  timestamp = new Date().toISOString(),
 ): Promise<void> {
   await auditLog.appendCritical({
     layer: "l1",
     operation,
     identity_id: "operator",
     result: "success",
+    timestamp,
     details: { discarded_count: 1 },
   });
 }
@@ -446,6 +448,150 @@ describe("boot-audit source folding (F-OBSNOINPUT C)", () => {
       source_id: "boot-audit:bad-segment",
       reason: "this boot-audit segment could not be verified or decrypted, so observe did not fold it",
     });
+  });
+
+  it("FAIL-WITHOUT-FIX (F2): an optional source store-merge failure throws instead of becoming undetermined", async () => {
+    const harness = makeHarness();
+    const bootLog = new AuditLog(new MemoryStorage(), harness.masterKey);
+    const source: RefreshAuditSource = {
+      source_id: "boot-audit:test-segment",
+      failure_mode: "undetermined",
+      streamVerifiedChain: (consumer) => bootLog.streamVerifiedChain(consumer),
+    };
+
+    await appendBlocked(bootLog);
+    await refreshWithSources(harness, [source]);
+    await appendBlocked(bootLog);
+
+    const failingStore = {
+      getFoldWatermark: harness.store.getFoldWatermark.bind(harness.store),
+      setFoldWatermark: harness.store.setFoldWatermark.bind(harness.store),
+      listCandidates: harness.store.listCandidates.bind(harness.store),
+      replaceObservations: harness.store.replaceObservations.bind(harness.store),
+      removeCandidate: harness.store.removeCandidate.bind(harness.store),
+      async mergeObservations(): Promise<void> {
+        throw new Error("disk full while writing candidates");
+      },
+    };
+
+    await expect(
+      refreshCandidatesFromAudit({
+        auditLog: harness.auditLog,
+        auditSources: [source],
+        store: failingStore,
+        readAllowlist: verifiedAllowlist([]),
+        lock: harness.lock,
+        now: new Date("2026-07-14T12:00:00.000Z"),
+        pinnedProducerKeyB64url: harness.pinnedProducerKeyB64url,
+        subjectFortressId: FORTRESS_ID,
+      }),
+    ).rejects.toThrow("disk full while writing candidates");
+  });
+
+  it("FAIL-WITHOUT-FIX (F3): recompute combines same-key observations across master and boot sources before replacing", async () => {
+    const harness = makeHarness();
+    const bootLog = new AuditLog(new MemoryStorage(), harness.masterKey);
+    for (let i = 0; i < 10; i++) await appendBlocked(harness.auditLog);
+    for (let i = 0; i < 5; i++) await appendBlocked(bootLog);
+
+    const outcome = await refreshWithSources(harness, [
+      {
+        source_id: "master-audit",
+        failure_mode: "error",
+        streamVerifiedChain: (consumer) => harness.auditLog.streamVerifiedChain(consumer),
+      },
+      {
+        source_id: "boot-audit:test-segment",
+        failure_mode: "undetermined",
+        streamVerifiedChain: (consumer) => bootLog.streamVerifiedChain(consumer),
+      },
+    ]);
+
+    expect(outcome.status === "refreshed" && outcome.mode).toBe("recompute");
+    expect((await onlyCandidate(harness.store)).times_seen).toBe(15);
+  });
+
+  it("FAIL-WITHOUT-FIX (F7): a master-chain discard marker bounds boot-audit recompute mints", async () => {
+    const harness = makeHarness();
+    const bootLog = new AuditLog(new MemoryStorage(), harness.masterKey);
+    await appendBlocked(bootLog, {
+      host: "discarded-before-marker.example",
+      ip: "198.51.100.66",
+      timestamp: "2026-07-14T10:00:00.000Z",
+    });
+    await appendReviewMarker(
+      harness.auditLog,
+      "castle_wall_observe_discard",
+      "2026-07-14T11:00:00.000Z",
+    );
+
+    const outcome = await refreshWithSources(harness, [
+      {
+        source_id: "master-audit",
+        failure_mode: "error",
+        streamVerifiedChain: (consumer) => harness.auditLog.streamVerifiedChain(consumer),
+      },
+      {
+        source_id: "boot-audit:test-segment",
+        failure_mode: "undetermined",
+        streamVerifiedChain: (consumer) => bootLog.streamVerifiedChain(consumer),
+      },
+    ]);
+
+    expect(outcome.status === "refreshed" && outcome.mode).toBe("recompute");
+    expect((await harness.store.listCandidates()).size).toBe(0);
+
+    await appendBlocked(bootLog, {
+      host: "discarded-before-marker.example",
+      ip: "198.51.100.66",
+      timestamp: "2026-07-14T12:00:00.000Z",
+    });
+    await refreshWithSources(harness, [
+      {
+        source_id: "master-audit",
+        failure_mode: "error",
+        streamVerifiedChain: (consumer) => harness.auditLog.streamVerifiedChain(consumer),
+      },
+      {
+        source_id: "boot-audit:test-segment",
+        failure_mode: "undetermined",
+        streamVerifiedChain: (consumer) => bootLog.streamVerifiedChain(consumer),
+      },
+    ]);
+    expect((await onlyCandidate(harness.store)).times_seen).toBe(1);
+  });
+
+  it("FAIL-WITHOUT-FIX (F10): rotated boot-audit watermarks are collected when the old segment is obsolete", async () => {
+    const harness = makeHarness();
+    await harness.store.setFoldWatermark(
+      {
+        folded_through_sequence: 7,
+        entry_hash: "old-token-head",
+        updated_at: "2026-07-01T00:00:00.000Z",
+      },
+      "boot-audit:old-token",
+    );
+    expect(await harness.store.getFoldWatermark("boot-audit:old-token")).not.toBeNull();
+
+    const outcome = await refreshCandidatesFromAudit({
+      auditLog: harness.auditLog,
+      auditSources: [
+        {
+          source_id: "master-audit",
+          failure_mode: "error",
+          streamVerifiedChain: (consumer) => harness.auditLog.streamVerifiedChain(consumer),
+        },
+      ],
+      staleWatermarkSourceIds: ["boot-audit:old-token"],
+      store: harness.store,
+      readAllowlist: verifiedAllowlist([]),
+      lock: harness.lock,
+      now: new Date("2026-07-14T12:00:00.000Z"),
+      pinnedProducerKeyB64url: harness.pinnedProducerKeyB64url,
+      subjectFortressId: FORTRESS_ID,
+    });
+    expect(outcome.status).toBe("refreshed");
+    expect(await harness.store.getFoldWatermark("boot-audit:old-token")).toBeNull();
   });
 });
 

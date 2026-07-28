@@ -117,9 +117,9 @@ import { ruleProtocolMatches, ruleScopeCoversAgent } from "../allowlist/match.js
 import { OBSERVE_PROMOTED_RULE_ID_PREFIX } from "../constants.js";
 import { ipMatches, cidrMatches } from "../allowlist/ip-cidr.js";
 import type { RuleMatch } from "../allowlist/schema.js";
-import type { VerifiedChainConsumer } from "../../operational/audit-log.js";
+import type { AuditEntry, VerifiedChainConsumer } from "../../operational/audit-log.js";
 import { flowEventFromAuditEntry } from "./adapter.js";
-import { foldObservations } from "./fold.js";
+import { foldObservations, mergeCandidateObservations } from "./fold.js";
 import {
   candidateKey,
   type CandidateObservation,
@@ -137,7 +137,7 @@ const OBSERVE_REVIEW_OPERATIONS: ReadonlySet<string> = new Set([
 
 /** Narrow audit surface the refresh needs; `AuditLog` satisfies it. Strict verification is the contract: the stream throws on a chain-integrity failure, so a refresh never folds over an unverified chain. */
 export interface RefreshAuditSource {
-  source_id?: FoldWatermarkSourceId;
+  source_id: FoldWatermarkSourceId;
   /**
    * `error` preserves the historical master-chain contract: verification
    * failure aborts the refresh. `undetermined` is for optional side segments
@@ -151,12 +151,13 @@ export interface RefreshAuditSource {
 
 /** Narrow candidate-store surface the refresh needs; `ObserveStore` satisfies it. */
 export interface RefreshCandidateStore {
-  getFoldWatermark(sourceId?: FoldWatermarkSourceId): Promise<FoldWatermark | null>;
-  setFoldWatermark(watermark: FoldWatermark, sourceId?: FoldWatermarkSourceId): Promise<void>;
+  getFoldWatermark(sourceId: FoldWatermarkSourceId): Promise<FoldWatermark | null>;
+  setFoldWatermark(watermark: FoldWatermark, sourceId: FoldWatermarkSourceId): Promise<void>;
   listCandidates(): Promise<Map<string, CandidateObservation>>;
   mergeObservations(observations: readonly CandidateObservation[]): Promise<void>;
   replaceObservations(observations: readonly CandidateObservation[]): Promise<void>;
   removeCandidate(key: string): Promise<void>;
+  deleteFoldWatermarks?(sourceIds: readonly FoldWatermarkSourceId[]): Promise<void>;
 }
 
 /**
@@ -203,8 +204,14 @@ export type RefreshAllowlistRead =
   | { status: "unverified"; reason: string };
 
 export interface RefreshDeps {
-  auditLog: RefreshAuditSource;
+  auditLog: { streamVerifiedChain(consumer: VerifiedChainConsumer): Promise<void> };
   auditSources?: readonly RefreshAuditSource[];
+  /**
+   * Source ids known to be obsolete for this refresh. The CLI uses this to
+   * collect boot-audit watermark records after boot-token rotation, once the
+   * current token has identified the live segment.
+   */
+  staleWatermarkSourceIds?: readonly FoldWatermarkSourceId[];
   store: RefreshCandidateStore;
   readAllowlist: () => Promise<RefreshAllowlistRead>;
   /** Mutual exclusion across concurrent refreshes (Codex gate BLOCKER; see {@link RefreshLock}). */
@@ -515,28 +522,68 @@ async function runRefresh(deps: RefreshDeps): Promise<RefreshOutcome> {
         ];
 
   const sourceResults: RefreshSourceResult[] = [];
+  const persistedBefore = await deps.store.listCandidates();
+  const readableSources: Array<Extract<SourceRead, { status: "read" }>> = [];
+
+  for (const source of sources) {
+    const sourceId = source.source_id;
+    const watermark = await deps.store.getFoldWatermark(sourceId);
+    const read = await readRefreshSource(deps, source, sourceId, watermark);
+    if (read.status === "undetermined") {
+      sourceResults.push(read);
+      continue;
+    }
+    readableSources.push(read);
+  }
+
+  const masterReviewTimestamp = latestMasterReviewTimestamp(readableSources);
   let totalFolded = 0;
   let totalSuppressedAllowed = 0;
   let anyRecompute = false;
+  const allReplacements: CandidateObservation[] = [];
+  const allMints: CandidateObservation[] = [];
+  const allMerges: CandidateObservation[] = [];
+  const watermarkWrites: Array<{ source_id: FoldWatermarkSourceId; watermark: FoldWatermark }> = [];
 
-  for (const source of sources) {
-    const sourceId = source.source_id ?? MASTER_AUDIT_WATERMARK_SOURCE_ID;
-    try {
-      const result = await runRefreshSource(deps, source, sourceId, allowlist.rules);
-      sourceResults.push(result);
-      totalFolded += result.folded_events;
-      totalSuppressedAllowed += result.suppressed_allowed;
-      if (result.mode === "recompute") anyRecompute = true;
-    } catch (error) {
-      if (source.failure_mode !== "undetermined") throw error;
-      sourceResults.push({
-        status: "undetermined",
-        source_id: sourceId,
-        reason:
-          source.undetermined_reason ??
-          "This boot-audit segment could not be verified or decrypted, so observe did not fold it.",
-      });
+  for (const read of readableSources) {
+    const plan = planRefreshSource(
+      read,
+      allowlist.rules,
+      persistedBefore,
+      masterReviewTimestamp,
+      deps.now,
+    );
+    sourceResults.push(plan.result);
+    totalFolded += plan.result.folded_events;
+    totalSuppressedAllowed += plan.result.suppressed_allowed;
+    if (plan.result.mode === "recompute") anyRecompute = true;
+    allReplacements.push(...plan.replacements);
+    allMints.push(...plan.mints);
+    allMerges.push(...plan.merges);
+    if (plan.watermark) {
+      watermarkWrites.push({ source_id: read.source_id, watermark: plan.watermark });
     }
+  }
+
+  if (allReplacements.length > 0 || allMints.length > 0) {
+    const replacementRows = mergeCandidateObservations(new Map(), allReplacements);
+    const mintRows = mergeCandidateObservations(new Map(), allMints).values();
+    await deps.store.replaceObservations([...replacementRows.values(), ...mintRows]);
+  }
+
+  if (allMerges.length > 0) {
+    for (const { source_id, watermark } of watermarkWrites) {
+      await deps.store.setFoldWatermark(watermark, source_id);
+    }
+    await deps.store.mergeObservations(allMerges);
+  } else {
+    for (const { source_id, watermark } of watermarkWrites) {
+      await deps.store.setFoldWatermark(watermark, source_id);
+    }
+  }
+
+  if (deps.staleWatermarkSourceIds && deps.staleWatermarkSourceIds.length > 0) {
+    await deps.store.deleteFoldWatermarks?.(deps.staleWatermarkSourceIds);
   }
 
   // ── Allowlist prune over the PERSISTED set: a pending candidate whose
@@ -563,52 +610,120 @@ async function runRefresh(deps: RefreshDeps): Promise<RefreshOutcome> {
   };
 }
 
-async function runRefreshSource(
+type SourceRead =
+  | {
+      status: "read";
+      source_id: FoldWatermarkSourceId;
+      watermark: FoldWatermark | null;
+      events: Array<{ sequence: number; entry: AuditEntry; event: FlowObservationEvent }>;
+      headSequence: number | null;
+      headHash: string | null;
+      hashAtWatermark: string | null;
+      lastReviewSequence: number | null;
+      lastReviewTimestamp: string | null;
+    }
+  | Extract<RefreshSourceResult, { status: "undetermined" }>;
+
+interface SourcePlan {
+  result: Extract<RefreshSourceResult, { status: "read" }>;
+  replacements: CandidateObservation[];
+  mints: CandidateObservation[];
+  merges: CandidateObservation[];
+  watermark: FoldWatermark | null;
+}
+
+async function readRefreshSource(
   deps: RefreshDeps,
   source: RefreshAuditSource,
   sourceId: FoldWatermarkSourceId,
-  rules: readonly AllowlistRule[],
-): Promise<Extract<RefreshSourceResult, { status: "read" }>> {
-  const watermark = await deps.store.getFoldWatermark(sourceId);
+  watermark: FoldWatermark | null,
+): Promise<SourceRead> {
 
   // ── Single verified pass over the chain (buffered writes: nothing below
   // touches the store until the stream has returned clean). ──
-  let events: Array<{ sequence: number; event: FlowObservationEvent }> = [];
+  let events: Array<{ sequence: number; entry: AuditEntry; event: FlowObservationEvent }> = [];
   let headSequence: number | null = null;
   let headHash: string | null = null;
   let hashAtWatermark: string | null = null;
   let lastReviewSequence: number | null = null;
-  await source.streamVerifiedChain({
-    onEntry: ({ sequence, entry_hash, entry }) => {
-      if (headSequence === null || sequence > headSequence) {
-        headSequence = sequence;
-        headHash = entry_hash;
-      }
-      if (watermark !== null && sequence === watermark.folded_through_sequence) {
-        hashAtWatermark = entry_hash;
-      }
-      if (
-        OBSERVE_REVIEW_OPERATIONS.has(entry.operation) &&
-        (lastReviewSequence === null || sequence > lastReviewSequence)
-      ) {
-        lastReviewSequence = sequence;
-      }
-      const event = flowEventFromAuditEntry(entry, {
-        pinnedProducerKeyB64url: deps.pinnedProducerKeyB64url ?? null,
-        subjectFortressId: deps.subjectFortressId ?? null,
-      });
-      if (event) events.push({ sequence, event });
-    },
-    reset: () => {
-      events = [];
-      headSequence = null;
-      headHash = null;
-      hashAtWatermark = null;
-      lastReviewSequence = null;
-    },
-  });
+  let lastReviewTimestamp: string | null = null;
+  try {
+    await source.streamVerifiedChain({
+      onEntry: ({ sequence, entry_hash, entry }) => {
+        if (headSequence === null || sequence > headSequence) {
+          headSequence = sequence;
+          headHash = entry_hash;
+        }
+        if (watermark !== null && sequence === watermark.folded_through_sequence) {
+          hashAtWatermark = entry_hash;
+        }
+        if (
+          OBSERVE_REVIEW_OPERATIONS.has(entry.operation) &&
+          (lastReviewSequence === null || sequence > lastReviewSequence)
+        ) {
+          lastReviewSequence = sequence;
+          lastReviewTimestamp = entry.timestamp;
+        }
+        const event = flowEventFromAuditEntry(entry, {
+          pinnedProducerKeyB64url: deps.pinnedProducerKeyB64url ?? null,
+          subjectFortressId: deps.subjectFortressId ?? null,
+        });
+        if (event) events.push({ sequence, entry, event });
+      },
+      reset: () => {
+        events = [];
+        headSequence = null;
+        headHash = null;
+        hashAtWatermark = null;
+        lastReviewSequence = null;
+        lastReviewTimestamp = null;
+      },
+    });
+  } catch (error) {
+    if (source.failure_mode !== "undetermined") throw error;
+    return {
+      status: "undetermined",
+      source_id: sourceId,
+      reason:
+        source.undetermined_reason ??
+        "This boot-audit segment could not be verified or decrypted, so observe did not fold it.",
+    };
+  }
 
-  const chainHead: number | null = headSequence;
+  return {
+    status: "read",
+    source_id: sourceId,
+    watermark,
+    events,
+    headSequence,
+    headHash,
+    hashAtWatermark,
+    lastReviewSequence,
+    lastReviewTimestamp,
+  };
+}
+
+function latestMasterReviewTimestamp(reads: readonly SourceRead[]): string | null {
+  let latest: string | null = null;
+  for (const read of reads) {
+    if (read.status !== "read" || read.source_id !== MASTER_AUDIT_WATERMARK_SOURCE_ID) continue;
+    if (read.lastReviewTimestamp && (latest === null || read.lastReviewTimestamp > latest)) {
+      latest = read.lastReviewTimestamp;
+    }
+  }
+  return latest;
+}
+
+function planRefreshSource(
+  read: Extract<SourceRead, { status: "read" }>,
+  rules: readonly AllowlistRule[],
+  persistedBefore: ReadonlyMap<string, CandidateObservation>,
+  masterReviewTimestamp: string | null,
+  now: Date,
+): SourcePlan {
+  const watermark = read.watermark;
+
+  const chainHead: number | null = read.headSequence;
 
   // A watermark is honored ONLY when its chain identity is POSITIVELY
   // verified (module doc, guarantee 1; Codex round-2 MED on the old
@@ -635,10 +750,12 @@ async function runRefreshSource(
     watermark !== null &&
     chainHead !== null &&
     watermark.folded_through_sequence <= chainHead &&
-    hashAtWatermark === watermark.entry_hash;
+    read.hashAtWatermark === watermark.entry_hash;
   const recompute = !(watermark !== null && (chainHead === null ? true : watermarkValid));
 
-  const kept: CandidateObservation[] = [];
+  const replacements: CandidateObservation[] = [];
+  const mints: CandidateObservation[] = [];
+  const merges: CandidateObservation[] = [];
   let suppressedAllowed = 0;
   let foldedCount: number;
 
@@ -652,68 +769,65 @@ async function runRefreshSource(
     }
   };
 
-  const advanceWatermark = async (): Promise<void> => {
-    if (chainHead === null || headHash === null) return;
+  const nextWatermark = (): FoldWatermark | null => {
+    if (chainHead === null || read.headHash === null) return null;
     if (
       watermark !== null &&
       watermark.folded_through_sequence === chainHead &&
-      watermark.entry_hash === headHash
+      watermark.entry_hash === read.headHash
     ) {
-      return;
+      return null;
     }
-    await deps.store.setFoldWatermark({
+    return {
       folded_through_sequence: chainHead,
-      entry_hash: headHash,
-      updated_at: deps.now.toISOString(),
-    }, sourceId);
+      entry_hash: read.headHash,
+      updated_at: now.toISOString(),
+    };
   };
 
   if (recompute) {
     // Heal existing rows from the FULL retained history; mint new rows only
     // from post-review events (module doc, guarantee 3).
-    const allEvents = events.map((item) => item.event);
-    const postReviewEvents =
-      lastReviewSequence === null
-        ? allEvents
-        : events.filter((item) => item.sequence > lastReviewSequence!).map((item) => item.event);
+    const allEvents = read.events.map((item) => item.event);
+    const sourceReviewSequence = read.lastReviewSequence;
+    const sourcePostReview = sourceReviewSequence === null
+      ? read.events
+      : read.events.filter((item) => item.sequence > sourceReviewSequence);
+    const reviewBoundTimestamp =
+      read.source_id === MASTER_AUDIT_WATERMARK_SOURCE_ID ? read.lastReviewTimestamp : masterReviewTimestamp;
+    const postReviewEvents = (reviewBoundTimestamp === null
+      ? sourcePostReview
+      : sourcePostReview.filter((item) => item.entry.timestamp > reviewBoundTimestamp)
+    ).map((item) => item.event);
     foldedCount = allEvents.length;
 
-    const persistedBefore = await deps.store.listCandidates();
-    const replacements: CandidateObservation[] = [];
     keepFiltered(
       foldObservations(allEvents).filter((row) => persistedBefore.has(candidateKey(row))),
       replacements,
     );
-    const mints: CandidateObservation[] = [];
     keepFiltered(
       foldObservations(postReviewEvents).filter((row) => !persistedBefore.has(candidateKey(row))),
       mints,
     );
-    kept.push(...replacements, ...mints);
-
-    // RECOMPUTE crash order: replace/mint FIRST, then the watermark (see
-    // module doc). Both writes are replace-semantics here: a re-run of this
-    // same recompute converges.
-    await deps.store.replaceObservations(kept);
-    await advanceWatermark();
   } else {
-    const newEvents = events
+    const newEvents = read.events
       .filter((item) => watermark === null || item.sequence > watermark.folded_through_sequence)
       .map((item) => item.event);
     foldedCount = newEvents.length;
-    keepFiltered(foldObservations(newEvents), kept);
-
-    // INCREMENTAL crash order: watermark FIRST, then the additive merge (see
-    // module doc): a crash between the two undercounts, never double-counts.
-    await advanceWatermark();
-    await deps.store.mergeObservations(kept);
+    keepFiltered(foldObservations(newEvents), merges);
   }
 
   return {
-    status: "read",
-    source_id: sourceId,
-    mode: recompute ? "recompute" : "incremental",
-    folded_events: foldedCount,
-    suppressed_allowed: suppressedAllowed,
+    result: {
+      status: "read",
+      source_id: read.source_id,
+      mode: recompute ? "recompute" : "incremental",
+      folded_events: foldedCount,
+      suppressed_allowed: suppressedAllowed,
+    },
+    replacements,
+    mints,
+    merges,
+    watermark: nextWatermark(),
   };
 }
