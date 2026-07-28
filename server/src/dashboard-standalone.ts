@@ -107,12 +107,14 @@ let standaloneProcessListenersInstalled = false;
 // first `await`. Await every cleanup to completion (via `Promise.allSettled`
 // so one failing cleanup cannot block the others) before returning.
 async function runStandaloneSignalCleanups(): Promise<void> {
-  const cleanups = [...standaloneSignalCleanups];
-  standaloneSignalCleanups.clear();
   standaloneExitCleanups.clear();
-  await Promise.allSettled(cleanups.map(async (cleanup) => {
-    await cleanup();
-  }));
+  while (standaloneSignalCleanups.size > 0) {
+    const cleanups = [...standaloneSignalCleanups];
+    standaloneSignalCleanups.clear();
+    await Promise.allSettled(cleanups.map(async (cleanup) => {
+      await cleanup();
+    }));
+  }
 }
 
 function runStandaloneExitCleanups(): void {
@@ -179,6 +181,26 @@ function registerStandaloneProcessCleanup(
     process.on("SIGTERM", handleStandaloneShutdownSignal);
     process.on("exit", runStandaloneExitCleanups);
   }
+}
+
+export function __registerStandaloneProcessCleanupForTest(
+  cleanup: StandaloneProcessCleanup,
+  options: { runOnExit?: boolean } = {},
+): void {
+  assertStandaloneTestHookAllowed("__registerStandaloneProcessCleanupForTest");
+  registerStandaloneProcessCleanup(cleanup, options);
+}
+
+export function __resetStandaloneShutdownStateForTest(): void {
+  assertStandaloneTestHookAllowed("__resetStandaloneShutdownStateForTest");
+  standaloneSignalCleanups.clear();
+  standaloneExitCleanups.clear();
+  standaloneShutdownInFlight = undefined;
+}
+
+function assertStandaloneTestHookAllowed(name: string): void {
+  if (process.env.NODE_ENV === "test" || process.env.VITEST !== undefined) return;
+  throw new Error(`${name} is test-only and is disabled outside the test runner.`);
 }
 
 export interface StandaloneDashboardOptions {

@@ -134,90 +134,17 @@ describe("wrap/cli renderAutoProvisionOutcomeLines", () => {
     expect(out[0]).toMatch(/sudo sanctuary castle-wall disable/);
   });
 
-  it("F2/F3: shutdown rollback with uncorroborated disarm is a warning and does not claim the agent still runs dedicated", () => {
-    const out = lines({
-      ran: true,
-      outcome: {
-        kind: "shutdown-after-arm-rolled-back",
-        uid: 503,
-        reason:
-          "shutdown requested (SIGTERM) at shutdown-after-arm; fast-disarmed before exit rather than leave an unverified armed wall. WARNING: disarm reported success as a dead-man lever but did NOT save the NE preference disabled; the wall may still be enabled at the preference level.",
-        egressRestoredToPreRunState: true,
-        wallMayBeArmed: true,
-        disarmOutcome: "fail_open_deadman",
-      },
-    });
-    expect(out[0]).toMatch(/^ {2}WARNING:/);
-    expect(out[0]).toMatch(/disarm was NOT corroborated/);
-    expect(out[0]).toMatch(/sudo sanctuary castle-wall disable/);
-    expect(out[0]).not.toMatch(/still runs under its dedicated, re-homed account/);
-  });
-
-  it("R9: shutdown rollback with save-accepted-inconclusive does not claim an observed disarm", () => {
-    // Fails with the R9 fix reverted: the render used the clean fast-disarm
-    // note even though the NE outcome type says this is never an observation.
-    const out = lines({
-      ran: true,
-      outcome: {
-        kind: "shutdown-after-arm-rolled-back",
-        uid: 503,
-        reason: "disable save accepted but status reread was inconclusive",
-        egressRestoredToPreRunState: true,
-        disarmOutcome: "save_accepted_inconclusive",
-      },
-    });
-    expect(out[0]).toMatch(/^ {2}WARNING:/);
-    expect(out[0]).toMatch(/status re-read was inconclusive/);
-    expect(out[0]).not.toMatch(/fast-disarmed before exit/);
-    expect(out[0]).not.toMatch(/enforcement came down/);
-  });
-
-  it("F1: shutdown rollback observed off contributes an unprotected CEILING instead of leaving the probe uncapped", () => {
-    // Fails with the R3 fix reverted: the ceiling path would return undefined,
-    // so a green probe could pass through after rollback.
-    const claim = autoProvisionCeilingFromSummary({
-      ran: true,
-      outcome: {
-        kind: "shutdown-after-arm-rolled-back",
-        uid: 503,
-        reason: "shutdown rollback observed the wall off",
-        egressRestoredToPreRunState: true,
-        disarmOutcome: "corroborated_off",
-        disarmObservedOff: true,
-      },
-    });
-    expect(claim?.state).toBe("unprotected");
-    expect(claim?.basis).toBe("disarm_observed_off");
-  });
-
-  it("F1: shutdown rollback wallMayBeArmed contributes an unknown CEILING instead of leaving the probe uncapped", () => {
-    // Fails with the R3 fix reverted: the ceiling path would return undefined,
-    // allowing a bounded green probe to become a protected banner.
-    const claim = autoProvisionCeilingFromSummary({
-      ran: true,
-      outcome: {
-        kind: "shutdown-after-arm-rolled-back",
-        uid: 503,
-        reason: "dead-man disarm did not save the NE preference disabled",
-        egressRestoredToPreRunState: true,
-        wallMayBeArmed: true,
-        disarmOutcome: "fail_open_deadman",
-      },
-    });
-    expect(claim?.state).toBe("unknown");
-    expect(claim?.basis).toBe("provision_outcome_not_observation");
-  });
-
   it("R1: save-accepted-but-inconclusive disarm contributes an unknown CEILING, never an uncapped protected claim", () => {
-    // Fails with the R1 fix reverted: `save_accepted_inconclusive` carries
-    // neither disarmObservedOff nor wallMayBeArmed, so the ceiling was undefined.
+    // Fails with the disarm-ceiling guard reverted: `save_accepted_inconclusive`
+    // carries neither disarmObservedOff nor wallMayBeArmed, so the ceiling
+    // would be undefined and a later green probe could pass through.
     const claim = autoProvisionCeilingFromSummary({
       ran: true,
       outcome: {
-        kind: "shutdown-after-arm-rolled-back",
-        uid: 503,
+        kind: "aborted",
+        stage: "arm",
         reason: "disable save accepted but status reread was inconclusive",
-        egressRestoredToPreRunState: true,
+        rolledBack: true,
         disarmOutcome: "save_accepted_inconclusive",
       },
     });

@@ -68,7 +68,6 @@ import {
   type DisarmNePreferenceOutcome,
   type ProvisionFlowOps,
   type ProvisionFlowOutcome,
-  type ProvisionFlowShutdownStatus,
   type RehomeStepResult,
   type EndpointProbeTarget,
   type PolicyDaemonAction,
@@ -956,6 +955,11 @@ export interface RunAutoProvisionForWrapOptions {
   print?: (line: string) => void;
   /** Stop the wrap-started transient Castle Wall daemon before installing the persistent boot service. */
   stopTransientCastleWallDaemon?: () => Promise<void>;
+  /**
+   * Called immediately before the provisioning orchestrator's first privileged
+   * write. Returning false aborts before account/re-home/Castle Wall mutation.
+   */
+  beforeFirstMutation?: () => boolean | Promise<boolean>;
   /** Override for `process.getuid` (tests only; production leaves this undefined). */
   getuid?: () => number;
   /** Override for the resolved operator identity (tests only; production leaves this undefined and resolves via SUDO_UID/GID/USER). */
@@ -967,16 +971,6 @@ export interface RunAutoProvisionForWrapOptions {
    * stages prove live. Off by default (coarse drill-proven path unchanged).
    */
   exclusiveEgress?: boolean;
-  /**
-   * Aborted by `wrap/cli.ts` when SIGINT/SIGTERM arrives during provisioning.
-   * The orchestrator observes it only at rollback-safe checkpoints.
-   */
-  shutdownSignal?: AbortSignal;
-  /**
-   * Receives non-secret in-flight state so signal shutdown can print a bounded
-   * residual-state warning if rollback does not settle before its deadline.
-   */
-  onShutdownStatus?: (status: ProvisionFlowShutdownStatus) => void;
 }
 
 /**
@@ -1278,8 +1272,9 @@ export async function runAutoProvisionForWrap(
       : undefined;
 
   const ops: ProvisionFlowOps = {
-    confirm: (promptText, signal) => confirmOnTty(promptText, signal),
+    confirm: (promptText) => confirmOnTty(promptText),
     print,
+    beforeFirstMutation: options.beforeFirstMutation,
     createAccount: async () => {
       const { planAndCreateAccount } = await import("../castle-wall/provision/account.js");
       // FIX F7: bind the account's home to the re-home target at create
@@ -1912,8 +1907,6 @@ export async function runAutoProvisionForWrap(
         // S5-6: fine-grained (exclusive-egress) mode -- parked install +
         // exclusive arming stage after the coarse stages prove live.
         fineGrainedDeclared: options.exclusiveEgress === true,
-        shutdownSignal: options.shutdownSignal,
-        onShutdownStatus: options.onShutdownStatus,
       },
       { ...ops, ...(exclusiveEgressOps !== undefined ? { exclusiveEgress: exclusiveEgressOps } : {}) },
     ),
@@ -2146,20 +2139,12 @@ async function resolveAccountShapeVerdict(
   }
 }
 
-async function confirmOnTty(promptText: string, signal?: AbortSignal): Promise<boolean> {
+async function confirmOnTty(promptText: string): Promise<boolean> {
   const readline = await import("node:readline/promises");
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   try {
-    const answer =
-      signal !== undefined
-        ? await rl.question(promptText, { signal })
-        : await rl.question(promptText);
+    const answer = await rl.question(promptText);
     return /^y(es)?$/i.test(answer.trim());
-  } catch (err) {
-    if (signal?.aborted === true || (err as Error).name === "AbortError") {
-      return false;
-    }
-    throw err;
   } finally {
     rl.close();
   }

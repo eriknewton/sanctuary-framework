@@ -100,7 +100,6 @@ export type {
   ProvisionFlowContext,
   ProvisionFlowOps,
   ProvisionFlowOutcome,
-  ProvisionFlowShutdownStatus,
 } from "./orchestrate.js";
 
 export { resolvePolicyDaemonAction } from "./policy-daemon.js";

@@ -36,7 +36,7 @@
 
 import type { ProvisionNeedResult } from "./detect.js";
 import type { HarnessDisposition, RunStateAdvice } from "../../egress-gate/parked-claim.js";
-import { assessHarnessParked, runStateAdvice, startedCoarseDisposition } from "../../egress-gate/parked-claim.js";
+import { assessHarnessParked, runStateAdvice } from "../../egress-gate/parked-claim.js";
 import {
   EGRESS_GATE_REPAIR_WITH_STAND_DOWN_COMMAND,
   EGRESS_GATE_STAND_DOWN_EFFECT,
@@ -65,21 +65,6 @@ import {
   renderEgressPlanLines,
   renderEndpointCheckLines,
 } from "./egress.js";
-
-/**
- * Operator-facing shutdown state for an in-flight provision attempt.
- * A signal cleanup uses the latest value when rollback does not settle before
- * its deadline, so it can name the residual state without inventing a clean
- * rollback claim.
- */
-export interface ProvisionFlowShutdownStatus {
-  /** The current provision stage, using the same vocabulary as outcome stages where possible. */
-  stage: string;
-  /** The host state that may remain if the process exits before rollback is observed. */
-  residualState: string;
-  /** Exact product command or verb the operator should run to recover this residual state. */
-  recoveryCommand: string;
-}
 
 /** Everything the orchestrator needs to decide + print, resolved once up front. */
 export interface ProvisionFlowContext {
@@ -119,17 +104,6 @@ export interface ProvisionFlowContext {
    * barrier), with the degrade-loud coarse fallback on failure.
    */
   fineGrainedDeclared?: boolean;
-  /**
-   * Set by the CLI signal cleanup when SIGINT/SIGTERM arrives. The flow checks it
-   * only at rollback-safe checkpoints, never by duplicating host cleanup in the
-   * signal handler.
-   */
-  shutdownSignal?: AbortSignal;
-  /**
-   * Receives the current rollback-relevant state for bounded signal shutdown.
-   * It must not contain secrets; it is rendered to the operator if rollback hangs.
-   */
-  onShutdownStatus?: (status: ProvisionFlowShutdownStatus) => void;
 }
 
 export type DisarmNePreferenceOutcome =
@@ -150,9 +124,14 @@ function disarmOutcomeAllowsFreshDaemonTeardown(
 /** The injected, side-effecting steps. Each corresponds to one stage of the target flow. */
 export interface ProvisionFlowOps {
   /** Ask the single "proceed? [y/N]" question. Only called when `isTty` is true. */
-  confirm(promptText: string, signal?: AbortSignal): Promise<boolean>;
+  confirm(promptText: string): Promise<boolean>;
   /** Print a line to the operator-facing channel (plan-and-print, progress, errors). */
   print(line: string): void;
+  /**
+   * Optional lifecycle hook that must run immediately before this flow's first
+   * privileged write. Returning false refuses before any provisioning mutation.
+   */
+  beforeFirstMutation?: () => boolean | Promise<boolean>;
   /** Build the account-provision plan (pure) then execute it. Returns the account's uid. */
   createAccount(): Promise<{ plan: AccountProvisionPlan; uid: number }>;
   /** Build + execute the re-home plan. Returns per-step results (for rollback). */
@@ -836,22 +815,6 @@ export type ProvisionFlowOutcome =
     }
   | { kind: "armed-rollback-failed"; uid: number; reason: string; disarmError: string }
   /**
-   * SIGINT/SIGTERM arrived after the Castle Wall arm mutation completed but
-   * before the flow reached a final safe success outcome. The shutdown path
-   * fast-disarmed through the same rollback operation used by the post-arm
-   * verification failures, and restored provisioned egress rules to their
-   * pre-run state when that could be observed.
-   */
-  | {
-      kind: "shutdown-after-arm-rolled-back";
-      uid: number;
-      reason: string;
-      egressRestoredToPreRunState: boolean;
-      wallMayBeArmed?: true;
-      disarmOutcome: DisarmNePreferenceOutcome;
-      disarmObservedOff?: true;
-    }
-  /**
    * Egress-provision outcome vocabulary (design section 5): a DISTINCT local
    * variant, never a widened shared enum (the file-grant round-4 lesson).
    * The wall ARMED, but the post-arm AS-UID egress verification failed (an
@@ -926,230 +889,9 @@ interface HarnessStandDownState {
   owed: boolean;
 }
 
-const PROTECT_RETRY_COMMAND = "sudo sanctuary protect --hermes";
-const CASTLE_WALL_DISABLE_COMMAND = "sudo sanctuary castle-wall disable";
-
-function reportShutdownStatus(ctx: ProvisionFlowContext, status: ProvisionFlowShutdownStatus): void {
-  ctx.onShutdownStatus?.(status);
-}
-
-function shutdownRequested(ctx: ProvisionFlowContext): boolean {
-  return ctx.shutdownSignal?.aborted === true;
-}
-
-function shutdownReason(ctx: ProvisionFlowContext): string {
-  const reason = ctx.shutdownSignal?.reason;
-  if (reason instanceof Error) return reason.message;
-  if (typeof reason === "string" && reason.length > 0) return reason;
-  return "process shutdown requested";
-}
-
-function shutdownRollbackReason(ctx: ProvisionFlowContext, checkpoint: string): string {
-  return (
-    `shutdown requested (${shutdownReason(ctx)}) at ${checkpoint}; ` +
-    "stopping automatic account provisioning before the next mutation and running the normal rollback path."
-  );
-}
-
-function shutdownBeforeRehomeOutcome(
-  ctx: ProvisionFlowContext,
-  stage: string,
-  accountCreated: boolean,
-  reason?: string,
-): Extract<ProvisionFlowOutcome, { kind: "aborted" }> {
-  return {
-    kind: "aborted",
-    stage,
-    reason:
-      reason ??
-      (accountCreated
-        ? `shutdown requested (${shutdownReason(ctx)}) after the dedicated account was created and before any file move; no re-home, egress, or Castle Wall arm change was made by this run.`
-        : `shutdown requested (${shutdownReason(ctx)}) before account, re-home, egress, or Castle Wall arm mutation; no privileged provisioning change was made by this run.`),
-    rolledBack: false,
-    rehomeAttempted: false,
-    accountCreated,
-  };
-}
-
-async function rollbackPreArmForShutdown(input: {
-  ctx: ProvisionFlowContext;
-  ops: ProvisionFlowOps;
-  stage: string;
-  rehomeResults: RehomeStepResult[];
-  accountCreated: boolean;
-  tearDownDaemon: boolean;
-  tearDownPolicyDaemon: boolean;
-  restoreEgress?: boolean;
-}): Promise<Extract<ProvisionFlowOutcome, { kind: "aborted" }>> {
-  reportShutdownStatus(input.ctx, {
-    stage: `rollback-${input.stage}`,
-    residualState:
-      "shutdown rollback is in flight; the harness daemon, policy daemon, provisioned egress rules, or re-homed files may be mid-restore",
-    recoveryCommand: PROTECT_RETRY_COMMAND,
-  });
-  const td = await teardownDaemonAndRestore(
-    input.ops,
-    input.rehomeResults,
-    input.tearDownDaemon,
-    input.tearDownPolicyDaemon,
-    input.restoreEgress === true,
-  );
-  return {
-    kind: "aborted",
-    stage: input.stage,
-    reason: withDaemonTeardownNote(
-      shutdownRollbackReason(input.ctx, input.stage),
-      td.daemonTeardownError,
-      td.policyDaemonTeardownError,
-      td.egressRestoreNote,
-    ),
-    rolledBack: td.rolledBack,
-    backupPaths: td.backupPaths,
-    conflictPaths: td.conflictPaths,
-    failedPaths: td.failedPaths,
-    daemonTeardownFailed:
-      td.daemonTeardownError !== undefined || td.policyDaemonTeardownError !== undefined,
-    rehomeAttempted: input.rehomeResults.some((r) => r.status === "moved"),
-    accountCreated: input.accountCreated,
-  };
-}
-
-async function rollbackAfterArmForShutdown(
-  ctx: ProvisionFlowContext,
-  ops: ProvisionFlowOps,
-  uid: number,
-  stage: string,
-  egressProvisionedThisRun: boolean,
-): Promise<ProvisionFlowOutcome> {
-  reportShutdownStatus(ctx, {
-    stage: `rollback-${stage}`,
-    residualState:
-      "shutdown rollback is in flight after Castle Wall arm; the wall disarm and pre-run egress-rule restore may not yet be observed",
-    recoveryCommand: CASTLE_WALL_DISABLE_COMMAND,
-  });
-  let disarmObservedOff = false;
-  let wallMayBeArmed = false;
-  let nePreferenceOutcome: DisarmNePreferenceOutcome;
-  let auditDisarmOutcome: "fast-disarmed" | "disarm-uncorroborated" = "fast-disarmed";
-  try {
-    const disarmResult = await ops.disarm();
-    nePreferenceOutcome = disarmResult.nePreferenceOutcome;
-    disarmObservedOff = disarmOutcomeObservedOff(nePreferenceOutcome);
-    if (!disarmOutcomeAllowsFreshDaemonTeardown(nePreferenceOutcome)) {
-      wallMayBeArmed = true;
-      auditDisarmOutcome = "disarm-uncorroborated";
-    }
-  } catch (disarmErr) {
-    await auditEgressRefusalBestEffort(ops, ctx, uid, {
-      stage,
-      disarm_outcome: "disarm-failed",
-    });
-    return {
-      kind: "armed-rollback-failed",
-      uid,
-      reason:
-        `shutdown requested (${shutdownReason(ctx)}) at ${stage}; automatic shutdown rollback could not confirm the Castle Wall is off.`,
-      disarmError: (disarmErr as Error).message,
-    };
-  }
-  const restoreNote = await restoreEgressBestEffort(ops, egressProvisionedThisRun);
-  await auditEgressRefusalBestEffort(ops, ctx, uid, {
-    stage,
-    disarm_outcome: auditDisarmOutcome,
-    egress_rules_restored_to_pre_run_state: restoreNote === "",
-  });
-  return {
-    kind: "shutdown-after-arm-rolled-back",
-    uid,
-    reason:
-      `shutdown requested (${shutdownReason(ctx)}) at ${stage}; fast-disarmed before exit rather than leave an unverified armed wall.` +
-      (wallMayBeArmed
-        ? " WARNING: disarm reported success as a dead-man lever but did NOT save the NE preference disabled; the wall may still be enabled at the preference level."
-        : "") +
-      egressRestoreReasonSuffix(restoreNote),
-    egressRestoredToPreRunState: restoreNote === "",
-    wallMayBeArmed: wallMayBeArmed ? true : undefined,
-    disarmOutcome: nePreferenceOutcome,
-    disarmObservedOff: disarmObservedOff ? true : undefined,
-  };
-}
-
-async function coarseOnlyShutdownBeforeExclusiveOutcome(
-  ctx: ProvisionFlowContext,
-  ops: ProvisionFlowOps,
-  uid: number,
-): Promise<Extract<ProvisionFlowOutcome, { kind: "exclusive-egress-unarmed-coarse-active" }>> {
-  reportShutdownStatus(ctx, {
-    stage: "shutdown-before-exclusive-egress-coarse-only",
-    residualState:
-      "coarse Castle Wall enforcement is verified live; shutdown is preserving coarse enforcement and settling the harness disposition",
-    recoveryCommand: EGRESS_GATE_REPAIR_WITH_STAND_DOWN_COMMAND,
-  });
-  const cleanupErrors: string[] = [];
-  let coarseCompositionRestored = false;
-  try {
-    await ops.exclusiveEgress!.restoreCoarseComposition(
-      `shutdown requested (${shutdownReason(ctx)}) before exclusive egress armed`,
-    );
-    coarseCompositionRestored = true;
-  } catch (err) {
-    cleanupErrors.push(`coarse composition restore failed: ${(err as Error).message}`);
-  }
-  let harness: HarnessDisposition | undefined;
-  try {
-    if (coarseCompositionRestored) {
-      await ops.exclusiveEgress!.startHarnessCoarse();
-      harness = startedCoarseDisposition();
-    }
-  } catch (err) {
-    cleanupErrors.push(
-      `coarse harness start failed (this run did not start the agent): ${(err as Error).message}`,
-    );
-  }
-  if (harness === undefined) {
-    harness = { disposition: "not-started", claim: await ops.exclusiveEgress!.assessHarnessParked() };
-  }
-  await ops.exclusiveEgress!.audit(EGRESS_PROVISION_REFUSED_AUDIT_OP, {
-    stage: "shutdown-before-exclusive-egress",
-    harness: ctx.agentId,
-    agent_uid: uid,
-    outcome: "exclusive-egress-unarmed-coarse-active",
-    coarse_wall_preserved: true,
-    cleanup_errors: cleanupErrors,
-  });
-  return {
-    kind: "exclusive-egress-unarmed-coarse-active",
-    uid,
-    stage: "release",
-    reason:
-      `shutdown requested (${shutdownReason(ctx)}) after coarse Castle Wall enforcement was verified and before exclusive egress armed; preserving proven-live coarse enforcement instead of disarming it.`,
-    coarseCompositionRestored,
-    harness,
-    cleanupErrors,
-  };
-}
-
-async function auditEgressRefusalBestEffort(
-  ops: ProvisionFlowOps,
-  ctx: ProvisionFlowContext,
-  uid: number,
-  details: Record<string, unknown>,
-): Promise<void> {
-  try {
-    await ops.auditEgress(EGRESS_PROVISION_REFUSED_AUDIT_OP, {
-      harness: ctx.agentId,
-      agent_uid: uid,
-      declared_endpoints: ctx.harnessEndpoints.endpoints.map((e) => `${e.host}:${e.port}`),
-      ...details,
-    });
-  } catch {
-    // Shutdown rollback audit is best-effort; the rollback outcome still has to surface.
-  }
-}
-
 /**
- * Outcome classifier for cases where the harness is NOT owed a restore,
- * because the exclusive-egress stage has taken ownership of it:
+ * Outcomes after which the harness is NOT owed a restore, because the
+ * exclusive-egress stage has taken ownership of it:
  *   - `armed-exclusive` / `armed-exclusive-repark-failed`: the release barrier
  *     started the agent under a committed generation. Restoring the PRE-run
  *     plist here would tear a correctly-confined agent back to coarse.
@@ -1161,34 +903,19 @@ async function auditEgressRefusalBestEffort(
  *     The suppression is right; what round 4 fixed is the CLAIM attached to
  *     it, which used to say "parked" regardless.
  *
- * Deliberately exhaustive: a new outcome kind must choose whether it owns the
- * harness, and an `exclusive-egress-unarmed-coarse-active` outcome only owns it
- * when the coarse harness was actually started.
+ * Deliberately an ALLOW-LIST of "already handled", not a deny-list of aborts:
+ * a new abort kind added later defaults to restoring, which is the safe
+ * direction. Getting on this list has to be a deliberate act.
  */
-function outcomeOwnsHarness(outcome: ProvisionFlowOutcome): boolean {
-  switch (outcome.kind) {
-    case "armed-exclusive":
-    case "armed-exclusive-repark-failed":
-      return true;
-    case "exclusive-egress-unarmed-coarse-active":
-      return outcome.harness.disposition === "started-coarse";
-    case "skipped-already-dedicated":
-    case "skipped-non-tty-cooperative-only":
-    case "declined-by-operator":
-    case "armed":
-    case "aborted":
-    case "armed-then-rolled-back":
-    case "armed-rollback-failed":
-    case "shutdown-after-arm-rolled-back":
-    case "egress-unprovisioned-rolled-back":
-      return false;
-    default:
-      return assertNeverProvisionFlowOutcome(outcome);
-  }
-}
+const OUTCOMES_THAT_OWN_THE_HARNESS: ReadonlySet<string> = new Set([
+  "armed-exclusive",
+  "armed-exclusive-repark-failed",
+  "exclusive-egress-unarmed-coarse-active",
+]);
 
 function assertNeverProvisionFlowOutcome(outcome: never): never {
-  throw new Error(`Unhandled ProvisionFlowOutcome kind: ${JSON.stringify(outcome)}`);
+  const kind = (outcome as { kind?: unknown }).kind;
+  throw new Error(`Unhandled ProvisionFlowOutcome kind: ${String(kind)}`);
 }
 
 /**
@@ -1209,11 +936,6 @@ export async function runProvisionFlow(
   ctx: ProvisionFlowContext,
   ops: ProvisionFlowOps,
 ): Promise<ProvisionFlowOutcome> {
-  reportShutdownStatus(ctx, {
-    stage: "preflight",
-    residualState: "no privileged provisioning mutation has run yet",
-    recoveryCommand: PROTECT_RETRY_COMMAND,
-  });
   const standDown: HarnessStandDownState = { owed: false };
   let outcome: ProvisionFlowOutcome;
   try {
@@ -1228,17 +950,11 @@ export async function runProvisionFlow(
     if (standDown.owed) await restoreStoodDownHarnessQuietly(ops);
     throw err;
   }
-  if (!standDown.owed || outcomeOwnsHarness(outcome)) {
+  if (!standDown.owed || OUTCOMES_THAT_OWN_THE_HARNESS.has(outcome.kind)) {
     return outcome;
   }
-  reportShutdownStatus(ctx, {
-    stage: "harness-restore",
-    residualState:
-      "rollback is restoring the stood-down harness; the launchd plist or run state may be mid-restore, and re-homed files may remain on the dedicated account",
-    recoveryCommand: PROTECT_RETRY_COMMAND,
-  });
   const restore = await restoreStoodDownHarnessOrWeakenedClaim(ops);
-  const note = harnessRestoreNote(restore, outcome.kind);
+  const note = harnessRestoreNote(restore, outcome);
   if (!("reason" in outcome) || typeof outcome.reason !== "string") {
     // FIX-ROUND 2 (MED): the restore DECISION defaults to safe (an allow-list
     // of outcomes that own the harness, so a new abort restores). The restore
@@ -1256,7 +972,14 @@ export async function runProvisionFlow(
 /** Best-effort restore on the throw path; the original error must win. */
 async function restoreStoodDownHarnessQuietly(ops: ProvisionFlowOps): Promise<void> {
   try {
-    ops.print(harnessRestoreNote(await restoreStoodDownHarnessOrWeakenedClaim(ops), "aborted"));
+    ops.print(
+      harnessRestoreNote(await restoreStoodDownHarnessOrWeakenedClaim(ops), {
+        kind: "aborted",
+        stage: "throw",
+        reason: "the provisioning flow threw before returning an outcome",
+        rolledBack: false,
+      }),
+    );
   } catch {
     // The caller is already propagating a more important failure.
   }
@@ -1303,20 +1026,26 @@ async function restoreStoodDownHarnessOrWeakenedClaim(
  * previous state" there is false in a way that matters: the restarted harness
  * may not find its credentials.
  */
-const OUTCOMES_THAT_KEEP_THE_REHOME = {
-  "skipped-already-dedicated": false,
-  "skipped-non-tty-cooperative-only": false,
-  "declined-by-operator": false,
-  armed: false,
-  aborted: false,
-  "armed-then-rolled-back": true,
-  "armed-rollback-failed": true,
-  "shutdown-after-arm-rolled-back": true,
-  "egress-unprovisioned-rolled-back": true,
-  "armed-exclusive": false,
-  "armed-exclusive-repark-failed": false,
-  "exclusive-egress-unarmed-coarse-active": false,
-} as const satisfies Readonly<Record<ProvisionFlowOutcome["kind"], boolean>>;
+function outcomeKeepsRehome(outcome: ProvisionFlowOutcome): boolean {
+  switch (outcome.kind) {
+    case "skipped-already-dedicated":
+    case "skipped-non-tty-cooperative-only":
+    case "declined-by-operator":
+      return false;
+    case "exclusive-egress-unarmed-coarse-active":
+    case "armed":
+    case "armed-then-rolled-back":
+    case "armed-rollback-failed":
+    case "egress-unprovisioned-rolled-back":
+    case "armed-exclusive":
+    case "armed-exclusive-repark-failed":
+      return true;
+    case "aborted":
+      return (outcome.failedPaths?.length ?? 0) > 0;
+    default:
+      return assertNeverProvisionFlowOutcome(outcome);
+  }
+}
 
 /**
  * The operator-facing sentence about the restore, built ONLY from observed
@@ -1361,7 +1090,7 @@ function harnessRestoreNote(
     problems: string[];
     runState?: RunStateAdvice;
   },
-  outcomeKind: ProvisionFlowOutcome["kind"],
+  outcome: ProvisionFlowOutcome,
 ): string {
   if (!restore.restored) {
     // `runState` is absent EXACTLY when none is owed -- i.e. nothing was
@@ -1382,9 +1111,12 @@ function harnessRestoreNote(
     : restore.wasRunning
       ? "was put back"
       : "was put back; it was not running before this run, and this run did not start it";
-  const scope = OUTCOMES_THAT_KEEP_THE_REHOME[outcomeKind]
-    ? " NOTE: the re-home was deliberately NOT reversed on this outcome, so the harness is back but its " +
-      "secrets remain on the dedicated account. This is not a return to your previous state."
+  const scope = outcomeKeepsRehome(outcome)
+    ? outcome.kind === "aborted"
+      ? " NOTE: the re-home restore was attempted but did not fully succeed on this outcome, so the harness is back but its " +
+        "secrets may remain on the dedicated account. This is not a return to your previous state."
+      : " NOTE: the re-home was deliberately NOT reversed on this outcome, so the harness is back but its " +
+        "secrets remain on the dedicated account. This is not a return to your previous state."
     : "";
   return `The agent harness this run stood down ${what}.${scope}`;
 }
@@ -1455,12 +1187,6 @@ async function runProvisionFlowSteps(
     };
   }
 
-  reportShutdownStatus(ctx, {
-    stage: "plan-and-confirm",
-    residualState: "no privileged provisioning mutation has run yet; the flow is still before the operator confirmation",
-    recoveryCommand: PROTECT_RETRY_COMMAND,
-  });
-
   // Step 2: plan-and-print. No mutation yet, either branch.
   ops.print(
     ctx.detectResult.alreadyDedicated
@@ -1503,12 +1229,6 @@ async function runProvisionFlowSteps(
     return { kind: "declined-by-operator" };
   }
 
-  reportShutdownStatus(ctx, {
-    stage: "exclusive-routing-residue",
-    residualState: "no account, re-home, egress, or Castle Wall arm mutation has run yet; the flow is checking stale exclusive-routing residue",
-    recoveryCommand: PROTECT_RETRY_COMMAND,
-  });
-
   // EXCLUSIVE-ROUTING RESIDUE GATE, JUDGEMENT HALF (FIX F-COARSE-AFTER-EXCLUSIVE
   // class half, 2026-07-26; placement per FIX F1/F2, 2026-07-26).
   //
@@ -1545,9 +1265,6 @@ async function runProvisionFlowSteps(
       rehomeAttempted: false,
     };
   }
-  if (shutdownRequested(ctx)) {
-    return shutdownBeforeRehomeOutcome(ctx, "shutdown-before-confirm", false);
-  }
   if (residue.kind === "orphaned") {
     // Name the removal BEFORE the confirm, so the yes covers it.
     ops.print(
@@ -1556,15 +1273,20 @@ async function runProvisionFlowSteps(
     );
   }
 
-  const proceed = await ops.confirm("Proceed with account creation and arming? [y/N] ", ctx.shutdownSignal);
+  const proceed = await ops.confirm("Proceed with account creation and arming? [y/N] ");
   if (!proceed) {
-    if (shutdownRequested(ctx)) {
-      return shutdownBeforeRehomeOutcome(ctx, "shutdown-at-confirm", false);
-    }
     return { kind: "declined-by-operator" };
   }
-  if (shutdownRequested(ctx)) {
-    return shutdownBeforeRehomeOutcome(ctx, "shutdown-after-confirm", false);
+
+  if (ops.beforeFirstMutation !== undefined && !(await ops.beforeFirstMutation())) {
+    return {
+      kind: "aborted",
+      stage: "shutdown-in-flight",
+      reason:
+        "shutdown was already in flight before the first provisioning mutation; no account, re-home, or Castle Wall changes were made by provisioning.",
+      rolledBack: false,
+      rehomeAttempted: false,
+    };
   }
 
   // RESIDUE GATE, CLEAR half: the FIRST mutation of this run, immediately after
@@ -1575,12 +1297,6 @@ async function runProvisionFlowSteps(
   // de-confinement. A verdict that is no longer `orphaned` aborts here, with
   // the host still untouched.
   if (residue.kind === "orphaned") {
-    reportShutdownStatus(ctx, {
-      stage: "exclusive-routing-residue-clear",
-      residualState:
-        "a stale exclusive-routing marker may be cleared, but no account, re-home, egress, or Castle Wall arm mutation has run",
-      recoveryCommand: PROTECT_RETRY_COMMAND,
-    });
     const cleared = await reconcileResidueSafely(ops, residueSubjectUid, "clear");
     const clearedRefusal = exclusiveRoutingResidueRefusal(cleared);
     if (clearedRefusal !== undefined) {
@@ -1608,25 +1324,12 @@ async function runProvisionFlowSteps(
         rehomeAttempted: false,
       };
     }
-    if (shutdownRequested(ctx)) {
-      return shutdownBeforeRehomeOutcome(
-        ctx,
-        "shutdown-after-exclusive-routing-residue",
-        false,
-        `shutdown requested (${shutdownReason(ctx)}) after clearing stale exclusive-routing residue; this run did remove that stale marker, but no account was created, no files were re-homed, no provisioned egress rules were published, and the Castle Wall was not armed.`,
-      );
-    }
   }
 
   if (ctx.detectResult.alreadyDedicated) {
     uid = ctx.detectResult.resolved!.uid;
   } else {
     // Step 4: create the dedicated hidden service account.
-    reportShutdownStatus(ctx, {
-      stage: "create-account",
-      residualState: "the dedicated account may be created, but files have not been re-homed and Castle Wall has not been armed",
-      recoveryCommand: PROTECT_RETRY_COMMAND,
-    });
     try {
       const created = await ops.createAccount();
       uid = created.uid;
@@ -1641,16 +1344,8 @@ async function runProvisionFlowSteps(
         rehomeAttempted: false,
       };
     }
-    if (shutdownRequested(ctx)) {
-      return shutdownBeforeRehomeOutcome(ctx, "shutdown-after-create-account", accountCreated);
-    }
 
     // Step 5: re-home (backup-first, reversible).
-    reportShutdownStatus(ctx, {
-      stage: "rehome",
-      residualState: "the dedicated account exists and file re-home may be partially complete; rollback must restore moved paths from backups",
-      recoveryCommand: PROTECT_RETRY_COMMAND,
-    });
     try {
       const rehomed = await ops.rehome(uid, uid);
       rehomeResults = rehomed.results;
@@ -1690,17 +1385,6 @@ async function runProvisionFlowSteps(
         accountCreated,
       };
     }
-    if (shutdownRequested(ctx)) {
-      return rollbackPreArmForShutdown({
-        ctx,
-        ops,
-        stage: "shutdown-after-rehome",
-        rehomeResults,
-        accountCreated,
-        tearDownDaemon: false,
-        tearDownPolicyDaemon: false,
-      });
-    }
   }
 
   // Step 6 (Bug B, the one-flow gap): ensure a reachable Castle Wall POLICY
@@ -1722,12 +1406,6 @@ async function runProvisionFlowSteps(
   // BEFORE the destructive step costs them nothing. The general rule the two
   // gate lenses converged on: a step that cannot be undone runs only after
   // every step that can still say no has said yes.
-  reportShutdownStatus(ctx, {
-    stage: "ensure-policy-daemon",
-    residualState:
-      "file re-home may already be complete; a fresh Castle Wall policy daemon may be installed and must be torn down on rollback",
-    recoveryCommand: PROTECT_RETRY_COMMAND,
-  });
   const ensure = await ops.ensurePolicyDaemon(ctx.fortressPath);
   if (!ensure.ok) {
     // Fail-closed: we never proceed to arm without a reachable policy daemon.
@@ -1748,17 +1426,6 @@ async function runProvisionFlowSteps(
       accountCreated,
     };
   }
-  if (shutdownRequested(ctx)) {
-    return rollbackPreArmForShutdown({
-      ctx,
-      ops,
-      stage: "shutdown-after-ensure-policy-daemon",
-      rehomeResults,
-      accountCreated,
-      tearDownDaemon: false,
-      tearDownPolicyDaemon: ensure.freshlyInstalled,
-    });
-  }
   // Only meaningful on the ok path: whether THIS run stood up the machine's wall
   // from nothing. Every LATER abort branch below threads this into
   // `teardownDaemonAndRestore` so a fresh install is torn back down while a
@@ -1773,12 +1440,6 @@ async function runProvisionFlowSteps(
   // Step 6.5: install the harness daemon. Agent now runs at ruid = uid; wall
   // NOT yet armed. A failure here means we already moved secrets -- restore
   // them before reporting the abort (never leave a half-provisioned agent).
-  reportShutdownStatus(ctx, {
-    stage: "install-daemon",
-    residualState:
-      "the harness daemon may be installed or parked under the dedicated account; rollback must tear down this run's daemon work and restore re-homed files",
-    recoveryCommand: PROTECT_RETRY_COMMAND,
-  });
   const install = await ops.installHarnessDaemon(uid);
   if (!install.ok) {
     // FIX (round 5, item N3 / R8-1): a failed install may have left a fresh
@@ -1852,17 +1513,6 @@ async function runProvisionFlowSteps(
       accountCreated,
     };
   }
-  if (shutdownRequested(ctx)) {
-    return rollbackPreArmForShutdown({
-      ctx,
-      ops,
-      stage: "shutdown-after-install-daemon",
-      rehomeResults,
-      accountCreated,
-      tearDownDaemon: daemonBootstrappedThisRun,
-      tearDownPolicyDaemon: policyDaemonFreshlyInstalled,
-    });
-  }
   ops.print(
     ctx.fineGrainedDeclared === true
       ? "Harness daemon PARK-installed (disabled; the release barrier starts it after the gate commits)."
@@ -1888,12 +1538,6 @@ async function runProvisionFlowSteps(
   // behind is the exact confine-into-silence outcome this step exists to
   // prevent -- and emits the DISTINCT `egress_provision_refused` audit op so
   // a fleet operator can prove the refusal happened and why.
-  reportShutdownStatus(ctx, {
-    stage: "provision-egress",
-    residualState:
-      "the harness may be parked or installed, and provisioned egress rules may be partially published; rollback must restore the pre-run rule set before arm",
-    recoveryCommand: PROTECT_RETRY_COMMAND,
-  });
   const egress = await ops.provisionEgress();
   if (egress.checks !== undefined) {
     for (const line of renderEndpointCheckLines(egress.checks)) {
@@ -1951,30 +1595,12 @@ async function runProvisionFlowSteps(
     `Egress provisioned: ${egress.ruleIds.length} signed allow rule(s) published for the agent ` +
       `(${egress.ruleIds.join(", ")}); scoped DNS allow derived.`,
   );
-  if (shutdownRequested(ctx)) {
-    return rollbackPreArmForShutdown({
-      ctx,
-      ops,
-      stage: "shutdown-after-provision-egress",
-      rehomeResults,
-      accountCreated,
-      tearDownDaemon: daemonBootstrappedThisRun,
-      tearDownPolicyDaemon: policyDaemonFreshlyInstalled,
-      restoreEgress: egressProvisionedThisRun,
-    });
-  }
 
   // Step 7: verify BEFORE arming (fix B2 ordering). FIX G5 (2026-07-07
   // re-gate 3): this proves DNS-resolvability + every moved credential
   // present-and-readable-by-target-uid (see verify.ts's module doc), NOT
   // reachability "as the new uid" (this process never crosses a uid
   // boundary) and NOT allow-list correctness (the wall is not armed yet).
-  reportShutdownStatus(ctx, {
-    stage: "verify-before-arm",
-    residualState:
-      "provisioned egress rules are published but Castle Wall has not been armed; rollback must restore rules, daemon state, and re-homed files",
-    recoveryCommand: PROTECT_RETRY_COMMAND,
-  });
   const preArmVerify: ConnectivityVerifyResult = await verifyReachabilityBeforeArm(ops.preArmEndpoints());
   if (!preArmVerify.allReachable) {
     const unreachable = preArmVerify.results.filter((r) => !r.reachable).map((r) => r.name);
@@ -2014,27 +1640,9 @@ async function runProvisionFlowSteps(
       accountCreated,
     };
   }
-  if (shutdownRequested(ctx)) {
-    return rollbackPreArmForShutdown({
-      ctx,
-      ops,
-      stage: "shutdown-after-verify-before-arm",
-      rehomeResults,
-      accountCreated,
-      tearDownDaemon: daemonBootstrappedThisRun,
-      tearDownPolicyDaemon: policyDaemonFreshlyInstalled,
-      restoreEgress: egressProvisionedThisRun,
-    });
-  }
 
   // Step 8: arm-time uid-existence gate (fix H1). Immediately before
   // arming, hard-check the account still exists at exactly this uid.
-  reportShutdownStatus(ctx, {
-    stage: "uid-existence-gate",
-    residualState:
-      "pre-arm checks passed and provisioned egress rules are published, but Castle Wall has not been armed; rollback must restore the pre-run state before exit",
-    recoveryCommand: PROTECT_RETRY_COMMAND,
-  });
   const existenceCheck = await ops.checkUidExistence(uid);
   if (!existenceCheck.ok) {
     // FIX (round 5, item N3): daemon is live; tear it down on this abort. Bug B:
@@ -2066,26 +1674,8 @@ async function runProvisionFlowSteps(
       accountCreated,
     };
   }
-  if (shutdownRequested(ctx)) {
-    return rollbackPreArmForShutdown({
-      ctx,
-      ops,
-      stage: "shutdown-after-uid-existence-gate",
-      rehomeResults,
-      accountCreated,
-      tearDownDaemon: daemonBootstrappedThisRun,
-      tearDownPolicyDaemon: policyDaemonFreshlyInstalled,
-      restoreEgress: egressProvisionedThisRun,
-    });
-  }
 
   // Step 9: arm via the shipped `enable --agent-uid=N --ceiling` (step 1).
-  reportShutdownStatus(ctx, {
-    stage: "arm",
-    residualState:
-      "Castle Wall arm is in progress; the content filter may become ARMED and rollback must disarm before exit",
-    recoveryCommand: CASTLE_WALL_DISABLE_COMMAND,
-  });
   const armResult = await ops.arm(uid, ctx.ceiling);
   if (!armResult.ok) {
     // FIX (round 5, item N3): arming failed but the harness daemon is live;
@@ -2176,24 +1766,8 @@ async function runProvisionFlowSteps(
       accountCreated,
     };
   }
-  if (shutdownRequested(ctx)) {
-    return rollbackAfterArmForShutdown(
-      ctx,
-      ops,
-      uid,
-      "shutdown-after-arm",
-      egressProvisionedThisRun,
-    );
-  }
-
   // Step 10: post-arm connectivity re-check with fast disarm-rollback (fix
   // B2). Allow-list correctness is only provable now.
-  reportShutdownStatus(ctx, {
-    stage: "post-arm-connectivity-check",
-    residualState:
-      "Castle Wall is armed and provisioned egress has not completed post-arm verification; rollback must disarm and restore the pre-run rule set",
-    recoveryCommand: CASTLE_WALL_DISABLE_COMMAND,
-  });
   const postArmVerify: ConnectivityVerifyResult = await verifyReachabilityAfterArm(ops.postArmEndpoints());
   if (!postArmVerify.allReachable) {
     const unreachable = postArmVerify.results.filter((r) => !r.reachable).map((r) => r.name);
@@ -2250,16 +1824,6 @@ async function runProvisionFlowSteps(
       disarmObservedOff: disarmObservedOff ? true : undefined,
     };
   }
-  if (shutdownRequested(ctx)) {
-    return rollbackAfterArmForShutdown(
-      ctx,
-      ops,
-      uid,
-      "shutdown-after-post-arm-connectivity-check",
-      egressProvisionedThisRun,
-    );
-  }
-
   // Step 11 (confined-agent egress, design section 5): the REAL post-arm
   // egress check, run AS THE AGENT UID through the ARMED wall -- the check
   // the 2026-07-09 drill proved the DNS-only probes above cannot make
@@ -2268,12 +1832,6 @@ async function runProvisionFlowSteps(
   // negative control must stay BLOCKED. Any failure triggers the same fix-B2
   // fast-disarm rollback as step 10, plus the provisioned-rule scrub, and is
   // reported as the DISTINCT local outcome `egress-unprovisioned-rolled-back`.
-  reportShutdownStatus(ctx, {
-    stage: "post-arm-as-uid-egress-check",
-    residualState:
-      "Castle Wall is armed and as-agent-uid egress verification is in progress; rollback must disarm before exit if verification does not reach a safe outcome",
-    recoveryCommand: CASTLE_WALL_DISABLE_COMMAND,
-  });
   const egressVerify = await ops.verifyAgentEgressAfterArm(uid);
   for (const line of renderAgentEgressReportLines(egressVerify)) {
     ops.print(line);
@@ -2328,16 +1886,6 @@ async function runProvisionFlowSteps(
       disarmObservedOff: disarmObservedOff ? true : undefined,
     };
   }
-  if (shutdownRequested(ctx)) {
-    return rollbackAfterArmForShutdown(
-      ctx,
-      ops,
-      uid,
-      "shutdown-after-post-arm-as-uid-egress-check",
-      egressProvisionedThisRun,
-    );
-  }
-
   await ops.auditEgress(EGRESS_PROVISIONED_AUDIT_OP, {
     harness: ctx.agentId,
     agent_uid: uid,
@@ -2350,22 +1898,12 @@ async function runProvisionFlowSteps(
     return { kind: "armed", uid };
   }
 
-  if (shutdownRequested(ctx)) {
-    return coarseOnlyShutdownBeforeExclusiveOutcome(ctx, ops, uid);
-  }
-
   // S5-6: the exclusive-egress arming stage. Runs ONLY after the coarse
   // stages proved live (wall armed + as-uid egress verified) and only over a
   // PARKED harness (asserted at install). Every failure inside the stage is
   // handled by the stage itself (degrade-loud coarse fallback / parked), so
   // the mapping here is 1:1 outcome translation -- no failure path can fall
   // through to a green "armed".
-  reportShutdownStatus(ctx, {
-    stage: "exclusive-egress-arm",
-    residualState:
-      "coarse Castle Wall is verified, the harness may be parked, and exclusive-egress bring-up or release may be in progress",
-    recoveryCommand: EGRESS_GATE_REPAIR_WITH_STAND_DOWN_COMMAND,
-  });
   ops.print("Coarse stages live; arming the exclusive-egress gate (fine-grained mode).");
   const exclusive = await runExclusiveEgressArming({ agentUid: uid }, ops.exclusiveEgress!);
   if (exclusive.kind === "exclusive-armed") {

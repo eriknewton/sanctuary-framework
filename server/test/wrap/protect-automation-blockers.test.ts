@@ -3,12 +3,10 @@
  * (drill record 2026-07-26), fix 2 corrected 2026-07-27 (harden-loop):
  *
  *   1. SIGINT/SIGTERM handlers must exit after cleanups run, and a repeat
- *      signal (a plain listener suppresses Node's default "exit on signal"
- *      action) waits for cleanup, while a repeat signal escalates and exits
- *      promptly with residual-state guidance. Without the exit, `sanctuary
- *      protect` and the standalone dashboard survived a plain `kill` and
- *      drills needed `kill -9`; without escalation, a second signal could
- *      leave the operator staring at a 75s rollback wait.
+ *      non-provisioning signal must join the same cleanup instead of
+ *      abandoning audit flush / Castle Wall teardown. During account
+ *      provisioning only, the first signal is refused and the second forces
+ *      exit with an honest partial-state warning.
  *   2. CORRECTED 2026-07-27: a declined step-2 arm confirm must NOT exit
  *      the process. `declined-by-operator` is only ever returned when the
  *      run is interactive (a non-interactive run gets the distinct
@@ -39,28 +37,27 @@ import {
   it,
   vi,
 } from "vitest";
+import { spawn } from "node:child_process";
 import { cp, mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
-  AUTO_PROVISION_SHUTDOWN_DEADLINE_MS,
+  __resetProcessShutdownStateForTest,
   handleProcessShutdownSignal,
   registerProcessShutdownCleanup,
+  renderAutoProvisionForcedExitWarning,
+  renderAutoProvisionSignalRefusal,
   runWrap,
   type RunWrapDeps,
-  type WrapOptions,
 } from "../../src/wrap/cli.js";
-import { handleStandaloneShutdownSignal } from "../../src/dashboard-standalone.js";
-import type { AutoProvisionSummary } from "../../src/wrap/auto-provision.js";
-import type { DashboardHandle } from "../../src/dashboard/index.js";
 import {
-  runProvisionFlow,
-  type ProvisionFlowContext,
-  type ProvisionFlowOps,
-} from "../../src/castle-wall/provision/orchestrate.js";
-import type { RehomeStepResult } from "../../src/castle-wall/provision/rehome.js";
+  __registerStandaloneProcessCleanupForTest,
+  __resetStandaloneShutdownStateForTest,
+  handleStandaloneShutdownSignal,
+} from "../../src/dashboard-standalone.js";
+import type { AutoProvisionSummary } from "../../src/wrap/auto-provision.js";
 import {
   agreeingHermesParity,
   installHermesParityHook,
@@ -69,15 +66,7 @@ import {
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const fixturesDir = join(__dirname, "..", "harness", "fixtures");
-const SIGNAL_TEST_UID = 503;
-const SIGNAL_TEST_REHOME_RESULTS: RehomeStepResult[] = [
-  {
-    entry: { sourcePath: "/Users/operator/.hermes/.env", destRelativePath: ".hermes/.env", isSecret: true },
-    destPath: "/var/sanctuary-agents/sanctuary-hermes/.hermes/.env",
-    status: "moved",
-    backupPath: "/root/backup/.hermes/.env.bak",
-  },
-];
+const wrapCliModuleUrl = pathToFileURL(join(__dirname, "..", "..", "src", "wrap", "cli.ts")).href;
 
 function sleepMs(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -91,106 +80,32 @@ function deferred<T = void>(): { promise: Promise<T>; resolve: (value: T) => voi
   return { promise, resolve };
 }
 
-function signalProvisionCtx(
-  shutdownSignal: AbortSignal | undefined,
-  onShutdownStatus: ((status: unknown) => void) | undefined,
-): ProvisionFlowContext {
-  return {
-    agentId: "hermes",
-    accountName: "sanctuary-hermes",
-    ceiling: 500,
-    detectResult: { needsProvisioning: true, alreadyDedicated: false, reason: "shared account" },
-    isTty: true,
-    fortressPath: "/Users/operator/.sanctuary",
-    harnessEndpoints: {
-      harnessId: "hermes",
-      endpoints: [
-        {
-          name: "LLM (Venice)",
-          host: "api.venice.ai",
-          port: 443,
-          protocol: "tcp",
-          riskClass: "standard",
-        },
-      ],
-    },
-    shutdownSignal,
-    onShutdownStatus,
-  } as ProvisionFlowContext & {
-    shutdownSignal?: AbortSignal;
-    onShutdownStatus?: (status: unknown) => void;
-  };
-}
-
-function signalProvisionOps(overrides: Partial<ProvisionFlowOps> = {}): ProvisionFlowOps {
-  return {
-    confirm: vi.fn(async () => true),
-    print: vi.fn(),
-    createAccount: vi.fn(async () => ({
-      plan: { action: "create", accountName: "sanctuary-hermes", uid: SIGNAL_TEST_UID },
-      uid: SIGNAL_TEST_UID,
-    })),
-    rehome: vi.fn(async () => ({
-      plan: { harnessId: "hermes", steps: [], requiresInteractiveReconsent: false },
-      results: SIGNAL_TEST_REHOME_RESULTS,
-    })),
-    installHarnessDaemon: vi.fn(async () => ({ ok: true as const, bootstrappedThisRun: true })),
-    restoreStoodDownHarness: vi.fn(async () => ({
-      restored: true,
-      wasRunning: true,
-      harnessRestarted: true,
-      problems: [],
-    })),
-    uninstallHarnessDaemon: vi.fn(async () => undefined),
-    ensurePolicyDaemon: vi.fn(async () => ({ ok: true as const, freshlyInstalled: false })),
-    teardownPolicyDaemon: vi.fn(async () => undefined),
-    provisionEgress: vi.fn(async () => ({
-      ok: true as const,
-      ruleIds: ["provisioned-hermes-abc123def456"],
-      checks: [{ name: "LLM (Venice)", host: "api.venice.ai", port: 443, allowed: true }],
-      dnsRulePresent: true,
-    })),
-    restoreProvisionedEgressToPreRunState: vi.fn(async () => ({
-      restored: true,
-      reloadOk: true,
-      problems: [],
-    })),
-    verifyAgentEgressAfterArm: vi.fn(async () => ({
-      ok: true,
-      rows: [
-        {
-          name: "LLM (Venice)",
-          host: "api.venice.ai",
-          port: 443,
-          expected: "reachable" as const,
-          observed: "reachable" as const,
-          pass: true,
-        },
-      ],
-    })),
-    auditEgress: vi.fn(async () => undefined),
-    preArmEndpoints: vi.fn(() => [{ name: "LLM", probe: async () => true }]),
-    checkUidExistence: vi.fn(async () => ({ ok: true, accountName: "sanctuary-hermes", uid: SIGNAL_TEST_UID })),
-    arm: vi.fn(async () => ({ ok: true as const })),
-    postArmEndpoints: vi.fn(() => [{ name: "LLM", probe: async () => true }]),
-    disarm: vi.fn(async () => ({ nePreferenceOutcome: "corroborated_off" as const })),
-    restoreRehome: vi.fn(async () => ({
-      fullyRestored: true,
-      restoredCount: SIGNAL_TEST_REHOME_RESULTS.length,
-      attemptedCount: SIGNAL_TEST_REHOME_RESULTS.length,
-      backupPaths: SIGNAL_TEST_REHOME_RESULTS.filter((r) => r.backupPath).map((r) => r.backupPath!),
-      conflictPaths: [],
-      failedPaths: [],
-    })),
-    reconcileExclusiveRoutingResidue: vi.fn(async () => ({ kind: "clear" as const })),
-    lookupDedicatedAccountUid: vi.fn(async () => undefined),
-    observeAgentConfinement: vi.fn(async () => ({
-      known: true as const,
-      confinedUids: [],
-      exclusiveRoutingMarkerPresent: false,
-    })),
-    ...overrides,
-  };
+async function runNodeSignalScript(script: string): Promise<{
+  code: number | null;
+  signal: NodeJS.Signals | null;
+  stdout: string;
+  stderr: string;
+}> {
+  const child = spawn(process.execPath, ["--import", "tsx", "--input-type=module", "-e", script], {
+    cwd: join(__dirname, "..", ".."),
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => {
+    stdout += chunk;
+  });
+  child.stderr.on("data", (chunk) => {
+    stderr += chunk;
+  });
+  return new Promise((resolve, reject) => {
+    child.on("error", reject);
+    child.on("close", (code, signal) => {
+      resolve({ code, signal, stdout, stderr });
+    });
+  });
 }
 
 // ── Fix 1: signal handlers must exit ─────────────────────────────────────
@@ -205,6 +120,7 @@ describe("handleProcessShutdownSignal (wrap/cli.ts) exits after cleanups", () =>
   });
 
   afterEach(() => {
+    __resetProcessShutdownStateForTest();
     exitSpy.mockRestore();
   });
 
@@ -233,7 +149,34 @@ describe("handleProcessShutdownSignal (wrap/cli.ts) exits after cleanups", () =>
     expect(exitSpy).toHaveBeenCalledWith(143);
   });
 
-  it("R4: a repeat signal while cleanup is in flight escalates to immediate exit", async () => {
+  it("an isolated real SIGTERM outside the provisioning window awaits registered cleanups before exit", async () => {
+    const result = await runNodeSignalScript(`
+      const {
+        installProcessShutdownListeners,
+        registerProcessShutdownCleanup,
+      } = await import(${JSON.stringify(wrapCliModuleUrl)});
+      installProcessShutdownListeners();
+      registerProcessShutdownCleanup(async () => {
+        console.log("cleanup-started");
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        console.log("cleanup-finished");
+      });
+      process.kill(process.pid, "SIGTERM");
+      setTimeout(() => {
+        console.log("watchdog-timeout");
+        process.exit(99);
+      }, 1000);
+    `);
+
+    // Fails if the refuse-then-force provisioning rule is applied globally:
+    // the child exits before the async cleanup reaches its second print.
+    expect(result.code).toBe(143);
+    expect(result.stdout).toContain("cleanup-started");
+    expect(result.stdout).toContain("cleanup-finished");
+    expect(result.stdout).not.toContain("watchdog-timeout");
+  });
+
+  it("repeat non-provisioning signals still await the same in-flight cleanup before exit", async () => {
     const cleanupEntered = deferred<void>();
     const finishCleanup = deferred<void>();
     let cleanupSettled = false;
@@ -247,18 +190,21 @@ describe("handleProcessShutdownSignal (wrap/cli.ts) exits after cleanups", () =>
     try {
       const first = handleProcessShutdownSignal("SIGTERM");
       await cleanupEntered.promise;
-      await handleProcessShutdownSignal("SIGINT");
+      const second = handleProcessShutdownSignal("SIGINT");
+      await sleepMs(25);
 
-      // Fails with the R4 fix reverted: the second signal awaited the first
-      // cleanup promise, so this assertion would not run until finishCleanup.
+      // Fails if the provisioning-only force-exit rule leaks into the normal
+      // cleanup path: the second signal exits immediately and abandons the
+      // audit flush / Castle Wall teardown represented by finishCleanup.
       expect(cleanupSettled).toBe(false);
-      expect(exitSpy).toHaveBeenCalledWith(130);
-      expect(stderrSpy.mock.calls.flat().join("\n")).toMatch(/cleanup is still in flight/);
+      expect(exitSpy).not.toHaveBeenCalled();
+      expect(stderrSpy).not.toHaveBeenCalled();
 
       finishCleanup.resolve();
-      await first;
+      await Promise.all([first, second]);
       expect(cleanupSettled).toBe(true);
       expect(exitSpy).toHaveBeenCalledWith(143);
+      expect(exitSpy).toHaveBeenCalledTimes(1);
     } finally {
       finishCleanup.resolve();
       stderrSpy.mockRestore();
@@ -298,7 +244,7 @@ describe("handleProcessShutdownSignal (wrap/cli.ts) exits after cleanups", () =>
   });
 });
 
-describe("runWrap: SIGTERM during in-flight provisioning waits for rollback or a bounded deadline", () => {
+describe("runWrap: signals during in-flight provisioning refuse once, then force exit", () => {
   let tmpHome: string;
   let originalHome: string | undefined;
   let originalStoragePath: string | undefined;
@@ -325,6 +271,7 @@ describe("runWrap: SIGTERM during in-flight provisioning waits for rollback or a
   });
 
   afterEach(async () => {
+    __resetProcessShutdownStateForTest();
     stderrSpy.mockRestore();
     exitSpy.mockRestore();
     clearHermesParityHook();
@@ -352,212 +299,259 @@ describe("runWrap: SIGTERM during in-flight provisioning waits for rollback or a
     };
   }
 
-  it("R4: pins the first-signal rollback-completeness budget at 75 seconds", () => {
-    // Fails if the R4 constant changes without updating the declared worst case.
-    expect(AUTO_PROVISION_SHUTDOWN_DEADLINE_MS).toBe(75_000);
+  function neverSettlingProvisionRunner(): {
+    entered: Promise<void>;
+    finish: () => void;
+    mutationStarted: () => boolean;
+    runAutoProvisionForWrap: RunWrapDeps["runAutoProvisionForWrap"];
+  } {
+    const entered = deferred<void>();
+    const finishProvision = deferred<void>();
+    let finished = false;
+    let started = false;
+    return {
+      entered: entered.promise,
+      finish: () => {
+        if (finished) return;
+        finished = true;
+        finishProvision.resolve();
+      },
+      mutationStarted: () => started,
+      runAutoProvisionForWrap: vi.fn(async (options): Promise<AutoProvisionSummary> => {
+        const opened = (await options.beforeFirstMutation?.()) ?? true;
+        if (!opened) {
+          return {
+            ran: true,
+            outcome: {
+              kind: "aborted",
+              stage: "shutdown-in-flight",
+              reason:
+                "shutdown was already in flight before the first provisioning mutation; no account, re-home, or Castle Wall changes were made by provisioning.",
+              rolledBack: false,
+              rehomeAttempted: false,
+            },
+          };
+        }
+        started = true;
+        entered.resolve();
+        await finishProvision.promise;
+        return { ran: true, outcome: { kind: "armed", uid: 503 } };
+      }),
+    };
+  }
+
+  it("a first SIGTERM during runWrap provisioning is refused, then honored after provisioning closes", async () => {
+    const provision = neverSettlingProvisionRunner();
+    const runPromise = runWrap(
+      { hermes: true, noOpen: true, noDashboard: true },
+      deps({ runAutoProvisionForWrap: provision.runAutoProvisionForWrap }),
+    );
+
+    try {
+      await provision.entered;
+      await handleProcessShutdownSignal("SIGTERM");
+      await sleepMs(25);
+
+      // Fails when reverted to the rollback-coordination design: the first
+      // signal starts shutdown cleanup and exits instead of refusing.
+      expect(exitSpy).not.toHaveBeenCalled();
+      expect(stderrSpy.mock.calls.flat().join("\n")).toContain(
+        renderAutoProvisionSignalRefusal("SIGTERM"),
+      );
+
+      provision.finish();
+      await runPromise;
+      expect(exitSpy).toHaveBeenCalledWith(143);
+    } finally {
+      provision.finish();
+      await runPromise.catch(() => undefined);
+    }
   });
 
-  it("a real SIGTERM while provision-egress is in flight waits for runProvisionFlow's egress restore before exit", async () => {
-    const provisionEntered = deferred<void>();
-    const finishProvision = deferred<void>();
-    let released = false;
-    const releaseProvision = () => {
-      if (released) return;
-      released = true;
-      finishProvision.resolve();
-    };
-    const restoreProvisionedEgressToPreRunState = vi.fn(async () => ({
-      restored: true,
-      reloadOk: true,
-      problems: [],
-    }));
-    const ops = signalProvisionOps({
-      provisionEgress: vi.fn(async () => {
-        provisionEntered.resolve();
-        await finishProvision.promise;
-        return {
-          ok: true as const,
-          ruleIds: ["provisioned-hermes-abc123def456"],
-          checks: [{ name: "LLM (Venice)", host: "api.venice.ai", port: 443, allowed: true }],
-          dnsRulePresent: true,
-        };
-      }),
-      restoreProvisionedEgressToPreRunState,
-    });
-    const runAutoProvisionForWrap = vi.fn(async (input: unknown): Promise<AutoProvisionSummary> => {
-      const provisionInput = input as {
-        shutdownSignal?: AbortSignal;
-        onShutdownStatus?: (status: unknown) => void;
-      };
-      const outcome = await runProvisionFlow(
-        signalProvisionCtx(provisionInput.shutdownSignal, provisionInput.onShutdownStatus),
-        ops,
-      );
-      return { ran: true, outcome };
-    });
+  it("a second SIGTERM during provisioning exits promptly without waiting for provisioning", async () => {
+    const provision = neverSettlingProvisionRunner();
+    const runPromise = runWrap(
+      { hermes: true, noOpen: true, noDashboard: true },
+      deps({ runAutoProvisionForWrap: provision.runAutoProvisionForWrap }),
+    ).catch(() => undefined);
 
+    try {
+      await provision.entered;
+      await handleProcessShutdownSignal("SIGTERM");
+      await vi.waitFor(() =>
+        expect(stderrSpy.mock.calls.flat().join("\n")).toContain(
+          renderAutoProvisionSignalRefusal("SIGTERM"),
+        ),
+      );
+
+      await handleProcessShutdownSignal("SIGTERM");
+      await vi.waitFor(() => expect(exitSpy).toHaveBeenCalledWith(143), { timeout: 250 });
+
+      // Fails if the non-provisioning latch is reused here: the second signal
+      // waits for the never-settling provisioning promise and does not exit.
+      expect(stderrSpy.mock.calls.flat().join("\n")).toContain(
+        renderAutoProvisionForcedExitWarning("SIGTERM"),
+      );
+    } finally {
+      provision.finish();
+      await runPromise;
+    }
+  });
+
+  it("a SIGTERM before the first provisioning mutation takes the normal shutdown path, not the partial-state refusal", async () => {
+    const preMutationEntered = deferred<void>();
+    const finishRunner = deferred<void>();
+    const runAutoProvisionForWrap = vi.fn(async (): Promise<AutoProvisionSummary> => {
+      preMutationEntered.resolve();
+      await finishRunner.promise;
+      return { ran: true };
+    });
     const runPromise = runWrap(
       { hermes: true, noOpen: true, noDashboard: true },
       deps({ runAutoProvisionForWrap }),
     );
 
     try {
-      await provisionEntered.promise;
-      process.kill(process.pid, "SIGTERM");
-      await sleepMs(25);
-      expect(exitSpy).not.toHaveBeenCalled();
+      await preMutationEntered.promise;
+      await handleProcessShutdownSignal("SIGTERM");
 
-      releaseProvision();
+      expect(exitSpy).toHaveBeenCalledWith(143);
+      expect(stderrSpy.mock.calls.flat().join("\n")).not.toContain(
+        "half-provisioned",
+      );
+      expect(stderrSpy.mock.calls.flat().join("\n")).not.toContain(
+        "account provisioning is mid-flight",
+      );
+    } finally {
+      finishRunner.resolve();
+      await runPromise.catch(() => undefined);
+    }
+  });
+
+  it("the forced-exit warning is honest about residual state and never claims rollback restored anything", async () => {
+    const warning = renderAutoProvisionForcedExitWarning("SIGTERM");
+
+    expect(warning).toContain("rollback did NOT run");
+    expect(warning).toContain("machine may be in a partial state");
+    expect(warning).toContain("audit trail may be incomplete");
+    expect(warning).toContain("Castle Wall teardown did not run");
+    expect(warning).toContain("filter_stopped close record may be missing");
+    expect(warning).toContain("sudo sanctuary protect --hermes --provision-agent-account");
+    expect(warning).toContain("sudo sanctuary castle-wall disable");
+    expect(warning).not.toMatch(/fast-disarmed|rollback ran|rollback was observed|restored/i);
+  });
+
+  it("exclusive-egress signal recovery names the repair verb and stand-down acknowledgement", () => {
+    const warning = renderAutoProvisionForcedExitWarning("SIGTERM", { exclusiveEgress: true });
+
+    expect(warning).toContain("sudo sanctuary protect --repair-egress-gate --stand-down-agent");
+    expect(warning).toContain("sudo sanctuary castle-wall disable");
+    expect(warning).not.toContain("sudo sanctuary protect --hermes --provision-agent-account");
+  });
+
+  it("an isolated real kill during provisioning is deferred and exits after provisioning closes", async () => {
+    const result = await runNodeSignalScript(`
+      const {
+        runWrap,
+      } = await import(${JSON.stringify(wrapCliModuleUrl)});
+      const { mkdir, cp, mkdtemp } = await import("node:fs/promises");
+      const { tmpdir } = await import("node:os");
+      const { join } = await import("node:path");
+      const tmpHome = await mkdtemp(join(tmpdir(), "sanctuary-real-deferred-signal-"));
+      process.env.HOME = tmpHome;
+      process.env.SANCTUARY_STORAGE_PATH = join(tmpHome, ".sanctuary");
+      Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
+      const hermesDir = join(tmpHome, ".hermes");
+      await mkdir(hermesDir, { recursive: true });
+      await cp(${JSON.stringify(join(fixturesDir, "hermes.json"))}, join(hermesDir, "cli-config.json"));
+      const runPromise = runWrap(
+        { hermes: true, noOpen: true, noDashboard: true },
+        {
+          startDashboard: async () => { throw new Error("dashboard should not start"); },
+          openBrowser: async () => {},
+          resolvePassphrase: async () => ({ value: "test-passphrase", location: "test-keychain", source: "generated" }),
+          runAutoProvisionForWrap: async (options) => {
+            if (!await options.beforeFirstMutation()) {
+              console.log("mutation-blocked");
+              return { ran: true };
+            }
+            console.log("mutation-entered");
+            process.kill(process.pid, "SIGTERM");
+            await new Promise((resolve) => setTimeout(resolve, 30));
+            console.log("provisioning-finished");
+            return { ran: true, outcome: { kind: "armed", uid: 503 } };
+          },
+        },
+      );
+      setTimeout(() => process.exit(99), 10_000);
       await runPromise;
-      await vi.waitFor(() => expect(exitSpy).toHaveBeenCalledWith(143));
+    `);
 
-      expect(restoreProvisionedEgressToPreRunState).toHaveBeenCalledTimes(1);
-      expect(ops.arm).not.toHaveBeenCalled();
-      const restoreOrder = restoreProvisionedEgressToPreRunState.mock.invocationCallOrder[0];
-      const exitOrder = exitSpy.mock.invocationCallOrder[0];
-      expect(restoreOrder).toBeLessThan(exitOrder);
-    } finally {
-      releaseProvision();
-      await Promise.race([runPromise.catch(() => undefined), sleepMs(50)]);
-    }
+    expect(result.code).toBe(143);
+    expect(result.stdout).toContain("mutation-entered");
+    expect(result.stdout).toContain("provisioning-finished");
+    expect(result.stderr).toContain(renderAutoProvisionSignalRefusal("SIGTERM"));
   });
 
-  it("a hung rollback is bounded and the shutdown message names the residual state plus recovery verb", async () => {
-    const provisionEntered = deferred<void>();
-    const finishProvisionEgress = deferred<void>();
-    const rollbackEntered = deferred<void>();
-    const finishRollback = deferred<{ restored: true; reloadOk: true; problems: [] }>();
-    let released = false;
-    const releaseProvision = () => {
-      if (released) return;
-      released = true;
-      finishRollback.resolve({ restored: true, reloadOk: true, problems: [] });
-    };
-    const ops = signalProvisionOps({
-      provisionEgress: vi.fn(async () => {
-        provisionEntered.resolve();
-        await finishProvisionEgress.promise;
-        return {
-          ok: true as const,
-          ruleIds: ["provisioned-hermes-abc123def456"],
-          checks: [{ name: "LLM (Venice)", host: "api.venice.ai", port: 443, allowed: true }],
-          dnsRulePresent: true,
-        };
-      }),
-      restoreProvisionedEgressToPreRunState: vi.fn(async () => {
-        rollbackEntered.resolve();
-        return finishRollback.promise;
-      }),
-    });
-    const runAutoProvisionForWrap = vi.fn(async (input: unknown): Promise<AutoProvisionSummary> => {
-      const provisionInput = input as {
-        shutdownSignal?: AbortSignal;
-        onShutdownStatus?: (status: unknown) => void;
-      };
-      const outcome = await runProvisionFlow(
-        signalProvisionCtx(provisionInput.shutdownSignal, provisionInput.onShutdownStatus),
-        ops,
-      );
-      return { ran: true, outcome };
-    });
+  it("an isolated real second SIGTERM during provisioning exits promptly", async () => {
+    const result = await runNodeSignalScript(`
+      const {
+        __setAutoProvisionMutationInFlightForTest,
+        installProcessShutdownListeners,
+      } = await import(${JSON.stringify(wrapCliModuleUrl)});
+      process.env.NODE_ENV = "test";
+      installProcessShutdownListeners();
+      __setAutoProvisionMutationInFlightForTest({ inFlight: true });
+      process.kill(process.pid, "SIGTERM");
+      setTimeout(() => {
+        console.log("sending-second");
+        process.kill(process.pid, "SIGTERM");
+      }, 30);
+      setTimeout(() => process.exit(99), 1000);
+    `);
 
-    const runPromise = runWrap(
-      { hermes: true, noOpen: true, noDashboard: true },
-      {
-        ...deps({ runAutoProvisionForWrap }),
-        autoProvisionShutdownDeadlineMs: 5,
-      } as RunWrapDeps & { autoProvisionShutdownDeadlineMs: number },
-    ).catch(() => undefined);
-
-    try {
-      await vi.waitFor(() => expect(runAutoProvisionForWrap).toHaveBeenCalledTimes(1), { timeout: 5000 });
-      await provisionEntered.promise;
-      const shutdownPromise = handleProcessShutdownSignal("SIGTERM");
-      finishProvisionEgress.resolve();
-      await rollbackEntered.promise;
-      await vi.waitFor(() => expect(exitSpy).toHaveBeenCalledWith(143), { timeout: 250 });
-      await shutdownPromise;
-
-      const printed = stderrSpy.mock.calls.flat().join("\n");
-      expect(printed).toMatch(/rollback was NOT observed/i);
-      expect(printed).toMatch(/rollback-shutdown-after-provision-egress/);
-      expect(printed).toMatch(/shutdown rollback is in flight/);
-      expect(printed).toMatch(/re-homed files may be mid-restore/);
-      expect(printed).toMatch(/sudo sanctuary protect --hermes/);
-    } finally {
-      finishProvisionEgress.resolve();
-      releaseProvision();
-      await Promise.race([runPromise, sleepMs(50)]);
-    }
+    // Fails if the provisioning repeat signal joins cleanup or waits for the
+    // still-in-flight provisioning work instead of forcing exit.
+    expect(result.code).toBe(143);
+    expect(result.stdout).toContain("sending-second");
+    expect(result.stderr).toContain(renderAutoProvisionSignalRefusal("SIGTERM"));
+    expect(result.stderr).toContain(renderAutoProvisionForcedExitWarning("SIGTERM"));
   });
 
-  it("R4: a second signal abandons the auto-provision wait and reports current residual state", async () => {
-    const provisionEntered = deferred<void>();
-    const finishProvisionEgress = deferred<void>();
-    const rollbackEntered = deferred<void>();
-    const finishRollback = deferred<{ restored: true; reloadOk: true; problems: [] }>();
-    let released = false;
-    const releaseProvision = () => {
-      if (released) return;
-      released = true;
-      finishRollback.resolve({ restored: true, reloadOk: true, problems: [] });
-    };
-    const ops = signalProvisionOps({
-      provisionEgress: vi.fn(async () => {
-        provisionEntered.resolve();
-        await finishProvisionEgress.promise;
-        return {
-          ok: true as const,
-          ruleIds: ["provisioned-hermes-abc123def456"],
-          checks: [{ name: "LLM (Venice)", host: "api.venice.ai", port: 443, allowed: true }],
-          dnsRulePresent: true,
-        };
-      }),
-      restoreProvisionedEgressToPreRunState: vi.fn(async () => {
-        rollbackEntered.resolve();
-        return finishRollback.promise;
-      }),
+  it("shutdown already in flight prevents the provisioning mutation window from opening", async () => {
+    const cleanupEntered = deferred<void>();
+    const finishCleanup = deferred<void>();
+    registerProcessShutdownCleanup(async () => {
+      cleanupEntered.resolve();
+      await finishCleanup.promise;
     });
-    const runAutoProvisionForWrap = vi.fn(async (input: unknown): Promise<AutoProvisionSummary> => {
-      const provisionInput = input as {
-        shutdownSignal?: AbortSignal;
-        onShutdownStatus?: (status: unknown) => void;
-      };
-      const outcome = await runProvisionFlow(
-        signalProvisionCtx(provisionInput.shutdownSignal, provisionInput.onShutdownStatus),
-        ops,
-      );
-      return { ran: true, outcome };
-    });
+    const shutdownPromise = handleProcessShutdownSignal("SIGTERM");
+    await cleanupEntered.promise;
 
+    const provision = neverSettlingProvisionRunner();
     const runPromise = runWrap(
       { hermes: true, noOpen: true, noDashboard: true },
-      deps({ runAutoProvisionForWrap }),
-    ).catch(() => undefined);
+      deps({ runAutoProvisionForWrap: provision.runAutoProvisionForWrap }),
+    );
 
     try {
-      await vi.waitFor(() => expect(runAutoProvisionForWrap).toHaveBeenCalledTimes(1), { timeout: 5000 });
-      await provisionEntered.promise;
-      const first = handleProcessShutdownSignal("SIGTERM");
-      finishProvisionEgress.resolve();
-      await rollbackEntered.promise;
-      await handleProcessShutdownSignal("SIGINT");
+      await vi.waitFor(() => expect(provision.runAutoProvisionForWrap).toHaveBeenCalled(), {
+        timeout: 10_000,
+      });
+      expect(exitSpy).not.toHaveBeenCalled();
+      expect(stderrSpy.mock.calls.flat().join("\n")).toContain(
+        "automatic account provisioning did not start because shutdown is already in flight",
+      );
+      expect(provision.mutationStarted()).toBe(false);
 
-      // Fails with the R4 fix reverted: the second signal joined the 75s
-      // rollback wait and never printed the residual state immediately.
-      expect(exitSpy).toHaveBeenCalledWith(130);
-      const printed = stderrSpy.mock.calls.flat().join("\n");
-      expect(printed).toMatch(/received SIGINT while shutdown cleanup is still in flight/i);
-      expect(printed).toMatch(/rollback-shutdown-after-provision-egress/);
-      expect(printed).toMatch(/shutdown rollback is in flight/);
-      expect(printed).toMatch(/sudo sanctuary protect --hermes/);
-
-      releaseProvision();
-      await first;
+      finishCleanup.resolve();
+      provision.finish();
+      await Promise.all([shutdownPromise, runPromise]);
+      expect(exitSpy).toHaveBeenCalledWith(143);
     } finally {
-      finishProvisionEgress.resolve();
-      releaseProvision();
-      await Promise.race([runPromise, sleepMs(50)]);
+      provision.finish();
+      finishCleanup.resolve();
+      await Promise.allSettled([shutdownPromise, runPromise]);
     }
   });
 });
@@ -572,6 +566,7 @@ describe("handleStandaloneShutdownSignal (dashboard-standalone.ts) exits after c
   });
 
   afterEach(() => {
+    __resetStandaloneShutdownStateForTest();
     exitSpy.mockRestore();
   });
 
@@ -597,6 +592,25 @@ describe("handleStandaloneShutdownSignal (dashboard-standalone.ts) exits after c
     await Promise.all([first, second]);
 
     expect(exitSpy).toHaveBeenCalledTimes(1);
+    expect(exitSpy).toHaveBeenCalledWith(143);
+  });
+
+  it("a cleanup registered while standalone shutdown is draining is still awaited before exit", async () => {
+    let firstSettled = false;
+    let lateSettled = false;
+    __registerStandaloneProcessCleanupForTest(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      firstSettled = true;
+    });
+
+    const signalPromise = handleStandaloneShutdownSignal("SIGTERM");
+    __registerStandaloneProcessCleanupForTest(async () => {
+      lateSettled = true;
+    });
+    await signalPromise;
+
+    expect(firstSettled).toBe(true);
+    expect(lateSettled).toBe(true);
     expect(exitSpy).toHaveBeenCalledWith(143);
   });
 });

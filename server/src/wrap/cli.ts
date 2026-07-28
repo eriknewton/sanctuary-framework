@@ -82,14 +82,12 @@ import {
 import { startDashboard, type DashboardHandle } from "../dashboard/index.js";
 import { buildWrapFleetRosterProvider } from "./fleet-roster-provider.js";
 import {
-  LAUNCHCTL_TIMEOUT_MS,
   runAutoProvisionForWrap,
   type AutoProvisionSummary,
 } from "./auto-provision.js";
 import type {
   DisarmNePreferenceOutcome,
   ProvisionFlowOutcome,
-  ProvisionFlowShutdownStatus,
 } from "../castle-wall/provision/index.js";
 import { ProvisionLockHeldError } from "../castle-wall/provision/index.js";
 import { harnessDispositionSentence } from "../egress-gate/parked-claim.js";
@@ -172,16 +170,77 @@ import {
 import type { UpstreamServer, SovereigntyProfile } from "../sovereignty-profile.js";
 import { runProvisionPin } from "../cli/castle-wall.js";
 
-type ProcessShutdownCleanup = (signal?: NodeJS.Signals) => void | Promise<void>;
+type ProcessShutdownCleanup = () => void | Promise<void>;
 
 const processShutdownCleanups = new Set<ProcessShutdownCleanup>();
-const processShutdownEscalationReporters = new Set<() => ProvisionFlowShutdownStatus>();
 let processShutdownListenersInstalled = false;
+let autoProvisionMutationInFlight = false;
+let autoProvisionSignalRefusedOnce = false;
+let autoProvisionPendingShutdownSignal: NodeJS.Signals | undefined;
+let pendingAutoProvisionWasExclusiveEgress = false;
+let processShutdownRequestedSignal: NodeJS.Signals | undefined;
 
-function printShutdownEscalationWarning(line: string): void {
-  // SAFETY: stderr is the operator-facing signal-shutdown channel; this prints
-  // fixed residual-state metadata and recovery guidance, never secrets.
-  console.error(line);
+const AUTO_PROVISION_SIGNAL_RECOVERY_COMMAND =
+  "sudo sanctuary protect --hermes --provision-agent-account";
+
+function autoProvisionSignalRecoveryCommand(input?: { exclusiveEgress?: boolean }): string {
+  return input?.exclusiveEgress === true
+    ? EGRESS_GATE_REPAIR_WITH_STAND_DOWN_COMMAND
+    : AUTO_PROVISION_SIGNAL_RECOVERY_COMMAND;
+}
+
+export function renderAutoProvisionSignalRefusal(
+  signal: NodeJS.Signals,
+  input?: { exclusiveEgress?: boolean },
+): string {
+  return (
+    `  WARNING: received ${signal} while account provisioning is mid-flight. ` +
+    "Exiting now could leave this machine half-provisioned, so this shutdown request will be honored after provisioning closes. " +
+    "Press Ctrl-C again (or send the signal again) to exit immediately anyway. " +
+    `If manual recovery is needed, run: ${autoProvisionSignalRecoveryCommand(input)}. ` +
+    "Before re-running, check whether Castle Wall is armed and run 'sudo sanctuary castle-wall disable' if it is enforcing over a half-provisioned agent."
+  );
+}
+
+export function renderAutoProvisionForcedExitWarning(
+  signal: NodeJS.Signals,
+  input?: { exclusiveEgress?: boolean },
+): string {
+  return (
+    `  WARNING: received ${signal} again while account provisioning is still mid-flight; exiting now. ` +
+    "Provisioning was interrupted mid-flight, its rollback did NOT run, and the machine may be in a partial state. " +
+    "The audit trail may be incomplete, shutdown audit flush was abandoned, Castle Wall teardown did not run, and the filter_stopped close record may be missing. " +
+    `Recover with: ${autoProvisionSignalRecoveryCommand(input)}. ` +
+    "Before re-running, check whether Castle Wall is armed and run 'sudo sanctuary castle-wall disable' if it is enforcing over a half-provisioned agent."
+  );
+}
+
+export function __setAutoProvisionMutationInFlightForTest(input: {
+  inFlight: boolean;
+  refusedOnce?: boolean;
+  pendingShutdownSignal?: NodeJS.Signals;
+}): void {
+  assertWrapCliTestHookAllowed("__setAutoProvisionMutationInFlightForTest");
+  autoProvisionMutationInFlight = input.inFlight;
+  autoProvisionSignalRefusedOnce = input.refusedOnce ?? false;
+  autoProvisionPendingShutdownSignal = input.pendingShutdownSignal;
+  pendingAutoProvisionWasExclusiveEgress = false;
+}
+
+export function __resetProcessShutdownStateForTest(): void {
+  assertWrapCliTestHookAllowed("__resetProcessShutdownStateForTest");
+  autoProvisionMutationInFlight = false;
+  autoProvisionSignalRefusedOnce = false;
+  autoProvisionPendingShutdownSignal = undefined;
+  pendingAutoProvisionWasExclusiveEgress = false;
+  processShutdownInFlight = undefined;
+  processShutdownRequestedSignal = undefined;
+  processShutdownCleanups.clear();
+}
+
+function assertWrapCliTestHookAllowed(name: string): void {
+  if (process.env.NODE_ENV === "test" || process.env.VITEST !== undefined) return;
+  throw new Error(`${name} is test-only and is disabled outside the test runner.`);
 }
 
 // FIX (N1-1 corrected, 2026-07-27): every registered cleanup starts an async
@@ -208,14 +267,13 @@ function printShutdownEscalationWarning(line: string): void {
 // abandoned at its first `await`. Loop until the set is observed empty so
 // any cleanup registered while a previous batch was draining gets picked up
 // by the next iteration instead of orphaned.
-async function runProcessShutdownCleanups(signal?: NodeJS.Signals | number): Promise<void> {
-  const cleanupSignal = typeof signal === "string" ? signal : undefined;
+async function runProcessShutdownCleanups(): Promise<void> {
   while (processShutdownCleanups.size > 0) {
     const cleanups = [...processShutdownCleanups];
     processShutdownCleanups.clear();
     await Promise.allSettled(
       cleanups.map(async (cleanup) => {
-        await cleanup(cleanupSignal);
+        await cleanup();
       }),
     );
   }
@@ -235,49 +293,90 @@ const SIGNAL_EXIT_CODE: Partial<Record<NodeJS.Signals, number>> = {
   SIGTERM: 128 + 15,
 };
 
-// FIX (N1-1 second-signal, 2026-07-27; tightened 2026-07-28): `process.on`
-// (not `once`) means a repeat SIGINT/SIGTERM re-enters this handler while the
-// first call is mid-await. The first signal attempts graceful cleanup; a second
-// signal means the operator wants the process gone now, so it exits promptly
-// instead of joining a long rollback wait.
+// FIX (N1-1 second-signal, 2026-07-27): `process.on` (not `once`) means a
+// repeat SIGINT/SIGTERM re-enters this handler while the first call is
+// mid-await. Outside the provisioning mutation window, repeat signals join the
+// same cleanup promise so audit flush / Castle Wall teardown are not abandoned.
 let processShutdownInFlight: Promise<void> | undefined;
 
-/** Exported for the seam: unit-test the exit code without sending real signals. */
-export async function handleProcessShutdownSignal(
-  signal: NodeJS.Signals,
-): Promise<void> {
+export function installProcessShutdownListeners(): void {
+  if (processShutdownListenersInstalled) return;
+  processShutdownListenersInstalled = true;
+  process.on("SIGINT", handleProcessShutdownSignal);
+  process.on("SIGTERM", handleProcessShutdownSignal);
+  process.on("exit", runProcessShutdownCleanups);
+}
+
+async function runProcessShutdownForSignal(signal: NodeJS.Signals): Promise<void> {
+  processShutdownRequestedSignal ??= signal;
   if (processShutdownInFlight) {
-    const reports = [...processShutdownEscalationReporters].map((reporter) => {
-      try {
-        return reporter();
-      } catch {
-        return undefined;
-      }
-    }).filter((report): report is ProvisionFlowShutdownStatus => report !== undefined);
-    if (reports.length === 0) {
-      printShutdownEscalationWarning(
-        `  WARNING: received ${signal} while shutdown cleanup is still in flight; exiting now. ` +
-          "Some rollback work may still be incomplete. Re-run 'sudo sanctuary protect --hermes' before assuming recovery.",
-      );
-    } else {
-      for (const status of reports) {
-        printShutdownEscalationWarning(
-          `  WARNING: received ${signal} while shutdown cleanup is still in flight; exiting now. ` +
-            `Current stage: ${status.stage}. Residual state: ${status.residualState}. ` +
-            `Recover with: ${status.recoveryCommand}. Do not assume a clean rollback.`,
-        );
-      }
-    }
-    process.exit(SIGNAL_EXIT_CODE[signal] ?? 128);
+    await processShutdownInFlight;
     return;
   }
-  processShutdownInFlight = runProcessShutdownCleanups(signal);
+  processShutdownInFlight = runProcessShutdownCleanups();
   try {
     await processShutdownInFlight;
   } finally {
     processShutdownInFlight = undefined;
   }
   process.exit(SIGNAL_EXIT_CODE[signal] ?? 128);
+  processShutdownRequestedSignal = undefined;
+}
+
+async function closeAutoProvisionMutationWindow(): Promise<void> {
+  autoProvisionMutationInFlight = false;
+  autoProvisionSignalRefusedOnce = false;
+  pendingAutoProvisionWasExclusiveEgress = false;
+  const deferredSignal = autoProvisionPendingShutdownSignal;
+  autoProvisionPendingShutdownSignal = undefined;
+  if (deferredSignal !== undefined) {
+    await runProcessShutdownForSignal(deferredSignal);
+  }
+}
+
+function tryOpenAutoProvisionMutationWindow(options: WrapOptions): boolean {
+  if (processShutdownRequestedSignal !== undefined || processShutdownInFlight !== undefined) {
+    // SAFETY: stderr is the operator-facing CLI channel; this fixed text names
+    // only the lifecycle state and says no privileged provisioning mutation ran.
+    console.error(
+      `  Note: automatic account provisioning did not start because shutdown is already in flight ` +
+        `(${processShutdownRequestedSignal ?? "cleanup-drain"}). No account, re-home, or Castle Wall changes were made by provisioning.`,
+    );
+    return false;
+  }
+  autoProvisionMutationInFlight = true;
+  autoProvisionSignalRefusedOnce = false;
+  autoProvisionPendingShutdownSignal = undefined;
+  pendingAutoProvisionWasExclusiveEgress = options.exclusiveEgress === true;
+  return true;
+}
+
+/** Exported for the seam: unit-test the exit code without sending real signals. */
+export async function handleProcessShutdownSignal(
+  signal: NodeJS.Signals,
+): Promise<void> {
+  if (autoProvisionMutationInFlight) {
+    if (!autoProvisionSignalRefusedOnce) {
+      autoProvisionSignalRefusedOnce = true;
+      autoProvisionPendingShutdownSignal = signal;
+      // SAFETY: stderr is the operator-facing signal channel; this fixed text
+      // names only the signal and recovery command, never secrets.
+      console.error(renderAutoProvisionSignalRefusal(signal, {
+        exclusiveEgress: pendingAutoProvisionWasExclusiveEgress,
+      }));
+      return;
+    }
+    // SAFETY: stderr is the operator-facing signal channel; this fixed text
+    // names only the signal and recovery command, never secrets.
+    console.error(renderAutoProvisionForcedExitWarning(signal, {
+      exclusiveEgress: pendingAutoProvisionWasExclusiveEgress,
+    }));
+    autoProvisionPendingShutdownSignal = undefined;
+    process.exit(SIGNAL_EXIT_CODE[signal] ?? 128);
+    return;
+  }
+  autoProvisionSignalRefusedOnce = false;
+  await runProcessShutdownForSignal(signal);
 }
 
 /** Exported for the seam: unit-test that a registered cleanup is awaited. */
@@ -285,88 +384,9 @@ export function registerProcessShutdownCleanup(
   cleanup: ProcessShutdownCleanup,
 ): () => void {
   processShutdownCleanups.add(cleanup);
-  if (!processShutdownListenersInstalled) {
-    processShutdownListenersInstalled = true;
-    process.on("SIGINT", handleProcessShutdownSignal);
-    process.on("SIGTERM", handleProcessShutdownSignal);
-    process.on("exit", runProcessShutdownCleanups);
-  }
   return () => {
     processShutdownCleanups.delete(cleanup);
   };
-}
-
-const AUTO_PROVISION_SHUTDOWN_LAUNCHCTL_OPERATION_SLOTS = 3;
-const AUTO_PROVISION_SHUTDOWN_RESTORE_OPERATION_SLOTS = 2;
-/**
- * Signal shutdown waits for in-flight provisioning rollback across the host
- * operations it can actually await: harness daemon bootout, policy daemon
- * teardown, egress daemon reload, re-home file restore, and stood-down harness
- * restore. First signal worst case is 75s; a second SIGINT/SIGTERM escalates
- * and exits promptly with the latest residual-state warning instead of waiting
- * for this budget. Each slot is anchored to the existing launchctl
- * host-operation budget rather than a new standalone timeout.
- */
-export const AUTO_PROVISION_SHUTDOWN_DEADLINE_MS =
-  LAUNCHCTL_TIMEOUT_MS *
-  (AUTO_PROVISION_SHUTDOWN_LAUNCHCTL_OPERATION_SLOTS +
-    AUTO_PROVISION_SHUTDOWN_RESTORE_OPERATION_SLOTS);
-
-const DEFAULT_AUTO_PROVISION_SHUTDOWN_STATUS: ProvisionFlowShutdownStatus = {
-  stage: "auto-provision",
-  residualState:
-    "automatic account provisioning was in flight; rollback state was not yet reported by the orchestrator",
-  recoveryCommand: "sudo sanctuary protect --hermes",
-};
-
-function createAutoProvisionShutdownStatusTracker(): {
-  current: () => ProvisionFlowShutdownStatus;
-  update: (status: ProvisionFlowShutdownStatus) => void;
-} {
-  let current = DEFAULT_AUTO_PROVISION_SHUTDOWN_STATUS;
-  return {
-    current: () => current,
-    update: (status) => {
-      current = status;
-    },
-  };
-}
-
-/**
- * Abort an in-flight auto-provision run and wait for its own rollback machinery
- * to settle. On deadline expiry it prints the latest non-secret residual state
- * instead of claiming a rollback that was not observed.
- */
-export async function waitForAutoProvisionShutdown(input: {
-  signal: NodeJS.Signals;
-  abortController: AbortController;
-  provisionPromise: Promise<AutoProvisionSummary>;
-  deadlineMs: number;
-  currentStatus: () => ProvisionFlowShutdownStatus;
-  print: (line: string) => void;
-}): Promise<void> {
-  if (!input.abortController.signal.aborted) {
-    input.abortController.abort(input.signal);
-  }
-  let timeout: ReturnType<typeof setTimeout> | undefined;
-  const deadline = new Promise<"deadline">((resolve) => {
-    timeout = setTimeout(() => resolve("deadline"), input.deadlineMs);
-  });
-  const settled = input.provisionPromise.then(
-    () => "settled" as const,
-    () => "settled" as const,
-  );
-  const result = await Promise.race([settled, deadline]);
-  if (timeout !== undefined) clearTimeout(timeout);
-  if (result === "deadline") {
-    const status = input.currentStatus();
-    input.print(
-      `WARNING: ${input.signal} arrived while automatic account provisioning was in flight. ` +
-        `Requested rollback and waited ${input.deadlineMs}ms, but rollback was NOT observed before the shutdown deadline. ` +
-        `Current stage: ${status.stage}. Residual state: ${status.residualState}. ` +
-        `Recover with: ${status.recoveryCommand}. Do not assume a clean rollback.`,
-    );
-  }
 }
 
 // ── Types ───────────────────────────────────────────────────────────
@@ -1855,7 +1875,6 @@ function protectionObservationFromAutoProvisionSummary(
         reasons: [outcome.reason],
       };
     case "armed-then-rolled-back":
-    case "shutdown-after-arm-rolled-back":
     case "egress-unprovisioned-rolled-back":
       if (outcome.disarmObservedOff === true) {
         return {
@@ -1940,7 +1959,6 @@ export function autoProvisionCeilingFromSummary(
       });
     case "aborted":
     case "armed-then-rolled-back":
-    case "shutdown-after-arm-rolled-back":
     case "egress-unprovisioned-rolled-back":
       if ("wallMayBeArmed" in outcome && outcome.wallMayBeArmed === true) {
         return protectionStateClaimFromObservation({
@@ -1968,14 +1986,15 @@ export function autoProvisionCeilingFromSummary(
 }
 
 function assertNeverProvisionFlowOutcome(outcome: never): never {
+  const kind = (outcome as { kind?: unknown }).kind;
   throw new Error(
-    `Unhandled ProvisionFlowOutcome kind in wrap protection claim path: ${JSON.stringify(outcome)}`,
+    `Unhandled ProvisionFlowOutcome kind in wrap protection claim path: ${String(kind)}`,
   );
 }
 
 function assertNeverDisarmNePreferenceOutcome(outcome: never): never {
   throw new Error(
-    `Unhandled DisarmNePreferenceOutcome in wrap protection claim ceiling: ${JSON.stringify(outcome)}`,
+    `Unhandled DisarmNePreferenceOutcome in wrap protection claim ceiling: ${String(outcome)}`,
   );
 }
 
@@ -2138,32 +2157,17 @@ async function maybeRunAutoProvisionForWrap(
     return { ran: false };
   }
   const runner = deps.runAutoProvisionForWrap ?? runAutoProvisionForWrap;
-  const shutdownAbort = new AbortController();
-  const shutdownStatus = createAutoProvisionShutdownStatusTracker();
-  let provisionPromise: Promise<AutoProvisionSummary> | undefined;
-  processShutdownEscalationReporters.add(shutdownStatus.current);
-  const unregisterProvisionShutdownCleanup = registerProcessShutdownCleanup(async (signal) => {
-    if (provisionPromise === undefined) {
-      if (!shutdownAbort.signal.aborted) shutdownAbort.abort("process shutdown before provisioning started");
-      return;
-    }
-    await waitForAutoProvisionShutdown({
-      signal: signal ?? "SIGTERM",
-      abortController: shutdownAbort,
-      provisionPromise,
-      deadlineMs: deps.autoProvisionShutdownDeadlineMs ?? AUTO_PROVISION_SHUTDOWN_DEADLINE_MS,
-      currentStatus: shutdownStatus.current,
-      // SAFETY: stderr is the operator-facing shutdown channel; the helper
-      // prints only stage/residual/recovery metadata, never secrets.
-      print: (line) => console.error(`  ${line}`),
-    });
-  });
+  let mutationWindowOpened = false;
   try {
-    provisionPromise = runner({
+    return await runner({
       isTty: process.stdin.isTTY === true,
       preAnsweredProvision: options.provisionAgentAccount,
       cliBinary: resolveAutoProvisionCliBinary(options),
       stopTransientCastleWallDaemon,
+      beforeFirstMutation: () => {
+        mutationWindowOpened = tryOpenAutoProvisionMutationWindow(options);
+        return mutationWindowOpened;
+      },
       // S5-6: fine-grained (exclusive-egress) provisioning mode.
       exclusiveEgress: options.exclusiveEgress,
       // SAFETY: stderr is the operator-facing CLI channel for this
@@ -2171,10 +2175,7 @@ async function maybeRunAutoProvisionForWrap(
       // the auto-provision flow (account plan, re-home summary, arm
       // result), never secrets or key material.
       print: (line) => console.error(`  ${line}`),
-      shutdownSignal: shutdownAbort.signal,
-      onShutdownStatus: shutdownStatus.update,
     });
-    return await provisionPromise;
   } catch (err) {
     // FIX (round 5 / R8-2): a held provision lock means the flow body NEVER
     // ran (another `sanctuary protect` is mid-provision), so this run mutated
@@ -2212,8 +2213,9 @@ async function maybeRunAutoProvisionForWrap(
     );
     return { ran: true };
   } finally {
-    unregisterProvisionShutdownCleanup();
-    processShutdownEscalationReporters.delete(shutdownStatus.current);
+    if (mutationWindowOpened) {
+      await closeAutoProvisionMutationWindow();
+    }
   }
 }
 
@@ -2283,24 +2285,6 @@ export function renderAutoProvisionOutcomeLines(summary: AutoProvisionSummary): 
           `The disarm attempt itself also failed: ${outcome.disarmError}. ` +
           `The agent may be unreachable behind the wall. Run 'sudo sanctuary castle-wall disable' manually now, ` +
           `then investigate before re-running 'sanctuary protect --hermes'.`,
-      ];
-    case "shutdown-after-arm-rolled-back":
-      if (outcome.wallMayBeArmed === true || outcome.disarmOutcome !== "corroborated_off") {
-        const disarmState =
-          outcome.disarmOutcome === "save_accepted_inconclusive"
-            ? "the disable save was accepted, but the status re-read was inconclusive"
-            : "the disarm was NOT corroborated cleanly";
-        return [
-          `  WARNING: SIGINT/SIGTERM arrived after Castle Wall armed; automatic shutdown rollback ran, but ${disarmState} ` +
-            `(${outcome.reason}). Do not assume the wall is off. Check with 'sanctuary castle-wall status' and run ` +
-            `'sudo sanctuary castle-wall disable' if it is still enabled.`,
-        ];
-      }
-      return [
-        `  Note: SIGINT/SIGTERM arrived after Castle Wall armed; automatic shutdown rollback fast-disarmed before exit ` +
-          `(${outcome.reason}). The re-home was not reversed; the wall was not observed armed after rollback` +
-          `${outcome.egressRestoredToPreRunState ? " and the provisioned egress rules were restored to their pre-run state" : ""}. ` +
-          `Re-run 'sanctuary protect --hermes' when you are ready to arm again.`,
       ];
     case "egress-unprovisioned-rolled-back":
       // Confined-agent egress (design section 5): the wall armed but the
@@ -2510,11 +2494,6 @@ export interface RunWrapDeps {
    */
   runAutoProvisionForWrap?: typeof runAutoProvisionForWrap;
   /**
-   * Test seam for the bounded SIGINT/SIGTERM provisioning rollback wait.
-   * Production leaves this unset and uses AUTO_PROVISION_SHUTDOWN_DEADLINE_MS.
-   */
-  autoProvisionShutdownDeadlineMs?: number;
-  /**
    * Override the resolved OS platform used by the `--exclusive-egress` /
    * `--provision-agent-account` darwin-only refusal (for tests). Production
    * callers leave this undefined and get the real `node:os` `platform()`.
@@ -2596,6 +2575,8 @@ export async function runWrap(
   options: WrapOptions,
   deps: RunWrapDeps = {}
 ): Promise<void> {
+  installProcessShutdownListeners();
+
   // D4 P2-2: --unwrap honors --dry-run too - pre-fix, the unwrap dispatch
   // sat above the dry-run gate, so `--unwrap --dry-run` restored backups
   // for real. The gate travels into unwrap() so it can report what WOULD
@@ -3975,6 +3956,14 @@ export async function runWrap(
         ndAuditStorage = ndStorage;
         ndAuditMasterKey = ndDerived.key;
         ndAuditLog = new AuditLog(ndStorage, ndDerived.key);
+        const flushNoDashboardAuditLogOnShutdown = ndAuditLog;
+        registerProcessShutdownCleanup(async () => {
+          try {
+            await flushNoDashboardAuditLogOnShutdown.flush();
+          } catch {
+            /* best-effort: a shutdown cleanup must not throw out of the signal handler */
+          }
+        });
         await bestEffortRecordWrapWorkloadRegistration({
           auditLog: ndAuditLog,
           storagePath,
