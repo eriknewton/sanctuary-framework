@@ -273,8 +273,19 @@ export function registerProcessShutdownCleanup(
   };
 }
 
-/** Signal shutdown waits for in-flight provisioning up to the existing launchctl host-operation budget. */
-export const AUTO_PROVISION_SHUTDOWN_DEADLINE_MS = LAUNCHCTL_TIMEOUT_MS;
+const AUTO_PROVISION_SHUTDOWN_LAUNCHCTL_OPERATION_SLOTS = 3;
+const AUTO_PROVISION_SHUTDOWN_RESTORE_OPERATION_SLOTS = 2;
+/**
+ * Signal shutdown waits for in-flight provisioning rollback across the host
+ * operations it can actually await: harness daemon bootout, policy daemon
+ * teardown, egress daemon reload, re-home file restore, and stood-down harness
+ * restore. Each slot is anchored to the existing launchctl host-operation
+ * budget rather than a new standalone timeout.
+ */
+export const AUTO_PROVISION_SHUTDOWN_DEADLINE_MS =
+  LAUNCHCTL_TIMEOUT_MS *
+  (AUTO_PROVISION_SHUTDOWN_LAUNCHCTL_OPERATION_SLOTS +
+    AUTO_PROVISION_SHUTDOWN_RESTORE_OPERATION_SLOTS);
 
 const DEFAULT_AUTO_PROVISION_SHUTDOWN_STATUS: ProvisionFlowShutdownStatus = {
   stage: "auto-provision",
@@ -1837,6 +1848,8 @@ function protectionObservationFromAutoProvisionSummary(
     case "skipped-non-tty-cooperative-only":
     case "declined-by-operator":
       return undefined;
+    default:
+      return assertNeverProvisionFlowOutcome(outcome);
   }
 }
 
@@ -1879,7 +1892,15 @@ function autoProvisionCeilingFromSummary(
       });
     case "aborted":
     case "armed-then-rolled-back":
+    case "shutdown-after-arm-rolled-back":
     case "egress-unprovisioned-rolled-back":
+      if ("wallMayBeArmed" in outcome && outcome.wallMayBeArmed === true) {
+        return protectionStateClaimFromObservation({
+          state: "unknown",
+          basis: "provision_outcome_not_observation",
+          reasons: [outcome.reason],
+        });
+      }
       if (outcome.disarmObservedOff === true) {
         return protectionStateClaimFromObservation({
           state: "unprotected",
@@ -1895,7 +1916,15 @@ function autoProvisionCeilingFromSummary(
     case "skipped-non-tty-cooperative-only":
     case "declined-by-operator":
       return undefined;
+    default:
+      return assertNeverProvisionFlowOutcome(outcome);
   }
+}
+
+function assertNeverProvisionFlowOutcome(outcome: never): never {
+  throw new Error(
+    `Unhandled ProvisionFlowOutcome kind in wrap protection claim path: ${JSON.stringify(outcome)}`,
+  );
 }
 
 const protectionClaimStateOrder: Readonly<Record<ProtectionClaimState, number>> =
@@ -2202,9 +2231,16 @@ export function renderAutoProvisionOutcomeLines(summary: AutoProvisionSummary): 
           `then investigate before re-running 'sanctuary protect --hermes'.`,
       ];
     case "shutdown-after-arm-rolled-back":
+      if (outcome.wallMayBeArmed === true) {
+        return [
+          `  WARNING: SIGINT/SIGTERM arrived after Castle Wall armed; automatic shutdown rollback ran, but the disarm was NOT corroborated cleanly ` +
+            `(${outcome.reason}). Do not assume the wall is off. Check with 'sanctuary castle-wall status' and run ` +
+            `'sudo sanctuary castle-wall disable' if it is still enabled.`,
+        ];
+      }
       return [
         `  Note: SIGINT/SIGTERM arrived after Castle Wall armed; automatic shutdown rollback fast-disarmed before exit ` +
-          `(${outcome.reason}). The agent still runs under its dedicated, re-homed account; only enforcement came down` +
+          `(${outcome.reason}). The re-home was not reversed; enforcement came down` +
           `${outcome.egressRestoredToPreRunState ? " and the provisioned egress rules were restored to their pre-run state" : ""}. ` +
           `Re-run 'sanctuary protect --hermes' when you are ready to arm again.`,
       ];
@@ -2273,6 +2309,8 @@ export function renderAutoProvisionOutcomeLines(summary: AutoProvisionSummary): 
     }
     case "aborted":
       return abortedProvisionLines(outcome);
+    default:
+      return assertNeverProvisionFlowOutcome(outcome);
   }
 }
 
@@ -3949,6 +3987,15 @@ export async function runWrap(
       // terminal-final success surface, not only the mid-flow warning.
       pinnedVersionResolvability: pinResolvability,
     });
+    try {
+      await stopTransientCastleWallDaemonForAutoProvision();
+    } catch (err) {
+      // SAFETY: a lingering transient daemon keeps the fortress socket held and blocks the sudo retry.
+      console.error(
+        `  WARNING: the transient Castle Wall daemon could not be stopped before --no-dashboard exit ` +
+          `(${(err as Error).message}). Stop the holding process before retrying the sudo protect command.`,
+      );
+    }
     return;
   }
 

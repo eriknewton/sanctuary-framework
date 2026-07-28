@@ -9,7 +9,10 @@
  */
 
 import { describe, it, expect, vi } from "vitest";
-import { renderAutoProvisionOutcomeLines } from "../../src/wrap/cli.js";
+import {
+  protectionClaimFromAutoProvisionSummary,
+  renderAutoProvisionOutcomeLines,
+} from "../../src/wrap/cli.js";
 import {
   describeNoAccountResidueTeardown,
   describeStandDownAgentForCli,
@@ -112,6 +115,39 @@ describe("wrap/cli renderAutoProvisionOutcomeLines", () => {
     });
     expect(out[0]).toMatch(/^ {2}WARNING: Castle Wall is ARMED/);
     expect(out[0]).toMatch(/sudo sanctuary castle-wall disable/);
+  });
+
+  it("F2/F3: shutdown rollback with uncorroborated disarm is a warning and does not claim the agent still runs dedicated", () => {
+    const out = lines({
+      ran: true,
+      outcome: {
+        kind: "shutdown-after-arm-rolled-back",
+        uid: 503,
+        reason:
+          "shutdown requested (SIGTERM) at shutdown-after-arm; fast-disarmed before exit rather than leave an unverified armed wall. WARNING: disarm reported success as a dead-man lever but did NOT save the NE preference disabled; the wall may still be enabled at the preference level.",
+        egressRestoredToPreRunState: true,
+        wallMayBeArmed: true,
+      },
+    });
+    expect(out[0]).toMatch(/^ {2}WARNING:/);
+    expect(out[0]).toMatch(/disarm was NOT corroborated/);
+    expect(out[0]).toMatch(/sudo sanctuary castle-wall disable/);
+    expect(out[0]).not.toMatch(/still runs under its dedicated, re-homed account/);
+  });
+
+  it("F1: shutdown rollback observed off contributes an unprotected claim instead of leaving the probe uncapped", () => {
+    const claim = protectionClaimFromAutoProvisionSummary({
+      ran: true,
+      outcome: {
+        kind: "shutdown-after-arm-rolled-back",
+        uid: 503,
+        reason: "shutdown rollback observed the wall off",
+        egressRestoredToPreRunState: true,
+        disarmObservedOff: true,
+      },
+    });
+    expect(claim?.state).toBe("unprotected");
+    expect(claim?.basis).toBe("disarm_observed_off");
   });
 
   it("aborted rolledBack:true (no daemon issue) -> soft Note frame with retry", () => {

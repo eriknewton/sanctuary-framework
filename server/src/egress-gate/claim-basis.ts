@@ -300,6 +300,7 @@ export type ClaimSiteId =
   | "provision-orchestrate.disarmed"
   | "provision-orchestrate.rules-scrubbed"
   | "provision-orchestrate.armed"
+  | "provision-orchestrate.shutdown-before-exclusive-preserves-coarse"
   | "provision-orchestrate.rehome-restored-note"
   | "provision-orchestrate.observed-agent-confinement"
   | "provision-unprovision.disarm-ok"
@@ -1806,6 +1807,15 @@ export const CLAIM_SITES: Record<ClaimSiteId, ClaimSiteDeclaration> = {
       basis: "observed",
     },
   },
+  "provision-orchestrate.shutdown-before-exclusive-preserves-coarse": {
+    file: `${CW}/orchestrate.ts`,
+    symbol: "coarseOnlyShutdownBeforeExclusiveOutcome",
+    claim:
+      "the already-verified coarse composition is preserved when shutdown lands before exclusive egress mutates it",
+    basis: "observed",
+    layer: "compute",
+    branches: "single",
+  },
   "provision-orchestrate.rehome-restored-note": {
     file: `${CW}/orchestrate.ts`,
     symbol: "describeRestoreForReason",
@@ -1964,7 +1974,7 @@ export const CLAIM_LITERAL_COUNTS: Readonly<Record<string, number>> = {
   // pid-liveness probe result for the lock-holder description; not a
   // protection claim.
   [`${CW}/lockfile.ts`]: 1,
-  [`${CW}/orchestrate.ts`]: 10,
+  [`${CW}/orchestrate.ts`]: 11,
   [`${CW}/policy-daemon.ts`]: 0,
   [`${CW}/rehome.ts`]: 0,
   [`${CW}/uid-gate.ts`]: 2,

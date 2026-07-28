@@ -1278,7 +1278,7 @@ export async function runAutoProvisionForWrap(
       : undefined;
 
   const ops: ProvisionFlowOps = {
-    confirm: (promptText) => confirmOnTty(promptText),
+    confirm: (promptText, signal) => confirmOnTty(promptText, signal),
     print,
     createAccount: async () => {
       const { planAndCreateAccount } = await import("../castle-wall/provision/account.js");
@@ -2146,12 +2146,20 @@ async function resolveAccountShapeVerdict(
   }
 }
 
-async function confirmOnTty(promptText: string): Promise<boolean> {
+async function confirmOnTty(promptText: string, signal?: AbortSignal): Promise<boolean> {
   const readline = await import("node:readline/promises");
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   try {
-    const answer = await rl.question(promptText);
+    const answer =
+      signal !== undefined
+        ? await rl.question(promptText, { signal })
+        : await rl.question(promptText);
     return /^y(es)?$/i.test(answer.trim());
+  } catch (err) {
+    if (signal?.aborted === true || (err as Error).name === "AbortError") {
+      return false;
+    }
+    throw err;
   } finally {
     rl.close();
   }

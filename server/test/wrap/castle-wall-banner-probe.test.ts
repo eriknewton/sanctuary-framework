@@ -1417,4 +1417,34 @@ describe("Castle Wall wrap-banner evidence probes", () => {
     expect(reparkFailed.basis).toBe("exclusive_egress_repark_failed");
     expect(protectionStateAdvice(reparkFailed).castleWallLabel).not.toContain("Castle Wall Full");
   });
+
+  it("F1: shutdown-after-arm rollback caps a fresh green probe to unprotected when disarm was observed off", async () => {
+    const livenessSince = currentWrapSince();
+    const subject = agentSubject();
+    await appendCW("egress_allowed", 60_000, {}, subject);
+    await appendDaemonStart(31_000, "success", subject);
+    await appendDaemonHeartbeat(30_000, subject);
+
+    const claim = await resolveWrapProtectionClaim({
+      auditLog: log,
+      autoProvisionSummary: {
+        ran: true,
+        outcome: {
+          kind: "shutdown-after-arm-rolled-back",
+          uid: agentUid,
+          reason: "shutdown rollback observed the wall off",
+          egressRestoredToPreRunState: true,
+          disarmObservedOff: true,
+        },
+      },
+      castleWallDaemonLivenessSince: livenessSince,
+      storagePath,
+      providerTimeoutMs: 20,
+      resolveExclusiveEgress: async () => coarseFleetStatus(),
+    });
+
+    expect(claim.state).toBe("unprotected");
+    expect(claim.basis).toBe("disarm_observed_off");
+    expect(protectionStateAdvice(claim).castleWallLabel).not.toContain("Castle Wall Full");
+  });
 });

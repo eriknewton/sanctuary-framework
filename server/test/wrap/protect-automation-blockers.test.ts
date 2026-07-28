@@ -412,23 +412,42 @@ describe("runWrap: SIGTERM during in-flight provisioning waits for rollback or a
   });
 
   it("a hung rollback is bounded and the shutdown message names the residual state plus recovery verb", async () => {
-    const finishProvision = deferred<AutoProvisionSummary>();
+    const provisionEntered = deferred<void>();
+    const finishProvisionEgress = deferred<void>();
+    const rollbackEntered = deferred<void>();
+    const finishRollback = deferred<{ restored: true; reloadOk: true; problems: [] }>();
     let released = false;
     const releaseProvision = () => {
       if (released) return;
       released = true;
-      finishProvision.resolve({ ran: false });
+      finishRollback.resolve({ restored: true, reloadOk: true, problems: [] });
     };
+    const ops = signalProvisionOps({
+      provisionEgress: vi.fn(async () => {
+        provisionEntered.resolve();
+        await finishProvisionEgress.promise;
+        return {
+          ok: true as const,
+          ruleIds: ["provisioned-hermes-abc123def456"],
+          checks: [{ name: "LLM (Venice)", host: "api.venice.ai", port: 443, allowed: true }],
+          dnsRulePresent: true,
+        };
+      }),
+      restoreProvisionedEgressToPreRunState: vi.fn(async () => {
+        rollbackEntered.resolve();
+        return finishRollback.promise;
+      }),
+    });
     const runAutoProvisionForWrap = vi.fn(async (input: unknown): Promise<AutoProvisionSummary> => {
       const provisionInput = input as {
+        shutdownSignal?: AbortSignal;
         onShutdownStatus?: (status: unknown) => void;
       };
-      provisionInput.onShutdownStatus?.({
-        stage: "provision-egress",
-        residualState: "the agent may be PARKED and provisioned egress rules may be partially published",
-        recoveryCommand: "sudo sanctuary protect --hermes",
-      });
-      return finishProvision.promise;
+      const outcome = await runProvisionFlow(
+        signalProvisionCtx(provisionInput.shutdownSignal, provisionInput.onShutdownStatus),
+        ops,
+      );
+      return { ran: true, outcome };
     });
 
     const runPromise = runWrap(
@@ -441,15 +460,21 @@ describe("runWrap: SIGTERM during in-flight provisioning waits for rollback or a
 
     try {
       await vi.waitFor(() => expect(runAutoProvisionForWrap).toHaveBeenCalledTimes(1), { timeout: 5000 });
-      process.kill(process.pid, "SIGTERM");
+      await provisionEntered.promise;
+      const shutdownPromise = handleProcessShutdownSignal("SIGTERM");
+      finishProvisionEgress.resolve();
+      await rollbackEntered.promise;
       await vi.waitFor(() => expect(exitSpy).toHaveBeenCalledWith(143), { timeout: 250 });
+      await shutdownPromise;
 
       const printed = stderrSpy.mock.calls.flat().join("\n");
       expect(printed).toMatch(/rollback was NOT observed/i);
-      expect(printed).toMatch(/provision-egress/);
-      expect(printed).toMatch(/PARKED/);
+      expect(printed).toMatch(/rollback-shutdown-after-provision-egress/);
+      expect(printed).toMatch(/shutdown rollback is in flight/);
+      expect(printed).toMatch(/re-homed files may be mid-restore/);
       expect(printed).toMatch(/sudo sanctuary protect --hermes/);
     } finally {
+      finishProvisionEgress.resolve();
       releaseProvision();
       await Promise.race([runPromise, sleepMs(50)]);
     }

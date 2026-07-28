@@ -301,6 +301,26 @@ describe("castle-wall/provision/orchestrate", () => {
     expect(ops.confirm).toHaveBeenCalledTimes(1);
   });
 
+  it("F5b: the confirm operation receives the shutdown signal so a TTY prompt can abort without waiting for the rollback deadline", async () => {
+    const shutdown = new AbortController();
+    const confirm = vi.fn(async (_prompt: string, signal?: AbortSignal) => {
+      expect(signal).toBe(shutdown.signal);
+      shutdown.abort("SIGTERM");
+      return false;
+    });
+    const ops = happyPathOps({ confirm });
+
+    const result = await runProvisionFlow(
+      { ...baseCtx(), shutdownSignal: shutdown.signal } as ProvisionFlowContext & {
+        shutdownSignal: AbortSignal;
+      },
+      ops,
+    );
+
+    expect(result).toEqual({ kind: "declined-by-operator" });
+    expect(ops.createAccount).not.toHaveBeenCalled();
+  });
+
   it("operator declines the interactive confirm: stops before any mutation", async () => {
     const ops = happyPathOps({ confirm: vi.fn(async () => false) });
     const result = await runProvisionFlow(baseCtx(), ops);
@@ -804,6 +824,43 @@ describe("castle-wall/provision/orchestrate", () => {
     expect(ops.verifyAgentEgressAfterArm).not.toHaveBeenCalled();
     expect((result as { reason: string }).reason).toMatch(/shutdown requested/i);
     expect((result as { reason: string }).reason).not.toMatch(/connectivity re-check failed|egress verification failed/i);
+  });
+
+  it("F2/F6: shutdown rollback records uncorroborated dead-man disarm honestly and audits the rule restore", async () => {
+    const shutdown = new AbortController();
+    const auditEgress = vi.fn(async () => undefined);
+    const ops = happyPathOps({
+      arm: vi.fn(async () => {
+        shutdown.abort("SIGTERM");
+        return { ok: true as const };
+      }),
+      disarm: vi.fn(async () => ({ nePreferenceOutcome: "fail_open_deadman" as const })),
+      auditEgress,
+    });
+
+    const result = await runProvisionFlow(
+      { ...baseCtx(), shutdownSignal: shutdown.signal } as ProvisionFlowContext & {
+        shutdownSignal: AbortSignal;
+      },
+      ops,
+    );
+
+    expect(result).toMatchObject({
+      kind: "shutdown-after-arm-rolled-back",
+      wallMayBeArmed: true,
+      egressRestoredToPreRunState: true,
+    });
+    expect((result as { reason: string }).reason).toMatch(/did NOT save the NE preference disabled/);
+    expect(auditEgress).toHaveBeenCalledWith(
+      "egress_provision_refused",
+      expect.objectContaining({
+        stage: "shutdown-after-arm",
+        harness: "hermes",
+        agent_uid: AGENT_UID,
+        disarm_outcome: "disarm-uncorroborated",
+        egress_rules_restored_to_pre_run_state: true,
+      }),
+    );
   });
 
   it("FIX (round 5, R7-3): a verify-before-arm abort whose restore hit a CONFLICT-only outcome does NOT say 'restore FAILED' in its reason (matches the R5-2 conflict-safe render)", async () => {
@@ -1490,6 +1547,9 @@ describe("castle-wall/provision/orchestrate", () => {
         runReleaseSequence: vi.fn(async () => ({ kind: "released" as const, generation_id: COMMITTED.generation_id })),
         restoreCoarseComposition: vi.fn(async () => undefined),
         startHarnessCoarse: vi.fn(async () => undefined),
+        assessHarnessParked: vi.fn(async () => assessHarnessParked({
+          probe: { harnessStatus: async () => PARKED_STATUS, sleepMs: async () => undefined },
+        })),
         audit: vi.fn(async () => undefined),
         print: vi.fn(),
       };
@@ -2211,6 +2271,37 @@ describe("castle-wall/provision/orchestrate", () => {
       const asUidResult = await runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), asUid);
       expect(asUidResult.kind).toBe("egress-unprovisioned-rolled-back");
       expect(asUid.restoreStoodDownHarness).toHaveBeenCalledTimes(1);
+    });
+
+    it("F4: a shutdown after verified as-uid egress but before exclusive arm preserves coarse enforcement", async () => {
+      const shutdown = new AbortController();
+      const exclusive = exclusiveOps();
+      const ops = stoodDownOps({
+        exclusiveEgress: exclusive,
+        auditEgress: vi.fn(async (operation: string) => {
+          if (operation === "egress_provisioned") {
+            shutdown.abort("SIGTERM");
+          }
+        }),
+      });
+
+      const result = await runProvisionFlow(
+        { ...baseCtx({ fineGrainedDeclared: true }), shutdownSignal: shutdown.signal } as ProvisionFlowContext & {
+          shutdownSignal: AbortSignal;
+        },
+        ops,
+      );
+
+      expect(result).toMatchObject({
+        kind: "exclusive-egress-unarmed-coarse-active",
+        stage: "bring-up",
+        coarseCompositionRestored: true,
+      });
+      expect((result as { reason: string }).reason).toMatch(/preserving proven-live coarse enforcement/);
+      expect(ops.disarm).not.toHaveBeenCalled();
+      expect(ops.restoreProvisionedEgressToPreRunState).not.toHaveBeenCalled();
+      expect(exclusive.startHarnessCoarse).toHaveBeenCalledTimes(1);
+      expect(ops.restoreStoodDownHarness).not.toHaveBeenCalled();
     });
 
     it("restores the agent when the barrier assertion rejects a non-parked install", async () => {
