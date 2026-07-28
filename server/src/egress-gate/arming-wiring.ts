@@ -61,7 +61,7 @@ import {
   resolveCommittedGeneration,
   type GateBinding,
 } from "./generation.js";
-import { createExecFilePfRunner, checkPfAnchorLiveness } from "./pf-anchor.js";
+import { PF_COMMAND_TIMEOUT_MS, createExecFilePfRunner, checkPfAnchorLiveness } from "./pf-anchor.js";
 import { readBootSessionUuid } from "./pf-enable-state.js";
 import {
   GateLivenessOracle,
@@ -177,11 +177,10 @@ export const GATE_ACCOUNT_HOME_BASE = "/var/sanctuary-agents";
 const GATE_ACCOUNT_HOME_BASE_RESOLVED = "/private/var/sanctuary-agents";
 const ORACLE_REFRESH_SKIP_WARN_THRESHOLD = 3;
 const ORACLE_REFRESH_STUCK_THRESHOLD = 6;
-const ORACLE_REFRESH_DEFAULT_TIMEOUT_MS = 10_000;
 // HONEST BOUND: per-uid scaling is a conservative estimate against the prior
 // ~350 ms/uid review measurement; it is a tuning guard, not drilled evidence.
 const ORACLE_REFRESH_PER_UID_TIMEOUT_MS = 500;
-const ORACLE_REFRESH_MAX_ABANDONED_ATTEMPTS = 1;
+const ORACLE_REFRESH_DEFAULT_TIMEOUT_MS = PF_COMMAND_TIMEOUT_MS + ORACLE_REFRESH_PER_UID_TIMEOUT_MS;
 
 /** Real O_EXCL lock ops (the shipped provision-lock discipline). */
 export function fsLockOps(): ProvisionLockOps {
@@ -3423,8 +3422,6 @@ export interface ExclusiveEgressBootSupervisorInternals {
   oracleRefreshTimeoutMs?: number;
   /** TEST-ONLY: scale the whole-pass refresh timeout for multi-uid fleets. */
   oracleRefreshPerUidTimeoutMs?: number;
-  /** TEST-ONLY: cap abandoned async attempts left behind after a timeout. */
-  oracleRefreshMaxAbandonedAttempts?: number;
   /** TEST-ONLY: make the stuck-transition threshold deterministic and fast. */
   oracleRefreshStuckThreshold?: number;
   /** Boot gate-plist self-heal writer (default: atomic root write, 0o644). */
@@ -4077,8 +4074,6 @@ export async function startExclusiveEgressBootSupervisor(input: {
   const interval = input.refreshIntervalMs ?? 1_000;
   const refreshBaseTimeoutMs = internals.oracleRefreshTimeoutMs ?? Math.max(ORACLE_REFRESH_DEFAULT_TIMEOUT_MS, interval * 5);
   const refreshPerUidTimeoutMs = internals.oracleRefreshPerUidTimeoutMs ?? ORACLE_REFRESH_PER_UID_TIMEOUT_MS;
-  const maxAbandonedRefreshAttempts =
-    internals.oracleRefreshMaxAbandonedAttempts ?? ORACLE_REFRESH_MAX_ABANDONED_ATTEMPTS;
   const refreshStuckThreshold = internals.oracleRefreshStuckThreshold ?? ORACLE_REFRESH_STUCK_THRESHOLD;
   const removeLivenessToken =
     internals.removeLivenessToken ?? (async (uid: number): Promise<void> => rm(gateLivenessTokenPath(uid), { force: true }));
@@ -4088,7 +4083,6 @@ export async function startExclusiveEgressBootSupervisor(input: {
   const warnedUnusableGenerationUids = new Set<number>();
   let warnedRegistryUnreadable = false;
   let activeRefresh: { id: number; timeout: ReturnType<typeof setTimeout> } | null = null;
-  const abandonedRefreshAttempts = new Set<number>();
   let refreshAttemptId = 0;
   let consecutiveRefreshMisses = 0;
   let refreshStuck = false;
@@ -4146,17 +4140,11 @@ export async function startExclusiveEgressBootSupervisor(input: {
       recordRefreshMiss("previous refresh still running; skipped this tick");
       return;
     }
-    if (abandonedRefreshAttempts.size >= maxAbandonedRefreshAttempts) {
-      recordRefreshMiss(
-        `${abandonedRefreshAttempts.size} abandoned refresh attempt(s) still pending; capped new attempts to avoid piling up hung probes`,
-      );
-      return;
-    }
     const attemptId = ++refreshAttemptId;
     const attemptTimeoutMs = currentRefreshTimeoutMs();
+    const isCurrentAttempt = (): boolean => activeRefresh?.id === attemptId;
     const timeout = setTimeout(() => {
-      if (activeRefresh?.id !== attemptId) return;
-      abandonedRefreshAttempts.add(attemptId);
+      if (!isCurrentAttempt()) return;
       activeRefresh = null;
       invalidateKnownRefreshTokens(`refresh attempt ${attemptId} timed out`);
       recordRefreshMiss(`refresh attempt timed out after ${attemptTimeoutMs} ms and was abandoned`, attemptTimeoutMs);
@@ -4171,6 +4159,7 @@ export async function startExclusiveEgressBootSupervisor(input: {
       try {
         current = await listEntries();
       } catch (err) {
+        if (!isCurrentAttempt()) return;
         missedCondition = `registry unreadable (${(err as Error).message})`;
         if (!warnedRegistryUnreadable) {
           warnedRegistryUnreadable = true;
@@ -4181,6 +4170,7 @@ export async function startExclusiveEgressBootSupervisor(input: {
         }
         return;
       }
+      if (!isCurrentAttempt()) return;
       rememberRefreshUids(current.entries);
       if (warnedRegistryUnreadable) {
         warnedRegistryUnreadable = false;
@@ -4246,6 +4236,7 @@ export async function startExclusiveEgressBootSupervisor(input: {
         if (gateUid === undefined) {
           try {
             const marker = await loadMarker(entry.fortress_path);
+            if (!isCurrentAttempt()) return;
             if (marker === null || marker.agent_uid !== entry.agent_uid) {
               missedCondition ??= `no exclusive-routing marker resolved a gate uid for uid ${entry.agent_uid}`;
               if (!warnedUids.has(entry.agent_uid)) {
@@ -4259,6 +4250,7 @@ export async function startExclusiveEgressBootSupervisor(input: {
             gateUid = marker.gate_uid;
             gateUids.set(entry.agent_uid, gateUid);
           } catch (err) {
+            if (!isCurrentAttempt()) return;
             missedCondition ??= `marker read failed for uid ${entry.agent_uid} (${(err as Error).message})`;
             if (!warnedUids.has(entry.agent_uid)) {
               warnedUids.add(entry.agent_uid);
@@ -4277,10 +4269,12 @@ export async function startExclusiveEgressBootSupervisor(input: {
               gatePort: entry.gate_port,
               generationId,
             },
-            { shouldPublish: () => (activeRefresh?.id === attemptId ? true : "skip") },
+            { shouldApply: () => (isCurrentAttempt() ? true : "skip") },
           );
+          if (!isCurrentAttempt()) return;
           completedObservation = true;
         } catch (err) {
+          if (!isCurrentAttempt()) return;
           missedCondition ??= `oracle refresh failed for uid ${entry.agent_uid} (${(err as Error).message})`;
           input.print(
             `[castle-wall] oracle refresh failed for uid ${entry.agent_uid}: ${(err as Error).message} (gate denies until it recovers)`,
@@ -4289,6 +4283,7 @@ export async function startExclusiveEgressBootSupervisor(input: {
       }
     })()
       .catch((err) => {
+        if (!isCurrentAttempt()) return;
         missedCondition = `unexpected refresh failure (${(err as Error).message})`;
         input.print(
           `[castle-wall] oracle refresh: unexpected refresh failure (${(err as Error).message}); ` +
@@ -4296,8 +4291,7 @@ export async function startExclusiveEgressBootSupervisor(input: {
         );
       })
       .finally(() => {
-        if (abandonedRefreshAttempts.delete(attemptId)) return;
-        if (activeRefresh?.id !== attemptId) return;
+        if (!isCurrentAttempt()) return;
         clearTimeout(timeout);
         activeRefresh = null;
         if (missedCondition === null && (completedObservation || !attemptedObservation)) {
@@ -4319,7 +4313,6 @@ export async function startExclusiveEgressBootSupervisor(input: {
         clearTimeout(activeRefresh.timeout);
         activeRefresh = null;
       }
-      abandonedRefreshAttempts.clear();
     },
   };
 }

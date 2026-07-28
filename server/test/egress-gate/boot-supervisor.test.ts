@@ -1314,118 +1314,144 @@ describe("startExclusiveEgressBootSupervisor (fix-round-2 MED-5: refresh loop re
     expect(listCalls).toBe(2);
   });
 
-  it("a timed-out refresh is surfaced as stuck at the production cap, then a later-resolved attempt lets the next tick start", async () => {
-    let listCalls = 0;
-    const releases: Array<() => void> = [];
-    const printed: string[] = [];
-    const handle = await startExclusiveEgressBootSupervisor({
-      resolveAgent: async () => OK_CTX,
-      audit: async () => undefined,
-      print: (line) => printed.push(line),
-      refreshIntervalMs: 50,
-      internals: baseInternals({
-        oracleRefreshTimeoutMs: 20,
-        oracleRefreshStuckThreshold: 1,
-        listRegistryEntries: async () => {
-          listCalls += 1;
-          if (listCalls > 1) {
-            await new Promise<void>((resolve) => {
-              releases.push(resolve);
-            });
-          }
-          return { entries: [ENTRY], quarantined: [], dirty: false };
-        },
-      }),
-    });
-    const stuckDeadline = Date.now() + 2_000;
-    while (!printed.some((line) => line.includes("refresh attempt timed out after 20 ms")) && Date.now() < stuckDeadline) {
-      await sleep(5);
-    }
-    expect(printed.join("\n")).toContain("oracle refresh STUCK");
-    expect(printed.join("\n")).toContain("refresh attempt timed out after 20 ms");
-    await sleep(120);
-    // Production cap is 1: a still-pending abandoned attempt caps new refreshes.
-    // One boot read + one abandoned refresh read; no third read starts yet.
-    expect(listCalls).toBe(2);
-    for (const release of [...releases]) release();
-    const retryDeadline = Date.now() + 2_000;
-    while (listCalls < 3 && Date.now() < retryDeadline) {
-      await sleep(5);
-    }
-    handle.stopOracleLoop();
-    for (const release of releases) release();
-    expect(listCalls).toBeGreaterThanOrEqual(3);
-    expect(printed.join("\n")).toContain("could not observe fresh registry/pf liveness");
-  });
-
-  it("an abandoned supervisor refresh cannot publish a late live token and invalidates the existing token", async () => {
+  it("a never-settling refresh is abandoned at the deadline, invalidates fail-closed, and the next tick starts fresh", async () => {
+    vi.useFakeTimers();
     const tokens = new Map<number, string>();
     tokens.set(ENTRY.agent_uid, "old-live-token");
-    const writes: number[] = [];
+    const writes: string[] = [];
     const removals: number[] = [];
-    let firstProbeRelease: (() => void) | undefined;
-    let firstProbeStarted = false;
     let probeCalls = 0;
     const printed: string[] = [];
-    const handle = await startExclusiveEgressBootSupervisor({
-      resolveAgent: async () => OK_CTX,
-      audit: async () => undefined,
-      print: (line) => printed.push(line),
-      refreshIntervalMs: 5,
-      internals: baseInternals({
-        oracleRefreshTimeoutMs: 20,
-        oracleRefreshStuckThreshold: 1,
-        oracleRefreshMaxAbandonedAttempts: 1,
-        removeLivenessToken: async (uid) => {
-          tokens.delete(uid);
-          removals.push(uid);
-        },
-        createOracle: ((privateKey: never) => {
-          let probes = 0;
-          return new GateLivenessOracle(
-            privateKey,
-            {
-              writeToken: async (uid, payload) => {
-                tokens.set(uid, payload);
-                writes.push(uid);
+    let handle: Awaited<ReturnType<typeof startExclusiveEgressBootSupervisor>> | undefined;
+    try {
+      handle = await startExclusiveEgressBootSupervisor({
+        resolveAgent: async () => OK_CTX,
+        audit: async () => undefined,
+        print: (line) => printed.push(line),
+        refreshIntervalMs: 50,
+        internals: baseInternals({
+          oracleRefreshTimeoutMs: 20,
+          oracleRefreshStuckThreshold: 1,
+          removeLivenessToken: async (uid) => {
+            tokens.delete(uid);
+            removals.push(uid);
+          },
+          createOracle: ((privateKey: never) =>
+            new GateLivenessOracle(
+              privateKey,
+              {
+                writeToken: async (uid, payload) => {
+                  tokens.set(uid, payload);
+                  writes.push(payload);
+                },
+                removeToken: async (uid) => {
+                  tokens.delete(uid);
+                  removals.push(uid);
+                },
+                probe: async () => {
+                  probeCalls += 1;
+                  if (probeCalls === 1) {
+                    await new Promise<never>(() => undefined);
+                  }
+                  return { live: true, reasons: [] };
+                },
+                now: () => Date.now(),
               },
-              removeToken: async (uid) => {
-                tokens.delete(uid);
-                removals.push(uid);
-              },
-              probe: async () => {
-                probeCalls += 1;
-                probes += 1;
-                if (probes === 1) {
-                  firstProbeStarted = true;
-                  await new Promise<void>((resolve) => {
-                    firstProbeRelease = resolve;
-                  });
-                }
-                return { live: true, reasons: [] };
-              },
-              now: () => Date.now(),
-            },
-            { ttlMs: 2_000 },
-          );
-        }) as never,
-      }),
-    });
-    const timeoutDeadline = Date.now() + 2_000;
-    while (removals.length === 0 && Date.now() < timeoutDeadline) {
-      await sleep(5);
+              { ttlMs: 2_000 },
+            )) as never,
+        }),
+      });
+
+      await vi.advanceTimersByTimeAsync(50);
+      expect(probeCalls).toBe(1);
+
+      await vi.advanceTimersByTimeAsync(21);
+      expect(removals).toContain(ENTRY.agent_uid);
+      expect(tokens.has(ENTRY.agent_uid)).toBe(false);
+      expect(printed.join("\n")).toContain("refresh attempt timed out after 20 ms");
+      expect(printed.join("\n")).toContain("oracle refresh STUCK");
+
+      await vi.advanceTimersByTimeAsync(29);
+      expect(probeCalls).toBe(2);
+      expect(writes).toHaveLength(1);
+      expect(tokens.has(ENTRY.agent_uid)).toBe(true);
+    } finally {
+      handle?.stopOracleLoop();
+      vi.useRealTimers();
     }
-    expect(firstProbeStarted).toBe(true);
-    expect(removals).toContain(ENTRY.agent_uid);
-    expect(tokens.has(ENTRY.agent_uid)).toBe(false);
-    await sleep(80);
-    expect(probeCalls).toBe(1);
-    firstProbeRelease?.();
-    await sleep(5);
-    handle.stopOracleLoop();
-    expect(writes).toHaveLength(0);
-    expect(tokens.has(ENTRY.agent_uid)).toBe(false);
-    expect(printed.join("\n")).toContain("oracle refresh STUCK");
+  });
+
+  it("a timed-out zombie success cannot overwrite the newer successful refresh token", async () => {
+    vi.useFakeTimers();
+    const tokens = new Map<number, string>();
+    tokens.set(ENTRY.agent_uid, "old-live-token");
+    const writes: string[] = [];
+    const removals: number[] = [];
+    let firstProbeRelease: (() => void) | undefined;
+    let probeCalls = 0;
+    const printed: string[] = [];
+    let handle: Awaited<ReturnType<typeof startExclusiveEgressBootSupervisor>> | undefined;
+    try {
+      handle = await startExclusiveEgressBootSupervisor({
+        resolveAgent: async () => OK_CTX,
+        audit: async () => undefined,
+        print: (line) => printed.push(line),
+        refreshIntervalMs: 50,
+        internals: baseInternals({
+          oracleRefreshTimeoutMs: 20,
+          oracleRefreshStuckThreshold: 1,
+          removeLivenessToken: async (uid) => {
+            tokens.delete(uid);
+            removals.push(uid);
+          },
+          createOracle: ((privateKey: never) =>
+            new GateLivenessOracle(
+              privateKey,
+              {
+                writeToken: async (uid, payload) => {
+                  tokens.set(uid, payload);
+                  writes.push(payload);
+                },
+                removeToken: async (uid) => {
+                  tokens.delete(uid);
+                  removals.push(uid);
+                },
+                probe: async () => {
+                  probeCalls += 1;
+                  if (probeCalls === 1) {
+                    await new Promise<void>((resolve) => {
+                      firstProbeRelease = resolve;
+                    });
+                  }
+                  return { live: true, reasons: [] };
+                },
+                now: () => Date.now(),
+              },
+              { ttlMs: 2_000 },
+            )) as never,
+        }),
+      });
+
+      await vi.advanceTimersByTimeAsync(50);
+      expect(probeCalls).toBe(1);
+      await vi.advanceTimersByTimeAsync(21);
+      expect(removals).toContain(ENTRY.agent_uid);
+
+      await vi.advanceTimersByTimeAsync(29);
+      expect(probeCalls).toBe(2);
+      expect(writes).toHaveLength(1);
+      const freshToken = tokens.get(ENTRY.agent_uid);
+      expect(freshToken).toBeDefined();
+
+      firstProbeRelease?.();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(writes).toHaveLength(1);
+      expect(tokens.get(ENTRY.agent_uid)).toBe(freshToken);
+      expect(printed.join("\n")).toContain("refresh attempt timed out after 20 ms");
+    } finally {
+      handle?.stopOracleLoop();
+      vi.useRealTimers();
+    }
   });
 
   it("an unreadable registry escalates as stuck instead of resetting the miss counter", async () => {
