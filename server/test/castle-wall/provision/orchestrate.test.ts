@@ -714,6 +714,98 @@ describe("castle-wall/provision/orchestrate", () => {
     expect(ops.arm).not.toHaveBeenCalled();
   });
 
+  it("F2: a shutdown requested after a fine-grained parked install restores the stood-down harness before egress or arm", async () => {
+    const shutdown = new AbortController();
+    const exclusiveEgress = {
+      bringUpGeneration: vi.fn(async () => ({ generation_id: 42, agent_uid: AGENT_UID, gate_port: 45_123 })),
+      runReleaseSequence: vi.fn(async () => ({ kind: "released" as const })),
+      restoreCoarseComposition: vi.fn(async () => undefined),
+      startHarnessCoarse: vi.fn(async () => undefined),
+      assessHarnessParked: vi.fn(async () => ({ known: true as const, installed: true, running: false })),
+      audit: vi.fn(async () => undefined),
+      print: vi.fn(),
+    };
+    const ops = happyPathOps({
+      exclusiveEgress,
+      installHarnessDaemon: vi.fn(async () => {
+        shutdown.abort("SIGTERM");
+        return {
+          ok: true as const,
+          bootstrappedThisRun: false,
+          parked: true,
+          harnessStoodDown: true,
+        };
+      }),
+    });
+
+    const result = await runProvisionFlow(
+      { ...baseCtx({ fineGrainedDeclared: true }), shutdownSignal: shutdown.signal } as ProvisionFlowContext & {
+        shutdownSignal: AbortSignal;
+      },
+      ops,
+    );
+
+    expect(result).toMatchObject({ kind: "aborted", stage: "shutdown-after-install-daemon", rolledBack: true });
+    expect(ops.provisionEgress).not.toHaveBeenCalled();
+    expect(ops.arm).not.toHaveBeenCalled();
+    expect(exclusiveEgress.bringUpGeneration).not.toHaveBeenCalled();
+    expect(ops.restoreRehome).toHaveBeenCalledWith(REHOME_RESULTS);
+    expect(ops.restoreStoodDownHarness).toHaveBeenCalledTimes(1);
+  });
+
+  it("F2: a shutdown requested while egress publication is in flight restores provisioned rules before arm", async () => {
+    const shutdown = new AbortController();
+    const ops = happyPathOps({
+      provisionEgress: vi.fn(async () => {
+        shutdown.abort("SIGTERM");
+        return {
+          ok: true as const,
+          ruleIds: ["provisioned-hermes-abc123def456"],
+          checks: [{ name: "LLM (Venice)", host: "api.venice.ai", port: 443, allowed: true }],
+          dnsRulePresent: true,
+        };
+      }),
+    });
+
+    const result = await runProvisionFlow(
+      { ...baseCtx(), shutdownSignal: shutdown.signal } as ProvisionFlowContext & {
+        shutdownSignal: AbortSignal;
+      },
+      ops,
+    );
+
+    expect(result).toMatchObject({ kind: "aborted", stage: "shutdown-after-provision-egress", rolledBack: true });
+    expect(ops.restoreProvisionedEgressToPreRunState).toHaveBeenCalledTimes(1);
+    expect(ops.uninstallHarnessDaemon).toHaveBeenCalledTimes(1);
+    expect(ops.restoreRehome).toHaveBeenCalledWith(REHOME_RESULTS);
+    expect(ops.arm).not.toHaveBeenCalled();
+  });
+
+  it("F2: a shutdown requested after arm fast-disarms and restores provisioned egress without pretending connectivity failed", async () => {
+    const shutdown = new AbortController();
+    const ops = happyPathOps({
+      arm: vi.fn(async () => {
+        shutdown.abort("SIGTERM");
+        return { ok: true as const };
+      }),
+    });
+
+    const result = await runProvisionFlow(
+      { ...baseCtx(), shutdownSignal: shutdown.signal } as ProvisionFlowContext & {
+        shutdownSignal: AbortSignal;
+      },
+      ops,
+    );
+
+    expect((result as { kind: string }).kind).toBe("shutdown-after-arm-rolled-back");
+    expect(ops.disarm).toHaveBeenCalledTimes(1);
+    expect(ops.restoreProvisionedEgressToPreRunState).toHaveBeenCalledTimes(1);
+    expect(ops.postArmEndpoints).not.toHaveBeenCalled();
+    expect(ops.verifyAgentEgressAfterArm).not.toHaveBeenCalled();
+    expect((result as { reason: string }).reason).toMatch(/shutdown requested/i);
+    expect((result as { reason: string }).reason).not.toMatch(/connectivity re-check failed|egress verification failed/i);
+  });
+
   it("FIX (round 5, R7-3): a verify-before-arm abort whose restore hit a CONFLICT-only outcome does NOT say 'restore FAILED' in its reason (matches the R5-2 conflict-safe render)", async () => {
     const ops = happyPathOps({
       preArmEndpoints: vi.fn(() => [{ name: "LLM", probe: async () => false }]),

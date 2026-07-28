@@ -82,10 +82,14 @@ import {
 import { startDashboard, type DashboardHandle } from "../dashboard/index.js";
 import { buildWrapFleetRosterProvider } from "./fleet-roster-provider.js";
 import {
+  LAUNCHCTL_TIMEOUT_MS,
   runAutoProvisionForWrap,
   type AutoProvisionSummary,
 } from "./auto-provision.js";
-import type { ProvisionFlowOutcome } from "../castle-wall/provision/index.js";
+import type {
+  ProvisionFlowOutcome,
+  ProvisionFlowShutdownStatus,
+} from "../castle-wall/provision/index.js";
 import { ProvisionLockHeldError } from "../castle-wall/provision/index.js";
 import { harnessDispositionSentence } from "../egress-gate/parked-claim.js";
 import {
@@ -167,7 +171,7 @@ import {
 import type { UpstreamServer, SovereigntyProfile } from "../sovereignty-profile.js";
 import { runProvisionPin } from "../cli/castle-wall.js";
 
-type ProcessShutdownCleanup = () => void | Promise<void>;
+type ProcessShutdownCleanup = (signal?: NodeJS.Signals) => void | Promise<void>;
 
 const processShutdownCleanups = new Set<ProcessShutdownCleanup>();
 let processShutdownListenersInstalled = false;
@@ -196,13 +200,14 @@ let processShutdownListenersInstalled = false;
 // abandoned at its first `await`. Loop until the set is observed empty so
 // any cleanup registered while a previous batch was draining gets picked up
 // by the next iteration instead of orphaned.
-async function runProcessShutdownCleanups(): Promise<void> {
+async function runProcessShutdownCleanups(signal?: NodeJS.Signals | number): Promise<void> {
+  const cleanupSignal = typeof signal === "string" ? signal : undefined;
   while (processShutdownCleanups.size > 0) {
     const cleanups = [...processShutdownCleanups];
     processShutdownCleanups.clear();
     await Promise.allSettled(
       cleanups.map(async (cleanup) => {
-        await cleanup();
+        await cleanup(cleanupSignal);
       }),
     );
   }
@@ -243,7 +248,7 @@ export async function handleProcessShutdownSignal(
     await processShutdownInFlight;
     return;
   }
-  processShutdownInFlight = runProcessShutdownCleanups();
+  processShutdownInFlight = runProcessShutdownCleanups(signal);
   try {
     await processShutdownInFlight;
   } finally {
@@ -266,6 +271,66 @@ export function registerProcessShutdownCleanup(
   return () => {
     processShutdownCleanups.delete(cleanup);
   };
+}
+
+/** Signal shutdown waits for in-flight provisioning up to the existing launchctl host-operation budget. */
+export const AUTO_PROVISION_SHUTDOWN_DEADLINE_MS = LAUNCHCTL_TIMEOUT_MS;
+
+const DEFAULT_AUTO_PROVISION_SHUTDOWN_STATUS: ProvisionFlowShutdownStatus = {
+  stage: "auto-provision",
+  residualState:
+    "automatic account provisioning was in flight; rollback state was not yet reported by the orchestrator",
+  recoveryCommand: "sudo sanctuary protect --hermes",
+};
+
+function createAutoProvisionShutdownStatusTracker(): {
+  current: () => ProvisionFlowShutdownStatus;
+  update: (status: ProvisionFlowShutdownStatus) => void;
+} {
+  let current = DEFAULT_AUTO_PROVISION_SHUTDOWN_STATUS;
+  return {
+    current: () => current,
+    update: (status) => {
+      current = status;
+    },
+  };
+}
+
+/**
+ * Abort an in-flight auto-provision run and wait for its own rollback machinery
+ * to settle. On deadline expiry it prints the latest non-secret residual state
+ * instead of claiming a rollback that was not observed.
+ */
+export async function waitForAutoProvisionShutdown(input: {
+  signal: NodeJS.Signals;
+  abortController: AbortController;
+  provisionPromise: Promise<AutoProvisionSummary>;
+  deadlineMs: number;
+  currentStatus: () => ProvisionFlowShutdownStatus;
+  print: (line: string) => void;
+}): Promise<void> {
+  if (!input.abortController.signal.aborted) {
+    input.abortController.abort(input.signal);
+  }
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<"deadline">((resolve) => {
+    timeout = setTimeout(() => resolve("deadline"), input.deadlineMs);
+  });
+  const settled = input.provisionPromise.then(
+    () => "settled" as const,
+    () => "settled" as const,
+  );
+  const result = await Promise.race([settled, deadline]);
+  if (timeout !== undefined) clearTimeout(timeout);
+  if (result === "deadline") {
+    const status = input.currentStatus();
+    input.print(
+      `WARNING: ${input.signal} arrived while automatic account provisioning was in flight. ` +
+        `Requested rollback and waited ${input.deadlineMs}ms, but rollback was NOT observed before the shutdown deadline. ` +
+        `Current stage: ${status.stage}. Residual state: ${status.residualState}. ` +
+        `Recover with: ${status.recoveryCommand}. Do not assume a clean rollback.`,
+    );
+  }
 }
 
 // ── Types ───────────────────────────────────────────────────────────
@@ -1754,6 +1819,7 @@ function protectionObservationFromAutoProvisionSummary(
         reasons: [outcome.reason],
       };
     case "armed-then-rolled-back":
+    case "shutdown-after-arm-rolled-back":
     case "egress-unprovisioned-rolled-back":
       if (outcome.disarmObservedOff === true) {
         return {
@@ -1991,8 +2057,27 @@ async function maybeRunAutoProvisionForWrap(
     return { ran: false };
   }
   const runner = deps.runAutoProvisionForWrap ?? runAutoProvisionForWrap;
+  const shutdownAbort = new AbortController();
+  const shutdownStatus = createAutoProvisionShutdownStatusTracker();
+  let provisionPromise: Promise<AutoProvisionSummary> | undefined;
+  const unregisterProvisionShutdownCleanup = registerProcessShutdownCleanup(async (signal) => {
+    if (provisionPromise === undefined) {
+      if (!shutdownAbort.signal.aborted) shutdownAbort.abort("process shutdown before provisioning started");
+      return;
+    }
+    await waitForAutoProvisionShutdown({
+      signal: signal ?? "SIGTERM",
+      abortController: shutdownAbort,
+      provisionPromise,
+      deadlineMs: deps.autoProvisionShutdownDeadlineMs ?? AUTO_PROVISION_SHUTDOWN_DEADLINE_MS,
+      currentStatus: shutdownStatus.current,
+      // SAFETY: stderr is the operator-facing shutdown channel; the helper
+      // prints only stage/residual/recovery metadata, never secrets.
+      print: (line) => console.error(`  ${line}`),
+    });
+  });
   try {
-    return await runner({
+    provisionPromise = runner({
       isTty: process.stdin.isTTY === true,
       preAnsweredProvision: options.provisionAgentAccount,
       cliBinary: resolveAutoProvisionCliBinary(options),
@@ -2004,7 +2089,10 @@ async function maybeRunAutoProvisionForWrap(
       // the auto-provision flow (account plan, re-home summary, arm
       // result), never secrets or key material.
       print: (line) => console.error(`  ${line}`),
+      shutdownSignal: shutdownAbort.signal,
+      onShutdownStatus: shutdownStatus.update,
     });
+    return await provisionPromise;
   } catch (err) {
     // FIX (round 5 / R8-2): a held provision lock means the flow body NEVER
     // ran (another `sanctuary protect` is mid-provision), so this run mutated
@@ -2041,6 +2129,8 @@ async function maybeRunAutoProvisionForWrap(
         `enforcing over a half-provisioned agent.`,
     );
     return { ran: true };
+  } finally {
+    unregisterProvisionShutdownCleanup();
   }
 }
 
@@ -2110,6 +2200,13 @@ export function renderAutoProvisionOutcomeLines(summary: AutoProvisionSummary): 
           `The disarm attempt itself also failed: ${outcome.disarmError}. ` +
           `The agent may be unreachable behind the wall. Run 'sudo sanctuary castle-wall disable' manually now, ` +
           `then investigate before re-running 'sanctuary protect --hermes'.`,
+      ];
+    case "shutdown-after-arm-rolled-back":
+      return [
+        `  Note: SIGINT/SIGTERM arrived after Castle Wall armed; automatic shutdown rollback fast-disarmed before exit ` +
+          `(${outcome.reason}). The agent still runs under its dedicated, re-homed account; only enforcement came down` +
+          `${outcome.egressRestoredToPreRunState ? " and the provisioned egress rules were restored to their pre-run state" : ""}. ` +
+          `Re-run 'sanctuary protect --hermes' when you are ready to arm again.`,
       ];
     case "egress-unprovisioned-rolled-back":
       // Confined-agent egress (design section 5): the wall armed but the
@@ -2299,6 +2396,11 @@ export interface RunWrapDeps {
    * daemon-install / arm side effects.
    */
   runAutoProvisionForWrap?: typeof runAutoProvisionForWrap;
+  /**
+   * Test seam for the bounded SIGINT/SIGTERM provisioning rollback wait.
+   * Production leaves this unset and uses AUTO_PROVISION_SHUTDOWN_DEADLINE_MS.
+   */
+  autoProvisionShutdownDeadlineMs?: number;
   /**
    * Override the resolved OS platform used by the `--exclusive-egress` /
    * `--provision-agent-account` darwin-only refusal (for tests). Production

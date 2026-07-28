@@ -99,6 +99,17 @@ const HERMES_LITERAL_CLASSIFICATIONS: readonly HermesLiteralClassification[] = [
     reason: "the provisioning orchestrator is reached from the Hermes-gated auto-provision path",
   },
   {
+    // FIX F2 (2026-07-28): shutdown-deadline residual-state reporting names
+    // the Hermes provisioning command because this orchestrator entrypoint is
+    // currently invoked only from the Hermes-gated auto-provision path.
+    file: "server/src/castle-wall/provision/orchestrate.ts",
+    scope: "<top-level>",
+    snippet: "sudo sanctuary protect --hermes",
+    exact: true,
+    expectedCount: 1,
+    reason: "the provisioning orchestrator is reached from the Hermes-gated auto-provision path",
+  },
+  {
     // FIX F-PIPX (2026-07-27): the Hermes runtime resolver accepts either
     // the legacy re-homed tree or a measured pipx install, so the remaining
     // command literal is still Hermes-scoped by construction.
@@ -235,6 +246,14 @@ const HERMES_LITERAL_CLASSIFICATIONS: readonly HermesLiteralClassification[] = [
   {
     file: "server/src/wrap/cli.ts",
     scope: "renderAutoProvisionOutcomeLines",
+    snippet: "Re-run 'sanctuary protect --hermes' when you are ready to arm again.",
+    exact: true,
+    expectedCount: 1,
+    reason: "auto-provision outcome text is inside the Hermes protect surface",
+  },
+  {
+    file: "server/src/wrap/cli.ts",
+    scope: "renderAutoProvisionOutcomeLines",
     snippet: "Re-run 'sanctuary protect --hermes' once the per-endpoint failures",
     expectedCount: 1,
     reason: "auto-provision outcome text is inside the Hermes protect surface",
@@ -314,8 +333,8 @@ const HERMES_LITERAL_CLASSIFICATIONS: readonly HermesLiteralClassification[] = [
     file: "server/src/wrap/cli.ts",
     scope: "<top-level>",
     snippet: "--hermes",
-    expectedCount: 2,
-    reason: "wrap option metadata declares the real Hermes flag",
+    expectedCount: 3,
+    reason: "wrap option metadata declares the real Hermes flag; the shutdown deadline default status is also Hermes-scoped inside protect auto-provisioning",
   },
   {
     file: "server/src/wrap/cli.ts",

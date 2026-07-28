@@ -68,6 +68,7 @@ import {
   type DisarmNePreferenceOutcome,
   type ProvisionFlowOps,
   type ProvisionFlowOutcome,
+  type ProvisionFlowShutdownStatus,
   type RehomeStepResult,
   type EndpointProbeTarget,
   type PolicyDaemonAction,
@@ -966,6 +967,16 @@ export interface RunAutoProvisionForWrapOptions {
    * stages prove live. Off by default (coarse drill-proven path unchanged).
    */
   exclusiveEgress?: boolean;
+  /**
+   * Aborted by `wrap/cli.ts` when SIGINT/SIGTERM arrives during provisioning.
+   * The orchestrator observes it only at rollback-safe checkpoints.
+   */
+  shutdownSignal?: AbortSignal;
+  /**
+   * Receives non-secret in-flight state so signal shutdown can print a bounded
+   * residual-state warning if rollback does not settle before its deadline.
+   */
+  onShutdownStatus?: (status: ProvisionFlowShutdownStatus) => void;
 }
 
 /**
@@ -1901,6 +1912,8 @@ export async function runAutoProvisionForWrap(
         // S5-6: fine-grained (exclusive-egress) mode -- parked install +
         // exclusive arming stage after the coarse stages prove live.
         fineGrainedDeclared: options.exclusiveEgress === true,
+        shutdownSignal: options.shutdownSignal,
+        onShutdownStatus: options.onShutdownStatus,
       },
       { ...ops, ...(exclusiveEgressOps !== undefined ? { exclusiveEgress: exclusiveEgressOps } : {}) },
     ),

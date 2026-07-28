@@ -56,6 +56,12 @@ import { handleStandaloneShutdownSignal } from "../../src/dashboard-standalone.j
 import type { AutoProvisionSummary } from "../../src/wrap/auto-provision.js";
 import type { DashboardHandle } from "../../src/dashboard/index.js";
 import {
+  runProvisionFlow,
+  type ProvisionFlowContext,
+  type ProvisionFlowOps,
+} from "../../src/castle-wall/provision/orchestrate.js";
+import type { RehomeStepResult } from "../../src/castle-wall/provision/rehome.js";
+import {
   agreeingHermesParity,
   installHermesParityHook,
   clearHermesParityHook,
@@ -63,6 +69,129 @@ import {
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const fixturesDir = join(__dirname, "..", "harness", "fixtures");
+const SIGNAL_TEST_UID = 503;
+const SIGNAL_TEST_REHOME_RESULTS: RehomeStepResult[] = [
+  {
+    entry: { sourcePath: "/Users/operator/.hermes/.env", destRelativePath: ".hermes/.env", isSecret: true },
+    destPath: "/var/sanctuary-agents/sanctuary-hermes/.hermes/.env",
+    status: "moved",
+    backupPath: "/root/backup/.hermes/.env.bak",
+  },
+];
+
+function sleepMs(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function deferred<T = void>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+
+function signalProvisionCtx(
+  shutdownSignal: AbortSignal | undefined,
+  onShutdownStatus: ((status: unknown) => void) | undefined,
+): ProvisionFlowContext {
+  return {
+    agentId: "hermes",
+    accountName: "sanctuary-hermes",
+    ceiling: 500,
+    detectResult: { needsProvisioning: true, alreadyDedicated: false, reason: "shared account" },
+    isTty: true,
+    fortressPath: "/Users/operator/.sanctuary",
+    harnessEndpoints: {
+      harnessId: "hermes",
+      endpoints: [
+        {
+          name: "LLM (Venice)",
+          host: "api.venice.ai",
+          port: 443,
+          protocol: "tcp",
+          riskClass: "standard",
+        },
+      ],
+    },
+    shutdownSignal,
+    onShutdownStatus,
+  } as ProvisionFlowContext & {
+    shutdownSignal?: AbortSignal;
+    onShutdownStatus?: (status: unknown) => void;
+  };
+}
+
+function signalProvisionOps(overrides: Partial<ProvisionFlowOps> = {}): ProvisionFlowOps {
+  return {
+    confirm: vi.fn(async () => true),
+    print: vi.fn(),
+    createAccount: vi.fn(async () => ({
+      plan: { action: "create", accountName: "sanctuary-hermes", uid: SIGNAL_TEST_UID },
+      uid: SIGNAL_TEST_UID,
+    })),
+    rehome: vi.fn(async () => ({
+      plan: { harnessId: "hermes", steps: [], requiresInteractiveReconsent: false },
+      results: SIGNAL_TEST_REHOME_RESULTS,
+    })),
+    installHarnessDaemon: vi.fn(async () => ({ ok: true as const, bootstrappedThisRun: true })),
+    restoreStoodDownHarness: vi.fn(async () => ({
+      restored: true,
+      wasRunning: true,
+      harnessRestarted: true,
+      problems: [],
+    })),
+    uninstallHarnessDaemon: vi.fn(async () => undefined),
+    ensurePolicyDaemon: vi.fn(async () => ({ ok: true as const, freshlyInstalled: false })),
+    teardownPolicyDaemon: vi.fn(async () => undefined),
+    provisionEgress: vi.fn(async () => ({
+      ok: true as const,
+      ruleIds: ["provisioned-hermes-abc123def456"],
+      checks: [{ name: "LLM (Venice)", host: "api.venice.ai", port: 443, allowed: true }],
+      dnsRulePresent: true,
+    })),
+    restoreProvisionedEgressToPreRunState: vi.fn(async () => ({
+      restored: true,
+      reloadOk: true,
+      problems: [],
+    })),
+    verifyAgentEgressAfterArm: vi.fn(async () => ({
+      ok: true,
+      rows: [
+        {
+          name: "LLM (Venice)",
+          host: "api.venice.ai",
+          port: 443,
+          expected: "reachable" as const,
+          observed: "reachable" as const,
+          pass: true,
+        },
+      ],
+    })),
+    auditEgress: vi.fn(async () => undefined),
+    preArmEndpoints: vi.fn(() => [{ name: "LLM", probe: async () => true }]),
+    checkUidExistence: vi.fn(async () => ({ ok: true, accountName: "sanctuary-hermes", uid: SIGNAL_TEST_UID })),
+    arm: vi.fn(async () => ({ ok: true as const })),
+    postArmEndpoints: vi.fn(() => [{ name: "LLM", probe: async () => true }]),
+    disarm: vi.fn(async () => ({ nePreferenceOutcome: "corroborated_off" as const })),
+    restoreRehome: vi.fn(async () => ({
+      fullyRestored: true,
+      restoredCount: SIGNAL_TEST_REHOME_RESULTS.length,
+      attemptedCount: SIGNAL_TEST_REHOME_RESULTS.length,
+      backupPaths: SIGNAL_TEST_REHOME_RESULTS.filter((r) => r.backupPath).map((r) => r.backupPath!),
+      conflictPaths: [],
+      failedPaths: [],
+    })),
+    reconcileExclusiveRoutingResidue: vi.fn(async () => ({ kind: "clear" as const })),
+    lookupDedicatedAccountUid: vi.fn(async () => undefined),
+    observeAgentConfinement: vi.fn(async () => ({
+      known: true as const,
+      confinedUids: [],
+      exclusiveRoutingMarkerPresent: false,
+    })),
+    ...overrides,
+  };
+}
 
 // ── Fix 1: signal handlers must exit ─────────────────────────────────────
 
@@ -160,6 +289,170 @@ describe("handleProcessShutdownSignal (wrap/cli.ts) exits after cleanups", () =>
     expect(firstSettled).toBe(true);
     expect(lateSettled).toBe(true);
     expect(exitSpy).toHaveBeenCalledWith(143);
+  });
+});
+
+describe("runWrap: SIGTERM during in-flight provisioning waits for rollback or a bounded deadline", () => {
+  let tmpHome: string;
+  let originalHome: string | undefined;
+  let originalStoragePath: string | undefined;
+  let originalIsTty: boolean | undefined;
+  let stderrSpy: ReturnType<typeof vi.spyOn>;
+  let exitSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(async () => {
+    tmpHome = await mkdtemp(join(tmpdir(), "sanctuary-provision-signal-"));
+    originalHome = process.env.HOME;
+    originalStoragePath = process.env.SANCTUARY_STORAGE_PATH;
+    originalIsTty = process.stdin.isTTY;
+    process.env.HOME = tmpHome;
+    process.env.SANCTUARY_STORAGE_PATH = join(tmpHome, ".sanctuary");
+    Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
+    stderrSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    exitSpy = vi.spyOn(process, "exit").mockImplementation(((
+      _code?: number,
+    ) => undefined) as never);
+    installHermesParityHook(agreeingHermesParity);
+    const hermesDir = join(tmpHome, ".hermes");
+    await mkdir(hermesDir, { recursive: true });
+    await cp(join(fixturesDir, "hermes.json"), join(hermesDir, "cli-config.json"));
+  });
+
+  afterEach(async () => {
+    stderrSpy.mockRestore();
+    exitSpy.mockRestore();
+    clearHermesParityHook();
+    if (originalHome === undefined) delete process.env.HOME;
+    else process.env.HOME = originalHome;
+    if (originalStoragePath === undefined) delete process.env.SANCTUARY_STORAGE_PATH;
+    else process.env.SANCTUARY_STORAGE_PATH = originalStoragePath;
+    Object.defineProperty(process.stdin, "isTTY", {
+      value: originalIsTty,
+      configurable: true,
+    });
+    await rm(tmpHome, { recursive: true, force: true });
+  });
+
+  function deps(overrides: Partial<RunWrapDeps> = {}): RunWrapDeps {
+    return {
+      startDashboard: vi.fn(),
+      openBrowser: vi.fn(async () => {}),
+      resolvePassphrase: async () => ({
+        value: "test-passphrase",
+        location: "test-keychain",
+        source: "generated" as const,
+      }),
+      ...overrides,
+    };
+  }
+
+  it("a real SIGTERM while provision-egress is in flight waits for runProvisionFlow's egress restore before exit", async () => {
+    const provisionEntered = deferred<void>();
+    const finishProvision = deferred<void>();
+    let released = false;
+    const releaseProvision = () => {
+      if (released) return;
+      released = true;
+      finishProvision.resolve();
+    };
+    const restoreProvisionedEgressToPreRunState = vi.fn(async () => ({
+      restored: true,
+      reloadOk: true,
+      problems: [],
+    }));
+    const ops = signalProvisionOps({
+      provisionEgress: vi.fn(async () => {
+        provisionEntered.resolve();
+        await finishProvision.promise;
+        return {
+          ok: true as const,
+          ruleIds: ["provisioned-hermes-abc123def456"],
+          checks: [{ name: "LLM (Venice)", host: "api.venice.ai", port: 443, allowed: true }],
+          dnsRulePresent: true,
+        };
+      }),
+      restoreProvisionedEgressToPreRunState,
+    });
+    const runAutoProvisionForWrap = vi.fn(async (input: unknown): Promise<AutoProvisionSummary> => {
+      const provisionInput = input as {
+        shutdownSignal?: AbortSignal;
+        onShutdownStatus?: (status: unknown) => void;
+      };
+      const outcome = await runProvisionFlow(
+        signalProvisionCtx(provisionInput.shutdownSignal, provisionInput.onShutdownStatus),
+        ops,
+      );
+      return { ran: true, outcome };
+    });
+
+    const runPromise = runWrap(
+      { hermes: true, noOpen: true, noDashboard: true },
+      deps({ runAutoProvisionForWrap }),
+    );
+
+    try {
+      await provisionEntered.promise;
+      process.kill(process.pid, "SIGTERM");
+      await sleepMs(25);
+      expect(exitSpy).not.toHaveBeenCalled();
+
+      releaseProvision();
+      await runPromise;
+      await vi.waitFor(() => expect(exitSpy).toHaveBeenCalledWith(143));
+
+      expect(restoreProvisionedEgressToPreRunState).toHaveBeenCalledTimes(1);
+      expect(ops.arm).not.toHaveBeenCalled();
+      const restoreOrder = restoreProvisionedEgressToPreRunState.mock.invocationCallOrder[0];
+      const exitOrder = exitSpy.mock.invocationCallOrder[0];
+      expect(restoreOrder).toBeLessThan(exitOrder);
+    } finally {
+      releaseProvision();
+      await Promise.race([runPromise.catch(() => undefined), sleepMs(50)]);
+    }
+  });
+
+  it("a hung rollback is bounded and the shutdown message names the residual state plus recovery verb", async () => {
+    const finishProvision = deferred<AutoProvisionSummary>();
+    let released = false;
+    const releaseProvision = () => {
+      if (released) return;
+      released = true;
+      finishProvision.resolve({ ran: false });
+    };
+    const runAutoProvisionForWrap = vi.fn(async (input: unknown): Promise<AutoProvisionSummary> => {
+      const provisionInput = input as {
+        onShutdownStatus?: (status: unknown) => void;
+      };
+      provisionInput.onShutdownStatus?.({
+        stage: "provision-egress",
+        residualState: "the agent may be PARKED and provisioned egress rules may be partially published",
+        recoveryCommand: "sudo sanctuary protect --hermes",
+      });
+      return finishProvision.promise;
+    });
+
+    const runPromise = runWrap(
+      { hermes: true, noOpen: true, noDashboard: true },
+      {
+        ...deps({ runAutoProvisionForWrap }),
+        autoProvisionShutdownDeadlineMs: 5,
+      } as RunWrapDeps & { autoProvisionShutdownDeadlineMs: number },
+    ).catch(() => undefined);
+
+    try {
+      await vi.waitFor(() => expect(runAutoProvisionForWrap).toHaveBeenCalledTimes(1), { timeout: 5000 });
+      process.kill(process.pid, "SIGTERM");
+      await vi.waitFor(() => expect(exitSpy).toHaveBeenCalledWith(143), { timeout: 250 });
+
+      const printed = stderrSpy.mock.calls.flat().join("\n");
+      expect(printed).toMatch(/rollback was NOT observed/i);
+      expect(printed).toMatch(/provision-egress/);
+      expect(printed).toMatch(/PARKED/);
+      expect(printed).toMatch(/sudo sanctuary protect --hermes/);
+    } finally {
+      releaseProvision();
+      await Promise.race([runPromise, sleepMs(50)]);
+    }
   });
 });
 
