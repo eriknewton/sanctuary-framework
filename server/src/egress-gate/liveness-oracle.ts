@@ -126,6 +126,13 @@ export interface LivenessProbeBinding {
 
 export interface LivenessOracleRefreshOptions {
   /**
+   * Guard evaluated before this refresh mutates the token file in either
+   * direction, including a last check immediately before a live-token write. A
+   * supervisor that has superseded an attempt returns `"skip"` so a stale async
+   * settle cannot publish OR remove a newer token.
+   */
+  shouldApply?: () => boolean | "skip";
+  /**
    * Last-chance write guard evaluated after the live probe and immediately
    * before publishing. A supervisor can abandon a timed-out attempt without
    * letting that old async path mint a later live token.
@@ -206,6 +213,10 @@ export class GateLivenessOracle {
       result = await this.ops.probe({ agentUid, gatePort });
     } catch (probeErr) {
       // Cannot confirm liveness -> invalidate fail-closed, then surface.
+      const applyDecision = options.shouldApply?.();
+      if (applyDecision !== undefined && applyDecision !== true) {
+        throw probeErr;
+      }
       try {
         await this.ops.removeToken(agentUid);
       } catch (rmErr) {
@@ -221,7 +232,15 @@ export class GateLivenessOracle {
     if (result.live !== true) {
       // Not live -> remove the token (do NOT publish a live:false token that a
       // write failure could fail to overwrite). A removal failure is loud.
+      const applyDecision = options.shouldApply?.();
+      if (applyDecision !== undefined && applyDecision !== true) {
+        return null;
+      }
       await this.ops.removeToken(agentUid);
+      return null;
+    }
+    const applyDecision = options.shouldApply?.();
+    if (applyDecision !== undefined && applyDecision !== true) {
       return null;
     }
     const publishDecision = options.shouldPublish?.();
@@ -249,6 +268,10 @@ export class GateLivenessOracle {
     };
     const sig = edSign(null, canonicalLivenessPayload(claims), this.privateKey).toString("base64");
     const token: SignedLivenessToken = { ...claims, sig };
+    const writeDecision = options.shouldApply?.();
+    if (writeDecision !== undefined && writeDecision !== true) {
+      return null;
+    }
     await this.ops.writeToken(agentUid, JSON.stringify(token));
     return token;
   }

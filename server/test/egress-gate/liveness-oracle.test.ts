@@ -112,6 +112,32 @@ describe("egress-gate/liveness-oracle sign + verify", () => {
     expect((await probe.check()).live).toBe(true);
   });
 
+  it("a refresh that becomes stale after the probe is guarded again before writing", async () => {
+    const { privateKey } = generateKeyPairSync("ed25519");
+    const writes: number[] = [];
+    let applyChecks = 0;
+    const h = harness({ now: 1_000, live: true });
+    const ops: LivenessOracleOps = {
+      ...h.ops,
+      writeToken: (uid, payload) => {
+        writes.push(uid);
+        return h.ops.writeToken(uid, payload);
+      },
+    };
+    const oracle = new GateLivenessOracle(privateKey, ops, { ttlMs: 2_000 });
+    const result = await oracle.refresh(binding, {
+      shouldApply: () => {
+        applyChecks += 1;
+        return applyChecks === 1 ? true : "skip";
+      },
+    });
+
+    expect(result).toBeNull();
+    expect(applyChecks).toBe(2);
+    expect(writes).toHaveLength(0);
+    expect(h.tokenFor(binding.agentUid)).toBeNull();
+  });
+
   it("an absent token is not live (supervisor invalidated / never published)", async () => {
     const { publicKey } = generateKeyPairSync("ed25519");
     const emptySource: LivenessTokenSource = { read: () => Promise.resolve(null) };
