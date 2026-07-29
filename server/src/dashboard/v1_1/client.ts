@@ -52,10 +52,11 @@ const SANCTUARY_VERSION = config.sanctuaryVersion || "";
 const SESSION_KEY = "sanctuary-v11-sidebar";
 // The top-bar seal is the strongest visible protection claim on the page.
 // It must be backed by evidence, not just the backend arm-state label. Ten
-// minutes mirrors the backend default freshness window and is only an upper
-// bound here; if the payload supplies a smaller window, the smaller window
-// wins. Missing or malformed freshness data never extends this threshold.
+// minutes is only an upper bound here; if the payload supplies a smaller
+// window, the smaller window wins. Missing, malformed, or non-positive
+// freshness windows are unknown, never silently widened to this maximum.
 const SEAL_FRESHNESS_MAX_MS = 10 * 60 * 1000;
+let sealFreshnessTimer = null;
 
 // ── State ──────────────────────────────────────────────────────────────
 const state = {
@@ -693,6 +694,7 @@ function renderAgentSwitcher() {
 // word (deriveSeal); the popover spells out the named layers (no L-numbers).
 function renderPostureSeal() {
   const seal = deriveSeal();
+  scheduleSealFreshnessRefresh(seal.freshness);
   const sealEl = document.getElementById("posture-seal");
   const wordEl = document.getElementById("posture-seal-word");
   const freshnessEl = document.getElementById("posture-seal-freshness");
@@ -723,7 +725,7 @@ function renderPostureSeal() {
     sub = "Lockdown holds wrapped agents. Protected is only shown when Castle Wall enforcement has current evidence.";
   } else if (seal.tone === "attention") {
     head = "Protected is not confirmed.";
-    sub = "The current enforcement observation is missing, stale, invalid, or degraded. Risky actions still require approval.";
+    sub = "The current enforcement observation is missing, stale, invalid, degraded, or missing a freshness window. Risky actions still require approval.";
   } else {
     head = "Posture is being checked.";
     sub = "Live enforcement evidence is not loaded yet. Until it is current, this is not shown as protected.";
@@ -3133,7 +3135,7 @@ function sealFreshnessWindowMs(live) {
   if (Number.isFinite(payloadWindow) && payloadWindow > 0) {
     return Math.min(payloadWindow, SEAL_FRESHNESS_MAX_MS);
   }
-  return SEAL_FRESHNESS_MAX_MS;
+  return null;
 }
 
 function sealEvidenceWhat(live) {
@@ -3172,8 +3174,21 @@ function sealEvidenceWhat(live) {
 function deriveSealFreshness(live, now) {
   const checkedAt = typeof now === "number" ? now : Date.now();
   const windowMs = sealFreshnessWindowMs(live);
-  const windowLabel = durationLabelFromMs(windowMs);
+  const windowKnown = typeof windowMs === "number" && Number.isFinite(windowMs);
+  const windowLabel = windowKnown ? durationLabelFromMs(windowMs) : "unknown";
   const what = sealEvidenceWhat(live);
+  if (!windowKnown) {
+    return {
+      state: "unknown",
+      current: false,
+      inline: "freshness window unknown",
+      detail: "freshness window unknown",
+      windowLabel: windowLabel,
+      windowKnown: false,
+      refreshAt: null,
+      what: what
+    };
+  }
   const raw = live && live.last_enforcement_evidence_at;
   if (typeof raw !== "string" || raw.trim() === "") {
     return {
@@ -3182,6 +3197,8 @@ function deriveSealFreshness(live, now) {
       inline: "no evidence",
       detail: "not provided",
       windowLabel: windowLabel,
+      windowKnown: true,
+      refreshAt: null,
       what: what
     };
   }
@@ -3194,6 +3211,8 @@ function deriveSealFreshness(live, now) {
       inline: "invalid evidence time",
       detail: "unparseable timestamp",
       windowLabel: windowLabel,
+      windowKnown: true,
+      refreshAt: null,
       what: what
     };
   }
@@ -3205,19 +3224,44 @@ function deriveSealFreshness(live, now) {
       inline: "invalid evidence time",
       detail: "timestamp is in the future",
       windowLabel: windowLabel,
+      windowKnown: true,
+      refreshAt: null,
       what: what
     };
   }
   const ageLabel = durationLabelFromMs(ageMs);
   const inline = "last evidenced " + ageLabel + " ago";
+  const current = ageMs <= windowMs;
   return {
-    state: ageMs <= windowMs ? "fresh" : "stale",
-    current: ageMs <= windowMs,
+    state: current ? "fresh" : "stale",
+    current: current,
     inline: inline,
     detail: shortTime(iso) + " (" + ageLabel + " ago)",
     windowLabel: windowLabel,
+    windowKnown: true,
+    refreshAt: current ? observedAt + windowMs + 1000 : null,
     what: what
   };
+}
+
+function clearSealFreshnessTimer() {
+  if (sealFreshnessTimer !== null) clearTimeout(sealFreshnessTimer);
+  sealFreshnessTimer = null;
+}
+
+function scheduleSealFreshnessRefresh(freshness) {
+  clearSealFreshnessTimer();
+  if (
+    !freshness ||
+    !freshness.current ||
+    typeof freshness.refreshAt !== "number" ||
+    !Number.isFinite(freshness.refreshAt)
+  ) return;
+  const delayMs = Math.max(0, freshness.refreshAt - Date.now());
+  sealFreshnessTimer = setTimeout(function () {
+    sealFreshnessTimer = null;
+    rerender();
+  }, delayMs);
 }
 
 // Wave 1: map the honest Castle Wall arm-state to the operator-facing seal.
@@ -3272,7 +3316,7 @@ function postureLayerLines() {
   return [
     { k: "What was evidenced", v: seal.freshness.what, warn: !seal.freshness.current, off: seal.freshness.state === "absent" },
     { k: "Evidence time", v: seal.freshness.detail, warn: !seal.freshness.current, off: seal.freshness.state === "absent" },
-    { k: "Freshness window", v: "within " + seal.freshness.windowLabel, warn: false },
+    { k: "Freshness window", v: seal.freshness.windowKnown ? "within " + seal.freshness.windowLabel : "unknown", warn: !seal.freshness.windowKnown },
     { k: "Castle Wall (boundary)", v: wallV, warn: wallWarn },
     { k: "Sentinels watching agents", v: wrapped + " wrapped", warn: false, off: wrapped === 0 },
     { k: "Charter approvals", v: pending ? pending + " waiting" : "clear", warn: pending > 0 },
@@ -3722,6 +3766,10 @@ function bindHashRoute() {
   window.addEventListener("hashchange", fromHash);
   fromHash();
 }
+
+document.addEventListener("visibilitychange", function () {
+  if (document.visibilityState === "visible") rerender();
+});
 
 document.addEventListener("click", function (ev) {
   const rawTgt = ev.target;
