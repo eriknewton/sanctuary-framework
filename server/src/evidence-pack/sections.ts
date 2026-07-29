@@ -46,6 +46,7 @@ import {
   foldOutcome,
   type ReadOutcome,
 } from "./read-outcome.js";
+import type { AnchorOfflineVerificationView } from "./anchor-offline-verification.js";
 
 /** One rendered section: a title (PDF page heading) plus its Markdown body. */
 export interface PackSection {
@@ -1319,6 +1320,7 @@ export interface DiscreteExportsView {
   transparency: DiscreteExportView;
   audit_chain: DiscreteExportView;
   anchor: DiscreteExportView;
+  anchor_verification?: AnchorOfflineVerificationView;
 }
 
 /**
@@ -1336,6 +1338,7 @@ export interface DiscreteExportsView {
 function anchorConfirmationLines(
   anchorFilename: string,
   transparency: DiscreteExportView,
+  verification: AnchorOfflineVerificationView | undefined,
   scope: { quarterLabel: string }
 ): string[] {
   const preamble =
@@ -1345,12 +1348,29 @@ function anchorConfirmationLines(
     declareArtifactScope("anchor_evidence", {
       quarterLabel: scope.quarterLabel,
     });
-  if (transparency.outcome.status === "populated") {
+  if (
+    transparency.outcome.status === "populated" &&
+    verification?.status === "confirmable"
+  ) {
     return [
       preamble +
         " Checked against the transparency checkpoint bundle above, an auditor " +
         "can confirm those checkpoints were publicly anchored (freshness and " +
-        "fork detection).",
+        "fork detection). The in-pack offline anchor check found no unverified " +
+        "or invalid anchored receipt in the bundled evidence.",
+      "",
+    ];
+  }
+  if (transparency.outcome.status === "populated") {
+    return [
+      preamble +
+        " NOTE: the transparency checkpoint bundle is included, but the bundled " +
+        "anchor receipts do NOT let an auditor confirm public anchoring offline " +
+        "for every receipt. " +
+        (verification?.detail ??
+          "The in-pack offline anchor verification result was unavailable.") +
+        " Re-export or re-anchor with receipt entry bodies and inclusion proofs " +
+        "before relying on these receipts for freshness or fork detection.",
       "",
     ];
   }
@@ -1546,6 +1566,7 @@ function renderVerification(
         anchorConfirmationLines(
           discreteExports.anchor.filename,
           discreteExports.transparency,
+          discreteExports.anchor_verification,
           scope
         ),
       // C4 (dry-bar): reached ONLY when a real read found no anchor evidence --

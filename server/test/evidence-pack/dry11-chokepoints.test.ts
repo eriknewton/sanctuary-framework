@@ -27,6 +27,7 @@ import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MemoryStorage } from "../../src/storage/memory.js";
+import { canonicalJson } from "../../src/audit/chain.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import { derivePurposeKey } from "../../src/core/key-derivation.js";
 import { createIdentity } from "../../src/core/identity.js";
@@ -55,6 +56,19 @@ import {
   isPackRelevantEntry,
 } from "../../src/evidence-pack/pack-files.js";
 import { PACK_FILENAMES } from "../../src/evidence-pack/generate.js";
+import {
+  anchorCommitmentDigestHex,
+  anchorCommitmentPreimage,
+  anchorPublicKeyPem,
+  buildHashedRekordProposal,
+  deriveAnchorSigningKey,
+  signAnchorPreimage,
+} from "../../src/transparency/anchor.js";
+import { rfc6962LeafHash } from "../../src/transparency/anchor-verify.js";
+import {
+  checkpointPayloadHash,
+  type VerifierCheckpointRecord,
+} from "../../src/transparency/verify.js";
 import type {
   EvidencePack,
   EvidencePackInput,
@@ -495,6 +509,135 @@ describe("D11 X-1: hidden pack-relevant files cannot ship unmanifested", () => {
 // ── X-2 (MED): anchor confirmation is gated on what was actually read ────────
 
 describe("D11 X-2: the anchor arm never claims confirmation the pack cannot support", () => {
+  function hex(bytes: Uint8Array): string {
+    return Buffer.from(bytes).toString("hex");
+  }
+
+  function checkpointRecord(): VerifierCheckpointRecord {
+    return {
+      checkpoint_kind: "enforcement-checkpoint",
+      schema_version: 1,
+      counter: 1,
+      previous_checkpoint_hash: "GENESIS",
+      issued_at: "2026-04-02T10:00:00.000Z",
+      fortress_id: "dry11-fortress",
+      audit: {
+        merkle_root: "01".repeat(32),
+        lowest_sequence: 1,
+        highest_sequence: 1,
+        head_hash: "02".repeat(32),
+        entry_count: 1,
+      },
+      policy: {
+        rules_sha256: "03".repeat(32),
+        rules_count: 1,
+        manifest_sha256: null,
+      },
+      daemon: {
+        version: "0.0.0-test",
+        binary_sha256: "04".repeat(32),
+      },
+      enforcement: {
+        total_allowed: 0,
+        total_blocked: 1,
+        rules: [{ rule_label: "05".repeat(32), allowed: 0, blocked: 1 }],
+      },
+      signer_kid: "castle-wall:test",
+      signature: "test-signature",
+      signature_algorithm: "Ed25519",
+      payload_encoding: "domain-separated-canonical-json-v1",
+      public_key: "test-public-key",
+    };
+  }
+
+  function signedNote(rootHash: Uint8Array): string {
+    const rootB64 = Buffer.from(rootHash).toString("base64");
+    const fakeSignatureBlob = Buffer.from([0, 0, 0, 0, 1]).toString("base64");
+    return (
+      `rekor.fixture.test - 1066\n1\n${rootB64}\n\n` +
+      `\u2014 rekor.fixture.test ${fakeSignatureBlob}\n`
+    );
+  }
+
+  function anchorFixture(partial = false): {
+    transparency: string;
+    anchor: string;
+  } {
+    const record = checkpointRecord();
+    const anchorKey = deriveAnchorSigningKey(generateRandomKey());
+    const anchorPublicKey = anchorPublicKeyPem(anchorKey.publicKey);
+    const salt = "11".repeat(32);
+    const checkpointHash = checkpointPayloadHash(record);
+    const preimage = anchorCommitmentPreimage({
+      saltHex: salt,
+      counter: record.counter,
+      checkpointHash,
+    });
+    const commitment = anchorCommitmentDigestHex(preimage);
+    const body = new TextEncoder().encode(
+      canonicalJson(
+        buildHashedRekordProposal({
+          digestHex: commitment,
+          signatureDer: signAnchorPreimage(anchorKey.privateKey, preimage),
+          publicKeyPem: anchorPublicKey,
+        })
+      )
+    );
+    const leafHash = rfc6962LeafHash(body);
+    const bodyB64 = Buffer.from(body).toString("base64");
+    const receipt = {
+      anchor_kind: "transparency-anchor-receipt",
+      schema_version: 1,
+      counter: record.counter,
+      checkpoint_hash: checkpointHash,
+      commitment_digest: commitment,
+      rekor_url: "https://rekor.fixture.test",
+      status: "anchored",
+      anchored_at: "2026-04-02T10:00:01.000Z",
+      rekor: {
+        uuid: hex(leafHash),
+        log_index: 0,
+        log_id: "fixture-log",
+        integrated_time: 1_760_000_000,
+        ...(!partial ? { body_b64: bodyB64 } : {}),
+        verification: {
+          inclusionProof: {
+            checkpoint: signedNote(leafHash),
+            hashes: [],
+            logIndex: 0,
+            rootHash: hex(leafHash),
+            treeSize: 1,
+          },
+        },
+      },
+    };
+    return {
+      transparency: JSON.stringify(
+        {
+          format: "SANCTUARY_TRANSPARENCY_BUNDLE_V1",
+          exported_at: "2026-04-02T10:00:02.000Z",
+          public_key: record.public_key,
+          checkpoints: [record],
+        },
+        null,
+        2
+      ),
+      anchor: JSON.stringify(
+        {
+          format: "SANCTUARY_TRANSPARENCY_ANCHORS_V1",
+          exported_at: "2026-04-02T10:00:02.000Z",
+          fortress_id: record.fortress_id,
+          salt,
+          anchor_public_key_pem: anchorPublicKey,
+          rekor_url: "https://rekor.fixture.test",
+          receipts: [receipt],
+        },
+        null,
+        2
+      ),
+    };
+  }
+
   function packWith(
     transparency: ReadOutcome<string>,
     anchor: ReadOutcome<string>
@@ -537,14 +680,23 @@ describe("D11 X-2: the anchor arm never claims confirmation the pack cannot supp
     expect(text).toContain("bundle is NOT included");
   });
 
-  it("makes the confirmation claim when the bundle IS included", () => {
-    const pack = packWith(
-      populated(JSON.stringify({ checkpoints: [] })),
-      populated(JSON.stringify({ receipts: [{ counter: 1 }] }))
-    );
+  it("makes the confirmation claim when the bundled receipt is offline-checkable", () => {
+    const fixture = anchorFixture();
+    const pack = packWith(populated(fixture.transparency), populated(fixture.anchor));
     const text = reportText(pack);
     expect(text).toContain("can confirm those checkpoints were publicly anchored");
     expect(text).not.toContain("does NOT let an auditor confirm");
+    expect(text).toContain("found no unverified or invalid anchored receipt");
+  });
+
+  it("prints a caveat when a bundled receipt is partial and unverified", () => {
+    const fixture = anchorFixture(true);
+    const pack = packWith(populated(fixture.transparency), populated(fixture.anchor));
+    const text = reportText(pack);
+    expect(text).not.toContain("can confirm those checkpoints were publicly anchored");
+    expect(text).toContain("do NOT let an auditor confirm public anchoring offline");
+    expect(text).toContain("1 unverified receipt");
+    expect(text).toContain("receipt entry bodies and inclusion proofs");
   });
 
   it("the PDF carries the same gated claim as the Markdown", () => {

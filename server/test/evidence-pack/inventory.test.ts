@@ -10,20 +10,37 @@
  */
 
 import { describe, it, expect } from "vitest";
+import { StateStore } from "../../src/cognitive/state-store.js";
+import { createIdentity, type StoredIdentity } from "../../src/core/identity.js";
+import { derivePurposeKey } from "../../src/core/key-derivation.js";
+import { generateRandomKey } from "../../src/core/random.js";
+import { ObserveStore } from "../../src/castle-wall/observe/store.js";
+import { MemoryStorage } from "../../src/storage/memory.js";
 import type { LocalAgentRecord } from "../../src/contracts/v1.1/local-agent-records.js";
 import type { CandidateObservation } from "../../src/castle-wall/observe/types.js";
+import {
+  buildEvidencePack,
+  REPORT_FILENAME,
+  type AuditReadData,
+  type BuildEvidencePackDeps,
+} from "../../src/evidence-pack/generate.js";
 import {
   buildInventorySnapshot,
   emptyInventorySnapshot,
   notCollectedInventorySnapshot,
   type ProxyServerView,
 } from "../../src/evidence-pack/inventory.js";
+import { readObservedDestinationCandidatesStrict } from "../../src/evidence-pack/observe-candidates.js";
 import type {
+  EvidencePack,
+  EvidencePackInput,
   InventoryAgentRow,
   InventoryMcpServerRow,
   InventoryObservedDestinationRow,
+  InventorySnapshot,
+  RetentionFacts,
 } from "../../src/evidence-pack/types.js";
-import type { ReadOutcome } from "../../src/evidence-pack/read-outcome.js";
+import { populated, type ReadOutcome } from "../../src/evidence-pack/read-outcome.js";
 
 function rowsOf<T>(o: ReadOutcome<T[]>): T[] {
   return o.status === "populated" ? o.value : [];
@@ -72,6 +89,64 @@ function candidate(over: Partial<CandidateObservation>): CandidateObservation {
   };
 }
 
+function retention(): RetentionFacts {
+  return {
+    max_entries: 100_000,
+    retained_total: 0,
+    max_total_size_bytes: 100 * 1024 * 1024,
+    retained_total_size_bytes: 0,
+    ever_pruned: false,
+    earliest_retained_at: null,
+    daemon_store: { status: "absent", included_entry_count: 0 },
+  };
+}
+
+function packInput(inventory: InventorySnapshot): EvidencePackInput {
+  return {
+    firm_name: "Evidence R1 Law LLP",
+    quarter: { year: 2026, quarter: 3 },
+    generated_at_override: "2026-10-02T00:00:00.000Z",
+    custody: populated({
+      custody_mode: "passphrase",
+      outbound_denied_by_default: populated(true),
+    }),
+    inventory,
+  };
+}
+
+function deps(signer: StoredIdentity, masterKey: Uint8Array): BuildEvidencePackDeps {
+  const audit: ReadOutcome<AuditReadData> = populated({
+    entries: [],
+    retention: retention(),
+  });
+  return { audit, signer, masterKey };
+}
+
+function reportText(pack: EvidencePack): string {
+  const report = pack.files.find((file) => file.filename === REPORT_FILENAME);
+  if (!report) throw new Error("expected report file");
+  return report.content;
+}
+
+function makeObservedStore(): {
+  store: ObserveStore;
+  stateStore: StateStore;
+  signer: StoredIdentity;
+  masterKey: Uint8Array;
+} {
+  const storage = new MemoryStorage();
+  const masterKey = generateRandomKey();
+  const stateStore = new StateStore(storage, masterKey);
+  const identityEncryptionKey = derivePurposeKey(masterKey, "identity-encryption");
+  const { storedIdentity } = createIdentity("evidence-r1", identityEncryptionKey, "pw");
+  const store = new ObserveStore(stateStore, {
+    identityId: storedIdentity.identity_id,
+    encryptedPrivateKey: storedIdentity.encrypted_private_key,
+    identityEncryptionKey,
+  });
+  return { store, stateStore, signer: storedIdentity, masterKey };
+}
+
 describe("buildInventorySnapshot", () => {
   it("maps agent records to a populated outcome and sorts the rows", () => {
     const snap = buildInventorySnapshot({
@@ -110,15 +185,40 @@ describe("buildInventorySnapshot", () => {
       observedDestinations: {
         ok: true,
         records: [
-          candidate({ host: "api.openai.com", port: 443, exfil_risk: true }),
+          candidate({ host: "api.telegram.org", port: 443, exfil_risk: true }),
           candidate({ host: null, ip: "9.9.9.9", port: 8080 }),
         ],
       },
     });
     const rows = rowsOf<InventoryObservedDestinationRow>(snap.observed_destinations);
-    expect(rows.map((d) => d.host)).toEqual(["9.9.9.9", "api.openai.com"]);
-    const openai = rows.find((d) => d.host === "api.openai.com")!;
-    expect(openai.exfil_risk).toBe(true);
+    expect(rows.map((d) => d.host)).toEqual(["9.9.9.9", "api.telegram.org"]);
+    const telegram = rows.find((d) => d.host === "api.telegram.org")!;
+    expect(telegram.exfil_risk).toBe(true);
+  });
+
+  it("rejects malformed observed-destination candidates as read_failed, never populated", () => {
+    const snap = buildInventorySnapshot({
+      observedDestinations: {
+        ok: true,
+        records: [
+          candidate({
+            host: "api.telegram.org",
+            would_be_disposition: "allowed",
+            times_seen: -7,
+            first_seen: "not-a-timestamp",
+            exfil_risk: false,
+          }),
+        ],
+      },
+    });
+    expect(snap.observed_destinations.status).toBe("read_failed");
+    if (snap.observed_destinations.status === "read_failed") {
+      expect(snap.observed_destinations.reason).toContain("malformed candidate evidence");
+      expect(snap.observed_destinations.reason).not.toContain("allowed");
+      expect(snap.observed_destinations.reason).not.toContain("-7");
+      expect(snap.observed_destinations.reason).not.toContain("not-a-timestamp");
+      expect(snap.observed_destinations.reason).not.toContain("api.telegram.org");
+    }
   });
 
   it("a failed source is read_failed with a reason and NO rows (never a partial list)", () => {
@@ -174,7 +274,10 @@ describe("buildInventorySnapshot", () => {
   describe("R4-2 pre-idempotency (un-healed legacy observe store) signal", () => {
     it("sets observed_destinations_pre_idempotency when a populated store had no fold watermark", () => {
       const snap = buildInventorySnapshot({
-        observedDestinations: { ok: true, records: [candidate({ host: "api.telegram.org" })] },
+        observedDestinations: {
+          ok: true,
+          records: [candidate({ host: "api.telegram.org", exfil_risk: true })],
+        },
         observedStorePreIdempotency: true,
       });
       expect(snap.observed_destinations.status).toBe("populated");
@@ -183,7 +286,10 @@ describe("buildInventorySnapshot", () => {
 
     it("is false on a post-#931 (watermarked) store even when populated", () => {
       const snap = buildInventorySnapshot({
-        observedDestinations: { ok: true, records: [candidate({ host: "api.telegram.org" })] },
+        observedDestinations: {
+          ok: true,
+          records: [candidate({ host: "api.telegram.org", exfil_risk: true })],
+        },
         observedStorePreIdempotency: false,
       });
       expect(snap.observed_destinations_pre_idempotency).toBe(false);
@@ -209,9 +315,74 @@ describe("buildInventorySnapshot", () => {
 
     it("defaults to false when the signal is omitted", () => {
       const snap = buildInventorySnapshot({
-        observedDestinations: { ok: true, records: [candidate({ host: "api.telegram.org" })] },
+        observedDestinations: {
+          ok: true,
+          records: [candidate({ host: "api.telegram.org", exfil_risk: true })],
+        },
       });
       expect(snap.observed_destinations_pre_idempotency).toBe(false);
+    });
+  });
+
+  describe("R1: strict persisted observe-candidate boundary", () => {
+    it("real persisted garbage renders as read_failed with no raw row contents", async () => {
+      const fixture = makeObservedStore();
+      await fixture.store.putCandidate(
+        candidate({
+          host: "leaky-r1.example",
+          would_be_disposition: "allowed",
+          times_seen: -7,
+          first_seen: "not-a-timestamp",
+          exfil_risk: true,
+        })
+      );
+
+      const observedDestinations = await readObservedDestinationCandidatesStrict(
+        fixture.stateStore
+      );
+      const snapshot = buildInventorySnapshot({
+        agents: { ok: true, records: [] },
+        proxyServers: { ok: true, records: [] },
+        observedDestinations,
+      });
+
+      expect(snapshot.observed_destinations.status).toBe("read_failed");
+      const report = reportText(
+        buildEvidencePack(packInput(snapshot), deps(fixture.signer, fixture.masterKey))
+      );
+      expect(report).toContain("observed egress destination inventory could not be read");
+      expect(report).toContain("malformed candidate evidence");
+      expect(report).not.toContain("leaky-r1.example");
+      expect(report).not.toContain("-7");
+      expect(report).not.toContain("not-a-timestamp");
+    });
+
+    it("real persisted valid observe candidate still renders through the pack", async () => {
+      const fixture = makeObservedStore();
+      await fixture.store.putCandidate(
+        candidate({
+          host: "api.telegram.org",
+          times_seen: 4,
+          exfil_risk: true,
+        })
+      );
+
+      const observedDestinations = await readObservedDestinationCandidatesStrict(
+        fixture.stateStore
+      );
+      const snapshot = buildInventorySnapshot({
+        agents: { ok: true, records: [] },
+        proxyServers: { ok: true, records: [] },
+        observedDestinations,
+      });
+
+      expect(snapshot.observed_destinations.status).toBe("populated");
+      const report = reportText(
+        buildEvidencePack(packInput(snapshot), deps(fixture.signer, fixture.masterKey))
+      );
+      expect(report).toContain("api.telegram.org");
+      expect(report).toContain("elevated (review)");
+      expect(report).toContain("| 4 |");
     });
   });
 });
