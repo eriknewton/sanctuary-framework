@@ -9,12 +9,15 @@
 export {
   OBSERVE_NAMESPACE,
   OBSERVE_SCHEMA_VERSION,
+  OBSERVE_AUDIT_SOURCE_IDS,
   DEFAULT_OBSERVE_GRANULARITY,
   candidateKey,
   candidateKeyDigest,
+  isObserveAuditSourceId,
 } from "./types.js";
 export type {
   HostnameSource,
+  ObserveAuditSourceId,
   ObserveGranularity,
   FlowObservationEvent,
   CandidateObservation,
@@ -34,6 +37,9 @@ export {
 } from "./refresh.js";
 export type {
   RefreshAuditSource,
+  RefreshAuditSourceDescriptor,
+  ObserveAuditSourceReadOutcome,
+  ObserveQuarantinedSourceState,
   RefreshCandidateStore,
   RefreshAllowlistRead,
   RefreshDeps,
@@ -52,7 +58,13 @@ export {
 export type { SynthesizeCandidateRulesResult, PromoteRouting } from "./synthesize.js";
 
 export { ObserveStore } from "./store.js";
-export type { ObserveWriteIdentity } from "./store.js";
+export type {
+  ObserveSourceReadStatus,
+  ObserveSourceState,
+  ObserveSourceStateSnapshot,
+  ObserveWriteIdentity,
+  QuarantinedObserveSourceState,
+} from "./store.js";
 
 export { promoteCandidates, describeEffectiveRule, ruleScopesEqual } from "./promote.js";
 export type {

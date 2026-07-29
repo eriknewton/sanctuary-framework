@@ -28,11 +28,14 @@ import type { EncryptedPayload } from "../../core/encryption.js";
 import type { StateStore } from "../../cognitive/state-store.js";
 import { mergeCandidateObservations } from "./fold.js";
 import {
+  OBSERVE_AUDIT_SOURCE_IDS,
   OBSERVE_NAMESPACE,
   candidateKey,
   candidateKeyDigest,
+  isObserveAuditSourceId,
   type CandidateObservation,
   type FoldWatermark,
+  type ObserveAuditSourceId,
   type ObserveModeState,
 } from "./types.js";
 
@@ -46,7 +49,80 @@ export interface ObserveWriteIdentity {
 const STATE_KEY = "state";
 const FOLD_WATERMARK_KEY = "fold-watermark";
 const CANDIDATE_KEY_PREFIX = "candidate:";
+const SOURCE_STATE_KEY_PREFIX = "source-state:";
 const PAGE_SIZE = 100;
+
+export type ObserveSourceReadStatus = "read_ok" | "read_failed" | "absent";
+
+/**
+ * Fixed-key metadata for an audit source. This is deliberately NOT a per-row
+ * contribution map: Option A keeps candidate rows aggregate-only, and uses
+ * this marker solely to distinguish "source never contributed here" from
+ * "source used to contribute and is now missing/unreadable" for empty-claim
+ * honesty.
+ */
+export interface ObserveSourceState {
+  source_id: ObserveAuditSourceId;
+  ever_contributed: boolean;
+  last_read_status: ObserveSourceReadStatus;
+  last_read_at: string;
+  last_instance_id?: string;
+  last_contributed_at?: string;
+}
+
+export interface QuarantinedObserveSourceState {
+  key: string;
+  reason: string;
+  source_id?: string;
+}
+
+export interface ObserveSourceStateSnapshot {
+  known: Map<ObserveAuditSourceId, ObserveSourceState>;
+  quarantined: QuarantinedObserveSourceState[];
+}
+
+function sourceStateKey(sourceId: ObserveAuditSourceId): string {
+  return `${SOURCE_STATE_KEY_PREFIX}${sourceId}`;
+}
+
+function parseSourceState(
+  key: string,
+  value: string,
+): { state: ObserveSourceState } | { quarantine: QuarantinedObserveSourceState } {
+  const sourceId = key.slice(SOURCE_STATE_KEY_PREFIX.length);
+  if (!isObserveAuditSourceId(sourceId)) {
+    return {
+      quarantine: { key, source_id: sourceId, reason: "unknown source id" },
+    };
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    return { quarantine: { key, source_id: sourceId, reason: "malformed JSON" } };
+  }
+
+  const candidate = parsed as Partial<ObserveSourceState>;
+  const validStatus =
+    candidate.last_read_status === "read_ok" ||
+    candidate.last_read_status === "read_failed" ||
+    candidate.last_read_status === "absent";
+  if (
+    candidate.source_id !== sourceId ||
+    typeof candidate.ever_contributed !== "boolean" ||
+    !validStatus ||
+    typeof candidate.last_read_at !== "string" ||
+    (candidate.last_instance_id !== undefined && typeof candidate.last_instance_id !== "string") ||
+    (candidate.last_contributed_at !== undefined && typeof candidate.last_contributed_at !== "string")
+  ) {
+    return {
+      quarantine: { key, source_id: sourceId, reason: "malformed source state" },
+    };
+  }
+
+  return { state: candidate as ObserveSourceState };
+}
 
 export class ObserveStore {
   constructor(
@@ -80,13 +156,9 @@ export class ObserveStore {
   }
 
   /**
-   * Read the fold watermark: the highest authenticated audit-chain sequence
-   * the refresh chokepoint has already folded (see `refresh.ts`). Absent on a
-   * store that has never completed a watermarked refresh (fresh install, or a
-   * store written by the pre-watermark engine) -- reads as `null`, which the
-   * refresh chokepoint treats as "recompute from scratch with replace
-   * semantics" (the one-time heal for stores the pre-watermark additive
-   * re-fold inflated).
+   * Read the legacy fold watermark record. Option A refreshes no longer depend
+   * on this record (they full-recompute every retained source), but the getter
+   * stays for backward-compatible diagnostics and evidence-pack inventory.
    */
   async getFoldWatermark(): Promise<FoldWatermark | null> {
     const result = await this.stateStore.read(OBSERVE_NAMESPACE, FOLD_WATERMARK_KEY);
@@ -108,7 +180,7 @@ export class ObserveStore {
     return parsed;
   }
 
-  /** Persist the fold watermark. Written by the refresh chokepoint ONLY after a fold pass committed cleanly. */
+  /** Persist the legacy fold watermark record. Kept for compatibility with older tests/fixtures and evidence-pack metadata. */
   async setFoldWatermark(watermark: FoldWatermark): Promise<void> {
     await this.put(FOLD_WATERMARK_KEY, watermark);
   }
@@ -124,6 +196,38 @@ export class ObserveStore {
 
   async removeCandidate(key: string): Promise<void> {
     await this.stateStore.delete(OBSERVE_NAMESPACE, this.storageKeyFor(key));
+  }
+
+  async listSourceStates(): Promise<ObserveSourceStateSnapshot> {
+    const known = new Map<ObserveAuditSourceId, ObserveSourceState>();
+    const quarantined: QuarantinedObserveSourceState[] = [];
+    let offset = 0;
+    for (;;) {
+      const { keys, total } = await this.stateStore.list(
+        OBSERVE_NAMESPACE,
+        SOURCE_STATE_KEY_PREFIX,
+        undefined,
+        PAGE_SIZE,
+        offset,
+      );
+      for (const { key } of keys) {
+        const result = await this.stateStore.read(OBSERVE_NAMESPACE, key);
+        if (!result) continue;
+        const parsed = parseSourceState(key, result.value);
+        if ("state" in parsed) known.set(parsed.state.source_id, parsed.state);
+        else quarantined.push(parsed.quarantine);
+      }
+      offset += keys.length;
+      if (keys.length === 0 || offset >= total) break;
+    }
+    return { known, quarantined };
+  }
+
+  async putSourceState(state: ObserveSourceState): Promise<void> {
+    if (!OBSERVE_AUDIT_SOURCE_IDS.includes(state.source_id)) {
+      throw new Error(`unknown observe source id: ${String(state.source_id)}`);
+    }
+    await this.put(sourceStateKey(state.source_id), state);
   }
 
   /** List every persisted candidate, keyed by its dedup `candidateKey`. Pages through every StateStore key so a large candidate set is never silently truncated (mirrors `FileGrantStore.list`). */
@@ -169,18 +273,10 @@ export class ObserveStore {
   }
 
   /**
-   * REPLACE-write freshly folded observations: each folded row overwrites the
-   * persisted row for its key outright (no count addition). Keys present in
-   * the store but absent from `observations` are left untouched (their audit
-   * history may simply have aged out of FIFO retention -- an unreviewed
-   * candidate is never silently dropped by a recompute).
-   *
-   * Used by the refresh chokepoint's RECOMPUTE mode (no valid watermark):
-   * replaying the full retained history yields the true per-key counts, so
-   * replacing converges -- this is the one-time heal for stores the
-   * pre-watermark additive re-fold inflated (sweep finding R3-1). Same
-   * RED-LINE scope as `mergeObservations`: only ever writes this reserved,
-   * agent-invisible namespace, never the live ruleset.
+   * REPLACE-write selected observations without deleting missing keys. Kept
+   * for older repair/test paths that want per-key overwrite semantics. The
+   * Option A refresh path uses `replaceCandidateSnapshot()` instead so a full
+   * recompute can also prune rows absent from retained source history.
    */
   async replaceObservations(observations: readonly CandidateObservation[]): Promise<void> {
     if (observations.length === 0) return;
@@ -189,6 +285,27 @@ export class ObserveStore {
       const prior = existing.get(candidateKey(incoming));
       if (prior && JSON.stringify(prior) === JSON.stringify(incoming)) continue;
       await this.putCandidate(incoming);
+    }
+  }
+
+  /**
+   * Replace the whole candidate set with one recomputed snapshot. This is the
+   * Option A crash contract: refreshes no longer add deltas to existing rows,
+   * so retrying after a partial write converges to the same aggregate counts
+   * instead of double-counting retained audit entries.
+   */
+  async replaceCandidateSnapshot(observations: readonly CandidateObservation[]): Promise<void> {
+    const existing = await this.listCandidates();
+    const incoming = new Map(observations.map((row) => [candidateKey(row), row]));
+
+    for (const [key, row] of incoming) {
+      const prior = existing.get(key);
+      if (prior && JSON.stringify(prior) === JSON.stringify(row)) continue;
+      await this.putCandidate(row);
+    }
+
+    for (const key of existing.keys()) {
+      if (!incoming.has(key)) await this.removeCandidate(key);
     }
   }
 }

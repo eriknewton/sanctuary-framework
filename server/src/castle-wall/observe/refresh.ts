@@ -15,28 +15,17 @@
  * This module fixes both at ONE chokepoint (the whack-a-mole -> chokepoint
  * rule; do not re-fix per surface):
  *
- * 1. FOLD WATERMARK (idempotency), CHAIN-IDENTITY-BOUND. Every audit-chain
- *    event is folded exactly once, ever: the store persists the highest
- *    authenticated chain sequence already folded PLUS the `entry_hash` of
- *    the chained entry at that sequence (`FoldWatermark`), and a refresh
- *    folds only entries with a HIGHER sequence. Sequences and hashes come
- *    from `AuditLog.streamVerifiedChain`, the same strict-verified,
- *    append-monotonic, prune-stable hash-chain position the workload
- *    registry replays by -- never a skewable wall-clock timestamp. The hash
- *    binding (Codex gate HIGH-2) means a watermark is honored ONLY against
- *    the chain that minted it: if the audit store was reset/rebuilt and the
- *    new chain regrew past the old watermark's sequence, the entry at that
- *    sequence carries a different hash, the watermark is invalid, and the
- *    refresh RECOMPUTES instead of silently skipping the new chain's prefix.
- *    A watermark whose sequence has been FIFO-pruned off the surviving
- *    chain can no longer be POSITIVELY re-verified against this chain, so
- *    it also recomputes (Codex round-2 MED: a reset chain that regrew and
- *    then pruned past the old position would otherwise be accepted);
- *    only a verified hash match admits the cheap incremental path.
+ * 1. SOURCE-ENUMERATED SNAPSHOT RECOMPUTE (idempotency). Every refresh reads
+ *    every registered audit source to completion and folds the full retained
+ *    history into one aggregate candidate snapshot. There is no per-source
+ *    contribution schema in Option A and no additive merge in the refresh
+ *    path: persisted aggregate rows are replaced from the snapshot, so
+ *    re-reading the same source history is idempotent.
  *
  * 2. CROSS-RUN MUTUAL EXCLUSION (Codex gate BLOCKER). Two concurrent
- *    refreshes would read the same watermark, fold the same suffix, and
- *    additively merge it twice. Every refresh therefore runs under
+ *    refreshes would compute and replace the same shared candidate rows with
+ *    no transactional boundary between the encrypted state entries. Every
+ *    refresh therefore runs under
  *    `deps.lock`: acquire returns null when another refresh holds it, and
  *    the refresh ABORTS (`refresh_in_progress`) without reading or writing
  *    anything. The CLI supplies an O_EXCL lockfile that is NEVER
@@ -46,14 +35,10 @@
  *    instead -- see `cli/castle-wall-observe.ts`); in-process callers/tests
  *    use `inProcessRefreshLock()`.
  *
- * 3. RECOMPUTE HEAL (bootstrap + anomaly), REVIEW-MARKER-AWARE. With no
- *    valid watermark (fresh store, a store written by the pre-watermark
- *    engine, or an invalid/mismatched watermark), the refresh replays the
- *    full retained history and REPLACE-writes each folded key that is
- *    ALREADY in the store (`replaceObservations`): re-running converges to
- *    the true retained-history counts instead of accumulating -- the heal
- *    for stores the old engine inflated. A key NOT in the store is minted
- *    only from events recorded AFTER the chain's last observe review action
+ * 3. REVIEW-MARKER-AWARE MINTING. The refresh replays the full retained
+ *    history every time. A key already present in the store is healed from
+ *    the full aggregate; a key NOT in the store is minted only from events
+ *    recorded AFTER the latest observe review action across all sources
  *    (`castle_wall_observe_discard` / `castle_wall_observe_promote` audit
  *    entries, which ride the same verified chain): any candidate the
  *    operator discarded under the old engine was folded from events BEFORE
@@ -95,16 +80,13 @@
  *    that cannot be canonicalized cannot be allowed by the wall, so its row
  *    is KEPT, and suppression happens only on a positive verified match.
  *
- * Crash ordering, per mode (neither write pair is atomic; pick the order
- * whose crash window can never double-count):
- *   - INCREMENTAL (additive merge): watermark FIRST. A crash between the two
- *     loses that delta batch -- an undercount that a still-denied destination
- *     re-mints on the agent's next attempt -- and can never re-add
- *     already-merged events.
- *   - RECOMPUTE (idempotent replace): replace FIRST. A crash before the
- *     watermark lands just recomputes again next run (replace converges);
- *     writing the watermark first would strand the heal as a permanently
- *     un-applied "incremental with nothing new".
+ * Crash ordering: Option A deliberately chooses idempotent snapshot
+ * replacement, not the old watermark-first undercount contract. Source
+ * contribution markers are written before the snapshot so a crash can only
+ * make a later missing source block definitive-empty output; then the
+ * candidate snapshot is replace-written. A retry folds the same retained
+ * history and converges to the same aggregate counts -- no crash window can
+ * double-add a source's events.
  *
  * RED-LINE (unchanged): nothing here writes the live signed allowlist. This
  * module READS the verified manifest and writes only the reserved,
@@ -120,7 +102,19 @@ import type { RuleMatch } from "../allowlist/schema.js";
 import type { VerifiedChainConsumer } from "../../operational/audit-log.js";
 import { flowEventFromAuditEntry } from "./adapter.js";
 import { foldObservations } from "./fold.js";
-import { candidateKey, type CandidateObservation, type FlowObservationEvent, type FoldWatermark } from "./types.js";
+import {
+  OBSERVE_AUDIT_SOURCE_IDS,
+  candidateKey,
+  isObserveAuditSourceId,
+  type CandidateObservation,
+  type FlowObservationEvent,
+  type FoldWatermark,
+  type ObserveAuditSourceId,
+} from "./types.js";
+import type {
+  ObserveSourceState,
+  ObserveSourceStateSnapshot,
+} from "./store.js";
 
 /** The observe review-action audit operations (written by the CLI's discard/promote verbs onto the SAME verified chain the fold streams). Their chain position bounds what a recompute may MINT (module doc, guarantee 3). */
 const OBSERVE_REVIEW_OPERATIONS: ReadonlySet<string> = new Set([
@@ -133,6 +127,61 @@ export interface RefreshAuditSource {
   streamVerifiedChain(consumer: VerifiedChainConsumer): Promise<void>;
 }
 
+export type RefreshAuditSourceDescriptor =
+  | {
+      source_id: ObserveAuditSourceId;
+      status: "present";
+      auditLog: RefreshAuditSource;
+      /** Stable physical segment identity for reset/missing detection, e.g. the boot-token fingerprint. */
+      instance_id?: string;
+    }
+  | {
+      source_id: ObserveAuditSourceId;
+      status: "absent";
+      reason: string;
+      instance_id?: string;
+    }
+  | {
+      source_id: ObserveAuditSourceId;
+      status: "read_failed";
+      reason: string;
+      instance_id?: string;
+    };
+
+export type ObserveAuditSourceReadOutcome =
+  | {
+      source_id: ObserveAuditSourceId;
+      status: "read_ok";
+      entries_read: number;
+      flow_events: number;
+      candidate_rows: number;
+      head_sequence: number | null;
+      head_hash: string | null;
+      instance_id?: string;
+    }
+  | {
+      source_id: ObserveAuditSourceId;
+      status: "absent";
+      reason: string;
+      instance_id?: string;
+    }
+  | {
+      source_id: ObserveAuditSourceId;
+      status: "read_failed";
+      reason: string;
+      failure:
+        | "source_unreadable"
+        | "missing_after_contribution"
+        | "instance_changed_after_contribution";
+      instance_id?: string;
+    };
+
+export interface ObserveQuarantinedSourceState {
+  key: string;
+  reason: string;
+  source_id?: string;
+}
+
 /** Narrow candidate-store surface the refresh needs; `ObserveStore` satisfies it. */
 export interface RefreshCandidateStore {
   getFoldWatermark(): Promise<FoldWatermark | null>;
@@ -140,6 +189,9 @@ export interface RefreshCandidateStore {
   listCandidates(): Promise<Map<string, CandidateObservation>>;
   mergeObservations(observations: readonly CandidateObservation[]): Promise<void>;
   replaceObservations(observations: readonly CandidateObservation[]): Promise<void>;
+  replaceCandidateSnapshot(observations: readonly CandidateObservation[]): Promise<void>;
+  listSourceStates(): Promise<ObserveSourceStateSnapshot>;
+  putSourceState(state: ObserveSourceState): Promise<void>;
   removeCandidate(key: string): Promise<void>;
 }
 
@@ -187,7 +239,13 @@ export type RefreshAllowlistRead =
   | { status: "unverified"; reason: string };
 
 export interface RefreshDeps {
+  /**
+   * Legacy single-source input. Production callers should pass
+   * `auditSources`; when this is used, it is treated as the registered
+   * `master-audit` source for older in-process tests/callers.
+   */
   auditLog: RefreshAuditSource;
+  auditSources?: readonly RefreshAuditSourceDescriptor[];
   store: RefreshCandidateStore;
   readAllowlist: () => Promise<RefreshAllowlistRead>;
   /** Mutual exclusion across concurrent refreshes (Codex gate BLOCKER; see {@link RefreshLock}). */
@@ -205,14 +263,24 @@ export interface RefreshDeps {
 export type RefreshOutcome =
   | {
       status: "refreshed";
-      /** `incremental`: folded only entries past the valid watermark, merged additively. `recompute`: no valid watermark -- replayed retained history with replace-existing/mint-post-review semantics (the heal path). */
-      mode: "incremental" | "recompute";
+      /** Option A always recomputes the aggregate from retained source history and replace-writes the snapshot. */
+      mode: "recompute";
       /** Denied-flow events this pass actually folded. */
       folded_events: number;
       /** Folded candidate rows suppressed because the verified allowlist already permits them (never minted). */
       suppressed_allowed: number;
       /** Persisted candidate rows removed because the verified allowlist now permits them. */
       removed_now_allowed: number;
+      /** Per-source read witnesses. Definitive empty output requires every enumerated source to be read_ok or valid absent. */
+      source_reads: ObserveAuditSourceReadOutcome[];
+      quarantined_sources: ObserveQuarantinedSourceState[];
+      definitive_empty: boolean;
+    }
+  | {
+      status: "source_read_incomplete";
+      source_reads: ObserveAuditSourceReadOutcome[];
+      quarantined_sources: ObserveQuarantinedSourceState[];
+      reason: string;
     }
   | { status: "allowlist_unverified"; reason: string }
   | { status: "refresh_in_progress" };
@@ -437,10 +505,10 @@ function patternCouldMatch(pattern: string, hostLower: string): boolean {
 }
 
 /**
- * Refresh the candidate store from the verified audit chain. See the module
- * header for the four guarantees (chain-bound fold watermark, mutual
- * exclusion, review-marker-aware recompute heal, allowlist-aware fold +
- * prune). Throws if the audit chain fails strict verification
+ * Refresh the candidate store from the registered verified audit sources. See
+ * the module header for the source-enumerated recompute, mutual exclusion,
+ * review-marker-aware minting, source read witnesses, and allowlist-aware
+ * fold/prune guarantees. Throws if an audit chain fails strict verification
  * (`streamVerifiedChain`'s contract) -- the caller surfaces that loud and
  * nothing has been written, because all store writes happen only after the
  * stream returns clean.
@@ -473,165 +541,287 @@ async function runRefresh(deps: RefreshDeps): Promise<RefreshOutcome> {
     return { status: "allowlist_unverified", reason: allowlist.reason };
   }
 
-  const watermark = await deps.store.getFoldWatermark();
+  const sourceStateSnapshot = await deps.store.listSourceStates();
+  const sources = normalizeAuditSources(deps);
+  const sourceReads: ObserveAuditSourceReadOutcome[] = [];
+  const readOk: SourceReadOk[] = [];
 
-  // ── Single verified pass over the chain (buffered writes: nothing below
-  // touches the store until the stream has returned clean). ──
-  let events: Array<{ sequence: number; event: FlowObservationEvent }> = [];
-  let headSequence: number | null = null;
-  let headHash: string | null = null;
-  let hashAtWatermark: string | null = null;
-  let lastReviewSequence: number | null = null;
-  await deps.auditLog.streamVerifiedChain({
-    onEntry: ({ sequence, entry_hash, entry }) => {
-      if (headSequence === null || sequence > headSequence) {
-        headSequence = sequence;
-        headHash = entry_hash;
-      }
-      if (watermark !== null && sequence === watermark.folded_through_sequence) {
-        hashAtWatermark = entry_hash;
-      }
-      if (
-        OBSERVE_REVIEW_OPERATIONS.has(entry.operation) &&
-        (lastReviewSequence === null || sequence > lastReviewSequence)
-      ) {
-        lastReviewSequence = sequence;
-      }
-      const event = flowEventFromAuditEntry(entry, {
-        pinnedProducerKeyB64url: deps.pinnedProducerKeyB64url ?? null,
-        subjectFortressId: deps.subjectFortressId ?? null,
-      });
-      if (event) events.push({ sequence, event });
-    },
-    reset: () => {
-      events = [];
-      headSequence = null;
-      headHash = null;
-      hashAtWatermark = null;
-      lastReviewSequence = null;
-    },
-  });
-
-  const chainHead: number | null = headSequence;
-
-  // A watermark is honored ONLY when its chain identity is POSITIVELY
-  // verified (module doc, guarantee 1; Codex round-2 MED on the old
-  // pruned-arm acceptance):
-  //   - none persisted -> recompute (fresh store, or a pre-watermark store);
-  //   - sequence beyond the surviving head -> the chain shrank/reset under
-  //     us -> recompute;
-  //   - the surviving entry at the watermark's sequence carries a DIFFERENT
-  //     hash -> a reset/rebuilt chain regrew past the old position -> the
-  //     old position is meaningless here -> recompute (never silently skip
-  //     the new chain's prefix);
-  //   - the watermark's sequence has been FIFO-pruned off the surviving
-  //     chain -> the identity binding CANNOT be re-verified against this
-  //     chain (a reset chain that regrew and pruned past the old position
-  //     would be indistinguishable) -> recompute. Replace semantics + the
-  //     review-marker mint bound make that recompute convergent, and the
-  //     case is rare in practice (it needs more appends between two
-  //     refreshes than the whole retention cap).
-  // A positive hash match is the ONLY thing that admits the cheap
-  // incremental path; everything else falls back to the convergent
-  // recompute. (An empty chain with a persisted watermark folds nothing and
-  // keeps the watermark.)
-  const watermarkValid =
-    watermark !== null &&
-    chainHead !== null &&
-    watermark.folded_through_sequence <= chainHead &&
-    hashAtWatermark === watermark.entry_hash;
-  const recompute = !(watermark !== null && (chainHead === null ? true : watermarkValid));
-
-  const kept: CandidateObservation[] = [];
-  let suppressedAllowed = 0;
-  let foldedCount: number;
-
-  const keepFiltered = (folded: readonly CandidateObservation[], into: CandidateObservation[]): void => {
-    for (const row of folded) {
-      if (candidateCurrentlyAllowed(allowlist.rules, row)) {
-        suppressedAllowed += 1;
-        continue;
-      }
-      into.push(row);
+  for (const source of sources) {
+    const prior = sourceStateSnapshot.known.get(source.source_id);
+    const gated = sourceCompletenessGate(source, prior);
+    if (gated !== null) {
+      sourceReads.push(gated);
+      continue;
     }
-  };
+    if (source.status === "absent") {
+      sourceReads.push({
+        source_id: source.source_id,
+        status: "absent",
+        reason: source.reason,
+        ...(source.instance_id !== undefined ? { instance_id: source.instance_id } : {}),
+      });
+      continue;
+    }
+    if (source.status === "read_failed") {
+      sourceReads.push({
+        source_id: source.source_id,
+        status: "read_failed",
+        reason: source.reason,
+        failure: "source_unreadable",
+        ...(source.instance_id !== undefined ? { instance_id: source.instance_id } : {}),
+      });
+      continue;
+    }
 
-  const advanceWatermark = async (): Promise<void> => {
-    if (chainHead === null || headHash === null) return;
-    if (
-      watermark !== null &&
-      watermark.folded_through_sequence === chainHead &&
-      watermark.entry_hash === headHash
-    ) {
+    const outcome = await readPresentSource(source, deps, allowlist.rules);
+    sourceReads.push(outcome.outcome);
+    if ("events" in outcome) readOk.push(outcome);
+  }
+
+  const quarantinedSources = sourceStateSnapshot.quarantined.map((q) => ({
+    key: q.key,
+    reason: q.reason,
+    ...(q.source_id !== undefined ? { source_id: q.source_id } : {}),
+  }));
+  const incomplete = sourceReads.find((source) => source.status === "read_failed");
+  if (incomplete || quarantinedSources.length > 0) {
+    return {
+      status: "source_read_incomplete",
+      source_reads: sourceReads,
+      quarantined_sources: quarantinedSources,
+      reason: incomplete
+        ? `${incomplete.source_id}: ${incomplete.reason}`
+        : "unknown persisted observe source state is quarantined",
+    };
+  }
+
+  const persistedBefore = await deps.store.listCandidates();
+  const reviewHorizon = latestReviewHorizon(readOk);
+  const allEvents = readOk.flatMap((source) => source.events.map((item) => item.event));
+  const postReviewEvents =
+    reviewHorizon === null
+      ? allEvents
+      : readOk.flatMap((source) =>
+          source.events
+            .filter((item) => eventAfterReviewHorizon(item.event, reviewHorizon))
+            .map((item) => item.event),
+        );
+
+  const snapshot = new Map<string, CandidateObservation>();
+  const suppressedAllowedKeys = new Set<string>();
+  const keepIfNotAllowed = (row: CandidateObservation, include: boolean): void => {
+    const key = candidateKey(row);
+    if (candidateCurrentlyAllowed(allowlist.rules, row)) {
+      suppressedAllowedKeys.add(key);
       return;
     }
-    await deps.store.setFoldWatermark({
-      folded_through_sequence: chainHead,
-      entry_hash: headHash,
-      updated_at: deps.now.toISOString(),
-    });
+    if (include) snapshot.set(key, row);
   };
 
-  if (recompute) {
-    // Heal existing rows from the FULL retained history; mint new rows only
-    // from post-review events (module doc, guarantee 3).
-    const allEvents = events.map((item) => item.event);
-    const postReviewEvents =
-      lastReviewSequence === null
-        ? allEvents
-        : events.filter((item) => item.sequence > lastReviewSequence!).map((item) => item.event);
-    foldedCount = allEvents.length;
-
-    const persistedBefore = await deps.store.listCandidates();
-    const replacements: CandidateObservation[] = [];
-    keepFiltered(
-      foldObservations(allEvents).filter((row) => persistedBefore.has(candidateKey(row))),
-      replacements,
-    );
-    const mints: CandidateObservation[] = [];
-    keepFiltered(
-      foldObservations(postReviewEvents).filter((row) => !persistedBefore.has(candidateKey(row))),
-      mints,
-    );
-    kept.push(...replacements, ...mints);
-
-    // RECOMPUTE crash order: replace/mint FIRST, then the watermark (see
-    // module doc). Both writes are replace-semantics here: a re-run of this
-    // same recompute converges.
-    await deps.store.replaceObservations(kept);
-    await advanceWatermark();
-  } else {
-    const newEvents = events
-      .filter((item) => watermark === null || item.sequence > watermark.folded_through_sequence)
-      .map((item) => item.event);
-    foldedCount = newEvents.length;
-    keepFiltered(foldObservations(newEvents), kept);
-
-    // INCREMENTAL crash order: watermark FIRST, then the additive merge (see
-    // module doc): a crash between the two undercounts, never double-counts.
-    await advanceWatermark();
-    await deps.store.mergeObservations(kept);
+  for (const row of foldObservations(allEvents)) {
+    keepIfNotAllowed(row, persistedBefore.has(candidateKey(row)));
+  }
+  for (const row of foldObservations(postReviewEvents)) {
+    const key = candidateKey(row);
+    if (persistedBefore.has(key)) continue;
+    keepIfNotAllowed(row, true);
   }
 
-  // ── Allowlist prune over the PERSISTED set: a pending candidate whose
-  // destination the operator's verified policy now permits is removed (the
-  // same safe direction as `observe discard`; never adds a rule). Runs even
-  // when nothing new folded, so a promote in another template/session is
-  // reconciled on the very next refresh. ──
   let removedNowAllowed = 0;
-  const persisted = await deps.store.listCandidates();
-  for (const [key, candidate] of persisted) {
-    if (candidateCurrentlyAllowed(allowlist.rules, candidate)) {
-      await deps.store.removeCandidate(key);
-      removedNowAllowed += 1;
+  for (const candidate of persistedBefore.values()) {
+    if (candidateCurrentlyAllowed(allowlist.rules, candidate)) removedNowAllowed += 1;
+  }
+
+  const nowIso = deps.now.toISOString();
+  for (const source of sourceReads) {
+    if (source.status === "read_ok" || source.status === "absent") {
+      const prior = sourceStateSnapshot.known.get(source.source_id);
+      const contributed = source.status === "read_ok" && source.candidate_rows > 0;
+      await deps.store.putSourceState({
+        source_id: source.source_id,
+        ever_contributed: (prior?.ever_contributed ?? false) || contributed,
+        last_read_status: source.status,
+        last_read_at: nowIso,
+        ...(source.instance_id !== undefined
+          ? { last_instance_id: source.instance_id }
+          : prior?.last_instance_id !== undefined
+            ? { last_instance_id: prior.last_instance_id }
+            : {}),
+        ...(contributed
+          ? { last_contributed_at: nowIso }
+          : prior?.last_contributed_at !== undefined
+            ? { last_contributed_at: prior.last_contributed_at }
+            : {}),
+      });
     }
   }
+
+  await deps.store.replaceCandidateSnapshot([...snapshot.values()]);
 
   return {
     status: "refreshed",
-    mode: recompute ? "recompute" : "incremental",
-    folded_events: foldedCount,
-    suppressed_allowed: suppressedAllowed,
+    mode: "recompute",
+    folded_events: allEvents.length,
+    suppressed_allowed: suppressedAllowedKeys.size,
     removed_now_allowed: removedNowAllowed,
+    source_reads: sourceReads,
+    quarantined_sources: quarantinedSources,
+    definitive_empty: snapshot.size === 0,
   };
+}
+
+interface SourceReadOk {
+  outcome: Extract<ObserveAuditSourceReadOutcome, { status: "read_ok" }>;
+  events: Array<{ sequence: number; event: FlowObservationEvent }>;
+  reviewTimestamps: string[];
+}
+
+interface ReviewHorizon {
+  timestamp: string;
+  epochMs: number;
+}
+
+function normalizeAuditSources(deps: RefreshDeps): RefreshAuditSourceDescriptor[] {
+  const raw = deps.auditSources ?? [
+    {
+      source_id: "master-audit" as const,
+      status: "present" as const,
+      auditLog: deps.auditLog,
+      instance_id: "operator-master",
+    },
+  ];
+
+  const sources: RefreshAuditSourceDescriptor[] = [];
+  const seen = new Set<ObserveAuditSourceId>();
+  for (const source of raw) {
+    if (!isObserveAuditSourceId(source.source_id) || seen.has(source.source_id)) continue;
+    seen.add(source.source_id);
+    sources.push(source);
+  }
+  return sources.sort(
+    (a, b) =>
+      OBSERVE_AUDIT_SOURCE_IDS.indexOf(a.source_id) -
+      OBSERVE_AUDIT_SOURCE_IDS.indexOf(b.source_id),
+  );
+}
+
+function sourceCompletenessGate(
+  source: RefreshAuditSourceDescriptor,
+  prior: ObserveSourceState | undefined,
+): ObserveAuditSourceReadOutcome | null {
+  if (!prior?.ever_contributed) return null;
+
+  if (source.status === "absent") {
+    return {
+      source_id: source.source_id,
+      status: "read_failed",
+      reason: "source is missing after previously contributing to this observe store",
+      failure: "missing_after_contribution",
+      ...(source.instance_id !== undefined ? { instance_id: source.instance_id } : {}),
+    };
+  }
+  if (
+    source.status === "present" &&
+    prior.last_instance_id !== undefined &&
+    source.instance_id !== undefined &&
+    prior.last_instance_id !== source.instance_id
+  ) {
+    return {
+      source_id: source.source_id,
+      status: "read_failed",
+      reason: "source segment changed after previously contributing to this observe store",
+      failure: "instance_changed_after_contribution",
+      instance_id: source.instance_id,
+    };
+  }
+  return null;
+}
+
+async function readPresentSource(
+  source: Extract<RefreshAuditSourceDescriptor, { status: "present" }>,
+  deps: RefreshDeps,
+  rules: readonly AllowlistRule[],
+): Promise<SourceReadOk | { outcome: Extract<ObserveAuditSourceReadOutcome, { status: "read_failed" }> }> {
+  let entriesRead = 0;
+  let events: Array<{ sequence: number; event: FlowObservationEvent }> = [];
+  let reviewTimestamps: string[] = [];
+  let headSequence: number | null = null;
+  let headHash: string | null = null;
+  try {
+    await source.auditLog.streamVerifiedChain({
+      onEntry: ({ sequence, entry_hash, entry }) => {
+        entriesRead += 1;
+        if (headSequence === null || sequence > headSequence) {
+          headSequence = sequence;
+          headHash = entry_hash;
+        }
+        if (OBSERVE_REVIEW_OPERATIONS.has(entry.operation)) {
+          reviewTimestamps.push(entry.timestamp);
+        }
+        const event = flowEventFromAuditEntry(entry, {
+          pinnedProducerKeyB64url: deps.pinnedProducerKeyB64url ?? null,
+          subjectFortressId: deps.subjectFortressId ?? null,
+        });
+        if (event) events.push({ sequence, event });
+      },
+      reset: () => {
+        entriesRead = 0;
+        events = [];
+        reviewTimestamps = [];
+        headSequence = null;
+        headHash = null;
+      },
+    });
+  } catch (error) {
+    return {
+      outcome: {
+        source_id: source.source_id,
+        status: "read_failed",
+        reason: (error as Error).message,
+        failure: "source_unreadable",
+        ...(source.instance_id !== undefined ? { instance_id: source.instance_id } : {}),
+      },
+    };
+  }
+
+  const candidateRows = foldObservations(events.map((item) => item.event)).filter(
+    (row) => !candidateCurrentlyAllowed(rules, row),
+  ).length;
+  return {
+    outcome: {
+      source_id: source.source_id,
+      status: "read_ok",
+      entries_read: entriesRead,
+      flow_events: events.length,
+      candidate_rows: candidateRows,
+      head_sequence: headSequence,
+      head_hash: headHash,
+      ...(source.instance_id !== undefined ? { instance_id: source.instance_id } : {}),
+    },
+    events,
+    reviewTimestamps,
+  };
+}
+
+function latestReviewHorizon(reads: readonly SourceReadOk[]): ReviewHorizon | null {
+  let latest: ReviewHorizon | null = null;
+  for (const read of reads) {
+    for (const timestamp of read.reviewTimestamps) {
+      const epochMs = Date.parse(timestamp);
+      if (Number.isNaN(epochMs)) continue;
+      if (latest === null || epochMs > latest.epochMs) {
+        latest = { timestamp, epochMs };
+      }
+    }
+  }
+  return latest;
+}
+
+function eventAfterReviewHorizon(
+  event: FlowObservationEvent,
+  horizon: ReviewHorizon,
+): boolean {
+  const epochMs = Date.parse(event.timestamp);
+  if (Number.isNaN(epochMs)) return event.timestamp > horizon.timestamp;
+  return epochMs > horizon.epochMs;
 }

@@ -15,12 +15,10 @@
  *                a per-flow prompt).
  *   status       Show whether observe mode is on and how many candidates
  *                are pending review. Tier-3, read-only.
- *   candidates   Fold the audit log's not-yet-folded denied flows into the
- *                candidate store (idempotent: a persisted watermark folds
- *                each recorded flow exactly once, and destinations the live
- *                verified allowlist already permits are never minted and
- *                are pruned -- see castle-wall/observe/refresh.ts), then
- *                list every pending candidate. Tier-3.
+ *   candidates   Re-read the master audit and boot-audit sources, recompute
+ *                the candidate snapshot from retained denied-flow history,
+ *                witness each source read outcome, and list every pending
+ *                candidate. Tier-3.
  *   promote      Tier-1 FORCED. Synthesizes the selected candidates into
  *                allow rules, fires the SAME non-relaxable approval gate an
  *                MCP-exposed tool would use, and -- ONLY on approval --
@@ -36,9 +34,9 @@
  * PR description).
  */
 
-import { mkdir, open, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, open, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { createInterface } from "node:readline/promises";
-import { isAbsolute, join, resolve } from "node:path";
+import { basename, isAbsolute, join, resolve } from "node:path";
 import { Writable } from "node:stream";
 import { createHash, randomBytes } from "node:crypto";
 
@@ -74,13 +72,21 @@ import {
   promoteCandidates,
   refreshCandidatesFromAudit,
   type CandidateObservation,
+  type ObserveAuditSourceReadOutcome,
   type ObserveGranularity,
+  type ObserveQuarantinedSourceState,
   type PromoteRouting,
   type PromoteSelectionRow,
+  type RefreshAuditSourceDescriptor,
   type RefreshAllowlistRead,
   type RefreshLock,
   type VerifiedManifestRead,
 } from "../castle-wall/observe/index.js";
+import {
+  deriveSafeModeAuditKey,
+  readBootToken,
+  safeModeAuditStoragePath,
+} from "../castle-wall/boot/boot-token.js";
 import {
   loadExclusiveRoutingMarker,
   ExclusiveRoutingMarkerError,
@@ -100,6 +106,8 @@ export interface ObserveCommandContext {
   out?: Writable;
   err?: Writable;
   env?: NodeJS.ProcessEnv;
+  /** Test seam for the root-owned boot-token path. Production uses the default custody path. */
+  bootTokenPath?: string;
   /**
    * TEST SEAM ONLY (round-3 R4): overrides the Tier-1 approval channel so the
    * approved-promote CLI paths (candidate retention, exclusive copy) are
@@ -266,6 +274,124 @@ async function bootstrap(
   return { fortressPath, storage, masterKey, auditLog, observeStore, primary };
 }
 
+async function bootAuditRootHasSegments(fortressPath: string): Promise<boolean> {
+  try {
+    const entries = await readdir(join(fortressPath, "boot-audit"));
+    return entries.length > 0;
+  } catch (error) {
+    if (isEnoent(error)) return false;
+    throw error;
+  }
+}
+
+async function resolveObserveAuditSources(
+  boot: Bootstrapped,
+  ctx: ObserveCommandContext,
+): Promise<RefreshAuditSourceDescriptor[]> {
+  const sources: RefreshAuditSourceDescriptor[] = [
+    {
+      source_id: "master-audit",
+      status: "present",
+      auditLog: boot.auditLog,
+      instance_id: "operator-master",
+    },
+  ];
+
+  let tokenRead;
+  try {
+    tokenRead = await readBootToken(ctx.bootTokenPath ? { path: ctx.bootTokenPath } : {});
+  } catch (error) {
+    sources.push({
+      source_id: "boot-audit",
+      status: "read_failed",
+      reason: `boot token could not be read: ${(error as Error).message}`,
+    });
+    return sources;
+  }
+
+  if (tokenRead.status !== "ok") {
+    if (tokenRead.status === "not-found") {
+      sources.push(
+        (await bootAuditRootHasSegments(boot.fortressPath))
+          ? {
+              source_id: "boot-audit",
+              status: "read_failed",
+              reason: "boot token is absent, but boot-audit segment directories exist",
+            }
+          : {
+              source_id: "boot-audit",
+              status: "absent",
+              reason: "no boot token is provisioned for this fortress",
+            },
+      );
+      return sources;
+    }
+    sources.push({
+      source_id: "boot-audit",
+      status: "read_failed",
+      reason:
+        tokenRead.status === "bad-mode"
+          ? `boot token has insecure permissions (mode ${tokenRead.mode.toString(8)})`
+          : `boot token has the wrong length (${tokenRead.length} bytes)`,
+    });
+    return sources;
+  }
+
+  const auditStoragePath = safeModeAuditStoragePath(boot.fortressPath, tokenRead.token);
+  const instanceId = basename(auditStoragePath);
+  try {
+    const auditStat = await stat(auditStoragePath);
+    if (!auditStat.isDirectory()) {
+      sources.push({
+        source_id: "boot-audit",
+        status: "read_failed",
+        reason: "boot-audit segment path is not a directory",
+        instance_id: instanceId,
+      });
+      return sources;
+    }
+  } catch (error) {
+    if (!isEnoent(error)) {
+      sources.push({
+        source_id: "boot-audit",
+        status: "read_failed",
+        reason: `boot-audit segment could not be inspected: ${(error as Error).message}`,
+        instance_id: instanceId,
+      });
+      return sources;
+    }
+    sources.push(
+      (await bootAuditRootHasSegments(boot.fortressPath))
+        ? {
+            source_id: "boot-audit",
+            status: "read_failed",
+            reason:
+              "current boot-audit segment is absent, but other boot-audit segments exist",
+            instance_id: instanceId,
+          }
+        : {
+            source_id: "boot-audit",
+            status: "absent",
+            reason: "current boot-audit segment has not been created",
+            instance_id: instanceId,
+          },
+    );
+    return sources;
+  }
+
+  sources.push({
+    source_id: "boot-audit",
+    status: "present",
+    auditLog: new AuditLog(
+      new FilesystemStorage(auditStoragePath),
+      deriveSafeModeAuditKey(tokenRead.token),
+      { consultSplitBoundary: false },
+    ),
+    instance_id: instanceId,
+  });
+  return sources;
+}
+
 export async function runObserveCommand(
   args: { argv: string[] } & ObserveCommandContext,
 ): Promise<number> {
@@ -281,7 +407,13 @@ export async function runObserveCommand(
 
   const command = argv[0]!;
   const rest = argv.slice(1);
-  const ctx: ObserveCommandContext = { out, err, env };
+  const ctx: ObserveCommandContext = {
+    out,
+    err,
+    env,
+    ...(args.bootTokenPath !== undefined ? { bootTokenPath: args.bootTokenPath } : {}),
+    ...(args.approvalChannel !== undefined ? { approvalChannel: args.approvalChannel } : {}),
+  };
 
   switch (command) {
     case "start":
@@ -371,7 +503,16 @@ export async function runObserveCandidates(
   const boot = await bootstrap(argv, err, env);
   if (!boot) return 1;
 
+  let sourceReads: ObserveAuditSourceReadOutcome[] = [];
+  let quarantinedSources: ObserveQuarantinedSourceState[] = [];
+  let refreshAttempted = false;
+  let refreshComplete = false;
+  let refreshIncompleteReason: string | null = noRefresh
+    ? "refresh was skipped, so audit-source reads were not witnessed"
+    : null;
+
   if (!noRefresh) {
+    refreshAttempted = true;
     const producerKey = await loadFortressProducerKey(boot.fortressPath);
     if (producerKey.status === "unreadable") {
       write(
@@ -381,15 +522,12 @@ export async function runObserveCandidates(
       );
       return 1;
     }
-    // The idempotent, allowlist-aware refresh chokepoint (sweep finding
-    // R3-1): every audit event folds exactly once (persisted watermark), and
-    // a destination the operator's verified policy already permits is never
-    // minted -- and is pruned if present. See castle-wall/observe/refresh.ts.
     let outcome;
     let lockHolderDescription = "";
     try {
       outcome = await refreshCandidatesFromAudit({
         auditLog: boot.auditLog,
+        auditSources: await resolveObserveAuditSources(boot, ctx),
         store: boot.observeStore,
         readAllowlist: () => readAllowlistForRefresh(boot.fortressPath),
         lock: observeRefreshFileLock(boot.fortressPath, (holder) => {
@@ -412,6 +550,16 @@ export async function runObserveCandidates(
       );
       return 1;
     }
+    if (outcome.status === "source_read_incomplete") {
+      sourceReads = outcome.source_reads;
+      quarantinedSources = outcome.quarantined_sources;
+      refreshIncompleteReason = outcome.reason;
+      write(
+        err,
+        `Warning: observe could not read every audit source (${outcome.reason}). ` +
+          "No candidate-store changes were made; an empty listing below is UNDETERMINED, not verified empty.\n",
+      );
+    }
     if (outcome.status === "refresh_in_progress") {
       write(
         err,
@@ -431,7 +579,12 @@ export async function runObserveCandidates(
       );
       return 1;
     }
-    if (outcome.removed_now_allowed > 0) {
+    if (outcome.status === "refreshed") {
+      sourceReads = outcome.source_reads;
+      quarantinedSources = outcome.quarantined_sources;
+      refreshComplete = true;
+    }
+    if (outcome.status === "refreshed" && outcome.removed_now_allowed > 0) {
       write(
         out,
         `Removed ${outcome.removed_now_allowed} candidate(s) your policy now permits (already-allowed destinations are never pending review).\n`,
@@ -455,10 +608,13 @@ export async function runObserveCandidates(
   // refuses loud on the same states).
   let awaitingRearmRules: readonly AllowlistRule[] = [];
   let awaitingRearmGateUid: number | null = null;
-  if (candidates.length > 0) {
-    try {
-      const marker = await loadExclusiveRoutingMarker(boot.fortressPath);
-      if (marker !== null) {
+  let exclusiveGateDenialsUnavailable = false;
+  let routingWitnessComplete = true;
+  try {
+    const marker = await loadExclusiveRoutingMarker(boot.fortressPath);
+    if (marker !== null) {
+      exclusiveGateDenialsUnavailable = true;
+      if (candidates.length > 0) {
         const allowlist = await readAllowlistForRefresh(boot.fortressPath);
         if (allowlist.status === "ok") {
           awaitingRearmRules = allowlist.rules;
@@ -467,27 +623,85 @@ export async function runObserveCandidates(
           write(err, "Warning: could not read the verified allowlist; the promoted-awaiting-re-arm marking is unavailable for this listing.\n");
         }
       }
-    } catch {
-      write(err, "Warning: the exclusive-routing marker is unreadable; the promoted-awaiting-re-arm marking is unavailable for this listing.\n");
     }
+  } catch {
+    routingWitnessComplete = false;
+    write(err, "Warning: the exclusive-routing marker is unreadable; the promoted-awaiting-re-arm marking is unavailable for this listing.\n");
   }
   const isAwaitingRearm = (candidate: CandidateObservation): boolean =>
     awaitingRearmGateUid !== null &&
     candidatePromotedAwaitingRearm(awaitingRearmRules, candidate, awaitingRearmGateUid);
+  const rows = candidates.map((candidate) =>
+    isAwaitingRearm(candidate) ? { ...candidate, promoted_awaiting_rearm: true } : candidate,
+  );
+  const completeReadWitness =
+    refreshAttempted &&
+    refreshComplete &&
+    routingWitnessComplete &&
+    sourceReads.every((source) => source.status === "read_ok" || source.status === "absent") &&
+    quarantinedSources.length === 0;
+  const canClaimEmpty =
+    candidates.length === 0 && completeReadWitness && !exclusiveGateDenialsUnavailable;
+  const undeterminedReason = candidateListingUndeterminedReason({
+    noRefresh,
+    refreshIncompleteReason,
+    routingWitnessComplete,
+    exclusiveGateDenialsUnavailable,
+  });
 
   if (json) {
-    const rows = candidates.map((candidate) =>
-      isAwaitingRearm(candidate) ? { ...candidate, promoted_awaiting_rearm: true } : candidate,
+    write(
+      out,
+      JSON.stringify(
+        {
+          status:
+            candidates.length > 0
+              ? completeReadWitness
+                ? "populated"
+                : "partial"
+              : canClaimEmpty
+                ? "empty_verified"
+                : "undetermined",
+          definitive_empty: canClaimEmpty,
+          candidates: rows,
+          source_reads: sourceReads,
+          quarantined_sources: quarantinedSources,
+          gate_denials: exclusiveGateDenialsUnavailable
+            ? {
+                status: "structurally_unavailable",
+                reason: EXCLUSIVE_GATE_DENIALS_UNAVAILABLE,
+              }
+            : { status: "not_applicable" },
+          ...(undeterminedReason !== null ? { undetermined_reason: undeterminedReason } : {}),
+        },
+        null,
+        2,
+      ) + "\n",
     );
-    write(out, JSON.stringify(rows, null, 2) + "\n");
     return 0;
   }
 
+  if (exclusiveGateDenialsUnavailable) {
+    write(out, `Exclusive routing: ${EXCLUSIVE_GATE_DENIALS_UNAVAILABLE}; this listing covers master-audit and boot-audit only.\n`);
+  }
+  if (candidates.length > 0 && !completeReadWitness) {
+    write(out, "UNDETERMINED: observe could not verify every source read, so this candidate listing may be incomplete.\n");
+    for (const line of sourceWitnessLines(sourceReads, quarantinedSources)) write(out, `${line}\n`);
+  }
+
   if (candidates.length === 0) {
-    write(
-      out,
-      "No candidates. Turn on observe mode (`sanctuary castle-wall observe start`), run your agent, then re-run this command.\n",
-    );
+    if (canClaimEmpty) {
+      write(
+        out,
+        "No candidates. Turn on observe mode (`sanctuary castle-wall observe start`), run your agent, then re-run this command.\n",
+      );
+    } else {
+      write(
+        out,
+        `UNDETERMINED: no candidates are listed, but this is not verified empty (${undeterminedReason ?? "source reads were not complete"}).\n`,
+      );
+      for (const line of sourceWitnessLines(sourceReads, quarantinedSources)) write(out, `${line}\n`);
+    }
     return 0;
   }
 
@@ -512,6 +726,41 @@ export async function runObserveCandidates(
     "\nPromote with: sanctuary castle-wall observe promote --destination <host:port> [--destination ...] | --all\n",
   );
   return 0;
+}
+
+const EXCLUSIVE_GATE_DENIALS_UNAVAILABLE =
+  "gate denials are structurally unavailable as an observe source";
+
+function candidateListingUndeterminedReason(input: {
+  noRefresh: boolean;
+  refreshIncompleteReason: string | null;
+  routingWitnessComplete: boolean;
+  exclusiveGateDenialsUnavailable: boolean;
+}): string | null {
+  if (input.noRefresh) return "refresh was skipped, so audit-source reads were not witnessed";
+  if (input.refreshIncompleteReason) return input.refreshIncompleteReason;
+  if (!input.routingWitnessComplete) return "exclusive-routing state could not be read";
+  if (input.exclusiveGateDenialsUnavailable) return EXCLUSIVE_GATE_DENIALS_UNAVAILABLE;
+  return null;
+}
+
+function sourceWitnessLines(
+  sourceReads: readonly ObserveAuditSourceReadOutcome[],
+  quarantinedSources: readonly ObserveQuarantinedSourceState[],
+): string[] {
+  const lines = sourceReads.map((source) => {
+    if (source.status === "read_ok") {
+      return `Source ${source.source_id}: read_ok (${source.flow_events} flow event(s), ${source.candidate_rows} candidate row(s)).`;
+    }
+    if (source.status === "absent") {
+      return `Source ${source.source_id}: absent (${source.reason}).`;
+    }
+    return `Source ${source.source_id}: read_failed (${source.failure}: ${source.reason}).`;
+  });
+  for (const source of quarantinedSources) {
+    lines.push(`Source state ${source.key}: quarantined (${source.reason}).`);
+  }
+  return lines;
 }
 
 /** Lockfile basename for the cross-process refresh mutual exclusion (Codex gate BLOCKER; see castle-wall/observe/refresh.ts guarantee 2). Lives directly under the fortress root (mode 0700). */

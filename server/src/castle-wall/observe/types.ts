@@ -25,6 +25,17 @@ export const OBSERVE_NAMESPACE = "_castle_wall_observe" as const;
 /** Schema version tag persisted on every candidate + state record. */
 export const OBSERVE_SCHEMA_VERSION = "1.0" as const;
 
+/** Closed registry of audit sources the observe refresh is allowed to fold. */
+export const OBSERVE_AUDIT_SOURCE_IDS = ["master-audit", "boot-audit"] as const;
+export type ObserveAuditSourceId = (typeof OBSERVE_AUDIT_SOURCE_IDS)[number];
+
+export function isObserveAuditSourceId(value: unknown): value is ObserveAuditSourceId {
+  return (
+    typeof value === "string" &&
+    (OBSERVE_AUDIT_SOURCE_IDS as readonly string[]).includes(value)
+  );
+}
+
 /** How confidently the daemon derived the destination hostname. Mirrors `IpcDestination.hostname_source` (ipc/messages.ts); `null` when the producer did not report one (e.g. the Linux daemon's generic `CastleWallEventDestination` carries no hostname_source field at all). */
 export type HostnameSource = "dns" | "sni" | "url" | "socket" | null;
 
