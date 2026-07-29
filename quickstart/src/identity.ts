@@ -8,7 +8,7 @@
  * identity subsystem, so quickstart identities are forward-compatible.
  */
 
-import { ed25519 } from "@noble/curves/ed25519";
+import { ed25519 } from "@noble/curves/ed25519.js";
 import { randomBytes } from "node:crypto";
 
 export interface QuickstartIdentity {
