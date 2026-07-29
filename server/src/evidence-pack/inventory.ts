@@ -30,6 +30,12 @@
 
 import type { LocalAgentRecord } from "../contracts/v1.1/local-agent-records.js";
 import type { CandidateObservation } from "../castle-wall/observe/types.js";
+import {
+  claimFromVerifiedEmpty,
+  verifiedEmptyFrom,
+  type SourceReadOutcome,
+  type VerifiedEmpty,
+} from "../claim-witness.js";
 import type {
   InventoryAgentRow,
   InventoryMcpServerRow,
@@ -74,6 +80,11 @@ export interface InventorySourceRead<T> {
   records: readonly T[];
   reason?: string;
 }
+
+type InventorySourceId =
+  | "inventory.agents"
+  | "inventory.mcp_servers"
+  | "inventory.observed_destinations";
 
 /** Raw enumeration sources + their read outcomes, fed into {@link buildInventorySnapshot}. */
 export interface InventorySources {
@@ -138,6 +149,35 @@ function destinationRow(
   };
 }
 
+function inventorySourceOutcome<TRaw>(
+  sourceId: InventorySourceId,
+  read: InventorySourceRead<TRaw> | undefined,
+): SourceReadOutcome {
+  if (read === undefined) {
+    return {
+      status: "not-read",
+      source_id: sourceId,
+      reason: NOT_COLLECTED_REASON,
+    };
+  }
+  if (!read.ok) {
+    return {
+      status: "read-failed",
+      source_id: sourceId,
+      reason: read.reason ?? "the source could not be read.",
+    };
+  }
+  return {
+    status: "read-and-verified",
+    source_id: sourceId,
+    record_count: read.records.length,
+  };
+}
+
+function emptyVerifiedInventory(witness: VerifiedEmpty): ReadOutcome<never[]> {
+  return claimFromVerifiedEmpty(witness, emptyVerified());
+}
+
 /**
  * Map one source read outcome to a {@link ReadOutcome} over its row list,
  * preserving the failure/empty distinction so the renderer prints honest
@@ -150,6 +190,7 @@ function destinationRow(
  * turns into a definitive "none recorded" census line (R3-5).
  */
 function toOutcome<TRaw, TRow>(
+  sourceId: InventorySourceId,
   read: InventorySourceRead<TRaw> | undefined,
   map: (raw: TRaw) => TRow,
   sort: (a: TRow, b: TRow) => number
@@ -160,8 +201,13 @@ function toOutcome<TRaw, TRow>(
   if (!read.ok) {
     return readFailed(read.reason ?? "the source could not be read.");
   }
+  const source = inventorySourceOutcome(sourceId, read);
   if (read.records.length === 0) {
-    return emptyVerified();
+    const witness = verifiedEmptyFrom("evidence-pack.inventory.empty-verified", [source]);
+    if (witness === undefined) {
+      return readFailed("the inventory source did not produce a verified-empty witness.");
+    }
+    return emptyVerifiedInventory(witness);
   }
   const rows = read.records.map(map);
   rows.sort(sort);
@@ -178,15 +224,16 @@ export function buildInventorySnapshot(
   sources: InventorySources
 ): InventorySnapshot {
   const observed_destinations = toOutcome(
+    "inventory.observed_destinations",
     sources.observedDestinations,
     destinationRow,
     (a, b) => a.host.localeCompare(b.host) || (a.port ?? 0) - (b.port ?? 0)
   );
   return {
-    agents: toOutcome(sources.agents, agentRow, (a, b) =>
+    agents: toOutcome("inventory.agents", sources.agents, agentRow, (a, b) =>
       a.agent_id.localeCompare(b.agent_id)
     ),
-    mcp_servers: toOutcome(sources.proxyServers, mcpServerRow, (a, b) =>
+    mcp_servers: toOutcome("inventory.mcp_servers", sources.proxyServers, mcpServerRow, (a, b) =>
       a.name.localeCompare(b.name)
     ),
     observed_destinations,
@@ -214,10 +261,26 @@ export const NOT_COLLECTED_REASON =
  * "none recorded" census (R3-5, round-3 sweep 2026-07-14).
  */
 export function emptyInventorySnapshot(): InventorySnapshot {
+  const agents = verifiedEmptyFrom("evidence-pack.inventory.empty-verified", [
+    { status: "read-and-verified", source_id: "inventory.agents", record_count: 0 },
+  ]);
+  const mcpServers = verifiedEmptyFrom("evidence-pack.inventory.empty-verified", [
+    { status: "read-and-verified", source_id: "inventory.mcp_servers", record_count: 0 },
+  ]);
+  const observedDestinations = verifiedEmptyFrom("evidence-pack.inventory.empty-verified", [
+    { status: "read-and-verified", source_id: "inventory.observed_destinations", record_count: 0 },
+  ]);
+  if (
+    agents === undefined ||
+    mcpServers === undefined ||
+    observedDestinations === undefined
+  ) {
+    throw new Error("empty inventory snapshot did not produce verified-empty witnesses");
+  }
   return {
-    agents: emptyVerified(),
-    mcp_servers: emptyVerified(),
-    observed_destinations: emptyVerified(),
+    agents: emptyVerifiedInventory(agents),
+    mcp_servers: emptyVerifiedInventory(mcpServers),
+    observed_destinations: emptyVerifiedInventory(observedDestinations),
   };
 }
 

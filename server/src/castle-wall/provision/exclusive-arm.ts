@@ -45,10 +45,17 @@ import {
   EGRESS_GATE_STAND_DOWN_EFFECT,
   EGRESS_GATE_UNPROTECT_WITH_STAND_DOWN_COMMAND,
 } from "../../egress-gate/operator-advice.js";
+import {
+  auditClaim,
+  observing,
+  type ClaimAuditDetailsByOperation,
+  type Observed,
+} from "../../claim-witness.js";
 
 /** Distinct local audit operation strings (never a widened shared enum). */
 export const EXCLUSIVE_EGRESS_ARMED_AUDIT_OP = "exclusive_egress_armed";
 export const EXCLUSIVE_EGRESS_DEGRADED_AUDIT_OP = "exclusive_egress_degraded_coarse_active";
+export const EXCLUSIVE_EGRESS_BOOT_RELEASE_AUDIT_OP = "exclusive_egress_boot_release";
 /**
  * D8 self-heal (2026-07-22): the reconcile preflight removed an ORPHANED
  * exclusive-routing marker left by a hard-interrupted prior arm. Distinct op
@@ -67,6 +74,81 @@ export interface ExclusiveGenerationIdentity {
   generation_id: number;
   agent_uid: number;
   gate_port: number;
+}
+
+type ReleasedBarrierOutcome = Extract<
+  ReleaseBarrierOutcome,
+  { kind: "released" | "released-repark-failed" }
+>;
+type ParkedBarrierOutcome = Extract<ReleaseBarrierOutcome, { kind: "parked" }>;
+
+type ExclusiveArmReleaseObservation =
+  | {
+      release_kind: "released";
+      agent_uid: number;
+      generation_id: number;
+      gate_port: number;
+    }
+  | {
+      release_kind: "released-repark-failed";
+      agent_uid: number;
+      generation_id: number;
+      gate_port: number;
+      repark_failed: string;
+    }
+  | { release_kind: "parked"; release: ParkedBarrierOutcome };
+
+type ObservedExclusiveArmReleaseObservation =
+  | {
+      release_kind: "released";
+      agent_uid: number;
+      generation_id: Observed<number>;
+      gate_port: number;
+    }
+  | {
+      release_kind: "released-repark-failed";
+      agent_uid: number;
+      generation_id: Observed<number>;
+      gate_port: number;
+      repark_failed: Observed<string>;
+    }
+  | { release_kind: "parked"; release: ParkedBarrierOutcome };
+
+type QuarantineRepairObservation =
+  | { repaired: false; quarantine: PfAnchorQuarantineRepairResult }
+  | {
+      repaired: true;
+      quarantine: PfAnchorQuarantineRepairResult;
+      agent_uid: number;
+      forensic_path: string | null;
+      quarantined: Array<{
+        index: number;
+        reason: string;
+        agent_uid: number | null;
+        disposition: "tombstoned" | "removed";
+        duplicate?: {
+          kept_generation_id: number | null;
+          removed_generation_id: number | null;
+        };
+      }>;
+      generation_floor_repair?: {
+        raw: unknown;
+        parsed: number | null;
+        resolved_floor: number | null;
+        unrecoverable: boolean;
+      };
+    };
+
+function releasedGenerationId(
+  committed: ExclusiveGenerationIdentity,
+  release: ReleasedBarrierOutcome,
+): number {
+  if (release.generation_id !== committed.generation_id) {
+    throw new Error(
+      `release barrier generation ${release.generation_id} did not match committed generation ${committed.generation_id}`,
+    );
+  }
+  return release.generation_id;
 }
 
 /**
@@ -218,13 +300,13 @@ export interface ExclusiveEgressArmOps {
 /** Terminal outcome of the exclusive-egress arming stage. */
 export type ExclusiveEgressArmOutcome =
   /** Fully live: generation committed, barrier released the harness. */
-  | { kind: "exclusive-armed"; generationId: number }
+  | { kind: "exclusive-armed"; generationId: Observed<number> }
   /**
    * Live but AMBER: the harness is running confined, but the persistent boot
    * state could not be re-parked (next boot could auto-start pre-G5). Never
    * rendered green; the repair verb re-runs the re-park.
    */
-  | { kind: "exclusive-armed-repark-failed"; generationId: number; reparkError: string }
+  | { kind: "exclusive-armed-repark-failed"; generationId: Observed<number>; reparkError: string }
   /**
    * DEGRADE-LOUD (design answer 2 choice (b)): the exclusive stack could not
    * come live; the coarse wall stays armed. Always a DISTINCT non-green
@@ -249,7 +331,7 @@ export type ExclusiveEgressArmOutcome =
       kind: "degraded-coarse-active";
       stage: "bring-up" | "release";
       reason: string;
-      coarseCompositionRestored: boolean;
+      coarseCompositionRestored: Observed<boolean>;
       /** What happened to the agent process, per branch. Never a boolean. */
       harness: HarnessDisposition;
       /** Cleanup problems that must stay loud (parked-state assertions etc). */
@@ -290,36 +372,65 @@ export async function runExclusiveEgressArming(
       `(gate port ${committed.gate_port}); releasing the parked harness through the barrier.`,
   );
 
-  let release: ReleaseBarrierOutcome;
+  let release: ObservedExclusiveArmReleaseObservation;
   try {
-    release = await ops.runReleaseSequence(committed);
+    release = await observing(
+      "provision-exclusive-arm.exclusive-armed",
+      async (): Promise<ExclusiveArmReleaseObservation> => {
+        const outcome = await ops.runReleaseSequence(committed);
+        if (outcome.kind === "released") {
+          return {
+            release_kind: "released",
+            agent_uid: ctx.agentUid,
+            generation_id: releasedGenerationId(committed, outcome),
+            gate_port: committed.gate_port,
+          };
+        }
+        if (outcome.kind === "released-repark-failed") {
+          return {
+            release_kind: "released-repark-failed",
+            agent_uid: ctx.agentUid,
+            generation_id: releasedGenerationId(committed, outcome),
+            gate_port: committed.gate_port,
+            repark_failed: outcome.reparkError,
+          };
+        }
+        return { release_kind: "parked", release: outcome };
+      },
+      ["generation_id", "repark_failed"] as const,
+    );
   } catch (err) {
     // The barrier's contract is discriminated outcomes, but a throwing op
     // wiring must still fail closed here: treat as a parked release failure.
     return degradeLoud(ctx, ops, "release", `release sequence threw: ${(err as Error).message}`);
   }
 
-  if (release.kind === "released") {
-    await ops.audit(EXCLUSIVE_EGRESS_ARMED_AUDIT_OP, {
-      agent_uid: ctx.agentUid,
-      generation_id: committed.generation_id,
-      gate_port: committed.gate_port,
-    });
-    return { kind: "exclusive-armed", generationId: committed.generation_id };
+  if (release.release_kind === "released") {
+    const generationId = release.generation_id;
+    await ops.audit(...auditClaim(EXCLUSIVE_EGRESS_ARMED_AUDIT_OP, {
+      agent_uid: release.agent_uid,
+      generation_id: generationId,
+      gate_port: release.gate_port,
+    }));
+    return {
+      kind: "exclusive-armed",
+      generationId,
+    };
   }
-  if (release.kind === "released-repark-failed") {
+  if (release.release_kind === "released-repark-failed") {
     // Running + confined, but the boot path is not re-parked: DISTINCT amber,
     // never green, never silently degraded.
-    await ops.audit(EXCLUSIVE_EGRESS_ARMED_AUDIT_OP, {
-      agent_uid: ctx.agentUid,
-      generation_id: committed.generation_id,
-      gate_port: committed.gate_port,
-      repark_failed: release.reparkError,
-    });
+    const generationId = release.generation_id;
+    await ops.audit(...auditClaim(EXCLUSIVE_EGRESS_ARMED_AUDIT_OP, {
+      agent_uid: release.agent_uid,
+      generation_id: generationId,
+      gate_port: release.gate_port,
+      repark_failed: release.repark_failed,
+    }));
     return {
       kind: "exclusive-armed-repark-failed",
-      generationId: committed.generation_id,
-      reparkError: release.reparkError,
+      generationId,
+      reparkError: release.repark_failed,
     };
   }
   // Parked: the barrier refused to release (and asserts hold-file/disable
@@ -328,8 +439,8 @@ export async function runExclusiveEgressArming(
     ctx,
     ops,
     "release",
-    `release barrier parked at stage ${release.stage}: ${release.reason}`,
-    release.cleanupErrors,
+    `release barrier parked at stage ${release.release.stage}: ${release.release.reason}`,
+    release.release.cleanupErrors,
   );
 }
 
@@ -349,13 +460,18 @@ async function degradeLoud(
   cleanupErrors: string[] = [],
 ): Promise<ExclusiveEgressArmOutcome> {
   const errors = [...cleanupErrors];
-  let coarseCompositionRestored = false;
-  try {
-    await ops.restoreCoarseComposition(reason);
-    coarseCompositionRestored = true;
-  } catch (err) {
-    errors.push(`coarse composition restore failed: ${(err as Error).message}`);
-  }
+  const coarseCompositionRestored = await observing(
+    "provision-exclusive-arm.coarse-composition-restored",
+    async () => {
+      try {
+        await ops.restoreCoarseComposition(reason);
+        return true;
+      } catch (err) {
+        errors.push(`coarse composition restore failed: ${(err as Error).message}`);
+        return false;
+      }
+    },
+  );
   let harness: HarnessDisposition | undefined;
   if (coarseCompositionRestored) {
     // Only start the agent over a manifest that is PROVEN back in coarse
@@ -388,7 +504,7 @@ async function degradeLoud(
     harness.disposition === "started-coarse"
       ? { harness_run_state: "running-coarse", harness_run_state_basis: harness.observed }
       : parkedClaimAuditFields(harness.claim);
-  await ops.audit(EXCLUSIVE_EGRESS_DEGRADED_AUDIT_OP, {
+  await ops.audit(...auditClaim(EXCLUSIVE_EGRESS_DEGRADED_AUDIT_OP, {
     agent_uid: ctx.agentUid,
     stage,
     reason,
@@ -396,7 +512,7 @@ async function degradeLoud(
     harness_disposition: harness.disposition,
     ...harnessAudit,
     cleanup_errors: errors,
-  });
+  }));
   ops.print(
     `Exclusive egress could NOT come live (${stage}): ${reason}. ` +
       (coarseCompositionRestored
@@ -715,27 +831,45 @@ export async function runEgressGateRepair(
   // never grounds to drop an entry), and preserves each removed entry's raw
   // content in a forensic sidecar before touching it.
   try {
-    const quarantine = await ops.repairQuarantinedRegistry();
+    const quarantine = await observing(
+      "provision-exclusive-arm.quarantine-repair",
+      async (): Promise<QuarantineRepairObservation> => {
+        const outcome = await ops.repairQuarantinedRegistry();
+        if (!outcome.repaired) return { repaired: false, quarantine: outcome };
+        return {
+          repaired: true,
+          quarantine: outcome,
+          agent_uid: ctx.agentUid,
+          forensic_path: outcome.forensicPath,
+          quarantined: outcome.findings.map((f) => ({
+            index: f.index,
+            reason: f.reason,
+            agent_uid: f.agent_uid,
+            disposition: f.disposition,
+            // Fix-round-5 P1: a removed structurally VALID duplicate is loud in
+            // the audit record too (kept vs removed generation).
+            ...(f.duplicate !== undefined ? { duplicate: f.duplicate } : {}),
+          })),
+          // Fix-round-6 F1: a repaired malformed generation floor is loud in the
+          // audit record (raw evidence, best-effort parse, resolved floor).
+          ...(outcome.floorRepair !== undefined
+            ? { generation_floor_repair: outcome.floorRepair }
+            : {}),
+        };
+      },
+      ["forensic_path", "quarantined", "generation_floor_repair"] as const,
+    );
+    const repairResult = quarantine.quarantine;
     if (quarantine.repaired) {
-      await ops.audit(EGRESS_GATE_REPAIR_QUARANTINE_AUDIT_OP, {
-        agent_uid: ctx.agentUid,
-        forensic_path: quarantine.forensicPath,
-        quarantined: quarantine.findings.map((f) => ({
-          index: f.index,
-          reason: f.reason,
-          agent_uid: f.agent_uid,
-          disposition: f.disposition,
-          // Fix-round-5 P1: a removed structurally VALID duplicate is loud in
-          // the audit record too (kept vs removed generation).
-          ...(f.duplicate !== undefined ? { duplicate: f.duplicate } : {}),
-        })),
-        // Fix-round-6 F1: a repaired malformed generation floor is loud in the
-        // audit record (raw evidence, best-effort parse, resolved floor).
-        ...(quarantine.floorRepair !== undefined
-          ? { generation_floor_repair: quarantine.floorRepair }
+      await ops.audit(...auditClaim(EGRESS_GATE_REPAIR_QUARANTINE_AUDIT_OP, {
+        agent_uid: quarantine.agent_uid,
+        forensic_path: quarantine.forensic_path,
+        quarantined: quarantine.quarantined,
+        ...(quarantine.generation_floor_repair !== undefined
+          ? { generation_floor_repair: quarantine.generation_floor_repair }
           : {}),
-      });
-      for (const f of quarantine.findings) {
+      }));
+      for (const f of repairResult.findings) {
         const uidText = f.agent_uid !== null ? `uid ${f.agent_uid}` : "an unrecoverable uid";
         const dispositionText =
           f.disposition === "tombstoned"
@@ -757,7 +891,7 @@ export async function runEgressGateRepair(
         ops.print(
           `Quarantined registry entry #${f.index} (${uidText}) was ${dispositionText}: ${f.reason}.` +
             duplicateText +
-            ` Raw entry preserved for forensics at ${quarantine.forensicPath}. The affected agent ` +
+            ` Raw entry preserved for forensics at ${repairResult.forensicPath}. The affected agent ` +
             "must be RE-PROVISIONED (sudo sanctuary protect) before its gate can serve again.",
         );
       }
@@ -765,8 +899,8 @@ export async function runEgressGateRepair(
       // especially the unrecoverable case, where the reset floor is only "the
       // maximum generation still observable" and the original may have been
       // higher.
-      if (quarantine.floorRepair !== undefined) {
-        const fr = quarantine.floorRepair;
+      if (repairResult.floorRepair !== undefined) {
+        const fr = repairResult.floorRepair;
         ops.print(
           fr.unrecoverable
             ? "The registry's persisted generation floor was malformed and its original value is " +
@@ -776,10 +910,10 @@ export async function runEgressGateRepair(
                 "original floor may have been higher, so RE-PROVISIONING the confined agents " +
                 "(sudo sanctuary protect) is advised: it allocates a fresh generation above " +
                 "everything observable, so no stale generation artifact can masquerade as current. " +
-                `Pre-repair bytes preserved at ${quarantine.forensicPath}.`
+                `Pre-repair bytes preserved at ${repairResult.forensicPath}.`
             : "The registry's persisted generation floor was malformed; its preserved raw value " +
                 `${JSON.stringify(fr.raw)} parsed to ${fr.parsed} and was folded into the repaired ` +
-                `floor (${fr.resolved_floor}). Pre-repair bytes preserved at ${quarantine.forensicPath}.`,
+                `floor (${fr.resolved_floor}). Pre-repair bytes preserved at ${repairResult.forensicPath}.`,
         );
       }
     }
@@ -802,37 +936,63 @@ export async function runEgressGateRepair(
   } catch (err) {
     return failParked("bring-up", (err as Error).message, true);
   }
-  let release: ReleaseBarrierOutcome;
+  let parkedRelease: ParkedBarrierOutcome | undefined;
+  let repairReleaseKind: "released" | "released-repark-failed" | undefined;
+  let repairAuditDetails: ClaimAuditDetailsByOperation["egress_gate_repair"];
   try {
-    release = await ops.runReleaseSequence(committed);
+    repairAuditDetails = await observing("provision-exclusive-arm.repair-release", async () => {
+      const release = await ops.runReleaseSequence(committed);
+      if (release.kind === "released") {
+        const generationId = releasedGenerationId(committed, release);
+        repairReleaseKind = "released";
+        return {
+          agent_uid: ctx.agentUid,
+          generation_id: generationId,
+          override_used: ctx.overrideTransientPfRules && foreign.length > 0,
+        };
+      }
+      if (release.kind === "released-repark-failed") {
+        const generationId = releasedGenerationId(committed, release);
+        repairReleaseKind = "released-repark-failed";
+        return {
+          agent_uid: ctx.agentUid,
+          generation_id: generationId,
+          repark_failed: release.reparkError,
+        };
+      }
+      parkedRelease = release;
+      throw new Error(`release barrier parked at stage ${release.stage}: ${release.reason}`);
+    });
   } catch (err) {
-    return failParked("release", (err as Error).message, true);
+    const parked = parkedRelease;
+    return failParked(
+      "release",
+      parked !== undefined
+        ? `release barrier parked at stage ${parked.stage}: ${parked.reason}`
+        : (err as Error).message,
+      true,
+    );
   }
-  if (release.kind === "released") {
-    await ops.audit(EGRESS_GATE_REPAIR_AUDIT_OP, {
-      agent_uid: ctx.agentUid,
-      generation_id: committed.generation_id,
-      override_used: ctx.overrideTransientPfRules && foreign.length > 0,
-    });
-    return { kind: "repaired", generationId: committed.generation_id };
+  await ops.audit(...auditClaim(EGRESS_GATE_REPAIR_AUDIT_OP, repairAuditDetails));
+  if (repairReleaseKind === "released") {
+    return { kind: "repaired", generationId: repairAuditDetails.generation_id };
   }
-  if (release.kind === "released-repark-failed") {
-    await ops.audit(EGRESS_GATE_REPAIR_AUDIT_OP, {
-      agent_uid: ctx.agentUid,
-      generation_id: committed.generation_id,
-      repark_failed: release.reparkError,
-    });
+  if (repairReleaseKind === "released-repark-failed") {
+    const reparkError = repairAuditDetails.repark_failed;
+    if (reparkError === undefined) {
+      return failParked(
+        "release",
+        "released-repark-failed observation did not include the re-park failure detail",
+        true,
+      );
+    }
     return {
       kind: "repaired-repark-failed",
-      generationId: committed.generation_id,
-      reparkError: release.reparkError,
+      generationId: repairAuditDetails.generation_id,
+      reparkError,
     };
   }
-  // FIX F-COARSE-AFTER-EXCLUSIVE: THE drill's actual path. The bring-up
-  // committed a generation (fortress now in exclusive composition) and the
-  // barrier then refused to release. Pre-fix this returned with the fortress
-  // still exclusive, which is what made the next plain coarse arm refuse.
-  return failParked("release", `release barrier parked at stage ${release.stage}: ${release.reason}`, true);
+  return failParked("release", "release observation returned no terminal success kind", true);
 }
 
 // ---------------------------------------------------------------------------
@@ -904,36 +1064,91 @@ export async function runBootExclusiveEgressRelease(
 ): Promise<BootReleaseResult[]> {
   const results: BootReleaseResult[] = [];
   for (const agent of agents) {
+    let parkedClaim: ParkedClaim | undefined;
+    let auditDetails: ClaimAuditDetailsByOperation["exclusive_egress_boot_release"];
     let outcome: BootReleaseResult["outcome"];
     try {
-      const release = await ops.releaseAgent(agent.agent_uid);
-      if (release.kind === "released") {
-        outcome = { kind: "released", generationId: release.generation_id };
-      } else if (release.kind === "released-repark-failed") {
-        outcome = {
-          kind: "released-repark-failed",
-          generationId: release.generation_id,
-          reparkError: release.reparkError,
-        };
-      } else {
+      auditDetails = await observing("provision-exclusive-arm.boot-release", async () => {
+        const release = await ops.releaseAgent(agent.agent_uid);
+        if (release.kind === "released") {
+          return {
+            agent_uid: agent.agent_uid,
+            outcome: "released" as const,
+            generation_id: release.generation_id,
+          };
+        }
+        if (release.kind === "released-repark-failed") {
+          return {
+            agent_uid: agent.agent_uid,
+            outcome: "released-repark-failed" as const,
+            generation_id: release.generation_id,
+            repark_failed: release.reparkError,
+          };
+        }
+        parkedClaim = release.parkedClaim;
         // Carry the REAL re-park results forward (fix-round-2 BLOCKER-1):
         // "parked" without the op results would be a claim nobody could audit.
-        outcome = {
-          kind: "parked",
+        return {
+          agent_uid: agent.agent_uid,
+          outcome: "parked" as const,
           reason: `release barrier parked at stage ${release.stage}: ${release.reason}`,
-          holdFileRemoved: release.holdFileRemoved,
-          jobDisabled: release.jobDisabled,
-          cleanupErrors: release.cleanupErrors,
-          parkedClaim: release.parkedClaim,
+          hold_file_removed: release.holdFileRemoved,
+          job_disabled: release.jobDisabled,
+          cleanup_errors: release.cleanupErrors,
+          ...parkedClaimAuditFields(release.parkedClaim),
         };
-      }
+      }, [
+        "generation_id",
+        "repark_failed",
+        "hold_file_removed",
+        "job_disabled",
+        "cleanup_errors",
+        "harness_run_state",
+        "harness_run_state_basis",
+      ] as const);
     } catch (err) {
       // Fix-round-2 BLOCKER-1: a THROW out of the release attempt proves
       // nothing about the parked state (the pre-fix code reported a synthetic
       // PARKED here with no re-park op verified). Distinct, LOUD, honest.
+      auditDetails = {
+        agent_uid: agent.agent_uid,
+        outcome: "park-not-verified",
+        reason: `boot release threw before a verified park: ${(err as Error).message}`,
+      };
+    }
+    if (auditDetails.outcome === "released") {
+      outcome = { kind: "released", generationId: auditDetails.generation_id };
+    } else if (auditDetails.outcome === "released-repark-failed") {
+      outcome = {
+        kind: "released-repark-failed",
+        generationId: auditDetails.generation_id,
+        reparkError: auditDetails.repark_failed,
+      };
+    } else if (auditDetails.outcome === "parked") {
+      if (parkedClaim === undefined) {
+        outcome = {
+          kind: "park-not-verified",
+          reason: "boot release returned a parked audit observation without the run-state claim",
+        };
+        auditDetails = {
+          agent_uid: agent.agent_uid,
+          outcome: "park-not-verified",
+          reason: outcome.reason,
+        };
+      } else {
+        outcome = {
+          kind: "parked",
+          reason: auditDetails.reason,
+          holdFileRemoved: auditDetails.hold_file_removed,
+          jobDisabled: auditDetails.job_disabled,
+          cleanupErrors: auditDetails.cleanup_errors,
+          parkedClaim,
+        };
+      }
+    } else {
       outcome = {
         kind: "park-not-verified",
-        reason: `boot release threw before a verified park: ${(err as Error).message}`,
+        reason: auditDetails.reason,
       };
     }
     if (outcome.kind === "park-not-verified") {
@@ -965,28 +1180,7 @@ export async function runBootExclusiveEgressRelease(
             : ""),
       );
     }
-    await ops.audit("exclusive_egress_boot_release", {
-      agent_uid: agent.agent_uid,
-      outcome: outcome.kind,
-      ...(outcome.kind === "released" || outcome.kind === "released-repark-failed"
-        ? { generation_id: outcome.generationId }
-        : { reason: outcome.reason }),
-      ...(outcome.kind === "parked"
-        ? {
-            hold_file_removed: outcome.holdFileRemoved,
-            job_disabled: outcome.jobDisabled,
-            cleanup_errors: outcome.cleanupErrors,
-            // FIX-ROUND 5: symmetry with the degrade path's audit. `outcome:
-            // "parked"` here means only "the barrier did not release"; the
-            // type doc says so, but a SIEM consumer does not read type docs.
-            // Without these two fields this record reads as a park over a host
-            // where the code had just observed a live pid -- the same
-            // downstream-silence gap round 4 closed on `degradeLoud`, left
-            // asymmetric. The claim is in the record, not only in the prose.
-            ...parkedClaimAuditFields(outcome.parkedClaim),
-          }
-        : {}),
-    });
+    await ops.audit(...auditClaim(EXCLUSIVE_EGRESS_BOOT_RELEASE_AUDIT_OP, auditDetails));
     results.push({ agent_uid: agent.agent_uid, outcome });
   }
   return results;
