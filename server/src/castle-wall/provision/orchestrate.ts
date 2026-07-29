@@ -65,6 +65,7 @@ import {
   renderEgressPlanLines,
   renderEndpointCheckLines,
 } from "./egress.js";
+import { observing, type Observed } from "../../claim-witness.js";
 
 /** Everything the orchestrator needs to decide + print, resolved once up front. */
 export interface ProvisionFlowContext {
@@ -119,6 +120,17 @@ function disarmOutcomeAllowsFreshDaemonTeardown(
   outcome: DisarmNePreferenceOutcome,
 ): boolean {
   return outcome !== "fail_open_deadman";
+}
+
+function observedTrue(value: Observed<boolean>): Observed<true> | undefined {
+  return value === true ? value : undefined;
+}
+
+function armedUidFromVerifiedEgress(uid: number, report: AgentEgressVerifyReport): number {
+  if (!report.ok) {
+    throw new Error("cannot witness an armed uid from a failed post-arm egress report");
+  }
+  return uid;
 }
 
 /** The injected, side-effecting steps. Each corresponds to one stage of the target flow. */
@@ -496,6 +508,27 @@ export interface ProvisionFlowOps {
   lookupDedicatedAccountUid(): Promise<number | undefined>;
 }
 
+async function observeDisarmObservedOff(
+  ops: ProvisionFlowOps,
+): Promise<{
+  nePreferenceOutcome: DisarmNePreferenceOutcome;
+  disarmObservedOff?: Observed<true>;
+}> {
+  let nePreferenceOutcome: DisarmNePreferenceOutcome | undefined;
+  const observedOff = await observing("provision-orchestrate.disarmed", async () => {
+    const disarmResult = await ops.disarm();
+    nePreferenceOutcome = disarmResult.nePreferenceOutcome;
+    return disarmOutcomeObservedOff(disarmResult.nePreferenceOutcome);
+  });
+  if (nePreferenceOutcome === undefined) {
+    throw new Error("disarm returned no NE preference outcome");
+  }
+  return {
+    nePreferenceOutcome,
+    disarmObservedOff: observedTrue(observedOff),
+  };
+}
+
 export type { ExclusiveRoutingResidue };
 
 const EGRESS_GATE_REPAIR_QUOTED_ADVICE =
@@ -729,7 +762,7 @@ export type ProvisionFlowOutcome =
   | { kind: "skipped-already-dedicated"; reason: string }
   | { kind: "skipped-non-tty-cooperative-only"; reason: string }
   | { kind: "declined-by-operator" }
-  | { kind: "armed"; uid: number }
+  | { kind: "armed"; uid: Observed<number> }
   | {
       kind: "aborted";
       stage: string;
@@ -802,7 +835,7 @@ export type ProvisionFlowOutcome =
        * Positive observed-off evidence from `ops.disarm()`. Absence means "not
        * observed", never "off".
        */
-      disarmObservedOff?: true;
+      disarmObservedOff?: Observed<true>;
       /** Raw NE rollback result when this abort actually called `disarm()`. */
       disarmOutcome?: DisarmNePreferenceOutcome;
     }
@@ -811,7 +844,7 @@ export type ProvisionFlowOutcome =
       uid: number;
       reason: string;
       disarmOutcome: DisarmNePreferenceOutcome;
-      disarmObservedOff?: true;
+      disarmObservedOff?: Observed<true>;
     }
   | { kind: "armed-rollback-failed"; uid: number; reason: string; disarmError: string }
   /**
@@ -837,7 +870,7 @@ export type ProvisionFlowOutcome =
        */
       egressRestoredToPreRunState: boolean;
       disarmOutcome: DisarmNePreferenceOutcome;
-      disarmObservedOff?: true;
+      disarmObservedOff?: Observed<true>;
     }
   /**
    * S5-6 (Unified Protect Slice 5): the FULL fine-grained outcome -- coarse
@@ -845,14 +878,19 @@ export type ProvisionFlowOutcome =
    * S5-5 release barrier released the (previously parked) harness. The only
    * fine-grained outcome that may contribute to aggregate green.
    */
-  | { kind: "armed-exclusive"; uid: number; generationId: number }
+  | { kind: "armed-exclusive"; uid: number; generationId: Observed<number> }
   /**
    * S5-6: exclusive stack LIVE and the harness running confined, but the
    * persistent boot state could not be re-parked (the next boot could
    * auto-start the harness before G5). DISTINCT AMBER, never green; fixed by
    * `sudo sanctuary protect --repair-egress-gate --stand-down-agent`.
    */
-  | { kind: "armed-exclusive-repark-failed"; uid: number; generationId: number; reparkError: string }
+  | {
+      kind: "armed-exclusive-repark-failed";
+      uid: number;
+      generationId: Observed<number>;
+      reparkError: string;
+    }
   /**
    * S5-6 DEGRADE-LOUD (design answer 2 choice (b), requires S5-P on every
    * surface): fine-grained was declared but the exclusive stack could not
@@ -869,7 +907,7 @@ export type ProvisionFlowOutcome =
       uid: number;
       stage: "bring-up" | "release";
       reason: string;
-      coarseCompositionRestored: boolean;
+      coarseCompositionRestored: Observed<boolean>;
       /**
        * What happened to the agent process. Fix-round 4 replaced the former
        * `harnessStartedCoarse: boolean`, whose FALSE branch ("this run did not
@@ -1705,17 +1743,17 @@ async function runProvisionFlowSteps(
     // the explicit disable outcome, not merely "disarm did not throw."
     let tearDownPolicyDaemon = false;
     let wallMayBeArmed = false;
-    let disarmObservedOff = false;
+    let disarmObservedOff: Observed<true> | undefined;
     let nePreferenceOutcome: DisarmNePreferenceOutcome | undefined;
     let disarmNote: string | undefined;
     if (policyDaemonFreshlyInstalled) {
       try {
-        const disarmResult = await ops.disarm();
+        const disarmResult = await observeDisarmObservedOff(ops);
         nePreferenceOutcome = disarmResult.nePreferenceOutcome;
         if (disarmOutcomeAllowsFreshDaemonTeardown(nePreferenceOutcome)) {
           tearDownPolicyDaemon = true;
-          disarmObservedOff = disarmOutcomeObservedOff(nePreferenceOutcome);
-          disarmNote = disarmObservedOff
+          disarmObservedOff = disarmResult.disarmObservedOff;
+          disarmNote = disarmObservedOff !== undefined
             ? "The content filter was observed disabled as part of this rollback; confirm current state with 'sanctuary castle-wall status'."
             : "The content-filter disable save was accepted during rollback, but status corroboration was inconclusive; observe live state before relying on it.";
         } else {
@@ -1766,7 +1804,7 @@ async function runProvisionFlowSteps(
       // confirm), the CLI must NOT render a clean "rolled back; re-run" line.
       wallMayBeArmed: wallMayBeArmed ? true : undefined,
       ...(nePreferenceOutcome !== undefined ? { disarmOutcome: nePreferenceOutcome } : {}),
-      disarmObservedOff: disarmObservedOff ? true : undefined,
+      disarmObservedOff,
       rehomeAttempted: rehomeResults.some((r) => r.status === "moved"),
       accountCreated,
     };
@@ -1801,11 +1839,11 @@ async function runProvisionFlowSteps(
     // the wrap's own success banner still printed over an ARMED wall with a
     // FAILED rollback. Catch it and return a distinct, loud outcome instead.
     let nePreferenceOutcome: DisarmNePreferenceOutcome;
-    let disarmObservedOff: boolean;
+    let disarmObservedOff: Observed<true> | undefined;
     try {
-      const disarmResult = await ops.disarm();
+      const disarmResult = await observeDisarmObservedOff(ops);
       nePreferenceOutcome = disarmResult.nePreferenceOutcome;
-      disarmObservedOff = disarmOutcomeObservedOff(nePreferenceOutcome);
+      disarmObservedOff = disarmResult.disarmObservedOff;
     } catch (disarmErr) {
       return {
         kind: "armed-rollback-failed",
@@ -1826,7 +1864,7 @@ async function runProvisionFlowSteps(
       uid,
       reason: `${baseReason} Fast-disarmed rather than leave a bricked agent.${egressRestoreReasonSuffix(restoreNote)}`,
       disarmOutcome: nePreferenceOutcome,
-      disarmObservedOff: disarmObservedOff ? true : undefined,
+      disarmObservedOff,
     };
   }
   // Step 11 (confined-agent egress, design section 5): the REAL post-arm
@@ -1848,14 +1886,12 @@ async function runProvisionFlowSteps(
       `A process running as the agent uid must reach every declared endpoint through the armed wall ` +
       `and must NOT reach the negative control; anything less confines the agent into ` +
       `non-functionality or proves nothing about confinement.`;
-    let disarmed: boolean;
     let nePreferenceOutcome: DisarmNePreferenceOutcome;
-    let disarmObservedOff: boolean;
+    let disarmObservedOff: Observed<true> | undefined;
     try {
-      const disarmResult = await ops.disarm();
-      disarmed = true;
+      const disarmResult = await observeDisarmObservedOff(ops);
       nePreferenceOutcome = disarmResult.nePreferenceOutcome;
-      disarmObservedOff = disarmOutcomeObservedOff(nePreferenceOutcome);
+      disarmObservedOff = disarmResult.disarmObservedOff;
     } catch (disarmErr) {
       await ops.auditEgress(EGRESS_PROVISION_REFUSED_AUDIT_OP, {
         stage: "post-arm-as-uid-verify",
@@ -1886,9 +1922,9 @@ async function runProvisionFlowSteps(
       kind: "egress-unprovisioned-rolled-back",
       uid,
       reason: `${egressBaseReason} Fast-disarmed rather than leave a bricked-or-unconfined agent.${egressRestoreReasonSuffix(restoreNote)}`,
-      egressRestoredToPreRunState: disarmed && restoreNote === "",
+      egressRestoredToPreRunState: restoreNote === "",
       disarmOutcome: nePreferenceOutcome,
-      disarmObservedOff: disarmObservedOff ? true : undefined,
+      disarmObservedOff,
     };
   }
   await ops.auditEgress(EGRESS_PROVISIONED_AUDIT_OP, {
@@ -1900,7 +1936,13 @@ async function runProvisionFlowSteps(
   });
 
   if (ctx.fineGrainedDeclared !== true) {
-    return { kind: "armed", uid };
+    return {
+      kind: "armed",
+      uid: await observing(
+        "provision-orchestrate.armed",
+        () => armedUidFromVerifiedEgress(uid, egressVerify),
+      ),
+    };
   }
 
   // S5-6: the exclusive-egress arming stage. Runs ONLY after the coarse

@@ -1,0 +1,47 @@
+name: Verify Fail Before
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "server/src/**"
+      - "server/test/**/*.test.ts"
+      - "scripts/verify-fail-before.sh"
+      - ".github/workflows/verify-fail-before.yml"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  verify-fail-before:
+    name: verify-fail-before
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Use Node.js 24
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+
+      - name: Install dependencies
+        working-directory: server
+        run: npm ci
+
+      - name: Verify changed tests fail before source fix
+        env:
+          SKIP_FAIL_BEFORE: ${{ vars.SKIP_FAIL_BEFORE }}
+          SKIP_REASON: ${{ vars.SKIP_FAIL_BEFORE_REASON }}
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            scripts/verify-fail-before.sh "origin/${{ github.base_ref }}"
+          else
+            scripts/verify-fail-before.sh "origin/main"
+          fi

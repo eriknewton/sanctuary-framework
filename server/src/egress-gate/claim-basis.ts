@@ -1758,19 +1758,17 @@ export const CLAIM_SITES: Record<ClaimSiteId, ClaimSiteDeclaration> = {
   "provision-orchestrate.disarmed": {
     file: `${CW}/orchestrate.ts`,
     symbol: "runProvisionFlowSteps",
-    claim: "the Castle Wall filter was disarmed rather than left over a bricked agent",
-    basis: "documented-bound",
-    unobserved:
-      "`ops.disarm()` resolving; the filter is not re-probed. Bounded: this is a ROLLBACK claim on an already " +
-      "failing run, reported as a non-green outcome.",
+    // The old raw `disarmObservedOff?: true` literal is gone. The positive
+    // marker is now minted only by `observing("provision-orchestrate.disarmed")`
+    // when the NE rollback result is the corroborated-off outcome.
+    claim: "the content filter was observed disabled during rollback",
+    basis: "observed",
     layer: "compute",
     branches: "boolean",
     negativeBranch: {
       claim:
-        "the disarm was not attempted, or did not resolve",
-      basis: "documented-bound",
-      unobserved:
-        "the filter is not re-probed on either branch; see the positive bound.",
+        "no observed-off witness exists for this outcome; no disabled-state claim is made",
+      basis: "observed",
     },
   },
   "provision-orchestrate.rules-scrubbed": {
@@ -1964,7 +1962,7 @@ export const CLAIM_LITERAL_COUNTS: Readonly<Record<string, number>> = {
   // pid-liveness probe result for the lock-holder description; not a
   // protection claim.
   [`${CW}/lockfile.ts`]: 1,
-  [`${CW}/orchestrate.ts`]: 11,
+  [`${CW}/orchestrate.ts`]: 10,
   [`${CW}/policy-daemon.ts`]: 0,
   [`${CW}/rehome.ts`]: 0,
   [`${CW}/uid-gate.ts`]: 2,
@@ -2036,9 +2034,23 @@ export const CLAIM_LITERAL_FIELDS: readonly string[] = [
   "committed",
 ];
 
+function snakeCaseClaimField(field: string): string {
+  return field.replace(/[A-Z]/g, (letter) => `_${letter.toLowerCase()}`);
+}
+
+function claimLiteralFieldAlternation(): string {
+  return [...new Set(CLAIM_LITERAL_FIELDS.flatMap((field) => [field, snakeCaseClaimField(field)]))]
+    .sort((a, b) => b.length - a.length)
+    .join("|");
+}
+
 /** The regex the detector runs, built from {@link CLAIM_LITERAL_FIELDS}. */
 export function claimLiteralRegex(): RegExp {
-  return new RegExp(`\\b(${CLAIM_LITERAL_FIELDS.join("|")})\\s*[:=]\\s*true\\b|\\breturn true\\b`, "g");
+  const field = claimLiteralFieldAlternation();
+  return new RegExp(
+    `(^|[^A-Za-z0-9_$])(${field})\\s*[:=]\\s*true\\b|\\breturn\\s+true\\b`,
+    "g",
+  );
 }
 
 // ---------------------------------------------------------------------------
