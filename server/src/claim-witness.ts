@@ -37,6 +37,14 @@ export type ClaimId = ClaimSiteId | StructuralHonestyClaimId;
  * The cast ban is review friction, not a type-system proof. TypeScript casts
  * can always be laundered by a determined author; the ban raises the review
  * bar, and the typed audit map remains the boundary.
+ *
+ * Known residuals (final gate 2026-07-29, accepted for merge): the structural
+ * test does not yet lock EGRESS_GATE_REPAIR_QUARANTINE_AUDIT_OP behind
+ * auditClaim (current code routes it; a future raw-audit regression there
+ * would not be caught structurally), and two raw exclusive_egress_boot_release
+ * audit paths predating this branch remain on the untyped path in the
+ * supervisor's pre-loop failure handling (egress-gate/arming-wiring.ts).
+ * Extending the typed map to those sites is follow-on coverage work.
  */
 export type Observed<T> = T & { readonly [OBSERVED]: true };
 
