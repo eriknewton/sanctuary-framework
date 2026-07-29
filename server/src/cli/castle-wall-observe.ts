@@ -15,12 +15,10 @@
  *                a per-flow prompt).
  *   status       Show whether observe mode is on and how many candidates
  *                are pending review. Tier-3, read-only.
- *   candidates   Fold the audit log's not-yet-folded denied flows into the
- *                candidate store (idempotent: a persisted watermark folds
- *                each recorded flow exactly once, and destinations the live
- *                verified allowlist already permits are never minted and
- *                are pruned -- see castle-wall/observe/refresh.ts), then
- *                list every pending candidate. Tier-3.
+ *   candidates   Re-read the master audit and boot-audit sources, recompute
+ *                the candidate snapshot from retained denied-flow history,
+ *                witness each source read outcome, and list every pending
+ *                candidate. Tier-3.
  *   promote      Tier-1 FORCED. Synthesizes the selected candidates into
  *                allow rules, fires the SAME non-relaxable approval gate an
  *                MCP-exposed tool would use, and -- ONLY on approval --
@@ -36,9 +34,9 @@
  * PR description).
  */
 
-import { mkdir, open, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, open, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { createInterface } from "node:readline/promises";
-import { isAbsolute, join, resolve } from "node:path";
+import { basename, isAbsolute, join, resolve } from "node:path";
 import { Writable } from "node:stream";
 import { createHash, randomBytes } from "node:crypto";
 
@@ -74,14 +72,23 @@ import {
   promoteCandidates,
   refreshCandidatesFromAudit,
   type CandidateObservation,
+  type ObserveLastRefreshOutcome,
+  type ObserveAuditSourceReadOutcome,
   type ObserveModeState,
   type ObserveGranularity,
+  type ObserveQuarantinedSourceState,
   type PromoteRouting,
   type PromoteSelectionRow,
+  type RefreshAuditSourceDescriptor,
   type RefreshAllowlistRead,
   type RefreshLock,
   type VerifiedManifestRead,
 } from "../castle-wall/observe/index.js";
+import {
+  deriveSafeModeAuditKey,
+  readBootToken,
+  safeModeAuditStoragePath,
+} from "../castle-wall/boot/boot-token.js";
 import {
   loadExclusiveRoutingMarker,
   ExclusiveRoutingMarkerError,
@@ -109,6 +116,8 @@ export interface ObserveCommandContext {
   out?: Writable;
   err?: Writable;
   env?: NodeJS.ProcessEnv;
+  /** Test seam for the root-owned boot-token path. Production uses the default custody path. */
+  bootTokenPath?: string;
   /**
    * TEST SEAM ONLY (round-3 R4): overrides the Tier-1 approval channel so the
    * approved-promote CLI paths (candidate retention, exclusive copy) are
@@ -357,6 +366,124 @@ async function bootstrap(
   return { fortressPath, storage, masterKey, auditLog, observeStore, primary };
 }
 
+async function bootAuditRootHasSegments(fortressPath: string): Promise<boolean> {
+  try {
+    const entries = await readdir(join(fortressPath, "boot-audit"));
+    return entries.length > 0;
+  } catch (error) {
+    if (isEnoent(error)) return false;
+    throw error;
+  }
+}
+
+async function resolveObserveAuditSources(
+  boot: Bootstrapped,
+  ctx: ObserveCommandContext,
+): Promise<RefreshAuditSourceDescriptor[]> {
+  const sources: RefreshAuditSourceDescriptor[] = [
+    {
+      source_id: "master-audit",
+      status: "present",
+      auditLog: boot.auditLog,
+      instance_id: "operator-master",
+    },
+  ];
+
+  let tokenRead;
+  try {
+    tokenRead = await readBootToken(ctx.bootTokenPath ? { path: ctx.bootTokenPath } : {});
+  } catch (error) {
+    sources.push({
+      source_id: "boot-audit",
+      status: "read_failed",
+      reason: `boot token could not be read: ${(error as Error).message}`,
+    });
+    return sources;
+  }
+
+  if (tokenRead.status !== "ok") {
+    if (tokenRead.status === "not-found") {
+      sources.push(
+        (await bootAuditRootHasSegments(boot.fortressPath))
+          ? {
+              source_id: "boot-audit",
+              status: "read_failed",
+              reason: "boot token is absent, but boot-audit segment directories exist",
+            }
+          : {
+              source_id: "boot-audit",
+              status: "absent",
+              reason: "no boot token is provisioned for this fortress",
+            },
+      );
+      return sources;
+    }
+    sources.push({
+      source_id: "boot-audit",
+      status: "read_failed",
+      reason:
+        tokenRead.status === "bad-mode"
+          ? `boot token has insecure permissions (mode ${tokenRead.mode.toString(8)})`
+          : `boot token has the wrong length (${tokenRead.length} bytes)`,
+    });
+    return sources;
+  }
+
+  const auditStoragePath = safeModeAuditStoragePath(boot.fortressPath, tokenRead.token);
+  const instanceId = basename(auditStoragePath);
+  try {
+    const auditStat = await stat(auditStoragePath);
+    if (!auditStat.isDirectory()) {
+      sources.push({
+        source_id: "boot-audit",
+        status: "read_failed",
+        reason: "boot-audit segment path is not a directory",
+        instance_id: instanceId,
+      });
+      return sources;
+    }
+  } catch (error) {
+    if (!isEnoent(error)) {
+      sources.push({
+        source_id: "boot-audit",
+        status: "read_failed",
+        reason: `boot-audit segment could not be inspected: ${(error as Error).message}`,
+        instance_id: instanceId,
+      });
+      return sources;
+    }
+    sources.push(
+      (await bootAuditRootHasSegments(boot.fortressPath))
+        ? {
+            source_id: "boot-audit",
+            status: "read_failed",
+            reason:
+              "current boot-audit segment is absent, but other boot-audit segments exist",
+            instance_id: instanceId,
+          }
+        : {
+            source_id: "boot-audit",
+            status: "absent",
+            reason: "current boot-audit segment has not been created",
+            instance_id: instanceId,
+          },
+    );
+    return sources;
+  }
+
+  sources.push({
+    source_id: "boot-audit",
+    status: "present",
+    auditLog: new AuditLog(
+      new FilesystemStorage(auditStoragePath),
+      deriveSafeModeAuditKey(tokenRead.token),
+      { consultSplitBoundary: false },
+    ),
+    instance_id: instanceId,
+  });
+  return sources;
+}
+
 export async function runObserveCommand(
   args: { argv: string[] } & ObserveCommandContext,
 ): Promise<number> {
@@ -372,7 +499,13 @@ export async function runObserveCommand(
 
   const command = argv[0]!;
   const rest = argv.slice(1);
-  const ctx: ObserveCommandContext = { out, err, env };
+  const ctx: ObserveCommandContext = {
+    out,
+    err,
+    env,
+    ...(args.bootTokenPath !== undefined ? { bootTokenPath: args.bootTokenPath } : {}),
+    ...(args.approvalChannel !== undefined ? { approvalChannel: args.approvalChannel } : {}),
+  };
 
   switch (command) {
     case "start":
@@ -436,6 +569,7 @@ export async function runObserveStatus(
   const out = ctx.out ?? process.stdout;
   const err = ctx.err ?? process.stderr;
   const env = ctx.env ?? process.env;
+  const json = hasFlag(argv, "--json");
 
   const boot = await bootstrap(argv, err, env);
   if (!boot) return 1;
@@ -460,6 +594,39 @@ export async function runObserveStatus(
     );
     return 1;
   }
+  const candidateCount = census.candidates.length;
+  if (candidateCount === 0 && census.emptyVerified === undefined) {
+    const pendingCandidateWitness = `Pending candidates: ${formatPendingCandidateCount(census)}`;
+    write(err, `Error: ${pendingCandidateWitness}; the empty candidate set was not verified.\n`);
+    return 1;
+  }
+  const lastRefresh = await boot.observeStore.getLastRefreshOutcome();
+  const structuralUndeterminedReason = await storeOnlyStructuralUndeterminedReason(boot.fortressPath);
+  const claim = candidateStoreClaim(candidateCount, lastRefresh, structuralUndeterminedReason);
+
+  if (json) {
+    write(
+      out,
+      JSON.stringify(
+        {
+          observe_mode: stateRead.state.enabled ? "on" : "off",
+          started_at: stateRead.state.started_at,
+          pending_candidates: candidateCount,
+          candidate_status: claim.status,
+          definitive_empty: claim.definitiveEmpty,
+          store_state_only: true,
+          last_refresh: lastRefreshForJson(lastRefresh),
+          gate_denials: gateDenialsForJson(structuralUndeterminedReason),
+          ...(claim.undeterminedReason !== null
+            ? { undetermined_reason: claim.undeterminedReason }
+            : {}),
+        },
+        null,
+        2,
+      ) + "\n",
+    );
+    return 0;
+  }
 
   write(
     out,
@@ -467,7 +634,7 @@ export async function runObserveStatus(
       ? `Observe mode: ON (since ${stateRead.state.started_at})\n`
       : "Observe mode: OFF\n",
   );
-  write(out, `Pending candidates: ${formatPendingCandidateCount(census)}\n`);
+  writeStoreCandidateClaim(out, candidateCount, lastRefresh, claim);
   return 0;
 }
 
@@ -485,7 +652,16 @@ export async function runObserveCandidates(
   const boot = await bootstrap(argv, err, env);
   if (!boot) return 1;
 
+  let sourceReads: ObserveAuditSourceReadOutcome[] = [];
+  let quarantinedSources: ObserveQuarantinedSourceState[] = [];
+  let refreshAttempted = false;
+  let refreshComplete = false;
+  let refreshIncompleteReason: string | null = noRefresh
+    ? "refresh was skipped, so audit-source reads were not witnessed"
+    : null;
+
   if (!noRefresh) {
+    refreshAttempted = true;
     const producerKey = await loadFortressProducerKey(boot.fortressPath);
     if (producerKey.status === "unreadable") {
       write(
@@ -495,15 +671,12 @@ export async function runObserveCandidates(
       );
       return 1;
     }
-    // The idempotent, allowlist-aware refresh chokepoint (sweep finding
-    // R3-1): every audit event folds exactly once (persisted watermark), and
-    // a destination the operator's verified policy already permits is never
-    // minted -- and is pruned if present. See castle-wall/observe/refresh.ts.
     let outcome;
     let lockHolderDescription = "";
     try {
       outcome = await refreshCandidatesFromAudit({
         auditLog: boot.auditLog,
+        auditSources: await resolveObserveAuditSources(boot, ctx),
         store: boot.observeStore,
         readAllowlist: () => readAllowlistForRefresh(boot.fortressPath),
         lock: observeRefreshFileLock(boot.fortressPath, (holder) => {
@@ -526,6 +699,16 @@ export async function runObserveCandidates(
       );
       return 1;
     }
+    if (outcome.status === "source_read_incomplete") {
+      sourceReads = outcome.source_reads;
+      quarantinedSources = outcome.quarantined_sources;
+      refreshIncompleteReason = outcome.reason;
+      write(
+        err,
+        `Warning: observe could not read every audit source (${outcome.reason}). ` +
+          "No candidate-store changes were made; an empty listing below is UNDETERMINED, not verified empty.\n",
+      );
+    }
     if (outcome.status === "refresh_in_progress") {
       write(
         err,
@@ -545,7 +728,12 @@ export async function runObserveCandidates(
       );
       return 1;
     }
-    if (outcome.removed_now_allowed > 0) {
+    if (outcome.status === "refreshed") {
+      sourceReads = outcome.source_reads;
+      quarantinedSources = outcome.quarantined_sources;
+      refreshComplete = true;
+    }
+    if (outcome.status === "refreshed" && outcome.removed_now_allowed > 0) {
       write(
         out,
         `Removed ${outcome.removed_now_allowed} candidate(s) your policy now permits (already-allowed destinations are never pending review).\n`,
@@ -575,10 +763,13 @@ export async function runObserveCandidates(
   // refuses loud on the same states).
   let awaitingRearmRules: readonly AllowlistRule[] = [];
   let awaitingRearmGateUid: number | null = null;
-  if (candidates.length > 0) {
-    try {
-      const marker = await loadExclusiveRoutingMarker(boot.fortressPath);
-      if (marker !== null) {
+  let exclusiveGateDenialsUnavailable = false;
+  let routingWitnessComplete = true;
+  try {
+    const marker = await loadExclusiveRoutingMarker(boot.fortressPath);
+    if (marker !== null) {
+      exclusiveGateDenialsUnavailable = true;
+      if (candidates.length > 0) {
         const allowlist = await readAllowlistForRefresh(boot.fortressPath);
         if (allowlist.status === "ok") {
           awaitingRearmRules = allowlist.rules;
@@ -587,38 +778,100 @@ export async function runObserveCandidates(
           write(err, "Warning: could not read the verified allowlist; the promoted-awaiting-re-arm marking is unavailable for this listing.\n");
         }
       }
-    } catch {
-      write(err, "Warning: the exclusive-routing marker is unreadable; the promoted-awaiting-re-arm marking is unavailable for this listing.\n");
     }
+  } catch {
+    routingWitnessComplete = false;
+    write(err, "Warning: the exclusive-routing marker is unreadable; the promoted-awaiting-re-arm marking is unavailable for this listing.\n");
   }
   const isAwaitingRearm = (candidate: CandidateObservation): boolean =>
     awaitingRearmGateUid !== null &&
     candidatePromotedAwaitingRearm(awaitingRearmRules, candidate, awaitingRearmGateUid);
-
-  if (json) {
-    const rows = candidates.map((candidate) =>
-      isAwaitingRearm(candidate) ? { ...candidate, promoted_awaiting_rearm: true } : candidate,
-    );
-    const body =
-      rows.length === 0 && census.emptyVerified !== undefined
-        ? claimFromVerifiedEmpty(census.emptyVerified, rows)
-        : rows;
-    write(out, JSON.stringify(body, null, 2) + "\n");
-    return 0;
-  }
-
-  if (candidates.length === 0) {
+  const rows = candidates.map((candidate) =>
+    isAwaitingRearm(candidate) ? { ...candidate, promoted_awaiting_rearm: true } : candidate,
+  );
+  const completeReadWitness =
+    refreshAttempted &&
+    refreshComplete &&
+    routingWitnessComplete &&
+    sourceReads.every(sourceReadSupportsDefinitiveEmpty) &&
+    quarantinedSources.length === 0;
+  const canClaimEmpty =
+    candidates.length === 0 && completeReadWitness && !exclusiveGateDenialsUnavailable;
+  const undeterminedReason = candidateListingUndeterminedReason({
+    noRefresh,
+    refreshIncompleteReason,
+    routingWitnessComplete,
+    exclusiveGateDenialsUnavailable,
+  });
+  let rowsForJson = rows;
+  if (canClaimEmpty) {
     if (census.emptyVerified === undefined) {
       write(err, "Error: candidate census could not verify the empty candidate set.\n");
       return 1;
     }
+    rowsForJson = claimFromVerifiedEmpty(census.emptyVerified, rows);
+  }
+
+  if (json) {
     write(
       out,
-      claimFromVerifiedEmpty(
-        census.emptyVerified,
-        "No candidates. Turn on observe mode (`sanctuary castle-wall observe start`), run your agent, then re-run this command.\n",
-      ),
+      JSON.stringify(
+        {
+          status:
+            candidates.length > 0
+              ? completeReadWitness
+                ? "populated"
+                : "partial"
+              : canClaimEmpty
+                ? "empty_verified"
+                : "undetermined",
+          definitive_empty: canClaimEmpty,
+          candidates: rowsForJson,
+          source_reads: sourceReads,
+          quarantined_sources: quarantinedSources,
+          gate_denials: exclusiveGateDenialsUnavailable
+            ? {
+                status: "structurally_unavailable",
+                reason: EXCLUSIVE_GATE_DENIALS_UNAVAILABLE,
+              }
+            : { status: "not_applicable" },
+          ...(undeterminedReason !== null ? { undetermined_reason: undeterminedReason } : {}),
+        },
+        null,
+        2,
+      ) + "\n",
     );
+    return 0;
+  }
+
+  if (exclusiveGateDenialsUnavailable) {
+    write(out, `Exclusive routing: ${EXCLUSIVE_GATE_DENIALS_UNAVAILABLE}; this listing covers master-audit and boot-audit only.\n`);
+  }
+  if (candidates.length > 0 && !completeReadWitness) {
+    write(out, "UNDETERMINED: observe could not verify every source read, so this candidate listing may be incomplete.\n");
+    for (const line of sourceWitnessLines(sourceReads, quarantinedSources)) write(out, `${line}\n`);
+  }
+
+  if (candidates.length === 0) {
+    if (canClaimEmpty) {
+      if (census.emptyVerified === undefined) {
+        write(err, "Error: candidate census could not verify the empty candidate set.\n");
+        return 1;
+      }
+      write(
+        out,
+        claimFromVerifiedEmpty(
+          census.emptyVerified,
+          "No candidates. Turn on observe mode (`sanctuary castle-wall observe start`), run your agent, then re-run this command.\n",
+        ),
+      );
+    } else {
+      write(
+        out,
+        `UNDETERMINED: no candidates are listed, but this is not verified empty (${undeterminedReason ?? "source reads were not complete"}).\n`,
+      );
+      for (const line of sourceWitnessLines(sourceReads, quarantinedSources)) write(out, `${line}\n`);
+    }
     return 0;
   }
 
@@ -643,6 +896,227 @@ export async function runObserveCandidates(
     "\nPromote with: sanctuary castle-wall observe promote --destination <host:port> [--destination ...] | --all\n",
   );
   return 0;
+}
+
+const EXCLUSIVE_GATE_DENIALS_UNAVAILABLE =
+  "gate denials are structurally unavailable as an observe source";
+
+function candidateListingUndeterminedReason(input: {
+  noRefresh: boolean;
+  refreshIncompleteReason: string | null;
+  routingWitnessComplete: boolean;
+  exclusiveGateDenialsUnavailable: boolean;
+}): string | null {
+  if (input.noRefresh) return "refresh was skipped, so audit-source reads were not witnessed";
+  if (input.refreshIncompleteReason) return input.refreshIncompleteReason;
+  if (!input.routingWitnessComplete) return "exclusive-routing state could not be read";
+  if (input.exclusiveGateDenialsUnavailable) return EXCLUSIVE_GATE_DENIALS_UNAVAILABLE;
+  return null;
+}
+
+function sourceWitnessLines(
+  sourceReads: readonly ObserveAuditSourceReadOutcome[],
+  quarantinedSources: readonly ObserveQuarantinedSourceState[],
+): string[] {
+  const lines = sourceReads.map((source) => {
+    if (source.status === "read_ok") {
+      return `Source ${source.source_id}: read_ok (${source.flow_events} flow event(s), ${source.candidate_rows} candidate row(s)).`;
+    }
+    if (source.status === "absent") {
+      return `Source ${source.source_id}: absent (${source.reason}).`;
+    }
+    return `Source ${source.source_id}: read_failed (${source.failure}: ${source.reason}).`;
+  });
+  for (const source of quarantinedSources) {
+    lines.push(`Source state ${source.key}: quarantined (${source.reason}).`);
+  }
+  return lines;
+}
+
+type StoreCandidateClaimStatus = "populated" | "empty_verified" | "undetermined";
+
+interface StoreCandidateClaim {
+  status: StoreCandidateClaimStatus;
+  definitiveEmpty: boolean;
+  undeterminedReason: string | null;
+}
+
+/**
+ * R2 predicate shared by every definitive-empty gate: a source read supports a
+ * verified-empty claim when it was read_ok, or when it is absent AND has never
+ * contributed (the refresh layer downgrades a previously-contributing absent
+ * source to missing_after_contribution, so a plain "absent" here is R2-valid).
+ * All commands (candidates, status, promote) MUST share this predicate so two
+ * surfaces can never disagree about the same store state.
+ */
+function sourceReadSupportsDefinitiveEmpty(source: { status: string }): boolean {
+  return source.status === "read_ok" || source.status === "absent";
+}
+
+function lastRefreshSupportsDefinitiveEmpty(lastRefresh: ObserveLastRefreshOutcome | null): boolean {
+  return (
+    lastRefresh !== null &&
+    lastRefresh.status === "refreshed" &&
+    lastRefresh.source_reads.length > 0 &&
+    lastRefresh.source_reads.every(sourceReadSupportsDefinitiveEmpty) &&
+    lastRefresh.quarantined_sources.length === 0
+  );
+}
+
+function refreshSourceStatusSummary(lastRefresh: ObserveLastRefreshOutcome): string {
+  const statuses = lastRefresh.source_reads
+    .map((source) => `${source.source_id}=${source.status}`)
+    .join(", ");
+  return statuses.length > 0 ? statuses : "no source reads recorded";
+}
+
+function lastRefreshSummary(lastRefresh: ObserveLastRefreshOutcome | null): string {
+  if (lastRefresh === null) return "last refresh: none";
+  return `last refresh at ${lastRefresh.refreshed_at}: ${lastRefresh.status} (${refreshSourceStatusSummary(lastRefresh)})`;
+}
+
+function lastRefreshUndeterminedReason(lastRefresh: ObserveLastRefreshOutcome | null): string {
+  if (lastRefresh === null) return "no observe refresh outcome is recorded";
+  if (lastRefresh.status !== "refreshed") {
+    return `last refresh at ${lastRefresh.refreshed_at} was ${lastRefresh.status}` +
+      (lastRefresh.reason ? ` (${lastRefresh.reason})` : "");
+  }
+  if (lastRefresh.quarantined_sources.length > 0) {
+    return `last refresh at ${lastRefresh.refreshed_at} had quarantined observe source state`;
+  }
+  return `last refresh at ${lastRefresh.refreshed_at} did not read (or validly-absent) every source (${refreshSourceStatusSummary(lastRefresh)})`;
+}
+
+function candidateStoreClaim(
+  candidateCount: number,
+  lastRefresh: ObserveLastRefreshOutcome | null,
+  structuralUndeterminedReason: string | null = null,
+): StoreCandidateClaim {
+  if (candidateCount > 0) {
+    return { status: "populated", definitiveEmpty: false, undeterminedReason: null };
+  }
+  if (structuralUndeterminedReason !== null) {
+    return {
+      status: "undetermined",
+      definitiveEmpty: false,
+      undeterminedReason: structuralUndeterminedReason,
+    };
+  }
+  if (lastRefreshSupportsDefinitiveEmpty(lastRefresh)) {
+    return { status: "empty_verified", definitiveEmpty: true, undeterminedReason: null };
+  }
+  return {
+    status: "undetermined",
+    definitiveEmpty: false,
+    undeterminedReason: lastRefreshUndeterminedReason(lastRefresh),
+  };
+}
+
+async function storeOnlyStructuralUndeterminedReason(fortressPath: string): Promise<string | null> {
+  try {
+    return (await loadExclusiveRoutingMarker(fortressPath)) !== null
+      ? EXCLUSIVE_GATE_DENIALS_UNAVAILABLE
+      : null;
+  } catch {
+    return "exclusive-routing state could not be read";
+  }
+}
+
+function gateDenialsForJson(structuralUndeterminedReason: string | null): unknown {
+  return structuralUndeterminedReason === EXCLUSIVE_GATE_DENIALS_UNAVAILABLE
+    ? { status: "structurally_unavailable", reason: EXCLUSIVE_GATE_DENIALS_UNAVAILABLE }
+    : { status: "not_applicable" };
+}
+
+function lastRefreshForJson(lastRefresh: ObserveLastRefreshOutcome | null): unknown {
+  if (lastRefresh === null) return { status: "none" };
+  return {
+    status: lastRefresh.status,
+    refreshed_at: lastRefresh.refreshed_at,
+    source_reads: lastRefresh.source_reads,
+    quarantined_sources: lastRefresh.quarantined_sources,
+    ...(lastRefresh.definitive_empty !== undefined
+      ? { definitive_empty: lastRefresh.definitive_empty }
+      : {}),
+    ...(lastRefresh.reason !== undefined ? { reason: lastRefresh.reason } : {}),
+  };
+}
+
+function writeStoreCandidateClaim(
+  out: Writable,
+  candidateCount: number,
+  lastRefresh: ObserveLastRefreshOutcome | null,
+  claim: StoreCandidateClaim = candidateStoreClaim(candidateCount, lastRefresh),
+): void {
+  if (candidateCount > 0) {
+    write(out, `Pending candidates in store: ${candidateCount} (store-state-only; ${lastRefreshSummary(lastRefresh)}).\n`);
+    return;
+  }
+  if (claim.status === "empty_verified") {
+    write(
+      out,
+      `Pending candidates in store: 0 (store-state-only; ${lastRefreshSummary(lastRefresh)}; all sources read_ok or validly absent).\n`,
+    );
+    return;
+  }
+  write(
+    out,
+    `UNDETERMINED: pending candidates in store: 0, but this is not verified empty (${claim.undeterminedReason ?? lastRefreshUndeterminedReason(lastRefresh)}).\n`,
+  );
+  write(out, `Store-state-only witness: ${lastRefreshSummary(lastRefresh)}.\n`);
+}
+
+function writePromoteNoSelectionJson(
+  out: Writable,
+  candidateCount: number,
+  lastRefresh: ObserveLastRefreshOutcome | null,
+  rescopeChecked: boolean,
+  structuralUndeterminedReason: string | null = null,
+): void {
+  const claim = candidateStoreClaim(candidateCount, lastRefresh, structuralUndeterminedReason);
+  write(
+    out,
+    JSON.stringify(
+      {
+        status: claim.status === "empty_verified" ? "nothing_to_promote_verified" : claim.status,
+        nothing_to_promote: claim.definitiveEmpty,
+        pending_candidates: candidateCount,
+        store_state_only: true,
+        rescope_checked: rescopeChecked,
+        last_refresh: lastRefreshForJson(lastRefresh),
+        gate_denials: gateDenialsForJson(structuralUndeterminedReason),
+        ...(claim.undeterminedReason !== null
+          ? { undetermined_reason: claim.undeterminedReason }
+          : {}),
+      },
+      null,
+      2,
+    ) + "\n",
+  );
+}
+
+function writePromoteNoSelectionText(
+  out: Writable,
+  candidateCount: number,
+  lastRefresh: ObserveLastRefreshOutcome | null,
+  rescopeChecked: boolean,
+  structuralUndeterminedReason: string | null = null,
+): void {
+  const claim = candidateStoreClaim(candidateCount, lastRefresh, structuralUndeterminedReason);
+  if (claim.status === "empty_verified") {
+    write(
+      out,
+      `Nothing to promote (store-state-only; ${lastRefreshSummary(lastRefresh)}; all sources read_ok or validly absent).` +
+        (rescopeChecked ? " No promoted rules need re-scoping.\n" : "\n"),
+    );
+    return;
+  }
+  write(
+    out,
+    `UNDETERMINED: no candidates are currently stored, but this is not verified empty (${claim.undeterminedReason ?? lastRefreshUndeterminedReason(lastRefresh)}).` +
+      (rescopeChecked ? " No promoted rules need re-scoping in the verified manifest.\n" : "\n"),
+  );
+  write(out, `Store-state-only witness: ${lastRefreshSummary(lastRefresh)}.\n`);
 }
 
 /** Lockfile basename for the cross-process refresh mutual exclusion (Codex gate BLOCKER; see castle-wall/observe/refresh.ts guarantee 2). Lives directly under the fortress root (mode 0700). */
@@ -1187,6 +1661,7 @@ export async function runObservePromote(
 
   const destinations = flagValues(argv, "--destination");
   const all = hasFlag(argv, "--all");
+  const json = hasFlag(argv, "--json");
   const includeRisky = hasFlag(argv, "--include-risky");
   const granularityFlag = flagValue(argv, "--granularity");
 
@@ -1288,7 +1763,14 @@ export async function runObservePromote(
 
   if (selection.length === 0) {
     if (routing.mode !== "exclusive") {
-      write(out, "Nothing selected to promote.\n");
+      const lastRefresh = await boot.observeStore.getLastRefreshOutcome();
+      if (json) {
+        writePromoteNoSelectionJson(out, candidatesByKey.size, lastRefresh, false);
+      } else if (candidatesByKey.size === 0) {
+        writePromoteNoSelectionText(out, 0, lastRefresh, false);
+      } else {
+        write(out, "Nothing selected to promote.\n");
+      }
       return 0;
     }
     // Round-3 R3: on an exclusive fortress an EMPTY selection still proceeds,
@@ -1372,7 +1854,24 @@ export async function runObservePromote(
     if (selection.length === 0) {
       // The exclusive-mode empty-selection rescope check (round-3 R3) found
       // nothing needing re-scope: an honest no-op, not an error.
-      write(out, "Nothing to promote, and no promoted rules need re-scoping.\n");
+      const lastRefresh = await boot.observeStore.getLastRefreshOutcome();
+      if (json) {
+        writePromoteNoSelectionJson(
+          out,
+          candidatesByKey.size,
+          lastRefresh,
+          true,
+          routing.mode === "exclusive" ? EXCLUSIVE_GATE_DENIALS_UNAVAILABLE : null,
+        );
+      } else {
+        writePromoteNoSelectionText(
+          out,
+          candidatesByKey.size,
+          lastRefresh,
+          true,
+          routing.mode === "exclusive" ? EXCLUSIVE_GATE_DENIALS_UNAVAILABLE : null,
+        );
+      }
       return 0;
     }
     write(err, "No valid candidates to promote (not found, or the synthesized rule failed validation).\n");
@@ -1455,7 +1954,13 @@ export async function runObservePromote(
   // re-arm" and the copy below says so plainly.
   if (routing.mode !== "exclusive") {
     for (const key of outcome.promotedKeys) {
-      await boot.observeStore.removeCandidate(key);
+      const candidate = candidatesByKey.get(key);
+      if (!candidate) continue;
+      await boot.observeStore.removeCandidateAfterReview(
+        candidate,
+        "promote",
+        new Date().toISOString(),
+      );
     }
   }
 
@@ -1531,8 +2036,10 @@ export async function runObserveDiscard(
     // between the append and the removals is harmless -- the marker only
     // bounds what a recompute may MINT for keys absent from the store, and
     // the still-present rows heal normally.
+    const reviewedAt = new Date().toISOString();
     try {
       await boot.auditLog.appendCritical({
+        timestamp: reviewedAt,
         layer: "l1",
         operation: "castle_wall_observe_discard",
         identity_id: boot.primary.identity_id,
@@ -1551,7 +2058,9 @@ export async function runObserveDiscard(
     }
 
     for (const key of keysToRemove) {
-      await boot.observeStore.removeCandidate(key);
+      const candidate = candidatesByKey.get(key);
+      if (!candidate) continue;
+      await boot.observeStore.removeCandidateAfterReview(candidate, "discard", reviewedAt);
     }
   }
 

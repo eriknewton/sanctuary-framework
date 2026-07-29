@@ -43,7 +43,9 @@ import {
   refreshCandidatesFromAudit,
   candidateCurrentlyAllowed,
   inProcessRefreshLock,
+  type RefreshAuditSourceDescriptor,
   type RefreshAllowlistRead,
+  type RefreshCandidateStore,
   type RefreshLock,
 } from "../../../src/castle-wall/observe/refresh.js";
 import {
@@ -54,12 +56,14 @@ import {
 
 interface Harness {
   auditLog: AuditLog;
+  bootAuditLog: AuditLog;
   store: ObserveStore;
   lock: RefreshLock;
   masterKey: Uint8Array;
   pinnedProducerKeyB64url: string;
   /** Replace the audit log with a brand-new chain on FRESH storage (simulates an audit-store reset/rebuild underneath a persisted observe store). */
   resetAuditChain(): void;
+  resetBootAuditChain(): void;
 }
 
 function toBase64url(bytes: Uint8Array): string {
@@ -121,12 +125,16 @@ function makeHarness(): Harness {
   });
   const harness: Harness = {
     auditLog: new AuditLog(new MemoryStorage(), masterKey),
+    bootAuditLog: new AuditLog(new MemoryStorage(), masterKey),
     store,
     lock: inProcessRefreshLock(),
     masterKey,
     pinnedProducerKeyB64url: producerPubB64,
     resetAuditChain() {
       harness.auditLog = new AuditLog(new MemoryStorage(), masterKey);
+    },
+    resetBootAuditChain() {
+      harness.bootAuditLog = new AuditLog(new MemoryStorage(), masterKey);
     },
   };
   return harness;
@@ -259,6 +267,59 @@ async function refresh(harness: Harness, rules: AllowlistRule[] = []) {
   });
 }
 
+function bothSources(harness: Harness): RefreshAuditSourceDescriptor[] {
+  return [
+    {
+      source_id: "master-audit",
+      status: "present",
+      auditLog: harness.auditLog,
+      instance_id: "operator-master",
+    },
+    {
+      source_id: "boot-audit",
+      status: "present",
+      auditLog: harness.bootAuditLog,
+      instance_id: "boot-segment-a",
+    },
+  ];
+}
+
+function emptyMasterSource(): RefreshAuditSourceDescriptor {
+  return {
+    source_id: "master-audit",
+    status: "present",
+    instance_id: "operator-master",
+    auditLog: {
+      async streamVerifiedChain(): Promise<void> {
+        // Simulates a retained master chain suffix that no longer contains
+        // the review marker because retention pruning aged it out.
+      },
+    },
+  };
+}
+
+async function refreshWithSources(
+  harness: Harness,
+  auditSources: readonly RefreshAuditSourceDescriptor[],
+  rules: AllowlistRule[] = [],
+  store: RefreshCandidateStore = harness.store,
+) {
+  return refreshCandidatesFromAudit({
+    auditLog: harness.auditLog,
+    auditSources,
+    store,
+    readAllowlist: verifiedAllowlist(rules),
+    lock: harness.lock,
+    now: new Date("2026-07-14T12:00:00.000Z"),
+    pinnedProducerKeyB64url: harness.pinnedProducerKeyB64url,
+    subjectFortressId: FORTRESS_ID,
+  });
+}
+
+async function refreshBoth(harness: Harness, rules: AllowlistRule[] = []) {
+  return refreshWithSources(harness, bothSources(harness), rules);
+}
+
 async function onlyCandidate(store: ObserveStore): Promise<CandidateObservation> {
   const listed = await store.listCandidates();
   expect(listed.size).toBe(1);
@@ -277,7 +338,7 @@ describe("refresh idempotency (R3-1a: refresh-twice yields identical times_seen)
 
     const second = await refresh(harness);
     expect(second.status).toBe("refreshed");
-    expect(second.status === "refreshed" && second.folded_events).toBe(0);
+    expect(second.status === "refreshed" && second.folded_events).toBe(2);
     // The old engine rendered 4 here (the round-3 sweep's probe).
     expect((await onlyCandidate(harness.store)).times_seen).toBe(2);
   });
@@ -294,7 +355,7 @@ describe("refresh idempotency (R3-1a: refresh-twice yields identical times_seen)
     expect(after4).toEqual(after1);
   });
 
-  it("a genuinely NEW observation after a refresh increments the count by exactly one (incremental fold)", async () => {
+  it("a genuinely NEW observation after a refresh is reflected by the next full recompute", async () => {
     const harness = makeHarness();
     await appendBlocked(harness.auditLog);
     await appendBlocked(harness.auditLog);
@@ -302,9 +363,145 @@ describe("refresh idempotency (R3-1a: refresh-twice yields identical times_seen)
 
     await appendBlocked(harness.auditLog);
     const outcome = await refresh(harness);
-    expect(outcome.status === "refreshed" && outcome.mode).toBe("incremental");
-    expect(outcome.status === "refreshed" && outcome.folded_events).toBe(1);
+    expect(outcome.status === "refreshed" && outcome.mode).toBe("recompute");
+    expect(outcome.status === "refreshed" && outcome.folded_events).toBe(3);
     expect((await onlyCandidate(harness.store)).times_seen).toBe(3);
+  });
+});
+
+describe("Option A source enumeration and read witnesses", () => {
+  it("opens both master-audit and boot-audit, folds their retained histories, and re-refreshes idempotently", async () => {
+    const harness = makeHarness();
+    await appendBlocked(harness.auditLog, { host: "master.example.com", ip: "203.0.113.10" });
+    await appendBlocked(harness.bootAuditLog, { host: "boot.example.com", ip: "203.0.113.11" });
+
+    const first = await refreshBoth(harness);
+    expect(first.status).toBe("refreshed");
+    if (first.status !== "refreshed") throw new Error("unreachable");
+    expect(first.source_reads.map((source) => [source.source_id, source.status])).toEqual([
+      ["master-audit", "read_ok"],
+      ["boot-audit", "read_ok"],
+    ]);
+    const bootRead = first.source_reads.find((source) => source.source_id === "boot-audit");
+    expect(bootRead?.status).toBe("read_ok");
+    expect(bootRead?.status === "read_ok" && bootRead.entries_read).toBeGreaterThan(0);
+
+    const hostsAfterFirst = [...(await harness.store.listCandidates()).values()]
+      .map((row) => row.host)
+      .sort();
+    expect(hostsAfterFirst).toEqual(["boot.example.com", "master.example.com"]);
+
+    const second = await refreshBoth(harness);
+    expect(second.status).toBe("refreshed");
+    if (second.status !== "refreshed") throw new Error("unreachable");
+    expect(second.folded_events).toBe(2);
+    expect([...(await harness.store.listCandidates()).values()].map((row) => row.times_seen)).toEqual([
+      1,
+      1,
+    ]);
+  });
+
+  it("aggregates overlapping master and boot observations into one candidate count without multiplying on refresh", async () => {
+    const harness = makeHarness();
+    await appendBlocked(harness.auditLog);
+    await appendBlocked(harness.bootAuditLog);
+
+    await refreshBoth(harness);
+    expect((await onlyCandidate(harness.store)).times_seen).toBe(2);
+
+    await refreshBoth(harness);
+    expect((await onlyCandidate(harness.store)).times_seen).toBe(2);
+  });
+
+  it("allows absent only for a source that has never contributed to this store", async () => {
+    const harness = makeHarness();
+    const absentBoot: RefreshAuditSourceDescriptor = {
+      source_id: "boot-audit",
+      status: "absent",
+      reason: "no boot-audit segment",
+    };
+
+    const first = await refreshWithSources(harness, [bothSources(harness)[0]!, absentBoot]);
+    expect(first.status).toBe("refreshed");
+    if (first.status !== "refreshed") throw new Error("unreachable");
+    expect(first.source_reads.find((source) => source.source_id === "boot-audit")?.status).toBe("absent");
+    expect(first.definitive_empty).toBe(true);
+
+    await appendBlocked(harness.bootAuditLog);
+    await refreshBoth(harness);
+    expect((await harness.store.listCandidates()).size).toBe(1);
+
+    const missingAfterContribution = await refreshWithSources(harness, [
+      bothSources(harness)[0]!,
+      absentBoot,
+    ]);
+    expect(missingAfterContribution.status).toBe("source_read_incomplete");
+    if (missingAfterContribution.status !== "source_read_incomplete") throw new Error("unreachable");
+    const bootRead = missingAfterContribution.source_reads.find(
+      (source) => source.source_id === "boot-audit",
+    );
+    expect(bootRead?.status).toBe("read_failed");
+    expect(bootRead?.status === "read_failed" && bootRead.failure).toBe("missing_after_contribution");
+    // No partial aggregate replacement: the previously observed boot candidate stays inspectable.
+    expect((await harness.store.listCandidates()).size).toBe(1);
+  });
+
+  it("treats a changed boot segment after contribution as incomplete rather than withdrawing its prior aggregate", async () => {
+    const harness = makeHarness();
+    await appendBlocked(harness.bootAuditLog);
+    await refreshBoth(harness);
+
+    const changedSegment = await refreshWithSources(harness, [
+      bothSources(harness)[0]!,
+      {
+        source_id: "boot-audit",
+        status: "present",
+        auditLog: harness.bootAuditLog,
+        instance_id: "boot-segment-b",
+      },
+    ]);
+    expect(changedSegment.status).toBe("source_read_incomplete");
+    if (changedSegment.status !== "source_read_incomplete") throw new Error("unreachable");
+    const bootRead = changedSegment.source_reads.find((source) => source.source_id === "boot-audit");
+    expect(bootRead?.status).toBe("read_failed");
+    expect(bootRead?.status === "read_failed" && bootRead.failure).toBe(
+      "instance_changed_after_contribution",
+    );
+  });
+
+  it("crash retry under snapshot replacement converges without double-counting", async () => {
+    const harness = makeHarness();
+    await appendBlocked(harness.bootAuditLog);
+    await appendBlocked(harness.bootAuditLog);
+
+    let crashOnce = true;
+    const crashingStore: RefreshCandidateStore = {
+      getFoldWatermark: () => harness.store.getFoldWatermark(),
+      setFoldWatermark: (watermark) => harness.store.setFoldWatermark(watermark),
+      listCandidates: () => harness.store.listCandidates(),
+      mergeObservations: (observations) => harness.store.mergeObservations(observations),
+      replaceObservations: (observations) => harness.store.replaceObservations(observations),
+      listSourceStates: () => harness.store.listSourceStates(),
+      putSourceState: (state) => harness.store.putSourceState(state),
+      listCandidateReviews: () => harness.store.listCandidateReviews(),
+      putLastRefreshOutcome: (outcome) => harness.store.putLastRefreshOutcome(outcome),
+      removeCandidate: (key) => harness.store.removeCandidate(key),
+      replaceCandidateSnapshot: async (observations) => {
+        if (crashOnce) {
+          crashOnce = false;
+          await harness.store.putCandidate(observations[0]!);
+          throw new Error("simulated crash after partial snapshot write");
+        }
+        await harness.store.replaceCandidateSnapshot(observations);
+      },
+    };
+
+    await expect(
+      refreshWithSources(harness, bothSources(harness), [], crashingStore),
+    ).rejects.toThrow(/simulated crash/);
+
+    await refreshBoth(harness);
+    expect((await onlyCandidate(harness.store)).times_seen).toBe(2);
   });
 });
 
@@ -346,7 +543,9 @@ describe("promote/discard non-resurrection (R3-1b)", () => {
     await refresh(harness);
     expect((await onlyCandidate(harness.store)).times_seen).toBe(3);
 
-    // Discard drops the row (runObserveDiscard's removeCandidate).
+    // Discard records the source-independent review horizon and drops the row
+    // (runObserveDiscard's appendCritical + removeCandidate ordering).
+    await appendReviewMarker(harness.auditLog, "castle_wall_observe_discard");
     await harness.store.removeCandidate(candidateKey(await onlyCandidate(harness.store)));
     await refresh(harness);
     expect((await harness.store.listCandidates()).size).toBe(0);
@@ -355,6 +554,117 @@ describe("promote/discard non-resurrection (R3-1b)", () => {
     // at the historical 3 the old engine resurrected.
     await appendBlocked(harness.auditLog);
     await refresh(harness);
+    expect((await onlyCandidate(harness.store)).times_seen).toBe(1);
+  });
+
+  it("R1 Option A: coarse promote marker in master prevents boot-audit recompute from resurrecting the removed row", async () => {
+    const harness = makeHarness();
+    await appendBlocked(harness.bootAuditLog);
+    await refreshBoth(harness);
+    const candidate = await onlyCandidate(harness.store);
+
+    await appendReviewMarker(harness.auditLog, "castle_wall_observe_promote");
+    await harness.store.removeCandidate(candidateKey(candidate));
+
+    await refreshBoth(harness, [allowRule()]);
+    expect((await harness.store.listCandidates()).size).toBe(0);
+
+    await refreshBoth(harness, [allowRule()]);
+    expect((await harness.store.listCandidates()).size).toBe(0);
+  });
+
+  it("R1 Option A: exclusive promote retains the row across boot-audit recomputes without reminting a duplicate", async () => {
+    const harness = makeHarness();
+    await appendBlocked(harness.bootAuditLog);
+    await refreshBoth(harness);
+    expect((await onlyCandidate(harness.store)).times_seen).toBe(1);
+
+    await appendReviewMarker(harness.auditLog, "castle_wall_observe_promote");
+    const gateScopedAllow = { ...allowRule(), scope: { uids: [602] } };
+
+    await refreshBoth(harness, [gateScopedAllow]);
+    expect((await onlyCandidate(harness.store)).times_seen).toBe(1);
+
+    await refreshBoth(harness, [gateScopedAllow]);
+    expect((await onlyCandidate(harness.store)).times_seen).toBe(1);
+  });
+
+  it("R1 Option A: discard marker in master prevents boot-audit recompute from resurrecting a discarded row", async () => {
+    const harness = makeHarness();
+    await appendBlocked(harness.bootAuditLog);
+    await refreshBoth(harness);
+    const candidate = await onlyCandidate(harness.store);
+
+    await appendReviewMarker(harness.auditLog, "castle_wall_observe_discard");
+    await harness.store.removeCandidate(candidateKey(candidate));
+
+    await refreshBoth(harness);
+    expect((await harness.store.listCandidates()).size).toBe(0);
+
+    await refreshBoth(harness);
+    expect((await harness.store.listCandidates()).size).toBe(0);
+  });
+
+  it("persists the review tombstone before row removal, so pruning the master review marker cannot re-mint a resolved boot-audit candidate", async () => {
+    const harness = makeHarness();
+    await appendBlocked(harness.bootAuditLog, { timestamp: "2026-07-14T09:00:00.000Z" });
+    await refreshBoth(harness);
+    const candidate = await onlyCandidate(harness.store);
+
+    await appendReviewMarker(harness.auditLog, "castle_wall_observe_discard");
+    await harness.store.removeCandidateAfterReview(
+      candidate,
+      "discard",
+      "2026-07-14T10:00:00.000Z",
+    );
+
+    const outcome = await refreshWithSources(harness, [
+      emptyMasterSource(),
+      bothSources(harness)[1]!,
+    ]);
+    expect(outcome.status).toBe("refreshed");
+    expect((await harness.store.listCandidates()).size).toBe(0);
+  });
+
+  it("persists the review tombstone before row removal, so a master-chain reset cannot re-mint a resolved boot-audit candidate", async () => {
+    const harness = makeHarness();
+    await appendBlocked(harness.bootAuditLog, { timestamp: "2026-07-14T09:00:00.000Z" });
+    await refreshBoth(harness);
+    const candidate = await onlyCandidate(harness.store);
+
+    await appendReviewMarker(harness.auditLog, "castle_wall_observe_discard");
+    await harness.store.removeCandidateAfterReview(
+      candidate,
+      "discard",
+      "2026-07-14T10:00:00.000Z",
+    );
+    harness.resetAuditChain();
+
+    await refreshBoth(harness);
+    expect((await harness.store.listCandidates()).size).toBe(0);
+  });
+
+  it("allows a genuinely new post-resolution event to re-surface the tombstoned candidate with a restarted, stable count", async () => {
+    const harness = makeHarness();
+    await appendBlocked(harness.bootAuditLog, { timestamp: "2026-07-14T09:00:00.000Z" });
+    await appendBlocked(harness.bootAuditLog, { timestamp: "2026-07-14T09:05:00.000Z" });
+    await refreshBoth(harness);
+    const candidate = await onlyCandidate(harness.store);
+    expect(candidate.times_seen).toBe(2);
+
+    await harness.store.removeCandidateAfterReview(
+      candidate,
+      "discard",
+      "2026-07-14T10:00:00.000Z",
+    );
+    await refreshBoth(harness);
+    expect((await harness.store.listCandidates()).size).toBe(0);
+
+    await appendBlocked(harness.bootAuditLog, { timestamp: "2026-07-14T10:00:01.000Z" });
+    await refreshBoth(harness);
+    expect((await onlyCandidate(harness.store)).times_seen).toBe(1);
+
+    await refreshBoth(harness);
     expect((await onlyCandidate(harness.store)).times_seen).toBe(1);
   });
 });
@@ -654,7 +964,7 @@ describe("recompute heal (pre-watermark stores and reset chains)", () => {
     expect((await onlyCandidate(harness.store)).times_seen).toBe(2);
   });
 
-  it("a candidate whose audit history aged out of retention is NOT dropped by a recompute (unreviewed candidates never vanish silently)", async () => {
+  it("full snapshot recompute drops rows whose audit history is no longer retained", async () => {
     const harness = makeHarness();
     // Store holds a candidate, but the audit chain has no matching entries
     // (fully pruned): the recompute folds nothing and must leave it alone.
@@ -675,7 +985,7 @@ describe("recompute heal (pre-watermark stores and reset chains)", () => {
 
     const outcome = await refresh(harness);
     expect(outcome.status).toBe("refreshed");
-    expect((await onlyCandidate(harness.store)).times_seen).toBe(5);
+    expect((await harness.store.listCandidates()).size).toBe(0);
   });
 
   it("a watermark AHEAD of the surviving chain head (audit store reset) triggers a recompute instead of silently folding nothing forever", async () => {
@@ -692,11 +1002,9 @@ describe("recompute heal (pre-watermark stores and reset chains)", () => {
     expect(outcome.status === "refreshed" && outcome.mode).toBe("recompute");
     expect((await onlyCandidate(harness.store)).times_seen).toBe(1);
 
-    // And the watermark now tracks the REAL chain head: a further refresh is
-    // an incremental no-op, not another recompute.
     const again = await refresh(harness);
-    expect(again.status === "refreshed" && again.mode).toBe("incremental");
-    expect(again.status === "refreshed" && again.folded_events).toBe(0);
+    expect(again.status === "refreshed" && again.mode).toBe("recompute");
+    expect(again.status === "refreshed" && again.folded_events).toBe(1);
     expect((await onlyCandidate(harness.store)).times_seen).toBe(1);
   });
 
@@ -880,35 +1188,30 @@ describe("Codex-gate hardening (two-family gate fix round, 2026-07-14)", () => {
     expect((await onlyCandidate(harness.store)).times_seen).toBe(1);
   });
 
-  it("HIGH-2: a RESET audit chain that regrew PAST the old watermark is detected by the hash binding -- recompute, never a silent prefix skip", async () => {
+  it("a RESET audit chain is fully recomputed on the next refresh, never prefix-skipped by a stale watermark", async () => {
     const harness = makeHarness();
-    // Chain epoch 1: one denial, refreshed -> watermark at (seq 1, hash-of-epoch-1).
+    // Chain epoch 1: one denial, refreshed into the candidate snapshot.
     await appendBlocked(harness.auditLog);
     await refresh(harness);
     expect((await harness.store.listCandidates()).size).toBe(1);
-    const watermark = await harness.store.getFoldWatermark();
-    expect(watermark).not.toBeNull();
 
-    // The audit store is reset/rebuilt and the NEW chain regrows past the old
-    // watermark's sequence before the next refresh.
+    // The audit store is reset/rebuilt and the NEW chain regrows.
     harness.resetAuditChain();
     await appendBlocked(harness.auditLog, { host: "reset-a.example.net", ip: "198.51.100.1" });
     await appendBlocked(harness.auditLog, { host: "reset-b.example.net", ip: "198.51.100.2" });
     await appendBlocked(harness.auditLog, { host: "reset-c.example.net", ip: "198.51.100.3" });
 
     const outcome = await refresh(harness);
-    // A bare-sequence watermark would have called this "incremental" and
-    // folded only entries 2..3, permanently skipping the new chain's entry 1.
+    // The old bare-sequence watermark path could skip entry 1 of the new
+    // chain. Option A folds the whole retained source snapshot every time.
     expect(outcome.status === "refreshed" && outcome.mode).toBe("recompute");
     const hosts = [...(await harness.store.listCandidates()).values()].map((c) => c.host).sort();
     expect(hosts).toContain("reset-a.example.net");
     expect(hosts).toContain("reset-b.example.net");
     expect(hosts).toContain("reset-c.example.net");
 
-    // The watermark now binds to the NEW chain: the next refresh is a plain
-    // incremental no-op.
     const again = await refresh(harness);
-    expect(again.status === "refreshed" && again.mode).toBe("incremental");
-    expect(again.status === "refreshed" && again.folded_events).toBe(0);
+    expect(again.status === "refreshed" && again.mode).toBe("recompute");
+    expect(again.status === "refreshed" && again.folded_events).toBe(3);
   });
 });

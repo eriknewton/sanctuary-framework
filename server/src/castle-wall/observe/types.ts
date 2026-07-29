@@ -25,6 +25,17 @@ export const OBSERVE_NAMESPACE = "_castle_wall_observe" as const;
 /** Schema version tag persisted on every candidate + state record. */
 export const OBSERVE_SCHEMA_VERSION = "1.0" as const;
 
+/** Closed registry of audit sources the observe refresh is allowed to fold. */
+export const OBSERVE_AUDIT_SOURCE_IDS = ["master-audit", "boot-audit"] as const;
+export type ObserveAuditSourceId = (typeof OBSERVE_AUDIT_SOURCE_IDS)[number];
+
+export function isObserveAuditSourceId(value: unknown): value is ObserveAuditSourceId {
+  return (
+    typeof value === "string" &&
+    (OBSERVE_AUDIT_SOURCE_IDS as readonly string[]).includes(value)
+  );
+}
+
 /** How confidently the daemon derived the destination hostname. Mirrors `IpcDestination.hostname_source` (ipc/messages.ts); `null` when the producer did not report one (e.g. the Linux daemon's generic `CastleWallEventDestination` carries no hostname_source field at all). */
 export type HostnameSource = "dns" | "sni" | "url" | "socket" | null;
 
@@ -125,6 +136,22 @@ export interface CandidateObservation {
   exfil_risk: boolean;
   /** Which enforcement producer minted the folded flow(s) behind this row; scopes the `"unknown"`-template suppression exemption per platform (see {@link ObserveProvenance} and refresh.ts `candidateCurrentlyAllowed`). Folded conservatively: `"linux_daemon"` survives ONLY when every contributing event was the Linux daemon; any macOS/undefined contribution keeps the row non-daemon. `undefined` on a legacy-persisted row => treated as non-daemon. */
   provenance?: ObserveProvenance;
+}
+
+/** Candidate-review actions that resolve a pending row without permitting it by default. */
+export type ObserveCandidateReviewAction = "promote" | "discard";
+
+/**
+ * Persisted per-candidate review marker. The record lives in the observe
+ * StateStore namespace, not in any audit chain, so a pruned or reset chain
+ * cannot resurrect already-reviewed retained denials. A later denial after
+ * `reviewed_at` may mint a fresh candidate for the same key.
+ */
+export interface ObserveCandidateReviewRecord {
+  schema_version: typeof OBSERVE_SCHEMA_VERSION;
+  candidate_key: string;
+  action: ObserveCandidateReviewAction;
+  reviewed_at: string;
 }
 
 /**
