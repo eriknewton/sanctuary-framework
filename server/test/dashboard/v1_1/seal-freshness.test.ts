@@ -7,10 +7,26 @@
  */
 
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { AuditLog } from "../../../src/operational/audit-log.js";
+import { MemoryStorage } from "../../../src/storage/memory.js";
+import { generateRandomKey } from "../../../src/core/random.js";
 import {
   getClientScript,
   renderDashboardV11Html,
 } from "../../../src/dashboard/v1_1/index.js";
+import {
+  buildSovereigntyRoutePayload,
+  type SovereigntyRoutePayload,
+} from "../../../src/principal-policy/dashboard.js";
+import {
+  buildCastleWallPosture,
+  DEFAULT_ENFORCEMENT_FRESHNESS_MS,
+  type CastleWallPosture,
+} from "../../../src/principal-policy/posture.js";
+import { protectionSubjectFromMacOSAuditToken } from "../../../src/castle-wall/subject-binding.js";
+import { NODE_TRUST_BOUNDARY_VERSION } from "../../../src/mesh/node-posture.js";
+import type { SignedSHR } from "../../../src/shr/types.js";
+import type { FederationPostureSummary } from "../../../src/v1/federation.js";
 
 interface SealHarness {
   state: {
@@ -47,6 +63,32 @@ interface SealHarness {
   rerenderCount: () => number;
 }
 
+const FORTRESS = "fortress:test";
+
+function auditTokenForRuid(uid: number): string {
+  const vals = [
+    0xffffffff,
+    uid,
+    uid,
+    uid,
+    uid,
+    0x00000269,
+    0x000186ae,
+    0x00000566,
+  ];
+  return vals
+    .map((value) => {
+      const bytes = new Uint8Array(4);
+      new DataView(bytes.buffer).setUint32(0, value >>> 0, true);
+      return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
+    })
+    .join("");
+}
+
+const CLAIM_TOKEN = auditTokenForRuid(503);
+const CLAIM_SUBJECT = protectionSubjectFromMacOSAuditToken(FORTRESS, CLAIM_TOKEN);
+if (CLAIM_SUBJECT === null) throw new Error("test subject could not be derived");
+
 function functionSource(src: string, name: string): string {
   const marker = `function ${name}(`;
   const start = src.indexOf(marker);
@@ -63,6 +105,105 @@ function functionSource(src: string, name: string): string {
     }
   }
   throw new Error(`${name} body did not close`);
+}
+
+function testShr(): SignedSHR {
+  return {
+    body: {
+      shr_version: "1.0",
+      implementation: {
+        sanctuary_version: "test",
+        node_version: "test",
+        generated_by: "sanctuary-mcp-server",
+      },
+      instance_id: FORTRESS,
+      generated_at: "2026-07-29T12:00:00.000Z",
+      expires_at: "2026-07-29T13:00:00.000Z",
+      layers: {
+        l1: {
+          status: "active",
+          encryption: "AES-256-GCM",
+          key_custody: "self",
+          integrity: "merkle-signed",
+          identity_type: "ed25519",
+          state_portable: true,
+        },
+        l2: {
+          status: "active",
+          isolation_type: "append-only audit",
+          attestation_available: true,
+        },
+        l3: {
+          status: "active",
+          proof_system: "commitments",
+          selective_disclosure: true,
+        },
+        l4: {
+          status: "active",
+          reputation_mode: "local",
+          attestation_format: "ed25519",
+          reputation_portable: true,
+        },
+      },
+      capabilities: {
+        handshake: true,
+        shr_exchange: true,
+        reputation_verify: true,
+        encrypted_channel: true,
+      },
+      degradations: [],
+    },
+    signed_by: "test-public-key",
+    signature_scheme: "ed25519-v1",
+    signature: "test-signature",
+  };
+}
+
+function testFederationPosture(): FederationPostureSummary {
+  return {
+    version: NODE_TRUST_BOUNDARY_VERSION,
+    local_nodes: 0,
+    operator_cloud_nodes: 0,
+    sovereign_tee_nodes: 0,
+    unknown_nodes: 0,
+    provider_in_trust_boundary: false,
+    tee_attested: false,
+    disclosure: null,
+    guardian_break_glass: { active: false },
+  };
+}
+
+async function armedWallPosture(now: number): Promise<CastleWallPosture> {
+  const storage = new MemoryStorage();
+  const log = new AuditLog(storage, generateRandomKey());
+  await log.appendCritical({
+    layer: "l1",
+    operation: "egress_allowed",
+    identity_id: CLAIM_SUBJECT,
+    result: "success",
+    details: {
+      agent_id: CLAIM_TOKEN,
+      cw_source: "castle_wall_audit_consumer",
+    },
+    timestamp: new Date(now - 2 * 60 * 1000).toISOString(),
+  });
+  return await buildCastleWallPosture({
+    protectionClaimSubject: CLAIM_SUBJECT,
+    auditLog: log,
+    originMachine: FORTRESS,
+    platform: "darwin",
+    now,
+  });
+}
+
+async function armedSovereigntyPayload(now: number): Promise<SovereigntyRoutePayload> {
+  const wall = await armedWallPosture(now);
+  return buildSovereigntyRoutePayload({
+    shr: testShr(),
+    wall,
+    federationPosture: testFederationPosture(),
+    configLoaded: true,
+  });
 }
 
 function liftSealHarness(): SealHarness {
@@ -175,6 +316,42 @@ describe("v1.1 dashboard seal freshness", () => {
     expect(seal.freshness.current).toBe(true);
     expect(seal.freshness.inline).toBe("last evidenced 2m ago");
     expect(seal.title).toBe("Protected. Last evidenced 2m ago.");
+  });
+
+  it("the real /api/sovereignty payload builder emits the posture freshness window", async () => {
+    const wall = await armedWallPosture(now);
+    const payload = buildSovereigntyRoutePayload({
+      shr: testShr(),
+      wall,
+      federationPosture: testFederationPosture(),
+      configLoaded: true,
+    });
+
+    expect(payload.live_enforcement.castle_wall_arm_state).toBe("armed");
+    expect(payload.live_enforcement.freshness_window_ms).toBe(
+      wall.freshness_window_ms,
+    );
+    expect(payload.live_enforcement.freshness_window_ms).toBe(
+      DEFAULT_ENFORCEMENT_FRESHNESS_MS,
+    );
+    expect(Number.isFinite(payload.live_enforcement.freshness_window_ms)).toBe(true);
+    expect(payload.live_enforcement.freshness_window_ms).toBeGreaterThan(0);
+  });
+
+  it("a real /api/sovereignty payload drives the client seal to Protected while current", async () => {
+    vi.spyOn(Date, "now").mockReturnValue(now);
+    const harness = liftSealHarness();
+    harness.state.posture.data = await armedSovereigntyPayload(now);
+
+    const seal = harness.deriveSeal();
+
+    expect(seal.word).toBe("Protected");
+    expect(seal.tone).toBe("protected");
+    expect(seal.freshness.state).toBe("fresh");
+    expect(seal.freshness.current).toBe(true);
+    expect(seal.freshness.windowKnown).toBe(true);
+    expect(seal.freshness.windowLabel).toBe("10m");
+    expect(seal.freshness.inline).toBe("last evidenced 2m ago");
   });
 
   it("rerenders the seal stale after the freshness window elapses without a new event", () => {
