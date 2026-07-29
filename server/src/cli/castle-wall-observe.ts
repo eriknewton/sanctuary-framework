@@ -74,6 +74,7 @@ import {
   promoteCandidates,
   refreshCandidatesFromAudit,
   type CandidateObservation,
+  type ObserveModeState,
   type ObserveGranularity,
   type PromoteRouting,
   type PromoteSelectionRow,
@@ -91,6 +92,14 @@ import {
 } from "../egress-gate/operator-advice.js";
 import { egressPolicyWriterLock } from "../castle-wall/provision/lockfile.js";
 import { loadFortressProducerKey } from "../castle-wall/runtime/producer-signature.js";
+import {
+  claimFromVerifiedEmpty,
+  observing,
+  verifiedEmptyFrom,
+  type Observed,
+  type SourceReadOutcome,
+  type VerifiedEmpty,
+} from "../claim-witness.js";
 
 /** Same on-disk filenames `runProvisionPin` (cli/castle-wall.ts) establishes under the fortress root. Re-declared here (that module keeps them private) rather than reused, since they are plain filename literals, not secret material. */
 const CASTLE_PINNED_PUBKEY = "castle-pinned-pubkey.bin";
@@ -145,6 +154,88 @@ function fingerprintFromPublicKey(publicKey: Uint8Array): string {
 
 function destinationLabel(candidate: CandidateObservation): string {
   return `${candidate.host ?? candidate.ip}:${candidate.port}`;
+}
+
+const OBSERVE_STATE_SOURCE_ID = "observe-mode-state";
+const OBSERVE_CANDIDATE_SOURCE_ID = "observe-candidate-store";
+
+interface ObserveSourceStateRead {
+  source: SourceReadOutcome;
+  state?: ObserveModeState;
+}
+
+interface ObserveCandidateCensus {
+  source: SourceReadOutcome;
+  candidates: CandidateObservation[];
+  emptyVerified?: VerifiedEmpty;
+}
+
+function sortCandidates(candidates: CandidateObservation[]): CandidateObservation[] {
+  return candidates.sort((a, b) =>
+    a.first_seen < b.first_seen ? -1 : a.first_seen > b.first_seen ? 1 : 0,
+  );
+}
+
+async function observeSourceState(
+  observeStore: ObserveStore,
+): Promise<Observed<ObserveSourceStateRead>> {
+  return observing("observe.source-state", async () => {
+    try {
+      const state = await observeStore.getState();
+      return {
+        source: {
+          status: "read-and-verified",
+          source_id: OBSERVE_STATE_SOURCE_ID,
+          record_count: 1,
+        },
+        state,
+      };
+    } catch (error) {
+      return {
+        source: {
+          status: "read-failed",
+          source_id: OBSERVE_STATE_SOURCE_ID,
+          reason: (error as Error).message,
+        },
+      };
+    }
+  });
+}
+
+async function observeCandidateCensus(
+  observeStore: ObserveStore,
+): Promise<Observed<ObserveCandidateCensus>> {
+  return observing("observe.candidate-census", async () => {
+    try {
+      const candidates = sortCandidates([...(await observeStore.listCandidates()).values()]);
+      const source: SourceReadOutcome = {
+        status: "read-and-verified",
+        source_id: OBSERVE_CANDIDATE_SOURCE_ID,
+        record_count: candidates.length,
+      };
+      const emptyVerified = verifiedEmptyFrom("observe.candidate-census", [source]);
+      return emptyVerified === undefined
+        ? { source, candidates }
+        : { source, candidates, emptyVerified };
+    } catch (error) {
+      return {
+        source: {
+          status: "read-failed",
+          source_id: OBSERVE_CANDIDATE_SOURCE_ID,
+          reason: (error as Error).message,
+        },
+        candidates: [],
+      };
+    }
+  });
+}
+
+function formatPendingCandidateCount(census: ObserveCandidateCensus): string {
+  if (census.source.status !== "read-and-verified") return "could not be determined";
+  if (census.candidates.length > 0) return String(census.candidates.length);
+  return census.emptyVerified !== undefined
+    ? claimFromVerifiedEmpty(census.emptyVerified, "0")
+    : "could not be determined";
 }
 
 function isEnoent(error: unknown): boolean {
@@ -349,11 +440,34 @@ export async function runObserveStatus(
   const boot = await bootstrap(argv, err, env);
   if (!boot) return 1;
 
-  const state = await boot.observeStore.getState();
-  const candidates = await boot.observeStore.listCandidates();
+  const stateRead = await observeSourceState(boot.observeStore);
+  if (stateRead.source.status !== "read-and-verified") {
+    write(
+      err,
+      `Error: could not read observe mode state (${stateRead.source.reason}).\n`,
+    );
+    return 1;
+  }
+  if (stateRead.state === undefined) {
+    write(err, "Error: observe mode state read completed without returning state.\n");
+    return 1;
+  }
+  const census = await observeCandidateCensus(boot.observeStore);
+  if (census.source.status !== "read-and-verified") {
+    write(
+      err,
+      `Error: could not read pending candidate census (${census.source.reason}).\n`,
+    );
+    return 1;
+  }
 
-  write(out, state.enabled ? `Observe mode: ON (since ${state.started_at})\n` : "Observe mode: OFF\n");
-  write(out, `Pending candidates: ${candidates.size}\n`);
+  write(
+    out,
+    stateRead.state.enabled
+      ? `Observe mode: ON (since ${stateRead.state.started_at})\n`
+      : "Observe mode: OFF\n",
+  );
+  write(out, `Pending candidates: ${formatPendingCandidateCount(census)}\n`);
   return 0;
 }
 
@@ -439,9 +553,15 @@ export async function runObserveCandidates(
     }
   }
 
-  const candidates = [...(await boot.observeStore.listCandidates()).values()].sort((a, b) =>
-    a.first_seen < b.first_seen ? -1 : a.first_seen > b.first_seen ? 1 : 0,
-  );
+  const census = await observeCandidateCensus(boot.observeStore);
+  if (census.source.status !== "read-and-verified") {
+    write(
+      err,
+      `Error: could not read candidate census (${census.source.reason}).\n`,
+    );
+    return 1;
+  }
+  const candidates = census.candidates;
 
   // Round-3 R2(b): on an exclusive-routing fortress, a candidate whose
   // destination is already covered by an observe-promoted, CURRENT-gate-uid
@@ -479,14 +599,25 @@ export async function runObserveCandidates(
     const rows = candidates.map((candidate) =>
       isAwaitingRearm(candidate) ? { ...candidate, promoted_awaiting_rearm: true } : candidate,
     );
-    write(out, JSON.stringify(rows, null, 2) + "\n");
+    const body =
+      rows.length === 0 && census.emptyVerified !== undefined
+        ? claimFromVerifiedEmpty(census.emptyVerified, rows)
+        : rows;
+    write(out, JSON.stringify(body, null, 2) + "\n");
     return 0;
   }
 
   if (candidates.length === 0) {
+    if (census.emptyVerified === undefined) {
+      write(err, "Error: candidate census could not verify the empty candidate set.\n");
+      return 1;
+    }
     write(
       out,
-      "No candidates. Turn on observe mode (`sanctuary castle-wall observe start`), run your agent, then re-run this command.\n",
+      claimFromVerifiedEmpty(
+        census.emptyVerified,
+        "No candidates. Turn on observe mode (`sanctuary castle-wall observe start`), run your agent, then re-run this command.\n",
+      ),
     );
     return 0;
   }

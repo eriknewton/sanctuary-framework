@@ -45,6 +45,7 @@ import {
   EGRESS_GATE_STAND_DOWN_EFFECT,
   EGRESS_GATE_UNPROTECT_WITH_STAND_DOWN_COMMAND,
 } from "../../egress-gate/operator-advice.js";
+import { observing, type Observed } from "../../claim-witness.js";
 
 /** Distinct local audit operation strings (never a widened shared enum). */
 export const EXCLUSIVE_EGRESS_ARMED_AUDIT_OP = "exclusive_egress_armed";
@@ -218,13 +219,13 @@ export interface ExclusiveEgressArmOps {
 /** Terminal outcome of the exclusive-egress arming stage. */
 export type ExclusiveEgressArmOutcome =
   /** Fully live: generation committed, barrier released the harness. */
-  | { kind: "exclusive-armed"; generationId: number }
+  | { kind: "exclusive-armed"; generationId: Observed<number> }
   /**
    * Live but AMBER: the harness is running confined, but the persistent boot
    * state could not be re-parked (next boot could auto-start pre-G5). Never
    * rendered green; the repair verb re-runs the re-park.
    */
-  | { kind: "exclusive-armed-repark-failed"; generationId: number; reparkError: string }
+  | { kind: "exclusive-armed-repark-failed"; generationId: Observed<number>; reparkError: string }
   /**
    * DEGRADE-LOUD (design answer 2 choice (b)): the exclusive stack could not
    * come live; the coarse wall stays armed. Always a DISTINCT non-green
@@ -249,7 +250,7 @@ export type ExclusiveEgressArmOutcome =
       kind: "degraded-coarse-active";
       stage: "bring-up" | "release";
       reason: string;
-      coarseCompositionRestored: boolean;
+      coarseCompositionRestored: Observed<boolean>;
       /** What happened to the agent process, per branch. Never a boolean. */
       harness: HarnessDisposition;
       /** Cleanup problems that must stay loud (parked-state assertions etc). */
@@ -305,7 +306,13 @@ export async function runExclusiveEgressArming(
       generation_id: committed.generation_id,
       gate_port: committed.gate_port,
     });
-    return { kind: "exclusive-armed", generationId: committed.generation_id };
+    return {
+      kind: "exclusive-armed",
+      generationId: await observing(
+        "provision-exclusive-arm.exclusive-armed",
+        () => committed.generation_id,
+      ),
+    };
   }
   if (release.kind === "released-repark-failed") {
     // Running + confined, but the boot path is not re-parked: DISTINCT amber,
@@ -318,7 +325,10 @@ export async function runExclusiveEgressArming(
     });
     return {
       kind: "exclusive-armed-repark-failed",
-      generationId: committed.generation_id,
+      generationId: await observing(
+        "provision-exclusive-arm.exclusive-armed",
+        () => committed.generation_id,
+      ),
       reparkError: release.reparkError,
     };
   }
@@ -349,13 +359,18 @@ async function degradeLoud(
   cleanupErrors: string[] = [],
 ): Promise<ExclusiveEgressArmOutcome> {
   const errors = [...cleanupErrors];
-  let coarseCompositionRestored = false;
-  try {
-    await ops.restoreCoarseComposition(reason);
-    coarseCompositionRestored = true;
-  } catch (err) {
-    errors.push(`coarse composition restore failed: ${(err as Error).message}`);
-  }
+  const coarseCompositionRestored = await observing(
+    "provision-exclusive-arm.coarse-composition-restored",
+    async () => {
+      try {
+        await ops.restoreCoarseComposition(reason);
+        return true;
+      } catch (err) {
+        errors.push(`coarse composition restore failed: ${(err as Error).message}`);
+        return false;
+      }
+    },
+  );
   let harness: HarnessDisposition | undefined;
   if (coarseCompositionRestored) {
     // Only start the agent over a manifest that is PROVEN back in coarse
