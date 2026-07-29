@@ -35,20 +35,20 @@ describe("v1.1 dashboard shell HTML", () => {
     expect(html).not.toContain('data-route="recovery"');
   });
 
-  it("embeds dashboard config as a JSON script tag, not a sensitive token in markup", () => {
+  it("embeds dashboard config as a JSON script tag without serializing the bearer", () => {
     const html = renderDashboardV11Html({
       authToken: "session-token-xyz",
       identityId: "operator-001",
       fortressId: "fortress-001",
     });
-    // Auth token may be embedded for the inline client to use, but never
-    // appears in localStorage write paths.
+    expect(html).not.toContain("session-token-xyz");
     expect(html).not.toContain("localStorage");
     // Sovereignty preference is in-memory; sidebar collapse goes to
     // sessionStorage only. Confirm via the embedded client script.
     const client = getClientScript();
     expect(client).not.toContain("localStorage");
     expect(client).toContain("sessionStorage");
+    expect(client).toContain('sessionStorage.getItem("authToken")');
   });
 
   it("uses short-lived sessions, not long-lived token URLs, for SSE", () => {
@@ -64,6 +64,72 @@ describe("v1.1 dashboard shell HTML", () => {
     // The shell HTML body must not include the U+2014 em-dash. Internal
     // comments live in source files (.ts), not in the rendered HTML.
     expect(html).not.toContain("—");
+  });
+
+  // ── One-surface posture fold (default-flip 2026-06-30) ────────────────
+  // The full posture detail is folded into the single default surface: a
+  // Posture entry in the Verify group, a Posture screen renderer that reuses
+  // the existing /api/posture/* data endpoints, and the seal click-to-expand
+  // into that screen. Nothing is lost; nothing is duplicated.
+  it("exposes a Posture entry in the sidebar (folded-in posture detail)", () => {
+    const html = renderDashboardV11Html({});
+    expect(html).toContain('data-route="posture"');
+    // It sits in the Verify group alongside Activity / Attestation / Health.
+    expect(html).toContain('data-route="activity"');
+    expect(html).toContain('data-route="attestation"');
+  });
+
+  it("renders the folded Posture screen reusing the existing posture data endpoints", () => {
+    const client = getClientScript();
+    // The Posture screen renderer + its route are wired.
+    expect(client).toContain("renderPostureScreen");
+    expect(client).toContain('case "posture":');
+    // It REUSES the existing posture data endpoints, never a duplicate API.
+    expect(client).toContain("/api/posture/home");
+    expect(client).toContain("/api/anomaly/findings");
+    // The per-agent drill-down and the Evidence view stay reachable.
+    expect(client).toContain("/posture/agent/");
+    expect(client).toContain("/posture/evidence");
+    // The six named metric cards from the posture board are folded in.
+    expect(client).toContain("Protection requested");
+    expect(client).toContain("Enforcement confirmed");
+    expect(client).toContain("Castle Wall");
+    expect(client).toContain("Approvals waiting");
+    expect(client).toContain("Open anomalies");
+    expect(client).toContain("Audit chain");
+    // Today's story + the plain-summary toggle are folded in (apostrophe is
+    // emitted as the &#39; entity so the raw client string is plain).
+    expect(client).toContain("Today&#39;s story");
+    expect(client).toContain("posture-story-plain");
+    // Anomaly findings list is folded in.
+    expect(client).toContain("Anomaly findings");
+  });
+
+  it("the seal click-to-expand routes into the full Posture detail", () => {
+    const client = getClientScript();
+    expect(client).toContain("posture-detail-open");
+    expect(client).toContain("See full posture detail");
+  });
+
+  it("the folded posture detail honors the never-overclaim seal (green only on armed)", () => {
+    const client = getClientScript();
+    // Castle Wall reads green/Enforcing ONLY on an armed arm-state; the
+    // per-agent pill reads green ONLY on confirmed live enforcement.
+    expect(client).toContain('armState === "armed"');
+    expect(client).toContain('a.enforcement_active === "active"');
+  });
+
+  it("the folded posture detail uses named layers only (no L1/L2/L3/L4 in copy)", () => {
+    const client = getClientScript();
+    // The Posture screen renderer block must not reintroduce L-numbering in
+    // operator-visible copy. Scan the renderPostureScreen region for the
+    // retired tokens as standalone layer labels.
+    const start = client.indexOf("function renderPostureScreen");
+    const region = start >= 0 ? client.slice(start, start + 4000) : client;
+    expect(region).not.toMatch(/\bL1 Cognitive\b/);
+    expect(region).not.toMatch(/\bL2 Operational\b/);
+    expect(region).not.toMatch(/\bL3\b/);
+    expect(region).not.toMatch(/\bL4 Reputation\b/);
   });
 
   it("no UBAI dead-claims in operator-visible copy", () => {
@@ -86,16 +152,30 @@ describe("v1.1 dashboard shell HTML", () => {
     expect(combined.toLowerCase()).not.toContain("forward secrecy via mls");
   });
 
-  it("renders the binary version pill in the topbar (Finding CCC, v1.2.0-rc.3)", () => {
+  it("renders the binary version pill (Finding CCC, v1.2.0-rc.3)", () => {
     const html = renderDashboardV11Html({ sanctuaryVersion: "1.2.0-rc.3" });
-    // Pill is server-rendered alongside deployment / mode / attestation.
+    // S2 (2026-07-18): the version / deployment / mode / attestation chips
+    // moved off the top bar into the sidebar footer so the top bar carries
+    // one overall state pill. The pill stays in the same flex container.
+    // S3 (2026-07-18): the container id followed the chips -- "topbar-pills"
+    // described a location they had already left, so it is now "sidebar-pills".
     expect(html).toContain('data-pill="version"');
     expect(html).toContain("v1.2.0-rc.3");
-    // The pill stays in the same flex container as the other pills.
-    const topbarMatch = html.match(/<div class="pills" id="topbar-pills">[\s\S]*?<\/div>/);
-    expect(topbarMatch).toBeTruthy();
-    expect(topbarMatch![0]).toContain('data-pill="version"');
-    expect(topbarMatch![0]).toContain('data-pill="deployment"');
+    const pillsMatch = html.match(/<div class="pills" id="sidebar-pills">[\s\S]*?<\/div>/);
+    expect(pillsMatch).toBeTruthy();
+    expect(pillsMatch![0]).toContain('data-pill="version"');
+    expect(pillsMatch![0]).toContain('data-pill="deployment"');
+  });
+
+  it("renders a clickable link to /fleet as the Machines nav item (C1 Finding 4; S2 reorder)", () => {
+    const html = renderDashboardV11Html({});
+    // S2: the Fleet Switcher moved from a top-bar link to the "Machines" item
+    // in the sidebar nav spine. The /fleet route stays reachable, unremoved.
+    expect(html).toMatch(/<a[^>]+href="\/fleet"[^>]*>/);
+    const navMatch = html.match(/<nav id="sidebar-nav">[\s\S]*?<\/nav>/);
+    expect(navMatch).toBeTruthy();
+    expect(navMatch![0]).toContain('href="/fleet"');
+    expect(navMatch![0]).toContain("Machines");
   });
 
   it("falls back to the package binary version when sanctuaryVersion is unset", () => {

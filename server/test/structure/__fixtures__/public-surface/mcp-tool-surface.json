@@ -1539,6 +1539,13 @@
     }
   },
   {
+    "name": "sanctuary_capabilities",
+    "inputSchema": {
+      "type": "object",
+      "properties": {}
+    }
+  },
+  {
     "name": "sanctuary_compound_execute",
     "inputSchema": {
       "type": "object",

@@ -20,4 +20,8 @@ export * from "./decision/index.js";
 export * from "./failure/index.js";
 export * from "./approval/index.js";
 export * from "./runtime/index.js";
+export * from "./observe/index.js";
+export * from "./export/index.js";
 export * from "./egress-proxy.js";
+export * from "./subject-binding.js";
+export * from "./audit-attribution.js";

@@ -6,11 +6,113 @@
  * to avoid flaky CI from registry availability.
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   isNewerVersion,
   formatUpdateMessage,
+  isWrappedInstall,
+  outboundUpdateChecksEnabled,
+  checkForUpdate,
+  checkForSignedUpdate,
 } from "../src/update-check.js";
+
+// node:https / node:http ESM namespaces are not configurable, so `get`
+// cannot be vi.spyOn'd directly on the real module (Vitest throws "Module
+// namespace is not configurable in ESM"). Mock both modules with spy
+// wrappers instead so the "no outbound call" assertions below can observe
+// whether the update-check gate ever reaches the transport layer. `vi.mock`
+// factories are hoisted above imports, so the spies must be created via
+// `vi.hoisted` rather than a plain top-level const.
+const { httpsGetSpy, httpGetSpy } = vi.hoisted(() => ({
+  httpsGetSpy: vi.fn(),
+  httpGetSpy: vi.fn(),
+}));
+vi.mock("node:https", () => ({ get: httpsGetSpy }));
+vi.mock("node:http", () => ({ get: httpGetSpy }));
+
+describe("outboundUpdateChecksEnabled", () => {
+  it("returns false when neither env var is set (zero-outbound default)", () => {
+    expect(outboundUpdateChecksEnabled({})).toBe(false);
+  });
+
+  it("returns true when SANCTUARY_UPDATE_CHECK=1 is the only var set", () => {
+    expect(outboundUpdateChecksEnabled({ SANCTUARY_UPDATE_CHECK: "1" })).toBe(
+      true,
+    );
+  });
+
+  it("returns false when both vars are set (the back-compat alias wins)", () => {
+    expect(
+      outboundUpdateChecksEnabled({
+        SANCTUARY_UPDATE_CHECK: "1",
+        SANCTUARY_NO_UPDATE_CHECK: "1",
+      }),
+    ).toBe(false);
+  });
+
+  it("returns false when only SANCTUARY_NO_UPDATE_CHECK=1 is set", () => {
+    expect(
+      outboundUpdateChecksEnabled({ SANCTUARY_NO_UPDATE_CHECK: "1" }),
+    ).toBe(false);
+  });
+
+  it("treats any other value as not opted in", () => {
+    expect(outboundUpdateChecksEnabled({ SANCTUARY_UPDATE_CHECK: "true" })).toBe(
+      false,
+    );
+    expect(
+      outboundUpdateChecksEnabled({ SANCTUARY_NO_UPDATE_CHECK: "0" }),
+    ).toBe(false);
+  });
+});
+
+describe("checkForUpdate / checkForSignedUpdate gate (zero-outbound default)", () => {
+  let savedNoUpdate: string | undefined;
+  let savedUpdate: string | undefined;
+
+  beforeEach(() => {
+    savedNoUpdate = process.env.SANCTUARY_NO_UPDATE_CHECK;
+    savedUpdate = process.env.SANCTUARY_UPDATE_CHECK;
+    httpsGetSpy.mockClear();
+    httpGetSpy.mockClear();
+  });
+
+  afterEach(() => {
+    if (savedNoUpdate !== undefined)
+      process.env.SANCTUARY_NO_UPDATE_CHECK = savedNoUpdate;
+    else delete process.env.SANCTUARY_NO_UPDATE_CHECK;
+    if (savedUpdate !== undefined)
+      process.env.SANCTUARY_UPDATE_CHECK = savedUpdate;
+    else delete process.env.SANCTUARY_UPDATE_CHECK;
+  });
+
+  it("checkForUpdate makes no outbound call when neither env var is set", async () => {
+    delete process.env.SANCTUARY_NO_UPDATE_CHECK;
+    delete process.env.SANCTUARY_UPDATE_CHECK;
+    await checkForUpdate("1.0.0");
+    expect(httpsGetSpy).not.toHaveBeenCalled();
+    expect(httpGetSpy).not.toHaveBeenCalled();
+  });
+
+  it("checkForSignedUpdate makes no outbound call when neither env var is set", async () => {
+    delete process.env.SANCTUARY_NO_UPDATE_CHECK;
+    delete process.env.SANCTUARY_UPDATE_CHECK;
+    await checkForSignedUpdate("1.0.0");
+    expect(httpsGetSpy).not.toHaveBeenCalled();
+    expect(httpGetSpy).not.toHaveBeenCalled();
+  });
+
+  it("checkForUpdate makes no outbound call when only the back-compat alias is set", async () => {
+    process.env.SANCTUARY_NO_UPDATE_CHECK = "1";
+    delete process.env.SANCTUARY_UPDATE_CHECK;
+    await checkForUpdate("1.0.0");
+    expect(httpsGetSpy).not.toHaveBeenCalled();
+    expect(httpGetSpy).not.toHaveBeenCalled();
+  });
+});
 
 describe("update-check", () => {
   describe("isNewerVersion", () => {
@@ -55,9 +157,10 @@ describe("update-check", () => {
       expect(msg).toContain("0.4.0");
     });
 
-    it("includes update command", () => {
+    it("includes an update command pinned to the announced version", () => {
       const msg = formatUpdateMessage("0.3.1", "0.4.0");
-      expect(msg).toContain("npx @sanctuary-framework/mcp-server@latest");
+      expect(msg).toContain("npx @sanctuary-framework/mcp-server@0.4.0");
+      expect(msg).not.toContain("@latest");
     });
 
     it("uses [Sanctuary] prefix", () => {
@@ -68,6 +171,64 @@ describe("update-check", () => {
     it("is a single line", () => {
       const msg = formatUpdateMessage("0.3.1", "0.4.0");
       expect(msg).not.toContain("\n");
+    });
+
+    it("advises re-running `sanctuary protect` for a wrapped install (npx would be a no-op)", () => {
+      const msg = formatUpdateMessage("1.6.0", "1.6.1", true);
+      expect(msg).toContain("sanctuary protect");
+      expect(msg).not.toContain("npx @sanctuary-framework/mcp-server@1.6.1");
+      expect(msg).not.toContain("\n");
+      // copy-paste safe: no unescaped angle-bracket placeholder
+      expect(msg).not.toMatch(/<[^>]+>/);
+    });
+
+    it("never emits a runnable command when `latest` is not a well-formed version (injection-shape guard)", () => {
+      const msg = formatUpdateMessage("1.6.0", "1.6.1; rm -rf ~");
+      expect(msg).not.toContain("npx @sanctuary-framework/mcp-server@");
+      expect(msg).not.toContain("sanctuary protect");
+      expect(msg).toContain("npmjs.com/package/@sanctuary-framework/mcp-server");
+      // guard applies even if a wrapped flag is set
+      const wrappedMsg = formatUpdateMessage("1.6.0", "not a version", true);
+      expect(wrappedMsg).not.toContain("sanctuary protect");
+      expect(wrappedMsg).toContain("npmjs.com");
+    });
+  });
+
+  describe("isWrappedInstall", () => {
+    let dir: string;
+    let prevStoragePath: string | undefined;
+
+    beforeEach(() => {
+      dir = mkdtempSync(join(tmpdir(), "sanctuary-wrapcheck-"));
+      prevStoragePath = process.env.SANCTUARY_STORAGE_PATH;
+      process.env.SANCTUARY_STORAGE_PATH = dir;
+    });
+
+    afterEach(() => {
+      if (prevStoragePath === undefined) delete process.env.SANCTUARY_STORAGE_PATH;
+      else process.env.SANCTUARY_STORAGE_PATH = prevStoragePath;
+      rmSync(dir, { recursive: true, force: true });
+    });
+
+    it("is false when no storage/backup dir exists", () => {
+      expect(isWrappedInstall()).toBe(false);
+    });
+
+    it("is false for an empty backup dir (no wrap-meta pointer)", () => {
+      mkdirSync(join(dir, "backup"), { recursive: true });
+      expect(isWrappedInstall()).toBe(false);
+    });
+
+    it("detects a default wrap-meta pointer", () => {
+      mkdirSync(join(dir, "backup"), { recursive: true });
+      writeFileSync(join(dir, "backup", "wrap-meta.json"), "{}");
+      expect(isWrappedInstall()).toBe(true);
+    });
+
+    it("detects a surface-scoped wrap-meta slot", () => {
+      mkdirSync(join(dir, "backup"), { recursive: true });
+      writeFileSync(join(dir, "backup", "wrap-meta-0123456789ab.json"), "{}");
+      expect(isWrappedInstall()).toBe(true);
     });
   });
 });

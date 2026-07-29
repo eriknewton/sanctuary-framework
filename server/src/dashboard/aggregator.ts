@@ -10,7 +10,13 @@
  * safe to call repeatedly — callers control freshness.
  */
 
-import type { AuditLog, AuditEntry } from "../operational/audit-log.js";
+import {
+  auditChainVerdictUntampered,
+  auditChainVerdictClaimsClean,
+  auditChainVerdictSealedUnverifiedAtPrivilege,
+  type AuditLog,
+  type AuditEntry,
+} from "../operational/audit-log.js";
 import type { IdentityManager } from "../cognitive/tools.js";
 import type { ClientManager } from "../proxy/client-manager.js";
 import type { BaselineTracker } from "../principal-policy/baseline.js";
@@ -18,6 +24,7 @@ import type { PrincipalPolicy } from "../principal-policy/types.js";
 import {
   buildCastleWallPosture,
   type CastleWallArmState,
+  type ExclusiveEgressStatus,
 } from "../principal-policy/posture.js";
 import type { ReputationEvidence } from "../shr/generator.js";
 import { deriveReputationDegradations } from "../shr/generator.js";
@@ -218,6 +225,23 @@ export interface AggregatorSources {
   resolveBrokerPinnedProducerKey?: () => string | null;
   /** Broker liveness producer key exists or is expected but could not be read. */
   brokerProducerKeyExpectedButUnavailable?: boolean;
+  /**
+   * Unified Protect Slice 5 S5-P: resolve the exclusive-egress posture for the
+   * wall reader. MUST already be fail-closed (the dashboard's resolver maps a
+   * provider throw to `failedExclusiveEgressStatus`, which caps green); this
+   * layer only threads the resolved status into `buildCastleWallPosture`, whose
+   * capping rule turns a would-be `armed` into the DISTINCT non-green
+   * `coarse_only` when a fine-grained-provisioned agent's exclusive stack is
+   * not live — so the hero shield (green requires `armed`) repaints with every
+   * other surface. Absent = no producer wired = unchanged behavior.
+   */
+  resolveExclusiveEgressPosture?: () => Promise<ExclusiveEgressStatus | null>;
+  /**
+   * Canonical confined-agent subject (`fortress/uid-N`) for protection claims.
+   * When supplied, the dashboard hero shield only greens from Castle Wall
+   * evidence stamped with that subject.
+   */
+  resolveProtectionClaimSubject?: () => string | null | Promise<string | null>;
 }
 
 /**
@@ -340,7 +364,15 @@ function buildCognitive(
    * could not confirm the chain) we downgrade to the honest "Encryption
    * configured" (the crypto is set up, but nothing live confirms it right now).
    */
-  hasLiveIntegrityEvidence: boolean
+  hasLiveIntegrityEvidence: boolean,
+  /**
+   * F2 round-4 HIGH-1: true when the chain is untampered but the sealed history
+   * was not re-verifiable at this privilege (`verified_suffix_only`, the armed-box
+   * operator-uid case). Renders an honest AMBER headline distinct from both the
+   * green "encrypted at rest" (which requires full `verified`) and the blank
+   * "no live integrity check" (which implies nothing was checked).
+   */
+  sealedUnverifiedAtPrivilege = false
 ): CognitiveStatus {
   const hasIdentity = !!sources.identityManager?.getDefault();
   const state: LayerState = hasIdentity ? "full" : "degraded";
@@ -349,6 +381,9 @@ function buildCognitive(
     headline = "No sovereign identity — run sanctuary_bootstrap";
   } else if (hasLiveIntegrityEvidence) {
     headline = "State encrypted at rest";
+  } else if (sealedUnverifiedAtPrivilege) {
+    headline =
+      "State encrypted; sealed history not re-verifiable at this privilege (run as root for a full verify)";
   } else {
     headline = "Encryption configured (no live integrity check)";
   }
@@ -620,6 +655,13 @@ function castleWallNotEnforcingHeadline(arm: CastleWallArmState): string {
       return "Layers configured, Castle Wall degraded (not enforcing)";
     case "not_installed":
       return "Layers configured, Castle Wall not installed on this host";
+    // S5-P distinct non-green: a fine-grained-provisioned agent's
+    // exclusive-egress stack is not live. Deliberately does NOT assert the
+    // coarse wall is enforcing FOR THAT AGENT: the worst per-agent mode may be
+    // `unprotected` (no coarse wall over it), so the machine headline stays
+    // mode-agnostic and points at the per-agent posture. Non-green either way.
+    case "coarse_only":
+      return "Fine-grained exclusive-egress not live for a protected agent (coarse-only or weaker); see per-agent posture";
     default:
       return "Layers configured, Castle Wall enforcement not confirmed";
   }
@@ -700,6 +742,11 @@ export async function getProtectionSnapshot(
   // live read; it gates the L1 "State encrypted at rest" enforcement claim,
   // which must never be asserted from config-presence alone (never-overclaim).
   let hasLiveIntegrityEvidence = false;
+  // Amber companion to `hasLiveIntegrityEvidence`: true when the chain is
+  // untampered but the sealed history was not re-verifiable at this privilege
+  // (`verified_suffix_only`). Lets the cognitive headline read an honest amber
+  // instead of falsely green or misleadingly "no live integrity check".
+  let sealedUnverifiedAtPrivilege = false;
   if (sources.auditLog) {
     // Local binding so the eager-scope closure keeps the AuditLog type (and the
     // `.query` receiver terminal name stays `auditLog`, which the agent-audit
@@ -732,25 +779,43 @@ export async function getProtectionSnapshot(
         auditLog.query({ limit: MAX_AUDIT }),
       );
       audit = result.entries;
-      // A real AuditLog.query always returns integrity_findings; treat an absent
-      // field (non-conforming stub) as "no findings" rather than a false red. A
-      // THROWN read still fails closed below.
-      auditIntegrityOk = (result.integrity_findings?.length ?? 0) === 0;
-      // Only a real, present, empty integrity_findings array is positive
-      // evidence the chain verified clean. An absent field (non-conforming stub)
-      // is NOT live evidence and must not earn the "encrypted at rest" claim.
+      // BLOCKER-1 (round 3): the overall-light integrity gate must reflect the
+      // sealed-region verdict (the routine query skips sealed content). Run the
+      // shared verdict (inside the same eager-read scope).
+      const verdict = await auditLog.runEagerReads(() =>
+        auditLog.getAuditChainVerdict(),
+      );
+      // The overall-light OPERATIONAL gate is non-red on anything UNTAMPERED
+      // (findings-free), including an armed box's `verified_suffix_only` where
+      // the operator uid cannot read the root-owned sealed history, which must
+      // NOT flip every armed box's light to red.
+      auditIntegrityOk = auditChainVerdictUntampered(verdict);
+      // F2 round-4 HIGH-1 (2026-07-15): `hasLiveIntegrityEvidence` drives the
+      // AFFIRMATIVE green claims "State encrypted at rest" + `memory_attest_ready`.
+      // Those are fully-verified evidence claims, so they require a full
+      // `verified` chain (routine clean AND sealed re-verified). A
+      // `verified_suffix_only` is untampered-but-not-fully-verified: it earns the
+      // non-red operational light above, but NOT the green integrity evidence
+      // (previously it did, a false green on armed boxes). It still also requires
+      // a real, present findings array (a non-conforming stub earns nothing).
       hasLiveIntegrityEvidence =
         Array.isArray(result.integrity_findings) &&
-        result.integrity_findings.length === 0;
+        auditChainVerdictClaimsClean(verdict);
+      // Amber caveat: distinguish "sealed not re-verifiable at this privilege"
+      // from a plain "no live integrity check", so the cognitive headline is
+      // honest rather than either falsely green or misleadingly blank.
+      sealedUnverifiedAtPrivilege =
+        auditChainVerdictSealedUnverifiedAtPrivilege(verdict);
     } catch {
       audit = [];
       auditIntegrityOk = false;
       hasLiveIntegrityEvidence = false;
+      sealedUnverifiedAtPrivilege = false;
     }
   }
 
   const agent = buildAgent(sources);
-  const l1 = buildCognitive(sources, audit, hasLiveIntegrityEvidence);
+  const l1 = buildCognitive(sources, audit, hasLiveIntegrityEvidence, sealedUnverifiedAtPrivilege);
   const l2 = buildOperational(sources, audit);
   const l3 = buildDisclosure(sources, audit);
   const l4 = buildReputation(sources);
@@ -787,6 +852,15 @@ export async function getProtectionSnapshot(
       // throttled backstop catch out-of-band tampering, and the shaper's
       // freshness/evidence gating (unknown / degraded, never armed without fresh
       // verified evidence) is untouched: only WHERE its `query` runs changes.
+      // S5-P: resolve the exclusive-egress posture (already fail-closed at the
+      // dashboard resolver) BEFORE the eager read scope, so the ONE canonical
+      // shaper applies the aggregate-green cap for the hero shield too.
+      const exclusiveEgress = sources.resolveExclusiveEgressPosture
+        ? await sources.resolveExclusiveEgressPosture()
+        : null;
+      const protectionClaimSubject = sources.resolveProtectionClaimSubject
+        ? await sources.resolveProtectionClaimSubject()
+        : null;
       const wall = await sources.auditLog.runEagerReads(() =>
         buildCastleWallPosture({
           auditLog: sources.auditLog as AuditLog,
@@ -795,6 +869,8 @@ export async function getProtectionSnapshot(
           ...(sources.producerKeyExpectedButUnavailable
             ? { producerKeyExpectedButUnavailable: true }
             : {}),
+          ...(exclusiveEgress !== null ? { exclusiveEgress } : {}),
+          protectionClaimSubject,
         }),
       );
       wallArmState = wall.arm_state;

@@ -75,7 +75,7 @@ calibration:
 
 ```bash
 cd server
-npx vite-node scripts/calibrate-d5-perf.ts
+npx tsx scripts/calibrate-d5-perf.ts
 ```
 
 The script prints per-batch p50/p90/p99/max plus a summary of variation
@@ -85,7 +85,7 @@ across batches per condition. To exercise the loaded condition, launch
 ```bash
 node -e 'function spin(){let x=0;for(let i=0;i<1e7;i++)x+=Math.sqrt(i);return x};while(true)spin();' &
 node -e 'function spin(){let x=0;for(let i=0;i<1e7;i++)x+=Math.sqrt(i);return x};while(true)spin();' &
-cd server && npx vite-node scripts/calibrate-d5-perf.ts
+cd server && npx tsx scripts/calibrate-d5-perf.ts
 kill %1 %2
 ```
 

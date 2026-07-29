@@ -10,6 +10,17 @@
 /** Schema version for v1 allowlist rules + manifest + signed envelopes. */
 export const CASTLE_WALL_SCHEMA_VERSION_V1 = 1 as const;
 
+/**
+ * The id prefix EVERY observe-promoted rule carries (provenance marker,
+ * mirroring provisioning's `provisioned-<harness>-` convention). Lives here
+ * (not in `observe/synthesize.ts`, which re-exports it) so the allowlist
+ * layer's exclusive-routing violation remedy can NAME the observe recovery
+ * path for a stale promoted rule without an allowlist->observe import cycle.
+ * NOT an ownership claim: the CLI publisher's orphan-cleanup owns files by
+ * membership in the previous promote-signed manifest, never by name.
+ */
+export const OBSERVE_PROMOTED_RULE_ID_PREFIX = "derived-observe-" as const;
+
 /** Audit-log layer for every Castle Wall event. Layer 1 per the Castle Architecture ADR. */
 export const CASTLE_WALL_AUDIT_LAYER = "l1" as const;
 
@@ -30,9 +41,12 @@ export const CASTLE_WALL_AUDIT_PROVENANCE_VALUE =
  * Audit operation name for the periodic Castle Wall daemon LIVENESS heartbeat
  * (observability Slice 2). The daemon appends an `l1` audit entry under this
  * operation on an audit-cadence interval (~30-60s), stamped with the same
- * `cw_source` provenance marker and producer-signature basis that enforcement
- * evidence uses, so the reader can tell an alive-but-idle wall from one that
- * silently died in a quiet window.
+ * `cw_source` provenance marker that enforcement evidence carries. Unlike
+ * signed enforcement evidence, the heartbeat is a DIRECT audit append (not
+ * routed through the signing consumer), so a genuine beat is channel-basis
+ * (marker only, NO producer signature) on every host, Linux included (see
+ * `runtime/macos-daemon.ts`). The reader uses it to tell an alive-but-idle wall
+ * from one that silently died in a quiet window.
  *
  * HONESTY: a heartbeat proves the daemon process is ALIVE, NOT that it
  * adjudicated a real flow. It is deliberately kept OUT of
@@ -132,6 +146,18 @@ export const CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY =
   "cw_producer_captured_at_ms" as const;
 
 /**
+ * `details` key recording the consumer-side subject-binding rule used when a
+ * producer-signed entry was written. The key is not producer-signed and has no
+ * read-side authority; readers derive subjects from verified signed bytes.
+ */
+export const CASTLE_WALL_PRODUCER_SUBJECT_BINDING_DETAIL_KEY =
+  "cw_producer_subject_binding" as const;
+export const CASTLE_WALL_PRODUCER_SUBJECT_BINDING_MACOS_AUDIT_TOKEN =
+  "macos_audit_token" as const;
+export const CASTLE_WALL_PRODUCER_SUBJECT_BINDING_SIGNED_IDENTITY_ID =
+  "signed_identity_id" as const;
+
+/**
  * `details` key recording the authenticity basis the consumer established for
  * this entry. `producer_signed` means a producer signature was verified
  * against the pinned key (the in-process forgery hole is closed for this
@@ -144,6 +170,48 @@ export const CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY = "cw_evidence_basis" as cons
 export const CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED = "producer_signed" as const;
 export const CASTLE_WALL_EVIDENCE_BASIS_CHANNEL_UNSIGNED =
   "channel_authenticated_unsigned" as const;
+/**
+ * Basis for a consumer-emitted NOT-ARMED drain FAULT signal (e.g. the
+ * `castle_wall_drain_failed` record the Linux activation gate writes when the
+ * daemon link wedges). It is NOT accepted enforcement evidence and carries NO
+ * producer signature - the TypeScript gate emits it locally to record that the
+ * daemon's signed evidence has stopped reaching the consumer. Labeling it
+ * honestly (never `producer_signed`) keeps the fault record from claiming an
+ * authenticity it does not have; every read-side attributor already re-verifies
+ * and fail-closed-rejects a record lacking a verified producer signature.
+ */
+export const CASTLE_WALL_EVIDENCE_BASIS_DRAIN_FAULT_UNSIGNED =
+  "drain_fault_unsigned" as const;
+
+/** WAL-chain sequence key grafted onto persisted details by the audit consumer. */
+export const CASTLE_WALL_WAL_SEQUENCE_DETAIL_KEY = "seq" as const;
+
+/** Prior-entry hash key grafted onto persisted details by the audit consumer. */
+export const CASTLE_WALL_WAL_PRIOR_SHA256_HEX_DETAIL_KEY =
+  "prior_sha256_hex" as const;
+
+/**
+ * Detail keys added by the TypeScript audit consumer outside the producer's
+ * signed canonical body. Read-side row binding strips exactly this set before
+ * comparing the persisted row to the signed body; adding a new writer-added
+ * carrier key requires adding it here, or re-verify fails closed.
+ */
+export const CASTLE_WALL_SIGNED_ROW_BINDING_IGNORED_DETAIL_KEYS = [
+  // WAL-chain metadata is authenticated by the consumer before persistence and
+  // bound into the producer-signature input, but it is not evidence payload.
+  CASTLE_WALL_WAL_SEQUENCE_DETAIL_KEY,
+  CASTLE_WALL_WAL_PRIOR_SHA256_HEX_DETAIL_KEY,
+  // Signature reconstruction carrier fields. These prove the body; they are
+  // not fields inside the body.
+  CASTLE_WALL_PRODUCER_SIG_DETAIL_KEY,
+  CASTLE_WALL_PRODUCER_KID_DETAIL_KEY,
+  CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY,
+  CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY,
+  CASTLE_WALL_PRODUCER_SUBJECT_BINDING_DETAIL_KEY,
+  CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY,
+  // Consumer provenance is stamped after the producer body is accepted.
+  CASTLE_WALL_AUDIT_PROVENANCE_KEY,
+] as const;
 
 /** IPC framing header per scope-lock section 5 (LSP-style). */
 export const CASTLE_WALL_IPC_CONTENT_LENGTH_HEADER = "Content-Length" as const;
@@ -171,3 +239,53 @@ export const CASTLE_WALL_REQUEST_ID_NONCE_BYTES = 16 as const;
 
 /** JSON-RPC method namespace for IPC messages. Subsequent PRs add concrete methods. */
 export const CASTLE_WALL_IPC_NAMESPACE = "castle-wall" as const;
+
+/**
+ * Client-side deadline (ms) for a `policy_reload_request`, used by the CLI
+ * reload path (`requestPolicyReload`). A policy reload RE-SIGNS the recomposed
+ * ruleset through the root signer helper (a cold code-signed shim spawn + XPC
+ * round-trip on a freshly-booted box), so it is fundamentally slower than a
+ * status/drain query. This deadline MUST exceed the daemon's own worst-case
+ * internal reload budget (the helper-sign shim timeout plus the reload broadcast
+ * backstop, {@link CASTLE_WALL_RELOAD_SIGN_DEADLINE_MS} +
+ * {@link CASTLE_WALL_RELOAD_BROADCAST_DEADLINE_MS}) with headroom, so a healthy
+ * reload returns `ok:true` in time and a genuine daemon-side stall surfaces as a
+ * fast, SPECIFIC `ok:false` from the daemon rather than a generic client-side
+ * timeout. Regression origin: the generic 5s CLI socket deadline was SHORTER
+ * than the 10s helper-sign shim timeout, so the first cold egress reload timed
+ * out client-side (Mini1 egress drill 2026-07-12) even though the daemon was
+ * healthy and still signing.
+ */
+export const CASTLE_WALL_RELOAD_CLIENT_TIMEOUT_MS = 20_000 as const;
+
+/**
+ * Daemon-side backstop deadline (ms) for the compose+sign phase of a policy
+ * reload (`reloadPolicy` -> `loadManifestState`). The helper-sign shim already
+ * self-bounds at its own timeout; this is an independent ceiling over the WHOLE
+ * phase (custody reads + compose + sign) so no await in the reload handler can
+ * exceed the client deadline silently. On breach the reload returns a specific
+ * `ok:false` ("signer helper did not respond ...") instead of hanging.
+ */
+export const CASTLE_WALL_RELOAD_SIGN_DEADLINE_MS = 12_000 as const;
+
+/**
+ * Daemon-side backstop deadline (ms) for the broadcast phase of a policy reload
+ * (fanning the freshly-signed manifest to sysext subscribers). A wedged
+ * subscriber write must not hang the reload; on breach the reload returns a
+ * specific `ok:false` ("manifest broadcast did not complete ...").
+ */
+export const CASTLE_WALL_RELOAD_BROADCAST_DEADLINE_MS = 3_000 as const;
+
+/**
+ * Daemon-side deadline (ms) for the BEST-EFFORT audit write that records a
+ * reload outcome. The reload response is NEVER gated on this write: a slow or
+ * wedged audit log (e.g. cross-process write-lock contention, or a large-chain
+ * re-verify on append) must not turn a successful re-sign + broadcast into a
+ * client-visible timeout, nor swallow a bounded refusal. The audit write runs
+ * fire-and-forget under this deadline purely so it cannot leak a pending
+ * operation. Root cause of the second drill miss (Mini1 2026-07-12): the reload
+ * COMPLETED the compose + sign + broadcast, but the response was stuck behind
+ * `auditLog.append`/`flush`, so no `policy_loaded` was ever written and the
+ * client saw a generic timeout.
+ */
+export const CASTLE_WALL_RELOAD_AUDIT_DEADLINE_MS = 5_000 as const;

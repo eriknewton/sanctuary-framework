@@ -23,7 +23,7 @@
 import { describe, expect, it } from "vitest";
 import { ed25519 } from "@noble/curves/ed25519";
 
-import { AuditLog, type AuditEntry } from "../../src/operational/audit-log.js";
+import { AuditLog, type AuditEntry, type SealedRegionVerdict } from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import { toBase64url } from "../../src/core/encoding.js";
@@ -127,6 +127,10 @@ function truncatedAuditLog(
         integrity_findings: [],
       };
     },
+    // F2 BLOCKER-1 (round 3): feature-health folds the sealed-region verdict
+    // into its cleanliness claim. This stub is a non-migrated fortress, so the
+    // sealed region is not present (never a tamper signal).
+    verifySealedRegion: async (): Promise<SealedRegionVerdict> => ({ status: "not_present" }),
   };
   return fake as unknown as AuditLog;
 }
@@ -136,6 +140,7 @@ async function buildPanel(
   brokerPinnedProducerKeyB64url: string | null = BROKER_PUB_B64,
 ): Promise<FeatureHealthPanel> {
   return buildFeatureHealthPanel({
+    protectionClaimSubject: FORTRESS,
     auditLog: log,
     originMachine: FORTRESS,
     now: NOW,
@@ -358,6 +363,7 @@ describe("broker daemon liveness — the 9 honesty invariants", () => {
     );
 
     const panel = await buildFeatureHealthPanel({
+      protectionClaimSubject: FORTRESS,
       auditLog: truncatedAuditLog(
         [...heartbeats, freshSelfReportingInvocationEntry(FRESH_TS)],
         pageLimit,
@@ -393,6 +399,7 @@ describe("broker daemon liveness — the 9 honesty invariants", () => {
     );
 
     const panel = await buildFeatureHealthPanel({
+      protectionClaimSubject: FORTRESS,
       auditLog: truncatedAuditLog(freshEntries, pageLimit),
       registry: Object.freeze([freshSelfReportingFeature()]),
       originMachine: FORTRESS,

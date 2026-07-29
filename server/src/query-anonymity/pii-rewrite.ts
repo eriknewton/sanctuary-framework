@@ -19,13 +19,28 @@
  *     `{ redacted, placeholders }`. Rho-3 smart mode (iteration-14)
  *     consumes the placeholders for context-aware re-mapping at
  *     concierge render time.
- *   - **Substrate-selector call carries rewritten text only ONCE Tier B is
- *     wired into the live path.** Tier B is NOT yet wired into the production
- *     substrate selector (deferred; see `effectiveTierBEnabled` and the DEBT
- *     note in pii-rewrite-routes.ts), so today the original query text still
- *     reaches the substrate. When wired, the caller replaces the field on its
- *     request object before calling the selector so the original text does not
- *     cross the outbound boundary.
+ *   - **Live wiring (Rho-2.5), stated precisely.** When the fortress
+ *     opted in with recorded consent, the concierge path
+ *     (`chat/operator-chat-service.ts`) applies the Tier B treatment
+ *     to BOTH the operator query and the assembled prior-turns context
+ *     before the summarize call (smart mode via `smartRewrite`, basic
+ *     mode via `rewritePiiWithLlm` here; secrets/credentials scrubbed
+ *     ahead of both). What this does NOT mean: (a) smart mode restores
+ *     intent-preserved classes to originals by ratified design, so
+ *     those originals DO egress on the query leg (subject to the
+ *     always-on concierge Tier 1 filter re-covering its own classes);
+ *     (b) regex residuals reach the `privacy-filter-tier-2` helper
+ *     surface via LLM-assist, but that surface is PINNED local-only
+ *     (ratified 2026-07-23; see `TIER2_PINNED_SURFACE` in
+ *     intelligence/types.ts), so residuals never leave the host
+ *     through it; (c) a
+ *     config record that cannot be READ (storage throw) or DECODED
+ *     FAILS the query; only a genuinely absent record evaluates to
+ *     the default-off posture (never a silent un-rewritten send on
+ *     an unknown posture). The consent-gated Tier 2 redactor
+ *     (`intelligence/privacy-tier2-redactor.ts`, installed on every
+ *     production selector by `installConsentGatedRedactor`)
+ *     additionally covers the frontier-with-filter egress substrate.
  *
  * Castle-walking discipline:
  *   - No new outbound surface. LLM-assist re-uses the existing
@@ -42,9 +57,10 @@
  *     split off to its own build for cleaner test surface + lower
  *     divergence risk.
  *   - **Live wiring into the substrate-selector invoke pipeline**:
- *     deferred to a Rho-2.5 boot-wiring follow-up. This module ships
- *     the primitive + config + routes; consumers (selector wrapper
- *     and/or selector mid-flight call site) attach to it.
+ *     LANDED as the Rho-2.5 follow-up (see the design bullet above).
+ *     This module ships the primitive + config + routes; the live
+ *     consumers are the concierge chat service and the consent-gated
+ *     Tier 2 redactor.
  *
  * Audit emission:
  *   - `query_anonymity_pii_rewritten` fires per rewrite call with
@@ -56,6 +72,7 @@ import type {
   SubstrateSelector,
 } from "../intelligence/selector.js";
 import type { Surface } from "../intelligence/types.js";
+import type { AuditLog } from "../operational/audit-log.js";
 
 // ── Public types ─────────────────────────────────────────────────────
 
@@ -107,10 +124,66 @@ export const PII_REWRITE_AUDIT_OPS = {
   PII_REWRITTEN: "query_anonymity_pii_rewritten",
   CONFIG_UPDATED: "query_anonymity_pii_config_updated",
   CONSENT_RECORDED: "query_anonymity_pii_consent_recorded",
+  /**
+   * The Tier B config could not be established: either a record
+   * EXISTS but could not be decoded (corrupt payload, wrong-fortress
+   * AAD, version mismatch; `reason: "decode_failed"`) or the storage
+   * read itself THREW (I/O error, lock contention, permissions;
+   * `reason: "read_failed"`). The live query path fails the query on
+   * both states rather than silently sending un-rewritten text
+   * (hard-constraint 5: never silently degrade). Only a genuinely
+   * ABSENT record evaluates to the default-off posture.
+   */
+  CONFIG_UNREADABLE: "query_anonymity_pii_config_unreadable",
 } as const;
 
 export type PiiRewriteAuditOp =
   (typeof PII_REWRITE_AUDIT_OPS)[keyof typeof PII_REWRITE_AUDIT_OPS];
+
+/**
+ * Emits the `query_anonymity_pii_rewritten` audit event with
+ * per-category counts. Called by the LIVE Rho-2.5 wiring in
+ * `chat/operator-chat-service.ts` on every Tier B rewrite that
+ * actually ran (both the basic anonymize-all path and the Rho-3
+ * smart-mode path), so the op fires only when a query was genuinely
+ * rewritten before the substrate call. Lives here (not in the route
+ * module) so live-path consumers never import the HTTP route chain.
+ */
+export function emitPiiRewriteAudit(opts: {
+  auditLog: AuditLog;
+  identityId: string;
+  fortressId: string;
+  /**
+   * Per-category counts of redactions that SURVIVED to the outbound
+   * text. Smart mode restores intent-preserved classes before the
+   * substrate call; the emitter must pass counts with those classes
+   * zeroed (plus `preservedClasses`) so the record never claims a
+   * redaction that was restored.
+   */
+  redactionCounts: Record<string, number>;
+  llmAssistRan: boolean;
+  llmResidualCount: number;
+  consentedToTradeOff: boolean;
+  /** PII classes intent-preservation restored to originals (smart mode). */
+  preservedClasses?: readonly string[];
+  /** Which outbound text this rewrite covered. Defaults to "query". */
+  leg?: "query" | "prior_context";
+}): void {
+  void opts.auditLog.append(
+    "l2",
+    PII_REWRITE_AUDIT_OPS.PII_REWRITTEN,
+    opts.identityId,
+    {
+      fortress_id: opts.fortressId,
+      redaction_counts: opts.redactionCounts,
+      llm_assist_ran: opts.llmAssistRan,
+      llm_residual_count: opts.llmResidualCount,
+      consented_to_trade_off: opts.consentedToTradeOff,
+      preserved_classes: [...(opts.preservedClasses ?? [])],
+      leg: opts.leg ?? "query",
+    },
+  );
+}
 
 /** Surface name fixed at the type level for LLM-assist invocations. */
 export const PII_REWRITE_LLM_SURFACE: Surface = "privacy-filter-tier-2";
@@ -122,50 +195,44 @@ export const PII_REWRITE_LLM_SURFACE: Surface = "privacy-filter-tier-2";
  * in the CLI, the dashboard, or a downstream consumer. Length-capped
  * because dashboards have small footers.
  *
- * Honesty (never-overclaim rule): this copy MUST NOT assert an active
- * protection the live path does not yet perform. The PII rewriter is
- * not wired into the production substrate-selector path (the deferred
- * Rho-2.5 boot-wiring), so live queries are NOT scrubbed before they
- * reach the substrate in this build. The explainer therefore leads
- * with a not-yet-active notice and describes the protection in the
- * future tense until the live wiring lands. See `feature-health.ts`
- * (the `privacy_strips` row reads amber/unconfirmed for the same
- * reason) and the DEBT note in `pii-rewrite-routes.ts`.
+ * Honesty (never-overclaim rule): this copy describes what happens
+ * WHEN the operator turns Tier B on and consents. The redactor is now
+ * installed on the production substrate-selector path (Rho-2.5), but it
+ * is opt-in: it scrubs only when this fortress has enabled Tier B AND
+ * recorded consent. Off-by-default; when off, queries are not scrubbed
+ * by Tier B (the always-on step is the separate Tier A header strip).
+ * The copy therefore frames the protection conditionally on the toggle,
+ * never as unconditionally-on, and never claims protection a toggled-off
+ * fortress does not receive. See `feature-health.ts` (the
+ * `privacy_strips` row greens only once an actual rewrite op fires).
  */
 export const PII_TRADE_OFF_EXPLAINER = [
-  "Tier B PII rewrite is designed to scrub personal information from",
-  "your queries before they reach the LLM substrate (Claude, GPT,",
-  "local model).",
+  "Tier B PII rewrite scrubs personal information from your queries",
+  "before they reach the LLM substrate (Claude, GPT, local model).",
   "",
-  "Note: automatic scrubbing of live queries is not yet active in",
-  "this build. Turning Tier B on records your preference and consent,",
-  "but it does NOT rewrite queries before they reach the substrate",
-  "yet. The preview below shows what WILL be removed once live",
-  "scrubbing ships; until then, treat this as off for protection",
-  "purposes. The always-on privacy step that DOES fire on every call",
-  "is the separate Tier A header strip.",
+  "This is OFF by default and opt-in. While it is off, Tier B does NOT",
+  "rewrite your queries; the always-on privacy step that fires on every",
+  "call is the separate Tier A header strip. The preview below shows",
+  "what gets removed when Tier B is on.",
   "",
-  "What it will protect (once active):",
+  "What it protects (when on):",
   "  - Emails, phone numbers, SSNs, IPs, credit cards, street",
-  "    addresses, and obvious name patterns will be replaced with",
+  "    addresses, and obvious name patterns are replaced with",
   "    placeholders before the call.",
-  "  - The substrate will receive only the rewritten text, so your",
-  "    original text will not cross the outbound boundary once live",
-  "    scrubbing is wired in.",
+  "  - The substrate receives only the rewritten text, so your",
+  "    original values do not cross the outbound boundary on calls",
+  "    routed through the filtered substrate.",
   "",
-  "What it costs (once active):",
+  "What it costs (when on):",
   "  - Substrates work less well when they cannot see the real",
   "    values. A query like 'email Alex about the rent' becomes",
   "    'email [NAME_0] about the rent', and the response loses",
   "    specificity. Some tasks (drafting personalized messages,",
   "    looking up specific addresses) become harder.",
-  "  - Smart mode (Rho-3) will re-introduce the originals at render",
-  "    time so YOU see them but the substrate never did. That mode",
-  "    ships in iteration-14; until then, the placeholder shows",
-  "    through.",
+  "  - Smart mode (Rho-3) re-introduces the originals at render time",
+  "    so YOU see them but the substrate never did.",
   "",
-  "This is OFF by default. You can record consent and your preference",
-  "now; live scrubbing engages once the boot-wiring follow-up lands.",
+  "Turning Tier B on requires recording your consent to this trade-off.",
   "You can turn it off again at any time.",
 ].join("\n");
 

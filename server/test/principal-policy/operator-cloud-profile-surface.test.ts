@@ -5,10 +5,7 @@ import { DashboardApprovalChannel } from "../../src/principal-policy/dashboard.j
 import { AuditLog } from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { SovereigntyProfileStore } from "../../src/sovereignty-profile.js";
-
-function pickPort(): number {
-  return 23000 + Math.floor(Math.random() * 20000);
-}
+import { getFreePort } from "../helpers/free-port.js";
 
 describe("dashboard sovereignty profile operator-cloud posture surface", () => {
   let dashboard: DashboardApprovalChannel | null = null;
@@ -25,7 +22,7 @@ describe("dashboard sovereignty profile operator-cloud posture surface", () => {
     const profileStore = new SovereigntyProfileStore(storage, masterKey);
     await profileStore.load();
     const authToken = "profile-posture-test";
-    const port = pickPort();
+    const port = await getFreePort();
     dashboard = new DashboardApprovalChannel({
       port,
       host: "127.0.0.1",

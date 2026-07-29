@@ -41,7 +41,14 @@ final class ManifestDerivedDigestFixtureTests: XCTestCase {
         XCTAssertNil(typedJSON.value(at: "derived"))
     }
 
-    func testUnknownDeliveredRuleFieldsAreDigestInput() throws {
+    func testUnknownDeliveredRuleFieldIsInDigestButRejectedBySchemaChokepoint() throws {
+        // The unknown field IS part of the signed digest (the digest-boundary
+        // property is preserved: `verifyRuleDigests` hashes the full raw bytes).
+        // But S5-0 round-3 (2026-07-14): the schema chokepoint now REJECTS an
+        // unknown rule key for TS/Rust `deny_unknown_fields` parity -- a v1 rule
+        // with an unknown field is a non-conforming producer or tampering, and
+        // an unknown-only scope/match axis is a widening vector. So the WHOLE
+        // snapshot is rejected (fail closed) rather than accepted-and-ignored.
         let ruleJSON = """
         {
           "id": "rule-with-future-field",
@@ -85,11 +92,15 @@ final class ManifestDerivedDigestFixtureTests: XCTestCase {
             receivedRules: [rawRule]
         )
 
-        XCTAssertNoThrow(try SignedManifestVerifier.verifiedSnapshot(
+        XCTAssertThrowsError(try SignedManifestVerifier.verifiedSnapshot(
             from: body,
             pinnedPublicKey: privateKey.publicKey.rawRepresentation,
             now: Date(timeIntervalSince1970: 0)
-        ))
+        )) { error in
+            guard case SignedManifestVerificationError.invalidRuleSchema = error else {
+                return XCTFail("expected .invalidRuleSchema for the unknown rule field, got \(error)")
+            }
+        }
     }
 
     private func loadCapturedManifest() throws -> MessageEnvelope {

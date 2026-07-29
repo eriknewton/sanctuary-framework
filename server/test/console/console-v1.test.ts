@@ -11,6 +11,7 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from "node:http";
+import type { AddressInfo } from "node:net";
 import { randomBytes } from "node:crypto";
 
 // ── Imports from console module ──────────────────────────────────────
@@ -48,6 +49,7 @@ import {
 } from "../../src/console/errors.js";
 
 import { enforceAuth, isLoopback, type AuthConfig } from "../../src/console/auth-middleware.js";
+import { handleConsoleRoute, type ConsoleRouterDeps } from "../../src/console/api-router.js";
 import { SignedEventStream } from "../../src/console/signed-event-stream.js";
 import { auditNoExternalFetches, resolvePublicDir } from "../../src/console/serve-static.js";
 
@@ -889,6 +891,189 @@ describe("Console metadata", () => {
   it("API_ROUTES values all start with /api/console/", () => {
     for (const route of Object.values(API_ROUTES)) {
       expect(route).toMatch(/^\/api\/console\//);
+    }
+  });
+});
+
+// =====================================================================
+// Default-deny on non-GET mutation (latent-surface hardening)
+// =====================================================================
+
+describe("console router - default-deny on non-GET mutation", () => {
+  // `handleConsoleRoute` used a FLAT `authMiddleware(authConfig)` for all
+  // methods, so LOOPBACK auto-auth would have released its POST mutations
+  // (fortress transition, agent retry-reset, policy compile, chat send)
+  // without the operator bearer. The console binding is not wired in any
+  // production boot today (the dispatcher answers 503), so this is a
+  // latent-surface hardening: the auth gate runs FIRST and returns 401 before
+  // any service call, so a stub service is sufficient to exercise it. With
+  // loopback auto-auth ON, the GET badge read still works, but the POST
+  // mutations now require the operator bearer.
+  const CONSOLE_AUTH_TOKEN = "console-default-deny-token";
+
+  async function makeServer(): Promise<{
+    base: string;
+    close: () => Promise<void>;
+  }> {
+    // The auth 401 short-circuits before any `deps.service` access, so a stub
+    // service is never touched on the rejected paths. The accepted GET badge
+    // path returns a badge object from the stub.
+    const stubService = {
+      // Only the GET badge path reaches the service (after auth passes); the
+      // rejected POST paths 401 before any service call.
+      getHeader: async () => ({ badge: { ok: true } }),
+    } as unknown as ConsoleRouterDeps["service"];
+    const deps: ConsoleRouterDeps = {
+      authConfig: {
+        loopbackAutoAuth: true,
+        authToken: CONSOLE_AUTH_TOKEN,
+      },
+      service: stubService,
+    };
+    const server: Server = createServer(
+      async (req: IncomingMessage, res: ServerResponse) => {
+        const handled = await handleConsoleRoute(deps, req, res);
+        if (!handled) res.writeHead(404).end();
+      },
+    );
+    await new Promise<void>((resolve) =>
+      server.listen(0, "127.0.0.1", resolve),
+    );
+    const addr = server.address() as AddressInfo;
+    return {
+      base: `http://127.0.0.1:${addr.port}`,
+      close: () =>
+        new Promise<void>((resolve) => server.close(() => resolve())),
+    };
+  }
+
+  it("POST fortress/transition on loopback with NO bearer is REJECTED (401) - default-deny mutation", async () => {
+    const { base, close } = await makeServer();
+    try {
+      const res = await fetch(`${base}${API_ROUTES.FORTRESS_TRANSITION}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      // Was the loopback-auto-auth shortcut under the flat gate; now 401.
+      expect(res.status).toBe(401);
+    } finally {
+      await close();
+    }
+  });
+
+  it("POST chat/send on loopback with NO bearer is REJECTED (401) - default-deny mutation", async () => {
+    const { base, close } = await makeServer();
+    try {
+      const res = await fetch(`${base}${API_ROUTES.CHAT_SEND}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      expect(res.status).toBe(401);
+    } finally {
+      await close();
+    }
+  });
+
+  it("POST policy/compile on loopback with NO bearer is REJECTED (401) - default-deny mutation", async () => {
+    const { base, close } = await makeServer();
+    try {
+      const res = await fetch(`${base}${API_ROUTES.POLICY_COMPILE}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      expect(res.status).toBe(401);
+    } finally {
+      await close();
+    }
+  });
+
+  it("POST agents/retry-reset on loopback with NO bearer is REJECTED (401) - default-deny mutation", async () => {
+    const { base, close } = await makeServer();
+    try {
+      const res = await fetch(`${base}${API_ROUTES.AGENT_RETRY_RESET}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      expect(res.status).toBe(401);
+    } finally {
+      await close();
+    }
+  });
+
+  it("GET header/badge on loopback with NO bearer still works (read unaffected by default-deny)", async () => {
+    const { base, close } = await makeServer();
+    try {
+      const res = await fetch(`${base}${API_ROUTES.HEADER_BADGE}`);
+      // Loopback auto-auth permits the GET read; it reaches the stub handler.
+      expect(res.status).not.toBe(401);
+    } finally {
+      await close();
+    }
+  });
+});
+
+// =====================================================================
+// Unexpected-error responses never leak internal detail (info-exposure)
+// =====================================================================
+
+describe("console router - 500 responses do not leak internal error detail", () => {
+  // A non-ConsoleError thrown from a route handler must NOT have its message
+  // (which can carry filesystem paths, stack text, or upstream internals)
+  // returned to the client. The response is a generic { ok:false,
+  // error:"internal" } with no `detail`. Regression guard for the
+  // js/stack-trace-exposure finding in api-router.ts handleError().
+  const SECRET_MARKER = "/Users/secret/.sanctuary/private-internal-path";
+
+  async function makeThrowingServer(): Promise<{
+    base: string;
+    close: () => Promise<void>;
+  }> {
+    // GET header/badge passes loopback auto-auth and reaches the service; a
+    // plain Error here exercises handleError()'s non-ConsoleError branch.
+    const stubService = {
+      getHeader: async () => {
+        throw new Error(`boom ${SECRET_MARKER}`);
+      },
+    } as unknown as ConsoleRouterDeps["service"];
+    const deps: ConsoleRouterDeps = {
+      authConfig: { loopbackAutoAuth: true, authToken: "irrelevant" },
+      service: stubService,
+    };
+    const server: Server = createServer(
+      async (req: IncomingMessage, res: ServerResponse) => {
+        const handled = await handleConsoleRoute(deps, req, res);
+        if (!handled) res.writeHead(404).end();
+      },
+    );
+    await new Promise<void>((resolve) =>
+      server.listen(0, "127.0.0.1", resolve),
+    );
+    const addr = server.address() as AddressInfo;
+    return {
+      base: `http://127.0.0.1:${addr.port}`,
+      close: () =>
+        new Promise<void>((resolve) => server.close(() => resolve())),
+    };
+  }
+
+  it("an unexpected handler error returns a generic 500 with no leaked detail", async () => {
+    const { base, close } = await makeThrowingServer();
+    try {
+      const res = await fetch(`${base}${API_ROUTES.HEADER_BADGE}`);
+      expect(res.status).toBe(500);
+      const raw = await res.text();
+      // The internal error text (and the secret path inside it) must not appear.
+      expect(raw).not.toContain(SECRET_MARKER);
+      expect(raw).not.toContain("boom");
+      const body = JSON.parse(raw);
+      expect(body).toEqual({ ok: false, error: "internal" });
+      expect(body.detail).toBeUndefined();
+    } finally {
+      await close();
     }
   });
 });

@@ -22,6 +22,14 @@
  *                           operator types the fortress name and the literal
  *                           word DESTROY before the wipe runs.
  *
+ * Deliberately ABSENT fourth path (ratified posture 2026-07-22,
+ * docs/custody-recovery-posture.md): "unlock with the OS-keyring custody key
+ * and enroll a new passphrase." The keyring key is released to any process in
+ * the logged-in session, so that path would let anyone at an unlocked machine
+ * take over custody without holding a human credential. Machine-resident
+ * factors never bootstrap human-held custody; do not add that mode without
+ * superseding the posture doc.
+ *
  * Refuse-if-unlocked guard: if `<storage>/runtime.json` exists, refuse with a
  * clear hint to stop the dashboard and any wrapped agents first. Operators on
  * a stale runtime file can remove it manually after confirming nothing is

@@ -9,14 +9,18 @@
  * can inspect what their agent has done.
  */
 
-import { mkdir, open, readFile, rm } from "node:fs/promises";
-import { join } from "node:path";
+import { mkdir, open, readFile, readdir, rm, link, stat, unlink } from "node:fs/promises";
+import { readFileSync, type Stats } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
+import { dirname, join } from "node:path";
 import { uptime as osUptime } from "node:os";
 import { AsyncLocalStorage } from "node:async_hooks";
 import type {
   FilesystemStorageCapabilities,
   StorageBackend,
 } from "../storage/interface.js";
+import { writeFileCustody } from "../storage/custody-fs.js";
 import { encrypt, decrypt, type EncryptedPayload } from "../core/encryption.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
 import { hmacSha256 } from "../core/hashing.js";
@@ -25,12 +29,17 @@ import {
   AUDIT_CHAIN_GENESIS,
   AUDIT_CHAIN_SCHEMA_VERSION,
   AUDIT_CHECKPOINT_SCHEMA_VERSION,
+  AUDIT_EPOCH_KEYS_KEY,
+  AUDIT_HEAD_ANCHOR_KEY,
+  AUDIT_ROTATION_ANCHOR_MARKER,
+  isAuditRotationAnchorEnvelope,
   type AuditCheckpointRecord,
   type AuditCheckpointSignature,
   type AuditCheckpointSigningPayload,
   canonicalJson,
   computeAuditEntryHash,
   computeAuditRoot,
+  isAuditCheckpointRecord,
   sha256Hex,
   verifyCheckpointSignature,
 } from "../audit/chain.js";
@@ -44,6 +53,39 @@ export interface AuditEntry {
   result: "success" | "failure";
   details?: Record<string, unknown>;
   contributors?: PluginContribution[];
+}
+
+/** One chained, decrypted, verified entry handed to a streaming consumer. */
+export interface VerifiedChainItem {
+  sequence: number;
+  entry_hash: string;
+  entry: AuditEntry;
+}
+
+/**
+ * Streaming consumer of the verified hash chain (the daemon-OOM-on-a-large-log
+ * bound). The full decrypted chain is NEVER simultaneously resident: each
+ * chained entry is decrypted + hash-checked, handed to `onEntry`, and then
+ * released. The contiguous chain walk + anchor/checkpoint verification complete
+ * AFTER the stream, before `streamVerifiedChain` resolves; in strict mode it
+ * throws on any failure, so a consumer that commits its fold only after the
+ * await returns clean never commits over an unverified chain (see
+ * {@link AuditLog.streamVerifiedChain}). Consumers fold their result
+ * incrementally (Merkle leaves, per-rule counters, workload replay) instead of
+ * materializing the whole `AuditEntry[]`.
+ *
+ * `reset` is the read-consistency contract: the verified pass runs under a
+ * torn-read retry loop, so a pass that observed a transient mid-mutation state
+ * is discarded and re-run. `reset()` fires before such a re-run so the consumer
+ * drops everything it accumulated from the abandoned pass and starts clean; the
+ * entries delivered between the LAST `reset()` (or the start) and a clean return
+ * are exactly the entries of the single accepted verified pass. A consumer that
+ * does not implement `reset` MUST be commutative-and-idempotent over re-delivery
+ * (none of the three production consumers are, so they all implement it).
+ */
+export interface VerifiedChainConsumer {
+  onEntry: (item: VerifiedChainItem) => void;
+  reset?: () => void;
 }
 
 export type AuditEntryInput = Omit<AuditEntry, "timestamp"> & {
@@ -76,7 +118,25 @@ export type AuditIntegrityFindingKind =
   | "checkpoint_malformed"
   | "checkpoint_root_mismatch"
   | "checkpoint_signature_mismatch"
-  | "checkpoint_signature_unverifiable";
+  | "checkpoint_signature_unverifiable"
+  // F2 Option A (writer-split) boundary findings. See the module doc comment
+  // near AUDIT_SPLIT_BOUNDARY_DIRNAME.
+  //  - split_boundary_invalid: a boundary record is PRESENT but fails MAC
+  //    authentication (tampered/forged/wrong-key). Fail closed: the load does
+  //    NOT filter the sealed region and does NOT let a truncated suffix be
+  //    TOFU-blessed as a rotation cut.
+  //  - split_boundary_missing: no boundary record, but a durable migration
+  //    marker (a `_audit-daemon*` namespace) proves the split migration ran.
+  //    An absent boundary in that state is a deletion, not a never-migrated
+  //    fortress, so it is a finding (fail closed), not a silent full walk.
+  //  - sealed_prefix_incomplete: with a VALID boundary, the sealed legacy
+  //    region's V2 entry files (seq <= sealed_tip) are not a gap-free run
+  //    ending exactly at sealed_tip. Detected from the directory LISTING
+  //    (no decrypt), so it catches deletion of sealed entries even when their
+  //    contents are unreadable at operator privilege (the F2 cross-uid case).
+  | "split_boundary_invalid"
+  | "split_boundary_missing"
+  | "sealed_prefix_incomplete";
 
 export interface AuditIntegrityFinding {
   kind: AuditIntegrityFindingKind;
@@ -92,8 +152,39 @@ export interface AuditLogConfig {
   maxTotalSizeBytes?: number;
   /** Maximum number of stored audit entry files to retain. Default: 100_000. */
   maxEntries?: number;
+  /**
+   * Upper bound on the number of decrypted entries the instance holds in memory
+   * (the recent-entry window in `this.entries` / `this.chainEntries`). This is
+   * DECOUPLED from `maxEntries` (the on-disk retention cap): the persisted log
+   * and every full re-read stay complete regardless of this value, which only
+   * bounds RAM growth on a long-running process. Defaults to `maxEntries` (never
+   * below {@link MIN_IN_MEMORY_ENTRY_FLOOR}) so behavior is unchanged unless set.
+   * Exposed primarily so the daemon can cap steady-state RAM below the (large)
+   * disk cap, and so tests can drive the in-memory trim independently of on-disk
+   * rotation.
+   */
+  maxInMemoryEntries?: number;
   /** Verify chain failures by throwing (strict) or surfacing findings (lenient). */
   integrityMode?: "strict" | "lenient";
+  /**
+   * F2 Option A (fortress audit store split by writer): whether this
+   * instance's load path should consult the on-disk "split boundary" record
+   * (see the module doc comment near {@link AUDIT_SPLIT_BOUNDARY_DIRNAME})
+   * written by {@link migrateFortressAuditStoreSplit} et al.
+   *
+   * Defaults to `true` so every EXISTING call site gets the fix for free:
+   * on a fortress that never had a boundary written (the overwhelming
+   * majority, meaning anything that never ran a root Castle Wall daemon),
+   * the check is a single cheap file read that comes back "absent" and
+   * changes NOTHING about today's behavior.
+   *
+   * Set to `false` for an `AuditLog` instance that is itself the boundary's
+   * *target* namespace re-mapped onto a DIFFERENT physical store (the
+   * daemon's own `_audit-daemon` chain via `createDaemonAuditLog`): that
+   * instance's local sequence numbers start fresh at 1 and must never be
+   * compared against the legacy `_audit` chain's sealed tip sequence.
+   */
+  consultSplitBoundary?: boolean;
   /** Write a checkpoint after this many critical appends. Default: 100. */
   checkpointInterval?: number;
   /** Optional typed identity signing bridge for checkpoint records. */
@@ -113,6 +204,17 @@ export interface AuditLogConfig {
    * gated by this interval; this is only the residual same-length+mtime backstop.
    */
   eagerReverifyIntervalMs?: number;
+  /**
+   * Age bound (ms) past which an id-less (0-byte) stale audit-write lock, and an
+   * orphaned `.acquire.*.tmp` acquire-temp, are considered crash litter and
+   * swept. Defaults to {@link AUDIT_WRITE_LOCK_IDLESS_STALE_MS} (10 min); also
+   * overridable via the `AUDIT_WRITE_LOCK_IDLESS_STALE_MS` env var. Exposed so
+   * tests can drive the 0-byte-age and orphan-temp-GC branches deterministically
+   * on a freshly-booted host (where a real 10-minute mtime cannot be assumed to
+   * post-date boot). Never breaks a content-bearing lock; only the id-less
+   * fallback and the acquire-temp sweep consult it.
+   */
+  idlessStaleLockMs?: number;
 }
 
 export interface AuditIntegrityAnomalyEvent {
@@ -130,6 +232,20 @@ export type AuditIntegrityAnomalySubscriber = (
 const DEFAULT_MAX_TOTAL_SIZE_BYTES = 100 * 1024 * 1024; // 100 MB
 const DEFAULT_MAX_ENTRIES = 100_000;
 const DEFAULT_CHECKPOINT_INTERVAL = 100;
+// In-memory retention bound for the decrypted recent-entry window the instance
+// holds in `this.entries` / `this.chainEntries`. On-disk rotation prunes the
+// PERSISTED log (authoritative), but the in-memory arrays were never trimmed:
+// every `append()` pushed one more decrypted entry forever, so a long-running
+// daemon's heap grew without bound (the full-mode `castle-wall daemon` OOM,
+// ~4GB after a few minutes of heartbeat appends). These arrays only ever serve
+// recent-entry reads (`query` returns `slice(-limit)`, default 50) and the
+// chained-tail view (which re-reads the full chain from disk first), so there is
+// no correctness need to hold more than the recent window in RAM. We cap the
+// in-memory window at the on-disk entry cap (so any log within its disk budget
+// is byte-for-byte unchanged) but never below a small floor (so a tiny
+// `maxEntries` test/config still keeps a usable recent window in memory while
+// still bounding growth). The disk remains the source of truth for full reads.
+const MIN_IN_MEMORY_ENTRY_FLOOR = 256;
 const AUDIT_NAMESPACE = "_audit";
 const AUDIT_CHECKPOINT_NAMESPACE = "_audit_checkpoints";
 // F3: reserved storage key for the single MAC-authenticated rotation checkpoint.
@@ -137,11 +253,41 @@ const AUDIT_CHECKPOINT_NAMESPACE = "_audit_checkpoints";
 // fixed key that does NOT match the `audit-checkpoint-`/`legacy-anchor-` prefixes
 // the checkpoint readers list on, so it never collides with those scans.
 const AUDIT_ROTATION_ANCHOR_KEY = "__rotation_anchor";
-const AUDIT_HEAD_ANCHOR_KEY = "__head_anchor";
+// AUDIT_HEAD_ANCHOR_KEY ("__head_anchor") is imported from the pure shared
+// `audit/checkpoint-shape.ts` (G1/G5) so this runtime and the raw CLI
+// exporter's control-key allowlist cannot drift.
 const AUDIT_HEAD_ANCHOR_ESTABLISHED_KEY = "audit-head-anchor-established-v1";
-// Distinctive envelope marker so a MAC'd rotation anchor is unambiguously
-// distinguished from a bare/marker-stripped record (mirrors F1's state-meta MAC).
-const AUDIT_ROTATION_ANCHOR_MARKER = "__sanctuary_audit_rotation_anchor_v1";
+// F2 Option A (Finding 1, adversarial gate 2026-07-15): an OPERATOR-provenance
+// marker that records "the operator has written at least one POST-SPLIT suffix
+// head anchor (an entry above the sealed tip)". It is a NEW key that no pre-#929
+// daemon ever wrote, and the post-#929 daemon's `_meta` is remapped to
+// `_audit-daemon_meta`, so its presence is UNSPOOFABLY operator-established. It
+// discriminates the two states that otherwise look identical from surviving
+// disk (chain == sealed region only + an unreadable `__head_anchor`): a genuine
+// just-migrated armed box (marker ABSENT, benign, suppress) versus a fortress
+// whose post-split suffix was ERASED and whose anchor was made unreadable to
+// launder it (marker PRESENT, tamper, fail closed). Without it, the unreadable
+// legacy-anchor suppression could hide a full-suffix truncation.
+//
+// RESIDUAL (documented, irreducible at the filesystem-durability tier): a
+// directory-write attacker who ALSO deletes this operator-owned marker returns
+// `read` -> null -> "not established" -> suppression, re-opening the full-suffix
+// laundering. This is (a) strictly narrower than the pre-fix single-chmod heal
+// (the marker raises the attack from "hide the anchor" to "hide the anchor AND
+// erase the whole suffix AND delete this marker"), and (b) the SAME co-deletable-
+// witness class the module already accepts for the whole-log case
+// (`AUDIT_HEAD_ANCHOR_ESTABLISHED_KEY` + `isEstablishedAuditStore`: delete every
+// entry + that marker + all checkpoints and a truncation-to-empty likewise reads
+// as a legitimate first boot). No non-co-deletable on-disk witness of a suffix
+// can exist once the entries, checkpoints, anchor, and marker all live in the
+// operator-writable store; closing it requires boot-anchored / externally-
+// attested state (Secure Enclave / TPM / remote attestation), which is a
+// separate build and out of scope for the mint unblock.
+const AUDIT_POST_SPLIT_SUFFIX_ESTABLISHED_KEY =
+  "audit-post-split-suffix-established-v1";
+// AUDIT_ROTATION_ANCHOR_MARKER ("__sanctuary_audit_rotation_anchor_v1") is
+// imported from the pure shared `audit/checkpoint-shape.ts` (re-gate round 3)
+// so this runtime's anchor shape and the raw CLI exporter's cannot drift.
 const AUDIT_HEAD_ANCHOR_MARKER = "__sanctuary_audit_head_anchor_v1";
 // Domain-separated MAC over the rotation-anchor record. The anchor records the
 // authenticated lowest-surviving sequence + its prev_hash after a prune, so a
@@ -150,6 +296,109 @@ const AUDIT_HEAD_ANCHOR_MARKER = "__sanctuary_audit_head_anchor_v1";
 // optional Ed25519 checkpoint signer, which may be null.
 const AUDIT_ROTATION_ANCHOR_MAC_DOMAIN = "sanctuary.audit-rotation-anchor.v1\n";
 const AUDIT_HEAD_ANCHOR_MAC_DOMAIN = "sanctuary.audit-head-anchor.v1\n";
+
+// ── F2 Option A: fortress audit store split by writer ──────────────────────
+//
+// On an armed box the root Castle Wall daemon and the operator CLI both wrote
+// into this SAME `_audit` store; the daemon's root-owned entries are
+// unreadable by the (non-root) operator uid, so `ensureLoaded()` threw
+// `AuditIntegrityError` on every armed box with any daemon history, and
+// file-grant mint (which requires a durable audit write) failed closed
+// (drill-verified 2026-07-14, finding F2). The fix is NOT to weaken this
+// check (that was the rejected Option C: it would blind the operator's own
+// integrity check to half of its own store); it is store separation: going
+// forward the daemon writes its own root-owned chain under `_audit-daemon`
+// (see operational/audit-store-split.ts) while the operator keeps writing
+// this `_audit` chain, completely untouched.
+//
+// The one remaining problem is HISTORY: an already-armed fortress has root
+// entries interleaved THROUGHOUT its existing single hash chain (the chain
+// links sequentially across every writer: `entry_hash` covers `prev_hash`,
+// so a daemon entry cannot be surgically extracted without invalidating
+// every operator entry's hash link on either side of it). The migration
+// therefore never touches a single existing byte of `_audit`: it freezes
+// the ENTIRE existing chain as a sealed legacy segment by writing a
+// MAC-authenticated "split boundary" record (a root-run migration can read
+// the whole legacy chain, since root bypasses ordinary file-permission
+// checks) that captures the chain's tip (sequence + entry_hash) at the
+// moment of the split. From then on, THIS instance's load path:
+//
+//   (a) never attempts to read/verify any `entry-*` key at or below the
+//       sealed tip sequence, since the key's sequence is parsed from its
+//       own unencrypted filename, so no permission-denied read is ever
+//       attempted for a legacy entry, and no `entry_unreadable` finding is
+//       ever raised for one; and
+//   (b) seeds the chain walk from (tip_sequence + 1, tip_entry_hash)
+//       instead of GENESIS, so the FIRST new post-split entry must
+//       cryptographically chain from the sealed tip.
+//
+// Nothing before the boundary is deleted, repaired, or rewritten: the full
+// legacy chain remains on disk. Honest scope of what re-verifies it (M-2,
+// adversarial gate 2026-07-14): the ROUTINE operator load does NOT re-walk the
+// sealed region's content: it pins the tip POSITION + HASH (via the MAC'd
+// boundary) and, from the directory LISTING only, checks the sealed V2 files
+// form a gap-free run ending at the tip (`checkSealedPrefixCompleteness`,
+// surfaced as a `sealed_prefix_incomplete` finding). The sealed entries'
+// CONTENT is re-verified only by the shipped crypto walk
+// `verifySealedLegacyPrefix` (operational/audit-store-split.ts), which
+// `audit-store-status` / `verifyFortressAuditFullPicture` run whenever the
+// caller can READ the sealed files (root, or an operator on a fortress whose
+// sealed entries predate root ownership). So: routine loads detect DELETION of
+// sealed files; a readable crypto re-walk additionally detects in-place CONTENT
+// tampering; an unreadable sealed region is reported honestly as unverified,
+// never as "verified". Only this instance's routine load stops re-walking the
+// content. On a fortress that never had a daemon write into `_audit` (the
+// overwhelming majority of installs, meaning anything that never armed Castle
+// Wall as root against this fortress), no boundary record is ever written, so
+// the whole mechanism is a silent no-op: the boundary file simply does not
+// exist, `loadSplitBoundary()` returns "absent", and behavior is byte-for-byte
+// identical to before this PR.
+//
+// The boundary record is intentionally NOT stored via the encrypted
+// StorageBackend contract (which, when the writer is root, always produces a
+// 0600 root-owned file): it holds no secret (two integers, a hex hash, and a
+// timestamp), it MUST be readable by the operator uid so the operator's own
+// load path can consult it, and its integrity comes entirely from the MAC
+// (keyed from the master key both root and the operator possess) rather than
+// from file-permission confidentiality. It lives as a plain file under its
+// own directory, matching `FilesystemStorageCapabilities.namespacePath`'s
+// documented exception for "callers' own files ... outside the normal
+// encrypted key/value contract."
+const AUDIT_SPLIT_BOUNDARY_DIRNAME = "_audit_migration";
+const AUDIT_SPLIT_BOUNDARY_FILENAME = "boundary-v1.json";
+const AUDIT_SPLIT_BOUNDARY_MARKER = "__sanctuary_audit_store_split_boundary_v1";
+const AUDIT_SPLIT_BOUNDARY_MAC_DOMAIN =
+  "sanctuary.audit-store-split-boundary.v1\n";
+// BLOCKER-2 (adversarial gate 2026-07-14): the durable "the writer-split
+// migration ran" markers, used to distinguish a DELETED boundary from a
+// never-migrated fortress. These literals MUST byte-match
+// `operational/audit-store-split.ts`'s `AUDIT_DAEMON_NAMESPACE` /
+// `AUDIT_DAEMON_CHECKPOINT_NAMESPACE` / `AUDIT_DAEMON_META_NAMESPACE`; they are
+// duplicated (not imported) because audit-store-split.ts imports FROM this
+// module, so importing back would create a dependency cycle. A structural test
+// (`audit-store-split-marker-namespaces-match`) asserts they stay in lockstep.
+const AUDIT_DAEMON_MIGRATION_MARKER_NAMESPACES = [
+  "_audit-daemon",
+  "_audit-daemon_checkpoints",
+  "_audit-daemon_meta",
+] as const;
+// BLOCKER-R2 (adversarial re-gate 2026-07-14): a durable, MAC-authenticated
+// "the writer-split migration ran" marker in `_meta`, deliberately NOT
+// co-deletable with the daemon namespace set. The prior boundary-loss
+// fail-closed depended ONLY on the `_audit-daemon*` namespaces; deleting those
+// alongside the boundary restored the pre-fix absent-boundary TOFU path. This
+// marker lives beside the fortress's own custody records in `_meta`, so an
+// attacker who strips every daemon namespace + the boundary still leaves it
+// behind, and an absent boundary with this marker present fails closed
+// (`split_boundary_missing` + TOFU suppressed). MAC'd (same derived key as the
+// boundary, distinct domain) so it cannot be forged; deletion is the residual
+// the F1/F3 "single deletable file" note already documents (closing it fully
+// needs boot-anchored/externally-attested storage, out of scope).
+const AUDIT_STORE_SPLIT_ESTABLISHED_META_KEY = "audit-store-split-established-v1";
+const AUDIT_STORE_SPLIT_ESTABLISHED_MARKER =
+  "__sanctuary_audit_store_split_established_v1";
+const AUDIT_STORE_SPLIT_ESTABLISHED_MAC_DOMAIN =
+  "sanctuary.audit-store-split-established.v1\n";
 
 // ── Master-rotation custody epochs (F7) ─────────────────────────────
 //
@@ -169,7 +418,11 @@ const AUDIT_HEAD_ANCHOR_MAC_DOMAIN = "sanctuary.audit-head-anchor.v1\n";
 // master AND the ciphertext can still read pre-rotation audit metadata
 // (operation names/results — never key material, per CLAUDE.md #6). That is
 // the price of keeping the chain externally verifiable across rotation.
-export const AUDIT_EPOCH_KEYS_KEY = "__custody_epoch_keys";
+// G1/G5 (post-#969 sweep re-gate): the key literal now lives in the pure
+// shared `audit/checkpoint-shape.ts` (one definition for this runtime AND the
+// raw CLI exporter's control-key allowlist); re-exported here so existing
+// importers (master rotation, tests) are unchanged.
+export { AUDIT_EPOCH_KEYS_KEY };
 const AUDIT_EPOCH_KEYS_MARKER = "__sanctuary_audit_epoch_keys_v1";
 const AUDIT_EPOCH_MAC_DOMAIN = "sanctuary.audit-epoch-keys.v1\n";
 const AUDIT_EPOCH_WRAP_PURPOSE = "audit-epoch-wrap";
@@ -502,6 +755,52 @@ const AUDIT_INTEGRITY_ALERT_KEY = "audit-integrity-alert.log";
 const AUDIT_WRITE_LOCK_FILE = ".audit-write.lock";
 const AUDIT_WRITE_LOCK_TIMEOUT_MS = 5_000;
 const AUDIT_WRITE_LOCK_RETRY_MS = 100;
+// Drill-found (Leg 5, MBA, 2026-07-15): a 0-byte / unparseable audit lock that
+// carries neither `pid` nor `acquired_at` cannot be proven stale by the two
+// content-based proofs in `breakStaleAuditLock`, so a torn acquire (crash
+// between file-create and stamp under the old open-then-write path) stranded a
+// permanently unbreakable lock. A lock with NO usable id content whose mtime
+// exceeds this generous age bound is provably not a live holder: a legitimate
+// holder ALWAYS writes its stamp before doing any work (and, since the
+// atomic-acquire fix below, the lock file never exists without its full stamp),
+// and no legitimate hold ever approaches this bound (holds are sub-second; the
+// contention timeout above is 5s). The bound only ever clears an id-less lock,
+// never a content-bearing one, so it cannot break a live lock a real holder
+// stamped. Ten minutes is far beyond any conceivable hold yet far below
+// "survived a reboot" (already covered by the boot-time proof).
+const AUDIT_WRITE_LOCK_IDLESS_STALE_MS = 10 * 60 * 1_000;
+// Slack (ms) absorbed when comparing a lock's monotonic `uptime_ms` stamp
+// against the current `os.uptime()`: the holder read its uptime a few syscalls
+// before the reader reads theirs, so a lock legitimately stamped "just now" can
+// carry an uptime a hair ABOVE the reader's current uptime purely from that
+// ordering. One second is far beyond that gap yet far below any interval that
+// could let a genuinely stale lock masquerade as same-boot-live.
+const AUDIT_LOCK_MONO_UPTIME_TOLERANCE_MS = 1_000;
+// Process-local monotonic counter for unique audit-lock temp-file names during
+// the atomic acquire (paired with pid + a wall-clock component). Never
+// persisted; collision-free within a process and across concurrent processes.
+let auditLockTempCounter = 0;
+// Suffix marking an audit-lock acquire-temp: `<lockfile>.acquire.<pid>.<n>.<hex>.tmp`.
+// A crash / kill -9 between `link()` and the `finally` unlink in
+// `atomicAcquireAuditLock` strands one of these; the startup sweep GCs any older
+// than the id-less stale bound (invisible to `list()`, litter only).
+const AUDIT_LOCK_ACQUIRE_TEMP_INFIX = ".acquire.";
+const AUDIT_LOCK_ACQUIRE_TEMP_SUFFIX = ".tmp";
+
+/** Parse the id-less-stale-lock / orphan-acquire-temp age bound from config /
+ * env, defaulting to {@link AUDIT_WRITE_LOCK_IDLESS_STALE_MS}. A positive finite
+ * override wins (config first, then env); anything else falls back to the
+ * default. Mirrors {@link resolveEagerReverifyIntervalMs}. */
+function resolveIdlessStaleLockMs(configured?: number): number {
+  if (typeof configured === "number" && Number.isFinite(configured) && configured >= 0) {
+    return configured;
+  }
+  const env = Number(process.env.AUDIT_WRITE_LOCK_IDLESS_STALE_MS);
+  if (Number.isFinite(env) && env >= 0 && process.env.AUDIT_WRITE_LOCK_IDLESS_STALE_MS) {
+    return env;
+  }
+  return AUDIT_WRITE_LOCK_IDLESS_STALE_MS;
+}
 // Read-consistency backstop. A reader does NOT take the write lock (audit reads
 // must work even if a crashed writer stranded a lock, and must never be blockable
 // by a planted lock file), so it can observe a torn cut while a rotation is
@@ -616,7 +915,14 @@ export class AuditPersistenceError extends Error {
 export class AuditLockContentionError extends Error {
   constructor(readonly lockPath: string) {
     super(
-      `audit write blocked: another writer held the lock for >5s; check for stuck processes; inspect with: lsof ${lockPath}`
+      `audit write blocked: the audit write lock at '${lockPath}' was held for >5s. ` +
+        `The lock file records the holder's pid and acquired_at; inspect it to see who ` +
+        `holds it. If a Sanctuary process is genuinely running, wait for it to finish. ` +
+        `If none is, the lock is a stale/torn leftover from a crashed writer: stop all ` +
+        `Sanctuary processes for this fortress, then delete the lock file at that path ` +
+        `and retry. (This lock is not held open by a file descriptor during the write, ` +
+        `so lsof may show no holder even for a legitimately held lock; trust the ` +
+        `recorded pid + a process check, not lsof.)`
     );
     this.name = "AuditLockContentionError";
   }
@@ -644,6 +950,24 @@ export class AuditIntegrityError extends Error {
   }
 }
 
+/**
+ * Internal marker wrapping an error thrown by a {@link VerifiedChainConsumer}'s
+ * `onEntry` during a streaming reload pass. The decrypt loop runs inside
+ * `loadPersistedEntries`' outer try (it iterates a live `storage.list`), so a
+ * raw consumer throw would otherwise be caught there and relabeled
+ * `storage_unavailable`. Tagging it lets the outer catch re-throw the consumer's
+ * ORIGINAL error verbatim: a consumer rejection (e.g. a malformed workload
+ * lifecycle payload) is neither a storage failure nor a decrypt failure and must
+ * surface as itself, never be absorbed into the integrity findings (#504). Never
+ * escapes the module: it is always unwrapped before it leaves `loadPersistedEntries`.
+ */
+class ConsumerRejectedEntryError extends Error {
+  constructor(readonly cause: unknown) {
+    super("audit-chain consumer rejected a decrypted entry");
+    this.name = "ConsumerRejectedEntryError";
+  }
+}
+
 const auditIntegrityContext = new AsyncLocalStorage<{
   allowIntegrityFindings: boolean;
 }>();
@@ -660,6 +984,616 @@ const auditIntegrityContext = new AsyncLocalStorage<{
  */
 const auditEagerReadContext = new AsyncLocalStorage<{ eager: boolean }>();
 
+// ── F2 Option A: split-boundary record (shared read/write logic) ───────────
+//
+// These are module-level (not `AuditLog` methods) because BOTH the class's
+// own load path (read-only, keyed from its own derived MAC key) and the
+// migration orchestration in `operational/audit-store-split.ts` (which
+// WRITES the record, from a different call site entirely) need the exact
+// same envelope shape and MAC computation. Keeping one definition avoids the
+// two ever drifting apart.
+
+/** The split-boundary record: where the operator's `_audit` chain was sealed
+ * and the daemon namespace new writes continue in. */
+export interface AuditStoreSplitBoundary {
+  /** Highest sequence number in the sealed legacy (pre-split) `_audit` chain.
+   * 0 if the chain was empty at migration time. */
+  sealed_tip_sequence: number;
+  /** BLOCKER-R1 (adversarial re-gate 2026-07-14): the LOWEST V2 `entry-*`
+   * sequence present in the sealed region at migration time (the pre-split
+   * rotation floor, or 1 if never rotated; 0 when the chain was empty). Recorded
+   * so a reader can detect deletion of the LOWEST sealed entry (the residual
+   * the first fix round documented but did not close). Without a known base, a
+   * deleted bottom entry leaves a still-contiguous-ending-at-tip run that reads
+   * as a legitimate rotation floor; with the base pinned, lowest-present must
+   * equal it. */
+  sealed_base_sequence: number;
+  /** `entry_hash` of the sequence-`sealed_tip_sequence` entry, or
+   * {@link AUDIT_CHAIN_GENESIS} if `sealed_tip_sequence` is 0. */
+  sealed_tip_entry_hash: string;
+  /** ISO timestamp the boundary was sealed. */
+  sealed_at: string;
+  /** The namespace the root daemon's own chain continues in
+   * (`operational/audit-store-split.ts`'s `AUDIT_DAEMON_NAMESPACE`). Recorded
+   * here so a future reader never has to hardcode it a second place. */
+  daemon_namespace: string;
+}
+
+export type AuditStoreSplitBoundaryLoadResult =
+  | { status: "valid"; boundary: AuditStoreSplitBoundary }
+  | { status: "absent" }
+  | { status: "invalid" };
+
+/** Absolute path to the split-boundary record, given the fortress's `state`
+ * directory (i.e. `dirname(namespacePath(AUDIT_NAMESPACE))`). */
+export function auditStoreSplitBoundaryPath(fortressStatePath: string): string {
+  return join(
+    fortressStatePath,
+    AUDIT_SPLIT_BOUNDARY_DIRNAME,
+    AUDIT_SPLIT_BOUNDARY_FILENAME
+  );
+}
+
+/** Derive the MAC key for the split-boundary record from the fortress master
+ * key. A dedicated purpose string, domain-separated from every other derived
+ * key in this file.
+ *
+ * F2 REKEY LANDMINE (adversarial gate M-1, 2026-07-14): this MAC key is derived
+ * from the ROTATING master (same as the audit head-anchor). The boundary record
+ * is NOT re-stamped by any master-rotation recipe today; instead rotation is
+ * REFUSED by name on any fortress that ran the writer-split migration (see the
+ * `_audit-daemon*` `unsupported` recipes in `core/master-rotation.ts`). If a
+ * future change adds a rotation recipe to RE-ENABLE rotation for those
+ * namespaces, it MUST also re-stamp this boundary record under the NEW master
+ * (re-derive this key + `writeAuditStoreSplitBoundary`) inside the same
+ * rotation. Otherwise the boundary reads `invalid` post-rotation, the operator
+ * load stops filtering the sealed region, and F2 regresses (re-throws on the
+ * unreadable root-owned entries on an armed box). Do not silently lift the
+ * rotation refusal without closing this. */
+export function deriveAuditStoreSplitBoundaryMacKey(
+  masterKey: Uint8Array
+): Uint8Array {
+  return derivePurposeKey(masterKey, "audit-store-split-boundary");
+}
+
+// LOW-1 (adversarial gate 2026-07-14): `sealed_at` is inside the MAC input, so
+// a file-writer without the master key cannot falsify WHEN the split happened
+// while preserving a valid MAC. Every authenticated field the record carries is
+// covered here; nothing about the boundary record is trusted display-only.
+function auditStoreSplitBoundaryMacBytes(
+  macKey: Uint8Array,
+  data: {
+    sealed_tip_sequence: number;
+    sealed_base_sequence: number;
+    sealed_tip_entry_hash: string;
+    daemon_namespace: string;
+    sealed_at: string;
+  }
+): Uint8Array {
+  return hmacSha256(
+    macKey,
+    stringToBytes(AUDIT_SPLIT_BOUNDARY_MAC_DOMAIN + canonicalJson(data))
+  );
+}
+
+/**
+ * Write the split-boundary record. Operator-readable by design (mode 0o644 /
+ * parent 0o755): see the module doc comment above for why that is safe. The
+ * record carries no secret, and its integrity comes from the MAC, not from
+ * file-permission confidentiality. Uses the same O_EXCL-temp + fsync +
+ * atomic-rename + fsync-dir discipline as every other durable write in this
+ * codebase (`writeFileCustody`), so a crash mid-write leaves either the OLD
+ * state (no boundary) or the fully-written NEW one, never a torn file.
+ *
+ * This is the COMMIT point of the store-split migration: callers must write
+ * everything else (the daemon chain's genesis marker entry) BEFORE calling
+ * this, so that a crash before this call is safely retryable (idempotent,
+ * see `migrateFortressAuditStoreSplit`) and a crash after it never leaves the
+ * daemon chain without its marker.
+ */
+export async function writeAuditStoreSplitBoundary(
+  fortressStatePath: string,
+  macKey: Uint8Array,
+  boundary: {
+    sealed_tip_sequence: number;
+    sealed_base_sequence: number;
+    sealed_tip_entry_hash: string;
+    daemon_namespace: string;
+    sealed_at?: string;
+  }
+): Promise<void> {
+  const sealedAt = boundary.sealed_at ?? new Date().toISOString();
+  // `data` holds the structural fields; `sealed_at` lives at the envelope top
+  // level (as it always has) but is folded into the MAC input below, so it is
+  // authenticated without being duplicated into the persisted `data`.
+  const data = {
+    sealed_tip_sequence: boundary.sealed_tip_sequence,
+    sealed_base_sequence: boundary.sealed_base_sequence,
+    sealed_tip_entry_hash: boundary.sealed_tip_entry_hash,
+    daemon_namespace: boundary.daemon_namespace,
+  };
+  const envelope = {
+    [AUDIT_SPLIT_BOUNDARY_MARKER]: true,
+    data,
+    sealed_at: sealedAt,
+    mac: toBase64url(
+      auditStoreSplitBoundaryMacBytes(macKey, { ...data, sealed_at: sealedAt })
+    ),
+  };
+  await writeFileCustody(
+    auditStoreSplitBoundaryPath(fortressStatePath),
+    JSON.stringify(envelope),
+    { mode: 0o644, parentMode: 0o755 }
+  );
+}
+
+/**
+ * Read + MAC-verify the split-boundary record.
+ *   - `valid`   : present, well-formed, MAC matches → authenticated boundary.
+ *   - `invalid` : present but malformed / MAC mismatch → tampered or forged;
+ *     the caller MUST fail closed (never silently treat as absent).
+ *   - `absent`  : no record, including "not readable at this privilege",
+ *     which degrades to "act as if no migration ran" (today's behavior).
+ *     This is safe as a NON-fatal default because the record is a pure
+ *     optimization for the class's own load path: an unreadable/absent
+ *     record simply means `ensureLoaded` walks the full legacy chain again,
+ *     exactly as it did before this PR (correct, if F2-affected). A caller
+ *     that needs to distinguish "genuinely never migrated" from "migrated
+ *     but I can't read the marker" for reporting purposes (the full-picture
+ *     verifier) does its own presence probe separately.
+ */
+export async function readAuditStoreSplitBoundary(
+  fortressStatePath: string,
+  macKey: Uint8Array
+): Promise<AuditStoreSplitBoundaryLoadResult> {
+  let raw: Buffer;
+  try {
+    raw = await readFile(auditStoreSplitBoundaryPath(fortressStatePath));
+  } catch {
+    return { status: "absent" };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw.toString("utf8"));
+  } catch {
+    return { status: "invalid" };
+  }
+  if (!isRecord(parsed) || parsed[AUDIT_SPLIT_BOUNDARY_MARKER] !== true) {
+    return { status: "absent" };
+  }
+  const data = parsed.data;
+  const mac = parsed.mac;
+  const sealedAt = parsed.sealed_at;
+  if (
+    !isRecord(data) ||
+    typeof mac !== "string" ||
+    typeof sealedAt !== "string" ||
+    typeof data.sealed_tip_sequence !== "number" ||
+    !Number.isSafeInteger(data.sealed_tip_sequence) ||
+    data.sealed_tip_sequence < 0 ||
+    typeof data.sealed_base_sequence !== "number" ||
+    !Number.isSafeInteger(data.sealed_base_sequence) ||
+    data.sealed_base_sequence < 0 ||
+    data.sealed_base_sequence > data.sealed_tip_sequence ||
+    // base is 0 iff the sealed chain was empty (tip 0); otherwise base >= 1.
+    (data.sealed_tip_sequence === 0
+      ? data.sealed_base_sequence !== 0
+      : data.sealed_base_sequence < 1) ||
+    typeof data.sealed_tip_entry_hash !== "string" ||
+    typeof data.daemon_namespace !== "string" ||
+    data.daemon_namespace.length === 0 ||
+    (data.sealed_tip_sequence === 0
+      ? data.sealed_tip_entry_hash !== AUDIT_CHAIN_GENESIS
+      : !/^[0-9a-f]{64}$/.test(data.sealed_tip_entry_hash))
+  ) {
+    return { status: "invalid" };
+  }
+  let providedMac: Uint8Array;
+  try {
+    providedMac = fromBase64url(mac);
+  } catch {
+    return { status: "invalid" };
+  }
+  const expected = auditStoreSplitBoundaryMacBytes(macKey, {
+    sealed_tip_sequence: data.sealed_tip_sequence,
+    sealed_base_sequence: data.sealed_base_sequence,
+    sealed_tip_entry_hash: data.sealed_tip_entry_hash,
+    daemon_namespace: data.daemon_namespace,
+    sealed_at: sealedAt,
+  });
+  if (!constantTimeEqual(providedMac, expected)) {
+    return { status: "invalid" };
+  }
+  return {
+    status: "valid",
+    boundary: {
+      sealed_tip_sequence: data.sealed_tip_sequence,
+      sealed_base_sequence: data.sealed_base_sequence,
+      sealed_tip_entry_hash: data.sealed_tip_entry_hash,
+      sealed_at: sealedAt,
+      daemon_namespace: data.daemon_namespace,
+    },
+  };
+}
+
+// BLOCKER-R2: MAC over the (data-less) established marker. Domain-separated
+// from the boundary MAC but reuses the same derived key. Authenticates "a
+// party with the master key wrote this marker", so a planted fake cannot force
+// a spurious split_boundary_missing DoS.
+function auditStoreSplitEstablishedMacBytes(macKey: Uint8Array): Uint8Array {
+  return hmacSha256(
+    macKey,
+    stringToBytes(AUDIT_STORE_SPLIT_ESTABLISHED_MAC_DOMAIN)
+  );
+}
+
+/**
+ * BLOCKER-R2 (adversarial re-gate 2026-07-14): write the durable
+ * migration-established marker to `_meta` (via the normal StorageBackend, so it
+ * lands beside the fortress's custody records, NOT co-deletable with the
+ * `_audit-daemon*` namespaces). Written by `migrateFortressAuditStoreSplit`
+ * BEFORE the boundary commit, so a crash mid-migration still leaves the marker
+ * (a retry is idempotent). Its presence + an absent boundary = boundary was
+ * deleted (fail closed), regardless of whether the daemon namespaces survive.
+ */
+export async function writeAuditStoreSplitEstablishedMarker(
+  storage: StorageBackend,
+  macKey: Uint8Array
+): Promise<void> {
+  const envelope = {
+    [AUDIT_STORE_SPLIT_ESTABLISHED_MARKER]: true,
+    mac: toBase64url(auditStoreSplitEstablishedMacBytes(macKey)),
+  };
+  await storage.write(
+    "_meta",
+    AUDIT_STORE_SPLIT_ESTABLISHED_META_KEY,
+    stringToBytes(JSON.stringify(envelope))
+  );
+}
+
+/**
+ * BLOCKER-R2 + HIGH-1 (round 3): read + MAC-verify the migration-established
+ * marker, TRI-STATE so a corrupted/unreadable marker is NOT laundered into
+ * "never migrated":
+ *   - `present`: authentic marker → the writer-split migration ran. An absent
+ *     boundary in this state is a deletion (fail closed).
+ *   - `invalid_or_unreadable`: the marker RECORD exists but does not
+ *     authenticate (bad JSON, missing/wrong marker key, missing/malformed/wrong
+ *     MAC) OR the read threw (EACCES/IO). This is evidence of a migration whose
+ *     witness was tampered/corrupted, so callers MUST treat it as migration
+ *     evidence and fail closed; the round-2 fix collapsed all of these to
+ *     "absent", which let an attacker CORRUPT the marker to re-open the TOFU
+ *     fail-open (HIGH-1).
+ *   - `absent`: NO record at all (`storage.read` returned null) → genuinely
+ *     never migrated (the common case). Absence never fabricates a migration.
+ */
+export async function readAuditStoreSplitEstablishedMarker(
+  storage: StorageBackend,
+  macKey: Uint8Array
+): Promise<"present" | "absent" | "invalid_or_unreadable"> {
+  let raw: Uint8Array | null;
+  try {
+    raw = await storage.read("_meta", AUDIT_STORE_SPLIT_ESTABLISHED_META_KEY);
+  } catch {
+    // A read error cannot prove absence; a present-but-unreadable marker is
+    // exactly the tamper case. Fail closed.
+    return "invalid_or_unreadable";
+  }
+  if (!raw) return "absent"; // no record: genuinely never migrated
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(bytesToString(raw));
+  } catch {
+    return "invalid_or_unreadable";
+  }
+  if (!isRecord(parsed) || parsed[AUDIT_STORE_SPLIT_ESTABLISHED_MARKER] !== true) {
+    return "invalid_or_unreadable";
+  }
+  const mac = parsed.mac;
+  if (typeof mac !== "string") return "invalid_or_unreadable";
+  let providedMac: Uint8Array;
+  try {
+    providedMac = fromBase64url(mac);
+  } catch {
+    return "invalid_or_unreadable";
+  }
+  return constantTimeEqual(providedMac, auditStoreSplitEstablishedMacBytes(macKey))
+    ? "present"
+    : "invalid_or_unreadable";
+}
+
+/** Parse the zero-padded sequence number embedded in a V2 `entry-*` storage
+ * key (`entry-${20-digit-sequence}-${epochMs}-${counter}`). Returns null for
+ * any key that does not match this shape (e.g. a pre-V2 legacy key), which
+ * callers must treat as "not filterable by sequence", never as sequence 0. */
+function parseEntryKeySequence(key: string): number | null {
+  const match = /^entry-(\d{20})-/.exec(key);
+  if (!match) return null;
+  const seq = Number(match[1]);
+  return Number.isSafeInteger(seq) ? seq : null;
+}
+
+/** Parse the zero-padded checkpoint sequence embedded in an `audit-checkpoint-`
+ * / `legacy-anchor-` storage key (`${kind}-${20-digit-sequence}`, built by
+ * `writeCheckpointRecord`). Returns null for any key that does not match, which
+ * callers treat as "not classifiable by sequence" (never sequence 0). Lets the
+ * operator decide a checkpoint sits in the sealed legacy region from the
+ * UNENCRYPTED key alone, without reading the (possibly root-owned, unreadable)
+ * file. */
+function parseCheckpointKeySequence(key: string): number | null {
+  const match = /-(\d{20})$/.exec(key);
+  if (!match) return null;
+  const seq = Number(match[1]);
+  return Number.isSafeInteger(seq) ? seq : null;
+}
+
+/** True iff a filesystem error is a privilege denial (EACCES/EPERM), i.e. "this
+ * process cannot open the file at its current privilege", as opposed to a
+ * corruption / IO / not-found condition. F2: on an armed box the legacy audit
+ * checkpoint/anchor files a pre-split ROOT daemon wrote are root-owned 0600, so
+ * the operator uid's read throws EACCES; that is the contamination case the
+ * split boundary re-routes, distinct from a genuine tamper/IO fault which must
+ * still fail closed. */
+function isPermissionError(err: unknown): boolean {
+  const code =
+    err instanceof Error && "code" in err
+      ? String((err as NodeJS.ErrnoException).code)
+      : "";
+  return code === "EACCES" || code === "EPERM";
+}
+
+// ── F2 sealed-region verifier (chokepoint core) ────────────────────────────
+//
+// BLOCKER-1 (adversarial re-gate round 3, 2026-07-14): the routine load SKIPS
+// the sealed legacy region by design, so `getIntegrityFindings()` never
+// reflects sealed CONTENT integrity. This crypto walk is the one place that
+// re-verifies the sealed region's content (reading envelope bytes, recomputing
+// entry hashes, chaining base->tip, matching the MAC'd tip hash; NO decrypt,
+// so it works whenever the caller can READ the files). It lives here (not in
+// audit-store-split.ts) so `AuditLog` can call it directly with its own stored
+// `splitBoundaryMacKey` + `storage`, WITHOUT the raw master key; which is what
+// makes the single `AuditLog.getAuditChainVerdict()` chokepoint reachable from
+// every clean-claiming surface (they all hold only an `AuditLog` handle).
+// `verifySealedLegacyPrefix(storage, masterKey)` in audit-store-split.ts is a
+// thin wrapper over this that derives the MAC key from the master.
+export type SealedRegionVerdict =
+  /** No VALID boundary present: nothing was sealed by a committed migration. */
+  | { status: "not_present" }
+  /** The migration sealed an empty chain (`sealed_tip_sequence === 0`). */
+  | { status: "empty" }
+  /** Every sealed V2 entry re-hashed, chained, and the tip matched the MAC'd
+   * `sealed_tip_entry_hash`. */
+  | { status: "verified"; entries_verified: number; sealed_tip_sequence: number }
+  /** At least one sealed entry could not be read at this privilege (the F2
+   * cross-uid case). Honest: NOT verified. Re-run as root. */
+  | { status: "unreadable"; note: string }
+  /** The sealed V2 entry files are not a gap-free run from the MAC'd base to the
+   * MAC'd tip (a sealed entry was deleted / disappeared). */
+  | { status: "incomplete"; expected_tip: number; highest_present: number }
+  /** A sealed entry's content was tampered: a recomputed entry hash, a chain
+   * link, or the tip hash did not match. */
+  | { status: "hash_mismatch"; sequence: number; expected: string; actual: string };
+
+interface SealedEnvelopeV2 {
+  sequence: number;
+  prev_hash: string;
+  entry_hash: string;
+  timestamp: string;
+  encrypted_payload_bytes: string;
+  schema_version: number;
+}
+
+function isSealedEnvelopeV2(value: unknown): value is SealedEnvelopeV2 {
+  if (!isRecord(value)) return false;
+  return (
+    value.schema_version === AUDIT_CHAIN_SCHEMA_VERSION &&
+    typeof value.sequence === "number" &&
+    Number.isSafeInteger(value.sequence) &&
+    value.sequence > 0 &&
+    typeof value.prev_hash === "string" &&
+    typeof value.entry_hash === "string" &&
+    /^[0-9a-f]{64}$/.test(value.entry_hash) &&
+    typeof value.timestamp === "string" &&
+    typeof value.encrypted_payload_bytes === "string"
+  );
+}
+
+/**
+ * The sealed-region crypto walk. `storage` needs only `list`/`read` on the
+ * `_audit` namespace; `statePath` is the fortress `state` dir (for the boundary
+ * file); `macKey` is the split-boundary MAC key (from the master key, or an
+ * `AuditLog`'s pre-derived `splitBoundaryMacKey`). Never decrypts.
+ *
+ * Deletion of the LOWEST sealed entry IS now caught (via the MAC'd
+ * `sealed_base_sequence`). Pre-V2 (null-sequence) sealed keys are not walked
+ * here; a chain mixing pre-V2 sealed entries gets `verified` over its V2 sealed
+ * region only.
+ */
+export async function verifySealedRegionAt(opts: {
+  storage: Pick<StorageBackend, "list" | "read">;
+  statePath: string;
+  macKey: Uint8Array;
+}): Promise<SealedRegionVerdict> {
+  const { storage, statePath, macKey } = opts;
+  const boundary = await readAuditStoreSplitBoundary(statePath, macKey);
+  if (boundary.status !== "valid") return { status: "not_present" };
+  const tip = boundary.boundary.sealed_tip_sequence;
+  const base = boundary.boundary.sealed_base_sequence;
+  if (tip <= 0) return { status: "empty" };
+
+  let metas;
+  try {
+    metas = await storage.list(AUDIT_NAMESPACE);
+  } catch {
+    return { status: "unreadable", note: "could not list the _audit namespace" };
+  }
+
+  const bySeq = new Map<number, SealedEnvelopeV2>();
+  for (const meta of metas) {
+    const seq = parseEntryKeySequence(meta.key);
+    if (seq === null || seq > tip) continue;
+    let raw: Uint8Array | null;
+    try {
+      raw = await storage.read(AUDIT_NAMESPACE, meta.key);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === "EACCES" || code === "EPERM") {
+        return {
+          status: "unreadable",
+          note: `sealed entry ${meta.key} is not readable at this privilege (re-run as root)`,
+        };
+      }
+      return {
+        status: "unreadable",
+        note: `sealed entry ${meta.key} could not be read: ${failureMessage(err)}`,
+      };
+    }
+    if (!raw) continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(bytesToString(raw));
+    } catch {
+      return { status: "hash_mismatch", sequence: seq, expected: "<valid V2 envelope>", actual: "<unparseable>" };
+    }
+    if (!isSealedEnvelopeV2(parsed)) {
+      return { status: "hash_mismatch", sequence: seq, expected: "<valid V2 envelope>", actual: "<malformed envelope>" };
+    }
+    bySeq.set(parsed.sequence, parsed);
+  }
+
+  const presentSeqs = [...bySeq.keys()].sort((a, b) => a - b);
+  const highest = presentSeqs.length > 0 ? presentSeqs[presentSeqs.length - 1]! : 0;
+  const lowest = presentSeqs.length > 0 ? presentSeqs[0]! : 0;
+  // Completeness: a gap-free run from the MAC'd base to the MAC'd tip. Checking
+  // `lowest === base` closes the lowest-entry-deletion residual.
+  if (presentSeqs.length === 0 || highest !== tip || (base > 0 && lowest !== base)) {
+    return { status: "incomplete", expected_tip: tip, highest_present: highest };
+  }
+  for (let i = 1; i < presentSeqs.length; i++) {
+    if (presentSeqs[i]! !== presentSeqs[i - 1]! + 1) {
+      return { status: "incomplete", expected_tip: tip, highest_present: highest };
+    }
+  }
+
+  // Crypto walk: recompute each entry hash, verify chain links among present
+  // entries, and match the tip to the MAC'd sealed_tip_entry_hash.
+  let prevHash: string | null = null;
+  for (const seq of presentSeqs) {
+    const env = bySeq.get(seq)!;
+    const recomputed = computeAuditEntryHash({
+      sequence: env.sequence,
+      prev_hash: env.prev_hash,
+      timestamp: env.timestamp,
+      encrypted_payload_bytes: env.encrypted_payload_bytes,
+      schema_version: env.schema_version,
+    });
+    if (recomputed !== env.entry_hash) {
+      return { status: "hash_mismatch", sequence: seq, expected: env.entry_hash, actual: recomputed };
+    }
+    if (prevHash !== null && env.prev_hash !== prevHash) {
+      return { status: "hash_mismatch", sequence: seq, expected: prevHash, actual: env.prev_hash };
+    }
+    prevHash = env.entry_hash;
+  }
+
+  const tipEnv = bySeq.get(tip)!;
+  if (tipEnv.entry_hash !== boundary.boundary.sealed_tip_entry_hash) {
+    return {
+      status: "hash_mismatch",
+      sequence: tip,
+      expected: boundary.boundary.sealed_tip_entry_hash,
+      actual: tipEnv.entry_hash,
+    };
+  }
+  return { status: "verified", entries_verified: presentSeqs.length, sealed_tip_sequence: tip };
+}
+
+/**
+ * BLOCKER-1 (round 3): the SINGLE audit-chain verdict every clean-claiming
+ * surface must consume. `verified` ONLY when routine suffix findings are empty
+ * AND the sealed region is `verified`/`empty`/`not_present`. `verified_suffix_only`
+ * when the suffix is clean but the sealed region is `unreadable` (e.g. an armed
+ * box's operator uid). `findings` for any routine finding OR a sealed
+ * `hash_mismatch`/`incomplete`. `key_unavailable` is for callers that have no
+ * verifier at all (never produced by `AuditLog.getAuditChainVerdict`, which
+ * always has its keys).
+ */
+export type AuditChainVerdictStatus =
+  | "verified"
+  | "verified_suffix_only"
+  | "findings"
+  | "key_unavailable";
+
+export interface AuditChainVerdict {
+  status: AuditChainVerdictStatus;
+  routine_finding_count: number;
+  sealed_region: SealedRegionVerdict;
+}
+
+/** Fold a routine-finding count + a sealed-region verdict into the single
+ * clean-claim verdict. Shared so the derivation lives in exactly one place. */
+export function foldAuditChainVerdict(
+  routineFindingCount: number,
+  sealed: SealedRegionVerdict
+): AuditChainVerdict {
+  const sealedIsProblem =
+    sealed.status === "hash_mismatch" || sealed.status === "incomplete";
+  let status: AuditChainVerdictStatus;
+  if (routineFindingCount > 0 || sealedIsProblem) {
+    status = "findings";
+  } else if (sealed.status === "unreadable") {
+    status = "verified_suffix_only";
+  } else {
+    status = "verified"; // sealed verified / empty / not_present
+  }
+  return { status, routine_finding_count: routineFindingCount, sealed_region: sealed };
+}
+
+/**
+ * Collapse the verdict for a surface that makes an explicit "verified clean /
+ * no tampering / verified_against_audit_chain" CLAIM. True ONLY for a fully
+ * `verified` chain (routine clean AND sealed verified/empty/not_present). A
+ * `verified_suffix_only` (sealed unreadable at this privilege) is NOT a clean
+ * claim and returns false; the surface should render "suffix verified, sealed
+ * region unverified at this privilege", never bare "verified".
+ */
+export function auditChainVerdictClaimsClean(v: AuditChainVerdict): boolean {
+  return v.status === "verified";
+}
+
+/**
+ * Collapse the verdict for a gate whose only job is "is the audit read TAINTED
+ * (active tamper); must I fail closed?"; e.g. the Castle Wall arm-state gate
+ * and the custody/recognition integrity gates. Untampered = anything that is
+ * NOT `findings` (which covers routine findings AND sealed hash_mismatch /
+ * incomplete). A `verified_suffix_only` (sealed unreadable) is UNTAMPERED: the
+ * live/suffix evidence verified, and an armed box's operator-uid simply cannot
+ * read the root-owned sealed history — that must NOT flip every armed box's
+ * arm-state to "unknown". Root re-verification (audit-store-status) is where a
+ * root-owned sealed tamper is caught.
+ */
+export function auditChainVerdictUntampered(v: AuditChainVerdict): boolean {
+  return v.status !== "findings";
+}
+
+/**
+ * F2 round-4 HIGH-1 (2026-07-15): the AMBER caveat companion to
+ * {@link auditChainVerdictUntampered}. True when the chain is untampered at
+ * this privilege BUT the sealed history could not be re-verified here
+ * (`verified_suffix_only`, i.e. an armed box's operator uid cannot read the
+ * root-owned sealed region). An operational/arm gate may treat this as non-red
+ * (untampered), but an EVIDENCE surface must NOT render it as a fully-`verified`
+ * green: it renders amber ("sealed history not re-verifiable at this privilege;
+ * run as root for a full verify"). Distinct from `findings` (active tamper) and
+ * from `verified` (fully clean). Callers pair this with `untampered` so the
+ * green claim stays reserved for `auditChainVerdictClaimsClean`.
+ */
+export function auditChainVerdictSealedUnverifiedAtPrivilege(
+  v: AuditChainVerdict
+): boolean {
+  return v.status === "verified_suffix_only";
+}
+
 export class AuditLog {
   private storage: StorageBackend;
   private encryptionKey: Uint8Array;
@@ -672,8 +1606,41 @@ export class AuditLog {
   private entries: AuditEntry[] = [];
   private chainEntries: Array<{ sequence: number; entry_hash: string }> = [];
   private counter = 0;
+  /**
+   * Per-instance random suffix mixed into every persisted entry key. Two
+   * DISTINCT writers (two processes, or two `AuditLog` instances in one process)
+   * that momentarily both believe they hold the write lock could otherwise
+   * persist the SAME `entry-<seq>-<ms>-<counter>` key in the same millisecond
+   * with both counters at 0, and the atomic rename would silently OVERWRITE one
+   * of the two forked writes at the same path, leaving no second file for the
+   * chain verifier to flag as a fork (Codex re-gate, 2026-07-15). A per-instance
+   * nonce makes their keys distinct, so a double-acquire always leaves TWO files
+   * at the same sequence, which the contiguous-sequence walk detects as
+   * `sequence_gap_or_reorder`/`prev_hash_mismatch` (fail closed, never a silent
+   * fork). The key's `^entry-<20-digit-seq>-` prefix (the only part any reader
+   * parses via `parseEntryKeySequence`) is unchanged, so this is parse- and
+   * sort-compatible with existing fortresses. */
+  private readonly instanceKeyNonce = randomBytes(6).toString("hex");
+  /** F2 Finding 1: the sealed split-boundary tip observed on the last load (0
+   * when no valid boundary). Cached so the append path can tell a post-split
+   * SUFFIX entry (`sequence > cachedSealedTip`) from a sealed-region one without
+   * re-reading the boundary per append. */
+  private cachedSealedTip = 0;
+  /** F2 Finding 1: in-memory guard so the post-split-suffix-established marker is
+   * written at most once per instance (it is idempotent, but this avoids a
+   * `_meta` write on every suffix append). */
+  private postSplitSuffixMarkerEnsured = false;
   private readonly maxTotalSizeBytes: number;
   private readonly maxEntries: number;
+  /**
+   * Upper bound on how many entries the instance keeps decrypted in memory
+   * (`this.entries` / `this.chainEntries`). Mirrors the on-disk entry cap but
+   * never drops below {@link MIN_IN_MEMORY_ENTRY_FLOOR}. Prevents the
+   * append-only in-memory arrays from growing without bound on a long-running
+   * daemon (the full-mode daemon OOM). The persisted log is unaffected; full
+   * reads re-load from disk.
+   */
+  private readonly maxInMemoryEntries: number;
   private readonly integrityMode: "strict" | "lenient";
   private readonly checkpointInterval: number;
   private readonly checkpointSigner?: (
@@ -737,6 +1704,27 @@ export class AuditLog {
   /** Backstop interval (ms) between full on-disk re-verifies on the eager path;
    * resolved once from config/env. See {@link resolveEagerReverifyIntervalMs}. */
   private readonly eagerReverifyIntervalMs: number;
+  /** Age bound (ms) for the id-less 0-byte stale-lock fallback and the orphan
+   * acquire-temp sweep; resolved once from config/env. See
+   * {@link resolveIdlessStaleLockMs}. */
+  private readonly idlessStaleLockMs: number;
+  /** One-shot guard: the orphan `.acquire.*.tmp` sweep runs once per process on
+   * the first write-lock acquire (crash-orphan temps can only predate this
+   * process, so a single lazy startup sweep suffices to keep them from
+   * accumulating across restarts). */
+  private staleAcquireTempsSwept = false;
+  /** F2 Option A: whether to consult the split-boundary record. See
+   * {@link AuditLogConfig.consultSplitBoundary}. */
+  private readonly consultSplitBoundary: boolean;
+  /** F2 Option A: MAC key for the split-boundary record, derived up front
+   * (mirrors every other purpose key on this class: the raw master is never
+   * retained). */
+  private readonly splitBoundaryMacKey: Uint8Array;
+  /** BLOCKER-1 (round 3): memoized sealed-region verdict, keyed on the cheap
+   * sealed-region fingerprint (see {@link verifySealedRegion}). The sealed
+   * region is immutable post-migration, so a stable fingerprint means the
+   * verdict is reusable; any tamper flips the fingerprint and forces a re-walk. */
+  private cachedSealedVerdict: { fingerprint: string; verdict: SealedRegionVerdict } | null = null;
 
   constructor(storage: StorageBackend, masterKey: Uint8Array, config?: AuditLogConfig) {
     this.storage = storage;
@@ -752,6 +1740,16 @@ export class AuditLog {
     this.epochMacKey = epochKeys.epochMacKey;
     this.maxTotalSizeBytes = config?.maxTotalSizeBytes ?? DEFAULT_MAX_TOTAL_SIZE_BYTES;
     this.maxEntries = config?.maxEntries ?? DEFAULT_MAX_ENTRIES;
+    // In-memory window cap, decoupled from the on-disk cap: defaults to
+    // `maxEntries` so behavior is unchanged unless a caller sets it explicitly,
+    // but is independently configurable so the daemon can keep less in RAM than
+    // it retains on disk (and so trim behavior can be exercised in isolation
+    // from on-disk rotation). Never below the floor, so a usable recent window
+    // survives even under a tiny cap.
+    this.maxInMemoryEntries = Math.max(
+      config?.maxInMemoryEntries ?? this.maxEntries,
+      MIN_IN_MEMORY_ENTRY_FLOOR
+    );
     this.integrityMode = config?.integrityMode ?? "strict";
     this.checkpointInterval =
       config?.checkpointInterval ?? DEFAULT_CHECKPOINT_INTERVAL;
@@ -761,6 +1759,9 @@ export class AuditLog {
     this.eagerReverifyIntervalMs = resolveEagerReverifyIntervalMs(
       config?.eagerReverifyIntervalMs
     );
+    this.idlessStaleLockMs = resolveIdlessStaleLockMs(config?.idlessStaleLockMs);
+    this.consultSplitBoundary = config?.consultSplitBoundary ?? true;
+    this.splitBoundaryMacKey = deriveAuditStoreSplitBoundaryMacKey(masterKey);
     this.filesystemCapabilities = asFilesystemCapabilities(storage);
     if (this.filesystemCapabilities) {
       this.auditWriteLockPath = join(
@@ -768,10 +1769,13 @@ export class AuditLog {
         AUDIT_WRITE_LOCK_FILE
       );
       // SAFETY: one-time startup announcement of the audit-write coordination
-      // mechanism. Operators need to see this so they can locate the lock file
-      // and inspect lsof on it if writes appear stuck. Goes to stderr-equivalent
-      // console.info, which is operator-facing diagnostic surface, not telemetry.
-      console.info(
+      // mechanism, routed to STDERR via console.error. Operators need to see
+      // this so they can locate the lock file and inspect lsof on it if writes
+      // appear stuck. It must NEVER touch stdout: on an MCP stdio boot stdout
+      // is the JSON-RPC channel, and console.info writes to stdout in Node
+      // (this line was empirically the first stdout byte, ahead of the
+      // initialize response).
+      console.error(
         `[audit-log] cross-process file locking enabled: ${this.auditWriteLockPath}`
       );
     }
@@ -846,6 +1850,127 @@ export class AuditLog {
   }
 
   /**
+   * F2 Option A: the current chain tip (sequence 0 / `AUDIT_CHAIN_GENESIS`
+   * for an empty chain). Used by `migrateFortressAuditStoreSplit` to compute
+   * the split-boundary record's sealed tip, and by any other caller that
+   * needs the verified head without appending. Loads (and integrity-checks,
+   * in whatever `integrityMode` this instance was constructed with) first.
+   */
+  async getChainHead(): Promise<{ sequence: number; entry_hash: string }> {
+    await this.appendQueue;
+    await this.ensureLoaded({ allowIntegrityFindings: true });
+    return { sequence: this.nextSequence - 1, entry_hash: this.lastEntryHash };
+  }
+
+  /**
+   * BLOCKER-1 (adversarial re-gate round 3, 2026-07-14; hardened round 5,
+   * 2026-07-15): crypto-re-verify the sealed legacy region's CONTENT using this
+   * instance's own `storage` + `splitBoundaryMacKey` (no master key needed; the
+   * walk reads envelope bytes and recomputes hashes). Memoized on a
+   * CONTENT-authenticated sealed-region fingerprint (see
+   * {@link sealedRegionFingerprint}): the fingerprint reads the same stored
+   * envelope bytes the verifier reads and folds them into a SHA-256, so any
+   * in-place edit or deletion of a sealed entry flips it and forces a full
+   * re-walk. A cache hit skips only the more expensive decrypt-free chain
+   * recompute + tip-MAC match, not the tamper check itself. Returns
+   * `not_present` for a non-filesystem backend or a daemon instance
+   * (`consultSplitBoundary: false`).
+   *
+   * Round-5 note: the prior fingerprint keyed on count + size/mtime metadata,
+   * which the exact in-place sealed-tamper adversary can forge (a same-length
+   * ciphertext-byte flip preserves size; `utimes`/`touch -r` restores mtime),
+   * so a long-lived process served a STALE `verified` over a real sealed tamper.
+   * Metadata is NOT a tamper-detection guarantee; only reading the bytes is.
+   */
+  async verifySealedRegion(): Promise<SealedRegionVerdict> {
+    if (!this.consultSplitBoundary || !this.filesystemCapabilities) {
+      return { status: "not_present" };
+    }
+    const statePath = dirname(
+      this.filesystemCapabilities.namespacePath(AUDIT_NAMESPACE)
+    );
+    // A fingerprint read failure yields NULL, never a shared sentinel string: a
+    // sentinel key could collide with itself across calls (throw -> cache under
+    // sentinel -> later throw -> stale hit on a non-content key). Null always
+    // misses the cache AND is never cached, so every failed-fingerprint call
+    // does a fresh walk (round-5 gate hardening).
+    let fingerprint: string | null;
+    try {
+      fingerprint = await this.sealedRegionFingerprint();
+    } catch {
+      fingerprint = null; // force a fresh walk; result not cacheable
+    }
+    if (
+      this.cachedSealedVerdict &&
+      this.cachedSealedVerdict.fingerprint === fingerprint
+    ) {
+      return this.cachedSealedVerdict.verdict;
+    }
+    const verdict = await verifySealedRegionAt({
+      storage: this.storage,
+      statePath,
+      macKey: this.splitBoundaryMacKey,
+    });
+    // Only cache a stable/terminal verdict under a REAL content fingerprint; an
+    // `unreadable` may be transient (a race with a chmod), and a null
+    // fingerprint (fingerprint read failed) must never be a cache key (null
+    // would match null on the next failed read and serve a stale verdict).
+    if (verdict.status !== "unreadable" && fingerprint !== null) {
+      this.cachedSealedVerdict = { fingerprint, verdict };
+    }
+    return verdict;
+  }
+
+  /** CONTENT-authenticated fingerprint of ONLY the sealed region (entries at or
+   * below the boundary tip). Reads the SAME stored envelope bytes the verifier
+   * ({@link verifySealedRegionAt}) reads and folds each entry's key + raw bytes
+   * into a SHA-256, so any in-place byte edit or deletion of a sealed entry
+   * changes the digest and forces a re-walk. It deliberately does NOT use file
+   * size/mtime: both are attacker-forgeable (a same-length ciphertext-byte flip
+   * preserves size; mtime can be restored via `utimes`), so metadata can never
+   * be the trust basis for reusing a cached `verified`. Returns "no-boundary"
+   * when there is no valid boundary (nothing sealed) so the memo key is stable
+   * for the common case; "empty" when the boundary sealed an empty chain.
+   * Propagates a read error (e.g. EACCES on an armed box) to the caller, which
+   * forces a walk that reports `unreadable` (and is not cached). */
+  private async sealedRegionFingerprint(): Promise<string> {
+    const boundary = await this.loadSplitBoundary();
+    if (boundary.status !== "valid") return "no-boundary";
+    const tip = boundary.boundary.sealed_tip_sequence;
+    if (tip <= 0) return "empty";
+    const metas = await this.storage.list(AUDIT_NAMESPACE, "entry-");
+    const sealed = metas.filter((m) => {
+      const seq = parseEntryKeySequence(m.key);
+      return seq !== null && seq <= tip;
+    });
+    sealed.sort((a, b) => a.key.localeCompare(b.key));
+    // Fold the actual stored bytes of every sealed entry into the digest. Any
+    // in-place tamper flips a per-entry hash; a deletion drops a key from the
+    // run (marked "<absent>" if it vanishes between list and read). A read
+    // failure throws out of here so the caller falls through to a fresh walk.
+    const parts: string[] = [`tip=${tip}`, `count=${sealed.length}`];
+    for (const m of sealed) {
+      const raw = await this.storage.read(AUDIT_NAMESPACE, m.key);
+      parts.push(`${m.key}:${raw ? sha256Hex(raw) : "<absent>"}`);
+    }
+    return sha256Hex(parts.join("\n"));
+  }
+
+  /**
+   * BLOCKER-1 (round 3): the SINGLE audit-chain verdict every clean-claiming
+   * surface must consume instead of deriving "clean" from
+   * `query().integrity_findings.length === 0` (which skips the sealed region
+   * and lies over in-place sealed tamper). Folds the routine suffix findings
+   * with the sealed-region crypto verdict. `verified` ONLY when routine findings
+   * are empty AND sealed is verified/empty/not_present.
+   */
+  async getAuditChainVerdict(): Promise<AuditChainVerdict> {
+    const routine = await this.getIntegrityFindings();
+    const sealed = await this.verifySealedRegion();
+    return foldAuditChainVerdict(routine.length, sealed);
+  }
+
+  /**
    * Wait for every in-flight `append()` persist (and its rotation pass) to
    * settle. Rejects with `AuditLogPersistenceError` if any tracked persist
    * failed. Safe to call multiple times — newly-appended entries during a
@@ -914,7 +2039,7 @@ export class AuditLog {
           timestamp: normalized.timestamp,
           encrypted_payload_bytes: encryptedPayloadBytes,
         };
-        const key = `entry-${String(sequence).padStart(20, "0")}-${Date.now()}-${this.counter++}`;
+        const key = `entry-${String(sequence).padStart(20, "0")}-${Date.now()}-${this.counter++}-${this.instanceKeyNonce}`;
         const persistedBytes = stringToBytes(JSON.stringify(envelope));
         try {
           await this.writeAuditEntryBytes(key, persistedBytes);
@@ -923,6 +2048,32 @@ export class AuditLog {
             await this.verifyPersistedBytes(key, persistedBytes);
           }
           await this.writeHeadAnchor(sequence, entryHash);
+          // F2 Finding 1: the FIRST time this operator instance persists a
+          // post-split SUFFIX entry (above the sealed tip) under boundary
+          // consultation, record the operator-provenance "suffix established"
+          // marker. Thereafter an unreadable/erased head anchor with the suffix
+          // gone is proven tamper (fail closed), not a benign just-migrated box.
+          // Best-effort + off the durability-critical path: a failure to stamp
+          // it must never brick an append (worst case the next append retries);
+          // the marker only tightens Finding 1's full-suffix-erasure case, which
+          // the `sequence > tip` gate already covers for surviving suffixes.
+          if (
+            this.consultSplitBoundary &&
+            !this.postSplitSuffixMarkerEnsured &&
+            sequence > this.cachedSealedTip &&
+            this.cachedSealedTip > 0
+          ) {
+            try {
+              await this.storage.write(
+                "_meta",
+                AUDIT_POST_SPLIT_SUFFIX_ESTABLISHED_KEY,
+                stringToBytes("1")
+              );
+              this.postSplitSuffixMarkerEnsured = true;
+            } catch {
+              // Non-fatal; retried on the next suffix append.
+            }
+          }
         } catch (err) {
           throw toAuditPersistenceError(err);
         }
@@ -932,6 +2083,11 @@ export class AuditLog {
         this.nextSequence = sequence + 1;
         this.lastEntryHash = entryHash;
         this.hashesSinceCheckpoint.push(entryHash);
+        // Bound the in-memory recent-entry window. Without this the arrays grow
+        // one element per append forever (the long-running-daemon OOM); disk
+        // rotation never touched them. Trimming here keeps the heap flat while
+        // the persisted log (and every full re-read) stays complete.
+        this.trimInMemoryRetention();
         if (options.critical) {
           this.criticalAppendsSinceCheckpoint++;
         }
@@ -962,6 +2118,49 @@ export class AuditLog {
       if (!options.critical && this.pendingVisibleEntries > 0) {
         this.pendingVisibleEntries--;
       }
+    }
+  }
+
+  /**
+   * Cap the decrypted recent-entry window held in memory.
+   *
+   * `this.entries` is `[legacy..., chained...]`; the chained suffix aligns 1:1
+   * with `this.chainEntries`. We trim the OLDEST entries from the front of both
+   * arrays in lockstep so the alignment invariant
+   * (`entries.length - chainEntries.length` === surviving legacy count) is
+   * preserved: dropping `n` from the front of `entries` while dropping the same
+   * count of the oldest aligned `chainEntries` removes legacy entries first (no
+   * chained counterpart) and only then chained entries (each with its
+   * `chainEntries` twin). `this.hashesSinceCheckpoint` is bounded the same way.
+   *
+   * SAFETY: this only drops the in-memory cache of OLD entries. The persisted
+   * log is untouched, the verified chain HEAD is tracked by `nextSequence` /
+   * `lastEntryHash` (not the array tail), checkpoint roots are computed from
+   * disk (`collectPersistedEntryHashes`), and `verifiedChainView()` / `query()`
+   * re-read the full chain from disk before serving. So trimming the in-memory
+   * window changes no on-the-wire, on-disk, or verification behavior; it only
+   * stops the heap from growing without bound on a long-running daemon.
+   */
+  private trimInMemoryRetention(): void {
+    const cap = this.maxInMemoryEntries;
+    const overflow = this.entries.length - cap;
+    if (overflow > 0) {
+      // Drop the oldest `overflow` entries from the front. The chained suffix
+      // shrinks by however many of those dropped entries were chained, which is
+      // exactly `overflow` once the legacy prefix has been consumed; before
+      // that, dropped entries are legacy-only and `chainEntries` is left intact.
+      const legacyCount = this.entries.length - this.chainEntries.length;
+      this.entries.splice(0, overflow);
+      const chainedDropped = Math.max(0, overflow - legacyCount);
+      if (chainedDropped > 0) {
+        this.chainEntries.splice(0, chainedDropped);
+      }
+    }
+    if (this.hashesSinceCheckpoint.length > cap) {
+      this.hashesSinceCheckpoint.splice(
+        0,
+        this.hashesSinceCheckpoint.length - cap
+      );
     }
   }
 
@@ -1029,9 +2228,41 @@ export class AuditLog {
     if (this.rotationInFlight) return;
     this.rotationInFlight = true;
     try {
+      // F2 Option A: a valid split boundary is an UNPRUNABLE floor. Rotation
+      // sorts oldest-first and deletes from the bottom, so without this an
+      // over-cap chain would eventually select sealed (possibly root-owned,
+      // possibly unreadable) legacy entries as prune candidates, silently
+      // destroying exactly the history the boundary promises to preserve
+      // ("nothing before the boundary is deleted, repaired, or rewritten";
+      // see the module doc comment). `storage.delete()` on most POSIX
+      // filesystems only needs write permission on the DIRECTORY, not the
+      // target file, so an unreadable sealed entry would otherwise still be
+      // deletable: this filter is the actual enforcement of that promise,
+      // not just a permission accident to route around.
+      const splitBoundary = await this.loadSplitBoundary();
+      const sealedTipSequence =
+        splitBoundary.status === "valid" ? splitBoundary.boundary.sealed_tip_sequence : 0;
+      // L-1 (adversarial gate 2026-07-14): when a valid boundary seals a region,
+      // a pre-V2 (null-sequence) `entry` key CANNOT be proven to sit above the
+      // sealed tip, and it may well belong to the sealed legacy region (a
+      // fortress old enough to hold pre-V2 entries that later armed a root
+      // daemon). Treat null-sequence keys as AT/BELOW the floor (protected,
+      // unprunable) whenever a boundary is in force, matching the "nothing
+      // before the boundary is deleted" promise. When there is no boundary
+      // (sealedTipSequence === 0), preserve the pre-F2 behavior exactly: legacy
+      // keys are prunable oldest-first as they always were.
+      const boundaryInForce = sealedTipSequence > 0;
+      const abovesSealedFloor = (meta: { key: string }): boolean => {
+        const seq = parseEntryKeySequence(meta.key);
+        if (seq === null) return !boundaryInForce;
+        return seq > sealedTipSequence;
+      };
+
       // Cheap lock-free pre-check: only pay the cross-process lock cost when a
       // prune is actually due. storage.list() returns key-sorted entries.
-      const preMetas = await this.storage.list(AUDIT_NAMESPACE);
+      const preMetas = (await this.storage.list(AUDIT_NAMESPACE)).filter(
+        abovesSealedFloor
+      );
       if (this.rotationDeleteCount(preMetas) <= 0) return;
 
       // F3: serialize the anchor write + prune under the SAME cross-process lock
@@ -1046,7 +2277,9 @@ export class AuditLog {
       await this.withAuditWriteLock(async () => {
         // Re-list INSIDE the lock: another rotator may have pruned since the
         // pre-check, so recompute the cut against the authoritative state.
-        const metas = await this.storage.list(AUDIT_NAMESPACE);
+        const metas = (await this.storage.list(AUDIT_NAMESPACE)).filter(
+          abovesSealedFloor
+        );
         metas.sort((a, b) => a.key.localeCompare(b.key));
         // Always keep at least one entry as the surviving anchor base — even
         // under degenerate caps (maxEntries: 0, or maxTotalSizeBytes smaller than
@@ -1148,6 +2381,198 @@ export class AuditLog {
   }
 
   /**
+   * F2 Option A: resolve this instance's own `_audit`-directory-adjacent
+   * split-boundary path and load + MAC-verify the record there. Returns
+   * `absent` (a pure no-op default, see the module doc comment) when
+   * `consultSplitBoundary` is false, when there is no filesystem capability
+   * (non-filesystem backend, mirroring the rotation anchor's own gating), or
+   * when the record does not exist / cannot be read at this privilege.
+   */
+  private async loadSplitBoundary(): Promise<AuditStoreSplitBoundaryLoadResult> {
+    if (!this.consultSplitBoundary || !this.filesystemCapabilities) {
+      return { status: "absent" };
+    }
+    const auditDir = this.filesystemCapabilities.namespacePath(AUDIT_NAMESPACE);
+    return readAuditStoreSplitBoundary(dirname(auditDir), this.splitBoundaryMacKey);
+  }
+
+  /**
+   * F2 Option A + BLOCKER-2 (adversarial gate 2026-07-14): probe whether the
+   * split migration has EVER run on this fortress, independent of the boundary
+   * record itself. The daemon's own `_audit-daemon` namespace (its genesis
+   * marker entry) is the durable proof the migration committed; its siblings
+   * (`_audit-daemon_checkpoints`/`_audit-daemon_meta`) are secondary markers.
+   * If any of them holds an entry, a MISSING boundary is a DELETION of the
+   * boundary, not a never-migrated fortress, and must fail closed rather than
+   * silently fall back to a full walk that a truncated-suffix attacker could
+   * ride via rotation-anchor TOFU. Metadata-only (`list`), never decrypts, so
+   * it is safe cross-uid.
+   */
+  private async daemonMigrationMarkerExists(): Promise<boolean> {
+    // BLOCKER-R2 + HIGH-1 (round 3): the durable `_meta` established marker is
+    // checked FIRST because it is NOT co-deletable with the daemon namespace
+    // set. Both `present` (authentic) AND `invalid_or_unreadable` (corrupted /
+    // unreadable record) count as migration evidence and fail closed; the
+    // round-2 code only checked `=== "present"`, which let an attacker CORRUPT
+    // the marker to collapse it to "absent" and re-open the TOFU fail-open.
+    // Only a genuinely-`absent` marker (no record at all) is not evidence.
+    if (
+      (await readAuditStoreSplitEstablishedMarker(
+        this.storage,
+        this.splitBoundaryMacKey
+      )) !== "absent"
+    ) {
+      return true;
+    }
+    for (const ns of AUDIT_DAEMON_MIGRATION_MARKER_NAMESPACES) {
+      try {
+        if ((await this.storage.list(ns)).length > 0) return true;
+      } catch {
+        // A listing error is itself suspicious (a marker dir we cannot
+        // enumerate). Treat it as "marker may exist" so an absent boundary
+        // fails closed rather than fails open.
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * F2 Option A + BLOCKER-1/BLOCKER-2 (adversarial gate 2026-07-14): resolve
+   * the split boundary for a LOAD, deriving integrity findings and the TOFU
+   * suppression flag. This is the single chokepoint that decides how the load
+   * treats the boundary:
+   *
+   *   - `valid`  : filter the sealed region (effectiveSealedTip = the MAC'd
+   *     tip); no boundary-level finding; TOFU not suppressed (a later rotation
+   *     of the POST-split chain is still a legitimate F3 cut). The sealed
+   *     region's completeness is checked separately by
+   *     {@link checkSealedPrefixCompleteness}.
+   *   - `invalid`: a PRESENT boundary that fails MAC authentication. Surface a
+   *     `split_boundary_invalid` finding (fail closed) and DO NOT filter
+   *     (effectiveSealedTip = 0 → full walk, which re-throws F2 on an armed box
+   *     = fail closed). Suppress TOFU so a boundary-loss + prefix-deletion
+   *     cannot be laundered into an authenticated rotation cut.
+   *   - `absent` + a durable migration marker exists: the boundary was DELETED
+   *     after a real migration. Surface `split_boundary_missing`, do not filter,
+   *     suppress TOFU. Same fail-closed posture as `invalid`.
+   *   - `absent` + no marker: genuinely never migrated (the overwhelming
+   *     majority). No finding, no filter, TOFU allowed exactly as pre-F2.
+   */
+  private async resolveSplitBoundaryForLoad(
+    findings: AuditIntegrityFinding[]
+  ): Promise<{
+    boundary: AuditStoreSplitBoundaryLoadResult;
+    effectiveSealedTip: number;
+    suppressTofu: boolean;
+  }> {
+    // When boundary consultation is disabled (the DAEMON chain's own AuditLog,
+    // constructed with `consultSplitBoundary: false`, i.e. it IS the daemon
+    // store, not the operator store), do NOTHING: no boundary read, no marker probe
+    // (its remap adapter does not even expose the marker namespaces), no
+    // finding. Same for a non-filesystem backend. This mirrors
+    // `loadSplitBoundary`'s own early return.
+    if (!this.consultSplitBoundary || !this.filesystemCapabilities) {
+      return { boundary: { status: "absent" }, effectiveSealedTip: 0, suppressTofu: false };
+    }
+    const boundary = await this.loadSplitBoundary();
+    if (boundary.status === "valid") {
+      return {
+        boundary,
+        effectiveSealedTip: boundary.boundary.sealed_tip_sequence,
+        suppressTofu: false,
+      };
+    }
+    if (boundary.status === "invalid") {
+      findings.push({
+        kind: "split_boundary_invalid",
+        message:
+          "audit store split-boundary record is present but failed authentication " +
+          "(tampered, forged, or wrong key); refusing to trust the sealed tip and " +
+          "not treating the surviving suffix as an authenticated rotation cut",
+      });
+      return { boundary, effectiveSealedTip: 0, suppressTofu: true };
+    }
+    // absent
+    if (await this.daemonMigrationMarkerExists()) {
+      findings.push({
+        kind: "split_boundary_missing",
+        message:
+          "a daemon audit store exists (the writer-split migration ran) but the " +
+          "split-boundary record is absent; it was deleted after migration, so the " +
+          "sealed tip cannot be trusted and the surviving suffix is not an " +
+          "authenticated rotation cut",
+      });
+      return { boundary, effectiveSealedTip: 0, suppressTofu: true };
+    }
+    return { boundary, effectiveSealedTip: 0, suppressTofu: false };
+  }
+
+  /**
+   * F2 Option A + BLOCKER-1 (adversarial gate 2026-07-14): with a VALID
+   * boundary, verify from the directory LISTING (no decrypt, so it works even
+   * when the sealed entries are root-owned and unreadable at operator
+   * privilege) that the sealed region's V2 `entry-*` files form a gap-free run
+   * ending EXACTLY at `sealed_tip_sequence`. This catches deletion or
+   * disappearance of a sealed entry (the evidence-suppression vector the gate
+   * flagged: an attacker with directory write permission unlinking sealed
+   * files), which the content-level chain walk cannot see because it never
+   * reads those files.
+   *
+   * BLOCKER-R1 (adversarial re-gate 2026-07-14): the run must ALSO start
+   * exactly at the MAC'd `sealed_base_sequence`, so deletion of the LOWEST
+   * sealed entry (which the first fix round left as a documented residual) is
+   * now caught here too, not just by the root crypto walk. Pre-V2 (null-seq)
+   * legacy keys below the V2 base are not sequence-checkable here; they are
+   * covered by the root crypto verifier, not this listing check.
+   */
+  private checkSealedPrefixCompleteness(
+    storedEntriesRaw: readonly { key: string }[],
+    sealedTipSequence: number,
+    sealedBaseSequence: number,
+    findings: AuditIntegrityFinding[]
+  ): void {
+    if (sealedTipSequence <= 0) return; // nothing was sealed (empty at migration)
+    const sealedSeqs: number[] = [];
+    for (const meta of storedEntriesRaw) {
+      const seq = parseEntryKeySequence(meta.key);
+      if (seq !== null && seq <= sealedTipSequence) sealedSeqs.push(seq);
+    }
+    sealedSeqs.sort((a, b) => a - b);
+    const highest = sealedSeqs.length > 0 ? sealedSeqs[sealedSeqs.length - 1]! : 0;
+    const lowest = sealedSeqs.length > 0 ? sealedSeqs[0]! : 0;
+    let contiguous = true;
+    for (let i = 1; i < sealedSeqs.length; i++) {
+      if (sealedSeqs[i]! !== sealedSeqs[i - 1]! + 1) {
+        contiguous = false;
+        break;
+      }
+    }
+    const baseOk = sealedBaseSequence <= 0 || lowest === sealedBaseSequence;
+    if (
+      sealedSeqs.length === 0 ||
+      highest !== sealedTipSequence ||
+      !baseOk ||
+      !contiguous
+    ) {
+      findings.push({
+        kind: "sealed_prefix_incomplete",
+        sequence: sealedTipSequence,
+        expected: sealedTipSequence,
+        actual: highest,
+        message:
+          sealedSeqs.length === 0
+            ? `the entire sealed legacy audit prefix (sequences <= ${sealedTipSequence}) is missing from disk (deletion or corruption)`
+            : highest !== sealedTipSequence
+              ? `the sealed legacy audit prefix's top entry (sequence ${sealedTipSequence}) is missing; highest surviving sealed sequence is ${highest} (truncation)`
+              : !baseOk
+                ? `the sealed legacy audit prefix's bottom entry (sequence ${sealedBaseSequence}) is missing; lowest surviving sealed sequence is ${lowest} (a sealed entry was deleted)`
+                : `the sealed legacy audit prefix has a gap below sequence ${sealedTipSequence} (a sealed entry was deleted)`,
+      });
+    }
+  }
+
+  /**
    * F3: load + MAC-verify the rotation anchor.
    *   - `valid`   : marker present, well-formed, MAC matches → authenticated cut.
    *   - `invalid` : marker present but malformed / MAC mismatch / unreadable →
@@ -1185,26 +2610,26 @@ export class AuditLog {
       return { status: "invalid" };
     }
     if (!isRecord(parsed) || parsed[AUDIT_ROTATION_ANCHOR_MARKER] !== true) {
-      // Bare / marker-stripped / legacy: untrusted, treated as no anchor so the
-      // TOFU migration path re-establishes it from the surviving chain.
+      // Bare / marker-stripped / legacy: untrusted, treated as no anchor. An
+      // absent anchor is NOT self-healed: for a genesis-rooted chain the default
+      // seed applies, and for an above-genesis suffix `resolveChainSeed` fails
+      // closed (`rotation_anchor_missing`). Only a legitimate future rotation
+      // re-establishes an authenticated anchor (via `maybeRotate`).
       return { status: "absent" };
     }
 
-    const data = parsed.data;
-    const mac = parsed.mac;
-    if (
-      !isRecord(data) ||
-      typeof mac !== "string" ||
-      typeof data.base_sequence !== "number" ||
-      !Number.isSafeInteger(data.base_sequence) ||
-      data.base_sequence <= 0 ||
-      typeof data.base_prev_hash !== "string"
-    ) {
+    // Re-gate round 3: the structural arm is the SHARED shape predicate
+    // (marker + data + canonical 43-char base64url mac), so this runtime and the raw
+    // CLI exporter cannot drift apart on what a rotation anchor looks like.
+    // The MAC VERIFICATION below stays here: only this runtime holds the
+    // custody-derived MAC key.
+    if (!isAuditRotationAnchorEnvelope(parsed)) {
       return { status: "invalid" };
     }
+    const data = parsed.data;
     let providedMac: Uint8Array;
     try {
-      providedMac = fromBase64url(mac);
+      providedMac = fromBase64url(parsed.mac);
     } catch {
       return { status: "invalid" };
     }
@@ -1268,11 +2693,21 @@ export class AuditLog {
   }
 
   private async loadHeadAnchor(
-    findings: AuditIntegrityFinding[]
+    findings: AuditIntegrityFinding[],
+    // F2 Option A: whether a VALID split boundary seals a legacy region. On an
+    // armed box the legacy `__head_anchor` was written by a pre-split ROOT
+    // daemon and is root-owned 0600, so the operator uid's read throws EACCES.
+    // With a valid boundary that legacy anchor only ever recorded the sealed
+    // region's head (<= sealed tip; the migration captured the tip), so it is
+    // superseded by the boundary. Reporting `unreadable_sealed` lets the caller
+    // treat it as "no usable anchor for the post-split suffix" and re-establish
+    // the operator's OWN anchor, instead of failing the whole load closed.
+    boundaryIsValid = false
   ): Promise<
     | { status: "valid"; highest_sequence: number; head_hash: string }
     | { status: "absent" }
     | { status: "invalid" }
+    | { status: "unreadable_sealed" }
   > {
     let raw: Uint8Array | null;
     try {
@@ -1281,6 +2716,12 @@ export class AuditLog {
         AUDIT_HEAD_ANCHOR_KEY
       );
     } catch (err) {
+      if (boundaryIsValid && isPermissionError(err)) {
+        // Root-owned legacy anchor, unreadable at the operator uid, superseded
+        // by the MAC'd boundary. Not a finding; the caller re-establishes the
+        // suffix anchor. A non-permission fault still fails closed below.
+        return { status: "unreadable_sealed" };
+      }
       findings.push({
         kind: "storage_unavailable",
         message: `audit head anchor could not be read: ${failureMessage(err)}`,
@@ -1341,9 +2782,11 @@ export class AuditLog {
     highestChainedHash: string,
     hasLegacyEntries: boolean,
     hasChainedEntries: boolean,
-    findings: AuditIntegrityFinding[]
+    findings: AuditIntegrityFinding[],
+    boundaryIsValid = false,
+    sealedTipSequence = 0
   ): Promise<void> {
-    const anchor = await this.loadHeadAnchor(findings);
+    const anchor = await this.loadHeadAnchor(findings, boundaryIsValid);
     if (anchor.status === "valid") {
       if (highestChainedSeq < anchor.highest_sequence) {
         findings.push({
@@ -1379,6 +2822,57 @@ export class AuditLog {
       return;
     }
 
+    if (anchor.status === "unreadable_sealed") {
+      // F2 Option A: `__head_anchor` is unreadable at the operator uid while a
+      // VALID MAC'd boundary exists. On a just-migrated armed box this is the
+      // benign legacy state (a pre-split root daemon wrote a root-owned anchor
+      // that only ever recorded the sealed region's head, <= the sealed tip,
+      // which the boundary now anchors). But a bare "suppress" here would launder
+      // a post-split tail truncation, so it is gated on TWO proofs (Finding 1,
+      // adversarial gate 2026-07-15):
+      //
+      //   (a) No surviving post-split SUFFIX. If `highestChainedSeq >
+      //       sealedTipSequence`, a suffix survives; the operator necessarily
+      //       already wrote its OWN operator-owned, readable anchor at that
+      //       higher floor, so an unreadable anchor now is tamper (someone made
+      //       it unreadable to force a lower-floor heal). Fail closed.
+      //   (b) The operator never established a suffix that has since been erased.
+      //       Even with no surviving suffix, a fortress that ONCE had one (and
+      //       whose suffix + suffix checkpoints were all deleted) is
+      //       indistinguishable from a fresh box by surviving entries alone. The
+      //       operator-provenance "suffix established" marker
+      //       (AUDIT_POST_SPLIT_SUFFIX_ESTABLISHED_KEY) closes that: if it is
+      //       present the suffix was erased -> fail closed.
+      //
+      // When both proofs pass (no surviving suffix AND never established one),
+      // this is the genuine just-migrated state: suppress the finding. NO write
+      // is done here (unlike the prior heal) -- the operator's next append
+      // establishes its own readable anchor via the normal append path, so a
+      // pure read never mutates the store.
+      if (highestChainedSeq > sealedTipSequence) {
+        findings.push({
+          kind: "tail_anchor_invalid",
+          sequence: highestChainedSeq,
+          message:
+            "audit head anchor is unreadable at this privilege but a post-split " +
+            "suffix survives (the operator's own anchor must be readable); " +
+            "refusing to heal to a lower floor (possible tail truncation)",
+        });
+        return;
+      }
+      if (await this.postSplitSuffixWasEstablished()) {
+        findings.push({
+          kind: "tail_anchor_invalid",
+          message:
+            "audit head anchor is unreadable and no post-split suffix survives, " +
+            "but the operator previously established a post-split suffix " +
+            "(possible full-suffix truncation with the anchor hidden)",
+        });
+        return;
+      }
+      return;
+    }
+
     if (hasLegacyEntries && !hasChainedEntries && highestChainedSeq > 0) {
       await this.writeHeadAnchor(highestChainedSeq, highestChainedHash);
       return;
@@ -1393,6 +2887,31 @@ export class AuditLog {
         message:
           "audit head anchor missing for established audit store (tail truncation or whole-log deletion may have occurred)",
       });
+    }
+  }
+
+  /**
+   * F2 Finding 1: has this operator ever established a POST-SPLIT suffix (an
+   * entry above the sealed tip)? Reads the operator-provenance marker
+   * {@link AUDIT_POST_SPLIT_SUFFIX_ESTABLISHED_KEY}. Fail-safe: a present OR
+   * unreadable/errored marker is treated as "established" (so an attacker cannot
+   * clear the tamper signal by making the marker unreadable); only a definitely-
+   * absent marker (`read` returns null) is "not established". `exists` is
+   * stat-based and would report a root-owned marker present without proving we
+   * can read its provenance, so this uses `read` and treats a permission error
+   * conservatively as established.
+   */
+  private async postSplitSuffixWasEstablished(): Promise<boolean> {
+    try {
+      const raw = await this.storage.read(
+        "_meta",
+        AUDIT_POST_SPLIT_SUFFIX_ESTABLISHED_KEY
+      );
+      return raw !== null;
+    } catch {
+      // Unreadable/errored: cannot prove absence, so assume established (fail
+      // closed) rather than let an unreadable marker suppress the tamper check.
+      return true;
     }
   }
 
@@ -1418,29 +2937,62 @@ export class AuditLog {
    *     genesis / legacy anchor as before (a stale anchor, if any, is ignored).
    *   - lowest chained  > legacyCount+1 → the head was pruned; REQUIRE a MAC-valid
    *     rotation anchor whose base_sequence == the lowest survivor. Absent /
-   *     invalid / mismatched → finding (fail closed), except the TOFU case below.
+   *     invalid / mismatched → finding (fail closed), unconditionally.
    *   - no chained entries → if an anchor still exists, the whole post-cut chain
    *     was truncated → finding.
    *
-   * Trust-on-first-use migration: a pre-F3 log that rotated before this change
-   * has lowest > legacyCount+1 and NO anchor. If its surviving chain is internally
-   * contiguous, accept it once and write the authenticated anchor; thereafter it
-   * is MAC-protected. A non-contiguous (genuinely truncated) chain still flags via
-   * the forward walk. This mirrors F1's one-time self-heal residual.
+   * NO trust-on-first-use for an above-genesis suffix (F2 round 3, 2026-07-14):
+   * the old pre-F3 accommodation, "an anchor-absent but internally-contiguous
+   * surviving chain is accepted once and a fresh anchor is written", was removed
+   * because an attacker who deletes the prefix AND every witness leaves exactly
+   * that shape. An above-genesis suffix with no authenticated cut now ALWAYS
+   * surfaces `rotation_anchor_missing` and writes NO anchor, regardless of
+   * marker/boundary state. Only a legitimate future rotation writes an anchor
+   * (via `maybeRotate`). A pre-F3 log that genuinely rotated before anchors
+   * existed therefore reports the finding until re-anchored by a real rotation:
+   * honest, fail-closed, and the accepted cost of closing the launder.
+   *
+   * F2 Option A: when a valid split-boundary record exists (`splitBoundary`),
+   * it REPLACES `legacyCount+1`/genesis as the default seed. The sealed
+   * legacy chain (V1-legacy region + everything chained up to the boundary)
+   * is treated exactly like a rotation cut that already happened, except no
+   * anchor file for it is required (the boundary record IS the anchor for
+   * this purpose) and `chainedEntries.length === 0` at the boundary is the
+   * EXPECTED steady state immediately after migration, not a truncation.
+   * Everything below (rotation-anchor validation / mismatch / truncation handling)
+   * is otherwise unchanged and layers on top of this new default correctly:
+   * a LATER rotation of the post-split chain is still detected and
+   * authenticated exactly as before.
+   *
+   * BLOCKER-2 (adversarial gate 2026-07-14): `suppressTofu` is set when the
+   * split boundary is present-but-invalid or deleted-after-migration. In that
+   * state the sealed tip is untrusted, so a surviving suffix that begins ABOVE
+   * sequence 1 could be a boundary-loss + prefix-deletion truncation. TOFU must
+   * NOT bless it as a rotation cut: with `suppressTofu`, the anchor-absent
+   * contiguous-suffix branch surfaces a finding and writes NO fresh rotation
+   * anchor (fail closed) instead of self-healing.
    */
   private async resolveChainSeed(
     chainedEntries: Array<{
       key: string;
       envelope: PersistedAuditEnvelopeV2;
-      entry: AuditEntry;
     }>,
     legacyCount: number,
     legacyAnchorHash: string,
+    splitBoundary: AuditStoreSplitBoundaryLoadResult,
+    suppressTofu: boolean,
     findings: AuditIntegrityFinding[]
   ): Promise<{ expectedSequence: number; expectedPrevHash: string }> {
-    const defaultSeedSequence = legacyCount + 1;
+    const defaultSeedSequence =
+      splitBoundary.status === "valid"
+        ? splitBoundary.boundary.sealed_tip_sequence + 1
+        : legacyCount + 1;
     const defaultSeedPrevHash =
-      legacyCount > 0 ? legacyAnchorHash : AUDIT_CHAIN_GENESIS;
+      splitBoundary.status === "valid"
+        ? splitBoundary.boundary.sealed_tip_entry_hash
+        : legacyCount > 0
+          ? legacyAnchorHash
+          : AUDIT_CHAIN_GENESIS;
     const defaultSeed = {
       expectedSequence: defaultSeedSequence,
       expectedPrevHash: defaultSeedPrevHash,
@@ -1512,33 +3064,56 @@ export class AuditLog {
       };
     }
 
-    // anchor.status === "absent": pre-F3 already-rotated log OR truncation.
-    if (this.isChainInternallyContiguous(chainedEntries)) {
-      // TOFU: accept the current surviving chain once and authenticate it.
-      //
-      // RESIDUAL (documented, not closed here — F3 design ratified 2026-06-06,
-      // consistent with F1 #394): a filesystem-level adversary who deletes BOTH
-      // this anchor file AND the current lowest-surviving (head) entry leaves a
-      // still-contiguous suffix that is indistinguishable from a legitimate
-      // pre-F3 rotation, so this branch re-accepts it and re-anchors at the new
-      // head — a head truncation hidden as migration. This is the same class as
-      // F1's "delete the MAC'd floor file + one more op" replay residual, and the
-      // filesystem-adversary threat model is explicitly not fully specified
-      // (see CLAUDE.md "Known Complexity" #6). Closing it requires a floor that
-      // does not live in a single deletable file (boot-anchored / externally
-      // attested), which is out of scope for F3.
-      await this.writeRotationAnchor(lowestChainedSeq, head.prev_hash);
+    // BLOCKER-2 (adversarial gate 2026-07-14): a missing/invalid split boundary
+    // could explain this above-floor suffix as a boundary-loss + prefix-deletion
+    // truncation. Refuse to TOFU-bless it (that would launder the truncation
+    // into an authenticated rotation cut); surface a finding and write no
+    // anchor. The `split_boundary_invalid` / `split_boundary_missing` finding is
+    // already recorded by the resolver; this adds the localized sequence
+    // context and keeps the walk from re-anchoring.
+    if (suppressTofu) {
+      findings.push({
+        kind: "rotation_anchor_missing",
+        sequence: lowestChainedSeq,
+        message: `audit chain starts at sequence ${lowestChainedSeq} (above ${defaultSeedSequence}) with an untrusted (invalid/missing) split boundary and no rotation anchor; refusing to self-heal a possibly-truncated suffix`,
+      });
       return {
         expectedSequence: lowestChainedSeq,
         expectedPrevHash: head.prev_hash,
       };
     }
-    // Non-contiguous: a genuine internal truncation. Flag it; the forward walk
-    // also localizes the exact break.
+
+    // HIGH-1 (adversarial re-gate round 3, 2026-07-14): the ROBUST,
+    // key-independent invariant. We are here only when the surviving chained
+    // region starts ABOVE the floor (`lowestChainedSeq > defaultSeedSequence`,
+    // so always > genesis) with NO authenticated rotation anchor. Such a suffix
+    // is itself evidence of a deleted prefix, and it must NEVER be TOFU-blessed
+    // (self-healed into a fresh rotation anchor) regardless of marker state.
+    // The round-2 code self-healed here whenever the suffix was internally
+    // contiguous, which is exactly the fail-open an attacker who deletes every
+    // migration witness (boundary + daemon namespaces + `_meta` marker + sealed
+    // prefix) rides: the contiguous above-genesis suffix got re-anchored and
+    // read clean. Now we fail closed unconditionally: surface a
+    // `rotation_anchor_missing` finding and write NO anchor.
+    //
+    // Compatibility note (accepted): a genuinely legitimate PRE-F3
+    // already-rotated log (rotated before F3 shipped 2026-06-06, no anchor, and
+    // never loaded since) no longer silently self-heals; it now surfaces this
+    // finding once and the operator re-establishes via `--accept-broken-chain`.
+    // Any F3+ rotation writes an authenticated anchor (handled above), so only
+    // that vanishing never-loaded-since population is affected, and for it the
+    // outcome is fail-closed (a finding), never corruption.
+    //
+    // IRREDUCIBLE RESIDUAL (documented, NOT claimed closed): this invariant
+    // relies on the SURVIVING entries. It cannot distinguish this from a
+    // legitimate history on evidence alone; a floor that does not live in a
+    // single deletable file (boot-anchored / externally attested) is required
+    // to close the "delete every witness" case fully, same class as F1/F3's
+    // documented boot-anchor residual (CLAUDE.md "Known Complexity" #6).
     findings.push({
       kind: "rotation_anchor_missing",
       sequence: lowestChainedSeq,
-      message: `audit chain starts at sequence ${lowestChainedSeq} (above ${defaultSeedSequence}) with no rotation anchor and is not internally contiguous (entries may have been truncated)`,
+      message: `audit chain starts at sequence ${lowestChainedSeq} (above ${defaultSeedSequence}) with no authenticated rotation anchor; an above-genesis suffix without an authenticated cut is evidence of a deleted prefix and is NOT self-healed`,
     });
     return {
       expectedSequence: lowestChainedSeq,
@@ -1546,23 +3121,10 @@ export class AuditLog {
     };
   }
 
-  /**
-   * True iff the chained entries form an unbroken run: each sequence is exactly
-   * one above its predecessor and each prev_hash equals the predecessor's
-   * entry_hash. Used to decide whether an anchor-less rotated log is a legitimate
-   * pre-F3 prune (TOFU-acceptable) versus a truncated chain.
-   */
-  private isChainInternallyContiguous(
-    chainedEntries: Array<{ envelope: PersistedAuditEnvelopeV2 }>
-  ): boolean {
-    for (let i = 1; i < chainedEntries.length; i++) {
-      const prev = chainedEntries[i - 1]!.envelope;
-      const curr = chainedEntries[i]!.envelope;
-      if (curr.sequence !== prev.sequence + 1) return false;
-      if (curr.prev_hash !== prev.entry_hash) return false;
-    }
-    return true;
-  }
+  // (`isChainInternallyContiguous` was removed in round 3: the anchor-absent
+  // above-genesis suffix is now unconditionally fail-closed per HIGH-1, so the
+  // contiguous-vs-not distinction no longer gates a TOFU self-heal. The forward
+  // chain walk still localizes any internal break.)
 
   /**
    * Read-only verified view of the surviving hash chain, pairing each chained
@@ -1574,21 +3136,56 @@ export class AuditLog {
    * throws `AuditIntegrityError` — a transparency checkpoint must never be
    * minted over a log that does not verify (fail closed, never degrade).
    */
-  async verifiedChainView(): Promise<
-    Array<{ sequence: number; entry_hash: string; entry: AuditEntry }>
-  > {
+  async verifiedChainView(): Promise<Array<VerifiedChainItem>> {
+    // Backward-compatible array view: materializes the full chain (so it is as
+    // memory-heavy as a caller that genuinely needs the whole array), but is now
+    // backed by the streaming verifier so it shares ONE verification path with
+    // {@link streamVerifiedChain}. Long-running daemon hot paths (transparency
+    // emit, against-log recount, workload replay) call streamVerifiedChain
+    // directly so the whole decrypted chain is never resident at once; that is
+    // the daemon-OOM-on-a-large-log fix. This array variant is retained for
+    // tests and any caller that legitimately wants the materialized view.
+    const view: Array<VerifiedChainItem> = [];
+    await this.streamVerifiedChain({
+      onEntry: (item) => view.push(item),
+      // A torn-read retry restarts the pass: drop the partially-built array so
+      // the returned view is exactly the single accepted verified pass.
+      reset: () => {
+        view.length = 0;
+      },
+    });
+    return view;
+  }
+
+  /**
+   * Streaming verified view of the surviving hash chain. Runs the SAME strict
+   * chain verification as {@link verifiedChainView} (it throws
+   * `AuditIntegrityError` in strict mode on a chain that does not verify, so a
+   * transparency checkpoint is never minted over a tampered log), but hands each
+   * chained entry to `consumer.onEntry` in ascending chain-sequence order and
+   * then RELEASES it. The full decrypted chain is never simultaneously resident,
+   * so a large on-disk log no longer allocates its whole multi-GB decrypted
+   * payload set per call.
+   *
+   * Ordering / tamper-evidence (read carefully, the safety is in the await, not
+   * a pre-stream gate): `onEntry` fires DURING the decrypt loop, so each entry is
+   * decrypted + hash-checked before the consumer sees it, but the FULL-CHAIN
+   * checks (the contiguous sequence/prev-hash walk, the legacy / rotation / head
+   * anchors, the checkpoint roots) run AFTER the loop, on cheap envelope metadata.
+   * The guarantee a consumer relies on is therefore the AWAIT boundary, not a
+   * pre-stream verification: this method does not resolve until those full-chain
+   * checks have run, and in strict mode it THROWS `AuditIntegrityError` if any
+   * failed. So a consumer that commits its incremental fold only AFTER
+   * `await streamVerifiedChain(...)` returns clean never commits a result over an
+   * unverified or tampered chain (a mid-stream tamper makes the await reject, the
+   * fold is discarded). The full-chain invariants are derived from envelope
+   * metadata and on-disk reads, never from a materialized decrypted array, so
+   * streaming changes WHEN payloads are released, not WHAT is verified. See
+   * {@link VerifiedChainConsumer} for the `reset` (read-consistency) contract.
+   */
+  async streamVerifiedChain(consumer: VerifiedChainConsumer): Promise<void> {
     await this.appendQueue;
-    await this.reloadPersistedEntries();
-    // this.entries is [legacy..., chained...] in order; the chained suffix
-    // aligns 1:1 with this.chainEntries (both built from the same load pass).
-    const chainedEntries = this.entries.slice(
-      this.entries.length - this.chainEntries.length
-    );
-    return this.chainEntries.map((chained, index) => ({
-      sequence: chained.sequence,
-      entry_hash: chained.entry_hash,
-      entry: chainedEntries[index]!,
-    }));
+    await this.reloadPersistedEntries(consumer);
   }
 
   /**
@@ -1687,6 +3284,49 @@ export class AuditLog {
     const entries = filtered.slice(-limit); // Most recent entries
 
     return { entries, total, integrity_findings: [...this.integrityFindings] };
+  }
+
+  /**
+   * Read-only view of the configured FIFO retention caps. Exposed for
+   * calendar-period reporters (the law-firm evidence pack) that must disclose
+   * a covered-window shortfall when size-based retention may have pruned
+   * early-period entries. Returns configuration only; no entries, no keys.
+   */
+  getRetentionConfig(): { maxEntries: number; maxTotalSizeBytes: number } {
+    return {
+      maxEntries: this.maxEntries,
+      maxTotalSizeBytes: this.maxTotalSizeBytes,
+    };
+  }
+
+  /**
+   * Read-only view of the CURRENT on-disk retention usage: the retained entry
+   * count, the total on-disk size in bytes, and whether the log has ever pruned
+   * (a rotation anchor exists). Exposed for calendar-period reporters (the
+   * law-firm evidence pack) so a covered-window shortfall can distinguish
+   * size-cap pruning from genuine inactivity (retention prunes on EITHER the
+   * entry cap OR the size cap). Returns metadata sums only; no entries decrypted,
+   * no keys touched. `everPruned` is best-effort: an unreadable anchor namespace
+   * yields `null` so the caller does not over-claim "never pruned".
+   */
+  async getRetentionUsage(): Promise<{
+    entryCount: number;
+    totalSizeBytes: number;
+    everPruned: boolean | null;
+  }> {
+    const metas = await this.storage.list(AUDIT_NAMESPACE);
+    const totalSizeBytes = metas.reduce((sum, m) => sum + m.size_bytes, 0);
+    let everPruned: boolean | null;
+    try {
+      const anchor = await this.storage.read(
+        AUDIT_CHECKPOINT_NAMESPACE,
+        AUDIT_ROTATION_ANCHOR_KEY
+      );
+      everPruned = anchor !== null;
+    } catch {
+      everPruned = null;
+    }
+    return { entryCount: metas.length, totalSizeBytes, everPruned };
   }
 
   /**
@@ -1924,8 +3564,10 @@ export class AuditLog {
     }
   }
 
-  private async reloadPersistedEntries(): Promise<void> {
-    await this.loadPersistedEntriesWithReadConsistency();
+  private async reloadPersistedEntries(
+    consumer?: VerifiedChainConsumer
+  ): Promise<void> {
+    await this.loadPersistedEntriesWithReadConsistency(consumer);
     this.loaded = true;
     await this.reportIntegrityFindingsIfAny();
     const contextAllowsIntegrityFindings =
@@ -1939,11 +3581,21 @@ export class AuditLog {
     }
   }
 
-  private async loadPersistedEntriesWithReadConsistency(): Promise<void> {
+  private async loadPersistedEntriesWithReadConsistency(
+    consumer?: VerifiedChainConsumer
+  ): Promise<void> {
     const deadline = Date.now() + AUDIT_READ_CONSISTENCY_MAX_MS;
     let lastSignature: string | null = null;
+    let streamedThisLoop = false;
     for (;;) {
-      await this.loadPersistedEntries();
+      // A retry means the prior pass observed a transient mid-mutation state and
+      // is being discarded. Tell the streaming consumer to drop everything it
+      // accumulated from that abandoned pass BEFORE we re-decrypt, so the entries
+      // it keeps are exactly those of the single accepted pass (the one we return
+      // from). The first pass needs no reset (nothing accumulated yet).
+      if (consumer && streamedThisLoop) consumer.reset?.();
+      await this.loadPersistedEntries(consumer);
+      streamedThisLoop = consumer !== undefined;
       if (this.integrityFindings.length === 0) {
         return; // clean read
       }
@@ -2023,22 +3675,30 @@ export class AuditLog {
       recursive: true,
       mode: 0o700,
     });
+    // Once-per-process: GC any `.acquire.*.tmp` a prior process's crash/kill-9
+    // stranded between `link()` and its cleanup (invisible to `list()`, litter
+    // only). Bounded and best-effort so it can never block or fail an acquire.
+    await this.sweepStaleAcquireTempsOnce(this.auditWriteLockPath);
     const started = Date.now();
+    // Identity (dev+ino) of the lock file THIS acquire published, captured at
+    // acquire time. The graceful release below unlinks ONLY if the path still
+    // resolves to this exact inode, symmetric with the stale-break path: if the
+    // lock was ever broken-and-republished under us (a fresh inode at the same
+    // path), a bare `rm(path)` would delete the NEW holder's lock and let two
+    // writers proceed. `unlinkIfSameInode` rejects that. See atomicAcquireAuditLock.
+    let heldLockStats: Stats | undefined;
     let acquired = false;
     while (!acquired) {
       try {
-        const handle = await open(this.auditWriteLockPath, "wx", 0o600);
-        try {
-          await handle.writeFile(
-            JSON.stringify({
-              pid: process.pid,
-              acquired_at: new Date().toISOString(),
-            })
-          );
-          await handle.sync();
-        } finally {
-          await handle.close();
-        }
+        // Atomic acquire (drill-found fix, Leg 5, MBA 2026-07-15): stamp a fully
+        // populated lock into a temp file (with `pid` + `acquired_at`), fsync it,
+        // then `link()` it into place. `link` fails with EEXIST if the lock is
+        // already held, giving the same mutual-exclusion guarantee as `open(wx)`,
+        // but the visible lock file NEVER exists in a content-less state; there
+        // is no create-then-stamp window in which a crash can strand a 0-byte
+        // lock its own staleness-prover cannot clear. A crash before the `link`
+        // leaves only the temp file (cleaned up below / ignored by the prover).
+        heldLockStats = await this.atomicAcquireAuditLock(this.auditWriteLockPath);
         acquired = true;
       } catch (err) {
         const code =
@@ -2064,32 +3724,322 @@ export class AuditLog {
     try {
       return await operation();
     } finally {
-      await rm(this.auditWriteLockPath, { force: true });
+      // Inode-verified release (symmetric with the stale-break path). Delete the
+      // lock only if it is still the file WE published; if a broken-and-republished
+      // lock now occupies the path with a different inode, leave it (never clobber
+      // the new holder). Fall back to a bare `rm` only if we somehow hold no
+      // captured identity, so a release never silently leaks the lock.
+      //
+      // A REAL unlink failure (EIO/EPERM/EROFS) now PROPAGATES rather than being
+      // swallowed: `unlinkIfSameInode` returns for the benign outcomes (the file
+      // was ours and removed, was already gone, or a different inode now occupies
+      // the path → not ours) and THROWS only on a genuine fs error. Swallowing
+      // that error would leave our lock on disk still carrying our live same-boot
+      // pid, which the next acquirer cannot prove stale → permanent self-brick.
+      // Surfacing it is invariant 5 (never silently degrade to a leaked lock).
+      if (heldLockStats) {
+        await this.unlinkIfSameInode(this.auditWriteLockPath, heldLockStats);
+      } else {
+        await rm(this.auditWriteLockPath, { force: true });
+      }
     }
   }
 
   /**
-   * Break the audit-write lock iff it is PROVABLY stale, returning true when a
-   * stale lock was removed. Staleness is proven two ways, both robust:
+   * Once per process, sweep orphaned audit-lock acquire-temps
+   * (`<lockfile>.acquire.*.tmp`) whose mtime is older than
+   * {@link idlessStaleLockMs}. A crash / kill -9 between `link()` and the
+   * `finally` unlink in {@link atomicAcquireAuditLock} strands one of these
+   * permanently: it is invisible to `list()` (which filters to `.enc`) and never
+   * consulted by the staleness prover, so it is pure litter that accumulates
+   * across restarts. Age-gating past the generous id-less bound guarantees a
+   * temp a CONCURRENT acquirer is mid-flight with (sub-second) is never reaped.
+   * Best-effort and bounded: any error is swallowed so the sweep can never block
+   * or fail a write-lock acquire.
+   */
+  private async sweepStaleAcquireTempsOnce(lockPath: string): Promise<void> {
+    if (this.staleAcquireTempsSwept) return;
+    this.staleAcquireTempsSwept = true;
+    try {
+      const dir = dirname(lockPath);
+      const lockBase = lockPath.slice(dir.length + 1);
+      const tempPrefix = lockBase + AUDIT_LOCK_ACQUIRE_TEMP_INFIX;
+      const entries = await readdir(dir);
+      const now = Date.now();
+      for (const name of entries) {
+        if (!name.startsWith(tempPrefix) || !name.endsWith(AUDIT_LOCK_ACQUIRE_TEMP_SUFFIX)) {
+          continue;
+        }
+        const tempPath = join(dir, name);
+        try {
+          const st = await stat(tempPath);
+          if (now - st.mtimeMs > this.idlessStaleLockMs) {
+            await unlink(tempPath).catch(() => undefined);
+          }
+        } catch {
+          // Vanished or unstattable between readdir and stat: nothing to reap.
+        }
+      }
+    } catch {
+      // Listing the audit dir failed (e.g. not yet created): no temps to sweep.
+    }
+  }
+
+  /**
+   * Atomically create the audit write lock already carrying its `{pid,
+   * acquired_at, uptime_ms, boot_id}` stamp, or throw `EEXIST` if it is already
+   * held. Returns the `Stats` (dev+ino) of the published lock so the caller's
+   * graceful release can be inode-verified (symmetric with the stale-break path).
    *
-   *   - The lock's `acquired_at` predates the current system boot. A lock that
-   *     survived a reboot is definitionally orphaned, and this is immune to PID
-   *     reuse (the recorded PID may now belong to an unrelated process).
+   * Drill-found fix (Leg 5, MBA 2026-07-15): the prior acquire did
+   * `open(path,"wx")` (which creates the file EMPTY) and only THEN wrote the
+   * stamp. A crash / kill -9 / power-loss in that window stranded a 0-byte lock,
+   * and `breakStaleAuditLock` (which proves staleness from `pid`/`acquired_at`)
+   * cannot clear a content-less file, so the fortress was permanently bricked
+   * with a misleading "another writer holds the lock". This closes the window:
+   * the fully-stamped payload is written + fsync'd to a temp file first, then
+   * `link()`-ed into place. `link` is atomic and fails with EEXIST when the lock
+   * already exists (same mutual exclusion as `open(wx)`), so the visible lock
+   * file only ever exists WITH its stamp. A crash before the `link` leaves at
+   * most an orphan temp file, which is cleaned up here and never consulted by
+   * the staleness prover.
+   *
+   * `boot_id` (a per-boot IDENTITY UUID; see {@link currentBootId}) is the
+   * PRIMARY same-boot proof: `breakStaleAuditLock` protects a live same-boot lock
+   * only when the lock's `boot_id` equals the current boot's, and treats any
+   * mismatch as definitive reboot evidence. `uptime_ms` (system `os.uptime()` at
+   * acquire) is a MONOTONIC magnitude used WITHIN a proven-same boot to tell our
+   * own live lock from a reused-self-pid orphan without trusting the wall clock;
+   * unlike `boot_id`, a bare uptime magnitude aliases across reboots, so it is
+   * never consulted unless `boot_id` has already proven the same boot.
+   */
+  private async atomicAcquireAuditLock(lockPath: string): Promise<Stats> {
+    // The temp name uses a CRYPTO-RANDOM component (not just pid + time +
+    // counter) so it is unpredictable: combined with the O_EXCL (`"wx"`) create
+    // below and the operator-owned 0700 audit dir it lives in, an attacker
+    // cannot pre-create a symlink at a guessable temp path to redirect the write
+    // (CodeQL js/insecure-temporary-file). The pid + counter are retained only
+    // for human-readable provenance in a crash-orphan.
+    const tempPath =
+      `${lockPath}${AUDIT_LOCK_ACQUIRE_TEMP_INFIX}${process.pid}.` +
+      `${(auditLockTempCounter++).toString(36)}.` +
+      `${randomBytes(12).toString("hex")}${AUDIT_LOCK_ACQUIRE_TEMP_SUFFIX}`;
+    let tempCreated = false;
+    // Inode identity of the file we publish. `link` is a hard link, so `lockPath`
+    // shares the temp's inode: capturing it from the OPEN handle (before close,
+    // hence before the link) is race-free: it is exactly the inode `lockPath`
+    // will resolve to, with no window for another actor to swap it.
+    let publishedStats: Stats | undefined;
+    try {
+      const handle = await open(tempPath, "wx", 0o600);
+      tempCreated = true;
+      try {
+        const uptimeMs = currentUptimeMs();
+        const bootId = currentBootId();
+        await handle.writeFile(
+          JSON.stringify({
+            pid: process.pid,
+            acquired_at: new Date().toISOString(),
+            ...(uptimeMs !== undefined ? { uptime_ms: Math.round(uptimeMs) } : {}),
+            ...(bootId !== undefined ? { boot_id: bootId } : {}),
+          })
+        );
+        await handle.sync();
+        publishedStats = await handle.stat();
+      } finally {
+        await handle.close();
+      }
+      // Atomic publish: EEXIST here means the lock is already held; propagate it
+      // so the caller's contention/break loop handles it exactly as before.
+      await link(tempPath, lockPath);
+    } finally {
+      if (tempCreated) {
+        // The temp name is no longer needed whether the link succeeded, the link
+        // threw, or the write/sync/close between them threw: `link` created a
+        // second name for the same inode (so `lockPath` keeps it), and every
+        // other path leaves only the orphan temp to reclaim. Cleaning up on the
+        // whole post-create range (not just after a successful stamp) prevents
+        // orphan-temp litter accumulating in the audit dir on partial failures.
+        await unlink(tempPath).catch(() => undefined);
+      }
+    }
+    // Reached only when the link succeeded (any failure above threw); the handle
+    // stat always populated publishedStats before the link, so this is defined.
+    return publishedStats!;
+  }
+
+  /**
+   * Remove `lockPath` ONLY if it still resolves to the SAME inode
+   * (`dev`+`ino`) that {@link breakStaleAuditLock} just proved stale, returning
+   * true iff the proven-stale file was removed (or had already vanished).
+   *
+   * Pathname-TOCTOU guard (Codex re-gate, 2026-07-15): break-by-path can, under
+   * concurrent acquirers, delete a DIFFERENT file than the one proven stale: a
+   * racing acquirer may have already broken the stale lock and published a fresh
+   * live lock at the same path, which a delayed `rm(lockPath)` would then
+   * clobber, letting two writers believe they hold the lock. Re-checking inode
+   * identity immediately before removal rejects exactly that case (a fresh lock
+   * has a new inode). The residual window between this re-`stat` and the `rm` is
+   * a couple of syscalls; any double-acquire it could still permit is caught by
+   * the hash-chain's contiguous-sequence verification on the next load (fail
+   * closed as a detected integrity finding, never a silent fork).
+   */
+  private async unlinkIfSameInode(
+    lockPath: string,
+    proven: Stats
+  ): Promise<boolean> {
+    let current: Stats;
+    try {
+      current = await stat(lockPath);
+    } catch (err) {
+      const code =
+        err instanceof Error && "code" in err
+          ? String((err as NodeJS.ErrnoException).code)
+          : "";
+      // Already gone: another writer removed the proven-stale lock; effectively
+      // broken from our perspective. A REAL fs error (EACCES/EIO/…) is NOT
+      // "already gone" and must NOT be laundered into a benign `false`: surface
+      // it so a caller (esp. the graceful release) never silently treats a lock
+      // it could not verify as released (invariant 5: never silently degrade).
+      if (code === "ENOENT") return true;
+      throw err;
+    }
+    if (current.dev !== proven.dev || current.ino !== proven.ino) {
+      // A different file object now occupies the path (a racing acquirer already
+      // broke the stale lock and published a fresh one). Do NOT remove it. This
+      // is the one benign `false`: not an error, just "not ours to remove".
+      return false;
+    }
+    // `rm(force)` swallows ENOENT (someone else removed it first → gone, fine)
+    // but PROPAGATES a real removal error (EIO/EPERM/EROFS). That propagation is
+    // intentional and must reach the caller: a swallowed release failure leaves
+    // our lock on disk still carrying our live same-boot pid, which the next
+    // acquirer cannot prove stale → permanent self-brick.
+    await rm(lockPath, { force: true });
+    return true;
+  }
+
+  /**
+   * Break the audit-write lock iff it is PROVABLY stale, returning true when a
+   * stale lock was removed. Staleness is proven several ways, all robust:
+   *
+   *   - BOOT-IDENTITY (primary; a per-boot UUID stamp, see {@link
+   *     currentBootId}). When the lock's `boot_id` proves a DIFFERENT boot than
+   *     the current one, the lock survived a reboot and is definitionally
+   *     orphaned REGARDLESS of pid liveness (a reboot can reuse the dead holder's
+   *     pid for a live process, foreign OR our own reclaimed pid), so it is
+   *     broken, and this check runs BEFORE any pid-liveness "protect" path.
+   *     When `boot_id` proves the SAME boot, the monotonic `uptime_ms` / pid
+   *     reasoning is valid and immune to a wall-clock step, so a live same-boot
+   *     holder is protected (legitimate contention) and a same-boot crash orphan
+   *     (dead pid, or our own reused pid stamped before our start) is broken.
+   *     This is what a bare `uptime_ms` MAGNITUDE cannot do alone: uptime resets
+   *     on reboot, so a previous boot's value ALIASES into this boot's range and
+   *     a reboot orphan with a reused-alive pid would masquerade as live (the
+   *     #944 permanent-brick regression this gating closes).
+   *   - WALL-CLOCK FALLBACK (locks with NO `boot_id`, i.e. old format, or when the
+   *     boot-identity source is unavailable in a confined sandbox): the lock's
+   *     `acquired_at` predates the current system boot. A lock that survived a
+   *     reboot is definitionally orphaned, and this is immune to PID reuse (the
+   *     recorded PID may now belong to an unrelated process, INCLUDING this very
+   *     process: after a reboot the OS can hand us the dead holder's old pid, so
+   *     this proof is checked BEFORE the self-pid guard). This restores the
+   *     pre-PR behavior for old-format locks: strong reboot evidence WINS.
+   *   - The recorded pid is OURS but `acquired_at` predates THIS process's start
+   *     (a reused-self-pid orphan): we had not started when it was stamped, so it
+   *     cannot be a lock we hold. Uses `process.uptime()` (no `uv_uptime`
+   *     syscall), so it breaks the orphan even when boot time is unavailable in a
+   *     confined-uid sandbox (Opus re-gate NEW-1, 2026-07-15).
    *   - The recorded holder PID is not alive. Covers a same-boot crash / kill
    *     before the PID has been reused.
+   *   - Drill-found (Leg 5, MBA 2026-07-15): the lock is a genuinely EMPTY
+   *     (0-byte) file (the exact torn-acquire artifact) AND its file mtime
+   *     predates boot OR exceeds the id-less stale bound ({@link
+   *     AuditLogConfig.idlessStaleLockMs}, default {@link
+   *     AUDIT_WRITE_LOCK_IDLESS_STALE_MS}). A legitimate holder always stamps
+   *     `{pid, acquired_at, uptime_ms, boot_id}` (and, since the atomic-acquire
+   *     fix, the lock file never exists content-less), so a 0-byte lock can only
+   *     be a torn acquire from an old binary or an out-of-band tool. Gated on
+   *     `size === 0` (not merely "no id parsed"): a NON-empty but unparseable
+   *     lock stays fail-closed, since it could be a live holder writing a format
+   *     this build does not understand.
+   *
+   * Documented residual: for an OLD-format lock (no `boot_id`), or in a sandbox
+   * with no boot-identity source, a large forward wall-clock step can still make
+   * a live same-boot lock's `acquired_at` look pre-boot and break it (the
+   * original clock-skew case). Every lock THIS build writes carries a `boot_id`
+   * and is immune (the same-boot identity match protects it). A false-break is
+   * detected fail-closed by the hash-chain's contiguous-sequence check on the
+   * next load (a detected integrity finding, never a silent fork). The lock is a
+   * LOCAL-ONLY, single-host, single-boot coordination primitive; the boot-
+   * identity / monotonic reasoning is not valid across a shared network
+   * filesystem.
    *
    * A lock held by a live process acquired during this boot is left untouched
-   * (legitimate contention). An unreadable / corrupt / pid-less lock cannot be
-   * proven stale, so it is also left untouched (fail-safe: never break a lock we
-   * cannot prove is dead). Fixes the daemon-cannot-restart-after-reboot defect
-   * surfaced by the A1 acceptance drill (2026-06-04, reboot 2).
+   * (legitimate contention). A lock that carries an id but cannot be proven
+   * stale, or a non-empty lock this build cannot parse, is left untouched
+   * (fail-safe: never break a lock we cannot prove is dead). Every removal goes
+   * through {@link unlinkIfSameInode} so a racing acquirer's fresh lock is never
+   * clobbered by a delayed break. Fixes the daemon-cannot-restart-after-reboot
+   * defect (A1 drill 2026-06-04, reboot 2) and the permanently-bricking 0-byte
+   * lock (MBA custody drill 2026-07-15).
+   *
+   * Availability limitation (documented, not a proof): a 0-byte lock with a
+   * FUTURE mtime is deliberately NOT broken here (it neither predates boot nor
+   * exceeds the age bound). Planting such a file requires fortress-uid write
+   * access, i.e. prior full compromise, at which point the attacker could
+   * destroy the audit log directly; this fallback is an availability aid for
+   * honest torn acquires, not a defense against a uid-level adversary.
    */
   private async breakStaleAuditLock(lockPath: string): Promise<boolean> {
+    // Capture the identity + metadata AND the content of the EXACT file we are
+    // about to reason about from a SINGLE open file descriptor: `fstat` + read
+    // on one fd is a consistent snapshot, so the metadata (inode, size, mtime)
+    // and the parsed `{pid, acquired_at}` always describe the same file object.
+    // This closes the stat->read TOCTOU a separate path-based `stat()` then
+    // `readFile()` would open (CodeQL js/file-system-race), and the captured
+    // inode is re-verified by `unlinkIfSameInode` before the eventual removal so
+    // a racing acquirer's fresh lock is never clobbered.
+    let proven: Stats;
+    let rawContent: string;
+    let handle: Awaited<ReturnType<typeof open>>;
+    try {
+      handle = await open(lockPath, "r");
+    } catch (err) {
+      const code =
+        err instanceof Error && "code" in err
+          ? String((err as NodeJS.ErrnoException).code)
+          : "";
+      // Vanished: another writer released it; retry. Otherwise (e.g. EACCES):
+      // cannot inspect, cannot prove stale.
+      if (code === "ENOENT") return true;
+      return false;
+    }
+    try {
+      proven = await handle.stat();
+      rawContent = await handle.readFile("utf8");
+    } catch (err) {
+      const code =
+        err instanceof Error && "code" in err
+          ? String((err as NodeJS.ErrnoException).code)
+          : "";
+      if (code === "ENOENT") return true;
+      return false;
+    } finally {
+      await handle.close().catch(() => undefined);
+    }
+
     let holderPid: number | undefined;
     let acquiredAtMs: number | undefined;
+    let lockUptimeMs: number | undefined;
+    let lockBootId: string | undefined;
     try {
-      const raw = await readFile(lockPath, "utf8");
-      const parsed = JSON.parse(raw) as { pid?: unknown; acquired_at?: unknown };
+      const parsed = JSON.parse(rawContent) as {
+        pid?: unknown;
+        acquired_at?: unknown;
+        uptime_ms?: unknown;
+        boot_id?: unknown;
+      };
       if (typeof parsed.pid === "number" && Number.isInteger(parsed.pid)) {
         holderPid = parsed.pid;
       }
@@ -2097,30 +4047,159 @@ export class AuditLog {
         const t = Date.parse(parsed.acquired_at);
         if (!Number.isNaN(t)) acquiredAtMs = t;
       }
-    } catch (err) {
-      const code =
-        err instanceof Error && "code" in err
-          ? String((err as NodeJS.ErrnoException).code)
-          : "";
-      // Vanished between open() and read(): another writer released it; retry.
-      if (code === "ENOENT") return true;
-      // Unreadable / corrupt content: cannot prove staleness — do not break.
-      return false;
+      if (typeof parsed.uptime_ms === "number" && Number.isFinite(parsed.uptime_ms)) {
+        lockUptimeMs = parsed.uptime_ms;
+      }
+      if (typeof parsed.boot_id === "string" && parsed.boot_id.length > 0) {
+        lockBootId = parsed.boot_id;
+      }
+    } catch {
+      // Empty or non-JSON content: no id to parse. Handled by the 0-byte
+      // fallback below (only when genuinely empty); non-empty stays fail-closed.
     }
 
-    if (holderPid === process.pid) return false;
+    // ── Boot-identity-gated staleness reasoning ─────────────────────────────
+    // A per-boot IDENTITY token (`boot_id`; a UUID minted fresh each boot, see
+    // currentBootId) answers "was this lock stamped during the CURRENT boot?"
+    // PROVABLY. This is what a raw uptime MAGNITUDE cannot do: `os.uptime()`
+    // resets to 0 on reboot, so a PREVIOUS boot's `uptime_ms` falls in the same
+    // numeric range as this boot's and ALIASES: a reboot orphan (whose recorded
+    // pid a reboot then reused for a live process) looks exactly like a live
+    // same-boot lock. Gating the "this is a live lock, protect it" decision on
+    // boot-identity EQUALITY lets us protect a genuine live same-boot lock
+    // WITHOUT ever shadowing the reboot-orphan proof (the #944 permanent-brick
+    // regression this closes).
+    //
+    // Local-only invariant (documented): this lock coordinates writers on ONE
+    // host's local filesystem. `boot_id` / `os.uptime()` are comparable only
+    // within a single machine; this must NOT be pointed at a shared network
+    // filesystem where they would come from a different host.
+    const currentBoot = currentBootId();
+    const bootIdentityKnown = lockBootId !== undefined && currentBoot !== undefined;
+    const bootIdentitySameBoot = bootIdentityKnown && lockBootId === currentBoot;
+    const bootIdentityDifferentBoot = bootIdentityKnown && lockBootId !== currentBoot;
 
+    // TIE-BREAK (mandatory): a boot-identity that proves a DIFFERENT boot is the
+    // STRONGEST reboot proof there is: the lock survived a reboot, so it is
+    // definitionally orphaned REGARDLESS of pid liveness (a reboot can hand the
+    // dead holder's pid to a live process, foreign OR our own reclaimed pid).
+    // Checked BEFORE any pid-liveness "protect" path so a reused-alive pid can
+    // never keep a reboot orphan intact. Rows A/B of the acceptance table.
+    if (bootIdentityDifferentBoot) {
+      return this.unlinkIfSameInode(lockPath, proven);
+    }
+
+    const currentUptime = currentUptimeMs();
+    const ourStartUptime =
+      currentUptime !== undefined ? currentUptime - process.uptime() * 1000 : undefined;
+
+    // SAME boot PROVEN → the monotonic uptime / pid-liveness reasoning is valid
+    // and immune to a wall-clock step, so we can safely protect a live same-boot
+    // lock (rows D/E) and break a same-boot crash orphan, with no risk of
+    // shadowing the reboot proof, since a reboot would have failed the identity
+    // match above. Only reached when boot-identity is KNOWN and equal.
+    if (bootIdentitySameBoot && holderPid !== undefined) {
+      if (holderPid === process.pid) {
+        // Our own pid, PROVEN same boot. If a monotonic `uptime_ms` stamp is
+        // present and predates THIS process's start, a dead predecessor reclaimed
+        // our pid this boot → reused-self orphan → break (clock-step-immune).
+        // If it is at/after our start, the lock is genuinely ours → never break.
+        // If no uptime stamp is present we cannot decide here; fall through to
+        // the wall-clock reused-self proof below (process.uptime()-based).
+        // Documented residual (mirrors the id-less note below): a same-boot
+        // OWN-PID lock LACKING `uptime_ms` reaches the wall-clock reused-self
+        // proof, so a large forward clock step can make our own live lock's
+        // `acquired_at` appear to predate our process start and false-break it.
+        // A false-break is detected fail-closed by the hash-chain
+        // contiguous-sequence check on the next load (never a silent fork).
+        // atomicAcquireAuditLock stamps `uptime_ms`/`boot_id` CONDITIONALLY
+        // (their platform sources can be unavailable), so the residual covers
+        // locks written by older binaries AND current builds on hosts where
+        // those sources return undefined.
+        if (lockUptimeMs !== undefined && ourStartUptime !== undefined) {
+          if (lockUptimeMs < ourStartUptime - AUDIT_LOCK_MONO_UPTIME_TOLERANCE_MS) {
+            return this.unlinkIfSameInode(lockPath, proven);
+          }
+          return false;
+        }
+      } else if (isProcessAlive(holderPid)) {
+        // A live FOREIGN holder that PROVABLY stamped this boot → legitimate
+        // contention. Protect it from the wall-clock `predatesBoot` proof below,
+        // which a forward clock step could otherwise use to break this live lock.
+        return false;
+      } else {
+        // Foreign holder, proven same boot, NOT alive → same-boot crash orphan.
+        return this.unlinkIfSameInode(lockPath, proven);
+      }
+    }
+
+    // UNKNOWN boot-identity (old-format lock with no `boot_id`, or boot-identity
+    // unavailable in a confined sandbox): we CANNOT prove same-boot, so we must
+    // NOT protect on pid-liveness alone: that is exactly what would let a reboot
+    // orphan with a reused-alive pid survive → brick. Fall through to the
+    // wall-clock reboot proofs below (`predatesBoot`-unconditional, the pre-PR
+    // fail-safe behavior), which break a reboot orphan. Documented residual: an
+    // OLD-format live same-boot lock under a large forward clock step can still
+    // be false-broken here (predatesBoot); every lock THIS build writes carries a
+    // `boot_id` and is immune. A false-break is detected fail-closed by the
+    // hash-chain contiguous-sequence check on the next load (never a silent
+    // fork), the same residual the id-less path documents.
     const bootTimeMs = currentBootTimeMs();
     const predatesBoot =
       acquiredAtMs !== undefined &&
       bootTimeMs !== undefined &&
       acquiredAtMs < bootTimeMs;
-    const holderDead = holderPid !== undefined && !isProcessAlive(holderPid);
-    if (!predatesBoot && !holderDead) return false;
+    // A lock whose recorded pid is OURS but whose acquired_at predates our own
+    // process start cannot be a lock this process holds (we had not started when
+    // it was stamped), so it is a reused-pid orphan. `process.uptime()` needs no
+    // `uv_uptime` syscall, so this proof holds even in the confined-uid sandbox
+    // that can leave `currentBootTimeMs()` undefined; without it, a restarted
+    // fixed-role daemon that reclaims its old pid across a reboot would re-brick
+    // exactly the way the boot proof is meant to prevent (Opus re-gate NEW-1,
+    // 2026-07-15). Sound because a pid is unique among LIVE processes: a lock
+    // carrying our pid is either ours (stamped at/after our start) or a dead
+    // predecessor's (stamped before), never a concurrent foreign live holder.
+    const processStartMs = currentProcessStartMs();
+    const reusedSelfPidOrphan =
+      holderPid === process.pid &&
+      acquiredAtMs !== undefined &&
+      processStartMs !== undefined &&
+      acquiredAtMs < processStartMs;
 
-    // Best-effort removal; ignore a race where another writer already cleared it.
-    await rm(lockPath, { force: true });
-    return true;
+    // A lock whose OWN acquired_at predates this boot cannot belong to any live
+    // process, INCLUDING this one (we started after boot). Break it regardless
+    // of the recorded pid, and BEFORE the self-pid guard: after a reboot the OS
+    // can reuse the dead holder's pid as ours, and a self-pid short-circuit here
+    // would otherwise refuse to break a genuinely orphaned lock (Codex re-gate,
+    // 2026-07-15).
+    if (predatesBoot || reusedSelfPidOrphan) {
+      return this.unlinkIfSameInode(lockPath, proven);
+    }
+
+    // Our OWN live lock (our pid, stamped at/after our start): never break it.
+    if (holderPid === process.pid) return false;
+
+    if (holderPid !== undefined && !isProcessAlive(holderPid)) {
+      return this.unlinkIfSameInode(lockPath, proven);
+    }
+
+    // 0-byte fallback: a genuinely EMPTY lock carries no id to prove liveness
+    // from, so the pid/boot proofs above can never clear it (the exact
+    // 0-byte-lock brick). It is provably NOT a live holder when its file mtime
+    // predates boot (survived a reboot) or exceeds a generous age bound no
+    // legitimate sub-second hold approaches. Gated on `size === 0` so a
+    // content-bearing lock (parseable or not) is NEVER cleared this way.
+    if (proven.size === 0) {
+      const mtimeMs = proven.mtimeMs;
+      const mtimePredatesBoot = bootTimeMs !== undefined && mtimeMs < bootTimeMs;
+      const exceedsIdlessAgeBound =
+        Date.now() - mtimeMs > this.idlessStaleLockMs;
+      if (mtimePredatesBoot || exceedsIdlessAgeBound) {
+        return this.unlinkIfSameInode(lockPath, proven);
+      }
+    }
+
+    return false;
   }
 
   private async freshenChainStateFromDisk(): Promise<void> {
@@ -2137,35 +4216,70 @@ export class AuditLog {
     }
   }
 
+  /**
+   * Drill-found lock-hold fix (Mini1 fortress drill, 2026-07-12): this used to
+   * read-and-parse EVERY persisted entry to find the max sequence, on every
+   * single append, HELD INSIDE the cross-process `withAuditWriteLock`. On a
+   * non-trivial log that made each append's lock hold time O(n), and under
+   * concurrent writers (egress-probe timer, heartbeats, reload, flow
+   * decisions) the queue backed up past `AUDIT_WRITE_LOCK_TIMEOUT_MS` (5s),
+   * exactly the contention window the drill observed, starving flow-decision
+   * writes with `AuditLockContentionError`.
+   *
+   * `storage.list()` returns keys sorted ascending, and the `entry-` key
+   * embeds the sequence zero-padded to a fixed width (see the `key` built in
+   * `persistChainedEntry`), so the highest-sequence entry is ALWAYS the tail
+   * of `metas`. Walking backward from the tail and stopping at the first
+   * entry that parses as a valid envelope makes the common case O(1) instead
+   * of O(n); a run of malformed/torn trailing entries costs more, but never
+   * more than the prior full scan (fail-safe: this can never see fewer
+   * candidates than necessary to find a valid one, matching the previous
+   * "scan until you find a real entry" behavior exactly).
+   */
   private async readLatestPersistedChainState(): Promise<{
     nextSequence: number;
     lastEntryHash: string;
   } | null> {
+    // F2 Option A: exactly like `loadPersistedEntries`, never attempt a read
+    // on an entry at or below a valid split boundary's sealed tip: those are
+    // the legacy, possibly-permission-denied entries this instance's routine
+    // paths must never touch. Without this, the O(1) backward tail-scan below
+    // would walk straight into a sealed (potentially unreadable) entry on
+    // EVERY `appendCritical` for a fortress with zero post-split entries so
+    // far, throwing on the very read this file's own fix exists to avoid.
+    // Exhausting the walk without finding anything ABOVE the boundary
+    // correctly returns `null` ("nothing new to freshen from"): the
+    // in-memory state was already seeded from the boundary by `ensureLoaded`.
+    const splitBoundary = await this.loadSplitBoundary();
+    const sealedTipSequence =
+      splitBoundary.status === "valid" ? splitBoundary.boundary.sealed_tip_sequence : 0;
+    // F2 Finding 1 (Codex re-gate MED): refresh the cached sealed tip from this
+    // fresh boundary read. `freshenChainStateFromDisk` runs on every append, so
+    // this keeps `cachedSealedTip` current even for a long-lived instance that
+    // first loaded BEFORE the boundary was created (which would otherwise leave
+    // it 0 and make the post-split-suffix marker write miss). Only advance it
+    // (never zero it) so a transient boundary-read failure cannot lose the tip.
+    if (sealedTipSequence > this.cachedSealedTip) {
+      this.cachedSealedTip = sealedTipSequence;
+    }
     const metas = await this.storage.list(AUDIT_NAMESPACE, "entry-");
-    let latest: PersistedAuditEnvelopeV2 | null = null;
-    for (const meta of metas) {
-      const raw = await this.storage.read(AUDIT_NAMESPACE, meta.key);
+    for (let i = metas.length - 1; i >= 0; i--) {
+      const seq = parseEntryKeySequence(metas[i]!.key);
+      if (seq !== null && seq <= sealedTipSequence) break;
+      const raw = await this.storage.read(AUDIT_NAMESPACE, metas[i]!.key);
       if (!raw) continue;
       try {
         const parsed = JSON.parse(bytesToString(raw));
         if (!isPersistedAuditEnvelopeV2(parsed)) continue;
-        if (
-          latest === null ||
-          parsed.sequence > latest.sequence ||
-          (parsed.sequence === latest.sequence &&
-            parsed.timestamp.localeCompare(latest.timestamp) > 0)
-        ) {
-          latest = parsed;
-        }
+        return {
+          nextSequence: parsed.sequence + 1,
+          lastEntryHash: parsed.entry_hash,
+        };
       } catch {
         // Full integrity verification reports malformed entries separately.
       }
     }
-    if (!latest) return null;
-    return {
-      nextSequence: latest.sequence + 1,
-      lastEntryHash: latest.entry_hash,
-    };
+    return null;
   }
 
   private async writeAuditEntryBytes(
@@ -2214,17 +4328,112 @@ export class AuditLog {
     }
   }
 
-  private async loadPersistedEntries(): Promise<void> {
+  /**
+   * Decrypt + strict-verify the full surviving chain.
+   *
+   * Memory contract (the daemon-OOM-on-a-large-log fix): the full decrypted
+   * chain is NEVER simultaneously resident. Each chained entry is decrypted to
+   * (a) prove it decrypts (the `entry_decrypt_failed` integrity check) and
+   * (b) be handed to the streaming `consumer` when one drives this pass, OR slid
+   * into the bounded recent-entry window otherwise; either way the decrypted
+   * payload is then released. The full-chain structures we retain
+   * (`chainedEntries`, `legacyRawEntries`, `this.chainEntries`) carry only cheap
+   * envelope / raw-byte metadata (sequence, entry_hash, prev_hash, key), so a
+   * large on-disk log no longer allocates its whole multi-GB decrypted payload
+   * set per reload. Verification coverage is unchanged: every entry is still
+   * decrypted, hash-checked, chain-walked, and anchor/checkpoint-covered.
+   *
+   * When a `consumer` is supplied (transparency emitter / against-log recount /
+   * workload replay) each decrypted chained entry streams to it in ascending
+   * chain-sequence order (listing order is sequence order because keys carry a
+   * zero-padded sequence, the same invariant the chain walk already relies on)
+   * and the non-streaming window is left untouched for the other callers. The
+   * chain is still verified AFTER the decrypt loop; in strict mode any tamper
+   * finding makes the caller throw `AuditIntegrityError`, discarding whatever the
+   * consumer accumulated (it folds incrementally, never persisting until the
+   * verified pass returns clean), so a tampered log never yields a usable result.
+   */
+  private async loadPersistedEntries(
+    consumer?: VerifiedChainConsumer
+  ): Promise<void> {
     const findings: AuditIntegrityFinding[] = [];
-    const legacyRawEntries: Array<{ key: string; raw: Uint8Array; entry: AuditEntry }> = [];
+    // Cheap full-chain metadata only; no decrypted payloads retained here.
+    const legacyRawEntries: Array<{ key: string; raw: Uint8Array }> = [];
     const chainedEntries: Array<{
       key: string;
       envelope: PersistedAuditEnvelopeV2;
-      entry: AuditEntry;
     }> = [];
+    // Bounded recent-entry window built during the streaming decrypt for the
+    // non-streaming callers (query / posture / append). Only the newest
+    // `maxInMemoryEntries` decrypted entries are kept; older payloads are dropped
+    // as the window slides, so a large chain never materializes its full
+    // decrypted set. A streaming `consumer` keeps NO window; it already received
+    // every chained entry in order.
+    const windowCap = this.maxInMemoryEntries;
+    const recentEntries: AuditEntry[] = [];
+    const recentChained: Array<{ sequence: number; entry_hash: string }> = [];
+    const pushWindow = (
+      entry: AuditEntry,
+      chained: { sequence: number; entry_hash: string } | null
+    ): void => {
+      if (consumer) return; // streaming consumer keeps no window
+      recentEntries.push(entry);
+      if (chained) recentChained.push(chained);
+      // Trim the OLDEST entries from the front in lockstep with their aligned
+      // chained twins (legacy entries, which have no chained twin, are dropped
+      // first) so `recentEntries.length - recentChained.length` stays equal to
+      // the surviving legacy count (the same alignment invariant the append
+      // path's trimInMemoryRetention preserves).
+      const overflow = recentEntries.length - windowCap;
+      if (overflow > 0) {
+        const legacyResident = recentEntries.length - recentChained.length;
+        recentEntries.splice(0, overflow);
+        const chainedDropped = Math.max(0, overflow - legacyResident);
+        if (chainedDropped > 0) recentChained.splice(0, chainedDropped);
+      }
+    };
 
     try {
-      const storedEntries = await this.storage.list(AUDIT_NAMESPACE);
+      // F2 Option A: resolve the split-boundary FIRST, before any read. The
+      // resolver (BLOCKER-1/2 hardening, 2026-07-14) surfaces a
+      // `split_boundary_invalid` / `split_boundary_missing` finding and sets
+      // `suppressTofu` for a present-but-invalid or deleted-after-migration
+      // boundary (fail closed), and yields the effective sealed tip (the MAC'd
+      // tip only when the boundary is VALID; 0 otherwise, so an untrusted
+      // boundary never filters the region). When valid, filter out every
+      // `entry-*` key at or below the sealed tip (parsed from the unencrypted
+      // key itself) so this never reads a legacy entry an armed box's operator
+      // uid cannot open; a key with no parseable sequence (pre-V2 legacy) is
+      // left to the existing legacy-entry path below.
+      const {
+        boundary: splitBoundary,
+        effectiveSealedTip,
+        suppressTofu,
+      } = await this.resolveSplitBoundaryForLoad(findings);
+      // F2 Finding 1: remember the trusted sealed tip so the append path can
+      // classify a post-split suffix entry without re-reading the boundary.
+      this.cachedSealedTip = effectiveSealedTip;
+      const storedEntriesRaw = await this.storage.list(AUDIT_NAMESPACE);
+      // BLOCKER-1: with a valid boundary, prove from the LISTING that the sealed
+      // region is complete (gap-free run ending at the tip). This catches
+      // deletion of sealed entries even when their contents are unreadable, so
+      // `getIntegrityFindings()` (hence `audit-findings`) no longer reports a
+      // deleted/truncated sealed prefix as clean.
+      if (splitBoundary.status === "valid") {
+        this.checkSealedPrefixCompleteness(
+          storedEntriesRaw,
+          effectiveSealedTip,
+          splitBoundary.boundary.sealed_base_sequence,
+          findings
+        );
+      }
+      const storedEntries =
+        effectiveSealedTip > 0
+          ? storedEntriesRaw.filter((meta) => {
+              const seq = parseEntryKeySequence(meta.key);
+              return seq === null || seq > effectiveSealedTip;
+            })
+          : storedEntriesRaw;
       for (const meta of storedEntries) {
         let raw: Uint8Array | null;
         try {
@@ -2277,12 +4486,12 @@ export class AuditLog {
             });
           }
 
+          let entry: AuditEntry;
           try {
             const encryptedBytes = fromBase64url(parsed.encrypted_payload_bytes);
             const encrypted: EncryptedPayload = JSON.parse(bytesToString(encryptedBytes));
             const decrypted = await this.decryptEntryPayload(encrypted);
-            const entry: AuditEntry = JSON.parse(bytesToString(decrypted));
-            chainedEntries.push({ key: meta.key, envelope: parsed, entry });
+            entry = JSON.parse(bytesToString(decrypted));
           } catch {
             findings.push({
               kind: "entry_decrypt_failed",
@@ -2290,22 +4499,70 @@ export class AuditLog {
               sequence: parsed.sequence,
               message: `audit entry ${meta.key} could not be decrypted at sequence ${parsed.sequence}`,
             });
+            continue;
+          }
+          // Retain only cheap envelope metadata for the full-chain verify.
+          chainedEntries.push({ key: meta.key, envelope: parsed });
+          // Stream the decrypted entry to the consumer (Merkle/recount/replay) or
+          // slide it into the bounded window; release it either way so a large
+          // chain is never fully resident. Listing order is ascending sequence
+          // order (zero-padded sequence in the key), so the consumer sees entries
+          // in chain-sequence order. This is DELIBERATELY outside the decrypt
+          // try/catch above: a consumer that throws (e.g. workload replay's
+          // validateWorkloadLifecyclePayload rejecting a malformed lifecycle
+          // entry) must propagate as ITSELF, not be miscategorized as
+          // `entry_decrypt_failed` (decrypt already succeeded). Mislabeling it
+          // would, under a future lenient pass, silently SKIP the entry: exactly
+          // the #504 under-report the consumers forbid.
+          if (consumer) {
+            try {
+              consumer.onEntry({
+                sequence: parsed.sequence,
+                entry_hash: parsed.entry_hash,
+                entry,
+              });
+            } catch (consumerErr) {
+              // The consumer rejected this (decrypted, hash-checked) entry, e.g.
+              // workload replay's validateWorkloadLifecyclePayload on a malformed
+              // lifecycle record. Propagate it AS ITSELF: tag it so the outer
+              // catch re-throws verbatim instead of relabeling it
+              // `storage_unavailable`. It is neither a decrypt failure nor a
+              // storage failure, and must never be silently absorbed into the
+              // findings list (the #504 under-report the consumers forbid).
+              throw new ConsumerRejectedEntryError(consumerErr);
+            }
+          } else {
+            pushWindow(entry, {
+              sequence: parsed.sequence,
+              entry_hash: parsed.entry_hash,
+            });
           }
           continue;
         }
 
+        let legacyEntry: AuditEntry;
         try {
           const encrypted = parsed as EncryptedPayload;
           const decrypted = await this.decryptEntryPayload(encrypted);
-          const entry: AuditEntry = JSON.parse(bytesToString(decrypted));
-          legacyRawEntries.push({ key: meta.key, raw, entry });
+          legacyEntry = JSON.parse(bytesToString(decrypted));
         } catch {
           findings.push({
             kind: "entry_decrypt_failed",
             key: meta.key,
             message: `legacy audit entry ${meta.key} could not be decrypted`,
           });
+          continue;
         }
+        // Keep the raw bytes (needed for the legacy-anchor hash below); the
+        // decrypted entry only slides into the bounded window. Legacy entries
+        // carry no chained (sequence, entry_hash) pair and the streaming
+        // consumers operate on the chained region only, so a legacy entry is
+        // never streamed; the legacy region's coverage is attested by the legacy
+        // anchor, not by these decrypted payloads. The window push is outside the
+        // decrypt try/catch above for the same reason as the chained path: a
+        // post-decrypt throw must not be miscategorized as a decrypt failure.
+        legacyRawEntries.push({ key: meta.key, raw });
+        pushWindow(legacyEntry, null);
       }
 
       const legacyHashes = legacyRawEntries.map((legacy, index) =>
@@ -2324,15 +4581,20 @@ export class AuditLog {
       await this.verifyAndMaybeWriteLegacyAnchor(
         legacyRawEntries.length,
         legacyAnchorHash,
-        findings
+        findings,
+        effectiveSealedTip
       );
 
       // F3: derive the chain-walk seed, honoring an authenticated rotation cut
-      // (async: it reads + MAC-verifies the rotation anchor and may TOFU-write).
+      // (async: it reads + MAC-verifies the rotation anchor). It no longer
+      // self-heals an above-genesis suffix: an absent/invalid anchor there fails
+      // closed (`rotation_anchor_missing`) rather than TOFU-writing a fresh one.
       const chainSeed = await this.resolveChainSeed(
         chainedEntries,
         legacyRawEntries.length,
         legacyAnchorHash,
+        splitBoundary,
+        suppressTofu,
         findings
       );
       this.verifyChainedEntries(
@@ -2346,36 +4608,67 @@ export class AuditLog {
         legacyRawEntries.length,
         legacyAnchorHash,
         chainedEntries.map((item) => item.envelope),
+        splitBoundary,
         findings
       );
 
-      this.entries = [
-        ...legacyRawEntries.map((item) => item.entry),
-        ...chainedEntries.map((item) => item.entry),
-      ];
-      this.chainEntries = chainedEntries.map((item) => ({
-        sequence: item.envelope.sequence,
-        entry_hash: item.envelope.entry_hash,
-      }));
+      // Serve the bounded recent-entry window built during the streaming decrypt
+      // above (NOT the full decrypted chain). When a streaming consumer drove
+      // this pass, both window arrays are empty by design: the consumer already
+      // received every chained entry in order, and the non-streaming window is
+      // left to the query / posture / append callers. The full-chain integrity
+      // invariants are unaffected: the chain head (`nextSequence` /
+      // `lastEntryHash`), the legacy / rotation / head anchors, and the
+      // checkpoint roots are all derived from the cheap envelope metadata and the
+      // on-disk reads below, never from this window.
+      if (!consumer) {
+        this.entries = recentEntries;
+        this.chainEntries = recentChained;
+      }
       // F3: continue from the HIGHEST surviving sequence, not the entry count.
       // After rotation prunes a contiguous prefix, count != highest sequence, and
       // a count-based nextSequence would re-issue an already-used sequence and
       // break the chain. (Identical to count+1 when nothing was pruned.)
+      // F2 Option A: when no chained entry survives (either genuinely nothing
+      // was ever written, or everything at/below a valid split boundary was
+      // filtered out above), the boundary's sealed tip is the correct floor,
+      // not `legacyRawEntries.length`/`legacyAnchorHash`, which describe the
+      // V1-legacy region and are 0/GENESIS on any fortress that never had one.
+      // Getting this wrong would corrupt `nextSequence`/`lastEntryHash` below
+      // (the state the NEXT append seeds from), not just the head-anchor check.
       const highestChainedSeq =
-        chainedEntries.at(-1)?.envelope.sequence ?? legacyRawEntries.length;
+        chainedEntries.at(-1)?.envelope.sequence ??
+        (splitBoundary.status === "valid"
+          ? splitBoundary.boundary.sealed_tip_sequence
+          : legacyRawEntries.length);
       const highestChainedHash =
-        chainedEntries.at(-1)?.envelope.entry_hash ?? legacyAnchorHash;
+        chainedEntries.at(-1)?.envelope.entry_hash ??
+        (splitBoundary.status === "valid"
+          ? splitBoundary.boundary.sealed_tip_entry_hash
+          : legacyAnchorHash);
       await this.verifyHeadAnchor(
         highestChainedSeq,
         highestChainedHash,
         legacyRawEntries.length > 0,
         chainedEntries.length > 0,
-        findings
+        findings,
+        splitBoundary.status === "valid",
+        effectiveSealedTip
       );
       this.nextSequence = highestChainedSeq + 1;
       this.lastEntryHash = highestChainedHash;
       this.hashesSinceCheckpoint = this.collectHashesSinceLastCheckpoint();
       this.integrityFindings = findings;
+      // The reload now keeps only the bounded recent-entry WINDOW resident (the
+      // splice in pushWindow slid it during the streaming decrypt), so a large
+      // on-disk log no longer materializes its full multi-GB decrypted payload
+      // set per reload; that was the daemon-OOM-on-a-large-log amplification.
+      // `verifiedChainView()` / `streamVerifiedChain()` STREAM the full surviving
+      // chain from disk one decrypted entry at a time, so the transparency Merkle
+      // root, the against-log recount, and workload replay still cover the
+      // complete chain without it ever being fully resident. #821's APPEND-path
+      // bound (trimInMemoryRetention) and this RELOAD-path bound together keep the
+      // heap flat on a long-running daemon.
       // A complete on-disk re-scan just ran: reset the eager-read backstop throttle
       // so the next eager read serves from this freshly-verified view without
       // re-paying, and re-baseline the sentinel fingerprint to this verified state
@@ -2383,6 +4676,15 @@ export class AuditLog {
       this.lastFullVerifyAtMs = Date.now();
       await this.refreshExpectedStoreFingerprint();
     } catch (err) {
+      // A consumer that rejected a (successfully decrypted, hash-checked) entry
+      // is NOT a storage failure: propagate its original error verbatim rather
+      // than mislabeling it `storage_unavailable` and swallowing it into the
+      // findings list. (The streaming consumers run in strict mode, where any
+      // finding throws anyway, but a future lenient pass must surface the
+      // consumer's real rejection, not a generic storage finding.)
+      if (err instanceof ConsumerRejectedEntryError) {
+        throw err.cause;
+      }
       findings.push({
         kind: "storage_unavailable",
         message: `audit storage could not be listed: ${failureMessage(err)}`,
@@ -2400,10 +4702,15 @@ export class AuditLog {
   private async verifyAndMaybeWriteLegacyAnchor(
     legacyCount: number,
     legacyAnchorHash: string,
-    findings: AuditIntegrityFinding[]
+    findings: AuditIntegrityFinding[],
+    sealedTipSequence = 0
   ): Promise<void> {
     if (legacyCount === 0) return;
-    const existing = await this.readCheckpoints("legacy-anchor", findings);
+    const existing = await this.readCheckpoints(
+      "legacy-anchor",
+      findings,
+      sealedTipSequence
+    );
     if (existing.length === 0) {
       await this.writeCheckpointRecord({
         checkpoint_kind: "legacy-anchor",
@@ -2435,7 +4742,6 @@ export class AuditLog {
     entries: Array<{
       key: string;
       envelope: PersistedAuditEnvelopeV2;
-      entry: AuditEntry;
     }>,
     expectedSequenceSeed: number,
     expectedPrevHashSeed: string,
@@ -2477,9 +4783,26 @@ export class AuditLog {
     legacyCount: number,
     legacyAnchorHash: string,
     entries: PersistedAuditEnvelopeV2[],
+    splitBoundary: AuditStoreSplitBoundaryLoadResult,
     findings: AuditIntegrityFinding[]
   ): Promise<void> {
-    const checkpoints = await this.readCheckpoints("audit-checkpoint", findings);
+    // F2 Option A: a checkpoint entirely within the SEALED legacy region (see
+    // the module doc comment near AUDIT_SPLIT_BOUNDARY_DIRNAME) can never be
+    // root-recomputed from the current in-memory entry set, since this
+    // instance never even attempted to read those entries. Every checkpoint
+    // that predates the split has `checkpoint_sequence <= sealedTipSequence`
+    // by construction (the migration captures the CURRENT tip, so nothing
+    // sealed can reference a not-yet-written future entry). Resolve it BEFORE
+    // the read so `readCheckpoints` can also SKIP a sealed-region checkpoint
+    // file that is unreadable at this privilege (a root-owned legacy file on an
+    // armed box) instead of failing the whole load closed.
+    const sealedTipSequence =
+      splitBoundary.status === "valid" ? splitBoundary.boundary.sealed_tip_sequence : 0;
+    const checkpoints = await this.readCheckpoints(
+      "audit-checkpoint",
+      findings,
+      sealedTipSequence
+    );
     const entryBySequence = new Map(entries.map((entry) => [entry.sequence, entry]));
     let highestCheckpoint = 0;
 
@@ -2489,7 +4812,8 @@ export class AuditLog {
     // root cannot be re-derived from entries that no longer exist. (When legacy
     // entries survive, no chained rotation has occurred — legacy keys prune first
     // — so the floor is legacyCount+1 and nothing is skipped.)
-    const rotationFloor = entries[0]?.sequence ?? legacyCount + 1;
+    const rotationFloor =
+      entries[0]?.sequence ?? Math.max(sealedTipSequence, legacyCount) + 1;
 
     for (const checkpoint of checkpoints) {
       if (checkpoint.checkpoint_sequence > highestCheckpoint) {
@@ -2497,14 +4821,17 @@ export class AuditLog {
       }
 
       // A checkpoint whose range dips below the surviving floor spans
-      // rotated-out entries. Skip the root re-derivation (it would always
-      // mismatch — the leaves are gone), but still verify its signature below.
-      // The CURRENT chain's integrity is anchored by the MAC'd rotation anchor +
-      // the forward walk, not by these historical checkpoints, so skipping the
-      // root recomputation here is not a fail-open for the protected property.
+      // rotated-out entries, OR sits entirely within the sealed split-boundary
+      // region. Skip the root re-derivation (it would always mismatch, since
+      // the leaves are gone or were never loaded), but still verify its signature
+      // below. The CURRENT chain's integrity is anchored by the MAC'd rotation
+      // anchor (or the MAC'd split-boundary record) + the forward walk, not by
+      // these historical checkpoints, so skipping the root recomputation here
+      // is not a fail-open for the protected property.
       const spansRotatedEntries =
-        checkpoint.from_sequence > legacyCount &&
-        checkpoint.from_sequence < rotationFloor;
+        checkpoint.checkpoint_sequence <= sealedTipSequence ||
+        (checkpoint.from_sequence > legacyCount &&
+          checkpoint.from_sequence < rotationFloor);
 
       if (!spansRotatedEntries) {
         const hashes: string[] = [];
@@ -2600,7 +4927,19 @@ export class AuditLog {
 
   private async readCheckpoints(
     kind: "audit-checkpoint" | "legacy-anchor",
-    findings: AuditIntegrityFinding[]
+    findings: AuditIntegrityFinding[],
+    // F2 Option A: the sealed split-boundary tip (0 when there is no VALID
+    // boundary). A checkpoint whose key-sequence sits at or below this tip
+    // anchors ONLY the sealed legacy region, whose integrity is carried by the
+    // MAC'd boundary + the root-only sealed-region crypto walk, NOT by these
+    // legacy checkpoints. On an armed box those files were written by a
+    // pre-split ROOT daemon (root-owned 0600) and are unreadable at the operator
+    // uid, so their read throws EACCES. Below, such a read is SKIPPED (never a
+    // finding) exactly as the routine load already skips sealed ENTRIES; a
+    // genuine tamper/IO fault, or any unreadable checkpoint ABOVE the tip, still
+    // fails closed. This is the READ-side analogue of the sealed-region skip that
+    // `verifyCheckpoints` already applies to the root RE-DERIVATION.
+    sealedTipSequence = 0
   ): Promise<AuditCheckpointRecord[]> {
     const records: AuditCheckpointRecord[] = [];
     let metas;
@@ -2615,7 +4954,28 @@ export class AuditLog {
     }
 
     for (const meta of metas) {
-      const raw = await this.storage.read(AUDIT_CHECKPOINT_NAMESPACE, meta.key);
+      const keySeq = parseCheckpointKeySequence(meta.key);
+      const inSealedRegion =
+        sealedTipSequence > 0 && keySeq !== null && keySeq <= sealedTipSequence;
+      let raw: Uint8Array | null;
+      try {
+        raw = await this.storage.read(AUDIT_CHECKPOINT_NAMESPACE, meta.key);
+      } catch (err) {
+        // F2: a sealed-region checkpoint the operator uid cannot open on an
+        // armed box (root-owned legacy file). The boundary MAC covers the
+        // sealed region, so skip it silently: the same soundness argument that
+        // lets the routine load skip unreadable sealed entries. Anything else
+        // (a non-permission error, or an unreadable checkpoint ABOVE the sealed
+        // tip) is a real problem and fails closed.
+        if (inSealedRegion && isPermissionError(err)) {
+          continue;
+        }
+        findings.push({
+          kind: "storage_unavailable",
+          message: `audit checkpoint ${meta.key} could not be read: ${failureMessage(err)}`,
+        });
+        continue;
+      }
       if (!raw) {
         findings.push({
           kind: "checkpoint_malformed",
@@ -2659,13 +5019,32 @@ export class AuditLog {
     try {
       await this.withAuditWriteLock(async () => {
         await this.freshenChainStateFromDisk();
+        // F2 Option A: never ask for hashes at or below a valid split
+        // boundary's sealed tip, since those entries are the legacy region
+        // this instance's routine paths must never attempt to read. A checkpoint
+        // whose natural `from_sequence` would dip into the sealed region
+        // instead starts right after it, mirroring how `verifyCheckpoints`
+        // already tolerates a checkpoint not covering a rotated/sealed
+        // prefix on the READ side. Resolve it BEFORE scanning existing
+        // checkpoints so the scan can also skip a sealed-region checkpoint file
+        // that is unreadable at this privilege (a root-owned legacy file on an
+        // armed box) instead of throwing EACCES out of the append/checkpoint path.
+        const splitBoundary = await this.loadSplitBoundary();
+        const sealedTipSequence =
+          splitBoundary.status === "valid"
+            ? splitBoundary.boundary.sealed_tip_sequence
+            : 0;
         const previousCheckpointSequence =
-          await this.readHighestAuditCheckpointSequence();
+          await this.readHighestAuditCheckpointSequence(sealedTipSequence);
         const checkpointSequence = this.nextSequence - 1;
-        const fromSequence = previousCheckpointSequence + 1;
+        const fromSequence = Math.max(
+          previousCheckpointSequence + 1,
+          sealedTipSequence + 1
+        );
         const hashes = await this.collectPersistedEntryHashes(
           fromSequence,
-          checkpointSequence
+          checkpointSequence,
+          sealedTipSequence
         );
         if (hashes.length === 0) return;
         await this.writeCheckpointRecord({
@@ -2685,14 +5064,31 @@ export class AuditLog {
     }
   }
 
-  private async readHighestAuditCheckpointSequence(): Promise<number> {
+  private async readHighestAuditCheckpointSequence(
+    sealedTipSequence = 0
+  ): Promise<number> {
     const metas = await this.storage.list(
       AUDIT_CHECKPOINT_NAMESPACE,
       "audit-checkpoint-"
     );
     let highest = 0;
     for (const meta of metas) {
-      const raw = await this.storage.read(AUDIT_CHECKPOINT_NAMESPACE, meta.key);
+      // F2 Option A: the operator's own checkpoints are always ABOVE the sealed
+      // tip, so a sealed-region checkpoint the operator uid cannot open on an
+      // armed box (root-owned legacy file) is never the highest and can be
+      // skipped silently. A non-permission fault, or an unreadable checkpoint
+      // above the tip, still surfaces (rethrown to the append/checkpoint caller,
+      // which fails closed rather than under-counting the checkpoint floor).
+      const keySeq = parseCheckpointKeySequence(meta.key);
+      const inSealedRegion =
+        sealedTipSequence > 0 && keySeq !== null && keySeq <= sealedTipSequence;
+      let raw: Uint8Array | null;
+      try {
+        raw = await this.storage.read(AUDIT_CHECKPOINT_NAMESPACE, meta.key);
+      } catch (err) {
+        if (inSealedRegion && isPermissionError(err)) continue;
+        throw err;
+      }
       if (!raw) continue;
       try {
         const parsed = JSON.parse(bytesToString(raw));
@@ -2712,11 +5108,16 @@ export class AuditLog {
 
   private async collectPersistedEntryHashes(
     fromSequence: number,
-    toSequence: number
+    toSequence: number,
+    sealedTipSequence = 0
   ): Promise<string[]> {
     const metas = await this.storage.list(AUDIT_NAMESPACE, "entry-");
     const bySequence = new Map<number, string>();
     for (const meta of metas) {
+      // F2 Option A: same guard as `readLatestPersistedChainState`; never
+      // attempt a read at or below the sealed tip.
+      const seq = parseEntryKeySequence(meta.key);
+      if (seq !== null && seq <= sealedTipSequence) continue;
       const raw = await this.storage.read(AUDIT_NAMESPACE, meta.key);
       if (!raw) continue;
       try {
@@ -2899,7 +5300,111 @@ function currentBootTimeMs(): number | undefined {
     return Date.now() - osUptime() * 1000;
   } catch {
     // Some sandboxed child processes cannot call uv_uptime. In that case the
-    // lock is not proven stale by boot time; PID liveness can still prove it.
+    // lock is not proven stale by boot time; PID liveness (and the
+    // process-start proof below) can still prove it.
+    return undefined;
+  }
+}
+
+/**
+ * System uptime in ms (`os.uptime()`), or undefined if the syscall is
+ * unavailable (the same confined-uid sandbox that can block {@link
+ * currentBootTimeMs}). Unlike a wall-clock-derived boot/start time, this is a
+ * MONOTONIC signal: it advances at real-time rate and is unaffected by a wall-
+ * clock step, so it is the trustworthy basis for deciding whether an audit-write
+ * lock stamped `uptime_ms` belongs to the current boot / a live holder even when
+ * the wall clock has jumped forward (VM resume, NTP correction).
+ */
+function currentUptimeMs(): number | undefined {
+  try {
+    return osUptime() * 1000;
+  } catch {
+    return undefined;
+  }
+}
+
+// Cache for {@link currentBootId}: `undefined` = not yet read, `null` = read but
+// no source available. The boot-identity token is constant for the life of a
+// boot, so one read suffices and keeps the sysctl exec / /proc read off the
+// per-acquire hot path.
+let cachedBootId: string | null | undefined;
+
+/**
+ * A per-boot IDENTITY token that is STABLE within a boot, DIFFERENT across
+ * reboots, and (unlike a boot TIME) INVARIANT to a wall-clock step:
+ *   - Linux: `/proc/sys/kernel/random/boot_id`, a random UUID minted each boot.
+ *   - macOS: `kern.bootsessionuuid`, a random UUID minted each boot; falls back
+ *     to the `kern.boottime` string on the rare build without it.
+ * Returns `undefined` when no source is available (an unknown platform, or a
+ * confined sandbox that blocks both the /proc read and the sysctl exec).
+ *
+ * This is the trustworthy answer to "was this lock stamped during the CURRENT
+ * boot?". A boot TIME derived from `Date.now() - uptime` shifts under an NTP /
+ * VM-resume clock step, and a raw `uptime` MAGNITUDE ALIASES across reboots (a
+ * previous boot's uptime falls in the same numeric range as this boot's), so
+ * neither can distinguish a live same-boot lock from a reboot orphan whose pid
+ * was reused by a live process. A per-boot UUID cannot be confused between two
+ * boots, so {@link AuditLog.breakStaleAuditLock} uses it to protect a genuine
+ * live same-boot lock WITHOUT shadowing the reboot-orphan proof.
+ *
+ * Result is cached (see {@link cachedBootId}). A read failure caches "no source"
+ * so a broken/blocked source is not retried on every acquire; this fails safe:
+ * with no identity the caller falls back to the wall-clock reboot proofs.
+ */
+function currentBootId(): string | undefined {
+  if (cachedBootId !== undefined) return cachedBootId ?? undefined;
+  cachedBootId = readBootIdUncached() ?? null;
+  return cachedBootId ?? undefined;
+}
+
+/** One-shot platform read behind {@link currentBootId}'s cache. */
+function readBootIdUncached(): string | undefined {
+  try {
+    if (process.platform === "linux") {
+      const id = readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+      return id.length > 0 ? id : undefined;
+    }
+    if (process.platform === "darwin") {
+      const readSysctl = (name: string): string => {
+        try {
+          return execFileSync("sysctl", ["-n", name], {
+            encoding: "utf8",
+            stdio: ["ignore", "pipe", "ignore"],
+            timeout: 2_000,
+          }).trim();
+        } catch {
+          return "";
+        }
+      };
+      const sessionUuid = readSysctl("kern.bootsessionuuid");
+      if (sessionUuid.length > 0) return sessionUuid;
+      // Last-resort fallback for a macOS build without kern.bootsessionuuid: the
+      // boot TIME string. Less ideal (a large clock step can shift it), but still
+      // a per-boot discriminator; the tie-break treats any mismatch as reboot
+      // evidence, never as license to protect an orphan.
+      const boottime = readSysctl("kern.boottime");
+      return boottime.length > 0 ? boottime : undefined;
+    }
+    return undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Wall-clock time this Node PROCESS started, in ms. Unlike
+ * {@link currentBootTimeMs}, `process.uptime()` is process-local and needs no
+ * `uv_uptime` syscall, so it survives the confined-uid sandbox that can block
+ * `os.uptime()`. Used ONLY as the reused-self-pid discriminator: a lock whose
+ * recorded pid equals ours but whose `acquired_at` predates our own start
+ * cannot be a lock this process holds (we had not started when it was stamped),
+ * so it is a reused-pid orphan and must be breakable even when boot time is
+ * unavailable (drill-follow-up, Opus re-gate NEW-1, 2026-07-15).
+ */
+function currentProcessStartMs(): number | undefined {
+  try {
+    return Date.now() - process.uptime() * 1000;
+  } catch {
     return undefined;
   }
 }
@@ -2938,29 +5443,12 @@ function isPersistedAuditEnvelopeV2(
   );
 }
 
-function isAuditCheckpointRecord(value: unknown): value is AuditCheckpointRecord {
-  return (
-    isRecord(value) &&
-    value.schema_version === AUDIT_CHECKPOINT_SCHEMA_VERSION &&
-    (value.checkpoint_kind === "audit-checkpoint" ||
-      value.checkpoint_kind === "legacy-anchor") &&
-    typeof value.checkpoint_sequence === "number" &&
-    Number.isSafeInteger(value.checkpoint_sequence) &&
-    typeof value.from_sequence === "number" &&
-    Number.isSafeInteger(value.from_sequence) &&
-    typeof value.root_hash === "string" &&
-    /^[0-9a-f]{64}$/.test(value.root_hash) &&
-    typeof value.previous_checkpoint_sequence === "number" &&
-    Number.isSafeInteger(value.previous_checkpoint_sequence) &&
-    typeof value.signed_at === "string" &&
-    (typeof value.signer_kid === "string" || value.signer_kid === null) &&
-    (typeof value.signature === "string" || value.signature === null) &&
-    (value.signature_algorithm === "Ed25519" ||
-      value.signature_algorithm === null) &&
-    value.payload_encoding === "domain-separated-canonical-json-v1" &&
-    typeof value.unsigned === "boolean"
-  );
-}
+// isAuditCheckpointRecord moved to the pure shared `audit/checkpoint-shape.ts`
+// (G1, post-#969 sweep re-gate) and is imported above: the raw CLI exporter's
+// hand-duplicated copy had drifted WEAKER than this runtime's (no
+// schema_version / signature_algorithm / payload_encoding / root_hash-hex
+// checks), so a malformed checkpoint could export uncounted. One shared
+// definition makes that drift structurally impossible.
 
 function checkpointPayload(
   checkpoint: AuditCheckpointRecord

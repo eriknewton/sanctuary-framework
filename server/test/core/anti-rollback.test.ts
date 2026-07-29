@@ -27,6 +27,10 @@ import {
   evaluateRollback,
   evaluateAndEnforceRollback,
   restoreAttest,
+  readBaselineEstablishedLatch,
+  raiseBaselineEstablishedLatch,
+  readRevocationFloorLatch,
+  raiseRevocationFloorLatch,
   EPOCH_WITNESS_META_KEY,
   ROLLBACK_FREEZE_META_KEY,
   type WitnessObservation,
@@ -127,6 +131,134 @@ describe("epoch witness", () => {
     );
     const read = await readEpochWitness(storage, master);
     if (read.status === "valid") expect(read.data.epoch).toBe(2);
+  });
+
+  it("FIX 5 (upgrade-safety): a LEGACY pre-revocation_floor witness blob still authenticates + reads floor 0 + does NOT false-freeze", async () => {
+    // A genuine legacy on-disk witness written BEFORE the revocation_floor field
+    // existed: it carries ONLY epoch/epoch_id/witnessed_at. writeEpochWitness omits
+    // any undefined field, so the persisted bytes contain NO revocation_floor - a
+    // byte-faithful pre-field fixture whose MAC covers exactly the legacy bytes.
+    const storage = new MemoryStorage();
+    const master = generateRandomKey();
+    await writeEpochWitness(storage, master, {
+      epoch: 4,
+      epoch_id: "rot-4-legacy",
+      witnessed_at: "2026-01-01T00:00:00.000Z",
+    });
+
+    // PROVE the on-disk blob is a genuine pre-field record (no revocation_floor).
+    const raw = await storage.read("_meta", EPOCH_WITNESS_META_KEY);
+    expect(raw).not.toBeNull();
+    const onDisk = bytesToString(raw!);
+    expect(onDisk).not.toContain("revocation_floor");
+    expect(onDisk).not.toContain("baseline_established");
+
+    // It still AUTHENTICATES under the master (the added optional field did not
+    // change the MAC of a record that never had it).
+    const witness = await readEpochWitness(storage, master);
+    expect(witness.status).toBe("valid");
+    if (witness.status === "valid") {
+      expect(witness.data.epoch).toBe(4);
+      expect(witness.data.revocation_floor).toBeUndefined();
+    }
+    // The revocation-floor read of a legacy witness is 0 (additive, no floor).
+    expect((await readRevocationFloorLatch(storage, master)).floor).toBe(0);
+
+    // And it does NOT false-trip the rollback freeze: a boot pass whose on-disk
+    // epoch matches the witness is OK, never frozen (the new field cannot regress
+    // a legacy fortress).
+    const res = await evaluateAndEnforceRollback({
+      storage,
+      master,
+      envelopeEpoch: 4,
+      observation: okObservation(4),
+    });
+    expect(res.frozen).toBe(false);
+    expect((await isRollbackFrozen(storage, master)).frozen).toBe(false);
+  });
+});
+
+describe("baseline-established latch (DEBT-1 close-out)", () => {
+  it("an untrusted (absent) witness reports established=false + witnessUntrusted", async () => {
+    const storage = new MemoryStorage();
+    const master = generateRandomKey();
+    const latch = await readBaselineEstablishedLatch(storage, master);
+    expect(latch.established).toBe(false);
+    expect(latch.witnessUntrusted).toBe(true);
+  });
+
+  it("raise sets the latch + schema floor and is MAC-bound (carried through read)", async () => {
+    const storage = new MemoryStorage();
+    const master = generateRandomKey();
+    await raiseBaselineEstablishedLatch(storage, master, 3);
+    const latch = await readBaselineEstablishedLatch(storage, master);
+    expect(latch.established).toBe(true);
+    expect(latch.sealedSchema).toBe(3);
+    expect(latch.witnessUntrusted).toBeUndefined();
+    // The latch fields are covered by the witness MAC: a witness keyed by a
+    // DIFFERENT master must not authenticate (so the latch cannot be read).
+    const other = generateRandomKey();
+    expect((await readBaselineEstablishedLatch(storage, other)).witnessUntrusted).toBe(
+      true
+    );
+  });
+
+  it("the schema floor is monotonic: a lower raise never lowers it", async () => {
+    const storage = new MemoryStorage();
+    const master = generateRandomKey();
+    await raiseBaselineEstablishedLatch(storage, master, 3);
+    await raiseBaselineEstablishedLatch(storage, master, 2); // attempt to lower
+    expect((await readBaselineEstablishedLatch(storage, master)).sealedSchema).toBe(
+      3
+    );
+  });
+
+  it("a non-force witness write never DROPS an already-set latch", async () => {
+    const storage = new MemoryStorage();
+    const master = generateRandomKey();
+    await raiseBaselineEstablishedLatch(storage, master, 3);
+    // A plain epoch advance (no latch field) must preserve the latch + floor.
+    await writeEpochWitness(storage, master, {
+      epoch: 1,
+      epoch_id: "rot-1",
+      witnessed_at: "t",
+    });
+    const latch = await readBaselineEstablishedLatch(storage, master);
+    expect(latch.established).toBe(true);
+    expect(latch.sealedSchema).toBe(3);
+  });
+
+  it("coexists with the epoch floor: raising the latch preserves the epoch", async () => {
+    const storage = new MemoryStorage();
+    const master = generateRandomKey();
+    await writeEpochWitness(storage, master, {
+      epoch: 4,
+      epoch_id: "rot-4",
+      witnessed_at: "t",
+    });
+    await raiseBaselineEstablishedLatch(storage, master, 3);
+    const read = await readEpochWitness(storage, master);
+    expect(read.status).toBe("valid");
+    if (read.status === "valid") {
+      expect(read.data.epoch).toBe(4);
+      expect(read.data.baseline_established).toBe(true);
+      expect(read.data.baseline_schema).toBe(3);
+    }
+  });
+
+  it("rejects a witness whose baseline_schema field is wrong-typed (forged)", async () => {
+    const storage = new MemoryStorage();
+    const master = generateRandomKey();
+    await raiseBaselineEstablishedLatch(storage, master, 3);
+    const raw = await storage.read("_meta", EPOCH_WITNESS_META_KEY);
+    const obj = JSON.parse(bytesToString(raw!)) as Record<string, unknown>;
+    (obj.data as Record<string, unknown>).baseline_schema = "not-a-number";
+    await storage.write(
+      "_meta",
+      EPOCH_WITNESS_META_KEY,
+      stringToBytes(JSON.stringify(obj))
+    );
+    expect((await readEpochWitness(storage, master)).status).toBe("invalid");
   });
 });
 
@@ -454,6 +586,96 @@ describe("restoreAttest (the only sanctioned way down)", () => {
     expect((await isRollbackFrozen(storage, master)).frozen).toBe(true);
     const witness = await readEpochWitness(storage, master);
     if (witness.status === "valid") expect(witness.data.epoch).toBe(5);
+  });
+
+  it("FIX 3: CARRIES the fleet revocation_floor across the force re-baseline (does NOT erase it)", async () => {
+    // A revocation was established (floor 7) on this fortress, plus a custody freeze
+    // to clear. Pre-fix, restoreAttest force-rewrote the witness carrying ONLY
+    // baseline_established/schema, ZEROING revocation_floor - so a restore-attest
+    // (e.g. clearing a freeze) wiped the revocation floor and an attacker could then
+    // delete the list+anchor -> floor 0 -> un-revoke every killed license. Post-fix
+    // the floor is carried forward (never lowered).
+    const storage = new MemoryStorage();
+    const master = generateRandomKey();
+    // Establish a revocation floor of 7 in the witness.
+    await raiseRevocationFloorLatch(storage, master, 7);
+    expect((await readRevocationFloorLatch(storage, master)).floor).toBe(7);
+    // Detect a rollback (witness floor 5, on-disk 1) -> frozen, so restore unfreezes.
+    await evaluateAndEnforceRollback({
+      storage,
+      master,
+      envelopeEpoch: 1,
+      observation: okObservation(5),
+    });
+    expect((await isRollbackFrozen(storage, master)).frozen).toBe(true);
+
+    await restoreAttest({
+      storage,
+      master,
+      currentEpoch: 1,
+      epochId: "attested-1",
+      recordAttestation: noopRecord,
+    });
+
+    // The custody restore succeeded AND the revocation floor survived at 7.
+    expect((await isRollbackFrozen(storage, master)).frozen).toBe(false);
+    expect((await readRevocationFloorLatch(storage, master)).floor).toBe(7);
+    const witness = await readEpochWitness(storage, master);
+    expect(witness.status).toBe("valid");
+    if (witness.status === "valid") {
+      expect(witness.data.revocation_floor).toBe(7);
+      expect(witness.data.epoch).toBe(1);
+    }
+  });
+
+  it("FIX 3: a fortress with NO revocation floor stays floor-less across restore-attest (additive, no phantom floor)", async () => {
+    // A never-revoked fortress must not GAIN a revocation floor from restore-attest.
+    const storage = new MemoryStorage();
+    const master = generateRandomKey();
+    await evaluateAndEnforceRollback({
+      storage,
+      master,
+      envelopeEpoch: 1,
+      observation: okObservation(5),
+    });
+    await restoreAttest({
+      storage,
+      master,
+      currentEpoch: 1,
+      epochId: "attested-1",
+      recordAttestation: noopRecord,
+    });
+    expect((await readRevocationFloorLatch(storage, master)).floor).toBe(0);
+    const witness = await readEpochWitness(storage, master);
+    if (witness.status === "valid") {
+      expect(witness.data.revocation_floor).toBeUndefined();
+    }
+  });
+
+  it("FIX 3: preserves baseline_established/schema AND revocation_floor together across restore-attest", async () => {
+    // The two carry-forwards must compose: a fortress with BOTH a sealed baseline
+    // and a revocation floor keeps both after a restore-attest.
+    const storage = new MemoryStorage();
+    const master = generateRandomKey();
+    await raiseBaselineEstablishedLatch(storage, master, 3);
+    await raiseRevocationFloorLatch(storage, master, 9);
+    await evaluateAndEnforceRollback({
+      storage,
+      master,
+      envelopeEpoch: 1,
+      observation: okObservation(5),
+    });
+    await restoreAttest({
+      storage,
+      master,
+      currentEpoch: 1,
+      epochId: "attested-1",
+      recordAttestation: noopRecord,
+    });
+    const latch = await readBaselineEstablishedLatch(storage, master);
+    expect(latch.established).toBe(true);
+    expect(latch.sealedSchema).toBe(3);
+    expect((await readRevocationFloorLatch(storage, master)).floor).toBe(9);
   });
 });
 

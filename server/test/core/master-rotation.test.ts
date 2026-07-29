@@ -92,6 +92,9 @@ import {
   FEDERATION_SYNC_STATE_STORE_NAMESPACE,
   FEDERATION_SYNC_STATE_STORE_KEY,
   FEDERATION_SYNC_STATE_STORE_HKDF_INFO,
+  FederationSyncStateStore,
+  FEDERATION_GUARDIAN_ANTIROLLBACK_ANCHOR_KEY,
+  FEDERATION_GUARDIAN_REQUIREMENT_ESTABLISHED_KEY,
 } from "../../src/v1/federation-sync-state-store.js";
 import {
   OPERATOR_CLOUD_JOINED_NODE_NAMESPACE,
@@ -514,6 +517,74 @@ describe("master rotation — fail-closed coverage", () => {
     );
   });
 
+  // F2 MED-1/M-1 (adversarial gate 2026-07-14): a fortress that ran the
+  // writer-split migration has an `_audit-daemon` namespace. Master rotation
+  // must refuse BY NAME (an intentional, greppable, actionable refusal), never
+  // silently skip it, and never mutate. Locks in the fail-closed contract the
+  // whole F2 design leans on (and prevents a future refactor from turning the
+  // refuse into a silent skip). Also asserts the message is the F2-specific one,
+  // not the generic "no registered rotation recipe" fallthrough.
+  it("aborts BY NAME (nothing mutated) when the F2 _audit-daemon namespace holds data", async () => {
+    const fortress = await buildFortress();
+    await fortress.storage.write(
+      "_audit-daemon",
+      "entry-00000000000000000001-1-0",
+      stringToBytes("{}")
+    );
+    let caught: unknown;
+    try {
+      await rotateMaster(rotateOpts(fortress));
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(RotationPreflightError);
+    expect((caught as Error).message).toMatch(/_audit-daemon|writer-split|Castle Wall daemon/);
+    expect((caught as Error).message).not.toMatch(/no registered rotation recipe/);
+    // Nothing mutated: the master still establishes from the original passphrase.
+    const est = await establishMaster({
+      storage: fortress.storage,
+      passphrase: PASSPHRASE,
+    });
+    expect(toBase64url(est.masterKey)).toBe(toBase64url(fortress.master));
+  });
+
+  it("aborts BY NAME on the sibling F2 daemon namespaces (_audit-daemon_checkpoints, _audit-daemon_meta)", async () => {
+    for (const ns of ["_audit-daemon_checkpoints", "_audit-daemon_meta"]) {
+      const fortress = await buildFortress();
+      await fortress.storage.write(ns, "some-key", stringToBytes("{}"));
+      await expect(rotateMaster(rotateOpts(fortress))).rejects.toThrow(
+        RotationPreflightError
+      );
+    }
+  });
+
+  // F2 BLOCKER-R2 (adversarial re-gate 2026-07-14): the durable `_meta`
+  // migration-established marker makes the rotation refusal robust even if the
+  // `_audit-daemon*` namespaces were deleted (the raw boundary-v1.json file is
+  // not a `.enc` entry and is skipped by namespace enumeration). Refuse BY NAME
+  // on the `_meta` marker alone, nothing mutated.
+  it("aborts BY NAME when only the F2 _meta established marker is present (daemon namespaces deleted)", async () => {
+    const fortress = await buildFortress();
+    await fortress.storage.write(
+      "_meta",
+      "audit-store-split-established-v1",
+      stringToBytes(JSON.stringify({ __sanctuary_audit_store_split_established_v1: true, mac: "x" }))
+    );
+    let caught: unknown;
+    try {
+      await rotateMaster(rotateOpts(fortress));
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(RotationPreflightError);
+    expect((caught as Error).message).toMatch(/writer-split|audit-store-split-established/);
+    const est = await establishMaster({
+      storage: fortress.storage,
+      passphrase: PASSPHRASE,
+    });
+    expect(toBase64url(est.masterKey)).toBe(toBase64url(fortress.master));
+  });
+
   it("rotates compound-AAD records (anomaly classifier: key state.<a>.<b>, AAD a|b — codex r2)", async () => {
     const fortress = await buildFortress();
     await fortress.storage.write(
@@ -877,6 +948,67 @@ describe("master rotation — fail-closed coverage", () => {
       const plain = decrypt(raw, derivePurposeKey(est.masterKey, r.info));
       expect(JSON.parse(bytesToString(plain))).toEqual(r.payload);
     }
+  });
+
+  // T7 (Finding #7): a fortress that ever enabled a guardian requirement carries
+  // BOTH new `_meta` keys - the established sentinel (a pre-existing latent break:
+  // it was unclassified, so a guarded fortress could NOT rotate) AND the new
+  // anti-rollback anchor. Both must be classified so rotation SUCCEEDS, and both
+  // must re-authenticate under the NEW master afterward (re-derived / restamped),
+  // with the monotonic anchor floors preserved.
+  it("Finding #7: master rotation composes with BOTH guardian _meta keys (established sentinel + antirollback anchor)", async () => {
+    const fortress = await buildFortress();
+
+    // Write both `_meta` markers MAC'd under the OLD master, exactly as the store
+    // does (use the store itself so the bytes are byte-for-byte what production
+    // writes).
+    const store = new FederationSyncStateStore({
+      storage: fortress.storage,
+      masterKey: fortress.master,
+    });
+    await store.markGuardianRequirementEstablished();
+    await store.writeGuardianAntiRollbackAnchor({
+      loweredHighWater: 4,
+      disableNonce: 6,
+      requirementGeneration: 9,
+    });
+    // Sanity: both authenticate under the OLD master pre-rotation.
+    expect((await store.guardianRequirementEstablished()).status).toBe("established");
+    expect((await store.readGuardianAntiRollbackAnchor()).status).toBe("valid");
+
+    // Without the two new classifications, convertMeta hits `default -> null ->
+    // throw` and rotation is DENIED. It must now SUCCEED.
+    await rotateMaster(rotateOpts(fortress));
+    const est = await establishMaster({
+      storage: fortress.storage,
+      passphrase: PASSPHRASE,
+    });
+
+    // Both `_meta` keys are still present (not deleted by rotation).
+    expect(
+      await fortress.storage.read("_meta", FEDERATION_GUARDIAN_REQUIREMENT_ESTABLISHED_KEY),
+    ).not.toBeNull();
+    expect(
+      await fortress.storage.read("_meta", FEDERATION_GUARDIAN_ANTIROLLBACK_ANCHOR_KEY),
+    ).not.toBeNull();
+
+    // Both re-authenticate under the NEW master (re-derived / restamped), with the
+    // monotonic anchor floors preserved.
+    const newStore = new FederationSyncStateStore({
+      storage: fortress.storage,
+      masterKey: est.masterKey,
+    });
+    expect((await newStore.guardianRequirementEstablished()).status).toBe("established");
+    const anchor = await newStore.readGuardianAntiRollbackAnchor();
+    expect(anchor.status).toBe("valid");
+    if (anchor.status !== "valid") throw new Error("unreachable");
+    expect(anchor.data.lowered_high_water).toBe(4);
+    expect(anchor.data.disable_nonce).toBe(6);
+    expect(anchor.data.requirement_generation).toBe(9);
+
+    // Neither authenticates under the OLD master any more (they were re-keyed).
+    expect((await store.guardianRequirementEstablished()).status).toBe("invalid");
+    expect((await store.readGuardianAntiRollbackAnchor()).status).toBe("invalid");
   });
 
   it("aborts BY NAME on unified-inbox operator-prefs records (hash-keyed AAD — codex r2)", async () => {

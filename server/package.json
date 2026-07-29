@@ -1,12 +1,13 @@
 {
   "name": "@sanctuary-framework/mcp-server",
-  "version": "1.4.0",
-  "description": "Your agent, your machine, your keys. An MCP server that adds encrypted state, approval gates, and a portable identity to any AI agent.",
+  "version": "1.7.2",
+  "description": "The open source standard for secure, private AI: a wall the operating system enforces in both directions, and your data under your own keys, portable anywhere. Any agent, local or cloud, solo or fleet.",
   "type": "module",
   "main": "dist/index.cjs",
   "module": "dist/index.js",
   "types": "dist/index.d.ts",
   "bin": {
+    "mcp-server": "dist/cli.js",
     "sanctuary-mcp-server": "dist/cli.js",
     "sanctuary": "dist/cli.js",
     "verify-transparency": "dist/verify-transparency.js",
@@ -28,6 +29,7 @@
   "scripts": {
     "build": "node scripts/sign-reference-plugin.mjs && tsup && node scripts/copy-templates.js",
     "sign-reference-plugin": "node scripts/sign-reference-plugin.mjs",
+    "sign-release": "tsx scripts/sign-release-manifest.mjs",
     "dev": "tsup --watch",
     "start": "node dist/cli.js",
     "pretest": "npm run build",
@@ -48,10 +50,10 @@
     "test:e2e:install": "playwright install chromium webkit",
     "typecheck": "tsc --noEmit",
     "lint": "eslint src/ --max-warnings 0",
-    "refresh-reorg-evidence": "vite-node scripts/refresh-reorg-evidence.ts",
-    "check-import-cycles": "vite-node scripts/check-import-cycles.ts",
-    "check-import-cycles:baseline": "vite-node scripts/check-import-cycles.ts > test/fixtures/import-cycle-baseline.txt",
-    "gen-at-rest-fixtures": "vite-node scripts/gen-at-rest-fixtures.ts",
+    "refresh-reorg-evidence": "tsx scripts/refresh-reorg-evidence.ts",
+    "check-import-cycles": "tsx scripts/check-import-cycles.ts",
+    "check-import-cycles:baseline": "tsx scripts/check-import-cycles.ts > test/fixtures/import-cycle-baseline.txt",
+    "gen-at-rest-fixtures": "tsx scripts/gen-at-rest-fixtures.ts",
     "hygiene": "npm run refresh-reorg-evidence && npm run check-import-cycles",
     "clean": "rm -rf dist",
     "install-hooks": "node scripts/install-hooks.js",
@@ -61,13 +63,13 @@
     "@chainsafe/libp2p-gossipsub": "14.1.2",
     "@chainsafe/libp2p-noise": "16.1.5",
     "@chainsafe/libp2p-yamux": "7.0.4",
-    "@libp2p/crypto": "5.1.20",
+    "@libp2p/crypto": "5.1.21",
     "@libp2p/identify": "3.0.39",
     "@libp2p/interface": "2.11.0",
-    "@libp2p/kad-dht": "16.3.3",
+    "@libp2p/kad-dht": "16.4.1",
     "@libp2p/mdns": "11.0.47",
     "@libp2p/peer-id": "5.1.9",
-    "@libp2p/ping": "3.1.7",
+    "@libp2p/ping": "3.1.10",
     "@libp2p/tcp": "10.1.19",
     "@modelcontextprotocol/sdk": "1.29.0",
     "@multiformats/multiaddr": "12.5.1",
@@ -76,27 +78,29 @@
     "@noble/hashes": "1.8.0",
     "@noble/post-quantum": "0.6.1",
     "hash-wasm": "4.12.0",
-    "it-length-prefixed": "9.1.1",
+    "it-length-prefixed": "10.0.2",
     "it-pipe": "3.0.1",
     "libp2p": "2.10.0",
-    "lmdb": "3.5.5",
-    "pg": "8.21.0",
+    "lmdb": "3.5.6",
+    "pg": "8.22.0",
     "pgvector": "0.3.0",
-    "uint8arraylist": "2.4.9",
-    "uint8arrays": "5.1.1"
+    "uint8arraylist": "3.0.2",
+    "uint8arrays": "6.1.1",
+    "viem": "2.55.8"
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",
-    "@playwright/test": "1.59.1",
-    "@types/node": "25.9.3",
+    "@playwright/test": "1.62.0",
+    "@types/node": "26.1.1",
     "@types/pg": "8.20.0",
-    "@vitest/coverage-v8": "3.2.4",
-    "eslint": "10.5.0",
+    "@vitest/coverage-v8": "4.1.10",
+    "eslint": "10.8.0",
     "tsup": "8.5.1",
-    "tsx": "4.22.4",
+    "tsx": "4.23.1",
     "typescript": "5.9.3",
-    "typescript-eslint": "8.61.1",
-    "vitest": "3.2.4"
+    "typescript-eslint": "8.65.0",
+    "vite": "8.1.5",
+    "vitest": "4.1.10"
   },
   "engines": {
     "node": ">=22.0.0"
@@ -117,5 +121,9 @@
     "reputation",
     "privacy"
   ],
-  "author": "Erik Newton"
+  "author": "Erik Newton",
+  "overrides": {
+    "ws": "^8.21.0",
+    "esbuild": "^0.28.1"
+  }
 }

@@ -1,7 +1,11 @@
-import { execFile as nodeExecFile, execSync as nodeExecSync } from "node:child_process";
+import {
+  execFile as nodeExecFile,
+  execSync as nodeExecSync,
+  spawnSync as nodeSpawnSync,
+} from "node:child_process";
 import { createConnection } from "node:net";
 import { createHash, randomBytes as nodeRandomBytes } from "node:crypto";
-import { chmod, mkdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, readdir, stat, unlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { Writable } from "node:stream";
@@ -23,7 +27,16 @@ import {
   AuditLog,
   AuditIntegrityError,
   type AuditEntry,
+  type AuditIntegrityFinding,
 } from "../operational/audit-log.js";
+import {
+  AuditStoreSplitMigrationError,
+  createDaemonAuditLog,
+  migrateFortressAuditStoreSplit,
+  probeDaemonChainAccess,
+  verifyFortressAuditFullPicture,
+  verifySealedLegacyPrefix,
+} from "../operational/audit-store-split.js";
 import {
   DEFAULT_DENY_BUCKET,
   attributeFlows,
@@ -33,6 +46,7 @@ import {
   type PerRuleGroup,
 } from "../castle-wall/audit/per-rule-report.js";
 import { frame, parseFrame } from "../castle-wall/ipc/framing.js";
+import { writeGlobalPinIfUnestablished } from "../castle-wall/global-pin/index.js";
 import { resolveCastleWallSocketPath } from "../castle-wall/runtime/socket-path.js";
 import {
   BOOT_TOKEN_LENGTH,
@@ -41,11 +55,34 @@ import {
   safeModeAuditStoragePath,
 } from "../castle-wall/boot/boot-token.js";
 import { validateAgentOrigin } from "../castle-wall/allowlist/agent-origin.js";
+import { validateRule, type AllowlistRule } from "../castle-wall/allowlist/schema.js";
+import { HABEAS_RULE_ID_PREFIX } from "../castle-wall/allowlist/habeas-port.js";
+import { EGRESS_PROVISION_REFUSED_AUDIT_OP } from "../castle-wall/provision/egress.js";
+import {
+  loadFortressProducerKey,
+  loadPinnedProducerKeyB64url,
+} from "../castle-wall/runtime/producer-signature.js";
+import {
+  reverifyEntryProducerSignature,
+  signedCanonicalOperation,
+  producerSignedDedupKey,
+  type EntryReverifyBasis,
+} from "../principal-policy/producer-reverify.js";
 import {
   CASTLE_WALL_BOOT_PLIST_PATH,
   bootServiceInstalled,
+  bootServiceReady,
 } from "./castle-wall-boot.js";
 import { fortressIdFromStoragePath } from "../dashboard/v1_1/wiring.js";
+import {
+  EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE,
+  GENERIC_UID_CONFINEMENT_REMEDY,
+} from "../egress-gate/operator-advice.js";
+import {
+  CASTLE_WALL_AUDIT_PROVENANCE_KEY,
+  CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
+  CASTLE_WALL_RELOAD_CLIENT_TIMEOUT_MS,
+} from "../castle-wall/constants.js";
 import type {
   CastleWallMessage,
   DecisionResponse,
@@ -93,11 +130,16 @@ export interface CastleWallCommandContext {
   /** Override the daemon-socket reachability probe (tests). */
   daemonProbe?: (socketPath: string) => Promise<boolean>;
   /**
-   * Override the persistent-boot-service presence probe used by the `enable`
-   * composition guard (#450 item 5; tests). Defaults to {@link bootServiceInstalled},
-   * which validates the LaunchDaemon plist is the well-formed boot-survival unit
-   * (correct label + RunAtLoad + --safe-mode), not merely that a file exists.
-   * Returns true iff a persistent boot-survival service is installed.
+   * Override the persistent-boot-service readiness probe used by the `enable`
+   * composition guard (#450 item 5; tests). Defaults to {@link bootServiceReady},
+   * which validates the LaunchDaemon plist, stable loaded launchd job, enabled
+   * state, and expected fortress binding. Returns true iff the boot-survival
+   * service is ready for reboot.
+   */
+  bootServiceReadyProbe?: (expectedFortressPath?: string) => Promise<boolean>;
+  /**
+   * Override the installed-plist probe used only for diagnostic wording when
+   * readiness fails. Defaults to {@link bootServiceInstalled}.
    */
   bootServiceInstalledProbe?: (expectedFortressPath?: string) => Promise<boolean>;
   /**
@@ -132,6 +174,49 @@ export interface CastleWallCommandContext {
   safeModeDaemonStart?: (
     input: import("../castle-wall/runtime/macos-daemon.js").MacOSCastleWallDaemonInput,
   ) => Promise<{ socketPath: string; stop: () => Promise<void> }>;
+  /**
+   * Override the agent-origin descriptor presence probe used by the `enable`
+   * boot-cut WARNING (#877 follow-up; tests). Returns true iff a structurally
+   * valid agent-origin descriptor is set for the fortress. Defaults to reading
+   * and validating `<fortress>/policy/egress/agent-origin.json`.
+   */
+  agentOriginDescriptorProbe?: (fortressPath: string) => Promise<boolean>;
+  /**
+   * Bug B P1/B round-2: out-callback that surfaces the disable outcome
+   * ALONGSIDE the numeric exit code. `runDisable` can return 0 in three
+   * meanings: (B) status re-read observed disabled, (C) save-disabled returned
+   * ok but corroboration was inconclusive, and (A) the save did not complete
+   * but the dead-man lease revoke made the provider fail open. These must stay
+   * distinguishable because only (B) is an OBSERVED-off fact suitable for a
+   * protection claim; (C) is a recovery/control-flow success, not an
+   * observation. Never fires on non-zero paths.
+   */
+  onDisableNePreferenceOutcome?: (outcome: DisableNePreferenceOutcome) => void;
+  /**
+   * Override the agent-matchable-allow-rule counter used by the `enable`
+   * no-egress brick guard (confined-agent egress design, section 5 layer 2;
+   * tests). Defaults to {@link countAgentMatchableAllowRules}, which reads
+   * `<fortress>/policy/egress/rules/*.json` and counts allow-disposition
+   * rules an agent-classified flow could match.
+   */
+  egressAllowRuleCountProbe?: (fortressPath: string) => Promise<number>;
+  /**
+   * Inject the FULL operator-daemon start function (Slice M; tests pass a fake
+   * that captures the resolved {@link MacOSCastleWallDaemonInput}, so the
+   * key-resolution + producer-key threading can be exercised without a real
+   * socket/helper). Defaults to {@link startMacOSCastleWallDaemon}.
+   */
+  fullDaemonStart?: (
+    input: import("../castle-wall/runtime/macos-daemon.js").MacOSCastleWallDaemonInput,
+  ) => Promise<{ socketPath: string; stop: () => Promise<void> }>;
+  /**
+   * Override the macOS audit-producer public-key path threaded into the daemon
+   * and macOS reader verification (Slice M). Tests point it at a temp key; an
+   * operator may set it via `SANCTUARY_CASTLE_AUDIT_PRODUCER_PUBKEY` for a
+   * non-default helper layout. When unset the daemon/readers use their built-in
+   * `/Library/Application Support/Sanctuary/castle-audit-producer.pub` default.
+   */
+  auditProducerPublicKeyPath?: string;
 }
 
 export interface CastleWallParsedArgs {
@@ -153,6 +238,39 @@ export interface CastleWallParsedArgs {
    * error instead of silently falling back to the raw dump.
    */
   ruleMissingValue?: boolean;
+  /**
+   * `enable --agent-uid=<uid>` (Build 3, one-command arm): fold
+   * `configure-origin uid` into `enable` so an operator can configure-then-arm
+   * in one command. Raw string, parsed/validated downstream via
+   * `validateAgentOrigin` - never trust this as a well-formed uid on its own.
+   * Explicit-flag-only; never auto-derived.
+   */
+  agentUid?: string;
+  /**
+   * `enable --ceiling=<uid>` (Build 3): optional system-uid allow-ceiling
+   * paired with `--agent-uid`. Defaults to 500 (matching `configure-origin`)
+   * when `--agent-uid` is given but `--ceiling` is not.
+   */
+  ceiling?: string;
+  /**
+   * `enable --allow-no-egress` (confined-agent egress design, section 5
+   * layer 2): explicit override for the standing no-egress brick guard.
+   * Arming a uid-mode wall whose manifest source carries ZERO
+   * agent-matchable allow rules confines the agent into total
+   * non-functionality; a deliberate deny-all quarantine is legitimate but
+   * must be ASKED FOR, never the accident. Deliberately NOT covered by
+   * `--force` (whose meaning is "the daemon/boot service is supervised
+   * out-of-band", a different assertion). The override is audited.
+   */
+  allowNoEgress?: boolean;
+  /** audit-verify: emit machine-readable JSON instead of the human summary. */
+  json?: boolean;
+  /**
+   * audit-verify: explicit override for the pinned audit-producer public-key
+   * file. Tests point this at a temp key; production resolves it from the
+   * fortress publish path. Never accepted from an untrusted source.
+   */
+  producerPubKey?: string;
 }
 
 /** Runs the host-app binary in headless mode; mirrors execFile semantics. */
@@ -160,6 +278,11 @@ export type HostAppInvoker = (
   binaryPath: string,
   args: string[],
 ) => Promise<{ stdout: string; stderr: string; exitCode: number }>;
+
+export type DisableNePreferenceOutcome =
+  | "corroborated_off"
+  | "save_accepted_inconclusive"
+  | "fail_open_deadman";
 
 /**
  * Runs `open` (or a test double). The default LaunchServices invoker launches
@@ -219,8 +342,18 @@ function formatDeadManLeaseStatus(
   const ttl = lease.ttl_seconds === null ? "none (--no-ttl)" : `${lease.ttl_seconds}s`;
   const filter =
     contentFilterState === null ? "" : `; content-filter=${contentFilterState}`;
+  // The lease line is a liveness signal for the dead-man BROADCAST, not an
+  // enforcement verdict - enforcement is the live content-filter state above.
+  // When the filter is disabled, the word "armed" can mislead a skimmer into
+  // reading it as "protected". In that case make the advisory nature explicit
+  // so the line cannot be mistaken for enforcement (audit-D F5).
+  const enforcementActive = contentFilterState === "enabled";
+  const label =
+    lease.armed && !enforcementActive
+      ? "Dead-man lease (advisory broadcast, not enforcement): armed"
+      : `Dead-man lease broadcast: ${lease.armed ? "armed" : "disarmed"}`;
   return (
-    `Dead-man lease broadcast: ${lease.armed ? "armed" : "disarmed"}` +
+    `${label}` +
     `${filter}; ttl=${ttl}; heartbeat=${lease.heartbeat_interval_seconds}s; updated=${lease.updated_at}\n`
   );
 }
@@ -249,6 +382,78 @@ const EXIT_SYSEXT_DISABLED = 4;
 
 function write(stream: Writable, text: string): void {
   stream.write(text);
+}
+
+/**
+ * Default agent-origin descriptor presence probe for the `enable` boot-cut
+ * WARNING (#877 follow-up). True iff `<fortress>/policy/egress/agent-origin.json`
+ * exists, parses, and passes `validateAgentOrigin`. Fail-safe to false (missing,
+ * unreadable, malformed, or invalid all count as "no descriptor set") so the
+ * warning errs toward informing the operator rather than staying silent.
+ */
+async function defaultAgentOriginDescriptorPresent(fortressPath: string): Promise<boolean> {
+  try {
+    const raw = await readFile(agentOriginDescriptorPath(fortressPath), "utf8");
+    return validateAgentOrigin(JSON.parse(raw)) !== null;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Shared helper: on a helper-sign-mode daemon-start failure (in `runDaemon` or
+ * `runSafeModeDaemon`), run the signer-helper boot-readiness preflight
+ * (design pass 2026-06-26) and print the SPECIFIC diagnosis (approve the
+ * Background Item, pin mismatch, or repair the custody directory) instead of
+ * leaving the operator with only the generic "signer helper is unreachable"
+ * message the caller already printed. Best-effort: a failure running the
+ * preflight itself must never mask the original daemon-start error, so this
+ * never throws.
+ */
+async function writeSignerHelperReadinessDiagnosis(
+  err: Writable,
+  opts: {
+    platform: NodeJS.Platform;
+    signerClientPath: string | undefined;
+    signerClientInvoke: ShimInvoker | undefined;
+    globalPinPath: string;
+  },
+): Promise<void> {
+  try {
+    const {
+      assessSignerHelperReadiness,
+      buildHelperPublicKeyQuery,
+      SIGNER_HELPER_LAUNCHCTL_KILL_SIGNAL,
+      SIGNER_HELPER_LAUNCHCTL_TIMEOUT_MS,
+    } = await import("./castle-wall-signer-helper.js");
+    const readiness = await assessSignerHelperReadiness({
+      execFileFn: (cmd, cmdArgs) => {
+        const result = nodeSpawnSync(cmd, cmdArgs, {
+          encoding: "utf8",
+          timeout: SIGNER_HELPER_LAUNCHCTL_TIMEOUT_MS,
+          killSignal: SIGNER_HELPER_LAUNCHCTL_KILL_SIGNAL,
+        });
+        const errorText = result.error ? `${result.error.name}: ${result.error.message}` : "";
+        return {
+          code: result.status ?? 1,
+          stdout: result.stdout ?? "",
+          stderr: [result.stderr ?? "", errorText].filter(Boolean).join("\n"),
+        };
+      },
+      queryHelperPublicKey: buildHelperPublicKeyQuery(opts.signerClientPath, opts.signerClientInvoke),
+      readGlobalPin: () => readFile(opts.globalPinPath),
+      statCustodyDir: async (dirPath) => {
+        const info = await stat(dirPath);
+        return { uid: info.uid, mode: info.mode & 0o777 };
+      },
+      platform: opts.platform,
+    });
+    if (!readiness.ready) {
+      write(err, `${readiness.guidance}\n`);
+    }
+  } catch {
+    // Preflight itself failed to run; the caller's generic message still stands.
+  }
 }
 
 function fingerprintFromPublicKey(publicKey: Uint8Array): string {
@@ -411,16 +616,48 @@ export async function runAuditFindings(
     const masterKey = await resolveMasterKey(fortressPath, env);
     const auditLog = new AuditLog(storage, masterKey, { integrityMode: "lenient" });
     const findings = await auditLog.getIntegrityFindings();
+
+    // BLOCKER-R1 (adversarial re-gate 2026-07-14): the routine load SKIPS the
+    // sealed legacy region (that is the F2 fix), so `getIntegrityFindings()`
+    // above verified only the post-split SUFFIX plus the cheap sealed-region
+    // LISTING completeness check. It cannot, on its own, prove the sealed
+    // region's CONTENT is intact. So this diagnostic must NOT print "the chain
+    // verifies clean" unless the sealed region was actually crypto-walked and
+    // returned `verified` / `empty` / `not_present` (never migrated). Run that
+    // walk now and fold its verdict into the clean/unclean decision.
+    const sealed = await verifySealedLegacyPrefix(storage, masterKey);
     masterKey.fill(0);
 
-    if (findings.length === 0) {
-      write(out, "No audit integrity findings; the chain verifies clean.\n");
+    const sealedClean =
+      sealed.status === "verified" ||
+      sealed.status === "empty" ||
+      sealed.status === "not_present";
+
+    if (findings.length === 0 && sealedClean) {
+      write(
+        out,
+        sealed.status === "verified"
+          ? "No audit integrity findings; the chain verifies clean (including a crypto re-walk of the sealed legacy region).\n"
+          : "No audit integrity findings; the chain verifies clean.\n",
+      );
       return 0;
     }
 
+    // Not clean. Emit the routine findings AND an honest sealed-region verdict.
+    const sealedNote =
+      sealed.status === "unreadable"
+        ? "the sealed legacy region is NOT readable at this privilege and was NOT re-verified (re-run as root); this is NOT a clean result"
+        : sealed.status === "incomplete"
+          ? `the sealed legacy region is INCOMPLETE (expected tip sequence ${sealed.expected_tip}, highest present ${sealed.highest_present}); a sealed entry was deleted`
+          : sealed.status === "hash_mismatch"
+            ? `the sealed legacy region FAILED crypto re-verification at sequence ${sealed.sequence} (content tampered)`
+            : null;
+
     write(
       err,
-      `${findings.length} audit integrity finding(s) for fortress ${fortressIdFromStoragePath(fortressPath)}:\n`,
+      `${findings.length} audit integrity finding(s)` +
+        (sealedNote ? ` plus a sealed-region issue` : "") +
+        ` for fortress ${fortressIdFromStoragePath(fortressPath)}; the chain does NOT verify clean.\n`,
     );
     findings.forEach((finding, index) => {
       write(
@@ -436,6 +673,50 @@ export async function runAuditFindings(
         }) + "\n",
       );
     });
+    if (sealedNote) {
+      write(
+        out,
+        JSON.stringify({
+          kind: "sealed_region",
+          status: sealed.status,
+          message: sealedNote,
+        }) + "\n",
+      );
+      write(err, `sealed legacy region: ${sealedNote}.\n`);
+    }
+    return 0;
+  } catch (error) {
+    write(err, `Error: ${error instanceof Error ? error.message : String(error)}\n`);
+    return 1;
+  }
+}
+
+/**
+ * F2 Option A: print the full-picture fortress audit-store-split status
+ * (both chains' verdicts, reported honestly and separately). Read-only;
+ * never migrates, repairs, or writes anything.
+ *
+ * Exit code is always 0 unless resolving the master key itself fails: a
+ * `present_unreadable` or `findings` verdict is the whole POINT of this
+ * command (it is meant to be run as the operator, where the daemon chain, if
+ * armed, is EXPECTED to be unreadable) and is not itself a command failure.
+ */
+export async function runAuditStoreStatus(
+  argv: string[] = [],
+  ctx: CastleWallCommandContext = {},
+): Promise<number> {
+  const out = ctx.out ?? process.stdout;
+  const err = ctx.err ?? process.stderr;
+  const env = ctx.env ?? process.env;
+  const parsed = parseCastleWallArgs(argv);
+  const fortressPath = resolveFortressArg(parsed.fortress, env);
+
+  try {
+    const storage = new FilesystemStorage(join(fortressPath, "state"));
+    const masterKey = await resolveMasterKey(fortressPath, env);
+    const report = await verifyFortressAuditFullPicture({ storage, masterKey });
+    masterKey.fill(0);
+    write(out, JSON.stringify(report, null, 2) + "\n");
     return 0;
   } catch (error) {
     write(err, `Error: ${error instanceof Error ? error.message : String(error)}\n`);
@@ -464,6 +745,12 @@ export async function runProvisionPin(
   const storagePath = resolveFortressArg(fortress, env);
   const pubPath = join(storagePath, CASTLE_PINNED_PUBKEY);
   const privPath = join(storagePath, CASTLE_PINNED_PRIVKEY);
+  // Reuse the existing globalPinnedPublicKeyPath test seam (already threaded
+  // through the F1 safe-mode daemon path above) instead of adding a new ctx
+  // field: tests point this at a temp file so the fail-open regression test
+  // below can drive the guard without a real root-owned path.
+  const globalPinPath =
+    ctx.globalPinnedPublicKeyPath ?? CASTLE_GLOBAL_PINNED_PUBKEY_PATH;
 
   try {
     await mkdir(storagePath, { recursive: true, mode: 0o700 });
@@ -475,7 +762,7 @@ export async function runProvisionPin(
           `Pinned public key at ${pubPath} must be 32 bytes (found ${existingPub.length}).`
         );
       }
-      await writeGlobalPinnedPublicKey(existingPub);
+      await writeGlobalPinnedPublicKey(existingPub, globalPinPath);
       const fingerprint = fingerprintFromPublicKey(existingPub);
       write(out, `${fingerprint}\n`);
       write(
@@ -512,7 +799,7 @@ export async function runProvisionPin(
 
     await writeFile(pubPath, publicKey, { mode: 0o600 });
     await chmod(pubPath, 0o600);
-    await writeGlobalPinnedPublicKey(publicKey);
+    await writeGlobalPinnedPublicKey(publicKey, globalPinPath);
     await writeFile(privPath, JSON.stringify(encryptedPrivateKey), {
       mode: 0o600,
     });
@@ -536,34 +823,73 @@ export async function runProvisionPin(
 
 async function writeGlobalPinnedPublicKey(
   publicKey: Uint8Array,
+  globalPinPath: string = CASTLE_GLOBAL_PINNED_PUBKEY_PATH,
 ): Promise<void> {
+  // Fail-open fix (2026-07-07, drill-confirmed on real hardware): the ORIGINAL
+  // guard here treated an EACCES/EPERM on write as "the root signer helper owns
+  // this file, skip." That holds for an operator-UID provision-pin, but fails
+  // OPEN under root: `sanctuary protect --hermes --provision-agent-account`
+  // runs the whole wrap (including provision-pin) under `sudo` because
+  // OS-account creation needs root, so a root-euid write to the root:wheel 0644
+  // global pin SUCCEEDS - silently clobbering the signer helper's pin with a
+  // fortress-local key and breaking arm/enforcement until a manual re-pin.
+  //
+  // The global-pin immutability invariant ("only re-pin migrates the pin") is
+  // now enforced in ONE shared chokepoint - `writeGlobalPinIfUnestablished` -
+  // that reads-and-compares BEFORE any write, so a second writer (the local-sign
+  // daemon) cannot reintroduce the fail-open on a different path. This function
+  // supplies the CLI-specific fresh write (exclusive-create) + refusal guidance.
+  const emitRePinGuidance = () =>
+    console.warn(
+      `[castle-wall] global pin ${globalPinPath} already exists and is owned by the root signer helper (A2); provision-pin does not overwrite it. Run 'sanctuary castle-wall re-pin' to migrate the trust anchor to the signer helper.`,
+    );
+
   try {
-    // A2/B2 (F-A2-1): do NOT `mkdir` the custody directory here. This runs as the
-    // operator-UID provision-pin CLI; creating the directory operator-owned is
-    // exactly the gap the helper-as-signer design closes (an operator-owned dir
-    // lets same-UID malware swap the key + pin). The root signer helper creates
-    // + owns the directory. Best-effort write only IF the dir already exists
-    // root-owned (it will EACCES, handled below) - never bring it into being.
-    await writeFile(CASTLE_GLOBAL_PINNED_PUBKEY_PATH, publicKey, { mode: 0o644 });
-    await chmod(CASTLE_GLOBAL_PINNED_PUBKEY_PATH, 0o644);
+    await writeGlobalPinIfUnestablished(publicKey, {
+      path: globalPinPath,
+      onRefuse: emitRePinGuidance,
+      // A2/B2 (F-A2-1): do NOT `mkdir` the custody directory here. This runs as
+      // the operator-UID (or, under auto-provision, root-euid) provision-pin
+      // CLI; creating the directory operator-owned is exactly the gap the
+      // helper-as-signer design closes (an operator-owned dir lets same-UID
+      // malware swap the key + pin). The root signer helper creates + owns the
+      // directory. The exclusive-create ("wx") flag closes the read-then-write
+      // TOCTOU inside the chokepoint (EEXIST there is turned into a refusal).
+      freshWrite: async (path, key) => {
+        await writeFile(path, key, { mode: 0o644, flag: "wx" });
+        await chmod(path, 0o644);
+      },
+    });
   } catch (error) {
+    // Reached only when the fresh write threw a NON-EEXIST error (the chokepoint
+    // handled EEXIST as a refusal). SAFETY: provision-pin diagnostics are
+    // operator-facing CLI stderr output. These carry CLI-specific guidance:
+    //   - ENOENT: the custody directory does not exist yet (only the root
+    //     helper creates it) - fresh install, no shared pin to migrate. Emit a
+    //     quiet, non-action-implying line so a first-time installer is not told
+    //     to "migrate the trust anchor" that does not exist. (audit-C MED-1 /
+    //     audit-D omit noise on fresh wrap.)
+    //   - EACCES/EPERM: the parent directory is not writable (e.g. root-owned
+    //     dir, no pin file yet) for an operator-UID caller - `re-pin` migrates
+    //     the trust anchor to the signer helper.
     const code =
       error instanceof Error && "code" in error
         ? (error as NodeJS.ErrnoException).code
         : undefined;
-    // SAFETY: provision-pin diagnostics are operator-facing CLI stderr output.
-    // Under A2 the global pin is root:wheel 0644 and owned by the signer helper;
-    // an operator-UID provision-pin CANNOT (and must not) overwrite it, and the
-    // directory may not exist yet (ENOENT) because only the helper creates it.
-    // Both are expected - the trust anchor is migrated via `castle-wall re-pin`.
-    if (code === "EACCES" || code === "EPERM" || code === "ENOENT") {
+    if (code === "ENOENT") {
       console.warn(
-        `[castle-wall] global pin ${CASTLE_GLOBAL_PINNED_PUBKEY_PATH} is owned by the root signer helper (A2); provision-pin does not write it. Run 'sanctuary castle-wall re-pin' to migrate the trust anchor to the signer helper.`,
+        `[castle-wall] shared pin not provisioned (root signer helper not installed); nothing to do for a cooperative-only install.`,
+      );
+      return;
+    }
+    if (code === "EACCES" || code === "EPERM") {
+      console.warn(
+        `[castle-wall] global pin ${globalPinPath} is owned by the root signer helper (A2); provision-pin does not write it. Run 'sanctuary castle-wall re-pin' to migrate the trust anchor to the signer helper.`,
       );
       return;
     }
     console.warn(
-      `[castle-wall] warning: unable to write shared pinned key at ${CASTLE_GLOBAL_PINNED_PUBKEY_PATH}: ${
+      `[castle-wall] warning: unable to write shared pinned key at ${globalPinPath}: ${
         error instanceof Error ? error.message : String(error)
       }`,
     );
@@ -638,8 +964,11 @@ function defaultSignerClientCandidates(env: NodeJS.ProcessEnv): string[] {
  *
  * The DEFAULT discovery predicate is `isOwnerTrustedExecutable` (the same
  * owner-trust check `resolveHostAppBinary` uses to guard the arming surface):
- * a probed candidate must be a regular file owned by root or the current uid,
- * so a binary an attacker dropped at a user-writable probed path is rejected.
+ * a probed candidate must be a regular file owned by root, the current uid, or
+ * (for a root process launched via sudo) SUDO_UID. The sudo case is required
+ * for `sudo sanctuary protect --hermes`: privileged account/launchd steps run
+ * as root, while the installed and user-consented Castle Wall app can be owned
+ * by the operator who invoked sudo.
  * This brings the signer-client surface to PARITY with the host-app surface.
  * NOTE: stronger same-UID hardening (designated-requirement / codesign
  * validation) is a broader follow-up that, if pursued, must apply UNIFORMLY to
@@ -658,7 +987,7 @@ async function resolveSignerClientPath(
   if (platform !== "darwin") return undefined;
   const getuid = ctx.getuid ?? process.getuid?.bind(process);
   const exists =
-    ctx.fileExistsFn ?? ((path: string) => isOwnerTrustedExecutable(path, getuid));
+    ctx.fileExistsFn ?? ((path: string) => isOwnerTrustedExecutable(path, getuid, env));
   const candidates = ctx.signerClientCandidates ?? defaultSignerClientCandidates(env);
   for (const candidate of candidates) {
     if (await exists(candidate)) return candidate;
@@ -1180,7 +1509,18 @@ export async function runDaemon(
     return runSafeModeDaemon(argv, ctx);
   }
 
-  const storagePath = resolveStoragePath(env);
+  // Honor the subcommand-level `--fortress <path>` flag, exactly like the
+  // sibling custody verbs (provision-pin, re-pin, audit-*). Before this the
+  // daemon resolved with `resolveStoragePath(env)`, which reads
+  // SANCTUARY_STORAGE_PATH only, so it silently DROPPED a trailing
+  // `--fortress` (the top-level extractor stops at the subcommand boundary
+  // and never sees it) and armed against the DEFAULT/home fortress instead of
+  // the operator-named one - a "never silently degrade" footgun (wrong-fortress
+  // unlock failures, or arming the wrong fortress). resolveFortressArg falls
+  // back to resolveStoragePath(env) when no flag is given, preserving prior
+  // env-var behavior (SANCTUARY_FORTRESS_PATH is promoted to
+  // SANCTUARY_STORAGE_PATH upstream in cli.ts).
+  const storagePath = resolveFortressArg(parseCastleWallArgs(argv).fortress, env);
   const localSign = env.SANCTUARY_CASTLE_LOCAL_SIGN === "1";
   const launchdBoot = argv.includes("--launchd");
 
@@ -1249,14 +1589,72 @@ export async function runDaemon(
     );
     return 1;
   }
-  const auditLog = await buildAuditLogForPrivilegedAction({
-    storage,
-    masterKey: derived.key,
-    fortressPath: storagePath,
-    verb: "daemon",
-    acceptBrokenChain,
-    err,
-  });
+  // F2 Option A (2026-07-14): on an armed box the `daemon` verb is launched as
+  // ROOT (launchd/system context, needed for the NEFilter/pf enforcement
+  // primitives), while every OTHER caller of this same binary runs as the
+  // fortress operator. When both write into the shared `_audit` chain, the
+  // daemon's root-owned entries become permanently unreadable to the
+  // operator uid, so the operator's own `ensureLoaded()` throws
+  // `AuditIntegrityError` on every subsequent read/mint (drill-verified
+  // finding F2, `Review/Sanctuary/FileGrant_F2_Audit_Contamination_Decision_2026-07-14.md`).
+  // The fix is store separation: a root daemon gets its OWN root-owned
+  // `_audit-daemon` chain (never `_audit`), reached via
+  // `createDaemonAuditLog`. On startup it MUST also run the one-time,
+  // idempotent, crash-safe migration that seals any PRE-EXISTING `_audit`
+  // history (which may already have contamination) as a legacy segment; see
+  // `operational/audit-store-split.ts`'s module doc comment for the full
+  // design.
+  //
+  // A NON-root daemon run (dev/test/manual, or a deployment that does not
+  // need root for enforcement) is unaffected: it keeps writing straight into
+  // the shared `_audit` chain exactly as before this PR, byte-for-byte, and
+  // never provisions a daemon namespace or a split-boundary record. This
+  // keeps every existing test/CI/dev flow (which never runs as uid 0)
+  // completely unchanged.
+  const getuid = ctx.getuid ?? process.getuid?.bind(process);
+  const isRootDaemon = getuid?.() === 0;
+  let auditLog: AuditLog;
+  if (isRootDaemon) {
+    try {
+      const migration = await migrateFortressAuditStoreSplit({
+        storage,
+        masterKey: derived.key,
+        identityId: fortressIdFromStoragePath(storagePath),
+      });
+      write(
+        out,
+        migration.status === "already-migrated"
+          ? `Fortress audit store split already active (sealed at legacy sequence ${migration.boundary.sealed_tip_sequence}).\n`
+          : `Fortress audit store split engaged: sealed the pre-split "_audit" chain at sequence ${migration.boundary.sealed_tip_sequence}; this daemon now writes its own root-owned "${migration.boundary.daemon_namespace}" chain.\n`,
+      );
+    } catch (error) {
+      write(
+        err,
+        `Refusing to start: the fortress audit store writer-split migration failed ` +
+          `(${error instanceof AuditStoreSplitMigrationError ? error.message : String(error)}).\n` +
+          "This runs as root and can read every existing audit entry regardless of " +
+          "owner, so a failure here means a genuine chain problem, not routine " +
+          "cross-uid unreadability. Investigate before retrying (see " +
+          "'sanctuary castle-wall audit-findings').\n",
+      );
+      return 1;
+    }
+    // The daemon's own chain is fresh from this migration onward (nothing but
+    // this migration and this daemon ever write to it), so there is no
+    // analogous "accept a pre-existing broken chain" override to apply here;
+    // `--accept-broken-chain` still governs ONLY the legacy `_audit` read
+    // path other privileged verbs (e.g. `re-pin`) use.
+    auditLog = createDaemonAuditLog(storage, derived.key);
+  } else {
+    auditLog = await buildAuditLogForPrivilegedAction({
+      storage,
+      masterKey: derived.key,
+      fortressPath: storagePath,
+      verb: "daemon",
+      acceptBrokenChain,
+      err,
+    });
+  }
 
   let daemon: { socketPath: string; stop: () => Promise<void> };
 
@@ -1312,17 +1710,41 @@ export async function runDaemon(
       ? undefined
       : await resolveSignerClientPath(env, platform, ctx);
 
-    const { startMacOSCastleWallDaemon } = await import("../castle-wall/runtime/index.js");
+    // Slice M: resolve the macOS audit-producer public-key path the daemon
+    // pins flow verdicts against. ctx (tests) → env override → daemon default
+    // (`/Library/Application Support/Sanctuary/castle-audit-producer.pub`). When
+    // a key IS published there, the daemon loads it and engages per-producer
+    // re-verification; when it is absent, the daemon stays on the honest
+    // channel-authenticated floor (never overclaims).
+    const auditProducerKeyPath =
+      ctx.auditProducerPublicKeyPath ??
+      env.SANCTUARY_CASTLE_AUDIT_PRODUCER_PUBKEY;
+
+    const startFullDaemon =
+      ctx.fullDaemonStart ??
+      (async (input) => {
+        const { startMacOSCastleWallDaemon } = await import(
+          "../castle-wall/runtime/index.js"
+        );
+        return startMacOSCastleWallDaemon(input);
+      });
     try {
-      daemon = await startMacOSCastleWallDaemon({
+      daemon = await startFullDaemon({
         fortressPath: storagePath,
         fortressId: fortressIdFromStoragePath(storagePath),
         masterKey: derived.key,
         auditLog,
+        // FULL operator daemon: come up in FULL mode (NOT safe-mode-from-boot-
+        // token). This is the console-login enforcement path that holds the
+        // fortress key + reaches the audit-producer signing service.
+        daemonMode: "full",
         ...(launchdBoot ? { auditSource: "launchd-boot" } : {}),
         ...(localSign ? { localSign: true } : {}),
         ...(resolvedSignerClient
           ? { signerClientPath: resolvedSignerClient }
+          : {}),
+        ...(auditProducerKeyPath
+          ? { auditProducerPublicKeyPath: auditProducerKeyPath }
           : {}),
       });
     } catch (error) {
@@ -1330,7 +1752,13 @@ export async function runDaemon(
       if (localSign) {
         write(err, "Local-sign mode: a decrypt error means the passphrase does not match the pinned key. Refusing to arm with a mismatched key.\n");
       } else {
-        write(err, "Helper-sign mode: the signer helper is unreachable. Confirm the helper is installed + approved and SANCTUARY_CASTLE_SIGNER_CLIENT points at the shim. Refusing to arm without a signer (fail-closed).\n");
+        write(err, "Helper-sign mode: the signer helper is unreachable. Refusing to arm without a signer (fail-closed).\n");
+        await writeSignerHelperReadinessDiagnosis(err, {
+          platform,
+          signerClientPath: resolvedSignerClient,
+          signerClientInvoke: ctx.signerClientInvoke,
+          globalPinPath: CASTLE_GLOBAL_PINNED_PUBKEY_PATH,
+        });
       }
       return 1;
     }
@@ -1534,7 +1962,7 @@ export async function runDaemon(
  * throughout, so an unattended reboot can no longer brick the box.
  */
 export async function runSafeModeDaemon(
-  _argv: string[] = [],
+  argv: string[] = [],
   ctx: CastleWallCommandContext = {},
 ): Promise<number> {
   const out = ctx.out ?? process.stdout;
@@ -1557,7 +1985,14 @@ export async function runSafeModeDaemon(
     return 1;
   }
 
-  const storagePath = resolveStoragePath(env);
+  // Honor the subcommand-level `--fortress <path>` flag, matching runDaemon and
+  // the other custody verbs. `castle-wall daemon --safe-mode --fortress <path>`
+  // routes here with the full argv, so without this the safe-mode boot path
+  // silently dropped `--fortress` and armed against the default/home fortress -
+  // the same footgun runDaemon had. resolveFortressArg falls back to
+  // resolveStoragePath(env) when no flag is given, so the launchd boot path
+  // (SANCTUARY_STORAGE_PATH set in the plist, no flag) is unchanged.
+  const storagePath = resolveFortressArg(parseCastleWallArgs(argv).fortress, env);
   const fortressId = fortressIdFromStoragePath(storagePath);
 
   // 1. Boot token (the only secret safe mode holds). Fail-closed on absence or
@@ -1641,6 +2076,16 @@ export async function runSafeModeDaemon(
       ...(ctx.globalPinnedPublicKeyPath
         ? { globalPinnedPublicKeyPath: ctx.globalPinnedPublicKeyPath }
         : {}),
+      // Slice M: a safe-mode boot daemon also loads the helper-published
+      // audit-producer key (the helper provisions it at boot independent of
+      // login), so producer-signed verdicts are re-verified even before login.
+      ...(ctx.auditProducerPublicKeyPath ?? env.SANCTUARY_CASTLE_AUDIT_PRODUCER_PUBKEY
+        ? {
+            auditProducerPublicKeyPath:
+              ctx.auditProducerPublicKeyPath ??
+              env.SANCTUARY_CASTLE_AUDIT_PRODUCER_PUBKEY,
+          }
+        : {}),
     });
   } catch (error) {
     write(err, `Safe-mode daemon failed to start: ${(error as Error).message}\n`);
@@ -1648,6 +2093,14 @@ export async function runSafeModeDaemon(
       err,
       "The signer helper is unreachable. The system extension keeps enforcing the persisted last-valid manifest (deny baseline) meanwhile; KeepAlive will retry. Refusing to arm without a signer (fail-closed).\n",
     );
+    // Boot-readiness preflight (design pass 2026-06-26): this is the boot-daemon
+    // path itself, so the diagnosis matters most here.
+    await writeSignerHelperReadinessDiagnosis(err, {
+      platform,
+      signerClientPath,
+      signerClientInvoke: ctx.signerClientInvoke,
+      globalPinPath: ctx.globalPinnedPublicKeyPath ?? CASTLE_GLOBAL_PINNED_PUBKEY_PATH,
+    });
     return 1;
   }
 
@@ -1661,12 +2114,86 @@ export async function runSafeModeDaemon(
     "Agents denied by default; persisted signed manifest enforced if present. Full operation resumes at first login.\n",
   );
 
+  // Unified Protect Slice 5 S5-6: the exclusive-egress BOOT release sequence
+  // (design "Boot ordering via the root supervisor"). For every confined
+  // agent in the S5-1 registry: re-arm the pf anchor union from the registry
+  // -> verify gate + generation -> recommit + hold file -> enable+bootstrap
+  // the parked harness, per the S5-5 persistent-park contract -- then keep
+  // the oracle freshness-token loop running (the gate's per-CONNECT liveness
+  // is TTL-fresh). PER-AGENT FAIL-CLOSED and NEVER daemon-fatal: a failure
+  // leaves that agent PARKED (loud, amber, repairable via
+  // 'sudo sanctuary protect --repair-egress-gate --stand-down-agent'), and the policy daemon
+  // keeps serving regardless.
+  let exclusiveEgressSupervisor: { stopOracleLoop(): void } | undefined;
+  try {
+    const { startExclusiveEgressBootSupervisor, NON_HERMES_BOOT_PARK_REASON } = await import(
+      "../egress-gate/arming-wiring.js"
+    );
+    const { deriveGateAccountName } = await import("../egress-gate/index.js");
+    const { loadExclusiveRoutingMarker } = await import("../castle-wall/allowlist/routing-marker.js");
+    const { deriveAgentAccountName, resolveHermesGatewayArgv, realHarnessArgvOps } = await import(
+      "../castle-wall/provision/index.js"
+    );
+    exclusiveEgressSupervisor = await startExclusiveEgressBootSupervisor({
+      // Discriminated resolution (fix-round H1): an unresolvable agent gets a
+      // REAL reassert-parked (bootout + hold-file removal + disable) inside
+      // the supervisor, never a synthetic unverified "parked" report.
+      resolveAgent: async (entry) => {
+        const marker = await loadExclusiveRoutingMarker(entry.fortress_path).catch(() => null);
+        if (marker === null || marker.agent_uid !== entry.agent_uid) {
+          return {
+            kind: "unresolvable" as const,
+            reason: `no exclusive-routing marker names uid ${entry.agent_uid} in ${entry.fortress_path} (marker missing, malformed, or for another uid)`,
+          };
+        }
+        if (marker.agent_id !== "hermes") {
+          // Fix-round M6: a deliberate v1 scope bound, not a fault.
+          return { kind: "unresolvable" as const, reason: NON_HERMES_BOOT_PARK_REASON };
+        }
+        const accountName = deriveAgentAccountName(marker.agent_id);
+        const agentHome = `/var/sanctuary-agents/${accountName}`;
+        const gateAccount = deriveGateAccountName(marker.agent_id);
+        const gateHomeDirectory = `/var/sanctuary-agents/${gateAccount}`;
+        // FIX F-INTERP: one shared production probe set (never a hand-rolled
+        // `pathExists` here), and the argv is resolved for the AGENT uid the
+        // boot release will actually run the harness as.
+        const resolved = await resolveHermesGatewayArgv(realHarnessArgvOps(), {
+          agentHome,
+          agentUid: marker.agent_uid,
+        });
+        return {
+          kind: "ok" as const,
+          agentAccount: accountName,
+          // FIX F-HARNESSENV: the boot release re-renders the harness plist, so
+          // it carries the WHOLE launch (argv + environment), never a bare argv.
+          harnessLaunch: resolved.launch,
+          harnessLogDir: `${agentHome}/logs`,
+          gateAccount,
+          gateHomeDirectory,
+          gateUid: marker.gate_uid,
+        };
+      },
+      audit: async () => undefined, // safe-mode: unified log is the boot evidence channel.
+      print: (line) => write(out, `${line}\n`),
+    });
+  } catch (bootErr) {
+    // HONESTY (fix-round-2 BLOCKER-1): a supervisor throw means NO re-park op
+    // verifiably ran here -- never claim the agents "stay PARKED"; their
+    // persisted parked posture (hold files + disable overrides) was not
+    // re-verified this boot.
+    write(
+      err,
+      `[castle-wall] exclusive-egress boot supervisor failed (${bootErr instanceof Error ? bootErr.message : String(bootErr)}); NO boot release or re-park ran and the confined agents' parked state was NOT verified -- treat them as possibly startable and intervene. Repair: ${EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE}\n`,
+    );
+  }
+
   await new Promise<void>((resolveWait) => {
     let stopping = false;
     const stop = () => {
       if (stopping) return;
       stopping = true;
       write(err, "\nStopping Castle Wall safe-mode daemon...\n");
+      exclusiveEgressSupervisor?.stopOracleLoop();
       void daemon
         .stop()
         .catch(() => undefined)
@@ -1748,6 +2275,63 @@ export async function runSetupSharedDir(
   return 0;
 }
 
+/** Result of {@link requestPolicyReload}. */
+export interface PolicyReloadResult {
+  ok: boolean;
+  loadedRuleCount?: number;
+  error?: string;
+  /** True when the failure was an unreachable daemon socket (no daemon running). */
+  socketUnavailable?: boolean;
+}
+
+/**
+ * Ask the running Castle Wall policy daemon for this fortress to re-read,
+ * re-compose, re-sign, and broadcast its manifest. FAIL-CLOSED result shape:
+ * an unreachable socket is `ok: false` (with `socketUnavailable: true`),
+ * never a silent success -- callers that REQUIRE a confirmed reload (the
+ * confined-agent egress provisioning step) must treat anything but
+ * `ok: true` as a refusal. The lenient "no daemon running" UX belongs to
+ * `runReload`'s CLI rendering, not to this primitive.
+ */
+export async function requestPolicyReload(
+  fortressPath: string,
+  platform: NodeJS.Platform = process.platform,
+): Promise<PolicyReloadResult> {
+  const socketPath = resolveCastleWallSocketPath({ platform, fortressPath }).path;
+  try {
+    // The daemon recomposes + re-signs from `policy/egress/rules/`, so no
+    // `manifest_path` is sent (it was a fabricated, non-existent path the daemon
+    // ignored). A reload re-signs through the root helper, which is far slower
+    // than a status query (especially the first cold reload on a freshly-booted
+    // box), so it gets a dedicated, longer client deadline that comfortably
+    // exceeds the daemon's own internal reload budget. Without it the generic 5s
+    // socket deadline fired BEFORE a healthy daemon finished signing and the
+    // reload was reported as a spurious timeout (Mini1 egress drill 2026-07-12).
+    const reply = await sendCastleWallMessage<PolicyReloadResponse>(
+      socketPath,
+      {
+        type: "policy_reload_request",
+        request_id: nodeRandomBytes(16).toString("hex"),
+      },
+      "policy_reload_response",
+      CASTLE_WALL_RELOAD_CLIENT_TIMEOUT_MS,
+    );
+    if (!reply.ok) {
+      return { ok: false, error: reply.error ?? "policy reload failed" };
+    }
+    return { ok: true, loadedRuleCount: reply.loaded_rule_count };
+  } catch (error) {
+    if (isSocketUnavailable(error)) {
+      return {
+        ok: false,
+        socketUnavailable: true,
+        error: `no Castle Wall daemon reachable at ${socketPath}`,
+      };
+    }
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
 export async function runReload(
   argv: string[] = [],
   ctx: CastleWallCommandContext = {}
@@ -1757,38 +2341,21 @@ export async function runReload(
   const env = ctx.env ?? process.env;
   const parsed = parseCastleWallArgs(argv);
   const fortressPath = resolveFortressArg(parsed.fortress, env);
-  const socketPath = resolveCastleWallSocketPath({
-    platform: ctx.platform ?? process.platform,
-    fortressPath,
-  }).path;
 
-  try {
-    const reply = await sendCastleWallMessage<PolicyReloadResponse>(
-      socketPath,
-      {
-        type: "policy_reload_request",
-        request_id: nodeRandomBytes(16).toString("hex"),
-        manifest_path: join(fortressPath, "policy", "egress", "manifest.json"),
-      },
-      "policy_reload_response",
-    );
-    if (!reply.ok) {
-      write(err, `Error: ${reply.error ?? "policy reload failed"}\n`);
-      return 1;
-    }
-    write(out, `Castle Wall policy reloaded (${reply.loaded_rule_count} rules).\n`);
+  const result = await requestPolicyReload(fortressPath, ctx.platform ?? process.platform);
+  if (result.ok) {
+    write(out, `Castle Wall policy reloaded (${result.loadedRuleCount} rules).\n`);
     return 0;
-  } catch (error) {
-    if (isSocketUnavailable(error)) {
-      write(
-        out,
-        `No Castle Wall daemon running for fortress ${fortressIdLabel(fortressPath)}. Run 'sanctuary wrap' to start one.\n`,
-      );
-      return 0;
-    }
-    write(err, `Error: ${error instanceof Error ? error.message : String(error)}\n`);
-    return 1;
   }
+  if (result.socketUnavailable) {
+    write(
+      out,
+      `No Castle Wall daemon running for fortress ${fortressIdLabel(fortressPath)}. Run 'sanctuary wrap' to start one.\n`,
+    );
+    return 0;
+  }
+  write(err, `Error: ${result.error ?? "policy reload failed"}\n`);
+  return 1;
 }
 
 export async function runApprove(
@@ -1840,6 +2407,65 @@ export async function runApprove(
   }
 }
 
+/**
+ * F2 HIGH-1 (adversarial gate 2026-07-14): after the writer-split, the root
+ * daemon's Castle Wall enforcement events (egress_allowed / egress_blocked /
+ * filter_started) live in `_audit-daemon`, NOT `_audit`. A reader that reads
+ * only `_audit` would print a false-green over an incomplete chain. This helper
+ * returns the daemon chain's entries when readable, or an honest status so the
+ * caller can mark its output INCOMPLETE (and never treat a zero-count as a
+ * clean success).
+ */
+type DaemonAuditView = {
+  // HIGH-R4 (adversarial re-gate 2026-07-14): `tampered` means the daemon chain
+  // is readable but FAILED integrity verification. Its entries must NOT be
+  // counted as verified coverage, and the caller must mark the run incomplete.
+  status: "absent" | "included" | "unreadable" | "tampered";
+  entries: AuditEntry[];
+  findings: AuditIntegrityFinding[];
+};
+
+async function collectDaemonCastleWallEntries(
+  storage: FilesystemStorage,
+  masterKey: Uint8Array,
+  queryOpts: { since?: string; layer: "l1"; limit: number },
+): Promise<DaemonAuditView> {
+  const access = await probeDaemonChainAccess(storage);
+  if (access === "absent") return { status: "absent", entries: [], findings: [] };
+  if (access === "present_unreadable") {
+    return { status: "unreadable", entries: [], findings: [] };
+  }
+  try {
+    const daemonLog = createDaemonAuditLog(storage, masterKey, {
+      integrityMode: "lenient",
+    });
+    const q = await daemonLog.query(queryOpts);
+    // HIGH-R4: `query()` returns the daemon chain's integrity findings; a prior
+    // version DISCARDED them, so a readable-but-tampered daemon chain read as
+    // `complete: true` with no warning. Surface them: a chain with findings is
+    // `tampered`, and its entries are NOT counted as verified coverage.
+    //
+    // F2 BLOCKER-1 (round 3): the cleanliness decision routes through the shared
+    // chokepoint `getAuditChainVerdict` (the daemon chain has no sealed region of
+    // its own, so its sealed verdict is `not_present` and the fold reduces to the
+    // routine findings, exactly as before) rather than reading findings.length
+    // directly. This keeps every audit-cleanliness claim on one code path.
+    const verdict = await daemonLog.getAuditChainVerdict();
+    if (verdict.status === "findings") {
+      return {
+        status: "tampered",
+        entries: q.entries,
+        findings: q.integrity_findings,
+      };
+    }
+    return { status: "included", entries: q.entries, findings: [] };
+  } catch {
+    // A read error mid-query (e.g. the dir became unreadable in a race) is
+    // reported as unreadable, never silently dropped to "complete".
+    return { status: "unreadable", entries: [], findings: [] };
+  }
+}
+
 export async function runAuditDump(
   argv: string[] = [],
   ctx: CastleWallCommandContext = {}
@@ -1860,13 +2486,49 @@ export async function runAuditDump(
   try {
     const storage = new FilesystemStorage(join(fortressPath, "state"));
     const masterKey = await resolveMasterKey(fortressPath, env);
-    const auditLog = new AuditLog(storage, masterKey, { integrityMode: "lenient" });
-    const query = await auditLog.query({
+    const queryOpts = {
       ...(sinceIso ? { since: sinceIso } : {}),
-      layer: "l1",
+      layer: "l1" as const,
       limit: 100_000,
-    });
-    const castleWallEntries = query.entries.filter(isCastleWallAuditEntry);
+    };
+    const auditLog = new AuditLog(storage, masterKey, { integrityMode: "lenient" });
+    const query = await auditLog.query(queryOpts);
+    const operatorEntries = query.entries.filter(isCastleWallAuditEntry);
+
+    // F2 HIGH-1: include the root daemon's own Castle Wall chain when present +
+    // readable; warn INCOMPLETE (never a false green) when it exists but is
+    // unreadable at this privilege.
+    const daemonView = await collectDaemonCastleWallEntries(
+      storage,
+      masterKey,
+      queryOpts,
+    );
+    const daemonEntries = daemonView.entries.filter(isCastleWallAuditEntry);
+    const daemonPresent = daemonView.status !== "absent";
+    if (daemonView.status === "unreadable") {
+      write(
+        err,
+        "WARNING: a root daemon audit store (_audit-daemon) exists but is NOT " +
+          "readable at this privilege; this dump is INCOMPLETE (daemon " +
+          "enforcement events are omitted). Re-run as root for the full picture.\n",
+      );
+    } else if (daemonView.status === "tampered") {
+      // HIGH-R4: the daemon chain is readable but FAILED integrity verification.
+      // Its records are still emitted (for forensic inspection) but MUST be
+      // flagged loudly so they are not trusted as verified evidence.
+      write(
+        err,
+        `WARNING: the root daemon audit store (_audit-daemon) has ` +
+          `${daemonView.findings.length} integrity finding(s); its records below ` +
+          `are TAMPERED / not trustworthy. Do NOT treat them as verified ` +
+          `enforcement evidence.\n`,
+      );
+      for (const f of daemonView.findings.slice(0, 20)) {
+        write(err, `  daemon finding: ${f.kind} - ${f.message}\n`);
+      }
+    }
+    // Merge for per-rule attribution (both chains' recorded flows).
+    const mergedEntries = [...operatorEntries, ...daemonEntries];
 
     // Per-rule-per-flow read-out modes (#c4). These attribute each RECORDED flow
     // to the rule that decided it; they do NOT change emission, schema, or
@@ -1874,7 +2536,7 @@ export async function runAuditDump(
     // separate, currently-inert producer-signed-audit capability). The rule id
     // shown here is operator-only - this CLI runs in operator context.
     if (parsed.byRule || parsed.rule !== undefined) {
-      const flows = attributeFlows(castleWallEntries);
+      const flows = attributeFlows(mergedEntries);
       if (parsed.rule !== undefined) {
         const ruleId = normalizeRuleFilter(parsed.rule);
         for (const flow of filterFlowsByRule(flows, ruleId)) {
@@ -1888,12 +2550,424 @@ export async function runAuditDump(
       return 0;
     }
 
-    for (const entry of castleWallEntries) {
-      write(out, JSON.stringify(entry) + "\n");
+    // Plain dump. When a daemon chain is present at all, tag each record with
+    // its source chain (`_chain`) so the two are distinguishable; on the
+    // overwhelming (non-migrated) majority the output is byte-identical to
+    // before this change (no `_chain` field, operator entries only).
+    for (const entry of operatorEntries) {
+      write(
+        out,
+        JSON.stringify(daemonPresent ? { ...entry, _chain: "operator" } : entry) + "\n",
+      );
+    }
+    for (const entry of daemonEntries) {
+      write(out, JSON.stringify({ ...entry, _chain: "daemon" }) + "\n");
     }
     return 0;
   } catch (error) {
     write(err, `Error: ${error instanceof Error ? error.message : String(error)}\n`);
+    return 1;
+  }
+}
+
+/** The per-basis tally `audit-verify` reports. */
+interface AuditVerifyTally {
+  verified: number;
+  rejected: number;
+  channel: number;
+  /**
+   * Verified-but-duplicate entries: a genuine signed tuple (same seq|signature)
+   * re-appended N times. The first copy is counted as `verified`; each extra
+   * copy lands here and does NOT inflate `verified`, so N copies of one real
+   * enforcement event never read as N distinct verified events.
+   */
+  duplicates: number;
+}
+
+/** Map a re-verification basis into the tally bucket it contributes to. */
+function tallyBucketForBasis(basis: EntryReverifyBasis): keyof AuditVerifyTally {
+  switch (basis) {
+    case "producer_signed_verified":
+      return "verified";
+    case "producer_signed_rejected":
+      return "rejected";
+    case "channel_authenticated":
+      return "channel";
+  }
+}
+
+/**
+ * Map from the daemon's SIGNED WAL `operation` vocabulary to the read-side
+ * `entry.operation` `audit-verify` scopes to. Mirrors `SIGNED_WAL_OP_TO_ENTRY_OP`
+ * in `posture.ts` and `SIGNED_WAL_OP_TO_FEATURE_OP` in `feature-health.ts`. Only
+ * the two flow-verdict operations matter here (the verb already filters to
+ * `egress_allowed` / `egress_blocked`); a signed `egress_pending` body can never
+ * match either, so a paused-decision tuple cannot be relabeled into a verdict.
+ */
+const AUDIT_VERIFY_SIGNED_WAL_OP_TO_ENTRY_OP: Readonly<Record<string, string>> =
+  Object.freeze({
+    egress_approved: "egress_allowed",
+    egress_blocked: "egress_blocked",
+  });
+
+/**
+ * True iff a re-verified producer-signed entry's SIGNED canonical body attests
+ * to the same read-side operation the entry is filed under (parity with the
+ * posture / feature-health green-light surfaces). Fail closed on any parse
+ * failure / unknown signed op / mismatch: a verified signature over one
+ * operation must NOT count toward a DIFFERENT operation's verified tally, so a
+ * genuine signed tuple cannot be relabeled under a different top-level operation
+ * to inflate or mis-slice the verified count.
+ */
+function auditVerifySignedOperationMatchesEntry(
+  details: Record<string, unknown>,
+  entryOperation: string,
+): boolean {
+  const signedOp = signedCanonicalOperation(details);
+  if (signedOp === null) return false;
+  return AUDIT_VERIFY_SIGNED_WAL_OP_TO_ENTRY_OP[signedOp] === entryOperation;
+}
+
+/**
+ * Resolve the pinned audit-producer public key for `audit-verify`, in
+ * base64url-no-pad, or `null` when no key is published.
+ *
+ * Path resolution (single source of truth - never invents a weaker basis):
+ *   1. an explicit `--producer-pub-key <path>` override (tests / non-default
+ *      layouts), else
+ *   2. on macOS, the root-helper-published host-wide key at
+ *      `/Library/Application Support/Sanctuary/castle-audit-producer.pub`,
+ *      falling back to the fortress path only when the host-wide key is absent,
+ *      else
+ *   3. the fortress publish path `resolveProducerPubKeyPath(fortressPath)` =
+ *      `<fortress>/policy/egress/audit-producer.pub`, which is exactly where the
+ *      Linux daemon publishes the key the audit CONSUMER pinned, so the reader
+ *      can never diverge onto a different key than the one writes were gated
+ *      against.
+ *
+ * A MISSING key file (ENOENT) is the honest no-key floor: the reader returns
+ * `null` and reports every entry on the channel basis - it never fabricates a
+ * verified result it cannot check. A PRESENT-but-bad key (wrong length, EACCES)
+ * is a fault, not "absent": it throws so the verb fails honestly rather than
+ * silently dropping to the channel basis (the Slice P fail-closed contract).
+ */
+async function resolveAuditVerifyProducerKey(
+  fortressPath: string,
+  explicitPath: string | undefined,
+  opts: {
+    platform?: NodeJS.Platform;
+    macosProducerPubKeyPath?: string;
+  } = {},
+): Promise<string | null> {
+  if (explicitPath === undefined) {
+    const load = await loadFortressProducerKey(fortressPath, {
+      platform: opts.platform,
+      macosProducerPubKeyPath: opts.macosProducerPubKeyPath,
+    });
+    if (load.status === "present") return load.keyB64url;
+    if (load.status === "absent") return null;
+    throw new Error(load.reason);
+  }
+  const pubKeyPath = explicitPath;
+  try {
+    return await loadPinnedProducerKeyB64url(pubKeyPath);
+  } catch (error) {
+    const code =
+      error && typeof error === "object" && "code" in error
+        ? (error as NodeJS.ErrnoException).code
+        : undefined;
+    if (code === "ENOENT") {
+      // No producer key published: the honest channel-authenticated floor.
+      // Not a failure - macOS pre-Slice-M / pre-provision Linux lives here.
+      return null;
+    }
+    // A key file exists but is unreadable / malformed. A key is EXPECTED here,
+    // so do NOT pretend it is absent and drop to the channel basis.
+    throw error;
+  }
+}
+
+/**
+ * `audit-verify` - the read-side tamper-evidence reader for Castle Wall
+ * enforcement evidence (Slice R / Slice M reader leg).
+ *
+ * Unlike `audit-dump` (which surfaces the RECORDED attribution, including a
+ * forgeable `cw_source` marker, and makes NO authenticity claim), this verb
+ * CRYPTOGRAPHICALLY RE-VERIFIES each entry's persisted producer signature
+ * against the daemon's pinned producer public key. A forger that stamped the
+ * `producer_signed` basis + marker but could not mint a signature over the
+ * pinned key is REJECTED here; only a signature that re-verifies counts as
+ * per-producer-authenticated.
+ *
+ * It reuses `reverifyEntryProducerSignature()` - the exact same fail-closed
+ * gate the posture/feature-health readers run - so the CLI cannot diverge from
+ * the live posture surface. Beyond the signature check it applies the SAME two
+ * guards those green-light surfaces apply, so a re-verifiable signature alone
+ * does not inflate the count: (1) OPERATION BINDING - the signed canonical
+ * body's operation must map to the entry's top-level operation, so a genuine
+ * signed tuple relabeled under a different operation is REJECTED, not verified;
+ * and (2) DEDUP on `seq|signature` - a genuine tuple copied N times counts once
+ * (the extras are surfaced as `duplicates`, never as distinct verified events).
+ * Without these, an in-process actor holding the AuditLog handle could replay a
+ * genuine signed tuple - relabeled and/or duplicated - to mis-slice the count.
+ *
+ * Honest no-key floor: when no producer key is published (macOS pre-Slice-M,
+ * pre-provision Linux), the verb reports every enforcement entry on the
+ * `channel_authenticated` basis and explicitly states it could NOT re-verify
+ * per-producer signatures. It never fakes a verified count.
+ *
+ * Exit codes:
+ *   0 - read + classification succeeded (this is a DIAGNOSTIC; a present
+ *       `rejected` count does NOT change the exit code, so a tamper finding is
+ *       reported, not swallowed by a non-zero exit a script might ignore).
+ *   1 - could not read the audit log / load an expected-but-broken key.
+ */
+export async function runAuditVerify(
+  argv: string[] = [],
+  ctx: CastleWallCommandContext = {},
+): Promise<number> {
+  const out = ctx.out ?? process.stdout;
+  const err = ctx.err ?? process.stderr;
+  const env = ctx.env ?? process.env;
+  const parsed = parseCastleWallArgs(argv);
+  const fortressPath = resolveFortressArg(parsed.fortress, env);
+  const sinceIso = parsed.since
+    ? new Date(Date.now() - parseDurationMs(parsed.since)).toISOString()
+    : undefined;
+
+  try {
+    const pinnedProducerKeyB64url = await resolveAuditVerifyProducerKey(
+      fortressPath,
+      parsed.producerPubKey,
+      {
+        platform: ctx.platform ?? process.platform,
+        macosProducerPubKeyPath: ctx.auditProducerPublicKeyPath,
+      },
+    );
+
+    const storage = new FilesystemStorage(join(fortressPath, "state"));
+    const masterKey = await resolveMasterKey(fortressPath, env);
+    const queryOpts = {
+      ...(sinceIso ? { since: sinceIso } : {}),
+      layer: "l1" as const,
+      limit: 100_000,
+    };
+    const auditLog = new AuditLog(storage, masterKey, {
+      integrityMode: "lenient",
+    });
+    const query = await auditLog.query(queryOpts);
+    // Only enforcement-evidence operations carry producer signatures; an
+    // operator_decision / policy_loaded / heartbeat entry is never expected to
+    // be producer-signed, so re-verifying them would inflate the channel count
+    // with entries that were never enforcement evidence. Scope to the two flow
+    // verdict operations the consumer signs.
+    const isEvidence = (entry: { operation: string }): boolean =>
+      entry.operation === "egress_allowed" ||
+      entry.operation === "egress_blocked";
+    const operatorEvidence = query.entries.filter(isEvidence);
+
+    // F2 HIGH-1: after the writer-split, the LIVE daemon enforcement evidence
+    // lives in `_audit-daemon`. Include it when readable; mark the run
+    // INCOMPLETE (and refuse to present a zero-count as a clean success) when
+    // the daemon chain exists but is unreadable at this privilege.
+    const daemonView = await collectDaemonCastleWallEntries(
+      storage,
+      masterKey,
+      queryOpts,
+    );
+    // HIGH-R4: a `tampered` daemon chain (readable but with integrity findings)
+    // is INCOMPLETE coverage too (its evidence is NOT trustworthy), so it is NOT
+    // merged into the verified tally and the run is marked incomplete.
+    const daemonTampered = daemonView.status === "tampered";
+    const daemonEvidence = daemonTampered
+      ? []
+      : daemonView.entries.filter(isEvidence);
+    const daemonIncomplete =
+      daemonView.status === "unreadable" || daemonTampered;
+    const evidenceEntries = [...operatorEvidence, ...daemonEvidence];
+
+    const tally: AuditVerifyTally = {
+      verified: 0,
+      rejected: 0,
+      channel: 0,
+      duplicates: 0,
+    };
+    const rejectedSamples: Array<{
+      timestamp: string;
+      operation: string;
+      reason: string;
+    }> = [];
+    // Dedup verified producer-signed entries on `seq|signature` so a genuine
+    // tuple copied N times counts once. Mirrors the posture / feature-health
+    // green-light surfaces, which already dedup the same way.
+    const seenSignedKeys = new Set<string>();
+    for (const entry of evidenceEntries) {
+      const details = entry.details ?? {};
+      const result = reverifyEntryProducerSignature(
+        details,
+        pinnedProducerKeyB64url,
+      );
+      // A signature that re-verifies is necessary but not sufficient to count as
+      // a distinct verified enforcement event: apply the same operation-binding
+      // and dedup guards the sibling green-light surfaces apply, so an in-process
+      // actor cannot replay a genuine signed tuple relabeled under a different
+      // top-level operation, nor duplicated N times, to inflate the verified
+      // tally.
+      if (result.basis === "producer_signed_verified") {
+        // (1) Operation binding: the signed canonical body's operation is
+        // authoritative, not the forgeable top-level `entry.operation`. A
+        // mismatch is a relabel attack: count it as REJECTED, not verified.
+        if (!auditVerifySignedOperationMatchesEntry(details, entry.operation)) {
+          tally.rejected += 1;
+          if (rejectedSamples.length < 20) {
+            rejectedSamples.push({
+              timestamp: entry.timestamp,
+              operation: entry.operation,
+              reason: "operation mismatch (signed body attests a different operation)",
+            });
+          }
+          continue;
+        }
+        // (2) Dedup: a genuine tuple copied N times re-verifies identically.
+        // Count the first copy as verified; surface the extras as duplicates so
+        // they do not read as distinct verified enforcement events. A
+        // null/absent dedup key cannot be trusted to be unique, so treat it as a
+        // duplicate beyond the first un-keyed entry would be unsound. Instead it
+        // simply cannot dedup, so it counts as verified (the inputs that make it
+        // verified already required seq+sig present in re-verification).
+        const dedupKey = producerSignedDedupKey(details);
+        if (dedupKey !== null && seenSignedKeys.has(dedupKey)) {
+          tally.duplicates += 1;
+          continue;
+        }
+        if (dedupKey !== null) seenSignedKeys.add(dedupKey);
+        tally.verified += 1;
+        continue;
+      }
+      tally[tallyBucketForBasis(result.basis)] += 1;
+      if (result.basis === "producer_signed_rejected" && rejectedSamples.length < 20) {
+        rejectedSamples.push({
+          timestamp: entry.timestamp,
+          operation: entry.operation,
+          reason: "signature failed re-verification against the pinned key",
+        });
+      }
+    }
+
+    if (parsed.json) {
+      write(
+        out,
+        JSON.stringify({
+          fortress: fortressPath,
+          producer_key_present: pinnedProducerKeyB64url !== null,
+          // The honest basis label for this run: with no pinned key we could
+          // only channel-authenticate; with a key we re-verified per-producer.
+          reader_basis:
+            pinnedProducerKeyB64url !== null
+              ? "per_producer_reverified"
+              : "channel_authenticated_only",
+          // F2 HIGH-1/HIGH-R4: honesty about chain coverage. `complete: false`
+          // means a daemon chain exists but was unreadable OR tampered, so this
+          // tally OMITS the live daemon enforcement evidence and a green here is
+          // NOT a full success claim. `daemon_chain: "tampered"` additionally
+          // surfaces the daemon chain's integrity findings.
+          daemon_chain: daemonView.status,
+          complete: !daemonIncomplete,
+          ...(daemonView.status === "tampered"
+            ? { daemon_integrity_findings: daemonView.findings }
+            : {}),
+          enforcement_entries: evidenceEntries.length,
+          verified: tally.verified,
+          rejected: tally.rejected,
+          channel_authenticated: tally.channel,
+          // Verified-but-duplicate copies of a genuine signed tuple. Surfaced
+          // separately so N copies of one real event never inflate `verified`.
+          duplicates: tally.duplicates,
+          rejected_samples: rejectedSamples,
+        }) + "\n",
+      );
+      return 0;
+    }
+
+    write(out, `Castle Wall audit-verify (fortress ${fortressPath})\n`);
+    if (pinnedProducerKeyB64url === null) {
+      write(
+        out,
+        "Producer key: NONE published. Cannot re-verify per-producer signatures.\n" +
+          "  Reporting on the channel-authenticated basis only (the honest macOS\n" +
+          "  pre-Slice-M / pre-provision Linux floor). A green here is NOT a\n" +
+          "  per-producer-authenticated claim.\n",
+      );
+    } else {
+      write(
+        out,
+        "Producer key: published. Re-verifying each enforcement entry's producer\n" +
+          "  signature against the pinned key (the forgeable cw_source marker is NOT\n" +
+          "  trusted; the cryptographic signature is the authority).\n",
+      );
+    }
+    if (daemonView.status === "included") {
+      write(
+        out,
+        "Chain coverage: operator + root daemon (_audit-daemon) chains both included.\n",
+      );
+    } else if (daemonView.status === "tampered") {
+      // HIGH-R4: readable but failed integrity verification.
+      write(
+        err,
+        `WARNING: the root daemon audit store (_audit-daemon) has ` +
+          `${daemonView.findings.length} integrity finding(s); its enforcement ` +
+          `evidence is NOT trustworthy and is EXCLUDED from this tally. This verify ` +
+          `is INCOMPLETE: a green here is NOT a full success claim.\n`,
+      );
+      for (const f of daemonView.findings.slice(0, 20)) {
+        write(err, `  daemon finding: ${f.kind} - ${f.message}\n`);
+      }
+    } else if (daemonIncomplete) {
+      write(
+        err,
+        "WARNING: a root daemon audit store (_audit-daemon) exists but is NOT " +
+          "readable at this privilege. This verify is INCOMPLETE: it OMITS the " +
+          "daemon's live enforcement evidence. A green / zero-count here is NOT a " +
+          "full success claim. Re-run as root to include the daemon chain.\n",
+      );
+    }
+    write(out, `Enforcement entries examined: ${evidenceEntries.length}\n`);
+    write(out, `  producer_signed_verified : ${tally.verified}\n`);
+    write(out, `  producer_signed_rejected : ${tally.rejected}\n`);
+    write(out, `  channel_authenticated    : ${tally.channel}\n`);
+    if (tally.duplicates > 0) {
+      write(
+        out,
+        `  duplicates (not counted)  : ${tally.duplicates}\n` +
+          "    (genuine signed tuples re-appended; the first copy counts as\n" +
+          "     verified, the rest are NOT distinct enforcement events.)\n",
+      );
+    }
+    if (tally.rejected > 0) {
+      write(
+        err,
+        `WARNING: ${tally.rejected} enforcement entr${
+          tally.rejected === 1 ? "y" : "ies"
+        } CLAIMED producer_signed but did NOT count as verified.\n` +
+          "  This is a forgery / tamper signal: either the signature failed to\n" +
+          "  re-verify against the pinned producer key, or it re-verified but the\n" +
+          "  signed body attests a DIFFERENT operation than the entry was filed\n" +
+          "  under (a relabel / staple attack). Neither counts as a verified event.\n",
+      );
+      for (const sample of rejectedSamples) {
+        write(
+          err,
+          `    rejected: ${sample.timestamp} ${sample.operation} (${sample.reason})\n`,
+        );
+      }
+    }
+    return 0;
+  } catch (error) {
+    write(
+      err,
+      `Error: ${error instanceof Error ? error.message : String(error)}\n`,
+    );
     return 1;
   }
 }
@@ -1951,6 +3025,133 @@ function perRuleGroupRecord(group: PerRuleGroup): Record<string, unknown> {
   };
 }
 
+/** Filesystem path of the agent-origin descriptor within a fortress. */
+function agentOriginDescriptorPath(fortressPath: string): string {
+  return join(fortressPath, "policy", "egress", "agent-origin.json");
+}
+
+/**
+ * Best-effort read of the fortress's agent-origin MODE ("uid" | "nat"), or
+ * null when the descriptor is absent, unreadable, or invalid. Used by the
+ * no-egress brick guard, which is uid-mode-only: descriptor ABSENCE is
+ * already handled (refused or --force-acknowledged) by the origin-descriptor
+ * boot-cut guard just above it, so null here means "guard does not apply",
+ * never a silent fail-open of a state some other guard owns.
+ */
+async function readAgentOriginModeBestEffort(
+  fortressPath: string,
+): Promise<"uid" | "nat" | null> {
+  try {
+    const raw = await readFile(agentOriginDescriptorPath(fortressPath), "utf8");
+    const validated = validateAgentOrigin(JSON.parse(raw));
+    if (validated === null) return null;
+    return validated.mode === "uid" ? "uid" : "nat";
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Count the allow-disposition rules in the fortress's persisted manifest
+ * source (`policy/egress/rules/*.json`) that an AGENT-classified flow could
+ * ever match (the no-egress brick guard's input; confined-agent egress
+ * design section 5 layer 2).
+ *
+ * Honest scope of "agent-matchable": every on-disk allow rule counts except
+ * rules claiming the reserved habeas distress ids (those are scoped to a
+ * synthetic agent id no wrapped agent is ever assigned, so they grant the
+ * agent nothing). Rules scoped to specific agent_ids/template_ids still
+ * count -- this generic guard cannot know the harness's ids (the
+ * endpoint-specific static check in the provision flow can, and does).
+ * Fail-closed reads: an unreadable directory or an unparseable/invalid rule
+ * file contributes ZERO (the enforcing daemon would refuse such a ruleset,
+ * so it cannot be the agent's egress path).
+ */
+export async function countAgentMatchableAllowRules(fortressPath: string): Promise<number> {
+  const rulesDir = join(fortressPath, "policy", "egress", "rules");
+  let filenames: string[];
+  try {
+    filenames = (await readdir(rulesDir)).filter((name) => name.endsWith(".json"));
+  } catch {
+    return 0;
+  }
+  let count = 0;
+  for (const filename of filenames) {
+    try {
+      const parsed = JSON.parse(await readFile(join(rulesDir, filename), "utf8")) as AllowlistRule;
+      if (validateRule(parsed).length > 0) continue;
+      if (parsed.disposition !== "allow") continue;
+      if (parsed.id.startsWith(HABEAS_RULE_ID_PREFIX)) continue;
+      count += 1;
+    } catch {
+      continue;
+    }
+  }
+  return count;
+}
+
+/**
+ * Strict uid/ceiling flag parse (shared chokepoint for `--agent-uid` /
+ * `--ceiling` in BOTH `configure-origin` and the `enable` fold-in). Returns a
+ * number ONLY when the ENTIRE string is decimal digits; anything else returns
+ * null so the caller fails closed. `parseInt` is NOT usable here: it silently
+ * truncates, so `parseInt("501abc",10)===501`, `parseInt("502.9",10)===502`,
+ * `parseInt("1e10",10)===1` - each a WRONG-but-plausible uid that could fail
+ * OPEN (leave the agent unconfined) or cut a system daemon. Rejecting the whole
+ * token is the only safe read of an operator-supplied uid.
+ */
+function parseUidFlag(value: string): number | null {
+  if (!/^\d+$/.test(value)) {
+    return null;
+  }
+  const n = Number(value);
+  return Number.isSafeInteger(n) ? n : null;
+}
+
+/**
+ * Shared build+validate+write path for the agent-origin descriptor (DRY
+ * chokepoint used by BOTH `configure-origin` and `enable --agent-uid`; do not
+ * copy-paste this logic into a second call site). Validates the candidate via
+ * {@link validateAgentOrigin} BEFORE writing anything - a structurally invalid
+ * candidate (e.g. uid mode missing `agent_uid`) is rejected and nothing is
+ * written or overwritten on disk, preserving the fail-closed invariant that a
+ * half-built descriptor must never reach the filesystem (see the file-level
+ * doc comment in `agent-origin.ts`).
+ */
+async function writeAgentOriginDescriptor(
+  fortressPath: string,
+  candidate: Record<string, unknown>,
+): Promise<
+  | { ok: true; validated: ReturnType<typeof validateAgentOrigin> & object; path: string }
+  | { ok: false; error: string }
+> {
+  const validated = validateAgentOrigin(candidate);
+  if (validated === null) {
+    return {
+      ok: false,
+      error:
+        "agent-origin descriptor is invalid (uid mode requires agent_uid a positive integer >= the ceiling; root/0 and sub-ceiling uids are rejected).",
+    };
+  }
+
+  const originPath = agentOriginDescriptorPath(fortressPath);
+  try {
+    await mkdir(join(fortressPath, "policy", "egress"), {
+      recursive: true,
+      mode: 0o700,
+    });
+    await writeFile(originPath, JSON.stringify(validated, null, 2) + "\n", {
+      mode: 0o600,
+    });
+    return { ok: true, validated, path: originPath };
+  } catch (error) {
+    return {
+      ok: false,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
 export async function runConfigureOrigin(
   argv: string[] = [],
   ctx: CastleWallCommandContext = {}
@@ -1960,7 +3161,6 @@ export async function runConfigureOrigin(
   const env = ctx.env ?? process.env;
   const parsed = parseCastleWallArgs(argv);
   const fortressPath = resolveFortressArg(parsed.fortress, env);
-  const originPath = join(fortressPath, "policy", "egress", "agent-origin.json");
 
   // Parse remaining positional args: configure-origin <mode> [options]
   // Usage:
@@ -1980,9 +3180,17 @@ export async function runConfigureOrigin(
     return match ? match.slice(prefix.length) : undefined;
   };
 
+  // Strict parse (no truncation) of --ceiling; applies to both modes.
+  const ceilingStr = getFlag("ceiling") ?? "500";
+  const ceiling = parseUidFlag(ceilingStr);
+  if (ceiling === null) {
+    write(err, `Error: --ceiling must be a plain non-negative integer, got '${ceilingStr}'.\n`);
+    return 1;
+  }
+
   const candidate: Record<string, unknown> = {
     mode: modeArg,
-    system_uid_allow_ceiling: parseInt(getFlag("ceiling") ?? "500", 10),
+    system_uid_allow_ceiling: ceiling,
   };
 
   if (modeArg === "uid") {
@@ -1991,7 +3199,15 @@ export async function runConfigureOrigin(
       write(err, "Error: uid mode requires --agent-uid=<uid>\n");
       return 2;
     }
-    candidate.agent_uid = parseInt(uidStr, 10);
+    // Strict parse (no truncation): a wrong-but-plausible uid can fail open or
+    // cut a system daemon. The semantic floor (>= 1 and >= ceiling) is enforced
+    // in validateAgentOrigin (the shared chokepoint) via writeAgentOriginDescriptor.
+    const agentUid = parseUidFlag(uidStr);
+    if (agentUid === null) {
+      write(err, `Error: --agent-uid must be a plain positive integer, got '${uidStr}'.\n`);
+      return 1;
+    }
+    candidate.agent_uid = agentUid;
   } else {
     const signingId = getFlag("signing-id");
     const teamId = getFlag("team-id");
@@ -2008,28 +3224,16 @@ export async function runConfigureOrigin(
     }
   }
 
-  const validated = validateAgentOrigin(candidate);
-  if (validated === null) {
-    write(err, "Error: agent-origin descriptor is structurally invalid.\n");
+  const result = await writeAgentOriginDescriptor(fortressPath, candidate);
+  if (!result.ok) {
+    write(err, `Error: ${result.error}\n`);
     return 1;
   }
 
-  try {
-    await mkdir(join(fortressPath, "policy", "egress"), {
-      recursive: true,
-      mode: 0o700,
-    });
-    await writeFile(originPath, JSON.stringify(validated, null, 2) + "\n", {
-      mode: 0o600,
-    });
-    write(out, `Agent origin configured: mode=${validated.mode}\n`);
-    write(out, `Written to: ${originPath}\n`);
-    write(out, "Run 'sanctuary castle-wall reload' to apply.\n");
-    return 0;
-  } catch (error) {
-    write(err, `Error: ${error instanceof Error ? error.message : String(error)}\n`);
-    return 1;
-  }
+  write(out, `Agent origin configured: mode=${result.validated.mode}\n`);
+  write(out, `Written to: ${result.path}\n`);
+  write(out, "Run 'sanctuary castle-wall reload' to apply.\n");
+  return 0;
 }
 
 const HOST_APP_RELATIVE_BINARY =
@@ -2051,12 +3255,23 @@ function defaultHostAppCandidates(env: NodeJS.ProcessEnv): string[] {
 async function isOwnerTrustedExecutable(
   path: string,
   getuid: (() => number) | undefined,
+  env: NodeJS.ProcessEnv = process.env,
 ): Promise<boolean> {
   try {
     const info = await stat(path);
     if (!info.isFile()) return false;
     const uid = getuid?.();
-    return info.uid === 0 || (uid !== undefined && info.uid === uid);
+    const trusted = new Set<number>([0]);
+    if (uid !== undefined) {
+      trusted.add(uid);
+      if (uid === 0 && env.SUDO_UID !== undefined && /^\d+$/.test(env.SUDO_UID)) {
+        const sudoUid = Number(env.SUDO_UID);
+        if (Number.isSafeInteger(sudoUid) && sudoUid > 0) {
+          trusted.add(sudoUid);
+        }
+      }
+    }
+    return trusted.has(info.uid);
   } catch {
     return false;
   }
@@ -2076,7 +3291,7 @@ async function resolveHostAppBinary(
   const getuid = ctx.getuid ?? process.getuid?.bind(process);
   const override = env.SANCTUARY_CASTLE_HOSTAPP;
   if (override) {
-    if (await isOwnerTrustedExecutable(override, getuid)) {
+    if (await isOwnerTrustedExecutable(override, getuid, env)) {
       return { path: override };
     }
     return {
@@ -2085,7 +3300,7 @@ async function resolveHostAppBinary(
   }
   const candidates = ctx.hostAppCandidates ?? defaultHostAppCandidates(env);
   for (const candidate of candidates) {
-    if (await isOwnerTrustedExecutable(candidate, getuid)) {
+    if (await isOwnerTrustedExecutable(candidate, getuid, env)) {
       return { path: candidate };
     }
   }
@@ -2396,13 +3611,16 @@ function validateHeadlessBuildIdentity(
   }
   if (appBuild.git_sha !== cliGitSha) {
     return (
-      `deployed app ${appBuild.git_sha} != CLI ${cliGitSha} - rebuild + redeploy the signed app.`
+      `deployed app ${appBuild.git_sha} != CLI ${cliGitSha} - rebuild + redeploy the signed app. ` +
+      `(The CLI SHA comes from SANCTUARY_CASTLE_BUILD_SHA or, if unset, 'git rev-parse HEAD' in the ` +
+      `current working directory - NOT the binary. If you are running from a git worktree whose HEAD ` +
+      `differs from the deployed app, run outside a repo or 'export SANCTUARY_CASTLE_BUILD_SHA=${appBuild.git_sha}'.)`
     );
   }
   return null;
 }
 
-function defaultDaemonProbe(socketPath: string): Promise<boolean> {
+export function defaultDaemonProbe(socketPath: string): Promise<boolean> {
   return new Promise((resolvePromise) => {
     let settled = false;
     const socket = createConnection(socketPath);
@@ -2424,10 +3642,17 @@ function defaultDaemonProbe(socketPath: string): Promise<boolean> {
  * decryptable audit log (the authoritative filter_started/filter_stopped
  * events come from the daemon path). A failed write degrades to a warning.
  */
-async function appendArmAuditBestEffort(
-  action: "enable" | "disable",
-  verifiedState: string,
-  forced: boolean,
+/**
+ * Best-effort CLI-side Castle Wall audit append (shared chokepoint): opens
+ * the fortress audit log with the resolved master key, writes ONE entry with
+ * the given operation string, and warns (never throws) when the write cannot
+ * complete. Used by the arm/disarm audit below and by the confined-agent
+ * egress flow's `egress_provisioned` / `egress_provision_refused` records
+ * (distinct LOCAL operation values, never a widened shared enum).
+ */
+export async function appendCastleWallCliAuditBestEffort(
+  operation: string,
+  details: Record<string, unknown>,
   fortressPath: string,
   env: NodeJS.ProcessEnv,
   err: Writable,
@@ -2438,14 +3663,9 @@ async function appendArmAuditBestEffort(
     const auditLog = new AuditLog(storage, masterKey);
     await auditLog.append(
       "l1",
-      action === "enable" ? "wall_armed" : "wall_disarmed",
+      operation,
       fortressIdFromStoragePath(fortressPath),
-      {
-        source: "castle-wall-cli",
-        action,
-        verified_state: verifiedState,
-        forced,
-      },
+      details,
       "success",
     );
     await auditLog.flush();
@@ -2453,11 +3673,36 @@ async function appendArmAuditBestEffort(
   } catch (error) {
     write(
       err,
-      `Warning: filter state changed but the audit entry could not be written (${
+      `Warning: the '${operation}' audit entry could not be written (${
         error instanceof Error ? error.message : String(error)
       }). Corroborate via 'sanctuary castle-wall audit-dump' once the fortress key is available.\n`,
     );
   }
+}
+
+async function appendArmAuditBestEffort(
+  action: "enable" | "disable",
+  verifiedState: string,
+  forced: boolean,
+  fortressPath: string,
+  env: NodeJS.ProcessEnv,
+  err: Writable,
+  extraDetails: Record<string, unknown> = {},
+): Promise<void> {
+  await appendCastleWallCliAuditBestEffort(
+    action === "enable" ? "wall_armed" : "wall_disarmed",
+    {
+      source: "castle-wall-cli",
+      action,
+      verified_state: verifiedState,
+      forced,
+      ...extraDetails,
+      [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
+    },
+    fortressPath,
+    env,
+    err,
+  );
 }
 
 function leaseStatusPath(fortressPath: string): string {
@@ -2617,20 +3862,34 @@ async function runArmDisarm(
   }
 
   if (action === "enable" && !parsed.force) {
-    // Composition guard (#450 item 5): "arming implies a persistent BOOT service
-    // is installed." The daemon-reachability gate above only proves a daemon is
-    // up NOW - a manually-started daemon passes it, yet leaves the box with an
-    // armed filter and NO boot daemon, so the NEXT REBOOT comes up deny-all with
-    // SSH locked out (the exact F1 boot-cut). Require the persistent boot service
-    // to exist so you cannot arm into the reboot-brick state. --force overrides
-    // (a boot-survival service supervised out-of-band).
-    const bootProbe =
+    // Composition guard (#450 item 5): "arming implies a READY persistent BOOT
+    // service." The daemon-reachability gate above only proves a daemon is up
+    // NOW - a manually-started daemon passes it, and even a matching plist can be
+    // disabled/unloaded. Require the persistent boot service to be strictly
+    // installed, loaded for this fortress, enabled, and stable so you cannot arm
+    // into the reboot-brick state. --force overrides (a boot-survival service
+    // supervised out-of-band).
+    const bootReadyProbe =
+      ctx.bootServiceReadyProbe ??
+      ((expectedFortressPath?: string) =>
+        bootServiceReady(CASTLE_WALL_BOOT_PLIST_PATH, expectedFortressPath));
+    const bootInstalledProbe =
       ctx.bootServiceInstalledProbe ??
       ((expectedFortressPath?: string) =>
         bootServiceInstalled(CASTLE_WALL_BOOT_PLIST_PATH, expectedFortressPath));
-    if (!(await bootProbe(fortressPath))) {
-      const bootServiceExists = await bootProbe();
-      if (bootServiceExists) {
+    if (!(await bootReadyProbe(fortressPath))) {
+      if (await bootInstalledProbe(fortressPath)) {
+        write(
+          err,
+          `Refusing to arm: the Castle Wall boot service for this fortress is installed but not ready/enabled/loaded (${fortressPath}).\n` +
+            "A disabled or unloaded boot service does not survive reboot; arming would make\n" +
+            "the NEXT REBOOT come up deny-all with no daemon for this fortress.\n" +
+            "Repair it first:  sudo sanctuary castle-wall install-boot --fortress <path>\n" +
+            "Or pass --force if a boot-survival service is supervised out-of-band.\n",
+        );
+        return 1;
+      }
+      if (await bootInstalledProbe()) {
         write(
           err,
           `Refusing to arm: the installed Castle Wall boot service targets a different fortress than this command (${fortressPath}).\n` +
@@ -2643,7 +3902,7 @@ async function runArmDisarm(
       }
       write(
         err,
-        "Refusing to arm: no persistent Castle Wall boot service is installed.\n" +
+        "Refusing to arm: no persistent Castle Wall boot service is installed, loaded, enabled, and ready for this fortress.\n" +
           "Reachability of a daemon NOW does not survive a reboot - arming without the\n" +
           "boot service means the NEXT REBOOT comes up deny-all with no daemon (SSH\n" +
           "locked out, the F1 boot-cut).\n" +
@@ -2675,6 +3934,147 @@ async function runArmDisarm(
     if ((await sysextProbe()) === "[activated disabled]") {
       write(err, SYSEXT_DISABLED_GUIDANCE);
       return EXIT_SYSEXT_DISABLED;
+    }
+  }
+
+  if (action === "enable" && parsed.agentUid !== undefined) {
+    // One-command arm (Build 3, 2026-07-06): fold `configure-origin uid` into
+    // `enable` so an operator can configure-then-arm in a single command.
+    // Explicit `--agent-uid` ONLY - never auto-derived (a wrong-uid inference
+    // could cut the operator; that inference is the deliberately-deferred
+    // Build 3b). Validate + write BEFORE the origin-descriptor guard below so
+    // a freshly-written descriptor satisfies that guard in the same run. Uses
+    // the SAME build/validate/write chokepoint as `configure-origin` -
+    // `writeAgentOriginDescriptor` - so the two entry points cannot drift.
+    // Fail-closed: an invalid/malformed uid or ceiling is rejected here and
+    // `enable` returns non-zero WITHOUT arming, matching the #884 hard-refuse
+    // floor (it never falls through to "no descriptor, proceed anyway").
+    // Strict parse (no truncation) - a wrong-but-plausible uid can fail OPEN
+    // (agent unconfined) or cut a system daemon. The semantic floor (>= 1 and
+    // >= ceiling) is enforced in validateAgentOrigin (the shared chokepoint).
+    const agentUid = parseUidFlag(parsed.agentUid);
+    if (agentUid === null) {
+      write(
+        err,
+        `Refusing to arm: --agent-uid must be a plain positive integer, got '${parsed.agentUid}'. Not arming.\n`,
+      );
+      return 1;
+    }
+    const ceilingStr = parsed.ceiling ?? "500";
+    const ceiling = parseUidFlag(ceilingStr);
+    if (ceiling === null) {
+      write(
+        err,
+        `Refusing to arm: --ceiling must be a plain non-negative integer, got '${ceilingStr}'. Not arming.\n`,
+      );
+      return 1;
+    }
+    const candidate: Record<string, unknown> = {
+      mode: "uid",
+      agent_uid: agentUid,
+      system_uid_allow_ceiling: ceiling,
+    };
+    const result = await writeAgentOriginDescriptor(fortressPath, candidate);
+    if (!result.ok) {
+      write(
+        err,
+        `Refusing to arm: --agent-uid=${parsed.agentUid} --ceiling=${ceiling} produced an invalid agent-origin descriptor (${result.error}). ` +
+          `agent_uid must be a positive integer >= the ceiling (root/0 and sub-ceiling uids are rejected). Not arming.\n`,
+      );
+      return 1;
+    }
+    write(
+      out,
+      `Agent origin configured: mode=uid agent_uid=${result.validated.agent_uid} ceiling=${result.validated.system_uid_allow_ceiling}\n`,
+    );
+  }
+
+  if (action === "enable") {
+    // Origin-descriptor boot-cut guard (#877 follow-up; refuse upgrade of the
+    // #883 warning). With NO valid agent-origin descriptor set, the macOS
+    // OriginClassifier classifies EVERY flow `.agent`, so arming default-denies
+    // the operator's OWN SSH / Tailscale / operator shell (the boot-cut). Like
+    // the sibling no-daemon / no-boot-service brick guards above, this REFUSES
+    // without `--force` so the lockout is PREVENTED, not merely narrated. When
+    // `--agent-uid` was passed above, the descriptor we just wrote satisfies
+    // this guard directly (no `--force` needed for the one-command path).
+    // `--force` still arms agent-only (an intentional no-operator lockdown) but
+    // warns loudly that operator access will be cut.
+    const originProbe =
+      ctx.agentOriginDescriptorProbe ?? defaultAgentOriginDescriptorPresent;
+    if (!(await originProbe(fortressPath))) {
+      if (!parsed.force) {
+        write(
+          err,
+          "Refusing to arm: no agent-origin descriptor is set for this fortress.\n" +
+            "Arming would classify EVERY flow as `.agent`, so default-deny would cut\n" +
+            "your OWN SSH / Tailscale / operator shell (the boot-cut).\n" +
+            `Set one first: ${GENERIC_UID_CONFINEMENT_REMEDY} Then re-run enable.\n` +
+            "Or pass --force to arm agent-only anyway (you WILL lose operator access\n" +
+            "unless another carve-out already exists).\n",
+        );
+        return 1;
+      }
+      write(
+        err,
+        "WARNING: --force arming with no agent-origin descriptor.\n" +
+          "Every flow classifies `.agent`; your OWN SSH / Tailscale / operator shell\n" +
+          "will be cut unless another carve-out already exists. Proceeding.\n",
+      );
+    }
+  }
+
+  // Standing no-egress brick guard (confined-agent egress design 2026-07-10,
+  // section 5 layer 2). When arming in uid mode over a manifest source with
+  // ZERO agent-matchable allow rules, the confined agent is walled off from
+  // EVERYTHING it needs (the 2026-07-09 drill finding: the CoS armed
+  // "successfully" and could not reach even its own endpoints). A deliberate
+  // deny-all quarantine is a legitimate posture, but it must be ASKED FOR via
+  // the explicit `--allow-no-egress` override (audited), never the accident.
+  // Deliberately NOT covered by --force (that flag asserts out-of-band
+  // daemon/boot supervision, a different statement). This guard is GENERIC
+  // (the CLI does not know harness endpoints); the endpoint-specific static +
+  // as-uid verification lives in the auto-provision flow.
+  let allowNoEgressOverrideUsed = false;
+  if (action === "enable") {
+    const originMode = await readAgentOriginModeBestEffort(fortressPath);
+    if (originMode === "uid") {
+      const countProbe = ctx.egressAllowRuleCountProbe ?? countAgentMatchableAllowRules;
+      const agentAllowRules = await countProbe(fortressPath);
+      if (agentAllowRules === 0) {
+        if (!parsed.allowNoEgress) {
+          write(
+            err,
+            "Refusing to arm: this fortress has ZERO agent-matchable allow rules, so the\n" +
+              "confined agent would be default-denied for EVERYTHING (including its own\n" +
+              "endpoints) -- confined into non-functionality, silently.\n" +
+              `${GENERIC_UID_CONFINEMENT_REMEDY} Also add agent-matchable allow rules to\n` +
+              `${join(fortressPath, "policy", "egress", "rules")} and reload.\n` +
+              "Or pass --allow-no-egress to arm a deliberate deny-all quarantine (audited).\n",
+          );
+          await appendCastleWallCliAuditBestEffort(
+            EGRESS_PROVISION_REFUSED_AUDIT_OP,
+            {
+              source: "castle-wall-cli",
+              guard: "no-egress-brick",
+              agent_origin_mode: "uid",
+              agent_matchable_allow_rules: 0,
+              disarm_outcome: "not-armed",
+            },
+            fortressPath,
+            env,
+            err,
+          );
+          return 1;
+        }
+        allowNoEgressOverrideUsed = true;
+        write(
+          err,
+          "WARNING: --allow-no-egress: arming a uid-mode wall with ZERO agent-matchable\n" +
+            "allow rules. The confined agent will be default-denied for everything (a\n" +
+            "deliberate quarantine posture). This override is audited.\n",
+        );
+      }
     }
   }
 
@@ -2735,6 +4135,12 @@ async function runArmDisarm(
         err,
       );
       write(out, "Castle Wall disarmed: provider dead-man lease revoked (NE preference disable best-effort did not complete).\n");
+      // Bug B P1 (case A): the provider is fail-OPEN now (lease revoked), but the
+      // NE preference disable did NOT complete -- it may STILL be enabled. This
+      // is NOT a confirmed filter-off; a caller must not treat it as safe to
+      // remove the policy daemon (reboot could come up enabled + no daemon =
+      // deny-all).
+      ctx.onDisableNePreferenceOutcome?.("fail_open_deadman");
       return 0;
     }
     write(err, `castle-wall ${action} failed: ${detail}\n`);
@@ -2813,6 +4219,9 @@ async function runArmDisarm(
     fortressPath,
     env,
     err,
+    // The --allow-no-egress override is audited (design section 5 layer 2):
+    // the wall_armed record carries the explicit quarantine consent.
+    allowNoEgressOverrideUsed ? { allow_no_egress_override: true } : {},
   );
 
   if (action === "enable") {
@@ -2835,6 +4244,11 @@ async function runArmDisarm(
     write(
       out,
       "Castle Wall disarmed: content filter disabled (host app confirmed the save; status corroboration pending).\n",
+    );
+  }
+  if (action === "disable") {
+    ctx.onDisableNePreferenceOutcome?.(
+      confirmed ? "corroborated_off" : "save_accepted_inconclusive",
     );
   }
   return 0;
@@ -2886,10 +4300,22 @@ export function parseCastleWallArgs(argv: string[]): CastleWallParsedArgs {
       parsed.scope = parseScope(argv[++i]);
     } else if (arg === "--force") {
       parsed.force = true;
+    } else if (arg === "--allow-no-egress") {
+      parsed.allowNoEgress = true;
+    } else if (arg.startsWith("--agent-uid=")) {
+      parsed.agentUid = arg.slice("--agent-uid=".length);
+    } else if (arg.startsWith("--ceiling=")) {
+      parsed.ceiling = arg.slice("--ceiling=".length);
     } else if (arg === "--accept-broken-chain") {
       parsed.acceptBrokenChain = true;
     } else if (arg === "--by-rule") {
       parsed.byRule = true;
+    } else if (arg === "--json") {
+      parsed.json = true;
+    } else if (arg.startsWith("--producer-pub-key=")) {
+      parsed.producerPubKey = arg.slice("--producer-pub-key=".length);
+    } else if (arg === "--producer-pub-key") {
+      parsed.producerPubKey = argv[++i];
     } else if (arg.startsWith("--rule=")) {
       parsed.rule = arg.slice("--rule=".length);
     } else if (arg === "--rule") {
@@ -2975,6 +4401,7 @@ async function sendCastleWallMessage<T extends CastleWallMessage>(
   socketPath: string,
   message: CastleWallMessage,
   expectedType: T["type"],
+  timeoutMs = 5_000,
 ): Promise<T> {
   return await new Promise<T>((resolvePromise, reject) => {
     const socket = createConnection(socketPath);
@@ -2982,7 +4409,7 @@ async function sendCastleWallMessage<T extends CastleWallMessage>(
     let settled = false;
     const timer = setTimeout(() => {
       finish(new Error("Castle Wall IPC request timed out"));
-    }, 5_000);
+    }, timeoutMs);
     const finish = (result: T | Error) => {
       if (settled) return;
       settled = true;

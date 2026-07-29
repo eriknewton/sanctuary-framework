@@ -14,6 +14,7 @@ import {
 } from "../../src/principal-policy/feature-health.js";
 import { CASTLE_WALL_ENFORCEMENT_OPERATIONS } from "../../src/principal-policy/posture.js";
 import type { AuditEntry } from "../../src/operational/audit-log.js";
+import { protectionSubjectForUid } from "../../src/castle-wall/subject-binding.js";
 
 const FORTRESS = "fortress:test";
 
@@ -29,15 +30,22 @@ async function appendCW(
   operation: string,
   timestamp: string,
   result: "success" | "failure" = "success",
+  identityId: string = FORTRESS,
 ): Promise<void> {
   await log.appendCritical({
     layer: "l1",
     operation,
-    identity_id: FORTRESS,
+    identity_id: identityId,
     result,
     details: { cw_source: "castle_wall_audit_consumer" },
     timestamp,
   });
+}
+
+function subjectForUid(uid: number): string {
+  const subject = protectionSubjectForUid(FORTRESS, uid);
+  if (subject === null) throw new Error("test subject could not be derived");
+  return subject;
 }
 
 function row(panel: { rows: FeatureHealthRow[] }, id: string): FeatureHealthRow {
@@ -134,6 +142,7 @@ describe("feature-health panel — the four mandatory color assertions", () => {
   it("(a) evidence-absent yields a NON-GREEN unconfirmed/unknown chip for EVERY feature, never active", async () => {
     const { log } = newAuditLog();
     const panel = await buildFeatureHealthPanel({
+      protectionClaimSubject: FORTRESS,
       auditLog: log,
       originMachine: FORTRESS,
       now: Date.now(),
@@ -159,6 +168,7 @@ describe("feature-health panel — the four mandatory color assertions", () => {
     const now = Date.now();
     await appendCW(log, "provider_unbound", new Date(now - 60_000).toISOString());
     const panel = await buildFeatureHealthPanel({
+      protectionClaimSubject: FORTRESS,
       auditLog: log,
       originMachine: FORTRESS,
       now,
@@ -204,6 +214,7 @@ describe("feature-health panel — the four mandatory color assertions", () => {
       new Date(now - 30 * 60_000).toISOString(),
     );
     const panel = await buildFeatureHealthPanel({
+      protectionClaimSubject: FORTRESS,
       auditLog: log,
       originMachine: FORTRESS,
       now,
@@ -221,6 +232,7 @@ describe("feature-health — green is earned correctly", () => {
     const now = Date.now();
     await appendCW(log, "egress_blocked", new Date(now - 60_000).toISOString());
     const panel = await buildFeatureHealthPanel({
+      protectionClaimSubject: FORTRESS,
       auditLog: log,
       originMachine: FORTRESS,
       now,
@@ -235,6 +247,7 @@ describe("feature-health — green is earned correctly", () => {
     const now = Date.now();
     await appendCW(log, "policy_loaded", new Date(now - 60_000).toISOString());
     const panel = await buildFeatureHealthPanel({
+      protectionClaimSubject: FORTRESS,
       auditLog: log,
       originMachine: FORTRESS,
       now,
@@ -256,6 +269,7 @@ describe("feature-health — green is earned correctly", () => {
       timestamp: new Date(now - 60_000).toISOString(),
     });
     const panel = await buildFeatureHealthPanel({
+      protectionClaimSubject: FORTRESS,
       auditLog: log,
       originMachine: FORTRESS,
       now,
@@ -277,6 +291,7 @@ describe("feature-health — green is earned correctly", () => {
       timestamp: new Date(now - 5 * 60_000).toISOString(),
     });
     const panel = await buildFeatureHealthPanel({
+      protectionClaimSubject: FORTRESS,
       auditLog: log,
       originMachine: FORTRESS,
       now,
@@ -297,6 +312,7 @@ describe("feature-health — green is earned correctly", () => {
       },
     } as unknown as AuditLog;
     const panel = await buildFeatureHealthPanel({
+      protectionClaimSubject: FORTRESS,
       auditLog: throwingLog,
       originMachine: FORTRESS,
       now,
@@ -311,6 +327,7 @@ describe("feature-health — green is earned correctly", () => {
   it("the panel always carries the honest disclosure flags", async () => {
     const { log } = newAuditLog();
     const panel = await buildFeatureHealthPanel({
+      protectionClaimSubject: FORTRESS,
       auditLog: log,
       originMachine: FORTRESS,
       now: Date.now(),
@@ -333,6 +350,7 @@ describe("feature-health — green is earned correctly", () => {
       new Date(now + 10 * 60_000).toISOString(),
     );
     const panel = await buildFeatureHealthPanel({
+      protectionClaimSubject: FORTRESS,
       auditLog: log,
       originMachine: FORTRESS,
       now,
@@ -474,6 +492,7 @@ describe("feature-health — green-strict/fault-loose + activity honesty (codex 
       timestamp: new Date(now - 60_000).toISOString(),
     });
     const panel = await buildFeatureHealthPanel({
+      protectionClaimSubject: FORTRESS,
       auditLog: log,
       originMachine: FORTRESS,
       now,
@@ -483,22 +502,51 @@ describe("feature-health — green-strict/fault-loose + activity honesty (codex 
     expect(privacy.status).toBe("unconfirmed");
   });
 
-  it("an actual pii_rewritten DOES render privacy_strips active", async () => {
+  it("an actual Tier 2 scrub (filter_tier:2) DOES render privacy_strips active", async () => {
     const { log } = newAuditLog();
     const now = Date.now();
+    // Rho-2.5: the live consent-gated redactor emits this op with
+    // filter_tier:2 on a REAL scrub.
     await log.appendCritical({
       layer: "l2",
-      operation: "query_anonymity_pii_rewritten",
+      operation: "intelligence_pii_redaction_event",
       identity_id: FORTRESS,
       result: "success",
+      details: { filter_tier: 2, match_count: 1 },
       timestamp: new Date(now - 60_000).toISOString(),
     });
     const panel = await buildFeatureHealthPanel({
+      protectionClaimSubject: FORTRESS,
       auditLog: log,
       originMachine: FORTRESS,
       now,
     });
     expect(row(panel, "privacy_strips").status).toBe("active");
+  });
+
+  it("a toggled-off passthrough (filter_tier:1) does NOT render privacy_strips green", async () => {
+    const { log } = newAuditLog();
+    const now = Date.now();
+    // The consent-gated redactor emits filter_tier:1 when Tier B is off /
+    // unconsented. The provenanceMarker (filter_tier===2) must NOT count it,
+    // so a quiet-Tier-B fortress can never read green from passthrough alone.
+    await log.appendCritical({
+      layer: "l2",
+      operation: "intelligence_pii_redaction_event",
+      identity_id: FORTRESS,
+      result: "success",
+      details: { filter_tier: 1, match_count: 0 },
+      timestamp: new Date(now - 60_000).toISOString(),
+    });
+    const panel = await buildFeatureHealthPanel({
+      protectionClaimSubject: FORTRESS,
+      auditLog: log,
+      originMachine: FORTRESS,
+      now,
+    });
+    const privacy = row(panel, "privacy_strips");
+    expect(privacy.status).not.toBe("active");
+    expect(privacy.status).toBe("unconfirmed");
   });
 
   it("MEDIUM regression: an UNMARKED Castle Wall fault still flips the wall to fault, even with fresh marked enforcement present", async () => {
@@ -516,6 +564,7 @@ describe("feature-health — green-strict/fault-loose + activity honesty (codex 
       timestamp: new Date(now - 60_000).toISOString(),
     });
     const panel = await buildFeatureHealthPanel({
+      protectionClaimSubject: FORTRESS,
       auditLog: log,
       originMachine: FORTRESS,
       now,
@@ -537,6 +586,7 @@ describe("feature-health — green-strict/fault-loose + activity honesty (codex 
     // a cross-cutting change that also hardens posture.ts, tracked separately.
     await appendCW(log, "egress_allowed", new Date(now - 60_000).toISOString());
     const panel = await buildFeatureHealthPanel({
+      protectionClaimSubject: FORTRESS,
       auditLog: log,
       originMachine: FORTRESS,
       now,
@@ -545,31 +595,56 @@ describe("feature-health — green-strict/fault-loose + activity honesty (codex 
     // never an unexamined gap: a correctly-marked fresh entry renders green.
     expect(row(panel, "castle_wall_egress").status).toBe("active");
   });
+
+  it("foreign subject-bound Castle Wall evidence does not render castle_wall_egress active", async () => {
+    const { log } = newAuditLog();
+    const now = Date.now();
+    await appendCW(
+      log,
+      "egress_allowed",
+      new Date(now - 60_000).toISOString(),
+      "success",
+      subjectForUid(65),
+    );
+    const panel = await buildFeatureHealthPanel({
+      auditLog: log,
+      originMachine: FORTRESS,
+      now,
+      protectionClaimSubject: subjectForUid(503),
+    });
+    const cw = row(panel, "castle_wall_egress");
+    expect(cw.status).toBe("unknown");
+    expect(cw.basis).toBe("subject_unbound_evidence");
+  });
 });
 
 describe("feature-health - query-privacy header strip (Phase 2 Slice 1; the always-on feature that actually fires)", () => {
-  // Context: the registry's only OTHER privacy row (`privacy_strips`) counts the
-  // Tier B PII-rewrite op, which is NOT wired into the live selector path, so it
-  // can only ever read `unconfirmed`. The Tier A header strip, by contrast, fires
-  // `query_anonymity_headers_stripped` on EVERY outbound substrate call. Before
-  // this slice the panel ignored the privacy feature that runs and counted one
-  // that does not - a lying-by-omission. These cases lock the honest behavior in.
+  // Context: the registry's OTHER privacy row (`privacy_strips`) counts the Tier
+  // B PII-rewrite scrub (`intelligence_pii_redaction_event` gated on
+  // filter_tier:2 since Rho-2.5), which is opt-in. The Tier A header strip, by
+  // contrast, fires `query_anonymity_headers_stripped` on EVERY outbound
+  // substrate call. These cases lock in that the header_strip row keys on its
+  // OWN always-on op and does not borrow the Tier B op.
 
-  it("the header_strip row exists, is event-driven, and keys on the op that actually fires (NOT pii_rewritten)", async () => {
+  it("the header_strip row exists, is event-driven, and keys on its own always-on op (not the Tier B op)", async () => {
     const { log } = newAuditLog();
     const panel = await buildFeatureHealthPanel({
+      protectionClaimSubject: FORTRESS,
       auditLog: log,
       originMachine: FORTRESS,
       now: Date.now(),
     });
     const hs = row(panel, "header_strip");
     expect(hs.liveness).toBe("event_driven");
-    // Keys on the always-on event, never the never-firing pii_rewritten op.
+    // Keys on the always-on header-strip event, never the Tier B scrub ops.
     const entry = SLICE1_FEATURE_REGISTRY.find((f) => f.id === "header_strip");
     expect(entry?.invocationOps.has("query_anonymity_headers_stripped")).toBe(
       true,
     );
     expect(entry?.invocationOps.has("query_anonymity_pii_rewritten")).toBe(false);
+    expect(entry?.invocationOps.has("intelligence_pii_redaction_event")).toBe(
+      false,
+    );
   });
 
   it("HONESTY: the label describes metadata/header stripping and never claims anonymity or privacy guarantees", () => {
@@ -597,6 +672,7 @@ describe("feature-health - query-privacy header strip (Phase 2 Slice 1; the alwa
       timestamp: new Date(now - 5 * 60_000).toISOString(),
     });
     const panel = await buildFeatureHealthPanel({
+      protectionClaimSubject: FORTRESS,
       auditLog: log,
       originMachine: FORTRESS,
       now,
@@ -610,6 +686,7 @@ describe("feature-health - query-privacy header strip (Phase 2 Slice 1; the alwa
   it("a QUIET window renders the row UNCONFIRMED (amber), never a fake green", async () => {
     const { log } = newAuditLog();
     const panel = await buildFeatureHealthPanel({
+      protectionClaimSubject: FORTRESS,
       auditLog: log,
       originMachine: FORTRESS,
       now: Date.now(),
@@ -630,6 +707,7 @@ describe("feature-health - query-privacy header strip (Phase 2 Slice 1; the alwa
       },
     } as unknown as AuditLog;
     const panel = await buildFeatureHealthPanel({
+      protectionClaimSubject: FORTRESS,
       auditLog: throwingLog,
       originMachine: FORTRESS,
       now: Date.now(),
@@ -695,6 +773,7 @@ describe("feature-health - opt-in operator-declared expectation floors (event-dr
     const now = Date.now();
     await appendBroker(log, 1, now); // 1 < floor of 3
     const panel = await buildFeatureHealthPanel({
+      protectionClaimSubject: FORTRESS,
       auditLog: log,
       originMachine: FORTRESS,
       now,
@@ -715,6 +794,7 @@ describe("feature-health - opt-in operator-declared expectation floors (event-dr
     const now = Date.now();
     await appendBroker(log, 3, now); // exactly meets floor of 3
     const panel = await buildFeatureHealthPanel({
+      protectionClaimSubject: FORTRESS,
       auditLog: log,
       originMachine: FORTRESS,
       now,
@@ -733,6 +813,7 @@ describe("feature-health - opt-in operator-declared expectation floors (event-dr
     const { log } = newAuditLog();
     const now = Date.now();
     const panel = await buildFeatureHealthPanel({
+      protectionClaimSubject: FORTRESS,
       auditLog: log,
       originMachine: FORTRESS,
       now,
@@ -750,6 +831,7 @@ describe("feature-health - opt-in operator-declared expectation floors (event-dr
     const now = Date.now();
     await appendBroker(log, 1, now);
     const panel = await buildFeatureHealthPanel({
+      protectionClaimSubject: FORTRESS,
       auditLog: log,
       originMachine: FORTRESS,
       now,
@@ -795,6 +877,7 @@ describe("feature-health - opt-in operator-declared expectation floors (event-dr
     // but the UNFLOORED feature must still NOT manufacture a below-typical alarm.
     await appendBroker(log, 5, now);
     const panel = await buildFeatureHealthPanel({
+      protectionClaimSubject: FORTRESS,
       auditLog: log,
       originMachine: FORTRESS,
       now,
@@ -816,6 +899,7 @@ describe("feature-health - opt-in operator-declared expectation floors (event-dr
     const now = Date.now();
     await appendBroker(log, 4, now);
     const panel = await buildFeatureHealthPanel({
+      protectionClaimSubject: FORTRESS,
       auditLog: log,
       originMachine: FORTRESS,
       now,
@@ -839,6 +923,7 @@ describe("feature-health - opt-in operator-declared expectation floors (event-dr
     // Two features on the same panel: one floored, one not. ONLY the floored one
     // changes behavior; the unfloored one is untouched.
     const panel = await buildFeatureHealthPanel({
+      protectionClaimSubject: FORTRESS,
       auditLog: log,
       originMachine: FORTRESS,
       now,
@@ -921,6 +1006,7 @@ describe("feature-health - opt-in operator-declared expectation floors (event-dr
     const { log: logPrev } = newAuditLog();
     await appendBroker(logPrev, 3, now); // meets floor
     const prevPanel = await buildFeatureHealthPanel({
+      protectionClaimSubject: FORTRESS,
       auditLog: logPrev,
       originMachine: FORTRESS,
       now,
@@ -929,6 +1015,7 @@ describe("feature-health - opt-in operator-declared expectation floors (event-dr
     const { log: logCur } = newAuditLog();
     await appendBroker(logCur, 1, now); // dips below floor
     const curPanel = await buildFeatureHealthPanel({
+      protectionClaimSubject: FORTRESS,
       auditLog: logCur,
       originMachine: FORTRESS,
       now,

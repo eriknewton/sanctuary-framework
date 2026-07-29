@@ -55,7 +55,7 @@ describe("CLI help routing", () => {
       expect(stderr).toContain("Recovery key output path must be outside");
       expect(stderr).not.toContain("Sanctuary MCP Server failed to start");
     } finally {
-      await rm(tmp, { recursive: true, force: true });
+      await rm(tmp, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     }
   }, CLI_SUBPROCESS_TEST_TIMEOUT_MS);
 

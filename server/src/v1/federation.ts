@@ -9,7 +9,7 @@
  *   POST /v1/federation/authorize/complete BOOTSTRAP_TOKEN (pre-session class)
  *
  * The join ceremony is operator-authorized in two crypto-verified steps and
- * is built by WRAPPING the existing mesh lifecycle primitives — it does not
+ * is built by WRAPPING the existing mesh lifecycle primitives - it does not
  * reimplement them:
  *
  *  - `authorize/init` mints a short-lived, operator-principal-signed
@@ -18,14 +18,14 @@
  *  - The joining node assembles a JoinRequest (`sanctuary federation join`)
  *    and submits it to `authorize/complete`, which verifies the bootstrap
  *    token signature (`verifyBootstrapToken`), the node_mode binding, and the
- *    HKDF salt proof (`verifyJoinHkdfSaltProof` — defeats a stolen token held
+ *    HKDF salt proof (`verifyJoinHkdfSaltProof` - defeats a stolen token held
  *    without the master-derived transport key), then runs the operator
  *    approval gate (`JoinApprover`) and issues a NodeIdentityCertificate
  *    (`issueCertificateForApprovedJoin`). This mirrors
  *    `MeshNode.acceptJoinRequest` field-for-field on the same helpers.
  *
  * Fail closed (CLAUDE.md constraint 4): a JoinRequest that cannot be
- * cryptographically verified is DENIED, never trusted — verification is
+ * cryptographically verified is DENIED, never trusted - verification is
  * signature/proof based, never shape based. Every ceremony step writes an
  * audit entry on BOTH success and denial (PR-A1 audit-write-completeness gap,
  * design note 5). The pre-session `authorize/complete` collapses every
@@ -82,6 +82,10 @@ import {
   signFederationNodeEvictionPayload,
   type FederationNodeCertificateRenewalConfig,
 } from "./federation-revocation.js";
+import {
+  evaluateGuardianRevocationSignOff,
+  type GuardianRevocationRequirement,
+} from "./federation-revocation-guardian-gate.js";
 
 const NODE_MODES: readonly NodeMode[] = [
   "local",
@@ -179,6 +183,15 @@ export interface FederationBaseContext {
   isNodeRevoked(nodeId: string): boolean;
   /** Operator-tunable renewal policy for new/renewed node certs. */
   nodeCertificateRenewal?: FederationNodeCertificateRenewalConfig;
+  /**
+   * Additive joiner adoption state (3c-2): roots this node has already accepted
+   * as revoked plus the monotonic revocation serial floor. Issuer contexts get
+   * the same information from the durable sync-state projection; joiner contexts
+   * can carry it from their custody record so boot preserves compromise-adoption
+   * state without issuer authority.
+   */
+  revokedRootPubkeys?: Set<string>;
+  highestRevocationSerial?: number;
 }
 
 export interface FederationIssuerContext extends FederationBaseContext {
@@ -304,7 +317,7 @@ export class JoinCeremony {
   async authorizeComplete(request: JoinRequest): Promise<AuthorizeCompleteResult> {
     // 1. Bootstrap token must verify against the issuing principal cert for
     //    THIS fortress (signature + fortress binding + TTL). Throws on any
-    //    failure — caught and mapped to a uniform denial.
+    //    failure - caught and mapped to a uniform denial.
     try {
       verifyBootstrapToken({
         token: request.bootstrap_token,
@@ -540,8 +553,22 @@ export interface V1FederationDeps {
   audit: FederationAudit;
   /** Joined node ids, for the status roster summary. */
   rosterNodeIds(): string[];
-  /** Record a newly joined node (status roster). */
-  recordJoin(certificate: NodeIdentityCertificate): void;
+  /**
+   * Record a newly joined node (status roster + DURABLE fleet membership).
+   * ASYNC + fail-closed (PR-A durable membership): the in-memory roster upsert is
+   * applied, then the DURABLE sync-state snapshot is persisted so the node
+   * survives a reboot and is counted for the paid node-count. THROWS if that
+   * persist fails so the caller fails closed (a join that did not durably commit
+   * its membership must not be acknowledged as fully joined). The join endpoint
+   * does NOT catch this throw: it propagates to the dashboard's top-level handler
+   * and surfaces as a generic HTTP 500, NOT a 401; either way no success/cert is
+   * returned. On that persist failure the implementation ROLLS BACK its in-memory
+   * mutations before re-throwing, so a failed join leaves NO phantom node in the
+   * roster / `summary.admitted` (consistent with the never-inflated durable
+   * basis). When no durable store is wired (in-memory rigs) the persist is a
+   * no-op and cannot throw.
+   */
+  recordJoin(certificate: NodeIdentityCertificate): Promise<void>;
   /** List federated nodes for GET /v1/nodes. */
   listNodes(): FederationNodeView[];
   /** Local append-only events available for exchange. */
@@ -611,7 +638,41 @@ export interface V1FederationDeps {
   ): Promise<boolean>;
   /** Structured aggregate disclosure for status surfaces. */
   federationPosture(): FederationPostureSummary;
+  /**
+   * OPTIONAL, operator-configurable M-of-N guardian sign-off requirement for the
+   * revoke/kill path. DEFAULT-OFF: when this dep is absent or returns `null`,
+   * the revoke handler runs the legacy single-operator path unchanged (provably
+   * a no-op). When it returns a {@link GuardianRevocationRequirement}, the
+   * handler requires M-of-N valid guardian signatures BEFORE minting the
+   * eviction and FAILS CLOSED (refuses, never executes) on insufficient,
+   * invalid, forged, or duplicate guardian approvals. Composes the existing
+   * guardian threshold evaluator onto the existing operator-signed revocation
+   * primitive; it can only ADD a required precondition, never weaken one.
+   *
+   * Return contract (fail-closed):
+   *   - `null`                          -> no requirement configured; legacy
+   *                                        single-operator revoke (byte-for-byte).
+   *   - a {@link GuardianRevocationRequirement} -> enforce M-of-N.
+   *   - `{ unavailable: true }`         -> a requirement WAS configured but is
+   *                                        currently unverifiable (a persisted
+   *                                        roster failed to re-verify against the
+   *                                        pinned master). The handler MUST REFUSE
+   *                                        every revocation, never fall through to
+   *                                        single-operator kill.
+   */
+  requireGuardianRevocationSignOff?(): GuardianRevocationSignOffState;
 }
+
+/**
+ * State returned by the guardian-revocation sign-off hook. Distinguishes "no
+ * requirement" (allowed single-operator path) from "requirement configured but
+ * unverifiable" (fail-closed refusal) so a broken/tampered persisted requirement
+ * can never silently revert the fleet to single-operator kill.
+ */
+export type GuardianRevocationSignOffState =
+  | GuardianRevocationRequirement
+  | { unavailable: true }
+  | null;
 
 export interface FederationNodeView {
   node_id: string;
@@ -630,6 +691,13 @@ export interface FederationNodeView {
     sent_at: string | null;
     last_sequence: number;
   };
+  applied_policy: {
+    version: number | null;
+    hash: string | null;
+    hash_algorithm: string | null;
+    applied_at: string | null;
+    source_event_id: string | null;
+  };
 }
 
 export interface FederationPostureSummary {
@@ -641,6 +709,23 @@ export interface FederationPostureSummary {
   provider_in_trust_boundary: boolean;
   tee_attested: boolean;
   disclosure: string | null;
+  /**
+   * F1 E1: the guardian-requirement DISABLE-gate's break-glass countdown, when
+   * armed. `active: false` when IDLE (no countdown in flight). Additive field
+   * so an older reader ignores it. Surfaced so any operator or guardian who
+   * opens the dashboard cannot miss an in-flight teardown of the fleet-kill
+   * guard (design 6.3).
+   */
+  guardian_break_glass:
+    | {
+        active: true;
+        intent: "disable" | "lower";
+        target_m: number | null;
+        initiated_at: string;
+        completes_at: string;
+        time_remaining_ms: number;
+      }
+    | { active: false };
 }
 
 export interface FederationEvent {
@@ -807,7 +892,7 @@ function handleStatus(deps: V1FederationDeps, res: ServerResponse): void {
  * Verify the inline OPERATOR_SIGNED signature over a federation admin payload.
  * Returns true only when an operator identity is configured AND the signature
  * verifies; otherwise false (the caller maps false to the generic 403, no
- * distinguishable reason — same contract as the agents write path).
+ * distinguishable reason - same contract as the agents write path).
  */
 function verifyOperator(
   deps: V1FederationDeps,
@@ -1031,6 +1116,63 @@ async function handleRevoke(
     return;
   }
 
+  // OPTIONAL guardian sign-off gate (default-off, fail-closed). When the host
+  // has not configured a requirement, `requirement` is null and this block is a
+  // no-op: control falls straight through to the legacy single-operator mint
+  // below, byte-for-byte unchanged. When a requirement IS configured, an
+  // M-of-N guardian quorum bound to THIS (fortress, node) revocation must
+  // verify before the eviction is minted; any insufficient/invalid/forged/
+  // duplicate approval set REFUSES the revocation (it is never executed).
+  const guardianSignOff = deps.requireGuardianRevocationSignOff?.() ?? null;
+  if (guardianSignOff !== null) {
+    // FAIL-CLOSED: a configured-but-unverifiable requirement (a persisted roster
+    // that failed to re-verify against the pinned master) must REFUSE, never fall
+    // through to single-operator kill.
+    if ("unavailable" in guardianSignOff) {
+      await deps.audit({
+        operation,
+        result: "failure",
+        identityId: node_id,
+        details: { reason: "guardian_signoff_unavailable" },
+      });
+      denyForbidden(res);
+      return;
+    }
+    const { guardian_approvals } = body as { guardian_approvals?: unknown };
+    const decision = evaluateGuardianRevocationSignOff({
+      requirement: guardianSignOff,
+      fortressId: ctx.fortressId,
+      nodeId: node_id,
+      approvals: guardian_approvals,
+    });
+    // Emit a dedicated audit event on EVERY guardian-gated decision (allowed OR
+    // refused), so the durable audit trail records the M-of-N sign-off outcome
+    // (who approved a fleet-kill and when) distinctly from the revoke outcome.
+    await deps.audit({
+      operation: "v1_federation_revoke_guardian_signoff",
+      result: decision.allowed ? "success" : "failure",
+      identityId: node_id,
+      details: decision.allowed
+        ? {
+            guardian_signoff: "allowed",
+            valid_guardian_ids: decision.validGuardianIds,
+          }
+        : { guardian_signoff: "refused", reason: decision.reason },
+    });
+    if (!decision.allowed) {
+      // Preserve the pre-existing revoke-failure audit event too (the revoke
+      // path's own outcome), unchanged in shape.
+      await deps.audit({
+        operation,
+        result: "failure",
+        identityId: node_id,
+        details: { reason: decision.reason },
+      });
+      denyForbidden(res);
+      return;
+    }
+  }
+
   const originNodeId = federationOperatorAuthorityOrigin(ctx.fortressId);
   const prior = deps.listFederationEvents({ node_id: originNodeId });
   const previous = prior.length > 0 ? prior[prior.length - 1] : null;
@@ -1157,7 +1299,9 @@ async function handleSync(
     node_id,
     events: parsedEvents,
   };
-  if (parsedCursor) signedPayload.cursor = parsedCursor;
+  if (cursor !== undefined && cursor !== null && parsedCursor) {
+    signedPayload.cursor = parsedCursor;
+  }
   if (typeof idempotency_key === "string") signedPayload.idempotency_key = idempotency_key;
 
   if (!verifyOperator(deps, action, signedPayload, operator_signature)) {
@@ -1888,7 +2032,7 @@ async function handlePeerSync(
   }
 
   // The reciprocal envelope is signed by THIS node and therefore may only carry
-  // THIS node's OWN events (origin == this node id) — the same origin-binding
+  // THIS node's OWN events (origin == this node id) - the same origin-binding
   // invariant the inbound path enforces. A node never forwards another node's
   // events inside its own signed envelope; multi-hop propagation happens through
   // pairwise syncs, not delegated forwarding (which would need its own proof).
@@ -2019,8 +2163,8 @@ function rootRevokedFailClosed(
 
 /**
  * Pre-session join-submission ceremony (BOOTSTRAP_TOKEN auth class). Reached
- * by the router BEFORE the session gate, like session/init. Every failure —
- * federation off, missing materials, bad body, unverifiable request — returns
+ * by the router BEFORE the session gate, like session/init. Every failure -
+ * federation off, missing materials, bad body, unverifiable request - returns
  * the SAME uniform 401 so a probing joining node gets no oracle.
  */
 export async function handleFederationCeremony(
@@ -2081,7 +2225,15 @@ export async function handleFederationCeremony(
     return true;
   }
 
-  deps.recordJoin(outcome.certificate);
+  // PR-A durable membership: persist the roster before acknowledging the join.
+  // A persist failure THROWS here; there is no try/catch around this call, so the
+  // throw propagates to the dashboard's top-level request handler and surfaces as
+  // a generic HTTP 500 ({"error":"Internal server error"}), NOT a 401. Either way
+  // the join is NOT acknowledged (no success response, no certificate returned),
+  // which is the fail-closed behavior we want: a join whose membership did not
+  // reach disk must not be treated as joined (the node would be silently
+  // forgotten on the next reboot and dropped from the paid count).
+  await deps.recordJoin(outcome.certificate);
   await deps.audit({
     operation,
     result: "success",

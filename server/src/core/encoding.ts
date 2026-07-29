@@ -28,6 +28,42 @@ export function fromBase64url(str: string): Uint8Array {
 }
 
 /**
+ * Decode a base64url string STRICTLY, rejecting any non-canonical input.
+ *
+ * `fromBase64url` (and Node's `Buffer.from(s, "base64")`) is lenient: it
+ * silently skips characters outside the alphabet, tolerates ASCII
+ * whitespace, and accepts stray `=` padding. That leniency is a fail-open
+ * hazard for signature material, where a canonicalized byte string is later
+ * length-checked and verified: an attacker can append `"!"`, a newline, or
+ * `"=="` to a valid signature and still decode to the same bytes.
+ *
+ * This decoder is canonical no-padding base64url: the input must contain only
+ * `[A-Za-z0-9\-_]`, must have a length that is a legal no-padding base64url
+ * length (never `1 mod 4`), and must round-trip back to itself under
+ * `toBase64url`. Any deviation throws. Callers verifying signatures MUST use
+ * this rather than `fromBase64url`.
+ */
+export function fromBase64urlStrict(str: string): Uint8Array {
+  if (typeof str !== "string") {
+    throw new TypeError("fromBase64urlStrict: not a string");
+  }
+  // Charset + length gate: canonical no-padding base64url only. A length of
+  // 1 mod 4 can never be produced by base64 and is rejected outright.
+  if (!/^[A-Za-z0-9\-_]*$/.test(str) || str.length % 4 === 1) {
+    throw new TypeError("fromBase64urlStrict: non-canonical base64url");
+  }
+  const decoded = fromBase64url(str);
+  // Re-encode-equality: the only string that decodes to `decoded` AND encodes
+  // back to `str` is the canonical one. This rejects non-canonical final-quad
+  // bit patterns (e.g. trailing bits that a lenient decoder discards) that the
+  // charset check alone would miss.
+  if (toBase64url(decoded) !== str) {
+    throw new TypeError("fromBase64urlStrict: non-canonical base64url");
+  }
+  return decoded;
+}
+
+/**
  * Encode a UTF-8 string to bytes.
  */
 export function stringToBytes(str: string): Uint8Array {

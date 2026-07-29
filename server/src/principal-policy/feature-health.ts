@@ -24,7 +24,7 @@
  *    event-driven features." Self-reporting features (Castle Wall) can prove
  *    their own liveness via fresh enforcement evidence, so they earn `armed`;
  *    a fault op flips them to `fault`/red. Slice 2 closes the "daemon silently
- *    died" gap: a periodic, producer-signed liveness heartbeat lets the
+ *    died" gap: a periodic, channel-authenticated (unsigned) liveness heartbeat lets the
  *    absence-of-enforcement case split into an honest alive-but-idle (`unknown`,
  *    `alive_no_recent_enforcement`) vs a silently-dead wall (`fault`/red,
  *    `dead_no_heartbeat`) - the latter the alarm Slice 1 left as a silent
@@ -68,7 +68,16 @@
  * without a live HTTP server or a running daemon.
  */
 
-import type { AuditLog, AuditEntry } from "../operational/audit-log.js";
+import type {
+  AuditEntry,
+  AuditIntegrityFinding,
+  SealedRegionVerdict,
+} from "../operational/audit-log.js";
+import {
+  auditChainVerdictUntampered,
+  auditChainVerdictSealedUnverifiedAtPrivilege,
+  foldAuditChainVerdict,
+} from "../operational/audit-log.js";
 import {
   CASTLE_WALL_AUDIT_PROVENANCE_KEY,
   CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
@@ -89,10 +98,13 @@ import {
   livenessEntryCounts,
   brokerLivenessEntryCounts,
   producerSignedDedupKey,
+  subjectEvidenceForReverifiedEntry,
+  signedCanonicalSubjectIssue,
   brokerProducerSignedDedupKey,
   brokerSignedOperationMatchesEntry,
   signedCanonicalOperation,
   type EntryReverifyBasis,
+  type EntryReverifyResult,
   type VerifyProducerSignatureFn,
 } from "./producer-reverify.js";
 import { CASTLE_WALL_HEARTBEAT_OPERATION } from "../castle-wall/constants.js";
@@ -107,6 +119,15 @@ import {
   buildPluginHealthRows,
   type PluginHealthRow,
 } from "./plugin-feature-health.js";
+import {
+  exclusiveEgressCapsAggregateGreen,
+  type ExclusiveEgressStatus,
+} from "../egress-gate/posture.js";
+import {
+  castleWallEvidenceMatchesProtectionSubject,
+  fortressIdFromProtectionSubject,
+  type ProtectionSubjectMatchMode,
+} from "../castle-wall/subject-binding.js";
 
 /**
  * Liveness-op set for the broker daemon's process-liveness heartbeat (Option C).
@@ -211,7 +232,8 @@ export interface ProducerSignatureScheme {
     details: unknown,
     pinnedProducerKeyB64url: string | null,
     verify?: VerifyProducerSignatureFn,
-  ) => { basis: EntryReverifyBasis; signedCapturedAtMs: number | null };
+    subjectFortressId?: string | null,
+  ) => EntryReverifyResult;
   /**
    * Does this basis let a GREEN-earning invocation count? (Key-present hosts
    * require a verified producer signature; no-key hosts accept channel basis.)
@@ -308,8 +330,23 @@ export type FeatureLivenessClass = "self_reporting" | "event_driven";
  *                 whose backing audit read was integrity-tainted. Slice 2 moves
  *                 the genuinely-dead case (alive once, now no heartbeat) OUT of
  *                 `unknown` and into `fault`.
+ *  - `coarse_only` → distinct NON-GREEN chip (Unified Protect Slice 5 S5-P,
+ *                 design §6). Applied ONLY to the `castle_wall_egress` row:
+ *                 the coarse wall's own evidence earned green, but a
+ *                 fine-grained-provisioned agent's exclusive-egress stack
+ *                 (gate + pf + generation match) is not live. Aggregate green
+ *                 is `castle_wall_armed AND exclusive_egress_live`, so the
+ *                 row must NOT read `active` - and it is NOT a `fault` either
+ *                 (the coarse wall IS protecting; OS-notification classes stay
+ *                 the ratified tight set). Distinct so the operator sees the
+ *                 degrade-loud coarse-only state, never a vague amber.
  */
-export type FeatureHealthStatus = "active" | "fault" | "unconfirmed" | "unknown";
+export type FeatureHealthStatus =
+  | "active"
+  | "fault"
+  | "unconfirmed"
+  | "unknown"
+  | "coarse_only";
 
 /**
  * Stable enum form of *why* a feature reads as it does. The UI renders human
@@ -344,6 +381,11 @@ export type FeatureHealthBasis =
   // forger cannot use it to mute a real alarm into green - only into this
   // non-green `unknown`.
   | "intentionally_stopped"
+  // A Castle Wall heartbeat producer was seen in the digest, but a would-be
+  // fresh enforcement reading has no fresh heartbeat alongside it. This is not
+  // enough to assert "not filtering"; it is also not enough for point-in-time
+  // green. Demote to unknown until liveness is observed again.
+  | "daemon_liveness_unconfirmed"
   | "no_activity_event_driven"
   // Observability (event-floor slice): an event-driven feature WITH an OPT-IN,
   // operator-declared expectation floor whose activity in the window met or
@@ -366,7 +408,18 @@ export type FeatureHealthBasis =
   // prove the absence of a fault, so a self-reporting feature can never render
   // green on this basis - it fails closed to `unknown`. See codex MEDIUM
   // 2026-06-13.
-  | "freshness_scan_incomplete";
+  | "freshness_scan_incomplete"
+  // Unified Protect Slice 5 S5-P (design §6): the coarse wall's evidence
+  // earned green, but a fine-grained-provisioned agent's exclusive-egress
+  // stack is not live, so the `castle_wall_egress` row is capped to the
+  // distinct non-green `coarse_only` status. The per-agent reasons live on the
+  // posture surface's `exclusive_egress` block; this basis names WHY the row
+  // is not green without leaking rule internals.
+  | "exclusive_egress_not_live"
+  | "subject_unbound_evidence"
+  | "legacy_macos_audit_token"
+  | "pre_canonical_linux_agent_name"
+  | "subject_unresolvable";
 
 /**
  * An OPT-IN, operator-declared "expected minimum volume" for an event-driven
@@ -461,8 +514,14 @@ export interface FeatureRegistryEntry {
    * own `{ key, value }` pair to get the same gate WITHOUT inheriting Castle
    * Wall's signature machinery. A feature with no marker counts on the operation
    * string alone (the event-driven rows).
+   *
+   * `value` is `string | number` because some producers stamp a numeric
+   * discriminator in `details` (e.g. the PII-rewrite row gates on
+   * `filter_tier === 2` to count ONLY a real Tier 2 scrub, never the
+   * `filter_tier: 1` passthrough on the same op). The comparison below is a
+   * strict `===`, so the declared type must match the value's runtime type.
    */
-  provenanceMarker?: { readonly key: string; readonly value: string };
+  provenanceMarker?: { readonly key: string; readonly value: string | number };
   /**
    * Optional per-feature producer-signature scheme. When present, the
    * green-earning invocation evidence (and the liveness / stand-down lifecycle
@@ -707,25 +766,34 @@ export const SLICE1_FEATURE_REGISTRY: ReadonlyArray<FeatureRegistryEntry> =
     },
     {
       // Tier B PII rewrite (OPT-IN, off by default). Distinct from the Tier A
-      // `header_strip` row above: this row intentionally counts ONLY the actual
-      // rewrite op (`query_anonymity_pii_rewritten`), so a config update or a
-      // consent record (administrative housekeeping, not a strip) can never
-      // render it green without a single query having been rewritten (codex HIGH
-      // 2026-06-13).
+      // `header_strip` row above.
       //
-      // KNOWN STANDING (documentation only - do NOT change behavior to force
-      // green): the PII-rewrite emitter is not yet wired into the live selector
-      // path (the deferred Rho-2.5 boot-wiring), so `query_anonymity_pii_rewritten`
-      // does not fire in production today. This row therefore reads `unconfirmed`
-      // (amber) until that wiring lands. That is the honest state; the always-on
-      // privacy feature that DOES fire on every call is the `header_strip` row.
+      // Rho-2.5 (live-wiring fix): the row now counts the op the LIVE scrub
+      // path ACTUALLY emits. The consent-gated redactor installed on the
+      // production selector emits `intelligence_pii_redaction_event` on every
+      // call, stamping `filter_tier: 2` on a REAL Tier 2 scrub and
+      // `filter_tier: 1` on the toggled-off passthrough. The `provenanceMarker`
+      // gates this row on `filter_tier === 2`, so:
+      //   - a passthrough (Tier B off / unconsented) emits filter_tier:1 and
+      //     does NOT green the row;
+      //   - administrative housekeeping (config update / consent record) emits
+      //     a different op entirely and cannot green the row;
+      //   - only a genuine Tier 2 scrub of a live query greens it.
+      // This replaces the prior `query_anonymity_pii_rewritten` key, which no
+      // live path emitted (the redactor reports via the selector's
+      // `emitRedactionEvent`, not `emitPiiRewriteAudit`), so the row was stuck
+      // amber even during real scrubbing. The honest signal is the op that
+      // fires.
       id: "privacy_strips",
       label: "Query-privacy PII rewrite (opt-in)",
       layer: "l2",
       liveness: "event_driven",
       invocationOps: Object.freeze(
-        new Set<string>(["query_anonymity_pii_rewritten"]),
+        new Set<string>(["intelligence_pii_redaction_event"]),
       ),
+      // Count ONLY a real Tier 2 scrub, never the filter_tier:1 passthrough
+      // emitted on the same op when Tier B is off/unconsented.
+      provenanceMarker: { key: "filter_tier", value: 2 },
       brokenZeroDetectable: false,
     },
   ]);
@@ -777,8 +845,23 @@ export function assertExpectationFloorsWellFormed(
 
 assertExpectationFloorsWellFormed(SLICE1_FEATURE_REGISTRY);
 
+export interface FeatureHealthAuditReader {
+  query(options: {
+    since?: string;
+    layer?: AuditEntry["layer"];
+    operation_type?: string;
+    identity_id?: string;
+    limit?: number;
+  }): Promise<{
+    entries: AuditEntry[];
+    total: number;
+    integrity_findings: AuditIntegrityFinding[];
+  }>;
+  verifySealedRegion(): Promise<SealedRegionVerdict>;
+}
+
 export interface BuildFeatureHealthInput {
-  auditLog: AuditLog;
+  auditLog: FeatureHealthAuditReader;
   originMachine: string;
   /** Registry to evaluate. Defaults to the Slice-1 registry; injectable for tests. */
   registry?: ReadonlyArray<FeatureRegistryEntry>;
@@ -819,6 +902,35 @@ export interface BuildFeatureHealthInput {
    * an empty `plugin_rows` array.
    */
   includePluginRows?: boolean;
+  /**
+   * Exclusive-egress posture (Unified Protect Slice 5 S5-P, design §6). When
+   * the SAME capping rule the wall posture applies
+   * ({@link exclusiveEgressCapsAggregateGreen}) says a
+   * fine-grained-provisioned agent's exclusive stack is not live, the
+   * `castle_wall_egress` row's would-be green (`active`) is capped to the
+   * DISTINCT non-green `coarse_only` status with basis
+   * `exclusive_egress_not_live`. Absent/null = no producer wired = unchanged.
+   * Impure callers whose provider THROWS must pass
+   * `failedExclusiveEgressStatus(...)`, never null (fail-closed).
+   */
+  exclusiveEgress?: ExclusiveEgressStatus | null;
+  /**
+   * Canonical confined-agent subject (`fortress/uid-N`) for a protection claim.
+   * When present, the `castle_wall_egress` row only counts green-earning
+   * enforcement evidence for that subject. An unresolvable claim subject becomes
+   * `subject_unresolvable`; legacy 64-hex macOS audit-token identities become
+   * `legacy_macos_audit_token`; old Linux daemon agent-name identities become
+   * `pre_canonical_linux_agent_name`; mismatched subjects become
+   * `subject_unbound_evidence`.
+   */
+  protectionClaimSubject: string | null;
+  /**
+   * Match mode for Castle Wall evidence. Default is exact per-agent subject
+   * matching. The only production caller that widens this is the coarse-wall
+   * probe, which names `fortress_scoped` because the coarse wall is a
+   * machine-wide fortress property, not a per-agent protection claim.
+   */
+  protectionSubjectMatchMode?: ProtectionSubjectMatchMode;
 }
 
 /**
@@ -872,6 +984,10 @@ export function evaluateFeatureHealth(args: {
    * `trailing_window_volume`. Null when no trailing context is available.
    */
   trailingWindowVolume?: number | null;
+  /** Canonical confined-agent subject for Castle Wall green-earning evidence. */
+  protectionClaimSubject?: string | null;
+  /** Castle Wall evidence subject match mode; defaults to exact per-agent. */
+  protectionSubjectMatchMode?: ProtectionSubjectMatchMode;
 }): FeatureHealthRow {
   const { feature, entries, originMachine, now, freshnessWindowMs, integrityOk } =
     args;
@@ -929,6 +1045,14 @@ export function evaluateFeatureHealth(args: {
         signedDedupKey: string | null;
         /** Signed producer sequence for verified producer-signed evidence. */
         signedSeq: number | null;
+        /** True when Castle Wall evidence is fresh-looking but bound elsewhere. */
+        subjectRejected: boolean;
+        /** True when evidence uses the pre-subject 64-hex macOS audit-token id. */
+        legacyMacOSAuditToken: boolean;
+        /** True when signed Linux evidence still uses an agent-name identity. */
+        preCanonicalLinuxAgentName: boolean;
+        /** True when the claim subject could not be resolved at all. */
+        subjectUnresolvable: boolean;
       }
     | null => {
     if (entry.layer !== feature.layer) return null;
@@ -974,6 +1098,7 @@ export function evaluateFeatureHealth(args: {
     let signedTs: number | null = null;
     let signedDedupKey: string | null = null;
     let signedSeq: number | null = null;
+    let reResultForSubject: EntryReverifyResult | null = null;
     if (provenanceMarker !== undefined && (isInvocation || isLiveness || isStandDown)) {
       // MARKER GATE (per-feature). The marker is a forgeable pre-filter that
       // defends against a different producer on the same layer reusing an
@@ -995,7 +1120,10 @@ export function evaluateFeatureHealth(args: {
           entry.details,
           pinnedProducerKey,
           args.verifyProducerSignature,
+          fortressIdFromProtectionSubject(args.protectionClaimSubject) ??
+            args.originMachine,
         );
+        reResultForSubject = reResult;
         const basisCounts = gatedAsLiveness
           ? signatureScheme.livenessCounts(reResult.basis)
           : signatureScheme.enforcementCounts(
@@ -1041,15 +1169,61 @@ export function evaluateFeatureHealth(args: {
     // freshness window, nor let a future-dated heartbeat read as a fresh
     // liveness signal.
     const tsValid = !Number.isNaN(ts) && ts <= now + ENFORCEMENT_FUTURE_SKEW_MS;
+    let subjectRejected = false;
+    let legacyMacOSAuditToken = false;
+    let preCanonicalLinuxAgentName = false;
+    let subjectUnresolvable = false;
+    if (
+      feature.id === "castle_wall_egress" &&
+      isInvocation
+    ) {
+      const subjectMatch = castleWallEvidenceMatchesProtectionSubject(
+        args.protectionClaimSubject,
+        reResultForSubject === null
+          ? entry
+          : subjectEvidenceForReverifiedEntry(entry, reResultForSubject),
+        args.protectionSubjectMatchMode,
+      );
+      if (!subjectMatch.matches) {
+        const subjectIssue =
+          reResultForSubject?.basis === "producer_signed_verified" &&
+          isRecord(entry.details)
+            ? signedCanonicalSubjectIssue(
+                entry.details,
+                fortressIdFromProtectionSubject(args.protectionClaimSubject) ??
+                  args.originMachine,
+              )
+            : null;
+        if (subjectMatch.reason === "subject_unresolvable") {
+          subjectUnresolvable = true;
+        } else if (subjectMatch.reason === "legacy_macos_audit_token") {
+          legacyMacOSAuditToken = true;
+        } else if (subjectIssue === "pre_canonical_linux_agent_name") {
+          preCanonicalLinuxAgentName = true;
+        } else {
+          subjectRejected = true;
+        }
+      }
+    }
     return {
       ts,
       tsValid,
-      isInvocation,
+      isInvocation:
+        subjectRejected ||
+        legacyMacOSAuditToken ||
+        preCanonicalLinuxAgentName ||
+        subjectUnresolvable
+          ? false
+          : isInvocation,
       isFault,
       isLiveness,
       isStandDown,
       signedDedupKey,
       signedSeq,
+      subjectRejected,
+      legacyMacOSAuditToken,
+      preCanonicalLinuxAgentName,
+      subjectUnresolvable,
     };
   };
 
@@ -1140,6 +1314,10 @@ export function evaluateFeatureHealth(args: {
   // freshness-window facts.
   let latestFreshInvocationMs: number | null = null;
   let latestFreshFaultMs: number | null = null;
+  let latestFreshSubjectRejectedInvocationMs: number | null = null;
+  let latestFreshLegacyMacOSAuditTokenInvocationMs: number | null = null;
+  let latestFreshPreCanonicalLinuxAgentNameInvocationMs: number | null = null;
+  let latestFreshSubjectUnresolvableInvocationMs: number | null = null;
   // Slice 2: the most recent FRESH, producer-gated liveness heartbeat. Only used
   // to split the absence-of-enforcement case into alive-idle vs silently-dead; it
   // NEVER promotes a feature to green.
@@ -1147,6 +1325,34 @@ export function evaluateFeatureHealth(args: {
   for (const entry of freshnessEntries) {
     const c = classify(entry);
     if (c === null || !c.tsValid || c.ts < freshnessFloor) continue;
+    if (
+      c.subjectRejected &&
+      (latestFreshSubjectRejectedInvocationMs === null ||
+        c.ts > latestFreshSubjectRejectedInvocationMs)
+    ) {
+      latestFreshSubjectRejectedInvocationMs = c.ts;
+    }
+    if (
+      c.subjectUnresolvable &&
+      (latestFreshSubjectUnresolvableInvocationMs === null ||
+        c.ts > latestFreshSubjectUnresolvableInvocationMs)
+    ) {
+      latestFreshSubjectUnresolvableInvocationMs = c.ts;
+    }
+    if (
+      c.legacyMacOSAuditToken &&
+      (latestFreshLegacyMacOSAuditTokenInvocationMs === null ||
+        c.ts > latestFreshLegacyMacOSAuditTokenInvocationMs)
+    ) {
+      latestFreshLegacyMacOSAuditTokenInvocationMs = c.ts;
+    }
+    if (
+      c.preCanonicalLinuxAgentName &&
+      (latestFreshPreCanonicalLinuxAgentNameInvocationMs === null ||
+        c.ts > latestFreshPreCanonicalLinuxAgentNameInvocationMs)
+    ) {
+      latestFreshPreCanonicalLinuxAgentNameInvocationMs = c.ts;
+    }
     if (
       feature.rejectNonMonotonicSignedLiveness === true &&
       (c.isLiveness || c.isStandDown) &&
@@ -1192,8 +1398,8 @@ export function evaluateFeatureHealth(args: {
   } else if (feature.liveness === "self_reporting") {
     // Self-reporting: green ONLY on fresh live-adjudication evidence; a fresh
     // fault is red and takes precedence over green ALWAYS. Slice 2 closes the
-    // "daemon silently died" gap Slice 1 left: a periodic, producer-signed
-    // liveness heartbeat lets the ABSENCE-of-enforcement case split into an
+    // "daemon silently died" gap Slice 1 left: a periodic, channel-authenticated
+    // (unsigned) liveness heartbeat lets the ABSENCE-of-enforcement case split into an
     // honest alive-but-idle (`unknown`) vs silently-dead (`fault`/red) reading.
     // The heartbeat NEVER moves the PRESENCE case to green - green stays gated on
     // fresh live-adjudication evidence only.
@@ -1241,11 +1447,43 @@ export function evaluateFeatureHealth(args: {
       // closed to `unknown`.
       status = "unknown";
       basis = "freshness_scan_incomplete";
+    } else if (
+      latestFreshInvocationMs !== null &&
+      latestStandDownMs !== null &&
+      latestStandDownMs >= latestFreshInvocationMs
+    ) {
+      // PRESENCE-THEN-STAND-DOWN case: a newer intentional stop/disarm beats
+      // older fresh adjudication evidence. The older flow still happened, but it
+      // cannot support a point-in-time green claim after the wall was stood down.
+      status = "unknown";
+      basis = "intentionally_stopped";
+    } else if (
+      latestFreshInvocationMs !== null &&
+      heartbeatProducerWasRunning &&
+      !hasFreshHeartbeat
+    ) {
+      // PRESENCE-BUT-NO-LIVENESS case: this digest proves the daemon has a
+      // heartbeat producer, but no fresh heartbeat accompanies the would-be
+      // green adjudication. Do not assert green from a prior instance's bounded
+      // evidence while the producer is silent.
+      status = "unknown";
+      basis = "daemon_liveness_unconfirmed";
     } else if (latestFreshInvocationMs !== null) {
-      // PRESENCE case: fresh live-adjudication evidence. Green. A heartbeat never
-      // changes this branch (it cannot upgrade or downgrade real adjudication).
+      // PRESENCE case: fresh live-adjudication evidence. Green.
       status = "active";
       basis = "fresh_enforcement_evidence";
+    } else if (latestFreshSubjectUnresolvableInvocationMs !== null) {
+      status = "unknown";
+      basis = "subject_unresolvable";
+    } else if (latestFreshLegacyMacOSAuditTokenInvocationMs !== null) {
+      status = "unknown";
+      basis = "legacy_macos_audit_token";
+    } else if (latestFreshPreCanonicalLinuxAgentNameInvocationMs !== null) {
+      status = "unknown";
+      basis = "pre_canonical_linux_agent_name";
+    } else if (latestFreshSubjectRejectedInvocationMs !== null) {
+      status = "unknown";
+      basis = "subject_unbound_evidence";
     } else if (hasFreshHeartbeat) {
       // ABSENCE-of-enforcement + FRESH heartbeat: the daemon is alive but has not
       // adjudicated a flow in the window. Honest alive-but-idle - `unknown`
@@ -1379,8 +1617,19 @@ export interface FeatureHealthPanel {
    * enforcement path. See `plugin-feature-health.ts`.
    */
   plugin_rows: PluginHealthRow[];
-  /** True when the backing audit read was integrity-clean. */
+  /** True when the backing audit read was untampered (findings-free). This is
+   * the OPERATIONAL gate: it stays true over an armed box's
+   * `verified_suffix_only` so a correctly-armed fortress is not falsely flagged.
+   * A fully-verified sealed region is NOT required here; that distinction is
+   * carried by {@link FeatureHealthPanel.sealed_region_unverified_at_privilege}. */
   audit_integrity_ok: boolean;
+  /** F2 round-4 HIGH-1: AMBER caveat. True when the chain is untampered but the
+   * sealed history could not be re-verified at this privilege
+   * (`verified_suffix_only`). Green rows remain honest only when a reader treats
+   * this as "sealed not re-verified here (run as root for a full verify)", never
+   * as fully-verified integrity. False when fully verified, when tainted, or when
+   * there is no sealed region. */
+  sealed_region_unverified_at_privilege: boolean;
   /**
    * Honest disclosure, surfaced to the UI: broken-zero (a silently-disabled
    * feature) is UNDETECTABLE for purely event-driven features in Slice 1.
@@ -1511,6 +1760,13 @@ export async function buildFeatureHealthPanel(
 
   let entries: AuditEntry[];
   let integrityOk: boolean;
+  // F2 round-4 HIGH-1 (2026-07-15): amber caveat. Feature rows stay ALIVE over
+  // an armed box's `verified_suffix_only` (the operator uid cannot read the
+  // root-owned sealed history, and forcing every armed box to `unknown` would
+  // cry wolf), but this evidence surface must SAY the sealed history was not
+  // re-verified here rather than presenting a bare green. `audit_integrity_ok`
+  // stays the operational untampered gate; this is the honest amber companion.
+  let sealedUnverifiedAtPrivilege = false;
   let freshnessComplete = true;
   let lifecycleHistoryComplete = true;
   try {
@@ -1522,7 +1778,23 @@ export async function buildFeatureHealthPanel(
       limit: AUDIT_PAGE_LIMIT,
     });
     entries = result.entries;
-    integrityOk = result.integrity_findings.length === 0;
+    // F2 BLOCKER-1 (round 3): fold the sealed-region crypto verdict (the routine
+    // windowed `query()` skips it over the boundary) into the cleanliness claim
+    // through the SHARED verdict fold. We deliberately fold the WINDOWED routine
+    // count (not a full-chain re-scan via getAuditChainVerdict) so this keeps
+    // feature-health's page-truncation tolerance intact; the sealed verdict is
+    // boundary-scoped and independent of the window. `untampered` (verified OR
+    // the armed-box verified_suffix_only) keeps feature health green when the
+    // sealed history is merely unreadable at operator privilege, but flips to
+    // NOT-ok on any real tamper (routine finding OR a sealed hash_mismatch /
+    // incomplete).
+    const foldedVerdict = foldAuditChainVerdict(
+      result.integrity_findings.length,
+      await input.auditLog.verifySealedRegion(),
+    );
+    integrityOk = auditChainVerdictUntampered(foldedVerdict);
+    sealedUnverifiedAtPrivilege =
+      auditChainVerdictSealedUnverifiedAtPrivilege(foldedVerdict);
 
     // Lifecycle evidence (heartbeat + intentional stand-down) must not be
     // crowded out by unrelated high-volume audit traffic. Query those exact
@@ -1539,6 +1811,10 @@ export async function buildFeatureHealthPanel(
       if (lifecycle.total > lifecycle.entries.length) {
         lifecycleHistoryComplete = false;
       }
+      // audit-chokepoint-exempt: fail-closed TIGHTENING (only ever flips
+      // integrityOk to false on a finding); never derives or stamps a clean
+      // verdict. The clean derivation for this panel routes through the fold
+      // above (F2 round-4 HIGH-2).
       if (lifecycle.integrity_findings.length > 0) integrityOk = false;
     }
   } catch {
@@ -1565,6 +1841,8 @@ export async function buildFeatureHealthPanel(
     });
     freshnessEntries = fresh.entries;
     freshnessComplete = fresh.entries.length < AUDIT_PAGE_LIMIT;
+    // audit-chokepoint-exempt: fail-closed TIGHTENING on the freshness-window
+    // read (only flips integrityOk to false on a finding); never a clean-claim.
     if (fresh.integrity_findings.length > 0) integrityOk = false;
   } catch {
     freshnessEntries = [];
@@ -1610,7 +1888,7 @@ export async function buildFeatureHealthPanel(
       now,
       windowMs,
     );
-    return evaluateFeatureHealth({
+    const row = evaluateFeatureHealth({
       feature,
       entries: inWindow,
       freshnessEntries: inFreshness,
@@ -1620,6 +1898,8 @@ export async function buildFeatureHealthPanel(
       freshnessWindowMs,
       integrityOk,
       pinnedProducerKeyB64url: featurePinnedProducerKey,
+      protectionClaimSubject: input.protectionClaimSubject,
+      protectionSubjectMatchMode: input.protectionSubjectMatchMode,
       trailingWindowVolume,
       ...(featureProducerKeyUnavailable
         ? { producerKeyExpectedButUnavailable: true }
@@ -1628,6 +1908,26 @@ export async function buildFeatureHealthPanel(
         ? { verifyProducerSignature: input.verifyProducerSignature }
       : {}),
     });
+    // S5-P aggregate-green cap (design §6): the `castle_wall_egress` row's
+    // would-be green is capped to the DISTINCT non-green `coarse_only` when a
+    // fine-grained-provisioned agent's exclusive-egress stack is not live -
+    // the SAME rule (same function) `buildCastleWallPosture` applies to
+    // `arm_state`, so the banner and this panel can never disagree on green.
+    // Only a would-be `active` is transformed: every other status is already
+    // non-green and keeps its more specific story (a stale/faulted wall must
+    // not be relabeled into "coarse wall enforcing, fine stack down").
+    if (
+      feature.id === "castle_wall_egress" &&
+      row.status === "active" &&
+      exclusiveEgressCapsAggregateGreen(input.exclusiveEgress)
+    ) {
+      return {
+        ...row,
+        status: "coarse_only" as const,
+        basis: "exclusive_egress_not_live" as const,
+      };
+    }
+    return row;
   });
   const detectionEvidenceComplete = freshnessComplete && lifecycleHistoryComplete;
 
@@ -1654,6 +1954,7 @@ export async function buildFeatureHealthPanel(
     rows,
     plugin_rows: pluginRows,
     audit_integrity_ok: integrityOk,
+    sealed_region_unverified_at_privilege: sealedUnverifiedAtPrivilege,
     disclosure: {
       broken_zero_undetectable_for_event_driven: true,
       // Slice 2: silent death is now DETECTED (a missing heartbeat reads

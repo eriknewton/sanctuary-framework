@@ -30,8 +30,15 @@ import {
   FederationSyncStateStore,
   FederationSyncStateStoreError,
   emptyFederationSyncState,
+  FEDERATION_GUARDIAN_ANTIROLLBACK_ANCHOR_KEY,
+  FEDERATION_SYNC_STATE_STORE_HKDF_INFO,
   type FederationSyncStateSnapshot,
 } from "../../src/v1/federation-sync-state-store.js";
+import { FEDERATION_GUARDIAN_REQUIREMENT_ESTABLISHED_KEY } from "../../src/v1/federation-sync-state-store.js";
+import type { FederationNodeView } from "../../src/v1/federation.js";
+import { bytesToString, stringToBytes } from "../../src/core/encoding.js";
+import { encrypt } from "../../src/core/encryption.js";
+import { derivePurposeKey } from "../../src/core/key-derivation.js";
 
 /** A 32-byte custody master stand-in (deterministic, keychain-free). */
 function masterKey(): Uint8Array {
@@ -504,5 +511,372 @@ describe("FederationSyncStateStore - write-OVERLAP close (cross-process lock)", 
     expect(writes.length).toBe(2);
     // The second read happens after the first write: serialized, not overlapping.
     expect(reads[1]!.i).toBeGreaterThan(writes[0]!.i);
+  });
+});
+
+/**
+ * F1 re-gate (§1 + Finding #6): the EXTERNAL anti-rollback anchor + the
+ * tamper-evident tri-state established sentinel. These operate at the STORE
+ * level, capturing/restoring RAW on-disk bytes (never handing the attacker the
+ * master), which is exactly the keyless filesystem attacker the fix defends
+ * against. The dashboard-level composition (§8 audit floor, the latch) is
+ * covered in federation-guardian-disable-gate.test.ts.
+ */
+describe("FederationSyncStateStore - §1 external anti-rollback anchor", () => {
+  function snapshotWithFloors(floors: {
+    generation: number;
+    disableNonce: number;
+    loweredHighWater: number;
+  }): FederationSyncStateSnapshot {
+    return {
+      ...emptyFederationSyncState(),
+      guardianRevocationRequirementGeneration: floors.generation,
+      guardianDisableNonce: floors.disableNonce,
+      guardianLoweredHighWater: floors.loweredHighWater,
+    };
+  }
+
+  it("persist writes a valid anchor at the merged floors; read authenticates it", async () => {
+    const storage = new MemoryStorage();
+    const store = new FederationSyncStateStore({ storage, masterKey: masterKey() });
+    await store.persist(
+      snapshotWithFloors({ generation: 4, disableNonce: 3, loweredHighWater: 2 }),
+    );
+    const anchor = await store.readGuardianAntiRollbackAnchor();
+    expect(anchor.status).toBe("valid");
+    if (anchor.status !== "valid") throw new Error("unreachable");
+    expect(anchor.data.requirement_generation).toBe(4);
+    expect(anchor.data.disable_nonce).toBe(3);
+    expect(anchor.data.lowered_high_water).toBe(2);
+  });
+
+  it("the anchor is NON-DECREASING: a lower persist never lowers an anchored floor", async () => {
+    const storage = new MemoryStorage();
+    const store = new FederationSyncStateStore({ storage, masterKey: masterKey() });
+    await store.persist(
+      snapshotWithFloors({ generation: 9, disableNonce: 7, loweredHighWater: 5 }),
+    );
+    // A subsequent persist carrying LOWER floors (a stale writer) must not lower
+    // the anchor.
+    await store.writeGuardianAntiRollbackAnchor({
+      loweredHighWater: 0,
+      disableNonce: 0,
+      requirementGeneration: 0,
+    });
+    const anchor = await store.readGuardianAntiRollbackAnchor();
+    expect(anchor.status).toBe("valid");
+    if (anchor.status !== "valid") throw new Error("unreachable");
+    expect(anchor.data.requirement_generation).toBe(9);
+    expect(anchor.data.disable_nonce).toBe(7);
+    expect(anchor.data.lowered_high_water).toBe(5);
+  });
+
+  it("absent anchor reads as absent (neutral); tampered anchor reads as invalid (latch signal)", async () => {
+    const storage = new MemoryStorage();
+    const store = new FederationSyncStateStore({ storage, masterKey: masterKey() });
+    expect((await store.readGuardianAntiRollbackAnchor()).status).toBe("absent");
+
+    await store.persist(
+      snapshotWithFloors({ generation: 2, disableNonce: 1, loweredHighWater: 0 }),
+    );
+    // Corrupt the anchor's MAC on disk (a keyless attacker mangling the record).
+    const raw = await storage.read("_meta", FEDERATION_GUARDIAN_ANTIROLLBACK_ANCHOR_KEY);
+    expect(raw).not.toBeNull();
+    const parsed = JSON.parse(bytesToString(raw!)) as { mac: string };
+    parsed.mac = "AAAA" + parsed.mac.slice(4);
+    await storage.write(
+      "_meta",
+      FEDERATION_GUARDIAN_ANTIROLLBACK_ANCHOR_KEY,
+      stringToBytes(JSON.stringify(parsed)),
+    );
+    expect((await store.readGuardianAntiRollbackAnchor()).status).toBe("invalid");
+  });
+
+  it("a keyless attacker who cannot re-MAC the anchor cannot forge a higher floor", async () => {
+    const storage = new MemoryStorage();
+    const store = new FederationSyncStateStore({ storage, masterKey: masterKey() });
+    await store.persist(
+      snapshotWithFloors({ generation: 2, disableNonce: 2, loweredHighWater: 2 }),
+    );
+    // The attacker rewrites the anchor's data floors UP without the master key
+    // (leaving the old MAC): the read must reject it (invalid), never accept a
+    // forged higher floor.
+    const raw = await storage.read("_meta", FEDERATION_GUARDIAN_ANTIROLLBACK_ANCHOR_KEY);
+    const parsed = JSON.parse(bytesToString(raw!)) as {
+      data: { requirement_generation: number };
+      mac: string;
+    };
+    parsed.data.requirement_generation = 999;
+    await storage.write(
+      "_meta",
+      FEDERATION_GUARDIAN_ANTIROLLBACK_ANCHOR_KEY,
+      stringToBytes(JSON.stringify(parsed)),
+    );
+    expect((await store.readGuardianAntiRollbackAnchor()).status).toBe("invalid");
+  });
+});
+
+describe("FederationSyncStateStore - Finding #6 tamper-evident established sentinel (tri-state)", () => {
+  it("absent -> {status: absent}; established -> {status: established}", async () => {
+    const storage = new MemoryStorage();
+    const store = new FederationSyncStateStore({ storage, masterKey: masterKey() });
+    expect((await store.guardianRequirementEstablished()).status).toBe("absent");
+    await store.markGuardianRequirementEstablished();
+    expect((await store.guardianRequirementEstablished()).status).toBe("established");
+  });
+
+  it("present-but-bad-MAC -> {status: invalid} (was the old false 'absent')", async () => {
+    const storage = new MemoryStorage();
+    const store = new FederationSyncStateStore({ storage, masterKey: masterKey() });
+    await store.markGuardianRequirementEstablished();
+    // Corrupt the MAC (a keyless attacker cannot recompute it under the master).
+    await storage.write(
+      "_meta",
+      FEDERATION_GUARDIAN_REQUIREMENT_ESTABLISHED_KEY,
+      stringToBytes(JSON.stringify({ v: 1, mac: "not-the-real-mac" })),
+    );
+    expect((await store.guardianRequirementEstablished()).status).toBe("invalid");
+  });
+
+  it("present-but-unparseable -> {status: invalid}", async () => {
+    const storage = new MemoryStorage();
+    const store = new FederationSyncStateStore({ storage, masterKey: masterKey() });
+    await store.markGuardianRequirementEstablished();
+    await storage.write(
+      "_meta",
+      FEDERATION_GUARDIAN_REQUIREMENT_ESTABLISHED_KEY,
+      stringToBytes("{ this is not json"),
+    );
+    expect((await store.guardianRequirementEstablished()).status).toBe("invalid");
+  });
+});
+
+/**
+ * PR-A (durable fleet membership): store-level durability of the node roster.
+ *
+ * BEFORE this the roster (`_federationState.nodes`, the authoritative source of
+ * the paid node-count) was in-memory ONLY (rebuilt from the unpersisted event
+ * log), so it came up EMPTY on every restart and the count reset to zero. These
+ * tests prove the roster round-trips through the SAME AEAD record as the rest of
+ * the sync-state, back-compat-decodes an OLD-shape (no-roster) record to the
+ * empty roster, fails closed when the roster is tampered out-of-band, and is
+ * GROW-ONLY merged so a stale/older snapshot never DROPS a node.
+ */
+function nodeView(
+  nodeId: string,
+  overrides?: Partial<FederationNodeView>,
+): FederationNodeView {
+  return {
+    node_id: nodeId,
+    label: null,
+    attestation_status: "verified",
+    node_mode: "local",
+    host_provider: null,
+    trust_boundary: {
+      version: "operator-cloud-trust-boundary-v1",
+      posture: "local_operator_host",
+      label: "local operator host",
+      provider_in_trust_boundary: false,
+      tee_attested: false,
+      disclosure: null,
+    },
+    tee_attested: false,
+    disclosure_acknowledged_at: null,
+    drill_status: "not_applicable",
+    first_seen: "2026-07-06T00:00:00.000Z",
+    last_seen: "2026-07-06T00:00:00.000Z",
+    last_sync: { received_at: null, sent_at: null, last_sequence: 0 },
+    applied_policy: {
+      version: null,
+      hash: null,
+      hash_algorithm: null,
+      applied_at: null,
+      source_event_id: null,
+    },
+    ...overrides,
+  };
+}
+
+function snapshotWithNodes(
+  nodes: FederationNodeView[],
+  extra?: Partial<FederationSyncStateSnapshot>,
+): FederationSyncStateSnapshot {
+  return {
+    ...emptyFederationSyncState(),
+    nodes: new Map(nodes.map((n) => [n.node_id, n])),
+    ...extra,
+  };
+}
+
+describe("FederationSyncStateStore - durable node roster (PR-A fleet membership)", () => {
+  it("round-trips the node roster through encrypt -> decrypt (restart survival)", async () => {
+    const storage = new MemoryStorage();
+    const snapshot = snapshotWithNodes([
+      nodeView("mac-1", { node_mode: "local", label: "home-mac" }),
+      nodeView("linux-1", {
+        node_mode: "operator_cloud",
+        last_sync: { received_at: "2026-07-06T01:00:00.000Z", sent_at: null, last_sequence: 4 },
+      }),
+    ]);
+
+    await new FederationSyncStateStore({ storage, masterKey: masterKey() }).persist(
+      snapshot,
+    );
+    // A fresh store over the SAME storage (simulated daemon restart).
+    const loaded = await new FederationSyncStateStore({
+      storage,
+      masterKey: masterKey(),
+    }).load();
+
+    expect([...loaded.nodes.keys()].sort()).toEqual(["linux-1", "mac-1"]);
+    expect(loaded.nodes.get("mac-1")?.label).toBe("home-mac");
+    expect(loaded.nodes.get("mac-1")?.node_mode).toBe("local");
+    expect(loaded.nodes.get("linux-1")?.node_mode).toBe("operator_cloud");
+    expect(loaded.nodes.get("linux-1")?.last_sync.last_sequence).toBe(4);
+    // Posture is RE-DERIVED from node_mode, not persisted verbatim.
+    expect(loaded.nodes.get("linux-1")?.trust_boundary.provider_in_trust_boundary).toBe(
+      true,
+    );
+    expect(loaded.nodes.get("mac-1")?.trust_boundary.posture).toBe("local_operator_host");
+  });
+
+  it("BACK-COMPAT: an OLD-shape record (no `nodes` field) rehydrates to the EMPTY roster, never crashes", async () => {
+    const storage = new MemoryStorage();
+    // Persist a snapshot the OLD way (no roster) by round-tripping a snapshot
+    // whose nodes map is empty, then asserting a fresh load yields an empty
+    // roster. (An old binary simply never wrote the `nodes` key; decodeNodeRoster
+    // treats `undefined` as the empty roster, the pre-PR-A behavior.)
+    await new FederationSyncStateStore({ storage, masterKey: masterKey() }).persist(
+      snapshotWithNodes([], {
+        acceptedHighWater: new Map([["mac-1", 3]]),
+        revokedNodeIds: new Set(["gone"]),
+      }),
+    );
+    const loaded = await new FederationSyncStateStore({
+      storage,
+      masterKey: masterKey(),
+    }).load();
+
+    expect(loaded.nodes.size).toBe(0);
+    // The rest of the record still decodes normally.
+    expect(loaded.acceptedHighWater.get("mac-1")).toBe(3);
+    expect(loaded.revokedNodeIds.has("gone")).toBe(true);
+  });
+
+  it("BACK-COMPAT: a literally roster-less plaintext (pre-PR-A on-disk shape) decodes to the empty roster", async () => {
+    // Prove decodeNodeRoster(undefined) -> empty at the true on-disk boundary by
+    // hand-crafting a v1 plaintext that OMITS `nodes` entirely, encrypting it
+    // under the store key, and loading it. This is exactly what an old binary
+    // wrote before this field existed.
+    const storage = new MemoryStorage();
+    const key = derivePurposeKey(masterKey(), FEDERATION_SYNC_STATE_STORE_HKDF_INFO);
+    const legacyPlaintext = {
+      v: 1,
+      accepted_high_water: [["mac-1", 7]],
+      outbound_high_water: 2,
+      revoked_node_ids: ["evil"],
+      highest_eviction_serial: 1,
+      // NO `nodes` key at all.
+    };
+    const encrypted = encrypt(
+      stringToBytes(JSON.stringify(legacyPlaintext)),
+      key,
+    );
+    await storage.write(
+      "_federation",
+      "sync-state-v1",
+      stringToBytes(JSON.stringify(encrypted)),
+    );
+
+    const loaded = await new FederationSyncStateStore({
+      storage,
+      masterKey: masterKey(),
+    }).load();
+    expect(loaded.nodes.size).toBe(0);
+    expect(loaded.acceptedHighWater.get("mac-1")).toBe(7);
+    expect(loaded.revokedNodeIds.has("evil")).toBe(true);
+  });
+
+  it("TAMPER: flipping a byte of the record with a persisted roster -> THROWS on load (fail closed, no forged node)", async () => {
+    const storage = new MemoryStorage();
+    const store = new FederationSyncStateStore({ storage, masterKey: masterKey() });
+    await store.persist(snapshotWithNodes([nodeView("mac-1"), nodeView("linux-1")]));
+
+    // A disk-level attacker flips the ciphertext (e.g. to forge an extra node id
+    // and claim a higher grandfather baseline). AEAD verification must fail
+    // closed: the whole record is rejected, not partially honored.
+    const raw = await storage.read("_federation", "sync-state-v1");
+    const obj = JSON.parse(bytesToString(raw!)) as { ct: string };
+    obj.ct = obj.ct.slice(0, -2) + (obj.ct.endsWith("AA") ? "BB" : "AA");
+    await storage.write(
+      "_federation",
+      "sync-state-v1",
+      stringToBytes(JSON.stringify(obj)),
+    );
+
+    await expect(store.load()).rejects.toBeInstanceOf(FederationSyncStateStoreError);
+  });
+
+  it("GROW-ONLY: persisting an OLDER snapshot with FEWER nodes does NOT drop a node already at rest", async () => {
+    const storage = new MemoryStorage();
+    const store = new FederationSyncStateStore({ storage, masterKey: masterKey() });
+    // At rest: a 2-node roster.
+    await store.persist(snapshotWithNodes([nodeView("mac-1"), nodeView("linux-1")]));
+    // A STALE writer persists a snapshot that only knows about mac-1 (e.g. an
+    // out-of-band writer with an older in-memory roster). The monotonic merge
+    // must UNION, keeping linux-1.
+    await store.persist(snapshotWithNodes([nodeView("mac-1")]));
+
+    const loaded = await store.load();
+    expect([...loaded.nodes.keys()].sort()).toEqual(["linux-1", "mac-1"]);
+  });
+
+  it("GROW-ONLY: a per-id collision keeps the entry with the higher last_sequence", async () => {
+    const storage = new MemoryStorage();
+    const store = new FederationSyncStateStore({ storage, masterKey: masterKey() });
+    await store.persist(
+      snapshotWithNodes([
+        nodeView("mac-1", {
+          last_sync: { received_at: null, sent_at: null, last_sequence: 9 },
+        }),
+      ]),
+    );
+    // A stale writer carries an OLDER view of mac-1 (lower last_sequence): it must
+    // not regress the persisted freshness.
+    await store.persist(
+      snapshotWithNodes([
+        nodeView("mac-1", {
+          last_sync: { received_at: null, sent_at: null, last_sequence: 2 },
+        }),
+      ]),
+    );
+
+    const loaded = await store.load();
+    expect(loaded.nodes.get("mac-1")?.last_sync.last_sequence).toBe(9);
+  });
+
+  it("MALFORMED: a present-but-invalid node entry THROWS (fail-closed-on-corrupt)", async () => {
+    // Hand-craft a v1 plaintext with a structurally-broken node (missing
+    // node_mode) and confirm it fails closed rather than half-decoding.
+    const storage = new MemoryStorage();
+    const key = derivePurposeKey(masterKey(), FEDERATION_SYNC_STATE_STORE_HKDF_INFO);
+    const badPlaintext = {
+      v: 1,
+      accepted_high_water: [],
+      outbound_high_water: 0,
+      revoked_node_ids: [],
+      highest_eviction_serial: 0,
+      nodes: [["mac-1", { node_id: "mac-1", label: null, attestation_status: "verified" }]],
+    };
+    const encrypted = encrypt(stringToBytes(JSON.stringify(badPlaintext)), key);
+    await storage.write(
+      "_federation",
+      "sync-state-v1",
+      stringToBytes(JSON.stringify(encrypted)),
+    );
+
+    await expect(
+      new FederationSyncStateStore({ storage, masterKey: masterKey() }).load(),
+    ).rejects.toBeInstanceOf(FederationSyncStateStoreError);
   });
 });

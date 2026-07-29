@@ -11,8 +11,12 @@
  *    existing `/api/query-anonymity/stats` aggregation over
  *    `query_anonymity_headers_stripped` audit evidence.
  *  - Tier B PII rewrite (opt-in, off by default): the existing `privacy_strips`
- *    feature-health row, which reads `unconfirmed` (amber) until the deferred
- *    Rho-2.5 selector wiring lands. Carried through verbatim; never forced green.
+ *    feature-health row. Since Rho-2.5 the consent-gated redactor is installed
+ *    on the production selectors, so the row greens once a REAL Tier 2 scrub
+ *    fires (`intelligence_pii_redaction_event` with `filter_tier: 2`) and stays
+ *    `unconfirmed` (amber) while Tier B is off / unconsented (those emit
+ *    `filter_tier: 1` and do not count). Carried through verbatim; never forced
+ *    green from config or from a passthrough.
  *
  * HONESTY CONTRACT (#617 never-fake-green + design 2.1 C overclaim flag):
  *  - This section is HEADER-METADATA HYGIENE, NOT ANONYMITY. The substrate
@@ -32,9 +36,10 @@
  *    distinction structurally so a viewer can never mistake 0-stripped for
  *    stripping-happened.
  *  - Tier B is NEVER green from config alone. Its status is the feature-health
- *    `privacy_strips` row status, which is `unconfirmed` until a real
- *    `query_anonymity_pii_rewritten` event fires (the emitter is unwired today),
- *    so it carries through as `unconfirmed`, never green.
+ *    `privacy_strips` row status, which greens only when a real Tier 2 scrub
+ *    fires (`intelligence_pii_redaction_event` with `filter_tier: 2`); a config
+ *    update, a consent record, or a toggled-off passthrough (`filter_tier: 1`)
+ *    never greens it. It carries through verbatim, never forced green.
  *  - Tier C (mix-network / ZK) is NOT rendered as a capability at all (omitted).
  *
  * Pure over its injected inputs so it unit-tests without a live server.

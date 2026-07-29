@@ -22,7 +22,7 @@
  * inversion durable (a new operator-attribution detail key cannot leak).
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { readFileSync, readdirSync } from "node:fs";
 import { join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -30,6 +30,7 @@ import ts from "typescript";
 import { createSanctuaryServer } from "../../src/index.js";
 import { AuditLog, BROKER_OPS } from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
+import { createTempHome } from "../helpers/temp-fortress.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import {
   redactAuditEntryForAgent,
@@ -98,6 +99,27 @@ function binding(identityId: string) {
     requester_identity_fingerprint: fingerprintIdentityId(identityId),
   };
 }
+
+
+// Fortress hermeticity: `createSanctuaryServer` boots the real server, and its
+// step 20 writes the config unconditionally. With `HOME` left alone that write
+// lands on the operator's own `~/.sanctuary/sanctuary.json` -- measured, not
+// inferred: this file was one of five bisected as rewriting it on every suite
+// run. Injecting `MemoryStorage` is not enough, because `config.storage_path`
+// still comes from `defaultConfig()`'s `join(homedir(), ".sanctuary")`.
+// Moving `HOME` redirects the mkdir, the permission tightening, and the config
+// write onto a throwaway directory without changing anything under test.
+// `saveConfig` now fails such a write closed under Vitest, so removing this
+// isolation turns the leak into a loud failure rather than a silent one.
+let fortressHome: Awaited<ReturnType<typeof createTempHome>>;
+
+beforeEach(async () => {
+  fortressHome = await createTempHome("sanctuary-audit-allowlist");
+});
+
+afterEach(async () => {
+  await fortressHome.cleanup();
+});
 
 describe("agent-audit-allowlist: unit (redactAuditEntryForAgent)", () => {
   it("(a) emits ONLY {timestamp, operation, result, has_details} — never reason/threshold/details", () => {
@@ -897,6 +919,7 @@ describe("agent-audit-allowlist: STRUCTURE TRIPWIRE (comprehensive — agent-fac
     "anomaly-detection/feature-extractors/time-of-day-activity.ts",
     "anomaly-detection/feature-extractors/tool-call-sequence.ts",
     // sentinels — internal background watchers
+    "sentinel/sentinels/agent-egress-watcher.ts",
     "sentinel/sentinels/credential-usage-watcher.ts",
     "sentinel/sentinels/cross-agent-chatter-watcher.ts",
     "sentinel/sentinels/egress-volume-watcher.ts",
@@ -911,10 +934,20 @@ describe("agent-audit-allowlist: STRUCTURE TRIPWIRE (comprehensive — agent-fac
     "principal-policy/posture.ts",
     "principal-policy/unified-inbox-producers.ts",
     // operator CLI
+    // NOTE (observe-fold idempotency chokepoint, 2026-07-14): cli/castle-wall-observe.ts
+    // no longer uses auditLog.query at all -- runObserveCandidates now folds via
+    // castle-wall/observe/refresh.ts over streamVerifiedChain (window-independent,
+    // strict-verified, watermark-incremental), which is not one of the query sites
+    // this tripwire discovers, so it needs no row here.
     "cli/audit.ts",
     "cli/castle-wall.ts",
+    "wrap/cli.ts",
     // compliance report generation — operator artifact
     "compliance/eu_ai_act/generator.ts",
+    // law-firm evidence pack — operator artifact. The CLI reads the full audit
+    // history to COUNT quarter activity; only aggregate counts/categories/
+    // timestamps are emitted into the pack, never raw entry `details`.
+    "evidence-pack/cli.ts",
     // operator chat context / concierge — human operator surface
     "chat/agent-context-cache.ts",
     "concierge/sanctuary-context-reader.ts",
@@ -1183,6 +1216,19 @@ describe("agent-audit-allowlist: STRUCTURE TRIPWIRE (comprehensive — agent-fac
       reason:
         "operator CLI castle-wall audit dump: one-shot full read per invocation; wants a single full re-verify.",
     },
+    // NOTE (observe-fold idempotency chokepoint, 2026-07-14): runObserveCandidates
+    // (cli/castle-wall-observe.ts) no longer has an auditLog.query site -- the fold
+    // now streams the WHOLE verified chain via streamVerifiedChain (one-shot,
+    // strict full re-verify per invocation, watermark-incremental fold; see
+    // castle-wall/observe/refresh.ts), which this query-site tripwire does not
+    // discover, so it needs no escape row.
+    {
+      module: "cli/castle-wall.ts",
+      fn: "runAuditVerify",
+      kind: "operator-batch",
+      reason:
+        "operator CLI castle-wall audit-verify (Slice M reader leg): one-shot full read per invocation that re-verifies every enforcement entry's producer signature; a single full re-verify across all entries IS the desired tamper-evidence behavior, never a warm/eager hot-path view.",
+    },
     {
       module: "exit/bundle.ts",
       fn: "exportAuditReceipts",
@@ -1196,6 +1242,13 @@ describe("agent-audit-allowlist: STRUCTURE TRIPWIRE (comprehensive — agent-fac
       kind: "operator-batch",
       reason:
         "EU AI Act report generator: effectively-unbounded period read, run once when generating the operator compliance artifact; one full re-verify is desired.",
+    },
+    {
+      module: "evidence-pack/cli.ts",
+      fn: "runEvidencePack",
+      kind: "operator-batch",
+      reason:
+        "law-firm evidence pack CLI: one full retained-history read per invocation to aggregate a calendar quarter; one full re-verify is the desired honest behavior, not a warm view, and only aggregate counts leave the generator.",
     },
     // ── operator-background: internal analyzers / sentinels on own schedule ──
     {
@@ -1248,6 +1301,13 @@ describe("agent-audit-allowlist: STRUCTURE TRIPWIRE (comprehensive — agent-fac
         "anomaly feature extractor: windowed read on the anomaly pipeline cadence; internal scoring, not the SSE board.",
     },
     {
+      module: "sentinel/sentinels/agent-egress-watcher.ts",
+      fn: "evaluate",
+      kind: "operator-background",
+      reason:
+        "sentinel background watcher (confined-agent egress MED-3): windowed l1 read of egress denials + probe failures on its own cadence; internal scoring, not the SSE board.",
+    },
+    {
       module: "sentinel/sentinels/credential-usage-watcher.ts",
       fn: "evaluate",
       kind: "operator-background",
@@ -1275,6 +1335,10 @@ describe("agent-audit-allowlist: STRUCTURE TRIPWIRE (comprehensive — agent-fac
       reason:
         "sentinel background watcher: windowed read on its own cadence; internal scoring.",
     },
+    // NOTE (F1 anti-rollback §8.6 round 2): dashboard.deriveGuardianFloorFromAudit
+    // does NOT use auditLog.query at all. It reads the WHOLE verified chain via
+    // streamVerifiedChain (window-independent per §8.6 P0), which is not one of
+    // the query sites this tripwire discovers, so it needs no query-escape row.
     // ── operator-per-request: deliberately per-request operator reads ───────
     {
       module: "principal-policy/dashboard.ts",

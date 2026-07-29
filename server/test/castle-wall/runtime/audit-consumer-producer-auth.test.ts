@@ -32,6 +32,9 @@ import {
   CASTLE_WALL_EVIDENCE_BASIS_CHANNEL_UNSIGNED,
   CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY,
   CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY,
+  CASTLE_WALL_PRODUCER_SUBJECT_BINDING_DETAIL_KEY,
+  CASTLE_WALL_PRODUCER_SUBJECT_BINDING_MACOS_AUDIT_TOKEN,
+  CASTLE_WALL_PRODUCER_SUBJECT_BINDING_SIGNED_IDENTITY_ID,
 } from "../../../src/castle-wall/constants.js";
 import type { CastleWallAuditEvent } from "../../../src/castle-wall/audit/events.js";
 
@@ -67,14 +70,37 @@ const daemonPubB64 = toBase64url(ed25519.getPublicKey(daemonPriv));
 const NOW = 1_750_000_000_000;
 const SIGNED_TS = NOW - 1000;
 
-const AGENT = { id: "agent-1", template: "tpl" };
+const FORTRESS_ID = "f";
+const SIGNED_AGENT_UID = 503;
+
+function auditTokenForRuid(uid: number): string {
+  const vals = [
+    0xffffffff,
+    uid,
+    uid,
+    uid,
+    uid,
+    0x00000269,
+    0x000186ae,
+    0x00000566,
+  ];
+  return vals
+    .map((value) => {
+      const bytes = new Uint8Array(4);
+      new DataView(bytes.buffer).setUint32(0, value >>> 0, true);
+      return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
+    })
+    .join("");
+}
+
+const AGENT = { id: auditTokenForRuid(SIGNED_AGENT_UID), template: "tpl" };
 const DEST = { host: "evil.example", ip: "9.9.9.9", port: 443, protocol: "tcp" as const };
 
 /** Build a blocked-egress enforcement event at a given seq. */
 function blockedEvent(seq: number, priorHash: string | null): CastleWallAuditEvent {
   return buildAuditEvent({
     timestamp: `2026-06-13T00:00:0${seq}Z`,
-    fortress_id: "f",
+    fortress_id: FORTRESS_ID,
     event_type: "egress_blocked",
     agent: AGENT,
     destination: DEST,
@@ -116,11 +142,33 @@ function walBodyFor(event: CastleWallAuditEvent): string {
   });
 }
 
+function walBodyWithSubjectFields(input: {
+  operation?: "egress_blocked" | "egress_approved";
+  identityId?: string;
+  agentId?: string;
+}): string {
+  return canonicalize({
+    timestamp: "2026-06-13T00:00:00Z",
+    layer: "l1",
+    operation: input.operation ?? "egress_blocked",
+    ...(input.identityId !== undefined ? { identity_id: input.identityId } : {}),
+    result:
+      input.operation === "egress_approved" ? "success" : "blocked",
+    details:
+      input.agentId !== undefined ? { agent_id: input.agentId } : {},
+  });
+}
+
 /** Sign an event the way the daemon would: over the WAL canonical body bytes. */
 function signedEnvelope(
   event: CastleWallAuditEvent,
   signer: Uint8Array,
-  opts?: { overrideSeq?: number; overrideTs?: number; bodyOverride?: string }
+  opts?: {
+    overrideSeq?: number;
+    overrideTs?: number;
+    bodyOverride?: string;
+    omitSubjectBinding?: boolean;
+  }
 ): CriticalEventEnvelope {
   const canonical = opts?.bodyOverride ?? walBodyFor(event);
   const seq = opts?.overrideSeq ?? (event.details.seq as number);
@@ -136,6 +184,14 @@ function signedEnvelope(
       signatureB64url: toBase64url(sig),
       keyId: CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1,
     },
+    ...(opts?.omitSubjectBinding === true
+      ? {}
+      : {
+          producerSubjectBinding: {
+            kind: "macos_audit_token" as const,
+            fortressId: FORTRESS_ID,
+          },
+        }),
   };
 }
 
@@ -162,7 +218,7 @@ describe("audit-consumer producer-authenticity (pinned key configured)", () => {
 
     const persisted = sink.entries.find((e) => e.operation === "egress_blocked");
     expect(persisted).toBeDefined();
-    expect(persisted!.result).toBe("success");
+    expect(persisted!.result).toBe("failure");
     expect(persisted!.details?.[CASTLE_WALL_PRODUCER_SIG_DETAIL_KEY]).toBe(
       env.producer!.signatureB64url
     );
@@ -171,6 +227,9 @@ describe("audit-consumer producer-authenticity (pinned key configured)", () => {
     );
     expect(persisted!.details?.[CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY]).toBe(
       CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED
+    );
+    expect(persisted!.details?.[CASTLE_WALL_PRODUCER_SUBJECT_BINDING_DETAIL_KEY]).toBe(
+      CASTLE_WALL_PRODUCER_SUBJECT_BINDING_MACOS_AUDIT_TOKEN,
     );
     // Evidence is sourced from the SIGNED body, not the event.
     expect(persisted!.details?.agent_id).toBe(AGENT.id);
@@ -197,6 +256,9 @@ describe("audit-consumer producer-authenticity (pinned key configured)", () => {
     expect(
       persisted!.details?.[CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY],
     ).toBe(env.producer!.capturedAtUnixMs);
+    expect(
+      persisted!.details?.[CASTLE_WALL_PRODUCER_SUBJECT_BINDING_DETAIL_KEY],
+    ).toBe(CASTLE_WALL_PRODUCER_SUBJECT_BINDING_MACOS_AUDIT_TOKEN);
     // seq is preserved from the chain-authenticated event details.
     expect(persisted!.details?.seq).toBe(0);
     // Together with sig/kid, this is the full ProducerSignatureInput. Round-trip
@@ -245,6 +307,86 @@ describe("audit-consumer producer-authenticity (pinned key configured)", () => {
     expect(acked).toBe(true);
   });
 
+  it("REJECTS a verified producer-signed event that omits subject binding", async () => {
+    const event = blockedEvent(0, null);
+    const env = signedEnvelope(event, daemonPriv, {
+      omitSubjectBinding: true,
+    });
+    await expect(consumer.ingestCritical(env)).rejects.toBeInstanceOf(
+      AuditChainError
+    );
+    expect(sink.entries.some((e) => e.operation === "egress_blocked")).toBe(false);
+    const rejection = sink.entries.find(
+      (e) => e.operation === "producer_signature_rejected"
+    );
+    expect(rejection?.details?.reason).toBe(
+      "producer_signed_without_subject_binding"
+    );
+    expect(consumer.getStats().producerSignatureRejections).toBe(1);
+    expect(consumer.getWalChainState().lastAckedSeq).toBeNull();
+  });
+
+  it("REJECTS macOS subject binding when the signed body omits agent_id", async () => {
+    const event = blockedEvent(0, null);
+    const env = signedEnvelope(event, daemonPriv, {
+      bodyOverride: walBodyWithSubjectFields({ identityId: "signed-agent" }),
+    });
+
+    await expect(consumer.ingestCritical(env)).rejects.toBeInstanceOf(
+      AuditChainError,
+    );
+
+    const rejection = sink.entries.find(
+      (e) => e.operation === "producer_signature_rejected",
+    );
+    expect(rejection?.details?.reason).toBe(
+      "producer_signed_body_missing_agent_id",
+    );
+    expect(sink.entries.some((e) => e.operation === "egress_blocked")).toBe(false);
+  });
+
+  it("REJECTS macOS subject binding when signed agent_id cannot derive a uid subject", async () => {
+    const event = blockedEvent(0, null);
+    const env = signedEnvelope(event, daemonPriv, {
+      bodyOverride: walBodyWithSubjectFields({
+        identityId: "signed-agent",
+        agentId: "agent-name-not-audit-token",
+      }),
+    });
+
+    await expect(consumer.ingestCritical(env)).rejects.toBeInstanceOf(
+      AuditChainError,
+    );
+
+    const rejection = sink.entries.find(
+      (e) => e.operation === "producer_signature_rejected",
+    );
+    expect(rejection?.details?.reason).toBe(
+      "producer_signed_body_agent_subject_unresolvable",
+    );
+    expect(sink.entries.some((e) => e.operation === "egress_blocked")).toBe(false);
+  });
+
+  it("REJECTS signed-identity binding when the signed body omits identity_id", async () => {
+    const event = blockedEvent(0, null);
+    const env = signedEnvelope(event, daemonPriv, {
+      bodyOverride: walBodyWithSubjectFields({ agentId: "agent-name" }),
+    });
+    env.producerSubjectBinding = { kind: "signed_identity_id" };
+
+    await expect(consumer.ingestCritical(env)).rejects.toBeInstanceOf(
+      AuditChainError,
+    );
+
+    const rejection = sink.entries.find(
+      (e) => e.operation === "producer_signature_rejected",
+    );
+    expect(rejection?.details?.reason).toBe(
+      "producer_signed_body_missing_identity_id",
+    );
+    expect(sink.entries.some((e) => e.operation === "egress_blocked")).toBe(false);
+  });
+
   it("REJECTS an enforcement event FORGED with a different key", async () => {
     const forgerPriv = ed25519.utils.randomPrivateKey();
     const event = blockedEvent(0, null);
@@ -269,7 +411,7 @@ describe("audit-consumer producer-authenticity (pinned key configured)", () => {
 
     const fabricated = buildAuditEvent({
       timestamp: "2026-06-13T00:00:00Z",
-      fortress_id: "f",
+      fortress_id: FORTRESS_ID,
       event_type: "egress_blocked", // operation must still map; everything else lies
       agent: { id: "victim-agent", template: "fabricated-template" },
       destination: { host: "innocent.example", ip: "1.1.1.1", port: 22, protocol: "udp" },
@@ -281,12 +423,19 @@ describe("audit-consumer producer-authenticity (pinned key configured)", () => {
       event: fabricated,
       ack: async () => {},
       producer: genuineSigned.producer,
+      producerSubjectBinding: {
+        kind: "macos_audit_token",
+        fortressId: FORTRESS_ID,
+      },
     });
 
     const persisted = sink.entries.find((e) => e.operation === "egress_blocked");
     expect(persisted).toBeDefined();
     expect(persisted!.details?.[CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY]).toBe(
       CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED
+    );
+    expect(persisted!.details?.[CASTLE_WALL_PRODUCER_SUBJECT_BINDING_DETAIL_KEY]).toBe(
+      CASTLE_WALL_PRODUCER_SUBJECT_BINDING_MACOS_AUDIT_TOKEN,
     );
     // The SIGNED body's values are persisted; the fabricated ones are gone.
     expect(persisted!.details?.agent_id).toBe(AGENT.id);
@@ -304,7 +453,7 @@ describe("audit-consumer producer-authenticity (pinned key configured)", () => {
     // it as an egress_blocked event — the operation→event_type binding fails.
     const allowEvent = buildAuditEvent({
       timestamp: "2026-06-13T00:00:00Z",
-      fortress_id: "f",
+      fortress_id: FORTRESS_ID,
       event_type: "egress_allowed",
       agent: AGENT,
       destination: DEST,
@@ -413,6 +562,8 @@ describe("audit-consumer producer-authenticity (NO pinned key — legacy basis)"
         // mistakes them for a verifiable signature.
         [CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY]: "{\"forged\":true}",
         [CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY]: 123,
+        [CASTLE_WALL_PRODUCER_SUBJECT_BINDING_DETAIL_KEY]:
+          CASTLE_WALL_PRODUCER_SUBJECT_BINDING_SIGNED_IDENTITY_ID,
       },
     });
     await consumer.ingestCritical({ event, ack: async () => {} });
@@ -429,6 +580,9 @@ describe("audit-consumer producer-authenticity (NO pinned key — legacy basis)"
     ).toBeUndefined();
     expect(
       persisted!.details?.[CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY]
+    ).toBeUndefined();
+    expect(
+      persisted!.details?.[CASTLE_WALL_PRODUCER_SUBJECT_BINDING_DETAIL_KEY],
     ).toBeUndefined();
     expect(persisted!.details?.[CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY]).toBe(
       CASTLE_WALL_EVIDENCE_BASIS_CHANNEL_UNSIGNED

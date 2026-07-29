@@ -151,4 +151,50 @@ describe("castle-wall/egress-proxy server integration", () => {
     );
     expect(result.statusCode).toBe(403);
   });
+
+  it("survives a client reset during the async decision window (no process-killing uncaughtException)", async () => {
+    // Regression (same hazard and fix as egress-gate/gate-server): the party
+    // on the client socket can RST while decideEgressProxyConnect performs
+    // DNS resolution; a listener-less 'error' event would crash the whole
+    // proxy process. A dedicated server with a slow resolver widens the
+    // decision window deterministically.
+    const slowServer = createCastleWallEgressProxyServer({
+      rules: [makeRule(ALLOWED_HOST, upstreamPort)],
+      resolver: {
+        resolve: () =>
+          new Promise<string[]>((resolve) =>
+            setTimeout(() => resolve(["127.0.0.1"]), 150),
+          ),
+      },
+      isRoutable: () => true,
+    });
+    await new Promise<void>((resolve) => {
+      slowServer.listen(0, "127.0.0.1", () => resolve());
+    });
+    const slowPort = (slowServer.address() as net.AddressInfo).port;
+    try {
+      await new Promise<void>((resolve) => {
+        const socket = net.connect(slowPort, "127.0.0.1", () => {
+          socket.write(
+            `CONNECT ${ALLOWED_HOST}:${upstreamPort} HTTP/1.1\r\nHost: x\r\n\r\n`,
+          );
+          setTimeout(() => {
+            socket.resetAndDestroy();
+            resolve();
+          }, 50);
+        });
+        socket.on("error", () => {});
+      });
+      // Let the in-flight handler run past the await with the dead client.
+      await new Promise((r) => setTimeout(r, 300));
+      // The proxy survived: a fresh CONNECT still tunnels.
+      const result = await connectAndSend(
+        slowPort,
+        `${ALLOWED_HOST}:${upstreamPort}`,
+      );
+      expect(result.statusCode).toBe(200);
+    } finally {
+      await new Promise<void>((r) => slowServer.close(() => r()));
+    }
+  });
 });

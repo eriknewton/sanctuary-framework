@@ -36,6 +36,30 @@ describe("Wrap CLI", () => {
       expect(opts.wrap).toBe("/path/to/config.json");
     });
 
+    it("parses --unprotect-egress-gate flag (S5-7 unprotect verb)", () => {
+      const opts = parseWrapArgs(["--unprotect-egress-gate"]);
+      expect(opts.unprotectEgressGate).toBe(true);
+      expect(opts.repairEgressGate).toBeUndefined();
+    });
+
+    it("parses --repair-egress-gate flag (S5-6 repair verb)", () => {
+      const opts = parseWrapArgs(["--repair-egress-gate"]);
+      expect(opts.repairEgressGate).toBe(true);
+      expect(opts.unprotectEgressGate).toBeUndefined();
+    });
+
+    it("parses --stand-down-agent as an explicit repair/unprotect opt-in", () => {
+      const opts = parseWrapArgs(["--repair-egress-gate", "--stand-down-agent"]);
+      expect(opts.repairEgressGate).toBe(true);
+      expect(opts.standDownAgent).toBe(true);
+    });
+
+    it("rejects --stand-down-agent without repair or unprotect so it cannot be silently ignored", () => {
+      expect(() => parseWrapArgs(["--stand-down-agent"])).toThrow(
+        /only valid with --repair-egress-gate or --unprotect-egress-gate/,
+      );
+    });
+
     it("parses --unwrap flag", () => {
       const opts = parseWrapArgs(["--unwrap"]);
       expect(opts.unwrap).toBe(true);

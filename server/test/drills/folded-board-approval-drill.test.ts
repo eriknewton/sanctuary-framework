@@ -61,7 +61,10 @@
  *      the tamper-evident hash chain with zero integrity findings.
  *   5. A token-carrying DENY returns the correct gate result AND a
  *      gate-written signed-audit entry (`gate_deny:state_export`).
- *   6. The session cookie minted by /api/session is `SameSite=Strict`.
+ *   6. The session cookie minted by /api/session is `SameSite=Lax` (C1: lets a
+ *      cross-host Fleet "Open Console" top-level navigation reuse a still-valid
+ *      session; Lax still withholds the cookie on cross-site POSTs, so the
+ *      approval-decision route stays CSRF-safe — proven by step 7's token lock).
  *   7. A TOKENLESS co-resident loopback attempt on the decision route is
  *      REJECTED (401) — a co-resident agent cannot self-approve, even though
  *      loopback auto-auth is enabled (requireToken:true defeats the shortcut).
@@ -695,17 +698,21 @@ describe("Item B drill — co-resident agent cannot self-approve (token-locked d
 });
 
 // ──────────────────────────────────────────────────────────────────────
-// Drill: the operator session cookie is SameSite=Strict (R3 invariant).
+// Drill: the operator session cookie is SameSite=Lax (R3 invariant).
+// C1: Lax (not Strict) lets a cross-host Fleet "Open Console" top-level
+// navigation reuse a still-valid session without re-prompting; Lax still
+// withholds the cookie on cross-site POSTs, so the approval-decision route
+// stays CSRF-safe (the token lock proven separately above is the teeth).
 // ──────────────────────────────────────────────────────────────────────
 
-describe("Item B drill — session cookie is SameSite=Strict", () => {
+describe("Item B drill — session cookie is SameSite=Lax", () => {
   let h: FoldedBoardHarness;
 
   afterEach(async () => {
     if (h) await h.stop();
   });
 
-  it("POST /auth/session mints a SameSite=Strict session cookie", async () => {
+  it("POST /auth/session mints a SameSite=Lax session cookie", async () => {
     h = await makeHarness("default");
     const res = await fetch(`http://127.0.0.1:${h.port}/auth/session`, {
       method: "POST",
@@ -715,6 +722,7 @@ describe("Item B drill — session cookie is SameSite=Strict", () => {
     const setCookie = res.headers.get("set-cookie");
     expect(setCookie).toBeTruthy();
     expect(setCookie).toContain("sanctuary_session=");
-    expect(setCookie).toContain("SameSite=Strict");
+    expect(setCookie).toContain("SameSite=Lax");
+    expect(setCookie).not.toContain("SameSite=Strict");
   });
 });

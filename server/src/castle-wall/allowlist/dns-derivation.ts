@@ -20,7 +20,13 @@
  *
  * This module is pure (resolvers are passed in) so it is unit-testable without
  * touching the host's real resolver configuration. The daemon supplies
- * `dns.getServers()` (verified to match `scutil --dns` nameservers on macOS).
+ * `collectSystemResolvers()` (runtime/system-resolvers.ts): on macOS that is
+ * a FRESH `scutil --dns` nameserver read (EMPTY on failure -- fail closed),
+ * because a long-lived daemon's `getServers()` is a process-lifetime snapshot
+ * and the resolv.conf view misses configd's scoped resolvers (the 2026-07-12
+ * drill bug: a boot-started daemon's snapshot predates Tailscale MagicDNS
+ * becoming the system resolver, so the derived rule misses 100.100.100.100
+ * and the agent's DNS is default-denied).
  */
 
 import type { AllowlistRule, RuleScope } from "./schema.js";
@@ -61,30 +67,40 @@ export function normalizeResolvers(servers: readonly unknown[]): string[] {
   return out;
 }
 
-/** True iff a scope means "all wrapped agents" (no agent_ids and no template_ids). */
+/**
+ * True iff a scope means "all wrapped agents" (no agent_ids, no template_ids,
+ * and no uids -- S5-0, 2026-07-14: a `uids`-only scope, e.g. a gate-uid-scoped
+ * hostname rule, is JUST as much a restriction as agent_ids/template_ids and
+ * must not be treated as "all", or the DNS-derived companion rule below would
+ * silently widen a gate-only hostname allow into an agent-reachable one).
+ */
 function scopeIsAll(scope: RuleScope): boolean {
   const hasAgents = (scope.agent_ids?.length ?? 0) > 0;
   const hasTemplates = (scope.template_ids?.length ?? 0) > 0;
-  return !hasAgents && !hasTemplates;
+  const hasUids = (scope.uids?.length ?? 0) > 0;
+  return !hasAgents && !hasTemplates && !hasUids;
 }
 
 /**
  * The derived DNS rule must apply to exactly the agents that hold a hostname
  * rule. If ANY parent hostname rule is unscoped (all agents), the derived rule
  * is unscoped too (those agents all need to resolve). Otherwise the derived
- * scope is the union of the parents' agent_ids / template_ids.
+ * scope is the union of the parents' agent_ids / template_ids / uids.
  */
 function unionScope(scopes: readonly RuleScope[]): RuleScope {
   if (scopes.some(scopeIsAll)) return {};
   const agentIds = new Set<string>();
   const templateIds = new Set<string>();
+  const uids = new Set<number>();
   for (const scope of scopes) {
     for (const id of scope.agent_ids ?? []) agentIds.add(id);
     for (const id of scope.template_ids ?? []) templateIds.add(id);
+    for (const uid of scope.uids ?? []) uids.add(uid);
   }
   const result: RuleScope = {};
   if (agentIds.size > 0) result.agent_ids = [...agentIds].sort();
   if (templateIds.size > 0) result.template_ids = [...templateIds].sort();
+  if (uids.size > 0) result.uids = [...uids].sort((a, b) => a - b);
   return result;
 }
 

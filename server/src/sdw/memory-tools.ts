@@ -59,6 +59,22 @@ export interface SdwMemoryToolsOptions {
   /** The shipped sovereign passage backend, already scoped to one owner_ref. */
   readonly adapter: MemoryBackendAdapter;
   readonly auditLog: AuditLog;
+  /**
+   * Resolver for the CALLING wrapped-agent identity (the router's
+   * `currentAgentId`). The single `adapter` here is bound to ONE shared
+   * `fleet-self` owner scope reused for every caller (index.ts), so SDW memory
+   * has NO per-agent custody isolation yet: a second distinct wrapped-agent
+   * identity would read and write the SAME passages (cross-agent
+   * contamination). This resolver lets the multi-agent isolation guard pin the
+   * single identity that the shared scope is bound to and REFUSE any second,
+   * distinct identity until real per-agent isolation (deriving owner_ref from
+   * the caller) lands. Omit it (or resolve a stable single value / a stable
+   * `undefined`) and the guard is a strict NO-OP for single-coordinator use.
+   *
+   * Fail-closed posture: this only ever ADDS a refusal. It never widens,
+   * relaxes, or changes existing single-agent behavior.
+   */
+  readonly ownerIdentity?: () => string | undefined;
 }
 
 /** Full body view, reserved for explicit single-passage retrieval. */
@@ -147,8 +163,64 @@ export function memoryInsertApprovalArgs(
   return projected;
 }
 
+/**
+ * Audit `denial_class` recorded when the multi-agent isolation guard refuses.
+ * The TYPED reason goes to the audit log only; the caller-facing response is
+ * the fixed denial, which leaks no scope detail (no owner_ref, no observed
+ * identities, no bound identity). This is the placeholder until real
+ * per-agent isolation (deriving owner_ref from the caller) lands.
+ */
+export const SDW_MEMORY_MULTI_AGENT_DENIAL_CLASS =
+  "sdw_memory_multi_agent_isolation_required" as const;
+
+/**
+ * Build the fail-closed multi-agent isolation guard.
+ *
+ * The single `adapter` is bound to ONE shared `fleet-self` owner scope reused
+ * for every caller (index.ts), so SDW memory has no per-agent custody
+ * isolation yet. This guard pins the FIRST observed wrapped-agent identity that
+ * the shared scope serves and REFUSES any later call from a DIFFERENT identity,
+ * so a second agent can never read or write the first agent's passages over the
+ * shared scope.
+ *
+ * Strictly additive + fail-closed:
+ * - No `ownerIdentity` resolver -> no second identity can ever be observed ->
+ *   the guard is a strict NO-OP (existing single-agent behavior unchanged).
+ * - A single coordinator resolves a stable value (or a stable `undefined`);
+ *   the bound identity is pinned once and every call matches it -> NO-OP.
+ * - Any call whose resolved identity differs from the pinned one is REFUSED.
+ *   The pin is NOT advanced to the new identity, so the guard cannot be walked
+ *   forward by alternating callers; the shared scope stays bound to whoever
+ *   touched it first.
+ *
+ * `undefined` is treated as a concrete identity value (the "no wrapped-agent
+ * id configured" caller). Mixing a concrete id with `undefined` is therefore
+ * two distinct identities and is refused - a configured agent must not share
+ * the unconfigured coordinator's scope.
+ */
+function createMultiAgentIsolationGuard(
+  ownerIdentity: (() => string | undefined) | undefined,
+): (operation: string) => { allowed: true } | { allowed: false } {
+  // Sentinel so we can distinguish "never observed an identity" from "observed
+  // `undefined`" without conflating the two.
+  let bound: { value: string | undefined } | null = null;
+  return (_operation: string) => {
+    if (ownerIdentity === undefined) {
+      // No resolver wired: a second identity can never be observed. NO-OP.
+      return { allowed: true };
+    }
+    const observed = ownerIdentity();
+    if (bound === null) {
+      bound = { value: observed };
+      return { allowed: true };
+    }
+    return bound.value === observed ? { allowed: true } : { allowed: false };
+  };
+}
+
 export function createSdwMemoryTools(options: SdwMemoryToolsOptions): ToolDefinition[] {
   const { adapter, auditLog } = options;
+  const isolationGuard = createMultiAgentIsolationGuard(options.ownerIdentity);
 
   const auditFailure = (operation: string, details: Record<string, unknown>): Promise<void> =>
     auditLog.appendCritical({
@@ -170,6 +242,24 @@ export function createSdwMemoryTools(options: SdwMemoryToolsOptions): ToolDefini
 
   const deny = (operation: string) =>
     toolResult(fixedDenial(`audit:${operation}`, "request_review", null));
+
+  /**
+   * Fail-closed multi-agent isolation gate, run at the top of every SDW memory
+   * handler (insert / get / search / list / count / delete) BEFORE any adapter
+   * touch. Returns the fixed denial when a second, distinct wrapped-agent
+   * identity would reach the shared `fleet-self` scope; returns null (proceed)
+   * for single-agent use. The typed reason is audit-only; the response is the
+   * fixed denial, so no scope detail leaks.
+   */
+  const isolationDenialOrNull = async (
+    operation: string,
+  ): Promise<ReturnType<typeof deny> | null> => {
+    if (isolationGuard(operation).allowed) return null;
+    await auditFailure(`${operation}_denied`, {
+      denial_class: SDW_MEMORY_MULTI_AGENT_DENIAL_CLASS,
+    });
+    return deny(operation);
+  };
 
   // -- memory_insert (write - inherits the SDW secret write-gate) --------------
   const memoryInsert: ToolDefinition = {
@@ -207,6 +297,8 @@ export function createSdwMemoryTools(options: SdwMemoryToolsOptions): ToolDefini
       required: ["text", "taint"],
     },
     handler: async (args) => {
+      const isolationDenied = await isolationDenialOrNull("memory_insert");
+      if (isolationDenied) return isolationDenied;
       const text = args.text;
       const taint = asTaint(args.taint);
       const tags = asStringArray(args.tags);
@@ -287,6 +379,8 @@ export function createSdwMemoryTools(options: SdwMemoryToolsOptions): ToolDefini
       required: ["passage_id"],
     },
     handler: async (args) => {
+      const isolationDenied = await isolationDenialOrNull("memory_get");
+      if (isolationDenied) return isolationDenied;
       const passageId = args.passage_id;
       if (typeof passageId !== "string" || passageId.length === 0) {
         await auditFailure("memory_get_denied", { denial_class: "invalid_passage_id" });
@@ -327,6 +421,8 @@ export function createSdwMemoryTools(options: SdwMemoryToolsOptions): ToolDefini
       required: ["text"],
     },
     handler: async (args) => {
+      const isolationDenied = await isolationDenialOrNull("memory_search");
+      if (isolationDenied) return isolationDenied;
       const text = args.text;
       const tag = args.tag;
       const limit = asPositiveInt(args.limit);
@@ -379,6 +475,8 @@ export function createSdwMemoryTools(options: SdwMemoryToolsOptions): ToolDefini
       },
     },
     handler: async (args) => {
+      const isolationDenied = await isolationDenialOrNull("memory_list");
+      if (isolationDenied) return isolationDenied;
       const limit = asPositiveInt(args.limit);
       const after = args.after;
       if (Number.isNaN(limit)) {
@@ -415,6 +513,8 @@ export function createSdwMemoryTools(options: SdwMemoryToolsOptions): ToolDefini
     tool_class: "read",
     inputSchema: { type: "object", properties: {} },
     handler: async () => {
+      const isolationDenied = await isolationDenialOrNull("memory_count");
+      if (isolationDenied) return isolationDenied;
       try {
         const count = await adapter.countPassages();
         await auditSuccess("memory_count", { count });
@@ -444,6 +544,8 @@ export function createSdwMemoryTools(options: SdwMemoryToolsOptions): ToolDefini
       required: ["passage_id"],
     },
     handler: async (args) => {
+      const isolationDenied = await isolationDenialOrNull("memory_delete");
+      if (isolationDenied) return isolationDenied;
       const passageId = args.passage_id;
       if (typeof passageId !== "string" || passageId.length === 0) {
         await auditFailure("memory_delete_denied", { denial_class: "invalid_passage_id" });

@@ -32,14 +32,21 @@
 import { writeFile, readFile, mkdir, access, lstat } from "node:fs/promises";
 import { dirname, join, resolve as resolvePath } from "node:path";
 import { Writable } from "node:stream";
-import { platform } from "node:os";
+import { platform, homedir } from "node:os";
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
+import { get as httpsGet } from "node:https";
+import { get as httpGet } from "node:http";
+import { outboundUpdateChecksEnabled } from "../update-check.js";
 import {
   detectAgentConfigWithDiagnostics,
   backupConfig,
   saveWrapMeta,
+  hasExistingWrapMeta,
   findLatestBackup,
+  findNewerBackup,
+  listWrapMetaPointerSummaries,
+  removeWrapMeta,
   restoreConfig,
   rewriteConfigForWrap,
   getPlatformPaths,
@@ -47,6 +54,8 @@ import {
   writeFileSafeUnderRoot,
   unlinkSafeUnderRoot,
   WrapMetaValidationError,
+  WrapMetaUnreadableError,
+  type WrapMetaRemovalFailure,
   type AgentPlatform,
   type MCPServerEntry,
   type WrapMetaAuxiliaryFile,
@@ -60,6 +69,10 @@ import {
   type HermesYamlPlan,
 } from "./hermes-yaml.js";
 import {
+  assertHermesYamlParseParity,
+  HermesYamlParityRefusedError,
+} from "./hermes-yaml-parse-parity.js";
+import {
   getOrCreatePassphrase,
   persistUserProvidedPassphrase,
   isOsKeyringLocation,
@@ -67,6 +80,22 @@ import {
   PassphraseKeyringUnreachableError,
 } from "./passphrase.js";
 import { startDashboard, type DashboardHandle } from "../dashboard/index.js";
+import { buildWrapFleetRosterProvider } from "./fleet-roster-provider.js";
+import {
+  runAutoProvisionForWrap,
+  type AutoProvisionSummary,
+} from "./auto-provision.js";
+import type {
+  DisarmNePreferenceOutcome,
+  ProvisionFlowOutcome,
+} from "../castle-wall/provision/index.js";
+import { ProvisionLockHeldError } from "../castle-wall/provision/index.js";
+import { harnessDispositionSentence } from "../egress-gate/parked-claim.js";
+import {
+  EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE,
+  EGRESS_GATE_REPAIR_WITH_STAND_DOWN_COMMAND,
+  EGRESS_GATE_STAND_DOWN_EFFECT,
+} from "../egress-gate/operator-advice.js";
 import {
   buildV11Bindings,
   fortressIdFromStoragePath,
@@ -82,8 +111,44 @@ import {
   establishWrapCustody,
   type WrapCustodyResult,
 } from "./custody-flow.js";
-import { AuditLog } from "../operational/audit-log.js";
+import {
+  AuditLog,
+  type AuditEntry,
+  type AuditIntegrityFinding,
+} from "../operational/audit-log.js";
+import {
+  createDaemonAuditLog,
+  resolveDaemonStorePresence,
+  verifyFortressAuditFullPicture,
+} from "../operational/audit-store-split.js";
+import type { FeatureHealthAuditReader } from "../principal-policy/feature-health.js";
+import {
+  DEFAULT_ENFORCEMENT_FRESHNESS_MS,
+  type ExclusiveEgressStatus,
+} from "../principal-policy/posture.js";
+import {
+  protectionObservationFromFeatureHealth,
+  protectionStateAdvice,
+  protectionStateClaimFromObservation,
+  type ProtectionFeatureBasis,
+  type ProtectionFeatureStatus,
+  type ProtectionClaimState,
+  type ProtectionStateClaim,
+  type ProtectionStateObservation,
+} from "../egress-gate/protection-claim.js";
+import {
+  CASTLE_WALL_AUDIT_LAYER,
+  CASTLE_WALL_AUDIT_PROVENANCE_KEY,
+  CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
+  CASTLE_WALL_HEARTBEAT_OPERATION,
+} from "../castle-wall/constants.js";
+import {
+  castleWallEvidenceMatchesProtectionSubject,
+  protectionSubjectForUid,
+  resolveProtectionSubjectFromFortressPath,
+} from "../castle-wall/subject-binding.js";
 import { SubstrateSelector } from "../intelligence/selector.js";
+import { installConsentGatedRedactor } from "../intelligence/privacy-tier2-redactor.js";
 import { SANCTUARY_VERSION } from "../config.js";
 import { recordWrappedHarnessRegistration } from "../workload-lifecycle/index.js";
 import {
@@ -104,6 +169,278 @@ import {
 } from "./recovery-key-disclosure.js";
 import type { UpstreamServer, SovereigntyProfile } from "../sovereignty-profile.js";
 import { runProvisionPin } from "../cli/castle-wall.js";
+
+type ProcessShutdownCleanup = () => void | Promise<void>;
+
+const processShutdownCleanups = new Set<ProcessShutdownCleanup>();
+let processShutdownListenersInstalled = false;
+let autoProvisionMutationInFlight = false;
+let autoProvisionSignalRefusedOnce = false;
+let autoProvisionPendingShutdownSignal: NodeJS.Signals | undefined;
+let pendingAutoProvisionWasExclusiveEgress = false;
+let processShutdownRequestedSignal: NodeJS.Signals | undefined;
+
+const AUTO_PROVISION_SIGNAL_RECOVERY_COMMAND =
+  "sudo sanctuary protect --hermes --provision-agent-account";
+
+function autoProvisionSignalRecoveryGuidance(input?: { exclusiveEgress?: boolean }): string {
+  const staleLockGuidance =
+    "The provision lock is released on forced exit; only an abrupt process death outside the exit path should leave it stranded, and recovery will report that separately.";
+  return input?.exclusiveEgress === true
+    ? `after checking the machine state, use the matching recovery command: ${AUTO_PROVISION_SIGNAL_RECOVERY_COMMAND} from an interactive terminal if account creation or re-home did not reach exclusive-egress gate generation; ${EGRESS_GATE_REPAIR_WITH_STAND_DOWN_COMMAND} if an exclusive-egress gate generation exists. ${staleLockGuidance}`
+    : `recover from an interactive terminal with: ${AUTO_PROVISION_SIGNAL_RECOVERY_COMMAND}. ${staleLockGuidance}`;
+}
+
+export function renderAutoProvisionSignalRefusal(
+  signal: NodeJS.Signals,
+  input?: { exclusiveEgress?: boolean },
+): string {
+  return (
+    `  WARNING: received ${signal} while account provisioning is mid-flight. ` +
+    "Exiting now could leave this machine half-provisioned, so this shutdown request will be honored after provisioning closes. " +
+    "Press Ctrl-C again (or send the signal again) to exit immediately anyway. " +
+    `If manual recovery is needed, ${autoProvisionSignalRecoveryGuidance(input)} ` +
+    "Before changing state, check whether Castle Wall is armed; only run 'sudo sanctuary castle-wall disable' if it is enforcing over a half-provisioned agent."
+  );
+}
+
+export function renderAutoProvisionForcedExitWarning(
+  signal: NodeJS.Signals,
+  input?: { exclusiveEgress?: boolean; firstSignal?: NodeJS.Signals },
+): string {
+  const repeatDescription =
+    input?.firstSignal !== undefined && input.firstSignal !== signal
+      ? `received ${signal} while account provisioning is still mid-flight after an earlier ${input.firstSignal}`
+      : `received ${signal} again while account provisioning is still mid-flight`;
+  return (
+    `  WARNING: ${repeatDescription}; exiting now. ` +
+    "Provisioning was interrupted mid-flight, no rollback was attempted, and the machine may be in a partial state. " +
+    "Some shutdown records may be missing, Castle Wall teardown did not run, and a provision lock can remain only after an abrupt process death outside the exit path. " +
+    `${autoProvisionSignalRecoveryGuidance(input)} ` +
+    "Before changing state, check whether Castle Wall is armed; only run 'sudo sanctuary castle-wall disable' if it is enforcing over a half-provisioned agent."
+  );
+}
+
+export function __setAutoProvisionMutationInFlightForTest(input: {
+  inFlight: boolean;
+  refusedOnce?: boolean;
+  pendingShutdownSignal?: NodeJS.Signals;
+}): void {
+  assertWrapCliTestHookAllowed("__setAutoProvisionMutationInFlightForTest");
+  autoProvisionMutationInFlight = input.inFlight;
+  autoProvisionSignalRefusedOnce = input.refusedOnce ?? false;
+  autoProvisionPendingShutdownSignal = input.pendingShutdownSignal;
+  pendingAutoProvisionWasExclusiveEgress = false;
+}
+
+export function __resetProcessShutdownStateForTest(): void {
+  assertWrapCliTestHookAllowed("__resetProcessShutdownStateForTest");
+  autoProvisionMutationInFlight = false;
+  autoProvisionSignalRefusedOnce = false;
+  autoProvisionPendingShutdownSignal = undefined;
+  pendingAutoProvisionWasExclusiveEgress = false;
+  processShutdownInFlight = undefined;
+  processShutdownRequestedSignal = undefined;
+  processShutdownRepeatSignalCount = 0;
+  processShutdownExitIssued = false;
+  processShutdownCleanups.clear();
+  process.removeListener("SIGINT", handleProcessShutdownSignal);
+  process.removeListener("SIGTERM", handleProcessShutdownSignal);
+  process.removeListener("exit", runProcessShutdownCleanups);
+  processShutdownListenersInstalled = false;
+}
+
+export function __processShutdownCleanupCountForTest(): number {
+  assertWrapCliTestHookAllowed("__processShutdownCleanupCountForTest");
+  return processShutdownCleanups.size;
+}
+
+function assertWrapCliTestHookAllowed(name: string): void {
+  if (process.env.NODE_ENV === "test" || process.env.VITEST !== undefined) return;
+  throw new Error(`${name} is test-only and is disabled outside the test runner.`);
+}
+
+// FIX (N1-1 corrected, 2026-07-27): every registered cleanup starts an async
+// operation (Castle Wall daemon teardown, tenant-runtime unlink, audit-log
+// flush) rather than awaiting it -- `process.exit()` right after firing them
+// synchronously abandons every promise past its first `await`, so a `kill
+// <pid>` still lost the graceful-shutdown audit checkpoint, the
+// `filter_stopped` close record, and the tenant-runtime unlink even though
+// the process itself now exits. Await every cleanup to completion (via
+// `Promise.allSettled` so one failing cleanup cannot block the others)
+// before returning.
+//
+// FIX (harden-loop, late-registration drop): a single snapshot-clear-drain
+// pass silently abandoned any cleanup registered by `registerProcessShutdown
+// Cleanup` DURING the drain -- nothing here stops `runWrap`'s main flow
+// (there is no "shutting down" flag it checks), so it keeps running in the
+// same await window as this function's `Promise.allSettled`, and can
+// register a brand-new cleanup (e.g. the tenant-runtime unlink registered
+// right after `writeTenantRuntime` resolves) into the Set this function
+// already cleared. That cleanup then sits unawaited: `process.exit()` runs
+// once THIS call returns, and the only other place that would ever run it,
+// `process.on("exit", runProcessShutdownCleanups)`, cannot do async work
+// (Node tears down synchronously once `exit` listeners return), so it is
+// abandoned at its first `await`. Loop until the set is observed empty so
+// any cleanup registered while a previous batch was draining gets picked up
+// by the next iteration instead of orphaned.
+async function runProcessShutdownCleanups(): Promise<void> {
+  while (processShutdownCleanups.size > 0) {
+    const cleanups = [...processShutdownCleanups];
+    processShutdownCleanups.clear();
+    await Promise.allSettled(
+      cleanups.map(async (cleanup) => {
+        await cleanup();
+      }),
+    );
+  }
+}
+
+// FIX (N1-1, 2026-07-26): SIGINT/SIGTERM handlers that only run cleanups
+// disable Node's default termination behavior for that signal -- installing
+// ANY listener suppresses the runtime's built-in "exit on signal" action, so
+// `sanctuary protect` survived a plain `kill` and drills needed `kill -9`
+// (drill record 2026-07-26). Exit explicitly with the conventional
+// 128+signal code after cleanups complete. The `exit` listener is a
+// different event (fired during an already-in-progress shutdown) and must
+// keep running cleanups only -- calling `process.exit()` from inside an
+// `exit` handler has no effect and would be misleading to leave in.
+const SIGNAL_EXIT_CODE: Partial<Record<NodeJS.Signals, number>> = {
+  SIGINT: 128 + 2,
+  SIGTERM: 128 + 15,
+};
+
+// FIX (N1-1 second-signal, 2026-07-27): `process.on` (not `once`) means a
+// repeat SIGINT/SIGTERM re-enters this handler while the first call is
+// mid-await. Outside the provisioning mutation window, repeat signals join the
+// same cleanup promise so audit flush / Castle Wall teardown are not abandoned.
+let processShutdownInFlight: Promise<void> | undefined;
+let processShutdownRepeatSignalCount = 0;
+let processShutdownExitIssued = false;
+export const PROCESS_SHUTDOWN_REPEAT_SIGNAL_GRACE_MS = 1_000;
+
+function waitForProcessShutdownGrace(
+  promise: Promise<void>,
+  ms: number,
+): Promise<"settled" | "timeout"> {
+  return new Promise((resolve) => {
+    const timeout = setTimeout(() => resolve("timeout"), ms);
+    void promise.finally(() => {
+      clearTimeout(timeout);
+      resolve("settled");
+    });
+  });
+}
+
+export function installProcessShutdownListeners(): void {
+  if (processShutdownListenersInstalled) return;
+  processShutdownListenersInstalled = true;
+  process.on("SIGINT", handleProcessShutdownSignal);
+  process.on("SIGTERM", handleProcessShutdownSignal);
+  process.on("exit", runProcessShutdownCleanups);
+}
+
+async function runProcessShutdownForSignal(signal: NodeJS.Signals): Promise<void> {
+  if (processShutdownExitIssued) return;
+  processShutdownRequestedSignal ??= signal;
+  if (processShutdownInFlight) {
+    processShutdownRepeatSignalCount += 1;
+    const exitCode = SIGNAL_EXIT_CODE[processShutdownRequestedSignal] ?? 128;
+    if (processShutdownRepeatSignalCount >= 2) {
+      processShutdownExitIssued = true;
+      processShutdownRequestedSignal = undefined;
+      process.exit(exitCode);
+      return;
+    }
+    const result = await waitForProcessShutdownGrace(
+      processShutdownInFlight,
+      PROCESS_SHUTDOWN_REPEAT_SIGNAL_GRACE_MS,
+    );
+    if (result === "timeout" && !processShutdownExitIssued) {
+      processShutdownExitIssued = true;
+      processShutdownRequestedSignal = undefined;
+      process.exit(exitCode);
+    }
+    return;
+  }
+  processShutdownInFlight = runProcessShutdownCleanups();
+  try {
+    await processShutdownInFlight;
+  } finally {
+    processShutdownInFlight = undefined;
+    processShutdownRepeatSignalCount = 0;
+  }
+  if (processShutdownExitIssued) return;
+  processShutdownExitIssued = true;
+  process.exit(SIGNAL_EXIT_CODE[signal] ?? 128);
+}
+
+function closeAutoProvisionMutationWindow(): NodeJS.Signals | undefined {
+  autoProvisionMutationInFlight = false;
+  autoProvisionSignalRefusedOnce = false;
+  pendingAutoProvisionWasExclusiveEgress = false;
+  const deferredSignal = autoProvisionPendingShutdownSignal;
+  autoProvisionPendingShutdownSignal = undefined;
+  return deferredSignal;
+}
+
+function tryOpenAutoProvisionMutationWindow(options: WrapOptions): boolean {
+  if (processShutdownRequestedSignal !== undefined || processShutdownInFlight !== undefined) {
+    // SAFETY: stderr is the operator-facing CLI channel; this fixed text names
+    // only the lifecycle state and says no privileged provisioning mutation ran.
+    console.error(
+      `  Note: automatic account provisioning did not start because shutdown is already in flight ` +
+        `(${processShutdownRequestedSignal ?? "cleanup-drain"}). No account, re-home, or Castle Wall changes were made by provisioning.`,
+    );
+    return false;
+  }
+  autoProvisionMutationInFlight = true;
+  autoProvisionSignalRefusedOnce = false;
+  autoProvisionPendingShutdownSignal = undefined;
+  pendingAutoProvisionWasExclusiveEgress = options.exclusiveEgress === true;
+  return true;
+}
+
+/** Exported for the seam: unit-test the exit code without sending real signals. */
+export async function handleProcessShutdownSignal(
+  signal: NodeJS.Signals,
+): Promise<void> {
+  if (autoProvisionMutationInFlight) {
+    if (!autoProvisionSignalRefusedOnce) {
+      autoProvisionSignalRefusedOnce = true;
+      autoProvisionPendingShutdownSignal = signal;
+      // SAFETY: stderr is the operator-facing signal channel; this fixed text
+      // names only the signal and recovery command, never secrets.
+      console.error(renderAutoProvisionSignalRefusal(signal, {
+        exclusiveEgress: pendingAutoProvisionWasExclusiveEgress,
+      }));
+      return;
+    }
+    // SAFETY: stderr is the operator-facing signal channel; this fixed text
+    // names only the signal and recovery command, never secrets.
+    console.error(renderAutoProvisionForcedExitWarning(signal, {
+      exclusiveEgress: pendingAutoProvisionWasExclusiveEgress,
+      firstSignal: autoProvisionPendingShutdownSignal,
+    }));
+    const exitSignal = autoProvisionPendingShutdownSignal ?? signal;
+    autoProvisionPendingShutdownSignal = undefined;
+    processShutdownExitIssued = true;
+    process.exit(SIGNAL_EXIT_CODE[exitSignal] ?? 128);
+    return;
+  }
+  autoProvisionSignalRefusedOnce = false;
+  await runProcessShutdownForSignal(signal);
+}
+
+/** Exported for the seam: unit-test that a registered cleanup is awaited. */
+export function registerProcessShutdownCleanup(
+  cleanup: ProcessShutdownCleanup,
+): () => void {
+  processShutdownCleanups.add(cleanup);
+  return () => {
+    processShutdownCleanups.delete(cleanup);
+  };
+}
 
 // ── Types ───────────────────────────────────────────────────────────
 
@@ -141,6 +478,12 @@ export interface WrapOptions {
    * setups starting above 3510.
    */
   port?: number;
+  /**
+   * Persist the plaintext-remote dashboard opt-in into the wrapped harness
+   * environment. The approval channel still refuses by default unless this
+   * reaches the later MCP boot path.
+   */
+  allowPlaintextRemote?: boolean;
   /** Preview changes without writing. */
   dryRun?: boolean;
   /** Suppress auto-open of the browser. */
@@ -157,10 +500,11 @@ export interface WrapOptions {
   noDashboard?: boolean;
   /**
    * Dogfood path (`--dev-dist <path>`): point the harness MCP
-   * config entry at a local Sanctuary build instead of `npx
-   * @sanctuary-framework/mcp-server`. Without this, an unpublished branch
-   * (e.g. an in-flight PR) gets shadowed by the npm-resolved version
-   * because npx pulls from the registry, not from the local checkout.
+   * config entry at a local Sanctuary build instead of the
+   * version-pinned npx registry entry. Without this, an unpublished
+   * branch (e.g. an in-flight PR) gets shadowed by the npm-resolved
+   * version because npx pulls from the registry, not from the local
+   * checkout.
    *
    * Pass the absolute path to the build's `dist/cli.js`. The wrap CLI
    * registers `node <path>` as the `sanctuary` command. `--dev-dist`
@@ -188,6 +532,58 @@ export interface WrapOptions {
    * (exit 2) rather than silently continuing without anchoring.
    */
   anchorTransparency?: boolean;
+  /**
+   * Auto-provision Step 2 (Build 1): pre-answers the CHOICE of whether to
+   * provision a dedicated agent OS account, when `protect` detects the
+   * agent is running on a shared (operator) account. Fix L2: this pre-
+   * answers the choice ONLY -- the privileged mutation (create account,
+   * re-home, install daemon, arm) still prints its plan and, on a TTY,
+   * still asks its own single confirm. `--provision-agent-account` sets
+   * this true; `--no-provision-agent-account` sets it false (an explicit
+   * decline, skipping straight to "cooperative wrap only"). Unset (neither
+   * flag passed) leaves the interactive prompt as the sole decision point.
+   */
+  provisionAgentAccount?: boolean;
+  /**
+   * Unified Protect Slice 5 S5-6: provision in FINE-GRAINED (exclusive-
+   * egress) mode -- the agent's only sanctioned egress path becomes the
+   * loopback policy gate; the harness is PARK-installed and released only
+   * after the gate generation commits (the S5-5 release barrier). Requires
+   * `--hermes` + darwin. Off by default (the coarse drill-proven path).
+   */
+  exclusiveEgress?: boolean;
+  /**
+   * S5-6 repair verb: re-run the exclusive-egress bring-up + release barrier
+   * for an already-provisioned fine-grained agent (after a flush, gate
+   * crash, or degrade). Runs the MED-7 transient-pf-rule drift guard first
+   * and REFUSES when foreign (VPN/firewall) rules are present in the running
+   * ruleset, unless `--override-transient-pf-rules` is also passed on an
+   * interactive TTY. Does not wrap anything.
+   */
+  repairEgressGate?: boolean;
+  /**
+   * Required operator acknowledgement for the S5-6/S5-7 repair and unprotect
+   * verbs: the sequence stops/disables the agent harness and verifies launchd
+   * settled it stopped before continuing.
+   */
+  standDownAgent?: boolean;
+  /**
+   * Explicit, interactive-only override for the repair drift guard (design
+   * MED-7). TTY-only: refused on a non-interactive stdin. Audited
+   * (`egress_gate_repair_override`) before any pf mutation.
+   */
+  overrideTransientPfRules?: boolean;
+  /**
+   * S5-7 unprotect verb: per-agent exclusive-egress teardown via the locked
+   * registry (verified park -> generation recovery -> gate daemon down ->
+   * credential/oracle teardown -> policy surfaces off -> provisioned-rule
+   * scrub -> registry remove; every REMAINING confined uid's rules re-verified
+   * live; the anchor is flushed only when the LAST agent leaves). Fail-closed:
+   * any failure leaves remaining protection intact; idempotent re-run
+   * converges. Does not delete accounts, disarm the coarse wall, or wrap
+   * anything.
+   */
+  unprotectEgressGate?: boolean;
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
@@ -271,6 +667,12 @@ function buildSanctuaryEnv(options: WrapOptions): Record<string, string> {
   if (process.env.SANCTUARY_DASHBOARD_ENABLED) {
     sanctuaryEnv.SANCTUARY_DASHBOARD_ENABLED = process.env.SANCTUARY_DASHBOARD_ENABLED;
   }
+  if (options.allowPlaintextRemote) {
+    sanctuaryEnv.SANCTUARY_DASHBOARD_ALLOW_PLAINTEXT_REMOTE = "true";
+  } else if (process.env.SANCTUARY_DASHBOARD_ALLOW_PLAINTEXT_REMOTE) {
+    sanctuaryEnv.SANCTUARY_DASHBOARD_ALLOW_PLAINTEXT_REMOTE =
+      process.env.SANCTUARY_DASHBOARD_ALLOW_PLAINTEXT_REMOTE;
+  }
   if (options.fortress) {
     sanctuaryEnv.SANCTUARY_FORTRESS_PATH = resolvePath(options.fortress);
   } else if (process.env.SANCTUARY_FORTRESS_PATH) {
@@ -290,6 +692,20 @@ function buildSanctuaryEnv(options: WrapOptions): Record<string, string> {
  * (e.g. an in-flight PR) gets shadowed by the npm-resolved version
  * because npx pulls from the registry. Published-version wraps omit
  * the flag and use the npx default unchanged.
+ *
+ * Published-version form (v1.6.1 install-path hardening, F2): the entry
+ * is PINNED to the version of the server that performed the wrap and
+ * names the `sanctuary` bin explicitly via `-p <pkg>@<version> sanctuary`.
+ * Two failure modes of the previous bare
+ * `npx @sanctuary-framework/mcp-server` form drove this:
+ * 1. npm's multi-bin resolution could not pick an executable for the
+ *    bare package name (dead at spawn on npm >= 7 for v1.4.0..v1.6.0).
+ * 2. An unpinned entry re-resolves to `latest` at every cold npx run,
+ *    so what the operator approved at wrap time is silently swapped
+ *    for whatever the registry serves later (no version custody).
+ * `-y` keeps the non-interactive MCP spawn from wedging on the npx
+ * install prompt. Upgrades re-run `sanctuary protect`, which rewrites
+ * the pin to the new version.
  */
 function resolveSanctuaryCommand(options: WrapOptions): {
   command: string;
@@ -298,8 +714,22 @@ function resolveSanctuaryCommand(options: WrapOptions): {
   const useDevDist = options.devDist !== undefined;
   return {
     command: useDevDist ? "node" : "npx",
-    args: useDevDist ? [options.devDist!] : ["@sanctuary-framework/mcp-server"],
+    args: useDevDist
+      ? [options.devDist!]
+      : [
+          "-y",
+          "-p",
+          `@sanctuary-framework/mcp-server@${SANCTUARY_VERSION}`,
+          "sanctuary",
+        ],
   };
+}
+
+function resolveAutoProvisionCliBinary(options: WrapOptions): string | undefined {
+  const candidate = options.devDist ?? process.argv[1];
+  return candidate === undefined || candidate.length === 0
+    ? undefined
+    : resolvePath(candidate);
 }
 
 /**
@@ -348,6 +778,402 @@ export async function validateDevDist(devDist: string): Promise<void> {
   }
 }
 
+/**
+ * Outcome of the wrap-time pinned-version resolvability probe (2026-07-02
+ * install-path hardening).
+ *
+ *   - "resolvable":  the registry affirmatively serves the pinned version.
+ *   - "unpublished": the registry (as resolved at wrap time) is reachable
+ *                    and affirmatively does NOT have the pinned version -
+ *                    the MCP entry this wrap writes would be dead at spawn
+ *                    time, unless the harness's own spawn directory routes
+ *                    the scope to a different registry this probe cannot
+ *                    see. Advisory, never a hard block.
+ *   - "unreachable": the registry could not be consulted (offline, DNS,
+ *                    timeout), or resolution is indirected through config
+ *                    the probe cannot faithfully reproduce (a non-default
+ *                    registry that may hide packages from unauthenticated
+ *                    requests, or proxy-only egress) and the answer was
+ *                    not an affirmative 200. Honest-unknown, never treated
+ *                    as either of the affirmative outcomes.
+ *   - "skipped":     the probe is OFF. ZERO-OUTBOUND-BY-DEFAULT (2026-07-05):
+ *                    with neither env var set, this is the default outcome -
+ *                    this probe is the same registry-metadata class of egress
+ *                    as the update check, so it is gated by the same helper
+ *                    (`outboundUpdateChecksEnabled`). Opt in with
+ *                    SANCTUARY_UPDATE_CHECK=1. SANCTUARY_NO_UPDATE_CHECK=1 is
+ *                    a back-compat alias that also keeps this off.
+ */
+export type PinnedVersionResolvability =
+  | "resolvable"
+  | "unpublished"
+  | "unreachable"
+  | "skipped";
+
+/** The registry `npx` consults when nothing overrides it. */
+const DEFAULT_NPM_REGISTRY = "https://registry.npmjs.org";
+
+interface NormalizedRegistryUrl {
+  /** Registry base URL with trailing slashes and userinfo removed. */
+  base: string;
+  /** True when the source URL carried username/password userinfo. */
+  strippedCredentials: boolean;
+}
+
+/** Trim + validate an npm registry URL; strip trailing slashes and userinfo. */
+function normalizeRegistryUrl(
+  value: string | undefined,
+): NormalizedRegistryUrl | null {
+  const trimmed = value?.trim();
+  if (!trimmed) return null;
+  if (!trimmed.startsWith("https://") && !trimmed.startsWith("http://")) {
+    return null;
+  }
+  try {
+    const parsed = new URL(trimmed);
+    const strippedCredentials =
+      parsed.username !== "" || parsed.password !== "";
+    parsed.username = "";
+    parsed.password = "";
+    return {
+      base: parsed.toString().replace(/\/+$/, ""),
+      strippedCredentials,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** Lenient `.npmrc` scan for the two registry keys the probe cares about. */
+async function readNpmrcRegistryKeys(
+  npmrcPath: string,
+): Promise<{ scoped: string | null; registry: string | null }> {
+  let raw: string;
+  try {
+    raw = await readFile(npmrcPath, "utf-8");
+  } catch {
+    return { scoped: null, registry: null };
+  }
+  let scoped: string | null = null;
+  let registry: string | null = null;
+  for (const line of raw.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (trimmed === "" || trimmed.startsWith("#") || trimmed.startsWith(";")) {
+      continue;
+    }
+    const eq = trimmed.indexOf("=");
+    if (eq === -1) continue;
+    const key = trimmed.slice(0, eq).trim();
+    const value = trimmed.slice(eq + 1).trim();
+    // Last occurrence wins, matching npm's ini semantics: a first-wins scan
+    // here read the OLD value of a key that tooling later re-appended
+    // (`registry=` twice in one file), probed the wrong registry, and could
+    // re-create the false-affirmative "unpublished" dead-pin warning.
+    if (key === "@sanctuary-framework:registry") {
+      scoped = value;
+    } else if (key === "registry") {
+      registry = value;
+    }
+  }
+  return { scoped, registry };
+}
+
+/**
+ * Walk up from `cwd` to npm's PROJECT ROOT: the nearest directory (cwd
+ * included) containing `package.json` or `node_modules`, mirroring npm's
+ * localPrefix resolution. npm reads the project `.npmrc` at that root,
+ * not at the literal cwd, so a probe that read only `<cwd>/.npmrc` missed
+ * a repo-root registry override whenever the wrap ran from a subdirectory
+ * (a corporate mirror-only package then 404ed on the DEFAULT registry,
+ * resolved direct, and rendered the false-affirmative "unpublished"
+ * dead-pin warning npx disproves at spawn time - the same class the
+ * wrong-registry and duplicate-key fixes closed). Falls back to `cwd`
+ * itself when no marker exists on the walk, matching npm's default
+ * localPrefix. Never throws; an unreadable candidate just keeps the walk
+ * going.
+ */
+async function findNpmProjectRoot(cwd: string): Promise<string> {
+  let dir = resolvePath(cwd);
+  for (;;) {
+    for (const marker of ["package.json", "node_modules"]) {
+      try {
+        await access(join(dir, marker));
+        return dir;
+      } catch {
+        // Marker absent (or unreadable): keep walking up.
+      }
+    }
+    const parent = dirname(dir);
+    if (parent === dir) return resolvePath(cwd);
+    dir = parent;
+  }
+}
+
+/**
+ * Best-effort path of npm's GLOBAL config file (`$PREFIX/etc/npmrc`, the
+ * file `npm config set --location=global registry=...` writes). Mirrors
+ * npm's own derivation approximately: an explicit globalconfig override in
+ * the npm config env wins, then a prefix override, then node's install
+ * prefix (the executable's grandparent directory on POSIX, its directory
+ * on Windows). Never throws; the caller treats an absent/unreadable file
+ * as "no keys", so an imprecise path only degrades to the pre-fix
+ * behavior.
+ */
+function defaultGlobalNpmrcPath(env: NodeJS.ProcessEnv): string {
+  const explicit = env.npm_config_globalconfig ?? env.NPM_CONFIG_GLOBALCONFIG;
+  if (typeof explicit === "string" && explicit.trim() !== "") {
+    return explicit.trim();
+  }
+  const prefixOverride =
+    env.npm_config_prefix ?? env.NPM_CONFIG_PREFIX ?? env.PREFIX;
+  const prefix =
+    typeof prefixOverride === "string" && prefixOverride.trim() !== ""
+      ? prefixOverride.trim()
+      : platform() === "win32"
+        ? dirname(process.execPath)
+        : resolvePath(process.execPath, "..", "..");
+  return join(prefix, "etc", "npmrc");
+}
+
+/**
+ * Best-effort, WRAP-TIME approximation of the npm registry the
+ * wrap-written `npx` entry will consult at spawn time (2026-07-02 fix
+ * round). The probe previously hard-coded the public registry, so in a
+ * private-mirror / corporate environment (registry override in `.npmrc`
+ * or the npm config env) it asked the WRONG registry and rendered a false
+ * dead-pin warning for an entry npx would start fine.
+ *
+ * Honesty limit: this resolves from the wrap process's OWN env and cwd.
+ * The harness spawns the MCP entry later, possibly from a different
+ * working directory whose project `.npmrc` this probe cannot see (e.g. a
+ * scope override pointing at a private mirror). A direct-default result
+ * here therefore does NOT guarantee spawn-time resolution also hits the
+ * default registry; callers must keep the resulting "unpublished" verdict
+ * advisory, never a hard block.
+ *
+ * Mirrors npm's per-key precedence approximately: the package-scope key
+ * (`@sanctuary-framework:registry`) beats the plain `registry` key, and
+ * within each key the env override beats the project `.npmrc` beats the
+ * user `~/.npmrc` beats npm's GLOBAL npmrc (`$PREFIX/etc/npmrc`, resolved
+ * by defaultGlobalNpmrcPath - a mirror configured only via `npm config
+ * set --location=global` previously resolved default+direct and rendered
+ * the same false-affirmative "unpublished" warning the other levels'
+ * fixes closed); duplicate keys within one file are last-wins, matching
+ * npm's ini semantics. The project `.npmrc` is read at the PROJECT ROOT
+ * (findNpmProjectRoot's upward walk from cwd), matching where npm reads
+ * it - the literal cwd alone missed a repo-root override when the wrap
+ * ran from a subdirectory. Never throws; a winning override this probe cannot
+ * interpret (npm env-var expansion like `registry=${NPM_MIRROR}`, or a
+ * non-http(s) value) falls back to the public default marked `indirect`,
+ * so a 404 stays honest-unknown instead of the affirmative "unpublished".
+ *
+ * `indirect` is true when resolution goes through machinery this bare
+ * node:http(s) probe cannot faithfully reproduce - a non-default registry
+ * (which may require auth npx has and the probe deliberately never sends)
+ * or proxy egress (npx honors HTTPS_PROXY/HTTP_PROXY; node:https does not).
+ * The caller then treats a 404 as honest-unknown instead of affirmative.
+ *
+ * `seams` (env/cwd/home/globalNpmrcPath) exist for tests; production
+ * callers pass nothing. `globalNpmrcPath: null` means "no global npmrc"
+ * (keeps hermetic tests off the host's real `$PREFIX/etc/npmrc`).
+ */
+export async function resolveNpmRegistryForProbe(
+  seams: {
+    env?: NodeJS.ProcessEnv;
+    cwd?: string;
+    home?: string;
+    globalNpmrcPath?: string | null;
+  } = {},
+): Promise<{ base: string; indirect: boolean }> {
+  const env = seams.env ?? process.env;
+  // Guard the cwd lookup: process.cwd() THROWS (uv_cwd ENOENT) when the
+  // wrap runs from a deleted directory (removed worktree, cleaned tmp
+  // dir). This probe's contract is never-throws / never-blocks-the-wrap,
+  // so an unresolvable cwd degrades to user-level config only (same
+  // semantics as an absent project .npmrc) instead of crashing the wrap.
+  let cwd: string | undefined = seams.cwd;
+  if (cwd === undefined) {
+    try {
+      cwd = process.cwd();
+    } catch {
+      cwd = undefined;
+    }
+  }
+  const globalNpmrcPath =
+    seams.globalNpmrcPath !== undefined
+      ? seams.globalNpmrcPath
+      : defaultGlobalNpmrcPath(env);
+  const files = [
+    cwd !== undefined
+      ? await readNpmrcRegistryKeys(
+          join(await findNpmProjectRoot(cwd), ".npmrc"),
+        )
+      : { scoped: null as string | null, registry: null as string | null },
+    await readNpmrcRegistryKeys(join(seams.home ?? homedir(), ".npmrc")),
+    globalNpmrcPath !== null
+      ? await readNpmrcRegistryKeys(globalNpmrcPath)
+      : { scoped: null as string | null, registry: null as string | null },
+  ];
+  // Per-key precedence: first PRESENT raw value wins (env beats project
+  // .npmrc beats user ~/.npmrc), and only then is the winner normalized.
+  // Normalizing each candidate and taking the first that PARSED silently
+  // skipped a higher-precedence override this probe cannot faithfully
+  // reproduce (npm env-var expansion like `registry=${NPM_MIRROR}`) and
+  // fell back to default+direct, where a 404 reads as the affirmative
+  // "unpublished". A present-but-unnormalizable winner now resolves to the
+  // default registry marked `indirect`, so a 404 stays honest-unknown.
+  const firstPresent = (
+    ...candidates: Array<string | null | undefined>
+  ): string | null => {
+    for (const candidate of candidates) {
+      if (typeof candidate === "string" && candidate.trim() !== "") {
+        return candidate;
+      }
+    }
+    return null;
+  };
+  const scopedRaw = firstPresent(
+    env["npm_config_@sanctuary-framework:registry"],
+    files[0].scoped,
+    files[1].scoped,
+    files[2].scoped,
+  );
+  const plainRaw = firstPresent(
+    env.npm_config_registry,
+    env.NPM_CONFIG_REGISTRY,
+    files[0].registry,
+    files[1].registry,
+    files[2].registry,
+  );
+  const winningRaw = scopedRaw ?? plainRaw;
+  const normalized = normalizeRegistryUrl(winningRaw ?? undefined);
+  const unresolvableOverride = winningRaw !== null && normalized === null;
+  const base = normalized?.base ?? DEFAULT_NPM_REGISTRY;
+  const credentialedOverride = normalized?.strippedCredentials === true;
+  const proxied = [
+    "HTTPS_PROXY",
+    "https_proxy",
+    "HTTP_PROXY",
+    "http_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+  ].some((key) => {
+    const value = env[key];
+    return typeof value === "string" && value.trim() !== "";
+  });
+  return {
+    base,
+    indirect:
+      proxied ||
+      unresolvableOverride ||
+      credentialedOverride ||
+      base !== DEFAULT_NPM_REGISTRY,
+  };
+}
+
+/**
+ * Wrap-time check that the version-pinned MCP entry
+ * (`-p @sanctuary-framework/mcp-server@<version> sanctuary`) actually
+ * resolves on the npm registry (2026-07-02 hardening): an unpublished pin
+ * - e.g. a wrap run from a not-yet-published release build without
+ * `--dev-dist` - writes a dead MCP entry behind a success banner, and the
+ * harness only discovers it at spawn time.
+ *
+ * Fail HONEST, not fail-open and not fail-closed: the caller never blocks
+ * the wrap on this probe (an unreachable registry must not take wrap
+ * availability down), but it downgrades the success claim with an explicit
+ * warning on "unpublished" and an honest could-not-verify note on
+ * "unreachable". Never throws.
+ *
+ * 2026-07-02 fix round (registry-config honesty): the probe consults the
+ * registry npx will most likely use, resolved at WRAP time
+ * (resolveNpmRegistryForProbe: npm config env, project/user/global npmrc;
+ * the harness's spawn-time cwd can differ, so even an affirmative
+ * "unpublished" stays advisory), and when resolution is `indirect` (non-default
+ * registry, which may hide packages from this deliberately unauthenticated
+ * probe, or proxy-only egress the bare GET does not traverse) a 404 is NOT
+ * affirmative: it maps to "unreachable" (honest could-not-verify) instead
+ * of the loud "unpublished" dead-pin warning. Only the public default
+ * registry, consulted directly, can affirm "unpublished". No credential is
+ * ever attached to the probe request.
+ *
+ * `registryBaseUrl` / `timeoutMs` are test seams; production callers use
+ * the defaults. An explicit `registryBaseUrl` is treated as authoritative
+ * (404 stays affirmative), preserving the seam's stub-registry semantics.
+ */
+export async function checkPinnedVersionResolvable(
+  version: string,
+  opts: { registryBaseUrl?: string; timeoutMs?: number } = {},
+): Promise<PinnedVersionResolvability> {
+  if (!outboundUpdateChecksEnabled()) return "skipped";
+  let base: string;
+  let notFoundIsAffirmative: boolean;
+  if (opts.registryBaseUrl !== undefined) {
+    base = opts.registryBaseUrl;
+    notFoundIsAffirmative = true;
+  } else {
+    const resolved = await resolveNpmRegistryForProbe();
+    base = resolved.base;
+    notFoundIsAffirmative = !resolved.indirect;
+  }
+  const timeoutMs = opts.timeoutMs ?? 3000;
+  const url = `${base}/@sanctuary-framework/mcp-server/${encodeURIComponent(version)}`;
+  const getFn = base.startsWith("http://") ? httpGet : httpsGet;
+  return new Promise((resolve) => {
+    // 2026-07-02 hardening (round 14): `timeout` on the request options
+    // below is a socket INACTIVITY timer (Node resets it on every byte
+    // received), not a wall-clock deadline. A responder that dribbles the
+    // HTTP status line slowly enough to keep beating that timer - a
+    // tarpit, a misbehaving proxy, an attacker on the network path - would
+    // otherwise stall this probe indefinitely, contradicting the "never
+    // blocks the wrap" contract this function documents. `deadline` is the
+    // hard wall-clock cap: it fires exactly once, destroys the in-flight
+    // request, and resolves "unreachable" regardless of subsequent socket
+    // activity. `settled` guards against a double-resolve if the deadline
+    // and a request event race.
+    let settled = false;
+    const settle = (result: PinnedVersionResolvability) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(deadline);
+      resolve(result);
+    };
+    const deadline = setTimeout(() => {
+      req?.destroy();
+      settle("unreachable");
+    }, timeoutMs);
+    let req: ReturnType<typeof httpGet> | undefined;
+    try {
+      req = getFn(
+        url,
+        { headers: { Accept: "application/json" }, timeout: timeoutMs },
+        (res) => {
+          // Only the response STATUS is consulted. Destroy the request
+          // (not just res.resume()-drain) before settling: a drained-but-
+          // open socket still has Node's per-byte inactivity timer backing
+          // it, so a tarpit that dribbles the body one byte at a time
+          // forever keeps that socket - and the event loop - alive even
+          // after this promise has resolved. req.destroy() releases the
+          // handle outright so a slow/hostile body can't outlive the
+          // decision that already stopped needing it.
+          req?.destroy();
+          if (res.statusCode === 200) settle("resolvable");
+          else if (res.statusCode === 404)
+            settle(notFoundIsAffirmative ? "unpublished" : "unreachable");
+          else settle("unreachable");
+        },
+      );
+      req.on("error", () => settle("unreachable"));
+      req.on("timeout", () => {
+        req?.destroy();
+        settle("unreachable");
+      });
+    } catch {
+      settle("unreachable");
+    }
+  });
+}
+
 /** Operator-facing one-liner for what the YAML injection did / would do. */
 function formatHermesYamlAction(plan: HermesYamlPlan, yamlPath: string): string {
   const preserved =
@@ -369,6 +1195,20 @@ function formatHermesYamlAction(plan: HermesYamlPlan, yamlPath: string): string 
 }
 
 /**
+ * Read-only existence probe. Returns true if `path` is reachable, false on
+ * any error (absent, permission, etc.). Used to decide first-run messaging;
+ * never mutates the filesystem.
+ */
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    await access(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * D4 staging, Bugs 1+2: dry-run preview of the Hermes config.yaml
  * injection. Read-only by construction (planHermesYamlInjection is pure;
  * the only filesystem touch is the readFile probe), and previews the
@@ -386,6 +1226,13 @@ async function reportHermesYamlDryRun(options: WrapOptions): Promise<void> {
   const sanctuaryEnv = buildSanctuaryEnv(options);
   const { command, args } = resolveSanctuaryCommand(options);
   try {
+    // Preview the parse-parity guard too: a dry run should report that the
+    // real run would refuse (disagreement or PyYAML-unavailable) rather than
+    // previewing an edit that would not actually happen. Production uses the
+    // real sidecar, resolving the python interpreter by PyYAML importability
+    // across a CODE-CONTROLLED candidate list (no caller or env input); the
+    // __hermesParityTestHook DI seam is test-only and stays non-injectable.
+    await assertHermesYamlParseParity(existingYaml, __hermesParityTestHook.parity);
     const plan = planHermesYamlInjection(existingYaml, {
       command,
       args,
@@ -396,7 +1243,10 @@ async function reportHermesYamlDryRun(options: WrapOptions): Promise<void> {
       `  Hermes MCP routing: would ${formatHermesYamlAction(plan, yamlPath)}`
     );
   } catch (err) {
-    if (err instanceof HermesYamlUnsupportedError) {
+    if (
+      err instanceof HermesYamlUnsupportedError ||
+      err instanceof HermesYamlParityRefusedError
+    ) {
       // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
       console.error(
         `  Hermes MCP routing: wrap would FAIL before modifying anything: ${err.message}`
@@ -463,7 +1313,1263 @@ export type DashboardStarter = (opts: {
 
 // ── Main: wrap ──────────────────────────────────────────────────────
 
+/**
+ * Wrap protection-state observation. The coarse evidence helper reads the
+ * dashboard's adjudicated-flow standard for the exclusive-egress producer.
+ * The banner-facing path then requires the producer's capped verdict and
+ * returns a branded ProtectionStateClaim; a missing or throwing provider
+ * fails closed to unknown, never green.
+ *
+ * Known bounded staleness: the feature-health panel treats fresh
+ * Castle-Wall-originated adjudicated-flow evidence as current for its bounded
+ * freshness window (10 minutes today). A later `wall_disarmed` /
+ * `filter_stopped` / `arm_lease_revoked` entry now demotes that evidence, and
+ * the banner requires an observed current-wrap daemon heartbeat before it lets
+ * a probe render green. Residual bound: adjudicated-flow evidence and daemon
+ * liveness are still bounded-window observations, not proof of the exact
+ * packet-filter state at the print instant.
+ */
+type CastleWallFeatureProbeInput =
+  | { purpose: "coarse-wall" }
+  | {
+      purpose: "protection-claim";
+      exclusiveEgress: ExclusiveEgressStatus | null;
+      protectionClaimSubject: string | null;
+    };
+
+type CastleWallFeatureProbeResult = {
+  status: ProtectionFeatureStatus | undefined;
+  basis: ProtectionFeatureBasis | undefined;
+};
+
+type AuditQueryResult = Awaited<ReturnType<FeatureHealthAuditReader["query"]>>;
+
+interface WrapAuditEvidenceReader extends FeatureHealthAuditReader {
+  runEagerReads<T>(fn: () => Promise<T>): Promise<T>;
+  incompleteEvidenceReasons?: readonly string[];
+}
+
+function protectionSubjectFromAutoProvisionSummary(
+  summary: AutoProvisionSummary,
+  fortressId: string,
+): string | null {
+  const outcome = summary.outcome;
+  if (outcome === undefined || !("uid" in outcome)) return null;
+  return protectionSubjectForUid(fortressId, outcome.uid);
+}
+
+async function resolveWrapProtectionClaimSubject(input: {
+  storagePath: string;
+  autoProvisionSummary: AutoProvisionSummary;
+}): Promise<string | null> {
+  const fortressId = fortressIdFromStoragePath(input.storagePath);
+  return (
+    protectionSubjectFromAutoProvisionSummary(
+      input.autoProvisionSummary,
+      fortressId,
+    ) ??
+    (await resolveProtectionSubjectFromFortressPath(
+      input.storagePath,
+      fortressId,
+    )).subject
+  );
+}
+
+function compareAuditEntriesByTimestamp(a: AuditEntry, b: AuditEntry): number {
+  const aMs = Date.parse(a.timestamp);
+  const bMs = Date.parse(b.timestamp);
+  if (Number.isFinite(aMs) && Number.isFinite(bMs) && aMs !== bMs) {
+    return aMs - bMs;
+  }
+  return a.timestamp.localeCompare(b.timestamp);
+}
+
+function daemonChainUnavailableFinding(message: string): AuditIntegrityFinding {
+  return {
+    kind: "storage_unavailable",
+    message,
+  };
+}
+
+function mergedAuditQueryTruncatedFinding(input: {
+  total: number;
+  returned: number;
+  limit: number;
+}): AuditIntegrityFinding {
+  return daemonChainUnavailableFinding(
+    `dual-chain audit query returned ${input.returned} of ${input.total} matching entries (limit ${input.limit}); read is incomplete`,
+  );
+}
+
+function mergeAuditQueryResults(
+  operator: AuditQueryResult,
+  daemon: AuditQueryResult,
+  limit: number,
+): AuditQueryResult {
+  const safeLimit = Number.isInteger(limit) && limit > 0 ? limit : 50;
+  const entries = [...operator.entries, ...daemon.entries]
+    .sort(compareAuditEntriesByTimestamp)
+    .slice(-safeLimit);
+  const total = operator.total + daemon.total;
+  const integrityFindings = [
+    ...operator.integrity_findings,
+    ...daemon.integrity_findings,
+  ];
+  if (total > entries.length) {
+    integrityFindings.push(
+      mergedAuditQueryTruncatedFinding({
+        total,
+        returned: entries.length,
+        limit: safeLimit,
+      }),
+    );
+  }
+  return {
+    entries,
+    total,
+    integrity_findings: integrityFindings,
+  };
+}
+
+type WrapDualAuditEvidence =
+  | { kind: "operator_only" }
+  | {
+      kind: "dual_chain";
+      auditStorage: FilesystemStorage;
+      masterKey: Uint8Array;
+    }
+  | { kind: "invalid"; reason: string };
+
+function dualAuditEvidenceFromInput(input: {
+  auditStorage?: FilesystemStorage;
+  masterKey?: Uint8Array;
+}): WrapDualAuditEvidence {
+  if (input.auditStorage === undefined && input.masterKey === undefined) {
+    return { kind: "operator_only" };
+  }
+  if (input.auditStorage !== undefined && input.masterKey !== undefined) {
+    return {
+      kind: "dual_chain",
+      auditStorage: input.auditStorage,
+      masterKey: input.masterKey,
+    };
+  }
+  return {
+    kind: "invalid",
+    reason:
+      "dual-chain audit evidence requires both audit storage and master key",
+  };
+}
+
+async function createWrapAuditEvidenceReader(input: {
+  auditLog: AuditLog;
+  dualAuditEvidence: WrapDualAuditEvidence;
+}): Promise<WrapAuditEvidenceReader> {
+  const { auditLog, dualAuditEvidence } = input;
+  if (dualAuditEvidence.kind === "operator_only") {
+    return auditLog;
+  }
+  if (dualAuditEvidence.kind === "invalid") {
+    const finding = daemonChainUnavailableFinding(dualAuditEvidence.reason);
+    return {
+      query: async (options) => {
+        const operator = await auditLog.queryEager(options);
+        return {
+          ...operator,
+          integrity_findings: [...operator.integrity_findings, finding],
+        };
+      },
+      runEagerReads: (fn) => auditLog.runEagerReads(fn),
+      verifySealedRegion: () => auditLog.verifySealedRegion(),
+    };
+  }
+  const { auditStorage, masterKey } = dualAuditEvidence;
+
+  try {
+    const fullPicture = await verifyFortressAuditFullPicture({
+      storage: auditStorage,
+      masterKey,
+    });
+    if (fullPicture.daemon.status === "absent") {
+      return auditLog;
+    }
+    if (fullPicture.daemon.status === "present_unreadable") {
+      const presence = await resolveDaemonStorePresence(auditStorage, masterKey);
+      const unreadableReason =
+        presence.kind === "present_unreadable" ? presence.reason : "io";
+      if (unreadableReason !== "privilege") {
+        const finding = daemonChainUnavailableFinding(
+          `daemon audit chain is present_unreadable/${unreadableReason}: ${fullPicture.daemon.note}`,
+        );
+        return {
+          query: async (options) => {
+            const operator = await auditLog.queryEager(options);
+            return {
+              ...operator,
+              integrity_findings: [...operator.integrity_findings, finding],
+            };
+          },
+          runEagerReads: (fn) => auditLog.runEagerReads(fn),
+          verifySealedRegion: () => auditLog.verifySealedRegion(),
+        };
+      }
+      return {
+        query: (options) => auditLog.queryEager(options),
+        runEagerReads: (fn) => auditLog.runEagerReads(fn),
+        verifySealedRegion: () => auditLog.verifySealedRegion(),
+        incompleteEvidenceReasons: [fullPicture.daemon.note],
+      };
+    }
+    if (fullPicture.daemon.status !== "verified") {
+      const findings =
+        fullPicture.daemon.status === "findings" &&
+        fullPicture.daemon.findings !== undefined
+          ? fullPicture.daemon.findings
+          : [
+              daemonChainUnavailableFinding(
+                `daemon audit chain is ${fullPicture.daemon.status}: ${fullPicture.daemon.note}`,
+              ),
+            ];
+      return {
+        query: async (options) => {
+          const operator = await auditLog.queryEager(options);
+          return {
+            ...operator,
+            integrity_findings: [...operator.integrity_findings, ...findings],
+          };
+        },
+        runEagerReads: (fn) => auditLog.runEagerReads(fn),
+        verifySealedRegion: () => auditLog.verifySealedRegion(),
+      };
+    }
+
+    const daemonLog = createDaemonAuditLog(auditStorage, masterKey, {
+      integrityMode: "lenient",
+    });
+    return {
+      query: async (options) => {
+        const limit = options.limit ?? 50;
+        const [operator, daemon] = await Promise.all([
+          auditLog.queryEager(options),
+          daemonLog.queryEager(options),
+        ]);
+        return mergeAuditQueryResults(operator, daemon, limit);
+      },
+      runEagerReads: (fn) => auditLog.runEagerReads(fn),
+      verifySealedRegion: () => auditLog.verifySealedRegion(),
+    };
+  } catch (err) {
+    const finding = daemonChainUnavailableFinding(
+      `dual-chain audit evidence could not be verified: ${(err as Error).message}`,
+    );
+    return {
+      query: async (options) => {
+        const operator = await auditLog.queryEager(options);
+        return {
+          ...operator,
+          integrity_findings: [...operator.integrity_findings, finding],
+        };
+      },
+      runEagerReads: (fn) => auditLog.runEagerReads(fn),
+      verifySealedRegion: () => auditLog.verifySealedRegion(),
+    };
+  }
+}
+
+function appendProtectionObservationReasons(
+  observation: ProtectionStateObservation,
+  reasons: readonly string[] | undefined,
+): ProtectionStateObservation {
+  if (reasons === undefined || reasons.length === 0) return observation;
+  const merged = [...(observation.reasons ?? []), ...reasons];
+  switch (observation.state) {
+    case "exclusive":
+      return { ...observation, reasons: merged };
+    case "coarse-only":
+      return { ...observation, reasons: merged };
+    case "unprotected":
+      return { ...observation, reasons: merged };
+    case "unknown":
+      return { ...observation, reasons: merged };
+  }
+}
+
+async function readCastleWallEgressFeatureStatus(
+  auditLog: WrapAuditEvidenceReader,
+  storagePath: string,
+  input: CastleWallFeatureProbeInput,
+): Promise<CastleWallFeatureProbeResult> {
+  const { buildFeatureHealthPanel } = await import(
+    "../principal-policy/feature-health.js"
+  );
+  const { loadFortressProducerKey } = await import(
+    "../castle-wall/runtime/producer-signature.js"
+  );
+  const keyLoad = await loadFortressProducerKey(storagePath);
+  // Eager-read scope: same one-verified-view discipline as the dashboard
+  // callers of buildFeatureHealthPanel (H4 chokepoint).
+  const panel = await auditLog.runEagerReads(() =>
+    buildFeatureHealthPanel({
+      auditLog,
+      originMachine: fortressIdFromStoragePath(storagePath),
+      pinnedProducerKeyB64url:
+        keyLoad.status === "present" ? keyLoad.keyB64url : null,
+      ...(keyLoad.status === "unreadable"
+        ? { producerKeyExpectedButUnavailable: true }
+        : {}),
+      ...(input.purpose === "protection-claim" &&
+      input.exclusiveEgress !== null
+        ? { exclusiveEgress: input.exclusiveEgress }
+        : {}),
+      protectionClaimSubject:
+        input.purpose === "protection-claim"
+          ? input.protectionClaimSubject ?? null
+          : fortressIdFromStoragePath(storagePath),
+      ...(input.purpose === "coarse-wall"
+        ? {
+            protectionSubjectMatchMode: {
+              mode: "fortress_scoped" as const,
+              fortressId: fortressIdFromStoragePath(storagePath),
+            },
+          }
+        : {}),
+    }),
+  );
+  const row = panel.rows.find((r) => r.feature_id === "castle_wall_egress");
+  return { status: row?.status, basis: row?.basis };
+}
+
+/**
+ * Coarse-wall evidence probe for callers that are building the exclusive-
+ * egress provider itself. It deliberately does NOT render protection prose:
+ * protection rendering goes through `probeCastleWallProtectionClaim`, which
+ * requires the capped exclusive-egress verdict.
+ */
+export async function probeCoarseCastleWallEnforcementObserved(
+  auditLog: WrapAuditEvidenceReader,
+  storagePath: string,
+): Promise<boolean> {
+  try {
+    return (
+      (await readCastleWallEgressFeatureStatus(auditLog, storagePath, {
+        purpose: "coarse-wall",
+      })).status === "active"
+    );
+  } catch {
+    return false;
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function hasCastleWallAuditProvenance(details: unknown): boolean {
+  return (
+    isRecord(details) &&
+    details[CASTLE_WALL_AUDIT_PROVENANCE_KEY] ===
+      CASTLE_WALL_AUDIT_PROVENANCE_VALUE
+  );
+}
+
+const CASTLE_WALL_DAEMON_START_OPERATION = "filter_started" as const;
+
+function stringDetail(
+  details: Record<string, unknown>,
+  key: string,
+): string | undefined {
+  const value = details[key];
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function daemonAttributionKey(details: unknown): string | undefined {
+  if (!isRecord(details)) return undefined;
+  const socketPath = stringDetail(details, "socket_path");
+  const source = stringDetail(details, "source");
+  if (socketPath === undefined || source === undefined) return undefined;
+  return `${source}\u0000${socketPath}`;
+}
+
+function currentWrapHeartbeatAttribution(details: unknown): string | undefined {
+  if (!isRecord(details) || !hasCastleWallAuditProvenance(details)) {
+    return undefined;
+  }
+  const daemonMode = details.daemon_mode;
+  if (daemonMode !== "full" && daemonMode !== "safe") return undefined;
+  return daemonAttributionKey(details);
+}
+
+/**
+ * Current-wrap daemon liveness gate for the banner resolver. This observes a
+ * daemon-shaped, provenance-marked heartbeat after the daemon-start attempt and
+ * inside the existing freshness window, paired to this wrap's daemon start entry.
+ * The subject match is fortress-scoped because a heartbeat proves the daemon is
+ * alive for this fortress, not that any one confined agent has subject-bound
+ * enforcement evidence. It never earns green by itself; exact-subject
+ * enforcement evidence remains required downstream.
+ */
+export async function observeCurrentWrapCastleWallDaemonLiveness(
+  auditLog: WrapAuditEvidenceReader,
+  storagePath: string,
+  daemonLivenessSince: Date | undefined,
+  nowMs: number = Date.now(),
+): Promise<boolean> {
+  const sinceMs = daemonLivenessSince?.getTime();
+  if (sinceMs === undefined || !Number.isFinite(sinceMs)) {
+    return false;
+  }
+  const freshnessFloorMs = nowMs - DEFAULT_ENFORCEMENT_FRESHNESS_MS;
+  try {
+    const limit = 10_000;
+    const fortressId = fortressIdFromStoragePath(storagePath);
+    const livenessMatchMode = {
+      mode: "fortress_scoped" as const,
+      fortressId,
+    };
+    const result = await auditLog.runEagerReads(() =>
+      auditLog.query({
+        layer: CASTLE_WALL_AUDIT_LAYER,
+        since: new Date(sinceMs).toISOString(),
+        limit,
+      }),
+    );
+    // audit-chokepoint-exempt: fail-closed liveness gate; raw integrity
+    // findings only block the banner from rendering green.
+    if (
+      result.integrity_findings.length > 0 ||
+      result.total > result.entries.length
+    ) {
+      return false;
+    }
+    const currentWrapDaemonStarts = new Map<string, number>();
+    for (const entry of result.entries) {
+      if (entry.operation !== CASTLE_WALL_DAEMON_START_OPERATION) continue;
+      if (entry.result !== "success") continue;
+      if (
+        !castleWallEvidenceMatchesProtectionSubject(
+          null,
+          entry,
+          livenessMatchMode,
+        ).matches
+      ) {
+        continue;
+      }
+      const ts = Date.parse(entry.timestamp);
+      if (!Number.isFinite(ts) || ts < sinceMs) continue;
+      const key = daemonAttributionKey(entry.details);
+      if (key === undefined) continue;
+      const previous = currentWrapDaemonStarts.get(key);
+      if (previous === undefined || ts > previous) {
+        currentWrapDaemonStarts.set(key, ts);
+      }
+    }
+    return result.entries.some((entry) => {
+      if (entry.operation !== CASTLE_WALL_HEARTBEAT_OPERATION) return false;
+      if (entry.result !== "success") return false;
+      if (
+        !castleWallEvidenceMatchesProtectionSubject(
+          null,
+          entry,
+          livenessMatchMode,
+        ).matches
+      ) {
+        return false;
+      }
+      const ts = Date.parse(entry.timestamp);
+      const key = currentWrapHeartbeatAttribution(entry.details);
+      const startTs = key === undefined ? undefined : currentWrapDaemonStarts.get(key);
+      return (
+        Number.isFinite(ts) &&
+        ts >= sinceMs &&
+        ts >= freshnessFloorMs &&
+        startTs !== undefined &&
+        ts >= startTs
+      );
+    });
+  } catch {
+    return false;
+  }
+}
+
+export const WRAP_PROTECTION_PROVIDER_TIMEOUT_MS = 1_500;
+
+async function withTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  label: string,
+): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const timeoutPromise = new Promise<never>((_resolve, reject) => {
+    timeout = setTimeout(() => {
+      reject(new Error(`${label} timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race([promise, timeoutPromise]);
+  } finally {
+    if (timeout !== undefined) clearTimeout(timeout);
+  }
+}
+
+export async function probeCastleWallProtectionClaim(
+  auditLog: WrapAuditEvidenceReader,
+  storagePath: string,
+  resolveExclusiveEgress: () => Promise<ExclusiveEgressStatus | null>,
+  options: {
+    providerTimeoutMs?: number;
+    protectionClaimSubject?: string | null;
+  } = {},
+): Promise<ProtectionStateClaim> {
+  let exclusiveEgress: ExclusiveEgressStatus | null;
+  try {
+    exclusiveEgress = await withTimeout(
+      resolveExclusiveEgress(),
+      options.providerTimeoutMs ?? WRAP_PROTECTION_PROVIDER_TIMEOUT_MS,
+      "exclusive-egress posture provider",
+    );
+  } catch (err) {
+    return protectionStateClaimFromObservation({
+      state: "unknown",
+      basis: "provider_unavailable",
+      reasons: [
+        `exclusive-egress posture provider could not be resolved: ${(err as Error).message}`,
+      ],
+    });
+  }
+  try {
+    const castleWallEgress = await readCastleWallEgressFeatureStatus(
+      auditLog,
+      storagePath,
+      {
+        purpose: "protection-claim",
+        exclusiveEgress,
+        protectionClaimSubject: options.protectionClaimSubject ?? null,
+      },
+    );
+    return protectionStateClaimFromObservation(
+      appendProtectionObservationReasons(
+        protectionObservationFromFeatureHealth({
+          castleWallEgressStatus: castleWallEgress.status,
+          castleWallEgressBasis: castleWallEgress.basis,
+          exclusiveEgress,
+        }),
+        auditLog.incompleteEvidenceReasons,
+      ),
+    );
+  } catch (err) {
+    return protectionStateClaimFromObservation({
+      state: "unknown",
+      basis: "read_failed",
+      reasons: [
+        `Castle Wall enforcement evidence could not be read: ${(err as Error).message}`,
+      ],
+    });
+  }
+}
+
+/**
+ * Build the production exclusive-egress resolver required before a protection
+ * claim can be rendered from feature-health evidence. Absent resolver means
+ * unknown, never green.
+ */
+async function createWrapProtectionResolver(
+  auditLog: WrapAuditEvidenceReader,
+  storagePath: string,
+): Promise<(() => Promise<ExclusiveEgressStatus | null>) | undefined> {
+  if (process.platform !== "darwin") return undefined;
+  const { createExclusiveEgressPostureProducer } = await import(
+    "../egress-gate/arming-wiring.js"
+  );
+  return createExclusiveEgressPostureProducer({
+    fortressPath: storagePath,
+    coarseWallArmed: () =>
+      probeCoarseCastleWallEnforcementObserved(auditLog, storagePath),
+  });
+}
+
+function protectionObservationFromAutoProvisionSummary(
+  summary: AutoProvisionSummary,
+): ProtectionStateObservation | undefined {
+  if (!summary.ran || summary.outcome === undefined) return undefined;
+  const outcome = summary.outcome;
+  switch (outcome.kind) {
+    case "armed-exclusive":
+    case "armed":
+      return undefined;
+    case "armed-exclusive-repark-failed":
+      return {
+        state: "unknown",
+        basis: "exclusive_egress_repark_failed",
+        reasons: [outcome.reparkError],
+      };
+    case "exclusive-egress-unarmed-coarse-active":
+      return {
+        state: "unknown",
+        basis: "provision_outcome_not_observation",
+        reasons: [outcome.reason, ...outcome.cleanupErrors],
+      };
+    case "armed-rollback-failed":
+      return {
+        state: "unknown",
+        basis: "insufficient_evidence",
+        reasons: [outcome.reason, outcome.disarmError],
+      };
+    case "aborted":
+      if (outcome.disarmObservedOff === true) {
+        return {
+          state: "unprotected",
+          basis: "disarm_observed_off",
+          reasons: [outcome.reason],
+        };
+      }
+      return {
+        state: "unknown",
+        basis: "provision_outcome_not_observation",
+        reasons: [outcome.reason],
+      };
+    case "armed-then-rolled-back":
+    case "egress-unprovisioned-rolled-back":
+      if (outcome.disarmObservedOff === true) {
+        return {
+          state: "unprotected",
+          basis: "disarm_observed_off",
+          reasons: [outcome.reason],
+        };
+      }
+      return {
+        state: "unknown",
+        basis: "provision_outcome_not_observation",
+        reasons: [outcome.reason],
+      };
+    case "skipped-already-dedicated":
+    case "skipped-non-tty-cooperative-only":
+    case "declined-by-operator":
+      return undefined;
+    default:
+      return assertNeverProvisionFlowOutcome(outcome);
+  }
+}
+
+export function protectionClaimFromAutoProvisionSummary(
+  summary: AutoProvisionSummary,
+): ProtectionStateClaim | undefined {
+  const observation = protectionObservationFromAutoProvisionSummary(summary);
+  return observation === undefined
+    ? undefined
+    : protectionStateClaimFromObservation(observation);
+}
+
+function disarmOutcomeProtectionCeiling(
+  outcome: DisarmNePreferenceOutcome,
+  reason: string,
+): ProtectionStateClaim | undefined {
+  switch (outcome) {
+    case "corroborated_off":
+      return protectionStateClaimFromObservation({
+        state: "unprotected",
+        basis: "disarm_observed_off",
+        reasons: [reason],
+      });
+    case "save_accepted_inconclusive":
+    case "fail_open_deadman":
+      return protectionStateClaimFromObservation({
+        state: "unknown",
+        basis: "provision_outcome_not_observation",
+        reasons: [reason],
+      });
+    default:
+      return assertNeverDisarmNePreferenceOutcome(outcome);
+  }
+}
+
+export function autoProvisionCeilingFromSummary(
+  summary: AutoProvisionSummary,
+): ProtectionStateClaim | undefined {
+  if (!summary.ran || summary.outcome === undefined) return undefined;
+  const outcome = summary.outcome;
+  switch (outcome.kind) {
+    case "armed-exclusive-repark-failed":
+      return protectionStateClaimFromObservation({
+        state: "unknown",
+        basis: "exclusive_egress_repark_failed",
+        reasons: [outcome.reparkError],
+      });
+    case "exclusive-egress-unarmed-coarse-active":
+      if (
+        outcome.coarseCompositionRestored === true &&
+        outcome.harness.disposition === "started-coarse"
+      ) {
+        return protectionStateClaimFromObservation({
+          state: "coarse-only",
+          basis: "exclusive_egress_unarmed_coarse_active",
+          reasons: [outcome.reason, ...outcome.cleanupErrors],
+        });
+      }
+      return protectionStateClaimFromObservation({
+        state: "unknown",
+        basis: "provision_outcome_not_observation",
+        reasons: [outcome.reason, ...outcome.cleanupErrors],
+      });
+    case "aborted":
+    case "armed-then-rolled-back":
+    case "egress-unprovisioned-rolled-back":
+      if ("wallMayBeArmed" in outcome && outcome.wallMayBeArmed === true) {
+        return protectionStateClaimFromObservation({
+          state: "unknown",
+          basis: "provision_outcome_not_observation",
+          reasons: [outcome.reason],
+        });
+      }
+      if (outcome.disarmObservedOff === true) {
+        return disarmOutcomeProtectionCeiling("corroborated_off", outcome.reason);
+      }
+      return "disarmOutcome" in outcome && outcome.disarmOutcome !== undefined
+        ? disarmOutcomeProtectionCeiling(outcome.disarmOutcome, outcome.reason)
+        : undefined;
+    case "armed":
+    case "armed-exclusive":
+    case "armed-rollback-failed":
+    case "skipped-already-dedicated":
+    case "skipped-non-tty-cooperative-only":
+    case "declined-by-operator":
+      return undefined;
+    default:
+      return assertNeverProvisionFlowOutcome(outcome);
+  }
+}
+
+function assertNeverProvisionFlowOutcome(outcome: never): never {
+  const kind = (outcome as { kind?: unknown }).kind;
+  throw new Error(
+    `Unhandled ProvisionFlowOutcome kind in wrap protection claim path: ${String(kind)}`,
+  );
+}
+
+function assertNeverDisarmNePreferenceOutcome(outcome: never): never {
+  throw new Error(
+    `Unhandled DisarmNePreferenceOutcome in wrap protection claim ceiling: ${String(outcome)}`,
+  );
+}
+
+const protectionClaimStateOrder: Readonly<Record<ProtectionClaimState, number>> =
+  Object.freeze({
+    unprotected: 0,
+    unknown: 1,
+    "coarse-only": 2,
+    exclusive: 3,
+  });
+
+function applyAutoProvisionCeiling(
+  probedClaim: ProtectionStateClaim,
+  autoProvisionCeiling: ProtectionStateClaim | undefined,
+): ProtectionStateClaim {
+  if (autoProvisionCeiling === undefined) return probedClaim;
+  return protectionClaimStateOrder[autoProvisionCeiling.state] <=
+    protectionClaimStateOrder[probedClaim.state]
+    ? autoProvisionCeiling
+    : probedClaim;
+}
+
+function unknownClaimWithAutoProvisionReasons(
+  observation: ProtectionStateObservation,
+  autoProvisionSummaryClaim: ProtectionStateClaim | undefined,
+): ProtectionStateClaim {
+  if (autoProvisionSummaryClaim?.basis === "disarm_observed_off") {
+    return autoProvisionSummaryClaim;
+  }
+  return protectionStateClaimFromObservation({
+    ...observation,
+    reasons: [
+      ...(observation.reasons ?? []),
+      ...(autoProvisionSummaryClaim?.reasons ?? []),
+    ],
+  });
+}
+
+export async function resolveWrapProtectionClaim(input: {
+  auditLog: AuditLog | undefined;
+  auditStorage?: FilesystemStorage;
+  masterKey?: Uint8Array;
+  autoProvisionSummary: AutoProvisionSummary;
+  castleWallDaemonLivenessSince?: Date;
+  storagePath: string;
+  providerTimeoutMs?: number;
+  resolveExclusiveEgress?: () => Promise<ExclusiveEgressStatus | null>;
+}): Promise<ProtectionStateClaim> {
+  const autoProvisionClaim = protectionClaimFromAutoProvisionSummary(
+    input.autoProvisionSummary,
+  );
+  const autoProvisionCeiling = autoProvisionCeilingFromSummary(
+    input.autoProvisionSummary,
+  );
+  if (input.auditLog === undefined) {
+    return unknownClaimWithAutoProvisionReasons(
+      {
+        state: "unknown",
+        basis: "provider_unavailable",
+        reasons: ["no audit log was available to observe enforcement"],
+      },
+      autoProvisionClaim,
+    );
+  }
+  const auditEvidence = await createWrapAuditEvidenceReader({
+    auditLog: input.auditLog,
+    dualAuditEvidence: dualAuditEvidenceFromInput({
+      auditStorage: input.auditStorage,
+      masterKey: input.masterKey,
+    }),
+  });
+  const protectionClaimSubject = await resolveWrapProtectionClaimSubject({
+    storagePath: input.storagePath,
+    autoProvisionSummary: input.autoProvisionSummary,
+  });
+  const daemonLivenessObserved =
+    await observeCurrentWrapCastleWallDaemonLiveness(
+      auditEvidence,
+      input.storagePath,
+      input.castleWallDaemonLivenessSince,
+    );
+  if (!daemonLivenessObserved) {
+    return unknownClaimWithAutoProvisionReasons(
+      {
+        state: "unknown",
+        basis: "provider_unavailable",
+        reasons: [
+          "Castle Wall current-wrap daemon heartbeat could not be confirmed",
+        ],
+      },
+      autoProvisionClaim,
+    );
+  }
+  let resolver: (() => Promise<ExclusiveEgressStatus | null>) | undefined;
+  try {
+    resolver =
+      input.resolveExclusiveEgress ??
+      (await createWrapProtectionResolver(
+        auditEvidence,
+        input.storagePath,
+      ));
+  } catch (err) {
+    return unknownClaimWithAutoProvisionReasons(
+      {
+        state: "unknown",
+        basis: "provider_unavailable",
+        reasons: [
+          `exclusive-egress posture provider could not be loaded: ${(err as Error).message}`,
+        ],
+      },
+      autoProvisionClaim,
+    );
+  }
+  if (resolver === undefined) {
+    return unknownClaimWithAutoProvisionReasons(
+      {
+        state: "unknown",
+        basis: "provider_unavailable",
+        reasons: ["exclusive-egress posture provider was not available"],
+      },
+      autoProvisionClaim,
+    );
+  }
+  const probedClaim = await probeCastleWallProtectionClaim(
+    auditEvidence,
+    input.storagePath,
+    resolver,
+    {
+      providerTimeoutMs: input.providerTimeoutMs,
+      protectionClaimSubject,
+    },
+  );
+  return applyAutoProvisionCeiling(probedClaim, autoProvisionCeiling);
+}
+
+/**
+ * Auto-provision Step 2 (Build 1): gate + invoke the one-flow orchestration
+ * (castle-wall/provision) from `runWrap`. v1 scope (D1/D2 resolved): Hermes
+ * on darwin only; a dry run never provisions (fix: dry-run must remain
+ * write-free, matching the existing `options.dryRun` early-return above).
+ * `--unwrap` never reaches this call (the unwrap branch returns at the top
+ * of `runWrap`).
+ *
+ * Fix H4: when provisioning is skipped because this run is non-interactive
+ * (no TTY), the cooperative wrap this function is called from has ALREADY
+ * completed its own writes by the time this runs -- this call only adds a
+ * status line, it never blocks or reverts the wrap that already happened.
+ * Any error thrown by the auto-provision flow is caught here and reported
+ * as a note, never allowed to turn an otherwise-successful cooperative wrap
+ * into a hard CLI failure. The terminal banner later resolves a protection
+ * claim from the observed final state, not from this control-flow boundary.
+ */
+async function maybeRunAutoProvisionForWrap(
+  agentConfig: { platform: AgentPlatform },
+  options: WrapOptions,
+  deps: RunWrapDeps,
+  stopTransientCastleWallDaemon?: () => Promise<void>,
+): Promise<{ summary: AutoProvisionSummary; deferredSignal?: NodeJS.Signals }> {
+  if (agentConfig.platform !== "hermes" || options.dryRun) {
+    return { summary: { ran: false } };
+  }
+  const runner = deps.runAutoProvisionForWrap ?? runAutoProvisionForWrap;
+  let mutationWindowOpened = false;
+  let deferredSignal: NodeJS.Signals | undefined;
+  let summary: AutoProvisionSummary;
+  try {
+    try {
+      summary = await runner({
+        isTty: process.stdin.isTTY === true,
+        preAnsweredProvision: options.provisionAgentAccount,
+        cliBinary: resolveAutoProvisionCliBinary(options),
+        stopTransientCastleWallDaemon,
+        beforeFirstMutation: () => {
+          mutationWindowOpened = tryOpenAutoProvisionMutationWindow(options);
+          return mutationWindowOpened;
+        },
+        // S5-6: fine-grained (exclusive-egress) provisioning mode.
+        exclusiveEgress: options.exclusiveEgress,
+        // SAFETY: stderr is the operator-facing CLI channel for this
+        // subcommand; this prints the plan-and-print + progress lines from
+        // the auto-provision flow (account plan, re-home summary, arm
+        // result), never secrets or key material.
+        print: (line) => console.error(`  ${line}`),
+      });
+    } catch (err) {
+      // FIX (round 5 / R8-2): a held provision lock means the flow body NEVER
+      // ran (another `sanctuary protect` is mid-provision), so this run mutated
+      // NOTHING. Classify it honestly -- the generic "may have PARTIALLY applied"
+      // warning below would falsely tell the operator to consider disarming a
+      // wall this run never touched.
+      if (err instanceof ProvisionLockHeldError) {
+        // SAFETY: stderr is the operator-facing CLI channel; a fixed, safe
+        // string plus the lock error message (a lock-path only, no secrets).
+        console.error(
+          `  Note: another 'sanctuary protect' provisioning run is already in progress (${(err as Error).message}); ` +
+            `this run made NO account, re-home, or Castle Wall changes. If a protect process is actually running, wait for it to finish; ` +
+            `if not, remove the stale lock file named above and re-run if needed.`,
+        );
+        summary = { ran: true };
+      } else {
+        // FIX (round 5, item N5): a throw reaching here can surface AFTER
+        // privileged side effects already landed -- e.g. `withProvisionLock`'s
+        // finally re-throws a non-ENOENT lock-release error even when
+        // `runProvisionFlow` already created the account, re-homed the secrets, or
+        // ARMED the wall. The pre-fix copy asserted provisioning "did not
+        // complete" and told the operator to blindly re-run, which is wrong (and
+        // unsafe) if the wall is in fact armed over a half-provisioned agent. The
+        // catch cannot know how far the flow got, so it must not claim a
+        // completion state: warn that it may have PARTIALLY applied and that the
+        // armed state must be checked before re-running.
+        //
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this
+        // subcommand; never surface secrets or key material here.
+        console.error(
+          `  WARNING: automatic account provisioning raised an error (${(err as Error).message}). ` +
+            `It may have PARTIALLY applied -- the dedicated account, the re-home, or an armed Castle Wall could ` +
+            `already be in place. The cooperative wrap above still applies. Do NOT assume nothing happened: check ` +
+            `whether Castle Wall is armed before re-running, and run 'sudo sanctuary castle-wall disable' if it is ` +
+            `enforcing over a half-provisioned agent.`,
+        );
+        summary = { ran: true };
+      }
+    }
+  } finally {
+    deferredSignal = mutationWindowOpened ? closeAutoProvisionMutationWindow() : undefined;
+  }
+  return { summary, deferredSignal };
+}
+
+async function exitAfterDeferredAutoProvisionSignal(
+  deferredSignal: NodeJS.Signals | undefined,
+): Promise<void> {
+  if (deferredSignal !== undefined) {
+    await runProcessShutdownForSignal(deferredSignal);
+  }
+}
+
+/**
+ * FIX F5 (HIGH, 2026-07-07 fix-round, absorbs the earlier F4 messaging nit):
+ * render EVERY `ProvisionFlowOutcome` at the CLI, not just the ones that
+ * happen to reach a catch block. Before this fix both wrap call sites
+ * ignored the returned outcome entirely: on a real abort (e.g. `launchctl
+ * bootstrap` failing after re-home) the wrap printed its normal success
+ * banner and the structured abort -- stage, reason, backup path, whether
+ * anything was actually restored -- was silently dropped. Every branch here
+ * is a distinct, accurate line:
+ *   - declined / non-tty: informational only, never "retry provisioning"
+ *     phrasing (the operator did not fail at anything).
+ *   - aborted with rolledBack === true: clean recovery, still surfaced so
+ *     the operator knows provisioning did not complete this run.
+ *   - aborted with rolledBack === false / "partial": LOUD manual-recovery
+ *     guidance with the backup path(s), since the operator's secrets may be
+ *     stranded under the new account's home.
+ *   - armed-then-rolled-back: the wall came down after a failed post-arm
+ *     check; the agent stays re-homed and the operator is told plainly.
+ *   - armed-rollback-failed (fix R5, 2026-07-07 fix-round 2): the wall
+ *     stayed ARMED after a failed post-arm check AND the fast-disarm rollback
+ *     itself failed. LOUDEST manual-recovery guidance of any branch: the
+ *     operator must disarm by hand, since the automatic rollback did not
+ *     complete.
+ *   - armed / skipped-already-dedicated: quiet single-line confirmation.
+ */
+/**
+ * Pure (exported for the seam, fix round-5 R2-2/R2-3): the operator-facing
+ * lines for a `ProvisionFlowOutcome`. Split out from the printer so every
+ * branch -- the silent-vs-loud framing, the non-TTY reason surfacing (R2-3),
+ * and the daemon-still-live loud override (R2-2) -- is unit-testable without
+ * spying on `console`. Returns `[]` when there is nothing to print. The
+ * render being untested is exactly how R2-2/R2-3 survived; this closes that.
+ */
+export function renderAutoProvisionOutcomeLines(summary: AutoProvisionSummary): string[] {
+  if (!summary.ran || summary.outcome === undefined) return [];
+  const outcome = summary.outcome;
+  switch (outcome.kind) {
+    case "armed":
+      return [`  Dedicated agent account provisioned and Castle Wall armed (uid ${outcome.uid}).`];
+    case "skipped-already-dedicated":
+      // The orchestrator already printed the "already a verified dedicated
+      // account ..." line via `print` at plan-and-print time; nothing to add.
+      return [];
+    case "skipped-non-tty-cooperative-only":
+      // FIX (round 5 / R2-3): the orchestrator printed only the forward-looking
+      // Plan line, NOT this outcome's reason, so the "re-run interactively to
+      // provision the account and arm the wall" guidance was silently dropped.
+      // Surface the reason here.
+      return [`  ${outcome.reason}`];
+    case "declined-by-operator":
+      return ["  Account provisioning declined; the cooperative wrap above still applies."];
+    case "armed-then-rolled-back":
+      return [
+        `  Note: Castle Wall armed then was fast-disarmed (${outcome.reason}). ` +
+          `The agent still runs under its dedicated, re-homed account; only enforcement came down. ` +
+          // FIX (round 5, item N5): honest -- the post-arm re-check proves
+          // DNS-resolvability + credential readability, not allow-list
+          // correctness, so do not tell the operator to "fix the allow-list".
+          `Re-run 'sanctuary protect --hermes' once the connectivity re-check passes (see the reason above).`,
+      ];
+    case "armed-rollback-failed":
+      return [
+        `  WARNING: Castle Wall is ARMED (uid ${outcome.uid}) and the automatic rollback FAILED (${outcome.reason}). ` +
+          `The disarm attempt itself also failed: ${outcome.disarmError}. ` +
+          `The agent may be unreachable behind the wall. Run 'sudo sanctuary castle-wall disable' manually now, ` +
+          `then investigate before re-running 'sanctuary protect --hermes'.`,
+      ];
+    case "egress-unprovisioned-rolled-back":
+      // Confined-agent egress (design section 5): the wall armed but the
+      // post-arm AS-UID egress verification failed (an endpoint unreachable
+      // as the agent uid, or the negative control reachable), so the flow
+      // fast-disarmed and put the provisioned rules back to their pre-run state
+      // rather than leave a confined-into-silence agent or an unverified grant.
+      // Honest framing: the per-endpoint PASS/FAIL table was already printed by
+      // the flow. FIX F-REVOKE: the claim is "restored to their pre-run state",
+      // which on a first run means removed and on a re-run means a previous
+      // run's grants survived -- the old "were scrubbed" wording asserted
+      // removal on both, and on a re-run that was the agent-strangling case.
+      return [
+        `  Note: Castle Wall armed, then was fast-disarmed because the as-agent-uid egress verification failed ` +
+          `(${outcome.reason}). The agent still runs under its dedicated, re-homed account; only enforcement came down` +
+          `${outcome.egressRestoredToPreRunState ? " and the provisioned egress rules were restored to their pre-run state" : ""}. ` +
+          `Re-run 'sanctuary protect --hermes' once the per-endpoint failures above are resolved.`,
+      ];
+    case "armed-exclusive":
+      // S5-6: the full fine-grained outcome. Honest wording: wired + live,
+      // drill-owed (no "audited per-rule per-flow"-class overclaim).
+      return [
+        `  Dedicated agent account provisioned, Castle Wall armed, and the exclusive-egress gate is LIVE ` +
+          `(uid ${outcome.uid}, generation ${outcome.generationId}). The agent's only sanctioned egress path is the gate.`,
+      ];
+    case "armed-exclusive-repark-failed":
+      // FIX-ROUND 5. This used to say "the agent is running confined" -- a
+      // positive run-state assertion composed at the RENDER layer, which is
+      // the thing the round-4 guard exists to forbid; it evaded the guard only
+      // by letter case. Its basis was also stale: the barrier's last
+      // stable-running probe ran BEFORE the re-park mutation that then threw.
+      // What IS observed here is the gate: a committed generation, live, with
+      // the agent's egress scoped to it. Say that, and leave run state to the
+      // one surface that reads it.
+      return [
+        `  WARNING: the exclusive-egress gate is LIVE (uid ${outcome.uid}, generation ${outcome.generationId}) and the ` +
+          `agent's only sanctioned egress path is the gate, but the persistent boot state could NOT be re-parked ` +
+          `(${outcome.reparkError}). ` +
+          `The NEXT boot could start the agent before the gate re-arms. Run '${EGRESS_GATE_REPAIR_WITH_STAND_DOWN_COMMAND}' (${EGRESS_GATE_STAND_DOWN_EFFECT}) now.`,
+      ];
+    case "exclusive-egress-unarmed-coarse-active": {
+      // S5-6 degrade-loud: DISTINCT non-green state; every posture surface
+      // renders coarse-only amber (S5-P). Never softened into a success line.
+      // FIX-ROUND 4 (the round-4 HIGH landed exactly here). This branch used
+      // to compose its own run-state sentence from `harnessStartedCoarse`,
+      // whose false branch means "this run did not start it" and was printed
+      // as "The agent is PARKED (not running)" -- captured over a live pid
+      // 9001, in the same output whose reason string said the job still
+      // reported that pid. The render layer no longer decides run state at
+      // all: the sentence comes from the parked-claim chokepoint, which
+      // produced it from a settled observation or explicitly weakened it.
+      const agentState = harnessDispositionSentence(outcome.harness);
+      const manifestState = outcome.coarseCompositionRestored
+        ? "The manifest is back in coarse scope."
+        : "The manifest could NOT be restored to coarse scope.";
+      const cleanupNote =
+        outcome.cleanupErrors.length > 0 ? ` Cleanup problems: ${outcome.cleanupErrors.join("; ")}.` : "";
+      return [
+        `  WARNING: fine-grained exclusive egress could NOT come live at "${outcome.stage}" (${outcome.reason}). ` +
+          `The coarse Castle Wall remains armed over the agent -- this is a DISTINCT NON-GREEN (coarse-only) state ` +
+          `on every posture surface, not full protection. ${manifestState} ${agentState}${cleanupNote} ` +
+          `Fix with: ${EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE}`,
+      ];
+    }
+    case "aborted":
+      return abortedProvisionLines(outcome);
+    default:
+      return assertNeverProvisionFlowOutcome(outcome);
+  }
+}
+
+function abortedProvisionLines(outcome: Extract<ProvisionFlowOutcome, { kind: "aborted" }>): string[] {
+  const backupNote =
+    outcome.backupPaths !== undefined && outcome.backupPaths.length > 0
+      ? ` Backup copies remain at: ${outcome.backupPaths.join(", ")}.`
+      : "";
+  // FIX (round 5 / R5-2): an R6 restore CONFLICT means the operator recreated
+  // a re-homed file during provisioning; their recreated file was left intact
+  // and the previously re-homed copy is preserved at conflictPaths. This is
+  // NOT a failed restore and the operator must NOT be told to overwrite from
+  // the stale backup (that would destroy their newer file).
+  const conflictNote =
+    outcome.conflictPaths !== undefined && outcome.conflictPaths.length > 0
+      ? ` Your file(s) recreated during provisioning were left intact; the previously re-homed copy is preserved at: ${outcome.conflictPaths.join(", ")} -- reconcile these by hand, and do NOT overwrite them from the backup.`
+      : "";
+  // Bug B P0 (disarm-first): an ARM-stage abort where disarm could NOT confirm
+  // the content filter is off. The freshly-installed policy daemon was left
+  // RUNNING (filter-on + daemon-up is enforcing and recoverable, never the
+  // deny-all lockout), and the wall MAY STILL BE ARMED. This is the most severe
+  // state, so it is checked FIRST and NEVER softened into a clean "rolled back;
+  // re-run" line (the honesty gap the P0 flagged). `outcome.reason` already
+  // carries the full WALL-STATE WARNING with the `castle-wall disable` command.
+  if (outcome.wallMayBeArmed) {
+    return [
+      `  WARNING: automatic account provisioning stopped at "${outcome.stage}" (${outcome.reason})${backupNote}${conflictNote}` +
+        ` The Castle Wall content filter MAY STILL BE ARMED; the policy daemon was left running to avoid a lockout.` +
+        ` Run 'sudo sanctuary castle-wall disable' to confirm the filter is off, then investigate before re-running.`,
+    ];
+  }
+  // FIX (round 5 / R2-2): a failed daemon teardown means a root LaunchDaemon
+  // may STILL BE LIVE regardless of whether the re-home restore succeeded, so
+  // it gets the LOUD frame -- never the soft "Note: ... re-run to retry" line
+  // the rolledBack===true branch below would otherwise emit (which would
+  // directly contradict the manual-recovery note already folded into
+  // `outcome.reason`).
+  if (outcome.daemonTeardownFailed) {
+    return [
+      `  WARNING: automatic account provisioning stopped at "${outcome.stage}" (${outcome.reason}).` +
+        ` A root harness LaunchDaemon may still be running under the dedicated account.${backupNote}${conflictNote}` +
+        ` Do not re-run until you have torn it down (see the note above) and recovered any files.`,
+    ];
+  }
+  // FIX (round 5 / R5-2): surface a restore conflict as its own honest frame
+  // (data is safe at conflictPaths) BEFORE the rolledBack branches, which would
+  // otherwise render a pure conflict (restoredCount 0 -> rolledBack false) as
+  // "restore FAILED / recover from backup" -- a false alarm that also
+  // misdirects the operator to clobber their newer recreated file.
+  //
+  // FIX (round 5 / R6-2): ONLY when there is no GENUINE failure. If a real
+  // restore failure co-occurs with a conflict, fall through to the LOUD
+  // rolledBack frames below (which now also carry `conflictNote`), so a
+  // conflict never masks a failure that needs backup recovery.
+  const hasGenuineFailure = outcome.failedPaths !== undefined && outcome.failedPaths.length > 0;
+  if (outcome.conflictPaths !== undefined && outcome.conflictPaths.length > 0 && !hasGenuineFailure) {
+    return [
+      `  Note: automatic account provisioning stopped at "${outcome.stage}" (${outcome.reason}).` +
+        conflictNote +
+        ` The cooperative wrap above still applies. Reconcile the file(s) above, then re-run 'sanctuary protect --hermes'.`,
+    ];
+  }
+  // FIX (round 5 / R3-2): a pre-re-home abort (root-check, operator-identity,
+  // detect, create-account, or a rehome that moved nothing) has NOTHING to
+  // restore. Render a neutral "nothing was changed; safe to re-run" line --
+  // never the "restore of your re-homed files FAILED / do not re-run" alarm
+  // the `rolledBack === false` branch below would otherwise print. This is the
+  // common no-sudo first attempt (stage "root-check"). Account existence is
+  // deliberately NOT inferred here; create-account failures carry their own
+  // observed rollback/repair text in `reason`.
+  if (outcome.rehomeAttempted === false) {
+    // FIX (round 5 / R4-2): key the account clause on `accountCreated`, not on
+    // `rehomeAttempted` (which only tracks whether a MOVE happened). At the
+    // rehome stage create-account has already succeeded, so an orphaned hidden
+    // account exists even though nothing moved.
+    const accountClause = outcome.accountCreated
+      ? `The dedicated account was created but no files were moved (it will be reused on the next run).`
+      : `No files were moved before this stop.`;
+    return [
+      `  Note: automatic account provisioning stopped at "${outcome.stage}" (${outcome.reason}). ` +
+        `${accountClause} The cooperative wrap above still applies. ` +
+        `Re-run 'sanctuary protect --hermes' once the cause above is resolved.`,
+    ];
+  }
+  if (outcome.rolledBack === true) {
+    return [
+      `  Note: automatic account provisioning stopped at "${outcome.stage}" (${outcome.reason}). ` +
+        `Re-homed paths were restored to your account. Re-run 'sanctuary protect --hermes' to retry.`,
+    ];
+  }
+  if (outcome.rolledBack === "partial") {
+    return [
+      `  WARNING: automatic account provisioning stopped at "${outcome.stage}" (${outcome.reason}). ` +
+        `Only SOME of your re-homed files were restored; the rest need manual recovery.${backupNote}${conflictNote} ` +
+        `Do not re-run until you have recovered the remaining files.`,
+    ];
+  }
+  return [
+    `  WARNING: automatic account provisioning stopped at "${outcome.stage}" (${outcome.reason}). ` +
+      `The restore of your re-homed files FAILED; manual recovery is required.${backupNote}${conflictNote} ` +
+      `Do not re-run until you have recovered your files.`,
+  ];
+}
+
+function printAutoProvisionOutcomeLineToStderr(line: string): void {
+  // SAFETY: stderr is the operator-facing CLI channel for this subcommand; the
+  // caller supplies rendered outcome metadata only, never secrets.
+  console.error(line);
+}
+
+export function renderAutoProvisionOutcome(
+  summary: AutoProvisionSummary,
+  print: (line: string) => void = printAutoProvisionOutcomeLineToStderr,
+): void {
+  try {
+    for (const line of renderAutoProvisionOutcomeLines(summary)) {
+      // SAFETY: stderr is the operator-facing CLI channel for this subcommand;
+      // every line comes from renderAutoProvisionOutcomeLines, which interpolates
+      // only outcome metadata (stage / reason / uid / backup paths this process
+      // itself wrote) -- never secrets or key material.
+      print(line);
+    }
+  } catch (err) {
+    print(
+      `  WARNING: automatic account provisioning completed with an outcome the CLI renderer could not display ` +
+        `(${err instanceof Error ? err.message : String(err)}). Re-run 'sudo sanctuary protect --hermes' or inspect ` +
+        `the Castle Wall status before assuming protection state.`,
+    );
+  }
+}
+
 export interface RunWrapDeps {
+  /**
+   * Override the auto-provision entry point (for tests). Production
+   * callers leave this undefined and get the real
+   * `wrap/auto-provision.ts:runAutoProvisionForWrap`, which is the ONLY
+   * caller of the privileged (drill-only) account-creation / re-home /
+   * daemon-install / arm side effects.
+   */
+  runAutoProvisionForWrap?: typeof runAutoProvisionForWrap;
+  /**
+   * Override the resolved OS platform used by the `--exclusive-egress` /
+   * `--provision-agent-account` darwin-only refusal (for tests). Production
+   * callers leave this undefined and get the real `node:os` `platform()`.
+   * Auto-provision itself (`wrap/auto-provision.ts:runAutoProvisionForWrap`)
+   * is gated the same way but is NOT test-overridable here -- this seam
+   * exists so a test can deterministically exercise the CLI-level refusal
+   * independent of the CI runner's actual OS, without needing to fake the
+   * full auto-provision darwin gate too.
+   */
+  osPlatform?: () => NodeJS.Platform;
   /** Override dashboard starter (for tests). */
   startDashboard?: DashboardStarter;
   /** Override browser opener (for tests). */
@@ -493,12 +2599,50 @@ export interface RunWrapDeps {
   ) => Promise<
     import("./claude-code-allowlist.js").InstallClaudeCodeAllowlistResult
   >;
+  /**
+   * Override the wrap-meta persistence (for tests). Production callers
+   * leave this undefined. Tests inject a throwing stub to pin the
+   * meta-write failure paths: full rollback of every wrapped surface, and
+   * the orphan-wrap guard's fallback meta write when a rollback restore
+   * itself fails.
+   */
+  saveWrapMeta?: typeof saveWrapMeta;
+  /**
+   * Override the wrap-time pinned-version resolvability probe (for tests).
+   * Production callers leave this undefined and get
+   * `checkPinnedVersionResolvable` (a real registry-metadata HEAD-class
+   * probe with a short timeout).
+   */
+  checkPinResolvability?: (
+    version: string,
+  ) => Promise<PinnedVersionResolvability>;
 }
+
+/**
+ * Test-only injection seam for the Hermes config.yaml parse-parity guard's
+ * PyYAML sidecar. This is DELIBERATELY not a field on RunWrapDeps: a public
+ * dep would let a programmatic production caller pass an agreeing / no-op
+ * parity and edit config.yaml WITHOUT the real PyYAML validator, defeating
+ * the fail-closed guarantee (HIGH: DI-bypass on the mutating path, closed
+ * 2026-07-03). The production runWrap paths always call the guard with the
+ * real default sidecar; only test code reaches in here to override it.
+ *
+ * Named `__`-prefixed and NOT re-exported from wrap/index.ts, matching the
+ * `__wrapMetaLockTestHooks` convention (config-reader.ts): a test sets
+ * `__hermesParityTestHook.parity` before driving runWrap and clears it after.
+ * When unset (every production path), `parity` is undefined and the guard
+ * spawns the real one-shot `python3` PyYAML parse.
+ */
+export const __hermesParityTestHook: {
+  parity?: import("./hermes-yaml-parse-parity.js").ParseParityOptions;
+} = {};
 
 export async function runWrap(
   options: WrapOptions,
   deps: RunWrapDeps = {}
 ): Promise<void> {
+  installProcessShutdownListeners();
+
   // D4 P2-2: --unwrap honors --dry-run too - pre-fix, the unwrap dispatch
   // sat above the dry-run gate, so `--unwrap --dry-run` restored backups
   // for real. The gate travels into unwrap() so it can report what WOULD
@@ -531,6 +2675,67 @@ export async function runWrap(
   // without standing up the whole wrap flow.
   promoteFortressToStoragePath(options);
 
+  // S5-6: the exclusive-egress repair verb. Does NOT wrap anything -- it
+  // re-runs the gate generation bring-up + release barrier for an
+  // already-provisioned fine-grained agent, behind the MED-7 transient-
+  // pf-rule drift guard (foreign VPN/firewall rules refuse without the
+  // interactive `--override-transient-pf-rules`).
+  if (options.repairEgressGate === true) {
+    const { runEgressGateRepairForCli } = await import("./auto-provision.js");
+    let mutationWindowOpened = false;
+    let deferredSignal: NodeJS.Signals | undefined;
+    let code = 2;
+    let thrown: unknown;
+    try {
+      code = await runEgressGateRepairForCli({
+        isTty: process.stdin.isTTY === true,
+        overrideTransientPfRules: options.overrideTransientPfRules === true,
+        standDownAgent: options.standDownAgent === true,
+        cliBinary: resolveAutoProvisionCliBinary(options),
+        beforeFirstMutation: () => {
+          mutationWindowOpened = tryOpenAutoProvisionMutationWindow(options);
+          return mutationWindowOpened;
+        },
+      });
+    } catch (err) {
+      thrown = err;
+    } finally {
+      deferredSignal = mutationWindowOpened ? closeAutoProvisionMutationWindow() : undefined;
+    }
+    await exitAfterDeferredAutoProvisionSignal(deferredSignal);
+    if (thrown !== undefined) throw thrown;
+    process.exit(code);
+  }
+
+  // S5-7: the exclusive-egress unprotect verb. Does NOT wrap anything -- it
+  // tears down the per-agent exclusive-egress stack (verified park first;
+  // registry remove LAST so every remaining confined uid's rules re-verify
+  // live and the anchor flushes only when the last agent leaves).
+  if (options.unprotectEgressGate === true) {
+    const { runEgressGateUnprotectForCli } = await import("./auto-provision.js");
+    let mutationWindowOpened = false;
+    let deferredSignal: NodeJS.Signals | undefined;
+    let code = 2;
+    let thrown: unknown;
+    try {
+      code = await runEgressGateUnprotectForCli({
+        standDownAgent: options.standDownAgent === true,
+        cliBinary: resolveAutoProvisionCliBinary(options),
+        beforeFirstMutation: () => {
+          mutationWindowOpened = tryOpenAutoProvisionMutationWindow(options);
+          return mutationWindowOpened;
+        },
+      });
+    } catch (err) {
+      thrown = err;
+    } finally {
+      deferredSignal = mutationWindowOpened ? closeAutoProvisionMutationWindow() : undefined;
+    }
+    await exitAfterDeferredAutoProvisionSignal(deferredSignal);
+    if (thrown !== undefined) throw thrown;
+    process.exit(code);
+  }
+
   let platformHint: AgentPlatform | undefined;
   if (options.openclaw) platformHint = "openclaw";
   else if (options.hermes) platformHint = "hermes";
@@ -545,6 +2750,60 @@ export async function runWrap(
   );
   let agentConfig = detection.config;
 
+  // FIX (harden-loop, side-effect-before-refusal): shared by both the
+  // dry-run branch below and the real (write) branch. Pre-fix, this check
+  // only ran inside the `options.dryRun` early-return, so on a REAL run the
+  // fresh-config bootstrap's `writeFileSafeUnderRoot` (further down) landed
+  // on disk -- and its "Bootstrapped a fresh config at ..." line printed --
+  // BEFORE this refusal could fire, on the exact darwin-only / wrong-
+  // platform-selector cases it's meant to block. That left a stub
+  // `~/.hermes/cli-config.json` (or platform equivalent) an operator never
+  // asked for sitting at the canonical path after a refused, exit-2 command,
+  // which then makes the NEXT run see a "configured" platform and skip the
+  // bootstrap branch entirely. Calling this BEFORE the write makes the
+  // refusal side-effect-free on both paths, matching the PR's own claim
+  // that it fires "before any wrap work (config detection, file writes,
+  // dashboard start)". Uses `platformHint`, not `agentConfig?.platform`:
+  // neither branch has a resolved `agentConfig` yet at this point (that's
+  // the whole reason the bootstrap block exists), and a real run would
+  // bootstrap a config FOR the hinted platform, so `platformHint` is what
+  // `agentConfig?.platform` would become.
+  function refuseUnsupportedExclusiveArmForHint(): boolean {
+    if (options.exclusiveEgress !== true && options.provisionAgentAccount !== true) {
+      return false;
+    }
+    const requestedFlags = [
+      options.exclusiveEgress === true ? "--exclusive-egress" : undefined,
+      options.provisionAgentAccount === true ? "--provision-agent-account" : undefined,
+    ]
+      .filter((flag): flag is string => flag !== undefined)
+      .join(" / ");
+    if (platformHint !== "hermes") {
+      // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
+      console.error(
+        `\n  Sanctuary: ${requestedFlags} requires a provisionable agent selector, ` +
+          `but the detected/configured platform is "${platformHint}". Only Hermes is provisionable today -- re-run with ` +
+          `--hermes against a Hermes config. Without it, wrap would proceed as a ` +
+          `plain cooperative wrap and arm nothing.\n`
+      );
+      process.exit(2);
+      return true;
+    }
+    const resolvedOsPlatform = (deps.osPlatform ?? platform)();
+    if (resolvedOsPlatform !== "darwin") {
+      // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
+      console.error(
+        `\n  Sanctuary: ${requestedFlags} requires automatic account provisioning ` +
+          `and Castle Wall arming, which are darwin-only today (this host reports ` +
+          `"${resolvedOsPlatform}"). Without it, wrap would proceed as a plain cooperative ` +
+          `wrap and arm nothing.\n`
+      );
+      process.exit(2);
+      return true;
+    }
+    return false;
+  }
+
   // If no config file exists for an explicitly-hinted platform, bootstrap an
   // empty one at the canonical (first-listed) path. Wrap then proceeds to
   // inject Sanctuary as the sole entry. First-time operators on a fresh
@@ -553,13 +2812,44 @@ export async function runWrap(
   if (!agentConfig && platformHint && !options.wrap) {
     const candidatePaths = getPlatformPaths()[platformHint];
     const canonicalPath = candidatePaths[0];
+    // Honesty fix: for Hermes, the JSON surface detected above
+    // (cli-config.json / config.json) is NOT where Hermes routes MCP
+    // traffic. v0.16.0 reads ~/.hermes/config.yaml (see hermes-yaml.ts
+    // header). A host that already has a populated config.yaml (e.g. a
+    // `venice` entry) has a REAL Hermes MCP config, so claiming "No
+    // existing hermes config found" is false and confusing on the exact
+    // install target. When config.yaml exists we say so, name the
+    // authoritative file, and note existing entries are preserved; the
+    // per-entry preserved count is reported by the config.yaml routing
+    // line (reportHermesYamlDryRun / the real injection below).
+    const hermesYamlExists =
+      platformHint === "hermes" && (await pathExists(hermesConfigYamlPath()));
     // D4 staging, Bug 1: --dry-run must guarantee ZERO filesystem writes.
     // This bootstrap ran BEFORE the dry-run gate below, so `protect
     // --hermes --dry-run` on a host with no config still created the file.
     // Report what would be bootstrapped and stop before any write path.
     if (canonicalPath && options.dryRun) {
+      // FIX (N1-3 dry-run gap, harden-loop): this early return happens
+      // BEFORE the `--exclusive-egress` / `--provision-agent-account`
+      // refusal further below, which only runs on the resolved
+      // `agentConfig?.platform` -- but a dry run never actually writes the
+      // bootstrap file or re-detects, so `agentConfig` stays undefined and
+      // that refusal is unreachable here. Without this, a dry run against a
+      // fresh (or non-hermes) host prints a clean "Would bootstrap.../Dry
+      // run. No changes made." plan for a command that refuses when run for
+      // real -- exactly the false belief the refusal exists to prevent.
+      if (refuseUnsupportedExclusiveArmForHint()) return;
       // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
-      console.error(`\n  No existing ${platformHint} config found.`);
+      if (hermesYamlExists) {
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+        console.error(
+          `\n  Found your Hermes MCP config at ${hermesConfigYamlPath()}.` +
+            `\n  Existing MCP servers there are preserved; Sanctuary routing will be added.`
+        );
+      } else {
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+        console.error(`\n  No existing ${platformHint} config found.`);
+      }
       // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
       console.error(`  Would bootstrap a fresh config at ${canonicalPath}.`);
       if (platformHint === "hermes") {
@@ -570,16 +2860,38 @@ export async function runWrap(
       return;
     }
     if (canonicalPath) {
+      // FIX (harden-loop, side-effect-before-refusal): mirror the dry-run
+      // check above BEFORE the write below. Without this, `sanctuary
+      // protect --hermes --exclusive-egress` on a non-darwin host (or
+      // `--cursor --exclusive-egress` with no cursor config) bootstrapped
+      // and printed "Bootstrapped a fresh config at ..." for real, THEN hit
+      // the resolved-platform refusal further down and exited 2 -- leaving
+      // a stub config on disk the operator never had, for a command that
+      // never armed anything.
+      if (refuseUnsupportedExclusiveArmForHint()) return;
       try {
         // Round-3 P1-A: the fresh-config bootstrap used mkdir(recursive) +
         // plain writeFile, both of which follow a symlinked parent (e.g.
         // ~/.hermes -> /tmp/victim). Route it through the same safe-path
         // discipline as every other wrap sink.
+        // DEBT (hermes cli-config.json): this JSON file is a legacy compat
+        // artifact. Hermes v0.16.0 does NOT consult it for MCP routing
+        // (hermes-yaml.ts:4-10). It is kept because the generic wrap flow
+        // keys off `agentConfig`, which detectAgentConfigWithDiagnostics
+        // derives from the JSON surface, and unwrap unlinks it
+        // (config-reader.ts). The authoritative surface is config.yaml.
         await writeFileSafeUnderRoot(canonicalPath, "{}", { mode: 0o600 });
         // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
-        console.error(
-          `\n  No existing ${platformHint} config found.`
-        );
+        if (hermesYamlExists) {
+          // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+          console.error(
+            `\n  Found your Hermes MCP config at ${hermesConfigYamlPath()}.` +
+              `\n  Existing MCP servers there are preserved; Sanctuary routing will be added.`
+          );
+        } else {
+          // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+          console.error(`\n  No existing ${platformHint} config found.`);
+        }
         // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
         console.error(
           `  Bootstrapped a fresh config at ${canonicalPath}.\n`
@@ -598,6 +2910,129 @@ export async function runWrap(
         console.error(`  Error: ${(err as Error).message}\n`);
         process.exit(1);
       }
+    }
+  }
+
+  // FIX (N1-3 corrected, 2026-07-27): `sanctuary protect --exclusive-egress`
+  // (or `--provision-agent-account`) without a provisionable agent selected
+  // silently armed NOTHING -- maybeRunAutoProvisionForWrap's early return
+  // (`agentConfig.platform !== "hermes"`) prints nothing, and there was zero
+  // cross-flag validation on these flags. Only Hermes is provisionable
+  // today; refuse loudly rather than quietly performing a plain cooperative
+  // wrap while the operator believes exclusive egress (or account
+  // provisioning) was armed. Fires the same regardless of --dry-run -- a
+  // dry run must not silently omit the same refusal.
+  //
+  // This checks the RESOLVED platform (`agentConfig?.platform`), not the
+  // explicit `--hermes` flag: `platformHint` is only set when the operator
+  // passed a platform selector, but `maybeRunAutoProvisionForWrap` (and the
+  // arming it gates) key on the platform `detectAgentConfigWithDiagnostics`
+  // actually resolves, which auto-detects Hermes with no flag at all (and
+  // resolves Hermes from an explicit `--wrap ~/.hermes/cli-config.json`
+  // too).
+  //
+  // FIX (N1-3 placement, 2026-07-27 harden-loop): this check must run AFTER
+  // the fresh-config bootstrap directly above, not before it. Hermes
+  // detection only probes the legacy JSON compat surface
+  // (`~/.hermes/cli-config.json` / `config.json`) -- never the authoritative
+  // `~/.hermes/config.yaml` that v0.16.0 actually routes MCP traffic
+  // through (see the DEBT note above). A first-install/yaml-only Hermes
+  // host therefore has `agentConfig === undefined` on the FIRST detection
+  // call, and only resolves to a Hermes config once the bootstrap block
+  // above has written the compat JSON file and re-detected. Checking before
+  // the bootstrap falsely refused that exact host with "re-run with
+  // --hermes" advice the operator had already followed. Placed here --
+  // after the bootstrap, before the generic "Configuration Not Found"
+  // handler -- `agentConfig` reflects the FINAL resolution, and a genuinely
+  // unresolvable config (no platform hint, or a hint the bootstrap can't
+  // help) still falls through to that handler's better diagnostics
+  // (paths checked, per-path errors) unchanged.
+  if (options.exclusiveEgress === true || options.provisionAgentAccount === true) {
+    const requestedFlags = [
+      options.exclusiveEgress === true ? "--exclusive-egress" : undefined,
+      options.provisionAgentAccount === true ? "--provision-agent-account" : undefined,
+    ]
+      .filter((flag): flag is string => flag !== undefined)
+      .join(" / ");
+    if (agentConfig?.platform !== "hermes") {
+      if (!agentConfig) {
+        // FIX (N1-3 diagnostics-swallow, harden-loop): this refusal exits
+        // BEFORE the "Configuration Not Found" handler below ever runs, so
+        // that handler's better diagnostics (`detection.pathsChecked`, the
+        // per-path `detection.errors`) and the underlying read error were
+        // silently dropped -- and the fixed "re-run with --hermes" advice
+        // is actively wrong when the operator already gave an explicit
+        // `--wrap <path>` (a typo'd path just gets told to try a flag that
+        // wouldn't change anything) or already passed `--hermes` itself
+        // (whose config the bootstrap above could not resolve). Surface
+        // the diagnostics this check would otherwise swallow, and only
+        // suggest `--hermes` when the operator has not already tried an
+        // explicit selector.
+        const alreadyTriedSelector = options.wrap !== undefined || platformHint === "hermes";
+        let diagnosticsClause = "";
+        if (detection.pathsChecked.length > 0) {
+          diagnosticsClause += `\n\n  Paths checked:\n${detection.pathsChecked
+            .map((p) => `    ${p}`)
+            .join("\n")}`;
+        }
+        if (detection.errors.length > 0) {
+          diagnosticsClause += `\n\n  Errors encountered:\n${detection.errors
+            .map((e) => `    ${e.path}: ${e.error}`)
+            .join("\n")}`;
+        }
+        const notFoundClause = "no agent configuration could be found";
+        if (alreadyTriedSelector) {
+          // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
+          console.error(
+            `\n  Sanctuary: ${requestedFlags} requires a provisionable agent selector, ` +
+              `but ${notFoundClause}. Only Hermes is provisionable today. Without it, ` +
+              `wrap would proceed as a plain cooperative wrap and arm nothing.${diagnosticsClause}\n`
+          );
+        } else {
+          // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
+          console.error(
+            `\n  Sanctuary: ${requestedFlags} requires a provisionable agent selector, ` +
+              `but ${notFoundClause}. Only Hermes is provisionable today -- re-run with ` +
+              `--hermes against a Hermes config. Without it, wrap would proceed as a ` +
+              `plain cooperative wrap and arm nothing.${diagnosticsClause}\n`
+          );
+        }
+        process.exit(2);
+        return;
+      }
+      // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
+      console.error(
+        `\n  Sanctuary: ${requestedFlags} requires a provisionable agent selector, ` +
+          `but the detected/configured platform is "${agentConfig.platform}". Only Hermes is provisionable today -- re-run with ` +
+          `--hermes against a Hermes config. Without it, wrap would proceed as a ` +
+          `plain cooperative wrap and arm nothing.\n`
+      );
+      process.exit(2);
+      return;
+    }
+    // FIX (N1-3 non-darwin gap, 2026-07-27 harden-loop): the check above
+    // only guards the platform-selector dimension. `runAutoProvisionForWrap`
+    // (auto-provision.ts) ALSO no-ops silently -- `{ ran: false }`, nothing
+    // printed -- on any non-darwin host, D1's v1 scope being darwin-only.
+    // Without this, a non-darwin Hermes host reached the real wrap flow,
+    // auto-provision silently armed nothing, and `printWrapSuccess` still
+    // rendered a success banner with no statement that exclusive egress (or
+    // account provisioning) armed nothing. Refuse loudly here too, before
+    // any wrap work, exactly like the platform-selector case above.
+    // `deps.osPlatform` is a test-only seam (defaults to the real `node:os`
+    // `platform()`) so this deterministically exercises both branches
+    // regardless of the CI runner's actual OS.
+    const resolvedOsPlatform = (deps.osPlatform ?? platform)();
+    if (resolvedOsPlatform !== "darwin") {
+      // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
+      console.error(
+        `\n  Sanctuary: ${requestedFlags} requires automatic account provisioning ` +
+          `and Castle Wall arming, which are darwin-only today (this host reports ` +
+          `"${resolvedOsPlatform}"). Without it, wrap would proceed as a plain cooperative ` +
+          `wrap and arm nothing.\n`
+      );
+      process.exit(2);
+      return;
     }
   }
 
@@ -646,14 +3081,28 @@ export async function runWrap(
       `\n  Sanctuary already wrapped: updating the existing Sanctuary entry.\n`
     );
   } else if (agentConfig.servers.length === 0) {
-    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
-    console.error(
-      `\n  Found ${agentConfig.platform} config at ${agentConfig.configPath} with no MCP servers yet.`
-    );
-    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
-    console.error(
-      `  Sanctuary will be installed as the only MCP server.\n`
-    );
+    if (agentConfig.platform === "hermes") {
+      // F7 (v1.6.1 first-run honesty): the empty surface here is the legacy
+      // cli-config.json artifact Hermes does NOT consult for MCP routing
+      // (see the DEBT note in the bootstrap path above). Printing "installed
+      // as the only MCP server" contradicted the config.yaml message printed
+      // moments earlier ("existing MCP servers there are preserved"), so
+      // point at the authoritative YAML surface instead.
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error(
+        `\n  Hermes routes MCP traffic through ${hermesConfigYamlPath()}.` +
+          `\n  Sanctuary will be added there; existing MCP entries are preserved.\n`
+      );
+    } else {
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error(
+        `\n  Found ${agentConfig.platform} config at ${agentConfig.configPath} with no MCP servers yet.`
+      );
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error(
+        `  Sanctuary will be installed as the only MCP server.\n`
+      );
+    }
   }
 
   // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
@@ -874,17 +3323,23 @@ export async function runWrap(
   // the opt-in Linux producer-signed activation (FIX 3). Both expose `stop()`; we
   // keep only the common shape so the cleanup is uniform.
   let castleWallDaemon: { stop(): Promise<void> } | undefined;
+  let castleWallDaemonLivenessSince: Date | undefined;
+  let unregisterCastleWallCleanup: (() => void) | undefined;
   const registerCastleWallCleanup = () => {
     if (!castleWallDaemon) return;
-    const stop = () => {
-      castleWallDaemon?.stop().catch(() => {});
+    unregisterCastleWallCleanup?.();
+    const stop = async () => {
+      try {
+        await castleWallDaemon?.stop();
+      } catch {
+        /* best-effort: a shutdown cleanup must not throw out of the signal handler */
+      }
     };
-    process.once("SIGINT", stop);
-    process.once("SIGTERM", stop);
-    process.once("exit", stop);
+    unregisterCastleWallCleanup = registerProcessShutdownCleanup(stop);
   };
   const startCastleWallForWrap = async (auditLog: AuditLog, masterKey: Uint8Array) => {
     if (castleWallDaemon) return;
+    castleWallDaemonLivenessSince = new Date();
     const fortressId = fortressIdFromStoragePath(storagePath);
     const runtime = await import("../castle-wall/runtime/index.js");
 
@@ -925,6 +3380,13 @@ export async function runWrap(
       auditLog,
     });
     registerCastleWallCleanup();
+  };
+  const stopTransientCastleWallDaemonForAutoProvision = async () => {
+    const daemon = castleWallDaemon;
+    castleWallDaemon = undefined;
+    unregisterCastleWallCleanup?.();
+    unregisterCastleWallCleanup = undefined;
+    await daemon?.stop();
   };
 
   // v1.2.1 (Finding GGG): plaintext passphrase backup file is now opt-in.
@@ -984,6 +3446,51 @@ export async function runWrap(
   const { command: sanctuaryCommand, args: sanctuaryArgs } =
     resolveSanctuaryCommand(options);
 
+  // 2026-07-02 hardening: the MCP entry written below is PINNED to
+  // SANCTUARY_VERSION with no prior guarantee that version is actually
+  // published - an unpublished pin yields a dead entry behind a success
+  // banner. Probe the registry (short timeout) and downgrade the claim
+  // honestly. NEVER blocks the wrap: "unpublished" and "unreachable" both
+  // warn and continue (availability); `--dev-dist` entries point at a local
+  // build validated above and involve no registry, so they skip the probe.
+  // The outcome is ALSO threaded into the terminal-final success banner
+  // (WrapSuccessInfo.pinnedVersionResolvability): the early warning here
+  // scrolls above dozens of lines of subsequent flow output, and a success
+  // surface that ends byte-identical to the resolvable case would re-create
+  // the exact dead-entry-behind-a-success-banner defect the probe exists to
+  // close.
+  let pinResolvability: PinnedVersionResolvability | undefined;
+  if (options.devDist === undefined) {
+    const checkPin = deps.checkPinResolvability ?? checkPinnedVersionResolvable;
+    pinResolvability = await checkPin(SANCTUARY_VERSION);
+    if (pinResolvability === "unpublished") {
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error(
+        `\n  WARNING: the harness MCP entry this wrap writes is pinned to` +
+          `\n  @sanctuary-framework/mcp-server@${SANCTUARY_VERSION}, but the npm registry` +
+          `\n  (as resolved from this directory) does not have that version. Unless your` +
+          `\n  agent's own project config routes the package scope to another registry,` +
+          `\n  the MCP entry will fail to start until it is published. If you are running` +
+          `\n  an unpublished build, re-run with --dev-dist <path-to-dist/cli.js> to point` +
+          `\n  the entry at your local build instead.`
+      );
+    } else if (pinResolvability === "unreachable") {
+      // "unreachable" also covers a REACHED custom registry whose
+      // unauthenticated 404 the probe declines to treat as authoritative
+      // (see checkPinnedVersionResolvable), so the stated cause must not
+      // claim the registry could not be reached.
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error(
+        `\n  Note: could not confirm with the npm registry that the pinned version` +
+          `\n  ${SANCTUARY_VERSION} resolves: the registry was unreachable (offline or` +
+          `\n  blocked), or a custom registry gave an answer this unauthenticated probe` +
+          `\n  cannot treat as authoritative. This wrap cannot verify the MCP entry it` +
+          `\n  writes will start; if the agent fails to start, re-run 'sanctuary protect'` +
+          `\n  once the registry confirms the version.`
+      );
+    }
+  }
+
   // D4 staging, Bug 2: Hermes v0.16.0 loads MCP servers from
   // ~/.hermes/config.yaml (`mcp_servers:` key, upstream
   // hermes_cli/mcp_config.py and mcp_startup.py), not from the JSON
@@ -1017,6 +3524,29 @@ export async function runWrap(
       // File absent - the plan creates it.
     }
     try {
+      // Parse-parity guard (Erik-ratified 2026-07-03, Option A): before the
+      // line-scanner's plan is allowed to drive a mutation, validate the
+      // scanner's view against a REAL PyYAML parse of the same bytes. Refuse
+      // on any disagreement, and refuse (fail-closed) if the PyYAML validator
+      // cannot run at all. This supersedes trusting the scanner's fidelity;
+      // it does not claim the scanner is correct, only that a real parser and
+      // the scanner agree on the facts this edit depends on. Runs BEFORE any
+      // surface is backed up or rewritten, so a refusal leaves everything
+      // untouched.
+      //
+      // The sidecar DI seam is NON-injectable on this production mutating
+      // path: the __hermesParityTestHook override is test-only (not a public
+      // dep), so a programmatic caller cannot pass an agreeing no-op parity and
+      // edit config.yaml without the real validator (DI-bypass closed
+      // 2026-07-03). The production path always runs a REAL PyYAML parse; it
+      // resolves WHICH python3 to run by probing a CODE-CONTROLLED candidate
+      // list (see hermesParityPythonCandidates) for PyYAML importability. No
+      // caller argument and no environment variable can steer that selection,
+      // so the parse cannot be pointed at an attacker-chosen interpreter.
+      await assertHermesYamlParseParity(
+        existingYaml,
+        __hermesParityTestHook.parity
+      );
       const plan = planHermesYamlInjection(existingYaml, {
         command: sanctuaryCommand,
         args: sanctuaryArgs,
@@ -1035,8 +3565,71 @@ export async function runWrap(
         );
         process.exit(1);
       }
+      if (err instanceof HermesYamlParityRefusedError) {
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+        console.error(`\n  Sanctuary: Hermes config.yaml Not Editable`);
+        console.error(`  ${err.message}`);
+        console.error(
+          `  Nothing was modified. The line-scanner that edits config.yaml is ` +
+            `checked\n  against the real PyYAML parser Hermes uses; wrap refuses to ` +
+            `edit when\n  they disagree or when that parser cannot run.\n`
+        );
+        process.exit(1);
+      }
       throw err;
     }
+  }
+
+  // `configStillWrapped` carries the PRE-wrap detection result (did ANY
+  // wrapped surface genuinely still carry the sanctuary entry? for Hermes
+  // that includes the authoritative config.yaml, whose plan action
+  // `replace-entry` means it did). Computed BEFORE the backup below so the
+  // crash-window warning next to it can fire before the already-wrapped
+  // content is captured as "the" backup; consumed by the deferred wrap-meta
+  // write at the end of the wrap.
+  const configStillWrapped =
+    hasSanctuaryInRaw || hermesYaml?.plan.action === "replace-entry";
+
+  // MED-2 (crash-window honesty): a config that already carries the
+  // sanctuary entry while NO wrap-meta exists on disk is exactly what an
+  // interrupted earlier wrap leaves behind (surfaces committed, then a
+  // crash before the deferred meta write). In that state the pristine
+  // pre-wrap config CANNOT be identified: the condition is
+  // indistinguishable from an operator who authored the sanctuary entry by
+  // hand, so no automatic recovery is attempted. The backup this wrap is
+  // about to take captures the CURRENT (already-wrapped) contents, and a
+  // later --unwrap restores THAT. Say so loudly, and point at the backup
+  // directory where an older pristine snapshot from the interrupted wrap
+  // may still exist (findNewerBackup's inverse breadcrumb: backup
+  // filenames embed timestamps, so older snapshots sort below the fresh
+  // one).
+  //
+  // 2026-07-02 hardening (MED-2 residual): the meta check is scoped to THIS
+  // surface (resolve()d configPath). The previous tenant-global check let a
+  // wrap-meta belonging to a DIFFERENT surface suppress the warning while
+  // this surface was in exactly the crash-window state.
+  //
+  // Copy honesty (fifth round): hasExistingWrapMeta deliberately reads an
+  // UNREADABLE pointer as false (failing toward this warning), so the text
+  // says "no READABLE wrap metadata" - in the unreadable-pointer state the
+  // meta likely IS on disk and the deferred meta write later in this same
+  // run will refuse with "wrap metadata exists but could not be read";
+  // the unhedged wording flatly contradicted that message.
+  if (
+    configStillWrapped &&
+    !(await hasExistingWrapMeta(agentConfig.configPath))
+  ) {
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+    console.error(
+      `\n  WARNING: this config already contains a Sanctuary entry, but no` +
+        `\n  readable wrap metadata exists for it, so the pristine pre-wrap` +
+        `\n  config could not be identified. The backup taken by THIS wrap` +
+        `\n  captures the current (already-wrapped) contents, and --unwrap` +
+        `\n  will restore that state. If this follows an interrupted wrap, check` +
+        `\n  ${join(storagePath, "backup")}` +
+        `\n  for an older pristine backup (timestamped config-backup-* files)` +
+        `\n  before relying on --unwrap.`
+    );
   }
 
   // Back up and rewrite agent config. For Hermes, config.yaml is backed up
@@ -1047,7 +3640,63 @@ export async function runWrap(
   if (hermesYaml?.existedBefore) {
     hermesYamlBackupPath = await backupConfig(hermesYaml.yamlPath);
   }
-  await saveWrapMeta({
+
+  // Harden round: the wrap-meta write is DEFERRED until every wrapped
+  // surface below is verified-committed. Writing it here (as earlier
+  // revisions did) violated the F6 invariant ("a wrap-meta exists" means
+  // "currently wrapped"): every rollback path after the write left the
+  // meta behind, and the next SUCCESSFUL wrap then preserved that stale
+  // pristine pointer, so a later --unwrap restored pre-failed-wrap content
+  // and silently discarded operator edits made between the failed wrap and
+  // the retry (worse for the created-fresh Hermes config.yaml, where a
+  // stale `backupPath: null` made unwrap DELETE an operator-authored file).
+
+  // Rollback for every post-rewrite failure: restore the primary config
+  // and, for Hermes, the config.yaml surface (or remove it when this wrap
+  // created it fresh). Defined here so the deferred wrap-meta write below
+  // shares the exact rollback the YAML block uses. Returns false when ANY
+  // surface could not be restored (MED-1: the wrap-meta failure path must
+  // know, because a still-wrapped surface with no meta on disk is an
+  // orphan --unwrap cannot find).
+  const rollbackWrapSurfaces = async (): Promise<boolean> => {
+    let allRestored = true;
+    if (hermesYaml) {
+      if (hermesYamlBackupPath) {
+        if (
+          !(await restoreFromBackup(hermesYaml.yamlPath, hermesYamlBackupPath))
+        ) {
+          allRestored = false;
+        }
+      } else {
+        try {
+          // Round-3 P1-A: parent-walk-safe even on the rollback path.
+          await unlinkSafeUnderRoot(hermesYaml.yamlPath);
+        } catch (err) {
+          // Best-effort removal of the file this wrap created. ENOENT means
+          // the write itself never landed (the end-state "absent" already
+          // holds); any OTHER failure (a symlink raced into its parent, an
+          // unwritable directory) leaves the created file in place, which
+          // counts as a failed restore for the orphan-wrap guard below.
+          const code =
+            err && typeof err === "object" && "code" in err
+              ? (err as NodeJS.ErrnoException).code
+              : undefined;
+          if (code !== "ENOENT") allRestored = false;
+        }
+      }
+    }
+    if (!(await restoreFromBackup(agentConfig.configPath, backupPath))) {
+      allRestored = false;
+    }
+    return allRestored;
+  };
+
+  // The unwrap pointer this wrap will persist once every surface verifies
+  // (see the deferred-write rationale at the persist site below). Built
+  // here, right after the backups, so the orphan-wrap guard can fall back
+  // to writing it from EVERY rollback path, not just the meta-write-failure
+  // one.
+  const wrapMetaPayload = {
     backupPath,
     originalPath: agentConfig.configPath,
     platform: agentConfig.platform,
@@ -1062,21 +3711,94 @@ export async function runWrap(
           ] satisfies WrapMetaAuxiliaryFile[],
         }
       : {}),
-  });
+  };
+  const persistWrapMeta = deps.saveWrapMeta ?? saveWrapMeta;
+
+  // MED-1 orphan-wrap guard, extended to ALL rollback paths (2026-07-02
+  // hardening; the #843 fix covered only the meta-write-failure rollback,
+  // leaving the three earlier rollback call sites able to end
+  // wrapped-with-no-meta). When ANY surface restore fails, the live config
+  // may STILL route traffic through Sanctuary while nothing on disk points
+  // at the pre-wrap backup; `--unwrap` would report "No Sanctuary wrap
+  // found". A meta pointing at the pre-wrap backup is strictly better than
+  // that orphan state (unwrap restores are idempotent, so re-restoring an
+  // already-restored surface is harmless - including a null-backup aux file
+  // this failed wrap never created or already removed, which unwrap's
+  // removal branch tolerates as already-absent ENOENT), so write it; if
+  // even that fails
+  // (e.g. disk full), never end silently: spell out exactly what --unwrap
+  // will (not) do and the manual restore for every surface.
+  const guardOrphanWrapAfterRollback = async (
+    fullyRolledBack: boolean,
+  ): Promise<void> => {
+    if (fullyRolledBack) return;
+    try {
+      await persistWrapMeta(wrapMetaPayload, { configStillWrapped });
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error(
+        `  Wrap metadata was written after the failed restore: run the` +
+          `\n  unwrap command (--unwrap) to retry restoring the pre-wrap config.`
+      );
+    } catch (retryErr) {
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error(
+        `\n  CRITICAL: the config is STILL WRAPPED and no wrap metadata` +
+          `\n  could be written: ${(retryErr as Error).message}` +
+          `\n  --unwrap will NOT find this wrap; traffic keeps routing` +
+          `\n  through Sanctuary until you restore manually:`
+      );
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error(
+        `    cp "${backupPath}" "${agentConfig.configPath}"`
+      );
+      if (hermesYaml) {
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+        console.error(
+          hermesYamlBackupPath
+            ? `    cp "${hermesYamlBackupPath}" "${hermesYaml.yamlPath}"`
+            : `    rm "${hermesYaml.yamlPath}" (this wrap created it fresh)`
+        );
+      }
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error("");
+    }
+  };
 
   const rewrite = deps.rewriteConfig ?? rewriteConfigForWrap;
-  await rewrite(
-    agentConfig,
-    sanctuaryCommand,
-    sanctuaryArgs,
-    Object.keys(sanctuaryEnv).length > 0 ? sanctuaryEnv : undefined,
-  );
+  // Harden round: the primary rewrite writes the live config IN PLACE
+  // (O_TRUNC via writeFileNoFollow, not temp+rename), so a throw mid-write
+  // (disk full, EIO) can leave the config truncated. With the wrap-meta
+  // write deferred until after verification, an uncaught throw here would
+  // propagate out of runWrap with no rollback AND no meta, so
+  // `--unwrap` would report nothing to restore. Catch, restore the
+  // pre-wrap surfaces, and exit non-zero, matching the YAML-write path.
+  try {
+    await rewrite(
+      agentConfig,
+      sanctuaryCommand,
+      sanctuaryArgs,
+      Object.keys(sanctuaryEnv).length > 0 ? sanctuaryEnv : undefined,
+    );
+  } catch (err) {
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+    console.error(
+      `\n  Config rewrite FAILED: ${(err as Error).message}`
+    );
+    await guardOrphanWrapAfterRollback(await rollbackWrapSurfaces());
+    process.exit(1);
+  }
 
-  const verifyOk = await verifyRewrittenConfig(
+  const verifyResult = await verifyRewrittenConfig(
     agentConfig.configPath,
     backupPath
   );
-  if (!verifyOk) process.exit(1);
+  if (!verifyResult.verified) {
+    // 2026-07-02 hardening: verification failure rolls back internally; if
+    // THAT restore failed, the live config is in an unknown (possibly still
+    // wrapped) state with no meta - run the orphan-wrap guard here too.
+    await guardOrphanWrapAfterRollback(verifyResult.restoredOnFailure);
+    process.exit(1);
+  }
 
   // D4 staging, Bug 2: apply the precomputed config.yaml injection now that
   // the JSON surface verified. D4 P1-1: the ENTIRE write+verify is inside
@@ -1087,21 +3809,6 @@ export async function runWrap(
   // non-zero, so the wrap is atomic: fully applied or fully rolled back.
   if (hermesYaml) {
     const yamlSurface = hermesYaml;
-    const rollbackBothSurfaces = async (): Promise<void> => {
-      if (hermesYamlBackupPath) {
-        await restoreFromBackup(yamlSurface.yamlPath, hermesYamlBackupPath);
-      } else {
-        try {
-          // Round-3 P1-A: parent-walk-safe even on the rollback path.
-          await unlinkSafeUnderRoot(yamlSurface.yamlPath);
-        } catch {
-          // Best-effort removal of the file this wrap created (it may not
-          // exist when the write itself was what failed, or be refused if a
-          // symlink was raced into its parent).
-        }
-      }
-      await restoreFromBackup(agentConfig.configPath, backupPath);
-    };
     let yamlVerified = false;
     try {
       // D4 P2-3 courtesy re-check at write time. Round-2 P1-A: lstat-then-
@@ -1124,7 +3831,7 @@ export async function runWrap(
       console.error(
         `\n  Hermes config.yaml write FAILED: ${(err as Error).message}`
       );
-      await rollbackBothSurfaces();
+      await guardOrphanWrapAfterRollback(await rollbackWrapSurfaces());
       process.exit(1);
     }
     if (!yamlVerified) {
@@ -1132,13 +3839,54 @@ export async function runWrap(
       console.error(
         `\n  Verification FAILED: No sanctuary entry in rewritten ${yamlSurface.yamlPath}.`
       );
-      await rollbackBothSurfaces();
+      await guardOrphanWrapAfterRollback(await rollbackWrapSurfaces());
       process.exit(1);
     }
     // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error(
       `  Hermes MCP routing: ${formatHermesYamlAction(yamlSurface.plan, yamlSurface.yamlPath)}`
     );
+  }
+
+  // F6 + harden round: persist the unwrap pointer ONLY now, after every
+  // wrapped surface is verified-committed, so no failure path can leave a
+  // meta behind for a wrap that did not stick. `configStillWrapped`
+  // (computed pre-backup above) keeps a stale meta left by a pre-1.6.1
+  // unwrap - which never removed metas - or by a by-hand unwrap from
+  // pinning an ancient pristine pointer over a config the operator has
+  // since edited, while a re-wrap over a partially-unwrapped Hermes install
+  // (JSON restored, YAML restore failed and retained the meta) still
+  // preserves the good pristine pointers. If the meta write itself fails,
+  // roll both surfaces back: a wrapped config with no unwrap pointer would
+  // strand --unwrap entirely.
+  //
+  // Honest crash window (MED-2): deferring the meta write opens the inverse
+  // hazard. Between the surface commits above and this write, a crash or
+  // power loss leaves the config WRAPPED with NO meta. A retry wrap then
+  // sees configStillWrapped=true with no existing meta to preserve, so the
+  // fresh pointer wins and the fresh backup captures the ALREADY-WRAPPED
+  // content; the pristine pre-wrap state survives only in the older
+  // timestamped backups nothing points at. Perfect detection is impossible
+  // (that state is indistinguishable from a hand-authored sanctuary entry),
+  // so the wrap prints the loud pre-backup warning above in exactly that
+  // condition instead of guessing.
+  try {
+    await persistWrapMeta(wrapMetaPayload, { configStillWrapped });
+  } catch (err) {
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+    console.error(
+      `\n  Wrap metadata write FAILED: ${(err as Error).message}`
+    );
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+    console.error(
+      `  Rolling back: a wrapped config without an unwrap pointer would strand --unwrap.`
+    );
+    // MED-1 (orphan-wrap guard): when a surface restore fails here, the
+    // guard retries the meta write once before giving up (a meta pointing
+    // at the pre-wrap backup beats the orphan state), then prints the
+    // CRITICAL manual-restore message on a double failure.
+    await guardOrphanWrapAfterRollback(await rollbackWrapSurfaces());
+    process.exit(1);
   }
 
   // WP-V1.2 reshape: write the broker-tool identifiers to Claude Code's
@@ -1287,6 +4035,10 @@ export async function runWrap(
     // and the auto-open browser path; print a concise success line that
     // points operators at the persistent dashboard.
 
+    let ndAuditLog: AuditLog | undefined;
+    let ndAuditStorage: FilesystemStorage | undefined;
+    let ndAuditMasterKey: Uint8Array | undefined;
+    let unregisterNoDashboardAuditFlush: (() => void) | undefined;
     // v1.3.0 (WWWWW, NNN regression): --no-dashboard wraps previously
     // skipped identity bootstrap because the creation lived after the
     // dashboard startup path. Derive the master key and create a default
@@ -1299,7 +4051,17 @@ export async function runWrap(
         // re-deriving from key-params here could produce a DIFFERENT master
         // than the envelope holds - exactly the divergence this build ends.
         const ndDerived = { key: wrapCustody.masterKey };
-        const ndAuditLog = new AuditLog(ndStorage, ndDerived.key);
+        ndAuditStorage = ndStorage;
+        ndAuditMasterKey = ndDerived.key;
+        ndAuditLog = new AuditLog(ndStorage, ndDerived.key);
+        const flushNoDashboardAuditLogOnShutdown = ndAuditLog;
+        unregisterNoDashboardAuditFlush = registerProcessShutdownCleanup(async () => {
+          try {
+            await flushNoDashboardAuditLogOnShutdown.flush();
+          } catch {
+            /* best-effort: a shutdown cleanup must not throw out of the signal handler */
+          }
+        });
         await bestEffortRecordWrapWorkloadRegistration({
           auditLog: ndAuditLog,
           storagePath,
@@ -1337,6 +4099,7 @@ export async function runWrap(
           });
         }
         await ndAuditLog.flush();
+        unregisterNoDashboardAuditFlush?.();
       } catch (err) {
         // SAFETY: stderr / stdout is the operator-facing CLI channel.
         console.error(
@@ -1347,19 +4110,57 @@ export async function runWrap(
     }
 
     failIfAnchorOptInDropped();
+    // Auto-provision Step 2 (Build 1): after the cooperative wrap above has
+    // fully completed (config rewritten, identity bootstrapped, agent
+    // record persisted), offer to provision the dedicated agent account and
+    // arm the wall. Runs AFTER, never blocking, the cooperative wrap: a
+    // decline / non-TTY skip / mid-flow abort here never reverts anything
+    // already done above (fix H4 -- the cooperative wrap always completes).
+    const autoProvisionRun = await maybeRunAutoProvisionForWrap(
+      agentConfig,
+      options,
+      deps,
+      stopTransientCastleWallDaemonForAutoProvision,
+    );
+    const autoProvisionSummary = autoProvisionRun.summary;
+    renderAutoProvisionOutcome(autoProvisionSummary);
+    await exitAfterDeferredAutoProvisionSignal(autoProvisionRun.deferredSignal);
+    bestEffortUpsertLocalAgentProtectionSubject({
+      storagePath,
+      record: localAgentRecord,
+      autoProvisionSummary,
+    });
+    const castleWallProtectionClaim = await resolveWrapProtectionClaim({
+      auditLog: ndAuditLog,
+      auditStorage: ndAuditStorage,
+      masterKey: ndAuditMasterKey,
+      autoProvisionSummary,
+      castleWallDaemonLivenessSince,
+      storagePath,
+    });
     const toolName = toolNameFor(agentConfig.platform, agentConfig.servers);
     printWrapSuccessNoDashboard({
       toolName,
       version: readPackageVersion(),
       toolCount: countUpstreamTools(upstreamServers),
       serverCount: upstreamServers.length,
+      platform: agentConfig.platform,
       passphraseLocation,
       passphraseSource,
-      // Honest arm outcome: castleWallDaemon is only defined when
-      // startCastleWallForWrap succeeded; on a start failure the catch above
-      // ran warnCastleWallDaemonNotStarted and left it undefined.
-      castleWallArmed: castleWallDaemon !== undefined,
+      castleWallProtectionClaim,
+      // 2026-07-02 hardening: the dead-pin warning must survive to the
+      // terminal-final success surface, not only the mid-flow warning.
+      pinnedVersionResolvability: pinResolvability,
     });
+    try {
+      await stopTransientCastleWallDaemonForAutoProvision();
+    } catch (err) {
+      // SAFETY: a lingering transient daemon keeps the fortress socket held and blocks the sudo retry.
+      console.error(
+        `  WARNING: the transient Castle Wall daemon could not be stopped before --no-dashboard exit ` +
+          `(${(err as Error).message}). Stop the holding process before retrying the sudo protect command.`,
+      );
+    }
     return;
   }
 
@@ -1367,10 +4168,37 @@ export async function runWrap(
   // success banner. Updated below when the substrate selector loads.
   let intelligenceHealthy: boolean | undefined;
   let intelligenceError: string | undefined;
+  // Rho-2.5: whether the consent-gated Tier B redactor was installed on the
+  // wrap-auto selector. Threaded into buildV11Bindings so the wrap-emitted
+  // dashboard's /api/query-anonymity/pii route reports the truthful state.
+  let wrapTierBPiiRedactorInstalled = false;
   let wrapAuditLog: AuditLog | undefined;
+  let wrapAuditStorage: FilesystemStorage | undefined;
+  let wrapAuditMasterKey: Uint8Array | undefined;
+  let unregisterWrapAuditFlush: (() => void) | undefined;
 
   // Start the dashboard in-process.
   const authToken = generateAuthToken();
+
+  // Fleet Console: wire the wrap ("Protect") dashboard's fleet-roster panel to
+  // the REAL, read-only, disk-backed federation projection. Without this the
+  // panel's `GET /api/posture/fleet` (and `GET /api/fleet/roster`) always read
+  // the honest-absent shape even when federation IS provisioned, so a real fleet
+  // was invisible on the wrap dashboard. The provider reads the at-rest fortress
+  // records (trust root + durable revocation projection) under the custody
+  // master; it is strictly read-only (no sync loop, no mutation, no key
+  // material) and resolved lazily per request so a post-start
+  // `sanctuary federation provision` is observed without a wrap restart. Only
+  // wired when custody is established (federation records are encrypted under the
+  // master key); otherwise the panel stays honestly absent.
+  const wrapFleetRoster =
+    wrapCustody !== undefined
+      ? buildWrapFleetRosterProvider({
+          storage: new FilesystemStorage(`${storagePath}/state`),
+          masterKey: wrapCustody.masterKey,
+        })
+      : undefined;
+
   const startFn: DashboardStarter =
     deps.startDashboard ??
     ((opts) =>
@@ -1380,6 +4208,7 @@ export async function runWrap(
         mode: opts.mode,
         authToken: opts.authToken,
         serverVersion: opts.serverVersion,
+        ...(wrapFleetRoster ? { fleetRoster: wrapFleetRoster } : {}),
       }));
   // Multi-tenancy: honour SANCTUARY_DASHBOARD_PORT so two wraps can pick
   // distinct starting ports without both racing for 3501.
@@ -1424,7 +4253,27 @@ export async function runWrap(
       // instead of re-deriving from key-params - the spawned MCP server
       // unlocks the same envelope with the same passphrase.
       const derived = { key: wrapCustody.masterKey };
+      wrapAuditStorage = v11Storage;
+      wrapAuditMasterKey = derived.key;
       wrapAuditLog = new AuditLog(v11Storage, derived.key);
+      // FIX (N1-1 corrected, 2026-07-27): `flush()` is the documented
+      // contract for durability on short-lived-CLI exit (drains
+      // `pendingWrites`/`appendQueue` and writes the graceful-shutdown
+      // checkpoint -- see AuditLog.flush()'s doc comment), but it was never
+      // registered as a shutdown cleanup. A SIGINT/SIGTERM during the
+      // foreground dashboard serve (the normal way this long-lived process
+      // ends) abandoned any in-flight append and skipped the checkpoint
+      // entirely. `flush()` documents itself as safe to call more than
+      // once, so this is harmless alongside the explicit `flush()` calls on
+      // the normal-completion exit paths below.
+      const flushAuditLogOnShutdown = wrapAuditLog;
+      unregisterWrapAuditFlush = registerProcessShutdownCleanup(async () => {
+        try {
+          await flushAuditLogOnShutdown.flush();
+        } catch {
+          /* best-effort: a shutdown cleanup must not throw out of the signal handler */
+        }
+      });
       await bestEffortRecordWrapWorkloadRegistration({
         auditLog: wrapAuditLog,
         storagePath,
@@ -1467,6 +4316,11 @@ export async function runWrap(
           ...(brokerProducerKeyLoad.status === "unreadable"
             ? { brokerProducerKeyExpectedButUnavailable: true }
             : {}),
+          resolveProtectionClaimSubject: () =>
+            resolveProtectionSubjectFromFortressPath(
+              storagePath,
+              fortressIdFromStoragePath(storagePath),
+            ).then((result) => result.subject),
         });
       } catch {
         // Never let the producer-key probe fail wrap. On any unexpected throw the
@@ -1537,10 +4391,26 @@ export async function runWrap(
           identityId: `fortress:${storagePath}`,
         });
         await wrapIntelligenceSelector.load();
+        // Rho-2.5 (HIGH privacy-leak fix): the wrap-auto dashboard mounts
+        // the /api/query-anonymity/pii route and serves concierge over the
+        // frontier substrate. Without this install the selector kept the
+        // passthrough IDENTITY_REDACTOR, so an operator who opted into
+        // Tier B here egressed query + context UNSCRUBBED. Route through
+        // THE shared chokepoint with the SAME hashed fortressId that the
+        // buildV11Bindings call below uses, so the route's PATCH and the
+        // live scrub read the same encrypted config.
+        wrapTierBPiiRedactorInstalled = installConsentGatedRedactor({
+          selector: wrapIntelligenceSelector,
+          storage: v11Storage,
+          masterKey: derived.key,
+          fortressId: fortressIdFromStoragePath(storagePath),
+        });
         intelligenceHealthy = true;
       } catch (err) {
         intelligenceHealthy = false;
         intelligenceError = (err as Error).message;
+        // wrapTierBPiiRedactorInstalled stays false (its initialized value):
+        // the install assignment above only completes when no throw occurred.
         // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
         console.error(
           `  Note: Intelligence panel unavailable on wrap URL ` +
@@ -1567,6 +4437,9 @@ export async function runWrap(
           // agent chat from first launch.
           storage: v11Storage,
           masterKey: derived.key,
+          // Rho-2.5: the consent-gated redactor is installed on the
+          // wrap-auto selector, so report the truthful effective state.
+          tierBPiiRedactorInstalled: wrapTierBPiiRedactorInstalled,
         }),
       );
       // The wrap-auto dashboard always binds 127.0.0.1. The printed URL
@@ -1584,6 +4457,52 @@ export async function runWrap(
   }
 
   failIfAnchorOptInDropped();
+
+  // Auto-provision Step 2 (Build 1): see the matching call + comment in the
+  // --no-dashboard branch above. Runs after the cooperative wrap (config +
+  // identity + dashboard) has fully completed; never reverts it.
+  const autoProvisionRun = await maybeRunAutoProvisionForWrap(
+    agentConfig,
+    options,
+    deps,
+    stopTransientCastleWallDaemonForAutoProvision,
+  );
+  const autoProvisionSummary = autoProvisionRun.summary;
+  renderAutoProvisionOutcome(autoProvisionSummary);
+  await exitAfterDeferredAutoProvisionSignal(autoProvisionRun.deferredSignal);
+  bestEffortUpsertLocalAgentProtectionSubject({
+    storagePath,
+    record: localAgentRecord,
+    autoProvisionSummary,
+  });
+
+  // FIX (N1-2, 2026-07-26; REVERTED 2026-07-27 harden-loop): a prior version
+  // of this fix exited the process whenever `declined-by-operator` was the
+  // outcome, on the premise that falling through to the foreground
+  // dashboard serve "holds the event loop open forever". That premise does
+  // not hold for this outcome kind: `declined-by-operator` is returned by
+  // the provision orchestrator ONLY when `ctx.isTty === true` (a
+  // non-interactive run returns the distinct `skipped-non-tty-cooperative-
+  // only` kind instead, via an earlier check in that same function) --
+  // i.e. this is always a real interactive operator at a terminal, for whom
+  // holding the dashboard open until they stop it is the entire point of
+  // `sanctuary protect`, identical to the accepted-arm path just below.
+  // Exiting here regressed the default interactive case: a bare Enter at
+  // the step-2 confirm (the DEFAULT-N prompt) or the explicit, common
+  // `--no-provision-agent-account` flag both terminated the whole wrap
+  // instead of continuing to serve the dashboard, and skipped
+  // `resolveWrapProtectionClaim` / `printWrapSuccess` entirely -- dropping
+  // the honest protection-state claim, the dashboard URL, and the
+  // passphrase location precisely on the un-armed path where the operator
+  // most needs them. The actual automation blocker this was meant to fix
+  // (a `kill` not terminating the process) is the SIGINT/SIGTERM fix above
+  // (`handleProcessShutdownSignal` now calls `process.exit` after cleanups,
+  // and the Castle Wall daemon started above is already registered via
+  // `registerProcessShutdownCleanup`, so it is torn down on that path
+  // without any special-casing here). Decline is informational only
+  // (`renderAutoProvisionOutcome` above already printed it) and the flow
+  // continues exactly like every other non-arming outcome, matching the
+  // `--no-dashboard` branch's sibling handling of the same outcome kind.
 
   const dashboardUrl = dashboard.createSessionUrl?.() ?? dashboard.url;
 
@@ -1610,12 +4529,14 @@ export async function runWrap(
       : {}),
     mode: "wrap",
   });
-  const cleanupRuntime = () => {
-    clearTenantRuntime(storagePath).catch(() => {});
+  const cleanupRuntime = async () => {
+    try {
+      await clearTenantRuntime(storagePath);
+    } catch {
+      /* best-effort: a shutdown cleanup must not throw out of the signal handler */
+    }
   };
-  process.once("SIGINT", cleanupRuntime);
-  process.once("SIGTERM", cleanupRuntime);
-  process.once("exit", cleanupRuntime);
+  registerProcessShutdownCleanup(cleanupRuntime);
 
   // Auto-open in browser.
   const toolName = toolNameFor(agentConfig.platform, agentConfig.servers);
@@ -1630,21 +4551,34 @@ export async function runWrap(
 
   if (wrapAuditLog) {
     await wrapAuditLog.flush();
+    unregisterWrapAuditFlush?.();
   }
+
+  const castleWallProtectionClaim = await resolveWrapProtectionClaim({
+    auditLog: wrapAuditLog,
+    auditStorage: wrapAuditStorage,
+    masterKey: wrapAuditMasterKey,
+    autoProvisionSummary,
+    castleWallDaemonLivenessSince,
+    storagePath,
+  });
 
   printWrapSuccess({
     toolName,
     version: readPackageVersion(),
     toolCount: countUpstreamTools(upstreamServers),
     serverCount: upstreamServers.length,
+    platform: agentConfig.platform,
     dashboardUrl,
     browserOpened: !options.noOpen,
     passphraseLocation,
     passphraseSource,
     intelligenceHealthy,
     intelligenceError,
-    // Honest arm outcome: defined only when startCastleWallForWrap succeeded.
-    castleWallArmed: castleWallDaemon !== undefined,
+    castleWallProtectionClaim,
+    // 2026-07-02 hardening: the dead-pin warning must survive to the
+    // terminal-final success surface, not only the mid-flow warning.
+    pinnedVersionResolvability: pinResolvability,
   });
 }
 
@@ -1725,21 +4659,31 @@ interface WrapSuccessInfo {
   version: string;
   toolCount: number;
   serverCount: number;
+  /**
+   * Wrap platform, used for platform-specific banner copy (F7: on Hermes with
+   * an empty legacy JSON surface, the upstream-count line would read
+   * "0 tools registered across 0 upstream servers" and appear to contradict
+   * the authoritative config.yaml routing message).
+   */
+  platform?: AgentPlatform;
   dashboardUrl: string;
   browserOpened: boolean;
   passphraseLocation: string;
   passphraseSource: string;
   intelligenceHealthy?: boolean;
   intelligenceError?: string;
+  castleWallProtectionClaim: ProtectionStateClaim;
   /**
-   * Whether the Castle Wall enforcement daemon actually armed during this
-   * wrap. `true` => daemon started; `false` => the loud "NOT armed" warning
-   * fired and traffic is not being filtered; `undefined` => no arm signal was
-   * threaded into the banner (treated conservatively as not-confirmed, never
-   * as "Full"). Reserving the affirmative "Castle Wall Full" hero claim for an
-   * observed arm mirrors the existing `intelligenceHealthy` discipline.
+   * Wrap-time registry probe outcome for the version-pinned MCP entry
+   * (2026-07-02 hardening). "unpublished" renders a loud warning INSIDE the
+   * final banner (the entry cannot start until the version is published);
+   * "unreachable" renders an honest could-not-verify note. `undefined`
+   * means the probe did not run (`--dev-dist` local-build entries involve
+   * no registry) and, conservatively, "resolvable"/"skipped" add no noise.
+   * The mid-flow warning alone is NOT enough: it scrolls far above the
+   * banner, and the banner is the success claim the operator acts on.
    */
-  castleWallArmed?: boolean;
+  pinnedVersionResolvability?: PinnedVersionResolvability;
 }
 
 export function formatWrapSuccess(info: WrapSuccessInfo): string {
@@ -1753,9 +4697,7 @@ export function formatWrapSuccess(info: WrapSuccessInfo): string {
   lines.push(
     `  ${g(check)} Wrapped ${b(info.toolName)} with Sanctuary v${info.version}`
   );
-  lines.push(
-    `  ${g(check)} ${info.toolCount} tools registered across ${info.serverCount} upstream server${info.serverCount !== 1 ? "s" : ""}`
-  );
+  lines.push(`  ${g(check)} ${renderUpstreamCountLine(info)}`);
   lines.push(
     `  ${g(check)} Sovereignty Dashboard running at ${b(info.dashboardUrl)}`
   );
@@ -1773,24 +4715,18 @@ export function formatWrapSuccess(info: WrapSuccessInfo): string {
   const sentinelsStatus = info.intelligenceHealthy === false
     ? "Sentinels Degraded (intelligence disabled)"
     : "Sentinels Degraded (no TEE)";
-  // Honesty: the load-bearing enforcement layer is Castle Wall. Reserve the
-  // affirmative "Castle Wall Full" hero claim for an observed arm. When the
-  // daemon failed to start (`castleWallArmed === false`) or no arm signal was
-  // threaded (`undefined`), do NOT print "Your agent is protected" / "Full" \u2014
-  // that is the exact overclaim the audit flagged (a green hero printed
-  // seconds after the loud "traffic NOT filtered" warning).
-  const castleWallLabel = renderCastleWallBannerLabel(info.castleWallArmed);
-  const heroPrefix = info.castleWallArmed === true
-    ? b("Your agent is protected.")
-    : b("Your agent is wrapped, but enforcement is not confirmed.");
+  const protection = protectionStateAdvice(info.castleWallProtectionClaim);
   // Honesty (Finding 3, 2026-06-25): Charter and Heralds are "ready" after a
   // wrap, not "Full". "Full" is a superlative reserved for observed/verified
   // state (as Castle Wall and Sentinels already are); printing "Charter Full /
   // Heralds Full" unconditionally (even under --no-dashboard, even when nothing
   // was exercised) was the same overclaim the load-bearing-layer fix removed.
   lines.push(
-    `  ${heroPrefix} ${castleWallLabel} / ${sentinelsStatus} / Charter: ready / Heralds: ready.`,
+    `  ${b(protection.operatorSentence)} ${protection.castleWallLabel} / ${sentinelsStatus} / Charter: ready / Heralds: ready.`,
   );
+  if (protection.imperative !== null) {
+    lines.push(`  ${protection.imperative}`);
+  }
   if (info.intelligenceHealthy === false && info.intelligenceError) {
     const w = (s: string) => `\x1b[33m${s}\x1b[0m`; // yellow
     lines.push("");
@@ -1798,20 +4734,77 @@ export function formatWrapSuccess(info: WrapSuccessInfo): string {
     lines.push(`    Concierge chat and substrate-driven explanations will not work until this is resolved.`);
     lines.push(`    Run 'sanctuary intelligence diagnose' to inspect substrate config.`);
   }
+  lines.push(...renderPinResolvabilityBannerLines(info));
   lines.push("");
   return lines.join("\n");
 }
 
 /**
- * Render the Castle Wall segment of the wrap success banner from the real arm
- * outcome. Honesty discipline: "Castle Wall Full" is only printed when the
- * daemon is observed armed; a failed arm renders a loud "NOT ARMED" and an
- * absent signal renders "status unknown" \u2014 never "Full" on presence alone.
+ * Banner lines for the pinned-MCP-entry resolvability outcome, shared by
+ * both success surfaces (2026-07-02 hardening). An "unpublished" pin means
+ * the MCP entry this wrap just wrote CANNOT start \u2014 saying so only in a
+ * mid-flow warning that scrolls above the banner left the terminal-final
+ * success surface byte-identical to a working wrap (the dead-entry-behind-
+ * a-success-banner defect the probe exists to close). "unreachable" gets
+ * the honest could-not-verify note; "resolvable"/"skipped"/absent add
+ * nothing.
  */
-function renderCastleWallBannerLabel(armed: boolean | undefined): string {
-  if (armed === true) return "Castle Wall Full";
-  if (armed === false) return "Castle Wall NOT ARMED (traffic not filtered)";
-  return "Castle Wall status unknown (not confirmed armed)";
+function renderPinResolvabilityBannerLines(info: {
+  version: string;
+  pinnedVersionResolvability?: PinnedVersionResolvability;
+}): string[] {
+  const w = (s: string) => `\x1b[33m${s}\x1b[0m`; // yellow
+  const d = (s: string) => `\x1b[2m${s}\x1b[0m`; // dim
+  if (info.pinnedVersionResolvability === "unpublished") {
+    return [
+      "",
+      `  ${w("\u26A0")} The MCP entry this wrap wrote is pinned to ` +
+        `@sanctuary-framework/mcp-server@${info.version},`,
+      `    which is not on the npm registry (as resolved from this directory): unless`,
+      `    your agent's project config routes the scope to another registry, it cannot`,
+      `    start until that version is published. For an unpublished build, re-run`,
+      `    with --dev-dist <path-to-dist/cli.js> to point the entry at your local build.`,
+    ];
+  }
+  if (info.pinnedVersionResolvability === "unreachable") {
+    // "unreachable" also covers a REACHED custom registry whose 404 the
+    // unauthenticated probe declines to trust, so the cause line says
+    // "could not confirm", never "could not be reached".
+    return [
+      "",
+      `  ${d(
+        `Note: the npm registry could not confirm the pinned MCP entry (v${info.version})`,
+      )}`,
+      `  ${d(
+        "resolves (unreachable, or a custom registry this probe cannot verify against),",
+      )}`,
+      `  ${d(
+        "so this wrap could not verify it. If the agent fails to start, re-run",
+      )}`,
+      `  ${d("'sanctuary protect' once the registry confirms the version.")}`,
+    ];
+  }
+  return [];
+}
+
+/**
+ * Render the upstream tools/servers count line. F7 (v1.6.1 first-run
+ * honesty): on Hermes the counts derive from the legacy cli-config.json
+ * surface Hermes does not consult for MCP routing, so a first run would
+ * print "0 tools registered across 0 upstream servers" moments after the
+ * (correct) message that config.yaml entries are preserved. When the
+ * authoritative surface is the Hermes YAML and the legacy surface is empty,
+ * say what actually happened instead.
+ */
+function renderUpstreamCountLine(info: {
+  toolCount: number;
+  serverCount: number;
+  platform?: AgentPlatform;
+}): string {
+  if (info.platform === "hermes" && info.serverCount === 0) {
+    return "Sanctuary MCP routing installed in Hermes config.yaml (existing entries preserved)";
+  }
+  return `${info.toolCount} tools registered across ${info.serverCount} upstream server${info.serverCount !== 1 ? "s" : ""}`;
 }
 
 function printWrapSuccess(info: WrapSuccessInfo): void {
@@ -1824,12 +4817,19 @@ interface WrapSuccessNoDashboardInfo {
   version: string;
   toolCount: number;
   serverCount: number;
+  /** See WrapSuccessInfo.platform; same platform-specific copy rules. */
+  platform?: AgentPlatform;
   passphraseLocation: string;
   passphraseSource: string;
   intelligenceHealthy?: boolean;
   intelligenceError?: string;
-  /** See WrapSuccessInfo.castleWallArmed; same arm-outcome discipline. */
-  castleWallArmed?: boolean;
+  castleWallProtectionClaim: ProtectionStateClaim;
+  /**
+   * See WrapSuccessInfo.pinnedVersionResolvability; same banner-honesty
+   * discipline (an unpublished pin must be visible on the terminal-final
+   * success surface, not only in a mid-flow warning).
+   */
+  pinnedVersionResolvability?: PinnedVersionResolvability;
 }
 
 /**
@@ -1852,9 +4852,7 @@ export function formatWrapSuccessNoDashboard(
   lines.push(
     `  ${g(check)} Wrapped ${b(info.toolName)} with Sanctuary v${info.version}`,
   );
-  lines.push(
-    `  ${g(check)} ${info.toolCount} tools registered across ${info.serverCount} upstream server${info.serverCount !== 1 ? "s" : ""}`,
-  );
+  lines.push(`  ${g(check)} ${renderUpstreamCountLine(info)}`);
   lines.push(
     `  ${d("Dashboard spawn skipped per --no-dashboard. Run `sanctuary dashboard` separately for a persistent dashboard.")}`,
   );
@@ -1864,21 +4862,20 @@ export function formatWrapSuccessNoDashboard(
   const sentinelsStatus = info.intelligenceHealthy === false
     ? "Sentinels Degraded (intelligence disabled)"
     : "Sentinels Degraded (no TEE)";
-  // Honesty: same arm-outcome discipline as formatWrapSuccess \u2014 reserve the
-  // affirmative "protected" / "Castle Wall Full" hero for an observed arm.
-  const castleWallLabel = renderCastleWallBannerLabel(info.castleWallArmed);
-  const heroPrefix = info.castleWallArmed === true
-    ? b("Your agent is protected.")
-    : b("Your agent is wrapped, but enforcement is not confirmed.");
+  const protection = protectionStateAdvice(info.castleWallProtectionClaim);
   lines.push(
-    `  ${heroPrefix} ${castleWallLabel} / ${sentinelsStatus} / Charter: ready / Heralds: ready.`,
+    `  ${b(protection.operatorSentence)} ${protection.castleWallLabel} / ${sentinelsStatus} / Charter: ready / Heralds: ready.`,
   );
+  if (protection.imperative !== null) {
+    lines.push(`  ${protection.imperative}`);
+  }
   if (info.intelligenceHealthy === false && info.intelligenceError) {
     const w = (s: string) => `\x1b[33m${s}\x1b[0m`;
     lines.push("");
     lines.push(`  ${w("\u26A0")} Sentinels intelligence disabled: ${info.intelligenceError}`);
     lines.push(`    Run 'sanctuary intelligence diagnose' to inspect substrate config.`);
   }
+  lines.push(...renderPinResolvabilityBannerLines(info));
   lines.push("");
   return lines.join("\n");
 }
@@ -1892,10 +4889,17 @@ function printWrapSuccessNoDashboard(
 
 // ── Post-wrap verification ──────────────────────────────────────────
 
+/**
+ * Verify the rewritten primary config and roll it back on failure.
+ * `restoredOnFailure` reports whether the internal rollback restore
+ * succeeded (meaningful only when `verified` is false) so the caller's
+ * orphan-wrap guard can detect a failed restore (2026-07-02 hardening;
+ * previously the restore result was discarded here).
+ */
 async function verifyRewrittenConfig(
   configPath: string,
   backupPath: string
-): Promise<boolean> {
+): Promise<{ verified: boolean; restoredOnFailure: boolean }> {
   try {
     const raw = await readFile(configPath, "utf-8");
     let parsed: Record<string, unknown>;
@@ -1905,8 +4909,10 @@ async function verifyRewrittenConfig(
       // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
       console.error(`\n  Verification FAILED: Rewritten config is not valid JSON.`);
       console.error(`  Error: ${(err as Error).message}`);
-      await restoreFromBackup(configPath, backupPath);
-      return false;
+      return {
+        verified: false,
+        restoredOnFailure: await restoreFromBackup(configPath, backupPath),
+      };
     }
 
     const servers =
@@ -1918,43 +4924,57 @@ async function verifyRewrittenConfig(
     if (!servers.sanctuary) {
       // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
       console.error(`\n  Verification FAILED: No sanctuary entry in rewritten config.`);
-      await restoreFromBackup(configPath, backupPath);
-      return false;
+      return {
+        verified: false,
+        restoredOnFailure: await restoreFromBackup(configPath, backupPath),
+      };
     }
 
     const sanctuaryEntry = servers.sanctuary as Record<string, unknown>;
     if (!sanctuaryEntry.command || typeof sanctuaryEntry.command !== "string") {
       // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
       console.error(`\n  Verification FAILED: Sanctuary entry has no command.`);
-      await restoreFromBackup(configPath, backupPath);
-      return false;
+      return {
+        verified: false,
+        restoredOnFailure: await restoreFromBackup(configPath, backupPath),
+      };
     }
 
-    return true;
+    return { verified: true, restoredOnFailure: true };
   } catch (err) {
     // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error(`\n  Verification FAILED: ${(err as Error).message}`);
-    await restoreFromBackup(configPath, backupPath);
-    return false;
+    return {
+      verified: false,
+      restoredOnFailure: await restoreFromBackup(configPath, backupPath),
+    };
   }
 }
 
+/**
+ * Restore `configPath` from `backupPath`, reporting failure to the operator
+ * without throwing. Returns false when the restore FAILED (the live config
+ * keeps its current, possibly-wrapped contents); callers that must not end
+ * in a wrapped-with-no-meta orphan state (MED-1, the wrap-meta failure
+ * rollback) branch on it. Other callers may ignore the result: the CRITICAL
+ * manual-recovery message has already printed.
+ */
 async function restoreFromBackup(
   configPath: string,
   backupPath: string
-): Promise<void> {
+): Promise<boolean> {
   try {
     await restoreConfig(backupPath, configPath);
     // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error(`  Original config restored from backup.`);
     console.error(`  Backup preserved at: ${backupPath}\n`);
+    return true;
   } catch (restoreErr) {
-    console.error(
-      `  CRITICAL: Could not restore backup from ${backupPath}`
-    );
     // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+    console.error(`  CRITICAL: Could not restore backup from ${backupPath}`);
     console.error(`  Error: ${(restoreErr as Error).message}`);
     console.error(`  Manual recovery: copy ${backupPath} to ${configPath}\n`);
+    return false;
   }
 }
 
@@ -1970,7 +4990,10 @@ async function unwrap(dryRun: boolean): Promise<void> {
   try {
     meta = await findLatestBackup();
   } catch (err) {
-    if (err instanceof WrapMetaValidationError) {
+    if (
+      err instanceof WrapMetaValidationError ||
+      err instanceof WrapMetaUnreadableError
+    ) {
       // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
       console.error(`\n  Sanctuary: Unwrap REFUSED`);
       console.error(`  ${err.message}`);
@@ -1994,6 +5017,49 @@ async function unwrap(dryRun: boolean): Promise<void> {
   } catch {
     // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error(`Backup file not found: ${meta.backupPath}`);
+    // Multi-surface honesty on the REFUSAL path (matches the eighth-round
+    // survivor note on the success path): findLatestBackup returns the
+    // FIRST readable pointer, so a wedged first pointer (its backup file
+    // pruned) blocks every later scoped slot - ending here silently would
+    // hide any other surface that remains wrapped behind it. Enumerate the
+    // other readable pointers and say what unblocks them. Advisory output
+    // only; the refusal itself (exit 1, nothing modified) is unchanged.
+    const resolvedWedged = resolvePath(meta.originalPath);
+    const pointers = await listWrapMetaPointerSummaries();
+    const wedgedPointer = pointers.find(
+      (p) => resolvePath(p.originalPath) === resolvedWedged,
+    );
+    const survivors = Array.from(
+      new Set(
+        pointers
+          .map((p) => resolvePath(p.originalPath))
+          .filter((p) => p !== resolvedWedged),
+      ),
+    );
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+    console.error(
+      `  This wrap metadata pointer` +
+        `${wedgedPointer ? ` (${wedgedPointer.metaPath})` : ""} names ` +
+        `${meta.originalPath}\n  but its backup file is gone. Restore the ` +
+        `backup file if you can; if it is gone\n  for good, remove the ` +
+        `pointer file manually (the config it names stays wrapped\n  and ` +
+        `must then be restored by hand).`
+    );
+    if (survivors.length > 0) {
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error(
+        `  Note: ${
+          survivors.length === 1
+            ? "another wrapped surface remains"
+            : "other wrapped surfaces remain"
+        } behind this pointer:` +
+          survivors.map((p) => `\n    ${p}`).join("") +
+          `\n  Re-run 'sanctuary wrap --unwrap' after this pointer is ` +
+          `repaired or removed\n  to restore ${
+            survivors.length === 1 ? "it" : "them"
+          }.`
+      );
+    }
     process.exit(1);
   }
 
@@ -2034,9 +5100,15 @@ async function unwrap(dryRun: boolean): Promise<void> {
           `  Would skip ${aux.originalPath} (created by wrap; already absent)`
         );
       } else {
+        // Fifth round (preview parity): the real unwrap snapshots this
+        // file's final contents into a timestamped backup BEFORE removing
+        // it (the recovery breadcrumb below); a dry run that omitted the
+        // snapshot read scarier than reality for an operator judging
+        // whether post-wrap edits would be lost.
         // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
         console.error(
-          `  Would remove ${aux.originalPath} (created by wrap; no pre-wrap version existed)`
+          `  Would remove ${aux.originalPath} (created by wrap; no pre-wrap version existed;` +
+            `\n  its final contents would first be preserved as a timestamped backup)`
         );
       }
     }
@@ -2050,13 +5122,30 @@ async function unwrap(dryRun: boolean): Promise<void> {
   console.error(`\n  Sanctuary: Unwrapped`);
   console.error(`  Original config restored to: ${meta.originalPath}`);
   console.error(`  Backup preserved at: ${meta.backupPath}`);
+  // Harden round (operator breadcrumb): the restored snapshot is the FIRST
+  // pre-wrap backup (F6 pristine-pointer preservation); config edits made
+  // while wrapped survive only in the newer timestamped backups that
+  // nothing points at. Say where they are so the discard is recoverable.
+  const newerPrimaryBackup = await findNewerBackup(
+    meta.backupPath,
+    meta.originalPath,
+  );
+  if (newerPrimaryBackup) {
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+    console.error(
+      `  Note: this restored the pristine pre-wrap snapshot. Newer backups exist;` +
+        `\n  config changes made while wrapped may be recoverable from: ${newerPrimaryBackup}`
+    );
+  }
 
   // D4 staging, Bug 2: restore auxiliary files the wrap touched (the
   // Hermes config.yaml surface). A null backupPath means wrap created the
   // file fresh; restoring the pre-wrap state removes it. Best-effort: the
   // primary config restore above already succeeded, so an auxiliary
   // failure reports loudly with the manual recovery path instead of
-  // aborting the unwrap.
+  // aborting the unwrap. Failures are counted: the wrap-meta retirement
+  // below is gated on ALL restores having succeeded.
+  let auxiliaryRestoreFailures = 0;
   for (const aux of auxiliary) {
     try {
       if (aux.backupPath) {
@@ -2066,6 +5155,17 @@ async function unwrap(dryRun: boolean): Promise<void> {
         // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
         console.error(`  Original config restored to: ${aux.originalPath}`);
         console.error(`  Backup preserved at: ${aux.backupPath}`);
+        const newerAuxBackup = await findNewerBackup(
+          aux.backupPath,
+          aux.originalPath,
+        );
+        if (newerAuxBackup) {
+          // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+          console.error(
+            `  Note: newer backups of this file exist; changes made while wrapped` +
+              `\n  may be recoverable from: ${newerAuxBackup}`
+          );
+        }
       } else if (aux.alreadyAbsent) {
         // Round-2 P2: created-by-wrap file whose parent directory is gone -
         // the "absent" end-state already holds; informational no-op.
@@ -2074,16 +5174,73 @@ async function unwrap(dryRun: boolean): Promise<void> {
           `  Skipped ${aux.originalPath} (created by wrap; already absent)`
         );
       } else {
+        // 2026-07-02 hardening (recovery breadcrumb): a created-by-wrap file
+        // (e.g. the Hermes config.yaml) is removed wholesale here, but the
+        // operator may have added their own MCP entries to it AFTER the
+        // wrap. Preserve the file's final contents as a timestamped backup
+        // before removing it and say where it is. Best-effort: a failed
+        // pre-removal snapshot warns but does not change the restore
+        // semantics (the file is still removed, exactly as before).
+        let preRemovalBackup: string | null = null;
+        try {
+          preRemovalBackup = await backupConfig(aux.originalPath);
+        } catch (err) {
+          // ENOENT is silent: the file is already gone (see the removal
+          // carve-out below), so there is nothing to snapshot and a WARNING
+          // would misread as a real failure.
+          if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+            // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+            console.error(
+              `  WARNING: could not snapshot ${aux.originalPath} before removal: ` +
+                `${(err as Error).message}`
+            );
+          }
+        }
         // Round-3 P1-A: refuse the unlink if a symlink was raced into the
         // parent dir after validate-time; unlink() does not follow a
         // symlinked leaf, so only the parent walk is needed.
-        await unlinkSafeUnderRoot(aux.originalPath);
-        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
-        console.error(
-          `  Removed ${aux.originalPath} (created by wrap; no pre-wrap version existed)`
-        );
+        //
+        // 2026-07-02 hardening (second round): ENOENT means the delete-on-
+        // unwrap end-state ALREADY holds - mirror the rollbackWrapSurfaces
+        // carve-out instead of counting it as an auxiliaryRestoreFailure.
+        // The orphan-wrap guard can persist a null-backup entry for a file
+        // the failed wrap never created (or that its rollback already
+        // removed) while the parent dir still exists (so validate-time
+        // `alreadyAbsent` does not fire); treating that phantom file as a
+        // restore failure kept the wrap-meta alive forever and wedged every
+        // --unwrap re-run on a cause that is a nonexistent file.
+        let removed = true;
+        try {
+          await unlinkSafeUnderRoot(aux.originalPath);
+        } catch (err) {
+          const code =
+            err && typeof err === "object" && "code" in err
+              ? (err as NodeJS.ErrnoException).code
+              : undefined;
+          if (code !== "ENOENT") throw err;
+          removed = false;
+        }
+        if (removed) {
+          // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+          console.error(
+            `  Removed ${aux.originalPath} (created by wrap; no pre-wrap version existed)`
+          );
+          if (preRemovalBackup) {
+            // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+            console.error(
+              `  Its final contents were preserved at: ${preRemovalBackup}` +
+                `\n  (in case you added entries to it after the wrap).`
+            );
+          }
+        } else {
+          // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+          console.error(
+            `  Skipped ${aux.originalPath} (created by wrap; already absent)`
+          );
+        }
       }
     } catch (err) {
+      auxiliaryRestoreFailures += 1;
       // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
       console.error(
         `  WARNING: could not restore ${aux.originalPath}: ${(err as Error).message}`
@@ -2092,6 +5249,113 @@ async function unwrap(dryRun: boolean): Promise<void> {
         // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
         console.error(
           `  Manual recovery: copy ${aux.backupPath} to ${aux.originalPath}`
+        );
+      }
+    }
+  }
+
+  // F6 (v1.6.1 wrap safety): a COMPLETED unwrap retires the wrap-meta
+  // pointer files, so "a wrap-meta exists" means "currently wrapped" and a
+  // FUTURE wrap records a fresh pristine backup instead of preserving a
+  // stale pointer (see saveWrapMeta). The backup files themselves stay.
+  //
+  // Harden round: retirement is gated on every auxiliary restore having
+  // succeeded. Removing the meta after a partial restore stranded the CLI
+  // retry path: a re-run of --unwrap reported "No Sanctuary wrap found"
+  // while e.g. the Hermes config.yaml still routed traffic through
+  // Sanctuary, and a subsequent wrap recorded that still-wrapped file as
+  // the new "pristine" backup. Keeping the meta keeps --unwrap re-runnable.
+  // The retirement is also scoped to the originalPath just restored, so a
+  // legacy meta naming a DIFFERENT wrapped surface keeps its pointer.
+  if (auxiliaryRestoreFailures > 0) {
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+    console.error(
+      `  WARNING: ${auxiliaryRestoreFailures} auxiliary ` +
+        `${auxiliaryRestoreFailures === 1 ? "restore" : "restores"} failed; ` +
+        `keeping the wrap metadata so 'sanctuary wrap --unwrap' can be ` +
+        `re-run after fixing the cause above.`
+    );
+  } else {
+    // 2026-07-02 hardening (honest failure surface): removeWrapMeta can now
+    // THROW - its wrap-meta lock acquisition is bounded + fail-closed (the
+    // 15s timeout while another sanctuary wrap/unwrap holds the lock, and
+    // the displaced-holder mutation guard). Uncaught, that throw fell
+    // through runWrap to the CLI's top-level catch, which printed
+    // "Sanctuary MCP Server failed to start:" plus a raw error AFTER the
+    // "Sanctuary: Unwrapped" success lines - a server-boot banner for a
+    // wrap subcommand whose restore had already succeeded. State is safe
+    // either way (config restored, meta retained, a re-run recovers), so
+    // report the failure in the retirement-warning voice with re-run
+    // advice and exit non-zero without the misleading banner.
+    let metaRemovalFailures: WrapMetaRemovalFailure[];
+    try {
+      metaRemovalFailures = await removeWrapMeta(meta.originalPath);
+    } catch (err) {
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error(
+        `  WARNING: could not retire the wrap metadata: ${(err as Error).message}`
+      );
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error(
+        `  The restore above succeeded; the wrap metadata was left in place` +
+          `\n  so 'sanctuary wrap --unwrap' can be re-run to retire it once no` +
+          `\n  other sanctuary wrap/unwrap is running.`
+      );
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error("");
+      process.exitCode = 1;
+      return;
+    }
+    for (const failure of metaRemovalFailures) {
+      // The advice must match the failure class: an UNREADABLE pointer may
+      // be a DIFFERENT wrapped surface's only restore pointer (a successful
+      // read would have skipped it), so telling the operator to delete it
+      // could orphan that surface's pristine backup.
+      if (failure.reason === "unreadable") {
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+        console.error(
+          `  WARNING: could not read wrap metadata ${failure.path}; it was ` +
+            `left in place because it may be another wrapped surface's only ` +
+            `restore pointer. Do NOT delete it; fix the read failure (for ` +
+            `example file permissions) and re-run 'sanctuary wrap --unwrap' ` +
+            `if a surface remains wrapped.`
+        );
+      } else {
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+        console.error(
+          `  WARNING: could not remove wrap metadata ${failure.path}; a ` +
+            `future re-wrap may preserve a stale restore pointer. Remove it ` +
+            `manually.`
+        );
+      }
+    }
+    // Eighth round (multi-surface honesty): surface-scoped meta slots mean
+    // OTHER surfaces wrapped on this tenant keep their own live pointers,
+    // and this run restored exactly ONE surface. Ending on an unqualified
+    // "Unwrapped" while e.g. ~/.claude/settings.json still routes traffic
+    // through Sanctuary is the same dead-entry-behind-a-success-banner
+    // class the wrap banner fix closed, so enumerate the survivors and say
+    // so. Scoped to the clean-retirement path: the failure branches above
+    // already print their own re-run guidance, and a surviving pointer for
+    // THIS surface (unreadable/unremovable) would otherwise misread here as
+    // "another wrapped surface".
+    if (metaRemovalFailures.length === 0) {
+      try {
+        const remaining = await findLatestBackup();
+        if (remaining) {
+          // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+          console.error(
+            `  Note: another wrapped surface remains (${remaining.originalPath}).` +
+              `\n  Re-run 'sanctuary wrap --unwrap' to restore it.`
+          );
+        }
+      } catch {
+        // A surviving pointer exists but failed validation on read; a
+        // re-run surfaces the precise refusal with nothing modified.
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+        console.error(
+          `  Note: wrap metadata for another surface remains but could not ` +
+            `be validated. Re-run 'sanctuary wrap --unwrap' to inspect it.`
         );
       }
     }
@@ -2130,12 +5394,17 @@ function warnCastleWallDaemonNotStarted(err: unknown): void {
     lines.push(
       "",
       "  Castle Wall now signs through a root helper by default (A2/B2). To",
-      "  arm the wall, do ONE of:",
+      "  start the userspace daemon, do ONE of:",
       '    1. Install the Castle Wall app (one-time "Allow background item"',
       "       approval), then set SANCTUARY_CASTLE_SIGNER_CLIENT to its shim:",
       "       /Applications/Sanctuary-CastleWall.app/Contents/MacOS/castle-wall-signer-client",
       "    2. To keep the legacy local-signing key, set SANCTUARY_CASTLE_LOCAL_SIGN=1",
       "  then re-run 'sanctuary wrap'.",
+      "",
+      "  NOTE: either option only starts the userspace daemon; that alone does",
+      "  NOT mean traffic is being filtered. Enforcement also needs the approved",
+      "  system extension, and is confirmed only by observed flow evidence on",
+      "  the dashboard's Castle Wall panel.",
     );
   } else {
     lines.push(
@@ -2280,6 +5549,41 @@ function buildLocalAgentRecord(input: {
   };
 }
 
+function withProtectionSubjectAlias(
+  record: LocalAgentRecord,
+  protectionSubject: string | null,
+): LocalAgentRecord {
+  return protectionSubject === null
+    ? record
+    : { ...record, protection_subject: protectionSubject };
+}
+
+function bestEffortUpsertLocalAgentProtectionSubject(input: {
+  storagePath: string;
+  record: LocalAgentRecord;
+  autoProvisionSummary: AutoProvisionSummary;
+}): void {
+  const fortressId = fortressIdFromStoragePath(input.storagePath);
+  const protectionSubject = protectionSubjectFromAutoProvisionSummary(
+    input.autoProvisionSummary,
+    fortressId,
+  );
+  if (protectionSubject === null) return;
+  try {
+    upsertPersistedLocalAgent(
+      input.storagePath,
+      withProtectionSubjectAlias(input.record, protectionSubject),
+    );
+  } catch (err) {
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+    console.error(
+      `  Note: hub agent protection subject not persisted ` +
+        `(${(err as Error).message}). ` +
+        `Recent macOS Castle Wall activity may not correlate to this agent until wrap is rerun.`,
+    );
+  }
+}
+
 async function recordWrapWorkloadRegistration(input: {
   auditLog: AuditLog;
   storagePath: string;
@@ -2376,7 +5680,15 @@ const WRAP_BOOLEAN_FLAGS = new Set([
   "--dry-run",
   "--no-open",
   "--no-dashboard",
+  "--allow-plaintext-remote",
   "--anchor-transparency",
+  "--provision-agent-account",
+  "--no-provision-agent-account",
+  "--exclusive-egress",
+  "--repair-egress-gate",
+  "--unprotect-egress-gate",
+  "--stand-down-agent",
+  "--override-transient-pf-rules",
   "--help",
   "-h",
 ]);
@@ -2471,8 +5783,32 @@ export function parseWrapArgs(argv: string[]): WrapOptions {
       case "--no-dashboard":
         options.noDashboard = true;
         break;
+      case "--allow-plaintext-remote":
+        options.allowPlaintextRemote = true;
+        break;
       case "--anchor-transparency":
         options.anchorTransparency = true;
+        break;
+      case "--provision-agent-account":
+        options.provisionAgentAccount = true;
+        break;
+      case "--no-provision-agent-account":
+        options.provisionAgentAccount = false;
+        break;
+      case "--exclusive-egress":
+        options.exclusiveEgress = true;
+        break;
+      case "--repair-egress-gate":
+        options.repairEgressGate = true;
+        break;
+      case "--unprotect-egress-gate":
+        options.unprotectEgressGate = true;
+        break;
+      case "--stand-down-agent":
+        options.standDownAgent = true;
+        break;
+      case "--override-transient-pf-rules":
+        options.overrideTransientPfRules = true;
         break;
       case "--fortress":
         options.fortress = argv[++i];
@@ -2488,6 +5824,16 @@ export function parseWrapArgs(argv: string[]): WrapOptions {
         printWrapHelp();
         process.exit(0);
     }
+  }
+
+  if (
+    options.standDownAgent === true &&
+    options.repairEgressGate !== true &&
+    options.unprotectEgressGate !== true
+  ) {
+    throw new Error(
+      "--stand-down-agent is only valid with --repair-egress-gate or --unprotect-egress-gate.",
+    );
   }
 
   return options;
@@ -2533,6 +5879,10 @@ function printWrapHelp(): void {
                        \`sanctuary dashboard\` (or a later wrap) sees the
                        harness. Use this for the clean operator setup
                        (one persistent dashboard + many wraps).
+    --allow-plaintext-remote
+                       Persist SANCTUARY_DASHBOARD_ALLOW_PLAINTEXT_REMOTE=true
+                       into the wrapped harness environment. Use only when a
+                       separate network layer already encrypts transport.
     --anchor-transparency
                        Opt in to transparency anchoring at setup (OFF by
                        default). Publishes a salted hash commitment of each
@@ -2545,12 +5895,17 @@ function printWrapHelp(): void {
                        Equivalent to running
                        \`sanctuary transparency anchor enable\` later.
     --dev-dist <path>  Dogfood path. Point the harness MCP entries at a
-                       local Sanctuary build (\`node <path>\` instead of
-                       \`npx @sanctuary-framework/mcp-server\`). Required
+                       local Sanctuary build (\`node <path>\` instead of the
+                       version-pinned npx registry entry). Required
                        when testing an unpublished branch; the published
                        version doesn't have new subcommands yet, and
                        npx pulls from the registry, not your checkout.
                        Pass the absolute path to dist/cli.js.
+    --stand-down-agent
+                       With --repair-egress-gate or --unprotect-egress-gate,
+                       acknowledge and permit the required agent-harness stop.
+                       Those verbs stop and disable the harness before changing
+                       exclusive-egress state and refuse without this flag.
     --help, -h         Show this help
 
   What happens:

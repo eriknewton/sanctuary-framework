@@ -46,6 +46,8 @@ import {
   createTunneledFetch,
   type Tier3AuditEvent,
   type Tier3TransportConfig,
+  type TunnelDialer,
+  type TunnelFetch,
 } from "../../src/query-anonymity/tier3-transport.js";
 import { QUERY_ANONYMITY_AUDIT_OPS } from "../../src/query-anonymity/header-strip.js";
 import { SubstrateSelector } from "../../src/intelligence/selector.js";
@@ -687,3 +689,229 @@ describe("Tier 3a Slice 1 — AC-1 end-to-end through SubstrateSelector", () => 
     expect(ops).toContain(TIER3_AUDIT_OPS.TUNNEL_USED);
   });
 });
+
+// ── Slice 1.5: connection-reuse hygiene (F-6) ────────────────────────────
+
+/**
+ * F-6 (within-crowd linkability): a tunnel connection reused across two
+ * queries lets a downstream observer correlate those queries to one origin
+ * and collapses the effective anonymity set below the raw crowd size k.
+ *
+ * These tests pin EXACTLY what the transport provably does and does NOT do,
+ * so the suite never overstates the guard:
+ *   - it enforces one-query-per-handle-object and rejects same-object
+ *     aliasing (a dialer handing the SAME handle back), fail-closed; and
+ *   - it does NOT, and cannot from object identity, detect a pooling dialer
+ *     that returns FRESH handle objects over one shared kept-alive socket —
+ *     that case is documented honestly below as the dialer's no-reuse
+ *     contract, not something this slice closes.
+ * The reference dialer opens a fresh two-hop tunnel per `dial()` and so
+ * satisfies the connection-level contract; the disarmed default and happy
+ * path are unchanged.
+ */
+describe("Tier 3a Slice 1.5 — connection-reuse hygiene (F-6)", () => {
+  /**
+   * A controllable mock dialer with three modes:
+   *   - `fresh`: a NEW `TunnelFetch` per `dial()` over a NEW underlying
+   *     connection each time (the correct shape).
+   *   - `pooled`: the SAME handle object every time (same-object aliasing —
+   *     the case the transport's WeakSet guard catches).
+   *   - `shared-conn`: a FRESH handle object per `dial()`, but every handle
+   *     routes through ONE shared underlying connection (a kept-alive socket
+   *     reused across queries). This is the F-6 leak the object-identity
+   *     guard CANNOT catch; the test below documents that honestly.
+   * `connectionIds` records the underlying connection each served query rode,
+   * so a test can prove whether queries shared a connection.
+   */
+  function makeMockDialer(reuse: "fresh" | "pooled" | "shared-conn"): {
+    dialer: TunnelDialer;
+    state: {
+      handlesIssued: TunnelFetch[];
+      connectionFetchCalls: number;
+      closes: number;
+      connectionIds: number[];
+    };
+  } {
+    const state = {
+      handlesIssued: [] as TunnelFetch[],
+      connectionFetchCalls: 0,
+      closes: 0,
+      connectionIds: [] as number[],
+    };
+    // A fresh underlying connection id per call, unless a shared one is given
+    // (the `shared-conn` mode passes one stable id to model a kept-alive
+    // socket reused across handles).
+    let nextConnId = 1;
+    const makeHandle = (connId: number): TunnelFetch => {
+      const handle: TunnelFetch = {
+        egressIp: "203.0.113.7",
+        fetch: (async () => {
+          state.connectionFetchCalls++;
+          state.connectionIds.push(connId);
+          return new Response("tunnel-ok", { status: 200 });
+        }) as typeof fetch,
+        close: () => {
+          state.closes++;
+        },
+      };
+      return handle;
+    };
+    let pooledHandle: TunnelFetch | null = null;
+    const sharedConnId = nextConnId; // the single reused socket for `shared-conn`
+    const dialer: TunnelDialer = {
+      label: `mock ${reuse} dialer`,
+      async dial(): Promise<TunnelFetch | null> {
+        if (reuse === "pooled") {
+          pooledHandle ??= makeHandle(nextConnId++);
+          state.handlesIssued.push(pooledHandle);
+          return pooledHandle;
+        }
+        if (reuse === "shared-conn") {
+          // FRESH wrapper object, but bound to the ONE shared connection id.
+          const h = makeHandle(sharedConnId);
+          state.handlesIssued.push(h);
+          return h;
+        }
+        const h = makeHandle(nextConnId++);
+        state.handlesIssued.push(h);
+        return h;
+      },
+    };
+    return { dialer, state };
+  }
+
+  function armedConfig(dialer: TunnelDialer): Tier3TransportConfig {
+    return {
+      armed: true,
+      mode: "connect",
+      posture: "operator-run",
+      onTunnelFailure: "deny",
+      dialer,
+    };
+  }
+
+  it("a well-behaved dialer: two queries (same destination) ride DISTINCT tunnel handles, never one shared connection", async () => {
+    const { dialer, state } = makeMockDialer("fresh");
+    const audits: Tier3AuditEvent[] = [];
+    const fetchFn = createTunneledFetch(baseFetchUnused(), armedConfig(dialer), (e) =>
+      audits.push(e),
+    );
+
+    const r1 = await fetchFn("https://api.anthropic.com/v1/messages");
+    const r2 = await fetchFn("https://api.anthropic.com/v1/messages");
+    expect(await r1.text()).toBe("tunnel-ok");
+    expect(await r2.text()).toBe("tunnel-ok");
+
+    // Two queries to the SAME destination got two DISTINCT tunnel handles
+    // over two DISTINCT underlying connections: no correlatable shared
+    // connection (the dialer honored its no-reuse contract).
+    expect(state.handlesIssued).toHaveLength(2);
+    expect(state.handlesIssued[0]).not.toBe(state.handlesIssued[1]);
+    expect(state.connectionIds).toEqual([1, 2]);
+    // Both succeeded as tunnel-used, none rejected as reuse.
+    const ops = audits.map((e) => e.op);
+    expect(ops.filter((o) => o === TIER3_AUDIT_OPS.TUNNEL_USED)).toHaveLength(2);
+    expect(ops).not.toContain(TIER3_AUDIT_OPS.REUSE_REJECTED);
+  });
+
+  it("a pooling dialer that returns the SAME handle twice: first query succeeds, the SECOND is REFUSED and fails closed (no direct)", async () => {
+    const { dialer, state } = makeMockDialer("pooled");
+    let directCalls = 0;
+    const baseFetch: typeof fetch = async () => {
+      directCalls++;
+      return new Response("DIRECT-LEAK", { status: 200 });
+    };
+    const audits: Tier3AuditEvent[] = [];
+    const fetchFn = createTunneledFetch(baseFetch, armedConfig(dialer), (e) => audits.push(e));
+
+    // First query: the pooled handle is fresh-to-the-transport, so it serves.
+    const r1 = await fetchFn("https://api.anthropic.com/v1/messages");
+    expect(await r1.text()).toBe("tunnel-ok");
+
+    // Second query: the dialer hands back the SAME handle. Reusing it would
+    // correlate the two queries on one connection (F-6). The transport must
+    // refuse and fail closed, NOT fall through to a direct connection.
+    await expect(fetchFn("https://api.anthropic.com/v1/messages")).rejects.toBeInstanceOf(
+      Tier3FailClosedError,
+    );
+    expect(directCalls).toBe(0);
+
+    // The reused handle was never driven a second time, and the reuse was
+    // surfaced + the handle torn down.
+    expect(state.connectionFetchCalls).toBe(1);
+    const ops = audits.map((e) => e.op);
+    expect(ops).toContain(TIER3_AUDIT_OPS.REUSE_REJECTED);
+    expect(ops).toContain(TIER3_AUDIT_OPS.FAIL_CLOSED);
+  });
+
+  it("one-query-per-handle: the transport invokes a handle's fetch once and closes it after that one query", async () => {
+    const { dialer, state } = makeMockDialer("fresh");
+    const fetchFn = createTunneledFetch(baseFetchUnused(), armedConfig(dialer));
+    const r = await fetchFn("https://api.anthropic.com/v1/messages");
+    await r.text(); // drain the (empty) body → triggers close
+    // One query → one fetch on the handle → the handle is closed. (Whether
+    // closing the handle frees the underlying socket is the dialer's job;
+    // this asserts only the per-handle invariant the transport owns.)
+    expect(state.connectionFetchCalls).toBe(1);
+    expect(state.closes).toBeGreaterThanOrEqual(1);
+  });
+
+  it("HONEST LIMITATION: a pooling dialer returning FRESH handles over ONE shared connection is NOT detected — three queries ride one reused connection, zero REUSE_REJECTED (this is the dialer's no-reuse contract, not transport-enforced)", async () => {
+    const { dialer, state } = makeMockDialer("shared-conn");
+    const audits: Tier3AuditEvent[] = [];
+    const fetchFn = createTunneledFetch(baseFetchUnused(), armedConfig(dialer), (e) =>
+      audits.push(e),
+    );
+
+    // Three queries through a dialer that hands back a fresh wrapper each
+    // time but routes them all over ONE kept-alive socket.
+    for (let i = 0; i < 3; i++) {
+      const res = await fetchFn("https://api.anthropic.com/v1/messages");
+      expect(await res.text()).toBe("tunnel-ok");
+    }
+
+    // Each query got a DISTINCT handle object, so the WeakSet guard never
+    // fires: object identity cannot see the shared socket beneath them.
+    expect(state.handlesIssued).toHaveLength(3);
+    expect(new Set(state.handlesIssued).size).toBe(3);
+    expect(audits.map((e) => e.op)).not.toContain(TIER3_AUDIT_OPS.REUSE_REJECTED);
+
+    // PoC of the F-6 gap the transport does NOT close: all three queries
+    // rode the SAME underlying connection. This is the case the
+    // `TunnelDialer` no-reuse contract obligates the dialer to prevent; the
+    // transport relies on the dialer and cannot detect it here. Documenting
+    // it in the suite keeps the limitation visible instead of hidden.
+    expect(state.connectionIds).toEqual([1, 1, 1]);
+    expect(new Set(state.connectionIds).size).toBe(1);
+  });
+
+  it("connection-reuse hygiene does NOT regress disarmed-default passthrough", () => {
+    const baseFetch: typeof fetch = async () => new Response("x");
+    // Disarmed → identity passthrough, no reuse machinery engaged at all.
+    expect(createTunneledFetch(baseFetch, DISARMED_TIER3_CONFIG)).toBe(baseFetch);
+  });
+
+  it("the reference loopback dialer opens a FRESH two-hop tunnel per query (no cross-query connection reuse at the real dialer)", async () => {
+    const h = await buildHarness();
+    for (let i = 0; i < 3; i++) {
+      const res = await h.tunneledFetch(destUrl(h, "/plain"));
+      await res.text();
+    }
+    // Three queries → three distinct egress CONNECTs and three destination
+    // peers: the reference dialer never reuses a tunnel across queries.
+    expect(h.egress.connectTargets).toHaveLength(3);
+    expect(h.destination.peerAddresses).toHaveLength(3);
+    expect(h.baseFetchCalls).toBe(0);
+  });
+});
+
+/**
+ * A base fetch that must never be called in the armed mock-dialer reuse
+ * tests (any call means an unwrapped direct connection — an AC-1 / F-6
+ * regression). Throws loudly if touched.
+ */
+function baseFetchUnused(): typeof fetch {
+  return (async () => {
+    throw new Error("base fetch must not be called on the armed tunnel path");
+  }) as typeof fetch;
+}

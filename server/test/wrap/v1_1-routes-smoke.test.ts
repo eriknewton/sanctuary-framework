@@ -38,6 +38,7 @@ import {
 } from "../../src/dashboard/v1_1/wiring.js";
 import { AuditLog } from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
+import { getFreePort } from "../helpers/free-port.js";
 
 const IDENTITY_ID = "wrap-smoke-operator";
 
@@ -49,16 +50,12 @@ interface WrapAutoTestRig {
   stop: () => Promise<void>;
 }
 
-function pickPort(): number {
-  return 31000 + Math.floor(Math.random() * 30000);
-}
-
 async function startWrapAutoRigWithRetry(): Promise<WrapAutoTestRig> {
   // Mirrors PR #27's EADDRINUSE retry helper. The wrap-auto dashboard
   // shares the host's port space with concurrent vitest workers; retry
   // on EADDRINUSE only — any other failure is a real bug.
   for (let attempt = 0; attempt < 6; attempt++) {
-    const port = pickPort();
+    const port = await getFreePort();
     const authToken = `wrap-smoke-${randomBytes(8).toString("hex")}`;
     try {
       const tmpFortress = await mkdtemp(join(tmpdir(), "sanctuary-v1_1-smoke-"));
@@ -165,18 +162,22 @@ describe("wrap-auto dashboard exposes v1.1 surfaces (Finding V)", () => {
     expect(await aliasRes.json()).toEqual(await directRes.json());
   });
 
-  it("GET / with a short-lived session URL serves the folded posture board", async () => {
+  it("GET / with a short-lived session URL serves the v1.1 concierge (default surface)", async () => {
+    // Default-flip (2026-06-30): `/` serves the v1.1 concierge as the single
+    // default surface, even in the wrap-auto path. The posture board is folded
+    // into the concierge (a Posture entry in the Verify group; the seal expands
+    // to full detail) and preserved standalone at /posture (asserted below).
     const sessionUrl = rig.handle.createSessionUrl?.() ?? rig.baseUrl;
     expect(sessionUrl).not.toContain("?token=");
     const res = await fetch(sessionUrl);
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toMatch(/text\/html/);
     const html = await res.text();
-    expect(html).toContain("/api/posture/home");
-    expect(html).toContain("Approvals waiting");
+    expect(html).toContain('id="main"');
+    expect(html).toContain('data-route="posture"');
   });
 
-  it("GET / and GET /posture serve the same posture board", async () => {
+  it("GET / serves the concierge; GET /posture serves the posture board (distinct surfaces)", async () => {
     const [rootRes, postureRes] = await Promise.all([
       fetch(`${rig.baseUrl}/`),
       fetch(`${rig.baseUrl}/posture`),
@@ -187,8 +188,9 @@ describe("wrap-auto dashboard exposes v1.1 surfaces (Finding V)", () => {
       rootRes.text(),
       postureRes.text(),
     ]);
-    expect(rootBody).toBe(postureBody);
-    expect(rootBody).toContain("/api/posture/home");
+    expect(rootBody).not.toBe(postureBody);
+    expect(rootBody).toContain('id="main"');
+    expect(postureBody).toContain("/api/posture/home");
   });
 
   it("wrap-auto posture auxiliaries are read-only and not decision-capable", async () => {
@@ -216,6 +218,38 @@ describe("wrap-auto dashboard exposes v1.1 surfaces (Finding V)", () => {
     expect(res.status).toBe(200);
     const body = (await res.json()) as { origin_machine: string };
     expect(typeof body.origin_machine).toBe("string");
+  });
+
+  it("did:web compromised rotation requires bearer despite loopback auto-auth", async () => {
+    const tokenless = await fetch(
+      `${rig.baseUrl}/api/hub/recognition/did-web/rotate-compromised`,
+      { method: "POST" },
+    );
+    expect(tokenless.status).toBe(401);
+
+    const sessionOnly = await fetch(
+      `${rig.baseUrl}/api/hub/recognition/did-web/rotate-compromised?session=short-lived`,
+      {
+        method: "POST",
+        headers: { Cookie: "sanctuary_session=short-lived" },
+      },
+    );
+    expect(sessionOnly.status).toBe(401);
+
+    const bearer = await fetch(
+      `${rig.baseUrl}/api/hub/recognition/did-web/rotate-compromised`,
+      {
+        method: "POST",
+        headers: { Authorization: `Bearer ${rig.authToken}` },
+      },
+    );
+    expect(bearer.status).toBe(200);
+    const body = (await bearer.json()) as {
+      ok: boolean;
+      data: { configured: boolean };
+    };
+    expect(body.ok).toBe(true);
+    expect(body.data.configured).toBe(false);
   });
 
   it("setV11Bindings(null) detaches the v1.1 routes; /v1.1 falls through legacy gate", async () => {

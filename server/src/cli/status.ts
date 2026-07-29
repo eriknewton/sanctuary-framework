@@ -171,6 +171,22 @@ export function renderTable(status: Record<string, unknown>): string {
     `  identity:     ${identity ? `${str(identity.label)} (${str(identity.did)})` : "none"}`,
     `  castle wall:  ${str(castleWall?.arm_state)}`,
   ];
+  // S5-P (design section 6): the exclusive-egress posture is a first-class
+  // status line on this surface whenever a fine-grained agent is provisioned.
+  // `coarse_only` above is the DISTINCT non-green arm-state; this line carries
+  // the mode + the why so the CLI never reduces the degrade to a bare token.
+  const exclusive = asRecord(castleWall?.exclusive_egress);
+  if (exclusive && exclusive.fine_grained_declared === true) {
+    const live = exclusive.exclusive_egress_live === true;
+    const mode = typeof exclusive.mode === "string" ? exclusive.mode : null;
+    const reasons = Array.isArray(exclusive.reasons)
+      ? exclusive.reasons.filter((r): r is string => typeof r === "string")
+      : [];
+    lines.push(
+      `  exclusive egress: ${live ? "live" : `NOT live${mode ? ` (${mode})` : ""}`}` +
+        (reasons.length > 0 ? ` - ${reasons.join("; ")}` : ""),
+    );
+  }
   return `${lines.join("\n")}\n`;
 }
 

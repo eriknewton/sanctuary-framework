@@ -1,5 +1,5 @@
 /**
- * §12.8 — Five §8 failure modes proven end-to-end through the three-mode drill.
+ * §12.8 - Five §8 failure modes proven end-to-end through the three-mode drill.
  *
  * Spec: Review/Sanctuary/Federation_Protocol_V0.1_Spec_2026-04-21.md §12.8,
  *       §8 (failure modes), §9 (recovery cascade).
@@ -15,7 +15,7 @@
  *
  * The drill harness's real libp2p transport is used on every wire path. The
  * compromise-signal injection (§8.2) uses the node's `onHeartbeatReceived`
- * hook — the same seam the production detector subscribes to — so the sealed
+ * hook - the same seam the production detector subscribes to - so the sealed
  * envelope emit path is not modified or mocked.
  */
 
@@ -36,13 +36,20 @@ import {
 } from "../../../src/mesh/errors.js";
 import { EVENT_CLASSES } from "../../../src/agent-contract/constants.js";
 import { SIGNATURE_SCHEME_V1 } from "../../../src/mesh/constants.js";
+import { encodePolicyBlob } from "../../../src/policy-engine/canonical-policy.js";
 import type {
   LocatorUpdatePayload,
   PolicyUpdatePayload,
   SignedEvent,
 } from "../../../src/mesh/types.js";
+import type { CompiledPolicy } from "../../../src/policy-engine/types.js";
 
-import { bootThreeModeDrill, type ThreeModeDrillHandle, waitFor } from "./harness.js";
+import {
+  bootThreeModeDrill,
+  GOSSIP_SETTLE_MS,
+  type ThreeModeDrillHandle,
+  waitFor,
+} from "./harness.js";
 
 let active: ThreeModeDrillHandle | null = null;
 
@@ -54,7 +61,7 @@ afterEach(async () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════
-// Shared wiring — mount a detector + dashboard bridge on a chosen observer.
+// Shared wiring - mount a detector + dashboard bridge on a chosen observer.
 // ═══════════════════════════════════════════════════════════════════════
 
 interface DetectorRig {
@@ -96,7 +103,7 @@ function mountDetector(
         ? drill.nodeKpB
         : drill.nodeKpC;
 
-  // Fresh counter store — detector emissions are isolated from the node's own
+  // Fresh counter store - detector emissions are isolated from the node's own
   // envelope counters. Seed past the node's bootstrap seqs (same pattern as
   // the unit fixture in server/test/mesh/failure-modes.test.ts).
   const counters = new InMemoryCounterStore();
@@ -142,9 +149,9 @@ function mountDetector(
 // The drill
 // ═══════════════════════════════════════════════════════════════════════
 
-describe("three-mode-drill §12.8 — five §8 failure modes end-to-end", () => {
+describe("three-mode-drill §12.8 - five §8 failure modes end-to-end", () => {
   it(
-    "§8.1 offline — stalled heartbeats flip a peer to unreachable, detector fires sentinel_alert, bridge forwards it",
+    "§8.1 offline - stalled heartbeats flip a peer to unreachable, detector fires sentinel_alert, bridge forwards it",
     async () => {
       active = await bootThreeModeDrill();
       const drill = active;
@@ -186,7 +193,7 @@ describe("three-mode-drill §12.8 — five §8 failure modes end-to-end", () => 
   );
 
   it(
-    "§8.2 compromised — non-monotonic envelope monotonic_seq from B surfaces as compromised with revoke option and no auto-revoke",
+    "§8.2 compromised - non-monotonic envelope monotonic_seq from B surfaces as compromised with revoke option and no auto-revoke",
     async () => {
       active = await bootThreeModeDrill();
       const drill = active;
@@ -204,7 +211,7 @@ describe("three-mode-drill §12.8 — five §8 failure modes end-to-end", () => 
         audit_seq: 0,
         advertised_state: "active",
       });
-      // Now drive a non-monotonic follow-up — strictly lower than the baseline.
+      // Now drive a non-monotonic follow-up - strictly lower than the baseline.
       drill.nodeA.onHeartbeatReceived({
         emitter_node: drill.nodeIdB,
         monotonic_seq: 200,
@@ -241,7 +248,7 @@ describe("three-mode-drill §12.8 — five §8 failure modes end-to-end", () => 
         "revoke_compromised",
       ]);
 
-      // No auto-revoke — B is still in A's active roster.
+      // No auto-revoke - B is still in A's active roster.
       expect(drill.nodeA.getRoster().presenceOf(drill.nodeIdB)).toBe("active");
       expect(
         drill.nodeA.getRoster().lookupActiveNodeCert(drill.nodeIdB)
@@ -262,7 +269,7 @@ describe("three-mode-drill §12.8 — five §8 failure modes end-to-end", () => 
   );
 
   it(
-    "§8.3 rollback — MeshRollbackDetectedError surfaces as ROLLBACK alert with accept/revoke branches on the Mesh Health bridge",
+    "§8.3 rollback - MeshRollbackDetectedError surfaces as ROLLBACK alert with accept/revoke branches on the Mesh Health bridge",
     async () => {
       active = await bootThreeModeDrill();
       const drill = active;
@@ -345,7 +352,7 @@ describe("three-mode-drill §12.8 — five §8 failure modes end-to-end", () => 
   );
 
   it(
-    "§8.4 split-brain — two policy versions for same parent_version raise SPLIT_BRAIN; resolveSplitBrainConflict emits policy_pinned with superseded_by",
+    "§8.4 split-brain - two policy versions for same parent_version raise SPLIT_BRAIN; resolveSplitBrainConflict emits policy_pinned with superseded_by",
     async () => {
       active = await bootThreeModeDrill();
       const drill = active;
@@ -355,22 +362,49 @@ describe("three-mode-drill §12.8 — five §8 failure modes end-to-end", () => 
       // but different policy_versions. Node A observes both via gossipsub;
       // the detector's policy-conflict observer records both versions for the
       // shared (agent, parent_version) key and raises SPLIT_BRAIN.
+      //
+      // ORDERING BARRIER. Two gossipsub publishes from two DIFFERENT peers
+      // have no delivery-order guarantee at A, so this test pins the order:
+      // publish v7, wait for A to have APPLIED it, then publish v8. That keeps
+      // the drill deterministic about WHICH version A ends up holding.
+      //
+      // It is no longer load-bearing for detection itself. The detector used
+      // to count only policy_updates whose PolicyBundleStore result was
+      // `applied`, and the store refuses any version <= the one it already
+      // holds as `policy_version_replay`; so if C's v8 had landed first, B's
+      // v7 was thrown away and the conflict below could never hold, at any
+      // timeout. The detector now also records a refusal that carries a
+      // different origin under the same parent_version, so both arrival orders
+      // raise SPLIT_BRAIN. Both orders are covered deterministically in
+      // `test/mesh/failure-modes.test.ts` ("policy conflict is arrival-order
+      // independent"), which is where that property is proven; keep this
+      // barrier so the drill does not depend on network luck.
       const agentId = "agent-split";
       await drill.nodeB.publishPolicyUpdate({
         payload: {
           agent_id: agentId,
           policy_version: 7,
-          policy_blob: JSON.stringify({ from: "B" }),
+          valid_from: "2026-06-01T00:00:00.000Z",
+          valid_until: "2099-01-01T00:00:00.000Z",
+          policy_blob: compiledPolicyBlob(agentId, 7, drill.fortressId, 1),
           parent_version: 1,
         } as PolicyUpdatePayload,
         principal_private_key: drill.root_principal_keypair.privateKey,
         emitter_principal: drill.root_principal_cert.principal_id,
       });
+      await waitFor(
+        () => drill.nodeA.getPolicyBundle().versionOf(agentId) === 7,
+        GOSSIP_SETTLE_MS,
+        50,
+        "A applied B's policy_version 7"
+      );
       await drill.nodeC.publishPolicyUpdate({
         payload: {
           agent_id: agentId,
           policy_version: 8,
-          policy_blob: JSON.stringify({ from: "C" }),
+          valid_from: "2026-06-01T00:00:00.000Z",
+          valid_until: "2099-01-01T00:00:00.000Z",
+          policy_blob: compiledPolicyBlob(agentId, 8, drill.fortressId, 1),
           parent_version: 1,
         } as PolicyUpdatePayload,
         principal_private_key: drill.root_principal_keypair.privateKey,
@@ -388,7 +422,7 @@ describe("three-mode-drill §12.8 — five §8 failure modes end-to-end", () => 
             )
           );
         },
-        15_000,
+        GOSSIP_SETTLE_MS,
         50,
         "split-brain conflict observed on A"
       );
@@ -414,7 +448,7 @@ describe("three-mode-drill §12.8 — five §8 failure modes end-to-end", () => 
       expect(resolved.event.signature_scheme).toBe(SIGNATURE_SCHEME_V1);
 
       // The resolved alert is marked `resolved` with the chosen event_id in
-      // its decision field — the event envelope itself hashes detail, so
+      // its decision field - the event envelope itself hashes detail, so
       // superseded_by wiring is asserted via the detector's recorded alert
       // state rather than by decoding the hashed envelope payload.
       const resolvedAlert = rig.detector
@@ -445,11 +479,14 @@ describe("three-mode-drill §12.8 — five §8 failure modes end-to-end", () => 
       );
       expect(splitBrainBridged).toBeDefined();
     },
-    90_000
+    // Boot (~37s of bounded harness waits worst case) + two GOSSIP_SETTLE_MS
+    // budgets. Sized so a slow wait reports through waitFor's descriptive
+    // message rather than as an opaque vitest test-timeout.
+    180_000
   );
 
   it(
-    "§8.5 canonical audit loss — 24h grace elapsed without canonical heartbeat fires alert with promote_replica; promoteCanonicalAudit retargets + emits policy_pinned",
+    "§8.5 canonical audit loss - 24h grace elapsed without canonical heartbeat fires alert with promote_replica; promoteCanonicalAudit retargets + emits policy_pinned",
     async () => {
       active = await bootThreeModeDrill();
       const drill = active;
@@ -496,6 +533,39 @@ describe("three-mode-drill §12.8 — five §8 failure modes end-to-end", () => 
     60_000
   );
 });
+
+function compiledPolicyBlob(
+  agentId: string,
+  policyVersion: number,
+  fortressId: string,
+  parentVersion?: number,
+): string {
+  return encodePolicyBlob({
+    schema_version: "0.1",
+    agent_id: agentId,
+    fortress_id: fortressId,
+    policy_version: policyVersion,
+    ...(parentVersion !== undefined ? { parent_version: parentVersion } : {}),
+    slots: {
+      memory: { slot: "memory", mode: "deny", grants: [] },
+      credentials: { slot: "credentials", mode: "deny", grants: [] },
+      plans: { slot: "plans", mode: "deny", grants: [] },
+      outputs: { slot: "outputs", mode: "deny", grants: [] },
+    },
+    capabilities: {
+      concordia_commitment_classes: [],
+      honeypot_skill_ids: [],
+      is_sentinel: false,
+    },
+    auto_trigger_ladder: {
+      honeypot_auto_freeze: false,
+      threshold_rule_action: "operator_approved",
+      ml_anomaly_action: "operator_approved",
+    },
+    source_english: "fixture",
+    compiled_at: "2026-06-09T12:00:00.000Z",
+  } satisfies CompiledPolicy);
+}
 
 // Touch type-only imports so they do not drop from tree-shaking. The
 // LocatorUpdatePayload + SignedEvent imports are reserved for a v1.x

@@ -493,6 +493,7 @@ export function generateFortressViewHTML(options: FortressViewOptions): string {
     // ── State ───────────────────────────────────────────────────────
     const API_BASE = window.location.origin;
     const SESSION_TOKEN = sessionStorage.getItem('sanctuary_session') || '';
+    let AUTH_TOKEN = sessionStorage.getItem('authToken') || '';
     const MAX_FEED_ITEMS = 50;
 
     let feedItems = [];
@@ -507,6 +508,34 @@ export function generateFortressViewHTML(options: FortressViewOptions): string {
     // 'unknown' (unproven, amber) | 'not_installed' (amber) | 'unavailable'
     // (posture endpoint unreachable/erroring, treated as unknown, amber).
     let wallArmState = 'unknown';
+
+    function operatorAuthHeaders(extra) {
+      const headers = Object.assign({}, extra || {});
+      if (AUTH_TOKEN) {
+        headers['Authorization'] = 'Bearer ' + AUTH_TOKEN;
+      }
+      return headers;
+    }
+
+    function promptForOperatorToken() {
+      const entered = window.prompt('Operator token required for this action.');
+      if (!entered || !entered.trim()) return false;
+      AUTH_TOKEN = entered.trim();
+      sessionStorage.setItem('authToken', AUTH_TOKEN);
+      return true;
+    }
+
+    async function strictMutationFetch(path, init) {
+      const request = init || {};
+      const send = () => fetch(API_BASE + path, Object.assign({}, request, {
+        headers: operatorAuthHeaders(request.headers),
+      }));
+      let response = await send();
+      if (response.status === 401 && promptForOperatorToken()) {
+        response = await send();
+      }
+      return response;
+    }
 
     // ── SSE Connection ──────────────────────────────────────────────
     function connectSSE() {
@@ -653,11 +682,14 @@ export function generateFortressViewHTML(options: FortressViewOptions): string {
     async function handleApproval(id, approved) {
       const endpoint = approved ? '/api/approve/' : '/api/deny/';
       try {
-        await fetch(API_BASE + endpoint + id, {
+        const response = await strictMutationFetch(endpoint + encodeURIComponent(id), {
           method: 'POST',
-          headers: SESSION_TOKEN ? { 'Authorization': 'Bearer ' + SESSION_TOKEN } : {},
         });
-        removePendingApproval(id);
+        if (response.ok) {
+          removePendingApproval(id);
+        } else {
+          console.error('Approval action failed:', response.status);
+        }
       } catch (err) {
         console.error('Approval action failed:', err);
       }
@@ -742,6 +774,9 @@ export function generateFortressViewHTML(options: FortressViewOptions): string {
       const hasPending = pendingApprovals.length > 0;
       const wallArmed = wallArmState === 'armed';
       const wallDegraded = wallArmState === 'degraded';
+      // S5-P distinct non-green: coarse wall enforcing, but a fine-grained
+      // agent's exclusive-egress stack is not live. Never green.
+      const wallCoarseOnly = wallArmState === 'coarse_only';
 
       if (hasErrors) {
         indicator.className = 'status-indicator red';
@@ -756,6 +791,17 @@ export function generateFortressViewHTML(options: FortressViewOptions): string {
         indicator.innerHTML = '&#x26A0;';
         title.textContent = 'Enforcement not active';
         subtitle.textContent = 'Castle Wall is not filtering traffic. Your agent is wrapped but not protected.';
+      } else if (wallCoarseOnly) {
+        // S5-P: the DISTINCT non-green coarse-only arm-state. A
+        // fine-grained-provisioned agent's exclusive-egress stack (gate + pf +
+        // generation) is not live. Copy stays mode-agnostic: the worst
+        // per-agent mode may be unprotected (no coarse wall over that agent),
+        // so this must NOT assert coarse protection for every agent. Amber,
+        // named plainly, pointing at per-agent posture; never green.
+        indicator.className = 'status-indicator amber';
+        indicator.innerHTML = '&#x26A0;';
+        title.textContent = 'Fine-grained protection not live';
+        subtitle.textContent = 'The fine-grained exclusive-egress gate is not live for a protected agent. Coverage may be coarse-only or weaker; see per-agent posture.';
       } else if (hasPending) {
         indicator.className = 'status-indicator amber';
         indicator.innerHTML = '&#x23F3;';

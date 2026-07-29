@@ -1,18 +1,40 @@
+import { execFile } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { getServers } from "node:dns";
+import { statSync } from "node:fs";
 import { mkdir, readdir, stat, unlink } from "node:fs/promises";
 import { createConnection } from "node:net";
 import { dirname, join } from "node:path";
+import { promisify } from "node:util";
 
 import { bytesToString, toBase64url } from "../../core/encoding.js";
 import { decrypt, encrypt, type EncryptedPayload } from "../../core/encryption.js";
 import type { AuditLog } from "../../operational/audit-log.js";
 import type { AllowlistRule } from "../allowlist/schema.js";
 import { validateRule } from "../allowlist/schema.js";
-import { composeEffectiveRules } from "../allowlist/habeas-port.js";
+import {
+  composeEffectiveRules,
+  HABEAS_RULE_ID_PREFIX,
+  isGenuineDerivedHabeasRule,
+} from "../allowlist/habeas-port.js";
+import { composeExclusiveRoutingRules } from "../allowlist/exclusive-routing.js";
+import { loadExclusiveRoutingMarker } from "../allowlist/routing-marker.js";
+import { collectSystemResolvers } from "./system-resolvers.js";
 import { readDistressConfig } from "../../distress/config.js";
 import { validateAgentOrigin } from "../allowlist/agent-origin.js";
+import {
+  EXCLUSIVE_EGRESS_GATE_FILENAME,
+  validateExclusiveEgressGatePolicy,
+  type ExclusiveEgressGatePolicy,
+} from "../allowlist/gate-derivation.js";
 import { validateOperatorBaseline } from "../allowlist/operator-baseline.js";
+import {
+  EMISSION_STALL_AUDIT_OP,
+  EMISSION_STALL_LOG_PREFIX,
+  EMISSION_STALL_RECOVERED_AUDIT_OP,
+  EmissionLivenessWatchdog,
+  type EmissionRecoveryFinding,
+  type EmissionStallFinding,
+} from "../audit/emission-liveness.js";
 import { verifyManifestSignature } from "../allowlist/parse.js";
 import type { SignedManifest } from "../allowlist/manifest.js";
 import type {
@@ -26,6 +48,12 @@ import {
   localManifestSigner,
 } from "./manifest-publisher.js";
 import { HelperSignerClient, type ShimInvoker } from "./helper-signer.js";
+import { writeGlobalPinIfUnestablished } from "../global-pin/index.js";
+import {
+  CASTLE_WALL_MACOS_AUDIT_PRODUCER_PUBKEY_PATH,
+  CASTLE_WALL_MACOS_GLOBAL_PINNED_PUBKEY_DIR,
+  resolveProducerPubKeyPath,
+} from "./producer-signature.js";
 import {
   isCustodyFsError,
   readFileCustody,
@@ -34,6 +62,7 @@ import {
 } from "../../storage/custody-fs.js";
 import { MacOSFlowEventConsumer } from "./macos-flow-events.js";
 import { MacOSFlowIpcListener } from "./macos-ipc-listener.js";
+import { protectionSubjectFromAgentOrigin } from "../subject-binding.js";
 import {
   CASTLE_WALL_ACTIVE_CONFIG_PATH,
   CASTLE_WALL_ACTIVE_CONFIG_LEGACY_PATH,
@@ -44,12 +73,23 @@ import {
   CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
   CASTLE_WALL_HEARTBEAT_OPERATION,
   CASTLE_WALL_ARM_LEASE_REVOKED_OPERATION,
+  CASTLE_WALL_RELOAD_SIGN_DEADLINE_MS,
+  CASTLE_WALL_RELOAD_BROADCAST_DEADLINE_MS,
+  CASTLE_WALL_RELOAD_AUDIT_DEADLINE_MS,
 } from "../constants.js";
+import {
+  EGRESS_PROBE_FAILED_AUDIT_OP,
+  asUidTlsProbeArgv,
+} from "../provision/egress.js";
+
+const execFileAsync = promisify(execFile);
 
 const CASTLE_PINNED_PUBKEY = "castle-pinned-pubkey.bin";
 const CASTLE_PINNED_PRIVKEY = "castle-pinned-privkey.enc";
-const CASTLE_GLOBAL_PINNED_PUBKEY_DIR = "/Library/Application Support/Sanctuary";
+const CASTLE_GLOBAL_PINNED_PUBKEY_DIR = CASTLE_WALL_MACOS_GLOBAL_PINNED_PUBKEY_DIR;
 const CASTLE_GLOBAL_PINNED_PUBKEY_PATH = `${CASTLE_GLOBAL_PINNED_PUBKEY_DIR}/${CASTLE_PINNED_PUBKEY}`;
+const CASTLE_GLOBAL_AUDIT_PRODUCER_PUBKEY_PATH =
+  CASTLE_WALL_MACOS_AUDIT_PRODUCER_PUBKEY_PATH;
 
 /**
  * Signing handle used by the daemon. B2: the production default routes both
@@ -66,8 +106,24 @@ export interface DaemonSigner {
   signNonce(nonce: Uint8Array): Promise<Uint8Array>;
 }
 
-export const CASTLE_WALL_ALREADY_RUNNING_MESSAGE =
-  "Castle Wall daemon already running for this fortress (PID <pid>). Multi-wrap-per-fortress is Phase 3.";
+export function formatCastleWallAlreadyRunningMessage(
+  pid?: number | null,
+  socketHolder?: string,
+): string {
+  const pidText =
+    typeof pid === "number" && Number.isSafeInteger(pid) && pid > 0
+      ? `PID ${pid}`
+      : "pid unavailable";
+  const holderText =
+    socketHolder !== undefined && socketHolder.length > 0
+      ? `; socket holder: ${socketHolder}`
+      : "";
+  return (
+    `Castle Wall daemon already running for this fortress (${pidText}${holderText}). ` +
+    "Multi-wrap-per-fortress is Phase 3. Stop the holding sanctuary protect/Castle Wall process, " +
+    "or run 'sudo sanctuary castle-wall disable' if it is the boot wall, then retry."
+  );
+}
 
 /**
  * Default cadence (seconds) of the periodic AUDIT liveness heartbeat
@@ -79,6 +135,51 @@ export const CASTLE_WALL_ALREADY_RUNNING_MESSAGE =
  * daemon always lands at least one heartbeat inside the window.
  */
 export const CASTLE_WALL_DEFAULT_AUDIT_HEARTBEAT_INTERVAL_SECONDS = 45 as const;
+
+/**
+ * Default cadence (seconds) of the periodic as-agent-uid egress liveness
+ * probe (confined-agent egress design MED-3, secondary signal): 6 hours.
+ * Deliberately order-of-hours -- the probe spawns real as-uid processes and
+ * makes real TLS connects; the PRIMARY runtime signal (the deny-spike
+ * sentinel over already-recorded audit denials) carries the minutes-scale
+ * latency, this probe only backstops endpoints the harness is not currently
+ * calling at all.
+ */
+export const CASTLE_WALL_DEFAULT_AGENT_EGRESS_PROBE_INTERVAL_SECONDS = 21_600 as const;
+
+/**
+ * Default cadence (seconds) of the Slice M emission-liveness watchdog tick
+ * (the decided-vs-emitted divergence evaluation). The tick is a pure counter
+ * comparison (no I/O unless a stall fires), so a seconds-scale cadence is
+ * cheap; it just needs to be comfortably shorter than the watchdog's grace
+ * window (default 60s) so a stall fires within roughly one grace window of
+ * onset.
+ */
+export const CASTLE_WALL_DEFAULT_EMISSION_LIVENESS_TICK_SECONDS = 15 as const;
+
+/**
+ * Resolve the as-agent-uid egress probe: the injected one (tests), else the
+ * real `sudo -n -u '#<uid>' curl` probe IFF this daemon runs as root on
+ * darwin (only root can genuinely change the real uid the wall keys on),
+ * else undefined (timer stays off; a probe that cannot change uid would
+ * report THIS process's reachability and alarm falsely).
+ */
+function resolveAgentEgressProbe(
+  input: MacOSCastleWallDaemonInput,
+): ((uid: number, host: string, port: number) => Promise<boolean>) | undefined {
+  if (input.agentEgressProbe !== undefined) return input.agentEgressProbe;
+  if ((input.platform ?? process.platform) !== "darwin") return undefined;
+  if (typeof process.getuid !== "function" || process.getuid() !== 0) return undefined;
+  return async (uid, host, port) => {
+    const { file, args } = asUidTlsProbeArgv(uid, host, port);
+    try {
+      await execFileAsync(file, args);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+}
 
 /**
  * launchd label of the safe-mode boot daemon. Mirror of `CASTLE_WALL_BOOT_LABEL`
@@ -115,11 +216,18 @@ export interface MacOSCastleWallDaemonInput {
   platform?: NodeJS.Platform;
   socketPath?: string;
   /**
-   * Re-own the bound IPC socket to this uid (F1 #450 item 3). Set by the
-   * SAFE-MODE boot daemon (which runs as root) to the operator/fortress-owner
+   * Re-own the bound IPC socket to this uid (F1 #450 item 3). Set explicitly by
+   * the SAFE-MODE boot daemon (which runs as root) to the operator/fortress-owner
    * uid so the operator CLI dead-man lever can reach the otherwise root-owned
-   * socket. Undefined for the full operator daemon (socket is already
-   * operator-owned). See {@link MacOSFlowIpcListenerOptions.socketOwnerUid}.
+   * socket.
+   *
+   * Slice M Layer-2 (2026-06-29): this is now OPTIONAL even for a root daemon. When
+   * omitted and the daemon runs as root, the operator uid is AUTO-DERIVED from the
+   * fortress dir owner (the uid the content-filter extension runs as) so the engage
+   * path (`wrap`, which never passed this) re-owns the socket too and
+   * audit-producer signing can engage. An explicit value is still honored verbatim.
+   * See {@link resolveSocketReownUid} and
+   * {@link MacOSFlowIpcListenerOptions.socketOwnerUid}.
    */
   socketOwnerUid?: number;
   /**
@@ -143,6 +251,14 @@ export interface MacOSCastleWallDaemonInput {
    * the daemon loads `policy/egress/operator-baseline.json` from the fortress.
    */
   operatorBaseline?: unknown;
+  /**
+   * Optional exclusive-egress gate policy (config / test fixture; Unified
+   * Protect Slice 1). When absent, the daemon loads
+   * `policy/egress/exclusive-egress-gate.json` from the fortress. When BOTH
+   * are absent (or the candidate is malformed), the manifest carries no gate
+   * allow rule (fail closed: no derived grant).
+   */
+  exclusiveEgressGate?: unknown;
   /**
    * Explicit signing handle. When provided it is used verbatim (tests inject a
    * fake). When absent the daemon builds one via the helper path (default) or
@@ -175,12 +291,25 @@ export interface MacOSCastleWallDaemonInput {
    */
   globalPinnedPublicKeyPath?: string;
   /**
+   * Root-helper-published macOS audit-producer public key. When present, the
+   * daemon pins the macOS flow-event consumer to it and copies it to the
+   * existing fortress producer-key reader path. Missing means the honest macOS
+   * channel-authenticated floor remains in effect.
+   */
+  auditProducerPublicKeyPath?: string;
+  /**
    * Provider-side dead-man lease. Undefined/null means durable arming
    * (--no-ttl); a positive number means the extension fails open after that
    * many seconds unless renewed by the authenticated daemon channel.
    */
   armLeaseTtlSeconds?: number | null;
   armLeaseHeartbeatIntervalSeconds?: number;
+  /**
+   * Injectable wall clock (epoch ms) for the dead-man TTL deadline. Defaults to
+   * `Date.now`. Tests inject a controllable clock so the periodic heartbeat's
+   * TTL-expiry fail-open can be asserted deterministically without a real sleep.
+   */
+  now?: () => number;
   /**
    * Interval (seconds) of the periodic AUDIT liveness heartbeat (observability
    * Slice 2). This is a SEPARATE, slower cadence than the ~5s IPC arm-lease
@@ -191,6 +320,70 @@ export interface MacOSCastleWallDaemonInput {
    * not bloat the audit chain. Tests inject a small value for determinism.
    */
   auditHeartbeatIntervalSeconds?: number;
+  /**
+   * Interval (seconds) of the periodic AS-AGENT-UID egress liveness probe
+   * (confined-agent egress design 2026-07-10, MED-3 secondary signal).
+   * Order-of-hours by default (21600s = 6h): for each `provisioned-*` allow
+   * rule in the loaded manifest (uid mode only), a probe process running as
+   * the agent uid attempts a TLS connect; a failure appends an
+   * `egress_probe_failed` audit entry that the agent-egress sentinel
+   * surfaces as an operator alert. Tests inject a small value.
+   */
+  agentEgressProbeIntervalSeconds?: number;
+  /**
+   * Injected as-uid egress probe (tests; also the ONLY way the probe runs on
+   * a non-root / non-darwin daemon). Resolve true iff a process running as
+   * `uid` completes a TLS connect to `host:port`. When absent, a real
+   * `sudo -n -u '#<uid>' curl` probe is used IFF this daemon runs as root on
+   * darwin; otherwise the timer stays OFF (no false alarms from a probe that
+   * cannot actually change uid).
+   */
+  agentEgressProbe?: (uid: number, host: string, port: number) => Promise<boolean>;
+  /**
+   * Grace window (ms) of the Slice M emission-liveness watchdog: how long
+   * decisions may keep arriving with ZERO persisted enforcement emission
+   * before the daemon fails loud (`audit_emission_stall` audit entry + a
+   * greppable stderr line). Defaults to
+   * {@link DEFAULT_EMISSION_STALL_GRACE_MS}. Tests inject a small value.
+   */
+  emissionStallGraceMs?: number;
+  /**
+   * Cadence (seconds) of the watchdog's divergence evaluation tick. Defaults
+   * to {@link CASTLE_WALL_DEFAULT_EMISSION_LIVENESS_TICK_SECONDS}. Tests
+   * inject a small value.
+   */
+  emissionLivenessTickSeconds?: number;
+  /**
+   * Backstop deadline (ms) for the compose+sign phase of a `policy_reload`
+   * (drill-found hang guard, 2026-07-12). Bounds custody reads + compose + the
+   * helper re-sign so the reload can NEVER exceed the client's request deadline
+   * silently; on breach the reload returns a specific `ok:false` rather than
+   * hanging. Defaults to {@link CASTLE_WALL_RELOAD_SIGN_DEADLINE_MS}. Tests
+   * inject a small value to assert the bounded refusal deterministically.
+   */
+  reloadSignDeadlineMs?: number;
+  /**
+   * Backstop deadline (ms) for the broadcast phase of a `policy_reload`. Bounds
+   * the manifest fan-out to sysext subscribers so a wedged subscriber write
+   * cannot hang the reload. Defaults to
+   * {@link CASTLE_WALL_RELOAD_BROADCAST_DEADLINE_MS}. Tests inject a small value.
+   */
+  reloadBroadcastDeadlineMs?: number;
+  /**
+   * Deadline (ms) for the fire-and-forget audit write that records a reload
+   * outcome. The reload response never awaits this write. Defaults to
+   * {@link CASTLE_WALL_RELOAD_AUDIT_DEADLINE_MS}. Tests inject a small value.
+   */
+  reloadAuditDeadlineMs?: number;
+  /**
+   * Test-only fault-injection seam (mirrors the existing `signerClientInvoke` /
+   * `agentEgressProbe` / `now` injection seams). When present it is awaited at
+   * the very TOP of the reload compose phase, BEFORE any fortress read or the
+   * re-sign, so a test can prove the whole-body reload deadline bounds a stall
+   * that occurs before the signer is ever reached (not only a signer hang).
+   * Undefined in production.
+   */
+  reloadComposeHook?: () => Promise<void>;
 }
 
 export type MacOSCastleWallListenerOptions = ConstructorParameters<
@@ -211,7 +404,8 @@ export interface MacOSCastleWallDaemonHandle {
   stop(): Promise<void>;
 }
 
-interface ManifestState {
+/** The composed + signed manifest state `loadManifestState` produces. */
+export interface ManifestState {
   signed: SignedManifest;
   rules: AllowlistRule[];
 }
@@ -225,6 +419,87 @@ interface ActiveCastleWallConfig {
   pinned_pubkey_sha256?: string;
   /** Daemon role marker (#450 item 4): "safe" boot daemon vs "full" login daemon. */
   mode?: "safe" | "full";
+}
+
+/**
+ * Resolve the uid the bound IPC socket must be (re-)owned by so the macOS
+ * content-filter extension (which runs as the LOGGED-IN OPERATOR uid, not root)
+ * can connect to it.
+ *
+ * WHY this exists (Slice M Layer-2, drilled 2026-06-29, Erik-present): macOS
+ * audit-producer signing never engaged because the extension's IPC dispatcher
+ * could not CONNECT to the daemon's UDS control socket. When the daemon runs as
+ * ROOT (the engage drill ran it as root), `net.Server.listen()` binds the socket
+ * owned by `root` at mode 0600, and a non-root operator-uid extension gets EPERM
+ * connecting to it (the host app, which shares the extension's IPCClient
+ * connect+handshake code, handshook fine over an OPERATOR-owned socket; only the
+ * root-owned 0600 socket blocked it). The fix is to re-own the socket to the
+ * operator uid (the same user the extension runs as), which is the uid that
+ * OWNS THE FORTRESS DIRECTORY (an operator-owned 0o700 dir). Mode stays 0600, so
+ * root (the daemon + a root-running extension) still reaches it via superuser
+ * bypass and no other local user can; we NEVER widen the socket.
+ *
+ * Resolution order:
+ *   - An explicit `socketOwnerUid` (the safe-mode boot daemon already derives
+ *     and passes it) wins verbatim, preserving that path's behavior.
+ *   - Otherwise, only when the daemon is running as ROOT (`getuid() === 0`, i.e.
+ *     the socket would otherwise be root-owned) AND the fortress-dir owner is a
+ *     DIFFERENT uid than the daemon process, return that owner uid so the socket
+ *     is re-owned to the operator. When owners already match (a same-uid operator
+ *     daemon), or we are not root, return `undefined` (no re-own is needed).
+ *   - On a stat failure, warn and return `undefined` (fail-soft: the daemon still
+ *     comes up + enforces; the re-own is best-effort and the listener's own
+ *     chown is likewise loud-but-non-fatal).
+ *
+ * Pure except for the optional `warn` sink, so the LOGIC (target uid / skip
+ * conditions) is unit-testable without a root-owned socket on disk.
+ */
+export function resolveSocketReownUid(input: {
+  socketOwnerUid?: number;
+  fortressPath: string;
+  /** Current process uid; defaults to `process.getuid?.()`. Injected by tests. */
+  processUid?: number | undefined;
+  /** Stat the fortress dir for its owner uid; defaults to `fs.statSync`. */
+  statFortressUid?: (fortressPath: string) => number;
+  /** Operator-facing warning sink (stderr by default). */
+  warn?: (message: string) => void;
+}): number | undefined {
+  if (input.socketOwnerUid !== undefined) {
+    return input.socketOwnerUid;
+  }
+  const processUid =
+    input.processUid !== undefined ? input.processUid : process.getuid?.();
+  // Only a root daemon binds a root-owned socket the operator-uid extension
+  // cannot reach. A non-root (operator) daemon already binds an operator-owned
+  // socket; leave ownership untouched.
+  if (processUid !== 0) {
+    return undefined;
+  }
+  let ownerUid: number;
+  try {
+    ownerUid = input.statFortressUid
+      ? input.statFortressUid(input.fortressPath)
+      : statSync(input.fortressPath).uid;
+  } catch (err) {
+    // SAFETY: daemon startup diagnostics are operator-facing stderr output.
+    (input.warn ?? defaultDaemonWarn)(
+      `[castle-wall] warning: could not resolve the fortress owner for ${input.fortressPath} ` +
+        `(${err instanceof Error ? err.message : String(err)}); the content-filter extension may be ` +
+        `unable to connect to the root-owned control socket and audit-producer signing may not engage.`,
+    );
+    return undefined;
+  }
+  // Owners already match (a same-uid daemon, e.g. an operator daemon that somehow
+  // reached here as root over its own fortress): no re-own needed.
+  if (ownerUid === processUid) {
+    return undefined;
+  }
+  return ownerUid;
+}
+
+function defaultDaemonWarn(message: string): void {
+  // SAFETY: daemon startup diagnostics are operator-facing stderr output.
+  console.error(message);
 }
 
 export async function startMacOSCastleWallDaemon(
@@ -247,6 +522,27 @@ export async function startMacOSCastleWallDaemon(
 
   const auditSource = input.auditSource ?? "sanctuary-wrap";
   const daemonMode: "safe" | "full" = input.daemonMode ?? "full";
+  const reloadSignDeadlineMs =
+    input.reloadSignDeadlineMs ?? CASTLE_WALL_RELOAD_SIGN_DEADLINE_MS;
+  const reloadBroadcastDeadlineMs =
+    input.reloadBroadcastDeadlineMs ?? CASTLE_WALL_RELOAD_BROADCAST_DEADLINE_MS;
+  const reloadAuditDeadlineMs =
+    input.reloadAuditDeadlineMs ?? CASTLE_WALL_RELOAD_AUDIT_DEADLINE_MS;
+
+  // Slice M Layer-2: when the daemon runs as root the socket binds root-owned and
+  // the operator-uid content-filter extension cannot connect (EPERM on a 0600 root
+  // socket), so audit-producer signing never engages. Re-own to the fortress owner
+  // (= the operator the extension runs as). An explicit `socketOwnerUid` (the
+  // safe-mode boot daemon already supplies one) is honored verbatim; otherwise this
+  // auto-derives it from the fortress dir so EVERY caller (notably `wrap`, which did
+  // not pass one) is correct without per-caller patching. Mode stays 0600 and is
+  // never widened. See {@link resolveSocketReownUid}.
+  const socketOwnerUid = resolveSocketReownUid({
+    ...(input.socketOwnerUid !== undefined
+      ? { socketOwnerUid: input.socketOwnerUid }
+      : {}),
+    fortressPath: input.fortressPath,
+  });
 
   await assertActiveConfigNotOwnedByLiveProcess(activeConfigPath, legacyActiveConfigPath);
   await assertSocketNotOwnedByLiveProcess(socketPath);
@@ -256,12 +552,28 @@ export async function startMacOSCastleWallDaemon(
   });
 
   const signer = input.signer ?? (await loadSigningKey(input));
-  await writeSystemPinnedPublicKey(signer);
+  await writeSystemPinnedPublicKey(signer, input.globalPinnedPublicKeyPath);
+  const auditProducerKey = await loadMacOSAuditProducerPublicKey(
+    input.auditProducerPublicKeyPath ?? CASTLE_GLOBAL_AUDIT_PRODUCER_PUBKEY_PATH,
+  );
+  if (auditProducerKey !== null) {
+    await publishFortressAuditProducerPublicKey(
+      input.fortressPath,
+      auditProducerKey.bytes,
+    );
+  }
   const pinnedPublicKeySha256 = sha256Hex(signer.publicKey);
   const agentOrigin = await resolveAgentOrigin(input.fortressPath, input.agentOrigin);
+  const protectionClaimSubject =
+    protectionSubjectFromAgentOrigin(input.fortressId, agentOrigin) ??
+    input.fortressId;
   const operatorBaseline = await resolveOperatorBaseline(
     input.fortressPath,
     input.operatorBaseline,
+  );
+  const exclusiveEgressGate = await resolveExclusiveEgressGate(
+    input.fortressPath,
+    input.exclusiveEgressGate,
   );
   let manifestState = await loadManifestState({
     fortressPath: input.fortressPath,
@@ -269,6 +581,7 @@ export async function startMacOSCastleWallDaemon(
     signer,
     agentOrigin,
     operatorBaseline,
+    exclusiveEgressGate,
     ...(input.globalPinnedPublicKeyPath
       ? { globalPinnedPublicKeyPath: input.globalPinnedPublicKeyPath }
       : {}),
@@ -281,6 +594,46 @@ export async function startMacOSCastleWallDaemon(
     clearInterval(leaseHeartbeat);
     leaseHeartbeat = undefined;
   };
+  // Absolute epoch-ms deadline of the operator's active dead-man TTL, or null
+  // for durable (--no-ttl) arming. The daemon ADOPTS this when an operator
+  // arm-lease with a positive `ttl_seconds` arrives (onArmLease), and its
+  // periodic heartbeat re-broadcasts the REMAINING seconds toward this fixed
+  // deadline. Without it, each heartbeat rebuilt the lease from the static
+  // `input.armLeaseTtlSeconds` (never set by any caller -> always null), which
+  // erased the operator's TTL in the extension every heartbeat interval, so the
+  // dead-man `ttl_expired` fail-open never fired (2026-07-05 Mini1 TTL-expiry
+  // drill: armed `--ttl 90s`, still enforcing at t+160s). `nowMs` is injectable
+  // so the fail-open deadline is testable without a wall-clock sleep.
+  const nowMs = input.now ?? (() => Date.now());
+  let operatorLeaseDeadlineMs: number | null =
+    typeof input.armLeaseTtlSeconds === "number" && input.armLeaseTtlSeconds > 0
+      ? nowMs() + input.armLeaseTtlSeconds * 1000
+      : null;
+  // Latched once the lease heartbeat has broadcast a fully-expired (0s) lease,
+  // so the interval self-cancels even in the first-emit-already-expired edge.
+  // A fresh operator arm (onArmLease) clears it to resume renewals.
+  let leaseExpired = false;
+  /**
+   * Remaining whole seconds until the operator's dead-man deadline, or null for
+   * durable arming. Returns 0 once the deadline has passed so the next heartbeat
+   * broadcasts `ttl_seconds: 0`, which the Swift extension turns into an
+   * immediate `ttl_expired` fail-open. Never negative. Rounds UP so a still-live
+   * lease is never reported as already-expired by a sub-second rounding error
+   * (the anti-spurious-disarm direction: a dead-man must never fire early on a
+   * live/renewed lease).
+   */
+  const remainingLeaseSeconds = (): number | null => {
+    if (operatorLeaseDeadlineMs === null) return null;
+    const remainingMs = operatorLeaseDeadlineMs - nowMs();
+    if (remainingMs <= 0) return 0;
+    return Math.ceil(remainingMs / 1000);
+  };
+  // Restart the periodic lease heartbeat if it is not currently running. Used
+  // when a fresh operator arm arrives AFTER a prior TTL expiry stopped the beat
+  // (re-arm resumes renewals). Assigned once the emit loop is wired up below;
+  // an operator arm can only arrive after `listener.start()`, by which point
+  // this is set. A no-op before then.
+  let restartLeaseHeartbeat: (() => void) | undefined;
   const auditHeartbeatIntervalSeconds =
     input.auditHeartbeatIntervalSeconds ??
     CASTLE_WALL_DEFAULT_AUDIT_HEARTBEAT_INTERVAL_SECONDS;
@@ -290,6 +643,206 @@ export async function startMacOSCastleWallDaemon(
     clearInterval(auditHeartbeat);
     auditHeartbeat = undefined;
   };
+  // Restart the periodic audit liveness heartbeat if it is not currently
+  // running. Used when a fresh operator arm arrives AFTER a prior revoke
+  // stopped the beat (final fix-round MED: onArmLeaseRevoke calls
+  // stopAuditHeartbeat, and without a restart the re-engaged watchdog's
+  // snapshot would never publish again for the rest of the process life).
+  // Assigned in the startup try-block below (it closes over
+  // emitAuditHeartbeat); an operator arm can only arrive after
+  // `listener.start()`, by which point this is set. A no-op before then.
+  let restartAuditHeartbeat: (() => void) | undefined;
+  /**
+   * #912 MED-1 fix (drill-found, 2026-07-12): a dropped best-effort reload
+   * audit write (`recordReloadOutcome`'s detached persist missing its
+   * deadline, or the underlying write itself failing) used to surface ONLY on
+   * daemon stderr; the reload still reported `ok:true`, and the drop was
+   * never chain-visible. Each drop is now counted here and stamped as an
+   * `audit_write_degraded_count` detail field onto the next successfully
+   * appended `castle_wall_heartbeat` (or the shutdown `filter_stopped`), so
+   * the loss becomes a tamper-evident chain entry within one heartbeat
+   * interval. A LOCAL detail field on existing operations, not a new
+   * operation or a widened enum. Reservation semantics (fix-round HIGH):
+   * see {@link createAuditWriteDegradedCarry} for why carries reserve units
+   * up front instead of subtracting after the append lands.
+   *
+   * HONEST BOUND (fix-round MED): the pending count is PROCESS-LOCAL. Once a
+   * carry is appended the marker is durable in the chain, but a count that
+   * has not yet been carried survives only until process exit: the residual
+   * loss window is one heartbeat interval, or a crash/SIGKILL before the
+   * next carry. This is availability-of-evidence in a crash window, not a
+   * forgery path; the full-chain verification is unchanged.
+   * DEBT: if a drill ever shows that window matters, persist the pending
+   * count alongside the existing daemon state (the active-config /
+   * fortress-path files) instead of building a retry queue.
+   *
+   * MEANING (fix-round LOW-3, deliberate): the counter records reload
+   * outcome audit writes NOT CONFIRMED within the deadline, not writes
+   * proven lost. A detached append that misses the deadline but lands late
+   * still increments (fail-safe over-report; the operator investigates a
+   * marker and finds the entry present, rather than a real loss going
+   * unmarked).
+   */
+  const degradedCarry = createAuditWriteDegradedCarry();
+  const agentEgressProbeIntervalSeconds =
+    input.agentEgressProbeIntervalSeconds ??
+    CASTLE_WALL_DEFAULT_AGENT_EGRESS_PROBE_INTERVAL_SECONDS;
+  let agentEgressProbeTimer: NodeJS.Timeout | undefined;
+  const stopAgentEgressProbeTimer = (): void => {
+    if (!agentEgressProbeTimer) return;
+    clearInterval(agentEgressProbeTimer);
+    agentEgressProbeTimer = undefined;
+  };
+
+  // Slice M emission-liveness watchdog (decided-vs-emitted divergence; the
+  // honest #946 follow-up, root cause in
+  // Review/Sanctuary/SliceM_Emission_Stall_RootCause_2026-07-17.md). The flow
+  // consumer feeds it (receipts / emissions / rejections), the as-uid egress
+  // probe feeds it (a daemon-initiated flow an armed wall must adjudicate),
+  // and the tick timer below evaluates it. A stall fails LOUD: one greppable
+  // stderr line plus one `audit_emission_stall` chain entry; recovery writes
+  // the paired recovered entry. The callbacks must NEVER crash the daemon or
+  // touch enforcement, and a failed stall-audit append must not mask the
+  // alarm: the stderr line fires FIRST, unconditionally.
+  const emissionLivenessTickSeconds =
+    input.emissionLivenessTickSeconds ??
+    CASTLE_WALL_DEFAULT_EMISSION_LIVENESS_TICK_SECONDS;
+  // Fail-closed boundary validation (fix-round LOW): a 0/negative/NaN cadence
+  // would either throw inside setInterval, silently clamp to a ~1ms busy
+  // tick, or never tick; none of those is an acceptable failure mode for the
+  // component whose job is detecting silent failure. Mirrors the watchdog's
+  // own graceMs/minDecisions constructor validation.
+  if (
+    !Number.isFinite(emissionLivenessTickSeconds) ||
+    emissionLivenessTickSeconds <= 0
+  ) {
+    throw new Error(
+      `startMacOSCastleWallDaemon: emissionLivenessTickSeconds must be a positive finite number (got ${String(
+        input.emissionLivenessTickSeconds,
+      )})`,
+    );
+  }
+  let emissionLivenessTimer: NodeJS.Timeout | undefined;
+  const stopEmissionLivenessTimer = (): void => {
+    if (!emissionLivenessTimer) return;
+    clearInterval(emissionLivenessTimer);
+    emissionLivenessTimer = undefined;
+  };
+  // Whether the operator has REVOKED the arm lease (deliberate stand-down).
+  // Gates exactly ONE decision feed, the as-uid egress probe below (the
+  // receipt feed in the flow consumer is deliberately ungated, so receipts
+  // landing in a revoked window still count into the watchdog's state; the
+  // fresh-arm stand-down in onArmLease clears them before the tick resumes).
+  // The revoke handler also stops the tick timer: a stood-down wall makes no
+  // emission promise, so nothing observed after a revoke may mature into a
+  // stall alarm (fix-round MED). A fresh operator arm clears it.
+  let armLeaseRevoked = false;
+  // Idempotent starter so the tick timer can be resumed after a revoke
+  // stopped it (mirror of restartLeaseHeartbeat). Defined here, first started
+  // in the startup try-block below.
+  const startEmissionLivenessTimer = (): void => {
+    if (emissionLivenessTimer) return;
+    // Slice M emission-liveness tick: evaluate the decided-vs-emitted
+    // divergence on a fixed cadence. Pure counter comparison; the loud
+    // outputs live in the watchdog callbacks below. A throwing evaluation
+    // must never take down enforcement, so the tick catches and reports.
+    emissionLivenessTimer = setInterval(() => {
+      try {
+        emissionLivenessWatchdog.evaluate();
+      } catch (err) {
+        // SAFETY: a throwing evaluate (e.g. a throwing onStall callback) must
+        // never take down enforcement; surface it on the operator channel and
+        // continue ticking.
+        console.error(
+          `${EMISSION_STALL_LOG_PREFIX} watchdog evaluation failed (non-fatal): ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
+    }, emissionLivenessTickSeconds * 1000);
+    emissionLivenessTimer.unref();
+  };
+  const recordEmissionLivenessTransition = (
+    operation:
+      | typeof EMISSION_STALL_AUDIT_OP
+      | typeof EMISSION_STALL_RECOVERED_AUDIT_OP,
+    details: Record<string, unknown>,
+    result: "success" | "failure",
+  ): void => {
+    void (async () => {
+      await input.auditLog.append(
+        "l1",
+        operation,
+        input.fortressId,
+        {
+          ...details,
+          source: auditSource,
+          // Provenance marker LAST, from constructed fields only (no
+          // untrusted spread), mirroring the heartbeat / filter_stopped
+          // pattern so the honest readers recognize daemon origin.
+          [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
+        },
+        result,
+      );
+      await input.auditLog.flush();
+    })().catch((err: unknown) => {
+      // SAFETY: never crash the daemon, never mask the alarm; the stderr line
+      // has already fired before this append was attempted, so this is a
+      // best-effort diagnostic for a failed audit write, not the alarm itself.
+      console.error(
+        `${EMISSION_STALL_LOG_PREFIX} ${operation} audit write failed (non-fatal; stderr line above is the alarm): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    });
+  };
+  const emissionLivenessWatchdog = new EmissionLivenessWatchdog({
+    now: nowMs,
+    ...(input.emissionStallGraceMs !== undefined
+      ? { graceMs: input.emissionStallGraceMs }
+      : {}),
+    onStall: (finding: EmissionStallFinding) => {
+      // SAFETY: this stderr line IS the loud alarm the divergence detector
+      // exists to raise; it fires unconditionally, before any audit write, so
+      // a wedged/failing audit store can never suppress the operator signal.
+      console.error(
+        `${EMISSION_STALL_LOG_PREFIX} enforcement decisions continue but audit emission has STOPPED: decided_since_last_emission=${finding.decidedSinceLastEmission} decided_total=${finding.decidedTotal} emitted_total=${finding.emittedTotal} rejected_total=${finding.rejectedTotal} ms_since_last_emission=${finding.msSinceLastEmissionMs ?? "never"} sources=${JSON.stringify(finding.decidedBySource)}`,
+      );
+      recordEmissionLivenessTransition(
+        EMISSION_STALL_AUDIT_OP,
+        {
+          decided_total: finding.decidedTotal,
+          emitted_total: finding.emittedTotal,
+          rejected_total: finding.rejectedTotal,
+          decided_since_last_emission: finding.decidedSinceLastEmission,
+          decided_by_source: finding.decidedBySource,
+          ms_since_last_emission: finding.msSinceLastEmissionMs,
+          ms_since_first_unemitted_decision:
+            finding.msSinceFirstUnemittedDecisionMs,
+        },
+        "failure",
+      );
+    },
+    onRecovery: (finding: EmissionRecoveryFinding) => {
+      // SAFETY: recovery is operator-relevant state (the stall cleared), so it
+      // uses the same stderr operator channel as the stall alarm above; it
+      // fires before the paired recovered audit write.
+      console.error(
+        `${EMISSION_STALL_LOG_PREFIX} audit emission RECOVERED after ${finding.stallDurationMs}ms (decided_during_stall=${finding.decidedDuringStall})`,
+      );
+      recordEmissionLivenessTransition(
+        EMISSION_STALL_RECOVERED_AUDIT_OP,
+        {
+          decided_total: finding.decidedTotal,
+          emitted_total: finding.emittedTotal,
+          rejected_total: finding.rejectedTotal,
+          decided_during_stall: finding.decidedDuringStall,
+          stall_duration_ms: finding.stallDurationMs,
+        },
+        "success",
+      );
+    },
+  });
 
   const consumer = new MacOSFlowEventConsumer({
     manifestProvider: {
@@ -307,13 +860,14 @@ export async function startMacOSCastleWallDaemon(
     },
     auditSink: input.auditLog,
     defaultApprovalTimeoutSeconds: 30,
+    pinnedProducerKeyB64url: auditProducerKey?.keyB64url ?? null,
+    fortressId: input.fortressId,
+    emissionLiveness: emissionLivenessWatchdog,
   });
 
   const listenerOptions: MacOSCastleWallListenerOptions = {
     socketPath,
-    ...(input.socketOwnerUid !== undefined
-      ? { socketOwnerUid: input.socketOwnerUid }
-      : {}),
+    ...(socketOwnerUid !== undefined ? { socketOwnerUid } : {}),
     consumer,
     handshakeSigner: {
       fortressId: input.fortressId,
@@ -358,12 +912,61 @@ export async function startMacOSCastleWallDaemon(
         return { ok: true };
       },
     },
+    onArmLease(lease) {
+      // ADOPT the operator's dead-man TTL so the periodic heartbeat below
+      // re-broadcasts the SAME deadline (decrementing remaining seconds) rather
+      // than erasing it with a no-TTL renewal. A positive `ttl_seconds` anchors
+      // a fresh deadline; null/absent (an explicit --no-ttl arm) clears any
+      // prior deadline back to durable. Never EXTENDS an unrelated deadline: the
+      // most recent operator arm is authoritative.
+      operatorLeaseDeadlineMs =
+        typeof lease.ttl_seconds === "number" && lease.ttl_seconds > 0
+          ? nowMs() + lease.ttl_seconds * 1000
+          : null;
+      // A fresh arm clears any prior expiry latch and resumes renewals if a
+      // previous TTL expiry had stopped the beat (re-arm after fail-open).
+      leaseExpired = false;
+      restartLeaseHeartbeat?.();
+      // A fresh arm also re-engages the emission-liveness watchdog that a
+      // prior revoke stood down (fix-round MED). Stand it down FIRST (final
+      // fix-round HIGH): the receipt feed is deliberately not gated by the
+      // revoke, so receipts landing DURING the revoked window (an in-flight
+      // or draining sysext, validation-rejected or persist-failing
+      // decisions) accumulate as an unemitted run whose grace anchor keeps
+      // aging while the wall is intentionally stood down. Restarting the
+      // tick with that stale run intact would mature it into a false
+      // `audit_emission_stall` on the first post-re-arm tick; clearing it
+      // here means only FRESH post-re-arm divergence can fire. Then clear
+      // the revoke gate so the probe feed counts again, and resume the
+      // divergence tick.
+      emissionLivenessWatchdog.standDown();
+      armLeaseRevoked = false;
+      startEmissionLivenessTimer();
+      // The revoke also stopped the audit liveness heartbeat; restart it so
+      // the re-armed wall's liveness (and the re-engaged watchdog's snapshot
+      // riding each beat) publishes again (final fix-round MED). Mirrors the
+      // initial start: one immediate best-effort beat, then the interval.
+      restartAuditHeartbeat?.();
+    },
     async onArmLeaseRevoke() {
       stopLeaseHeartbeat();
+      // A revoke ends the operator's dead-man window; drop the adopted deadline
+      // so a later re-arm cannot inherit a stale expiry.
+      operatorLeaseDeadlineMs = null;
       // A revoked arm-lease means the wall is no longer enforcing for this
       // operator; stop claiming liveness too so the reader does not see a fresh
       // heartbeat from a daemon that has been told to stand down.
       stopAuditHeartbeat();
+      // Stand the emission-liveness watchdog down with the wall (fix-round
+      // MED): a deliberately revoked wall makes no emission promise, so
+      // decisions observed BEFORE the revoke must not mature into a stall
+      // alarm after it (false-fire on an intentionally stood-down wall), and
+      // the probe feed is gated off via `armLeaseRevoked` so probe attempts
+      // on an unarmed wall are never counted as decisions. Timer stopped +
+      // run cleared; a fresh operator arm (onArmLease) re-engages both.
+      armLeaseRevoked = true;
+      stopEmissionLivenessTimer();
+      emissionLivenessWatchdog.standDown();
       // Observability Slice 2 (false-RED fix): RECORD the intentional stand-down.
       // Stopping the heartbeat without a recorded reason is indistinguishable
       // from a daemon that was KILLED mid-flight, so the silent-death reader
@@ -380,11 +983,12 @@ export async function startMacOSCastleWallDaemon(
         await input.auditLog.append(
           "l1",
           CASTLE_WALL_ARM_LEASE_REVOKED_OPERATION,
-          input.fortressId,
+          protectionClaimSubject,
           {
             socket_path: socketPath,
             source: auditSource,
             daemon_mode: daemonMode,
+            fortress_id: input.fortressId,
             // Provenance marker LAST, from constructed fields only.
             [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
           },
@@ -424,23 +1028,53 @@ export async function startMacOSCastleWallDaemon(
     await input.auditLog.append(
       "l1",
       "filter_started",
-      input.fortressId,
-      { socket_path: socketPath, source: auditSource },
+      protectionClaimSubject,
+      { socket_path: socketPath, source: auditSource, fortress_id: input.fortressId },
       "success",
     );
     await input.auditLog.flush();
     const emitLease = async (): Promise<void> => {
+      // Broadcast the REMAINING seconds of the operator's active dead-man TTL,
+      // not the static `input.armLeaseTtlSeconds`. This is the fix for the
+      // 2026-07-05 TTL-expiry gap: previously every heartbeat re-broadcast a
+      // no-TTL lease (input.armLeaseTtlSeconds was never set by any caller), so
+      // the extension's `leaseExpiresAt` was cleared every interval and the
+      // dead-man never fired. Now the deadline stays fixed (heartbeat refreshes
+      // liveness; remaining seconds count down toward the operator's arm+ttl
+      // instant) and the Swift `ttl_expired` fail-open fires on schedule.
+      const remaining = remainingLeaseSeconds();
       await listener.broadcastArmLease(buildArmLease({
         armed: true,
-        ttlSeconds: input.armLeaseTtlSeconds ?? null,
+        ttlSeconds: remaining,
         heartbeatIntervalSeconds,
       })).catch(() => undefined);
+      // Once the deadline has passed, we have broadcast `ttl_seconds: 0` (an
+      // immediate fail-open in the extension). Stop the lease heartbeat so we do
+      // not keep spamming a 0-TTL renewal; the wall has intentionally degraded
+      // to the operator-armed fail-open. The audit liveness heartbeat is left
+      // running (the daemon process itself is still alive and honest about it).
+      // `leaseExpired` also covers the (test-only) case where the FIRST emit is
+      // already expired: the interval is created just below, so a plain
+      // stopLeaseHeartbeat() here would no-op against a not-yet-assigned handle;
+      // the flag makes the next tick self-cancel.
+      if (remaining === 0) {
+        leaseExpired = true;
+        stopLeaseHeartbeat();
+      }
+    };
+    restartLeaseHeartbeat = (): void => {
+      if (leaseHeartbeat) return;
+      leaseHeartbeat = setInterval(() => {
+        if (leaseExpired) {
+          stopLeaseHeartbeat();
+          return;
+        }
+        void emitLease();
+      }, heartbeatIntervalSeconds * 1000);
+      leaseHeartbeat.unref();
     };
     await emitLease();
-    leaseHeartbeat = setInterval(() => {
-      void emitLease();
-    }, heartbeatIntervalSeconds * 1000);
-    leaseHeartbeat.unref();
+    restartLeaseHeartbeat();
 
     // Observability Slice 2: periodic AUDIT liveness heartbeat. SEPARATE from the
     // IPC arm-lease heartbeat above (that is an in-memory broadcast; this writes
@@ -464,15 +1098,46 @@ export async function startMacOSCastleWallDaemon(
     // HONESTY: a heartbeat proves the daemon is ALIVE, NOT that it adjudicated a
     // real flow, so the reader keeps it OUT of the green/armed determination.
     const emitAuditHeartbeat = async (): Promise<void> => {
+      // RESERVATION carry (fix-round HIGH): take ownership of the pending
+      // units synchronously BEFORE the append, so an overlapping beat (slow
+      // append + short interval) reserves 0 and can never double-subtract
+      // the same units. A drop recorded WHILE this write is in flight stays
+      // pending for the next beat.
+      const degradedCountThisBeat = degradedCarry.reserve();
+      // Slice M fix-round HIGH: the emission-liveness watchdog is a detector
+      // FOR silent failure, so its own liveness must be observable, not
+      // assumed. Each heartbeat carries a compact watchdog snapshot on the
+      // same provenance basis as `audit_write_degraded_count` (a LOCAL detail
+      // field on the existing heartbeat operation, constructed fields only).
+      // `last_evaluate_at_ms` is the tick timer's own pulse: a cleared /
+      // never-started tick shows up as a null or stale value against the
+      // advancing heartbeat timestamps instead of being invisible.
+      const emissionLivenessSnapshot = emissionLivenessWatchdog.snapshot();
       try {
         await input.auditLog.append(
           "l1",
           CASTLE_WALL_HEARTBEAT_OPERATION,
-          input.fortressId,
+          protectionClaimSubject,
           {
             socket_path: socketPath,
             source: auditSource,
             daemon_mode: daemonMode,
+            fortress_id: input.fortressId,
+            // #912 MED-1: a non-zero count means a reload outcome audit write
+            // was not confirmed within its deadline (deadline or persist
+            // failure) since the last successfully carried marker. See the
+            // `degradedCarry` declaration above for the exact semantics.
+            ...(degradedCountThisBeat > 0
+              ? { audit_write_degraded_count: degradedCountThisBeat }
+              : {}),
+            emission_liveness: {
+              decided_total: emissionLivenessSnapshot.decidedTotal,
+              emitted_total: emissionLivenessSnapshot.emittedTotal,
+              decided_since_last_emission:
+                emissionLivenessSnapshot.decidedSinceLastEmission,
+              stalled: emissionLivenessSnapshot.stalled,
+              last_evaluate_at_ms: emissionLivenessSnapshot.lastEvaluateAtMs,
+            },
             // Provenance marker LAST, from constructed fields only (no untrusted
             // spread), mirroring the audit consumer's enforcement-evidence path.
             [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
@@ -484,17 +1149,126 @@ export async function startMacOSCastleWallDaemon(
         // A heartbeat write failure must never crash the daemon or take down
         // enforcement. The reader's silent-death detection fails toward an
         // alarm (a MISSING heartbeat reads as fault), so a dropped beat is
-        // surfaced honestly rather than masked.
+        // surfaced honestly rather than masked. The reserved units go back
+        // so the next beat retries carrying the same count.
+        degradedCarry.restore(degradedCountThisBeat);
       }
     };
-    await emitAuditHeartbeat();
-    auditHeartbeat = setInterval(() => {
+    const startAuditHeartbeatInterval = (): void => {
+      auditHeartbeat = setInterval(() => {
+        void emitAuditHeartbeat();
+      }, auditHeartbeatIntervalSeconds * 1000);
+      auditHeartbeat.unref();
+    };
+    restartAuditHeartbeat = (): void => {
+      if (auditHeartbeat) return;
+      // One immediate best-effort beat so the re-armed wall's liveness (and
+      // the watchdog snapshot it carries) is visible without waiting a full
+      // audit-cadence interval, mirroring the awaited first beat of the
+      // initial start below. emitAuditHeartbeat handles its own write
+      // failures, so nothing here can throw into the arm path.
       void emitAuditHeartbeat();
-    }, auditHeartbeatIntervalSeconds * 1000);
-    auditHeartbeat.unref();
+      startAuditHeartbeatInterval();
+    };
+    await emitAuditHeartbeat();
+    startAuditHeartbeatInterval();
+
+    // Slice M emission-liveness tick (definition next to
+    // stopEmissionLivenessTimer above; restarted by a fresh operator arm
+    // after a revoke stopped it).
+    startEmissionLivenessTimer();
+
+    // Confined-agent egress MED-3 (secondary signal): periodic AS-AGENT-UID
+    // egress liveness probe over the provisioned-* allow rules in the loaded
+    // manifest. Refuse-to-arm protects the ARM moment; this timer bounds
+    // RUNTIME silent degradation (a rotated host, a harness update, a broken
+    // path) to the probe interval: a failed probe appends one
+    // `egress_probe_failed` audit entry (result: failure) that the
+    // agent-egress sentinel raises as an operator alert. Observation only --
+    // it never mutates policy or enforcement. The timer only runs when a
+    // probe is available (injected, or root-on-darwin for the real
+    // `sudo -u '#<uid>'` probe): a probe that cannot actually change uid
+    // would report the DAEMON's reachability and alarm falsely.
+    const agentEgressProbe = resolveAgentEgressProbe(input);
+    if (agentEgressProbe !== undefined) {
+      const emitAgentEgressProbe = async (): Promise<void> => {
+        try {
+          const origin = manifestState.signed.manifest.agent_origin;
+          if (!origin || origin.mode !== "uid" || typeof origin.agent_uid !== "number") {
+            return;
+          }
+          const provisioned = manifestState.rules.filter(
+            (rule) => rule.disposition === "allow" && rule.id.startsWith("provisioned-"),
+          );
+          for (const rule of provisioned) {
+            const hostAxis = rule.match.host;
+            const host = Array.isArray(hostAxis) ? hostAxis[0] : hostAxis;
+            if (typeof host !== "string" || host.length === 0) continue;
+            const portAxis = rule.match.port;
+            const port = Array.isArray(portAxis) ? portAxis[0] : portAxis;
+            const destPort = typeof port === "number" ? port : 443;
+            let reachable = false;
+            try {
+              reachable = await agentEgressProbe(origin.agent_uid, host, destPort);
+            } catch {
+              reachable = false;
+            }
+            // Slice M emission-liveness: an INFERRED decision signal, and an
+            // honest accounting of what it proves. What the daemon observes
+            // here is ONLY its own probe attempt and its connect outcome. It
+            // does NOT observe a sysext verdict for this flow: no receipt is
+            // matched to it, and a successful (allowed) probe is not
+            // correlated with any paired audit entry here. Counting it as a
+            // decision rests on an inference: while an operator arm is live
+            // and a sysext subscriber is connected, a real as-agent-uid flow
+            // SHOULD be adjudicated by the wall, so a sustained run of probe
+            // attempts with ZERO emissions is divergence-shaped evidence.
+            // That inference can be wrong exactly when the wall is not
+            // actually filtering this flow, which is why this feed is gated
+            // on the arm-lease state (below) and why it is NOT the owed
+            // instrument from the root-cause doc section 6(b): that design
+            // correlates each probe with the appearance of its OWN audit
+            // entry and only it fires under every surviving hypothesis.
+            // Gates: never counted after an operator revoke (a stood-down
+            // wall adjudicates nothing on this operator's behalf; fix-round
+            // MED), and never without a sysext subscriber (nothing on the
+            // channel could emit, and the silent-death / provider_unbound
+            // alarms own that state).
+            if (!armLeaseRevoked && consumer.getStats().subscribers > 0) {
+              emissionLivenessWatchdog.noteDecision("agent_egress_probe");
+            }
+            if (!reachable) {
+              await input.auditLog.append(
+                "l1",
+                EGRESS_PROBE_FAILED_AUDIT_OP,
+                input.fortressId,
+                {
+                  host,
+                  port: destPort,
+                  agent_uid: origin.agent_uid,
+                  rule_id: rule.id,
+                  source: auditSource,
+                },
+                "failure",
+              );
+              await input.auditLog.flush();
+            }
+          }
+        } catch {
+          // The probe must never crash the daemon or take down enforcement;
+          // a missed probe cycle is bounded by the next interval tick.
+        }
+      };
+      agentEgressProbeTimer = setInterval(() => {
+        void emitAgentEgressProbe();
+      }, agentEgressProbeIntervalSeconds * 1000);
+      agentEgressProbeTimer.unref();
+    }
   } catch (err) {
     stopLeaseHeartbeat();
     stopAuditHeartbeat();
+    stopAgentEgressProbeTimer();
+    stopEmissionLivenessTimer();
     if (activeConfigWritten) {
       await removeActiveConfigIfCurrent(writtenActiveConfigPath, socketPath, input.fortressId);
     }
@@ -502,30 +1276,115 @@ export async function startMacOSCastleWallDaemon(
     throw err;
   }
 
+  /**
+   * Record a reload outcome to the audit log BEST-EFFORT and FIRE-AND-FORGET.
+   *
+   * Drill-found root cause (Mini1 2026-07-12, second miss): the reload COMPLETED
+   * the compose + sign + broadcast, but the response was gated behind
+   * `auditLog.append` + `flush`. A slow / wedged / lock-contended audit write
+   * therefore turned a successful reload into a client-visible generic timeout
+   * AND swallowed the bounded refusal (the failure-audit in the old catch block
+   * hung the same way, so no response was ever written). The audit write is
+   * observability, not correctness: the manifest is already signed and
+   * broadcast to the enforcing sysext. So the response path MUST NOT await it.
+   * This runs it detached, under its own deadline so it can never leak a pending
+   * operation, and never rejects into the caller.
+   */
+  function recordReloadOutcome(
+    operation: "policy_loaded" | "policy_validation_failed",
+    details: Record<string, unknown>,
+    result: "success" | "failure",
+  ): void {
+    void withReloadDeadline(
+      (async () => {
+        await input.auditLog.append(
+          "l1",
+          operation,
+          input.fortressId,
+          { ...details, source: "castle-wall-reload" },
+          result,
+        );
+        await input.auditLog.flush();
+      })(),
+      reloadAuditDeadlineMs,
+      `reload audit write (${operation}) did not complete within ${reloadAuditDeadlineMs}ms`,
+    ).catch((err: unknown) => {
+      // A dropped audit write must not be silent: count it so it becomes
+      // chain-visible on the next successful carry (#912 MED-1; see the
+      // `degradedCarry` declaration / `emitAuditHeartbeat` above).
+      degradedCarry.record();
+      // SAFETY: the reload itself never fails on this (the wall is already
+      // armed with the new manifest); the immediate operator signal is
+      // daemon stderr, and the chain marker above is the durable record.
+      console.error(
+        `[castle-wall] reload audit write (${operation}) failed (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    });
+  }
+
   async function reloadPolicy(
     request?: PolicyReloadRequest,
   ): Promise<PolicyReloadResponse> {
+    const requestId = request?.request_id ?? randomBytes(16).toString("hex");
+    // Preserve the last-known-good signature for the failure response BEFORE any
+    // await, so a bounded refusal can be returned without touching (possibly
+    // wedged) shared state.
+    const lastKnownSignature = manifestState.signed.signature.signature_b64url;
     try {
-      const reloadedOrigin = await resolveAgentOrigin(input.fortressPath, input.agentOrigin);
-      const reloadedBaseline = await resolveOperatorBaseline(
-        input.fortressPath,
-        input.operatorBaseline,
+      // Drill-found hang guard (Mini1 egress drill 2026-07-12): a policy reload
+      // RE-COMPOSES and RE-SIGNS the ruleset through the root signer helper. The
+      // ENTIRE compose+sign phase (the fortress reads AND the re-sign) runs under
+      // one internal deadline strictly shorter than the client's request
+      // deadline, so a stall ANYWHERE before the sign completes (a hung fortress
+      // read, a stalled signer helper) surfaces as a FAST, SPECIFIC `ok:false`
+      // from the daemon rather than a generic client-side "IPC request timed
+      // out". The response is NEVER gated on the audit write (see
+      // recordReloadOutcome). A bounded specific refusal preserves fail-closed
+      // refuse-to-arm.
+      manifestState = await withReloadDeadline(
+        (async () => {
+          // Test-only fault-injection point (before any real work), so the
+          // whole-body bound can be proven for a stall that is NOT the signer.
+          if (input.reloadComposeHook) {
+            await input.reloadComposeHook();
+          }
+          const reloadedOrigin = await resolveAgentOrigin(
+            input.fortressPath,
+            input.agentOrigin,
+          );
+          const reloadedBaseline = await resolveOperatorBaseline(
+            input.fortressPath,
+            input.operatorBaseline,
+          );
+          const reloadedGate = await resolveExclusiveEgressGate(
+            input.fortressPath,
+            input.exclusiveEgressGate,
+          );
+          return await loadManifestState({
+            fortressPath: input.fortressPath,
+            fortressId: input.fortressId,
+            signer,
+            agentOrigin: reloadedOrigin,
+            operatorBaseline: reloadedBaseline,
+            exclusiveEgressGate: reloadedGate,
+            ...(input.globalPinnedPublicKeyPath
+              ? { globalPinnedPublicKeyPath: input.globalPinnedPublicKeyPath }
+              : {}),
+          });
+        })(),
+        reloadSignDeadlineMs,
+        `policy reload did not compose and sign within ${reloadSignDeadlineMs}ms (signer helper or fortress read stalled)`,
       );
-      manifestState = await loadManifestState({
-        fortressPath: input.fortressPath,
-        fortressId: input.fortressId,
-        signer,
-        agentOrigin: reloadedOrigin,
-        operatorBaseline: reloadedBaseline,
-        ...(input.globalPinnedPublicKeyPath
-          ? { globalPinnedPublicKeyPath: input.globalPinnedPublicKeyPath }
-          : {}),
-      });
-      const emitted = await listener.broadcastManifestUpdate();
-      await input.auditLog.append(
-        "l1",
+      const emitted = await withReloadDeadline(
+        listener.broadcastManifestUpdate(),
+        reloadBroadcastDeadlineMs,
+        `manifest broadcast did not complete within ${reloadBroadcastDeadlineMs}ms during policy reload`,
+      );
+      // Fire-and-forget: the response is returned WITHOUT awaiting the audit.
+      recordReloadOutcome(
         "policy_loaded",
-        input.fortressId,
         {
           loaded_rule_count: manifestState.rules.length,
           // Surface auto-derived rules (#380) so a derived grant is never
@@ -534,34 +1393,28 @@ export async function startMacOSCastleWallDaemon(
             .filter((rule) => rule.derived === true)
             .map((rule) => rule.id),
           emitted_subscribers: emitted,
-          source: "castle-wall-reload",
         },
         "success",
       );
-      await input.auditLog.flush();
       return {
         type: "policy_reload_response",
-        request_id: request?.request_id ?? randomBytes(16).toString("hex"),
+        request_id: requestId,
         ok: true,
         loaded_manifest_signature_b64url: manifestState.signed.signature.signature_b64url,
         loaded_rule_count: manifestState.rules.length,
       };
     } catch (err) {
-      await input.auditLog.append(
-        "l1",
-        "policy_validation_failed",
-        input.fortressId,
-        { error: err instanceof Error ? err.message : String(err) },
-        "failure",
-      );
-      await input.auditLog.flush();
+      const message = err instanceof Error ? err.message : String(err);
+      // Fire-and-forget: a bounded refusal must reach the client even if the
+      // audit log is the thing that is wedged.
+      recordReloadOutcome("policy_validation_failed", { error: message }, "failure");
       return {
         type: "policy_reload_response",
-        request_id: request?.request_id ?? randomBytes(16).toString("hex"),
+        request_id: requestId,
         ok: false,
-        loaded_manifest_signature_b64url: manifestState.signed.signature.signature_b64url,
+        loaded_manifest_signature_b64url: lastKnownSignature,
         loaded_rule_count: manifestState.rules.length,
-        error: err instanceof Error ? err.message : String(err),
+        error: message,
       };
     }
   }
@@ -575,31 +1428,50 @@ export async function startMacOSCastleWallDaemon(
         // Stop the audit liveness heartbeat in the SAME teardown that stops the
         // IPC lease heartbeat, so a stopped daemon stops claiming liveness.
         stopAuditHeartbeat();
+        stopAgentEgressProbeTimer();
+        stopEmissionLivenessTimer();
         await listener.broadcastArmLease(buildArmLease({
           armed: false,
           ttlSeconds: null,
           heartbeatIntervalSeconds,
         })).catch(() => undefined);
         await listener.stop();
-        await input.auditLog.append(
-          "l1",
-          "filter_stopped",
-          input.fortressId,
-          {
-            socket_path: socketPath,
-            source: auditSource,
-            // Observability Slice 2 (false-RED fix): stamp the SAME `cw_source`
-            // marker the heartbeat carries so the silent-death reader recognizes
-            // this clean operator stop as an INTENTIONAL stand-down (off on
-            // purpose) and does NOT raise a false `dead_no_heartbeat`/red alarm.
-            // Constructed fields only, marker LAST (no untrusted spread). Gated
-            // read-side on the heartbeat's trust basis; it can only relabel red
-            // to a non-green `unknown`, never manufacture green.
-            [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
-          },
-          "success",
-        );
-        await input.auditLog.flush();
+        // #912 MED-1: carry any still-pending degraded-write count into the
+        // shutdown audit write too, not only the next heartbeat -- a reload
+        // that drops its audit write shortly before `stop()` must not lose the
+        // marker to a heartbeat that never fires again. Same RESERVATION
+        // semantics as the heartbeat carry (fix-round HIGH; the same
+        // double-subtract race exists against an in-flight beat at teardown):
+        // reserve before the append, restore on append failure.
+        const degradedCountAtStop = degradedCarry.reserve();
+        try {
+          await input.auditLog.append(
+            "l1",
+            "filter_stopped",
+            protectionClaimSubject,
+            {
+              socket_path: socketPath,
+              source: auditSource,
+              fortress_id: input.fortressId,
+              ...(degradedCountAtStop > 0
+                ? { audit_write_degraded_count: degradedCountAtStop }
+                : {}),
+              // Observability Slice 2 (false-RED fix): stamp the SAME `cw_source`
+              // marker the heartbeat carries so the silent-death reader recognizes
+              // this clean operator stop as an INTENTIONAL stand-down (off on
+              // purpose) and does NOT raise a false `dead_no_heartbeat`/red alarm.
+              // Constructed fields only, marker LAST (no untrusted spread). Gated
+              // read-side on the heartbeat's trust basis; it can only relabel red
+              // to a non-green `unknown`, never manufacture green.
+              [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
+            },
+            "success",
+          );
+          await input.auditLog.flush();
+        } catch (err) {
+          degradedCarry.restore(degradedCountAtStop);
+          throw err;
+        }
       } finally {
         await removeActiveConfigIfCurrent(writtenActiveConfigPath, socketPath, input.fortressId);
       }
@@ -623,8 +1495,156 @@ function buildArmLease(input: {
   };
 }
 
+/**
+ * Race `op` against a deadline. Resolves with `op`'s value when it settles
+ * first; rejects with a specific-reason Error on timeout. The underlying `op`
+ * is NOT cancelled (the helper-sign shim already self-terminates at its own
+ * timeout, and a late-settling `op` is simply dropped): the point is that the
+ * caller returns PROMPTLY with a specific reason rather than blocking until a
+ * downstream client's own generic deadline fires. Fail-closed: a timeout is an
+ * error, so a `reloadPolicy` that times out here returns `ok:false`, never a
+ * silent partial success.
+ */
+/**
+ * Pending degraded-audit-write counter with RESERVATION carry semantics
+ * (#912 MED-1 follow-up, fix-round HIGH).
+ *
+ * `record()` counts one dropped (deadline-missed or persist-failed) audit
+ * write. A carrier calls `reserve()` to take ownership of the units it will
+ * stamp into a chain entry, BEFORE starting its append; on append failure it
+ * calls `restore(units)` so the next carrier retries them. Because a reserve
+ * synchronously zeroes the pending units, two overlapping carries can never
+ * both snapshot and then both subtract the same units (the double-subtract
+ * bug: two concurrent heartbeat carries of the same 1-unit snapshot drove the
+ * counter to -1, and a LATER real drop incremented -1 to 0, so its marker
+ * never emitted and the loss became chain-invisible again).
+ *
+ * The count is clamped at >= 0: with reservation semantics a negative value
+ * is unreachable, so reaching one means the carry protocol was violated and
+ * is reported loudly instead of silently corrupting later markers.
+ *
+ * Exported for direct unit-testing of the reservation and clamp invariants;
+ * production code uses the single instance inside
+ * {@link startMacOSCastleWallDaemon}.
+ */
+export interface AuditWriteDegradedCarry {
+  /** Count one dropped audit write. */
+  record(): void;
+  /** Take ownership of all pending units (may be 0). Call BEFORE the append. */
+  reserve(): number;
+  /** Return reserved units after a FAILED carry so the next carrier retries them. */
+  restore(units: number): void;
+}
+
+export function createAuditWriteDegradedCarry(): AuditWriteDegradedCarry {
+  let pending = 0;
+  const clamp = (): void => {
+    if (pending >= 0) return;
+    // SAFETY: an impossible negative counter is an invariant violation in the
+    // carry protocol; report it loudly on daemon stderr rather than letting it
+    // silently swallow the next real drop's marker.
+    console.error(
+      `[castle-wall] degraded-audit-write counter went negative (${pending}); clamping to 0 (carry-protocol invariant violation)`,
+    );
+    pending = 0;
+  };
+  return {
+    record() {
+      pending += 1;
+    },
+    reserve() {
+      const units = pending;
+      pending -= units;
+      clamp();
+      return units;
+    },
+    restore(units) {
+      pending += units;
+      clamp();
+    },
+  };
+}
+
+function withReloadDeadline<T>(
+  op: Promise<T>,
+  deadlineMs: number,
+  timeoutReason: string,
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      reject(new Error(timeoutReason));
+    }, deadlineMs);
+    timer.unref?.();
+    op.then(
+      (value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (err: unknown) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        reject(err instanceof Error ? err : new Error(String(err)));
+      },
+    );
+  });
+}
+
 const AGENT_ORIGIN_FILENAME = "agent-origin.json";
 const OPERATOR_BASELINE_FILENAME = "operator-baseline.json";
+
+/**
+ * Resolve the exclusive-egress gate policy (Unified Protect Slice 1): prefer
+ * the explicit input, fall back to `policy/egress/exclusive-egress-gate.json`
+ * in the fortress. BOTH branches run through
+ * `validateExclusiveEgressGatePolicy`; a malformed candidate resolves to
+ * `undefined` (fail closed: the manifest carries no gate allow rule, so no
+ * derived grant is ever signed from bad bytes).
+ */
+async function resolveExclusiveEgressGate(
+  fortressPath: string,
+  explicitInput: unknown,
+): Promise<ExclusiveEgressGatePolicy | undefined> {
+  if (explicitInput !== undefined) {
+    const validated = validateExclusiveEgressGatePolicy(explicitInput);
+    if (validated === null) {
+      // SAFETY: daemon startup diagnostics are operator-facing stderr output.
+      console.warn(
+        "[castle-wall] warning: explicit exclusive-egress gate policy is structurally invalid; ignoring (no gate rule derived)",
+      );
+      return undefined;
+    }
+    return validated;
+  }
+  const filePath = join(fortressPath, "policy", "egress", EXCLUSIVE_EGRESS_GATE_FILENAME);
+  try {
+    const raw = await readFileCustody(filePath, {
+      encoding: "utf8",
+      verifyPathIdentity: true,
+    });
+    const parsed = JSON.parse(raw) as unknown;
+    const validated = validateExclusiveEgressGatePolicy(parsed);
+    if (validated === null) {
+      // SAFETY: daemon startup diagnostics are operator-facing stderr output.
+      console.warn(
+        `[castle-wall] warning: ${EXCLUSIVE_EGRESS_GATE_FILENAME} is structurally invalid; ignoring (no gate rule derived)`,
+      );
+      return undefined;
+    }
+    return validated;
+  } catch (err) {
+    const code = err instanceof Error && "code" in err
+      ? (err as NodeJS.ErrnoException).code
+      : undefined;
+    if (code === "ENOENT") return undefined;
+    throw err;
+  }
+}
 
 /**
  * Resolve the agent-origin descriptor from config: prefer the explicit input,
@@ -794,8 +1814,21 @@ async function loadLocalSigningKey(
  * must NOT write it (it lacks root and would only EACCES). It is explicit, not a
  * silent warn. In the local dev/test path the daemon still best-effort writes it
  * so a developer box without the helper still has a readable pin.
+ *
+ * Fail-open fix (2026-07-07): the local-sign path previously rename-over-wrote
+ * the pin unconditionally, so a root local-sign daemon would silently CLOBBER
+ * an existing DIFFERING signer-owned pin (the same fail-open the provision-pin
+ * path had, on a different path). It now routes through the shared
+ * `writeGlobalPinIfUnestablished` chokepoint (read-and-compare before any
+ * write), so an existing, differing pin is left intact at ANY euid. Only re-pin
+ * (`helper-signer.ts installPin()`, NOT routed here) migrates an established
+ * pin. `globalPinPath` mirrors the existing helper-mode cross-check seam so the
+ * guard is testable without the real `/Library` path.
  */
-async function writeSystemPinnedPublicKey(signer: DaemonSigner): Promise<void> {
+export async function writeSystemPinnedPublicKey(
+  signer: DaemonSigner,
+  globalPinPath: string = CASTLE_GLOBAL_PINNED_PUBKEY_PATH,
+): Promise<void> {
   if (signer.mode === "helper") {
     // SAFETY: daemon startup diagnostics are operator-facing stderr output.
     console.error(
@@ -804,20 +1837,68 @@ async function writeSystemPinnedPublicKey(signer: DaemonSigner): Promise<void> {
     return;
   }
   try {
-    await mkdir(CASTLE_GLOBAL_PINNED_PUBKEY_DIR, {
-      recursive: true,
-      mode: 0o755,
-    });
-    await writeFileCustody(CASTLE_GLOBAL_PINNED_PUBKEY_PATH, signer.publicKey, {
-      mode: 0o644,
-      createParent: false,
+    await writeGlobalPinIfUnestablished(signer.publicKey, {
+      path: globalPinPath,
+      onRefuse: () =>
+        // SAFETY: daemon startup diagnostics are operator-facing stderr output.
+        console.warn(
+          `[castle-wall] global pin ${globalPinPath} already exists with a different key owned by the root signer helper (A2); the local-sign daemon does not overwrite it. Run 'sanctuary castle-wall re-pin' to migrate the trust anchor to the signer helper.`,
+        ),
+      freshWrite: async (path, key) => {
+        await mkdir(dirname(path), { recursive: true, mode: 0o755 });
+        await writeFileCustody(path, key, {
+          mode: 0o644,
+          createParent: false,
+        });
+      },
     });
   } catch (error) {
     // SAFETY: daemon startup diagnostics are operator-facing stderr output.
     console.warn(
-      `[castle-wall] warning: unable to write shared pinned public key at ${CASTLE_GLOBAL_PINNED_PUBKEY_PATH}: ${error instanceof Error ? error.message : String(error)}`,
+      `[castle-wall] warning: unable to write shared pinned public key at ${globalPinPath}: ${error instanceof Error ? error.message : String(error)}`,
     );
   }
+}
+
+async function loadMacOSAuditProducerPublicKey(
+  path: string,
+): Promise<{ bytes: Uint8Array; keyB64url: string } | null> {
+  let bytes: Uint8Array;
+  try {
+    bytes = new Uint8Array(
+      await readFileCustody(path, { verifyPathIdentity: true }),
+    );
+  } catch (error) {
+    const code =
+      error && typeof error === "object" && "code" in error
+        ? (error as NodeJS.ErrnoException).code
+        : undefined;
+    if (code === "ENOENT") {
+      return null;
+    }
+    throw new Error(
+      `Castle Wall macOS audit-producer key at ${path} is unreadable: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+      { cause: error },
+    );
+  }
+  if (bytes.length !== 32) {
+    throw new Error(
+      `Castle Wall macOS audit-producer key at ${path} is ${bytes.length} bytes (expected 32).`,
+    );
+  }
+  return { bytes, keyB64url: toBase64url(bytes) };
+}
+
+async function publishFortressAuditProducerPublicKey(
+  fortressPath: string,
+  publicKey: Uint8Array,
+): Promise<void> {
+  await writeFileCustody(resolveProducerPubKeyPath(fortressPath), publicKey, {
+    mode: 0o644,
+    createParent: true,
+  });
 }
 
 /**
@@ -874,12 +1955,29 @@ async function assertGlobalPinMatchesLiveKey(
   }
 }
 
-async function loadManifestState(input: {
+/**
+ * THE manifest composer: read every rule file from the fortress's
+ * `policy/egress/rules/` directory (the one true rule source -- promotion,
+ * provisioning, and operator-authored rules all publish there), compose the
+ * effective ruleset (habeas lanes, derived DNS, gate rule, and the
+ * exclusive-routing assertion when the routing marker is present), and sign
+ * the result. This is the daemon's ONLY manifest production path, for both
+ * the initial load and every reload.
+ *
+ * Exported (2026-07-27) so the observe/promote enforcement-reach end-to-end
+ * test can assert against the REAL composer the daemon runs, not a
+ * test-local reimplementation of its read half -- the original defect
+ * shipped precisely because the only round-trip test paired the promote
+ * writer with the promote module's own reader while no enforcement path read
+ * that location. Production callers remain inside this module.
+ */
+export async function loadManifestState(input: {
   fortressPath: string;
   fortressId: string;
   signer: DaemonSigner;
   agentOrigin?: unknown;
   operatorBaseline?: unknown;
+  exclusiveEgressGate?: ExclusiveEgressGatePolicy | undefined;
   globalPinnedPublicKeyPath?: string;
 }): Promise<ManifestState> {
   // Defense-in-depth: cross-check the persisted root-owned pin against the live
@@ -911,21 +2009,76 @@ async function loadManifestState(input: {
     if (issues.length > 0) {
       throw new Error(`rule ${filename} invalid: ${issues.join("; ")}`);
     }
+    // Round-4 C2: the observe promote publishes the genuine derived habeas
+    // lane INTO its signed manifest (the Linux daemon's composed-manifest
+    // gate requires exactly one), which necessarily places the lane's rule
+    // FILE in this directory (a manifest entry must resolve at
+    // rules/<file> for the Rust loader). This composer derives its OWN
+    // lanes and treats everything here as operator input, so a byte-GENUINE
+    // lane file (the shipped exact-shape recognizer, never id-trust or the
+    // `derived` flag) is skipped as the known cross-platform artifact --
+    // semantically a dedup, never a widening: the injected lane is
+    // identical. A file that merely CLAIMS a habeas id still flows through
+    // and is rejected by the reserved-namespace firewall
+    // (`findHabeasConflicts`), fail-closed, unchanged.
+    if (parsed.id.startsWith(HABEAS_RULE_ID_PREFIX) && isGenuineDerivedHabeasRule(parsed)) {
+      continue;
+    }
     rules.push(parsed);
   }
   // Compose the effective ruleset: HABEAS PORT reserved distress rules are
   // ALWAYS injected (a conflicting operator ruleset throws — fail closed,
   // never a wall that can silence distress), then the scoped DNS allow
   // (#380) is derived when hostname allow-rules exist. The rule scopes to
-  // the system resolvers ONLY (dns.getServers(), verified to match
-  // `scutil --dns`); absent when no hostname rules exist.
+  // the host's ACTIVE resolver set ONLY (collectSystemResolvers: on macOS a
+  // fresh scutil --dns read, EMPTY on failure -- fail closed, never a grant
+  // signed from this long-lived process's stale dns.getServers() snapshot;
+  // the 2026-07-12 drill bug); absent when no hostname rules exist.
   const distressConfig = await readDistressConfig(input.fortressPath);
-  const effectiveRules = composeEffectiveRules({
-    operatorRules: rules,
-    resolvers: getServers(),
-    distressWebhook: distressConfig.webhook_target,
-    createdAt: new Date().toISOString(),
-  });
+  const resolvers = await collectSystemResolvers();
+  // Unified Protect Slice 5 S5-6: the exclusive-routing MODE MARKER decides
+  // which composition this manifest gets. Marker ABSENT = coarse (today's
+  // path, byte-unchanged). Marker PRESENT = the S5-4 exclusive composition:
+  // provisioned endpoint rules must be gate-scoped and the compose-time
+  // assertion refuses ANY agent-reachable direct off-box allow -- a violation
+  // THROWS here, so NO manifest is produced (fail-closed: no manifest, no
+  // arm; never a silently-widened one). A present-but-malformed marker also
+  // throws (loadExclusiveRoutingMarker's contract) rather than guessing a
+  // mode. This makes the daemon -- the only real manifest producer -- the
+  // chokepoint for the BLOCKER-1 routing property on every load AND reload.
+  const routingMarker = await loadExclusiveRoutingMarker(input.fortressPath);
+  let effectiveRules: AllowlistRule[];
+  if (routingMarker !== null) {
+    const composition = await composeExclusiveRoutingRules({
+      base: {
+        operatorRules: rules,
+        resolvers,
+        distressWebhook: distressConfig.webhook_target,
+        exclusiveEgressGate: input.exclusiveEgressGate,
+        createdAt: new Date().toISOString(),
+      },
+      routing: {
+        mode: "exclusive",
+        principals: {
+          agent_uid: routingMarker.agent_uid,
+          gate_uid: routingMarker.gate_uid,
+          agent: {
+            agent_id: routingMarker.agent_id,
+            agent_template: routingMarker.agent_template,
+          },
+        },
+      },
+    });
+    effectiveRules = composition.rules;
+  } else {
+    effectiveRules = composeEffectiveRules({
+      operatorRules: rules,
+      resolvers,
+      distressWebhook: distressConfig.webhook_target,
+      exclusiveEgressGate: input.exclusiveEgressGate,
+      createdAt: new Date().toISOString(),
+    });
+  }
   const { signed } = await buildSignedManifest({
     fortressId: input.fortressId,
     issuedAt: new Date().toISOString(),
@@ -965,7 +2118,9 @@ async function assertSocketNotOwnedByLiveProcess(socketPath: string): Promise<vo
   }
 
   if (await socketHasLiveListener(socketPath)) {
-    throw new Error(CASTLE_WALL_ALREADY_RUNNING_MESSAGE);
+    throw new Error(
+      formatCastleWallAlreadyRunningMessage(undefined, await describeSocketHolder(socketPath)),
+    );
   }
 
   await unlink(socketPath).catch((err: unknown) => {
@@ -974,6 +2129,36 @@ async function assertSocketNotOwnedByLiveProcess(socketPath: string): Promise<vo
       : undefined;
     if (code !== "ENOENT") throw err;
   });
+}
+
+async function describeSocketHolder(socketPath: string): Promise<string | undefined> {
+  const lsofPath = process.platform === "darwin" ? "/usr/sbin/lsof" : "lsof";
+  try {
+    const { stdout } = await execFileAsync(lsofPath, ["-nP", "-F", "pc", "--", socketPath], {
+      timeout: 1000,
+    });
+    const holders: string[] = [];
+    let pid: string | undefined;
+    let command: string | undefined;
+    const flush = (): void => {
+      if (pid === undefined && command === undefined) return;
+      holders.push(`${command ?? "process"}${pid !== undefined ? ` pid ${pid}` : ""}`);
+      pid = undefined;
+      command = undefined;
+    };
+    for (const line of stdout.split(/\r?\n/)) {
+      if (line.startsWith("p")) {
+        flush();
+        pid = line.slice(1);
+      } else if (line.startsWith("c")) {
+        command = line.slice(1);
+      }
+    }
+    flush();
+    return holders.length > 0 ? holders.join(", ") : undefined;
+  } catch {
+    return "live listener accepted a connection, but lsof could not identify its pid/process";
+  }
 }
 
 /**
@@ -1026,7 +2211,7 @@ async function assertActiveConfigNotOwnedByLiveProcess(
     if (config.mode === "safe") {
       throw new Error(safeModeHandoffMessage(config.pid));
     }
-    throw new Error(CASTLE_WALL_ALREADY_RUNNING_MESSAGE);
+    throw new Error(formatCastleWallAlreadyRunningMessage(config.pid));
   }
 }
 

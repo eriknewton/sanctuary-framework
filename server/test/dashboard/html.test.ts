@@ -130,7 +130,21 @@ describe("renderDashboardHTML", () => {
 
   it("renders the hero copy from the exported HERO_COPY constant", () => {
     const html = renderDashboardHTML({ snapshot: makeSnapshot() });
-    expect(html).toContain(HERO_COPY);
+    expect(html).toContain(`<h1 id="hero-copy">${HERO_COPY}</h1>`);
+  });
+
+  it("does not render the protected hero copy for non-green snapshots", () => {
+    const html = renderDashboardHTML({
+      snapshot: makeSnapshot({
+        overall: {
+          status: "degraded",
+          light: "yellow",
+          headline: "Castle Wall enforcement not confirmed",
+        },
+      }),
+    });
+    expect(html).not.toContain(`<h1 id="hero-copy">${HERO_COPY}</h1>`);
+    expect(html).toContain('<h1 id="hero-copy">Protection not confirmed.</h1>');
   });
 
   it("renders the privacy boundary summary", () => {
@@ -255,12 +269,14 @@ describe("renderDashboardHTML", () => {
     expect(html).toContain("\"server_version\":\"0.9.0-test\"");
   });
 
-  it("injects the auth token into the client bootstrap when provided", () => {
+  it("does not inject the auth token into the client bootstrap when provided", () => {
     const html = renderDashboardHTML({
       snapshot: makeSnapshot(),
       authToken: "tok-abc",
     });
-    expect(html).toContain('AUTH_TOKEN = "tok-abc"');
+    expect(html).not.toContain("tok-abc");
+    expect(html).toContain('sessionStorage.getItem("authToken")');
+    expect(html).toContain("promptForOperatorToken");
   });
 
   it("does not construct long-lived token URLs for API calls or SSE", () => {

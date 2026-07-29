@@ -88,7 +88,17 @@ import {
   type ConciergeProactiveStarter,
 } from "./agent-context-cache.js";
 import { classifyQueryIntent, type IntentClassifier } from "../query-anonymity/intent-classifier.js";
-import type { PiiConfigStore } from "../query-anonymity/pii-config-store.js";
+import {
+  PiiConfigReadFailed,
+  type PiiConfigStore,
+  type PiiQueryGates,
+} from "../query-anonymity/pii-config-store.js";
+import {
+  PII_REWRITE_AUDIT_OPS,
+  emitPiiRewriteAudit,
+  rewritePiiWithLlm,
+} from "../query-anonymity/pii-rewrite.js";
+import { detectSensitiveSpans } from "../operational/privacy-filter.js";
 import type { ReverseMappingStore } from "../query-anonymity/reverse-mapping-store.js";
 import {
   emitReverseMappingUsedAudit,
@@ -270,11 +280,19 @@ export interface OperatorChatServiceDeps {
    */
   conciergeAgentStateBudget?: number;
   /**
-   * Rho-3 smart-mode query anonymity. Optional so existing service
-   * wiring remains unchanged; when present and smart mode is enabled,
-   * the operator query is smart-rewritten before the concierge
-   * substrate call, reverse mappings are stored per query id, and the
-   * response is restored server-side before display.
+   * Tier B query anonymity (Rho-2.5 live wiring). Optional so existing
+   * service wiring remains unchanged. When the config store is present
+   * and the operator opted in with recorded consent:
+   *   - smart mode (Rho-3): the operator query is smart-rewritten
+   *     before the concierge substrate call, reverse mappings are
+   *     stored per query id, and the response is restored server-side
+   *     before display;
+   *   - basic Tier B (Rho-2): the query is anonymize-all rewritten
+   *     (regex + LLM-assist) before the substrate call, with no
+   *     render-time restoration.
+   * Both paths emit `query_anonymity_pii_rewritten`. Default-off: with
+   * the toggle off the substrate query is byte-identical to the
+   * pre-Tier-B behavior.
    */
   queryAnonymityConfig?: PiiConfigStore;
   queryAnonymityReverseMappingStore?: ReverseMappingStore;
@@ -283,6 +301,48 @@ export interface OperatorChatServiceDeps {
 }
 
 const DEFAULT_CONCIERGE_MAX_TOKENS = 512;
+
+/**
+ * Sensitive classes the Rho-2 Tier B rewrite does NOT model (its seven
+ * categories are person-PII). These are scrubbed from Tier-B-bound text
+ * BEFORE the rewrite runs so secrets/credentials never reach the
+ * classify/redact helper surfaces and are never candidates for smart
+ * mode's intent preservation. The overlap classes (email, phone, ssn,
+ * credit_card) are deliberately NOT in this set: the Tier B pass owns
+ * them (reverse mappings + intent preservation need the originals) and
+ * the concierge Tier 1 filter re-covers them on the composed outbound
+ * text.
+ */
+const NON_REWRITE_SENSITIVE_CLASSES: ReadonlySet<string> = new Set([
+  "secret",
+  "secret_assignment",
+  "credential",
+  "account_number",
+  "file_path",
+]);
+
+/**
+ * Replace non-Rho-2 sensitive spans (secrets, credentials, account
+ * numbers, file paths) with `[REDACTED:CLASS]` markers, mirroring the
+ * concierge Tier 1 filter's replacement style. Pure; idempotent over
+ * already-scrubbed text (markers match none of the detector patterns).
+ */
+function scrubNonRewriteClasses(text: string): string {
+  const spans = detectSensitiveSpans(text).filter((span) =>
+    NON_REWRITE_SENSITIVE_CLASSES.has(span.class),
+  );
+  if (spans.length === 0) return text;
+  // Replace back-to-front so span offsets stay valid.
+  const sorted = [...spans].sort((a, b) => b.start - a.start);
+  let out = text;
+  for (const span of sorted) {
+    out =
+      out.slice(0, span.start) +
+      `[REDACTED:${span.class.toUpperCase()}]` +
+      out.slice(span.end);
+  }
+  return out;
+}
 
 /**
  * WP-V1.3-9 Tau-2 defaults. Coordinator-CTO baked: 10-turn window, 24h
@@ -532,37 +592,99 @@ export class OperatorChatService {
 
     let substrateQuery = filterResult.filtered;
     let reverseMappingQueryId: string | null = null;
-    if (
-      this.substrateSelector &&
-      this.queryAnonymityConfig &&
-      this.queryAnonymityReverseMappingStore
-    ) {
-      const smartEnabled = await this.queryAnonymityConfig
-        .shouldRewriteSmartMode()
-        .catch(() => false);
-      if (smartEnabled) {
+    // Rho-2.5: set when an enabled-Tier-B rewrite ran on this
+    // round-trip. When true, the assembled context (which folds prior
+    // turns verbatim from the raw-by-design memory store) also gets the
+    // Tier B egress treatment before the substrate call, so turn N's
+    // PII cannot egress inside turn N+1's context.
+    let tierBRewriteActive = false;
+    const tierBFortressId =
+      this.queryAnonymityFortressId ?? "fortress:operator-chat";
+    if (this.substrateSelector && this.queryAnonymityConfig) {
+      // Rho-2.5 live Tier B gate. One store read decides smart vs basic
+      // vs off. An ABSENT config record (storage read succeeds, no
+      // record) evaluates to the canonical default (off, no consent):
+      // no rewrite, and no protection is claimed. Two failure states
+      // are different: a record that EXISTS but cannot be decoded
+      // (gates === null) and a storage read that THROWS
+      // (PiiConfigReadFailed). In both, the operator's persisted
+      // privacy posture is UNKNOWN, so per hard-constraint 5 (never
+      // silently degrade) the query FAILS with an actionable error
+      // instead of silently egressing un-rewritten text.
+      let gates: PiiQueryGates | null;
+      let configFailure: "decode_failed" | "read_failed" | null = null;
+      try {
+        gates = await this.queryAnonymityConfig.evaluateForQuery();
+        if (gates === null) configFailure = "decode_failed";
+      } catch (err) {
+        if (!(err instanceof PiiConfigReadFailed)) throw err;
+        gates = null;
+        configFailure = "read_failed";
+      }
+      if (gates === null || configFailure !== null) {
+        void this.auditLog.append(
+          "l2",
+          PII_REWRITE_AUDIT_OPS.CONFIG_UNREADABLE,
+          this.identityId,
+          { fortress_id: tierBFortressId, reason: configFailure },
+          "failure",
+        );
+        throw new Error(
+          configFailure === "read_failed"
+            ? "Tier B PII-rewrite config could not be read from storage, " +
+              "so the operator's privacy posture for this fortress is " +
+              "unknown. Refusing to send the query. Retry once fortress " +
+              "storage is healthy."
+            : "Tier B PII-rewrite config exists but cannot be decoded, so " +
+              "the operator's privacy posture for this fortress is " +
+              "unknown. Refusing to send the query. Reset the config via " +
+              "PATCH /api/query-anonymity/pii/config and retry.",
+        );
+      }
+      // Both legs below require the recorded consent snapshot (defense
+      // in depth; the store's patch gate already refuses enabling
+      // without consent).
+      if (
+        gates.smart &&
+        gates.consented &&
+        this.queryAnonymityReverseMappingStore
+      ) {
+        tierBRewriteActive = true;
         const classifier =
           this.queryAnonymityIntentClassifier ??
           ({
             classify: (input: string) =>
               classifyQueryIntent(input, this.substrateSelector!),
           } satisfies IntentClassifier);
-        const result = await smartRewrite(trimmed, {
+        // Non-Rho-2 sensitive classes (secrets, credentials, account
+        // numbers, file paths) are scrubbed BEFORE the smart rewrite so
+        // they never reach the classify/redact helper surfaces and are
+        // never candidates for intent preservation. The seven Rho-2 PII
+        // categories stay raw here on purpose: reverse mappings and
+        // intent preservation need the originals.
+        const result = await smartRewrite(scrubNonRewriteClasses(trimmed), {
           selector: this.substrateSelector,
           classifier,
         });
-        substrateQuery = result.rewritten_query;
+        // The concierge Tier 1 filter runs over the composed outbound
+        // query AFTER intent-preserved restores, so smart mode is never
+        // weaker than Tier-B-off for the filter's classes: anything the
+        // filter would scrub on the plain path (including a restored
+        // overlap class like email) is scrubbed here too. The Tier B
+        // audit event below still reports what THIS pass redacted /
+        // preserved; the filter layer accounts for itself.
+        substrateQuery = this.piiFilter
+          ? this.piiFilter.filter(result.rewritten_query).filtered
+          : result.rewritten_query;
         reverseMappingQueryId = queryId;
         await this.queryAnonymityReverseMappingStore
           .store(queryId, result.reverse_map)
           .catch(() => undefined);
-        const fortressId =
-          this.queryAnonymityFortressId ?? "fortress:operator-chat";
         if (result.fallback_reason) {
           emitSmartModeFallbackAudit({
             auditLog: this.auditLog,
             identityId: this.identityId,
-            fortressId,
+            fortressId: tierBFortressId,
             queryId,
             reason: result.fallback_reason,
           });
@@ -570,9 +692,45 @@ export class OperatorChatService {
         emitSmartRewriteAudit({
           auditLog: this.auditLog,
           identityId: this.identityId,
-          fortressId,
+          fortressId: tierBFortressId,
           queryId,
           result,
+        });
+        emitPiiRewriteAudit({
+          auditLog: this.auditLog,
+          identityId: this.identityId,
+          fortressId: tierBFortressId,
+          redactionCounts: result.pii_rewrite.redaction_counts,
+          llmAssistRan: result.pii_rewrite.llm_assist_ran,
+          llmResidualCount: result.pii_rewrite.llm_residual_count,
+          consentedToTradeOff: gates.consented,
+          preservedClasses: result.preserved_classes,
+          leg: "query",
+        });
+      } else if (gates.rewrite && gates.consented) {
+        // Basic Tier B (Rho-2.5): `enabled` without smart mode, or smart
+        // mode on a binding without a reverse-mapping store. Anonymize-all
+        // with no render-time restoration (that is smart mode's job). The
+        // input is `substrateQuery` (the concierge-PII-filtered text) plus
+        // the non-rewrite-class scrub, so Tier B composes ON TOP of the
+        // existing filter and turning it on only ever removes more from
+        // the outbound query.
+        tierBRewriteActive = true;
+        const result = await rewritePiiWithLlm(
+          scrubNonRewriteClasses(substrateQuery),
+          this.substrateSelector,
+          { identityId: this.identityId },
+        );
+        substrateQuery = result.rewritten;
+        emitPiiRewriteAudit({
+          auditLog: this.auditLog,
+          identityId: this.identityId,
+          fortressId: tierBFortressId,
+          redactionCounts: result.redaction_counts,
+          llmAssistRan: result.llm_assist_ran,
+          llmResidualCount: result.llm_residual_count,
+          consentedToTradeOff: gates.consented,
+          leg: "query",
         });
       }
     }
@@ -673,11 +831,23 @@ export class OperatorChatService {
             parsedGrammar,
           );
           dynamicCategoriesIncluded = dynamicResult.categoriesIncluded;
-          const context = await this.assembleConciergeContext(
+          const assembledContext = await this.assembleConciergeContext(
             priorTurns,
             dynamicResult.section,
             agentStateSection,
           );
+          // Rho-2.5 (context leg): the assembled context folds prior
+          // turns verbatim from memory, which persists RAW text by
+          // design (encrypted at rest; the operator's own history
+          // renders real values). The egress boundary is HERE, so with
+          // Tier B active the whole context gets the same treatment as
+          // the query before it enters the selector call.
+          const context = tierBRewriteActive
+            ? await this.rewriteTierBOutboundContext(
+                assembledContext,
+                tierBFortressId,
+              )
+            : assembledContext;
           const response = await this.substrateSelector.invokeSummarize(
             "concierge",
             {
@@ -1069,6 +1239,55 @@ export class OperatorChatService {
    * if available; the v1.2 selector does not expose one, so structured
    * serialization is the canonical path for v1.3.
    */
+  /**
+   * Rho-2.5 (F1 fix): Tier B egress treatment for the assembled
+   * concierge context. Memory keeps the operator's turns RAW by design
+   * (encrypted at rest; local history renders real values), so with
+   * Tier B active this is the chokepoint that keeps earlier turns' PII
+   * (and PII in dynamic/agent-state sections) from egressing inside
+   * the next turn's context. Same composition as the query legs:
+   * concierge Tier 1 filter (when wired) + non-rewrite-class scrub +
+   * Rho-2 regex/LLM-assist pass, anonymize-all (no intent preservation
+   * for context; only the live query gets intent-aware treatment).
+   *
+   * Emits the pii_rewritten op with leg "prior_context" only when the
+   * pass actually redacted something, so clean turns do not double the
+   * per-round audit volume; the query-leg event is the per-round
+   * liveness signal.
+   */
+  private async rewriteTierBOutboundContext(
+    context: string,
+    fortressId: string,
+  ): Promise<string> {
+    const filtered = this.piiFilter
+      ? this.piiFilter.filter(context).filtered
+      : context;
+    const result = await rewritePiiWithLlm(
+      scrubNonRewriteClasses(filtered),
+      this.substrateSelector!,
+      { identityId: this.identityId },
+    );
+    const regexHits = Object.values(result.redaction_counts).reduce(
+      (a, b) => a + b,
+      0,
+    );
+    if (regexHits > 0 || result.llm_residual_count > 0) {
+      emitPiiRewriteAudit({
+        auditLog: this.auditLog,
+        identityId: this.identityId,
+        fortressId,
+        redactionCounts: result.redaction_counts,
+        llmAssistRan: result.llm_assist_ran,
+        llmResidualCount: result.llm_residual_count,
+        // Both Tier B legs gate on gates.consented, so an active
+        // rewrite implies recorded consent.
+        consentedToTradeOff: true,
+        leg: "prior_context",
+      });
+    }
+    return result.rewritten;
+  }
+
   private async assembleConciergeContext(
     priorTurns: ConciergeTurn[] = [],
     dynamicSection = "",

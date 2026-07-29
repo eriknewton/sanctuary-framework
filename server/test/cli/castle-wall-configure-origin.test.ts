@@ -130,4 +130,76 @@ describe("castle-wall configure-origin CLI", () => {
     expect(code).toBe(2);
     expect(err.text()).toContain("--signing-id");
   });
+
+  // --- Hardening: strict numeric parse + floor invariant (shared chokepoint) ---
+
+  async function originExists(): Promise<boolean> {
+    try {
+      await readFile(join(tmpDir, "policy", "egress", "agent-origin.json"), "utf8");
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  it("rejects --agent-uid=0 (root can never be the confined agent)", async () => {
+    const err = collectStream();
+    const code = await runConfigureOrigin(
+      ["uid", "--agent-uid=0", "--ceiling=0", "--fortress", tmpDir],
+      { out: err.stream, err: err.stream, env: {} }
+    );
+    expect(code).toBe(1);
+    expect(await originExists()).toBe(false);
+  });
+
+  it("rejects an agent uid below the ceiling", async () => {
+    const err = collectStream();
+    const code = await runConfigureOrigin(
+      ["uid", "--agent-uid=100", "--ceiling=500", "--fortress", tmpDir],
+      { out: err.stream, err: err.stream, env: {} }
+    );
+    expect(code).toBe(1);
+    expect(await originExists()).toBe(false);
+  });
+
+  it("accepts agent uid EQUAL to the ceiling (boundary)", async () => {
+    const out = collectStream();
+    const code = await runConfigureOrigin(
+      ["uid", "--agent-uid=500", "--ceiling=500", "--fortress", tmpDir],
+      { out: out.stream, err: out.stream, env: {} }
+    );
+    expect(code).toBe(0);
+    const raw = await readFile(
+      join(tmpDir, "policy", "egress", "agent-origin.json"),
+      "utf8"
+    );
+    expect(JSON.parse(raw)).toEqual({
+      mode: "uid",
+      agent_uid: 500,
+      system_uid_allow_ceiling: 500,
+    });
+  });
+
+  it("rejects a non-numeric --agent-uid fail-closed (no parseInt truncation)", async () => {
+    const err = collectStream();
+    const code = await runConfigureOrigin(
+      ["uid", "--agent-uid=501abc", "--fortress", tmpDir],
+      { out: err.stream, err: err.stream, env: {} }
+    );
+    // parseInt("501abc") would have silently produced 501; strict parse refuses.
+    expect(code).toBe(1);
+    expect(err.text()).toContain("plain positive integer");
+    expect(await originExists()).toBe(false);
+  });
+
+  it("rejects a non-numeric --ceiling fail-closed (no parseInt truncation)", async () => {
+    const err = collectStream();
+    const code = await runConfigureOrigin(
+      ["uid", "--agent-uid=502", "--ceiling=500abc", "--fortress", tmpDir],
+      { out: err.stream, err: err.stream, env: {} }
+    );
+    expect(code).toBe(1);
+    expect(err.text()).toContain("--ceiling");
+    expect(await originExists()).toBe(false);
+  });
 });

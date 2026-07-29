@@ -369,7 +369,7 @@ describe("LmdbStorageBackend", () => {
       expect(encryptedEnvelopeContains(raw!, "transactional note")).toBe(false);
     } finally {
       await backend.close();
-      await rm(dir, { recursive: true, force: true });
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     }
   },
   );
@@ -384,7 +384,7 @@ function lmdbNativeOpenAvailable(): boolean {
       const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'lmdb-smoke-'));
       const db = lmdb.open({ path: dir, encoding: 'binary', compression: false, mapSize: 1024 * 1024 });
       await db.close();
-      await fs.rm(dir, { recursive: true, force: true });
+      await fs.rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     });
   `;
   const result = spawnSync(process.execPath, ["-e", script], {

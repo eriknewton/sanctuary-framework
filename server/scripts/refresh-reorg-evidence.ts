@@ -21,8 +21,8 @@
  * git/find/grep, matching the existing scripts in this directory.
  *
  * Usage:
- *   npx vite-node scripts/refresh-reorg-evidence.ts
- *   npx vite-node scripts/refresh-reorg-evidence.ts --top 30
+ *   npx tsx scripts/refresh-reorg-evidence.ts
+ *   npx tsx scripts/refresh-reorg-evidence.ts --top 30
  *
  * This is a reporting tool. It always exits 0; it never fails a build.
  */

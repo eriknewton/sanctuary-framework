@@ -18,7 +18,7 @@
  *   - Castle-walking: routes do not surface outbound network.
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -26,6 +26,7 @@ import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { randomUUID } from "node:crypto";
 import { Writable } from "node:stream";
+import { useTestPassphrase } from "../helpers/temp-fortress.js";
 
 import {
   AuditLog,
@@ -111,6 +112,13 @@ function makeRig(opts?: { fortressId?: string }): {
   return { storage, masterKey, auditLog, findingStore, dispatcher, fortressId };
 }
 
+// The POST/DELETE subscribe routes are DEFAULT-DENY mutations: they require the
+// operator bearer even on loopback (requireToken suppresses the loopback
+// shortcut). GET reads stay loopback-readable. The rig wires a fixed operator
+// token; non-GET calls send it via `MUTATION_AUTH`.
+const ANOMALY_AUTH_TOKEN = "anomaly-ux-operator-token";
+const MUTATION_AUTH = { Authorization: `Bearer ${ANOMALY_AUTH_TOKEN}` };
+
 async function makeServer(rig: ReturnType<typeof makeRig>): Promise<{
   base: string;
   close: () => Promise<void>;
@@ -118,7 +126,10 @@ async function makeServer(rig: ReturnType<typeof makeRig>): Promise<{
   const server: Server = createServer(async (req, res) => {
     const handled = await handleAnomalyRoute(
       {
-        authConfig: { loopbackAutoAuth: true },
+        authConfig: {
+          loopbackAutoAuth: true,
+          authToken: ANOMALY_AUTH_TOKEN,
+        },
         dispatcher: rig.dispatcher,
         findingStore: rig.findingStore,
         auditLog: rig.auditLog,
@@ -281,7 +292,7 @@ describe("Chi-3 — HTTP routes", () => {
     try {
       const subRes = await fetch(
         `${base}${ANOMALY_API_PREFIX}/${PER_AGENT_ACTIVITY_DETECTOR_ID}/subscribe?classifier=${ROLLING_BASELINE_CLASSIFIER_ID}`,
-        { method: "POST" },
+        { method: "POST", headers: MUTATION_AUTH },
       );
       expect(subRes.status).toBe(200);
 
@@ -293,7 +304,7 @@ describe("Chi-3 — HTTP routes", () => {
 
       const unsubRes = await fetch(
         `${base}${ANOMALY_API_PREFIX}/${PER_AGENT_ACTIVITY_DETECTOR_ID}/subscribe?classifier=${ROLLING_BASELINE_CLASSIFIER_ID}`,
-        { method: "DELETE" },
+        { method: "DELETE", headers: MUTATION_AUTH },
       );
       expect(unsubRes.status).toBe(200);
 
@@ -306,18 +317,67 @@ describe("Chi-3 — HTTP routes", () => {
     }
   });
 
+  // ── Default-deny: the subscribe MUTATIONS require the operator bearer ────
+  // even on loopback (the co-resident-agent invariant-7 hole). The rig has
+  // loopbackAutoAuth ON, so a no-bearer GET read still works, but the POST and
+  // DELETE subscribe mutations now 401 without the operator bearer.
+  it("POST .../subscribe on loopback with NO bearer is REJECTED (401) — default-deny mutation", async () => {
+    const rig = makeRig();
+    const { base, close } = await makeServer(rig);
+    try {
+      const res = await fetch(
+        `${base}${ANOMALY_API_PREFIX}/${PER_AGENT_ACTIVITY_DETECTOR_ID}/subscribe?classifier=${ROLLING_BASELINE_CLASSIFIER_ID}`,
+        { method: "POST" },
+      );
+      // Was 200 under the flat gate (loopback auto-auth released the mutation);
+      // now 401 because requireToken suppresses the loopback shortcut.
+      expect(res.status).toBe(401);
+      // And no detector was registered as a side effect.
+      const audit = await rig.auditLog.query({ layer: "l2", limit: 100 });
+      const ops = audit.entries.map((e) => e.operation);
+      expect(ops).not.toContain(ANOMALY_AUDIT_OPS.DETECTOR_REGISTERED);
+    } finally {
+      await close();
+    }
+  });
+
+  it("DELETE .../subscribe on loopback with NO bearer is REJECTED (401) — default-deny mutation", async () => {
+    const rig = makeRig();
+    const { base, close } = await makeServer(rig);
+    try {
+      const res = await fetch(
+        `${base}${ANOMALY_API_PREFIX}/${PER_AGENT_ACTIVITY_DETECTOR_ID}/subscribe?classifier=${ROLLING_BASELINE_CLASSIFIER_ID}`,
+        { method: "DELETE" },
+      );
+      expect(res.status).toBe(401);
+    } finally {
+      await close();
+    }
+  });
+
+  it("GET .../subscribed on loopback with NO bearer still works (read unaffected by default-deny)", async () => {
+    const rig = makeRig();
+    const { base, close } = await makeServer(rig);
+    try {
+      const res = await fetch(`${base}${ANOMALY_API_PREFIX}/subscribed`);
+      expect(res.status).toBe(200);
+    } finally {
+      await close();
+    }
+  });
+
   it("unsubscribes one classifier tuple without disabling siblings on the same detector", async () => {
     const rig = makeRig();
     const { base, close } = await makeServer(rig);
     try {
       const rolling = await fetch(
         `${base}${ANOMALY_API_PREFIX}/${PER_AGENT_ACTIVITY_DETECTOR_ID}/subscribe?classifier=${ROLLING_BASELINE_CLASSIFIER_ID}`,
-        { method: "POST" },
+        { method: "POST", headers: MUTATION_AUTH },
       );
       expect(rolling.status).toBe(200);
       const cusum = await fetch(
         `${base}${ANOMALY_API_PREFIX}/${PER_AGENT_ACTIVITY_DETECTOR_ID}/subscribe?classifier=${CUSUM_CLASSIFIER_ID}`,
-        { method: "POST" },
+        { method: "POST", headers: MUTATION_AUTH },
       );
       expect(cusum.status).toBe(200);
       expect(
@@ -326,7 +386,7 @@ describe("Chi-3 — HTTP routes", () => {
 
       const unsubCusum = await fetch(
         `${base}${ANOMALY_API_PREFIX}/${PER_AGENT_ACTIVITY_DETECTOR_ID}/subscribe?classifier=${CUSUM_CLASSIFIER_ID}`,
-        { method: "DELETE" },
+        { method: "DELETE", headers: MUTATION_AUTH },
       );
       expect(unsubCusum.status).toBe(200);
       expect(
@@ -346,7 +406,7 @@ describe("Chi-3 — HTTP routes", () => {
     try {
       const res = await fetch(
         `${base}${ANOMALY_API_PREFIX}/${PER_AGENT_ACTIVITY_DETECTOR_ID}/subscribe`,
-        { method: "POST" },
+        { method: "POST", headers: MUTATION_AUTH },
       );
       expect(res.status).toBe(400);
     } finally {
@@ -360,7 +420,7 @@ describe("Chi-3 — HTTP routes", () => {
     try {
       const res = await fetch(
         `${base}${ANOMALY_API_PREFIX}/no-such-detector/subscribe?classifier=no-classifier`,
-        { method: "POST" },
+        { method: "POST", headers: MUTATION_AUTH },
       );
       expect(res.status).toBe(404);
     } finally {
@@ -541,6 +601,17 @@ describe("Chi-3 — HTTP routes", () => {
 });
 
 describe("Chi-3 — CLI subcommands", () => {
+  // Pin the passphrase so deriveFortressMasterKey never falls through to the
+  // OS keyring: against a fresh temp fortress that resolver would GENERATE
+  // and store a new login-keychain entry on every run.
+  let restorePassphrase: () => void;
+  beforeEach(() => {
+    restorePassphrase = useTestPassphrase();
+  });
+  afterEach(() => {
+    restorePassphrase();
+  });
+
   it("anomaly detectors list emits the catalog entries", async () => {
     const out = new CollectStream();
     const err = new CollectStream();
@@ -636,7 +707,7 @@ describe("Chi-3 — multi-fortress isolation + Castle-walking", () => {
       await fetch(`${base}${ANOMALY_API_PREFIX}/detectors`);
       await fetch(
         `${base}${ANOMALY_API_PREFIX}/${PER_AGENT_ACTIVITY_DETECTOR_ID}/subscribe?classifier=${ROLLING_BASELINE_CLASSIFIER_ID}`,
-        { method: "POST" },
+        { method: "POST", headers: MUTATION_AUTH },
       );
       const audit = await rig.auditLog.query({ layer: "l2", limit: 100 });
       const ops = new Set(audit.entries.map((e) => e.operation));

@@ -1160,3 +1160,17 @@ button:focus-visible {
     scroll-behavior: auto !important;
   }
 }
+
+/* Editor's note banner (claims-era note on pre-enforcement posts) */
+.editors-note {
+  max-width: 68ch;
+  margin: 0 auto 2.5rem;
+  padding: 1rem 1.25rem;
+  border-left: 3px solid var(--accent, #4fdbc8);
+  border-radius: 0 var(--radius-md, 8px) var(--radius-md, 8px) 0;
+  background: rgba(79, 219, 200, 0.06);
+  font-size: 0.95rem;
+  line-height: 1.6;
+  color: var(--text-secondary, #a8b3c7);
+}
+.editors-note a { color: var(--accent, #4fdbc8); }

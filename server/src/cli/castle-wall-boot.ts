@@ -58,11 +58,12 @@
  *
  * Secrets NEVER go into the plist: /Library/LaunchDaemons plists are
  * root-owned but world-readable (0644). The renderer rejects any attempt to
- * embed SANCTUARY_PASSPHRASE / SANCTUARY_RECOVERY_KEY.
+ * embed direct Sanctuary secrets or proxy variables that may carry credentials.
  */
 
 import { spawnSync } from "node:child_process";
-import { mkdir, rm, stat } from "node:fs/promises";
+import { lstat, mkdir, rm, stat } from "node:fs/promises";
+import { createConnection } from "node:net";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { execPath } from "node:process";
 import { Writable } from "node:stream";
@@ -80,18 +81,29 @@ import {
   readBootToken,
   safeModeAuditStoragePath,
 } from "../castle-wall/boot/boot-token.js";
+import { resolveCastleWallSocketPath } from "../castle-wall/runtime/socket-path.js";
 
 export const CASTLE_WALL_BOOT_LABEL = "ai.sanctuaryprotocol.castle-wall.daemon";
 export const CASTLE_WALL_BOOT_PLIST_PATH = `/Library/LaunchDaemons/${CASTLE_WALL_BOOT_LABEL}.plist`;
+export const LAUNCHCTL_TIMEOUT_MS = 15_000;
+export const LAUNCHCTL_KILL_SIGNAL = "SIGKILL";
 const CASTLE_GLOBAL_PINNED_PUBKEY_PATH =
   "/Library/Application Support/Sanctuary/castle-pinned-pubkey.bin";
 const SAFE_NAME_RE = /^[a-zA-Z0-9._-]+$/;
 /**
  * Env names that must never be rendered into a LaunchDaemon plist. The plist
- * is world-readable; embedding either of these would leak the master secret
- * to every local user (hard constraint #6 adjacent).
+ * is world-readable; these may carry master or proxy credentials.
  */
-const FORBIDDEN_PLIST_ENV = ["SANCTUARY_PASSPHRASE", "SANCTUARY_RECOVERY_KEY"];
+export const FORBIDDEN_PLIST_ENV = [
+  "SANCTUARY_PASSPHRASE",
+  "SANCTUARY_RECOVERY_KEY",
+  "HTTPS_PROXY",
+  "HTTP_PROXY",
+  "https_proxy",
+  "http_proxy",
+];
+
+const CREDENTIALED_URL_VALUE_RE = /:\/\/[^/@\s]*:[^/@\s]*@/;
 
 export interface ExecFileResult {
   code: number;
@@ -118,6 +130,11 @@ export interface CastleWallBootContext {
    * they don't actually wait). Defaults to a real timer.
    */
   sleepFn?: (ms: number) => Promise<void>;
+  /**
+   * Bounded live-listener probe for uninstall cleanup. Tests inject this so the
+   * stale-socket guard does not depend on local Unix socket permissions.
+   */
+  socketHasLiveListenerFn?: (socketPath: string) => Promise<boolean>;
 }
 
 function write(stream: Writable, text: string): void {
@@ -125,11 +142,16 @@ function write(stream: Writable, text: string): void {
 }
 
 function defaultExecFile(cmd: string, args: string[]): ExecFileResult {
-  const result = spawnSync(cmd, args, { encoding: "utf8" });
+  const result = spawnSync(cmd, args, {
+    encoding: "utf8",
+    timeout: LAUNCHCTL_TIMEOUT_MS,
+    killSignal: LAUNCHCTL_KILL_SIGNAL,
+  });
+  const errorText = result.error ? `${result.error.name}: ${result.error.message}` : "";
   return {
     code: result.status ?? 1,
     stdout: result.stdout ?? "",
-    stderr: result.stderr ?? "",
+    stderr: [result.stderr ?? "", errorText].filter(Boolean).join("\n"),
   };
 }
 
@@ -245,6 +267,14 @@ function assertNoControlChars(value: string, what: string): void {
   }
 }
 
+function assertNoCredentialedPlistValue(name: string, value: string): void {
+  if (CREDENTIALED_URL_VALUE_RE.test(value)) {
+    throw new Error(
+      `Refusing to embed ${name} value containing URL credentials in a world-readable LaunchDaemon plist.`,
+    );
+  }
+}
+
 export interface BootPlistOptions {
   /**
    * Full argv the daemon runs as, e.g.
@@ -332,6 +362,7 @@ export function renderBootLaunchDaemonPlist(opts: BootPlistOptions): string {
   }
   for (const arg of opts.programArguments) {
     assertNoControlChars(arg, "program argument");
+    assertNoCredentialedPlistValue("program argument", arg);
   }
   if (!opts.programArguments.includes("--safe-mode")) {
     // Fail-closed: the boot service must come up in safe mode (boot token only,
@@ -397,6 +428,9 @@ export function renderBootLaunchDaemonPlist(opts: BootPlistOptions): string {
       );
     }
   }
+  for (const [name, value] of envEntries) {
+    assertNoCredentialedPlistValue(name, value);
+  }
 
   const argsXml = opts.programArguments
     .map((a) => `\t\t<string>${xmlEscape(a)}</string>`)
@@ -439,22 +473,69 @@ ${envXml}
 `;
 }
 
+function plistDictValue(
+  plist: Record<string, ParsedPlistValue>,
+  key: string,
+): Record<string, ParsedPlistValue> | null {
+  const value = plist[key];
+  return value && !Array.isArray(value) && typeof value === "object"
+    ? (value as Record<string, ParsedPlistValue>)
+    : null;
+}
+
+function plistStringArrayValue(
+  plist: Record<string, ParsedPlistValue>,
+  key: string,
+): string[] | null {
+  const value = plist[key];
+  return Array.isArray(value) && value.every((entry) => typeof entry === "string")
+    ? (value as string[])
+    : null;
+}
+
+function supportedCastleWallCliPath(path: string): boolean {
+  const name = path.split("/").pop();
+  return name === "sanctuary" || name === "sanctuary-framework" || name === "cli.js" || name === "cli.cjs";
+}
+
+function programArgumentsRunCastleWallDaemon(programArguments: string[]): boolean {
+  const daemonArgs = ["castle-wall", "daemon", "--safe-mode", "--launchd"];
+  if (programArguments.length === 5) {
+    const [program, ...args] = programArguments;
+    return Boolean(program && isAbsolute(program) && supportedCastleWallCliPath(program)) &&
+      args.every((arg, index) => arg === daemonArgs[index]);
+  }
+  if (programArguments.length === 6) {
+    const [interpreter, script, ...args] = programArguments;
+    return Boolean(
+      interpreter &&
+        script &&
+        isAbsolute(interpreter) &&
+        isAbsolute(script) &&
+        supportedCastleWallCliPath(script),
+    ) && args.every((arg, index) => arg === daemonArgs[index]);
+  }
+  return false;
+}
+
 /**
  * Validate that a persistent, well-formed Castle Wall BOOT service is installed
  * — not merely that a file exists at the path (#450 item 5 / codex 2026-06-14).
- * Reads the world-readable plist and confirms it is THE boot-survival unit: the
- * expected Label, `RunAtLoad=true`, and a `--safe-mode` ProgramArguments entry.
- * When `expectedFortressPath` is supplied, also confirms the service targets
- * that same fortress through its `SANCTUARY_STORAGE_PATH` environment value.
- * Returns false on absent / unreadable / malformed / wrong-label / non-safe-mode
- * / wrong-fortress (fail-closed: an unverifiable boot service is treated as not
- * installed for this guard).
+ * Reads the world-readable plist and confirms it is THE boot-survival unit:
+ * expected Label, `RunAtLoad=true`, `KeepAlive=true`, a launchd safe-mode
+ * `castle-wall daemon` argv, and the signer/fortress environment required for
+ * the daemon to start after reboot. When `expectedFortressPath` is supplied,
+ * also confirms the service targets that same fortress through its
+ * `SANCTUARY_STORAGE_PATH` environment value. Returns false on absent /
+ * unreadable / malformed / wrong-label / non-safe-mode / wrong-fortress
+ * (fail-closed: an unverifiable boot service is treated as not installed for
+ * this guard).
  *
  * RESIDUAL (honest): from the operator context this cannot detect a root
  * `launchctl disable system/<label>` override — that state lives in launchd's
- * root-owned database, unreadable without root. `install-boot` verifies a live
- * pid at install time; this guard ensures the persistent unit is present and
- * well-formed, so a reboot brings it up unless an explicit root disable intervened.
+ * root-owned database, unreadable without root. `bootServiceReady` separately
+ * requires a stable live pid for paths that want to no-op instead of
+ * re-bootstrap.
  */
 export async function bootServiceInstalled(
   plistPath: string = CASTLE_WALL_BOOT_PLIST_PATH,
@@ -473,26 +554,123 @@ export async function bootServiceInstalled(
   if (!plist) return false;
   if (plist.Label !== CASTLE_WALL_BOOT_LABEL) return false;
   if (plist.RunAtLoad !== true) return false;
-  const programArguments = plist.ProgramArguments;
-  if (
-    !Array.isArray(programArguments) ||
-    !programArguments.some((arg) => arg === "--safe-mode")
-  ) {
-    return false;
-  }
+  if (plist.KeepAlive !== true) return false;
+  const programArguments = plistStringArrayValue(plist, "ProgramArguments");
+  if (!programArguments || !programArgumentsRunCastleWallDaemon(programArguments)) return false;
+  const environment = plistDictValue(plist, "EnvironmentVariables");
+  if (!environment) return false;
+  const installedFortressPathRaw = environment.SANCTUARY_STORAGE_PATH;
+  if (typeof installedFortressPathRaw !== "string") return false;
+  if (!isAbsolute(installedFortressPathRaw)) return false;
+  const signerClientPath = environment.SANCTUARY_CASTLE_SIGNER_CLIENT;
+  if (typeof signerClientPath !== "string" || !isAbsolute(signerClientPath)) return false;
   if (expectedFortressPath !== undefined) {
-    const environment = plist.EnvironmentVariables;
-    if (!environment || Array.isArray(environment) || typeof environment !== "object") {
-      return false;
-    }
-    const installedFortressPathRaw = environment.SANCTUARY_STORAGE_PATH;
-    if (typeof installedFortressPathRaw !== "string") return false;
-    if (!isAbsolute(installedFortressPathRaw)) return false;
     const installedFortressPath = resolve(installedFortressPathRaw);
     const expectedFortressPathResolved = resolve(expectedFortressPath);
     if (installedFortressPath !== expectedFortressPathResolved) return false;
   }
   return true;
+}
+
+export async function bootServicePlistPresent(
+  plistPath: string = CASTLE_WALL_BOOT_PLIST_PATH,
+): Promise<boolean> {
+  try {
+    await lstat(plistPath);
+    return true;
+  } catch (error) {
+    const code = error instanceof Error && "code" in error
+      ? (error as NodeJS.ErrnoException).code
+      : undefined;
+    return code === "ENOENT" ? false : true;
+  }
+}
+
+function printBootService(
+  execFileFn: (cmd: string, args: string[]) => ExecFileResult,
+): ExecFileResult {
+  return execFileFn("launchctl", ["print", `system/${CASTLE_WALL_BOOT_LABEL}`]);
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+export function bootServiceEnabled(
+  execFileFn: (cmd: string, args: string[]) => ExecFileResult = defaultExecFile,
+): boolean {
+  const result = execFileFn("launchctl", ["print-disabled", "system"]);
+  if (result.code !== 0) {
+    return false;
+  }
+  const re = new RegExp(`["']?${escapeRegExp(CASTLE_WALL_BOOT_LABEL)}["']?\\s*=>\\s*([^\\n,;]+)`);
+  const match = re.exec(result.stdout);
+  if (!match) {
+    return true;
+  }
+  const value = match[1]!.trim().replace(/^["']|["']$/g, "").toLowerCase();
+  if (value === "false" || value === "enabled") {
+    return true;
+  }
+  if (value === "true" || value === "disabled") {
+    return false;
+  }
+  return false;
+}
+
+export interface BootServiceLoadState {
+  loaded: boolean;
+  fortressPath: string | null;
+}
+
+function fortressPathFromLaunchdPrint(stdout: string): string | null {
+  const match =
+    /"?SANCTUARY_STORAGE_PATH"?\s*=>\s*"?([^\n"]+)"?/.exec(stdout) ??
+    /"?SANCTUARY_STORAGE_PATH"?\s*=\s*"?([^\n"]+)"?/.exec(stdout);
+  const raw = match?.[1]?.trim().replace(/[;,]+$/, "") ?? null;
+  return raw && isAbsolute(raw) ? resolve(raw) : null;
+}
+
+export function bootServiceLoadState(
+  execFileFn: (cmd: string, args: string[]) => ExecFileResult = defaultExecFile,
+): BootServiceLoadState {
+  const printed = printBootService(execFileFn);
+  if (printed.code !== 0) {
+    return { loaded: !launchctlResultWasNotLoaded(printed), fortressPath: null };
+  }
+  return {
+    loaded: true,
+    fortressPath: fortressPathFromLaunchdPrint(printed.stdout),
+  };
+}
+
+export function bootServiceLoaded(
+  execFileFn: (cmd: string, args: string[]) => ExecFileResult = defaultExecFile,
+): boolean {
+  return bootServiceLoadState(execFileFn).loaded;
+}
+
+export async function bootServiceReady(
+  plistPath: string = CASTLE_WALL_BOOT_PLIST_PATH,
+  expectedFortressPath?: string,
+  execFileFn: (cmd: string, args: string[]) => ExecFileResult = defaultExecFile,
+  sleepFn: (ms: number) => Promise<void> = (ms) =>
+    new Promise<void>((resolveSleep) => setTimeout(resolveSleep, ms)),
+): Promise<boolean> {
+  if (!(await bootServiceInstalled(plistPath, expectedFortressPath))) {
+    return false;
+  }
+  if ((await awaitStableServicePid(execFileFn, sleepFn)) === null) {
+    return false;
+  }
+  if (!bootServiceEnabled(execFileFn)) {
+    return false;
+  }
+  if (expectedFortressPath === undefined) {
+    return true;
+  }
+  const loaded = bootServiceLoadState(execFileFn);
+  return loaded.loaded && loaded.fortressPath === resolve(expectedFortressPath);
 }
 
 interface ParsedBootArgs {
@@ -530,6 +708,131 @@ async function fileExists(path: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+function fortressPathFromBootPlistContents(contents: string | null): string | null {
+  if (contents === null) return null;
+  const plist = parseBootPlist(contents);
+  if (!plist) return null;
+  const environment = plist.EnvironmentVariables;
+  if (!environment || Array.isArray(environment) || typeof environment !== "object") {
+    return null;
+  }
+  const raw = environment.SANCTUARY_STORAGE_PATH;
+  return typeof raw === "string" && isAbsolute(raw) ? resolve(raw) : null;
+}
+
+function resolveUninstallFortressPath(
+  parsed: ParsedBootArgs,
+  env: NodeJS.ProcessEnv,
+  execFileFn: (cmd: string, args: string[]) => ExecFileResult,
+  existingPlist: string | null,
+): string | null {
+  if (parsed.fortress && isAbsolute(parsed.fortress)) {
+    return resolve(parsed.fortress);
+  }
+  const fromPlist = fortressPathFromBootPlistContents(existingPlist);
+  if (fromPlist) {
+    return fromPlist;
+  }
+  if (env.SANCTUARY_STORAGE_PATH && isAbsolute(env.SANCTUARY_STORAGE_PATH)) {
+    return resolve(env.SANCTUARY_STORAGE_PATH);
+  }
+  const user = parsed.user ?? env.SUDO_USER;
+  if (user && SAFE_NAME_RE.test(user)) {
+    const home = deriveOperatorHome(user, execFileFn);
+    if (home) {
+      return resolve(home, ".sanctuary");
+    }
+  }
+  return null;
+}
+
+async function removeStaleCastleSocket(
+  socketPath: string,
+  err: Writable,
+  socketHasLiveListener: (socketPath: string) => Promise<boolean> = castleSocketHasLiveListener,
+): Promise<{ ok: boolean; removed: boolean }> {
+  try {
+    const st = await lstat(socketPath);
+    if (!st.isSocket() && !st.isSymbolicLink()) {
+      write(err, `Warning: not removing ${socketPath}; it exists but is not a Unix socket.\n`);
+      return { ok: true, removed: false };
+    }
+    let live = false;
+    try {
+      live = await socketHasLiveListener(socketPath);
+    } catch (error) {
+      write(
+        err,
+        `Warning: not removing ${socketPath}; could not prove it is stale: ${
+          error instanceof Error ? error.message : String(error)
+        }\n`,
+      );
+      return { ok: true, removed: false };
+    }
+    if (live) {
+      write(
+        err,
+        `Warning: not removing ${socketPath}; a Castle Wall daemon is accepting connections there.\n`,
+      );
+      return { ok: true, removed: false };
+    }
+    await rm(socketPath);
+    return { ok: true, removed: true };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return { ok: true, removed: false };
+    }
+    write(err, `Error removing stale Castle Wall socket ${socketPath}: ${(error as Error).message}\n`);
+    return { ok: false, removed: false };
+  }
+}
+
+function castleSocketHasLiveListener(socketPath: string): Promise<boolean> {
+  return new Promise((resolveProbe) => {
+    let settled = false;
+    const socket = createConnection({ path: socketPath });
+    const finish = (alive: boolean): void => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolveProbe(alive);
+    };
+    socket.once("connect", () => finish(true));
+    socket.once("error", () => finish(false));
+    socket.setTimeout(1000, () => finish(false));
+  });
+}
+
+function launchctlResultWasNotLoaded(result: ExecFileResult): boolean {
+  if (result.code === 0) return false;
+  const text = `${result.stdout}\n${result.stderr}`.toLowerCase();
+  return (
+    text.includes("no such process") ||
+    text.includes("could not find service") ||
+    text.includes("not found") ||
+    text.includes("does not exist")
+  );
+}
+
+function bootOutFailedCastleWallUnit(
+  execFileFn: (cmd: string, args: string[]) => ExecFileResult,
+  err: Writable,
+  plistPath: string,
+): boolean {
+  const bootout = execFileFn("launchctl", ["bootout", `system/${CASTLE_WALL_BOOT_LABEL}`]);
+  if (bootout.code === 0 || launchctlResultWasNotLoaded(bootout)) {
+    return true;
+  }
+  write(
+    err,
+    `launchctl bootout after failed bootstrap did not complete (exit ${bootout.code}): ${
+      bootout.stderr.trim() || bootout.stdout.trim()
+    }\n` +
+      `The failed unit may still be loaded; ${plistPath} is left installed for manual recovery.\n`,
+  );
+  return false;
 }
 
 /**
@@ -691,7 +994,7 @@ export async function runProvisionBootToken(
 function serviceRunningPid(
   execFileFn: (cmd: string, args: string[]) => ExecFileResult,
 ): number | null {
-  const printed = execFileFn("launchctl", ["print", `system/${CASTLE_WALL_BOOT_LABEL}`]);
+  const printed = printBootService(execFileFn);
   if (printed.code !== 0) return null;
   // launchctl print emits a `pid = N` line only while the job has a live process.
   const match = /\bpid\s*=\s*(\d+)/.exec(printed.stdout);
@@ -780,6 +1083,7 @@ export async function runInstallBoot(
     write(err, `Fortress path must be absolute (got: ${fortressPath}).\n`);
     return 1;
   }
+  fortressPath = resolve(fortressPath);
 
   // ── Preflight: refuse to install a unit that cannot actually enforce at
   // boot. Installing a non-starting boot service would LOOK like F1 is
@@ -876,12 +1180,44 @@ export async function runInstallBoot(
     encoding: "utf8",
     verifyPathIdentity: true,
   }).catch(() => null);
-  // Idempotent shortcut: only when the plist already matches AND the service is
-  // STABLY running. Use the same stability check as the install path — a
-  // one-shot read here would re-introduce the false-PASS on a preexisting
-  // crash-looping unit whose plist happens to match. If it is not stable, fall
-  // through to re-bootstrap + re-verify rather than certify the brick.
-  if (existing === plist && (await awaitStableServicePid(execFileFn, sleepFn)) !== null) {
+  const hadPlist = await bootServicePlistPresent(plistPath);
+  const installedFortressPath = fortressPathFromBootPlistContents(existing);
+  const launchdState = bootServiceLoadState(execFileFn);
+  if (hadPlist) {
+    if (!installedFortressPath) {
+      write(
+        err,
+        `Refusing to replace ${plistPath}: the singleton boot service plist exists but does not expose a verifiable SANCTUARY_STORAGE_PATH.\n` +
+          "Inspect or uninstall it explicitly before installing a new Castle Wall boot service.\n",
+      );
+      return 1;
+    }
+    if (installedFortressPath !== fortressPath) {
+      write(
+        err,
+        `Refusing to replace ${plistPath}: the installed singleton boot service targets ${installedFortressPath}, not requested fortress ${fortressPath}.\n` +
+          "Use uninstall-boot with the matching --fortress first, then re-run install-boot for the new fortress.\n",
+      );
+      return 1;
+    }
+  }
+  if (launchdState.loaded && launchdState.fortressPath !== fortressPath) {
+    write(
+      err,
+      `Refusing to replace loaded system/${CASTLE_WALL_BOOT_LABEL}: the loaded singleton boot service ${
+        launchdState.fortressPath
+          ? `targets ${launchdState.fortressPath}`
+          : "does not expose a verifiable SANCTUARY_STORAGE_PATH"
+      }, not requested fortress ${fortressPath}.\n` +
+        "Boot out or uninstall the existing singleton service explicitly before installing this fortress.\n",
+    );
+    return 1;
+  }
+  // Idempotent shortcut: only when the plist already matches AND launchd proves
+  // the stable loaded job targets this fortress. A matching disk plist plus a
+  // stable singleton PID is not enough: the loaded job might predate the plist
+  // or target a different fortress.
+  if (existing === plist && (await bootServiceReady(plistPath, fortressPath, execFileFn, sleepFn))) {
     write(out, `Castle Wall boot service already installed and running (${plistPath}).\n`);
     return 0;
   }
@@ -896,9 +1232,27 @@ export async function runInstallBoot(
     return 1;
   }
 
-  // Replace-or-load: boot out any previous instance (ignore "not loaded"),
-  // then bootstrap the new unit.
-  execFileFn("launchctl", ["bootout", `system/${CASTLE_WALL_BOOT_LABEL}`]);
+  const enable = execFileFn("launchctl", ["enable", `system/${CASTLE_WALL_BOOT_LABEL}`]);
+  if (enable.code !== 0 || !bootServiceEnabled(execFileFn)) {
+    write(
+      err,
+      `launchctl enable failed (exit ${enable.code}): ${enable.stderr.trim() || enable.stdout.trim()}\n` +
+        `Leaving ${plistPath} installed but not certifying boot survival; fix launchd disabled state and re-run install-boot.\n`,
+    );
+    return 1;
+  }
+
+  // Replace-or-load: with any disabled override repaired first, boot out any
+  // previous instance (ignore "not loaded"), then bootstrap the new unit.
+  const bootout = execFileFn("launchctl", ["bootout", `system/${CASTLE_WALL_BOOT_LABEL}`]);
+  if (bootout.code !== 0 && !launchctlResultWasNotLoaded(bootout)) {
+    write(
+      err,
+      `launchctl bootout failed (exit ${bootout.code}): ${bootout.stderr.trim() || bootout.stdout.trim()}\n` +
+        `Leaving ${plistPath} installed but not re-bootstrapping; fix launchd state and re-run install-boot.\n`,
+    );
+    return 1;
+  }
   const bootstrap = execFileFn("launchctl", ["bootstrap", "system", plistPath]);
   if (bootstrap.code !== 0) {
     write(
@@ -908,25 +1262,32 @@ export async function runInstallBoot(
     );
     return 1;
   }
-  execFileFn("launchctl", ["enable", `system/${CASTLE_WALL_BOOT_LABEL}`]);
-
   // Codex (a): bootstrap success only means "accepted." Certify nothing until
-  // we observe a STABLY live PID — a single read can catch a doomed process in
-  // the moment before it exits (e.g. `env: node: not found` → 127) while launchd
-  // throttle-restarts it on a new pid. A one-shot check certifies that crash
-  // loop as "running" and leaves the brick alive (the 2026-06-14 drill false-PASS).
-  const pid = await awaitStableServicePid(execFileFn, sleepFn);
-  if (pid === null) {
+  // we observe a STABLY live PID, exact fortress binding, and no disabled
+  // override. A one-shot pid read can catch a doomed process in the moment
+  // before it exits; a disabled override can leave a currently-live daemon that
+  // will not return at reboot.
+  if (!(await bootServiceReady(plistPath, fortressPath, execFileFn, sleepFn))) {
     // Stop the throttled crash loop we just bootstrapped so it does not churn
     // forever; the plist stays on disk for inspection and re-run.
-    execFileFn("launchctl", ["bootout", `system/${CASTLE_WALL_BOOT_LABEL}`]);
+    const bootedOut = bootOutFailedCastleWallUnit(execFileFn, err, plistPath);
     write(
       err,
       `Bootstrap was accepted but system/${CASTLE_WALL_BOOT_LABEL} did not stay running.\n` +
         `The daemon failed to start or is crash-looping (likely node is not resolvable on the daemon PATH, the signer helper is unreachable, or the boot token is unreadable). Inspect:\n` +
         `  sudo launchctl print system/${CASTLE_WALL_BOOT_LABEL}\n` +
         `  tail -n 50 ${join(logDir, "castle-wall-daemon.err.log")}\n` +
-        `Booted the failed unit out. Not certifying the boot service; the brick condition is NOT yet closed.\n`,
+        `${bootedOut ? "Booted the failed unit out." : "Could not prove the failed unit was booted out."} Not certifying the boot service; the brick condition is NOT yet closed.\n`,
+    );
+    return 1;
+  }
+  const pid = serviceRunningPid(execFileFn);
+  if (pid === null) {
+    const bootedOut = bootOutFailedCastleWallUnit(execFileFn, err, plistPath);
+    write(
+      err,
+      `Bootstrap was accepted but system/${CASTLE_WALL_BOOT_LABEL} vanished before certification completed.\n` +
+        `${bootedOut ? "Booted the failed unit out." : "Could not prove the failed unit was booted out."} Not certifying the boot service; the brick condition is NOT yet closed.\n`,
     );
     return 1;
   }
@@ -950,10 +1311,12 @@ export async function runUninstallBoot(
 ): Promise<number> {
   const out = ctx.out ?? process.stdout;
   const err = ctx.err ?? process.stderr;
+  const env = ctx.env ?? process.env;
   const platform = ctx.platform ?? process.platform;
   const getuid = ctx.getuid ?? process.getuid?.bind(process);
   const execFileFn = ctx.execFileFn ?? defaultExecFile;
   const plistPath = ctx.plistPath ?? CASTLE_WALL_BOOT_PLIST_PATH;
+  const socketHasLiveListenerFn = ctx.socketHasLiveListenerFn ?? castleSocketHasLiveListener;
   const parsed = parseBootArgs(argv);
 
   if (platform !== "darwin") {
@@ -979,8 +1342,57 @@ export async function runUninstallBoot(
     return 1;
   }
 
+  const existing = await readFileCustody(plistPath, {
+    encoding: "utf8",
+    verifyPathIdentity: true,
+  }).catch(() => null);
+  const hadPlist = await bootServicePlistPresent(plistPath);
+  if (parsed.fortress && !isAbsolute(parsed.fortress)) {
+    write(err, `Fortress path must be absolute (got: ${parsed.fortress}).\n`);
+    return 1;
+  }
+  const requestedFortressPath = parsed.fortress ? resolve(parsed.fortress) : null;
+  const installedFortressPath = fortressPathFromBootPlistContents(existing);
+  const launchdState = bootServiceLoadState(execFileFn);
+  if ((hadPlist || launchdState.loaded) && requestedFortressPath) {
+    if (!installedFortressPath) {
+      write(
+        err,
+        `Refusing to uninstall ${plistPath}: --fortress ${requestedFortressPath} was requested, but the singleton boot service does not have a verifiable matching plist with SANCTUARY_STORAGE_PATH.\n`,
+      );
+      return 1;
+    }
+    if (installedFortressPath !== requestedFortressPath) {
+      write(
+        err,
+        `Refusing to uninstall ${plistPath}: --fortress ${requestedFortressPath} was requested, but the installed boot service targets ${installedFortressPath}.\n`,
+      );
+      return 1;
+    }
+    if (launchdState.loaded && launchdState.fortressPath !== requestedFortressPath) {
+      write(
+        err,
+        `Refusing to uninstall ${plistPath}: --fortress ${requestedFortressPath} was requested, but the loaded singleton boot service ${
+          launchdState.fortressPath
+            ? `targets ${launchdState.fortressPath}`
+            : "does not expose a verifiable SANCTUARY_STORAGE_PATH"
+        }.\n`,
+      );
+      return 1;
+    }
+  }
+  const fortressPath =
+    requestedFortressPath ?? resolveUninstallFortressPath(parsed, env, execFileFn, existing);
   const bootout = execFileFn("launchctl", ["bootout", `system/${CASTLE_WALL_BOOT_LABEL}`]);
-  const hadPlist = await fileExists(plistPath);
+  if ((hadPlist || launchdState.loaded) && bootout.code !== 0 && !launchctlResultWasNotLoaded(bootout)) {
+    write(
+      err,
+      `launchctl bootout failed (exit ${bootout.code}): ${
+        bootout.stderr.trim() || bootout.stdout.trim()
+      }\nLeaving ${plistPath} and any Castle Wall socket untouched; the boot service may still be loaded.\n`,
+    );
+    return 1;
+  }
   if (hadPlist) {
     try {
       await rm(plistPath);
@@ -989,13 +1401,36 @@ export async function runUninstallBoot(
       return 1;
     }
   }
+  let removedSocket = false;
+  if (fortressPath) {
+    const socketPath = resolveCastleWallSocketPath({
+      platform: "darwin",
+      fortressPath,
+    }).path;
+    const socketCleanup = await removeStaleCastleSocket(
+      socketPath,
+      err,
+      socketHasLiveListenerFn,
+    );
+    if (!socketCleanup.ok) {
+      return 1;
+    }
+    removedSocket = socketCleanup.removed;
+  }
 
   if (!hadPlist && bootout.code !== 0) {
-    write(out, "Castle Wall boot service was not installed; nothing to remove.\n");
+    if (removedSocket) {
+      write(out, `Castle Wall boot service was not installed; removed stale Castle Wall socket for fortress ${fortressPath}.\n`);
+    } else {
+      write(out, "Castle Wall boot service was not installed; nothing to remove.\n");
+    }
     return 0;
   }
 
-  write(out, "Castle Wall boot service removed (plist deleted, launchd job booted out).\n");
+  write(out, "Castle Wall boot service removed (plist deleted; launchd job booted out or was not loaded).\n");
+  if (removedSocket) {
+    write(out, `Removed stale Castle Wall socket for fortress ${fortressPath}.\n`);
+  }
   write(
     out,
     "WARNING: this does NOT disarm the content filter. If the wall is armed, the next reboot comes up deny-by-default with NO daemon (the brick condition F1 exists to prevent). Disarm with 'sanctuary castle-wall disable' before rebooting, or reinstall with install-boot.\n",

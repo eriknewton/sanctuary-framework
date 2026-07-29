@@ -23,6 +23,7 @@ import {
   type DashboardServerOptions,
 } from "./server.js";
 import type { ApprovalHandlers } from "./api.js";
+import type { FleetRoster } from "../principal-policy/fleet-roster.js";
 
 export { getProtectionSnapshot } from "./aggregator.js";
 export { renderDashboardHTML, HERO_COPY } from "./html.js";
@@ -104,6 +105,17 @@ export interface StartDashboardOptions {
   resolveBrokerPinnedProducerKey?: () => string | null;
   /** Broker liveness producer key exists or is expected but could not be read. */
   brokerProducerKeyExpectedButUnavailable?: boolean;
+  /** Canonical confined-agent protection subject (`fortress/uid-N`). */
+  resolveProtectionClaimSubject?: () => string | null | Promise<string | null>;
+  /**
+   * Read-only fleet-roster provider (wrap "Protect" dashboard). Forwarded to the
+   * dashboard server, where it feeds both `GET /api/fleet/roster` and the
+   * posture-route `GET /api/posture/fleet` that the posture-home fleet panel
+   * fetches. MAY be async (the wrap process reads the roster from the at-rest
+   * fortress records). When omitted the fleet panel stays absent (honest "no
+   * fleet"). See `DashboardServerOptions.fleetRoster`.
+   */
+  fleetRoster?: () => FleetRoster | Promise<FleetRoster>;
 }
 
 /**
@@ -148,6 +160,9 @@ export async function startDashboard(
     ...(options.brokerProducerKeyExpectedButUnavailable
       ? { brokerProducerKeyExpectedButUnavailable: true }
       : {}),
+    ...(options.resolveProtectionClaimSubject
+      ? { resolveProtectionClaimSubject: options.resolveProtectionClaimSubject }
+      : {}),
     activity,
     pendingApprovals: pending,
   };
@@ -159,6 +174,7 @@ export async function startDashboard(
     ...(options.host ? { host: options.host } : {}),
     ...(options.authToken ? { authToken: options.authToken } : {}),
     ...(options.approvals ? { approvals: options.approvals } : {}),
+    ...(options.fleetRoster ? { fleetRoster: options.fleetRoster } : {}),
   };
 
   const handle = await startDashboardServer(serverOpts);

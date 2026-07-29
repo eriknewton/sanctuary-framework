@@ -98,6 +98,12 @@ export interface LocalAgentRecord {
   version: "1.1";
   /** Stable agent identifier, scoped to this fortress. */
   agent_id: string;
+  /**
+   * Optional OS protection subject for subject-bound Castle Wall evidence
+   * (for example `<fortress>/uid-501` on macOS). This is an alias used only for
+   * audit correlation; `agent_id` remains the stable operator-facing id.
+   */
+  protection_subject?: string;
   /** Operator identity that owns the agent. */
   identity_id: string;
   /** Harness the agent runs under. */

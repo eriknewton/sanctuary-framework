@@ -1,5 +1,5 @@
-import { afterEach, describe, expect, it } from "vitest";
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { chmod, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
@@ -12,6 +12,7 @@ import {
   type PersistedAuditEnvelopeV2,
 } from "../../src/operational/audit-log.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
+import { createTempHome } from "../helpers/temp-fortress.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import { hashToString } from "../../src/core/hashing.js";
 import { bytesToString, stringToBytes, toBase64url } from "../../src/core/encoding.js";
@@ -48,7 +49,7 @@ describe("castle-wall CLI verbs", () => {
 
   afterEach(async () => {
     for (const dir of tempDirs.splice(0)) {
-      await rm(dir, { recursive: true, force: true });
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     }
   });
 
@@ -169,6 +170,61 @@ describe("castle-wall CLI verbs", () => {
     const pub = await readFile(join(fortressPath, "castle-pinned-pubkey.bin"));
     expect(pub.length).toBe(32);
     expect(out.text().trim()).toBe(fingerprint(pub));
+  });
+
+  // skipIf(non-darwin): `castle-wall daemon` is macOS-only (runDaemon returns
+  // early on non-darwin hosts), so this regression guard is scoped to darwin.
+  // Gating it keeps the Linux CI passing count - and therefore .test-baseline -
+  // unchanged, while still exercising the fix on the platform where the daemon
+  // actually runs.
+  it.skipIf(process.platform !== "darwin")("daemon honors the --fortress flag over a stale SANCTUARY_STORAGE_PATH", async () => {
+    // Regression: `runDaemon` resolved its target with `resolveStoragePath(env)`
+    // (SANCTUARY_STORAGE_PATH only), so a trailing `castle-wall daemon
+    // --fortress <path>` was silently DROPPED - the top-level extractor stops at
+    // the subcommand boundary and never sees it - and the daemon armed against
+    // the DEFAULT/home fortress instead of the operator-named one. It must honor
+    // the flag, like every sibling custody verb (provision-pin, re-pin, audit-*).
+    //
+    // Proven at the pin-read seam (no live daemon boot): the flag-named fortress
+    // holds a deliberately malformed 16-byte pinned pubkey and the stale env path
+    // holds NO pinned key. The fixed daemon reads the FLAG path and exits with the
+    // size error; the old (buggy) daemon read the stale path and would exit with
+    // "No pinned key found". The two outcomes are mutually exclusive, so the size
+    // error uniquely proves the flag path won.
+    const { fortressPath } = await makeFortress();
+    // Malformed pin in the FLAG fortress: triggers the 32-byte guard, which
+    // exits BEFORE any passphrase resolution / master establishment / host-app
+    // launch - i.e. before the daemon actually boots anything.
+    await writeFile(
+      join(fortressPath, "castle-pinned-pubkey.bin"),
+      Buffer.alloc(16, 7),
+      { mode: 0o600 },
+    );
+
+    // A DIFFERENT directory pointed at by SANCTUARY_STORAGE_PATH with NO pinned
+    // key. If the daemon (wrongly) honored the env path it would fail with the
+    // distinct "No pinned key found" message instead.
+    const staleStoragePath = await mkdtemp(join(tmpdir(), "sanctuary-cw-daemon-stale-"));
+    tempDirs.push(staleStoragePath);
+
+    const out = new CaptureStream();
+    const err = new CaptureStream();
+    const code = await runDaemon(["--fortress", fortressPath], {
+      out,
+      err,
+      platform: "darwin",
+      env: {
+        SANCTUARY_STORAGE_PATH: staleStoragePath,
+        // Local-sign mode reads the per-fortress pin directly, keeping the seam
+        // deterministic (no root-owned global pin lookup).
+        SANCTUARY_CASTLE_LOCAL_SIGN: "1",
+      },
+    });
+
+    expect(code).toBe(1);
+    // The flag-named fortress was read (its 16-byte pin), NOT the stale env path.
+    expect(err.text()).toContain("Pinned public key must be 32 bytes (found 16)");
+    expect(err.text()).not.toContain("No pinned key found");
   });
 
   it("status with pinned key", async () => {
@@ -707,6 +763,203 @@ describe("castle-wall CLI verbs", () => {
     expect(code).toBe(0);
     expect(out.text()).toContain("Pinned key fingerprint:");
   });
+
+  describe("provision-pin global-pin fail-open guard (2026-07-07)", () => {
+    // Regression coverage for the root-euid fail-open: the OLD guard inferred
+    // "the signer helper owns this file" from an EACCES/EPERM write failure,
+    // which never fires for a root-euid caller (e.g. the auto-provision-
+    // agent-account flow, which runs the whole wrap under `sudo` because OS
+    // account creation needs root). The fix reads-and-compares BEFORE ever
+    // writing, so the refusal holds at ANY euid. These tests drive
+    // `runProvisionPin` with `ctx.globalPinnedPublicKeyPath` pointed at a temp
+    // file instead of the real root-owned `/Library/Application Support/
+    // Sanctuary/castle-pinned-pubkey.bin`, so no root/sudo is needed.
+
+    async function makeGlobalPinDir() {
+      const dir = await mkdtemp(join(tmpdir(), "sanctuary-cw-globalpin-"));
+      tempDirs.push(dir);
+      return join(dir, "castle-pinned-pubkey.bin");
+    }
+
+    it("REGRESSION: a differing global pin is never overwritten, even on a fresh per-fortress key (fresh-key call site)", async () => {
+      const { fortressPath, recoveryKey } = await makeFortress();
+      const globalPinPath = await makeGlobalPinDir();
+      const keyA = Buffer.from(new Uint8Array(32).fill(0xaa));
+      await writeFile(globalPinPath, keyA, { mode: 0o644 });
+
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const out = new CaptureStream();
+        const err = new CaptureStream();
+        const code = await runProvisionPin([], {
+          out,
+          err,
+          env: {
+            SANCTUARY_STORAGE_PATH: fortressPath,
+            SANCTUARY_RECOVERY_KEY: recoveryKey,
+          },
+          globalPinnedPublicKeyPath: globalPinPath,
+        });
+
+        expect(code).toBe(0);
+        // The core per-fortress result must still succeed: provision-pin's
+        // job (mint + persist the fortress-local pin) is not blocked by the
+        // best-effort global-mirror refusal.
+        const localPub = await readFile(join(fortressPath, "castle-pinned-pubkey.bin"));
+        expect(localPub.length).toBe(32);
+        const localStat = await stat(join(fortressPath, "castle-pinned-pubkey.bin"));
+        expect(localStat.mode & 0o777).toBe(0o600);
+
+        // THE FIX: the global pin must be byte-for-byte untouched.
+        const globalAfter = await readFile(globalPinPath);
+        expect(Buffer.compare(globalAfter, keyA)).toBe(0);
+
+        // Guidance must have been emitted so the operator knows to re-pin.
+        const warnedText = warnSpy.mock.calls.map((c) => String(c[0])).join("\n");
+        expect(warnedText).toContain("already exists and is owned by the root signer helper");
+        expect(warnedText).toContain("sanctuary castle-wall re-pin");
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
+    it("writes the global pin when none exists yet (ENOENT)", async () => {
+      const { fortressPath, recoveryKey } = await makeFortress();
+      const globalPinPath = await makeGlobalPinDir(); // file does not exist yet
+
+      const out = new CaptureStream();
+      const err = new CaptureStream();
+      const code = await runProvisionPin([], {
+        out,
+        err,
+        env: {
+          SANCTUARY_STORAGE_PATH: fortressPath,
+          SANCTUARY_RECOVERY_KEY: recoveryKey,
+        },
+        globalPinnedPublicKeyPath: globalPinPath,
+      });
+
+      expect(code).toBe(0);
+      const localPub = await readFile(join(fortressPath, "castle-pinned-pubkey.bin"));
+      const globalPub = await readFile(globalPinPath);
+      expect(Buffer.compare(globalPub, localPub)).toBe(0);
+      const globalStat = await stat(globalPinPath);
+      expect(globalStat.mode & 0o777).toBe(0o644);
+    });
+
+    it("is a no-op when the existing global pin already equals the key being written (existing-local-key call site)", async () => {
+      const { fortressPath } = await makeFortress();
+      const globalPinPath = await makeGlobalPinDir();
+      const key = Buffer.from(new Uint8Array(32).fill(0x42));
+      // Pre-seed the LOCAL per-fortress pin (so runProvisionPin takes the
+      // "already provisioned" branch, which reads the existing local key and
+      // calls writeGlobalPinnedPublicKey with it) and the GLOBAL pin with the
+      // SAME bytes.
+      await writeFile(join(fortressPath, "castle-pinned-pubkey.bin"), key, { mode: 0o600 });
+      await writeFile(globalPinPath, key, { mode: 0o644 });
+      const globalStatBefore = await stat(globalPinPath);
+
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const out = new CaptureStream();
+        const err = new CaptureStream();
+        const code = await runProvisionPin([], {
+          out,
+          err,
+          env: { SANCTUARY_STORAGE_PATH: fortressPath },
+          globalPinnedPublicKeyPath: globalPinPath,
+        });
+
+        expect(code).toBe(0);
+        expect(err.text()).toBe("");
+        const globalAfter = await readFile(globalPinPath);
+        expect(Buffer.compare(globalAfter, key)).toBe(0);
+        const globalStatAfter = await stat(globalPinPath);
+        // Idempotent: no write means mtime is untouched too.
+        expect(globalStatAfter.mtimeMs).toBe(globalStatBefore.mtimeMs);
+        // No re-pin guidance for the quiet already-equal case.
+        const warnedText = warnSpy.mock.calls.map((c) => String(c[0])).join("\n");
+        expect(warnedText).not.toContain("re-pin");
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
+    it("fails CLOSED (does not write) when the existing global pin is present but unreadable", async () => {
+      const { fortressPath, recoveryKey } = await makeFortress();
+      const globalPinPath = await makeGlobalPinDir();
+      const keyA = Buffer.from(new Uint8Array(32).fill(0x99));
+      await writeFile(globalPinPath, keyA, { mode: 0o644 });
+      // Simulate "present but unreadable for a reason other than ENOENT"
+      // (e.g. EACCES reading a root-owned file as an operator-UID caller) by
+      // stripping all permission bits from the file itself. As the
+      // non-privileged user running this test suite, this reproduces a real
+      // EACCES on readFile without needing root.
+      await chmod(globalPinPath, 0o000);
+
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const out = new CaptureStream();
+        const err = new CaptureStream();
+        const code = await runProvisionPin([], {
+          out,
+          err,
+          env: {
+            SANCTUARY_STORAGE_PATH: fortressPath,
+            SANCTUARY_RECOVERY_KEY: recoveryKey,
+          },
+          globalPinnedPublicKeyPath: globalPinPath,
+        });
+
+        expect(code).toBe(0);
+        // Restore permissions before reading back, so the assertion itself
+        // (and the afterEach temp-dir cleanup) is not fighting the 0o000 mode.
+        await chmod(globalPinPath, 0o644);
+        const globalAfter = await readFile(globalPinPath);
+        expect(Buffer.compare(globalAfter, keyA)).toBe(0);
+        const warnedText = warnSpy.mock.calls.map((c) => String(c[0])).join("\n");
+        expect(warnedText).toContain("already exists and is owned by the root signer helper");
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
+    it("REGRESSION (existing-local-key call site): a differing global pin is left intact while the local per-fortress key is confirmed present at 0600", async () => {
+      const { fortressPath } = await makeFortress();
+      const globalPinPath = await makeGlobalPinDir();
+      const keyA = Buffer.from(new Uint8Array(32).fill(0xaa)); // global (helper-owned)
+      const keyB = Buffer.from(new Uint8Array(32).fill(0xbb)); // local per-fortress
+      await writeFile(globalPinPath, keyA, { mode: 0o644 });
+      await writeFile(join(fortressPath, "castle-pinned-pubkey.bin"), keyB, { mode: 0o600 });
+
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const out = new CaptureStream();
+        const err = new CaptureStream();
+        const code = await runProvisionPin([], {
+          out,
+          err,
+          env: { SANCTUARY_STORAGE_PATH: fortressPath },
+          globalPinnedPublicKeyPath: globalPinPath,
+        });
+
+        expect(code).toBe(0);
+        // The local pin the wrap IPC handshake depends on is present and
+        // correct, regardless of the global-pin refusal.
+        const localAfter = await readFile(join(fortressPath, "castle-pinned-pubkey.bin"));
+        expect(Buffer.compare(localAfter, keyB)).toBe(0);
+        const localStat = await stat(join(fortressPath, "castle-pinned-pubkey.bin"));
+        expect(localStat.mode & 0o777).toBe(0o600);
+        // Only the GLOBAL pin is protected; it must be untouched.
+        const globalAfter = await readFile(globalPinPath);
+        expect(Buffer.compare(globalAfter, keyA)).toBe(0);
+        const warnedText = warnSpy.mock.calls.map((c) => String(c[0])).join("\n");
+        expect(warnedText).toContain("already exists and is owned by the root signer helper");
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+  });
 });
 
 describe("castle-wall setup-shared-dir", () => {
@@ -814,7 +1067,7 @@ describe("castle-wall audit-chain operator override", () => {
 
   afterEach(async () => {
     for (const dir of tempDirs.splice(0)) {
-      await rm(dir, { recursive: true, force: true });
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     }
   });
 
@@ -1104,7 +1357,7 @@ describe("castle-wall operability fixes (drill 2026-06-13: F1/F2a/F2b/F3)", () =
 
   afterEach(async () => {
     for (const dir of tempDirs.splice(0)) {
-      await rm(dir, { recursive: true, force: true });
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     }
   });
 
@@ -1241,20 +1494,31 @@ describe("castle-wall operability fixes (drill 2026-06-13: F1/F2a/F2b/F3)", () =
     // We don't let it proceed to real state (no shim resolvable, no invoke), so
     // it returns 1 at the shim-resolution wall — but the announcement (which
     // runs FIRST) must already carry the default-fortress note.
-    const err = new CaptureStream();
-    const code = await runRePin([], {
-      out: new CaptureStream(),
-      err,
-      env: {},
-      platform: "darwin",
-      signerClientCandidates: [],
-      fileExistsFn: async () => false,
-    });
-    expect(code).toBe(1); // hit the shim-unknown wall, no state touched
-    expect(err.text()).toContain("Re-pinning trust anchor for fortress:");
-    expect(err.text()).toContain(
-      "(default fortress; set SANCTUARY_STORAGE_PATH to target another)",
-    );
+    //
+    // HOME is redirected (not SANCTUARY_STORAGE_PATH, which would defeat the
+    // branch under test) so "the default fortress" is a temp path, never the
+    // operator's own.
+    const tempHome = await createTempHome("sanctuary-cw-default-fortress");
+    try {
+      const err = new CaptureStream();
+      const code = await runRePin([], {
+        out: new CaptureStream(),
+        err,
+        env: {},
+        platform: "darwin",
+        signerClientCandidates: [],
+        fileExistsFn: async () => false,
+      });
+      expect(code).toBe(1); // hit the shim-unknown wall, no state touched
+      expect(err.text()).toContain(
+        `Re-pinning trust anchor for fortress: ${tempHome.defaultFortressPath}`,
+      );
+      expect(err.text()).toContain(
+        "(default fortress; set SANCTUARY_STORAGE_PATH to target another)",
+      );
+    } finally {
+      await tempHome.cleanup();
+    }
   });
 
   // ── F2b: don't mask a successful migration behind a post-migration error ──

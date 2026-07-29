@@ -52,11 +52,22 @@ export interface RuleMatch {
 
 /**
  * Scope describes which wrapped agents the rule applies to. An empty agent_ids
- * AND empty template_ids both mean "all wrapped agents."
+ * AND empty template_ids AND empty uids all mean "all wrapped agents."
+ *
+ * `uids` (S5-0, 2026-07-14 two-confined-uid extension): scopes a rule to one
+ * or more macOS real uids directly, composing as an OR with `agent_ids` /
+ * `template_ids` (same as the destination-axis OR-composition on `RuleMatch`).
+ * This is the axis a gate-scoped endpoint rule uses so it matches the
+ * `sanctuary-gate` confined uid WITHOUT matching the wrapped agent's uid --
+ * the Swift `AllowlistEvaluator.scopeMatches` compares against the flow's
+ * `sourceRuid`. Any caller that composes/unions rule scopes (e.g.
+ * `dns-derivation.ts`) must fold this axis in too, or a uid-scoped rule's
+ * derived companion rule silently widens back to "all agents."
  */
 export interface RuleScope {
   agent_ids?: string[];
   template_ids?: string[];
+  uids?: number[];
 }
 
 /**
@@ -101,6 +112,22 @@ function isValidPortNumber(value: unknown): value is number {
 }
 
 /**
+ * True when `value` is a positive integer uid within the `UInt32` wire range.
+ * 0/root is never a valid scope member, and the sysext decodes `scope.uids`
+ * as `[UInt32]` (castle-wall-macos `ManifestRuleScope`), so a value above
+ * `UInt32.max` (LOW-1, 2026-07-14) passes canonical signing but fails Swift
+ * decode -- an unappliable signed manifest. Cap it here at publish.
+ */
+function isPositiveUid(value: unknown): value is number {
+  return (
+    typeof value === "number" &&
+    Number.isInteger(value) &&
+    value >= 1 &&
+    value <= 0xffffffff
+  );
+}
+
+/**
  * Validate a `T | T[]` axis: present means a single valid scalar or a
  * NON-EMPTY array of valid scalars. `null`, wrong-typed scalars, empty
  * arrays, and wrong-typed array members all reject. This is load-bearing
@@ -142,7 +169,7 @@ const KNOWN_RULE_KEYS = new Set([
   "derived",
 ]);
 const KNOWN_MATCH_KEYS = new Set(["host", "host_pattern", "ip", "cidr", "port", "protocol"]);
-const KNOWN_SCOPE_KEYS = new Set(["agent_ids", "template_ids"]);
+const KNOWN_SCOPE_KEYS = new Set(["agent_ids", "template_ids", "uids"]);
 const KNOWN_TIME_WINDOW_KEYS = new Set(["start", "end"]);
 
 /**
@@ -267,6 +294,11 @@ export function validateRule(rule: AllowlistRule): string[] {
       if (ids === undefined) continue;
       if (!Array.isArray(ids) || ids.some((id) => !isNonEmptyString(id))) {
         issues.push(`rule.scope.${key} must be an array of non-empty strings when present`);
+      }
+    }
+    if (rule.scope.uids !== undefined) {
+      if (!Array.isArray(rule.scope.uids) || rule.scope.uids.some((uid) => !isPositiveUid(uid))) {
+        issues.push("rule.scope.uids must be an array of positive integers when present");
       }
     }
   }

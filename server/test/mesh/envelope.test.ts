@@ -1,5 +1,5 @@
 /**
- * Sanctuary Federation Protocol v0.1 — Envelope Tests
+ * Sanctuary Federation Protocol v0.1 - Envelope Tests
  *
  * Exercises packSignedEvent + verifySignedEvent end-to-end. Hard-gate reservations
  * (reserved extension keys, reserved event-type namespaces, forward-compat) are
@@ -118,7 +118,7 @@ function signNodeCertWithCapabilities(
   };
 }
 
-describe("mesh/envelope — basic pack + verify round-trip", () => {
+describe("mesh/envelope - basic pack + verify round-trip", () => {
   let f: TestFortress;
   beforeAll(() => {
     f = buildFortress();
@@ -128,6 +128,8 @@ describe("mesh/envelope — basic pack + verify round-trip", () => {
     const payload: PolicyUpdatePayload = {
       agent_id: "agent-x",
       policy_version: 1,
+      valid_from: "2026-06-01T00:00:00.000Z",
+      valid_until: "2099-01-01T00:00:00.000Z",
       policy_blob: "base64url-of-compiled-policy",
     };
     const evt = packSignedEvent<PolicyUpdatePayload>({
@@ -153,6 +155,8 @@ describe("mesh/envelope — basic pack + verify round-trip", () => {
     const payload: PolicyUpdatePayload = {
       agent_id: "agent-x",
       policy_version: 1,
+      valid_from: "2026-06-01T00:00:00.000Z",
+      valid_until: "2099-01-01T00:00:00.000Z",
       policy_blob: "base64url-of-compiled-policy",
     };
     const events = [1, 2, 3].map((seq) =>
@@ -176,6 +180,8 @@ describe("mesh/envelope — basic pack + verify round-trip", () => {
     const payload: PolicyUpdatePayload = {
       agent_id: "agent-x",
       policy_version: 4,
+      valid_from: "2026-06-01T00:00:00.000Z",
+      valid_until: "2099-01-01T00:00:00.000Z",
       policy_blob: "base64url-of-compiled-policy",
     };
     const body = {
@@ -247,7 +253,7 @@ describe("mesh/envelope — basic pack + verify round-trip", () => {
   });
 });
 
-describe("mesh/envelope — hard-gate reservations (§10.1, §10.3)", () => {
+describe("mesh/envelope - hard-gate reservations (§10.1, §10.3)", () => {
   let f: TestFortress;
   beforeAll(() => {
     f = buildFortress();
@@ -347,7 +353,7 @@ describe("mesh/envelope — hard-gate reservations (§10.1, §10.3)", () => {
       },
     };
     const bytes = canonicalizeToBytes(body);
-    // Re-canonicalize and compare bytes — determinism check.
+    // Re-canonicalize and compare bytes - determinism check.
     const bytes2 = canonicalizeToBytes(body);
     expect(Buffer.from(bytes).equals(Buffer.from(bytes2))).toBe(true);
     const sig = ed25519.sign(bytes, f.nodeKeypair.privateKey);
@@ -411,7 +417,7 @@ describe("mesh/envelope — hard-gate reservations (§10.1, §10.3)", () => {
 
   it("receiver rejects envelope whose fortress_id does not match pinned fortress (§10.5)", () => {
     const other = buildFortress("root");
-    // Pack under other's keys but claim our fortress_id — this should fail
+    // Pack under other's keys but claim our fortress_id - this should fail
     // at lookupNodeCert (our roster doesn't know other.nodeCert). And if we
     // claim other.fortress_id, the isolation-guard should fire.
     const evt = packSignedEvent({

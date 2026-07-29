@@ -5,8 +5,15 @@ import {
   queryPrivacyPill,
   renderPostureHomeHTML,
 } from "../../src/principal-policy/posture-home-html.js";
+// S3: the page's renderers now call the shared freshness formatter for their
+// "checked Ns ago" stamps. These harnesses eval SLICES of the page script, so
+// each slice must be given the same page-level helper the real page has in
+// scope. Supplying the real shared source (not a stub) keeps the harness
+// honest: the tests exercise the exact formatter the browser runs.
+import { REL_TIME_FN_SOURCE } from "../../src/principal-policy/posture-html-shared.js";
 import type { FeatureHealthStatus } from "../../src/principal-policy/feature-health.js";
 import type { CustodyState } from "../../src/principal-policy/posture.js";
+import type { FleetRoster } from "../../src/principal-policy/fleet-roster.js";
 
 type StoryDigestFixture = {
   total_operations: number;
@@ -28,6 +35,34 @@ type StoryHarness = {
     addEventListener: (event: string, listener: () => void) => void;
   };
   store: Record<string, string>;
+};
+
+type FleetHarness = {
+  renderFleet: (roster: FleetRoster | null) => void;
+  fleetEl: { innerHTML: string };
+  section: { style: { display: string } };
+  summaryEl: { textContent: string };
+};
+
+type BannerHarness = {
+  renderBanner: (
+    home: {
+      origin_machine: string;
+      federation?: {
+        available: boolean;
+        enabled: boolean;
+        fleet_node_count: number;
+      };
+      protection_requested_count: number;
+      enforcement_confirmed_count: number;
+      castle_wall: { arm_state: string };
+      digest: { chain_verified: boolean };
+    },
+    approvalState: { rows: unknown[] },
+    anomalies: unknown[],
+  ) => void;
+  originEl: { textContent: string };
+  bannerEl: { innerHTML: string };
 };
 
 function storyHarness(initialStore: Record<string, string> = {}): StoryHarness {
@@ -68,6 +103,8 @@ function storyHarness(initialStore: Record<string, string> = {}): StoryHarness {
   const source =
     html.slice(escStart, escEnd) +
     "\n" +
+    REL_TIME_FN_SOURCE +
+    "\n" +
     html.slice(storyStart, storyEnd) +
     "\nreturn { renderStory: renderStory, wireStoryToggle: wireStoryToggle };";
   const helpers = new Function("document", "sessionStorage", source)(
@@ -75,6 +112,153 @@ function storyHarness(initialStore: Record<string, string> = {}): StoryHarness {
     sessionStorage,
   ) as Pick<StoryHarness, "renderStory" | "wireStoryToggle">;
   return { ...helpers, storyEl, toggle, store };
+}
+
+function fleetNode(
+  nodeId: string,
+  policy: FleetRoster["nodes"][number]["policy"],
+): FleetRoster["nodes"][number] {
+  return {
+    node_id: nodeId,
+    label: null,
+    trust_state: "admitted",
+    trust_evaluable: true,
+    reach: "recent",
+    node_mode: "local",
+    provider_in_trust_boundary: false,
+    last_sync_received_at: "2026-06-24T11:59:00.000Z",
+    policy,
+    first_seen: "2026-06-24T11:00:00.000Z",
+    last_seen: "2026-06-24T11:59:00.000Z",
+  };
+}
+
+function policyFixture(
+  version: number | null,
+  driftState: FleetRoster["nodes"][number]["policy"]["drift_state"],
+  hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+): FleetRoster["nodes"][number]["policy"] {
+  return {
+    version,
+    hash: version === null ? null : hash,
+    hash_algorithm: version === null ? null : "sha256-base64url",
+    applied_at: version === null ? null : "2026-06-24T11:59:00.000Z",
+    source_event_id: version === null ? null : `operator:fortress:test:${version}`,
+    drift_state: driftState,
+  };
+}
+
+function fleetRosterFixture(overrides: Partial<FleetRoster> = {}): FleetRoster {
+  const operatorPolicy = {
+    version: 7,
+    hash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    hash_algorithm: "sha256-base64url",
+    applied_at: "2026-06-24T11:58:00.000Z",
+    source_event_id: "operator:fortress:test:7",
+  };
+  const nodes = overrides.nodes ?? [
+    fleetNode("fresh", policyFixture(7, "in_sync")),
+    fleetNode("old", policyFixture(6, "drifted", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")),
+    fleetNode("unknown", policyFixture(null, "unknown")),
+  ];
+  return {
+    available: true,
+    enabled: true,
+    fortress_id: "fortress:test",
+    node_id: "home-mac",
+    eviction_serial: 0,
+    nodes,
+    summary: { total: nodes.length, admitted: nodes.length, revoked: 0, untrusted: 0 },
+    sync_health: {
+      reachable: nodes.length,
+      stale: 0,
+      never: 0,
+      oldest_last_sync: "2026-06-24T11:59:00.000Z",
+      freshness_window_ms: 300_000,
+    },
+    policy_distribution: {
+      available: true,
+      operator_policy: operatorPolicy,
+      summary: { in_sync: 1, drifted: 1, unknown: 1 },
+    },
+    ...overrides,
+  };
+}
+
+function fleetHarness(): FleetHarness {
+  const html = renderPostureHomeHTML();
+  const escStart = html.indexOf("function esc(s)");
+  const escEnd = html.indexOf('  // "Never fake green": ARMED');
+  const fleetStart = html.indexOf('  // "Never fake green" for the fleet roster.');
+  const fleetEnd = html.indexOf("function renderWall(w)");
+  expect(escStart).toBeGreaterThan(-1);
+  expect(escEnd).toBeGreaterThan(escStart);
+  expect(fleetStart).toBeGreaterThan(-1);
+  expect(fleetEnd).toBeGreaterThan(fleetStart);
+
+  const section = { style: { display: "none" } };
+  const fleetEl = { innerHTML: "" };
+  const summaryEl = { textContent: "" };
+  const document = {
+    getElementById(id: string) {
+      if (id === "fleet-section") return section;
+      if (id === "fleet") return fleetEl;
+      if (id === "fleet-summary") return summaryEl;
+      return null;
+    },
+  };
+  const source =
+    html.slice(escStart, escEnd) +
+    "\n" +
+    REL_TIME_FN_SOURCE +
+    "\n" +
+    html.slice(fleetStart, fleetEnd) +
+    "\nreturn { renderFleet: renderFleet };";
+  const helpers = new Function("document", source)(document) as Pick<
+    FleetHarness,
+    "renderFleet"
+  >;
+  return { ...helpers, fleetEl, section, summaryEl };
+}
+
+function bannerHarness(): BannerHarness {
+  const html = renderPostureHomeHTML();
+  const escStart = html.indexOf("function esc(s)");
+  const escEnd = html.indexOf('  // "Never fake green": ARMED');
+  const wallStart = html.indexOf("function wallPill(state)");
+  const wallEnd = html.indexOf("  // \"Never fake green\" for the agent grid");
+  const bannerStart = html.indexOf("function renderBanner(home");
+  const bannerEnd = html.indexOf("function renderAgents(home)");
+  expect(escStart).toBeGreaterThan(-1);
+  expect(escEnd).toBeGreaterThan(escStart);
+  expect(wallStart).toBeGreaterThan(-1);
+  expect(wallEnd).toBeGreaterThan(wallStart);
+  expect(bannerStart).toBeGreaterThan(-1);
+  expect(bannerEnd).toBeGreaterThan(bannerStart);
+
+  const originEl = { textContent: "" };
+  const bannerEl = { innerHTML: "" };
+  const document = {
+    getElementById(id: string) {
+      if (id === "origin") return originEl;
+      if (id === "banner") return bannerEl;
+      return null;
+    },
+  };
+  const source =
+    html.slice(escStart, escEnd) +
+    "\n" +
+    html.slice(wallStart, wallEnd) +
+    "\n" +
+    REL_TIME_FN_SOURCE +
+    "\n" +
+    html.slice(bannerStart, bannerEnd) +
+    "\nreturn { renderBanner: renderBanner };";
+  const helpers = new Function("document", source)(document) as Pick<
+    BannerHarness,
+    "renderBanner"
+  >;
+  return { ...helpers, originEl, bannerEl };
 }
 
 /**
@@ -140,6 +324,27 @@ describe("posture home — feature-health panel honesty", () => {
     expect(fnSource).not.toMatch(/unknown[^\n]*pill green/);
     expect(fnSource).toContain('unconfirmed") return \'<span class="pill amber">');
   });
+
+  it("explains subject-binding non-green bases with distinct non-daemon copy", () => {
+    const html = renderPostureHomeHTML();
+
+    expect(html).toContain('case "subject_unbound_evidence":');
+    expect(html).toContain(
+      "Castle Wall has recent enforcement evidence, but it is not attributed to this confined agent.",
+    );
+    expect(html).toContain('case "legacy_macos_audit_token":');
+    expect(html).toContain(
+      "Evidence predates the subject-binding format; re-arm Castle Wall to produce subject-bound evidence.",
+    );
+    expect(html).toContain('case "pre_canonical_linux_agent_name":');
+    expect(html).toContain(
+      "Linux evidence predates canonical subject binding; upgrade the daemon path before claiming this agent is protected.",
+    );
+    expect(html).toContain('case "subject_unresolvable":');
+    expect(html).toContain(
+      "This agent's confinement identity could not be read, so no enforcement evidence can be bound to it.",
+    );
+  });
 });
 
 describe("posture home - Today's story plain summary toggle", () => {
@@ -162,8 +367,15 @@ describe("posture home - Today's story plain summary toggle", () => {
     expect(h.storyEl.innerHTML).toContain(
       '<div class="story-line"><strong>212</strong> operations in the last 24h.</div>',
     );
+    // S3 (2026-07-18): the story counts gained DENOMINATORS. "4 blocked" is
+    // ambiguous on its own; "4 of 212 observed" is the auditable claim. The
+    // baseline moved deliberately, and the totals are computed from digest
+    // fields already on the payload (blocks + allows, denied + granted).
     expect(h.storyEl.innerHTML).toContain(
-      "<strong>4</strong> outbound connections blocked at the kernel; 208 allowed.",
+      "<strong>4</strong> of 212 observed outbound connections blocked at the kernel; 208 allowed.",
+    );
+    expect(h.storyEl.innerHTML).toContain(
+      "<strong>1</strong> of 4 decided approvals denied by you, 3 granted.",
     );
     expect(h.storyEl.innerHTML).not.toContain("story-summary");
   });
@@ -765,6 +977,54 @@ describe("posture home - Recognition panel (P5) impartiality", () => {
 });
 
 describe("posture home - Fleet panel (Slice 1) honesty", () => {
+  it("renders the banner as federated when the home payload reports a live fleet", () => {
+    const { renderBanner, originEl } = bannerHarness();
+    renderBanner(
+      {
+        origin_machine: "home-mac",
+        federation: {
+          available: true,
+          enabled: true,
+          fleet_node_count: 3,
+        },
+        protection_requested_count: 0,
+        enforcement_confirmed_count: 0,
+        castle_wall: { arm_state: "armed" },
+        digest: { chain_verified: true },
+      },
+      { rows: [] },
+      [],
+    );
+
+    expect(originEl.textContent).toBe("Machine: home-mac · federation: 3 machines");
+    expect(originEl.textContent).not.toContain("federation off");
+    expect(originEl.textContent).not.toContain("single-machine view");
+  });
+
+  it("keeps the single-machine banner only when no federation fleet is available", () => {
+    const { renderBanner, originEl } = bannerHarness();
+    renderBanner(
+      {
+        origin_machine: "solo-mac",
+        federation: {
+          available: false,
+          enabled: false,
+          fleet_node_count: 0,
+        },
+        protection_requested_count: 0,
+        enforcement_confirmed_count: 0,
+        castle_wall: { arm_state: "unknown" },
+        digest: { chain_verified: true },
+      },
+      { rows: [] },
+      [],
+    );
+
+    expect(originEl.textContent).toBe(
+      "Machine: solo-mac · single-machine view (federation off)",
+    );
+  });
+
   it("ships the fleet section hidden by default (absent until federation says otherwise)", () => {
     const html = renderPostureHomeHTML();
     // The section exists in the shell but is display:none until the gated fetch
@@ -807,5 +1067,95 @@ describe("posture home - Fleet panel (Slice 1) honesty", () => {
     // trust pill (that would launder liveness into trust). It uses a muted chip.
     expect(region).not.toContain("pill green");
     expect(region).toContain("reachable");
+  });
+
+  it("renders the live operator policy version and fleet drift rollup", () => {
+    const { renderFleet, fleetEl, section, summaryEl } = fleetHarness();
+    renderFleet(fleetRosterFixture());
+    expect(section.style.display).toBe("");
+    expect(summaryEl.textContent).toContain("operator policy v7");
+    expect(summaryEl.textContent).toContain(
+      "1 of 3 nodes in sync / 1 drifted / 1 unknown",
+    );
+    expect(fleetEl.innerHTML).toContain("operator policy v7");
+    expect(fleetEl.innerHTML).toContain(
+      "1 of 3 nodes in sync / 1 drifted / 1 unknown",
+    );
+    expect(fleetEl.innerHTML).not.toContain("not yet available");
+    expect(fleetEl.innerHTML).not.toContain("Signed policy state is unavailable");
+  });
+
+  it("renders each node's applied policy version beside its drift pill", () => {
+    const { renderFleet, fleetEl } = fleetHarness();
+    renderFleet(fleetRosterFixture());
+    expect(fleetEl.innerHTML).toContain('<span class="pill green">policy in sync</span>');
+    expect(fleetEl.innerHTML).toContain('<span class="pill red">policy drifted</span>');
+    expect(fleetEl.innerHTML).toContain('<span class="pill amber">policy unknown</span>');
+    expect(fleetEl.innerHTML).toContain("applied policy v7");
+    expect(fleetEl.innerHTML).toContain("applied policy v6");
+    expect(fleetEl.innerHTML).toContain("applied policy unknown");
+  });
+
+  it("keeps unknown policy drift amber and never green", () => {
+    const { renderFleet, fleetEl, summaryEl } = fleetHarness();
+    renderFleet(
+      fleetRosterFixture({
+        nodes: [fleetNode("partial", { ...policyFixture(7, "unknown"), hash: null })],
+        summary: { total: 1, admitted: 1, revoked: 0, untrusted: 0 },
+        policy_distribution: {
+          available: true,
+          operator_policy: {
+            version: 7,
+            hash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            hash_algorithm: "sha256-base64url",
+            applied_at: "2026-06-24T11:58:00.000Z",
+            source_event_id: "operator:fortress:test:7",
+          },
+          summary: { in_sync: 0, drifted: 0, unknown: 1 },
+        },
+      }),
+    );
+    expect(summaryEl.textContent).toContain(
+      "0 of 1 nodes in sync / 0 drifted / 1 unknown",
+    );
+    expect(fleetEl.innerHTML).toContain('<span class="pill amber">policy unknown</span>');
+    expect(fleetEl.innerHTML).not.toContain('pill green">policy unknown');
+    expect(fleetEl.innerHTML).not.toContain("policy in sync");
+  });
+
+  it("renders an honest absent state when no operator policy is known", () => {
+    const { renderFleet, fleetEl, summaryEl } = fleetHarness();
+    renderFleet(
+      fleetRosterFixture({
+        nodes: [fleetNode("node-1", policyFixture(7, "unknown"))],
+        summary: { total: 1, admitted: 1, revoked: 0, untrusted: 0 },
+        policy_distribution: {
+          available: true,
+          operator_policy: null,
+          summary: { in_sync: 0, drifted: 0, unknown: 1 },
+        },
+      }),
+    );
+    expect(summaryEl.textContent).toContain("no operator policy");
+    expect(fleetEl.innerHTML).toContain("No signed operator policy bundle is known yet.");
+    expect(fleetEl.innerHTML).toContain("applied policy v7");
+    expect(fleetEl.innerHTML).toContain('<span class="pill amber">policy unknown</span>');
+    expect(fleetEl.innerHTML).not.toContain("policy in sync");
+  });
+});
+
+describe("posture home — Fleet Switcher nav affordance (C1 Finding 4)", () => {
+  it("renders a clickable link to /fleet in the page header", () => {
+    const html = renderPostureHomeHTML();
+    // A real anchor whose href is /fleet (discoverable without typing the URL).
+    expect(html).toMatch(/<a[^>]+href="\/fleet"[^>]*>/);
+    // The affordance is labelled so an operator recognises it.
+    expect(html).toContain("Fleet Switcher");
+    // It lives in the header, not buried below the fold.
+    const headerStart = html.indexOf("<header>");
+    const headerEnd = html.indexOf("</header>");
+    expect(headerStart).toBeGreaterThan(-1);
+    expect(headerEnd).toBeGreaterThan(headerStart);
+    expect(html.slice(headerStart, headerEnd)).toContain('href="/fleet"');
   });
 });

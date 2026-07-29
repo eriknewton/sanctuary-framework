@@ -22,6 +22,7 @@
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
+import { useTestPassphrase } from "../helpers/temp-fortress.js";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer, type Server } from "node:http";
@@ -612,6 +613,12 @@ describe("WP-V1.3-1 Phi-1 EgressVolumeWatcher", () => {
 });
 
 describe("WP-V1.3-1 Phi-1 HTTP routes", () => {
+  // #800 follow-on: the sentinel subscribe (POST) / unsubscribe (DELETE)
+  // mutations require the operator bearer even under loopback auto-auth, so
+  // the rig is configured WITH a token and the mutation calls present it.
+  // GET reads stay tokenless (loopback auto-auth still applies to them).
+  const HTTP_AUTH_TOKEN = "operator-token-sentinel";
+
   async function makeServer(rig: ReturnType<typeof makeRig>): Promise<{
     base: string;
     close: () => Promise<void>;
@@ -620,7 +627,10 @@ describe("WP-V1.3-1 Phi-1 HTTP routes", () => {
       const handled = await handleSentinelRoute(
         {
           dispatcher: rig.dispatcher,
-          authConfig: { loopbackAutoAuth: true },
+          authConfig: {
+            loopbackAutoAuth: true,
+            authToken: HTTP_AUTH_TOKEN,
+          },
         },
         req,
         res,
@@ -642,6 +652,10 @@ describe("WP-V1.3-1 Phi-1 HTTP routes", () => {
           }),
         ),
     };
+  }
+
+  function bearer(): HeadersInit {
+    return { Authorization: `Bearer ${HTTP_AUTH_TOKEN}` };
   }
 
   it("GET /api/sentinels returns the catalog", async () => {
@@ -669,7 +683,7 @@ describe("WP-V1.3-1 Phi-1 HTTP routes", () => {
     try {
       const subRes = await fetch(
         `${base}${SENTINEL_API_PREFIX}/${EGRESS_VOLUME_SENTINEL_ID}/subscribe`,
-        { method: "POST" },
+        { method: "POST", headers: bearer() },
       );
       expect(subRes.status).toBe(200);
       expect(rig.registry.isSubscribed(EGRESS_VOLUME_SENTINEL_ID)).toBe(true);
@@ -685,7 +699,7 @@ describe("WP-V1.3-1 Phi-1 HTTP routes", () => {
 
       const unsubRes = await fetch(
         `${base}${SENTINEL_API_PREFIX}/${EGRESS_VOLUME_SENTINEL_ID}/subscribe`,
-        { method: "DELETE" },
+        { method: "DELETE", headers: bearer() },
       );
       expect(unsubRes.status).toBe(200);
       expect(rig.registry.isSubscribed(EGRESS_VOLUME_SENTINEL_ID)).toBe(false);
@@ -700,9 +714,47 @@ describe("WP-V1.3-1 Phi-1 HTTP routes", () => {
     try {
       const res = await fetch(
         `${base}${SENTINEL_API_PREFIX}/never-registered/subscribe`,
-        { method: "POST" },
+        { method: "POST", headers: bearer() },
       );
       expect(res.status).toBe(404);
+    } finally {
+      await close();
+    }
+  });
+
+  // #800 follow-on (operational-mutation chokepoint): the subscribe POST
+  // and unsubscribe DELETE require the operator bearer even on loopback.
+  // A co-resident agent sharing the loopback interface holds no proxy for
+  // operator identity, so a tokenless loopback mutation must 401 and must
+  // NOT change the subscribed set. GET reads stay tokenless.
+  it("rejects tokenless loopback subscribe/unsubscribe with 401 (bearer required)", async () => {
+    const rig = makeRig();
+    const { base, close } = await makeServer(rig);
+    try {
+      const subRes = await fetch(
+        `${base}${SENTINEL_API_PREFIX}/${EGRESS_VOLUME_SENTINEL_ID}/subscribe`,
+        { method: "POST" },
+      );
+      expect(subRes.status).toBe(401);
+      expect(rig.registry.isSubscribed(EGRESS_VOLUME_SENTINEL_ID)).toBe(false);
+
+      const unsubRes = await fetch(
+        `${base}${SENTINEL_API_PREFIX}/${EGRESS_VOLUME_SENTINEL_ID}/subscribe`,
+        { method: "DELETE" },
+      );
+      expect(unsubRes.status).toBe(401);
+
+      // A bad bearer is also rejected.
+      const badRes = await fetch(
+        `${base}${SENTINEL_API_PREFIX}/${EGRESS_VOLUME_SENTINEL_ID}/subscribe`,
+        { method: "POST", headers: { Authorization: "Bearer wrong-token" } },
+      );
+      expect(badRes.status).toBe(401);
+      expect(rig.registry.isSubscribed(EGRESS_VOLUME_SENTINEL_ID)).toBe(false);
+
+      // The catalog GET still works tokenless under loopback auto-auth.
+      const catalog = await fetch(`${base}${SENTINEL_API_PREFIX}`);
+      expect(catalog.status).toBe(200);
     } finally {
       await close();
     }
@@ -752,8 +804,14 @@ describe("WP-V1.3-1 Phi-1 CLI subscribe + persistence", () => {
   let outBuf: string;
   let outStream: NodeJS.WritableStream;
 
+  let restorePassphrase: () => void;
+
   beforeEach(async () => {
     storagePath = await mkdtemp(join(tmpdir(), "sanctuary-sentinel-cli-"));
+    // Pin the passphrase so deriveSentinelMasterKey never falls through to
+    // the OS keyring: against a fresh temp fortress that resolver would
+    // GENERATE and store a new login-keychain entry on every run.
+    restorePassphrase = useTestPassphrase();
     outBuf = "";
     outStream = {
       write(chunk: string | Buffer): boolean {
@@ -764,6 +822,7 @@ describe("WP-V1.3-1 Phi-1 CLI subscribe + persistence", () => {
   });
 
   afterEach(async () => {
+    restorePassphrase();
     if (storagePath) {
       await rm(storagePath, { recursive: true, force: true });
     }

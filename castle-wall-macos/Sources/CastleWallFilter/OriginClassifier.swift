@@ -51,11 +51,20 @@ public extension AgentOriginDescriptor {
                 egressHelperTeamId: nil,
                 agentRuntimePortRange: nil,
                 agentUid: wire.agentUid.map { uid_t($0) },
+                gateUid: wire.gateUid.map { uid_t($0) },
                 systemUidAllowCeiling: uid_t(wire.systemUidAllowCeiling)
             )
         case .nat:
-            // NAT mode requires at least one egress-helper identity axis.
-            guard wire.egressHelperSigningId != nil || wire.egressHelperTeamId != nil else {
+            // NAT mode requires at least one NON-EMPTY egress-helper identity
+            // axis (HIGH-4, 2026-07-14). Defense-in-depth mirror of the
+            // verifier's `validateAgentOriginFloors`: normalize an empty string
+            // to nil so `""` can never become a match target (which would make
+            // the REAL helper -- with a non-empty signing id -- fail the match
+            // and classify `.operator`, bypassing every rule via the allow-all
+            // fast-path). A descriptor with no non-empty identity is unusable.
+            let signingId = wire.egressHelperSigningId.flatMap { $0.isEmpty ? nil : $0 }
+            let teamId = wire.egressHelperTeamId.flatMap { $0.isEmpty ? nil : $0 }
+            guard signingId != nil || teamId != nil else {
                 return nil
             }
             var portRange: ClosedRange<Int>?
@@ -66,10 +75,11 @@ public extension AgentOriginDescriptor {
             }
             self.init(
                 mode: .nat,
-                egressHelperSigningId: wire.egressHelperSigningId,
-                egressHelperTeamId: wire.egressHelperTeamId,
+                egressHelperSigningId: signingId,
+                egressHelperTeamId: teamId,
                 agentRuntimePortRange: portRange,
                 agentUid: nil,
+                gateUid: nil,
                 systemUidAllowCeiling: uid_t(wire.systemUidAllowCeiling)
             )
         }
@@ -117,6 +127,13 @@ public struct AgentOriginDescriptor: Equatable {
     // UID mode inputs.
     /// The dedicated agent account's real uid (UID mode).
     public let agentUid: uid_t?
+    /// SECOND optional confined-principal uid (S5-0, 2026-07-14
+    /// two-confined-uid extension). When present, `classifyUid` routes flows
+    /// from EITHER `agentUid` OR `gateUid` to `.agent` (confined/default-deny
+    /// + allowlist) -- never `.operator`. This is the classifier-side half of
+    /// the S5-0 change; per-principal rule separation is expressed through
+    /// `ManifestRuleScope.uids` (`AllowlistEvaluator.scopeMatches`), NOT here.
+    public let gateUid: uid_t?
     /// Real uids strictly below this ceiling are treated as system daemons
     /// and earn the (conceded, explicit) operator low-UID path. Applies in
     /// UID mode.
@@ -128,6 +145,7 @@ public struct AgentOriginDescriptor: Equatable {
         egressHelperTeamId: String? = nil,
         agentRuntimePortRange: ClosedRange<Int>? = nil,
         agentUid: uid_t? = nil,
+        gateUid: uid_t? = nil,
         systemUidAllowCeiling: uid_t
     ) {
         self.mode = mode
@@ -135,6 +153,7 @@ public struct AgentOriginDescriptor: Equatable {
         self.egressHelperTeamId = egressHelperTeamId
         self.agentRuntimePortRange = agentRuntimePortRange
         self.agentUid = agentUid
+        self.gateUid = gateUid
         self.systemUidAllowCeiling = systemUidAllowCeiling
     }
 }
@@ -180,6 +199,18 @@ public enum OriginClassifier {
             return .agent
         }
 
+        // S5-0 (2026-07-14 two-confined-uid extension): the gate's dedicated
+        // account is ALSO positively a confined principal, not the operator.
+        // Before this branch existed, ANY high uid that was not the agent
+        // fell through to the "operator" return below -- exactly the
+        // unbounded-egress fail-open the S5-0 feasibility spike identified
+        // for a `sanctuary-gate` account. Both confined uids share the
+        // default-deny + allowlist path; they are told apart at the RULE
+        // level via `ManifestRuleScope.uids`, not here.
+        if let gateUid = agentOrigin.gateUid, descriptor.sourceRuid == gateUid {
+            return .agent
+        }
+
         // Conceded, EXPLICIT low-UID path: system daemons (ruid strictly
         // below the ceiling) are the only inferred operator-allow. This is
         // the documented residual risk (DNS via mDNSResponder, etc.).
@@ -187,10 +218,11 @@ public enum OriginClassifier {
             return .operator
         }
 
-        // Any other RESOLVED high uid that is not the agent account is the
-        // operator's own session. The ruid came from a successful audit-token
-        // decode (sourceUnattributed == false was checked above), so this is
-        // a positive determination, not an inference-from-absence.
+        // Any other RESOLVED high uid that is not the agent account or the
+        // gate account is the operator's own session. The ruid came from a
+        // successful audit-token decode (sourceUnattributed == false was
+        // checked above), so this is a positive determination, not an
+        // inference-from-absence.
         return .operator
     }
 

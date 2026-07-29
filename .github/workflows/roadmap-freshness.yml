@@ -1,0 +1,90 @@
+# Keeps ROADMAP.md honest against the tree.
+#
+# Two mechanisms:
+#   1. PR gate: a PR whose title starts with "feat" must either modify ROADMAP.md
+#      or carry the "roadmap-exempt" label (for features with no public surface).
+#   2. Weekly drift report: every Monday, list feat merges that landed after the
+#      last ROADMAP.md change and file/update a "Public roadmap drift" issue.
+#
+# Companion rule in ROADMAP.md ("Last updated" paragraph). Mirrors the coverage
+# discipline used elsewhere in this repo (test-baseline guard, module-map same-PR
+# rule): documentation that can drift silently eventually will, so it is gated.
+
+name: roadmap-freshness
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled, edited]
+  schedule:
+    - cron: "0 14 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  feature-pr-touches-roadmap:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Require ROADMAP.md update (or roadmap-exempt label) on feature PRs
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          case "$PR_TITLE" in
+            feat*|Feat*) ;;
+            *) echo "Not a feature PR (title does not start with 'feat'); skipping."; exit 0 ;;
+          esac
+          if printf '%s' "$LABELS" | tr ',' '\n' | grep -qx 'roadmap-exempt'; then
+            echo "roadmap-exempt label present; skipping. The PR description should say why."
+            exit 0
+          fi
+          if git diff --name-only "$BASE_SHA" "$HEAD_SHA" | grep -qx 'ROADMAP.md'; then
+            echo "ROADMAP.md updated in this PR. OK."
+            exit 0
+          fi
+          echo "::error::Feature PR does not update ROADMAP.md."
+          echo "Either reflect the shipped surface in ROADMAP.md in this same PR, or add"
+          echo "the 'roadmap-exempt' label with a one-line justification in the PR"
+          echo "description (internal-only change, no public surface)."
+          exit 1
+
+  weekly-drift-report:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: File or update the drift issue when shipped features are unreflected
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          last_roadmap_commit=$(git log -1 --format=%H -- ROADMAP.md)
+          if [ -z "$last_roadmap_commit" ]; then
+            echo "ROADMAP.md has no history; skipping."
+            exit 0
+          fi
+          drift=$(git log "$last_roadmap_commit"..HEAD --format='%h %s' | grep -E '^[0-9a-f]+ feat(\(|:)' || true)
+          if [ -z "$drift" ]; then
+            echo "No unreflected feature merges since the last ROADMAP.md update. Clean."
+            exit 0
+          fi
+          count=$(printf '%s\n' "$drift" | wc -l | tr -d ' ')
+          title="Public roadmap drift: $count shipped feature(s) not reflected in ROADMAP.md"
+          body=$(printf 'The following feature merges landed after the last ROADMAP.md update.\nReconcile the roadmap: fold each into the right section, or note in a comment here why it has no public surface.\n\n```\n%s\n```\n\nFiled automatically by the roadmap-freshness workflow.' "$drift")
+          existing=$(gh issue list --state open --search 'Public roadmap drift in:title' --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue edit "$existing" --title "$title" --body "$body"
+            echo "Updated existing drift issue #$existing."
+          else
+            gh issue create --title "$title" --body "$body"
+            echo "Created new drift issue."
+          fi

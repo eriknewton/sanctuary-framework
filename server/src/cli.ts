@@ -15,7 +15,8 @@
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { createSanctuaryServer } from "./index.js";
 import { refuseMissingMcpChildFortressOrExit } from "./mcp-child-fortress-refusal.js";
-import { checkForUpdate } from "./update-check.js";
+import { checkForUpdate, checkForSignedUpdate } from "./update-check.js";
+import { printFirstRunNoticeOnce } from "./first-run-notice.js";
 import { assertSupportedNodeVersion } from "./cli/node-version.js";
 import { extractTopLevelFortressFlag } from "./cli/top-level-fortress.js";
 import { SUPERVISOR_KEY_FD_ENV } from "./supervisor/spawn-launcher.js";
@@ -174,6 +175,12 @@ async function main(): Promise<void> {
     return drainAndExit(code);
   }
 
+  if (args[0] === "check-updates") {
+    const { runCheckUpdatesCommand } = await import("./cli/check-updates.js");
+    const code = await runCheckUpdatesCommand({ argv: args.slice(1) });
+    return drainAndExit(code);
+  }
+
   if (args[0] === "completion") {
     const { runCompletionCommand } = await import("./cli/completion.js");
     const code = await runCompletionCommand({ argv: args.slice(1) });
@@ -189,6 +196,12 @@ async function main(): Promise<void> {
   if (args[0] === "distress") {
     const { runDistressCommand } = await import("./cli/distress.js");
     const code = await runDistressCommand({ argv: args.slice(1) });
+    return drainAndExit(code);
+  }
+
+  if (args[0] === "cortex-export") {
+    const { runCortexExportCommand } = await import("./cli/cortex-export.js");
+    const code = await runCortexExportCommand({ argv: args.slice(1) });
     return drainAndExit(code);
   }
 
@@ -209,6 +222,12 @@ async function main(): Promise<void> {
       "./compliance/eu_ai_act/cli.js"
     );
     await runCompliance(args.slice(1));
+    return;
+  }
+
+  if (args[0] === "evidence-pack") {
+    const { runEvidencePack } = await import("./evidence-pack/cli.js");
+    await runEvidencePack(args.slice(1));
     return;
   }
 
@@ -250,6 +269,24 @@ async function main(): Promise<void> {
   if (args[0] === "federation") {
     const { runFederationCommand } = await import("./cli/federation.js");
     const code = await runFederationCommand({ argv: args.slice(1) });
+    return drainAndExit(code);
+  }
+
+  if (args[0] === "file-grant") {
+    const { runFileGrantCommand } = await import("./cli/file-grant.js");
+    const code = await runFileGrantCommand({ argv: args.slice(1) });
+    return drainAndExit(code);
+  }
+
+  if (args[0] === "license") {
+    const { runLicenseCommand } = await import("./cli/license.js");
+    const code = await runLicenseCommand({ argv: args.slice(1) });
+    return drainAndExit(code);
+  }
+
+  if (args[0] === "fleet") {
+    const { runFleetCommand } = await import("./cli/fleet.js");
+    const code = await runFleetCommand({ argv: args.slice(1) });
     return drainAndExit(code);
   }
 
@@ -384,12 +421,16 @@ async function main(): Promise<void> {
         // SAFETY: stderr / stdout is the operator-facing CLI channel; no logger module in scope.
         console.error(`sanctuary audit-chain export. Dump audit chain records to JSONL.
 
-Usage: sanctuary audit-chain export [--output <path>] [--fortress <path>]
+Usage: sanctuary audit-chain export [--output <path>] [--fortress <path>] [--operator-only]
 
 Options:
   --output <path>        Write JSONL to file (default: stdout)
   --fortress <path>      Override fortress path
   --storage-path <path>  Override state directory
+  --operator-only        Acknowledge an operator-chain-only export on a fortress
+                         that has a root daemon audit chain (_audit-daemon).
+                         Required there; the export otherwise fails closed rather
+                         than silently omitting the daemon chain.
   --help, -h             Show this help
 
 Examples:
@@ -534,6 +575,8 @@ Commands:
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--dashboard") {
       process.env.SANCTUARY_DASHBOARD_ENABLED = "true";
+    } else if (args[i] === "--allow-plaintext-remote") {
+      process.env.SANCTUARY_DASHBOARD_ALLOW_PLAINTEXT_REMOTE = "true";
     } else if (args[i] === "--passphrase" && args[i + 1]) {
       // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
       console.error(
@@ -563,9 +606,21 @@ Commands:
     console.error(`Storage: ${config.storage_path}`);
     console.error("Tools: all registered");
 
+    // One-time zero-outbound-by-default notice (2026-07-05). Fire and
+    // forget: fails open on any I/O error and never blocks startup.
+    void printFirstRunNoticeOnce(config.storage_path);
+
     // Non-blocking update check. Fire and forget (checkForUpdate catches
     // all failures internally and never rejects).
     void checkForUpdate(PKG_VERSION);
+
+    // Non-blocking AUTHENTICATED update check. Fetches the signed release
+    // manifest from the GitHub Releases channel and verifies it against the
+    // PINNED release-signing key, advising only on a verified newer version.
+    // Inert (silent) while the pinned key is the all-zero placeholder; it
+    // fails closed on any unsigned/wrong-key/tampered/absent manifest. Fire
+    // and forget: it catches all failures internally and never rejects.
+    void checkForSignedUpdate(PKG_VERSION);
   } else {
     // HTTP transport (future implementation)
     // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
@@ -600,6 +655,8 @@ async function runStandaloneDashboard(args: string[]): Promise<void> {
   let tenant: string | undefined;
   let noConfirm = false;
   let recoveryOut: string | undefined;
+  let allowPlaintextRemote = false;
+  let allowPark = false;
 
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--passphrase" && args[i + 1]) {
@@ -618,8 +675,17 @@ async function runStandaloneDashboard(args: string[]): Promise<void> {
       tenant = args[++i];
     } else if (args[i] === "--no-confirm") {
       noConfirm = true;
+    } else if (args[i] === "--allow-plaintext-remote") {
+      allowPlaintextRemote = true;
     } else if (args[i] === "--recovery-out" && args[i + 1]) {
       recoveryOut = args[++i];
+    } else if (args[i] === "--allow-park") {
+      // Slice 2 (park-not-exit): opt-in. Set by the supervised LaunchAgent so
+      // a locked-no-credential start boots PARKED (listener up, readiness
+      // "locked", unlock door live) instead of throwing and crash-looping
+      // under KeepAlive. Interactive `sanctuary dashboard` omits this and keeps
+      // its loud remediation behavior.
+      allowPark = true;
     } else if (args[i] === "--help" || args[i] === "-h") {
       printDashboardHelp();
       process.exit(0);
@@ -665,21 +731,25 @@ async function runStandaloneDashboard(args: string[]): Promise<void> {
     host,
     ...(tenant !== undefined ? { tenant } : {}),
     ...(recoveryOut !== undefined ? { recoveryOut } : {}),
+    ...(allowPlaintextRemote ? { allowPlaintextRemote } : {}),
     noConfirm,
+    allowPark,
   });
 
   // Keep the process alive. The HTTP server is listening.
   // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.error(`\nSanctuary Dashboard running (standalone mode). Press Ctrl+C to stop.\n`);
 
-  // Graceful shutdown
-  const shutdown = () => {
-    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
-    console.error("\nShutting down Sanctuary Dashboard...");
-    process.exit(0);
-  };
-  process.on("SIGINT", shutdown);
-  process.on("SIGTERM", shutdown);
+  // Graceful shutdown: `startStandaloneDashboard` (dashboard-standalone.ts)
+  // already installed its own SIGINT/SIGTERM listeners before returning
+  // (`registerStandaloneProcessCleanup` -> `handleStandaloneShutdownSignal`),
+  // which awaits every registered cleanup (tenant-runtime unlink, distress
+  // listener stop, baseline save) and then exits with 128+signal. Registering
+  // a second, synchronous listener here raced it: Node invokes listeners in
+  // registration order, so this handler's synchronous `process.exit(0)` ran
+  // on the same tick as the async handler's first `await`, killing the
+  // process before any cleanup completed and before the async handler's own
+  // exit code was ever reached. Do not add a second listener here.
 }
 
 async function runExportPassphrase(args: string[]): Promise<void> {
@@ -695,9 +765,16 @@ async function runExportPassphrase(args: string[]): Promise<void> {
   const { readStoredPassphrase, PassphraseUnreadableError } = await import(
     "./wrap/passphrase.js"
   );
+  // Resolve the fortress HERE, at the CLI entry point, and pass it down.
+  // Ambient resolution is correct at this layer -- for `sanctuary
+  // export-passphrase` the operator's own environment IS the input -- but it
+  // is stated rather than left implicit, so no leaf module has to reach for
+  // process state on its own.
+  const { resolveStoragePath } = await import("./paths.js");
+  const storagePath = resolveStoragePath();
   let stored: Awaited<ReturnType<typeof readStoredPassphrase>>;
   try {
-    stored = await readStoredPassphrase();
+    stored = await readStoredPassphrase({ storagePath });
   } catch (err) {
     if (err instanceof PassphraseUnreadableError) {
       // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
@@ -746,6 +823,7 @@ Usage:
   sanctuary dashboard [opts]              # Standalone dashboard
   sanctuary status [opts]                 # Daemon status over the /v1 API
   sanctuary doctor [opts]                 # Local environment diagnostic
+  sanctuary check-updates                 # Explicitly check for updates
   sanctuary completion <bash|zsh|fish>    # Emit shell completion
   sanctuary audit search [opts]           # Search local audit log
   sanctuary transparency <cmd> [opts]     # Signed enforcement checkpoints
@@ -789,6 +867,12 @@ Subcommands:
   doctor               Run read-only local health diagnostics.
                        Use "sanctuary doctor --help" for options.
 
+  check-updates        Explicitly check npmjs.org / GitHub Releases for a
+                       newer version, right now, regardless of the
+                       zero-outbound default. Sanctuary makes no unrequested
+                       outbound connection otherwise.
+                       Use "sanctuary check-updates --help" for options.
+
   completion           Emit shell completion for bash, zsh, or fish.
 
   audit                Search local audit history.
@@ -797,6 +881,11 @@ Subcommands:
   distress             Emit a distress signal through the reserved habeas
                        lane (operator test verb; same path the agent uses).
                        Use "sanctuary distress --help" for options.
+
+  cortex-export        Export Castle Wall enforcement decisions to a security
+                       console as a frozen metadata-only event stream (local by
+                       default; outbound push is Tier-1 gated + pinned).
+                       Use "sanctuary cortex-export --help" for options.
 
   transparency         Emit and export signed enforcement checkpoints
                        (verifiable evidence the wall is enforcing).
@@ -846,10 +935,21 @@ Environment variables:
   SANCTUARY_DASHBOARD_ENABLED       "true" to enable dashboard
   SANCTUARY_DASHBOARD_PORT          Dashboard port (default: 3501)
   SANCTUARY_DASHBOARD_AUTH_TOKEN    Bearer token or "auto"
+  SANCTUARY_DASHBOARD_ALLOW_PLAINTEXT_REMOTE
+                                      "true" allows plaintext remote dashboard
   SANCTUARY_WEBHOOK_ENABLED         "true" to enable webhook approvals
   SANCTUARY_WEBHOOK_URL             Webhook target URL
   SANCTUARY_WEBHOOK_SECRET          HMAC-SHA256 shared secret
-  SANCTUARY_NO_UPDATE_CHECK         "1" to disable startup update check
+  SANCTUARY_UPDATE_CHECK            "1" to opt in to the startup update check
+                                      and wrap's pinned-version registry probe.
+                                      Sanctuary makes NO unrequested outbound
+                                      connection by default (zero-outbound);
+                                      run "sanctuary check-updates" any time
+                                      to check on demand regardless of this
+                                      setting.
+  SANCTUARY_NO_UPDATE_CHECK         "1" is a back-compat alias that also keeps
+                                      the above checks off (cannot force them
+                                      on)
 
 For more info: https://github.com/eriknewton/sanctuary-framework
 `);
@@ -887,6 +987,15 @@ Options:
                        On a first-run mint, write the plaintext recovery key to
                        this exact path OUTSIDE the fortress directory (durable
                        off-host escrow). Also honors SANCTUARY_RECOVERY_OUT.
+  --allow-plaintext-remote
+                       Allow plaintext HTTP on non-loopback dashboard bindings
+                       when a separate network layer already encrypts transport.
+  --allow-park         Park (do not exit) on a locked-no-credential start
+                       instead of failing loudly: bind the listener, report
+                       readiness "locked", serve the in-process unlock door,
+                       and stay up. Intended for the supervised LaunchAgent so
+                       KeepAlive does not crash-loop a locked fortress. The
+                       process does NOT auto-unlock; an operator unlocks once.
   --help, -h           Show this help
 
 Environment variables:
@@ -897,6 +1006,8 @@ Environment variables:
   SANCTUARY_RECOVERY_OUT            Off-host plaintext recovery-key path (first run)
   SANCTUARY_DASHBOARD_PORT          Dashboard port (default: 3501)
   SANCTUARY_DASHBOARD_AUTH_TOKEN    Bearer token or "auto"
+  SANCTUARY_DASHBOARD_ALLOW_PLAINTEXT_REMOTE
+                                      "true" allows plaintext remote dashboard
   SANCTUARY_MULTI_DASHBOARD         "true" to auto-enable multi-agent mode
   SANCTUARY_MULTI_DASHBOARD_PORT    Multi-agent dashboard port (default: 3500)
   SANCTUARY_AGENTS_EXTRA_PATHS      Colon-separated extra tenant storage paths
@@ -973,6 +1084,11 @@ async function handleHelpEarly(args: string[]): Promise<boolean> {
       await runDistressCommand({ argv: args.slice(1).concat("--help") });
       return true;
     }
+    case "cortex-export": {
+      const { runCortexExportCommand } = await import("./cli/cortex-export.js");
+      await runCortexExportCommand({ argv: args.slice(1).concat("--help") });
+      return true;
+    }
     case "deploy": {
       const { runDeployCommand } = await import("./cli/deploy.js");
       await runDeployCommand({ argv: args.slice(1).concat("--help") });
@@ -1028,9 +1144,19 @@ async function runCastleWallCommand(args: string[]): Promise<number> {
     return runAuditDump(args.slice(1));
   }
 
+  if (command === "audit-verify") {
+    const { runAuditVerify } = await import("./cli/castle-wall.js");
+    return runAuditVerify(args.slice(1));
+  }
+
   if (command === "audit-findings") {
     const { runAuditFindings } = await import("./cli/castle-wall.js");
     return runAuditFindings(args.slice(1));
+  }
+
+  if (command === "audit-store-status") {
+    const { runAuditStoreStatus } = await import("./cli/castle-wall.js");
+    return runAuditStoreStatus(args.slice(1));
   }
 
   if (command === "approve") {
@@ -1068,6 +1194,128 @@ async function runCastleWallCommand(args: string[]): Promise<number> {
     return runProvisionBootToken(args.slice(1));
   }
 
+  if (command === "signer-helper") {
+    const sub = args[1];
+    if (sub === "status" || sub === undefined) {
+      const { runSignerHelperStatus } = await import("./cli/castle-wall-signer-helper.js");
+      return runSignerHelperStatus(args.slice(2));
+    }
+    // SAFETY: stderr is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+    console.error(`Unknown signer-helper subcommand: ${sub}. Try: sanctuary castle-wall signer-helper status`);
+    return 2;
+  }
+
+  if (command === "observe") {
+    const { runObserveCommand } = await import("./cli/castle-wall-observe.js");
+    return runObserveCommand({ argv: args.slice(1) });
+  }
+
+  if (command === "egress-gate-daemon") {
+    // Unified Protect Slice 5 S5-6: the long-lived exclusive-egress gate
+    // daemon entrypoint. Spawned by launchd under the dedicated
+    // `sanctuary-gate-<agentId>` service uid (NEVER root, NEVER the agent);
+    // reads its gate-readable config copies from /var/db/sanctuary/
+    // gate-runtime, binds EXACTLY the committed gate port, and serves with
+    // the S5-3 TCB wiring (oracle liveness probe + fail-closed client auth +
+    // peer runner). A bind/config failure exits non-zero (the gate refuses
+    // to serve rather than squat another port; posture reads amber).
+    const uidArg = args.slice(1).find((a) => a.startsWith("--agent-uid="));
+    const agentUid = uidArg !== undefined ? Number(uidArg.slice("--agent-uid=".length)) : NaN;
+    if (!Number.isInteger(agentUid) || agentUid <= 0) {
+      // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
+      console.error("egress-gate-daemon requires --agent-uid=<positive integer>");
+      return 2;
+    }
+    const { runEgressGateDaemon } = await import("./egress-gate/gate-daemon.js");
+    try {
+      const handle = await runEgressGateDaemon({ agentUid });
+      const stop = async (): Promise<void> => {
+        try {
+          await handle.close();
+        } finally {
+          process.exit(0);
+        }
+      };
+      process.on("SIGTERM", () => {
+        void stop();
+      });
+      process.on("SIGINT", () => {
+        void stop();
+      });
+      // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
+      console.error(
+        `[egress-gate] serving uid ${agentUid} on 127.0.0.1:${handle.gate.port} (generation ${handle.generationId})`,
+      );
+      // The gate server holds the event loop open; this promise never
+      // resolves (shutdown exits via the signal handlers above).
+      return await new Promise<number>(() => undefined);
+    } catch (err) {
+      // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
+      console.error(`egress-gate daemon failed to start: ${(err as Error).message}`);
+      return 1;
+    }
+  }
+
+  if (command === "peer-resolver-daemon") {
+    // 2026-07-24 S5-3 fix (Option 1): the PRIVILEGED root helper the gate
+    // daemon dials to resolve a loopback CONNECT peer's uid (the gate daemon
+    // itself stays unprivileged and cannot see a different uid's socket --
+    // see `peer-resolver-daemon.ts`). Spawned by launchd as ROOT (no
+    // UserName in its plist), one per confined agent, alongside that agent's
+    // gate daemon.
+    const args1 = args.slice(1);
+    const uidArg = args1.find((a) => a.startsWith("--agent-uid="));
+    const gateUidArg = args1.find((a) => a.startsWith("--gate-uid="));
+    const gatePortArg = args1.find((a) => a.startsWith("--gate-port="));
+    const agentUid = uidArg !== undefined ? Number(uidArg.slice("--agent-uid=".length)) : NaN;
+    const gateUid = gateUidArg !== undefined ? Number(gateUidArg.slice("--gate-uid=".length)) : NaN;
+    const gatePort = gatePortArg !== undefined ? Number(gatePortArg.slice("--gate-port=".length)) : NaN;
+    if (!Number.isInteger(agentUid) || agentUid <= 0) {
+      // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
+      console.error("peer-resolver-daemon requires --agent-uid=<positive integer>");
+      return 2;
+    }
+    if (!Number.isInteger(gateUid) || gateUid <= 0) {
+      // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
+      console.error("peer-resolver-daemon requires --gate-uid=<positive integer>");
+      return 2;
+    }
+    // 2026-07-24 fix-round BLOCKER: the gate port MUST come from this
+    // daemon's OWN root-written startup config (this argv, baked into the
+    // plist at arming time), never from a wire request -- see
+    // peer-resolver-daemon.ts's module header.
+    if (!Number.isInteger(gatePort) || gatePort <= 0 || gatePort > 65535) {
+      // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
+      console.error("peer-resolver-daemon requires --gate-port=<valid TCP port>");
+      return 2;
+    }
+    const { runPeerResolverDaemon } = await import("./egress-gate/peer-resolver-daemon.js");
+    try {
+      const handle = await runPeerResolverDaemon({ agentUid, gateUid, gatePort });
+      const stop = async (): Promise<void> => {
+        try {
+          await handle.close();
+        } finally {
+          process.exit(0);
+        }
+      };
+      process.on("SIGTERM", () => {
+        void stop();
+      });
+      process.on("SIGINT", () => {
+        void stop();
+      });
+      // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
+      console.error(`[egress-gate-peer-resolver] serving uid ${agentUid} on ${handle.socketPath}`);
+      // Holds the event loop open; shutdown exits via the signal handlers above.
+      return await new Promise<number>(() => undefined);
+    } catch (err) {
+      // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
+      console.error(`peer-resolver daemon failed to start: ${(err as Error).message}`);
+      return 1;
+    }
+  }
+
   // SAFETY: stderr is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.error(
     `Unknown subcommand: ${command}. Try: sanctuary castle-wall --help`
@@ -1091,6 +1339,16 @@ function printCastleWallHelp(): void {
     status           Show pinned-key fingerprint and sysext status.
     enable           Arm the content filter headlessly (macOS; SSH-safe after the one-time GUI consent).
                      Refuses without a reachable policy daemon; --force overrides.
+                     --agent-uid=<uid> [--ceiling=<uid>]
+                                      One-command arm: configure the agent-origin descriptor
+                                      (same effect as 'configure-origin uid --agent-uid=<uid>')
+                                      THEN arm, in a single command. --ceiling defaults to 500.
+                                      The uid must be a plain positive integer AND >= the ceiling
+                                      (root/0 and sub-ceiling uids are rejected; non-numeric values
+                                      are never truncated). Explicit flag only - never auto-derived.
+                                      Without --agent-uid, behavior is unchanged: enable still refuses
+                                      to arm with no agent-origin descriptor already on disk unless
+                                      --force (use 'configure-origin' first, or pass --agent-uid).
     disable          Disarm the content filter headlessly (macOS; unconditional dead-man lever).
     setup-shared-dir Create the privileged shared dir for the pinned key (run with sudo, macOS).
     reload           Reload policy in the running fortress daemon.
@@ -1102,7 +1360,18 @@ function printCastleWallHelp(): void {
                      Surfaces RECORDED per-flow rule attribution. It does NOT make the
                      audit trail tamper-evident: tamper-evidence (producer-signed audit
                      activation) is a separate capability, not yet active in production on Linux.
+    audit-verify     Re-verify each enforcement entry's PRODUCER SIGNATURE against the
+                     pinned audit-producer key and report verified / rejected / channel
+                     counts. Read-only. This is the tamper-evidence reader: unlike
+                     audit-dump it does NOT trust the cw_source marker; it cryptographically
+                     re-verifies the signature, so a forged producer_signed entry is REJECTED.
+                     With no published producer key it reports the honest channel-authenticated
+                     floor and makes no per-producer claim. --json for machine output;
+                     --since <dur>; --producer-pub-key <path> override.
     audit-findings   List audit-chain integrity findings for the fortress (read-only diagnostic).
+    audit-store-status Report BOTH the operator and root-daemon audit chain verdicts (F2 Option A
+                     writer-split), each honestly and separately; a daemon chain that exists but
+                     is unreadable at this privilege reports as such, never as "verified". Read-only.
     approve          Approve a pending Castle Wall request.
     configure-origin Configure the agent-origin descriptor for origin-differential enforcement.
     re-pin           Migrate the trust anchor to the root signer helper's key (one-time, operator-approved).
@@ -1114,6 +1383,19 @@ function printCastleWallHelp(): void {
     install-boot     Install the daemon as a launchd safe-mode boot service (run with sudo, macOS).
                      Options: --user <name> --fortress <path> --binary <path> --signer-client <path>
     uninstall-boot   Remove the launchd boot service (run with sudo, macOS; requires --yes). Does NOT disarm the filter.
+    signer-helper status
+                     Boot-readiness preflight for the root signer-helper LaunchDaemon: checks the
+                     launchd job is loaded, the helper answers over XPC, its key matches the global
+                     pin, and the custody directory is root-owned and not group/other-writable.
+                     Exit 0 when ready, 1 otherwise. Does NOT prove reboot survival by itself; see
+                     castle-wall-macos-boot-service.md for the required Erik-present reboot drill.
+    observe start|status|candidates|promote|discard
+                     Observe / Learn Allow-List v1: the wall stays armed and default-deny the
+                     whole time; observe mode records denied novel destinations for review
+                     instead of nagging per-flow. 'promote' is Tier-1 FORCED (requires the same
+                     approval gate as state_export / key rotation) and is the ONLY verb that can
+                     ever widen the live ruleset. Run 'sanctuary castle-wall observe --help' for
+                     command-specific options.
 
   Options:
     --help, -h              Show this help
@@ -1185,8 +1467,8 @@ function printWrapHelpEarly(): void {
                        harness. Use this for the clean operator setup
                        (one persistent dashboard + many wraps).
     --dev-dist <path>  Dogfood path. Point the harness MCP entries at a
-                       local Sanctuary build (\`node <path>\` instead of
-                       \`npx @sanctuary-framework/mcp-server\`). Required
+                       local Sanctuary build (\`node <path>\` instead of the
+                       version-pinned npx registry entry). Required
                        when testing an unpublished branch; the published
                        version doesn't have new subcommands yet, and
                        npx pulls from the registry, not your checkout.

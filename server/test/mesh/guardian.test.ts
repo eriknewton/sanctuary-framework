@@ -330,6 +330,401 @@ describe("verifyGuardianQuorum — M-of-N enforcement", () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════
+// Regression: shared-public-key quorum collapse (A3 harden 2026-07-04)
+//
+// One key holder must not occupy multiple guardian slots under distinct
+// guardian_ids. Approval/quorum signatures bind the signing input and the
+// guardian key, never the guardian_id, so N distinct ids sharing one public
+// key let a single private key satisfy M-of-N alone. Both issuance/verification
+// (root-cause) and the quorum counter (defense-in-depth) must fail closed.
+// ═══════════════════════════════════════════════════════════════════════
+
+describe("shared-public-key quorum collapse: fail closed", () => {
+  // Forge a master-signed roster whose guardians have distinct ids but a shared
+  // public key. Mirrors issueGuardianRoster's body shape so the master_signature
+  // is genuine; the only deviation is that it bypasses validateRosterShape.
+  function forgeSharedKeyRoster(
+    fortress: ReturnType<typeof makeFortress>,
+    ids: string[]
+  ): { roster: ReturnType<typeof issueGuardianRoster>; shared: GuardianKp } {
+    const shared = makeGuardian(ids[0]);
+    const guardians: GuardianIdentity[] = ids.map((id) => ({
+      guardian_id: id,
+      public_key: shared.identity.public_key,
+      kind: "human" as const,
+      invited_at: new Date().toISOString(),
+    }));
+    const body = {
+      m: guardians.length,
+      n: guardians.length,
+      guardians,
+      signature_scheme: SIGNATURE_SCHEME_V1,
+      version: 1,
+      created_at: new Date().toISOString(),
+      fortress_id: fortress.public.fortress_id,
+    };
+    const sig = ed25519.sign(canonicalizeToBytes(body), fortress.private_key);
+    return {
+      roster: { ...body, master_signature: toBase64url(sig) },
+      shared,
+    };
+  }
+
+  it("issueGuardianRoster rejects distinct guardian_ids that share a public key", () => {
+    const fortress = makeFortress();
+    const shared = makeGuardian("g1");
+    const guardians: GuardianIdentity[] = [
+      { ...shared.identity, guardian_id: "g1" },
+      { ...shared.identity, guardian_id: "g2" },
+      { ...shared.identity, guardian_id: "g3" },
+    ];
+    expect(() =>
+      issueGuardianRoster({
+        m: 3,
+        n: 3,
+        guardians,
+        fortress_id: fortress.public.fortress_id,
+        version: 1,
+        master_private_key: fortress.private_key,
+      })
+    ).toThrow(GuardianRosterError);
+  });
+
+  it("verifyGuardianRoster rejects a forged roster with a shared public key", () => {
+    const fortress = makeFortress();
+    const { roster } = forgeSharedKeyRoster(fortress, ["g0", "g1", "g2"]);
+    // master_signature is genuine, so this fails on shape (duplicate key), not
+    // on the signature, proving the roster body itself is the closed gate.
+    expect(() => verifyGuardianRoster(roster, fortress.public)).toThrow(
+      GuardianRosterError
+    );
+  });
+
+  it("verifyGuardianQuorum does not let one key satisfy M-of-N via shared-key slots", () => {
+    const fortress = makeFortress();
+    const { roster, shared } = forgeSharedKeyRoster(fortress, ["g0", "g1", "g2"]);
+    const newMaster = generateFortressMaster();
+    newMaster.public.fortress_id = fortress.public.fortress_id;
+    const input: MasterRotationQuorumInput = {
+      old_master_pubkey: fortress.public.public_key,
+      new_master_pubkey: newMaster.public,
+      rotated_at: new Date().toISOString(),
+      fortress_id: fortress.public.fortress_id,
+    };
+    // One private key signs three envelopes labeled g0/g1/g2. Each individual
+    // signature verifies against the (shared) key; pre-fix all three counted.
+    const sigs = ["g0", "g1", "g2"].map((id) =>
+      signMasterRotationAsGuardian({
+        input,
+        guardian_id: id,
+        guardian_private_key: shared.private_key,
+      })
+    );
+    // After the A3 follow-up shape gate, verifyGuardianQuorum runs
+    // validateRosterShape first, so this shared-key roster (duplicate canonical
+    // keys) is rejected wholesale as a malformed roster BEFORE the per-key
+    // quorum counter runs, a strictly stronger fail-closed rejection than the
+    // earlier per-key GuardianQuorumError. GuardianRosterError and
+    // GuardianQuorumError both extend GuardianError; the rejection is now a
+    // roster-shape error because the roster, not the proof, is malformed.
+    expect(() =>
+      verifyGuardianQuorum({
+        input,
+        proof: { roster_version: roster.version, signatures: sigs },
+        pinned_roster: roster,
+      })
+    ).toThrow(GuardianRosterError);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// Regression: NON-CANONICAL shared-key quorum collapse (A3 harden 2026-07-04)
+//
+// The first shared-key guard compared raw base64url strings for uniqueness,
+// but fromBase64url decodes permissively: "KEY", "KEY==", "KEY " all decode to
+// the same 32 bytes and every slot verifies against the one key. Distinct
+// spellings of ONE key therefore slipped past the string-equality uniqueness
+// check while a single private key satisfied M-of-N. The fix compares on the
+// canonical decoded key and rejects non-canonical spellings outright. These
+// tests FAIL before the canonical-key fix and PASS after.
+// ═══════════════════════════════════════════════════════════════════════
+
+describe("non-canonical shared-public-key quorum collapse: fail closed", () => {
+  it("issueGuardianRoster rejects a non-canonical re-spelling of one key", () => {
+    const fortress = makeFortress();
+    const shared = makeGuardian("g1");
+    const canonical = shared.identity.public_key;
+    const padded = `${canonical}==`;
+    const spaced = `${canonical} `;
+    // The spellings differ as strings but decode to the identical key.
+    expect(padded).not.toBe(canonical);
+    expect(spaced).not.toBe(canonical);
+    expect(toBase64url(fromBase64url(padded))).toBe(canonical);
+    expect(toBase64url(fromBase64url(spaced))).toBe(canonical);
+    const guardians: GuardianIdentity[] = [
+      { ...shared.identity, guardian_id: "g1", public_key: canonical },
+      { ...shared.identity, guardian_id: "g2", public_key: padded },
+      { ...shared.identity, guardian_id: "g3", public_key: spaced },
+    ];
+    expect(() =>
+      issueGuardianRoster({
+        m: 3,
+        n: 3,
+        guardians,
+        fortress_id: fortress.public.fortress_id,
+        version: 1,
+        master_private_key: fortress.private_key,
+      })
+    ).toThrow(GuardianRosterError);
+  });
+
+  it("verifyGuardianRoster rejects a forged roster with non-canonical shared-key spellings", () => {
+    const fortress = makeFortress();
+    const shared = makeGuardian("g0");
+    const canonical = shared.identity.public_key;
+    const guardians: GuardianIdentity[] = [
+      { ...shared.identity, guardian_id: "g0", public_key: canonical },
+      { ...shared.identity, guardian_id: "g1", public_key: `${canonical}==` },
+      { ...shared.identity, guardian_id: "g2", public_key: `${canonical} ` },
+    ];
+    const body = {
+      m: 3,
+      n: 3,
+      guardians,
+      signature_scheme: SIGNATURE_SCHEME_V1,
+      version: 1,
+      created_at: new Date().toISOString(),
+      fortress_id: fortress.public.fortress_id,
+    };
+    const sig = ed25519.sign(canonicalizeToBytes(body), fortress.private_key);
+    const roster = { ...body, master_signature: toBase64url(sig) };
+    // master_signature is genuine, so the rejection is on shape (a non-canonical
+    // spelling of an already-seen key), not on the signature.
+    expect(() => verifyGuardianRoster(roster, fortress.public)).toThrow(
+      GuardianRosterError
+    );
+  });
+
+  it("verifyGuardianQuorum does not count non-canonical spellings of one key twice", () => {
+    const fortress = makeFortress();
+    const shared = makeGuardian("g0");
+    const canonical = shared.identity.public_key;
+    const guardians: GuardianIdentity[] = [
+      { ...shared.identity, guardian_id: "g0", public_key: canonical },
+      { ...shared.identity, guardian_id: "g1", public_key: `${canonical}==` },
+      { ...shared.identity, guardian_id: "g2", public_key: `${canonical} ` },
+    ];
+    const body = {
+      m: 3,
+      n: 3,
+      guardians,
+      signature_scheme: SIGNATURE_SCHEME_V1,
+      version: 1,
+      created_at: new Date().toISOString(),
+      fortress_id: fortress.public.fortress_id,
+    };
+    const masterSig = ed25519.sign(canonicalizeToBytes(body), fortress.private_key);
+    const roster = { ...body, master_signature: toBase64url(masterSig) };
+    const newMaster = generateFortressMaster();
+    newMaster.public.fortress_id = fortress.public.fortress_id;
+    const input: MasterRotationQuorumInput = {
+      old_master_pubkey: fortress.public.public_key,
+      new_master_pubkey: newMaster.public,
+      rotated_at: new Date().toISOString(),
+      fortress_id: fortress.public.fortress_id,
+    };
+    const sigs = ["g0", "g1", "g2"].map((id) =>
+      signMasterRotationAsGuardian({
+        input,
+        guardian_id: id,
+        guardian_private_key: shared.private_key,
+      })
+    );
+    // After the A3 follow-up shape gate, the non-canonical shared-key roster
+    // (three spellings collapsing to one canonical key) is rejected at
+    // validateRosterShape as a malformed roster before the per-key quorum
+    // counter, a strictly stronger fail-closed rejection surfaced as
+    // GuardianRosterError (roster malformed, not proof).
+    expect(() =>
+      verifyGuardianQuorum({
+        input,
+        proof: { roster_version: roster.version, signatures: sigs },
+        pinned_roster: roster,
+      })
+    ).toThrow(GuardianRosterError);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// Regression: malformed pinned roster fails closed at verifyGuardianQuorum
+// (A3 harden 2026-07-04)
+//
+// verifyGuardianQuorum compared proof.signatures.length and validCount against
+// an UNVALIDATED roster.m/roster.n. A master-signed but structurally degenerate
+// roster (m=0,n=1) let the empty-signature path succeed: `0 < 0` (length < m) is
+// false, the signature loop is empty, and `validCount(0) < m(0)` is false, so
+// the quorum "verified" with ZERO guardian signatures. The fix runs
+// validateRosterShape at the START of verifyGuardianQuorum, so any malformed
+// pinned roster throws GuardianRosterError before any threshold comparison.
+// Each test FAILS before the shape gate (quorum returns success / wrong error)
+// and PASSES after (throws GuardianRosterError). GuardianRosterError and
+// GuardianQuorumError both extend GuardianError; the roster-shape violation
+// surfaces as the roster error because the roster, not the proof, is malformed.
+// ═══════════════════════════════════════════════════════════════════════
+
+describe("malformed pinned roster: verifyGuardianQuorum fails closed", () => {
+  // Forge a master-signed roster with an arbitrary (possibly invalid) shape.
+  // The master_signature is genuine over the body, so any rejection is on shape,
+  // not on the signature, proving the shape gate itself is the closed boundary.
+  function forgeRoster(
+    fortress: ReturnType<typeof makeFortress>,
+    body: {
+      m: number;
+      n: number;
+      guardians: GuardianIdentity[];
+    }
+  ): ReturnType<typeof issueGuardianRoster> {
+    const full = {
+      m: body.m,
+      n: body.n,
+      guardians: body.guardians,
+      signature_scheme: SIGNATURE_SCHEME_V1,
+      version: 1,
+      created_at: new Date().toISOString(),
+      fortress_id: fortress.public.fortress_id,
+    };
+    const sig = ed25519.sign(canonicalizeToBytes(full), fortress.private_key);
+    return { ...full, master_signature: toBase64url(sig) };
+  }
+
+  function buildInput(
+    fortress: ReturnType<typeof makeFortress>
+  ): MasterRotationQuorumInput {
+    const newMaster = generateFortressMaster();
+    newMaster.public.fortress_id = fortress.public.fortress_id;
+    return {
+      old_master_pubkey: fortress.public.public_key,
+      new_master_pubkey: newMaster.public,
+      rotated_at: new Date().toISOString(),
+      fortress_id: fortress.public.fortress_id,
+    };
+  }
+
+  it("m=0 with an empty proof does NOT verify (the empty-signature success path is closed)", () => {
+    const fortress = makeFortress();
+    const g0 = makeGuardian("g0");
+    // Degenerate roster: m=0, n=1, one real guardian. Pre-fix an empty proof
+    // whose roster_version matches slipped through with zero signatures.
+    const roster = forgeRoster(fortress, {
+      m: 0,
+      n: 1,
+      guardians: [g0.identity],
+    });
+    const input = buildInput(fortress);
+    expect(() =>
+      verifyGuardianQuorum({
+        input,
+        proof: { roster_version: roster.version, signatures: [] },
+        pinned_roster: roster,
+      })
+    ).toThrow(GuardianRosterError);
+  });
+
+  it("m>n fails closed", () => {
+    const fortress = makeFortress();
+    const g0 = makeGuardian("g0");
+    const roster = forgeRoster(fortress, {
+      m: 2,
+      n: 1,
+      guardians: [g0.identity],
+    });
+    const input = buildInput(fortress);
+    expect(() =>
+      verifyGuardianQuorum({
+        input,
+        proof: { roster_version: roster.version, signatures: [] },
+        pinned_roster: roster,
+      })
+    ).toThrow(GuardianRosterError);
+  });
+
+  it("guardians.length !== n fails closed", () => {
+    const fortress = makeFortress();
+    const g0 = makeGuardian("g0");
+    const g1 = makeGuardian("g1");
+    // n claims 3 but only 2 guardians listed.
+    const roster = forgeRoster(fortress, {
+      m: 1,
+      n: 3,
+      guardians: [g0.identity, g1.identity],
+    });
+    const input = buildInput(fortress);
+    const sig = signMasterRotationAsGuardian({
+      input,
+      guardian_id: "g0",
+      guardian_private_key: g0.private_key,
+    });
+    expect(() =>
+      verifyGuardianQuorum({
+        input,
+        proof: { roster_version: roster.version, signatures: [sig] },
+        pinned_roster: roster,
+      })
+    ).toThrow(GuardianRosterError);
+  });
+
+  it("duplicate guardian_id in the roster fails closed", () => {
+    const fortress = makeFortress();
+    const g0 = makeGuardian("dup");
+    const g1 = makeGuardian("dup"); // same id, distinct key
+    const roster = forgeRoster(fortress, {
+      m: 1,
+      n: 2,
+      guardians: [g0.identity, g1.identity],
+    });
+    const input = buildInput(fortress);
+    const sig = signMasterRotationAsGuardian({
+      input,
+      guardian_id: "dup",
+      guardian_private_key: g0.private_key,
+    });
+    expect(() =>
+      verifyGuardianQuorum({
+        input,
+        proof: { roster_version: roster.version, signatures: [sig] },
+        pinned_roster: roster,
+      })
+    ).toThrow(GuardianRosterError);
+  });
+
+  it("duplicate canonical public key in the roster fails closed", () => {
+    const fortress = makeFortress();
+    const shared = makeGuardian("g0");
+    const roster = forgeRoster(fortress, {
+      m: 1,
+      n: 2,
+      guardians: [
+        { ...shared.identity, guardian_id: "g0" },
+        { ...shared.identity, guardian_id: "g1" },
+      ],
+    });
+    const input = buildInput(fortress);
+    const sig = signMasterRotationAsGuardian({
+      input,
+      guardian_id: "g0",
+      guardian_private_key: shared.private_key,
+    });
+    expect(() =>
+      verifyGuardianQuorum({
+        input,
+        proof: { roster_version: roster.version, signatures: [sig] },
+        pinned_roster: roster,
+      })
+    ).toThrow(GuardianRosterError);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
 // Spawn-prompt acceptance #4 — master_rotation flow + cascade
 // ═══════════════════════════════════════════════════════════════════════
 

@@ -41,6 +41,8 @@ async function startDashboardOnFreePort(
       // target (SANCTUARY_RECOVERY_OUT, set per-test) so the gate is satisfied
       // deterministically. Individual tests may still override noConfirm.
       noConfirm: true,
+      // Ephemeral distress port so parallel dashboards never contend on 8741.
+      distressPort: 0,
       ...options,
       discoveryOptions: options.discoveryOptions ?? isolatedDiscoveryOptions,
       port,
@@ -87,6 +89,7 @@ describe("Standalone Dashboard", () => {
     delete process.env.SANCTUARY_DASHBOARD_ENABLED;
     delete process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN;
     delete process.env.SANCTUARY_DASHBOARD_PORT;
+    delete process.env.SANCTUARY_DASHBOARD_ALLOW_PLAINTEXT_REMOTE;
     delete process.env.SANCTUARY_RECOVERY_OUT;
     isolatedDiscoveryOptions = undefined;
   });
@@ -107,6 +110,39 @@ describe("Standalone Dashboard", () => {
     const text = await res.text();
     // Should show login page (we didn't provide auth)
     expect(text).toContain("Sanctuary");
+  });
+
+  it("threads allowPlaintextRemote into the approval channel config", async () => {
+    process.env.SANCTUARY_STORAGE_PATH = tempDir;
+    process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN = "test-token-remote-plaintext";
+
+    const result = await startDashboardOnFreePort({
+      passphrase: "test-passphrase-remote-plaintext",
+      host: "0.0.0.0",
+      allowPlaintextRemote: true,
+    });
+    dashboard = result.dashboard;
+
+    const channel = dashboard as unknown as {
+      config: { allow_plaintext_remote?: boolean };
+    };
+    expect(channel.config.allow_plaintext_remote).toBe(true);
+  });
+
+  it("refuses standalone non-loopback plaintext when allowPlaintextRemote is unset", async () => {
+    process.env.SANCTUARY_STORAGE_PATH = tempDir;
+    process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN = "test-token-remote-refuse";
+
+    await expect(
+      startStandaloneDashboard({
+        passphrase: "test-passphrase-remote-refuse",
+        host: "0.0.0.0",
+        port: randomTestPort(),
+        distressPort: 0,
+        noConfirm: true,
+        discoveryOptions: isolatedDiscoveryOptions,
+      })
+    ).rejects.toThrow(/refusing to start on non-loopback interface/i);
   });
 
   it("serves audit log API in standalone mode", async () => {
@@ -245,6 +281,7 @@ describe("Standalone Dashboard", () => {
       dashboard2 = await startStandaloneDashboard({
         port: randomTestPort(),
         host: "127.0.0.1",
+        distressPort: 0,
         discoveryOptions: isolatedDiscoveryOptions,
       });
       // If we get here, clean up and fail
@@ -499,5 +536,169 @@ describe("Standalone Dashboard", () => {
       );
     }
     expect(approveRes.status).toBe(200);
+  });
+
+  // ── Remote operator console drill regressions (PR #375) ────────────────
+  // Three defects an Erik-present browser drill caught that server-side curl
+  // could not see. Each test pins the fix.
+
+  it("FIX 1: GET /api/health sends Access-Control-Allow-Origin so a cross-host fleet probe can read it", async () => {
+    process.env.SANCTUARY_STORAGE_PATH = tempDir;
+    process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN = "test-token-health-cors";
+
+    const result = await startDashboardOnFreePort({
+      passphrase: "test-passphrase-health-cors",
+      host: "127.0.0.1",
+    });
+    dashboard = result.dashboard;
+
+    // Simulate the switcher's cross-host browser probe: a different Origin
+    // than the host it connected to.
+    const crossOrigin = "https://100.64.0.5:3501";
+    const res = await fetch(`http://127.0.0.1:${result.port}/api/health`, {
+      headers: { Origin: crossOrigin },
+    });
+    expect(res.status).toBe(200);
+    // The browser would block the response body without this header; the fix
+    // reflects the request Origin so the cross-host probe can read `ok`.
+    expect(res.headers.get("access-control-allow-origin")).toBe(crossOrigin);
+    // SECURITY: never the reflected-origin + credentials account-takeover combo.
+    expect(res.headers.get("access-control-allow-credentials")).toBeNull();
+    const body = await res.json();
+    expect(body.ok).toBe(true);
+    // The probe stays liveness-only: no secrets, no posture, no auth state.
+    expect(body).not.toHaveProperty("supervisor");
+    expect(body).not.toHaveProperty("arm_state");
+  });
+
+  it("FIX 1 (security): a protected route does NOT reflect a cross-origin Origin", async () => {
+    process.env.SANCTUARY_STORAGE_PATH = tempDir;
+    process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN = "test-token-protected-cors";
+
+    const result = await startDashboardOnFreePort({
+      passphrase: "test-passphrase-protected-cors",
+      host: "127.0.0.1",
+    });
+    dashboard = result.dashboard;
+
+    // A protected JSON route with a foreign Origin must NOT get an ACAO header
+    // reflecting that origin (the permissive header is scoped to /api/health).
+    const crossOrigin = "https://evil.example:3501";
+    const res = await fetch(`http://127.0.0.1:${result.port}/api/status`, {
+      headers: { Origin: crossOrigin },
+    });
+    expect(res.headers.get("access-control-allow-origin")).not.toBe(
+      crossOrigin,
+    );
+    expect(res.headers.get("access-control-allow-credentials")).toBeNull();
+  });
+
+  it("FIX 3: unauthenticated remote GET / serves the login page when an auth token is required", async () => {
+    process.env.SANCTUARY_STORAGE_PATH = tempDir;
+    process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN = "test-token-remote-login";
+
+    // Remote (non-loopback) bind: loopback auto-auth is OFF, so an
+    // unauthenticated browser at the root URL must get the login box, not a
+    // data-less shell.
+    const result = await startDashboardOnFreePort({
+      passphrase: "test-passphrase-remote-login",
+      host: "0.0.0.0",
+      allowPlaintextRemote: true,
+    });
+    dashboard = result.dashboard;
+
+    const base = `http://127.0.0.1:${result.port}`;
+
+    // No bearer => login page (offers a token box), NOT the empty concierge
+    // shell. Default-flip preserves the remote-login affordance for `/`.
+    const noAuth = await fetch(`${base}/`);
+    expect(noAuth.status).toBe(200);
+    const noAuthBody = await noAuth.text();
+    expect(noAuthBody).toMatch(/Auth Token/);
+    expect(noAuthBody).toMatch(/Session tokens expire/);
+    // S2 (2026-07-18): the posture page identity is "Security Posture" (copy
+    // rule; renamed off the retired term). The login page is not that shell.
+    expect(noAuthBody).not.toContain("Security Posture");
+
+    // The v1.1 SPA aliases get the same login affordance.
+    const aliasNoAuth = await fetch(`${base}/dashboard`);
+    expect(aliasNoAuth.status).toBe(200);
+    expect(await aliasNoAuth.text()).toMatch(/Auth Token/);
+
+    // With a valid bearer token, the SAME root path serves the v1.1 concierge
+    // (the single default surface) - auth is not weakened, the login box is
+    // just the unauthenticated entry point. Default-flip: `/` is the concierge,
+    // NOT the separate posture shell (which is preserved at /posture).
+    const authed = await fetch(`${base}/`, {
+      headers: { Authorization: "Bearer test-token-remote-login" },
+    });
+    expect(authed.status).toBe(200);
+    const authedBody = await authed.text();
+    expect(authedBody).toContain('id="main"');
+    // S2: the v1.1 concierge surface is not the posture shell.
+    expect(authedBody).not.toContain("Security Posture");
+    expect(authedBody).not.toMatch(/Session tokens expire/);
+
+    // SECURITY: the data routes still require the token regardless of the
+    // login affordance - an unauthenticated posture read is 401, not data.
+    const dataNoAuth = await fetch(`${base}/api/posture/home`);
+    expect(dataNoAuth.status).toBe(401);
+  });
+
+  it("FIX 3 (loopback): an auto-auth loopback GET / serves the v1.1 concierge (default surface), not the login page", async () => {
+    // Seed an identity so standalone enables loopback auto-auth.
+    process.env.SANCTUARY_STORAGE_PATH = tempDir;
+    process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN = "test-token-loopback-shell";
+
+    const seed = await startDashboardOnFreePort({
+      passphrase: "loopback-shell-passphrase",
+      host: "127.0.0.1",
+    });
+
+    const { IdentityManager } = await import("../src/cognitive/tools.js");
+    const { FilesystemStorage } = await import("../src/storage/filesystem.js");
+    const { derivePurposeKey } = await import("../src/core/key-derivation.js");
+    const { createIdentity } = await import("../src/core/identity.js");
+    const { establishMaster } = await import("../src/core/master-custody.js");
+    const storage = new FilesystemStorage(`${tempDir}/state`);
+    const { masterKey: mk } = await establishMaster({
+      storage,
+      passphrase: "loopback-shell-passphrase",
+    });
+    const idEncKey = derivePurposeKey(mk, "identity-encryption");
+    const idMgr = new IdentityManager(storage, mk);
+    await idMgr.load();
+    const { storedIdentity } = createIdentity(
+      "loopback-shell-identity",
+      idEncKey,
+      "passphrase",
+    );
+    await idMgr.save(storedIdentity);
+    await seed.dashboard.stop();
+
+    const result = await startDashboardOnFreePort({
+      passphrase: "loopback-shell-passphrase",
+      host: "127.0.0.1",
+    });
+    dashboard = result.dashboard;
+
+    // Loopback auto-auth => the v1.1 concierge (default surface), never the
+    // login page. Default-flip: `/` serves the concierge, NOT the posture shell
+    // (the posture board is preserved at /posture and folded into the concierge).
+    const res = await fetch(`http://127.0.0.1:${result.port}/`);
+    expect(res.status).toBe(200);
+    const body = await res.text();
+    expect(body).toContain('id="main"');
+    // S2: the v1.1 concierge surface is not the posture shell.
+    expect(body).not.toContain("Security Posture");
+    expect(body).not.toMatch(/Auth Token/);
+    expect(body).not.toMatch(/Session tokens expire/);
+
+    // The posture board is preserved at /posture (frozen surface).
+    const postureRes = await fetch(`http://127.0.0.1:${result.port}/posture`);
+    expect(postureRes.status).toBe(200);
+    // S2: the posture page identity is "Security Posture" (renamed off the
+    // retired term, which must never appear on screen).
+    expect(await postureRes.text()).toContain("Security Posture");
   });
 });

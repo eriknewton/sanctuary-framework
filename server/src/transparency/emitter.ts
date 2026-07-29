@@ -167,9 +167,39 @@ export async function emitEnforcementCheckpoint(
   );
   try {
     return await withEmitLock(input.storage, async () => {
-      // 1. Verified audit-chain view. Strict mode: AuditIntegrityError on a
-      //    chain that does not verify — never checkpoint a tampered log.
-      const chain = await input.auditLog.verifiedChainView();
+      // 1. Verified audit-chain view, STREAMED. Strict mode: AuditIntegrityError
+      //    on a chain that does not verify — never checkpoint a tampered log.
+      //    We fold the Merkle leaf hashes, the covered sequence range, the head
+      //    hash, and the per-rule enforcement counters incrementally so the full
+      //    decrypted chain is never simultaneously resident (the daemon-OOM-on-a-
+      //    large-log fix); only the cheap entry-hash leaves accumulate, which the
+      //    Merkle root structurally requires. `reset` discards a torn-read pass
+      //    that the audit log's read-consistency loop abandons, so these folds
+      //    reflect exactly the single accepted verified pass.
+      let entryHashes: string[] = [];
+      let lowestSequence: number | null = null;
+      let highestSequence = 0;
+      let headHash = "GENESIS";
+      let entryCount = 0;
+      let enforcementAcc = newEnforcementAccumulator();
+      await input.auditLog.streamVerifiedChain({
+        onEntry: (item) => {
+          entryHashes.push(item.entry_hash);
+          if (lowestSequence === null) lowestSequence = item.sequence;
+          highestSequence = item.sequence;
+          headHash = item.entry_hash;
+          entryCount++;
+          accumulateEnforcement(enforcementAcc, input.fortressId, item.entry);
+        },
+        reset: () => {
+          entryHashes = [];
+          lowestSequence = null;
+          highestSequence = 0;
+          headHash = "GENESIS";
+          entryCount = 0;
+          enforcementAcc = newEnforcementAccumulator();
+        },
+      });
 
       // 2. Policy posture (hashes + counts only).
       const policy = await readPolicyPosture(input.fortressPath);
@@ -214,18 +244,15 @@ export async function emitEnforcementCheckpoint(
         issued_at: (input.now?.() ?? new Date()).toISOString(),
         fortress_id: input.fortressId,
         audit: {
-          merkle_root: computeAuditRoot(chain.map((item) => item.entry_hash)),
-          lowest_sequence: chain[0]?.sequence ?? 0,
-          highest_sequence: chain.at(-1)?.sequence ?? 0,
-          head_hash: chain.at(-1)?.entry_hash ?? "GENESIS",
-          entry_count: chain.length,
+          merkle_root: computeAuditRoot(entryHashes),
+          lowest_sequence: lowestSequence ?? 0,
+          highest_sequence: highestSequence,
+          head_hash: headHash,
+          entry_count: entryCount,
         },
         policy,
         daemon,
-        enforcement: countEnforcement(
-          input.fortressId,
-          chain.map((item) => item.entry)
-        ),
+        enforcement: finalizeEnforcement(enforcementAcc),
       };
 
       // 6. Sign, then independently verify the returned signature before
@@ -275,38 +302,50 @@ export async function emitEnforcementCheckpoint(
   }
 }
 
-/** Count enforcement events over the covered (decrypted) entries. */
-function countEnforcement(
+/**
+ * Incremental enforcement accumulator. Lets the emitter fold the per-rule
+ * allow/block counters one streamed audit entry at a time, so the full
+ * decrypted chain never has to be materialized to count (the bounded-memory
+ * Merkle/emit path). The finalized result is byte-identical to the previous
+ * batch `countEnforcement` over the same ordered entry set.
+ */
+interface EnforcementAccumulator {
+  totalAllowed: number;
+  totalBlocked: number;
+  byLabel: Map<string, { allowed: number; blocked: number }>;
+}
+
+function newEnforcementAccumulator(): EnforcementAccumulator {
+  return { totalAllowed: 0, totalBlocked: 0, byLabel: new Map() };
+}
+
+function accumulateEnforcement(
+  acc: EnforcementAccumulator,
   fortressId: string,
-  entries: ReadonlyArray<{
-    operation: string;
-    details?: Record<string, unknown>;
-  }>
-): CheckpointEnforcement {
-  let totalAllowed = 0;
-  let totalBlocked = 0;
-  const byLabel = new Map<string, { allowed: number; blocked: number }>();
-  for (const entry of entries) {
-    const kind =
-      entry.operation === "egress_allowed"
-        ? "allowed"
-        : entry.operation === "egress_blocked"
-          ? "blocked"
-          : null;
-    if (!kind) continue;
-    if (kind === "allowed") totalAllowed++;
-    else totalBlocked++;
-    const ruleId = entry.details?.rule_id;
-    if (typeof ruleId !== "string" || ruleId.length === 0) continue;
-    const label = transparencyRuleLabel(fortressId, ruleId);
-    const bucket = byLabel.get(label) ?? { allowed: 0, blocked: 0 };
-    bucket[kind]++;
-    byLabel.set(label, bucket);
-  }
-  const rules: CheckpointRuleCounter[] = [...byLabel.entries()]
+  entry: { operation: string; details?: Record<string, unknown> }
+): void {
+  const kind =
+    entry.operation === "egress_allowed"
+      ? "allowed"
+      : entry.operation === "egress_blocked"
+        ? "blocked"
+        : null;
+  if (!kind) return;
+  if (kind === "allowed") acc.totalAllowed++;
+  else acc.totalBlocked++;
+  const ruleId = entry.details?.rule_id;
+  if (typeof ruleId !== "string" || ruleId.length === 0) return;
+  const label = transparencyRuleLabel(fortressId, ruleId);
+  const bucket = acc.byLabel.get(label) ?? { allowed: 0, blocked: 0 };
+  bucket[kind]++;
+  acc.byLabel.set(label, bucket);
+}
+
+function finalizeEnforcement(acc: EnforcementAccumulator): CheckpointEnforcement {
+  const rules: CheckpointRuleCounter[] = [...acc.byLabel.entries()]
     .map(([rule_label, counts]) => ({ rule_label, ...counts }))
     .sort((a, b) => a.rule_label.localeCompare(b.rule_label));
-  return { total_allowed: totalAllowed, total_blocked: totalBlocked, rules };
+  return { total_allowed: acc.totalAllowed, total_blocked: acc.totalBlocked, rules };
 }
 
 /**

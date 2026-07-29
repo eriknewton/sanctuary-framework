@@ -27,11 +27,21 @@ import { getProcessInstance, getProcessSince } from "./process-identity.js";
 import { logCaughtError } from "../http/error-envelope.js";
 import { renderPostureHomeHTML } from "../principal-policy/posture-home-html.js";
 import {
+  renderMobileCompanionHTML,
+  MOBILE_COMPANION_WEBMANIFEST,
+  MOBILE_COMPANION_SERVICE_WORKER_JS,
+  MOBILE_COMPANION_CSP,
+  MOBILE_COMPANION_ROUTE_PREFIX,
+} from "./mobile.js";
+import {
   handlePostureRoute,
   POSTURE_AGENT_PATH_PREFIX,
   POSTURE_API_PREFIX,
+  POSTURE_EVIDENCE_PATH,
   POSTURE_HOME_PATH,
 } from "../principal-policy/posture-routes.js";
+import { absentFleetRoster } from "../principal-policy/fleet-roster.js";
+import type { FleetRoster } from "../principal-policy/fleet-roster.js";
 
 export { constantTimeEquals };
 
@@ -101,6 +111,30 @@ export interface APIDeps {
    * "unwired", never "n/a".) NEVER exposed on `/api/health`.
    */
   supervisorStatus?: () => "wired" | "unwired" | "n/a";
+  /**
+   * Read-only fleet-roster provider for the wrap ("Protect") dashboard's
+   * fleet-roster panel. Returns the presenter output of `buildFleetRoster` over
+   * this process's federation read-seam. Wired by the wrap CLI to a REAL,
+   * disk-backed provider (`buildWrapFleetRosterProvider`) that reads the at-rest
+   * fortress records; MAY be async because the wrap process runs no live
+   * federation daemon and resolves the roster by reading disk per request.
+   *
+   * The SAME provider feeds two consumers on this server: the standalone-parity
+   * `GET /api/fleet/roster` route AND the posture-route `GET /api/posture/fleet`
+   * that the already-served posture-home fleet panel fetches. Passing one
+   * provider to both keeps a single source of truth (no second trust path).
+   *
+   * Strictly read-only: there is no admit/revoke/rotate route here (those are a
+   * later, deliberately separate slice), so the panel SEES and monitors the
+   * fleet, it never manages trust. No key material crosses this seam - the
+   * roster shape carries only public identifiers and posture metadata.
+   *
+   * When omitted (the common single-machine wrap install with no federation
+   * wired), the route serves `absentFleetRoster()` - the honest "no fleet
+   * configured" shape - never a fabricated roster or a greyed-green "all
+   * admitted" shell. It must report REAL federation state, never a guess.
+   */
+  fleetRoster?: () => FleetRoster | Promise<FleetRoster>;
 }
 
 export interface DashboardSession {
@@ -154,7 +188,7 @@ export function isAuthorized(deps: APIDeps, req: IncomingMessage, url: URL): boo
 }
 
 function isAuthorizedWithBearerToken(deps: APIDeps, req: IncomingMessage, url: URL): boolean {
-  if (!deps.authToken) return true;
+  if (!deps.authToken) return false;
   const token = extractToken(req, url);
   return token !== null && constantTimeEquals(token, deps.authToken);
 }
@@ -198,10 +232,17 @@ function generateEphemeralKey(): Uint8Array {
   return new Uint8Array(randomBytes(32));
 }
 
-function writeText(res: ServerResponse, status: number, body: string, contentType = "text/plain"): void {
+function writeText(
+  res: ServerResponse,
+  status: number,
+  body: string,
+  contentType = "text/plain",
+  extraHeaders?: Record<string, string>,
+): void {
   res.writeHead(status, {
     "Content-Type": contentType,
     "Cache-Control": "no-store",
+    ...(extraHeaders ?? {}),
   });
   res.end(body);
 }
@@ -220,11 +261,19 @@ export async function handleRequest(
   const method = (req.method ?? "GET").toUpperCase();
   const path = url.pathname;
 
-  // ── Posture board shell (3-to-1 fold, minimal Stack A retirement) ───
-  // The co-located wrap server serves the same posture shell at `/` and
-  // `/posture`, while keeping `/api/status` decision_capable false below so
-  // the approval area stays read-only on this process.
-  if (method === "GET" && (path === "/" || path === POSTURE_HOME_PATH)) {
+  // ── Posture board shell (folded INTO the concierge default) ─────────
+  // Default-flip (2026-06-30): `/` now serves the v1.1 concierge as the single
+  // default surface (handled by the v1.1 dispatch below), and the posture board
+  // is preserved at `/posture` AND folded into the concierge (the seal expands
+  // to full posture detail; a Posture entry lives in the Verify group). This
+  // block now owns ONLY `/posture`. `/api/status` keeps decision_capable false
+  // below so the approval area stays read-only on this process.
+  //
+  // NOTE: `/posture` keeps its prior read-auth gate in this router (unchanged
+  // by the default-flip). `/` falls through to the v1.1 dispatch, which serves
+  // the concierge SPA tokenless and runs its own client-side auth dance,
+  // exactly as `/dashboard` and `/v1.1` already do.
+  if (method === "GET" && path === POSTURE_HOME_PATH) {
     if (!isAuthorizedForRead(deps, req, url)) {
       writeJSON(res, 401, { error: "unauthorized" });
       return true;
@@ -233,9 +282,41 @@ export async function handleRequest(
     return true;
   }
 
+  // ── Mobile companion (PWA) -- slice 1: phone-as-approval ─────────────
+  // Served TOKENLESS, exactly like the v1.1 concierge SPA: the shell carries
+  // NO operator data and runs its own client-side auth (the operator's token
+  // is sent only as a bearer header to the EXISTING gated /api routes -- see
+  // ./mobile.ts for the full security posture). The service worker is
+  // scope-limited to /m/ and never caches /api traffic.
+  if (
+    method === "GET" &&
+    (path === MOBILE_COMPANION_ROUTE_PREFIX || path === `${MOBILE_COMPANION_ROUTE_PREFIX}/`)
+  ) {
+    writeText(res, 200, renderMobileCompanionHTML(), "text/html; charset=utf-8", {
+      "Content-Security-Policy": MOBILE_COMPANION_CSP,
+      "X-Content-Type-Options": "nosniff",
+      "Referrer-Policy": "no-referrer",
+    });
+    return true;
+  }
+  if (method === "GET" && path === `${MOBILE_COMPANION_ROUTE_PREFIX}/manifest.webmanifest`) {
+    writeText(res, 200, MOBILE_COMPANION_WEBMANIFEST, "application/manifest+json; charset=utf-8", {
+      "X-Content-Type-Options": "nosniff",
+    });
+    return true;
+  }
+  if (method === "GET" && path === `${MOBILE_COMPANION_ROUTE_PREFIX}/sw.js`) {
+    writeText(res, 200, MOBILE_COMPANION_SERVICE_WORKER_JS, "text/javascript; charset=utf-8", {
+      "X-Content-Type-Options": "nosniff",
+      "Service-Worker-Allowed": "/m/",
+    });
+    return true;
+  }
+
   if (
     path === POSTURE_API_PREFIX ||
     path.startsWith(`${POSTURE_API_PREFIX}/`) ||
+    path === POSTURE_EVIDENCE_PATH ||
     path.startsWith(POSTURE_AGENT_PATH_PREFIX)
   ) {
     if (!isAuthorizedForRead(deps, req, url)) {
@@ -255,6 +336,15 @@ export async function handleRequest(
           deps.sources.resolveBrokerPinnedProducerKey,
         brokerProducerKeyExpectedButUnavailable:
           deps.sources.brokerProducerKeyExpectedButUnavailable === true,
+        resolveProtectionClaimSubject:
+          deps.sources.resolveProtectionClaimSubject,
+        // Fleet Console: pass the SAME read-only fleet-roster provider the
+        // `/api/fleet/roster` route uses to the posture routes, so the already-
+        // served posture-home fleet panel (`GET /api/posture/fleet`) lights up
+        // on this wrap dashboard instead of 404ing. One provider, one trust
+        // path. Absent -> the posture route 404s and the panel stays hidden
+        // (honest "no fleet"), exactly as on an unfederated fortress.
+        ...(deps.fleetRoster ? { fleetRoster: deps.fleetRoster } : {}),
       },
       req,
       res,
@@ -296,7 +386,9 @@ export async function handleRequest(
 
   // ── v1.1 dispatch (v1.1.2 hotfix, Finding V) ────────────────────────
   // Try v1.1 compatibility routes first when bindings are set. Mounted at
-  // /dashboard + /v1.1 (HTML) and /api/hub/* (API); `/` is the posture
+  // /dashboard + /v1.1 (HTML) and /api/hub/* (API). After the default-flip
+  // (2026-06-30) `/` falls THROUGH to this dispatch and is served by the
+  // v1.1 concierge as the single default surface; `/posture` is the posture
   // shell handled above.
   //
   // Auth gating is intentionally inside the shared helper so the v1.1
@@ -316,6 +408,29 @@ export async function handleRequest(
       method,
     );
     if (handled) return true;
+  }
+
+  // ── `/` posture-shell fallback when v1.1 bindings are absent ─────────
+  // Default-flip (2026-06-30): `/` normally serves the v1.1 concierge via the
+  // dispatch above. But that dispatch is gated on `deps.v11Bindings`, which is
+  // null in two reachable windows: (a) the startup race between listen() and
+  // setV11Bindings(), and (b) the permanent degraded path where buildV11Bindings
+  // throws and setV11Bindings is therefore never called (wrap/cli.ts swallows the
+  // throw and prints a note). Without this fallback `/` would skip both the
+  // posture block above (now `/posture`-only) and the v1.1 dispatch, fall through
+  // to `return false`, and 404 - a regression from the pre-flip behavior where
+  // `/` always served the posture shell. This mirrors the principal-policy
+  // router's `isRootServedAsShell` fallback (principal-policy/dashboard.ts): when
+  // there is no concierge to fall through to, `/` keeps serving the posture board
+  // shell as the honest degraded surface rather than 404ing. Same read-auth gate
+  // the posture block above and the pre-flip `/` used.
+  if (method === "GET" && path === "/" && !deps.v11Bindings) {
+    if (!isAuthorizedForRead(deps, req, url)) {
+      writeJSON(res, 401, { error: "unauthorized" });
+      return true;
+    }
+    writeText(res, 200, renderPostureHomeHTML(), "text/html; charset=utf-8");
+    return true;
   }
 
   // ── Health (unauthenticated liveness only) ───────────────────────────
@@ -369,7 +484,10 @@ export async function handleRequest(
 
   // ── Auth (all routes) ───────────────────────────────────────────────
   const isFoldedReadAuxiliary =
-    method === "GET" && (path === "/api/status" || path === "/api/pending");
+    method === "GET" &&
+    (path === "/api/status" ||
+      path === "/api/pending" ||
+      path === "/api/stream");
   const authorized = isFoldedReadAuxiliary
     ? isAuthorizedForRead(deps, req, url)
     : isAuthorized(deps, req, url);
@@ -416,17 +534,38 @@ export async function handleRequest(
     return true;
   }
 
+  // ── Fleet roster (read-only; SEE-not-manage) ────────────────────────
+  // The wrap ("Protect") dashboard's fleet-roster panel. This is the auth-gated
+  // (the shared gate above already ran and 401'd an unauthenticated caller
+  // before reaching here), STRICTLY read-only view of the fleet: it SEES and
+  // monitors the machines the federation layer knows, and never manages trust
+  // (there is no admit/revoke/rotate route here - that is a later slice). It
+  // carries no key material.
+  //
+  // When no federation read-seam is wired on this process (the common
+  // single-machine install), it serves the honest `absentFleetRoster()` shape -
+  // `available: false`, empty nodes, all-zero summaries - never a fabricated
+  // roster or a greyed-green "all admitted" shell over a fortress with no fleet.
+  if (method === "GET" && path === "/api/fleet/roster") {
+    const roster = deps.fleetRoster
+      ? await deps.fleetRoster()
+      : absentFleetRoster();
+    writeJSON(res, 200, roster);
+    return true;
+  }
+
   // ── Legacy v1.0 HTML (preserved at /v1.0) ───────────────────────────
-  // v1.1.7: root serves the posture shell above; /dashboard and /v1.1
-  // remain compatibility aliases via dispatchV11. The legacy four-panel
-  // dashboard moved to /v1.0 so operators who explicitly want the prior
-  // surface can reach it; /index.html alias preserved on the legacy path.
+  // Default-flip: root serves the v1.1 concierge (via dispatchV11 above);
+  // /dashboard and /v1.1 remain compatibility aliases; /posture serves the
+  // posture shell above. The legacy four-panel dashboard moved to /v1.0 so
+  // operators who explicitly want the prior surface can reach it; /index.html
+  // alias preserved on the legacy path.
   if (
     method === "GET" &&
     (path === "/v1.0" || path === "/v1.0/" || path === "/v1.0/index.html")
   ) {
     const snapshot = await getProtectionSnapshot(deps.sources);
-    const html = renderDashboardHTML({ snapshot, authToken: deps.authToken });
+    const html = renderDashboardHTML({ snapshot });
     writeText(res, 200, html, "text/html; charset=utf-8");
     return true;
   }
@@ -510,8 +649,21 @@ export async function handleRequest(
   }
 
   // ── Template init (POST) ───────────────────────────────────────────
+  // SECURITY (templates-init-operator-bearer): template init AUTHORS and
+  // Ed25519-SIGNS a governance policy event for an agent, a custody-class
+  // mutation, the same trust level as an approval decision. It MUST require
+  // the operator bearer token (fail-closed: no token configured => reject),
+  // matching the `/api/approvals/:id/:action` gate above. The shared
+  // `isAuthorized` gate at the top of this handler fail-OPENS when no token
+  // is configured and honors loopback auto-auth, neither of which is
+  // acceptable for a mutation: a co-resident wrapped agent shares loopback
+  // with the operator, so loopback origin is NOT operator identity.
   const initMatch = /^\/api\/templates\/([^/]+)\/init$/.exec(path);
   if (method === "POST" && initMatch) {
+    if (!isAuthorizedWithBearerToken(deps, req, url)) {
+      writeJSON(res, 401, { error: "unauthorized" });
+      return true;
+    }
     const name = decodeURIComponent(initMatch[1]!);
     try {
       // Validate template exists

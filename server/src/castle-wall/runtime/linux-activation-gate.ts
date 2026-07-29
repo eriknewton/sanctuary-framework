@@ -25,10 +25,10 @@
  *
  * # Drill-acceptance caveat (never overclaim)
  *
- * Activating this gate wires the close end-to-end IN CODE on Linux. The external
- * capability claim ("the fake-arm hole is closed in prod on Linux") still
- * requires a CAPTURED DRILL on real Linux hardware. Until then the honest status
- * is "test/smoke-passed, drill-acceptance pending."
+ * Activating this gate wires only the producer-signed binding/activation half.
+ * Linux still lacks the manifest-publication half that stamps `agent_origin`, so
+ * no Linux capability claim is made here. The claim is unavailable until that
+ * half exists and a CAPTURED DRILL on real Linux hardware passes.
  */
 
 import { startCastleWall, type CastleWallLifecycleHandle } from "./lifecycle.js";
@@ -50,6 +50,7 @@ import {
   type LinuxAuditDrainOptions,
 } from "./linux-audit-drain.js";
 import { loadFortressProducerKey } from "./producer-signature.js";
+import { CASTLE_WALL_EVIDENCE_BASIS_DRAIN_FAULT_UNSIGNED } from "../constants.js";
 import { RuntimeLinuxActivationError } from "./errors.js";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -270,7 +271,9 @@ export async function activateLinuxProducerSignedCastleWall(
   // not-armed. (`unreadable` already throws below via `startCastleWall`; this adds
   // the missing `absent` case so all three loads are handled honestly:
   // present→enforce, unreadable→throw, absent→throw - none silently channel.)
-  const keyLoad = await loadFortressProducerKey(input.fortressStoragePath);
+  const keyLoad = await loadFortressProducerKey(input.fortressStoragePath, {
+    platform: "linux",
+  });
   if (keyLoad.status !== "present") {
     const reason: RuntimeLinuxActivationError["reason"] =
       keyLoad.status === "absent"
@@ -309,6 +312,7 @@ export async function activateLinuxProducerSignedCastleWall(
       key: input.key,
       auditSink: input.auditSink,
       fortressStoragePath: input.fortressStoragePath,
+      producerKeyLoadOptions: { platform: "linux" },
     });
   } catch (err) {
     // Best-effort close the transport we opened before failing closed.
@@ -380,7 +384,12 @@ export async function activateLinuxProducerSignedCastleWall(
           input.fortressId,
           {
             reason: err.message,
-            evidence_basis: "producer_signed",
+            // HONESTY: this is a consumer-emitted NOT-ARMED fault signal, NOT
+            // accepted enforcement evidence, and it carries NO producer
+            // signature - so it must never claim the `producer_signed` basis.
+            // Read-side attributors already fail-closed-reject a record without
+            // a verified producer signature; the honest label matches that.
+            evidence_basis: CASTLE_WALL_EVIDENCE_BASIS_DRAIN_FAULT_UNSIGNED,
             armed: false,
             note: "drain transport/persistence fault - wall is NOT armed (signed enforcement evidence is not reaching the consumer)",
           },

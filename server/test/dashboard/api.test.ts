@@ -58,8 +58,9 @@ describe("Dashboard HTTP API", () => {
 
   it("serves the legacy hero HTML at /v1.0 (v1.1.7 path-flip)", async () => {
     // v1.1.7: legacy four-panel hero dashboard moved from `/` to `/v1.0`.
-    // Root serves the posture shell; /dashboard and /v1.1 are v1.1 SPA
-    // compatibility aliases when production wiring provides v11Bindings. This
+    // Default-flip (2026-06-30): root serves the v1.1 concierge (the single
+    // default surface) when production wiring provides v11Bindings; /posture
+    // serves the posture board; /dashboard and /v1.1 are v1.1 SPA aliases. This
     // rig boots without v11Bindings, so legacy serves at the new /v1.0 URL.
     handle = await startForTest();
     const res = await fetch(`${handle.url}/v1.0`);
@@ -116,9 +117,18 @@ describe("Dashboard HTTP API", () => {
     expect(res.status).toBe(401);
   });
 
-  it("rejects approve/deny when no approval handler is configured", async () => {
+  it("rejects approve/deny when no operator token is configured", async () => {
     handle = await startForTest();
     const res = await fetch(`${handle.url}/api/approvals/abc/allow`, { method: "POST" });
+    expect(res.status).toBe(401);
+  });
+
+  it("rejects approve/deny when no approval handler is configured", async () => {
+    handle = await startForTest({ authToken: "secret-xyz" });
+    const res = await fetch(`${handle.url}/api/approvals/abc/allow`, {
+      method: "POST",
+      headers: { Authorization: "Bearer secret-xyz" },
+    });
     expect(res.status).toBe(503);
   });
 
@@ -126,13 +136,21 @@ describe("Dashboard HTTP API", () => {
     const allowed: string[] = [];
     const denied: string[] = [];
     handle = await startForTest({
+      authToken: "secret-xyz",
       approvals: {
         allow: async (id: string) => { allowed.push(id); return true; },
         deny: async (id: string) => { denied.push(id); return true; },
       },
     });
-    const a = await fetch(`${handle.url}/api/approvals/abc/allow`, { method: "POST" });
-    const d = await fetch(`${handle.url}/api/approvals/xyz/deny`, { method: "POST" });
+    const auth = { Authorization: "Bearer secret-xyz" };
+    const a = await fetch(`${handle.url}/api/approvals/abc/allow`, {
+      method: "POST",
+      headers: auth,
+    });
+    const d = await fetch(`${handle.url}/api/approvals/xyz/deny`, {
+      method: "POST",
+      headers: auth,
+    });
     expect(a.status).toBe(200);
     expect(d.status).toBe(200);
     expect(allowed).toEqual(["abc"]);
@@ -304,6 +322,31 @@ describe("Dashboard HTTP API", () => {
     expect(res.status).toBe(404);
   });
 
+  it("serves the posture shell at / as the fallback when v1.1 bindings are absent", async () => {
+    // Default-flip (2026-06-30): `/` normally serves the v1.1 concierge via the
+    // v1.1 dispatch, but that dispatch is gated on v11Bindings. This rig boots
+    // WITHOUT v11Bindings (the degraded/startup-race window). `/` must keep
+    // serving the posture board shell as the honest fallback, mirroring the
+    // principal-policy router's isRootServedAsShell fallback - NOT 404 (the
+    // regression this asserts against).
+    handle = await startForTest();
+    const res = await fetch(`${handle.url}/`);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    // S2 (2026-07-18): posture page identity renamed off the internal
+    // "sovereignty" term to a user-facing "Security Posture" per the
+    // 2026-06-21 copy rule (sovereignty never on screen).
+    expect(html).toContain("Sanctuary - Security Posture");
+  });
+
+  it("401s / fallback shell when an operator token is required and missing", async () => {
+    // The no-bindings `/` fallback honors the same read-auth gate the pre-flip
+    // `/` and `/posture` use: when a token is required and absent, it 401s.
+    handle = await startForTest({ authToken: "secret-xyz" });
+    const res = await fetch(`${handle.url}/`);
+    expect(res.status).toBe(401);
+  });
+
   // ERROR-DETAIL-001: completes the #604 error-envelope sweep. The legacy
   // dashboard 500-paths used to serialize `(err as Error).message` to the
   // client. The fix keeps the specific public error code but emits no
@@ -313,6 +356,7 @@ describe("Dashboard HTTP API", () => {
     const leakyMessage =
       "ENOENT: /Users/eriknewton/secret/path/.sanctuary/state at innerHandler";
     handle = await startForTest({
+      authToken: "secret-xyz",
       approvals: {
         allow: async () => {
           throw new Error(leakyMessage);
@@ -322,6 +366,7 @@ describe("Dashboard HTTP API", () => {
     });
     const res = await fetch(`${handle.url}/api/approvals/abc/allow`, {
       method: "POST",
+      headers: { Authorization: "Bearer secret-xyz" },
     });
     expect(res.status).toBe(500);
     const raw = await res.text();

@@ -61,9 +61,38 @@ public enum AllowlistEvaluator {
             return .allow(matchedRuleId: baselineRuleId(flow: flow, operatorBaseline: operatorBaseline))
         }
 
+        // HIGH-1 hardening (confined-agent egress design 2026-07-10,
+        // adversarial-review must-fix, then PR-905-review BLOCKER fix): when a
+        // flow is `.unattributed` it is the FAIL-CLOSED bucket and must NEVER
+        // earn an allow-disposition match, UNLESS we POSITIVELY know we are in
+        // NAT mode (where `.unattributed` flows are common unsigned
+        // operator-software and the documented NAT rationale keeps the allow).
+        // Publishing unscoped agent allow rules (the egress provisioning
+        // build) would otherwise invert this bucket to fail-OPEN for
+        // exfil-capable hosts -- any flow whose audit token fails to decode
+        // would inherit the agent's grants.
+        //
+        // The predicate is `agentOrigin?.mode != .nat`, NOT `== .uid`: the
+        // `== .uid` form failed OPEN when `agentOrigin == nil` (nil?.mode is
+        // nil, nil != .uid), and a nil descriptor is REACHABLE -- provisioned
+        // allow rules and the origin descriptor install non-atomically (the
+        // rules go live via `store.update` before `installAgentOriginIfPresent`
+        // runs), so on every manifest apply / recovery there is a window where
+        // allow rules are live while the engine's retained `_agentOrigin` is
+        // still nil (FlowEvaluatorEngine). The `!= .nat` form suppresses for
+        // the nil-descriptor AND uid-mode cases (both fail closed) and keeps
+        // the allow ONLY for a positively-resolved NAT mode. The install
+        // ordering is ALSO reordered (installAgentOriginIfPresent BEFORE
+        // store.update) to close the window structurally as defense in depth;
+        // this predicate is the invariant that holds regardless of ordering.
+        // Deny rules keep applying and prompt rules keep surfacing for
+        // operator decision; the bucket simply stops benefiting from allows.
+        // No wire or schema change.
+        let suppressAllowMatches = origin == .unattributed && agentOrigin?.mode != .nat
+
         // `.agent` and `.unattributed` route to the unchanged default-deny +
         // allowlist evaluation. Default-deny on no match is preserved.
-        return evaluate(flow: flow, rules: rules)
+        return evaluate(flow: flow, rules: rules, suppressAllowMatches: suppressAllowMatches)
     }
 
     static func baselineRuleId(
@@ -76,6 +105,14 @@ public enum AllowlistEvaluator {
         return operatorBaselineUidRuleId
     }
 
+    /// INVARIANT (harden against future refactors): `operator_baseline.essentials`
+    /// is consulted ONLY to LABEL the matched-rule id AFTER a flow has already
+    /// been positively classified `.operator` and taken the allow fast-path
+    /// (see `evaluate`); it never itself grants egress. So a null-collapsed
+    /// sub-field of a multi-axis essential can only broaden which OPERATOR flow
+    /// gets which label, never widen agent-facing egress. If a refactor ever
+    /// makes `matchingEssential` reachable for a non-`.operator` flow, its
+    /// fields must be schema-validated at the signed-manifest chokepoint too.
     static func matchingEssential(
         flow: FilterFlowDescriptor,
         operatorBaseline: OperatorBaselineWire?
@@ -97,9 +134,16 @@ public enum AllowlistEvaluator {
     }
 
     /// Evaluate a flow against the current manifest snapshot.
+    ///
+    /// `suppressAllowMatches` (HIGH-1 hardening, default `false` so every
+    /// existing caller is unchanged): when `true`, allow-disposition rules
+    /// never match-through -- deny rules keep applying, prompt rules keep
+    /// surfacing, and the default-deny floor is preserved. Set ONLY for
+    /// uid-mode `.unattributed` flows by the origin-gated overload above.
     public static func evaluate(
         flow: FilterFlowDescriptor,
-        rules: [ManifestRule]
+        rules: [ManifestRule],
+        suppressAllowMatches: Bool = false
     ) -> EvaluationOutcome {
         var firstAllow: ManifestRule?
         var firstPrompt: ManifestRule?
@@ -109,7 +153,7 @@ public enum AllowlistEvaluator {
             case "deny":
                 return .drop(matchedRuleId: rule.id)
             case "allow":
-                if firstAllow == nil { firstAllow = rule }
+                if !suppressAllowMatches, firstAllow == nil { firstAllow = rule }
             case "prompt":
                 if firstPrompt == nil { firstPrompt = rule }
             default:
@@ -127,6 +171,14 @@ public enum AllowlistEvaluator {
     }
 
     /// True when the rule's match conditions and scope both apply to the flow.
+    ///
+    /// NOTE (S5-0 HIGH-5): this evaluator does NOT read `rule.timeWindow` -- it
+    /// enforces no time bound. Because ignoring a time bound would WIDEN a
+    /// windowed allow to an all-time allow, `SignedManifestVerifier.validateSignedRule`
+    /// rejects any signed rule carrying `time_window` fail-closed (mirroring the
+    /// Linux daemon). If time-window enforcement is EVER wired in here, that
+    /// reject gate MUST be removed (so macOS stops rejecting an axis it now
+    /// supports) and a `time_window` enforcement parity row added.
     public static func matches(rule: ManifestRule, flow: FilterFlowDescriptor) -> Bool {
         if !scopeMatches(scope: rule.scope, flow: flow) {
             return false
@@ -134,17 +186,26 @@ public enum AllowlistEvaluator {
         return matchClauseMatches(match: rule.match, flow: flow)
     }
 
-    /// Scope: agent_ids OR template_ids. Empty/nil on both means "all".
+    /// Scope: agent_ids OR template_ids OR uids. Empty/nil on all three means
+    /// "all". `uids` (S5-0, 2026-07-14 two-confined-uid extension) matches
+    /// directly against the flow's `sourceRuid` -- this is the axis that lets
+    /// an endpoint rule bind to the gate uid WITHOUT matching the agent uid
+    /// (or vice versa), the core separation the two-confined-uid capability
+    /// exists to provide.
     public static func scopeMatches(scope: ManifestRuleScope, flow: FilterFlowDescriptor) -> Bool {
         let hasAgents = scope.agentIds?.isEmpty == false
         let hasTemplates = scope.templateIds?.isEmpty == false
-        if !hasAgents && !hasTemplates {
+        let hasUids = scope.uids?.isEmpty == false
+        if !hasAgents && !hasTemplates && !hasUids {
             return true
         }
         if hasAgents, let agents = scope.agentIds, agents.contains(flow.agentId) {
             return true
         }
         if hasTemplates, let templates = scope.templateIds, templates.contains(flow.templateId) {
+            return true
+        }
+        if hasUids, let uids = scope.uids, uids.contains(flow.sourceRuid) {
             return true
         }
         return false

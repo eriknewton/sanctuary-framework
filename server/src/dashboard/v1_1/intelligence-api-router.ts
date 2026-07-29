@@ -31,6 +31,7 @@ import {
   SUBSTRATE_CHOICES,
   SURFACES,
   FRONTIER_PROVIDERS,
+  Tier2BindingPinnedError,
   type FallbackBehavior,
   type FrontierProvider,
   type HybridRoutingRules,
@@ -315,7 +316,23 @@ export async function handleIntelligenceRoute(
   }
 
   // Auth gate fires before any selector method runs.
-  const checkAuth = authMiddleware(deps.authConfig);
+  //
+  // SECURITY (#800 follow-on, operational mutations): the intelligence
+  // mutations (POST /reset, POST surface/all choice, POST preferences,
+  // POST per-surface choice/fallback, POST/DELETE credentials, POST
+  // hybrid-rules) change the model-routing substrate and write provider
+  // API keys. They must require the operator bearer even on loopback with
+  // `--auto-auth-localhost`, so a co-resident agent sharing the loopback
+  // interface cannot retarget its own model routing or plant/clear
+  // credentials tokenless. The GET reads (status / config) keep loopback
+  // auto-auth. `requireToken` only suppresses the loopback shortcut; token
+  // validation is unchanged. Fail-closed: with no token configured, a
+  // mutating request is rejected, never allowed.
+  const requiresOperatorBearer = method !== "GET";
+  const checkAuth = authMiddleware(
+    deps.authConfig,
+    requiresOperatorBearer ? { requireToken: true } : undefined,
+  );
   if (!checkAuth(req, res, url)) return true;
 
   try {
@@ -380,8 +397,19 @@ export async function handleIntelligenceRoute(
           );
         }
       }
-      await deps.selector.applyChoiceToAllSurfaces(body.substrate, { localModelPick });
-      writeJSON(res, 200, { ok: true, data: sanitizeConfig(deps.selector) });
+      const bulkResult = await deps.selector.applyChoiceToAllSurfaces(
+        body.substrate,
+        { localModelPick },
+      );
+      // Additive: surfaces the fan-out skipped because of a local-only
+      // pin (ratified 2026-07-23: privacy-filter-tier-2). Empty array
+      // when nothing was skipped, so the picker UI can show an explicit
+      // "not applied to N pinned surface(s)" note.
+      writeJSON(res, 200, {
+        ok: true,
+        data: sanitizeConfig(deps.selector),
+        skipped_pinned_surfaces: bulkResult.skippedPinnedSurfaces,
+      });
       return true;
     }
 
@@ -449,7 +477,17 @@ export async function handleIntelligenceRoute(
             );
           }
         }
-        await deps.selector.setPerSurfaceChoice(surface, body.substrate);
+        try {
+          await deps.selector.setPerSurfaceChoice(surface, body.substrate);
+        } catch (err) {
+          // Ratified 2026-07-23: the tier-2 surface is pinned local-only.
+          // Surface the refusal as a 409 with the posture-naming message
+          // rather than a generic 500.
+          if (err instanceof Tier2BindingPinnedError) {
+            throw new IntelligenceRouterError(409, err.code, err.message);
+          }
+          throw err;
+        }
         writeJSON(res, 200, { ok: true, data: sanitizeConfig(deps.selector) });
         return true;
       }

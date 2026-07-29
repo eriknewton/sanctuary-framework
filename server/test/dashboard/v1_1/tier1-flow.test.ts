@@ -70,4 +70,16 @@ describe("v1.1 dashboard Tier 1 client logic", () => {
     // (action === "approve") ? "engaged" : "idle".
     expect(src).toMatch(/action === "approve" \? "engaged" : "idle"/);
   });
+
+  it("client script sends bearer and prompts for mutating 401 responses", async () => {
+    const { getClientScript } = await import(
+      "../../../src/dashboard/v1_1/client.js"
+    );
+    const src = getClientScript();
+    expect(src).toContain('init.headers["Authorization"] = "Bearer " + TOKEN');
+    expect(src).toContain(
+      'if (res.status === 401 && method !== "GET" && promptForOperatorToken())',
+    );
+    expect(src).toContain('sessionStorage.setItem("authToken", TOKEN)');
+  });
 });

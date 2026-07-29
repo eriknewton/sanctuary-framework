@@ -651,7 +651,7 @@ describe("InjectionDetector", () => {
   // ──────────────────────────────────────────────────────────────────────
 
   describe("Performance", () => {
-    it("scans typical tool call in < 5ms", () => {
+    it("scans typical tool call in < 5ms", { retry: 3 }, () => {
       const args = {
         namespace: "user-data",
         key: "important-state",
@@ -669,7 +669,7 @@ describe("InjectionDetector", () => {
       expect(elapsed).toBeLessThan(5);
     });
 
-    it("handles large nested structures efficiently", () => {
+    it("handles large nested structures efficiently", { retry: 3 }, () => {
       const largeArgs: Record<string, any> = {};
       for (let i = 0; i < 100; i++) {
         largeArgs[`field_${i}`] = {

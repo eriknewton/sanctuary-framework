@@ -7,7 +7,7 @@
  * implemented in server/src/cli.ts.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdtemp, rm, mkdir, writeFile, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -17,6 +17,7 @@ import { runAgentsCommand } from "../../src/cli/agents/cli.js";
 import type { HealthProbeResult } from "../../src/cli/agents/health.js";
 import type { TenantDescriptor } from "../../src/cli/agents/discovery.js";
 import { parsePolicy } from "../../src/principal-policy/loader.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
 
 class StringWritable extends Writable {
   chunks: string[] = [];
@@ -40,6 +41,8 @@ const offlineProbe = async (
   status: null,
   reason: "ECONNREFUSED",
 });
+
+const configEnv = { SANCTUARY_PASSPHRASE: "test-passphrase" };
 
 async function makeTenant(root: string, name: string): Promise<string> {
   const dir = join(root, name);
@@ -70,6 +73,7 @@ describe("sanctuary agents config --approval-redirect (Upsilon-2)", () => {
   let home: string;
   let defaultRoot: string;
   let tenantADir: string;
+  let appendCriticalSpy: ReturnType<typeof vi.spyOn>;
 
   beforeEach(async () => {
     home = await mkdtemp(join(tmpdir(), "sanctuary-cfg-redirect-"));
@@ -77,9 +81,13 @@ describe("sanctuary agents config --approval-redirect (Upsilon-2)", () => {
     await mkdir(defaultRoot, { recursive: true, mode: 0o700 });
     tenantADir = await makeTenant(defaultRoot, "tenant-a");
     await writeMinimalPolicy(tenantADir);
+    appendCriticalSpy = vi
+      .spyOn(AuditLog.prototype, "appendCritical")
+      .mockResolvedValue(undefined);
   });
 
   afterEach(async () => {
+    appendCriticalSpy.mockRestore();
     await rm(home, { recursive: true, force: true });
   });
 
@@ -92,6 +100,7 @@ describe("sanctuary agents config --approval-redirect (Upsilon-2)", () => {
       probe: offlineProbe,
       out: out as unknown as NodeJS.WritableStream,
       err: err as unknown as NodeJS.WritableStream,
+      env: configEnv,
     });
     expect(code).toBe(0);
     const policyPath = join(tenantADir, "principal-policy.yaml");
@@ -119,6 +128,7 @@ describe("sanctuary agents config --approval-redirect (Upsilon-2)", () => {
       probe: offlineProbe,
       out: out as unknown as NodeJS.WritableStream,
       err: err as unknown as NodeJS.WritableStream,
+      env: configEnv,
     });
     expect(code).toBe(0);
     const parsed = parsePolicy(
@@ -130,7 +140,7 @@ describe("sanctuary agents config --approval-redirect (Upsilon-2)", () => {
     });
   });
 
-  it("config can flip enabled=false and is idempotent across multiple invocations", async () => {
+  it("config refuses to downgrade approval_redirect.enabled after it is enabled", async () => {
     // Turn on.
     await runAgentsCommand({
       argv: ["config", "tenant-a", "--approval-redirect=true"],
@@ -138,28 +148,24 @@ describe("sanctuary agents config --approval-redirect (Upsilon-2)", () => {
       probe: offlineProbe,
       out: new StringWritable() as unknown as NodeJS.WritableStream,
       err: new StringWritable() as unknown as NodeJS.WritableStream,
+      env: configEnv,
     });
-    // Turn off.
-    await runAgentsCommand({
-      argv: ["config", "tenant-a", "--approval-redirect=false"],
-      home,
-      probe: offlineProbe,
-      out: new StringWritable() as unknown as NodeJS.WritableStream,
-      err: new StringWritable() as unknown as NodeJS.WritableStream,
-    });
-    // Turn off again (idempotent).
+    const out = new StringWritable();
+    const err = new StringWritable();
     const code = await runAgentsCommand({
       argv: ["config", "tenant-a", "--approval-redirect=false"],
       home,
       probe: offlineProbe,
-      out: new StringWritable() as unknown as NodeJS.WritableStream,
-      err: new StringWritable() as unknown as NodeJS.WritableStream,
+      out: out as unknown as NodeJS.WritableStream,
+      err: err as unknown as NodeJS.WritableStream,
+      env: configEnv,
     });
-    expect(code).toBe(0);
+    expect(code).toBe(1);
+    expect(err.text).toContain("principal policy update refused");
     const parsed = parsePolicy(
       await readFile(join(tenantADir, "principal-policy.yaml"), "utf-8"),
     );
-    expect(parsed.approval_redirect?.enabled).toBe(false);
+    expect(parsed.approval_redirect?.enabled).toBe(true);
     // Block appears exactly once in the file.
     const content = await readFile(
       join(tenantADir, "principal-policy.yaml"),
@@ -167,6 +173,44 @@ describe("sanctuary agents config --approval-redirect (Upsilon-2)", () => {
     );
     const matches = content.match(/^approval_redirect:/gm) ?? [];
     expect(matches.length).toBe(1);
+  });
+
+  it("config is idempotent when keeping approval_redirect disabled", async () => {
+    const out = new StringWritable();
+    const err = new StringWritable();
+    const code = await runAgentsCommand({
+      argv: ["config", "tenant-a", "--approval-redirect=false"],
+      home,
+      probe: offlineProbe,
+      out: out as unknown as NodeJS.WritableStream,
+      err: err as unknown as NodeJS.WritableStream,
+      env: configEnv,
+    });
+
+    expect(code).toBe(0);
+    const parsed = parsePolicy(
+      await readFile(join(tenantADir, "principal-policy.yaml"), "utf-8"),
+    );
+    expect(parsed.approval_redirect?.enabled).toBe(false);
+  });
+
+  it("config refuses to persist when the required audit append fails", async () => {
+    appendCriticalSpy.mockRejectedValueOnce(new Error("audit unavailable"));
+    const out = new StringWritable();
+    const err = new StringWritable();
+    const code = await runAgentsCommand({
+      argv: ["config", "tenant-a", "--approval-redirect=true"],
+      home,
+      probe: offlineProbe,
+      out: out as unknown as NodeJS.WritableStream,
+      err: err as unknown as NodeJS.WritableStream,
+      env: configEnv,
+    });
+
+    expect(code).toBe(1);
+    expect(err.text).toContain("principal policy update refused");
+    const content = await readFile(join(tenantADir, "principal-policy.yaml"), "utf-8");
+    expect(content).not.toContain("approval_redirect:");
   });
 
   it("rejects an invalid --approval-redirect-mode value", async () => {
@@ -215,6 +259,7 @@ describe("sanctuary agents config --approval-redirect (Upsilon-2)", () => {
       probe: offlineProbe,
       out: new StringWritable() as unknown as NodeJS.WritableStream,
       err: new StringWritable() as unknown as NodeJS.WritableStream,
+      env: configEnv,
     });
     const out = new StringWritable();
     const err = new StringWritable();
@@ -236,6 +281,7 @@ describe("sanctuary agents config --approval-redirect (Upsilon-2)", () => {
       probe: offlineProbe,
       out: new StringWritable() as unknown as NodeJS.WritableStream,
       err: new StringWritable() as unknown as NodeJS.WritableStream,
+      env: configEnv,
     });
     const out = new StringWritable();
     const code = await runAgentsCommand({
@@ -264,6 +310,7 @@ describe("sanctuary agents config --approval-redirect (Upsilon-2)", () => {
       probe: offlineProbe,
       out: out as unknown as NodeJS.WritableStream,
       err: err as unknown as NodeJS.WritableStream,
+      env: configEnv,
     });
     expect(code).toBe(0);
     const policyPath = join(defaultRoot, "tenant-b", "principal-policy.yaml");

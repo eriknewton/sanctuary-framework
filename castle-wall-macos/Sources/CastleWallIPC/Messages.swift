@@ -731,18 +731,26 @@ public struct ManifestRuleMatch: Codable, Equatable {
     }
 }
 
+/// `uids` (S5-0, 2026-07-14 two-confined-uid extension): scopes a rule to one
+/// or more macOS real uids directly, composing as an OR with `agentIds` /
+/// `templateIds` (mirrors TS `RuleScope.uids`, `server/src/castle-wall/allowlist/schema.ts`).
+/// `nil`/empty encodes to absent, keeping canonical-JSON bytes byte-identical
+/// to today when no rule uses this axis.
 public struct ManifestRuleScope: Codable, Equatable {
     public let agentIds: [String]?
     public let templateIds: [String]?
+    public let uids: [UInt32]?
 
-    public init(agentIds: [String]?, templateIds: [String]?) {
+    public init(agentIds: [String]?, templateIds: [String]?, uids: [UInt32]? = nil) {
         self.agentIds = agentIds
         self.templateIds = templateIds
+        self.uids = uids
     }
 
     enum CodingKeys: String, CodingKey {
         case agentIds = "agent_ids"
         case templateIds = "template_ids"
+        case uids
     }
 }
 
@@ -800,6 +808,14 @@ public struct AgentOriginWire: Codable, Equatable {
     public let egressHelperTeamId: String?
     public let agentRuntimePortRange: [Int]?
     public let agentUid: UInt32?
+    /// SECOND optional confined-principal uid (S5-0, 2026-07-14 two-confined-uid
+    /// extension). Valid only alongside `mode == .uid`; mirrors TS
+    /// `AgentOrigin.gate_uid`. `nil` encodes to absent, keeping canonical-JSON
+    /// bytes byte-identical to today. Floor invariants (>=1, >= ceiling,
+    /// distinct from `agentUid`) are enforced by the TS producer
+    /// (`validateAgentOrigin`) BEFORE signing -- this wire type only carries
+    /// the value through; Swift trusts the signed body, same as `agentUid`.
+    public let gateUid: UInt32?
     public let systemUidAllowCeiling: UInt32
 
     public init(
@@ -808,6 +824,7 @@ public struct AgentOriginWire: Codable, Equatable {
         egressHelperTeamId: String? = nil,
         agentRuntimePortRange: [Int]? = nil,
         agentUid: UInt32? = nil,
+        gateUid: UInt32? = nil,
         systemUidAllowCeiling: UInt32
     ) {
         self.mode = mode
@@ -815,6 +832,7 @@ public struct AgentOriginWire: Codable, Equatable {
         self.egressHelperTeamId = egressHelperTeamId
         self.agentRuntimePortRange = agentRuntimePortRange
         self.agentUid = agentUid
+        self.gateUid = gateUid
         self.systemUidAllowCeiling = systemUidAllowCeiling
     }
 
@@ -824,6 +842,7 @@ public struct AgentOriginWire: Codable, Equatable {
         case egressHelperTeamId = "egress_helper_team_id"
         case agentRuntimePortRange = "agent_runtime_port_range"
         case agentUid = "agent_uid"
+        case gateUid = "gate_uid"
         case systemUidAllowCeiling = "system_uid_allow_ceiling"
     }
 }
@@ -937,6 +956,14 @@ public struct ManifestUpdatedBody: Codable, Equatable {
     /// this representation so additive fields unknown to `ManifestRule` remain
     /// inside the signed digest boundary.
     public let receivedRules: [JSONValue]?
+    /// Opaque manifest-body JSON as delivered on the wire (S5-0 HIGH-2,
+    /// 2026-07-14). Retained -- symmetric with `receivedRules` -- so the
+    /// enforcement boundary can schema-validate the RAW `agent_origin` and
+    /// catch shapes that optional `Codable` would silently collapse (e.g. an
+    /// explicit `"agent_uid": null`). Decode-only; never re-encoded and never
+    /// part of signature/digest verification (the signature binds the
+    /// re-encoded TYPED `manifest`).
+    public let receivedManifest: JSONValue?
 
     public init(manifestSignatureB64url: String?, rules: [ManifestRule]) {
         self.type = "manifest_updated"
@@ -958,19 +985,22 @@ public struct ManifestUpdatedBody: Codable, Equatable {
         }
         self.rules = rules
         self.receivedRules = nil
+        self.receivedManifest = nil
     }
 
     public init(
         manifest: ManifestSignedBody,
         signature: ManifestSignatureEnvelope,
         rules: [ManifestRule],
-        receivedRules: [JSONValue]? = nil
+        receivedRules: [JSONValue]? = nil,
+        receivedManifest: JSONValue? = nil
     ) {
         self.type = "manifest_updated"
         self.manifest = manifest
         self.signature = signature
         self.rules = rules
         self.receivedRules = receivedRules
+        self.receivedManifest = receivedManifest
     }
 
     public var manifestSignatureB64url: String? {
@@ -991,6 +1021,10 @@ public struct ManifestUpdatedBody: Codable, Equatable {
         self.signature = try container.decodeIfPresent(ManifestSignatureEnvelope.self, forKey: .signature)
         self.rules = try container.decode([ManifestRule].self, forKey: .rules)
         self.receivedRules = try container.decode([JSONValue].self, forKey: .rules)
+        // Retain the RAW manifest-body JSON (decode-only), so the enforcement
+        // boundary can schema-validate the raw `agent_origin` before trusting
+        // the Codable-collapsed typed form (S5-0 HIGH-2).
+        self.receivedManifest = try container.decodeIfPresent(JSONValue.self, forKey: .manifest)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -1014,13 +1048,15 @@ public struct FlowDecisionRecordedBody: Codable, Equatable {
     public let agent: IpcAgentAttribution
     public let matchedRuleId: String?
     public let recordedAt: String
+    public let producer: AuditProducerSignatureBody?
 
     public init(
         decision: String,
         destination: IpcDestination,
         agent: IpcAgentAttribution,
         matchedRuleId: String?,
-        recordedAt: String
+        recordedAt: String,
+        producer: AuditProducerSignatureBody? = nil
     ) {
         self.type = "flow_decision_recorded"
         self.decision = decision
@@ -1028,6 +1064,7 @@ public struct FlowDecisionRecordedBody: Codable, Equatable {
         self.agent = agent
         self.matchedRuleId = matchedRuleId
         self.recordedAt = recordedAt
+        self.producer = producer
     }
 
     enum CodingKeys: String, CodingKey {
@@ -1037,6 +1074,7 @@ public struct FlowDecisionRecordedBody: Codable, Equatable {
         case agent
         case matchedRuleId = "matched_rule_id"
         case recordedAt = "recorded_at"
+        case producer
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -1047,6 +1085,44 @@ public struct FlowDecisionRecordedBody: Codable, Equatable {
         try container.encode(agent, forKey: .agent)
         try container.encode(matchedRuleId, forKey: .matchedRuleId)
         try container.encode(recordedAt, forKey: .recordedAt)
+        try container.encodeIfPresent(producer, forKey: .producer)
+    }
+}
+
+/// Per-flow producer-signature tuple carried by the macOS extension. Mirrors
+/// the Linux `AuditDrainEvent` signature fields so the TypeScript reader can
+/// reuse the same fail-closed re-verification gate.
+public struct AuditProducerSignatureBody: Codable, Equatable {
+    public let eventCanonicalJson: String
+    public let capturedAtUnixMs: UInt64
+    public let seq: UInt64
+    public let priorSha256Hex: String?
+    public let signatureB64url: String
+    public let keyId: String
+
+    public init(
+        eventCanonicalJson: String,
+        capturedAtUnixMs: UInt64,
+        seq: UInt64,
+        priorSha256Hex: String?,
+        signatureB64url: String,
+        keyId: String
+    ) {
+        self.eventCanonicalJson = eventCanonicalJson
+        self.capturedAtUnixMs = capturedAtUnixMs
+        self.seq = seq
+        self.priorSha256Hex = priorSha256Hex
+        self.signatureB64url = signatureB64url
+        self.keyId = keyId
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case eventCanonicalJson = "event_canonical_json"
+        case capturedAtUnixMs = "captured_at_unix_ms"
+        case seq
+        case priorSha256Hex = "prior_sha256_hex"
+        case signatureB64url = "signature_b64url"
+        case keyId = "key_id"
     }
 }
 

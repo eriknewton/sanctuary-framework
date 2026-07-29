@@ -119,6 +119,8 @@ fn write_signed_allow_only_example_443(policy_dir: &Path, signing: &SigningKey) 
         schema_version: 1,
         fortress_id: "deadbeef".to_string(),
         issued_at: "2026-05-06T00:00:00Z".to_string(),
+        agent_origin: None,
+        operator_baseline: None,
         rules: vec![
             ManifestRuleEntry {
                 rule_id: "rule-allow-example".to_string(),

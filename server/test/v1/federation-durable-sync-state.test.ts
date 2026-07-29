@@ -43,6 +43,7 @@ import {
 } from "../../src/v1/federation-revocation.js";
 import { federationEventHash } from "../../src/v1/federation.js";
 import type { FederationEvent, V1FederationDeps } from "../../src/v1/federation.js";
+import { buildFleetRoster } from "../../src/principal-policy/fleet-roster.js";
 import { makeMultiNodeFortress, type MultiNodeFortress } from "./fed-materials.js";
 
 type DepsAccess = DashboardApprovalChannel & {
@@ -350,5 +351,124 @@ describe("Federation 3/3b P0 - durable sync-state at the dashboard seam", () => 
     // Fresh fortress: empty anti-replay, and accepts a normal advance.
     expect(boot.deps.acceptedHighWaterFor("mac-1")).toBeNull();
     await expect(boot.deps.recordAcceptedHighWater("mac-1", 1)).resolves.toBe(true);
+  });
+
+  it("PR-A: the node ROSTER + active count SURVIVE a restart (durable fleet membership)", async () => {
+    // The core "count survives reboot" proof at the dashboard seam. Two peers
+    // sync in (entering the durable roster), one is evicted (entering the durable
+    // revoked set), the daemon restarts, and both the roster AND the active
+    // (admitted, non-revoked) count rehydrate. The active count is derived by the
+    // SAME buildFleetRoster summary.admitted path the console/billing consume; we
+    // do not recount by hand.
+    const threeNode = makeMultiNodeFortress(["linux-1", "node-a", "node-b"]);
+    const storage = new MemoryStorage();
+
+    // Boot 1: two peers sync an agent event in (each upserts into the roster and,
+    // because the roster GREW, triggers a durable persist), then one is evicted.
+    const boot1 = await buildRecipient(threeNode, "linux-1", storage);
+    for (const sender of ["node-a", "node-b"] as const) {
+      const envelope = captureEnvelope(threeNode, sender, "linux-1", 3);
+      const append = await boot1.deps.appendFederationEvents(envelope.events, {
+        senderNodeId: sender,
+        wireVersion: FEDERATION_SYNC_WIRE_VERSION,
+      });
+      expect(append.rejected).toEqual([]);
+    }
+    // Roster now holds both peers; the active count is 2 (none revoked yet).
+    expect(boot1.deps.listNodes().map((n) => n.node_id).sort()).toEqual([
+      "node-a",
+      "node-b",
+    ]);
+    expect(
+      buildFleetRoster(boot1.deps, { evictionSerial: 0 }).summary.admitted,
+    ).toBe(2);
+
+    // Evict node-b via an operator-authority eviction (adds it to the durable
+    // revoked set; the roster itself is NOT deleted from).
+    const fortressId = threeNode.fortressId;
+    const evictionPayload = signFederationNodeEvictionPayload({
+      fortressId,
+      nodeId: "node-b",
+      reason: "compromised",
+      effectiveAt: new Date().toISOString(),
+      evictionSerial: 1,
+      operatorPrincipalId: threeNode.principalCert.principal_id,
+      operatorPrincipalPrivateKey:
+        threeNode.nodes["linux-1"].context.getIssuingPrincipalPrivateKey(),
+    });
+    const evBody = {
+      event_id: `${federationOperatorAuthorityOrigin(fortressId)}:1`,
+      origin_node_id: federationOperatorAuthorityOrigin(fortressId),
+      sequence: 1,
+      occurred_at: new Date().toISOString(),
+      kind: "node_eviction",
+      payload: { ...evictionPayload },
+      previous_hash: null,
+    };
+    const evictionEvent: FederationEvent = {
+      ...evBody,
+      event_hash: federationEventHash(evBody),
+    };
+    const evAppend = await boot1.deps.appendFederationEvents([evictionEvent], {
+      senderNodeId: "node-a",
+      wireVersion: FEDERATION_SYNC_WIRE_VERSION,
+    });
+    expect(evAppend.accepted.map((e) => e.event_id)).toContain(evictionEvent.event_id);
+    expect(boot1.deps.isNodeRevoked("node-b")).toBe(true);
+    // Active count is now 1 (node-a admitted, node-b revoked).
+    expect(
+      buildFleetRoster(boot1.deps, { evictionSerial: 1 }).summary.admitted,
+    ).toBe(1);
+
+    // RESTART over the SAME storage (the event log is NOT persisted, so the
+    // roster survives ONLY via the durable snapshot this slice adds).
+    const boot2 = await buildRecipient(threeNode, "linux-1", storage);
+
+    // The roster is restored (both node ids present) ...
+    expect(boot2.deps.listNodes().map((n) => n.node_id).sort()).toEqual([
+      "node-a",
+      "node-b",
+    ]);
+    // ... the eviction still holds ...
+    expect(boot2.deps.isNodeRevoked("node-b")).toBe(true);
+    expect(boot2.deps.isNodeRevoked("node-a")).toBe(false);
+    // ... and the active (billing) count is the CORRECT 1, not 0 (pre-PR-A the
+    // roster came up empty -> 0) and not 2 (revocation forgotten).
+    const rosterAfter = buildFleetRoster(boot2.deps, { evictionSerial: 1 });
+    expect(rosterAfter.summary.total).toBe(2);
+    expect(rosterAfter.summary.admitted).toBe(1);
+    expect(rosterAfter.summary.revoked).toBe(1);
+  });
+
+  it("PR-A: a recordJoin whose persist FAILS is rejected AND leaves no phantom node in memory", async () => {
+    // recordJoin is fail-closed: if the durable persist throws, the join must be
+    // rejected (throw propagates) AND the in-memory mutations must be rolled back
+    // so no phantom node lingers in the roster / summary.admitted until reboot
+    // (mirrors recordAcceptedHighWater's in-memory rollback). This closes the
+    // divergence the gate flagged: a failed join must not inflate the in-memory
+    // count even though the durable billing basis is never inflated.
+    class ArmedFailWriteStorage extends MemoryStorage {
+      armed = false;
+      override async write(ns: string, key: string, bytes: Uint8Array): Promise<void> {
+        if (this.armed && ns === "_federation" && key === "sync-state-v1") {
+          throw new Error("disk write failed");
+        }
+        return super.write(ns, key, bytes);
+      }
+    }
+    const storage = new ArmedFailWriteStorage();
+    const boot = await buildRecipient(fortress, "linux-1", storage);
+
+    // Baseline: an empty roster (the recipient's own node is not auto-added).
+    expect(boot.deps.listNodes().map((n) => n.node_id)).toEqual([]);
+    expect(buildFleetRoster(boot.deps, { evictionSerial: 0 }).summary.admitted).toBe(0);
+
+    // Arm the write failure so the recordJoin-triggered persist throws.
+    storage.armed = true;
+    await expect(boot.deps.recordJoin(fortress.nodes["mac-1"].nodeCert)).rejects.toThrow();
+
+    // The in-memory roster is UNCHANGED: no phantom node, admitted still 0.
+    expect(boot.deps.listNodes().map((n) => n.node_id)).toEqual([]);
+    expect(buildFleetRoster(boot.deps, { evictionSerial: 0 }).summary.admitted).toBe(0);
   });
 });

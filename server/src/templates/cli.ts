@@ -31,6 +31,13 @@ export interface TemplateCommandArgs {
    * given agent_id. Default: resolves against tenant discovery.
    */
   isAgentWrapped?: (agentId: string) => Promise<boolean>;
+  /**
+   * The fortress the audit write lands in. Injection seam for callers that
+   * have already chosen a fortress (tests, and any embedder driving more than
+   * one tenant). When omitted the audit write falls back to the configured
+   * default, which is correct for a plain CLI invocation.
+   */
+  storagePath?: string;
 }
 
 export async function runTemplateCommand(args: TemplateCommandArgs): Promise<number> {
@@ -47,7 +54,13 @@ export async function runTemplateCommand(args: TemplateCommandArgs): Promise<num
     case "list":
       return cmdList(out, err);
     case "init":
-      return cmdInit(rest, out, err, args.isAgentWrapped ?? defaultIsAgentWrapped);
+      return cmdInit(
+        rest,
+        out,
+        err,
+        args.isAgentWrapped ?? defaultIsAgentWrapped,
+        args.storagePath,
+      );
     default:
       err.write(`Unknown template subcommand: ${sub}\n`);
       printTemplateHelp(err);
@@ -110,7 +123,8 @@ async function cmdInit(
   argv: string[],
   out: NodeJS.WritableStream,
   err: NodeJS.WritableStream,
-  isAgentWrapped: (agentId: string) => Promise<boolean>
+  isAgentWrapped: (agentId: string) => Promise<boolean>,
+  storagePathOverride?: string
 ): Promise<number> {
   let templateName: string | undefined;
   let agentId: string | undefined;
@@ -187,12 +201,16 @@ async function cmdInit(
 
   // Best-effort audit write
   try {
-    const config = await loadConfig();
-    const storagePath = config.storage_path;
+    const storagePath = storagePathOverride ?? (await loadConfig()).storage_path;
     const storage = new FilesystemStorage(`${storagePath}/state`);
     let passphrase = process.env["SANCTUARY_PASSPHRASE"];
     if (!passphrase) {
-      const resolved = await getOrCreatePassphrase();
+      // Scope the passphrase lookup to the fortress this command already
+      // resolved. Calling with no argument re-resolves ambiently from the
+      // environment, which reads and can create the HOME fortress's
+      // passphrase (and its keyring entry) even when the caller selected a
+      // different fortress with --fortress.
+      const resolved = await getOrCreatePassphrase({ storagePath });
       passphrase = resolved.value;
     }
     // Unified custody (master-custody.ts): never derive a fortress master verb-locally.

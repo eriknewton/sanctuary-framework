@@ -179,7 +179,23 @@ export async function handleAnomalyRoute(
     return false;
   }
 
-  const checkAuth = authMiddleware(deps.authConfig);
+  // DEFAULT-DENY on mutation (invariant 7, co-resident-agent threat): any
+  // non-GET method requires the operator bearer (`requireToken: true`), which
+  // suppresses the loopback auto-auth shortcut so a co-resident agent sharing
+  // loopback cannot register/remove detector subscriptions by network position
+  // alone. The only non-GET routes here are `POST`/`DELETE
+  // /api/anomaly/:detector_id/subscribe`, which mutate the live dispatcher
+  // (registerDetector / addClassifierToDetector / unregisterDetector /
+  // removeClassifierFromDetector) — both are genuine mutations, so there is no
+  // read-style exemption. This mirrors the per-router default-deny the other
+  // v1.1 routers use (`intelligence-api-router.ts`, the PII Tier-B router),
+  // replacing the prior flat `authMiddleware(authConfig)` that let loopback
+  // auto-auth release the subscribe/unsubscribe mutations.
+  const requiresOperatorBearer = method !== "GET";
+  const checkAuth = authMiddleware(
+    deps.authConfig,
+    requiresOperatorBearer ? { requireToken: true } : undefined,
+  );
   if (!checkAuth(req, res, url)) return true;
 
   const now = (deps.now ?? (() => new Date()))();

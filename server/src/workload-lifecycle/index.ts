@@ -75,12 +75,14 @@ export {
   type AttestedWorkload,
   type HostWorkloadAttestationBody,
   type SignedHostWorkloadAttestation,
+  type HostWorkloadAttestationTrust,
   type WorkloadAttestationSigner,
   type BuildHostWorkloadAttestationParams,
 } from "./host-attestation.js";
 
 export {
   sealHostAttestation,
+  HostAttestationSealError,
   type HostAttestationSealContext,
 } from "./host-attestation-seal.js";
 

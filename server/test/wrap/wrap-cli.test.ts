@@ -6,12 +6,14 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { startedCoarseDisposition, type HarnessDisposition } from "../../src/egress-gate/parked-claim.js";
 import { mkdtemp, writeFile, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   parseWrapArgs,
   formatWrapSuccess,
+  protectionClaimFromAutoProvisionSummary,
   runWrap,
   validateDevDist,
   DevDistInvalidError,
@@ -19,6 +21,50 @@ import {
   type DashboardStarter,
   type RunWrapDeps,
 } from "../../src/wrap/cli.js";
+import { SANCTUARY_VERSION } from "../../src/config.js";
+import {
+  protectionStateAdvice,
+  protectionStateClaimFromObservation,
+  type ProtectionStateClaim,
+} from "../../src/egress-gate/protection-claim.js";
+
+/**
+ * The published-version MCP entry the wrap writes (v1.6.1 install-path
+ * hardening, F2): version-pinned, explicit `sanctuary` bin, `-y` so the
+ * non-interactive MCP spawn never wedges on the npx install prompt.
+ */
+const PINNED_SANCTUARY_ARGS = [
+  "-y",
+  "-p",
+  `@sanctuary-framework/mcp-server@${SANCTUARY_VERSION}`,
+  "sanctuary",
+];
+
+function claim(state: "exclusive" | "coarse-only" | "unprotected" | "unknown"): ProtectionStateClaim {
+  switch (state) {
+    case "exclusive":
+      return protectionStateClaimFromObservation({
+        state,
+        basis: "exclusive_egress_observed",
+      });
+    case "coarse-only":
+      return protectionStateClaimFromObservation({
+        state,
+        basis: "exclusive_egress_cap_observed",
+      });
+    case "unprotected":
+      return protectionStateClaimFromObservation({
+        state,
+        basis: "disarm_observed_off",
+      });
+    case "unknown":
+      return protectionStateClaimFromObservation({
+        state,
+        basis: "insufficient_evidence",
+        reasons: ["test"],
+      });
+  }
+}
 
 describe("validateDevDist (Finding 4, 2026-06-25)", () => {
   let dir: string;
@@ -160,10 +206,7 @@ describe("formatWrapSuccess", () => {
     browserOpened: true,
     passphraseLocation: "macOS Keychain",
     passphraseSource: "generated",
-    // Honesty (audit seam #1): the "Your agent is protected / Castle Wall Full"
-    // hero is now reserved for an observed daemon arm. The baseline fixture
-    // models the armed case; the not-armed case is covered separately below.
-    castleWallArmed: true,
+    castleWallProtectionClaim: claim("exclusive"),
   };
 
   it("includes wrapped tool name and version", () => {
@@ -192,7 +235,7 @@ describe("formatWrapSuccess", () => {
     );
   });
 
-  it("includes the agent-protected summary line when Castle Wall armed", () => {
+  it("includes the agent-protected summary line on observed enforcement evidence", () => {
     const out = formatWrapSuccess(baseInfo);
     expect(out).toContain("Your agent is protected");
     expect(out).toContain("Castle Wall Full");
@@ -207,25 +250,214 @@ describe("formatWrapSuccess", () => {
     expect(out).not.toMatch(/\bL[1-4]\b/);
   });
 
-  // Honesty (audit seam #1): when the Castle Wall daemon failed to arm, the
-  // banner must NOT claim "protected" / "Castle Wall Full" — that contradicted
-  // the loud "traffic NOT filtered" warning printed seconds earlier.
-  it("does NOT claim protected / Full when Castle Wall did not arm", () => {
-    const out = formatWrapSuccess({ ...baseInfo, castleWallArmed: false });
+  it("does NOT claim protected / Full when protection state is unknown", () => {
+    const out = formatWrapSuccess({
+      ...baseInfo,
+      castleWallProtectionClaim: claim("unknown"),
+    });
+    expect(out).not.toContain("Your agent is protected");
+    expect(out).not.toContain("Castle Wall Full");
+    expect(out).toContain("Castle Wall status unknown");
+    expect(out).toContain("enforcement is not confirmed");
+  });
+
+  it("points unbindable subject evidence at the uid confinement path without turning green", () => {
+    const expectedImperative =
+      "Ensure this wrapped agent is uid-confined, then bind Castle Wall to that uid with " +
+      "'sanctuary castle-wall configure-origin uid --agent-uid=<uid> --ceiling=500'; " +
+      "reload or re-arm Castle Wall so per-agent enforcement evidence can bind to this wrapped agent.";
+    const cases = [
+      "subject_unbound_evidence",
+      "subject_unresolvable",
+    ] as const;
+
+    for (const basis of cases) {
+      const protection = protectionStateClaimFromObservation({
+        state: "unknown",
+        basis,
+        reasons: ["test"],
+      });
+      const advice = protectionStateAdvice(protection);
+      expect(protection.state).toBe("unknown");
+      expect(protection.basis).toBe(basis);
+      expect(advice.green).toBe(false);
+      expect(advice.imperative).toBe(expectedImperative);
+      expect(advice.imperative).not.toContain("--hermes");
+    }
+  });
+
+  it("renders coarse-only as distinct non-green, never Full or NOT ARMED", () => {
+    const out = formatWrapSuccess({
+      ...baseInfo,
+      castleWallProtectionClaim: claim("coarse-only"),
+    });
+    expect(out).not.toContain("Your agent is protected");
+    expect(out).not.toContain("Castle Wall Full");
+    expect(out).not.toContain("Castle Wall NOT ARMED");
+    expect(out).toContain("only coarse Castle Wall enforcement is confirmed");
+    expect(out).toContain("Castle Wall coarse-only");
+  });
+
+  it("does NOT claim protected / Full when observed unprotected", () => {
+    const out = formatWrapSuccess({
+      ...baseInfo,
+      castleWallProtectionClaim: claim("unprotected"),
+    });
     expect(out).not.toContain("Your agent is protected");
     expect(out).not.toContain("Castle Wall Full");
     expect(out).toContain("Castle Wall NOT ARMED");
     expect(out).toContain("enforcement is not confirmed");
   });
 
-  // Honesty (audit seam #1): with no arm signal threaded, default conservative —
-  // never render "Full" on presence/absence of a field alone.
-  it("renders unknown (never Full) when no arm signal is threaded", () => {
-    const { castleWallArmed: _omit, ...noSignal } = baseInfo;
-    const out = formatWrapSuccess(noSignal);
+  it("requires a protection-state claim to render the Castle Wall sentence", () => {
+    const out = formatWrapSuccess({
+      ...baseInfo,
+      castleWallProtectionClaim: claim("unknown"),
+    });
     expect(out).not.toContain("Castle Wall Full");
     expect(out).toContain("Castle Wall status unknown");
     expect(out).not.toContain("Your agent is protected");
+  });
+
+  it("drill run 1: ensure-policy-daemon abort renders unknown, not NOT ARMED", () => {
+    const protection = protectionClaimFromAutoProvisionSummary({
+      ran: true,
+      outcome: {
+        kind: "aborted",
+        stage: "ensure-policy-daemon",
+        reason: "policy daemon refused fortress",
+        rolledBack: true,
+      },
+    });
+    expect(protection?.state).toBe("unknown");
+    expect(protection?.basis).toBe("provision_outcome_not_observation");
+    const out = formatWrapSuccess({
+      ...baseInfo,
+      castleWallProtectionClaim: protection!,
+    });
+    expect(out).not.toContain("Your agent is protected");
+    expect(out).not.toContain("Castle Wall Full");
+    expect(out).not.toContain("Castle Wall NOT ARMED");
+    expect(out).toContain("Castle Wall status unknown");
+  });
+
+  it("drill run 2: arm abort without typed observed-off evidence renders unknown", () => {
+    const protection = protectionClaimFromAutoProvisionSummary({
+      ran: true,
+      outcome: {
+        kind: "aborted",
+        stage: "arm",
+        reason: "arm failed",
+        rolledBack: true,
+      },
+    });
+    expect(protection?.state).toBe("unknown");
+    const out = formatWrapSuccess({
+      ...baseInfo,
+      castleWallProtectionClaim: protection!,
+    });
+    expect(out).not.toContain("Your agent is protected");
+    expect(out).not.toContain("Castle Wall Full");
+    expect(out).not.toContain("Castle Wall NOT ARMED");
+    expect(out).toContain("Castle Wall status unknown");
+  });
+
+  it("drill run 2: arm abort renders unprotected only with typed observed-off evidence", () => {
+    const protection = protectionClaimFromAutoProvisionSummary({
+      ran: true,
+      outcome: {
+        kind: "aborted",
+        stage: "arm",
+        reason: "arm failed and disarm observed off",
+        rolledBack: true,
+        disarmObservedOff: true,
+      },
+    });
+    expect(protection?.state).toBe("unprotected");
+    expect(protection?.basis).toBe("disarm_observed_off");
+    const out = formatWrapSuccess({
+      ...baseInfo,
+      castleWallProtectionClaim: protection!,
+    });
+    expect(out).not.toContain("Your agent is protected");
+    expect(out).not.toContain("Castle Wall Full");
+    expect(out).toContain("Castle Wall NOT ARMED");
+  });
+
+  it("kind armed does not derive coarse-only from the outcome alone", () => {
+    const protection = protectionClaimFromAutoProvisionSummary({
+      ran: true,
+      outcome: { kind: "armed", uid: 503 },
+    });
+    expect(protection).toBeUndefined();
+  });
+
+  it("armed-exclusive-repark-failed is unknown until the probe observes live enforcement", () => {
+    const protection = protectionClaimFromAutoProvisionSummary({
+      ran: true,
+      outcome: {
+        kind: "armed-exclusive-repark-failed",
+        uid: 503,
+        generationId: 9,
+        reparkError: "launchctl disable failed",
+      },
+    });
+    expect(protection?.state).toBe("unknown");
+    expect(protection?.basis).toBe("exclusive_egress_repark_failed");
+    const out = formatWrapSuccess({
+      ...baseInfo,
+      castleWallProtectionClaim: protection!,
+    });
+    expect(out).not.toContain("Castle Wall Full");
+    expect(out).toContain("exclusive-egress boot re-park is not confirmed");
+  });
+
+  it("drill run 3: bring-up abort needs a fresh probe before any coarse-only claim", () => {
+    const protection = protectionClaimFromAutoProvisionSummary({
+      ran: true,
+      outcome: {
+        kind: "exclusive-egress-unarmed-coarse-active",
+        uid: 503,
+        stage: "bring-up",
+        reason: "generation bring-up failed",
+        coarseCompositionRestored: true,
+        harness: startedCoarseDisposition(),
+        cleanupErrors: [],
+      },
+    });
+    expect(protection?.state).toBe("unknown");
+    expect(protection?.basis).toBe("provision_outcome_not_observation");
+    const out = formatWrapSuccess({
+      ...baseInfo,
+      castleWallProtectionClaim: protection!,
+    });
+    expect(out).not.toContain("Your agent is protected");
+    expect(out).not.toContain("Castle Wall Full");
+    expect(out).not.toContain("Castle Wall NOT ARMED");
+    expect(out).toContain("enforcement is not confirmed");
+  });
+
+  // F7 (v1.6.1 first-run honesty): on Hermes the tool/server counts derive
+  // from the legacy cli-config.json surface Hermes does not consult for MCP
+  // routing; an empty legacy surface must not render "0 tools registered
+  // across 0 upstream servers" right after the config.yaml preservation
+  // message.
+  it("replaces the 0/0 upstream count line with the config.yaml routing line on Hermes", () => {
+    const out = formatWrapSuccess({
+      ...baseInfo,
+      platform: "hermes",
+      toolCount: 0,
+      serverCount: 0,
+    });
+    expect(out).not.toContain("0 tools registered across 0 upstream servers");
+    expect(out).toContain(
+      "Sanctuary MCP routing installed in Hermes config.yaml"
+    );
+  });
+
+  it("keeps the real upstream count line on Hermes when the legacy surface has servers", () => {
+    const out = formatWrapSuccess({ ...baseInfo, platform: "hermes" });
+    expect(out).toContain("74 tools registered across 2 upstream servers");
   });
 
   it("includes the dashboard URL without the long-lived token", () => {
@@ -423,7 +655,7 @@ describe("runWrap — SEC-061 passphrase leak regression", () => {
 
     expect(rewriteSpy).toHaveBeenCalledTimes(1);
     const rewriteArgs = rewriteSpy.mock.calls[0]?.[2] as string[];
-    expect(rewriteArgs).toEqual(["@sanctuary-framework/mcp-server"]);
+    expect(rewriteArgs).toEqual(PINNED_SANCTUARY_ARGS);
     expect(rewriteArgs.join(" ")).not.toContain(sentinel);
     expect(rewriteArgs).not.toContain("--passphrase");
 
@@ -519,7 +751,7 @@ describe("runWrap — SEC-061 passphrase leak regression", () => {
     );
 
     const rewriteArgs = rewriteSpy.mock.calls[0]?.[2] as string[];
-    expect(rewriteArgs).toEqual(["@sanctuary-framework/mcp-server"]);
+    expect(rewriteArgs).toEqual(PINNED_SANCTUARY_ARGS);
   });
 });
 
@@ -645,6 +877,43 @@ describe("runWrap — v0.10.0 WP1 multi-tenancy env vars", () => {
     );
 
     expect(seen.port).toBe(3507);
+  });
+
+  it("persists allow plaintext remote from the wrap flag into harness env", async () => {
+    let capturedEnv: Record<string, string> | undefined;
+    const rewriteConfig = vi.fn(
+      async (_agentConfig, command: string, args: string[], env?: Record<string, string>) => {
+        capturedEnv = env;
+        await writeFile(
+          configPath,
+          JSON.stringify({
+            mcp: {
+              servers: {
+                sanctuary: { command, args, env },
+              },
+            },
+          }),
+          "utf-8"
+        );
+        return configPath;
+      }
+    );
+
+    await runWrap(
+      { wrap: configPath, noOpen: true, allowPlaintextRemote: true },
+      {
+        startDashboard: capturingDashboardStarter({}),
+        openBrowser: async () => {},
+        resolvePassphrase: async () => ({
+          value: "gen",
+          location: "macOS Keychain",
+          source: "generated",
+        }),
+        rewriteConfig,
+      }
+    );
+
+    expect(capturedEnv?.SANCTUARY_DASHBOARD_ALLOW_PLAINTEXT_REMOTE).toBe("true");
   });
 
   it("prefers an explicit --port over SANCTUARY_DASHBOARD_PORT", async () => {

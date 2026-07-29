@@ -76,8 +76,26 @@ export async function handleConsoleRoute(
 
   if (!isConsoleRoute) return false;
 
-  // Auth gate: first middleware on every matched route
-  const checkAuth = authMiddleware(deps.authConfig);
+  // Auth gate: first middleware on every matched route.
+  //
+  // DEFAULT-DENY on mutation (invariant 7, co-resident-agent threat): any
+  // non-GET method requires the operator bearer (`requireToken: true`), which
+  // suppresses the loopback auto-auth shortcut so a co-resident agent sharing
+  // loopback cannot drive a console mutation by network position alone. The
+  // non-GET routes here are all POST mutations (fortress transition, agent
+  // retry-reset, policy compile, chat send); the GET routes (static console
+  // assets under `/console/*`, header badge, status reads) keep loopback/
+  // session readability. This mirrors the per-router default-deny the other
+  // v1.1 routers use (`intelligence-api-router.ts`, the PII Tier-B + anomaly
+  // routers), replacing the prior flat `authMiddleware(authConfig)`. The
+  // console binding is not wired in any production boot today (the dispatcher
+  // answers 503), so this is a latent-surface hardening: it is correct the
+  // moment the console service ships.
+  const requiresOperatorBearer = method !== "GET";
+  const checkAuth = authMiddleware(
+    deps.authConfig,
+    requiresOperatorBearer ? { requireToken: true } : undefined,
+  );
   if (!checkAuth(req, res, url)) return true; // 401 already sent
 
   // ── Static files: /console/*, /console ────────────────────────────
@@ -287,7 +305,11 @@ function handleError(res: ServerResponse, err: unknown): void {
       detail: err.message,
     });
   } else {
-    const msg = err instanceof Error ? err.message : String(err);
-    writeJSON(res, 500, { ok: false, error: "internal", detail: msg });
+    // Unexpected (non-ConsoleError) failures can carry internal detail in
+    // their message or stack (filesystem paths, upstream error text). Never
+    // return that to the console client: the ConsoleError branch above is the
+    // only operator-facing error text, and its messages are constructed from
+    // known-safe strings. Unexpected errors get a generic 500 with no detail.
+    writeJSON(res, 500, { ok: false, error: "internal" });
   }
 }

@@ -24,6 +24,15 @@ export const INTEL_OPS = {
    * surfaces in a single persist.
    */
   BULK_SUBSTRATE_CHOSEN: "intelligence_bulk_substrate_chosen",
+  /**
+   * The invoke-time chokepoint found a persisted non-local binding for
+   * the pinned `privacy-filter-tier-2` surface (pre-existing or
+   * tampered config) and overrode it to `local` per the ratified
+   * 2026-07-23 posture. Emitted ONCE per process on the first override
+   * so a tampered binding leaves a trace without flooding the log on
+   * every call. Never silently honored.
+   */
+  TIER2_BINDING_PINNED: "query_anonymity_tier2_binding_pinned",
 } as const;
 
 export type IntelOp = (typeof INTEL_OPS)[keyof typeof INTEL_OPS];

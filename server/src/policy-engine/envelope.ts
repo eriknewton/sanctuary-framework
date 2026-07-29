@@ -1,19 +1,19 @@
 /**
- * Sanctuary Policy Engine — SignedEvent<PolicyUpdatePayload> packaging.
+ * Sanctuary Policy Engine - SignedEvent<PolicyUpdatePayload> packaging.
  *
  * WP-MVP-3 owns the mesh surface. This module calls into the mesh only via
- * its public API (packSignedEvent / verifySignedEvent / verifyCertChain) —
+ * its public API (packSignedEvent / verifySignedEvent / verifyCertChain) -
  * it never touches `server/src/mesh/` internals.
  *
  * Pack flow:
  *   1. Validate CompiledPolicy shape.
  *   2. Encode blob: base64url(canonicalJSON(policy)).
- *   3. Build PolicyUpdatePayload { agent_id, policy_version, policy_blob,
- *      parent_version? }.
+ *   3. Build PolicyUpdatePayload { agent_id, policy_version, validity window,
+ *      policy_blob, parent_version? }.
  *   4. Hand to mesh packSignedEvent with event_type = "policy_update".
  *
  * Unpack flow (receiver):
- *   1. mesh verifySignedEvent — validates chain + signatures + payload_hash.
+ *   1. mesh verifySignedEvent - validates chain + signatures + payload_hash.
  *   2. Decode policy_blob; validateCompiledPolicyShape.
  *   3. Cross-check payload.agent_id === compiled.agent_id,
  *      payload.policy_version === compiled.policy_version,
@@ -53,18 +53,22 @@ export interface PackPolicyUpdateParams {
   emitter_principal: string;
   /** Per-emitter monotonic envelope sequence. */
   monotonic_seq: number;
-  /** Node signing key — Ed25519 private key bytes. */
+  /** Node signing key - Ed25519 private key bytes. */
   node_private_key: Uint8Array;
-  /** Principal signing key — Ed25519 private key bytes. Recommended. */
+  /** Principal signing key - Ed25519 private key bytes. Recommended. */
   principal_private_key?: Uint8Array;
   /** Optional causal parents (prior policy_update event_ids). */
   causal_parents?: string[];
+  /** Optional start of the signed validity window. Defaults to now. */
+  valid_from?: string;
+  /** Optional end of the signed validity window. Defaults to valid_from + 24h. */
+  valid_until?: string;
 }
 
 /**
  * Pack a CompiledPolicy into a signed mesh event ready for transport.
  *
- * Intentionally does NOT transport — the caller hands the returned event to
+ * Intentionally does NOT transport - the caller hands the returned event to
  * whatever mesh transport is active (WP-MVP-3's in-memory transport at v0.1,
  * a libp2p wire adapter at a later phase).
  */
@@ -73,9 +77,15 @@ export function packPolicyUpdate(
 ): SignedEvent<PolicyUpdatePayload> {
   validateCompiledPolicyShape(params.policy);
   const blob = encodePolicyBlob(params.policy);
+  const validFrom = params.valid_from ?? new Date().toISOString();
+  const validUntil =
+    params.valid_until ??
+    new Date(Date.parse(validFrom) + 24 * 60 * 60 * 1000).toISOString();
   const payload: PolicyUpdatePayload = {
     agent_id: params.policy.agent_id,
     policy_version: params.policy.policy_version,
+    valid_from: validFrom,
+    valid_until: validUntil,
     policy_blob: blob,
     ...(params.policy.parent_version !== undefined
       ? { parent_version: params.policy.parent_version }

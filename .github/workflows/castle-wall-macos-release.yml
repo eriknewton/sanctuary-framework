@@ -31,6 +31,146 @@ jobs:
           xcodebuild -version
           swift --version
 
+      # Preflight: name the missing credential instead of dying inside Keychain.
+      #
+      # 2026-06-16 (run 27641268243) this job's only execution failed with
+      # "SecKeychainItemImport: One or more parameters passed to a function were
+      # not valid." That message reads like a malformed or expired certificate.
+      # It was neither: none of the five Apple secrets had ever been set, so
+      # P12_BASE64 was empty, `base64 --decode` produced a 0-byte file, and
+      # `security import` rejected it as a bad parameter. The real fault was
+      # six steps upstream of the error text, and the release pipeline sat
+      # silently broken for six weeks because nothing said which input was absent.
+      #
+      # Absence must be representable. Check every secret this job consumes,
+      # report ALL that are missing in one pass rather than one failure per run,
+      # and never print a value.
+      - name: Preflight signing and notarization credentials
+        env:
+          P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_P12 }}
+          P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
+          NOTARY_APPLE_ID: ${{ secrets.APPLE_NOTARY_APPLE_ID }}
+          NOTARY_PASSWORD: ${{ secrets.APPLE_NOTARY_PASSWORD }}
+          TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          missing=""
+          for name in P12_BASE64 P12_PASSWORD NOTARY_APPLE_ID NOTARY_PASSWORD TEAM_ID; do
+            eval "value=\${$name}"
+            if [ -z "$value" ]; then
+              missing="$missing $name"
+            fi
+          done
+
+          if [ -n "$missing" ]; then
+            echo "::error::Apple release credentials are not configured on this repository."
+            echo "Missing (empty or unset):$missing"
+            echo ""
+            echo "Secret names, in repository Settings > Secrets and variables > Actions:"
+            echo "  APPLE_DEVELOPER_ID_P12           base64 of the Developer ID Application .p12"
+            echo "  APPLE_DEVELOPER_ID_P12_PASSWORD  the password used when exporting that .p12"
+            echo "  APPLE_NOTARY_APPLE_ID            Apple ID used for notarytool"
+            echo "  APPLE_NOTARY_PASSWORD            app-specific password for that Apple ID"
+            echo "  APPLE_TEAM_ID                    Developer Team ID"
+            echo ""
+            echo "See .github/RELEASING.md for the export procedure."
+            exit 1
+          fi
+
+          # Validate the p12 decodes and is really PKCS#12 before Keychain sees
+          # it, so a truncated or mis-pasted secret reports as such rather than
+          # as an opaque Keychain parameter error. Password is NOT checked here:
+          # a wrong password must fail at import, not leak a distinguishing
+          # signal from a step whose output is public.
+          if ! printf '%s' "$P12_BASE64" | base64 --decode > "$RUNNER_TEMP/preflight.p12" 2>/dev/null; then
+            echo "::error::APPLE_DEVELOPER_ID_P12 is not valid base64. Re-export and re-paste it."
+            rm -f "$RUNNER_TEMP/preflight.p12"
+            exit 1
+          fi
+
+          if [ ! -s "$RUNNER_TEMP/preflight.p12" ]; then
+            echo "::error::APPLE_DEVELOPER_ID_P12 decoded to an empty file."
+            rm -f "$RUNNER_TEMP/preflight.p12"
+            exit 1
+          fi
+
+          if ! openssl asn1parse -inform DER -in "$RUNNER_TEMP/preflight.p12" >/dev/null 2>&1; then
+            echo "::error::APPLE_DEVELOPER_ID_P12 decoded to $(wc -c < "$RUNNER_TEMP/preflight.p12" | tr -d ' ') bytes that are not a PKCS#12 container."
+            rm -f "$RUNNER_TEMP/preflight.p12"
+            exit 1
+          fi
+
+          rm -f "$RUNNER_TEMP/preflight.p12"
+          echo "All five Apple credentials are present and the .p12 parses."
+
+      # Presence is not validity. 2026-07-25 (run 30181951917) the step above
+      # passed, the app built and signed, and the job then died at "Notarize and
+      # staple" with Apple HTTP 401 "Invalid credentials": the notary secrets
+      # were SET but WRONG, and the pipeline only learned that after the entire
+      # build. Same failure class as the six-week silent gap that motivated the
+      # presence preflight, one layer up.
+      #
+      # So before any build step, make the same round-trip to Apple that the
+      # notarize step will make, using a cheap read-only call. `notarytool
+      # history` authenticates with the identical apple-id/team-id/password
+      # triple as `notarytool submit` and lists past submissions without
+      # uploading anything, so it succeeds if and only if the notarize step's
+      # credentials would be accepted.
+      #
+      # This step runs AFTER the presence checks on purpose: a missing secret
+      # must still be reported as missing (by the step above), never as
+      # "invalid". This step therefore only ever fires on secrets that exist
+      # but are rejected by Apple. Never print a secret value; classify from
+      # the HTTP status code alone and do not dump raw notarytool output
+      # (it can echo the Apple ID back).
+      - name: Preflight notary credential validity against Apple
+        env:
+          APPLE_ID: ${{ secrets.APPLE_NOTARY_APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_NOTARY_PASSWORD: ${{ secrets.APPLE_NOTARY_PASSWORD }}
+        run: |
+          set -u
+
+          status=0
+          output=$(xcrun notarytool history \
+            --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_NOTARY_PASSWORD" 2>&1) || status=$?
+
+          if [ "$status" -eq 0 ]; then
+            echo "Notary credentials are VALID: notarytool history round-trip to Apple succeeded."
+            exit 0
+          fi
+
+          http_code=$(printf '%s' "$output" \
+            | grep -oE 'HTTP status code: [0-9]{3}' \
+            | head -n 1 \
+            | grep -oE '[0-9]{3}' || true)
+
+          echo "::error::Preflight check FAILED: notary credential VALIDITY (credentials are present but Apple rejected them)."
+          echo "notarytool history exited with status $status before any build step ran."
+          echo "The presence preflight already passed, so all five secrets are set; the notary triple (APPLE_NOTARY_APPLE_ID / APPLE_NOTARY_PASSWORD / APPLE_TEAM_ID) is being rejected or is unreachable."
+          echo ""
+          case "$http_code" in
+            401)
+              echo "Apple error class: HTTP 401 invalid credentials. The Apple ID + app-specific password + Team ID combination was rejected."
+              echo "Fix: regenerate the app-specific password at appleid.apple.com (Sign-In and Security > App-Specific Passwords) and paste the NEW value into the APPLE_NOTARY_PASSWORD repository secret."
+              echo "The Apple ID account password will NOT work; notarytool requires an app-specific password."
+              ;;
+            403)
+              echo "Apple error class: HTTP 403 forbidden. Usually a pending developer-agreement or account/team access issue, not a wrong password."
+              echo "Fix: sign in at developer.apple.com with the notary Apple ID and accept any pending agreements, then re-run."
+              ;;
+            "")
+              echo "Apple error class: no HTTP status code in notarytool output. Likely a network failure, an Xcode command-line-tools problem on the runner, or a malformed invocation rather than a credential rejection."
+              echo "Fix: re-run the job; if it persists, run the same notarytool history call locally with the same credentials to see the full error."
+              ;;
+            *)
+              echo "Apple error class: HTTP $http_code (neither 401 invalid-credentials nor 403 agreement/access)."
+              echo "Fix: run the same notarytool history call locally with the same credentials to see the full error."
+              ;;
+          esac
+          exit 1
+
       - name: Import signing certificate
         env:
           P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_P12 }}
@@ -42,7 +182,7 @@ jobs:
           security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
 
-          echo "$P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          printf '%s' "$P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
           security import "$RUNNER_TEMP/cert.p12" \
             -k "$KEYCHAIN_PATH" \
             -P "$P12_PASSWORD" \
@@ -55,6 +195,17 @@ jobs:
           security find-identity -v -p codesigning "$KEYCHAIN_PATH"
           rm -f "$RUNNER_TEMP/cert.p12"
 
+      # `build-signed.sh --wrapped` notarizes INLINE when NOTARYTOOL_PROFILE names
+      # a stored notarytool keychain profile, and otherwise refuses, because a
+      # signed-but-unnotarized .systemextension is silently uninstalled by Tahoe
+      # sysextd at validation (drill 2026-06-11c, finding W6-N1). This job has no
+      # such profile: it holds the raw Apple ID + app-specific password as secrets
+      # and notarizes in the dedicated step below.
+      #
+      # `--allow-unnotarized` therefore says "this step is not the notarizing
+      # step", NOT "ship it unnotarized". The guard's intent is preserved by the
+      # Notarize step, which is mandatory here and fails the job if it does not
+      # run. Do NOT use this flag in a path that has no following notarization.
       - name: Build, wrap, and sign
         working-directory: castle-wall-macos
         env:
@@ -62,23 +213,155 @@ jobs:
         run: |
           swift build -c release
           bash scripts/build-wrapped.sh
-          bash scripts/build-signed.sh --wrapped
+          bash scripts/build-signed.sh --wrapped --allow-unnotarized
 
-      - name: Notarize
+      # Fail-closed launchability assertions, BEFORE notarization spends time
+      # and an Apple round-trip on a bundle that cannot launch.
+      #
+      # Why: the v1.7.0 and v1.7.1 release assets were signed and notarized
+      # but could not launch on any Mac. Their binaries claim restricted
+      # entitlements (com.apple.developer.system-extension.install plus the
+      # networkextension content-filter provider), and AMFI refuses to spawn
+      # a restricted-entitlement binary whose bundle has no
+      # Contents/embedded.provisionprofile ("Launchd job spawn failed", RBS
+      # error 5). Signing, notarization, spctl, and stapler ALL pass on such
+      # a bundle; none of them checks for the profile. These assertions do.
+      #
+      # The profiles now live in the repo at castle-wall-macos/signing/ and
+      # are embedded by build-signed.sh before codesign seals the bundle. A
+      # provisioning profile is NOT a secret: it ships inside every
+      # distributed app, readable by anyone who downloads the release zip,
+      # and cannot sign anything.
+      #
+      # The script asserts, each failure naming exactly what is missing:
+      #   1. Contents/embedded.provisionprofile exists in the outer app;
+      #   2. the nested .systemextension has its own embedded profile
+      #      (the working local build carries both);
+      #   3. every restricted entitlement the signed binaries claim is
+      #      covered by the embedded profile's grant (security cms -D +
+      #      plist comparison);
+      #   4. codesign --verify --deep --strict passes (a profile copied in
+      #      AFTER signing breaks the seal and fails here).
+      - name: Assert embedded provisioning profiles and entitlement coverage
+        working-directory: castle-wall-macos
+        run: bash scripts/verify-embedded-profiles.sh build/Sanctuary-CastleWall.app
+
+      # Ordering matters and was wrong before: the uploaded artifact used to be a
+      # zip taken BEFORE `stapler staple`, so Apple held the ticket while the
+      # shipped bundle did not carry it. That bundle passes `spctl` on a machine
+      # that can reach Apple and fails Gatekeeper offline, which is the worst
+      # place to discover it. Staple the .app first, prove the ticket is attached
+      # with `stapler validate`, and only then produce the artifact zip.
+      - name: Notarize and staple
         env:
           APPLE_ID: ${{ secrets.APPLE_NOTARY_APPLE_ID }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           APPLE_NOTARY_PASSWORD: ${{ secrets.APPLE_NOTARY_PASSWORD }}
         working-directory: castle-wall-macos
         run: |
-          ditto -c -k --keepParent build/Sanctuary-CastleWall.app build/Sanctuary-CastleWall.app.zip
-          xcrun notarytool submit build/Sanctuary-CastleWall.app.zip \
+          set -euo pipefail
+
+          # Submission zip is a transient input to notarytool, never the artifact.
+          ditto -c -k --keepParent build/Sanctuary-CastleWall.app "$RUNNER_TEMP/notarize-submission.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/notarize-submission.zip" \
             --apple-id "$APPLE_ID" \
             --team-id "$APPLE_TEAM_ID" \
             --password "$APPLE_NOTARY_PASSWORD" \
             --wait
+          rm -f "$RUNNER_TEMP/notarize-submission.zip"
+
           xcrun stapler staple build/Sanctuary-CastleWall.app
+
+          # `stapler validate` is the check that the ticket is actually ATTACHED
+          # to the bundle. `spctl` alone can pass on a networked machine via an
+          # online lookup, so it cannot distinguish stapled from merely notarized.
+          xcrun stapler validate build/Sanctuary-CastleWall.app
           spctl --assess --type execute --verbose=4 build/Sanctuary-CastleWall.app
+
+          # Artifact zip is produced from the STAPLED bundle.
+          ditto -c -k --keepParent build/Sanctuary-CastleWall.app build/Sanctuary-CastleWall.app.zip
+
+      # Launch smoke test: prove the exact bundle we ship can be SPAWNED.
+      #
+      # Mechanism: direct-exec the host binary in `--headless status` mode
+      # (built for no-WindowServer contexts) under a watchdog. An AMFI spawn
+      # refusal kills the process with SIGKILL before main() ever runs and
+      # produces no output; measured on the broken v1.7.1 asset this is an
+      # instant exit 137. So the classification is:
+      #   - killed by a signal (exit >= 128) or exec failure (126/127):
+      #     FAIL loudly with the signal/exit diagnosis. This is the
+      #     v1.7.0/v1.7.1 defect class.
+      #   - any controlled exit (0-4, the headless CLI contract codes): PASS.
+      #     AMFI refusal can never produce a controlled exit, so reaching
+      #     main() and returning a contract code proves spawnability.
+      #   - still alive after the watchdog cap: it spawned and ran; kill it
+      #     and PASS.
+      #
+      # What this proves and does not prove: it proves the signed, stapled
+      # bundle passes the AMFI entitlement/profile check and executes our
+      # code on a stock macOS runner - the exact check that killed
+      # v1.7.0/v1.7.1. It does NOT prove filter enforcement, system
+      # extension activation (needs one-time console consent), or a full
+      # LaunchServices GUI launch (a CI runner has no interactive login
+      # session to test that in); those remain hardware-drill territory.
+      - name: Launch smoke test (spawnability, fail closed)
+        working-directory: castle-wall-macos
+        run: |
+          set -uo pipefail
+          BIN="build/Sanctuary-CastleWall.app/Contents/MacOS/CastleWallHostApp"
+          test -x "$BIN" || { echo "::error::smoke test: host binary missing at $BIN"; exit 1; }
+
+          "$BIN" --headless status > "$RUNNER_TEMP/smoke-out.txt" 2> "$RUNNER_TEMP/smoke-err.txt" &
+          pid=$!
+
+          # 3-second watchdog window: AMFI kills are effectively instant.
+          early_death=false
+          for _ in $(seq 1 30); do
+            kill -0 "$pid" 2>/dev/null || { early_death=true; break; }
+            sleep 0.1
+          done
+
+          we_killed=false
+          if [ "$early_death" = false ]; then
+            # Survived the spawn window. Allow up to 35 more seconds for the
+            # headless status call (30s internal timeout) to exit on its own,
+            # then reap it ourselves.
+            for _ in $(seq 1 350); do
+              kill -0 "$pid" 2>/dev/null || break
+              sleep 0.1
+            done
+            if kill -0 "$pid" 2>/dev/null; then
+              we_killed=true
+              kill -9 "$pid" 2>/dev/null || true
+            fi
+          fi
+
+          set +e
+          wait "$pid"
+          status=$?
+          set -e
+
+          echo "--- stdout ---"; cat "$RUNNER_TEMP/smoke-out.txt" || true
+          echo "--- stderr ---"; cat "$RUNNER_TEMP/smoke-err.txt" || true
+
+          if [ "$we_killed" = true ]; then
+            echo "smoke test PASS: process spawned and was still running at the watchdog cap (killed by the test, not the OS)."
+            exit 0
+          fi
+          if [ "$status" -ge 128 ]; then
+            sig=$((status - 128))
+            echo "::error::smoke test FAIL: host binary died from signal $sig (exit $status). Signal 9 within the spawn window is the AMFI kill that shipped in v1.7.0/v1.7.1 (restricted entitlements without an embedded provisioning profile)."
+            exit 1
+          fi
+          if [ "$status" -eq 126 ] || [ "$status" -eq 127 ]; then
+            echo "::error::smoke test FAIL: host binary could not be executed at all (exit $status)."
+            exit 1
+          fi
+          if [ "$status" -le 4 ]; then
+            echo "smoke test PASS: controlled exit $status (headless CLI contract code); the process spawned and executed application code."
+          else
+            echo "smoke test PASS on spawnability: controlled exit $status (outside the 0-4 contract range, logged for the record); the process spawned and executed application code."
+          fi
 
       - name: Upload signed artifact
         uses: actions/upload-artifact@v7

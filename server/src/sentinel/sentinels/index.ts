@@ -40,6 +40,10 @@ import {
   AuditdTailWatcher,
   AUDITD_TAIL_SENTINEL_ID,
 } from "./auditd-tail-watcher.js";
+import {
+  AgentEgressWatcher,
+  AGENT_EGRESS_SENTINEL_ID,
+} from "./agent-egress-watcher.js";
 import type { SentinelCatalogEntry } from "../sentinel-registry.js";
 
 export const PHI1_BASELINE_CATALOG: SentinelCatalogEntry[] = [
@@ -85,6 +89,13 @@ export const PHI1_BASELINE_CATALOG: SentinelCatalogEntry[] = [
       "Tails platform audit log as cross-platform fallback for kernel observation when eBPF is unavailable.",
     factory: () => new AuditdTailWatcher(),
   },
+  {
+    sentinelId: AGENT_EGRESS_SENTINEL_ID,
+    description:
+      "Watches the confined agent's default-deny egress denials and the periodic as-agent-uid endpoint probe; " +
+      "alerts on a sustained deny burst to one host or a failed provisioned-endpoint probe (a silently degraded agent).",
+    factory: () => new AgentEgressWatcher(),
+  },
 ];
 
 export {
@@ -102,4 +113,6 @@ export {
   EBPF_SYSCALL_SENTINEL_ID,
   AuditdTailWatcher,
   AUDITD_TAIL_SENTINEL_ID,
+  AgentEgressWatcher,
+  AGENT_EGRESS_SENTINEL_ID,
 };

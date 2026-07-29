@@ -48,10 +48,7 @@ import {
 import { upsertPersistedLocalAgent } from "../../../src/hub/agent-registry-persistence.js";
 import { getClientScript } from "../../../src/dashboard/v1_1/index.js";
 import type { LocalAgentRecord } from "../../../src/contracts/v1.1/local-agent-records.js";
-
-function pickPort(): number {
-  return 17000 + Math.floor(Math.random() * 20000);
-}
+import { getFreePort } from "../../helpers/free-port.js";
 
 function buildSeedRecord(agentId: string): LocalAgentRecord {
   const now = new Date().toISOString();
@@ -104,7 +101,7 @@ describe("v1.1 Agents empty-state canary (Finding Z regression)", () => {
     beforeEach(async () => {
       storagePath = await mkdtemp(join(tmpdir(), "sanctuary-v117-z-canary-"));
       authToken = `z-canary-${randomBytes(8).toString("hex")}`;
-      port = pickPort();
+      port = await getFreePort();
     });
 
     afterEach(async () => {

@@ -17,11 +17,13 @@ import {
   ReputationStore,
   buildReputationCompletenessManifest,
   reputationBundleSigningBytes,
+  trustedSovereigntyTier,
   verifyReputationBundleCompleteness,
   type Attestation,
   type ReputationBundle,
   type StoredAttestation,
 } from "../../src/reputation/reputation-store.js";
+import type { SovereigntyTier } from "../../src/reputation/tiers.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import type { StorageBackend } from "../../src/storage/interface.js";
 import { generateRandomKey } from "../../src/core/random.js";
@@ -77,6 +79,42 @@ function publicKeysFor(
 
 function cloneBundle(bundle: ReputationBundle): ReputationBundle {
   return JSON.parse(JSON.stringify(bundle)) as ReputationBundle;
+}
+
+/**
+ * Observe the reputation_query_weighted MCP tool output over the same
+ * storage + masterKey a ReputationStore persists to. The tool builds its own
+ * store over that storage, so it reads exactly the records under test. This is
+ * the end-to-end scoring surface an agent actually calls, used to prove the
+ * tier clamp is enforced at the loadAllForTierScoring boundary rather than only
+ * when a caller remembers to call trustedSovereigntyTier.
+ */
+async function queryWeighted(
+  store: ReputationStore,
+  masterKey: Uint8Array,
+  metric: string
+): Promise<{
+  weighted_score: number;
+  tier_distribution: Record<SovereigntyTier, number>;
+}> {
+  // The store already holds the storage; reuse it so the tool sees the same
+  // persisted _reputation records.
+  const storage = (store as unknown as { storage: StorageBackend }).storage;
+  const identityManager = new IdentityManager(storage, masterKey);
+  const auditLog = new AuditLog(storage, masterKey);
+  const { tools } = createReputationTools(
+    storage,
+    masterKey,
+    identityManager,
+    auditLog
+  );
+  const tool = tools.find((t) => t.name === "reputation_query_weighted");
+  if (!tool) throw new Error("reputation_query_weighted tool not found");
+  const result = await tool.handler({ metric });
+  return JSON.parse(result.content[0]!.text) as {
+    weighted_score: number;
+    tier_distribution: Record<SovereigntyTier, number>;
+  };
 }
 
 function stripManifest(bundle: ReputationBundle): ReputationBundle {
@@ -1902,6 +1940,523 @@ describe("L4 Reputation Store", () => {
       // Summary for the actual participant returns the record
       const self = await store.summarizeForSHR(identity.did);
       expect(self.attestation_count).toBe(1);
+    });
+  });
+
+  // ── Attestation-trust hardening (Heralds reputation import path) ─────────
+  describe("import-trust hardening", () => {
+    // Re-seal a tampered bundle so the completeness manifest and the BUNDLE
+    // signature both pass, isolating the per-attestation signature-verification
+    // layer as the thing that must reject the forgery. Without this the manifest
+    // checksum would trip first (also a valid rejection, but a different layer).
+    function resealManifestAndBundle(
+      bundle: ReputationBundle,
+      exporter: ReturnType<typeof setupIdentity>["identity"],
+      exporterKey: Uint8Array
+    ): ReputationBundle {
+      const rebuilt = cloneBundle(bundle);
+      rebuilt.completeness_manifest = buildReputationCompletenessManifest(
+        rebuilt.exported_at,
+        rebuilt.attestations
+      );
+      rebuilt.bundle_signature = toBase64url(
+        sign(
+          reputationBundleSigningBytes(rebuilt),
+          exporter.encrypted_private_key,
+          exporterKey
+        )
+      );
+      return rebuilt;
+    }
+
+    // (1) FORGED IMPORT: a bundle whose per-attestation signature does not match
+    // the claimed signer must be REJECTED, not credited, EVEN when the bundle
+    // and its completeness manifest are internally consistent.
+    it("rejects a forged import whose attestation signature is invalid", async () => {
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const store = new ReputationStore(storage, masterKey);
+      const { identity, encryptionKey } = setupIdentity(masterKey);
+
+      await store.record(
+        "forge-1", "did:key:cp",
+        { type: "transaction", result: "completed", metrics: { rate: 0.9 } },
+        "commerce", identity, encryptionKey
+      );
+
+      const bundle = await store.exportBundle(identity, encryptionKey);
+
+      // Attacker tampers the signed metric value but leaves the OLD per-att
+      // signature, then re-seals the manifest + bundle signature so only the
+      // per-attestation signature is now wrong.
+      const forged = cloneBundle(bundle);
+      forged.attestations[0]!.data.metrics.rate = 1.0;
+      const resealed = resealManifestAndBundle(forged, identity, encryptionKey);
+
+      const storage2 = new MemoryStorage();
+      const store2 = new ReputationStore(storage2, masterKey);
+      const publicKeys = publicKeysFor(identity);
+
+      // FAIL-BEFORE (regression anchor): must throw, never silently import.
+      await expect(
+        store2.importBundle(resealed, true, publicKeys)
+      ).rejects.toThrow(/invalid or unverifiable signatures/);
+      await expect(storage2.list("_reputation")).resolves.toHaveLength(0);
+    });
+
+    it("rejects a forged import whose signer does not match participant_did", async () => {
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const store = new ReputationStore(storage, masterKey);
+      const { identity, encryptionKey } = setupIdentity(masterKey, "victim");
+      const { identity: attacker } = setupIdentity(masterKey, "attacker");
+
+      await store.record(
+        "forge-2", "did:key:cp",
+        { type: "transaction", result: "completed" },
+        "commerce", identity, encryptionKey
+      );
+      const bundle = await store.exportBundle(identity, encryptionKey);
+
+      // Attacker rewrites the signer to their own DID while participant_did stays
+      // the victim's, then re-seals so signer !== participant_did is the only
+      // defect left for the signature layer to catch.
+      const forged = cloneBundle(bundle);
+      forged.attestations[0]!.signer = attacker.did;
+      const resealed = resealManifestAndBundle(forged, identity, encryptionKey);
+
+      const storage2 = new MemoryStorage();
+      const store2 = new ReputationStore(storage2, masterKey);
+      const publicKeys = publicKeysFor(identity, attacker);
+
+      await expect(
+        store2.importBundle(resealed, true, publicKeys)
+      ).rejects.toThrow(/invalid or unverifiable signatures/);
+      await expect(storage2.list("_reputation")).resolves.toHaveLength(0);
+    });
+
+    // (3) CRAFTED TIER: a self-signed "verified-sovereign" attestation is a valid
+    // signature over a self-asserted tier. Import must accept the signature but
+    // must NOT trust the privileged tier: weighted scoring / SHR summary must
+    // clamp it to the non-privileged import ceiling (self-attested).
+    it("clamps a self-asserted verified-sovereign tier on import so it cannot inflate weight", async () => {
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const store = new ReputationStore(storage, masterKey);
+      const { identity, encryptionKey } = setupIdentity(masterKey);
+
+      // Attacker self-signs an attestation CLAIMING the top tier.
+      await store.record(
+        "tier-forge-1", "did:key:cp",
+        { type: "transaction", result: "completed", metrics: { rate: 1.0 } },
+        "commerce", identity, encryptionKey,
+        undefined,
+        "verified-sovereign"
+      );
+      const bundle = await store.exportBundle(identity, encryptionKey);
+      // Sanity: the exported claim is indeed the privileged tier.
+      expect(bundle.attestations[0]!.data.sovereignty_tier).toBe(
+        "verified-sovereign"
+      );
+
+      const storage2 = new MemoryStorage();
+      const store2 = new ReputationStore(storage2, masterKey);
+      const result = await store2.importBundle(
+        bundle, true, publicKeysFor(identity)
+      );
+      expect(result.imported).toBe(1);
+      expect(result.invalid).toBe(0);
+
+      // FAIL-BEFORE: summary tier distribution would have counted this as
+      // verified-sovereign. PASS-AFTER: it is clamped to self-attested.
+      const summary = await store2.summarizeForSHR();
+      expect(summary.tier_distribution["verified-sovereign"]).toBe(0);
+      expect(summary.tier_distribution["self-attested"]).toBe(1);
+
+      // Tier scoring sees the clamped tier, not the forged claim.
+      const stored = await store2.loadAllForTierScoring({});
+      expect(stored).toHaveLength(1);
+      expect(trustedSovereigntyTier(stored[0]!)).toBe("self-attested");
+      // B2 round-2 finding 2 (boundary chokepoint): the clamp is applied AT the
+      // loadAllForTierScoring API, so a caller reading the RAW tier field of the
+      // returned scoring view sees the clamped tier WITHOUT having to remember
+      // to call trustedSovereigntyTier. FAIL-BEFORE: this field was the forged
+      // "verified-sovereign". PASS-AFTER: the boundary returns "self-attested".
+      expect(stored[0]!.attestation.data.sovereignty_tier).toBe("self-attested");
+
+      // The forged import must also score as self-attested weight (0.6), never
+      // the privileged 1.0, observed through the reputation_query_weighted tool.
+      const weighted = await queryWeighted(store2, masterKey, "rate");
+      expect(weighted.tier_distribution["verified-sovereign"]).toBe(0);
+      expect(weighted.tier_distribution["self-attested"]).toBe(1);
+    });
+
+    it("does NOT clamp a locally recorded verified-sovereign tier", async () => {
+      // Regression guard: the clamp must apply ONLY to imported attestations.
+      // A locally recorded tier came from a handshake this instance witnessed.
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const store = new ReputationStore(storage, masterKey);
+      const { identity, encryptionKey } = setupIdentity(masterKey);
+
+      await store.record(
+        "local-1", "did:key:cp",
+        { type: "transaction", result: "completed" },
+        "commerce", identity, encryptionKey,
+        undefined,
+        "verified-sovereign"
+      );
+
+      const summary = await store.summarizeForSHR();
+      expect(summary.tier_distribution["verified-sovereign"]).toBe(1);
+      const stored = await store.loadAllForTierScoring({});
+      expect(trustedSovereigntyTier(stored[0]!)).toBe("verified-sovereign");
+    });
+
+    // Write a StoredAttestation straight into the encrypted _reputation
+    // namespace, letting the caller control (or omit) the `imported` field.
+    // This reproduces a record persisted BEFORE the provenance marker existed
+    // (no `imported` key) or one written with an explicit provenance.
+    async function writeStoredAttestationWithProvenance(
+      storage: StorageBackend,
+      masterKey: Uint8Array,
+      identity: ReturnType<typeof setupIdentity>["identity"],
+      encryptionKey: Uint8Array,
+      opts: {
+        attestationId: string;
+        sovereigntyTier: SovereigntyTier;
+        imported?: boolean;
+        includeImportedField: boolean;
+      }
+    ): Promise<void> {
+      const now = new Date().toISOString();
+      const data: Attestation["data"] = {
+        interaction_id: opts.attestationId,
+        participant_did: identity.did,
+        counterparty_did: "did:key:cp",
+        outcome_type: "transaction",
+        outcome_result: "completed",
+        metrics: { rate: 1.0 },
+        context: "commerce",
+        timestamp: now,
+        sovereignty_tier: opts.sovereigntyTier,
+      };
+      const attestation: Attestation = {
+        attestation_id: opts.attestationId,
+        schema: "sanctuary-interaction-v1",
+        data,
+        signature: toBase64url(
+          sign(
+            stringToBytes(JSON.stringify(data)),
+            identity.encrypted_private_key,
+            encryptionKey
+          )
+        ),
+        signer: identity.did,
+      };
+      const stored: StoredAttestation = {
+        attestation,
+        counterparty_confirmed: false,
+        recorded_at: now,
+        // Only set the marker when the test asks for it; a legacy record has
+        // NO imported key at all.
+        ...(opts.includeImportedField ? { imported: opts.imported } : {}),
+      };
+      const reputationKey = derivePurposeKey(masterKey, "l4-reputation");
+      const encrypted = encrypt(
+        stringToBytes(JSON.stringify(stored)),
+        reputationKey
+      );
+      await storage.write(
+        "_reputation",
+        opts.attestationId,
+        stringToBytes(JSON.stringify(encrypted))
+      );
+    }
+
+    // FINDING 1 (legacy-provenance fail-open): a stored attestation with NO
+    // `imported` field is unknown-provenance and must FAIL CLOSED (clamped),
+    // not be treated as trusted-local. An attestation imported before this
+    // patch was written without `imported:true`, so absent-marker MUST clamp.
+    it("clamps a legacy record with NO imported field (fail-closed on absent provenance)", async () => {
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const store = new ReputationStore(storage, masterKey);
+      const { identity, encryptionKey } = setupIdentity(masterKey);
+
+      await writeStoredAttestationWithProvenance(
+        storage,
+        masterKey,
+        identity,
+        encryptionKey,
+        {
+          attestationId: "legacy-no-marker",
+          sovereigntyTier: "verified-sovereign",
+          includeImportedField: false, // legacy: no imported key at all
+        }
+      );
+
+      const stored = await store.loadAllForTierScoring({});
+      expect(stored).toHaveLength(1);
+      // Sanity: the field really is absent, so this exercises the fail-closed path.
+      expect(stored[0]!.imported).toBeUndefined();
+
+      // FAIL-BEFORE: trustedSovereigntyTier returned "verified-sovereign" for a
+      // record whose imported field was undefined (a pre-patch imported claim
+      // kept top weight). PASS-AFTER: absent provenance is clamped.
+      expect(trustedSovereigntyTier(stored[0]!)).toBe("self-attested");
+      // B2 round-2 finding 2 (boundary chokepoint): the RAW tier field of the
+      // scoring view returned by loadAllForTierScoring is already clamped, so a
+      // caller that reads attestation.data.sovereignty_tier directly (without
+      // calling trustedSovereigntyTier) still scores a legacy verified-sovereign
+      // record as self-attested. FAIL-BEFORE this was "verified-sovereign".
+      expect(stored[0]!.attestation.data.sovereignty_tier).toBe("self-attested");
+      const summary = await store.summarizeForSHR();
+      expect(summary.tier_distribution["verified-sovereign"]).toBe(0);
+      expect(summary.tier_distribution["self-attested"]).toBe(1);
+
+      // End-to-end through the reputation_query_weighted tool: a legacy
+      // no-marker verified-sovereign record scores as self-attested weight.
+      const weighted = await queryWeighted(store, masterKey, "rate");
+      expect(weighted.tier_distribution["verified-sovereign"]).toBe(0);
+      expect(weighted.tier_distribution["self-attested"]).toBe(1);
+    });
+
+    it("does NOT clamp a record explicitly marked imported:false", async () => {
+      // The other half of the fail-closed pair: only a provably-local record
+      // (imported === false) escapes the clamp. This is what record() now stamps.
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const store = new ReputationStore(storage, masterKey);
+      const { identity, encryptionKey } = setupIdentity(masterKey);
+
+      await writeStoredAttestationWithProvenance(
+        storage,
+        masterKey,
+        identity,
+        encryptionKey,
+        {
+          attestationId: "explicit-local",
+          sovereigntyTier: "verified-sovereign",
+          imported: false,
+          includeImportedField: true,
+        }
+      );
+
+      const stored = await store.loadAllForTierScoring({});
+      expect(stored).toHaveLength(1);
+      expect(stored[0]!.imported).toBe(false);
+      expect(trustedSovereigntyTier(stored[0]!)).toBe("verified-sovereign");
+      // Boundary chokepoint regression: a provably-local record is NOT clamped,
+      // so the raw tier field of the scoring view is left at verified-sovereign.
+      expect(stored[0]!.attestation.data.sovereignty_tier).toBe(
+        "verified-sovereign"
+      );
+    });
+
+    it("record() stamps genuinely-local attestations with imported:false", async () => {
+      // Guard the write side: a locally recorded attestation must carry the
+      // explicit local marker so it is correctly NOT clamped, and so it is
+      // distinguishable from an unknown-provenance legacy record.
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const store = new ReputationStore(storage, masterKey);
+      const { identity, encryptionKey } = setupIdentity(masterKey);
+
+      const recorded = await store.record(
+        "local-marked-1", "did:key:cp",
+        { type: "transaction", result: "completed" },
+        "commerce", identity, encryptionKey,
+        undefined,
+        "verified-sovereign"
+      );
+      expect(recorded.imported).toBe(false);
+
+      const stored = await store.loadAllForTierScoring({});
+      expect(stored[0]!.imported).toBe(false);
+    });
+
+    // FINDING 2 (signature-verification bypass on import): a missing signer key
+    // must make the attestation INVALID and the whole bundle rejected with zero
+    // writes. There is no allowUnverifiableAttestations escape on the import
+    // path. (Absent / malformed / tampered signatures are covered below.)
+    it("rejects an import whose per-attestation signer key is missing (zero writes, no bypass)", async () => {
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const store = new ReputationStore(storage, masterKey);
+      // Exporter (victim) whose key WILL be supplied, so the bundle-level
+      // signature check passes and the per-attestation layer is what must reject.
+      const { identity: exporter, encryptionKey: exporterKey } =
+        setupIdentity(masterKey, "victim");
+      // Stranger who signs the attestation; the importer never learns this key.
+      const { identity: stranger, encryptionKey: strangerKey } =
+        setupIdentity(masterKey, "stranger");
+
+      await store.record(
+        "unknown-signer-1", "did:key:cp",
+        { type: "transaction", result: "completed", metrics: { rate: 0.9 } },
+        "commerce", exporter, exporterKey
+      );
+      const bundle = await store.exportBundle(exporter, exporterKey);
+
+      // Rewrite the attestation so BOTH its signer and participant_did are the
+      // stranger, and it is validly self-signed by the stranger. This passes the
+      // signer===participant_did check, so the ONLY remaining defect is that the
+      // importer has no public key for the stranger (unknown signer).
+      const forged = cloneBundle(bundle);
+      forged.attestations[0]!.data.participant_did = stranger.did;
+      forged.attestations[0]!.signer = stranger.did;
+      forged.attestations[0]!.signature = toBase64url(
+        sign(
+          stringToBytes(JSON.stringify(forged.attestations[0]!.data)),
+          stranger.encrypted_private_key,
+          strangerKey
+        )
+      );
+      const resealed = resealManifestAndBundle(forged, exporter, exporterKey);
+
+      const storage2 = new MemoryStorage();
+      const store2 = new ReputationStore(storage2, masterKey);
+      // Supply ONLY the exporter's key, not the stranger's.
+      const publicKeys = publicKeysFor(exporter);
+
+      // FAIL-BEFORE: with the (now removed) allowUnverifiableAttestations option
+      // a missing signer key was counted only "unverifiable" and the bundle was
+      // still imported. PASS-AFTER: an unknown per-attestation signer is invalid,
+      // so the import is refused with no writes.
+      await expect(
+        store2.importBundle(resealed, true, publicKeys)
+      ).rejects.toThrow(/invalid or unverifiable signatures/);
+      await expect(storage2.list("_reputation")).resolves.toHaveLength(0);
+    });
+
+    it("rejects an import whose per-attestation signature is absent (zero writes)", async () => {
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const store = new ReputationStore(storage, masterKey);
+      const { identity, encryptionKey } = setupIdentity(masterKey);
+
+      await store.record(
+        "absent-sig-1", "did:key:cp",
+        { type: "transaction", result: "completed", metrics: { rate: 0.9 } },
+        "commerce", identity, encryptionKey
+      );
+      const bundle = await store.exportBundle(identity, encryptionKey);
+
+      // Strip the per-attestation signature entirely, then re-seal manifest +
+      // bundle so only the missing per-attestation signature is the defect.
+      const forged = cloneBundle(bundle);
+      // Cast through unknown: the wire shape may omit a field a strict type
+      // requires; this reproduces a hand-crafted bundle with no signature.
+      delete (forged.attestations[0]! as unknown as { signature?: string })
+        .signature;
+      const resealed = resealManifestAndBundle(forged, identity, encryptionKey);
+
+      const storage2 = new MemoryStorage();
+      const store2 = new ReputationStore(storage2, masterKey);
+      const publicKeys = publicKeysFor(identity);
+
+      await expect(
+        store2.importBundle(resealed, true, publicKeys)
+      ).rejects.toThrow(/invalid or unverifiable signatures/);
+      await expect(storage2.list("_reputation")).resolves.toHaveLength(0);
+    });
+
+    it("rejects an import whose per-attestation signature is malformed (zero writes)", async () => {
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const store = new ReputationStore(storage, masterKey);
+      const { identity, encryptionKey } = setupIdentity(masterKey);
+
+      await store.record(
+        "malformed-sig-1", "did:key:cp",
+        { type: "transaction", result: "completed", metrics: { rate: 0.9 } },
+        "commerce", identity, encryptionKey
+      );
+      const bundle = await store.exportBundle(identity, encryptionKey);
+
+      // A non-canonical / non-base64url signature string. fromBase64urlStrict
+      // rejects it; the lenient decoder used before would have silently coerced
+      // trailing junk and let a mangled signature through to verify() as bytes.
+      const forged = cloneBundle(bundle);
+      forged.attestations[0]!.signature = "!!!not-valid-base64url!!!";
+      const resealed = resealManifestAndBundle(forged, identity, encryptionKey);
+
+      const storage2 = new MemoryStorage();
+      const store2 = new ReputationStore(storage2, masterKey);
+      const publicKeys = publicKeysFor(identity);
+
+      await expect(
+        store2.importBundle(resealed, true, publicKeys)
+      ).rejects.toThrow(/invalid or unverifiable signatures/);
+      await expect(storage2.list("_reputation")).resolves.toHaveLength(0);
+    });
+
+    it("rejects an import whose per-attestation signature is tampered (zero writes)", async () => {
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const store = new ReputationStore(storage, masterKey);
+      const { identity, encryptionKey } = setupIdentity(masterKey);
+
+      await store.record(
+        "tampered-sig-1", "did:key:cp",
+        { type: "transaction", result: "completed", metrics: { rate: 0.9 } },
+        "commerce", identity, encryptionKey
+      );
+      const bundle = await store.exportBundle(identity, encryptionKey);
+
+      // Flip bytes inside a still-canonical base64url signature: it decodes
+      // cleanly (strict decode passes) but no longer verifies against the data.
+      const forged = cloneBundle(bundle);
+      const originalSig = forged.attestations[0]!.signature;
+      const sigBytes = fromBase64url(originalSig);
+      sigBytes[0]! ^= 0xff;
+      forged.attestations[0]!.signature = toBase64url(sigBytes);
+      // Sanity: still parseable as base64url, so this exercises verify(), not decode.
+      expect(forged.attestations[0]!.signature).not.toBe(originalSig);
+      const resealed = resealManifestAndBundle(forged, identity, encryptionKey);
+
+      const storage2 = new MemoryStorage();
+      const store2 = new ReputationStore(storage2, masterKey);
+      const publicKeys = publicKeysFor(identity);
+
+      await expect(
+        store2.importBundle(resealed, true, publicKeys)
+      ).rejects.toThrow(/invalid or unverifiable signatures/);
+      await expect(storage2.list("_reputation")).resolves.toHaveLength(0);
+    });
+
+    // (2) AGGREGATES-ONLY: query must expose aggregate shape only, never raw
+    // interaction rows (interaction_id, counterparty DIDs, per-attestation
+    // signatures, timestamps of individual interactions).
+    it("query returns aggregates only, never raw attestation rows", async () => {
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const store = new ReputationStore(storage, masterKey);
+      const { identity, encryptionKey } = setupIdentity(masterKey);
+
+      await store.record(
+        "secret-interaction-42", "did:key:secret-counterparty",
+        { type: "transaction", result: "completed", metrics: { rate: 0.77 } },
+        "commerce", identity, encryptionKey
+      );
+
+      const summary = await store.query({ metrics: ["rate"] });
+      const serialized = JSON.stringify(summary);
+
+      // No raw identifiers or per-row provenance leak through the aggregate.
+      expect(serialized).not.toContain("secret-interaction-42");
+      expect(serialized).not.toContain("secret-counterparty");
+      expect(serialized).not.toContain(identity.did);
+      expect(serialized).not.toContain("signature");
+      expect(serialized).not.toContain("attestation_id");
+
+      // The aggregate shape is present.
+      expect(summary.total_interactions).toBe(1);
+      expect(summary.aggregate_metrics.rate?.mean).toBeCloseTo(0.77);
+      expect(Object.keys(summary.aggregate_metrics.rate ?? {}).sort()).toEqual([
+        "count", "max", "mean", "median", "min",
+      ]);
     });
   });
 });

@@ -3,15 +3,15 @@
  * close on Linux without regressing the macOS / no-key channel basis.
  *
  * Slice L1 made the Linux daemon sign each enforcement event; Slice R made the
- * readers re-verify that signature against a pinned key. But nothing loaded the
- * key from disk in prod, so the crypto close was inert (key-null channel basis
- * on both sides). Slice P wires the SINGLE-SOURCE loader
+ * readers re-verify that signature against a pinned key. This suite exercises
+ * the key-loading binding with mocked signed events; it does not prove live
+ * Linux capability. Slice P wires the SINGLE-SOURCE loader
  * (`loadFortressProducerKey` → `<storage>/policy/egress/audit-producer.pub`) into
  * BOTH the consumer (lifecycle) and the readers (posture/dashboard), so:
  *
- *   (1) a real daemon-signed event re-verifies GREEN because the key is loaded;
+ *   (1) a mock-signed event re-verifies GREEN because the key is loaded;
  *   (2) a forged in-process entry renders NON-green BECAUSE the key is loaded
- *       (the activation made the close real — not key-null);
+ *       (the key-loaded harness is not key-null);
  *   (3) macOS / no-key stays channel-basis green (unknown-never-green preserved);
  *   (4) key-published-but-unreadable fails HONESTLY (degraded), never channel-green;
  *   (5) explicit rotation does not break verification.
@@ -41,6 +41,7 @@ import {
   producerKeyDaemonLaunchArgs,
   producerSigningBytes,
   CASTLE_WALL_PRODUCER_PUBKEY_RELPATH,
+  CASTLE_WALL_MACOS_AUDIT_PRODUCER_PUBKEY_PATH,
 } from "../../../src/castle-wall/runtime/producer-signature.js";
 import { startCastleWall } from "../../../src/castle-wall/runtime/lifecycle.js";
 import { buildCastleWallPosture } from "../../../src/principal-policy/posture.js";
@@ -54,11 +55,15 @@ import {
   CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY,
   CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
   CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1,
+  CASTLE_WALL_PRODUCER_SUBJECT_BINDING_DETAIL_KEY,
+  CASTLE_WALL_PRODUCER_SUBJECT_BINDING_SIGNED_IDENTITY_ID,
 } from "../../../src/castle-wall/constants.js";
 
 const FORTRESS = "fortress:test";
+const SUBJECT = `${FORTRESS}/uid-503`;
 const NOW = 1_750_000_000_000;
 const FRESH_TS = NOW - 1000;
+const LINUX_PRODUCER_KEY_LOAD = { platform: "linux" as const };
 
 function toBase64url(bytes: Uint8Array): string {
   let bin = "";
@@ -82,9 +87,9 @@ function walBody(seq: number): string {
     timestamp: new Date(FRESH_TS).toISOString(),
     layer: "l1",
     operation: "egress_blocked",
-    identity_id: "agent-1",
+    identity_id: SUBJECT,
     result: "blocked",
-    details: { agent_id: "agent-1", dest_host: "evil.example" },
+    details: { agent_id: SUBJECT, dest_host: "evil.example" },
   });
 }
 
@@ -98,18 +103,20 @@ async function appendGenuineSigned(
   await log.appendCritical({
     layer: "l1",
     operation: "egress_blocked",
-    identity_id: FORTRESS,
+    identity_id: SUBJECT,
     result: "success",
     timestamp: new Date(FRESH_TS).toISOString(),
     details: {
       seq,
-      agent_id: "agent-1",
+      agent_id: SUBJECT,
       dest_host: "evil.example",
       [CASTLE_WALL_PRODUCER_SIG_DETAIL_KEY]: toBase64url(sig),
       [CASTLE_WALL_PRODUCER_KID_DETAIL_KEY]: CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1,
       [CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY]: canonical,
       [CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY]: FRESH_TS,
       [CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY]: CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
+      [CASTLE_WALL_PRODUCER_SUBJECT_BINDING_DETAIL_KEY]:
+        CASTLE_WALL_PRODUCER_SUBJECT_BINDING_SIGNED_IDENTITY_ID,
       [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
     },
   });
@@ -120,7 +127,7 @@ async function appendForgedMarkerOnly(log: AuditLog): Promise<void> {
   await log.appendCritical({
     layer: "l1",
     operation: "egress_blocked",
-    identity_id: FORTRESS,
+    identity_id: SUBJECT,
     result: "success",
     timestamp: new Date(FRESH_TS).toISOString(),
     details: {
@@ -129,6 +136,8 @@ async function appendForgedMarkerOnly(log: AuditLog): Promise<void> {
       [CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY]: walBody(0),
       [CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY]: FRESH_TS,
       [CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY]: CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
+      [CASTLE_WALL_PRODUCER_SUBJECT_BINDING_DETAIL_KEY]:
+        CASTLE_WALL_PRODUCER_SUBJECT_BINDING_SIGNED_IDENTITY_ID,
       [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
     },
   });
@@ -248,12 +257,15 @@ describe("Slice P — single-source loader (the path consumer + reader share)", 
     expect(CASTLE_WALL_PRODUCER_PUBKEY_RELPATH).toBe(
       "policy/egress/audit-producer.pub",
     );
+    expect(CASTLE_WALL_MACOS_AUDIT_PRODUCER_PUBKEY_PATH).toBe(
+      "/Library/Application Support/Sanctuary/castle-audit-producer.pub",
+    );
   });
 
   it("status=present for a 32-byte published key", async () => {
     const pub = ed25519.getPublicKey(ed25519.utils.randomPrivateKey());
     await publishPubKey(tmp, pub);
-    const load = await loadFortressProducerKey(tmp);
+    const load = await loadFortressProducerKey(tmp, LINUX_PRODUCER_KEY_LOAD);
     expect(load.status).toBe("present");
     if (load.status === "present") {
       expect(load.keyB64url).toBe(toBase64url(pub));
@@ -261,7 +273,7 @@ describe("Slice P — single-source loader (the path consumer + reader share)", 
   });
 
   it("status=absent when no key file exists (the ONLY channel-basis path)", async () => {
-    const load = await loadFortressProducerKey(tmp);
+    const load = await loadFortressProducerKey(tmp, LINUX_PRODUCER_KEY_LOAD);
     expect(load.status).toBe("absent");
   });
 
@@ -269,8 +281,41 @@ describe("Slice P — single-source loader (the path consumer + reader share)", 
     const dir = join(tmp, "policy", "egress");
     await mkdir(dir, { recursive: true });
     await writeFile(join(dir, "audit-producer.pub"), Buffer.from([1, 2, 3]));
-    const load = await loadFortressProducerKey(tmp);
+    const load = await loadFortressProducerKey(tmp, LINUX_PRODUCER_KEY_LOAD);
     expect(load.status).toBe("unreadable");
+  });
+
+  it("on darwin prefers the host-wide audit-producer key published by the root helper", async () => {
+    const pub = ed25519.getPublicKey(ed25519.utils.randomPrivateKey());
+    const hostDir = join(tmp, "host-wide");
+    const hostPath = join(hostDir, "castle-audit-producer.pub");
+    await mkdir(hostDir, { recursive: true });
+    await writeFile(hostPath, Buffer.from(pub));
+
+    const load = await loadFortressProducerKey(tmp, {
+      platform: "darwin",
+      macosProducerPubKeyPath: hostPath,
+    });
+
+    expect(load.status).toBe("present");
+    if (load.status === "present") {
+      expect(load.keyB64url).toBe(toBase64url(pub));
+    }
+  });
+
+  it("on darwin falls back to the fortress key only when the host-wide key is absent", async () => {
+    const pub = ed25519.getPublicKey(ed25519.utils.randomPrivateKey());
+    await publishPubKey(tmp, pub);
+
+    const load = await loadFortressProducerKey(tmp, {
+      platform: "darwin",
+      macosProducerPubKeyPath: join(tmp, "missing", "castle-audit-producer.pub"),
+    });
+
+    expect(load.status).toBe("present");
+    if (load.status === "present") {
+      expect(load.keyB64url).toBe(toBase64url(pub));
+    }
   });
 
   it("daemon-launch args BIND the daemon publish path to the TS read path (codex HIGH #2)", () => {
@@ -291,7 +336,10 @@ describe("Slice P — consumer activation (startCastleWall via fortressStoragePa
   it("ACTIVATES: key present → consumer ENFORCES producer signatures", async () => {
     const pub = ed25519.getPublicKey(ed25519.utils.randomPrivateKey());
     await publishPubKey(tmp, pub);
-    const handle = await startToRunning({ fortressStoragePath: tmp });
+    const handle = await startToRunning({
+      fortressStoragePath: tmp,
+      producerKeyLoadOptions: LINUX_PRODUCER_KEY_LOAD,
+    });
     expect(handle.state()).toBe("running");
     // The load-bearing assertion: the consumer resolved the published key and is
     // enforcing per-producer signatures (the L1 close is ACTIVE), not key-null.
@@ -303,14 +351,20 @@ describe("Slice P — consumer activation (startCastleWall via fortressStoragePa
     const dir = join(tmp, "policy", "egress");
     await mkdir(dir, { recursive: true });
     await writeFile(join(dir, "audit-producer.pub"), Buffer.from([9, 9, 9]));
-    await expect(startNoHandshake({ fortressStoragePath: tmp })).rejects.toThrow(
-      /expected but unreadable/,
-    );
+    await expect(
+      startNoHandshake({
+        fortressStoragePath: tmp,
+        producerKeyLoadOptions: LINUX_PRODUCER_KEY_LOAD,
+      }),
+    ).rejects.toThrow(/expected but unreadable/);
   });
 
   it("absent key → consumer stays on the channel basis (macOS / pre-provision floor)", async () => {
     // No key file published → absent → channel basis, NOT a refusal.
-    const handle = await startToRunning({ fortressStoragePath: tmp });
+    const handle = await startToRunning({
+      fortressStoragePath: tmp,
+      producerKeyLoadOptions: LINUX_PRODUCER_KEY_LOAD,
+    });
     expect(handle.state()).toBe("running");
     expect(handle.audit().isProducerSignatureEnforced()).toBe(false);
     await handle.stop();
@@ -327,6 +381,7 @@ describe("Slice P — consumer activation (startCastleWall via fortressStoragePa
     await expect(
       startNoHandshake({
         fortressStoragePath: tmp,
+        producerKeyLoadOptions: LINUX_PRODUCER_KEY_LOAD,
         pinnedProducerKeyB64url: pubB64,
       }),
     ).rejects.toThrow(/not both/);
@@ -339,6 +394,7 @@ describe("Slice P — consumer activation (startCastleWall via fortressStoragePa
     await publishPubKey(tmp, pub);
     const handle = await startToRunning({
       fortressStoragePath: tmp,
+      producerKeyLoadOptions: LINUX_PRODUCER_KEY_LOAD,
       pinnedProducerKeyB64url: null,
     });
     expect(handle.state()).toBe("running");
@@ -358,17 +414,18 @@ describe("Slice P — consumer activation (startCastleWall via fortressStoragePa
 });
 
 describe("Slice P — reader activation end-to-end (provisioned key on disk)", () => {
-  it("(1) a real daemon-signed event re-verifies GREEN once the key is loaded", async () => {
+  it("(1) a mock-signed event re-verifies GREEN once the key is loaded", async () => {
     const priv = ed25519.utils.randomPrivateKey();
     const pub = ed25519.getPublicKey(priv);
     await publishPubKey(tmp, pub);
-    const load = await loadFortressProducerKey(tmp);
+    const load = await loadFortressProducerKey(tmp, LINUX_PRODUCER_KEY_LOAD);
     expect(load.status).toBe("present");
     const keyB64 = load.status === "present" ? load.keyB64url : null;
 
     const log = newLog();
     await appendGenuineSigned(log, priv, 1);
     const posture = await buildCastleWallPosture({
+      protectionClaimSubject: SUBJECT,
       auditLog: log,
       originMachine: "m",
       platform: "linux",
@@ -383,12 +440,13 @@ describe("Slice P — reader activation end-to-end (provisioned key on disk)", (
     const priv = ed25519.utils.randomPrivateKey();
     const pub = ed25519.getPublicKey(priv);
     await publishPubKey(tmp, pub);
-    const load = await loadFortressProducerKey(tmp);
+    const load = await loadFortressProducerKey(tmp, LINUX_PRODUCER_KEY_LOAD);
     const keyB64 = load.status === "present" ? load.keyB64url : null;
 
     const log = newLog();
     await appendForgedMarkerOnly(log);
     const posture = await buildCastleWallPosture({
+      protectionClaimSubject: SUBJECT,
       auditLog: log,
       originMachine: "m",
       platform: "linux",
@@ -402,13 +460,17 @@ describe("Slice P — reader activation end-to-end (provisioned key on disk)", (
 
   it("(3) macOS / no-key path: a channel-basis event still arms (floor preserved)", async () => {
     // No key file published → absent → channel basis.
-    const load = await loadFortressProducerKey(tmp);
+    const load = await loadFortressProducerKey(tmp, {
+      platform: "darwin",
+      macosProducerPubKeyPath: join(tmp, "missing", "castle-audit-producer.pub"),
+    });
     expect(load.status).toBe("absent");
     const log = newLog();
     // A genuine signed entry still arms on the channel basis when no key is set
     // (the reader does not require re-verification without a pinned key).
     await appendGenuineSigned(log, ed25519.utils.randomPrivateKey(), 1);
     const posture = await buildCastleWallPosture({
+      protectionClaimSubject: SUBJECT,
       auditLog: log,
       originMachine: "m",
       platform: "darwin",
@@ -425,6 +487,7 @@ describe("Slice P — reader activation end-to-end (provisioned key on disk)", (
     // signal forces a non-armed degraded posture (never green on the channel basis).
     await appendGenuineSigned(log, ed25519.utils.randomPrivateKey(), 1);
     const posture = await buildCastleWallPosture({
+      protectionClaimSubject: SUBJECT,
       auditLog: log,
       originMachine: "m",
       platform: "linux",
@@ -442,12 +505,13 @@ describe("Slice P — reader activation end-to-end (provisioned key on disk)", (
     const newPriv = ed25519.utils.randomPrivateKey();
     const newPub = ed25519.getPublicKey(newPriv);
     await publishPubKey(tmp, newPub);
-    const load = await loadFortressProducerKey(tmp);
+    const load = await loadFortressProducerKey(tmp, LINUX_PRODUCER_KEY_LOAD);
     const keyB64 = load.status === "present" ? load.keyB64url : null;
 
     const log = newLog();
     await appendGenuineSigned(log, newPriv, 7);
     const posture = await buildCastleWallPosture({
+      protectionClaimSubject: SUBJECT,
       auditLog: log,
       originMachine: "m",
       platform: "linux",

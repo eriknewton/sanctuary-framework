@@ -5,6 +5,7 @@ description: "Cooperative gates do not stop a prompt-injected agent. Kernel-leve
 author: "Erik Newton"
 image: /images/blog/castle-wall-phase-1-linux.jpg
 archive_note: "Predates Mantle vocabulary canonicalization on 2026-05-15. Terminology in this post may refer to install-time-binding concepts using earlier language; current canonical vocabulary lives at https://github.com/eriknewton/newton-wiki/blob/main/concepts/mantle.md."
+claims_era_note: true
 ---
 
 > **Archive note:** This post predates Mantle vocabulary canonicalization on 2026-05-15.
@@ -30,7 +31,7 @@ Today the floor is real on Linux. The rest of this post explains how it works, w
 
 Sanctuary's enforcement model has four layers, each with a distinct contract. The contracts compose; none of them substitute for another. The model is named after the way a real castle defends a perimeter, observes its interior, governs its inhabitants, and accounts to neighbors.
 
-**The Castle Wall.** Operating-system-level filtering at the boundary between the operator's machine and the external world, in both directions. Outbound calls (HTTP, DNS, custom protocols) and inbound connections (webhooks, callbacks) route through a wall the operator's policies define. The kernel itself enforces. A prompt-injected or jailbroken agent cannot bypass the wall, because the agent does not get to choose; the operating system routes the call. This is the load-bearing answer to the question every honest enterprise buyer asks: how does the substrate enforce against an agent determined to escape?
+**The Castle Wall.** Operating-system-level filtering at the boundary between the operator's machine and the external world, on the outbound path. Outbound calls (HTTP, DNS, custom protocols) route through a wall the operator's policies define. The kernel itself enforces. Within that proven scope, a prompt-injected or jailbroken agent does not get to choose; the operating system routes the call. This is the load-bearing answer to the question every honest enterprise buyer asks: how does the substrate enforce against an agent determined to escape? Ingress filtering of inbound webhooks and callbacks is roadmap, not part of the shipped surface.
 
 **Sentinels.** Internal observation, not enforcement. Behavioral baselining via process introspection, eBPF observability, and audit-log analysis. Anomalies surface to the operator via system notifications. Sentinels see what the wall cannot: file-access patterns, internal model calls, cross-agent coordination, prompt-injection signatures inside internal communications. The sentinels surface; the operator decides. Sentinels ship in v1.3.
 
@@ -52,7 +53,7 @@ This is what kept the Castle Wall from drifting back into the cooperative-only p
 
 Castle Wall Phase 1 on Linux landed in PRs #124 and #125 last week, with the chain-wiring fix in PR #131 and the full TCP-bypass coverage closed in PR #132. 203 Rust integration and unit tests pass against a real kernel binding, including the DoH and DoT bypass coverage that makes the difference between a real wall and a hopeful one. Here is what is in the box.
 
-**Kernel binding.** The wall enforces at the Linux kernel level using nftables for packet routing decisions, cgroup v2 for per-process scope (each wrapped agent gets its own egress policy, not a shared one), and NFQUEUE for in-line decisions on packets the kernel hands up to user space. Allowed traffic flows with under-10-millisecond p99 overhead. Disallowed traffic does not reach the wire.
+**Kernel binding.** The wall enforces at the Linux kernel level using nftables for packet routing decisions, cgroup v2 for per-process scope (each wrapped agent gets its own egress policy, not a shared one), and NFQUEUE for in-line decisions on packets the kernel hands up to user space. Allowed traffic flows with low added latency in our test rig; formal p99 numbers are owed to the Assurance Matrix before we publish them as claims. Disallowed traffic does not reach the wire.
 
 **Bypass coverage.** A prompt-injected agent does not just send HTTP. It tries DNS exfiltration. It tries DNS-over-HTTPS to a vendor-controlled resolver. It tries DNS-over-TLS to the same. It tries raw sockets. It tries every transport a normal Linux process can reach. The Phase 1 daemon enforces against the full set, verified end-to-end on real cgroups with real packet flow: plain-DNS, DoH, and DoT bypass attempts each spawn a real subprocess inside the agent's cgroup, emit a real packet, get caught by the kernel's cgroupv2 socket match, route through the per-agent chain into NFQUEUE, and resolve to a deny verdict in the audit log. The DoH and DoT tests matter because every previous L7 agent firewall the category has shipped misses one or both, and every miss is a ship-side covert channel.
 

@@ -10,6 +10,10 @@
  */
 
 import type { ProtectionSnapshot } from "./aggregator.js";
+import {
+  PROTECTION_HERO_COPY,
+  protectionHeroCopyForLight,
+} from "../egress-gate/protection-claim.js";
 
 // Re-export the multi-tenant renderer so dashboard consumers can import a
 // single module for both modes.
@@ -19,7 +23,8 @@ export {
 } from "./multi-html.js";
 
 /** Hero copy. Change here if we ever A/B test. */
-export const HERO_COPY = "Your agent is protected.";
+export const HERO_COPY = PROTECTION_HERO_COPY.green;
+const NON_GREEN_HERO_COPY = PROTECTION_HERO_COPY.nonGreen;
 
 export interface DashboardHTMLOptions {
   snapshot: ProtectionSnapshot;
@@ -161,6 +166,7 @@ function l4EvidenceBlock(l4: ProtectionSnapshot["layers"]["l4"]): string {
 export function renderDashboardHTML(options: DashboardHTMLOptions): string {
   const { snapshot } = options;
   const { overall, agent, layers, activity, pending_approvals, audit, privacy, upstream_servers } = snapshot;
+  const heroCopy = protectionHeroCopyForLight(overall.light);
 
   const activityRows = activity.length === 0
     ? `<tr class="empty"><td colspan="5">Waiting for tool calls…</td></tr>`
@@ -580,7 +586,7 @@ details.audit-details .audit-filters { display: flex; gap: 6px; padding: 0 18px 
         <path class="shield-mark" d="M85 102 L96 113 L118 90"></path>
       </svg>
     </div>
-    <h1 id="hero-copy">${escHtml(HERO_COPY)}</h1>
+    <h1 id="hero-copy">${escHtml(heroCopy)}</h1>
     <p class="hero-sub" id="hero-sub">${escHtml(overall.headline)}</p>
     <div class="identity-line" id="identity-line">
       <span class="name" id="agent-name">${escHtml(agent.display_name)}</span>
@@ -665,8 +671,17 @@ details.audit-details .audit-filters { display: flex; gap: 6px; padding: 0 18px 
 <script>
 (() => {
   const INITIAL_SNAPSHOT = ${initialSnapshot};
-  const AUTH_TOKEN = ${options.authToken ? JSON.stringify(options.authToken) : "null"};
-  const AUTH_HEADER = AUTH_TOKEN ? { "Authorization": "Bearer " + AUTH_TOKEN } : {};
+  let AUTH_TOKEN = sessionStorage.getItem("authToken") || "";
+  function authHeader() {
+    return AUTH_TOKEN ? { "Authorization": "Bearer " + AUTH_TOKEN } : {};
+  }
+  function promptForOperatorToken() {
+    const entered = window.prompt("Operator token required for this action.");
+    if (!entered || !entered.trim()) return false;
+    AUTH_TOKEN = entered.trim();
+    sessionStorage.setItem("authToken", AUTH_TOKEN);
+    return true;
+  }
 
   let snapshot = INITIAL_SNAPSHOT;
 
@@ -679,12 +694,18 @@ details.audit-details .audit-filters { display: flex; gap: 6px; padding: 0 18px 
   function fmtTime(iso) {
     try { return new Date(iso).toLocaleTimeString(); } catch { return iso; }
   }
+  const HERO_COPY_TEXT = ${JSON.stringify(HERO_COPY)};
+  const NON_GREEN_HERO_COPY_TEXT = ${JSON.stringify(NON_GREEN_HERO_COPY)};
+  function heroCopyForLight(light) {
+    return light === "green" ? HERO_COPY_TEXT : NON_GREEN_HERO_COPY_TEXT;
+  }
 
   function renderShield(light, headline) {
     const shield = document.getElementById("shield");
     if (!shield) return;
     shield.classList.remove("green", "yellow", "red");
     shield.classList.add(light);
+    document.getElementById("hero-copy").textContent = heroCopyForLight(light);
     document.getElementById("hero-sub").textContent = headline;
   }
 
@@ -796,9 +817,14 @@ details.audit-details .audit-filters { display: flex; gap: 6px; padding: 0 18px 
         const action = btn.dataset.action;
         btn.disabled = true;
         try {
-          await fetch("/api/approvals/" + encodeURIComponent(id) + "/" + action, {
-            method: "POST", headers: AUTH_HEADER
+          let response = await fetch("/api/approvals/" + encodeURIComponent(id) + "/" + action, {
+            method: "POST", headers: authHeader()
           });
+          if (response.status === 401 && promptForOperatorToken()) {
+            response = await fetch("/api/approvals/" + encodeURIComponent(id) + "/" + action, {
+              method: "POST", headers: authHeader()
+            });
+          }
         } catch {}
         await refreshSnapshot();
       });
@@ -817,7 +843,7 @@ details.audit-details .audit-filters { display: flex; gap: 6px; padding: 0 18px 
 
   async function refreshSnapshot() {
     try {
-      const res = await fetch("/api/snapshot", { headers: AUTH_HEADER });
+      const res = await fetch("/api/snapshot", { headers: authHeader() });
       if (!res.ok) return;
       const snap = await res.json();
       renderAll(snap);
@@ -826,7 +852,7 @@ details.audit-details .audit-filters { display: flex; gap: 6px; padding: 0 18px 
 
   async function createSessionQuery() {
     if (!AUTH_TOKEN) return "";
-    const res = await fetch("/auth/session", { method: "POST", headers: AUTH_HEADER });
+    const res = await fetch("/auth/session", { method: "POST", headers: authHeader() });
     if (!res.ok) throw new Error("session_exchange_failed");
     const body = await res.json();
     if (!body || !body.session_id || body.session_id === "no-auth") return "";

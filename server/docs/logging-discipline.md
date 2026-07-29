@@ -143,7 +143,7 @@ purpose across languages.
 ```bash
 # Pass / fail check
 cd server
-npx vite-node scripts/check-no-raw-console.ts
+npx tsx scripts/check-no-raw-console.ts
 
 # Self-tests for the gate logic itself
 npx vitest run test/scripts/check-no-raw-console.test.ts

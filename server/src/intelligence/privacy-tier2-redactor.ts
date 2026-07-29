@@ -39,6 +39,9 @@ import {
   PrivacyPlaceholderVault,
   detectSensitiveSpans,
 } from "../operational/privacy-filter.js";
+import { PiiConfigStore } from "../query-anonymity/pii-config-store.js";
+import { PII_REWRITE_LLM_SURFACE } from "../query-anonymity/pii-rewrite.js";
+import type { StorageBackend } from "../storage/interface.js";
 import type { FrontierRedactor } from "./substrates/frontier.js";
 import type { SubstrateSelector } from "./selector.js";
 import type { Surface, SubstrateChoice } from "./types.js";
@@ -124,4 +127,126 @@ export function buildPrivacyTier2Redactor(cfg: Tier2RedactorConfig): FrontierRed
 
     return { redacted, matchCount };
   };
+}
+
+/**
+ * Config for the consent-gated Tier B redactor installed on the
+ * production substrate selector at boot.
+ */
+export interface ConsentGatedTier2RedactorConfig extends Tier2RedactorConfig {
+  /**
+   * Live per-fortress Tier B config store. Read at EVERY call so the
+   * operator's toggle takes effect immediately without re-installing the
+   * redactor. Tier 2 scrubbing fires ONLY when the operator opted in
+   * (`enabled` or `smart_mode_enabled`) AND recorded consent
+   * (`consented_to_trade_off`); otherwise the redactor is a passthrough
+   * that audit-emits `filter_tier: 1` so the transparency UI shows the
+   * Tier B step did not run.
+   */
+  configStore: PiiConfigStore;
+}
+
+/**
+ * Build the redactor the entry point installs on the production
+ * `SubstrateSelector` via `installRedactor`. Unlike the bare
+ * `buildPrivacyTier2Redactor`, this variant is opt-in + consent-gated:
+ * it reads the live `PiiConfigStore` on every call and only performs the
+ * Tier 2 scrub when the operator has both enabled Tier B and consented to
+ * the trade-off. When Tier B is off or unconsented, it returns the input
+ * unchanged and emits a `filter_tier: 1` redaction event (zero matches),
+ * exactly matching the prior `IDENTITY_REDACTOR` behavior so a toggled-off
+ * operator sees no behavior change.
+ *
+ * Honesty (never-overclaim rule): the gate is read from real persisted
+ * state at call time, so a query is scrubbed iff the operator genuinely
+ * opted in with consent. `effectiveTierBEnabled()` in the route layer
+ * derives the same truth from the same config plus the
+ * redactor-installed signal, so the operator-facing surface never claims
+ * active scrubbing the path does not perform.
+ */
+export function buildConsentGatedTier2Redactor(
+  cfg: ConsentGatedTier2RedactorConfig,
+): FrontierRedactor {
+  const tier2 = buildPrivacyTier2Redactor(cfg);
+  return async (text: string) => {
+    let active: boolean;
+    try {
+      const config = await cfg.configStore.get();
+      active = Boolean(
+        config &&
+          (config.enabled || config.smart_mode_enabled) &&
+          config.consented_to_trade_off,
+      );
+    } catch {
+      // Fail closed toward NO claimed protection: a store read error must
+      // never silently behave as if Tier B is active. Passthrough (the
+      // substrate still receives the text) with a filter_tier:1 event so
+      // the transparency UI reflects that Tier 2 did not run.
+      active = false;
+    }
+    if (!active) {
+      cfg.selector.emitRedactionEvent({
+        surface: cfg.surface,
+        substrate: cfg.substrate,
+        matchCount: 0,
+        filterTier: 1,
+      });
+      return { redacted: text, matchCount: 0 };
+    }
+    return tier2(text);
+  };
+}
+
+/**
+ * THE Tier B install chokepoint. EVERY production `SubstrateSelector`
+ * (every `new SubstrateSelector` site that serves an operator dashboard /
+ * concierge / LLM-assist surface) MUST run through this one helper so the
+ * consent-gated redactor is installed uniformly. Installing it per-site by
+ * hand is what let the `sanctuary wrap` auto-dashboard egress UNSCRUBBED
+ * (a HIGH privacy leak); routing all sites through one function closes the
+ * whole class and makes a future 5th selector obviously-correct to wire.
+ *
+ * It constructs the per-fortress `PiiConfigStore` (AAD-bound to
+ * `fortressId` — which MUST be the SAME id the matching `buildV11Bindings`
+ * call uses, so the route's PATCH and the live scrub read the same
+ * encrypted config) and a `PrivacyPlaceholderVault`, builds the
+ * consent-gated redactor, installs it via `installRedactor` (late-binding
+ * that resolves the selector<->redactor construction cycle), and returns
+ * `true` — the `tierBPiiRedactorInstalled` signal the caller threads into
+ * `buildV11Bindings` so the `/api/query-anonymity/pii` route reports the
+ * truthful `effective_tier_b_enabled`.
+ *
+ * Returns `true` on success. A caller that never reaches this helper (the
+ * selector failed to construct) keeps the signal `false`, so the route
+ * honestly reports inactive.
+ */
+export function installConsentGatedRedactor(args: {
+  selector: SubstrateSelector;
+  storage: StorageBackend;
+  masterKey: Uint8Array;
+  /**
+   * Fortress id used for the PiiConfigStore AAD binding. MUST match the
+   * `fortressId` passed to the same boot path's `buildV11Bindings` call,
+   * or the redactor and the route would read different encrypted configs.
+   */
+  fortressId: string;
+  /** Optional surface override; defaults to the Tier B LLM surface. */
+  surface?: Surface;
+  /** Optional substrate override; defaults to frontier-with-filter. */
+  substrate?: SubstrateChoice;
+}): true {
+  args.selector.installRedactor(
+    buildConsentGatedTier2Redactor({
+      selector: args.selector,
+      vault: new PrivacyPlaceholderVault(args.storage, args.masterKey),
+      surface: args.surface ?? PII_REWRITE_LLM_SURFACE,
+      substrate: args.substrate ?? "frontier-with-filter",
+      configStore: new PiiConfigStore({
+        storage: args.storage,
+        masterKey: args.masterKey,
+        fortressId: args.fortressId,
+      }),
+    }),
+  );
+  return true;
 }

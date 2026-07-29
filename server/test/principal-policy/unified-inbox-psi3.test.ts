@@ -24,6 +24,18 @@ import { handleUnifiedInboxRoute } from "../../src/principal-policy/unified-inbo
 const FORTRESS = "fortress_psi3";
 const IDENTITY = "identity_psi3";
 
+// #800 follow-on: every inbox mutation (PUT prefs, entry housekeeping,
+// PATCH retention, POST batch) requires the operator bearer even under
+// loopback auto-auth. The test server is configured WITH a token and the
+// mutation calls present it via `jsonAuth()`. GET reads stay tokenless.
+const INBOX_HTTP_TOKEN = "operator-token-inbox-psi3";
+function jsonAuth(): HeadersInit {
+  return {
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${INBOX_HTTP_TOKEN}`,
+  };
+}
+
 function rig(now = "2026-05-13T12:00:00.000Z", fortressId = FORTRESS) {
   const storage = new MemoryStorage();
   const masterKey = generateRandomKey();
@@ -83,7 +95,7 @@ async function makeInboxServer(opts: {
   const server: Server = createServer(async (req, res) => {
     const handled = await handleUnifiedInboxRoute(
       {
-        authConfig: { loopbackAutoAuth: true },
+        authConfig: { loopbackAutoAuth: true, authToken: INBOX_HTTP_TOKEN },
         bridge: opts.bridge,
         retentionPolicy: opts.policy,
         retentionPolicyStore: opts.policyStore,
@@ -106,15 +118,25 @@ async function makeInboxServer(opts: {
 }
 
 async function withDashboardUrl<T>(base: string, fn: () => Promise<T>): Promise<T> {
-  const previous = process.env.SANCTUARY_DASHBOARD_URL;
+  const previousUrl = process.env.SANCTUARY_DASHBOARD_URL;
+  const previousToken = process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN;
   process.env.SANCTUARY_DASHBOARD_URL = base;
+  // #800 follow-on: the retention PATCH is now an operator-bearer-gated
+  // mutation, so the CLI must present the operator token (the production
+  // CLI reads it from this env var via `dashboardRequest`).
+  process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN = INBOX_HTTP_TOKEN;
   try {
     return await fn();
   } finally {
-    if (previous === undefined) {
+    if (previousUrl === undefined) {
       delete process.env.SANCTUARY_DASHBOARD_URL;
     } else {
-      process.env.SANCTUARY_DASHBOARD_URL = previous;
+      process.env.SANCTUARY_DASHBOARD_URL = previousUrl;
+    }
+    if (previousToken === undefined) {
+      delete process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN;
+    } else {
+      process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN = previousToken;
     }
   }
 }
@@ -222,7 +244,7 @@ describe("Psi-3 batch actions and snooze", () => {
       const before = await auditEntries(auditLog);
       const res = await fetch(`${base}/api/inbox/unified/batch`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: jsonAuth(),
         body: JSON.stringify({ action: "delete", entry_ids: [a.inbox_id] }),
       });
       expect(res.status).toBe(400);
@@ -231,7 +253,7 @@ describe("Psi-3 batch actions and snooze", () => {
 
       const confirmed = await fetch(`${base}/api/inbox/unified/batch`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: jsonAuth(),
         body: JSON.stringify({
           action: "delete",
           entry_ids: [a.inbox_id],
@@ -465,7 +487,7 @@ describe("Psi-3 retention and isolation", () => {
     try {
       const save = await fetch(`${server.base}/api/inbox/unified/prefs`, {
         method: "PUT",
-        headers: { "Content-Type": "application/json" },
+        headers: jsonAuth(),
         body: JSON.stringify({
           filters: {
             search: "budget",
@@ -513,6 +535,70 @@ describe("Psi-3 retention and isolation", () => {
       }
     } finally {
       await server.close().catch(() => undefined);
+    }
+  });
+
+  // #800 follow-on (operational-mutation chokepoint): every inbox
+  // mutation requires the operator bearer even on loopback. A co-resident
+  // agent sharing the loopback interface must not batch-mutate or write
+  // prefs tokenless. GET reads (list) stay tokenless under loopback
+  // auto-auth.
+  it("rejects tokenless loopback inbox mutations with 401 (bearer required); GET reads stay open", async () => {
+    const { bridge, auditLog, storage, masterKey } = rig();
+    const { a } = seed(bridge);
+    const policyStore = new UnifiedInboxRetentionPolicyStore({
+      storage,
+      masterKey,
+      fortressId: FORTRESS,
+    });
+    const prefsStore = new UnifiedInboxPrefsStore({
+      storage,
+      masterKey,
+      fortressId: FORTRESS,
+      operatorId: IDENTITY,
+    });
+    const { base, close } = await makeInboxServer({
+      bridge,
+      auditLog,
+      policy: await policyStore.load(),
+      policyStore,
+      prefsStore,
+    });
+    try {
+      // POST /batch dismiss without a bearer -> 401, entry not dismissed.
+      const batch = await fetch(`${base}/api/inbox/unified/batch`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "dismiss", entry_ids: [a.inbox_id] }),
+      });
+      expect(batch.status).toBe(401);
+      expect(bridge.queryInbox().map((e) => e.inbox_id)).toContain(a.inbox_id);
+
+      // PUT /prefs without a bearer -> 401.
+      const prefs = await fetch(`${base}/api/inbox/unified/prefs`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ filters: { search: "x" } }),
+      });
+      expect(prefs.status).toBe(401);
+
+      // A bad bearer is also rejected.
+      const bad = await fetch(`${base}/api/inbox/unified/batch`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: "Bearer wrong-token",
+        },
+        body: JSON.stringify({ action: "dismiss", entry_ids: [a.inbox_id] }),
+      });
+      expect(bad.status).toBe(401);
+      expect(bridge.queryInbox().map((e) => e.inbox_id)).toContain(a.inbox_id);
+
+      // The list GET still works tokenless under loopback auto-auth.
+      const list = await fetch(`${base}/api/inbox/unified`);
+      expect(list.status).toBe(200);
+    } finally {
+      await close();
     }
   });
 

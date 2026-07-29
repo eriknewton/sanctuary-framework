@@ -14,7 +14,10 @@ import { ApprovalStub } from "./approval-stub.js";
 import { AuditConsumer, type AuditSink } from "./audit-consumer.js";
 import { IpcClient, type IpcTransport, type ClientKeyMaterial } from "./ipc-client.js";
 import { RuntimeIpcError } from "./errors.js";
-import { loadFortressProducerKey } from "./producer-signature.js";
+import {
+  loadFortressProducerKey,
+  type ProducerKeyLoadOptions,
+} from "./producer-signature.js";
 
 /** Public lifecycle state surface. */
 export type CastleWallLifecycleState =
@@ -66,6 +69,11 @@ export interface StartCastleWallInput {
    * a storage path (tests / callers that resolve the key themselves).
    */
   fortressStoragePath?: string;
+  /**
+   * Optional producer-key loader overrides. Production callers normally omit
+   * this; tests use it to pin Linux vs macOS behavior deterministically.
+   */
+  producerKeyLoadOptions?: ProducerKeyLoadOptions;
   promptTimeoutMs?: number;
   strictMode?: boolean;
   /** Optional override for handshake timeout; defaults to 5s. */
@@ -123,7 +131,10 @@ export async function startCastleWall(
         "Castle Wall consumer: pass either fortressStoragePath OR an explicit pinnedProducerKeyB64url, not both — they are two sources of truth for one key."
       );
     }
-    const load = await loadFortressProducerKey(input.fortressStoragePath);
+    const load = await loadFortressProducerKey(
+      input.fortressStoragePath,
+      input.producerKeyLoadOptions,
+    );
     if (load.status === "present") {
       consumerPinnedKey = load.keyB64url;
     } else if (load.status === "absent") {

@@ -1,0 +1,22 @@
+# Sanctuary second reference blocklist plugin - Pi-hole / hosts-format egress denylist.
+#
+# This is the native Pi-hole gravity / /etc/hosts adblock shape: "<sink-ip> <domain>",
+# one rule per line. The sink IP (0.0.0.0, 127.0.0.1, ::, ::1) is what a hosts-format
+# blocklist null-routes a blocked domain to; this plugin treats any such line as a
+# block rule for <domain>. '#' starts a comment (whole-line or trailing); blank lines
+# are ignored. A request host is DENIED if it equals a listed domain or is a subdomain
+# of one.
+#
+# These are illustrative known-bad / tracker / ad domains for the reference plugin and
+# its drill, in the exact format a Pi-hole export or an off-the-shelf hosts adblock
+# list emits. A real vendor ships their own curated gravity list; the contract is
+# identical. This is a FIRST-PARTY BUNDLED reference plugin, not a third-party or
+# marketplace plugin.
+0.0.0.0 ads.tracker-network.example
+0.0.0.0 telemetry.creepy-analytics.example
+0.0.0.0 beacon.ad-exchange.example
+127.0.0.1 malvertising.example.net
+0.0.0.0 fingerprint.data-broker.example    # trailing comment tolerated
+::  ipv6-sink.tracker.example
+# a bare-domain line (no IP) is also accepted, for lists that omit the sink IP:
+coin-miner.example.org

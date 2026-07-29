@@ -1,3 +1,8 @@
+import {
+  PAPER_INK_ROOT_TOKENS_CSS,
+  THEME_BOOTSTRAP_SCRIPT,
+} from "../dashboard/design-tokens.js";
+
 export function generateLoginHTML(options: { serverVersion: string }): string {
   return `<!DOCTYPE html>
 <html lang="en">
@@ -6,16 +11,34 @@ export function generateLoginHTML(options: { serverVersion: string }): string {
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Sanctuary — Principal Dashboard</title>
   <style>
+    /* v1.1 "paper/ink" design tokens. Canonical source of truth is the
+       dashboard board at server/src/dashboard/v1_1/html.ts (:root at :47).
+       These are a scoped mirror (Option A) of the subset this page uses;
+       do not diverge the values. A shared tokens module is a logged
+       follow-up. */
     :root {
-      --bg: #0d1117;
-      --surface: #161b22;
-      --border: #30363d;
-      --text-primary: #e6edf3;
-      --text-secondary: #8b949e;
-      --green: #3fb950;
-      --amber: #d29922;
-      --red: #f85149;
-      --blue: #58a6ff;
+      --paper: #f7f5f0;
+      --paper-2: #efece5;
+      --ink: #1a1a17;
+      --ink-2: #39362f;
+      --ink-3: #6a6659;
+      --ink-4: #9a9585;
+      --rule: #d8d4c8;
+      --surface: #fdfcf8;
+      --surface-2: #f1eee6;
+      --rust: oklch(55% 0.11 35);
+      --rust-bg: oklch(94% 0.03 35);
+      --mono: ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+      --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+      --serif: "Iowan Old Style", "Charter", "Georgia", serif;
+      --rad: 6px;
+      --rad-lg: 10px;
+      --shadow: 0 1px 2px rgba(0,0,0,0.04), 0 0 0 1px rgba(0,0,0,0.02);
+      --text-xs: 11px;
+      --text-sm: 12px;
+      --text-md: 14px;
+      --text-base: 13px;
+      --text-lg: 16px;
     }
 
     * {
@@ -25,9 +48,11 @@ export function generateLoginHTML(options: { serverVersion: string }): string {
     }
 
     body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
-      background-color: var(--bg);
-      color: var(--text-primary);
+      font-family: var(--sans);
+      font-size: var(--text-md);
+      background-color: var(--paper);
+      color: var(--ink);
+      line-height: 1.45;
       min-height: 100vh;
       display: flex;
       align-items: center;
@@ -42,10 +67,10 @@ export function generateLoginHTML(options: { serverVersion: string }): string {
 
     .login-card {
       background-color: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 8px;
+      border: 1px solid var(--rule);
+      border-radius: var(--rad-lg);
       padding: 40px 32px;
-      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+      box-shadow: var(--shadow);
     }
 
     .login-header {
@@ -56,9 +81,10 @@ export function generateLoginHTML(options: { serverVersion: string }): string {
     }
 
     .logo {
+      font-family: var(--serif);
       font-size: 24px;
-      font-weight: 700;
-      color: var(--blue);
+      font-weight: 500;
+      color: var(--ink);
     }
 
     .logo-text {
@@ -67,15 +93,23 @@ export function generateLoginHTML(options: { serverVersion: string }): string {
     }
 
     .logo-text .title {
-      font-size: 18px;
-      font-weight: 600;
-      letter-spacing: -0.5px;
+      font-family: var(--serif);
+      font-size: var(--text-lg);
+      font-weight: 500;
+      letter-spacing: -0.3px;
     }
 
     .logo-text .version {
-      font-size: 12px;
-      color: var(--text-secondary);
-      margin-top: 2px;
+      display: inline-block;
+      align-self: flex-start;
+      margin-top: 4px;
+      padding: 2px 8px;
+      border: 1px solid var(--rule);
+      border-radius: 12px;
+      background: var(--surface-2);
+      font-family: var(--mono);
+      font-size: var(--text-xs);
+      color: var(--ink-3);
     }
 
     .form-group {
@@ -84,40 +118,46 @@ export function generateLoginHTML(options: { serverVersion: string }): string {
 
     label {
       display: block;
-      font-size: 14px;
+      font-family: var(--sans);
+      font-size: var(--text-md);
       font-weight: 500;
       margin-bottom: 8px;
-      color: var(--text-primary);
+      color: var(--ink);
     }
 
     input[type="text"],
     input[type="password"] {
       width: 100%;
       padding: 10px 12px;
-      background-color: var(--bg);
-      border: 1px solid var(--border);
-      border-radius: 6px;
-      color: var(--text-primary);
-      font-size: 14px;
-      font-family: 'JetBrains Mono', monospace;
-      transition: border-color 0.2s;
+      background-color: var(--surface);
+      border: 1px solid var(--rule);
+      border-radius: var(--rad);
+      color: var(--ink);
+      font-size: var(--text-md);
+      font-family: var(--mono);
+      transition: border-color 0.15s;
+    }
+
+    input[type="text"]::placeholder,
+    input[type="password"]::placeholder {
+      color: var(--ink-4);
     }
 
     input[type="text"]:focus,
     input[type="password"]:focus {
-      outline: none;
-      border-color: var(--blue);
-      box-shadow: 0 0 0 2px rgba(88, 166, 255, 0.1);
+      outline: 2px solid var(--ink-3);
+      outline-offset: 1px;
+      border-color: var(--ink-3);
     }
 
     .error-message {
       display: none;
-      background-color: rgba(248, 81, 73, 0.1);
-      border: 1px solid var(--red);
-      color: #ff9999;
+      background-color: var(--rust-bg);
+      border: 1px solid var(--rust);
+      color: var(--rust);
       padding: 12px;
-      border-radius: 6px;
-      font-size: 13px;
+      border-radius: var(--rad);
+      font-size: var(--text-base);
       margin-bottom: 20px;
     }
 
@@ -127,34 +167,43 @@ export function generateLoginHTML(options: { serverVersion: string }): string {
 
     button {
       width: 100%;
-      padding: 10px 16px;
-      background-color: var(--blue);
-      color: var(--bg);
-      border: none;
-      border-radius: 6px;
-      font-size: 14px;
-      font-weight: 600;
+      padding: 8px 18px;
+      background-color: var(--ink);
+      color: var(--paper);
+      border: 1px solid var(--ink);
+      border-radius: var(--rad);
+      font-family: var(--sans);
+      font-size: var(--text-base);
+      font-weight: 500;
       cursor: pointer;
-      transition: background-color 0.2s;
+      transition: background-color 0.15s, border-color 0.15s;
     }
 
     button:hover {
-      background-color: #79c0ff;
+      background-color: var(--ink-2);
+      border-color: var(--ink-2);
     }
 
     button:active {
-      background-color: #4184e4;
+      background-color: var(--ink-2);
     }
 
     button:disabled {
-      background-color: var(--text-secondary);
+      background-color: var(--surface-2);
+      border-color: var(--rule);
+      color: var(--ink-4);
       cursor: not-allowed;
-      opacity: 0.5;
+      opacity: 0.7;
+    }
+
+    button:focus-visible {
+      outline: 2px solid var(--ink-3);
+      outline-offset: 2px;
     }
 
     .info-text {
-      font-size: 12px;
-      color: var(--text-secondary);
+      font-size: var(--text-sm);
+      color: var(--ink-3);
       margin-top: 16px;
       text-align: center;
     }
@@ -227,9 +276,15 @@ export function generateLoginHTML(options: { serverVersion: string }): string {
 
         if (response.ok) {
           const data = await response.json();
+          // Live credential fallback: the board client (dashboard/v1_1/client.ts)
+          // and the legacy /v1.0 board read sessionStorage.authToken as their API
+          // bearer under loopback auto-auth. Not dead; keep it.
           sessionStorage.setItem('authToken', token);
           window.location.href = '/'; // Dashboard is served at root path
         } else if (response.status === 401) {
+          // Client-only hardening: clear any stale session cookie so a
+          // previously valid login cannot mask a just-rejected token.
+          document.cookie = 'sanctuary_session=; Max-Age=0; Path=/';
           showError('Invalid token. Please check and try again.');
         } else {
           showError('Authentication failed. Please try again.');
@@ -421,6 +476,23 @@ export function generateDashboardHTML(options: {
       font-weight: 500;
     }
 
+    .fleet-link {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      color: var(--blue, #58a6ff);
+      text-decoration: none;
+      padding: 4px 10px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      white-space: nowrap;
+    }
+
+    .fleet-link:hover {
+      border-color: var(--blue, #58a6ff);
+    }
+
     .status-dot {
       width: 8px;
       height: 8px;
@@ -526,6 +598,14 @@ export function generateDashboardHTML(options: {
     .layer-card.degraded .layer-status {
       background-color: rgba(210, 153, 34, 0.15);
       color: var(--amber);
+    }
+
+    /* Neutral "configured" state: the capability is present but live
+       enforcement is unproven on this surface. NEVER green - green means a
+       verdict, not config presence (the green-on-presence honesty fix). */
+    .layer-card.configured .layer-status {
+      background-color: rgba(139, 148, 158, 0.15);
+      color: var(--text-secondary, #8b949e);
     }
 
     .layer-card.inactive .layer-status {
@@ -1448,6 +1528,7 @@ export function generateDashboardHTML(options: {
     </div>
 
     <div class="status-bar-right">
+      <a href="/fleet" class="fleet-link" title="Switch between Sanctuary machines">Fleet Switcher</a>
       <div class="status-item">
         <strong id="protections-count">—</strong>
         <span>Protections</span>
@@ -1997,6 +2078,35 @@ export function generateDashboardHTML(options: {
       }
     }
 
+    function currentOperatorToken() {
+      return sessionStorage.getItem('authToken') || AUTH_TOKEN;
+    }
+
+    function promptForOperatorToken() {
+      const entered = (window.prompt('Operator token required for this action.') || '').trim();
+      if (!entered) return false;
+      sessionStorage.setItem('authToken', entered);
+      return true;
+    }
+
+    async function strictMutationFetch(endpoint, init) {
+      const request = init || {};
+      const send = () => {
+        const headers = Object.assign({}, request.headers || {});
+        const token = currentOperatorToken();
+        if (token) {
+          headers['Authorization'] = 'Bearer ' + token;
+        }
+        return fetch(API_BASE + endpoint, Object.assign({}, request, { headers: headers }));
+      };
+
+      let response = await send();
+      if (response.status === 401 && promptForOperatorToken()) {
+        response = await send();
+      }
+      return response;
+    }
+
     function redirectToLogin() {
       sessionStorage.removeItem('authToken');
       window.location.href = '/';
@@ -2017,7 +2127,12 @@ export function generateDashboardHTML(options: {
       scoreEl.textContent = score;
 
       badge.classList.remove('degraded', 'inactive');
-      if (score < 70) badge.classList.add('degraded');
+      // Green-on-presence fix: the badge goes green ONLY when the live wall
+      // arm-state is "armed" (a fresh enforcement verdict). With no live verdict
+      // the badge is amber at best, regardless of how high the capability score
+      // climbs - green must mean a verdict, not config presence.
+      const wallArmed = data.live_enforcement && data.live_enforcement.castle_wall_arm_state === 'armed';
+      if (!wallArmed || score < 70) badge.classList.add('degraded');
       if (score < 40) badge.classList.add('inactive');
 
       updateLayerCards(data);
@@ -2058,12 +2173,15 @@ export function generateDashboardHTML(options: {
       if (!card) return;
 
       const status = layerData.status || 'inactive';
-      card.classList.remove('degraded', 'inactive');
+      card.classList.remove('degraded', 'inactive', 'configured');
 
       if (status === 'degraded') {
         card.classList.add('degraded');
       } else if (status === 'inactive') {
         card.classList.add('inactive');
+      } else if (status === 'configured') {
+        // Capability present, live enforcement unproven: neutral, never green.
+        card.classList.add('configured');
       }
 
       document.getElementById(\`\${layer}-status\`).textContent = status.toUpperCase();
@@ -2771,19 +2889,13 @@ export function generateDashboardHTML(options: {
       payload[feature] = { enabled: enabled };
 
       try {
-        const response = await fetch(API_BASE + '/api/sovereignty-profile', {
+        const response = await strictMutationFetch('/api/sovereignty-profile', {
           method: 'POST',
           headers: {
-            'Authorization': 'Bearer ' + AUTH_TOKEN,
             'Content-Type': 'application/json',
           },
           body: JSON.stringify(payload),
         });
-
-        if (response.status === 401) {
-          redirectToLogin();
-          return;
-        }
 
         if (response.ok) {
           const data = await response.json();
@@ -2839,10 +2951,9 @@ export function generateDashboardHTML(options: {
     document.querySelectorAll('#config-injection_detection .sensitivity-option').forEach(function(btn) {
       btn.addEventListener('click', async function() {
         const sensitivity = this.getAttribute('data-sensitivity');
-        const response = await fetch(API_BASE + '/api/sovereignty-profile', {
+        const response = await strictMutationFetch('/api/sovereignty-profile', {
           method: 'POST',
           headers: {
-            'Authorization': 'Bearer ' + AUTH_TOKEN,
             'Content-Type': 'application/json',
           },
           body: JSON.stringify({ injection_detection: { sensitivity: sensitivity } }),
@@ -2864,10 +2975,9 @@ export function generateDashboardHTML(options: {
     // Context gating policy selector handler
     document.getElementById('config-context-policy').addEventListener('change', async function() {
       const policyId = this.value;
-      const response = await fetch(API_BASE + '/api/sovereignty-profile', {
+      const response = await strictMutationFetch('/api/sovereignty-profile', {
         method: 'POST',
         headers: {
-          'Authorization': 'Bearer ' + AUTH_TOKEN,
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({ context_gating: { policy_id: policyId } }),
@@ -3006,10 +3116,9 @@ export function generateDashboardHTML(options: {
       current.push(serverConfig);
 
       try {
-        const resp = await fetch(API_BASE + '/api/proxy/servers', {
+        const resp = await strictMutationFetch('/api/proxy/servers', {
           method: 'POST',
           headers: {
-            'Authorization': 'Bearer ' + AUTH_TOKEN,
             'Content-Type': 'application/json',
           },
           body: JSON.stringify({ upstream_servers: current }),
@@ -3031,10 +3140,9 @@ export function generateDashboardHTML(options: {
       const updated = proxyServers.filter(s => s.name !== serverName);
 
       try {
-        const resp = await fetch(API_BASE + '/api/proxy/servers', {
+        const resp = await strictMutationFetch('/api/proxy/servers', {
           method: 'POST',
           headers: {
-            'Authorization': 'Bearer ' + AUTH_TOKEN,
             'Content-Type': 'application/json',
           },
           body: JSON.stringify({ upstream_servers: updated }),
@@ -3152,6 +3260,380 @@ export function generateDashboardHTML(options: {
 
     // Start
     initialize();
+  </script>
+</body>
+</html>`;
+}
+
+// ── Fleet Switcher HTML (C1) ────────────────────────────────────────
+
+export function generateFleetSwitcherHTML(options: {
+  serverVersion: string;
+  protocol: string;
+  currentHost: string;
+  currentPort: number;
+}): string {
+  const { serverVersion, protocol, currentHost, currentPort } = options;
+  const currentEndpoint = `${protocol}://${currentHost}:${currentPort}`;
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sanctuary Fleet Switcher</title>
+  <script>${THEME_BOOTSTRAP_SCRIPT}</script>
+  <style>
+    /* The shared "paper/ink" design tokens (server/src/dashboard/design-tokens.ts),
+       the SAME block the v1.1 board and the posture surfaces interpolate. This
+       page now includes the warm dark theme and follows the dashboard's
+       light/dark choice via the head bootstrap above, instead of the old
+       light-only scoped mirror that ignored the console theme. */
+    ${PAPER_INK_ROOT_TOKENS_CSS}
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: var(--sans);
+      font-size: var(--text-md);
+      background-color: var(--paper);
+      color: var(--ink);
+      line-height: 1.45;
+      min-height: 100vh;
+      padding: 20px;
+    }
+    .fleet-wrap { max-width: 980px; margin: 0 auto; }
+    .header {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 24px;
+      padding-bottom: 16px;
+      border-bottom: 1px solid var(--rule);
+    }
+    .header h1 { font-family: var(--serif); font-size: 28px; font-weight: 400; letter-spacing: -0.3px; }
+    .header .version {
+      padding: 2px 8px;
+      border: 1px solid var(--rule);
+      border-radius: 12px;
+      background: var(--surface-2);
+      font-family: var(--mono);
+      font-size: var(--text-xs);
+      color: var(--ink-3);
+    }
+    .back-link {
+      color: var(--ink-2);
+      text-decoration: none;
+      font-size: var(--text-md);
+      margin-left: auto;
+    }
+    .back-link:hover { color: var(--ink); text-decoration: underline; }
+
+    .add-form {
+      background: var(--surface);
+      border: 1px solid var(--rule);
+      border-radius: var(--rad-lg);
+      box-shadow: var(--shadow);
+      padding: 16px;
+      margin-bottom: 24px;
+      display: flex;
+      gap: 8px;
+      align-items: end;
+    }
+    .add-form .field { flex: 1; min-width: 0; }
+    .add-form label {
+      display: block;
+      font-family: var(--mono);
+      font-size: var(--text-xs);
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--ink-3);
+      margin-bottom: 4px;
+    }
+    .add-form input {
+      width: 100%;
+      padding: 8px 12px;
+      background: var(--surface);
+      border: 1px solid var(--rule);
+      border-radius: var(--rad);
+      color: var(--ink);
+      font-family: var(--sans);
+      font-size: var(--text-md);
+    }
+    .add-form input#machine-url { font-family: var(--mono); }
+    .add-form input::placeholder { color: var(--ink-4); }
+    .add-form input:focus { outline: 2px solid var(--ink-3); outline-offset: 1px; border-color: var(--ink-3); }
+    .add-form input.invalid { border-color: var(--rust); }
+    .add-form button {
+      padding: 8px 18px;
+      background: var(--ink);
+      color: var(--paper);
+      border: 1px solid var(--ink);
+      border-radius: var(--rad);
+      font-family: var(--sans);
+      font-size: var(--text-base);
+      font-weight: 500;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .add-form button:hover { background: var(--ink-2); border-color: var(--ink-2); }
+    .add-form button:focus-visible { outline: 2px solid var(--ink-3); outline-offset: 2px; }
+    .form-hint {
+      display: none;
+      color: var(--rust);
+      font-size: var(--text-sm);
+      margin: -16px 0 24px;
+    }
+    .form-hint.show { display: block; }
+
+    .machine-list { display: flex; flex-direction: column; gap: 8px; }
+    .machine-card {
+      background: var(--surface);
+      border: 1px solid var(--rule);
+      border-radius: var(--rad-lg);
+      box-shadow: var(--shadow);
+      padding: 16px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .machine-card.current { border-color: var(--sage); }
+    .machine-card .status-dot {
+      width: 10px; height: 10px;
+      border-radius: 50%;
+      background: var(--ink-4);
+      flex-shrink: 0;
+    }
+    .machine-card .status-dot.online { background: var(--sage); }
+    .machine-card .status-dot.offline { background: var(--rust); }
+    .machine-card .status-dot.checking { background: var(--ochre); }
+    .machine-card .status-label {
+      font-family: var(--mono);
+      font-size: var(--text-xs);
+      color: var(--ink-3);
+      flex-shrink: 0;
+      min-width: 56px;
+    }
+    .machine-card .info { flex: 1; min-width: 0; }
+    .machine-card .name {
+      font-weight: 600;
+      font-size: 15px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .machine-card .url {
+      color: var(--ink-3);
+      font-size: var(--text-base);
+      font-family: var(--mono);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .machine-card .current-badge {
+      font-family: var(--mono);
+      font-size: var(--text-xs);
+      background: var(--sage-bg);
+      color: var(--sage);
+      border: 1px solid var(--sage);
+      padding: 2px 8px;
+      border-radius: 12px;
+    }
+    .machine-card .actions { display: flex; gap: 8px; flex-shrink: 0; }
+    .machine-card .btn-open {
+      padding: 6px 14px;
+      background: var(--surface);
+      color: var(--ink);
+      border: 1px solid var(--rule);
+      border-radius: var(--rad);
+      font-family: var(--sans);
+      font-size: var(--text-base);
+      cursor: pointer;
+      text-decoration: none;
+    }
+    .machine-card .btn-open:hover { background: var(--surface-2); }
+    .machine-card .btn-remove {
+      padding: 6px 10px;
+      background: var(--rust-bg);
+      color: var(--rust);
+      border: 1px solid var(--rust);
+      border-radius: var(--rad);
+      font-family: var(--sans);
+      font-size: var(--text-base);
+      cursor: pointer;
+    }
+    .machine-card .btn-remove:hover { background: var(--rust-bg); filter: brightness(0.97); }
+    .empty-state {
+      text-align: center;
+      color: var(--ink-3);
+      padding: 40px;
+      font-size: var(--text-md);
+    }
+  </style>
+</head>
+<body>
+  <div class="fleet-wrap">
+  <div class="header">
+    <h1>Fleet Switcher</h1>
+    <span class="version">v${serverVersion}</span>
+    <a href="/" class="back-link">Back to Dashboard</a>
+  </div>
+
+  <div class="add-form">
+    <div class="field">
+      <label for="machine-name">Name</label>
+      <input id="machine-name" type="text" placeholder="e.g. Mini1, Cloud-GPU, Dev-Box" />
+    </div>
+    <div class="field" style="flex:2">
+      <label for="machine-url">Dashboard URL</label>
+      <input id="machine-url" type="text" placeholder="e.g. https://100.64.0.5:3501" />
+    </div>
+    <button onclick="addMachine()">Add Machine</button>
+  </div>
+  <div id="form-hint" class="form-hint"></div>
+
+  <div id="machine-list" class="machine-list"></div>
+  </div>
+
+  <script>
+    const STORAGE_KEY = 'sanctuary_fleet_machines';
+    const CURRENT_ENDPOINT = ${JSON.stringify(currentEndpoint)};
+
+    function loadMachines() {
+      try {
+        return JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]');
+      } catch { return []; }
+    }
+
+    function saveMachines(machines) {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(machines));
+    }
+
+    function showFormHint(message) {
+      const hint = document.getElementById('form-hint');
+      hint.textContent = message;
+      hint.classList.add('show');
+    }
+
+    function clearFormHint() {
+      const hint = document.getElementById('form-hint');
+      hint.classList.remove('show');
+      document.getElementById('machine-name').classList.remove('invalid');
+      document.getElementById('machine-url').classList.remove('invalid');
+    }
+
+    function addMachine() {
+      const nameEl = document.getElementById('machine-name');
+      const urlEl = document.getElementById('machine-url');
+      const name = nameEl.value.trim();
+      let url = urlEl.value.trim();
+      clearFormHint();
+      if (!name || !url) {
+        nameEl.classList.toggle('invalid', !name);
+        urlEl.classList.toggle('invalid', !url);
+        showFormHint('Enter both a name and a dashboard URL.');
+        return;
+      }
+
+      // Normalize: strip trailing slash
+      url = url.replace(/\\/+$/, '');
+
+      const machines = loadMachines();
+      // Prevent duplicates by URL
+      if (machines.some(m => m.url === url)) {
+        alert('A machine with this URL already exists.');
+        return;
+      }
+      machines.push({ name, url, added: new Date().toISOString() });
+      saveMachines(machines);
+      nameEl.value = '';
+      urlEl.value = '';
+      render();
+    }
+
+    function removeMachine(url) {
+      const machines = loadMachines().filter(m => m.url !== url);
+      saveMachines(machines);
+      render();
+    }
+
+    async function checkHealth(url) {
+      try {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 3000);
+        const resp = await fetch(url + '/api/health', { signal: controller.signal });
+        clearTimeout(timeout);
+        const data = await resp.json();
+        return data.ok === true ? 'online' : 'offline';
+      } catch {
+        return 'offline';
+      }
+    }
+
+    function render() {
+      const machines = loadMachines();
+      const list = document.getElementById('machine-list');
+
+      if (machines.length === 0) {
+        list.innerHTML = '<div class="empty-state">No machines saved. Add a machine above to get started.</div>';
+        return;
+      }
+
+      list.innerHTML = machines.map(m => {
+        const isCurrent = m.url === CURRENT_ENDPOINT || m.url === location.origin;
+        const key = btoa(m.url).replace(/=/g,'');
+        return \`
+          <div class="machine-card \${isCurrent ? 'current' : ''}" data-url="\${m.url}">
+            <div class="status-dot checking" id="dot-\${key}"></div>
+            <div class="status-label" id="label-\${key}">Checking</div>
+            <div class="info">
+              <div class="name">\${escapeHtml(m.name)}\${isCurrent ? ' <span class="current-badge">CURRENT</span>' : ''}</div>
+              <div class="url">\${escapeHtml(m.url)}</div>
+            </div>
+            <div class="actions">
+              <a href="\${m.url}" class="btn-open">Open Console</a>
+              <button class="btn-remove" onclick="removeMachine('\${escapeHtml(m.url)}')">Remove</button>
+            </div>
+          </div>
+        \`;
+      }).join('');
+
+      // Check health for each machine
+      machines.forEach(async (m) => {
+        const key = btoa(m.url).replace(/=/g,'');
+        const dot = document.getElementById('dot-' + key);
+        const label = document.getElementById('label-' + key);
+        if (!dot) return;
+        const status = await checkHealth(m.url);
+        dot.className = 'status-dot ' + status;
+        if (label) label.textContent = status === 'online' ? 'Online' : 'Offline';
+      });
+    }
+
+    function escapeHtml(text) {
+      const div = document.createElement('div');
+      div.textContent = text;
+      return div.innerHTML;
+    }
+
+    // Auto-add current machine if not in list
+    (function autoAddCurrent() {
+      const machines = loadMachines();
+      const origin = location.origin;
+      if (!machines.some(m => m.url === origin)) {
+        const hostname = location.hostname;
+        const name = hostname === '127.0.0.1' || hostname === 'localhost'
+          ? 'This machine (local)'
+          : hostname;
+        machines.push({ name, url: origin, added: new Date().toISOString() });
+        saveMachines(machines);
+      }
+    })();
+
+    // Clear the validation hint once the operator starts correcting the fields.
+    ['machine-name', 'machine-url'].forEach((id) => {
+      document.getElementById(id).addEventListener('input', clearFormHint);
+    });
+
+    render();
   </script>
 </body>
 </html>`;

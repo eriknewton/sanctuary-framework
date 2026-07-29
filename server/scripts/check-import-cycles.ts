@@ -25,8 +25,8 @@
  *   - extensionless and directory specifiers resolve via .ts then /index.ts.
  *
  * Usage:
- *   npx vite-node scripts/check-import-cycles.ts
- *   npx vite-node scripts/check-import-cycles.ts --list-edges
+ *   npx tsx scripts/check-import-cycles.ts
+ *   npx tsx scripts/check-import-cycles.ts --list-edges
  *
  * Exit code is always 0.
  */

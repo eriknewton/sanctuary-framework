@@ -106,6 +106,55 @@ describe("castle-wall/allowlist/agent-origin : validateAgentOrigin", () => {
     ).toBeNull();
   });
 
+  // --- Floor invariant (uid mode): agent_uid must be >= 1 AND >= ceiling ---
+
+  it("rejects agent_uid 0 (root can never be the confined agent)", () => {
+    expect(
+      validateAgentOrigin({
+        mode: "uid",
+        agent_uid: 0,
+        system_uid_allow_ceiling: 0,
+      })
+    ).toBeNull();
+  });
+
+  it("rejects an agent_uid strictly below the system-uid ceiling", () => {
+    // uid inside the system-daemon allow band is nonsensical/dangerous.
+    expect(
+      validateAgentOrigin({
+        mode: "uid",
+        agent_uid: 100,
+        system_uid_allow_ceiling: 500,
+      })
+    ).toBeNull();
+  });
+
+  it("accepts agent_uid EQUAL to the ceiling (boundary is allowed, not strictly-below)", () => {
+    const out = validateAgentOrigin({
+      mode: "uid",
+      agent_uid: 500,
+      system_uid_allow_ceiling: 500,
+    });
+    expect(out).toEqual({
+      mode: "uid",
+      agent_uid: 500,
+      system_uid_allow_ceiling: 500,
+    });
+  });
+
+  it("accepts the real Mini2 shape (agent_uid 502 >= ceiling 500)", () => {
+    const out = validateAgentOrigin({
+      mode: "uid",
+      agent_uid: 502,
+      system_uid_allow_ceiling: 500,
+    });
+    expect(out).toEqual({
+      mode: "uid",
+      agent_uid: 502,
+      system_uid_allow_ceiling: 500,
+    });
+  });
+
   it("rejects a nat descriptor with neither signing id nor team id", () => {
     expect(
       validateAgentOrigin({ mode: "nat", system_uid_allow_ceiling: 500 })
@@ -154,5 +203,167 @@ describe("castle-wall/allowlist/agent-origin : validateAgentOrigin", () => {
     });
     expect(out).not.toBeNull();
     expect(out).not.toHaveProperty("agent_runtime_port_range");
+  });
+
+  // --- S5-0 (2026-07-14): gate_uid, the second confined principal ---
+
+  it("accepts a well-formed twin-uid descriptor (agent_uid + gate_uid)", () => {
+    const out = validateAgentOrigin({
+      mode: "uid",
+      agent_uid: 600,
+      gate_uid: 601,
+      system_uid_allow_ceiling: 500,
+    });
+    expect(out).toEqual({
+      mode: "uid",
+      agent_uid: 600,
+      gate_uid: 601,
+      system_uid_allow_ceiling: 500,
+    });
+  });
+
+  it("still accepts a uid descriptor with no gate_uid (byte-identical to today)", () => {
+    const out = validateAgentOrigin({
+      mode: "uid",
+      agent_uid: 600,
+      system_uid_allow_ceiling: 500,
+    });
+    expect(out).toEqual({
+      mode: "uid",
+      agent_uid: 600,
+      system_uid_allow_ceiling: 500,
+    });
+    expect(out).not.toHaveProperty("gate_uid");
+  });
+
+  it("rejects the WHOLE descriptor when gate_uid collides with agent_uid (the scope-leak the field must prevent)", () => {
+    expect(
+      validateAgentOrigin({
+        mode: "uid",
+        agent_uid: 600,
+        gate_uid: 600,
+        system_uid_allow_ceiling: 500,
+      })
+    ).toBeNull();
+  });
+
+  it("rejects the WHOLE descriptor when gate_uid is 0 (root can never be confined)", () => {
+    expect(
+      validateAgentOrigin({
+        mode: "uid",
+        agent_uid: 600,
+        gate_uid: 0,
+        system_uid_allow_ceiling: 0,
+      })
+    ).toBeNull();
+  });
+
+  it("rejects the WHOLE descriptor when gate_uid is strictly below the system-uid ceiling", () => {
+    expect(
+      validateAgentOrigin({
+        mode: "uid",
+        agent_uid: 600,
+        gate_uid: 100,
+        system_uid_allow_ceiling: 500,
+      })
+    ).toBeNull();
+  });
+
+  it("rejects the WHOLE descriptor when gate_uid is a non-integer", () => {
+    expect(
+      validateAgentOrigin({
+        mode: "uid",
+        agent_uid: 600,
+        gate_uid: 601.5,
+        system_uid_allow_ceiling: 500,
+      })
+    ).toBeNull();
+  });
+
+  it("rejects the WHOLE descriptor when gate_uid is negative", () => {
+    expect(
+      validateAgentOrigin({
+        mode: "uid",
+        agent_uid: 600,
+        gate_uid: -1,
+        system_uid_allow_ceiling: 500,
+      })
+    ).toBeNull();
+  });
+
+  it("accepts gate_uid EQUAL to the ceiling (boundary allowed, same as agent_uid)", () => {
+    const out = validateAgentOrigin({
+      mode: "uid",
+      agent_uid: 600,
+      gate_uid: 500,
+      system_uid_allow_ceiling: 500,
+    });
+    expect(out).toEqual({
+      mode: "uid",
+      agent_uid: 600,
+      gate_uid: 500,
+      system_uid_allow_ceiling: 500,
+    });
+  });
+
+  it("rejects a NAT descriptor carrying gate_uid (UID-mode-only concept, no half-built cross-mode descriptor)", () => {
+    expect(
+      validateAgentOrigin({
+        mode: "nat",
+        egress_helper_signing_id: "ai.sanctuaryprotocol.egress-helper",
+        gate_uid: 601,
+        system_uid_allow_ceiling: 500,
+      })
+    ).toBeNull();
+  });
+
+  // --- LOW-1 (2026-07-14): uid-family fields capped at UInt32.max (wire type) ---
+
+  const UINT32_MAX = 0xffffffff;
+
+  it("accepts agent_uid + gate_uid at exactly UInt32.max (boundary)", () => {
+    const out = validateAgentOrigin({
+      mode: "uid",
+      agent_uid: UINT32_MAX,
+      gate_uid: UINT32_MAX - 1,
+      system_uid_allow_ceiling: 500,
+    });
+    expect(out).toEqual({
+      mode: "uid",
+      agent_uid: UINT32_MAX,
+      gate_uid: UINT32_MAX - 1,
+      system_uid_allow_ceiling: 500,
+    });
+  });
+
+  it("rejects agent_uid above UInt32.max (would fail the sysext UInt32 decode)", () => {
+    expect(
+      validateAgentOrigin({
+        mode: "uid",
+        agent_uid: UINT32_MAX + 1,
+        system_uid_allow_ceiling: 500,
+      })
+    ).toBeNull();
+  });
+
+  it("rejects gate_uid above UInt32.max", () => {
+    expect(
+      validateAgentOrigin({
+        mode: "uid",
+        agent_uid: 600,
+        gate_uid: 9007199254740991, // Number.MAX_SAFE_INTEGER, far above UInt32.max
+        system_uid_allow_ceiling: 500,
+      })
+    ).toBeNull();
+  });
+
+  it("rejects system_uid_allow_ceiling above UInt32.max (also decodes as UInt32)", () => {
+    expect(
+      validateAgentOrigin({
+        mode: "uid",
+        agent_uid: 600,
+        system_uid_allow_ceiling: UINT32_MAX + 1,
+      })
+    ).toBeNull();
   });
 });

@@ -23,6 +23,7 @@ describe("template-list tarball (Finding HHH)", () => {
     const tarballName = execSync("npm pack --pack-destination " + tmpDir, {
       cwd: serverDir,
       encoding: "utf-8",
+      env: { ...process.env, npm_config_cache: join(tmpDir, ".npm-cache") },
     }).trim();
 
     // Extract
@@ -42,7 +43,7 @@ describe("template-list tarball (Finding HHH)", () => {
     expect(raFiles).toContain("policy.md");
     expect(raFiles).toContain("defaults.json");
 
-    await rm(tmpDir, { recursive: true, force: true });
+    await rm(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     // `npm pack` boots a fresh npm + tars dist/; under the full suite's parallel
     // load on a constrained machine that can exceed the old 30s budget. Use the
     // same generous timeout as the other CLI-subprocess tests.

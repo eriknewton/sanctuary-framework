@@ -60,7 +60,7 @@ jobs:
           echo "Baseline floor: $baseline"
 
       - name: Use Node.js 24
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: 24
           cache: npm
@@ -71,7 +71,7 @@ jobs:
         run: npm ci
 
       - name: Set up Python 3.12 for Concordia sidecar
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
@@ -146,9 +146,16 @@ jobs:
           # vitest version emits a transform error without failing
           # the run.
           PATTERNS='(transform failed|transform error|failed to parse|failed to collect|failed to load source|cannot find module|failed suites)'
-          if grep -Eqi "$PATTERNS" /tmp/vitest-output.log; then
+          # A vite 8 SSR "Failed to load source MAP for X" warning is benign:
+          # tests still run, it is NOT the 4ac95830 transform/collection class,
+          # but it matches "failed to load source". Exclude that one benign line
+          # before the gate so it cannot false-positive (vite 8 emits it when a
+          # test imports the TypeScript compiler API). A real
+          # "failed to load source <module>" (no "map") still trips the gate.
+          HITS="$(grep -Ei "$PATTERNS" /tmp/vitest-output.log | grep -viE 'failed to load source map' || true)"
+          if [ -n "$HITS" ]; then
             echo "::error::Transform/collection error detected in vitest output. This is the specific failure class from commit 4ac95830 (see docs/audit/commit-4ac95830-postmortem.md)."
-            grep -Ei "$PATTERNS" /tmp/vitest-output.log | head -20
+            echo "$HITS" | head -20
             exit 1
           fi
           echo "✓ No transform/collection errors detected."

@@ -23,6 +23,7 @@ import {
   buildV11Bindings,
   fortressIdFromStoragePath,
 } from "../../src/dashboard/v1_1/wiring.js";
+import { getFreePort } from "../helpers/free-port.js";
 
 const IDENTITY_ID = "operator-test-001";
 const FORTRESS_STORAGE_PATH = "/tmp/sanctuary-v1.1.1-test";
@@ -34,24 +35,22 @@ interface TestRig {
   stop: () => Promise<void>;
 }
 
-function pickPort(): number {
-  return 17000 + Math.floor(Math.random() * 20000);
-}
 
-async function startRig(): Promise<TestRig> {
+async function startRig(options: { host?: string; allowPlaintextRemote?: boolean } = {}): Promise<TestRig> {
   const storage = new MemoryStorage();
   const masterKey = randomBytes(32);
   const auditLog = new AuditLog(storage, masterKey);
 
   const authToken = `v1-1-1-test-${randomBytes(8).toString("hex")}`;
-  const port = pickPort();
+  const port = await getFreePort();
 
   const dashboard = new DashboardApprovalChannel({
     port,
-    host: "127.0.0.1",
+    host: options.host ?? "127.0.0.1",
     timeout_seconds: 30,
     auth_token: authToken,
     auto_open: false,
+    ...(options.allowPlaintextRemote ? { allow_plaintext_remote: true } : {}),
   });
 
   // Minimal legacy deps so the existing route table doesn't 500 when we
@@ -161,30 +160,33 @@ describe("DashboardApprovalChannel v1.1 routing (hotfix)", () => {
     expect(res.status).toBe(401);
   });
 
-  it("GET / serves the posture board shell WITHOUT a token (real auth path)", async () => {
-    // The one-surface correction flips the default page at `/` to the posture
-    // board (the same shell `/posture` serves), even with v1.1 bindings wired.
-    // This rig sets a real `auth_token`, so this exercises the PRODUCTION auth
-    // path (not an auth-disabled rig): the static shell carries no posture data
-    // and must be served WITHOUT a bearer, while its `/api/posture/*` data
-    // fetches stay behind checkAuth (asserted by the 401 test below). The v1.1
-    // SPA is preserved at /dashboard and /v1.1 (asserted below).
+  it("GET / serves the v1.1 concierge as the single default surface (default-flip 2026-06-30)", async () => {
+    // Default-flip: `/` now serves the v1.1 concierge SPA, NOT the separate
+    // posture board shell. This is the "ONE SURFACE" requirement: the concierge
+    // is the default landing on a bare standalone dashboard boot, and the
+    // posture data is folded INTO it (the seal expands to full posture detail;
+    // a Posture entry lives in the Verify group). The SPA is served tokenless
+    // (it runs its own client-side auth dance), exactly like /dashboard + /v1.1.
     const res = await fetch(`${rig.baseUrl}/`);
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toMatch(/text\/html/);
     const html = await res.text();
-    // Posture-board marker: the shell fetches the posture API client-side. It is
-    // NOT the v1.1 SPA (which mounts on #main / #fortress).
-    expect(html).toContain("/api/posture/home");
-    expect(html).not.toContain('id="fortress"');
+    // v1.1 SPA markers: the shell mounts on #main and carries the grouped
+    // sidebar nav. It is NOT the standalone posture board shell (which would
+    // fetch /api/posture/home directly from its own static page). S2
+    // (2026-07-18): the SPA now lands on the posture Overview (data-route
+    // "posture") rather than the concierge; Talk stays reachable in the nav.
+    expect(html).toContain('id="main"');
+    expect(html).toContain('id="sidebar-nav"');
+    // The posture Overview is the landing surface on this single shell.
+    expect(html).toContain('data-route="posture"');
   });
 
-  it("GET / and GET /posture are ONE surface under real auth (byte-for-byte, no token)", async () => {
-    // Delta Review A3 remediation: `/` and `/posture` must serve the SAME shell
-    // under the SAME auth posture. Before the fix `/` was unauthenticated while
-    // `/posture`'s HTML sat behind checkAuth, so the equivalence only held when
-    // a test rig disabled auth. With a real `auth_token` set, BOTH paths must
-    // answer 200 with the identical shell to an UNAUTHENTICATED caller.
+  it("GET / (concierge) and GET /posture (board) are now DISTINCT surfaces", async () => {
+    // The posture data is folded INTO the concierge, but the standalone posture
+    // board is PRESERVED at /posture (a frozen surface, never blind-deleted).
+    // So `/` and `/posture` now serve DIFFERENT HTML: `/` is the concierge SPA;
+    // `/posture` is the posture board shell that fetches /api/posture/home.
     const [rootRes, postureRes] = await Promise.all([
       fetch(`${rig.baseUrl}/`),
       fetch(`${rig.baseUrl}/posture`),
@@ -195,8 +197,11 @@ describe("DashboardApprovalChannel v1.1 routing (hotfix)", () => {
       rootRes.text(),
       postureRes.text(),
     ]);
-    expect(rootBody).toBe(postureBody);
-    expect(rootBody).toContain("/api/posture/home");
+    expect(rootBody).not.toBe(postureBody);
+    // `/` is the concierge SPA.
+    expect(rootBody).toContain('id="main"');
+    // `/posture` is the preserved posture board shell.
+    expect(postureBody).toContain("/api/posture/home");
   });
 
   it("the posture shell's data routes stay behind auth (401 without a token)", async () => {
@@ -223,6 +228,33 @@ describe("DashboardApprovalChannel v1.1 routing (hotfix)", () => {
     });
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toMatch(/text\/html/);
+  });
+
+  it("remote /dashboard gates unauthenticated callers and never serializes the bearer for session-authenticated HTML", async () => {
+    await rig.stop();
+    rig = await startRig({ host: "0.0.0.0", allowPlaintextRemote: true });
+
+    const unauth = await fetch(`${rig.baseUrl}/dashboard`);
+    expect(unauth.status).toBe(200);
+    const login = await unauth.text();
+    expect(login).toContain('id="auth-token"');
+    expect(login).not.toContain(rig.authToken);
+
+    const exchange = await fetch(`${rig.baseUrl}/auth/session`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${rig.authToken}` },
+    });
+    expect(exchange.status).toBe(200);
+    const { session_id } = await exchange.json() as { session_id: string };
+
+    const withSession = await fetch(
+      `${rig.baseUrl}/dashboard?session=${encodeURIComponent(session_id)}`,
+    );
+    expect(withSession.status).toBe(200);
+    const shell = await withSession.text();
+    expect(shell).toContain('id="main"');
+    expect(shell).not.toContain(rig.authToken);
+    expect(shell).toContain('"authToken":""');
   });
 
   it("GET /v1.0 serves the legacy four-panel dashboard (v1.1.7 preserve)", async () => {

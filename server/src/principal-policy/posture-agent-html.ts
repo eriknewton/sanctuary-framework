@@ -29,7 +29,12 @@
  * `renderPostureHomeHTML`).
  */
 
-import { AGENT_PILL_FN_SOURCE } from "./posture-html-shared.js";
+import {
+  AGENT_PILL_FN_SOURCE,
+  POSTURE_ROOT_TOKENS_CSS,
+  STATUS_PILL_CSS,
+  THEME_BOOTSTRAP_SCRIPT,
+} from "./posture-html-shared.js";
 
 export function renderPostureAgentHTML(): string {
   // Inline everything (no external assets) so the page works on a locked-down
@@ -40,51 +45,44 @@ export function renderPostureAgentHTML(): string {
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Sanctuary - Agent posture</title>
+<script>${THEME_BOOTSTRAP_SCRIPT}</script>
 <style>
-  :root {
-    --bg: #0e1116; --panel: #161b22; --panel-2: #1c2330; --border: #2a313c;
-    --text: #e6edf3; --muted: #9aa6b2; --green: #2ea043; --amber: #d29922;
-    --red: #f85149; --accent: #58a6ff;
-  }
+  ${POSTURE_ROOT_TOKENS_CSS}
   * { box-sizing: border-box; }
   body {
-    margin: 0; background: var(--bg); color: var(--text);
+    margin: 0; background: var(--paper); color: var(--ink);
     font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   }
-  header { padding: 16px 24px; border-bottom: 1px solid var(--border); }
+  header { padding: 16px 24px; border-bottom: 1px solid var(--rule); }
   h1 { font-size: 16px; margin: 0; font-weight: 600; letter-spacing: .2px; }
-  .sub { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  .sub { color: var(--ink-3); font-size: 12px; margin-top: 2px; }
   .back { display: inline-block; margin-top: 6px; font-size: 12px; }
   main { padding: 20px 24px; max-width: 1100px; margin: 0 auto; }
-  .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; }
-  .pill.green { background: rgba(46,160,67,.18); color: var(--green); }
-  .pill.amber { background: rgba(210,153,34,.18); color: var(--amber); }
-  .pill.red { background: rgba(248,81,73,.18); color: var(--red); }
-  .pill.neutral { background: rgba(154,166,178,.18); color: var(--muted); }
+  ${STATUS_PILL_CSS}
   section { margin-bottom: 24px; }
-  section > h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .5px; color: var(--muted); margin: 0 0 10px; }
-  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px; }
-  a { color: var(--accent); text-decoration: none; }
+  section > h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .5px; color: var(--ink-3); margin: 0 0 10px; }
+  .panel { background: var(--surface); border: 1px solid var(--rule); border-radius: 10px; padding: 16px; }
+  a { color: var(--indigo); text-decoration: none; }
   a:hover { text-decoration: underline; }
-  .empty { color: var(--muted); font-style: italic; }
-  .err { color: var(--red); }
-  code { background: var(--panel-2); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
-  .evidence { font-size: 11px; color: var(--muted); margin-top: 6px; }
-  .meta { color: var(--muted); font-size: 12px; }
+  .empty { color: var(--ink-3); font-style: italic; }
+  .err { color: var(--rust); }
+  code { background: var(--surface-2); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+  .evidence { font-size: 11px; color: var(--ink-3); margin-top: 6px; }
+  .meta { color: var(--ink-3); font-size: 12px; }
   table.reach { width: 100%; border-collapse: collapse; font-size: 13px; }
-  table.reach th { text-align: left; color: var(--muted); font-weight: 600; font-size: 11px;
-    text-transform: uppercase; letter-spacing: .4px; padding: 4px 8px; border-bottom: 1px solid var(--border); }
-  table.reach td { padding: 6px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  table.reach th { text-align: left; color: var(--ink-3); font-weight: 600; font-size: 11px;
+    text-transform: uppercase; letter-spacing: .4px; padding: 4px 8px; border-bottom: 1px solid var(--rule); }
+  table.reach td { padding: 6px 8px; border-bottom: 1px solid var(--rule); vertical-align: top; }
   table.reach tr:last-child td { border-bottom: 0; }
-  .standing-row { display: flex; align-items: baseline; gap: 8px; padding: 6px 0; border-bottom: 1px solid var(--border); }
+  .standing-row { display: flex; align-items: baseline; gap: 8px; padding: 6px 0; border-bottom: 1px solid var(--rule); }
   .standing-row:last-child { border-bottom: 0; }
   .standing-row .name { flex: 1; }
-  .standing-row .why { color: var(--muted); font-size: 12px; }
+  .standing-row .why { color: var(--ink-3); font-size: 12px; }
   .footer {
-    margin: 24px 0 8px; padding: 14px 16px; background: var(--panel-2);
-    border: 1px solid var(--border); border-radius: 10px; color: var(--muted); font-size: 12px;
+    margin: 24px 0 8px; padding: 14px 16px; background: var(--surface-2);
+    border: 1px solid var(--rule); border-radius: 10px; color: var(--ink-3); font-size: 12px;
   }
-  .footer strong { color: var(--text); }
+  .footer strong { color: var(--ink); }
 </style>
 </head>
 <body>

@@ -22,9 +22,14 @@ import {
   CASTLE_WALL_PRODUCER_KID_DETAIL_KEY,
   CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY,
   CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY,
+  CASTLE_WALL_PRODUCER_SUBJECT_BINDING_DETAIL_KEY,
+  CASTLE_WALL_PRODUCER_SUBJECT_BINDING_MACOS_AUDIT_TOKEN,
+  CASTLE_WALL_PRODUCER_SUBJECT_BINDING_SIGNED_IDENTITY_ID,
   CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY,
   CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
   CASTLE_WALL_EVIDENCE_BASIS_CHANNEL_UNSIGNED,
+  CASTLE_WALL_WAL_PRIOR_SHA256_HEX_DETAIL_KEY,
+  CASTLE_WALL_WAL_SEQUENCE_DETAIL_KEY,
 } from "../constants.js";
 import { canonicalize } from "../../mesh/canonical-json.js";
 import type {
@@ -35,6 +40,7 @@ import {
   verifyProducerSignature,
   type ProducerSignatureInput,
 } from "./producer-signature.js";
+import { protectionSubjectFromMacOSAuditToken } from "../subject-binding.js";
 import type { UnifiedInboxBridge } from "../../principal-policy/unified-inbox-bridge.js";
 import { ingestCastleWallBlockedEgress } from "../../principal-policy/unified-inbox-producers.js";
 
@@ -128,6 +134,23 @@ export interface CriticalEventEnvelope {
    * and verify, or the event is rejected (fail closed).
    */
   producer?: ProducerSignatureInput;
+  /**
+   * Subject-binding context for producer-signed verdicts. For macOS extension
+   * verdicts, the signed WAL body carries the raw audit token and the local
+   * runtime supplies the fortress id. For drain-shaped events whose signed WAL
+   * body already carries a canonical `identity_id`, the persist path uses that
+   * signed identity directly. A verified signature without one of these bindings
+   * is rejected before persistence so signed evidence can never inherit the
+   * unsigned envelope identity.
+   */
+  producerSubjectBinding?:
+    | {
+        kind: "macos_audit_token";
+        fortressId: string;
+      }
+    | {
+        kind: "signed_identity_id";
+      };
 }
 
 /** Metric-batch entry shape, mirroring the IPC message. */
@@ -294,7 +317,7 @@ export class AuditConsumer {
         CASTLE_WALL_AUDIT_LAYER,
         "audit_event_rejected",
         envelope.event.fortress_id ?? "unknown",
-        { reason, event_canonical: canonicalize(envelope.event) },
+        { reason, event_canonical: safeCanonicalizeForDiagnostic(envelope.event) },
         "failure"
       );
       await this.sink.flush();
@@ -302,7 +325,51 @@ export class AuditConsumer {
       await this.tryAck(envelope, "audit_event_rejected");
       return;
     }
-    const chainOutcome = this.validateWalChain(envelope.event);
+    // Anti-DoS (interaction with mesh #924): mesh `canonicalize()` now THROWS
+    // on an unsafe integer (>= 2^53) anywhere in the value, and `event.details`
+    // is a `Record<string, unknown>` spread verbatim from the attacker-
+    // controllable daemon wire body (linux-audit-drain.ts). An event that
+    // cannot be canonicalized is MALFORMED - it must be a SETTLED rejection
+    // (recorded + ACKed, cursor advances, wall stays ARMED), exactly like any
+    // other malformed event above, and it must NEVER be accepted/chained.
+    // Computing the hash HERE, before the WAL-chain check or the persist call
+    // even look at the event, means neither the chain's duplicate-hash
+    // comparison nor the post-persist `lastEventCanonicalHash` update below can
+    // ever throw: both reuse this already-proven-canonicalizable hash instead
+    // of re-deriving it from an event that might not be. A forger that stapled
+    // a bogus integer onto an otherwise-valid event must settle the same way a
+    // forger who stapled a bogus `event_type` does - never as an unsettled
+    // fault that would wedge the drain loop into NOT-ARMED (see
+    // linux-audit-drain.ts's cursor-is-the-discriminator ack/fault split).
+    let canonicalHash: string;
+    try {
+      canonicalHash = computeCanonicalHash(envelope.event);
+    } catch (err) {
+      this.stats.rejectedEvents += 1;
+      await this.sink.append(
+        CASTLE_WALL_AUDIT_LAYER,
+        "audit_event_rejected",
+        envelope.event.fortress_id ?? "unknown",
+        {
+          reason: "canonicalization_failed",
+          detail: err instanceof Error ? err.message : String(err),
+          // Record seq + event_type so an auditor can correlate WHICH WAL
+          // position was suppressed - matching the sibling
+          // `producer_signature_rejected` path. Both are read WITHOUT
+          // canonicalize (the unrepresentable value lives elsewhere in
+          // `details`), so reading them here stays throw-safe.
+          seq: envelope.event.details?.seq,
+          event_type: envelope.event.event_type,
+        },
+        "failure"
+      );
+      await this.sink.flush();
+      // Settle + ACK exactly like the shape-validation rejection above: a
+      // refused forgery must never stop the drain loop.
+      await this.tryAck(envelope, "audit_event_rejected");
+      return;
+    }
+    const chainOutcome = this.validateWalChain(envelope.event, canonicalHash);
     if (chainOutcome.kind === "duplicate_replay") {
       // Daemon retried a critical event whose persistence completed but whose
       // ACK never landed. Drop the payload silently (no double-append) and
@@ -359,14 +426,32 @@ export class AuditConsumer {
     if (sigOutcome.kind === "verified") {
       this.stats.producerSignatureAccepted += 1;
     }
+    const identityOutcome = persistedIdentityForEvent(envelope, sigOutcome);
+    if (identityOutcome.kind === "rejected") {
+      this.stats.producerSignatureRejections += 1;
+      await this.sink.append(
+        CASTLE_WALL_AUDIT_LAYER,
+        "producer_signature_rejected",
+        envelope.event.fortress_id ?? "unknown",
+        {
+          reason: identityOutcome.reason,
+          event_type: envelope.event.event_type,
+          seq: envelope.event.details.seq,
+        },
+        "failure"
+      );
+      await this.sink.flush();
+      await this.tryAck(envelope, "producer_signature_rejected");
+      throw new AuditChainError(identityOutcome.reason);
+    }
 
     try {
       await this.sink.append(
         CASTLE_WALL_AUDIT_LAYER,
         envelope.event.event_type,
-        envelope.event.fortress_id,
-        buildDetailsForEvent(envelope.event, sigOutcome),
-        "success"
+        identityOutcome.identityId,
+        buildDetailsForEvent(envelope, sigOutcome),
+        resultForSignatureOutcome(sigOutcome),
       );
       if (this.inboxBridge && envelope.event.event_type === "egress_blocked") {
         ingestCastleWallBlockedEgress({
@@ -376,7 +461,7 @@ export class AuditConsumer {
         await this.sink.append(
           CASTLE_WALL_AUDIT_LAYER,
           "castle_wall_blocked_egress",
-          envelope.event.fortress_id,
+          identityOutcome.identityId,
           {
             event_type: envelope.event.event_type,
             seq: envelope.event.details.seq,
@@ -398,7 +483,10 @@ export class AuditConsumer {
     // a transport-layer ACK failure must NOT leave the consumer's chain view
     // out of sync with what is actually on disk.
     this.lastAckedSeq = Number(envelope.event.details.seq);
-    this.lastEventCanonicalHash = computeCanonicalHash(envelope.event);
+    // Reuse the hash computed up front in `ingestCritical` (already proven
+    // canonicalizable there); do NOT re-derive it here, which would
+    // reintroduce a throw site after the event is already durably persisted.
+    this.lastEventCanonicalHash = canonicalHash;
     // The owed seq (if any) is now durable - clear the FIX 2 guard.
     this.pendingUnpersistedSeq = null;
     this.stats.acceptedCriticalEvents += 1;
@@ -465,6 +553,12 @@ export class AuditConsumer {
   /**
    * Classify an inbound critical event against the WAL chain.
    *
+   * `canonicalHash` is the hash the caller already computed up front in
+   * `ingestCritical` (before this method runs) - reusing it here means this
+   * method never itself calls `canonicalize()`/`computeCanonicalHash()` and
+   * so can never throw on an unrepresentable event; the caller's up-front
+   * check already routed that case to a settled rejection before we get here.
+   *
    * Returns:
    *   - `{ kind: "ok" }` for fresh, well-chained events.
    *   - `{ kind: "duplicate_replay" }` for daemon retries of an already-
@@ -474,18 +568,32 @@ export class AuditConsumer {
    *     mismatch.
    */
   private validateWalChain(
-    event: CastleWallAuditEvent
+    event: CastleWallAuditEvent,
+    canonicalHash: string
   ):
     | { kind: "ok" }
     | { kind: "duplicate_replay" }
     | { kind: "error"; reason: string } {
-    const hasSeq = Object.prototype.hasOwnProperty.call(event.details, "seq");
+    // Defense in depth: `details` is typed `Record<string, unknown>` and the
+    // drain path always builds it as an object, but a null/undefined here
+    // would make the `hasOwnProperty.call` below throw. Treat a missing
+    // `details` as "no chain fields" - the same settled rejection as any other
+    // malformed event, never an unsettled fault.
+    const details = event.details as Record<string, unknown> | null | undefined;
+    if (details === null || details === undefined) {
+      return { kind: "error", reason: "chain_fields_missing" };
+    }
+    const hasSeq = Object.prototype.hasOwnProperty.call(
+      event.details,
+      CASTLE_WALL_WAL_SEQUENCE_DETAIL_KEY,
+    );
     const hasPriorHash = Object.prototype.hasOwnProperty.call(
       event.details,
-      "prior_sha256_hex"
+      CASTLE_WALL_WAL_PRIOR_SHA256_HEX_DETAIL_KEY,
     );
-    const seq = event.details.seq;
-    const priorHash = event.details.prior_sha256_hex;
+    const seq = event.details[CASTLE_WALL_WAL_SEQUENCE_DETAIL_KEY];
+    const priorHash =
+      event.details[CASTLE_WALL_WAL_PRIOR_SHA256_HEX_DETAIL_KEY];
     if (
       !hasSeq ||
       typeof seq !== "number" ||
@@ -503,7 +611,7 @@ export class AuditConsumer {
       if (
         seq === this.lastAckedSeq &&
         this.lastEventCanonicalHash !== null &&
-        computeCanonicalHash(event) === this.lastEventCanonicalHash
+        canonicalHash === this.lastEventCanonicalHash
       ) {
         return { kind: "duplicate_replay" };
       }
@@ -597,9 +705,39 @@ export class AuditConsumer {
     // the consumer's chain already rejects seq regressions; require the signed
     // seq to match the event's own seq so a signature lifted from one event
     // cannot be stapled onto a different-seq event.
-    const eventSeq = envelope.event.details.seq;
+    const eventSeq =
+      envelope.event.details[CASTLE_WALL_WAL_SEQUENCE_DETAIL_KEY];
     if (typeof eventSeq === "number" && eventSeq !== envelope.producer.seq) {
       return { kind: "rejected", reason: "producer_signature_seq_mismatch" };
+    }
+    const signedDetails =
+      parsed.body.details !== null &&
+      typeof parsed.body.details === "object" &&
+      !Array.isArray(parsed.body.details)
+        ? (parsed.body.details as Record<string, unknown>)
+        : {};
+    if (
+      Object.prototype.hasOwnProperty.call(
+        signedDetails,
+        CASTLE_WALL_WAL_SEQUENCE_DETAIL_KEY,
+      ) &&
+      signedDetails[CASTLE_WALL_WAL_SEQUENCE_DETAIL_KEY] !==
+        envelope.producer.seq
+    ) {
+      return { kind: "rejected", reason: "producer_signed_body_seq_mismatch" };
+    }
+    if (
+      Object.prototype.hasOwnProperty.call(
+        signedDetails,
+        CASTLE_WALL_WAL_PRIOR_SHA256_HEX_DETAIL_KEY,
+      ) &&
+      signedDetails[CASTLE_WALL_WAL_PRIOR_SHA256_HEX_DETAIL_KEY] !==
+        envelope.event.details[CASTLE_WALL_WAL_PRIOR_SHA256_HEX_DETAIL_KEY]
+    ) {
+      return {
+        kind: "rejected",
+        reason: "producer_signed_body_prior_hash_mismatch",
+      };
     }
     // Freshness gate (anti-replay across process restart). The signature is
     // authentic, but a captured PAST signed frame could be replayed after a
@@ -637,7 +775,7 @@ export class AuditConsumer {
       CASTLE_WALL_AUDIT_LAYER,
       "wal_chain_verification_failed",
       event.fortress_id ?? "unknown",
-      { reason, event_canonical: canonicalize(event) },
+      { reason, event_canonical: safeCanonicalizeForDiagnostic(event) },
       "failure"
     );
     await this.sink.flush();
@@ -747,9 +885,10 @@ function parseSignedBody(
 
 /** Build the `details` payload from an event, omitting redundant top-level fields. */
 function buildDetailsForEvent(
-  event: CastleWallAuditEvent,
+  envelope: CriticalEventEnvelope,
   signature: SignatureOutcome
 ): Record<string, unknown> {
+  const { event } = envelope;
   // For a PRODUCER-SIGNED entry the authoritative evidence is the SIGNED BODY,
   // not the attacker-controllable `CastleWallAuditEvent`. We persist the signed
   // body's own `details` (agent_id, dest_*, decision_provenance, rule_id_matched,
@@ -767,11 +906,23 @@ function buildDetailsForEvent(
         : {};
     const out: Record<string, unknown> = { ...signedDetails };
     // Preserve the chain bookkeeping the upstream WAL-chain check authenticated.
-    if (Object.prototype.hasOwnProperty.call(event.details, "seq")) {
-      out.seq = event.details.seq;
+    if (
+      Object.prototype.hasOwnProperty.call(
+        event.details,
+        CASTLE_WALL_WAL_SEQUENCE_DETAIL_KEY,
+      )
+    ) {
+      out[CASTLE_WALL_WAL_SEQUENCE_DETAIL_KEY] =
+        event.details[CASTLE_WALL_WAL_SEQUENCE_DETAIL_KEY];
     }
-    if (Object.prototype.hasOwnProperty.call(event.details, "prior_sha256_hex")) {
-      out.prior_sha256_hex = event.details.prior_sha256_hex;
+    if (
+      Object.prototype.hasOwnProperty.call(
+        event.details,
+        CASTLE_WALL_WAL_PRIOR_SHA256_HEX_DETAIL_KEY,
+      )
+    ) {
+      out[CASTLE_WALL_WAL_PRIOR_SHA256_HEX_DETAIL_KEY] =
+        event.details[CASTLE_WALL_WAL_PRIOR_SHA256_HEX_DETAIL_KEY];
     }
     out[CASTLE_WALL_PRODUCER_SIG_DETAIL_KEY] = signature.signatureB64url;
     out[CASTLE_WALL_PRODUCER_KID_DETAIL_KEY] = signature.keyId;
@@ -784,6 +935,13 @@ function buildDetailsForEvent(
       signature.eventCanonicalJson;
     out[CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY] =
       signature.capturedAtUnixMs;
+    if (envelope.producerSubjectBinding?.kind === "macos_audit_token") {
+      out[CASTLE_WALL_PRODUCER_SUBJECT_BINDING_DETAIL_KEY] =
+        CASTLE_WALL_PRODUCER_SUBJECT_BINDING_MACOS_AUDIT_TOKEN;
+    } else if (envelope.producerSubjectBinding?.kind === "signed_identity_id") {
+      out[CASTLE_WALL_PRODUCER_SUBJECT_BINDING_DETAIL_KEY] =
+        CASTLE_WALL_PRODUCER_SUBJECT_BINDING_SIGNED_IDENTITY_ID;
+    }
     out[CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY] =
       CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED;
     out[CASTLE_WALL_AUDIT_PROVENANCE_KEY] = CASTLE_WALL_AUDIT_PROVENANCE_VALUE;
@@ -803,6 +961,7 @@ function buildDetailsForEvent(
   // read-side consumer might mistake for a verified signature.
   delete out[CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY];
   delete out[CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY];
+  delete out[CASTLE_WALL_PRODUCER_SUBJECT_BINDING_DETAIL_KEY];
   out[CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY] =
     CASTLE_WALL_EVIDENCE_BASIS_CHANNEL_UNSIGNED;
   // Provenance LAST, so a forged `event.details.cw_source` cannot survive into
@@ -812,6 +971,107 @@ function buildDetailsForEvent(
   return out;
 }
 
+function resultForSignatureOutcome(
+  signature: SignatureOutcome,
+): "success" | "failure" {
+  if (signature.kind !== "verified") return "success";
+  const result = signature.signedBody.result;
+  if (result === "failure" || result === "blocked") return "failure";
+  return "success";
+}
+
+function signedDetailsFromBody(
+  signedBody: Record<string, unknown>
+): Record<string, unknown> {
+  return signedBody.details !== null &&
+    typeof signedBody.details === "object" &&
+    !Array.isArray(signedBody.details)
+    ? (signedBody.details as Record<string, unknown>)
+    : {};
+}
+
+function persistedIdentityForEvent(
+  envelope: CriticalEventEnvelope,
+  signature: SignatureOutcome,
+):
+  | { kind: "ok"; identityId: string }
+  | { kind: "rejected"; reason: string } {
+  const subjectBinding = envelope.producerSubjectBinding;
+  if (signature.kind !== "verified") {
+    return { kind: "ok", identityId: envelope.event.fortress_id };
+  }
+  if (subjectBinding === undefined) {
+    return {
+      kind: "rejected",
+      reason: "producer_signed_without_subject_binding",
+    };
+  }
+  if (subjectBinding.kind === "macos_audit_token") {
+    const signedDetails = signedDetailsFromBody(signature.signedBody);
+    const agentId =
+      typeof signedDetails.agent_id === "string"
+        ? signedDetails.agent_id
+        : null;
+    if (agentId === null) {
+      return {
+        kind: "rejected",
+        reason: "producer_signed_body_missing_agent_id",
+      };
+    }
+    const subject = protectionSubjectFromMacOSAuditToken(
+      subjectBinding.fortressId,
+      agentId,
+    );
+    if (subject === null) {
+      return {
+        kind: "rejected",
+        reason: "producer_signed_body_agent_subject_unresolvable",
+      };
+    }
+    return { kind: "ok", identityId: subject };
+  }
+  if (subjectBinding.kind === "signed_identity_id") {
+    const identityId =
+      typeof signature.signedBody.identity_id === "string" &&
+      signature.signedBody.identity_id.length > 0
+        ? signature.signedBody.identity_id
+        : null;
+    if (identityId === null) {
+      return {
+        kind: "rejected",
+        reason: "producer_signed_body_missing_identity_id",
+      };
+    }
+    return { kind: "ok", identityId };
+  }
+  return {
+    kind: "rejected",
+    reason: "producer_signed_body_subject_binding_unknown",
+  };
+}
+
 function computeCanonicalHash(event: CastleWallAuditEvent): string {
   return createHash("sha256").update(canonicalize(event), "utf8").digest("hex");
+}
+
+/**
+ * Canonicalize a value for a DIAGNOSTIC audit field only - e.g. the
+ * `event_canonical` detail attached to a rejection entry - never for the WAL
+ * hash chain. Mesh `canonicalize()` (#924) throws on values it cannot
+ * represent exactly (an unsafe integer >= 2^53, non-finite numbers, ...); an
+ * attacker-controllable event that trips that guard is exactly the kind of
+ * malformed input a diagnostic field exists to describe, so a serialization
+ * failure here must degrade to a clearly-labeled placeholder string instead
+ * of propagating out of the caller. The caller is typically already IN a
+ * fail-closed rejection path (e.g. the `audit_event_rejected` /
+ * `wal_chain_verification_failed` recording), and that recording - and the
+ * ACK that settles the event - must never itself be prevented by the very
+ * malformation it is recording.
+ */
+function safeCanonicalizeForDiagnostic(value: unknown): string {
+  try {
+    return canonicalize(value);
+  } catch (err) {
+    return `<uncanonicalizable: ${err instanceof Error ? err.message : String(err)}>`;
+  }
 }

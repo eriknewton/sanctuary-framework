@@ -24,7 +24,7 @@
  *     outbound audit ops.
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { Writable } from "node:stream";
@@ -58,6 +58,7 @@ import {
   handleEnglishPolicyRoute,
 } from "../../src/policy-engine/english-policy-routes.js";
 import { runPolicyCommand } from "../../src/cli/policy.js";
+import { createTempFortress } from "../helpers/temp-fortress.js";
 
 const FORTRESS_A = "fortress_a";
 const FORTRESS_B = "fortress_b";
@@ -138,6 +139,17 @@ class CollectStream extends Writable {
     return Buffer.concat(this.chunks).toString("utf-8");
   }
 }
+
+// Every test in this file that drives a CLI verb resolves a fortress. Without
+// a per-test fortress those verbs resolved the operator's own `~/.sanctuary`,
+// read its real custody, and wrote audit entries into it.
+let __fortress: Awaited<ReturnType<typeof createTempFortress>>;
+beforeEach(async () => {
+  __fortress = await createTempFortress("sanctuary-policy-activator");
+});
+afterEach(async () => {
+  await __fortress.cleanup();
+});
 
 describe("Xi-2 - applyRule pure function", () => {
   it("tier1_add_operation appends + dedupes", () => {
@@ -254,11 +266,11 @@ describe("Xi-2 - applyRule re-asserts the forced-Tier invariant (defense-in-dept
     expect(t3Added.tier3_always_allow).toContain("custom_reader_op");
   });
 
-  it("even FORCING past the conflict gate, a tier1_remove draft cannot downgrade a forced op on the live policy", async () => {
+  it("even FORCING past the conflict gate, a tier1_remove draft is refused before live policy write", async () => {
     // The conflict detector is the first-line defense: it flags this as a
     // high-severity contradiction the operator must acknowledge + force. We
-    // deliberately force past it to prove the enforceForcedTiers backstop in
-    // applyRule still neutralizes the downgrade (defense-in-depth).
+    // deliberately force past it to prove the anti-downgrade gate still
+    // refuses the weakening before the live policy is written.
     const rig = makeActivatorRig();
     expect(rig.livePolicy.current.tier1_always_approve).toContain(FORCED_T1);
     const draft = buildCompiled({
@@ -273,15 +285,20 @@ describe("Xi-2 - applyRule re-asserts the forced-Tier invariant (defense-in-dept
       conflicts_acknowledged: conflicts,
       force_conflict_ids: highIds,
     });
-    expect(outcome.ok).toBe(true);
-    if (outcome.ok) {
-      expect(outcome.updated_policy.tier1_always_approve).toContain(FORCED_T1);
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      expect(outcome.reason).toBe("policy_posture_downgrade_refused");
+      expect(outcome.downgrades).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ field: `operation.${FORCED_T1}` }),
+        ]),
+      );
     }
     // And the persisted live policy still gates it.
     expect(rig.livePolicy.current.tier1_always_approve).toContain(FORCED_T1);
   });
 
-  it("even FORCING past the conflict gate, a tier3_add draft cannot smuggle a forced op into Tier 3", async () => {
+  it("even FORCING past the conflict gate, a tier3_add draft is refused before live policy write", async () => {
     const rig = makeActivatorRig();
     const draft = buildCompiled({
       kind: "tier3_add_operation",
@@ -295,10 +312,13 @@ describe("Xi-2 - applyRule re-asserts the forced-Tier invariant (defense-in-dept
       conflicts_acknowledged: conflicts,
       force_conflict_ids: highIds,
     });
-    expect(outcome.ok).toBe(true);
-    if (outcome.ok) {
-      expect(outcome.updated_policy.tier3_always_allow).not.toContain(
-        FORCED_T1_CLOUD,
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      expect(outcome.reason).toBe("policy_posture_downgrade_refused");
+      expect(outcome.downgrades).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ field: `operation.${FORCED_T1_CLOUD}` }),
+        ]),
       );
     }
     expect(rig.livePolicy.current.tier3_always_allow).not.toContain(
@@ -306,6 +326,39 @@ describe("Xi-2 - applyRule re-asserts the forced-Tier invariant (defense-in-dept
     );
     expect(rig.livePolicy.current.tier1_always_approve).toContain(
       FORCED_T1_CLOUD,
+    );
+  });
+
+  it("rejects a Tier 2 action downgrade after conflicts are acknowledged", async () => {
+    const rig = makeActivatorRig();
+    const draft = buildCompiled({
+      kind: "tier2_set_field",
+      tier2_update: { field: "first_session_policy", value: "allow" },
+    });
+    const conflicts = await rig.activator.checkConflicts(draft, OPERATOR);
+
+    const outcome = await rig.activator.activate(draft, OPERATOR, {
+      conflicts_acknowledged: conflicts,
+    });
+
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      expect(outcome.reason).toBe("policy_posture_downgrade_refused");
+      expect(outcome.downgrades).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            field: "tier2_anomaly.first_session_policy",
+            reason: "tier2_action_downgrade",
+          }),
+        ]),
+      );
+    }
+    expect(rig.livePolicy.current.tier2_anomaly.first_session_policy).toBe(
+      "approve",
+    );
+    const ops = await auditOps(rig.auditLog);
+    expect(ops).toContain(
+      ENGLISH_POLICY_ACTIVATION_AUDIT_OPS.POLICY_WRITE_REFUSED,
     );
   });
 });
@@ -552,7 +605,10 @@ describe("Xi-3 - pre-activation conflict gating", () => {
       conflicts_acknowledged: conflicts,
       force_conflict_ids: highIds,
     });
-    expect(forced.ok).toBe(true);
+    expect(forced.ok).toBe(false);
+    if (!forced.ok) {
+      expect(forced.reason).toBe("policy_posture_downgrade_refused");
+    }
     const ops = await auditOps(rig.auditLog);
     expect(ops).toContain(
       ENGLISH_POLICY_ACTIVATION_AUDIT_OPS.FORCE_CONFLICT_USED,
@@ -561,7 +617,34 @@ describe("Xi-3 - pre-activation conflict gating", () => {
 });
 
 describe("Xi-2 - EnglishPolicyActivator.revoke()", () => {
-  it("revokes an activated draft and applies the inverse rule", async () => {
+  it("revokes an activated no-op Tier-2 draft without weakening posture", async () => {
+    const rig = makeActivatorRig();
+    const draft = buildCompiled({
+      kind: "tier2_set_field",
+      tier2_update: { field: "first_session_policy", value: "approve" },
+    });
+    await rig.store.save({
+      draft,
+      status: "activated",
+      fortress_id: FORTRESS_A,
+      activated_at: OBSERVED_AT,
+      activated_by: OPERATOR,
+      pre_activation_policy_hash: canonicalPolicyHash(rig.livePolicy.current),
+    });
+    expect(rig.livePolicy.current.tier2_anomaly.first_session_policy).toBe(
+      "approve",
+    );
+    const outcome = await rig.activator.revoke(draft.draft_id, OPERATOR);
+    expect(outcome.ok).toBe(true);
+    if (outcome.ok) {
+      expect(outcome.record.status).toBe("revoked");
+      expect(outcome.updated_policy.tier2_anomaly.first_session_policy).toBe(
+        "approve",
+      );
+    }
+  });
+
+  it("refuses revocation when the inverse rule would downgrade Principal Policy posture", async () => {
     const rig = makeActivatorRig();
     const draft = buildCompiled({
       kind: "tier1_add_operation",
@@ -571,14 +654,28 @@ describe("Xi-2 - EnglishPolicyActivator.revoke()", () => {
     expect(rig.livePolicy.current.tier1_always_approve).toContain(
       "state_export",
     );
+
     const outcome = await rig.activator.revoke(draft.draft_id, OPERATOR);
-    expect(outcome.ok).toBe(true);
-    if (outcome.ok) {
-      expect(outcome.record.status).toBe("revoked");
-      expect(outcome.updated_policy.tier1_always_approve).not.toContain(
-        "state_export",
+
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      expect(outcome.reason).toBe("policy_posture_downgrade_refused");
+      expect(outcome.downgrades).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            field: "operation.state_export",
+            reason: "operation_tier_downgrade",
+          }),
+        ]),
       );
     }
+    expect(rig.livePolicy.current.tier1_always_approve).toContain(
+      "state_export",
+    );
+    const ops = await auditOps(rig.auditLog);
+    expect(ops).toContain(
+      ENGLISH_POLICY_ACTIVATION_AUDIT_OPS.POLICY_WRITE_REFUSED,
+    );
   });
 
   it("revoke returns not_activated for a pending draft", async () => {
@@ -591,10 +688,17 @@ describe("Xi-2 - EnglishPolicyActivator.revoke()", () => {
   it("revoke emits a drift_warning in audit when the live policy mutated since activation", async () => {
     const rig = makeActivatorRig();
     const draft = buildCompiled({
-      kind: "tier1_add_operation",
-      operation: "state_export",
+      kind: "tier2_set_field",
+      tier2_update: { field: "first_session_policy", value: "approve" },
     });
-    await rig.activator.activate(draft, OPERATOR);
+    await rig.store.save({
+      draft,
+      status: "activated",
+      fortress_id: FORTRESS_A,
+      activated_at: OBSERVED_AT,
+      activated_by: OPERATOR,
+      pre_activation_policy_hash: canonicalPolicyHash(rig.livePolicy.current),
+    });
     // External mutation that bypasses the activator -- simulate the
     // policy file being edited out-of-band between activate + revoke.
     rig.livePolicy.current = {
@@ -793,11 +897,18 @@ describe("Xi-2 - HTTP routes", () => {
     const compiler = compilerFor(rig.auditLog);
     const store = new EnglishPolicyDraftStore();
     const draft = buildCompiled({
-      kind: "tier1_add_operation",
-      operation: "state_export",
+      kind: "tier2_set_field",
+      tier2_update: { field: "first_session_policy", value: "approve" },
     });
     store.put(draft);
-    await rig.activator.activate(draft, OPERATOR);
+    await rig.store.save({
+      draft,
+      status: "activated",
+      fortress_id: FORTRESS_A,
+      activated_at: OBSERVED_AT,
+      activated_by: OPERATOR,
+      pre_activation_policy_hash: canonicalPolicyHash(rig.livePolicy.current),
+    });
     const { base, close } = await makeServer({
       compiler,
       store,
@@ -815,6 +926,45 @@ describe("Xi-2 - HTTP routes", () => {
       expect(body.data.status).toBe("revoked");
       expect(body.data.updated_policy).toBeUndefined();
       expect(body.data.record).toBeUndefined();
+    } finally {
+      await close();
+    }
+  });
+
+  it("DELETE /api/policy/drafts/:id returns a generic refusal when revoke would downgrade posture", async () => {
+    const rig = makeActivatorRig();
+    const compiler = compilerFor(rig.auditLog);
+    const store = new EnglishPolicyDraftStore();
+    const draft = buildCompiled({
+      kind: "tier1_add_operation",
+      operation: "state_export",
+    });
+    store.put(draft);
+    await rig.activator.activate(draft, OPERATOR);
+    const { base, close } = await makeServer({
+      compiler,
+      store,
+      activator: rig.activator,
+    });
+    try {
+      const res = await fetch(
+        `${base}${ENGLISH_POLICY_API_PREFIX}/drafts/${draft.draft_id}`,
+        { method: "DELETE", headers: operatorHeaders() },
+      );
+      expect(res.status).toBe(409);
+      const body = (await res.json()) as {
+        error: string;
+        detail?: string;
+        data?: { audit_ref?: { operation: string } };
+      };
+      expect(body.error).toBe("revocation_refused");
+      expect(body.detail).toBeUndefined();
+      expect(body.data?.audit_ref?.operation).toBe(
+        ENGLISH_POLICY_ACTIVATION_AUDIT_OPS.POLICY_WRITE_REFUSED,
+      );
+      expect(rig.livePolicy.current.tier1_always_approve).toContain(
+        "state_export",
+      );
     } finally {
       await close();
     }

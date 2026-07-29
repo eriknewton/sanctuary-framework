@@ -1,5 +1,7 @@
 # MERGE_GATE_REPORT.md — Sanctuary Framework
 
+> Historical record - 2026-03-28 security-review sprint. Point-in-time gate artifact; not current state. The repo path below is stale and preserved as-recorded.
+
 **Date:** 2026-03-28
 **Branch:** `security-review`
 **Repo:** sanctuary-framework (~/Desktop/Claude/Sanctuary)

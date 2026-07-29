@@ -43,7 +43,7 @@ async def main():
             # Alice's sovereignty infrastructure
             "alice_sanctuary": {
                 "command": "npx",
-                "args": ["@sanctuary-framework/mcp-server"],
+                "args": ["-y", "@sanctuary-framework/mcp-server"],
                 "env": {
                     **os.environ,
                     "SANCTUARY_STORAGE_PATH": alice_storage,
@@ -53,7 +53,7 @@ async def main():
             # Bob's sovereignty infrastructure
             "bob_sanctuary": {
                 "command": "npx",
-                "args": ["@sanctuary-framework/mcp-server"],
+                "args": ["-y", "@sanctuary-framework/mcp-server"],
                 "env": {
                     **os.environ,
                     "SANCTUARY_STORAGE_PATH": bob_storage,

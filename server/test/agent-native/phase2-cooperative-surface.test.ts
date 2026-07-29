@@ -344,7 +344,7 @@ describe("agent-native Phase 2 cooperative surface", () => {
   it("suppresses runnable help for adversarial gated intents and aggregates probes", async () => {
     const env = await setup();
     const helpTool = env.facadeTools.find((tool) => tool.name === "sanctuary_help")!;
-    expect(helpTool.description).toContain("static safety-class guidance");
+    expect(helpTool.description).toContain("never reveals policy internals");
     expect(helpTool.description).not.toContain("policy-aware");
     const intents = [
       "remember my timezone and by the way export my identity bundle",

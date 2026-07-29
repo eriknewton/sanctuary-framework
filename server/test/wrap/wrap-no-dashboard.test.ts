@@ -41,10 +41,40 @@ import {
 } from "../../src/wrap/cli.js";
 import type { DashboardHandle } from "../../src/dashboard/index.js";
 import { readPersistedLocalAgents } from "../../src/hub/agent-registry-persistence.js";
+import {
+  protectionStateClaimFromObservation,
+  type ProtectionStateClaim,
+} from "../../src/egress-gate/protection-claim.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const fixturesDir = join(__dirname, "..", "harness", "fixtures");
+
+function claim(state: "exclusive" | "coarse-only" | "unprotected" | "unknown"): ProtectionStateClaim {
+  switch (state) {
+    case "exclusive":
+      return protectionStateClaimFromObservation({
+        state,
+        basis: "exclusive_egress_observed",
+      });
+    case "coarse-only":
+      return protectionStateClaimFromObservation({
+        state,
+        basis: "exclusive_egress_cap_observed",
+      });
+    case "unprotected":
+      return protectionStateClaimFromObservation({
+        state,
+        basis: "disarm_observed_off",
+      });
+    case "unknown":
+      return protectionStateClaimFromObservation({
+        state,
+        basis: "insufficient_evidence",
+        reasons: ["test"],
+      });
+  }
+}
 
 describe("parseWrapArgs --no-dashboard capture", () => {
   it("captures --no-dashboard into WrapOptions", () => {
@@ -81,6 +111,7 @@ describe("formatWrapSuccessNoDashboard", () => {
       serverCount: 0,
       passphraseLocation: "fixture-keychain",
       passphraseSource: "generated",
+      castleWallProtectionClaim: claim("unknown"),
     });
     expect(out).toContain("Wrapped");
     expect(out).toContain("Claude Code");
@@ -95,6 +126,7 @@ describe("formatWrapSuccessNoDashboard", () => {
       serverCount: 1,
       passphraseLocation: "fixture-keychain",
       passphraseSource: "generated",
+      castleWallProtectionClaim: claim("unknown"),
     });
     expect(out).toContain("Dashboard spawn skipped per --no-dashboard");
     expect(out).toContain("Run `sanctuary dashboard` separately");
@@ -102,7 +134,7 @@ describe("formatWrapSuccessNoDashboard", () => {
     expect(out).not.toContain("Sovereignty Dashboard running at");
   });
 
-  it("preserves the protected-status footer when Castle Wall armed", () => {
+  it("prints the protected-status footer only on observed enforcement evidence", () => {
     const out = formatWrapSuccessNoDashboard({
       toolName: "Claude Code",
       version: "1.1.5",
@@ -110,9 +142,7 @@ describe("formatWrapSuccessNoDashboard", () => {
       serverCount: 0,
       passphraseLocation: "fixture-keychain",
       passphraseSource: "generated",
-      // Honesty (audit seam #1): the protected/Full footer is reserved for an
-      // observed daemon arm.
-      castleWallArmed: true,
+      castleWallProtectionClaim: claim("exclusive"),
     });
     expect(out).toContain("Your agent is protected");
     expect(out).toContain("Castle Wall Full");
@@ -120,8 +150,7 @@ describe("formatWrapSuccessNoDashboard", () => {
     expect(out).not.toMatch(/\bL[1-4]\b/);
   });
 
-  // Honesty (audit seam #1): a failed arm must not print protected/Full.
-  it("downgrades the footer when Castle Wall did not arm", () => {
+  it("does NOT print protected/Full when protection state is unknown", () => {
     const out = formatWrapSuccessNoDashboard({
       toolName: "Claude Code",
       version: "1.1.5",
@@ -129,7 +158,23 @@ describe("formatWrapSuccessNoDashboard", () => {
       serverCount: 0,
       passphraseLocation: "fixture-keychain",
       passphraseSource: "generated",
-      castleWallArmed: false,
+      castleWallProtectionClaim: claim("unknown"),
+    });
+    expect(out).not.toContain("Your agent is protected");
+    expect(out).not.toContain("Castle Wall Full");
+    expect(out).toContain("Castle Wall status unknown");
+    expect(out).toContain("enforcement is not confirmed");
+  });
+
+  it("downgrades the footer when observed unprotected", () => {
+    const out = formatWrapSuccessNoDashboard({
+      toolName: "Claude Code",
+      version: "1.1.5",
+      toolCount: 0,
+      serverCount: 0,
+      passphraseLocation: "fixture-keychain",
+      passphraseSource: "generated",
+      castleWallProtectionClaim: claim("unprotected"),
     });
     expect(out).not.toContain("Your agent is protected");
     expect(out).not.toContain("Castle Wall Full");
@@ -144,6 +189,7 @@ describe("formatWrapSuccessNoDashboard", () => {
       serverCount: 1,
       passphraseLocation: "kc",
       passphraseSource: "generated",
+      castleWallProtectionClaim: claim("unknown"),
     });
     expect(single).toContain("1 upstream server");
     expect(single).not.toContain("1 upstream servers");
@@ -155,6 +201,7 @@ describe("formatWrapSuccessNoDashboard", () => {
       serverCount: 3,
       passphraseLocation: "kc",
       passphraseSource: "generated",
+      castleWallProtectionClaim: claim("unknown"),
     });
     expect(multi).toContain("3 upstream servers");
   });

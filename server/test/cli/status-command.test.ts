@@ -18,6 +18,7 @@ import { AuditLog } from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { renderTable, runStatusCommand, toYaml } from "../../src/cli/status.js";
 import { toBase64url } from "../../src/core/encoding.js";
+import { getFreePort } from "../helpers/free-port.js";
 
 class Capture extends Writable {
   chunks: string[] = [];
@@ -41,16 +42,12 @@ interface TestRig {
   stop: () => Promise<void>;
 }
 
-function pickPort(): number {
-  return 17000 + Math.floor(Math.random() * 20000);
-}
-
 async function startRig(): Promise<TestRig> {
   const storage = new MemoryStorage();
   const masterKey = randomBytes(32);
   const auditLog = new AuditLog(storage, masterKey);
   const authToken = `status-cli-test-${randomBytes(8).toString("hex")}`;
-  const port = pickPort();
+  const port = await getFreePort();
 
   const dashboard = new DashboardApprovalChannel({
     port,
@@ -208,7 +205,7 @@ describe("sanctuary status (CLI, /v1-backed)", { retry: 2 }, () => {
     const storage = new MemoryStorage();
     const masterKey = randomBytes(32);
     const auditLog = new AuditLog(storage, masterKey);
-    const port = 17000 + Math.floor(Math.random() * 20000);
+    const port = await getFreePort();
     const operatorPub = ed25519.getPublicKey(randomBytes(32));
     const dashboard = new DashboardApprovalChannel({
       port,

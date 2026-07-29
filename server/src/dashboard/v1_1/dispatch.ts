@@ -28,6 +28,22 @@ import {
   handleIntelligenceRoute,
   INTELLIGENCE_API_PREFIX,
 } from "./intelligence-api-router.js";
+import {
+  handleConsoleRoute,
+} from "../../console/api-router.js";
+import { CONSOLE_API_PREFIX, CONSOLE_HTML_PATH } from "../../console/constants.js";
+import {
+  handleAnomalyRoute,
+  ANOMALY_API_PREFIX,
+} from "../../anomaly-detection/anomaly-routes.js";
+import {
+  handleEnglishPolicyRoute,
+  ENGLISH_POLICY_API_PREFIX,
+} from "../../policy-engine/english-policy-routes.js";
+import {
+  handlePiiRewriteRoute,
+  PII_REWRITE_API_PREFIX,
+} from "../../query-anonymity/pii-rewrite-routes.js";
 import type { V11Bindings } from "./wiring.js";
 import { enforceAuth, type AuthConfig } from "../../console/auth-middleware.js";
 import { FilesystemStorage } from "../../storage/filesystem.js";
@@ -81,8 +97,16 @@ async function handleRecognitionDidWebRoute(
     loopbackAutoAuth: inputs.loopbackAutoAuth,
     ...(inputs.authToken !== undefined ? { authToken: inputs.authToken } : {}),
   };
+  const requiresOperatorBearer =
+    method === "POST" &&
+    url.pathname === "/api/hub/recognition/did-web/rotate-compromised";
   try {
-    enforceAuth(authConfig, req, url);
+    enforceAuth(
+      authConfig,
+      req,
+      url,
+      requiresOperatorBearer ? { requireToken: true } : undefined,
+    );
   } catch {
     writeJSON(res, 401, { ok: false, error: "unauthorized" });
     return true;
@@ -197,12 +221,15 @@ export async function dispatchV11Request(
 ): Promise<boolean> {
   const { bindings, authToken, loopbackAutoAuth } = inputs;
 
-  // v1.1 dashboard HTML at /dashboard and /v1.1 (and trailing slash). The
-  // bare root match remains for direct/back-compat helper callers, but both
-  // production dashboard routers now serve the posture shell at `/` before
-  // dispatch reaches this helper. Legacy v1.0 dashboard is preserved at
-  // /v1.0 by the legacy route tables in principal-policy/dashboard.ts and
-  // dashboard/api.ts; /v1.1 continues to serve operator bookmarks.
+  // v1.1 dashboard HTML at `/` (the single default surface), /dashboard, and
+  // /v1.1 (and trailing slash). Default-flip (2026-06-30): `/` now serves the
+  // v1.1 concierge here. Both production dashboard routers
+  // (principal-policy/dashboard.ts and dashboard/api.ts) NO LONGER serve the
+  // posture shell at `/`; they let `/` fall through to this helper, while the
+  // posture shell is preserved at `/posture` and folded into the concierge (the
+  // posture seal expands to full detail; a Posture entry lives in the Verify
+  // group). Legacy v1.0 dashboard is preserved at /v1.0 by the legacy route
+  // tables in those two routers; /v1.1 continues to serve operator bookmarks.
   if (
     method === "GET" &&
     (url.pathname === "/" ||
@@ -215,7 +242,6 @@ export async function dispatchV11Request(
         identityId: bindings.identityId,
         fortressId: bindings.fortressId,
         ...(bindings.storagePath ? { tenantName: tenantNameFromStoragePath(bindings.storagePath) } : {}),
-        ...(authToken !== undefined ? { authToken } : {}),
       },
       req,
       res,
@@ -251,6 +277,182 @@ export async function dispatchV11Request(
     }
     return handleIntelligenceRoute(
       { authConfig, selector: bindings.intelligenceSelector },
+      req,
+      res,
+    );
+  }
+
+  // Operator Console API at /api/console/* (+ /console static). Mounted
+  // behind the SAME auth chokepoint as the hub: `handleConsoleRoute` runs
+  // `authMiddleware(authConfig)` as its first action on every matched
+  // route, so an unauthenticated non-loopback request is rejected 401
+  // before any handler runs. The console domain service is constructed by
+  // the entry point (it owns the FortressService + node/principal signing
+  // keys) and threaded through `bindings.consoleService`. When the binding
+  // is absent we still match the prefix and run auth first, then answer
+  // 503 "not configured" - never a bypass, never a silent unmounted 404.
+  if (
+    url.pathname === CONSOLE_HTML_PATH ||
+    url.pathname.startsWith(`${CONSOLE_HTML_PATH}/`) ||
+    url.pathname.startsWith(`${CONSOLE_API_PREFIX}/`)
+  ) {
+    const authConfig: AuthConfig = {
+      loopbackAutoAuth,
+      ...(authToken !== undefined ? { authToken } : {}),
+    };
+    if (!bindings.consoleService) {
+      try {
+        enforceAuth(authConfig, req, url);
+      } catch {
+        writeJSON(res, 401, { ok: false, error: "unauthorized" });
+        return true;
+      }
+      writeJSON(res, 503, {
+        ok: false,
+        error: "console_not_configured",
+        detail: "Operator console service is not wired into this dashboard binding.",
+      });
+      return true;
+    }
+    return handleConsoleRoute(
+      {
+        authConfig,
+        service: bindings.consoleService,
+        ...(bindings.consolePublicDir !== undefined
+          ? { publicDir: bindings.consolePublicDir }
+          : {}),
+      },
+      req,
+      res,
+    );
+  }
+
+  // Anomaly Detection API at /api/anomaly/*. Same auth chokepoint:
+  // `handleAnomalyRoute` runs `authMiddleware(authConfig)` first on every
+  // matched route. The anomaly binding (dispatcher + finding store + audit)
+  // is constructed by `buildV11Bindings` when storage + master key are
+  // present; absent it, match-then-auth-then-503.
+  if (
+    url.pathname === ANOMALY_API_PREFIX ||
+    url.pathname.startsWith(`${ANOMALY_API_PREFIX}/`)
+  ) {
+    const authConfig: AuthConfig = {
+      loopbackAutoAuth,
+      ...(authToken !== undefined ? { authToken } : {}),
+    };
+    if (!bindings.anomaly) {
+      try {
+        enforceAuth(authConfig, req, url);
+      } catch {
+        writeJSON(res, 401, { ok: false, error: "unauthorized" });
+        return true;
+      }
+      writeJSON(res, 503, {
+        ok: false,
+        error: "anomaly_not_configured",
+        detail: "Anomaly detection is not wired into this dashboard binding.",
+      });
+      return true;
+    }
+    return handleAnomalyRoute(
+      {
+        authConfig,
+        dispatcher: bindings.anomaly.dispatcher,
+        findingStore: bindings.anomaly.findingStore,
+        auditLog: bindings.anomaly.auditLog,
+        identityId: bindings.anomaly.identityId,
+        storage: bindings.anomaly.storage,
+        masterKey: bindings.anomaly.masterKey,
+        fortressId: bindings.anomaly.fortressId,
+      },
+      req,
+      res,
+    );
+  }
+
+  // English-Authored Policy API at /api/policy/*. Same auth chokepoint:
+  // `handleEnglishPolicyRoute` runs `authMiddleware(authConfig)` first on
+  // every matched route. The policy binding (compiler + draft store, plus
+  // optional activator) is constructed by `buildV11Bindings` when storage
+  // + master key are present; absent it, match-then-auth-then-503.
+  if (
+    url.pathname === ENGLISH_POLICY_API_PREFIX ||
+    url.pathname.startsWith(`${ENGLISH_POLICY_API_PREFIX}/`)
+  ) {
+    const authConfig: AuthConfig = {
+      loopbackAutoAuth,
+      ...(authToken !== undefined ? { authToken } : {}),
+    };
+    if (!bindings.englishPolicy) {
+      try {
+        enforceAuth(authConfig, req, url);
+      } catch {
+        writeJSON(res, 401, { ok: false, error: "unauthorized" });
+        return true;
+      }
+      writeJSON(res, 503, {
+        ok: false,
+        error: "policy_not_configured",
+        detail: "English-authored policy is not wired into this dashboard binding.",
+      });
+      return true;
+    }
+    return handleEnglishPolicyRoute(
+      {
+        authConfig,
+        compiler: bindings.englishPolicy.compiler,
+        store: bindings.englishPolicy.store,
+        ...(bindings.englishPolicy.activator !== undefined
+          ? { activator: bindings.englishPolicy.activator }
+          : {}),
+        ...(bindings.englishPolicy.defaultOperatorId !== undefined
+          ? { defaultOperatorId: bindings.englishPolicy.defaultOperatorId }
+          : {}),
+      },
+      req,
+      res,
+    );
+  }
+
+  // Tier B PII-rewrite API at /api/query-anonymity/pii(/*). Same auth
+  // chokepoint: `handlePiiRewriteRoute` runs `authMiddleware(authConfig)`
+  // first on every matched route, so an unauthenticated non-loopback
+  // request is rejected 401 before any handler runs. The PII binding
+  // (config store + audit + redactor-installed flag) is constructed by
+  // `buildV11Bindings` when storage + master key are present; absent it,
+  // match-then-auth-then-503 (never a bypass, never a silent 404).
+  if (
+    url.pathname === PII_REWRITE_API_PREFIX ||
+    url.pathname.startsWith(`${PII_REWRITE_API_PREFIX}/`)
+  ) {
+    const authConfig: AuthConfig = {
+      loopbackAutoAuth,
+      ...(authToken !== undefined ? { authToken } : {}),
+    };
+    if (!bindings.pii) {
+      try {
+        enforceAuth(authConfig, req, url);
+      } catch {
+        writeJSON(res, 401, { ok: false, error: "unauthorized" });
+        return true;
+      }
+      writeJSON(res, 503, {
+        ok: false,
+        error: "pii_rewrite_not_configured",
+        detail:
+          "Tier B PII rewrite is not wired into this dashboard binding.",
+      });
+      return true;
+    }
+    return handlePiiRewriteRoute(
+      {
+        authConfig,
+        store: bindings.pii.store,
+        auditLog: bindings.pii.auditLog,
+        identityId: bindings.pii.identityId,
+        fortressId: bindings.pii.fortressId,
+        redactorInstalled: bindings.pii.redactorInstalled,
+      },
       req,
       res,
     );

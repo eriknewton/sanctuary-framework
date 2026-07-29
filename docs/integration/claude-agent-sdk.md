@@ -54,7 +54,7 @@ async for message in query(
         mcp_servers={
             "sanctuary": {
                 "command": "npx",
-                "args": ["@sanctuary-framework/mcp-server"]
+                "args": ["-y", "@sanctuary-framework/mcp-server"]
             }
         }
     ),
@@ -75,7 +75,7 @@ for await (const message of query({
     mcpServers: {
       sanctuary: {
         command: "npx",
-        args: ["@sanctuary-framework/mcp-server"]
+        args: ["-y", "@sanctuary-framework/mcp-server"]
       }
     }
   }
@@ -91,7 +91,7 @@ for await (const message of query({
   "mcpServers": {
     "sanctuary": {
       "command": "npx",
-      "args": ["@sanctuary-framework/mcp-server"]
+      "args": ["-y", "@sanctuary-framework/mcp-server"]
     }
   }
 }

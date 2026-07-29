@@ -65,11 +65,21 @@ export interface StatusResponse {
   no_wall_engaged: boolean;
 }
 
-/** Request from main to daemon: "manifest changed; re-read." */
+/**
+ * Request from main to daemon: "manifest changed; re-read."
+ *
+ * The daemon RECOMPOSES the manifest from the persisted rule files under
+ * `<fortress>/policy/egress/rules/` (multiple provenance-tagged files, not a
+ * single manifest document) and RE-SIGNS it through the pinned signer, so there
+ * is no single "manifest path" to hand it. `manifest_path` is therefore OPTIONAL
+ * and advisory only: no daemon reads it (it was a fabricated, non-existent path
+ * on the macOS reload path). Kept optional for wire compatibility; new callers
+ * should omit it.
+ */
 export interface PolicyReloadRequest {
   type: "policy_reload_request";
   request_id: IpcRequestId;
-  manifest_path: string;
+  manifest_path?: string;
 }
 
 /** Response from daemon to main confirming reload outcome. */
@@ -149,6 +159,22 @@ export interface DecisionResponseAck {
 export interface AuditEmitNotification {
   type: "audit_emit";
   event: CastleWallAuditEvent;
+}
+
+/** Per-event producer signature carried by a macOS extension verdict. */
+export interface AuditProducerSignatureNotification {
+  /** Exact canonical JSON body the extension signed. */
+  event_canonical_json: string;
+  /** Capture timestamp bound into the signature. */
+  captured_at_unix_ms: number;
+  /** Monotonic extension-side sequence bound into the signature. */
+  seq: number;
+  /** Prior CastleWallAuditEvent canonical hash, or null for genesis. */
+  prior_sha256_hex: string | null;
+  /** base64url-no-pad of the 64-byte Ed25519 producer signature. */
+  signature_b64url: string;
+  /** Key id selecting the pinned producer public key. */
+  key_id: string;
 }
 
 /** Aggregate metric batch (per scope-lock section 8 Option D metric path). */
@@ -317,6 +343,7 @@ export interface FlowDecisionRecordedNotification {
   agent: IpcAgentAttribution;
   matched_rule_id?: string | null;
   recorded_at: string;
+  producer?: AuditProducerSignatureNotification | null;
 }
 
 /**

@@ -20,11 +20,18 @@ import {
   getPlatformPaths,
 } from "../../src/wrap/config-reader.js";
 import { detectHarnessSchema } from "../../src/wrap/harness-schema.js";
+import { createTempFortress } from "../helpers/temp-fortress.js";
 
 describe("Config Reader", () => {
   let tmpDir: string;
+  // backupConfig / saveWrapMeta / findLatestBackup all resolve the fortress
+  // backup directory ambiently. Without a per-test fortress they wrote into
+  // the operator's own `~/.sanctuary/backup`, which is how that directory
+  // grew to thousands of files: one config-backup-<timestamp>.json per run.
+  let fortress: Awaited<ReturnType<typeof createTempFortress>>;
 
   beforeEach(async () => {
+    fortress = await createTempFortress("sanctuary-config-reader");
     tmpDir = await mkdtemp(join(tmpdir(), "sanctuary-test-"));
   });
 
@@ -32,6 +39,7 @@ describe("Config Reader", () => {
     try {
       await rm(tmpDir, { recursive: true, force: true });
     } catch {}
+    await fortress.cleanup();
   });
 
   // ── Config parsing ──────────────────────────────────────────────

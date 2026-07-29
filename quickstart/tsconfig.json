@@ -12,9 +12,7 @@
     "declaration": false,
     "sourceMap": false,
     "resolveJsonModule": true,
-    "types": [
-      "node"
-    ]
+    "types": ["node"]
   },
   "include": [
     "src/**/*"

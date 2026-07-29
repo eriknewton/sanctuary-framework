@@ -4,6 +4,7 @@ date: 2026-04-13
 description: "Add cryptographic identity, encrypted audit, and compliance reporting to Claude Managed Agents in 30 seconds."
 author: "Erik Newton"
 archive_note: "Predates Mantle vocabulary canonicalization on 2026-05-15. Terminology in this post may refer to install-time-binding concepts using earlier language; current canonical vocabulary lives at https://github.com/eriknewton/newton-wiki/blob/main/concepts/mantle.md."
+claims_era_note: true
 ---
 
 > **Archive note:** This post predates Mantle vocabulary canonicalization on 2026-05-15.
@@ -48,7 +49,7 @@ Deploy the agent. Sanctuary tools load automatically via MCP.
 | Aspect | Without Sanctuary | With Sanctuary |
 |--------|------------------|----------------|
 | Identity | Implicit (cloud-managed) | Explicit (agent-owned Ed25519 keypair) |
-| Audit | Default logging | Encrypted, tamper-proof, SIEM-ready |
+| Audit | Default logging | Encrypted, tamper-evident, SIEM-ready |
 | Policy | Platform-level (static) | Principal-level (dynamic, time-locked) |
 | Disclosure | All-or-nothing | Selective (ZK attestations) |
 | Reputation | Opaque | Verifiable via Verascore |

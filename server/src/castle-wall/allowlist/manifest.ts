@@ -49,6 +49,21 @@ export type AgentOriginMode = "nat" | "uid";
  * - `uid`: `agent_uid` (the dedicated account uid) must be present.
  * - both: `system_uid_allow_ceiling` is required (uids strictly below it are
  *   treated as system daemons on the conceded operator low-UID path).
+ *
+ * `gate_uid` (S5-0, 2026-07-14 two-confined-uid extension): a SECOND optional
+ * confined-principal uid, valid only alongside `mode: "uid"`. When present,
+ * the sysext classifies flows from EITHER `agent_uid` OR `gate_uid` as
+ * `.agent` (default-deny + allowlist), never `.operator` -- see
+ * `OriginClassifier.classifyUid` in castle-wall-macos. It rides in the same
+ * signed body as `agent_uid` so it is covered by the exact same Ed25519
+ * signature; canonical-JSON bytes are byte-identical to today when absent
+ * (additive, no `schema_version` bump). `validateAgentOrigin` enforces the
+ * same floor invariants as `agent_uid` (>=1, >= `system_uid_allow_ceiling`)
+ * PLUS distinctness from `agent_uid` (a colliding gate uid would let a
+ * gate-scoped `RuleScope.uids` rule apply to the agent's own flows too,
+ * defeating the entire two-principal separation) -- any violation rejects the
+ * WHOLE descriptor (never a partially-trusted one), the same fail-closed
+ * treatment `agent_uid` already gets.
  */
 export interface AgentOrigin {
   mode: AgentOriginMode;
@@ -56,6 +71,7 @@ export interface AgentOrigin {
   egress_helper_team_id?: string;
   agent_runtime_port_range?: [number, number];
   agent_uid?: number;
+  gate_uid?: number;
   system_uid_allow_ceiling: number;
 }
 

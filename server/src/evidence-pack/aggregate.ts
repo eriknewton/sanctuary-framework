@@ -1,0 +1,1080 @@
+/**
+ * Sanctuary MCP Server - Law-firm Evidence Pack: quarter aggregation
+ *
+ * Copyright 2026 Erik Newton
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * The calendar-quarter aggregation and covered-window shortfall detection.
+ * This is the main NEW computation the pack adds. It is pure over an injected
+ * `AuditEntry[]` + retention facts, so tests exercise the real bucketing and
+ * shortfall logic with synthetic fixtures and never touch `~/.sanctuary`.
+ *
+ * The decision-category mapping reads the shipped enforcement-gate operation
+ * strings (`gate_allow:`, `gate_deny:`, `gate_approval_proof:`, etc., written
+ * by `principal-policy/gate.ts`) and the cross-harness approval resolution op
+ * (`cross_harness_approval_resolved`, written by the approval aggregator). It
+ * never invents a decision the log did not record.
+ */
+
+import type { AuditEntry } from "../operational/audit-log.js";
+import type {
+  DecisionCategory,
+  QuarterAggregation,
+  QuarterWindow,
+  RetentionFacts,
+  ShortfallReport,
+} from "./types.js";
+import {
+  daemonStoreExcludedFromCensus,
+  isRecognizedDaemonStatus,
+  isUsableFigure,
+  isUsableTimestamp,
+} from "./types.js";
+import { isInWindow } from "./quarter.js";
+import { diagnoseHistoryGap } from "./history-attribution.js";
+import {
+  populated,
+  readFailed,
+  sanitizeReason,
+  type ReadOutcome,
+} from "./read-outcome.js";
+
+/**
+ * D10-DISC-1 (neighbouring surface): quote a value that FAILED its usability
+ * check back to the reader. Every caller is on an error path, so by definition
+ * the value is NOT a valid timestamp: it is arbitrary text from a corrupted
+ * store or an untyped caller, and the coverage `explanation` it lands in is
+ * copied verbatim into the SIGNED manifest's `coverage.reason` whenever the
+ * window is not determinable. That is the same free-text-into-a-signed-artifact
+ * vector `readFailed` closes, reached by a different door, so it is scrubbed by
+ * the same sanitizer. It is also LENGTH-CAPPED: a corrupt store could otherwise
+ * push an unbounded blob into a signed field and the firm's PDF.
+ *
+ * Values that PASS the usability check are not routed here: a string only
+ * parses to a finite instant if it is a real date, so it cannot carry a path.
+ */
+function quoteUnusableValue(value: unknown): string {
+  const raw = typeof value === "string" ? value : String(value);
+  const scrubbed = sanitizeReason(raw);
+  return scrubbed.length > 60 ? `${scrubbed.slice(0, 60)}...` : scrubbed;
+}
+
+/**
+ * The operation string the approval aggregator writes when a cross-harness
+ * Tier-1 approval is resolved. Mirrored here (not imported) so this pure layer
+ * does not couple to the aggregator's internals; it is a wire-string constant,
+ * not behavior. Kept in lockstep with `APPROVAL_AGGREGATOR_AUDIT_OPS.RESOLVED`.
+ *
+ * DE-DUP (sweep HIGH-1): this op is DELIBERATELY treated as observational
+ * (`other`), NOT a human decision count. When the cross-harness approval inbox
+ * is enabled (`approval_redirect.enabled`), a single human approval writes BOTH
+ * `cross_harness_approval_resolved` (the aggregator) AND `gate_approve:` /
+ * `gate_deny:` (the gate, which is written on EVERY gated Tier-1 path whether
+ * redirect is on or off). Counting both would roughly DOUBLE the "human
+ * reviewed" figure and inflate `total_in_window` and the denial rows. The gate
+ * op is the single source of truth for a human control-point decision; the
+ * aggregator op is a paired observation of the same decision, so it is not
+ * counted a second time.
+ */
+const CROSS_HARNESS_APPROVAL_RESOLVED = "cross_harness_approval_resolved";
+
+/** Every decision category, so `by_category` is always fully zero-filled. */
+const ALL_CATEGORIES: DecisionCategory[] = [
+  "allowed",
+  "allowed_proxy",
+  "human_approved",
+  "human_denied",
+  "denied",
+  "injection_blocked",
+  "unclassified",
+  "uncategorized",
+  "other",
+];
+
+/**
+ * The EXPLICIT gate-decision op-prefix -> category map. This is the single
+ * source of truth the exhaustiveness test checks against the ops actually
+ * emitted by `principal-policy/gate.ts`: adding a new `gate_*` decision op to
+ * the gate without adding it here fails that test, so a new op can never
+ * silently vanish into `other` or a flattering bucket.
+ *
+ * These are the PRIMARY categories; at runtime `categorizeEntry` refines
+ * `gate_approve`/`gate_deny` by `details.decided_by` (a "human" decision ->
+ * `human_approved`/`human_denied`; otherwise `allowed`/`denied`). The map entries
+ * exist so the exhaustiveness test sees every emitted `gate_*` op mapped to a
+ * real bucket (never `uncategorized`/`other`). `gate_approval_proof` is a human
+ * approval; the automated tiers are `gate_allow`/`gate_allow_proxy`/
+ * `gate_injection_block`/`gate_unclassified`. There is no `gate_escalate`
+ * producer.
+ */
+export const GATE_DECISION_OP_CATEGORIES: Readonly<
+  Record<string, DecisionCategory>
+> = {
+  gate_allow: "allowed",
+  gate_allow_proxy: "allowed_proxy",
+  gate_approve: "human_approved",
+  gate_approval_proof: "human_approved",
+  gate_deny: "denied",
+  gate_injection_block: "injection_blocked",
+  gate_unclassified: "unclassified",
+};
+
+/**
+ * Map one audit entry to a decision category. The gate encodes the decision in
+ * the operation prefix before the first colon, refined by `details.decided_by`
+ * for the human/automated split. The `cross_harness_approval_resolved` op is
+ * NOT read from the entry `result`; it is routed to `other` unconditionally
+ * (see the de-dup note below), because it is a paired observation of a decision
+ * the gate already counted.
+ *
+ * UNMAPPED-OP GUARD: a `gate_`-shaped op NOT in {@link GATE_DECISION_OP_CATEGORIES}
+ * is a control-point decision this version does not classify, so it returns
+ * `uncategorized` (surfaced honestly for investigation) rather than falling
+ * into `other` or inflating an automated count. Only genuine non-`gate_`
+ * operations (identity ops, state writes, heartbeats) return `other`.
+ */
+export function categorizeEntry(entry: AuditEntry): DecisionCategory {
+  // De-dup (HIGH-1): the cross-harness approval resolution is a paired
+  // OBSERVATION of a decision the gate already recorded (gate_approve/gate_deny),
+  // so it is `other`, never a second human-decision count.
+  if (entry.operation === CROSS_HARNESS_APPROVAL_RESOLVED) {
+    return "other";
+  }
+  const prefix = entry.operation.split(":", 1)[0] ?? "";
+  // HUMAN vs AUTOMATED via the gate's own `details.decided_by` (round-2 N1 fix):
+  // `principal-policy/gate.ts` writes `decided_by: response.decided_by` on
+  // gate_approve/gate_deny, where "human" is a genuine control-point human
+  // decision (inbox OR interactive) and every other value
+  // (timeout/auto/stderr/channel_failure, or an invalid-proof deny with no
+  // decided_by) is NOT human. This is the SINGLE counted source for a human
+  // decision (the paired cross_harness op is observational), so one human
+  // decision counts exactly once, in BOTH directions. gate_deny sourced this way
+  // is the only unambiguous human-denial signal (the cross-harness aggregator op
+  // was routed to `other` in round-1); without this, `human_denied` was
+  // structurally always 0.
+  const decidedByHuman = entry.details?.decided_by === "human";
+  if (prefix === "gate_approve") {
+    return decidedByHuman ? "human_approved" : "allowed";
+  }
+  if (prefix === "gate_deny") {
+    return decidedByHuman ? "human_denied" : "denied";
+  }
+  const mapped = GATE_DECISION_OP_CATEGORIES[prefix];
+  if (mapped !== undefined) return mapped;
+  // A gate-shaped op we do not explicitly map is a decision we cannot classify:
+  // surface it, never hide it in `other` or a flattering bucket.
+  if (prefix.startsWith("gate_")) return "uncategorized";
+  return "other";
+}
+
+/**
+ * Bucket audit entries into a single calendar quarter and count them by
+ * decision category. Entries outside the window are ignored. Boundaries are
+ * inclusive-start / exclusive-end (see {@link isInWindow}).
+ */
+export function aggregateQuarter(
+  entries: readonly AuditEntry[],
+  window: QuarterWindow
+): QuarterAggregation {
+  const byCategory = {} as Record<DecisionCategory, number>;
+  for (const category of ALL_CATEGORIES) byCategory[category] = 0;
+
+  const identities = new Set<string>();
+  let firstAtMs = Number.POSITIVE_INFINITY;
+  let lastAtMs = Number.NEGATIVE_INFINITY;
+  let firstAt: string | null = null;
+  let lastAt: string | null = null;
+  let total = 0;
+
+  for (const entry of entries) {
+    if (!isInWindow(entry.timestamp, window)) continue;
+    total++;
+    byCategory[categorizeEntry(entry)]++;
+    identities.add(entry.identity_id);
+    const t = new Date(entry.timestamp).getTime();
+    if (t < firstAtMs) {
+      firstAtMs = t;
+      firstAt = entry.timestamp;
+    }
+    if (t > lastAtMs) {
+      lastAtMs = t;
+      lastAt = entry.timestamp;
+    }
+  }
+
+  return {
+    window,
+    total_in_window: total,
+    by_category: byCategory,
+    unique_identities: Array.from(identities).sort(),
+    first_entry_at: firstAt,
+    last_entry_at: lastAt,
+  };
+}
+
+/**
+ * G-1(c): a short pointer appended to the ZERO-ENTRY operator-store explanations
+ * when a root-owned daemon enforcement store IS present but excluded from the
+ * census (unreadable at this privilege, or tamper-failed). Without it, an
+ * operator-empty quarter reads as "no enforcement history exists" when the
+ * daemon may have been enforcing and recording the whole time. Empty for a
+ * daemon store that is absent (nothing to disclose) or included (already in the
+ * counts). The full disclosure + remedy lives in the enforcement-summary and
+ * definitive-count sections; this is a one-line signpost.
+ */
+function daemonPresentButExcludedSuffix(retention: RetentionFacts): string {
+  // Defensive: a coverage read produced before this field existed (or a partial
+  // test fixture) has no daemon disclosure -- treat as `absent` (nothing to add).
+  const d = retention.daemon_store;
+  if (!d) return "";
+  if (d.status === "present_unreadable") {
+    return (
+      " NOTE: a separate root-owned daemon enforcement store (_audit-daemon) IS " +
+      "present but was not readable here, so daemon-recorded enforcement " +
+      "(automated Castle Wall gate decisions and egress denials) for this " +
+      "quarter may exist that is NOT reflected above; see the enforcement-summary " +
+      "section."
+    );
+  }
+  if (d.status === "present_tampered") {
+    return (
+      " NOTE: a separate root-owned daemon enforcement store (_audit-daemon) IS " +
+      "present but FAILED integrity verification, so daemon-recorded enforcement " +
+      "for this quarter is not reflected above and the store shows tamper " +
+      "evidence; see the enforcement-summary section."
+    );
+  }
+  if (d.status === "missing") {
+    return (
+      " NOTE: audit-store writer-split evidence is present on this fortress but " +
+      "the separate root-owned daemon enforcement store (_audit-daemon) it " +
+      "references is ABSENT (deleted or renamed, or the split evidence is present " +
+      "but unverifiable), so daemon-recorded enforcement for this quarter is not " +
+      "reflected above. This is not a clean fresh fortress; see the " +
+      "enforcement-summary section."
+    );
+  }
+  // D8-4 (Dry-9): an UNRECOGNIZED status (an untyped / JSON caller) is disclosed
+  // as not-determinable, never silently dropped -- and never mislabeled with a
+  // known status's specific wording.
+  if (!isRecognizedDaemonStatus(d.status)) {
+    return (
+      " NOTE: the daemon enforcement store disclosure carried an UNRECOGNIZED " +
+      "status, so whether daemon-recorded enforcement for this quarter is " +
+      "reflected above cannot be determined; treat this as an operator-store " +
+      "view, not a complete enforcement census. See the enforcement-summary " +
+      "section."
+    );
+  }
+  return "";
+}
+
+/**
+ * One contributing store's retention position as consumed by the at-cap
+ * decision: the store's OWN caps against its OWN retained figures. A structural
+ * subset of {@link PerStoreRetention} (no `store` tag) so the legacy top-level
+ * single-store fallback can flow through the same chokepoint.
+ */
+export interface StoreRetentionPosition {
+  max_entries: number;
+  retained_total: number;
+  max_total_size_bytes: number;
+  retained_total_size_bytes: number | null;
+}
+
+/**
+ * The at-cap determinability classification: either at-cap CAN be computed and
+ * `contributing_stores` are the stores whose own caps drive it, or it CANNOT
+ * (`contributing_stores` empty) and no surface may assert a definitive at-cap
+ * or below-cap claim.
+ */
+export interface RetentionDeterminability {
+  /** True when "at a retention cap" can honestly be computed from the facts. */
+  at_cap_determinable: boolean;
+  /**
+   * The stores whose OWN caps drive the at-cap decision when determinable;
+   * empty when not determinable (at-cap must never be asserted either way).
+   */
+  contributing_stores: readonly StoreRetentionPosition[];
+}
+
+/**
+ * F2-R2 -> D8-1: runtime USABILITY of one contributing store position. Row
+ * PRESENCE alone is not determinability: a tags-only row like
+ * `{ store: "operator" }` carries no cap evidence at all, yet the at-cap
+ * comparison would silently evaluate its missing fields as "not at cap" and
+ * let the pack SIGN a definitive flattering `retention_at_cap: false` (plus
+ * the never-pruned reassurance). Every field the at-cap comparison reads must
+ * be a finite number, and (D8-1, Dry-8 sweep) the figures must be USABLE for
+ * a definitive verdict in BOTH directions, not merely finite:
+ *
+ *  - Leg B (caps): a cap `<= 0` is the in-band "this cap is not known to this
+ *    reporter" encoding (see `types.ts`). A row whose entry or size cap is
+ *    unknown can prove NEITHER "at cap" NOR "below both caps", yet previously
+ *    still earned the definitive signed `retention_at_cap: false` and the
+ *    "below both its entry and size retention caps" prose over caps declared
+ *    UNKNOWN. Cap unknown => the store's position is not determinable.
+ *  - Leg C (unread size): `retained_total_size_bytes: null` is the documented
+ *    "size was never read" encoding (it is what the shipped CLI now carries
+ *    when `getRetentionUsage()` threw -- Leg A). A null size cannot support
+ *    "below both its entry and size retention caps" (the size dimension was
+ *    never read), and `ever_pruned === false` does not exclude `size == cap`
+ *    (pruning fires only when the size EXCEEDS the cap), so the previous
+ *    allowance let a signed definitive below-both-caps claim ride on a figure
+ *    nobody read. Unread size => the store's position is not determinable.
+ *    (This DELIBERATELY reverses the #954 null-is-usable allowance; the two
+ *    non-vacuity tests that pinned it were updated with the reversal note.)
+ *
+ * `undefined`, `NaN`, `Infinity`, and wrong-typed values remain rejected as
+ * before (F2-R2 completeness).
+ */
+const storePositionUsable = (s: StoreRetentionPosition): boolean =>
+  isUsableFigure(s.max_entries) &&
+  s.max_entries > 0 &&
+  isUsableFigure(s.retained_total) &&
+  isUsableFigure(s.max_total_size_bytes) &&
+  s.max_total_size_bytes > 0 &&
+  isUsableFigure(s.retained_total_size_bytes);
+
+/**
+ * D7-1 / Codex-F1+F2 (dry-bar round 7): the SINGLE chokepoint deciding whether
+ * "the log is at a retention cap" is DETERMINABLE from a set of retention
+ * facts, and if so which stores' own caps drive the decision. Both consumers
+ * route through it: `detectShortfall` (every prose surface -- shortfall
+ * explanation, exec-summary and section-7 coverage notices, the PDF) and, via
+ * the `retention_at_cap_determinable` field it feeds, the SIGNED manifest
+ * serialization in `generate.ts`. This replaces the P1-B `=== undefined` guard,
+ * whose narrow keying let an INCOMPLETE/INCONSISTENT breakdown (empty `[]`, a
+ * type-invalid `null` from a JS/`JSON.parse` caller, or an operator-only row
+ * while the daemon store is `included`) fall back to the mismatched-scope
+ * merged-total-vs-one-cap arithmetic and revive the flattering "never pruned /
+ * below both caps" reassurance.
+ *
+ * Classification, fail-safe by default (mirrors the D5-3 rule: never assert a
+ * definitive claim the present data cannot back):
+ *  1. USABLE breakdown -- a present, non-empty, genuinely-Array
+ *     `per_store_retention` whose EVERY row is a runtime-complete
+ *     {@link PerStoreRetention} (a known `store` tag plus finite numeric
+ *     `max_entries`, `retained_total`, `max_total_size_bytes`, and a
+ *     null-or-finite `retained_total_size_bytes`), with EXACTLY ONE
+ *     `store: "operator"` row (the operator store is part of EVERY census) and
+ *     AT MOST ONE `store: "daemon"` row -- EXACTLY ONE whenever the census is
+ *     MERGED (`daemon_store.status === "included"`) -> DETERMINABLE, judged
+ *     per store against each store's own caps (the shipped path:
+ *     `deriveAuditReadOutcome` always seeds a complete operator row and adds
+ *     the daemon row when merged). A single complete daemon row on a
+ *     NON-merged census stays usable: it can only widen the at-cap OR toward
+ *     over-warning, never manufacture the flattering below-cap claim, and the
+ *     pre-WATCH-1 D5-1 fixtures (no `daemon_store` disclosure) depend on it.
+ *  2. Breakdown genuinely ABSENT (`undefined`) on a genuinely SINGLE-store
+ *     census (daemon NOT `included`) -> DETERMINABLE via the top-level fields,
+ *     which ARE that one store's own figures (the legacy pre-D5-1 caller) --
+ *     but ONLY when those top-level fields are themselves runtime-complete
+ *     under the same rule (F2-R2: the fallback row is a CONTRIBUTING row like
+ *     any other; a non-finite/absent top-level figure from an untyped caller
+ *     is no more evaluable than a field-free breakdown row).
+ *  3. Everything else -> NOT DETERMINABLE:
+ *     - daemon `included` with the breakdown absent, `null`, empty, or missing
+ *       the daemon row: the top-level total is MERGED, so comparing it to one
+ *       store's cap is the exact mismatched-scope arithmetic P1-B banned;
+ *     - a breakdown missing the OPERATOR row (fix-round F1): every census
+ *       includes the operator store, so a daemon-only breakdown left the
+ *       operator store's own cap position unsupplied -- the exact mirror of
+ *       the daemon-less case -- yet previously still earned the definitive
+ *       below-cap claim and the flattering reassurance over the daemon row
+ *       alone;
+ *     - an explicitly-supplied empty `[]`, `null`, or non-Array breakdown on
+ *       ANY census: the caller asserted a breakdown and delivered nothing
+ *       usable, so the anomalous input never earns a definitive at-cap OR
+ *       below-cap claim;
+ *     - F2-R2 (second-family review): any row that is not a runtime-complete
+ *       object -- a `null`/non-object element, an unknown `store` tag, a
+ *       missing/`NaN`/`Infinity`/wrong-typed numeric field, or an `undefined`
+ *       `retained_total_size_bytes` (the contract is null-or-finite). Row
+ *       PRESENCE without field COMPLETENESS previously sailed through: the
+ *       at-cap comparison evaluated the missing fields as "not at cap" and the
+ *       pack SIGNED a definitive flattering `retention_at_cap: false` plus the
+ *       never-pruned reassurance from rows carrying zero cap evidence;
+ *     - F2-R2 / Dry-8 HIGH: DUPLICATE rows for the same store or UNKNOWN-store
+ *       rows (e.g. `store: "archive"`). `contributing_stores` feeds the at-cap
+ *       OR directly, so an invalid extra row could also SIGN a definitive
+ *       `retention_at_cap: true` -- a signed falsehood in the OVER-claiming
+ *       direction. An inconsistent census description forfeits determinability
+ *       entirely (fail-safe: assert NEITHER direction);
+ *     - D8-1 (Dry-8 sweep): any contributing row -- a breakdown row or the
+ *       legacy top-level fallback -- whose figures are finite but not USABLE
+ *       for a definitive verdict: an entry or size cap `<= 0` (the documented
+ *       in-band "cap not known to this reporter" encoding, Leg B) or a `null`
+ *       `retained_total_size_bytes` (the documented "size unread" encoding,
+ *       now ALSO what the shipped CLI carries when `getRetentionUsage()`
+ *       threw -- Leg A/C). Previously these rows validated and earned the
+ *       definitive signed `retention_at_cap: false` plus "below both its
+ *       entry and size retention caps" prose over caps declared unknown and
+ *       size figures nobody read. See {@link storePositionUsable}.
+ */
+export function retentionDeterminability(
+  retention: RetentionFacts
+): RetentionDeterminability {
+  const breakdown = retention.per_store_retention;
+  const daemonIncluded = retention.daemon_store?.status === "included";
+  // `Array.isArray` deliberately rejects `undefined`, a `null` smuggled past
+  // the optional-array type by an untyped caller, AND any non-Array object.
+  if (Array.isArray(breakdown) && breakdown.length > 0) {
+    // F2-R2 -> D8-1: every row must be a runtime-USABLE object with a KNOWN
+    // store tag -- presence-only rows like `{ store: "operator" }` carry no cap
+    // evidence, and rows with an unknown (`<= 0`) cap or an unread (`null`)
+    // size carry evidence that cannot back a definitive verdict in either
+    // direction. Neither must ever be evaluated as "not at cap".
+    const rowsComplete = breakdown.every(
+      (s) =>
+        typeof s === "object" &&
+        s !== null &&
+        (s.store === "operator" || s.store === "daemon") &&
+        storePositionUsable(s)
+    );
+    // The operator store is part of EVERY census (`types.ts` documents the
+    // breakdown invariant as "Always includes the operator store"), so a
+    // daemon-only breakdown is as incomplete as an operator-only one. F2-R2 /
+    // Dry-8: DUPLICATE rows would feed the at-cap OR twice (an invalid extra
+    // at-cap row signs a definitive over-claim), so exactly one operator row
+    // and at most one daemon row -- exactly one when the census is MERGED.
+    if (!rowsComplete) {
+      return { at_cap_determinable: false, contributing_stores: [] };
+    }
+    const operatorCount = breakdown.filter((s) => s.store === "operator").length;
+    const daemonCount = breakdown.filter((s) => s.store === "daemon").length;
+    const usable =
+      operatorCount === 1 &&
+      (daemonIncluded ? daemonCount === 1 : daemonCount <= 1);
+    if (usable) {
+      return { at_cap_determinable: true, contributing_stores: breakdown };
+    }
+    return { at_cap_determinable: false, contributing_stores: [] };
+  }
+  if (!daemonIncluded && breakdown === undefined) {
+    // F2-R2 -> D8-1: the legacy fallback row is a CONTRIBUTING row like any
+    // other -- validate the top-level figures under the same usability rule
+    // (finite, caps > 0, size actually read) before letting them drive a
+    // definitive at-cap/below-cap claim.
+    const single: StoreRetentionPosition = {
+      max_entries: retention.max_entries,
+      retained_total: retention.retained_total,
+      max_total_size_bytes: retention.max_total_size_bytes,
+      retained_total_size_bytes: retention.retained_total_size_bytes,
+    };
+    if (storePositionUsable(single)) {
+      return { at_cap_determinable: true, contributing_stores: [single] };
+    }
+  }
+  return { at_cap_determinable: false, contributing_stores: [] };
+}
+
+/**
+ * Detect a covered-window shortfall: whether the retained audit log
+ * demonstrably covers the full quarter, on BOTH the start side and the end
+ * side (HIGH-2 fix). A shortfall exists when either:
+ *  - START: the earliest retained entry is later than the quarter start (so
+ *    pre-existing entries are unavailable for this quarter), OR
+ *  - END: the quarter had not ended at generation time, so the pack cannot
+ *    attest coverage of the portion of the quarter after `generatedAt` (an
+ *    in-progress quarter, the default one-command case).
+ *
+ * `covered_to_exclusive` is `min(quarter end, generation instant, census cut)`
+ * and is NEVER unconditionally the quarter end: the pack can never attest
+ * coverage of a period after the moment it was generated, NOR (D9C-1) past the
+ * instant the audit census was taken. The audit census is read BEFORE the pack
+ * stamps its generation time, so entries appended in the gap between the census
+ * and generation were never counted; attesting coverage through the later
+ * generation instant would sign a window covering operations the census never
+ * saw. When the caller supplies `censusTakenAt`, the covered window stops at
+ * that cut so the count and the attested span stay mutually consistent.
+ *
+ * D9C-2: the attested span must never run BACKWARDS. An entry timestamped after
+ * the attestable end (a future-dated in-quarter entry, or any entry past the
+ * census/generation cut) cannot anchor `covered_from` -- that would sign an
+ * impossible `covered_from > covered_to_exclusive` span. Such a state renders as
+ * zero-covered (mirroring the M1 wholly-post-quarter case), never a backwards
+ * window.
+ *
+ * The start-side disclosure distinguishes retention pruning (log at/above its
+ * FIFO cap; early entries LIKELY dropped) from genuine inactivity (log below
+ * cap; the fortress simply had no earlier activity), and always states the real
+ * covered span. The real last-recorded entry is surfaced so an auditor sees the
+ * true tail of activity rather than inferring coverage to the quarter end.
+ */
+export function detectShortfall(
+  window: QuarterWindow,
+  retention: RetentionFacts,
+  params: {
+    generatedAt: string;
+    lastEntryAt: string | null;
+    /**
+     * D9C-1: the instant the audit census was taken (the audit `query()` +
+     * usage read completed), when the caller captured it. The census is read
+     * BEFORE the pack stamps its generation time, so the attested coverage
+     * window must not extend past it -- otherwise the signed span would claim
+     * coverage of operations appended between the census and generation that the
+     * census never counted. Omit (legacy callers) to fall back to the generation
+     * instant.
+     */
+    censusTakenAt?: string;
+  }
+): ShortfallReport {
+  const quarterStartMs = new Date(window.start_inclusive).getTime();
+  const quarterEndMs = new Date(window.end_exclusive).getTime();
+  const generatedMs = new Date(params.generatedAt).getTime();
+  // Dry-9 fix-round-2 (P1): the audit-census cut is attestation-bearing -- it
+  // bounds `covered_to_exclusive` from above. A present-but-UNPARSEABLE cut can
+  // bound nothing, and falling back to the generation instant would attest
+  // coverage the census never proved (the exact widening #954/#958 fought on the
+  // NUMERIC dimension). So a present-but-unusable cut makes the covered WINDOW
+  // NOT DETERMINABLE: fail closed to the same shape a read_failed audit source
+  // produces (no definitive span; prose + SIGNED manifest both render
+  // not-determinable) rather than silently widen. An ABSENT cut (legacy caller)
+  // and a USABLE cut both flow through normally below.
+  const censusUnusable =
+    params.censusTakenAt !== undefined && !isUsableTimestamp(params.censusTakenAt);
+  if (censusUnusable) {
+    return {
+      shortfall: true,
+      // No definitive span: the manifest chokepoint serializes determinable:false
+      // (dropping these bounds) and every prose surface reads coverage_determinable.
+      covered_from: window.start_inclusive,
+      covered_to_exclusive: window.start_inclusive,
+      in_progress_quarter: false,
+      last_entry_at: params.lastEntryAt,
+      retention_at_cap: false,
+      retention_at_cap_determinable: false,
+      // NOT a zero-covered finding (that is a DETERMINED empty window); this is
+      // "we could not determine the window at all". Keep the markers off so no
+      // surface reads a definitive zero-coverage claim here.
+      zero_of_quarter_covered: false,
+      covered_to_is_census_cut: false,
+      coverage_determinable: false,
+      explanation:
+        "The audit-census cut timestamp (" +
+        quoteUnusableValue(params.censusTakenAt) +
+        ") was present but could not be parsed, so this report cannot bound the " +
+        "upper end of the coverage window: the covered window for this quarter " +
+        "is NOT DETERMINABLE. This report makes no coverage claim. Investigate " +
+        "the census-capture timestamp and regenerate.",
+      daemon_store: retention.daemon_store,
+    };
+  }
+  // D9C-1: the census cut, when supplied and USABLE, bounds the attested window
+  // from above. An absent or unparseable value is ignored (falls back to
+  // generation) -- D8-2: the census cut is attestation-bearing, so it flows
+  // through the shared `isUsableTimestamp` guard exactly like the earliest
+  // instant below.
+  const censusBoundMs =
+    params.censusTakenAt !== undefined && isUsableTimestamp(params.censusTakenAt)
+      ? new Date(params.censusTakenAt).getTime()
+      : null;
+  // D8-2 (Dry-9): the earliest-retained instant DRIVES the start-coverage
+  // verdict, so it must be USABLE (a string that parses to a finite instant)
+  // before it can anchor any definitive claim. A fully type-valid but
+  // UNPARSEABLE value previously NaN'd through every numeric branch below into
+  // the flattering "reaches the quarter start" arm, signing shortfall:false off
+  // an instant nobody parsed. `earliestMs` is a finite number ONLY when the
+  // stored value is usable; a genuinely-null (empty log) value and an unusable
+  // (unparseable) value are told apart by `earliestUnparseable`.
+  const earliestRaw = retention.earliest_retained_at;
+  const earliestUsable = earliestRaw !== null && isUsableTimestamp(earliestRaw);
+  const earliestMs = earliestUsable
+    ? new Date(earliestRaw as string).getTime()
+    : null;
+  const earliestUnparseable = earliestRaw !== null && !earliestUsable;
+  // D5-1 (dry-bar round 5): "at a retention cap" is judged PER STORE against
+  // each store's OWN independent cap, then OR-ed. Each contributing `AuditLog`
+  // (operator + daemon) prunes on its own 100k-entry / 100 MB caps, so the
+  // combined healthy capacity is 200k/200 MB; comparing the MERGED two-store
+  // retained total against a SINGLE store's cap falsely reported "at cap" (and a
+  // false `retention_at_cap: true` in the signed manifest) for a healthy split
+  // fortress whose combined count crossed one store's cap while NEITHER store was
+  // near its own.
+  //
+  // P1-B (round 6) -> D7-1/F2 (round 7): whether at-cap is even DETERMINABLE,
+  // and over which stores, is decided by the `retentionDeterminability`
+  // chokepoint above (usable breakdown -> per store; genuine legacy
+  // single-store -> top-level fields; anything else -- a merged census with an
+  // absent/`null`/empty/daemon-less breakdown, or an explicitly-supplied
+  // empty/`null` breakdown -- fail-safe NOT determinable). When not
+  // determinable, assert NEITHER at-cap NOR the flattering "never pruned /
+  // below caps" reassurance.
+  const atCapForStore = (s: StoreRetentionPosition): boolean => {
+    // Either FIFO cap counts as "at cap" for a given store (sweep HIGH-5):
+    // entries OR total size. D8-1: a contributing store is guaranteed by the
+    // `retentionDeterminability` chokepoint to carry caps > 0 and a non-null
+    // (actually read) size, so the `> 0` / `!== null` guards below are
+    // defensive narrowing, never a semantic "unknown cap counts as below-cap"
+    // allowance (that allowance is retired; unknown/unread => not determinable).
+    const atEntryCap = s.max_entries > 0 && s.retained_total >= s.max_entries;
+    const atSizeCap =
+      s.max_total_size_bytes > 0 &&
+      s.retained_total_size_bytes !== null &&
+      s.retained_total_size_bytes >= s.max_total_size_bytes;
+    return atEntryCap || atSizeCap;
+  };
+  // When not determinable, `retentionAtCap` stays false (never asserted) AND
+  // the reassurance is gated off by `atCapDeterminable` below.
+  const determinability = retentionDeterminability(retention);
+  const atCapDeterminable = determinability.at_cap_determinable;
+  const retentionAtCap =
+    atCapDeterminable && determinability.contributing_stores.some(atCapForStore);
+
+  // END SIDE: coverage can never extend past the moment the report was made,
+  // NOR (D9C-1) past the instant the audit census was taken. The attestable end
+  // is the earliest of the quarter end, the generation instant, and the census
+  // cut (when supplied).
+  const coveredToExclusiveMs = Math.min(
+    quarterEndMs,
+    generatedMs,
+    ...(censusBoundMs !== null ? [censusBoundMs] : [])
+  );
+  const inProgress = coveredToExclusiveMs < quarterEndMs;
+  const coveredToExclusive = new Date(coveredToExclusiveMs).toISOString();
+  // P3 (Dry-9): the attestable end is the AUDIT-CENSUS cut (not the generation
+  // instant) when that census cut precedes generation AND is the binding
+  // minimum. Surfaces that echo the bound name it honestly from this flag
+  // instead of the stale "the generation time".
+  const coveredToIsCensusCut =
+    censusBoundMs !== null &&
+    censusBoundMs < generatedMs &&
+    coveredToExclusiveMs === censusBoundMs;
+
+  // G-1(c): `earliest_retained_at` is derived from the OPERATOR store only (the
+  // daemon store is merged into the scan only when readable). When a root-owned
+  // daemon store is present but EXCLUDED (unreadable/tampered), the operator
+  // store can be empty while the daemon HAS been enforcing and recording, so an
+  // unqualified "the audit log holds no history" would be a false completeness
+  // claim -- scope it to the operator log and signpost the daemon store. When the
+  // daemon store is absent/included, the operator count IS the whole census, so
+  // keep the neutral wording (do not introduce a distinction that under-claims
+  // the single-store case -- two-family gate follow-up).
+  const daemonExcluded = daemonStoreExcludedFromCensus(retention.daemon_store);
+
+  // D11-1: ONE causal diagnosis of the log's history, settled ONCE from the
+  // definitive discriminator, shared by every start-side arm that says anything
+  // about why the history begins where it does. The zero-coverage arm and the
+  // partial-coverage arm previously computed this independently and diverged:
+  // on the same fortress, one said "not that entries were pruned" and the other
+  // said "almost always means earlier entries were pruned". Sharing the
+  // constructed value is what makes that divergence unrepresentable.
+  const historyGap = diagnoseHistoryGap({
+    ever_pruned: retention.ever_pruned,
+    at_cap_determinable: atCapDeterminable,
+    at_cap: retentionAtCap,
+  });
+
+  // START SIDE.
+  let coveredFrom: string;
+  let startShortfall: boolean;
+  let startExplanation: string;
+  let zeroOfQuarterCovered = false;
+  if (earliestUnparseable) {
+    // D8-2 (Dry-9): the earliest-retained timestamp is present but UNPARSEABLE,
+    // so the start side is NOT DETERMINABLE. Attest an EMPTY span (never the
+    // flattering "reaches the quarter start" full-coverage arm, and never a
+    // definitive non-empty span) and disclose the unparseable value honestly --
+    // without the false FIFO-pruning or "no entries survive" diagnosis (entries
+    // exist; only their instant is unreadable).
+    coveredFrom = coveredToExclusive;
+    startShortfall = true;
+    startExplanation = daemonExcluded
+      ? "The earliest retained entry in the operator audit log carries a " +
+        "timestamp (" +
+        quoteUnusableValue(retention.earliest_retained_at) +
+        ") that could not be parsed, so this report cannot demonstrate coverage " +
+        "of any part of the quarter from the operator store; start-side coverage " +
+        "is NOT DETERMINABLE. Investigate the operator store's earliest entry." +
+        daemonPresentButExcludedSuffix(retention)
+      : "The earliest retained audit entry carries a timestamp (" +
+        quoteUnusableValue(retention.earliest_retained_at) +
+        ") that could not be parsed, so this report cannot demonstrate coverage " +
+        "of any part of the quarter; start-side coverage is NOT DETERMINABLE. " +
+        "Investigate the audit store's earliest entry.";
+  } else if (earliestMs === null) {
+    coveredFrom = window.start_inclusive;
+    startShortfall = true;
+    zeroOfQuarterCovered = true;
+    startExplanation = daemonExcluded
+      ? "The operator audit log holds no retained entries, so this quarter has " +
+        "no covered access history in the operator store. Confirm the fortress " +
+        "was recording during the reporting period." +
+        daemonPresentButExcludedSuffix(retention)
+      : "The audit log holds no retained entries, so this quarter has no " +
+        "covered access history. Confirm the fortress was recording during " +
+        "the reporting period.";
+  } else if (earliestMs >= coveredToExclusiveMs) {
+    // M1 + D9C-2: the earliest retained entry is at or after the ATTESTABLE end
+    // (min(quarter end, generation, census cut)) -- either the whole retained
+    // window post-dates the quarter (all in-quarter entries pruned), OR the
+    // earliest entry post-dates the generation/census cut (a future-dated stamp,
+    // clock skew). Either way NONE of the attestable window is covered: do NOT
+    // cite an out-of-window covered_from (that would sign an impossible
+    // covered_from > covered_to_exclusive span), and do NOT attribute a
+    // post-generation entry to pruning. State plainly that zero is covered.
+    coveredFrom = window.start_inclusive;
+    startShortfall = true;
+    zeroOfQuarterCovered = true;
+    // The reason + advice differ: an entry at/after the QUARTER END raises the
+    // question of what happened to the earlier history; an entry after the
+    // attestable end but BEFORE the quarter end post-dates the report itself (a
+    // future stamp), where ANY history-gap diagnosis would be a false diagnosis
+    // (nothing is missing; the report simply cannot yet attest that far).
+    const postQuarterEnd = earliestMs >= quarterEndMs;
+    const reasonClause = postQuarterEnd
+      ? "is at or after the quarter end"
+      : "is after this report's attested coverage end (" +
+        coveredToExclusive +
+        "), so it post-dates the window this report can attest";
+    // D11-1: the causal half of this sentence is built by the SINGLE history
+    // attribution constructor, which consults `ever_pruned` -- the definitive
+    // discriminator -- on every path. Before this, the arm branched only on
+    // `postQuarterEnd` and told a never-pruned fortress "This almost always
+    // means earlier entries were pruned", contradicting a fact the pack held
+    // and contradicting the sibling arm below on the SAME fortress. There is
+    // now no route from here to a causal claim that skips the discriminator.
+    const tailAdvice = postQuarterEnd
+      ? " " + historyGap.cause + historyGap.advice
+      : " Regenerate after the entry's timestamp (and after the quarter closes) " +
+        "for a report whose attested window can include it.";
+    startExplanation = daemonExcluded
+      ? "NONE of this quarter is covered by the operator audit log: its earliest " +
+        "retained entry (" +
+        retention.earliest_retained_at! +
+        ") " +
+        reasonClause +
+        ", so no operator-store entries survive inside the attested window. The " +
+        "counts above are therefore zero for the attested window (from the " +
+        "operator store)." +
+        tailAdvice +
+        daemonPresentButExcludedSuffix(retention)
+      : "NONE of this quarter is covered: the earliest retained audit entry (" +
+        retention.earliest_retained_at! +
+        ") " +
+        reasonClause +
+        ", so no entries survive inside the attested window. The counts above " +
+        "are therefore zero for the attested window." +
+        tailAdvice;
+  } else if (earliestMs > quarterStartMs) {
+    coveredFrom = retention.earliest_retained_at!;
+    startShortfall = true;
+    // D11-1: the DEFINITIVE discriminator (whether the log ever pruned) is now
+    // consulted once, by `diagnoseHistoryGap` above, for BOTH this arm and the
+    // zero-coverage arm. The `never_pruned` attribution encodes exactly the old
+    // local predicate -- ever_pruned === false AND at-cap determinable AND below
+    // cap -- so this arm's behaviour is unchanged while the zero-coverage arm
+    // gains the check it was missing. P1-B: at-cap determinability is part of
+    // that attribution, so an unknown cap position cannot fire the flattering
+    // reassurance.
+    const neverPruned = historyGap.attribution === "never_pruned";
+    // C2 (dry-bar): `earliest_retained_at` / `ever_pruned` are the OPERATOR
+    // store's facts (the daemon store merges into the scan only when readable).
+    // When a root-owned daemon store is present but EXCLUDED, the "no recorded
+    // activity before <coveredFrom>" reassurance is a completeness claim the
+    // code cannot back -- the daemon may have been enforcing and recording
+    // before that instant. Scope the reassurance to the operator store and
+    // signpost the excluded daemon store; keep the neutral wording when the
+    // operator count IS the whole census (absent/included).
+    startExplanation = neverPruned
+      ? daemonExcluded
+        ? "The earliest retained entry in the operator audit log is after the " +
+          "quarter start, and the operator log has never pruned entries (it is " +
+          "below both its entry and size retention caps), so the operator store " +
+          "records no activity before " +
+          coveredFrom +
+          "; operator-store coverage begins at that instant." +
+          daemonPresentButExcludedSuffix(retention)
+        : "The earliest retained audit entry is after the quarter start, and the " +
+          "log has never pruned entries (it is below both its entry and size " +
+          "retention caps), so this reflects that the fortress had no recorded " +
+          "activity before " +
+          coveredFrom +
+          ", not that entries were pruned. Coverage begins at that instant."
+      : // D11-1: the ENTIRE causal clause comes from the shared constructor,
+        // not from a second local branch on the same facts. This arm used to
+        // compose its own "may have been pruned by size/count (FIFO) retention"
+        // sentence, which is the same shape that survived ten rounds: a claim
+        // constructible outside the chokepoint. D11-3: the advice no longer says
+        // "raise the retention cap" -- the shipped server exposes no way to
+        // raise it (see history-attribution.ts).
+        "The retained audit window begins after the quarter start. " +
+        historyGap.cause +
+        " This report covers access history from " +
+        coveredFrom +
+        " onward." +
+        historyGap.advice +
+        (daemonExcluded ? daemonPresentButExcludedSuffix(retention) : "");
+  } else {
+    coveredFrom = window.start_inclusive;
+    startShortfall = false;
+    startExplanation =
+      "The retained audit window reaches the quarter start: the earliest " +
+      "retained entry precedes it.";
+  }
+
+  // D9C-2 (a): a signed coverage span must never run BACKWARDS. Every branch
+  // above keeps covered_from <= covered_to_exclusive EXCEPT the degenerate case
+  // where the attestable end precedes even the quarter start (a report generated
+  // -- or a census taken -- before its own quarter began), where covered_from
+  // defaults to the quarter start yet the attestable end is earlier. Collapse
+  // the window to an empty [end, end) span (never backwards) and disclose zero
+  // coverage rather than sign an impossible span.
+  if (new Date(coveredFrom).getTime() > coveredToExclusiveMs) {
+    coveredFrom = coveredToExclusive;
+    startShortfall = true;
+    zeroOfQuarterCovered = true;
+  }
+
+  // D9C-2/P1 (Dry-9 fix): whenever ZERO of the quarter is covered, the attested
+  // span must be EMPTY. Several zero-covered branches above leave `coveredFrom`
+  // at the quarter start, which the cover span, the §7 span, AND the SIGNED
+  // manifest all render as covered_from..covered_to_exclusive -- a DEFINITIVE
+  // non-empty coverage window that flatly contradicts the "NONE of this quarter
+  // is covered" disclosure a machine reader would otherwise trust. Collapse
+  // `coveredFrom` to the exclusive end so every surface attests a zero-width
+  // span consistent with the disclosure.
+  if (zeroOfQuarterCovered) {
+    coveredFrom = coveredToExclusive;
+  }
+
+  // Dry-9 fix-round-2 (P3): the zero_of_quarter_covered marker is derived from
+  // the SPAN itself, UNIFORMLY, from this one code path -- so an EMPTY signed
+  // span can never be emitted without its marker. The earlier per-branch flag
+  // (set in the empty-log and post-attestable-end arms) missed the
+  // unparseable-earliest arm, which attests an empty span (covered_from ==
+  // covered_to_exclusive) but left the marker off, so the SIGNED manifest
+  // carried an empty span with no zero marker. An empty span is exactly
+  // covered_from >= covered_to_exclusive (the end is EXCLUSIVE, so equal bounds
+  // are already a zero-width window); a genuine covered window keeps the marker
+  // off. This runs after every branch has settled covered_from, so it is the
+  // single structural guarantee for "empty span <=> marker".
+  if (new Date(coveredFrom).getTime() >= coveredToExclusiveMs) {
+    zeroOfQuarterCovered = true;
+  }
+
+  const parts: string[] = [];
+  if (inProgress) {
+    // D9C-1: the attestable end is the census cut when that is what bounds the
+    // window (it precedes the generation instant); otherwise it is the
+    // generation instant. Name it honestly.
+    const endLabel =
+      censusBoundMs !== null && censusBoundMs < generatedMs
+        ? " (the audit-census cut point)"
+        : " (the generation time)";
+    parts.push(
+      "PARTIAL QUARTER: this report can only attest coverage through " +
+        coveredToExclusive +
+        endLabel +
+        ", not the full quarter ending " +
+        window.end_exclusive +
+        ". Regenerate after the quarter closes for a complete report."
+    );
+  }
+  parts.push(startExplanation);
+  if (!inProgress && params.lastEntryAt) {
+    // D5-4 (dry-bar round 5, C2-family residue): `lastEntryAt` is the maximum
+    // in-window timestamp across the MERGED census, which excludes a daemon
+    // store that was not read (present_unreadable/tampered/missing). When the
+    // daemon store is excluded it may hold a LATER in-window enforcement entry,
+    // so an unqualified "the last recorded audit entry ... is X" is a definitive
+    // claim the code cannot back. Scope it to the operator store (its true
+    // source) exactly like its sibling coverage sentences; when the daemon store
+    // is absent/included the merged census IS the whole story, so keep the
+    // neutral wording (no under-claim of the single-store case).
+    parts.push(
+      (daemonExcluded
+        ? "The last recorded operator-store audit entry inside the covered window is "
+        : "The last recorded audit entry inside the covered window is ") +
+        params.lastEntryAt +
+        "."
+    );
+  }
+
+  return {
+    shortfall: startShortfall || inProgress,
+    covered_from: coveredFrom,
+    covered_to_exclusive: coveredToExclusive,
+    in_progress_quarter: inProgress,
+    last_entry_at: params.lastEntryAt,
+    retention_at_cap: retentionAtCap,
+    // D7-1/F1 (round 7): carry determinability so the SIGNED manifest can
+    // serialize a not-determinable marker instead of a definitive boolean.
+    retention_at_cap_determinable: atCapDeterminable,
+    zero_of_quarter_covered: zeroOfQuarterCovered,
+    // P3 (Dry-9): whether the attestable end is the audit-census cut (vs the
+    // generation instant / quarter end), so surfaces echo the bound honestly.
+    covered_to_is_census_cut: coveredToIsCensusCut,
+    // Dry-9 fix-round-2 (P1): every path that reaches here bounded the window
+    // from a USABLE (or absent) census cut, so the covered window IS
+    // determinable. Only the present-but-unusable-census short-circuit above
+    // returns false.
+    coverage_determinable: true,
+    explanation: parts.join(" "),
+    // WATCH-1: carry the daemon-store disclosure onto the coverage report so the
+    // enforcement-summary section can state whether daemon-recorded enforcement
+    // events are included in the counts.
+    daemon_store: retention.daemon_store,
+  };
+}
+
+// ── D10-1: THE ATTESTED-WINDOW COUNTING CHOKEPOINT ───────────────────
+//
+// Round 10 produced a SIGNED report that simultaneously said the attested
+// coverage window was EMPTY, said "NONE of this quarter is covered", said "The
+// counts above are therefore zero for the attested window", and printed
+// "Total recorded audit operations in the quarter: 1" with a nonzero category
+// table. Both statements were rendered from the same signed file.
+//
+// The root cause was that TWO DIFFERENT WINDOWS were in play. `detectShortfall`
+// settles the window the pack may ATTEST -- [covered_from,
+// covered_to_exclusive), bounded by the census cut and the generation instant.
+// `aggregateQuarter` counted against the CALENDAR QUARTER, which is wider: it
+// includes the future-dated tail after the census cut. Fixing the manifest span
+// (Dry-9) left the count surfaces still reading the wider boundary.
+//
+// The fix is not a guard on the count renderers. It is to delete the second
+// window: counts are ONLY ever taken over the attested window, and there is
+// exactly ONE function that produces the (counts, coverage) pair. A count and
+// the coverage statement about it can no longer disagree, because they are no
+// longer derived from different boundaries.
+//
+// Two consequences fall out for free rather than needing their own fixes:
+//
+//  - A zero-width attested window yields ZERO counts automatically, because
+//    `isInWindow` requires `t >= start && t < end` and no instant satisfies
+//    that when start == end. "The counts above are therefore zero" becomes true
+//    by construction instead of by assertion.
+//  - The "last recorded audit entry inside the covered window is X" sentence
+//    becomes true by construction, because `last_entry_at` is now the maximum
+//    timestamp INSIDE the attested window. Round 10 reproduced that sentence
+//    naming an instant outside the window; it is now unrepresentable.
+//
+// A NOT-DETERMINABLE window (a present-but-unparseable audit-census cut) yields
+// a `read_failed` aggregation, so every count surface renders its honest
+// "could not be computed" arm. Previously the manifest correctly said
+// `determinable: false` while the report still printed definitive counts: the
+// same contradiction, one surface over.
+
+/**
+ * The window over which the pack may render DEFINITIVE decision counts. Either
+ * the attested span (never the calendar quarter) or an explicit
+ * not-determinable with the reason the reader is owed.
+ */
+export type AttestedCountWindow =
+  | { readonly determinable: true; readonly window: QuarterWindow }
+  | { readonly determinable: false; readonly reason: string };
+
+/**
+ * Derive the countable window from a settled coverage report. The calendar
+ * quarter's `quarter` and `label` are preserved (the pack is still "2026-Q3"),
+ * but the BOUNDS become the attested span, so nothing outside what the report
+ * can attest is ever counted.
+ */
+export function attestedCountWindow(
+  quarter: QuarterWindow,
+  coverage: ShortfallReport
+): AttestedCountWindow {
+  if (!coverage.coverage_determinable) {
+    return { determinable: false, reason: coverage.explanation };
+  }
+  return {
+    determinable: true,
+    window: {
+      ...quarter,
+      start_inclusive: coverage.covered_from,
+      end_exclusive: coverage.covered_to_exclusive,
+    },
+  };
+}
+
+/** The (counts, coverage) pair, guaranteed to share one boundary. */
+export interface AttestedQuarterCensus {
+  /**
+   * Counts over the ATTESTED window. `read_failed` when that window was not
+   * determinable, so no count surface can print a definitive figure.
+   */
+  readonly aggregation: ReadOutcome<QuarterAggregation>;
+  /** The coverage report whose span bounded those counts. */
+  readonly coverage: ShortfallReport;
+}
+
+/**
+ * THE SINGLE CONSTRUCTION SITE for the pack's decision counts and its coverage
+ * statement (see the block comment above). `buildEvidencePack` calls ONLY this;
+ * it never pairs `aggregateQuarter` with `detectShortfall` itself, because that
+ * pairing is exactly what allowed the two boundaries to drift apart.
+ *
+ * The two passes over `detectShortfall` are ordering, not duplication:
+ * `lastEntryAt` is consumed ONLY to render one sentence and is read by no
+ * window-bounding branch, so pass 1 settles the identical span that pass 2
+ * returns. That equality is not assumed: it is asserted below and fails CLOSED,
+ * matching how the pack already behaves when signing cannot be completed (it
+ * emits nothing rather than something dishonest).
+ */
+export function censusOverAttestedWindow(
+  entries: readonly AuditEntry[],
+  retention: RetentionFacts,
+  quarter: QuarterWindow,
+  params: {
+    generatedAt: string;
+    censusTakenAt?: string;
+    /**
+     * G-2: the merged daemon entries, counted over the SAME attested window as
+     * everything else so the "N merged into the counts above" note cannot cite
+     * a figure taken from a different boundary than the counts it describes.
+     */
+    daemonEntries?: readonly AuditEntry[];
+  }
+): AttestedQuarterCensus {
+  // PASS 1: settle the attested span. `lastEntryAt: null` cannot change it.
+  const bounds = detectShortfall(quarter, retention, {
+    generatedAt: params.generatedAt,
+    lastEntryAt: null,
+    censusTakenAt: params.censusTakenAt,
+  });
+  const attested = attestedCountWindow(quarter, bounds);
+  if (!attested.determinable) {
+    // No countable window: assert no counts at all.
+    return { aggregation: readFailed(attested.reason), coverage: bounds };
+  }
+
+  const aggregation = aggregateQuarter(entries, attested.window);
+
+  // PASS 2: the same span, now carrying the windowed tail for the prose.
+  const coverage = detectShortfall(quarter, retention, {
+    generatedAt: params.generatedAt,
+    lastEntryAt: aggregation.last_entry_at,
+    censusTakenAt: params.censusTakenAt,
+  });
+  if (
+    coverage.covered_from !== bounds.covered_from ||
+    coverage.covered_to_exclusive !== bounds.covered_to_exclusive ||
+    coverage.coverage_determinable !== bounds.coverage_determinable
+  ) {
+    throw new Error(
+      "Evidence pack internal invariant violated: the attested coverage window " +
+        "that bounded the decision counts is not the window rendered alongside " +
+        "them. No pack was written. This is a defect in the pack generator, not " +
+        "a problem with this fortress; report it with the quarter label."
+    );
+  }
+
+  // G-2: count the daemon contribution over the attested window too.
+  if (
+    coverage.daemon_store?.status === "included" &&
+    params.daemonEntries !== undefined
+  ) {
+    const windowed = params.daemonEntries.reduce(
+      (n, e) => (isInWindow(e.timestamp, attested.window) ? n + 1 : n),
+      0
+    );
+    coverage.daemon_store = {
+      ...coverage.daemon_store,
+      windowed_entry_count: windowed,
+    };
+  }
+
+  return { aggregation: populated(aggregation), coverage };
+}

@@ -27,13 +27,13 @@ import { parseGovernance, type Governance } from "../governance.js";
 import {
   SIGNATURE_FILENAME,
   sha256Hex,
-  verifyBundle,
   type BundleDescriptor,
   type BundleFileEntry,
   type ObservedBundle,
   type SignatureFile,
   type TrustedSigner,
 } from "../manifest.js";
+import { loadBundledPlugin } from "./bundled-plugins.js";
 
 /** Stable identity of the first-party reference plugin (matches governance.yaml). */
 export const REFERENCE_BLOCKLIST_PLUGIN_ID = "ai.sanctuary.blocklist";
@@ -204,63 +204,38 @@ export function signDescriptor(descriptor: BundleDescriptor, privateKey: Uint8Ar
 }
 
 /**
- * Load + integrity-verify the bundled reference plugin against the first-party signer
- * public key shipped in the signed release. Returns everything the supervisor needs to
- * launch it. Throws a named SubstrateError if verification fails (fail-closed). Trust
- * here reduces to release integrity: the signer pubkey travels with the bundle, so
- * there is no independent host-policy pin until the third-party signer registry lands
- * (F1-gated).
+ * Load + integrity-verify the bundled reference blocklist plugin.
+ *
+ * SECURITY (fail-closed, arbitrary-code-execution class): this function's exported NAME
+ * and return shape are frozen for compatibility, but it NO LONGER honors a caller-supplied
+ * `bundleDir` or `signer`/`signatureFile`. Accepting a caller path + a caller-supplied
+ * signer was an arbitrary-code-execution fail-open (a sibling of the loadBundledPlugin
+ * path issue): an attacker who could point it at a self-signed bundle got a verified,
+ * spawnable entryPath. It now delegates UNCONDITIONALLY to the single chokepoint
+ * `loadBundledPlugin('ai.sanctuary.blocklist')`, so trust derives from the frozen,
+ * compiled-in registry + the registry-PINNED signer key, never from caller input. The
+ * `opts` argument is accepted (frozen signature) but its fields are ignored; the bundle
+ * is always the registry blocklist bundle, verified against the registry-pinned key.
+ * Throws a named SubstrateError if verification fails (fail-closed).
  */
-export async function loadReferenceBlocklistBundle(opts: {
+export async function loadReferenceBlocklistBundle(_opts?: {
   bundleDir?: string;
-  /** First-party signer (public key) shipped in the signed release; trust = release integrity, not an independent host-policy pin. */
-  signer: TrustedSigner;
-  /** The detached SIGNATURE.json wrapper for this bundle. */
-  signatureFile: SignatureFile;
+  /** IGNORED: trust is the registry-pinned key, not a caller-supplied signer. */
+  signer?: TrustedSigner;
+  /** IGNORED: the committed SIGNATURE.json for the registry bundle is used. */
+  signatureFile?: SignatureFile;
 }): Promise<LoadedReferenceBundle> {
-  const bundleDir = opts.bundleDir ?? referenceBlocklistBundleDir();
-  const governanceText = await fs.readFile(path.join(bundleDir, "governance.yaml"), "utf8");
-  const governance = parseGovernance(governanceText);
-  const enumerated = await enumerateBundle(bundleDir);
-
-  const observed: ObservedBundle = {
-    files: enumerated.files.map((f) => ({
-      ...f,
-      mode_exec: f.path === REFERENCE_BLOCKLIST_ENTRY ? true : f.mode_exec,
-    })),
-    nonRegular: enumerated.nonRegular,
-    signatureFileCount: enumerated.signatureFileCount,
-  };
-
-  const descriptor = verifyBundle(opts.signatureFile, {
-    resolveSigner: (signer_id, key_id) =>
-      signer_id === opts.signer.signer_id && key_id === opts.signer.key_id ? opts.signer : undefined,
-    observed,
-    entryPath: governance.entry,
-    expect: {
-      plugin_id: governance.plugin_id,
-      version: governance.version,
-      channel: governance.channel,
-    },
-  });
-
-  const bundleHash = sha256Hex(canonicalizeToBytes(descriptor));
-
-  return {
-    bundleDir,
-    governance,
-    descriptor,
-    observed,
-    bundleHash,
-    entryPath: path.join(bundleDir, governance.entry),
-  };
+  // Delegate to the ONE chokepoint. The returned LoadedBundledPlugin is structurally a
+  // LoadedReferenceBundle (same fields), verified against the registry-pinned signer.
+  return loadBundledPlugin(REFERENCE_BLOCKLIST_PLUGIN_ID);
 }
 
 /**
- * Read the committed first-party signer public key from the bundle. This is the key
- * the host verifies the bundled reference plugin against; it ships with the bundle as
- * part of the signed release (trust = release integrity), NOT an independent host-policy
- * pin and NOT a third-party signer-registry entry (that path is F1-gated).
+ * Read the committed first-party signer public key from the bundle. This is a read-only
+ * helper (frozen exported name). NOTE: it is NOT a trust root - the registry pin in
+ * BUNDLED_PLUGINS is. loadBundledPlugin verifies the bundle against the registry-pinned
+ * key and rejects a self-shipped key that diverges from it; this helper is retained for
+ * inspection/tests only. It does not load, verify, or return a spawnable bundle.
  */
 export async function readBundledSigner(bundleDir: string): Promise<TrustedSigner> {
   const raw = await fs.readFile(path.join(bundleDir, REFERENCE_SIGNER_PUBKEY_FILENAME), "utf8");
@@ -280,18 +255,14 @@ export async function readBundledSigner(bundleDir: string): Promise<TrustedSigne
 }
 
 /**
- * Load + integrity-verify the bundled reference plugin using its COMMITTED
- * SIGNATURE.json and the COMMITTED first-party signer pubkey. This is the
- * production-honest path: it proves the on-disk file set matches the signed
- * descriptor and that the signature verifies under the first-party signer key
- * shipped in the signed release (trust = release integrity; there is no independent
- * host-policy pin until the third-party signer registry lands, which is F1-gated). No
- * ephemeral keys, no third-party registry.
+ * Load + integrity-verify the bundled reference blocklist plugin the production-honest
+ * way. Frozen exported NAME + return shape; the optional `bundleDir` argument is now
+ * IGNORED (accepting a caller path was the arbitrary-code-execution fail-open). It
+ * delegates UNCONDITIONALLY to the single chokepoint `loadBundledPlugin` by REGISTRY
+ * PLUGIN ID, so the directory is resolved internally from the frozen registry,
+ * realpath-equality-checked, and the signature is verified against the registry-PINNED
+ * key (not a bundle-self-shipped key). No caller-controlled path, no self-signed input.
  */
-export async function loadBundledReferenceBlocklist(bundleDir?: string): Promise<LoadedReferenceBundle> {
-  const dir = bundleDir ?? referenceBlocklistBundleDir();
-  const signer = await readBundledSigner(dir);
-  const signatureRaw = await fs.readFile(path.join(dir, "SIGNATURE.json"), "utf8");
-  const signatureFile = JSON.parse(signatureRaw) as SignatureFile;
-  return loadReferenceBlocklistBundle({ bundleDir: dir, signer, signatureFile });
+export async function loadBundledReferenceBlocklist(_bundleDir?: string): Promise<LoadedReferenceBundle> {
+  return loadBundledPlugin(REFERENCE_BLOCKLIST_PLUGIN_ID);
 }

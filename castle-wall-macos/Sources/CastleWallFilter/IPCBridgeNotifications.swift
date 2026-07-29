@@ -122,9 +122,15 @@ public enum IPCBridgeNotifications {
                 "last valid manifest persistence failed: \(String(describing: error))"
             )
         }
+        // PR-905-review BLOCKER fix (ordering half; the AllowlistEvaluator
+        // predicate is the primary, ordering-independent defense): install the
+        // signed agent-origin descriptor BEFORE `store.update` makes the new
+        // rules live, so there is no window in which provisioned allow rules
+        // are evaluable while `_agentOrigin` is still nil. Both steps clear the
+        // flow cache, so no stale verdict survives the swap.
+        installAgentOriginIfPresent(snapshot: snapshot, engine: engine)
         store.update(snapshot)
         cache.clear()
-        installAgentOriginIfPresent(snapshot: snapshot, engine: engine)
         CastleWallLog.ipc.notice("manifest applied; rule_count=\(snapshot.rules.count)")
         return snapshot
     }
@@ -191,9 +197,16 @@ public enum IPCBridgeNotifications {
             )
             return nil
         }
+        // PR-905-review BLOCKER fix (ordering half): on restart recovery, the
+        // persisted manifest's provisioned allow rules must never be evaluable
+        // before the persisted agent-origin descriptor is installed. Install
+        // the descriptor FIRST, then make the rules live -- so a flow arriving
+        // mid-recovery can never see allow rules with a nil `_agentOrigin`. The
+        // AllowlistEvaluator predicate (suppress unless positively NAT) is the
+        // ordering-independent invariant backing this.
+        installAgentOriginIfPresent(snapshot: snapshot, engine: engine)
         store.update(snapshot)
         cache.clear()
-        installAgentOriginIfPresent(snapshot: snapshot, engine: engine)
         return snapshot
     }
 

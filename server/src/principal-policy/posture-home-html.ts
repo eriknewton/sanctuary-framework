@@ -1,9 +1,9 @@
 /**
- * Sovereignty Posture Dashboard — Phase 1 home HTML.
+ * Sovereignty Posture Dashboard - Phase 1 home HTML.
  *
  * A single self-contained page that renders the posture board: the banner, the
  * agent grid (wrapped + detected-unwrapped amber cards), the approvals inbox,
- * "today's story," anomaly findings, and the Castle Wall panel — with a
+ * "today's story," anomaly findings, and the Castle Wall panel - with a
  * persistent data-custody footer. CISO-first ordering: security and
  * data-sovereignty affordances lead; agent-welfare content is deliberately
  * absent from Home (it lives in the agent drill-down's secondary section).
@@ -21,7 +21,7 @@
  * The page authenticates via the same loopback/bearer model as the rest of the
  * dashboard. Every tile drills to evidence: counts link into the audit feed,
  * the wall panel exposes its evidence basis, reach links to the per-agent
- * reach endpoint. "Never fake green" is enforced in the renderer — the banner
+ * reach endpoint. "Never fake green" is enforced in the renderer - the banner
  * shows ARMED green only when `arm_state === "armed"`; `unknown` is amber and
  * `degraded` is red.
  *
@@ -31,7 +31,14 @@
 
 import type { FeatureHealthStatus } from "./feature-health.js";
 import type { CustodyState } from "./posture.js";
-import { AGENT_PILL_FN_SOURCE } from "./posture-html-shared.js";
+import {
+  AGENT_PILL_FN_SOURCE,
+  EVIDENCE_SPINE_CSS,
+  POSTURE_ROOT_TOKENS_CSS,
+  REL_TIME_FN_SOURCE,
+  STATUS_PILL_CSS,
+  THEME_BOOTSTRAP_SCRIPT,
+} from "./posture-html-shared.js";
 
 /**
  * "Never fake green" + "never imply anonymity" for the Query-privacy section
@@ -89,6 +96,12 @@ export function featureHealthPill(status: FeatureHealthStatus): {
       return { cls: "red", label: "fault" };
     case "unconfirmed":
       return { cls: "amber", label: "unconfirmed" };
+    // S5-P (design §6): the DISTINCT non-green coarse-only chip. The coarse
+    // wall is enforcing but a fine-grained-provisioned agent's exclusive-egress
+    // stack is not live. Amber (not red: the coarse wall IS protecting), with
+    // its own label so it is never mistaken for a vague "unconfirmed".
+    case "coarse_only":
+      return { cls: "amber", label: "coarse-only" };
     case "unknown":
     default:
       // Fail closed: any unrecognized status is non-green by construction.
@@ -103,7 +116,7 @@ export function featureHealthPill(status: FeatureHealthStatus): {
  * envelope MAC, anti-rollback epoch, pinned-key non-extraction) live under the
  * transient master at boot and are not re-derivable from the dashboard's
  * request-time view. So `unconfirmed` is amber (the honest default), `damaged`
- * is red (earned by fresh negative evidence), and there is no green branch — a
+ * is red (earned by fresh negative evidence), and there is no green branch - a
  * future edit that introduced one would fail a test.
  *
  * The client-side `custodyPill` below embeds the exact same mapping (the page is
@@ -132,109 +145,153 @@ export function renderPostureHomeHTML(): string {
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Sanctuary — Sovereignty Posture</title>
+<title>Sanctuary - Security Posture</title>
+<script>${THEME_BOOTSTRAP_SCRIPT}</script>
 <style>
-  :root {
-    --bg: #0e1116; --panel: #161b22; --panel-2: #1c2330; --border: #2a313c;
-    --text: #e6edf3; --muted: #9aa6b2; --green: #2ea043; --amber: #d29922;
-    --red: #f85149; --accent: #58a6ff;
-  }
+  ${POSTURE_ROOT_TOKENS_CSS}
   * { box-sizing: border-box; }
   body {
-    margin: 0; background: var(--bg); color: var(--text);
+    margin: 0; background: var(--paper); color: var(--ink);
     font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   }
-  header { padding: 16px 24px; border-bottom: 1px solid var(--border); }
+  header { padding: 16px 24px; border-bottom: 1px solid var(--rule); }
+  .header-row { display: flex; align-items: flex-start; gap: 16px; }
+  .header-row .header-titles { flex: 1; min-width: 0; }
   h1 { font-size: 16px; margin: 0; font-weight: 600; letter-spacing: .2px; }
-  .sub { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  .sub { color: var(--ink-3); font-size: 12px; margin-top: 2px; }
+  .fleet-link {
+    flex: none; align-self: center; color: var(--indigo); font-size: 13px;
+    padding: 6px 12px; border: 1px solid var(--rule); border-radius: 6px;
+    background: var(--surface); white-space: nowrap;
+  }
+  .fleet-link:hover { border-color: var(--indigo); text-decoration: none; }
   main { padding: 20px 24px; max-width: 1100px; margin: 0 auto; }
+  /*
+    S3: the at-a-glance row is a grid, not a wrapping flex row. With the
+    evidence spine each tile is taller and carries a footer, and flex-wrap left
+    the last tile orphaned on its own row at common widths. auto-fit keeps the
+    six tiles on an even baseline and lets them reflow to 3+3 or 2+2+2 rather
+    than 5+1.
+  */
   .banner {
-    display: flex; flex-wrap: wrap; gap: 14px; padding: 16px;
-    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    display: grid; grid-template-columns: repeat(2, 1fr);
+    gap: 14px 18px; padding: 16px;
+    background: var(--surface); border: 1px solid var(--rule); border-radius: 10px;
     margin-bottom: 20px;
   }
-  .stat { display: flex; flex-direction: column; min-width: 130px; }
-  .stat .v { font-size: 22px; font-weight: 700; }
-  .stat .l { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .4px; }
-  .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; }
-  .pill.green { background: rgba(46,160,67,.18); color: var(--green); }
-  .pill.amber { background: rgba(210,153,34,.18); color: var(--amber); }
-  .pill.red { background: rgba(248,81,73,.18); color: var(--red); }
+  @media (min-width: 780px) { .banner { grid-template-columns: repeat(3, 1fr); } }
+  .stat { display: flex; flex-direction: column; min-width: 0; }
+  .stat .v { font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .stat .l { color: var(--ink-3); font-size: 12px; text-transform: uppercase; letter-spacing: .4px; }
+  ${STATUS_PILL_CSS}
+  ${EVIDENCE_SPINE_CSS}
   section { margin-bottom: 24px; }
-  section > h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .5px; color: var(--muted); margin: 0 0 10px; }
+  section > h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .5px; color: var(--ink-3); margin: 0 0 10px; }
   .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 12px; }
   .card {
-    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    background: var(--surface); border: 1px solid var(--rule); border-radius: 10px;
     padding: 14px;
   }
-  .card.amber { border-color: var(--amber); }
+  .card.amber { border-color: var(--ochre); }
   .card h3 { margin: 0 0 4px; font-size: 14px; }
-  .card .meta { color: var(--muted); font-size: 12px; }
-  .reach { margin-top: 8px; font-size: 12px; color: var(--muted); }
-  a { color: var(--accent); text-decoration: none; }
+  .card .meta { color: var(--ink-3); font-size: 12px; }
+  .reach { margin-top: 8px; font-size: 12px; color: var(--ink-3); }
+  a { color: var(--indigo); text-decoration: none; }
   a:hover { text-decoration: underline; }
-  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px; }
+  .panel { background: var(--surface); border: 1px solid var(--rule); border-radius: 10px; padding: 16px; }
   .story-line { margin: 4px 0; }
-  .fh-row { display: flex; align-items: baseline; gap: 8px; padding: 6px 0; border-bottom: 1px solid var(--border); }
+  .fh-row { display: flex; align-items: baseline; gap: 8px; padding: 6px 0; border-bottom: 1px solid var(--rule); }
   .fh-row:last-child { border-bottom: 0; }
   .fh-row .name { flex: 1; }
-  .fh-row .why { color: var(--muted); font-size: 12px; }
-  .fh-note { color: var(--muted); font-size: 11px; margin-top: 10px; }
+  .fh-row .why { color: var(--ink-3); font-size: 12px; }
+  .fh-note { color: var(--ink-3); font-size: 11px; margin-top: 10px; }
   .approval-row {
     display: flex; align-items: flex-start; justify-content: space-between; gap: 12px;
-    padding: 10px 0; border-bottom: 1px solid var(--border);
+    padding: 10px 0; border-bottom: 1px solid var(--rule);
   }
   .approval-row:last-child { border-bottom: 0; }
   .approval-main { min-width: 0; }
   .approval-title { font-weight: 600; }
-  .approval-detail { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  .approval-detail { color: var(--ink-3); font-size: 12px; margin-top: 2px; }
   .approval-actions { display: flex; gap: 8px; flex: none; }
   .approval-actions button {
-    border: 1px solid var(--border); border-radius: 6px; padding: 5px 10px;
-    color: var(--text); background: var(--panel-2); cursor: pointer; font-size: 12px;
+    border: 1px solid var(--rule); border-radius: 6px; padding: 5px 10px;
+    color: var(--ink); background: var(--surface-2); cursor: pointer; font-size: 12px;
   }
-  .approval-actions button.approve { border-color: rgba(46,160,67,.55); }
-  .approval-actions button.deny { border-color: rgba(248,81,73,.55); }
+  .approval-actions button.approve { border-color: var(--sage); }
+  .approval-actions button.deny { border-color: var(--rust); }
   .approval-actions button:disabled { opacity: .55; cursor: not-allowed; }
-  .approval-error { color: var(--red); font-size: 12px; margin-top: 8px; }
+  .approval-error { color: var(--rust); font-size: 12px; margin-top: 8px; }
   .footer {
-    margin: 24px 0 8px; padding: 14px 16px; background: var(--panel-2);
-    border: 1px solid var(--border); border-radius: 10px; color: var(--muted); font-size: 12px;
+    margin: 24px 0 8px; padding: 14px 16px; background: var(--surface-2);
+    border: 1px solid var(--rule); border-radius: 10px; color: var(--ink-3); font-size: 12px;
   }
-  .footer strong { color: var(--text); }
-  .empty { color: var(--muted); font-style: italic; }
-  .err { color: var(--red); }
-  code { background: var(--panel-2); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
-  .evidence { font-size: 11px; color: var(--muted); margin-top: 6px; }
+  .footer strong { color: var(--ink); }
+  .empty { color: var(--ink-3); font-style: italic; }
+  .err { color: var(--rust); }
+  code { background: var(--surface-2); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+  .evidence { font-size: 11px; color: var(--ink-3); margin-top: 6px; }
   button.guided {
-    margin-top: 8px; background: var(--panel-2); color: var(--text);
-    border: 1px solid var(--border); border-radius: 6px; padding: 5px 10px; cursor: pointer; font-size: 12px;
+    margin-top: 8px; background: var(--surface-2); color: var(--ink);
+    border: 1px solid var(--rule); border-radius: 6px; padding: 5px 10px; cursor: pointer; font-size: 12px;
   }
-  button.guided:hover { border-color: var(--accent); }
+  button.guided:hover { border-color: var(--indigo); }
   /* Live-refresh connection indicator. The dot color is the at-a-glance honesty
      signal: green = a fresh frame arrived inside the staleness window; amber =
      reconnecting / no recent frame (the data on screen may be stale). It is
      NEVER green merely because a stream socket is open. */
-  .conn { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); margin-top: 4px; }
-  .conn .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
-  .conn.live .dot { background: var(--green); }
-  .conn.reconnecting .dot { background: var(--amber); }
-  .conn .updated { color: var(--muted); }
+  .conn { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--ink-3); margin-top: 4px; }
+  .conn .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ink-3); flex: none; }
+  .conn.live .dot { background: var(--sage); }
+  .conn.reconnecting .dot { background: var(--ochre); }
+  .conn .updated { color: var(--ink-3); }
   .section-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 0 0 10px; }
-  .section-head h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .5px; color: var(--muted); margin: 0; }
-  .story-toggle { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; user-select: none; }
+  .section-head h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .5px; color: var(--ink-3); margin: 0; }
+  .story-toggle { display: inline-flex; align-items: center; gap: 6px; color: var(--ink-3); font-size: 12px; user-select: none; }
   .story-toggle input { margin: 0; }
   .story-summary { margin: 0; }
+  /*
+    S3 first-run empty state. An empty fortress is the most common first
+    impression, so emptiness renders as a guided path rather than a void. It
+    spans the agent grid's columns so the checklist reads as one block.
+  */
+  .firstrun {
+    grid-column: 1 / -1; background: var(--surface); border: 1px solid var(--rule);
+    border-radius: 10px; padding: 18px 20px;
+  }
+  .firstrun h3 { margin: 0 0 6px; font-size: 15px; }
+  .firstrun p { margin: 0 0 12px; color: var(--ink-3); font-size: 12.5px; max-width: 68ch; }
+  .firstrun-steps { margin: 0; padding-left: 20px; display: grid; gap: 10px; }
+  .firstrun-steps li { font-size: 12.5px; color: var(--ink-2); }
+  .firstrun-cmd {
+    display: block; margin-top: 5px; font-family: var(--mono, monospace); font-size: 11.5px;
+    background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px;
+    padding: 5px 9px; color: var(--ink-2); width: fit-content;
+  }
+  .firstrun-foot { margin: 14px 0 0; font-size: 11.5px; color: var(--ink-4, var(--ink-3)); }
+  /*
+    S3 quiet empty state: "nothing here" should read as earned calm, not as a
+    failure or a blank. Used for the panels that are legitimately empty on a
+    healthy box (no approvals waiting, no anomaly findings).
+  */
+  .quiet { display: flex; align-items: baseline; gap: 8px; font-size: 12.5px; color: var(--ink-2); }
+  .quiet .quiet-mark { color: var(--sage); font-size: 11px; }
+  .quiet .quiet-why { color: var(--ink-3); font-size: 11.5px; }
 </style>
 </head>
 <body>
 <header>
-  <h1>Sanctuary — Sovereignty Posture</h1>
-  <div class="sub" id="origin">Loading…</div>
-  <div class="conn" id="conn">
-    <span class="dot"></span>
-    <span id="conn-label">Connecting…</span>
-    <span class="updated" id="conn-updated"></span>
+  <div class="header-row">
+    <div class="header-titles">
+      <h1>Sanctuary - Security Posture</h1>
+      <div class="sub" id="origin">Loading…</div>
+      <div class="conn" id="conn">
+        <span class="dot"></span>
+        <span id="conn-label">Connecting…</span>
+        <span class="updated" id="conn-updated"></span>
+      </div>
+    </div>
+    <a href="/fleet" class="fleet-link" title="Switch between Sanctuary machines">Fleet Switcher</a>
   </div>
 </header>
 <main>
@@ -453,9 +510,12 @@ export function renderPostureHomeHTML(): string {
     });
   }
 
-  // "Never fake green": ARMED is the ONLY green arm-state.
+  // "Never fake green": ARMED is the ONLY green arm-state. COARSE-ONLY (S5-P)
+  // is the DISTINCT non-green state: the coarse wall is enforcing but a
+  // fine-grained-provisioned agent's exclusive-egress stack is not live.
   function wallPill(state) {
     if (state === "armed") return '<span class="pill green">ARMED</span>';
+    if (state === "coarse_only") return '<span class="pill amber">COARSE-ONLY</span>';
     if (state === "degraded") return '<span class="pill red">DEGRADED</span>';
     if (state === "not_installed") return '<span class="pill amber">NOT INSTALLED</span>';
     return '<span class="pill amber">UNKNOWN</span>';
@@ -471,6 +531,12 @@ export function renderPostureHomeHTML(): string {
   // the drill-down cannot weaken this color model independently (#641).
   ${AGENT_PILL_FN_SOURCE}
 
+  // S3 evidence spine: the shared freshness formatter (posture-html-shared.ts).
+  // Returns "" for an absent or unparseable timestamp so a missing check can
+  // never render as a recent one; call sites render an explicit "no evidence
+  // yet" on "". Shared so "checked 14s ago" means the same on every surface.
+  ${REL_TIME_FN_SOURCE}
+
   // "Never fake green" for the feature-health panel. Mirrors the canonical
   // pure mapper exported from this module (featureHealthPill). GREEN is earned
   // ONLY by "active"; "fault" is red; "unconfirmed" and "unknown" are amber and
@@ -480,6 +546,7 @@ export function renderPostureHomeHTML(): string {
     if (status === "active") return '<span class="pill green">active</span>';
     if (status === "fault") return '<span class="pill red">fault</span>';
     if (status === "unconfirmed") return '<span class="pill amber">unconfirmed</span>';
+    if (status === "coarse_only") return '<span class="pill amber">coarse-only</span>';
     return '<span class="pill amber">unknown</span>';
   }
 
@@ -487,7 +554,8 @@ export function renderPostureHomeHTML(): string {
   // Never leaks rule internals; phrases the honest non-green cases plainly.
   //
   // HONESTY: the liveness bases (alive_no_recent_enforcement / dead_no_heartbeat
-  // / intentionally_stopped / no_evidence_self_reporting) are SHARED between the
+  // / intentionally_stopped / daemon_liveness_unconfirmed /
+  // no_evidence_self_reporting) are SHARED between the
   // Castle Wall row and the broker DAEMON row, but they mean different things.
   // For Castle Wall, a fresh heartbeat means "armed but idle" (no flow filtered).
   // For the broker daemon it means ONLY "the process is up" - NOT that it would
@@ -503,6 +571,8 @@ export function renderPostureHomeHTML(): string {
         return "Activity observed in the last 24h.";
       case "fault_evidence":
         return "A fault event was observed; not enforcing.";
+      case "exclusive_egress_not_live":
+        return "Coarse-only: the coarse wall is enforcing, but a fine-grained agent's exclusive-egress stack (gate, pf, generation) is not live.";
       case "stale_evidence":
         return "Evidence is stale; recent state cannot be confirmed.";
       case "no_evidence_self_reporting":
@@ -520,7 +590,19 @@ export function renderPostureHomeHTML(): string {
       case "intentionally_stopped":
         return isBrokerDaemon
           ? "The broker daemon was intentionally stopped (clean shutdown); it is off on purpose, not dead."
-          : "The wall was intentionally stopped (operator stop or arm-lease revoke); it is off on purpose, not dead.";
+          : "The wall was intentionally stopped (operator stop, disable, or arm-lease revoke); it is off on purpose, not dead.";
+      case "daemon_liveness_unconfirmed":
+        return isBrokerDaemon
+          ? "Broker daemon liveness is not confirmed after recent activity; not rendered green."
+          : "The wall has prior enforcement evidence, but daemon liveness is not currently confirmed; not rendered green.";
+      case "subject_unbound_evidence":
+        return "Castle Wall has recent enforcement evidence, but it is not attributed to this confined agent.";
+      case "legacy_macos_audit_token":
+        return "Evidence predates the subject-binding format; re-arm Castle Wall to produce subject-bound evidence.";
+      case "pre_canonical_linux_agent_name":
+        return "Linux evidence predates canonical subject binding; upgrade the daemon path before claiming this agent is protected.";
+      case "subject_unresolvable":
+        return "This agent's confinement identity could not be read, so no enforcement evidence can be bound to it.";
       case "no_activity_event_driven":
         return row.broken_zero_detectable === false
           ? "No activity in window. A silently-disabled feature is undetectable here, so this is shown as unconfirmed, not green."
@@ -602,11 +684,17 @@ export function renderPostureHomeHTML(): string {
         (e.verified_wraps !== null && e.verified_wraps !== undefined
           ? " · " + esc(e.verified_wraps) + " verified recovery factor(s)"
           : "") +
-        " · observed " + esc(e.observed_at) + "</div>";
+        // S3 freshness: an age reads faster than a raw ISO stamp. The absolute
+        // timestamp stays in the title attribute so the exact value an operator
+        // would cite in an incident write-up is never lost, only demoted.
+        ' · observed <span title="' + esc(e.observed_at) + '">' +
+        esc(relTime(e.observed_at) || e.observed_at) + "</span></div>";
     }
     if (panel.last_damage_evidence_at) {
       html += '<div class="evidence">Last custody-damage evidence: ' +
-        esc(panel.last_damage_evidence_at) + "</div>";
+        '<span title="' + esc(panel.last_damage_evidence_at) + '">' +
+        esc(relTime(panel.last_damage_evidence_at) || panel.last_damage_evidence_at) +
+        "</span></div>";
     }
     if (!panel.audit_integrity_ok) {
       html += '<div class="err">Audit integrity finding present - custody read may be incomplete.</div>';
@@ -755,13 +843,13 @@ export function renderPostureHomeHTML(): string {
   function loadRecognitionOnce() { loadRecognition(0); }
 
   // ── Fleet roster (Fleet Console Slice 1) ────────────────────────────────
-  // A separate, federation-gated fetch (NOT on the home payload, so a fortress
-  // with no federation never receives any roster data). A 200 with
-  // available:true reveals the panel; a 404 (federation not wired) or
-  // available:false (not provisioned) keeps it hidden (honest absence), never a
-  // fabricated roster. Unlike Recognition, the fleet is RE-POLLED on a cadence so
-  // a revocation (a machine going from admitted -> revoked, or an unevaluable
-  // machine flipping to untrusted) shows up live on the board without a reload.
+  // A separate, federation-gated fetch for the full roster (the home payload
+  // carries only the tiny banner summary). A 200 with available:true reveals the
+  // panel; a 404 (federation not wired) or available:false (not provisioned)
+  // keeps it hidden (honest absence), never a fabricated roster. Unlike
+  // Recognition, the fleet is RE-POLLED on a cadence so a revocation (a machine
+  // going from admitted -> revoked, or an unevaluable machine flipping to
+  // untrusted) shows up live on the board without a reload.
   var FLEET_RETRY_MS = [1000, 2000, 4000, 8000, 15000, 30000];
   var FLEET_REFRESH_MS = 15000;
   var fleetRefreshTimer = null;
@@ -856,21 +944,117 @@ export function renderPostureHomeHTML(): string {
   function renderBanner(home, approvalState, anomalies) {
     var openAnomalies = (anomalies && anomalies.length) || 0;
     var pendingCount = (approvalState && approvalState.rows && approvalState.rows.length) || 0;
+    var federation = home && home.federation;
+    var originText = "Machine: " + home.origin_machine;
+    if (federation && federation.available) {
+      var fleetCount = Number(federation.fleet_node_count || 0);
+      if (federation.enabled) {
+        originText += " · federation: " + fleetCount + " machines";
+      } else {
+        originText += " · federation provisioned, disabled · " + fleetCount + " machines";
+      }
+    } else {
+      originText += " · single-machine view (federation off)";
+    }
     document.getElementById("origin").textContent =
-      "Machine: " + home.origin_machine + " · single-machine view (federation off)";
+      originText;
+    // S3 evidence spine. Every tile below carries, where the payload already
+    // supports it: a denominator (so a bare count cannot be read as a whole), a
+    // freshness stamp (so a claim states how recently it was checked), and a
+    // link to the evidence behind the number. Nothing here fetches new data --
+    // every value comes from the /api/posture/home payload the page already
+    // holds. Where the payload has no honest denominator or timestamp for a
+    // tile, that tile renders WITHOUT one rather than inventing a plausible
+    // value. See the null-handling in statOf/fresh below.
+    var detectedTotal =
+      ((home.agents && home.agents.length) || 0) +
+      ((home.unwrapped && home.unwrapped.unwrapped && home.unwrapped.unwrapped.length) || 0);
+    var wallEvidenceAt = home.castle_wall && home.castle_wall.last_enforcement_evidence_at;
+    var digest = home.digest || {};
     document.getElementById("banner").innerHTML =
       // Honest split (#634): "protection requested" is policy intent; "enforcement
       // confirmed" is the observed-live count. Reporting only a flat "protected"
-      // number overstated enforcement the server cannot prove.
-      stat(home.protection_requested_count, "Protection requested") +
-      stat(home.enforcement_confirmed_count, "Enforcement confirmed") +
-      stat(wallPill(home.castle_wall.arm_state), "Castle Wall") +
-      stat(pendingCount, "Approvals waiting") +
-      stat(openAnomalies, "Open anomalies") +
-      stat(home.digest.chain_verified ? '<span class="pill green">VERIFIED</span>' : '<span class="pill red">UNVERIFIED</span>', "Audit chain");
+      // number overstated enforcement the server cannot prove. S3 keeps that
+      // split and adds the denominator that makes it legible: requested is "of
+      // N detected", and confirmed is "of N requested" -- so a "0 of 3" reads as
+      // the honest gap it is rather than an unexplained zero.
+      stat(home.protection_requested_count, "Protection requested", {
+        of: detectedTotal,
+        ev: { href: "#agents", text: "agents" },
+      }) +
+      stat(home.enforcement_confirmed_count, "Enforcement confirmed", {
+        of: home.protection_requested_count,
+        ev: { href: "/posture/evidence", text: "evidence" },
+      }) +
+      stat(wallPill(home.castle_wall.arm_state), "Castle Wall", {
+        // The wall's freshness is the age of its last ENFORCEMENT evidence, not
+        // the age of this page render. No evidence means an explicit "no
+        // enforcement evidence yet", never a blank that could read as fresh.
+        fresh: wallEvidenceAt,
+        freshNoneText: "no enforcement evidence yet",
+        ev: { href: "#wall", text: "what is protecting you" },
+      }) +
+      stat(pendingCount, "Approvals waiting", {
+        ev: { href: "#approvals", text: "queue" },
+      }) +
+      stat(openAnomalies, "Open anomalies", {
+        ev: { href: "#anomalies", text: "findings" },
+      }) +
+      stat(auditChainPill(home.digest), "Audit chain", {
+        // The digest window is the period the chain verdict covers. Rendering
+        // its end as a freshness stamp says how current the verdict is.
+        fresh: digest.window_end,
+        freshNoneText: "no verify on record",
+        ev: { href: "/api/audit-log", text: "audit log" },
+      });
   }
-  function stat(value, label) {
-    return '<div class="stat"><span class="v">' + value + '</span><span class="l">' + esc(label) + "</span></div>";
+  // F2 BLOCKER-1: three-state pill from the shared verdict — green VERIFIED only
+  // for a fully-verified chain; a neutral SUFFIX-ONLY when the sealed history is
+  // unreadable at this privilege (an armed box's operator uid); red UNVERIFIED on
+  // tamper/failure. Never green over an in-place-corrupted sealed entry.
+  function auditChainPill(d) {
+    if (d.chain_verdict === "verified_suffix_only")
+      return '<span class="pill amber">SUFFIX-ONLY</span>';
+    return d.chain_verified
+      ? '<span class="pill green">VERIFIED</span>'
+      : '<span class="pill red">UNVERIFIED</span>';
+  }
+  // S3 evidence spine tile. The opts argument is optional and every field in it
+  // is optional, because the honest render of a missing denominator or a missing
+  // timestamp is to OMIT it, not to substitute a placeholder that looks like
+  // data. Specifically:
+  //   opts.of            a denominator. Rendered only when it is a finite
+  //                      number; a null/undefined/NaN total renders a bare
+  //                      count, never "of 0" and never "of -".
+  //   opts.fresh         an ISO timestamp. Rendered through the shared relTime,
+  //                      which returns "" for absent/unparseable input; on ""
+  //                      we render opts.freshNoneText in the slate unknown tone
+  //                      so "not checked" can never be mistaken for "checked".
+  //   opts.ev            { href, text } link to the evidence behind the number.
+  function stat(value, label, opts) {
+    var o = opts || {};
+    var ofText = "";
+    if (typeof o.of === "number" && isFinite(o.of)) {
+      ofText = '<span class="stat-of">of ' + esc(o.of) + "</span>";
+    }
+    var foot = "";
+    var freshText = o.fresh ? relTime(o.fresh) : "";
+    var freshHtml = "";
+    if (freshText) {
+      freshHtml = '<span class="stat-fresh">checked ' + esc(freshText) + "</span>";
+    } else if (o.freshNoneText) {
+      freshHtml = '<span class="stat-fresh none">' + esc(o.freshNoneText) + "</span>";
+    }
+    var evHtml = o.ev
+      ? '<a class="stat-ev" href="' + esc(o.ev.href) + '">' + esc(o.ev.text) + " &rarr;</a>"
+      : "";
+    if (freshHtml || evHtml) {
+      foot = '<span class="stat-foot">' + freshHtml + evHtml + "</span>";
+    }
+    return (
+      '<div class="stat"><span class="v">' + value + ofText + "</span>" +
+      '<span class="l">' + esc(label) + "</span>" + foot + "</div>"
+    );
   }
 
   function renderAgents(home) {
@@ -893,7 +1077,33 @@ export function renderPostureHomeHTML(): string {
         '<div class="reach"><code>' + esc(u.config_path) + "</code></div>" +
         '<button class="guided" data-harness="' + esc(u.harness) + '">Protect (guided)</button></div>';
     });
-    if (!html) html = '<span class="empty">No agents detected.</span>';
+    // S3 empty states: first-run reads as a guided path, not as a void. An
+    // empty agent grid is the most common first impression a new operator gets,
+    // and "No agents detected." gave them nothing to do next. The checklist
+    // below is honest about state -- step 1 is the only step that is actionable
+    // before an agent exists, and the wall/chain steps are described, not
+    // claimed. Nothing here asserts a protection that is not in place.
+    if (!html) {
+      html =
+        '<div class="firstrun">' +
+        "<h3>No agents protected yet.</h3>" +
+        "<p>Sanctuary protects an agent by giving it an identity, a policy, and " +
+        "approval gates, then enforcing them at the operating system. Three steps " +
+        "get this board to green.</p>" +
+        '<ol class="firstrun-steps">' +
+        "<li><strong>Protect your first agent.</strong> Run this where your agent lives." +
+        '<code class="firstrun-cmd">sanctuary protect</code></li>' +
+        "<li><strong>Arm the wall.</strong> Turns policy into blocking that the " +
+        "agent cannot talk its way past." +
+        '<code class="firstrun-cmd">sanctuary castle-wall arm</code></li>' +
+        "<li><strong>Verify your audit chain.</strong> Confirms the record of what " +
+        "happened has not been altered." +
+        '<code class="firstrun-cmd">sanctuary audit-chain verify</code></li>' +
+        "</ol>" +
+        '<p class="firstrun-foot">Each step lights its own tile above. The tiles ' +
+        "stay grey until there is evidence for them.</p>" +
+        "</div>";
+    }
     var el = document.getElementById("agents");
     el.innerHTML = html;
     // Guided wrap: show the command, never execute in-place (one-click
@@ -984,7 +1194,14 @@ export function renderPostureHomeHTML(): string {
   function renderApprovals(approvalState) {
     var pending = (approvalState && approvalState.rows) || [];
     if (!pending.length) {
-      document.getElementById("approvals").innerHTML = '<span class="empty">Nothing needs you.</span>';
+      // S3 quiet empty state: earned calm. An empty approvals queue is a good
+      // state, so it reads as one -- but the second clause keeps it honest
+      // about WHY it is empty (nothing was held), not that nothing happened.
+      document.getElementById("approvals").innerHTML =
+        '<div class="quiet"><span class="quiet-mark">&#9679;</span>' +
+        "<span>Nothing needs you." +
+        '<span class="quiet-why"> No operation is waiting on your decision.</span>' +
+        "</span></div>";
       return;
     }
     var html = "";
@@ -1058,17 +1275,36 @@ export function renderPostureHomeHTML(): string {
     toggle.checked = readStoryPlainSummaryPreference();
   }
 
+  // S3 evidence spine for Today's story: the window the counts cover, how
+  // recently that window closed, and the two links to the evidence behind them.
+  // The digest carries window_start/window_end already; stating the window's
+  // age stops a stale digest from reading as live. When the payload has no
+  // window_end we say so rather than implying the counts are current.
+  function storyEvidenceFoot(d) {
+    var freshText = d && d.window_end ? relTime(d.window_end) : "";
+    var fresh = freshText
+      ? '<span class="stat-fresh" title="' + esc(d.window_end) + '">window closed ' + esc(freshText) + "</span>"
+      : '<span class="stat-fresh none">window not stated</span>';
+    return (
+      '<div class="evidence stat-foot">' + fresh +
+      '<span><a class="stat-ev" href="/posture/evidence">Evidence view &rarr;</a>' +
+      ' &nbsp;<a class="stat-ev" href="/api/audit-log">signed audit feed &rarr;</a></span></div>'
+    );
+  }
+
   function renderStoryPlainSummary(d) {
     var chainText = d.chain_verified
       ? "The audit log verified clean: no tampering."
-      : "The audit log is unverified: " + d.integrity_finding_count + " integrity finding(s).";
+      : d.chain_verdict === "verified_suffix_only"
+        ? "The recent audit log verified clean; the sealed legacy history is not re-verifiable at this privilege (run as root for a full verify)."
+        : "The audit log is unverified: " + d.integrity_finding_count + " integrity finding(s).";
     return '<p class="story-summary">Today your agents ran <strong>' + esc(d.total_operations) +
       "</strong> operations in the last 24h. Sanctuary blocked <strong>" + esc(d.kernel_blocks) +
       "</strong> outbound connections and allowed <strong>" + esc(d.kernel_allows) +
       "</strong>. You denied <strong>" + esc(d.approvals_denied) +
       "</strong> approvals and granted <strong>" + esc(d.approvals_granted) +
       "</strong>. " + esc(chainText) + "</p>" +
-      '<div class="evidence"><a href="/api/audit-log">Open the signed audit feed &rarr;</a></div>';
+      storyEvidenceFoot(d);
   }
 
   function renderStory(d) {
@@ -1079,17 +1315,25 @@ export function renderPostureHomeHTML(): string {
       el.innerHTML = renderStoryPlainSummary(d);
       return;
     }
+    // S3 denominators: each count states the whole it came out of, so a "4" is
+    // legible as 4-of-2,113 rather than an unanchored number. The totals are
+    // computed from fields already on the digest; nothing new is fetched.
+    var connTotal = (d.kernel_blocks || 0) + (d.kernel_allows || 0);
+    var decidedTotal = (d.approvals_denied || 0) + (d.approvals_granted || 0);
     var lines = [];
-    lines.push("<strong>" + d.total_operations + "</strong> operations in the last 24h.");
-    lines.push("<strong>" + d.kernel_blocks + "</strong> outbound connections blocked at the kernel; " +
-      d.kernel_allows + " allowed.");
-    lines.push("<strong>" + d.approvals_denied + "</strong> approvals denied, " +
-      d.approvals_granted + " granted by you.");
+    lines.push("<strong>" + d.total_operations + "</strong> operations in the last 24h" +
+      (d.failures ? ", " + d.failures + " of them failed." : "."));
+    lines.push("<strong>" + d.kernel_blocks + "</strong> of " + connTotal +
+      " observed outbound connections blocked at the kernel; " + d.kernel_allows + " allowed.");
+    lines.push("<strong>" + d.approvals_denied + "</strong> of " + decidedTotal +
+      " decided approvals denied by you, " + d.approvals_granted + " granted.");
     lines.push(d.chain_verified
       ? '<span class="pill green">Audit chain verified</span> no tampering.'
-      : '<span class="err">Audit chain UNVERIFIED (' + d.integrity_finding_count + " findings).</span>");
+      : d.chain_verdict === "verified_suffix_only"
+        ? '<span class="pill amber">Audit chain: recent verified, sealed history not re-verifiable at this privilege</span> (run as root for a full verify).'
+        : '<span class="err">Audit chain UNVERIFIED (' + d.integrity_finding_count + " findings).</span>");
     el.innerHTML = lines.map(function (l) { return '<div class="story-line">' + l + "</div>"; }).join("") +
-      '<div class="evidence"><a href="/api/audit-log">Open the signed audit feed &rarr;</a></div>';
+      storyEvidenceFoot(d);
   }
 
   function wireStoryToggle() {
@@ -1105,7 +1349,15 @@ export function renderPostureHomeHTML(): string {
   function renderAnomalies(findings) {
     var el = document.getElementById("anomalies");
     if (!findings || !findings.length) {
-      el.innerHTML = '<span class="empty">No open anomaly findings.</span>';
+      // S3 quiet empty state: earned calm. This is the DETECTOR-ANSWERED empty
+      // case only. The separate "detector did not respond" path elsewhere on
+      // this page must never borrow this treatment: a silent detector is an
+      // unknown, not a clean bill of health.
+      el.innerHTML =
+        '<div class="quiet"><span class="quiet-mark">&#9679;</span>' +
+        "<span>No open anomaly findings." +
+        '<span class="quiet-why"> The detector answered and reported nothing open.</span>' +
+        "</span></div>";
       return;
     }
     el.innerHTML = findings.map(function (f) {
@@ -1131,7 +1383,7 @@ export function renderPostureHomeHTML(): string {
   // muted vocabulary and never a green/red trust pill: a node's reach can never
   // launder it into looking trusted. "recent" is informational, not "all well."
   function fleetReachLabel(reach) {
-    if (reach === "recent") return '<span class="pill" style="background:#1c2330">reachable</span>';
+    if (reach === "recent") return '<span class="pill" style="background:var(--surface-2)">reachable</span>';
     if (reach === "stale") return '<span class="pill amber">no recent sync</span>';
     return '<span class="pill amber">never synced</span>';
   }
@@ -1147,6 +1399,84 @@ export function renderPostureHomeHTML(): string {
     return node.trust_evaluable === false
       ? "Trust could not be evaluated for this machine right now, so it is shown UNTRUSTED by design (fail-closed), not assumed safe."
       : "This machine is not in good standing and is shown untrusted.";
+  }
+
+  // Fleet-wide sync-health rollup (A1). LIVENESS only: it reports how many
+  // machines are currently in touch, NEVER a trust claim. It uses the muted reach
+  // vocabulary (not a green/red trust pill) so a reachable-but-revoked node can
+  // never read as "all well." Honest when nothing has ever synced.
+  function fleetSyncHealthLine(h) {
+    if (!h) return "";
+    var parts = [];
+    if (h.reachable) parts.push(esc(h.reachable) + " in touch");
+    if (h.stale) parts.push(esc(h.stale) + " no recent sync");
+    if (h.never) parts.push(esc(h.never) + " never synced");
+    var summary = parts.length ? parts.join(" · ") : "no sync activity yet";
+    var frontier = h.oldest_last_sync
+      ? " · oldest sync " + esc(h.oldest_last_sync)
+      : "";
+    return '<div class="evidence">Fleet reach (liveness, not trust): ' +
+      summary + frontier + "</div>";
+  }
+
+  // Signed-policy-distribution status (A2). Custody-state distribution only:
+  // hash/version markers from verified signed bundles, never raw policy
+  // contents. Unknown is never green.
+  function fleetPolicySummaryText(pd) {
+    if (!pd || pd.available !== true) return "policy unknown";
+    var summary = pd.summary || { in_sync: 0, drifted: 0, unknown: 0 };
+    var policy = pd.operator_policy;
+    if (!policy || policy.version == null || !policy.hash || !policy.hash_algorithm) {
+      return "no operator policy";
+    }
+    var total = summary.in_sync + summary.drifted + summary.unknown;
+    return "operator policy v" + policy.version +
+      " · " + summary.in_sync + " of " + total + " nodes in sync" +
+      " / " + summary.drifted + " drifted" +
+      " / " + summary.unknown + " unknown";
+  }
+
+  function fleetPolicyDistributionLine(pd) {
+    if (!pd || pd.available !== true) {
+      return '<div class="evidence">' +
+        '<span class="pill amber">policy unknown</span> &nbsp;' +
+        "Policy distribution status cannot be evaluated for this fleet.</div>";
+    }
+    var summary = pd.summary || { in_sync: 0, drifted: 0, unknown: 0 };
+    var policy = pd.operator_policy;
+    if (!policy || policy.version == null || !policy.hash || !policy.hash_algorithm) {
+      return '<div class="evidence">' +
+        '<span class="pill amber">policy unknown</span> &nbsp;' +
+        "No signed operator policy bundle is known yet. " +
+        "Nodes render policy drift as unknown until an operator policy hash is distributed.</div>";
+    }
+    var total = summary.in_sync + summary.drifted + summary.unknown;
+    return '<div class="evidence">' +
+      '<span class="pill">operator policy v' + esc(policy.version) + "</span> &nbsp;" +
+      esc(summary.in_sync) + " of " + esc(total) + " nodes in sync" +
+      " / " + esc(summary.drifted) + " drifted" +
+      " / " + esc(summary.unknown) + " unknown" +
+      " · hash " + esc(policy.hash_algorithm) + ":" + esc(policy.hash) + "</div>";
+  }
+
+  function fleetPolicyPill(state) {
+    if (state === "in_sync") return '<span class="pill green">policy in sync</span>';
+    if (state === "drifted") return '<span class="pill red">policy drifted</span>';
+    return '<span class="pill amber">policy unknown</span>';
+  }
+
+  function fleetPolicyEvidence(policy) {
+    if (!policy || policy.version == null) {
+      return "applied policy unknown";
+    }
+    var base = "applied policy v" + policy.version;
+    if (policy.hash && policy.hash_algorithm) {
+      base += " hash " + policy.hash_algorithm + ":" + policy.hash;
+    } else {
+      base += " hash unknown";
+    }
+    if (policy.applied_at) base += " applied " + policy.applied_at;
+    return base;
   }
 
   function renderFleet(roster) {
@@ -1167,13 +1497,16 @@ export function renderPostureHomeHTML(): string {
       if (s.admitted) parts.push(esc(s.admitted) + " admitted");
       if (s.revoked) parts.push(esc(s.revoked) + " revoked");
       if (s.untrusted) parts.push(esc(s.untrusted) + " untrusted");
+      parts.push(fleetPolicySummaryText(roster.policy_distribution));
       summaryEl.textContent = parts.join(" · ");
     }
     var head =
       '<div class="evidence">Fleet ' + (roster.enabled ? "on" : "off") +
       " · this machine <code>" + esc(roster.node_id) + "</code>" +
       " · fortress <code>" + esc(roster.fortress_id) + "</code>" +
-      " · eviction serial " + esc(roster.eviction_serial) + "</div>";
+      " · eviction serial " + esc(roster.eviction_serial) + "</div>" +
+      fleetSyncHealthLine(roster.sync_health) +
+      fleetPolicyDistributionLine(roster.policy_distribution);
     var nodes = roster.nodes || [];
     if (!nodes.length) {
       el.innerHTML = head +
@@ -1186,13 +1519,19 @@ export function renderPostureHomeHTML(): string {
         : "";
       return '<div class="story-line">' +
         fleetTrustPill(n.trust_state) + " &nbsp;" +
+        fleetPolicyPill(n.policy && n.policy.drift_state) + " &nbsp;" +
         "<code>" + esc(n.node_id) + "</code>" +
         (n.label ? " (" + esc(n.label) + ")" : "") +
         " &nbsp;" + fleetReachLabel(n.reach) +
         '<div class="evidence">' + esc(fleetTrustWhy(n)) +
         " · mode " + esc(n.node_mode) + modeNote +
+        " · " + esc(fleetPolicyEvidence(n.policy)) +
+        // S3 freshness: a machine's staleness is the point of this line, and an
+        // age states it directly. "no sync received" stays explicit -- a silent
+        // machine must never render as a recently-synced one.
         (n.last_sync_received_at
-          ? " · last sync " + esc(n.last_sync_received_at)
+          ? ' · last sync <span title="' + esc(n.last_sync_received_at) + '">' +
+            esc(relTime(n.last_sync_received_at) || n.last_sync_received_at) + "</span>"
           : " · no sync received") +
         "</div></div>";
     }).join("");
@@ -1201,20 +1540,61 @@ export function renderPostureHomeHTML(): string {
 
   function renderWall(w) {
     var el = document.getElementById("wall");
+    // S5-P: when the arm-state is capped to coarse_only, the precise meaning
+    // depends on the WORST per-agent mode carried on the exclusive_egress
+    // block: coarse-only (coarse wall enforcing, fine stack down) vs
+    // unprotected (a fine-grained agent has NO coarse wall either). Never
+    // assert coarse protection when the worst mode is unprotected.
+    var coarseMeaning =
+      w.exclusive_egress && w.exclusive_egress.mode === "unprotected"
+        ? "A fine-grained agent is UNPROTECTED: its exclusive-egress stack is not live AND coarse Castle Wall enforcement is not confirmed for this fortress. Not green by design."
+        : "The coarse wall is enforcing, but a fine-grained agent's exclusive-egress stack (gate, pf, generation) is NOT live. Not green by design.";
     var meaning = w.arm_state === "armed"
       ? "The operating system is blocking unauthorized outbound connections from wrapped agents."
-      : w.arm_state === "degraded"
-        ? "The wall is present but recent evidence shows it is NOT enforcing."
-        : w.arm_state === "not_installed"
-          ? "Castle Wall is not installed on this machine."
-          : "Enforcement could not be proven from recent audit evidence. Not rendered green by design.";
+      : w.arm_state === "coarse_only"
+        ? coarseMeaning
+        : w.arm_state === "degraded"
+          ? "The wall is present but recent evidence shows it is NOT enforcing."
+          : w.arm_state === "not_installed"
+            ? "Castle Wall is not installed on this machine."
+            : "Enforcement could not be proven from recent audit evidence. Not rendered green by design.";
+    // S5-P: the exclusive-egress posture block (design section 6), rendered
+    // whenever the wall posture carries it. Non-live reasons are listed so the
+    // coarse-only state is a first-class story, never a footnote.
+    var exclusiveDetail = "";
+    var x = w.exclusive_egress;
+    if (x && x.fine_grained_declared) {
+      var xLabel = x.exclusive_egress_live
+        ? "live (all fine-grained agents exclusive)"
+        : "NOT live" + (x.mode ? " (" + esc(x.mode) + ")" : "");
+      exclusiveDetail =
+        '<div class="evidence">Exclusive egress: <code>' + xLabel + "</code>" +
+        (x.reasons && x.reasons.length
+          ? " · " + esc(x.reasons.join(" · "))
+          : "") +
+        "</div>";
+    }
     el.innerHTML =
       "<div>" + wallPill(w.arm_state) + " &nbsp;" + esc(meaning) + "</div>" +
+      exclusiveDetail +
+      // S3 denominator: the three verdict counts are parts of one total, so the
+      // total is stated rather than left for the reader to add up. A zero total
+      // says "no traffic observed", which is NOT the same claim as "nothing was
+      // blocked" -- an unarmed wall also reports zeros.
       '<div class="evidence">Platform: ' + esc(w.platform) +
-      " · verdicts (24h): " + w.verdict_counts.allowed + " allowed / " + w.verdict_counts.blocked + " blocked / " +
+      " · verdicts (24h): " +
+      (w.verdict_counts.allowed + w.verdict_counts.blocked + w.verdict_counts.operator_decisions) +
+      " observed, of which " + w.verdict_counts.allowed + " allowed / " +
+      w.verdict_counts.blocked + " blocked / " +
       w.verdict_counts.operator_decisions + " operator decisions</div>" +
       '<div class="evidence">Evidence basis: <code>' + esc(w.evidence_basis) + "</code>" +
-      (w.last_enforcement_evidence_at ? " · last enforcement " + esc(w.last_enforcement_evidence_at) : "") + "</div>" +
+      // S3 freshness: the age of the evidence the wall's color rests on. When
+      // there is none, say so outright -- absence of evidence must read as
+      // absence, never as a fresh check.
+      (w.last_enforcement_evidence_at
+        ? ' · last enforcement <span title="' + esc(w.last_enforcement_evidence_at) + '">' +
+          esc(relTime(w.last_enforcement_evidence_at) || w.last_enforcement_evidence_at) + "</span>"
+        : " · no enforcement evidence on record") + "</div>" +
       // Slice R: honestly surface the cryptographic basis the green light rests
       // on. producer_signed = the daemon producer signature was re-verified at
       // read time. channel_authenticated = the green rests on the mutually-
@@ -1227,7 +1607,7 @@ export function renderPostureHomeHTML(): string {
             : " (channel-authenticated + tamper-evident chain; per-producer signing not available on this reader)") +
           "</div>"
         : "") +
-      (w.audit_integrity_ok ? "" : '<div class="err">Audit integrity finding present — arm-state read may be incomplete.</div>');
+      (w.audit_integrity_ok ? "" : '<div class="err">Audit integrity finding present - arm-state read may be incomplete.</div>');
   }
 
   // ── Render the whole board from one honest home payload ─────────────────
