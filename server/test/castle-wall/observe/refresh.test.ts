@@ -284,6 +284,20 @@ function bothSources(harness: Harness): RefreshAuditSourceDescriptor[] {
   ];
 }
 
+function emptyMasterSource(): RefreshAuditSourceDescriptor {
+  return {
+    source_id: "master-audit",
+    status: "present",
+    instance_id: "operator-master",
+    auditLog: {
+      async streamVerifiedChain(): Promise<void> {
+        // Simulates a retained master chain suffix that no longer contains
+        // the review marker because retention pruning aged it out.
+      },
+    },
+  };
+}
+
 async function refreshWithSources(
   harness: Harness,
   auditSources: readonly RefreshAuditSourceDescriptor[],
@@ -469,6 +483,8 @@ describe("Option A source enumeration and read witnesses", () => {
       replaceObservations: (observations) => harness.store.replaceObservations(observations),
       listSourceStates: () => harness.store.listSourceStates(),
       putSourceState: (state) => harness.store.putSourceState(state),
+      listCandidateReviews: () => harness.store.listCandidateReviews(),
+      putLastRefreshOutcome: (outcome) => harness.store.putLastRefreshOutcome(outcome),
       removeCandidate: (key) => harness.store.removeCandidate(key),
       replaceCandidateSnapshot: async (observations) => {
         if (crashOnce) {
@@ -587,6 +603,69 @@ describe("promote/discard non-resurrection (R3-1b)", () => {
 
     await refreshBoth(harness);
     expect((await harness.store.listCandidates()).size).toBe(0);
+  });
+
+  it("persists the review tombstone before row removal, so pruning the master review marker cannot re-mint a resolved boot-audit candidate", async () => {
+    const harness = makeHarness();
+    await appendBlocked(harness.bootAuditLog, { timestamp: "2026-07-14T09:00:00.000Z" });
+    await refreshBoth(harness);
+    const candidate = await onlyCandidate(harness.store);
+
+    await appendReviewMarker(harness.auditLog, "castle_wall_observe_discard");
+    await harness.store.removeCandidateAfterReview(
+      candidate,
+      "discard",
+      "2026-07-14T10:00:00.000Z",
+    );
+
+    const outcome = await refreshWithSources(harness, [
+      emptyMasterSource(),
+      bothSources(harness)[1]!,
+    ]);
+    expect(outcome.status).toBe("refreshed");
+    expect((await harness.store.listCandidates()).size).toBe(0);
+  });
+
+  it("persists the review tombstone before row removal, so a master-chain reset cannot re-mint a resolved boot-audit candidate", async () => {
+    const harness = makeHarness();
+    await appendBlocked(harness.bootAuditLog, { timestamp: "2026-07-14T09:00:00.000Z" });
+    await refreshBoth(harness);
+    const candidate = await onlyCandidate(harness.store);
+
+    await appendReviewMarker(harness.auditLog, "castle_wall_observe_discard");
+    await harness.store.removeCandidateAfterReview(
+      candidate,
+      "discard",
+      "2026-07-14T10:00:00.000Z",
+    );
+    harness.resetAuditChain();
+
+    await refreshBoth(harness);
+    expect((await harness.store.listCandidates()).size).toBe(0);
+  });
+
+  it("allows a genuinely new post-resolution event to re-surface the tombstoned candidate with a restarted, stable count", async () => {
+    const harness = makeHarness();
+    await appendBlocked(harness.bootAuditLog, { timestamp: "2026-07-14T09:00:00.000Z" });
+    await appendBlocked(harness.bootAuditLog, { timestamp: "2026-07-14T09:05:00.000Z" });
+    await refreshBoth(harness);
+    const candidate = await onlyCandidate(harness.store);
+    expect(candidate.times_seen).toBe(2);
+
+    await harness.store.removeCandidateAfterReview(
+      candidate,
+      "discard",
+      "2026-07-14T10:00:00.000Z",
+    );
+    await refreshBoth(harness);
+    expect((await harness.store.listCandidates()).size).toBe(0);
+
+    await appendBlocked(harness.bootAuditLog, { timestamp: "2026-07-14T10:00:01.000Z" });
+    await refreshBoth(harness);
+    expect((await onlyCandidate(harness.store)).times_seen).toBe(1);
+
+    await refreshBoth(harness);
+    expect((await onlyCandidate(harness.store)).times_seen).toBe(1);
   });
 });
 

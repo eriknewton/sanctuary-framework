@@ -16,7 +16,11 @@ import { Writable } from "node:stream";
 
 import { ed25519 } from "@noble/curves/ed25519";
 
-import { runObserveCandidates } from "../../../src/cli/castle-wall-observe.js";
+import {
+  runObserveCandidates,
+  runObservePromote,
+  runObserveStatus,
+} from "../../../src/cli/castle-wall-observe.js";
 import {
   deriveSafeModeAuditKey,
   generateBootToken,
@@ -294,5 +298,162 @@ describe("observe candidates Option A CLI source enumeration", () => {
     expect(payload.undetermined_reason).toBe(
       "gate denials are structurally unavailable as an observe source",
     );
+  });
+
+  it("status and promote --all render empty store state as UNDETERMINED in text and JSON when no refresh witness exists", async () => {
+    const fortress = await makeCliFortress();
+    await appendBootDeniedFlow(fortress);
+
+    const statusTextOut = new Capture();
+    const statusTextCode = await runObserveStatus(["--fortress", fortress.fortressPath], {
+      out: statusTextOut,
+      err: new Capture(),
+      bootTokenPath: fortress.bootTokenPath,
+      env: { SANCTUARY_RECOVERY_KEY: fortress.recoveryKey },
+    });
+    expect(statusTextCode).toBe(0);
+    expect(statusTextOut.text()).toContain("UNDETERMINED");
+    expect(statusTextOut.text()).toContain("pending candidates in store: 0");
+    expect(statusTextOut.text()).toContain("last refresh: none");
+    expect(statusTextOut.text()).not.toContain("Pending candidates: 0\n");
+
+    const statusJsonOut = new Capture();
+    const statusJsonCode = await runObserveStatus(
+      ["--json", "--fortress", fortress.fortressPath],
+      {
+        out: statusJsonOut,
+        err: new Capture(),
+        bootTokenPath: fortress.bootTokenPath,
+        env: { SANCTUARY_RECOVERY_KEY: fortress.recoveryKey },
+      },
+    );
+    expect(statusJsonCode).toBe(0);
+    const statusPayload = JSON.parse(statusJsonOut.text()) as {
+      pending_candidates: number;
+      candidate_status: string;
+      definitive_empty: boolean;
+      last_refresh: { status: string };
+      undetermined_reason?: string;
+    };
+    expect(statusPayload.pending_candidates).toBe(0);
+    expect(statusPayload.candidate_status).toBe("undetermined");
+    expect(statusPayload.definitive_empty).toBe(false);
+    expect(statusPayload.last_refresh.status).toBe("none");
+    expect(statusPayload.undetermined_reason).toBe("no observe refresh outcome is recorded");
+
+    const promoteTextOut = new Capture();
+    const promoteTextCode = await runObservePromote(["--all", "--fortress", fortress.fortressPath], {
+      out: promoteTextOut,
+      err: new Capture(),
+      bootTokenPath: fortress.bootTokenPath,
+      env: { SANCTUARY_RECOVERY_KEY: fortress.recoveryKey },
+    });
+    expect(promoteTextCode).toBe(0);
+    expect(promoteTextOut.text()).toContain("UNDETERMINED");
+    expect(promoteTextOut.text()).toContain("last refresh: none");
+    expect(promoteTextOut.text()).not.toContain("Nothing to promote");
+
+    const promoteJsonOut = new Capture();
+    const promoteJsonCode = await runObservePromote(
+      ["--json", "--all", "--fortress", fortress.fortressPath],
+      {
+        out: promoteJsonOut,
+        err: new Capture(),
+        bootTokenPath: fortress.bootTokenPath,
+        env: { SANCTUARY_RECOVERY_KEY: fortress.recoveryKey },
+      },
+    );
+    expect(promoteJsonCode).toBe(0);
+    const promotePayload = JSON.parse(promoteJsonOut.text()) as {
+      status: string;
+      nothing_to_promote: boolean;
+      pending_candidates: number;
+      last_refresh: { status: string };
+      undetermined_reason?: string;
+    };
+    expect(promotePayload.status).toBe("undetermined");
+    expect(promotePayload.nothing_to_promote).toBe(false);
+    expect(promotePayload.pending_candidates).toBe(0);
+    expect(promotePayload.last_refresh.status).toBe("none");
+    expect(promotePayload.undetermined_reason).toBe("no observe refresh outcome is recorded");
+  });
+
+  it("status and promote --all may claim verified empty in text and JSON only after an all-read_ok refresh witness", async () => {
+    const fortress = await makeCliFortress();
+    const refreshOut = new Capture();
+    const refreshCode = await runObserveCandidates(["--fortress", fortress.fortressPath], {
+      out: refreshOut,
+      err: new Capture(),
+      bootTokenPath: fortress.bootTokenPath,
+      env: { SANCTUARY_RECOVERY_KEY: fortress.recoveryKey },
+    });
+    expect(refreshCode).toBe(0);
+    expect(refreshOut.text()).toContain("No candidates.");
+
+    const statusTextOut = new Capture();
+    const statusTextCode = await runObserveStatus(["--fortress", fortress.fortressPath], {
+      out: statusTextOut,
+      err: new Capture(),
+      bootTokenPath: fortress.bootTokenPath,
+      env: { SANCTUARY_RECOVERY_KEY: fortress.recoveryKey },
+    });
+    expect(statusTextCode).toBe(0);
+    expect(statusTextOut.text()).toContain("Pending candidates in store: 0");
+    expect(statusTextOut.text()).toContain("all sources read_ok");
+    expect(statusTextOut.text()).not.toContain("UNDETERMINED");
+
+    const statusJsonOut = new Capture();
+    const statusJsonCode = await runObserveStatus(
+      ["--json", "--fortress", fortress.fortressPath],
+      {
+        out: statusJsonOut,
+        err: new Capture(),
+        bootTokenPath: fortress.bootTokenPath,
+        env: { SANCTUARY_RECOVERY_KEY: fortress.recoveryKey },
+      },
+    );
+    expect(statusJsonCode).toBe(0);
+    const statusPayload = JSON.parse(statusJsonOut.text()) as {
+      candidate_status: string;
+      definitive_empty: boolean;
+      last_refresh: { status: string; source_reads: Array<{ status: string }> };
+    };
+    expect(statusPayload.candidate_status).toBe("empty_verified");
+    expect(statusPayload.definitive_empty).toBe(true);
+    expect(statusPayload.last_refresh.status).toBe("refreshed");
+    expect(statusPayload.last_refresh.source_reads.every((source) => source.status === "read_ok")).toBe(true);
+
+    const promoteTextOut = new Capture();
+    const promoteTextCode = await runObservePromote(["--all", "--fortress", fortress.fortressPath], {
+      out: promoteTextOut,
+      err: new Capture(),
+      bootTokenPath: fortress.bootTokenPath,
+      env: { SANCTUARY_RECOVERY_KEY: fortress.recoveryKey },
+    });
+    expect(promoteTextCode).toBe(0);
+    expect(promoteTextOut.text()).toContain("Nothing to promote");
+    expect(promoteTextOut.text()).toContain("all sources read_ok");
+    expect(promoteTextOut.text()).not.toContain("UNDETERMINED");
+
+    const promoteJsonOut = new Capture();
+    const promoteJsonCode = await runObservePromote(
+      ["--json", "--all", "--fortress", fortress.fortressPath],
+      {
+        out: promoteJsonOut,
+        err: new Capture(),
+        bootTokenPath: fortress.bootTokenPath,
+        env: { SANCTUARY_RECOVERY_KEY: fortress.recoveryKey },
+      },
+    );
+    expect(promoteJsonCode).toBe(0);
+    const promotePayload = JSON.parse(promoteJsonOut.text()) as {
+      status: string;
+      nothing_to_promote: boolean;
+      last_refresh: { status: string; source_reads: Array<{ status: string }> };
+    };
+    expect(promotePayload.status).toBe("nothing_to_promote_verified");
+    expect(promotePayload.nothing_to_promote).toBe(true);
+    expect(promotePayload.last_refresh.status).toBe("refreshed");
+    expect(promotePayload.last_refresh.source_reads.every((source) => source.status === "read_ok")).toBe(true);
   });
 });

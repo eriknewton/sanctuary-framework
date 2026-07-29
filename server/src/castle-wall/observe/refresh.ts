@@ -35,25 +35,18 @@
  *    instead -- see `cli/castle-wall-observe.ts`); in-process callers/tests
  *    use `inProcessRefreshLock()`.
  *
- * 3. REVIEW-MARKER-AWARE MINTING. The refresh replays the full retained
- *    history every time. A key already present in the store is healed from
- *    the full aggregate; a key NOT in the store is minted only from events
- *    recorded AFTER the latest observe review action across all sources
- *    (`castle_wall_observe_discard` / `castle_wall_observe_promote` audit
- *    entries, which ride the same verified chain): any candidate the
- *    operator discarded under the old engine was folded from events BEFORE
- *    that review, so those events must not resurrect it (Codex gate
- *    HIGH-1). A chain with no review action ever recorded is a fresh
- *    bootstrap and mints from the full retained history (the documented
- *    "observe start -> run agent -> review candidates" flow). DISCLOSED
- *    LIMIT (Codex round-2 MED, accepted): the marker is global, not
- *    per-key, so a pre-marker event for a candidate the operator NEVER
- *    reviewed is also suppressed by a recompute -- the conservative,
- *    self-healing direction: the destination stays DENIED and re-mints
- *    itself from its next NEW denial; nothing is ever allowed by
- *    suppression. The discard verb writes its marker CRITICALLY, BEFORE
- *    removing rows, and aborts the discard if the append fails -- the
- *    marker this guarantee depends on is never best-effort.
+ * 3. REVIEW-LEDGER-AWARE MINTING. The refresh replays the full retained
+ *    history every time. Candidate removals now write a per-candidate review
+ *    tombstone in the observe StateStore BEFORE the row is deleted; this is
+ *    the durable guarantee, independent of any audit chain's retention or
+ *    reset history. A reviewed key is folded only from events recorded AFTER
+ *    its tombstone `reviewed_at`, even after a later post-review denial
+ *    re-mints it, so historical pre-resolution events never refill its
+ *    count. Chain review markers (`castle_wall_observe_discard` /
+ *    `castle_wall_observe_promote`) remain as a secondary migration horizon
+ *    for older rows with no tombstone: absent keys are minted only from
+ *    events after the latest retained marker. A chain with no review action
+ *    and no tombstone is a fresh bootstrap and mints from retained history.
  *
  * 4. ALLOWLIST-AWARE FOLD + PRUNE, SCOPE-AWARE. A folded row whose flow the
  *    CURRENT cryptographically verified manifest already allows FOR THAT
@@ -109,9 +102,12 @@ import {
   type CandidateObservation,
   type FlowObservationEvent,
   type FoldWatermark,
+  type ObserveCandidateReviewRecord,
   type ObserveAuditSourceId,
 } from "./types.js";
 import type {
+  ObserveCandidateReviewSnapshot,
+  ObserveLastRefreshOutcome,
   ObserveSourceState,
   ObserveSourceStateSnapshot,
 } from "./store.js";
@@ -192,6 +188,8 @@ export interface RefreshCandidateStore {
   replaceCandidateSnapshot(observations: readonly CandidateObservation[]): Promise<void>;
   listSourceStates(): Promise<ObserveSourceStateSnapshot>;
   putSourceState(state: ObserveSourceState): Promise<void>;
+  listCandidateReviews(): Promise<ObserveCandidateReviewSnapshot>;
+  putLastRefreshOutcome(outcome: ObserveLastRefreshOutcome): Promise<void>;
   removeCandidate(key: string): Promise<void>;
 }
 
@@ -538,10 +536,14 @@ export async function refreshCandidatesFromAudit(deps: RefreshDeps): Promise<Ref
 async function runRefresh(deps: RefreshDeps): Promise<RefreshOutcome> {
   const allowlist = await deps.readAllowlist();
   if (allowlist.status === "unverified") {
-    return { status: "allowlist_unverified", reason: allowlist.reason };
+    return recordLastRefreshOutcome(deps, {
+      status: "allowlist_unverified",
+      reason: allowlist.reason,
+    });
   }
 
   const sourceStateSnapshot = await deps.store.listSourceStates();
+  const candidateReviewSnapshot = await deps.store.listCandidateReviews();
   const sources = normalizeAuditSources(deps);
   const sourceReads: ObserveAuditSourceReadOutcome[] = [];
   const readOk: SourceReadOk[] = [];
@@ -584,48 +586,43 @@ async function runRefresh(deps: RefreshDeps): Promise<RefreshOutcome> {
     ...(q.source_id !== undefined ? { source_id: q.source_id } : {}),
   }));
   const incomplete = sourceReads.find((source) => source.status === "read_failed");
-  if (incomplete || quarantinedSources.length > 0) {
-    return {
+  if (incomplete || quarantinedSources.length > 0 || candidateReviewSnapshot.quarantined.length > 0) {
+    return recordLastRefreshOutcome(deps, {
       status: "source_read_incomplete",
       source_reads: sourceReads,
       quarantined_sources: quarantinedSources,
       reason: incomplete
         ? `${incomplete.source_id}: ${incomplete.reason}`
-        : "unknown persisted observe source state is quarantined",
-    };
+        : quarantinedSources.length > 0
+          ? "unknown persisted observe source state is quarantined"
+          : "persisted observe candidate review state is quarantined",
+    });
   }
 
   const persistedBefore = await deps.store.listCandidates();
   const reviewHorizon = latestReviewHorizon(readOk);
   const allEvents = readOk.flatMap((source) => source.events.map((item) => item.event));
-  const postReviewEvents =
-    reviewHorizon === null
-      ? allEvents
-      : readOk.flatMap((source) =>
-          source.events
-            .filter((item) => eventAfterReviewHorizon(item.event, reviewHorizon))
-            .map((item) => item.event),
-        );
+  const foldableEvents = allEvents.filter((event) =>
+    eventSurvivesReviewLedger(
+      event,
+      persistedBefore,
+      candidateReviewSnapshot.known,
+      reviewHorizon,
+    ),
+  );
 
   const snapshot = new Map<string, CandidateObservation>();
   const suppressedAllowedKeys = new Set<string>();
-  const keepIfNotAllowed = (row: CandidateObservation, include: boolean): void => {
+  const keepIfNotAllowed = (row: CandidateObservation): void => {
     const key = candidateKey(row);
     if (candidateCurrentlyAllowed(allowlist.rules, row)) {
       suppressedAllowedKeys.add(key);
       return;
     }
-    if (include) snapshot.set(key, row);
+    snapshot.set(key, row);
   };
 
-  for (const row of foldObservations(allEvents)) {
-    keepIfNotAllowed(row, persistedBefore.has(candidateKey(row)));
-  }
-  for (const row of foldObservations(postReviewEvents)) {
-    const key = candidateKey(row);
-    if (persistedBefore.has(key)) continue;
-    keepIfNotAllowed(row, true);
-  }
+  for (const row of foldObservations(foldableEvents)) keepIfNotAllowed(row);
 
   let removedNowAllowed = 0;
   for (const candidate of persistedBefore.values()) {
@@ -658,16 +655,16 @@ async function runRefresh(deps: RefreshDeps): Promise<RefreshOutcome> {
 
   await deps.store.replaceCandidateSnapshot([...snapshot.values()]);
 
-  return {
+  return recordLastRefreshOutcome(deps, {
     status: "refreshed",
     mode: "recompute",
-    folded_events: allEvents.length,
+    folded_events: foldableEvents.length,
     suppressed_allowed: suppressedAllowedKeys.size,
     removed_now_allowed: removedNowAllowed,
     source_reads: sourceReads,
     quarantined_sources: quarantinedSources,
     definitive_empty: snapshot.size === 0,
-  };
+  });
 }
 
 interface SourceReadOk {
@@ -824,4 +821,61 @@ function eventAfterReviewHorizon(
   const epochMs = Date.parse(event.timestamp);
   if (Number.isNaN(epochMs)) return event.timestamp > horizon.timestamp;
   return epochMs > horizon.epochMs;
+}
+
+function reviewHorizonFromRecord(record: ObserveCandidateReviewRecord): ReviewHorizon {
+  return { timestamp: record.reviewed_at, epochMs: Date.parse(record.reviewed_at) };
+}
+
+function candidateKeyForEvent(event: FlowObservationEvent): string {
+  return candidateKey({
+    agent_template: event.agent.template,
+    host: event.destination.host,
+    ip: event.destination.ip,
+    port: event.destination.port,
+    protocol: event.destination.protocol,
+  });
+}
+
+function eventSurvivesReviewLedger(
+  event: FlowObservationEvent,
+  persistedBefore: ReadonlyMap<string, CandidateObservation>,
+  candidateReviews: ReadonlyMap<string, ObserveCandidateReviewRecord>,
+  chainReviewHorizon: ReviewHorizon | null,
+): boolean {
+  const key = candidateKeyForEvent(event);
+  const candidateReview = candidateReviews.get(key);
+  if (candidateReview) {
+    return eventAfterReviewHorizon(event, reviewHorizonFromRecord(candidateReview));
+  }
+  if (persistedBefore.has(key) || chainReviewHorizon === null) return true;
+  return eventAfterReviewHorizon(event, chainReviewHorizon);
+}
+
+async function recordLastRefreshOutcome<T extends RefreshOutcome>(
+  deps: RefreshDeps,
+  outcome: T,
+): Promise<T> {
+  if (outcome.status === "refresh_in_progress") return outcome;
+  const refreshedAt = deps.now.toISOString();
+  const sourceReads = "source_reads" in outcome ? outcome.source_reads : [];
+  const quarantinedSources =
+    "quarantined_sources" in outcome ? outcome.quarantined_sources : [];
+  const record: ObserveLastRefreshOutcome = {
+    schema_version: "1.0",
+    refreshed_at: refreshedAt,
+    status: outcome.status,
+    source_reads: sourceReads,
+    quarantined_sources: quarantinedSources,
+    ...("definitive_empty" in outcome ? { definitive_empty: outcome.definitive_empty } : {}),
+    ...("reason" in outcome ? { reason: outcome.reason } : {}),
+  };
+  try {
+    await deps.store.putLastRefreshOutcome(record);
+  } catch {
+    // The candidate snapshot is already the source of truth. A missing
+    // witness makes later store-only zero claims UNDETERMINED, which is the
+    // safe direction; do not report a successful refresh as failed here.
+  }
+  return outcome;
 }

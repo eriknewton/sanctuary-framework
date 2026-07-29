@@ -138,6 +138,22 @@ export interface CandidateObservation {
   provenance?: ObserveProvenance;
 }
 
+/** Candidate-review actions that resolve a pending row without permitting it by default. */
+export type ObserveCandidateReviewAction = "promote" | "discard";
+
+/**
+ * Persisted per-candidate review marker. The record lives in the observe
+ * StateStore namespace, not in any audit chain, so a pruned or reset chain
+ * cannot resurrect already-reviewed retained denials. A later denial after
+ * `reviewed_at` may mint a fresh candidate for the same key.
+ */
+export interface ObserveCandidateReviewRecord {
+  schema_version: typeof OBSERVE_SCHEMA_VERSION;
+  candidate_key: string;
+  action: ObserveCandidateReviewAction;
+  reviewed_at: string;
+}
+
 /**
  * Stable dedup / lookup key: (agent template, host-or-ip, port, protocol),
  * per scoping doc section 2.1's fold rule. Built via `JSON.stringify` on a

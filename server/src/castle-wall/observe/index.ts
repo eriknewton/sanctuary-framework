@@ -21,6 +21,8 @@ export type {
   ObserveGranularity,
   FlowObservationEvent,
   CandidateObservation,
+  ObserveCandidateReviewAction,
+  ObserveCandidateReviewRecord,
   ObserveModeState,
   FoldWatermark,
 } from "./types.js";
@@ -63,7 +65,12 @@ export type {
   ObserveSourceState,
   ObserveSourceStateSnapshot,
   ObserveWriteIdentity,
+  ObserveCandidateReviewSnapshot,
+  ObserveLastRefreshOutcome,
+  ObserveLastRefreshSourceRead,
+  ObserveLastRefreshStatus,
   QuarantinedObserveSourceState,
+  QuarantinedObserveCandidateReviewRecord,
 } from "./store.js";
 
 export { promoteCandidates, describeEffectiveRule, ruleScopesEqual } from "./promote.js";

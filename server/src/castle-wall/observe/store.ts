@@ -30,12 +30,15 @@ import { mergeCandidateObservations } from "./fold.js";
 import {
   OBSERVE_AUDIT_SOURCE_IDS,
   OBSERVE_NAMESPACE,
+  OBSERVE_SCHEMA_VERSION,
   candidateKey,
   candidateKeyDigest,
   isObserveAuditSourceId,
   type CandidateObservation,
   type FoldWatermark,
   type ObserveAuditSourceId,
+  type ObserveCandidateReviewAction,
+  type ObserveCandidateReviewRecord,
   type ObserveModeState,
 } from "./types.js";
 
@@ -48,7 +51,9 @@ export interface ObserveWriteIdentity {
 
 const STATE_KEY = "state";
 const FOLD_WATERMARK_KEY = "fold-watermark";
+const LAST_REFRESH_KEY = "last-refresh";
 const CANDIDATE_KEY_PREFIX = "candidate:";
+const CANDIDATE_REVIEW_KEY_PREFIX = "candidate-review:";
 const SOURCE_STATE_KEY_PREFIX = "source-state:";
 const PAGE_SIZE = 100;
 
@@ -81,8 +86,56 @@ export interface ObserveSourceStateSnapshot {
   quarantined: QuarantinedObserveSourceState[];
 }
 
+export interface QuarantinedObserveCandidateReviewRecord {
+  key: string;
+  reason: string;
+  candidate_key?: string;
+}
+
+export interface ObserveCandidateReviewSnapshot {
+  known: Map<string, ObserveCandidateReviewRecord>;
+  quarantined: QuarantinedObserveCandidateReviewRecord[];
+}
+
+export type ObserveLastRefreshStatus =
+  | "refreshed"
+  | "source_read_incomplete"
+  | "allowlist_unverified";
+
+export type ObserveLastRefreshFailure =
+  | "source_unreadable"
+  | "missing_after_contribution"
+  | "instance_changed_after_contribution";
+
+export interface ObserveLastRefreshSourceRead {
+  source_id: ObserveAuditSourceId;
+  status: ObserveSourceReadStatus;
+  entries_read?: number;
+  flow_events?: number;
+  candidate_rows?: number;
+  head_sequence?: number | null;
+  head_hash?: string | null;
+  reason?: string;
+  failure?: ObserveLastRefreshFailure;
+  instance_id?: string;
+}
+
+export interface ObserveLastRefreshOutcome {
+  schema_version: typeof OBSERVE_SCHEMA_VERSION;
+  refreshed_at: string;
+  status: ObserveLastRefreshStatus;
+  source_reads: ObserveLastRefreshSourceRead[];
+  quarantined_sources: QuarantinedObserveSourceState[];
+  definitive_empty?: boolean;
+  reason?: string;
+}
+
 function sourceStateKey(sourceId: ObserveAuditSourceId): string {
   return `${SOURCE_STATE_KEY_PREFIX}${sourceId}`;
+}
+
+function candidateReviewKeyFor(key: string): string {
+  return `${CANDIDATE_REVIEW_KEY_PREFIX}${candidateKeyDigest(key)}`;
 }
 
 function parseSourceState(
@@ -122,6 +175,79 @@ function parseSourceState(
   }
 
   return { state: candidate as ObserveSourceState };
+}
+
+function parseCandidateReview(
+  key: string,
+  value: string,
+): { review: ObserveCandidateReviewRecord } | { quarantine: QuarantinedObserveCandidateReviewRecord } {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    return { quarantine: { key, reason: "malformed JSON" } };
+  }
+
+  const candidate = parsed as Partial<ObserveCandidateReviewRecord>;
+  const validAction = candidate.action === "promote" || candidate.action === "discard";
+  const validTimestamp =
+    typeof candidate.reviewed_at === "string" && !Number.isNaN(Date.parse(candidate.reviewed_at));
+  if (
+    candidate.schema_version !== OBSERVE_SCHEMA_VERSION ||
+    typeof candidate.candidate_key !== "string" ||
+    candidate.candidate_key.length === 0 ||
+    !validAction ||
+    !validTimestamp
+  ) {
+    return {
+      quarantine: {
+        key,
+        reason: "malformed candidate review record",
+        ...(typeof candidate.candidate_key === "string"
+          ? { candidate_key: candidate.candidate_key }
+          : {}),
+      },
+    };
+  }
+  if (candidateReviewKeyFor(candidate.candidate_key) !== key) {
+    return {
+      quarantine: {
+        key,
+        candidate_key: candidate.candidate_key,
+        reason: "candidate key digest mismatch",
+      },
+    };
+  }
+
+  return { review: candidate as ObserveCandidateReviewRecord };
+}
+
+function parseLastRefreshOutcome(value: string): ObserveLastRefreshOutcome | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    return null;
+  }
+  const candidate = parsed as Partial<ObserveLastRefreshOutcome>;
+  const validStatus =
+    candidate.status === "refreshed" ||
+    candidate.status === "source_read_incomplete" ||
+    candidate.status === "allowlist_unverified";
+  const validTimestamp =
+    typeof candidate.refreshed_at === "string" && !Number.isNaN(Date.parse(candidate.refreshed_at));
+  if (
+    candidate.schema_version !== OBSERVE_SCHEMA_VERSION ||
+    !validStatus ||
+    !validTimestamp ||
+    !Array.isArray(candidate.source_reads) ||
+    !Array.isArray(candidate.quarantined_sources) ||
+    (candidate.definitive_empty !== undefined && typeof candidate.definitive_empty !== "boolean") ||
+    (candidate.reason !== undefined && typeof candidate.reason !== "string")
+  ) {
+    return null;
+  }
+  return candidate as ObserveLastRefreshOutcome;
 }
 
 export class ObserveStore {
@@ -196,6 +322,66 @@ export class ObserveStore {
 
   async removeCandidate(key: string): Promise<void> {
     await this.stateStore.delete(OBSERVE_NAMESPACE, this.storageKeyFor(key));
+  }
+
+  async putCandidateReview(review: ObserveCandidateReviewRecord): Promise<void> {
+    await this.put(candidateReviewKeyFor(review.candidate_key), review);
+  }
+
+  /**
+   * Resolve a candidate row by first writing its durable per-candidate review
+   * tombstone, then removing the row. If the process crashes after the
+   * tombstone write, a later refresh still treats pre-review retained denials
+   * as resolved and converges by removing the stale row.
+   */
+  async removeCandidateAfterReview(
+    candidate: CandidateObservation,
+    action: ObserveCandidateReviewAction,
+    reviewedAt: string,
+  ): Promise<void> {
+    const key = candidateKey(candidate);
+    await this.putCandidateReview({
+      schema_version: OBSERVE_SCHEMA_VERSION,
+      candidate_key: key,
+      action,
+      reviewed_at: reviewedAt,
+    });
+    await this.removeCandidate(key);
+  }
+
+  async listCandidateReviews(): Promise<ObserveCandidateReviewSnapshot> {
+    const known = new Map<string, ObserveCandidateReviewRecord>();
+    const quarantined: QuarantinedObserveCandidateReviewRecord[] = [];
+    let offset = 0;
+    for (;;) {
+      const { keys, total } = await this.stateStore.list(
+        OBSERVE_NAMESPACE,
+        CANDIDATE_REVIEW_KEY_PREFIX,
+        undefined,
+        PAGE_SIZE,
+        offset,
+      );
+      for (const { key } of keys) {
+        const result = await this.stateStore.read(OBSERVE_NAMESPACE, key);
+        if (!result) continue;
+        const parsed = parseCandidateReview(key, result.value);
+        if ("review" in parsed) known.set(parsed.review.candidate_key, parsed.review);
+        else quarantined.push(parsed.quarantine);
+      }
+      offset += keys.length;
+      if (keys.length === 0 || offset >= total) break;
+    }
+    return { known, quarantined };
+  }
+
+  async getLastRefreshOutcome(): Promise<ObserveLastRefreshOutcome | null> {
+    const result = await this.stateStore.read(OBSERVE_NAMESPACE, LAST_REFRESH_KEY);
+    if (!result) return null;
+    return parseLastRefreshOutcome(result.value);
+  }
+
+  async putLastRefreshOutcome(outcome: ObserveLastRefreshOutcome): Promise<void> {
+    await this.put(LAST_REFRESH_KEY, outcome);
   }
 
   async listSourceStates(): Promise<ObserveSourceStateSnapshot> {

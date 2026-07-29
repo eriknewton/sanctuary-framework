@@ -72,6 +72,7 @@ import {
   promoteCandidates,
   refreshCandidatesFromAudit,
   type CandidateObservation,
+  type ObserveLastRefreshOutcome,
   type ObserveAuditSourceReadOutcome,
   type ObserveGranularity,
   type ObserveQuarantinedSourceState,
@@ -477,15 +478,43 @@ export async function runObserveStatus(
   const out = ctx.out ?? process.stdout;
   const err = ctx.err ?? process.stderr;
   const env = ctx.env ?? process.env;
+  const json = hasFlag(argv, "--json");
 
   const boot = await bootstrap(argv, err, env);
   if (!boot) return 1;
 
   const state = await boot.observeStore.getState();
   const candidates = await boot.observeStore.listCandidates();
+  const lastRefresh = await boot.observeStore.getLastRefreshOutcome();
+  const structuralUndeterminedReason = await storeOnlyStructuralUndeterminedReason(boot.fortressPath);
+  const claim = candidateStoreClaim(candidates.size, lastRefresh, structuralUndeterminedReason);
+
+  if (json) {
+    write(
+      out,
+      JSON.stringify(
+        {
+          observe_mode: state.enabled ? "on" : "off",
+          started_at: state.started_at,
+          pending_candidates: candidates.size,
+          candidate_status: claim.status,
+          definitive_empty: claim.definitiveEmpty,
+          store_state_only: true,
+          last_refresh: lastRefreshForJson(lastRefresh),
+          gate_denials: gateDenialsForJson(structuralUndeterminedReason),
+          ...(claim.undeterminedReason !== null
+            ? { undetermined_reason: claim.undeterminedReason }
+            : {}),
+        },
+        null,
+        2,
+      ) + "\n",
+    );
+    return 0;
+  }
 
   write(out, state.enabled ? `Observe mode: ON (since ${state.started_at})\n` : "Observe mode: OFF\n");
-  write(out, `Pending candidates: ${candidates.size}\n`);
+  writeStoreCandidateClaim(out, candidates.size, lastRefresh, claim);
   return 0;
 }
 
@@ -761,6 +790,180 @@ function sourceWitnessLines(
     lines.push(`Source state ${source.key}: quarantined (${source.reason}).`);
   }
   return lines;
+}
+
+type StoreCandidateClaimStatus = "populated" | "empty_verified" | "undetermined";
+
+interface StoreCandidateClaim {
+  status: StoreCandidateClaimStatus;
+  definitiveEmpty: boolean;
+  undeterminedReason: string | null;
+}
+
+function lastRefreshAllReadOk(lastRefresh: ObserveLastRefreshOutcome | null): boolean {
+  return (
+    lastRefresh !== null &&
+    lastRefresh.status === "refreshed" &&
+    lastRefresh.source_reads.length > 0 &&
+    lastRefresh.source_reads.every((source) => source.status === "read_ok") &&
+    lastRefresh.quarantined_sources.length === 0
+  );
+}
+
+function refreshSourceStatusSummary(lastRefresh: ObserveLastRefreshOutcome): string {
+  const statuses = lastRefresh.source_reads
+    .map((source) => `${source.source_id}=${source.status}`)
+    .join(", ");
+  return statuses.length > 0 ? statuses : "no source reads recorded";
+}
+
+function lastRefreshSummary(lastRefresh: ObserveLastRefreshOutcome | null): string {
+  if (lastRefresh === null) return "last refresh: none";
+  return `last refresh at ${lastRefresh.refreshed_at}: ${lastRefresh.status} (${refreshSourceStatusSummary(lastRefresh)})`;
+}
+
+function lastRefreshUndeterminedReason(lastRefresh: ObserveLastRefreshOutcome | null): string {
+  if (lastRefresh === null) return "no observe refresh outcome is recorded";
+  if (lastRefresh.status !== "refreshed") {
+    return `last refresh at ${lastRefresh.refreshed_at} was ${lastRefresh.status}` +
+      (lastRefresh.reason ? ` (${lastRefresh.reason})` : "");
+  }
+  if (lastRefresh.quarantined_sources.length > 0) {
+    return `last refresh at ${lastRefresh.refreshed_at} had quarantined observe source state`;
+  }
+  return `last refresh at ${lastRefresh.refreshed_at} was not all-read_ok (${refreshSourceStatusSummary(lastRefresh)})`;
+}
+
+function candidateStoreClaim(
+  candidateCount: number,
+  lastRefresh: ObserveLastRefreshOutcome | null,
+  structuralUndeterminedReason: string | null = null,
+): StoreCandidateClaim {
+  if (candidateCount > 0) {
+    return { status: "populated", definitiveEmpty: false, undeterminedReason: null };
+  }
+  if (structuralUndeterminedReason !== null) {
+    return {
+      status: "undetermined",
+      definitiveEmpty: false,
+      undeterminedReason: structuralUndeterminedReason,
+    };
+  }
+  if (lastRefreshAllReadOk(lastRefresh)) {
+    return { status: "empty_verified", definitiveEmpty: true, undeterminedReason: null };
+  }
+  return {
+    status: "undetermined",
+    definitiveEmpty: false,
+    undeterminedReason: lastRefreshUndeterminedReason(lastRefresh),
+  };
+}
+
+async function storeOnlyStructuralUndeterminedReason(fortressPath: string): Promise<string | null> {
+  try {
+    return (await loadExclusiveRoutingMarker(fortressPath)) !== null
+      ? EXCLUSIVE_GATE_DENIALS_UNAVAILABLE
+      : null;
+  } catch {
+    return "exclusive-routing state could not be read";
+  }
+}
+
+function gateDenialsForJson(structuralUndeterminedReason: string | null): unknown {
+  return structuralUndeterminedReason === EXCLUSIVE_GATE_DENIALS_UNAVAILABLE
+    ? { status: "structurally_unavailable", reason: EXCLUSIVE_GATE_DENIALS_UNAVAILABLE }
+    : { status: "not_applicable" };
+}
+
+function lastRefreshForJson(lastRefresh: ObserveLastRefreshOutcome | null): unknown {
+  if (lastRefresh === null) return { status: "none" };
+  return {
+    status: lastRefresh.status,
+    refreshed_at: lastRefresh.refreshed_at,
+    source_reads: lastRefresh.source_reads,
+    quarantined_sources: lastRefresh.quarantined_sources,
+    ...(lastRefresh.definitive_empty !== undefined
+      ? { definitive_empty: lastRefresh.definitive_empty }
+      : {}),
+    ...(lastRefresh.reason !== undefined ? { reason: lastRefresh.reason } : {}),
+  };
+}
+
+function writeStoreCandidateClaim(
+  out: Writable,
+  candidateCount: number,
+  lastRefresh: ObserveLastRefreshOutcome | null,
+  claim: StoreCandidateClaim = candidateStoreClaim(candidateCount, lastRefresh),
+): void {
+  if (candidateCount > 0) {
+    write(out, `Pending candidates in store: ${candidateCount} (store-state-only; ${lastRefreshSummary(lastRefresh)}).\n`);
+    return;
+  }
+  if (claim.status === "empty_verified") {
+    write(
+      out,
+      `Pending candidates in store: 0 (store-state-only; ${lastRefreshSummary(lastRefresh)}; all sources read_ok).\n`,
+    );
+    return;
+  }
+  write(
+    out,
+    `UNDETERMINED: pending candidates in store: 0, but this is not verified empty (${claim.undeterminedReason ?? lastRefreshUndeterminedReason(lastRefresh)}).\n`,
+  );
+  write(out, `Store-state-only witness: ${lastRefreshSummary(lastRefresh)}.\n`);
+}
+
+function writePromoteNoSelectionJson(
+  out: Writable,
+  candidateCount: number,
+  lastRefresh: ObserveLastRefreshOutcome | null,
+  rescopeChecked: boolean,
+  structuralUndeterminedReason: string | null = null,
+): void {
+  const claim = candidateStoreClaim(candidateCount, lastRefresh, structuralUndeterminedReason);
+  write(
+    out,
+    JSON.stringify(
+      {
+        status: claim.status === "empty_verified" ? "nothing_to_promote_verified" : claim.status,
+        nothing_to_promote: claim.definitiveEmpty,
+        pending_candidates: candidateCount,
+        store_state_only: true,
+        rescope_checked: rescopeChecked,
+        last_refresh: lastRefreshForJson(lastRefresh),
+        gate_denials: gateDenialsForJson(structuralUndeterminedReason),
+        ...(claim.undeterminedReason !== null
+          ? { undetermined_reason: claim.undeterminedReason }
+          : {}),
+      },
+      null,
+      2,
+    ) + "\n",
+  );
+}
+
+function writePromoteNoSelectionText(
+  out: Writable,
+  candidateCount: number,
+  lastRefresh: ObserveLastRefreshOutcome | null,
+  rescopeChecked: boolean,
+  structuralUndeterminedReason: string | null = null,
+): void {
+  const claim = candidateStoreClaim(candidateCount, lastRefresh, structuralUndeterminedReason);
+  if (claim.status === "empty_verified") {
+    write(
+      out,
+      `Nothing to promote (store-state-only; ${lastRefreshSummary(lastRefresh)}; all sources read_ok).` +
+        (rescopeChecked ? " No promoted rules need re-scoping.\n" : "\n"),
+    );
+    return;
+  }
+  write(
+    out,
+    `UNDETERMINED: no candidates are currently stored, but this is not verified empty (${claim.undeterminedReason ?? lastRefreshUndeterminedReason(lastRefresh)}).` +
+      (rescopeChecked ? " No promoted rules need re-scoping in the verified manifest.\n" : "\n"),
+  );
+  write(out, `Store-state-only witness: ${lastRefreshSummary(lastRefresh)}.\n`);
 }
 
 /** Lockfile basename for the cross-process refresh mutual exclusion (Codex gate BLOCKER; see castle-wall/observe/refresh.ts guarantee 2). Lives directly under the fortress root (mode 0700). */
@@ -1305,6 +1508,7 @@ export async function runObservePromote(
 
   const destinations = flagValues(argv, "--destination");
   const all = hasFlag(argv, "--all");
+  const json = hasFlag(argv, "--json");
   const includeRisky = hasFlag(argv, "--include-risky");
   const granularityFlag = flagValue(argv, "--granularity");
 
@@ -1406,7 +1610,14 @@ export async function runObservePromote(
 
   if (selection.length === 0) {
     if (routing.mode !== "exclusive") {
-      write(out, "Nothing selected to promote.\n");
+      const lastRefresh = await boot.observeStore.getLastRefreshOutcome();
+      if (json) {
+        writePromoteNoSelectionJson(out, candidatesByKey.size, lastRefresh, false);
+      } else if (candidatesByKey.size === 0) {
+        writePromoteNoSelectionText(out, 0, lastRefresh, false);
+      } else {
+        write(out, "Nothing selected to promote.\n");
+      }
       return 0;
     }
     // Round-3 R3: on an exclusive fortress an EMPTY selection still proceeds,
@@ -1490,7 +1701,24 @@ export async function runObservePromote(
     if (selection.length === 0) {
       // The exclusive-mode empty-selection rescope check (round-3 R3) found
       // nothing needing re-scope: an honest no-op, not an error.
-      write(out, "Nothing to promote, and no promoted rules need re-scoping.\n");
+      const lastRefresh = await boot.observeStore.getLastRefreshOutcome();
+      if (json) {
+        writePromoteNoSelectionJson(
+          out,
+          candidatesByKey.size,
+          lastRefresh,
+          true,
+          routing.mode === "exclusive" ? EXCLUSIVE_GATE_DENIALS_UNAVAILABLE : null,
+        );
+      } else {
+        writePromoteNoSelectionText(
+          out,
+          candidatesByKey.size,
+          lastRefresh,
+          true,
+          routing.mode === "exclusive" ? EXCLUSIVE_GATE_DENIALS_UNAVAILABLE : null,
+        );
+      }
       return 0;
     }
     write(err, "No valid candidates to promote (not found, or the synthesized rule failed validation).\n");
@@ -1573,7 +1801,13 @@ export async function runObservePromote(
   // re-arm" and the copy below says so plainly.
   if (routing.mode !== "exclusive") {
     for (const key of outcome.promotedKeys) {
-      await boot.observeStore.removeCandidate(key);
+      const candidate = candidatesByKey.get(key);
+      if (!candidate) continue;
+      await boot.observeStore.removeCandidateAfterReview(
+        candidate,
+        "promote",
+        new Date().toISOString(),
+      );
     }
   }
 
@@ -1649,8 +1883,10 @@ export async function runObserveDiscard(
     // between the append and the removals is harmless -- the marker only
     // bounds what a recompute may MINT for keys absent from the store, and
     // the still-present rows heal normally.
+    const reviewedAt = new Date().toISOString();
     try {
       await boot.auditLog.appendCritical({
+        timestamp: reviewedAt,
         layer: "l1",
         operation: "castle_wall_observe_discard",
         identity_id: boot.primary.identity_id,
@@ -1669,7 +1905,9 @@ export async function runObserveDiscard(
     }
 
     for (const key of keysToRemove) {
-      await boot.observeStore.removeCandidate(key);
+      const candidate = candidatesByKey.get(key);
+      if (!candidate) continue;
+      await boot.observeStore.removeCandidateAfterReview(candidate, "discard", reviewedAt);
     }
   }
 
