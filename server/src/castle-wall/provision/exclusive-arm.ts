@@ -45,11 +45,17 @@ import {
   EGRESS_GATE_STAND_DOWN_EFFECT,
   EGRESS_GATE_UNPROTECT_WITH_STAND_DOWN_COMMAND,
 } from "../../egress-gate/operator-advice.js";
-import { auditClaim, observing, type Observed } from "../../claim-witness.js";
+import {
+  auditClaim,
+  observing,
+  type ClaimAuditDetailsByOperation,
+  type Observed,
+} from "../../claim-witness.js";
 
 /** Distinct local audit operation strings (never a widened shared enum). */
 export const EXCLUSIVE_EGRESS_ARMED_AUDIT_OP = "exclusive_egress_armed";
 export const EXCLUSIVE_EGRESS_DEGRADED_AUDIT_OP = "exclusive_egress_degraded_coarse_active";
+export const EXCLUSIVE_EGRESS_BOOT_RELEASE_AUDIT_OP = "exclusive_egress_boot_release";
 /**
  * D8 self-heal (2026-07-22): the reconcile preflight removed an ORPHANED
  * exclusive-routing marker left by a hard-interrupted prior arm. Distinct op
@@ -74,6 +80,7 @@ type ReleasedBarrierOutcome = Extract<
   ReleaseBarrierOutcome,
   { kind: "released" | "released-repark-failed" }
 >;
+type ParkedBarrierOutcome = Extract<ReleaseBarrierOutcome, { kind: "parked" }>;
 
 function releasedGenerationId(
   committed: ExclusiveGenerationIdentity,
@@ -836,37 +843,63 @@ export async function runEgressGateRepair(
   } catch (err) {
     return failParked("bring-up", (err as Error).message, true);
   }
-  let release: ReleaseBarrierOutcome;
+  let parkedRelease: ParkedBarrierOutcome | undefined;
+  let repairReleaseKind: "released" | "released-repark-failed" | undefined;
+  let repairAuditDetails: ClaimAuditDetailsByOperation["egress_gate_repair"];
   try {
-    release = await ops.runReleaseSequence(committed);
+    repairAuditDetails = await observing("provision-exclusive-arm.repair-release", async () => {
+      const release = await ops.runReleaseSequence(committed);
+      if (release.kind === "released") {
+        const generationId = releasedGenerationId(committed, release);
+        repairReleaseKind = "released";
+        return {
+          agent_uid: ctx.agentUid,
+          generation_id: generationId,
+          override_used: ctx.overrideTransientPfRules && foreign.length > 0,
+        };
+      }
+      if (release.kind === "released-repark-failed") {
+        const generationId = releasedGenerationId(committed, release);
+        repairReleaseKind = "released-repark-failed";
+        return {
+          agent_uid: ctx.agentUid,
+          generation_id: generationId,
+          repark_failed: release.reparkError,
+        };
+      }
+      parkedRelease = release;
+      throw new Error(`release barrier parked at stage ${release.stage}: ${release.reason}`);
+    });
   } catch (err) {
-    return failParked("release", (err as Error).message, true);
+    const parked = parkedRelease;
+    return failParked(
+      "release",
+      parked !== undefined
+        ? `release barrier parked at stage ${parked.stage}: ${parked.reason}`
+        : (err as Error).message,
+      true,
+    );
   }
-  if (release.kind === "released") {
-    await ops.audit(EGRESS_GATE_REPAIR_AUDIT_OP, {
-      agent_uid: ctx.agentUid,
-      generation_id: committed.generation_id,
-      override_used: ctx.overrideTransientPfRules && foreign.length > 0,
-    });
-    return { kind: "repaired", generationId: committed.generation_id };
+  await ops.audit(...auditClaim(EGRESS_GATE_REPAIR_AUDIT_OP, repairAuditDetails));
+  if (repairReleaseKind === "released") {
+    return { kind: "repaired", generationId: repairAuditDetails.generation_id };
   }
-  if (release.kind === "released-repark-failed") {
-    await ops.audit(EGRESS_GATE_REPAIR_AUDIT_OP, {
-      agent_uid: ctx.agentUid,
-      generation_id: committed.generation_id,
-      repark_failed: release.reparkError,
-    });
+  if (repairReleaseKind === "released-repark-failed") {
+    const reparkError = repairAuditDetails.repark_failed;
+    if (reparkError === undefined) {
+      return failParked(
+        "release",
+        "released-repark-failed observation did not include the re-park failure detail",
+        true,
+      );
+    }
     return {
       kind: "repaired-repark-failed",
-      generationId: committed.generation_id,
-      reparkError: release.reparkError,
+      generationId: repairAuditDetails.generation_id,
+      reparkError,
     };
   }
-  // FIX F-COARSE-AFTER-EXCLUSIVE: THE drill's actual path. The bring-up
-  // committed a generation (fortress now in exclusive composition) and the
-  // barrier then refused to release. Pre-fix this returned with the fortress
-  // still exclusive, which is what made the next plain coarse arm refuse.
-  return failParked("release", `release barrier parked at stage ${release.stage}: ${release.reason}`, true);
+  return failParked("release", "release observation returned no terminal success kind", true);
 }
 
 // ---------------------------------------------------------------------------
@@ -938,36 +971,83 @@ export async function runBootExclusiveEgressRelease(
 ): Promise<BootReleaseResult[]> {
   const results: BootReleaseResult[] = [];
   for (const agent of agents) {
+    let parkedClaim: ParkedClaim | undefined;
+    let auditDetails: ClaimAuditDetailsByOperation["exclusive_egress_boot_release"];
     let outcome: BootReleaseResult["outcome"];
     try {
-      const release = await ops.releaseAgent(agent.agent_uid);
-      if (release.kind === "released") {
-        outcome = { kind: "released", generationId: release.generation_id };
-      } else if (release.kind === "released-repark-failed") {
-        outcome = {
-          kind: "released-repark-failed",
-          generationId: release.generation_id,
-          reparkError: release.reparkError,
-        };
-      } else {
+      auditDetails = await observing("provision-exclusive-arm.boot-release", async () => {
+        const release = await ops.releaseAgent(agent.agent_uid);
+        if (release.kind === "released") {
+          return {
+            agent_uid: agent.agent_uid,
+            outcome: "released" as const,
+            generation_id: release.generation_id,
+          };
+        }
+        if (release.kind === "released-repark-failed") {
+          return {
+            agent_uid: agent.agent_uid,
+            outcome: "released-repark-failed" as const,
+            generation_id: release.generation_id,
+            repark_failed: release.reparkError,
+          };
+        }
+        parkedClaim = release.parkedClaim;
         // Carry the REAL re-park results forward (fix-round-2 BLOCKER-1):
         // "parked" without the op results would be a claim nobody could audit.
-        outcome = {
-          kind: "parked",
+        return {
+          agent_uid: agent.agent_uid,
+          outcome: "parked" as const,
           reason: `release barrier parked at stage ${release.stage}: ${release.reason}`,
-          holdFileRemoved: release.holdFileRemoved,
-          jobDisabled: release.jobDisabled,
-          cleanupErrors: release.cleanupErrors,
-          parkedClaim: release.parkedClaim,
+          hold_file_removed: release.holdFileRemoved,
+          job_disabled: release.jobDisabled,
+          cleanup_errors: release.cleanupErrors,
+          ...parkedClaimAuditFields(release.parkedClaim),
         };
-      }
+      });
     } catch (err) {
       // Fix-round-2 BLOCKER-1: a THROW out of the release attempt proves
       // nothing about the parked state (the pre-fix code reported a synthetic
       // PARKED here with no re-park op verified). Distinct, LOUD, honest.
+      auditDetails = {
+        agent_uid: agent.agent_uid,
+        outcome: "park-not-verified",
+        reason: `boot release threw before a verified park: ${(err as Error).message}`,
+      };
+    }
+    if (auditDetails.outcome === "released") {
+      outcome = { kind: "released", generationId: auditDetails.generation_id };
+    } else if (auditDetails.outcome === "released-repark-failed") {
+      outcome = {
+        kind: "released-repark-failed",
+        generationId: auditDetails.generation_id,
+        reparkError: auditDetails.repark_failed,
+      };
+    } else if (auditDetails.outcome === "parked") {
+      if (parkedClaim === undefined) {
+        outcome = {
+          kind: "park-not-verified",
+          reason: "boot release returned a parked audit observation without the run-state claim",
+        };
+        auditDetails = {
+          agent_uid: agent.agent_uid,
+          outcome: "park-not-verified",
+          reason: outcome.reason,
+        };
+      } else {
+        outcome = {
+          kind: "parked",
+          reason: auditDetails.reason,
+          holdFileRemoved: auditDetails.hold_file_removed,
+          jobDisabled: auditDetails.job_disabled,
+          cleanupErrors: auditDetails.cleanup_errors,
+          parkedClaim,
+        };
+      }
+    } else {
       outcome = {
         kind: "park-not-verified",
-        reason: `boot release threw before a verified park: ${(err as Error).message}`,
+        reason: auditDetails.reason,
       };
     }
     if (outcome.kind === "park-not-verified") {
@@ -999,28 +1079,7 @@ export async function runBootExclusiveEgressRelease(
             : ""),
       );
     }
-    await ops.audit("exclusive_egress_boot_release", {
-      agent_uid: agent.agent_uid,
-      outcome: outcome.kind,
-      ...(outcome.kind === "released" || outcome.kind === "released-repark-failed"
-        ? { generation_id: outcome.generationId }
-        : { reason: outcome.reason }),
-      ...(outcome.kind === "parked"
-        ? {
-            hold_file_removed: outcome.holdFileRemoved,
-            job_disabled: outcome.jobDisabled,
-            cleanup_errors: outcome.cleanupErrors,
-            // FIX-ROUND 5: symmetry with the degrade path's audit. `outcome:
-            // "parked"` here means only "the barrier did not release"; the
-            // type doc says so, but a SIEM consumer does not read type docs.
-            // Without these two fields this record reads as a park over a host
-            // where the code had just observed a live pid -- the same
-            // downstream-silence gap round 4 closed on `degradeLoud`, left
-            // asymmetric. The claim is in the record, not only in the prose.
-            ...parkedClaimAuditFields(outcome.parkedClaim),
-          }
-        : {}),
-    });
+    await ops.audit(...auditClaim(EXCLUSIVE_EGRESS_BOOT_RELEASE_AUDIT_OP, auditDetails));
     results.push({ agent_uid: agent.agent_uid, outcome });
   }
   return results;

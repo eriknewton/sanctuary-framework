@@ -64,16 +64,57 @@ fi
 
 SRC_PATCH="$(mktemp "${TMPDIR:-/tmp}/verify-fail-before-src.XXXXXX.patch")"
 STASHED_SRC=0
+STASH_REF=""
+STASH_OBJECT=""
 APPLIED_REVERSE=0
+
+record_stash_ref() {
+  STASHED_SRC=1
+  STASH_REF="stash@{0}"
+  STASH_OBJECT="$(git rev-parse --short "$STASH_REF" 2>/dev/null || true)"
+}
+
+stash_label() {
+  if [[ -n "$STASH_OBJECT" ]]; then
+    printf '%s (%s)' "$STASH_REF" "$STASH_OBJECT"
+  else
+    printf '%s' "${STASH_REF:-unknown}"
+  fi
+}
+
+report_restore_failed() {
+  local reason="$1"
+  if [[ "$STASHED_SRC" -eq 1 ]]; then
+    echo "RESTORE FAILED — your staged server/src state is in stash $(stash_label)" >&2
+  else
+    echo "RESTORE FAILED — server/src patch restore failed and no pre-run server/src stash was created" >&2
+  fi
+  echo "  $reason" >&2
+  echo "  Resolve the restore manually before continuing." >&2
+}
 
 restore() {
   local status=$?
+  local restore_failed=0
   set +e
   if [[ "$APPLIED_REVERSE" -eq 1 ]]; then
     git apply "$SRC_PATCH" >/dev/null 2>&1
+    local apply_status=$?
+    if [[ "$apply_status" -ne 0 ]]; then
+      report_restore_failed "git apply failed while reapplying the server/src patch (exit $apply_status); patch left at $SRC_PATCH"
+      restore_failed=1
+    fi
   fi
-  if [[ "$STASHED_SRC" -eq 1 ]]; then
-    git stash pop --index -q >/dev/null 2>&1
+  if [[ "$restore_failed" -eq 0 && "$STASHED_SRC" -eq 1 ]]; then
+    git stash pop --index -q "$STASH_REF" >/dev/null 2>&1
+    local stash_status=$?
+    if [[ "$stash_status" -ne 0 ]]; then
+      report_restore_failed "git stash pop --index $STASH_REF failed (exit $stash_status)"
+      restore_failed=1
+    fi
+  fi
+  if [[ "$restore_failed" -ne 0 ]]; then
+    exit 1
   fi
   rm -f "$SRC_PATCH"
   exit "$status"
@@ -84,7 +125,7 @@ git diff --binary "$BASE_REF"...HEAD -- server/src > "$SRC_PATCH"
 
 if ! git diff --quiet -- server/src || ! git diff --cached --quiet -- server/src; then
   git stash push -q --include-untracked -m "verify-fail-before-src-$$" -- server/src
-  STASHED_SRC=1
+  record_stash_ref
 else
   UNTRACKED_SRC=()
   while IFS= read -r untracked_src; do
@@ -93,7 +134,7 @@ else
   done < <(git ls-files --others --exclude-standard -- server/src)
   if [[ ${#UNTRACKED_SRC[@]} -gt 0 ]]; then
     git stash push -q --include-untracked -m "verify-fail-before-src-$$" -- server/src
-    STASHED_SRC=1
+    record_stash_ref
   fi
 fi
 

@@ -1,5 +1,5 @@
 import { readFileSync, readdirSync } from "node:fs";
-import { join, relative } from "node:path";
+import { join, posix, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { describe, expect, it } from "vitest";
@@ -71,6 +71,107 @@ function lineOf(source: ts.SourceFile, node: ts.Node): number {
   return source.getLineAndCharacterOfPosition(node.getStart(source)).line + 1;
 }
 
+const WITNESS_BRAND_NAMES = new Set(["Observed", "VerifiedEmpty"]);
+
+function entityNameText(name: ts.EntityName): string {
+  return ts.isIdentifier(name)
+    ? name.text
+    : `${entityNameText(name.left)}.${name.right.text}`;
+}
+
+function lastEntitySegment(name: string): string {
+  const parts = name.split(".");
+  return parts[parts.length - 1] ?? name;
+}
+
+function typeNodeNamesWitnessBrand(typeNode: ts.TypeNode): boolean {
+  let namesWitnessBrand = false;
+  const visit = (node: ts.Node): void => {
+    if (ts.isTypeReferenceNode(node)) {
+      const name = lastEntitySegment(entityNameText(node.typeName));
+      if (WITNESS_BRAND_NAMES.has(name)) {
+        namesWitnessBrand = true;
+        return;
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(typeNode);
+  return namesWitnessBrand;
+}
+
+function moduleSpecifierTargetsClaimWitness(fromRel: string, specifier: string): boolean {
+  if (!specifier.startsWith(".")) return false;
+  const withoutExtension = specifier.replace(/\.(?:c|m)?(?:j|t)sx?$/, "");
+  return posix.normalize(posix.join(posix.dirname(fromRel), withoutExtension)) ===
+    "server/src/claim-witness";
+}
+
+function importTypeNamesWitnessBrand(
+  fromRel: string,
+  node: ts.ImportTypeNode,
+): boolean {
+  const literal = node.argument.literal;
+  if (!ts.isStringLiteral(literal)) return false;
+  if (!moduleSpecifierTargetsClaimWitness(fromRel, literal.text)) return false;
+  const qualifier = node.qualifier;
+  if (qualifier === undefined) return false;
+  return WITNESS_BRAND_NAMES.has(lastEntitySegment(entityNameText(qualifier)));
+}
+
+function typeNodeImportsWitnessBrand(fromRel: string, typeNode: ts.TypeNode): boolean {
+  let importsWitnessBrand = false;
+  const visit = (node: ts.Node): void => {
+    if (ts.isImportTypeNode(node) && importTypeNamesWitnessBrand(fromRel, node)) {
+      importsWitnessBrand = true;
+      return;
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(typeNode);
+  return importsWitnessBrand;
+}
+
+function isLiteralExpression(node: ts.Expression): boolean {
+  if (
+    ts.isStringLiteral(node) ||
+    ts.isNoSubstitutionTemplateLiteral(node) ||
+    ts.isNumericLiteral(node) ||
+    node.kind === ts.SyntaxKind.TrueKeyword ||
+    node.kind === ts.SyntaxKind.FalseKeyword ||
+    node.kind === ts.SyntaxKind.NullKeyword
+  ) {
+    return true;
+  }
+  return (
+    ts.isPrefixUnaryExpression(node) &&
+    (node.operator === ts.SyntaxKind.PlusToken || node.operator === ts.SyntaxKind.MinusToken) &&
+    ts.isNumericLiteral(node.operand)
+  );
+}
+
+function isPromiseSettledFactory(node: ts.CallExpression): boolean {
+  return (
+    ts.isPropertyAccessExpression(node.expression) &&
+    ts.isIdentifier(node.expression.expression) &&
+    node.expression.expression.text === "Promise" &&
+    (node.expression.name.text === "resolve" || node.expression.name.text === "reject")
+  );
+}
+
+function isPureLiteralWrapperCall(node: ts.CallExpression): boolean {
+  return (
+    ts.isIdentifier(node.expression) &&
+    ["Boolean", "Number", "String"].includes(node.expression.text) &&
+    node.arguments.length === 1 &&
+    isLiteralExpression(node.arguments[0]!)
+  );
+}
+
+function isQualifyingObservationCall(node: ts.CallExpression): boolean {
+  return !isPromiseSettledFactory(node) && !isPureLiteralWrapperCall(node);
+}
+
 function observingCallbackCanObserve(callback: ts.Expression | undefined): boolean {
   if (
     callback === undefined ||
@@ -80,7 +181,7 @@ function observingCallbackCanObserve(callback: ts.Expression | undefined): boole
   }
   let canObserve = false;
   const visit = (node: ts.Node): void => {
-    if (ts.isAwaitExpression(node) || ts.isCallExpression(node)) {
+    if (ts.isCallExpression(node) && isQualifyingObservationCall(node)) {
       canObserve = true;
       return;
     }
@@ -98,8 +199,24 @@ describe("structural honesty witnesses", () => {
       if (rel === CLAIM_WITNESS) continue;
       const source = readFileSync(full, "utf8");
       if (/\bas\s+(?:Observed|VerifiedEmpty)\b/.test(source)) {
-        offenders.push(rel);
+        offenders.push(`${rel}: direct witness-brand cast`);
       }
+      const ast = parseSource(rel, source);
+      const visit = (node: ts.Node): void => {
+        if (ts.isImportTypeNode(node) && importTypeNamesWitnessBrand(rel, node)) {
+          offenders.push(`${rel}:${lineOf(ast, node)} import-type witness-brand reference`);
+          return;
+        }
+        if (
+          ts.isSatisfiesExpression(node) &&
+          (typeNodeNamesWitnessBrand(node.type) || typeNodeImportsWitnessBrand(rel, node.type))
+        ) {
+          offenders.push(`${rel}:${lineOf(ast, node)} witness-brand satisfies expression`);
+          return;
+        }
+        ts.forEachChild(node, visit);
+      };
+      visit(ast);
     }
     expect(offenders).toEqual([]);
   });
@@ -133,7 +250,7 @@ describe("structural honesty witnesses", () => {
                 !observingCallbackCanObserve(node.arguments[1])
               ) {
                 inertObservingCallbacks.push(
-                  `${rel}:${lineOf(ast, node)} ${label} callback has no await or call expression`,
+                  `${rel}:${lineOf(ast, node)} ${label} callback has no real operation call`,
                 );
               }
             }
@@ -187,6 +304,10 @@ describe("structural honesty witnesses", () => {
     );
     expect(exclusiveArm).toMatch(/ops\.audit\(\.\.\.auditClaim\(\s*EXCLUSIVE_EGRESS_ARMED_AUDIT_OP/);
     expect(exclusiveArm).toMatch(/ops\.audit\(\.\.\.auditClaim\(\s*EXCLUSIVE_EGRESS_DEGRADED_AUDIT_OP/);
+    expect(exclusiveArm).toMatch(/ops\.audit\(\.\.\.auditClaim\(\s*EGRESS_GATE_REPAIR_AUDIT_OP/);
+    expect(exclusiveArm).toMatch(/ops\.audit\(\.\.\.auditClaim\(\s*EXCLUSIVE_EGRESS_BOOT_RELEASE_AUDIT_OP/);
+    expect(exclusiveArm).not.toMatch(/ops\.audit\(\s*EGRESS_GATE_REPAIR_AUDIT_OP/);
+    expect(exclusiveArm).not.toMatch(/ops\.audit\(\s*"exclusive_egress_boot_release"/);
     expect(exclusiveArm).not.toMatch(/coarseCompositionRestored\s*=\s*true/);
     expect(exclusiveArm).not.toMatch(/coarseCompositionRestored\s*:\s*true/);
   });

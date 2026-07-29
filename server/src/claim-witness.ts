@@ -13,6 +13,8 @@ export const STRUCTURAL_HONESTY_CLAIM_IDS = [
   "provision-orchestrate.disarmed",
   "provision-exclusive-arm.exclusive-armed",
   "provision-exclusive-arm.coarse-composition-restored",
+  "provision-exclusive-arm.repair-release",
+  "provision-exclusive-arm.boot-release",
   "observe.source-state",
   "observe.candidate-census",
   "evidence-pack.inventory.empty-verified",
@@ -25,10 +27,15 @@ export type ClaimId = ClaimSiteId | StructuralHonestyClaimId;
  * A value produced inside a named observation boundary.
  *
  * The brand does not prove at runtime that the callback observed the world.
- * Its job is narrower: mint sites are named review markers, the structural
- * AST test rejects callbacks that cannot observe anything, and
- * {@link auditClaim} makes unwitnessed claim-bearing values unconstructible at
- * the audit boundary.
+ * Its job is narrower: mint sites are named review markers, the structural AST
+ * test rejects callbacks with no real operation call, and {@link auditClaim}
+ * makes unwitnessed claim-bearing values unconstructible at the audit boundary.
+ * A deliberately fabricated observation is still constructible by a determined
+ * author; the enforced boundary is `auditClaim`'s typed operation map.
+ *
+ * The cast ban is review friction, not a type-system proof. TypeScript casts
+ * can always be laundered by a determined author; the ban raises the review
+ * bar, and the typed audit map remains the boundary.
  */
 export type Observed<T> = T & { readonly [OBSERVED]: true };
 
@@ -87,7 +94,9 @@ export type AuditClaimSink = (
 
 export type ClaimAuditOperation =
   | "exclusive_egress_armed"
-  | "exclusive_egress_degraded_coarse_active";
+  | "exclusive_egress_degraded_coarse_active"
+  | "egress_gate_repair"
+  | "exclusive_egress_boot_release";
 
 type LooseDiagnostics = Record<string, unknown>;
 
@@ -106,12 +115,50 @@ export type ClaimAuditDetailsByOperation = {
     harness_disposition: string;
     cleanup_errors: string[];
   };
+  egress_gate_repair: Observed<
+    LooseDiagnostics & {
+      agent_uid: number;
+      generation_id: number;
+      override_used?: boolean;
+      repark_failed?: string;
+    }
+  >;
+  exclusive_egress_boot_release:
+    | Observed<
+        LooseDiagnostics & {
+          agent_uid: number;
+          outcome: "released";
+          generation_id: number;
+        }
+      >
+    | Observed<
+        LooseDiagnostics & {
+          agent_uid: number;
+          outcome: "released-repark-failed";
+          generation_id: number;
+          repark_failed: string;
+        }
+      >
+    | (LooseDiagnostics & {
+        agent_uid: number;
+        outcome: "parked";
+        reason: string;
+        hold_file_removed: boolean;
+        job_disabled: boolean;
+        cleanup_errors: string[];
+      })
+    | (LooseDiagnostics & {
+        agent_uid: number;
+        outcome: "park-not-verified";
+        reason: string;
+      });
 };
 
 /**
  * Typed audit chokepoint for records that carry structural-honesty claims.
- * Diagnostic fields may remain loose, but fields that assert a claim must be
- * routed through an `Observed<T>` or `VerifiedEmpty` witness in this map.
+ * Diagnostic fields may remain loose, but fields or detail objects that assert
+ * a claim must be routed through an `Observed<T>` or `VerifiedEmpty` witness in
+ * this map.
  */
 export function auditClaim<const Op extends ClaimAuditOperation>(
   operation: Op,
