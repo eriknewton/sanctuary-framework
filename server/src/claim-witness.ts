@@ -14,6 +14,7 @@ export const STRUCTURAL_HONESTY_CLAIM_IDS = [
   "provision-exclusive-arm.exclusive-armed",
   "provision-exclusive-arm.coarse-composition-restored",
   "provision-exclusive-arm.repair-release",
+  "provision-exclusive-arm.quarantine-repair",
   "provision-exclusive-arm.boot-release",
   "observe.source-state",
   "observe.candidate-census",
@@ -39,13 +40,34 @@ export type ClaimId = ClaimSiteId | StructuralHonestyClaimId;
  */
 export type Observed<T> = T & { readonly [OBSERVED]: true };
 
+type ObservedFields<T, K extends PropertyKey> =
+  T extends object
+    ? Omit<T, Extract<keyof T, K>> & {
+        readonly [P in Extract<keyof T, K> as undefined extends T[P] ? never : P]: Observed<T[P]>;
+      } & {
+        readonly [P in Extract<keyof T, K> as undefined extends T[P] ? P : never]?:
+          Observed<Exclude<T[P], undefined>>;
+      }
+    : Observed<T>;
+
 /** The only constructor for `Observed<T>` values. */
 export async function observing<T>(
   label: ClaimId,
   op: () => T | Promise<T>,
-): Promise<Observed<Awaited<T>>> {
+): Promise<Observed<Awaited<T>>>;
+export async function observing<T, const K extends readonly PropertyKey[]>(
+  label: ClaimId,
+  op: () => T | Promise<T>,
+  fields: K,
+): Promise<ObservedFields<Awaited<T>, K[number]>>;
+export async function observing<T>(
+  label: ClaimId,
+  op: () => T | Promise<T>,
+  fields?: readonly PropertyKey[],
+): Promise<Observed<Awaited<T>> | ObservedFields<Awaited<T>, PropertyKey>> {
   void label;
-  return (await op()) as Observed<Awaited<T>>;
+  void fields;
+  return (await op()) as Observed<Awaited<T>> | ObservedFields<Awaited<T>, PropertyKey>;
 }
 
 export type SourceReadOutcome =
@@ -96,16 +118,35 @@ export type ClaimAuditOperation =
   | "exclusive_egress_armed"
   | "exclusive_egress_degraded_coarse_active"
   | "egress_gate_repair"
+  | "egress_gate_repair_quarantine"
   | "exclusive_egress_boot_release";
 
 type LooseDiagnostics = Record<string, unknown>;
+
+type QuarantineAuditFinding = {
+  index: number;
+  reason: string;
+  agent_uid: number | null;
+  disposition: "tombstoned" | "removed";
+  duplicate?: {
+    kept_generation_id: number | null;
+    removed_generation_id: number | null;
+  };
+};
+
+type GenerationFloorRepairAudit = {
+  raw: unknown;
+  parsed: number | null;
+  resolved_floor: number | null;
+  unrecoverable: boolean;
+};
 
 export type ClaimAuditDetailsByOperation = {
   exclusive_egress_armed: LooseDiagnostics & {
     agent_uid: number;
     generation_id: Observed<number>;
     gate_port: number;
-    repark_failed?: string;
+    repark_failed?: Observed<string>;
   };
   exclusive_egress_degraded_coarse_active: LooseDiagnostics & {
     agent_uid: number;
@@ -123,29 +164,33 @@ export type ClaimAuditDetailsByOperation = {
       repark_failed?: string;
     }
   >;
+  egress_gate_repair_quarantine: LooseDiagnostics & {
+    agent_uid: number;
+    forensic_path: Observed<string | null>;
+    quarantined: Observed<QuarantineAuditFinding[]>;
+    generation_floor_repair?: Observed<GenerationFloorRepairAudit>;
+  };
   exclusive_egress_boot_release:
-    | Observed<
-        LooseDiagnostics & {
-          agent_uid: number;
-          outcome: "released";
-          generation_id: number;
-        }
-      >
-    | Observed<
-        LooseDiagnostics & {
-          agent_uid: number;
-          outcome: "released-repark-failed";
-          generation_id: number;
-          repark_failed: string;
-        }
-      >
+    | (LooseDiagnostics & {
+        agent_uid: number;
+        outcome: "released";
+        generation_id: Observed<number>;
+      })
+    | (LooseDiagnostics & {
+        agent_uid: number;
+        outcome: "released-repark-failed";
+        generation_id: Observed<number>;
+        repark_failed: Observed<string>;
+      })
     | (LooseDiagnostics & {
         agent_uid: number;
         outcome: "parked";
         reason: string;
-        hold_file_removed: boolean;
-        job_disabled: boolean;
-        cleanup_errors: string[];
+        hold_file_removed: Observed<boolean>;
+        job_disabled: Observed<boolean>;
+        cleanup_errors: Observed<string[]>;
+        harness_run_state: Observed<string>;
+        harness_run_state_basis: Observed<string>;
       })
     | (LooseDiagnostics & {
         agent_uid: number;
