@@ -32,12 +32,16 @@ export interface BindWithRetryOptions {
 }
 
 /**
- * Pick a port uniformly at random in the 10000-59999 range. The range is
- * the same one the legacy in-test randomPort() helpers used so the
- * collision profile of the test fleet is unchanged.
+ * Pick a port uniformly at random in the 10000-59999 range. Exclude ports
+ * Node's Fetch rejects as unsafe before the request reaches the local test
+ * server; in this range the practical offender is 10080.
  */
 export function randomTestPort(): number {
-  return 10000 + Math.floor(Math.random() * 50000);
+  let port = 10000 + Math.floor(Math.random() * 50000);
+  while (port === 10080) {
+    port = 10000 + Math.floor(Math.random() * 50000);
+  }
+  return port;
 }
 
 /**

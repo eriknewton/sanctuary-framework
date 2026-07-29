@@ -740,14 +740,16 @@ async function runStandaloneDashboard(args: string[]): Promise<void> {
   // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.error(`\nSanctuary Dashboard running (standalone mode). Press Ctrl+C to stop.\n`);
 
-  // Graceful shutdown
-  const shutdown = () => {
-    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
-    console.error("\nShutting down Sanctuary Dashboard...");
-    process.exit(0);
-  };
-  process.on("SIGINT", shutdown);
-  process.on("SIGTERM", shutdown);
+  // Graceful shutdown: `startStandaloneDashboard` (dashboard-standalone.ts)
+  // already installed its own SIGINT/SIGTERM listeners before returning
+  // (`registerStandaloneProcessCleanup` -> `handleStandaloneShutdownSignal`),
+  // which awaits every registered cleanup (tenant-runtime unlink, distress
+  // listener stop, baseline save) and then exits with 128+signal. Registering
+  // a second, synchronous listener here raced it: Node invokes listeners in
+  // registration order, so this handler's synchronous `process.exit(0)` ran
+  // on the same tick as the async handler's first `await`, killing the
+  // process before any cleanup completed and before the async handler's own
+  // exit code was ever reached. Do not add a second listener here.
 }
 
 async function runExportPassphrase(args: string[]): Promise<void> {

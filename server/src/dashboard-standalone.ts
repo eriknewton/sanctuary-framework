@@ -94,24 +94,119 @@ import {
   createStandaloneJoinApprover,
 } from "./mesh/lifecycle/index.js";
 
-type StandaloneProcessCleanup = () => void;
+type StandaloneProcessCleanup = () => void | Promise<void>;
 
 const standaloneSignalCleanups = new Set<StandaloneProcessCleanup>();
 const standaloneExitCleanups = new Set<StandaloneProcessCleanup>();
 let standaloneProcessListenersInstalled = false;
 
-function runStandaloneSignalCleanups(): void {
-  const cleanups = [...standaloneSignalCleanups];
-  standaloneSignalCleanups.clear();
+// FIX (N1-1 corrected, 2026-07-27): same defect as server/src/wrap/cli.ts --
+// every registered cleanup here starts an async operation (tenant-runtime
+// unlink, distress-listener stop, baseline save) without awaiting it, so the
+// synchronous `process.exit()` right after abandoned each one past its
+// first `await`. Await every cleanup to completion (via `Promise.allSettled`
+// so one failing cleanup cannot block the others) before returning.
+async function runStandaloneSignalCleanups(): Promise<void> {
   standaloneExitCleanups.clear();
-  for (const cleanup of cleanups) cleanup();
+  while (standaloneSignalCleanups.size > 0) {
+    const cleanups = [...standaloneSignalCleanups];
+    standaloneSignalCleanups.clear();
+    await Promise.allSettled(cleanups.map(async (cleanup) => {
+      await cleanup();
+    }));
+  }
 }
 
 function runStandaloneExitCleanups(): void {
   const cleanups = [...standaloneExitCleanups];
   standaloneSignalCleanups.clear();
   standaloneExitCleanups.clear();
-  for (const cleanup of cleanups) cleanup();
+  // Node's `exit` event cannot await async work (the event loop stops
+  // processing microtasks once shutdown begins), so this fires each
+  // cleanup and intentionally does not wait for it -- same limitation the
+  // doc comment above `handleStandaloneShutdownSignal` describes. The
+  // SIGINT/SIGTERM path (`runStandaloneSignalCleanups`, above) is the one
+  // that actually awaits.
+  for (const cleanup of cleanups) void cleanup();
+}
+
+// FIX (N1-1, 2026-07-26): same defect as server/src/wrap/cli.ts -- a
+// SIGINT/SIGTERM handler that only runs cleanups suppresses Node's default
+// "exit on signal" behavior, so the standalone dashboard survived a plain
+// `kill` and required `kill -9`. Exit explicitly with 128+signal after
+// cleanups complete. The `exit` listener stays cleanup-only (calling
+// `process.exit()` during the `exit` event has no effect).
+const STANDALONE_SIGNAL_EXIT_CODE: Partial<Record<NodeJS.Signals, number>> = {
+  SIGINT: 128 + 2,
+  SIGTERM: 128 + 15,
+};
+
+// FIX (N1-1 second-signal, 2026-07-27): same defect as the matching latch in
+// server/src/wrap/cli.ts -- `process.on` (not `once`) lets a repeat
+// SIGINT/SIGTERM re-enter this handler while the first call is still
+// mid-await on `runStandaloneSignalCleanups()`. Without a latch the second
+// call sees the cleanup sets already drained and exits immediately,
+// abandoning the first call's in-flight cleanups. Join the same in-flight
+// run instead of starting a second, empty one.
+let standaloneShutdownInFlight: Promise<void> | undefined;
+let standaloneShutdownRepeatSignalCount = 0;
+let standaloneShutdownRequestedSignal: NodeJS.Signals | undefined;
+let standaloneShutdownExitIssued = false;
+const STANDALONE_SHUTDOWN_REPEAT_SIGNAL_GRACE_MS = 1_000;
+
+function waitForStandaloneShutdownGrace(
+  promise: Promise<void>,
+  ms: number,
+): Promise<"settled" | "timeout"> {
+  return new Promise((resolve) => {
+    const timeout = setTimeout(() => resolve("timeout"), ms);
+    void promise.finally(() => {
+      clearTimeout(timeout);
+      resolve("settled");
+    });
+  });
+}
+
+/** Exported for the seam: unit-test the exit code without sending real signals. */
+export async function handleStandaloneShutdownSignal(
+  signal: NodeJS.Signals,
+): Promise<void> {
+  if (standaloneShutdownExitIssued) return;
+  standaloneShutdownRequestedSignal ??= signal;
+  if (standaloneShutdownInFlight) {
+    standaloneShutdownRepeatSignalCount += 1;
+    const exitCode = STANDALONE_SIGNAL_EXIT_CODE[standaloneShutdownRequestedSignal] ?? 128;
+    const result =
+      standaloneShutdownRepeatSignalCount >= 2
+        ? "timeout"
+        : await waitForStandaloneShutdownGrace(
+            standaloneShutdownInFlight,
+            STANDALONE_SHUTDOWN_REPEAT_SIGNAL_GRACE_MS,
+          );
+    if (result === "timeout" && !standaloneShutdownExitIssued) {
+      standaloneShutdownExitIssued = true;
+      process.exit(exitCode);
+    }
+    return;
+  }
+  standaloneShutdownInFlight = runStandaloneSignalCleanups();
+  try {
+    await standaloneShutdownInFlight;
+  } finally {
+    standaloneShutdownInFlight = undefined;
+    standaloneShutdownRepeatSignalCount = 0;
+  }
+  if (standaloneShutdownExitIssued) return;
+  standaloneShutdownExitIssued = true;
+  process.exit(STANDALONE_SIGNAL_EXIT_CODE[signal] ?? 128);
+}
+
+function installStandaloneProcessListeners(): void {
+  if (standaloneProcessListenersInstalled) return;
+  standaloneProcessListenersInstalled = true;
+  process.on("SIGINT", handleStandaloneShutdownSignal);
+  process.on("SIGTERM", handleStandaloneShutdownSignal);
+  process.on("exit", runStandaloneExitCleanups);
 }
 
 function registerStandaloneProcessCleanup(
@@ -122,12 +217,34 @@ function registerStandaloneProcessCleanup(
   if (options.runOnExit === true) {
     standaloneExitCleanups.add(cleanup);
   }
-  if (!standaloneProcessListenersInstalled) {
-    standaloneProcessListenersInstalled = true;
-    process.on("SIGINT", runStandaloneSignalCleanups);
-    process.on("SIGTERM", runStandaloneSignalCleanups);
-    process.on("exit", runStandaloneExitCleanups);
-  }
+  installStandaloneProcessListeners();
+}
+
+export function __registerStandaloneProcessCleanupForTest(
+  cleanup: StandaloneProcessCleanup,
+  options: { runOnExit?: boolean } = {},
+): void {
+  assertStandaloneTestHookAllowed("__registerStandaloneProcessCleanupForTest");
+  registerStandaloneProcessCleanup(cleanup, options);
+}
+
+export function __resetStandaloneShutdownStateForTest(): void {
+  assertStandaloneTestHookAllowed("__resetStandaloneShutdownStateForTest");
+  standaloneSignalCleanups.clear();
+  standaloneExitCleanups.clear();
+  standaloneShutdownInFlight = undefined;
+  standaloneShutdownRepeatSignalCount = 0;
+  standaloneShutdownRequestedSignal = undefined;
+  standaloneShutdownExitIssued = false;
+  process.removeListener("SIGINT", handleStandaloneShutdownSignal);
+  process.removeListener("SIGTERM", handleStandaloneShutdownSignal);
+  process.removeListener("exit", runStandaloneExitCleanups);
+  standaloneProcessListenersInstalled = false;
+}
+
+function assertStandaloneTestHookAllowed(name: string): void {
+  if (process.env.NODE_ENV === "test" || process.env.VITEST !== undefined) return;
+  throw new Error(`${name} is test-only and is disabled outside the test runner.`);
 }
 
 export interface StandaloneDashboardOptions {
@@ -284,6 +401,8 @@ export function renderTenantDiscoveryHint(tenants: TenantDescriptor[]): string {
 export async function startStandaloneDashboard(
   options: StandaloneDashboardOptions = {}
 ): Promise<DashboardApprovalChannel> {
+  installStandaloneProcessListeners();
+
   // Force dashboard enabled for this mode
   process.env.SANCTUARY_DASHBOARD_ENABLED = "true";
 
@@ -1273,9 +1392,17 @@ async function wireUnlockedDeps(args: {
     distressListener = undefined;
   }
 
-  const clearRuntime = () => {
-    clearTenantRuntime(config.storage_path).catch(() => {});
-    distressListener?.stop().catch(() => {});
+  const clearRuntime = async () => {
+    try {
+      await clearTenantRuntime(config.storage_path);
+    } catch {
+      /* best-effort: a shutdown cleanup must not throw out of the signal handler */
+    }
+    try {
+      await distressListener?.stop();
+    } catch {
+      /* best-effort: a shutdown cleanup must not throw out of the signal handler */
+    }
   };
   registerStandaloneProcessCleanup(clearRuntime, { runOnExit: true });
 
@@ -1341,8 +1468,12 @@ async function wireUnlockedDeps(args: {
   }
 
   // 12. Save baseline on exit
-  const saveBaseline = () => {
-    baseline.save().catch(() => {});
+  const saveBaseline = async () => {
+    try {
+      await baseline.save();
+    } catch {
+      /* best-effort: a shutdown cleanup must not throw out of the signal handler */
+    }
   };
   registerStandaloneProcessCleanup(saveBaseline);
 }

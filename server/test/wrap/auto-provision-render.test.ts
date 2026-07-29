@@ -9,7 +9,11 @@
  */
 
 import { describe, it, expect, vi } from "vitest";
-import { renderAutoProvisionOutcomeLines } from "../../src/wrap/cli.js";
+import {
+  autoProvisionCeilingFromSummary,
+  renderAutoProvisionOutcome,
+  renderAutoProvisionOutcomeLines,
+} from "../../src/wrap/cli.js";
 import {
   describeNoAccountResidueTeardown,
   describeStandDownAgentForCli,
@@ -35,6 +39,22 @@ describe("wrap/cli renderAutoProvisionOutcomeLines", () => {
   it("not-ran or no-outcome -> no lines", () => {
     expect(lines({ ran: false })).toEqual([]);
     expect(lines({ ran: true })).toEqual([]);
+  });
+
+  it("R8: guarded printer reports an unrenderable outcome instead of throwing past wrap success", () => {
+    // Fails with the R8 fix reverted: the `never` default throw from
+    // renderAutoProvisionOutcomeLines propagates out of the printer.
+    const printed: string[] = [];
+    expect(() =>
+      renderAutoProvisionOutcome(
+        {
+          ran: true,
+          outcome: { kind: "future-outcome", reason: "new branch" } as unknown as AutoProvisionSummary["outcome"],
+        },
+        (line) => printed.push(line),
+      ),
+    ).not.toThrow();
+    expect(printed.join("\n")).toMatch(/could not display/i);
   });
 
   it("armed -> a single quiet confirmation with the uid", () => {
@@ -112,6 +132,41 @@ describe("wrap/cli renderAutoProvisionOutcomeLines", () => {
     });
     expect(out[0]).toMatch(/^ {2}WARNING: Castle Wall is ARMED/);
     expect(out[0]).toMatch(/sudo sanctuary castle-wall disable/);
+  });
+
+  it("R1: save-accepted-but-inconclusive disarm contributes an unknown CEILING, never an uncapped protected claim", () => {
+    // Fails with the disarm-ceiling guard reverted: `save_accepted_inconclusive`
+    // carries neither disarmObservedOff nor wallMayBeArmed, so the ceiling
+    // would be undefined and a later green probe could pass through.
+    const claim = autoProvisionCeilingFromSummary({
+      ran: true,
+      outcome: {
+        kind: "aborted",
+        stage: "arm",
+        reason: "disable save accepted but status reread was inconclusive",
+        rolledBack: true,
+        disarmOutcome: "save_accepted_inconclusive",
+      },
+    });
+    expect(claim?.state).toBe("unknown");
+    expect(claim?.basis).toBe("provision_outcome_not_observation");
+  });
+
+  it("safe-direction: aborted wallMayBeArmed now contributes an unknown CEILING", () => {
+    // Fails if the safe-direction R3 change is reverted: the aborted kind would
+    // be uncapped and could print protected over an inconclusive arm-abort.
+    const claim = autoProvisionCeilingFromSummary({
+      ran: true,
+      outcome: {
+        kind: "aborted",
+        stage: "arm",
+        reason: "arm returned nonzero after enabling the host app preference",
+        rolledBack: true,
+        wallMayBeArmed: true,
+      },
+    });
+    expect(claim?.state).toBe("unknown");
+    expect(claim?.basis).toBe("provision_outcome_not_observation");
   });
 
   it("aborted rolledBack:true (no daemon issue) -> soft Note frame with retry", () => {

@@ -29,6 +29,7 @@
 import { platform as osPlatform } from "node:os";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { unlinkSync } from "node:fs";
 import {
   mkdir,
   rename,
@@ -954,6 +955,11 @@ export interface RunAutoProvisionForWrapOptions {
   print?: (line: string) => void;
   /** Stop the wrap-started transient Castle Wall daemon before installing the persistent boot service. */
   stopTransientCastleWallDaemon?: () => Promise<void>;
+  /**
+   * Called immediately before the provisioning orchestrator's first privileged
+   * write. Returning false aborts before account/re-home/Castle Wall mutation.
+   */
+  beforeFirstMutation?: () => boolean | Promise<boolean>;
   /** Override for `process.getuid` (tests only; production leaves this undefined). */
   getuid?: () => number;
   /** Override for the resolved operator identity (tests only; production leaves this undefined and resolves via SUDO_UID/GID/USER). */
@@ -1268,6 +1274,7 @@ export async function runAutoProvisionForWrap(
   const ops: ProvisionFlowOps = {
     confirm: (promptText) => confirmOnTty(promptText),
     print,
+    beforeFirstMutation: options.beforeFirstMutation,
     createAccount: async () => {
       const { planAndCreateAccount } = await import("../castle-wall/provision/account.js");
       // FIX F7: bind the account's home to the re-home target at create
@@ -2877,18 +2884,57 @@ function realParkedInstallRevertOps(daemonOps: HarnessDaemonOps): ParkedInstallR
   };
 }
 
+// FIX (N1-4, harden-loop): `handleProcessShutdownSignal` (wrap/cli.ts) now
+// calls `process.exit()` once its REGISTERED shutdown cleanups finish, but
+// nothing registers a cleanup that releases the provision lock -- and
+// `withProvisionLock`'s `finally` release (lockfile.ts) never runs because
+// `process.exit()` unwinds past it, not through it. A SIGINT/SIGTERM during
+// provisioning (account create, secret re-home, pf arm, release-barrier
+// sequence -- all mid-flow, all awaiting) therefore stranded
+// `/var/run/sanctuary-provision.lock` permanently: every subsequent
+// `protect --exclusive-egress`, `--repair-egress-gate`, and
+// `--unprotect-egress-gate` (which takes the SAME lock via
+// `withUnprotectLock` -> `withProvisionLock`) throws `ProvisionLockHeldError`
+// until an operator manually deletes the file or reboots -- removing the
+// product's own recovery verb after a half-armed exclusive gate. Node's
+// `exit` event fires synchronously even when `process.exit()` is called
+// mid-flight (no async work survives it, matching the same limitation the
+// standalone-dashboard exit-cleanup fallback documents), so a plain
+// `unlinkSync` registered here closes the gap without any new async
+// cleanup-registration plumbing (which would need to reach across from this
+// module into wrap/cli.ts's shutdown-cleanup registry and risk a circular
+// import: cli.ts already imports FROM this module).
 function realLockOps() {
+  let heldLockPath: string | undefined;
+  let exitFallbackInstalled = false;
+
+  function installExitFallback(): void {
+    if (exitFallbackInstalled) return;
+    exitFallbackInstalled = true;
+    process.on("exit", () => {
+      if (heldLockPath === undefined) return;
+      try {
+        unlinkSync(heldLockPath);
+      } catch {
+        /* best-effort: an exit-time fallback must not throw past `exit` */
+      }
+    });
+  }
+
   return {
     acquire: async (lockPath: string): Promise<void> => {
       const { open } = await import("node:fs/promises");
       const handle = await open(lockPath, "wx");
       await handle.close();
+      heldLockPath = lockPath;
+      installExitFallback();
     },
     release: async (lockPath: string): Promise<void> => {
       const { unlink } = await import("node:fs/promises");
       await unlink(lockPath).catch((err) => {
         if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
       });
+      if (heldLockPath === lockPath) heldLockPath = undefined;
     },
   };
 }
@@ -3086,7 +3132,8 @@ export async function runEgressGateRepairUnderProvisionLock(
       // plus the lock error message (a lock-path only, no secrets).
       print(
         `Repair refused: another 'sanctuary protect' provisioning run is already in progress ` +
-          `(${(err as Error).message}); this run made NO changes. Wait for it to finish, then re-run.`,
+          `(${(err as Error).message}); this run made NO changes. If a protect process is actually running, wait for it to finish; ` +
+          `if not, remove the stale lock file named above and re-run.`,
       );
       return { locked: false };
     }
@@ -3113,6 +3160,7 @@ export async function runEgressGateRepairForCli(options: {
   cliBinary?: string;
   getuid?: () => number;
   resolveOperatorIdentity?: () => Promise<OperatorIdentity | undefined>;
+  beforeFirstMutation?: () => boolean | Promise<boolean>;
 }): Promise<number> {
   // SAFETY: stderr is the operator-facing CLI channel for this subcommand;
   // this is only the default when no `print` override is supplied (the CLI
@@ -3188,6 +3236,10 @@ export async function runEgressGateRepairForCli(options: {
   // unprotect (`withUnprotectLock`) paths take, so arm, repair, and unprotect
   // are genuinely mutually exclusive. See {@link runEgressGateRepairUnderProvisionLock}
   // for the rationale and the no-self-deadlock argument.
+  if (options.beforeFirstMutation !== undefined && !(await options.beforeFirstMutation())) {
+    print("Repair did not start because shutdown is already in flight; no exclusive-egress changes were made.");
+    return 2;
+  }
   const locked = await runEgressGateRepairUnderProvisionLock(
     () =>
       runEgressGateRepair(
@@ -3332,6 +3384,7 @@ export async function runEgressGateUnprotectForCli(options: {
   standDownAgent?: boolean;
   getuid?: () => number;
   resolveOperatorIdentity?: () => Promise<OperatorIdentity | undefined>;
+  beforeFirstMutation?: () => boolean | Promise<boolean>;
 }): Promise<number> {
   // SAFETY: stderr is the operator-facing CLI channel for this subcommand;
   // this is only the default when no `print` override is supplied (the CLI
@@ -3363,6 +3416,10 @@ export async function runEgressGateUnprotectForCli(options: {
   const accountOps = realAccountProvisionOps();
   const agentUid = await accountOps.lookupAccountUid(accountName);
   if (agentUid === undefined || agentUid === null) {
+    if (options.beforeFirstMutation !== undefined && !(await options.beforeFirstMutation())) {
+      print("Unprotect did not start because shutdown is already in flight; no exclusive-egress changes were made.");
+      return 2;
+    }
     // FIX F3 (adversarial review, 2026-07-26): "nothing to unprotect" was FALSE
     // whenever the account went away while the fortress kept its
     // exclusive-routing files (a drill teardown, a restored fortress, an
@@ -3436,6 +3493,10 @@ export async function runEgressGateUnprotectForCli(options: {
     accountOps,
     ...(options.cliBinary !== undefined ? { cliBinary: options.cliBinary } : {}),
   });
+  if (options.beforeFirstMutation !== undefined && !(await options.beforeFirstMutation())) {
+    print("Unprotect did not start because shutdown is already in flight; no exclusive-egress changes were made.");
+    return 2;
+  }
   const outcome = await runEgressGateUnprotect(
     { agentUid },
     withExplicitStandDownAgent(createUnprotectExclusiveEgressOps(wiring), print, "--unprotect-egress-gate"),

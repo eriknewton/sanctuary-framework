@@ -308,6 +308,21 @@ describe("castle-wall/provision/orchestrate", () => {
     expect(ops.createAccount).not.toHaveBeenCalled();
   });
 
+  it("opens the shutdown-protected mutation window only after confirm accepts, and before account creation", async () => {
+    const ops = happyPathOps({
+      confirm: vi.fn(async () => true),
+      beforeFirstMutation: vi.fn(async () => true),
+    });
+
+    await runProvisionFlow(baseCtx(), ops);
+
+    const confirmOrder = (ops.confirm as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0]!;
+    const windowOrder = (ops.beforeFirstMutation as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0]!;
+    const createOrder = (ops.createAccount as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0]!;
+    expect(confirmOrder).toBeLessThan(windowOrder);
+    expect(windowOrder).toBeLessThan(createOrder);
+  });
+
   it("fail-closed: account creation failure aborts before re-home, no rollback needed (nothing moved yet)", async () => {
     const ops = happyPathOps({
       createAccount: vi.fn(async () => {
@@ -1297,6 +1312,25 @@ describe("castle-wall/provision/orchestrate", () => {
       expect(Math.min(...printCalls)).toBeLessThan(orderConfirm);
     });
 
+    it("the shutdown/mutation window opens only AFTER the Tier-1 confirm completes", async () => {
+      const ops = happyPathOps({
+        confirm: vi.fn(async () => true),
+        beforeFirstMutation: vi.fn(async () => false),
+      });
+      const result = await runProvisionFlow(baseCtx(), ops);
+
+      expect(result).toMatchObject({
+        kind: "aborted",
+        stage: "shutdown-in-flight",
+      });
+      const orderConfirm = (ops.confirm as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0]!;
+      const orderBeforeMutation = (ops.beforeFirstMutation as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0]!;
+      expect(orderConfirm).toBeLessThan(orderBeforeMutation);
+      expect(ops.createAccount).not.toHaveBeenCalled();
+      expect(ops.rehome).not.toHaveBeenCalled();
+      expect(ops.arm).not.toHaveBeenCalled();
+    });
+
     it("armed-then-rolled-back (post-arm DNS/credential re-check failure) also scrubs the provisioned rules", async () => {
       const ops = happyPathOps({
         postArmEndpoints: vi.fn(() => [{ name: "LLM", probe: async () => false }]),
@@ -1398,6 +1432,9 @@ describe("castle-wall/provision/orchestrate", () => {
         runReleaseSequence: vi.fn(async () => ({ kind: "released" as const, generation_id: COMMITTED.generation_id })),
         restoreCoarseComposition: vi.fn(async () => undefined),
         startHarnessCoarse: vi.fn(async () => undefined),
+        assessHarnessParked: vi.fn(async () => assessHarnessParked({
+          probe: { harnessStatus: async () => PARKED_STATUS, sleepMs: async () => undefined },
+        })),
         audit: vi.fn(async () => undefined),
         print: vi.fn(),
       };
@@ -2041,6 +2078,9 @@ describe("castle-wall/provision/orchestrate", () => {
         runReleaseSequence: vi.fn(async () => ({ kind: "released" as const, generation_id: COMMITTED.generation_id })),
         restoreCoarseComposition: vi.fn(async () => undefined),
         startHarnessCoarse: vi.fn(async () => undefined),
+        assessHarnessParked: vi.fn(async () => assessHarnessParked({
+          probe: { harnessStatus: async () => PARKED_STATUS, sleepMs: async () => undefined },
+        })),
         audit: vi.fn(async () => undefined),
         print: vi.fn(),
       };
@@ -2109,6 +2149,9 @@ describe("castle-wall/provision/orchestrate", () => {
       const postArmResult = await runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), postArm);
       expect(postArmResult.kind).toBe("armed-then-rolled-back");
       expect(postArm.restoreStoodDownHarness).toHaveBeenCalledTimes(1);
+      // Fails with the R2 exhaustive record reverted: this sibling return kind
+      // restored the harness but omitted the re-home-still-dedicated warning.
+      expect(String((postArmResult as { reason: string }).reason)).toMatch(/re-home was deliberately NOT reversed/i);
 
       const asUid = stoodDownOps({
         verifyAgentEgressAfterArm: vi.fn(async () => ({
@@ -2119,6 +2162,9 @@ describe("castle-wall/provision/orchestrate", () => {
       const asUidResult = await runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), asUid);
       expect(asUidResult.kind).toBe("egress-unprovisioned-rolled-back");
       expect(asUid.restoreStoodDownHarness).toHaveBeenCalledTimes(1);
+      // Fails with the R2 exhaustive record reverted for the second sibling
+      // rollback outcome that bypasses `teardownDaemonAndRestore`.
+      expect(String((asUidResult as { reason: string }).reason)).toMatch(/not a return to your previous state/i);
     });
 
     it("restores the agent when the barrier assertion rejects a non-parked install", async () => {

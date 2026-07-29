@@ -23,6 +23,7 @@ describe("template-list tarball (Finding HHH)", () => {
     const tarballName = execSync("npm pack --pack-destination " + tmpDir, {
       cwd: serverDir,
       encoding: "utf-8",
+      env: { ...process.env, npm_config_cache: join(tmpDir, ".npm-cache") },
     }).trim();
 
     // Extract

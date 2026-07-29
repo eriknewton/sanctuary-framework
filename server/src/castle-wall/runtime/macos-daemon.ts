@@ -106,12 +106,23 @@ export interface DaemonSigner {
   signNonce(nonce: Uint8Array): Promise<Uint8Array>;
 }
 
-export function formatCastleWallAlreadyRunningMessage(pid?: number | null): string {
+export function formatCastleWallAlreadyRunningMessage(
+  pid?: number | null,
+  socketHolder?: string,
+): string {
   const pidText =
     typeof pid === "number" && Number.isSafeInteger(pid) && pid > 0
       ? `PID ${pid}`
       : "pid unavailable";
-  return `Castle Wall daemon already running for this fortress (${pidText}). Multi-wrap-per-fortress is Phase 3.`;
+  const holderText =
+    socketHolder !== undefined && socketHolder.length > 0
+      ? `; socket holder: ${socketHolder}`
+      : "";
+  return (
+    `Castle Wall daemon already running for this fortress (${pidText}${holderText}). ` +
+    "Multi-wrap-per-fortress is Phase 3. Stop the holding sanctuary protect/Castle Wall process, " +
+    "or run 'sudo sanctuary castle-wall disable' if it is the boot wall, then retry."
+  );
 }
 
 /**
@@ -2107,7 +2118,9 @@ async function assertSocketNotOwnedByLiveProcess(socketPath: string): Promise<vo
   }
 
   if (await socketHasLiveListener(socketPath)) {
-    throw new Error(formatCastleWallAlreadyRunningMessage());
+    throw new Error(
+      formatCastleWallAlreadyRunningMessage(undefined, await describeSocketHolder(socketPath)),
+    );
   }
 
   await unlink(socketPath).catch((err: unknown) => {
@@ -2116,6 +2129,36 @@ async function assertSocketNotOwnedByLiveProcess(socketPath: string): Promise<vo
       : undefined;
     if (code !== "ENOENT") throw err;
   });
+}
+
+async function describeSocketHolder(socketPath: string): Promise<string | undefined> {
+  const lsofPath = process.platform === "darwin" ? "/usr/sbin/lsof" : "lsof";
+  try {
+    const { stdout } = await execFileAsync(lsofPath, ["-nP", "-F", "pc", "--", socketPath], {
+      timeout: 1000,
+    });
+    const holders: string[] = [];
+    let pid: string | undefined;
+    let command: string | undefined;
+    const flush = (): void => {
+      if (pid === undefined && command === undefined) return;
+      holders.push(`${command ?? "process"}${pid !== undefined ? ` pid ${pid}` : ""}`);
+      pid = undefined;
+      command = undefined;
+    };
+    for (const line of stdout.split(/\r?\n/)) {
+      if (line.startsWith("p")) {
+        flush();
+        pid = line.slice(1);
+      } else if (line.startsWith("c")) {
+        command = line.slice(1);
+      }
+    }
+    flush();
+    return holders.length > 0 ? holders.join(", ") : undefined;
+  } catch {
+    return "live listener accepted a connection, but lsof could not identify its pid/process";
+  }
 }
 
 /**

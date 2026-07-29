@@ -1345,7 +1345,7 @@ describe("Castle Wall macOS daemon integration", () => {
           activeConfigPath: configPath,
           listenerFactory: fakeListenerFactory,
         }),
-      ).rejects.toThrow(formatCastleWallAlreadyRunningMessage());
+      ).rejects.toThrow(/Castle Wall daemon already running for this fortress/);
     } finally {
       await new Promise<void>((resolve) => liveServer.close(() => resolve()));
     }

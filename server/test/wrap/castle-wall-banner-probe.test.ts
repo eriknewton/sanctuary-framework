@@ -1417,4 +1417,5 @@ describe("Castle Wall wrap-banner evidence probes", () => {
     expect(reparkFailed.basis).toBe("exclusive_egress_repark_failed");
     expect(protectionStateAdvice(reparkFailed).castleWallLabel).not.toContain("Castle Wall Full");
   });
+
 });

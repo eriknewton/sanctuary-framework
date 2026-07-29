@@ -1964,7 +1964,7 @@ export const CLAIM_LITERAL_COUNTS: Readonly<Record<string, number>> = {
   // pid-liveness probe result for the lock-holder description; not a
   // protection claim.
   [`${CW}/lockfile.ts`]: 1,
-  [`${CW}/orchestrate.ts`]: 10,
+  [`${CW}/orchestrate.ts`]: 11,
   [`${CW}/policy-daemon.ts`]: 0,
   [`${CW}/rehome.ts`]: 0,
   [`${CW}/uid-gate.ts`]: 2,
