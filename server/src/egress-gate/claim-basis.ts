@@ -2034,9 +2034,23 @@ export const CLAIM_LITERAL_FIELDS: readonly string[] = [
   "committed",
 ];
 
+function snakeCaseClaimField(field: string): string {
+  return field.replace(/[A-Z]/g, (letter) => `_${letter.toLowerCase()}`);
+}
+
+function claimLiteralFieldAlternation(): string {
+  return [...new Set(CLAIM_LITERAL_FIELDS.flatMap((field) => [field, snakeCaseClaimField(field)]))]
+    .sort((a, b) => b.length - a.length)
+    .join("|");
+}
+
 /** The regex the detector runs, built from {@link CLAIM_LITERAL_FIELDS}. */
 export function claimLiteralRegex(): RegExp {
-  return new RegExp(`\\b(${CLAIM_LITERAL_FIELDS.join("|")})\\s*[:=]\\s*true\\b|\\breturn true\\b`, "g");
+  const field = claimLiteralFieldAlternation();
+  return new RegExp(
+    `(^|[^A-Za-z0-9_$])(${field})\\s*[:=]\\s*true\\b|\\breturn\\s+true\\b`,
+    "g",
+  );
 }
 
 // ---------------------------------------------------------------------------

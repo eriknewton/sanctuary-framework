@@ -21,7 +21,15 @@ export const STRUCTURAL_HONESTY_CLAIM_IDS = [
 export type StructuralHonestyClaimId = typeof STRUCTURAL_HONESTY_CLAIM_IDS[number];
 export type ClaimId = ClaimSiteId | StructuralHonestyClaimId;
 
-/** A value produced inside a named observation boundary. */
+/**
+ * A value produced inside a named observation boundary.
+ *
+ * The brand does not prove at runtime that the callback observed the world.
+ * Its job is narrower: mint sites are named review markers, the structural
+ * AST test rejects callbacks that cannot observe anything, and
+ * {@link auditClaim} makes unwitnessed claim-bearing values unconstructible at
+ * the audit boundary.
+ */
 export type Observed<T> = T & { readonly [OBSERVED]: true };
 
 /** The only constructor for `Observed<T>` values. */
@@ -70,4 +78,44 @@ export function verifiedEmptyFrom(
 export function claimFromVerifiedEmpty<T>(witness: VerifiedEmpty, value: T): T {
   void witness;
   return value;
+}
+
+export type AuditClaimSink = (
+  operation: string,
+  details: Record<string, unknown>,
+) => Promise<void>;
+
+export type ClaimAuditOperation =
+  | "exclusive_egress_armed"
+  | "exclusive_egress_degraded_coarse_active";
+
+type LooseDiagnostics = Record<string, unknown>;
+
+export type ClaimAuditDetailsByOperation = {
+  exclusive_egress_armed: LooseDiagnostics & {
+    agent_uid: number;
+    generation_id: Observed<number>;
+    gate_port: number;
+    repark_failed?: string;
+  };
+  exclusive_egress_degraded_coarse_active: LooseDiagnostics & {
+    agent_uid: number;
+    stage: "bring-up" | "release";
+    reason: string;
+    coarse_composition_restored: Observed<boolean>;
+    harness_disposition: string;
+    cleanup_errors: string[];
+  };
+};
+
+/**
+ * Typed audit chokepoint for records that carry structural-honesty claims.
+ * Diagnostic fields may remain loose, but fields that assert a claim must be
+ * routed through an `Observed<T>` or `VerifiedEmpty` witness in this map.
+ */
+export function auditClaim<const Op extends ClaimAuditOperation>(
+  operation: Op,
+  details: ClaimAuditDetailsByOperation[Op],
+): readonly [operation: Op, details: ClaimAuditDetailsByOperation[Op]] {
+  return [operation, details];
 }

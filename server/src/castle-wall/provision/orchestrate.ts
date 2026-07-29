@@ -126,6 +126,13 @@ function observedTrue(value: Observed<boolean>): Observed<true> | undefined {
   return value === true ? value : undefined;
 }
 
+function armedUidFromVerifiedEgress(uid: number, report: AgentEgressVerifyReport): number {
+  if (!report.ok) {
+    throw new Error("cannot witness an armed uid from a failed post-arm egress report");
+  }
+  return uid;
+}
+
 /** The injected, side-effecting steps. Each corresponds to one stage of the target flow. */
 export interface ProvisionFlowOps {
   /** Ask the single "proceed? [y/N]" question. Only called when `isTty` is true. */
@@ -1931,7 +1938,10 @@ async function runProvisionFlowSteps(
   if (ctx.fineGrainedDeclared !== true) {
     return {
       kind: "armed",
-      uid: await observing("provision-orchestrate.armed", () => uid),
+      uid: await observing(
+        "provision-orchestrate.armed",
+        () => armedUidFromVerifiedEgress(uid, egressVerify),
+      ),
     };
   }
 

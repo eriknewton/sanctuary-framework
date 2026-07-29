@@ -45,7 +45,7 @@ import {
   EGRESS_GATE_STAND_DOWN_EFFECT,
   EGRESS_GATE_UNPROTECT_WITH_STAND_DOWN_COMMAND,
 } from "../../egress-gate/operator-advice.js";
-import { observing, type Observed } from "../../claim-witness.js";
+import { auditClaim, observing, type Observed } from "../../claim-witness.js";
 
 /** Distinct local audit operation strings (never a widened shared enum). */
 export const EXCLUSIVE_EGRESS_ARMED_AUDIT_OP = "exclusive_egress_armed";
@@ -68,6 +68,23 @@ export interface ExclusiveGenerationIdentity {
   generation_id: number;
   agent_uid: number;
   gate_port: number;
+}
+
+type ReleasedBarrierOutcome = Extract<
+  ReleaseBarrierOutcome,
+  { kind: "released" | "released-repark-failed" }
+>;
+
+function releasedGenerationId(
+  committed: ExclusiveGenerationIdentity,
+  release: ReleasedBarrierOutcome,
+): number {
+  if (release.generation_id !== committed.generation_id) {
+    throw new Error(
+      `release barrier generation ${release.generation_id} did not match committed generation ${committed.generation_id}`,
+    );
+  }
+  return release.generation_id;
 }
 
 /**
@@ -301,34 +318,36 @@ export async function runExclusiveEgressArming(
   }
 
   if (release.kind === "released") {
-    await ops.audit(EXCLUSIVE_EGRESS_ARMED_AUDIT_OP, {
+    const generationId = await observing(
+      "provision-exclusive-arm.exclusive-armed",
+      () => releasedGenerationId(committed, release),
+    );
+    await ops.audit(...auditClaim(EXCLUSIVE_EGRESS_ARMED_AUDIT_OP, {
       agent_uid: ctx.agentUid,
-      generation_id: committed.generation_id,
+      generation_id: generationId,
       gate_port: committed.gate_port,
-    });
+    }));
     return {
       kind: "exclusive-armed",
-      generationId: await observing(
-        "provision-exclusive-arm.exclusive-armed",
-        () => committed.generation_id,
-      ),
+      generationId,
     };
   }
   if (release.kind === "released-repark-failed") {
     // Running + confined, but the boot path is not re-parked: DISTINCT amber,
     // never green, never silently degraded.
-    await ops.audit(EXCLUSIVE_EGRESS_ARMED_AUDIT_OP, {
+    const generationId = await observing(
+      "provision-exclusive-arm.exclusive-armed",
+      () => releasedGenerationId(committed, release),
+    );
+    await ops.audit(...auditClaim(EXCLUSIVE_EGRESS_ARMED_AUDIT_OP, {
       agent_uid: ctx.agentUid,
-      generation_id: committed.generation_id,
+      generation_id: generationId,
       gate_port: committed.gate_port,
       repark_failed: release.reparkError,
-    });
+    }));
     return {
       kind: "exclusive-armed-repark-failed",
-      generationId: await observing(
-        "provision-exclusive-arm.exclusive-armed",
-        () => committed.generation_id,
-      ),
+      generationId,
       reparkError: release.reparkError,
     };
   }
@@ -403,7 +422,7 @@ async function degradeLoud(
     harness.disposition === "started-coarse"
       ? { harness_run_state: "running-coarse", harness_run_state_basis: harness.observed }
       : parkedClaimAuditFields(harness.claim);
-  await ops.audit(EXCLUSIVE_EGRESS_DEGRADED_AUDIT_OP, {
+  await ops.audit(...auditClaim(EXCLUSIVE_EGRESS_DEGRADED_AUDIT_OP, {
     agent_uid: ctx.agentUid,
     stage,
     reason,
@@ -411,7 +430,7 @@ async function degradeLoud(
     harness_disposition: harness.disposition,
     ...harnessAudit,
     cleanup_errors: errors,
-  });
+  }));
   ops.print(
     `Exclusive egress could NOT come live (${stage}): ${reason}. ` +
       (coarseCompositionRestored

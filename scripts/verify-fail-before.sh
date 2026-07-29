@@ -37,8 +37,17 @@ if ! git rev-parse --verify "$BASE_REF^{commit}" >/dev/null 2>&1; then
   exit 2
 fi
 
-mapfile -t CHANGED_SRC < <(git diff --name-only "$BASE_REF"...HEAD -- server/src)
-mapfile -t CHANGED_TESTS < <(
+CHANGED_SRC=()
+while IFS= read -r changed_src; do
+  [[ -z "$changed_src" ]] && continue
+  CHANGED_SRC+=("$changed_src")
+done < <(git diff --name-only "$BASE_REF"...HEAD -- server/src)
+
+CHANGED_TESTS=()
+while IFS= read -r changed_test; do
+  [[ -z "$changed_test" ]] && continue
+  CHANGED_TESTS+=("$changed_test")
+done < <(
   git diff --name-only --diff-filter=ACMR "$BASE_REF"...HEAD -- server/test \
     | grep -E '\.test\.tsx?$' || true
 )
@@ -64,7 +73,7 @@ restore() {
     git apply "$SRC_PATCH" >/dev/null 2>&1
   fi
   if [[ "$STASHED_SRC" -eq 1 ]]; then
-    git stash pop -q >/dev/null 2>&1
+    git stash pop --index -q >/dev/null 2>&1
   fi
   rm -f "$SRC_PATCH"
   exit "$status"
@@ -77,7 +86,11 @@ if ! git diff --quiet -- server/src || ! git diff --cached --quiet -- server/src
   git stash push -q --include-untracked -m "verify-fail-before-src-$$" -- server/src
   STASHED_SRC=1
 else
-  mapfile -t UNTRACKED_SRC < <(git ls-files --others --exclude-standard -- server/src)
+  UNTRACKED_SRC=()
+  while IFS= read -r untracked_src; do
+    [[ -z "$untracked_src" ]] && continue
+    UNTRACKED_SRC+=("$untracked_src")
+  done < <(git ls-files --others --exclude-standard -- server/src)
   if [[ ${#UNTRACKED_SRC[@]} -gt 0 ]]; then
     git stash push -q --include-untracked -m "verify-fail-before-src-$$" -- server/src
     STASHED_SRC=1

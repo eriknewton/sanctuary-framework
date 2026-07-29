@@ -196,6 +196,12 @@ describe("claim register: the literal ratchet", () => {
     expect(drift, "claim-literal drift -- classify the new claim in claim-basis.ts").toEqual([]);
   });
 
+  it("matches guarded claim fields in camelCase and snake_case", () => {
+    const matches = 'audit({ coarseCompositionRestored: true, coarse_composition_restored: true })'
+      .match(claimLiteralRegex());
+    expect(matches?.length).toBe(2);
+  });
+
   it("keeps run-state prose in exactly ONE file", () => {
     // THE RENDER-LAYER GUARD. Round 4's HIGH was a SENTENCE, and no count
     // ratchet could have caught it. This is an ownership rule instead: the
