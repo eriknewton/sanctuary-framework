@@ -48,8 +48,8 @@ import type {
 import { AuditIntegrityError } from "../operational/audit-log.js";
 import type { IdentityManager } from "../cognitive/tools.js";
 import type { HandshakeResult } from "../handshake/types.js";
-// SignedSHR type available via shr/types if needed in future
 import { generateSHR, type SHRGeneratorOptions } from "../shr/generator.js";
+import type { SignedSHR } from "../shr/types.js";
 import { gatherReputationEvidence } from "../shr/tools.js";
 import { ReputationStore } from "../reputation/reputation-store.js";
 import type { StorageBackend } from "../storage/interface.js";
@@ -247,6 +247,110 @@ import {
 } from "./unified-inbox-retention-policy.js";
 
 // ── Types ───────────────────────────────────────────────────────────────
+
+export interface SovereigntyRoutePayload {
+  score: number;
+  overall_level: "full" | "degraded" | "minimal" | "unverified";
+  layers: Record<string, unknown>;
+  live_enforcement: {
+    castle_wall_arm_state: CastleWallPosture["arm_state"];
+    evidence_basis: CastleWallPosture["evidence_basis"];
+    last_enforcement_evidence_at: CastleWallPosture["last_enforcement_evidence_at"];
+    freshness_window_ms: CastleWallPosture["freshness_window_ms"];
+    audit_integrity_ok: CastleWallPosture["audit_integrity_ok"];
+  };
+  degradations: SignedSHR["body"]["degradations"];
+  capabilities: SignedSHR["body"]["capabilities"];
+  federation: {
+    operator_cloud_nodes: FederationPostureSummary["operator_cloud_nodes"];
+    provider_in_trust_boundary: FederationPostureSummary["provider_in_trust_boundary"];
+    tee_attested: FederationPostureSummary["tee_attested"];
+    trust_boundary: FederationPostureSummary;
+  };
+  config_loaded: boolean;
+}
+
+export function buildSovereigntyRoutePayload(input: {
+  shr: SignedSHR;
+  wall: CastleWallPosture;
+  federationPosture: FederationPostureSummary;
+  configLoaded: boolean;
+}): SovereigntyRoutePayload {
+  const layers = input.shr.body.layers;
+  const wall = input.wall;
+  const federationPosture = input.federationPosture;
+
+  // L1 LIVE status: green `active` ONLY on a fresh enforcement verdict
+  // (`armed`); every other arm-state is the neutral `configured`
+  // (capability present, live enforcement unproven), never green.
+  const l1LiveStatus = wall.arm_state === "armed" ? "active" : "configured";
+  // L3 LIVE status: capability present, no live verdict on this surface -
+  // neutral `configured`, never a green live pill (relabel of the SHR
+  // capability `active`).
+  const l3LiveStatus = "configured";
+
+  // Score: the enforcing layer (L1) earns its points from the wall arm VERDICT,
+  // not config presence. `configured` is a non-green PARTIAL.
+  const layerPoints = (status: string): number =>
+    status === "active" ? 25
+      : status === "degraded" ? 15
+        : status === "configured" ? 10
+          : 0; // inactive
+  const l1Points =
+    wall.arm_state === "armed" ? 25
+      : wall.arm_state === "degraded" ? 10
+        : 5; // unknown / not_installed: capability real, enforcement unproven
+  const score =
+    l1Points +
+    layerPoints(layers.l2.status) +
+    layerPoints(l3LiveStatus) +
+    layerPoints(layers.l4.status);
+
+  const overallLevel =
+    wall.arm_state === "armed" && score >= 90 ? "full"
+      : score >= 65 ? "degraded"
+        : score >= 25 ? "minimal"
+          : "unverified";
+
+  return {
+    score,
+    overall_level: overallLevel,
+    layers: {
+      l1: {
+        status: l1LiveStatus,
+        capability_status: layers.l1.status,
+        detail: layers.l1.encryption,
+        key_custody: layers.l1.key_custody,
+      },
+      l2: { status: layers.l2.status, detail: layers.l2.isolation_type, attestation: layers.l2.attestation_available },
+      l3: {
+        status: l3LiveStatus,
+        capability_status: layers.l3.status,
+        detail: layers.l3.proof_system,
+        selective_disclosure: layers.l3.selective_disclosure,
+      },
+      l4: { status: layers.l4.status, detail: layers.l4.attestation_format, reputation_portable: layers.l4.reputation_portable },
+    },
+    // This payload is the client seal's freshness source. It must echo the
+    // exact window the posture shaper used to decide whether evidence is fresh.
+    live_enforcement: {
+      castle_wall_arm_state: wall.arm_state,
+      evidence_basis: wall.evidence_basis,
+      last_enforcement_evidence_at: wall.last_enforcement_evidence_at,
+      freshness_window_ms: wall.freshness_window_ms,
+      audit_integrity_ok: wall.audit_integrity_ok,
+    },
+    degradations: input.shr.body.degradations,
+    capabilities: input.shr.body.capabilities,
+    federation: {
+      operator_cloud_nodes: federationPosture.operator_cloud_nodes,
+      provider_in_trust_boundary: federationPosture.provider_in_trust_boundary,
+      tee_attested: federationPosture.tee_attested,
+      trust_boundary: federationPosture,
+    },
+    config_loaded: input.configLoaded,
+  };
+}
 
 export interface DashboardConfig {
   port: number;
@@ -7278,7 +7382,6 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       return;
     }
 
-    const layers = shr.body.layers;
     const federationPosture = this.buildFederationPostureSummary();
 
     // Read the LIVE Castle Wall arm-state from the canonical evidence-gated
@@ -7288,85 +7391,13 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     // failure, never a thrown 500 that paints green by omission).
     this.buildStatusCastleWall()
       .then((wall) => {
-        // L1 LIVE status: green `active` ONLY on a fresh enforcement verdict
-        // (`armed`); every other arm-state is the neutral `configured`
-        // (capability present, live enforcement unproven), never green.
-        const l1LiveStatus = wall.arm_state === "armed" ? "active" : "configured";
-        // L3 LIVE status: capability present, no live verdict on this surface →
-        // neutral `configured`, never a green live pill (relabel of the SHR
-        // capability `active`).
-        const l3LiveStatus = "configured";
-
-        // Score: the enforcing layer (L1) earns its points from the wall arm
-        // VERDICT, not config presence. `configured` is a non-green PARTIAL - the
-        // encryption-at-rest capability is real, but live enforcement is unproven,
-        // so it can never reach the full-green 25. L3 likewise caps at the
-        // `configured` partial. L2/L4 keep the SHR's honest active/degraded scale.
-        const layerPoints = (status: string): number =>
-          status === "active" ? 25
-            : status === "degraded" ? 15
-              : status === "configured" ? 10
-                : 0; // inactive
-        const l1Points =
-          wall.arm_state === "armed" ? 25
-            : wall.arm_state === "degraded" ? 10
-              : 5; // unknown / not_installed: capability real, enforcement unproven
-        const score =
-          l1Points +
-          layerPoints(layers.l2.status) +
-          layerPoints(l3LiveStatus) +
-          layerPoints(layers.l4.status);
-
-        // `full` now requires a fresh wall verdict (l1=25) AND non-degraded
-        // L2/L4; a capability-only host tops out below `full`, honestly.
-        const overallLevel =
-          wall.arm_state === "armed" && score >= 90 ? "full"
-            : score >= 65 ? "degraded"
-              : score >= 25 ? "minimal"
-                : "unverified";
-
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({
-          score,
-          overall_level: overallLevel,
-          layers: {
-            // L1 live status comes from the wall verdict; the SHR capability is
-            // preserved under `capability_status` so a consumer can still tell
-            // "build supports this" from "it is live-enforcing now".
-            l1: {
-              status: l1LiveStatus,
-              capability_status: layers.l1.status,
-              detail: layers.l1.encryption,
-              key_custody: layers.l1.key_custody,
-            },
-            l2: { status: layers.l2.status, detail: layers.l2.isolation_type, attestation: layers.l2.attestation_available },
-            l3: {
-              status: l3LiveStatus,
-              capability_status: layers.l3.status,
-              detail: layers.l3.proof_system,
-              selective_disclosure: layers.l3.selective_disclosure,
-            },
-            l4: { status: layers.l4.status, detail: layers.l4.attestation_format, reputation_portable: layers.l4.reputation_portable },
-          },
-          // The real enforcement signal behind the L1 pill + score, surfaced so
-          // the operator can see WHY green was or was not earned (never a leak of
-          // rule internals - the same honest enum the /api/posture surface uses).
-          live_enforcement: {
-            castle_wall_arm_state: wall.arm_state,
-            evidence_basis: wall.evidence_basis,
-            last_enforcement_evidence_at: wall.last_enforcement_evidence_at,
-            audit_integrity_ok: wall.audit_integrity_ok,
-          },
-          degradations: shr.body.degradations,
-          capabilities: shr.body.capabilities,
-          federation: {
-            operator_cloud_nodes: federationPosture.operator_cloud_nodes,
-            provider_in_trust_boundary: federationPosture.provider_in_trust_boundary,
-            tee_attested: federationPosture.tee_attested,
-            trust_boundary: federationPosture,
-          },
-          config_loaded: this._sanctuaryConfig != null,
-        }));
+        res.end(JSON.stringify(buildSovereigntyRoutePayload({
+          shr,
+          wall,
+          federationPosture,
+          configLoaded: this._sanctuaryConfig != null,
+        })));
       })
       .catch((err) => {
         logCaughtError(
