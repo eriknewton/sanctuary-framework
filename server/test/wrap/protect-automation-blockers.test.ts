@@ -271,6 +271,34 @@ describe("handleProcessShutdownSignal (wrap/cli.ts) exits after cleanups", () =>
     }
   });
 
+  it("repeat non-provisioning mixed signals starting with SIGINT preserve 130, not the later SIGTERM's code", async () => {
+    vi.useFakeTimers();
+    const cleanupEntered = deferred<void>();
+    registerProcessShutdownCleanup(async () => {
+      cleanupEntered.resolve();
+      await new Promise<void>(() => {});
+    });
+
+    try {
+      void handleProcessShutdownSignal("SIGINT");
+      await cleanupEntered.promise;
+
+      const second = handleProcessShutdownSignal("SIGTERM");
+      await vi.advanceTimersByTimeAsync(PROCESS_SHUTDOWN_REPEAT_SIGNAL_GRACE_MS - 1);
+      expect(exitSpy).not.toHaveBeenCalled();
+
+      await handleProcessShutdownSignal("SIGTERM");
+      expect(exitSpy).toHaveBeenCalledWith(130);
+      expect(exitSpy).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(1);
+      await second;
+      expect(exitSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   // FIX (harden-loop, late-registration drop): nothing stops `runWrap`'s
   // main flow when a signal lands -- it keeps running in the same await
   // window as the in-flight cleanup drain, and can register a brand-new
@@ -472,6 +500,34 @@ describe("runWrap: signals during in-flight provisioning refuse once, then force
       // waits for the never-settling provisioning promise and does not exit.
       expect(stderrSpy.mock.calls.flat().join("\n")).toContain(
         renderAutoProvisionForcedExitWarning("SIGINT", { firstSignal: "SIGTERM" }),
+      );
+    } finally {
+      provision.finish();
+      await runPromise;
+    }
+  });
+
+  it("a second mixed signal during provisioning starting with SIGINT exits with 130, not the later SIGTERM's code", async () => {
+    const provision = neverSettlingProvisionRunner();
+    const runPromise = runWrap(
+      { hermes: true, noOpen: true, noDashboard: true },
+      deps({ runAutoProvisionForWrap: provision.runAutoProvisionForWrap }),
+    ).catch(() => undefined);
+
+    try {
+      await provision.entered;
+      await handleProcessShutdownSignal("SIGINT");
+      await vi.waitFor(() =>
+        expect(stderrSpy.mock.calls.flat().join("\n")).toContain(
+          renderAutoProvisionSignalRefusal("SIGINT"),
+        ),
+      );
+
+      await handleProcessShutdownSignal("SIGTERM");
+      await vi.waitFor(() => expect(exitSpy).toHaveBeenCalledWith(130), { timeout: 250 });
+
+      expect(stderrSpy.mock.calls.flat().join("\n")).toContain(
+        renderAutoProvisionForcedExitWarning("SIGTERM", { firstSignal: "SIGINT" }),
       );
     } finally {
       provision.finish();
