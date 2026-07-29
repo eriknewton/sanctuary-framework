@@ -61,6 +61,10 @@ export type {
   RehomeStep,
   RehomePlan,
   RehomeStepResult,
+  RehomePathHash,
+  RehomeDestinationProvenance,
+  RehomeChownReport,
+  ExecuteRehomePlanOptions,
   RestoreStepOutcome,
   RestoreRehomeResult,
 } from "./rehome.js";

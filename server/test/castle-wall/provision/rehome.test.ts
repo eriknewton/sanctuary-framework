@@ -12,6 +12,7 @@ import {
   executeRehomePlan,
   restoreRehomeSteps,
   hermesRehomeAdapter,
+  RehomeExecutionError,
   type RehomeOps,
   type AgentRehomeAdapter,
 } from "../../../src/castle-wall/provision/rehome.js";
@@ -33,14 +34,14 @@ function mockOps(
   backups: string[];
   moves: Array<{ from: string; to: string }>;
   chowns: Array<{ path: string; uid: number; gid: number }>;
-  restores: Array<{ destPath: string; sourcePath: string }>;
+  restores: Array<{ destPath: string; sourcePath: string; backupPath?: string }>;
   restoreCustodyCalls: Array<{ path: string; uid: number; gid: number }>;
   contents: Map<string, string>;
 } {
   const backups: string[] = [];
   const moves: Array<{ from: string; to: string }> = [];
   const chowns: Array<{ path: string; uid: number; gid: number }> = [];
-  const restores: Array<{ destPath: string; sourcePath: string }> = [];
+  const restores: Array<{ destPath: string; sourcePath: string; backupPath?: string }> = [];
   const restoreCustodyCalls: Array<{ path: string; uid: number; gid: number }> = [];
   const contents = new Map<string, string>();
   return {
@@ -51,6 +52,29 @@ function mockOps(
     restoreCustodyCalls,
     contents,
     pathExists: async (path) => existingPaths.has(path),
+    pathExistsNoFollow: async (path) => existingPaths.has(path),
+    hashPath: async (path) => ({ algorithm: "sha256", value: `hash-${path}` }),
+    readDestinationProvenance: async () => undefined,
+    recordDestinationProvenance: async () => {},
+    clearDestinationProvenance: async () => {},
+    displaceDestination: async (destPath) => {
+      const displacedPath = `${destPath}.displaced-20260729T000000000Z`;
+      existingPaths.delete(destPath);
+      existingPaths.add(displacedPath);
+      return { displacedPath };
+    },
+    restoreDisplacedDestination: async (displacedPath, destPath) => {
+      if (!existingPaths.has(displacedPath)) return { restored: false };
+      if (existingPaths.has(destPath)) {
+        const conflictPath = `${destPath}.restored-conflict`;
+        existingPaths.delete(displacedPath);
+        existingPaths.add(conflictPath);
+        return { restored: false, conflictPath };
+      }
+      existingPaths.delete(displacedPath);
+      existingPaths.add(destPath);
+      return { restored: true };
+    },
     backup: async (path) => {
       const backupPath = `/root/.sanctuary-rehome-backups${path}.bak`;
       backups.push(backupPath);
@@ -58,12 +82,15 @@ function mockOps(
     },
     move: async (from, to) => {
       moves.push({ from, to });
+      existingPaths.delete(from);
+      existingPaths.add(to);
     },
     chown: async (path, uid, gid) => {
       chowns.push({ path, uid, gid });
+      return { excludedPaths: [] };
     },
-    restore: async (destPath, sourcePath) => {
-      restores.push({ destPath, sourcePath });
+    restore: async (destPath, sourcePath, backupPath) => {
+      restores.push({ destPath, sourcePath, backupPath });
       // Simulate a reverse-move: reproduce whatever "content" is recorded at
       // destPath (the real path the data lives at post-move) back onto
       // sourcePath, mirroring the production reverse-rename semantics.
@@ -71,6 +98,8 @@ function mockOps(
       if (data !== undefined) {
         contents.set(sourcePath, data);
         contents.delete(destPath);
+        existingPaths.delete(destPath);
+        existingPaths.add(sourcePath);
         return { restored: true };
       }
       return { restored: false };
@@ -90,6 +119,7 @@ describe("castle-wall/provision/rehome", () => {
       const sourcePaths = entries.map((e) => e.sourcePath);
       expect(sourcePaths).toContain(`${OPERATOR_HOME}/.hermes/.env`);
       expect(sourcePaths).toContain(`${OPERATOR_HOME}/.hermes/auth.json`);
+      expect(sourcePaths).toContain(`${OPERATOR_HOME}/.hermes/cli-config.json`);
       expect(sourcePaths).toContain(`${OPERATOR_HOME}/.hermes/config.yaml`);
       expect(sourcePaths).toContain(`${OPERATOR_HOME}/.hermes/hermes-agent`);
       expect(sourcePaths).toContain(`${OPERATOR_HOME}/.google_workspace_mcp/credentials`);
@@ -189,6 +219,102 @@ describe("castle-wall/provision/rehome", () => {
       expect(ops.backups).toEqual([]);
       expect(ops.moves.length).toBe(1);
     });
+
+    it("refuses a dual source+destination conflict before backup or move, printing both hashes and paths", async () => {
+      const adapter: AgentRehomeAdapter = {
+        harnessId: "test-conflict",
+        pathsToRehome: (home) => [
+          { sourcePath: `${home}/.hermes/config.yaml`, destRelativePath: ".hermes/config.yaml", isSecret: true },
+        ],
+        requiresInteractiveReconsent: () => false,
+      };
+      const src = `${OPERATOR_HOME}/.hermes/config.yaml`;
+      const dest = `${NEW_ACCOUNT_HOME}/.hermes/config.yaml`;
+      const ops = mockOps(new Set([src, dest]));
+      const plan = planRehome(adapter, { operatorHome: OPERATOR_HOME, newAccountHome: NEW_ACCOUNT_HOME });
+
+      await expect(executeRehomePlan(plan, ops, { uid: 502, gid: 502 })).rejects.toThrow(
+        new RegExp(`source ${src} \\(sha256:hash-${src}\\).*destination ${dest} \\(sha256:hash-${dest}\\)`),
+      );
+      expect(ops.backups).toEqual([]);
+      expect(ops.moves).toEqual([]);
+      expect(ops.chowns).toEqual([]);
+    });
+
+    it("lets a provenance-backed destination win without mtime and without mutating the source or destination", async () => {
+      const adapter: AgentRehomeAdapter = {
+        harnessId: "test-provenance",
+        pathsToRehome: (home) => [
+          { sourcePath: `${home}/.hermes/config.yaml`, destRelativePath: ".hermes/config.yaml", isSecret: true },
+        ],
+        requiresInteractiveReconsent: () => false,
+      };
+      const src = `${OPERATOR_HOME}/.hermes/config.yaml`;
+      const dest = `${NEW_ACCOUNT_HOME}/.hermes/config.yaml`;
+      const ops = mockOps(new Set([src, dest]), {
+        readDestinationProvenance: async () => ({
+          schemaVersion: 1,
+          sourcePath: src,
+          destPath: dest,
+          destHash: { algorithm: "sha256", value: `hash-${dest}` },
+          recordedAt: "2026-07-29T00:00:00.000Z",
+        }),
+      });
+      const plan = planRehome(adapter, { operatorHome: OPERATOR_HOME, newAccountHome: NEW_ACCOUNT_HOME });
+
+      const results = await executeRehomePlan(plan, ops, { uid: 502, gid: 502 });
+
+      expect(results).toEqual([
+        {
+          entry: { sourcePath: src, destRelativePath: ".hermes/config.yaml", isSecret: true },
+          destPath: dest,
+          status: "destination-authoritative",
+          sourceHash: { algorithm: "sha256", value: `hash-${src}` },
+          destinationHash: { algorithm: "sha256", value: `hash-${dest}` },
+        },
+      ]);
+      expect(ops.backups).toEqual([]);
+      expect(ops.moves).toEqual([]);
+      expect(ops.chowns).toEqual([]);
+    });
+
+    it("--overwrite-destination records the displaced destination before backup/move so abort rollback can restore it", async () => {
+      const adapter: AgentRehomeAdapter = {
+        harnessId: "test-overwrite",
+        pathsToRehome: (home) => [
+          { sourcePath: `${home}/.hermes/config.yaml`, destRelativePath: ".hermes/config.yaml", isSecret: true },
+        ],
+        requiresInteractiveReconsent: () => false,
+      };
+      const src = `${OPERATOR_HOME}/.hermes/config.yaml`;
+      const dest = `${NEW_ACCOUNT_HOME}/.hermes/config.yaml`;
+      const ops = mockOps(new Set([src, dest]), {
+        backup: async () => {
+          throw new Error("forced later abort");
+        },
+      });
+      const plan = planRehome(adapter, { operatorHome: OPERATOR_HOME, newAccountHome: NEW_ACCOUNT_HOME });
+
+      let caught: unknown;
+      try {
+        await executeRehomePlan(plan, ops, { uid: 502, gid: 502 }, { overwriteDestination: true });
+      } catch (err) {
+        caught = err;
+      }
+
+      expect(caught).toBeInstanceOf(RehomeExecutionError);
+      const rehomeErr = caught as RehomeExecutionError;
+      expect(rehomeErr.partialResults).toEqual([
+        {
+          entry: { sourcePath: src, destRelativePath: ".hermes/config.yaml", isSecret: true },
+          destPath: dest,
+          status: "destination-displaced",
+          displacedDestinationPath: `${dest}.displaced-20260729T000000000Z`,
+          sourceHash: { algorithm: "sha256", value: `hash-${src}` },
+          destinationHash: { algorithm: "sha256", value: `hash-${dest}` },
+        },
+      ]);
+    });
   });
 
   describe("restoreRehomeSteps", () => {
@@ -211,9 +337,14 @@ describe("castle-wall/provision/rehome", () => {
       // The restore call must pass destPath (where the data actually is),
       // not backupPath (the M4 custody copy) -- fix F2's reverse-move.
       for (const r of results.filter((x) => x.status === "moved")) {
-        expect(ops.restores.some((call) => call.destPath === r.destPath && call.sourcePath === r.entry.sourcePath)).toBe(
-          true,
-        );
+        expect(
+          ops.restores.some(
+            (call) =>
+              call.destPath === r.destPath &&
+              call.sourcePath === r.entry.sourcePath &&
+              call.backupPath === r.backupPath,
+          ),
+        ).toBe(true);
       }
       expect(restoreResult.fullyRestored).toBe(true);
       expect(restoreResult.steps.filter((s) => s.status === "restored").length).toBe(

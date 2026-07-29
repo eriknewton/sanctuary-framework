@@ -34,7 +34,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtemp, rm, mkdir, writeFile, readFile, access, chmod, lstat, stat, symlink, readlink } from "node:fs/promises";
+import { mkdtemp, rm, mkdir, writeFile, readFile, access, chmod, lstat, stat, symlink, readlink, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 
@@ -71,6 +71,7 @@ import { harnessLaunchSpec } from "../../src/egress-gate/harness-daemon.js";
 import {
   planRehome,
   executeRehomePlan,
+  restoreRehomeSteps,
   RehomeExecutionError,
   type AgentRehomeAdapter,
   type RehomeOps,
@@ -449,6 +450,13 @@ describe("castle-wall/provision/rehome real-ops chokepoint: RehomeExecutionError
     let moveCount = 0;
     return {
       pathExists: async () => true,
+      pathExistsNoFollow: async () => true,
+      hashPath: async (path) => ({ algorithm: "sha256", value: `hash-${path}` }),
+      readDestinationProvenance: async () => undefined,
+      recordDestinationProvenance: async () => {},
+      clearDestinationProvenance: async () => {},
+      displaceDestination: async (destPath) => ({ displacedPath: `${destPath}.displaced-20260729T000000000Z` }),
+      restoreDisplacedDestination: async () => ({ restored: true }),
       backup: async (path) => ({ backupPath: `/root/backup${path}.bak` }),
       move: async () => {
         moveCount += 1;
@@ -456,7 +464,7 @@ describe("castle-wall/provision/rehome real-ops chokepoint: RehomeExecutionError
           throw new Error("chown failed: operation not permitted");
         }
       },
-      chown: async () => {},
+      chown: async () => ({ excludedPaths: [] }),
       restore: async () => ({ restored: true }),
       restoreCustody: async () => {},
     };
@@ -493,11 +501,18 @@ describe("castle-wall/provision/rehome real-ops chokepoint: RehomeExecutionError
     const plan = planRehome(testAdapter, { operatorHome: "/Users/operator", newAccountHome: "/var/sanctuary-agents/x" });
     const ops: RehomeOps = {
       pathExists: async () => true,
+      pathExistsNoFollow: async () => true,
+      hashPath: async (path) => ({ algorithm: "sha256", value: `hash-${path}` }),
+      readDestinationProvenance: async () => undefined,
+      recordDestinationProvenance: async () => {},
+      clearDestinationProvenance: async () => {},
+      displaceDestination: async (destPath) => ({ displacedPath: `${destPath}.displaced-20260729T000000000Z` }),
+      restoreDisplacedDestination: async () => ({ restored: true }),
       backup: async () => {
         throw new Error("backup destination not root-only writable");
       },
       move: async () => {},
-      chown: async () => {},
+      chown: async () => ({ excludedPaths: [] }),
       restore: async () => ({ restored: true }),
       restoreCustody: async () => {},
     };
@@ -518,6 +533,13 @@ describe("castle-wall/provision/rehome real-ops chokepoint: RehomeExecutionError
     let chownCount = 0;
     const ops: RehomeOps = {
       pathExists: async () => true,
+      pathExistsNoFollow: async () => true,
+      hashPath: async (path) => ({ algorithm: "sha256", value: `hash-${path}` }),
+      readDestinationProvenance: async () => undefined,
+      recordDestinationProvenance: async () => {},
+      clearDestinationProvenance: async () => {},
+      displaceDestination: async (destPath) => ({ displacedPath: `${destPath}.displaced-20260729T000000000Z` }),
+      restoreDisplacedDestination: async () => ({ restored: true }),
       backup: async (path) => ({ backupPath: `/root/backup${path}.bak` }),
       move: async () => {},
       chown: async () => {
@@ -529,6 +551,7 @@ describe("castle-wall/provision/rehome real-ops chokepoint: RehomeExecutionError
           // by the pre-fix code.
           throw new Error("chown failed: operation not permitted");
         }
+        return { excludedPaths: [] };
       },
       restore: async () => ({ restored: true }),
       restoreCustody: async () => {},
@@ -836,7 +859,7 @@ describe("wrap/auto-provision real-ops chokepoint: realRehomeOps().restore confl
 
       const destPath = join(tmpRoot, "dest-that-does-not-exist", "secret.env");
       const ops = realRehomeOps({ backupRoot });
-      const result = await ops.restore(destPath, sourcePath);
+      const result = await ops.restore(destPath, sourcePath, backupPath);
 
       expect(result.restored).toBe(true);
       expect(result.conflictPath).toBeUndefined();
@@ -859,7 +882,7 @@ describe("wrap/auto-provision real-ops chokepoint: realRehomeOps().restore confl
 
       const destPath = join(tmpRoot, "dest-that-does-not-exist", "secret.env");
       const ops = realRehomeOps({ backupRoot });
-      const result = await ops.restore(destPath, sourcePath);
+      const result = await ops.restore(destPath, sourcePath, backupPath);
 
       expect(result.restored).toBe(false);
       expect(result.conflictPath).toBe(`${sourcePath}.restored-conflict`);
@@ -885,7 +908,7 @@ describe("wrap/auto-provision real-ops chokepoint: realRehomeOps().restore confl
 
       const destPath = join(tmpRoot, "dest-that-does-not-exist", "secret.env");
       const ops = realRehomeOps({ backupRoot });
-      const result = await ops.restore(destPath, sourcePath);
+      const result = await ops.restore(destPath, sourcePath, backupPath);
 
       expect(result.restored).toBe(false);
       expect(result.conflictPath).toBe(`${preexistingConflictPath}.1`);
@@ -913,7 +936,7 @@ describe("wrap/auto-provision real-ops chokepoint: realRehomeOps().restore confl
       await symlink(realTarget, backupPath);
       const destPath = join(tmpRoot, "dest-that-does-not-exist", "secret.env");
 
-      const result = await realRehomeOps({ backupRoot }).restore(destPath, sourcePath);
+      const result = await realRehomeOps({ backupRoot }).restore(destPath, sourcePath, backupPath);
 
       expect(result.restored).toBe(true);
       // The credential must round-trip as a SYMLINK, NOT a dereferenced plain

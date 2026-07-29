@@ -40,6 +40,26 @@ export interface RehomePathEntry {
   isSecret: boolean;
 }
 
+/** Content hash for conflict diagnostics and destination provenance. */
+export interface RehomePathHash {
+  algorithm: "sha256";
+  value: string;
+}
+
+/** Root-owned proof that Sanctuary previously moved this source to this destination. */
+export interface RehomeDestinationProvenance {
+  schemaVersion: 1;
+  sourcePath: string;
+  destPath: string;
+  destHash: RehomePathHash;
+  recordedAt: string;
+}
+
+/** Result of a recursive ownership change; excluded paths are reported, never silent. */
+export interface RehomeChownReport {
+  excludedPaths: string[];
+}
+
 /** Per-harness adapter: describes what to move and how to verify the move. */
 export interface AgentRehomeAdapter {
   /** Harness identifier, e.g. "hermes". */
@@ -63,6 +83,23 @@ export interface AgentRehomeAdapter {
 export interface RehomeOps {
   /** True when `path` exists (file or directory). */
   pathExists(path: string): Promise<boolean>;
+  /** True when the final path component exists, without following symlinks. */
+  pathExistsNoFollow(path: string): Promise<boolean>;
+  /** Compute a no-follow content hash for a file, symlink, or directory tree. */
+  hashPath(path: string): Promise<RehomePathHash>;
+  /** Read root-owned provenance for an already-rehomed destination, if present and parseable. */
+  readDestinationProvenance(sourcePath: string, destPath: string): Promise<RehomeDestinationProvenance | undefined>;
+  /** Record root-owned provenance after a successful move to the destination. */
+  recordDestinationProvenance(sourcePath: string, destPath: string): Promise<void>;
+  /** Clear provenance when rollback removes the moved destination. */
+  clearDestinationProvenance(sourcePath: string, destPath: string): Promise<void>;
+  /** Preserve an occupied destination as a dated sibling before an explicit overwrite. */
+  displaceDestination(destPath: string): Promise<{ displacedPath: string }>;
+  /** Restore a previously displaced destination, without overwriting a new occupant. */
+  restoreDisplacedDestination(
+    displacedPath: string,
+    destPath: string,
+  ): Promise<{ restored: boolean; conflictPath?: string }>;
   /**
    * Copy the file tree at `path` into a root-only (0600 file / 0700 dir),
    * reversible backup location, returning the backup's path. Production
@@ -78,7 +115,7 @@ export interface RehomeOps {
   /** Move (not copy) the file tree from `sourcePath` to `destPath`, creating parent dirs as needed. */
   move(sourcePath: string, destPath: string): Promise<void>;
   /** chown the path (recursively, if a directory) to the given uid/gid. */
-  chown(path: string, uid: number, gid: number): Promise<void>;
+  chown(path: string, uid: number, gid: number): Promise<RehomeChownReport>;
   /**
    * Restore a path back to `sourcePath` (used by `unprovision` and by the
    * orchestrator's fail-closed abort path). FIX F2 (2026-07-07 fix-round):
@@ -99,7 +136,11 @@ export interface RehomeOps {
    * `conflictPath` (with `restored: false`), so the caller reports a
    * manual-recovery outcome rather than a false clean restore.
    */
-  restore(destPath: string, sourcePath: string): Promise<{ restored: boolean; conflictPath?: string }>;
+  restore(
+    destPath: string,
+    sourcePath: string,
+    backupPath?: string,
+  ): Promise<{ restored: boolean; conflictPath?: string }>;
   /**
    * Restore custody of a recovered secret path to the operator (fix F3):
    * chmod 0600 (file) / 0700 (dir) and chown back to the operator's uid/gid.
@@ -158,8 +199,12 @@ function joinPosix(base: string, rel: string): string {
 export interface RehomeStepResult {
   entry: RehomePathEntry;
   destPath: string;
-  status: "moved" | "skipped-absent";
+  status: "moved" | "skipped-absent" | "destination-authoritative" | "destination-displaced";
   backupPath?: string;
+  displacedDestinationPath?: string;
+  sourceHash?: RehomePathHash;
+  destinationHash?: RehomePathHash;
+  chownExcludedPaths?: string[];
 }
 
 /**
@@ -183,6 +228,40 @@ export class RehomeExecutionError extends Error {
     this.name = "RehomeExecutionError";
     this.partialResults = partialResults;
   }
+}
+
+export interface ExecuteRehomePlanOptions {
+  /** Explicit operator override for dual source+destination presence. */
+  overwriteDestination?: boolean;
+}
+
+function provenanceMatchesDestination(
+  provenance: RehomeDestinationProvenance | undefined,
+  sourcePath: string,
+  destPath: string,
+  destHash: RehomePathHash,
+): boolean {
+  return (
+    provenance?.schemaVersion === 1 &&
+    provenance.sourcePath === sourcePath &&
+    provenance.destPath === destPath &&
+    provenance.destHash.algorithm === destHash.algorithm &&
+    provenance.destHash.value === destHash.value
+  );
+}
+
+function destinationConflictMessage(
+  sourcePath: string,
+  destPath: string,
+  sourceHash: RehomePathHash,
+  destHash: RehomePathHash,
+): string {
+  return (
+    `re-home destination conflict: source ${sourcePath} (${sourceHash.algorithm}:${sourceHash.value}) ` +
+    `and destination ${destPath} (${destHash.algorithm}:${destHash.value}) both exist, but no current ` +
+    "Sanctuary re-home provenance marks the destination as authoritative; refusing before backup/move. " +
+    "Re-run with --overwrite-destination to preserve the destination as a dated sibling and move the source anyway."
+  );
 }
 
 /**
@@ -225,6 +304,7 @@ export async function executeRehomePlan(
   plan: RehomePlan,
   ops: RehomeOps,
   newAccountUidGid: { uid: number; gid: number },
+  options: ExecuteRehomePlanOptions = {},
 ): Promise<RehomeStepResult[]> {
   const results: RehomeStepResult[] = [];
   for (const step of plan.steps) {
@@ -234,6 +314,41 @@ export async function executeRehomePlan(
         results.push({ entry: step.entry, destPath: step.destPath, status: "skipped-absent" });
         continue;
       }
+      const destExists = await ops.pathExistsNoFollow(step.destPath);
+      let stepResult: RehomeStepResult | undefined;
+      if (destExists) {
+        const sourceHash = await ops.hashPath(step.entry.sourcePath);
+        const destinationHash = await ops.hashPath(step.destPath);
+        const provenance = await ops.readDestinationProvenance(step.entry.sourcePath, step.destPath);
+        if (
+          options.overwriteDestination !== true &&
+          provenanceMatchesDestination(provenance, step.entry.sourcePath, step.destPath, destinationHash)
+        ) {
+          results.push({
+            entry: step.entry,
+            destPath: step.destPath,
+            status: "destination-authoritative",
+            sourceHash,
+            destinationHash,
+          });
+          continue;
+        }
+        if (options.overwriteDestination !== true) {
+          throw new Error(destinationConflictMessage(step.entry.sourcePath, step.destPath, sourceHash, destinationHash));
+        }
+        const { displacedPath } = await ops.displaceDestination(step.destPath);
+        stepResult = {
+          entry: step.entry,
+          destPath: step.destPath,
+          status: "destination-displaced",
+          displacedDestinationPath: displacedPath,
+          sourceHash,
+          destinationHash,
+        };
+        // Record immediately: if backup or move fails, rollback must still
+        // know where the displaced destination is.
+        results.push(stepResult);
+      }
       let backupPath: string | undefined;
       if (step.entry.isSecret) {
         const backup = await ops.backup(step.entry.sourcePath);
@@ -242,9 +357,18 @@ export async function executeRehomePlan(
       await ops.move(step.entry.sourcePath, step.destPath);
       // FIX G3: record the moved result NOW, before chown -- a chown failure
       // below must not strand this entry outside `results`/`partialResults`.
-      const stepResult: RehomeStepResult = { entry: step.entry, destPath: step.destPath, status: "moved", backupPath };
-      results.push(stepResult);
-      await ops.chown(step.destPath, newAccountUidGid.uid, newAccountUidGid.gid);
+      if (stepResult === undefined) {
+        stepResult = { entry: step.entry, destPath: step.destPath, status: "moved", backupPath };
+        results.push(stepResult);
+      } else {
+        stepResult.status = "moved";
+        stepResult.backupPath = backupPath;
+      }
+      const chownReport = await ops.chown(step.destPath, newAccountUidGid.uid, newAccountUidGid.gid);
+      if (chownReport.excludedPaths.length > 0) {
+        stepResult.chownExcludedPaths = chownReport.excludedPaths;
+      }
+      await ops.recordDestinationProvenance(step.entry.sourcePath, step.destPath);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       throw new RehomeExecutionError(message, results, { cause: err });
@@ -264,7 +388,14 @@ export async function executeRehomePlan(
 export interface RestoreStepOutcome {
   entry: RehomePathEntry;
   sourcePath: string;
-  status: "restored" | "skipped-absent" | "failed" | "conflict";
+  status:
+    | "restored"
+    | "skipped-absent"
+    | "skipped-destination-authoritative"
+    | "displaced-destination-restored"
+    | "displaced-destination-conflict"
+    | "failed"
+    | "conflict";
   error?: string;
   conflictPath?: string;
 }
@@ -313,9 +444,72 @@ export async function restoreRehomeSteps(
       steps.push({ entry: result.entry, sourcePath: result.entry.sourcePath, status: "skipped-absent" });
       continue;
     }
+    if (result.status === "destination-authoritative") {
+      steps.push({
+        entry: result.entry,
+        sourcePath: result.entry.sourcePath,
+        status: "skipped-destination-authoritative",
+      });
+      continue;
+    }
+    if (result.status === "destination-displaced") {
+      if (result.displacedDestinationPath === undefined) {
+        steps.push({
+          entry: result.entry,
+          sourcePath: result.entry.sourcePath,
+          status: "failed",
+          error: "destination was displaced but no displacedDestinationPath was recorded",
+        });
+        continue;
+      }
+      try {
+        const displaced = await ops.restoreDisplacedDestination(result.displacedDestinationPath, result.destPath);
+        if (displaced.restored) {
+          steps.push({
+            entry: result.entry,
+            sourcePath: result.entry.sourcePath,
+            status: "displaced-destination-restored",
+          });
+        } else {
+          steps.push({
+            entry: result.entry,
+            sourcePath: result.entry.sourcePath,
+            status: "displaced-destination-conflict",
+            conflictPath: displaced.conflictPath,
+            error:
+              displaced.conflictPath !== undefined
+                ? `destination path was occupied during rollback; displaced destination was preserved at ${displaced.conflictPath}`
+                : "displaced destination restore reported no data reproduced at the destination path",
+          });
+        }
+      } catch (err) {
+        steps.push({
+          entry: result.entry,
+          sourcePath: result.entry.sourcePath,
+          status: "failed",
+          error: (err as Error).message,
+        });
+      }
+      continue;
+    }
     try {
-      const { restored, conflictPath } = await ops.restore(result.destPath, result.entry.sourcePath);
+      const { restored, conflictPath } = await ops.restore(result.destPath, result.entry.sourcePath, result.backupPath);
+      await ops.clearDestinationProvenance(result.entry.sourcePath, result.destPath);
       if (!restored) {
+        let displacedRestoreNote = "";
+        if (result.displacedDestinationPath !== undefined) {
+          try {
+            const displaced = await ops.restoreDisplacedDestination(result.displacedDestinationPath, result.destPath);
+            if (!displaced.restored) {
+              displacedRestoreNote =
+                displaced.conflictPath !== undefined
+                  ? `; displaced destination was preserved at ${displaced.conflictPath} because ${result.destPath} was occupied during rollback`
+                  : "; displaced destination restore reported no data reproduced at the destination path";
+            }
+          } catch (displacedErr) {
+            displacedRestoreNote = `; displaced destination restore failed: ${(displacedErr as Error).message}`;
+          }
+        }
         // FIX R6 (2026-07-07 fix-round 2): a `conflictPath` means the ops
         // layer detected a recreated file/dir at `sourcePath` and restored
         // to a sibling conflict path instead of overwriting it -- report
@@ -363,14 +557,15 @@ export async function restoreRehomeSteps(
               `source path was recreated during re-home; restored data was placed at ${conflictPath} instead of overwriting it` +
               (custodyError !== undefined
                 ? ` (custody handback to the operator failed: ${custodyError}; the recovered data at ${conflictPath} may need a manual chown)`
-                : ""),
+                : "") +
+              displacedRestoreNote,
           });
         } else {
           steps.push({
             entry: result.entry,
             sourcePath: result.entry.sourcePath,
             status: "failed",
-            error: "restore reported no data reproduced at the source path",
+            error: `restore reported no data reproduced at the source path${displacedRestoreNote}`,
           });
         }
         continue;
@@ -381,6 +576,21 @@ export async function restoreRehomeSteps(
         await ops.chown(result.entry.sourcePath, operatorUidGid.uid, operatorUidGid.gid);
       }
       steps.push({ entry: result.entry, sourcePath: result.entry.sourcePath, status: "restored" });
+      if (result.displacedDestinationPath !== undefined) {
+        const displaced = await ops.restoreDisplacedDestination(result.displacedDestinationPath, result.destPath);
+        if (!displaced.restored) {
+          steps.push({
+            entry: result.entry,
+            sourcePath: result.entry.sourcePath,
+            status: "displaced-destination-conflict",
+            conflictPath: displaced.conflictPath,
+            error:
+              displaced.conflictPath !== undefined
+                ? `destination path was occupied during rollback; displaced destination was preserved at ${displaced.conflictPath}`
+                : "displaced destination restore reported no data reproduced at the destination path",
+          });
+        }
+      }
     } catch (err) {
       steps.push({
         entry: result.entry,
@@ -393,7 +603,9 @@ export async function restoreRehomeSteps(
   // FIX R6: "conflict" is not a clean restore either -- the operator's
   // secret is not back at its original path (it is at conflictPath), so
   // fullyRestored must be false for a conflict just as for a failure.
-  const fullyRestored = steps.every((s) => s.status !== "failed" && s.status !== "conflict");
+  const fullyRestored = steps.every(
+    (s) => s.status !== "failed" && s.status !== "conflict" && s.status !== "displaced-destination-conflict",
+  );
   return { steps, fullyRestored };
 }
 
@@ -422,6 +634,7 @@ export const hermesRehomeAdapter: AgentRehomeAdapter = {
     return [
       { sourcePath: join(".hermes", ".env"), destRelativePath: ".hermes/.env", isSecret: true },
       { sourcePath: join(".hermes", "auth.json"), destRelativePath: ".hermes/auth.json", isSecret: true },
+      { sourcePath: join(".hermes", "cli-config.json"), destRelativePath: ".hermes/cli-config.json", isSecret: true },
       { sourcePath: join(".hermes", "config.yaml"), destRelativePath: ".hermes/config.yaml", isSecret: true },
       {
         sourcePath: join(".hermes", "hermes-agent"),
