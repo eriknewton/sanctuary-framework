@@ -667,7 +667,7 @@ export async function runObserveCandidates(
     refreshAttempted &&
     refreshComplete &&
     routingWitnessComplete &&
-    sourceReads.every((source) => source.status === "read_ok" || source.status === "absent") &&
+    sourceReads.every(sourceReadSupportsDefinitiveEmpty) &&
     quarantinedSources.length === 0;
   const canClaimEmpty =
     candidates.length === 0 && completeReadWitness && !exclusiveGateDenialsUnavailable;
@@ -800,12 +800,24 @@ interface StoreCandidateClaim {
   undeterminedReason: string | null;
 }
 
-function lastRefreshAllReadOk(lastRefresh: ObserveLastRefreshOutcome | null): boolean {
+/**
+ * R2 predicate shared by every definitive-empty gate: a source read supports a
+ * verified-empty claim when it was read_ok, or when it is absent AND has never
+ * contributed (the refresh layer downgrades a previously-contributing absent
+ * source to missing_after_contribution, so a plain "absent" here is R2-valid).
+ * All commands (candidates, status, promote) MUST share this predicate so two
+ * surfaces can never disagree about the same store state.
+ */
+function sourceReadSupportsDefinitiveEmpty(source: { status: string }): boolean {
+  return source.status === "read_ok" || source.status === "absent";
+}
+
+function lastRefreshSupportsDefinitiveEmpty(lastRefresh: ObserveLastRefreshOutcome | null): boolean {
   return (
     lastRefresh !== null &&
     lastRefresh.status === "refreshed" &&
     lastRefresh.source_reads.length > 0 &&
-    lastRefresh.source_reads.every((source) => source.status === "read_ok") &&
+    lastRefresh.source_reads.every(sourceReadSupportsDefinitiveEmpty) &&
     lastRefresh.quarantined_sources.length === 0
   );
 }
@@ -831,7 +843,7 @@ function lastRefreshUndeterminedReason(lastRefresh: ObserveLastRefreshOutcome | 
   if (lastRefresh.quarantined_sources.length > 0) {
     return `last refresh at ${lastRefresh.refreshed_at} had quarantined observe source state`;
   }
-  return `last refresh at ${lastRefresh.refreshed_at} was not all-read_ok (${refreshSourceStatusSummary(lastRefresh)})`;
+  return `last refresh at ${lastRefresh.refreshed_at} did not read (or validly-absent) every source (${refreshSourceStatusSummary(lastRefresh)})`;
 }
 
 function candidateStoreClaim(
@@ -849,7 +861,7 @@ function candidateStoreClaim(
       undeterminedReason: structuralUndeterminedReason,
     };
   }
-  if (lastRefreshAllReadOk(lastRefresh)) {
+  if (lastRefreshSupportsDefinitiveEmpty(lastRefresh)) {
     return { status: "empty_verified", definitiveEmpty: true, undeterminedReason: null };
   }
   return {
@@ -902,7 +914,7 @@ function writeStoreCandidateClaim(
   if (claim.status === "empty_verified") {
     write(
       out,
-      `Pending candidates in store: 0 (store-state-only; ${lastRefreshSummary(lastRefresh)}; all sources read_ok).\n`,
+      `Pending candidates in store: 0 (store-state-only; ${lastRefreshSummary(lastRefresh)}; all sources read_ok or validly absent).\n`,
     );
     return;
   }
@@ -953,7 +965,7 @@ function writePromoteNoSelectionText(
   if (claim.status === "empty_verified") {
     write(
       out,
-      `Nothing to promote (store-state-only; ${lastRefreshSummary(lastRefresh)}; all sources read_ok).` +
+      `Nothing to promote (store-state-only; ${lastRefreshSummary(lastRefresh)}; all sources read_ok or validly absent).` +
         (rescopeChecked ? " No promoted rules need re-scoping.\n" : "\n"),
     );
     return;
