@@ -126,3 +126,80 @@ describe("ObserveStore: readable / exportable / deletable (DoD test 5)", () => {
     expect(listed.size).toBe(150);
   });
 });
+
+describe("ObserveStore: persisted last-refresh strict validation (definitive-empty authority)", () => {
+  const validOutcome = () => ({
+    schema_version: "1.0" as const,
+    refreshed_at: "2026-07-29T10:00:00.000Z",
+    status: "refreshed" as const,
+    source_reads: [
+      { source_id: "master-audit" as const, status: "read_ok" as const, entries_read: 3, flow_events: 2, candidate_rows: 1, head_sequence: 3, head_hash: "abc" },
+      { source_id: "boot-audit" as const, status: "absent" as const, reason: "never contributed" },
+    ],
+    quarantined_sources: [],
+    definitive_empty: false,
+  });
+
+  async function writeRaw(store: ObserveStore, stateStore: StateStore, outcome: unknown): Promise<void> {
+    await store.putLastRefreshOutcome(validOutcome());
+    // Overwrite the persisted value with the raw (possibly malformed) shape
+    // through the same state path putLastRefreshOutcome uses.
+    await (store as unknown as { put(key: string, value: unknown): Promise<void> }).put(
+      "last-refresh",
+      outcome,
+    );
+  }
+
+  it("round-trips a fully valid two-source record", async () => {
+    const { store } = makeStore();
+    await store.putLastRefreshOutcome(validOutcome());
+    const read = await store.getLastRefreshOutcome();
+    expect(read).not.toBeNull();
+    expect(read?.source_reads).toHaveLength(2);
+  });
+
+  it("rejects a bare absent row lacking a reason (authority by omission)", async () => {
+    const { store, stateStore } = makeStore();
+    const malformed = validOutcome() as unknown as { source_reads: unknown[] };
+    malformed.source_reads[1] = { source_id: "boot-audit", status: "absent" };
+    await writeRaw(store, stateStore, malformed);
+    expect(await store.getLastRefreshOutcome()).toBeNull();
+  });
+
+  it("rejects an absent row smuggling a downgrade failure enum", async () => {
+    const { store, stateStore } = makeStore();
+    const malformed = validOutcome() as unknown as { source_reads: unknown[] };
+    malformed.source_reads[1] = {
+      source_id: "boot-audit",
+      status: "absent",
+      reason: "gone",
+      failure: "missing_after_contribution",
+    };
+    await writeRaw(store, stateStore, malformed);
+    expect(await store.getLastRefreshOutcome()).toBeNull();
+  });
+
+  it("rejects a single-source record (cannot carry full-registry authority)", async () => {
+    const { store, stateStore } = makeStore();
+    const partial = validOutcome() as unknown as { source_reads: unknown[] };
+    partial.source_reads = [partial.source_reads[0]];
+    await writeRaw(store, stateStore, partial);
+    expect(await store.getLastRefreshOutcome()).toBeNull();
+  });
+
+  it("rejects duplicate source ids", async () => {
+    const { store, stateStore } = makeStore();
+    const dup = validOutcome() as unknown as { source_reads: unknown[] };
+    dup.source_reads = [dup.source_reads[0], dup.source_reads[0]];
+    await writeRaw(store, stateStore, dup);
+    expect(await store.getLastRefreshOutcome()).toBeNull();
+  });
+
+  it("rejects an unknown source id", async () => {
+    const { store, stateStore } = makeStore();
+    const unknownSource = validOutcome() as unknown as { source_reads: unknown[] };
+    unknownSource.source_reads[1] = { source_id: "rogue-audit", status: "absent", reason: "x" };
+    await writeRaw(store, stateStore, unknownSource);
+    expect(await store.getLastRefreshOutcome()).toBeNull();
+  });
+});

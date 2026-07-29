@@ -222,6 +222,54 @@ function parseCandidateReview(
   return { review: candidate as ObserveCandidateReviewRecord };
 }
 
+/**
+ * Strict per-row validation for a persisted source read. A persisted
+ * `"absent"` row carries definitive-empty authority downstream (the shared
+ * R2 predicate), so a shallow top-level parse is not enough: a stale or
+ * malformed record must never gain that authority by omission. Any
+ * unrecognized shape rejects the WHOLE outcome (fail-closed -- consumers then
+ * render UNDETERMINED, never verified-empty).
+ */
+function isValidPersistedSourceRead(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const row = value as Record<string, unknown>;
+  if (!isObserveAuditSourceId(row.source_id)) return false;
+  if (row.instance_id !== undefined && typeof row.instance_id !== "string") return false;
+  const finiteCount = (n: unknown): boolean =>
+    typeof n === "number" && Number.isFinite(n) && n >= 0;
+  switch (row.status) {
+    case "read_ok":
+      // The persisted shape keeps the count fields optional; validate them
+      // only when present. The definitive-empty authority hinges on "absent"
+      // below, which stays strict.
+      return (
+        (row.entries_read === undefined || finiteCount(row.entries_read)) &&
+        (row.flow_events === undefined || finiteCount(row.flow_events)) &&
+        (row.candidate_rows === undefined || finiteCount(row.candidate_rows)) &&
+        (row.head_sequence === undefined ||
+          row.head_sequence === null ||
+          finiteCount(row.head_sequence)) &&
+        (row.head_hash === undefined ||
+          row.head_hash === null ||
+          typeof row.head_hash === "string")
+      );
+    case "absent":
+      // A downgraded previously-contributing source is status "read_failed"
+      // with an explicit failure enum; a valid persisted "absent" row must
+      // not smuggle one in.
+      return typeof row.reason === "string" && row.failure === undefined;
+    case "read_failed":
+      return (
+        typeof row.reason === "string" &&
+        (row.failure === "source_unreadable" ||
+          row.failure === "missing_after_contribution" ||
+          row.failure === "instance_changed_after_contribution")
+      );
+    default:
+      return false;
+  }
+}
+
 function parseLastRefreshOutcome(value: string): ObserveLastRefreshOutcome | null {
   let parsed: unknown;
   try {
@@ -244,6 +292,21 @@ function parseLastRefreshOutcome(value: string): ObserveLastRefreshOutcome | nul
     !Array.isArray(candidate.quarantined_sources) ||
     (candidate.definitive_empty !== undefined && typeof candidate.definitive_empty !== "boolean") ||
     (candidate.reason !== undefined && typeof candidate.reason !== "string")
+  ) {
+    return null;
+  }
+  // Every enumerated registry source must appear EXACTLY once with a strictly
+  // valid row. A record that lists only one source (e.g. persisted before the
+  // second source existed) or duplicates a source must never carry
+  // definitive-empty authority for the full registry.
+  if (!candidate.source_reads.every(isValidPersistedSourceRead)) {
+    return null;
+  }
+  const seen = candidate.source_reads.map((row) => (row as { source_id: string }).source_id);
+  if (
+    seen.length !== OBSERVE_AUDIT_SOURCE_IDS.length ||
+    new Set(seen).size !== seen.length ||
+    !OBSERVE_AUDIT_SOURCE_IDS.every((id) => seen.includes(id))
   ) {
     return null;
   }
