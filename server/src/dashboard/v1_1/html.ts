@@ -1276,12 +1276,14 @@ body {
   display: inline-flex; align-items: center; gap: 7px;
   padding: 4px 11px 4px 8px; border-radius: 999px; cursor: pointer;
   border: 1px solid var(--rule); background: var(--surface-2); color: var(--ink-2);
-  font-family: var(--mono); font-size: var(--text-xs); letter-spacing: 0.02em;
+  font-family: var(--mono); font-size: var(--text-xs); letter-spacing: 0;
+  max-width: min(300px, 42vw); white-space: nowrap;
 }
 .posture-seal .seal-glyph { width: 12px; height: 12px; position: relative; flex-shrink: 0; }
 .posture-seal .seal-glyph::before { content: ""; position: absolute; inset: 0; border: 1.5px solid currentColor; border-radius: 50%; }
 .posture-seal .seal-glyph::after { content: ""; position: absolute; inset: 4px; background: currentColor; border-radius: 50%; opacity: 0.9; }
-.posture-seal .seal-word { text-transform: uppercase; font-weight: 600; }
+.posture-seal .seal-word { text-transform: uppercase; font-weight: 600; flex-shrink: 0; }
+.posture-seal .seal-freshness { min-width: 0; overflow: hidden; text-overflow: ellipsis; opacity: 0.78; letter-spacing: 0; }
 .posture-seal.tone-protected { border-color: var(--sage); background: var(--sage-bg); color: var(--sage); }
 .posture-seal.tone-attention { border-color: var(--ochre); background: var(--ochre-bg); color: var(--ochre); }
 .posture-seal.tone-locked { border-color: var(--rust); background: var(--rust-bg); color: var(--rust); }
@@ -1690,9 +1692,10 @@ export function renderDashboardV11Html(
       </div>
       <div class="topbar-spacer"></div>
       <div class="posture-seal-wrap" id="posture-seal-wrap" data-seal>
-        <button type="button" class="posture-seal" id="posture-seal" data-action="posture-seal-toggle" aria-haspopup="true" aria-expanded="false" title="How protected you are right now">
+        <button type="button" class="posture-seal" id="posture-seal" data-action="posture-seal-toggle" aria-haspopup="true" aria-expanded="false" title="Current protection evidence">
           <span class="seal-glyph" aria-hidden="true"></span>
           <span class="seal-word" id="posture-seal-word">Checking</span>
+          <span class="seal-freshness" id="posture-seal-freshness">loading evidence</span>
         </button>
         <div class="posture-seal-pop" id="posture-seal-pop" hidden></div>
       </div>
