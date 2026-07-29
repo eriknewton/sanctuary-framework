@@ -50,6 +50,13 @@ const STREAM = config.streamUrl || "/api/stream";
 let TOKEN = config.authToken || sessionStorage.getItem("authToken") || "";
 const SANCTUARY_VERSION = config.sanctuaryVersion || "";
 const SESSION_KEY = "sanctuary-v11-sidebar";
+// The top-bar seal is the strongest visible protection claim on the page.
+// It must be backed by evidence, not just the backend arm-state label. Ten
+// minutes is only an upper bound here; if the payload supplies a smaller
+// window, the smaller window wins. Missing, malformed, or non-positive
+// freshness windows are unknown, never silently widened to this maximum.
+const SEAL_FRESHNESS_MAX_MS = 10 * 60 * 1000;
+let sealFreshnessTimer = null;
 
 // ── State ──────────────────────────────────────────────────────────────
 const state = {
@@ -687,8 +694,10 @@ function renderAgentSwitcher() {
 // word (deriveSeal); the popover spells out the named layers (no L-numbers).
 function renderPostureSeal() {
   const seal = deriveSeal();
+  scheduleSealFreshnessRefresh(seal.freshness);
   const sealEl = document.getElementById("posture-seal");
   const wordEl = document.getElementById("posture-seal-word");
+  const freshnessEl = document.getElementById("posture-seal-freshness");
   const popEl = document.getElementById("posture-seal-pop");
   if (!sealEl || !wordEl || !popEl) return;
   sealEl.classList.remove("tone-protected", "tone-attention", "tone-locked");
@@ -697,23 +706,29 @@ function renderPostureSeal() {
   else if (seal.tone === "attention") sealEl.classList.add("tone-attention");
   // "unknown" tone keeps the neutral default styling.
   wordEl.textContent = seal.word;
+  if (freshnessEl) {
+    freshnessEl.textContent = seal.freshness.inline;
+    freshnessEl.classList.remove("fresh", "not-fresh");
+    freshnessEl.classList.add(seal.freshness.current ? "fresh" : "not-fresh");
+  }
   const open = !!state.posture.sealOpen;
   popEl.hidden = !open;
   sealEl.setAttribute("aria-expanded", open ? "true" : "false");
+  sealEl.setAttribute("title", seal.title);
   if (!open) return;
   var head, sub;
   if (seal.tone === "protected") {
-    head = "You are protected.";
-    sub = "Everything below is checked right now. Nothing leaves this machine without your hand on it.";
+    head = "Protected. " + seal.freshness.inline + ".";
+    sub = "Protected means Castle Wall enforcement was observed within the freshness window and the Charter still gates risky actions. It does not mean every past action is fully verified here.";
   } else if (seal.tone === "locked") {
     head = "This fortress is locked down.";
-    sub = "Wrapped agents are held until you lift the lockdown. The Charter still gates every risky action.";
+    sub = "Lockdown holds wrapped agents. Protected is only shown when Castle Wall enforcement has current evidence.";
   } else if (seal.tone === "attention") {
-    head = "Needs your attention.";
-    sub = "Live enforcement is degraded or unconfirmed right now. The Charter still holds risky actions for your approval. Check the Health screen.";
+    head = "Protected is not confirmed.";
+    sub = "The current enforcement observation is missing, stale, invalid, degraded, or missing a freshness window. Risky actions still require approval.";
   } else {
     head = "Posture is being checked.";
-    sub = "Live enforcement evidence is not loaded yet. Until it is confirmed, this is not shown as protected.";
+    sub = "Live enforcement evidence is not loaded yet. Until it is current, this is not shown as protected.";
   }
   const lines = postureLayerLines().map(function (l) {
     const dotCls = l.off ? "pp-dot off" : (l.warn ? "pp-dot warn" : "pp-dot");
@@ -1238,6 +1253,19 @@ function relTimeFromIso(iso) {
   const diffDay = Math.floor(diffHr / 24);
   return diffDay + "d ago";
 }
+
+function durationLabelFromMs(ms) {
+  const safeMs = Math.max(0, Number(ms) || 0);
+  const sec = Math.floor(safeMs / 1000);
+  if (sec < 60) return sec + "s";
+  const min = Math.floor(sec / 60);
+  if (min < 60) return min + "m";
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return hr + "h";
+  const day = Math.floor(hr / 24);
+  return day + "d";
+}
+
 function renderAgentsList() {
   if (!state.agents.length) return '<h1>Agents</h1>' +
     '<div class="agents-empty">' +
@@ -2571,10 +2599,12 @@ function renderFortress() {
     : "All agents";
   const fortressLabel = escHtml(config.tenantName || config.fortressId || "this fortress");
   var protectingLine;
-  if (seal.arm === "armed") {
+  if (seal.tone === "protected") {
     protectingLine = "Castle Wall is enforcing on this machine. Sentinels watch every wrapped agent, and the Charter holds anything risky for your approval.";
   } else if (seal.arm === "locked_down") {
     protectingLine = "This fortress is locked down. Wrapped agents are held until you lift it. The Charter still gates every risky action.";
+  } else if (seal.arm === "armed") {
+    protectingLine = "Castle Wall enforcement evidence is not current enough for a protected claim. Sentinels still watch your wrapped agents and the Charter still holds risky actions for your approval.";
   } else if (seal.arm === "degraded") {
     protectingLine = "Castle Wall protection is degraded right now. Sentinels still watch your wrapped agents and the Charter still holds risky actions for your approval. Check the Health screen.";
   } else {
@@ -2594,7 +2624,7 @@ function renderFortress() {
       '<div class="ambient-posture">',
         '<div class="ambient-seal tone-' + seal.tone + '">',
           '<span class="as-glyph"></span>',
-          '<span class="as-text"><strong>' + escHtml(seal.word) + '</strong><small>' + scopeLabel + ' &middot; ' + fortressLabel + '</small></span>',
+          '<span class="as-text"><strong>' + escHtml(seal.word) + '</strong><small>' + escHtml(seal.freshness.inline) + ' &middot; ' + scopeLabel + ' &middot; ' + fortressLabel + '</small></span>',
         '</div>',
         '<div class="ambient-line"><span class="lead">What is protecting you</span>' + escHtml(protectingLine) + '</div>',
         '<div class="ambient-stats">',
@@ -3095,22 +3125,173 @@ async function fetchPostureHome() {
   }
 }
 
+function liveEnforcementSnapshot() {
+  const d = state.posture.data;
+  return d && d.live_enforcement ? d.live_enforcement : null;
+}
+
+function sealFreshnessWindowMs(live) {
+  const payloadWindow = live ? Number(live.freshness_window_ms) : NaN;
+  if (Number.isFinite(payloadWindow) && payloadWindow > 0) {
+    return Math.min(payloadWindow, SEAL_FRESHNESS_MAX_MS);
+  }
+  return null;
+}
+
+function sealEvidenceWhat(live) {
+  if (!live) return "not loaded";
+  switch (live.evidence_basis) {
+    case "fresh_enforcement_evidence":
+    case "stale_evidence":
+      return "Castle Wall enforcement";
+    case "not_enforcing_evidence":
+      return "not enforcing";
+    case "intentionally_stopped":
+      return "intentional stand-down";
+    case "daemon_liveness_unconfirmed":
+      return "daemon liveness unconfirmed";
+    case "not_installed":
+      return "wall not installed";
+    case "subject_unbound_evidence":
+      return "subject unbound";
+    case "legacy_macos_audit_token":
+      return "legacy macOS audit token";
+    case "pre_canonical_linux_agent_name":
+      return "pre-canonical Linux agent name";
+    case "subject_unresolvable":
+      return "subject unresolved";
+    case "producer_key_unavailable":
+      return "producer key unavailable";
+    case "no_evidence":
+      return "no enforcement evidence";
+    default:
+      return live.castle_wall_arm_state
+        ? String(live.castle_wall_arm_state).replace(/_/g, " ")
+        : "unknown";
+  }
+}
+
+function deriveSealFreshness(live, now) {
+  const checkedAt = typeof now === "number" ? now : Date.now();
+  const windowMs = sealFreshnessWindowMs(live);
+  const windowKnown = typeof windowMs === "number" && Number.isFinite(windowMs);
+  const windowLabel = windowKnown ? durationLabelFromMs(windowMs) : "unknown";
+  const what = sealEvidenceWhat(live);
+  if (!windowKnown) {
+    return {
+      state: "unknown",
+      current: false,
+      inline: "freshness window unknown",
+      detail: "freshness window unknown",
+      windowLabel: windowLabel,
+      windowKnown: false,
+      refreshAt: null,
+      what: what
+    };
+  }
+  const raw = live && live.last_enforcement_evidence_at;
+  if (typeof raw !== "string" || raw.trim() === "") {
+    return {
+      state: "absent",
+      current: false,
+      inline: "no evidence",
+      detail: "not provided",
+      windowLabel: windowLabel,
+      windowKnown: true,
+      refreshAt: null,
+      what: what
+    };
+  }
+  const iso = raw.trim();
+  const observedAt = Date.parse(iso);
+  if (!Number.isFinite(observedAt)) {
+    return {
+      state: "unparseable",
+      current: false,
+      inline: "invalid evidence time",
+      detail: "unparseable timestamp",
+      windowLabel: windowLabel,
+      windowKnown: true,
+      refreshAt: null,
+      what: what
+    };
+  }
+  const ageMs = checkedAt - observedAt;
+  if (ageMs < 0) {
+    return {
+      state: "unparseable",
+      current: false,
+      inline: "invalid evidence time",
+      detail: "timestamp is in the future",
+      windowLabel: windowLabel,
+      windowKnown: true,
+      refreshAt: null,
+      what: what
+    };
+  }
+  const ageLabel = durationLabelFromMs(ageMs);
+  const inline = "last evidenced " + ageLabel + " ago";
+  const current = ageMs <= windowMs;
+  return {
+    state: current ? "fresh" : "stale",
+    current: current,
+    inline: inline,
+    detail: shortTime(iso) + " (" + ageLabel + " ago)",
+    windowLabel: windowLabel,
+    windowKnown: true,
+    refreshAt: current ? observedAt + windowMs + 1000 : null,
+    what: what
+  };
+}
+
+function clearSealFreshnessTimer() {
+  if (sealFreshnessTimer !== null) clearTimeout(sealFreshnessTimer);
+  sealFreshnessTimer = null;
+}
+
+function scheduleSealFreshnessRefresh(freshness) {
+  clearSealFreshnessTimer();
+  if (
+    !freshness ||
+    !freshness.current ||
+    typeof freshness.refreshAt !== "number" ||
+    !Number.isFinite(freshness.refreshAt)
+  ) return;
+  const delayMs = Math.max(0, freshness.refreshAt - Date.now());
+  sealFreshnessTimer = setTimeout(function () {
+    sealFreshnessTimer = null;
+    rerender();
+  }, delayMs);
+}
+
 // Wave 1: map the honest Castle Wall arm-state to the operator-facing seal.
-// "armed" (fresh enforcement evidence) is the ONLY green/Protected state;
-// "degraded" reads Attention; everything else (unknown, not_installed,
-// missing data) reads Attention too, NEVER Protected (never-overclaim).
+// "armed" plus current, parseable enforcement evidence is the ONLY
+// green/Protected state; "degraded" reads Attention; everything else
+// (unknown, not_installed, missing data, absent evidence timestamp,
+// unparseable evidence timestamp, stale evidence timestamp) reads non-green.
 // A locked-down fortress (the lockdown control engaged) reads Locked.
 function deriveSeal() {
   const t1 = state.tier1.lockdown.state;
+  const live = liveEnforcementSnapshot();
+  const freshness = deriveSealFreshness(live);
+  const arm = live ? live.castle_wall_arm_state : null;
+  const title = function (word) {
+    const qualifier = freshness.inline.charAt(0).toUpperCase() + freshness.inline.slice(1);
+    return word + ". " + qualifier + ".";
+  };
   if (t1 === "engaged") {
-    return { tone: "locked", word: "Locked", arm: "locked_down" };
+    return { tone: "locked", word: "Locked", arm: "locked_down", freshness: freshness, title: title("Locked") };
   }
-  const d = state.posture.data;
-  const arm = d && d.live_enforcement ? d.live_enforcement.castle_wall_arm_state : null;
-  if (arm === "armed") return { tone: "protected", word: "Protected", arm: arm };
-  if (arm === "degraded") return { tone: "attention", word: "Attention", arm: arm };
-  if (arm) return { tone: "attention", word: "Attention", arm: arm };
-  return { tone: "unknown", word: "Unknown", arm: null };
+  if (arm === "armed" && freshness.current) {
+    return { tone: "protected", word: "Protected", arm: arm, freshness: freshness, title: title("Protected") };
+  }
+  if (arm === "degraded") {
+    return { tone: "attention", word: "Attention", arm: arm, freshness: freshness, title: title("Attention") };
+  }
+  if (arm) {
+    return { tone: "attention", word: "Attention", arm: arm, freshness: freshness, title: title("Attention") };
+  }
+  return { tone: "unknown", word: "Unknown", arm: null, freshness: freshness, title: title("Unknown") };
 }
 
 // Plain-English line for the named layer in the posture popover. Uses the
@@ -3120,7 +3301,8 @@ function postureLayerLines() {
   const d = state.posture.data;
   const seal = deriveSeal();
   var wallV;
-  if (seal.arm === "armed") wallV = "enforcing";
+  if (seal.arm === "armed" && seal.freshness.current) wallV = "enforcing";
+  else if (seal.arm === "armed") wallV = "evidence not current";
   // S5-P: honest coarse-only line - the coarse wall IS enforcing, the
   // fine-grained exclusive-egress stack is not live. Non-green (warn) below.
   else if (seal.arm === "coarse_only") wallV = "coarse-only (exclusive egress not live)";
@@ -3128,10 +3310,13 @@ function postureLayerLines() {
   else if (seal.arm === "locked_down") wallV = "locked down";
   else if (seal.arm) wallV = "not enforcing";
   else wallV = "unknown";
-  const wallWarn = seal.arm !== "armed";
+  const wallWarn = !(seal.arm === "armed" && seal.freshness.current);
   const pending = state.inbox.filter(function (i) { return !i.resolved && i.kind === "approval_pending"; }).length;
   const wrapped = state.agents.length;
   return [
+    { k: "What was evidenced", v: seal.freshness.what, warn: !seal.freshness.current, off: seal.freshness.state === "absent" },
+    { k: "Evidence time", v: seal.freshness.detail, warn: !seal.freshness.current, off: seal.freshness.state === "absent" },
+    { k: "Freshness window", v: seal.freshness.windowKnown ? "within " + seal.freshness.windowLabel : "unknown", warn: !seal.freshness.windowKnown },
     { k: "Castle Wall (boundary)", v: wallV, warn: wallWarn },
     { k: "Sentinels watching agents", v: wrapped + " wrapped", warn: false, off: wrapped === 0 },
     { k: "Charter approvals", v: pending ? pending + " waiting" : "clear", warn: pending > 0 },
@@ -3581,6 +3766,10 @@ function bindHashRoute() {
   window.addEventListener("hashchange", fromHash);
   fromHash();
 }
+
+document.addEventListener("visibilitychange", function () {
+  if (document.visibilityState === "visible") rerender();
+});
 
 document.addEventListener("click", function (ev) {
   const rawTgt = ev.target;
