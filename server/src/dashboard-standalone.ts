@@ -160,7 +160,7 @@ function waitForStandaloneShutdownGrace(
 ): Promise<"settled" | "timeout"> {
   return new Promise((resolve) => {
     const timeout = setTimeout(() => resolve("timeout"), ms);
-    promise.finally(() => {
+    void promise.finally(() => {
       clearTimeout(timeout);
       resolve("settled");
     });

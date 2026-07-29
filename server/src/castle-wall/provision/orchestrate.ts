@@ -1040,6 +1040,7 @@ function outcomeKeepsRehome(outcome: ProvisionFlowOutcome): boolean {
       // OUTCOMES_THAT_OWN_THE_HARNESS exits before any restore note is built.
       // Keep the cases explicit so the switch remains exhaustive without
       // implying their re-home wording can currently be rendered by this helper.
+      // falls through
     case "exclusive-egress-unarmed-coarse-active":
     case "armed-exclusive":
     case "armed-exclusive-repark-failed":
