@@ -91,6 +91,14 @@ import {
   runAutoProvisionForWrap,
   type AutoProvisionSummary,
 } from "./auto-provision.js";
+import {
+  protectPreflightExitCode,
+  renderProtectPreflightJson,
+  renderProtectPreflightReport,
+  runProtectPreflight,
+  type ProtectPreflightReport,
+  type RunProtectPreflightInput,
+} from "./preflight.js";
 import type {
   DisarmNePreferenceOutcome,
   ProvisionFlowOutcome,
@@ -451,6 +459,14 @@ export function registerProcessShutdownCleanup(
 // ── Types ───────────────────────────────────────────────────────────
 
 export interface WrapOptions {
+  /** True when the top-level CLI invoked this module through `sanctuary protect`. */
+  protectCommand?: boolean;
+  /** Run the read-only install preflight and exit before any host mutation. */
+  preflight?: boolean;
+  /** Render the preflight table as machine-readable JSON. */
+  preflightJson?: boolean;
+  /** Treat UNDETERMINED preflight rows as a non-zero exit. */
+  preflightStrict?: boolean;
   /** Wrap a specific config file. */
   wrap?: string;
   /** Auto-detect OpenClaw config. */
@@ -2605,6 +2621,13 @@ export function renderAutoProvisionOutcome(
 
 export interface RunWrapDeps {
   /**
+   * Override the read-only protect preflight (for tests). Production callers
+   * leave this undefined and get the real preflight probes.
+   */
+  runProtectPreflight?: (
+    input?: RunProtectPreflightInput,
+  ) => Promise<ProtectPreflightReport>;
+  /**
    * Override the auto-provision entry point (for tests). Production
    * callers leave this undefined and get the real
    * `wrap/auto-provision.ts:runAutoProvisionForWrap`, which is the ONLY
@@ -2696,6 +2719,12 @@ export async function runWrap(
 ): Promise<void> {
   installProcessShutdownListeners();
 
+  if (options.preflight === true && options.unwrap === true) {
+    // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
+    console.error("\n  Sanctuary protect: --preflight cannot be combined with --unwrap.\n");
+    process.exit(2);
+  }
+
   // D4 P2-2: --unwrap honors --dry-run too - pre-fix, the unwrap dispatch
   // sat above the dry-run gate, so `--unwrap --dry-run` restored backups
   // for real. The gate travels into unwrap() so it can report what WOULD
@@ -2703,6 +2732,52 @@ export async function runWrap(
   if (options.unwrap) {
     await unwrap(options.dryRun === true);
     return;
+  }
+
+  // v1.1.1 hotfix (Finding T): honor --fortress and SANCTUARY_FORTRESS_PATH
+  // by promoting them onto SANCTUARY_STORAGE_PATH BEFORE any code calls
+  // resolveStoragePath(). Extracted so tests can pin the precedence
+  // without standing up the whole wrap flow.
+  promoteFortressToStoragePath(options);
+
+  if (options.preflight === true && options.protectCommand !== true) {
+    // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
+    console.error("\n  Sanctuary wrap: --preflight is only valid with 'sanctuary protect --preflight'.\n");
+    process.exit(2);
+  }
+  if (options.preflightJson === true && options.preflight !== true) {
+    // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
+    console.error("\n  Sanctuary protect: --json is only valid with --preflight.\n");
+    process.exit(2);
+  }
+
+  const protectInstallFlow =
+    options.protectCommand === true &&
+    options.repairEgressGate !== true &&
+    options.unprotectEgressGate !== true;
+  if (options.protectCommand === true && (options.preflight === true || protectInstallFlow)) {
+    const preflight = await (deps.runProtectPreflight ?? runProtectPreflight)({
+      strict: options.preflightStrict === true,
+    });
+    const preflightCode = protectPreflightExitCode(
+      preflight,
+      options.preflightStrict === true,
+    );
+    if (options.preflightJson === true) {
+      process.stdout.write(renderProtectPreflightJson(preflight));
+    } else {
+      process.stderr.write(`\n${renderProtectPreflightReport(preflight)}`);
+    }
+    if (options.preflight === true) {
+      process.exit(preflightCode);
+    }
+    if (preflightCode !== 0) {
+      // SAFETY: stderr is the operator-facing CLI channel; this fixed text names only preflight status.
+      console.error(
+        "  Sanctuary protect refused before any host mutation. Fix the FAIL rows and re-run.\n",
+      );
+      process.exit(preflightCode);
+    }
   }
 
   // Finding 4 (2026-06-25): validate --dev-dist BEFORE anything is previewed or
@@ -2721,12 +2796,6 @@ export async function runWrap(
       throw err;
     }
   }
-
-  // v1.1.1 hotfix (Finding T): honor --fortress and SANCTUARY_FORTRESS_PATH
-  // by promoting them onto SANCTUARY_STORAGE_PATH BEFORE any code calls
-  // resolveStoragePath(). Extracted so tests can pin the precedence
-  // without standing up the whole wrap flow.
-  promoteFortressToStoragePath(options);
 
   // S5-6: the exclusive-egress repair verb. Does NOT wrap anything -- it
   // re-runs the gate generation bring-up + release barrier for an
@@ -5748,6 +5817,9 @@ const WRAP_BOOLEAN_FLAGS = new Set([
   "--unprotect-egress-gate",
   "--stand-down-agent",
   "--override-transient-pf-rules",
+  "--preflight",
+  "--json",
+  "--strict",
   "--help",
   "-h",
 ]);
@@ -5869,6 +5941,15 @@ export function parseWrapArgs(argv: string[]): WrapOptions {
       case "--override-transient-pf-rules":
         options.overrideTransientPfRules = true;
         break;
+      case "--preflight":
+        options.preflight = true;
+        break;
+      case "--json":
+        options.preflightJson = true;
+        break;
+      case "--strict":
+        options.preflightStrict = true;
+        break;
       case "--fortress":
         options.fortress = argv[++i];
         break;
@@ -5894,6 +5975,12 @@ export function parseWrapArgs(argv: string[]): WrapOptions {
       "--stand-down-agent is only valid with --repair-egress-gate or --unprotect-egress-gate.",
     );
   }
+  if (options.preflightJson === true && options.preflight !== true) {
+    throw new Error("--json is only valid with --preflight.");
+  }
+  if (options.preflight === true && options.unwrap === true) {
+    throw new Error("--preflight cannot be combined with --unwrap.");
+  }
 
   return options;
 }
@@ -5912,6 +5999,7 @@ function printWrapHelp(): void {
     sanctuary wrap --mastra            Wrap Mastra
     sanctuary wrap --wrap <path>       Wrap a specific MCP config file
     sanctuary wrap --unwrap            Restore original config
+    sanctuary protect --preflight      Run the read-only install preflight
 
   Options:
     --openclaw         Auto-detect and wrap OpenClaw
@@ -5922,6 +6010,9 @@ function printWrapHelp(): void {
     --mastra           Auto-detect and wrap Mastra
     --wrap <path>      Wrap a specific MCP config file
     --unwrap           Restore original config from backup
+    --preflight        Run every knowable install preflight check and exit
+    --json             Render --preflight output as machine-readable JSON
+    --strict           Make UNDETERMINED preflight rows exit non-zero
     --passphrase <p>   Override the stored passphrase (one-off)
     --fortress <path>  Fortress directory (default: ~/.sanctuary). Honors
                        SANCTUARY_FORTRESS_PATH env var when the flag is

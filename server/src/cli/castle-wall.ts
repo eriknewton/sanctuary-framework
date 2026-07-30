@@ -513,7 +513,7 @@ function fingerprintFromPublicKey(publicKey: Uint8Array): string {
     .slice(0, 16);
 }
 
-function parseCastleWallState(raw: string): SysextState {
+export function parseCastleWallState(raw: string): SysextState {
   if (raw.includes("[activated enabled]")) return "[activated enabled]";
   if (raw.includes("[activated waiting for user]")) {
     return "[activated waiting for user]";

@@ -85,6 +85,25 @@ describe("Wrap CLI", () => {
       expect(opts.devDist).toBe("/abs/path/to/dist/cli.js");
     });
 
+    it("parses protect preflight flags", () => {
+      const opts = parseWrapArgs(["--preflight", "--json", "--strict"]);
+      expect(opts.preflight).toBe(true);
+      expect(opts.preflightJson).toBe(true);
+      expect(opts.preflightStrict).toBe(true);
+    });
+
+    it("rejects --json without --preflight", () => {
+      expect(() => parseWrapArgs(["--json"])).toThrow(
+        /--json is only valid with --preflight/,
+      );
+    });
+
+    it("rejects --preflight with --unwrap", () => {
+      expect(() => parseWrapArgs(["--preflight", "--unwrap"])).toThrow(
+        /--preflight cannot be combined with --unwrap/,
+      );
+    });
+
     it("parses combined flags", () => {
       const opts = parseWrapArgs([
         "--openclaw",
