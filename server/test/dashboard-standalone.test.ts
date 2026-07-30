@@ -228,17 +228,25 @@ describe("Standalone Dashboard", () => {
     // helper also pins tenant discovery to an empty test root, so this fresh
     // fortress cannot auto-discover a parallel tenant and engage loopback
     // auto-auth.
-    process.env.SANCTUARY_STORAGE_PATH = tempDir;
-    process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN = "test-token-snapshot-auth";
+    const authToken = "test-token-snapshot-auth";
+    delete process.env.SANCTUARY_STORAGE_PATH;
+    delete process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN;
 
     const result = await startDashboardOnFreePort({
       passphrase: "test-passphrase-snapshot-auth",
       host: "127.0.0.1",
+      storagePath: tempDir,
+      authToken,
+      recoveryOut: join(escrowDir, "recovery.txt"),
     });
     dashboard = result.dashboard;
 
     const res = await fetch(`http://127.0.0.1:${result.port}/api/snapshot`);
     expect(res.status).toBe(401);
+    const authed = await fetch(`http://127.0.0.1:${result.port}/api/snapshot`, {
+      headers: { Authorization: `Bearer ${authToken}` },
+    });
+    expect(authed.status).toBe(200);
   });
 
   it("uses custom port from options", async () => {

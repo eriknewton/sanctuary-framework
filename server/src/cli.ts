@@ -135,6 +135,7 @@ async function main(): Promise<void> {
     }
     const { parseWrapArgs, runWrap } = await import("./wrap/cli.js");
     const opts = parseWrapArgs(args.slice(1));
+    if (args[0] === "protect") opts.protectCommand = true;
     await runWrap(opts);
     return;
   }

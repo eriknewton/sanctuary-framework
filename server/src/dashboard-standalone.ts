@@ -24,6 +24,7 @@
 import { mkdir } from "node:fs/promises";
 import { randomBytes } from "node:crypto";
 import { homedir } from "node:os";
+import { join } from "node:path";
 import { loadConfig, SANCTUARY_VERSION } from "./config.js";
 import { FilesystemStorage } from "./storage/filesystem.js";
 import { AuditLog } from "./operational/audit-log.js";
@@ -252,6 +253,18 @@ export interface StandaloneDashboardOptions {
   port?: number;
   host?: string;
   /**
+   * Programmatic storage-path override for callers/tests that already resolved
+   * the tenant and should not depend on mutable SANCTUARY_STORAGE_PATH process
+   * state. CLI callers normally leave this unset and use config/env/--tenant.
+   */
+  storagePath?: string;
+  /**
+   * Programmatic dashboard-auth override. Same semantics as
+   * config.dashboard.auth_token, but avoids process-env races in embedded
+   * callers and tests.
+   */
+  authToken?: string;
+  /**
    * TEST-ONLY. Bind port for the HABEAS local distress listener (127.0.0.1:8741
    * in production). Production callers leave this undefined so the listener
    * takes the fixed reserved port. Tests pass `0` so every parallel dashboard
@@ -406,6 +419,10 @@ export async function startStandaloneDashboard(
   // Force dashboard enabled for this mode
   process.env.SANCTUARY_DASHBOARD_ENABLED = "true";
 
+  if (options.tenant !== undefined && options.storagePath !== undefined) {
+    throw new Error("startStandaloneDashboard: tenant and storagePath are mutually exclusive");
+  }
+
   // 0. Resolve --tenant before loadConfig so the rest of the boot path picks
   //    up the per-tenant storage path. Operator-typed --tenant beats env var.
   if (options.tenant !== undefined) {
@@ -423,7 +440,19 @@ export async function startStandaloneDashboard(
   }
 
   // 1. Load configuration
-  const config = await loadConfig(options.configPath);
+  const config = await loadConfig(
+    options.configPath ?? (
+      options.storagePath !== undefined
+        ? join(options.storagePath, "sanctuary.json")
+        : undefined
+    ),
+  );
+  if (options.storagePath !== undefined) {
+    config.storage_path = options.storagePath;
+  }
+  if (options.authToken !== undefined) {
+    config.dashboard.auth_token = options.authToken;
+  }
 
   // 2. Ensure storage directory exists
   await mkdir(config.storage_path, { recursive: true, mode: 0o700 });

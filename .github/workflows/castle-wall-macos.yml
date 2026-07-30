@@ -18,12 +18,14 @@ on:
     paths:
       - "castle-wall-macos/**"
       - "server/src/castle-wall/**"
+      - "server/src/cli/castle-wall.ts"
       - ".github/workflows/castle-wall-macos.yml"
   pull_request:
     branches: [main]
     paths:
       - "castle-wall-macos/**"
       - "server/src/castle-wall/**"
+      - "server/src/cli/castle-wall.ts"
       - ".github/workflows/castle-wall-macos.yml"
 
 permissions:
