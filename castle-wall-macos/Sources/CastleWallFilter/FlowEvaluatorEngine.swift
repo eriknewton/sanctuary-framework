@@ -87,6 +87,25 @@ public final class FlowEvaluatorEngine {
     /// tuple short-circuit. Uncertain outcomes are NOT cached because the
     /// resolution arrives via the operator-decision IPC path.
     public func evaluate(_ descriptor: FilterFlowDescriptor) -> EvaluationOutcome {
+        if armLease.missingLeaseReason() != nil, let snapshot = manifestStore.currentSnapshot() {
+            let origin = OriginClassifier.originClass(
+                descriptor: descriptor,
+                agentOrigin: agentOrigin
+            )
+            if origin != .operator {
+                let outcome = AllowlistEvaluator.evaluate(
+                    flow: descriptor,
+                    rules: snapshot.rules,
+                    agentOrigin: agentOrigin,
+                    operatorBaseline: snapshot.operatorBaseline
+                )
+                if case .drop = outcome {
+                    return outcome
+                }
+                return .drop(matchedRuleId: ArmLease.missingLeaseRuleId)
+            }
+        }
+
         if armLease.failOpenReason() != nil {
             // Intentional operator-armed degrade: an expired/stopped dead-man
             // lease fails OPEN so an SSH-only operator can always recover from

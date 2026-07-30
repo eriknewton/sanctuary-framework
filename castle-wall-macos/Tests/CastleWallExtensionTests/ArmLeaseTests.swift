@@ -43,6 +43,26 @@ final class ArmLeaseTests: XCTestCase {
         )
     }
 
+    func test_defaultLeaseReportsMissingUntilFirstArmLeaseArrives() {
+        let clock = TestClock()
+        let lease = makeLease(clock)
+
+        XCTAssertEqual(lease.missingLeaseReason(), "arm_lease_missing")
+        XCTAssertFalse(lease.snapshot().leaseReceived)
+
+        lease.update(armUpdate(ttlSeconds: nil))
+
+        XCTAssertNil(lease.missingLeaseReason())
+        XCTAssertTrue(lease.snapshot().leaseReceived)
+
+        lease.resetToMissing()
+
+        XCTAssertEqual(lease.missingLeaseReason(), "arm_lease_missing")
+        XCTAssertFalse(lease.snapshot().leaseReceived)
+        XCTAssertFalse(lease.snapshot().armed)
+        XCTAssertFalse(lease.snapshot().revoked)
+    }
+
     // MARK: - The 0-contract: ttl_seconds == 0 means "expire now"
 
     // This is the exact instant the daemon broadcasts on expiry. A received
