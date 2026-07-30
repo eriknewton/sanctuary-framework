@@ -575,6 +575,11 @@ export interface WrapOptions {
    */
   exclusiveEgress?: boolean;
   /**
+   * Explicitly allow dedicated-account re-home to replace an occupied
+   * destination after preserving it as a dated sibling. Default is refusal.
+   */
+  overwriteDestination?: boolean;
+  /**
    * S5-6 repair verb: re-run the exclusive-egress bring-up + release barrier
    * for an already-provisioned fine-grained agent (after a flush, gate
    * crash, or degrade). Runs the MED-7 transient-pf-rule drift guard first
@@ -2295,6 +2300,7 @@ async function maybeRunAutoProvisionForWrap(
         },
         // S5-6: fine-grained (exclusive-egress) provisioning mode.
         exclusiveEgress: options.exclusiveEgress,
+        overwriteDestination: options.overwriteDestination,
         // SAFETY: stderr is the operator-facing CLI channel for this
         // subcommand; this prints the plan-and-print + progress lines from
         // the auto-provision flow (account plan, re-home summary, arm
@@ -5813,6 +5819,7 @@ const WRAP_BOOLEAN_FLAGS = new Set([
   "--provision-agent-account",
   "--no-provision-agent-account",
   "--exclusive-egress",
+  "--overwrite-destination",
   "--repair-egress-gate",
   "--unprotect-egress-gate",
   "--stand-down-agent",
@@ -5928,6 +5935,9 @@ export function parseWrapArgs(argv: string[]): WrapOptions {
         break;
       case "--exclusive-egress":
         options.exclusiveEgress = true;
+        break;
+      case "--overwrite-destination":
+        options.overwriteDestination = true;
         break;
       case "--repair-egress-gate":
         options.repairEgressGate = true;
@@ -6056,6 +6066,10 @@ function printWrapHelp(): void {
                        acknowledge and permit the required agent-harness stop.
                        Those verbs stop and disable the harness before changing
                        exclusive-egress state and refuse without this flag.
+    --overwrite-destination
+                       During dedicated-account re-home, preserve an occupied
+                       destination as a dated sibling and move the operator
+                       source anyway. Default: refuse before backup/move.
     --help, -h         Show this help
 
   What happens:

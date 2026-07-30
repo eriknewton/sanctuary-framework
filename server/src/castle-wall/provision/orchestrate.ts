@@ -1421,7 +1421,7 @@ async function runProvisionFlowSteps(
         // FIX (round 5 / R3-2): only "attempted" if a move actually landed;
         // an empty-partialResults rehome throw moved nothing, so the CLI
         // shows the neutral "nothing changed" frame, not a restore claim.
-        rehomeAttempted: partialResults.some((r) => r.status === "moved"),
+        rehomeAttempted: partialResults.some((r) => r.status === "moved" || r.status === "destination-displaced"),
         // FIX (round 5 / R4-2): create-account already succeeded by the time
         // re-home runs, so an orphaned hidden account exists even when nothing
         // moved -- the neutral frame must not claim "no account was created".
@@ -1465,7 +1465,7 @@ async function runProvisionFlowSteps(
       conflictPaths: td.conflictPaths,
       failedPaths: td.failedPaths,
       daemonTeardownFailed: td.daemonTeardownError !== undefined || td.policyDaemonTeardownError !== undefined,
-      rehomeAttempted: rehomeResults.some((r) => r.status === "moved"),
+      rehomeAttempted: rehomeResults.some((r) => r.status === "moved" || r.status === "destination-displaced"),
       accountCreated,
     };
   }
@@ -1509,7 +1509,7 @@ async function runProvisionFlowSteps(
       conflictPaths: td.conflictPaths,
       failedPaths: td.failedPaths,
       daemonTeardownFailed: td.daemonTeardownError !== undefined || td.policyDaemonTeardownError !== undefined,
-      rehomeAttempted: rehomeResults.some((r) => r.status === "moved"),
+      rehomeAttempted: rehomeResults.some((r) => r.status === "moved" || r.status === "destination-displaced"),
       accountCreated,
     };
   }
@@ -1552,7 +1552,7 @@ async function runProvisionFlowSteps(
       conflictPaths: td.conflictPaths,
       failedPaths: td.failedPaths,
       daemonTeardownFailed: td.daemonTeardownError !== undefined || td.policyDaemonTeardownError !== undefined,
-      rehomeAttempted: rehomeResults.some((r) => r.status === "moved"),
+      rehomeAttempted: rehomeResults.some((r) => r.status === "moved" || r.status === "destination-displaced"),
       accountCreated,
     };
   }
@@ -1628,7 +1628,7 @@ async function runProvisionFlowSteps(
       failedPaths: td.failedPaths,
       daemonTeardownFailed:
         td.daemonTeardownError !== undefined || td.policyDaemonTeardownError !== undefined,
-      rehomeAttempted: rehomeResults.some((r) => r.status === "moved"),
+      rehomeAttempted: rehomeResults.some((r) => r.status === "moved" || r.status === "destination-displaced"),
       accountCreated,
     };
   }
@@ -1679,7 +1679,7 @@ async function runProvisionFlowSteps(
       conflictPaths: td.conflictPaths,
       failedPaths: td.failedPaths,
       daemonTeardownFailed: td.daemonTeardownError !== undefined || td.policyDaemonTeardownError !== undefined,
-      rehomeAttempted: rehomeResults.some((r) => r.status === "moved"),
+      rehomeAttempted: rehomeResults.some((r) => r.status === "moved" || r.status === "destination-displaced"),
       accountCreated,
     };
   }
@@ -1713,7 +1713,7 @@ async function runProvisionFlowSteps(
       conflictPaths: td.conflictPaths,
       failedPaths: td.failedPaths,
       daemonTeardownFailed: td.daemonTeardownError !== undefined || td.policyDaemonTeardownError !== undefined,
-      rehomeAttempted: rehomeResults.some((r) => r.status === "moved"),
+      rehomeAttempted: rehomeResults.some((r) => r.status === "moved" || r.status === "destination-displaced"),
       accountCreated,
     };
   }
@@ -1805,7 +1805,7 @@ async function runProvisionFlowSteps(
       wallMayBeArmed: wallMayBeArmed ? true : undefined,
       ...(nePreferenceOutcome !== undefined ? { disarmOutcome: nePreferenceOutcome } : {}),
       disarmObservedOff,
-      rehomeAttempted: rehomeResults.some((r) => r.status === "moved"),
+      rehomeAttempted: rehomeResults.some((r) => r.status === "moved" || r.status === "destination-displaced"),
       accountCreated,
     };
   }
@@ -2149,7 +2149,9 @@ async function safeRestore(
       rolledBack: false,
       backupPaths: results.filter((r) => r.backupPath).map((r) => r.backupPath!),
       conflictPaths: [],
-      failedPaths: results.filter((r) => r.status === "moved").map((r) => r.entry.sourcePath),
+      failedPaths: results
+        .filter((r) => r.status === "moved" || r.status === "destination-displaced")
+        .map((r) => r.entry.sourcePath),
     };
   }
 }

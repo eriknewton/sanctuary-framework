@@ -34,9 +34,9 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtemp, rm, mkdir, writeFile, readFile, access, chmod, lstat, stat, symlink, readlink } from "node:fs/promises";
+import { mkdtemp, rm, mkdir, writeFile, readFile, access, chmod, lstat, stat, symlink, readlink, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, dirname } from "node:path";
+import { join, dirname, basename } from "node:path";
 
 import {
   credentialReadableAsUidDecision,
@@ -71,6 +71,7 @@ import { harnessLaunchSpec } from "../../src/egress-gate/harness-daemon.js";
 import {
   planRehome,
   executeRehomePlan,
+  restoreRehomeSteps,
   RehomeExecutionError,
   type AgentRehomeAdapter,
   type RehomeOps,
@@ -449,14 +450,23 @@ describe("castle-wall/provision/rehome real-ops chokepoint: RehomeExecutionError
     let moveCount = 0;
     return {
       pathExists: async () => true,
+      pathExistsNoFollow: async () => false,
+      hashPath: async (path) => ({ algorithm: "sha256", value: `hash-${path}` }),
+      readDestinationProvenance: async () => undefined,
+      recordDestinationProvenance: async () => {},
+      clearDestinationProvenance: async () => {},
+      displaceDestination: async (destPath) => ({ displacedPath: `${destPath}.displaced-20260729T000000000Z` }),
+      restoreDisplacedDestination: async () => ({ restored: true }),
       backup: async (path) => ({ backupPath: `/root/backup${path}.bak` }),
+      removeSourceDuplicate: async () => undefined,
+      restoreSourceDuplicate: async () => ({ restored: true }),
       move: async () => {
         moveCount += 1;
         if (moveCount === 3) {
           throw new Error("chown failed: operation not permitted");
         }
       },
-      chown: async () => {},
+      chown: async () => ({ excludedPaths: [] }),
       restore: async () => ({ restored: true }),
       restoreCustody: async () => {},
     };
@@ -493,11 +503,20 @@ describe("castle-wall/provision/rehome real-ops chokepoint: RehomeExecutionError
     const plan = planRehome(testAdapter, { operatorHome: "/Users/operator", newAccountHome: "/var/sanctuary-agents/x" });
     const ops: RehomeOps = {
       pathExists: async () => true,
+      pathExistsNoFollow: async () => false,
+      hashPath: async (path) => ({ algorithm: "sha256", value: `hash-${path}` }),
+      readDestinationProvenance: async () => undefined,
+      recordDestinationProvenance: async () => {},
+      clearDestinationProvenance: async () => {},
+      displaceDestination: async (destPath) => ({ displacedPath: `${destPath}.displaced-20260729T000000000Z` }),
+      restoreDisplacedDestination: async () => ({ restored: true }),
       backup: async () => {
         throw new Error("backup destination not root-only writable");
       },
+      removeSourceDuplicate: async () => undefined,
+      restoreSourceDuplicate: async () => ({ restored: true }),
       move: async () => {},
-      chown: async () => {},
+      chown: async () => ({ excludedPaths: [] }),
       restore: async () => ({ restored: true }),
       restoreCustody: async () => {},
     };
@@ -518,7 +537,16 @@ describe("castle-wall/provision/rehome real-ops chokepoint: RehomeExecutionError
     let chownCount = 0;
     const ops: RehomeOps = {
       pathExists: async () => true,
+      pathExistsNoFollow: async () => false,
+      hashPath: async (path) => ({ algorithm: "sha256", value: `hash-${path}` }),
+      readDestinationProvenance: async () => undefined,
+      recordDestinationProvenance: async () => {},
+      clearDestinationProvenance: async () => {},
+      displaceDestination: async (destPath) => ({ displacedPath: `${destPath}.displaced-20260729T000000000Z` }),
+      restoreDisplacedDestination: async () => ({ restored: true }),
       backup: async (path) => ({ backupPath: `/root/backup${path}.bak` }),
+      removeSourceDuplicate: async () => undefined,
+      restoreSourceDuplicate: async () => ({ restored: true }),
       move: async () => {},
       chown: async () => {
         chownCount += 1;
@@ -529,6 +557,7 @@ describe("castle-wall/provision/rehome real-ops chokepoint: RehomeExecutionError
           // by the pre-fix code.
           throw new Error("chown failed: operation not permitted");
         }
+        return { excludedPaths: [] };
       },
       restore: async () => ({ restored: true }),
       restoreCustody: async () => {},
@@ -561,6 +590,210 @@ describe("castle-wall/provision/rehome real-ops chokepoint: RehomeExecutionError
     // The straddling entry's destPath must be present so safeRestore can
     // reverse-move it back, exactly like the first two.
     expect(rehomeErr.partialResults[2]!.destPath).toBe("/var/sanctuary-agents/x/c");
+  });
+});
+
+describe("install-preflight Build 2 re-home custody real-ops fixtures", () => {
+  const uidGid = { uid: process.getuid?.() ?? 0, gid: process.getgid?.() ?? 0 };
+
+  function singleConfigAdapter(): AgentRehomeAdapter {
+    return {
+      harnessId: "hermes",
+      pathsToRehome: (home) => [
+        { sourcePath: join(home, ".hermes", "config.yaml"), destRelativePath: ".hermes/config.yaml", isSecret: true },
+      ],
+      requiresInteractiveReconsent: () => false,
+    };
+  }
+
+  it("F-7/F-8 incident: rerun with a fresh source stub and existing real destination refuses before backup/move, leaving the real backup untouched", async () => {
+    const tmpRoot = await mkdtemp(join(tmpdir(), "sanctuary-b2-incident-"));
+    try {
+      const backupRoot = join(tmpRoot, "backups");
+      const operatorHome = join(tmpRoot, "operator");
+      const accountHome = join(tmpRoot, "account");
+      const sourcePath = join(operatorHome, ".hermes", "config.yaml");
+      const destPath = join(accountHome, ".hermes", "config.yaml");
+      await mkdir(dirname(sourcePath), { recursive: true });
+      await writeFile(sourcePath, "REAL_CONFIG_WITH_SECRET=one");
+
+      const ops = realRehomeOps({ backupRoot });
+      const plan = planRehome(singleConfigAdapter(), { operatorHome, newAccountHome: accountHome });
+      const first = await executeRehomePlan(plan, ops, uidGid);
+      const realBackupPath = first[0]!.backupPath!;
+      expect(await readFile(destPath, "utf8")).toBe("REAL_CONFIG_WITH_SECRET=one");
+      expect(await readFile(realBackupPath, "utf8")).toBe("REAL_CONFIG_WITH_SECRET=one");
+
+      // Simulate the real Mini2 incident's pre-Build-2 state: the destination
+      // is a prior re-home product, but no provenance record exists yet.
+      await ops.clearDestinationProvenance(sourcePath, destPath);
+      await mkdir(dirname(sourcePath), { recursive: true });
+      await writeFile(sourcePath, "stub: true\n");
+
+      await expect(executeRehomePlan(plan, ops, uidGid)).rejects.toThrow(/re-home destination conflict/);
+
+      expect(await readFile(destPath, "utf8")).toBe("REAL_CONFIG_WITH_SECRET=one");
+      expect(await readFile(sourcePath, "utf8")).toBe("stub: true\n");
+      expect(await readFile(realBackupPath, "utf8")).toBe("REAL_CONFIG_WITH_SECRET=one");
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("--overwrite-destination preserves the displaced destination and restores it on a forced later abort through the real restore path", async () => {
+    const tmpRoot = await mkdtemp(join(tmpdir(), "sanctuary-b2-overwrite-"));
+    try {
+      const backupRoot = join(tmpRoot, "backups");
+      const operatorHome = join(tmpRoot, "operator");
+      const accountHome = join(tmpRoot, "account");
+      const sourcePath = join(operatorHome, ".hermes", "config.yaml");
+      const destPath = join(accountHome, ".hermes", "config.yaml");
+      await mkdir(dirname(sourcePath), { recursive: true });
+      await mkdir(dirname(destPath), { recursive: true });
+      await writeFile(sourcePath, "stub: true\n");
+      await writeFile(destPath, "REAL_CONFIG_WITH_SECRET=two");
+
+      const ops = realRehomeOps({ backupRoot });
+      const plan = planRehome(singleConfigAdapter(), { operatorHome, newAccountHome: accountHome });
+      const results = await executeRehomePlan(plan, ops, uidGid, { overwriteDestination: true });
+
+      expect(results[0]?.status).toBe("moved");
+      expect(results[0]?.displacedDestinationPath).toMatch(/\.displaced-\d{8}T\d{9}Z$/);
+      expect(results[0]?.displacedDestinationPath?.startsWith(`${backupRoot}/.displaced`)).toBe(true);
+      expect(dirname(results[0]!.displacedDestinationPath!)).not.toBe(dirname(destPath));
+      expect(await readFile(results[0]!.displacedDestinationPath!, "utf8")).toBe("REAL_CONFIG_WITH_SECRET=two");
+      expect(await readFile(destPath, "utf8")).toBe("stub: true\n");
+
+      const restore = await restoreRehomeSteps(results, ops, uidGid);
+
+      expect(restore.fullyRestored).toBe(true);
+      expect(await readFile(sourcePath, "utf8")).toBe("stub: true\n");
+      expect(await readFile(destPath, "utf8")).toBe("REAL_CONFIG_WITH_SECRET=two");
+      await expect(access(results[0]!.displacedDestinationPath!)).rejects.toThrow();
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("destination-authoritative rerun backs up and removes the duplicate operator secret source", async () => {
+    const tmpRoot = await mkdtemp(join(tmpdir(), "sanctuary-b2-authoritative-"));
+    try {
+      const backupRoot = join(tmpRoot, "backups");
+      const operatorHome = join(tmpRoot, "operator");
+      const accountHome = join(tmpRoot, "account");
+      const sourcePath = join(operatorHome, ".hermes", "config.yaml");
+      const destPath = join(accountHome, ".hermes", "config.yaml");
+      await mkdir(dirname(sourcePath), { recursive: true });
+      await writeFile(sourcePath, "REAL_CONFIG_WITH_SECRET=authoritative");
+
+      const ops = realRehomeOps({ backupRoot });
+      const plan = planRehome(singleConfigAdapter(), { operatorHome, newAccountHome: accountHome });
+      const first = await executeRehomePlan(plan, ops, uidGid);
+      expect(first[0]?.status).toBe("moved");
+      expect(await readFile(destPath, "utf8")).toBe("REAL_CONFIG_WITH_SECRET=authoritative");
+
+      await mkdir(dirname(sourcePath), { recursive: true });
+      await writeFile(sourcePath, "REAL_CONFIG_WITH_SECRET=authoritative");
+      const second = await executeRehomePlan(plan, ops, uidGid);
+
+      expect(second[0]?.status).toBe("destination-authoritative");
+      expect(second[0]?.sourceDuplicateRemoved).toBe(true);
+      expect(second[0]?.backupPath?.startsWith(backupRoot)).toBe(true);
+      await expect(access(sourcePath)).rejects.toThrow();
+      expect(await readFile(destPath, "utf8")).toBe("REAL_CONFIG_WITH_SECRET=authoritative");
+      expect(await readFile(second[0]!.backupPath!, "utf8")).toBe("REAL_CONFIG_WITH_SECRET=authoritative");
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("restoreRehomeSteps consumes the recorded versioned backupPath through the real restore path, not a recomputed .bak path", async () => {
+    const tmpRoot = await mkdtemp(join(tmpdir(), "sanctuary-b2-backup-path-"));
+    try {
+      const backupRoot = join(tmpRoot, "backups");
+      const sourcePath = join(tmpRoot, "operator", ".hermes", "config.yaml");
+      const destPath = join(tmpRoot, "account", ".hermes", "config.yaml");
+      await mkdir(dirname(sourcePath), { recursive: true });
+      await writeFile(sourcePath, "VERSIONED_BACKUP_CONTENT");
+
+      const ops = realRehomeOps({ backupRoot });
+      const { backupPath } = await ops.backup(sourcePath);
+      const legacyBak = `${backupRoot}${sourcePath}.bak`;
+      await mkdir(dirname(legacyBak), { recursive: true });
+      await writeFile(legacyBak, "WRONG_LEGACY_BACKUP");
+      await rm(sourcePath, { force: true });
+
+      const restore = await restoreRehomeSteps(
+        [
+          {
+            entry: { sourcePath, destRelativePath: ".hermes/config.yaml", isSecret: true },
+            destPath,
+            status: "moved",
+            backupPath,
+          },
+        ],
+        ops,
+        uidGid,
+      );
+
+      expect(restore.fullyRestored).toBe(true);
+      expect(await readFile(sourcePath, "utf8")).toBe("VERSIONED_BACKUP_CONTENT");
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("versioned backups are content-addressed and bounded by the per-source retention cap", async () => {
+    const tmpRoot = await mkdtemp(join(tmpdir(), "sanctuary-b2-retention-"));
+    try {
+      const backupRoot = join(tmpRoot, "backups");
+      const sourcePath = join(tmpRoot, "operator", ".hermes", "config.yaml");
+      await mkdir(dirname(sourcePath), { recursive: true });
+      const ops = realRehomeOps({ backupRoot });
+      let firstBackupName: string | undefined;
+
+      for (let i = 0; i < 12; i++) {
+        await writeFile(sourcePath, `secret-version-${i}`);
+        const backup = await ops.backup(sourcePath);
+        firstBackupName ??= basename(backup.backupPath);
+      }
+
+      const stem = `${backupRoot}${sourcePath}.bak-`;
+      const names = await readdir(dirname(stem));
+      const backupNames = names.filter((name) => name.startsWith(basename(stem)));
+      expect(backupNames.length).toBeLessThanOrEqual(10);
+      expect(firstBackupName).toBeDefined();
+      expect(backupNames).toContain(firstBackupName!);
+      expect(backupNames.every((name) => /\d{8}T\d{9}Z-[a-f0-9]{16}$/.test(name))).toBe(true);
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("chownRecursive excludes a macOS TCC data-vault subtree, reports it, and the re-home fixture still completes", async () => {
+    const tmpRoot = await mkdtemp(join(tmpdir(), "sanctuary-b2-datavault-"));
+    try {
+      const backupRoot = join(tmpRoot, "backups");
+      const operatorHome = join(tmpRoot, "operator");
+      const accountHome = join(tmpRoot, "account");
+      const sourcePath = join(operatorHome, ".hermes", "config.yaml");
+      const dataVaultPath = join(accountHome, "Library", "Caches", "com.apple.containermanagerd");
+      await mkdir(dirname(sourcePath), { recursive: true });
+      await mkdir(dataVaultPath, { recursive: true });
+      await writeFile(sourcePath, "REAL_CONFIG_WITH_SECRET=three");
+      await writeFile(join(dataVaultPath, "blocked.db"), "tcc-vault");
+
+      const ops = realRehomeOps({ backupRoot });
+      const plan = planRehome(singleConfigAdapter(), { operatorHome, newAccountHome: accountHome });
+      await executeRehomePlan(plan, ops, uidGid);
+      const chownReport = await ops.chown(accountHome, uidGid.uid, uidGid.gid);
+
+      expect(await readFile(join(accountHome, ".hermes", "config.yaml"), "utf8")).toBe("REAL_CONFIG_WITH_SECRET=three");
+      expect(chownReport.excludedPaths).toContain(dataVaultPath);
+      expect(await readFile(join(dataVaultPath, "blocked.db"), "utf8")).toBe("tcc-vault");
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
   });
 });
 
@@ -836,7 +1069,7 @@ describe("wrap/auto-provision real-ops chokepoint: realRehomeOps().restore confl
 
       const destPath = join(tmpRoot, "dest-that-does-not-exist", "secret.env");
       const ops = realRehomeOps({ backupRoot });
-      const result = await ops.restore(destPath, sourcePath);
+      const result = await ops.restore(destPath, sourcePath, backupPath);
 
       expect(result.restored).toBe(true);
       expect(result.conflictPath).toBeUndefined();
@@ -859,7 +1092,7 @@ describe("wrap/auto-provision real-ops chokepoint: realRehomeOps().restore confl
 
       const destPath = join(tmpRoot, "dest-that-does-not-exist", "secret.env");
       const ops = realRehomeOps({ backupRoot });
-      const result = await ops.restore(destPath, sourcePath);
+      const result = await ops.restore(destPath, sourcePath, backupPath);
 
       expect(result.restored).toBe(false);
       expect(result.conflictPath).toBe(`${sourcePath}.restored-conflict`);
@@ -885,7 +1118,7 @@ describe("wrap/auto-provision real-ops chokepoint: realRehomeOps().restore confl
 
       const destPath = join(tmpRoot, "dest-that-does-not-exist", "secret.env");
       const ops = realRehomeOps({ backupRoot });
-      const result = await ops.restore(destPath, sourcePath);
+      const result = await ops.restore(destPath, sourcePath, backupPath);
 
       expect(result.restored).toBe(false);
       expect(result.conflictPath).toBe(`${preexistingConflictPath}.1`);
@@ -913,7 +1146,7 @@ describe("wrap/auto-provision real-ops chokepoint: realRehomeOps().restore confl
       await symlink(realTarget, backupPath);
       const destPath = join(tmpRoot, "dest-that-does-not-exist", "secret.env");
 
-      const result = await realRehomeOps({ backupRoot }).restore(destPath, sourcePath);
+      const result = await realRehomeOps({ backupRoot }).restore(destPath, sourcePath, backupPath);
 
       expect(result.restored).toBe(true);
       // The credential must round-trip as a SYMLINK, NOT a dereferenced plain
@@ -1110,21 +1343,23 @@ describe("wrap/auto-provision real-ops chokepoint: all-credentials readability p
     const paths = allHermesCredentialDestPaths();
     expect(paths).toContain(".hermes/.env");
     expect(paths).toContain(".hermes/auth.json");
+    expect(paths).toContain(".hermes/cli-config.json");
     expect(paths).toContain(".hermes/config.yaml");
     expect(paths).toContain(".google_workspace_mcp/credentials");
     expect(paths).toContain(".workspace-mcp/cli-tokens");
     expect(paths).toContain(".hermes/google-mcp-creds");
-    expect(paths).toHaveLength(6);
+    expect(paths).toHaveLength(7);
   });
 
   it("hermesEndpointProbes builds one probe per DNS host PLUS one per credential path (not just .env)", () => {
     const targets = hermesEndpointProbes("/var/sanctuary-agents/sanctuary-hermes", 502, 502);
     const credentialProbeNames = targets.filter((t) => t.name.includes("moved credential"));
-    // 6 credential paths -- .env, auth.json, config.yaml, google_workspace_mcp
-    // credentials, workspace-mcp cli-tokens, hermes google-mcp-creds.
-    expect(credentialProbeNames).toHaveLength(6);
+    // 7 credential paths -- .env, auth.json, cli-config.json, config.yaml,
+    // google_workspace_mcp credentials, workspace-mcp cli-tokens, hermes google-mcp-creds.
+    expect(credentialProbeNames).toHaveLength(7);
     expect(credentialProbeNames.some((t) => t.name.includes(".env"))).toBe(true);
     expect(credentialProbeNames.some((t) => t.name.includes("auth.json"))).toBe(true);
+    expect(credentialProbeNames.some((t) => t.name.includes("cli-config.json"))).toBe(true);
     expect(credentialProbeNames.some((t) => t.name.includes("config.yaml"))).toBe(true);
     expect(credentialProbeNames.some((t) => t.name.includes("google_workspace_mcp/credentials"))).toBe(true);
     expect(credentialProbeNames.some((t) => t.name.includes("workspace-mcp/cli-tokens"))).toBe(true);
@@ -1212,11 +1447,13 @@ describe("wrap/auto-provision real-ops chokepoint: all-credentials readability p
 
       await writeFile(join(hermesDir, ".env"), "LLM_KEY=abc");
       await writeFile(join(hermesDir, "auth.json"), '{"token":"secret"}');
+      await writeFile(join(hermesDir, "cli-config.json"), '{"legacy":true}');
       await writeFile(join(hermesDir, "config.yaml"), "persona: hermes");
       await writeFile(join(googleDir, "credentials"), "refresh-token");
 
       await chmod(join(hermesDir, ".env"), 0o600);
       await chmod(join(hermesDir, "auth.json"), 0o600);
+      await chmod(join(hermesDir, "cli-config.json"), 0o600);
       await chmod(join(hermesDir, "config.yaml"), 0o600);
       await chmod(join(googleDir, "credentials"), 0o600);
       await chmod(join(workspaceMcpDir, "cli-tokens"), 0o700);
@@ -1259,6 +1496,7 @@ describe("wrap/auto-provision real-ops chokepoint: all-credentials readability p
 
       await writeFile(join(hermesDir, ".env"), "LLM_KEY=abc");
       await writeFile(join(hermesDir, "auth.json"), '{"token":"secret"}');
+      await writeFile(join(hermesDir, "cli-config.json"), '{"legacy":true}');
       await writeFile(join(hermesDir, "config.yaml"), "persona: hermes");
       await writeFile(join(googleDir, "credentials"), "refresh-token");
       await mkdir(join(workspaceMcpDir, "cli-tokens"), { recursive: true });
@@ -1266,6 +1504,7 @@ describe("wrap/auto-provision real-ops chokepoint: all-credentials readability p
 
       await chmod(join(hermesDir, ".env"), 0o600);
       await chmod(join(hermesDir, "auth.json"), 0o600);
+      await chmod(join(hermesDir, "cli-config.json"), 0o600);
       await chmod(join(hermesDir, "config.yaml"), 0o600);
       await chmod(join(googleDir, "credentials"), 0o600);
       await chmod(join(workspaceMcpDir, "cli-tokens"), 0o700);
@@ -1280,7 +1519,7 @@ describe("wrap/auto-provision real-ops chokepoint: all-credentials readability p
       const result = await verifyReachabilityBeforeArm(targets);
       expect(result.allReachable).toBe(true);
       expect(result.results.every((r) => r.reachable)).toBe(true);
-      expect(result.results).toHaveLength(6);
+      expect(result.results).toHaveLength(7);
     } finally {
       await rm(tmpRoot, { recursive: true, force: true });
     }
@@ -1698,7 +1937,7 @@ describe("wrap/auto-provision real-ops chokepoint: probe-what-moved + directory 
   });
 
   it("FIX R6-5: hermesEndpointProbes probes ONLY the supplied moved-credential list -- an absent/skipped credential is never probed, so a partial-credential install can arm", () => {
-    // Only .env moved this run; the other five were skipped-absent.
+    // Only .env moved this run; the other six were skipped-absent.
     const targets = hermesEndpointProbes("/var/sanctuary-agents/sanctuary-hermes", 502, 502, [".hermes/.env"]);
     const credTargets = targets.filter((t) => t.name.includes("moved credential"));
     expect(credTargets).toHaveLength(1);
@@ -1712,7 +1951,7 @@ describe("wrap/auto-provision real-ops chokepoint: probe-what-moved + directory 
   it("with no explicit list at all (defensive last resort, not a production path), it falls back to the full adapter set", () => {
     const targets = hermesEndpointProbes("/var/sanctuary-agents/sanctuary-hermes", 502, 502);
     const credTargets = targets.filter((t) => t.name.includes("moved credential"));
-    expect(credTargets).toHaveLength(6);
+    expect(credTargets).toHaveLength(7);
   });
 
   it("FIX R7-2: a FRESH provision that re-homed ZERO secrets (explicit empty moved-set []) adds a synthetic FAIL-CLOSED probe, so verify aborts instead of arming with a vacuous credential gate", async () => {

@@ -29,7 +29,8 @@
 import { platform as osPlatform } from "node:os";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { unlinkSync } from "node:fs";
+import { constants as fsConstants, unlinkSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
 import {
   mkdir,
   rename,
@@ -45,6 +46,9 @@ import {
   rm,
   cp,
   realpath,
+  readdir,
+  writeFile,
+  open,
 } from "node:fs/promises";
 import { basename, dirname, join, normalize as normalizePath, relative, resolve as pathResolve, sep } from "node:path";
 import { resolve as dnsResolve } from "node:dns/promises";
@@ -971,6 +975,13 @@ export interface RunAutoProvisionForWrapOptions {
    * stages prove live. Off by default (coarse drill-proven path unchanged).
    */
   exclusiveEgress?: boolean;
+  /**
+   * Explicitly allow re-home to move a source over an occupied destination.
+   * The destination is first preserved as a dated sibling and restored on any
+   * later abort. Unset/false refuses dual source+destination presence before
+   * backup or move.
+   */
+  overwriteDestination?: boolean;
 }
 
 /**
@@ -1305,14 +1316,26 @@ export async function runAutoProvisionForWrap(
         print(`Moved stale Hermes runtime destination aside at ${staleRuntimeConflictPath}.`);
       }
       const plan = planRehome(hermesRehomeAdapter, { operatorHome, newAccountHome });
-      const results = await executeRehomePlan(plan, rehomeOps, { uid, gid });
+      const results = await executeRehomePlan(
+        plan,
+        rehomeOps,
+        { uid, gid },
+        { overwriteDestination: options.overwriteDestination === true },
+      );
+      const perStepExcludedPaths = results.flatMap((r) => r.chownExcludedPaths ?? []);
+      if (perStepExcludedPaths.length > 0) {
+        print(`Excluded macOS data-vault path(s) during per-path re-home ownership: ${perStepExcludedPaths.join(", ")}.`);
+      }
       // FIX (round 5, item N1): chown the agent's WHOLE home tree (the home
       // dir + every intermediate credential dir `move()`'s mkdir created
       // root-owned + the leaves) to the agent, so it can traverse to and read
       // its re-homed secrets. Per-leaf chown only covered the leaves, never
       // the ancestor dirs, so the agent had no traverse bit on `.hermes/` etc.
       try {
-        await rehomeOps.chown(newAccountHome, uid, gid);
+        const chownReport = await rehomeOps.chown(newAccountHome, uid, gid);
+        if (chownReport.excludedPaths.length > 0) {
+          print(`Excluded macOS data-vault path(s) during account-home ownership repair: ${chownReport.excludedPaths.join(", ")}.`);
+        }
       } catch (err) {
         // The moves ALREADY succeeded by now; a failure chowning the home
         // tree must NOT discard the moved results (the orchestrator's
@@ -1329,7 +1352,7 @@ export async function runAutoProvisionForWrap(
       // this run actually placed on the account -- a partial-credential
       // install (some sources legitimately absent) can still arm.
       credentialDestPathsToVerify = results
-        .filter((r) => r.status === "moved" && r.entry.isSecret)
+        .filter((r) => (r.status === "moved" || r.status === "destination-authoritative") && r.entry.isSecret)
         .map((r) => r.entry.destRelativePath);
       return { plan, results };
     },
@@ -2000,6 +2023,181 @@ async function pathExists(path: string): Promise<boolean> {
   }
 }
 
+let lastRehomeTimestampMs = 0;
+
+function formatRehomeTimestamp(date = new Date()): string {
+  const requestedMs = date.getTime();
+  const timestampMs = requestedMs <= lastRehomeTimestampMs ? lastRehomeTimestampMs + 1 : requestedMs;
+  lastRehomeTimestampMs = timestampMs;
+  return new Date(timestampMs).toISOString().replace(/[-:.]/g, "");
+}
+
+async function hashPathNoFollow(path: string): Promise<{ algorithm: "sha256"; value: string }> {
+  const hash = createHash("sha256");
+  await updatePathHash(hash, path, ".");
+  return { algorithm: "sha256", value: hash.digest("hex") };
+}
+
+async function readRegularFileNoFollow(path: string): Promise<Buffer> {
+  const handle = await open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  try {
+    const st = await handle.stat();
+    if (!st.isFile()) {
+      throw new Error(`expected regular file while hashing re-home path: ${path}`);
+    }
+    return await handle.readFile();
+  } finally {
+    await handle.close();
+  }
+}
+
+async function updatePathHash(hash: ReturnType<typeof createHash>, path: string, relativePath: string): Promise<void> {
+  const st = await lstat(path);
+  if (st.isSymbolicLink()) {
+    hash.update(`symlink\0${relativePath}\0`);
+    hash.update(await readlink(path));
+    hash.update("\0");
+    return;
+  }
+  if (st.isDirectory()) {
+    hash.update(`dir\0${relativePath}\0`);
+    const entries = (await readdir(path)).sort();
+    for (const entry of entries) {
+      await updatePathHash(hash, join(path, entry), `${relativePath}/${entry}`);
+    }
+    return;
+  }
+  hash.update(`file\0${relativePath}\0`);
+  hash.update(await readRegularFileNoFollow(path));
+  hash.update("\0");
+}
+
+interface ParsedVersionedBackup {
+  path: string;
+  name: string;
+  timestamp: string;
+  hashPrefix: string;
+}
+
+async function listVersionedBackupsForSource(backupRoot: string, sourcePath: string): Promise<ParsedVersionedBackup[]> {
+  const rootedStem = `${backupRoot}${sourcePath}.bak-`;
+  const dir = dirname(rootedStem);
+  const prefix = basename(rootedStem);
+  let entries: string[];
+  try {
+    entries = await readdir(dir);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw err;
+  }
+  const parsed: ParsedVersionedBackup[] = [];
+  for (const name of entries) {
+    if (!name.startsWith(prefix)) continue;
+    const suffix = name.slice(prefix.length);
+    const match = /^(\d{8}T\d{9}Z)-([a-f0-9]{16})$/.exec(suffix);
+    if (match === null) continue;
+    parsed.push({ path: join(dir, name), name, timestamp: match[1]!, hashPrefix: match[2]! });
+  }
+  return parsed;
+}
+
+const REHOME_BACKUP_MAX_PER_SOURCE = 10;
+
+async function findContentAddressedBackup(
+  backupRoot: string,
+  sourcePath: string,
+  sourceHash: string,
+): Promise<string | undefined> {
+  const hashPrefix = sourceHash.slice(0, 16);
+  const candidates = await listVersionedBackupsForSource(backupRoot, sourcePath);
+  for (const candidate of candidates.filter((entry) => entry.hashPrefix === hashPrefix)) {
+    try {
+      const candidateHash = await hashPathNoFollow(candidate.path);
+      if (candidateHash.value === sourceHash) {
+        return candidate.path;
+      }
+    } catch {
+      // A corrupt/unreadable same-prefix candidate is not dedupe evidence.
+    }
+  }
+  return undefined;
+}
+
+async function enforceVersionedBackupRetention(backupRoot: string, sourcePath: string): Promise<void> {
+  const entries = await listVersionedBackupsForSource(backupRoot, sourcePath);
+  const oldestFirst = [...entries].sort((a, b) => a.name.localeCompare(b.name));
+  const newestFirst = [...entries].sort((a, b) => b.name.localeCompare(a.name));
+  const keep = new Set<string>();
+  const seenHashes = new Set<string>();
+  const keepDistinctHash = (entry: { path: string; hashPrefix: string }): boolean => {
+    if (seenHashes.has(entry.hashPrefix) || seenHashes.size >= REHOME_BACKUP_MAX_PER_SOURCE) return false;
+    keep.add(entry.path);
+    seenHashes.add(entry.hashPrefix);
+    return true;
+  };
+  for (const entry of oldestFirst) {
+    if (keepDistinctHash(entry)) break;
+  }
+  for (const entry of newestFirst) {
+    keepDistinctHash(entry);
+  }
+  const toRemove = entries.filter((entry) => !keep.has(entry.path));
+  for (const entry of toRemove) {
+    try {
+      await rm(entry.path, { recursive: true, force: false });
+    } catch (err) {
+      throw new Error(
+        `could not enforce re-home backup retention cap (${REHOME_BACKUP_MAX_PER_SOURCE}) for ${sourcePath}: ` +
+          `${(err as Error).message}`,
+        { cause: err },
+      );
+    }
+  }
+}
+
+function rehomeProvenancePath(backupRoot: string, destPath: string): string {
+  return `${backupRoot}/.provenance${destPath}.json`;
+}
+
+async function writeJsonRootOnly(path: string, value: unknown): Promise<void> {
+  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+  const tmp = `${path}.tmp-${process.pid}-${randomUUID()}`;
+  await writeFile(tmp, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+  await rename(tmp, path);
+  await chmod(path, 0o600);
+}
+
+async function findUniqueDatedBackupRootPath(backupRoot: string, originalPath: string, label: string): Promise<string> {
+  const base = `${backupRoot}/.${label}${originalPath}.${label}-${formatRehomeTimestamp()}`;
+  if (!(await pathExistsNoFollow(base))) return base;
+  const MAX_SUFFIX = 1000;
+  for (let i = 1; i <= MAX_SUFFIX; i++) {
+    const candidate = `${base}.${i}`;
+    if (!(await pathExistsNoFollow(candidate))) return candidate;
+  }
+  throw new Error(
+    `could not find a free dated root-only ${label} path for ${originalPath} after ${MAX_SUFFIX} attempts; refusing to overwrite`,
+  );
+}
+
+async function restoreBackupCopyNoFollow(backupPath: string, targetPath: string): Promise<boolean> {
+  let backupStat;
+  try {
+    backupStat = await lstat(backupPath);
+  } catch {
+    return false;
+  }
+  await mkdir(dirname(targetPath), { recursive: true, mode: 0o700 });
+  if (backupStat.isSymbolicLink()) {
+    await symlink(await readlink(backupPath), targetPath);
+  } else if (backupStat.isDirectory()) {
+    await cp(backupPath, targetPath, { recursive: true });
+  } else {
+    await copyFile(backupPath, targetPath);
+  }
+  return pathExistsNoFollow(targetPath);
+}
+
 /** Paths for the non-secret Hermes runtime tree that may be left behind by an aborted dedicated-account run. */
 export function hermesRuntimeRehomePaths(
   operatorHome: string,
@@ -2540,20 +2738,77 @@ async function chmodRecursive(path: string): Promise<void> {
  * chowned via `lchown` (the LINK itself, never its target) and never recursed
  * into; recursion only descends into a REAL directory.
  */
-async function chownRecursive(path: string, uid: number, gid: number): Promise<void> {
-  const st = await lstat(path);
-  if (st.isSymbolicLink()) {
-    // Chown the link itself (never its target); do not recurse through it.
-    await lchown(path, uid, gid);
+function isMacosTccDataVaultPath(path: string): boolean {
+  const normalized = path.replace(/\\/g, "/");
+  return (
+    normalized.endsWith("/Library/Caches/com.apple.containermanagerd") ||
+    normalized.includes("/Library/Caches/com.apple.containermanagerd/")
+  );
+}
+
+function shouldExcludeChownPath(path: string, err?: unknown): boolean {
+  if (!isMacosTccDataVaultPath(path)) return false;
+  if (err === undefined) return true;
+  const code = (err as NodeJS.ErrnoException).code;
+  return code === undefined || code === "EPERM" || code === "EACCES" || code === "ENOENT";
+}
+
+async function chownRecursive(path: string, uid: number, gid: number): Promise<{ excludedPaths: string[] }> {
+  const excludedPaths: string[] = [];
+  await chownRecursiveInner(path, uid, gid, excludedPaths);
+  return { excludedPaths };
+}
+
+async function chownRecursiveInner(path: string, uid: number, gid: number, excludedPaths: string[]): Promise<void> {
+  if (shouldExcludeChownPath(path)) {
+    excludedPaths.push(path);
     return;
   }
-  await fsChown(path, uid, gid);
+  let st;
+  try {
+    st = await lstat(path);
+  } catch (err) {
+    if (shouldExcludeChownPath(path, err)) {
+      excludedPaths.push(path);
+      return;
+    }
+    throw err;
+  }
+  if (st.isSymbolicLink()) {
+    // Chown the link itself (never its target); do not recurse through it.
+    try {
+      await lchown(path, uid, gid);
+    } catch (err) {
+      if (shouldExcludeChownPath(path, err)) {
+        excludedPaths.push(path);
+        return;
+      }
+      throw err;
+    }
+    return;
+  }
+  try {
+    await fsChown(path, uid, gid);
+  } catch (err) {
+    if (shouldExcludeChownPath(path, err)) {
+      excludedPaths.push(path);
+      return;
+    }
+    throw err;
+  }
   if (st.isDirectory()) {
-    const { readdir } = await import("node:fs/promises");
-    const { join } = await import("node:path");
-    const entries = await readdir(path);
+    let entries: string[];
+    try {
+      entries = await readdir(path);
+    } catch (err) {
+      if (shouldExcludeChownPath(path, err)) {
+        excludedPaths.push(path);
+        return;
+      }
+      throw err;
+    }
     for (const entry of entries) {
-      await chownRecursive(join(path, entry), uid, gid);
+      await chownRecursiveInner(join(path, entry), uid, gid, excludedPaths);
     }
   }
 }
@@ -2575,6 +2830,70 @@ export function realRehomeOps(opts?: { backupRoot?: string }) {
   const backupRoot = opts?.backupRoot ?? "/var/root/.sanctuary-rehome-backups";
   return {
     pathExists,
+    pathExistsNoFollow,
+    hashPath: hashPathNoFollow,
+    readDestinationProvenance: async (sourcePath: string, destPath: string) => {
+      const provenancePath = rehomeProvenancePath(backupRoot, destPath);
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(await readFile(provenancePath, "utf8"));
+      } catch {
+        return undefined;
+      }
+      if (parsed === null || typeof parsed !== "object") return undefined;
+      const record = parsed as Record<string, unknown>;
+      const destHash = record.dest_hash;
+      if (destHash === null || typeof destHash !== "object") return undefined;
+      const hashRecord = destHash as Record<string, unknown>;
+      if (
+        record.schema_version !== 1 ||
+        record.source_path !== sourcePath ||
+        record.dest_path !== destPath ||
+        hashRecord.algorithm !== "sha256" ||
+        typeof hashRecord.value !== "string" ||
+        typeof record.recorded_at !== "string"
+      ) {
+        return undefined;
+      }
+      return {
+        schemaVersion: 1 as const,
+        sourcePath,
+        destPath,
+        destHash: { algorithm: "sha256" as const, value: hashRecord.value },
+        recordedAt: record.recorded_at,
+      };
+    },
+    recordDestinationProvenance: async (sourcePath: string, destPath: string): Promise<void> => {
+      const destHash = await hashPathNoFollow(destPath);
+      await writeJsonRootOnly(rehomeProvenancePath(backupRoot, destPath), {
+        schema_version: 1,
+        source_path: sourcePath,
+        dest_path: destPath,
+        dest_hash: destHash,
+        recorded_at: new Date().toISOString(),
+      });
+    },
+    clearDestinationProvenance: async (_sourcePath: string, destPath: string): Promise<void> => {
+      await rm(rehomeProvenancePath(backupRoot, destPath), { force: true });
+    },
+    displaceDestination: async (destPath: string): Promise<{ displacedPath: string }> => {
+      const displacedPath = await findUniqueDatedBackupRootPath(backupRoot, destPath, "displaced");
+      await mkdir(dirname(displacedPath), { recursive: true, mode: 0o700 });
+      await rename(destPath, displacedPath);
+      return { displacedPath };
+    },
+    restoreDisplacedDestination: async (
+      displacedPath: string,
+      destPath: string,
+    ): Promise<{ restored: boolean; conflictPath?: string }> => {
+      if (!(await pathExistsNoFollow(displacedPath))) return { restored: false };
+      await mkdir(dirname(destPath), { recursive: true, mode: 0o700 });
+      if (await pathExistsNoFollow(destPath)) {
+        return { restored: false, conflictPath: displacedPath };
+      }
+      await rename(displacedPath, destPath);
+      return { restored: await pathExistsNoFollow(destPath) };
+    },
     backup: async (path: string): Promise<{ backupPath: string }> => {
       // Fix M4: the pre-re-home secrets backup MUST be root-only (0600 for
       // files, 0700 for directories) -- NEVER an operator-readable plaintext
@@ -2582,19 +2901,17 @@ export function realRehomeOps(opts?: { backupRoot?: string }) {
       // produce (AGENTS.md invariant #6). `copyFile` does not accept a mode
       // argument, so the mode is set explicitly with `chmod` immediately
       // after the copy, closing the umask-dependent window.
-      const backupPath = `${backupRoot}${path}.bak`;
+      const sourceHash = await hashPathNoFollow(path);
+      const existing = await findContentAddressedBackup(backupRoot, path, sourceHash.value);
+      if (existing !== undefined) {
+        await enforceVersionedBackupRetention(backupRoot, path);
+        return { backupPath: existing };
+      }
+      const backupPath = `${backupRoot}${path}.bak-${formatRehomeTimestamp()}-${sourceHash.value.slice(0, 16)}`;
       await mkdir(dirname(backupPath), { recursive: true, mode: 0o700 });
-      // FIX (round 5 / R5-1, generalizing R4-1): remove any pre-existing name
-      // at backupPath BEFORE writing, for ALL shapes. Nothing cleans up the
-      // backup root, so a `.bak` from a prior aborted run survives; if it is a
-      // stale SYMLINK, `copyFile`/`cp` (file/dir branches) FOLLOW it -- writing
-      // the secret's plaintext THROUGH the link to its old (possibly
-      // operator-readable) target and clobbering whatever lived there (M4 /
-      // AGENTS.md #6 leak + data-loss), while `symlink()` throws EEXIST. A
-      // single no-follow rm-first makes every branch idempotent AND never
-      // follows a stale link. Safe: the backup is always re-derived from the
-      // current source (which must exist for backup to run).
-      await rm(backupPath, { force: true, recursive: true });
+      if (await pathExistsNoFollow(backupPath)) {
+        throw new Error(`versioned re-home backup path already exists, refusing to overwrite: ${backupPath}`);
+      }
       // FIX (round 5 / R3-1): decide the shape by `lstat` (no-follow), not
       // `stat`. A symlinked secret must be backed up as the LINK itself, never
       // dereferenced -- otherwise `stat` reports a symlink-to-directory as a
@@ -2630,14 +2947,30 @@ export function realRehomeOps(opts?: { backupRoot?: string }) {
         await copyFile(path, backupPath);
         await chmod(backupPath, 0o600);
       }
+      await enforceVersionedBackupRetention(backupRoot, path);
       return { backupPath };
+    },
+    removeSourceDuplicate: async (path: string): Promise<void> => {
+      await rm(path, { recursive: true, force: false });
+    },
+    restoreSourceDuplicate: async (
+      backupPath: string,
+      sourcePath: string,
+    ): Promise<{ restored: boolean; conflictPath?: string }> => {
+      if (await pathExistsNoFollow(sourcePath)) {
+        const conflictPath = await findUniqueConflictPath(sourcePath);
+        const restoredToConflict = await restoreBackupCopyNoFollow(backupPath, conflictPath);
+        return restoredToConflict ? { restored: false, conflictPath } : { restored: false };
+      }
+      const restored = await restoreBackupCopyNoFollow(backupPath, sourcePath);
+      return { restored };
     },
     move: async (sourcePath: string, destPath: string): Promise<void> => {
       await mkdir(dirname(destPath), { recursive: true, mode: 0o700 });
       await rename(sourcePath, destPath);
     },
-    chown: async (path: string, uid: number, gid: number): Promise<void> => {
-      await chownRecursive(path, uid, gid);
+    chown: async (path: string, uid: number, gid: number): Promise<{ excludedPaths: string[] }> => {
+      return chownRecursive(path, uid, gid);
     },
     /**
      * FIX F2 (2026-07-07 fix-round): restore is a REVERSE-MOVE of `destPath`
@@ -2678,7 +3011,11 @@ export function realRehomeOps(opts?: { backupRoot?: string }) {
      * {@link findUniqueConflictPath} before writing, so a pre-existing
      * conflict sibling is never clobbered either.
      */
-    restore: async (destPath: string, sourcePath: string): Promise<{ restored: boolean; conflictPath?: string }> => {
+    restore: async (
+      destPath: string,
+      sourcePath: string,
+      backupPath?: string,
+    ): Promise<{ restored: boolean; conflictPath?: string }> => {
       // FIX (round 5 / R2-1): no-follow. `pathExists` (access) FOLLOWS a
       // symlink, so a re-homed credential that is a DANGLING symlink at
       // destPath (a relative dotfile symlink whose target no longer resolves
@@ -2716,11 +3053,11 @@ export function realRehomeOps(opts?: { backupRoot?: string }) {
         return { restored: await pathExistsNoFollow(sourcePath) };
       }
       // destPath is already gone (unusual: implies a partial rollback
-      // already ran). Fall back to the M4 backup copy, if this path had one.
-      // FIX (round 5, item d): `backupRoot` is the injectable closure value
-      // (defaults to the production /var/root location), so this fallback
-      // branch is now reachable by the seam against a disposable tmpdir.
-      const backupPath = `${backupRoot}${sourcePath}.bak`;
+      // already ran). Fall back to the RECORDED M4 backup copy, if this path
+      // had one. Build 2 F-8: never recompute a latest-wins `.bak` path here;
+      // versioned backup correctness depends on the writer's returned
+      // `backupPath` being threaded through this real restore path.
+      if (backupPath === undefined) return { restored: false };
       // FIX (round 5 / R9-1): resolve the backup's shape with a SINGLE no-follow
       // `lstat`. If it cannot be lstat'd (absent, or unreadable -- e.g. the
       // production `/var/root/...` root-only backup root read as a non-root
