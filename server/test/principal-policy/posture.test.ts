@@ -210,7 +210,7 @@ describe("G4 — Castle Wall posture (enforcement-evidenced)", () => {
     expect(posture.evidence_basis).toBe("enforcement_unavailable");
   });
 
-  it("lets newer live adjudication recover over an older local enforcement_unavailable fallback", async () => {
+  it("stays degraded while a fresh local enforcement_unavailable fallback is still present", async () => {
     const { log } = newAuditLog();
     const now = Date.now();
     await appendCW(log, "egress_allowed", new Date(now - 30_000).toISOString());
@@ -231,8 +231,8 @@ describe("G4 — Castle Wall posture (enforcement-evidenced)", () => {
       },
     });
 
-    expect(posture.arm_state).toBe("armed");
-    expect(posture.evidence_basis).toBe("fresh_enforcement_evidence");
+    expect(posture.arm_state).toBe("degraded");
+    expect(posture.evidence_basis).toBe("enforcement_unavailable");
   });
 
   it("does NOT render armed when the only evidence is stale (older than the freshness window)", async () => {

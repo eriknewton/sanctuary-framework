@@ -77,7 +77,7 @@ import {
   enforcementAvailabilityStatusTimeMs,
   isEnforcementUnavailableProviderUnboundDetails,
   isFreshEnforcementAvailabilityStatus,
-  type EnforcementAvailabilityStatusFile,
+  type EnforcementAvailabilityStatus,
 } from "../castle-wall/runtime/enforcement-availability-status.js";
 
 // Re-export the S5-P exclusive-egress posture surface for posture consumers
@@ -396,7 +396,7 @@ export interface BuildCastleWallPostureInput {
    * non-green direction (`degraded`/`enforcement_unavailable`); it is never
    * interpreted as arm evidence.
    */
-  enforcementAvailabilityStatus?: EnforcementAvailabilityStatusFile | null;
+  enforcementAvailabilityStatus?: EnforcementAvailabilityStatus | null;
 }
 
 /**
@@ -795,6 +795,12 @@ export async function buildCastleWallPosture(
     // just the daemon-belief path.
     armState = "unknown";
     basis = "no_evidence";
+  } else if (
+    latestEnforcementUnavailableMs !== null &&
+    latestEnforcementUnavailableMs >= freshnessFloor
+  ) {
+    armState = "degraded";
+    basis = "enforcement_unavailable";
   } else if (
     latestNotEnforcingMs !== null &&
     latestNotEnforcingMs >= freshnessFloor &&

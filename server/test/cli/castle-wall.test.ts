@@ -438,11 +438,86 @@ describe("castle-wall CLI verbs", () => {
 
       expect(code).toBe(0);
       expect(out.text()).toContain(
-        "Enforcement availability: unavailable (manifest present, arm lease absent; agents are denied fail-closed until the wall is re-armed)",
+        "Enforcement availability: unavailable (extension reported manifest present with no arm lease; a #1045-capable extension should deny agents fail-closed, while older extensions may be unfiltered).",
+      );
+      expect(out.text()).toContain(
+        "Remediation: Install/reload the current Castle Wall extension, log in, run 'sanctuary castle-wall enable'",
       );
       expect(out.text()).toContain(
         "Dead-man lease broadcast (advisory, not proof provider received it): armed",
       );
+    });
+
+    it("prints corrupt enforcement_unavailable diagnostics as unavailable, not clean", async () => {
+      const { fortressPath, hostAppPath } = await makeDarwinFixture();
+      await writeFile(
+        join(fortressPath, "castle-wall-enforcement-status.json"),
+        "{not-json\n",
+      );
+      const out = new CaptureStream();
+      const { invoke } = statusInvoker({
+        stdout:
+          JSON.stringify({ ok: true, action: "status", state: "enabled" }) +
+          "\n",
+        exitCode: 0,
+      });
+
+      const code = await runStatus({
+        out,
+        env: { SANCTUARY_STORAGE_PATH: fortressPath },
+        platform: "darwin",
+        execSyncFn: () =>
+          "com.sanctuary.castle-wall [activated enabled] (state: enabled)",
+        hostAppCandidates: [hostAppPath],
+        hostAppInvoke: invoke,
+      });
+
+      expect(code).toBe(0);
+      expect(out.text()).toContain(
+        "Enforcement availability: unavailable (local diagnostic file is present but unreadable or invalid: invalid_json; failing closed until the diagnostic is readable or removed).",
+      );
+    });
+
+    it("mentions stale enforcement_unavailable diagnostics as historical rather than going silent", async () => {
+      const { fortressPath, hostAppPath } = await makeDarwinFixture();
+      await writeFile(
+        join(fortressPath, "castle-wall-enforcement-status.json"),
+        JSON.stringify(
+          {
+            state: "enforcement_unavailable",
+            reason: "manifest_present_arm_lease_missing",
+            updated_at: new Date(Date.now() - 60 * 60_000).toISOString(),
+            source: "macos_extension_provider_unbound",
+            manifest_received: true,
+            arm_lease_received: false,
+          },
+          null,
+          2,
+        ) + "\n",
+      );
+      const out = new CaptureStream();
+      const { invoke } = statusInvoker({
+        stdout:
+          JSON.stringify({ ok: true, action: "status", state: "enabled" }) +
+          "\n",
+        exitCode: 0,
+      });
+
+      const code = await runStatus({
+        out,
+        env: { SANCTUARY_STORAGE_PATH: fortressPath },
+        platform: "darwin",
+        execSyncFn: () =>
+          "com.sanctuary.castle-wall [activated enabled] (state: enabled)",
+        hostAppCandidates: [hostAppPath],
+        hostAppInvoke: invoke,
+      });
+
+      expect(code).toBe(0);
+      expect(out.text()).toContain(
+        "Enforcement availability: historical unavailable diagnostic",
+      );
+      expect(out.text()).toContain("outside the 10m freshness window");
     });
 
     it("reports the filter disabled (sysext installed but not filtering)", async () => {

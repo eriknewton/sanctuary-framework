@@ -24,6 +24,7 @@ import {
 } from "./server.js";
 import type { ApprovalHandlers } from "./api.js";
 import type { FleetRoster } from "../principal-policy/fleet-roster.js";
+import type { EnforcementAvailabilityStatus } from "../castle-wall/runtime/enforcement-availability-status.js";
 
 export { getProtectionSnapshot } from "./aggregator.js";
 export { renderDashboardHTML, HERO_COPY } from "./html.js";
@@ -107,6 +108,11 @@ export interface StartDashboardOptions {
   brokerProducerKeyExpectedButUnavailable?: boolean;
   /** Canonical confined-agent protection subject (`fortress/uid-N`). */
   resolveProtectionClaimSubject?: () => string | null | Promise<string | null>;
+  /** Fresh local extension diagnostic fallback; non-green evidence only. */
+  resolveEnforcementAvailabilityStatus?: () =>
+    | EnforcementAvailabilityStatus
+    | null
+    | Promise<EnforcementAvailabilityStatus | null>;
   /**
    * Read-only fleet-roster provider (wrap "Protect" dashboard). Forwarded to the
    * dashboard server, where it feeds both `GET /api/fleet/roster` and the
@@ -162,6 +168,12 @@ export async function startDashboard(
       : {}),
     ...(options.resolveProtectionClaimSubject
       ? { resolveProtectionClaimSubject: options.resolveProtectionClaimSubject }
+      : {}),
+    ...(options.resolveEnforcementAvailabilityStatus
+      ? {
+          resolveEnforcementAvailabilityStatus:
+            options.resolveEnforcementAvailabilityStatus,
+        }
       : {}),
     activity,
     pendingApprovals: pending,

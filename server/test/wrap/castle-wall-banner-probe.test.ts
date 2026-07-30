@@ -576,6 +576,37 @@ describe("Castle Wall wrap-banner evidence probes", () => {
     expect(claim.state).toBe("exclusive");
   });
 
+  it("does not render protected when a fresh local enforcement_unavailable diagnostic remains despite newer allow evidence", async () => {
+    const now = Date.now();
+    await writeFile(
+      join(storagePath, "castle-wall-enforcement-status.json"),
+      JSON.stringify(
+        {
+          state: "enforcement_unavailable",
+          reason: "manifest_present_arm_lease_missing",
+          updated_at: new Date(now - 90_000).toISOString(),
+          source: "macos_extension_provider_unbound",
+          manifest_received: true,
+          arm_lease_received: false,
+        },
+        null,
+        2,
+      ) + "\n",
+    );
+    await appendCW("egress_allowed", 30_000);
+
+    const claim = await probeCastleWallProtectionClaim(
+      log,
+      storagePath,
+      async () => exclusiveStatus(),
+      { protectionClaimSubject: agentSubject() },
+    );
+
+    expect(claim.state).toBe("unprotected");
+    expect(claim.state).not.toBe("exclusive");
+    expect(protectionStateAdvice(claim).green).toBe(false);
+  });
+
   it("fresh coarse default evidence stays green when no fine-grained agent was declared", async () => {
     await appendCW("egress_allowed", 60_000);
     const claim = await probeCastleWallProtectionClaim(

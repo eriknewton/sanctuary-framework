@@ -798,6 +798,39 @@ describe("MacOSFlowEventConsumer : flow_decision_recorded", () => {
     expect(consumer.getStats().decisionsRejected).toBe(0);
   });
 
+  it("clears a persisted enforcement_unavailable diagnostic after a successful flow decision", async () => {
+    let clearCount = 0;
+    const { consumer } = buildConsumer({
+      enforcementAvailabilitySink: {
+        recordUnavailable() {
+          throw new Error("recordUnavailable should not be called");
+        },
+        clearUnavailable() {
+          clearCount += 1;
+        },
+      },
+    });
+    const notification: FlowDecisionRecordedNotification = {
+      type: "flow_decision_recorded",
+      decision: "allow",
+      destination: {
+        host: "api.anthropic.com",
+        ip: "104.18.32.10",
+        port: 443,
+        protocol: "tcp",
+        hostname_source: "sni",
+        opaque: false,
+      },
+      agent: { id: auditTokenForRuid(503), template: "coding-assistant" },
+      matched_rule_id: "rule-anthropic",
+      recorded_at: "2026-05-11T12:00:00Z",
+    };
+
+    await consumer.handleFlowDecisionRecorded(notification);
+
+    expect(clearCount).toBe(1);
+  });
+
   it("rejects malformed flow_decision_recorded with a rejected audit entry", async () => {
     const { consumer, auditSinkBundle } = buildConsumer();
     const malformed = {
@@ -1095,6 +1128,54 @@ describe("MacOSFlowEventConsumer : extension diagnostics", () => {
     expect(
       auditSinkBundle.entries[0]?.details?.[CASTLE_WALL_AUDIT_PROVENANCE_KEY],
     ).toBe(CASTLE_WALL_AUDIT_PROVENANCE_VALUE);
+  });
+
+  it("uses the consumer clock when a provider_unbound diagnostic has an invalid timestamp", async () => {
+    const statuses: unknown[] = [];
+    const { consumer, auditSinkBundle } = buildConsumer({
+      now: () => Date.parse("2026-06-11T00:05:00.000Z"),
+      enforcementAvailabilitySink: {
+        recordUnavailable(status) {
+          statuses.push(status);
+        },
+      },
+    });
+    const notification: AuditEmitNotification = {
+      type: "audit_emit",
+      event: {
+        schema_version: 1,
+        layer: "l1",
+        timestamp: undefined as unknown as string,
+        fortress_id: "fortress-test",
+        event_type: "provider_unbound",
+        agent: null,
+        destination: null,
+        decision: null,
+        rule_id: null,
+        details: {
+          source: "macos_extension",
+          trigger: "verdict",
+          manifest_received: true,
+          arm_lease_received: false,
+        },
+      },
+    };
+
+    await consumer.handleAuditEmit(notification);
+
+    expect(statuses).toEqual([
+      {
+        state: "enforcement_unavailable",
+        reason: "manifest_present_arm_lease_missing",
+        updated_at: "2026-06-11T00:05:00.000Z",
+        source: "macos_extension_provider_unbound",
+        manifest_received: true,
+        arm_lease_received: false,
+      },
+    ]);
+    expect(auditSinkBundle.entries[0]?.details?.timestamp).toBe(
+      "2026-06-11T00:05:00.000Z",
+    );
   });
 
   it("rejects non-provider extension audit events", async () => {

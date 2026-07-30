@@ -119,7 +119,7 @@ import { resolveProtectionSubjectFromFortressPath } from "../castle-wall/subject
 import {
   isFreshEnforcementAvailabilityStatus,
   readEnforcementAvailabilityStatus,
-  type EnforcementAvailabilityStatusFile,
+  type EnforcementAvailabilityStatus,
 } from "../castle-wall/runtime/enforcement-availability-status.js";
 import {
   createPostureStreamRegistry,
@@ -2367,7 +2367,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     )).subject;
   }
 
-  private async resolveEnforcementAvailabilityStatus(): Promise<EnforcementAvailabilityStatusFile | null> {
+  private async resolveEnforcementAvailabilityStatus(): Promise<EnforcementAvailabilityStatus | null> {
     const storagePath = this._sanctuaryConfig?.storage_path;
     if (storagePath === undefined || storagePath.length === 0) return null;
     return await readEnforcementAvailabilityStatus(storagePath);

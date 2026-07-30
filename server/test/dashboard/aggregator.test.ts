@@ -697,6 +697,20 @@ describe("getProtectionSnapshot", () => {
         /Castle Wall degraded \(not enforcing\)/
       );
     });
+
+    it("a failed enforcement-availability read keeps the hero shield non-green even with fresh wall evidence", async () => {
+      const snap = await getProtectionSnapshot(
+        fullConfigSources(stubAuditLog([cwArmEntry(60_000)]), {
+          resolveEnforcementAvailabilityStatus: () => {
+            throw new Error("EACCES");
+          },
+        }),
+      );
+
+      expect(snap.overall.light).toBe("yellow");
+      expect(snap.overall.status).toBe("degraded");
+      expect(snap.overall.headline).toMatch(/Castle Wall degraded/);
+    });
   });
 
   // ─── L1 "encrypted at rest" requires live integrity evidence ─────────

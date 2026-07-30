@@ -77,10 +77,10 @@ The macOS flow-event consumer writes this file when it records the matching `pro
 `castle-wall status` reads it best-effort and, when fresh, prints:
 
 ```text
-Enforcement availability: unavailable (manifest present, arm lease absent; agents are denied fail-closed until the wall is re-armed)
+Enforcement availability: unavailable (extension reported manifest present with no arm lease; a #1045-capable extension should deny agents fail-closed, while older extensions may be unfiltered). Remediation: Install/reload the current Castle Wall extension, log in, run 'sanctuary castle-wall enable', and verify with an as-uid differential probe.
 ```
 
-Freshness uses the existing Castle Wall enforcement freshness window. A stale file may be mentioned as historical, but only a fresh file drives the loud unavailable line.
+Freshness uses the existing Castle Wall enforcement freshness window. A stale file is mentioned as historical, but only a fresh valid file drives the loud unavailable line. A present-but-unreadable file is different from an absent file: read errors, truncated JSON, corrupt JSON, and schema mismatches synthesize a fresh non-green `status_present_unreadable` diagnostic until the file is fixed or removed.
 
 The dead-man lease line stays advisory and should say so plainly. The status command must not treat an on-disk `armed: true` lease as proof that the provider received an arm lease.
 
@@ -99,9 +99,10 @@ Extend the canonical posture reason vocabulary:
 
 Mapping rule:
 
-- latest fresh `provider_unbound` with `manifest_received=true` and `arm_lease_received=false` wins as `enforcement_unavailable`
+- fresh `provider_unbound` with `manifest_received=true` and `arm_lease_received=false` is a subclass of fault, not an alternative to fault
+- feature-health records that entry in both the specific `enforcement_unavailable` accumulator and the generic fault accumulator, so a newer allow cannot turn the row green while the fault remains in the freshness window
+- wall posture stays degraded while a fresh local `enforcement_unavailable` fallback is present; confirmed flow-decision recovery clears the local file, and only then can fresh adjudication recover the surface to green
 - other fresh not-enforcing events continue to map to `not_enforcing_evidence` / `fault_evidence`
-- fresh live adjudication can still win only when it is newer than the unavailable diagnostic, preserving the existing "latest evidence wins" posture rule
 
 There are two accepted sources for this read-side signal:
 
@@ -113,8 +114,9 @@ Every caller of the canonical builders must thread the same local diagnostic sna
 - posture routes, including `/api/posture/castle-wall`, `/api/posture/feature-health`, `/api/posture/home`, and `/api/posture/stream`
 - `Dashboard.buildStatusCastleWall()` for `/v1/status`
 - the dashboard aggregator hero-shield path
+- wrap's protection-claim probe and wrap-served dashboard startup/update source wiring
 
-This is additive evidence only in the non-green direction. A local diagnostic can degrade or fault the wall, but can never arm it. If fresh live adjudication is newer than the diagnostic, the normal latest-evidence rule may recover the surface to green.
+This is additive evidence only in the non-green direction. A local diagnostic can degrade or fault the wall, but can never arm it. While the diagnostic is fresh, newer live adjudication does not recover the surface to green; confirmed flow-decision recovery must clear the diagnostic first, or the diagnostic must age outside the freshness window.
 
 Dashboard copy should be direct:
 
@@ -135,6 +137,14 @@ This build does not:
 
 The ack protocol is the stronger future proof, but it is not the close-behind status fix. This build uses the extension diagnostic already emitted in the failing condition.
 
+Residual bounds called out by independent review:
+
+- this PR closes the lease-never-received status-surface gap only; it does not close the deliberate dead-man fail-open path after a lease was received and then expired
+- `castle-wall status` still exits 0 when enforcement is unavailable, so scripted monitors must inspect the status text or a structured surface
+- local fallback injection occurs after some posture early-return paths, so those paths can remain non-green without carrying the exact `enforcement_unavailable` reason
+- same-millisecond generic not-enforcing versus enforcement-unavailable ordering can mislabel the specific reason, but not the non-green state
+- agent-facing MCP health/attestation surfaces remain bounded to degraded/not-green state and do not yet render this specific diagnostic
+
 ## Independent Review Notes
 
 The first independent design review blocked implementation until four gaps were closed:
@@ -145,6 +155,8 @@ The first independent design review blocked implementation until four gaps were 
 - feature-health needed to track the specific unavailable fault timestamp, not only the latest generic fault timestamp
 
 This revision closes those gaps by requiring the canonical local diagnostic fallback, provenance stamping, top-level CLI rendering, and timestamp-specific unavailable tracking.
+
+The second independent review found two merge-blockers and six follow-ups. This revision closes the blockers by treating `enforcement_unavailable` as fault evidence as well as a specific basis, and by chowning the safe-mode status file to the fortress owner while preserving `0600`. It also changes present-but-unreadable status files from silent `null` to a fail-closed local diagnostic, validates diagnostic timestamps before writing, clears the file on confirmed flow-decision recovery, wires the resolver through wrap/dashboard construction sites, and adds route-level coverage.
 
 ## Acceptance Criteria
 
@@ -157,7 +169,11 @@ Host-free tests:
 - `buildCastleWallPosture` returns `arm_state: "degraded"` and `evidence_basis: "enforcement_unavailable"` for the matching diagnostic
 - `buildCastleWallPosture` returns the same degraded basis when the fresh local diagnostic fallback is supplied and the audit log lacks the boot-token entry
 - `buildFeatureHealthPanel` returns Castle Wall `status: "fault"` and `basis: "enforcement_unavailable"` for the same diagnostic
-- `buildFeatureHealthPanel` lets newer live adjudication recover only when newer than the unavailable diagnostic
+- `buildFeatureHealthPanel` stays non-green when the unavailable diagnostic remains present even if a newer allow is observed
+- the wrap protection claim does not render protected in that state
+- present-but-unreadable status files synthesize a non-green local diagnostic rather than disappearing as `null`
+- a successful flow decision clears the local diagnostic so genuine recovery does not stay loud for the full freshness window
+- posture routes and the dashboard HTTP API surface the diagnostic end to end
 - dashboard label rendering recognizes `enforcement_unavailable`
 
 Hardware acceptance, owed after PR review:

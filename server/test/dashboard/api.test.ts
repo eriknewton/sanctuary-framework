@@ -13,6 +13,9 @@ import { describe, it, expect, afterEach } from "vitest";
 import { startDashboardServer } from "../../src/dashboard/server.js";
 import type { DashboardHandle } from "../../src/dashboard/server.js";
 import type { ActivityEntry, PendingApproval, AggregatorSources } from "../../src/dashboard/aggregator.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
+import { MemoryStorage } from "../../src/storage/memory.js";
+import { generateRandomKey } from "../../src/core/random.js";
 
 async function startForTest(overrides: {
   authToken?: string;
@@ -54,6 +57,35 @@ describe("Dashboard HTTP API", () => {
     expect(body.layers.l1.label).toBe("L1 Cognitive");
     expect(body.overall.light).toMatch(/^(green|yellow|red)$/);
     expect(body.server_version).toBe("0.9.0-test");
+  });
+
+  it("threads enforcement_unavailable into authenticated posture routes", async () => {
+    const now = Date.now();
+    const auditLog = new AuditLog(new MemoryStorage(), generateRandomKey());
+    handle = await startDashboardServer({
+      mode: "co-located",
+      port: 0,
+      sources: {
+        mode: "co-located",
+        server_version: "0.9.0-test",
+        auditLog,
+        resolveProtectionClaimSubject: () => null,
+        resolveEnforcementAvailabilityStatus: () => ({
+          state: "enforcement_unavailable",
+          reason: "manifest_present_arm_lease_missing",
+          updated_at: new Date(now - 60_000).toISOString(),
+          source: "macos_extension_provider_unbound",
+          manifest_received: true,
+          arm_lease_received: false,
+        }),
+      },
+    });
+
+    const res = await fetch(`${handle.url}/api/posture/castle-wall`);
+    expect(res.status).toBe(200);
+    const wall = await res.json();
+    expect(wall.arm_state).toBe("degraded");
+    expect(wall.evidence_basis).toBe("enforcement_unavailable");
   });
 
   it("serves the legacy hero HTML at /v1.0 (v1.1.7 path-flip)", async () => {

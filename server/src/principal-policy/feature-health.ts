@@ -132,7 +132,7 @@ import {
   enforcementAvailabilityStatusTimeMs,
   isEnforcementUnavailableProviderUnboundDetails,
   isFreshEnforcementAvailabilityStatus,
-  type EnforcementAvailabilityStatusFile,
+  type EnforcementAvailabilityStatus,
 } from "../castle-wall/runtime/enforcement-availability-status.js";
 
 /**
@@ -935,7 +935,7 @@ export interface BuildFeatureHealthInput {
    * Fresh local extension diagnostic fallback. Only the Castle Wall row consumes
    * this, and only as non-green fault evidence.
    */
-  enforcementAvailabilityStatus?: EnforcementAvailabilityStatusFile | null;
+  enforcementAvailabilityStatus?: EnforcementAvailabilityStatus | null;
   /**
    * Match mode for Castle Wall evidence. Default is exact per-agent subject
    * matching. The only production caller that widens this is the coarse-wall
@@ -1398,10 +1398,8 @@ export function evaluateFeatureHealth(args: {
         c.ts > latestFreshEnforcementUnavailableMs)
     ) {
       latestFreshEnforcementUnavailableMs = c.ts;
-    } else if (
-      c.isFault &&
-      (latestFreshFaultMs === null || c.ts > latestFreshFaultMs)
-    ) {
+    }
+    if (c.isFault && (latestFreshFaultMs === null || c.ts > latestFreshFaultMs)) {
       latestFreshFaultMs = c.ts;
     }
     if (

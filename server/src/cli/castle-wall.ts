@@ -79,8 +79,11 @@ import {
   GENERIC_UID_CONFINEMENT_REMEDY,
 } from "../egress-gate/operator-advice.js";
 import {
+  enforcementAvailabilityStatusTimeMs,
+  isEnforcementAvailabilityStatusReadFailure,
   readEnforcementAvailabilityStatus,
   isFreshEnforcementAvailabilityStatus,
+  type EnforcementAvailabilityStatus,
 } from "../castle-wall/runtime/enforcement-availability-status.js";
 import {
   DEFAULT_ENFORCEMENT_FRESHNESS_MS,
@@ -1443,16 +1446,31 @@ export async function runStatus(
   }
   const enforcementAvailability =
     await readEnforcementAvailabilityStatus(storagePath);
-  if (
-    isFreshEnforcementAvailabilityStatus(enforcementAvailability, {
+  const enforcementAvailabilityFresh = isFreshEnforcementAvailabilityStatus(
+    enforcementAvailability,
+    {
       now: Date.now(),
       freshnessWindowMs: DEFAULT_ENFORCEMENT_FRESHNESS_MS,
       futureSkewMs: ENFORCEMENT_FUTURE_SKEW_MS,
-    })
+    },
+  );
+  const enforcementAvailabilityMs =
+    enforcementAvailabilityStatusTimeMs(enforcementAvailability);
+  if (
+    enforcementAvailabilityFresh
+  ) {
+    write(out, formatEnforcementUnavailableStatus(enforcementAvailability));
+  } else if (
+    enforcementAvailability !== null &&
+    enforcementAvailabilityMs !== null
   ) {
     write(
       out,
-      "Enforcement availability: unavailable (manifest present, arm lease absent; agents are denied fail-closed until the wall is re-armed)\n",
+      `Enforcement availability: historical unavailable diagnostic (last updated ${new Date(
+        enforcementAvailabilityMs,
+      ).toISOString()}; outside the ${Math.round(
+        DEFAULT_ENFORCEMENT_FRESHNESS_MS / 60_000,
+      )}m freshness window, so it is not current enforcement evidence. Re-arm with 'sanctuary castle-wall enable' after login, then re-check with an as-uid differential probe.)\n`,
     );
   }
   const lease = await readLeaseStatus(storagePath);
@@ -1460,6 +1478,17 @@ export async function runStatus(
     write(out, formatDeadManLeaseStatus(lease, contentFilterState));
   }
   return 0;
+}
+
+function formatEnforcementUnavailableStatus(
+  status: EnforcementAvailabilityStatus | null,
+): string {
+  const repair =
+    "Install/reload the current Castle Wall extension, log in, run 'sanctuary castle-wall enable', and verify with an as-uid differential probe.";
+  if (isEnforcementAvailabilityStatusReadFailure(status)) {
+    return `Enforcement availability: unavailable (local diagnostic file is present but unreadable or invalid: ${status.read_error.kind}; failing closed until the diagnostic is readable or removed). Remediation: ${repair}\n`;
+  }
+  return `Enforcement availability: unavailable (extension reported manifest present with no arm lease; a #1045-capable extension should deny agents fail-closed, while older extensions may be unfiltered). Remediation: ${repair} ${GENERIC_UID_CONFINEMENT_REMEDY}\n`;
 }
 
 /**

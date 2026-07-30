@@ -62,7 +62,10 @@ import {
 } from "../../storage/custody-fs.js";
 import { MacOSFlowEventConsumer } from "./macos-flow-events.js";
 import { MacOSFlowIpcListener } from "./macos-ipc-listener.js";
-import { writeEnforcementAvailabilityStatusBestEffort } from "./enforcement-availability-status.js";
+import {
+  clearEnforcementAvailabilityStatusBestEffort,
+  writeEnforcementAvailabilityStatusBestEffort,
+} from "./enforcement-availability-status.js";
 import { protectionSubjectFromAgentOrigin } from "../subject-binding.js";
 import {
   CASTLE_WALL_ACTIVE_CONFIG_PATH,
@@ -869,12 +872,27 @@ export async function startMacOSCastleWallDaemon(
         const ok = await writeEnforcementAvailabilityStatusBestEffort(
           input.fortressPath,
           status,
+          input.socketOwnerUid !== undefined
+            ? { ownerUid: input.socketOwnerUid }
+            : {},
         );
         if (!ok) {
           // SAFETY: this is an operator-loud local status persistence failure;
           // enforcement and audit persistence continue fail-closed/non-green.
           console.error(
             "[castle-wall] failed to persist enforcement_unavailable diagnostic",
+          );
+        }
+      },
+      async clearUnavailable() {
+        const ok = await clearEnforcementAvailabilityStatusBestEffort(
+          input.fortressPath,
+        );
+        if (!ok) {
+          // SAFETY: this is an operator-loud local status clear failure after
+          // confirmed recovery; enforcement and audit persistence continue.
+          console.error(
+            "[castle-wall] failed to clear enforcement_unavailable diagnostic after flow decision recovery",
           );
         }
       },

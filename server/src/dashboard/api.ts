@@ -338,6 +338,8 @@ export async function handleRequest(
           deps.sources.brokerProducerKeyExpectedButUnavailable === true,
         resolveProtectionClaimSubject:
           deps.sources.resolveProtectionClaimSubject,
+        resolveEnforcementAvailabilityStatus:
+          deps.sources.resolveEnforcementAvailabilityStatus,
         // Fleet Console: pass the SAME read-only fleet-roster provider the
         // `/api/fleet/roster` route uses to the posture routes, so the already-
         // served posture-home fleet panel (`GET /api/posture/fleet`) lights up

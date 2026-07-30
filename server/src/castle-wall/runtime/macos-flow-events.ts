@@ -57,6 +57,7 @@ import { protectionSubjectFromMacOSAuditToken } from "../subject-binding.js";
 import {
   buildEnforcementUnavailableStatusFile,
   isEnforcementUnavailableProviderUnboundDetails,
+  parseEnforcementAvailabilityStatus,
   type EnforcementAvailabilityStatusFile,
 } from "./enforcement-availability-status.js";
 
@@ -113,6 +114,7 @@ export interface MacOSEnforcementAvailabilitySink {
   recordUnavailable(
     status: EnforcementAvailabilityStatusFile,
   ): Promise<void> | void;
+  clearUnavailable?(): Promise<void> | void;
 }
 
 /** Constructor input. */
@@ -174,6 +176,7 @@ export class MacOSFlowEventConsumer {
   private readonly producerAuditConsumer: AuditConsumer | null;
   private readonly emissionLiveness: EmissionLivenessNotes | null;
   private readonly enforcementAvailabilitySink: MacOSEnforcementAvailabilitySink | null;
+  private readonly now: () => number;
   private stats: MacOSFlowEventStats = {
     subscribers: 0,
     manifestSnapshotsEmitted: 0,
@@ -194,6 +197,7 @@ export class MacOSFlowEventConsumer {
     this.emissionLiveness = input.emissionLiveness ?? null;
     this.enforcementAvailabilitySink =
       input.enforcementAvailabilitySink ?? null;
+    this.now = input.now ?? Date.now;
     this.producerAuditConsumer =
       typeof input.pinnedProducerKeyB64url === "string" &&
       input.pinnedProducerKeyB64url.length > 0
@@ -306,6 +310,7 @@ export class MacOSFlowEventConsumer {
         );
         this.stats.decisionsRecorded += 1;
         this.emissionLiveness?.noteEmission();
+        await this.clearEnforcementUnavailableStatus();
       } catch (err) {
         this.stats.decisionsRejected += 1;
         if (err instanceof AuditChainError) {
@@ -392,6 +397,7 @@ export class MacOSFlowEventConsumer {
     }
     this.stats.decisionsRecorded += 1;
     this.emissionLiveness?.noteEmission();
+    await this.clearEnforcementUnavailableStatus();
   }
 
   /**
@@ -458,13 +464,17 @@ export class MacOSFlowEventConsumer {
       await this.auditSink.flush();
       return;
     }
+    const diagnosticTimestamp = validIsoTimestampOrNow(
+      event.timestamp,
+      this.now,
+    );
     await this.auditSink.append(
       CASTLE_WALL_AUDIT_LAYER,
       event.event_type,
       event.fortress_id,
       {
         ...event.details,
-        timestamp: event.timestamp,
+        timestamp: diagnosticTimestamp,
         [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
       },
       "failure"
@@ -475,9 +485,13 @@ export class MacOSFlowEventConsumer {
       this.enforcementAvailabilitySink !== null
     ) {
       try {
-        await this.enforcementAvailabilitySink.recordUnavailable(
-          buildEnforcementUnavailableStatusFile(event.timestamp),
+        const status = parseEnforcementAvailabilityStatus(
+          buildEnforcementUnavailableStatusFile(diagnosticTimestamp),
         );
+        if (status === null) {
+          throw new Error("internal enforcement_unavailable status failed schema validation");
+        }
+        await this.enforcementAvailabilitySink.recordUnavailable(status);
       } catch (error) {
         // SAFETY: stderr is the operator channel for a failed local diagnostic
         // write; the accepted provider_unbound audit event was already flushed.
@@ -491,9 +505,35 @@ export class MacOSFlowEventConsumer {
     this.stats.extensionDiagnosticsRecorded += 1;
   }
 
+  private async clearEnforcementUnavailableStatus(): Promise<void> {
+    if (this.enforcementAvailabilitySink?.clearUnavailable === undefined) return;
+    try {
+      await this.enforcementAvailabilitySink.clearUnavailable();
+    } catch (error) {
+      // SAFETY: stderr is the operator channel for a failed local diagnostic
+      // clear after confirmed recovery; audit persistence has already succeeded.
+      console.error(
+        `[castle-wall] failed to clear enforcement_unavailable diagnostic after flow decision recovery: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      );
+    }
+  }
+
   getStats(): MacOSFlowEventStats {
     return { ...this.stats };
   }
+}
+
+function validIsoTimestampOrNow(
+  timestamp: unknown,
+  now: () => number,
+): string {
+  if (typeof timestamp === "string") {
+    const parsed = Date.parse(timestamp);
+    if (!Number.isNaN(parsed)) return new Date(parsed).toISOString();
+  }
+  return new Date(now()).toISOString();
 }
 
 function buildProducerSignedEnvelope(

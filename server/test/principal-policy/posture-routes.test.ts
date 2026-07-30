@@ -307,6 +307,40 @@ describe("posture route layer", () => {
     expect(homeBroker.status).not.toBe("active");
   });
 
+  it("routes enforcement_unavailable to castle-wall, feature-health, and home as non-green", async () => {
+    const now = Date.now();
+    const deps: PostureRouteDeps = {
+      ...baseDeps(newLog(), [wrappedAgent("a1", "claude_code")]),
+      now: () => now,
+      resolveEnforcementAvailabilityStatus: () => ({
+        state: "enforcement_unavailable",
+        reason: "manifest_present_arm_lease_missing",
+        updated_at: new Date(now - 60_000).toISOString(),
+        source: "macos_extension_provider_unbound",
+        manifest_received: true,
+        arm_lease_received: false,
+      }),
+    };
+    const base = await serve(deps);
+
+    const wall = await (await fetch(`${base}${POSTURE_API_PREFIX}/castle-wall`)).json();
+    const panel = await (await fetch(`${base}${POSTURE_API_PREFIX}/feature-health`)).json();
+    const home = await (await fetch(`${base}${POSTURE_API_PREFIX}/home`)).json();
+    const wallRow = panel.rows.find(
+      (r: { feature_id: string }) => r.feature_id === "castle_wall_egress",
+    );
+    const homeWallRow = home.feature_health.rows.find(
+      (r: { feature_id: string }) => r.feature_id === "castle_wall_egress",
+    );
+
+    expect(wall.arm_state).toBe("degraded");
+    expect(wall.evidence_basis).toBe("enforcement_unavailable");
+    expect(wallRow.status).toBe("fault");
+    expect(wallRow.basis).toBe("enforcement_unavailable");
+    expect(home.castle_wall.arm_state).toBe("degraded");
+    expect(homeWallRow.status).toBe("fault");
+  });
+
   it("serves per-agent reach (G5) and 404s an unknown agent", async () => {
     const base = await serve(baseDeps(newLog(), [wrappedAgent("a1", "claude_code")]));
     const ok = await fetch(`${base}${POSTURE_API_PREFIX}/reach/a1`);

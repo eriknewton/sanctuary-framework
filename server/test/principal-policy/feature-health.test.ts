@@ -206,6 +206,36 @@ describe("feature-health panel — the four mandatory color assertions", () => {
     expect(cw.basis).toBe("enforcement_unavailable");
   });
 
+  it("keeps a manifest-present arm-lease-absent fault non-green even when a newer allow follows", async () => {
+    const { log } = newAuditLog();
+    const now = Date.now();
+    await log.appendCritical({
+      layer: "l1",
+      operation: "provider_unbound",
+      identity_id: FORTRESS,
+      result: "failure",
+      details: {
+        manifest_received: true,
+        arm_lease_received: false,
+        cw_source: "castle_wall_audit_consumer",
+      },
+      timestamp: new Date(now - 90_000).toISOString(),
+    });
+    await appendCW(log, "egress_allowed", new Date(now - 30_000).toISOString());
+
+    const panel = await buildFeatureHealthPanel({
+      protectionClaimSubject: FORTRESS,
+      auditLog: log,
+      originMachine: FORTRESS,
+      now,
+    });
+
+    const cw = row(panel, "castle_wall_egress");
+    expect(cw.status).toBe("fault");
+    expect(cw.status).not.toBe("active");
+    expect(cw.basis).toBe("fault_evidence");
+  });
+
   it("labels Castle Wall fault from the local enforcement_unavailable fallback when the audit log lacks the safe-mode entry", async () => {
     const { log } = newAuditLog();
     const now = Date.now();
@@ -230,7 +260,7 @@ describe("feature-health panel — the four mandatory color assertions", () => {
     expect(cw.basis).toBe("enforcement_unavailable");
   });
 
-  it("lets newer live Castle Wall adjudication recover over an older local enforcement_unavailable fallback", async () => {
+  it("keeps the row faulted while a fresh local enforcement_unavailable fallback is still present", async () => {
     const { log } = newAuditLog();
     const now = Date.now();
     await appendCW(log, "egress_allowed", new Date(now - 30_000).toISOString());
@@ -251,8 +281,8 @@ describe("feature-health panel — the four mandatory color assertions", () => {
     });
 
     const cw = row(panel, "castle_wall_egress");
-    expect(cw.status).toBe("active");
-    expect(cw.basis).toBe("fresh_enforcement_evidence");
+    expect(cw.status).toBe("fault");
+    expect(cw.basis).toBe("fault_evidence");
   });
 
   it("(c) integrity-taint forces unknown for EVERY feature, even with fresh evidence present", () => {

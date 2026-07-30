@@ -1605,7 +1605,12 @@ async function readCastleWallEgressFeatureStatus(
   const { loadFortressProducerKey } = await import(
     "../castle-wall/runtime/producer-signature.js"
   );
+  const { readEnforcementAvailabilityStatus } = await import(
+    "../castle-wall/runtime/enforcement-availability-status.js"
+  );
   const keyLoad = await loadFortressProducerKey(storagePath);
+  const enforcementAvailabilityStatus =
+    await readEnforcementAvailabilityStatus(storagePath);
   // Eager-read scope: same one-verified-view discipline as the dashboard
   // callers of buildFeatureHealthPanel (H4 chokepoint).
   const panel = await auditLog.runEagerReads(() =>
@@ -1625,6 +1630,9 @@ async function readCastleWallEgressFeatureStatus(
         input.purpose === "protection-claim"
           ? input.protectionClaimSubject ?? null
           : fortressIdFromStoragePath(storagePath),
+      ...(enforcementAvailabilityStatus !== null
+        ? { enforcementAvailabilityStatus }
+        : {}),
       ...(input.purpose === "coarse-wall"
         ? {
             protectionSubjectMatchMode: {
@@ -4208,6 +4216,12 @@ export async function runWrap(
         mode: opts.mode,
         authToken: opts.authToken,
         serverVersion: opts.serverVersion,
+        resolveEnforcementAvailabilityStatus: async () => {
+          const { readEnforcementAvailabilityStatus } = await import(
+            "../castle-wall/runtime/enforcement-availability-status.js"
+          );
+          return readEnforcementAvailabilityStatus(storagePath);
+        },
         ...(wrapFleetRoster ? { fleetRoster: wrapFleetRoster } : {}),
       }));
   // Multi-tenancy: honour SANCTUARY_DASHBOARD_PORT so two wraps can pick
@@ -4299,6 +4313,9 @@ export async function runWrap(
         const { loadBrokerProducerKey } = await import(
           "../broker-mcp/producer-signature.js"
         );
+        const { readEnforcementAvailabilityStatus } = await import(
+          "../castle-wall/runtime/enforcement-availability-status.js"
+        );
         const producerKeyLoad = await loadFortressProducerKey(storagePath);
         const brokerProducerKeyLoad = await loadBrokerProducerKey(storagePath);
         dashboard.updateSources?.({
@@ -4321,6 +4338,8 @@ export async function runWrap(
               storagePath,
               fortressIdFromStoragePath(storagePath),
             ).then((result) => result.subject),
+          resolveEnforcementAvailabilityStatus: () =>
+            readEnforcementAvailabilityStatus(storagePath),
         });
       } catch {
         // Never let the producer-key probe fail wrap. On any unexpected throw the

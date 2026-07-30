@@ -29,8 +29,9 @@ import {
   type ExclusiveEgressStatus,
 } from "../principal-policy/posture.js";
 import {
+  buildEnforcementAvailabilityStatusReadFailure,
   isFreshEnforcementAvailabilityStatus,
-  type EnforcementAvailabilityStatusFile,
+  type EnforcementAvailabilityStatus,
 } from "../castle-wall/runtime/enforcement-availability-status.js";
 import type { ReputationEvidence } from "../shr/generator.js";
 import { deriveReputationDegradations } from "../shr/generator.js";
@@ -233,9 +234,9 @@ export interface AggregatorSources {
   brokerProducerKeyExpectedButUnavailable?: boolean;
   /** Fresh local extension diagnostic fallback; non-green evidence only. */
   resolveEnforcementAvailabilityStatus?: () =>
-    | EnforcementAvailabilityStatusFile
+    | EnforcementAvailabilityStatus
     | null
-    | Promise<EnforcementAvailabilityStatusFile | null>;
+    | Promise<EnforcementAvailabilityStatus | null>;
   /**
    * Unified Protect Slice 5 S5-P: resolve the exclusive-egress posture for the
    * wall reader. MUST already be fail-closed (the dashboard's resolver maps a
@@ -842,13 +843,18 @@ export async function getProtectionSnapshot(
   // closed to amber), and an expected-but-unreadable key forces non-green rather
   // than silently dropping to the weaker channel basis. Mirrors the
   // posture-routes / dispatchPosture wiring.
-  let enforcementAvailabilityStatus: EnforcementAvailabilityStatusFile | null = null;
+  let enforcementAvailabilityStatus: EnforcementAvailabilityStatus | null = null;
   try {
     enforcementAvailabilityStatus = sources.resolveEnforcementAvailabilityStatus
       ? await sources.resolveEnforcementAvailabilityStatus()
       : null;
-  } catch {
-    enforcementAvailabilityStatus = null;
+  } catch (err) {
+    enforcementAvailabilityStatus =
+      buildEnforcementAvailabilityStatusReadFailure(
+        "dashboard snapshot enforcement availability provider",
+        "read_error",
+        err,
+      );
   }
   const unavailableIsFresh = isFreshEnforcementAvailabilityStatus(
     enforcementAvailabilityStatus,
