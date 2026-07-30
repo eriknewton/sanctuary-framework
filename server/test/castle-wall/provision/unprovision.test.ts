@@ -18,12 +18,15 @@ const OPERATOR_UID_GID = { uid: 501, gid: 501 };
 
 function mockRehomeOps(overrides: Partial<RehomeOps> = {}): RehomeOps & {
   restores: string[];
+  sourceDuplicateRestores: Array<{ backupPath: string; sourcePath: string }>;
   restoreCustodyCalls: Array<{ path: string; uid: number; gid: number }>;
 } {
   const restores: string[] = [];
+  const sourceDuplicateRestores: Array<{ backupPath: string; sourcePath: string }> = [];
   const restoreCustodyCalls: Array<{ path: string; uid: number; gid: number }> = [];
   return {
     restores,
+    sourceDuplicateRestores,
     restoreCustodyCalls,
     pathExists: async () => true,
     pathExistsNoFollow: async () => true,
@@ -35,7 +38,10 @@ function mockRehomeOps(overrides: Partial<RehomeOps> = {}): RehomeOps & {
     restoreDisplacedDestination: async () => ({ restored: true }),
     backup: async (path) => ({ backupPath: `${path}.bak` }),
     removeSourceDuplicate: async () => undefined,
-    restoreSourceDuplicate: async () => ({ restored: true }),
+    restoreSourceDuplicate: async (backupPath, sourcePath) => {
+      sourceDuplicateRestores.push({ backupPath, sourcePath });
+      return { restored: true };
+    },
     move: async () => undefined,
     chown: async () => ({ excludedPaths: [] }),
     restore: async (destPath) => {
@@ -91,6 +97,38 @@ describe("castle-wall/provision/unprovision", () => {
     expect(rehomeOps.restoreCustodyCalls).toEqual([
       { path: "/Users/operator/.hermes/.env", uid: OPERATOR_UID_GID.uid, gid: OPERATOR_UID_GID.gid },
     ]);
+  });
+
+  it("restores removed destination-authoritative source duplicates without moving the authoritative destination", async () => {
+    const sourcePath = "/Users/operator/.hermes/config.yaml";
+    const destPath = "/var/sanctuary-agents/sanctuary-hermes/.hermes/config.yaml";
+    const backupPath = "/root/.sanctuary-rehome-backups/Users/operator/.hermes/config.yaml.bak";
+    const unprovisionOps: UnprovisionOps = {
+      disarm: async () => undefined,
+      uninstallHarnessDaemon: async () => undefined,
+      scrubProvisionedEgressRules: async () => undefined,
+    };
+    const rehomeOps = mockRehomeOps();
+
+    const outcomes = await unprovision({
+      rehomeResults: [
+        {
+          entry: { sourcePath, destRelativePath: ".hermes/config.yaml", isSecret: true },
+          destPath,
+          status: "destination-authoritative",
+          backupPath,
+          sourceDuplicateRemoved: true,
+        },
+      ],
+      rehomeOps,
+      unprovisionOps,
+      operatorUidGid: OPERATOR_UID_GID,
+    });
+
+    expect(unprovisionFullyOk(outcomes)).toBe(true);
+    expect(rehomeOps.sourceDuplicateRestores).toEqual([{ backupPath, sourcePath }]);
+    expect(rehomeOps.restores).toEqual([]);
+    expect(rehomeOps.restoreCustodyCalls).toEqual([{ path: sourcePath, uid: OPERATOR_UID_GID.uid, gid: OPERATOR_UID_GID.gid }]);
   });
 
   it("still attempts later steps when an earlier step fails (fail-loud, not fail-stop)", async () => {

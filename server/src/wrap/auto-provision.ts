@@ -2023,8 +2023,13 @@ async function pathExists(path: string): Promise<boolean> {
   }
 }
 
+let lastRehomeTimestampMs = 0;
+
 function formatRehomeTimestamp(date = new Date()): string {
-  return date.toISOString().replace(/[-:.]/g, "");
+  const requestedMs = date.getTime();
+  const timestampMs = requestedMs <= lastRehomeTimestampMs ? lastRehomeTimestampMs + 1 : requestedMs;
+  lastRehomeTimestampMs = timestampMs;
+  return new Date(timestampMs).toISOString().replace(/[-:.]/g, "");
 }
 
 async function hashPathNoFollow(path: string): Promise<{ algorithm: "sha256"; value: string }> {
