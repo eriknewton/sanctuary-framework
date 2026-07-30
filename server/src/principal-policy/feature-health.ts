@@ -937,7 +937,11 @@ export interface BuildFeatureHealthInput {
    * machine-wide fortress property, not a per-agent protection claim.
    */
   protectionSubjectMatchMode?: ProtectionSubjectMatchMode;
-  /** Node platform; macOS Castle Wall green is availability-report-gated. */
+  /**
+   * Node platform. A supplied enforcementAvailability object gates the Castle
+   * Wall verdict on any host so Linux CI can exercise the macOS honesty
+   * contract; absent availability keeps Linux on its existing audit-drain path.
+   */
   platform?: NodeJS.Platform;
   /** macOS v3 level-triggered availability verdict for Castle Wall. */
   enforcementAvailability?: ResolvedEnforcementAvailability | null;
@@ -1920,7 +1924,8 @@ export async function buildFeatureHealthPanel(
     });
     if (
       feature.id === "castle_wall_egress" &&
-      (input.platform ?? process.platform) === "darwin"
+      ((input.platform ?? process.platform) === "darwin" ||
+        input.enforcementAvailability !== undefined)
     ) {
       const availability =
         input.enforcementAvailability ?? {

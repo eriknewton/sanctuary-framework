@@ -68,6 +68,13 @@ const NOW = 1_750_000_000_000;
 const FRESH_TS = NOW - 1000;
 // Safely OUTSIDE the 10-minute freshness window but inside the 24h digest.
 const STALE_TS = NOW - 30 * 60_000;
+const UNDETERMINED_AVAILABILITY = {
+  status: "undetermined",
+  reason: "availability_not_queried",
+  observed_at: null,
+  freshness_window_ms: 30_000,
+  active_connection_count: 0,
+} as const;
 
 function toB64url(bytes: Uint8Array): string {
   let bin = "";
@@ -428,6 +435,24 @@ describe("Slice 2 — fresh enforcement evidence is still green; a beat does not
     const cw = cwRow(panel);
     expect(cw.status).toBe("active");
     expect(cw.basis).toBe("fresh_enforcement_evidence");
+  });
+
+  it("v3 availability still caps fresh block + heartbeat on a Linux-shaped reader", async () => {
+    const log = newLog();
+    await appendGenuineBlock(log, FRESH_TS, 1);
+    await appendGenuineHeartbeat(log, FRESH_TS, 2);
+    const panel = await buildFeatureHealthPanel({
+      protectionClaimSubject: SUBJECT,
+      auditLog: log,
+      originMachine: FORTRESS,
+      now: NOW,
+      pinnedProducerKeyB64url: daemonPubB64,
+      enforcementAvailability: UNDETERMINED_AVAILABILITY,
+    });
+    const cw = cwRow(panel);
+    expect(cw.status).toBe("unknown");
+    expect(cw.status).not.toBe("active");
+    expect(cw.basis).toBe("no_evidence_self_reporting");
   });
 });
 

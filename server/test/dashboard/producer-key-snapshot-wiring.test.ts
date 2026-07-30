@@ -137,6 +137,13 @@ function auditTokenForRuid(uid: number): string {
 const CLAIM_UID = 601;
 const CLAIM_TOKEN = auditTokenForRuid(CLAIM_UID);
 const CLAIM_SUBJECT = subjectForUid(CLAIM_UID);
+const UNDETERMINED_AVAILABILITY = {
+  status: "undetermined" as const,
+  reason: "availability_not_queried",
+  observed_at: null,
+  freshness_window_ms: 30_000,
+  active_connection_count: 0,
+};
 
 function toBase64url(bytes: Uint8Array): string {
   let bin = "";
@@ -350,6 +357,7 @@ describe("producer-key production wiring — startDashboard snapshot server", ()
 
   async function bootAndSnapshot(
     setupAudit: (log: AuditLog) => Promise<void>,
+    enforcementAvailability?: typeof UNDETERMINED_AVAILABILITY,
   ): Promise<{ light: string; status: string }> {
     const storage = new MemoryStorage();
     const masterKey = generateRandomKey();
@@ -379,6 +387,9 @@ describe("producer-key production wiring — startDashboard snapshot server", ()
         load.status === "present" ? load.keyB64url : null,
       ...(load.status === "unreadable"
         ? { producerKeyExpectedButUnavailable: true }
+        : {}),
+      ...(enforcementAvailability !== undefined
+        ? { resolveEnforcementAvailability: () => enforcementAvailability }
         : {}),
     });
 
@@ -420,5 +431,14 @@ describe("producer-key production wiring — startDashboard snapshot server", ()
     // suites instead.
     const { light } = await bootAndSnapshot(appendGenuine);
     expect(light).toBe("green");
+  });
+
+  it("injected undetermined v3 availability caps the Linux-shaped snapshot path", async () => {
+    const { light, status } = await bootAndSnapshot(
+      appendGenuine,
+      UNDETERMINED_AVAILABILITY,
+    );
+    expect(light).toBe("yellow");
+    expect(status).toBe("degraded");
   });
 });

@@ -47,6 +47,13 @@ function auditTokenForRuid(uid: number): string {
 const CLAIM_UID = 601;
 const CLAIM_TOKEN = auditTokenForRuid(CLAIM_UID);
 const CLAIM_SUBJECT = subjectForUid(CLAIM_UID);
+const UNDETERMINED_AVAILABILITY = {
+  status: "undetermined",
+  reason: "availability_not_queried",
+  observed_at: null,
+  freshness_window_ms: 30_000,
+  active_connection_count: 0,
+} as const;
 
 function wrappedAgent(id: string, harness: string): LocalAgentRecord {
   return {
@@ -100,7 +107,11 @@ async function serve(deps: PostureRouteDeps): Promise<string> {
   return `http://127.0.0.1:${addr.port}`;
 }
 
-function baseDeps(log: AuditLog | null, agents: LocalAgentRecord[]): PostureRouteDeps {
+function baseDeps(
+  log: AuditLog | null,
+  agents: LocalAgentRecord[],
+  extra?: Partial<PostureRouteDeps>,
+): PostureRouteDeps {
   const detected: DetectedHarness[] = [
     { platform: "cursor", harness: "cursor", config_path: "/home/u/.cursor/mcp.json" },
   ];
@@ -119,6 +130,7 @@ function baseDeps(log: AuditLog | null, agents: LocalAgentRecord[]): PostureRout
     ],
     platform: "linux",
     resolveProtectionClaimSubject: () => CLAIM_SUBJECT,
+    ...extra,
   };
 }
 
@@ -171,6 +183,35 @@ describe("posture route layer", () => {
     expect(body.unwrapped.unwrapped[0].harness).toBe("cursor");
     expect(body.digest.kernel_allows).toBe(1);
     expect(body.origin_machine).toBe(FORTRESS);
+  });
+
+  it("injected v3 undetermined availability caps the Linux-shaped home payload", async () => {
+    const log = newLog();
+    const now = Date.now();
+    await log.appendCritical({
+      layer: "l1",
+      operation: "egress_allowed",
+      identity_id: CLAIM_SUBJECT,
+      result: "success",
+      details: {
+        agent_id: CLAIM_TOKEN,
+        cw_source: "castle_wall_audit_consumer",
+      },
+      timestamp: new Date(now - 30_000).toISOString(),
+    });
+    const base = await serve(
+      baseDeps(log, [wrappedAgent("a1", "claude_code")], {
+        resolveEnforcementAvailability: () => UNDETERMINED_AVAILABILITY,
+      }),
+    );
+    const body = await (await fetch(`${base}${POSTURE_API_PREFIX}/home`)).json();
+    expect(body.castle_wall.arm_state).toBe("unknown");
+    expect(body.castle_wall.arm_state).not.toBe("armed");
+    expect(
+      body.feature_health.rows.find(
+        (r: { feature_id: string }) => r.feature_id === "castle_wall_egress",
+      ).status,
+    ).toBe("unknown");
   });
 
   it("home digest reflects a just-appended entry with NO stale lag (eager-read never-stale-green, #714)", async () => {

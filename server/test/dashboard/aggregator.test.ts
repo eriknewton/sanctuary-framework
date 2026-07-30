@@ -125,6 +125,13 @@ function auditTokenForRuid(uid: number): string {
 const CLAIM_UID = 601;
 const CLAIM_TOKEN = auditTokenForRuid(CLAIM_UID);
 const CLAIM_SUBJECT = subjectForUid(CLAIM_UID);
+const UNDETERMINED_AVAILABILITY = {
+  status: "undetermined" as const,
+  reason: "availability_not_queried",
+  observed_at: null,
+  freshness_window_ms: 30_000,
+  active_connection_count: 0,
+};
 
 function cwArmEntry(ageMs = 60_000, identityId = CLAIM_SUBJECT): AuditEntry {
   return {
@@ -196,6 +203,21 @@ describe("getProtectionSnapshot", () => {
     expect(snap.overall.light).toBe("green");
     expect(snap.overall.status).toBe("healthy");
     expect(snap.overall.headline).toBe("All layers full, Castle Wall enforcing");
+  });
+
+  it("injected undetermined v3 availability prevents linux-shaped legacy evidence from going green", async () => {
+    const sources = baseSources({
+      identityManager: stubIdentityManager(stubIdentity()),
+      auditLog: stubAuditLog([cwArmEntry()]),
+      teeAvailable: true,
+      reputation: { score: 95, profile_url: "https://verascore.ai/p/xyz" },
+      resolveProtectionClaimSubject: () => CLAIM_SUBJECT,
+      resolveEnforcementAvailability: () => UNDETERMINED_AVAILABILITY,
+    });
+    const snap = await getProtectionSnapshot(sources);
+    expect(snap.overall.light).toBe("yellow");
+    expect(snap.overall.status).toBe("degraded");
+    expect(snap.overall.headline).toMatch(/Castle Wall enforcement not confirmed/);
   });
 
   it("legacy dashboard hero stays non-green when Castle Wall evidence is fresh but subject-bound elsewhere", async () => {

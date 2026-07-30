@@ -391,9 +391,11 @@ export interface BuildCastleWallPostureInput {
    */
   protectionClaimSubject: string | null;
   /**
-   * macOS v3 level-triggered availability verdict. On macOS this is the only
-   * green authority; absence is treated as undetermined/non-green. Linux keeps
-   * the existing signed audit-drain evidence path.
+   * v3 level-triggered availability verdict. On macOS this is the only green
+   * authority; absence is treated as undetermined/non-green. When supplied on a
+   * non-macOS host (tests / injected surfaces), it is still authoritative for
+   * this verdict. Linux production keeps the existing signed audit-drain path by
+   * not supplying this object.
    */
   enforcementAvailability?: ResolvedEnforcementAvailability | null;
 }
@@ -450,8 +452,10 @@ export async function buildCastleWallPosture(
   const digestWindowMs = input.digestWindowMs ?? DEFAULT_DIGEST_WINDOW_MS;
   const platform = mapPlatform(input.platform ?? process.platform);
   const pinnedProducerKey = input.pinnedProducerKeyB64url ?? null;
+  const availabilityApplies =
+    platform === "macos" || input.enforcementAvailability !== undefined;
   const macOSEnforcementAvailability =
-    platform === "macos"
+    availabilityApplies
       ? input.enforcementAvailability ?? {
           status: "undetermined" as const,
           reason: "availability_not_queried",

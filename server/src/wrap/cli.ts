@@ -1619,9 +1619,7 @@ async function readCastleWallEgressFeatureStatus(
   const enforcementAvailability =
     input.enforcementAvailability !== undefined
       ? input.enforcementAvailability
-      : platform() === "darwin"
-      ? await resolveWrapEnforcementAvailability(storagePath)
-      : null;
+      : await resolveWrapEnforcementAvailability(storagePath);
   // Eager-read scope: same one-verified-view discipline as the dashboard
   // callers of buildFeatureHealthPanel (H4 chokepoint).
   const panel = await auditLog.runEagerReads(() =>
@@ -1660,6 +1658,15 @@ async function readCastleWallEgressFeatureStatus(
 async function resolveWrapEnforcementAvailability(
   storagePath: string,
 ): Promise<ResolvedEnforcementAvailability> {
+  if (platform() !== "darwin") {
+    return {
+      status: "undetermined",
+      reason: "availability_probe_not_supported",
+      observed_at: null,
+      freshness_window_ms: DEFAULT_ENFORCEMENT_AVAILABILITY_FRESHNESS_MS,
+      active_connection_count: 0,
+    };
+  }
   try {
     const socketPath = resolveCastleWallSocketPath({
       platform: "darwin",

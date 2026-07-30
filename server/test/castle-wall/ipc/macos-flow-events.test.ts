@@ -67,6 +67,14 @@ const SAMPLE_RULE: AllowlistRule = {
   disposition: "allow",
 };
 
+const UNDETERMINED_AVAILABILITY = {
+  status: "undetermined" as const,
+  reason: "availability_not_queried",
+  observed_at: null,
+  freshness_window_ms: 30_000,
+  active_connection_count: 0,
+};
+
 interface FakeAuditEntry {
   layer: "l1";
   operation: string;
@@ -485,6 +493,16 @@ describe("MacOSFlowEventConsumer : flow_decision_recorded", () => {
     });
     expect(posture.arm_state).toBe("armed");
     expect(posture.evidence_basis).toBe("fresh_enforcement_evidence");
+
+    const cappedByAvailability = await buildCastleWallPosture({
+      auditLog: log,
+      originMachine: "fortress-test",
+      platform: "linux",
+      protectionClaimSubject: subjectForUid("fortress-test", 503),
+      enforcementAvailability: UNDETERMINED_AVAILABILITY,
+    });
+    expect(cappedByAvailability.arm_state).toBe("unknown");
+    expect(cappedByAvailability.evidence_basis).toBe("no_evidence");
   });
 
   it("accepts a producer-signed macOS allow verdict when the audit-producer key is pinned", async () => {

@@ -88,6 +88,13 @@ function auditTokenForRuid(uid: number): string {
 const CLAIM_TOKEN = auditTokenForRuid(503);
 const CLAIM_SUBJECT = protectionSubjectFromMacOSAuditToken(FORTRESS, CLAIM_TOKEN);
 if (CLAIM_SUBJECT === null) throw new Error("test subject could not be derived");
+const UNDETERMINED_AVAILABILITY = {
+  status: "undetermined" as const,
+  reason: "availability_not_queried",
+  observed_at: null,
+  freshness_window_ms: 30_000,
+  active_connection_count: 0,
+};
 
 function functionSource(src: string, name: string): string {
   const marker = `function ${name}(`;
@@ -193,6 +200,30 @@ async function armedWallPosture(now: number): Promise<CastleWallPosture> {
     originMachine: FORTRESS,
     platform: "linux",
     now,
+  });
+}
+
+async function availabilityCappedWallPosture(now: number): Promise<CastleWallPosture> {
+  const storage = new MemoryStorage();
+  const log = new AuditLog(storage, generateRandomKey());
+  await log.appendCritical({
+    layer: "l1",
+    operation: "egress_allowed",
+    identity_id: CLAIM_SUBJECT,
+    result: "success",
+    details: {
+      agent_id: CLAIM_TOKEN,
+      cw_source: "castle_wall_audit_consumer",
+    },
+    timestamp: new Date(now - 2 * 60 * 1000).toISOString(),
+  });
+  return await buildCastleWallPosture({
+    protectionClaimSubject: CLAIM_SUBJECT,
+    auditLog: log,
+    originMachine: FORTRESS,
+    platform: "linux",
+    now,
+    enforcementAvailability: UNDETERMINED_AVAILABILITY,
   });
 }
 
@@ -336,6 +367,26 @@ describe("v1.1 dashboard seal freshness", () => {
     );
     expect(Number.isFinite(payload.live_enforcement.freshness_window_ms)).toBe(true);
     expect(payload.live_enforcement.freshness_window_ms).toBeGreaterThan(0);
+  });
+
+  it("the real /api/sovereignty payload stays non-protected when v3 availability is undetermined", async () => {
+    vi.spyOn(Date, "now").mockReturnValue(now);
+    const harness = liftSealHarness();
+    const wall = await availabilityCappedWallPosture(now);
+    const payload = buildSovereigntyRoutePayload({
+      shr: testShr(),
+      wall,
+      federationPosture: testFederationPosture(),
+      configLoaded: true,
+    });
+    harness.state.posture.data = payload;
+
+    const seal = harness.deriveSeal();
+
+    expect(wall.arm_state).toBe("unknown");
+    expect(payload.live_enforcement.castle_wall_arm_state).toBe("unknown");
+    expect(seal.word).toBe("Attention");
+    expect(seal.tone).toBe("attention");
   });
 
   it("a real /api/sovereignty payload drives the client seal to Protected while current", async () => {

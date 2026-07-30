@@ -52,6 +52,13 @@ const SUBJECT = `${FORTRESS}/uid-503`;
 const NOW = 1_750_000_000_000;
 // A timestamp safely inside the freshness window AND inside the 5-min sig age.
 const FRESH_TS = NOW - 1000;
+const UNDETERMINED_AVAILABILITY = {
+  status: "undetermined",
+  reason: "availability_not_queried",
+  observed_at: null,
+  freshness_window_ms: 30_000,
+  active_connection_count: 0,
+} as const;
 
 function toBase64url(bytes: Uint8Array): string {
   let bin = "";
@@ -1030,6 +1037,23 @@ describe("Slice R — codex round-4 HIGH: a duplicated fresh signed tuple counts
     const cw = panel.rows.find((r) => r.feature_id === "castle_wall_egress");
     expect(cw!.status).toBe("active");
     expect(cw!.invocation_count).toBe(1);
+  });
+
+  it("v3 undetermined availability caps a reverified Linux-shaped duplicate tuple", async () => {
+    const log = newLog();
+    await appendDuplicateSigned(log, 5);
+    const posture = await buildCastleWallPosture({
+      protectionClaimSubject: SUBJECT,
+      auditLog: log,
+      originMachine: FORTRESS,
+      platform: "linux",
+      now: NOW,
+      pinnedProducerKeyB64url: daemonPubB64,
+      enforcementAvailability: UNDETERMINED_AVAILABILITY,
+    });
+    expect(posture.arm_state).toBe("unknown");
+    expect(posture.arm_state).not.toBe("armed");
+    expect(posture.evidence_basis).toBe("no_evidence");
   });
 
   it("TWO DISTINCT signed events (different seq) both count — dedup does not over-collapse", async () => {

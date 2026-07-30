@@ -64,6 +64,13 @@ const SUBJECT = `${FORTRESS}/uid-503`;
 const NOW = 1_750_000_000_000;
 const FRESH_TS = NOW - 1000;
 const LINUX_PRODUCER_KEY_LOAD = { platform: "linux" as const };
+const UNDETERMINED_AVAILABILITY = {
+  status: "undetermined" as const,
+  reason: "availability_not_queried",
+  observed_at: null,
+  freshness_window_ms: 30_000,
+  active_connection_count: 0,
+};
 
 function toBase64url(bytes: Uint8Array): string {
   let bin = "";
@@ -479,6 +486,18 @@ describe("Slice P — reader activation end-to-end (provisioned key on disk)", (
     });
     expect(posture.arm_state).toBe("armed");
     expect(posture.producer_authenticity).toBe("channel_authenticated");
+
+    const cappedByAvailability = await buildCastleWallPosture({
+      protectionClaimSubject: SUBJECT,
+      auditLog: log,
+      originMachine: "m",
+      platform: "linux",
+      now: NOW,
+      pinnedProducerKeyB64url: null,
+      enforcementAvailability: UNDETERMINED_AVAILABILITY,
+    });
+    expect(cappedByAvailability.arm_state).toBe("unknown");
+    expect(cappedByAvailability.producer_authenticity).toBe("not_applicable");
   });
 
   it("(4) key published-but-unreadable → reader fails HONESTLY (degraded, never channel-green)", async () => {

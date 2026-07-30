@@ -319,7 +319,12 @@ async function resolveExclusiveEgress(
 async function resolveEnforcementAvailability(
   deps: PostureRouteDeps,
 ): Promise<ResolvedEnforcementAvailability | null> {
-  if ((deps.platform ?? process.platform) !== "darwin") return null;
+  if (
+    (deps.platform ?? process.platform) !== "darwin" &&
+    !deps.resolveEnforcementAvailability
+  ) {
+    return null;
+  }
   if (!deps.resolveEnforcementAvailability) {
     return {
       status: "undetermined",

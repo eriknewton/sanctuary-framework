@@ -56,6 +56,13 @@ import {
 
 const LARGE_CHAIN = 10_200; // > 10k, the drill's real chain size class.
 const FORTRESS = "fortress:badge-test";
+const UNDETERMINED_AVAILABILITY = {
+  status: "undetermined" as const,
+  reason: "availability_not_queried",
+  observed_at: null,
+  freshness_window_ms: 30_000,
+  active_connection_count: 0,
+};
 
 /**
  * Build a valid chain of `count` entries CHEAPLY (byte-identical to a real
@@ -146,7 +153,11 @@ async function buildChainWithFreshArmEvidence(
  * inside the eager scope (no pinned producer key, i.e. the macOS / channel-basis
  * floor, which is what the native badge surface uses today).
  */
-function badgeRead(reader: AuditLog, now?: number) {
+function badgeRead(
+  reader: AuditLog,
+  now?: number,
+  enforcementAvailability?: typeof UNDETERMINED_AVAILABILITY,
+) {
   return reader.runEagerReads(() =>
     buildCastleWallPosture({
       protectionClaimSubject: FORTRESS,
@@ -155,6 +166,9 @@ function badgeRead(reader: AuditLog, now?: number) {
       platform: "linux",
       pinnedProducerKeyB64url: null,
       ...(now !== undefined ? { now } : {}),
+      ...(enforcementAvailability !== undefined
+        ? { enforcementAvailability }
+        : {}),
     }),
   );
 }
@@ -233,6 +247,19 @@ describe("Castle Wall badge eager read - never-fake-green honesty", () => {
     const after = await badgeRead(log);
     expect(after.arm_state).toBe("armed");
     expect(after.audit_integrity_ok).toBe(true);
+  });
+
+  it("injected undetermined v3 availability caps a fresh eager badge read", async () => {
+    const { reader } = await buildChainWithFreshArmEvidence(50);
+
+    const capped = await badgeRead(
+      reader,
+      undefined,
+      UNDETERMINED_AVAILABILITY,
+    );
+
+    expect(capped.arm_state).toBe("unknown");
+    expect(capped.evidence_basis).toBe("no_evidence");
   });
 
   it("the badge falls to unknown (never armed) once the only evidence ages past the freshness window", async () => {

@@ -71,6 +71,13 @@ const NOW = 1_750_000_000_000;
 const STALE_TS = NOW - 30 * 60_000;
 // A second, even older stale timestamp (still inside the 24h digest).
 const OLDER_TS = NOW - 60 * 60_000;
+const UNDETERMINED_AVAILABILITY = {
+  status: "undetermined",
+  reason: "availability_not_queried",
+  observed_at: null,
+  freshness_window_ms: 30_000,
+  active_connection_count: 0,
+} as const;
 
 function toB64url(bytes: Uint8Array): string {
   let bin = "";
@@ -255,6 +262,22 @@ describe("Slice 2 false-RED fix — stand-down op set is honest and disjoint", (
 });
 
 describe("B2 false-green fix — newer stand-down beats older fresh enforcement", () => {
+  it("v3 undetermined availability caps fresh Linux-shaped evidence before stand-down logic", async () => {
+    const log = newLog();
+    await appendCW(log, "egress_allowed", NOW - 60_000);
+    const panel = await buildFeatureHealthPanel({
+      protectionClaimSubject: FORTRESS,
+      auditLog: log,
+      originMachine: FORTRESS,
+      now: NOW,
+      enforcementAvailability: UNDETERMINED_AVAILABILITY,
+    });
+    const cw = cwRow(panel);
+    expect(cw.status).toBe("unknown");
+    expect(cw.status).not.toBe("active");
+    expect(cw.basis).toBe("no_evidence_self_reporting");
+  });
+
   for (const op of [
     "filter_stopped",
     "wall_disarmed",

@@ -85,6 +85,16 @@ function liveAvailability(): ResolvedEnforcementAvailability {
   };
 }
 
+function undeterminedAvailability(): ResolvedEnforcementAvailability {
+  return {
+    status: "undetermined",
+    reason: "availability_not_queried",
+    observed_at: null,
+    freshness_window_ms: 30_000,
+    active_connection_count: 0,
+  };
+}
+
 /** A summary in which the one fine-grained agent's exclusive stack is DOWN. */
 function coarseOnlyStatus(): ExclusiveEgressStatus {
   return summarizeExclusiveEgressStatus([
@@ -174,6 +184,23 @@ describe("S5-P: buildCastleWallPosture aggregate-green cap (the one chokepoint)"
     });
     expect(posture.arm_state).toBe("armed");
     expect(posture.exclusive_egress).toBeUndefined();
+  });
+
+  it("v3 undetermined availability caps fresh Linux-shaped evidence before the S5-P cap", async () => {
+    const log = newAuditLog();
+    const now = Date.now();
+    await appendCW(log, "egress_allowed", new Date(now - 60_000).toISOString());
+    const posture = await buildCastleWallPosture({
+      protectionClaimSubject: subjectForUid(601),
+      auditLog: log,
+      originMachine: FORTRESS,
+      platform: "linux",
+      now,
+      enforcementAvailability: undeterminedAvailability(),
+    });
+    expect(posture.arm_state).toBe("unknown");
+    expect(posture.arm_state).not.toBe("armed");
+    expect(posture.evidence_basis).toBe("no_evidence");
   });
 
   it("fresh same-fortress evidence for a foreign uid is explicit subject-unbound evidence", async () => {
