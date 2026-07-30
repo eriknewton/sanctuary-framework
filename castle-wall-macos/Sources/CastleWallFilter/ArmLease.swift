@@ -2,8 +2,10 @@ import Foundation
 
 public final class ArmLease {
     public static let failOpenRuleId = "fail_open_deadman"
+    public static let missingLeaseRuleId = "fail_closed_missing_arm_lease"
 
     private let lock = NSLock()
+    private var leaseReceived = false
     private var armed = false
     private var revoked = false
     private var leaseExpiresAt: Date?
@@ -18,6 +20,7 @@ public final class ArmLease {
         lock.lock()
         defer { lock.unlock() }
 
+        leaseReceived = true
         if update.revoked {
             armed = false
             revoked = true
@@ -43,6 +46,24 @@ public final class ArmLease {
         heartbeatExpiresAt = current.addingTimeInterval(
             TimeInterval(update.heartbeatIntervalSeconds * 2)
         )
+    }
+
+    public func resetToMissing() {
+        lock.lock()
+        defer { lock.unlock() }
+
+        leaseReceived = false
+        armed = false
+        revoked = false
+        leaseExpiresAt = nil
+        heartbeatExpiresAt = nil
+    }
+
+    public func missingLeaseReason() -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+
+        return leaseReceived ? nil : "arm_lease_missing"
     }
 
     public func failOpenReason() -> String? {
@@ -71,6 +92,7 @@ public final class ArmLease {
         defer { lock.unlock() }
 
         return ArmLeaseSnapshot(
+            leaseReceived: leaseReceived,
             armed: armed,
             revoked: revoked,
             leaseExpiresAt: leaseExpiresAt,
@@ -116,6 +138,7 @@ public struct ArmLeaseUpdate: Equatable {
 }
 
 public struct ArmLeaseSnapshot: Equatable {
+    public let leaseReceived: Bool
     public let armed: Bool
     public let revoked: Bool
     public let leaseExpiresAt: Date?

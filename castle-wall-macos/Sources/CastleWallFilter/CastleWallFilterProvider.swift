@@ -24,8 +24,9 @@
 //     evaluator answers `drop` (fail-closed) so a wrapped agent that has
 //     never seen the manifest cannot exfiltrate while the runtime is down.
 //   - Mid-flight, if IPC drops AND a cached manifest IS loaded, the
-//     evaluator continues against the cached snapshot until the manifest
-//     ages out (TTL is enforced by the runtime side; v1.x).
+//     evaluator keeps deny/default-deny semantics from the snapshot, but
+//     refuses agent allow/prompt outcomes until a fresh arm lease arrives.
+//     Operator-baseline flows remain reachable.
 //
 
 import Foundation

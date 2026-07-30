@@ -93,7 +93,8 @@ final class ExtensionDispatcherTests: XCTestCase {
         ip: String = "104.18.32.10",
         port: Int = 443,
         agent: String = "agent-7",
-        template: String = "coding-assistant"
+        template: String = "coding-assistant",
+        sourceRuid: uid_t = 0
     ) -> FilterFlowDescriptor {
         return FilterFlowDescriptor(
             sourceAppIdentifier: "ai.sanctuaryprotocol.test",
@@ -107,6 +108,7 @@ final class ExtensionDispatcherTests: XCTestCase {
             opaqueDestination: host == nil,
             // Attributed agent flow: these fixtures exercise the allowlist
             // allow-path, not the #905 unattributed fail-closed suppression.
+            sourceRuid: sourceRuid,
             sourceUnattributed: false
         )
     }
@@ -147,6 +149,15 @@ final class ExtensionDispatcherTests: XCTestCase {
         )
     }
 
+    func arm(_ dispatcher: ExtensionDispatcher) {
+        dispatcher.handleInbound(.armLease(ArmLeaseBody(
+            armed: true,
+            ttlSeconds: nil,
+            heartbeatIntervalSeconds: 5,
+            updatedAt: "2026-07-29T22:17:00.000Z"
+        )))
+    }
+
     // MARK: - Inbound: manifest_updated applies snapshot + clears cache
 
     func test_handleInbound_manifestUpdated_appliesToEngineStore() throws {
@@ -178,6 +189,7 @@ final class ExtensionDispatcherTests: XCTestCase {
             engine: engine,
             ipcClient: makeFloatingClient(pinnedPublicKey: signedAllow.publicKey)
         )
+        arm(dispatcher)
 
         // Seed snapshot A and evaluate to populate the cache.
         dispatcher.handleInbound(.manifestUpdated(signedAllow.body))
@@ -192,6 +204,30 @@ final class ExtensionDispatcherTests: XCTestCase {
         XCTAssertEqual(engine.flowCache.count, 0, "cache must clear on manifest replace")
         let outcomeB = engine.evaluate(flow)
         XCTAssertEqual(outcomeB, .drop(matchedRuleId: "r-deny"))
+    }
+
+    func test_manifestPresentWithoutArmLease_forcesAgentAllowClosed() throws {
+        let engine = FlowEvaluatorEngine()
+        let allowRule = makeRule(id: "r-agent-allow", host: "api.anthropic.com", port: 443, disposition: "allow")
+        let signed = try makeSignedManifestUpdatedBody(
+            rules: [allowRule],
+            agentOrigin: AgentOriginWire(mode: .uid, agentUid: 600, systemUidAllowCeiling: 500)
+        )
+        let dispatcher = ExtensionDispatcher(
+            engine: engine,
+            ipcClient: makeFloatingClient(pinnedPublicKey: signed.publicKey)
+        )
+
+        dispatcher.handleInbound(.manifestUpdated(signed.body))
+
+        XCTAssertTrue(dispatcher.bindingState.manifestReceived)
+        XCTAssertFalse(dispatcher.bindingState.armLeaseReceived)
+        XCTAssertEqual(engine.armLease.missingLeaseReason(), "arm_lease_missing")
+        XCTAssertEqual(
+            engine.evaluate(makeFlow(sourceRuid: 600)),
+            .drop(matchedRuleId: ArmLease.missingLeaseRuleId),
+            "a real signed manifest must not allow an agent flow until an arm lease has arrived"
+        )
     }
 
     // MARK: - Hot-reload latency invariant
