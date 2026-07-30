@@ -250,16 +250,21 @@ function provenanceMatchesDestination(
   );
 }
 
+function hashesMatch(left: RehomePathHash, right: RehomePathHash): boolean {
+  return left.algorithm === right.algorithm && left.value === right.value;
+}
+
 function destinationConflictMessage(
   sourcePath: string,
   destPath: string,
   sourceHash: RehomePathHash,
   destHash: RehomePathHash,
+  reason = "no current Sanctuary re-home provenance marks the destination as authoritative",
 ): string {
   return (
     `re-home destination conflict: source ${sourcePath} (${sourceHash.algorithm}:${sourceHash.value}) ` +
-    `and destination ${destPath} (${destHash.algorithm}:${destHash.value}) both exist, but no current ` +
-    "Sanctuary re-home provenance marks the destination as authoritative; refusing before backup/move. " +
+    `and destination ${destPath} (${destHash.algorithm}:${destHash.value}) both exist, but ${reason}; ` +
+    "refusing before backup/move. " +
     "Re-run with --overwrite-destination to preserve the destination as a dated sibling and move the source anyway."
   );
 }
@@ -324,6 +329,17 @@ export async function executeRehomePlan(
           options.overwriteDestination !== true &&
           provenanceMatchesDestination(provenance, step.entry.sourcePath, step.destPath, destinationHash)
         ) {
+          if (!hashesMatch(sourceHash, destinationHash)) {
+            throw new Error(
+              destinationConflictMessage(
+                step.entry.sourcePath,
+                step.destPath,
+                sourceHash,
+                destinationHash,
+                "Sanctuary re-home provenance marks the destination as previously re-homed, but the current source and destination hashes diverge",
+              ),
+            );
+          }
           results.push({
             entry: step.entry,
             destPath: step.destPath,

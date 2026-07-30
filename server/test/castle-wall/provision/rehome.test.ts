@@ -252,11 +252,12 @@ describe("castle-wall/provision/rehome", () => {
       const src = `${OPERATOR_HOME}/.hermes/config.yaml`;
       const dest = `${NEW_ACCOUNT_HOME}/.hermes/config.yaml`;
       const ops = mockOps(new Set([src, dest]), {
+        hashPath: async () => ({ algorithm: "sha256", value: "hash-identical-rehomed-config" }),
         readDestinationProvenance: async () => ({
           schemaVersion: 1,
           sourcePath: src,
           destPath: dest,
-          destHash: { algorithm: "sha256", value: `hash-${dest}` },
+          destHash: { algorithm: "sha256", value: "hash-identical-rehomed-config" },
           recordedAt: "2026-07-29T00:00:00.000Z",
         }),
       });
@@ -269,10 +270,37 @@ describe("castle-wall/provision/rehome", () => {
           entry: { sourcePath: src, destRelativePath: ".hermes/config.yaml", isSecret: true },
           destPath: dest,
           status: "destination-authoritative",
-          sourceHash: { algorithm: "sha256", value: `hash-${src}` },
-          destinationHash: { algorithm: "sha256", value: `hash-${dest}` },
+          sourceHash: { algorithm: "sha256", value: "hash-identical-rehomed-config" },
+          destinationHash: { algorithm: "sha256", value: "hash-identical-rehomed-config" },
         },
       ]);
+      expect(ops.backups).toEqual([]);
+      expect(ops.moves).toEqual([]);
+      expect(ops.chowns).toEqual([]);
+    });
+
+    it("refuses divergent dual presence even when provenance marks the destination as previously re-homed", async () => {
+      const adapter: AgentRehomeAdapter = {
+        harnessId: "test-divergent-provenance",
+        pathsToRehome: (home) => [
+          { sourcePath: `${home}/.hermes/config.yaml`, destRelativePath: ".hermes/config.yaml", isSecret: true },
+        ],
+        requiresInteractiveReconsent: () => false,
+      };
+      const src = `${OPERATOR_HOME}/.hermes/config.yaml`;
+      const dest = `${NEW_ACCOUNT_HOME}/.hermes/config.yaml`;
+      const ops = mockOps(new Set([src, dest]), {
+        readDestinationProvenance: async () => ({
+          schemaVersion: 1,
+          sourcePath: src,
+          destPath: dest,
+          destHash: { algorithm: "sha256", value: `hash-${dest}` },
+          recordedAt: "2026-07-29T00:00:00.000Z",
+        }),
+      });
+      const plan = planRehome(adapter, { operatorHome: OPERATOR_HOME, newAccountHome: NEW_ACCOUNT_HOME });
+
+      await expect(executeRehomePlan(plan, ops, { uid: 502, gid: 502 })).rejects.toThrow(/hashes diverge/);
       expect(ops.backups).toEqual([]);
       expect(ops.moves).toEqual([]);
       expect(ops.chowns).toEqual([]);

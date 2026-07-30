@@ -2123,6 +2123,7 @@ async function enforceVersionedBackupRetention(backupRoot: string, sourcePath: s
       throw new Error(
         `could not enforce re-home backup retention cap (${REHOME_BACKUP_MAX_PER_SOURCE}) for ${sourcePath}: ` +
           `${(err as Error).message}`,
+        { cause: err },
       );
     }
   }
@@ -2809,10 +2810,10 @@ export function realRehomeOps(opts?: { backupRoot?: string }) {
         return undefined;
       }
       return {
-        schemaVersion: 1,
+        schemaVersion: 1 as const,
         sourcePath,
         destPath,
-        destHash: { algorithm: "sha256", value: hashRecord.value },
+        destHash: { algorithm: "sha256" as const, value: hashRecord.value },
         recordedAt: record.recorded_at,
       };
     },

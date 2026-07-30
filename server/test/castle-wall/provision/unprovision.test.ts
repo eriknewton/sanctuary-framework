@@ -26,9 +26,16 @@ function mockRehomeOps(overrides: Partial<RehomeOps> = {}): RehomeOps & {
     restores,
     restoreCustodyCalls,
     pathExists: async () => true,
+    pathExistsNoFollow: async () => true,
+    hashPath: async (path) => ({ algorithm: "sha256", value: `hash-${path}` }),
+    readDestinationProvenance: async () => undefined,
+    recordDestinationProvenance: async () => {},
+    clearDestinationProvenance: async () => {},
+    displaceDestination: async (destPath) => ({ displacedPath: `${destPath}.displaced-20260729T000000000Z` }),
+    restoreDisplacedDestination: async () => ({ restored: true }),
     backup: async (path) => ({ backupPath: `${path}.bak` }),
     move: async () => undefined,
-    chown: async () => undefined,
+    chown: async () => ({ excludedPaths: [] }),
     restore: async (destPath) => {
       restores.push(destPath);
       return { restored: true };
