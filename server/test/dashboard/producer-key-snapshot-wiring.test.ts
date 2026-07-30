@@ -137,6 +137,13 @@ function auditTokenForRuid(uid: number): string {
 const CLAIM_UID = 601;
 const CLAIM_TOKEN = auditTokenForRuid(CLAIM_UID);
 const CLAIM_SUBJECT = subjectForUid(CLAIM_UID);
+const UNDETERMINED_AVAILABILITY = {
+  status: "undetermined" as const,
+  reason: "availability_not_queried",
+  observed_at: null,
+  freshness_window_ms: 30_000,
+  active_connection_count: 0,
+};
 
 function toBase64url(bytes: Uint8Array): string {
   let bin = "";
@@ -350,6 +357,7 @@ describe("producer-key production wiring — startDashboard snapshot server", ()
 
   async function bootAndSnapshot(
     setupAudit: (log: AuditLog) => Promise<void>,
+    enforcementAvailability?: typeof UNDETERMINED_AVAILABILITY,
   ): Promise<{ light: string; status: string }> {
     const storage = new MemoryStorage();
     const masterKey = generateRandomKey();
@@ -367,6 +375,7 @@ describe("producer-key production wiring — startDashboard snapshot server", ()
       mode: "co-located",
       serverVersion: "0.9.0-test",
       auditLog,
+      platform: "linux",
       // Supporting sources so the non-wall layers reach `full`; the Castle Wall
       // arm state (driven by the producer-key state below) decides the overall
       // light, isolating exactly the behavior under test.
@@ -378,6 +387,9 @@ describe("producer-key production wiring — startDashboard snapshot server", ()
         load.status === "present" ? load.keyB64url : null,
       ...(load.status === "unreadable"
         ? { producerKeyExpectedButUnavailable: true }
+        : {}),
+      ...(enforcementAvailability !== undefined
+        ? { resolveEnforcementAvailability: () => enforcementAvailability }
         : {}),
     });
 
@@ -412,14 +424,21 @@ describe("producer-key production wiring — startDashboard snapshot server", ()
     expect(status).toBe("degraded");
   });
 
-  it("no key on disk (macOS / pre-provision floor) → genuine channel-basis entry still arms green", async () => {
-    // The macOS-no-key floor must stay intact: absent producer key → the honest
-    // channel-authenticated basis, which still arms green on a genuine
-    // channel-basis enforcement entry (parity with the DashboardApprovalChannel
-    // path). We assert the absent case does not over-tighten to amber here.
-    // No producer key written; a genuine signed entry still carries the channel
-    // provenance marker, so the wall arms on the channel basis.
+  it("no key on disk (Linux / pre-provision floor) → genuine channel-basis entry still arms green", async () => {
+    // The Linux no-key floor must stay byte-for-byte intact in this PR: absent
+    // producer key → the existing channel-authenticated basis. macOS green now
+    // requires v3 live availability and is covered by the new availability
+    // suites instead.
     const { light } = await bootAndSnapshot(appendGenuine);
     expect(light).toBe("green");
+  });
+
+  it("injected undetermined v3 availability caps the Linux-shaped snapshot path", async () => {
+    const { light, status } = await bootAndSnapshot(
+      appendGenuine,
+      UNDETERMINED_AVAILABILITY,
+    );
+    expect(light).toBe("yellow");
+    expect(status).toBe("degraded");
   });
 });

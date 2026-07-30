@@ -21,8 +21,9 @@
  *  - Inbound frame routing - manifest_subscribe / flow_decision_recorded
  *    / flow_pending_approval dispatch to the existing
  *    `MacOSFlowEventConsumer` handlers.
- *  - Subscriber registration - each connection registers as a
- *    `MacOSSubscriber` so manifest broadcasts fan out to it.
+ *  - Subscriber registration - extension-origin connections register as
+ *    `MacOSSubscriber`s once they send extension traffic. Local admin query
+ *    clients never enter the extension availability pool.
  *
  * Out of scope (deferred to follow-up):
  *
@@ -49,6 +50,8 @@ import { frame, parseFrame } from "../ipc/framing.js";
 import type {
   AuditEmitNotification,
   CastleWallMessage,
+  EnforcementAvailabilityReportNotification,
+  EnforcementAvailabilityRequest,
   FlowDecisionRecordedNotification,
   HandshakeResponse,
   FlowPendingApprovalNotification,
@@ -179,7 +182,7 @@ interface ConnectionState {
   inbound: Uint8Array;
   /**
    * True once the connection has been registered with the consumer
-   * (post-handshake). Subsequent inbound frames are dispatched.
+   * as an extension subscriber. Admin-only connections stay unregistered.
    */
   registered: boolean;
 }
@@ -423,18 +426,6 @@ export class MacOSFlowIpcListener {
     socket.on("close", () => this.handleClose(state));
     socket.on("error", (err) => this.handleSocketError(state, err));
 
-    // Register the subscriber wrapper BEFORE sending the handshake. The
-    // consumer needs the subscriber present so a synchronous
-    // `manifest_subscribe` arriving immediately after the handshake can
-    // resolve via `subscribers.get(subscriberId)`.
-    this.consumer.registerSubscriber({
-      subscriberId,
-      emitManifestUpdate: async (notification) => {
-        this.writeMessage(state, notification);
-      },
-    });
-    state.registered = true;
-
     // Send the handshake challenge, then prove possession of the pinned
     // fortress key when the runtime supplied signing material.
     const nonceBytes = this.generateNonce();
@@ -548,14 +539,31 @@ export class MacOSFlowIpcListener {
         await this.handleArmLease(message as ArmLeaseNotification);
         return;
       case "audit_emit":
+        this.ensureSubscriberRegistered(state);
         await this.consumer.handleAuditEmit(message as AuditEmitNotification);
         return;
+      case "enforcement_availability_report":
+        this.ensureSubscriberRegistered(state);
+        this.consumer.handleEnforcementAvailabilityReport(
+          message as EnforcementAvailabilityReportNotification,
+          state.subscriberId,
+        );
+        return;
+      case "enforcement_availability_request":
+        this.handleEnforcementAvailabilityRequest(
+          state,
+          message as EnforcementAvailabilityRequest,
+        );
+        return;
       case "flow_decision_recorded":
+        this.ensureSubscriberRegistered(state);
         await this.consumer.handleFlowDecisionRecorded(
           message as FlowDecisionRecordedNotification,
+          state.subscriberId,
         );
         return;
       case "flow_pending_approval":
+        this.ensureSubscriberRegistered(state);
         await this.consumer.handleFlowPendingApproval(
           message as FlowPendingApprovalNotification,
         );
@@ -584,10 +592,33 @@ export class MacOSFlowIpcListener {
     state: ConnectionState,
     request: ManifestSubscribeRequest,
   ): Promise<void> {
+    this.ensureSubscriberRegistered(state);
     await this.consumer.handleManifestSubscribe(request, state.subscriberId);
     if (this.currentArmLease) {
       this.writeMessage(state, this.currentArmLease);
     }
+  }
+
+  private handleEnforcementAvailabilityRequest(
+    state: ConnectionState,
+    request: EnforcementAvailabilityRequest,
+  ): void {
+    this.writeMessage(state, {
+      type: "enforcement_availability_response",
+      request_id: request.request_id,
+      availability: this.consumer.resolveEnforcementAvailability(),
+    });
+  }
+
+  private ensureSubscriberRegistered(state: ConnectionState): void {
+    if (state.registered) return;
+    this.consumer.registerSubscriber({
+      subscriberId: state.subscriberId,
+      emitManifestUpdate: async (notification) => {
+        this.writeMessage(state, notification);
+      },
+    });
+    state.registered = true;
   }
 
   private async handlePolicyReload(

@@ -3,12 +3,13 @@ import { AuditLog } from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import {
-  buildFeatureHealthPanel,
+  buildFeatureHealthPanel as buildFeatureHealthPanelRaw,
   evaluateFeatureHealth,
   assertExpectationFloorsWellFormed,
   SLICE1_FEATURE_REGISTRY,
   FEATURE_FAULT_CLASS_RULES,
   CASTLE_WALL_LIVE_ADJUDICATION_OPERATIONS,
+  type BuildFeatureHealthInput,
   type FeatureHealthRow,
   type FeatureRegistryEntry,
 } from "../../src/principal-policy/feature-health.js";
@@ -17,6 +18,17 @@ import type { AuditEntry } from "../../src/operational/audit-log.js";
 import { protectionSubjectForUid } from "../../src/castle-wall/subject-binding.js";
 
 const FORTRESS = "fortress:test";
+const UNDETERMINED_AVAILABILITY = {
+  status: "undetermined",
+  reason: "availability_not_queried",
+  observed_at: null,
+  freshness_window_ms: 30_000,
+  active_connection_count: 0,
+} as const;
+
+function buildFeatureHealthPanel(input: BuildFeatureHealthInput) {
+  return buildFeatureHealthPanelRaw({ platform: "linux", ...input });
+}
 
 function newAuditLog(): { log: AuditLog } {
   const storage = new MemoryStorage();
@@ -240,6 +252,24 @@ describe("feature-health — green is earned correctly", () => {
     const cw = row(panel, "castle_wall_egress");
     expect(cw.status).toBe("active");
     expect(cw.basis).toBe("fresh_enforcement_evidence");
+  });
+
+  it("injected v3 undetermined availability caps fresh Linux-shaped evidence to non-green", async () => {
+    const { log } = newAuditLog();
+    const now = Date.now();
+    await appendCW(log, "egress_blocked", new Date(now - 60_000).toISOString());
+    const panel = await buildFeatureHealthPanel({
+      protectionClaimSubject: FORTRESS,
+      auditLog: log,
+      originMachine: FORTRESS,
+      now,
+      enforcementAvailability: UNDETERMINED_AVAILABILITY,
+    });
+    const cw = row(panel, "castle_wall_egress");
+    expect(cw.status).toBe("unknown");
+    expect(cw.status).not.toBe("active");
+    expect(cw.basis).toBe("no_evidence_self_reporting");
+    expect(cw.enforcement_availability?.status).toBe("undetermined");
   });
 
   it("policy_loaded alone does NOT arm Castle Wall (the honesty seam — stays unknown)", async () => {

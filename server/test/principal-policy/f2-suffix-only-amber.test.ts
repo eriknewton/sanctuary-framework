@@ -27,6 +27,13 @@ import {
 } from "../../src/castle-wall/constants.js";
 
 const FORTRESS = "fortress:test";
+const UNDETERMINED_AVAILABILITY = {
+  status: "undetermined" as const,
+  reason: "availability_not_queried",
+  observed_at: null,
+  freshness_window_ms: 30_000,
+  active_connection_count: 0,
+};
 
 /** A fresh Castle Wall enforcement entry that arms the wall on the channel basis
  * (no producer key configured, macOS floor). */
@@ -88,7 +95,7 @@ describe("F2 HIGH-1: verified_suffix_only renders amber, not affirmative green",
       protectionClaimSubject: FORTRESS,
       auditLog: suffixOnlyAuditLog([freshEnforcementEntry(now)]),
       originMachine: FORTRESS,
-      platform: "darwin",
+      platform: "linux",
       now,
     });
     // Fresh enforcement evidence + suffix-only (untampered) => still armed. The
@@ -97,6 +104,22 @@ describe("F2 HIGH-1: verified_suffix_only renders amber, not affirmative green",
     expect(posture.audit_integrity_ok).toBe(true);
     // Amber caveat present so the green badge honestly says the sealed history
     // was not re-verified at this privilege.
+    expect(posture.sealed_region_unverified_at_privilege).toBe(true);
+  });
+
+  it("posture: injected undetermined v3 availability overrides suffix-only fresh evidence", async () => {
+    const now = Date.now();
+    const posture = await buildCastleWallPosture({
+      protectionClaimSubject: FORTRESS,
+      auditLog: suffixOnlyAuditLog([freshEnforcementEntry(now)]),
+      originMachine: FORTRESS,
+      platform: "linux",
+      now,
+      enforcementAvailability: UNDETERMINED_AVAILABILITY,
+    });
+
+    expect(posture.arm_state).toBe("unknown");
+    expect(posture.evidence_basis).toBe("no_evidence");
     expect(posture.sealed_region_unverified_at_privilege).toBe(true);
   });
 
@@ -119,7 +142,7 @@ describe("F2 HIGH-1: verified_suffix_only renders amber, not affirmative green",
       protectionClaimSubject: FORTRESS,
       auditLog: verifiedLog,
       originMachine: FORTRESS,
-      platform: "darwin",
+      platform: "linux",
       now,
     });
     expect(posture.arm_state).toBe("armed");

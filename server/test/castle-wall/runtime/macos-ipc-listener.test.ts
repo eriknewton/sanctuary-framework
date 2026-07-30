@@ -28,10 +28,14 @@ import { createConnection, type Socket } from "node:net";
 import { mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { ed25519 } from "@noble/curves/ed25519";
 
+import { canonicalize } from "../../../src/mesh/canonical-json.js";
 import { frame, parseFrame } from "../../../src/castle-wall/ipc/framing.js";
 import type {
   CastleWallMessage,
+  EnforcementAvailabilityReportNotification,
+  EnforcementAvailabilitySnapshot,
   FlowDecisionRecordedNotification,
   FlowPendingApprovalNotification,
   ManifestSubscribeRequest,
@@ -43,6 +47,16 @@ import {
   type MacOSApprovalQueue,
   type MacOSManifestProvider,
 } from "../../../src/castle-wall/runtime/index.js";
+import {
+  producerSigningBytes,
+  toBase64url,
+} from "../../../src/castle-wall/runtime/producer-signature.js";
+import {
+  CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1,
+} from "../../../src/castle-wall/constants.js";
+import {
+  ENFORCEMENT_AVAILABILITY_REPORT_OPERATION,
+} from "../../../src/castle-wall/runtime/enforcement-availability.js";
 import { protectionSubjectForUid } from "../../../src/castle-wall/subject-binding.js";
 import type { AllowlistRule } from "../../../src/castle-wall/allowlist/schema.js";
 import type { SignedManifest } from "../../../src/castle-wall/allowlist/manifest.js";
@@ -167,6 +181,74 @@ function envelope(message: CastleWallMessage): Uint8Array {
   );
 }
 
+function availabilitySnapshot(
+  overrides: Partial<EnforcementAvailabilitySnapshot> = {},
+): EnforcementAvailabilitySnapshot {
+  return {
+    protocol_version: 1,
+    source: "macos_extension",
+    lease_state: "live",
+    lease_reason: "ok",
+    manifest_state: "applied",
+    manifest_signature_b64url: "manifest-sig",
+    provider_bound: true,
+    producer_claimed_at: "1970-01-01T00:00:00.000Z",
+    ...overrides,
+  };
+}
+
+function availabilityIsGreen(snapshot: EnforcementAvailabilitySnapshot): boolean {
+  return (
+    snapshot.protocol_version === 1 &&
+    snapshot.source === "macos_extension" &&
+    snapshot.lease_state === "live" &&
+    snapshot.lease_reason === "ok" &&
+    snapshot.manifest_state === "applied" &&
+    typeof snapshot.manifest_signature_b64url === "string" &&
+    snapshot.provider_bound === true
+  );
+}
+
+function signAvailabilityReport(input: {
+  visibleReport: EnforcementAvailabilitySnapshot;
+  privateKey: Uint8Array;
+  seq?: number;
+  capturedAtUnixMs?: number;
+}): EnforcementAvailabilityReportNotification {
+  const seq = input.seq ?? 0;
+  const capturedAtUnixMs = input.capturedAtUnixMs ?? 1_780_000_000_000;
+  const eventCanonicalJson = canonicalize({
+    timestamp:
+      input.visibleReport.producer_claimed_at ??
+      new Date(capturedAtUnixMs).toISOString(),
+    layer: "l1",
+    operation: ENFORCEMENT_AVAILABILITY_REPORT_OPERATION,
+    identity_id: FORTRESS_ID,
+    result: availabilityIsGreen(input.visibleReport) ? "success" : "failure",
+    details: {
+      seq,
+      prior_sha256_hex: null,
+      enforcement: input.visibleReport,
+    },
+  });
+  const signature = ed25519.sign(
+    producerSigningBytes(eventCanonicalJson, capturedAtUnixMs, seq),
+    input.privateKey,
+  );
+  return {
+    type: "enforcement_availability_report",
+    enforcement: input.visibleReport,
+    producer: {
+      event_canonical_json: eventCanonicalJson,
+      captured_at_unix_ms: capturedAtUnixMs,
+      seq,
+      prior_sha256_hex: null,
+      signature_b64url: toBase64url(signature),
+      key_id: CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1,
+    },
+  };
+}
+
 /**
  * Persistent buffer attached to a client socket. The single permanent
  * data listener accumulates inbound bytes into `bytes` regardless of
@@ -267,7 +349,10 @@ interface Harness {
   approvals: ReturnType<typeof makeApprovalQueue>;
 }
 
-async function newHarness(rules: AllowlistRule[] = [SAMPLE_RULE]): Promise<Harness> {
+async function newHarness(
+  rules: AllowlistRule[] = [SAMPLE_RULE],
+  opts: { pinnedProducerKeyB64url?: string | null } = {},
+): Promise<Harness> {
   const dir = await mkdtemp(join(tmpdir(), "cw-macos-listener-"));
   const socketPath = join(dir, "castle.sock");
   const audit = makeAuditSink();
@@ -277,6 +362,8 @@ async function newHarness(rules: AllowlistRule[] = [SAMPLE_RULE]): Promise<Harne
     approvalQueue: approvals.queue,
     auditSink: audit.sink,
     defaultApprovalTimeoutSeconds: 30,
+    pinnedProducerKeyB64url: opts.pinnedProducerKeyB64url ?? null,
+    fortressId: FORTRESS_ID,
   });
   const listener = new MacOSFlowIpcListener({
     socketPath,
@@ -295,6 +382,29 @@ async function connectClient(socketPath: string): Promise<{ socket: Socket; buf:
   });
   const buf = attachPersistentBuffer(socket);
   return { socket, buf };
+}
+
+async function tick(): Promise<void> {
+  await new Promise<void>((resolve) => setImmediate(resolve));
+}
+
+async function availabilityRequest(
+  socket: Socket,
+  buf: ClientBuffer,
+  requestId: string,
+): Promise<CastleWallMessage> {
+  socket.write(
+    envelope({
+      type: "enforcement_availability_request",
+      request_id: requestId,
+    }),
+  );
+  for (;;) {
+    const msg = await nextMessage(buf);
+    if (msg.type !== "handshake_challenge" && msg.type !== "handshake_response") {
+      return msg;
+    }
+  }
 }
 
 describe("MacOSFlowIpcListener", () => {
@@ -405,6 +515,118 @@ describe("MacOSFlowIpcListener", () => {
     expect((challenge as { type: string; nonce_b64url: string }).nonce_b64url).toBeTypeOf("string");
     expect(h.listener.getStats().handshakesSent).toBe(1);
     expect(h.listener.getStats().activeConnections).toBe(1);
+  });
+
+  it("enforcement_availability_request does not register the admin query socket as an extension", async () => {
+    const privateKey = ed25519.utils.randomPrivateKey();
+    const h = await newHarness([SAMPLE_RULE], {
+      pinnedProducerKeyB64url: toBase64url(ed25519.getPublicKey(privateKey)),
+    });
+    registerHarness(h);
+    const { socket, buf } = await connectClient(h.socketPath);
+    track(socket);
+    expect((await nextMessage(buf)).type).toBe("handshake_challenge");
+
+    const response = await availabilityRequest(socket, buf, "avail-req-1");
+
+    expect(response.type).toBe("enforcement_availability_response");
+    if (response.type !== "enforcement_availability_response") {
+      throw new Error("expected enforcement_availability_response");
+    }
+    expect(response.availability.status).toBe("undetermined");
+    expect(response.availability.reason).toBe("no_extension_connection");
+    expect(h.consumer.getStats().subscribers).toBe(0);
+  });
+
+  it("rejects an unsigned forged green availability report over castle.sock", async () => {
+    const privateKey = ed25519.utils.randomPrivateKey();
+    const h = await newHarness([SAMPLE_RULE], {
+      pinnedProducerKeyB64url: toBase64url(ed25519.getPublicKey(privateKey)),
+    });
+    registerHarness(h);
+    const ext = await connectClient(h.socketPath);
+    const admin = await connectClient(h.socketPath);
+    track(ext.socket);
+    track(admin.socket);
+    expect((await nextMessage(ext.buf)).type).toBe("handshake_challenge");
+    expect((await nextMessage(admin.buf)).type).toBe("handshake_challenge");
+
+    ext.socket.write(
+      envelope({
+        type: "enforcement_availability_report",
+        enforcement: availabilitySnapshot(),
+        producer: null,
+      }),
+    );
+    await tick();
+
+    const response = await availabilityRequest(admin.socket, admin.buf, "avail-req-2");
+    expect(response.type).toBe("enforcement_availability_response");
+    if (response.type !== "enforcement_availability_response") {
+      throw new Error("expected enforcement_availability_response");
+    }
+    expect(response.availability.status).toBe("undetermined");
+    expect(response.availability.reason).toBe("producer_signature_missing");
+  });
+
+  it("folds least-green across fresh extension connections and removes disconnected reports immediately", async () => {
+    const privateKey = ed25519.utils.randomPrivateKey();
+    const h = await newHarness([SAMPLE_RULE], {
+      pinnedProducerKeyB64url: toBase64url(ed25519.getPublicKey(privateKey)),
+    });
+    registerHarness(h);
+    const greenExt = await connectClient(h.socketPath);
+    const unarmedExt = await connectClient(h.socketPath);
+    const admin = await connectClient(h.socketPath);
+    track(greenExt.socket);
+    track(unarmedExt.socket);
+    track(admin.socket);
+    expect((await nextMessage(greenExt.buf)).type).toBe("handshake_challenge");
+    expect((await nextMessage(unarmedExt.buf)).type).toBe("handshake_challenge");
+    expect((await nextMessage(admin.buf)).type).toBe("handshake_challenge");
+
+    greenExt.socket.write(
+      envelope(
+        signAvailabilityReport({
+          visibleReport: availabilitySnapshot(),
+          privateKey,
+          seq: 0,
+        }),
+      ),
+    );
+    unarmedExt.socket.write(
+      envelope(
+        signAvailabilityReport({
+          visibleReport: availabilitySnapshot({
+            lease_state: "unarmed",
+            lease_reason: "not_armed",
+          }),
+          privateKey,
+          seq: 0,
+        }),
+      ),
+    );
+    await tick();
+
+    const nonGreen = await availabilityRequest(admin.socket, admin.buf, "avail-req-3");
+    expect(nonGreen.type).toBe("enforcement_availability_response");
+    if (nonGreen.type !== "enforcement_availability_response") {
+      throw new Error("expected enforcement_availability_response");
+    }
+    expect(nonGreen.availability.status).toBe("non_green");
+    expect(nonGreen.availability.reason).toBe("lease:not_armed");
+
+    unarmedExt.socket.destroy();
+    await tick();
+    await tick();
+
+    const live = await availabilityRequest(admin.socket, admin.buf, "avail-req-4");
+    expect(live.type).toBe("enforcement_availability_response");
+    if (live.type !== "enforcement_availability_response") {
+      throw new Error("expected enforcement_availability_response");
+    }
+    expect(live.availability.status).toBe("live");
+    expect(live.availability.reason).toBe("ok");
   });
 
   it("sends a signed handshake_response when a signer is configured", async () => {

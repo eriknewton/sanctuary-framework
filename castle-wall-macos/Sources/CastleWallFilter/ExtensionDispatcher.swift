@@ -87,6 +87,7 @@ public final class ExtensionDispatcher {
     private var providerUnboundAuditSent = false
     private var connectedFortressId: String?
     private var unboundTimer: DispatchSourceTimer?
+    private var availabilityReportTimer: DispatchSourceTimer?
     /// True once `start()` has been invoked at least once. Gates the
     /// lazy-reconnect path in `notifyVerdict`: a dispatcher that has never
     /// been started (the pristine `.disconnected` state used by unit tests
@@ -119,6 +120,7 @@ public final class ExtensionDispatcher {
     private static let maxRetryDelaySeconds: TimeInterval = 30.0
     private static let retryJitterPercent: Double = 0.15
     private static let unboundAuditDelaySeconds: TimeInterval = 5.0
+    private static let availabilityReportIntervalSeconds: TimeInterval = 5.0
 
     public init(
         engine: FlowEvaluatorEngine,
@@ -211,12 +213,15 @@ public final class ExtensionDispatcher {
 
     /// Close the underlying IPC client. Idempotent.
     public func stop() {
+        emitAvailabilityReport(trigger: "stop", providerBoundOverride: false)
         stateQueue.sync {
             isStopping = true
             retryTimer?.cancel()
             retryTimer = nil
             unboundTimer?.cancel()
             unboundTimer = nil
+            availabilityReportTimer?.cancel()
+            availabilityReportTimer = nil
             connectionStateValue = .disconnected
             retryDelaySeconds = Self.initialRetryDelaySeconds
             manifestReceived = false
@@ -271,23 +276,16 @@ public final class ExtensionDispatcher {
                 // signer was never assigned. A pinned-key consumer must reject
                 // unsigned enforcement evidence, so we DROP rather than fall
                 // back to an unsigned emit (hard security invariant). The
-                // unsigned builder below exists ONLY for the no-signer unit
-                // tests; it must never be reached on a signing-extension build.
                 CastleWallLog.lifecycle.error(
                     "\(Self.auditDropLogPrefix) path=nil-signer reason=audit-producer-signer-not-assigned outcome=\(Self.outcomeLabel(outcome)) decision: dropping per-flow audit emission (no unsigned fallback)"
                 )
-                guard let message = IPCBridgeNotifications.buildFlowDecisionRecorded(
-                    outcome: outcome,
-                    flow: flow
-                ) else {
-                    return
-                }
-                ipcClient.send(message, onError: handleSendError)
                 return
             }
+            let enforcement = availabilitySnapshotForCurrentState()
             auditProducerChain.buildSignedFlowDecision(
                 outcome: outcome,
                 flow: flow,
+                enforcement: enforcement,
                 signer: auditProducerSigner
             ) { [weak self] result in
                 guard let self else { return }
@@ -309,6 +307,7 @@ public final class ExtensionDispatcher {
                     )
                 }
             }
+            emitAvailabilityReport(trigger: "flow-decision")
         case .uncertain:
             let message = IPCBridgeNotifications.buildFlowPendingApproval(flow: flow)
             ipcClient.send(message, onError: handleSendError)
@@ -408,6 +407,7 @@ public final class ExtensionDispatcher {
                 cancelUnboundTimerIfBoundLocked()
             }
             flowCache.clear()
+            emitAvailabilityReport(trigger: "arm-lease")
         case .manifestUpdated:
             // Apply via the existing helper to keep store + cache invariants paired.
             let applied = IPCBridgeNotifications.applyManifestUpdated(
@@ -436,6 +436,7 @@ public final class ExtensionDispatcher {
                     manifestReceived = true
                     cancelUnboundTimerIfBoundLocked()
                 }
+                emitAvailabilityReport(trigger: "manifest-applied")
             } else {
                 CastleWallLog.ipc.notice(
                     "manifest_updated rejected; manifest_received NOT advanced (prior policy retained)"
@@ -500,6 +501,8 @@ public final class ExtensionDispatcher {
                 onError: handleSendError
             )
             scheduleUnboundAuditCheck(trigger: trigger)
+            startAvailabilityReportTimer()
+            emitAvailabilityReport(trigger: "connected")
             CastleWallLog.lifecycle.notice("ExtensionDispatcher connected; trigger=\(trigger)")
             return true
         } catch {
@@ -560,6 +563,71 @@ public final class ExtensionDispatcher {
         unboundTimer?.cancel()
         unboundTimer = nil
         CastleWallLog.lifecycle.notice("ExtensionDispatcher bound: manifest_received=true arm_lease_received=true")
+    }
+
+    private func startAvailabilityReportTimer() {
+        stateQueue.sync {
+            availabilityReportTimer?.cancel()
+            let timer = DispatchSource.makeTimerSource(queue: stateQueue)
+            timer.schedule(
+                deadline: .now() + Self.availabilityReportIntervalSeconds,
+                repeating: Self.availabilityReportIntervalSeconds
+            )
+            timer.setEventHandler { [weak self] in
+                DispatchQueue.global(qos: .utility).async {
+                    self?.emitAvailabilityReport(trigger: "timer")
+                }
+            }
+            availabilityReportTimer = timer
+            timer.resume()
+        }
+    }
+
+    private func availabilitySnapshotForCurrentState(
+        providerBoundOverride: Bool? = nil
+    ) -> EnforcementAvailabilitySnapshotBody {
+        let providerBound = stateQueue.sync {
+            providerBoundOverride ?? (
+                connectionStateValue == .connected &&
+                manifestReceived &&
+                armLeaseReceived &&
+                !isStopping
+            )
+        }
+        return engine.enforcementAvailabilitySnapshot(providerBound: providerBound)
+    }
+
+    private func emitAvailabilityReport(
+        trigger: String,
+        providerBoundOverride: Bool? = nil
+    ) {
+        let context = stateQueue.sync { () -> (String, AuditProducerSigning)? in
+            guard connectionStateValue == .connected else { return nil }
+            guard let fortressId = connectedFortressId else { return nil }
+            guard let signer = auditProducerSigner else { return nil }
+            return (fortressId, signer)
+        }
+        guard let (fortressId, signer) = context else {
+            return
+        }
+        let enforcement = availabilitySnapshotForCurrentState(
+            providerBoundOverride: providerBoundOverride
+        )
+        auditProducerChain.buildSignedAvailabilityReport(
+            enforcement: enforcement,
+            fortressId: fortressId,
+            signer: signer
+        ) { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .success(let message):
+                self.ipcClient.send(message, onError: self.handleSendError)
+            case .failure(let error):
+                CastleWallLog.lifecycle.error(
+                    "\(Self.auditDropLogPrefix) path=availability-signing-failure trigger=\(trigger) reason=\(Self.signingErrorLabel(error)) decision: dropping enforcement availability report (fail-closed)"
+                )
+            }
+        }
     }
 
     private func maybeEmitProviderUnboundAudit(trigger: String) {
@@ -669,6 +737,8 @@ public final class ExtensionDispatcher {
             self.retryTimer = nil
             self.unboundTimer?.cancel()
             self.unboundTimer = nil
+            self.availabilityReportTimer?.cancel()
+            self.availabilityReportTimer = nil
 
             let base = self.retryDelaySeconds
             let jitterRange = base * Self.retryJitterPercent
@@ -702,6 +772,8 @@ public final class ExtensionDispatcher {
             if newValue != .connected {
                 unboundTimer?.cancel()
                 unboundTimer = nil
+                availabilityReportTimer?.cancel()
+                availabilityReportTimer = nil
             }
         }
     }

@@ -49,6 +49,11 @@ import { frame, parseFrame } from "../castle-wall/ipc/framing.js";
 import { writeGlobalPinIfUnestablished } from "../castle-wall/global-pin/index.js";
 import { resolveCastleWallSocketPath } from "../castle-wall/runtime/socket-path.js";
 import {
+  DEFAULT_ENFORCEMENT_AVAILABILITY_FRESHNESS_MS,
+  queryMacOSEnforcementAvailability,
+  type ResolvedEnforcementAvailability,
+} from "../castle-wall/runtime/enforcement-availability.js";
+import {
   BOOT_TOKEN_LENGTH,
   deriveSafeModeAuditKey,
   readBootToken,
@@ -129,6 +134,10 @@ export interface CastleWallCommandContext {
   hostAppCandidates?: string[];
   /** Override the daemon-socket reachability probe (tests). */
   daemonProbe?: (socketPath: string) => Promise<boolean>;
+  /** Override the signed enforcement-availability socket query (tests). */
+  enforcementAvailabilityQuery?: (
+    socketPath: string,
+  ) => Promise<ResolvedEnforcementAvailability>;
   /**
    * Override the persistent-boot-service readiness probe used by the `enable`
    * composition guard (#450 item 5; tests). Defaults to {@link bootServiceReady},
@@ -356,6 +365,47 @@ function formatDeadManLeaseStatus(
     `${label}` +
     `${filter}; ttl=${ttl}; heartbeat=${lease.heartbeat_interval_seconds}s; updated=${lease.updated_at}\n`
   );
+}
+
+function formatEnforcementAvailabilityStatus(
+  availability: ResolvedEnforcementAvailability,
+): string {
+  const observed = availability.observed_at ?? "none";
+  return (
+    `Enforcement availability: ${availability.status} (${availability.reason}; ` +
+    `observed=${observed}; active_connections=${availability.active_connection_count})\n`
+  );
+}
+
+async function readEnforcementAvailabilityForStatus(
+  storagePath: string,
+  platform: NodeJS.Platform,
+  ctx: CastleWallCommandContext,
+): Promise<ResolvedEnforcementAvailability> {
+  if (platform !== "darwin") {
+    return {
+      status: "undetermined",
+      reason: "not_macos",
+      observed_at: null,
+      freshness_window_ms: DEFAULT_ENFORCEMENT_AVAILABILITY_FRESHNESS_MS,
+      active_connection_count: 0,
+    };
+  }
+  const socketPath = resolveCastleWallSocketPath({ platform, fortressPath: storagePath }).path;
+  const query = ctx.enforcementAvailabilityQuery ?? queryMacOSEnforcementAvailability;
+  try {
+    return await query(socketPath);
+  } catch (error) {
+    return {
+      status: "undetermined",
+      reason: `availability_query_failed:${
+        error instanceof Error ? error.message : String(error)
+      }`,
+      observed_at: null,
+      freshness_window_ms: DEFAULT_ENFORCEMENT_AVAILABILITY_FRESHNESS_MS,
+      active_connection_count: 0,
+    };
+  }
 }
 
 /** Exit-code contract with HeadlessFilterCLI.ExitCode (Swift side). */
@@ -1438,6 +1488,12 @@ export async function runStatus(
       );
     }
   }
+  const enforcementAvailability = await readEnforcementAvailabilityForStatus(
+    storagePath,
+    platform,
+    ctx,
+  );
+  write(out, formatEnforcementAvailabilityStatus(enforcementAvailability));
   const lease = await readLeaseStatus(storagePath);
   if (lease) {
     write(out, formatDeadManLeaseStatus(lease, contentFilterState));

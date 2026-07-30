@@ -52,6 +52,13 @@ const SUBJECT = `${FORTRESS}/uid-503`;
 const NOW = 1_750_000_000_000;
 // A timestamp safely inside the freshness window AND inside the 5-min sig age.
 const FRESH_TS = NOW - 1000;
+const UNDETERMINED_AVAILABILITY = {
+  status: "undetermined",
+  reason: "availability_not_queried",
+  observed_at: null,
+  freshness_window_ms: 30_000,
+  active_connection_count: 0,
+} as const;
 
 function toBase64url(bytes: Uint8Array): string {
   let bin = "";
@@ -332,7 +339,7 @@ async function appendForged(
   });
 }
 
-/** Append a channel-authenticated (unsigned) entry, the macOS / no-key shape. */
+/** Append a channel-authenticated (unsigned) entry, the Linux / no-key shape. */
 async function appendChannelUnsigned(log: AuditLog): Promise<void> {
   await log.appendCritical({
     layer: "l1",
@@ -448,6 +455,7 @@ describe("Slice R — read-side subject binding rejects producer-signed relabels
       protectionClaimSubject: victim,
       auditLog: log,
       originMachine: FORTRESS,
+      platform: "linux",
       now: NOW,
       pinnedProducerKeyB64url: daemonPubB64,
     });
@@ -516,7 +524,7 @@ describe("Slice R — read-side subject binding rejects producer-signed relabels
     });
   }
 
-  it("digest and posture join on the storage-path fortress subject for macOS signed audit-token evidence", async () => {
+  it("digest and posture join on the storage-path fortress subject for Linux signed audit-token evidence", async () => {
     const log = newLog();
     const storagePath = "/var/sanctuary/fortress-alpha";
     const subjectFortressId = fortressIdFromStoragePath(storagePath);
@@ -533,7 +541,7 @@ describe("Slice R — read-side subject binding rejects producer-signed relabels
       protectionClaimSubject: postureSubject,
       auditLog: log,
       originMachine,
-      platform: "macos",
+      platform: "linux",
       now: NOW,
       pinnedProducerKeyB64url: daemonPubB64,
     });
@@ -674,6 +682,7 @@ describe("Slice R — codex HIGH #1: key-bearing reader rejects channel/legacy-b
       protectionClaimSubject: SUBJECT,
       auditLog: log,
       originMachine: FORTRESS,
+      platform: "linux",
       now: NOW,
       pinnedProducerKeyB64url: daemonPubB64,
     });
@@ -720,14 +729,14 @@ describe("Slice R — codex HIGH #2: policy_loaded cannot arm without re-verific
       protectionClaimSubject: SUBJECT,
       auditLog: log,
       originMachine: FORTRESS,
-      platform: "macos",
+      platform: "linux",
       now: NOW,
       pinnedProducerKeyB64url: null,
     });
     // UPDATED by the arm-set honesty narrowing: policy_loaded attests
     // manifest-acceptance, not live adjudication, so it is no longer arm-eligible
     // on ANY basis. A wall that only loaded a policy now reads unknown (amber),
-    // never armed. This intentionally raises the prior no-key / macOS channel
+    // never armed. This intentionally raises the prior no-key / Linux channel
     // floor (which armed on a manifest-load alone); posture and feature-health
     // now share one live-adjudication set so the banner cannot over-claim green.
     expect(posture.arm_state).not.toBe("armed");
@@ -1021,12 +1030,30 @@ describe("Slice R — codex round-4 HIGH: a duplicated fresh signed tuple counts
       protectionClaimSubject: SUBJECT,
       auditLog: log,
       originMachine: FORTRESS,
+      platform: "linux",
       now: NOW,
       pinnedProducerKeyB64url: daemonPubB64,
     });
     const cw = panel.rows.find((r) => r.feature_id === "castle_wall_egress");
     expect(cw!.status).toBe("active");
     expect(cw!.invocation_count).toBe(1);
+  });
+
+  it("v3 undetermined availability caps a reverified Linux-shaped duplicate tuple", async () => {
+    const log = newLog();
+    await appendDuplicateSigned(log, 5);
+    const posture = await buildCastleWallPosture({
+      protectionClaimSubject: SUBJECT,
+      auditLog: log,
+      originMachine: FORTRESS,
+      platform: "linux",
+      now: NOW,
+      pinnedProducerKeyB64url: daemonPubB64,
+      enforcementAvailability: UNDETERMINED_AVAILABILITY,
+    });
+    expect(posture.arm_state).toBe("unknown");
+    expect(posture.arm_state).not.toBe("armed");
+    expect(posture.evidence_basis).toBe("no_evidence");
   });
 
   it("TWO DISTINCT signed events (different seq) both count — dedup does not over-collapse", async () => {
@@ -1093,6 +1120,7 @@ describe("Slice R — POSITIVE: a valid producer-signed entry re-verifies and re
       protectionClaimSubject: SUBJECT,
       auditLog: log,
       originMachine: FORTRESS,
+      platform: "linux",
       now: NOW,
       pinnedProducerKeyB64url: daemonPubB64,
     });
@@ -1165,7 +1193,7 @@ describe("Slice R — POSITIVE: a valid producer-signed entry re-verifies and re
   });
 });
 
-describe("Slice R — FALLBACK (macOS parity): no pinned key → honest channel basis", () => {
+describe("Slice R — FALLBACK (Linux no-key parity): no pinned key → honest channel basis", () => {
   it("posture: channel-unsigned entry arms but is labeled channel_authenticated, never producer_signed", async () => {
     const log = newLog();
     await appendChannelUnsigned(log);
@@ -1174,7 +1202,7 @@ describe("Slice R — FALLBACK (macOS parity): no pinned key → honest channel 
       protectionClaimSubject: SUBJECT,
       auditLog: log,
       originMachine: FORTRESS,
-      platform: "macos",
+      platform: "linux",
       now: NOW,
       pinnedProducerKeyB64url: null,
     });
@@ -1192,7 +1220,7 @@ describe("Slice R — FALLBACK (macOS parity): no pinned key → honest channel 
       protectionClaimSubject: SUBJECT,
       auditLog: log,
       originMachine: FORTRESS,
-      platform: "macos",
+      platform: "linux",
       now: NOW,
       pinnedProducerKeyB64url: null,
     });
@@ -1206,7 +1234,7 @@ describe("Slice R — FALLBACK (macOS parity): no pinned key → honest channel 
       protectionClaimSubject: SUBJECT,
       auditLog: log,
       originMachine: FORTRESS,
-      platform: "macos",
+      platform: "linux",
       now: NOW,
       pinnedProducerKeyB64url: null,
     });
@@ -1221,11 +1249,11 @@ describe("Slice R — FALLBACK (macOS parity): no pinned key → honest channel 
       protectionClaimSubject: SUBJECT,
       auditLog: log,
       originMachine: FORTRESS,
-      platform: "macos",
+      platform: "linux",
       now: NOW,
       pinnedProducerKeyB64url: null,
     });
-    // No key → cannot verify → channel basis. This is the documented macOS cap:
+    // No key → cannot verify → channel basis. This is the documented Linux cap:
     // the no-key reader is no stronger than the channel today. The KEY-BEARING
     // reader (HEADLINE NEGATIVE above) is what closes the hole.
     expect(posture.arm_state).toBe("armed");

@@ -46,6 +46,7 @@ import {
 } from "../../src/castle-wall/subject-binding.js";
 import type { FlowDecisionRecordedNotification } from "../../src/castle-wall/ipc/messages.js";
 import { MacOSFlowEventConsumer } from "../../src/castle-wall/runtime/macos-flow-events.js";
+import type { ResolvedEnforcementAvailability } from "../../src/castle-wall/runtime/enforcement-availability.js";
 import { producerSigningBytes } from "../../src/castle-wall/runtime/producer-signature.js";
 import { canonicalize } from "../../src/mesh/canonical-json.js";
 import {
@@ -94,6 +95,26 @@ function coarseFleetStatus(): ExclusiveEgressStatus {
 
 function currentWrapSince(ageMs: number = 2 * 60_000): Date {
   return new Date(Date.now() - ageMs);
+}
+
+function liveAvailability(): ResolvedEnforcementAvailability {
+  return {
+    status: "live",
+    reason: "ok",
+    observed_at: new Date().toISOString(),
+    freshness_window_ms: 30_000,
+    active_connection_count: 1,
+  };
+}
+
+function providerUnboundAvailability(): ResolvedEnforcementAvailability {
+  return {
+    status: "non_green",
+    reason: "provider_unbound",
+    observed_at: new Date().toISOString(),
+    freshness_window_ms: 30_000,
+    active_connection_count: 1,
+  };
 }
 
 describe("Castle Wall wrap-banner evidence probes", () => {
@@ -534,13 +555,25 @@ describe("Castle Wall wrap-banner evidence probes", () => {
 
   it("fresh adjudicated evidence (egress_allowed, inside the freshness window) reads true", async () => {
     await appendCW("egress_allowed", 60_000);
-    expect(await probeCoarseCastleWallEnforcementObserved(log, storagePath)).toBe(true);
+    expect(
+      await probeCoarseCastleWallEnforcementObserved(
+        log,
+        storagePath,
+        liveAvailability(),
+      ),
+    ).toBe(true);
   });
 
   it("fresh producer-signed evidence with a pinned key reads true through the fortress-scoped coarse probe", async () => {
     const privateKey = await publishPinnedProducerKey();
     await appendSignedCW(log, "egress_allowed", 60_000, privateKey);
-    expect(await probeCoarseCastleWallEnforcementObserved(log, storagePath)).toBe(true);
+    expect(
+      await probeCoarseCastleWallEnforcementObserved(
+        log,
+        storagePath,
+        liveAvailability(),
+      ),
+    ).toBe(true);
   });
 
   it("policy loads and heartbeats NEVER arm the banner (the honesty seam)", async () => {
@@ -571,7 +604,10 @@ describe("Castle Wall wrap-banner evidence probes", () => {
       log,
       storagePath,
       async () => exclusiveStatus(),
-      { protectionClaimSubject: agentSubject() },
+      {
+        protectionClaimSubject: agentSubject(),
+        enforcementAvailability: liveAvailability(),
+      },
     );
     expect(claim.state).toBe("exclusive");
   });
@@ -582,7 +618,10 @@ describe("Castle Wall wrap-banner evidence probes", () => {
       log,
       storagePath,
       async () => coarseFleetStatus(),
-      { protectionClaimSubject: agentSubject() },
+      {
+        protectionClaimSubject: agentSubject(),
+        enforcementAvailability: liveAvailability(),
+      },
     );
     expect(claim.state).toBe("exclusive");
     expect(claim.basis).toBe("castle_wall_enforcement_observed");
@@ -594,7 +633,10 @@ describe("Castle Wall wrap-banner evidence probes", () => {
       log,
       storagePath,
       async () => coarseOnlyStatus(),
-      { protectionClaimSubject: agentSubject() },
+      {
+        protectionClaimSubject: agentSubject(),
+        enforcementAvailability: liveAvailability(),
+      },
     );
     expect(claim.state).toBe("coarse-only");
   });
@@ -624,7 +666,7 @@ describe("Castle Wall wrap-banner evidence probes", () => {
     expect(claim.basis).toBe("provider_unavailable");
   });
 
-  it("dead_no_heartbeat maps to unknown lockout copy, not traffic-not-filtered", async () => {
+  it("missing v3 availability maps to unknown lockout copy, not traffic-not-filtered", async () => {
     await appendCW("castle_wall_heartbeat", 30 * 60_000);
     const claim = await probeCastleWallProtectionClaim(
       log,
@@ -634,8 +676,8 @@ describe("Castle Wall wrap-banner evidence probes", () => {
     );
     const advice = protectionStateAdvice(claim);
     expect(claim.state).toBe("unknown");
-    expect(claim.basis).toBe("daemon_liveness_missing");
-    expect(advice.castleWallLabel).toContain("daemon heartbeat missing");
+    expect(claim.basis).toBe("insufficient_evidence");
+    expect(advice.castleWallLabel).not.toContain("Castle Wall Full");
     expect(advice.castleWallLabel).not.toContain("traffic not filtered");
     expect(advice.castleWallLabel).not.toContain("NOT ARMED");
   });
@@ -700,6 +742,7 @@ describe("Castle Wall wrap-banner evidence probes", () => {
       storagePath,
       providerTimeoutMs: 20,
       resolveExclusiveEgress: async () => exclusiveStatus(),
+      enforcementAvailability: liveAvailability(),
     });
     expect(claim.state).toBe("exclusive");
     expect(claim.basis).toBe("exclusive_egress_observed");
@@ -722,6 +765,7 @@ describe("Castle Wall wrap-banner evidence probes", () => {
       storagePath,
       providerTimeoutMs: 20,
       resolveExclusiveEgress: async () => exclusiveStatus(),
+      enforcementAvailability: liveAvailability(),
     });
     expect(claim.state).toBe("exclusive");
     expect(claim.basis).toBe("exclusive_egress_observed");
@@ -758,6 +802,7 @@ describe("Castle Wall wrap-banner evidence probes", () => {
       storagePath,
       providerTimeoutMs: 20,
       resolveExclusiveEgress: async () => exclusiveStatus(),
+      enforcementAvailability: liveAvailability(),
     });
 
     expect(claim.state).toBe("exclusive");
@@ -783,13 +828,14 @@ describe("Castle Wall wrap-banner evidence probes", () => {
       storagePath,
       providerTimeoutMs: 20,
       resolveExclusiveEgress: async () => exclusiveStatus(),
+      enforcementAvailability: liveAvailability(),
     });
 
     expect(claim.state).toBe("exclusive");
     expect(claim.basis).toBe("exclusive_egress_observed");
   });
 
-  it("two confined agents in one fortress green only from their own enforcement evidence", async () => {
+  it("two confined agents require live v3 availability before either can render protected", async () => {
     const livenessSince = currentWrapSince();
     const subjectA = subjectForUid(503);
     const subjectB = subjectForUid(777);
@@ -808,6 +854,7 @@ describe("Castle Wall wrap-banner evidence probes", () => {
       storagePath,
       providerTimeoutMs: 20,
       resolveExclusiveEgress: async () => exclusiveStatus(),
+      enforcementAvailability: liveAvailability(),
     });
     const claimBFromAOnly = await resolveWrapProtectionClaim({
       auditLog: log,
@@ -832,17 +879,18 @@ describe("Castle Wall wrap-banner evidence probes", () => {
       storagePath,
       providerTimeoutMs: 20,
       resolveExclusiveEgress: async () => exclusiveStatus(),
+      enforcementAvailability: liveAvailability(),
     });
 
     expect(claimA.state).toBe("exclusive");
     expect(claimA.basis).toBe("exclusive_egress_observed");
     expect(claimBFromAOnly.state).toBe("unknown");
-    expect(claimBFromAOnly.basis).toBe("subject_unbound_evidence");
+    expect(claimBFromAOnly.basis).toBe("insufficient_evidence");
     expect(claimBAfterOwnEvidence.state).toBe("exclusive");
     expect(claimBAfterOwnEvidence.basis).toBe("exclusive_egress_observed");
   });
 
-  it("foreign enforcement evidence greens no claim even with fortress-scoped liveness", async () => {
+  it("foreign enforcement evidence greens no claim without v3 availability", async () => {
     const livenessSince = currentWrapSince();
     const privateKey = await publishPinnedProducerKey();
     await appendDaemonStart(31_000, "success", fortressId);
@@ -880,8 +928,8 @@ describe("Castle Wall wrap-banner evidence probes", () => {
 
     expect(claimA.state).not.toBe("exclusive");
     expect(claimB.state).not.toBe("exclusive");
-    expect(claimA.basis).toBe("subject_unbound_evidence");
-    expect(claimB.basis).toBe("subject_unbound_evidence");
+    expect(claimA.basis).toBe("insufficient_evidence");
+    expect(claimB.basis).toBe("insufficient_evidence");
   });
 
   it("producer-signed relabel attack is refused: signed uid-504 persisted as uid-503", async () => {
@@ -912,13 +960,13 @@ describe("Castle Wall wrap-banner evidence probes", () => {
     });
 
     expect(claim.state).toBe("unknown");
-    expect(claim.basis).toBe("subject_unbound_evidence");
-    expect(protectionStateAdvice(claim).castleWallLabel).toContain(
-      "no subject-bound enforcement evidence",
+    expect(claim.basis).toBe("insufficient_evidence");
+    expect(protectionStateAdvice(claim).castleWallLabel).not.toContain(
+      "Castle Wall Full",
     );
   });
 
-  it("coarse-armed true plus foreign fine evidence still cannot green the per-agent wrap banner", async () => {
+  it("foreign fine evidence without v3 availability cannot green the per-agent wrap banner", async () => {
     const subject = agentSubject();
     const privateKey = await publishPinnedProducerKey();
     await appendSignedCW(
@@ -928,7 +976,7 @@ describe("Castle Wall wrap-banner evidence probes", () => {
       privateKey,
       subjectForUid(504),
     );
-    expect(await probeCoarseCastleWallEnforcementObserved(log, storagePath)).toBe(true);
+    expect(await probeCoarseCastleWallEnforcementObserved(log, storagePath)).toBe(false);
 
     const claim = await probeCastleWallProtectionClaim(
       log,
@@ -938,13 +986,13 @@ describe("Castle Wall wrap-banner evidence probes", () => {
     );
 
     expect(claim.state).toBe("unknown");
-    expect(claim.basis).toBe("subject_unbound_evidence");
-    expect(protectionStateAdvice(claim).castleWallLabel).toContain(
-      "no subject-bound enforcement evidence",
+    expect(claim.basis).toBe("insufficient_evidence");
+    expect(protectionStateAdvice(claim).castleWallLabel).not.toContain(
+      "Castle Wall Full",
     );
   });
 
-  it("old-format 64-hex macOS evidence fails closed as legacy evidence, not liveness-missing", async () => {
+  it("old-format 64-hex macOS evidence fails closed when v3 availability is absent", async () => {
     const livenessSince = currentWrapSince();
     const subject = agentSubject();
     const legacyAuditToken =
@@ -966,10 +1014,10 @@ describe("Castle Wall wrap-banner evidence probes", () => {
     });
 
     expect(claim.state).toBe("unknown");
-    expect(claim.basis).toBe("legacy_macos_audit_token");
+    expect(claim.basis).toBe("insufficient_evidence");
     expect(claim.reasons.join("\n")).not.toContain("daemon liveness");
-    expect(protectionStateAdvice(claim).castleWallLabel).toContain(
-      "legacy audit-token evidence",
+    expect(protectionStateAdvice(claim).castleWallLabel).not.toContain(
+      "Castle Wall Full",
     );
   });
 
@@ -989,6 +1037,7 @@ describe("Castle Wall wrap-banner evidence probes", () => {
       storagePath,
       providerTimeoutMs: 20,
       resolveExclusiveEgress: async () => exclusiveStatus(),
+      enforcementAvailability: liveAvailability(),
     });
 
     expect(claim.state).toBe("exclusive");
@@ -1012,6 +1061,7 @@ describe("Castle Wall wrap-banner evidence probes", () => {
       storagePath,
       providerTimeoutMs: 20,
       resolveExclusiveEgress: async () => exclusiveStatus(),
+      enforcementAvailability: liveAvailability(),
     });
 
     expect(claim.state).toBe("exclusive");
@@ -1041,6 +1091,7 @@ describe("Castle Wall wrap-banner evidence probes", () => {
         storagePath,
         providerTimeoutMs: 20,
         resolveExclusiveEgress: async () => exclusiveStatus(),
+        enforcementAvailability: liveAvailability(),
       });
 
       expect(claim.state).toBe("exclusive");
@@ -1247,6 +1298,7 @@ describe("Castle Wall wrap-banner evidence probes", () => {
       storagePath,
       providerTimeoutMs: 20,
       resolveExclusiveEgress: async () => coarseFleetStatus(),
+      enforcementAvailability: liveAvailability(),
     });
     expect(claim.state).toBe("coarse-only");
     expect(claim.basis).toBe("exclusive_egress_unarmed_coarse_active");
@@ -1333,6 +1385,7 @@ describe("Castle Wall wrap-banner evidence probes", () => {
       storagePath,
       providerTimeoutMs: 20,
       resolveExclusiveEgress: async () => coarseFleetStatus(),
+      enforcementAvailability: providerUnboundAvailability(),
     });
 
     expect(claim.state).toBe("unprotected");
@@ -1364,6 +1417,7 @@ describe("Castle Wall wrap-banner evidence probes", () => {
       storagePath,
       providerTimeoutMs: 20,
       resolveExclusiveEgress: async () => coarseFleetStatus(),
+      enforcementAvailability: liveAvailability(),
     });
 
     expect(claim.state).toBe("unknown");
@@ -1393,6 +1447,7 @@ describe("Castle Wall wrap-banner evidence probes", () => {
       storagePath,
       providerTimeoutMs: 20,
       resolveExclusiveEgress: async () => coarseFleetStatus(),
+      enforcementAvailability: liveAvailability(),
     });
     expect(observedOff.state).toBe("unprotected");
     expect(observedOff.basis).toBe("disarm_observed_off");
@@ -1412,6 +1467,7 @@ describe("Castle Wall wrap-banner evidence probes", () => {
       storagePath,
       providerTimeoutMs: 20,
       resolveExclusiveEgress: async () => coarseFleetStatus(),
+      enforcementAvailability: liveAvailability(),
     });
     expect(reparkFailed.state).toBe("unknown");
     expect(reparkFailed.basis).toBe("exclusive_egress_repark_failed");

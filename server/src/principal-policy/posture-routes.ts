@@ -99,6 +99,10 @@ import {
 // the payload shape without closing a `posture-routes` <-> `posture-stream`
 // cycle (this module imports the stream handler above).
 import type { PostureHome } from "./posture-home-types.js";
+import {
+  DEFAULT_ENFORCEMENT_AVAILABILITY_FRESHNESS_MS,
+  type ResolvedEnforcementAvailability,
+} from "../castle-wall/runtime/enforcement-availability.js";
 
 export const POSTURE_API_PREFIX = "/api/posture";
 export const POSTURE_HOME_PATH = "/posture";
@@ -226,6 +230,10 @@ export interface PostureRouteDeps {
    * with, never a weaker basis (Slice R, R-4).
    */
   resolvePinnedProducerKey?: () => string | null;
+  /** macOS v3 level-triggered enforcement availability source. */
+  resolveEnforcementAvailability?: () =>
+    | Promise<ResolvedEnforcementAvailability>
+    | ResolvedEnforcementAvailability;
   /**
    * Slice P fail-honest signal: a producer key is EXPECTED for this fortress (the
    * daemon published one) but the dashboard could NOT load it (present but
@@ -305,6 +313,39 @@ async function resolveExclusiveEgress(
     return failedExclusiveEgressStatus(
       err instanceof Error ? err.message : String(err),
     );
+  }
+}
+
+async function resolveEnforcementAvailability(
+  deps: PostureRouteDeps,
+): Promise<ResolvedEnforcementAvailability | null> {
+  if (
+    (deps.platform ?? process.platform) !== "darwin" &&
+    !deps.resolveEnforcementAvailability
+  ) {
+    return null;
+  }
+  if (!deps.resolveEnforcementAvailability) {
+    return {
+      status: "undetermined",
+      reason: "availability_not_queried",
+      observed_at: null,
+      freshness_window_ms: DEFAULT_ENFORCEMENT_AVAILABILITY_FRESHNESS_MS,
+      active_connection_count: 0,
+    };
+  }
+  try {
+    return await deps.resolveEnforcementAvailability();
+  } catch (error) {
+    return {
+      status: "undetermined",
+      reason: `availability_query_failed:${
+        error instanceof Error ? error.message : String(error)
+      }`,
+      observed_at: null,
+      freshness_window_ms: DEFAULT_ENFORCEMENT_AVAILABILITY_FRESHNESS_MS,
+      active_connection_count: 0,
+    };
   }
 }
 
@@ -660,6 +701,7 @@ async function buildWallPosture(
    */
   preResolvedExclusiveEgress?: ExclusiveEgressStatus | null,
   preResolvedProtectionClaimSubject?: string | null,
+  preResolvedEnforcementAvailability?: ResolvedEnforcementAvailability | null,
 ): Promise<CastleWallPosture> {
   // S5-P: resolve the exclusive-egress posture BEFORE the eager read scope so
   // the provider (which may read its own state surfaces) never nests inside the
@@ -672,6 +714,10 @@ async function buildWallPosture(
     preResolvedProtectionClaimSubject !== undefined
       ? preResolvedProtectionClaimSubject
       : await resolveProtectionClaimSubject(deps);
+  const enforcementAvailability =
+    preResolvedEnforcementAvailability !== undefined
+      ? preResolvedEnforcementAvailability
+      : await resolveEnforcementAvailability(deps);
   return (deps.auditLog as AuditLog).runEagerReads(() =>
     buildCastleWallPosture({
       auditLog: deps.auditLog as AuditLog,
@@ -685,6 +731,7 @@ async function buildWallPosture(
         ? { producerKeyExpectedButUnavailable: true }
         : {}),
       ...(exclusiveEgress !== null ? { exclusiveEgress } : {}),
+      ...(enforcementAvailability !== null ? { enforcementAvailability } : {}),
       protectionClaimSubject,
     }),
   );
@@ -744,6 +791,7 @@ async function buildFeatureHealth(
    */
   preResolvedExclusiveEgress?: ExclusiveEgressStatus | null,
   preResolvedProtectionClaimSubject?: string | null,
+  preResolvedEnforcementAvailability?: ResolvedEnforcementAvailability | null,
 ): Promise<FeatureHealthPanel> {
   // S5-P: same fail-closed resolve as the wall posture, so the
   // `castle_wall_egress` row and the banner cap green identically.
@@ -755,6 +803,10 @@ async function buildFeatureHealth(
     preResolvedProtectionClaimSubject !== undefined
       ? preResolvedProtectionClaimSubject
       : await resolveProtectionClaimSubject(deps);
+  const enforcementAvailability =
+    preResolvedEnforcementAvailability !== undefined
+      ? preResolvedEnforcementAvailability
+      : await resolveEnforcementAvailability(deps);
   return (deps.auditLog as AuditLog).runEagerReads(() =>
     buildFeatureHealthPanel({
       auditLog: deps.auditLog as AuditLog,
@@ -764,6 +816,8 @@ async function buildFeatureHealth(
       includePluginRows: true,
       ...(exclusiveEgress !== null ? { exclusiveEgress } : {}),
       protectionClaimSubject,
+      ...(deps.platform !== undefined ? { platform: deps.platform } : {}),
+      ...(enforcementAvailability !== null ? { enforcementAvailability } : {}),
       ...(deps.now ? { now: deps.now() } : {}),
       pinnedProducerKeyB64url: deps.resolvePinnedProducerKey
         ? deps.resolvePinnedProducerKey()
@@ -1038,12 +1092,23 @@ async function buildHome(deps: PostureRouteDeps): Promise<PostureHome> {
   // (feature-health row) still rendered green from a second, luckier read.
   const exclusiveEgress = await resolveExclusiveEgress(deps);
   const protectionClaimSubject = await resolveProtectionClaimSubject(deps);
+  const enforcementAvailability = await resolveEnforcementAvailability(deps);
   const [castleWall, digest, unwrapped, featureHealth, custodyExit, federation] =
     await Promise.all([
-      buildWallPosture(deps, exclusiveEgress, protectionClaimSubject),
+      buildWallPosture(
+        deps,
+        exclusiveEgress,
+        protectionClaimSubject,
+        enforcementAvailability,
+      ),
       buildDigest(deps, protectionClaimSubject),
       buildUnwrapped(deps),
-      buildFeatureHealth(deps, exclusiveEgress, protectionClaimSubject),
+      buildFeatureHealth(
+        deps,
+        exclusiveEgress,
+        protectionClaimSubject,
+        enforcementAvailability,
+      ),
       buildCustodyExit(deps),
       buildFederationSummary(deps),
     ]);

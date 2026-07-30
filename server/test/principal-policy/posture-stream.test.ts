@@ -72,6 +72,13 @@ function auditTokenForRuid(uid: number): string {
 const CLAIM_UID = 601;
 const CLAIM_TOKEN = auditTokenForRuid(CLAIM_UID);
 const CLAIM_SUBJECT = subjectForUid(CLAIM_UID);
+const UNDETERMINED_AVAILABILITY = {
+  status: "undetermined",
+  reason: "availability_not_queried",
+  observed_at: null,
+  freshness_window_ms: 30_000,
+  active_connection_count: 0,
+} as const;
 
 function wrappedAgent(id: string, harness: string): LocalAgentRecord {
   return {
@@ -146,7 +153,7 @@ function baseDeps(
         enforcing_layer: "castle_wall",
       },
     ],
-    platform: "darwin",
+    platform: "linux",
     resolveProtectionClaimSubject: () => CLAIM_SUBJECT,
     ...extra,
   };
@@ -229,6 +236,44 @@ describe("posture SSE stream (server)", () => {
     expect(payload.digest.kernel_allows).toBe(1);
     // No new green path: the stream carries the same fields, nothing invented.
     expect(payload.feature_health).toBeDefined();
+  });
+
+  it("(a-v3) streams injected undetermined availability as non-green on Linux-shaped payloads", async () => {
+    const log = newLog();
+    const now = Date.now();
+    await log.appendCritical({
+      layer: "l1",
+      operation: "egress_allowed",
+      identity_id: CLAIM_SUBJECT,
+      result: "success",
+      details: {
+        agent_id: CLAIM_TOKEN,
+        cw_source: "castle_wall_audit_consumer",
+      },
+      timestamp: new Date(now - 30_000).toISOString(),
+    });
+    const base = await serve(
+      baseDeps(log, [wrappedAgent("a1", "claude_code")], {
+        resolveEnforcementAvailability: () => UNDETERMINED_AVAILABILITY,
+        streamRegistry: createPostureStreamRegistry(),
+        streamIntervalMs: 50,
+        streamHeartbeatMs: 50,
+      }),
+    );
+
+    const { text } = await readStreamUntil(base, POSTURE_STREAM_PATH, (buf) =>
+      buf.includes("event: home"),
+    );
+    const m = /event: home\ndata: (.+)\n/.exec(text);
+    expect(m).not.toBeNull();
+    const payload = JSON.parse(m![1]!);
+    expect(payload.castle_wall.arm_state).toBe("unknown");
+    expect(payload.castle_wall.arm_state).not.toBe("armed");
+    expect(
+      payload.feature_health.rows.find(
+        (r: { feature_id: string }) => r.feature_id === "castle_wall_egress",
+      ).status,
+    ).toBe("unknown");
   });
 
   it("(a) the stream payload equals the /home payload byte-for-byte (same shaper)", async () => {

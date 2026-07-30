@@ -67,6 +67,14 @@ const SAMPLE_RULE: AllowlistRule = {
   disposition: "allow",
 };
 
+const UNDETERMINED_AVAILABILITY = {
+  status: "undetermined" as const,
+  reason: "availability_not_queried",
+  observed_at: null,
+  freshness_window_ms: 30_000,
+  active_connection_count: 0,
+};
+
 interface FakeAuditEntry {
   layer: "l1";
   operation: string;
@@ -446,7 +454,7 @@ describe("MacOSFlowEventConsumer : flow_decision_recorded", () => {
     expect(consumer.getStats().decisionsRejected).toBe(1);
   });
 
-  it("a REAL macOS allow flow arms buildCastleWallPosture (end-to-end, marker from the writer not the test)", async () => {
+  it("a REAL allow flow arms buildCastleWallPosture (end-to-end, marker from the writer not the test)", async () => {
     // The gold regression for the 2026-06-17 macOS under-claim: run the actual
     // writer into a real AuditLog (so cw_source is stamped by the writer, NOT
     // pre-set by the test), then prove the honest posture reader arms from it.
@@ -480,11 +488,21 @@ describe("MacOSFlowEventConsumer : flow_decision_recorded", () => {
     const posture = await buildCastleWallPosture({
       auditLog: log,
       originMachine: "fortress-test",
-      platform: "darwin",
+      platform: "linux",
       protectionClaimSubject: subjectForUid("fortress-test", 503),
     });
     expect(posture.arm_state).toBe("armed");
     expect(posture.evidence_basis).toBe("fresh_enforcement_evidence");
+
+    const cappedByAvailability = await buildCastleWallPosture({
+      auditLog: log,
+      originMachine: "fortress-test",
+      platform: "linux",
+      protectionClaimSubject: subjectForUid("fortress-test", 503),
+      enforcementAvailability: UNDETERMINED_AVAILABILITY,
+    });
+    expect(cappedByAvailability.arm_state).toBe("unknown");
+    expect(cappedByAvailability.evidence_basis).toBe("no_evidence");
   });
 
   it("accepts a producer-signed macOS allow verdict when the audit-producer key is pinned", async () => {
@@ -533,7 +551,7 @@ describe("MacOSFlowEventConsumer : flow_decision_recorded", () => {
     expect(consumer.getStats().decisionsRejected).toBe(0);
   });
 
-  it("producer-signed macOS evidence arms only the independently derived matching claim subject", async () => {
+  it("producer-signed evidence arms only the independently derived matching claim subject", async () => {
     const fortressId = "fortress-test";
     const agentUid = 503;
     const token = auditTokenForRuid(agentUid);
@@ -574,7 +592,7 @@ describe("MacOSFlowEventConsumer : flow_decision_recorded", () => {
     const matching = await buildCastleWallPosture({
       auditLog: log,
       originMachine: fortressId,
-      platform: "darwin",
+      platform: "linux",
       now: capturedAtUnixMs + 1000,
       pinnedProducerKeyB64url: publicKeyB64url,
       protectionClaimSubject: subjectForUid(fortressId, agentUid),
@@ -584,7 +602,7 @@ describe("MacOSFlowEventConsumer : flow_decision_recorded", () => {
     const foreign = await buildCastleWallPosture({
       auditLog: log,
       originMachine: fortressId,
-      platform: "darwin",
+      platform: "linux",
       now: capturedAtUnixMs + 1000,
       pinnedProducerKeyB64url: publicKeyB64url,
       protectionClaimSubject: subjectForUid(fortressId, agentUid + 1),
@@ -593,7 +611,7 @@ describe("MacOSFlowEventConsumer : flow_decision_recorded", () => {
     expect(foreign.evidence_basis).toBe("subject_unbound_evidence");
   });
 
-  it("binds producer-signed macOS subject attribution to the signed body when the unsigned envelope agent is swapped", async () => {
+  it("binds producer-signed subject attribution to the signed body when the unsigned envelope agent is swapped", async () => {
     const fortressId = "fortress-test";
     const signedUid = 65;
     const swappedEnvelopeUid = 503;
@@ -650,7 +668,7 @@ describe("MacOSFlowEventConsumer : flow_decision_recorded", () => {
     const swappedPosture = await buildCastleWallPosture({
       auditLog: log,
       originMachine: fortressId,
-      platform: "darwin",
+      platform: "linux",
       now: capturedAtUnixMs + 1000,
       pinnedProducerKeyB64url: publicKeyB64url,
       protectionClaimSubject: subjectForUid(fortressId, swappedEnvelopeUid),
@@ -661,7 +679,7 @@ describe("MacOSFlowEventConsumer : flow_decision_recorded", () => {
     const signedPosture = await buildCastleWallPosture({
       auditLog: log,
       originMachine: fortressId,
-      platform: "darwin",
+      platform: "linux",
       now: capturedAtUnixMs + 1000,
       pinnedProducerKeyB64url: publicKeyB64url,
       protectionClaimSubject: subjectForUid(fortressId, signedUid),

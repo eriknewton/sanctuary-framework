@@ -30,6 +30,11 @@ import {
   type ProducerKeyLoad,
   type ProducerKeyLoadOptions,
 } from "../castle-wall/runtime/producer-signature.js";
+import { resolveCastleWallSocketPath } from "../castle-wall/runtime/socket-path.js";
+import {
+  DEFAULT_ENFORCEMENT_AVAILABILITY_FRESHNESS_MS,
+  queryMacOSEnforcementAvailability,
+} from "../castle-wall/runtime/enforcement-availability.js";
 import {
   loadBrokerProducerKey,
   type BrokerProducerKeyLoad,
@@ -1394,11 +1399,14 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     // notification - the ratified tight fault-class set is unchanged).
     const exclusiveEgress = await this.resolveExclusiveEgressPosture();
     const protectionClaimSubject = await this.resolveProtectionClaimSubject();
+    const enforcementAvailability = await this.resolveEnforcementAvailability();
     return auditLog.runEagerReads(() =>
       buildFeatureHealthPanel({
         auditLog,
         originMachine,
         includePluginRows: true,
+        platform: process.platform,
+        enforcementAvailability,
         pinnedProducerKeyB64url:
           load?.status === "present" ? load.keyB64url : null,
         ...(load?.status === "unreadable"
@@ -1752,6 +1760,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     const deps: PostureRouteDeps = {
       auditLog: this.auditLog ?? null,
       originMachine,
+      platform: process.platform,
       compositionEnabled,
       // Recognition panel (P5) impure sources, resolved lazily per request so
       // post-unlock wiring is observed. Both are LOCAL reads only: a count of
@@ -1798,6 +1807,8 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         brokerLoad?.status === "unreadable",
       resolveProtectionClaimSubject: () =>
         this.resolveProtectionClaimSubject(),
+      resolveEnforcementAvailability: () =>
+        this.resolveEnforcementAvailability(),
       // Wire the shared registry so the SSE live-refresh stream is available and
       // its concurrency cap is enforced server-wide. The stream reuses `buildHome`
       // (no new data, no new green paths) on a cadence plus a heartbeat.
@@ -2006,16 +2017,19 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       // diverge on green.
       const exclusiveEgress = await this.resolveExclusiveEgressPosture();
       const protectionClaimSubject = await this.resolveProtectionClaimSubject();
+      const enforcementAvailability = await this.resolveEnforcementAvailability();
       return await this.auditLog.runEagerReads(() =>
         buildCastleWallPosture({
           auditLog: this.auditLog as AuditLog,
           originMachine,
+          platform: process.platform,
           pinnedProducerKeyB64url:
             load?.status === "present" ? load.keyB64url : null,
           ...(load?.status === "unreadable"
             ? { producerKeyExpectedButUnavailable: true }
             : {}),
           ...(exclusiveEgress !== null ? { exclusiveEgress } : {}),
+          enforcementAvailability,
           protectionClaimSubject,
         }),
       );
@@ -2146,6 +2160,45 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       load = { status: "unreadable", reason: "broker_producer_key_load_threw" };
     }
     this._brokerProducerKeyLoad = load.status === "absent" ? undefined : load;
+  }
+
+  private async resolveEnforcementAvailability() {
+    if (platform() !== "darwin") {
+      return {
+        status: "undetermined" as const,
+        reason: "not_macos",
+        observed_at: null,
+        freshness_window_ms: DEFAULT_ENFORCEMENT_AVAILABILITY_FRESHNESS_MS,
+        active_connection_count: 0,
+      };
+    }
+    const storagePath = this._sanctuaryConfig?.storage_path;
+    if (typeof storagePath !== "string" || storagePath.length === 0) {
+      return {
+        status: "undetermined" as const,
+        reason: "storage_path_unavailable",
+        observed_at: null,
+        freshness_window_ms: DEFAULT_ENFORCEMENT_AVAILABILITY_FRESHNESS_MS,
+        active_connection_count: 0,
+      };
+    }
+    const socketPath = resolveCastleWallSocketPath({
+      platform: "darwin",
+      fortressPath: storagePath,
+    }).path;
+    try {
+      return await queryMacOSEnforcementAvailability(socketPath);
+    } catch (error) {
+      return {
+        status: "undetermined" as const,
+        reason: `availability_query_failed:${
+          error instanceof Error ? error.message : String(error)
+        }`,
+        observed_at: null,
+        freshness_window_ms: DEFAULT_ENFORCEMENT_AVAILABILITY_FRESHNESS_MS,
+        active_connection_count: 0,
+      };
+    }
   }
 
   /**
@@ -7171,6 +7224,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     return {
       mode: this._standaloneMode ? "standalone" : "co-located",
       server_version: PKG_VERSION,
+      platform: process.platform,
       ...(this.identityManager ? { identityManager: this.identityManager } : {}),
       ...(this.auditLog ? { auditLog: this.auditLog } : {}),
       ...(this.baseline ? { baseline: this.baseline } : {}),
@@ -7186,6 +7240,8 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       // (via the ONE canonical shaper) caps green identically.
       resolveExclusiveEgressPosture: () => this.resolveExclusiveEgressPosture(),
       resolveProtectionClaimSubject: () => this.resolveProtectionClaimSubject(),
+      resolveEnforcementAvailability: () =>
+        this.resolveEnforcementAvailability(),
       pendingApprovals: Array.from(this.pending.values()).map((p) => ({
         id: p.id,
         operation: p.request.operation,
