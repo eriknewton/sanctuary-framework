@@ -29,7 +29,7 @@
 import { platform as osPlatform } from "node:os";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { unlinkSync } from "node:fs";
+import { constants as fsConstants, unlinkSync } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import {
   mkdir,
@@ -48,6 +48,7 @@ import {
   realpath,
   readdir,
   writeFile,
+  open,
 } from "node:fs/promises";
 import { basename, dirname, join, normalize as normalizePath, relative, resolve as pathResolve, sep } from "node:path";
 import { resolve as dnsResolve } from "node:dns/promises";
@@ -2032,6 +2033,19 @@ async function hashPathNoFollow(path: string): Promise<{ algorithm: "sha256"; va
   return { algorithm: "sha256", value: hash.digest("hex") };
 }
 
+async function readRegularFileNoFollow(path: string): Promise<Buffer> {
+  const handle = await open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  try {
+    const st = await handle.stat();
+    if (!st.isFile()) {
+      throw new Error(`expected regular file while hashing re-home path: ${path}`);
+    }
+    return await handle.readFile();
+  } finally {
+    await handle.close();
+  }
+}
+
 async function updatePathHash(hash: ReturnType<typeof createHash>, path: string, relativePath: string): Promise<void> {
   const st = await lstat(path);
   if (st.isSymbolicLink()) {
@@ -2049,7 +2063,7 @@ async function updatePathHash(hash: ReturnType<typeof createHash>, path: string,
     return;
   }
   hash.update(`file\0${relativePath}\0`);
-  hash.update(await readFile(path));
+  hash.update(await readRegularFileNoFollow(path));
   hash.update("\0");
 }
 
