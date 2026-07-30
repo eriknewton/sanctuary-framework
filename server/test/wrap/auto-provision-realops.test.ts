@@ -458,6 +458,8 @@ describe("castle-wall/provision/rehome real-ops chokepoint: RehomeExecutionError
       displaceDestination: async (destPath) => ({ displacedPath: `${destPath}.displaced-20260729T000000000Z` }),
       restoreDisplacedDestination: async () => ({ restored: true }),
       backup: async (path) => ({ backupPath: `/root/backup${path}.bak` }),
+      removeSourceDuplicate: async () => undefined,
+      restoreSourceDuplicate: async () => ({ restored: true }),
       move: async () => {
         moveCount += 1;
         if (moveCount === 3) {
@@ -511,6 +513,8 @@ describe("castle-wall/provision/rehome real-ops chokepoint: RehomeExecutionError
       backup: async () => {
         throw new Error("backup destination not root-only writable");
       },
+      removeSourceDuplicate: async () => undefined,
+      restoreSourceDuplicate: async () => ({ restored: true }),
       move: async () => {},
       chown: async () => ({ excludedPaths: [] }),
       restore: async () => ({ restored: true }),
@@ -541,6 +545,8 @@ describe("castle-wall/provision/rehome real-ops chokepoint: RehomeExecutionError
       displaceDestination: async (destPath) => ({ displacedPath: `${destPath}.displaced-20260729T000000000Z` }),
       restoreDisplacedDestination: async () => ({ restored: true }),
       backup: async (path) => ({ backupPath: `/root/backup${path}.bak` }),
+      removeSourceDuplicate: async () => undefined,
+      restoreSourceDuplicate: async () => ({ restored: true }),
       move: async () => {},
       chown: async () => {
         chownCount += 1;
@@ -653,6 +659,9 @@ describe("install-preflight Build 2 re-home custody real-ops fixtures", () => {
 
       expect(results[0]?.status).toBe("moved");
       expect(results[0]?.displacedDestinationPath).toMatch(/\.displaced-\d{8}T\d{9}Z$/);
+      expect(results[0]?.displacedDestinationPath?.startsWith(`${backupRoot}/.displaced`)).toBe(true);
+      expect(dirname(results[0]!.displacedDestinationPath!)).not.toBe(dirname(destPath));
+      expect(await readFile(results[0]!.displacedDestinationPath!, "utf8")).toBe("REAL_CONFIG_WITH_SECRET=two");
       expect(await readFile(destPath, "utf8")).toBe("stub: true\n");
 
       const restore = await restoreRehomeSteps(results, ops, uidGid);
@@ -661,6 +670,38 @@ describe("install-preflight Build 2 re-home custody real-ops fixtures", () => {
       expect(await readFile(sourcePath, "utf8")).toBe("stub: true\n");
       expect(await readFile(destPath, "utf8")).toBe("REAL_CONFIG_WITH_SECRET=two");
       await expect(access(results[0]!.displacedDestinationPath!)).rejects.toThrow();
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("destination-authoritative rerun backs up and removes the duplicate operator secret source", async () => {
+    const tmpRoot = await mkdtemp(join(tmpdir(), "sanctuary-b2-authoritative-"));
+    try {
+      const backupRoot = join(tmpRoot, "backups");
+      const operatorHome = join(tmpRoot, "operator");
+      const accountHome = join(tmpRoot, "account");
+      const sourcePath = join(operatorHome, ".hermes", "config.yaml");
+      const destPath = join(accountHome, ".hermes", "config.yaml");
+      await mkdir(dirname(sourcePath), { recursive: true });
+      await writeFile(sourcePath, "REAL_CONFIG_WITH_SECRET=authoritative");
+
+      const ops = realRehomeOps({ backupRoot });
+      const plan = planRehome(singleConfigAdapter(), { operatorHome, newAccountHome: accountHome });
+      const first = await executeRehomePlan(plan, ops, uidGid);
+      expect(first[0]?.status).toBe("moved");
+      expect(await readFile(destPath, "utf8")).toBe("REAL_CONFIG_WITH_SECRET=authoritative");
+
+      await mkdir(dirname(sourcePath), { recursive: true });
+      await writeFile(sourcePath, "REAL_CONFIG_WITH_SECRET=authoritative");
+      const second = await executeRehomePlan(plan, ops, uidGid);
+
+      expect(second[0]?.status).toBe("destination-authoritative");
+      expect(second[0]?.sourceDuplicateRemoved).toBe(true);
+      expect(second[0]?.backupPath?.startsWith(backupRoot)).toBe(true);
+      await expect(access(sourcePath)).rejects.toThrow();
+      expect(await readFile(destPath, "utf8")).toBe("REAL_CONFIG_WITH_SECRET=authoritative");
+      expect(await readFile(second[0]!.backupPath!, "utf8")).toBe("REAL_CONFIG_WITH_SECRET=authoritative");
     } finally {
       await rm(tmpRoot, { recursive: true, force: true });
     }
@@ -709,16 +750,20 @@ describe("install-preflight Build 2 re-home custody real-ops fixtures", () => {
       const sourcePath = join(tmpRoot, "operator", ".hermes", "config.yaml");
       await mkdir(dirname(sourcePath), { recursive: true });
       const ops = realRehomeOps({ backupRoot });
+      let firstBackupName: string | undefined;
 
       for (let i = 0; i < 12; i++) {
         await writeFile(sourcePath, `secret-version-${i}`);
-        await ops.backup(sourcePath);
+        const backup = await ops.backup(sourcePath);
+        firstBackupName ??= basename(backup.backupPath);
       }
 
       const stem = `${backupRoot}${sourcePath}.bak-`;
       const names = await readdir(dirname(stem));
       const backupNames = names.filter((name) => name.startsWith(basename(stem)));
       expect(backupNames.length).toBeLessThanOrEqual(10);
+      expect(firstBackupName).toBeDefined();
+      expect(backupNames).toContain(firstBackupName!);
       expect(backupNames.every((name) => /\d{8}T\d{9}Z-[a-f0-9]{16}$/.test(name))).toBe(true);
     } finally {
       await rm(tmpRoot, { recursive: true, force: true });

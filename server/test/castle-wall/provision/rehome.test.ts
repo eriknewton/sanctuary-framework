@@ -32,6 +32,8 @@ function mockOps(
   overrides: Partial<RehomeOps> = {},
 ): RehomeOps & {
   backups: string[];
+  sourceDuplicateRemovals: string[];
+  sourceDuplicateRestores: Array<{ backupPath: string; sourcePath: string }>;
   moves: Array<{ from: string; to: string }>;
   chowns: Array<{ path: string; uid: number; gid: number }>;
   restores: Array<{ destPath: string; sourcePath: string; backupPath?: string }>;
@@ -39,6 +41,8 @@ function mockOps(
   contents: Map<string, string>;
 } {
   const backups: string[] = [];
+  const sourceDuplicateRemovals: string[] = [];
+  const sourceDuplicateRestores: Array<{ backupPath: string; sourcePath: string }> = [];
   const moves: Array<{ from: string; to: string }> = [];
   const chowns: Array<{ path: string; uid: number; gid: number }> = [];
   const restores: Array<{ destPath: string; sourcePath: string; backupPath?: string }> = [];
@@ -46,6 +50,8 @@ function mockOps(
   const contents = new Map<string, string>();
   return {
     backups,
+    sourceDuplicateRemovals,
+    sourceDuplicateRestores,
     moves,
     chowns,
     restores,
@@ -78,7 +84,27 @@ function mockOps(
     backup: async (path) => {
       const backupPath = `/root/.sanctuary-rehome-backups${path}.bak`;
       backups.push(backupPath);
+      contents.set(backupPath, contents.get(path) ?? `backup-data-for-${path}`);
       return { backupPath };
+    },
+    removeSourceDuplicate: async (path) => {
+      sourceDuplicateRemovals.push(path);
+      existingPaths.delete(path);
+      contents.delete(path);
+    },
+    restoreSourceDuplicate: async (backupPath, sourcePath) => {
+      sourceDuplicateRestores.push({ backupPath, sourcePath });
+      const data = contents.get(backupPath);
+      if (data === undefined) return { restored: false };
+      if (existingPaths.has(sourcePath)) {
+        const conflictPath = `${sourcePath}.restored-conflict`;
+        existingPaths.add(conflictPath);
+        contents.set(conflictPath, data);
+        return { restored: false, conflictPath };
+      }
+      existingPaths.add(sourcePath);
+      contents.set(sourcePath, data);
+      return { restored: true };
     },
     move: async (from, to) => {
       moves.push({ from, to });
@@ -241,7 +267,7 @@ describe("castle-wall/provision/rehome", () => {
       expect(ops.chowns).toEqual([]);
     });
 
-    it("lets a provenance-backed destination win without mtime and without mutating the source or destination", async () => {
+    it("lets a provenance-backed destination win, then backs up and removes the duplicate secret source", async () => {
       const adapter: AgentRehomeAdapter = {
         harnessId: "test-provenance",
         pathsToRehome: (home) => [
@@ -270,11 +296,15 @@ describe("castle-wall/provision/rehome", () => {
           entry: { sourcePath: src, destRelativePath: ".hermes/config.yaml", isSecret: true },
           destPath: dest,
           status: "destination-authoritative",
+          backupPath: `/root/.sanctuary-rehome-backups${src}.bak`,
+          sourceDuplicateRemoved: true,
           sourceHash: { algorithm: "sha256", value: "hash-identical-rehomed-config" },
           destinationHash: { algorithm: "sha256", value: "hash-identical-rehomed-config" },
         },
       ]);
-      expect(ops.backups).toEqual([]);
+      expect(ops.backups).toEqual([`/root/.sanctuary-rehome-backups${src}.bak`]);
+      expect(ops.sourceDuplicateRemovals).toEqual([src]);
+      expect(await ops.pathExists(src)).toBe(false);
       expect(ops.moves).toEqual([]);
       expect(ops.chowns).toEqual([]);
     });
@@ -346,6 +376,43 @@ describe("castle-wall/provision/rehome", () => {
   });
 
   describe("restoreRehomeSteps", () => {
+    it("restores a removed destination-authoritative source duplicate from backup without moving the destination", async () => {
+      const src = `${OPERATOR_HOME}/.hermes/config.yaml`;
+      const dest = `${NEW_ACCOUNT_HOME}/.hermes/config.yaml`;
+      const backupPath = `/root/.sanctuary-rehome-backups${src}.bak`;
+      const ops = mockOps(new Set([dest]));
+      ops.contents.set(backupPath, "operator-secret-copy");
+
+      const restoreResult = await restoreRehomeSteps(
+        [
+          {
+            entry: { sourcePath: src, destRelativePath: ".hermes/config.yaml", isSecret: true },
+            destPath: dest,
+            status: "destination-authoritative",
+            backupPath,
+            sourceDuplicateRemoved: true,
+          },
+        ],
+        ops,
+        OPERATOR_UID_GID,
+      );
+
+      expect(restoreResult.fullyRestored).toBe(true);
+      expect(restoreResult.steps).toEqual([
+        {
+          entry: { sourcePath: src, destRelativePath: ".hermes/config.yaml", isSecret: true },
+          sourcePath: src,
+          status: "restored",
+        },
+      ]);
+      expect(ops.sourceDuplicateRestores).toEqual([{ backupPath, sourcePath: src }]);
+      expect(ops.restores).toEqual([]);
+      expect(await ops.pathExists(src)).toBe(true);
+      expect(await ops.pathExists(dest)).toBe(true);
+      expect(ops.contents.get(src)).toBe("operator-secret-copy");
+      expect(ops.restoreCustodyCalls).toEqual([{ path: src, uid: OPERATOR_UID_GID.uid, gid: OPERATOR_UID_GID.gid }]);
+    });
+
     it("restores every moved step via a REVERSE-MOVE from destPath (fix F2: not the shallow backup) and skips absent steps", async () => {
       const plan = planRehome(hermesRehomeAdapter, {
         operatorHome: OPERATOR_HOME,

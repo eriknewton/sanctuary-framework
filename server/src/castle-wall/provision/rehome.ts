@@ -112,6 +112,17 @@ export interface RehomeOps {
    * genuine backup if it actually contains the data.
    */
   backup(path: string): Promise<{ backupPath: string }>;
+  /** Remove an already-backed-up duplicate source after a provenance-backed destination is authoritative. */
+  removeSourceDuplicate(path: string): Promise<void>;
+  /**
+   * Restore a removed source duplicate from its recorded backup without
+   * touching the authoritative destination. If the source path has been
+   * recreated, restore to a conflict path and report it.
+   */
+  restoreSourceDuplicate(
+    backupPath: string,
+    sourcePath: string,
+  ): Promise<{ restored: boolean; conflictPath?: string }>;
   /** Move (not copy) the file tree from `sourcePath` to `destPath`, creating parent dirs as needed. */
   move(sourcePath: string, destPath: string): Promise<void>;
   /** chown the path (recursively, if a directory) to the given uid/gid. */
@@ -202,6 +213,7 @@ export interface RehomeStepResult {
   status: "moved" | "skipped-absent" | "destination-authoritative" | "destination-displaced";
   backupPath?: string;
   displacedDestinationPath?: string;
+  sourceDuplicateRemoved?: boolean;
   sourceHash?: RehomePathHash;
   destinationHash?: RehomePathHash;
   chownExcludedPaths?: string[];
@@ -340,10 +352,20 @@ export async function executeRehomePlan(
               ),
             );
           }
+          let backupPath: string | undefined;
+          let sourceDuplicateRemoved = false;
+          if (step.entry.isSecret) {
+            const backup = await ops.backup(step.entry.sourcePath);
+            backupPath = backup.backupPath;
+            await ops.removeSourceDuplicate(step.entry.sourcePath);
+            sourceDuplicateRemoved = true;
+          }
           results.push({
             entry: step.entry,
             destPath: step.destPath,
             status: "destination-authoritative",
+            backupPath,
+            sourceDuplicateRemoved,
             sourceHash,
             destinationHash,
           });
@@ -461,6 +483,58 @@ export async function restoreRehomeSteps(
       continue;
     }
     if (result.status === "destination-authoritative") {
+      if (result.sourceDuplicateRemoved === true) {
+        if (result.backupPath === undefined) {
+          steps.push({
+            entry: result.entry,
+            sourcePath: result.entry.sourcePath,
+            status: "failed",
+            error: "source duplicate was removed but no backupPath was recorded",
+          });
+          continue;
+        }
+        try {
+          const duplicate = await ops.restoreSourceDuplicate(result.backupPath, result.entry.sourcePath);
+          if (!duplicate.restored) {
+            let custodyError: string | undefined;
+            if (duplicate.conflictPath !== undefined && result.entry.isSecret) {
+              try {
+                await ops.restoreCustody(duplicate.conflictPath, operatorUidGid.uid, operatorUidGid.gid);
+              } catch (custodyErr) {
+                custodyError = (custodyErr as Error).message;
+              }
+            }
+            steps.push({
+              entry: result.entry,
+              sourcePath: result.entry.sourcePath,
+              status: duplicate.conflictPath !== undefined ? "conflict" : "failed",
+              conflictPath: duplicate.conflictPath,
+              error:
+                duplicate.conflictPath !== undefined
+                  ? `source path was recreated after duplicate cleanup; restored duplicate was placed at ${duplicate.conflictPath} instead of overwriting it` +
+                    (custodyError !== undefined
+                      ? ` (custody handback to the operator failed: ${custodyError}; the recovered data at ${duplicate.conflictPath} may need a manual chown)`
+                      : "")
+                  : "source duplicate restore reported no data reproduced at the source path",
+            });
+            continue;
+          }
+          if (result.entry.isSecret) {
+            await ops.restoreCustody(result.entry.sourcePath, operatorUidGid.uid, operatorUidGid.gid);
+          } else {
+            await ops.chown(result.entry.sourcePath, operatorUidGid.uid, operatorUidGid.gid);
+          }
+          steps.push({ entry: result.entry, sourcePath: result.entry.sourcePath, status: "restored" });
+        } catch (err) {
+          steps.push({
+            entry: result.entry,
+            sourcePath: result.entry.sourcePath,
+            status: "failed",
+            error: (err as Error).message,
+          });
+        }
+        continue;
+      }
       steps.push({
         entry: result.entry,
         sourcePath: result.entry.sourcePath,

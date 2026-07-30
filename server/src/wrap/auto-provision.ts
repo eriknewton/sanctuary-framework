@@ -2120,14 +2120,21 @@ async function findContentAddressedBackup(
 
 async function enforceVersionedBackupRetention(backupRoot: string, sourcePath: string): Promise<void> {
   const entries = await listVersionedBackupsForSource(backupRoot, sourcePath);
+  const oldestFirst = [...entries].sort((a, b) => a.name.localeCompare(b.name));
   const newestFirst = [...entries].sort((a, b) => b.name.localeCompare(a.name));
   const keep = new Set<string>();
   const seenHashes = new Set<string>();
+  const keepDistinctHash = (entry: { path: string; hashPrefix: string }): boolean => {
+    if (seenHashes.has(entry.hashPrefix) || seenHashes.size >= REHOME_BACKUP_MAX_PER_SOURCE) return false;
+    keep.add(entry.path);
+    seenHashes.add(entry.hashPrefix);
+    return true;
+  };
+  for (const entry of oldestFirst) {
+    if (keepDistinctHash(entry)) break;
+  }
   for (const entry of newestFirst) {
-    if (!seenHashes.has(entry.hashPrefix) && seenHashes.size < REHOME_BACKUP_MAX_PER_SOURCE) {
-      keep.add(entry.path);
-      seenHashes.add(entry.hashPrefix);
-    }
+    keepDistinctHash(entry);
   }
   const toRemove = entries.filter((entry) => !keep.has(entry.path));
   for (const entry of toRemove) {
@@ -2155,15 +2162,35 @@ async function writeJsonRootOnly(path: string, value: unknown): Promise<void> {
   await chmod(path, 0o600);
 }
 
-async function findUniqueDatedSiblingPath(path: string, label: string): Promise<string> {
-  const base = `${path}.${label}-${formatRehomeTimestamp()}`;
+async function findUniqueDatedBackupRootPath(backupRoot: string, originalPath: string, label: string): Promise<string> {
+  const base = `${backupRoot}/.${label}${originalPath}.${label}-${formatRehomeTimestamp()}`;
   if (!(await pathExistsNoFollow(base))) return base;
   const MAX_SUFFIX = 1000;
   for (let i = 1; i <= MAX_SUFFIX; i++) {
     const candidate = `${base}.${i}`;
     if (!(await pathExistsNoFollow(candidate))) return candidate;
   }
-  throw new Error(`could not find a free dated sibling for ${path} after ${MAX_SUFFIX} attempts; refusing to overwrite`);
+  throw new Error(
+    `could not find a free dated root-only ${label} path for ${originalPath} after ${MAX_SUFFIX} attempts; refusing to overwrite`,
+  );
+}
+
+async function restoreBackupCopyNoFollow(backupPath: string, targetPath: string): Promise<boolean> {
+  let backupStat;
+  try {
+    backupStat = await lstat(backupPath);
+  } catch {
+    return false;
+  }
+  await mkdir(dirname(targetPath), { recursive: true, mode: 0o700 });
+  if (backupStat.isSymbolicLink()) {
+    await symlink(await readlink(backupPath), targetPath);
+  } else if (backupStat.isDirectory()) {
+    await cp(backupPath, targetPath, { recursive: true });
+  } else {
+    await copyFile(backupPath, targetPath);
+  }
+  return pathExistsNoFollow(targetPath);
 }
 
 /** Paths for the non-secret Hermes runtime tree that may be left behind by an aborted dedicated-account run. */
@@ -2845,7 +2872,8 @@ export function realRehomeOps(opts?: { backupRoot?: string }) {
       await rm(rehomeProvenancePath(backupRoot, destPath), { force: true });
     },
     displaceDestination: async (destPath: string): Promise<{ displacedPath: string }> => {
-      const displacedPath = await findUniqueDatedSiblingPath(destPath, "displaced");
+      const displacedPath = await findUniqueDatedBackupRootPath(backupRoot, destPath, "displaced");
+      await mkdir(dirname(displacedPath), { recursive: true, mode: 0o700 });
       await rename(destPath, displacedPath);
       return { displacedPath };
     },
@@ -2856,9 +2884,7 @@ export function realRehomeOps(opts?: { backupRoot?: string }) {
       if (!(await pathExistsNoFollow(displacedPath))) return { restored: false };
       await mkdir(dirname(destPath), { recursive: true, mode: 0o700 });
       if (await pathExistsNoFollow(destPath)) {
-        const conflictPath = await findUniqueConflictPath(destPath);
-        await rename(displacedPath, conflictPath);
-        return { restored: false, conflictPath };
+        return { restored: false, conflictPath: displacedPath };
       }
       await rename(displacedPath, destPath);
       return { restored: await pathExistsNoFollow(destPath) };
@@ -2918,6 +2944,21 @@ export function realRehomeOps(opts?: { backupRoot?: string }) {
       }
       await enforceVersionedBackupRetention(backupRoot, path);
       return { backupPath };
+    },
+    removeSourceDuplicate: async (path: string): Promise<void> => {
+      await rm(path, { recursive: true, force: false });
+    },
+    restoreSourceDuplicate: async (
+      backupPath: string,
+      sourcePath: string,
+    ): Promise<{ restored: boolean; conflictPath?: string }> => {
+      if (await pathExistsNoFollow(sourcePath)) {
+        const conflictPath = await findUniqueConflictPath(sourcePath);
+        const restoredToConflict = await restoreBackupCopyNoFollow(backupPath, conflictPath);
+        return restoredToConflict ? { restored: false, conflictPath } : { restored: false };
+      }
+      const restored = await restoreBackupCopyNoFollow(backupPath, sourcePath);
+      return { restored };
     },
     move: async (sourcePath: string, destPath: string): Promise<void> => {
       await mkdir(dirname(destPath), { recursive: true, mode: 0o700 });
