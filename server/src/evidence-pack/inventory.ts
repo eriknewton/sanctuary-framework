@@ -128,8 +128,8 @@ function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.length > 0;
 }
 
-function isSafeCount(value: unknown): value is number {
-  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+function isObservedDeniedCount(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 1;
 }
 
 function isValidPort(value: unknown): value is number {
@@ -201,7 +201,7 @@ export function validatePersistedObservedDestinationCandidate(
     !isValidPort(value.port) ||
     (value.protocol !== "tcp" && value.protocol !== "udp") ||
     !isValidHostnameSource(value.hostname_source) ||
-    !isSafeCount(value.times_seen) ||
+    !isObservedDeniedCount(value.times_seen) ||
     !isParseableTimestamp(firstSeen) ||
     !isParseableTimestamp(lastSeen) ||
     Date.parse(lastSeen) < Date.parse(firstSeen) ||

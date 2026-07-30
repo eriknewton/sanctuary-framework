@@ -221,6 +221,23 @@ describe("buildInventorySnapshot", () => {
     }
   });
 
+  it("rejects a zero-count observed destination before it can sign denied-flow prose", () => {
+    const snap = buildInventorySnapshot({
+      observedDestinations: {
+        ok: true,
+        records: [candidate({ times_seen: 0 })],
+      },
+    });
+
+    expect(snap.observed_destinations.status).toBe("read_failed");
+    const fixture = makeObservedStore();
+    const pack = buildEvidencePack(packInput(snap), deps(fixture.signer, fixture.masterKey));
+    const text = reportText(pack);
+    expect(text).toContain("malformed candidate evidence");
+    expect(text).not.toContain("| api.openai.com |");
+    expect(text).not.toContain("Each row is a destination the wall DENIED");
+  });
+
   it("a failed source is read_failed with a reason and NO rows (never a partial list)", () => {
     const snap = buildInventorySnapshot({
       agents: { ok: false, records: [], reason: "profile could not be read" },

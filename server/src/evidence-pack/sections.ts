@@ -1356,8 +1356,9 @@ function anchorConfirmationLines(
       preamble +
         " Checked against the transparency checkpoint bundle above, an auditor " +
         "can confirm those checkpoints were publicly anchored (freshness and " +
-        "fork detection). The in-pack offline anchor check found no unverified " +
-        "or invalid anchored receipt in the bundled evidence.",
+        "fork detection). The in-pack offline anchor check found only " +
+        "log-key verified anchored receipts in the bundled evidence and no " +
+        "anchor findings.",
       "",
     ];
   }

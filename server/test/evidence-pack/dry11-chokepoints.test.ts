@@ -680,13 +680,14 @@ describe("D11 X-2: the anchor arm never claims confirmation the pack cannot supp
     expect(text).toContain("bundle is NOT included");
   });
 
-  it("makes the confirmation claim when the bundled receipt is offline-checkable", () => {
+  it("prints a caveat when the bundled receipt is internally consistent but lacks a pinned log key", () => {
     const fixture = anchorFixture();
     const pack = packWith(populated(fixture.transparency), populated(fixture.anchor));
     const text = reportText(pack);
-    expect(text).toContain("can confirm those checkpoints were publicly anchored");
-    expect(text).not.toContain("does NOT let an auditor confirm");
-    expect(text).toContain("found no unverified or invalid anchored receipt");
+    expect(text).not.toContain("can confirm those checkpoints were publicly anchored");
+    expect(text).toContain("do NOT let an auditor confirm public anchoring offline");
+    expect(text).toContain("0 log-key verified receipt(s), 1 internally consistent receipt(s)");
+    expect(text).toContain("they do not support an offline public-anchoring confirmation");
   });
 
   it("prints a caveat when a bundled receipt is partial and unverified", () => {

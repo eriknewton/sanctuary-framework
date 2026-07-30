@@ -118,7 +118,7 @@ export function evaluateAnchorOfflineConfirmation(input: {
 
   const result = verifyAnchorEvidence(records, anchorsDoc, {});
   const view = {
-    confirmable_receipts: result.coverage.verified + result.coverage.consistent,
+    confirmable_receipts: result.coverage.verified,
     verified_receipts: result.coverage.verified,
     consistent_receipts: result.coverage.consistent,
     unverified_receipts: result.coverage.unverified,
@@ -129,16 +129,20 @@ export function evaluateAnchorOfflineConfirmation(input: {
     log_signature_basis: result.coverage.log_signature_basis,
   };
   const confirmable =
-    view.confirmable_receipts > 0 &&
+    view.log_signature_basis === "pinned-rekor-key" &&
+    view.verified_receipts > 0 &&
+    view.consistent_receipts === 0 &&
     view.unverified_receipts === 0 &&
     view.invalid_receipts === 0 &&
+    view.anchor_failed_receipts === 0 &&
+    view.unanchored_checkpoints === 0 &&
     view.findings === 0;
   if (confirmable) {
     return {
       status: "confirmable",
       ...view,
       detail:
-        "the offline anchor verifier found no unverified or invalid anchored receipt in the bundled evidence",
+        "the offline anchor verifier found only log-key verified anchored receipts in the bundled evidence and no anchor findings",
     };
   }
   return {
