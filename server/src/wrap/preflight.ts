@@ -208,10 +208,11 @@ const PROVIDERS: ProviderDefinition[] = [
     label: "Google Gemini",
     envNames: ["GEMINI_API_KEY", "GOOGLE_API_KEY"],
     buildRequest: (credential) => ({
-      url: `https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(
-        credential,
-      )}`,
-      request: { method: "GET" },
+      url: "https://generativelanguage.googleapis.com/v1beta/models",
+      request: {
+        method: "GET",
+        headers: { "x-goog-api-key": credential },
+      },
     }),
   },
   {

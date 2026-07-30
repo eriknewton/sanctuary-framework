@@ -283,6 +283,37 @@ describe("protect preflight", () => {
     );
   });
 
+  it("sends Gemini preflight credentials in the x-goog-api-key header, not the URL", async () => {
+    const requests: Array<{ url: string; request: ProviderHttpRequest }> = [];
+    const report = await runProtectPreflight({
+      ops: fixtureOps({
+        env: baseEnv({
+          VENICE_API_KEY: "",
+          GEMINI_API_KEY: "gemini-secret",
+          GOOGLE_API_KEY: "",
+        }),
+        fetch: async (url, request) => {
+          requests.push({ url, request });
+          return { status: 200 };
+        },
+      }),
+    });
+
+    expect(row(report, "provider_liveness")).toMatchObject({
+      status: "PASS",
+      state: "all_configured_providers_live",
+    });
+    expect(requests).toEqual([
+      {
+        url: "https://generativelanguage.googleapis.com/v1beta/models",
+        request: {
+          method: "GET",
+          headers: { "x-goog-api-key": "gemini-secret" },
+        },
+      },
+    ]);
+  });
+
   it("reports UNDETERMINED instead of passing by omission when probes cannot establish facts", async () => {
     const report = await runProtectPreflight({
       ops: fixtureOps({
