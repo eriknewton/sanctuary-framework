@@ -79,6 +79,14 @@ import {
   GENERIC_UID_CONFINEMENT_REMEDY,
 } from "../egress-gate/operator-advice.js";
 import {
+  readEnforcementAvailabilityStatus,
+  isFreshEnforcementAvailabilityStatus,
+} from "../castle-wall/runtime/enforcement-availability-status.js";
+import {
+  DEFAULT_ENFORCEMENT_FRESHNESS_MS,
+  ENFORCEMENT_FUTURE_SKEW_MS,
+} from "../principal-policy/posture.js";
+import {
   CASTLE_WALL_AUDIT_PROVENANCE_KEY,
   CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
   CASTLE_WALL_RELOAD_CLIENT_TIMEOUT_MS,
@@ -342,16 +350,11 @@ function formatDeadManLeaseStatus(
   const ttl = lease.ttl_seconds === null ? "none (--no-ttl)" : `${lease.ttl_seconds}s`;
   const filter =
     contentFilterState === null ? "" : `; content-filter=${contentFilterState}`;
-  // The lease line is a liveness signal for the dead-man BROADCAST, not an
-  // enforcement verdict - enforcement is the live content-filter state above.
-  // When the filter is disabled, the word "armed" can mislead a skimmer into
-  // reading it as "protected". In that case make the advisory nature explicit
-  // so the line cannot be mistaken for enforcement (audit-D F5).
-  const enforcementActive = contentFilterState === "enabled";
-  const label =
-    lease.armed && !enforcementActive
-      ? "Dead-man lease (advisory broadcast, not enforcement): armed"
-      : `Dead-man lease broadcast: ${lease.armed ? "armed" : "disarmed"}`;
+  // The lease line is a liveness signal for the dead-man BROADCAST, not proof
+  // that the provider received the arm lease and not an enforcement verdict.
+  const label = `Dead-man lease broadcast (advisory, not proof provider received it): ${
+    lease.armed ? "armed" : "disarmed"
+  }`;
   return (
     `${label}` +
     `${filter}; ttl=${ttl}; heartbeat=${lease.heartbeat_interval_seconds}s; updated=${lease.updated_at}\n`
@@ -1438,6 +1441,20 @@ export async function runStatus(
       );
     }
   }
+  const enforcementAvailability =
+    await readEnforcementAvailabilityStatus(storagePath);
+  if (
+    isFreshEnforcementAvailabilityStatus(enforcementAvailability, {
+      now: Date.now(),
+      freshnessWindowMs: DEFAULT_ENFORCEMENT_FRESHNESS_MS,
+      futureSkewMs: ENFORCEMENT_FUTURE_SKEW_MS,
+    })
+  ) {
+    write(
+      out,
+      "Enforcement availability: unavailable (manifest present, arm lease absent; agents are denied fail-closed until the wall is re-armed)\n",
+    );
+  }
   const lease = await readLeaseStatus(storagePath);
   if (lease) {
     write(out, formatDeadManLeaseStatus(lease, contentFilterState));
@@ -1944,11 +1961,13 @@ export async function runDaemon(
  *      distinguishable from a full interactive/login bring-up in the audit
  *      stream.
  *
- * The wall still enforces: the system extension recovers + verifies the
- * persisted last-valid signed manifest against the pinned PUBLIC key (no secret
- * needed), and absent a manifest classifies every flow `.agent` and denies.
- * Full operation (approvals that touch fortress state, the master-key audit
- * log) resumes when the operator logs in and starts the full daemon.
+ * The wall must fail closed when safe mode cannot deliver a usable arm lease:
+ * the system extension recovers + verifies the persisted last-valid signed
+ * manifest against the pinned PUBLIC key (no secret needed), and a provider
+ * diagnostic of manifest-present / arm-lease-absent is surfaced as
+ * `enforcement_unavailable` rather than silently presenting as armed.
+ * Full operation (approvals that touch fortress state, the master-key audit log)
+ * resumes when the operator logs in and starts the full daemon.
  *
  * HANDOFF (#450 item 4 - de-scoped, no automatic supersede): this boot daemon
  * is a ROOT launchd KeepAlive unit. The full operator daemon runs unprivileged
@@ -2111,7 +2130,7 @@ export async function runSafeModeDaemon(
   );
   write(
     out,
-    "Agents denied by default; persisted signed manifest enforced if present. Full operation resumes at first login.\n",
+    "Agents denied fail-closed if the extension reports manifest present with no arm lease; status surfaces report enforcement_unavailable. Full operation resumes at first login.\n",
   );
 
   // Unified Protect Slice 5 S5-6: the exclusive-egress BOOT release sequence

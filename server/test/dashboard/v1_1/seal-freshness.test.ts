@@ -271,6 +271,26 @@ describe("v1.1 dashboard seal freshness", () => {
     expect(seal.freshness.inline).toBe("no evidence");
   });
 
+  it("labels enforcement_unavailable distinctly in the dashboard seal evidence copy", () => {
+    vi.spyOn(Date, "now").mockReturnValue(now);
+    const harness = liftSealHarness();
+    harness.state.posture.data = {
+      live_enforcement: {
+        castle_wall_arm_state: "degraded",
+        evidence_basis: "enforcement_unavailable",
+        last_enforcement_evidence_at: null,
+        freshness_window_ms: DEFAULT_ENFORCEMENT_FRESHNESS_MS,
+      },
+    };
+
+    const seal = harness.deriveSeal();
+
+    expect(seal.word).toBe("Attention");
+    expect(seal.freshness.what).toBe(
+      "Enforcement unavailable: manifest loaded, arm lease missing",
+    );
+  });
+
   it("unparseable enforcement timestamp with armed payload does not render Protected", () => {
     vi.spyOn(Date, "now").mockReturnValue(now);
     const harness = liftSealHarness();

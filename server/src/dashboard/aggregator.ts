@@ -23,9 +23,15 @@ import type { BaselineTracker } from "../principal-policy/baseline.js";
 import type { PrincipalPolicy } from "../principal-policy/types.js";
 import {
   buildCastleWallPosture,
+  DEFAULT_ENFORCEMENT_FRESHNESS_MS,
+  ENFORCEMENT_FUTURE_SKEW_MS,
   type CastleWallArmState,
   type ExclusiveEgressStatus,
 } from "../principal-policy/posture.js";
+import {
+  isFreshEnforcementAvailabilityStatus,
+  type EnforcementAvailabilityStatusFile,
+} from "../castle-wall/runtime/enforcement-availability-status.js";
 import type { ReputationEvidence } from "../shr/generator.js";
 import { deriveReputationDegradations } from "../shr/generator.js";
 import type { SHRDegradation } from "../shr/types.js";
@@ -225,6 +231,11 @@ export interface AggregatorSources {
   resolveBrokerPinnedProducerKey?: () => string | null;
   /** Broker liveness producer key exists or is expected but could not be read. */
   brokerProducerKeyExpectedButUnavailable?: boolean;
+  /** Fresh local extension diagnostic fallback; non-green evidence only. */
+  resolveEnforcementAvailabilityStatus?: () =>
+    | EnforcementAvailabilityStatusFile
+    | null
+    | Promise<EnforcementAvailabilityStatusFile | null>;
   /**
    * Unified Protect Slice 5 S5-P: resolve the exclusive-egress posture for the
    * wall reader. MUST already be fail-closed (the dashboard's resolver maps a
@@ -831,7 +842,25 @@ export async function getProtectionSnapshot(
   // closed to amber), and an expected-but-unreadable key forces non-green rather
   // than silently dropping to the weaker channel basis. Mirrors the
   // posture-routes / dispatchPosture wiring.
-  let wallArmState: CastleWallArmState = "unknown";
+  let enforcementAvailabilityStatus: EnforcementAvailabilityStatusFile | null = null;
+  try {
+    enforcementAvailabilityStatus = sources.resolveEnforcementAvailabilityStatus
+      ? await sources.resolveEnforcementAvailabilityStatus()
+      : null;
+  } catch {
+    enforcementAvailabilityStatus = null;
+  }
+  const unavailableIsFresh = isFreshEnforcementAvailabilityStatus(
+    enforcementAvailabilityStatus,
+    {
+      now: Date.now(),
+      freshnessWindowMs: DEFAULT_ENFORCEMENT_FRESHNESS_MS,
+      futureSkewMs: ENFORCEMENT_FUTURE_SKEW_MS,
+    },
+  );
+  let wallArmState: CastleWallArmState = unavailableIsFresh
+    ? "degraded"
+    : "unknown";
   if (sources.auditLog) {
     try {
       const pinnedProducerKeyB64url = sources.resolvePinnedProducerKey
@@ -871,11 +900,14 @@ export async function getProtectionSnapshot(
             : {}),
           ...(exclusiveEgress !== null ? { exclusiveEgress } : {}),
           protectionClaimSubject,
+          ...(enforcementAvailabilityStatus !== null
+            ? { enforcementAvailabilityStatus }
+            : {}),
         }),
       );
       wallArmState = wall.arm_state;
     } catch {
-      wallArmState = "unknown";
+      wallArmState = unavailableIsFresh ? "degraded" : "unknown";
     }
   }
 

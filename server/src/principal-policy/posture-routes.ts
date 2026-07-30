@@ -95,6 +95,7 @@ import {
   handlePostureStream,
   type PostureStreamRegistry,
 } from "./posture-stream.js";
+import type { EnforcementAvailabilityStatusFile } from "../castle-wall/runtime/enforcement-availability-status.js";
 // `PostureHome` lives in a neutral type module so `posture-stream.ts` can import
 // the payload shape without closing a `posture-routes` <-> `posture-stream`
 // cycle (this module imports the stream handler above).
@@ -246,6 +247,15 @@ export interface PostureRouteDeps {
    */
   resolveProtectionClaimSubject?: () => string | null | Promise<string | null>;
   /**
+   * Fresh local extension diagnostic fallback. This lets safe-mode diagnostics
+   * written before master-key unlock degrade/fault every status surface after
+   * login without treating the local file as green evidence.
+   */
+  resolveEnforcementAvailabilityStatus?: () =>
+    | EnforcementAvailabilityStatusFile
+    | null
+    | Promise<EnforcementAvailabilityStatusFile | null>;
+  /**
    * Shared active-stream registry for the SSE live-refresh endpoint
    * (`/api/posture/stream`). Supplied by the dashboard so the concurrency cap is
    * enforced across all open streams on the server. When ABSENT, the stream
@@ -314,6 +324,17 @@ async function resolveProtectionClaimSubject(
   if (!deps.resolveProtectionClaimSubject) return null;
   try {
     return await deps.resolveProtectionClaimSubject();
+  } catch {
+    return null;
+  }
+}
+
+async function resolveEnforcementAvailabilityStatus(
+  deps: PostureRouteDeps,
+): Promise<EnforcementAvailabilityStatusFile | null> {
+  if (!deps.resolveEnforcementAvailabilityStatus) return null;
+  try {
+    return await deps.resolveEnforcementAvailabilityStatus();
   } catch {
     return null;
   }
@@ -660,6 +681,7 @@ async function buildWallPosture(
    */
   preResolvedExclusiveEgress?: ExclusiveEgressStatus | null,
   preResolvedProtectionClaimSubject?: string | null,
+  preResolvedEnforcementAvailabilityStatus?: EnforcementAvailabilityStatusFile | null,
 ): Promise<CastleWallPosture> {
   // S5-P: resolve the exclusive-egress posture BEFORE the eager read scope so
   // the provider (which may read its own state surfaces) never nests inside the
@@ -672,6 +694,10 @@ async function buildWallPosture(
     preResolvedProtectionClaimSubject !== undefined
       ? preResolvedProtectionClaimSubject
       : await resolveProtectionClaimSubject(deps);
+  const enforcementAvailabilityStatus =
+    preResolvedEnforcementAvailabilityStatus !== undefined
+      ? preResolvedEnforcementAvailabilityStatus
+      : await resolveEnforcementAvailabilityStatus(deps);
   return (deps.auditLog as AuditLog).runEagerReads(() =>
     buildCastleWallPosture({
       auditLog: deps.auditLog as AuditLog,
@@ -686,6 +712,9 @@ async function buildWallPosture(
         : {}),
       ...(exclusiveEgress !== null ? { exclusiveEgress } : {}),
       protectionClaimSubject,
+      ...(enforcementAvailabilityStatus !== null
+        ? { enforcementAvailabilityStatus }
+        : {}),
     }),
   );
 }
@@ -744,6 +773,7 @@ async function buildFeatureHealth(
    */
   preResolvedExclusiveEgress?: ExclusiveEgressStatus | null,
   preResolvedProtectionClaimSubject?: string | null,
+  preResolvedEnforcementAvailabilityStatus?: EnforcementAvailabilityStatusFile | null,
 ): Promise<FeatureHealthPanel> {
   // S5-P: same fail-closed resolve as the wall posture, so the
   // `castle_wall_egress` row and the banner cap green identically.
@@ -755,6 +785,10 @@ async function buildFeatureHealth(
     preResolvedProtectionClaimSubject !== undefined
       ? preResolvedProtectionClaimSubject
       : await resolveProtectionClaimSubject(deps);
+  const enforcementAvailabilityStatus =
+    preResolvedEnforcementAvailabilityStatus !== undefined
+      ? preResolvedEnforcementAvailabilityStatus
+      : await resolveEnforcementAvailabilityStatus(deps);
   return (deps.auditLog as AuditLog).runEagerReads(() =>
     buildFeatureHealthPanel({
       auditLog: deps.auditLog as AuditLog,
@@ -764,6 +798,9 @@ async function buildFeatureHealth(
       includePluginRows: true,
       ...(exclusiveEgress !== null ? { exclusiveEgress } : {}),
       protectionClaimSubject,
+      ...(enforcementAvailabilityStatus !== null
+        ? { enforcementAvailabilityStatus }
+        : {}),
       ...(deps.now ? { now: deps.now() } : {}),
       pinnedProducerKeyB64url: deps.resolvePinnedProducerKey
         ? deps.resolvePinnedProducerKey()
@@ -1038,12 +1075,24 @@ async function buildHome(deps: PostureRouteDeps): Promise<PostureHome> {
   // (feature-health row) still rendered green from a second, luckier read.
   const exclusiveEgress = await resolveExclusiveEgress(deps);
   const protectionClaimSubject = await resolveProtectionClaimSubject(deps);
+  const enforcementAvailabilityStatus =
+    await resolveEnforcementAvailabilityStatus(deps);
   const [castleWall, digest, unwrapped, featureHealth, custodyExit, federation] =
     await Promise.all([
-      buildWallPosture(deps, exclusiveEgress, protectionClaimSubject),
+      buildWallPosture(
+        deps,
+        exclusiveEgress,
+        protectionClaimSubject,
+        enforcementAvailabilityStatus,
+      ),
       buildDigest(deps, protectionClaimSubject),
       buildUnwrapped(deps),
-      buildFeatureHealth(deps, exclusiveEgress, protectionClaimSubject),
+      buildFeatureHealth(
+        deps,
+        exclusiveEgress,
+        protectionClaimSubject,
+        enforcementAvailabilityStatus,
+      ),
       buildCustodyExit(deps),
       buildFederationSummary(deps),
     ]);

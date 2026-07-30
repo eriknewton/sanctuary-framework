@@ -128,6 +128,12 @@ import {
   fortressIdFromProtectionSubject,
   type ProtectionSubjectMatchMode,
 } from "../castle-wall/subject-binding.js";
+import {
+  enforcementAvailabilityStatusTimeMs,
+  isEnforcementUnavailableProviderUnboundDetails,
+  isFreshEnforcementAvailabilityStatus,
+  type EnforcementAvailabilityStatusFile,
+} from "../castle-wall/runtime/enforcement-availability-status.js";
 
 /**
  * Liveness-op set for the broker daemon's process-liveness heartbeat (Option C).
@@ -356,6 +362,7 @@ export type FeatureHealthBasis =
   | "fresh_enforcement_evidence"
   | "activity_in_window"
   | "fault_evidence"
+  | "enforcement_unavailable"
   | "stale_evidence"
   | "no_evidence_self_reporting"
   // Observability Slice 2: NO fresh enforcement evidence AND a FRESH liveness
@@ -925,6 +932,11 @@ export interface BuildFeatureHealthInput {
    */
   protectionClaimSubject: string | null;
   /**
+   * Fresh local extension diagnostic fallback. Only the Castle Wall row consumes
+   * this, and only as non-green fault evidence.
+   */
+  enforcementAvailabilityStatus?: EnforcementAvailabilityStatusFile | null;
+  /**
    * Match mode for Castle Wall evidence. Default is exact per-agent subject
    * matching. The only production caller that widens this is the coarse-wall
    * probe, which names `fortress_scoped` because the coarse wall is a
@@ -1053,6 +1065,8 @@ export function evaluateFeatureHealth(args: {
         preCanonicalLinuxAgentName: boolean;
         /** True when the claim subject could not be resolved at all. */
         subjectUnresolvable: boolean;
+        /** Provider has a manifest but no arm lease; non-green only. */
+        enforcementUnavailable: boolean;
       }
     | null => {
     if (entry.layer !== feature.layer) return null;
@@ -1224,6 +1238,10 @@ export function evaluateFeatureHealth(args: {
       legacyMacOSAuditToken,
       preCanonicalLinuxAgentName,
       subjectUnresolvable,
+      enforcementUnavailable:
+        isFault &&
+        op === "provider_unbound" &&
+        isEnforcementUnavailableProviderUnboundDetails(entry.details),
     };
   };
 
@@ -1314,6 +1332,7 @@ export function evaluateFeatureHealth(args: {
   // freshness-window facts.
   let latestFreshInvocationMs: number | null = null;
   let latestFreshFaultMs: number | null = null;
+  let latestFreshEnforcementUnavailableMs: number | null = null;
   let latestFreshSubjectRejectedInvocationMs: number | null = null;
   let latestFreshLegacyMacOSAuditTokenInvocationMs: number | null = null;
   let latestFreshPreCanonicalLinuxAgentNameInvocationMs: number | null = null;
@@ -1374,6 +1393,13 @@ export function evaluateFeatureHealth(args: {
     }
     if (
       c.isFault &&
+      c.enforcementUnavailable &&
+      (latestFreshEnforcementUnavailableMs === null ||
+        c.ts > latestFreshEnforcementUnavailableMs)
+    ) {
+      latestFreshEnforcementUnavailableMs = c.ts;
+    } else if (
+      c.isFault &&
       (latestFreshFaultMs === null || c.ts > latestFreshFaultMs)
     ) {
       latestFreshFaultMs = c.ts;
@@ -1431,7 +1457,14 @@ export function evaluateFeatureHealth(args: {
     const intentionallyStoodDown =
       latestStandDownMs !== null &&
       (latestHeartbeatMs === null || latestStandDownMs >= latestHeartbeatMs);
-    if (latestFreshFaultMs !== null) {
+    if (
+      latestFreshEnforcementUnavailableMs !== null &&
+      (latestFreshInvocationMs === null ||
+        latestFreshEnforcementUnavailableMs >= latestFreshInvocationMs)
+    ) {
+      status = "fault";
+      basis = "enforcement_unavailable";
+    } else if (latestFreshFaultMs !== null) {
       // Fault precedence: a fresh fault renders the feature `fault` even when
       // fresh enforcement evidence (or a fresh heartbeat) co-occurs in the window
       // (a wall that crashed/unbound after adjudicating is degraded, not
@@ -1848,6 +1881,34 @@ export async function buildFeatureHealthPanel(
     freshnessEntries = [];
     freshnessComplete = false;
     integrityOk = false;
+  }
+
+  if (
+    isFreshEnforcementAvailabilityStatus(input.enforcementAvailabilityStatus, {
+      now,
+      freshnessWindowMs,
+      futureSkewMs: ENFORCEMENT_FUTURE_SKEW_MS,
+    })
+  ) {
+    const ts = enforcementAvailabilityStatusTimeMs(
+      input.enforcementAvailabilityStatus,
+    );
+    if (ts !== null) {
+      const unavailableEntry: AuditEntry = {
+        timestamp: new Date(ts).toISOString(),
+        layer: "l1",
+        operation: "provider_unbound",
+        identity_id: input.originMachine,
+        result: "failure",
+        details: {
+          manifest_received: true,
+          arm_lease_received: false,
+          [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
+        },
+      };
+      entries.push(unavailableEntry);
+      freshnessEntries.push(unavailableEntry);
+    }
   }
 
   // Slice P fail-honest: a producer key is expected but the reader could not

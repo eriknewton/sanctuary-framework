@@ -382,9 +382,67 @@ describe("castle-wall CLI verbs", () => {
       expect(code).toBe(0);
       expect(out.text()).toContain("Content filter: enabled");
       expect(out.text()).toContain(
-        "Dead-man lease broadcast: disarmed; content-filter=enabled; ttl=none (--no-ttl); heartbeat=5s; updated=2026-06-26T08:00:00.000Z",
+        "Dead-man lease broadcast (advisory, not proof provider received it): disarmed; content-filter=enabled; ttl=none (--no-ttl); heartbeat=5s; updated=2026-06-26T08:00:00.000Z",
       );
       expect(out.text()).not.toContain("Dead-man lease: disarmed");
+    });
+
+    it("prints enforcement_unavailable even when the advisory lease file says armed", async () => {
+      const { fortressPath, hostAppPath } = await makeDarwinFixture();
+      await writeFile(
+        join(fortressPath, "castle-wall-enforcement-status.json"),
+        JSON.stringify(
+          {
+            state: "enforcement_unavailable",
+            reason: "manifest_present_arm_lease_missing",
+            updated_at: new Date().toISOString(),
+            source: "macos_extension_provider_unbound",
+            manifest_received: true,
+            arm_lease_received: false,
+          },
+          null,
+          2,
+        ) + "\n",
+      );
+      await writeFile(
+        join(fortressPath, "castle-wall-lease.json"),
+        JSON.stringify(
+          {
+            armed: true,
+            ttl_seconds: null,
+            heartbeat_interval_seconds: 5,
+            updated_at: "2026-06-26T08:00:00.000Z",
+            source: "castle-wall-cli",
+          },
+          null,
+          2,
+        ) + "\n",
+      );
+      const out = new CaptureStream();
+      const { invoke } = statusInvoker({
+        stdout:
+          JSON.stringify({ ok: true, action: "status", state: "enabled" }) +
+          "\n",
+        exitCode: 0,
+      });
+
+      const code = await runStatus({
+        out,
+        env: { SANCTUARY_STORAGE_PATH: fortressPath },
+        platform: "darwin",
+        execSyncFn: () =>
+          "com.sanctuary.castle-wall [activated enabled] (state: enabled)",
+        hostAppCandidates: [hostAppPath],
+        hostAppInvoke: invoke,
+      });
+
+      expect(code).toBe(0);
+      expect(out.text()).toContain(
+        "Enforcement availability: unavailable (manifest present, arm lease absent; agents are denied fail-closed until the wall is re-armed)",
+      );
+      expect(out.text()).toContain(
+        "Dead-man lease broadcast (advisory, not proof provider received it): armed",
+      );
     });
 
     it("reports the filter disabled (sysext installed but not filtering)", async () => {

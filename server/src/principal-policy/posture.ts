@@ -73,6 +73,12 @@ import {
   castleWallEvidenceMatchesProtectionSubject,
   fortressIdFromProtectionSubject,
 } from "../castle-wall/subject-binding.js";
+import {
+  enforcementAvailabilityStatusTimeMs,
+  isEnforcementUnavailableProviderUnboundDetails,
+  isFreshEnforcementAvailabilityStatus,
+  type EnforcementAvailabilityStatusFile,
+} from "../castle-wall/runtime/enforcement-availability-status.js";
 
 // Re-export the S5-P exclusive-egress posture surface for posture consumers
 // (routes, dashboard, CLI) so they import the wall-posture module they already
@@ -277,6 +283,7 @@ export interface CastleWallPosture {
     | "legacy_macos_audit_token"
     | "pre_canonical_linux_agent_name"
     | "subject_unresolvable"
+    | "enforcement_unavailable"
     // Slice P: a producer key is expected but the reader could not load it, so
     // the wall is reported `degraded` rather than green on a weaker basis.
     | "producer_key_unavailable";
@@ -384,6 +391,12 @@ export interface BuildCastleWallPostureInput {
    * `pre_canonical_linux_agent_name`. None is green.
    */
   protectionClaimSubject: string | null;
+  /**
+   * Fresh local extension diagnostic fallback. This can only move the wall in a
+   * non-green direction (`degraded`/`enforcement_unavailable`); it is never
+   * interpreted as arm evidence.
+   */
+  enforcementAvailabilityStatus?: EnforcementAvailabilityStatusFile | null;
 }
 
 /**
@@ -410,6 +423,16 @@ function applyExclusiveEgress(
     ...(capped ? { arm_state: "coarse_only" as const } : {}),
     exclusive_egress: exclusiveEgress,
   };
+}
+
+function isEnforcementUnavailableEntry(
+  operation: string,
+  details: unknown,
+): boolean {
+  return (
+    operation === "provider_unbound" &&
+    isEnforcementUnavailableProviderUnboundDetails(details)
+  );
 }
 
 /**
@@ -517,6 +540,7 @@ export async function buildCastleWallPosture(
   };
   let latestEnforcementMs: number | null = null;
   let latestNotEnforcingMs: number | null = null;
+  let latestEnforcementUnavailableMs: number | null = null;
   let latestHeartbeatMs: number | null = null;
   let latestFreshHeartbeatMs: number | null = null;
   let latestStandDownMs: number | null = null;
@@ -531,6 +555,21 @@ export async function buildCastleWallPosture(
   // Dedup of re-verified producer-signed tuples so a copied genuine entry counts
   // at most once toward verdict_counts (codex round-4 HIGH: duplicate replay).
   const seenSignedKeys = new Set<string>();
+  if (
+    isFreshEnforcementAvailabilityStatus(input.enforcementAvailabilityStatus, {
+      now,
+      freshnessWindowMs,
+      futureSkewMs: ENFORCEMENT_FUTURE_SKEW_MS,
+    })
+  ) {
+    const localUnavailableMs = enforcementAvailabilityStatusTimeMs(
+      input.enforcementAvailabilityStatus,
+    );
+    if (localUnavailableMs !== null) {
+      latestNotEnforcingMs = localUnavailableMs;
+      latestEnforcementUnavailableMs = localUnavailableMs;
+    }
+  }
 
   for (const entry of entries) {
     const op = entry.operation;
@@ -688,6 +727,13 @@ export async function buildCastleWallPosture(
       if (latestNotEnforcingMs === null || armTs > latestNotEnforcingMs) {
         latestNotEnforcingMs = armTs;
       }
+      if (
+        isEnforcementUnavailableEntry(op, entry.details) &&
+        (latestEnforcementUnavailableMs === null ||
+          armTs > latestEnforcementUnavailableMs)
+      ) {
+        latestEnforcementUnavailableMs = armTs;
+      }
     }
     if ((isLiveness || isStandDown) && tsValidForArm) {
       if (!livenessEntryCounts(reResult.basis)) continue;
@@ -755,7 +801,11 @@ export async function buildCastleWallPosture(
     (latestEnforcementMs === null || latestNotEnforcingMs >= latestEnforcementMs)
   ) {
     armState = "degraded";
-    basis = "not_enforcing_evidence";
+    basis =
+      latestEnforcementUnavailableMs !== null &&
+      latestEnforcementUnavailableMs === latestNotEnforcingMs
+        ? "enforcement_unavailable"
+        : "not_enforcing_evidence";
   } else if (hasFreshEnforcement && hasNewerStandDown) {
     armState = "unknown";
     basis = "intentionally_stopped";

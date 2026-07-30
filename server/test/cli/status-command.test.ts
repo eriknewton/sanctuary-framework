@@ -317,6 +317,19 @@ describe("renderTable castle-wall line", () => {
     const line = table.split("\n").find((l) => l.includes("castle wall:"));
     expect(line).toContain("castle wall:  unknown");
   });
+
+  it("renders enforcement_unavailable as a loud reason line, not bare degraded only", () => {
+    const table = renderTable({
+      castle_wall: {
+        arm_state: "degraded",
+        evidence_basis: "enforcement_unavailable",
+      },
+    });
+    expect(table).toContain("castle wall:  degraded");
+    expect(table).toContain(
+      "castle wall reason: enforcement_unavailable (manifest loaded, arm lease missing)",
+    );
+  });
 });
 
 describe("toYaml", () => {

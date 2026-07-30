@@ -54,6 +54,11 @@ import {
   type CriticalEventEnvelope,
 } from "./audit-consumer.js";
 import { protectionSubjectFromMacOSAuditToken } from "../subject-binding.js";
+import {
+  buildEnforcementUnavailableStatusFile,
+  isEnforcementUnavailableProviderUnboundDetails,
+  type EnforcementAvailabilityStatusFile,
+} from "./enforcement-availability-status.js";
 
 /** The runtime's view of a registered macOS subscriber. */
 export interface MacOSSubscriber {
@@ -104,6 +109,12 @@ export interface MacOSFlowEventStats {
   pendingApprovalsRejected: number;
 }
 
+export interface MacOSEnforcementAvailabilitySink {
+  recordUnavailable(
+    status: EnforcementAvailabilityStatusFile,
+  ): Promise<void> | void;
+}
+
 /** Constructor input. */
 export interface MacOSFlowEventConsumerInput {
   manifestProvider: MacOSManifestProvider;
@@ -139,6 +150,13 @@ export interface MacOSFlowEventConsumerInput {
    * watchdog's tick timer and loud outputs; this consumer only feeds it.
    */
   emissionLiveness?: EmissionLivenessNotes;
+  /**
+   * Best-effort local status sink for extension diagnostics that prove the
+   * provider has a manifest but no arm lease. This is intentionally non-green
+   * evidence only; failures are reported to stderr but must not block the audit
+   * append path.
+   */
+  enforcementAvailabilitySink?: MacOSEnforcementAvailabilitySink;
 }
 
 /**
@@ -155,6 +173,7 @@ export class MacOSFlowEventConsumer {
   private readonly defaultApprovalTimeoutSeconds: number;
   private readonly producerAuditConsumer: AuditConsumer | null;
   private readonly emissionLiveness: EmissionLivenessNotes | null;
+  private readonly enforcementAvailabilitySink: MacOSEnforcementAvailabilitySink | null;
   private stats: MacOSFlowEventStats = {
     subscribers: 0,
     manifestSnapshotsEmitted: 0,
@@ -173,6 +192,8 @@ export class MacOSFlowEventConsumer {
     this.fortressId = resolveMacOSFlowFortressId(input);
     this.defaultApprovalTimeoutSeconds = input.defaultApprovalTimeoutSeconds;
     this.emissionLiveness = input.emissionLiveness ?? null;
+    this.enforcementAvailabilitySink =
+      input.enforcementAvailabilitySink ?? null;
     this.producerAuditConsumer =
       typeof input.pinnedProducerKeyB64url === "string" &&
       input.pinnedProducerKeyB64url.length > 0
@@ -444,10 +465,29 @@ export class MacOSFlowEventConsumer {
       {
         ...event.details,
         timestamp: event.timestamp,
+        [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
       },
       "failure"
     );
     await this.auditSink.flush();
+    if (
+      isEnforcementUnavailableProviderUnboundDetails(event.details) &&
+      this.enforcementAvailabilitySink !== null
+    ) {
+      try {
+        await this.enforcementAvailabilitySink.recordUnavailable(
+          buildEnforcementUnavailableStatusFile(event.timestamp),
+        );
+      } catch (error) {
+        // SAFETY: stderr is the operator channel for a failed local diagnostic
+        // write; the accepted provider_unbound audit event was already flushed.
+        console.error(
+          `[castle-wall] failed to persist enforcement_unavailable diagnostic: ${
+            error instanceof Error ? error.message : String(error)
+          }`
+        );
+      }
+    }
     this.stats.extensionDiagnosticsRecorded += 1;
   }
 

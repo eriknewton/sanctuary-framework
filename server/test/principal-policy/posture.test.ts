@@ -158,6 +158,83 @@ describe("G4 — Castle Wall posture (enforcement-evidenced)", () => {
     expect(posture.verdict_counts.allowed).toBe(1);
   });
 
+  it("renders DEGRADED with enforcement_unavailable for manifest-present arm-lease-absent diagnostics", async () => {
+    const { log } = newAuditLog();
+    const now = Date.now();
+    await log.appendCritical({
+      layer: "l1",
+      operation: "provider_unbound",
+      identity_id: FORTRESS,
+      result: "failure",
+      details: {
+        manifest_received: true,
+        arm_lease_received: false,
+        cw_source: "castle_wall_audit_consumer",
+      },
+      timestamp: new Date(now - 60_000).toISOString(),
+    });
+
+    const posture = await buildCastleWallPosture({
+      protectionClaimSubject: CLAIM_SUBJECT,
+      auditLog: log,
+      originMachine: FORTRESS,
+      platform: "darwin",
+      now,
+    });
+
+    expect(posture.arm_state).toBe("degraded");
+    expect(posture.evidence_basis).toBe("enforcement_unavailable");
+  });
+
+  it("renders DEGRADED from a fresh local enforcement_unavailable fallback when the audit log lacks the safe-mode entry", async () => {
+    const { log } = newAuditLog();
+    const now = Date.now();
+
+    const posture = await buildCastleWallPosture({
+      protectionClaimSubject: CLAIM_SUBJECT,
+      auditLog: log,
+      originMachine: FORTRESS,
+      platform: "darwin",
+      now,
+      enforcementAvailabilityStatus: {
+        state: "enforcement_unavailable",
+        reason: "manifest_present_arm_lease_missing",
+        updated_at: new Date(now - 60_000).toISOString(),
+        source: "macos_extension_provider_unbound",
+        manifest_received: true,
+        arm_lease_received: false,
+      },
+    });
+
+    expect(posture.arm_state).toBe("degraded");
+    expect(posture.evidence_basis).toBe("enforcement_unavailable");
+  });
+
+  it("lets newer live adjudication recover over an older local enforcement_unavailable fallback", async () => {
+    const { log } = newAuditLog();
+    const now = Date.now();
+    await appendCW(log, "egress_allowed", new Date(now - 30_000).toISOString());
+
+    const posture = await buildCastleWallPosture({
+      protectionClaimSubject: CLAIM_SUBJECT,
+      auditLog: log,
+      originMachine: FORTRESS,
+      platform: "darwin",
+      now,
+      enforcementAvailabilityStatus: {
+        state: "enforcement_unavailable",
+        reason: "manifest_present_arm_lease_missing",
+        updated_at: new Date(now - 90_000).toISOString(),
+        source: "macos_extension_provider_unbound",
+        manifest_received: true,
+        arm_lease_received: false,
+      },
+    });
+
+    expect(posture.arm_state).toBe("armed");
+    expect(posture.evidence_basis).toBe("fresh_enforcement_evidence");
+  });
+
   it("does NOT render armed when the only evidence is stale (older than the freshness window)", async () => {
     const { log } = newAuditLog();
     const now = Date.now();

@@ -171,6 +171,11 @@ export function renderTable(status: Record<string, unknown>): string {
     `  identity:     ${identity ? `${str(identity.label)} (${str(identity.did)})` : "none"}`,
     `  castle wall:  ${str(castleWall?.arm_state)}`,
   ];
+  if (castleWall?.evidence_basis === "enforcement_unavailable") {
+    lines.push(
+      "  castle wall reason: enforcement_unavailable (manifest loaded, arm lease missing)",
+    );
+  }
   // S5-P (design section 6): the exclusive-egress posture is a first-class
   // status line on this surface whenever a fine-grained agent is provisioned.
   // `coarse_only` above is the DISTINCT non-green arm-state; this line carries

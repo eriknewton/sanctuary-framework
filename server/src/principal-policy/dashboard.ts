@@ -109,12 +109,18 @@ import {
 import {
   buildCastleWallPosture,
   DEFAULT_ENFORCEMENT_FRESHNESS_MS,
+  ENFORCEMENT_FUTURE_SKEW_MS,
   mapPlatform,
   failedExclusiveEgressStatus,
   type CastleWallPosture,
   type ExclusiveEgressStatus,
 } from "./posture.js";
 import { resolveProtectionSubjectFromFortressPath } from "../castle-wall/subject-binding.js";
+import {
+  isFreshEnforcementAvailabilityStatus,
+  readEnforcementAvailabilityStatus,
+  type EnforcementAvailabilityStatusFile,
+} from "../castle-wall/runtime/enforcement-availability-status.js";
 import {
   createPostureStreamRegistry,
   type PostureStreamRegistry,
@@ -1394,6 +1400,8 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     // notification - the ratified tight fault-class set is unchanged).
     const exclusiveEgress = await this.resolveExclusiveEgressPosture();
     const protectionClaimSubject = await this.resolveProtectionClaimSubject();
+    const enforcementAvailabilityStatus =
+      await this.resolveEnforcementAvailabilityStatus();
     return auditLog.runEagerReads(() =>
       buildFeatureHealthPanel({
         auditLog,
@@ -1411,6 +1419,9 @@ export class DashboardApprovalChannel implements ApprovalChannel {
           : {}),
         ...(exclusiveEgress !== null ? { exclusiveEgress } : {}),
         protectionClaimSubject,
+        ...(enforcementAvailabilityStatus !== null
+          ? { enforcementAvailabilityStatus }
+          : {}),
       }),
     );
   }
@@ -1798,6 +1809,8 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         brokerLoad?.status === "unreadable",
       resolveProtectionClaimSubject: () =>
         this.resolveProtectionClaimSubject(),
+      resolveEnforcementAvailabilityStatus: () =>
+        this.resolveEnforcementAvailabilityStatus(),
       // Wire the shared registry so the SSE live-refresh stream is available and
       // its concurrency cap is enforced server-wide. The stream reuses `buildHome`
       // (no new data, no new green paths) on a cadence plus a heartbeat.
@@ -1963,6 +1976,28 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       this.v11Bindings?.fortressId ??
       this.identityManager?.getPrimaryIdentityId() ??
       "local";
+    const enforcementAvailabilityStatus =
+      await this.resolveEnforcementAvailabilityStatus();
+    const unavailableIsFresh = isFreshEnforcementAvailabilityStatus(
+      enforcementAvailabilityStatus,
+      {
+        now: Date.now(),
+        freshnessWindowMs: DEFAULT_ENFORCEMENT_FRESHNESS_MS,
+        futureSkewMs: ENFORCEMENT_FUTURE_SKEW_MS,
+      },
+    );
+    const unavailablePosture = (): CastleWallPosture => ({
+      origin_machine: originMachine,
+      arm_state: "degraded",
+      platform: mapPlatform(process.platform),
+      evidence_basis: "enforcement_unavailable",
+      last_enforcement_evidence_at: null,
+      freshness_window_ms: DEFAULT_ENFORCEMENT_FRESHNESS_MS,
+      verdict_counts: { allowed: 0, blocked: 0, operator_decisions: 0 },
+      audit_integrity_ok: true,
+      sealed_region_unverified_at_privilege: false,
+      producer_authenticity: "not_applicable",
+    });
     try {
       // Reuse the same producer-key load + audit log + origin attribution the
       // posture dispatcher uses, so the two surfaces can never diverge on green.
@@ -1971,6 +2006,9 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       if (this.auditLog === null) {
         // No unlocked audit log ⇒ no enforcement evidence to read. Honest
         // `unknown` (amber), never green, never a fabricated placeholder.
+        if (unavailableIsFresh) {
+          return unavailablePosture();
+        }
         return {
           origin_machine: originMachine,
           arm_state: "unknown",
@@ -2017,9 +2055,15 @@ export class DashboardApprovalChannel implements ApprovalChannel {
             : {}),
           ...(exclusiveEgress !== null ? { exclusiveEgress } : {}),
           protectionClaimSubject,
+          ...(enforcementAvailabilityStatus !== null
+            ? { enforcementAvailabilityStatus }
+            : {}),
         }),
       );
     } catch {
+      if (unavailableIsFresh) {
+        return unavailablePosture();
+      }
       // Defensive: a health probe must never fail. Fall back to an honest
       // `unknown` posture rather than throwing or claiming green.
       return {
@@ -2321,6 +2365,12 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       storagePath,
       fortressId,
     )).subject;
+  }
+
+  private async resolveEnforcementAvailabilityStatus(): Promise<EnforcementAvailabilityStatusFile | null> {
+    const storagePath = this._sanctuaryConfig?.storage_path;
+    if (storagePath === undefined || storagePath.length === 0) return null;
+    return await readEnforcementAvailabilityStatus(storagePath);
   }
 
   /**
@@ -7186,6 +7236,8 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       // (via the ONE canonical shaper) caps green identically.
       resolveExclusiveEgressPosture: () => this.resolveExclusiveEgressPosture(),
       resolveProtectionClaimSubject: () => this.resolveProtectionClaimSubject(),
+      resolveEnforcementAvailabilityStatus: () =>
+        this.resolveEnforcementAvailabilityStatus(),
       pendingApprovals: Array.from(this.pending.values()).map((p) => ({
         id: p.id,
         operation: p.request.operation,

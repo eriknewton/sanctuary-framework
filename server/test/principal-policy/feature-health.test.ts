@@ -178,6 +178,83 @@ describe("feature-health panel — the four mandatory color assertions", () => {
     expect(cw.basis).toBe("fault_evidence");
   });
 
+  it("labels manifest-present arm-lease-absent Castle Wall faults as enforcement_unavailable", async () => {
+    const { log } = newAuditLog();
+    const now = Date.now();
+    await log.appendCritical({
+      layer: "l1",
+      operation: "provider_unbound",
+      identity_id: FORTRESS,
+      result: "failure",
+      details: {
+        manifest_received: true,
+        arm_lease_received: false,
+        cw_source: "castle_wall_audit_consumer",
+      },
+      timestamp: new Date(now - 60_000).toISOString(),
+    });
+
+    const panel = await buildFeatureHealthPanel({
+      protectionClaimSubject: FORTRESS,
+      auditLog: log,
+      originMachine: FORTRESS,
+      now,
+    });
+
+    const cw = row(panel, "castle_wall_egress");
+    expect(cw.status).toBe("fault");
+    expect(cw.basis).toBe("enforcement_unavailable");
+  });
+
+  it("labels Castle Wall fault from the local enforcement_unavailable fallback when the audit log lacks the safe-mode entry", async () => {
+    const { log } = newAuditLog();
+    const now = Date.now();
+
+    const panel = await buildFeatureHealthPanel({
+      protectionClaimSubject: FORTRESS,
+      auditLog: log,
+      originMachine: FORTRESS,
+      now,
+      enforcementAvailabilityStatus: {
+        state: "enforcement_unavailable",
+        reason: "manifest_present_arm_lease_missing",
+        updated_at: new Date(now - 60_000).toISOString(),
+        source: "macos_extension_provider_unbound",
+        manifest_received: true,
+        arm_lease_received: false,
+      },
+    });
+
+    const cw = row(panel, "castle_wall_egress");
+    expect(cw.status).toBe("fault");
+    expect(cw.basis).toBe("enforcement_unavailable");
+  });
+
+  it("lets newer live Castle Wall adjudication recover over an older local enforcement_unavailable fallback", async () => {
+    const { log } = newAuditLog();
+    const now = Date.now();
+    await appendCW(log, "egress_allowed", new Date(now - 30_000).toISOString());
+
+    const panel = await buildFeatureHealthPanel({
+      protectionClaimSubject: FORTRESS,
+      auditLog: log,
+      originMachine: FORTRESS,
+      now,
+      enforcementAvailabilityStatus: {
+        state: "enforcement_unavailable",
+        reason: "manifest_present_arm_lease_missing",
+        updated_at: new Date(now - 90_000).toISOString(),
+        source: "macos_extension_provider_unbound",
+        manifest_received: true,
+        arm_lease_received: false,
+      },
+    });
+
+    const cw = row(panel, "castle_wall_egress");
+    expect(cw.status).toBe("active");
+    expect(cw.basis).toBe("fresh_enforcement_evidence");
+  });
+
   it("(c) integrity-taint forces unknown for EVERY feature, even with fresh evidence present", () => {
     // Drive the pure evaluator with integrityOk=false and a fresh invocation:
     // it must still render unknown (a tainted read can never render green/red).

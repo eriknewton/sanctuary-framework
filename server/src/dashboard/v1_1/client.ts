@@ -3146,6 +3146,8 @@ function sealEvidenceWhat(live) {
       return "Castle Wall enforcement";
     case "not_enforcing_evidence":
       return "not enforcing";
+    case "enforcement_unavailable":
+      return "Enforcement unavailable: manifest loaded, arm lease missing";
     case "intentionally_stopped":
       return "intentional stand-down";
     case "daemon_liveness_unconfirmed":

@@ -36,6 +36,7 @@ import {
   validateFlowDecisionRecorded,
   validateFlowPendingApproval,
   type AuditSink,
+  type MacOSEnforcementAvailabilitySink,
   type MacOSApprovalQueue,
   type MacOSManifestProvider,
   type MacOSSubscriber,
@@ -181,6 +182,7 @@ function buildConsumer(args?: {
   pinnedProducerKeyB64url?: string | null;
   now?: () => number;
   fortressId?: string;
+  enforcementAvailabilitySink?: MacOSEnforcementAvailabilitySink;
 }) {
   const auditSinkBundle = makeAuditSink();
   const queueBundle = makeApprovalQueue();
@@ -196,6 +198,9 @@ function buildConsumer(args?: {
     pinnedProducerKeyB64url: args?.pinnedProducerKeyB64url ?? null,
     ...(args?.fortressId ? { fortressId: args.fortressId } : {}),
     ...(args?.now ? { now: args.now } : {}),
+    ...(args?.enforcementAvailabilitySink
+      ? { enforcementAvailabilitySink: args.enforcementAvailabilitySink }
+      : {}),
   });
   return { consumer, auditSinkBundle, queueBundle, manifestProvider };
 }
@@ -1038,8 +1043,58 @@ describe("MacOSFlowEventConsumer : extension diagnostics", () => {
       arm_lease_received: false,
       timestamp: "2026-06-11T00:00:00.000Z",
     });
+    expect(
+      auditSinkBundle.entries[0]?.details?.[CASTLE_WALL_AUDIT_PROVENANCE_KEY],
+    ).toBe(CASTLE_WALL_AUDIT_PROVENANCE_VALUE);
     expect(consumer.getStats().extensionDiagnosticsRecorded).toBe(1);
     expect(consumer.getStats().extensionDiagnosticsRejected).toBe(0);
+  });
+
+  it("records enforcement_unavailable status for manifest-present arm-lease-absent diagnostics", async () => {
+    const statuses: unknown[] = [];
+    const { consumer, auditSinkBundle } = buildConsumer({
+      enforcementAvailabilitySink: {
+        recordUnavailable(status) {
+          statuses.push(status);
+        },
+      },
+    });
+    const notification: AuditEmitNotification = {
+      type: "audit_emit",
+      event: {
+        schema_version: 1,
+        layer: "l1",
+        timestamp: "2026-06-11T00:00:00.000Z",
+        fortress_id: "fortress-test",
+        event_type: "provider_unbound",
+        agent: null,
+        destination: null,
+        decision: null,
+        rule_id: null,
+        details: {
+          source: "macos_extension",
+          trigger: "verdict",
+          manifest_received: true,
+          arm_lease_received: false,
+        },
+      },
+    };
+
+    await consumer.handleAuditEmit(notification);
+
+    expect(statuses).toEqual([
+      {
+        state: "enforcement_unavailable",
+        reason: "manifest_present_arm_lease_missing",
+        updated_at: "2026-06-11T00:00:00.000Z",
+        source: "macos_extension_provider_unbound",
+        manifest_received: true,
+        arm_lease_received: false,
+      },
+    ]);
+    expect(
+      auditSinkBundle.entries[0]?.details?.[CASTLE_WALL_AUDIT_PROVENANCE_KEY],
+    ).toBe(CASTLE_WALL_AUDIT_PROVENANCE_VALUE);
   });
 
   it("rejects non-provider extension audit events", async () => {
