@@ -3,12 +3,13 @@ import { AuditLog } from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import {
-  buildFeatureHealthPanel,
+  buildFeatureHealthPanel as buildFeatureHealthPanelRaw,
   evaluateFeatureHealth,
   assertExpectationFloorsWellFormed,
   SLICE1_FEATURE_REGISTRY,
   FEATURE_FAULT_CLASS_RULES,
   CASTLE_WALL_LIVE_ADJUDICATION_OPERATIONS,
+  type BuildFeatureHealthInput,
   type FeatureHealthRow,
   type FeatureRegistryEntry,
 } from "../../src/principal-policy/feature-health.js";
@@ -17,6 +18,10 @@ import type { AuditEntry } from "../../src/operational/audit-log.js";
 import { protectionSubjectForUid } from "../../src/castle-wall/subject-binding.js";
 
 const FORTRESS = "fortress:test";
+
+function buildFeatureHealthPanel(input: BuildFeatureHealthInput) {
+  return buildFeatureHealthPanelRaw({ platform: "linux", ...input });
+}
 
 function newAuditLog(): { log: AuditLog } {
   const storage = new MemoryStorage();

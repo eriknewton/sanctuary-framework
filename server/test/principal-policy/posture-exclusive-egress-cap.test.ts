@@ -45,6 +45,7 @@ import {
   resolveProtectionSubjectFromFortressPath,
   type ProtectionSubjectResolutionStatus,
 } from "../../src/castle-wall/subject-binding.js";
+import type { ResolvedEnforcementAvailability } from "../../src/castle-wall/runtime/enforcement-availability.js";
 
 const FORTRESS = "fortress:test";
 
@@ -72,6 +73,16 @@ function subjectForUid(uid: number): string {
   const subject = protectionSubjectForUid(FORTRESS, uid);
   if (subject === null) throw new Error("test subject could not be derived");
   return subject;
+}
+
+function liveAvailability(): ResolvedEnforcementAvailability {
+  return {
+    status: "live",
+    reason: "ok",
+    observed_at: new Date().toISOString(),
+    freshness_window_ms: 30_000,
+    active_connection_count: 1,
+  };
 }
 
 /** A summary in which the one fine-grained agent's exclusive stack is DOWN. */
@@ -119,7 +130,7 @@ describe("S5-P: buildCastleWallPosture aggregate-green cap (the one chokepoint)"
       protectionClaimSubject: subjectForUid(601),
       auditLog: log,
       originMachine: FORTRESS,
-      platform: "darwin",
+      platform: "linux",
       now,
       exclusiveEgress: coarseOnlyStatus(),
     });
@@ -142,7 +153,7 @@ describe("S5-P: buildCastleWallPosture aggregate-green cap (the one chokepoint)"
       protectionClaimSubject: subjectForUid(601),
       auditLog: log,
       originMachine: FORTRESS,
-      platform: "darwin",
+      platform: "linux",
       now,
       exclusiveEgress: exclusiveLiveStatus(),
     });
@@ -158,7 +169,7 @@ describe("S5-P: buildCastleWallPosture aggregate-green cap (the one chokepoint)"
       protectionClaimSubject: subjectForUid(601),
       auditLog: log,
       originMachine: FORTRESS,
-      platform: "darwin",
+      platform: "linux",
       now,
     });
     expect(posture.arm_state).toBe("armed");
@@ -177,7 +188,7 @@ describe("S5-P: buildCastleWallPosture aggregate-green cap (the one chokepoint)"
     const posture = await buildCastleWallPosture({
       auditLog: log,
       originMachine: FORTRESS,
-      platform: "darwin",
+      platform: "linux",
       now,
       protectionClaimSubject: subjectForUid(601),
     });
@@ -197,7 +208,7 @@ describe("S5-P: buildCastleWallPosture aggregate-green cap (the one chokepoint)"
     const posture = await buildCastleWallPosture({
       auditLog: log,
       originMachine: FORTRESS,
-      platform: "darwin",
+      platform: "linux",
       now,
       protectionClaimSubject: subjectForUid(601),
     });
@@ -211,7 +222,7 @@ describe("S5-P: buildCastleWallPosture aggregate-green cap (the one chokepoint)"
       protectionClaimSubject: subjectForUid(601),
       auditLog: log,
       originMachine: FORTRESS,
-      platform: "darwin",
+      platform: "linux",
       now: Date.now(),
       exclusiveEgress: coarseOnlyStatus(),
     });
@@ -228,7 +239,7 @@ describe("S5-P: buildCastleWallPosture aggregate-green cap (the one chokepoint)"
       protectionClaimSubject: subjectForUid(601),
       auditLog: log,
       originMachine: FORTRESS,
-      platform: "darwin",
+      platform: "linux",
       now,
       exclusiveEgress: failedExclusiveEgressStatus("provider exploded"),
     });
@@ -248,6 +259,7 @@ describe("S5-P: castle_wall_egress feature-health row caps to the distinct coars
       protectionClaimSubject: subjectForUid(601),
       auditLog: log,
       originMachine: FORTRESS,
+      platform: "linux",
       now,
       exclusiveEgress: coarseOnlyStatus(),
     });
@@ -269,6 +281,7 @@ describe("S5-P: castle_wall_egress feature-health row caps to the distinct coars
       protectionClaimSubject: subjectForUid(601),
       auditLog: log,
       originMachine: FORTRESS,
+      platform: "linux",
       now,
       exclusiveEgress: exclusiveLiveStatus(),
     });
@@ -410,7 +423,7 @@ describe("B2: unresolved protection subjects fail closed on every green surface"
         const posture = await buildCastleWallPosture({
           auditLog: log,
           originMachine: FORTRESS,
-          platform: "darwin",
+          platform: "linux",
           now,
           protectionClaimSubject: resolution.subject,
         });
@@ -420,6 +433,7 @@ describe("B2: unresolved protection subjects fail closed on every green surface"
         const panel = await buildFeatureHealthPanel({
           auditLog: log,
           originMachine: FORTRESS,
+          platform: "linux",
           now,
           protectionClaimSubject: resolution.subject,
         });
@@ -566,7 +580,7 @@ describe("S5-P: single-resolve BLOCKER fix + fail-closed provider semantics", ()
       auditLog: log,
       originMachine: FORTRESS,
       listAgents: () => [],
-      platform: "darwin" as const,
+      platform: "linux" as const,
       resolveProtectionClaimSubject: () => subjectForUid(601),
       // Would-be intermittent: cap on the 1st call, throw on any 2nd. A
       // per-builder resolve (the bug) would call this TWICE and diverge; the
@@ -612,7 +626,7 @@ describe("S5-P: single-resolve BLOCKER fix + fail-closed provider semantics", ()
       auditLog: log,
       originMachine: FORTRESS,
       listAgents: () => [],
-      platform: "darwin" as const,
+      platform: "linux" as const,
       resolveProtectionClaimSubject: () => subjectForUid(601),
       exclusiveEgressPosture: () => {
         throw new Error("provider exploded");
@@ -648,7 +662,7 @@ describe("S5-P: single-resolve BLOCKER fix + fail-closed provider semantics", ()
       protectionClaimSubject: subjectForUid(601),
       auditLog: log,
       originMachine: FORTRESS,
-      platform: "darwin",
+      platform: "linux",
       now,
       exclusiveEgress: null,
     });
@@ -674,7 +688,7 @@ describe("S5-P: single-resolve BLOCKER fix + fail-closed provider semantics", ()
       auditLog: log,
       originMachine: FORTRESS,
       listAgents: () => [],
-      platform: "darwin" as const,
+      platform: "linux" as const,
       now: () => now,
       resolveProtectionClaimSubject: () => subjectForUid(601),
     };
@@ -799,7 +813,10 @@ describe("S5-P: wrap first-run banner requires the capped protection claim", () 
       log,
       storagePath,
       async () => coarseOnlyStatus(),
-      { protectionClaimSubject: subjectForUid(601) },
+      {
+        protectionClaimSubject: subjectForUid(601),
+        enforcementAvailability: liveAvailability(),
+      },
     );
     expect(claim.state).toBe("coarse-only");
   });

@@ -24,6 +24,7 @@ import {
 } from "./server.js";
 import type { ApprovalHandlers } from "./api.js";
 import type { FleetRoster } from "../principal-policy/fleet-roster.js";
+import type { ResolvedEnforcementAvailability } from "../castle-wall/runtime/enforcement-availability.js";
 
 export { getProtectionSnapshot } from "./aggregator.js";
 export { renderDashboardHTML, HERO_COPY } from "./html.js";
@@ -107,6 +108,12 @@ export interface StartDashboardOptions {
   brokerProducerKeyExpectedButUnavailable?: boolean;
   /** Canonical confined-agent protection subject (`fortress/uid-N`). */
   resolveProtectionClaimSubject?: () => string | null | Promise<string | null>;
+  /** Node platform for Castle Wall surface shaping; defaults to the host. */
+  platform?: NodeJS.Platform;
+  /** macOS v3 level-triggered enforcement availability resolver. */
+  resolveEnforcementAvailability?: () =>
+    | Promise<ResolvedEnforcementAvailability>
+    | ResolvedEnforcementAvailability;
   /**
    * Read-only fleet-roster provider (wrap "Protect" dashboard). Forwarded to the
    * dashboard server, where it feeds both `GET /api/fleet/roster` and the
@@ -162,6 +169,10 @@ export async function startDashboard(
       : {}),
     ...(options.resolveProtectionClaimSubject
       ? { resolveProtectionClaimSubject: options.resolveProtectionClaimSubject }
+      : {}),
+    ...(options.platform !== undefined ? { platform: options.platform } : {}),
+    ...(options.resolveEnforcementAvailability
+      ? { resolveEnforcementAvailability: options.resolveEnforcementAvailability }
       : {}),
     activity,
     pendingApprovals: pending,

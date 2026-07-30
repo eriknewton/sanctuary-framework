@@ -82,6 +82,12 @@ import {
 import { startDashboard, type DashboardHandle } from "../dashboard/index.js";
 import { buildWrapFleetRosterProvider } from "./fleet-roster-provider.js";
 import {
+  DEFAULT_ENFORCEMENT_AVAILABILITY_FRESHNESS_MS,
+  queryMacOSEnforcementAvailability,
+  type ResolvedEnforcementAvailability,
+} from "../castle-wall/runtime/enforcement-availability.js";
+import { resolveCastleWallSocketPath } from "../castle-wall/runtime/socket-path.js";
+import {
   runAutoProvisionForWrap,
   type AutoProvisionSummary,
 } from "./auto-provision.js";
@@ -1330,11 +1336,15 @@ export type DashboardStarter = (opts: {
  * packet-filter state at the print instant.
  */
 type CastleWallFeatureProbeInput =
-  | { purpose: "coarse-wall" }
+  | {
+      purpose: "coarse-wall";
+      enforcementAvailability?: ResolvedEnforcementAvailability | null;
+    }
   | {
       purpose: "protection-claim";
       exclusiveEgress: ExclusiveEgressStatus | null;
       protectionClaimSubject: string | null;
+      enforcementAvailability?: ResolvedEnforcementAvailability | null;
     };
 
 type CastleWallFeatureProbeResult = {
@@ -1606,12 +1616,20 @@ async function readCastleWallEgressFeatureStatus(
     "../castle-wall/runtime/producer-signature.js"
   );
   const keyLoad = await loadFortressProducerKey(storagePath);
+  const enforcementAvailability =
+    input.enforcementAvailability !== undefined
+      ? input.enforcementAvailability
+      : platform() === "darwin"
+      ? await resolveWrapEnforcementAvailability(storagePath)
+      : null;
   // Eager-read scope: same one-verified-view discipline as the dashboard
   // callers of buildFeatureHealthPanel (H4 chokepoint).
   const panel = await auditLog.runEagerReads(() =>
     buildFeatureHealthPanel({
       auditLog,
       originMachine: fortressIdFromStoragePath(storagePath),
+      platform: process.platform,
+      ...(enforcementAvailability !== null ? { enforcementAvailability } : {}),
       pinnedProducerKeyB64url:
         keyLoad.status === "present" ? keyLoad.keyB64url : null,
       ...(keyLoad.status === "unreadable"
@@ -1639,6 +1657,28 @@ async function readCastleWallEgressFeatureStatus(
   return { status: row?.status, basis: row?.basis };
 }
 
+async function resolveWrapEnforcementAvailability(
+  storagePath: string,
+): Promise<ResolvedEnforcementAvailability> {
+  try {
+    const socketPath = resolveCastleWallSocketPath({
+      platform: "darwin",
+      fortressPath: storagePath,
+    }).path;
+    return await queryMacOSEnforcementAvailability(socketPath);
+  } catch (error) {
+    return {
+      status: "undetermined",
+      reason: `availability_query_failed:${
+        error instanceof Error ? error.message : String(error)
+      }`,
+      observed_at: null,
+      freshness_window_ms: DEFAULT_ENFORCEMENT_AVAILABILITY_FRESHNESS_MS,
+      active_connection_count: 0,
+    };
+  }
+}
+
 /**
  * Coarse-wall evidence probe for callers that are building the exclusive-
  * egress provider itself. It deliberately does NOT render protection prose:
@@ -1648,11 +1688,13 @@ async function readCastleWallEgressFeatureStatus(
 export async function probeCoarseCastleWallEnforcementObserved(
   auditLog: WrapAuditEvidenceReader,
   storagePath: string,
+  enforcementAvailability?: ResolvedEnforcementAvailability | null,
 ): Promise<boolean> {
   try {
     return (
       (await readCastleWallEgressFeatureStatus(auditLog, storagePath, {
         purpose: "coarse-wall",
+        enforcementAvailability,
       })).status === "active"
     );
   } catch {
@@ -1818,6 +1860,7 @@ export async function probeCastleWallProtectionClaim(
   options: {
     providerTimeoutMs?: number;
     protectionClaimSubject?: string | null;
+    enforcementAvailability?: ResolvedEnforcementAvailability | null;
   } = {},
 ): Promise<ProtectionStateClaim> {
   let exclusiveEgress: ExclusiveEgressStatus | null;
@@ -1844,6 +1887,7 @@ export async function probeCastleWallProtectionClaim(
         purpose: "protection-claim",
         exclusiveEgress,
         protectionClaimSubject: options.protectionClaimSubject ?? null,
+        enforcementAvailability: options.enforcementAvailability,
       },
     );
     return protectionStateClaimFromObservation(
@@ -2095,6 +2139,7 @@ export async function resolveWrapProtectionClaim(input: {
   storagePath: string;
   providerTimeoutMs?: number;
   resolveExclusiveEgress?: () => Promise<ExclusiveEgressStatus | null>;
+  enforcementAvailability?: ResolvedEnforcementAvailability | null;
 }): Promise<ProtectionStateClaim> {
   const autoProvisionClaim = protectionClaimFromAutoProvisionSummary(
     input.autoProvisionSummary,
@@ -2178,6 +2223,7 @@ export async function resolveWrapProtectionClaim(input: {
     {
       providerTimeoutMs: input.providerTimeoutMs,
       protectionClaimSubject,
+      enforcementAvailability: input.enforcementAvailability,
     },
   );
   return applyAutoProvisionCeiling(probedClaim, autoProvisionCeiling);
@@ -4208,6 +4254,9 @@ export async function runWrap(
         mode: opts.mode,
         authToken: opts.authToken,
         serverVersion: opts.serverVersion,
+        platform: process.platform,
+        resolveEnforcementAvailability: () =>
+          resolveWrapEnforcementAvailability(storagePath),
         ...(wrapFleetRoster ? { fleetRoster: wrapFleetRoster } : {}),
       }));
   // Multi-tenancy: honour SANCTUARY_DASHBOARD_PORT so two wraps can pick
@@ -4321,6 +4370,9 @@ export async function runWrap(
               storagePath,
               fortressIdFromStoragePath(storagePath),
             ).then((result) => result.subject),
+          platform: process.platform,
+          resolveEnforcementAvailability: () =>
+            resolveWrapEnforcementAvailability(storagePath),
         });
       } catch {
         // Never let the producer-key probe fail wrap. On any unexpected throw the

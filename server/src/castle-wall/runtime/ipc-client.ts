@@ -18,6 +18,7 @@ import { frame, parseFrame } from "../ipc/framing.js";
 import type {
   AuditDrainResponse,
   CastleWallMessage,
+  EnforcementAvailabilityResponse,
   HandshakeChallenge,
   HandshakeResponse,
   IpcRequestId,
@@ -134,6 +135,17 @@ export class IpcClient {
     };
     const envelope = wrapEnvelope("audit_drain_request", params);
     return await this.send<AuditDrainResponse>(requestId, envelope);
+  }
+
+  /** Query daemon-cached extension-origin enforcement availability. */
+  async enforcementAvailabilityRequest(): Promise<EnforcementAvailabilityResponse> {
+    const requestId = this.options.generateNonceHex();
+    const params: CastleWallMessage = {
+      type: "enforcement_availability_request",
+      request_id: requestId,
+    };
+    const envelope = wrapEnvelope("enforcement_availability_request", params);
+    return await this.send<EnforcementAvailabilityResponse>(requestId, envelope);
   }
 
   /**
@@ -374,6 +386,8 @@ function expectedReplyType(requestType: string): string {
       return "policy_reload_response";
     case "audit_drain_request":
       return "audit_drain_response";
+    case "enforcement_availability_request":
+      return "enforcement_availability_response";
     default:
       return requestType;
   }

@@ -152,6 +152,7 @@ function badgeRead(reader: AuditLog, now?: number) {
       protectionClaimSubject: FORTRESS,
       auditLog: reader,
       originMachine: FORTRESS,
+      platform: "linux",
       pinnedProducerKeyB64url: null,
       ...(now !== undefined ? { now } : {}),
     }),

@@ -133,7 +133,7 @@ describe("G4 — Castle Wall posture (enforcement-evidenced)", () => {
       protectionClaimSubject: CLAIM_SUBJECT,
       auditLog: log,
       originMachine: FORTRESS,
-      platform: "darwin",
+      platform: "linux",
       now: Date.now(),
     });
     expect(posture.arm_state).toBe("unknown");
@@ -150,7 +150,7 @@ describe("G4 — Castle Wall posture (enforcement-evidenced)", () => {
       protectionClaimSubject: CLAIM_SUBJECT,
       auditLog: log,
       originMachine: FORTRESS,
-      platform: "darwin",
+      platform: "linux",
       now,
     });
     expect(posture.arm_state).toBe("armed");
@@ -167,7 +167,7 @@ describe("G4 — Castle Wall posture (enforcement-evidenced)", () => {
       protectionClaimSubject: CLAIM_SUBJECT,
       auditLog: log,
       originMachine: FORTRESS,
-      platform: "darwin",
+      platform: "linux",
       now,
     });
     expect(posture.arm_state).toBe("unknown");
@@ -185,7 +185,7 @@ describe("G4 — Castle Wall posture (enforcement-evidenced)", () => {
       protectionClaimSubject: CLAIM_SUBJECT,
       auditLog: log,
       originMachine: FORTRESS,
-      platform: "darwin",
+      platform: "linux",
       now,
     });
     expect(posture.arm_state).toBe("unknown");
@@ -200,7 +200,7 @@ describe("G4 — Castle Wall posture (enforcement-evidenced)", () => {
       protectionClaimSubject: CLAIM_SUBJECT,
       auditLog: log,
       originMachine: FORTRESS,
-      platform: "darwin",
+      platform: "linux",
       now,
     });
     expect(posture.arm_state).toBe("unknown");
@@ -217,7 +217,7 @@ describe("G4 — Castle Wall posture (enforcement-evidenced)", () => {
       protectionClaimSubject: CLAIM_SUBJECT,
       auditLog: log,
       originMachine: FORTRESS,
-      platform: "darwin",
+      platform: "linux",
       now,
     });
     expect(posture.arm_state).toBe("unknown");
@@ -234,7 +234,7 @@ describe("G4 — Castle Wall posture (enforcement-evidenced)", () => {
       protectionClaimSubject: CLAIM_SUBJECT,
       auditLog: log,
       originMachine: FORTRESS,
-      platform: "darwin",
+      platform: "linux",
       now,
       // No pinnedProducerKeyB64url: the NO-KEY / macOS-floor / channel basis.
     });
@@ -251,7 +251,7 @@ describe("G4 — Castle Wall posture (enforcement-evidenced)", () => {
       protectionClaimSubject: CLAIM_SUBJECT,
       auditLog: log,
       originMachine: FORTRESS,
-      platform: "darwin",
+      platform: "linux",
       now,
       // A pinned key is configured: policy_loaded was already not arm-eligible
       // here via Slice R (it re-verifies as channel basis); assert it stays so
@@ -273,7 +273,7 @@ describe("G4 — Castle Wall posture (enforcement-evidenced)", () => {
       protectionClaimSubject: CLAIM_SUBJECT,
       auditLog: log,
       originMachine: FORTRESS,
-      platform: "darwin",
+      platform: "linux",
       now,
     });
     expect(posture.arm_state).toBe("armed");
@@ -297,7 +297,7 @@ describe("G4 — Castle Wall posture (enforcement-evidenced)", () => {
       protectionClaimSubject: CLAIM_SUBJECT,
       auditLog: log,
       originMachine: FORTRESS,
-      platform: "darwin",
+      platform: "linux",
       now,
     });
     expect(posture.arm_state).toBe("unknown");
@@ -352,7 +352,7 @@ describe("G4 — Castle Wall posture (enforcement-evidenced)", () => {
       protectionClaimSubject: CLAIM_SUBJECT,
       auditLog: log,
       originMachine: FORTRESS,
-      platform: "darwin",
+      platform: "linux",
       now,
     });
     expect(posture.arm_state).toBe("degraded");
@@ -368,7 +368,7 @@ describe("G4 — Castle Wall posture (enforcement-evidenced)", () => {
       protectionClaimSubject: CLAIM_SUBJECT,
       auditLog: log,
       originMachine: FORTRESS,
-      platform: "darwin",
+      platform: "linux",
       now,
     });
     expect(posture.arm_state).toBe("armed");
@@ -383,7 +383,7 @@ describe("G4 — Castle Wall posture (enforcement-evidenced)", () => {
       protectionClaimSubject: CLAIM_SUBJECT,
       auditLog: log,
       originMachine: FORTRESS,
-      platform: "darwin",
+      platform: "linux",
       now,
     });
     expect(posture.arm_state).toBe("degraded");
@@ -400,7 +400,7 @@ describe("G4 — Castle Wall posture (enforcement-evidenced)", () => {
       protectionClaimSubject: CLAIM_SUBJECT,
       auditLog: log,
       originMachine: FORTRESS,
-      platform: "darwin",
+      platform: "linux",
       now,
     });
     expect(posture.arm_state).toBe("unknown");
@@ -421,7 +421,7 @@ describe("G4 — Castle Wall posture (enforcement-evidenced)", () => {
       protectionClaimSubject: CLAIM_SUBJECT,
       auditLog: log,
       originMachine: FORTRESS,
-      platform: "darwin",
+      platform: "linux",
       now,
     });
     expect(posture.arm_state).toBe("unknown");
@@ -437,7 +437,7 @@ describe("G4 — Castle Wall posture (enforcement-evidenced)", () => {
       protectionClaimSubject: CLAIM_SUBJECT,
       auditLog: log,
       originMachine: FORTRESS,
-      platform: "darwin",
+      platform: "linux",
       now,
     });
     expect(posture.arm_state).toBe("unknown");
@@ -470,7 +470,7 @@ describe("G4 — Castle Wall posture (enforcement-evidenced)", () => {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       auditLog: taintedLog as any,
       originMachine: FORTRESS,
-      platform: "darwin",
+      platform: "linux",
       now,
     });
     expect(posture.arm_state).toBe("unknown");

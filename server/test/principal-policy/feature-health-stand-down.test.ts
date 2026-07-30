@@ -40,7 +40,8 @@ import { AuditLog } from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import {
-  buildFeatureHealthPanel,
+  buildFeatureHealthPanel as buildFeatureHealthPanelRaw,
+  type BuildFeatureHealthInput,
   type FeatureHealthRow,
 } from "../../src/principal-policy/feature-health.js";
 import {
@@ -79,6 +80,10 @@ function toB64url(bytes: Uint8Array): string {
 
 const daemonPriv = ed25519.utils.randomPrivateKey();
 const daemonPubB64 = toB64url(ed25519.getPublicKey(daemonPriv));
+
+function buildFeatureHealthPanel(input: BuildFeatureHealthInput) {
+  return buildFeatureHealthPanelRaw({ platform: "linux", ...input });
+}
 
 function newLog(): AuditLog {
   return new AuditLog(new MemoryStorage(), generateRandomKey());

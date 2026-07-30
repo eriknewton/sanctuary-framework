@@ -124,6 +124,10 @@ import {
   type ExclusiveEgressStatus,
 } from "../egress-gate/posture.js";
 import {
+  DEFAULT_ENFORCEMENT_AVAILABILITY_FRESHNESS_MS,
+  type ResolvedEnforcementAvailability,
+} from "../castle-wall/runtime/enforcement-availability.js";
+import {
   castleWallEvidenceMatchesProtectionSubject,
   fortressIdFromProtectionSubject,
   type ProtectionSubjectMatchMode,
@@ -609,6 +613,8 @@ export interface FeatureHealthRow {
   audit_integrity_ok: boolean;
   /** Freshness window (ms) used to judge "recent" for self-reporting features. */
   freshness_window_ms: number;
+  /** macOS v3 extension-origin availability verdict, when queried. */
+  enforcement_availability?: ResolvedEnforcementAvailability;
 }
 
 /**
@@ -931,6 +937,10 @@ export interface BuildFeatureHealthInput {
    * machine-wide fortress property, not a per-agent protection claim.
    */
   protectionSubjectMatchMode?: ProtectionSubjectMatchMode;
+  /** Node platform; macOS Castle Wall green is availability-report-gated. */
+  platform?: NodeJS.Platform;
+  /** macOS v3 level-triggered availability verdict for Castle Wall. */
+  enforcementAvailability?: ResolvedEnforcementAvailability | null;
 }
 
 /**
@@ -1888,7 +1898,7 @@ export async function buildFeatureHealthPanel(
       now,
       windowMs,
     );
-    const row = evaluateFeatureHealth({
+    let row = evaluateFeatureHealth({
       feature,
       entries: inWindow,
       freshnessEntries: inFreshness,
@@ -1908,6 +1918,47 @@ export async function buildFeatureHealthPanel(
         ? { verifyProducerSignature: input.verifyProducerSignature }
       : {}),
     });
+    if (
+      feature.id === "castle_wall_egress" &&
+      (input.platform ?? process.platform) === "darwin"
+    ) {
+      const availability =
+        input.enforcementAvailability ?? {
+          status: "undetermined" as const,
+          reason: "availability_not_queried",
+          observed_at: null,
+          freshness_window_ms: DEFAULT_ENFORCEMENT_AVAILABILITY_FRESHNESS_MS,
+          active_connection_count: 0,
+        };
+      if (availability.status === "live") {
+        row = {
+          ...row,
+          status: "active",
+          basis: "fresh_enforcement_evidence",
+          last_evidence_at: availability.observed_at,
+          enforcement_availability: availability,
+        };
+      } else if (availability.status === "non_green") {
+        row = {
+          ...row,
+          status: "fault",
+          basis: "fault_evidence",
+          last_evidence_at: availability.observed_at,
+          enforcement_availability: availability,
+        };
+      } else {
+        row = {
+          ...row,
+          status: "unknown",
+          basis:
+            availability.reason === "stale_report"
+              ? "stale_evidence"
+              : "no_evidence_self_reporting",
+          last_evidence_at: availability.observed_at,
+          enforcement_availability: availability,
+        };
+      }
+    }
     // S5-P aggregate-green cap (design §6): the `castle_wall_egress` row's
     // would-be green is capped to the DISTINCT non-green `coarse_only` when a
     // fine-grained-provisioned agent's exclusive-egress stack is not live -

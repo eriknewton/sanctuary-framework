@@ -153,6 +153,7 @@ public final class AuditProducerChain {
     public func buildSignedFlowDecision(
         outcome: EvaluationOutcome,
         flow: FilterFlowDescriptor,
+        enforcement: EnforcementAvailabilitySnapshotBody? = nil,
         recordedAt: Date = Date(),
         signer: AuditProducerSigning,
         completion: @escaping (Result<IpcMessage, AuditProducerSigningError>) -> Void
@@ -163,6 +164,7 @@ public final class AuditProducerChain {
                 try buildPendingDecisionLocked(
                     outcome: outcome,
                     flow: flow,
+                    enforcement: enforcement,
                     recordedAt: recordedAt
                 )
             }
@@ -243,6 +245,7 @@ public final class AuditProducerChain {
                 agent: pending.body.agent,
                 matchedRuleId: pending.body.matchedRuleId,
                 recordedAt: pending.body.recordedAt,
+                enforcement: pending.body.enforcement,
                 producer: producer
             )
             finish(
@@ -252,9 +255,92 @@ public final class AuditProducerChain {
         }
     }
 
+    public func buildSignedAvailabilityReport(
+        enforcement: EnforcementAvailabilitySnapshotBody,
+        fortressId: String,
+        reportedAt: Date = Date(),
+        signer: AuditProducerSigning,
+        completion: @escaping (Result<IpcMessage, AuditProducerSigningError>) -> Void
+    ) {
+        let pending: PendingAvailability
+        do {
+            pending = try stateQueue.sync {
+                try buildPendingAvailabilityLocked(
+                    enforcement: enforcement,
+                    fortressId: fortressId,
+                    reportedAt: reportedAt
+                )
+            }
+        } catch let error as AuditProducerSigningError {
+            completion(.failure(error))
+            return
+        } catch {
+            completion(.failure(.canonicalizationFailed("\(error)")))
+            return
+        }
+
+        let completionLock = NSLock()
+        var didComplete = false
+        let finish: (Result<IpcMessage, AuditProducerSigningError>, (seq: UInt64, hash: String)?) -> Void = { [weak self] result, advance in
+            completionLock.lock()
+            if didComplete {
+                completionLock.unlock()
+                return
+            }
+            didComplete = true
+            completionLock.unlock()
+            if let advance, let self {
+                self.stateQueue.sync {
+                    if self.nextSeq == advance.seq {
+                        self.nextSeq = advance.seq + 1
+                        self.priorHashHex = advance.hash
+                    }
+                }
+            }
+            completion(result)
+        }
+
+        timeoutQueue.asyncAfter(deadline: .now() + signTimeoutSeconds) { [signTimeoutSeconds] in
+            finish(
+                .failure(.signerUnavailable(
+                    "audit-producer sign reply did not arrive within \(signTimeoutSeconds)s (helper unreachable or XPC reply dropped)"
+                )),
+                nil
+            )
+        }
+
+        signer.signAuditProducerPayload(pending.signingBytes) { signature, error in
+            if let error {
+                finish(.failure(.signerUnavailable(error)), nil)
+                return
+            }
+            guard let signature, !signature.isEmpty else {
+                finish(.failure(.emptySignature), nil)
+                return
+            }
+            let producer = AuditProducerSignatureBody(
+                eventCanonicalJson: pending.eventCanonicalJson,
+                capturedAtUnixMs: pending.capturedAtUnixMs,
+                seq: pending.seq,
+                priorSha256Hex: pending.priorHashHex,
+                signatureB64url: Base64URL.encode(signature),
+                keyId: AuditProducerSigningConstants.keyId
+            )
+            let body = EnforcementAvailabilityReportBody(
+                enforcement: pending.enforcement,
+                producer: producer
+            )
+            finish(
+                .success(.enforcementAvailabilityReport(body)),
+                (pending.seq, pending.eventHashHex)
+            )
+        }
+    }
+
     private func buildPendingDecisionLocked(
         outcome: EvaluationOutcome,
         flow: FilterFlowDescriptor,
+        enforcement: EnforcementAvailabilitySnapshotBody?,
         recordedAt: Date
     ) throws -> PendingDecision {
         let decision: String
@@ -314,7 +400,8 @@ public final class AuditProducerChain {
             agent: agent,
             matchedRuleId: matchedRuleId,
             seq: seq,
-            priorHashHex: prior
+            priorHashHex: prior,
+            enforcement: enforcement
         )
         let walBody = JSONValue.object([
             "timestamp": .string(recordedAtString),
@@ -335,7 +422,8 @@ public final class AuditProducerChain {
                 destination: destination,
                 agent: agent,
                 matchedRuleId: matchedRuleId,
-                recordedAt: recordedAtString
+                recordedAt: recordedAtString,
+                enforcement: enforcement
             ),
             eventCanonicalJson: walCanonical,
             eventHashHex: sha256Hex(Data(eventCanonical.utf8)),
@@ -352,7 +440,8 @@ public final class AuditProducerChain {
         agent: IpcAgentAttribution,
         matchedRuleId: String?,
         seq: UInt64,
-        priorHashHex: String?
+        priorHashHex: String?,
+        enforcement: EnforcementAvailabilitySnapshotBody?
     ) -> [String: JSONValue] {
         var details: [String: JSONValue] = [
             "agent_id": .string(agent.id),
@@ -369,7 +458,73 @@ public final class AuditProducerChain {
         if let host = destination.host {
             details["dest_host"] = .string(host)
         }
+        if let enforcement {
+            details["enforcement"] = jsonValue(for: enforcement)
+        }
         return details
+    }
+
+    private func buildPendingAvailabilityLocked(
+        enforcement: EnforcementAvailabilitySnapshotBody,
+        fortressId: String,
+        reportedAt: Date
+    ) throws -> PendingAvailability {
+        let seq = nextSeq
+        let prior = priorHashHex
+        let reportedAtString = enforcement.producerClaimedAt ?? IPCBridgeNotifications.iso8601(reportedAt)
+        let details: [String: JSONValue] = [
+            "seq": .number(Double(seq)),
+            "prior_sha256_hex": prior.map { .string($0) } ?? .null,
+            "enforcement": jsonValue(for: enforcement),
+        ]
+        let walBody = JSONValue.object([
+            "timestamp": .string(reportedAtString),
+            "layer": .string("l1"),
+            "operation": .string("enforcement_availability_report"),
+            "identity_id": .string(fortressId),
+            "result": .string(isGreen(enforcement) ? "success" : "failure"),
+            "details": .object(details),
+        ])
+        let walCanonical = try canonicalJSONString(walBody)
+        let capturedAtUnixMs = UInt64(reportedAt.timeIntervalSince1970 * 1000)
+        let signingBytes = Data(
+            "\(AuditProducerSigningConstants.domainPrefix)\(walCanonical)\n\(capturedAtUnixMs)\n\(seq)".utf8
+        )
+        return PendingAvailability(
+            enforcement: enforcement,
+            eventCanonicalJson: walCanonical,
+            eventHashHex: sha256Hex(Data(walCanonical.utf8)),
+            signingBytes: signingBytes,
+            capturedAtUnixMs: capturedAtUnixMs,
+            seq: seq,
+            priorHashHex: prior
+        )
+    }
+
+    private func jsonValue(for enforcement: EnforcementAvailabilitySnapshotBody) -> JSONValue {
+        var object: [String: JSONValue] = [
+            "protocol_version": .number(Double(enforcement.protocolVersion)),
+            "source": .string(enforcement.source),
+            "lease_state": .string(enforcement.leaseState),
+            "lease_reason": .string(enforcement.leaseReason),
+            "manifest_state": .string(enforcement.manifestState),
+            "manifest_signature_b64url": enforcement.manifestSignatureB64url.map { .string($0) } ?? .null,
+            "provider_bound": .bool(enforcement.providerBound),
+        ]
+        if let producerClaimedAt = enforcement.producerClaimedAt {
+            object["producer_claimed_at"] = .string(producerClaimedAt)
+        }
+        return .object(object)
+    }
+
+    private func isGreen(_ enforcement: EnforcementAvailabilitySnapshotBody) -> Bool {
+        return enforcement.protocolVersion == 1 &&
+            enforcement.source == "macos_extension" &&
+            enforcement.leaseState == "live" &&
+            enforcement.leaseReason == "ok" &&
+            enforcement.manifestState == "applied" &&
+            enforcement.manifestSignatureB64url?.isEmpty == false &&
+            enforcement.providerBound
     }
 
     private func canonicalJSONString(_ value: JSONValue) throws -> String {
@@ -387,6 +542,16 @@ public final class AuditProducerChain {
 
     private struct PendingDecision {
         let body: FlowDecisionRecordedBody
+        let eventCanonicalJson: String
+        let eventHashHex: String
+        let signingBytes: Data
+        let capturedAtUnixMs: UInt64
+        let seq: UInt64
+        let priorHashHex: String?
+    }
+
+    private struct PendingAvailability {
+        let enforcement: EnforcementAvailabilitySnapshotBody
         let eventCanonicalJson: String
         let eventHashHex: String
         let signingBytes: Data

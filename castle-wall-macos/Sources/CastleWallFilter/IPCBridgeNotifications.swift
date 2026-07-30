@@ -47,6 +47,7 @@ public enum IPCBridgeNotifications {
     public static func buildFlowDecisionRecorded(
         outcome: EvaluationOutcome,
         flow: FilterFlowDescriptor,
+        enforcement: EnforcementAvailabilitySnapshotBody? = nil,
         recordedAt: Date = Date()
     ) -> IpcMessage? {
         let decision: String
@@ -66,7 +67,8 @@ public enum IPCBridgeNotifications {
             destination: destinationFor(flow: flow),
             agent: agentFor(flow: flow),
             matchedRuleId: matchedRuleId,
-            recordedAt: iso8601(recordedAt)
+            recordedAt: iso8601(recordedAt),
+            enforcement: enforcement
         )
         return .flowDecisionRecorded(body)
     }

@@ -367,6 +367,7 @@ describe("producer-key production wiring — startDashboard snapshot server", ()
       mode: "co-located",
       serverVersion: "0.9.0-test",
       auditLog,
+      platform: "linux",
       // Supporting sources so the non-wall layers reach `full`; the Castle Wall
       // arm state (driven by the producer-key state below) decides the overall
       // light, isolating exactly the behavior under test.
@@ -412,13 +413,11 @@ describe("producer-key production wiring — startDashboard snapshot server", ()
     expect(status).toBe("degraded");
   });
 
-  it("no key on disk (macOS / pre-provision floor) → genuine channel-basis entry still arms green", async () => {
-    // The macOS-no-key floor must stay intact: absent producer key → the honest
-    // channel-authenticated basis, which still arms green on a genuine
-    // channel-basis enforcement entry (parity with the DashboardApprovalChannel
-    // path). We assert the absent case does not over-tighten to amber here.
-    // No producer key written; a genuine signed entry still carries the channel
-    // provenance marker, so the wall arms on the channel basis.
+  it("no key on disk (Linux / pre-provision floor) → genuine channel-basis entry still arms green", async () => {
+    // The Linux no-key floor must stay byte-for-byte intact in this PR: absent
+    // producer key → the existing channel-authenticated basis. macOS green now
+    // requires v3 live availability and is covered by the new availability
+    // suites instead.
     const { light } = await bootAndSnapshot(appendGenuine);
     expect(light).toBe("green");
   });

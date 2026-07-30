@@ -26,6 +26,7 @@ import {
   type CastleWallArmState,
   type ExclusiveEgressStatus,
 } from "../principal-policy/posture.js";
+import type { ResolvedEnforcementAvailability } from "../castle-wall/runtime/enforcement-availability.js";
 import type { ReputationEvidence } from "../shr/generator.js";
 import { deriveReputationDegradations } from "../shr/generator.js";
 import type { SHRDegradation } from "../shr/types.js";
@@ -196,6 +197,8 @@ export interface AggregatorSources {
   l4Evidence?: ReputationEvidence;
   /** Clock override for deterministic staleness rendering in tests. */
   l4Now?: Date;
+  /** Node platform for Castle Wall surface shaping; defaults to the host. */
+  platform?: NodeJS.Platform;
   /**
    * The reader's pinned producer public key (base64url-no-pad), resolved lazily
    * so post-provision wiring is observed. Threaded straight into
@@ -242,6 +245,14 @@ export interface AggregatorSources {
    * evidence stamped with that subject.
    */
   resolveProtectionClaimSubject?: () => string | null | Promise<string | null>;
+  /**
+   * macOS v3 level-triggered enforcement availability. The dashboard owner
+   * resolves this from castle.sock; this pure aggregator only threads the
+   * resolved answer into the canonical wall posture builder.
+   */
+  resolveEnforcementAvailability?: () =>
+    | Promise<ResolvedEnforcementAvailability>
+    | ResolvedEnforcementAvailability;
 }
 
 /**
@@ -861,15 +872,22 @@ export async function getProtectionSnapshot(
       const protectionClaimSubject = sources.resolveProtectionClaimSubject
         ? await sources.resolveProtectionClaimSubject()
         : null;
+      const enforcementAvailability = sources.resolveEnforcementAvailability
+        ? await sources.resolveEnforcementAvailability()
+        : null;
       const wall = await sources.auditLog.runEagerReads(() =>
         buildCastleWallPosture({
           auditLog: sources.auditLog as AuditLog,
           originMachine: agent.primary_identity_id ?? "local",
+          ...(sources.platform !== undefined ? { platform: sources.platform } : {}),
           pinnedProducerKeyB64url,
           ...(sources.producerKeyExpectedButUnavailable
             ? { producerKeyExpectedButUnavailable: true }
             : {}),
           ...(exclusiveEgress !== null ? { exclusiveEgress } : {}),
+          ...(enforcementAvailability !== null
+            ? { enforcementAvailability }
+            : {}),
           protectionClaimSubject,
         }),
       );

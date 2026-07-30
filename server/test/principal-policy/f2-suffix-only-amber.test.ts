@@ -88,7 +88,7 @@ describe("F2 HIGH-1: verified_suffix_only renders amber, not affirmative green",
       protectionClaimSubject: FORTRESS,
       auditLog: suffixOnlyAuditLog([freshEnforcementEntry(now)]),
       originMachine: FORTRESS,
-      platform: "darwin",
+      platform: "linux",
       now,
     });
     // Fresh enforcement evidence + suffix-only (untampered) => still armed. The
@@ -119,7 +119,7 @@ describe("F2 HIGH-1: verified_suffix_only renders amber, not affirmative green",
       protectionClaimSubject: FORTRESS,
       auditLog: verifiedLog,
       originMachine: FORTRESS,
-      platform: "darwin",
+      platform: "linux",
       now,
     });
     expect(posture.arm_state).toBe("armed");

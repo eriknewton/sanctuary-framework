@@ -458,10 +458,10 @@ describe("Slice P — reader activation end-to-end (provisioned key on disk)", (
     expect(posture.arm_state).not.toBe("armed");
   });
 
-  it("(3) macOS / no-key path: a channel-basis event still arms (floor preserved)", async () => {
+  it("(3) Linux / no-key path: a channel-basis event still arms (floor preserved)", async () => {
     // No key file published → absent → channel basis.
     const load = await loadFortressProducerKey(tmp, {
-      platform: "darwin",
+      platform: "linux",
       macosProducerPubKeyPath: join(tmp, "missing", "castle-audit-producer.pub"),
     });
     expect(load.status).toBe("absent");
@@ -473,7 +473,7 @@ describe("Slice P — reader activation end-to-end (provisioned key on disk)", (
       protectionClaimSubject: SUBJECT,
       auditLog: log,
       originMachine: "m",
-      platform: "darwin",
+      platform: "linux",
       now: NOW,
       pinnedProducerKeyB64url: null,
     });

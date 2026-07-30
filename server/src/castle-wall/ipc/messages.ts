@@ -47,7 +47,10 @@ export type CastleWallMessage =
   | ManifestSubscribeRequest
   | ManifestUpdatedNotification
   | FlowDecisionRecordedNotification
-  | FlowPendingApprovalNotification;
+  | FlowPendingApprovalNotification
+  | EnforcementAvailabilityReportNotification
+  | EnforcementAvailabilityRequest
+  | EnforcementAvailabilityResponse;
 
 /** Request from main to daemon: "are you alive?" */
 export interface StatusRequest {
@@ -297,6 +300,71 @@ export interface ArmLeaseNotification {
 }
 
 /**
+ * Extension-originated enforcement-availability assertion.
+ *
+ * Green surfaces must be derived from this block only after the daemon verifies
+ * the attached audit-producer signature. The producer timestamp is diagnostic;
+ * freshness is stamped by the receiving consumer as `observed_at`.
+ */
+export interface EnforcementAvailabilitySnapshot {
+  protocol_version: 1;
+  source: "macos_extension";
+  lease_state: "live" | "missing" | "unarmed" | "failed_open";
+  lease_reason:
+    | "ok"
+    | "arm_lease_missing"
+    | "not_armed"
+    | "lease_revoked"
+    | "ttl_expired"
+    | "heartbeat_stopped";
+  manifest_state: "applied" | "absent";
+  manifest_signature_b64url: string | null;
+  provider_bound: boolean;
+  producer_claimed_at?: string;
+}
+
+/**
+ * One-way notification from the macOS extension to the daemon reporting the
+ * extension's current enforcement availability level. It is accepted as a
+ * surface signal only when the `producer` tuple verifies against the pinned
+ * audit-producer key and the signed canonical body binds to the visible
+ * `enforcement` block. Unsigned or malformed reports are non-green.
+ */
+export interface EnforcementAvailabilityReportNotification {
+  type: "enforcement_availability_report";
+  enforcement: EnforcementAvailabilitySnapshot;
+  producer?: AuditProducerSignatureNotification | null;
+}
+
+/**
+ * Local query over `castle.sock` asking the daemon for the least-green fresh
+ * enforcement-availability level across live extension connections. This is a
+ * read-only status request: the daemon must answer from already-received
+ * extension reports and must not mint a green result from daemon intent.
+ */
+export interface EnforcementAvailabilityRequest {
+  type: "enforcement_availability_request";
+  request_id: IpcRequestId;
+}
+
+/**
+ * Daemon response to `enforcement_availability_request`. `availability.status`
+ * is the only color authority for macOS Castle Wall green surfaces; `observed_at`
+ * is the daemon receive time for the report that determined the verdict.
+ */
+export interface EnforcementAvailabilityResponse {
+  type: "enforcement_availability_response";
+  request_id: IpcRequestId;
+  availability: {
+    status: "live" | "non_green" | "undetermined";
+    reason: string;
+    observed_at: string | null;
+    freshness_window_ms: number;
+    active_connection_count: number;
+  };
+}
+
+/**
  * Castle Wall macOS Phase 1 (Alpha-2) message types: manifest sync + flow
  * decision telemetry.
  *
@@ -343,6 +411,13 @@ export interface FlowDecisionRecordedNotification {
   agent: IpcAgentAttribution;
   matched_rule_id?: string | null;
   recorded_at: string;
+  /**
+   * Optional v3 per-decision carriage of the same extension-originated
+   * availability block reported by `enforcement_availability_report`. Consumers
+   * may use it only when the producer signature verifies and the signed flow
+   * canonical body contains this exact block.
+   */
+  enforcement?: EnforcementAvailabilitySnapshot | null;
   producer?: AuditProducerSignatureNotification | null;
 }
 

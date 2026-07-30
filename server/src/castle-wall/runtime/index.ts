@@ -22,6 +22,7 @@ export * from "./ipc-client.js";
 export * from "./lifecycle.js";
 export * from "./macos-flow-events.js";
 export * from "./macos-ipc-listener.js";
+export * from "./enforcement-availability.js";
 export * from "./system-resolvers.js";
 export * from "./macos-daemon.js";
 export * from "./linux-daemon.js";

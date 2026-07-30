@@ -18,6 +18,11 @@
 // flow_pending_approval. Phase 1 ships full-snapshot manifest sync; delta
 // patches are reserved for v1.x.
 //
+// Level-triggered enforcement availability (2026-07-30): the extension emits
+// `enforcement_availability_report` and may carry the same `enforcement` block
+// on `flow_decision_recorded`. The daemon answers
+// `enforcement_availability_request` from received extension reports only.
+//
 
 import Foundation
 
@@ -61,6 +66,9 @@ public enum IpcMessage: Codable, Equatable {
     case armLease(ArmLeaseBody)
     case flowDecisionRecorded(FlowDecisionRecordedBody)
     case flowPendingApproval(FlowPendingApprovalBody)
+    case enforcementAvailabilityReport(EnforcementAvailabilityReportBody)
+    case enforcementAvailabilityRequest(requestId: String)
+    case enforcementAvailabilityResponse(EnforcementAvailabilityResponseBody)
 
     private enum DiscriminatorKeys: String, CodingKey {
         case type
@@ -125,6 +133,13 @@ public enum IpcMessage: Codable, Equatable {
             self = .flowDecisionRecorded(try body.decode(FlowDecisionRecordedBody.self))
         case "flow_pending_approval":
             self = .flowPendingApproval(try body.decode(FlowPendingApprovalBody.self))
+        case "enforcement_availability_report":
+            self = .enforcementAvailabilityReport(try body.decode(EnforcementAvailabilityReportBody.self))
+        case "enforcement_availability_request":
+            let inner = try body.decode(EnforcementAvailabilityRequestEnvelopeBody.self)
+            self = .enforcementAvailabilityRequest(requestId: inner.requestId)
+        case "enforcement_availability_response":
+            self = .enforcementAvailabilityResponse(try body.decode(EnforcementAvailabilityResponseBody.self))
         default:
             throw DecodingError.dataCorruptedError(
                 forKey: .type,
@@ -203,6 +218,15 @@ public enum IpcMessage: Codable, Equatable {
         case .flowDecisionRecorded(let body):
             try container.encode(body)
         case .flowPendingApproval(let body):
+            try container.encode(body)
+        case .enforcementAvailabilityReport(let body):
+            try container.encode(body)
+        case .enforcementAvailabilityRequest(let requestId):
+            try container.encode(EnforcementAvailabilityRequestEnvelopeBody(
+                type: "enforcement_availability_request",
+                requestId: requestId
+            ))
+        case .enforcementAvailabilityResponse(let body):
             try container.encode(body)
         }
     }
@@ -1040,6 +1064,126 @@ public struct ManifestUpdatedBody: Codable, Equatable {
     }
 }
 
+/// Extension-originated enforcement-availability assertion. Freshness is
+/// stamped by the receiving daemon; `producer_claimed_at` is diagnostic only.
+public struct EnforcementAvailabilitySnapshotBody: Codable, Equatable {
+    public let protocolVersion: UInt32
+    public let source: String
+    public let leaseState: String
+    public let leaseReason: String
+    public let manifestState: String
+    public let manifestSignatureB64url: String?
+    public let providerBound: Bool
+    public let producerClaimedAt: String?
+
+    public init(
+        protocolVersion: UInt32 = 1,
+        source: String = "macos_extension",
+        leaseState: String,
+        leaseReason: String,
+        manifestState: String,
+        manifestSignatureB64url: String?,
+        providerBound: Bool,
+        producerClaimedAt: String? = nil
+    ) {
+        self.protocolVersion = protocolVersion
+        self.source = source
+        self.leaseState = leaseState
+        self.leaseReason = leaseReason
+        self.manifestState = manifestState
+        self.manifestSignatureB64url = manifestSignatureB64url
+        self.providerBound = providerBound
+        self.producerClaimedAt = producerClaimedAt
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case protocolVersion = "protocol_version"
+        case source
+        case leaseState = "lease_state"
+        case leaseReason = "lease_reason"
+        case manifestState = "manifest_state"
+        case manifestSignatureB64url = "manifest_signature_b64url"
+        case providerBound = "provider_bound"
+        case producerClaimedAt = "producer_claimed_at"
+    }
+}
+
+/// Signed extension-to-daemon availability report. The daemon verifies
+/// `producer` against the pinned audit-producer key before any surface may use
+/// `enforcement`.
+public struct EnforcementAvailabilityReportBody: Codable, Equatable {
+    public let type: String
+    public let enforcement: EnforcementAvailabilitySnapshotBody
+    public let producer: AuditProducerSignatureBody?
+
+    public init(
+        enforcement: EnforcementAvailabilitySnapshotBody,
+        producer: AuditProducerSignatureBody? = nil
+    ) {
+        self.type = "enforcement_availability_report"
+        self.enforcement = enforcement
+        self.producer = producer
+    }
+}
+
+public struct EnforcementAvailabilityRequestEnvelopeBody: Codable, Equatable {
+    public let type: String
+    public let requestId: String
+
+    enum CodingKeys: String, CodingKey {
+        case type
+        case requestId = "request_id"
+    }
+}
+
+public struct EnforcementAvailabilityResolvedBody: Codable, Equatable {
+    public let status: String
+    public let reason: String
+    public let observedAt: String?
+    public let freshnessWindowMs: UInt64
+    public let activeConnectionCount: UInt32
+
+    public init(
+        status: String,
+        reason: String,
+        observedAt: String?,
+        freshnessWindowMs: UInt64,
+        activeConnectionCount: UInt32
+    ) {
+        self.status = status
+        self.reason = reason
+        self.observedAt = observedAt
+        self.freshnessWindowMs = freshnessWindowMs
+        self.activeConnectionCount = activeConnectionCount
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case status
+        case reason
+        case observedAt = "observed_at"
+        case freshnessWindowMs = "freshness_window_ms"
+        case activeConnectionCount = "active_connection_count"
+    }
+}
+
+public struct EnforcementAvailabilityResponseBody: Codable, Equatable {
+    public let type: String
+    public let requestId: String
+    public let availability: EnforcementAvailabilityResolvedBody
+
+    public init(requestId: String, availability: EnforcementAvailabilityResolvedBody) {
+        self.type = "enforcement_availability_response"
+        self.requestId = requestId
+        self.availability = availability
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case type
+        case requestId = "request_id"
+        case availability
+    }
+}
+
 /// `flow_decision_recorded` notification body.
 public struct FlowDecisionRecordedBody: Codable, Equatable {
     public let type: String
@@ -1048,6 +1192,7 @@ public struct FlowDecisionRecordedBody: Codable, Equatable {
     public let agent: IpcAgentAttribution
     public let matchedRuleId: String?
     public let recordedAt: String
+    public let enforcement: EnforcementAvailabilitySnapshotBody?
     public let producer: AuditProducerSignatureBody?
 
     public init(
@@ -1056,6 +1201,7 @@ public struct FlowDecisionRecordedBody: Codable, Equatable {
         agent: IpcAgentAttribution,
         matchedRuleId: String?,
         recordedAt: String,
+        enforcement: EnforcementAvailabilitySnapshotBody? = nil,
         producer: AuditProducerSignatureBody? = nil
     ) {
         self.type = "flow_decision_recorded"
@@ -1064,6 +1210,7 @@ public struct FlowDecisionRecordedBody: Codable, Equatable {
         self.agent = agent
         self.matchedRuleId = matchedRuleId
         self.recordedAt = recordedAt
+        self.enforcement = enforcement
         self.producer = producer
     }
 
@@ -1074,6 +1221,7 @@ public struct FlowDecisionRecordedBody: Codable, Equatable {
         case agent
         case matchedRuleId = "matched_rule_id"
         case recordedAt = "recorded_at"
+        case enforcement
         case producer
     }
 
@@ -1085,6 +1233,7 @@ public struct FlowDecisionRecordedBody: Codable, Equatable {
         try container.encode(agent, forKey: .agent)
         try container.encode(matchedRuleId, forKey: .matchedRuleId)
         try container.encode(recordedAt, forKey: .recordedAt)
+        try container.encodeIfPresent(enforcement, forKey: .enforcement)
         try container.encodeIfPresent(producer, forKey: .producer)
     }
 }

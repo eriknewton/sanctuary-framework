@@ -221,6 +221,9 @@ public final class IPCClient {
         case .armLease: return "arm_lease"
         case .flowDecisionRecorded: return "flow_decision_recorded"
         case .flowPendingApproval: return "flow_pending_approval"
+        case .enforcementAvailabilityReport: return "enforcement_availability_report"
+        case .enforcementAvailabilityRequest: return "enforcement_availability_request"
+        case .enforcementAvailabilityResponse: return "enforcement_availability_response"
         }
     }
 

@@ -73,6 +73,10 @@ import {
   castleWallEvidenceMatchesProtectionSubject,
   fortressIdFromProtectionSubject,
 } from "../castle-wall/subject-binding.js";
+import {
+  DEFAULT_ENFORCEMENT_AVAILABILITY_FRESHNESS_MS,
+  type ResolvedEnforcementAvailability,
+} from "../castle-wall/runtime/enforcement-availability.js";
 
 // Re-export the S5-P exclusive-egress posture surface for posture consumers
 // (routes, dashboard, CLI) so they import the wall-posture module they already
@@ -318,6 +322,8 @@ export interface CastleWallPosture {
     | "producer_signed"
     | "channel_authenticated"
     | "not_applicable";
+  /** macOS v3 extension-origin availability verdict, when queried. */
+  enforcement_availability?: ResolvedEnforcementAvailability;
   /**
    * The exclusive-egress posture object (Unified Protect Slice 5 S5-P, design
    * §6): the first-class, queryable per-agent status (mode, generation match,
@@ -384,6 +390,12 @@ export interface BuildCastleWallPostureInput {
    * `pre_canonical_linux_agent_name`. None is green.
    */
   protectionClaimSubject: string | null;
+  /**
+   * macOS v3 level-triggered availability verdict. On macOS this is the only
+   * green authority; absence is treated as undetermined/non-green. Linux keeps
+   * the existing signed audit-drain evidence path.
+   */
+  enforcementAvailability?: ResolvedEnforcementAvailability | null;
 }
 
 /**
@@ -438,6 +450,16 @@ export async function buildCastleWallPosture(
   const digestWindowMs = input.digestWindowMs ?? DEFAULT_DIGEST_WINDOW_MS;
   const platform = mapPlatform(input.platform ?? process.platform);
   const pinnedProducerKey = input.pinnedProducerKeyB64url ?? null;
+  const macOSEnforcementAvailability =
+    platform === "macos"
+      ? input.enforcementAvailability ?? {
+          status: "undetermined" as const,
+          reason: "availability_not_queried",
+          observed_at: null,
+          freshness_window_ms: DEFAULT_ENFORCEMENT_AVAILABILITY_FRESHNESS_MS,
+          active_connection_count: 0,
+        }
+      : null;
 
   // Slice P fail-honest: a producer key is expected (the daemon published one)
   // but the reader could not load it. The consumer is enforcing on the signed
@@ -456,6 +478,9 @@ export async function buildCastleWallPosture(
         audit_integrity_ok: true,
         sealed_region_unverified_at_privilege: false,
         producer_authenticity: "not_applicable",
+        ...(macOSEnforcementAvailability !== null
+          ? { enforcement_availability: macOSEnforcementAvailability }
+          : {}),
       },
       input.exclusiveEgress,
     );
@@ -504,6 +529,9 @@ export async function buildCastleWallPosture(
         audit_integrity_ok: false,
         sealed_region_unverified_at_privilege: false,
         producer_authenticity: "not_applicable",
+        ...(macOSEnforcementAvailability !== null
+          ? { enforcement_availability: macOSEnforcementAvailability }
+          : {}),
       },
       input.exclusiveEgress,
     );
@@ -741,7 +769,21 @@ export async function buildCastleWallPosture(
 
   let armState: CastleWallArmState;
   let basis: CastleWallPosture["evidence_basis"];
-  if (!integrityOk) {
+  if (macOSEnforcementAvailability !== null) {
+    if (macOSEnforcementAvailability.status === "live") {
+      armState = "armed";
+      basis = "fresh_enforcement_evidence";
+    } else if (macOSEnforcementAvailability.status === "non_green") {
+      armState = "degraded";
+      basis = "not_enforcing_evidence";
+    } else {
+      armState = "unknown";
+      basis =
+        macOSEnforcementAvailability.reason === "stale_report"
+          ? "stale_evidence"
+          : "no_evidence";
+    }
+  } else if (!integrityOk) {
     // A tainted audit read (integrity findings present) can NEVER render
     // green: the evidence we would judge "armed" from is itself untrustworthy.
     // Fail closed to unknown regardless of what verdict entries appear to say.
@@ -801,6 +843,8 @@ export async function buildCastleWallPosture(
   let producerAuthenticity: CastleWallPosture["producer_authenticity"];
   if (armState !== "armed") {
     producerAuthenticity = "not_applicable";
+  } else if (macOSEnforcementAvailability !== null) {
+    producerAuthenticity = "producer_signed";
   } else if (latestEnforcementWasProducerSigned) {
     producerAuthenticity = "producer_signed";
   } else {
@@ -830,6 +874,9 @@ export async function buildCastleWallPosture(
       audit_integrity_ok: integrityOk,
       sealed_region_unverified_at_privilege: sealedUnverifiedAtPrivilege,
       producer_authenticity: producerAuthenticity,
+      ...(macOSEnforcementAvailability !== null
+        ? { enforcement_availability: macOSEnforcementAvailability }
+        : {}),
     },
     input.exclusiveEgress,
   );

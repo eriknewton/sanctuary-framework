@@ -117,7 +117,7 @@ function baseDeps(log: AuditLog | null, agents: LocalAgentRecord[]): PostureRout
         enforcing_layer: "castle_wall",
       },
     ],
-    platform: "darwin",
+    platform: "linux",
     resolveProtectionClaimSubject: () => CLAIM_SUBJECT,
   };
 }

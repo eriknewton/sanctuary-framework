@@ -191,7 +191,7 @@ async function armedWallPosture(now: number): Promise<CastleWallPosture> {
     protectionClaimSubject: CLAIM_SUBJECT,
     auditLog: log,
     originMachine: FORTRESS,
-    platform: "darwin",
+    platform: "linux",
     now,
   });
 }

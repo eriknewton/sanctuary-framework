@@ -146,7 +146,7 @@ function baseDeps(
         enforcing_layer: "castle_wall",
       },
     ],
-    platform: "darwin",
+    platform: "linux",
     resolveProtectionClaimSubject: () => CLAIM_SUBJECT,
     ...extra,
   };

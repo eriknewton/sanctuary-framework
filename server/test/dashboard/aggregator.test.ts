@@ -144,6 +144,7 @@ function baseSources(overrides: Partial<AggregatorSources> = {}): AggregatorSour
   const sources: AggregatorSources = {
     mode: "co-located",
     server_version: "0.9.0-test",
+    platform: "linux",
     ...overrides,
   };
   return sources;

@@ -16,6 +16,7 @@
 //
 
 import Foundation
+import CastleWallIPC
 
 public final class FlowEvaluatorEngine {
     public let manifestStore: ManifestStore
@@ -79,6 +80,45 @@ public final class FlowEvaluatorEngine {
 
     public static let defaultAgentResolver: AgentResolver = { sourceAppId in
         return (agentId: sourceAppId, templateId: "unknown")
+    }
+
+    /// Snapshot the extension-owned enforcement availability level. This is
+    /// the only macOS green-authority payload the daemon may consume: the
+    /// daemon stamps receive time and verifies the producer signature, but it
+    /// cannot derive live enforcement from its own arm intent or status file.
+    public func enforcementAvailabilitySnapshot(
+        providerBound: Bool,
+        claimedAt: Date = Date()
+    ) -> EnforcementAvailabilitySnapshotBody {
+        let leaseSnapshot = armLease.snapshot()
+        let leaseState: String
+        let leaseReason: String
+        if !leaseSnapshot.leaseReceived {
+            leaseState = "missing"
+            leaseReason = "arm_lease_missing"
+        } else if let failOpenReason = armLease.failOpenReason() {
+            leaseState = "failed_open"
+            leaseReason = failOpenReason
+        } else if !leaseSnapshot.armed {
+            leaseState = "unarmed"
+            leaseReason = "not_armed"
+        } else {
+            leaseState = "live"
+            leaseReason = "ok"
+        }
+
+        let manifest = manifestStore.currentSnapshot()
+        let manifestSignature = manifest?.signatureB64url
+        let manifestApplied = manifestSignature?.isEmpty == false
+
+        return EnforcementAvailabilitySnapshotBody(
+            leaseState: leaseState,
+            leaseReason: leaseReason,
+            manifestState: manifestApplied ? "applied" : "absent",
+            manifestSignatureB64url: manifestApplied ? manifestSignature : nil,
+            providerBound: providerBound,
+            producerClaimedAt: IPCBridgeNotifications.iso8601(claimedAt)
+        )
     }
 
     /// Evaluate a flow against the current manifest snapshot, consulting

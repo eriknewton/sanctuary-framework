@@ -40,6 +40,7 @@ import {
 import type {
   AuditEmitNotification,
   AuditProducerSignatureNotification,
+  EnforcementAvailabilityReportNotification,
   FlowDecisionRecordedNotification,
   FlowPendingApprovalNotification,
   IpcAgentAttribution,
@@ -54,6 +55,13 @@ import {
   type CriticalEventEnvelope,
 } from "./audit-consumer.js";
 import { protectionSubjectFromMacOSAuditToken } from "../subject-binding.js";
+import {
+  EnforcementAvailabilityStore,
+  verifyEnforcementAvailabilityReport,
+  verifyFlowDecisionEnforcementCarriage,
+  type ResolvedEnforcementAvailability,
+  type EnforcementAvailabilityVerification,
+} from "./enforcement-availability.js";
 
 /** The runtime's view of a registered macOS subscriber. */
 export interface MacOSSubscriber {
@@ -100,6 +108,8 @@ export interface MacOSFlowEventStats {
   decisionsRejected: number;
   extensionDiagnosticsRecorded: number;
   extensionDiagnosticsRejected: number;
+  enforcementAvailabilityReportsRecorded: number;
+  enforcementAvailabilityReportsRejected: number;
   pendingApprovalsEnqueued: number;
   pendingApprovalsRejected: number;
 }
@@ -154,6 +164,9 @@ export class MacOSFlowEventConsumer {
   private readonly fortressId: string;
   private readonly defaultApprovalTimeoutSeconds: number;
   private readonly producerAuditConsumer: AuditConsumer | null;
+  private readonly pinnedProducerKeyB64url: string | null;
+  private readonly now: () => number;
+  private readonly enforcementAvailability: EnforcementAvailabilityStore;
   private readonly emissionLiveness: EmissionLivenessNotes | null;
   private stats: MacOSFlowEventStats = {
     subscribers: 0,
@@ -162,6 +175,8 @@ export class MacOSFlowEventConsumer {
     decisionsRejected: 0,
     extensionDiagnosticsRecorded: 0,
     extensionDiagnosticsRejected: 0,
+    enforcementAvailabilityReportsRecorded: 0,
+    enforcementAvailabilityReportsRejected: 0,
     pendingApprovalsEnqueued: 0,
     pendingApprovalsRejected: 0,
   };
@@ -173,12 +188,18 @@ export class MacOSFlowEventConsumer {
     this.fortressId = resolveMacOSFlowFortressId(input);
     this.defaultApprovalTimeoutSeconds = input.defaultApprovalTimeoutSeconds;
     this.emissionLiveness = input.emissionLiveness ?? null;
-    this.producerAuditConsumer =
+    this.pinnedProducerKeyB64url =
       typeof input.pinnedProducerKeyB64url === "string" &&
       input.pinnedProducerKeyB64url.length > 0
+        ? input.pinnedProducerKeyB64url
+        : null;
+    this.now = input.now ?? Date.now;
+    this.enforcementAvailability = new EnforcementAvailabilityStore();
+    this.producerAuditConsumer =
+      this.pinnedProducerKeyB64url !== null
         ? new AuditConsumer(input.auditSink, undefined, {
-            pinnedProducerKeyB64url: input.pinnedProducerKeyB64url,
-            ...(input.now ? { now: input.now } : {}),
+            pinnedProducerKeyB64url: this.pinnedProducerKeyB64url,
+            now: this.now,
           })
         : null;
   }
@@ -186,12 +207,14 @@ export class MacOSFlowEventConsumer {
   /** Add a subscriber. The runtime calls this when an IPC connection finishes the handshake. */
   registerSubscriber(subscriber: MacOSSubscriber): void {
     this.subscribers.set(subscriber.subscriberId, subscriber);
+    this.enforcementAvailability.registerConnection(subscriber.subscriberId);
     this.stats.subscribers = this.subscribers.size;
   }
 
   /** Remove a subscriber. Idempotent. */
   unregisterSubscriber(subscriberId: string): void {
     this.subscribers.delete(subscriberId);
+    this.enforcementAvailability.unregisterConnection(subscriberId);
     this.stats.subscribers = this.subscribers.size;
   }
 
@@ -255,8 +278,12 @@ export class MacOSFlowEventConsumer {
    * payloads with an audit-rejected entry.
    */
   async handleFlowDecisionRecorded(
-    notification: FlowDecisionRecordedNotification
+    notification: FlowDecisionRecordedNotification,
+    subscriberId?: string,
   ): Promise<void> {
+    if (subscriberId !== undefined) {
+      this.recordFlowCarriedAvailability(notification, subscriberId);
+    }
     // Slice M emission-liveness: an ARRIVING flow_decision_recorded is
     // evidence the wall reports having decided a flow, independent of whether
     // it persists below. Noted FIRST so every downstream reject path counts
@@ -444,6 +471,7 @@ export class MacOSFlowEventConsumer {
       {
         ...event.details,
         timestamp: event.timestamp,
+        [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
       },
       "failure"
     );
@@ -453,6 +481,60 @@ export class MacOSFlowEventConsumer {
 
   getStats(): MacOSFlowEventStats {
     return { ...this.stats };
+  }
+
+  handleEnforcementAvailabilityReport(
+    notification: EnforcementAvailabilityReportNotification,
+    subscriberId: string,
+  ): void {
+    const verified = verifyEnforcementAvailabilityReport({
+      notification,
+      pinnedProducerKeyB64url: this.pinnedProducerKeyB64url,
+      fortressId: this.fortressId,
+    });
+    this.recordVerifiedAvailability(subscriberId, verified);
+  }
+
+  resolveEnforcementAvailability(nowMs = this.now()): ResolvedEnforcementAvailability {
+    return this.enforcementAvailability.resolve(nowMs);
+  }
+
+  private recordFlowCarriedAvailability(
+    notification: FlowDecisionRecordedNotification,
+    subscriberId: string,
+  ): void {
+    const verified = verifyFlowDecisionEnforcementCarriage({
+      notification,
+      pinnedProducerKeyB64url: this.pinnedProducerKeyB64url,
+    });
+    this.recordVerifiedAvailability(subscriberId, verified);
+  }
+
+  private recordVerifiedAvailability(
+    subscriberId: string,
+    verified: EnforcementAvailabilityVerification,
+  ): void {
+    if (!verified.ok) {
+      this.enforcementAvailability.recordInvalidReport(subscriberId, verified.reason);
+      this.stats.enforcementAvailabilityReportsRejected += 1;
+      return;
+    }
+    const lastSeq = this.enforcementAvailability.lastProducerSeq(subscriberId);
+    if (lastSeq !== null && verified.seq <= lastSeq) {
+      this.enforcementAvailability.recordInvalidReport(
+        subscriberId,
+        "producer_sequence_replay",
+      );
+      this.stats.enforcementAvailabilityReportsRejected += 1;
+      return;
+    }
+    this.enforcementAvailability.recordValidReport(
+      subscriberId,
+      verified.enforcement,
+      this.now(),
+      verified.seq,
+    );
+    this.stats.enforcementAvailabilityReportsRecorded += 1;
   }
 }
 
