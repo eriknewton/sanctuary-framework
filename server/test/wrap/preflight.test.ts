@@ -201,6 +201,17 @@ describe("protect preflight", () => {
     expect(renderProtectPreflightReport(report)).toContain("| PASS");
   });
 
+  it("escapes backslashes before pipes in rendered table cells", () => {
+    const report = failingReportFixture();
+    report.rows[0]!.detail = String.raw`path \| injected | next`;
+    report.rows[0]!.remedy = "line one\nline two";
+
+    const rendered = renderProtectPreflightReport(report);
+
+    expect(rendered).toContain(String.raw`path \\\| injected \| next`);
+    expect(rendered).toContain("line one line two");
+  });
+
   it("reports every drill-mini2 failure in one run, including billing_dead and exact safe-mode bootout remedy", async () => {
     const report = await runProtectPreflight({
       ops: fixtureOps({

@@ -1365,7 +1365,7 @@ function row(input: ProtectPreflightRow): ProtectPreflightRow {
 }
 
 function sanitizeCell(value: string): string {
-  return value.replace(/\r?\n/g, " ").replace(/\|/g, "\\|");
+  return value.replace(/\\/g, "\\\\").replace(/\r?\n/g, " ").replace(/\|/g, "\\|");
 }
 
 function isAbsentCode(code: string | undefined): boolean {
