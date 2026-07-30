@@ -1,0 +1,6 @@
+[2026-07-30T03:14:15Z] SKIP_FAIL_BEFORE=1
+  base_ref: origin/main
+  branch: fix/preflight-b2-rehome-custody
+  head: dfd73be7
+  actor: eriknewton
+  reason: Advisory override for server/test/castle-wall/provision/unprovision.test.ts: this changed test only widens the shared RehomeOps mock for new source-duplicate cleanup methods and asserts no new behavior. Assertion-bearing B2 custody regressions are in rehome.test.ts and auto-provision-realops.test.ts.
