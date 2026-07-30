@@ -28,8 +28,17 @@
  * completeness claim, a total, or a "fully covered" flag.
  */
 
+import { isIP } from "node:net";
+
 import type { LocalAgentRecord } from "../contracts/v1.1/local-agent-records.js";
-import type { CandidateObservation } from "../castle-wall/observe/types.js";
+import {
+  candidateKey,
+  candidateKeyDigest,
+  flagExfilRisk,
+  type CandidateObservation,
+  type HostnameSource,
+  type ObserveProvenance,
+} from "../castle-wall/observe/index.js";
 import {
   claimFromVerifiedEmpty,
   verifiedEmptyFrom,
@@ -109,6 +118,145 @@ export interface InventorySources {
   observedStorePreIdempotency?: boolean;
 }
 
+export const MALFORMED_OBSERVED_DESTINATIONS_REASON =
+  "the observe store contained malformed candidate evidence, so observed destinations could not be rendered safely.";
+
+const OBSERVE_CANDIDATE_STORAGE_KEY_PREFIX = "candidate:";
+const HOST_LABEL_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$/;
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
+}
+
+function isObservedDeniedCount(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 1;
+}
+
+function isValidPort(value: unknown): value is number {
+  return (
+    typeof value === "number" &&
+    Number.isSafeInteger(value) &&
+    value >= 1 &&
+    value <= 65535
+  );
+}
+
+function isValidHost(value: unknown): value is string | null {
+  if (value === null) return true;
+  if (typeof value !== "string" || value.length === 0 || value.length > 253) {
+    return false;
+  }
+  return (
+    !value.startsWith(".") &&
+    !value.endsWith(".") &&
+    value
+      .split(".")
+      .every((label) => label.length <= 63 && HOST_LABEL_PATTERN.test(label))
+  );
+}
+
+function isValidIp(value: unknown): value is string {
+  return typeof value === "string" && isIP(value) !== 0;
+}
+
+function isValidHostnameSource(value: unknown): value is HostnameSource {
+  return (
+    value === "dns" ||
+    value === "sni" ||
+    value === "url" ||
+    value === "socket" ||
+    value === null
+  );
+}
+
+function isValidProvenance(value: unknown): value is ObserveProvenance | undefined {
+  return value === undefined || value === "macos" || value === "linux_daemon";
+}
+
+function isParseableTimestamp(value: unknown): value is string {
+  return typeof value === "string" && !Number.isNaN(Date.parse(value));
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+/**
+ * Strict validation for observe candidates as they cross into a SIGNED evidence
+ * pack. The observe consumer keeps its best-effort legacy semantics; this
+ * boundary is stricter because every accepted row backs denied-flow prose.
+ */
+export function validatePersistedObservedDestinationCandidate(
+  value: unknown,
+  storageKey?: string
+): CandidateObservation | null {
+  if (!isObject(value)) return null;
+  const firstSeen = value.first_seen;
+  const lastSeen = value.last_seen;
+  if (
+    !isNonEmptyString(value.agent_id) ||
+    !isNonEmptyString(value.agent_template) ||
+    !isValidHost(value.host) ||
+    !isValidIp(value.ip) ||
+    !isValidPort(value.port) ||
+    (value.protocol !== "tcp" && value.protocol !== "udp") ||
+    !isValidHostnameSource(value.hostname_source) ||
+    !isObservedDeniedCount(value.times_seen) ||
+    !isParseableTimestamp(firstSeen) ||
+    !isParseableTimestamp(lastSeen) ||
+    Date.parse(lastSeen) < Date.parse(firstSeen) ||
+    value.would_be_disposition !== "denied" ||
+    typeof value.exfil_risk !== "boolean" ||
+    !isValidProvenance(value.provenance)
+  ) {
+    return null;
+  }
+  const candidate: CandidateObservation = {
+    agent_id: value.agent_id,
+    agent_template: value.agent_template,
+    host: value.host,
+    ip: value.ip,
+    port: value.port,
+    protocol: value.protocol,
+    hostname_source: value.hostname_source,
+    times_seen: value.times_seen,
+    first_seen: firstSeen,
+    last_seen: lastSeen,
+    would_be_disposition: "denied",
+    exfil_risk: value.exfil_risk,
+    ...(value.provenance !== undefined ? { provenance: value.provenance } : {}),
+  };
+  if (candidate.exfil_risk !== flagExfilRisk(candidate.host)) {
+    return null;
+  }
+  if (
+    storageKey !== undefined &&
+    storageKey !==
+      `${OBSERVE_CANDIDATE_STORAGE_KEY_PREFIX}${candidateKeyDigest(candidateKey(candidate))}`
+  ) {
+    return null;
+  }
+  return candidate;
+}
+
+function validatedObservedDestinationsRead(
+  read: InventorySourceRead<CandidateObservation> | undefined
+): InventorySourceRead<CandidateObservation> | undefined {
+  if (read === undefined || !read.ok) return read;
+  if (!Array.isArray(read.records)) {
+    return { ok: false, records: [], reason: MALFORMED_OBSERVED_DESTINATIONS_REASON };
+  }
+  const records: CandidateObservation[] = [];
+  for (const raw of read.records as readonly unknown[]) {
+    const candidate = validatePersistedObservedDestinationCandidate(raw);
+    if (!candidate) {
+      return { ok: false, records: [], reason: MALFORMED_OBSERVED_DESTINATIONS_REASON };
+    }
+    records.push(candidate);
+  }
+  return { ok: true, records };
+}
+
 /** Map one `LocalAgentRecord` to the inventory row shape. */
 function agentRow(record: LocalAgentRecord): InventoryAgentRow {
   return {
@@ -145,7 +293,7 @@ function destinationRow(
     port: candidate.port,
     protocol: candidate.protocol,
     times_seen: candidate.times_seen,
-    exfil_risk: candidate.exfil_risk,
+    exfil_risk: flagExfilRisk(candidate.host),
   };
 }
 
@@ -223,9 +371,12 @@ function toOutcome<TRaw, TRow>(
 export function buildInventorySnapshot(
   sources: InventorySources
 ): InventorySnapshot {
+  const observedDestinationsRead = validatedObservedDestinationsRead(
+    sources.observedDestinations
+  );
   const observed_destinations = toOutcome(
     "inventory.observed_destinations",
-    sources.observedDestinations,
+    observedDestinationsRead,
     destinationRow,
     (a, b) => a.host.localeCompare(b.host) || (a.port ?? 0) - (b.port ?? 0)
   );

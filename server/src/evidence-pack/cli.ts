@@ -67,6 +67,7 @@ import {
   type InventorySourceRead,
   type ProxyServerView,
 } from "./inventory.js";
+import { readObservedDestinationCandidatesStrict } from "./observe-candidates.js";
 import {
   describeReadFailureCause,
   emptyVerified,
@@ -364,17 +365,17 @@ async function gatherInventory(
     await (async () => {
       try {
         const stateStore = new StateStore(storage, masterKey);
-        const observeStore = new ObserveStore(stateStore, {
-          identityId: signer.identity_id,
-          encryptedPrivateKey: signer.encrypted_private_key,
-          identityEncryptionKey: derivePurposeKey(masterKey, "identity-encryption"),
-        });
-        const records = [...(await observeStore.listCandidates()).values()];
-        if (records.length > 0) {
+        const read = await readObservedDestinationCandidatesStrict(stateStore);
+        if (read.ok && read.records.length > 0) {
+          const observeStore = new ObserveStore(stateStore, {
+            identityId: signer.identity_id,
+            encryptedPrivateKey: signer.encrypted_private_key,
+            identityEncryptionKey: derivePurposeKey(masterKey, "identity-encryption"),
+          });
           const watermark = await observeStore.getFoldWatermark();
           observedStorePreIdempotency = watermark === null;
         }
-        return { ok: true, records };
+        return read;
       } catch (e) {
         return {
           ok: false,

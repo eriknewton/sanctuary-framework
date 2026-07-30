@@ -44,6 +44,7 @@ import {
 } from "./aggregate.js";
 import { renderSections } from "./sections.js";
 import { buildPackManifest, makePackSigner, signFile } from "./signer.js";
+import { evaluateAnchorOfflineConfirmation } from "./anchor-offline-verification.js";
 
 /** Working product name shown on the cover and in the manifest. */
 export const PRODUCT_NAME = "Sanctuary Evidence Pack";
@@ -339,6 +340,10 @@ export function buildEvidencePack(
     input.custody ?? readFailed("custody facts were not supplied for this pack.");
   const inventory = input.inventory;
   const discrete = input.discrete_exports ?? defaultDiscreteExports();
+  const anchorVerification = evaluateAnchorOfflineConfirmation({
+    transparency: discrete.transparency,
+    anchor: discrete.anchor,
+  });
 
   const sections = renderSections({
     input,
@@ -354,6 +359,7 @@ export function buildEvidencePack(
       transparency: { outcome: discrete.transparency, filename: TRANSPARENCY_BUNDLE_FILENAME },
       audit_chain: { outcome: discrete.audit_chain, filename: AUDIT_CHAIN_FILENAME },
       anchor: { outcome: discrete.anchor, filename: ANCHOR_EVIDENCE_FILENAME },
+      anchor_verification: anchorVerification,
     },
   });
 

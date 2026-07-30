@@ -19,6 +19,7 @@ export type {
   HostnameSource,
   ObserveAuditSourceId,
   ObserveGranularity,
+  ObserveProvenance,
   FlowObservationEvent,
   CandidateObservation,
   ObserveCandidateReviewAction,
