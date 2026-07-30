@@ -480,6 +480,8 @@ public final class ExtensionDispatcher {
             return false
         }
 
+        engine.armLease.resetToMissing()
+        flowCache.clear()
         updateConnectionState(.handshaking)
         do {
             let identity = try await ipcClient.start()
@@ -635,6 +637,8 @@ public final class ExtensionDispatcher {
         let shouldStop = stateQueue.sync { isStopping }
         guard !shouldStop else { return }
 
+        engine.armLease.resetToMissing()
+        flowCache.clear()
         updateConnectionState(.deadChannel)
         CastleWallLog.lifecycle.error(
             "ExtensionDispatcher transport dropped; scheduling reconnect reason=\(String(describing: error))"

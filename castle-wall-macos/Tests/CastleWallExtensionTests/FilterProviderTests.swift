@@ -77,12 +77,21 @@ final class FilterProviderTests: XCTestCase {
         store.update(snapshot)
     }
 
+    func arm(_ engine: FlowEvaluatorEngine) {
+        engine.armLease.update(ArmLeaseUpdate(
+            armed: true,
+            ttlSeconds: nil,
+            heartbeatIntervalSeconds: 5
+        ))
+    }
+
     // MARK: - evaluate(_:) verdict path
 
     func testEvaluateReturnsAllowForMatchingRule() {
         let store = ManifestStore()
         let cache = FlowCache(capacity: 8)
         let engine = FlowEvaluatorEngine(manifestStore: store, flowCache: cache)
+        arm(engine)
         loadStore(store, rules: [rule(id: "r-allow", host: "api.anthropic.com", disposition: "allow")])
 
         let outcome = engine.evaluate(flow())
@@ -93,6 +102,7 @@ final class FilterProviderTests: XCTestCase {
         let store = ManifestStore()
         let cache = FlowCache(capacity: 8)
         let engine = FlowEvaluatorEngine(manifestStore: store, flowCache: cache)
+        arm(engine)
         loadStore(store, rules: [rule(id: "r-deny", host: "api.anthropic.com", disposition: "deny")])
 
         let outcome = engine.evaluate(flow())
@@ -103,6 +113,7 @@ final class FilterProviderTests: XCTestCase {
         let store = ManifestStore()
         let cache = FlowCache(capacity: 8)
         let engine = FlowEvaluatorEngine(manifestStore: store, flowCache: cache)
+        arm(engine)
         loadStore(store, rules: [rule(host: "other.example.com")])
 
         let outcome = engine.evaluate(flow(host: "novel.example.com"))
@@ -155,15 +166,27 @@ final class FilterProviderTests: XCTestCase {
         )
     }
 
-    func testNeverArmedLeaseStillEnforcesManifest() {
+    func testMissingArmLeaseForcesAllowRuleClosed() {
         let store = ManifestStore()
         let engine = FlowEvaluatorEngine(manifestStore: store, armLease: ArmLease())
-        loadStore(store, rules: [rule(host: "blocked.example.com", disposition: "deny")])
+        loadStore(store, rules: [rule(host: "api.anthropic.com", disposition: "allow")])
 
-        XCTAssertNil(engine.armLease.failOpenReason())
+        XCTAssertEqual(engine.armLease.missingLeaseReason(), "arm_lease_missing")
         XCTAssertEqual(
-            engine.evaluate(flow(host: "blocked.example.com")),
-            .drop(matchedRuleId: "r-1")
+            engine.evaluate(flow(host: "api.anthropic.com")),
+            .drop(matchedRuleId: ArmLease.missingLeaseRuleId)
+        )
+    }
+
+    func testMissingManifestAndMissingArmLeaseDropsClosed() {
+        let store = ManifestStore()
+        let engine = FlowEvaluatorEngine(manifestStore: store, armLease: ArmLease())
+
+        XCTAssertNil(store.currentSnapshot())
+        XCTAssertEqual(engine.armLease.missingLeaseReason(), "arm_lease_missing")
+        XCTAssertEqual(
+            engine.evaluate(flow(host: "api.anthropic.com")),
+            .drop(matchedRuleId: nil)
         )
     }
 
@@ -220,6 +243,7 @@ final class FilterProviderTests: XCTestCase {
         let store = ManifestStore()
         let cache = FlowCache(capacity: 8)
         let engine = FlowEvaluatorEngine(manifestStore: store, flowCache: cache)
+        arm(engine)
         loadStore(store, rules: [rule(host: "api.anthropic.com", disposition: "prompt")])
 
         let outcome = engine.evaluate(flow())
@@ -232,6 +256,7 @@ final class FilterProviderTests: XCTestCase {
         let store = ManifestStore()
         let cache = FlowCache(capacity: 8)
         let engine = FlowEvaluatorEngine(manifestStore: store, flowCache: cache)
+        arm(engine)
         loadStore(store, rules: [rule(host: "api.anthropic.com", disposition: "allow")])
 
         _ = engine.evaluate(flow())
@@ -248,6 +273,7 @@ final class FilterProviderTests: XCTestCase {
         let store = ManifestStore()
         let cache = FlowCache(capacity: 8)
         let engine = FlowEvaluatorEngine(manifestStore: store, flowCache: cache)
+        arm(engine)
         loadStore(store, rules: [rule(host: "api.anthropic.com", disposition: "deny")])
 
         _ = engine.evaluate(flow())
@@ -258,6 +284,7 @@ final class FilterProviderTests: XCTestCase {
         let store = ManifestStore()
         let cache = FlowCache(capacity: 8)
         let engine = FlowEvaluatorEngine(manifestStore: store, flowCache: cache)
+        arm(engine)
         loadStore(store, rules: [rule(host: "api.anthropic.com", disposition: "prompt")])
 
         _ = engine.evaluate(flow())
@@ -268,6 +295,7 @@ final class FilterProviderTests: XCTestCase {
         let store = ManifestStore()
         let cache = FlowCache(capacity: 8)
         let engine = FlowEvaluatorEngine(manifestStore: store, flowCache: cache)
+        arm(engine)
         loadStore(store, rules: [rule(id: "r-allow", disposition: "allow")])
         _ = engine.evaluate(flow())
         XCTAssertEqual(cache.count, 1)
