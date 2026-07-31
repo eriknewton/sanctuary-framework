@@ -93,7 +93,44 @@ async function issueChallenge(): Promise<{ challenge_id: string; challenge: stri
   expect(body.request_version).toBe(FEDERATION_REISSUE_NODE_CERT_REQUEST_VERSION);
   expect(body.challenge_id).toMatch(/[0-9a-f-]{36}/);
   expect(body.challenge.length).toBeGreaterThan(20);
+  expect(String((body as unknown as { request_id?: unknown }).request_id)).toMatch(
+    UUID_RE,
+  );
   return { challenge_id: body.challenge_id, challenge: body.challenge };
+}
+
+/** POST the challenge action and hand back the RAW body, decoy or real. */
+async function rawChallengeBody(
+  nodeId = materials.nodeId,
+): Promise<Record<string, unknown>> {
+  const res = await fetch(`${rig.baseUrl}/v1/federation/rotate/reissue-node-cert`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ action: "challenge", node_id: nodeId }),
+  });
+  expect(res.status).toBe(200);
+  return (await res.json()) as Record<string, unknown>;
+}
+
+/** Every issuer audit entry for this route, newest last. */
+async function reissueAuditEntries(): Promise<
+  { operation: string; result: string; details?: Record<string, unknown> }[]
+> {
+  const { entries } = await rig.auditLog.query({ limit: Number.MAX_SAFE_INTEGER });
+  return entries.filter((entry) =>
+    entry.operation.startsWith("v1_federation_reissue_node_cert"),
+  );
+}
+
+/** The single audit entry the caller's `request_id` resolves to. */
+async function auditEntryForRequestId(
+  requestId: string,
+): Promise<{ operation: string; result: string; details?: Record<string, unknown> }> {
+  const matches = (await reissueAuditEntries()).filter(
+    (entry) => entry.details?.request_id === requestId,
+  );
+  expect(matches).toHaveLength(1);
+  return matches[0]!;
 }
 
 function signedCompleteBody(
@@ -129,6 +166,25 @@ async function completeReissue(body: Record<string, unknown>): Promise<Response>
   });
 }
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+/**
+ * THE denial-shape assertion for this route. Every refusal, whatever the cause,
+ * must be `{ error, request_id }` and NOTHING else: the id is uniform random
+ * noise (F-FED-OPAQUEDENY), so the body still distinguishes nothing, and the
+ * exact-key check is what catches a future edit that "helpfully" adds a reason
+ * field to one branch. Returns the id so a caller can additionally assert that
+ * two denials do not share one.
+ */
+async function expectUniformForbidden(res: Response): Promise<string> {
+  expect(res.status).toBe(403);
+  const body = (await res.json()) as Record<string, unknown>;
+  expect(Object.keys(body).sort()).toEqual(["error", "request_id"]);
+  expect(body.error).toBe("forbidden");
+  expect(String(body.request_id)).toMatch(UUID_RE);
+  return String(body.request_id);
+}
+
 // retry:2 - loopback /v1 rigs can race random local ports under full-suite load.
 describe("/v1/federation/rotate/reissue-node-cert", { retry: 2 }, () => {
   it("returns a same-shaped challenge while disabled, then fails closed on completion", async () => {
@@ -136,7 +192,7 @@ describe("/v1/federation/rotate/reissue-node-cert", { retry: 2 }, () => {
 
     const res = await completeReissue(signedCompleteBody(challenge));
     expect(res.status).toBe(403);
-    expect(await res.json()).toEqual({ error: "forbidden" });
+    await expectUniformForbidden(res);
   });
 
   it("reissues a K2-chained node cert after challenge POP against the old K1 cert", async () => {
@@ -171,7 +227,7 @@ describe("/v1/federation/rotate/reissue-node-cert", { retry: 2 }, () => {
 
     const replay = await completeReissue(body);
     expect(replay.status).toBe(403);
-    expect(await replay.json()).toEqual({ error: "forbidden" });
+    await expectUniformForbidden(replay);
   });
 
   it("denies a node that becomes revoked before completion", async () => {
@@ -184,7 +240,7 @@ describe("/v1/federation/rotate/reissue-node-cert", { retry: 2 }, () => {
 
     const res = await completeReissue(signedCompleteBody(challenge));
     expect(res.status).toBe(403);
-    expect(await res.json()).toEqual({ error: "forbidden" });
+    await expectUniformForbidden(res);
   });
 
   it("fails closed on a hybrid rotation cert instead of verifying only the classical half", async () => {
@@ -197,7 +253,7 @@ describe("/v1/federation/rotate/reissue-node-cert", { retry: 2 }, () => {
 
     const res = await completeReissue(signedCompleteBody(challenge, hybridRotationCert));
     expect(res.status).toBe(403);
-    expect(await res.json()).toEqual({ error: "forbidden" });
+    await expectUniformForbidden(res);
   });
 
   // HOLE 1: a forged predecessor master cannot mint a real current-root cert.
@@ -213,7 +269,7 @@ describe("/v1/federation/rotate/reissue-node-cert", { retry: 2 }, () => {
 
     const res = await completeReissue(forged.signedBody(challenge));
     expect(res.status).toBe(403);
-    expect(await res.json()).toEqual({ error: "forbidden" });
+    await expectUniformForbidden(res);
   });
 
   // HOLE 1 (replay/rollback): a genuine-lineage rotation cert with a rolled-back
@@ -231,7 +287,7 @@ describe("/v1/federation/rotate/reissue-node-cert", { retry: 2 }, () => {
     // Client submits the OLD serial-1 cert; server adopted serial 2.
     const res = await completeReissue(signedCompleteBody(challenge, materials.rotationCert));
     expect(res.status).toBe(403);
-    expect(await res.json()).toEqual({ error: "forbidden" });
+    await expectUniformForbidden(res);
   });
 
   // HOLE 2: on a hybrid (PQC) fortress the reissue endpoint refuses entirely, so
@@ -245,7 +301,187 @@ describe("/v1/federation/rotate/reissue-node-cert", { retry: 2 }, () => {
 
     const res = await completeReissue(signedCompleteBody(challenge));
     expect(res.status).toBe(403);
-    expect(await res.json()).toEqual({ error: "forbidden" });
+    await expectUniformForbidden(res);
+  });
+});
+
+/**
+ * F-FED-OPAQUEDENY: the joiner-visible refusal maps at least five distinct
+ * server-side causes onto one message, the issuer audits the precise one, and
+ * the joiner's operator never sees it. Two separate two-machine drills
+ * (2026-07-30, 2026-07-31) lost real time to exactly this, and both only moved
+ * because the operator already knew to go read the issuer's audit log.
+ *
+ * The fix has to buy diagnosability WITHOUT selling the no-membership-oracle
+ * property, so these tests are written adversarially against the fix itself: the
+ * first two prove the wire still tells an unauthenticated caller nothing, and
+ * only then do the rest prove the reason is recoverable by someone who can open
+ * the issuer's fortress.
+ */
+// retry:2 - loopback /v1 rigs can race random local ports under full-suite load.
+describe("reissue denials are diagnosable without becoming an oracle", { retry: 2 }, () => {
+  it("gives every response on the route a distinct request id, denial or not", async () => {
+    // A decoy challenge (federation OFF) and a real one (federation ON) must be
+    // indistinguishable, so the id has to be on BOTH -- if it rode only on real
+    // ones its mere presence would answer "is federation enabled?".
+    const decoy = await rawChallengeBody();
+    const denial = await expectUniformForbidden(
+      await completeReissue(signedCompleteBody({
+        challenge_id: String(decoy.challenge_id),
+        challenge: String(decoy.challenge),
+      })),
+    );
+
+    await enableFederation();
+    const real = await rawChallengeBody();
+    const success = await completeReissue(
+      signedCompleteBody({
+        challenge_id: String(real.challenge_id),
+        challenge: String(real.challenge),
+      }),
+    );
+    expect(success.status).toBe(200);
+    const successBody = (await success.json()) as { request_id?: unknown };
+
+    for (const id of [decoy.request_id, real.request_id, successBody.request_id]) {
+      expect(String(id)).toMatch(UUID_RE);
+    }
+    const ids = [decoy.request_id, denial, real.request_id, successBody.request_id];
+    expect(new Set(ids.map(String)).size).toBe(4);
+  });
+
+  it("returns the SAME denial body shape for three different causes", async () => {
+    // federation_disabled: never enabled.
+    const disabledChallenge = await rawChallengeBody();
+    const disabledDenial = await completeReissue(
+      signedCompleteBody({
+        challenge_id: String(disabledChallenge.challenge_id),
+        challenge: String(disabledChallenge.challenge),
+      }),
+    );
+
+    // challenge_invalid: enable, then present a challenge that was never issued.
+    await enableFederation();
+    const challengeInvalidDenial = await completeReissue(
+      signedCompleteBody({
+        challenge_id: "00000000-0000-4000-8000-000000000000",
+        challenge: "not-a-real-challenge",
+      }),
+    );
+
+    // no_recorded_rotation_lineage: a fortress that never rotated.
+    const noLineage = { ...materials.context };
+    delete noLineage.recordedRotationCert;
+    delete noLineage.recordedRotationSerial;
+    rig.dashboard.setFederationContext(noLineage);
+    await enableFederation();
+    const lineageChallenge = await issueChallenge();
+    const lineageDenial = await completeReissue(signedCompleteBody(lineageChallenge));
+
+    const bodies = await Promise.all(
+      [disabledDenial, challengeInvalidDenial, lineageDenial].map(async (res) => {
+        expect(res.status).toBe(403);
+        return (await res.json()) as Record<string, unknown>;
+      }),
+    );
+    // Identical once the uniform-random id is removed: nothing in the body
+    // separates "federation is off" from "no lineage" from "bad challenge".
+    for (const body of bodies) {
+      const { request_id, ...rest } = body;
+      expect(String(request_id)).toMatch(UUID_RE);
+      expect(rest).toEqual({ error: "forbidden" });
+    }
+    expect(new Set(bodies.map((b) => String(b.request_id))).size).toBe(3);
+  });
+
+  it("resolves a denial's request id to the precise reason in the ISSUER audit", async () => {
+    await enableFederation();
+    const challenge = await issueChallenge();
+    const body = signedCompleteBody(challenge);
+    expect((await completeReissue(body)).status).toBe(200);
+
+    // Replay the spent challenge: the wire says only "forbidden".
+    const requestId = await expectUniformForbidden(await completeReissue(body));
+
+    const entry = await auditEntryForRequestId(requestId);
+    expect(entry.result).toBe("failure");
+    expect(entry.details?.reason).toBe("challenge_invalid");
+    // And the remediation, so the lookup ends in an action rather than a code.
+    expect(String(entry.details?.operator_next_step)).toContain("fresh challenge");
+  });
+
+  it("audits the lineage reason with BOTH serials and the restart instruction", async () => {
+    // The exact condition Leg A hit: a rotate-root the running endpoint never
+    // picked up. The two serials are what separate that from "never rotated".
+    const noLineage = { ...materials.context };
+    delete noLineage.recordedRotationCert;
+    delete noLineage.recordedRotationSerial;
+    rig.dashboard.setFederationContext(noLineage);
+    await enableFederation();
+    const challenge = await issueChallenge();
+
+    const requestId = await expectUniformForbidden(
+      await completeReissue(signedCompleteBody(challenge)),
+    );
+
+    const entry = await auditEntryForRequestId(requestId);
+    expect(entry.details?.reason).toBe("no_recorded_rotation_lineage");
+    expect(entry.details?.recorded_rotation_serial).toBeNull();
+    expect(entry.details?.presented_rotation_serial).toBe(
+      materials.rotationCert.rotation_serial,
+    );
+    expect(String(entry.details?.operator_next_step)).toContain("Restart the fortress endpoint");
+  });
+
+  it("audits the disabled reason with status and re-enable instructions", async () => {
+    const challenge = await rawChallengeBody();
+    const requestId = await expectUniformForbidden(
+      await completeReissue(
+        signedCompleteBody({
+          challenge_id: String(challenge.challenge_id),
+          challenge: String(challenge.challenge),
+        }),
+      ),
+    );
+
+    const entry = await auditEntryForRequestId(requestId);
+    expect(entry.details?.reason).toBe("federation_disabled");
+    expect(String(entry.details?.operator_next_step)).toContain(
+      "sanctuary federation status",
+    );
+    expect(String(entry.details?.operator_next_step)).toContain(
+      "sanctuary federation enable",
+    );
+  });
+
+  it("carries a remediation for a deep issuance reason too, not just the shallow ones", async () => {
+    // The remediation map has to cover the reasons thrown from inside the
+    // issuance path as well, or the CLI sends the operator to read a field that
+    // is not there. proof_invalid is one of those deep ones.
+    await enableFederation();
+    const challenge = await issueChallenge();
+    const body = signedCompleteBody(challenge);
+    body.node_signature = toBase64url(randomBytes(64));
+
+    const requestId = await expectUniformForbidden(await completeReissue(body));
+    const entry = await auditEntryForRequestId(requestId);
+    expect(entry.details?.reason).toBe("proof_invalid");
+    expect(String(entry.details?.operator_next_step)).toContain("fresh challenge");
+  });
+
+  it("keeps the reason and the remediation OFF the wire entirely", async () => {
+    const challenge = await rawChallengeBody();
+    const res = await completeReissue(
+      signedCompleteBody({
+        challenge_id: String(challenge.challenge_id),
+        challenge: String(challenge.challenge),
+      }),
+    );
+    const raw = await res.text();
+    // The literal audit strings must never appear in a response body.
+    expect(raw).not.toContain("federation_disabled");
+    expect(raw).not.toContain("operator_next_step");
+    expect(raw).not.toContain("reason");
   });
 });
 
