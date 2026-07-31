@@ -212,6 +212,20 @@ export type GuardianAntiRollbackAnchorRead =
 
 /** The derived security state this store persists and rehydrates. */
 export interface FederationSyncStateSnapshot {
+  /**
+   * Operator-controlled /v1 federation serving switch. It is persisted in this
+   * same encrypted federation state record so `sanctuary federation enable`
+   * survives a dashboard restart. Absent on older records decodes to false,
+   * preserving the prior fail-closed default.
+   */
+  federationEnabled?: boolean;
+  /**
+   * Monotonic generation for {@link federationEnabled}. Enable/disable is not a
+   * grow-only value, so the merge cannot OR it. The higher generation wins,
+   * preventing a stale writer that only updates revocation/high-water fields
+   * from clobbering a newer operator enable or disable decision.
+   */
+  federationEnabledGeneration?: number;
   /** Per-sender accepted high-water: senderNodeId -> highest accepted value. */
   acceptedHighWater: Map<string, number>;
   /** This daemon's own monotonic outbound (reciprocal) high-water. */
@@ -332,6 +346,10 @@ export interface FederationSyncStateSnapshot {
 interface PersistedSyncState {
   /** Format version for forward-compatibility. */
   v: 1;
+  /** Durable operator serving switch for /v1 federation routes. */
+  federation_enabled?: boolean;
+  /** Monotonic generation for `federation_enabled`. */
+  federation_enabled_generation?: number;
   /** [senderNodeId, highWater] pairs. */
   accepted_high_water: Array<[string, number]>;
   /** This daemon's own outbound high-water. */
@@ -461,6 +479,8 @@ export class FederationSyncStateStoreError extends Error {
 /** An empty/zero snapshot: the only legitimate "no record yet" result. */
 export function emptyFederationSyncState(): FederationSyncStateSnapshot {
   return {
+    federationEnabled: false,
+    federationEnabledGeneration: 0,
     acceptedHighWater: new Map(),
     outboundHighWater: 0,
     revokedNodeIds: new Set(),
@@ -858,6 +878,8 @@ export class FederationSyncStateStore {
         });
         const persisted: PersistedSyncState = {
           v: 1,
+          federation_enabled: merged.federationEnabled ?? false,
+          federation_enabled_generation: merged.federationEnabledGeneration ?? 0,
           accepted_high_water: [...merged.acceptedHighWater],
           outbound_high_water: merged.outboundHighWater,
           revoked_node_ids: [...merged.revokedNodeIds],
@@ -912,6 +934,11 @@ function cloneSnapshot(
     (snapshot as Partial<FederationSyncStateSnapshot>).appliedPolicyVersions ??
     new Map<string, FederationAppliedPolicyVersion>();
   return {
+    federationEnabled:
+      (snapshot as Partial<FederationSyncStateSnapshot>).federationEnabled ?? false,
+    federationEnabledGeneration:
+      (snapshot as Partial<FederationSyncStateSnapshot>)
+        .federationEnabledGeneration ?? 0,
     acceptedHighWater: new Map(snapshot.acceptedHighWater),
     outboundHighWater: snapshot.outboundHighWater,
     revokedNodeIds: new Set(snapshot.revokedNodeIds),
@@ -1065,6 +1092,7 @@ function mergeSyncStateMonotonic(
     }
   }
   return {
+    ...selectFederationEnabledByGeneration(base, next),
     acceptedHighWater,
     outboundHighWater: Math.max(base.outboundHighWater, next.outboundHighWater),
     revokedNodeIds,
@@ -1121,6 +1149,24 @@ function mergeSyncStateMonotonic(
 }
 
 /**
+ * Choose the durable federation serving switch by the higher generation. On a
+ * tie, keep `base`, the freshly loaded on-disk state, so an unchanged stale
+ * caller cannot win by accident.
+ */
+function selectFederationEnabledByGeneration(
+  base: FederationSyncStateSnapshot,
+  next: FederationSyncStateSnapshot,
+): { federationEnabled: boolean; federationEnabledGeneration: number } {
+  const baseGen = base.federationEnabledGeneration ?? 0;
+  const nextGen = next.federationEnabledGeneration ?? 0;
+  const winner = nextGen > baseGen ? next : base;
+  return {
+    federationEnabled: winner.federationEnabled ?? false,
+    federationEnabledGeneration: Math.max(baseGen, nextGen),
+  };
+}
+
+/**
  * Choose the guardian revocation requirement + its generation + its in-flight
  * break-glass state, ALL THREE, by the HIGHER generation counter. On a tie
  * (neither writer bumped the generation) the values are identical, so `base`
@@ -1172,6 +1218,17 @@ function decodeSyncState(value: unknown): FederationSyncStateSnapshot {
   }
 
   const acceptedHighWater = decodeAcceptedHighWater(obj.accepted_high_water);
+  const federationEnabled =
+    obj.federation_enabled === undefined
+      ? false
+      : decodeBoolean(obj.federation_enabled, "federation_enabled");
+  const federationEnabledGeneration =
+    obj.federation_enabled_generation === undefined
+      ? 0
+      : decodeNonNegativeInt(
+          obj.federation_enabled_generation,
+          "federation_enabled_generation",
+        );
   const outboundHighWater = decodeNonNegativeInt(
     obj.outbound_high_water,
     "outbound_high_water",
@@ -1243,6 +1300,8 @@ function decodeSyncState(value: unknown): FederationSyncStateSnapshot {
   const guardianBreakGlass = decodeBreakGlassState(obj.guardian_break_glass);
 
   return {
+    federationEnabled,
+    federationEnabledGeneration,
     acceptedHighWater,
     outboundHighWater,
     revokedNodeIds,
@@ -1258,6 +1317,13 @@ function decodeSyncState(value: unknown): FederationSyncStateSnapshot {
     guardianLoweredHighWater,
     guardianBreakGlass,
   };
+}
+
+function decodeBoolean(value: unknown, label: string): boolean {
+  if (typeof value !== "boolean") {
+    throw new FederationSyncStateStoreError(`${label} is invalid`);
+  }
+  return value;
 }
 
 function encodeBreakGlassState(state: BreakGlassState): PersistedBreakGlassState {

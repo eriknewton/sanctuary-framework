@@ -109,6 +109,7 @@ import {
 import {
   dashboardRequest,
   DashboardRequestError,
+  parseServerRequestId,
   type DashboardRequestContext,
 } from "./dashboard-request.js";
 import {
@@ -225,8 +226,13 @@ interface JoinFlags {
   deliveryTarget?: string;
   /** Slice 3b: persist the issued joiner trust root after a successful join (default OFF). */
   persist: boolean;
-  /** Slice 3b: out-of-band pinned master JSON (FortressMasterPublicKey) for --persist. */
-  pinnedMasterJson?: string;
+  /**
+   * Slice 3b: out-of-band pinned master for `--persist`, as inline
+   * `FortressMasterPublicKey` JSON or `@path` (F-FED-FLAGPARITY: `adopt` has
+   * always taken `@file` here; `join` silently did not, so a well-formed
+   * `@pin.json` failed as "not a valid FortressMasterPublicKey").
+   */
+  pinnedMasterArg?: string;
   /** Slice 3b: custody passphrase for --persist (opens the local fortress to write the joiner store). */
   passphrase?: string;
   /** Slice 3b: custody recovery key for --persist (alternative to passphrase). */
@@ -248,7 +254,7 @@ function parseJoinFlags(argv: string[], env: NodeJS.ProcessEnv): JoinFlags {
     deliveryKeyB64: flag("--delivery-key") ?? env.SANCTUARY_OC_DELIVERY_KEY,
     deliveryTarget: flag("--delivery-target"),
     persist: argv.includes("--persist"),
-    pinnedMasterJson: flag("--pinned-master"),
+    pinnedMasterArg: flag("--pinned-master"),
     passphrase: flag("--passphrase") ?? env.SANCTUARY_PASSPHRASE,
     recoveryKey: env.SANCTUARY_RECOVERY_KEY,
     fortressPath: flag("--fortress"),
@@ -293,15 +299,25 @@ export async function runFederationJoin(args: {
   // cannot persist).
   let pinnedMaster: FortressMasterPublicKey | null = null;
   if (flags.persist) {
-    if (!flags.pinnedMasterJson) {
+    if (!flags.pinnedMasterArg) {
       err.write(
-        "sanctuary federation join: --persist requires --pinned-master <json> " +
+        "sanctuary federation join: --persist requires --pinned-master <json | @file> " +
           "(the out-of-band fortress-master public key this joiner trusts; " +
           "the server response is never the trust source)\n",
       );
       return 1;
     }
-    pinnedMaster = parsePinnedMaster(flags.pinnedMasterJson);
+    // Same `@file` handling as `adopt` and `rejoin`: the pinned master is a
+    // multi-line JSON blob carried between machines, so making the operator
+    // paste it inline on exactly one of the three verbs was a pure trap.
+    const pinnedMasterJson = await readInlineOrFile(flags.pinnedMasterArg);
+    if (pinnedMasterJson === null) {
+      err.write(
+        "sanctuary federation join: could not read --pinned-master (bad @file path?)\n",
+      );
+      return 1;
+    }
+    pinnedMaster = parsePinnedMaster(pinnedMasterJson);
     if (pinnedMaster === null) {
       err.write(
         "sanctuary federation join: --pinned-master is not a valid FortressMasterPublicKey " +
@@ -777,7 +793,31 @@ export async function runFederationAdopt(args: {
       `${plannedAdoptHeldReason(result.reason)}` +
       `${result.detail ? ` (${result.detail})` : ""}\n`,
   );
+  if (result.issuerRequestId !== undefined) {
+    err.write(issuerLookupInstruction(result.issuerRequestId));
+  }
   return result.reason === "reissue_unreachable" ? 2 : 3;
+}
+
+/**
+ * The operator's route from an opaque issuer refusal to the actual reason.
+ *
+ * The issuer will not tell an unauthenticated joiner WHICH check failed (that
+ * would be a fortress-state oracle), so it returns a correlation id instead. An
+ * operator who can already read the issuer's fortress trades that id for the
+ * precise audited reason plus its remediation. Printing the exact command is the
+ * point: a correlation id nobody knows how to spend is not diagnosability
+ * (F-FED-OPAQUEDENY, hit twice on the 2026-07-30/31 two-machine drills).
+ */
+function issuerLookupInstruction(issuerRequestId: string): string {
+  return (
+    `  issuer request id: ${issuerRequestId}\n` +
+    `  the issuer audited the precise reason; the joiner is deliberately not told it. ` +
+    `On the ISSUER machine run:\n` +
+    `    sanctuary audit search --request-id ${issuerRequestId} --json\n` +
+    `  and read \`reason\` in the matching entry, plus \`operator_next_step\` when ` +
+    `that reason has a recorded remediation.\n`
+  );
 }
 
 function plannedAdoptHeldReason(reason: string): string {
@@ -801,8 +841,15 @@ function plannedAdoptHeldReason(reason: string): string {
         "operator-supplied --pinned-master; a K1-signed cert alone is not a " +
         "sufficient anchor when K1 may be compromised";
     case "reissue_denied":
-      return "the fortress refused to reissue this node's cert (revoked node, " +
-        "revoked old root, or no recorded rotation lineage)";
+      // Every listed cause has been seen in the field. The joiner cannot tell
+      // them apart by design; the issuer request id printed below this line is
+      // how the operator finds out which one it was.
+      return "the ISSUER refused to reissue this node's cert. The issuer does " +
+        "not tell a joiner which check failed; the observed causes are " +
+        "federation switched off on the issuer, no recorded rotation lineage " +
+        "(a rotate-root the running endpoint never picked up), a presented " +
+        "rotation cert that is not the issuer's recorded lineage, a revoked " +
+        "node, a revoked old root, or a stale/spent challenge";
     case "reissue_unreachable":
       return "the fortress was unreachable for the reissue round";
     case "server_root_mismatch":
@@ -868,13 +915,17 @@ async function reissueNodeCertViaHttp(
   const ctx: DashboardRequestContext = { dashboardUrl: fortressUrl, authToken: "" };
   const nodeId = req.current.node_id;
 
-  let challenge: { challenge_id?: unknown; challenge?: unknown };
+  let challenge: {
+    challenge_id?: unknown;
+    challenge?: unknown;
+    request_id?: unknown;
+  };
   try {
     challenge = (await request(
       FEDERATION_REISSUE_NODE_CERT_PATH,
       { method: "POST", body: JSON.stringify({ action: "challenge", node_id: nodeId }) },
       ctx,
-    )) as { challenge_id?: unknown; challenge?: unknown };
+    )) as { challenge_id?: unknown; challenge?: unknown; request_id?: unknown };
   } catch (cause) {
     return mapReissueTransportError(cause);
   }
@@ -882,7 +933,7 @@ async function reissueNodeCertViaHttp(
     typeof challenge.challenge_id !== "string" ||
     typeof challenge.challenge !== "string"
   ) {
-    return { ok: false, reason: "denied" };
+    return denied(responseRequestId(challenge));
   }
 
   const proofMessage = buildFederationReissueNodeCertProofMessage({
@@ -900,6 +951,7 @@ async function reissueNodeCertViaHttp(
     certificate?: unknown;
     issuing_principal_cert?: unknown;
     pinned_master?: unknown;
+    request_id?: unknown;
   };
   try {
     completed = (await request(
@@ -922,6 +974,7 @@ async function reissueNodeCertViaHttp(
       certificate?: unknown;
       issuing_principal_cert?: unknown;
       pinned_master?: unknown;
+      request_id?: unknown;
     };
   } catch (cause) {
     return mapReissueTransportError(cause);
@@ -937,7 +990,7 @@ async function reissueNodeCertViaHttp(
     typeof completed.pinned_master !== "object" ||
     completed.pinned_master === null
   ) {
-    return { ok: false, reason: "denied" };
+    return denied(responseRequestId(completed));
   }
   return {
     ok: true,
@@ -947,11 +1000,37 @@ async function reissueNodeCertViaHttp(
   };
 }
 
+/** A denial, carrying the issuer's correlation id when the issuer sent one. */
+function denied(
+  issuerRequestId?: string,
+): FederationJoinerPlannedRootAdoptReissueResult {
+  return {
+    ok: false,
+    reason: "denied",
+    ...(issuerRequestId !== undefined ? { issuerRequestId } : {}),
+  };
+}
+
+/**
+ * Read a server-minted `request_id` out of an untrusted 200 body, through the
+ * SAME shape guard the error path uses. The endpoint is pre-session, so this
+ * string is remote-controlled and ends up in a command shown to the operator;
+ * anything that is not a literal UUID is dropped. See `parseServerRequestId`.
+ */
+function responseRequestId(body: { request_id?: unknown }): string | undefined {
+  return parseServerRequestId(body.request_id);
+}
+
 function mapReissueTransportError(
   cause: unknown,
 ): FederationJoinerPlannedRootAdoptReissueResult {
   if (cause instanceof DashboardRequestError) {
-    return { ok: false, reason: cause.kind === "auth" ? "denied" : "unreachable" };
+    // The issuer's 403 carries an opaque correlation id (and nothing else about
+    // the cause); keep it so the adopt refusal can tell the operator what to
+    // look up on the ISSUER.
+    return cause.kind === "auth"
+      ? denied(cause.requestId)
+      : { ok: false, reason: "unreachable" };
   }
   return { ok: false, reason: "unreachable" };
 }
@@ -1025,7 +1104,8 @@ interface RejoinFlags {
   fortressUrl?: string;
   bootstrapTokenJson?: string;
   masterSecretB64?: string;
-  pinnedMasterJson?: string;
+  /** Inline `FortressMasterPublicKey` JSON or `@path` (F-FED-FLAGPARITY). */
+  pinnedMasterArg?: string;
   revokedOldMaster?: string;
   revocationSerialRaw?: string;
   passphrase?: string;
@@ -1043,7 +1123,7 @@ function parseRejoinFlags(argv: string[], env: NodeJS.ProcessEnv): RejoinFlags {
     fortressUrl: flag("--fortress-url") ?? env.SANCTUARY_FORTRESS_URL,
     bootstrapTokenJson: flag("--bootstrap-token"),
     masterSecretB64: flag("--master-secret") ?? env.SANCTUARY_FORTRESS_MASTER_SECRET,
-    pinnedMasterJson: flag("--pinned-master"),
+    pinnedMasterArg: flag("--pinned-master"),
     revokedOldMaster: flag("--revoked-old-master"),
     revocationSerialRaw: flag("--revocation-serial"),
     passphrase: flag("--passphrase") ?? env.SANCTUARY_PASSPHRASE,
@@ -1099,15 +1179,22 @@ export async function runFederationRejoin(args: {
     );
     return 1;
   }
-  if (!flags.pinnedMasterJson) {
+  if (!flags.pinnedMasterArg) {
     err.write(
-      "sanctuary federation rejoin: --pinned-master <K2 json> is required " +
+      "sanctuary federation rejoin: --pinned-master <K2 json | @file> is required " +
         "(the OUT-OF-BAND new fortress-master public key; the server response is " +
         "never the trust source)\n",
     );
     return 1;
   }
-  const pinnedMaster = parsePinnedMaster(flags.pinnedMasterJson);
+  const pinnedMasterJson = await readInlineOrFile(flags.pinnedMasterArg);
+  if (pinnedMasterJson === null) {
+    err.write(
+      "sanctuary federation rejoin: could not read --pinned-master (bad @file path?)\n",
+    );
+    return 1;
+  }
+  const pinnedMaster = parsePinnedMaster(pinnedMasterJson);
   if (pinnedMaster === null) {
     err.write(
       "sanctuary federation rejoin: --pinned-master is not a valid " +
@@ -1188,8 +1275,11 @@ export async function runFederationRejoin(args: {
     flags.bootstrapTokenJson,
     "--master-secret",
     flags.masterSecretB64,
+    // Forward the RESOLVED JSON, not the raw `@path`: the file has already been
+    // read and validated here, so the inner join must not re-read it (a swap
+    // between the two reads would be a TOCTOU on the trust anchor).
     "--pinned-master",
-    flags.pinnedMasterJson,
+    pinnedMasterJson,
     "--persist",
     ...(flags.passphrase !== undefined ? ["--passphrase", flags.passphrase] : []),
     ...(flags.fortressPath !== undefined ? ["--fortress", flags.fortressPath] : []),
@@ -1297,6 +1387,12 @@ function isBase64urlEd25519Pubkey(raw: string): boolean {
 interface AdminFlags {
   fortressUrl?: string;
   authToken?: string;
+  /**
+   * `SANCTUARY_DASHBOARD_AUTH_TOKEN` was set in the environment and DELIBERATELY
+   * not consumed as an auth-token override (F-FED-AUTHENVTRAP). Drives a
+   * one-line notice so the operator is not surprised in the other direction.
+   */
+  envAuthTokenIgnored: boolean;
   idempotencyKey?: string;
   nodeId?: string;
   nodeMode: NodeMode;
@@ -1317,9 +1413,26 @@ function parseAdminFlags(argv: string[], env: NodeJS.ProcessEnv): AdminFlags {
   const nodeModeValid = (["local", "operator_cloud", "sovereign_tee"] as const).includes(
     rawMode as NodeMode,
   );
+  const explicitAuthToken = flag("--auth-token");
   return {
     fortressUrl: flag("--fortress-url") ?? env.SANCTUARY_FORTRESS_URL,
-    authToken: flag("--auth-token") ?? env.SANCTUARY_DASHBOARD_AUTH_TOKEN,
+    // F-FED-AUTHENVTRAP (drilled 2026-07-30 AND 2026-07-31): this used to fall
+    // back to `env.SANCTUARY_DASHBOARD_AUTH_TOKEN`. That env var holds the
+    // LEGACY `/api/*` operator token, and every federation admin verb targets
+    // `/v1`, which is session-token only. So merely having the variable exported
+    // -- the normal state on a machine that uses any other Sanctuary CLI verb --
+    // suppressed the session ceremony below and sent a bearer token `/v1` will
+    // never accept, turning working verbs into "operator authorization
+    // rejected". The trap is REMOVED rather than documented: only an explicit
+    // `--auth-token` counts as an override now, which is also the only way to
+    // supply a token that could actually be a valid /v1 session token. The
+    // ignored env var is reported once (see `resolveAdminSessionToken`) so the
+    // operator never has to guess in the other direction either.
+    ...(explicitAuthToken !== undefined ? { authToken: explicitAuthToken } : {}),
+    envAuthTokenIgnored:
+      explicitAuthToken === undefined &&
+      typeof env.SANCTUARY_DASHBOARD_AUTH_TOKEN === "string" &&
+      env.SANCTUARY_DASHBOARD_AUTH_TOKEN.length > 0,
     idempotencyKey: flag("--idempotency-key"),
     nodeId: flag("--node-id"),
     nodeMode: rawMode as NodeMode,
@@ -1365,6 +1478,15 @@ async function resolveAdminSessionToken(
 ): Promise<string | number> {
   // Explicit override: the operator handed us a token; use it verbatim.
   if (flags.authToken !== undefined) return flags.authToken;
+  if (flags.envAuthTokenIgnored) {
+    err.write(
+      `sanctuary federation ${verb}: note: SANCTUARY_DASHBOARD_AUTH_TOKEN is set ` +
+        `and is IGNORED here. It is the legacy /api operator token; the /v1 ` +
+        `federation endpoints accept session tokens only, so this verb opens its ` +
+        `own /v1 session with your operator identity. Pass --auth-token <token> ` +
+        `to override that deliberately.\n`,
+    );
+  }
   try {
     const session = await openSession(
       flags.fortressUrl !== undefined ? { dashboardUrl: flags.fortressUrl } : undefined,
@@ -1594,6 +1716,12 @@ export async function runFederationEnableDisable(args: {
       adminRequestContext(flags, sessionToken),
     )) as { enabled?: unknown };
     out.write(`${JSON.stringify({ enabled: response.enabled === true }, null, 2)}\n`);
+    if (args.enable && response.enabled === true) {
+      err.write(
+        "sanctuary federation enable: enabled state was durably recorded and " +
+          "will be restored on endpoint restart.\n",
+      );
+    }
     return 0;
   } catch (cause) {
     return mapAdminRequestError(verb, cause, flags.fortressUrl, err);
@@ -2558,6 +2686,33 @@ function parseRotateRootFlags(
  *   fail-closed custody / mutual-exclusion / rotation failure). No exit 2 (no
  *   HTTP call).
  */
+/**
+ * What the operator MUST do after a rotation, in order.
+ *
+ * `rotate-root` is a separate process writing to the fortress on disk; a fortress
+ * ENDPOINT that was already running keeps serving the root it loaded at boot. So
+ * every joiner `adopt` against that endpoint fails (`no_recorded_rotation_lineage`)
+ * until it is restarted (F-FED-ROTLINEAGE). Older endpoints also dropped the
+ * federation-enabled flag on restart; current endpoints persist that flag, but
+ * the status check below remains the operator-visible confirmation.
+ *
+ * Deliberately UNCONDITIONAL: this verb is local-only and never opens a socket,
+ * so it cannot truthfully report whether an endpoint is running. It says "if one
+ * is running" rather than pretending to know.
+ */
+const ROTATE_ROOT_NEXT_STEPS: readonly string[] = [
+  "If a fortress endpoint was already RUNNING during this rotation, it is still serving the PRE-rotation root from memory and will refuse every joiner adopt: restart it now.",
+  "After the restart, run `sanctuary federation status --fortress-url <url>`; if it reports disabled, run `sanctuary federation enable --fortress-url <url>`.",
+  "Then distribute pinned_master (and rotation_cert, when present) out of band and run the joiner-side verb on each node.",
+];
+
+function writeRotateRootNextSteps(err: Writable): void {
+  err.write("sanctuary federation rotate-root: next steps\n");
+  for (const step of ROTATE_ROOT_NEXT_STEPS) {
+    err.write(`  - ${step}\n`);
+  }
+}
+
 export async function runFederationRotateRoot(args: {
   argv: string[];
   env?: NodeJS.ProcessEnv;
@@ -2684,11 +2839,13 @@ export async function runFederationRotateRoot(args: {
             pinned_master: { ...result.new_pinned_master },
             root_revocation: { ...result.root_revocation },
             adoption: "out-of-band re-pin of pinned_master (no rotation cert is issued for a compromise)",
+            next_steps: ROTATE_ROOT_NEXT_STEPS,
           },
           null,
           2,
         )}\n`,
       );
+      writeRotateRootNextSteps(err);
       return 0;
     }
 
@@ -2719,11 +2876,13 @@ export async function runFederationRotateRoot(args: {
           previous_master_pubkey: result.previous_master_pubkey,
           pinned_master: { ...result.new_pinned_master },
           rotation_cert: { ...result.rotation_cert },
+          next_steps: ROTATE_ROOT_NEXT_STEPS,
         },
         null,
         2,
       )}\n`,
     );
+    writeRotateRootNextSteps(err);
     return 0;
   } catch (cause) {
     if (
@@ -3179,7 +3338,7 @@ Joiner verb -- runs on the joining node:
     --delivery-key <b64url> --delivery-target <target>
 
   Persist the joiner trust root (boots this node provisioned next start):
-  sanctuary federation join ... --persist --pinned-master <FortressMasterPublicKey json>
+  sanctuary federation join ... --persist --pinned-master <FortressMasterPublicKey json | @file>
 
   join     Submit a JoinRequest to a fortress and install the issued node
            certificate. The bootstrap token is minted by the operator on the
@@ -3209,7 +3368,7 @@ Recover after a rotate-root -- run on the joining node:
 
   Compromise rotation (the old root is in enemy hands):
   sanctuary federation rejoin --fortress-url <url> \\
-    --pinned-master <K2 json> --bootstrap-token <fresh json> --master-secret <new b64url> \\
+    --pinned-master <K2 json | @file> --bootstrap-token <fresh json> --master-secret <new b64url> \\
     --revoked-old-master <K1 pubkey> --revocation-serial <n> \\
     [--passphrase <s> | SANCTUARY_PASSPHRASE | SANCTUARY_RECOVERY_KEY] [--fortress <path>]
 

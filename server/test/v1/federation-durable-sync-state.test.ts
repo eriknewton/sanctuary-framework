@@ -282,6 +282,42 @@ describe("Federation 3/3b P0 - durable sync-state at the dashboard seam", () => 
     expect(third).toBe(3);
   });
 
+  it("F-FED-ENABLEVOLATILE: the federation enable switch survives restart", async () => {
+    const storage = new MemoryStorage();
+
+    const boot1 = await buildRecipient(fortress, "linux-1", storage);
+    expect(boot1.deps.isEnabled()).toBe(false);
+    await boot1.deps.setEnabled(true);
+    expect(boot1.deps.isEnabled()).toBe(true);
+
+    const boot2 = await buildRecipient(fortress, "linux-1", storage);
+    expect(boot2.deps.isEnabled()).toBe(true);
+    await boot2.deps.setEnabled(false);
+    expect(boot2.deps.isEnabled()).toBe(false);
+
+    const boot3 = await buildRecipient(fortress, "linux-1", storage);
+    expect(boot3.deps.isEnabled()).toBe(false);
+  });
+
+  it("F-FED-ENABLEVOLATILE: failed enable persistence rolls the live switch back", async () => {
+    class ArmedFailWriteStorage extends MemoryStorage {
+      armed = false;
+      override async write(ns: string, key: string, bytes: Uint8Array): Promise<void> {
+        if (this.armed && ns === "_federation" && key === "sync-state-v1") {
+          throw new Error("disk write failed");
+        }
+        return super.write(ns, key, bytes);
+      }
+    }
+    const storage = new ArmedFailWriteStorage();
+    const boot = await buildRecipient(fortress, "linux-1", storage);
+
+    expect(boot.deps.isEnabled()).toBe(false);
+    storage.armed = true;
+    await expect(boot.deps.setEnabled(true)).rejects.toThrow();
+    expect(boot.deps.isEnabled()).toBe(false);
+  });
+
   it("RR-1: the revoked-root predicate is wired feature-inert (empty in P0)", async () => {
     const storage = new MemoryStorage();
     const boot = await buildRecipient(fortress, "linux-1", storage);

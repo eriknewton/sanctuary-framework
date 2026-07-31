@@ -68,7 +68,13 @@ import type {
 } from "../mesh/lifecycle/types.js";
 import type { V1SessionClaims } from "./session-service.js";
 import { canonicalJson, verifyOperatorSignature } from "./operator-signed.js";
-import { writeJson, readJsonBody, denyUnauthorized, denyForbidden } from "./http.js";
+import {
+  writeJson,
+  readJsonBody,
+  denyUnauthorized,
+  denyForbidden,
+  denyForbiddenWithRequestId,
+} from "./http.js";
 import {
   verifySyncEnvelope,
   signSyncEnvelope,
@@ -555,7 +561,7 @@ export interface V1FederationDeps {
   /** Live fortress materials, or null when federation is not provisioned. */
   getContext(): FederationContext | null;
   isEnabled(): boolean;
-  setEnabled(enabled: boolean): void;
+  setEnabled(enabled: boolean): void | Promise<void>;
   /** Operator identity public key for OPERATOR_SIGNED gating (PR-A2 parity). */
   resolveOperatorPublicKey(): Uint8Array | null;
   audit: FederationAudit;
@@ -964,7 +970,18 @@ async function handleEnableDisable(
     return;
   }
 
-  deps.setEnabled(enable);
+  try {
+    await deps.setEnabled(enable);
+  } catch {
+    await deps.audit({
+      operation,
+      result: "failure",
+      identityId: "operator",
+      details: { reason: "durable_state_persist_failed", enabled: enable },
+    });
+    writeJson(res, 503, { error: "unavailable" });
+    return;
+  }
   await deps.audit({
     operation,
     result: "success",
@@ -1415,16 +1432,78 @@ interface ReissueNodeCertCompleteRequest {
 }
 
 class ReissueNodeCertFailure extends Error {
-  constructor(readonly auditReason: string) {
+  constructor(
+    readonly auditReason: string,
+    /** Extra NON-SECRET facts for the issuer audit entry only. Never sent on the wire. */
+    readonly auditFacts: Record<string, unknown> = {},
+  ) {
     super(auditReason);
   }
 }
+
+/**
+ * Per-denial-reason remediation, written into the ISSUER's audit entry ONLY
+ * (never into a response). This is the operator-facing half of the correlation
+ * id: `sanctuary audit search --request-id <id>` prints the precise reason AND
+ * the exact next step, instead of leaving the operator to infer it.
+ *
+ * The two lineage reasons carry the restart instruction because a running
+ * endpoint does NOT pick up a `rotate-root` performed under it
+ * (F-FED-ROTLINEAGE). `federation_disabled` still carries an explicit
+ * enable/status instruction because disabled is the only safe server-side
+ * response when the operator switch is off or could not be rehydrated.
+ */
+const REISSUE_DENIAL_OPERATOR_NEXT_STEP: Readonly<Record<string, string>> = {
+  malformed_or_oversized_body:
+    "the request body was unparseable or over the size cap. Re-run the joiner verb rather than replaying a captured request; if it repeats, the two ends are running incompatible builds.",
+  malformed_request:
+    "the request did not carry the fields this endpoint requires. Re-run the joiner verb; if it repeats, the two ends are running incompatible builds.",
+  revocation_state_unavailable:
+    "this fortress could not read its own node-revocation state, so it refused rather than issue on stale state. Check the fortress's storage health and audit integrity, then retry.",
+  challenge_store_unavailable:
+    "this fortress could not open its single-use challenge store, so it refused rather than skip the proof-of-possession round. Check storage health and retry.",
+  old_root_revoked:
+    "the PREDECESSOR root in this fortress's own recorded lineage has been revoked, so that lineage can no longer anchor an issuance. The node must re-join against the current root with `sanctuary federation rejoin`, not adopt.",
+  rotation_cert_invalid:
+    "this fortress's own recorded rotation cert failed verification against its predecessor master (including the anti-rollback serial floor). This is a fortress-side integrity problem, not a joiner problem: inspect the trust-root record before retrying.",
+  rotation_cert_not_current_root:
+    "this fortress's recorded rotation cert does not attest the root it currently pins, so its lineage is internally inconsistent. Inspect the trust-root record; do not retry the adopt until it is resolved.",
+  old_cert_chain_invalid:
+    "the node cert chain presented for reissue is not a valid chain for this fortress and this node. Re-join the node with `sanctuary federation rejoin` instead of adopting.",
+  proof_invalid:
+    "the proof of possession over the server challenge did not verify against the presented node cert. Re-run the adopt so it obtains a fresh challenge; if it repeats, this node's stored private key does not match the cert it presented.",
+  certificate_issue_failed:
+    "this fortress could not mint the replacement certificate. Check the fortress's issuing material and storage health, then retry.",
+  federation_disabled:
+    "federation is OFF in the running fortress process. Current builds persist the enabled switch across endpoint restarts; run `sanctuary federation status --fortress-url <url>` on the issuer, then run `sanctuary federation enable --fortress-url <url>` if it is disabled, and retry.",
+  no_recorded_rotation_lineage:
+    "this fortress PROCESS has no recorded root-rotation lineage. Either the fortress has never run `rotate-root`, or a rotation happened while this endpoint was already running (a running endpoint does NOT pick up a rotate-root). Restart the fortress endpoint, run `sanctuary federation status --fortress-url <url>` and enable only if it reports disabled, then retry the adopt. Compare recorded_rotation_serial below with presented_rotation_serial: a presented serial above the recorded one means this process is behind the on-disk root.",
+  rotation_cert_not_recorded_lineage:
+    "the presented rotation cert is not the rotation this fortress recorded. Either it is a superseded/orphaned cert (e.g. the losing side of a same-serial fork), or this endpoint has not picked up the newest rotate-root. Redistribute the rotation cert printed by the CURRENT `rotate-root`, restart the fortress endpoint if it was running during the rotation, then retry. Compare recorded_rotation_serial with presented_rotation_serial below.",
+  root_revoked:
+    "the root this fortress pins is in its revoked set; a revoked root can never anchor an issuance. Complete the compromise re-key and have joiners re-join with `sanctuary federation rejoin` against the new root.",
+  node_revoked:
+    "this node id is revoked on the issuer. Re-authorize it (`sanctuary federation authorize --node-id <id>`) and have it re-join; a revoked node is never reissued.",
+  challenge_invalid:
+    "the reissue challenge was missing, expired, already spent, or did not match. Retry the adopt so it obtains a fresh challenge; a challenge is single-use by design.",
+  issuer_authority_unavailable:
+    "this fortress holds no issuing material (it is a joiner or an operator-cloud node, not the issuer). Run the reissue against the ISSUER's fortress URL.",
+  hybrid_reissue_unsupported:
+    "this fortress uses the post-quantum hybrid suite, for which node-cert reissue is not implemented; refusing rather than verifying only the classical half. Re-join the node out of band instead of adopting.",
+};
 
 async function handleReissueNodeCert(
   deps: V1FederationDeps,
   req: IncomingMessage,
   res: ServerResponse,
 ): Promise<void> {
+  // F-FED-OPAQUEDENY: ONE opaque correlation id per request, minted BEFORE any
+  // check runs so it can never encode which check failed, and attached to every
+  // response THIS HANDLER emits (real challenge, decoy challenge, success, and
+  // every denial) so its presence is not an oracle either. A request rejected in
+  // front of the handler (the shared /v1 rate limiter's 429) has no id and needs
+  // none. See `denyForbiddenWithRequestId` for the full argument.
+  const requestId = randomUUID();
   const body = await readJsonBody(req, V1_FEDERATION_REISSUE_NODE_CERT_MAX_BODY_BYTES);
   if (!isRecord(body)) {
     await auditReissueFailure(
@@ -1432,17 +1511,18 @@ async function handleReissueNodeCert(
       "v1_federation_reissue_node_cert",
       reissueRequestNodeId(body),
       "malformed_or_oversized_body",
+      requestId,
     );
-    denyForbidden(res);
+    denyForbiddenWithRequestId(res, requestId);
     return;
   }
 
   if (body.action === "challenge") {
-    await handleReissueNodeCertChallenge(deps, body, res);
+    await handleReissueNodeCertChallenge(deps, body, res, requestId);
     return;
   }
   if (body.action === "complete") {
-    await handleReissueNodeCertComplete(deps, body, res);
+    await handleReissueNodeCertComplete(deps, body, res, requestId);
     return;
   }
 
@@ -1451,14 +1531,16 @@ async function handleReissueNodeCert(
     "v1_federation_reissue_node_cert",
     reissueRequestNodeId(body),
     "malformed_request",
+    requestId,
   );
-  denyForbidden(res);
+  denyForbiddenWithRequestId(res, requestId);
 }
 
 async function handleReissueNodeCertChallenge(
   deps: V1FederationDeps,
   body: Record<string, unknown>,
   res: ServerResponse,
+  requestId: string,
 ): Promise<void> {
   const operation = "v1_federation_reissue_node_cert_challenge";
   const nodeId = typeof body.node_id === "string" && body.node_id.length > 0
@@ -1467,8 +1549,8 @@ async function handleReissueNodeCertChallenge(
   const ctx = deps.getContext();
   const unavailable = !deps.isEnabled() || ctx === null;
   if (nodeId === null) {
-    await auditReissueFailure(deps, operation, "peer", "malformed_request");
-    denyForbidden(res);
+    await auditReissueFailure(deps, operation, "peer", "malformed_request", requestId);
+    denyForbiddenWithRequestId(res, requestId);
     return;
   }
   if (unavailable || !federationContextHasIssuerAuthority(ctx)) {
@@ -1477,14 +1559,15 @@ async function handleReissueNodeCertChallenge(
       operation,
       nodeId,
       unavailable ? "federation_disabled" : "issuer_authority_unavailable",
+      requestId,
     );
-    writeReissueChallenge(res, dummyReissueChallenge());
+    writeReissueChallenge(res, dummyReissueChallenge(), requestId);
     return;
   }
 
   if (rootRevokedFailClosed(deps, ctx.pinnedMasterPubkey.public_key)) {
-    await auditReissueFailure(deps, operation, nodeId, "root_revoked");
-    writeReissueChallenge(res, dummyReissueChallenge());
+    await auditReissueFailure(deps, operation, nodeId, "root_revoked", requestId);
+    writeReissueChallenge(res, dummyReissueChallenge(), requestId);
     return;
   }
 
@@ -1492,13 +1575,19 @@ async function handleReissueNodeCertChallenge(
   try {
     revoked = deps.isNodeRevoked(nodeId);
   } catch {
-    await auditReissueFailure(deps, operation, nodeId, "revocation_state_unavailable");
-    writeReissueChallenge(res, dummyReissueChallenge());
+    await auditReissueFailure(
+      deps,
+      operation,
+      nodeId,
+      "revocation_state_unavailable",
+      requestId,
+    );
+    writeReissueChallenge(res, dummyReissueChallenge(), requestId);
     return;
   }
   if (revoked) {
-    await auditReissueFailure(deps, operation, nodeId, "node_revoked");
-    writeReissueChallenge(res, dummyReissueChallenge());
+    await auditReissueFailure(deps, operation, nodeId, "node_revoked", requestId);
+    writeReissueChallenge(res, dummyReissueChallenge(), requestId);
     return;
   }
 
@@ -1509,8 +1598,14 @@ async function handleReissueNodeCertChallenge(
       nodeId,
     });
   } catch {
-    await auditReissueFailure(deps, operation, nodeId, "challenge_store_unavailable");
-    writeReissueChallenge(res, dummyReissueChallenge());
+    await auditReissueFailure(
+      deps,
+      operation,
+      nodeId,
+      "challenge_store_unavailable",
+      requestId,
+    );
+    writeReissueChallenge(res, dummyReissueChallenge(), requestId);
     return;
   }
 
@@ -1518,17 +1613,30 @@ async function handleReissueNodeCertChallenge(
     operation,
     result: "success",
     identityId: nodeId,
-    details: { challenge_id: issued.challenge_id, expires_at: issued.expires_at },
+    details: {
+      request_id: requestId,
+      challenge_id: issued.challenge_id,
+      expires_at: issued.expires_at,
+    },
   });
-  writeReissueChallenge(res, issued);
+  writeReissueChallenge(res, issued, requestId);
 }
 
+/**
+ * The single writer for every challenge-path 200, REAL and DECOY alike, so the
+ * two stay byte-shape identical (the decoy is what keeps a probing caller from
+ * learning whether federation is on). `request_id` is written here rather than
+ * at the call sites for the same reason: one writer cannot drift into emitting
+ * it on only one of the two.
+ */
 function writeReissueChallenge(
   res: ServerResponse,
   challenge: FederationReissueChallenge,
+  requestId: string,
 ): void {
   writeJson(res, 200, {
     request_version: FEDERATION_REISSUE_NODE_CERT_REQUEST_VERSION,
+    request_id: requestId,
     ...challenge,
   });
 }
@@ -1545,24 +1653,31 @@ async function handleReissueNodeCertComplete(
   deps: V1FederationDeps,
   body: Record<string, unknown>,
   res: ServerResponse,
+  requestId: string,
 ): Promise<void> {
   const operation = "v1_federation_reissue_node_cert";
   const request = parseReissueNodeCertComplete(body);
   const ctx = deps.getContext();
   const unavailable = !deps.isEnabled() || ctx === null;
   if (request === null || unavailable || !federationContextHasIssuerAuthority(ctx)) {
-    await auditReissueFailure(deps, operation, reissueRequestNodeId(body), unavailable
-      ? "federation_disabled"
-      : request === null
-        ? "malformed_request"
-        : "issuer_authority_unavailable");
-    denyForbidden(res);
+    await auditReissueFailure(
+      deps,
+      operation,
+      reissueRequestNodeId(body),
+      unavailable
+        ? "federation_disabled"
+        : request === null
+          ? "malformed_request"
+          : "issuer_authority_unavailable",
+      requestId,
+    );
+    denyForbiddenWithRequestId(res, requestId);
     return;
   }
 
   if (rootRevokedFailClosed(deps, ctx.pinnedMasterPubkey.public_key)) {
-    await auditReissueFailure(deps, operation, request.node_id, "root_revoked");
-    denyForbidden(res);
+    await auditReissueFailure(deps, operation, request.node_id, "root_revoked", requestId);
+    denyForbiddenWithRequestId(res, requestId);
     return;
   }
 
@@ -1578,8 +1693,14 @@ async function handleReissueNodeCertComplete(
     consumed = false;
   }
   if (!consumed) {
-    await auditReissueFailure(deps, operation, request.node_id, "challenge_invalid");
-    denyForbidden(res);
+    await auditReissueFailure(
+      deps,
+      operation,
+      request.node_id,
+      "challenge_invalid",
+      requestId,
+    );
+    denyForbiddenWithRequestId(res, requestId);
     return;
   }
 
@@ -1594,8 +1715,10 @@ async function handleReissueNodeCertComplete(
       err instanceof ReissueNodeCertFailure
         ? err.auditReason
         : "certificate_issue_failed",
+      requestId,
+      err instanceof ReissueNodeCertFailure ? err.auditFacts : {},
     );
-    denyForbidden(res);
+    denyForbiddenWithRequestId(res, requestId);
     return;
   }
 
@@ -1604,6 +1727,7 @@ async function handleReissueNodeCertComplete(
     result: "success",
     identityId: request.node_id,
     details: {
+      request_id: requestId,
       node_id: request.node_id,
       rotation_serial: request.rotation_cert.rotation_serial,
       expires_at: certificate.expires_at ?? null,
@@ -1612,6 +1736,7 @@ async function handleReissueNodeCertComplete(
   writeJson(res, 200, {
     reissued: true,
     request_version: FEDERATION_REISSUE_NODE_CERT_REQUEST_VERSION,
+    request_id: requestId,
     node_id: request.node_id,
     certificate,
     issuing_principal_cert: ctx.issuingPrincipalCert,
@@ -1654,7 +1779,10 @@ function reissueNodeCertificate(
     recordedRotationCert === undefined ||
     ctx.recordedRotationSerial === undefined
   ) {
-    throw new ReissueNodeCertFailure("no_recorded_rotation_lineage");
+    throw new ReissueNodeCertFailure(
+      "no_recorded_rotation_lineage",
+      lineageDiagnosticFacts(ctx, request),
+    );
   }
   // The submitted rotation cert must be byte-identical (canonical-JSON equal) to
   // the one the fortress persisted. This is the strongest tie: an attacker
@@ -1662,7 +1790,10 @@ function reissueNodeCertificate(
   // alter the rotated_at / signature, because anything but the exact recorded
   // cert is rejected here.
   if (canonicalJson(rotationCert) !== canonicalJson(recordedRotationCert)) {
-    throw new ReissueNodeCertFailure("rotation_cert_not_recorded_lineage");
+    throw new ReissueNodeCertFailure(
+      "rotation_cert_not_recorded_lineage",
+      lineageDiagnosticFacts(ctx, request),
+    );
   }
   if (recordedRotationCert.fortress_id !== ctx.fortressId) {
     throw new ReissueNodeCertFailure("rotation_cert_invalid");
@@ -1839,18 +1970,62 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+/**
+ * Record a reissue denial in the ISSUER's audit log, with everything the
+ * operator needs to act: the precise reason (which the wire response
+ * deliberately does not carry), the correlation id printed to the caller, the
+ * remediation for that reason, and any non-secret diagnostic facts the failing
+ * check gathered. All of this is LOCAL: nothing here is ever written to a
+ * response body.
+ */
 async function auditReissueFailure(
   deps: V1FederationDeps,
   operation: string,
   identityId: string,
   reasonCode: string,
+  requestId: string,
+  facts: Record<string, unknown> = {},
 ): Promise<void> {
+  const nextStep = REISSUE_DENIAL_OPERATOR_NEXT_STEP[reasonCode];
   await deps.audit({
     operation,
     result: "failure",
     identityId,
-    details: { reason: reasonCode },
+    details: {
+      reason: reasonCode,
+      request_id: requestId,
+      ...(nextStep !== undefined ? { operator_next_step: nextStep } : {}),
+      ...facts,
+    },
   });
+}
+
+/**
+ * The two numbers that separate the two very different situations behind a
+ * lineage refusal, for the ISSUER's audit entry only.
+ *
+ * `recorded_rotation_serial` is what THIS PROCESS holds (loaded at boot, from
+ * the durable trust-root record); `presented_rotation_serial` is what the caller
+ * sent. Presented ABOVE recorded means the caller has a newer rotation than this
+ * process does, i.e. the endpoint has not picked up a `rotate-root` and needs a
+ * restart (F-FED-ROTLINEAGE). Presented AT OR BELOW recorded points at a
+ * superseded or orphaned cert instead.
+ *
+ * NOT A TRUST INPUT. The presented serial is untrusted attacker-controlled data
+ * and is used for exactly one thing: printing a number in a local audit entry
+ * next to the label `presented_` so an operator can compare them. No branch in
+ * the issuance decision reads it, and neither number is ever written to a
+ * response.
+ */
+function lineageDiagnosticFacts(
+  ctx: FederationIssuerContext,
+  request: ReissueNodeCertCompleteRequest,
+): Record<string, unknown> {
+  const presented = request.rotation_cert.rotation_serial;
+  return {
+    recorded_rotation_serial: ctx.recordedRotationSerial ?? null,
+    presented_rotation_serial: typeof presented === "number" ? presented : null,
+  };
 }
 
 function reissueRequestNodeId(body: unknown): string {
