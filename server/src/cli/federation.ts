@@ -21,7 +21,11 @@ import { join } from "node:path";
 import type { Writable } from "node:stream";
 import { ed25519 } from "@noble/curves/ed25519";
 import { loadConfig } from "../config.js";
-import { toBase64url, fromBase64url } from "../core/encoding.js";
+import {
+  toBase64url,
+  fromBase64url,
+  fromBase64urlStrict,
+} from "../core/encoding.js";
 import { generateIdentityId } from "../core/identity.js";
 import {
   REVOCATION_LIST_SIGN_ACTION,
@@ -786,8 +790,9 @@ function plannedAdoptHeldReason(reason: string): string {
       return "the rotation cert is HYBRID (post-quantum); classical-only adopt " +
         "refuses it rather than silently drop the post-quantum half";
     case "rotation_signer_revoked":
-      return "the rotation cert is signed by a root this machine has locally " +
-        "revoked (a compromised old root can never re-anchor trust)";
+      return "the rotation cert is signed by, or attests as the new root, a " +
+        "root this machine has locally revoked (a revoked root can never " +
+        "anchor trust)";
     case "rotation_cert_invalid":
       return "the rotation cert did not verify under the currently pinned root " +
         "(wrong signer, bad signature, or a stale/replayed serial)";
@@ -1131,6 +1136,19 @@ export async function runFederationRejoin(args: {
     );
     return 1;
   }
+  // L3 (re-gate 2026-07-30): this value is persisted into the grow-only
+  // revoked-root set, where it is compared byte-for-byte against real cert
+  // pubkeys forever after. Free text that is not a well-formed key (a typo, a
+  // pasted fingerprint, a truncated value) would be recorded as a revocation
+  // that can never match anything - fail closed on garbage instead.
+  if (!isBase64urlEd25519Pubkey(flags.revokedOldMaster)) {
+    err.write(
+      "sanctuary federation rejoin: --revoked-old-master is not a base64url " +
+        "Ed25519 fortress-master public key (expected the 43-char base64url " +
+        "form of a 32-byte key, exactly as printed by rotate-root)\n",
+    );
+    return 1;
+  }
   const revocationSerial = parsePositiveInt(flags.revocationSerialRaw);
   if (revocationSerial === null) {
     err.write(
@@ -1254,6 +1272,26 @@ function parsePositiveInt(raw: string | undefined): number | null {
   const n = Number(raw);
   if (!Number.isSafeInteger(n) || n < 1) return null;
   return n;
+}
+
+/**
+ * Structural validation for an operator-typed fortress-master public key (L3):
+ * STRICT canonical base64url decoding to exactly 32 bytes (Ed25519). Strict
+ * matters (codex gate 2026-07-31): the lenient `fromBase64url` accepts
+ * non-canonical spellings (e.g. a different final character with the same
+ * decoded bytes) which would be persisted as a revocation STRING that never
+ * string-matches a canonical cert pubkey - a silently non-matching revocation,
+ * the exact L3 class this guard exists to close. Never throws.
+ */
+function isBase64urlEd25519Pubkey(raw: string): boolean {
+  try {
+    const decoded = fromBase64urlStrict(raw);
+    const ok = decoded.length === 32;
+    decoded.fill(0);
+    return ok;
+  } catch {
+    return false;
+  }
 }
 
 interface AdminFlags {

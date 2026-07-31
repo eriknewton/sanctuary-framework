@@ -1144,6 +1144,265 @@ describe("compromise manual re-join (persist records the dead K1)", () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════
+// F1 (re-gate 2026-07-30): planned adopted_rotation_serial under-lock floor
+// ═══════════════════════════════════════════════════════════════════════
+
+describe("F1: planned adopted-serial floor is enforced UNDER THE LOCK", () => {
+  it("the executing probe is dead: a same-pin lower serial through lockedUpdate is refused and the floor holds", async () => {
+    const storage = new MemoryStorage();
+    const masterKey = await testMasterKey(storage);
+    const { record } = buildJoinerRecord();
+    await saveJoiner(storage, masterKey, record);
+    const store = new FederationJoinerTrustRootStore(storage, masterKey);
+
+    // Raise the planned floor to 9 (same pinned master).
+    await store.lockedUpdate((current) => ({
+      ...current!,
+      adopted_rotation_serial: 9,
+    }));
+    let loaded = await loadFederationJoinerTrustRoot({ storage, masterKey });
+    expect(loaded?.record.adopted_rotation_serial).toBe(9);
+
+    // The re-gate's executing probe (9 -> 2 through the chokepoint) must now
+    // FAIL: a same-pin write with a strictly lower positive serial is refused
+    // loudly under the lock, not passed through verbatim.
+    await expect(
+      store.lockedUpdate((current) => ({
+        ...current!,
+        adopted_rotation_serial: 2,
+      })),
+    ).rejects.toThrow(/below the recorded planned anti-rollback floor/);
+
+    // A STALE same-pin caller carrying NO planned serial inherits the floor
+    // (Math.max merge), exactly like the compromise floor.
+    await store.lockedUpdate((current) => ({
+      fortress_id: current!.fortress_id,
+      node_id: current!.node_id,
+      pinned_master_pubkey: current!.pinned_master_pubkey,
+      issuing_principal_cert: current!.issuing_principal_cert,
+      local_node_cert: current!.local_node_cert,
+      local_node_private_key: current!.local_node_private_key,
+      // deliberately NO adopted_rotation_serial
+    }));
+
+    loaded = await loadFederationJoinerTrustRoot({ storage, masterKey });
+    expect(loaded?.record.adopted_rotation_serial).toBe(9);
+    expect(loaded?.record.pinned_master_pubkey.public_key).toBe(
+      record.pinned_master_pubkey.public_key,
+    );
+  });
+
+  it("a fresh join onto a NEW pinned master resets the planned serial to 0 (lineage change, NOT a rollback)", async () => {
+    const storage = new MemoryStorage();
+    const masterKey = await testMasterKey(storage);
+    const { record } = buildJoinerRecord();
+    await saveJoiner(storage, masterKey, record);
+    const store = new FederationJoinerTrustRootStore(storage, masterKey);
+    await store.lockedUpdate((current) => ({
+      ...current!,
+      adopted_rotation_serial: 9,
+    }));
+
+    // A fresh join is a NEW lineage: different home fortress, different pinned
+    // master, planned serial honestly absent. The scoped floor must NOT read
+    // this as a 9 -> 0 rollback and refuse (or silently re-impose 9).
+    const fresh = buildJoinerRecord();
+    await saveJoiner(storage, masterKey, fresh.record);
+
+    const loaded = await loadFederationJoinerTrustRoot({ storage, masterKey });
+    expect(loaded?.record.pinned_master_pubkey.public_key).toBe(
+      fresh.record.pinned_master_pubkey.public_key,
+    );
+    expect(loaded?.record.adopted_rotation_serial ?? 0).toBe(0);
+  });
+
+  it("F1 race: an adopt whose pin moved under it is refused; the WINNER's pinned master AND serial survive", async () => {
+    const storage = new MemoryStorage();
+    const masterKey = await testMasterKey(storage);
+    const { record, home } = buildJoinerRecord();
+    await saveJoiner(storage, masterKey, record);
+
+    // Equivocating-issuer fork (the F1 concrete state): two valid K1-signed
+    // certs to DIFFERENT new masters at DECREASING serials. Adopt A (serial 5,
+    // K2a) completes INSIDE adopt B's reissue round, so B's pre-lock
+    // verification (against K1) is stale by the time B reaches the lock.
+    const rotationA = buildPlannedRotation({
+      current: record,
+      home,
+      rotationSerial: 5,
+    });
+    const rotationB = buildPlannedRotation({
+      current: record,
+      home,
+      rotationSerial: 3,
+    });
+
+    const resultB = await adoptFederationJoinerPlannedRoot({
+      storage,
+      masterKey,
+      rotationCert: rotationB.rotationCert,
+      expectedPinnedMaster: rotationB.newPinnedMaster,
+      reissue: async () => {
+        const resultA = await adoptFederationJoinerPlannedRoot({
+          storage,
+          masterKey,
+          rotationCert: rotationA.rotationCert,
+          expectedPinnedMaster: rotationA.newPinnedMaster,
+          reissue: rotationA.reissue,
+        });
+        expect(resultA.adopted).toBe(true);
+        return rotationB.reissue();
+      },
+    });
+
+    // B must be refused UNDER THE LOCK (the pin is no longer B's cert's old
+    // master), never allowed to roll the anchor back to (K2b, 3).
+    expect(resultB).toEqual(
+      expect.objectContaining({
+        adopted: false,
+        state: "held_old_trust",
+        reason: "rotation_cert_invalid",
+      }),
+    );
+    const loaded = await loadFederationJoinerTrustRoot({ storage, masterKey });
+    // The assertions the prior regression suite lacked: pinned master AND the
+    // planned serial after the race, not just the revoked set.
+    expect(loaded?.record.pinned_master_pubkey.public_key).toBe(
+      rotationA.newPinnedMaster.public_key,
+    );
+    expect(loaded?.record.adopted_rotation_serial).toBe(5);
+    rotationA.newIssuingPrincipalPrivateKey.fill(0);
+    rotationB.newIssuingPrincipalPrivateKey.fill(0);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// L2 + LOW notes (re-gate 2026-07-30): pre-network revoked-K2 refusal and
+// direct coverage of the reissue-result refusal reasons
+// ═══════════════════════════════════════════════════════════════════════
+
+describe("adopt refusal precision (re-gate 2026-07-30)", () => {
+  it("L2: a locally-revoked K2 is refused BEFORE the network reissue round (honest reason, no round-trip)", async () => {
+    const storage = new MemoryStorage();
+    const masterKey = await testMasterKey(storage);
+    const { record, home } = buildJoinerRecord();
+    const rotation = buildPlannedRotation({ current: record, home });
+    // The joiner has locally revoked the very root this cert attests as new
+    // (e.g. a prior compromise wave burned K2 as well as K1).
+    await persistFederationJoinerTrustRoot({
+      storage,
+      masterKey,
+      pinnedMasterPubkey: record.pinned_master_pubkey,
+      issuingPrincipalCert: record.issuing_principal_cert,
+      localNodeCert: record.local_node_cert,
+      localNodePrivateKey: record.local_node_private_key,
+      revokedRootPubkeys: [rotation.newPinnedMaster.public_key],
+      highestRevocationSerial: 5,
+    });
+
+    let reissueCalled = false;
+    const rejected = await adoptFederationJoinerPlannedRoot({
+      storage,
+      masterKey,
+      rotationCert: rotation.rotationCert,
+      expectedPinnedMaster: rotation.newPinnedMaster,
+      reissue: async () => {
+        reissueCalled = true;
+        return rotation.reissue();
+      },
+    });
+
+    expect(rejected).toEqual(
+      expect.objectContaining({
+        adopted: false,
+        state: "held_old_trust",
+        reason: "rotation_signer_revoked",
+      }),
+    );
+    // The refusal fires pre-network: the operator gets the honest reason and
+    // the server never sees a doomed reissue round.
+    expect(reissueCalled).toBe(false);
+    const loaded = await loadFederationJoinerTrustRoot({ storage, masterKey });
+    expect(loaded?.record.pinned_master_pubkey.public_key).toBe(
+      record.pinned_master_pubkey.public_key,
+    );
+    rotation.newIssuingPrincipalPrivateKey.fill(0);
+  });
+
+  it("a reissued cert for a DIFFERENT node identity is held with reissued_identity_mismatch", async () => {
+    const storage = new MemoryStorage();
+    const masterKey = await testMasterKey(storage);
+    const { record, home } = buildJoinerRecord();
+    await saveJoiner(storage, masterKey, record);
+    const rotation = buildPlannedRotation({ current: record, home });
+
+    const rejected = await adoptFederationJoinerPlannedRoot({
+      storage,
+      masterKey,
+      rotationCert: rotation.rotationCert,
+      expectedPinnedMaster: rotation.newPinnedMaster,
+      reissue: async () => ({
+        ok: true,
+        certificate: { ...rotation.reissuedNodeCert, node_id: "impostor-node" },
+        issuingPrincipalCert: rotation.newIssuingPrincipalCert,
+        serverPinnedMaster: rotation.newPinnedMaster,
+      }),
+    });
+
+    expect(rejected).toEqual(
+      expect.objectContaining({
+        adopted: false,
+        state: "held_old_trust",
+        reason: "reissued_identity_mismatch",
+      }),
+    );
+    const loaded = await loadFederationJoinerTrustRoot({ storage, masterKey });
+    expect(loaded?.record.pinned_master_pubkey.public_key).toBe(
+      record.pinned_master_pubkey.public_key,
+    );
+    rotation.newIssuingPrincipalPrivateKey.fill(0);
+  });
+
+  it("a reissued chain that does NOT terminate at the cert's K2 is held with reissued_chain_invalid", async () => {
+    const storage = new MemoryStorage();
+    const masterKey = await testMasterKey(storage);
+    const { record, home } = buildJoinerRecord();
+    await saveJoiner(storage, masterKey, record);
+    const rotation = buildPlannedRotation({ current: record, home });
+    // A malicious server returns a chain rooted at a DIFFERENT master (K2')
+    // while echoing the expected K2 (so the echo check alone cannot catch it).
+    const foreign = buildPlannedRotation({ current: record, home });
+
+    const rejected = await adoptFederationJoinerPlannedRoot({
+      storage,
+      masterKey,
+      rotationCert: rotation.rotationCert,
+      expectedPinnedMaster: rotation.newPinnedMaster,
+      reissue: async () => ({
+        ok: true,
+        certificate: foreign.reissuedNodeCert,
+        issuingPrincipalCert: foreign.newIssuingPrincipalCert,
+        serverPinnedMaster: rotation.newPinnedMaster,
+      }),
+    });
+
+    expect(rejected).toEqual(
+      expect.objectContaining({
+        adopted: false,
+        state: "held_old_trust",
+        reason: "reissued_chain_invalid",
+      }),
+    );
+    const loaded = await loadFederationJoinerTrustRoot({ storage, masterKey });
+    expect(loaded?.record.pinned_master_pubkey.public_key).toBe(
+      record.pinned_master_pubkey.public_key,
+    );
+    rotation.newIssuingPrincipalPrivateKey.fill(0);
+    foreign.newIssuingPrincipalPrivateKey.fill(0);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
 // Slice 3c-2 cross-class + retirement regression
 // ═══════════════════════════════════════════════════════════════════════
 

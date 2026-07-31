@@ -195,6 +195,11 @@ describe("sanctuary federation adopt (planned auto-adopt CLI)", () => {
     expect(printed).toContain('"rotation_serial": 3');
     // Never leaks the node private key.
     expect(printed).not.toContain(toBase64url(nodePriv));
+    // LOW (re-gate 2026-07-30): the value check above is weakly formed on its
+    // own (a re-serialized leak might not contain the base64url form), so ALSO
+    // assert the private-key FIELD NAME never appears in the printed JSON: the
+    // print enumerates public fields and must never grow the private one.
+    expect(printed).not.toContain("local_node_private_key");
   });
 
   it("maps a held-old-trust result to exit 3, an unreachable to exit 2", async () => {
@@ -347,6 +352,70 @@ describe("sanctuary federation rejoin (compromise manual re-join CLI)", () => {
     });
     expect(code).toBe(1);
     expect(err.text()).toContain("--revocation-serial");
+  });
+
+  it("L3: refuses a --revoked-old-master that is not a base64url Ed25519 pubkey (exit 1)", async () => {
+    // Garbage charset: would be persisted as a revocation that can never match.
+    const garbage = validArgv();
+    garbage[garbage.indexOf("--revoked-old-master") + 1] = "not a key!!";
+    const garbageErr = collector();
+    const garbageCode = await runFederationRejoin({
+      argv: garbage,
+      env: {},
+      out: collector().stream,
+      err: garbageErr.stream,
+    });
+    expect(garbageCode).toBe(1);
+    expect(garbageErr.text()).toContain(
+      "--revoked-old-master is not a base64url",
+    );
+
+    // Valid base64url charset but the WRONG key length (a truncated paste).
+    const truncated = validArgv();
+    truncated[truncated.indexOf("--revoked-old-master") + 1] = toBase64url(
+      randomBytes(16),
+    );
+    const truncatedErr = collector();
+    const truncatedCode = await runFederationRejoin({
+      argv: truncated,
+      env: {},
+      out: collector().stream,
+      err: truncatedErr.stream,
+    });
+    expect(truncatedCode).toBe(1);
+    expect(truncatedErr.text()).toContain(
+      "--revoked-old-master is not a base64url",
+    );
+
+    // NON-CANONICAL spelling (codex gate 2026-07-31): 43 chars, valid charset,
+    // decodes to the same 32 bytes as a canonical key under a LENIENT decoder,
+    // but round-trips to a DIFFERENT string. Persisting it would record a
+    // revocation that never string-matches a canonical cert pubkey. The strict
+    // validator must refuse it.
+    const canonical = toBase64url(randomBytes(32));
+    const lastChar = canonical[canonical.length - 1]!;
+    const alphabet =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    // Flip a low-order bit of the final character's 6-bit group: the two
+    // discarded trailing bits differ, so a lenient decode yields the same 32
+    // bytes while the string is non-canonical.
+    const flipped = alphabet[alphabet.indexOf(lastChar) ^ 1]!;
+    const nonCanonical = canonical.slice(0, -1) + flipped;
+    expect(nonCanonical).not.toBe(canonical);
+    const nonCanonicalArgv = validArgv();
+    nonCanonicalArgv[nonCanonicalArgv.indexOf("--revoked-old-master") + 1] =
+      nonCanonical;
+    const nonCanonicalErr = collector();
+    const nonCanonicalCode = await runFederationRejoin({
+      argv: nonCanonicalArgv,
+      env: {},
+      out: collector().stream,
+      err: nonCanonicalErr.stream,
+    });
+    expect(nonCanonicalCode).toBe(1);
+    expect(nonCanonicalErr.text()).toContain(
+      "--revoked-old-master is not a base64url",
+    );
   });
 
   it("refuses --revoked-old-master equal to the new --pinned-master (exit 1)", async () => {

@@ -190,9 +190,18 @@ export class FederationJoinerTrustRootStore {
    *      on-disk record loaded UNDER THE LOCK: the revoked-root set is `current
    *      UNION next` and the compromise floor is `max(current, next)` - never
    *      dropped or lowered; a mutation that tries to LOWER the floor is refused
-   *      loudly. (The planned `adopted_rotation_serial` is per-lineage - reset on
-   *      a fresh join, advanced on a planned adopt - so it is the mutator's to set
-   *      and is NOT merged here.)
+   *      loudly. The planned `adopted_rotation_serial` gets the SAME under-lock
+   *      floor, SCOPED to the pinned lineage (F1, re-gate 2026-07-30): while the
+   *      `pinned_master_pubkey` identity is unchanged the planned floor is
+   *      `max(current, next)` and a strictly-lower positive serial is refused
+   *      loudly; a write that MOVES the pinned master (a planned adopt's K1->K2
+   *      re-pin, or a fresh join/rejoin onto a new root) is a legitimate lineage
+   *      change and carries the mutator's serial verbatim, so a fresh-join
+   *      reset-to-0 is never mistaken for a rollback. Read "structural" as
+   *      SAME-LINEAGE monotonicity: a trusted in-process caller holding
+   *      `storage` + `masterKey` can still legitimately move to a new pinned
+   *      lineage (that IS a fresh join); no writer can lower the floor while
+   *      keeping the pin.
    *   4. Raw-writes the merged record (`#writeRaw` re-runs full validation) and
    *      releases the lock in `finally`.
    *
@@ -251,11 +260,50 @@ export class FederationJoinerTrustRootStore {
         }
         const mergedFloor = Math.max(currentFloor, nextFloor);
 
+        // F1 (re-gate 2026-07-30): the planned adopted_rotation_serial gets a
+        // SYMMETRIC under-lock floor, scoped to the pinned lineage. An executing
+        // probe drove this floor backwards (9 -> 2) through this very chokepoint
+        // while its docstring claimed the grow-only invariant was structurally
+        // enforced; this guard makes the claim literally true. The scope: only a
+        // write that KEEPS the pinned-master identity is held to the floor. A
+        // write that MOVES the pinned master is a legitimate lineage change (a
+        // planned adopt re-pins K1 -> K2 at that cert's serial; a fresh
+        // join/rejoin resets to a new root at 0) and carries the mutator's
+        // serial verbatim, so a fresh-join reset-to-0 never reads as a rollback.
+        const currentPlannedFloor = normalizeAdoptedRotationSerial(
+          current?.adopted_rotation_serial,
+        );
+        const nextPlannedSerial = normalizeAdoptedRotationSerial(
+          next.adopted_rotation_serial,
+        );
+        const samePinnedLineage =
+          current !== null &&
+          current.pinned_master_pubkey.public_key ===
+            next.pinned_master_pubkey.public_key &&
+          current.pinned_master_pubkey.fortress_id ===
+            next.pinned_master_pubkey.fortress_id;
+        if (
+          samePinnedLineage &&
+          nextPlannedSerial > 0 &&
+          nextPlannedSerial < currentPlannedFloor
+        ) {
+          throw new FederationJoinerTrustRootStoreError(
+            `adopted rotation serial ${nextPlannedSerial} is below the recorded ` +
+              `planned anti-rollback floor ${currentPlannedFloor} for the same ` +
+              `pinned master; refusing to lower the monotonic floor`,
+          );
+        }
+        const mergedPlannedSerial = samePinnedLineage
+          ? Math.max(currentPlannedFloor, nextPlannedSerial)
+          : nextPlannedSerial;
+
         const merged: FederationJoinerTrustRootRecord = {
           ...next,
           revoked_root_pubkeys:
             mergedRevoked.size > 0 ? mergedRevoked : undefined,
           highest_revocation_serial: mergedFloor > 0 ? mergedFloor : undefined,
+          adopted_rotation_serial:
+            mergedPlannedSerial > 0 ? mergedPlannedSerial : undefined,
         };
         await this.#writeRaw(merged);
         return merged;
@@ -384,8 +432,17 @@ async function lockedUpdateJoinerTrustRoot(
  *
  * The optional `revokedRootPubkeys` / `highestRevocationSerial` let a COMPROMISE
  * manual re-join (`sanctuary federation rejoin`) record the now-dead old root
- * (K1) into the fresh K2 record with an anti-rollback floor, so a later K1 (or
- * K1-signed artifact) is refused locally. This routes through the single
+ * (K1) into the fresh K2 record with an anti-rollback floor. PRECISION on what
+ * consumes that record (M3, re-gate 2026-07-30): a later K1-signed rotation
+ * cert is refused on this machine by (a) the planned-adopt cross-class guard in
+ * this module (reason `rotation_signer_revoked`, checked both pre-lock and
+ * under-lock), and (b) at the sync surface, by the dashboard boot-wire
+ * (`setFederationContext` folds the record's revoked set + floor into the
+ * revoked-root projection backing the sync-envelope `root_revoked` refusals).
+ * Independently of the revocation, a stale K1-chained artifact ALSO fails the
+ * pin itself once this joiner pins K2 (chain/cert checks terminate at the
+ * pinned master) - the recorded revocation is what keeps refusing K1 even if a
+ * K1 holder tries to re-anchor the pin. This routes through the single
  * `lockedUpdateJoinerTrustRoot` chokepoint, so the supplied roots are UNIONed
  * into any existing record's revoked set (never replace it), the floor is
  * `Math.max(existing, supplied)` (never lowered), a strictly-below-floor serial
@@ -466,6 +523,17 @@ export async function persistFederationJoinerTrustRoot(opts: {
  * `getFortressMasterSecret`, NO `getMasterPrivateKey`, and NO `approver`. It is
  * a `nodeMode` context (the node mode of this joiner) that can present its cert
  * on `/sync/peer` but structurally cannot mint bootstrap tokens or issue certs.
+ *
+ * Field-consumption honesty (M3, re-gate 2026-07-30): `revokedRootPubkeys` and
+ * `highestRevocationSerial` ARE consumed - the dashboard boot-wire
+ * (`setFederationContext`) folds them into its revoked-root projection, which
+ * backs the sync-envelope `root_revoked` refusals and the reissue endpoint's
+ * revoked-root denial. `adoptedRotationSerial` is currently CARRIED ONLY: no
+ * consumer reads it off the context today; the planned-rotation anti-replay
+ * floor is enforced inside this module from the persisted record
+ * (`adoptFederationJoinerPlannedRoot` + the locked chokepoint), not from the
+ * context. It stays on the context for consumers that later need to surface or
+ * gate on the adopted lineage without re-opening custody storage.
  */
 export function joinerContextFromRecord(
   record: FederationJoinerTrustRootRecord,
@@ -660,11 +728,16 @@ export async function adoptFederationJoinerPlannedRoot(opts: {
 
   // Cross-class guard: never re-anchor on a locally-revoked root. A K1 that a
   // prior compromise re-join marked dead is refused even though its holder could
-  // still forge a K1-signed rotation cert.
+  // still forge a K1-signed rotation cert. The cert's ATTESTED NEW root (K2) is
+  // checked here too (L2, re-gate 2026-07-30): a locally-revoked K2 would
+  // otherwise only be caught by the save-time validation AFTER the network
+  // reissue round, surfacing as a vague `persist_failed` instead of this honest
+  // refusal, and would leak a pointless reissue round-trip to the server.
   const revoked = normalizeRevokedRootPubkeys(current.revoked_root_pubkeys);
   if (
     revoked.has(opts.rotationCert.old_master_pubkey) ||
-    revoked.has(currentPinned.public_key)
+    revoked.has(currentPinned.public_key) ||
+    revoked.has(opts.rotationCert.new_master.public_key)
   ) {
     await auditPlannedAdoptFailure(opts.audit, "rotation_signer_revoked", {
       fortress_id: current.fortress_id,
@@ -698,8 +771,15 @@ export async function adoptFederationJoinerPlannedRoot(opts: {
   }
 
   // K2 is learned from the K1-VERIFIED cert, NEVER from the server response.
+  // L1 (re-gate 2026-07-30): copy ONLY the K1-SIGNED fields into the trust
+  // anchor. `rotationCertSignedBody` covers exactly `public_key`, `fortress_id`,
+  // and `created_at`; a wholesale spread would persist any UNSIGNED extra field
+  // a future `FortressMasterPublicKey` widening might carry, letting attacker
+  // -controlled unsigned bytes ride into the pinned anchor.
   const newPinnedMaster: FortressMasterPublicKey = {
-    ...opts.rotationCert.new_master,
+    public_key: opts.rotationCert.new_master.public_key,
+    fortress_id: opts.rotationCert.new_master.fortress_id,
+    created_at: opts.rotationCert.new_master.created_at,
   };
 
   // A-FULL (HIGH fix 2026-07-24): the trust anchor is OPERATOR-CONFIRMED. Even a
@@ -798,11 +878,14 @@ export async function adoptFederationJoinerPlannedRoot(opts: {
   // is already complete, so the cross-process lock is NEVER held across a network
   // call. The chokepoint merge-preserves the current revoked set + floor, so a
   // concurrent rejoin's anti-rollback update can never be clobbered by adopt's
-  // stale earlier load. Under the lock we RE-CHECK the cross-class guard against
-  // the CURRENT-under-lock revoked set: a concurrent compromise re-join may have
-  // revoked K1 (the rotation signer) AFTER our unlocked decision, in which case
-  // re-pinning through that now-dead root is refused (never re-anchor on a
-  // revoked root just because our unlocked snapshot predated the revocation).
+  // stale earlier load. Under the lock we RE-CHECK two things against the
+  // CURRENT-under-lock record: (a) the cross-class guard - a concurrent
+  // compromise re-join may have revoked K1 (the rotation signer) or even this
+  // cert's K2 AFTER our unlocked decision, in which case re-pinning through a
+  // now-dead root is refused; and (b) that the pinned master is STILL the
+  // cert's old_master - a concurrent writer moving the pin invalidates our
+  // pre-lock verification, so the save is refused rather than allowed to roll
+  // the anchor onto a sibling lineage (F1, re-gate 2026-07-30).
   const repinNodeKey = Uint8Array.from(current.local_node_private_key);
   let repinned: FederationJoinerTrustRootRecord;
   try {
@@ -818,9 +901,29 @@ export async function adoptFederationJoinerPlannedRoot(opts: {
         );
         if (
           revokedUnderLock.has(opts.rotationCert.old_master_pubkey) ||
-          revokedUnderLock.has(underLock.pinned_master_pubkey.public_key)
+          revokedUnderLock.has(underLock.pinned_master_pubkey.public_key) ||
+          revokedUnderLock.has(newPinnedMaster.public_key)
         ) {
           throw new JoinerPlannedAdoptConflictError("rotation_signer_revoked");
+        }
+        // F1 (re-gate 2026-07-30): the rotation cert was verified against OUR
+        // pre-lock pin (its old_master). If a concurrent writer moved the pin
+        // since (another adopt won the lock first, or a rejoin re-anchored),
+        // that verification no longer speaks for the record we would overwrite:
+        // re-pinning now could roll the anchor (and its serial) backwards onto
+        // a sibling lineage. Refuse under the lock; the operator re-runs adopt
+        // against the CURRENT pin and the cert either verifies there or is
+        // honestly refused. FULL pinned identity (pubkey AND fortress_id, codex
+        // gate 2026-07-31): a same-pubkey/different-fortress move would fail
+        // `#writeRaw` validation anyway, but as the vague `persist_failed`; the
+        // identity check here keeps the refusal reason honest.
+        if (
+          underLock.pinned_master_pubkey.public_key !==
+            opts.rotationCert.old_master_pubkey ||
+          underLock.pinned_master_pubkey.fortress_id !==
+            opts.rotationCert.fortress_id
+        ) {
+          throw new JoinerPlannedAdoptConflictError("rotation_cert_invalid");
         }
         return {
           fortress_id: underLock.fortress_id,
