@@ -898,7 +898,9 @@ describe("castle-wall boot service (F1 Option C)", () => {
       const code = await runInstallBoot(f.argv, f.ctx);
 
       expect(code).toBe(1);
-      expect(f.err.text()).toContain("is a symlink");
+      // The refusal is now OPEN-driven (ELOOP from an O_NOFOLLOW open) rather
+      // than a stat-then-use check, so it names the condition, not the stat.
+      expect(f.err.text()).toContain("not a plain directory");
       // The outside directory's ownership is untouched.
       const outsideStat = await stat(outside);
       expect(outsideStat.uid).toBe(process.getuid?.() ?? outsideStat.uid);

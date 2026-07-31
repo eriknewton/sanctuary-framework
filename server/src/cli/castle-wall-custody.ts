@@ -32,7 +32,8 @@
  */
 
 import { execFile as nodeExecFile } from "node:child_process";
-import { lstat, readFile } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
+import { lstat, open } from "node:fs/promises";
 import { dirname, isAbsolute, resolve } from "node:path";
 import { Writable } from "node:stream";
 import { promisify } from "node:util";
@@ -92,6 +93,12 @@ export interface RepairCustodyContext {
     mode: number;
   }>;
   /**
+   * Manifest reader override (tests cannot mint a root-owned manifest, and
+   * the production reader re-verifies root ownership on its own descriptor).
+   * Defaults to {@link readManifestBytesNoFollow}.
+   */
+  readManifestFile?: (path: string) => Promise<string>;
+  /**
    * Best-effort audit append override (tests avoid real master-key
    * resolution). Defaults to {@link appendCastleWallCliAuditBestEffort}.
    */
@@ -100,6 +107,35 @@ export interface RepairCustodyContext {
 
 function write(stream: Writable, text: string): void {
   stream.write(text);
+}
+
+/**
+ * Read a rollback manifest through ONE `O_NOFOLLOW` descriptor, re-verifying
+ * root ownership and the not-group/other-writable bits on that descriptor
+ * before reading. Closes the check-then-use race a stat-then-`readFile` pair
+ * leaves open on a file that drives root chown/chmod.
+ */
+async function readManifestBytesNoFollow(path: string): Promise<string> {
+  const handle = await open(
+    path,
+    fsConstants.O_RDONLY |
+      (typeof fsConstants.O_NOFOLLOW === "number" ? fsConstants.O_NOFOLLOW : 0),
+  );
+  try {
+    const stats = await handle.stat();
+    if (!stats.isFile()) {
+      throw new Error("manifest is not a regular file");
+    }
+    if (stats.uid !== 0) {
+      throw new Error(`manifest is owned by uid ${stats.uid}, not root`);
+    }
+    if ((stats.mode & 0o022) !== 0) {
+      throw new Error("manifest is group- or world-writable");
+    }
+    return await handle.readFile("utf8");
+  } finally {
+    await handle.close().catch(() => undefined);
+  }
 }
 
 async function defaultLookupOperatorHome(user: string): Promise<string | undefined> {
@@ -278,9 +314,14 @@ export async function runRepairCustody(
       return REPAIR_CUSTODY_EXIT_REFUSED;
     }
 
+    // Read from the SAME descriptor the provenance was checked on. A
+    // stat-then-readFile pair is a check-then-use race: the manifest could be
+    // swapped between the root-ownership check and the read, and this file
+    // drives root chown/chmod. `readManifestBytes` re-verifies uid/mode on
+    // the open fd and reads through it, so no swap can slip between them.
     let raw: string;
     try {
-      raw = await readFile(rollbackPath, "utf8");
+      raw = await (ctx.readManifestFile ?? readManifestBytesNoFollow)(rollbackPath);
     } catch (error) {
       write(
         err,

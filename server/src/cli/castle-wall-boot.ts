@@ -1280,56 +1280,61 @@ async function runInstallBootInner(
   const logDir = join(fortressPath, "logs");
   try {
     // 2026-07-31 gate round 3: refusing only a symlinked `logs` leaf was not
-    // enough -- a symlinked FORTRESS (or any symlinked component of it) is
-    // still followed by both the mkdir and the no-follow open below, because
-    // O_NOFOLLOW guards only the final component. Refuse a symlinked fortress
-    // outright; the custody walk applies the same rule.
-    const fortressEntry = await lstat(fortressPath).catch(() => null);
-    if (fortressEntry !== null && fortressEntry.isSymbolicLink()) {
+    // enough -- a symlinked FORTRESS is still followed by the mkdir and by a
+    // no-follow open of `logs`, because O_NOFOLLOW guards only the FINAL
+    // component. Both checks below are OPEN-driven, never stat-then-use: an
+    // ELOOP from an O_NOFOLLOW open is proof-at-open-time that the component
+    // is not a symlink, which a prior `lstat` could never be.
+    const dirFlags =
+      fsConstants.O_RDONLY |
+      (typeof fsConstants.O_NOFOLLOW === "number" ? fsConstants.O_NOFOLLOW : 0) |
+      (typeof fsConstants.O_DIRECTORY === "number" ? fsConstants.O_DIRECTORY : 0);
+    const fortressHandle = await open(fortressPath, dirFlags).catch((error: unknown) => {
+      const code = (error as NodeJS.ErrnoException).code;
+      return code === "ENOENT" ? null : (error as NodeJS.ErrnoException);
+    });
+    if (fortressHandle !== null && !("close" in fortressHandle)) {
       write(
         err,
-        `Refusing to install the boot service: the fortress path ${fortressPath} is a symlink. Root would create and hand away directories outside the fortress.\n`,
+        `Refusing to install the boot service: the fortress path ${fortressPath} is not a plain directory (${fortressHandle.code}). A symlinked fortress would make root create and hand away directories outside it.\n`,
       );
       return 1;
     }
-    const existingLogDir = await lstat(logDir).catch(() => null);
-    if (existingLogDir !== null && existingLogDir.isSymbolicLink()) {
-      write(
-        err,
-        `Refusing to prepare the daemon log dir: ${logDir} is a symlink. A symlinked log dir would make root create and hand away a directory outside the fortress.\n` +
-          "Remove or replace it, then re-run install-boot.\n",
-      );
-      return 1;
-    }
-    if (existingLogDir !== null && !existingLogDir.isDirectory()) {
-      write(err, `Refusing to prepare the daemon log dir: ${logDir} exists and is not a directory.\n`);
-      return 1;
-    }
+    await fortressHandle?.close().catch(() => undefined);
+
     await mkdir(logDir, { recursive: true, mode: 0o755 });
-    const operatorUid = resolveSudoIdentityDecision(env)?.uid;
-    if (operatorUid === undefined) {
+
+    // The containment check is UNCONDITIONAL: a symlinked log dir is refused
+    // whether or not an operator uid is resolvable. (An earlier revision put
+    // this inside the resolved-operator branch, so a run without SUDO_UID
+    // skipped the refusal entirely.)
+    let handle;
+    try {
+      handle = await open(logDir, dirFlags);
+    } catch (error) {
       write(
         err,
-        `Warning: could not resolve the operator uid (SUDO_UID/SUDO_GID) to own ${logDir}; the root daemon's logs may not be operator-readable. Run: sudo sanctuary castle-wall repair-custody\n`,
+        `Refusing to prepare the daemon log dir: ${logDir} is not a plain directory (${
+          (error as NodeJS.ErrnoException).code ?? "open failed"
+        }). A symlinked log dir would make root hand away a directory outside the fortress.\n`,
       );
-    } else {
-      const handle = await open(
-        logDir,
-        fsConstants.O_RDONLY |
-          (typeof fsConstants.O_NOFOLLOW === "number" ? fsConstants.O_NOFOLLOW : 0) |
-          (typeof fsConstants.O_DIRECTORY === "number" ? fsConstants.O_DIRECTORY : 0),
-      );
-      try {
+      return 1;
+    }
+    try {
+      const operatorUid = resolveSudoIdentityDecision(env)?.uid;
+      if (operatorUid === undefined) {
+        write(
+          err,
+          `Warning: could not resolve the operator uid (SUDO_UID/SUDO_GID) to own ${logDir}; the root daemon's logs may not be operator-readable. Run: sudo sanctuary castle-wall repair-custody\n`,
+        );
+      } else {
+        // O_DIRECTORY already proved this is a directory; the fstat is only
+        // for the gid to preserve. BEST-EFFORT chown, exactly as the
+        // pre-hardening `chown` was: failing to hand the log dir to the
+        // operator degrades log READABILITY, it does not make the boot
+        // service unsafe, so it must not fail the install. The security
+        // property (never following a symlink) is NOT best-effort.
         const stats = await handle.stat();
-        if (!stats.isDirectory()) {
-          write(err, `Refusing to prepare the daemon log dir: ${logDir} is not a directory.\n`);
-          return 1;
-        }
-        // BEST-EFFORT, exactly as the pre-hardening `chown` was: a failure to
-        // hand the log dir to the operator degrades log READABILITY, it does
-        // not make the boot service unsafe, so it must not fail the install.
-        // (The security property -- never following a symlink -- is enforced
-        // above and is NOT best-effort.)
         try {
           await handle.chown(operatorUid, stats.gid);
         } catch (chownError) {
@@ -1340,9 +1345,9 @@ async function runInstallBootInner(
             }); the root daemon's logs may not be operator-readable. Run: sudo sanctuary castle-wall repair-custody\n`,
           );
         }
-      } finally {
-        await handle.close().catch(() => undefined);
       }
+    } finally {
+      await handle.close().catch(() => undefined);
     }
   } catch (error) {
     write(err, `Error preparing log dir ${logDir}: ${error instanceof Error ? error.message : String(error)}\n`);

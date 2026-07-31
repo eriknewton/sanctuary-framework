@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import type { Stats } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -154,6 +154,11 @@ function baseCtx(
       uid: 0,
       mode: 0o100600,
     }),
+    // The production reader re-verifies root ownership on its OWN descriptor
+    // (closing the stat-then-read race); a test cannot mint a root-owned
+    // file, so the read is seamed while the provenance checks above stay
+    // asserted through `statManifest`.
+    readManifestFile: async (path: string) => readFile(path, "utf8"),
     appendAudit: async (operation, details) => {
       auditOps.push({ operation, details });
     },

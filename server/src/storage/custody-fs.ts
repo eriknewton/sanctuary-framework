@@ -376,6 +376,10 @@ export async function chownCreatedDirChain(
     for (const component of components) {
       let handle;
       try {
+        // codeql[js/insecure-temporary-file] -- read-only O_NOFOLLOW|O_DIRECTORY
+        // open of an EXISTING directory for verification. No file is created
+        // here (no O_CREAT), so there is no temporary-file exposure; the
+        // no-follow flag is the whole point of the call.
         handle = await open(component, dirFlags);
       } catch (err) {
         throw new Error(
@@ -442,6 +446,10 @@ async function assertNoFollowPathWithinBase(
   try {
     for (const component of components) {
       try {
+        // codeql[js/insecure-temporary-file] -- read-only O_NOFOLLOW|O_DIRECTORY
+        // open of an EXISTING directory for verification. No file is created
+        // here (no O_CREAT), so there is no temporary-file exposure; the
+        // no-follow flag is the whole point of the call.
         handles.push(await open(component, dirFlags));
       } catch (err) {
         throw new Error(
