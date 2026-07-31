@@ -60,6 +60,7 @@ import {
   verifyEnforcementAvailabilityReport,
   verifyFlowDecisionEnforcementCarriage,
   type ResolvedEnforcementAvailability,
+  type EnforcementAvailabilityStream,
   type EnforcementAvailabilityVerification,
 } from "./enforcement-availability.js";
 
@@ -492,7 +493,7 @@ export class MacOSFlowEventConsumer {
       pinnedProducerKeyB64url: this.pinnedProducerKeyB64url,
       fortressId: this.fortressId,
     });
-    this.recordVerifiedAvailability(subscriberId, verified);
+    this.recordVerifiedAvailability(subscriberId, verified, "dedicated_report");
   }
 
   resolveEnforcementAvailability(nowMs = this.now()): ResolvedEnforcementAvailability {
@@ -507,19 +508,37 @@ export class MacOSFlowEventConsumer {
       notification,
       pinnedProducerKeyB64url: this.pinnedProducerKeyB64url,
     });
-    this.recordVerifiedAvailability(subscriberId, verified);
+    this.recordVerifiedAvailability(subscriberId, verified, "flow_carried");
   }
 
+  /**
+   * Replay protection is a per-stream monotonic floor. The extension signs
+   * dedicated availability reports and flow-carried availability from ONE
+   * producer counter, but the two paths deliver asynchronously, so a
+   * dedicated report signed at seq N legitimately arrives after a
+   * flow-carried event signed at seq N+k (F-AVAIL-SEQ-FLAP: a single shared
+   * floor misread that interleaving as replay and flapped the armed surface
+   * to undetermined). Within one stream delivery is in signing order, so
+   * seq <= that stream's floor IS a genuine replay and is still rejected;
+   * cross-stream re-delivery is rejected earlier by the verifiers' signed
+   * `operation` binding. Never-green-on-absence is untouched: acceptance
+   * still requires a verified, signed, fortress-bound report inside the
+   * consumer-observed freshness window.
+   */
   private recordVerifiedAvailability(
     subscriberId: string,
     verified: EnforcementAvailabilityVerification,
+    stream: EnforcementAvailabilityStream,
   ): void {
     if (!verified.ok) {
       this.enforcementAvailability.recordInvalidReport(subscriberId, verified.reason);
       this.stats.enforcementAvailabilityReportsRejected += 1;
       return;
     }
-    const lastSeq = this.enforcementAvailability.lastProducerSeq(subscriberId);
+    const lastSeq = this.enforcementAvailability.lastProducerSeq(
+      subscriberId,
+      stream,
+    );
     if (lastSeq !== null && verified.seq <= lastSeq) {
       this.enforcementAvailability.recordInvalidReport(
         subscriberId,
@@ -533,6 +552,7 @@ export class MacOSFlowEventConsumer {
       verified.enforcement,
       this.now(),
       verified.seq,
+      stream,
     );
     this.stats.enforcementAvailabilityReportsRecorded += 1;
   }

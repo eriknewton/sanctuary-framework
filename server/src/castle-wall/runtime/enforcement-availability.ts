@@ -47,6 +47,31 @@ export interface ResolvedEnforcementAvailability {
   active_connection_count: number;
 }
 
+/**
+ * The two delivery paths that carry producer-signed availability from the
+ * extension. Both are signed from the SAME producer counter, but they are
+ * delivered asynchronously relative to each other, so seqs interleave across
+ * paths: a dedicated report signed at seq N routinely arrives after a
+ * flow-carried report signed at seq N+k. Replay floors are therefore kept
+ * per stream: within one stream delivery is in signing order, so a seq at or
+ * below that stream's floor is a genuine replay; across streams it is just
+ * out-of-order delivery. Cross-stream replay (re-delivering one stream's
+ * message on the other path) is structurally impossible because each
+ * verifier checks the signed body's `operation` field
+ * (`enforcement_availability_report` vs `egress_approved`/`egress_blocked`).
+ *
+ * Scope (deliberate, and unchanged from the single-floor design this
+ * replaces): floors are per CONNECTION and reset when a connection
+ * re-registers, because an extension restart resets the producer counter and
+ * a floor that survived reconnect would falsely reject every post-restart
+ * report forever (stuck-at-undetermined). The residual cross-connection
+ * window is bounded elsewhere: reaching the socket requires local access,
+ * resolve() greens only if EVERY active connection holds a fresh live
+ * report, and a replayed tuple is only fresh for the consumer-observed
+ * freshness window after delivery.
+ */
+export type EnforcementAvailabilityStream = "dedicated_report" | "flow_carried";
+
 export type EnforcementAvailabilityVerification =
   | {
       ok: true;
@@ -69,7 +94,12 @@ interface ConnectionAvailabilityState {
   report: EnforcementAvailabilitySnapshot | null;
   observedAtMs: number | null;
   invalidReason: string | null;
-  lastProducerSeq: number | null;
+  /**
+   * Per-stream monotonic replay floors (two numbers per connection; bounded
+   * memory, cleared with the connection on unregister). See
+   * {@link EnforcementAvailabilityStream} for why the floor is per stream.
+   */
+  lastProducerSeqByStream: Record<EnforcementAvailabilityStream, number | null>;
 }
 
 export class EnforcementAvailabilityStore {
@@ -87,7 +117,7 @@ export class EnforcementAvailabilityStore {
       report: null,
       observedAtMs: null,
       invalidReason: null,
-      lastProducerSeq: null,
+      lastProducerSeqByStream: { dedicated_report: null, flow_carried: null },
     });
   }
 
@@ -100,12 +130,13 @@ export class EnforcementAvailabilityStore {
     report: EnforcementAvailabilitySnapshot,
     observedAtMs: number,
     seq?: number,
+    stream: EnforcementAvailabilityStream = "dedicated_report",
   ): void {
     this.registerConnection(connectionId);
     const state = this.connections.get(connectionId);
     if (!state) return;
     if (seq !== undefined) {
-      state.lastProducerSeq = seq;
+      state.lastProducerSeqByStream[stream] = seq;
     }
     state.report = report;
     state.observedAtMs = observedAtMs;
@@ -116,20 +147,26 @@ export class EnforcementAvailabilityStore {
     connectionId: string,
     reason: string,
     seq?: number,
+    stream: EnforcementAvailabilityStream = "dedicated_report",
   ): void {
     this.registerConnection(connectionId);
     const state = this.connections.get(connectionId);
     if (!state) return;
     if (seq !== undefined) {
-      state.lastProducerSeq = seq;
+      state.lastProducerSeqByStream[stream] = seq;
     }
     state.report = null;
     state.observedAtMs = null;
     state.invalidReason = reason;
   }
 
-  lastProducerSeq(connectionId: string): number | null {
-    return this.connections.get(connectionId)?.lastProducerSeq ?? null;
+  lastProducerSeq(
+    connectionId: string,
+    stream: EnforcementAvailabilityStream = "dedicated_report",
+  ): number | null {
+    return (
+      this.connections.get(connectionId)?.lastProducerSeqByStream[stream] ?? null
+    );
   }
 
   resolve(nowMs = Date.now()): ResolvedEnforcementAvailability {
