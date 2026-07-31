@@ -466,7 +466,20 @@ export async function runRepairCustody(
       gid: identity.gid,
     });
     if (sweepPlan.actions.length > 0) {
-      await applyFortressCustodyRepairs(fortressPath, sweepPlan, ops);
+      const swept = await applyFortressCustodyRepairs(fortressPath, sweepPlan, ops);
+      // 2026-07-31 re-gate LOW: the sweep's own failures used to be dropped
+      // on the floor, so an audit write that minted root-owned state the
+      // sweep could not repair still exited success. Surface it and downgrade
+      // the exit code -- never report a clean repair over known residue.
+      if (swept.failed.length > 0 || swept.identityChanged.length > 0) {
+        describeApply(swept, out);
+        write(
+          err,
+          "Repair incomplete: the post-audit custody sweep could not hand every freshly written entry back to the operator (see above). " +
+            "Re-run 'sudo sanctuary castle-wall repair-custody' once the fortress is quiescent.\n",
+        );
+        return REPAIR_CUSTODY_EXIT_FAILED;
+      }
     }
   } catch (error) {
     write(

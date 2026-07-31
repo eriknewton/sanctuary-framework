@@ -855,11 +855,47 @@ export async function applyCustodyRollback(
         const needsChmod =
           entry.type !== "symlink" && (current.mode & 0o7777) !== targetMode;
         if (!needsChown && !needsChmod) continue;
-        if (needsChown) {
-          await ops.lchown(absPath, entry.uid, entry.gid);
-        }
-        if (needsChmod) {
-          await ops.chmod(absPath, targetMode);
+        if (entry.type === "file" || entry.type === "dir") {
+          // 2026-07-31 re-gate BLOCKER: a PATHNAME chmod after an lstat is a
+          // root chmod primitive (swap the final component for a symlink in
+          // the window and chmod follows it). Go through an O_NOFOLLOW
+          // descriptor pinned to the observed inode instead.
+          const flags =
+            fsConstants.O_RDONLY |
+            (typeof fsConstants.O_NOFOLLOW === "number" ? fsConstants.O_NOFOLLOW : 0) |
+            (entry.type === "dir" && typeof fsConstants.O_DIRECTORY === "number"
+              ? fsConstants.O_DIRECTORY
+              : 0);
+          let handle: OpenHandle;
+          try {
+            handle = await ops.open(absPath, flags);
+          } catch (err) {
+            if (isEnoent(err)) {
+              result.vanished.push(entry.path);
+              continue;
+            }
+            throw err;
+          }
+          try {
+            const pinned = await handle.stat();
+            if (entryType(pinned) !== entry.type || pinned.ino !== current.ino) {
+              result.identityChanged.push(entry.path);
+              continue;
+            }
+            if (needsChown) await handle.chown(entry.uid, entry.gid);
+            if (needsChmod) await handle.chmod(targetMode);
+          } finally {
+            await handle.close().catch(() => undefined);
+          }
+        } else {
+          // Sockets/symlinks cannot be opened. lchown never follows, so
+          // ownership is safe; a pathname CHMOD is not, so rollback does not
+          // restore modes for these types. Stated bound, not a silent skip:
+          // the socket's 0600 is re-established by the daemon that binds it,
+          // and symlink modes are meaningless.
+          if (needsChown) {
+            await ops.lchown(absPath, entry.uid, entry.gid);
+          }
         }
         result.repaired.push(entry.path);
       } finally {

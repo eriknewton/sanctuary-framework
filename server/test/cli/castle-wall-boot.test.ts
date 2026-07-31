@@ -883,6 +883,24 @@ describe("castle-wall boot service (F1 Option C)", () => {
       expect(normalizeCalls).toHaveLength(2);
     });
 
+    it("REFUSES a symlinked daemon log dir instead of chowning through it (re-gate BLOCKER)", async () => {
+      const f = await makeInstallFixture();
+      const outside = await makeTemp("f1-outside-");
+      // The attack: a same-uid actor plants <fortress>/logs as a symlink to a
+      // directory outside the fortress. The old code ran `mkdir -p` and a
+      // PATHNAME chown, handing that outside directory to the operator; the
+      // custody normalize can never undo it because it only walks inside.
+      await symlink(outside, join(f.fortress, "logs"));
+
+      const code = await runInstallBoot(f.argv, f.ctx);
+
+      expect(code).toBe(1);
+      expect(f.err.text()).toContain("is a symlink");
+      // The outside directory's ownership is untouched.
+      const outsideStat = await stat(outside);
+      expect(outsideStat.uid).toBe(process.getuid?.() ?? outsideStat.uid);
+    });
+
     it("normalizes on FAILURE exits too, not just success (gate HIGH: the log-dir mkdir precedes them)", async () => {
       const f = await makeInstallFixture();
       const normalizeCalls: string[] = [];

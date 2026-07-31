@@ -62,7 +62,8 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { lstat, mkdir, rm, stat } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
+import { lstat, mkdir, open, rm, stat } from "node:fs/promises";
 import { createConnection } from "node:net";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { execPath } from "node:process";
@@ -1268,12 +1269,53 @@ async function runInstallBootInner(
 
   // Log dir must exist before launchd starts the job; chown to the operator so
   // they can read the root daemon's logs.
+  //
+  // SECURITY (2026-07-31 re-gate BLOCKER): this ran `mkdir -p` and then a
+  // PATHNAME `chown` as root. A same-uid actor who pre-created
+  // `<fortress>/logs` as a SYMLINK (say to /Library/LaunchDaemons) made both
+  // follow it, handing an outside root-owned directory to the operator --
+  // an escalation the custody normalize can never undo, because it only ever
+  // walks INSIDE the fortress. Refuse a symlinked log dir outright, and do
+  // the ownership change through an O_NOFOLLOW descriptor rather than a path.
   const logDir = join(fortressPath, "logs");
   try {
+    const existingLogDir = await lstat(logDir).catch(() => null);
+    if (existingLogDir !== null && existingLogDir.isSymbolicLink()) {
+      write(
+        err,
+        `Refusing to prepare the daemon log dir: ${logDir} is a symlink. A symlinked log dir would make root create and hand away a directory outside the fortress.\n` +
+          "Remove or replace it, then re-run install-boot.\n",
+      );
+      return 1;
+    }
+    if (existingLogDir !== null && !existingLogDir.isDirectory()) {
+      write(err, `Refusing to prepare the daemon log dir: ${logDir} exists and is not a directory.\n`);
+      return 1;
+    }
     await mkdir(logDir, { recursive: true, mode: 0o755 });
-    const chownResult = execFileFn("chown", [user, logDir]);
-    if (chownResult.code !== 0) {
-      write(err, `Warning: could not chown ${logDir} to ${user}: ${chownResult.stderr.trim()}\n`);
+    const operatorUid = resolveSudoIdentityDecision(env)?.uid;
+    if (operatorUid === undefined) {
+      write(
+        err,
+        `Warning: could not resolve the operator uid (SUDO_UID/SUDO_GID) to own ${logDir}; the root daemon's logs may not be operator-readable. Run: sudo sanctuary castle-wall repair-custody\n`,
+      );
+    } else {
+      const handle = await open(
+        logDir,
+        fsConstants.O_RDONLY |
+          (typeof fsConstants.O_NOFOLLOW === "number" ? fsConstants.O_NOFOLLOW : 0) |
+          (typeof fsConstants.O_DIRECTORY === "number" ? fsConstants.O_DIRECTORY : 0),
+      );
+      try {
+        const stats = await handle.stat();
+        if (!stats.isDirectory()) {
+          write(err, `Refusing to prepare the daemon log dir: ${logDir} is not a directory.\n`);
+          return 1;
+        }
+        await handle.chown(operatorUid, stats.gid);
+      } finally {
+        await handle.close().catch(() => undefined);
+      }
     }
   } catch (error) {
     write(err, `Error preparing log dir ${logDir}: ${error instanceof Error ? error.message : String(error)}\n`);

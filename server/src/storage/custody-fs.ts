@@ -1,5 +1,5 @@
 import { constants as fsConstants, type Stats } from "node:fs";
-import { lchown, mkdir, open, rename, unlink, lstat } from "node:fs/promises";
+import { mkdir, open, rename, unlink, lstat } from "node:fs/promises";
 import { randomBytes } from "node:crypto";
 import { basename, dirname, join, resolve as resolvePath } from "node:path";
 
@@ -287,9 +287,31 @@ async function fsyncDirectory(dir: string): Promise<void> {
  * `leafDir` (inclusive) to `owner`. `firstCreated` is the value `mkdir
  * {recursive:true}` returns: the FIRST directory it actually created, so the
  * chain covers exactly the dirs this call minted (pre-existing parents are
- * never touched). lchown so a hostile symlink swap of a chain segment is
- * chowned as the link itself, never through it. Exported for the other
- * create-with-fchown sites (the macOS daemon's fortress-internal mkdirs).
+ * never touched). Exported for the other create-with-fchown sites (the macOS
+ * daemon's fortress-internal mkdirs).
+ *
+ * SECURITY (2026-07-31 re-gate BLOCKER): this used to `lchown` PATH STRINGS.
+ * `lchown` refuses to follow only the FINAL component, so a pre-existing
+ * symlinked ANCESTOR (`<fortress>/policy -> /outside`) made the recursive
+ * `mkdir` create `/outside/egress/rules` and this function then chowned that
+ * outside chain to the operator -- a root ownership-transfer primitive
+ * reachable by anyone who could plant one symlink.
+ *
+ * Every component from the created chain's PARENT downward is now opened with
+ * `O_NOFOLLOW | O_DIRECTORY`, so a symlink at or below that point fails the
+ * open; the created chain is then chowned through those descriptors (never by
+ * name). Handles are held open across the whole operation so the inodes
+ * cannot be recycled. Fail-closed: any refusal throws, which fails the
+ * enclosing write rather than leaving a directory misowned.
+ *
+ * BOUND, STATED PLAINLY: verification starts at the created chain's parent,
+ * not at `/`, because legitimate system symlinks sit above it (on macOS
+ * `/var` is itself a symlink to `/private/var`, so a root-anchored check
+ * would refuse every real write under a temp or var path). A symlink planted
+ * ABOVE the first created directory is therefore not caught here; that region
+ * is governed by the fortress custody walk, which refuses a symlinked
+ * fortress root outright, and by `resolveFortressCreateOwner`, which lstats
+ * (never stats) the fortress so a symlinked fortress yields no owner at all.
  */
 export async function chownCreatedDirChain(
   firstCreated: string,
@@ -302,21 +324,67 @@ export async function chownCreatedDirChain(
   // the owner option fail-closed, and a misowned created dir is exactly the
   // defect class this exists to prevent.
   const stop = resolvePath(firstCreated);
-  let current = resolvePath(leafDir);
-  const chain: string[] = [];
+  const leaf = resolvePath(leafDir);
+  let current = leaf;
+  const createdChain = new Set<string>();
   for (;;) {
-    chain.push(current);
+    createdChain.add(current);
     if (current === stop) break;
     const parent = dirname(current);
     if (parent === current) {
       throw new Error(
-        `chownCreatedDirChain: ${stop} is not an ancestor of ${chain[0]}; refusing to leave created directories misowned`,
+        `chownCreatedDirChain: ${stop} is not an ancestor of ${leaf}; refusing to leave created directories misowned`,
       );
     }
     current = parent;
   }
-  for (const dir of chain.reverse()) {
-    await lchown(dir, owner.uid, owner.gid);
+
+  // Components from the created chain's PARENT down to the leaf, opened
+  // no-follow (see the BOUND note above for why this does not start at "/").
+  const verifyFrom = dirname(stop);
+  const components: string[] = [];
+  let walk = leaf;
+  for (;;) {
+    components.push(walk);
+    if (walk === verifyFrom) break;
+    const parent = dirname(walk);
+    if (parent === walk) break;
+    walk = parent;
+  }
+  components.reverse();
+
+  const dirFlags =
+    fsConstants.O_RDONLY |
+    O_NOFOLLOW |
+    (typeof fsConstants.O_DIRECTORY === "number" ? fsConstants.O_DIRECTORY : 0);
+  const handles: Array<{
+    path: string;
+    handle: Awaited<ReturnType<typeof open>>;
+  }> = [];
+  try {
+    for (const component of components) {
+      let handle;
+      try {
+        handle = await open(component, dirFlags);
+      } catch (err) {
+        throw new Error(
+          `chownCreatedDirChain: refusing to chown through ${component} (${
+            (err as NodeJS.ErrnoException).code ?? "open failed"
+          }); a symlinked path component would transfer ownership outside the intended tree`,
+          { cause: err },
+        );
+      }
+      handles.push({ path: component, handle });
+    }
+    for (const entry of handles) {
+      if (createdChain.has(entry.path)) {
+        await entry.handle.chown(owner.uid, owner.gid);
+      }
+    }
+  } finally {
+    for (const entry of handles.reverse()) {
+      await entry.handle.close().catch(() => undefined);
+    }
   }
 }
 

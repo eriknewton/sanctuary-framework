@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { statSync } from "node:fs";
+import { lstatSync, statSync } from "node:fs";
 import { mkdir, readdir, stat, unlink } from "node:fs/promises";
 import { createConnection } from "node:net";
 import { dirname, join } from "node:path";
@@ -545,13 +545,23 @@ export function resolveFortressCreateOwner(input: {
     if (input.statFortressOwner) {
       owner = input.statFortressOwner(input.fortressPath);
     } else {
-      const stats = statSync(input.fortressPath);
+      // lstat, NOT stat (2026-07-31 re-gate): a SYMLINKED fortress would
+      // otherwise report its target's owner, and every create-with-fchown
+      // write would then hand files outside the fortress to that uid. A
+      // symlinked fortress yields no owner at all, so no chown happens.
+      const stats = lstatSync(input.fortressPath);
+      if (stats.isSymbolicLink() || !stats.isDirectory()) {
+        return undefined;
+      }
       owner = { uid: stats.uid, gid: stats.gid };
     }
   } catch {
     return undefined;
   }
-  if (owner.uid === 0) {
+  // 2026-07-31 re-gate MED: gid 0 is refused for the same reason uid 0 is.
+  // A `501:0` fortress would otherwise have every root-created file chowned
+  // to GROUP wheel, which is not the operator's custody domain.
+  if (owner.uid === 0 || owner.gid === 0) {
     return undefined;
   }
   return owner;

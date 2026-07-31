@@ -612,6 +612,33 @@ describe("fortress-custody: rollback containment (2026-07-31 gate BLOCKER-2)", (
     expect(fake.chmods.every((c) => (c.mode & 0o7000) === 0)).toBe(true);
   });
 
+  it("applies file/dir rollback through an fd, never a pathname chmod (re-gate BLOCKER)", async () => {
+    const fake = makeFakeFs(
+      {
+        "/f": { type: "dir", uid: 501, gid: 20, mode: 0o700, ino: 1 },
+        "/f/a.enc": { type: "file", uid: 501, gid: 20, mode: 0o644, ino: 2 },
+      },
+      { "/f": ["a.enc"] },
+    );
+    await applyCustodyRollback(
+      "/f",
+      manifestOf([
+        { path: ".", type: "dir", uid: 501, gid: 20, mode: 0o700, dev: 1, ino: 1 },
+        { path: "a.enc", type: "file", uid: 0, gid: 20, mode: 0o600, dev: 1, ino: 2 },
+      ]),
+      fake.ops,
+    );
+    // Ownership and mode were restored...
+    expect(fake.nodes.get("/f/a.enc")!.uid).toBe(0);
+    expect(fake.nodes.get("/f/a.enc")!.mode).toBe(0o600);
+    // ...entirely through the DESCRIPTOR: a pathname chmod after an lstat is
+    // the root chmod primitive the re-gate flagged, so there must be none.
+    expect(fake.chmods).toEqual([]);
+    expect(fake.lchowns).toEqual([]);
+    expect(fake.fchmods.some((c) => c.path === "/f/a.enc")).toBe(true);
+    expect(fake.fchowns.some((c) => c.path === "/f/a.enc")).toBe(true);
+  });
+
   it("REFUSES a symlinked fortress root (repair already did; rollback used to skip this)", async () => {
     const fake = makeFakeFs(
       { "/f": { type: "symlink", uid: 501, gid: 20, mode: 0o777, ino: 1 } },

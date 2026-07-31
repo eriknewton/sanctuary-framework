@@ -171,6 +171,31 @@ describe("create-with-fchown owner option (fortress-ownership spec 2026-07-30)",
     expect(await bad.read("ns", "key")).toBeNull();
   });
 
+  it("REFUSES to chown created dirs through a symlinked ANCESTOR (2026-07-31 re-gate BLOCKER)", async () => {
+    // The reported primitive: a pre-existing symlinked path component made
+    // the recursive mkdir create the tree OUTSIDE and the chain chown hand
+    // that outside tree away. Now every component is opened O_NOFOLLOW, so
+    // the write fails closed instead.
+    const outside = await mkdtemp(join(tmpdir(), "custody-outside-"));
+    try {
+      await symlink(outside, join(dir, "policy"));
+      const target = join(dir, "policy", "egress", "rules", "file.enc");
+      await expect(
+        writeFileCustody(target, "payload", { mode: 0o600, owner: selfOwner() }),
+      ).rejects.toThrow(/refusing to chown through/);
+    } finally {
+      await rm(outside, { recursive: true, force: true });
+    }
+  });
+
+  it("still chowns a legitimately created chain (no symlink on the path)", async () => {
+    const target = join(dir, "a", "b", "c", "file.enc");
+    await writeFileCustody(target, "payload", { mode: 0o600, owner: selfOwner() });
+    for (const created of [join(dir, "a"), join(dir, "a", "b"), join(dir, "a", "b", "c")]) {
+      expect((await lstat(created)).uid).toBe(selfOwner().uid);
+    }
+  });
+
   it("no owner option means no chown call and unchanged behavior", async () => {
     const target = join(dir, "plain.enc");
     await writeFileCustody(target, "payload", { mode: 0o600 });

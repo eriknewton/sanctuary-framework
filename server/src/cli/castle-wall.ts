@@ -2139,10 +2139,13 @@ export async function runSafeModeDaemon(
       `Warning: the fortress at ${storagePath} is owned by root (uid 0), so the safe-mode socket stays root-owned and the operator may be unable to reach it (including the 'disable' dead-man lever). Run 'sudo sanctuary castle-wall repair-custody' to hand the fortress back to the operator. Disarm via System Settings VPN & Filters if needed.\n`,
     );
   }
+  // 2026-07-31 re-gate MED: gid 0 is refused alongside uid 0, so a `501:0`
+  // fortress never has root-created files chowned to group wheel.
   const fortressCreateOwner =
     socketOwnerUid !== undefined &&
     socketOwnerUid !== 0 &&
     fortressOwnerGid !== undefined &&
+    fortressOwnerGid !== 0 &&
     (ctx.getuid ?? process.getuid?.bind(process))?.() === 0
       ? { uid: socketOwnerUid, gid: fortressOwnerGid }
       : undefined;
