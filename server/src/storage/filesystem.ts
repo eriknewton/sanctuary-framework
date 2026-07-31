@@ -155,7 +155,12 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     await writeFileCustody(filePath, data, {
       mode: 0o600,
       parentMode: 0o700,
-      ...(this.owner !== undefined ? { owner: this.owner } : {}),
+      // The storage root is the containment base: an owner-write must never
+      // land outside this backend's own basePath, even if a path component
+      // inside it was replaced with a symlink.
+      ...(this.owner !== undefined
+        ? { owner: this.owner, ownerBase: this.basePath }
+        : {}),
     });
     if (syncFile) await this.fsyncDirectory(dirname(filePath));
   }

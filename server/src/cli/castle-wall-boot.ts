@@ -1279,6 +1279,19 @@ async function runInstallBootInner(
   // the ownership change through an O_NOFOLLOW descriptor rather than a path.
   const logDir = join(fortressPath, "logs");
   try {
+    // 2026-07-31 gate round 3: refusing only a symlinked `logs` leaf was not
+    // enough -- a symlinked FORTRESS (or any symlinked component of it) is
+    // still followed by both the mkdir and the no-follow open below, because
+    // O_NOFOLLOW guards only the final component. Refuse a symlinked fortress
+    // outright; the custody walk applies the same rule.
+    const fortressEntry = await lstat(fortressPath).catch(() => null);
+    if (fortressEntry !== null && fortressEntry.isSymbolicLink()) {
+      write(
+        err,
+        `Refusing to install the boot service: the fortress path ${fortressPath} is a symlink. Root would create and hand away directories outside the fortress.\n`,
+      );
+      return 1;
+    }
     const existingLogDir = await lstat(logDir).catch(() => null);
     if (existingLogDir !== null && existingLogDir.isSymbolicLink()) {
       write(

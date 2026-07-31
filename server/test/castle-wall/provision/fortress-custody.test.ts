@@ -223,16 +223,21 @@ describe("fortress-custody: plan", () => {
     ]);
   });
 
-  it("restores fortress-dir 0700 and castle.sock 0600 only where deviant", () => {
+  it("restores the fortress-dir 0700 but only REPORTS a deviant castle.sock mode (gate round 3)", () => {
     const entries: FortressCustodyEntry[] = [
       { path: ".", type: "dir", uid: 501, gid: 20, mode: 0o755, dev: 1, ino: 1 },
       { path: "castle.sock", type: "socket", uid: 501, gid: 20, mode: 0o666, dev: 1, ino: 2 },
       { path: "ok.enc", type: "file", uid: 501, gid: 20, mode: 0o644, dev: 1, ino: 3 },
     ];
     const plan = planFortressCustodyRepairs(entries, OPERATOR);
-    expect(plan.actions).toHaveLength(2);
+    // The fortress dir is openable, so its mode is restored through an fd.
+    expect(plan.actions).toHaveLength(1);
     expect(plan.actions.find((a) => a.entry.path === ".")?.chmodTo).toBe(0o700);
-    expect(plan.actions.find((a) => a.entry.path === "castle.sock")?.chmodTo).toBe(0o600);
+    // A socket cannot be opened, so restoring its mode could only be a
+    // PATHNAME chmod -- a root chmod primitive under a final-component
+    // symlink swap. It is reported instead, never repaired.
+    expect(plan.actions.some((a) => a.entry.path === "castle.sock")).toBe(false);
+    expect(plan.socketModeDeviations).toEqual([{ path: "castle.sock", mode: 0o666 }]);
     // A non-canonical mode on an ordinary operator-owned file is NOT touched.
     expect(plan.actions.some((a) => a.entry.path === "ok.enc")).toBe(false);
   });

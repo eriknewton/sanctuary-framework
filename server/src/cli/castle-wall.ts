@@ -5,7 +5,7 @@ import {
 } from "node:child_process";
 import { createConnection } from "node:net";
 import { createHash, randomBytes as nodeRandomBytes } from "node:crypto";
-import { chmod, mkdir, readFile, readdir, stat, unlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, readFile, readdir, stat, unlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { Writable } from "node:stream";
@@ -23,6 +23,7 @@ import { resolveStoragePath } from "../paths.js";
 import { getSanctuaryVersion } from "../version.js";
 import { getOrCreatePassphrase } from "../wrap/passphrase.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
+import { writeFileCustody } from "../storage/custody-fs.js";
 import {
   AuditLog,
   AuditIntegrityError,
@@ -182,7 +183,9 @@ export interface CastleWallCommandContext {
    * socket re-own uid + create-with-fchown owner (tests simulate a root-owned
    * fortress without root).
    */
-  fortressStat?: (path: string) => Promise<{ uid: number; gid: number }>;
+  fortressStat?: (
+    path: string,
+  ) => Promise<{ uid: number; gid: number; isSymbolicLink?: () => boolean }>;
   /**
    * Override the fortress-owner probe behind the `enable` root-owned-fortress
    * refusal (fortress-ownership spec 2026-07-30 §4(a2)(2); tests). Resolves
@@ -2120,7 +2123,16 @@ export async function runSafeModeDaemon(
   let socketOwnerUid: number | undefined;
   let fortressOwnerGid: number | undefined;
   try {
-    const fortressStat = await (ctx.fortressStat ?? stat)(storagePath);
+    // lstat, NOT stat (2026-07-31 gate round 3): a SYMLINKED fortress would
+    // otherwise report its target's owner, and the create-with-fchown writes
+    // below would hand files outside the fortress to that uid.
+    const fortressStat = await (ctx.fortressStat ?? lstat)(storagePath);
+    if (
+      typeof (fortressStat as { isSymbolicLink?: () => boolean }).isSymbolicLink === "function" &&
+      (fortressStat as { isSymbolicLink: () => boolean }).isSymbolicLink()
+    ) {
+      throw new Error(`fortress ${storagePath} is a symlink`);
+    }
     socketOwnerUid = fortressStat.uid;
     fortressOwnerGid = fortressStat.gid;
   } catch (error) {
@@ -3839,10 +3851,17 @@ async function writeLeaseStatusBestEffort(
   lease: LeaseStatusFile,
 ): Promise<void> {
   try {
-    await writeFile(leaseStatusPath(fortressPath), JSON.stringify(lease, null, 2) + "\n", {
-      mode: 0o600,
-    });
-    await chmod(leaseStatusPath(fortressPath), 0o600);
+    // SECURITY (2026-07-31 gate round 3): this used a plain `writeFile` +
+    // PATHNAME `chmod`. Under `sudo enable|disable` that runs AS ROOT, so a
+    // same-uid actor who pre-created `castle-wall-lease.json` as a symlink
+    // made root write through it and chmod the outside target. `writeFileCustody`
+    // creates an O_EXCL|O_NOFOLLOW temp file, chmods the DESCRIPTOR, and
+    // atomically renames, so no pathname write or chmod ever follows a link.
+    await writeFileCustody(
+      leaseStatusPath(fortressPath),
+      JSON.stringify(lease, null, 2) + "\n",
+      { mode: 0o600, createParent: false },
+    );
   } catch {
     // Advisory-only status surface; enforcement rides authenticated IPC.
   }

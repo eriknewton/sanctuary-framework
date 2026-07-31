@@ -409,10 +409,25 @@ export async function runRepairCustody(
     write(out, `  note: ${path} vanished mid-walk (live daemon churn); skipped.\n`);
   }
 
-  if (plan.actions.length === 0) {
+  for (const deviation of plan.socketModeDeviations) {
     write(
       out,
-      `Already clean: every entry under ${fortressPath} is operator-owned with canonical modes; nothing changed.\n`,
+      `  note: ${deviation.path} has mode ${deviation.mode.toString(8)} (canonical is 600). A socket cannot be repaired safely by path; restart the Castle Wall daemon to rebind it with the canonical mode.\n`,
+    );
+  }
+
+  if (plan.actions.length === 0) {
+    // 2026-07-31 gate round 3 (MED): "every entry is operator-owned" was an
+    // OVERCLAIM whenever entries were skipped for foreign ownership or a
+    // socket mode deviated. State exactly what was and was not done.
+    const caveats = plan.skips.length + plan.socketModeDeviations.length;
+    write(
+      out,
+      caveats === 0
+        ? `Already clean: every entry under ${fortressPath} is operator-owned with canonical modes; nothing changed.\n`
+        : `Nothing to repair under ${fortressPath}: no root-owned entries remain. ${caveats} entr${
+            caveats === 1 ? "y was" : "ies were"
+          } left untouched and reported above (foreign owner or socket mode); this verb cannot and does not repair those.\n`,
     );
     return REPAIR_CUSTODY_EXIT_ALREADY_CLEAN;
   }

@@ -226,6 +226,14 @@ export interface CustodyRepairPlan {
   actions: CustodyRepairAction[];
   skips: CustodySkip[];
   /**
+   * Sockets whose mode deviates from the canonical 0600. REPORTED rather than
+   * repaired: a socket cannot be opened, so restoring its mode could only be
+   * a pathname chmod, which is a root chmod primitive under a final-component
+   * symlink swap (2026-07-31 gate round 3). The daemon re-establishes the
+   * mode when it rebinds.
+   */
+  socketModeDeviations: { path: string; mode: number }[];
+  /**
    * EVERY observed entry (not just the actionable ones), keyed for the
    * apply phase's ancestor verification: repairing `a/b/c` must prove that
    * `a` and `a/b` are still the exact directories the walk observed, so a
@@ -347,6 +355,7 @@ export function planFortressCustodyRepairs(
 ): CustodyRepairPlan {
   const actions: CustodyRepairAction[] = [];
   const skips: CustodySkip[] = [];
+  const socketModeDeviations: { path: string; mode: number }[] = [];
   for (const entry of entries) {
     if (entry.uid !== 0 && entry.uid !== operator.uid) {
       skips.push({
@@ -364,18 +373,22 @@ export function planFortressCustodyRepairs(
     if (entry.path === "." && entry.type === "dir" && entry.mode !== 0o700) {
       action.chmodTo = 0o700;
     }
+    // A deviant castle.sock mode is REPORTED, never chmod'd by pathname (a
+    // socket cannot be opened, and a pathname chmod after an lstat is a root
+    // chmod primitive; 2026-07-31 gate round 3). The daemon re-establishes
+    // 0600 when it rebinds, which is the honest remedy.
     if (
       entry.path === CASTLE_SOCKET_BASENAME &&
       entry.type === "socket" &&
       entry.mode !== 0o600
     ) {
-      action.chmodTo = 0o600;
+      socketModeDeviations.push({ path: entry.path, mode: entry.mode });
     }
     if (action.chownTo !== undefined || action.chmodTo !== undefined) {
       actions.push(action);
     }
   }
-  return { actions, skips, observed: entries };
+  return { actions, skips, socketModeDeviations, observed: entries };
 }
 
 // ---------------------------------------------------------------------------
@@ -555,9 +568,13 @@ async function applyOneAction(
     if (action.chownTo !== undefined) {
       await ops.lchown(absPath, action.chownTo.uid, action.chownTo.gid);
     }
-    if (action.chmodTo !== undefined && action.entry.type !== "symlink") {
-      await ops.chmod(absPath, action.chmodTo);
-    }
+    // NOTE (2026-07-31 gate round 3): sockets and symlinks cannot be opened,
+    // so a mode restore here could only be a PATHNAME chmod -- and a pathname
+    // chmod after an lstat is a root chmod primitive (swap the final
+    // component for a symlink in the window). We therefore chown these types
+    // (lchown never follows) but never chmod them. `castle.sock`'s 0600 is
+    // re-established by the daemon that binds it; a deviant socket mode is
+    // REPORTED by the plan instead of silently left, see `socketModeDeviations`.
     return "repaired";
   } finally {
     for (const handle of ancestors.handles.reverse()) {
@@ -1000,6 +1017,19 @@ export async function normalizeFortressCustody(
         `Fortress custody normalized: ${applied.repaired.length} root-owned entr${
           applied.repaired.length === 1 ? "y" : "ies"
         } under ${input.fortressPath} handed back to the operator (uid ${input.operator.uid}).`,
+      );
+    }
+    // 2026-07-31 gate round 3 (LOW): identity/ancestor changes were dropped
+    // here, so a race could leave root-owned residue behind a "clean"
+    // outcome. Surface them as loudly as a failure.
+    if (applied.identityChanged.length > 0) {
+      outcome.status = "failed";
+      input.log(
+        `Warning: fortress custody normalize left ${applied.identityChanged.length} entr${
+          applied.identityChanged.length === 1 ? "y" : "ies"
+        } unrepaired under ${input.fortressPath} because the entry or an ancestor changed mid-run (${applied.identityChanged.join(
+          "; ",
+        )}). Run 'sudo sanctuary castle-wall repair-custody' once the fortress is quiescent.`,
       );
     }
     if (applied.failed.length > 0) {

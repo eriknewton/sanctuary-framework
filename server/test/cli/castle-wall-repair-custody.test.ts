@@ -236,7 +236,12 @@ describe("castle-wall repair-custody", () => {
       );
       const ctx2 = baseCtx(fake, manifestDir);
       expect(await runRepairCustody([], ctx2)).toBe(REPAIR_CUSTODY_EXIT_ALREADY_CLEAN);
-      expect(ctx2.out.text()).toContain("Already clean");
+      // The fixture carries a foreign-owned entry, so the run must NOT claim
+      // "every entry is operator-owned" (gate round 3 MED overclaim); it
+      // states exactly what it did and did not touch.
+      expect(ctx2.out.text()).toContain("Nothing to repair");
+      expect(ctx2.out.text()).toContain("left untouched");
+      expect(ctx2.out.text()).not.toContain("Already clean");
       // Two manifests side by side; nothing clobbered.
       expect(await readdir(manifestDir)).toHaveLength(2);
     } finally {

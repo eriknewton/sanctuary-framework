@@ -1975,7 +1975,8 @@ async function publishFortressAuditProducerPublicKey(
   await writeFileCustody(resolveProducerPubKeyPath(fortressPath), publicKey, {
     mode: 0o644,
     createParent: true,
-    ...(owner !== undefined ? { owner } : {}),
+    // The fortress is the containment base for this owner-write.
+    ...(owner !== undefined ? { owner, ownerBase: fortressPath } : {}),
   });
 }
 

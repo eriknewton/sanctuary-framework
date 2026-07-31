@@ -124,6 +124,7 @@ describe("create-with-fchown owner option (fortress-ownership spec 2026-07-30)",
     await writeFileCustody(target, "payload", {
       mode: 0o600,
       owner: selfOwner(),
+      ownerBase: dir,
     });
     // Owner + contents are read through ONE descriptor (no stat-then-open
     // check-then-use race on the path).
@@ -149,11 +150,48 @@ describe("create-with-fchown owner option (fortress-ownership spec 2026-07-30)",
       writeFileCustody(target, "payload", {
         mode: 0o600,
         // A non-root process cannot give a file away to root: fchown EPERM.
+        // ownerBase is supplied so the failure is the CHOWN, not the missing
+        // containment root (otherwise this test would pass for the wrong reason).
         owner: { uid: 0, gid: 0 },
+        ownerBase: dir,
       }),
-    ).rejects.toThrow();
+    ).rejects.toThrow(/EPERM|operation not permitted/i);
     // Never a silent degradation: no destination file with the wrong owner.
     await expect(lstat(target)).rejects.toThrow();
+  });
+
+  it("REFUSES an owner-write with no declared ownerBase (fail-closed containment root)", async () => {
+    await expect(
+      writeFileCustody(join(dir, "x.enc"), "payload", {
+        mode: 0o600,
+        owner: selfOwner(),
+      }),
+    ).rejects.toThrow(/requires `ownerBase`/);
+  });
+
+  it("REFUSES an owner-write through a PRE-EXISTING symlinked ancestor when mkdir creates nothing (gate round 3)", async () => {
+    // The round-3 BLOCKER: when every directory already exists, recursive
+    // mkdir returns undefined, so the created-chain check never runs. The
+    // temp-file open then followed the symlinked ancestor and the file was
+    // created, chowned, and renamed OUTSIDE the tree. The base-to-leaf
+    // no-follow verification must refuse regardless of what mkdir created.
+    const outside = await mkdtemp(join(tmpdir(), "custody-outside-"));
+    try {
+      await mkdir(join(outside, "egress", "rules"), { recursive: true });
+      await symlink(outside, join(dir, "policy"));
+      const target = join(dir, "policy", "egress", "rules", "file.enc");
+      await expect(
+        writeFileCustody(target, "payload", {
+          mode: 0o600,
+          owner: selfOwner(),
+          ownerBase: dir,
+        }),
+      ).rejects.toThrow(/refusing an owner-write through/);
+      // Nothing was planted outside.
+      await expect(lstat(join(outside, "egress", "rules", "file.enc"))).rejects.toThrow();
+    } finally {
+      await rm(outside, { recursive: true, force: true });
+    }
   });
 
   it("FilesystemStorage threads its owner into every write (fail-closed proves the call path)", async function (this: void) {
@@ -181,7 +219,7 @@ describe("create-with-fchown owner option (fortress-ownership spec 2026-07-30)",
       await symlink(outside, join(dir, "policy"));
       const target = join(dir, "policy", "egress", "rules", "file.enc");
       await expect(
-        writeFileCustody(target, "payload", { mode: 0o600, owner: selfOwner() }),
+        writeFileCustody(target, "payload", { mode: 0o600, owner: selfOwner(), ownerBase: dir }),
       ).rejects.toThrow(/refusing to chown through/);
     } finally {
       await rm(outside, { recursive: true, force: true });
@@ -190,7 +228,7 @@ describe("create-with-fchown owner option (fortress-ownership spec 2026-07-30)",
 
   it("still chowns a legitimately created chain (no symlink on the path)", async () => {
     const target = join(dir, "a", "b", "c", "file.enc");
-    await writeFileCustody(target, "payload", { mode: 0o600, owner: selfOwner() });
+    await writeFileCustody(target, "payload", { mode: 0o600, owner: selfOwner(), ownerBase: dir });
     for (const created of [join(dir, "a"), join(dir, "a", "b"), join(dir, "a", "b", "c")]) {
       expect((await lstat(created)).uid).toBe(selfOwner().uid);
     }

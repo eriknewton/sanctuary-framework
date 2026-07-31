@@ -106,6 +106,17 @@ export interface WriteFileCustodyOptions {
    * file with the wrong owner).
    */
   owner?: { uid: number; gid: number };
+  /**
+   * Containment base for `owner` writes (2026-07-31 gate round 3). Every path
+   * component from this directory down to the file is opened
+   * `O_NOFOLLOW | O_DIRECTORY` before the write, so a PRE-EXISTING symlinked
+   * ancestor cannot make a root process create, chown, and rename a file
+   * outside the intended tree -- the case the created-chain check alone
+   * missed, because when every directory already exists `mkdir` creates
+   * nothing and there is no chain to verify. Required whenever `owner` is
+   * set; the fortress path is the natural value.
+   */
+  ownerBase?: string;
 }
 
 const O_NOFOLLOW =
@@ -388,6 +399,66 @@ export async function chownCreatedDirChain(
   }
 }
 
+/**
+ * Assert that every path component from `base` down to `leafDir` is a real
+ * directory reachable WITHOUT following a symlink, by opening each one
+ * `O_NOFOLLOW | O_DIRECTORY`. Throws otherwise (fail-closed).
+ *
+ * `base` is required for owner-writes: without a declared containment root
+ * there is no correct place to stop, and starting at `/` is impossible on
+ * macOS (`/var` is itself a symlink). A caller that passes `owner` without
+ * `ownerBase` is refused rather than silently given weaker containment.
+ */
+async function assertNoFollowPathWithinBase(
+  leafDir: string,
+  base: string | undefined,
+): Promise<void> {
+  if (base === undefined || base.length === 0) {
+    throw new Error(
+      "writeFileCustody: `owner` requires `ownerBase` (the directory the write must stay inside); refusing an owner-write without a containment root",
+    );
+  }
+  const resolvedBase = resolvePath(base);
+  const leaf = resolvePath(leafDir);
+  const components: string[] = [];
+  let walk = leaf;
+  for (;;) {
+    components.push(walk);
+    if (walk === resolvedBase) break;
+    const parent = dirname(walk);
+    if (parent === walk) {
+      throw new Error(
+        `writeFileCustody: ${leaf} is not inside the declared ownerBase ${resolvedBase}; refusing the owner-write`,
+      );
+    }
+    walk = parent;
+  }
+  components.reverse();
+  const dirFlags =
+    fsConstants.O_RDONLY |
+    O_NOFOLLOW |
+    (typeof fsConstants.O_DIRECTORY === "number" ? fsConstants.O_DIRECTORY : 0);
+  const handles: Array<Awaited<ReturnType<typeof open>>> = [];
+  try {
+    for (const component of components) {
+      try {
+        handles.push(await open(component, dirFlags));
+      } catch (err) {
+        throw new Error(
+          `writeFileCustody: refusing an owner-write through ${component} (${
+            (err as NodeJS.ErrnoException).code ?? "open failed"
+          }); a symlinked path component would place the file outside ${resolvedBase}`,
+          { cause: err },
+        );
+      }
+    }
+  } finally {
+    for (const handle of handles.reverse()) {
+      await handle.close().catch(() => undefined);
+    }
+  }
+}
+
 export async function writeFileCustody(
   path: string,
   data: string | Uint8Array,
@@ -402,6 +473,16 @@ export async function writeFileCustody(
     if (options.owner !== undefined && firstCreated !== undefined) {
       await chownCreatedDirChain(firstCreated, dir, options.owner);
     }
+  }
+  if (options.owner !== undefined) {
+    // 2026-07-31 gate round 3: containment for owner-writes must NOT depend on
+    // `mkdir` having created something. When every directory already exists
+    // (including a symlinked ancestor an attacker planted), `firstCreated` is
+    // undefined, the chain check never runs, and the temp-file open below
+    // would follow the symlink -- letting a root writer create, chown, and
+    // rename a file OUTSIDE the tree. Verify the whole base-to-leaf path
+    // no-follow, every time.
+    await assertNoFollowPathWithinBase(dir, options.ownerBase);
   }
   await verifyParentCustody(path, options.parent);
   const tempPath = join(
