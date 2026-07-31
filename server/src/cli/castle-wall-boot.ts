@@ -1325,7 +1325,21 @@ async function runInstallBootInner(
           write(err, `Refusing to prepare the daemon log dir: ${logDir} is not a directory.\n`);
           return 1;
         }
-        await handle.chown(operatorUid, stats.gid);
+        // BEST-EFFORT, exactly as the pre-hardening `chown` was: a failure to
+        // hand the log dir to the operator degrades log READABILITY, it does
+        // not make the boot service unsafe, so it must not fail the install.
+        // (The security property -- never following a symlink -- is enforced
+        // above and is NOT best-effort.)
+        try {
+          await handle.chown(operatorUid, stats.gid);
+        } catch (chownError) {
+          write(
+            err,
+            `Warning: could not hand ${logDir} to operator uid ${operatorUid} (${
+              chownError instanceof Error ? chownError.message : String(chownError)
+            }); the root daemon's logs may not be operator-readable. Run: sudo sanctuary castle-wall repair-custody\n`,
+          );
+        }
       } finally {
         await handle.close().catch(() => undefined);
       }

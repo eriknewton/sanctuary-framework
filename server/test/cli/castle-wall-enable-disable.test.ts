@@ -29,6 +29,9 @@ import {
 
 const TEST_BUILD_SHA = "test-build-sha";
 
+const TEST_OPERATOR_UID = String(process.getuid?.() ?? 501);
+const TEST_OPERATOR_GID = String(process.getgid?.() ?? 20);
+
 class CaptureStream extends Writable {
   chunks: string[] = [];
   override _write(chunk: unknown, _encoding: BufferEncoding, callback: (error?: Error | null) => void): void {
@@ -2011,7 +2014,7 @@ describe("fortress-ownership guards on arm/disarm (spec 2026-07-30)", () => {
     const code = await runEnable(["--fortress", fortressPath, "--no-ttl"], {
       out: new CaptureStream(),
       err: new CaptureStream(),
-      env: { ...env, SUDO_UID: "501", SUDO_GID: "20", SUDO_USER: "operator" },
+      env: { ...env, SUDO_UID: TEST_OPERATOR_UID, SUDO_GID: TEST_OPERATOR_GID, SUDO_USER: "operator" },
       platform: "darwin",
       getuid: () => 0,
       hostAppCandidates: [hostAppPath],
@@ -2030,7 +2033,7 @@ describe("fortress-ownership guards on arm/disarm (spec 2026-07-30)", () => {
 
     expect(code).toBe(0);
     expect(normalizeCalls).toEqual([
-      { fortressPath, operator: { uid: 501, gid: 20 } },
+      { fortressPath, operator: { uid: Number(TEST_OPERATOR_UID), gid: Number(TEST_OPERATOR_GID) } },
     ]);
   });
 
@@ -2045,7 +2048,7 @@ describe("fortress-ownership guards on arm/disarm (spec 2026-07-30)", () => {
       await runDisable([], {
         out: new CaptureStream(),
         err: new CaptureStream(),
-        env: { ...env, SUDO_UID: "501", SUDO_GID: "20", SUDO_USER: "operator" },
+        env: { ...env, SUDO_UID: TEST_OPERATOR_UID, SUDO_GID: TEST_OPERATOR_GID, SUDO_USER: "operator" },
         platform: "darwin",
         getuid: () => 0,
         hostAppCandidates: [hostAppPath],
@@ -2079,7 +2082,7 @@ describe("fortress-ownership guards on arm/disarm (spec 2026-07-30)", () => {
 
   it("normalizes on REFUSAL exits too, not just success (gate HIGH: the descriptor/lease writes precede them)", async () => {
     const { fortressPath, hostAppPath, env } = await makeFixture();
-    const sudoEnv = { ...env, SUDO_UID: "501", SUDO_GID: "20", SUDO_USER: "operator" };
+    const sudoEnv = { ...env, SUDO_UID: TEST_OPERATOR_UID, SUDO_GID: TEST_OPERATOR_GID, SUDO_USER: "operator" };
 
     // (a) `--agent-uid` writes the agent-origin descriptor as root, THEN the
     // no-egress guard refuses. The chokepoint must still run.
@@ -2162,7 +2165,7 @@ describe("fortress-ownership guards on arm/disarm (spec 2026-07-30)", () => {
       err,
       // SUDO_GID missing: the fail-closed identity chokepoint refuses, even
       // though enough SUDO context exists for host-app trust resolution.
-      env: { ...env, SUDO_UID: "501" },
+      env: { ...env, SUDO_UID: TEST_OPERATOR_UID },
       platform: "darwin",
       getuid: () => 0,
       hostAppCandidates: [hostAppPath],

@@ -28,6 +28,9 @@ import {
 import { AuditLog } from "../../src/operational/audit-log.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
 
+const TEST_OPERATOR_UID = String(process.getuid?.() ?? 501);
+const TEST_OPERATOR_GID = String(process.getgid?.() ?? 20);
+
 class CaptureStream extends Writable {
   chunks: string[] = [];
   override _write(
@@ -859,7 +862,7 @@ describe("castle-wall boot service (F1 Option C)", () => {
       const normalizeCalls: { fortressPath: string; operator: { uid: number; gid: number } }[] = [];
       const ctx = {
         ...f.ctx,
-        env: { SUDO_USER: "operator", SUDO_UID: "501", SUDO_GID: "20" },
+        env: { SUDO_USER: "operator", SUDO_UID: TEST_OPERATOR_UID, SUDO_GID: TEST_OPERATOR_GID },
         normalizeFortressCustody: async (input: { fortressPath: string; operator: { uid: number; gid: number } }) => {
           normalizeCalls.push({ fortressPath: input.fortressPath, operator: input.operator });
           return {
@@ -873,7 +876,7 @@ describe("castle-wall boot service (F1 Option C)", () => {
       };
       expect(await runInstallBoot(f.argv, ctx)).toBe(0);
       expect(normalizeCalls).toEqual([
-        { fortressPath: f.fortress, operator: { uid: 501, gid: 20 } },
+        { fortressPath: f.fortress, operator: { uid: Number(TEST_OPERATOR_UID), gid: Number(TEST_OPERATOR_GID) } },
       ]);
 
       // The idempotent already-installed shortcut ALSO normalizes: the log-dir
@@ -917,7 +920,7 @@ describe("castle-wall boot service (F1 Option C)", () => {
       };
       const code = await runInstallBoot(f.argv, {
         ...f.ctx,
-        env: { SUDO_USER: "operator", SUDO_UID: "501", SUDO_GID: "20" },
+        env: { SUDO_USER: "operator", SUDO_UID: TEST_OPERATOR_UID, SUDO_GID: TEST_OPERATOR_GID },
         execFileFn: flappingExec,
         normalizeFortressCustody: async (input: { fortressPath: string }) => {
           normalizeCalls.push(input.fortressPath);
