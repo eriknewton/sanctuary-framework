@@ -1,9 +1,9 @@
 import { execFile } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { lstatSync, statSync } from "node:fs";
-import { mkdir, readdir, stat, unlink } from "node:fs/promises";
+import { constants as fsConstants, lstatSync, statSync } from "node:fs";
+import { mkdir, open, readdir, stat, unlink } from "node:fs/promises";
 import { createConnection } from "node:net";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve as resolvePath } from "node:path";
 import { promisify } from "node:util";
 
 import { bytesToString, toBase64url } from "../../core/encoding.js";
@@ -55,7 +55,6 @@ import {
   resolveProducerPubKeyPath,
 } from "./producer-signature.js";
 import {
-  chownCreatedDirChain,
   isCustodyFsError,
   readFileCustody,
   readFileCustodyWithStats,
@@ -567,6 +566,45 @@ export function resolveFortressCreateOwner(input: {
   return owner;
 }
 
+async function openExistingDirectoryNoFollow(path: string): Promise<Awaited<ReturnType<typeof open>>> {
+  return open(
+    path,
+    fsConstants.O_RDONLY |
+      (typeof fsConstants.O_NOFOLLOW === "number" ? fsConstants.O_NOFOLLOW : 0) |
+      (typeof fsConstants.O_DIRECTORY === "number" ? fsConstants.O_DIRECTORY : 0),
+    0o600,
+  );
+}
+
+export async function assertExistingDirectoryTreeNoFollow(base: string, leaf: string): Promise<void> {
+  const resolvedBase = resolvePath(base);
+  const resolvedLeaf = resolvePath(leaf);
+  const components: string[] = [];
+  let walk = resolvedLeaf;
+  for (;;) {
+    components.push(walk);
+    if (walk === resolvedBase) break;
+    const parent = dirname(walk);
+    if (parent === walk) {
+      throw new Error(
+        `rules directory ${resolvedLeaf} is not inside fortress ${resolvedBase}`,
+      );
+    }
+    walk = parent;
+  }
+  components.reverse();
+  const handles: Array<Awaited<ReturnType<typeof open>>> = [];
+  try {
+    for (const component of components) {
+      handles.push(await openExistingDirectoryNoFollow(component));
+    }
+  } finally {
+    for (const handle of handles.reverse()) {
+      await handle.close().catch(() => undefined);
+    }
+  }
+}
+
 export async function startMacOSCastleWallDaemon(
   input: MacOSCastleWallDaemonInput,
 ): Promise<MacOSCastleWallDaemonHandle> {
@@ -612,18 +650,24 @@ export async function startMacOSCastleWallDaemon(
   await assertActiveConfigNotOwnedByLiveProcess(activeConfigPath, legacyActiveConfigPath);
   await assertSocketNotOwnedByLiveProcess(socketPath);
   // Create-with-fchown (fortress-ownership spec 2026-07-30): fortress-internal
-  // dirs/files a ROOT daemon creates are handed to the fortress owner at
-  // creation so operator readability never erodes boot over boot.
+  // files a ROOT daemon creates are handed to the fortress owner at creation
+  // so operator readability never erodes boot over boot. Directories are not
+  // recursively created here as root; the rules directory must already exist.
   const fortressCreateOwner = resolveFortressCreateOwner({
     fortressPath: input.fortressPath,
   });
   const rulesDir = join(input.fortressPath, "policy", "egress", "rules");
-  const firstCreatedRulesDir = await mkdir(rulesDir, {
-    recursive: true,
-    mode: 0o700,
-  });
-  if (fortressCreateOwner !== undefined && firstCreatedRulesDir !== undefined) {
-    await chownCreatedDirChain(firstCreatedRulesDir, rulesDir, fortressCreateOwner);
+  if (process.getuid?.() === 0) {
+    // No mkdirat/openat in Node: a root recursive mkdir under the operator
+    // fortress can be redirected by a symlink swap. Root daemon startup
+    // therefore requires the rules directory to already exist as real
+    // directories; protect/repair-custody owns creating and normalizing it.
+    await assertExistingDirectoryTreeNoFollow(input.fortressPath, rulesDir);
+  } else {
+    await mkdir(rulesDir, {
+      recursive: true,
+      mode: 0o700,
+    });
   }
 
   const signer = input.signer ?? (await loadSigningKey(input));

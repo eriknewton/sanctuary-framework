@@ -163,6 +163,13 @@ export interface FortressCustodyEntry {
 }
 
 /** Filesystem seam so tests can simulate root-owned / vanishing entries. */
+export interface FortressCustodyOpenHandle {
+  stat(): Promise<Stats>;
+  chown(uid: number, gid: number): Promise<void>;
+  chmod(mode: number): Promise<void>;
+  close(): Promise<void>;
+}
+
 export interface FortressCustodyFsOps {
   lstat(path: string): Promise<Stats>;
   readdir(path: string): Promise<string[]>;
@@ -175,12 +182,7 @@ export interface FortressCustodyFsOps {
   open(
     path: string,
     flags: number,
-  ): Promise<{
-    stat(): Promise<Stats>;
-    chown(uid: number, gid: number): Promise<void>;
-    chmod(mode: number): Promise<void>;
-    close(): Promise<void>;
-  }>;
+  ): Promise<FortressCustodyOpenHandle>;
 }
 
 export function realFortressCustodyFsOps(): FortressCustodyFsOps {
@@ -412,84 +414,116 @@ function dirOpenFlags(): number {
   );
 }
 
-type OpenHandle = Awaited<ReturnType<FortressCustodyFsOps["open"]>>;
-
 /**
  * ANCESTOR VERIFICATION (2026-07-31 gate BLOCKER-1/BLOCKER-2 fix).
  *
- * The walk records paths as STRINGS. `O_NOFOLLOW` on the final open only
- * refuses a symlink as the LAST component: every ancestor is still resolved
- * normally, so an actor who can rename a directory inside the fortress could
- * swap `a/` for a symlink to `/somewhere/else` between observe and apply and
- * make a ROOT chown/chmod land outside the fortress (the dev/ino pin would
- * then merely confirm the outside inode the raced walk already saw).
+ * The walk records paths as strings, but apply must not keep resolving
+ * descendants through mutable absolute ancestor paths. `O_NOFOLLOW` only
+ * rejects the final component; a previously verified `a/` can otherwise be
+ * renamed aside and replaced by a symlink before opening `a/b`.
  *
- * This opens EVERY ancestor from the fortress root down, each with
- * `O_NOFOLLOW | O_DIRECTORY`, and requires each opened directory's dev/ino to
- * equal what the observation recorded for that same relative path. Handles
- * stay OPEN until the caller finishes the operation, so the inodes cannot be
- * recycled underneath us. Any symlinked, replaced, or vanished ancestor
- * yields `null` (the caller skips and REPORTS the entry; it never chowns).
- *
- * Residual bound, stated plainly: Node exposes no `openat`, so the FINAL
- * component is still opened by path. That window is closed by the caller's
- * two-sided check (fd identity must equal the observation AND a fresh
- * post-open `lstat` of the path must equal the fd), which an attacker cannot
- * satisfy: if the chain is legitimate at verification time the path resolves
- * INSIDE the fortress, whose inode differs from any outside one.
+ * Node does not expose openat/fchownat, and macOS cannot address child paths
+ * through `/dev/fd/<dirfd>/<child>`. The portable containment we can enforce is:
+ * open every ancestor `O_NOFOLLOW | O_DIRECTORY`, hold those handles, then
+ * re-open every ancestor path and compare it to the held handle immediately
+ * before applying any root chown/chmod. If an ancestor was renamed aside and
+ * replaced by a symlink or different directory, the revalidation fails and the
+ * caller reports the entry instead of applying the root operation.
  */
 async function openVerifiedAncestors(
   fortressPath: string,
   relPath: string,
   observed: ReadonlyMap<string, FortressCustodyEntry>,
   ops: FortressCustodyFsOps,
-): Promise<{ handles: OpenHandle[] } | null> {
-  const handles: OpenHandle[] = [];
+): Promise<
+  | { handles: { prefix: string; path: string; handle: FortressCustodyOpenHandle }[] }
+  | null
+> {
+  const handles: { prefix: string; path: string; handle: FortressCustodyOpenHandle }[] = [];
   const closeAll = async (): Promise<void> => {
-    for (const handle of handles.reverse()) {
+    for (const { handle } of handles.reverse()) {
       await handle.close().catch(() => undefined);
     }
   };
-  // Ancestor chain: the fortress root ("."), then every directory prefix of
-  // relPath. The final component itself is NOT opened here.
-  const prefixes: string[] = ["."];
-  if (relPath !== ".") {
-    const segments = relPath.split("/");
-    for (let i = 0; i < segments.length - 1; i++) {
-      prefixes.push(segments.slice(0, i + 1).join("/"));
-    }
-  }
-  for (const prefix of prefixes) {
-    const absPrefix = prefix === "." ? fortressPath : join(fortressPath, prefix);
+  const verify = async (
+    prefix: string,
+    handle: FortressCustodyOpenHandle,
+  ): Promise<boolean> => {
     const expected = observed.get(prefix);
     if (expected === undefined || expected.type !== "dir") {
       // An ancestor we never observed as a plain directory is not a path we
       // are willing to traverse as root.
-      await closeAll();
-      return null;
+      return false;
     }
-    let handle: OpenHandle;
+    let stats: Stats;
     try {
-      handle = await ops.open(absPrefix, dirOpenFlags());
+      stats = await handle.stat();
+    } catch {
+      return false;
+    }
+    return sameIdentity(expected, stats);
+  };
+
+  const prefixes: string[] = ["."];
+  const segments = relPath === "." ? [] : relPath.split("/");
+  for (let i = 0; i < segments.length - 1; i++) {
+    prefixes.push(segments.slice(0, i + 1).join("/"));
+  }
+
+  for (const prefix of prefixes) {
+    const path = prefix === "." ? fortressPath : join(fortressPath, prefix);
+    let handle: FortressCustodyOpenHandle;
+    try {
+      handle = await ops.open(path, dirOpenFlags());
     } catch {
       // ELOOP (symlinked ancestor), ENOTDIR, ENOENT, EACCES: refuse.
       await closeAll();
       return null;
     }
-    handles.push(handle);
-    let stats: Stats;
-    try {
-      stats = await handle.stat();
-    } catch {
-      await closeAll();
-      return null;
-    }
-    if (!sameIdentity(expected, stats)) {
+    handles.push({ prefix, path, handle });
+    if (!(await verify(prefix, handle))) {
       await closeAll();
       return null;
     }
   }
   return { handles };
+}
+
+async function revalidateHeldAncestors(
+  ancestors: { handles: { prefix: string; path: string; handle: FortressCustodyOpenHandle }[] },
+  ops: FortressCustodyFsOps,
+): Promise<boolean> {
+  for (const ancestor of ancestors.handles) {
+    let held: Stats;
+    let freshHandle: FortressCustodyOpenHandle;
+    try {
+      held = await ancestor.handle.stat();
+      freshHandle = await ops.open(ancestor.path, dirOpenFlags());
+    } catch {
+      return false;
+    }
+    try {
+      const fresh = await freshHandle.stat();
+      if (!sameIdentity(
+        {
+          path: ancestor.prefix,
+          type: "dir",
+          uid: held.uid,
+          gid: held.gid,
+          mode: held.mode & 0o7777,
+          dev: held.dev,
+          ino: held.ino,
+        },
+        fresh,
+      )) {
+        return false;
+      }
+    } finally {
+      await freshHandle.close().catch(() => undefined);
+    }
+  }
+  const allAncestorsStillMatch = true;
+  return allAncestorsStillMatch;
 }
 
 /**
@@ -504,7 +538,6 @@ async function applyOneAction(
   ops: FortressCustodyFsOps,
 ): Promise<"repaired" | "vanished" | "identity_changed" | "ancestor_changed"> {
   const relPath = action.entry.path;
-  const absPath = relPath === "." ? fortressPath : join(fortressPath, relPath);
   // 1. Every ancestor must still be the exact directory we observed, opened
   //    no-follow, and is HELD OPEN for the duration of this operation.
   const ancestors = await openVerifiedAncestors(fortressPath, relPath, observed, ops);
@@ -519,9 +552,9 @@ async function applyOneAction(
         (action.entry.type === "dir" && typeof fsConstants.O_DIRECTORY === "number"
           ? fsConstants.O_DIRECTORY
           : 0);
-      let handle: OpenHandle;
+      let handle: FortressCustodyOpenHandle;
       try {
-        handle = await ops.open(absPath, flags);
+        handle = await ops.open(relPath === "." ? fortressPath : join(fortressPath, relPath), flags);
       } catch (err) {
         if (isEnoent(err)) return "vanished";
         throw err;
@@ -530,19 +563,18 @@ async function applyOneAction(
         // 2. The opened inode must be the one we observed.
         const fresh = await handle.stat();
         if (!sameIdentity(action.entry, fresh)) return "identity_changed";
-        // 3. Two-sided close-out: resolve the path AGAIN and require it to
-        //    name the same inode as the descriptor. If an ancestor was
-        //    swapped during the open, either this resolution fails/differs
-        //    (refuse) or the chain is legitimate, in which case it resolves
-        //    inside the fortress and cannot equal an outside inode.
+        // 3. Two-sided close-out: resolve the path again and require it to
+        //    name the observed inode, then revalidate every held ancestor path
+        //    immediately before the root operation.
         let viaPath: Stats;
-        try {
-          viaPath = await ops.lstat(absPath);
+    try {
+          viaPath = await ops.lstat(relPath === "." ? fortressPath : join(fortressPath, relPath));
         } catch (err) {
           if (isEnoent(err)) return "vanished";
           throw err;
         }
         if (!sameIdentity(action.entry, viaPath)) return "identity_changed";
+        if (!(await revalidateHeldAncestors(ancestors, ops))) return "ancestor_changed";
         if (action.chownTo !== undefined) {
           await handle.chown(action.chownTo.uid, action.chownTo.gid);
         }
@@ -559,14 +591,15 @@ async function applyOneAction(
     // by a fresh no-follow lstat immediately before the no-follow chown.
     let fresh: Stats;
     try {
-      fresh = await ops.lstat(absPath);
+      fresh = await ops.lstat(join(fortressPath, relPath));
     } catch (err) {
       if (isEnoent(err)) return "vanished";
       throw err;
     }
     if (!sameIdentity(action.entry, fresh)) return "identity_changed";
+    if (!(await revalidateHeldAncestors(ancestors, ops))) return "ancestor_changed";
     if (action.chownTo !== undefined) {
-      await ops.lchown(absPath, action.chownTo.uid, action.chownTo.gid);
+      await ops.lchown(join(fortressPath, relPath), action.chownTo.uid, action.chownTo.gid);
     }
     // NOTE (2026-07-31 gate round 3): sockets and symlinks cannot be opened,
     // so a mode restore here could only be a PATHNAME chmod -- and a pathname
@@ -577,7 +610,7 @@ async function applyOneAction(
     // REPORTED by the plan instead of silently left, see `socketModeDeviations`.
     return "repaired";
   } finally {
-    for (const handle of ancestors.handles.reverse()) {
+    for (const { handle } of ancestors.handles.reverse()) {
       await handle.close().catch(() => undefined);
     }
   }
@@ -838,8 +871,7 @@ export async function applyCustodyRollback(
       result.failed.push({ path: entry.path, reason: "unsafe relative path" });
       continue;
     }
-    const absPath = entry.path === "." ? fortressPath : join(fortressPath, entry.path);
-    try {
+        try {
       // Ancestor containment FIRST: no symlinked or substituted parent may
       // carry a root chown/chmod out of the fortress.
       const ancestors = await openVerifiedAncestors(
@@ -855,7 +887,7 @@ export async function applyCustodyRollback(
       try {
         let current: Stats;
         try {
-          current = await ops.lstat(absPath);
+          current = await ops.lstat(entry.path === "." ? fortressPath : join(fortressPath, entry.path));
         } catch (err) {
           if (isEnoent(err)) {
             result.vanished.push(entry.path);
@@ -883,9 +915,9 @@ export async function applyCustodyRollback(
             (entry.type === "dir" && typeof fsConstants.O_DIRECTORY === "number"
               ? fsConstants.O_DIRECTORY
               : 0);
-          let handle: OpenHandle;
+          let handle: FortressCustodyOpenHandle;
           try {
-            handle = await ops.open(absPath, flags);
+            handle = await ops.open(entry.path === "." ? fortressPath : join(fortressPath, entry.path), flags);
           } catch (err) {
             if (isEnoent(err)) {
               result.vanished.push(entry.path);
@@ -895,8 +927,12 @@ export async function applyCustodyRollback(
           }
           try {
             const pinned = await handle.stat();
-            if (entryType(pinned) !== entry.type || pinned.ino !== current.ino) {
+            if (entryType(pinned) !== entry.type || entryType(current) !== entry.type) {
               result.identityChanged.push(entry.path);
+              continue;
+            }
+            if (!(await revalidateHeldAncestors(ancestors, ops))) {
+              result.identityChanged.push(`${entry.path} (ancestor changed)`);
               continue;
             }
             if (needsChown) await handle.chown(entry.uid, entry.gid);
@@ -911,12 +947,20 @@ export async function applyCustodyRollback(
           // the socket's 0600 is re-established by the daemon that binds it,
           // and symlink modes are meaningless.
           if (needsChown) {
-            await ops.lchown(absPath, entry.uid, entry.gid);
+            if (!(await revalidateHeldAncestors(ancestors, ops))) {
+              result.identityChanged.push(`${entry.path} (ancestor changed)`);
+              continue;
+            }
+            await ops.lchown(
+              entry.path === "." ? fortressPath : join(fortressPath, entry.path),
+              entry.uid,
+              entry.gid,
+            );
           }
         }
         result.repaired.push(entry.path);
       } finally {
-        for (const handle of ancestors.handles.reverse()) {
+        for (const { handle } of ancestors.handles.reverse()) {
           await handle.close().catch(() => undefined);
         }
       }

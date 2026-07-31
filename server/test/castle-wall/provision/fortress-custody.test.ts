@@ -122,6 +122,7 @@ function makeFakeFs(
           throw err;
         }
         return {
+          path,
           stat: async () => fakeStats(node),
           chown: async (uid: number, gid: number) => {
             fake.fchowns.push({ path, uid, gid });
@@ -511,6 +512,31 @@ describe("fortress-custody: rollback", () => {
     expect(rollback.repaired).toEqual([]);
     expect(fake.lchowns).toEqual([]);
     expect(fake.chmods).toEqual([]);
+  });
+
+  it("replays metadata onto a same-type occupant whose inode changed by tmp rename", async () => {
+    const fake = mini2Fixture();
+    const walk = await walkFortressCustody("/f", fake.ops);
+    const manifest: CustodyRepairManifest = {
+      version: 1,
+      kind: CUSTODY_REPAIR_MANIFEST_KIND,
+      generated_at: "2026-07-30T22:15:00.000Z",
+      fortress_path: "/f",
+      operator: OPERATOR,
+      entries: walk.entries,
+      vanished: [],
+    };
+    const node = fake.nodes.get("/f/castle-pinned-pubkey.bin")!;
+    node.uid = 501;
+    node.mode = 0o600;
+    node.ino = 31337;
+
+    const rollback = await applyCustodyRollback("/f", manifest, fake.ops);
+
+    expect(rollback.identityChanged).toEqual([]);
+    expect(rollback.repaired).toContain("castle-pinned-pubkey.bin");
+    expect(node.uid).toBe(0);
+    expect(node.mode).toBe(0o644);
   });
 
   it("notes vanished entries and reports type changes instead of touching them", async () => {

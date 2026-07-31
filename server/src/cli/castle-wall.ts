@@ -3258,6 +3258,7 @@ function parseUidFlag(value: string): number | null {
 async function writeAgentOriginDescriptor(
   fortressPath: string,
   candidate: Record<string, unknown>,
+  owner?: { uid: number; gid: number },
 ): Promise<
   | { ok: true; validated: ReturnType<typeof validateAgentOrigin> & object; path: string }
   | { ok: false; error: string }
@@ -3273,12 +3274,10 @@ async function writeAgentOriginDescriptor(
 
   const originPath = agentOriginDescriptorPath(fortressPath);
   try {
-    await mkdir(join(fortressPath, "policy", "egress"), {
-      recursive: true,
-      mode: 0o700,
-    });
-    await writeFile(originPath, JSON.stringify(validated, null, 2) + "\n", {
+    await writeFileCustody(originPath, JSON.stringify(validated, null, 2) + "\n", {
       mode: 0o600,
+      parentMode: 0o700,
+      ...(owner !== undefined ? { owner, ownerBase: fortressPath } : {}),
     });
     return { ok: true, validated, path: originPath };
   } catch (error) {
@@ -4030,6 +4029,13 @@ async function runArmDisarm(
   const wrapperEnv = ctx.env ?? process.env;
   const wrapperErr = ctx.err ?? process.stderr;
   const wrapperGetuid = ctx.getuid ?? process.getuid?.bind(process);
+  if (wrapperGetuid?.() === 0 && resolveSudoIdentityDecision(wrapperEnv) === undefined) {
+    write(
+      wrapperErr,
+      `Cannot resolve the non-root operator identity (SUDO_UID/SUDO_GID). Refusing to run castle-wall ${action} as root because fortress custody could not be normalized afterward. Re-run from a normal sudo invocation, not a raw root shell.\n`,
+    );
+    return 1;
+  }
   try {
     return await runArmDisarmInner(action, argv, ctx);
   } finally {
@@ -4068,6 +4074,7 @@ async function runArmDisarmInner(
   const err = ctx.err ?? process.stderr;
   const env = ctx.env ?? process.env;
   const platform = ctx.platform ?? process.platform;
+  const getuid = ctx.getuid ?? process.getuid?.bind(process);
 
   if (platform !== "darwin") {
     write(err, `castle-wall ${action} is macOS-only.\n`);
@@ -4237,7 +4244,14 @@ async function runArmDisarmInner(
       agent_uid: agentUid,
       system_uid_allow_ceiling: ceiling,
     };
-    const result = await writeAgentOriginDescriptor(fortressPath, candidate);
+    const sudoIdentity = resolveSudoIdentityDecision(env);
+    const result = await writeAgentOriginDescriptor(
+      fortressPath,
+      candidate,
+      getuid?.() === 0 && sudoIdentity !== undefined
+        ? { uid: sudoIdentity.uid, gid: sudoIdentity.gid }
+        : undefined,
+    );
     if (!result.ok) {
       write(
         err,

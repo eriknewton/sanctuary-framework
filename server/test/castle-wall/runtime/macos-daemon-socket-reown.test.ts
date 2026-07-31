@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdtemp, rm, stat } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, stat, symlink } from "node:fs/promises";
 import { createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -11,6 +11,7 @@ import { generateRandomKey } from "../../../src/core/random.js";
 import { toBase64url } from "../../../src/core/encoding.js";
 import { runProvisionPin } from "../../../src/cli/castle-wall.js";
 import {
+  assertExistingDirectoryTreeNoFollow,
   resolveFortressCreateOwner,
   resolveSocketReownUid,
   startMacOSCastleWallDaemon,
@@ -138,6 +139,31 @@ describe("resolveSocketReownUid (Slice M Layer-2 socket ownership)", () => {
       statFortressUid: () => 501,
     });
     expect(resolved === 501).toBe(true);
+  });
+});
+
+describe("assertExistingDirectoryTreeNoFollow", () => {
+  const tempDirs: string[] = [];
+
+  afterEach(async () => {
+    while (tempDirs.length > 0) {
+      await rm(tempDirs.pop()!, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a symlinked rules-dir ancestor, not only a symlinked final component", async () => {
+    const fortress = await mkdtemp(join(tmpdir(), "cw-rules-fortress-"));
+    const outside = await mkdtemp(join(tmpdir(), "cw-rules-outside-"));
+    tempDirs.push(fortress, outside);
+    await mkdir(join(outside, "egress", "rules"), { recursive: true });
+    await symlink(outside, join(fortress, "policy"));
+
+    await expect(
+      assertExistingDirectoryTreeNoFollow(
+        fortress,
+        join(fortress, "policy", "egress", "rules"),
+      ),
+    ).rejects.toThrow();
   });
 });
 

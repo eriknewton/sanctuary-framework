@@ -321,6 +321,28 @@ describe("castle-wall repair-custody", () => {
     }
   });
 
+  it("rollback exits failed when an entry changed identity instead of reporting a clean no-op", async () => {
+    const manifestDir = await mkdtemp(join(tmpdir(), "repair-manifests-"));
+    try {
+      const fake = rootOwnedFortress();
+      expect(await runRepairCustody([], baseCtx(fake, manifestDir))).toBe(
+        REPAIR_CUSTODY_EXIT_CHANGED,
+      );
+      const files = await readdir(manifestDir);
+      const manifestPath = join(manifestDir, files[0]!);
+      fake.nodes.get("/Users/mini2/.sanctuary/state")!.type = "symlink";
+
+      const ctx = baseCtx(fake, manifestDir);
+      const code = await runRepairCustody(["--rollback", manifestPath], ctx);
+
+      expect(code).toBe(REPAIR_CUSTODY_EXIT_FAILED);
+      expect(ctx.out.text()).toContain("state changed identity");
+      expect(ctx.err.text()).toContain("Rollback incomplete");
+    } finally {
+      await rm(manifestDir, { recursive: true, force: true });
+    }
+  });
+
   it("refuses a rollback manifest recorded for a different fortress", async () => {
     const dir = await mkdtemp(join(tmpdir(), "repair-manifests-"));
     try {

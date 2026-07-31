@@ -353,10 +353,12 @@ export async function runRepairCustody(
     }
     const result = await applyCustodyRollback(fortressPath, manifest, ops);
     describeApply(result, out);
-    if (result.failed.length > 0) {
+    if (result.failed.length > 0 || result.identityChanged.length > 0) {
       write(
         err,
-        `Rollback incomplete: ${result.failed.length} entries could not be restored (see above).\n`,
+        `Rollback incomplete: ${
+          result.failed.length + result.identityChanged.length
+        } entries could not be restored (see above).\n`,
       );
       return REPAIR_CUSTODY_EXIT_FAILED;
     }
@@ -545,7 +547,7 @@ export async function runRepairCustody(
   }
   write(
     out,
-    `Repaired ${applied.repaired.length} entries under ${fortressPath}: root-owned entries handed to operator uid ${identity.uid}:${identity.gid}; fortress dir 0700 and castle.sock 0600 restored where deviant.\n`,
+    `Repaired ${applied.repaired.length} entries under ${fortressPath}: root-owned entries handed to operator uid ${identity.uid}:${identity.gid}; fortress dir 0700 restored where deviant. Deviant castle.sock modes are reported and repaired when the daemon rebinds the socket.\n`,
   );
   write(
     out,

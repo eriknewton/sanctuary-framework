@@ -87,11 +87,11 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
   private basePath: string;
   /**
    * Create-with-fchown owner (fortress-ownership spec 2026-07-30): when set,
-   * every file and namespace directory this backend CREATES is chowned to
-   * this owner before it becomes visible. Root daemons writing inside an
-   * operator-owned fortress (the safe-mode boot daemon's audit segments) pass
-   * the fortress owner so fortress-internal files never accrete root
-   * ownership boot over boot. Fail-closed: a chown failure fails the write.
+   * every file this backend creates is chowned to this owner before it
+   * becomes visible. The namespace directory must already exist inside the
+   * storage root; root recursive mkdir through a mutable path is refused
+   * because Node exposes no mkdirat/openat primitive. Fail-closed: a missing
+   * parent or chown failure fails the write.
    */
   private owner: { uid: number; gid: number } | undefined;
 
@@ -150,8 +150,9 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     data: Uint8Array,
     syncFile: boolean
   ): Promise<void> {
-    // Parent (namespace dir) creation rides writeFileCustody's createParent so
-    // the create-with-fchown owner covers created dirs and the file uniformly.
+    // For owner writes, writeFileCustody verifies the namespace dir exists
+    // inside basePath before opening the temp file. It will not recursively
+    // create parent dirs as root.
     await writeFileCustody(filePath, data, {
       mode: 0o600,
       parentMode: 0o700,

@@ -589,15 +589,22 @@ describe("castle-wall boot service (F1 Option C)", () => {
       const tokenPath = join(await makeTemp("f1-tok-"), "boot-token.bin");
       const out = new CaptureStream();
       const fake = makeFakeExec({ fortress });
+      const normalizeCalls: string[] = [];
       const code = await runProvisionBootToken(["--fortress", fortress], {
         out,
+        env: { SUDO_USER: "operator", SUDO_UID: TEST_OPERATOR_UID, SUDO_GID: TEST_OPERATOR_GID },
         platform: "darwin",
         getuid: () => 0,
         execFileFn: fake.execFileFn,
         bootTokenPath: tokenPath,
+        normalizeFortressCustody: async (input: { fortressPath: string }) => {
+          normalizeCalls.push(input.fortressPath);
+          return { status: "clean", repaired: [], skips: [], vanished: [], failed: [] };
+        },
       });
       expect(code).toBe(0);
       expect(out.text()).toContain("Boot token provisioned");
+      expect(normalizeCalls).toEqual([fortress]);
 
       const info = await stat(tokenPath);
       expect(info.mode & 0o777).toBe(0o600);
@@ -625,6 +632,31 @@ describe("castle-wall boot service (F1 Option C)", () => {
       }
     });
 
+    it("refuses an audited root provision when the operator identity is unresolved", async () => {
+      const fortress = await makeTemp("f1-prov-unresolved-");
+      const tokenPath = join(await makeTemp("f1-tok-unresolved-"), "boot-token.bin");
+      const err = new CaptureStream();
+      const normalizeCalls: string[] = [];
+
+      const code = await runProvisionBootToken(["--fortress", fortress], {
+        err,
+        env: {},
+        platform: "darwin",
+        getuid: () => 0,
+        execFileFn: makeFakeExec({ fortress }).execFileFn,
+        bootTokenPath: tokenPath,
+        normalizeFortressCustody: async (input: { fortressPath: string }) => {
+          normalizeCalls.push(input.fortressPath);
+          return { status: "clean", repaired: [], skips: [], vanished: [], failed: [] };
+        },
+      });
+
+      expect(code).toBe(1);
+      expect(err.text()).toContain("Cannot resolve the non-root operator identity");
+      await expect(readFile(tokenPath)).rejects.toThrow();
+      expect(normalizeCalls).toEqual([]);
+    });
+
     it("is idempotent: a second run keeps the existing token unless --rotate", async () => {
       const fortress = await makeTemp("f1-prov2-");
       const tokenPath = join(await makeTemp("f1-tok2-"), "boot-token.bin");
@@ -634,7 +666,7 @@ describe("castle-wall boot service (F1 Option C)", () => {
         getuid: () => 0,
         execFileFn: makeFakeExec().execFileFn,
         bootTokenPath: tokenPath,
-        env: {},
+        env: { SUDO_USER: "operator", SUDO_UID: TEST_OPERATOR_UID, SUDO_GID: TEST_OPERATOR_GID },
       };
       expect(await runProvisionBootToken(["--fortress", fortress], ctx)).toBe(0);
       const first = await readFile(tokenPath);
@@ -679,7 +711,7 @@ describe("castle-wall boot service (F1 Option C)", () => {
       const ctx: CastleWallBootContext = {
         out,
         err,
-        env: { SUDO_USER: "operator" },
+        env: { SUDO_USER: "operator", SUDO_UID: TEST_OPERATOR_UID, SUDO_GID: TEST_OPERATOR_GID },
         platform: "darwin",
         getuid: () => 0,
         execFileFn: fake.execFileFn,
@@ -886,22 +918,17 @@ describe("castle-wall boot service (F1 Option C)", () => {
       expect(normalizeCalls).toHaveLength(2);
     });
 
-    it("REFUSES a symlinked daemon log dir instead of chowning through it (re-gate BLOCKER)", async () => {
+    it("does not touch a symlinked fortress log dir; boot logs go to /var/log", async () => {
       const f = await makeInstallFixture();
       const outside = await makeTemp("f1-outside-");
-      // The attack: a same-uid actor plants <fortress>/logs as a symlink to a
-      // directory outside the fortress. The old code ran `mkdir -p` and a
-      // PATHNAME chown, handing that outside directory to the operator; the
-      // custody normalize can never undo it because it only walks inside.
+      // The attack: a same-uid actor plants <fortress>/logs as a symlink.
+      // install-boot must not mkdir/chown through it at all.
       await symlink(outside, join(f.fortress, "logs"));
 
       const code = await runInstallBoot(f.argv, f.ctx);
 
-      expect(code).toBe(1);
-      // The refusal is now OPEN-driven (ELOOP from an O_NOFOLLOW open) rather
-      // than a stat-then-use check, so it names the condition, not the stat.
-      expect(f.err.text()).toContain("not a plain directory");
-      // The outside directory's ownership is untouched.
+      expect(code).toBe(0);
+      expect(await readFile(f.plistPath, "utf8")).toContain("/var/log/castle-wall-daemon.log");
       const outsideStat = await stat(outside);
       expect(outsideStat.uid).toBe(process.getuid?.() ?? outsideStat.uid);
     });
@@ -940,7 +967,7 @@ describe("castle-wall boot service (F1 Option C)", () => {
       expect(normalizeCalls).toEqual([f.fortress]);
     });
 
-    it("warns loudly instead of guessing an owner when root runs without a resolvable operator", async () => {
+    it("refuses before mutation when root runs without a resolvable operator", async () => {
       const f = await makeInstallFixture();
       const normalizeCalls: string[] = [];
       const ctx = {
@@ -959,10 +986,10 @@ describe("castle-wall boot service (F1 Option C)", () => {
           };
         },
       };
-      expect(await runInstallBoot(f.argv, ctx)).toBe(0);
+      expect(await runInstallBoot(f.argv, ctx)).toBe(1);
       expect(normalizeCalls).toEqual([]);
-      expect(f.err.text()).toContain("fortress custody was not normalized");
-      expect(f.err.text()).toContain("repair-custody");
+      expect(f.err.text()).toContain("Cannot resolve the non-root operator identity");
+      expect(f.fake.calls.some((call) => call.cmd === "launchctl")).toBe(false);
     });
 
     it("repairs a disabled launchd override instead of taking the idempotent shortcut", async () => {

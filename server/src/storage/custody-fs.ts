@@ -98,10 +98,12 @@ export interface WriteFileCustodyOptions {
   prepareTemp?: (tempPath: string) => void | Promise<void>;
   /**
    * Create-with-fchown (fortress-ownership spec 2026-07-30, open question 5):
-   * chown the file (via its open descriptor, before the atomic rename) and any
-   * parent directories THIS call created to the given owner. Root daemons that
-   * write inside an operator-owned fortress pass the fortress owner here so
-   * fortress-internal files never accrete root ownership boot over boot.
+   * chown the file via its open descriptor before the atomic rename. Root
+   * daemons that write inside an operator-owned fortress pass the fortress
+   * owner here so fortress-internal files never accrete root ownership boot
+   * over boot. Parent directories must already exist and verify no-follow
+   * inside `ownerBase`; this API deliberately will not recursively create
+   * directories as root through a mutable path.
    * FAIL-CLOSED: if the chown fails the write fails (never silently leave the
    * file with the wrong owner).
    */
@@ -293,13 +295,28 @@ async function fsyncDirectory(dir: string): Promise<void> {
   }
 }
 
+async function openExistingDirectoryNoFollow(
+  path: string,
+): Promise<Awaited<ReturnType<typeof open>>> {
+  return open(
+    path,
+    fsConstants.O_RDONLY |
+      O_NOFOLLOW |
+      (typeof fsConstants.O_DIRECTORY === "number" ? fsConstants.O_DIRECTORY : 0),
+    // Ignored unless O_CREAT is present. We do not pass O_CREAT here; the mode
+    // is explicit so static scanners can see there is no broad temp-file mode.
+    0o600,
+  );
+}
+
 /**
  * Chown every directory on the segment chain from `firstCreated` down to
  * `leafDir` (inclusive) to `owner`. `firstCreated` is the value `mkdir
  * {recursive:true}` returns: the FIRST directory it actually created, so the
  * chain covers exactly the dirs this call minted (pre-existing parents are
- * never touched). Exported for the other create-with-fchown sites (the macOS
- * daemon's fortress-internal mkdirs).
+ * never touched). Retained for non-root/future descriptor-chown creation
+ * paths; current root owner-writes require parents to pre-exist because Node
+ * does not expose mkdirat/openat.
  *
  * SECURITY (2026-07-31 re-gate BLOCKER): this used to `lchown` PATH STRINGS.
  * `lchown` refuses to follow only the FINAL component, so a pre-existing
@@ -364,10 +381,6 @@ export async function chownCreatedDirChain(
   }
   components.reverse();
 
-  const dirFlags =
-    fsConstants.O_RDONLY |
-    O_NOFOLLOW |
-    (typeof fsConstants.O_DIRECTORY === "number" ? fsConstants.O_DIRECTORY : 0);
   const handles: Array<{
     path: string;
     handle: Awaited<ReturnType<typeof open>>;
@@ -376,11 +389,9 @@ export async function chownCreatedDirChain(
     for (const component of components) {
       let handle;
       try {
-        // codeql[js/insecure-temporary-file] -- read-only O_NOFOLLOW|O_DIRECTORY
-        // open of an EXISTING directory for verification. No file is created
-        // here (no O_CREAT), so there is no temporary-file exposure; the
-        // no-follow flag is the whole point of the call.
-        handle = await open(component, dirFlags);
+        // Read-only, no-create open of an existing directory for verification.
+        // O_NOFOLLOW is the point of the call: a symlinked component must fail.
+        handle = await openExistingDirectoryNoFollow(component);
       } catch (err) {
         throw new Error(
           `chownCreatedDirChain: refusing to chown through ${component} (${
@@ -413,10 +424,17 @@ export async function chownCreatedDirChain(
  * macOS (`/var` is itself a symlink). A caller that passes `owner` without
  * `ownerBase` is refused rather than silently given weaker containment.
  */
-async function assertNoFollowPathWithinBase(
+type NoFollowPathGuard = {
+  resolvedBase: string;
+  handles: Array<{ path: string; handle: Awaited<ReturnType<typeof open>> }>;
+  revalidate(): Promise<void>;
+  close(): Promise<void>;
+};
+
+async function openNoFollowPathWithinBase(
   leafDir: string,
   base: string | undefined,
-): Promise<void> {
+): Promise<NoFollowPathGuard> {
   if (base === undefined || base.length === 0) {
     throw new Error(
       "writeFileCustody: `owner` requires `ownerBase` (the directory the write must stay inside); refusing an owner-write without a containment root",
@@ -438,19 +456,45 @@ async function assertNoFollowPathWithinBase(
     walk = parent;
   }
   components.reverse();
-  const dirFlags =
-    fsConstants.O_RDONLY |
-    O_NOFOLLOW |
-    (typeof fsConstants.O_DIRECTORY === "number" ? fsConstants.O_DIRECTORY : 0);
-  const handles: Array<Awaited<ReturnType<typeof open>>> = [];
+  const handles: Array<{ path: string; handle: Awaited<ReturnType<typeof open>> }> = [];
+  const close = async (): Promise<void> => {
+    for (const entry of handles.reverse()) {
+      await entry.handle.close().catch(() => undefined);
+    }
+  };
+  const revalidate = async (): Promise<void> => {
+    for (const entry of handles) {
+      let held;
+      let fresh;
+      try {
+        held = await entry.handle.stat();
+        fresh = await openExistingDirectoryNoFollow(entry.path);
+      } catch (err) {
+        throw new Error(
+          `writeFileCustody: refusing an owner-write through ${entry.path} (${
+            (err as NodeJS.ErrnoException).code ?? "open failed"
+          }); a path component changed after containment verification`,
+          { cause: err },
+        );
+      }
+      try {
+        const freshStats = await fresh.stat();
+        if (!sameFile(held, freshStats)) {
+          throw new Error(
+            `writeFileCustody: refusing an owner-write through ${entry.path}; path identity changed after containment verification`,
+          );
+        }
+      } finally {
+        await fresh.close().catch(() => undefined);
+      }
+    }
+  };
   try {
     for (const component of components) {
       try {
-        // codeql[js/insecure-temporary-file] -- read-only O_NOFOLLOW|O_DIRECTORY
-        // open of an EXISTING directory for verification. No file is created
-        // here (no O_CREAT), so there is no temporary-file exposure; the
-        // no-follow flag is the whole point of the call.
-        handles.push(await open(component, dirFlags));
+        // Read-only, no-create open of an existing directory for verification.
+        // O_NOFOLLOW is the point of the call: a symlinked component must fail.
+        handles.push({ path: component, handle: await openExistingDirectoryNoFollow(component) });
       } catch (err) {
         throw new Error(
           `writeFileCustody: refusing an owner-write through ${component} (${
@@ -460,9 +504,35 @@ async function assertNoFollowPathWithinBase(
         );
       }
     }
+    return { resolvedBase, handles, revalidate, close };
+  } catch (err) {
+    await close();
+    throw err;
+  }
+}
+
+async function withOwnerEffectiveIdentity<T>(
+  owner: { uid: number; gid: number } | undefined,
+  fn: (dropped: boolean) => Promise<T>,
+): Promise<T> {
+  if (
+    owner === undefined ||
+    process.geteuid?.() !== 0 ||
+    process.seteuid === undefined ||
+    process.setegid === undefined
+  ) {
+    return fn(false);
+  }
+  const oldUid = process.geteuid();
+  const oldGid = process.getegid?.();
+  try {
+    process.setegid(owner.gid);
+    process.seteuid(owner.uid);
+    return await fn(true);
   } finally {
-    for (const handle of handles.reverse()) {
-      await handle.close().catch(() => undefined);
+    process.seteuid(oldUid);
+    if (oldGid !== undefined) {
+      process.setegid(oldGid);
     }
   }
 }
@@ -473,60 +543,68 @@ export async function writeFileCustody(
   options: WriteFileCustodyOptions,
 ): Promise<void> {
   const dir = dirname(path);
-  if (options.createParent !== false) {
-    const firstCreated = await mkdir(dir, {
-      recursive: true,
-      mode: options.parentMode ?? 0o700,
-    });
-    if (options.owner !== undefined && firstCreated !== undefined) {
-      await chownCreatedDirChain(firstCreated, dir, options.owner);
-    }
-  }
+  let ownerGuard: NoFollowPathGuard | undefined;
   if (options.owner !== undefined) {
-    // 2026-07-31 gate round 3: containment for owner-writes must NOT depend on
-    // `mkdir` having created something. When every directory already exists
-    // (including a symlinked ancestor an attacker planted), `firstCreated` is
-    // undefined, the chain check never runs, and the temp-file open below
-    // would follow the symlink -- letting a root writer create, chown, and
-    // rename a file OUTSIDE the tree. Verify the whole base-to-leaf path
-    // no-follow, every time.
-    await assertNoFollowPathWithinBase(dir, options.ownerBase);
+    // 2026-07-31 fix-round: verify containment BEFORE any recursive mkdir.
+    // There is no mkdirat-style API here; creating missing parents by path as
+    // root can be redirected by a symlinked ancestor before the later
+    // no-follow check runs. Owner writes therefore require the parent chain to
+    // already exist as real directories inside ownerBase.
+    ownerGuard = await openNoFollowPathWithinBase(dir, options.ownerBase);
   }
-  await verifyParentCustody(path, options.parent);
-  const tempPath = join(
-    dir,
-    `.${basename(path)}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`,
-  );
-  let handle;
-  let cleanupTemp = true;
   try {
-    handle = await open(
-      tempPath,
-      fsConstants.O_WRONLY |
-        fsConstants.O_CREAT |
-        fsConstants.O_EXCL |
-        O_NOFOLLOW,
-      options.mode,
-    );
-    await handle.chmod(options.mode);
-    if (options.owner !== undefined) {
-      // Create-with-fchown: applied on the DESCRIPTOR before the atomic
-      // rename, so the destination never exists with the wrong owner. A
-      // failure here fails the whole write (fail-closed).
-      await handle.chown(options.owner.uid, options.owner.gid);
-    }
-    await options.prepareTemp?.(tempPath);
-    await handle.writeFile(data);
-    await handle.sync();
-    await handle.close();
-    handle = undefined;
-    await rename(tempPath, path);
-    cleanupTemp = false;
-    await fsyncDirectory(dir);
+    await withOwnerEffectiveIdentity(options.owner, async (droppedToOwner) => {
+      if (options.createParent !== false && options.owner === undefined) {
+        await mkdir(dir, {
+          recursive: true,
+          mode: options.parentMode ?? 0o700,
+        });
+      }
+      await verifyParentCustody(path, options.parent);
+      const tempPath = join(
+        dir,
+        `.${basename(path)}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`,
+      );
+      let handle;
+      let cleanupTemp = true;
+      try {
+        await ownerGuard?.revalidate();
+        handle = await open(
+          tempPath,
+          fsConstants.O_WRONLY |
+            fsConstants.O_CREAT |
+            fsConstants.O_EXCL |
+            O_NOFOLLOW,
+          options.mode,
+        );
+        await handle.chmod(options.mode);
+        if (options.owner !== undefined && !droppedToOwner) {
+          // Create-with-fchown: applied on the DESCRIPTOR before the atomic
+          // rename, so the destination never exists with the wrong owner. A
+          // failure here fails the whole write (fail-closed). When running as
+          // root, the path operations are performed under the target effective
+          // uid/gid instead, so an ancestor race is not a root write primitive.
+          await handle.chown(options.owner.uid, options.owner.gid);
+        }
+        await options.prepareTemp?.(tempPath);
+        await handle.writeFile(data);
+        await handle.sync();
+        await handle.close();
+        handle = undefined;
+        await ownerGuard?.revalidate();
+        await rename(tempPath, path);
+        cleanupTemp = false;
+        await fsyncDirectory(dir);
+      } finally {
+        await handle?.close().catch(() => undefined);
+        if (cleanupTemp) {
+          await unlink(tempPath).catch(() => undefined);
+        }
+      }
+    });
   } finally {
-    await handle?.close().catch(() => undefined);
-    if (cleanupTemp) {
-      await unlink(tempPath).catch(() => undefined);
+    if (ownerGuard !== undefined) {
+      await ownerGuard.close();
     }
   }
 }
