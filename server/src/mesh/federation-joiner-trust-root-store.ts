@@ -600,7 +600,19 @@ export type FederationJoinerPlannedRootAdoptReissueResult =
       /** The pinned master the server ECHOED; used only for a mismatch check. */
       serverPinnedMaster: FortressMasterPublicKey;
     }
-  | { ok: false; reason: "denied" | "unreachable" };
+  | {
+      ok: false;
+      reason: "denied" | "unreachable";
+      /**
+       * The issuer's opaque correlation id for the denied request, when it sent
+       * one. The issuer never tells the joiner WHICH check failed (no membership
+       * oracle); this id is what lets an operator who can read the ISSUER's
+       * fortress recover the precise reason from its audit log. Carried through
+       * so the joiner-side refusal can print it instead of leaving the operator
+       * with a four-cause message and nothing to look up.
+       */
+      issuerRequestId?: string;
+    };
 
 export type FederationJoinerPlannedRootAdoptResult =
   | {
@@ -619,6 +631,13 @@ export type FederationJoinerPlannedRootAdoptResult =
       currentPinnedMaster: FortressMasterPublicKey | null;
       rotationSerial?: number;
       detail?: string;
+      /**
+       * Set only for an issuer-side refusal (`reissue_denied`): the issuer's
+       * correlation id for that request, for the operator's audit lookup on the
+       * ISSUER. Absent for every joiner-side refusal, which already names its
+       * own precise reason locally.
+       */
+      issuerRequestId?: string;
     };
 
 /**
@@ -826,11 +845,17 @@ export async function adoptFederationJoinerPlannedRoot(opts: {
   if (!reissued.ok) {
     const reason =
       reissued.reason === "unreachable" ? "reissue_unreachable" : "reissue_denied";
+    // The issuer's correlation id (when it sent one) goes into BOTH the joiner's
+    // own audit entry and the returned result, so the operator can find it
+    // whether they are reading the log or the terminal.
     await auditPlannedAdoptFailure(opts.audit, reason, {
       fortress_id: current.fortress_id,
       node_id: current.node_id,
+      ...(reissued.issuerRequestId !== undefined
+        ? { issuer_request_id: reissued.issuerRequestId }
+        : {}),
     });
-    return held(reason, currentPinned, rotationSerial);
+    return held(reason, currentPinned, rotationSerial, reissued.issuerRequestId);
   }
 
   // Constraint 4: the server response is never the trust source. The pinned
@@ -998,6 +1023,7 @@ function held(
   reason: FederationJoinerPlannedRootAdoptRejectionReason,
   currentPinnedMaster: FortressMasterPublicKey | null,
   rotationSerial?: number,
+  issuerRequestId?: string,
 ): FederationJoinerPlannedRootAdoptResult {
   return {
     adopted: false,
@@ -1005,6 +1031,7 @@ function held(
     reason,
     currentPinnedMaster,
     ...(rotationSerial !== undefined ? { rotationSerial } : {}),
+    ...(issuerRequestId !== undefined ? { issuerRequestId } : {}),
   };
 }
 

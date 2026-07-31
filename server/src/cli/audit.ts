@@ -28,6 +28,17 @@ interface SearchOptions {
   since?: string;
   until?: string;
   actor?: string;
+  /**
+   * Filter to entries whose `details.request_id` matches exactly.
+   *
+   * This is the operator's redemption path for a server-minted correlation id.
+   * Endpoints that must not tell a caller WHICH check failed (the pre-session
+   * federation reissue route) return an opaque id instead and audit the precise
+   * reason locally; this flag turns that id back into the reason for someone who
+   * can already open the fortress. Without it the lookup is a manual scan of
+   * `--json` output, which is exactly the tax the drills paid.
+   */
+  requestId?: string;
   limit: number;
   json: boolean;
   fortress?: string;
@@ -85,6 +96,11 @@ export async function runAuditCommand(args: AuditCommandArgs): Promise<number> {
     if (searchOpts.actor) {
       entries = entries.filter((entry) => entry.identity_id === searchOpts.actor);
     }
+    if (searchOpts.requestId) {
+      entries = entries.filter(
+        (entry) => entry.details?.request_id === searchOpts.requestId,
+      );
+    }
     const total = entries.length;
     entries = entries.slice(-searchOpts.limit);
 
@@ -109,7 +125,7 @@ export async function runAuditCommand(args: AuditCommandArgs): Promise<number> {
         ) + "\n"
       );
     } else {
-      printTable(out, entries);
+      printTable(out, entries, searchOpts.requestId !== undefined);
     }
     return findings.length > 0 ? 1 : 0;
   } catch (error) {
@@ -147,6 +163,7 @@ export function parseSearchOptions(argv: string[]): SearchOptions {
   let since: string | undefined;
   let until: string | undefined;
   let actor: string | undefined;
+  let requestId: string | undefined;
   let limit = 50;
   let json = false;
   let fortress: string | undefined;
@@ -176,6 +193,10 @@ export function parseSearchOptions(argv: string[]): SearchOptions {
       actor = requireValue(argv, ++i, "--actor");
     } else if (arg.startsWith("--actor=")) {
       actor = arg.slice("--actor=".length);
+    } else if (arg === "--request-id") {
+      requestId = requireValue(argv, ++i, "--request-id");
+    } else if (arg.startsWith("--request-id=")) {
+      requestId = arg.slice("--request-id=".length);
     } else if (arg === "--limit") {
       limit = parseLimit(requireValue(argv, ++i, "--limit"));
     } else if (arg.startsWith("--limit=")) {
@@ -192,7 +213,7 @@ export function parseSearchOptions(argv: string[]): SearchOptions {
       throw new Error(`unknown option: ${arg}`);
     }
   }
-  return { types, since, until, actor, limit, json, fortress, passphrase };
+  return { types, since, until, actor, requestId, limit, json, fortress, passphrase };
 }
 
 export function parseTimeExpression(value: string): string {
@@ -247,13 +268,16 @@ Commands:
 function printSearchUsage(out: Writable): void {
   write(
     out,
-    `Usage: sanctuary audit search [--type <event_type>] [--since <iso|relative>] [--until <iso|relative>] [--actor <id>] [--limit <n>] [--json]
+    `Usage: sanctuary audit search [--type <event_type>] [--since <iso|relative>] [--until <iso|relative>] [--actor <id>] [--request-id <id>] [--limit <n>] [--json]
 
 Options:
   --type <event_type>  Filter by operation. Repeat or comma-separate.
   --since <time>       ISO time or relative duration like 5m, 2h, 7d.
   --until <time>       ISO time or relative duration like 5m, 2h, 7d.
   --actor <id>         Filter by identity_id.
+  --request-id <id>    Filter by details.request_id. Use this to look up the
+                       reason behind a request id a client was handed in place
+                       of a denial reason (e.g. a federation adopt refusal).
   --limit <n>          Maximum records to print. Defaults to 50.
   --fortress <path>    Override fortress path.
   --passphrase <val>   Passphrase for decrypting audit entries.
@@ -262,7 +286,17 @@ Options:
   );
 }
 
-function printTable(out: Writable, entries: AuditEntry[]): void {
+/**
+ * `withReason` expands each row with its `reason` and `operator_next_step`.
+ * Enabled for a `--request-id` lookup, where the whole point of the query is to
+ * read those two fields: making the operator re-run with `--json` to see the
+ * answer they asked for would leave the diagnosability gap half-closed.
+ */
+function printTable(
+  out: Writable,
+  entries: AuditEntry[],
+  withReason = false,
+): void {
   if (entries.length === 0) {
     write(out, "(no audit entries)\n");
     return;
@@ -273,6 +307,15 @@ function printTable(out: Writable, entries: AuditEntry[]): void {
       out,
       `${entry.timestamp.padEnd(28)} ${entry.layer.padEnd(5)} ${entry.result.padEnd(7)} ${truncate(entry.identity_id, 29).padEnd(29)} ${entry.operation}\n`,
     );
+    if (!withReason) continue;
+    const reason = entry.details?.reason;
+    if (typeof reason === "string") {
+      write(out, `  reason: ${reason}\n`);
+    }
+    const nextStep = entry.details?.operator_next_step;
+    if (typeof nextStep === "string") {
+      write(out, `  next step: ${nextStep}\n`);
+    }
   }
 }
 

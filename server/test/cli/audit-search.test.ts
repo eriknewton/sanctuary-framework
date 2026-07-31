@@ -60,10 +60,93 @@ describe("sanctuary audit search", () => {
       identity_id: "agent-a",
       result: "success",
     });
+    // Two denial entries that differ ONLY by request_id: this is the shape an
+    // endpoint writes when it refuses to tell the caller which check failed and
+    // hands back a correlation id instead. The lookup has to pick out exactly
+    // one of them.
+    await auditLog.appendCritical({
+      timestamp: "2026-06-09T13:00:00.000Z",
+      layer: "l2",
+      operation: "v1_federation_reissue_node_cert",
+      identity_id: "joiner-1",
+      result: "failure",
+      details: {
+        reason: "no_recorded_rotation_lineage",
+        request_id: "11111111-1111-4111-8111-111111111111",
+        operator_next_step: "Restart the fortress endpoint, then re-enable.",
+      },
+    });
+    await auditLog.appendCritical({
+      timestamp: "2026-06-09T13:01:00.000Z",
+      layer: "l2",
+      operation: "v1_federation_reissue_node_cert",
+      identity_id: "joiner-1",
+      result: "failure",
+      details: {
+        reason: "federation_disabled",
+        request_id: "22222222-2222-4222-8222-222222222222",
+      },
+    });
     await auditLog.flush();
     derived.key.fill(0);
     return fortress;
   }
+
+  // The redemption half of the correlation-id fix (F-FED-OPAQUEDENY): the id a
+  // refused caller was handed has to be spendable in one command, or the
+  // diagnosability gap is only half closed and the operator still greps JSON.
+  it("looks a denial's request id up to exactly one entry, with the reason", async () => {
+    const fortress = await makeFortress();
+    const out = new Capture();
+    const code = await runAuditCommand({
+      argv: [
+        "search",
+        "--fortress",
+        fortress,
+        "--request-id",
+        "11111111-1111-4111-8111-111111111111",
+      ],
+      out,
+      env: { SANCTUARY_PASSPHRASE: passphrase },
+    });
+    expect(code).toBe(0);
+    // The reason + remediation print WITHOUT --json: the operator asked the
+    // question, so they get the answer, not a pointer to another flag.
+    expect(out.text()).toContain("no_recorded_rotation_lineage");
+    expect(out.text()).toContain("Restart the fortress endpoint");
+    // The sibling denial (same operation, same actor, different id) is excluded.
+    expect(out.text()).not.toContain("federation_disabled");
+  });
+
+  it("accepts --request-id=<id> and returns nothing for an unknown id", async () => {
+    const fortress = await makeFortress();
+    const out = new Capture();
+    const code = await runAuditCommand({
+      argv: [
+        "search",
+        "--fortress",
+        fortress,
+        "--request-id=22222222-2222-4222-8222-222222222222",
+        "--json",
+      ],
+      out,
+      env: { SANCTUARY_PASSPHRASE: passphrase },
+    });
+    expect(code).toBe(0);
+    const parsed = JSON.parse(out.text());
+    expect(parsed.total).toBe(1);
+    expect(parsed.entries[0].details.reason).toBe("federation_disabled");
+
+    const missing = new Capture();
+    expect(
+      await runAuditCommand({
+        argv: ["search", "--fortress", fortress, "--request-id", "no-such-id"],
+        out: missing,
+        env: { SANCTUARY_PASSPHRASE: passphrase },
+      }),
+    ).toBe(0);
+    expect(missing.text()).toBe("(no audit entries)\n");
+  });
 
   it("filters by type, actor, since, until, and limit", async () => {
     const fortress = await makeFortress();

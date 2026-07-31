@@ -854,11 +854,13 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * pubkey) the join ceremony needs; it is bound out of band by the console/
    * mesh boot path via {@link setFederationContext}. Until bound, federation
    * is unprovisioned and every authorize path fails closed. `_federationEnabled`
-   * is the operator-controlled on/off switch; `_federationRoster` tracks
+   * is the operator-controlled on/off switch, rehydrated from the durable
+   * federation sync-state record when one is wired; `_federationRoster` tracks
    * joined node ids for the status summary only.
    */
   private _federationContext: FederationContext | null = null;
   private _federationEnabled = false;
+  private _federationEnabledGeneration = 0;
   /**
    * OPTIONAL operator opt-in: when set, the /v1/federation/revoke (kill) path
    * requires an M-of-N guardian quorum before a node eviction is minted.
@@ -2422,6 +2424,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     this._federationContext = ctx;
     if (ctx === null) {
       this._federationEnabled = false;
+      this._federationEnabledGeneration = 0;
       this._federationState = {
         ...this._federationState,
         revoked: new Set<string>(),
@@ -3386,6 +3389,11 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       return;
     }
     this._federationSyncStateUnavailable = false;
+    this._federationEnabled = snapshot.federationEnabled ?? false;
+    this._federationEnabledGeneration = Math.max(
+      this._federationEnabledGeneration,
+      snapshot.federationEnabledGeneration ?? 0,
+    );
     this._federationAcceptedHighWater.clear();
     for (const [nodeId, highWater] of snapshot.acceptedHighWater) {
       this._federationAcceptedHighWater.set(nodeId, highWater);
@@ -3900,6 +3908,8 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    */
   private snapshotFederationSyncState(): FederationSyncStateSnapshot {
     return {
+      federationEnabled: this._federationEnabled,
+      federationEnabledGeneration: this._federationEnabledGeneration,
       acceptedHighWater: new Map(this._federationAcceptedHighWater),
       outboundHighWater: this._federationOutboundHighWater,
       revokedNodeIds: new Set(this._federationState.revoked),
@@ -4253,8 +4263,18 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     return {
       getContext: () => this._federationContext,
       isEnabled: () => this._federationEnabled,
-      setEnabled: (enabled) => {
+      setEnabled: async (enabled) => {
+        const previousEnabled = this._federationEnabled;
+        const previousGeneration = this._federationEnabledGeneration;
         this._federationEnabled = enabled;
+        this._federationEnabledGeneration += 1;
+        try {
+          await this.persistFederationSyncState();
+        } catch (err) {
+          this._federationEnabled = previousEnabled;
+          this._federationEnabledGeneration = previousGeneration;
+          throw err;
+        }
       },
       resolveOperatorPublicKey: () => this.resolveOperatorPublicKey(),
       rosterNodeIds: () => [...this._federationRoster],

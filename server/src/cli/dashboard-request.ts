@@ -21,16 +21,26 @@ export interface DashboardRequestContext {
 export class DashboardRequestError extends Error {
   readonly kind: "network" | "auth" | "not-implemented" | "server" | "http";
   readonly status: number | undefined;
+  /**
+   * Server-minted correlation id from the failure body's `request_id`, when the
+   * endpoint emits one (today: the federation node-cert reissue route). The
+   * server deliberately does not tell the caller WHICH check failed; this id is
+   * how an operator who can read that fortress looks the reason up in its audit
+   * log. Undefined for every endpoint that does not mint one.
+   */
+  readonly requestId: string | undefined;
 
   constructor(
     message: string,
     kind: DashboardRequestError["kind"],
     status?: number,
+    requestId?: string,
   ) {
     super(message);
     this.name = "DashboardRequestError";
     this.kind = kind;
     this.status = status;
+    this.requestId = requestId;
   }
 }
 
@@ -38,6 +48,32 @@ interface DashboardErrorBody {
   ok?: boolean;
   error?: unknown;
   detail?: unknown;
+  request_id?: unknown;
+}
+
+/**
+ * Accept a server-supplied correlation id ONLY in the exact shape a Sanctuary
+ * fortress mints (`randomUUID`), and drop anything else.
+ *
+ * This value comes off the wire from a host the client has NOT authenticated
+ * (the reissue route is pre-session), and it is displayed to the operator inside
+ * a command they are invited to run. A hostile or MITM'd endpoint that could put
+ * arbitrary text in this field would be writing into the operator's terminal and
+ * clipboard: `"x\nrm -rf ~/.sanctuary #"` renders as a second line that looks
+ * like part of the suggested command. Constraining it to 36 hex-and-dash
+ * characters removes the whole class -- newlines, shell metacharacters, ANSI
+ * escapes, and unbounded length -- rather than trying to escape it at each
+ * display site. A non-conforming id is DROPPED, not sanitized: the correct
+ * outcome is "this endpoint gave us nothing to look up", which the callers
+ * already handle by printing no lookup line at all.
+ */
+const CORRELATION_ID_SHAPE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+export function parseServerRequestId(value: unknown): string | undefined {
+  return typeof value === "string" && CORRELATION_ID_SHAPE.test(value)
+    ? value
+    : undefined;
 }
 
 /**
@@ -85,6 +121,7 @@ export async function dashboardRequest(
       classifyHttpFailure(res.status, path, body),
       failureKind(res.status),
       res.status,
+      parseServerRequestId(body.request_id),
     );
   }
   return body;

