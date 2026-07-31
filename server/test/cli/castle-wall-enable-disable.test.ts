@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -28,6 +28,9 @@ import {
 } from "../../src/cli/castle-wall-boot.js";
 
 const TEST_BUILD_SHA = "test-build-sha";
+
+const TEST_OPERATOR_UID = String(process.getuid?.() ?? 501);
+const TEST_OPERATOR_GID = String(process.getgid?.() ?? 20);
 
 class CaptureStream extends Writable {
   chunks: string[] = [];
@@ -507,7 +510,6 @@ describe("castle-wall enable/disable CLI verbs", () => {
         daemonProbe: async () => true,
         bootServiceReadyProbe: makeBootServiceReadyProbe(plistPath, fortressPath),
         sysextProbe: async () => "[activated enabled]",
-      egressAllowRuleCountProbe: async () => 1,
         // These tests are not about the no-egress brick guard; report one
         // agent-matchable allow rule so the guard stays out of the way (the
         // guard's own behavior has dedicated tests below).
@@ -537,6 +539,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
     const { fortressPath, hostAppPath, env } = await makeFixture();
     const plistPath = join(fortressPath, "boot.plist");
     await writeFile(plistPath, makeBootPlist(`${fortressPath}/`));
+    await mkdir(join(fortressPath, "policy", "egress"), { recursive: true });
     const { invoke } = makeInvoker({
       enable: { stdout: reportLine("enable", "enabled", true), exitCode: 0 },
       status: { stdout: reportLine("status", "enabled", true), exitCode: 0 },
@@ -555,7 +558,6 @@ describe("castle-wall enable/disable CLI verbs", () => {
         daemonProbe: async () => true,
         bootServiceReadyProbe: makeBootServiceReadyProbe(plistPath, fortressPath),
         sysextProbe: async () => "[activated enabled]",
-      egressAllowRuleCountProbe: async () => 1,
         // These tests are not about the no-egress brick guard; report one
         // agent-matchable allow rule so the guard stays out of the way (the
         // guard's own behavior has dedicated tests below).
@@ -590,7 +592,6 @@ describe("castle-wall enable/disable CLI verbs", () => {
         daemonProbe: async () => true,
         bootServiceReadyProbe: makeBootServiceReadyProbe(plistPath, fortressPath),
         sysextProbe: async () => "[activated enabled]",
-      egressAllowRuleCountProbe: async () => 1,
         // These tests are not about the no-egress brick guard; report one
         // agent-matchable allow rule so the guard stays out of the way (the
         // guard's own behavior has dedicated tests below).
@@ -630,7 +631,6 @@ describe("castle-wall enable/disable CLI verbs", () => {
         daemonProbe: async () => true,
         bootServiceReadyProbe: makeBootServiceReadyProbe(plistPath, fortressPath),
         sysextProbe: async () => "[activated enabled]",
-      egressAllowRuleCountProbe: async () => 1,
         // These tests are not about the no-egress brick guard; report one
         // agent-matchable allow rule so the guard stays out of the way (the
         // guard's own behavior has dedicated tests below).
@@ -665,7 +665,6 @@ describe("castle-wall enable/disable CLI verbs", () => {
         daemonProbe: async () => true,
         bootServiceReadyProbe: makeBootServiceReadyProbe(plistPath, fortressPath),
         sysextProbe: async () => "[activated enabled]",
-      egressAllowRuleCountProbe: async () => 1,
         // These tests are not about the no-egress brick guard; report one
         // agent-matchable allow rule so the guard stays out of the way (the
         // guard's own behavior has dedicated tests below).
@@ -682,6 +681,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
     const { fortressPath, hostAppPath, env } = await makeFixture();
     const plistPath = join(fortressPath, "boot.plist");
     await writeFile(plistPath, makeBootPlist(`${fortressPath}/`));
+    await mkdir(join(fortressPath, "policy", "egress"), { recursive: true });
     const out = new CaptureStream();
     const { invoke } = makeInvoker({
       enable: { stdout: reportLine("enable", "enabled", true), exitCode: 0 },
@@ -700,7 +700,6 @@ describe("castle-wall enable/disable CLI verbs", () => {
         daemonProbe: async () => true,
         bootServiceReadyProbe: makeBootServiceReadyProbe(plistPath, fortressPath),
         sysextProbe: async () => "[activated enabled]",
-      egressAllowRuleCountProbe: async () => 1,
         // These tests are not about the no-egress brick guard; report one
         // agent-matchable allow rule so the guard stays out of the way (the
         // guard's own behavior has dedicated tests below).
@@ -740,7 +739,6 @@ describe("castle-wall enable/disable CLI verbs", () => {
         daemonProbe: async () => true,
         bootServiceReadyProbe: makeBootServiceReadyProbe(plistPath, fortressPath),
         sysextProbe: async () => "[activated enabled]",
-      egressAllowRuleCountProbe: async () => 1,
         // These tests are not about the no-egress brick guard; report one
         // agent-matchable allow rule so the guard stays out of the way (the
         // guard's own behavior has dedicated tests below).
@@ -775,7 +773,6 @@ describe("castle-wall enable/disable CLI verbs", () => {
         daemonProbe: async () => true,
         bootServiceReadyProbe: makeBootServiceReadyProbe(plistPath, fortressPath),
         sysextProbe: async () => "[activated enabled]",
-      egressAllowRuleCountProbe: async () => 1,
         // These tests are not about the no-egress brick guard; report one
         // agent-matchable allow rule so the guard stays out of the way (the
         // guard's own behavior has dedicated tests below).
@@ -904,6 +901,39 @@ describe("castle-wall enable/disable CLI verbs", () => {
 
     expect(code).toBe(0);
     expect(out.text()).toContain("Castle Wall armed");
+  });
+
+  it("enable --agent-uid refuses a symlinked policy ancestor before writing outside", async () => {
+    const { fortressPath, hostAppPath, env } = await makeFixture();
+    const plistPath = join(fortressPath, "boot.plist");
+    await writeFile(plistPath, makeBootPlist(`${fortressPath}/`));
+    const outside = await mkdtemp(join(tmpdir(), "cw-agent-origin-outside-"));
+    tempDirs.push(outside);
+    await symlink(outside, join(fortressPath, "policy"));
+    const err = new CaptureStream();
+    const { invoke, calls } = makeInvoker({});
+
+    const code = await runEnable(
+      ["--fortress", fortressPath, "--no-ttl", "--agent-uid=502"],
+      {
+        out: new CaptureStream(),
+        err,
+        env: { ...env, SUDO_UID: TEST_OPERATOR_UID, SUDO_GID: TEST_OPERATOR_GID, SUDO_USER: "operator" },
+        platform: "darwin",
+        getuid: () => 0,
+        hostAppCandidates: [hostAppPath],
+        hostAppInvoke: invoke,
+        daemonProbe: async () => true,
+        bootServiceReadyProbe: makeBootServiceReadyProbe(plistPath, fortressPath),
+        sysextProbe: async () => "[activated enabled]",
+        egressAllowRuleCountProbe: async () => 1,
+      },
+    );
+
+    expect(code).toBe(1);
+    expect(err.text()).toContain("refusing an owner-write through");
+    await expect(readFile(join(outside, "egress", "agent-origin.json"), "utf8")).rejects.toThrow();
+    expect(calls).toHaveLength(0);
   });
 
   it("enable --force bypasses the daemon gate and verifies via status", async () => {
@@ -1344,7 +1374,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
     const code = await runDisable([], {
       out,
       err,
-      env: { ...env, SUDO_UID: String(operatorUid) },
+      env: { ...env, SUDO_UID: String(operatorUid), SUDO_GID: TEST_OPERATOR_GID },
       platform: "darwin",
       getuid: () => 0,
       hostAppCandidates: [hostAppPath],
@@ -1920,5 +1950,265 @@ describe("makeLaunchServicesHostAppInvoke", () => {
     expect(result.stderr).toContain("already running");
     expect(result.stderr).toContain("relaunching headlessly");
     expect(events).toEqual(["probe", "terminate:CastleWallHostApp", "open"]);
+  });
+});
+
+describe("fortress-ownership guards on arm/disarm (spec 2026-07-30)", () => {
+  const tempDirs: string[] = [];
+
+  afterEach(async () => {
+    for (const dir of tempDirs.splice(0)) {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  async function makeFixture() {
+    const fortressPath = await mkdtemp(join(tmpdir(), "sanctuary-cw-custody-"));
+    tempDirs.push(fortressPath);
+    const hostAppPath = join(fortressPath, "CastleWallHostApp");
+    await writeFile(hostAppPath, "#!/bin/sh\n", { mode: 0o755 });
+    const env = {
+      SANCTUARY_STORAGE_PATH: fortressPath,
+      SANCTUARY_RECOVERY_KEY: toBase64url(generateRandomKey()),
+      SANCTUARY_CASTLE_BUILD_SHA: TEST_BUILD_SHA,
+    };
+    return { fortressPath, hostAppPath, env };
+  }
+
+  it("enable refuses a root-owned fortress before any other gate, and --force does not override", async () => {
+    const { hostAppPath, env } = await makeFixture();
+    const err = new CaptureStream();
+    const { invoke, calls } = makeInvoker({});
+
+    const code = await runEnable(["--no-ttl", "--force"], {
+      out: new CaptureStream(),
+      err,
+      env,
+      platform: "darwin",
+      hostAppCandidates: [hostAppPath],
+      hostAppInvoke: invoke,
+      // Every downstream gate would pass; only the custody guard refuses.
+      daemonProbe: async () => true,
+      bootServiceReadyProbe: async () => true,
+      sysextProbe: async () => "[activated enabled]",
+      agentOriginDescriptorProbe: async () => true,
+      fortressOwnerUidProbe: async () => 0,
+    });
+
+    expect(code).toBe(1);
+    expect(err.text()).toContain("owned by root");
+    expect(err.text()).toContain("repair-custody");
+    expect(err.text()).toContain("--force does not override");
+    // Never reaches the host app: nothing armed.
+    expect(calls).toHaveLength(0);
+  });
+
+  it("enable proceeds when the fortress is operator-owned or unstattable", async () => {
+    const { fortressPath, hostAppPath, env } = await makeFixture();
+    const out = new CaptureStream();
+    const { invoke } = makeInvoker({
+      enable: { stdout: reportLine("enable", "enabled", true), exitCode: 0 },
+      status: { stdout: reportLine("status", "enabled", true), exitCode: 0 },
+    });
+
+    const code = await runEnable(["--fortress", fortressPath, "--no-ttl"], {
+      out,
+      err: new CaptureStream(),
+      env,
+      platform: "darwin",
+      hostAppCandidates: [hostAppPath],
+      hostAppInvoke: invoke,
+      daemonProbe: async () => true,
+      bootServiceReadyProbe: async () => true,
+      sysextProbe: async () => "[activated enabled]",
+      egressAllowRuleCountProbe: async () => 1,
+      agentOriginDescriptorProbe: async () => true,
+      fortressOwnerUidProbe: async () => 501,
+    });
+
+    expect(code).toBe(0);
+    expect(out.text()).toContain("Castle Wall armed");
+  });
+
+  it("a sudo enable runs the custody-normalize chokepoint with the resolved operator", async () => {
+    const { fortressPath, hostAppPath, env } = await makeFixture();
+    const { invoke } = makeInvoker({
+      enable: { stdout: reportLine("enable", "enabled", true), exitCode: 0 },
+      status: { stdout: reportLine("status", "enabled", true), exitCode: 0 },
+    });
+    const normalizeCalls: { fortressPath: string; operator: { uid: number; gid: number } }[] = [];
+
+    const code = await runEnable(["--fortress", fortressPath, "--no-ttl"], {
+      out: new CaptureStream(),
+      err: new CaptureStream(),
+      env: { ...env, SUDO_UID: TEST_OPERATOR_UID, SUDO_GID: TEST_OPERATOR_GID, SUDO_USER: "operator" },
+      platform: "darwin",
+      getuid: () => 0,
+      hostAppCandidates: [hostAppPath],
+      hostAppInvoke: invoke,
+      daemonProbe: async () => true,
+      bootServiceReadyProbe: async () => true,
+      sysextProbe: async () => "[activated enabled]",
+      egressAllowRuleCountProbe: async () => 1,
+      agentOriginDescriptorProbe: async () => true,
+      fortressOwnerUidProbe: async () => 501,
+      normalizeFortressCustody: async (input) => {
+        normalizeCalls.push({ fortressPath: input.fortressPath, operator: input.operator });
+        return { status: "clean", repaired: [], skips: [], vanished: [], failed: [] };
+      },
+    });
+
+    expect(code).toBe(0);
+    expect(normalizeCalls).toEqual([
+      { fortressPath, operator: { uid: Number(TEST_OPERATOR_UID), gid: Number(TEST_OPERATOR_GID) } },
+    ]);
+  });
+
+  it("a sudo disable runs the chokepoint too; a non-root run never does", async () => {
+    const { fortressPath, hostAppPath, env } = await makeFixture();
+    const responses = {
+      disable: { stdout: reportLine("disable", "disabled", true), exitCode: 0 },
+      status: { stdout: reportLine("status", "disabled", true), exitCode: 0 },
+    };
+    const sudoCalls: string[] = [];
+    expect(
+      await runDisable([], {
+        out: new CaptureStream(),
+        err: new CaptureStream(),
+        env: { ...env, SUDO_UID: TEST_OPERATOR_UID, SUDO_GID: TEST_OPERATOR_GID, SUDO_USER: "operator" },
+        platform: "darwin",
+        getuid: () => 0,
+        hostAppCandidates: [hostAppPath],
+        hostAppInvoke: makeInvoker(responses).invoke,
+        normalizeFortressCustody: async (input) => {
+          sudoCalls.push(input.fortressPath);
+          return { status: "clean", repaired: [], skips: [], vanished: [], failed: [] };
+        },
+      }),
+    ).toBe(0);
+    expect(sudoCalls).toEqual([fortressPath]);
+
+    const nonRootCalls: string[] = [];
+    expect(
+      await runDisable([], {
+        out: new CaptureStream(),
+        err: new CaptureStream(),
+        env,
+        platform: "darwin",
+        // The REAL uid, so the host-app owner-trust check passes on any
+        // runner; hard-coding 501 made this pass only where the author's uid
+        // happened to match.
+        getuid: () => Number(TEST_OPERATOR_UID),
+        hostAppCandidates: [hostAppPath],
+        hostAppInvoke: makeInvoker(responses).invoke,
+        normalizeFortressCustody: async (input) => {
+          nonRootCalls.push(input.fortressPath);
+          return { status: "clean", repaired: [], skips: [], vanished: [], failed: [] };
+        },
+      }),
+    ).toBe(0);
+    expect(nonRootCalls).toEqual([]);
+  });
+
+  it("normalizes on REFUSAL exits too, not just success (gate HIGH: the descriptor/lease writes precede them)", async () => {
+    const { fortressPath, hostAppPath, env } = await makeFixture();
+    const sudoEnv = { ...env, SUDO_UID: TEST_OPERATOR_UID, SUDO_GID: TEST_OPERATOR_GID, SUDO_USER: "operator" };
+    await mkdir(join(fortressPath, "policy", "egress"), { recursive: true });
+
+    // (a) `--agent-uid` writes the agent-origin descriptor as root, THEN the
+    // no-egress guard refuses. The chokepoint must still run.
+    const noEgressCalls: string[] = [];
+    const noEgress = await runEnable(
+      ["--fortress", fortressPath, "--no-ttl", "--agent-uid=550"],
+      {
+        out: new CaptureStream(),
+        err: new CaptureStream(),
+        env: sudoEnv,
+        platform: "darwin",
+        getuid: () => 0,
+        hostAppCandidates: [hostAppPath],
+        hostAppInvoke: makeInvoker({}).invoke,
+        daemonProbe: async () => true,
+        bootServiceReadyProbe: async () => true,
+        sysextProbe: async () => "[activated enabled]",
+        fortressOwnerUidProbe: async () => 501,
+        egressAllowRuleCountProbe: async () => 0,
+        normalizeFortressCustody: async (input) => {
+          noEgressCalls.push(input.fortressPath);
+          return { status: "clean", repaired: [], skips: [], vanished: [], failed: [] };
+        },
+      },
+    );
+    expect(noEgress).toBe(1);
+    expect(noEgressCalls).toEqual([fortressPath]);
+
+    // (b) `disable` writes the lease-status file, then the host app fails.
+    const disableCalls: string[] = [];
+    const failed = await runDisable(["--fortress", fortressPath], {
+      out: new CaptureStream(),
+      err: new CaptureStream(),
+      env: sudoEnv,
+      platform: "darwin",
+      getuid: () => 0,
+      hostAppCandidates: [hostAppPath],
+      hostAppInvoke: makeInvoker({
+        disable: { stdout: "", exitCode: 1, stderr: "host app exploded" },
+      }).invoke,
+      normalizeFortressCustody: async (input) => {
+        disableCalls.push(input.fortressPath);
+        return { status: "clean", repaired: [], skips: [], vanished: [], failed: [] };
+      },
+    });
+    expect(failed).toBe(1);
+    expect(disableCalls).toEqual([fortressPath]);
+
+    // (c) the root-owned-fortress arm refusal itself still normalizes.
+    const refusalCalls: string[] = [];
+    const refused = await runEnable(["--fortress", fortressPath, "--no-ttl"], {
+      out: new CaptureStream(),
+      err: new CaptureStream(),
+      env: sudoEnv,
+      platform: "darwin",
+      getuid: () => 0,
+      hostAppCandidates: [hostAppPath],
+      hostAppInvoke: makeInvoker({}).invoke,
+      fortressOwnerUidProbe: async () => 0,
+      normalizeFortressCustody: async (input) => {
+        refusalCalls.push(input.fortressPath);
+        return { status: "changed", repaired: ["."], skips: [], vanished: [], failed: [] };
+      },
+    });
+    expect(refused).toBe(1);
+    expect(refusalCalls).toEqual([fortressPath]);
+  });
+
+  it("a root run without a resolvable operator refuses before mutation", async () => {
+    const { fortressPath, hostAppPath, env } = await makeFixture();
+    const err = new CaptureStream();
+    const { invoke } = makeInvoker({
+      disable: { stdout: reportLine("disable", "disabled", true), exitCode: 0 },
+      status: { stdout: reportLine("status", "disabled", true), exitCode: 0 },
+    });
+    const calls: string[] = [];
+
+    const code = await runDisable(["--fortress", fortressPath], {
+      out: new CaptureStream(),
+      err,
+      // SUDO_GID missing: the fail-closed identity chokepoint refuses, even
+      // though enough SUDO context exists for host-app trust resolution.
+      env: { ...env, SUDO_UID: TEST_OPERATOR_UID },
+      platform: "darwin",
+      getuid: () => 0,
+      hostAppCandidates: [hostAppPath],
+      hostAppInvoke: invoke,
+      normalizeFortressCustody: async (input) => {
+        calls.push(input.fortressPath);
+        return { status: "clean", repaired: [], skips: [], vanished: [], failed: [] };
+      },
+    });
+
+    expect(code).toBe(1);
+    expect(calls).toEqual([]);
+    expect(err.text()).toContain("Cannot resolve the non-root operator identity");
   });
 });

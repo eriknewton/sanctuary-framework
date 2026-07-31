@@ -5,7 +5,7 @@ import {
 } from "node:child_process";
 import { createConnection } from "node:net";
 import { createHash, randomBytes as nodeRandomBytes } from "node:crypto";
-import { chmod, mkdir, readFile, readdir, stat, unlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, readFile, readdir, stat, unlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { Writable } from "node:stream";
@@ -23,6 +23,7 @@ import { resolveStoragePath } from "../paths.js";
 import { getSanctuaryVersion } from "../version.js";
 import { getOrCreatePassphrase } from "../wrap/passphrase.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
+import { writeFileCustody } from "../storage/custody-fs.js";
 import {
   AuditLog,
   AuditIntegrityError,
@@ -63,6 +64,12 @@ import { validateAgentOrigin } from "../castle-wall/allowlist/agent-origin.js";
 import { validateRule, type AllowlistRule } from "../castle-wall/allowlist/schema.js";
 import { HABEAS_RULE_ID_PREFIX } from "../castle-wall/allowlist/habeas-port.js";
 import { EGRESS_PROVISION_REFUSED_AUDIT_OP } from "../castle-wall/provision/egress.js";
+import {
+  normalizeFortressCustody,
+  resolveSudoIdentityDecision,
+  type NormalizeFortressCustodyInput,
+  type NormalizeFortressCustodyOutcome,
+} from "../castle-wall/provision/fortress-custody.js";
 import {
   loadFortressProducerKey,
   loadPinnedProducerKeyB64url,
@@ -171,6 +178,27 @@ export interface CastleWallCommandContext {
   sysextProbe?: () => Promise<SysextState>;
   /** Override the boot-token custody path (F1 safe-mode; tests). */
   bootTokenPath?: string;
+  /**
+   * Override the fortress-dir stat used by the safe-mode daemon to derive the
+   * socket re-own uid + create-with-fchown owner (tests simulate a root-owned
+   * fortress without root).
+   */
+  fortressStat?: (
+    path: string,
+  ) => Promise<{ uid: number; gid: number; isSymbolicLink?: () => boolean }>;
+  /**
+   * Override the fortress-owner probe behind the `enable` root-owned-fortress
+   * refusal (fortress-ownership spec 2026-07-30 §4(a2)(2); tests). Resolves
+   * the fortress dir's owner uid, or undefined when it cannot be statted.
+   */
+  fortressOwnerUidProbe?: (fortressPath: string) => Promise<number | undefined>;
+  /**
+   * Override the end-of-flow custody-normalize chokepoint (tests). Defaults
+   * to {@link normalizeFortressCustody}.
+   */
+  normalizeFortressCustody?: (
+    input: NormalizeFortressCustodyInput,
+  ) => Promise<NormalizeFortressCustodyOutcome>;
   /**
    * Override the root-owned global pin path threaded into the safe-mode daemon
    * cross-check (F1 safe-mode; tests point it at a temp path).
@@ -367,14 +395,29 @@ function formatDeadManLeaseStatus(
   );
 }
 
-function formatEnforcementAvailabilityStatus(
+/**
+ * Matches an availability reason whose socket connect died at permissions
+ * (EACCES/EPERM), i.e. THIS ACCOUNT could not reach the socket path at all.
+ * That is querier blindness, not wall state; the render appends a
+ * plain-English line so a human cannot misread it as an enforcement verdict
+ * (fortress-ownership spec 2026-07-30 §4(a2)(3); the per-cause reason code is
+ * kept verbatim, this only adds to it).
+ */
+const AVAILABILITY_CONNECT_PERMISSION_RE = /connect\s+E(?:ACCES|PERM)\b/;
+
+export function formatEnforcementAvailabilityStatus(
   availability: ResolvedEnforcementAvailability,
 ): string {
   const observed = availability.observed_at ?? "none";
-  return (
+  let text =
     `Enforcement availability: ${availability.status} (${availability.reason}; ` +
-    `observed=${observed}; active_connections=${availability.active_connection_count})\n`
-  );
+    `observed=${observed}; active_connections=${availability.active_connection_count})\n`;
+  if (AVAILABILITY_CONNECT_PERMISSION_RE.test(availability.reason)) {
+    text +=
+      "Note: this account cannot reach the fortress socket, so this surface is blind, not the wall. " +
+      "If the fortress is root-owned, repair custody: sudo sanctuary castle-wall repair-custody\n";
+  }
+  return text;
 }
 
 async function readEnforcementAvailabilityForStatus(
@@ -2067,12 +2110,67 @@ export async function runSafeModeDaemon(
     return 1;
   }
 
+  // #450 item 3: safe mode runs as root, so the socket it binds is root-owned
+  // and the operator CLI dead-man lever (`disable`) cannot reach it. Re-own the
+  // socket to the FORTRESS OWNER (= operator). Derive the uid from the fortress
+  // dir owner rather than trust SUDO_USER/env, so it tracks whoever actually
+  // owns the fortress. Fail-soft: if the fortress is unreadable we skip the
+  // re-own (the daemon still comes up + enforces; only the programmatic lever is
+  // degraded, with the GUI toggle as backstop) rather than refuse to start.
+  // Resolved BEFORE the audit storage opens so the same owner drives
+  // create-with-fchown for the fortress-internal audit segments this ROOT
+  // daemon writes (fortress-ownership spec 2026-07-30, open question 5).
+  let socketOwnerUid: number | undefined;
+  let fortressOwnerGid: number | undefined;
+  try {
+    // lstat, NOT stat (2026-07-31 gate round 3): a SYMLINKED fortress would
+    // otherwise report its target's owner, and the create-with-fchown writes
+    // below would hand files outside the fortress to that uid.
+    const fortressStat = await (ctx.fortressStat ?? lstat)(storagePath);
+    if (
+      typeof (fortressStat as { isSymbolicLink?: () => boolean }).isSymbolicLink === "function" &&
+      (fortressStat as { isSymbolicLink: () => boolean }).isSymbolicLink()
+    ) {
+      throw new Error(`fortress ${storagePath} is a symlink`);
+    }
+    socketOwnerUid = fortressStat.uid;
+    fortressOwnerGid = fortressStat.gid;
+  } catch (error) {
+    write(
+      err,
+      `Warning: could not resolve the fortress owner for ${storagePath} (${error instanceof Error ? error.message : String(error)}); the operator may be unable to reach the safe-mode socket. Disarm via System Settings VPN & Filters if needed.\n`,
+    );
+  }
+  if (socketOwnerUid === 0 && (ctx.getuid ?? process.getuid?.bind(process))?.() === 0) {
+    // Fortress-ownership spec 2026-07-30 §4(a2)(3): a root-owned fortress makes
+    // the socket re-own a no-op BY CONSTRUCTION (we would "re-own" the socket to
+    // root). That state is exactly as blind as a failed stat, so it gets the
+    // same loud operator-facing warning instead of silence.
+    write(
+      err,
+      `Warning: the fortress at ${storagePath} is owned by root (uid 0), so the safe-mode socket stays root-owned and the operator may be unable to reach it (including the 'disable' dead-man lever). Run 'sudo sanctuary castle-wall repair-custody' to hand the fortress back to the operator. Disarm via System Settings VPN & Filters if needed.\n`,
+    );
+  }
+  // 2026-07-31 re-gate MED: gid 0 is refused alongside uid 0, so a `501:0`
+  // fortress never has root-created files chowned to group wheel.
+  const fortressCreateOwner =
+    socketOwnerUid !== undefined &&
+    socketOwnerUid !== 0 &&
+    fortressOwnerGid !== undefined &&
+    fortressOwnerGid !== 0 &&
+    (ctx.getuid ?? process.getuid?.bind(process))?.() === 0
+      ? { uid: socketOwnerUid, gid: fortressOwnerGid }
+      : undefined;
+
   // 2. Derive the safe-mode audit key and open the boot-token-keyed audit
   //    segment (separate from the master-key audit log, which is unreadable
-  //    pre-login by design).
+  //    pre-login by design). Create-with-fchown: audit segments this ROOT
+  //    daemon creates inside the operator-owned fortress are handed to the
+  //    fortress owner at creation, so operator readability never erodes.
   const safeModeAuditKey = deriveSafeModeAuditKey(tokenRead.token);
   const auditStorage = new FilesystemStorage(
     safeModeAuditStoragePath(storagePath, tokenRead.token),
+    fortressCreateOwner !== undefined ? { owner: fortressCreateOwner } : {},
   );
   const auditLog = new AuditLog(auditStorage, safeModeAuditKey);
 
@@ -2095,23 +2193,6 @@ export async function runSafeModeDaemon(
       );
       return startMacOSCastleWallDaemon(input);
     });
-
-  // #450 item 3: safe mode runs as root, so the socket it binds is root-owned
-  // and the operator CLI dead-man lever (`disable`) cannot reach it. Re-own the
-  // socket to the FORTRESS OWNER (= operator). Derive the uid from the fortress
-  // dir owner rather than trust SUDO_USER/env, so it tracks whoever actually
-  // owns the fortress. Fail-soft: if the fortress is unreadable we skip the
-  // re-own (the daemon still comes up + enforces; only the programmatic lever is
-  // degraded, with the GUI toggle as backstop) rather than refuse to start.
-  let socketOwnerUid: number | undefined;
-  try {
-    socketOwnerUid = (await stat(storagePath)).uid;
-  } catch (error) {
-    write(
-      err,
-      `Warning: could not resolve the fortress owner for ${storagePath} (${error instanceof Error ? error.message : String(error)}); the operator may be unable to reach the safe-mode socket. Disarm via System Settings VPN & Filters if needed.\n`,
-    );
-  }
 
   let daemon: { socketPath: string; stop: () => Promise<void> };
   try {
@@ -3177,6 +3258,7 @@ function parseUidFlag(value: string): number | null {
 async function writeAgentOriginDescriptor(
   fortressPath: string,
   candidate: Record<string, unknown>,
+  owner?: { uid: number; gid: number },
 ): Promise<
   | { ok: true; validated: ReturnType<typeof validateAgentOrigin> & object; path: string }
   | { ok: false; error: string }
@@ -3192,12 +3274,10 @@ async function writeAgentOriginDescriptor(
 
   const originPath = agentOriginDescriptorPath(fortressPath);
   try {
-    await mkdir(join(fortressPath, "policy", "egress"), {
-      recursive: true,
-      mode: 0o700,
-    });
-    await writeFile(originPath, JSON.stringify(validated, null, 2) + "\n", {
+    await writeFileCustody(originPath, JSON.stringify(validated, null, 2) + "\n", {
       mode: 0o600,
+      parentMode: 0o700,
+      ...(owner !== undefined ? { owner, ownerBase: fortressPath } : {}),
     });
     return { ok: true, validated, path: originPath };
   } catch (error) {
@@ -3770,10 +3850,17 @@ async function writeLeaseStatusBestEffort(
   lease: LeaseStatusFile,
 ): Promise<void> {
   try {
-    await writeFile(leaseStatusPath(fortressPath), JSON.stringify(lease, null, 2) + "\n", {
-      mode: 0o600,
-    });
-    await chmod(leaseStatusPath(fortressPath), 0o600);
+    // SECURITY (2026-07-31 gate round 3): this used a plain `writeFile` +
+    // PATHNAME `chmod`. Under `sudo enable|disable` that runs AS ROOT, so a
+    // same-uid actor who pre-created `castle-wall-lease.json` as a symlink
+    // made root write through it and chmod the outside target. `writeFileCustody`
+    // creates an O_EXCL|O_NOFOLLOW temp file, chmods the DESCRIPTOR, and
+    // atomically renames, so no pathname write or chmod ever follows a link.
+    await writeFileCustody(
+      leaseStatusPath(fortressPath),
+      JSON.stringify(lease, null, 2) + "\n",
+      { mode: 0o600, createParent: false },
+    );
   } catch {
     // Advisory-only status surface; enforcement rides authenticated IPC.
   }
@@ -3877,7 +3964,108 @@ async function defaultSysextProbe(
   }
 }
 
+/**
+ * Default probe behind the `enable` root-owned-fortress refusal: the fortress
+ * dir's owner uid, or undefined when the dir cannot be statted (an absent /
+ * unreadable fortress is handled by the sibling guards, never refused here).
+ */
+async function defaultFortressOwnerUidProbe(
+  fortressPath: string,
+): Promise<number | undefined> {
+  try {
+    return (await stat(fortressPath)).uid;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Custody-normalize chokepoint for privileged CLI verbs (fortress-ownership
+ * spec 2026-07-30 §4(a2)(1)): when a verb ran with euid 0 (sudo) and touched
+ * the fortress (lease status writes, arm audit entries), hand any root-owned
+ * entries back to the resolved operator before returning. No-op for non-root
+ * runs. Loud (never silent) when root ran without a resolvable operator.
+ */
+async function normalizeFortressCustodyAfterPrivilegedVerb(
+  fortressPath: string,
+  env: NodeJS.ProcessEnv,
+  getuid: (() => number) | undefined,
+  err: Writable,
+  override?: (
+    input: NormalizeFortressCustodyInput,
+  ) => Promise<NormalizeFortressCustodyOutcome>,
+): Promise<void> {
+  if (getuid?.() !== 0) return;
+  const identity = resolveSudoIdentityDecision(env);
+  if (identity === undefined) {
+    write(
+      err,
+      "Warning: this privileged run could not resolve the operator identity (SUDO_UID/SUDO_GID), so fortress custody was not normalized. If operator surfaces report EACCES, run: sudo sanctuary castle-wall repair-custody\n",
+    );
+    return;
+  }
+  const normalize = override ?? normalizeFortressCustody;
+  await normalize({
+    fortressPath,
+    operator: { uid: identity.uid, gid: identity.gid },
+    log: (line) => write(err, `${line}\n`),
+  });
+}
+
+/**
+ * Arm/disarm with the custody-normalize chokepoint on EVERY root exit path
+ * (2026-07-31 gate HIGH). The inner flow writes into the fortress well before
+ * several refusal returns -- `--agent-uid` writes the agent-origin descriptor
+ * before the no-egress guard can refuse, and `disable` writes the lease-status
+ * file before the host-app failure branches -- so hanging the normalize off
+ * the two success returns left root-owned residue on those exits. Wrapping
+ * makes reachability structural: no future return statement inside can skip it.
+ */
 async function runArmDisarm(
+  action: "enable" | "disable",
+  argv: string[],
+  ctx: CastleWallCommandContext,
+): Promise<number> {
+  const wrapperEnv = ctx.env ?? process.env;
+  const wrapperErr = ctx.err ?? process.stderr;
+  const wrapperGetuid = ctx.getuid ?? process.getuid?.bind(process);
+  if (wrapperGetuid?.() === 0 && resolveSudoIdentityDecision(wrapperEnv) === undefined) {
+    write(
+      wrapperErr,
+      `Cannot resolve the non-root operator identity (SUDO_UID/SUDO_GID). Refusing to run castle-wall ${action} as root because fortress custody could not be normalized afterward. Re-run from a normal sudo invocation, not a raw root shell.\n`,
+    );
+    return 1;
+  }
+  try {
+    return await runArmDisarmInner(action, argv, ctx);
+  } finally {
+    if (wrapperGetuid?.() === 0) {
+      // Resolve LAZILY and only as root: a non-darwin or unresolvable-fortress
+      // run touched nothing, and fortress resolution itself can refuse (the
+      // hermetic-path guard), which must never turn into a thrown wrapper.
+      let wrapperFortress: string | undefined;
+      try {
+        wrapperFortress = resolveFortressArg(
+          parseCastleWallArgs(argv).fortress,
+          wrapperEnv,
+        );
+      } catch {
+        wrapperFortress = undefined;
+      }
+      if (wrapperFortress !== undefined) {
+        await normalizeFortressCustodyAfterPrivilegedVerb(
+          wrapperFortress,
+          wrapperEnv,
+          wrapperGetuid,
+          wrapperErr,
+          ctx.normalizeFortressCustody,
+        );
+      }
+    }
+  }
+}
+
+async function runArmDisarmInner(
   action: "enable" | "disable",
   argv: string[],
   ctx: CastleWallCommandContext,
@@ -3886,6 +4074,7 @@ async function runArmDisarm(
   const err = ctx.err ?? process.stderr;
   const env = ctx.env ?? process.env;
   const platform = ctx.platform ?? process.platform;
+  const getuid = ctx.getuid ?? process.getuid?.bind(process);
 
   if (platform !== "darwin") {
     write(err, `castle-wall ${action} is macOS-only.\n`);
@@ -3898,6 +4087,31 @@ async function runArmDisarm(
     platform,
     fortressPath,
   }).path;
+
+  if (action === "enable") {
+    // Root-owned-fortress refusal (fortress-ownership spec 2026-07-30
+    // §4(a2)(2)): a root-owned fortress means the operator CLI cannot reach
+    // castle.sock, so the `disable` dead-man lever PROVABLY cannot work.
+    // Arming into that state is arming without an exit; "if the approval
+    // channel is unreachable, deny" is the house rule. This is a hard refuse
+    // (not a warning) and deliberately NOT overridable by --force: there is
+    // no out-of-band story in which a root-owned fortress is intended, and
+    // the remedy is one command. Disable never gates here: it stays the
+    // unconditional dead-man lever.
+    const ownerProbe = ctx.fortressOwnerUidProbe ?? defaultFortressOwnerUidProbe;
+    if ((await ownerProbe(fortressPath)) === 0) {
+      write(
+        err,
+        `Refusing to arm: the fortress at ${fortressPath} is owned by root (uid 0).\n` +
+          "The operator account cannot traverse a root-owned fortress, so the\n" +
+          "'sanctuary castle-wall disable' dead-man lever cannot reach castle.sock:\n" +
+          "arming now would leave you no operator exit.\n" +
+          "Repair custody first:  sudo sanctuary castle-wall repair-custody\n" +
+          "Then re-run enable. (--force does not override this guard.)\n",
+      );
+      return 1;
+    }
+  }
 
   if (action === "enable" && !parsed.force) {
     // Brick-condition gate: filter on + no policy daemon = deny-all with no
@@ -4030,7 +4244,14 @@ async function runArmDisarm(
       agent_uid: agentUid,
       system_uid_allow_ceiling: ceiling,
     };
-    const result = await writeAgentOriginDescriptor(fortressPath, candidate);
+    const sudoIdentity = resolveSudoIdentityDecision(env);
+    const result = await writeAgentOriginDescriptor(
+      fortressPath,
+      candidate,
+      getuid?.() === 0 && sudoIdentity !== undefined
+        ? { uid: sudoIdentity.uid, gid: sudoIdentity.gid }
+        : undefined,
+    );
     if (!result.ok) {
       write(
         err,
@@ -4307,6 +4528,8 @@ async function runArmDisarm(
       confirmed ? "corroborated_off" : "save_accepted_inconclusive",
     );
   }
+  // The custody-normalize chokepoint runs in the runArmDisarm wrapper, so it
+  // covers this success path AND every refusal return above it.
   return 0;
 }
 

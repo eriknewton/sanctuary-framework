@@ -28,6 +28,9 @@ import {
 import { AuditLog } from "../../src/operational/audit-log.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
 
+const TEST_OPERATOR_UID = String(process.getuid?.() ?? 501);
+const TEST_OPERATOR_GID = String(process.getgid?.() ?? 20);
+
 class CaptureStream extends Writable {
   chunks: string[] = [];
   override _write(
@@ -586,15 +589,22 @@ describe("castle-wall boot service (F1 Option C)", () => {
       const tokenPath = join(await makeTemp("f1-tok-"), "boot-token.bin");
       const out = new CaptureStream();
       const fake = makeFakeExec({ fortress });
+      const normalizeCalls: string[] = [];
       const code = await runProvisionBootToken(["--fortress", fortress], {
         out,
+        env: { SUDO_USER: "operator", SUDO_UID: TEST_OPERATOR_UID, SUDO_GID: TEST_OPERATOR_GID },
         platform: "darwin",
         getuid: () => 0,
         execFileFn: fake.execFileFn,
         bootTokenPath: tokenPath,
+        normalizeFortressCustody: async (input: { fortressPath: string }) => {
+          normalizeCalls.push(input.fortressPath);
+          return { status: "clean", repaired: [], skips: [], vanished: [], failed: [] };
+        },
       });
       expect(code).toBe(0);
       expect(out.text()).toContain("Boot token provisioned");
+      expect(normalizeCalls).toEqual([fortress]);
 
       const info = await stat(tokenPath);
       expect(info.mode & 0o777).toBe(0o600);
@@ -622,6 +632,31 @@ describe("castle-wall boot service (F1 Option C)", () => {
       }
     });
 
+    it("refuses an audited root provision when the operator identity is unresolved", async () => {
+      const fortress = await makeTemp("f1-prov-unresolved-");
+      const tokenPath = join(await makeTemp("f1-tok-unresolved-"), "boot-token.bin");
+      const err = new CaptureStream();
+      const normalizeCalls: string[] = [];
+
+      const code = await runProvisionBootToken(["--fortress", fortress], {
+        err,
+        env: {},
+        platform: "darwin",
+        getuid: () => 0,
+        execFileFn: makeFakeExec({ fortress }).execFileFn,
+        bootTokenPath: tokenPath,
+        normalizeFortressCustody: async (input: { fortressPath: string }) => {
+          normalizeCalls.push(input.fortressPath);
+          return { status: "clean", repaired: [], skips: [], vanished: [], failed: [] };
+        },
+      });
+
+      expect(code).toBe(1);
+      expect(err.text()).toContain("Cannot resolve the non-root operator identity");
+      await expect(readFile(tokenPath)).rejects.toThrow();
+      expect(normalizeCalls).toEqual([]);
+    });
+
     it("is idempotent: a second run keeps the existing token unless --rotate", async () => {
       const fortress = await makeTemp("f1-prov2-");
       const tokenPath = join(await makeTemp("f1-tok2-"), "boot-token.bin");
@@ -631,7 +666,7 @@ describe("castle-wall boot service (F1 Option C)", () => {
         getuid: () => 0,
         execFileFn: makeFakeExec().execFileFn,
         bootTokenPath: tokenPath,
-        env: {},
+        env: { SUDO_USER: "operator", SUDO_UID: TEST_OPERATOR_UID, SUDO_GID: TEST_OPERATOR_GID },
       };
       expect(await runProvisionBootToken(["--fortress", fortress], ctx)).toBe(0);
       const first = await readFile(tokenPath);
@@ -676,7 +711,7 @@ describe("castle-wall boot service (F1 Option C)", () => {
       const ctx: CastleWallBootContext = {
         out,
         err,
-        env: { SUDO_USER: "operator" },
+        env: { SUDO_USER: "operator", SUDO_UID: TEST_OPERATOR_UID, SUDO_GID: TEST_OPERATOR_GID },
         platform: "darwin",
         getuid: () => 0,
         execFileFn: fake.execFileFn,
@@ -852,6 +887,109 @@ describe("castle-wall boot service (F1 Option C)", () => {
       ).length;
       expect(bootstrapsAfterSecond).toBe(bootstrapsAfterFirst);
       expect(f.out.text()).toContain("already installed and running");
+    });
+
+    it("runs the custody-normalize chokepoint on success with the resolved operator (spec 2026-07-30)", async () => {
+      const f = await makeInstallFixture();
+      const normalizeCalls: { fortressPath: string; operator: { uid: number; gid: number } }[] = [];
+      const ctx = {
+        ...f.ctx,
+        env: { SUDO_USER: "operator", SUDO_UID: TEST_OPERATOR_UID, SUDO_GID: TEST_OPERATOR_GID },
+        normalizeFortressCustody: async (input: { fortressPath: string; operator: { uid: number; gid: number } }) => {
+          normalizeCalls.push({ fortressPath: input.fortressPath, operator: input.operator });
+          return {
+            status: "clean" as const,
+            repaired: [],
+            skips: [],
+            vanished: [],
+            failed: [],
+          };
+        },
+      };
+      expect(await runInstallBoot(f.argv, ctx)).toBe(0);
+      expect(normalizeCalls).toEqual([
+        { fortressPath: f.fortress, operator: { uid: Number(TEST_OPERATOR_UID), gid: Number(TEST_OPERATOR_GID) } },
+      ]);
+
+      // The idempotent already-installed shortcut ALSO normalizes: the log-dir
+      // mkdir above it touches the fortress on every run.
+      expect(await runInstallBoot(f.argv, ctx)).toBe(0);
+      expect(f.out.text()).toContain("already installed and running");
+      expect(normalizeCalls).toHaveLength(2);
+    });
+
+    it("does not touch a symlinked fortress log dir; boot logs go to /var/log", async () => {
+      const f = await makeInstallFixture();
+      const outside = await makeTemp("f1-outside-");
+      // The attack: a same-uid actor plants <fortress>/logs as a symlink.
+      // install-boot must not mkdir/chown through it at all.
+      await symlink(outside, join(f.fortress, "logs"));
+
+      const code = await runInstallBoot(f.argv, f.ctx);
+
+      expect(code).toBe(0);
+      expect(await readFile(f.plistPath, "utf8")).toContain("/var/log/castle-wall-daemon.log");
+      const outsideStat = await stat(outside);
+      expect(outsideStat.uid).toBe(process.getuid?.() ?? outsideStat.uid);
+    });
+
+    it("normalizes on FAILURE exits too, not just success (gate HIGH: the log-dir mkdir precedes them)", async () => {
+      const f = await makeInstallFixture();
+      const normalizeCalls: string[] = [];
+      // Bootstrap is accepted but the unit never stays running: a failure
+      // return AFTER the log-dir mkdir may have created the fortress
+      // top-level dir root-owned, so the chokepoint must still run.
+      let bootstrapped = false;
+      const flappingExec = (cmd: string, args: string[]): ExecFileResult => {
+        if (cmd === "launchctl" && args[0] === "bootstrap") bootstrapped = true;
+        if (bootstrapped && cmd === "launchctl" && args[0] === "print") {
+          return { code: 0, stdout: "\tstate = not running\n", stderr: "" };
+        }
+        return f.fake.execFileFn(cmd, args);
+      };
+      const code = await runInstallBoot(f.argv, {
+        ...f.ctx,
+        env: { SUDO_USER: "operator", SUDO_UID: TEST_OPERATOR_UID, SUDO_GID: TEST_OPERATOR_GID },
+        execFileFn: flappingExec,
+        normalizeFortressCustody: async (input: { fortressPath: string }) => {
+          normalizeCalls.push(input.fortressPath);
+          return {
+            status: "clean" as const,
+            repaired: [],
+            skips: [],
+            vanished: [],
+            failed: [],
+          };
+        },
+      });
+      expect(code).toBe(1);
+      expect(f.err.text()).toContain("did not stay running");
+      expect(normalizeCalls).toEqual([f.fortress]);
+    });
+
+    it("refuses before mutation when root runs without a resolvable operator", async () => {
+      const f = await makeInstallFixture();
+      const normalizeCalls: string[] = [];
+      const ctx = {
+        ...f.ctx,
+        // SUDO_USER present (install-boot's own operator-name requirement) but
+        // no SUDO_UID/SUDO_GID: the fail-closed identity chokepoint refuses.
+        env: { SUDO_USER: "operator" },
+        normalizeFortressCustody: async (input: { fortressPath: string }) => {
+          normalizeCalls.push(input.fortressPath);
+          return {
+            status: "clean" as const,
+            repaired: [],
+            skips: [],
+            vanished: [],
+            failed: [],
+          };
+        },
+      };
+      expect(await runInstallBoot(f.argv, ctx)).toBe(1);
+      expect(normalizeCalls).toEqual([]);
+      expect(f.err.text()).toContain("Cannot resolve the non-root operator identity");
+      expect(f.fake.calls.some((call) => call.cmd === "launchctl")).toBe(false);
     });
 
     it("repairs a disabled launchd override instead of taking the idempotent shortcut", async () => {

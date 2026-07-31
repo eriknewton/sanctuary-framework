@@ -62,7 +62,7 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { lstat, mkdir, rm, stat } from "node:fs/promises";
+import { lstat, rm, stat } from "node:fs/promises";
 import { createConnection } from "node:net";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { execPath } from "node:process";
@@ -82,6 +82,12 @@ import {
   safeModeAuditStoragePath,
 } from "../castle-wall/boot/boot-token.js";
 import { resolveCastleWallSocketPath } from "../castle-wall/runtime/socket-path.js";
+import {
+  normalizeFortressCustody,
+  resolveSudoIdentityDecision,
+  type NormalizeFortressCustodyInput,
+  type NormalizeFortressCustodyOutcome,
+} from "../castle-wall/provision/fortress-custody.js";
 
 export const CASTLE_WALL_BOOT_LABEL = "ai.sanctuaryprotocol.castle-wall.daemon";
 export const CASTLE_WALL_BOOT_PLIST_PATH = `/Library/LaunchDaemons/${CASTLE_WALL_BOOT_LABEL}.plist`;
@@ -89,6 +95,7 @@ export const LAUNCHCTL_TIMEOUT_MS = 15_000;
 export const LAUNCHCTL_KILL_SIGNAL = "SIGKILL";
 const CASTLE_GLOBAL_PINNED_PUBKEY_PATH =
   "/Library/Application Support/Sanctuary/castle-pinned-pubkey.bin";
+const CASTLE_WALL_BOOT_LOG_DIR = "/var/log";
 const SAFE_NAME_RE = /^[a-zA-Z0-9._-]+$/;
 /**
  * Env names that must never be rendered into a LaunchDaemon plist. The plist
@@ -135,6 +142,13 @@ export interface CastleWallBootContext {
    * stale-socket guard does not depend on local Unix socket permissions.
    */
   socketHasLiveListenerFn?: (socketPath: string) => Promise<boolean>;
+  /**
+   * Override the end-of-flow custody-normalize chokepoint (tests). Defaults
+   * to {@link normalizeFortressCustody}.
+   */
+  normalizeFortressCustody?: (
+    input: NormalizeFortressCustodyInput,
+  ) => Promise<NormalizeFortressCustodyOutcome>;
 }
 
 function write(stream: Writable, text: string): void {
@@ -952,36 +966,57 @@ export async function runProvisionBootToken(
     if (home) fortressPath = join(home, ".sanctuary");
   }
 
-  let result;
-  try {
-    result = await ensureBootToken(bootTokenPath, parsed.rotate, execFileFn);
-  } catch (error) {
-    write(err, `Error writing boot token: ${error instanceof Error ? error.message : String(error)}\n`);
+  const normalizeFortressPath =
+    fortressPath !== undefined && isAbsolute(fortressPath) ? fortressPath : undefined;
+  if (normalizeFortressPath !== undefined && resolveSudoIdentityDecision(env) === undefined) {
+    write(
+      err,
+      "Cannot resolve the non-root operator identity (SUDO_UID/SUDO_GID). Refusing to provision a boot token with fortress audit writes that cannot normalize custody. Re-run from a normal sudo invocation, not a raw root shell.\n",
+    );
     return 1;
   }
 
-  if (!result.minted) {
-    write(out, `Boot token already present at ${bootTokenPath} (root-owned 0600); nothing to do. Pass --rotate to replace it.\n`);
-    return 0;
-  }
-
-  if (fortressPath && isAbsolute(fortressPath)) {
+  try {
+    let result;
     try {
-      await auditBootTokenEvent(fortressPath, result.token, "boot_token_provisioned", {
-        source: "castle-wall-provision-boot-token",
-        token_path: bootTokenPath,
-        custody: "root-owned 0600, software-protected (FileVault at rest); NOT the fortress master key",
-        rotated: parsed.rotate,
-      });
+      result = await ensureBootToken(bootTokenPath, parsed.rotate, execFileFn);
     } catch (error) {
-      write(err, `Boot token written to ${bootTokenPath}, but the boot-audit append failed: ${error instanceof Error ? error.message : String(error)}\n`);
+      write(err, `Error writing boot token: ${error instanceof Error ? error.message : String(error)}\n`);
       return 1;
     }
-  }
 
-  write(out, `Boot token provisioned: ${bootTokenPath} (root-owned, mode 0600).\n`);
-  write(out, "This is the anti-brick credential only: it brings the daemon up in SAFE MODE at boot. It is NOT the fortress passphrase and cannot decrypt fortress state.\n");
-  return 0;
+    if (!result.minted) {
+      write(out, `Boot token already present at ${bootTokenPath} (root-owned 0600); nothing to do. Pass --rotate to replace it.\n`);
+      return 0;
+    }
+
+    if (normalizeFortressPath !== undefined) {
+      try {
+        await auditBootTokenEvent(normalizeFortressPath, result.token, "boot_token_provisioned", {
+          source: "castle-wall-provision-boot-token",
+          token_path: bootTokenPath,
+          custody: "root-owned 0600, software-protected (FileVault at rest); NOT the fortress master key",
+          rotated: parsed.rotate,
+        });
+      } catch (error) {
+        write(err, `Boot token written to ${bootTokenPath}, but the boot-audit append failed: ${error instanceof Error ? error.message : String(error)}\n`);
+        return 1;
+      }
+    }
+
+    write(out, `Boot token provisioned: ${bootTokenPath} (root-owned, mode 0600).\n`);
+    write(out, "This is the anti-brick credential only: it brings the daemon up in SAFE MODE at boot. It is NOT the fortress passphrase and cannot decrypt fortress state.\n");
+    return 0;
+  } finally {
+    if (normalizeFortressPath !== undefined) {
+      await normalizeInstallBootFortressCustody(
+        normalizeFortressPath,
+        env,
+        err,
+        ctx.normalizeFortressCustody,
+      );
+    }
+  }
 }
 
 /**
@@ -1034,7 +1069,108 @@ async function awaitStableServicePid(
   return distinctLivePids.size === 1 ? last : null;
 }
 
+/**
+ * Custody-normalize chokepoint for root boot flows that touch the operator
+ * fortress (fortress-ownership spec 2026-07-30 §4(a2)(1)). Hand every
+ * root-owned entry back to the resolved operator before returning. Loud
+ * (never silent) when the operator is unresolvable.
+ */
+async function normalizeInstallBootFortressCustody(
+  fortressPath: string,
+  env: NodeJS.ProcessEnv,
+  err: Writable,
+  override?: (
+    input: NormalizeFortressCustodyInput,
+  ) => Promise<NormalizeFortressCustodyOutcome>,
+): Promise<void> {
+  const identity = resolveSudoIdentityDecision(env);
+  if (identity === undefined) {
+    write(
+      err,
+      "Warning: could not resolve the operator identity (SUDO_UID/SUDO_GID), so fortress custody was not normalized. If operator surfaces report EACCES, run: sudo sanctuary castle-wall repair-custody\n",
+    );
+    return;
+  }
+  const normalize = override ?? normalizeFortressCustody;
+  await normalize({
+    fortressPath,
+    operator: { uid: identity.uid, gid: identity.gid },
+    log: (line) => write(err, `${line}\n`),
+  });
+}
+
+/**
+ * install-boot with the custody-normalize chokepoint on EVERY root exit path
+ * (2026-07-31 gate HIGH). The log-dir `mkdir { recursive: true }` can CREATE
+ * the fortress top-level dir root-owned (the Mini2 root cause), and the
+ * launchd enable/bootout/bootstrap/certify sequence after it has many failure
+ * returns; hanging the normalize off the success returns alone left
+ * root-owned residue on all of them. Wrapping makes reachability structural.
+ * The wrapper resolves the fortress the same way the inner flow does and
+ * no-ops when it cannot (a pre-root/pre-arg-validation exit touched nothing).
+ */
 export async function runInstallBoot(
+  argv: string[] = [],
+  ctx: CastleWallBootContext = {},
+): Promise<number> {
+  const env = ctx.env ?? process.env;
+  const err = ctx.err ?? process.stderr;
+  const getuid = ctx.getuid ?? process.getuid?.bind(process);
+  const parsed = parseBootArgs(argv);
+  if (
+    (ctx.platform ?? process.platform) === "darwin" &&
+    getuid?.() === 0 &&
+    (parsed.user !== undefined || env.SUDO_USER !== undefined) &&
+    resolveSudoIdentityDecision(env) === undefined
+  ) {
+    write(
+      err,
+      "Cannot resolve the non-root operator identity (SUDO_UID/SUDO_GID). Refusing to install a root boot service that cannot normalize fortress custody. Re-run from a normal sudo invocation, not a raw root shell.\n",
+    );
+    return 1;
+  }
+  try {
+    return await runInstallBootInner(argv, ctx);
+  } finally {
+    if (getuid?.() === 0) {
+      const fortressPath = resolveInstallBootFortressPath(argv, ctx, env);
+      if (fortressPath !== undefined) {
+        await normalizeInstallBootFortressCustody(
+          fortressPath,
+          env,
+          err,
+          ctx.normalizeFortressCustody,
+        );
+      }
+    }
+  }
+}
+
+/**
+ * Resolve the fortress the install-boot run targets, for the wrapper's
+ * chokepoint. Mirrors the inner flow's resolution (flag, then env, then the
+ * operator's home via dscl) and returns undefined when it cannot be resolved
+ * without guessing, in which case nothing was created to normalize.
+ */
+function resolveInstallBootFortressPath(
+  argv: string[],
+  ctx: CastleWallBootContext,
+  env: NodeJS.ProcessEnv,
+): string | undefined {
+  const parsed = parseBootArgs(argv);
+  let fortressPath = parsed.fortress ?? env.SANCTUARY_STORAGE_PATH;
+  if (!fortressPath) {
+    const user = parsed.user ?? env.SUDO_USER;
+    if (!user || !SAFE_NAME_RE.test(user)) return undefined;
+    const home = deriveOperatorHome(user, ctx.execFileFn ?? defaultExecFile);
+    if (!home) return undefined;
+    fortressPath = join(home, ".sanctuary");
+  }
+  if (!isAbsolute(fortressPath)) return undefined;
+  return resolve(fortressPath);
+}
+
+async function runInstallBootInner(
   argv: string[] = [],
   ctx: CastleWallBootContext = {},
 ): Promise<number> {
@@ -1141,11 +1277,13 @@ export async function runInstallBoot(
 
   // ── Render + install (idempotent).
   let plist: string;
+  const logDir = CASTLE_WALL_BOOT_LOG_DIR;
   try {
     plist = renderBootLaunchDaemonPlist({
       programArguments,
       fortressPath,
       signerClientPath: signerClient,
+      logDir,
       // Put the running interpreter's dir on the daemon PATH so a
       // `#!/usr/bin/env node` shim resolves node under launchd's minimal PATH.
       nodeBinDir: dirname(execPath),
@@ -1162,19 +1300,10 @@ export async function runInstallBoot(
     return 1;
   }
 
-  // Log dir must exist before launchd starts the job; chown to the operator so
-  // they can read the root daemon's logs.
-  const logDir = join(fortressPath, "logs");
-  try {
-    await mkdir(logDir, { recursive: true, mode: 0o755 });
-    const chownResult = execFileFn("chown", [user, logDir]);
-    if (chownResult.code !== 0) {
-      write(err, `Warning: could not chown ${logDir} to ${user}: ${chownResult.stderr.trim()}\n`);
-    }
-  } catch (error) {
-    write(err, `Error preparing log dir ${logDir}: ${error instanceof Error ? error.message : String(error)}\n`);
-    return 1;
-  }
+  // Do not create `<fortress>/logs` here. Root path-based recursive mkdir under
+  // the operator fortress cannot be made race-free without mkdirat/openat, and
+  // a swapped symlinked fortress could redirect creation outside the custody
+  // tree. The LaunchDaemon writes directly to `/var/log`, which already exists.
 
   const existing = await readFileCustody(plistPath, {
     encoding: "utf8",
@@ -1292,6 +1421,8 @@ export async function runInstallBoot(
     return 1;
   }
 
+  // The custody-normalize chokepoint runs in the runInstallBoot wrapper, so it
+  // covers this success path AND every failure return above it.
   write(out, `Castle Wall safe-mode boot service installed and running (pid ${pid}): ${plistPath}\n`);
   write(out, `Runs as root at boot in SAFE MODE (boot token only, never the master key); fortress ${fortressPath}; KeepAlive on.\n`);
   if (tokenResult.minted) {

@@ -25,7 +25,11 @@ const GENERIC_ADVICE_SURFACES = [
   },
   {
     file: "server/src/cli/castle-wall.ts",
-    functionName: "runArmDisarm",
+    // 2026-07-31: `runArmDisarm` became a thin wrapper that guarantees the
+    // custody-normalize chokepoint runs on EVERY root exit path; the arm/
+    // disarm body (and therefore the operator advice this gate tracks) moved
+    // verbatim into `runArmDisarmInner`.
+    functionName: "runArmDisarmInner",
   },
 ] as const;
 

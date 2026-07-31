@@ -1,9 +1,9 @@
 import { execFile } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { statSync } from "node:fs";
-import { mkdir, readdir, stat, unlink } from "node:fs/promises";
+import { constants as fsConstants, lstatSync, statSync } from "node:fs";
+import { mkdir, open, readdir, stat, unlink } from "node:fs/promises";
 import { createConnection } from "node:net";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve as resolvePath } from "node:path";
 import { promisify } from "node:util";
 
 import { bytesToString, toBase64url } from "../../core/encoding.js";
@@ -492,6 +492,21 @@ export function resolveSocketReownUid(input: {
   // Owners already match (a same-uid daemon, e.g. an operator daemon that somehow
   // reached here as root over its own fortress): no re-own needed.
   if (ownerUid === processUid) {
+    if (processUid === 0) {
+      // Fortress-ownership spec 2026-07-30 §4(a2)(3): a ROOT-owned fortress
+      // under a root daemon used to make the re-own a silent no-op by
+      // construction (the #450 item 3 fix re-owns to the fortress owner, and
+      // the fortress owner IS the bug). That state leaves the operator CLI
+      // dead-man lever and the operator-uid extension unable to reach the
+      // socket -- exactly as blind as a failed stat, so it gets the same loud
+      // operator-facing warning instead of silence.
+      (input.warn ?? defaultDaemonWarn)(
+        `[castle-wall] warning: the fortress at ${input.fortressPath} is owned by root, ` +
+          `so the IPC socket stays root-owned and the operator CLI (including the 'disable' dead-man lever) ` +
+          `and the operator-uid extension may be unable to connect. ` +
+          `Run 'sudo sanctuary castle-wall repair-custody' to hand the fortress back to the operator.`,
+      );
+    }
     return undefined;
   }
   return ownerUid;
@@ -500,6 +515,94 @@ export function resolveSocketReownUid(input: {
 function defaultDaemonWarn(message: string): void {
   // SAFETY: daemon startup diagnostics are operator-facing stderr output.
   console.error(message);
+}
+
+/**
+ * Resolve the create-with-fchown owner for fortress-internal files a ROOT
+ * daemon creates (fortress-ownership spec 2026-07-30, open question 5):
+ * a root daemon that writes into an operator-owned fortress must create
+ * files owned by the FORTRESS OWNER, not root, or operator readability of
+ * audit artifacts erodes boot over boot. Only a root process needs this
+ * (a non-root daemon already creates operator-owned files); a root-owned or
+ * unreadable fortress yields `undefined` (no owner to hand files to -- the
+ * loud warnings in {@link resolveSocketReownUid} cover those states).
+ */
+export function resolveFortressCreateOwner(input: {
+  fortressPath: string;
+  /** Current process uid; defaults to `process.getuid?.()`. Injected by tests. */
+  processUid?: number | undefined;
+  /** Stat the fortress dir for its owner; defaults to `fs.statSync`. */
+  statFortressOwner?: (fortressPath: string) => { uid: number; gid: number };
+}): { uid: number; gid: number } | undefined {
+  const processUid =
+    input.processUid !== undefined ? input.processUid : process.getuid?.();
+  if (processUid !== 0) {
+    return undefined;
+  }
+  let owner: { uid: number; gid: number };
+  try {
+    if (input.statFortressOwner) {
+      owner = input.statFortressOwner(input.fortressPath);
+    } else {
+      // lstat, NOT stat (2026-07-31 re-gate): a SYMLINKED fortress would
+      // otherwise report its target's owner, and every create-with-fchown
+      // write would then hand files outside the fortress to that uid. A
+      // symlinked fortress yields no owner at all, so no chown happens.
+      const stats = lstatSync(input.fortressPath);
+      if (stats.isSymbolicLink() || !stats.isDirectory()) {
+        return undefined;
+      }
+      owner = { uid: stats.uid, gid: stats.gid };
+    }
+  } catch {
+    return undefined;
+  }
+  // 2026-07-31 re-gate MED: gid 0 is refused for the same reason uid 0 is.
+  // A `501:0` fortress would otherwise have every root-created file chowned
+  // to GROUP wheel, which is not the operator's custody domain.
+  if (owner.uid === 0 || owner.gid === 0) {
+    return undefined;
+  }
+  return owner;
+}
+
+async function openExistingDirectoryNoFollow(path: string): Promise<Awaited<ReturnType<typeof open>>> {
+  return open(
+    path,
+    fsConstants.O_RDONLY |
+      (typeof fsConstants.O_NOFOLLOW === "number" ? fsConstants.O_NOFOLLOW : 0) |
+      (typeof fsConstants.O_DIRECTORY === "number" ? fsConstants.O_DIRECTORY : 0),
+    0o600,
+  );
+}
+
+export async function assertExistingDirectoryTreeNoFollow(base: string, leaf: string): Promise<void> {
+  const resolvedBase = resolvePath(base);
+  const resolvedLeaf = resolvePath(leaf);
+  const components: string[] = [];
+  let walk = resolvedLeaf;
+  for (;;) {
+    components.push(walk);
+    if (walk === resolvedBase) break;
+    const parent = dirname(walk);
+    if (parent === walk) {
+      throw new Error(
+        `rules directory ${resolvedLeaf} is not inside fortress ${resolvedBase}`,
+      );
+    }
+    walk = parent;
+  }
+  components.reverse();
+  const handles: Array<Awaited<ReturnType<typeof open>>> = [];
+  try {
+    for (const component of components) {
+      handles.push(await openExistingDirectoryNoFollow(component));
+    }
+  } finally {
+    for (const handle of handles.reverse()) {
+      await handle.close().catch(() => undefined);
+    }
+  }
 }
 
 export async function startMacOSCastleWallDaemon(
@@ -546,10 +649,26 @@ export async function startMacOSCastleWallDaemon(
 
   await assertActiveConfigNotOwnedByLiveProcess(activeConfigPath, legacyActiveConfigPath);
   await assertSocketNotOwnedByLiveProcess(socketPath);
-  await mkdir(join(input.fortressPath, "policy", "egress", "rules"), {
-    recursive: true,
-    mode: 0o700,
+  // Create-with-fchown (fortress-ownership spec 2026-07-30): fortress-internal
+  // files a ROOT daemon creates are handed to the fortress owner at creation
+  // so operator readability never erodes boot over boot. Directories are not
+  // recursively created here as root; the rules directory must already exist.
+  const fortressCreateOwner = resolveFortressCreateOwner({
+    fortressPath: input.fortressPath,
   });
+  const rulesDir = join(input.fortressPath, "policy", "egress", "rules");
+  if (process.getuid?.() === 0) {
+    // No mkdirat/openat in Node: a root recursive mkdir under the operator
+    // fortress can be redirected by a symlink swap. Root daemon startup
+    // therefore requires the rules directory to already exist as real
+    // directories; protect/repair-custody owns creating and normalizing it.
+    await assertExistingDirectoryTreeNoFollow(input.fortressPath, rulesDir);
+  } else {
+    await mkdir(rulesDir, {
+      recursive: true,
+      mode: 0o700,
+    });
+  }
 
   const signer = input.signer ?? (await loadSigningKey(input));
   await writeSystemPinnedPublicKey(signer, input.globalPinnedPublicKeyPath);
@@ -560,6 +679,7 @@ export async function startMacOSCastleWallDaemon(
     await publishFortressAuditProducerPublicKey(
       input.fortressPath,
       auditProducerKey.bytes,
+      fortressCreateOwner,
     );
   }
   const pinnedPublicKeySha256 = sha256Hex(signer.publicKey);
@@ -1894,10 +2014,13 @@ async function loadMacOSAuditProducerPublicKey(
 async function publishFortressAuditProducerPublicKey(
   fortressPath: string,
   publicKey: Uint8Array,
+  owner?: { uid: number; gid: number },
 ): Promise<void> {
   await writeFileCustody(resolveProducerPubKeyPath(fortressPath), publicKey, {
     mode: 0o644,
     createParent: true,
+    // The fortress is the containment base for this owner-write.
+    ...(owner !== undefined ? { owner, ownerBase: fortressPath } : {}),
   });
 }
 

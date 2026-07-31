@@ -41,7 +41,7 @@
  */
 
 import { constants as fsConstants } from "node:fs";
-import { mkdir, open, unlink, readdir, stat, lstat } from "node:fs/promises";
+import { open, unlink, readdir, stat, lstat } from "node:fs/promises";
 import type { Stats } from "node:fs";
 import { dirname, join } from "node:path";
 import { randomBytes } from "../core/random.js";
@@ -85,9 +85,19 @@ function encodedNamespacePath(basePath: string, namespace: string): string {
 
 export class FilesystemStorage implements StorageBackend, FilesystemStorageCapabilities {
   private basePath: string;
+  /**
+   * Create-with-fchown owner (fortress-ownership spec 2026-07-30): when set,
+   * every file this backend creates is chowned to this owner before it
+   * becomes visible. The namespace directory must already exist inside the
+   * storage root; root recursive mkdir through a mutable path is refused
+   * because Node exposes no mkdirat/openat primitive. Fail-closed: a missing
+   * parent or chown failure fails the write.
+   */
+  private owner: { uid: number; gid: number } | undefined;
 
-  constructor(basePath: string) {
+  constructor(basePath: string, options: { owner?: { uid: number; gid: number } } = {}) {
     this.basePath = basePath;
+    this.owner = options.owner;
   }
 
   private entryPath(namespace: string, key: string): string {
@@ -119,10 +129,8 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     data: Uint8Array
   ): Promise<void> {
     const checkedData = assertSdwRawWriteAuthorized(namespace, key, data);
-    const dirPath = encodedNamespacePath(this.basePath, namespace);
     const filePath = this.entryPath(namespace, key);
 
-    await mkdir(dirPath, { recursive: true, mode: 0o700 });
     await this.atomicWriteFile(filePath, checkedData, false);
   }
 
@@ -132,10 +140,8 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     data: Uint8Array
   ): Promise<void> {
     const checkedData = assertSdwRawWriteAuthorized(namespace, key, data);
-    const dirPath = encodedNamespacePath(this.basePath, namespace);
     const filePath = this.entryPath(namespace, key);
 
-    await mkdir(dirPath, { recursive: true, mode: 0o700 });
     await this.atomicWriteFile(filePath, checkedData, true);
   }
 
@@ -144,7 +150,19 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     data: Uint8Array,
     syncFile: boolean
   ): Promise<void> {
-    await writeFileCustody(filePath, data, { mode: 0o600, parentMode: 0o700 });
+    // For owner writes, writeFileCustody verifies the namespace dir exists
+    // inside basePath before opening the temp file. It will not recursively
+    // create parent dirs as root.
+    await writeFileCustody(filePath, data, {
+      mode: 0o600,
+      parentMode: 0o700,
+      // The storage root is the containment base: an owner-write must never
+      // land outside this backend's own basePath, even if a path component
+      // inside it was replaced with a symlink.
+      ...(this.owner !== undefined
+        ? { owner: this.owner, ownerBase: this.basePath }
+        : {}),
+    });
     if (syncFile) await this.fsyncDirectory(dirname(filePath));
   }
 

@@ -184,3 +184,31 @@ export {
   type EgressGateUnprotectOutcome,
   type EgressGateUnprotectStage,
 } from "./exclusive-unprotect.js";
+
+// Fortress custody repair + never-root-owned normalize chokepoint
+// (fortress-ownership spec 2026-07-30 section 4(a)).
+export {
+  CUSTODY_REPAIR_MANIFEST_DIR,
+  CUSTODY_REPAIR_MANIFEST_KIND,
+  applyCustodyRollback,
+  applyFortressCustodyRepairs,
+  isSafeManifestRelPath,
+  normalizeFortressCustody,
+  parseCustodyRepairManifest,
+  planFortressCustodyRepairs,
+  realFortressCustodyFsOps,
+  resolveSudoIdentityDecision,
+  walkFortressCustody,
+  writeCustodyRepairManifest,
+  type CustodyApplyResult,
+  type CustodyRepairAction,
+  type CustodyRepairManifest,
+  type CustodyRepairPlan,
+  type CustodySkip,
+  type FortressCustodyEntry,
+  type FortressCustodyEntryType,
+  type FortressCustodyFsOps,
+  type FortressWalkResult,
+  type NormalizeFortressCustodyInput,
+  type NormalizeFortressCustodyOutcome,
+} from "./fortress-custody.js";
