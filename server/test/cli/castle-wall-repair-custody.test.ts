@@ -146,6 +146,14 @@ function baseCtx(
     fsOps: fake.ops,
     manifestDir,
     lookupOperatorHome: async () => "/Users/mini2",
+    // Tests cannot mint a root-owned manifest, so the provenance stat is
+    // seamed to report the shape a real root-written manifest has.
+    statManifest: async () => ({
+      isFile: () => true,
+      isSymbolicLink: () => false,
+      uid: 0,
+      mode: 0o100600,
+    }),
     appendAudit: async (operation, details) => {
       auditOps.push({ operation, details });
     },
@@ -371,6 +379,131 @@ describe("castle-wall repair-custody", () => {
     const fake = rootOwnedFortress();
     const ctx = baseCtx(fake, "/unused");
     expect(await runRepairCustody(["--bogus"], ctx)).toBe(REPAIR_CUSTODY_EXIT_REFUSED);
+  });
+
+  it("REFUSES a rollback manifest from outside the root-owned manifest directory (gate BLOCKER-2)", async () => {
+    const manifestDir = await mkdtemp(join(tmpdir(), "repair-manifests-"));
+    const attackerDir = await mkdtemp(join(tmpdir(), "attacker-"));
+    try {
+      const attackerManifest = join(attackerDir, "evil.json");
+      await writeFile(
+        attackerManifest,
+        JSON.stringify({
+          version: 1,
+          kind: CUSTODY_REPAIR_MANIFEST_KIND,
+          generated_at: "2026-07-31T00:00:00.000Z",
+          fortress_path: "/Users/mini2/.sanctuary",
+          operator: { uid: 501, gid: 20 },
+          entries: [
+            { path: "payload", type: "file", uid: 0, gid: 0, mode: 0o4755, dev: 1, ino: 9 },
+          ],
+          vanished: [],
+        }),
+      );
+      const fake = rootOwnedFortress();
+      const ctx = baseCtx(fake, manifestDir);
+      expect(await runRepairCustody(["--rollback", attackerManifest], ctx)).toBe(
+        REPAIR_CUSTODY_EXIT_REFUSED,
+      );
+      expect(ctx.err.text()).toContain("not inside the root-owned manifest directory");
+    } finally {
+      await rm(manifestDir, { recursive: true, force: true });
+      await rm(attackerDir, { recursive: true, force: true });
+    }
+  });
+
+  it("REFUSES a non-root-owned or world-writable manifest, and one carrying setuid bits", async () => {
+    const manifestDir = await mkdtemp(join(tmpdir(), "repair-manifests-"));
+    try {
+      const manifestPath = join(manifestDir, "custody-x.json");
+      const cleanManifest = {
+        version: 1,
+        kind: CUSTODY_REPAIR_MANIFEST_KIND,
+        generated_at: "2026-07-31T00:00:00.000Z",
+        fortress_path: "/Users/mini2/.sanctuary",
+        operator: { uid: 501, gid: 20 },
+        entries: [
+          { path: ".", type: "dir", uid: 0, gid: 20, mode: 0o700, dev: 1, ino: 1 },
+        ],
+        vanished: [],
+      };
+      await writeFile(manifestPath, JSON.stringify(cleanManifest));
+
+      // (a) manifest not owned by root.
+      const fake = rootOwnedFortress();
+      const notRoot = baseCtx(fake, manifestDir, {
+        statManifest: async () => ({
+          isFile: () => true,
+          isSymbolicLink: () => false,
+          uid: 501,
+          mode: 0o100600,
+        }),
+      });
+      expect(await runRepairCustody(["--rollback", manifestPath], notRoot)).toBe(
+        REPAIR_CUSTODY_EXIT_REFUSED,
+      );
+      expect(notRoot.err.text()).toContain("not root");
+
+      // (b) group/world-writable manifest.
+      const writable = baseCtx(fake, manifestDir, {
+        statManifest: async () => ({
+          isFile: () => true,
+          isSymbolicLink: () => false,
+          uid: 0,
+          mode: 0o100666,
+        }),
+      });
+      expect(await runRepairCustody(["--rollback", manifestPath], writable)).toBe(
+        REPAIR_CUSTODY_EXIT_REFUSED,
+      );
+      expect(writable.err.text()).toContain("world-writable");
+
+      // (c) a root-owned manifest that records setuid bits is still refused.
+      await writeFile(
+        manifestPath,
+        JSON.stringify({
+          ...cleanManifest,
+          entries: [
+            ...cleanManifest.entries,
+            { path: "bin", type: "file", uid: 0, gid: 0, mode: 0o4755, dev: 1, ino: 2 },
+          ],
+        }),
+      );
+      const setuid = baseCtx(fake, manifestDir);
+      expect(await runRepairCustody(["--rollback", manifestPath], setuid)).toBe(
+        REPAIR_CUSTODY_EXIT_REFUSED,
+      );
+      expect(setuid.err.text()).toContain("setuid/setgid/sticky");
+      // Nothing was touched on any of the three refusals.
+      expect(fake.nodes.get("/Users/mini2/.sanctuary")!.uid).toBe(0);
+    } finally {
+      await rm(manifestDir, { recursive: true, force: true });
+    }
+  });
+
+  it("exits FAILED (not success) when every planned repair was skipped by an identity change (gate LOW)", async () => {
+    const manifestDir = await mkdtemp(join(tmpdir(), "repair-manifests-"));
+    try {
+      const fake = rootOwnedFortress();
+      const ctx = baseCtx(fake, manifestDir);
+      // Every planned entry changes inode between observe and apply.
+      const originalOpen = fake.ops.open.bind(fake.ops);
+      let planned = false;
+      fake.ops.open = async (path: string, flags: number) => {
+        const handle = await originalOpen(path, flags);
+        if (path === "/Users/mini2/.sanctuary" && planned) {
+          return { ...handle, stat: async () => ({ ...(await handle.stat()), ino: 9999 }) };
+        }
+        planned = true;
+        return handle;
+      };
+      const code = await runRepairCustody([], ctx);
+      expect(code).toBe(REPAIR_CUSTODY_EXIT_FAILED);
+      expect(ctx.err.text()).toContain("Repair incomplete");
+      expect(ctx.err.text()).toContain("changed identity");
+    } finally {
+      await rm(manifestDir, { recursive: true, force: true });
+    }
   });
 
   it("requires --fortress when the operator home cannot be resolved", async () => {

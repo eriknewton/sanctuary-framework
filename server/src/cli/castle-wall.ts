@@ -3991,7 +3991,53 @@ async function normalizeFortressCustodyAfterPrivilegedVerb(
   });
 }
 
+/**
+ * Arm/disarm with the custody-normalize chokepoint on EVERY root exit path
+ * (2026-07-31 gate HIGH). The inner flow writes into the fortress well before
+ * several refusal returns -- `--agent-uid` writes the agent-origin descriptor
+ * before the no-egress guard can refuse, and `disable` writes the lease-status
+ * file before the host-app failure branches -- so hanging the normalize off
+ * the two success returns left root-owned residue on those exits. Wrapping
+ * makes reachability structural: no future return statement inside can skip it.
+ */
 async function runArmDisarm(
+  action: "enable" | "disable",
+  argv: string[],
+  ctx: CastleWallCommandContext,
+): Promise<number> {
+  const wrapperEnv = ctx.env ?? process.env;
+  const wrapperErr = ctx.err ?? process.stderr;
+  const wrapperGetuid = ctx.getuid ?? process.getuid?.bind(process);
+  try {
+    return await runArmDisarmInner(action, argv, ctx);
+  } finally {
+    if (wrapperGetuid?.() === 0) {
+      // Resolve LAZILY and only as root: a non-darwin or unresolvable-fortress
+      // run touched nothing, and fortress resolution itself can refuse (the
+      // hermetic-path guard), which must never turn into a thrown wrapper.
+      let wrapperFortress: string | undefined;
+      try {
+        wrapperFortress = resolveFortressArg(
+          parseCastleWallArgs(argv).fortress,
+          wrapperEnv,
+        );
+      } catch {
+        wrapperFortress = undefined;
+      }
+      if (wrapperFortress !== undefined) {
+        await normalizeFortressCustodyAfterPrivilegedVerb(
+          wrapperFortress,
+          wrapperEnv,
+          wrapperGetuid,
+          wrapperErr,
+          ctx.normalizeFortressCustody,
+        );
+      }
+    }
+  }
+}
+
+async function runArmDisarmInner(
   action: "enable" | "disable",
   argv: string[],
   ctx: CastleWallCommandContext,
@@ -4000,7 +4046,6 @@ async function runArmDisarm(
   const err = ctx.err ?? process.stderr;
   const env = ctx.env ?? process.env;
   const platform = ctx.platform ?? process.platform;
-  const getuid = ctx.getuid ?? process.getuid?.bind(process);
 
   if (platform !== "darwin") {
     write(err, `castle-wall ${action} is macOS-only.\n`);
@@ -4337,13 +4382,6 @@ async function runArmDisarm(
       // remove the policy daemon (reboot could come up enabled + no daemon =
       // deny-all).
       ctx.onDisableNePreferenceOutcome?.("fail_open_deadman");
-      await normalizeFortressCustodyAfterPrivilegedVerb(
-        fortressPath,
-        env,
-        getuid,
-        err,
-        ctx.normalizeFortressCustody,
-      );
       return 0;
     }
     write(err, `castle-wall ${action} failed: ${detail}\n`);
@@ -4454,17 +4492,8 @@ async function runArmDisarm(
       confirmed ? "corroborated_off" : "save_accepted_inconclusive",
     );
   }
-  // Custody-normalize chokepoint: a sudo arm/disarm writes into the fortress
-  // (lease status file, arm audit entry) as root; hand those entries back to
-  // the operator before returning so the ceremony can never leave a
-  // root-owned fortress entry behind.
-  await normalizeFortressCustodyAfterPrivilegedVerb(
-    fortressPath,
-    env,
-    getuid,
-    err,
-    ctx.normalizeFortressCustody,
-  );
+  // The custody-normalize chokepoint runs in the runArmDisarm wrapper, so it
+  // covers this success path AND every refusal return above it.
   return 0;
 }
 

@@ -1080,7 +1080,65 @@ async function normalizeInstallBootFortressCustody(
   });
 }
 
+/**
+ * install-boot with the custody-normalize chokepoint on EVERY root exit path
+ * (2026-07-31 gate HIGH). The log-dir `mkdir { recursive: true }` can CREATE
+ * the fortress top-level dir root-owned (the Mini2 root cause), and the
+ * launchd enable/bootout/bootstrap/certify sequence after it has many failure
+ * returns; hanging the normalize off the success returns alone left
+ * root-owned residue on all of them. Wrapping makes reachability structural.
+ * The wrapper resolves the fortress the same way the inner flow does and
+ * no-ops when it cannot (a pre-root/pre-arg-validation exit touched nothing).
+ */
 export async function runInstallBoot(
+  argv: string[] = [],
+  ctx: CastleWallBootContext = {},
+): Promise<number> {
+  const env = ctx.env ?? process.env;
+  const err = ctx.err ?? process.stderr;
+  const getuid = ctx.getuid ?? process.getuid?.bind(process);
+  try {
+    return await runInstallBootInner(argv, ctx);
+  } finally {
+    if (getuid?.() === 0) {
+      const fortressPath = resolveInstallBootFortressPath(argv, ctx, env);
+      if (fortressPath !== undefined) {
+        await normalizeInstallBootFortressCustody(
+          fortressPath,
+          env,
+          err,
+          ctx.normalizeFortressCustody,
+        );
+      }
+    }
+  }
+}
+
+/**
+ * Resolve the fortress the install-boot run targets, for the wrapper's
+ * chokepoint. Mirrors the inner flow's resolution (flag, then env, then the
+ * operator's home via dscl) and returns undefined when it cannot be resolved
+ * without guessing, in which case nothing was created to normalize.
+ */
+function resolveInstallBootFortressPath(
+  argv: string[],
+  ctx: CastleWallBootContext,
+  env: NodeJS.ProcessEnv,
+): string | undefined {
+  const parsed = parseBootArgs(argv);
+  let fortressPath = parsed.fortress ?? env.SANCTUARY_STORAGE_PATH;
+  if (!fortressPath) {
+    const user = parsed.user ?? env.SUDO_USER;
+    if (!user || !SAFE_NAME_RE.test(user)) return undefined;
+    const home = deriveOperatorHome(user, ctx.execFileFn ?? defaultExecFile);
+    if (!home) return undefined;
+    fortressPath = join(home, ".sanctuary");
+  }
+  if (!isAbsolute(fortressPath)) return undefined;
+  return resolve(fortressPath);
+}
+
+async function runInstallBootInner(
   argv: string[] = [],
   ctx: CastleWallBootContext = {},
 ): Promise<number> {
@@ -1265,12 +1323,6 @@ export async function runInstallBoot(
   // or target a different fortress.
   if (existing === plist && (await bootServiceReady(plistPath, fortressPath, execFileFn, sleepFn))) {
     write(out, `Castle Wall boot service already installed and running (${plistPath}).\n`);
-    await normalizeInstallBootFortressCustody(
-      fortressPath,
-      env,
-      err,
-      ctx.normalizeFortressCustody,
-    );
     return 0;
   }
 
@@ -1344,13 +1396,8 @@ export async function runInstallBoot(
     return 1;
   }
 
-  await normalizeInstallBootFortressCustody(
-    fortressPath,
-    env,
-    err,
-    ctx.normalizeFortressCustody,
-  );
-
+  // The custody-normalize chokepoint runs in the runInstallBoot wrapper, so it
+  // covers this success path AND every failure return above it.
   write(out, `Castle Wall safe-mode boot service installed and running (pid ${pid}): ${plistPath}\n`);
   write(out, `Runs as root at boot in SAFE MODE (boot token only, never the master key); fortress ${fortressPath}; KeepAlive on.\n`);
   if (tokenResult.minted) {

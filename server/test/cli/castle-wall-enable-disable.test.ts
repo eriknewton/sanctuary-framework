@@ -2077,6 +2077,77 @@ describe("fortress-ownership guards on arm/disarm (spec 2026-07-30)", () => {
     expect(nonRootCalls).toEqual([]);
   });
 
+  it("normalizes on REFUSAL exits too, not just success (gate HIGH: the descriptor/lease writes precede them)", async () => {
+    const { fortressPath, hostAppPath, env } = await makeFixture();
+    const sudoEnv = { ...env, SUDO_UID: "501", SUDO_GID: "20", SUDO_USER: "operator" };
+
+    // (a) `--agent-uid` writes the agent-origin descriptor as root, THEN the
+    // no-egress guard refuses. The chokepoint must still run.
+    const noEgressCalls: string[] = [];
+    const noEgress = await runEnable(
+      ["--fortress", fortressPath, "--no-ttl", "--agent-uid=550"],
+      {
+        out: new CaptureStream(),
+        err: new CaptureStream(),
+        env: sudoEnv,
+        platform: "darwin",
+        getuid: () => 0,
+        hostAppCandidates: [hostAppPath],
+        hostAppInvoke: makeInvoker({}).invoke,
+        daemonProbe: async () => true,
+        bootServiceReadyProbe: async () => true,
+        sysextProbe: async () => "[activated enabled]",
+        fortressOwnerUidProbe: async () => 501,
+        egressAllowRuleCountProbe: async () => 0,
+        normalizeFortressCustody: async (input) => {
+          noEgressCalls.push(input.fortressPath);
+          return { status: "clean", repaired: [], skips: [], vanished: [], failed: [] };
+        },
+      },
+    );
+    expect(noEgress).toBe(1);
+    expect(noEgressCalls).toEqual([fortressPath]);
+
+    // (b) `disable` writes the lease-status file, then the host app fails.
+    const disableCalls: string[] = [];
+    const failed = await runDisable(["--fortress", fortressPath], {
+      out: new CaptureStream(),
+      err: new CaptureStream(),
+      env: sudoEnv,
+      platform: "darwin",
+      getuid: () => 0,
+      hostAppCandidates: [hostAppPath],
+      hostAppInvoke: makeInvoker({
+        disable: { stdout: "", exitCode: 1, stderr: "host app exploded" },
+      }).invoke,
+      normalizeFortressCustody: async (input) => {
+        disableCalls.push(input.fortressPath);
+        return { status: "clean", repaired: [], skips: [], vanished: [], failed: [] };
+      },
+    });
+    expect(failed).toBe(1);
+    expect(disableCalls).toEqual([fortressPath]);
+
+    // (c) the root-owned-fortress arm refusal itself still normalizes.
+    const refusalCalls: string[] = [];
+    const refused = await runEnable(["--fortress", fortressPath, "--no-ttl"], {
+      out: new CaptureStream(),
+      err: new CaptureStream(),
+      env: sudoEnv,
+      platform: "darwin",
+      getuid: () => 0,
+      hostAppCandidates: [hostAppPath],
+      hostAppInvoke: makeInvoker({}).invoke,
+      fortressOwnerUidProbe: async () => 0,
+      normalizeFortressCustody: async (input) => {
+        refusalCalls.push(input.fortressPath);
+        return { status: "changed", repaired: ["."], skips: [], vanished: [], failed: [] };
+      },
+    });
+    expect(refused).toBe(1);
+    expect(refusalCalls).toEqual([fortressPath]);
+  });
+
   it("a root run without a resolvable operator warns loudly instead of guessing an owner", async () => {
     const { fortressPath, hostAppPath, env } = await makeFixture();
     const err = new CaptureStream();

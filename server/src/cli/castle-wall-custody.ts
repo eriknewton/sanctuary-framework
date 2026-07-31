@@ -32,8 +32,8 @@
  */
 
 import { execFile as nodeExecFile } from "node:child_process";
-import { readFile } from "node:fs/promises";
-import { isAbsolute, resolve } from "node:path";
+import { lstat, readFile } from "node:fs/promises";
+import { dirname, isAbsolute, resolve } from "node:path";
 import { Writable } from "node:stream";
 import { promisify } from "node:util";
 
@@ -42,6 +42,7 @@ import {
   applyFortressCustodyRepairs,
   CUSTODY_REPAIR_MANIFEST_DIR,
   CUSTODY_REPAIR_MANIFEST_KIND,
+  manifestCarriesPrivilegeBits,
   parseCustodyRepairManifest,
   planFortressCustodyRepairs,
   realFortressCustodyFsOps,
@@ -80,6 +81,16 @@ export interface RepairCustodyContext {
   ) => Promise<string>;
   /** Operator-home lookup override (tests avoid dscl). */
   lookupOperatorHome?: (user: string) => Promise<string | undefined>;
+  /**
+   * Manifest-provenance stat override (tests cannot mint a root-owned
+   * manifest). Defaults to `fs.lstat`.
+   */
+  statManifest?: (path: string) => Promise<{
+    isFile(): boolean;
+    isSymbolicLink(): boolean;
+    uid: number;
+    mode: number;
+  }>;
   /**
    * Best-effort audit append override (tests avoid real master-key
    * resolution). Defaults to {@link appendCastleWallCliAuditBestEffort}.
@@ -222,13 +233,58 @@ export async function runRepairCustody(
 
   // ── Rollback mode ──
   if (parsed.rollback !== undefined) {
-    let raw: string;
+    const manifestDir = ctx.manifestDir ?? CUSTODY_REPAIR_MANIFEST_DIR;
+    // PROVENANCE GATE (2026-07-31 gate BLOCKER-2): rollback applies
+    // file-controlled uid/gid/mode AS ROOT, so it accepts ONLY a manifest
+    // this verb itself wrote: inside the root-owned manifest directory, a
+    // regular file (never a symlink), owned by root, not group/other
+    // writable. Without this, any readable JSON became a root chown/chmod
+    // primitive.
+    const rollbackPath = resolve(parsed.rollback);
+    if (dirname(rollbackPath) !== resolve(manifestDir)) {
+      write(
+        err,
+        `Refusing rollback: ${rollbackPath} is not inside the root-owned manifest directory ${manifestDir}.\n` +
+          "Only manifests written by 'repair-custody' itself can be replayed.\n",
+      );
+      return REPAIR_CUSTODY_EXIT_REFUSED;
+    }
+    let manifestStats;
     try {
-      raw = await readFile(parsed.rollback, "utf8");
+      manifestStats = await (ctx.statManifest ?? lstat)(rollbackPath);
     } catch (error) {
       write(
         err,
-        `Cannot read rollback manifest ${parsed.rollback}: ${error instanceof Error ? error.message : String(error)}\n`,
+        `Cannot read rollback manifest ${rollbackPath}: ${error instanceof Error ? error.message : String(error)}\n`,
+      );
+      return REPAIR_CUSTODY_EXIT_FAILED;
+    }
+    if (!manifestStats.isFile() || manifestStats.isSymbolicLink()) {
+      write(err, `Refusing rollback: ${rollbackPath} is not a regular file.\n`);
+      return REPAIR_CUSTODY_EXIT_REFUSED;
+    }
+    if (manifestStats.uid !== 0) {
+      write(
+        err,
+        `Refusing rollback: ${rollbackPath} is owned by uid ${manifestStats.uid}, not root. A non-root-owned manifest is not trustworthy input for a root chown.\n`,
+      );
+      return REPAIR_CUSTODY_EXIT_REFUSED;
+    }
+    if ((manifestStats.mode & 0o022) !== 0) {
+      write(
+        err,
+        `Refusing rollback: ${rollbackPath} is group- or world-writable (mode ${(manifestStats.mode & 0o7777).toString(8)}).\n`,
+      );
+      return REPAIR_CUSTODY_EXIT_REFUSED;
+    }
+
+    let raw: string;
+    try {
+      raw = await readFile(rollbackPath, "utf8");
+    } catch (error) {
+      write(
+        err,
+        `Cannot read rollback manifest ${rollbackPath}: ${error instanceof Error ? error.message : String(error)}\n`,
       );
       return REPAIR_CUSTODY_EXIT_FAILED;
     }
@@ -236,7 +292,14 @@ export async function runRepairCustody(
     if (manifest === null) {
       write(
         err,
-        `Refusing rollback: ${parsed.rollback} is not a valid ${CUSTODY_REPAIR_MANIFEST_KIND} manifest.\n`,
+        `Refusing rollback: ${rollbackPath} is not a valid ${CUSTODY_REPAIR_MANIFEST_KIND} manifest.\n`,
+      );
+      return REPAIR_CUSTODY_EXIT_REFUSED;
+    }
+    if (manifestCarriesPrivilegeBits(manifest)) {
+      write(
+        err,
+        `Refusing rollback: ${rollbackPath} records setuid/setgid/sticky bits. A fortress entry never legitimately carries them, and replaying one as root would create a privileged binary.\n`,
       );
       return REPAIR_CUSTODY_EXIT_REFUSED;
     }
@@ -360,6 +423,20 @@ export async function runRepairCustody(
     write(
       err,
       `Repair incomplete: ${applied.failed.length} entries failed (see above). Rollback: sudo sanctuary castle-wall repair-custody --rollback ${manifestPath}\n`,
+    );
+    return REPAIR_CUSTODY_EXIT_FAILED;
+  }
+  // 2026-07-31 gate LOW: an entry skipped because its inode or an ancestor
+  // changed under us is NOT repaired, so the fortress still holds root-owned
+  // entries. Reporting success there would be the "green without positive
+  // evidence" shape. Exit FAILED and name the re-run.
+  if (applied.identityChanged.length > 0) {
+    write(
+      err,
+      `Repair incomplete: ${applied.identityChanged.length} entr${
+        applied.identityChanged.length === 1 ? "y" : "ies"
+      } changed identity (or had an ancestor change) between observe and apply and were NOT repaired (see above). ` +
+        "Re-run 'sudo sanctuary castle-wall repair-custody' once the fortress is quiescent.\n",
     );
     return REPAIR_CUSTODY_EXIT_FAILED;
   }

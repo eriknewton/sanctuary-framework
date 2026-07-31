@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
-import type { Stats } from "node:fs";
+import { constants as fsConstants, type Stats } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -9,6 +9,7 @@ import {
   applyFortressCustodyRepairs,
   CUSTODY_REPAIR_MANIFEST_KIND,
   isSafeManifestRelPath,
+  manifestCarriesPrivilegeBits,
   normalizeFortressCustody,
   parseCustodyRepairManifest,
   planFortressCustodyRepairs,
@@ -98,9 +99,28 @@ function makeFakeFs(
         fake.chmods.push({ path, mode });
         node.mode = mode;
       },
-      open: async (path) => {
+      // The fake HONORS O_NOFOLLOW / O_DIRECTORY: a mock that opened a
+      // symlinked ancestor happily could not represent the very condition
+      // the ancestor guard exists to catch.
+      open: async (path, flags) => {
         const node = nodeMap.get(path);
         if (node === undefined) throw enoent();
+        const noFollow =
+          typeof fsConstants.O_NOFOLLOW === "number" &&
+          (flags & fsConstants.O_NOFOLLOW) !== 0;
+        const dirOnly =
+          typeof fsConstants.O_DIRECTORY === "number" &&
+          (flags & fsConstants.O_DIRECTORY) !== 0;
+        if (noFollow && node.type === "symlink") {
+          const err = new Error("ELOOP: symbolic link") as NodeJS.ErrnoException;
+          err.code = "ELOOP";
+          throw err;
+        }
+        if (dirOnly && node.type !== "dir") {
+          const err = new Error("ENOTDIR: not a directory") as NodeJS.ErrnoException;
+          err.code = "ENOTDIR";
+          throw err;
+        }
         return {
           stat: async () => fakeStats(node),
           chown: async (uid: number, gid: number) => {
@@ -278,6 +298,102 @@ describe("fortress-custody: apply", () => {
   });
 });
 
+describe("fortress-custody: ancestor containment (2026-07-31 gate BLOCKER-1)", () => {
+  /** A nested tree so `state/` is a real ANCESTOR of the repaired entry. */
+  function nestedFixture(): FakeFs {
+    return makeFakeFs(
+      {
+        "/f": { type: "dir", uid: 0, gid: 20, mode: 0o700, ino: 1 },
+        "/f/state": { type: "dir", uid: 0, gid: 20, mode: 0o700, ino: 2 },
+        "/f/state/a.enc": { type: "file", uid: 0, gid: 20, mode: 0o600, ino: 3 },
+      },
+      { "/f": ["state"], "/f/state": ["a.enc"] },
+    );
+  }
+
+  it("REFUSES to chown when an ancestor became a symlink between observe and apply", async () => {
+    const fake = nestedFixture();
+    const walk = await walkFortressCustody("/f", fake.ops);
+    const plan = planFortressCustodyRepairs(walk.entries, OPERATOR);
+
+    // The attack: swap the observed ancestor dir for a symlink pointing
+    // outside the fortress. Without ancestor verification, O_NOFOLLOW on the
+    // FINAL component alone would let root chown /outside/a.enc.
+    fake.nodes.set("/f/state", { type: "symlink", uid: 502, gid: 20, mode: 0o777, ino: 99 });
+
+    const applied = await applyFortressCustodyRepairs("/f", plan, fake.ops);
+    expect(applied.identityChanged).toContain("state/a.enc (ancestor changed)");
+    expect(applied.repaired).not.toContain("state/a.enc");
+    // Nothing under the swapped ancestor was touched.
+    expect(fake.fchowns.some((c) => c.path === "/f/state/a.enc")).toBe(false);
+    expect(fake.nodes.get("/f/state/a.enc")!.uid).toBe(0);
+  });
+
+  it("REFUSES when an ancestor is replaced by a DIFFERENT directory (inode swap)", async () => {
+    const fake = nestedFixture();
+    const walk = await walkFortressCustody("/f", fake.ops);
+    const plan = planFortressCustodyRepairs(walk.entries, OPERATOR);
+    // Same path, same type, different inode: a rename-over attack.
+    fake.nodes.get("/f/state")!.ino = 4242;
+
+    const applied = await applyFortressCustodyRepairs("/f", plan, fake.ops);
+    expect(applied.identityChanged).toContain("state/a.enc (ancestor changed)");
+    expect(fake.nodes.get("/f/state/a.enc")!.uid).toBe(0);
+  });
+
+  it("REFUSES when the fortress ROOT itself is swapped under us", async () => {
+    const fake = nestedFixture();
+    const walk = await walkFortressCustody("/f", fake.ops);
+    const plan = planFortressCustodyRepairs(walk.entries, OPERATOR);
+    fake.nodes.get("/f")!.ino = 777;
+
+    const applied = await applyFortressCustodyRepairs("/f", plan, fake.ops);
+    expect(applied.repaired).toEqual([]);
+    expect(applied.identityChanged.length).toBeGreaterThan(0);
+    expect(fake.fchowns).toEqual([]);
+  });
+
+  it("still repairs the whole nested tree when nothing is tampered with", async () => {
+    const fake = nestedFixture();
+    const walk = await walkFortressCustody("/f", fake.ops);
+    const plan = planFortressCustodyRepairs(walk.entries, OPERATOR);
+    const applied = await applyFortressCustodyRepairs("/f", plan, fake.ops);
+    expect(applied.repaired.sort()).toEqual([".", "state", "state/a.enc"]);
+    expect(applied.identityChanged).toEqual([]);
+    expect(fake.nodes.get("/f/state/a.enc")!.uid).toBe(501);
+  });
+
+  it("REFUSES when the path resolves to a different inode than the descriptor (two-sided check)", async () => {
+    const fake = nestedFixture();
+    const walk = await walkFortressCustody("/f", fake.ops);
+    const plan = planFortressCustodyRepairs(walk.entries, OPERATOR);
+    // The descriptor sees the observed inode, but a fresh path resolution
+    // sees something else: the close-out check must refuse.
+    const realLstat = fake.ops.lstat.bind(fake.ops);
+    let seen = 0;
+    fake.ops.lstat = async (path: string) => {
+      if (path === "/f/state/a.enc") {
+        seen += 1;
+        if (seen > 0) {
+          return {
+            ...(await realLstat(path)),
+            isDirectory: () => false,
+            isFile: () => true,
+            isSocket: () => false,
+            isSymbolicLink: () => false,
+            dev: 1,
+            ino: 31337,
+          } as unknown as Stats;
+        }
+      }
+      return realLstat(path);
+    };
+    const applied = await applyFortressCustodyRepairs("/f", plan, fake.ops);
+    expect(applied.identityChanged).toContain("state/a.enc");
+    expect(fake.nodes.get("/f/state/a.enc")!.uid).toBe(0);
+  });
+});
+
 describe("fortress-custody: manifest", () => {
   function manifestFixture(entries: FortressCustodyEntry[]): CustodyRepairManifest {
     return {
@@ -410,6 +526,100 @@ describe("fortress-custody: rollback", () => {
     const rollback = await applyCustodyRollback("/f", manifest, fake.ops);
     expect(rollback.vanished).toEqual(["castle.sock"]);
     expect(rollback.identityChanged).toEqual(["castle-pinned-pubkey.bin"]);
+  });
+});
+
+describe("fortress-custody: rollback containment (2026-07-31 gate BLOCKER-2)", () => {
+  function manifestOf(
+    entries: FortressCustodyEntry[],
+    fortressPath = "/f",
+  ): CustodyRepairManifest {
+    return {
+      version: 1,
+      kind: CUSTODY_REPAIR_MANIFEST_KIND,
+      generated_at: "2026-07-31T00:00:00.000Z",
+      fortress_path: fortressPath,
+      operator: OPERATOR,
+      entries,
+      vanished: [],
+    };
+  }
+
+  it("REFUSES the codex exploit: a symlinked parent cannot carry a root chown/chmod outside the fortress", async () => {
+    // Exactly the reported attack: `escape -> /Users/operator` inside the
+    // fortress, plus a crafted manifest entry `escape/payload` recording
+    // uid 0 / gid 0 / mode 04755. Pre-fix this chowned an attacker file to
+    // root and set it setuid.
+    const fake = makeFakeFs(
+      {
+        "/f": { type: "dir", uid: 501, gid: 20, mode: 0o700, ino: 1 },
+        "/f/escape": { type: "symlink", uid: 501, gid: 20, mode: 0o777, ino: 2 },
+        "/f/escape/payload": { type: "file", uid: 501, gid: 20, mode: 0o755, ino: 3 },
+      },
+      { "/f": ["escape"] },
+    );
+    const manifest = manifestOf([
+      { path: ".", type: "dir", uid: 501, gid: 20, mode: 0o700, dev: 1, ino: 1 },
+      // The crafted entry claims the symlink is a plain directory.
+      { path: "escape", type: "dir", uid: 501, gid: 20, mode: 0o755, dev: 1, ino: 2 },
+      { path: "escape/payload", type: "file", uid: 0, gid: 0, mode: 0o4755, dev: 1, ino: 3 },
+    ]);
+
+    const result = await applyCustodyRollback("/f", manifest, fake.ops);
+
+    expect(result.identityChanged).toContain("escape/payload (ancestor changed)");
+    // The attacker's file was NEVER chowned to root and NEVER made setuid.
+    expect(fake.nodes.get("/f/escape/payload")!.uid).toBe(501);
+    expect(fake.nodes.get("/f/escape/payload")!.mode).toBe(0o755);
+    expect(fake.lchowns.some((c) => c.path === "/f/escape/payload")).toBe(false);
+    expect(fake.chmods.some((c) => c.path === "/f/escape/payload")).toBe(false);
+  });
+
+  it("detects setuid/setgid/sticky in a manifest so the CLI can refuse it wholesale", () => {
+    expect(
+      manifestCarriesPrivilegeBits(
+        manifestOf([
+          { path: "x", type: "file", uid: 0, gid: 0, mode: 0o4755, dev: 1, ino: 9 },
+        ]),
+      ),
+    ).toBe(true);
+    expect(
+      manifestCarriesPrivilegeBits(
+        manifestOf([
+          { path: "x", type: "file", uid: 0, gid: 0, mode: 0o600, dev: 1, ino: 9 },
+        ]),
+      ),
+    ).toBe(false);
+  });
+
+  it("masks applied modes to 0o777 so no rollback path can create a setuid file", async () => {
+    const fake = makeFakeFs(
+      {
+        "/f": { type: "dir", uid: 501, gid: 20, mode: 0o700, ino: 1 },
+        "/f/bin": { type: "file", uid: 501, gid: 20, mode: 0o755, ino: 2 },
+      },
+      { "/f": ["bin"] },
+    );
+    await applyCustodyRollback(
+      "/f",
+      manifestOf([
+        { path: ".", type: "dir", uid: 501, gid: 20, mode: 0o700, dev: 1, ino: 1 },
+        { path: "bin", type: "file", uid: 501, gid: 20, mode: 0o6755, dev: 1, ino: 2 },
+      ]),
+      fake.ops,
+    );
+    expect(fake.nodes.get("/f/bin")!.mode).toBe(0o755);
+    expect(fake.chmods.every((c) => (c.mode & 0o7000) === 0)).toBe(true);
+  });
+
+  it("REFUSES a symlinked fortress root (repair already did; rollback used to skip this)", async () => {
+    const fake = makeFakeFs(
+      { "/f": { type: "symlink", uid: 501, gid: 20, mode: 0o777, ino: 1 } },
+      {},
+    );
+    await expect(
+      applyCustodyRollback("/f", manifestOf([]), fake.ops),
+    ).rejects.toThrow(/not a plain directory/);
   });
 });
 

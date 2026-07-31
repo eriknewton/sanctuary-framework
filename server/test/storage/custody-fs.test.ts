@@ -12,7 +12,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { lstat } from "node:fs/promises";
+import { lstat, open } from "node:fs/promises";
 import {
   CustodyFsError,
   readFileCustody,
@@ -125,11 +125,18 @@ describe("create-with-fchown owner option (fortress-ownership spec 2026-07-30)",
       mode: 0o600,
       owner: selfOwner(),
     });
-    const stats = await lstat(target);
-    expect(stats.uid).toBe(selfOwner().uid);
+    // Owner + contents are read through ONE descriptor (no stat-then-open
+    // check-then-use race on the path).
+    const handle = await open(target, "r");
+    try {
+      const stats = await handle.stat();
+      expect(stats.uid).toBe(selfOwner().uid);
+      expect(await handle.readFile("utf8")).toBe("payload");
+    } finally {
+      await handle.close();
+    }
     expect((await lstat(join(dir, "made"))).uid).toBe(selfOwner().uid);
     expect((await lstat(join(dir, "made", "deep"))).uid).toBe(selfOwner().uid);
-    expect((await readFile(target, "utf8"))).toBe("payload");
   });
 
   it("FAILS CLOSED: an impossible owner fails the whole write and leaves no destination file", async function (this: void) {

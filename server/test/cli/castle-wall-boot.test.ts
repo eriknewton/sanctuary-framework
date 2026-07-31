@@ -883,6 +883,40 @@ describe("castle-wall boot service (F1 Option C)", () => {
       expect(normalizeCalls).toHaveLength(2);
     });
 
+    it("normalizes on FAILURE exits too, not just success (gate HIGH: the log-dir mkdir precedes them)", async () => {
+      const f = await makeInstallFixture();
+      const normalizeCalls: string[] = [];
+      // Bootstrap is accepted but the unit never stays running: a failure
+      // return AFTER the log-dir mkdir may have created the fortress
+      // top-level dir root-owned, so the chokepoint must still run.
+      let bootstrapped = false;
+      const flappingExec = (cmd: string, args: string[]): ExecFileResult => {
+        if (cmd === "launchctl" && args[0] === "bootstrap") bootstrapped = true;
+        if (bootstrapped && cmd === "launchctl" && args[0] === "print") {
+          return { code: 0, stdout: "\tstate = not running\n", stderr: "" };
+        }
+        return f.fake.execFileFn(cmd, args);
+      };
+      const code = await runInstallBoot(f.argv, {
+        ...f.ctx,
+        env: { SUDO_USER: "operator", SUDO_UID: "501", SUDO_GID: "20" },
+        execFileFn: flappingExec,
+        normalizeFortressCustody: async (input: { fortressPath: string }) => {
+          normalizeCalls.push(input.fortressPath);
+          return {
+            status: "clean" as const,
+            repaired: [],
+            skips: [],
+            vanished: [],
+            failed: [],
+          };
+        },
+      });
+      expect(code).toBe(1);
+      expect(f.err.text()).toContain("did not stay running");
+      expect(normalizeCalls).toEqual([f.fortress]);
+    });
+
     it("warns loudly instead of guessing an owner when root runs without a resolvable operator", async () => {
       const f = await makeInstallFixture();
       const normalizeCalls: string[] = [];
