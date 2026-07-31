@@ -2068,7 +2068,10 @@ describe("fortress-ownership guards on arm/disarm (spec 2026-07-30)", () => {
         err: new CaptureStream(),
         env,
         platform: "darwin",
-        getuid: () => 501,
+        // The REAL uid, so the host-app owner-trust check passes on any
+        // runner; hard-coding 501 made this pass only where the author's uid
+        // happened to match.
+        getuid: () => Number(TEST_OPERATOR_UID),
         hostAppCandidates: [hostAppPath],
         hostAppInvoke: makeInvoker(responses).invoke,
         normalizeFortressCustody: async (input) => {
