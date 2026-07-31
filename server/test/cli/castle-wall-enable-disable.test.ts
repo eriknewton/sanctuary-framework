@@ -1922,3 +1922,189 @@ describe("makeLaunchServicesHostAppInvoke", () => {
     expect(events).toEqual(["probe", "terminate:CastleWallHostApp", "open"]);
   });
 });
+
+describe("fortress-ownership guards on arm/disarm (spec 2026-07-30)", () => {
+  const tempDirs: string[] = [];
+
+  afterEach(async () => {
+    for (const dir of tempDirs.splice(0)) {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  async function makeFixture() {
+    const fortressPath = await mkdtemp(join(tmpdir(), "sanctuary-cw-custody-"));
+    tempDirs.push(fortressPath);
+    const hostAppPath = join(fortressPath, "CastleWallHostApp");
+    await writeFile(hostAppPath, "#!/bin/sh\n", { mode: 0o755 });
+    const env = {
+      SANCTUARY_STORAGE_PATH: fortressPath,
+      SANCTUARY_RECOVERY_KEY: toBase64url(generateRandomKey()),
+      SANCTUARY_CASTLE_BUILD_SHA: TEST_BUILD_SHA,
+    };
+    return { fortressPath, hostAppPath, env };
+  }
+
+  it("enable refuses a root-owned fortress before any other gate, and --force does not override", async () => {
+    const { hostAppPath, env } = await makeFixture();
+    const err = new CaptureStream();
+    const { invoke, calls } = makeInvoker({});
+
+    const code = await runEnable(["--no-ttl", "--force"], {
+      out: new CaptureStream(),
+      err,
+      env,
+      platform: "darwin",
+      hostAppCandidates: [hostAppPath],
+      hostAppInvoke: invoke,
+      // Every downstream gate would pass; only the custody guard refuses.
+      daemonProbe: async () => true,
+      bootServiceReadyProbe: async () => true,
+      sysextProbe: async () => "[activated enabled]",
+      agentOriginDescriptorProbe: async () => true,
+      fortressOwnerUidProbe: async () => 0,
+    });
+
+    expect(code).toBe(1);
+    expect(err.text()).toContain("owned by root");
+    expect(err.text()).toContain("repair-custody");
+    expect(err.text()).toContain("--force does not override");
+    // Never reaches the host app: nothing armed.
+    expect(calls).toHaveLength(0);
+  });
+
+  it("enable proceeds when the fortress is operator-owned or unstattable", async () => {
+    const { fortressPath, hostAppPath, env } = await makeFixture();
+    const out = new CaptureStream();
+    const { invoke } = makeInvoker({
+      enable: { stdout: reportLine("enable", "enabled", true), exitCode: 0 },
+      status: { stdout: reportLine("status", "enabled", true), exitCode: 0 },
+    });
+
+    const code = await runEnable(["--fortress", fortressPath, "--no-ttl"], {
+      out,
+      err: new CaptureStream(),
+      env,
+      platform: "darwin",
+      hostAppCandidates: [hostAppPath],
+      hostAppInvoke: invoke,
+      daemonProbe: async () => true,
+      bootServiceReadyProbe: async () => true,
+      sysextProbe: async () => "[activated enabled]",
+      egressAllowRuleCountProbe: async () => 1,
+      agentOriginDescriptorProbe: async () => true,
+      fortressOwnerUidProbe: async () => 501,
+    });
+
+    expect(code).toBe(0);
+    expect(out.text()).toContain("Castle Wall armed");
+  });
+
+  it("a sudo enable runs the custody-normalize chokepoint with the resolved operator", async () => {
+    const { fortressPath, hostAppPath, env } = await makeFixture();
+    const { invoke } = makeInvoker({
+      enable: { stdout: reportLine("enable", "enabled", true), exitCode: 0 },
+      status: { stdout: reportLine("status", "enabled", true), exitCode: 0 },
+    });
+    const normalizeCalls: { fortressPath: string; operator: { uid: number; gid: number } }[] = [];
+
+    const code = await runEnable(["--fortress", fortressPath, "--no-ttl"], {
+      out: new CaptureStream(),
+      err: new CaptureStream(),
+      env: { ...env, SUDO_UID: "501", SUDO_GID: "20", SUDO_USER: "operator" },
+      platform: "darwin",
+      getuid: () => 0,
+      hostAppCandidates: [hostAppPath],
+      hostAppInvoke: invoke,
+      daemonProbe: async () => true,
+      bootServiceReadyProbe: async () => true,
+      sysextProbe: async () => "[activated enabled]",
+      egressAllowRuleCountProbe: async () => 1,
+      agentOriginDescriptorProbe: async () => true,
+      fortressOwnerUidProbe: async () => 501,
+      normalizeFortressCustody: async (input) => {
+        normalizeCalls.push({ fortressPath: input.fortressPath, operator: input.operator });
+        return { status: "clean", repaired: [], skips: [], vanished: [], failed: [] };
+      },
+    });
+
+    expect(code).toBe(0);
+    expect(normalizeCalls).toEqual([
+      { fortressPath, operator: { uid: 501, gid: 20 } },
+    ]);
+  });
+
+  it("a sudo disable runs the chokepoint too; a non-root run never does", async () => {
+    const { fortressPath, hostAppPath, env } = await makeFixture();
+    const responses = {
+      disable: { stdout: reportLine("disable", "disabled", true), exitCode: 0 },
+      status: { stdout: reportLine("status", "disabled", true), exitCode: 0 },
+    };
+    const sudoCalls: string[] = [];
+    expect(
+      await runDisable([], {
+        out: new CaptureStream(),
+        err: new CaptureStream(),
+        env: { ...env, SUDO_UID: "501", SUDO_GID: "20", SUDO_USER: "operator" },
+        platform: "darwin",
+        getuid: () => 0,
+        hostAppCandidates: [hostAppPath],
+        hostAppInvoke: makeInvoker(responses).invoke,
+        normalizeFortressCustody: async (input) => {
+          sudoCalls.push(input.fortressPath);
+          return { status: "clean", repaired: [], skips: [], vanished: [], failed: [] };
+        },
+      }),
+    ).toBe(0);
+    expect(sudoCalls).toEqual([fortressPath]);
+
+    const nonRootCalls: string[] = [];
+    expect(
+      await runDisable([], {
+        out: new CaptureStream(),
+        err: new CaptureStream(),
+        env,
+        platform: "darwin",
+        getuid: () => 501,
+        hostAppCandidates: [hostAppPath],
+        hostAppInvoke: makeInvoker(responses).invoke,
+        normalizeFortressCustody: async (input) => {
+          nonRootCalls.push(input.fortressPath);
+          return { status: "clean", repaired: [], skips: [], vanished: [], failed: [] };
+        },
+      }),
+    ).toBe(0);
+    expect(nonRootCalls).toEqual([]);
+  });
+
+  it("a root run without a resolvable operator warns loudly instead of guessing an owner", async () => {
+    const { fortressPath, hostAppPath, env } = await makeFixture();
+    const err = new CaptureStream();
+    const { invoke } = makeInvoker({
+      disable: { stdout: reportLine("disable", "disabled", true), exitCode: 0 },
+      status: { stdout: reportLine("status", "disabled", true), exitCode: 0 },
+    });
+    const calls: string[] = [];
+
+    const code = await runDisable(["--fortress", fortressPath], {
+      out: new CaptureStream(),
+      err,
+      // SUDO_GID missing: the fail-closed identity chokepoint refuses, even
+      // though enough SUDO context exists for host-app trust resolution.
+      env: { ...env, SUDO_UID: "501" },
+      platform: "darwin",
+      getuid: () => 0,
+      hostAppCandidates: [hostAppPath],
+      hostAppInvoke: invoke,
+      normalizeFortressCustody: async (input) => {
+        calls.push(input.fortressPath);
+        return { status: "clean", repaired: [], skips: [], vanished: [], failed: [] };
+      },
+    });
+
+    expect(code).toBe(0);
+    expect(calls).toEqual([]);
+    expect(err.text()).toContain("fortress custody was not normalized");
+    expect(err.text()).toContain("repair-custody");
+  });
+});

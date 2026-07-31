@@ -141,6 +141,12 @@ import {
   type EgressGateRepairOutcome,
 } from "../castle-wall/provision/exclusive-arm.js";
 import { runEgressGateUnprotect } from "../castle-wall/provision/exclusive-unprotect.js";
+import {
+  normalizeFortressCustody,
+  resolveSudoIdentityDecision,
+  type NormalizeFortressCustodyInput,
+  type NormalizeFortressCustodyOutcome,
+} from "../castle-wall/provision/fortress-custody.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -741,76 +747,13 @@ export interface OperatorIdentity {
   home: string;
 }
 
-/**
- * Pure decision logic behind sudo-aware operator-identity resolution (fix R2
- * chokepoint seam): given the raw env values `sudo` sets
- * (`SUDO_UID`/`SUDO_GID`/`SUDO_USER`) and a name-validity check, decide
- * whether the operator identity is resolvable and, if so, from which env
- * vars. Exported so the real-ops unit-test suite can drive every branch
- * (both present, one missing, malformed) without touching a real process
- * environment or `dscl`.
- *
- * FIX R2: the pre-fix-round-2 code called `homedir()`/`userInfo()`
- * unconditionally, which under `sudo sanctuary protect --hermes` (this
- * function's only supported invocation shape, per the root check above every
- * caller) resolves to root's own identity (`/var/root`, 0/0) -- NOT the
- * operator. Two concrete failures followed: (1) the re-home SOURCE path
- * resolved to `/var/root/.hermes/...`, which is never where the operator's
- * real Hermes config lives, so re-home silently found nothing to move and
- * the wall armed over un-re-homed secrets; (2) F3's custody handback chowned
- * restored secrets to root, leaving the operator unable to read their own
- * recovered `.env` after a failed/aborted run.
- *
- * Fail-closed: `SUDO_UID`/`SUDO_GID` must both be present and parse as
- * non-negative integers, and (when present) `SUDO_USER` must match a safe
- * account-name shape; any other combination resolves `undefined` (never a
- * fabricated or root-fallback identity).
- *
- * FIX G4 (MEDIUM, 2026-07-07 re-gate 3 / fix-round 3): a ROOT sudo context
- * (e.g. `sudo su -` then running `sanctuary protect --hermes` from that root
- * shell) sets `SUDO_UID=0`/`SUDO_GID=0` (and often `SUDO_USER=root`). The
- * pre-fix code accepted uid/gid `0` as a perfectly well-formed "operator"
- * identity, which resolves the operator's home to `/var/root` and custody
- * to `0:0` -- reintroducing the EXACT root-home path this whole R2 fix
- * exists to fail closed against (re-home would look for secrets under
- * `/var/root/.hermes/...`, never where they actually live, and any restored
- * secret would be chowned back to root instead of a real operator account).
- * Reject uid `0`, gid `0`, and `SUDO_USER === "root"` outright -- fail closed
- * to the same `undefined` the caller already treats as "abort at the
- * root-check stage", never silently resolving root as the operator.
- */
-export function resolveSudoIdentityDecision(env: {
-  SUDO_UID?: string;
-  SUDO_GID?: string;
-  SUDO_USER?: string;
-}): { uid: number; gid: number; user?: string } | undefined {
-  const { SUDO_UID, SUDO_GID, SUDO_USER } = env;
-  if (SUDO_UID === undefined || SUDO_GID === undefined) {
-    return undefined;
-  }
-  if (!/^\d+$/.test(SUDO_UID) || !/^\d+$/.test(SUDO_GID)) {
-    return undefined;
-  }
-  const uid = Number(SUDO_UID);
-  const gid = Number(SUDO_GID);
-  if (!Number.isSafeInteger(uid) || !Number.isSafeInteger(gid)) {
-    return undefined;
-  }
-  // FIX G4: a root sudo context is never a valid "operator" -- fail closed
-  // rather than resolve /var/root + custody 0:0.
-  if (uid === 0 || gid === 0 || SUDO_USER === "root") {
-    return undefined;
-  }
-  if (SUDO_USER !== undefined && !/^[a-zA-Z0-9._-]+$/.test(SUDO_USER)) {
-    // A SUDO_USER value that fails the safe-name shape is refused outright
-    // (fail-closed), even though uid/gid alone would be enough to chown
-    // with: an unparseable SUDO_USER is a signal something about this
-    // invocation is not a normal sudo call, and the home-directory lookup
-    // below needs a trustworthy name to pass to `dscl`.
-    return undefined;
-  }
-  return { uid, gid, user: SUDO_USER };
-}
+// `resolveSudoIdentityDecision` (the R2/G4 sudo-identity chokepoint) moved
+// VERBATIM to `../castle-wall/provision/fortress-custody.ts` so the custody
+// repair verb + normalize chokepoint (which the CLI layers call) can share
+// the SAME fail-closed resolution without an import cycle (cli ->
+// wrap/auto-provision would cycle through wrap/preflight -> cli). Re-exported
+// here for the historical import sites (wrap/preflight + tests).
+export { resolveSudoIdentityDecision };
 
 /**
  * Resolve the operator's identity + home directory, sudo-aware (fix R2).
@@ -968,6 +911,13 @@ export interface RunAutoProvisionForWrapOptions {
   getuid?: () => number;
   /** Override for the resolved operator identity (tests only; production leaves this undefined and resolves via SUDO_UID/GID/USER). */
   resolveOperatorIdentity?: () => Promise<OperatorIdentity | undefined>;
+  /**
+   * Override for the end-of-flow custody-normalize chokepoint (tests only;
+   * production leaves this undefined and uses {@link normalizeFortressCustody}).
+   */
+  normalizeFortressCustody?: (
+    input: NormalizeFortressCustodyInput,
+  ) => Promise<NormalizeFortressCustodyOutcome>;
   /**
    * Unified Protect Slice 5 S5-6: fine-grained (exclusive-egress) mode. The
    * harness is PARK-installed (S5-5 barrier form) and the exclusive-egress
@@ -1935,7 +1885,43 @@ export async function runAutoProvisionForWrap(
     ),
   );
 
-  return { ran: true, outcome };
+  return finishProvisionOutcomeWithCustodyNormalize({
+    outcome,
+    wallFortressPath,
+    operator: { uid: operatorIdentity.uid, gid: operatorIdentity.gid },
+    print,
+    normalize: options.normalizeFortressCustody,
+  });
+}
+
+/**
+ * Custody-normalize chokepoint tail for the protect flow (fortress-ownership
+ * spec 2026-07-30 §4(a2)(1), amendment 2): the flow runs with euid 0 and
+ * touches the fortress (daemon install, lease writes, arm audit), so ANY
+ * outcome -- including an abort after partial mutation -- can leave
+ * root-owned entries behind (the Mini2 root-owned `~/.sanctuary` root
+ * cause). Hand every root-owned entry back to the resolved operator before
+ * the summary is returned; same semantics as `sudo sanctuary castle-wall
+ * repair-custody`, loud on failure, never flow-fatal. Exported so the unit
+ * suite can prove the production tail normalizes on every outcome kind
+ * without driving the root-only provisioning flow end to end.
+ */
+export async function finishProvisionOutcomeWithCustodyNormalize(input: {
+  outcome: ProvisionFlowOutcome;
+  wallFortressPath: string;
+  operator: { uid: number; gid: number };
+  print: (line: string) => void;
+  normalize?: (
+    normalizeInput: NormalizeFortressCustodyInput,
+  ) => Promise<NormalizeFortressCustodyOutcome>;
+}): Promise<AutoProvisionSummary> {
+  const normalize = input.normalize ?? normalizeFortressCustody;
+  await normalize({
+    fortressPath: input.wallFortressPath,
+    operator: input.operator,
+    log: input.print,
+  });
+  return { ran: true, outcome: input.outcome };
 }
 
 // ── Real op implementations (drill-only side effects; never exercised by CI) ──

@@ -239,4 +239,65 @@ describe("castle-wall safe-mode daemon (F1 Option C)", () => {
     expect(err.text()).toContain("signer helper is unreachable");
     expect(err.text()).toMatch(/Background Item/);
   });
+
+  it("warns LOUDLY when a root safe-mode daemon derives a root-owned fortress (silent no-op killed; spec 2026-07-30)", async () => {
+    const fortress = await makeFortress();
+    const tok = await makeToken();
+    const err = new CaptureStream();
+
+    const code = await runSafeModeDaemon([], {
+      err,
+      platform: "darwin",
+      env: { SANCTUARY_STORAGE_PATH: fortress },
+      bootTokenPath: tok.path,
+      signerClientPath: "/Applications/Castle Wall.app/Contents/MacOS/castle-wall-signer-client",
+      getuid: () => 0,
+      // The Mini2 state: the fortress dir itself stats as root-owned.
+      fortressStat: async () => ({ uid: 0, gid: 20 }),
+      safeModeDaemonStart: async () => {
+        throw STOP_AFTER_CAPTURE;
+      },
+    });
+
+    expect(code).toBe(1);
+    expect(err.text()).toContain("owned by root (uid 0)");
+    expect(err.text()).toContain("dead-man lever");
+    expect(err.text()).toContain("sudo sanctuary castle-wall repair-custody");
+  });
+
+  it("does NOT warn about root ownership for an operator-owned fortress, and keeps the stat-failure warning", async () => {
+    const fortress = await makeFortress();
+    const tok = await makeToken();
+    const cleanErr = new CaptureStream();
+    await runSafeModeDaemon([], {
+      err: cleanErr,
+      platform: "darwin",
+      env: { SANCTUARY_STORAGE_PATH: fortress },
+      bootTokenPath: tok.path,
+      signerClientPath: "/Applications/Castle Wall.app/Contents/MacOS/castle-wall-signer-client",
+      getuid: () => 0,
+      fortressStat: async () => ({ uid: 501, gid: 20 }),
+      safeModeDaemonStart: async () => {
+        throw STOP_AFTER_CAPTURE;
+      },
+    });
+    expect(cleanErr.text()).not.toContain("owned by root");
+
+    const statFailErr = new CaptureStream();
+    await runSafeModeDaemon([], {
+      err: statFailErr,
+      platform: "darwin",
+      env: { SANCTUARY_STORAGE_PATH: fortress },
+      bootTokenPath: tok.path,
+      signerClientPath: "/Applications/Castle Wall.app/Contents/MacOS/castle-wall-signer-client",
+      getuid: () => 0,
+      fortressStat: async () => {
+        throw new Error("EACCES: denied");
+      },
+      safeModeDaemonStart: async () => {
+        throw STOP_AFTER_CAPTURE;
+      },
+    });
+    expect(statFailErr.text()).toContain("could not resolve the fortress owner");
+  });
 });

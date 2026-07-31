@@ -12,11 +12,13 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { lstat } from "node:fs/promises";
 import {
   CustodyFsError,
   readFileCustody,
   writeFileCustody,
 } from "../../src/storage/custody-fs.js";
+import { FilesystemStorage } from "../../src/storage/filesystem.js";
 
 describe("custody-fs descriptor-first file API", () => {
   let dir: string;
@@ -98,5 +100,74 @@ describe("CustodyFsError", () => {
     const error = new CustodyFsError("mode_rejected", "redacted");
     expect(error.code).toBe("mode_rejected");
     expect(error.message).toBe("redacted");
+  });
+});
+
+describe("create-with-fchown owner option (fortress-ownership spec 2026-07-30)", () => {
+  let dir: string;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), "sanctuary-custody-owner-"));
+  });
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  const selfOwner = () => ({
+    uid: process.getuid?.() ?? 0,
+    gid: process.getgid?.() ?? 0,
+  });
+
+  it("applies the owner on the descriptor before the atomic rename (and to created parent dirs)", async () => {
+    const target = join(dir, "made", "deep", "file.enc");
+    await writeFileCustody(target, "payload", {
+      mode: 0o600,
+      owner: selfOwner(),
+    });
+    const stats = await lstat(target);
+    expect(stats.uid).toBe(selfOwner().uid);
+    expect((await lstat(join(dir, "made"))).uid).toBe(selfOwner().uid);
+    expect((await lstat(join(dir, "made", "deep"))).uid).toBe(selfOwner().uid);
+    expect((await readFile(target, "utf8"))).toBe("payload");
+  });
+
+  it("FAILS CLOSED: an impossible owner fails the whole write and leaves no destination file", async function (this: void) {
+    if (process.getuid?.() === 0) {
+      // Root can chown to anyone; the fail-closed branch is unreachable.
+      return;
+    }
+    const target = join(dir, "file.enc");
+    await expect(
+      writeFileCustody(target, "payload", {
+        mode: 0o600,
+        // A non-root process cannot give a file away to root: fchown EPERM.
+        owner: { uid: 0, gid: 0 },
+      }),
+    ).rejects.toThrow();
+    // Never a silent degradation: no destination file with the wrong owner.
+    await expect(lstat(target)).rejects.toThrow();
+  });
+
+  it("FilesystemStorage threads its owner into every write (fail-closed proves the call path)", async function (this: void) {
+    if (process.getuid?.() === 0) {
+      return;
+    }
+    const good = new FilesystemStorage(join(dir, "store"), { owner: selfOwner() });
+    await good.write("ns", "key", new TextEncoder().encode("v"));
+    expect(await good.read("ns", "key")).not.toBeNull();
+
+    // With an impossible owner the SAME write must fail: proof the owner
+    // actually reaches fchown (a storage that ignored the option would pass).
+    const bad = new FilesystemStorage(join(dir, "store-bad"), { owner: { uid: 0, gid: 0 } });
+    await expect(bad.write("ns", "key", new TextEncoder().encode("v"))).rejects.toThrow();
+    expect(await bad.read("ns", "key")).toBeNull();
+  });
+
+  it("no owner option means no chown call and unchanged behavior", async () => {
+    const target = join(dir, "plain.enc");
+    await writeFileCustody(target, "payload", { mode: 0o600 });
+    const stats = await lstat(target);
+    expect(stats.uid).toBe(process.getuid?.() ?? stats.uid);
   });
 });

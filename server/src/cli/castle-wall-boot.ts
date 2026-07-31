@@ -82,6 +82,12 @@ import {
   safeModeAuditStoragePath,
 } from "../castle-wall/boot/boot-token.js";
 import { resolveCastleWallSocketPath } from "../castle-wall/runtime/socket-path.js";
+import {
+  normalizeFortressCustody,
+  resolveSudoIdentityDecision,
+  type NormalizeFortressCustodyInput,
+  type NormalizeFortressCustodyOutcome,
+} from "../castle-wall/provision/fortress-custody.js";
 
 export const CASTLE_WALL_BOOT_LABEL = "ai.sanctuaryprotocol.castle-wall.daemon";
 export const CASTLE_WALL_BOOT_PLIST_PATH = `/Library/LaunchDaemons/${CASTLE_WALL_BOOT_LABEL}.plist`;
@@ -135,6 +141,13 @@ export interface CastleWallBootContext {
    * stale-socket guard does not depend on local Unix socket permissions.
    */
   socketHasLiveListenerFn?: (socketPath: string) => Promise<boolean>;
+  /**
+   * Override the end-of-flow custody-normalize chokepoint (tests). Defaults
+   * to {@link normalizeFortressCustody}.
+   */
+  normalizeFortressCustody?: (
+    input: NormalizeFortressCustodyInput,
+  ) => Promise<NormalizeFortressCustodyOutcome>;
 }
 
 function write(stream: Writable, text: string): void {
@@ -1034,6 +1047,39 @@ async function awaitStableServicePid(
   return distinctLivePids.size === 1 ? last : null;
 }
 
+/**
+ * Custody-normalize chokepoint for install-boot (fortress-ownership spec
+ * 2026-07-30 §4(a2)(1)): install-boot runs as root and touches the fortress
+ * (its log-dir `mkdir { recursive: true }` CREATED the fortress top-level dir
+ * root-owned when it did not exist yet -- the exact Mini2 root cause -- and
+ * the freshly bootstrapped root daemon writes audit/config entries into it).
+ * Hand every root-owned entry back to the resolved operator before
+ * returning success. Loud (never silent) when the operator is unresolvable.
+ */
+async function normalizeInstallBootFortressCustody(
+  fortressPath: string,
+  env: NodeJS.ProcessEnv,
+  err: Writable,
+  override?: (
+    input: NormalizeFortressCustodyInput,
+  ) => Promise<NormalizeFortressCustodyOutcome>,
+): Promise<void> {
+  const identity = resolveSudoIdentityDecision(env);
+  if (identity === undefined) {
+    write(
+      err,
+      "Warning: could not resolve the operator identity (SUDO_UID/SUDO_GID), so fortress custody was not normalized. If operator surfaces report EACCES, run: sudo sanctuary castle-wall repair-custody\n",
+    );
+    return;
+  }
+  const normalize = override ?? normalizeFortressCustody;
+  await normalize({
+    fortressPath,
+    operator: { uid: identity.uid, gid: identity.gid },
+    log: (line) => write(err, `${line}\n`),
+  });
+}
+
 export async function runInstallBoot(
   argv: string[] = [],
   ctx: CastleWallBootContext = {},
@@ -1219,6 +1265,12 @@ export async function runInstallBoot(
   // or target a different fortress.
   if (existing === plist && (await bootServiceReady(plistPath, fortressPath, execFileFn, sleepFn))) {
     write(out, `Castle Wall boot service already installed and running (${plistPath}).\n`);
+    await normalizeInstallBootFortressCustody(
+      fortressPath,
+      env,
+      err,
+      ctx.normalizeFortressCustody,
+    );
     return 0;
   }
 
@@ -1291,6 +1343,13 @@ export async function runInstallBoot(
     );
     return 1;
   }
+
+  await normalizeInstallBootFortressCustody(
+    fortressPath,
+    env,
+    err,
+    ctx.normalizeFortressCustody,
+  );
 
   write(out, `Castle Wall safe-mode boot service installed and running (pid ${pid}): ${plistPath}\n`);
   write(out, `Runs as root at boot in SAFE MODE (boot token only, never the master key); fortress ${fortressPath}; KeepAlive on.\n`);

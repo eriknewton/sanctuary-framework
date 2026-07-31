@@ -37,11 +37,16 @@ const FDA_PROBE = `${OPERATOR_HOME}/Library/Caches/com.apple.containermanagerd`;
 const HERMES_GATEWAY_PLIST = `${OPERATOR_HOME}/Library/LaunchAgents/ai.hermes.gateway.plist`;
 const PRETEND_TIME = new Date("2026-07-29T12:00:00.000Z");
 
+type OwnerResult =
+  | { ok: true; uid: number; gid: number }
+  | { ok: false; reason: string; code?: string };
+
 interface FixtureOpsInput {
   env?: NodeJS.ProcessEnv;
   platform?: string;
   uid?: number;
   entries?: Map<string, FsEntry>;
+  owner?: Map<string, OwnerResult>;
   executable?: Set<string>;
   readText?: Map<string, { ok: true; text: string } | { ok: false; reason: string; code?: string }>;
   readDir?: Map<string, { ok: true } | { ok: false; reason: string; code?: string }>;
@@ -123,6 +128,10 @@ function fixtureOps(input: FixtureOpsInput = {}): ProtectPreflightOps {
         return execResult(1, "", `unexpected exec ${cmd} ${joined}`);
       }),
     entry: async (path) => entries.get(path) ?? absentEntry(),
+    owner: async (path) =>
+      (input.owner ?? new Map<string, OwnerResult>([[FORTRESS, { ok: true, uid: 501, gid: 20 }]])).get(
+        path,
+      ) ?? { ok: false, reason: "ENOENT", code: "ENOENT" },
     access:
       input.access ??
       (async (path) =>
@@ -182,7 +191,7 @@ describe("protect preflight", () => {
       ops: fixtureOps(),
     });
 
-    expect(report.summary).toEqual({ pass: 7, fail: 0, undetermined: 0 });
+    expect(report.summary).toEqual({ pass: 8, fail: 0, undetermined: 0 });
     expect(protectPreflightExitCode(report)).toBe(0);
     expect(report.rows.map((candidate) => candidate.status)).toEqual([
       "PASS",
@@ -192,11 +201,13 @@ describe("protect preflight", () => {
       "PASS",
       "PASS",
       "PASS",
+      "PASS",
     ]);
+    expect(row(report, "fortress_custody").state).toBe("operator_owned");
     expect(row(report, "provider_liveness").providers?.[0]?.state).toBe("live");
     expect(JSON.parse(renderProtectPreflightJson(report))).toMatchObject({
       command: "sanctuary protect preflight",
-      summary: { pass: 7, fail: 0, undetermined: 0 },
+      summary: { pass: 8, fail: 0, undetermined: 0 },
     });
     expect(renderProtectPreflightReport(report)).toContain("| PASS");
   });
@@ -229,6 +240,8 @@ describe("protect preflight", () => {
         readDir: new Map([
           [FDA_PROBE, { ok: false, reason: "EACCES", code: "EACCES" }],
         ]),
+        // The drill-mini2 state: the fortress itself is ROOT-owned.
+        owner: new Map<string, OwnerResult>([[FORTRESS, { ok: true, uid: 0, gid: 20 }]]),
         execFile: async (cmd, args) => {
           const joined = args.join(" ");
           if (cmd.endsWith("lsof")) {
@@ -255,12 +268,18 @@ describe("protect preflight", () => {
       }),
     });
 
-    expect(report.summary).toEqual({ pass: 0, fail: 7, undetermined: 0 });
+    expect(report.summary).toEqual({ pass: 0, fail: 8, undetermined: 0 });
     expect(row(report, "castle_sock_holder")).toMatchObject({
       status: "FAIL",
       state: "launchd_safe_mode_boot_daemon",
       remedy: "sudo launchctl bootout system/ai.sanctuaryprotocol.castle-wall.daemon",
     });
+    expect(row(report, "fortress_custody")).toMatchObject({
+      status: "FAIL",
+      state: "root_owned_fortress",
+      remedy: "Run: sudo sanctuary castle-wall repair-custody",
+    });
+    expect(row(report, "fortress_custody").detail).toContain("dead-man lever");
     expect(row(report, "root_path_sanctuary").remedy).toContain(
       "node server/dist/cli.js",
     );
@@ -328,6 +347,9 @@ describe("protect preflight", () => {
           [FDA_PROBE, unknownEntry("EIO")],
           [HERMES_GATEWAY_PLIST, unknownEntry("EIO")],
         ]),
+        owner: new Map<string, OwnerResult>([
+          [FORTRESS, { ok: false, reason: "EIO", code: "EIO" }],
+        ]),
         access: async () => ({ ok: false, reason: "EIO", code: "EIO" }),
         execFile: async (cmd, args) => {
           const joined = args.join(" ");
@@ -341,10 +363,65 @@ describe("protect preflight", () => {
       }),
     });
 
-    expect(report.summary).toEqual({ pass: 0, fail: 0, undetermined: 7 });
+    expect(report.summary).toEqual({ pass: 0, fail: 0, undetermined: 8 });
     expect(report.rows.every((candidate) => candidate.status === "UNDETERMINED")).toBe(true);
     expect(protectPreflightExitCode(report)).toBe(0);
     expect(protectPreflightExitCode(report, true)).toBe(2);
+  });
+
+  it("fortress_custody FAILs on any non-operator owner and PASSes on an absent fortress", async () => {
+    const mismatch = await runProtectPreflight({
+      ops: fixtureOps({
+        owner: new Map<string, OwnerResult>([[FORTRESS, { ok: true, uid: 777, gid: 20 }]]),
+      }),
+    });
+    expect(row(mismatch, "fortress_custody")).toMatchObject({
+      status: "FAIL",
+      state: "owner_mismatch",
+      remedy: "Run: sudo sanctuary castle-wall repair-custody",
+    });
+    expect(protectPreflightExitCode(mismatch)).toBe(2);
+
+    const absent = await runProtectPreflight({
+      ops: fixtureOps({
+        owner: new Map<string, OwnerResult>([
+          [FORTRESS, { ok: false, reason: "ENOENT", code: "ENOENT" }],
+        ]),
+      }),
+    });
+    expect(row(absent, "fortress_custody")).toMatchObject({
+      status: "PASS",
+      state: "no_fortress",
+    });
+  });
+
+  it("fortress_custody resolves the operator from the sudo identity when run under sudo", async () => {
+    // Root under sudo: operator resolves to uid 501 via SUDO_*, and a
+    // root-owned fortress still FAILs loudly.
+    const report = await runProtectPreflight({
+      ops: fixtureOps({
+        uid: 0,
+        env: baseEnv({ SUDO_UID: "501", SUDO_GID: "20", SUDO_USER: "operator" }),
+        owner: new Map<string, OwnerResult>([[FORTRESS, { ok: true, uid: 0, gid: 0 }]]),
+        execFile: async (cmd, args) => {
+          const joined = args.join(" ");
+          if (cmd === "/usr/bin/dscl") {
+            return execResult(0, `NFSHomeDirectory: ${OPERATOR_HOME}\n`);
+          }
+          if (cmd.endsWith("lsof")) return execResult(1);
+          if (cmd === "systemextensionsctl") {
+            return execResult(0, "[activated enabled] ai.sanctuaryprotocol.castlewall\n");
+          }
+          if (cmd === "launchctl") return execResult(113, "", "Could not find service");
+          if (cmd.endsWith("ps")) return execResult(0, "UID PID COMMAND\n");
+          return execResult(1, "", `unexpected exec ${cmd} ${joined}`);
+        },
+      }),
+    });
+    expect(row(report, "fortress_custody")).toMatchObject({
+      status: "FAIL",
+      state: "root_owned_fortress",
+    });
   });
 
   it("does not write when run against a read-only fixture tree", async () => {
@@ -430,6 +507,7 @@ describe("protect preflight", () => {
       expect(parsed.command).toBe("sanctuary protect preflight");
       expect(parsed.rows.map((candidate) => candidate.id)).toEqual([
         "castle_sock_holder",
+        "fortress_custody",
         "root_path_sanctuary",
         "signer_client",
         "sysext_approval",

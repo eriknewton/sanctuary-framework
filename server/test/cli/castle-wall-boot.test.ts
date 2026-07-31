@@ -854,6 +854,60 @@ describe("castle-wall boot service (F1 Option C)", () => {
       expect(f.out.text()).toContain("already installed and running");
     });
 
+    it("runs the custody-normalize chokepoint on success with the resolved operator (spec 2026-07-30)", async () => {
+      const f = await makeInstallFixture();
+      const normalizeCalls: { fortressPath: string; operator: { uid: number; gid: number } }[] = [];
+      const ctx = {
+        ...f.ctx,
+        env: { SUDO_USER: "operator", SUDO_UID: "501", SUDO_GID: "20" },
+        normalizeFortressCustody: async (input: { fortressPath: string; operator: { uid: number; gid: number } }) => {
+          normalizeCalls.push({ fortressPath: input.fortressPath, operator: input.operator });
+          return {
+            status: "clean" as const,
+            repaired: [],
+            skips: [],
+            vanished: [],
+            failed: [],
+          };
+        },
+      };
+      expect(await runInstallBoot(f.argv, ctx)).toBe(0);
+      expect(normalizeCalls).toEqual([
+        { fortressPath: f.fortress, operator: { uid: 501, gid: 20 } },
+      ]);
+
+      // The idempotent already-installed shortcut ALSO normalizes: the log-dir
+      // mkdir above it touches the fortress on every run.
+      expect(await runInstallBoot(f.argv, ctx)).toBe(0);
+      expect(f.out.text()).toContain("already installed and running");
+      expect(normalizeCalls).toHaveLength(2);
+    });
+
+    it("warns loudly instead of guessing an owner when root runs without a resolvable operator", async () => {
+      const f = await makeInstallFixture();
+      const normalizeCalls: string[] = [];
+      const ctx = {
+        ...f.ctx,
+        // SUDO_USER present (install-boot's own operator-name requirement) but
+        // no SUDO_UID/SUDO_GID: the fail-closed identity chokepoint refuses.
+        env: { SUDO_USER: "operator" },
+        normalizeFortressCustody: async (input: { fortressPath: string }) => {
+          normalizeCalls.push(input.fortressPath);
+          return {
+            status: "clean" as const,
+            repaired: [],
+            skips: [],
+            vanished: [],
+            failed: [],
+          };
+        },
+      };
+      expect(await runInstallBoot(f.argv, ctx)).toBe(0);
+      expect(normalizeCalls).toEqual([]);
+      expect(f.err.text()).toContain("fortress custody was not normalized");
+      expect(f.err.text()).toContain("repair-custody");
+    });
+
     it("repairs a disabled launchd override instead of taking the idempotent shortcut", async () => {
       const f = await makeInstallFixture();
       expect(await runInstallBoot(f.argv, f.ctx)).toBe(0);

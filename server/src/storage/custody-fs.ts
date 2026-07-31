@@ -1,7 +1,7 @@
 import { constants as fsConstants, type Stats } from "node:fs";
-import { mkdir, open, rename, unlink, lstat } from "node:fs/promises";
+import { lchown, mkdir, open, rename, unlink, lstat } from "node:fs/promises";
 import { randomBytes } from "node:crypto";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, resolve as resolvePath } from "node:path";
 
 export type CustodyFsErrorCode =
   | "symlink_rejected"
@@ -96,6 +96,16 @@ export interface WriteFileCustodyOptions {
    * on disk, e.g. root:wheel boot-token provisioning.
    */
   prepareTemp?: (tempPath: string) => void | Promise<void>;
+  /**
+   * Create-with-fchown (fortress-ownership spec 2026-07-30, open question 5):
+   * chown the file (via its open descriptor, before the atomic rename) and any
+   * parent directories THIS call created to the given owner. Root daemons that
+   * write inside an operator-owned fortress pass the fortress owner here so
+   * fortress-internal files never accrete root ownership boot over boot.
+   * FAIL-CLOSED: if the chown fails the write fails (never silently leave the
+   * file with the wrong owner).
+   */
+  owner?: { uid: number; gid: number };
 }
 
 const O_NOFOLLOW =
@@ -272,6 +282,44 @@ async function fsyncDirectory(dir: string): Promise<void> {
   }
 }
 
+/**
+ * Chown every directory on the segment chain from `firstCreated` down to
+ * `leafDir` (inclusive) to `owner`. `firstCreated` is the value `mkdir
+ * {recursive:true}` returns: the FIRST directory it actually created, so the
+ * chain covers exactly the dirs this call minted (pre-existing parents are
+ * never touched). lchown so a hostile symlink swap of a chain segment is
+ * chowned as the link itself, never through it. Exported for the other
+ * create-with-fchown sites (the macOS daemon's fortress-internal mkdirs).
+ */
+export async function chownCreatedDirChain(
+  firstCreated: string,
+  leafDir: string,
+  owner: { uid: number; gid: number },
+): Promise<void> {
+  // Normalize both ends so a non-normalized caller path (double slash,
+  // trailing slash) cannot silently break the chain match. If the chain still
+  // cannot be established, FAIL (never silently skip the chown): callers use
+  // the owner option fail-closed, and a misowned created dir is exactly the
+  // defect class this exists to prevent.
+  const stop = resolvePath(firstCreated);
+  let current = resolvePath(leafDir);
+  const chain: string[] = [];
+  for (;;) {
+    chain.push(current);
+    if (current === stop) break;
+    const parent = dirname(current);
+    if (parent === current) {
+      throw new Error(
+        `chownCreatedDirChain: ${stop} is not an ancestor of ${chain[0]}; refusing to leave created directories misowned`,
+      );
+    }
+    current = parent;
+  }
+  for (const dir of chain.reverse()) {
+    await lchown(dir, owner.uid, owner.gid);
+  }
+}
+
 export async function writeFileCustody(
   path: string,
   data: string | Uint8Array,
@@ -279,7 +327,13 @@ export async function writeFileCustody(
 ): Promise<void> {
   const dir = dirname(path);
   if (options.createParent !== false) {
-    await mkdir(dir, { recursive: true, mode: options.parentMode ?? 0o700 });
+    const firstCreated = await mkdir(dir, {
+      recursive: true,
+      mode: options.parentMode ?? 0o700,
+    });
+    if (options.owner !== undefined && firstCreated !== undefined) {
+      await chownCreatedDirChain(firstCreated, dir, options.owner);
+    }
   }
   await verifyParentCustody(path, options.parent);
   const tempPath = join(
@@ -298,6 +352,12 @@ export async function writeFileCustody(
       options.mode,
     );
     await handle.chmod(options.mode);
+    if (options.owner !== undefined) {
+      // Create-with-fchown: applied on the DESCRIPTOR before the atomic
+      // rename, so the destination never exists with the wrong owner. A
+      // failure here fails the whole write (fail-closed).
+      await handle.chown(options.owner.uid, options.owner.gid);
+    }
     await options.prepareTemp?.(tempPath);
     await handle.writeFile(data);
     await handle.sync();

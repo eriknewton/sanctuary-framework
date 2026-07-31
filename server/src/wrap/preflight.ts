@@ -18,6 +18,7 @@ export type ProtectPreflightStatus = "PASS" | "FAIL" | "UNDETERMINED";
 
 export type ProtectPreflightCheckId =
   | "castle_sock_holder"
+  | "fortress_custody"
   | "root_path_sanctuary"
   | "signer_client"
   | "sysext_approval"
@@ -100,6 +101,16 @@ export interface ProtectPreflightOps {
   getuid: () => number | undefined;
   execFile: (cmd: string, args: string[]) => Promise<ExecFileResult>;
   entry: (path: string) => Promise<FsEntry>;
+  /**
+   * Owner uid/gid of a path (lstat, never following a symlink). Backs the
+   * `fortress_custody` row (fortress-ownership spec 2026-07-30 §4(a2)(2)).
+   */
+  owner: (
+    path: string,
+  ) => Promise<
+    | { ok: true; uid: number; gid: number }
+    | { ok: false; reason: string; code?: string }
+  >;
   access: (path: string, kind: AccessKind) => Promise<AccessResult>;
   readText: (path: string) => Promise<{ ok: true; text: string } | { ok: false; reason: string; code?: string }>;
   readDir: (path: string) => Promise<{ ok: true } | { ok: false; reason: string; code?: string }>;
@@ -236,6 +247,7 @@ export function createProtectPreflightOps(): ProtectPreflightOps {
     getuid: () => process.getuid?.(),
     execFile: defaultExecFile,
     entry: defaultEntry,
+    owner: defaultOwner,
     access: defaultAccess,
     readText: defaultReadText,
     readDir: defaultReadDir,
@@ -265,6 +277,7 @@ export async function runProtectPreflight(
 
   const rows = [
     await checkCastleSockHolder(context),
+    await checkFortressCustody(context),
     await checkRootPathSanctuary(context),
     await checkSignerClient(context),
     await checkSysextApproval(context),
@@ -365,6 +378,24 @@ async function defaultEntry(path: string): Promise<FsEntry> {
       kind: "unknown",
       reason: safeErrorReason(err),
       code,
+    };
+  }
+}
+
+async function defaultOwner(
+  path: string,
+): Promise<
+  | { ok: true; uid: number; gid: number }
+  | { ok: false; reason: string; code?: string }
+> {
+  try {
+    const stats = await lstat(path);
+    return { ok: true, uid: stats.uid, gid: stats.gid };
+  } catch (err) {
+    return {
+      ok: false,
+      reason: safeErrorReason(err),
+      code: errorCode(err),
     };
   }
 }
@@ -741,6 +772,105 @@ function holderList(holders: LsofHolder[]): string {
       return `${holder.command} (${pid}${user})`;
     })
     .join(", ");
+}
+
+const REPAIR_CUSTODY_REMEDY = "Run: sudo sanctuary castle-wall repair-custody";
+
+/**
+ * Fortress-custody row (fortress-ownership spec 2026-07-30 §4(a2)(2)): FAIL
+ * when the fortress exists and its owner is not the resolved operator --
+ * LOUDLY when the owner is uid 0 (the Mini2 state: enforcement fine, every
+ * operator surface dark, the dead-man lever unable to reach castle.sock).
+ * An absent fortress is a PASS (protect creates it, and the euid-0 flows'
+ * custody-normalize chokepoint hands it to the operator).
+ */
+async function checkFortressCustody(
+  context: ProtectPreflightContext,
+): Promise<ProtectPreflightRow> {
+  if (context.platform !== "darwin") {
+    return row({
+      id: "fortress_custody",
+      check: "fortress custody",
+      status: "UNDETERMINED",
+      state: "not_darwin",
+      detail: "Fortress-ownership preflight is defined for macOS arm/provision hosts.",
+      remedy: "Run this preflight on the macOS host that will be armed.",
+      findings: ["F-13"],
+    });
+  }
+  if (context.fortressPath === undefined || context.operator.uid === undefined) {
+    return row({
+      id: "fortress_custody",
+      check: "fortress custody",
+      status: "UNDETERMINED",
+      state: "operator_identity_unknown",
+      detail:
+        context.operator.reason ??
+        "Could not resolve the operator identity or fortress path for the custody check.",
+      remedy:
+        "Run from a normal sudo session so SUDO_USER/SUDO_UID/SUDO_GID resolve to the operator account.",
+      findings: ["F-13"],
+    });
+  }
+
+  const owner = await context.ops.owner(context.fortressPath);
+  if (!owner.ok) {
+    if (isAbsentCode(owner.code)) {
+      return row({
+        id: "fortress_custody",
+        check: "fortress custody",
+        status: "PASS",
+        state: "no_fortress",
+        detail: `No fortress exists at ${context.fortressPath} yet; protect will create it operator-owned.`,
+        remedy: NO_REMEDY,
+        findings: ["F-13"],
+      });
+    }
+    return row({
+      id: "fortress_custody",
+      check: "fortress custody",
+      status: "UNDETERMINED",
+      state: "owner_probe_unknown",
+      detail: `Could not stat ${context.fortressPath}: ${owner.reason}.`,
+      remedy: `Inspect the fortress owner manually: stat -f '%Su %u' ${context.fortressPath}`,
+      findings: ["F-13"],
+    });
+  }
+
+  if (owner.uid === context.operator.uid) {
+    return row({
+      id: "fortress_custody",
+      check: "fortress custody",
+      status: "PASS",
+      state: "operator_owned",
+      detail: `The fortress at ${context.fortressPath} is owned by the operator (uid ${owner.uid}).`,
+      remedy: NO_REMEDY,
+      findings: ["F-13"],
+    });
+  }
+  if (owner.uid === 0) {
+    return row({
+      id: "fortress_custody",
+      check: "fortress custody",
+      status: "FAIL",
+      state: "root_owned_fortress",
+      detail:
+        `The fortress at ${context.fortressPath} is owned by ROOT (uid 0). The operator cannot read their own state, ` +
+        "operator status surfaces are blind (connect EACCES), and the 'disable' dead-man lever cannot reach castle.sock. " +
+        "Arming refuses in this state.",
+      remedy: REPAIR_CUSTODY_REMEDY,
+      findings: ["F-13"],
+    });
+  }
+  return row({
+    id: "fortress_custody",
+    check: "fortress custody",
+    status: "FAIL",
+    state: "owner_mismatch",
+    detail: `The fortress at ${context.fortressPath} is owned by uid ${owner.uid}, not the resolved operator (uid ${context.operator.uid}).`,
+    remedy: REPAIR_CUSTODY_REMEDY,
+    findings: ["F-13"],
+  });
 }
 
 async function checkRootPathSanctuary(

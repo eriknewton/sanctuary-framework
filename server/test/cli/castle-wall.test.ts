@@ -17,6 +17,7 @@ import { generateRandomKey } from "../../src/core/random.js";
 import { hashToString } from "../../src/core/hashing.js";
 import { bytesToString, stringToBytes, toBase64url } from "../../src/core/encoding.js";
 import {
+  formatEnforcementAvailabilityStatus,
   parseCastleWallArgs,
   runDaemon,
   runProvisionPin,
@@ -1839,5 +1840,45 @@ describe("castle-wall operability fixes (drill 2026-06-13: F1/F2a/F2b/F3)", () =
       // It reached the real macOS daemon flow (a pin / credential failure).
       expect(err.text()).toMatch(/No pinned key found|Refusing to start/i);
     });
+  });
+});
+
+describe("formatEnforcementAvailabilityStatus (querier-blindness polish, spec 2026-07-30)", () => {
+  function availability(reason: string) {
+    return {
+      status: "undetermined" as const,
+      reason,
+      observed_at: null,
+      freshness_window_ms: 15_000,
+      active_connection_count: 0,
+    };
+  }
+
+  it("appends the plain-English blindness line on connect EACCES, keeping the per-cause reason code intact", () => {
+    const text = formatEnforcementAvailabilityStatus(
+      availability("availability_query_failed:connect EACCES /Users/mini2/.sanctuary/castle.sock"),
+    );
+    // The per-cause reason code survives verbatim (never replaced by prose).
+    expect(text).toContain("availability_query_failed:connect EACCES /Users/mini2/.sanctuary/castle.sock");
+    expect(text).toContain("this surface is blind, not the wall");
+    expect(text).toContain("sudo sanctuary castle-wall repair-custody");
+  });
+
+  it("appends the line for connect EPERM too", () => {
+    const text = formatEnforcementAvailabilityStatus(
+      availability("availability_query_failed:connect EPERM /x/castle.sock"),
+    );
+    expect(text).toContain("blind, not the wall");
+  });
+
+  it("does NOT append the line for non-permission reasons (ECONNREFUSED, lease states)", () => {
+    for (const reason of [
+      "availability_query_failed:connect ECONNREFUSED /x/castle.sock",
+      "lease:absent",
+      "ok",
+    ]) {
+      const text = formatEnforcementAvailabilityStatus(availability(reason));
+      expect(text).not.toContain("blind, not the wall");
+    }
   });
 });

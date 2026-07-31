@@ -11,6 +11,7 @@ import { generateRandomKey } from "../../../src/core/random.js";
 import { toBase64url } from "../../../src/core/encoding.js";
 import { runProvisionPin } from "../../../src/cli/castle-wall.js";
 import {
+  resolveFortressCreateOwner,
   resolveSocketReownUid,
   startMacOSCastleWallDaemon,
   type MacOSCastleWallListenerOptions,
@@ -81,15 +82,34 @@ describe("resolveSocketReownUid (Slice M Layer-2 socket ownership)", () => {
     expect(resolved).toBeUndefined();
   });
 
-  it("skips (undefined) when root but the fortress owner already matches the process uid", () => {
-    // A same-uid daemon (root over a root-owned fortress) needs no re-own — the
-    // socket is already reachable by its owner.
+  it("root over a ROOT-owned fortress is a loud warning, never a silent no-op (spec 2026-07-30)", () => {
+    // Mini2 2026-07-30: the fortress owner IS the bug, so "re-own to the
+    // fortress owner" resolved to root and the operator lever stayed dead
+    // silently. The skip behavior is preserved (no re-own target exists) but
+    // the state now warns as loudly as a failed stat.
+    const warnings: string[] = [];
     const resolved = resolveSocketReownUid({
       fortressPath: FORTRESS,
       processUid: 0,
       statFortressUid: () => 0,
+      warn: (message) => warnings.push(message),
     });
     expect(resolved).toBeUndefined();
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("owned by root");
+    expect(warnings[0]).toContain("repair-custody");
+  });
+
+  it("a same-NON-ROOT-uid match stays a quiet skip (operator daemon over its own fortress)", () => {
+    const warnings: string[] = [];
+    const resolved = resolveSocketReownUid({
+      fortressPath: FORTRESS,
+      processUid: 501,
+      statFortressUid: () => 501,
+      warn: (message) => warnings.push(message),
+    });
+    expect(resolved).toBeUndefined();
+    expect(warnings).toEqual([]);
   });
 
   it("fail-soft: warns and returns undefined when the fortress dir cannot be stat-ed", () => {
@@ -118,6 +138,59 @@ describe("resolveSocketReownUid (Slice M Layer-2 socket ownership)", () => {
       statFortressUid: () => 501,
     });
     expect(resolved === 501).toBe(true);
+  });
+});
+
+/**
+ * Create-with-fchown owner resolution (fortress-ownership spec 2026-07-30,
+ * open question 5): a ROOT daemon writing inside an operator-owned fortress
+ * must create files owned by the fortress owner, never root.
+ */
+describe("resolveFortressCreateOwner", () => {
+  const FORTRESS = "/fake/fortress";
+
+  it("resolves the fortress owner for a root daemon over an operator-owned fortress", () => {
+    expect(
+      resolveFortressCreateOwner({
+        fortressPath: FORTRESS,
+        processUid: 0,
+        statFortressOwner: () => ({ uid: 501, gid: 20 }),
+      }),
+    ).toEqual({ uid: 501, gid: 20 });
+  });
+
+  it("returns undefined for a non-root daemon (its files are already operator-owned)", () => {
+    expect(
+      resolveFortressCreateOwner({
+        fortressPath: FORTRESS,
+        processUid: 501,
+        statFortressOwner: () => {
+          throw new Error("stat must not be consulted for a non-root daemon");
+        },
+      }),
+    ).toBeUndefined();
+  });
+
+  it("returns undefined for a root-owned fortress (no owner to hand files to; the loud warning covers it)", () => {
+    expect(
+      resolveFortressCreateOwner({
+        fortressPath: FORTRESS,
+        processUid: 0,
+        statFortressOwner: () => ({ uid: 0, gid: 0 }),
+      }),
+    ).toBeUndefined();
+  });
+
+  it("returns undefined when the fortress cannot be statted (fail-soft)", () => {
+    expect(
+      resolveFortressCreateOwner({
+        fortressPath: FORTRESS,
+        processUid: 0,
+        statFortressOwner: () => {
+          throw new Error("ENOENT");
+        },
+      }),
+    ).toBeUndefined();
   });
 });
 

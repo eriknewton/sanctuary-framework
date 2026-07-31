@@ -55,6 +55,7 @@ import {
   resolveProducerPubKeyPath,
 } from "./producer-signature.js";
 import {
+  chownCreatedDirChain,
   isCustodyFsError,
   readFileCustody,
   readFileCustodyWithStats,
@@ -492,6 +493,21 @@ export function resolveSocketReownUid(input: {
   // Owners already match (a same-uid daemon, e.g. an operator daemon that somehow
   // reached here as root over its own fortress): no re-own needed.
   if (ownerUid === processUid) {
+    if (processUid === 0) {
+      // Fortress-ownership spec 2026-07-30 §4(a2)(3): a ROOT-owned fortress
+      // under a root daemon used to make the re-own a silent no-op by
+      // construction (the #450 item 3 fix re-owns to the fortress owner, and
+      // the fortress owner IS the bug). That state leaves the operator CLI
+      // dead-man lever and the operator-uid extension unable to reach the
+      // socket -- exactly as blind as a failed stat, so it gets the same loud
+      // operator-facing warning instead of silence.
+      (input.warn ?? defaultDaemonWarn)(
+        `[castle-wall] warning: the fortress at ${input.fortressPath} is owned by root, ` +
+          `so the IPC socket stays root-owned and the operator CLI (including the 'disable' dead-man lever) ` +
+          `and the operator-uid extension may be unable to connect. ` +
+          `Run 'sudo sanctuary castle-wall repair-custody' to hand the fortress back to the operator.`,
+      );
+    }
     return undefined;
   }
   return ownerUid;
@@ -500,6 +516,45 @@ export function resolveSocketReownUid(input: {
 function defaultDaemonWarn(message: string): void {
   // SAFETY: daemon startup diagnostics are operator-facing stderr output.
   console.error(message);
+}
+
+/**
+ * Resolve the create-with-fchown owner for fortress-internal files a ROOT
+ * daemon creates (fortress-ownership spec 2026-07-30, open question 5):
+ * a root daemon that writes into an operator-owned fortress must create
+ * files owned by the FORTRESS OWNER, not root, or operator readability of
+ * audit artifacts erodes boot over boot. Only a root process needs this
+ * (a non-root daemon already creates operator-owned files); a root-owned or
+ * unreadable fortress yields `undefined` (no owner to hand files to -- the
+ * loud warnings in {@link resolveSocketReownUid} cover those states).
+ */
+export function resolveFortressCreateOwner(input: {
+  fortressPath: string;
+  /** Current process uid; defaults to `process.getuid?.()`. Injected by tests. */
+  processUid?: number | undefined;
+  /** Stat the fortress dir for its owner; defaults to `fs.statSync`. */
+  statFortressOwner?: (fortressPath: string) => { uid: number; gid: number };
+}): { uid: number; gid: number } | undefined {
+  const processUid =
+    input.processUid !== undefined ? input.processUid : process.getuid?.();
+  if (processUid !== 0) {
+    return undefined;
+  }
+  let owner: { uid: number; gid: number };
+  try {
+    if (input.statFortressOwner) {
+      owner = input.statFortressOwner(input.fortressPath);
+    } else {
+      const stats = statSync(input.fortressPath);
+      owner = { uid: stats.uid, gid: stats.gid };
+    }
+  } catch {
+    return undefined;
+  }
+  if (owner.uid === 0) {
+    return undefined;
+  }
+  return owner;
 }
 
 export async function startMacOSCastleWallDaemon(
@@ -546,10 +601,20 @@ export async function startMacOSCastleWallDaemon(
 
   await assertActiveConfigNotOwnedByLiveProcess(activeConfigPath, legacyActiveConfigPath);
   await assertSocketNotOwnedByLiveProcess(socketPath);
-  await mkdir(join(input.fortressPath, "policy", "egress", "rules"), {
+  // Create-with-fchown (fortress-ownership spec 2026-07-30): fortress-internal
+  // dirs/files a ROOT daemon creates are handed to the fortress owner at
+  // creation so operator readability never erodes boot over boot.
+  const fortressCreateOwner = resolveFortressCreateOwner({
+    fortressPath: input.fortressPath,
+  });
+  const rulesDir = join(input.fortressPath, "policy", "egress", "rules");
+  const firstCreatedRulesDir = await mkdir(rulesDir, {
     recursive: true,
     mode: 0o700,
   });
+  if (fortressCreateOwner !== undefined && firstCreatedRulesDir !== undefined) {
+    await chownCreatedDirChain(firstCreatedRulesDir, rulesDir, fortressCreateOwner);
+  }
 
   const signer = input.signer ?? (await loadSigningKey(input));
   await writeSystemPinnedPublicKey(signer, input.globalPinnedPublicKeyPath);
@@ -560,6 +625,7 @@ export async function startMacOSCastleWallDaemon(
     await publishFortressAuditProducerPublicKey(
       input.fortressPath,
       auditProducerKey.bytes,
+      fortressCreateOwner,
     );
   }
   const pinnedPublicKeySha256 = sha256Hex(signer.publicKey);
@@ -1894,10 +1960,12 @@ async function loadMacOSAuditProducerPublicKey(
 async function publishFortressAuditProducerPublicKey(
   fortressPath: string,
   publicKey: Uint8Array,
+  owner?: { uid: number; gid: number },
 ): Promise<void> {
   await writeFileCustody(resolveProducerPubKeyPath(fortressPath), publicKey, {
     mode: 0o644,
     createParent: true,
+    ...(owner !== undefined ? { owner } : {}),
   });
 }
 
