@@ -1956,6 +1956,12 @@ export const CLAIM_LITERAL_COUNTS: Readonly<Record<string, number>> = {
   [`${CW}/egress.ts`]: 5,
   [`${CW}/exclusive-arm.ts`]: 3,
   [`${CW}/exclusive-unprotect.ts`]: 4,
+  // fortress-custody.ts (2026-07-31): the single hit is the literal-true
+  // early return in `isSafeManifestRelPath` for the "." root path -- a pure
+  // path-shape validator, not a protection claim. The repair/normalize
+  // outcomes report COUNTS (repaired/skipped/vanished), never claim-shaped
+  // booleans.
+  [`${CW}/fortress-custody.ts`]: 1,
   [`${CW}/harness-argv.ts`]: 1,
   [`${CW}/index.ts`]: 0,
   // lockfile.ts round-4 C1: `isEgressLockHolderAlive` returns a truthy

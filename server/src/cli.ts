@@ -1195,6 +1195,11 @@ async function runCastleWallCommand(args: string[]): Promise<number> {
     return runProvisionBootToken(args.slice(1));
   }
 
+  if (command === "repair-custody") {
+    const { runRepairCustody } = await import("./cli/castle-wall-custody.js");
+    return runRepairCustody(args.slice(1));
+  }
+
   if (command === "signer-helper") {
     const sub = args[1];
     if (sub === "status" || sub === undefined) {
@@ -1384,6 +1389,12 @@ function printCastleWallHelp(): void {
     install-boot     Install the daemon as a launchd safe-mode boot service (run with sudo, macOS).
                      Options: --user <name> --fortress <path> --binary <path> --signer-client <path>
     uninstall-boot   Remove the launchd boot service (run with sudo, macOS; requires --yes). Does NOT disarm the filter.
+    repair-custody   Hand a root-owned fortress back to the operator (run with sudo, macOS).
+                     Observe-first: writes a timestamped manifest of every entry's uid/gid/mode
+                     outside the fortress before changing anything; chowns root-owned entries only;
+                     restores fortress 0700 / castle.sock 0600 where deviant; skips foreign-uid
+                     entries. Idempotent. Exit codes: 0 changed, 3 already clean, 2 refused, 1 failed.
+                     Options: --fortress <path>   --rollback <manifest> (replays recorded ownership)
     signer-helper status
                      Boot-readiness preflight for the root signer-helper LaunchDaemon: checks the
                      launchd job is loaded, the helper answers over XPC, its key matches the global
