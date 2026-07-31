@@ -536,6 +536,124 @@ describe("macOS extension-origin enforcement availability reports", () => {
     expect(consumer.resolveEnforcementAvailability().status).toBe("live");
   });
 
+  it("F-AVAIL-SEQ-FLAP repro: a dedicated report signed earlier but delivered after a flow-carried report on the same producer counter is accepted, not misread as replay", async () => {
+    const privateKey = ed25519.utils.randomPrivateKey();
+    const publicKeyB64url = toBase64url(ed25519.getPublicKey(privateKey));
+    const log = new AuditLog(new MemoryStorage(), generateRandomKey());
+    const consumer = makeConsumer({
+      publicKeyB64url,
+      sink: log as unknown as AuditSink,
+    });
+
+    // Flow-carried availability signed at producer seq 5 arrives first.
+    await consumer.handleFlowDecisionRecorded(
+      signedFlowWithAvailability({
+        report: greenSnapshot(),
+        privateKey,
+        seq: 5,
+        capturedAtUnixMs: NOW,
+      }),
+      "ext-1",
+    );
+    expect(consumer.resolveEnforcementAvailability().status).toBe("live");
+
+    // Dedicated availability report signed EARLIER (seq 3) on the same
+    // producer counter, delivered later via the async dedicated path. This is
+    // out-of-order delivery from one signing counter across two paths, not a
+    // replay: seq 3 has never been seen on the dedicated stream.
+    await consumer.handleEnforcementAvailabilityReport(
+      signAvailabilityReport({
+        visibleReport: greenSnapshot(),
+        privateKey,
+        seq: 3,
+      }),
+      "ext-1",
+    );
+
+    const resolved = consumer.resolveEnforcementAvailability();
+    expect(resolved.reason).toBe("ok");
+    expect(resolved.status).toBe("live");
+    expect(consumer.getStats().enforcementAvailabilityReportsRecorded).toBe(2);
+    expect(consumer.getStats().enforcementAvailabilityReportsRejected).toBe(0);
+  });
+
+  it("F-AVAIL-SEQ-FLAP negative: the SAME dedicated report delivered twice is a genuine replay and the second delivery is rejected", async () => {
+    const privateKey = ed25519.utils.randomPrivateKey();
+    const publicKeyB64url = toBase64url(ed25519.getPublicKey(privateKey));
+    const consumer = makeConsumer({ publicKeyB64url });
+
+    const report = signAvailabilityReport({
+      visibleReport: greenSnapshot(),
+      privateKey,
+      seq: 3,
+    });
+    await consumer.handleEnforcementAvailabilityReport(report, "ext-1");
+    expect(consumer.resolveEnforcementAvailability().status).toBe("live");
+
+    await consumer.handleEnforcementAvailabilityReport(report, "ext-1");
+    const resolved = consumer.resolveEnforcementAvailability();
+    expect(resolved.status).toBe("undetermined");
+    expect(resolved.reason).toBe("producer_sequence_replay");
+    expect(consumer.getStats().enforcementAvailabilityReportsRejected).toBe(1);
+  });
+
+  it("F-AVAIL-SEQ-FLAP negative: the SAME flow-carried availability delivered twice is a genuine replay and the second delivery is rejected", async () => {
+    const privateKey = ed25519.utils.randomPrivateKey();
+    const publicKeyB64url = toBase64url(ed25519.getPublicKey(privateKey));
+    const log = new AuditLog(new MemoryStorage(), generateRandomKey());
+    const consumer = makeConsumer({
+      publicKeyB64url,
+      sink: log as unknown as AuditSink,
+    });
+
+    const flow = signedFlowWithAvailability({
+      report: greenSnapshot(),
+      privateKey,
+      seq: 5,
+      capturedAtUnixMs: NOW,
+    });
+    await consumer.handleFlowDecisionRecorded(flow, "ext-1");
+    expect(consumer.resolveEnforcementAvailability().status).toBe("live");
+
+    await consumer.handleFlowDecisionRecorded(flow, "ext-1");
+    const resolved = consumer.resolveEnforcementAvailability();
+    expect(resolved.status).toBe("undetermined");
+    expect(resolved.reason).toBe("producer_sequence_replay");
+    expect(consumer.getStats().enforcementAvailabilityReportsRejected).toBe(1);
+  });
+
+  it("F-AVAIL-SEQ-FLAP negative: within the dedicated stream, a lower-seq report after a higher-seq report is still rejected (per-stream monotonicity holds)", async () => {
+    const privateKey = ed25519.utils.randomPrivateKey();
+    const publicKeyB64url = toBase64url(ed25519.getPublicKey(privateKey));
+    const consumer = makeConsumer({ publicKeyB64url });
+
+    await consumer.handleEnforcementAvailabilityReport(
+      signAvailabilityReport({
+        visibleReport: greenSnapshot(),
+        privateKey,
+        seq: 4,
+      }),
+      "ext-1",
+    );
+    expect(consumer.resolveEnforcementAvailability().status).toBe("live");
+
+    // A distinct, validly-signed dedicated report at a LOWER seq. The
+    // dedicated stream is delivered in order on hardware, so a same-stream
+    // regression is treated as replay and rejected.
+    await consumer.handleEnforcementAvailabilityReport(
+      signAvailabilityReport({
+        visibleReport: greenSnapshot(),
+        privateKey,
+        seq: 2,
+      }),
+      "ext-1",
+    );
+    const resolved = consumer.resolveEnforcementAvailability();
+    expect(resolved.status).toBe("undetermined");
+    expect(resolved.reason).toBe("producer_sequence_replay");
+    expect(consumer.getStats().enforcementAvailabilityReportsRejected).toBe(1);
+  });
+
   it("I7: a subscribed older extension with no v3 report remains undetermined", async () => {
     const privateKey = ed25519.utils.randomPrivateKey();
     const publicKeyB64url = toBase64url(ed25519.getPublicKey(privateKey));
