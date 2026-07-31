@@ -189,6 +189,14 @@ export interface FederationBaseContext {
    * the same information from the durable sync-state projection; joiner contexts
    * can carry it from their custody record so boot preserves compromise-adoption
    * state without issuer authority.
+   *
+   * Where these are READ (M3, re-gate 2026-07-30): not by the route handlers in
+   * this file directly - the dashboard's `setFederationContext` folds them into
+   * its grow-only revoked-root projection at bind time, and the routes consume
+   * that projection through the injected `isRootRevoked` dependency (the
+   * sync-envelope `root_revoked` refusals and the reissue endpoint's
+   * revoked-root denial). A context that omits them simply contributes nothing
+   * to the projection; it never clears previously folded state.
    */
   revokedRootPubkeys?: Set<string>;
   highestRevocationSerial?: number;

@@ -1,11 +1,15 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { randomBytes } from "node:crypto";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { ed25519 } from "@noble/curves/ed25519";
 
 import { DashboardApprovalChannel } from "../../src/principal-policy/dashboard.js";
 import { buildChallengeMessage } from "../../src/v1/ceremony.js";
 import { AuditLog } from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
+import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import { establishMaster } from "../../src/core/master-custody.js";
 import {
   bytesToString,
@@ -21,37 +25,34 @@ import {
   generateFortressMaster,
   issueNodeIdentityCertificate,
   issuePrincipalCertificate,
+  signFederationRootRotationCertificate,
   verifyCertChain,
 } from "../../src/mesh/trust-root.js";
 import {
   mintFederationTrustRootRecord,
-  mintHybridFederationMaterial,
   type FederationTrustRootRecord,
 } from "../../src/mesh/federation-trust-root-store.js";
+import * as joinerStore from "../../src/mesh/federation-joiner-trust-root-store.js";
 import {
   FEDERATION_JOINER_TRUST_ROOT_HKDF_INFO,
   FEDERATION_JOINER_TRUST_ROOT_KEY,
   FEDERATION_JOINER_TRUST_ROOT_NAMESPACE,
   FederationJoinerTrustRootStore,
   FederationJoinerTrustRootStoreError,
-  adoptFederationJoinerCompromiseRoot,
+  adoptFederationJoinerPlannedRoot,
+  joinerContextFromRecord,
   loadFederationJoinerTrustRoot,
   persistFederationJoinerTrustRoot,
-  signFederationJoinerCompromiseRootAdoptionAttestation,
   validateJoinerRecord,
-  type FederationJoinerCompromiseRootAdoptionAttestation,
+  type FederationJoinerPlannedRootAdoptReissueResult,
   type FederationJoinerTrustRootAuditEvent,
   type FederationJoinerTrustRootRecord,
 } from "../../src/mesh/federation-joiner-trust-root-store.js";
-import {
-  signFederationRootRevocationPayload,
-  signFederationRootRevocationPayloadHybrid,
-  type FederationRootRevocationPayload,
-} from "../../src/v1/federation-revocation.js";
 import type {
+  FederationRootRotationCertificate,
   FortressMasterPublicKey,
-  NodeIdentityCertificate,
   PrincipalCertificate,
+  NodeIdentityCertificate,
 } from "../../src/mesh/types.js";
 
 async function testMasterKey(storage: MemoryStorage): Promise<Uint8Array> {
@@ -116,34 +117,44 @@ function buildJoinerRecord(opts?: {
   }
 }
 
-function buildCompromiseAdoptionArtifact(opts: {
+/**
+ * Build a GENUINE planned rotation: mint K2 + a K2 issuing principal, reissue
+ * THIS joiner's node cert under K2 (same node key), and sign a K1->K2 rotation
+ * certificate with the home fortress's OLD master private key. Returns the cert
+ * plus a reissue callback that plays the shipped reissue-endpoint response.
+ */
+function buildPlannedRotation(opts: {
   current: FederationJoinerTrustRootRecord;
-  currentIssuingPrincipalPrivateKey: Uint8Array;
-  revocationSerial?: number;
+  home: FederationTrustRootRecord;
+  rotationSerial?: number;
 }): {
+  rotationCert: FederationRootRotationCertificate;
   newPinnedMaster: FortressMasterPublicKey;
   newIssuingPrincipalCert: PrincipalCertificate;
-  reissuedLocalNodeCert: NodeIdentityCertificate;
-  rootRevocation: FederationRootRevocationPayload;
-  adoptionAttestation: FederationJoinerCompromiseRootAdoptionAttestation;
+  reissuedNodeCert: NodeIdentityCertificate;
+  reissue: () => Promise<FederationJoinerPlannedRootAdoptReissueResult>;
   newIssuingPrincipalPrivateKey: Uint8Array;
 } {
+  const serial = opts.rotationSerial ?? 1;
   const k2 = generateFortressMaster();
-  const principal = generateKeypair();
+  const k2Principal = generateKeypair();
   const nodePubkey = fromBase64url(opts.current.local_node_cert.node_pubkey);
-  const newPinnedMaster = {
+  const newPinnedMaster: FortressMasterPublicKey = {
     ...k2.public,
     fortress_id: opts.current.fortress_id,
   };
+  if (!opts.home.master_private_key) {
+    throw new Error("home record must hold master private key");
+  }
   try {
     const newIssuingPrincipalCert = issuePrincipalCertificate({
       principal_id: opts.current.issuing_principal_cert.principal_id,
-      principal_pubkey: principal.publicKey,
+      principal_pubkey: k2Principal.publicKey,
       role: "root",
       fortress_id: opts.current.fortress_id,
       master_private_key: k2.private_key,
     });
-    const reissuedLocalNodeCert = issueNodeIdentityCertificate({
+    const reissuedNodeCert = issueNodeIdentityCertificate({
       node_id: opts.current.node_id,
       node_pubkey: nodePubkey,
       node_mode: opts.current.local_node_cert.node_mode,
@@ -154,40 +165,55 @@ function buildCompromiseAdoptionArtifact(opts: {
         principal_id: newIssuingPrincipalCert.principal_id,
         principal_pubkey: newIssuingPrincipalCert.principal_pubkey,
       },
-      principal_private_key: principal.privateKey,
+      principal_private_key: k2Principal.privateKey,
       master_private_key: k2.private_key,
     });
-    const rootRevocation = signFederationRootRevocationPayload({
-      fortressId: opts.current.fortress_id,
-      revokedMasterPubkey: opts.current.pinned_master_pubkey.public_key,
-      effectiveAt: new Date().toISOString(),
-      revocationSerial: opts.revocationSerial ?? 1,
-      operatorPrincipalId: newIssuingPrincipalCert.principal_id,
-      operatorPrincipalPrivateKey: principal.privateKey,
-    });
-    const adoptionAttestation =
-      signFederationJoinerCompromiseRootAdoptionAttestation({
-        current: opts.current,
-        newPinnedMasterPubkey: newPinnedMaster,
-        newIssuingPrincipalCert,
-        reissuedLocalNodeCert,
-        rootRevocation,
-        currentIssuingPrincipalPrivateKey:
-          opts.currentIssuingPrincipalPrivateKey,
+    const k1Private = Uint8Array.from(opts.home.master_private_key);
+    let rotationCert: FederationRootRotationCertificate;
+    try {
+      rotationCert = signFederationRootRotationCertificate({
+        fortress_id: opts.current.fortress_id,
+        old_master_pubkey: opts.current.pinned_master_pubkey.public_key,
+        new_master: newPinnedMaster,
+        old_master_private_key: k1Private,
+        rotation_serial: serial,
       });
+    } finally {
+      k1Private.fill(0);
+    }
     return {
+      rotationCert,
       newPinnedMaster,
       newIssuingPrincipalCert,
-      reissuedLocalNodeCert,
-      rootRevocation,
-      adoptionAttestation,
-      newIssuingPrincipalPrivateKey: Uint8Array.from(principal.privateKey),
+      reissuedNodeCert,
+      newIssuingPrincipalPrivateKey: Uint8Array.from(k2Principal.privateKey),
+      reissue: async () => ({
+        ok: true,
+        certificate: reissuedNodeCert,
+        issuingPrincipalCert: newIssuingPrincipalCert,
+        serverPinnedMaster: newPinnedMaster,
+      }),
     };
   } finally {
     k2.private_key.fill(0);
-    principal.privateKey.fill(0);
+    k2Principal.privateKey.fill(0);
     nodePubkey.fill(0);
   }
+}
+
+async function saveJoiner(
+  storage: MemoryStorage,
+  masterKey: Uint8Array,
+  record: FederationJoinerTrustRootRecord,
+): Promise<void> {
+  await persistFederationJoinerTrustRoot({
+    storage,
+    masterKey,
+    pinnedMasterPubkey: record.pinned_master_pubkey,
+    issuingPrincipalCert: record.issuing_principal_cert,
+    localNodeCert: record.local_node_cert,
+    localNodePrivateKey: record.local_node_private_key,
+  });
 }
 
 function persisted(record: FederationJoinerTrustRootRecord) {
@@ -228,9 +254,6 @@ describe("FederationJoinerTrustRootStore", () => {
   });
 
   it("has no mint path: a joiner record is only created from a real join", async () => {
-    // The store exposes no mint export at all; loadFederationJoinerTrustRoot
-    // never minted material is the structural guarantee. (a) confirms the
-    // record holds NO issuer/master secret material.
     const { record } = buildJoinerRecord();
     const candidate = record as unknown as Record<string, unknown>;
     expect("master_secret" in candidate).toBe(false);
@@ -260,7 +283,6 @@ describe("FederationJoinerTrustRootStore", () => {
     expect(raw).not.toBeNull();
     const rawText = bytesToString(raw!);
     expect(rawText).toContain('"alg":"aes-256-gcm"');
-    // The node private key never appears in cleartext at rest.
     expect(rawText).not.toContain(toBase64url(record.local_node_private_key));
 
     const loaded = await loadFederationJoinerTrustRoot({ storage, masterKey });
@@ -286,7 +308,6 @@ describe("FederationJoinerTrustRootStore", () => {
     expect("getFortressMasterSecret" in ctx).toBe(false);
     expect("getMasterPrivateKey" in ctx).toBe(false);
     expect("approver" in ctx).toBe(false);
-    // It DOES expose the public chain + its own node key for /sync/peer.
     expect(typeof provisioned.context.getLocalNodePrivateKey).toBe("function");
     expect(provisioned.context.issuingPrincipalCert).toBeDefined();
     expect(provisioned.context.localNodeCert).toBeDefined();
@@ -305,7 +326,6 @@ describe("FederationJoinerTrustRootStore", () => {
       localNodePrivateKey: record.local_node_private_key,
     });
 
-    // Operator B's master derives a different purpose key -> GCM auth fails.
     const masterB = await testMasterKey(new MemoryStorage());
     const audit: FederationJoinerTrustRootAuditEvent[] = [];
     const loaded = await loadFederationJoinerTrustRoot({
@@ -329,14 +349,14 @@ describe("FederationJoinerTrustRootStore", () => {
     const masterKey = await testMasterKey(storage);
     const { record } = buildJoinerRecord();
     const store = new FederationJoinerTrustRootStore(storage, masterKey);
-    await store.save(record);
+    // Setup write routes through the only public write path (the locked chokepoint).
+    await store.lockedUpdate(() => record);
 
     const raw = await storage.read(
       FEDERATION_JOINER_TRUST_ROOT_NAMESPACE,
       FEDERATION_JOINER_TRUST_ROOT_KEY,
     );
     const payload = JSON.parse(bytesToString(raw!)) as { ct: string };
-    // Flip a character in the ciphertext body.
     const ctChars = payload.ct.split("");
     ctChars[0] = ctChars[0] === "A" ? "B" : "A";
     payload.ct = ctChars.join("");
@@ -364,7 +384,6 @@ describe("FederationJoinerTrustRootStore", () => {
     const storage = new MemoryStorage();
     const masterKey = await testMasterKey(storage);
     const { record } = buildJoinerRecord();
-    // Smuggle a master_secret into the at-rest blob.
     const body = {
       ...persisted(record),
       master_secret: toBase64url(randomBytes(32)),
@@ -401,7 +420,6 @@ describe("FederationJoinerTrustRootStore", () => {
     const masterKey = await testMasterKey(storage);
     const { record } = buildJoinerRecord();
 
-    // A different fortress's master is NOT the trust anchor this cert chains to.
     const foreign = mintFederationTrustRootRecord({ nodeId: "foreign" });
     await expect(
       persistFederationJoinerTrustRoot({
@@ -413,7 +431,6 @@ describe("FederationJoinerTrustRootStore", () => {
         localNodePrivateKey: record.local_node_private_key,
       }),
     ).rejects.toThrow();
-    // Nothing was written on the refused persist.
     expect(
       await storage.exists(
         FEDERATION_JOINER_TRUST_ROOT_NAMESPACE,
@@ -439,32 +456,26 @@ describe("FederationJoinerTrustRootStore", () => {
     };
     expect(() => validateJoinerRecord(tampered)).toThrow(/fortress_id/);
   });
+});
 
-  it("3c-2 adopts a valid compromise rotation only after K2 revocation + K2 reissued node cert verify", async () => {
+// ═══════════════════════════════════════════════════════════════════════
+// Slice 3c-2 planned-rotation joiner auto-adopt
+// ═══════════════════════════════════════════════════════════════════════
+
+describe("adoptFederationJoinerPlannedRoot (planned auto-adopt)", () => {
+  it("verifies a genuine K1-signed rotation cert and re-pins K2 (happy path)", async () => {
     const storage = new MemoryStorage();
     const masterKey = await testMasterKey(storage);
     const { record, home } = buildJoinerRecord();
-    await persistFederationJoinerTrustRoot({
-      storage,
-      masterKey,
-      pinnedMasterPubkey: record.pinned_master_pubkey,
-      issuingPrincipalCert: record.issuing_principal_cert,
-      localNodeCert: record.local_node_cert,
-      localNodePrivateKey: record.local_node_private_key,
-    });
-    const artifact = buildCompromiseAdoptionArtifact({
-      current: record,
-      currentIssuingPrincipalPrivateKey: home.issuing_principal_private_key,
-    });
+    await saveJoiner(storage, masterKey, record);
+    const rotation = buildPlannedRotation({ current: record, home });
 
-    const adopted = await adoptFederationJoinerCompromiseRoot({
+    const adopted = await adoptFederationJoinerPlannedRoot({
       storage,
       masterKey,
-      newPinnedMasterPubkey: artifact.newPinnedMaster,
-      newIssuingPrincipalCert: artifact.newIssuingPrincipalCert,
-      reissuedLocalNodeCert: artifact.reissuedLocalNodeCert,
-      rootRevocation: artifact.rootRevocation,
-      adoptionAttestation: artifact.adoptionAttestation,
+      rotationCert: rotation.rotationCert,
+      expectedPinnedMaster: rotation.newPinnedMaster,
+      reissue: rotation.reissue,
     });
 
     expect(adopted.adopted).toBe(true);
@@ -473,392 +484,1046 @@ describe("FederationJoinerTrustRootStore", () => {
       record.pinned_master_pubkey.public_key,
     );
     expect(adopted.pinnedMaster.public_key).toBe(
-      artifact.newPinnedMaster.public_key,
+      rotation.newPinnedMaster.public_key,
     );
-    expect(adopted.revocationSerial).toBe(1);
-    expect(adopted.context.revokedRootPubkeys.has(record.pinned_master_pubkey.public_key)).toBe(true);
-    expect(adopted.context.highestRevocationSerial).toBe(1);
+    expect(adopted.rotationSerial).toBe(1);
 
     const loaded = await loadFederationJoinerTrustRoot({ storage, masterKey });
     expect(loaded?.record.pinned_master_pubkey.public_key).toBe(
-      artifact.newPinnedMaster.public_key,
+      rotation.newPinnedMaster.public_key,
     );
-    expect(loaded?.record.local_node_cert.parent_chain.fortress_master_pubkey).toBe(
-      artifact.newPinnedMaster.public_key,
-    );
-    expect(loaded?.record.revoked_root_pubkeys?.has(record.pinned_master_pubkey.public_key)).toBe(true);
-    expect(loaded?.record.highest_revocation_serial).toBe(1);
+    expect(loaded?.record.adopted_rotation_serial).toBe(1);
+    // The re-pinned record chains to K2 and validates.
     verifyCertChain(
       loaded!.record.local_node_cert,
       loaded!.record.issuing_principal_cert,
       loaded!.record.pinned_master_pubkey,
     );
-    artifact.newIssuingPrincipalPrivateKey.fill(0);
+    expect(() => validateJoinerRecord(loaded!.record)).not.toThrow();
+    // The node key is unchanged across the re-pin.
+    expect(loaded?.record.local_node_cert.node_pubkey).toBe(
+      record.local_node_cert.node_pubkey,
+    );
+    rotation.newIssuingPrincipalPrivateKey.fill(0);
   });
 
-  it("3c-2 rejects a forged compromise artifact and holds the old trust anchor", async () => {
+  it("A-full: refuses when the cert's new_master does not match the operator pin (forged K1->K2')", async () => {
     const storage = new MemoryStorage();
     const masterKey = await testMasterKey(storage);
     const { record, home } = buildJoinerRecord();
-    await persistFederationJoinerTrustRoot({
+    await saveJoiner(storage, masterKey, record);
+    // A GENUINE K1-signed rotation cert to K2 (proves K1 authorized the
+    // succession) -- but the operator expected a DIFFERENT new root out of band.
+    // A K1 holder under an UNDETECTED compromise could forge exactly this cert;
+    // the operator pin is what defeats it.
+    const rotation = buildPlannedRotation({ current: record, home });
+    const operatorExpected = generateFortressMaster();
+    let reissueCalled = false;
+
+    const rejected = await adoptFederationJoinerPlannedRoot({
       storage,
       masterKey,
-      pinnedMasterPubkey: record.pinned_master_pubkey,
-      issuingPrincipalCert: record.issuing_principal_cert,
-      localNodeCert: record.local_node_cert,
-      localNodePrivateKey: record.local_node_private_key,
-    });
-    const artifact = buildCompromiseAdoptionArtifact({
-      current: record,
-      currentIssuingPrincipalPrivateKey: home.issuing_principal_private_key,
-    });
-    const forgedSignature = fromBase64url(
-      artifact.rootRevocation.operator_signature,
-    );
-    forgedSignature[0] ^= 1;
-    const forgedRevocation = {
-      ...artifact.rootRevocation,
-      operator_signature: toBase64url(forgedSignature),
-    };
-    forgedSignature.fill(0);
-    const forgedAttestation =
-      signFederationJoinerCompromiseRootAdoptionAttestation({
-        current: record,
-        newPinnedMasterPubkey: artifact.newPinnedMaster,
-        newIssuingPrincipalCert: artifact.newIssuingPrincipalCert,
-        reissuedLocalNodeCert: artifact.reissuedLocalNodeCert,
-        rootRevocation: forgedRevocation,
-        currentIssuingPrincipalPrivateKey: home.issuing_principal_private_key,
-      });
-
-    const rejected = await adoptFederationJoinerCompromiseRoot({
-      storage,
-      masterKey,
-      newPinnedMasterPubkey: artifact.newPinnedMaster,
-      newIssuingPrincipalCert: artifact.newIssuingPrincipalCert,
-      reissuedLocalNodeCert: artifact.reissuedLocalNodeCert,
-      rootRevocation: forgedRevocation,
-      adoptionAttestation: forgedAttestation,
-    });
-
-    expect(rejected).toEqual(
-      expect.objectContaining({
-        adopted: false,
-        state: "held_old_trust",
-        reason: "root_revocation_invalid",
-        detail: "operator_signature_invalid",
-      }),
-    );
-    const loaded = await loadFederationJoinerTrustRoot({ storage, masterKey });
-    expect(loaded?.record.pinned_master_pubkey.public_key).toBe(
-      record.pinned_master_pubkey.public_key,
-    );
-    expect(loaded?.record.highest_revocation_serial).toBe(0);
-    artifact.newIssuingPrincipalPrivateKey.fill(0);
-  });
-
-  it("3c-2 rejects a self-minted attacker root without the pinned old-principal attestation", async () => {
-    const storage = new MemoryStorage();
-    const masterKey = await testMasterKey(storage);
-    const { record, home } = buildJoinerRecord();
-    await persistFederationJoinerTrustRoot({
-      storage,
-      masterKey,
-      pinnedMasterPubkey: record.pinned_master_pubkey,
-      issuingPrincipalCert: record.issuing_principal_cert,
-      localNodeCert: record.local_node_cert,
-      localNodePrivateKey: record.local_node_private_key,
-    });
-    const artifact = buildCompromiseAdoptionArtifact({
-      current: record,
-      currentIssuingPrincipalPrivateKey: home.issuing_principal_private_key,
-    });
-    const attacker = generateKeypair();
-    const attackerAttestation =
-      signFederationJoinerCompromiseRootAdoptionAttestation({
-        current: record,
-        newPinnedMasterPubkey: artifact.newPinnedMaster,
-        newIssuingPrincipalCert: artifact.newIssuingPrincipalCert,
-        reissuedLocalNodeCert: artifact.reissuedLocalNodeCert,
-        rootRevocation: artifact.rootRevocation,
-        currentIssuingPrincipalPrivateKey: attacker.privateKey,
-      });
-
-    const rejected = await adoptFederationJoinerCompromiseRoot({
-      storage,
-      masterKey,
-      newPinnedMasterPubkey: artifact.newPinnedMaster,
-      newIssuingPrincipalCert: artifact.newIssuingPrincipalCert,
-      reissuedLocalNodeCert: artifact.reissuedLocalNodeCert,
-      rootRevocation: artifact.rootRevocation,
-      adoptionAttestation: attackerAttestation,
-    });
-    attacker.privateKey.fill(0);
-
-    expect(rejected).toEqual(
-      expect.objectContaining({
-        adopted: false,
-        state: "held_old_trust",
-        reason: "old_principal_attestation_invalid",
-      }),
-    );
-    const loaded = await loadFederationJoinerTrustRoot({ storage, masterKey });
-    expect(loaded?.record.pinned_master_pubkey.public_key).toBe(
-      record.pinned_master_pubkey.public_key,
-    );
-    artifact.newIssuingPrincipalPrivateKey.fill(0);
-  });
-
-  it("3c-2 rejects a rolled-back compromise serial and keeps the already-adopted K2 anchor", async () => {
-    const storage = new MemoryStorage();
-    const masterKey = await testMasterKey(storage);
-    const { record, home } = buildJoinerRecord();
-    await persistFederationJoinerTrustRoot({
-      storage,
-      masterKey,
-      pinnedMasterPubkey: record.pinned_master_pubkey,
-      issuingPrincipalCert: record.issuing_principal_cert,
-      localNodeCert: record.local_node_cert,
-      localNodePrivateKey: record.local_node_private_key,
-    });
-    const firstArtifact = buildCompromiseAdoptionArtifact({
-      current: record,
-      currentIssuingPrincipalPrivateKey: home.issuing_principal_private_key,
-      revocationSerial: 2,
-    });
-    const first = await adoptFederationJoinerCompromiseRoot({
-      storage,
-      masterKey,
-      newPinnedMasterPubkey: firstArtifact.newPinnedMaster,
-      newIssuingPrincipalCert: firstArtifact.newIssuingPrincipalCert,
-      reissuedLocalNodeCert: firstArtifact.reissuedLocalNodeCert,
-      rootRevocation: firstArtifact.rootRevocation,
-      adoptionAttestation: firstArtifact.adoptionAttestation,
-    });
-    expect(first.adopted).toBe(true);
-    const afterFirst = await loadFederationJoinerTrustRoot({ storage, masterKey });
-    const rollbackArtifact = buildCompromiseAdoptionArtifact({
-      current: afterFirst!.record,
-      currentIssuingPrincipalPrivateKey:
-        firstArtifact.newIssuingPrincipalPrivateKey,
-      revocationSerial: 2,
-    });
-
-    const rejected = await adoptFederationJoinerCompromiseRoot({
-      storage,
-      masterKey,
-      newPinnedMasterPubkey: rollbackArtifact.newPinnedMaster,
-      newIssuingPrincipalCert: rollbackArtifact.newIssuingPrincipalCert,
-      reissuedLocalNodeCert: rollbackArtifact.reissuedLocalNodeCert,
-      rootRevocation: rollbackArtifact.rootRevocation,
-      adoptionAttestation: rollbackArtifact.adoptionAttestation,
-    });
-
-    expect(rejected).toEqual(
-      expect.objectContaining({
-        adopted: false,
-        state: "held_old_trust",
-        reason: "revocation_serial_replay",
-        revocationSerial: 2,
-      }),
-    );
-    const loaded = await loadFederationJoinerTrustRoot({ storage, masterKey });
-    expect(loaded?.record.pinned_master_pubkey.public_key).toBe(
-      firstArtifact.newPinnedMaster.public_key,
-    );
-    expect(loaded?.record.highest_revocation_serial).toBe(2);
-    firstArtifact.newIssuingPrincipalPrivateKey.fill(0);
-    rollbackArtifact.newIssuingPrincipalPrivateKey.fill(0);
-  });
-
-  it("3c-2 does not strand on an unverifiable K2 node cert: old trust remains and state is surfaced", async () => {
-    const storage = new MemoryStorage();
-    const masterKey = await testMasterKey(storage);
-    const { record, home } = buildJoinerRecord();
-    await persistFederationJoinerTrustRoot({
-      storage,
-      masterKey,
-      pinnedMasterPubkey: record.pinned_master_pubkey,
-      issuingPrincipalCert: record.issuing_principal_cert,
-      localNodeCert: record.local_node_cert,
-      localNodePrivateKey: record.local_node_private_key,
-    });
-    const artifact = buildCompromiseAdoptionArtifact({
-      current: record,
-      currentIssuingPrincipalPrivateKey: home.issuing_principal_private_key,
-    });
-    const wrongNode = generateKeypair();
-    const badReissuedCert = {
-      ...artifact.reissuedLocalNodeCert,
-      node_pubkey: toBase64url(wrongNode.publicKey),
-    };
-    const badNodeAttestation =
-      signFederationJoinerCompromiseRootAdoptionAttestation({
-        current: record,
-        newPinnedMasterPubkey: artifact.newPinnedMaster,
-        newIssuingPrincipalCert: artifact.newIssuingPrincipalCert,
-        reissuedLocalNodeCert: badReissuedCert,
-        rootRevocation: artifact.rootRevocation,
-        currentIssuingPrincipalPrivateKey: home.issuing_principal_private_key,
-      });
-
-    const rejected = await adoptFederationJoinerCompromiseRoot({
-      storage,
-      masterKey,
-      newPinnedMasterPubkey: artifact.newPinnedMaster,
-      newIssuingPrincipalCert: artifact.newIssuingPrincipalCert,
-      reissuedLocalNodeCert: badReissuedCert,
-      rootRevocation: artifact.rootRevocation,
-      adoptionAttestation: badNodeAttestation,
-    });
-    wrongNode.privateKey.fill(0);
-
-    expect(rejected).toEqual(
-      expect.objectContaining({
-        adopted: false,
-        state: "held_old_trust",
-        reason: "reissued_node_identity_mismatch",
-      }),
-    );
-    const loaded = await loadFederationJoinerTrustRoot({ storage, masterKey });
-    expect(loaded?.record.pinned_master_pubkey.public_key).toBe(
-      record.pinned_master_pubkey.public_key,
-    );
-    expect(loaded?.record.local_node_cert.parent_chain.fortress_master_pubkey).toBe(
-      record.pinned_master_pubkey.public_key,
-    );
-    artifact.newIssuingPrincipalPrivateKey.fill(0);
-  });
-
-  // DEBT (#802 review follow-up): HYBRID (PQC, ML-DSA) compromise-root adoption is
-  // NOT yet supported on the joiner side. verifyJoinerCompromiseRootAdoption calls
-  // verifyFederationRootRevocationEvent WITHOUT operatorHybridPrincipalPublicKeys
-  // (federation-joiner-trust-root-store.ts ~line 661), so a revocation carrying a
-  // revoked_hybrid / ML-DSA bundle hits the hybrid-bundle gate in
-  // federation-revocation.ts (~line 1034) and returns operator_signature_bundle_invalid.
-  // That is FAIL-CLOSED (safe): a hybrid fleet cannot yet re-secure a joiner via this
-  // path, but it can NEVER silently adopt an unverified hybrid root. This test PINS the
-  // fail-closed reject so a future change cannot flip it to fail-OPEN. The follow-on
-  // slice that adds real hybrid support (thread the hybrid principal pubkeys through +
-  // bind them in the adoption attestation body + add accept/reject hybrid tests) MUST
-  // update this expectation deliberately, not by accident.
-  it("3c-2 rejects a HYBRID-root adoption FAIL-CLOSED (no hybrid joiner support yet)", async () => {
-    const storage = new MemoryStorage();
-    const masterKey = await testMasterKey(storage);
-    const { record, home } = buildJoinerRecord();
-    await persistFederationJoinerTrustRoot({
-      storage,
-      masterKey,
-      pinnedMasterPubkey: record.pinned_master_pubkey,
-      issuingPrincipalCert: record.issuing_principal_cert,
-      localNodeCert: record.local_node_cert,
-      localNodePrivateKey: record.local_node_private_key,
-    });
-
-    // Build a real K2 classical anchor (master + issuing principal) so the
-    // classical leg of the hybrid revocation, and the new principal chain, both
-    // VERIFY. The adoption then fails ONLY at the hybrid-bundle gate, which is the
-    // exact gap we are documenting (not at an earlier classical check).
-    const k2 = generateFortressMaster();
-    const k2Principal = generateKeypair();
-    const newPinnedMaster: FortressMasterPublicKey = {
-      ...k2.public,
-      fortress_id: record.fortress_id,
-    };
-    const newIssuingPrincipalCert = issuePrincipalCertificate({
-      principal_id: record.issuing_principal_cert.principal_id,
-      principal_pubkey: k2Principal.publicKey,
-      role: "root",
-      fortress_id: record.fortress_id,
-      master_private_key: k2.private_key,
-    });
-    const nodePubkey = fromBase64url(record.local_node_cert.node_pubkey);
-    const reissuedLocalNodeCert = issueNodeIdentityCertificate({
-      node_id: record.node_id,
-      node_pubkey: nodePubkey,
-      node_mode: record.local_node_cert.node_mode,
-      fortress_id: record.fortress_id,
-      capabilities: record.local_node_cert.capabilities,
-      parent_chain: {
-        fortress_master_pubkey: newPinnedMaster.public_key,
-        principal_id: newIssuingPrincipalCert.principal_id,
-        principal_pubkey: newIssuingPrincipalCert.principal_pubkey,
+      rotationCert: rotation.rotationCert,
+      expectedPinnedMaster: {
+        ...operatorExpected.public,
+        fortress_id: record.fortress_id,
       },
-      principal_private_key: k2Principal.privateKey,
-      master_private_key: k2.private_key,
+      reissue: async () => {
+        reissueCalled = true;
+        return rotation.reissue();
+      },
+    });
+    operatorExpected.private_key.fill(0);
+
+    expect(rejected).toEqual(
+      expect.objectContaining({
+        adopted: false,
+        state: "held_old_trust",
+        reason: "adopted_root_mismatch_operator_pin",
+      }),
+    );
+    // Fail closed BEFORE any network round.
+    expect(reissueCalled).toBe(false);
+    const loaded = await loadFederationJoinerTrustRoot({ storage, masterKey });
+    expect(loaded?.record.pinned_master_pubkey.public_key).toBe(
+      record.pinned_master_pubkey.public_key,
+    );
+    rotation.newIssuingPrincipalPrivateKey.fill(0);
+  });
+
+  it("LOW: an absent operator pin returns a clean held result, not a TypeError", async () => {
+    const storage = new MemoryStorage();
+    const masterKey = await testMasterKey(storage);
+    const { record, home } = buildJoinerRecord();
+    await saveJoiner(storage, masterKey, record);
+    const rotation = buildPlannedRotation({ current: record, home });
+    let reissueCalled = false;
+
+    // A direct JS caller passes no pin (the CLI makes it required, but the core
+    // must fail closed-as-specified rather than throw).
+    const rejected = await adoptFederationJoinerPlannedRoot({
+      storage,
+      masterKey,
+      rotationCert: rotation.rotationCert,
+      expectedPinnedMaster: undefined as unknown as FortressMasterPublicKey,
+      reissue: async () => {
+        reissueCalled = true;
+        return rotation.reissue();
+      },
     });
 
-    // A separately-minted hybrid material supplies a well-formed revoked_hybrid
-    // binding plus the hybrid principal keys that sign the both-must-pass bundle.
-    const hybrid = await mintHybridFederationMaterial({
-      fortressId: record.fortress_id,
-      nodeId: record.node_id,
-      principalId: newIssuingPrincipalCert.principal_id,
+    expect(rejected).toEqual(
+      expect.objectContaining({
+        adopted: false,
+        state: "held_old_trust",
+        reason: "adopted_root_mismatch_operator_pin",
+      }),
+    );
+    expect(reissueCalled).toBe(false);
+    const loaded = await loadFederationJoinerTrustRoot({ storage, masterKey });
+    expect(loaded?.record.pinned_master_pubkey.public_key).toBe(
+      record.pinned_master_pubkey.public_key,
+    );
+    rotation.newIssuingPrincipalPrivateKey.fill(0);
+  });
+
+  it("rejects a rotation cert whose serial does not advance the adopted serial (replay)", async () => {
+    const storage = new MemoryStorage();
+    const masterKey = await testMasterKey(storage);
+    const { record, home } = buildJoinerRecord();
+    // Simulate a joiner that already adopted a planned rotation at serial 5.
+    // Setup routes through the only public write path (the locked chokepoint).
+    await new FederationJoinerTrustRootStore(storage, masterKey).lockedUpdate(
+      () => ({ ...record, adopted_rotation_serial: 5 }),
+    );
+    // A cert at serial 5 (equal, not advancing) must be rejected.
+    const rotation = buildPlannedRotation({
+      current: record,
+      home,
+      rotationSerial: 5,
     });
 
-    const rootRevocation = await signFederationRootRevocationPayloadHybrid({
-      fortressId: record.fortress_id,
-      revokedMasterPubkey: record.pinned_master_pubkey.public_key,
-      revokedHybrid: {
-        ed25519: {
-          key_ref: hybrid.pinned_master.public_keys.ed25519.key_ref,
-          public_key: hybrid.pinned_master.public_keys.ed25519.public_key,
-        },
-        ml_dsa_65: {
-          key_ref: hybrid.pinned_master.public_keys.ml_dsa_65.key_ref,
-          public_key: hybrid.pinned_master.public_keys.ml_dsa_65.public_key,
+    const rejected = await adoptFederationJoinerPlannedRoot({
+      storage,
+      masterKey,
+      rotationCert: rotation.rotationCert,
+      expectedPinnedMaster: rotation.newPinnedMaster,
+      reissue: rotation.reissue,
+    });
+
+    expect(rejected).toEqual(
+      expect.objectContaining({
+        adopted: false,
+        state: "held_old_trust",
+        reason: "rotation_cert_invalid",
+      }),
+    );
+    const loaded = await loadFederationJoinerTrustRoot({ storage, masterKey });
+    expect(loaded?.record.pinned_master_pubkey.public_key).toBe(
+      record.pinned_master_pubkey.public_key,
+    );
+    expect(loaded?.record.adopted_rotation_serial).toBe(5);
+    rotation.newIssuingPrincipalPrivateKey.fill(0);
+  });
+
+  it("rejects a rotation cert signed by a master the joiner does not pin", async () => {
+    const storage = new MemoryStorage();
+    const masterKey = await testMasterKey(storage);
+    const { record } = buildJoinerRecord();
+    await saveJoiner(storage, masterKey, record);
+
+    // A rotation cert whose old_master is a FOREIGN fortress (not the pinned K1).
+    const foreignHome = mintFederationTrustRootRecord({ nodeId: "attacker" });
+    const foreign = buildJoinerRecord({ home: foreignHome, joinerNodeId: record.node_id });
+    // Re-key the foreign joiner record onto our fortress_id so only the SIGNER
+    // differs (not the fortress); the verify must reject on the signer mismatch.
+    const foreignRotation = buildPlannedRotation({
+      current: {
+        ...foreign.record,
+        fortress_id: record.fortress_id,
+        pinned_master_pubkey: {
+          ...foreignHome.pinned_master_pubkey,
+          fortress_id: record.fortress_id,
         },
       },
-      effectiveAt: new Date().toISOString(),
-      revocationSerial: 1,
-      operatorPrincipalId: newIssuingPrincipalCert.principal_id,
-      // Classical leg signed by the K2 classical principal so the existing
-      // classical verify path ACCEPTS it (the gap is purely the missing hybrid
-      // pubkeys downstream, not a classical-signature failure).
-      newClassicalPrincipalPrivateKey: k2Principal.privateKey,
-      newHybridPrincipalPrivateKeys: hybrid.issuing_principal_private_keys,
+      home: foreignHome,
     });
 
-    const adoptionAttestation =
-      signFederationJoinerCompromiseRootAdoptionAttestation({
-        current: record,
-        newPinnedMasterPubkey: newPinnedMaster,
-        newIssuingPrincipalCert,
-        reissuedLocalNodeCert,
-        rootRevocation,
-        currentIssuingPrincipalPrivateKey: home.issuing_principal_private_key,
-      });
-
-    const rejected = await adoptFederationJoinerCompromiseRoot({
+    const rejected = await adoptFederationJoinerPlannedRoot({
       storage,
       masterKey,
-      newPinnedMasterPubkey: newPinnedMaster,
-      newIssuingPrincipalCert,
-      reissuedLocalNodeCert,
-      rootRevocation,
-      adoptionAttestation,
+      rotationCert: foreignRotation.rotationCert,
+      expectedPinnedMaster: foreignRotation.newPinnedMaster,
+      reissue: foreignRotation.reissue,
     });
-    k2.private_key.fill(0);
-    k2Principal.privateKey.fill(0);
-    nodePubkey.fill(0);
 
-    // FAIL-CLOSED: the classical leg verifies, then the hybrid-bundle gate trips
-    // because the joiner adoption path supplies no operatorHybridPrincipalPublicKeys.
     expect(rejected).toEqual(
       expect.objectContaining({
         adopted: false,
         state: "held_old_trust",
-        reason: "root_revocation_invalid",
-        detail: "operator_signature_bundle_invalid",
-        revocationSerial: 1,
+        reason: "rotation_cert_invalid",
       }),
     );
-    // The joiner HOLDS the old trust anchor: nothing adopted, no serial advance.
     const loaded = await loadFederationJoinerTrustRoot({ storage, masterKey });
     expect(loaded?.record.pinned_master_pubkey.public_key).toBe(
       record.pinned_master_pubkey.public_key,
     );
-    expect(loaded?.record.highest_revocation_serial ?? 0).toBe(0);
+    foreignRotation.newIssuingPrincipalPrivateKey.fill(0);
+  });
+
+  it("holds when the reissue endpoint reports the old root revoked (K1-holder-forged-cert defense)", async () => {
+    const storage = new MemoryStorage();
+    const masterKey = await testMasterKey(storage);
+    const { record, home } = buildJoinerRecord();
+    await saveJoiner(storage, masterKey, record);
+    const rotation = buildPlannedRotation({ current: record, home });
+
+    const rejected = await adoptFederationJoinerPlannedRoot({
+      storage,
+      masterKey,
+      rotationCert: rotation.rotationCert,
+      expectedPinnedMaster: rotation.newPinnedMaster,
+      // The endpoint denies (e.g. old_root_revoked): fail closed to held.
+      reissue: async () => ({ ok: false, reason: "denied" }),
+    });
+
+    expect(rejected).toEqual(
+      expect.objectContaining({
+        adopted: false,
+        state: "held_old_trust",
+        reason: "reissue_denied",
+      }),
+    );
+    const loaded = await loadFederationJoinerTrustRoot({ storage, masterKey });
+    expect(loaded?.record.pinned_master_pubkey.public_key).toBe(
+      record.pinned_master_pubkey.public_key,
+    );
+    rotation.newIssuingPrincipalPrivateKey.fill(0);
+  });
+
+  it("refuses a HYBRID rotation cert LOUDLY (classical-only slice, no silent downgrade)", async () => {
+    const storage = new MemoryStorage();
+    const masterKey = await testMasterKey(storage);
+    const { record, home } = buildJoinerRecord();
+    await saveJoiner(storage, masterKey, record);
+    const rotation = buildPlannedRotation({ current: record, home });
+    const hybridCert = {
+      ...rotation.rotationCert,
+      // Presence of ANY hybrid binding must trip the classical-only refusal
+      // BEFORE the classical signature is even checked.
+      hybrid_rotation: { placeholder: true } as unknown,
+    } as unknown as FederationRootRotationCertificate;
+
+    let reissueCalled = false;
+    const rejected = await adoptFederationJoinerPlannedRoot({
+      storage,
+      masterKey,
+      rotationCert: hybridCert,
+      expectedPinnedMaster: rotation.newPinnedMaster,
+      reissue: async () => {
+        reissueCalled = true;
+        return rotation.reissue();
+      },
+    });
+
+    expect(rejected).toEqual(
+      expect.objectContaining({
+        adopted: false,
+        state: "held_old_trust",
+        reason: "hybrid_rotation_unsupported",
+      }),
+    );
+    // Refused before any network round.
+    expect(reissueCalled).toBe(false);
+    const loaded = await loadFederationJoinerTrustRoot({ storage, masterKey });
+    expect(loaded?.record.pinned_master_pubkey.public_key).toBe(
+      record.pinned_master_pubkey.public_key,
+    );
+    rotation.newIssuingPrincipalPrivateKey.fill(0);
+  });
+
+  it("refuses when the server echoes a different root than the rotation cert (constraint 4)", async () => {
+    const storage = new MemoryStorage();
+    const masterKey = await testMasterKey(storage);
+    const { record, home } = buildJoinerRecord();
+    await saveJoiner(storage, masterKey, record);
+    const rotation = buildPlannedRotation({ current: record, home });
+    const attacker = generateFortressMaster();
+
+    const rejected = await adoptFederationJoinerPlannedRoot({
+      storage,
+      masterKey,
+      rotationCert: rotation.rotationCert,
+      expectedPinnedMaster: rotation.newPinnedMaster,
+      // Server tries to redirect to an attacker root in its response body.
+      reissue: async () => ({
+        ok: true,
+        certificate: rotation.reissuedNodeCert,
+        issuingPrincipalCert: rotation.newIssuingPrincipalCert,
+        serverPinnedMaster: {
+          ...attacker.public,
+          fortress_id: record.fortress_id,
+        },
+      }),
+    });
+    attacker.private_key.fill(0);
+
+    expect(rejected).toEqual(
+      expect.objectContaining({
+        adopted: false,
+        state: "held_old_trust",
+        reason: "server_root_mismatch",
+      }),
+    );
+    rotation.newIssuingPrincipalPrivateKey.fill(0);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// Slice 3c-2 compromise-rotation manual re-join (record-level)
+// ═══════════════════════════════════════════════════════════════════════
+
+describe("compromise manual re-join (persist records the dead K1)", () => {
+  it("persists K2 with the dead K1 recorded revoked and the serial floor set", async () => {
+    const storage = new MemoryStorage();
+    const masterKey = await testMasterKey(storage);
+    // The joiner record's pinned master IS the new K2 (a fresh join against K2).
+    const { record } = buildJoinerRecord();
+    const deadK1 = toBase64url(randomBytes(32));
+
+    await persistFederationJoinerTrustRoot({
+      storage,
+      masterKey,
+      pinnedMasterPubkey: record.pinned_master_pubkey,
+      issuingPrincipalCert: record.issuing_principal_cert,
+      localNodeCert: record.local_node_cert,
+      localNodePrivateKey: record.local_node_private_key,
+      revokedRootPubkeys: [deadK1],
+      highestRevocationSerial: 7,
+    });
+
+    const loaded = await loadFederationJoinerTrustRoot({ storage, masterKey });
+    expect(loaded?.record.pinned_master_pubkey.public_key).toBe(
+      record.pinned_master_pubkey.public_key,
+    );
+    expect(loaded?.record.revoked_root_pubkeys?.has(deadK1)).toBe(true);
+    expect(loaded?.record.highest_revocation_serial).toBe(7);
+    expect(loaded?.context.revokedRootPubkeys.has(deadK1)).toBe(true);
+    expect(loaded?.context.highestRevocationSerial).toBe(7);
+  });
+
+  it("a record whose pinned master is in its own revoked set fails validation", () => {
+    const { record } = buildJoinerRecord();
+    const selfRevoked: FederationJoinerTrustRootRecord = {
+      ...record,
+      revoked_root_pubkeys: new Set([record.pinned_master_pubkey.public_key]),
+      highest_revocation_serial: 1,
+    };
+    expect(() => validateJoinerRecord(selfRevoked)).toThrow(
+      /current pinned master is marked revoked/,
+    );
+  });
+
+  it("refuses to persist a self-revoked master (a fortress cannot re-pin a root it revokes)", async () => {
+    const storage = new MemoryStorage();
+    const masterKey = await testMasterKey(storage);
+    const { record } = buildJoinerRecord();
+
+    await expect(
+      persistFederationJoinerTrustRoot({
+        storage,
+        masterKey,
+        pinnedMasterPubkey: record.pinned_master_pubkey,
+        issuingPrincipalCert: record.issuing_principal_cert,
+        localNodeCert: record.local_node_cert,
+        localNodePrivateKey: record.local_node_private_key,
+        revokedRootPubkeys: [record.pinned_master_pubkey.public_key],
+        highestRevocationSerial: 1,
+      }),
+    ).rejects.toThrow(/current pinned master is marked revoked/);
+    expect(
+      await storage.exists(
+        FEDERATION_JOINER_TRUST_ROOT_NAMESPACE,
+        FEDERATION_JOINER_TRUST_ROOT_KEY,
+      ),
+    ).toBe(false);
+  });
+
+  it("is idempotent: re-running the re-join yields the same record and the floor never drops", async () => {
+    const storage = new MemoryStorage();
+    const masterKey = await testMasterKey(storage);
+    const { record } = buildJoinerRecord();
+    const deadK1 = toBase64url(randomBytes(32));
+
+    for (let i = 0; i < 2; i++) {
+      await persistFederationJoinerTrustRoot({
+        storage,
+        masterKey,
+        pinnedMasterPubkey: record.pinned_master_pubkey,
+        issuingPrincipalCert: record.issuing_principal_cert,
+        localNodeCert: record.local_node_cert,
+        localNodePrivateKey: record.local_node_private_key,
+        revokedRootPubkeys: [deadK1, deadK1],
+        highestRevocationSerial: 4,
+      });
+    }
+
+    const loaded = await loadFederationJoinerTrustRoot({ storage, masterKey });
+    expect(loaded?.record.pinned_master_pubkey.public_key).toBe(
+      record.pinned_master_pubkey.public_key,
+    );
+    // Re-adding K1 is a no-op set add.
+    expect([...(loaded?.record.revoked_root_pubkeys ?? [])]).toEqual([deadK1]);
+    expect(loaded?.record.highest_revocation_serial).toBe(4);
+  });
+
+  it("MED: a lower-serial rejoin rerun is refused loudly; the monotonic floor never drops", async () => {
+    const storage = new MemoryStorage();
+    const masterKey = await testMasterKey(storage);
+    const { record } = buildJoinerRecord();
+    const deadK1 = toBase64url(randomBytes(32));
+    // First re-join records the dead root at serial 5.
+    await persistFederationJoinerTrustRoot({
+      storage,
+      masterKey,
+      pinnedMasterPubkey: record.pinned_master_pubkey,
+      issuingPrincipalCert: record.issuing_principal_cert,
+      localNodeCert: record.local_node_cert,
+      localNodePrivateKey: record.local_node_private_key,
+      revokedRootPubkeys: [deadK1],
+      highestRevocationSerial: 5,
+    });
+    // A stale rerun at serial 3 is REFUSED loudly; nothing lowers the floor.
+    await expect(
+      persistFederationJoinerTrustRoot({
+        storage,
+        masterKey,
+        pinnedMasterPubkey: record.pinned_master_pubkey,
+        issuingPrincipalCert: record.issuing_principal_cert,
+        localNodeCert: record.local_node_cert,
+        localNodePrivateKey: record.local_node_private_key,
+        revokedRootPubkeys: [deadK1],
+        highestRevocationSerial: 3,
+      }),
+    ).rejects.toThrow(/below the recorded anti-rollback floor/);
+    const loaded = await loadFederationJoinerTrustRoot({ storage, masterKey });
+    expect(loaded?.record.highest_revocation_serial).toBe(5);
+    expect(loaded?.record.revoked_root_pubkeys?.has(deadK1)).toBe(true);
+  });
+
+  it("MED: successive re-joins UNION the revoked set and raise the floor (never replace)", async () => {
+    const storage = new MemoryStorage();
+    const masterKey = await testMasterKey(storage);
+    const { record } = buildJoinerRecord();
+    const deadK1 = toBase64url(randomBytes(32));
+    const deadKPrev = toBase64url(randomBytes(32));
+    await persistFederationJoinerTrustRoot({
+      storage,
+      masterKey,
+      pinnedMasterPubkey: record.pinned_master_pubkey,
+      issuingPrincipalCert: record.issuing_principal_cert,
+      localNodeCert: record.local_node_cert,
+      localNodePrivateKey: record.local_node_private_key,
+      revokedRootPubkeys: [deadKPrev],
+      highestRevocationSerial: 2,
+    });
+    // A later, HIGHER-serial re-join naming a DIFFERENT dead root must keep the
+    // earlier one (union, never replace) and raise the floor.
+    await persistFederationJoinerTrustRoot({
+      storage,
+      masterKey,
+      pinnedMasterPubkey: record.pinned_master_pubkey,
+      issuingPrincipalCert: record.issuing_principal_cert,
+      localNodeCert: record.local_node_cert,
+      localNodePrivateKey: record.local_node_private_key,
+      revokedRootPubkeys: [deadK1],
+      highestRevocationSerial: 6,
+    });
+    const loaded = await loadFederationJoinerTrustRoot({ storage, masterKey });
+    expect(loaded?.record.revoked_root_pubkeys?.has(deadKPrev)).toBe(true);
+    expect(loaded?.record.revoked_root_pubkeys?.has(deadK1)).toBe(true);
+    expect(loaded?.record.highest_revocation_serial).toBe(6);
+  });
+
+  it("MED-1: a persist over an UNREADABLE existing record fails closed (never resets the floor)", async () => {
+    const storage = new MemoryStorage();
+    const masterKey = await testMasterKey(storage);
+    const { record } = buildJoinerRecord();
+    const deadK1 = toBase64url(randomBytes(32));
+    // Seed a valid record: floor 5, {deadK1}.
+    await persistFederationJoinerTrustRoot({
+      storage,
+      masterKey,
+      pinnedMasterPubkey: record.pinned_master_pubkey,
+      issuingPrincipalCert: record.issuing_principal_cert,
+      localNodeCert: record.local_node_cert,
+      localNodePrivateKey: record.local_node_private_key,
+      revokedRootPubkeys: [deadK1],
+      highestRevocationSerial: 5,
+    });
+    // Corrupt the at-rest ciphertext so load() THROWS (not returns null).
+    const raw = await storage.read(
+      FEDERATION_JOINER_TRUST_ROOT_NAMESPACE,
+      FEDERATION_JOINER_TRUST_ROOT_KEY,
+    );
+    const payload = JSON.parse(bytesToString(raw!)) as { ct: string };
+    const ctChars = payload.ct.split("");
+    ctChars[0] = ctChars[0] === "A" ? "B" : "A";
+    payload.ct = ctChars.join("");
+    const tampered = stringToBytes(JSON.stringify(payload));
+    await storage.write(
+      FEDERATION_JOINER_TRUST_ROOT_NAMESPACE,
+      FEDERATION_JOINER_TRUST_ROOT_KEY,
+      tampered,
+    );
+    // A rejoin at a LOWER serial must FAIL CLOSED, not overwrite / lower the floor.
+    await expect(
+      persistFederationJoinerTrustRoot({
+        storage,
+        masterKey,
+        pinnedMasterPubkey: record.pinned_master_pubkey,
+        issuingPrincipalCert: record.issuing_principal_cert,
+        localNodeCert: record.local_node_cert,
+        localNodePrivateKey: record.local_node_private_key,
+        revokedRootPubkeys: [toBase64url(randomBytes(32))],
+        highestRevocationSerial: 2,
+      }),
+    ).rejects.toThrow(/unreadable joiner record|cannot be decoded/i);
+    // The corrupt blob is UNCHANGED (not overwritten with a lower floor).
+    const after = await storage.read(
+      FEDERATION_JOINER_TRUST_ROOT_NAMESPACE,
+      FEDERATION_JOINER_TRUST_ROOT_KEY,
+    );
+    expect(bytesToString(after!)).toBe(bytesToString(tampered));
+  });
+
+  it("MED-2: concurrent persists serialize via the cross-process lock (union + max preserved)", async () => {
+    // The cross-process lock only engages on a filesystem backend (it degrades to
+    // a direct run on the in-memory rig), so this uses a real FilesystemStorage.
+    const dir = await mkdtemp(join(tmpdir(), "joiner-lock-"));
+    try {
+      const storage = new FilesystemStorage(join(dir, "state"));
+      const { masterKey } = await establishMaster({
+        storage,
+        passphrase: `lock-${randomBytes(6).toString("hex")}`,
+        firstRun: { installMode: "headless", mintRecoveryKey: false },
+      });
+      const { record } = buildJoinerRecord();
+      const deadA = toBase64url(randomBytes(32));
+      const deadB = toBase64url(randomBytes(32));
+      const base = {
+        storage,
+        masterKey,
+        pinnedMasterPubkey: record.pinned_master_pubkey,
+        issuingPrincipalCert: record.issuing_principal_cert,
+        localNodeCert: record.local_node_cert,
+        localNodePrivateKey: record.local_node_private_key,
+      };
+      // Two overlapping rejoin persists, each recording a DIFFERENT dead root at
+      // the SAME serial (so neither is legitimately below-floor whichever wins the
+      // lock first). The lock serializes the read-modify-write so the second sees
+      // the first's write and UNIONs; without it, last-writer-wins would drop one
+      // revoked key entirely.
+      await Promise.all([
+        persistFederationJoinerTrustRoot({
+          ...base,
+          revokedRootPubkeys: [deadA],
+          highestRevocationSerial: 5,
+        }),
+        persistFederationJoinerTrustRoot({
+          ...base,
+          revokedRootPubkeys: [deadB],
+          highestRevocationSerial: 5,
+        }),
+      ]);
+      const loaded = await loadFederationJoinerTrustRoot({ storage, masterKey });
+      expect(loaded?.record.revoked_root_pubkeys?.has(deadA)).toBe(true);
+      expect(loaded?.record.revoked_root_pubkeys?.has(deadB)).toBe(true);
+      expect(loaded?.record.highest_revocation_serial).toBe(5);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("chokepoint: a planned adopt PRESERVES the current revoked set + floor (adopt mutation carries none)", async () => {
+    const storage = new MemoryStorage();
+    const masterKey = await testMasterKey(storage);
+    const { record, home } = buildJoinerRecord();
+    const deadForeign = toBase64url(randomBytes(32));
+    // The joiner already recorded a dead root at floor 5 (e.g. from an earlier
+    // compromise re-join of a different lineage). A planned adopt's mutation
+    // carries NO revoked/floor - the chokepoint must merge-preserve these.
+    await persistFederationJoinerTrustRoot({
+      storage,
+      masterKey,
+      pinnedMasterPubkey: record.pinned_master_pubkey,
+      issuingPrincipalCert: record.issuing_principal_cert,
+      localNodeCert: record.local_node_cert,
+      localNodePrivateKey: record.local_node_private_key,
+      revokedRootPubkeys: [deadForeign],
+      highestRevocationSerial: 5,
+    });
+    const rotation = buildPlannedRotation({ current: record, home });
+
+    const adopted = await adoptFederationJoinerPlannedRoot({
+      storage,
+      masterKey,
+      rotationCert: rotation.rotationCert,
+      expectedPinnedMaster: rotation.newPinnedMaster,
+      reissue: rotation.reissue,
+    });
+    expect(adopted.adopted).toBe(true);
+
+    const loaded = await loadFederationJoinerTrustRoot({ storage, masterKey });
+    // Re-pinned to K2, but the anti-rollback state is INTACT (not dropped).
+    expect(loaded?.record.pinned_master_pubkey.public_key).toBe(
+      rotation.newPinnedMaster.public_key,
+    );
+    expect(loaded?.record.revoked_root_pubkeys?.has(deadForeign)).toBe(true);
+    expect(loaded?.record.highest_revocation_serial).toBe(5);
+    expect(loaded?.record.adopted_rotation_serial).toBe(1);
+    rotation.newIssuingPrincipalPrivateKey.fill(0);
+  });
+
+  it("chokepoint: concurrent adopt + rejoin preserves the union revoked set + max floor (FilesystemStorage)", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "joiner-chokepoint-"));
+    try {
+      const storage = new FilesystemStorage(join(dir, "state"));
+      const { masterKey } = await establishMaster({
+        storage,
+        passphrase: `cp-${randomBytes(6).toString("hex")}`,
+        firstRun: { installMode: "headless", mintRecoveryKey: false },
+      });
+      const { record, home } = buildJoinerRecord();
+      const k1Pub = record.pinned_master_pubkey.public_key;
+      // Seed the base record (pin=K1, no revoked).
+      await persistFederationJoinerTrustRoot({
+        storage,
+        masterKey,
+        pinnedMasterPubkey: record.pinned_master_pubkey,
+        issuingPrincipalCert: record.issuing_principal_cert,
+        localNodeCert: record.local_node_cert,
+        localNodePrivateKey: record.local_node_private_key,
+      });
+      // Adopt: a genuine K1->K2 planned rotation (via the injected reissue).
+      const rotationAdopt = buildPlannedRotation({ current: record, home });
+      // Rejoin: a fresh K1->K2' re-pin recording K1 revoked at floor 5.
+      const rotationRejoin = buildPlannedRotation({ current: record, home });
+
+      // Fire both concurrently. Depending on lock order, adopt either commits then
+      // is superseded, or is refused under the lock because K1 got revoked - EITHER
+      // WAY the rejoin's anti-rollback update (K1 revoked, floor 5) must survive.
+      const adoptP = adoptFederationJoinerPlannedRoot({
+        storage,
+        masterKey,
+        rotationCert: rotationAdopt.rotationCert,
+        expectedPinnedMaster: rotationAdopt.newPinnedMaster,
+        reissue: rotationAdopt.reissue,
+      });
+      const rejoinP = persistFederationJoinerTrustRoot({
+        storage,
+        masterKey,
+        pinnedMasterPubkey: rotationRejoin.newPinnedMaster,
+        issuingPrincipalCert: rotationRejoin.newIssuingPrincipalCert,
+        localNodeCert: rotationRejoin.reissuedNodeCert,
+        localNodePrivateKey: record.local_node_private_key,
+        revokedRootPubkeys: [k1Pub],
+        highestRevocationSerial: 5,
+      });
+      await Promise.all([adoptP, rejoinP]);
+
+      const loaded = await loadFederationJoinerTrustRoot({ storage, masterKey });
+      expect(loaded?.record.revoked_root_pubkeys?.has(k1Pub)).toBe(true);
+      expect(loaded?.record.highest_revocation_serial).toBe(5);
+      rotationAdopt.newIssuingPrincipalPrivateKey.fill(0);
+      rotationRejoin.newIssuingPrincipalPrivateKey.fill(0);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// F1 (re-gate 2026-07-30): planned adopted_rotation_serial under-lock floor
+// ═══════════════════════════════════════════════════════════════════════
+
+describe("F1: planned adopted-serial floor is enforced UNDER THE LOCK", () => {
+  it("the executing probe is dead: a same-pin lower serial through lockedUpdate is refused and the floor holds", async () => {
+    const storage = new MemoryStorage();
+    const masterKey = await testMasterKey(storage);
+    const { record } = buildJoinerRecord();
+    await saveJoiner(storage, masterKey, record);
+    const store = new FederationJoinerTrustRootStore(storage, masterKey);
+
+    // Raise the planned floor to 9 (same pinned master).
+    await store.lockedUpdate((current) => ({
+      ...current!,
+      adopted_rotation_serial: 9,
+    }));
+    let loaded = await loadFederationJoinerTrustRoot({ storage, masterKey });
+    expect(loaded?.record.adopted_rotation_serial).toBe(9);
+
+    // The re-gate's executing probe (9 -> 2 through the chokepoint) must now
+    // FAIL: a same-pin write with a strictly lower positive serial is refused
+    // loudly under the lock, not passed through verbatim.
+    await expect(
+      store.lockedUpdate((current) => ({
+        ...current!,
+        adopted_rotation_serial: 2,
+      })),
+    ).rejects.toThrow(/below the recorded planned anti-rollback floor/);
+
+    // A STALE same-pin caller carrying NO planned serial inherits the floor
+    // (Math.max merge), exactly like the compromise floor.
+    await store.lockedUpdate((current) => ({
+      fortress_id: current!.fortress_id,
+      node_id: current!.node_id,
+      pinned_master_pubkey: current!.pinned_master_pubkey,
+      issuing_principal_cert: current!.issuing_principal_cert,
+      local_node_cert: current!.local_node_cert,
+      local_node_private_key: current!.local_node_private_key,
+      // deliberately NO adopted_rotation_serial
+    }));
+
+    loaded = await loadFederationJoinerTrustRoot({ storage, masterKey });
+    expect(loaded?.record.adopted_rotation_serial).toBe(9);
+    expect(loaded?.record.pinned_master_pubkey.public_key).toBe(
+      record.pinned_master_pubkey.public_key,
+    );
+  });
+
+  it("a fresh join onto a NEW pinned master resets the planned serial to 0 (lineage change, NOT a rollback)", async () => {
+    const storage = new MemoryStorage();
+    const masterKey = await testMasterKey(storage);
+    const { record } = buildJoinerRecord();
+    await saveJoiner(storage, masterKey, record);
+    const store = new FederationJoinerTrustRootStore(storage, masterKey);
+    await store.lockedUpdate((current) => ({
+      ...current!,
+      adopted_rotation_serial: 9,
+    }));
+
+    // A fresh join is a NEW lineage: different home fortress, different pinned
+    // master, planned serial honestly absent. The scoped floor must NOT read
+    // this as a 9 -> 0 rollback and refuse (or silently re-impose 9).
+    const fresh = buildJoinerRecord();
+    await saveJoiner(storage, masterKey, fresh.record);
+
+    const loaded = await loadFederationJoinerTrustRoot({ storage, masterKey });
+    expect(loaded?.record.pinned_master_pubkey.public_key).toBe(
+      fresh.record.pinned_master_pubkey.public_key,
+    );
+    expect(loaded?.record.adopted_rotation_serial ?? 0).toBe(0);
+  });
+
+  it("F1 race: an adopt whose pin moved under it is refused; the WINNER's pinned master AND serial survive", async () => {
+    const storage = new MemoryStorage();
+    const masterKey = await testMasterKey(storage);
+    const { record, home } = buildJoinerRecord();
+    await saveJoiner(storage, masterKey, record);
+
+    // Equivocating-issuer fork (the F1 concrete state): two valid K1-signed
+    // certs to DIFFERENT new masters at DECREASING serials. Adopt A (serial 5,
+    // K2a) completes INSIDE adopt B's reissue round, so B's pre-lock
+    // verification (against K1) is stale by the time B reaches the lock.
+    const rotationA = buildPlannedRotation({
+      current: record,
+      home,
+      rotationSerial: 5,
+    });
+    const rotationB = buildPlannedRotation({
+      current: record,
+      home,
+      rotationSerial: 3,
+    });
+
+    const resultB = await adoptFederationJoinerPlannedRoot({
+      storage,
+      masterKey,
+      rotationCert: rotationB.rotationCert,
+      expectedPinnedMaster: rotationB.newPinnedMaster,
+      reissue: async () => {
+        const resultA = await adoptFederationJoinerPlannedRoot({
+          storage,
+          masterKey,
+          rotationCert: rotationA.rotationCert,
+          expectedPinnedMaster: rotationA.newPinnedMaster,
+          reissue: rotationA.reissue,
+        });
+        expect(resultA.adopted).toBe(true);
+        return rotationB.reissue();
+      },
+    });
+
+    // B must be refused UNDER THE LOCK (the pin is no longer B's cert's old
+    // master), never allowed to roll the anchor back to (K2b, 3).
+    expect(resultB).toEqual(
+      expect.objectContaining({
+        adopted: false,
+        state: "held_old_trust",
+        reason: "rotation_cert_invalid",
+      }),
+    );
+    const loaded = await loadFederationJoinerTrustRoot({ storage, masterKey });
+    // The assertions the prior regression suite lacked: pinned master AND the
+    // planned serial after the race, not just the revoked set.
+    expect(loaded?.record.pinned_master_pubkey.public_key).toBe(
+      rotationA.newPinnedMaster.public_key,
+    );
+    expect(loaded?.record.adopted_rotation_serial).toBe(5);
+    rotationA.newIssuingPrincipalPrivateKey.fill(0);
+    rotationB.newIssuingPrincipalPrivateKey.fill(0);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// L2 + LOW notes (re-gate 2026-07-30): pre-network revoked-K2 refusal and
+// direct coverage of the reissue-result refusal reasons
+// ═══════════════════════════════════════════════════════════════════════
+
+describe("adopt refusal precision (re-gate 2026-07-30)", () => {
+  it("L2: a locally-revoked K2 is refused BEFORE the network reissue round (honest reason, no round-trip)", async () => {
+    const storage = new MemoryStorage();
+    const masterKey = await testMasterKey(storage);
+    const { record, home } = buildJoinerRecord();
+    const rotation = buildPlannedRotation({ current: record, home });
+    // The joiner has locally revoked the very root this cert attests as new
+    // (e.g. a prior compromise wave burned K2 as well as K1).
+    await persistFederationJoinerTrustRoot({
+      storage,
+      masterKey,
+      pinnedMasterPubkey: record.pinned_master_pubkey,
+      issuingPrincipalCert: record.issuing_principal_cert,
+      localNodeCert: record.local_node_cert,
+      localNodePrivateKey: record.local_node_private_key,
+      revokedRootPubkeys: [rotation.newPinnedMaster.public_key],
+      highestRevocationSerial: 5,
+    });
+
+    let reissueCalled = false;
+    const rejected = await adoptFederationJoinerPlannedRoot({
+      storage,
+      masterKey,
+      rotationCert: rotation.rotationCert,
+      expectedPinnedMaster: rotation.newPinnedMaster,
+      reissue: async () => {
+        reissueCalled = true;
+        return rotation.reissue();
+      },
+    });
+
+    expect(rejected).toEqual(
+      expect.objectContaining({
+        adopted: false,
+        state: "held_old_trust",
+        reason: "rotation_signer_revoked",
+      }),
+    );
+    // The refusal fires pre-network: the operator gets the honest reason and
+    // the server never sees a doomed reissue round.
+    expect(reissueCalled).toBe(false);
+    const loaded = await loadFederationJoinerTrustRoot({ storage, masterKey });
+    expect(loaded?.record.pinned_master_pubkey.public_key).toBe(
+      record.pinned_master_pubkey.public_key,
+    );
+    rotation.newIssuingPrincipalPrivateKey.fill(0);
+  });
+
+  it("a reissued cert for a DIFFERENT node identity is held with reissued_identity_mismatch", async () => {
+    const storage = new MemoryStorage();
+    const masterKey = await testMasterKey(storage);
+    const { record, home } = buildJoinerRecord();
+    await saveJoiner(storage, masterKey, record);
+    const rotation = buildPlannedRotation({ current: record, home });
+
+    const rejected = await adoptFederationJoinerPlannedRoot({
+      storage,
+      masterKey,
+      rotationCert: rotation.rotationCert,
+      expectedPinnedMaster: rotation.newPinnedMaster,
+      reissue: async () => ({
+        ok: true,
+        certificate: { ...rotation.reissuedNodeCert, node_id: "impostor-node" },
+        issuingPrincipalCert: rotation.newIssuingPrincipalCert,
+        serverPinnedMaster: rotation.newPinnedMaster,
+      }),
+    });
+
+    expect(rejected).toEqual(
+      expect.objectContaining({
+        adopted: false,
+        state: "held_old_trust",
+        reason: "reissued_identity_mismatch",
+      }),
+    );
+    const loaded = await loadFederationJoinerTrustRoot({ storage, masterKey });
+    expect(loaded?.record.pinned_master_pubkey.public_key).toBe(
+      record.pinned_master_pubkey.public_key,
+    );
+    rotation.newIssuingPrincipalPrivateKey.fill(0);
+  });
+
+  it("a reissued chain that does NOT terminate at the cert's K2 is held with reissued_chain_invalid", async () => {
+    const storage = new MemoryStorage();
+    const masterKey = await testMasterKey(storage);
+    const { record, home } = buildJoinerRecord();
+    await saveJoiner(storage, masterKey, record);
+    const rotation = buildPlannedRotation({ current: record, home });
+    // A malicious server returns a chain rooted at a DIFFERENT master (K2')
+    // while echoing the expected K2 (so the echo check alone cannot catch it).
+    const foreign = buildPlannedRotation({ current: record, home });
+
+    const rejected = await adoptFederationJoinerPlannedRoot({
+      storage,
+      masterKey,
+      rotationCert: rotation.rotationCert,
+      expectedPinnedMaster: rotation.newPinnedMaster,
+      reissue: async () => ({
+        ok: true,
+        certificate: foreign.reissuedNodeCert,
+        issuingPrincipalCert: foreign.newIssuingPrincipalCert,
+        serverPinnedMaster: rotation.newPinnedMaster,
+      }),
+    });
+
+    expect(rejected).toEqual(
+      expect.objectContaining({
+        adopted: false,
+        state: "held_old_trust",
+        reason: "reissued_chain_invalid",
+      }),
+    );
+    const loaded = await loadFederationJoinerTrustRoot({ storage, masterKey });
+    expect(loaded?.record.pinned_master_pubkey.public_key).toBe(
+      record.pinned_master_pubkey.public_key,
+    );
+    rotation.newIssuingPrincipalPrivateKey.fill(0);
+    foreign.newIssuingPrincipalPrivateKey.fill(0);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// Slice 3c-2 cross-class + retirement regression
+// ═══════════════════════════════════════════════════════════════════════
+
+describe("cross-class refusal + retired custody-core is gone", () => {
+  it("after a compromise re-join, an old K1->K2' rotation cert is refused (K1 revoked locally)", async () => {
+    const storage = new MemoryStorage();
+    const masterKey = await testMasterKey(storage);
+    // Post-re-join state: joiner pins K2 (this record's home) with the dead K1
+    // recorded in its revoked-root set.
+    const { record } = buildJoinerRecord();
+    // Mint a real (foreign) old master to play the compromised K1, sign a
+    // K1->K2' rotation cert with it, and mark K1 revoked on the joiner.
+    const k1Home = mintFederationTrustRootRecord({ nodeId: "old-issuer" });
+    const k1Pub = k1Home.pinned_master_pubkey.public_key;
+    await persistFederationJoinerTrustRoot({
+      storage,
+      masterKey,
+      pinnedMasterPubkey: record.pinned_master_pubkey,
+      issuingPrincipalCert: record.issuing_principal_cert,
+      localNodeCert: record.local_node_cert,
+      localNodePrivateKey: record.local_node_private_key,
+      revokedRootPubkeys: [k1Pub],
+      highestRevocationSerial: 9,
+    });
+
+    // Build a rotation cert SIGNED BY the revoked K1 (old_master_pubkey = K1).
+    const attackerRotation = buildPlannedRotation({
+      current: {
+        ...record,
+        pinned_master_pubkey: {
+          ...k1Home.pinned_master_pubkey,
+          fortress_id: record.fortress_id,
+        },
+      },
+      home: k1Home,
+    });
+
+    const rejected = await adoptFederationJoinerPlannedRoot({
+      storage,
+      masterKey,
+      rotationCert: attackerRotation.rotationCert,
+      expectedPinnedMaster: attackerRotation.newPinnedMaster,
+      reissue: attackerRotation.reissue,
+    });
+
+    expect(rejected).toEqual(
+      expect.objectContaining({
+        adopted: false,
+        state: "held_old_trust",
+        reason: "rotation_signer_revoked",
+      }),
+    );
+    const loaded = await loadFederationJoinerTrustRoot({ storage, masterKey });
+    expect(loaded?.record.pinned_master_pubkey.public_key).toBe(
+      record.pinned_master_pubkey.public_key,
+    );
+    attackerRotation.newIssuingPrincipalPrivateKey.fill(0);
+  });
+
+  it("the retired compromise auto-adopt custody-core is gone / unexported", () => {
+    const surface = joinerStore as unknown as Record<string, unknown>;
+    // The dangerous auto-adoption functions must no longer exist.
+    expect(surface.adoptFederationJoinerCompromiseRoot).toBeUndefined();
+    expect(
+      surface.signFederationJoinerCompromiseRootAdoptionAttestation,
+    ).toBeUndefined();
+    // The wire/at-rest version string must be gone (it never rode any surface).
+    expect(
+      surface.FEDERATION_JOINER_COMPROMISE_ROOT_ADOPTION_EVENT_VERSION,
+    ).toBeUndefined();
+    // The kept additive fields remain part of the surface.
+    expect(typeof surface.adoptFederationJoinerPlannedRoot).toBe("function");
+    expect(typeof surface.persistFederationJoinerTrustRoot).toBe("function");
+  });
+
+  it("no public raw writer: the store exposes load() + lockedUpdate() but NOT a bypass save()", async () => {
+    const storage = new MemoryStorage();
+    const masterKey = await testMasterKey(storage);
+    const store = new FederationJoinerTrustRootStore(storage, masterKey);
+    // The raw `save()` writer is GONE from the public surface; the grow-only
+    // anti-rollback invariant is STRUCTURALLY enforced (there is no public write
+    // path that bypasses the locked chokepoint), not merely conventional.
+    expect(
+      (store as unknown as Record<string, unknown>).save,
+    ).toBeUndefined();
+    expect(typeof store.load).toBe("function");
+    expect(typeof store.lockedUpdate).toBe("function");
+  });
+
+  it("chokepoint: even a STALE mutation through lockedUpdate cannot drop the revoked set / floor", async () => {
+    const storage = new MemoryStorage();
+    const masterKey = await testMasterKey(storage);
+    const { record } = buildJoinerRecord();
+    const deadK1 = toBase64url(randomBytes(32));
+    // Seed {deadK1}/floor 5 via the public writer.
+    await persistFederationJoinerTrustRoot({
+      storage,
+      masterKey,
+      pinnedMasterPubkey: record.pinned_master_pubkey,
+      issuingPrincipalCert: record.issuing_principal_cert,
+      localNodeCert: record.local_node_cert,
+      localNodePrivateKey: record.local_node_private_key,
+      revokedRootPubkeys: [deadK1],
+      highestRevocationSerial: 5,
+    });
+    // A direct lockedUpdate whose mutation returns a record carrying NO
+    // revoked/floor (a stale caller) must NOT drop them - the chokepoint merges
+    // grow-only against the current-under-lock record.
+    const store = new FederationJoinerTrustRootStore(storage, masterKey);
+    await store.lockedUpdate((current) => ({
+      fortress_id: current!.fortress_id,
+      node_id: current!.node_id,
+      pinned_master_pubkey: current!.pinned_master_pubkey,
+      issuing_principal_cert: current!.issuing_principal_cert,
+      local_node_cert: current!.local_node_cert,
+      local_node_private_key: current!.local_node_private_key,
+      // deliberately NO revoked_root_pubkeys / highest_revocation_serial
+    }));
+    const loaded = await loadFederationJoinerTrustRoot({ storage, masterKey });
+    expect(loaded?.record.revoked_root_pubkeys?.has(deadK1)).toBe(true);
+    expect(loaded?.record.highest_revocation_serial).toBe(5);
   });
 });
 
@@ -904,9 +1569,6 @@ async function startJoinerDaemon(
     baseline: { load: async () => {}, save: async () => {} } as never,
     auditLog,
   });
-  // The generalized non-issuer guard inside setFederationContext must ACCEPT a
-  // local joiner context (no issuer accessors, no approver). If it carried any
-  // issuer material this would throw.
   dashboard.setFederationContext(context);
   await dashboard.start();
   const daemon = {
@@ -932,7 +1594,6 @@ describe("joiner boot-wire (non-issuer context provisions /v1/federation reads)"
       localNodePrivateKey: record.local_node_private_key,
     });
 
-    // This is the joiner half of the Slice 1 boot wiring: load-only.
     const loaded = await loadFederationJoinerTrustRoot({ storage, masterKey });
     expect(loaded).not.toBeNull();
 
@@ -976,7 +1637,6 @@ describe("joiner boot-wire (non-issuer context provisions /v1/federation reads)"
     expect(status).toEqual(
       expect.objectContaining({
         provisioned: true,
-        // Not enabled until the federation enable verb runs (Slice 3b).
         enabled: false,
         fortress_id: record.fortress_id,
         node_id: record.node_id,
