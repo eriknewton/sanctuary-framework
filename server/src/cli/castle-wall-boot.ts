@@ -88,6 +88,7 @@ import {
   type NormalizeFortressCustodyInput,
   type NormalizeFortressCustodyOutcome,
 } from "../castle-wall/provision/fortress-custody.js";
+import { resolveFortressCreateOwner } from "../castle-wall/runtime/fortress-create-owner.js";
 
 export const CASTLE_WALL_BOOT_LABEL = "ai.sanctuaryprotocol.castle-wall.daemon";
 export const CASTLE_WALL_BOOT_PLIST_PATH = `/Library/LaunchDaemons/${CASTLE_WALL_BOOT_LABEL}.plist`;
@@ -888,8 +889,16 @@ async function auditBootTokenEvent(
   details: Record<string, unknown>,
 ): Promise<void> {
   const auditKey = deriveSafeModeAuditKey(token);
-  const storage = new FilesystemStorage(safeModeAuditStoragePath(fortressPath, token));
-  const auditLog = new AuditLog(storage, auditKey);
+  const fortressCreateOwner = resolveFortressCreateOwner({ fortressPath });
+  const storage = new FilesystemStorage(
+    safeModeAuditStoragePath(fortressPath, token),
+    fortressCreateOwner !== undefined ? { owner: fortressCreateOwner } : {},
+  );
+  const auditLog = new AuditLog(
+    storage,
+    auditKey,
+    fortressCreateOwner !== undefined ? { createOwner: fortressCreateOwner } : undefined,
+  );
   await auditLog.append(
     "l1",
     operation,

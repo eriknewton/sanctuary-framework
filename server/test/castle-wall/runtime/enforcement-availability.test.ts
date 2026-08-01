@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer } from "node:net";
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { ed25519 } from "@noble/curves/ed25519";
 
 import { canonicalize } from "../../../src/mesh/canonical-json.js";
@@ -314,6 +314,32 @@ describe("level-triggered enforcement availability store", () => {
     expect(stale.reason).toBe("stale_report");
   });
 
+  it("invalid reports cannot create live state or preserve already-stale verified state", () => {
+    let now = NOW;
+    const store = new EnforcementAvailabilityStore({
+      freshnessWindowMs: FRESHNESS_MS,
+      now: () => now,
+    });
+
+    store.recordInvalidReport("ext-1", "producer_sequence_replay");
+    const invalidOnly = store.resolve();
+    expect(invalidOnly.status).toBe("undetermined");
+    expect(invalidOnly.reason).toBe("producer_sequence_replay");
+    expect(invalidOnly.observed_at).toBeNull();
+
+    store.recordValidReport("ext-1", greenSnapshot(), NOW);
+    now = NOW + FRESHNESS_MS + 1;
+    const staleBeforeInvalid = store.resolve();
+    expect(staleBeforeInvalid.status).toBe("undetermined");
+    expect(staleBeforeInvalid.reason).toBe("stale_report");
+
+    store.recordInvalidReport("ext-1", "producer_sequence_replay");
+    const staleAfterInvalid = store.resolve();
+    expect(staleAfterInvalid.status).toBe("undetermined");
+    expect(staleAfterInvalid.reason).toBe("producer_sequence_replay");
+    expect(staleAfterInvalid.observed_at).toBeNull();
+  });
+
   it("I8/I11: every non-live lease algebra and provider_bound=false is non-green", () => {
     const cases: Array<[string, Partial<EnforcementAvailabilitySnapshot>]> = [
       ["missing lease", { lease_state: "missing", lease_reason: "arm_lease_missing" }],
@@ -577,10 +603,45 @@ describe("macOS extension-origin enforcement availability reports", () => {
     expect(consumer.getStats().enforcementAvailabilityReportsRejected).toBe(0);
   });
 
-  it("F-AVAIL-SEQ-FLAP negative: the SAME dedicated report delivered twice is a genuine replay and the second delivery is rejected", async () => {
+  it("rejected same-stream replay preserves the previous verified fresh availability report", async () => {
     const privateKey = ed25519.utils.randomPrivateKey();
     const publicKeyB64url = toBase64url(ed25519.getPublicKey(privateKey));
-    const consumer = makeConsumer({ publicKeyB64url });
+    let now = NOW;
+    const consumer = makeConsumer({ publicKeyB64url, now: () => now });
+
+    const report = signAvailabilityReport({
+      visibleReport: greenSnapshot(),
+      privateKey,
+      seq: 3,
+    });
+    await consumer.handleEnforcementAvailabilityReport(report, "ext-1");
+    const firstResolved = consumer.resolveEnforcementAvailability();
+    expect(firstResolved.status).toBe("live");
+    expect(firstResolved.observed_at).toBe(new Date(NOW).toISOString());
+
+    now = NOW + 10_000;
+    const replayError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      await consumer.handleEnforcementAvailabilityReport(report, "ext-1");
+      expect(replayError).toHaveBeenCalledWith(
+        "[castle-wall] enforcement availability replay rejected stream=dedicated_report rejected_seq=3 floor=3"
+      );
+    } finally {
+      replayError.mockRestore();
+    }
+
+    const replayResolved = consumer.resolveEnforcementAvailability();
+    expect(replayResolved.status).toBe("live");
+    expect(replayResolved.reason).toBe("ok");
+    expect(replayResolved.observed_at).toBe(new Date(NOW).toISOString());
+    expect(consumer.getStats().enforcementAvailabilityReportsRejected).toBe(1);
+  });
+
+  it("F-AVAIL-SEQ-FLAP negative: the SAME dedicated report delivered twice is rejected without refreshing live state", async () => {
+    const privateKey = ed25519.utils.randomPrivateKey();
+    const publicKeyB64url = toBase64url(ed25519.getPublicKey(privateKey));
+    let now = NOW;
+    const consumer = makeConsumer({ publicKeyB64url, now: () => now });
 
     const report = signAvailabilityReport({
       visibleReport: greenSnapshot(),
@@ -590,19 +651,29 @@ describe("macOS extension-origin enforcement availability reports", () => {
     await consumer.handleEnforcementAvailabilityReport(report, "ext-1");
     expect(consumer.resolveEnforcementAvailability().status).toBe("live");
 
-    await consumer.handleEnforcementAvailabilityReport(report, "ext-1");
+    now = NOW + 10_000;
+    const replayError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      await consumer.handleEnforcementAvailabilityReport(report, "ext-1");
+    } finally {
+      replayError.mockRestore();
+    }
     const resolved = consumer.resolveEnforcementAvailability();
-    expect(resolved.status).toBe("undetermined");
-    expect(resolved.reason).toBe("producer_sequence_replay");
+    expect(resolved.status).toBe("live");
+    expect(resolved.reason).toBe("ok");
+    expect(resolved.observed_at).toBe(new Date(NOW).toISOString());
+    expect(consumer.getStats().enforcementAvailabilityReportsRecorded).toBe(1);
     expect(consumer.getStats().enforcementAvailabilityReportsRejected).toBe(1);
   });
 
-  it("F-AVAIL-SEQ-FLAP negative: the SAME flow-carried availability delivered twice is a genuine replay and the second delivery is rejected", async () => {
+  it("F-AVAIL-SEQ-FLAP negative: the SAME flow-carried availability delivered twice is rejected without refreshing live state", async () => {
     const privateKey = ed25519.utils.randomPrivateKey();
     const publicKeyB64url = toBase64url(ed25519.getPublicKey(privateKey));
     const log = new AuditLog(new MemoryStorage(), generateRandomKey());
+    let now = NOW;
     const consumer = makeConsumer({
       publicKeyB64url,
+      now: () => now,
       sink: log as unknown as AuditSink,
     });
 
@@ -615,17 +686,26 @@ describe("macOS extension-origin enforcement availability reports", () => {
     await consumer.handleFlowDecisionRecorded(flow, "ext-1");
     expect(consumer.resolveEnforcementAvailability().status).toBe("live");
 
-    await consumer.handleFlowDecisionRecorded(flow, "ext-1");
+    now = NOW + 10_000;
+    const replayError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      await consumer.handleFlowDecisionRecorded(flow, "ext-1");
+    } finally {
+      replayError.mockRestore();
+    }
     const resolved = consumer.resolveEnforcementAvailability();
-    expect(resolved.status).toBe("undetermined");
-    expect(resolved.reason).toBe("producer_sequence_replay");
+    expect(resolved.status).toBe("live");
+    expect(resolved.reason).toBe("ok");
+    expect(resolved.observed_at).toBe(new Date(NOW).toISOString());
+    expect(consumer.getStats().enforcementAvailabilityReportsRecorded).toBe(1);
     expect(consumer.getStats().enforcementAvailabilityReportsRejected).toBe(1);
   });
 
   it("F-AVAIL-SEQ-FLAP negative: within the dedicated stream, a lower-seq report after a higher-seq report is still rejected (per-stream monotonicity holds)", async () => {
     const privateKey = ed25519.utils.randomPrivateKey();
     const publicKeyB64url = toBase64url(ed25519.getPublicKey(privateKey));
-    const consumer = makeConsumer({ publicKeyB64url });
+    let now = NOW;
+    const consumer = makeConsumer({ publicKeyB64url, now: () => now });
 
     await consumer.handleEnforcementAvailabilityReport(
       signAvailabilityReport({
@@ -640,17 +720,25 @@ describe("macOS extension-origin enforcement availability reports", () => {
     // A distinct, validly-signed dedicated report at a LOWER seq. The
     // dedicated stream is delivered in order on hardware, so a same-stream
     // regression is treated as replay and rejected.
-    await consumer.handleEnforcementAvailabilityReport(
-      signAvailabilityReport({
-        visibleReport: greenSnapshot(),
-        privateKey,
-        seq: 2,
-      }),
-      "ext-1",
-    );
+    now = NOW + 10_000;
+    const replayError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      await consumer.handleEnforcementAvailabilityReport(
+        signAvailabilityReport({
+          visibleReport: greenSnapshot(),
+          privateKey,
+          seq: 2,
+        }),
+        "ext-1",
+      );
+    } finally {
+      replayError.mockRestore();
+    }
     const resolved = consumer.resolveEnforcementAvailability();
-    expect(resolved.status).toBe("undetermined");
-    expect(resolved.reason).toBe("producer_sequence_replay");
+    expect(resolved.status).toBe("live");
+    expect(resolved.reason).toBe("ok");
+    expect(resolved.observed_at).toBe(new Date(NOW).toISOString());
+    expect(consumer.getStats().enforcementAvailabilityReportsRecorded).toBe(1);
     expect(consumer.getStats().enforcementAvailabilityReportsRejected).toBe(1);
   });
 
