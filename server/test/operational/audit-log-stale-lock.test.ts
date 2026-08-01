@@ -347,6 +347,13 @@ describe("AuditLog write-lock robustness (#944 cluster)", () => {
     withAuditWriteLock<T>(operation: () => Promise<T>): Promise<T>;
     readonly auditWriteLockPath?: string;
   };
+  type AuditLogCreateOwnerTestConfig = AuditLogConfig & {
+    createOwner?: { uid: number; gid: number };
+    createOwnerChown?: (
+      handle: unknown,
+      owner: { uid: number; gid: number },
+    ) => Promise<void>;
+  };
 
   async function makeLog(config?: AuditLogConfig) {
     const root = await mkdtemp(join(tmpdir(), "sanctuary-audit-lock-robust-"));
@@ -373,6 +380,7 @@ describe("AuditLog write-lock robustness (#944 cluster)", () => {
   // that no real boot mints), used to simulate a PREVIOUS boot's lock (a reboot
   // orphan). currentBootId reads a per-boot UUID; this fixed one cannot collide.
   const DIFFERENT_BOOT = "00000000-0000-4000-8000-000000000000";
+  const OWNER = { uid: 501, gid: 20 };
 
   // The EXACT boot-identity token production stamps THIS boot, read back from a
   // real acquire so the test can never drift from currentBootId's platform read
@@ -585,6 +593,72 @@ describe("AuditLog write-lock robustness (#944 cluster)", () => {
     );
 
     await expect(internals.breakStaleAuditLock(lockPath)).resolves.toBe(true);
+    await expect(stat(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("applies createOwner to the write lock on the open descriptor before visibility", async () => {
+    let lockPath = "";
+    const calls: Array<{ owner: { uid: number; gid: number }; visibleAtChown: boolean }> = [];
+    const config: AuditLogCreateOwnerTestConfig = {
+      createOwner: OWNER,
+      createOwnerChown: async (_handle, owner) => {
+        let visibleAtChown = true;
+        try {
+          await stat(lockPath);
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+            visibleAtChown = false;
+          } else {
+            throw err;
+          }
+        }
+        calls.push({ owner, visibleAtChown });
+      },
+    };
+    const made = await makeLog(config);
+    lockPath = made.lockPath;
+
+    await made.internals.withAuditWriteLock(async () => {
+      expect(calls).toEqual([{ owner: OWNER, visibleAtChown: false }]);
+      await expect(stat(lockPath)).resolves.toBeDefined();
+    });
+    await expect(stat(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("does not attempt write-lock chown when createOwner is absent", async () => {
+    let chownCalls = 0;
+    const config: AuditLogCreateOwnerTestConfig = {
+      createOwnerChown: async () => {
+        chownCalls++;
+      },
+    };
+    const { internals } = await makeLog(config);
+
+    await internals.withAuditWriteLock(async () => undefined);
+
+    expect(chownCalls).toBe(0);
+  });
+
+  it("applies createOwner when a stale lock is broken and replaced", async () => {
+    const calls: Array<{ uid: number; gid: number }> = [];
+    const config: AuditLogCreateOwnerTestConfig = {
+      createOwner: OWNER,
+      createOwnerChown: async (_handle, owner) => {
+        calls.push(owner);
+      },
+    };
+    const { log, lockPath } = await makeLog(config);
+    await writeFile(
+      lockPath,
+      JSON.stringify({ pid: 999_999, acquired_at: new Date().toISOString() }),
+    );
+
+    await expect(
+      log.append("l1", "egress_allowed", "after-stale-break", { n: 1 }),
+    ).resolves.toBeUndefined();
+
+    expect(calls.length).toBeGreaterThanOrEqual(2);
+    expect(calls.every((call) => call.uid === OWNER.uid && call.gid === OWNER.gid)).toBe(true);
     await expect(stat(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
   });
 

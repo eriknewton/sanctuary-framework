@@ -229,26 +229,31 @@ describe("runWrap: maybeRunAutoProvisionForWrap gating", () => {
     );
   });
 
-  it("does not turn an armed auto-provision outcome into a confirmed Castle Wall banner", async () => {
-    await installHermesFixture();
-    setTty(true);
+  it("an armed auto-provision outcome renders one consistent claim: coarse-only, never 'status unknown' beside the armed line (F-11)", async () => {
+    // The `armed` outcome is only mintable in orchestrate after the post-arm
+    // as-uid egress verification passed (its uid is Observed<number>, thrown
+    // otherwise), so the run HOLDS an arm observation. The old pin here
+    // asserted the F-11 contradiction as correct: the armed line and a
+    // "status unknown" summary in the same run. One observation, both
+    // surfaces.
     const runAutoProvisionForWrap = vi.fn(async (): Promise<AutoProvisionSummary> => ({
       ran: true,
       outcome: { kind: "armed", uid: 503, liveness: UNVERIFIED_NO_CHANNEL },
     }));
+    await installHermesFixture();
+    setTty(true);
     await runWrap(options({ hermes: true }), baseDeps({ runAutoProvisionForWrap }));
 
     const stderr = stderrSpy.mock.calls.flat().join("\n");
     expect(stderr).toContain("Dedicated agent account provisioned and Castle Wall armed (uid 503)");
     expect(stderr).not.toContain("Castle Wall NOT ARMED");
-    expect(stderr).not.toContain("Castle Wall coarse-only");
-    expect(stderr).toContain(
-      "Your agent is wrapped, but enforcement is not confirmed.",
-    );
-    expect(stderr).toContain("Castle Wall status unknown");
-    // F-GATEWAY-TWIN fix 8: the armed summary must surface the liveness
-    // verdict the outcome now carries — before this fix the operator could
-    // read a freshly-armed wrap as "functional through the wall" on zero
+    // B4 (merged main): one observation, both surfaces — the armed run's
+    // summary claims coarse-only and never contradicts itself with unknown.
+    expect(stderr).toContain("Castle Wall coarse-only");
+    expect(stderr).not.toContain("Castle Wall status unknown");
+    // F-GATEWAY-TWIN fix 8 (this PR): the armed summary must also surface the
+    // liveness verdict the outcome now carries — before this fix the operator
+    // could read a freshly-armed wrap as "functional through the wall" on zero
     // evidence (the exact false result the unconfined twin produced on Mini2).
     expect(stderr).toContain(
       "CoS liveness unverified (no_channel_configured); no functional-through-wall claim was made.",

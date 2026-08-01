@@ -195,7 +195,9 @@ export class MacOSFlowEventConsumer {
         ? input.pinnedProducerKeyB64url
         : null;
     this.now = input.now ?? Date.now;
-    this.enforcementAvailability = new EnforcementAvailabilityStore();
+    this.enforcementAvailability = new EnforcementAvailabilityStore({
+      now: this.now,
+    });
     this.producerAuditConsumer =
       this.pinnedProducerKeyB64url !== null
         ? new AuditConsumer(input.auditSink, undefined, {
@@ -540,6 +542,13 @@ export class MacOSFlowEventConsumer {
       stream,
     );
     if (lastSeq !== null && verified.seq <= lastSeq) {
+      // SAFETY: stderr is the daemon's operator log channel; one line per
+      // rejected report is the only observable that can distinguish a
+      // duplicate redelivery from a within-stream reorder on hardware
+      // (F-AVAIL-REJECT-CLOBBER: the drill could not tell them apart).
+      console.error(
+        `[castle-wall] enforcement availability replay rejected stream=${stream} rejected_seq=${verified.seq} floor=${lastSeq}`
+      );
       this.enforcementAvailability.recordInvalidReport(
         subscriberId,
         "producer_sequence_replay",

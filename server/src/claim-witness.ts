@@ -16,6 +16,7 @@ export const STRUCTURAL_HONESTY_CLAIM_IDS = [
   "provision-exclusive-arm.repair-release",
   "provision-exclusive-arm.quarantine-repair",
   "provision-exclusive-arm.boot-release",
+  "castle-wall-cli.content-filter-enabled",
   "observe.source-state",
   "observe.candidate-census",
   "evidence-pack.inventory.empty-verified",

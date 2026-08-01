@@ -19,6 +19,7 @@ import {
   HelperSignerClient,
   type ShimInvoker,
 } from "../castle-wall/runtime/helper-signer.js";
+import { resolveFortressCreateOwner } from "../castle-wall/runtime/fortress-create-owner.js";
 import { resolveStoragePath } from "../paths.js";
 import { getSanctuaryVersion } from "../version.js";
 import { getOrCreatePassphrase } from "../wrap/passphrase.js";
@@ -100,6 +101,7 @@ import type {
   DecisionResponse,
   PolicyReloadResponse,
 } from "../castle-wall/ipc/messages.js";
+import { observing, type Observed } from "../claim-witness.js";
 
 const CASTLE_PINNED_PUBKEY = "castle-pinned-pubkey.bin";
 const CASTLE_PINNED_PRIVKEY = "castle-pinned-privkey.enc";
@@ -339,6 +341,18 @@ export type SysextState =
   | "[activated disabled]"
   | "[activated waiting for user]"
   | "not loaded";
+
+type SysextArmClaimState = SysextState | "unreadable";
+
+interface SysextArmClaimObservation {
+  state: SysextArmClaimState;
+  reason?: string;
+}
+
+type ObservedSysextArmClaimObservation =
+  Omit<SysextArmClaimObservation, "state"> & {
+    state: Observed<SysextArmClaimState>;
+  };
 
 /** JSON line emitted by `CastleWallHostApp --headless <action>` (HeadlessFilterCLI.Report). */
 interface HeadlessReport {
@@ -1671,7 +1685,17 @@ export async function runDaemon(
   // key-params); never establish a fresh master from the daemon verb - a
   // fresh key could not match the pin and arming with it would fail-closed
   // the whole machine.
-  const storage = new FilesystemStorage(join(storagePath, "state"));
+  const getuid = ctx.getuid ?? process.getuid?.bind(process);
+  const processUid = getuid?.();
+  const isRootDaemon = processUid === 0;
+  const fortressCreateOwner =
+    platform === "darwin"
+      ? resolveFortressCreateOwner({ fortressPath: storagePath })
+      : undefined;
+  const storage = new FilesystemStorage(
+    join(storagePath, "state"),
+    fortressCreateOwner !== undefined ? { owner: fortressCreateOwner } : {},
+  );
   let derived: { key: Uint8Array };
   try {
     const custodyResult = await establishMaster({
@@ -1710,8 +1734,6 @@ export async function runDaemon(
   // never provisions a daemon namespace or a split-boundary record. This
   // keeps every existing test/CI/dev flow (which never runs as uid 0)
   // completely unchanged.
-  const getuid = ctx.getuid ?? process.getuid?.bind(process);
-  const isRootDaemon = getuid?.() === 0;
   let auditLog: AuditLog;
   if (isRootDaemon) {
     try {
@@ -1719,6 +1741,7 @@ export async function runDaemon(
         storage,
         masterKey: derived.key,
         identityId: fortressIdFromStoragePath(storagePath),
+        ...(fortressCreateOwner !== undefined ? { createOwner: fortressCreateOwner } : {}),
       });
       write(
         out,
@@ -1743,7 +1766,11 @@ export async function runDaemon(
     // analogous "accept a pre-existing broken chain" override to apply here;
     // `--accept-broken-chain` still governs ONLY the legacy `_audit` read
     // path other privileged verbs (e.g. `re-pin`) use.
-    auditLog = createDaemonAuditLog(storage, derived.key);
+    auditLog = createDaemonAuditLog(
+      storage,
+      derived.key,
+      fortressCreateOwner !== undefined ? { createOwner: fortressCreateOwner } : undefined,
+    );
   } else {
     auditLog = await buildAuditLogForPrivilegedAction({
       storage,
@@ -2158,7 +2185,7 @@ export async function runSafeModeDaemon(
     socketOwnerUid !== 0 &&
     fortressOwnerGid !== undefined &&
     fortressOwnerGid !== 0 &&
-    (ctx.getuid ?? process.getuid?.bind(process))?.() === 0
+    process.getuid?.() === 0
       ? { uid: socketOwnerUid, gid: fortressOwnerGid }
       : undefined;
 
@@ -2172,7 +2199,11 @@ export async function runSafeModeDaemon(
     safeModeAuditStoragePath(storagePath, tokenRead.token),
     fortressCreateOwner !== undefined ? { owner: fortressCreateOwner } : {},
   );
-  const auditLog = new AuditLog(auditStorage, safeModeAuditKey);
+  const auditLog = new AuditLog(
+    auditStorage,
+    safeModeAuditKey,
+    fortressCreateOwner !== undefined ? { createOwner: fortressCreateOwner } : undefined,
+  );
 
   // 3. Helper signer is mandatory in safe mode.
   const signerClientPath =
@@ -3964,6 +3995,70 @@ async function defaultSysextProbe(
   }
 }
 
+function describeUnknownError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+async function readSysextStateForArmClaim(
+  sysextProbe: () => Promise<SysextState>,
+): Promise<SysextArmClaimObservation> {
+  try {
+    return { state: await sysextProbe() };
+  } catch (error) {
+    return { state: "unreadable", reason: describeUnknownError(error) };
+  }
+}
+
+async function observeSysextStateForArmClaim(
+  sysextProbe: () => Promise<SysextState>,
+): Promise<ObservedSysextArmClaimObservation> {
+  return observing(
+    "castle-wall-cli.content-filter-enabled",
+    () => readSysextStateForArmClaim(sysextProbe),
+    ["state"],
+  );
+}
+
+function observedSysextEnabled(
+  state: Observed<SysextArmClaimState>,
+): Observed<"[activated enabled]"> | undefined {
+  return state === "[activated enabled]" ? state : undefined;
+}
+
+function renderArmSysextNotEnabledLine(
+  observation: ObservedSysextArmClaimObservation,
+): string {
+  switch (observation.state) {
+    case "[activated waiting for user]":
+      return (
+        "Castle Wall arm pending: system extension is activated but waiting for user approval. " +
+        "Open System Settings > Privacy & Security and approve the Castle Wall system extension before relying on enforcement.\n"
+      );
+    case "[activated disabled]":
+      return (
+        "Castle Wall arm saved by the host app, but the system extension is toggled off. " +
+        "Open System Settings > General > Login Items & Extensions > Network Extensions and switch Castle Wall on before relying on enforcement.\n"
+      );
+    case "not loaded":
+      return (
+        "Castle Wall arm saved by the host app, but the system extension is not loaded. " +
+        "Install and approve the Castle Wall system extension in System Settings before relying on enforcement.\n"
+      );
+    case "unreadable":
+      return (
+        "Castle Wall arm saved by the host app, but system extension state could not be read" +
+        `${observation.reason !== undefined ? ` (${observation.reason})` : ""}. ` +
+        "Open System Settings > Privacy & Security and approve the Castle Wall system extension before relying on enforcement.\n"
+      );
+    case "[activated enabled]":
+      return "Castle Wall armed: content filter enabled (verified via host-app status and system extension state).\n";
+  }
+  return (
+    "Castle Wall arm saved by the host app, but system extension state could not be read. " +
+    "Open System Settings > Privacy & Security and approve the Castle Wall system extension before relying on enforcement.\n"
+  );
+}
+
 /**
  * Default probe behind the `enable` root-owned-fortress refusal: the fortress
  * dir's owner uid, or undefined when the dir cannot be statted (an absent /
@@ -4195,13 +4290,13 @@ async function runArmDisarmInner(
     return 2;
   }
 
+  const sysextProbe = ctx.sysextProbe ?? (() => defaultSysextProbe(ctx));
   if (action === "enable") {
     // Tahoe ships the sysext toggled OFF; arming over it would save an NE config
     // that never enforces (the false-assurance trap). Detect that distinct state
     // and route the operator to the one-time console toggle. Disable never gates
     // here - it stays the unconditional dead-man lever.
-    const sysextProbe = ctx.sysextProbe ?? (() => defaultSysextProbe(ctx));
-    if ((await sysextProbe()) === "[activated disabled]") {
+    if ((await readSysextStateForArmClaim(sysextProbe)).state === "[activated disabled]") {
       write(err, SYSEXT_DISABLED_GUIDANCE);
       return EXIT_SYSEXT_DISABLED;
     }
@@ -4514,7 +4609,16 @@ async function runArmDisarmInner(
         "Warning: Castle Wall armed, but the daemon did not accept the dead-man lease update. Existing daemon heartbeat state remains authoritative.\n",
       );
     }
-    write(out, "Castle Wall armed: content filter enabled (verified via host-app status).\n");
+    const sysextObservation = await observeSysextStateForArmClaim(sysextProbe);
+    const contentFilterEnabledClaim = observedSysextEnabled(
+      sysextObservation.state,
+    );
+    write(
+      out,
+      contentFilterEnabledClaim !== undefined
+        ? "Castle Wall armed: content filter enabled (verified via host-app status and system extension state).\n"
+        : renderArmSysextNotEnabledLine(sysextObservation),
+    );
   } else if (confirmed) {
     write(out, "Castle Wall disarmed: content filter disabled (verified via host-app status).\n");
   } else {

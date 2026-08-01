@@ -1,3 +1,4 @@
+// fail-before-exempt: type-forced fixture update only: armed outcomes gained a required liveness field; the subject (finishProvisionOutcomeWithCustodyNormalize) is a pure passthrough tail with no behavioral stake in this PR
 /**
  * Custody-normalize chokepoint tail of the protect flow (fortress-ownership
  * spec 2026-07-30 §4(a2)(1)): `runAutoProvisionForWrap` finishes EVERY

@@ -390,12 +390,19 @@ describe("formatWrapSuccess", () => {
     expect(out).toContain("Castle Wall NOT ARMED");
   });
 
-  it("kind armed does not derive coarse-only from the outcome alone", () => {
+  it("kind armed renders a current-run armed summary instead of unknown", () => {
     const protection = protectionClaimFromAutoProvisionSummary({
       ran: true,
       outcome: { kind: "armed", uid: 503, liveness: UNVERIFIED_NO_CHANNEL },
     });
-    expect(protection).toBeUndefined();
+    expect(protection?.state).toBe("coarse-only");
+    expect(protection?.basis).toBe("castle_wall_arm_observed");
+    const out = formatWrapSuccess({
+      ...baseInfo,
+      castleWallProtectionClaim: protection!,
+    });
+    expect(out).not.toContain("Castle Wall status unknown");
+    expect(out).toContain("Castle Wall coarse-only");
   });
 
   it("armed outcome renders the unverified-liveness line, never a functional-through-wall claim (F-GATEWAY-TWIN fix 8)", () => {

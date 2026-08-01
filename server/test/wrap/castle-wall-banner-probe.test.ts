@@ -1,3 +1,4 @@
+// fail-before-exempt: type-forced fixture update only: armed-exclusive outcome fixtures gained the required liveness field; banner evidence probes have no behavioral stake in this PR
 /**
  * Castle Wall wrap-banner enforcement probes (fix-round MED-4c for PR #843,
  * protection-claim chokepoint 2026-07-19).
@@ -748,6 +749,38 @@ describe("Castle Wall wrap-banner evidence probes", () => {
       "Castle Wall current-wrap daemon heartbeat could not be confirmed",
     );
     expect(protectionStateAdvice(claim).castleWallLabel).not.toContain("Castle Wall Full");
+  });
+
+  it("a current-run verified arm does not fall through to the unknown summary", async () => {
+    const claim = await resolveWrapProtectionClaim({
+      auditLog: undefined,
+      autoProvisionSummary: {
+        ran: true,
+        outcome: { kind: "armed", uid: 503 },
+      },
+      castleWallDaemonLivenessSince: currentWrapSince(),
+      storagePath,
+      providerTimeoutMs: 20,
+      resolveExclusiveEgress: async () => exclusiveStatus(),
+    });
+    const advice = protectionStateAdvice(claim);
+    expect(claim.state).toBe("coarse-only");
+    expect(advice.castleWallLabel).not.toContain("status unknown");
+    expect(advice.castleWallLabel).toContain("Castle Wall coarse-only");
+  });
+
+  it("without a current-run observation the unavailable-evidence summary stays unknown", async () => {
+    const claim = await resolveWrapProtectionClaim({
+      auditLog: undefined,
+      autoProvisionSummary: { ran: false },
+      castleWallDaemonLivenessSince: currentWrapSince(),
+      storagePath,
+      providerTimeoutMs: 20,
+      resolveExclusiveEgress: async () => exclusiveStatus(),
+    });
+    const advice = protectionStateAdvice(claim);
+    expect(claim.state).toBe("unknown");
+    expect(advice.castleWallLabel).toContain("Castle Wall status unknown");
   });
 
   it("flagship armed-exclusive path reaches green with current-wrap daemon liveness and fresh egress", async () => {
