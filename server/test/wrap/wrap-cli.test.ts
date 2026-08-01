@@ -14,6 +14,7 @@ import {
   parseWrapArgs,
   formatWrapSuccess,
   protectionClaimFromAutoProvisionSummary,
+  renderAutoProvisionOutcomeLines,
   runWrap,
   validateDevDist,
   DevDistInvalidError,
@@ -395,6 +396,23 @@ describe("formatWrapSuccess", () => {
       outcome: { kind: "armed", uid: 503, liveness: UNVERIFIED_NO_CHANNEL },
     });
     expect(protection).toBeUndefined();
+  });
+
+  it("armed outcome renders the unverified-liveness line, never a functional-through-wall claim (F-GATEWAY-TWIN fix 8)", () => {
+    // Pre-#F-GATEWAY-TWIN source ignored `liveness` entirely: the armed line
+    // rendered alone and the operator could read a freshly-armed summary as
+    // "the agent works through the wall" with zero evidence. The outcome now
+    // carries an explicit liveness verdict and the renderer must surface it.
+    const lines = renderAutoProvisionOutcomeLines({
+      ran: true,
+      outcome: { kind: "armed", uid: 503, liveness: UNVERIFIED_NO_CHANNEL },
+    });
+    const text = lines.join("\n");
+    expect(text).toContain("Castle Wall armed (uid 503)");
+    expect(text).toContain(
+      "CoS liveness unverified (no_channel_configured); no functional-through-wall claim was made.",
+    );
+    expect(text).not.toContain("liveness verified");
   });
 
   it("armed-exclusive-repark-failed is unknown until the probe observes live enforcement", () => {

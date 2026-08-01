@@ -246,6 +246,13 @@ describe("runWrap: maybeRunAutoProvisionForWrap gating", () => {
       "Your agent is wrapped, but enforcement is not confirmed.",
     );
     expect(stderr).toContain("Castle Wall status unknown");
+    // F-GATEWAY-TWIN fix 8: the armed summary must surface the liveness
+    // verdict the outcome now carries — before this fix the operator could
+    // read a freshly-armed wrap as "functional through the wall" on zero
+    // evidence (the exact false result the unconfined twin produced on Mini2).
+    expect(stderr).toContain(
+      "CoS liveness unverified (no_channel_configured); no functional-through-wall claim was made.",
+    );
   });
 
   it("prefers --dev-dist as the auto-provision CLI binary for dogfood installs", async () => {
