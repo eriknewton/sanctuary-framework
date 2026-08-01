@@ -100,11 +100,31 @@ export type { HarnessArgvOps, InterpreterVersion, ResolvedHarnessArgv } from "./
 
 export { runProvisionFlow } from "./orchestrate.js";
 export type {
+  AgentLivenessProbeResult,
+  CosLivenessOutcome,
+  CosLivenessRoundTrip,
+  CosLivenessUnverifiedReason,
   DisarmNePreferenceOutcome,
   ProvisionFlowContext,
   ProvisionFlowOps,
   ProvisionFlowOutcome,
 } from "./orchestrate.js";
+export { cosLivenessFromProbeResult } from "./orchestrate.js";
+
+export {
+  hermesOperatorTwinDescriptor,
+  operatorTwinServiceName,
+  readOperatorTwinLaunchdStatus,
+  restoreOperatorTwinStandDown,
+  standDownOperatorTwinLaunchAgent,
+  OperatorTwinStandDownError,
+} from "./operator-twin.js";
+export type {
+  OperatorTwinDescriptor,
+  OperatorTwinRestoreReport,
+  OperatorTwinStandDownOps,
+  OperatorTwinStandDownSnapshot,
+} from "./operator-twin.js";
 
 export { resolvePolicyDaemonAction } from "./policy-daemon.js";
 export type { PolicyDaemonState, PolicyDaemonAction } from "./policy-daemon.js";

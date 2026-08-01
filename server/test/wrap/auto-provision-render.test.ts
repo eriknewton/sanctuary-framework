@@ -35,6 +35,11 @@ function lines(summary: AutoProvisionSummary): string[] {
   return renderAutoProvisionOutcomeLines(summary);
 }
 
+const UNVERIFIED_NO_CHANNEL = {
+  kind: "cos_liveness_unverified" as const,
+  reason: "no_channel_configured" as const,
+};
+
 describe("wrap/cli renderAutoProvisionOutcomeLines", () => {
   it("not-ran or no-outcome -> no lines", () => {
     expect(lines({ ran: false })).toEqual([]);
@@ -58,9 +63,49 @@ describe("wrap/cli renderAutoProvisionOutcomeLines", () => {
   });
 
   it("armed -> a single quiet confirmation with the uid", () => {
-    const out = lines({ ran: true, outcome: { kind: "armed", uid: 502 } });
-    expect(out).toHaveLength(1);
+    const out = lines({ ran: true, outcome: { kind: "armed", uid: 502, liveness: UNVERIFIED_NO_CHANNEL } });
+    expect(out).toHaveLength(2);
     expect(out[0]).toMatch(/armed \(uid 502\)/);
+    expect(out[1]).toMatch(/CoS liveness unverified \(no_channel_configured\)/);
+    expect(out[1]).toMatch(/no functional-through-wall claim was made/);
+  });
+
+  it("verified liveness is rendered only as a confined-path round trip", () => {
+    const out = lines({
+      ran: true,
+      outcome: {
+        kind: "armed",
+        uid: 502,
+        liveness: {
+          kind: "cos_liveness_verified",
+          roundTrip: {
+            channel: "telegram",
+            requestId: "request-1",
+            responseId: "response-1",
+          },
+        },
+      },
+    });
+    expect(out[1]).toMatch(/confined-path round trip/);
+    expect(out[1]).toMatch(/request request-1, response response-1/);
+  });
+
+  it("operator-twin stand-down abort does not reuse the re-home restore failure frame", () => {
+    const out = lines({
+      ran: true,
+      outcome: {
+        kind: "aborted",
+        stage: "operator-twin-stand-down",
+        reason: "launchctl still reports pid 4242",
+        rolledBack: false,
+        rehomeAttempted: true,
+        accountCreated: true,
+      },
+    });
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatch(/^ {2}WARNING:/);
+    expect(out[0]).toMatch(/no agent-liveness claim was made/);
+    expect(out[0]).not.toMatch(/restore of your re-homed files FAILED/);
   });
 
   it("skipped-already-dedicated stays SILENT (orchestrator already printed its plan-and-print line)", () => {

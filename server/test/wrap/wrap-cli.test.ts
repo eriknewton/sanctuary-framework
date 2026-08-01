@@ -14,6 +14,7 @@ import {
   parseWrapArgs,
   formatWrapSuccess,
   protectionClaimFromAutoProvisionSummary,
+  renderAutoProvisionOutcomeLines,
   runWrap,
   validateDevDist,
   DevDistInvalidError,
@@ -39,6 +40,11 @@ const PINNED_SANCTUARY_ARGS = [
   `@sanctuary-framework/mcp-server@${SANCTUARY_VERSION}`,
   "sanctuary",
 ];
+
+const UNVERIFIED_NO_CHANNEL = {
+  kind: "cos_liveness_unverified" as const,
+  reason: "no_channel_configured" as const,
+};
 
 function claim(state: "exclusive" | "coarse-only" | "unprotected" | "unknown"): ProtectionStateClaim {
   switch (state) {
@@ -387,7 +393,7 @@ describe("formatWrapSuccess", () => {
   it("kind armed renders a current-run armed summary instead of unknown", () => {
     const protection = protectionClaimFromAutoProvisionSummary({
       ran: true,
-      outcome: { kind: "armed", uid: 503 },
+      outcome: { kind: "armed", uid: 503, liveness: UNVERIFIED_NO_CHANNEL },
     });
     expect(protection?.state).toBe("coarse-only");
     expect(protection?.basis).toBe("castle_wall_arm_observed");
@@ -399,6 +405,23 @@ describe("formatWrapSuccess", () => {
     expect(out).toContain("Castle Wall coarse-only");
   });
 
+  it("armed outcome renders the unverified-liveness line, never a functional-through-wall claim (F-GATEWAY-TWIN fix 8)", () => {
+    // Pre-#F-GATEWAY-TWIN source ignored `liveness` entirely: the armed line
+    // rendered alone and the operator could read a freshly-armed summary as
+    // "the agent works through the wall" with zero evidence. The outcome now
+    // carries an explicit liveness verdict and the renderer must surface it.
+    const lines = renderAutoProvisionOutcomeLines({
+      ran: true,
+      outcome: { kind: "armed", uid: 503, liveness: UNVERIFIED_NO_CHANNEL },
+    });
+    const text = lines.join("\n");
+    expect(text).toContain("Castle Wall armed (uid 503)");
+    expect(text).toContain(
+      "CoS liveness unverified (no_channel_configured); no functional-through-wall claim was made.",
+    );
+    expect(text).not.toContain("liveness verified");
+  });
+
   it("armed-exclusive-repark-failed is unknown until the probe observes live enforcement", () => {
     const protection = protectionClaimFromAutoProvisionSummary({
       ran: true,
@@ -407,6 +430,7 @@ describe("formatWrapSuccess", () => {
         uid: 503,
         generationId: 9,
         reparkError: "launchctl disable failed",
+        liveness: UNVERIFIED_NO_CHANNEL,
       },
     });
     expect(protection?.state).toBe("unknown");

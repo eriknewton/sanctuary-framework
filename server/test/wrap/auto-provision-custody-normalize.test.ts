@@ -1,3 +1,4 @@
+// fail-before-exempt: type-forced fixture update only: armed outcomes gained a required liveness field; the subject (finishProvisionOutcomeWithCustodyNormalize) is a pure passthrough tail with no behavioral stake in this PR
 /**
  * Custody-normalize chokepoint tail of the protect flow (fortress-ownership
  * spec 2026-07-30 §4(a2)(1)): `runAutoProvisionForWrap` finishes EVERY
@@ -15,11 +16,16 @@ import { join } from "node:path";
 import { finishProvisionOutcomeWithCustodyNormalize } from "../../src/wrap/auto-provision.js";
 import type { NormalizeFortressCustodyInput } from "../../src/castle-wall/provision/fortress-custody.js";
 
+const UNVERIFIED_NO_CHANNEL = {
+  kind: "cos_liveness_unverified" as const,
+  reason: "no_channel_configured" as const,
+};
+
 describe("finishProvisionOutcomeWithCustodyNormalize", () => {
   it("normalizes with the resolved operator and returns the summary for a success outcome", async () => {
     const calls: { fortressPath: string; operator: { uid: number; gid: number } }[] = [];
     const summary = await finishProvisionOutcomeWithCustodyNormalize({
-      outcome: { kind: "armed", uid: { value: 550, observedVia: "test" } as never },
+      outcome: { kind: "armed", uid: { value: 550, observedVia: "test" } as never, liveness: UNVERIFIED_NO_CHANNEL },
       wallFortressPath: "/Users/operator/.sanctuary",
       operator: { uid: 501, gid: 20 },
       print: () => undefined,

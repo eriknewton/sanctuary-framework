@@ -50,6 +50,10 @@ import {
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const fixturesDir = join(__dirname, "..", "harness", "fixtures");
+const UNVERIFIED_NO_CHANNEL = {
+  kind: "cos_liveness_unverified" as const,
+  reason: "no_channel_configured" as const,
+};
 
 describe("parseWrapArgs --provision-agent-account / --no-provision-agent-account (fix L2)", () => {
   it("captures --provision-agent-account as true", () => {
@@ -234,7 +238,7 @@ describe("runWrap: maybeRunAutoProvisionForWrap gating", () => {
     // surfaces.
     const runAutoProvisionForWrap = vi.fn(async (): Promise<AutoProvisionSummary> => ({
       ran: true,
-      outcome: { kind: "armed", uid: 503 },
+      outcome: { kind: "armed", uid: 503, liveness: UNVERIFIED_NO_CHANNEL },
     }));
     await installHermesFixture();
     setTty(true);
@@ -243,8 +247,17 @@ describe("runWrap: maybeRunAutoProvisionForWrap gating", () => {
     const stderr = stderrSpy.mock.calls.flat().join("\n");
     expect(stderr).toContain("Dedicated agent account provisioned and Castle Wall armed (uid 503)");
     expect(stderr).not.toContain("Castle Wall NOT ARMED");
+    // B4 (merged main): one observation, both surfaces — the armed run's
+    // summary claims coarse-only and never contradicts itself with unknown.
     expect(stderr).toContain("Castle Wall coarse-only");
     expect(stderr).not.toContain("Castle Wall status unknown");
+    // F-GATEWAY-TWIN fix 8 (this PR): the armed summary must also surface the
+    // liveness verdict the outcome now carries — before this fix the operator
+    // could read a freshly-armed wrap as "functional through the wall" on zero
+    // evidence (the exact false result the unconfined twin produced on Mini2).
+    expect(stderr).toContain(
+      "CoS liveness unverified (no_channel_configured); no functional-through-wall claim was made.",
+    );
   });
 
   it("prefers --dev-dist as the auto-provision CLI binary for dogfood installs", async () => {
