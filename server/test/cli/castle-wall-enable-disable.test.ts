@@ -270,6 +270,68 @@ describe("castle-wall enable/disable CLI verbs", () => {
     expect(out.text()).toContain("Castle Wall armed");
   });
 
+  it("enable does not claim content filter enabled while the sysext waits for user approval", async () => {
+    const { fortressPath, hostAppPath, env } = await makeFixture();
+    const plistPath = join(fortressPath, "boot.plist");
+    await writeFile(plistPath, makeBootPlist(`${fortressPath}/`));
+    const out = new CaptureStream();
+    const { invoke } = makeInvoker({
+      enable: { stdout: reportLine("enable", "enabled", true), exitCode: 0 },
+      status: { stdout: reportLine("status", "enabled", true), exitCode: 0 },
+    });
+
+    const code = await runEnable(["--fortress", fortressPath, "--no-ttl"], {
+      out,
+      err: new CaptureStream(),
+      env,
+      platform: "darwin",
+      hostAppCandidates: [hostAppPath],
+      hostAppInvoke: invoke,
+      daemonProbe: async () => true,
+      bootServiceReadyProbe: makeBootServiceReadyProbe(plistPath, fortressPath),
+      sysextProbe: async () => "[activated waiting for user]",
+      egressAllowRuleCountProbe: async () => 1,
+      agentOriginDescriptorProbe: async () => true,
+    });
+
+    expect(code).toBe(0);
+    expect(out.text()).not.toContain("content filter enabled");
+    expect(out.text()).toContain("waiting for user approval");
+    expect(out.text()).toContain("System Settings");
+  });
+
+  it("enable does not claim content filter enabled when sysext state is unreadable", async () => {
+    const { fortressPath, hostAppPath, env } = await makeFixture();
+    const plistPath = join(fortressPath, "boot.plist");
+    await writeFile(plistPath, makeBootPlist(`${fortressPath}/`));
+    const out = new CaptureStream();
+    const { invoke } = makeInvoker({
+      enable: { stdout: reportLine("enable", "enabled", true), exitCode: 0 },
+      status: { stdout: reportLine("status", "enabled", true), exitCode: 0 },
+    });
+
+    const code = await runEnable(["--fortress", fortressPath, "--no-ttl"], {
+      out,
+      err: new CaptureStream(),
+      env,
+      platform: "darwin",
+      hostAppCandidates: [hostAppPath],
+      hostAppInvoke: invoke,
+      daemonProbe: async () => true,
+      bootServiceReadyProbe: makeBootServiceReadyProbe(plistPath, fortressPath),
+      sysextProbe: async () => {
+        throw new Error("systemextensionsctl unavailable");
+      },
+      egressAllowRuleCountProbe: async () => 1,
+      agentOriginDescriptorProbe: async () => true,
+    });
+
+    expect(code).toBe(0);
+    expect(out.text()).not.toContain("content filter enabled");
+    expect(out.text()).toContain("system extension state could not be read");
+    expect(out.text()).toContain("System Settings");
+  });
+
   it("enable refuses when the matching boot service is disabled", async () => {
     const { fortressPath, hostAppPath, env } = await makeFixture();
     const plistPath = join(fortressPath, "boot.plist");

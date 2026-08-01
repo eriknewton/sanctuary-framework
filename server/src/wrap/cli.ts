@@ -1965,8 +1965,13 @@ function protectionObservationFromAutoProvisionSummary(
   if (!summary.ran || summary.outcome === undefined) return undefined;
   const outcome = summary.outcome;
   switch (outcome.kind) {
-    case "armed-exclusive":
     case "armed":
+      return {
+        state: "coarse-only",
+        basis: "castle_wall_arm_observed",
+        reasons: [`Castle Wall arm verified for uid ${outcome.uid}`],
+      };
+    case "armed-exclusive":
       return undefined;
     case "armed-exclusive-repark-failed":
       return {
@@ -2146,7 +2151,10 @@ function unknownClaimWithAutoProvisionReasons(
   observation: ProtectionStateObservation,
   autoProvisionSummaryClaim: ProtectionStateClaim | undefined,
 ): ProtectionStateClaim {
-  if (autoProvisionSummaryClaim?.basis === "disarm_observed_off") {
+  if (
+    autoProvisionSummaryClaim?.basis === "disarm_observed_off" ||
+    autoProvisionSummaryClaim?.basis === "castle_wall_arm_observed"
+  ) {
     return autoProvisionSummaryClaim;
   }
   return protectionStateClaimFromObservation({
