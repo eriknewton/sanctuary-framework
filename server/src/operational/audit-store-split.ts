@@ -275,8 +275,10 @@ export async function migrateFortressAuditStoreSplit(opts: {
   masterKey: Uint8Array;
   /** `identity_id` recorded on the daemon's genesis marker entry. */
   identityId?: string;
+  /** Create-with-fchown owner for daemon-created audit lock files. */
+  createOwner?: AuditLogConfig["createOwner"];
 }): Promise<AuditStoreSplitMigrationResult> {
-  const { storage, masterKey, identityId } = opts;
+  const { storage, masterKey, identityId, createOwner } = opts;
   const auditDir = storage.namespacePath("_audit");
   const statePath = dirnameOf(auditDir);
   const macKey = deriveAuditStoreSplitBoundaryMacKey(masterKey);
@@ -341,7 +343,9 @@ export async function migrateFortressAuditStoreSplit(opts: {
   }
 
   // Step 2: daemon genesis marker entry (durable, idempotent).
-  const daemonAuditLog = createDaemonAuditLog(storage, masterKey);
+  const daemonAuditLog = createDaemonAuditLog(storage, masterKey, {
+    ...(createOwner !== undefined ? { createOwner } : {}),
+  });
   const daemonFindings = await daemonAuditLog.getIntegrityFindings();
   if (daemonFindings.length > 0) {
     throw new AuditStoreSplitMigrationError(
