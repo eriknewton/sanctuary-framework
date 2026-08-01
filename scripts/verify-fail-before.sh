@@ -14,6 +14,55 @@ BASE_REF="$1"
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "$REPO_ROOT"
 
+trim_ws() {
+  local value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "$value"
+}
+
+exemption_reason_for_test_file() {
+  local test_file="$1"
+  local line=""
+  local trimmed=""
+  local raw_reason=""
+  local reason=""
+  local line_no=0
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line_no=$((line_no + 1))
+    [[ "$line_no" -gt 30 ]] && break
+    trimmed="$(trim_ws "$line")"
+    case "$trimmed" in
+      "// fail-before-exempt:"*)
+        raw_reason="${trimmed#// fail-before-exempt:}"
+        reason="$(trim_ws "$raw_reason")"
+        if [[ -z "$reason" ]]; then
+          echo "FAIL: fail-before-exempt marker in $test_file has an empty reason; use // fail-before-exempt: <non-empty reason>." >&2
+          return 2
+        fi
+        printf '%s\n' "$reason"
+        return 0
+        ;;
+    esac
+  done < "$test_file"
+
+  return 1
+}
+
+record_file_exemption() {
+  local test_file="$1"
+  local reason="$2"
+  printf '[%s] fail-before-exempt file=%s base_ref=%s branch=%s head=%s actor=%s reason=%s\n' \
+    "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+    "$test_file" \
+    "$BASE_REF" \
+    "$(git branch --show-current 2>/dev/null || echo unknown)" \
+    "$(git rev-parse --short HEAD)" \
+    "${GITHUB_ACTOR:-${USER:-unknown}}" \
+    "$reason" >> .fail-before-overrides.log
+}
+
 if [[ "${SKIP_FAIL_BEFORE:-}" == "1" ]]; then
   REASON="${SKIP_REASON:-${FAIL_BEFORE_SKIP_REASON:-}}"
   if [[ -z "$REASON" ]]; then
@@ -59,6 +108,30 @@ fi
 
 if [[ ${#CHANGED_TESTS[@]} -eq 0 ]]; then
   echo "FAIL: server/src changed, but no changed server/test/*.test.ts files were found." >&2
+  exit 1
+fi
+
+COVERED_TESTS=()
+EXEMPT_TESTS=()
+for test_file in "${CHANGED_TESTS[@]}"; do
+  set +e
+  exemption_reason="$(exemption_reason_for_test_file "$test_file")"
+  exemption_status=$?
+  set -e
+
+  if [[ "$exemption_status" -eq 0 ]]; then
+    EXEMPT_TESTS+=("$test_file")
+    echo "EXEMPT($test_file): $exemption_reason"
+    record_file_exemption "$test_file" "$exemption_reason"
+  elif [[ "$exemption_status" -eq 2 ]]; then
+    exit 2
+  else
+    COVERED_TESTS+=("$test_file")
+  fi
+done
+
+if [[ ${#COVERED_TESTS[@]} -eq 0 ]]; then
+  echo "FAIL: a source change with zero fail-before coverage is not verifiable — at least one changed test file must carry a real pre-fix-failing test" >&2
   exit 1
 fi
 
@@ -146,7 +219,7 @@ fi
 echo "Fail-before source delta removed; running changed tests against $BASE_REF source."
 overall=0
 
-for test_file in "${CHANGED_TESTS[@]}"; do
+for test_file in "${COVERED_TESTS[@]}"; do
   server_test="${test_file#server/}"
   echo
   echo "== $test_file =="
@@ -184,4 +257,8 @@ if [[ "$overall" -ne 0 ]]; then
 fi
 
 echo
-echo "PASS: every changed test file failed against pre-fix source."
+if [[ ${#EXEMPT_TESTS[@]} -gt 0 ]]; then
+  echo "PASS: every non-exempt changed test file failed against pre-fix source."
+else
+  echo "PASS: every changed test file failed against pre-fix source."
+fi
