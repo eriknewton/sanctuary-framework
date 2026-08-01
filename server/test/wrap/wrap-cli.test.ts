@@ -40,6 +40,11 @@ const PINNED_SANCTUARY_ARGS = [
   "sanctuary",
 ];
 
+const UNVERIFIED_NO_CHANNEL = {
+  kind: "cos_liveness_unverified" as const,
+  reason: "no_channel_configured" as const,
+};
+
 function claim(state: "exclusive" | "coarse-only" | "unprotected" | "unknown"): ProtectionStateClaim {
   switch (state) {
     case "exclusive":
@@ -387,7 +392,7 @@ describe("formatWrapSuccess", () => {
   it("kind armed does not derive coarse-only from the outcome alone", () => {
     const protection = protectionClaimFromAutoProvisionSummary({
       ran: true,
-      outcome: { kind: "armed", uid: 503 },
+      outcome: { kind: "armed", uid: 503, liveness: UNVERIFIED_NO_CHANNEL },
     });
     expect(protection).toBeUndefined();
   });
@@ -400,6 +405,7 @@ describe("formatWrapSuccess", () => {
         uid: 503,
         generationId: 9,
         reparkError: "launchctl disable failed",
+        liveness: UNVERIFIED_NO_CHANNEL,
       },
     });
     expect(protection?.state).toBe("unknown");

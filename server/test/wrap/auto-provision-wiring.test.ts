@@ -50,6 +50,10 @@ import {
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const fixturesDir = join(__dirname, "..", "harness", "fixtures");
+const UNVERIFIED_NO_CHANNEL = {
+  kind: "cos_liveness_unverified" as const,
+  reason: "no_channel_configured" as const,
+};
 
 describe("parseWrapArgs --provision-agent-account / --no-provision-agent-account (fix L2)", () => {
   it("captures --provision-agent-account as true", () => {
@@ -230,7 +234,7 @@ describe("runWrap: maybeRunAutoProvisionForWrap gating", () => {
     setTty(true);
     const runAutoProvisionForWrap = vi.fn(async (): Promise<AutoProvisionSummary> => ({
       ran: true,
-      outcome: { kind: "armed", uid: 503 },
+      outcome: { kind: "armed", uid: 503, liveness: UNVERIFIED_NO_CHANNEL },
     }));
     await runWrap(options({ hermes: true }), baseDeps({ runAutoProvisionForWrap }));
 

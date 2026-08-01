@@ -107,6 +107,30 @@ function liveAvailability(): ResolvedEnforcementAvailability {
   };
 }
 
+const UNVERIFIED_NO_CHANNEL = {
+  kind: "cos_liveness_unverified" as const,
+  reason: "no_channel_configured" as const,
+};
+
+function armedExclusiveOutcome(uid: number, generationId: number) {
+  return {
+    kind: "armed-exclusive" as const,
+    uid,
+    generationId,
+    liveness: UNVERIFIED_NO_CHANNEL,
+  };
+}
+
+function armedExclusiveReparkFailedOutcome(uid: number, generationId: number, reparkError: string) {
+  return {
+    kind: "armed-exclusive-repark-failed" as const,
+    uid,
+    generationId,
+    reparkError,
+    liveness: UNVERIFIED_NO_CHANNEL,
+  };
+}
+
 function providerUnboundAvailability(): ResolvedEnforcementAvailability {
   return {
     status: "non_green",
@@ -736,7 +760,7 @@ describe("Castle Wall wrap-banner evidence probes", () => {
       auditLog: log,
       autoProvisionSummary: {
         ran: true,
-        outcome: { kind: "armed-exclusive", uid: 503, generationId: 9 },
+        outcome: armedExclusiveOutcome(503, 9),
       },
       castleWallDaemonLivenessSince: livenessSince,
       storagePath,
@@ -759,7 +783,7 @@ describe("Castle Wall wrap-banner evidence probes", () => {
       auditLog: log,
       autoProvisionSummary: {
         ran: true,
-        outcome: { kind: "armed-exclusive", uid: 503, generationId: 9 },
+        outcome: armedExclusiveOutcome(503, 9),
       },
       castleWallDaemonLivenessSince: livenessSince,
       storagePath,
@@ -822,7 +846,7 @@ describe("Castle Wall wrap-banner evidence probes", () => {
       auditLog: log,
       autoProvisionSummary: {
         ran: true,
-        outcome: { kind: "armed-exclusive", uid: 503, generationId: 9 },
+        outcome: armedExclusiveOutcome(503, 9),
       },
       castleWallDaemonLivenessSince: livenessSince,
       storagePath,
@@ -848,7 +872,7 @@ describe("Castle Wall wrap-banner evidence probes", () => {
       auditLog: log,
       autoProvisionSummary: {
         ran: true,
-        outcome: { kind: "armed-exclusive", uid: 503, generationId: 9 },
+        outcome: armedExclusiveOutcome(503, 9),
       },
       castleWallDaemonLivenessSince: livenessSince,
       storagePath,
@@ -860,7 +884,7 @@ describe("Castle Wall wrap-banner evidence probes", () => {
       auditLog: log,
       autoProvisionSummary: {
         ran: true,
-        outcome: { kind: "armed-exclusive", uid: 777, generationId: 10 },
+        outcome: armedExclusiveOutcome(777, 10),
       },
       castleWallDaemonLivenessSince: livenessSince,
       storagePath,
@@ -873,7 +897,7 @@ describe("Castle Wall wrap-banner evidence probes", () => {
       auditLog: log,
       autoProvisionSummary: {
         ran: true,
-        outcome: { kind: "armed-exclusive", uid: 777, generationId: 10 },
+        outcome: armedExclusiveOutcome(777, 10),
       },
       castleWallDaemonLivenessSince: livenessSince,
       storagePath,
@@ -907,7 +931,7 @@ describe("Castle Wall wrap-banner evidence probes", () => {
       auditLog: log,
       autoProvisionSummary: {
         ran: true,
-        outcome: { kind: "armed-exclusive", uid: 503, generationId: 9 },
+        outcome: armedExclusiveOutcome(503, 9),
       },
       castleWallDaemonLivenessSince: livenessSince,
       storagePath,
@@ -918,7 +942,7 @@ describe("Castle Wall wrap-banner evidence probes", () => {
       auditLog: log,
       autoProvisionSummary: {
         ran: true,
-        outcome: { kind: "armed-exclusive", uid: 777, generationId: 10 },
+        outcome: armedExclusiveOutcome(777, 10),
       },
       castleWallDaemonLivenessSince: livenessSince,
       storagePath,
@@ -951,7 +975,7 @@ describe("Castle Wall wrap-banner evidence probes", () => {
       auditLog: log,
       autoProvisionSummary: {
         ran: true,
-        outcome: { kind: "armed-exclusive", uid: 503, generationId: 9 },
+        outcome: armedExclusiveOutcome(503, 9),
       },
       castleWallDaemonLivenessSince: livenessSince,
       storagePath,
@@ -1005,7 +1029,7 @@ describe("Castle Wall wrap-banner evidence probes", () => {
       auditLog: log,
       autoProvisionSummary: {
         ran: true,
-        outcome: { kind: "armed-exclusive", uid: 503, generationId: 9 },
+        outcome: armedExclusiveOutcome(503, 9),
       },
       castleWallDaemonLivenessSince: livenessSince,
       storagePath,
@@ -1031,7 +1055,7 @@ describe("Castle Wall wrap-banner evidence probes", () => {
       masterKey,
       autoProvisionSummary: {
         ran: true,
-        outcome: { kind: "armed-exclusive", uid: 503, generationId: 9 },
+        outcome: armedExclusiveOutcome(503, 9),
       },
       castleWallDaemonLivenessSince: livenessSince,
       storagePath,
@@ -1055,7 +1079,7 @@ describe("Castle Wall wrap-banner evidence probes", () => {
       masterKey,
       autoProvisionSummary: {
         ran: true,
-        outcome: { kind: "armed-exclusive", uid: 503, generationId: 9 },
+        outcome: armedExclusiveOutcome(503, 9),
       },
       castleWallDaemonLivenessSince: livenessSince,
       storagePath,
@@ -1085,7 +1109,7 @@ describe("Castle Wall wrap-banner evidence probes", () => {
         masterKey,
         autoProvisionSummary: {
           ran: true,
-          outcome: { kind: "armed-exclusive", uid: 503, generationId: 9 },
+          outcome: armedExclusiveOutcome(503, 9),
         },
         castleWallDaemonLivenessSince: livenessSince,
         storagePath,
@@ -1114,7 +1138,7 @@ describe("Castle Wall wrap-banner evidence probes", () => {
       masterKey,
       autoProvisionSummary: {
         ran: true,
-        outcome: { kind: "armed-exclusive", uid: 503, generationId: 9 },
+        outcome: armedExclusiveOutcome(503, 9),
       },
       castleWallDaemonLivenessSince: livenessSince,
       storagePath,
@@ -1139,7 +1163,7 @@ describe("Castle Wall wrap-banner evidence probes", () => {
       masterKey,
       autoProvisionSummary: {
         ran: true,
-        outcome: { kind: "armed-exclusive", uid: 503, generationId: 9 },
+        outcome: armedExclusiveOutcome(503, 9),
       },
       castleWallDaemonLivenessSince: livenessSince,
       storagePath,
@@ -1167,7 +1191,7 @@ describe("Castle Wall wrap-banner evidence probes", () => {
       masterKey,
       autoProvisionSummary: {
         ran: true,
-        outcome: { kind: "armed-exclusive", uid: 503, generationId: 9 },
+        outcome: armedExclusiveOutcome(503, 9),
       },
       castleWallDaemonLivenessSince: livenessSince,
       storagePath,
@@ -1191,7 +1215,7 @@ describe("Castle Wall wrap-banner evidence probes", () => {
       auditLog: log,
       autoProvisionSummary: {
         ran: true,
-        outcome: { kind: "armed-exclusive", uid: 503, generationId: 9 },
+        outcome: armedExclusiveOutcome(503, 9),
       },
       castleWallDaemonLivenessSince: livenessSince,
       storagePath,
@@ -1216,7 +1240,7 @@ describe("Castle Wall wrap-banner evidence probes", () => {
       auditLog: log,
       autoProvisionSummary: {
         ran: true,
-        outcome: { kind: "armed-exclusive", uid: 503, generationId: 9 },
+        outcome: armedExclusiveOutcome(503, 9),
       },
       castleWallDaemonLivenessSince: livenessSince,
       storagePath,
@@ -1456,12 +1480,7 @@ describe("Castle Wall wrap-banner evidence probes", () => {
       auditLog: log,
       autoProvisionSummary: {
         ran: true,
-        outcome: {
-          kind: "armed-exclusive-repark-failed",
-          uid: 503,
-          generationId: 9,
-          reparkError: "launchctl disable failed",
-        },
+        outcome: armedExclusiveReparkFailedOutcome(503, 9, "launchctl disable failed"),
       },
       castleWallDaemonLivenessSince: livenessSince,
       storagePath,

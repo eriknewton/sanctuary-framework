@@ -68,6 +68,9 @@ import {
   withProvisionLock,
   PROVISION_LOCK_PATH,
   ProvisionLockHeldError,
+  hermesOperatorTwinDescriptor,
+  standDownOperatorTwinLaunchAgent,
+  restoreOperatorTwinStandDown,
   type ProvisionLockOps,
   type DisarmNePreferenceOutcome,
   type ProvisionFlowOps,
@@ -75,6 +78,7 @@ import {
   type RehomeStepResult,
   type EndpointProbeTarget,
   type PolicyDaemonAction,
+  type OperatorTwinStandDownSnapshot,
   HERMES_ENDPOINT_SET,
   publishProvisionedEgressRules,
   readEgressRulesFromDisk,
@@ -1144,6 +1148,18 @@ export async function runAutoProvisionForWrap(
   // agent back on any abort. Set exactly once, only in exclusive mode, only
   // when a parked install actually ran.
   let harnessStandDownSnapshot: HarnessStandDownSnapshot | undefined;
+  // F-GATEWAY-TWIN: the per-user operator LaunchAgent superseded by this run.
+  // Distinct from `harnessStandDownSnapshot`, which is the SYSTEM LaunchDaemon.
+  let operatorTwinStandDownSnapshot: OperatorTwinStandDownSnapshot | undefined;
+  // A twin plist this run (re)writes must stay the OPERATOR's file. Protect
+  // runs under sudo, so a plain write leaves a root-owned plist in the
+  // operator's LaunchAgents: the operator loses custody of their own agent
+  // config, and launchd can refuse to bootstrap a gui-domain plist with the
+  // wrong owner -- the restore would then fail exactly when it is owed.
+  const handOperatorTwinPlistBack = async (path: string): Promise<void> => {
+    if (process.getuid?.() !== 0) return;
+    await lchown(path, operatorIdentity.uid, operatorIdentity.gid);
+  };
 
   // The ONE best-effort CLI audit closure for this flow's fortress. Hoisted
   // out of `buildExclusiveWiringInput` so the mode-independent residue gate
@@ -1747,6 +1763,72 @@ export async function runAutoProvisionForWrap(
         // catch covers the dynamic import failing).
       }
     },
+    // F-GATEWAY-TWIN: after the armed as-uid egress evidence succeeds, stop
+    // the operator-uid LaunchAgent this run supersedes before any liveness
+    // outcome is reported. The helper snapshots plist bytes + launchd state
+    // and verifies the job is actually gone after disable -> bootout.
+    standDownOperatorTwin: async () => {
+      const descriptor = hermesOperatorTwinDescriptor({
+        operatorHome,
+        operatorUid: consoleOwnerUid,
+      });
+      try {
+        const snapshot = await standDownOperatorTwinLaunchAgent(descriptor, {
+          readFile: async (path) => {
+            try {
+              return await readFile(path, "utf8");
+            } catch (err) {
+              if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+              throw err;
+            }
+          },
+          writeFile: async (path, content, mode) => {
+            await writeFile(path, content, { mode });
+            await handOperatorTwinPlistBack(path);
+          },
+          removeFile: async (path) => {
+            await rm(path, { force: true });
+          },
+          runLaunchctl: (args) => runLaunchctlWithTimeout(args),
+          sleepMs: (ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
+          notify: (message) => print(message),
+        });
+        operatorTwinStandDownSnapshot = snapshot;
+        return { ok: true as const, snapshot };
+      } catch (err) {
+        return { ok: false as const, error: err instanceof Error ? err.message : String(err) };
+      }
+    },
+    restoreOperatorTwinStandDown: async (snapshot) => {
+      const restored = await restoreOperatorTwinStandDown(snapshot, {
+        readFile: async (path) => {
+          try {
+            return await readFile(path, "utf8");
+          } catch (err) {
+            if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+            throw err;
+          }
+        },
+        writeFile: async (path, content, mode) => {
+          await writeFile(path, content, { mode });
+          await handOperatorTwinPlistBack(path);
+        },
+        removeFile: async (path) => {
+          await rm(path, { force: true });
+        },
+        runLaunchctl: (args) => runLaunchctlWithTimeout(args),
+        sleepMs: (ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
+        notify: (message) => print(message),
+      });
+      if (snapshot === operatorTwinStandDownSnapshot) {
+        operatorTwinStandDownSnapshot = undefined;
+      }
+      return restored;
+    },
+    // No current Hermes round-trip prober is wired here. Honest outcome:
+    // liveness is unverified because there is no channel config/prober object,
+    // never inferred from `hermes status` or from the process being loaded.
+    verifyAgentLivenessAfterStandDown: async () => undefined,
     // FIX R1 (BLOCKER, fix-round 2): honest, fail-closed probe list -- see
     // `hermesEndpointProbes` above. `resolvedAgentUidGid` is always set by
     // `installHarnessDaemon` before this is called (steps 6 -> 7); if it is

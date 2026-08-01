@@ -1968,7 +1968,20 @@ export const CLAIM_LITERAL_COUNTS: Readonly<Record<string, number>> = {
   // pid-liveness probe result for the lock-holder description; not a
   // protection claim.
   [`${CW}/lockfile.ts`]: 1,
-  [`${CW}/orchestrate.ts`]: 10,
+  // operator-twin.ts (F-GATEWAY-TWIN): every counted literal is a launchd
+  // STATUS READBACK, not a protection claim -- `known/installed/running:
+  // true` are parsed from `launchctl print` output, `disabled: true` from
+  // `launchctl print-disabled`, and `disabledStateRestored = true` is set
+  // only after `setOperatorTwinDisabled` re-read launchd's persistent
+  // override and matched it. Nothing here asserts the agent is protected or
+  // live; liveness stays `cos_liveness_unverified` unless a real round-trip
+  // reports it (rendered in orchestrate/cli, classified there).
+  [`${CW}/operator-twin.ts`]: 9,
+  // orchestrate.ts +1 (F-GATEWAY-TWIN): `rehomeAttempted: true` on the
+  // `operator-twin-stand-down` abort outcome states what THIS run already
+  // did (rehome ran before the twin stage) so the operator knows the abort's
+  // rollback scope; it claims nothing about protection or liveness.
+  [`${CW}/orchestrate.ts`]: 11,
   [`${CW}/policy-daemon.ts`]: 0,
   [`${CW}/rehome.ts`]: 0,
   [`${CW}/uid-gate.ts`]: 2,

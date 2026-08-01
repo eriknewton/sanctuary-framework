@@ -100,6 +100,7 @@ import {
   type RunProtectPreflightInput,
 } from "./preflight.js";
 import type {
+  CosLivenessOutcome,
   DisarmNePreferenceOutcome,
   ProvisionFlowOutcome,
 } from "../castle-wall/provision/index.js";
@@ -2398,7 +2399,10 @@ export function renderAutoProvisionOutcomeLines(summary: AutoProvisionSummary): 
   const outcome = summary.outcome;
   switch (outcome.kind) {
     case "armed":
-      return [`  Dedicated agent account provisioned and Castle Wall armed (uid ${outcome.uid}).`];
+      return [
+        `  Dedicated agent account provisioned and Castle Wall armed (uid ${outcome.uid}).`,
+        ...renderCosLivenessOutcome(outcome.liveness),
+      ];
     case "skipped-already-dedicated":
       // The orchestrator already printed the "already a verified dedicated
       // account ..." line via `print` at plan-and-print time; nothing to add.
@@ -2450,6 +2454,7 @@ export function renderAutoProvisionOutcomeLines(summary: AutoProvisionSummary): 
       return [
         `  Dedicated agent account provisioned, Castle Wall armed, and the exclusive-egress gate is LIVE ` +
           `(uid ${outcome.uid}, generation ${outcome.generationId}). The agent's only sanctioned egress path is the gate.`,
+        ...renderCosLivenessOutcome(outcome.liveness),
       ];
     case "armed-exclusive-repark-failed":
       // FIX-ROUND 5. This used to say "the agent is running confined" -- a
@@ -2465,6 +2470,7 @@ export function renderAutoProvisionOutcomeLines(summary: AutoProvisionSummary): 
           `agent's only sanctioned egress path is the gate, but the persistent boot state could NOT be re-parked ` +
           `(${outcome.reparkError}). ` +
           `The NEXT boot could start the agent before the gate re-arms. Run '${EGRESS_GATE_REPAIR_WITH_STAND_DOWN_COMMAND}' (${EGRESS_GATE_STAND_DOWN_EFFECT}) now.`,
+        ...renderCosLivenessOutcome(outcome.liveness),
       ];
     case "exclusive-egress-unarmed-coarse-active": {
       // S5-6 degrade-loud: DISTINCT non-green state; every posture surface
@@ -2497,6 +2503,22 @@ export function renderAutoProvisionOutcomeLines(summary: AutoProvisionSummary): 
   }
 }
 
+function renderCosLivenessOutcome(liveness: CosLivenessOutcome | undefined): string[] {
+  if (liveness === undefined) return [];
+  if (liveness.kind === "cos_liveness_verified") {
+    const roundTrip = liveness.roundTrip;
+    const detail = roundTrip.detail !== undefined ? `: ${roundTrip.detail}` : "";
+    return [
+      `  CoS liveness verified by confined-path round trip (${roundTrip.channel}, ` +
+        `request ${roundTrip.requestId}, response ${roundTrip.responseId}${detail}).`,
+    ];
+  }
+  const detail = liveness.detail !== undefined ? `: ${liveness.detail}` : "";
+  return [
+    `  CoS liveness unverified (${liveness.reason}${detail}); no functional-through-wall claim was made.`,
+  ];
+}
+
 function abortedProvisionLines(outcome: Extract<ProvisionFlowOutcome, { kind: "aborted" }>): string[] {
   const backupNote =
     outcome.backupPaths !== undefined && outcome.backupPaths.length > 0
@@ -2518,6 +2540,13 @@ function abortedProvisionLines(outcome: Extract<ProvisionFlowOutcome, { kind: "a
   // state, so it is checked FIRST and NEVER softened into a clean "rolled back;
   // re-run" line (the honesty gap the P0 flagged). `outcome.reason` already
   // carries the full WALL-STATE WARNING with the `castle-wall disable` command.
+  if (outcome.stage === "operator-twin-stand-down") {
+    return [
+      `  WARNING: automatic account provisioning stopped after Castle Wall armed (${outcome.reason}). ` +
+        `The confined account and wall state were left in place; no agent-liveness claim was made. ` +
+        `Stand down the operator LaunchAgent manually, then inspect 'sanctuary castle-wall status' before re-running.`,
+    ];
+  }
   if (outcome.wallMayBeArmed) {
     return [
       `  WARNING: automatic account provisioning stopped at "${outcome.stage}" (${outcome.reason})${backupNote}${conflictNote}` +

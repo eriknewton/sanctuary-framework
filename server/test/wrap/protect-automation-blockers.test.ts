@@ -72,6 +72,10 @@ const fixturesDir = join(__dirname, "..", "harness", "fixtures");
 const wrapCliModuleUrl = pathToFileURL(join(__dirname, "..", "..", "src", "wrap", "cli.ts")).href;
 const wrapCliSourcePath = join(__dirname, "..", "..", "src", "wrap", "cli.ts");
 const autoProvisionSourcePath = join(__dirname, "..", "..", "src", "wrap", "auto-provision.ts");
+const UNVERIFIED_NO_CHANNEL = {
+  kind: "cos_liveness_unverified" as const,
+  reason: "no_channel_configured" as const,
+};
 
 function sleepMs(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -444,7 +448,7 @@ describe("runWrap: signals during in-flight provisioning refuse once, then force
         started = true;
         entered.resolve();
         await finishProvision.promise;
-        return { ran: true, outcome: { kind: "armed", uid: 503 } };
+        return { ran: true, outcome: { kind: "armed", uid: 503, liveness: UNVERIFIED_NO_CHANNEL } };
       }),
     };
   }
@@ -658,7 +662,14 @@ describe("runWrap: signals during in-flight provisioning refuse once, then force
             process.kill(process.pid, "SIGTERM");
             await new Promise((resolve) => setTimeout(resolve, 30));
             console.log("provisioning-finished");
-            return { ran: true, outcome: { kind: "armed", uid: 503 } };
+            return {
+              ran: true,
+              outcome: {
+                kind: "armed",
+                uid: 503,
+                liveness: { kind: "cos_liveness_unverified", reason: "no_channel_configured" },
+              },
+            };
           },
         },
       );
@@ -677,7 +688,7 @@ describe("runWrap: signals during in-flight provisioning refuse once, then force
     const runAutoProvisionForWrap = vi.fn(async (options): Promise<AutoProvisionSummary> => {
       await options.beforeFirstMutation?.();
       await handleProcessShutdownSignal("SIGTERM");
-      return { ran: true, outcome: { kind: "armed", uid: 503 } };
+      return { ran: true, outcome: { kind: "armed", uid: 503, liveness: UNVERIFIED_NO_CHANNEL } };
     });
     exitSpy.mockImplementation(((code?: number) => {
       throw new Error(`process.exit:${code ?? 0}`);
@@ -956,7 +967,7 @@ describe("runWrap: declined step-2 arm confirm does not exit, matching the accep
     const runAutoProvisionForWrap = vi.fn(
       async (): Promise<AutoProvisionSummary> => ({
         ran: true,
-        outcome: { kind: "armed", uid: 503 },
+        outcome: { kind: "armed", uid: 503, liveness: UNVERIFIED_NO_CHANNEL },
       }),
     );
     const deps = { ...baseDeps(stopSpy), runAutoProvisionForWrap };

@@ -66,6 +66,10 @@ import {
   renderEndpointCheckLines,
 } from "./egress.js";
 import { observing, type Observed } from "../../claim-witness.js";
+import type {
+  OperatorTwinRestoreReport,
+  OperatorTwinStandDownSnapshot,
+} from "./operator-twin.js";
 
 /** Everything the orchestrator needs to decide + print, resolved once up front. */
 export interface ProvisionFlowContext {
@@ -251,6 +255,35 @@ export interface ProvisionFlowOps {
      */
     runState?: RunStateAdvice;
   }>;
+  /**
+   * Stop and persistently disable the OPERATOR-uid LaunchAgent that this run
+   * supersedes. This is separate from `restoreStoodDownHarness`: that older
+   * snapshot covers Sanctuary's SYSTEM LaunchDaemon, while this one covers the
+   * per-user LaunchAgent that can otherwise keep polling as the unconfined
+   * twin.
+   *
+   * Called only after post-arm as-uid egress evidence succeeds and before any
+   * agent-liveness outcome is reported. A failure is a loud post-arm refusal:
+   * liveness cannot be checked honestly while the unconfined twin may answer.
+   */
+  standDownOperatorTwin(): Promise<
+    | { ok: true; snapshot: OperatorTwinStandDownSnapshot }
+    | { ok: false; error: string }
+  >;
+  /**
+   * Restore a previously-stood-down operator LaunchAgent from its snapshot.
+   * MUST NOT THROW: this runs from the single outcome chokepoint on a path that
+   * is already refusing for another reason.
+   */
+  restoreOperatorTwinStandDown(
+    snapshot: OperatorTwinStandDownSnapshot,
+  ): Promise<OperatorTwinRestoreReport>;
+  /**
+   * Optional real round-trip liveness probe for the confined agent after the
+   * operator twin has been stood down. Absence or any non-round-trip result is
+   * rendered as `cos_liveness_unverified`, never as verified-by-omission.
+   */
+  verifyAgentLivenessAfterStandDown(): Promise<AgentLivenessProbeResult | undefined>;
   /**
    * Uninstall the harness daemon (fix, round 5 item N3). `installHarnessDaemon`
    * bootstraps a LIVE root LaunchDaemon; every post-install abort branch
@@ -762,7 +795,7 @@ export type ProvisionFlowOutcome =
   | { kind: "skipped-already-dedicated"; reason: string }
   | { kind: "skipped-non-tty-cooperative-only"; reason: string }
   | { kind: "declined-by-operator" }
-  | { kind: "armed"; uid: Observed<number> }
+  | { kind: "armed"; uid: Observed<number>; liveness: CosLivenessOutcome }
   | {
       kind: "aborted";
       stage: string;
@@ -878,7 +911,12 @@ export type ProvisionFlowOutcome =
    * S5-5 release barrier released the (previously parked) harness. The only
    * fine-grained outcome that may contribute to aggregate green.
    */
-  | { kind: "armed-exclusive"; uid: number; generationId: Observed<number> }
+  | {
+      kind: "armed-exclusive";
+      uid: number;
+      generationId: Observed<number>;
+      liveness: CosLivenessOutcome;
+    }
   /**
    * S5-6: exclusive stack LIVE and the harness running confined, but the
    * persistent boot state could not be re-parked (the next boot could
@@ -890,6 +928,7 @@ export type ProvisionFlowOutcome =
       uid: number;
       generationId: Observed<number>;
       reparkError: string;
+      liveness: CosLivenessOutcome;
     }
   /**
    * S5-6 DEGRADE-LOUD (design answer 2 choice (b), requires S5-P on every
@@ -927,6 +966,44 @@ interface HarnessStandDownState {
   owed: boolean;
 }
 
+interface OperatorTwinStandDownState {
+  snapshot?: OperatorTwinStandDownSnapshot;
+  owed: boolean;
+}
+
+export type CosLivenessUnverifiedReason =
+  | "no_channel_configured"
+  | "network_unavailable"
+  | "provider_failed";
+
+export interface CosLivenessRoundTrip {
+  channel: string;
+  requestId: string;
+  responseId: string;
+  detail?: string;
+}
+
+export type AgentLivenessProbeResult =
+  | { kind: "round_trip"; roundTrip: CosLivenessRoundTrip }
+  | { kind: "unverified"; reason: CosLivenessUnverifiedReason; detail?: string };
+
+export type CosLivenessOutcome =
+  | { kind: "cos_liveness_verified"; roundTrip: CosLivenessRoundTrip }
+  | { kind: "cos_liveness_unverified"; reason: CosLivenessUnverifiedReason; detail?: string };
+
+export function cosLivenessFromProbeResult(
+  result: AgentLivenessProbeResult | undefined,
+): CosLivenessOutcome {
+  if (result?.kind === "round_trip") {
+    return { kind: "cos_liveness_verified", roundTrip: result.roundTrip };
+  }
+  return {
+    kind: "cos_liveness_unverified",
+    reason: result?.reason ?? "no_channel_configured",
+    ...(result?.detail !== undefined ? { detail: result.detail } : {}),
+  };
+}
+
 /**
  * Outcomes after which the harness is NOT owed a restore, because the
  * exclusive-egress stage has taken ownership of it:
@@ -949,6 +1026,18 @@ const OUTCOMES_THAT_OWN_THE_HARNESS: ReadonlySet<string> = new Set([
   "armed-exclusive",
   "armed-exclusive-repark-failed",
   "exclusive-egress-unarmed-coarse-active",
+]);
+
+/**
+ * Outcomes after which the operator-side twin is deliberately NOT restored:
+ * the provision either succeeded, or it is in the amber "gate live but re-park
+ * failed" state. Every other post-stand-down outcome restores the operator's
+ * pre-run LaunchAgent state from the snapshot.
+ */
+const OUTCOMES_THAT_SUPERSEDE_THE_OPERATOR_TWIN: ReadonlySet<string> = new Set([
+  "armed",
+  "armed-exclusive",
+  "armed-exclusive-repark-failed",
 ]);
 
 function assertNeverProvisionFlowOutcome(outcome: never): never {
@@ -975,9 +1064,10 @@ export async function runProvisionFlow(
   ops: ProvisionFlowOps,
 ): Promise<ProvisionFlowOutcome> {
   const standDown: HarnessStandDownState = { owed: false };
+  const operatorTwinStandDown: OperatorTwinStandDownState = { owed: false };
   let outcome: ProvisionFlowOutcome;
   try {
-    outcome = await runProvisionFlowSteps(ctx, ops, standDown);
+    outcome = await runProvisionFlowSteps(ctx, ops, standDown, operatorTwinStandDown);
   } catch (err) {
     // A step that THREW rather than returning an outcome is exactly the abort
     // path nobody enumerates. Restore, then let the original error surface.
@@ -985,8 +1075,15 @@ export async function runProvisionFlow(
     // swallowed. The thrown error still wins as the outcome, but a restore
     // that left the agent stopped is news the operator needs regardless of
     // what else went wrong, and this path had no way to tell them.
+    if (operatorTwinStandDown.owed) await restoreOperatorTwinStandDownQuietly(ops, operatorTwinStandDown);
     if (standDown.owed) await restoreStoodDownHarnessQuietly(ops);
     throw err;
+  }
+  if (
+    operatorTwinStandDown.owed &&
+    !OUTCOMES_THAT_SUPERSEDE_THE_OPERATOR_TWIN.has(outcome.kind)
+  ) {
+    outcome = await restoreOperatorTwinStandDownFromOutcome(ops, operatorTwinStandDown, outcome);
   }
   if (!standDown.owed || OUTCOMES_THAT_OWN_THE_HARNESS.has(outcome.kind)) {
     return outcome;
@@ -1020,6 +1117,55 @@ async function restoreStoodDownHarnessQuietly(ops: ProvisionFlowOps): Promise<vo
     );
   } catch {
     // The caller is already propagating a more important failure.
+  }
+}
+
+async function restoreOperatorTwinStandDownQuietly(
+  ops: ProvisionFlowOps,
+  standDown: OperatorTwinStandDownState,
+): Promise<void> {
+  try {
+    if (standDown.snapshot === undefined) return;
+    ops.print(operatorTwinRestoreNote(await ops.restoreOperatorTwinStandDown(standDown.snapshot)));
+  } catch {
+    // The caller is already propagating the original failure.
+  }
+}
+
+async function restoreOperatorTwinStandDownFromOutcome(
+  ops: ProvisionFlowOps,
+  standDown: OperatorTwinStandDownState,
+  outcome: ProvisionFlowOutcome,
+): Promise<ProvisionFlowOutcome> {
+  if (standDown.snapshot === undefined) return outcome;
+  const note = operatorTwinRestoreNote(await ops.restoreOperatorTwinStandDown(standDown.snapshot));
+  if (!("reason" in outcome) || typeof outcome.reason !== "string") {
+    ops.print(note);
+    return outcome;
+  }
+  return { ...outcome, reason: `${outcome.reason} ${note}` } as ProvisionFlowOutcome;
+}
+
+function operatorTwinRestoreNote(restore: OperatorTwinRestoreReport): string {
+  if (restore.restored) {
+    return "The operator-side agent LaunchAgent this run stood down was restored from its pre-run snapshot.";
+  }
+  return (
+    "The operator-side agent LaunchAgent this run stood down could NOT be fully restored: " +
+    (restore.problems.length > 0 ? restore.problems.join("; ") : "no detail returned") +
+    ". Check the operator LaunchAgent plist and launchd disabled state before re-running."
+  );
+}
+
+async function verifyCosLivenessAfterStandDown(ops: ProvisionFlowOps): Promise<CosLivenessOutcome> {
+  try {
+    return cosLivenessFromProbeResult(await ops.verifyAgentLivenessAfterStandDown());
+  } catch (err) {
+    return {
+      kind: "cos_liveness_unverified",
+      reason: "provider_failed",
+      detail: err instanceof Error ? err.message : String(err),
+    };
   }
 }
 
@@ -1168,6 +1314,7 @@ async function runProvisionFlowSteps(
   ctx: ProvisionFlowContext,
   ops: ProvisionFlowOps,
   standDown: HarnessStandDownState,
+  operatorTwinStandDown: OperatorTwinStandDownState,
 ): Promise<ProvisionFlowOutcome> {
   let uid: number;
   // Re-home results accumulated so far, threaded into every restore call
@@ -1935,6 +2082,27 @@ async function runProvisionFlowSteps(
     probe_rows: egressVerify.rows,
   });
 
+  // F-GATEWAY-TWIN: the post-arm as-uid egress evidence has now proved the
+  // confined path can reach its declared endpoints. Before any liveness
+  // outcome is reported, stand down the operator-uid LaunchAgent this run
+  // supersedes. Otherwise an unconfined twin can answer provider polls and
+  // create a false "functional through the wall" result.
+  const operatorTwin = await ops.standDownOperatorTwin();
+  if (!operatorTwin.ok) {
+    return {
+      kind: "aborted",
+      stage: "operator-twin-stand-down",
+      reason:
+        `the operator-side agent LaunchAgent could not be stopped and disabled after the wall armed ` +
+        `(${operatorTwin.error}). Liveness was NOT checked, because the unconfined twin may still be able to answer.`,
+      rolledBack: false,
+      rehomeAttempted: true,
+      accountCreated,
+    };
+  }
+  operatorTwinStandDown.snapshot = operatorTwin.snapshot;
+  operatorTwinStandDown.owed = operatorTwin.snapshot.preexistingTwinModified;
+
   if (ctx.fineGrainedDeclared !== true) {
     return {
       kind: "armed",
@@ -1942,6 +2110,7 @@ async function runProvisionFlowSteps(
         "provision-orchestrate.armed",
         () => armedUidFromVerifiedEgress(uid, egressVerify),
       ),
+      liveness: await verifyCosLivenessAfterStandDown(ops),
     };
   }
 
@@ -1954,7 +2123,12 @@ async function runProvisionFlowSteps(
   ops.print("Coarse stages live; arming the exclusive-egress gate (fine-grained mode).");
   const exclusive = await runExclusiveEgressArming({ agentUid: uid }, ops.exclusiveEgress!);
   if (exclusive.kind === "exclusive-armed") {
-    return { kind: "armed-exclusive", uid, generationId: exclusive.generationId };
+    return {
+      kind: "armed-exclusive",
+      uid,
+      generationId: exclusive.generationId,
+      liveness: await verifyCosLivenessAfterStandDown(ops),
+    };
   }
   if (exclusive.kind === "exclusive-armed-repark-failed") {
     return {
@@ -1962,6 +2136,7 @@ async function runProvisionFlowSteps(
       uid,
       generationId: exclusive.generationId,
       reparkError: exclusive.reparkError,
+      liveness: await verifyCosLivenessAfterStandDown(ops),
     };
   }
   return {

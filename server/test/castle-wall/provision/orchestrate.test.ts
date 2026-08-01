@@ -9,6 +9,7 @@ import { describe, it, expect, vi } from "vitest";
 
 import {
   runProvisionFlow,
+  cosLivenessFromProbeResult,
   describeObservedAgentConfinement,
   describeExclusiveRoutingResidueRefusal,
   exclusiveRoutingResidueRefusal,
@@ -57,6 +58,23 @@ async function observedRunState(status: HarnessDaemonStatus): Promise<RunStateAd
 
 const PARKED_STATUS: HarnessDaemonStatus = { known: true, installed: true, running: false };
 const LIVE_STATUS: HarnessDaemonStatus = { known: true, installed: true, running: true, pid: 9001 };
+
+const UNVERIFIED_NO_CHANNEL = {
+  kind: "cos_liveness_unverified" as const,
+  reason: "no_channel_configured" as const,
+};
+
+const OPERATOR_TWIN_SNAPSHOT = {
+  plistPath: "/Users/operator/Library/LaunchAgents/ai.hermes.gateway.plist",
+  priorPlistBytes: "<plist/>",
+  domain: "gui/501",
+  label: "ai.hermes.gateway",
+  serviceName: "gui/501/ai.hermes.gateway",
+  disabledBefore: false,
+  wasLoaded: false,
+  wasRunning: false,
+  preexistingTwinModified: false,
+};
 
 const CEILING = 500;
 const AGENT_UID = 502;
@@ -170,6 +188,19 @@ function happyPathOps(overrides: Partial<ProvisionFlowOps> = {}): ProvisionFlowO
       harnessRestarted: true,
       problems: [] as string[],
     })),
+    standDownOperatorTwin: vi.fn(async () => ({
+      ok: true as const,
+      snapshot: OPERATOR_TWIN_SNAPSHOT,
+    })),
+    restoreOperatorTwinStandDown: vi.fn(async () => ({
+      restored: true,
+      plistRestored: true,
+      disabledStateRestored: true,
+      loadedStateRestored: true,
+      runningStateRestored: true,
+      problems: [] as string[],
+    })),
+    verifyAgentLivenessAfterStandDown: vi.fn(async () => undefined),
     ensurePolicyDaemon: vi.fn(async () => ({ ok: true as const, freshlyInstalled: false })),
     teardownPolicyDaemon: vi.fn(async () => undefined),
     preArmEndpoints: vi.fn(() => [{ name: "LLM", probe: async () => true }]),
@@ -221,7 +252,7 @@ describe("castle-wall/provision/orchestrate", () => {
   it("happy path: runs every step in order and arms", async () => {
     const ops = happyPathOps();
     const result = await runProvisionFlow(baseCtx(), ops);
-    expect(result).toEqual({ kind: "armed", uid: AGENT_UID });
+    expect(result).toEqual({ kind: "armed", uid: AGENT_UID, liveness: UNVERIFIED_NO_CHANNEL });
     expect(ops.createAccount).toHaveBeenCalledTimes(1);
     expect(ops.rehome).toHaveBeenCalledWith(AGENT_UID, AGENT_UID);
     expect(ops.installHarnessDaemon).toHaveBeenCalledWith(AGENT_UID);
@@ -236,7 +267,7 @@ describe("castle-wall/provision/orchestrate", () => {
     const result = await runProvisionFlow(baseCtx({ detectResult: ALREADY_DEDICATED }), ops);
     // Fix F6: this must NEVER short-circuit to a bare "skipped" outcome --
     // it must actually reach arm, exactly like the fresh-provision path.
-    expect(result).toEqual({ kind: "armed", uid: AGENT_UID });
+    expect(result).toEqual({ kind: "armed", uid: AGENT_UID, liveness: UNVERIFIED_NO_CHANNEL });
     expect(ops.createAccount).not.toHaveBeenCalled();
     expect(ops.rehome).not.toHaveBeenCalled();
     // FIX R4 (HIGH, 2026-07-07 fix-round 2): arming IS a privileged mutation
@@ -299,6 +330,66 @@ describe("castle-wall/provision/orchestrate", () => {
     const result = await runProvisionFlow(baseCtx({ preAnsweredProvision: true }), ops);
     expect(result.kind).toBe("armed");
     expect(ops.confirm).toHaveBeenCalledTimes(1);
+  });
+
+  describe("F-GATEWAY-TWIN liveness outcome honesty", () => {
+    it("never reports verified without a round-trip result object", () => {
+      expect(cosLivenessFromProbeResult(undefined)).toEqual(UNVERIFIED_NO_CHANNEL);
+      expect(cosLivenessFromProbeResult({ kind: "unverified", reason: "network_unavailable" })).toEqual({
+        kind: "cos_liveness_unverified",
+        reason: "network_unavailable",
+      });
+      expect(cosLivenessFromProbeResult({ kind: "unverified", reason: "provider_failed", detail: "telegram 503" }))
+        .toEqual({
+          kind: "cos_liveness_unverified",
+          reason: "provider_failed",
+          detail: "telegram 503",
+        });
+    });
+
+    it("reports verified only from an explicit confined-path round trip", () => {
+      expect(
+        cosLivenessFromProbeResult({
+          kind: "round_trip",
+          roundTrip: {
+            channel: "telegram",
+            requestId: "request-1",
+            responseId: "response-1",
+          },
+        }),
+      ).toEqual({
+        kind: "cos_liveness_verified",
+        roundTrip: {
+          channel: "telegram",
+          requestId: "request-1",
+          responseId: "response-1",
+        },
+      });
+    });
+
+    it("threads no-channel and provider-failure liveness through the terminal armed outcome", async () => {
+      const noChannel = await runProvisionFlow(baseCtx(), happyPathOps());
+      expect(noChannel).toMatchObject({ kind: "armed", liveness: UNVERIFIED_NO_CHANNEL });
+
+      const providerFailed = await runProvisionFlow(
+        baseCtx(),
+        happyPathOps({
+          verifyAgentLivenessAfterStandDown: vi.fn(async () => ({
+            kind: "unverified" as const,
+            reason: "provider_failed" as const,
+            detail: "telegram send failed",
+          })),
+        }),
+      );
+      expect(providerFailed).toMatchObject({
+        kind: "armed",
+        liveness: {
+          kind: "cos_liveness_unverified",
+          reason: "provider_failed",
+          detail: "telegram send failed",
+        },
+      });
+    });
   });
 
   it("operator declines the interactive confirm: stops before any mutation", async () => {
@@ -752,7 +843,7 @@ describe("castle-wall/provision/orchestrate", () => {
     it("happy path calls ensurePolicyDaemon with ctx.fortressPath BEFORE the harness install and before arm, still arms, tears down nothing", async () => {
       const ops = happyPathOps();
       const result = await runProvisionFlow(baseCtx(), ops);
-      expect(result).toEqual({ kind: "armed", uid: AGENT_UID });
+      expect(result).toEqual({ kind: "armed", uid: AGENT_UID, liveness: UNVERIFIED_NO_CHANNEL });
       expect(ops.ensurePolicyDaemon).toHaveBeenCalledWith(FORTRESS_PATH);
       // ORDER CHANGE (drill-D2 fix-round, 2026-07-18): the policy daemon is
       // now ensured BEFORE the harness install, not after it. In fine-grained
@@ -776,7 +867,7 @@ describe("castle-wall/provision/orchestrate", () => {
         ensurePolicyDaemon: vi.fn(async () => ({ ok: true as const, freshlyInstalled: true })),
       });
       const result = await runProvisionFlow(baseCtx(), ops);
-      expect(result).toEqual({ kind: "armed", uid: AGENT_UID });
+      expect(result).toEqual({ kind: "armed", uid: AGENT_UID, liveness: UNVERIFIED_NO_CHANNEL });
       expect(ops.teardownPolicyDaemon).not.toHaveBeenCalled();
     });
 
@@ -1003,7 +1094,7 @@ describe("castle-wall/provision/orchestrate", () => {
     it("happy path: provisionEgress runs AFTER ensure-policy-daemon and BEFORE arm; as-uid verify runs AFTER arm; egress_provisioned is audited with the rule ids", async () => {
       const ops = happyPathOps();
       const result = await runProvisionFlow(baseCtx(), ops);
-      expect(result).toEqual({ kind: "armed", uid: AGENT_UID });
+      expect(result).toEqual({ kind: "armed", uid: AGENT_UID, liveness: UNVERIFIED_NO_CHANNEL });
       const order = (fn: unknown) => (fn as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
       expect(order(ops.ensurePolicyDaemon)).toBeLessThan(order(ops.provisionEgress));
       expect(order(ops.provisionEgress)).toBeLessThan(order(ops.arm));
@@ -1482,15 +1573,26 @@ describe("castle-wall/provision/orchestrate", () => {
     it("happy fine-grained path: coarse stages first, then the exclusive stage, terminal outcome armed-exclusive (never plain armed)", async () => {
       const { ops, exclusive } = fineGrainedOps();
       const result = await runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), ops);
-      expect(result).toEqual({ kind: "armed-exclusive", uid: AGENT_UID, generationId: COMMITTED.generation_id });
-      // The exclusive stage ran strictly AFTER the coarse arm proved live.
+      expect(result).toEqual({
+        kind: "armed-exclusive",
+        uid: AGENT_UID,
+        generationId: COMMITTED.generation_id,
+        liveness: UNVERIFIED_NO_CHANNEL,
+      });
+      // The twin stand-down runs after post-arm as-uid egress evidence and
+      // before the liveness-bearing exclusive stage.
+      const egressVerifyOrder = (ops.verifyAgentEgressAfterArm as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0]!;
+      const twinStandDownOrder = (ops.standDownOperatorTwin as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0]!;
       const armOrder = (ops.arm as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0]!;
       const bringUpOrder = exclusive.bringUpGeneration.mock.invocationCallOrder[0]!;
       expect(armOrder).toBeLessThan(bringUpOrder);
+      expect(egressVerifyOrder).toBeLessThan(twinStandDownOrder);
+      expect(twinStandDownOrder).toBeLessThan(bringUpOrder);
       expect(exclusive.runReleaseSequence).toHaveBeenCalledWith(COMMITTED);
       // No degrade surfaces touched on the happy path.
       expect(exclusive.restoreCoarseComposition).not.toHaveBeenCalled();
       expect(exclusive.startHarnessCoarse).not.toHaveBeenCalled();
+      expect(ops.restoreOperatorTwinStandDown).not.toHaveBeenCalled();
     });
 
     it("released-repark-failed maps to the DISTINCT armed-exclusive-repark-failed outcome (amber, never green)", async () => {
@@ -1507,6 +1609,7 @@ describe("castle-wall/provision/orchestrate", () => {
         uid: AGENT_UID,
         generationId: COMMITTED.generation_id,
         reparkError: "launchctl disable exited 1",
+        liveness: UNVERIFIED_NO_CHANNEL,
       });
     });
 
@@ -1529,12 +1632,40 @@ describe("castle-wall/provision/orchestrate", () => {
       expect(ops.disarm).not.toHaveBeenCalled();
     });
 
+    it("restores the operator twin snapshot on a later post-stand-down refusal", async () => {
+      const snapshot = { ...OPERATOR_TWIN_SNAPSHOT, preexistingTwinModified: true };
+      const exclusive = happyExclusiveOps();
+      exclusive.bringUpGeneration = vi.fn(async () => {
+        throw new Error("pf anchor liveness probe reported NOT live");
+      });
+      const { ops } = fineGrainedOps(exclusive, {
+        standDownOperatorTwin: vi.fn(async () => ({ ok: true as const, snapshot })),
+      });
+      const result = await runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), ops);
+
+      expect(result.kind).toBe("exclusive-egress-unarmed-coarse-active");
+      expect(ops.restoreOperatorTwinStandDown).toHaveBeenCalledTimes(1);
+      expect(ops.restoreOperatorTwinStandDown).toHaveBeenCalledWith(snapshot);
+      expect(String((result as { reason: string }).reason)).toMatch(/operator-side agent LaunchAgent .* restored/i);
+    });
+
+    it("does not restore the operator twin after a successful superseding outcome", async () => {
+      const snapshot = { ...OPERATOR_TWIN_SNAPSHOT, preexistingTwinModified: true };
+      const { ops } = fineGrainedOps(happyExclusiveOps(), {
+        standDownOperatorTwin: vi.fn(async () => ({ ok: true as const, snapshot })),
+      });
+      const result = await runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), ops);
+
+      expect(result.kind).toBe("armed-exclusive");
+      expect(ops.restoreOperatorTwinStandDown).not.toHaveBeenCalled();
+    });
+
     it("coarse mode (fineGrainedDeclared absent) never invokes the exclusive stage even when ops are wired", async () => {
       const { ops, exclusive } = fineGrainedOps(happyExclusiveOps(), {
         installHarnessDaemon: vi.fn(async () => ({ ok: true as const, bootstrappedThisRun: true })),
       });
       const result = await runProvisionFlow(baseCtx(), ops);
-      expect(result).toEqual({ kind: "armed", uid: AGENT_UID });
+      expect(result).toEqual({ kind: "armed", uid: AGENT_UID, liveness: UNVERIFIED_NO_CHANNEL });
       expect(exclusive.bringUpGeneration).not.toHaveBeenCalled();
     });
 
@@ -1549,7 +1680,12 @@ describe("castle-wall/provision/orchestrate", () => {
       });
       const result = await runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), ops);
       // The flow proceeded all the way to a live exclusive arm.
-      expect(result).toEqual({ kind: "armed-exclusive", uid: AGENT_UID, generationId: COMMITTED.generation_id });
+      expect(result).toEqual({
+        kind: "armed-exclusive",
+        uid: AGENT_UID,
+        generationId: COMMITTED.generation_id,
+        liveness: UNVERIFIED_NO_CHANNEL,
+      });
       const residue = ops.reconcileExclusiveRoutingResidue as ReturnType<typeof vi.fn>;
       // Judged once, cleared once.
       expect(residue.mock.calls.map((c) => c[1])).toEqual(["observe", "clear"]);
@@ -1623,7 +1759,7 @@ describe("castle-wall/provision/orchestrate", () => {
     it("REGRESSION (coarse): a run with NO exclusive mode declared and NO exclusive ops wired STILL runs the residue gate", async () => {
       const ops = happyPathOps();
       const result = await runProvisionFlow(baseCtx(), ops);
-      expect(result).toEqual({ kind: "armed", uid: AGENT_UID });
+      expect(result).toEqual({ kind: "armed", uid: AGENT_UID, liveness: UNVERIFIED_NO_CHANNEL });
       // Pre-fix this op did not exist on the coarse path at all: the self-heal
       // was gated on a mode the wedging component (the signing daemon) does
       // not read. With no marker on disk the judgement is the only call.
@@ -1687,7 +1823,7 @@ describe("castle-wall/provision/orchestrate", () => {
       const printed: string[] = [];
       (ops as { print: (line: string) => void }).print = (line: string) => printed.push(line);
       const result = await runProvisionFlow(baseCtx(), ops);
-      expect(result).toEqual({ kind: "armed", uid: AGENT_UID });
+      expect(result).toEqual({ kind: "armed", uid: AGENT_UID, liveness: UNVERIFIED_NO_CHANNEL });
       // The removal is NAMED before the confirm, so the operator's yes covers it.
       expect(printed.join("\n")).toMatch(/will be cleared if you proceed/);
       // FIX F7: the flow does NOT re-print the self-heal fact. The production
