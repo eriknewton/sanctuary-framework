@@ -147,6 +147,13 @@ export interface AuditIntegrityFinding {
   actual?: string | number;
 }
 
+export interface AuditCreateOwner {
+  uid: number;
+  gid: number;
+}
+
+type AuditLockFileHandle = Awaited<ReturnType<typeof open>>;
+
 export interface AuditLogConfig {
   /** Maximum total size of stored audit entries in bytes. Default: 100 MB. */
   maxTotalSizeBytes?: number;
@@ -195,6 +202,22 @@ export interface AuditLogConfig {
   checkpointPublicKeyResolver?: (signerKid: string) => string | Uint8Array | undefined;
   /** Optional in-process subscribers notified when audit-chain integrity fails. */
   integrityAnomalySubscribers?: AuditIntegrityAnomalySubscriber[];
+  /**
+   * Create-with-fchown owner for filesystem artifacts this AuditLog creates
+   * outside the StorageBackend contract. Today that is the cross-process
+   * `.audit-write.lock` file: when set, the owner is applied on the open temp
+   * descriptor before the lock is linked into visibility, mirroring
+   * `writeFileCustody`'s descriptor-first owner discipline.
+   */
+  createOwner?: AuditCreateOwner;
+  /**
+   * Test seam for the descriptor owner operation. Production defaults to
+   * `FileHandle.chown`; callers should set only `createOwner`.
+   */
+  createOwnerChown?: (
+    handle: AuditLockFileHandle,
+    owner: AuditCreateOwner,
+  ) => Promise<void>;
   /**
    * Backstop interval (ms) between full on-disk re-verifications on the eager
    * read path. Defaults to {@link DEFAULT_AUDIT_EAGER_REVERIFY_INTERVAL_MS}
@@ -1704,6 +1727,11 @@ export class AuditLog {
   /** Backstop interval (ms) between full on-disk re-verifies on the eager path;
    * resolved once from config/env. See {@link resolveEagerReverifyIntervalMs}. */
   private readonly eagerReverifyIntervalMs: number;
+  private readonly createOwner: AuditCreateOwner | undefined;
+  private readonly createOwnerChown: (
+    handle: AuditLockFileHandle,
+    owner: AuditCreateOwner,
+  ) => Promise<void>;
   /** Age bound (ms) for the id-less 0-byte stale-lock fallback and the orphan
    * acquire-temp sweep; resolved once from config/env. See
    * {@link resolveIdlessStaleLockMs}. */
@@ -1759,6 +1787,10 @@ export class AuditLog {
     this.eagerReverifyIntervalMs = resolveEagerReverifyIntervalMs(
       config?.eagerReverifyIntervalMs
     );
+    this.createOwner = config?.createOwner;
+    this.createOwnerChown =
+      config?.createOwnerChown ??
+      ((handle, owner) => handle.chown(owner.uid, owner.gid));
     this.idlessStaleLockMs = resolveIdlessStaleLockMs(config?.idlessStaleLockMs);
     this.consultSplitBoundary = config?.consultSplitBoundary ?? true;
     this.splitBoundaryMacKey = deriveAuditStoreSplitBoundaryMacKey(masterKey);
@@ -3834,6 +3866,7 @@ export class AuditLog {
       const handle = await open(tempPath, "wx", 0o600);
       tempCreated = true;
       try {
+        await this.applyAuditWriteLockCreateOwner(handle);
         const uptimeMs = currentUptimeMs();
         const bootId = currentBootId();
         await handle.writeFile(
@@ -3866,6 +3899,13 @@ export class AuditLog {
     // Reached only when the link succeeded (any failure above threw); the handle
     // stat always populated publishedStats before the link, so this is defined.
     return publishedStats!;
+  }
+
+  private async applyAuditWriteLockCreateOwner(
+    handle: AuditLockFileHandle
+  ): Promise<void> {
+    if (this.createOwner === undefined) return;
+    await this.createOwnerChown(handle, this.createOwner);
   }
 
   /**

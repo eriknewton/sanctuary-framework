@@ -19,6 +19,7 @@ import {
   HelperSignerClient,
   type ShimInvoker,
 } from "../castle-wall/runtime/helper-signer.js";
+import { resolveFortressCreateOwner } from "../castle-wall/runtime/fortress-create-owner.js";
 import { resolveStoragePath } from "../paths.js";
 import { getSanctuaryVersion } from "../version.js";
 import { getOrCreatePassphrase } from "../wrap/passphrase.js";
@@ -1671,7 +1672,17 @@ export async function runDaemon(
   // key-params); never establish a fresh master from the daemon verb - a
   // fresh key could not match the pin and arming with it would fail-closed
   // the whole machine.
-  const storage = new FilesystemStorage(join(storagePath, "state"));
+  const getuid = ctx.getuid ?? process.getuid?.bind(process);
+  const processUid = getuid?.();
+  const isRootDaemon = processUid === 0;
+  const fortressCreateOwner =
+    platform === "darwin"
+      ? resolveFortressCreateOwner({ fortressPath: storagePath })
+      : undefined;
+  const storage = new FilesystemStorage(
+    join(storagePath, "state"),
+    fortressCreateOwner !== undefined ? { owner: fortressCreateOwner } : {},
+  );
   let derived: { key: Uint8Array };
   try {
     const custodyResult = await establishMaster({
@@ -1710,8 +1721,6 @@ export async function runDaemon(
   // never provisions a daemon namespace or a split-boundary record. This
   // keeps every existing test/CI/dev flow (which never runs as uid 0)
   // completely unchanged.
-  const getuid = ctx.getuid ?? process.getuid?.bind(process);
-  const isRootDaemon = getuid?.() === 0;
   let auditLog: AuditLog;
   if (isRootDaemon) {
     try {
@@ -1719,6 +1728,7 @@ export async function runDaemon(
         storage,
         masterKey: derived.key,
         identityId: fortressIdFromStoragePath(storagePath),
+        ...(fortressCreateOwner !== undefined ? { createOwner: fortressCreateOwner } : {}),
       });
       write(
         out,
@@ -1743,7 +1753,11 @@ export async function runDaemon(
     // analogous "accept a pre-existing broken chain" override to apply here;
     // `--accept-broken-chain` still governs ONLY the legacy `_audit` read
     // path other privileged verbs (e.g. `re-pin`) use.
-    auditLog = createDaemonAuditLog(storage, derived.key);
+    auditLog = createDaemonAuditLog(
+      storage,
+      derived.key,
+      fortressCreateOwner !== undefined ? { createOwner: fortressCreateOwner } : undefined,
+    );
   } else {
     auditLog = await buildAuditLogForPrivilegedAction({
       storage,
@@ -2158,7 +2172,7 @@ export async function runSafeModeDaemon(
     socketOwnerUid !== 0 &&
     fortressOwnerGid !== undefined &&
     fortressOwnerGid !== 0 &&
-    (ctx.getuid ?? process.getuid?.bind(process))?.() === 0
+    process.getuid?.() === 0
       ? { uid: socketOwnerUid, gid: fortressOwnerGid }
       : undefined;
 
@@ -2172,7 +2186,11 @@ export async function runSafeModeDaemon(
     safeModeAuditStoragePath(storagePath, tokenRead.token),
     fortressCreateOwner !== undefined ? { owner: fortressCreateOwner } : {},
   );
-  const auditLog = new AuditLog(auditStorage, safeModeAuditKey);
+  const auditLog = new AuditLog(
+    auditStorage,
+    safeModeAuditKey,
+    fortressCreateOwner !== undefined ? { createOwner: fortressCreateOwner } : undefined,
+  );
 
   // 3. Helper signer is mandatory in safe mode.
   const signerClientPath =
