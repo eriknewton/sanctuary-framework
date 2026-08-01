@@ -83,6 +83,7 @@ export type EnforcementAvailabilityVerification =
 
 export interface EnforcementAvailabilityStoreOptions {
   freshnessWindowMs?: number;
+  now?: () => number;
 }
 
 export interface EnforcementAvailabilitySocketQueryOptions {
@@ -104,11 +105,13 @@ interface ConnectionAvailabilityState {
 
 export class EnforcementAvailabilityStore {
   private readonly freshnessWindowMs: number;
+  private readonly now: () => number;
   private readonly connections = new Map<string, ConnectionAvailabilityState>();
 
   constructor(options: EnforcementAvailabilityStoreOptions = {}) {
     this.freshnessWindowMs =
       options.freshnessWindowMs ?? DEFAULT_ENFORCEMENT_AVAILABILITY_FRESHNESS_MS;
+    this.now = options.now ?? Date.now;
   }
 
   registerConnection(connectionId: string): void {
@@ -155,6 +158,9 @@ export class EnforcementAvailabilityStore {
     if (seq !== undefined) {
       state.lastProducerSeqByStream[stream] = seq;
     }
+    if (this.hasFreshVerifiedReport(state, this.now())) {
+      return;
+    }
     state.report = null;
     state.observedAtMs = null;
     state.invalidReason = reason;
@@ -169,7 +175,7 @@ export class EnforcementAvailabilityStore {
     );
   }
 
-  resolve(nowMs = Date.now()): ResolvedEnforcementAvailability {
+  resolve(nowMs = this.now()): ResolvedEnforcementAvailability {
     const activeConnectionCount = this.connections.size;
     if (activeConnectionCount === 0) {
       return this.undetermined("no_extension_connection", activeConnectionCount);
@@ -241,6 +247,17 @@ export class EnforcementAvailabilityStore {
       freshness_window_ms: this.freshnessWindowMs,
       active_connection_count: activeConnectionCount,
     };
+  }
+
+  private hasFreshVerifiedReport(
+    state: ConnectionAvailabilityState,
+    nowMs: number,
+  ): boolean {
+    return (
+      state.report !== null &&
+      state.observedAtMs !== null &&
+      nowMs - state.observedAtMs <= this.freshnessWindowMs
+    );
   }
 
   private undetermined(
