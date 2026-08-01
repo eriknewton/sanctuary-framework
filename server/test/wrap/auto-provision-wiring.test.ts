@@ -256,7 +256,7 @@ describe("runWrap: maybeRunAutoProvisionForWrap gating", () => {
     // could read a freshly-armed wrap as "functional through the wall" on zero
     // evidence (the exact false result the unconfined twin produced on Mini2).
     expect(stderr).toContain(
-      "CoS liveness unverified (no_channel_configured); no functional-through-wall claim was made.",
+      "CoS liveness unverified (no_channel_configured); no brain-routing or provider-chain claim was made.",
     );
   });
 

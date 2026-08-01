@@ -80,6 +80,31 @@ export type {
 } from "./verify.js";
 
 export {
+  DEFAULT_TELEGRAM_LIVENESS_MAX_DRAIN_BATCHES,
+  DEFAULT_TELEGRAM_LIVENESS_POLL_INTERVAL_MS,
+  DEFAULT_TELEGRAM_LIVENESS_TIMEOUT_MS,
+  TELEGRAM_LIVENESS_PROBE_AUDIT_OP,
+  TELEGRAM_LIVENESS_PROBE_CONFIG_RELATIVE_PATH,
+  TelegramLivenessProbeConfigError,
+  parseTelegramLivenessProbeConfig,
+  readTelegramLivenessProbeConfigFromFortress,
+  resolveTelegramLivenessProbeConfigPath,
+  runTelegramLivenessProbe,
+  verifyTelegramAgentLivenessFromFortress,
+} from "./liveness-probe.js";
+export type {
+  RunTelegramLivenessProbeOptions,
+  TelegramLivenessProbeAuditSink,
+  TelegramLivenessProbeConfig,
+  TelegramLivenessProbeConfigErrorCode,
+  TelegramLivenessProbeConfigFs,
+  TelegramLivenessProbeConfigRead,
+  TelegramLivenessProbeFailureDetail,
+  TelegramLivenessProbeOps,
+  VerifyTelegramAgentLivenessFromFortressOptions,
+} from "./liveness-probe.js";
+
+export {
   withProvisionLock,
   ProvisionLockHeldError,
   PROVISION_LOCK_PATH,
@@ -210,6 +235,7 @@ export {
 export {
   CUSTODY_REPAIR_MANIFEST_DIR,
   CUSTODY_REPAIR_MANIFEST_KIND,
+  FortressCustodyBaseError,
   applyCustodyRollback,
   applyFortressCustodyRepairs,
   isSafeManifestRelPath,
@@ -218,6 +244,7 @@ export {
   planFortressCustodyRepairs,
   realFortressCustodyFsOps,
   resolveSudoIdentityDecision,
+  verifyFortressCustodyBase,
   walkFortressCustody,
   writeCustodyRepairManifest,
   type CustodyApplyResult,
@@ -225,6 +252,7 @@ export {
   type CustodyRepairManifest,
   type CustodyRepairPlan,
   type CustodySkip,
+  type FortressCustodyBaseFailureReason,
   type FortressCustodyEntry,
   type FortressCustodyEntryType,
   type FortressCustodyFsOps,

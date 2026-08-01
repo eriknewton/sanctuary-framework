@@ -254,6 +254,68 @@ export interface CustodyApplyResult {
   failed: { path: string; reason: string }[];
 }
 
+export type FortressCustodyBaseFailureReason =
+  | "missing"
+  | "operator_uid_unknown"
+  | "operator_uid_root"
+  | "stat_failed"
+  | "not_plain_directory"
+  | "root_owned"
+  | "owner_mismatch"
+  | "mode_mismatch";
+
+export class FortressCustodyBaseError extends Error {
+  readonly reason: FortressCustodyBaseFailureReason;
+  readonly details: Record<string, unknown>;
+
+  constructor(
+    reason: FortressCustodyBaseFailureReason,
+    details: Record<string, unknown> = {},
+    options: { cause?: unknown } = {},
+  ) {
+    super("fortress_custody_invalid", options);
+    this.name = "FortressCustodyBaseError";
+    this.reason = reason;
+    this.details = details;
+    Object.defineProperty(this, "reason", { value: reason, enumerable: false });
+    Object.defineProperty(this, "details", { value: details, enumerable: false });
+  }
+}
+
+export async function verifyFortressCustodyBase(input: {
+  fortressPath: string;
+  operatorUid?: number;
+  ops?: Pick<FortressCustodyFsOps, "lstat">;
+}): Promise<void> {
+  if (input.operatorUid === undefined) {
+    throw new FortressCustodyBaseError("operator_uid_unknown", { path: input.fortressPath });
+  }
+  if (input.operatorUid === 0) {
+    throw new FortressCustodyBaseError("operator_uid_root", { path: input.fortressPath });
+  }
+  const ops = input.ops ?? realFortressCustodyFsOps();
+  let stats: Stats;
+  try {
+    stats = await ops.lstat(input.fortressPath);
+  } catch (err) {
+    const reason = isEnoent(err) ? "missing" : "stat_failed";
+    throw new FortressCustodyBaseError(reason, { path: input.fortressPath }, { cause: err });
+  }
+  if (stats.isSymbolicLink() || !stats.isDirectory()) {
+    throw new FortressCustodyBaseError("not_plain_directory", { path: input.fortressPath });
+  }
+  if (stats.uid === 0) {
+    throw new FortressCustodyBaseError("root_owned", { path: input.fortressPath, uid: stats.uid });
+  }
+  if (stats.uid !== input.operatorUid) {
+    throw new FortressCustodyBaseError("owner_mismatch", { path: input.fortressPath, uid: stats.uid });
+  }
+  const mode = stats.mode & 0o777;
+  if (mode !== 0o700) {
+    throw new FortressCustodyBaseError("mode_mismatch", { path: input.fortressPath, mode });
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Walk
 // ---------------------------------------------------------------------------
