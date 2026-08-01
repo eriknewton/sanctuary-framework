@@ -1977,10 +1977,13 @@ export const CLAIM_LITERAL_COUNTS: Readonly<Record<string, number>> = {
   // live; liveness stays `cos_liveness_unverified` unless a real round-trip
   // reports it (rendered in orchestrate/cli, classified there).
   [`${CW}/operator-twin.ts`]: 9,
-  // orchestrate.ts +1 (F-GATEWAY-TWIN): `rehomeAttempted: true` on the
-  // `operator-twin-stand-down` abort outcome states what THIS run already
-  // did (rehome ran before the twin stage) so the operator knows the abort's
-  // rollback scope; it claims nothing about protection or liveness.
+  // orchestrate.ts +1 (F-GATEWAY-TWIN): `ok: true` in the
+  // `standDownOperatorTwin` result union (~:270) — the discriminated-union
+  // success tag of the stand-down OPERATION result, whose truth is
+  // established by the helper's own settle-and-verify readback before it
+  // returns. It claims nothing about protection or liveness. (The abort
+  // outcome's `rehomeAttempted: true` is NOT a tracked field and is not
+  // part of this count.)
   [`${CW}/orchestrate.ts`]: 11,
   [`${CW}/policy-daemon.ts`]: 0,
   [`${CW}/rehome.ts`]: 0,
