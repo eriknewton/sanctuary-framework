@@ -47,6 +47,7 @@ export type ProtectionStateObservation =
   | {
       state: "coarse-only";
       basis:
+        | "castle_wall_arm_observed"
         | "exclusive_egress_cap_observed"
         | "exclusive_egress_unarmed_coarse_active";
       reasons?: readonly string[];
