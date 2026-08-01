@@ -1,3 +1,4 @@
+// fail-before-exempt: type-forced fixture update only (armed outcomes gained a required liveness field); the liveness rendering this PR adds is already pinned pre-fix-failing in auto-provision-wiring.test.ts and wrap-cli.test.ts
 /**
  * N1: three bounded automation-blocker fixes for `sanctuary protect`
  * (drill record 2026-07-26), fix 2 corrected 2026-07-27 (harden-loop):
