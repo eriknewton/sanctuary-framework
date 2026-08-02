@@ -65,12 +65,15 @@ import {
   buildHermesExclusiveCliWiring,
   describeRepairCoarseComposition,
   resolveGateDaemonArgvPrefix,
+  resolveProvisionedAgentHome,
 } from "../../src/wrap/auto-provision.js";
 import { HERMES_ENDPOINT_SET } from "../../src/castle-wall/provision/egress.js";
 import { harnessLaunchSpec } from "../../src/egress-gate/harness-daemon.js";
 import {
   planRehome,
+  planBrainRehome,
   executeRehomePlan,
+  executeBrainRehomePlan,
   restoreRehomeSteps,
   RehomeExecutionError,
   type AgentRehomeAdapter,
@@ -590,6 +593,179 @@ describe("castle-wall/provision/rehome real-ops chokepoint: RehomeExecutionError
     // The straddling entry's destPath must be present so safeRestore can
     // reverse-move it back, exactly like the first two.
     expect(rehomeErr.partialResults[2]!.destPath).toBe("/var/sanctuary-agents/x/c");
+  });
+});
+
+describe("F-9 Tier-M real-ops journal and parent-custody guards", () => {
+  it("P0: auto-provision preflights Tier-M with the same prospective account home used by provision", async () => {
+    expect(resolveProvisionedAgentHome("sanctuary-hermes")).toBe("/var/sanctuary-agents/sanctuary-hermes");
+
+    const source = await readFile(new URL("../../src/wrap/auto-provision.ts", import.meta.url), "utf8");
+    const accountHome = source.indexOf("const newAccountHome = resolveProvisionedAgentHome(accountName)");
+    const preflightStart = source.indexOf("preflightBrainRehome: async () =>");
+    const preflightOps = source.indexOf("realRehomeOps({ fortressPath: wallFortressPath, newAccountHome })", preflightStart);
+    const preflightPlan = source.indexOf("planBrainRehome(hermesRehomeAdapter, { operatorHome, newAccountHome })", preflightStart);
+    const preflightAssert = source.indexOf("assertBrainRehomePreflight(brainPlan, rehomeOps as BrainRehomeOps)", preflightStart);
+
+    expect(accountHome).toBeGreaterThanOrEqual(0);
+    expect(preflightStart).toBeGreaterThan(accountHome);
+    expect(preflightOps).toBeGreaterThan(preflightStart);
+    expect(preflightPlan).toBeGreaterThan(preflightStart);
+    expect(preflightAssert).toBeGreaterThan(preflightPlan);
+  });
+
+  it("P0: auto-provision keeps the in-rehome open-journal assertion before the Tier-K move starts", async () => {
+    const source = await readFile(new URL("../../src/wrap/auto-provision.ts", import.meta.url), "utf8");
+    const rehomeStart = source.indexOf("rehome: async (uid, gid) =>");
+    const tierKMove = source.indexOf("executeRehomePlan", rehomeStart);
+    const journalPreflight = source.indexOf("assertNoOpenBrainRehomeJournal", rehomeStart);
+
+    expect(rehomeStart).toBeGreaterThanOrEqual(0);
+    expect(journalPreflight).toBeGreaterThan(rehomeStart);
+    expect(journalPreflight).toBeLessThan(tierKMove);
+  });
+
+  it("P0: corrupt Tier-M journal is a hard refusal with the journal path, never treated as absent", async () => {
+    const tmpRoot = await mkdtemp(join(tmpdir(), "sanctuary-brain-journal-corrupt-"));
+    try {
+      const fortressPath = join(tmpRoot, "fortress");
+      const journalPath = join(fortressPath, "state", "rehome-brain-journal.json");
+      await mkdir(dirname(journalPath), { recursive: true });
+      await writeFile(journalPath, "{ not json");
+      const ops = realRehomeOps({
+        fortressPath,
+        backupRoot: join(tmpRoot, "backups"),
+        newAccountHome: join(tmpRoot, "account"),
+      });
+
+      await expect(ops.readBrainJournal()).rejects.toThrow(journalPath);
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("P0: Tier-M staging cleanup refuses a symlinked ancestor before deleting a stale staging leaf", async () => {
+    const tmpRoot = await mkdtemp(join(tmpdir(), "sanctuary-brain-stage-parent-"));
+    try {
+      const operatorHome = join(tmpRoot, "operator");
+      const accountHome = join(tmpRoot, "account");
+      const fortressPath = join(tmpRoot, "fortress");
+      const backupRoot = join(tmpRoot, "backups");
+      const sourcePath = join(operatorHome, "SOUL.md");
+      const destPath = join(accountHome, ".hermes", "config.yaml");
+      const stagingPath = `${destPath}.sanctuary-brain-stage-stage-guard`;
+      const outside = join(tmpRoot, "outside");
+      const outsideStagingPath = join(outside, basename(stagingPath));
+      const adapter: AgentRehomeAdapter = {
+        harnessId: "test-brain",
+        pathsToRehome: () => [],
+        brainPathsToRehome: () => [
+          {
+            tier: "mind",
+            relPath: ".hermes/config.yaml",
+            sourcePath,
+            destRelativePath: ".hermes/config.yaml",
+            kind: "file",
+            required: true,
+            isSecret: true,
+            largeObject: false,
+          },
+        ],
+        requiresInteractiveReconsent: () => false,
+      };
+      await mkdir(dirname(sourcePath), { recursive: true });
+      await mkdir(dirname(destPath), { recursive: true });
+      await mkdir(outside, { recursive: true });
+      await writeFile(sourcePath, "agent-memory");
+      await rm(dirname(destPath), { recursive: true, force: true });
+      await symlink(outside, dirname(destPath));
+      await writeFile(outsideStagingPath, "outside-must-survive");
+      const plan = planBrainRehome(adapter, { operatorHome, newAccountHome: accountHome });
+      const ops = realRehomeOps({ fortressPath, backupRoot, newAccountHome: accountHome });
+      const uidGid = { uid: process.getuid?.() ?? 0, gid: process.getgid?.() ?? 0 };
+
+      await expect(
+        executeBrainRehomePlan(plan, ops, uidGid, { runId: "stage-guard" }),
+      ).rejects.toThrow(/symlink|outside|refusing|too many levels/i);
+
+      expect(await readFile(outsideStagingPath, "utf8")).toBe("outside-must-survive");
+      expect(await readFile(sourcePath, "utf8")).toBe("agent-memory");
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("P1: backup vault parent mutations refuse a symlinked ancestor instead of copying outside the vault", async () => {
+    const tmpRoot = await mkdtemp(join(tmpdir(), "sanctuary-backup-parent-"));
+    try {
+      const sourcePath = join(tmpRoot, "operator", "SOUL.md");
+      const backupRoot = join(tmpRoot, "backups");
+      const outside = join(tmpRoot, "outside");
+      await mkdir(dirname(sourcePath), { recursive: true });
+      await mkdir(outside, { recursive: true });
+      await writeFile(sourcePath, "agent-memory");
+      const backupStem = `${backupRoot}${sourcePath}.bak-`;
+      const symlinkedBackupParent = dirname(backupStem);
+      await mkdir(dirname(symlinkedBackupParent), { recursive: true });
+      await symlink(outside, symlinkedBackupParent);
+
+      const ops = realRehomeOps({ backupRoot });
+
+      await expect(ops.backup(sourcePath)).rejects.toThrow(/symlink|outside|refusing/i);
+      expect(await readdir(outside)).toEqual([]);
+      expect(await readFile(sourcePath, "utf8")).toBe("agent-memory");
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("P1: displaced-destination backup parents refuse a symlinked ancestor instead of renaming outside the vault", async () => {
+    const tmpRoot = await mkdtemp(join(tmpdir(), "sanctuary-displace-parent-"));
+    try {
+      const backupRoot = join(tmpRoot, "backups");
+      const accountHome = join(tmpRoot, "account");
+      const destPath = join(accountHome, ".hermes", "config.yaml");
+      const outside = join(tmpRoot, "outside");
+      await mkdir(dirname(destPath), { recursive: true });
+      await mkdir(outside, { recursive: true });
+      await writeFile(destPath, "real-destination");
+      const displacedStem = `${backupRoot}/.displaced${destPath}.displaced-`;
+      const symlinkedDisplacedParent = dirname(displacedStem);
+      await mkdir(dirname(symlinkedDisplacedParent), { recursive: true });
+      await symlink(outside, symlinkedDisplacedParent);
+
+      const ops = realRehomeOps({ backupRoot, newAccountHome: accountHome });
+
+      await expect(ops.displaceDestination(destPath)).rejects.toThrow(/symlink|outside|refusing/i);
+      expect(await readFile(destPath, "utf8")).toBe("real-destination");
+      expect(await readdir(outside)).toEqual([]);
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("P1: displaced-destination restore parents refuse a symlinked ancestor instead of renaming outside the account", async () => {
+    const tmpRoot = await mkdtemp(join(tmpdir(), "sanctuary-restore-displace-parent-"));
+    try {
+      const backupRoot = join(tmpRoot, "backups");
+      const displacedPath = join(backupRoot, ".displaced", "config.yaml");
+      const destParent = join(tmpRoot, "account", ".hermes");
+      const destPath = join(destParent, "config.yaml");
+      const outside = join(tmpRoot, "outside");
+      await mkdir(dirname(displacedPath), { recursive: true });
+      await mkdir(dirname(destParent), { recursive: true });
+      await mkdir(outside, { recursive: true });
+      await writeFile(displacedPath, "real-destination");
+      await symlink(outside, destParent);
+
+      const ops = realRehomeOps({ backupRoot });
+
+      await expect(ops.restoreDisplacedDestination(displacedPath, destPath)).rejects.toThrow(/symlink|outside|refusing/i);
+      expect(await readFile(displacedPath, "utf8")).toBe("real-destination");
+      expect(await readdir(outside)).toEqual([]);
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
   });
 });
 

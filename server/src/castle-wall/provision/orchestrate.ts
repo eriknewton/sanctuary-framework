@@ -150,6 +150,13 @@ export interface ProvisionFlowOps {
   beforeFirstMutation?: () => boolean | Promise<boolean>;
   /** Build the account-provision plan (pure) then execute it. Returns the account's uid. */
   createAccount(): Promise<{ plan: AccountProvisionPlan; uid: number }>;
+  /**
+   * Pure/read-only Tier-M brain re-home preflight for the fresh-provision path.
+   * It must run before the first host mutation, because an open journal or
+   * already-placed agent-home copy is a refusal, not something discovered after
+   * account creation or stand-down.
+   */
+  preflightBrainRehome(): Promise<void>;
   /** Build + execute the re-home plan. Returns per-step results (for rollback). */
   rehome(uid: number, gid: number): Promise<{ plan: RehomePlan; results: RehomeStepResult[] }>;
   /**
@@ -268,6 +275,18 @@ export interface ProvisionFlowOps {
    */
   standDownOperatorTwin(): Promise<
     | { ok: true; snapshot: OperatorTwinStandDownSnapshot }
+    | { ok: false; error: string }
+  >;
+  /**
+   * Tier-M rehome quiescence gate: the confined SYSTEM harness must be absent
+   * or verified stopped before any operating-mind state is copied. The
+   * production implementation reuses the existing harness park/status rails;
+   * this orchestration layer only consumes the proven verdict.
+   */
+  standDownSystemHarnessForBrainRehome(
+    uid: number,
+  ): Promise<
+    | { ok: true; snapshot: { preexistingJobModified: boolean } }
     | { ok: false; error: string }
   >;
   /**
@@ -1004,6 +1023,33 @@ export function cosLivenessFromProbeResult(
   };
 }
 
+function rehomeResultMutated(result: RehomeStepResult): boolean {
+  return (
+    result.status === "moved" ||
+    result.status === "destination-displaced" ||
+    (result.status === "destination-authoritative" && result.sourceDuplicateRemoved === true)
+  );
+}
+
+function missingRequiredTierMStrands(results: RehomeStepResult[]): string[] {
+  return results
+    .filter((result) => {
+      if (result.entry.tier !== "mind" || result.entry.required !== true) return false;
+      return !(
+        result.status === "moved" ||
+        result.status === "destination-authoritative" ||
+        result.status === "destination-displaced"
+      );
+    })
+    .map((result) => result.entry.relPath ?? result.entry.destRelativePath);
+}
+
+function optionalTierMSkips(results: RehomeStepResult[]): string[] {
+  return results
+    .filter((result) => result.entry.tier === "mind" && result.entry.required !== true && result.status === "skipped-absent")
+    .map((result) => result.entry.relPath ?? result.entry.destRelativePath);
+}
+
 /**
  * Outcomes after which the harness is NOT owed a restore, because the
  * exclusive-egress stage has taken ownership of it:
@@ -1468,6 +1514,20 @@ async function runProvisionFlowSteps(
     return { kind: "declined-by-operator" };
   }
 
+  if (!ctx.detectResult.alreadyDedicated) {
+    try {
+      await ops.preflightBrainRehome();
+    } catch (err) {
+      return {
+        kind: "aborted",
+        stage: "tier-m-brain-rehome-preflight",
+        reason: (err as Error).message,
+        rolledBack: false,
+        rehomeAttempted: false,
+      };
+    }
+  }
+
   if (ops.beforeFirstMutation !== undefined && !(await ops.beforeFirstMutation())) {
     return {
       kind: "aborted",
@@ -1537,8 +1597,58 @@ async function runProvisionFlowSteps(
 
     // Step 5: re-home (backup-first, reversible).
     try {
+      const operatorTwin = await ops.standDownOperatorTwin();
+      if (!operatorTwin.ok) {
+        return {
+          kind: "aborted",
+          stage: "operator-twin-stand-down",
+          reason:
+            `the operator-side agent LaunchAgent could not be stopped and disabled before Tier-M re-home ` +
+            `(${operatorTwin.error}). No brain state was moved, because the unconfined twin may still be writing it.`,
+          rolledBack: true,
+          rehomeAttempted: false,
+          accountCreated,
+        };
+      }
+      operatorTwinStandDown.snapshot = operatorTwin.snapshot;
+      operatorTwinStandDown.owed = operatorTwin.snapshot.preexistingTwinModified;
+      const systemHarness = await ops.standDownSystemHarnessForBrainRehome(uid);
+      if (!systemHarness.ok) {
+        return {
+          kind: "aborted",
+          stage: "operator-twin-stand-down",
+          reason:
+            `the system agent harness could not be verified stopped before Tier-M re-home ` +
+            `(${systemHarness.error}). No brain state was moved.`,
+          rolledBack: true,
+          rehomeAttempted: false,
+          accountCreated,
+        };
+      }
+      standDown.owed = standDown.owed || systemHarness.snapshot.preexistingJobModified;
       const rehomed = await ops.rehome(uid, uid);
       rehomeResults = rehomed.results;
+      const requiredMissing = missingRequiredTierMStrands(rehomeResults);
+      if (requiredMissing.length > 0) {
+        const restore = await safeRestore(ops, rehomeResults);
+        return {
+          kind: "aborted",
+          stage: "tier-m-brain-rehome",
+          reason:
+            `Tier-M brain re-home incomplete: required strand(s) missing: ${requiredMissing.join(", ")}. ` +
+            "Harness install refused; optional skips may continue, but required brain inventory cannot be armed as protected.",
+          rolledBack: restore.rolledBack,
+          backupPaths: restore.backupPaths,
+          conflictPaths: restore.conflictPaths,
+          failedPaths: restore.failedPaths,
+          rehomeAttempted: rehomeResults.some(rehomeResultMutated),
+          accountCreated,
+        };
+      }
+      const optionalMissing = optionalTierMSkips(rehomeResults);
+      if (optionalMissing.length > 0) {
+        ops.print(`Optional Tier-M brain item(s) absent and skipped: ${optionalMissing.join(", ")}.`);
+      }
       ops.print(`Re-homed ${rehomeResults.filter((r) => r.status === "moved").length} path(s) onto the new account.`);
     } catch (err) {
       // FIX R3 (HIGH, 2026-07-07 fix-round 2): a rehome failure can be a
@@ -1568,7 +1678,7 @@ async function runProvisionFlowSteps(
         // FIX (round 5 / R3-2): only "attempted" if a move actually landed;
         // an empty-partialResults rehome throw moved nothing, so the CLI
         // shows the neutral "nothing changed" frame, not a restore claim.
-        rehomeAttempted: partialResults.some((r) => r.status === "moved" || r.status === "destination-displaced"),
+        rehomeAttempted: partialResults.some(rehomeResultMutated),
         // FIX (round 5 / R4-2): create-account already succeeded by the time
         // re-home runs, so an orphaned hidden account exists even when nothing
         // moved -- the neutral frame must not claim "no account was created".
@@ -1612,7 +1722,7 @@ async function runProvisionFlowSteps(
       conflictPaths: td.conflictPaths,
       failedPaths: td.failedPaths,
       daemonTeardownFailed: td.daemonTeardownError !== undefined || td.policyDaemonTeardownError !== undefined,
-      rehomeAttempted: rehomeResults.some((r) => r.status === "moved" || r.status === "destination-displaced"),
+      rehomeAttempted: rehomeResults.some(rehomeResultMutated),
       accountCreated,
     };
   }
@@ -1656,7 +1766,7 @@ async function runProvisionFlowSteps(
       conflictPaths: td.conflictPaths,
       failedPaths: td.failedPaths,
       daemonTeardownFailed: td.daemonTeardownError !== undefined || td.policyDaemonTeardownError !== undefined,
-      rehomeAttempted: rehomeResults.some((r) => r.status === "moved" || r.status === "destination-displaced"),
+      rehomeAttempted: rehomeResults.some(rehomeResultMutated),
       accountCreated,
     };
   }
@@ -1670,7 +1780,7 @@ async function runProvisionFlowSteps(
   // operator a restore, handled once at the outcome chokepoint (see
   // `runProvisionFlow`). Recorded before the barrier assertion below so even
   // that abort restores.
-  standDown.owed = install.harnessStoodDown === true;
+  standDown.owed = standDown.owed || install.harnessStoodDown === true;
 
   // S5-6 BARRIER ASSERTION (fail-closed): in fine-grained mode the install
   // MUST have been the S5-5 PARKED form -- a bootstrapped (running) agent
@@ -1699,7 +1809,7 @@ async function runProvisionFlowSteps(
       conflictPaths: td.conflictPaths,
       failedPaths: td.failedPaths,
       daemonTeardownFailed: td.daemonTeardownError !== undefined || td.policyDaemonTeardownError !== undefined,
-      rehomeAttempted: rehomeResults.some((r) => r.status === "moved" || r.status === "destination-displaced"),
+      rehomeAttempted: rehomeResults.some(rehomeResultMutated),
       accountCreated,
     };
   }
@@ -1775,7 +1885,7 @@ async function runProvisionFlowSteps(
       failedPaths: td.failedPaths,
       daemonTeardownFailed:
         td.daemonTeardownError !== undefined || td.policyDaemonTeardownError !== undefined,
-      rehomeAttempted: rehomeResults.some((r) => r.status === "moved" || r.status === "destination-displaced"),
+      rehomeAttempted: rehomeResults.some(rehomeResultMutated),
       accountCreated,
     };
   }
@@ -1826,7 +1936,7 @@ async function runProvisionFlowSteps(
       conflictPaths: td.conflictPaths,
       failedPaths: td.failedPaths,
       daemonTeardownFailed: td.daemonTeardownError !== undefined || td.policyDaemonTeardownError !== undefined,
-      rehomeAttempted: rehomeResults.some((r) => r.status === "moved" || r.status === "destination-displaced"),
+      rehomeAttempted: rehomeResults.some(rehomeResultMutated),
       accountCreated,
     };
   }
@@ -1860,7 +1970,7 @@ async function runProvisionFlowSteps(
       conflictPaths: td.conflictPaths,
       failedPaths: td.failedPaths,
       daemonTeardownFailed: td.daemonTeardownError !== undefined || td.policyDaemonTeardownError !== undefined,
-      rehomeAttempted: rehomeResults.some((r) => r.status === "moved" || r.status === "destination-displaced"),
+      rehomeAttempted: rehomeResults.some(rehomeResultMutated),
       accountCreated,
     };
   }
@@ -1952,7 +2062,7 @@ async function runProvisionFlowSteps(
       wallMayBeArmed: wallMayBeArmed ? true : undefined,
       ...(nePreferenceOutcome !== undefined ? { disarmOutcome: nePreferenceOutcome } : {}),
       disarmObservedOff,
-      rehomeAttempted: rehomeResults.some((r) => r.status === "moved" || r.status === "destination-displaced"),
+      rehomeAttempted: rehomeResults.some(rehomeResultMutated),
       accountCreated,
     };
   }
@@ -2087,30 +2197,35 @@ async function runProvisionFlowSteps(
   // outcome is reported, stand down the operator-uid LaunchAgent this run
   // supersedes. Otherwise an unconfined twin can answer provider polls and
   // create a false "functional through the wall" result.
-  const operatorTwin = await ops.standDownOperatorTwin();
-  if (!operatorTwin.ok) {
-    return {
-      kind: "aborted",
-      stage: "operator-twin-stand-down",
-      reason:
-        `the operator-side agent LaunchAgent could not be stopped and disabled after the wall armed ` +
-        `(${operatorTwin.error}). Liveness was NOT checked, because the unconfined twin may still be able to answer.`,
-      rolledBack: false,
-      rehomeAttempted: true,
-      accountCreated,
-    };
+  if (operatorTwinStandDown.snapshot === undefined) {
+    const operatorTwin = await ops.standDownOperatorTwin();
+    if (!operatorTwin.ok) {
+      return {
+        kind: "aborted",
+        stage: "operator-twin-stand-down",
+        reason:
+          `the operator-side agent LaunchAgent could not be stopped and disabled after the wall armed ` +
+          `(${operatorTwin.error}). Liveness was NOT checked, because the unconfined twin may still be able to answer.`,
+        rolledBack: false,
+        rehomeAttempted: true,
+        accountCreated,
+      };
+    }
+    operatorTwinStandDown.snapshot = operatorTwin.snapshot;
+    operatorTwinStandDown.owed = operatorTwin.snapshot.preexistingTwinModified;
   }
-  operatorTwinStandDown.snapshot = operatorTwin.snapshot;
-  operatorTwinStandDown.owed = operatorTwin.snapshot.preexistingTwinModified;
 
   if (ctx.fineGrainedDeclared !== true) {
+    const armedUid = await observing(
+      "provision-orchestrate.armed",
+      () => armedUidFromVerifiedEgress(uid, egressVerify),
+    );
+    const liveness = await verifyCosLivenessAfterStandDown(ops);
+    standDown.owed = false;
     return {
       kind: "armed",
-      uid: await observing(
-        "provision-orchestrate.armed",
-        () => armedUidFromVerifiedEgress(uid, egressVerify),
-      ),
-      liveness: await verifyCosLivenessAfterStandDown(ops),
+      uid: armedUid,
+      liveness,
     };
   }
 
@@ -2325,7 +2440,7 @@ async function safeRestore(
       backupPaths: results.filter((r) => r.backupPath).map((r) => r.backupPath!),
       conflictPaths: [],
       failedPaths: results
-        .filter((r) => r.status === "moved" || r.status === "destination-displaced")
+        .filter(rehomeResultMutated)
         .map((r) => r.entry.sourcePath),
     };
   }

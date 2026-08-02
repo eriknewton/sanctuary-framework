@@ -9,11 +9,18 @@ import { describe, it, expect } from "vitest";
 
 import {
   planRehome,
+  planBrainRehome,
   executeRehomePlan,
+  executeBrainRehomePlan,
   restoreRehomeSteps,
+  summarizeBrainRehomeResults,
   hermesRehomeAdapter,
   RehomeExecutionError,
+  BrainRehomeJournalOpenError,
   type RehomeOps,
+  type BrainRehomeJournal,
+  type BrainRehomeOps,
+  type BrainRehomePathEntry,
   type AgentRehomeAdapter,
 } from "../../../src/castle-wall/provision/rehome.js";
 
@@ -137,6 +144,118 @@ function mockOps(
   };
 }
 
+function mockBrainOps(
+  existingPaths: Set<string>,
+  overrides: Partial<BrainRehomeOps> = {},
+): BrainRehomeOps & {
+  backups: string[];
+  sourceDuplicateRemovals: string[];
+  chowns: Array<{ path: string; uid: number; gid: number }>;
+  provenanceRecords: Array<{ sourcePath: string; destPath: string; placingRunId?: string }>;
+  removedPaths: string[];
+  contents: Map<string, string>;
+  journal?: BrainRehomeJournal;
+} {
+  const backups: string[] = [];
+  const sourceDuplicateRemovals: string[] = [];
+  const chowns: Array<{ path: string; uid: number; gid: number }> = [];
+  const provenanceRecords: Array<{ sourcePath: string; destPath: string; placingRunId?: string }> = [];
+  const removedPaths: string[] = [];
+  const contents = new Map<string, string>();
+  const ops: BrainRehomeOps & {
+    backups: string[];
+    sourceDuplicateRemovals: string[];
+    chowns: Array<{ path: string; uid: number; gid: number }>;
+    provenanceRecords: Array<{ sourcePath: string; destPath: string; placingRunId?: string }>;
+    removedPaths: string[];
+    contents: Map<string, string>;
+    journal?: BrainRehomeJournal;
+  } = {
+    backups,
+    sourceDuplicateRemovals,
+    chowns,
+    provenanceRecords,
+    removedPaths,
+    contents,
+    pathExists: async (path) => existingPaths.has(path),
+    pathExistsNoFollow: async (path) => existingPaths.has(path),
+    hashPath: async (path) => ({ algorithm: "sha256", value: contents.get(path) ?? `hash-${path}` }),
+    readDestinationProvenance: async () => undefined,
+    recordDestinationProvenance: async (sourcePath, destPath, record) => {
+      provenanceRecords.push({ sourcePath, destPath, placingRunId: record?.placingRunId });
+    },
+    clearDestinationProvenance: async () => {},
+    displaceDestination: async (destPath) => {
+      const displacedPath = `${destPath}.displaced-20260801T000000000Z`;
+      existingPaths.delete(destPath);
+      existingPaths.add(displacedPath);
+      contents.set(displacedPath, contents.get(destPath) ?? `hash-${destPath}`);
+      contents.delete(destPath);
+      return { displacedPath };
+    },
+    restoreDisplacedDestination: async () => ({ restored: true }),
+    backup: async (path) => {
+      const backupPath = `/root/.sanctuary-rehome-backups${path}.bak`;
+      backups.push(backupPath);
+      contents.set(backupPath, contents.get(path) ?? `hash-${path}`);
+      return { backupPath };
+    },
+    removeSourceDuplicate: async (path) => {
+      sourceDuplicateRemovals.push(path);
+      existingPaths.delete(path);
+      contents.delete(path);
+    },
+    restoreSourceDuplicate: async () => ({ restored: true }),
+    move: async (from, to) => {
+      existingPaths.delete(from);
+      existingPaths.add(to);
+      contents.set(to, contents.get(from) ?? `hash-${from}`);
+      contents.delete(from);
+    },
+    chown: async (path, uid, gid) => {
+      chowns.push({ path, uid, gid });
+      return { excludedPaths: [] };
+    },
+    restore: async () => ({ restored: true }),
+    restoreCustody: async () => {},
+    readBrainJournal: async () => ops.journal,
+    writeBrainJournal: async (journal) => {
+      ops.journal = JSON.parse(JSON.stringify(journal)) as BrainRehomeJournal;
+    },
+    clearBrainJournal: async () => {
+      ops.journal = undefined;
+    },
+    copyToStaging: async (sourcePath, stagingPath) => {
+      if (!existingPaths.has(sourcePath)) throw new Error(`missing source ${sourcePath}`);
+      existingPaths.add(stagingPath);
+      contents.set(stagingPath, contents.get(sourcePath) ?? `hash-${sourcePath}`);
+    },
+    removePath: async (path) => {
+      removedPaths.push(path);
+      existingPaths.delete(path);
+      contents.delete(path);
+    },
+    swapStagingIntoPlace: async (stagingPath, destPath) => {
+      if (!existingPaths.has(stagingPath)) throw new Error(`missing staging ${stagingPath}`);
+      existingPaths.delete(stagingPath);
+      existingPaths.add(destPath);
+      contents.set(destPath, contents.get(stagingPath) ?? `hash-${stagingPath}`);
+      contents.delete(stagingPath);
+    },
+    ...overrides,
+  };
+  return ops;
+}
+
+function singleBrainAdapter(entry: Omit<BrainRehomePathEntry, "tier">): AgentRehomeAdapter {
+  return {
+    harnessId: "test-brain",
+    pathsToRehome: () => [],
+    brainPathsToRehome: () => [{ ...entry, tier: "mind" }],
+    requiresInteractiveReconsent: () => false,
+  };
+}
+
 describe("castle-wall/provision/rehome", () => {
   describe("hermesRehomeAdapter", () => {
     it("enumerates the Mini2-D2-grounded runtime + file-based secret paths", () => {
@@ -161,6 +280,381 @@ describe("castle-wall/provision/rehome", () => {
 
     it("requires no interactive re-consent in v1 (file-portable Google refresh tokens, calendar:readonly scope)", () => {
       expect(hermesRehomeAdapter.requiresInteractiveReconsent()).toBe(false);
+    });
+
+    it("fail-before/pass-after: enumerates the field-proven Tier-M Hermes brain inventory", () => {
+      const entries = hermesRehomeAdapter.brainPathsToRehome?.(OPERATOR_HOME) ?? [];
+      const relPaths = entries.map((entry) => entry.relPath);
+
+      expect(relPaths).toEqual([
+        "SOUL.md",
+        "IDENTITY.md",
+        "memories",
+        "skills",
+        "sessions",
+        "state.db",
+        "kanban",
+        "workspace",
+        "cron",
+        "channel_directory.json",
+        "gateway_state.json",
+        ".skills_prompt_snapshot.json",
+        ".no-bundled-skills",
+      ]);
+      expect(entries.every((entry) => entry.tier === "mind")).toBe(true);
+      expect(entries.find((entry) => entry.relPath === "state.db")).toMatchObject({
+        kind: "file",
+        required: true,
+        isSecret: true,
+        largeObject: true,
+        stateDbFamily: true,
+      });
+      expect(entries.find((entry) => entry.relPath === ".no-bundled-skills")?.isSecret).toBe(false);
+    });
+  });
+
+  describe("executeBrainRehomePlan", () => {
+    it("fail-before/pass-after: Mini2 amnesia fixture moves SOUL.md into the agent home as Tier-M", async () => {
+      const adapter = singleBrainAdapter({
+        sourcePath: `${OPERATOR_HOME}/SOUL.md`,
+        destRelativePath: "SOUL.md",
+        relPath: "SOUL.md",
+        kind: "file",
+        required: true,
+        isSecret: true,
+        largeObject: false,
+      });
+      const plan = planBrainRehome(adapter, { operatorHome: OPERATOR_HOME, newAccountHome: NEW_ACCOUNT_HOME });
+      const src = `${OPERATOR_HOME}/SOUL.md`;
+      const dest = `${NEW_ACCOUNT_HOME}/SOUL.md`;
+      const ops = mockBrainOps(new Set([src]));
+      ops.contents.set(src, "agent-memory");
+
+      const results = await executeBrainRehomePlan(plan, ops, { uid: 502, gid: 502 }, { runId: "mini2" });
+
+      expect(results).toMatchObject([{ status: "moved", destPath: dest, backupPath: `/root/.sanctuary-rehome-backups${src}.bak` }]);
+      expect(await ops.pathExistsNoFollow(src)).toBe(false);
+      expect(await ops.pathExistsNoFollow(dest)).toBe(true);
+      expect(ops.contents.get(dest)).toBe("agent-memory");
+      expect(summarizeBrainRehomeResults(results).status).toBe("complete");
+    });
+
+    it("fail-before/pass-after: mid-copy state.db crash leaves source intact, destination clean, and journal as a manual breadcrumb", async () => {
+      const src = `${OPERATOR_HOME}/state.db`;
+      const dest = `${NEW_ACCOUNT_HOME}/state.db`;
+      const adapter = singleBrainAdapter({
+        sourcePath: src,
+        destRelativePath: "state.db",
+        relPath: "state.db",
+        kind: "file",
+        required: true,
+        isSecret: true,
+        largeObject: true,
+        stateDbFamily: true,
+      });
+      const plan = planBrainRehome(adapter, { operatorHome: OPERATOR_HOME, newAccountHome: NEW_ACCOUNT_HOME });
+      const ops = mockBrainOps(new Set([src]), {
+        copyToStaging: async () => {
+          throw new Error("crash after journal before staging");
+        },
+      });
+      ops.contents.set(src, "sqlite-main");
+
+      await expect(
+        executeBrainRehomePlan(plan, ops, { uid: 502, gid: 502 }, { runId: "crash" }),
+      ).rejects.toThrow(/crash after journal before staging/);
+
+      expect(await ops.pathExistsNoFollow(src)).toBe(true);
+      expect(await ops.pathExistsNoFollow(dest)).toBe(false);
+      expect(ops.removedPaths).toContain(`${dest}.sanctuary-brain-stage-crash`);
+      expect(ops.journal?.items[0]?.state).toBe("pending");
+    });
+
+    it("fail-before/pass-after: journal present refuses before any mutation and names manual recovery", async () => {
+      const src = `${OPERATOR_HOME}/SOUL.md`;
+      const dest = `${NEW_ACCOUNT_HOME}/SOUL.md`;
+      const staging = `${dest}.sanctuary-brain-stage-journal`;
+      const adapter = singleBrainAdapter({
+        sourcePath: src,
+        destRelativePath: "SOUL.md",
+        relPath: "SOUL.md",
+        kind: "file",
+        required: true,
+        isSecret: true,
+        largeObject: false,
+      });
+      const plan = planBrainRehome(adapter, { operatorHome: OPERATOR_HOME, newAccountHome: NEW_ACCOUNT_HOME });
+      const journalItem = {
+        relPath: "SOUL.md",
+        sourcePath: src,
+        destPath: dest,
+        stagingPath: staging,
+        kind: "file" as const,
+        required: true,
+        isSecret: true,
+        largeObject: false,
+        stateDbFamily: false,
+      };
+      const freshOps = mockBrainOps(new Set([src]));
+      freshOps.journal = {
+        schemaVersion: 1,
+        harnessId: "test-brain",
+        runId: "journal",
+        createdAt: "2026-08-01T00:00:00.000Z",
+        journalPath: "/Users/operator/.sanctuary/state/rehome-brain-journal.json",
+        items: [{ ...journalItem, state: "staged" as const }],
+      };
+
+      await expect(executeBrainRehomePlan(plan, freshOps, { uid: 502, gid: 502 })).rejects.toThrow(
+        BrainRehomeJournalOpenError,
+      );
+      await expect(executeBrainRehomePlan(plan, freshOps, { uid: 502, gid: 502 })).rejects.toThrow(
+        /rehome-brain-journal\.json.*manual.*sourcePath\/destPath\/stagingPath/i,
+      );
+
+      expect(freshOps.removedPaths).toEqual([]);
+      expect(freshOps.backups).toEqual([]);
+      expect(freshOps.chowns).toEqual([]);
+      expect(freshOps.provenanceRecords).toEqual([]);
+      expect(await freshOps.pathExistsNoFollow(src)).toBe(true);
+      expect(await freshOps.pathExistsNoFollow(staging)).toBe(false);
+    });
+
+    it("F-9 P0: records swapping in the journal before the staging rename can crash", async () => {
+      const src = `${OPERATOR_HOME}/state.db`;
+      const dest = `${NEW_ACCOUNT_HOME}/state.db`;
+      const adapter = singleBrainAdapter({
+        sourcePath: src,
+        destRelativePath: "state.db",
+        relPath: "state.db",
+        kind: "file",
+        required: true,
+        isSecret: true,
+        largeObject: true,
+        stateDbFamily: true,
+      });
+      const plan = planBrainRehome(adapter, { operatorHome: OPERATOR_HOME, newAccountHome: NEW_ACCOUNT_HOME });
+      const ops = mockBrainOps(new Set([src]), {
+        swapStagingIntoPlace: async () => {
+          throw new Error("crash during staging rename");
+        },
+      });
+      ops.contents.set(src, "sqlite-main");
+
+      await expect(
+        executeBrainRehomePlan(plan, ops, { uid: 502, gid: 502 }, { runId: "swap-crash" }),
+      ).rejects.toThrow(/crash during staging rename/);
+
+      expect(ops.journal?.items[0]?.state).toBe("swapping");
+    });
+
+    it("F-9 P0: stale Tier-M provenance without a destination is ignored on a fresh host", async () => {
+      const src = `${OPERATOR_HOME}/SOUL.md`;
+      const dest = `${NEW_ACCOUNT_HOME}/SOUL.md`;
+      const adapter = singleBrainAdapter({
+        sourcePath: src,
+        destRelativePath: "SOUL.md",
+        relPath: "SOUL.md",
+        kind: "file",
+        required: true,
+        isSecret: true,
+        largeObject: false,
+      });
+      const plan = planBrainRehome(adapter, { operatorHome: OPERATOR_HOME, newAccountHome: NEW_ACCOUNT_HOME });
+      const staleProvenanceOps = mockBrainOps(new Set([src]), {
+        readDestinationProvenance: async () => ({
+          schemaVersion: 2,
+          sourcePath: src,
+          destPath: dest,
+          destHash: { algorithm: "sha256", value: "placed-hash" },
+          placementHash: { algorithm: "sha256", value: "placed-hash" },
+          placingRunId: "placed-run",
+          recordedAt: "2026-08-01T00:00:00.000Z",
+        }),
+      });
+      staleProvenanceOps.contents.set(src, "operator-copy");
+
+      const results = await executeBrainRehomePlan(
+        plan,
+        staleProvenanceOps,
+        { uid: 502, gid: 502 },
+        { runId: "stale-provenance" },
+      );
+
+      expect(results).toMatchObject([{ status: "moved", destPath: dest }]);
+      expect(staleProvenanceOps.journal).toBeUndefined();
+      expect(staleProvenanceOps.backups).toEqual([`/root/.sanctuary-rehome-backups${src}.bak`]);
+      expect(staleProvenanceOps.provenanceRecords).toEqual([
+        { sourcePath: src, destPath: dest, placingRunId: "stale-provenance" },
+      ]);
+      expect(await staleProvenanceOps.pathExistsNoFollow(src)).toBe(false);
+      expect(await staleProvenanceOps.pathExistsNoFollow(dest)).toBe(true);
+      expect(staleProvenanceOps.contents.get(dest)).toBe("operator-copy");
+    });
+
+    it("F-9 P0: provenance plus an existing Tier-M destination refuses as already placed", async () => {
+      const src = `${OPERATOR_HOME}/SOUL.md`;
+      const dest = `${NEW_ACCOUNT_HOME}/SOUL.md`;
+      const adapter = singleBrainAdapter({
+        sourcePath: src,
+        destRelativePath: "SOUL.md",
+        relPath: "SOUL.md",
+        kind: "file",
+        required: true,
+        isSecret: true,
+        largeObject: false,
+      });
+      const plan = planBrainRehome(adapter, { operatorHome: OPERATOR_HOME, newAccountHome: NEW_ACCOUNT_HOME });
+      const provenanceOps = mockBrainOps(new Set([src, dest]), {
+        readDestinationProvenance: async () => ({
+          schemaVersion: 2,
+          sourcePath: src,
+          destPath: dest,
+          destHash: { algorithm: "sha256", value: "placed-hash" },
+          placementHash: { algorithm: "sha256", value: "placed-hash" },
+          placingRunId: "placed-run",
+          recordedAt: "2026-08-01T00:00:00.000Z",
+        }),
+      });
+      provenanceOps.contents.set(src, "operator-copy");
+      provenanceOps.contents.set(dest, "placed-hash");
+
+      await expect(
+        executeBrainRehomePlan(plan, provenanceOps, { uid: 502, gid: 502 }, { runId: "placed-provenance" }),
+      ).rejects.toThrow(/fresh-provision only.*existing Sanctuary placement provenance.*migration.*not supported yet/i);
+      expect(provenanceOps.journal).toBeUndefined();
+      expect(provenanceOps.backups).toEqual([]);
+      expect(await provenanceOps.pathExistsNoFollow(src)).toBe(true);
+    });
+
+    it("fail-before/pass-after: already-placed Tier-M host with an agent-side copy refuses before journal or mutation", async () => {
+      const src = `${OPERATOR_HOME}/SOUL.md`;
+      const dest = `${NEW_ACCOUNT_HOME}/SOUL.md`;
+      const adapter = singleBrainAdapter({
+        sourcePath: src,
+        destRelativePath: "SOUL.md",
+        relPath: "SOUL.md",
+        kind: "file",
+        required: true,
+        isSecret: true,
+        largeObject: false,
+      });
+      const plan = planBrainRehome(adapter, { operatorHome: OPERATOR_HOME, newAccountHome: NEW_ACCOUNT_HOME });
+
+      const agentCopyOps = mockBrainOps(new Set([src, dest]));
+      agentCopyOps.contents.set(src, "source-hash");
+      agentCopyOps.contents.set(dest, "destination-hash");
+      await expect(
+        executeBrainRehomePlan(plan, agentCopyOps, { uid: 502, gid: 502 }, { runId: "placed-copy" }),
+      ).rejects.toThrow(/existing agent-side copy.*migration.*not supported yet.*content-identical placement was not proven/is);
+      expect(agentCopyOps.journal).toBeUndefined();
+      expect(agentCopyOps.backups).toEqual([]);
+      expect(agentCopyOps.removedPaths).toEqual([]);
+      expect(await agentCopyOps.pathExistsNoFollow(src)).toBe(true);
+    });
+
+    it("fail-before/pass-after: state.db refuses when WAL or SHM sidecars remain after quiescence", async () => {
+      const src = `${OPERATOR_HOME}/state.db`;
+      const adapter = singleBrainAdapter({
+        sourcePath: src,
+        destRelativePath: "state.db",
+        relPath: "state.db",
+        kind: "file",
+        required: true,
+        isSecret: true,
+        largeObject: true,
+        stateDbFamily: true,
+      });
+      const plan = planBrainRehome(adapter, { operatorHome: OPERATOR_HOME, newAccountHome: NEW_ACCOUNT_HOME });
+      const walOps = mockBrainOps(new Set([src, `${src}-wal`]));
+      await expect(executeBrainRehomePlan(plan, walOps, { uid: 502, gid: 502 })).rejects.toThrow(
+        /state\.db sidecar still exists after quiescence/,
+      );
+      expect(walOps.journal).toBeUndefined();
+
+      const shmOps = mockBrainOps(new Set([src, `${src}-shm`]));
+      await expect(executeBrainRehomePlan(plan, shmOps, { uid: 502, gid: 502 })).rejects.toThrow(
+        /state\.db sidecar still exists after quiescence/,
+      );
+      expect(shmOps.journal).toBeUndefined();
+    });
+
+    it("F-9 P1: state.db sidecars are rechecked immediately before copy", async () => {
+      const src = `${OPERATOR_HOME}/state.db`;
+      const adapter = singleBrainAdapter({
+        sourcePath: src,
+        destRelativePath: "state.db",
+        relPath: "state.db",
+        kind: "file",
+        required: true,
+        isSecret: true,
+        largeObject: true,
+        stateDbFamily: true,
+      });
+      const plan = planBrainRehome(adapter, { operatorHome: OPERATOR_HOME, newAccountHome: NEW_ACCOUNT_HOME });
+      const existing = new Set([src]);
+      const ops = mockBrainOps(existing);
+      ops.contents.set(src, "sqlite-main");
+      let journalWritten = false;
+      let copyCalled = false;
+      const originalWriteJournal = ops.writeBrainJournal;
+      ops.writeBrainJournal = async (journal) => {
+        await originalWriteJournal(journal);
+        journalWritten = true;
+      };
+      ops.pathExistsNoFollow = async (path) => {
+        if (path === `${src}-wal`) return journalWritten;
+        return existing.has(path);
+      };
+      ops.copyToStaging = async () => {
+        copyCalled = true;
+      };
+
+      await expect(executeBrainRehomePlan(plan, ops, { uid: 502, gid: 502 })).rejects.toThrow(
+        /state\.db sidecar still exists after quiescence/,
+      );
+      expect(copyCalled).toBe(false);
+      expect(ops.journal).toBeDefined();
+    });
+
+    it("F-9 P1: state.db sidecars are rechecked immediately before swap", async () => {
+      const src = `${OPERATOR_HOME}/state.db`;
+      const dest = `${NEW_ACCOUNT_HOME}/state.db`;
+      const adapter = singleBrainAdapter({
+        sourcePath: src,
+        destRelativePath: "state.db",
+        relPath: "state.db",
+        kind: "file",
+        required: true,
+        isSecret: true,
+        largeObject: true,
+        stateDbFamily: true,
+      });
+      const plan = planBrainRehome(adapter, { operatorHome: OPERATOR_HOME, newAccountHome: NEW_ACCOUNT_HOME });
+      const existing = new Set([src]);
+      const ops = mockBrainOps(existing);
+      ops.contents.set(src, "sqlite-main");
+      let copyComplete = false;
+      let swapCalled = false;
+      ops.pathExistsNoFollow = async (path) => {
+        if (path === `${src}-wal`) return copyComplete;
+        return existing.has(path);
+      };
+      ops.copyToStaging = async (sourcePath, stagingPath) => {
+        copyComplete = true;
+        existing.add(stagingPath);
+        ops.contents.set(stagingPath, ops.contents.get(sourcePath) ?? `hash-${sourcePath}`);
+      };
+      ops.swapStagingIntoPlace = async () => {
+        swapCalled = true;
+      };
+
+      await expect(
+        executeBrainRehomePlan(plan, ops, { uid: 502, gid: 502 }, { runId: "late-wal" }),
+      ).rejects.toThrow(/state\.db sidecar still exists after quiescence/);
+
+      expect(swapCalled).toBe(false);
+      expect(await ops.pathExistsNoFollow(dest)).toBe(false);
     });
   });
 

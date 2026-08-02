@@ -50,7 +50,7 @@ import {
   writeFile,
   open,
 } from "node:fs/promises";
-import { basename, dirname, join, normalize as normalizePath, relative, resolve as pathResolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, normalize as normalizePath, relative, resolve as pathResolve, sep } from "node:path";
 import { resolve as dnsResolve } from "node:dns/promises";
 
 import {
@@ -58,7 +58,12 @@ import {
   deriveAgentAccountName,
   hermesRehomeAdapter,
   planRehome,
+  planBrainRehome,
   executeRehomePlan,
+  executeBrainRehomePlan,
+  assertNoOpenBrainRehomeJournal,
+  assertBrainRehomePreflight,
+  summarizeBrainRehomeResults,
   RehomeExecutionError,
   restoreRehomeSteps,
   resolveHermesGatewayArgv,
@@ -75,6 +80,9 @@ import {
   type DisarmNePreferenceOutcome,
   type ProvisionFlowOps,
   type ProvisionFlowOutcome,
+  type BrainRehomeJournal,
+  type BrainRehomeOps,
+  type BrainRehomeStepResult,
   type RehomeStepResult,
   type EndpointProbeTarget,
   type PolicyDaemonAction,
@@ -96,6 +104,7 @@ import {
   AccountUidEnumerationError,
   type AgentEgressVerifyReport,
 } from "../castle-wall/provision/index.js";
+import { openNoFollowPathWithinBase } from "../storage/custody-fs.js";
 import { resolveCastleWallSocketPath } from "../castle-wall/runtime/socket-path.js";
 import {
   AGENT_HARNESS_DAEMON_PLIST_PATH,
@@ -165,6 +174,11 @@ export const LAUNCHCTL_KILL_SIGNAL = "SIGKILL";
 /** Dedicated harness daemon logs must be writable by the agent uid, not the operator-only fortress. */
 export function resolveHarnessDaemonLogDir(newAccountHome: string): string {
   return `${newAccountHome.replace(/\/+$/, "")}/logs`;
+}
+
+/** Prospective dedicated account home used by account creation, preflight, and re-home. */
+export function resolveProvisionedAgentHome(accountName: string): string {
+  return `${NEW_ACCOUNT_HOME_BASE}/${accountName}`;
 }
 
 /**
@@ -1012,7 +1026,7 @@ export async function runAutoProvisionForWrap(
   const print = options.print ?? ((line: string) => console.error(line));
   const agentId = "hermes";
   const accountName = deriveAgentAccountName(agentId);
-  const newAccountHome = `${NEW_ACCOUNT_HOME_BASE}/${accountName}`;
+  const newAccountHome = resolveProvisionedAgentHome(accountName);
 
   // Privileged-path root check (matches the established pattern in
   // cli/castle-wall.ts's `setup-shared-dir` / `install-boot`: privileged
@@ -1267,6 +1281,11 @@ export async function runAutoProvisionForWrap(
         realAccountProvisionOps(),
       );
     },
+    preflightBrainRehome: async () => {
+      const rehomeOps = realRehomeOps({ fortressPath: wallFortressPath, newAccountHome });
+      const brainPlan = planBrainRehome(hermesRehomeAdapter, { operatorHome, newAccountHome });
+      await assertBrainRehomePreflight(brainPlan, rehomeOps as BrainRehomeOps);
+    },
     rehome: async (uid, gid) => {
       // FIX (round 5, item N1): the shared agent-home BASE
       // (`/var/sanctuary-agents`) must be root-owned and world-TRAVERSABLE
@@ -1274,9 +1293,10 @@ export async function runAutoProvisionForWrap(
       // listable/writable by non-root. Normalize it BEFORE the moves --
       // `move()`'s recursive mkdir would otherwise create it 0700 root-owned,
       // leaving the agent unable to even traverse into its own home.
+      const rehomeOps = realRehomeOps({ fortressPath: wallFortressPath, newAccountHome });
+      await assertNoOpenBrainRehomeJournal(rehomeOps as BrainRehomeOps);
       await mkdir(NEW_ACCOUNT_HOME_BASE, { recursive: true, mode: 0o711 });
       await chmod(NEW_ACCOUNT_HOME_BASE, 0o711);
-      const rehomeOps = realRehomeOps();
       const staleRuntimeConflictPath = await moveAsideStaleHermesRuntimeDestination(operatorHome, newAccountHome);
       if (staleRuntimeConflictPath !== undefined) {
         print(`Moved stale Hermes runtime destination aside at ${staleRuntimeConflictPath}.`);
@@ -1288,6 +1308,50 @@ export async function runAutoProvisionForWrap(
         { uid, gid },
         { overwriteDestination: options.overwriteDestination === true },
       );
+      const brainPlan = planBrainRehome(hermesRehomeAdapter, { operatorHome, newAccountHome });
+      let brainResults: BrainRehomeStepResult[];
+      try {
+        brainResults = await executeBrainRehomePlan(
+          brainPlan,
+          rehomeOps as BrainRehomeOps,
+          { uid, gid },
+        );
+      } catch (err) {
+        const partialBrainResults =
+          err instanceof RehomeExecutionError
+            ? (err.partialResults as BrainRehomeStepResult[]).map(brainRehomeResultToRehomeStepResult)
+            : [];
+        throw new RehomeExecutionError(
+          err instanceof Error ? err.message : String(err),
+          [...results, ...partialBrainResults],
+          { cause: err },
+        );
+      }
+      const brainSummary = summarizeBrainRehomeResults(brainResults);
+      if (brainResults.length > 0) {
+        const moved = brainResults.filter((r) => r.status === "moved").length;
+        const suffix =
+          brainSummary.status === "complete"
+            ? ""
+            : `; PARTIAL Tier-M brain move, missing: ${brainSummary.stranded.join(", ")}`;
+        print(`Re-homed ${moved} brain item(s) onto the new account${suffix}.`);
+        const optionalSkipped = brainResults
+          .filter((r) => r.entry.required !== true && r.status === "skipped-absent")
+          .map((r) => r.entry.relPath);
+        if (optionalSkipped.length > 0) {
+          print(`Optional Tier-M brain item(s) absent and skipped: ${optionalSkipped.join(", ")}.`);
+        }
+      }
+      const allResults: RehomeStepResult[] = [
+        ...results,
+        ...brainResults.map(brainRehomeResultToRehomeStepResult),
+      ];
+      if (brainSummary.status === "partial") {
+        throw new RehomeExecutionError(
+          `Tier-M brain re-home incomplete: required strand(s) missing: ${brainSummary.stranded.join(", ")}; refusing before harness install.`,
+          allResults,
+        );
+      }
       const perStepExcludedPaths = results.flatMap((r) => r.chownExcludedPaths ?? []);
       if (perStepExcludedPaths.length > 0) {
         print(`Excluded macOS data-vault path(s) during per-path re-home ownership: ${perStepExcludedPaths.join(", ")}.`);
@@ -1311,7 +1375,7 @@ export async function runAutoProvisionForWrap(
         // pattern) -- otherwise a plain throw here would reach the
         // orchestrator as an empty-partialResults abort and strand the moved
         // secrets under the new account with nothing restored.
-        throw new RehomeExecutionError(err instanceof Error ? err.message : String(err), results, { cause: err });
+        throw new RehomeExecutionError(err instanceof Error ? err.message : String(err), allResults, { cause: err });
       }
       // FIX (round 5 / R6-5): capture exactly the secret credentials that
       // MOVED (never skipped-absent), so the endpoint probes verify only what
@@ -1320,7 +1384,7 @@ export async function runAutoProvisionForWrap(
       credentialDestPathsToVerify = results
         .filter((r) => (r.status === "moved" || r.status === "destination-authoritative") && r.entry.isSecret)
         .map((r) => r.entry.destRelativePath);
-      return { plan, results };
+      return { plan, results: allResults };
     },
     installHarnessDaemon: async (uid) => {
       // FIX R1: capture the target uid/gid here (see the comment above the
@@ -1799,6 +1863,44 @@ export async function runAutoProvisionForWrap(
         return { ok: false as const, error: err instanceof Error ? err.message : String(err) };
       }
     },
+    standDownSystemHarnessForBrainRehome: async (uid) => {
+      try {
+        const resolved = await resolveHermesGatewayArgv(realHarnessArgvOps(), {
+          agentHome: newAccountHome,
+          agentUid: uid,
+          operatorHome,
+        });
+        const plan = planParkedHarnessInstall({
+          agentAccount: accountName,
+          agentUid: uid,
+          harnessLaunch: resolved.launch,
+          fortressPath: wallFortressPath,
+          logDir: resolveHarnessDaemonLogDir(newAccountHome),
+        });
+        const daemonOps = realHarnessDaemonOps();
+        const snapshot = await executeParkedHarnessInstall(plan, {
+          ...realParkedInstallRevertOps(daemonOps),
+          ensureHoldDir: ensureAgentHarnessHoldDir,
+          readFile: async (path) => {
+            try {
+              return await readFile(path, "utf8");
+            } catch (err) {
+              if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+              throw err;
+            }
+          },
+          writeFile: daemonOps.writeFile,
+          removeFile: daemonOps.removeFile,
+          runLaunchctl: daemonOps.runLaunchctl,
+          harnessStatus: () => agentHarnessDaemonStatus(daemonOps),
+          notify: (message) => print(message),
+        });
+        harnessStandDownSnapshot = snapshot;
+        return { ok: true as const, snapshot };
+      } catch (err) {
+        return { ok: false as const, error: err instanceof Error ? err.message : String(err) };
+      }
+    },
     restoreOperatorTwinStandDown: async (snapshot) => {
       const restored = await restoreOperatorTwinStandDown(snapshot, {
         readFile: async (path) => {
@@ -1922,10 +2024,14 @@ export async function runAutoProvisionForWrap(
       // `consoleOwnerGid` (below) are resolved from the SUDO-aware operator
       // identity, not the raw root identity `userInfo()` would otherwise
       // report -- see the `operatorIdentity` resolution above.
-      const restoreResult = await restoreRehomeSteps(results, realRehomeOps(), {
-        uid: consoleOwnerUid,
-        gid: consoleOwnerGid,
-      });
+      const restoreResult = await restoreRehomeSteps(
+        results,
+        realRehomeOps({ fortressPath: wallFortressPath, newAccountHome }),
+        {
+          uid: consoleOwnerUid,
+          gid: consoleOwnerGid,
+        },
+      );
       return {
         fullyRestored: restoreResult.fullyRestored,
         restoredCount: restoreResult.steps.filter((s) => s.status === "restored").length,
@@ -2227,12 +2333,105 @@ function rehomeProvenancePath(backupRoot: string, destPath: string): string {
   return `${backupRoot}/.provenance${destPath}.json`;
 }
 
-async function writeJsonRootOnly(path: string, value: unknown): Promise<void> {
-  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+async function fsyncDirectoryBestEffort(dir: string): Promise<void> {
+  let handle;
+  try {
+    handle = await open(dir, fsConstants.O_RDONLY);
+    await handle.sync();
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (!["EINVAL", "ENOTSUP", "EISDIR", "EPERM"].includes(code ?? "")) {
+      throw err;
+    }
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
+}
+
+function assertPathWithinBase(path: string, basePath: string): void {
+  const resolvedBase = pathResolve(basePath);
+  const resolvedPath = pathResolve(path);
+  const rel = relative(resolvedBase, resolvedPath);
+  if (rel === "" || (!rel.startsWith("..") && !isAbsolute(rel))) {
+    return;
+  }
+  throw new Error(`refusing to create ${resolvedPath}; it is outside the declared base ${resolvedBase}`);
+}
+
+async function ensureDirectoryNoFollowWithinBase(
+  leafDir: string,
+  basePath: string,
+  mode = 0o700,
+): Promise<void> {
+  await mkdir(basePath, { recursive: true, mode });
+  const resolvedBase = pathResolve(basePath);
+  const baseGuard = await openNoFollowPathWithinBase(resolvedBase, resolvedBase);
+  try {
+    await baseGuard.revalidate();
+  } finally {
+    await baseGuard.close();
+  }
+  const resolvedLeaf = pathResolve(leafDir);
+  assertPathWithinBase(resolvedLeaf, resolvedBase);
+  const relativeLeaf = relative(resolvedBase, resolvedLeaf);
+  const segments = relativeLeaf === "" ? [] : relativeLeaf.split(sep).filter((segment) => segment.length > 0);
+  let current = resolvedBase;
+  for (const segment of segments) {
+    const parentGuard = await openNoFollowPathWithinBase(current, resolvedBase);
+    try {
+      await parentGuard.revalidate();
+    } finally {
+      await parentGuard.close();
+    }
+    const next = join(current, segment);
+    try {
+      await mkdir(next, { mode });
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+    }
+    const childGuard = await openNoFollowPathWithinBase(next, resolvedBase);
+    try {
+      await childGuard.revalidate();
+    } finally {
+      await childGuard.close();
+    }
+    current = next;
+  }
+}
+
+async function writeJsonRootOnly(
+  path: string,
+  value: unknown,
+  opts: { basePath?: string } = {},
+): Promise<void> {
+  if (opts.basePath !== undefined) {
+    await ensureDirectoryNoFollowWithinBase(dirname(path), opts.basePath);
+  } else {
+    await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+  }
   const tmp = `${path}.tmp-${process.pid}-${randomUUID()}`;
-  await writeFile(tmp, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
-  await rename(tmp, path);
-  await chmod(path, 0o600);
+  let handle;
+  let cleanupTmp = true;
+  try {
+    handle = await open(
+      tmp,
+      fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
+      0o600,
+    );
+    await handle.chmod(0o600);
+    await handle.writeFile(`${JSON.stringify(value, null, 2)}\n`);
+    await handle.sync();
+    await handle.close();
+    handle = undefined;
+    await rename(tmp, path);
+    cleanupTmp = false;
+    await fsyncDirectoryBestEffort(dirname(path));
+  } finally {
+    await handle?.close().catch(() => undefined);
+    if (cleanupTmp) {
+      await rm(tmp, { force: true }).catch(() => undefined);
+    }
+  }
 }
 
 async function findUniqueDatedBackupRootPath(backupRoot: string, originalPath: string, label: string): Promise<string> {
@@ -2316,6 +2515,164 @@ async function pathExistsNoFollow(path: string): Promise<boolean> {
   } catch (err) {
     return (err as NodeJS.ErrnoException).code !== "ENOENT";
   }
+}
+
+function brainRehomeJournalPath(fortressPath: string): string {
+  return `${fortressPath.replace(/\/+$/, "")}/state/rehome-brain-journal.json`;
+}
+
+function invalidBrainRehomeJournal(path: string, reason: string): Error {
+  return new Error(
+    `Tier-M brain re-home journal at ${path} is corrupt or unparseable (${reason}); refusing to treat it as absent. ` +
+      "Recovery is manual: inspect the journal file, the agent-home destination tree, and the root-only re-home backups before removing it.",
+  );
+}
+
+function parseBrainRehomeJournal(raw: string, path: string): BrainRehomeJournal {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    throw invalidBrainRehomeJournal(path, err instanceof Error ? err.message : "invalid JSON");
+  }
+  if (parsed === null || typeof parsed !== "object") throw invalidBrainRehomeJournal(path, "expected object");
+  const record = parsed as Record<string, unknown>;
+  if (
+    record.schemaVersion !== 1 ||
+    typeof record.harnessId !== "string" ||
+    typeof record.runId !== "string" ||
+    typeof record.createdAt !== "string" ||
+    !Array.isArray(record.items)
+  ) {
+    throw invalidBrainRehomeJournal(path, "invalid header");
+  }
+  const items: BrainRehomeJournal["items"] = [];
+  for (const item of record.items) {
+    if (item === null || typeof item !== "object") throw invalidBrainRehomeJournal(path, "invalid item");
+    const row = item as Record<string, unknown>;
+    if (
+      typeof row.relPath !== "string" ||
+      typeof row.sourcePath !== "string" ||
+      typeof row.destPath !== "string" ||
+      typeof row.stagingPath !== "string" ||
+      (row.kind !== "file" && row.kind !== "dir") ||
+      typeof row.required !== "boolean" ||
+      typeof row.isSecret !== "boolean" ||
+      typeof row.largeObject !== "boolean" ||
+      typeof row.stateDbFamily !== "boolean" ||
+      (row.state !== "pending" &&
+        row.state !== "staged" &&
+        row.state !== "swapping" &&
+        row.state !== "swapped" &&
+        row.state !== "backed-up")
+    ) {
+      throw invalidBrainRehomeJournal(path, `invalid item for ${typeof row.relPath === "string" ? row.relPath : "<unknown>"}`);
+    }
+    items.push({
+      relPath: row.relPath,
+      sourcePath: row.sourcePath,
+      destPath: row.destPath,
+      stagingPath: row.stagingPath,
+      kind: row.kind,
+      required: row.required,
+      isSecret: row.isSecret,
+      largeObject: row.largeObject,
+      stateDbFamily: row.stateDbFamily,
+      state: row.state,
+      ...(typeof row.backupPath === "string" ? { backupPath: row.backupPath } : {}),
+    });
+  }
+  return {
+    schemaVersion: 1,
+    harnessId: record.harnessId,
+    runId: record.runId,
+    createdAt: record.createdAt,
+    items,
+    journalPath: path,
+  };
+}
+
+function serializeBrainRehomeJournal(journal: BrainRehomeJournal): unknown {
+  return {
+    schemaVersion: journal.schemaVersion,
+    harnessId: journal.harnessId,
+    runId: journal.runId,
+    createdAt: journal.createdAt,
+    items: journal.items.map((item) => ({
+      relPath: item.relPath,
+      sourcePath: item.sourcePath,
+      destPath: item.destPath,
+      stagingPath: item.stagingPath,
+      kind: item.kind,
+      required: item.required,
+      isSecret: item.isSecret,
+      largeObject: item.largeObject,
+      stateDbFamily: item.stateDbFamily,
+      state: item.state,
+      ...(item.backupPath !== undefined ? { backupPath: item.backupPath } : {}),
+    })),
+  };
+}
+
+function brainRehomeResultToRehomeStepResult(result: BrainRehomeStepResult): RehomeStepResult {
+  return {
+    entry: result.entry,
+    destPath: result.destPath,
+    status: result.status,
+    ...(result.backupPath !== undefined ? { backupPath: result.backupPath } : {}),
+    ...(result.sourceHash !== undefined ? { sourceHash: result.sourceHash } : {}),
+    ...(result.destinationHash !== undefined ? { destinationHash: result.destinationHash } : {}),
+  };
+}
+
+async function withNoFollowDestinationParent<T>(
+  destPath: string,
+  basePath: string | undefined,
+  fn: () => Promise<T>,
+): Promise<T> {
+  if (basePath === undefined) {
+    throw new Error("Tier-M re-home production ops require newAccountHome for ancestor containment");
+  }
+  await ensureDirectoryNoFollowWithinBase(dirname(destPath), basePath);
+  const guard = await openNoFollowPathWithinBase(dirname(destPath), basePath);
+  try {
+    await guard.revalidate();
+    const result = await fn();
+    await guard.revalidate();
+    return result;
+  } finally {
+    await guard.close();
+  }
+}
+
+async function removePathInsideNoFollowDestinationParent(path: string, newAccountHome: string | undefined): Promise<void> {
+  await withNoFollowDestinationParent(path, newAccountHome, async () => {
+    await rm(path, { recursive: true, force: true });
+  });
+}
+
+async function copyBrainPathToStaging(
+  sourcePath: string,
+  stagingPath: string,
+  owner: { uid: number; gid: number },
+  newAccountHome: string | undefined,
+): Promise<void> {
+  await withNoFollowDestinationParent(stagingPath, newAccountHome, async () => {
+    await rm(stagingPath, { recursive: true, force: true });
+    const sourceStat = await lstat(sourcePath);
+    if (sourceStat.isSymbolicLink()) {
+      await symlink(await readlink(sourcePath), stagingPath);
+      await lchown(stagingPath, owner.uid, owner.gid);
+    } else if (sourceStat.isDirectory()) {
+      await cp(sourcePath, stagingPath, { recursive: true });
+      await chmodRecursive(stagingPath);
+      await chownRecursive(stagingPath, owner.uid, owner.gid);
+    } else {
+      await copyFile(sourcePath, stagingPath);
+      await chmod(stagingPath, 0o600);
+      await fsChown(stagingPath, owner.uid, owner.gid);
+    }
+  });
 }
 
 async function readHarnessConfiguredUid(): Promise<number | undefined> {
@@ -2894,7 +3251,7 @@ async function chownRecursiveInner(path: string, uid: number, gid: number, exclu
  * could only document as a non-root-testable boundary. Production callers pass
  * no argument and get the root-only backup root unchanged.
  */
-export function realRehomeOps(opts?: { backupRoot?: string }) {
+export function realRehomeOps(opts?: { backupRoot?: string; fortressPath?: string; newAccountHome?: string }) {
   const backupRoot = opts?.backupRoot ?? "/var/root/.sanctuary-rehome-backups";
   return {
     pathExists,
@@ -2913,8 +3270,10 @@ export function realRehomeOps(opts?: { backupRoot?: string }) {
       const destHash = record.dest_hash;
       if (destHash === null || typeof destHash !== "object") return undefined;
       const hashRecord = destHash as Record<string, unknown>;
+      const schemaVersion: 1 | 2 | undefined =
+        record.schema_version === 2 ? 2 : record.schema_version === 1 ? 1 : undefined;
       if (
-        record.schema_version !== 1 ||
+        schemaVersion === undefined ||
         record.source_path !== sourcePath ||
         record.dest_path !== destPath ||
         hashRecord.algorithm !== "sha256" ||
@@ -2924,29 +3283,39 @@ export function realRehomeOps(opts?: { backupRoot?: string }) {
         return undefined;
       }
       return {
-        schemaVersion: 1 as const,
+        schemaVersion,
         sourcePath,
         destPath,
         destHash: { algorithm: "sha256" as const, value: hashRecord.value },
         recordedAt: record.recorded_at,
+        ...(typeof record.placing_run_id === "string" ? { placingRunId: record.placing_run_id } : {}),
+        placementHash: { algorithm: "sha256" as const, value: hashRecord.value },
       };
     },
-    recordDestinationProvenance: async (sourcePath: string, destPath: string): Promise<void> => {
-      const destHash = await hashPathNoFollow(destPath);
+    recordDestinationProvenance: async (
+      sourcePath: string,
+      destPath: string,
+      record?: { placingRunId?: string; destHash?: { algorithm: "sha256"; value: string }; recordedAt?: string },
+    ): Promise<void> => {
+      const destHash = record?.destHash ?? (await hashPathNoFollow(destPath));
+      const recordedAt = record?.recordedAt ?? new Date().toISOString();
       await writeJsonRootOnly(rehomeProvenancePath(backupRoot, destPath), {
-        schema_version: 1,
+        schema_version: 2,
         source_path: sourcePath,
         dest_path: destPath,
         dest_hash: destHash,
-        recorded_at: new Date().toISOString(),
-      });
+        placement_hash: destHash,
+        recorded_at: recordedAt,
+        placed_at: recordedAt,
+        placing_run_id: record?.placingRunId ?? `rehome-${formatRehomeTimestamp()}`,
+      }, { basePath: backupRoot });
     },
     clearDestinationProvenance: async (_sourcePath: string, destPath: string): Promise<void> => {
       await rm(rehomeProvenancePath(backupRoot, destPath), { force: true });
     },
     displaceDestination: async (destPath: string): Promise<{ displacedPath: string }> => {
       const displacedPath = await findUniqueDatedBackupRootPath(backupRoot, destPath, "displaced");
-      await mkdir(dirname(displacedPath), { recursive: true, mode: 0o700 });
+      await ensureDirectoryNoFollowWithinBase(dirname(displacedPath), backupRoot);
       await rename(destPath, displacedPath);
       return { displacedPath };
     },
@@ -2955,12 +3324,18 @@ export function realRehomeOps(opts?: { backupRoot?: string }) {
       destPath: string,
     ): Promise<{ restored: boolean; conflictPath?: string }> => {
       if (!(await pathExistsNoFollow(displacedPath))) return { restored: false };
-      await mkdir(dirname(destPath), { recursive: true, mode: 0o700 });
-      if (await pathExistsNoFollow(destPath)) {
-        return { restored: false, conflictPath: displacedPath };
+      const restore = async (): Promise<{ restored: boolean; conflictPath?: string }> => {
+        if (await pathExistsNoFollow(destPath)) {
+          return { restored: false, conflictPath: displacedPath };
+        }
+        await rename(displacedPath, destPath);
+        return { restored: await pathExistsNoFollow(destPath) };
+      };
+      if (opts?.newAccountHome !== undefined) {
+        return withNoFollowDestinationParent(destPath, opts.newAccountHome, restore);
       }
-      await rename(displacedPath, destPath);
-      return { restored: await pathExistsNoFollow(destPath) };
+      await ensureDirectoryNoFollowWithinBase(dirname(destPath), dirname(destPath));
+      return restore();
     },
     backup: async (path: string): Promise<{ backupPath: string }> => {
       // Fix M4: the pre-re-home secrets backup MUST be root-only (0600 for
@@ -2976,7 +3351,7 @@ export function realRehomeOps(opts?: { backupRoot?: string }) {
         return { backupPath: existing };
       }
       const backupPath = `${backupRoot}${path}.bak-${formatRehomeTimestamp()}-${sourceHash.value.slice(0, 16)}`;
-      await mkdir(dirname(backupPath), { recursive: true, mode: 0o700 });
+      await ensureDirectoryNoFollowWithinBase(dirname(backupPath), backupRoot);
       if (await pathExistsNoFollow(backupPath)) {
         throw new Error(`versioned re-home backup path already exists, refusing to overwrite: ${backupPath}`);
       }
@@ -3036,6 +3411,46 @@ export function realRehomeOps(opts?: { backupRoot?: string }) {
     move: async (sourcePath: string, destPath: string): Promise<void> => {
       await mkdir(dirname(destPath), { recursive: true, mode: 0o700 });
       await rename(sourcePath, destPath);
+    },
+    readBrainJournal: async (): Promise<BrainRehomeJournal | undefined> => {
+      if (opts?.fortressPath === undefined) return undefined;
+      const journalPath = brainRehomeJournalPath(opts.fortressPath);
+      try {
+        return parseBrainRehomeJournal(await readFile(journalPath, "utf8"), journalPath);
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+        throw err;
+      }
+    },
+    writeBrainJournal: async (journal: BrainRehomeJournal): Promise<void> => {
+      if (opts?.fortressPath === undefined) {
+        throw new Error("Tier-M re-home production ops require fortressPath for the durable journal");
+      }
+      await writeJsonRootOnly(brainRehomeJournalPath(opts.fortressPath), serializeBrainRehomeJournal(journal), {
+        basePath: opts.fortressPath,
+      });
+    },
+    clearBrainJournal: async (): Promise<void> => {
+      if (opts?.fortressPath === undefined) return;
+      const journalPath = brainRehomeJournalPath(opts.fortressPath);
+      await rm(journalPath, { force: true });
+      await fsyncDirectoryBestEffort(dirname(journalPath));
+    },
+    copyToStaging: async (
+      sourcePath: string,
+      stagingPath: string,
+      _entry: unknown,
+      owner: { uid: number; gid: number },
+    ): Promise<void> => {
+      await copyBrainPathToStaging(sourcePath, stagingPath, owner, opts?.newAccountHome);
+    },
+    removePath: async (path: string): Promise<void> => {
+      await removePathInsideNoFollowDestinationParent(path, opts?.newAccountHome);
+    },
+    swapStagingIntoPlace: async (stagingPath: string, destPath: string): Promise<void> => {
+      await withNoFollowDestinationParent(destPath, opts?.newAccountHome, async () => {
+        await rename(stagingPath, destPath);
+      });
     },
     chown: async (path: string, uid: number, gid: number): Promise<{ excludedPaths: string[] }> => {
       return chownRecursive(path, uid, gid);

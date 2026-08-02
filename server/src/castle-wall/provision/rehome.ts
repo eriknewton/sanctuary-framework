@@ -36,8 +36,32 @@ export interface RehomePathEntry {
   sourcePath: string;
   /** Path relative to the new account's home directory. */
   destRelativePath: string;
+  /**
+   * Inventory tier. Existing entries are Tier K (keys/config). Tier M (mind)
+   * entries are moved only by the journaled copy-verify-swap executor below.
+   */
+  tier?: "keys" | "mind";
+  /** Stable inventory-relative path. Required for Tier M journal/result rows. */
+  relPath?: string;
+  /** Declared filesystem kind. Required for Tier M; optional for legacy Tier K. */
+  kind?: "file" | "dir";
+  /** Whether absence is a non-green brain outcome. Required for Tier M. */
+  required?: boolean;
   /** Whether this is a secret (drives backup mode / encryption requirements). */
   isSecret: boolean;
+  /** Large objects use staging/copy verification and are named in crash tests. */
+  largeObject?: boolean;
+  /** True for the SQLite state.db family entry. */
+  stateDbFamily?: boolean;
+}
+
+export interface BrainRehomePathEntry extends RehomePathEntry {
+  tier: "mind";
+  relPath: string;
+  kind: "file" | "dir";
+  required: boolean;
+  isSecret: boolean;
+  largeObject: boolean;
 }
 
 /** Content hash for conflict diagnostics and destination provenance. */
@@ -48,11 +72,15 @@ export interface RehomePathHash {
 
 /** Root-owned proof that Sanctuary previously moved this source to this destination. */
 export interface RehomeDestinationProvenance {
-  schemaVersion: 1;
+  schemaVersion: 1 | 2;
   sourcePath: string;
   destPath: string;
   destHash: RehomePathHash;
   recordedAt: string;
+  /** v2: stable id for the Sanctuary run that placed this destination. */
+  placingRunId?: string;
+  /** v2: placement-time hash, repeated explicitly for divergence-matrix reads. */
+  placementHash?: RehomePathHash;
 }
 
 /** Result of a recursive ownership change; excluded paths are reported, never silent. */
@@ -70,6 +98,12 @@ export interface AgentRehomeAdapter {
    * the filesystem itself (existence-checking happens in `planRehome`).
    */
   pathsToRehome(operatorHome: string): RehomePathEntry[];
+  /**
+   * Tier M operating-mind inventory. Separate from {@link pathsToRehome} so
+   * the existing key/config move cannot accidentally apply rename semantics to
+   * live brain state.
+   */
+  brainPathsToRehome?(operatorHome: string): BrainRehomePathEntry[];
   /**
    * Whether this harness has ANY re-consent step that only a human can drive
    * (e.g. an OAuth scope upgrade the platform forces on account change).
@@ -90,7 +124,11 @@ export interface RehomeOps {
   /** Read root-owned provenance for an already-rehomed destination, if present and parseable. */
   readDestinationProvenance(sourcePath: string, destPath: string): Promise<RehomeDestinationProvenance | undefined>;
   /** Record root-owned provenance after a successful move to the destination. */
-  recordDestinationProvenance(sourcePath: string, destPath: string): Promise<void>;
+  recordDestinationProvenance(
+    sourcePath: string,
+    destPath: string,
+    record?: { placingRunId?: string; destHash?: RehomePathHash; recordedAt?: string },
+  ): Promise<void>;
   /** Clear provenance when rollback removes the moved destination. */
   clearDestinationProvenance(sourcePath: string, destPath: string): Promise<void>;
   /** Preserve an occupied destination as a dated sibling before an explicit overwrite. */
@@ -210,7 +248,11 @@ function joinPosix(base: string, rel: string): string {
 export interface RehomeStepResult {
   entry: RehomePathEntry;
   destPath: string;
-  status: "moved" | "skipped-absent" | "destination-authoritative" | "destination-displaced";
+  status:
+    | "moved"
+    | "skipped-absent"
+    | "destination-authoritative"
+    | "destination-displaced";
   backupPath?: string;
   displacedDestinationPath?: string;
   sourceDuplicateRemoved?: boolean;
@@ -247,6 +289,396 @@ export interface ExecuteRehomePlanOptions {
   overwriteDestination?: boolean;
 }
 
+export interface BrainRehomeStep {
+  entry: BrainRehomePathEntry;
+  destPath: string;
+}
+
+export interface BrainRehomePlan {
+  harnessId: string;
+  steps: BrainRehomeStep[];
+}
+
+export type BrainRehomeStepStatus =
+  | "moved"
+  | "skipped-absent";
+
+export interface BrainRehomeStepResult {
+  entry: BrainRehomePathEntry;
+  destPath: string;
+  status: BrainRehomeStepStatus;
+  backupPath?: string;
+  sourceHash?: RehomePathHash;
+  destinationHash?: RehomePathHash;
+  placementRunId?: string;
+}
+
+export interface BrainRehomeSummary {
+  status: "complete" | "partial";
+  results: BrainRehomeStepResult[];
+  stranded: string[];
+}
+
+export type BrainRehomeJournalItemState = "pending" | "staged" | "swapping" | "swapped" | "backed-up";
+
+export interface BrainRehomeJournalItem {
+  relPath: string;
+  sourcePath: string;
+  destPath: string;
+  stagingPath: string;
+  kind: BrainRehomePathEntry["kind"];
+  required: boolean;
+  isSecret: boolean;
+  largeObject: boolean;
+  stateDbFamily: boolean;
+  state: BrainRehomeJournalItemState;
+  backupPath?: string;
+}
+
+export interface BrainRehomeJournal {
+  schemaVersion: 1;
+  harnessId: string;
+  runId: string;
+  createdAt: string;
+  items: BrainRehomeJournalItem[];
+  /** Operator-facing path to inspect when a prior journal blocks fresh work. */
+  journalPath?: string;
+}
+
+export interface BrainRehomeOps extends RehomeOps {
+  readBrainJournal(): Promise<BrainRehomeJournal | undefined>;
+  writeBrainJournal(journal: BrainRehomeJournal): Promise<void>;
+  clearBrainJournal(): Promise<void>;
+  copyToStaging(sourcePath: string, stagingPath: string, entry: BrainRehomePathEntry, owner: { uid: number; gid: number }): Promise<void>;
+  removePath(path: string): Promise<void>;
+  swapStagingIntoPlace(stagingPath: string, destPath: string): Promise<void>;
+}
+
+export interface ExecuteBrainRehomeOptions {
+  runId?: string;
+  now?: () => Date;
+}
+
+export class BrainRehomeJournalOpenError extends Error {
+  constructor(journal?: BrainRehomeJournal) {
+    super(
+      describeBrainJournalManualRecovery(journal?.journalPath),
+    );
+    this.name = "BrainRehomeJournalOpenError";
+  }
+}
+
+function describeBrainJournalManualRecovery(journalPath?: string): string {
+  const pathText = journalPath ?? "the Tier-M brain re-home journal path";
+  return (
+    `Tier-M brain re-home journal exists at ${pathText}; refusing fresh work and never auto-resuming. ` +
+    "Recovery is manual: inspect the journal items, their sourcePath/destPath/stagingPath fields, " +
+    "the agent-home destination tree, and the root-only re-home backups before removing the journal."
+  );
+}
+
+export async function assertNoOpenBrainRehomeJournal(
+  ops: Pick<BrainRehomeOps, "readBrainJournal">,
+): Promise<void> {
+  const openJournal = await ops.readBrainJournal();
+  if (openJournal !== undefined) {
+    throw new BrainRehomeJournalOpenError(openJournal);
+  }
+}
+
+type BrainRehomePreflightOps = Pick<
+  BrainRehomeOps,
+  "readBrainJournal" | "pathExistsNoFollow" | "readDestinationProvenance" | "hashPath"
+>;
+
+/**
+ * Read-only Tier-M refusal gate for fresh provisioning. It mirrors the
+ * destination/journal checks inside {@link executeBrainRehomePlan}, but performs
+ * no journal writes, backups, copies, removals, ownership changes, or provenance
+ * writes, so the orchestrator can run it before account creation or stand-down.
+ */
+export async function assertBrainRehomePreflight(
+  plan: BrainRehomePlan,
+  ops: BrainRehomePreflightOps,
+): Promise<void> {
+  await assertNoOpenBrainRehomeJournal(ops);
+  for (const step of plan.steps) {
+    await assertStateDbFamilyQuiescent(step, ops);
+    const destinationExists = await ops.pathExistsNoFollow(step.destPath);
+    const provenance = destinationExists
+      ? await ops.readDestinationProvenance(step.entry.sourcePath, step.destPath)
+      : undefined;
+    const sourceExists = await ops.pathExistsNoFollow(step.entry.sourcePath);
+    if (destinationExists) {
+      let sourceHash: RehomePathHash | undefined;
+      let destinationHash: RehomePathHash | undefined;
+      if (sourceExists) sourceHash = await ops.hashPath(step.entry.sourcePath);
+      destinationHash = await ops.hashPath(step.destPath);
+      throw new Error(
+        alreadyPlacedBrainRehomeMessage({
+          relPath: step.entry.relPath,
+          sourcePath: step.entry.sourcePath,
+          destPath: step.destPath,
+          hasProvenance: provenance !== undefined,
+          sourceHash,
+          destinationHash,
+        }),
+      );
+    }
+    if (!sourceExists) {
+      const sidecars = stateDbSidecarPaths(step.entry.sourcePath);
+      if (
+        step.entry.stateDbFamily === true &&
+        ((await ops.pathExistsNoFollow(sidecars.shm)) || (await ops.pathExistsNoFollow(sidecars.wal)))
+      ) {
+        throw new Error(
+          `state.db family is incomplete: sidecar exists but ${step.entry.sourcePath} is absent; refusing Tier-M re-home`,
+        );
+      }
+    }
+  }
+}
+
+export function planBrainRehome(
+  adapter: AgentRehomeAdapter,
+  options: { operatorHome: string; newAccountHome: string },
+): BrainRehomePlan {
+  const entries = adapter.brainPathsToRehome?.(options.operatorHome) ?? [];
+  return {
+    harnessId: adapter.harnessId,
+    steps: entries.map((entry) => ({
+      entry,
+      destPath: joinPosix(options.newAccountHome, entry.destRelativePath),
+    })),
+  };
+}
+
+export function summarizeBrainRehomeResults(results: BrainRehomeStepResult[]): BrainRehomeSummary {
+  const stranded = results
+    .filter((result) => {
+      if (result.status === "moved") return false;
+      return result.entry.required;
+    })
+    .map((result) => result.entry.relPath);
+  return {
+    status: stranded.length === 0 ? "complete" : "partial",
+    results,
+    stranded,
+  };
+}
+
+function stateDbSidecarPaths(path: string): { wal: string; shm: string } {
+  return { wal: `${path}-wal`, shm: `${path}-shm` };
+}
+
+async function assertStateDbFamilyQuiescent(
+  step: BrainRehomeStep,
+  ops: Pick<BrainRehomeOps, "pathExistsNoFollow">,
+): Promise<void> {
+  if (step.entry.stateDbFamily !== true) return;
+  const sourceSidecars = stateDbSidecarPaths(step.entry.sourcePath);
+  const destSidecars = stateDbSidecarPaths(step.destPath);
+  const sourceWal = await ops.pathExistsNoFollow(sourceSidecars.wal);
+  const sourceShm = await ops.pathExistsNoFollow(sourceSidecars.shm);
+  const destWal = await ops.pathExistsNoFollow(destSidecars.wal);
+  const destShm = await ops.pathExistsNoFollow(destSidecars.shm);
+  if (sourceWal || sourceShm || destWal || destShm) {
+    throw new Error(
+      `state.db sidecar still exists after quiescence (${[
+        sourceWal ? sourceSidecars.wal : undefined,
+        sourceShm ? sourceSidecars.shm : undefined,
+        destWal ? destSidecars.wal : undefined,
+        destShm ? destSidecars.shm : undefined,
+      ].filter(Boolean).join(", ")}); refusing Tier-M re-home until SQLite is checkpointed`,
+    );
+  }
+}
+
+function journalItemFor(journal: BrainRehomeJournal, relPath: string): BrainRehomeJournalItem {
+  const item = journal.items.find((candidate) => candidate.relPath === relPath);
+  if (item === undefined) {
+    throw new Error(`Tier-M journal is missing item ${relPath}`);
+  }
+  return item;
+}
+
+async function writeJournalItemState(
+  ops: BrainRehomeOps,
+  journal: BrainRehomeJournal,
+  relPath: string,
+  state: BrainRehomeJournalItemState,
+  patch: Partial<BrainRehomeJournalItem> = {},
+): Promise<void> {
+  const item = journalItemFor(journal, relPath);
+  Object.assign(item, patch, { state });
+  await ops.writeBrainJournal(journal);
+}
+
+async function backupAndRemoveBrainSource(
+  ops: BrainRehomeOps,
+  sourcePath: string,
+): Promise<string | undefined> {
+  if (!(await ops.pathExistsNoFollow(sourcePath))) return undefined;
+  const backup = await ops.backup(sourcePath);
+  await ops.removeSourceDuplicate(sourcePath);
+  return backup.backupPath;
+}
+
+function freshBrainJournal(
+  plan: BrainRehomePlan,
+  steps: BrainRehomeStep[],
+  runId: string,
+  now: Date,
+): BrainRehomeJournal {
+  return {
+    schemaVersion: 1,
+    harnessId: plan.harnessId,
+    runId,
+    createdAt: now.toISOString(),
+    items: steps.map((step) => ({
+      relPath: step.entry.relPath,
+      sourcePath: step.entry.sourcePath,
+      destPath: step.destPath,
+      stagingPath: `${step.destPath}.sanctuary-brain-stage-${runId}`,
+      kind: step.entry.kind,
+      required: step.entry.required,
+      isSecret: step.entry.isSecret,
+      largeObject: step.entry.largeObject,
+      stateDbFamily: step.entry.stateDbFamily === true,
+      state: "pending",
+    })),
+  };
+}
+
+export async function executeBrainRehomePlan(
+  plan: BrainRehomePlan,
+  ops: BrainRehomeOps,
+  newAccountUidGid: { uid: number; gid: number },
+  options: ExecuteBrainRehomeOptions = {},
+): Promise<BrainRehomeStepResult[]> {
+  const openJournal = await ops.readBrainJournal();
+  if (openJournal !== undefined) {
+    throw new BrainRehomeJournalOpenError(openJournal);
+  }
+
+  const results: BrainRehomeStepResult[] = [];
+  const candidateSteps: BrainRehomeStep[] = [];
+  for (const step of plan.steps) {
+    await assertStateDbFamilyQuiescent(step, ops);
+    const destinationExists = await ops.pathExistsNoFollow(step.destPath);
+    const provenance = destinationExists
+      ? await ops.readDestinationProvenance(step.entry.sourcePath, step.destPath)
+      : undefined;
+    const sourceExists = await ops.pathExistsNoFollow(step.entry.sourcePath);
+    if (destinationExists) {
+      let sourceHash: RehomePathHash | undefined;
+      let destinationHash: RehomePathHash | undefined;
+      if (sourceExists) sourceHash = await ops.hashPath(step.entry.sourcePath);
+      if (destinationExists) destinationHash = await ops.hashPath(step.destPath);
+      throw new Error(
+        alreadyPlacedBrainRehomeMessage({
+          relPath: step.entry.relPath,
+          sourcePath: step.entry.sourcePath,
+          destPath: step.destPath,
+          hasProvenance: provenance !== undefined,
+          sourceHash,
+          destinationHash,
+        }),
+      );
+    }
+    if (!sourceExists) {
+      const sidecars = stateDbSidecarPaths(step.entry.sourcePath);
+      if (
+        step.entry.stateDbFamily === true &&
+        ((await ops.pathExistsNoFollow(sidecars.shm)) || (await ops.pathExistsNoFollow(sidecars.wal)))
+      ) {
+        throw new Error(
+          `state.db family is incomplete: sidecar exists but ${step.entry.sourcePath} is absent; refusing Tier-M re-home`,
+        );
+      }
+      results.push({ entry: step.entry, destPath: step.destPath, status: "skipped-absent" });
+      continue;
+    }
+    candidateSteps.push(step);
+  }
+  if (candidateSteps.length === 0) return results;
+
+  const runId = options.runId ?? `brain-${Date.now().toString(36)}`;
+  const journal = freshBrainJournal(plan, candidateSteps, runId, (options.now ?? (() => new Date()))());
+  await ops.writeBrainJournal(journal);
+
+  try {
+    for (const step of candidateSteps) {
+      const item = journalItemFor(journal, step.entry.relPath);
+      const sourceHash = await ops.hashPath(step.entry.sourcePath);
+      await ops.removePath(item.stagingPath);
+      await assertStateDbFamilyQuiescent(step, ops);
+      const destinationExists = await ops.pathExistsNoFollow(step.destPath);
+      const provenance = destinationExists
+        ? await ops.readDestinationProvenance(step.entry.sourcePath, step.destPath)
+        : undefined;
+      if (destinationExists) {
+        throw new Error(
+          alreadyPlacedBrainRehomeMessage({
+            relPath: step.entry.relPath,
+            sourcePath: step.entry.sourcePath,
+            destPath: step.destPath,
+            hasProvenance: provenance !== undefined,
+            sourceHash,
+            destinationHash: destinationExists ? await ops.hashPath(step.destPath) : undefined,
+          }),
+        );
+      }
+      await ops.copyToStaging(step.entry.sourcePath, item.stagingPath, step.entry, newAccountUidGid);
+      const stagedHash = await ops.hashPath(item.stagingPath);
+      if (!hashesMatch(sourceHash, stagedHash)) {
+        throw new Error(
+          `Tier-M copy verification failed for ${step.entry.relPath}: source ${sourceHash.algorithm}:${sourceHash.value} ` +
+            `!= staged ${stagedHash.algorithm}:${stagedHash.value}`,
+        );
+      }
+      await writeJournalItemState(ops, journal, step.entry.relPath, "staged");
+      await assertStateDbFamilyQuiescent(step, ops);
+      await writeJournalItemState(ops, journal, step.entry.relPath, "swapping");
+      await ops.swapStagingIntoPlace(item.stagingPath, step.destPath);
+      const destinationHash = await ops.hashPath(step.destPath);
+      if (!hashesMatch(sourceHash, destinationHash)) {
+        throw new Error(
+          `Tier-M swap verification failed for ${step.entry.relPath}: source ${sourceHash.algorithm}:${sourceHash.value} ` +
+            `!= destination ${destinationHash.algorithm}:${destinationHash.value}`,
+        );
+      }
+      await writeJournalItemState(ops, journal, step.entry.relPath, "swapped");
+      const backupPath = await backupAndRemoveBrainSource(ops, step.entry.sourcePath);
+      await writeJournalItemState(ops, journal, step.entry.relPath, "backed-up", { backupPath });
+      await ops.chown(step.destPath, newAccountUidGid.uid, newAccountUidGid.gid);
+      await ops.recordDestinationProvenance(step.entry.sourcePath, step.destPath, {
+        placingRunId: journal.runId,
+        destHash: destinationHash,
+      });
+      results.push({
+        entry: step.entry,
+        destPath: step.destPath,
+        status: "moved",
+        backupPath,
+        sourceHash,
+        destinationHash,
+        placementRunId: journal.runId,
+      });
+    }
+    await ops.clearBrainJournal();
+    return results;
+  } catch (err) {
+    for (const step of candidateSteps) {
+      const item = journal.items.find((candidate) => candidate.relPath === step.entry.relPath);
+      if (item !== undefined && (item.state === "pending" || item.state === "staged")) {
+        await ops.removePath(item.stagingPath).catch(() => undefined);
+      }
+    }
+    throw new RehomeExecutionError(err instanceof Error ? err.message : String(err), results, { cause: err });
+  }
+}
+
 function provenanceMatchesDestination(
   provenance: RehomeDestinationProvenance | undefined,
   sourcePath: string,
@@ -254,7 +686,8 @@ function provenanceMatchesDestination(
   destHash: RehomePathHash,
 ): boolean {
   return (
-    provenance?.schemaVersion === 1 &&
+    provenance !== undefined &&
+    (provenance.schemaVersion === 1 || provenance.schemaVersion === 2) &&
     provenance.sourcePath === sourcePath &&
     provenance.destPath === destPath &&
     provenance.destHash.algorithm === destHash.algorithm &&
@@ -276,8 +709,34 @@ function destinationConflictMessage(
   return (
     `re-home destination conflict: source ${sourcePath} (${sourceHash.algorithm}:${sourceHash.value}) ` +
     `and destination ${destPath} (${destHash.algorithm}:${destHash.value}) both exist, but ${reason}; ` +
-    "refusing before backup/move. " +
+    "refusing before backup/move because content-identical placement was not proven. " +
     "Re-run with --overwrite-destination to preserve the destination as a dated sibling and move the source anyway."
+  );
+}
+
+function alreadyPlacedBrainRehomeMessage(input: {
+  relPath: string;
+  sourcePath: string;
+  destPath: string;
+  hasProvenance: boolean;
+  sourceHash?: RehomePathHash;
+  destinationHash?: RehomePathHash;
+}): string {
+  const hashDetail =
+    input.sourceHash !== undefined && input.destinationHash !== undefined
+      ? ` Source ${input.sourcePath} is ${input.sourceHash.algorithm}:${input.sourceHash.value}; ` +
+        `destination ${input.destPath} is ${input.destinationHash.algorithm}:${input.destinationHash.value}; ` +
+        "content-identical placement was not proven as a supported migration path."
+      : input.destinationHash !== undefined
+        ? ` Destination ${input.destPath} is ${input.destinationHash.algorithm}:${input.destinationHash.value}.`
+        : "";
+  const evidence = input.hasProvenance
+    ? "existing Sanctuary placement provenance"
+    : "an existing agent-side copy";
+  return (
+    `Tier-M brain re-home is fresh-provision only: ${input.relPath} already has ${evidence} at ${input.destPath}. ` +
+    "Migration of an already-provisioned host is not supported yet; refusing before backup, copy, install, or arm." +
+    hashDetail
   );
 }
 
@@ -348,7 +807,8 @@ export async function executeRehomePlan(
                 step.destPath,
                 sourceHash,
                 destinationHash,
-                "Sanctuary re-home provenance marks the destination as previously re-homed, but the current source and destination hashes diverge",
+                `Sanctuary re-home provenance schema v${provenance?.schemaVersion ?? "unknown"} ` +
+                  "marks the destination as previously re-homed, but the current source and destination content hashes diverge",
               ),
             );
           }
@@ -746,6 +1206,46 @@ export const hermesRehomeAdapter: AgentRehomeAdapter = {
         destRelativePath: ".hermes/google-mcp-creds",
         isSecret: true,
       },
+    ];
+  },
+  brainPathsToRehome(operatorHome: string): BrainRehomePathEntry[] {
+    const join = (...parts: string[]): string => `${operatorHome}/${parts.join("/")}`.replace(/\/+/g, "/");
+    const file = (relPath: string, options: Partial<BrainRehomePathEntry> = {}): BrainRehomePathEntry => ({
+      tier: "mind",
+      relPath,
+      sourcePath: join(relPath),
+      destRelativePath: relPath,
+      kind: "file",
+      required: true,
+      isSecret: true,
+      largeObject: false,
+      ...options,
+    });
+    const dir = (relPath: string, options: Partial<BrainRehomePathEntry> = {}): BrainRehomePathEntry => ({
+      tier: "mind",
+      relPath,
+      sourcePath: join(relPath),
+      destRelativePath: relPath,
+      kind: "dir",
+      required: true,
+      isSecret: true,
+      largeObject: false,
+      ...options,
+    });
+    return [
+      file("SOUL.md"),
+      file("IDENTITY.md"),
+      dir("memories"),
+      dir("skills"),
+      dir("sessions", { largeObject: true }),
+      file("state.db", { largeObject: true, stateDbFamily: true }),
+      dir("kanban"),
+      dir("workspace", { largeObject: true }),
+      dir("cron"),
+      file("channel_directory.json"),
+      file("gateway_state.json"),
+      file(".skills_prompt_snapshot.json"),
+      file(".no-bundled-skills", { isSecret: false }),
     ];
   },
   requiresInteractiveReconsent(): boolean {

@@ -76,6 +76,29 @@ const OPERATOR_TWIN_SNAPSHOT = {
   preexistingTwinModified: false,
 };
 
+const PREEXISTING_OPERATOR_TWIN_SNAPSHOT = {
+  ...OPERATOR_TWIN_SNAPSHOT,
+  wasLoaded: true,
+  wasRunning: true,
+  preexistingTwinModified: true,
+};
+
+const SYSTEM_HARNESS_CLEAN_SNAPSHOT = {
+  plistPath: "/Library/LaunchDaemons/ai.sanctuaryprotocol.agent-harness.plist",
+  harnessLabel: "ai.sanctuaryprotocol.agent-harness",
+  wasInstalled: false,
+  wasRunning: false,
+  preexistingJobModified: false,
+};
+
+const SYSTEM_HARNESS_PREEXISTING_SNAPSHOT = {
+  ...SYSTEM_HARNESS_CLEAN_SNAPSHOT,
+  priorPlistContent: "<plist>prior system harness</plist>",
+  wasInstalled: true,
+  wasRunning: true,
+  preexistingJobModified: true,
+};
+
 const CEILING = 500;
 const AGENT_UID = 502;
 
@@ -168,13 +191,14 @@ function happyPathOps(overrides: Partial<ProvisionFlowOps> = {}): ProvisionFlowO
     restoreProvisionedEgressToPreRunState: vi.fn(async () => ({ restored: true, reloadOk: true, problems: [] })),
     verifyAgentEgressAfterArm: vi.fn(async () => passingEgressReport()),
     auditEgress: vi.fn(async () => undefined),
-    createAccount: vi.fn(async () => ({
-      plan: { action: "create", accountName: "sanctuary-hermes", uid: AGENT_UID },
-      uid: AGENT_UID,
-    })),
-    rehome: vi.fn(async () => ({
-      plan: { harnessId: "hermes", steps: [], requiresInteractiveReconsent: false },
-      results: REHOME_RESULTS,
+	    createAccount: vi.fn(async () => ({
+	      plan: { action: "create", accountName: "sanctuary-hermes", uid: AGENT_UID },
+	      uid: AGENT_UID,
+	    })),
+	    preflightBrainRehome: vi.fn(async () => undefined),
+	    rehome: vi.fn(async () => ({
+	      plan: { harnessId: "hermes", steps: [], requiresInteractiveReconsent: false },
+	      results: REHOME_RESULTS,
     })),
     installHarnessDaemon: vi.fn(async () => ({ ok: true as const, bootstrappedThisRun: true })),
     uninstallHarnessDaemon: vi.fn(async () => undefined),
@@ -188,10 +212,14 @@ function happyPathOps(overrides: Partial<ProvisionFlowOps> = {}): ProvisionFlowO
       harnessRestarted: true,
       problems: [] as string[],
     })),
-    standDownOperatorTwin: vi.fn(async () => ({
-      ok: true as const,
-      snapshot: OPERATOR_TWIN_SNAPSHOT,
-    })),
+	    standDownOperatorTwin: vi.fn(async () => ({
+	      ok: true as const,
+	      snapshot: OPERATOR_TWIN_SNAPSHOT,
+	    })),
+	    standDownSystemHarnessForBrainRehome: vi.fn(async () => ({
+	      ok: true as const,
+	      snapshot: SYSTEM_HARNESS_CLEAN_SNAPSHOT,
+	    })),
     restoreOperatorTwinStandDown: vi.fn(async () => ({
       restored: true,
       plistRestored: true,
@@ -255,11 +283,174 @@ describe("castle-wall/provision/orchestrate", () => {
     expect(result).toEqual({ kind: "armed", uid: AGENT_UID, liveness: UNVERIFIED_NO_CHANNEL });
     expect(ops.createAccount).toHaveBeenCalledTimes(1);
     expect(ops.rehome).toHaveBeenCalledWith(AGENT_UID, AGENT_UID);
+    expect(ops.standDownOperatorTwin).toHaveBeenCalledTimes(1);
+    expect(ops.standDownSystemHarnessForBrainRehome).toHaveBeenCalledWith(AGENT_UID);
+    expect((ops.standDownOperatorTwin as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0]!).toBeLessThan(
+      (ops.rehome as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0]!,
+    );
     expect(ops.installHarnessDaemon).toHaveBeenCalledWith(AGENT_UID);
     expect(ops.checkUidExistence).toHaveBeenCalledWith(AGENT_UID);
     expect(ops.arm).toHaveBeenCalledWith(AGENT_UID, CEILING);
     expect(ops.disarm).not.toHaveBeenCalled();
     expect(ops.restoreRehome).not.toHaveBeenCalled();
+  });
+
+  it("fail-before/pass-after: Tier-M refuses before rehome when the system harness stand-down is unproven", async () => {
+    const ops = happyPathOps({
+      standDownSystemHarnessForBrainRehome: vi.fn(async () => ({
+        ok: false as const,
+        error: "launchctl reported pid 9001",
+      })),
+    });
+    const result = await runProvisionFlow(baseCtx(), ops);
+    expect(result).toMatchObject({
+      kind: "aborted",
+      stage: "operator-twin-stand-down",
+      rehomeAttempted: false,
+    });
+    expect(String((result as { reason: string }).reason)).toMatch(/system agent harness.*before Tier-M re-home/i);
+    expect(ops.rehome).not.toHaveBeenCalled();
+    expect(ops.installHarnessDaemon).not.toHaveBeenCalled();
+  });
+
+  it("fail-before/pass-after: open Tier-M journal refuses before the first fresh-provision mutation", async () => {
+    const residue = residueOp();
+    const ops = happyPathOps({
+      reconcileExclusiveRoutingResidue: residue,
+      preflightBrainRehome: vi.fn(async () => {
+        throw new Error(
+          "Tier-M brain re-home journal exists at /Users/operator/.sanctuary/state/rehome-brain-journal.json",
+        );
+      }),
+    });
+
+    const result = await runProvisionFlow(baseCtx(), ops);
+
+    expect(result).toMatchObject({
+      kind: "aborted",
+      stage: "tier-m-brain-rehome-preflight",
+      rolledBack: false,
+      rehomeAttempted: false,
+    });
+    expect(String((result as { reason: string }).reason)).toMatch(/re-home journal exists/i);
+    expect(ops.createAccount).not.toHaveBeenCalled();
+    expect(ops.standDownOperatorTwin).not.toHaveBeenCalled();
+    expect(ops.standDownSystemHarnessForBrainRehome).not.toHaveBeenCalled();
+    expect(ops.rehome).not.toHaveBeenCalled();
+    expect(ops.installHarnessDaemon).not.toHaveBeenCalled();
+    expect(ops.arm).not.toHaveBeenCalled();
+    expect(residue).toHaveBeenCalledTimes(1);
+    expect(residue).toHaveBeenCalledWith(undefined, "observe");
+  });
+
+  it("F-9 P0: missing required Tier-M strands refuse before harness install and restore Tier-K moves", async () => {
+    const requiredBrainMissing: RehomeStepResult = {
+      entry: {
+        tier: "mind",
+        relPath: "SOUL.md",
+        sourcePath: "/Users/operator/SOUL.md",
+        destRelativePath: "SOUL.md",
+        kind: "file",
+        required: true,
+        isSecret: true,
+        largeObject: false,
+      },
+      destPath: "/var/sanctuary-agents/sanctuary-hermes/SOUL.md",
+      status: "skipped-absent",
+    };
+    const mixedResults = [...REHOME_RESULTS, requiredBrainMissing];
+    const ops = happyPathOps({
+      rehome: vi.fn(async () => ({
+        plan: { harnessId: "hermes", steps: [], requiresInteractiveReconsent: false },
+        results: mixedResults,
+      })),
+      restoreRehome: vi.fn(async (results: RehomeStepResult[]) => ({
+        fullyRestored: true,
+        restoredCount: REHOME_RESULTS.length,
+        attemptedCount: results.length,
+        backupPaths: REHOME_RESULTS.filter((r) => r.backupPath).map((r) => r.backupPath!),
+        conflictPaths: [],
+        failedPaths: [],
+      })),
+    });
+
+    const result = await runProvisionFlow(baseCtx(), ops);
+
+    expect(result).toMatchObject({
+      kind: "aborted",
+      stage: "tier-m-brain-rehome",
+      rolledBack: true,
+      rehomeAttempted: true,
+    });
+    expect(String((result as { reason: string }).reason)).toContain("SOUL.md");
+    expect(ops.restoreRehome).toHaveBeenCalledWith(mixedResults);
+    expect(ops.installHarnessDaemon).not.toHaveBeenCalled();
+    expect(ops.arm).not.toHaveBeenCalled();
+  });
+
+  it("fail-before/pass-after: required Tier-M strand refusal restores both stood-down harnesses", async () => {
+    const requiredBrainMissing: RehomeStepResult = {
+      entry: {
+        tier: "mind",
+        relPath: "SOUL.md",
+        sourcePath: "/Users/operator/SOUL.md",
+        destRelativePath: "SOUL.md",
+        kind: "file",
+        required: true,
+        isSecret: true,
+        largeObject: false,
+      },
+      destPath: "/var/sanctuary-agents/sanctuary-hermes/SOUL.md",
+      status: "skipped-absent",
+    };
+    const mixedResults = [...REHOME_RESULTS, requiredBrainMissing];
+    const ops = happyPathOps({
+      standDownOperatorTwin: vi.fn(async () => ({
+        ok: true as const,
+        snapshot: PREEXISTING_OPERATOR_TWIN_SNAPSHOT,
+      })),
+      standDownSystemHarnessForBrainRehome: vi.fn(async () => ({
+        ok: true as const,
+        snapshot: SYSTEM_HARNESS_PREEXISTING_SNAPSHOT,
+      })),
+      rehome: vi.fn(async () => ({
+        plan: { harnessId: "hermes", steps: [], requiresInteractiveReconsent: false },
+        results: mixedResults,
+      })),
+      restoreRehome: vi.fn(async (results: RehomeStepResult[]) => ({
+        fullyRestored: true,
+        restoredCount: REHOME_RESULTS.length,
+        attemptedCount: results.length,
+        backupPaths: REHOME_RESULTS.filter((r) => r.backupPath).map((r) => r.backupPath!),
+        conflictPaths: [],
+        failedPaths: [],
+      })),
+    });
+
+    const result = await runProvisionFlow(baseCtx(), ops);
+
+    expect(result).toMatchObject({ kind: "aborted", stage: "tier-m-brain-rehome" });
+    expect(ops.restoreOperatorTwinStandDown).toHaveBeenCalledWith(PREEXISTING_OPERATOR_TWIN_SNAPSHOT);
+    expect(ops.restoreStoodDownHarness).toHaveBeenCalledTimes(1);
+  });
+
+  it("F-9: verified armed outcome keeps the superseded twin and system harness down", async () => {
+    const ops = happyPathOps({
+      standDownOperatorTwin: vi.fn(async () => ({
+        ok: true as const,
+        snapshot: PREEXISTING_OPERATOR_TWIN_SNAPSHOT,
+      })),
+      standDownSystemHarnessForBrainRehome: vi.fn(async () => ({
+        ok: true as const,
+        snapshot: SYSTEM_HARNESS_PREEXISTING_SNAPSHOT,
+      })),
+    });
+
+    const result = await runProvisionFlow(baseCtx(), ops);
+
+    expect(result).toEqual({ kind: "armed", uid: AGENT_UID, liveness: UNVERIFIED_NO_CHANNEL });
+    expect(ops.restoreOperatorTwinStandDown).not.toHaveBeenCalled();
+    expect(ops.restoreStoodDownHarness).not.toHaveBeenCalled();
   });
 
   it("fix F6: already-dedicated (VERIFIED) skips ONLY create + re-home, but still reaches daemon-install, verify, uid-gate, and arm", async () => {
@@ -1579,15 +1770,14 @@ describe("castle-wall/provision/orchestrate", () => {
         generationId: COMMITTED.generation_id,
         liveness: UNVERIFIED_NO_CHANNEL,
       });
-      // The twin stand-down runs after post-arm as-uid egress evidence and
-      // before the liveness-bearing exclusive stage.
-      const egressVerifyOrder = (ops.verifyAgentEgressAfterArm as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0]!;
+      // F-9 moved the SAME operator twin stand-down earlier: before Tier-M
+      // rehome, so live brain state is quiescent before copy-verify-swap.
       const twinStandDownOrder = (ops.standDownOperatorTwin as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0]!;
+      const rehomeOrder = (ops.rehome as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0]!;
       const armOrder = (ops.arm as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0]!;
       const bringUpOrder = exclusive.bringUpGeneration.mock.invocationCallOrder[0]!;
+      expect(twinStandDownOrder).toBeLessThan(rehomeOrder);
       expect(armOrder).toBeLessThan(bringUpOrder);
-      expect(egressVerifyOrder).toBeLessThan(twinStandDownOrder);
-      expect(twinStandDownOrder).toBeLessThan(bringUpOrder);
       expect(exclusive.runReleaseSequence).toHaveBeenCalledWith(COMMITTED);
       // No degrade surfaces touched on the happy path.
       expect(exclusive.restoreCoarseComposition).not.toHaveBeenCalled();
@@ -2641,11 +2831,9 @@ describe("castle-wall/provision/orchestrate", () => {
       expect(reason).toMatch(/not a return to your previous state/i);
     });
 
-    it("MED: the restore note cannot be silenced by an outcome that has no `reason` field", async () => {
-      // The restore DECISION defaults to safe (an allow-list). The NOTE used
-      // to default to SILENCE: `withHarnessRestoreNote` returned the outcome
-      // untouched when it had no `reason`, dropping even the loud
-      // agent-is-stopped message. No outcome shape can swallow it now.
+    it("MED: a verified armed outcome with no `reason` field keeps the superseded harness down", async () => {
+      // Round F-9: `armed` is a superseding success. It carries no `reason`, but
+      // that is no longer a cue to restore a harness the verified run replaced.
       const printed: string[] = [];
       const reasonless = stoodDownOps({
         print: vi.fn((line: string) => printed.push(line)),
@@ -2656,15 +2844,12 @@ describe("castle-wall/provision/orchestrate", () => {
           problems: ["launchctl bootstrap exited 5"],
           runState: await observedRunState(PARKED_STATUS),
         })),
-        // `armed` carries no `reason`. It cannot co-occur with a parked
-        // install today, which is exactly why the silence went unnoticed --
-        // so drive it explicitly rather than trust that it stays unreachable.
         exclusiveEgress: undefined,
       });
       const coarse = await runProvisionFlow(baseCtx({ fineGrainedDeclared: false }), reasonless);
       expect(coarse.kind).toBe("armed");
-      expect(printed.join("\n")).toMatch(/could NOT be fully restored/);
-      expect(printed.join("\n")).toMatch(/The agent is PARKED \(not running\)/);
+      expect(reasonless.restoreStoodDownHarness).not.toHaveBeenCalled();
+      expect(printed.join("\n")).not.toMatch(/could NOT be fully restored/);
     });
 
     it("MED: a restore on the THROW path is reported too, instead of being swallowed with the error", async () => {

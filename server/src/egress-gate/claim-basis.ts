@@ -1977,14 +1977,15 @@ export const CLAIM_LITERAL_COUNTS: Readonly<Record<string, number>> = {
   // live; liveness stays `cos_liveness_unverified` unless a real round-trip
   // reports it (rendered in orchestrate/cli, classified there).
   [`${CW}/operator-twin.ts`]: 9,
-  // orchestrate.ts +1 (F-GATEWAY-TWIN): the truthy `ok` tag in the
-  // `standDownOperatorTwin` result union (~:270) — the discriminated-union
-  // success tag of the stand-down OPERATION result, whose truth is
-  // established by the helper's own settle-and-verify readback before it
-  // returns. It claims nothing about protection or liveness. (The abort
+  // orchestrate.ts +4 (F-GATEWAY-TWIN + F-9): the truthy `ok` tags in the
+  // operator-twin and Tier-M system-harness stand-down result unions, plus the
+  // corresponding success-branch checks, are operation-verdict tags. The
+  // production helpers establish those verdicts through their own launchd
+  // settle/readback paths before returning; orchestrate consumes the verdicts
+  // and still makes no protection/liveness claim from them. (The abort
   // outcome's truthy `rehomeAttempted` is NOT a tracked field and is not
   // part of this count.)
-  [`${CW}/orchestrate.ts`]: 11,
+  [`${CW}/orchestrate.ts`]: 14,
   [`${CW}/policy-daemon.ts`]: 0,
   [`${CW}/rehome.ts`]: 0,
   [`${CW}/uid-gate.ts`]: 2,

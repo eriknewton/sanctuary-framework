@@ -424,14 +424,14 @@ export async function chownCreatedDirChain(
  * macOS (`/var` is itself a symlink). A caller that passes `owner` without
  * `ownerBase` is refused rather than silently given weaker containment.
  */
-type NoFollowPathGuard = {
+export type NoFollowPathGuard = {
   resolvedBase: string;
   handles: Array<{ path: string; handle: Awaited<ReturnType<typeof open>> }>;
   revalidate(): Promise<void>;
   close(): Promise<void>;
 };
 
-async function openNoFollowPathWithinBase(
+export async function openNoFollowPathWithinBase(
   leafDir: string,
   base: string | undefined,
 ): Promise<NoFollowPathGuard> {
