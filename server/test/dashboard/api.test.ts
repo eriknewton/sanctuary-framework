@@ -19,6 +19,7 @@ async function startForTest(overrides: {
   approvals?: { allow: (id: string) => Promise<boolean>; deny: (id: string) => Promise<boolean> };
   activity?: ActivityEntry[];
   pendingApprovals?: PendingApproval[];
+  shutdownGraceMs?: number;
 } = {}): Promise<DashboardHandle> {
   const sources: AggregatorSources = {
     mode: "co-located",
@@ -30,9 +31,12 @@ async function startForTest(overrides: {
     mode: "co-located",
     port: 0,
     sources,
+    ...(overrides.shutdownGraceMs !== undefined
+      ? { shutdownGraceMs: overrides.shutdownGraceMs }
+      : {}),
     ...(overrides.authToken ? { authToken: overrides.authToken } : {}),
     ...(overrides.approvals ? { approvals: overrides.approvals } : {}),
-  });
+  } as Parameters<typeof startDashboardServer>[0] & { shutdownGraceMs?: number });
 }
 
 describe("Dashboard HTTP API", () => {
@@ -300,6 +304,29 @@ describe("Dashboard HTTP API", () => {
     expect(buf).toContain("event: activity");
     expect(buf).toContain("state_write");
     await reader.cancel();
+  });
+
+  it("stop() resolves after the shutdown grace while an SSE client is still open", async () => {
+    handle = await startForTest({ shutdownGraceMs: 25 });
+    const res = await fetch(`${handle.url}/api/stream`);
+    expect(res.status).toBe(200);
+    const reader = res.body!.getReader();
+    await reader.read();
+
+    const stopping = handle.stop();
+    try {
+      const outcome = await Promise.race([
+        stopping.then(() => "stopped" as const),
+        new Promise<"timeout">((resolve) =>
+          setTimeout(() => resolve("timeout"), 200),
+        ),
+      ]);
+      expect(outcome).toBe("stopped");
+    } finally {
+      await reader.cancel().catch(() => undefined);
+      await stopping.catch(() => undefined);
+      handle = null;
+    }
   });
 
   it("returns /api/health unauthenticated shape", async () => {

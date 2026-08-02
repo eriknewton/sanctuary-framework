@@ -18,6 +18,12 @@ import type {
 } from "./aggregator.js";
 import { handleRequest, type ApprovalHandlers, type StreamEvent } from "./api.js";
 import { sendCaughtError } from "../http/error-envelope.js";
+import {
+  attachPostListenHttpServerErrorLogger,
+  cleanupFailedHttpServer,
+  closeHttpServer,
+  DEFAULT_HTTP_SHUTDOWN_GRACE_MS,
+} from "../http/server-lifecycle.js";
 import type { V11Bindings } from "./v1_1/wiring.js";
 import type { FleetRoster } from "../principal-policy/fleet-roster.js";
 
@@ -37,6 +43,8 @@ export interface DashboardServerOptions {
    * roster / 404 (no fabricated fleet). See `APIDeps.fleetRoster`.
    */
   fleetRoster?: () => FleetRoster | Promise<FleetRoster>;
+  /** Shutdown grace before active connections are force-closed. Default: 5000ms. */
+  shutdownGraceMs?: number;
 }
 
 export interface DashboardHandle {
@@ -205,9 +213,16 @@ export async function startDashboardServer(
   });
 
   await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
+    const onStartupError = (err: Error) => {
+      void cleanupFailedHttpServer(server).finally(() => reject(err));
+    };
+    server.once("error", onStartupError);
     server.listen(port, host, () => {
-      server.off("error", reject);
+      server.off("error", onStartupError);
+      attachPostListenHttpServerErrorLogger(
+        server,
+        "Sanctuary Dashboard HTTP server",
+      );
       resolve();
     });
   });
@@ -224,15 +239,28 @@ export async function startDashboardServer(
     const session = sessionStore.create();
     return `${url}?session=${encodeURIComponent(session.id)}`;
   };
+  let stopped = false;
+  let stopPromise: Promise<void> | null = null;
+  const stop = (): Promise<void> => {
+    if (stopped) return Promise.resolve();
+    if (stopPromise) return stopPromise;
+    stopPromise = closeHttpServer(server, {
+      label: "Sanctuary Dashboard HTTP server",
+      graceMs: options.shutdownGraceMs ?? DEFAULT_HTTP_SHUTDOWN_GRACE_MS,
+    }).finally(() => {
+      stopped = true;
+      stopPromise = null;
+      listeners.clear();
+      sessions.clear();
+    });
+    return stopPromise;
+  };
 
   return {
     url,
     port: actualPort,
     host,
-    stop: () =>
-      new Promise<void>((resolve, reject) => {
-        server.close((err) => (err ? reject(err) : resolve()));
-      }),
+    stop,
     publish,
     publishActivity: (entry: ActivityEntry) =>
       publish({ type: "activity", data: entry }),

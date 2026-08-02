@@ -80,6 +80,10 @@ import {
   PassphraseKeyringUnreachableError,
 } from "./passphrase.js";
 import { startDashboard, type DashboardHandle } from "../dashboard/index.js";
+import {
+  cleanupFailedHttpServer,
+  type HttpServerLifecycleTarget,
+} from "../http/server-lifecycle.js";
 import { buildWrapFleetRosterProvider } from "./fleet-roster-provider.js";
 import {
   DEFAULT_ENFORCEMENT_AVAILABILITY_FRESHNESS_MS,
@@ -1341,6 +1345,38 @@ export type DashboardStarter = (opts: {
   authToken: string;
   serverVersion: string;
 }) => Promise<DashboardHandle>;
+
+type DashboardStartFailure = {
+  dashboardServerCleanup?: () => void | Promise<void>;
+  dashboardServer?: HttpServerLifecycleTarget;
+  server?: HttpServerLifecycleTarget;
+};
+
+function isServerLifecycleTarget(
+  value: unknown,
+): value is HttpServerLifecycleTarget {
+  return (
+    !!value &&
+    typeof value === "object" &&
+    typeof (value as { close?: unknown }).close === "function"
+  );
+}
+
+async function cleanupDashboardStartFailure(err: unknown): Promise<void> {
+  if (!err || typeof err !== "object") return;
+  const failure = err as DashboardStartFailure;
+  if (typeof failure.dashboardServerCleanup === "function") {
+    await failure.dashboardServerCleanup();
+    return;
+  }
+  if (isServerLifecycleTarget(failure.dashboardServer)) {
+    await cleanupFailedHttpServer(failure.dashboardServer);
+    return;
+  }
+  if (isServerLifecycleTarget(failure.server)) {
+    await cleanupFailedHttpServer(failure.server);
+  }
+}
 
 // ── Main: wrap ──────────────────────────────────────────────────────
 
@@ -4796,6 +4832,7 @@ export async function startDashboardWithFallback(
     } catch (err) {
       lastErr = err;
       if (!isAddressInUse(err)) throw err;
+      await cleanupDashboardStartFailure(err);
     }
   }
   const lastPort = preferredPort + PORT_FALLBACK_ATTEMPTS - 1;

@@ -6,7 +6,11 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { request as httpRequest, type IncomingHttpHeaders } from "node:http";
+import {
+  request as httpRequest,
+  type IncomingHttpHeaders,
+  type Server,
+} from "node:http";
 import {
   DashboardApprovalChannel,
   ipv6Slash64Prefix,
@@ -23,6 +27,33 @@ import {
 import { AuditLog } from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
+
+function dashboardServer(channel: DashboardApprovalChannel): Server | null {
+  return (channel as unknown as { httpServer: Server | null }).httpServer;
+}
+
+function captureStderr(): { chunks: string[]; restore: () => void } {
+  const chunks: string[] = [];
+  const original = process.stderr.write;
+  process.stderr.write = ((chunk: unknown) => {
+    chunks.push(String(chunk));
+    return true;
+  }) as typeof process.stderr.write;
+  return {
+    chunks,
+    restore: () => {
+      process.stderr.write = original;
+    },
+  };
+}
+
+async function closeServerQuietly(server: Server | null): Promise<void> {
+  if (!server) return;
+  server.closeAllConnections?.();
+  await new Promise<void>((resolve) => {
+    server.close(() => resolve());
+  }).catch(() => undefined);
+}
 
 async function requestNoKeepAlive(
   url: string,
@@ -123,6 +154,9 @@ describe("Principal Dashboard", () => {
         // short-timeout dashboard so this value does not affect it.
         timeout_seconds: 30,
         auto_deny: true,
+        shutdown_grace_ms: 25,
+      } as ConstructorParameters<typeof DashboardApprovalChannel>[0] & {
+        shutdown_grace_ms: number;
       });
       await dashboard.start();
     });
@@ -415,6 +449,42 @@ describe("Principal Dashboard", () => {
       expect(dashboard.clientCount).toBe(1);
 
       await reader.cancel();
+    });
+
+    it("stop() resolves after the shutdown grace while an SSE client is still open", async () => {
+      const response = await fetch(`http://127.0.0.1:${port}/events`);
+      expect(response.status).toBe(200);
+      const reader = response.body!.getReader();
+      await reader.read();
+
+      const stopping = dashboard.stop();
+      try {
+        const outcome = await Promise.race([
+          stopping.then(() => "stopped" as const),
+          new Promise<"timeout">((resolve) =>
+            setTimeout(() => resolve("timeout"), 200),
+          ),
+        ]);
+        expect(outcome).toBe("stopped");
+      } finally {
+        await reader.cancel().catch(() => undefined);
+        await stopping.catch(() => undefined);
+      }
+    });
+
+    it("logs post-listen server errors instead of swallowing them", async () => {
+      const server = dashboardServer(dashboard);
+      expect(server).not.toBeNull();
+      const captured = captureStderr();
+      try {
+        server!.emit("error", new Error("synthetic post-listen failure"));
+      } finally {
+        captured.restore();
+      }
+      expect(captured.chunks.join("")).toContain(
+        "synthetic post-listen failure",
+      );
+      expect(captured.chunks.join("")).toContain("SAFETY:");
     });
   });
 
@@ -1464,6 +1534,29 @@ describe("Principal Dashboard", () => {
   // ── Cleanup ──────────────────────────────────────────────────────────
 
   describe("Cleanup", () => {
+    it("start() is idempotent and does not replace the active server", async () => {
+      const first = dashboardServer(dashboard);
+      let second: Server | null = null;
+      try {
+        await expect(dashboard.start()).resolves.toBeUndefined();
+        second = dashboardServer(dashboard);
+        expect(second).toBe(first);
+      } finally {
+        second = dashboardServer(dashboard);
+        if (second && first && second !== first) {
+          await closeServerQuietly(second);
+          (dashboard as unknown as { httpServer: Server | null }).httpServer =
+            first;
+        }
+      }
+    });
+
+    it("stop() clears server state and is re-entrant", async () => {
+      await dashboard.stop();
+      expect(dashboardServer(dashboard)).toBeNull();
+      await expect(dashboard.stop()).resolves.toBeUndefined();
+    });
+
     it("stop() resolves all pending requests as deny", async () => {
       const request: ApprovalRequest = {
         operation: "state_export",

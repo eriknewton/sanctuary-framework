@@ -41,7 +41,7 @@ async function makeTenant(
   if (withRuntime) {
     await writeTenantRuntime(dir, {
       version: "0.10.0-test",
-      pid: 99000,
+      pid: process.pid,
       started_at: new Date().toISOString(),
       dashboard_host: "127.0.0.1",
       dashboard_port: 3501,
@@ -155,7 +155,7 @@ describe("sanctuary agents CLI", () => {
     const nsa = parsed.find((p: { name: string }) => p.name === "nsa");
     expect(nsa).toBeTruthy();
     expect(nsa.dashboard_port).toBe(3501);
-    expect(nsa.pid).toBe(99000);
+    expect(nsa.pid).toBe(process.pid);
     expect(nsa.running).toBe(true);
     const bravo = parsed.find((p: { name: string }) => p.name === "bravo");
     expect(bravo.dashboard_port).toBeNull();

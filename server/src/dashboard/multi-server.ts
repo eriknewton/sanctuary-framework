@@ -15,6 +15,12 @@ import { getMultiTenantSnapshot } from "./multi-aggregator.js";
 import { renderMultiAgentHTML } from "./multi-html.js";
 import { getProcessInstance, getProcessSince } from "./process-identity.js";
 import { sendCaughtError } from "../http/error-envelope.js";
+import {
+  attachPostListenHttpServerErrorLogger,
+  cleanupFailedHttpServer,
+  closeHttpServer,
+  DEFAULT_HTTP_SHUTDOWN_GRACE_MS,
+} from "../http/server-lifecycle.js";
 
 export interface MultiDashboardOptions {
   /** HTTP port. Default 3500 (distinct from single-tenant default 3501). */
@@ -31,6 +37,8 @@ export interface MultiDashboardOptions {
    * Override discovery root (tests). Normally derived from HOME.
    */
   discoveryRoot?: string;
+  /** Shutdown grace before active connections are force-closed. Default: 5000ms. */
+  shutdownGraceMs?: number;
 }
 
 export interface MultiDashboardHandle {
@@ -153,9 +161,16 @@ export async function startMultiDashboardServer(
   });
 
   await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
+    const onStartupError = (err: Error) => {
+      void cleanupFailedHttpServer(server).finally(() => reject(err));
+    };
+    server.once("error", onStartupError);
     server.listen(port, host, () => {
-      server.off("error", reject);
+      server.off("error", onStartupError);
+      attachPostListenHttpServerErrorLogger(
+        server,
+        "Sanctuary Multi Dashboard HTTP server",
+      );
       resolve();
     });
   });
@@ -163,14 +178,25 @@ export async function startMultiDashboardServer(
   const addr = server.address();
   const actualPort =
     addr && typeof addr === "object" && addr.port ? addr.port : port;
+  let stopped = false;
+  let stopPromise: Promise<void> | null = null;
+  const stop = (): Promise<void> => {
+    if (stopped) return Promise.resolve();
+    if (stopPromise) return stopPromise;
+    stopPromise = closeHttpServer(server, {
+      label: "Sanctuary Multi Dashboard HTTP server",
+      graceMs: options.shutdownGraceMs ?? DEFAULT_HTTP_SHUTDOWN_GRACE_MS,
+    }).finally(() => {
+      stopped = true;
+      stopPromise = null;
+    });
+    return stopPromise;
+  };
 
   return {
     url: `http://${host}:${actualPort}`,
     port: actualPort,
     host,
-    stop: () =>
-      new Promise<void>((resolve, reject) => {
-        server.close((err) => (err ? reject(err) : resolve()));
-      }),
+    stop,
   };
 }

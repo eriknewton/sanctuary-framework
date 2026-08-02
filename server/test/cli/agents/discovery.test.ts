@@ -214,7 +214,7 @@ describe("cli/agents/discovery", () => {
     const dir = await makeTenantLayout(tmpRoot, "live", { withState: true });
     await writeTenantRuntime(dir, {
       version: "0.10.0-test",
-      pid: 99999,
+      pid: process.pid,
       started_at: new Date().toISOString(),
       dashboard_host: "127.0.0.1",
       dashboard_port: 3524,

@@ -40,6 +40,20 @@ function runtimePath(storagePath: string): string {
   return join(storagePath, RUNTIME_FILE_NAME);
 }
 
+function isProcessAlive(pid: number): boolean {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (
+      !!err &&
+      typeof err === "object" &&
+      (err as NodeJS.ErrnoException).code === "EPERM"
+    );
+  }
+}
+
 /**
  * Persist live runtime state for a tenant. Overwrites any existing file.
  * Never throws for I/O reasons — the caller should not fail to start the
@@ -74,8 +88,8 @@ export async function clearTenantRuntime(storagePath: string): Promise<void> {
 
 /**
  * Read runtime state for a tenant. Returns null if the file is missing or
- * malformed. Does not validate the process is still alive — callers that
- * care must probe the dashboard via HTTP.
+ * malformed, or if the writer process is no longer alive. Callers still probe
+ * the dashboard via HTTP before treating a tenant as reachable.
  */
 export async function readTenantRuntime(
   storagePath: string
@@ -107,6 +121,7 @@ export async function readTenantRuntime(
     if (typeof parsed.webhook_callback_host === "string") {
       state.webhook_callback_host = parsed.webhook_callback_host;
     }
+    if (!isProcessAlive(state.pid)) return null;
     return state;
   } catch {
     return null;

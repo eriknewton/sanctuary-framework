@@ -31,7 +31,7 @@ describe("cli/agents/runtime", () => {
   it("writes then reads a full runtime record", async () => {
     await writeTenantRuntime(dir, {
       version: "0.10.0-x",
-      pid: 4242,
+      pid: process.pid,
       started_at: "2026-04-17T00:00:00.000Z",
       dashboard_host: "127.0.0.1",
       dashboard_port: 3505,
@@ -41,7 +41,7 @@ describe("cli/agents/runtime", () => {
     });
     const got = await readTenantRuntime(dir);
     expect(got).not.toBeNull();
-    expect(got!.pid).toBe(4242);
+    expect(got!.pid).toBe(process.pid);
     expect(got!.dashboard_port).toBe(3505);
     expect(got!.webhook_callback_port).toBe(3515);
     expect(got!.mode).toBe("wrap");
@@ -50,7 +50,7 @@ describe("cli/agents/runtime", () => {
   it("omits webhook fields when the writer did not supply them", async () => {
     await writeTenantRuntime(dir, {
       version: "0.10.0-x",
-      pid: 1,
+      pid: process.pid,
       started_at: "2026-04-17T00:00:00.000Z",
       dashboard_host: "127.0.0.1",
       dashboard_port: 3501,
@@ -89,6 +89,21 @@ describe("cli/agents/runtime", () => {
     await writeFile(
       join(dir, RUNTIME_FILE_NAME),
       JSON.stringify({ dashboard_port: "not-a-number" })
+    );
+    expect(await readTenantRuntime(dir)).toBeNull();
+  });
+
+  it("readTenantRuntime ignores a dead writer pid instead of trusting stale runtime.json", async () => {
+    await writeFile(
+      join(dir, RUNTIME_FILE_NAME),
+      JSON.stringify({
+        version: "0.10.0-x",
+        pid: 99_999_999,
+        started_at: "2026-04-17T00:00:00.000Z",
+        dashboard_host: "127.0.0.1",
+        dashboard_port: 3501,
+        mode: "wrap",
+      }),
     );
     expect(await readTenantRuntime(dir)).toBeNull();
   });
