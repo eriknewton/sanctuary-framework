@@ -60,13 +60,18 @@ async function startStubDashboard(): Promise<{
 
 async function writeRuntimeRecord(
   storagePath: string,
-  opts: { pid: number; port: number; mode?: "standalone" | "wrap" },
+  opts: {
+    pid: number;
+    port: number;
+    mode?: "standalone" | "wrap";
+    host?: string;
+  },
 ): Promise<string> {
   const record = {
     version: "9.9.9-test",
     pid: opts.pid,
     started_at: new Date().toISOString(),
-    dashboard_host: "127.0.0.1",
+    dashboard_host: opts.host ?? "127.0.0.1",
     dashboard_port: opts.port,
     mode: opts.mode ?? "standalone",
   };
@@ -192,6 +197,32 @@ describe("dashboard-fold PR-4: ensureMainDashboardForWrap", () => {
     expect(ensured.reused).toBe(false);
     expect(ensured.port).toBe(3611);
     expect(stub.requests).not.toContain("/api/health");
+  });
+
+  it("F5: NEVER probes a non-loopback host from a runtime record (file data must not aim an outbound request)", async () => {
+    const storagePath = await makeFortressDir();
+    // A poisoned record naming an external host: the probe must never fire
+    // toward it (CodeQL js/file-data-in-outbound-network-request — the probe
+    // URL is file-derived, so it is pinned to loopback). Falls through to a
+    // fresh start instead.
+    await writeRuntimeRecord(storagePath, {
+      pid: OTHER_LIVE_PID,
+      port: 443,
+      host: "203.0.113.7",
+    });
+    let probed: string | undefined;
+    const ensured = await ensureMainDashboardForWrap({
+      storagePath,
+      requestedPort: 3612,
+      start: async ({ port }) => ({ url: `http://127.0.0.1:${port}`, port }),
+      probeHealth: async (url) => {
+        probed = url;
+        return true; // even an "answering" foreign host must not be blessed
+      },
+    });
+    expect(probed).toBeUndefined();
+    expect(ensured.reused).toBe(false);
+    expect(ensured.port).toBe(3612);
   });
 
   it("ignores a STALE runtime record (dead PID) and starts fresh", async () => {

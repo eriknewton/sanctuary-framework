@@ -4821,6 +4821,19 @@ export async function ensureMainDashboardForWrap(
     // FOREIGN process that answers a health probe. Self-records mean "no
     // live dashboard", never "reuse".
     if (existing.pid === process.pid) return null;
+    // Fix round 1, F5 (CodeQL js/file-data-in-outbound-network-request): the
+    // probe target comes from an on-disk record, so pin it to loopback. The
+    // ensured main dashboard is always loopback-bound in this flow; a record
+    // naming any other host cannot be ours and must never aim an outbound
+    // request (a poisoned record would otherwise turn the probe into a
+    // beacon toward an arbitrary host).
+    if (
+      existing.dashboard_host !== "127.0.0.1" &&
+      existing.dashboard_host !== "::1" &&
+      existing.dashboard_host !== "localhost"
+    ) {
+      return null;
+    }
     const url = `http://${existing.dashboard_host}:${existing.dashboard_port}`;
     if (!(await probe(url))) return null;
     return { url, port: existing.dashboard_port, reused: true };
