@@ -71,6 +71,17 @@ import {
   type V11Bindings,
 } from "../dashboard/v1_1/wiring.js";
 import { getProcessInstance, getProcessSince } from "../dashboard/process-identity.js";
+// Dashboard-fold PR-3 (ratified decision 7): the mobile companion PWA moves
+// onto the ONE surviving surface. The shell/manifest/service-worker are
+// tokenless static assets with client-side auth; see dashboard/mobile.ts for
+// the full security posture.
+import {
+  renderMobileCompanionHTML,
+  MOBILE_COMPANION_WEBMANIFEST,
+  MOBILE_COMPANION_SERVICE_WORKER_JS,
+  MOBILE_COMPANION_CSP,
+  MOBILE_COMPANION_ROUTE_PREFIX,
+} from "../dashboard/mobile.js";
 import {
   composeAggregatorSources,
   getProtectionSnapshot,
@@ -6146,6 +6157,58 @@ export class DashboardApprovalChannel implements ApprovalChannel {
           since: getProcessSince(),
         }),
       );
+      return;
+    }
+
+    // ── Mobile companion (PWA) — dashboard-fold PR-3 (ratified decision 7) ──
+    // Served TOKENLESS before the auth gate, exactly like the concierge SPA
+    // and like the wrap surface served it before the fold: the shell carries
+    // NO operator data and runs its own client-side auth (the operator token
+    // rides only as a bearer header to the EXISTING gated /api routes —
+    // /api/pending and the decision routes, both live on this surface since
+    // fold PR-2). The service worker is scope-limited to /m/ and never caches
+    // /api traffic; headers match the retired wrap route byte-for-byte
+    // (strict same-origin CSP, nosniff, no-referrer). See dashboard/mobile.ts
+    // for the full security posture. Static views: no rate limit, matching
+    // the other HTML view routes.
+    if (
+      method === "GET" &&
+      (url.pathname === MOBILE_COMPANION_ROUTE_PREFIX ||
+        url.pathname === `${MOBILE_COMPANION_ROUTE_PREFIX}/`)
+    ) {
+      res.writeHead(200, {
+        "Content-Type": "text/html; charset=utf-8",
+        "Cache-Control": "no-store",
+        "Content-Security-Policy": MOBILE_COMPANION_CSP,
+        "X-Content-Type-Options": "nosniff",
+        "Referrer-Policy": "no-referrer",
+      });
+      res.end(renderMobileCompanionHTML());
+      return;
+    }
+    if (
+      method === "GET" &&
+      url.pathname === `${MOBILE_COMPANION_ROUTE_PREFIX}/manifest.webmanifest`
+    ) {
+      res.writeHead(200, {
+        "Content-Type": "application/manifest+json; charset=utf-8",
+        "Cache-Control": "no-store",
+        "X-Content-Type-Options": "nosniff",
+      });
+      res.end(MOBILE_COMPANION_WEBMANIFEST);
+      return;
+    }
+    if (
+      method === "GET" &&
+      url.pathname === `${MOBILE_COMPANION_ROUTE_PREFIX}/sw.js`
+    ) {
+      res.writeHead(200, {
+        "Content-Type": "text/javascript; charset=utf-8",
+        "Cache-Control": "no-store",
+        "X-Content-Type-Options": "nosniff",
+        "Service-Worker-Allowed": "/m/",
+      });
+      res.end(MOBILE_COMPANION_SERVICE_WORKER_JS);
       return;
     }
 
