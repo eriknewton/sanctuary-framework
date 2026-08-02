@@ -82,6 +82,7 @@ import {
   type EntryReverifyBasis,
 } from "../principal-policy/producer-reverify.js";
 import {
+  CASTLE_WALL_BOOT_LABEL,
   CASTLE_WALL_BOOT_PLIST_PATH,
   bootServiceInstalled,
   bootServiceReady,
@@ -349,9 +350,15 @@ interface SysextArmClaimObservation {
   reason?: string;
 }
 
-type ObservedSysextArmClaimObservation =
-  Omit<SysextArmClaimObservation, "state"> & {
-    state: Observed<SysextArmClaimState>;
+interface ArmClaimObservationBasis {
+  sysext: SysextArmClaimObservation;
+  enforcementAvailability: ResolvedEnforcementAvailability;
+}
+
+type ObservedArmClaimObservationBasis =
+  Omit<ArmClaimObservationBasis, "sysext" | "enforcementAvailability"> & {
+    sysext: Observed<SysextArmClaimObservation>;
+    enforcementAvailability: Observed<ResolvedEnforcementAvailability>;
   };
 
 /** JSON line emitted by `CastleWallHostApp --headless <action>` (HeadlessFilterCLI.Report). */
@@ -4009,24 +4016,76 @@ async function readSysextStateForArmClaim(
   }
 }
 
-async function observeSysextStateForArmClaim(
+async function observeArmClaimBasis(
+  storagePath: string,
+  platform: NodeJS.Platform,
+  ctx: CastleWallCommandContext,
   sysextProbe: () => Promise<SysextState>,
-): Promise<ObservedSysextArmClaimObservation> {
+): Promise<ObservedArmClaimObservationBasis> {
   return observing(
     "castle-wall-cli.content-filter-enabled",
-    () => readSysextStateForArmClaim(sysextProbe),
-    ["state"],
+    async () => ({
+      sysext: await readSysextStateForArmClaim(sysextProbe),
+      enforcementAvailability: await readEnforcementAvailabilityForStatus(
+        storagePath,
+        platform,
+        ctx,
+      ),
+    }),
+    ["sysext", "enforcementAvailability"],
   );
 }
 
-function observedSysextEnabled(
-  state: Observed<SysextArmClaimState>,
-): Observed<"[activated enabled]"> | undefined {
-  return state === "[activated enabled]" ? state : undefined;
+function renderVerifiedArmClaimLine(
+  basis: ObservedArmClaimObservationBasis,
+): string | undefined {
+  if (
+    basis.sysext.state !== "[activated enabled]" ||
+    basis.enforcementAvailability.status !== "live"
+  ) {
+    return undefined;
+  }
+  return "Castle Wall armed: content filter enabled (verified via host-app status, system extension state, and enforcement availability).\n";
+}
+
+function renderArmAvailabilityRemedyLine(
+  availability: ResolvedEnforcementAvailability,
+): string {
+  if (
+    availability.reason === "lease:heartbeat_stopped" ||
+    availability.reason === "lease:arm_lease_missing"
+  ) {
+    return (
+      "Remedy: restart the root Castle Wall boot daemon, then re-run enable: " +
+      `sudo launchctl kickstart -k system/${CASTLE_WALL_BOOT_LABEL}\n`
+    );
+  }
+  if (AVAILABILITY_CONNECT_PERMISSION_RE.test(availability.reason)) {
+    return "Remedy: repair fortress custody, then re-run enable: sudo sanctuary castle-wall repair-custody\n";
+  }
+  if (
+    availability.reason === "no_extension_connection" ||
+    availability.reason === "no_report" ||
+    availability.reason === "stale_report"
+  ) {
+    return "Remedy: start or repair the Castle Wall daemon, then re-run enable: sanctuary castle-wall daemon\n";
+  }
+  return "Remedy: run sanctuary castle-wall status, fix the named availability reason above, then re-run enable.\n";
+}
+
+function renderArmAvailabilityNotLiveRefusal(
+  availability: Observed<ResolvedEnforcementAvailability>,
+): string {
+  return (
+    "Castle Wall arm saved by the host app, but enforcement availability is not live. " +
+    "Treat the wall as not enforcing until the availability surface is live.\n" +
+    formatEnforcementAvailabilityStatus(availability) +
+    renderArmAvailabilityRemedyLine(availability)
+  );
 }
 
 function renderArmSysextNotEnabledLine(
-  observation: ObservedSysextArmClaimObservation,
+  observation: SysextArmClaimObservation,
 ): string {
   switch (observation.state) {
     case "[activated waiting for user]":
@@ -4051,7 +4110,10 @@ function renderArmSysextNotEnabledLine(
         "Open System Settings > Privacy & Security and approve the Castle Wall system extension before relying on enforcement.\n"
       );
     case "[activated enabled]":
-      return "Castle Wall armed: content filter enabled (verified via host-app status and system extension state).\n";
+      return (
+        "Castle Wall arm saved by the host app, but enforcement availability was not evaluated. " +
+        "Treat the wall as not enforcing until the availability surface is live.\n"
+      );
   }
   return (
     "Castle Wall arm saved by the host app, but system extension state could not be read. " +
@@ -4606,18 +4668,28 @@ async function runArmDisarmInner(
     if (!leaseSent) {
       write(
         err,
-        "Warning: Castle Wall armed, but the daemon did not accept the dead-man lease update. Existing daemon heartbeat state remains authoritative.\n",
+        "Warning: the host app saved the Castle Wall arm preference, but the daemon did not accept the dead-man lease update. Existing daemon heartbeat state remains authoritative.\n",
       );
     }
-    const sysextObservation = await observeSysextStateForArmClaim(sysextProbe);
-    const contentFilterEnabledClaim = observedSysextEnabled(
-      sysextObservation.state,
+    const armClaimBasis = await observeArmClaimBasis(
+      fortressPath,
+      platform,
+      ctx,
+      sysextProbe,
     );
+    if (armClaimBasis.enforcementAvailability.status !== "live") {
+      write(
+        err,
+        renderArmAvailabilityNotLiveRefusal(
+          armClaimBasis.enforcementAvailability,
+        ),
+      );
+      return 1;
+    }
+    const verifiedArmClaim = renderVerifiedArmClaimLine(armClaimBasis);
     write(
       out,
-      contentFilterEnabledClaim !== undefined
-        ? "Castle Wall armed: content filter enabled (verified via host-app status and system extension state).\n"
-        : renderArmSysextNotEnabledLine(sysextObservation),
+      verifiedArmClaim ?? renderArmSysextNotEnabledLine(armClaimBasis.sysext),
     );
   } else if (confirmed) {
     write(out, "Castle Wall disarmed: content filter disabled (verified via host-app status).\n");

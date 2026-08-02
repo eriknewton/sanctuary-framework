@@ -13,13 +13,16 @@ import { generateRandomKey } from "../../src/core/random.js";
 import { fromBase64url, toBase64url } from "../../src/core/encoding.js";
 import {
   CASTLE_WALL_HEADLESS_CONTRACT_VERSION,
+  formatEnforcementAvailabilityStatus,
   makeLaunchServicesHostAppInvoke,
   parseCastleWallArgs,
   runDisable,
-  runEnable,
+  runEnable as runEnableRaw,
+  type CastleWallCommandContext,
   type HostAppInvoker,
   type OpenRunner,
 } from "../../src/cli/castle-wall.js";
+import type { ResolvedEnforcementAvailability } from "../../src/castle-wall/runtime/enforcement-availability.js";
 import {
   CASTLE_WALL_BOOT_LABEL,
   bootServiceInstalled,
@@ -63,6 +66,29 @@ function legacyReportLine(
   error?: string,
 ): string {
   return JSON.stringify({ action, error, ok, state }) + "\n";
+}
+
+function availability(
+  overrides: Partial<ResolvedEnforcementAvailability> = {},
+): ResolvedEnforcementAvailability {
+  return {
+    status: "live",
+    reason: "ok",
+    observed_at: "2026-08-02T00:00:00.000Z",
+    freshness_window_ms: 30_000,
+    active_connection_count: 1,
+    ...overrides,
+  };
+}
+
+function runEnable(
+  argv: string[],
+  ctx: CastleWallCommandContext = {},
+): Promise<number> {
+  return runEnableRaw(argv, {
+    enforcementAvailabilityQuery: async () => availability(),
+    ...ctx,
+  });
 }
 
 function makeInvoker(
@@ -268,6 +294,9 @@ describe("castle-wall enable/disable CLI verbs", () => {
 
     expect(code).toBe(0);
     expect(out.text()).toContain("Castle Wall armed");
+    expect(out.text()).toContain(
+      "verified via host-app status, system extension state, and enforcement availability",
+    );
   });
 
   it("enable does not claim content filter enabled while the sysext waits for user approval", async () => {
@@ -330,6 +359,127 @@ describe("castle-wall enable/disable CLI verbs", () => {
     expect(out.text()).not.toContain("content filter enabled");
     expect(out.text()).toContain("system extension state could not be read");
     expect(out.text()).toContain("System Settings");
+  });
+
+  it("enable refuses the verified claim when the shared availability verdict is heartbeat_stopped", async () => {
+    const { fortressPath, hostAppPath, env } = await makeFixture();
+    const plistPath = join(fortressPath, "boot.plist");
+    await writeFile(plistPath, makeBootPlist(`${fortressPath}/`));
+    const out = new CaptureStream();
+    const err = new CaptureStream();
+    const { invoke } = makeInvoker({
+      enable: { stdout: reportLine("enable", "enabled", true), exitCode: 0 },
+      status: { stdout: reportLine("status", "enabled", true), exitCode: 0 },
+    });
+
+    const code = await runEnable(["--fortress", fortressPath, "--no-ttl"], {
+      out,
+      err,
+      env,
+      platform: "darwin",
+      hostAppCandidates: [hostAppPath],
+      hostAppInvoke: invoke,
+      daemonProbe: async () => true,
+      bootServiceReadyProbe: makeBootServiceReadyProbe(plistPath, fortressPath),
+      sysextProbe: async () => "[activated enabled]",
+      egressAllowRuleCountProbe: async () => 1,
+      agentOriginDescriptorProbe: async () => true,
+      enforcementAvailabilityQuery: async () =>
+        availability({
+          status: "non_green",
+          reason: "lease:heartbeat_stopped",
+        }),
+    });
+
+    expect(code).toBe(1);
+    expect(out.text()).not.toContain("verified via host-app status and system extension state");
+    expect(err.text()).toContain(
+      "Enforcement availability: non_green (lease:heartbeat_stopped",
+    );
+    expect(err.text()).toContain(
+      "sudo launchctl kickstart -k system/ai.sanctuaryprotocol.castle-wall.daemon",
+    );
+  });
+
+  it("enable refusal renders the same arm_lease_missing availability verdict as status", async () => {
+    const { fortressPath, hostAppPath, env } = await makeFixture();
+    const plistPath = join(fortressPath, "boot.plist");
+    await writeFile(plistPath, makeBootPlist(`${fortressPath}/`));
+    const out = new CaptureStream();
+    const err = new CaptureStream();
+    const { invoke } = makeInvoker({
+      enable: { stdout: reportLine("enable", "enabled", true), exitCode: 0 },
+      status: { stdout: reportLine("status", "enabled", true), exitCode: 0 },
+    });
+    const sharedVerdict = availability({
+      status: "non_green",
+      reason: "lease:arm_lease_missing",
+      observed_at: "2026-08-02T01:02:03.000Z",
+      active_connection_count: 2,
+    });
+    let queries = 0;
+
+    const code = await runEnable(["--fortress", fortressPath, "--no-ttl"], {
+      out,
+      err,
+      env,
+      platform: "darwin",
+      hostAppCandidates: [hostAppPath],
+      hostAppInvoke: invoke,
+      daemonProbe: async () => true,
+      bootServiceReadyProbe: makeBootServiceReadyProbe(plistPath, fortressPath),
+      sysextProbe: async () => "[activated enabled]",
+      egressAllowRuleCountProbe: async () => 1,
+      agentOriginDescriptorProbe: async () => true,
+      enforcementAvailabilityQuery: async () => {
+        queries += 1;
+        return sharedVerdict;
+      },
+    });
+
+    expect(code).toBe(1);
+    expect(queries).toBe(1);
+    expect(out.text()).not.toContain("content filter enabled");
+    expect(err.text()).toContain(formatEnforcementAvailabilityStatus(sharedVerdict));
+    expect(err.text()).toContain(
+      "sudo launchctl kickstart -k system/ai.sanctuaryprotocol.castle-wall.daemon",
+    );
+  });
+
+  it("enable fails closed when the availability verdict cannot be read", async () => {
+    const { fortressPath, hostAppPath, env } = await makeFixture();
+    const plistPath = join(fortressPath, "boot.plist");
+    await writeFile(plistPath, makeBootPlist(`${fortressPath}/`));
+    const out = new CaptureStream();
+    const err = new CaptureStream();
+    const { invoke } = makeInvoker({
+      enable: { stdout: reportLine("enable", "enabled", true), exitCode: 0 },
+      status: { stdout: reportLine("status", "enabled", true), exitCode: 0 },
+    });
+
+    const code = await runEnable(["--fortress", fortressPath, "--no-ttl"], {
+      out,
+      err,
+      env,
+      platform: "darwin",
+      hostAppCandidates: [hostAppPath],
+      hostAppInvoke: invoke,
+      daemonProbe: async () => true,
+      bootServiceReadyProbe: makeBootServiceReadyProbe(plistPath, fortressPath),
+      sysextProbe: async () => "[activated enabled]",
+      egressAllowRuleCountProbe: async () => 1,
+      agentOriginDescriptorProbe: async () => true,
+      enforcementAvailabilityQuery: async () => {
+        throw new Error("malformed enforcement availability response");
+      },
+    });
+
+    expect(code).toBe(1);
+    expect(out.text()).not.toContain("content filter enabled");
+    expect(err.text()).toContain(
+      "Enforcement availability: undetermined (availability_query_failed:malformed enforcement availability response",
+    );
+    expect(err.text()).toContain("Treat the wall as not enforcing");
   });
 
   it("enable refuses when the matching boot service is disabled", async () => {

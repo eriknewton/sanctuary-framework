@@ -310,11 +310,14 @@ export type ClaimSiteId =
   // --- castle-wall/provision (FIX F-REVOKE + F-INTERP, 2026-07-26) ---
   | "provision-egress.restore-reload-ok"
   | "provision-harness-argv.path-exists"
+  // --- cli/castle-wall.ts (Castle Wall operator render layer) ---
+  | "castle-wall-cli.content-filter-enabled"
   // --- wrap/cli.ts (THE RENDER LAYER -- had zero rows before fix-round 4) ---
   | "wrap-cli.degrade-agent-state";
 
 const EG = "server/src/egress-gate";
 const CW = "server/src/castle-wall/provision";
+const CLI = "server/src/cli";
 
 /**
  * The register. Total over {@link ClaimSiteId} -- a missing row does not
@@ -1908,6 +1911,16 @@ export const CLAIM_SITES: Record<ClaimSiteId, ClaimSiteDeclaration> = {
       claim: "the path could not be accessed by this process",
       basis: "observed",
     },
+  },
+  "castle-wall-cli.content-filter-enabled": {
+    file: `${CLI}/castle-wall.ts`,
+    symbol: "renderVerifiedArmClaimLine",
+    claim:
+      "the host app reports the content filter enabled, the system extension is activated enabled, and enforcement availability is live at arm-claim time",
+    basis: "observed",
+    layer: "render",
+    branches: "single",
+    detectorBlind: true,
   },
   "provision-unprovision.fully-ok": {
     file: `${CW}/unprovision.ts`,
