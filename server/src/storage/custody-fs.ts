@@ -10,6 +10,11 @@ export type CustodyFsErrorCode =
   | "mode_rejected"
   | "uid_rejected"
   | "gid_rejected"
+  | "directory_symlink_rejected"
+  | "directory_not_directory"
+  | "directory_mode_rejected"
+  | "directory_uid_rejected"
+  | "directory_gid_rejected"
   | "parent_not_directory"
   | "parent_symlink_rejected"
   | "parent_mode_rejected"
@@ -47,6 +52,13 @@ export interface DirectoryCustodyOptions {
   uid?: number;
   gid?: number;
   mode?: CustodyModeCheck;
+}
+
+export interface DirectoryWithinBaseCustodyOptions extends DirectoryCustodyOptions {
+  /** Permit the leaf directory itself to be absent, while still verifying its existing parent chain. */
+  allowMissingLeaf?: boolean;
+  /** Apply the custody predicate to every opened directory from base through leaf, not only the leaf. */
+  verifyEveryComponent?: boolean;
 }
 
 export interface ReadFileCustodyBaseOptions {
@@ -112,13 +124,13 @@ export interface WriteFileCustodyOptions {
   owner?: { uid: number; gid: number };
   /**
    * Containment base for `owner` writes (2026-07-31 gate round 3). Every path
-   * component from this directory down to the file is opened
-   * `O_NOFOLLOW | O_DIRECTORY` before the write, so a PRE-EXISTING symlinked
-   * ancestor cannot make a root process create, chown, and rename a file
-   * outside the intended tree -- the case the created-chain check alone
-   * missed, because when every directory already exists `mkdir` creates
-   * nothing and there is no chain to verify. Required whenever `owner` is
-   * set; the fortress path is the natural value.
+   * component from this directory down to the parent is opened
+   * `O_NOFOLLOW | O_DIRECTORY` before the write and revalidated immediately
+   * before the path-based calls. This refuses pre-existing/static symlinked
+   * ancestors and narrows the race window, but Node does not expose the
+   * `renameat`/`openat` primitives needed to bind the final path syscall to
+   * the held descriptors. Required whenever `owner` is set; the fortress path
+   * is the natural value.
    */
   ownerBase?: string;
 }
@@ -152,6 +164,46 @@ function throwModeRejected(
     `File custody check failed for ${path}: mode is not permitted.`,
     { details: { mode } },
   );
+}
+
+function verifyDirectoryStats(
+  path: string,
+  stats: Stats,
+  custody: DirectoryCustodyOptions,
+): void {
+  if (stats.isSymbolicLink()) {
+    throw new CustodyFsError(
+      "directory_symlink_rejected",
+      `Directory custody check failed for ${path}: symbolic links are not permitted.`,
+    );
+  }
+  if (!stats.isDirectory()) {
+    throw new CustodyFsError(
+      "directory_not_directory",
+      `Directory custody check failed for ${path}: not a directory.`,
+    );
+  }
+  if (custody.uid !== undefined && stats.uid !== custody.uid) {
+    throw new CustodyFsError(
+      "directory_uid_rejected",
+      `Directory custody check failed for ${path}: owner is not permitted.`,
+      { details: { uid: stats.uid, expected_uid: custody.uid } },
+    );
+  }
+  if (custody.gid !== undefined && stats.gid !== custody.gid) {
+    throw new CustodyFsError(
+      "directory_gid_rejected",
+      `Directory custody check failed for ${path}: group is not permitted.`,
+      { details: { gid: stats.gid, expected_gid: custody.gid } },
+    );
+  }
+  if (modeRejected(fileMode(stats), custody.mode)) {
+    throw new CustodyFsError(
+      "directory_mode_rejected",
+      `Directory custody check failed for ${path}: mode is not permitted.`,
+      { details: { mode: fileMode(stats) } },
+    );
+  }
 }
 
 async function verifyParentCustody(
@@ -427,7 +479,7 @@ export async function chownCreatedDirChain(
  * macOS (`/var` is itself a symlink). A caller that passes `owner` without
  * `ownerBase` is refused rather than silently given weaker containment.
  */
-type NoFollowPathGuard = {
+export type NoFollowDirectoryGuard = {
   resolvedBase: string;
   handles: Array<{ path: string; handle: Awaited<ReturnType<typeof open>> }>;
   revalidate(): Promise<void>;
@@ -437,7 +489,7 @@ type NoFollowPathGuard = {
 async function openNoFollowPathWithinBase(
   leafDir: string,
   base: string | undefined,
-): Promise<NoFollowPathGuard> {
+): Promise<NoFollowDirectoryGuard> {
   if (base === undefined || base.length === 0) {
     throw new Error(
       "writeFileCustody: `owner` requires `ownerBase` (the directory the write must stay inside); refusing an owner-write without a containment root",
@@ -514,6 +566,88 @@ async function openNoFollowPathWithinBase(
   }
 }
 
+async function verifyDirectoryGuardStats(
+  guard: NoFollowDirectoryGuard,
+  custody: DirectoryCustodyOptions,
+  verifyEveryComponent: boolean,
+): Promise<void> {
+  const handles = verifyEveryComponent ? guard.handles : guard.handles.slice(-1);
+  for (const entry of handles) {
+    verifyDirectoryStats(entry.path, await entry.handle.stat(), custody);
+  }
+}
+
+/**
+ * Open and hold every directory component from `base` through `leafDir`
+ * without following symlinks. The returned guard mirrors the owner-write
+ * pattern: keep descriptors live, then call `revalidate()` immediately before
+ * the path-based syscall that depends on the chain. That syscall still
+ * re-resolves the path by name: a swap between revalidation and the syscall is
+ * not prevented in Node because there is no `renameat`/`openat` binding here.
+ * The guard bounds that window and refuses pre-existing/static hostile shapes.
+ */
+export async function openDirectoryCustodyWithinBase(
+  leafDir: string,
+  base: string,
+  options: Omit<DirectoryWithinBaseCustodyOptions, "allowMissingLeaf"> = {},
+): Promise<NoFollowDirectoryGuard> {
+  const { verifyEveryComponent = false, ...custody } = options;
+  const guard = await openNoFollowPathWithinBase(leafDir, base);
+  const revalidate = async (): Promise<void> => {
+    await guard.revalidate();
+    await verifyDirectoryGuardStats(guard, custody, verifyEveryComponent);
+  };
+  try {
+    await verifyDirectoryGuardStats(guard, custody, verifyEveryComponent);
+    return {
+      resolvedBase: guard.resolvedBase,
+      handles: guard.handles,
+      revalidate,
+      close: guard.close,
+    };
+  } catch (err) {
+    await guard.close();
+    throw err;
+  }
+}
+
+/**
+ * Verify an existing directory chain from `base` to `leafDir` with the same
+ * per-component `O_NOFOLLOW | O_DIRECTORY` guard used by owner writes.
+ * When `allowMissingLeaf` is true, a missing leaf is accepted only after the
+ * existing parent chain inside `base` verifies no-follow.
+ */
+export async function verifyDirectoryCustodyWithinBase(
+  leafDir: string,
+  base: string,
+  options: DirectoryWithinBaseCustodyOptions = {},
+): Promise<void> {
+  const resolvedLeaf = resolvePath(leafDir);
+  const resolvedBase = resolvePath(base);
+  const { allowMissingLeaf = false, verifyEveryComponent = false, ...custody } = options;
+  try {
+    const leafStats = await lstat(resolvedLeaf);
+    verifyDirectoryStats(resolvedLeaf, leafStats, custody);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT" || !allowMissingLeaf) {
+      throw err;
+    }
+    const parentGuard = await openNoFollowPathWithinBase(dirname(resolvedLeaf), resolvedBase);
+    await parentGuard.close();
+    return;
+  }
+
+  const guard = await openDirectoryCustodyWithinBase(resolvedLeaf, resolvedBase, {
+    ...custody,
+    verifyEveryComponent,
+  });
+  try {
+    await guard.revalidate();
+  } finally {
+    await guard.close();
+  }
+}
+
 async function withOwnerEffectiveIdentity<T>(
   owner: { uid: number; gid: number } | undefined,
   fn: (dropped: boolean) => Promise<T>,
@@ -546,7 +680,7 @@ export async function writeFileCustody(
   options: WriteFileCustodyOptions,
 ): Promise<void> {
   const dir = dirname(path);
-  let ownerGuard: NoFollowPathGuard | undefined;
+  let ownerGuard: NoFollowDirectoryGuard | undefined;
   if (options.owner !== undefined) {
     // 2026-07-31 fix-round: verify containment BEFORE any recursive mkdir.
     // There is no mkdirat-style API here; creating missing parents by path as

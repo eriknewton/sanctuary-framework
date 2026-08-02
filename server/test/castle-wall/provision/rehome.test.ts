@@ -57,6 +57,8 @@ function mockOps(
     restores,
     restoreCustodyCalls,
     contents,
+    verifyDestinationHomeCustody: async () => {},
+    prepareDestinationParentCustody: async () => ({ revalidate: async () => {}, close: async () => {} }),
     pathExists: async (path) => existingPaths.has(path),
     pathExistsNoFollow: async (path) => existingPaths.has(path),
     hashPath: async (path) => ({ algorithm: "sha256", value: `hash-${path}` }),
@@ -171,6 +173,7 @@ describe("castle-wall/provision/rehome", () => {
         newAccountHome: NEW_ACCOUNT_HOME,
       });
       expect(plan.harnessId).toBe("hermes");
+      expect(plan.newAccountHome).toBe(NEW_ACCOUNT_HOME);
       const envStep = plan.steps.find((s) => s.entry.destRelativePath === ".hermes/.env");
       expect(envStep?.destPath).toBe(`${NEW_ACCOUNT_HOME}/.hermes/.env`);
       expect(plan.requiresInteractiveReconsent).toBe(false);
@@ -244,6 +247,76 @@ describe("castle-wall/provision/rehome", () => {
       expect(results[0]?.backupPath).toBeUndefined();
       expect(ops.backups).toEqual([]);
       expect(ops.moves.length).toBe(1);
+    });
+
+    it("revalidates the destination guard before path-dependent work and closes it after the step", async () => {
+      const adapter: AgentRehomeAdapter = {
+        harnessId: "test-guard-order",
+        pathsToRehome: (home) => [
+          { sourcePath: `${home}/.hermes/config.yaml`, destRelativePath: ".hermes/config.yaml", isSecret: true },
+        ],
+        requiresInteractiveReconsent: () => false,
+      };
+      const events: string[] = [];
+      const guard = {
+        revalidate: async () => {
+          events.push("guard:revalidate");
+        },
+        close: async () => {
+          events.push("guard:close");
+        },
+      };
+      const ops = mockOps(new Set([`${OPERATOR_HOME}/.hermes/config.yaml`]), {
+        verifyDestinationHomeCustody: async () => {
+          events.push("home:verify");
+        },
+        prepareDestinationParentCustody: async () => {
+          events.push("parent:prepare");
+          return guard;
+        },
+        pathExists: async () => {
+          events.push("source:exists");
+          return true;
+        },
+        pathExistsNoFollow: async () => {
+          events.push("dest:exists");
+          return false;
+        },
+        backup: async (path) => {
+          events.push("backup");
+          return { backupPath: `/root/.sanctuary-rehome-backups${path}.bak` };
+        },
+        move: async (_sourcePath, _destPath, destinationParentGuard) => {
+          events.push(destinationParentGuard === guard ? "move:guard-passed" : "move:guard-missing");
+          await destinationParentGuard?.revalidate();
+          events.push("move:done");
+        },
+        chown: async () => {
+          events.push("chown");
+          return { excludedPaths: [] };
+        },
+        recordDestinationProvenance: async () => {
+          events.push("provenance");
+        },
+      });
+      const plan = planRehome(adapter, { operatorHome: OPERATOR_HOME, newAccountHome: NEW_ACCOUNT_HOME });
+
+      await executeRehomePlan(plan, ops, { uid: 502, gid: 502 });
+
+      expect(events).toEqual([
+        "home:verify",
+        "source:exists",
+        "parent:prepare",
+        "guard:revalidate",
+        "dest:exists",
+        "backup",
+        "move:guard-passed",
+        "guard:revalidate",
+        "move:done",
+        "chown",
+        "provenance",
+        "guard:close",
+      ]);
     });
 
     it("refuses a dual source+destination conflict before backup or move, printing both hashes and paths", async () => {

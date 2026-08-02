@@ -153,6 +153,11 @@ import {
   type NormalizeFortressCustodyInput,
   type NormalizeFortressCustodyOutcome,
 } from "../castle-wall/provision/fortress-custody.js";
+import {
+  chownCreatedDirChain,
+  openDirectoryCustodyWithinBase,
+  verifyDirectoryCustodyWithinBase,
+} from "../storage/custody-fs.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -1281,7 +1286,11 @@ export async function runAutoProvisionForWrap(
       await mkdir(NEW_ACCOUNT_HOME_BASE, { recursive: true, mode: 0o711 });
       await chmod(NEW_ACCOUNT_HOME_BASE, 0o711);
       const rehomeOps = realRehomeOps();
-      const staleRuntimeConflictPath = await moveAsideStaleHermesRuntimeDestination(operatorHome, newAccountHome);
+      const staleRuntimeConflictPath = await moveAsideStaleHermesRuntimeDestination(
+        operatorHome,
+        newAccountHome,
+        { uid, gid },
+      );
       if (staleRuntimeConflictPath !== undefined) {
         print(`Moved stale Hermes runtime destination aside at ${staleRuntimeConflictPath}.`);
       }
@@ -2295,14 +2304,56 @@ export function hermesRuntimeRehomePaths(
 export async function moveAsideStaleHermesRuntimeDestination(
   operatorHome: string,
   newAccountHome: string,
+  expectedUidGid: { uid: number; gid: number },
 ): Promise<string | undefined> {
   const { sourcePath, destPath } = hermesRuntimeRehomePaths(operatorHome, newAccountHome);
-  if (!(await pathExists(sourcePath)) || !(await pathExistsNoFollow(destPath))) {
+  if (!(await pathExists(sourcePath))) {
     return undefined;
   }
-  const conflictPath = await findUniqueConflictPath(destPath);
-  await rename(destPath, conflictPath);
-  return conflictPath;
+  await verifyRehomeDestinationHomeCustody(newAccountHome, expectedUidGid);
+  const destParent = dirname(destPath);
+  if (!(await pathExistsNoFollow(destParent))) {
+    return undefined;
+  }
+  const parentGuard = await openDirectoryCustodyWithinBase(destParent, newAccountHome, {
+    uid: expectedUidGid.uid,
+    mode: { rejectGroupOrOtherWrite: true },
+    verifyEveryComponent: true,
+  });
+  try {
+    await parentGuard.revalidate();
+    if (!(await pathExistsNoFollow(destPath))) {
+      return undefined;
+    }
+    await parentGuard.revalidate();
+    const conflictPath = await findUniqueConflictPath(destPath);
+    await parentGuard.revalidate();
+    await rename(destPath, conflictPath);
+    return conflictPath;
+  } finally {
+    await parentGuard.close();
+  }
+}
+
+export async function verifyRehomeDestinationHomeCustody(
+  newAccountHome: string,
+  expectedUidGid: { uid: number; gid: number },
+): Promise<void> {
+  try {
+    await verifyDirectoryCustodyWithinBase(newAccountHome, dirname(newAccountHome), {
+      uid: expectedUidGid.uid,
+      mode: { rejectGroupOrOtherWrite: true },
+      allowMissingLeaf: true,
+    });
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    throw new Error(
+      `account home custody precheck failed for ${newAccountHome}: ${detail}. ` +
+        `Inspect ${newAccountHome} and its ancestors under ${dirname(newAccountHome)} before re-running; ` +
+        `a pre-existing account home must be a real directory owned by uid ${expectedUidGid.uid} and not group/other-writable, or be absent.`,
+      { cause: err },
+    );
+  }
 }
 
 /**
@@ -2904,6 +2955,38 @@ async function chownRecursiveInner(path: string, uid: number, gid: number, exclu
 export function realRehomeOps(opts?: { backupRoot?: string }) {
   const backupRoot = opts?.backupRoot ?? "/var/root/.sanctuary-rehome-backups";
   return {
+    verifyDestinationHomeCustody: async (
+      newAccountHome: string,
+      expectedUidGid: { uid: number; gid: number },
+    ): Promise<void> => {
+      await verifyRehomeDestinationHomeCustody(newAccountHome, expectedUidGid);
+    },
+    prepareDestinationParentCustody: async (
+      destPath: string,
+      newAccountHome: string,
+      expectedUidGid: { uid: number; gid: number },
+    ) => {
+      const parent = dirname(destPath);
+      try {
+        const firstCreated = await mkdir(parent, { recursive: true, mode: 0o700 });
+        if (firstCreated !== undefined) {
+          await chownCreatedDirChain(firstCreated, parent, expectedUidGid);
+        }
+        return await openDirectoryCustodyWithinBase(parent, newAccountHome, {
+          uid: expectedUidGid.uid,
+          mode: { rejectGroupOrOtherWrite: true },
+          verifyEveryComponent: true,
+        });
+      } catch (err) {
+        const detail = err instanceof Error ? err.message : String(err);
+        throw new Error(
+          `destination parent custody check failed for ${destPath}: ${detail}. ` +
+            `Refusing to move a re-homed secret unless every directory from ${newAccountHome} ` +
+            `through ${parent} is a real uid ${expectedUidGid.uid} directory with no group/other write bit.`,
+          { cause: err },
+        );
+      }
+    },
     pathExists,
     pathExistsNoFollow,
     hashPath: hashPathNoFollow,
@@ -3040,8 +3123,15 @@ export function realRehomeOps(opts?: { backupRoot?: string }) {
       const restored = await restoreBackupCopyNoFollow(backupPath, sourcePath);
       return { restored };
     },
-    move: async (sourcePath: string, destPath: string): Promise<void> => {
-      await mkdir(dirname(destPath), { recursive: true, mode: 0o700 });
+    move: async (
+      sourcePath: string,
+      destPath: string,
+      destinationParentGuard?: { revalidate(): Promise<void> },
+    ): Promise<void> => {
+      if (destinationParentGuard === undefined) {
+        await mkdir(dirname(destPath), { recursive: true, mode: 0o700 });
+      }
+      await destinationParentGuard?.revalidate();
       await rename(sourcePath, destPath);
     },
     chown: async (path: string, uid: number, gid: number): Promise<{ excludedPaths: string[] }> => {

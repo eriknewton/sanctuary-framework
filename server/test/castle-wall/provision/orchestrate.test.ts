@@ -1,4 +1,4 @@
-// fail-before-exempt: type-forced fixture update only (ParkedInstallRevertOps gained setJobDisabled/ensureHoldDir and the snapshot gained holdFilePath/disabledBefore); this file's subject has no behavioral stake in park reversibility — the real pins are in release-barrier.test.ts
+// fail-before-exempt: type-forced fixture updates only, from two separate contract changes — the rehome plan gained a required newAccountHome field (account-home custody), and ParkedInstallRevertOps gained setJobDisabled/ensureHoldDir plus snapshot holdFilePath/disabledBefore (park reversibility). This file's subject has a behavioral stake in neither; the real pins are in rehome.test.ts, auto-provision-realops.test.ts, and release-barrier.test.ts.
 /**
  * Tests for the one-flow orchestration (fold of the target flow's steps 1
  * through 11, folded fixes B2/H1/H3/H4/L2): every fail-closed branch is
@@ -175,7 +175,12 @@ function happyPathOps(overrides: Partial<ProvisionFlowOps> = {}): ProvisionFlowO
       uid: AGENT_UID,
     })),
     rehome: vi.fn(async () => ({
-      plan: { harnessId: "hermes", steps: [], requiresInteractiveReconsent: false },
+      plan: {
+        harnessId: "hermes",
+        newAccountHome: "/var/sanctuary-agents/sanctuary-hermes",
+        steps: [],
+        requiresInteractiveReconsent: false,
+      },
       results: REHOME_RESULTS,
     })),
     installHarnessDaemon: vi.fn(async () => ({ ok: true as const, bootstrappedThisRun: true })),
@@ -754,7 +759,12 @@ describe("castle-wall/provision/orchestrate", () => {
   it("FIX (round 5, R5-3): an abort where every re-home entry was skipped-absent reports rehomeAttempted:false (nothing MOVED, so no false 'restored' claim)", async () => {
     const ops = happyPathOps({
       rehome: vi.fn(async () => ({
-        plan: { harnessId: "hermes", steps: [], requiresInteractiveReconsent: false },
+        plan: {
+          harnessId: "hermes",
+          newAccountHome: "/var/sanctuary-agents/sanctuary-hermes",
+          steps: [],
+          requiresInteractiveReconsent: false,
+        },
         results: [
           {
             entry: { sourcePath: "/Users/op/.hermes/.env", destRelativePath: ".hermes/.env", isSecret: true },
