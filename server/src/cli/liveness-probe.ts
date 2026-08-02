@@ -145,6 +145,12 @@ async function readCommittedAgentUid(fortressPath: string): Promise<number> {
       originErr instanceof Error && "code" in originErr
         ? (originErr as NodeJS.ErrnoException).code
         : undefined;
+    // SECURITY: no `cause` by design. The caught error is a CustodyFsError
+    // carrying the absolute origin path, and `util.inspect(err)` prints
+    // `[cause]` even when the top-level message is sanitized — that exact leak
+    // was a merged finding on the Telegram prober (#1062). The CODE is the
+    // diagnostic; the path stays out of operator output.
+    // eslint-disable-next-line preserve-caught-error -- intentional: see SECURITY note above
     throw new Error(code === "ENOENT" ? "agent_origin_absent" : "agent_origin_unreadable");
   }
   let parsed: unknown;
