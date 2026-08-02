@@ -1,9 +1,22 @@
 /**
  * Sanctuary Sovereignty Dashboard — public surface.
  *
- * Consumers import `startDashboard` to bring up the hero-shield UI
- * on port 3501 (default). The rest of the exports are types + utilities
- * for tests and callers that want to wire in live events.
+ * RETIRED FROM PRODUCTION SPAWNING (dashboard one-surface fold PR-4,
+ * ratified decision 1, 2026-08-02): `sanctuary protect`/`wrap` no longer
+ * starts this server. The ONE production dashboard is the principal-policy
+ * `DashboardApprovalChannel` (`principal-policy/dashboard.ts`, booted by
+ * `sanctuary dashboard` / `dashboard-standalone.ts` and the MCP-server boot
+ * path), which now also serves everything this server was the only home of:
+ * the fleet-roster read, the `/api/templates` routes (init behind the Tier-1
+ * approval gate), the `/api/approvals/:id/(allow|deny)` wire shape, and the
+ * mobile companion PWA at `/m/*`.
+ *
+ * `startDashboard`/`startDashboardServer` remain EXPORTED: they are pinned
+ * public surface (`exported-names.json`) with live test anchors, and
+ * embedders may still construct this server deliberately. Deleting the
+ * module is a coordinator-scoped disposition (counted test removal), not a
+ * drive-by. Do not wire NEW production callers here; add routes to the
+ * principal-policy dashboard instead.
  */
 
 import type { AuditLog } from "../operational/audit-log.js";

@@ -4,6 +4,14 @@
  * Request router for the unified dashboard. Pure functions that
  * take a request + sources and produce a response so the transport
  * layer (node:http) and tests can exercise the same code paths.
+ *
+ * RETIRED FROM PRODUCTION SPAWNING (dashboard one-surface fold, 2026-08-02):
+ * no production path starts a server over this router anymore (`sanctuary
+ * protect` ensures-and-reuses the principal-policy dashboard instead). Every
+ * route group this router was the only home of now also lives on the
+ * principal-policy dashboard under ITS auth (fleet roster, templates with a
+ * Tier-1-gated init, the approvals alias, the `/m/*` PWA). Kept for the
+ * pinned exports + test anchors; do not add NEW routes here.
  */
 
 import { randomBytes } from "node:crypto";
