@@ -77,6 +77,12 @@ import {
 } from "../dashboard/aggregator.js";
 import { constantTimeEquals } from "../http/auth.js";
 import { logCaughtError } from "../http/error-envelope.js";
+import {
+  attachPostListenHttpServerErrorLogger,
+  cleanupFailedHttpServer,
+  closeHttpServer,
+  DEFAULT_HTTP_SHUTDOWN_GRACE_MS,
+} from "../http/server-lifecycle.js";
 import { V1SessionService } from "../v1/session-service.js";
 import { handleV1Request } from "../v1/router.js";
 import { denyForbidden } from "../v1/http.js";
@@ -382,6 +388,8 @@ export interface DashboardConfig {
   allow_plaintext_remote?: boolean;
   /** Optional producer-key loader overrides. Tests pin platform/path here. */
   producer_key_load_options?: ProducerKeyLoadOptions;
+  /** Shutdown grace before active connections are force-closed. Default: 5000ms. */
+  shutdown_grace_ms?: number;
 }
 
 interface PendingRequest {
@@ -779,7 +787,12 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   private pending: Map<string, PendingRequest> = new Map();
   private sseClients: Set<SSEClient> = new Set();
   private dashboardStreamClients: Set<SSEClient> = new Set();
-  private httpServer: ReturnType<typeof createHttpServer> | null = null;
+  private httpServer:
+    | ReturnType<typeof createHttpServer>
+    | ReturnType<typeof createHttpsServer>
+    | null = null;
+  private startPromise: Promise<void> | null = null;
+  private stopPromise: Promise<void> | null = null;
   private policy: PrincipalPolicy | null = null;
   private baseline: BaselineTracker | null = null;
   private auditLog: AuditLog | null = null;
@@ -5045,6 +5058,20 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    *   prints the loud operator banner and rejects.
    */
   async start(opts?: { exitCleanOnAddrInUse?: boolean }): Promise<void> {
+    if (this.startPromise) return this.startPromise;
+    if (this.httpServer) return;
+    this._addrInUse = false;
+    this.startPromise = this.startHttpServer(opts);
+    try {
+      await this.startPromise;
+    } finally {
+      this.startPromise = null;
+    }
+  }
+
+  private async startHttpServer(opts?: {
+    exitCleanOnAddrInUse?: boolean;
+  }): Promise<void> {
     // C1: enforce TLS for non-loopback bindings. Plaintext approve/deny
     // over the wire is a credential-theft vector. The operator can opt
     // out via allow_plaintext_remote for tailnet/VPN environments where
@@ -5092,8 +5119,47 @@ export class DashboardApprovalChannel implements ApprovalChannel {
 
       const protocol = this.useTLS ? "https" : "http";
       const baseUrl = `${protocol}://${this.config.host}:${this.config.port}`;
+      const onStartupError = (err: NodeJS.ErrnoException) => {
+        void cleanupFailedHttpServer(server).finally(() => {
+          if (this.httpServer === server) this.httpServer = null;
+          if (err.code === "EADDRINUSE") {
+            const port = this.config.port;
+            // Slice 2 single-owner: on the supervised path, another owner already
+            // holds the port (the LaunchAgent process, or a prior in-app spawn).
+            // This is NOT a crash; resolve cleanly so the boot path can exit 0
+            // and KeepAlive treats it as a successful run (no restart churn,
+            // never a tight loop). At most one listener survives; EADDRINUSE
+            // loses, quietly.
+            if (opts?.exitCleanOnAddrInUse) {
+              this._addrInUse = true;
+              process.stderr.write(
+                `\n  Sanctuary Dashboard: port ${port} already owned by another ` +
+                  `instance; standing down (single-owner).\n\n`,
+              );
+              resolve();
+              return;
+            }
+            process.stderr.write(
+              `\n  ╔══════════════════════════════════════════════════════════════╗\n` +
+              `  ║  Port ${port} is already in use.                              ║\n` +
+              `  ║                                                              ║\n` +
+              `  ║  Another Sanctuary Dashboard may still be running.           ║\n` +
+              `  ║  To fix: lsof -ti:${port} | xargs kill                        ║\n` +
+              `  ║  Then restart the dashboard.                                 ║\n` +
+              `  ╚══════════════════════════════════════════════════════════════╝\n\n`
+            );
+          }
+          reject(err);
+        });
+      };
+      server.once("error", onStartupError);
 
       server.listen(this.config.port, this.config.host, () => {
+        server.off("error", onStartupError);
+        attachPostListenHttpServerErrorLogger(
+          server,
+          "Sanctuary Principal Dashboard HTTP server",
+        );
         // Generate a pre-authenticated one-click URL
         const sessionUrl = this.authToken ? this.createSessionUrl() : baseUrl;
 
@@ -5120,36 +5186,6 @@ export class DashboardApprovalChannel implements ApprovalChannel {
 
         resolve();
       });
-      server.on("error", (err: NodeJS.ErrnoException) => {
-        if (err.code === "EADDRINUSE") {
-          const port = this.config.port;
-          // Slice 2 single-owner: on the supervised path, another owner already
-          // holds the port (the LaunchAgent process, or a prior in-app spawn).
-          // This is NOT a crash; resolve cleanly so the boot path can exit 0
-          // and KeepAlive treats it as a successful run (no restart churn,
-          // never a tight loop). At most one listener survives; EADDRINUSE
-          // loses, quietly.
-          if (opts?.exitCleanOnAddrInUse) {
-            this._addrInUse = true;
-            process.stderr.write(
-              `\n  Sanctuary Dashboard: port ${port} already owned by another ` +
-                `instance; standing down (single-owner).\n\n`,
-            );
-            resolve();
-            return;
-          }
-          process.stderr.write(
-            `\n  ╔══════════════════════════════════════════════════════════════╗\n` +
-            `  ║  Port ${port} is already in use.                              ║\n` +
-            `  ║                                                              ║\n` +
-            `  ║  Another Sanctuary Dashboard may still be running.           ║\n` +
-            `  ║  To fix: lsof -ti:${port} | xargs kill                        ║\n` +
-            `  ║  Then restart the dashboard.                                 ║\n` +
-            `  ╚══════════════════════════════════════════════════════════════╝\n\n`
-          );
-        }
-        reject(err);
-      });
     });
   }
 
@@ -5157,6 +5193,16 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * Stop the HTTP server and clean up.
    */
   async stop(): Promise<void> {
+    if (this.stopPromise) return this.stopPromise;
+    this.stopPromise = this.stopHttpServer();
+    try {
+      await this.stopPromise;
+    } finally {
+      this.stopPromise = null;
+    }
+  }
+
+  private async stopHttpServer(): Promise<void> {
     // Clear all pending requests
     for (const [, pending] of this.pending) {
       clearTimeout(pending.timer);
@@ -5193,8 +5239,12 @@ export class DashboardApprovalChannel implements ApprovalChannel {
 
     // Close HTTP server
     if (this.httpServer) {
-      return new Promise((resolve) => {
-        this.httpServer!.close(() => resolve());
+      const server = this.httpServer;
+      this.httpServer = null;
+      await closeHttpServer(server, {
+        label: "Sanctuary Principal Dashboard HTTP server",
+        graceMs:
+          this.config.shutdown_grace_ms ?? DEFAULT_HTTP_SHUTDOWN_GRACE_MS,
       });
     }
   }

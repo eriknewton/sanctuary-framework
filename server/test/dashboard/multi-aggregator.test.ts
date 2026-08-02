@@ -25,7 +25,7 @@ async function makeTenant(
   if (withRuntime) {
     await writeTenantRuntime(dir, {
       version: "0.10.0-test",
-      pid: 99001,
+      pid: process.pid,
       started_at: "2026-04-17T12:00:00.000Z",
       dashboard_host: "127.0.0.1",
       dashboard_port: port,
@@ -76,7 +76,7 @@ describe("dashboard/multi-aggregator", () => {
     expect(nsa.dashboard_url).toBe("http://127.0.0.1:3501");
     expect(nsa.dashboard_port).toBe(3501);
     expect(nsa.webhook_callback_port).toBe(3511);
-    expect(nsa.pid).toBe(99001);
+    expect(nsa.pid).toBe(process.pid);
     expect(nsa.running).toBe(true);
     const bravo = snap.tenants.find((r) => r.name === "bravo")!;
     expect(bravo.dashboard_url).toBeNull();

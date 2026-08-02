@@ -12,6 +12,7 @@ import { mkdtemp, rm, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { request as httpRequest } from "node:http";
+import { createConnection, type Socket } from "node:net";
 import { startMultiDashboardServer } from "../../src/dashboard/multi-server.js";
 import type { MultiDashboardHandle } from "../../src/dashboard/multi-server.js";
 
@@ -71,6 +72,16 @@ async function makeTenant(
   }
 }
 
+function openRawConnection(handle: MultiDashboardHandle): Promise<Socket> {
+  return new Promise((resolve, reject) => {
+    const socket = createConnection(
+      { host: handle.host, port: handle.port },
+      () => resolve(socket),
+    );
+    socket.once("error", reject);
+  });
+}
+
 describe("multi-server", () => {
   let home: string;
   let root: string;
@@ -89,10 +100,13 @@ describe("multi-server", () => {
   });
 
   async function start(authToken?: string): Promise<MultiDashboardHandle> {
-    const options: Parameters<typeof startMultiDashboardServer>[0] = {
+    const options: Parameters<typeof startMultiDashboardServer>[0] & {
+      shutdownGraceMs?: number;
+    } = {
       port: 0,
       host: "127.0.0.1",
       home,
+      shutdownGraceMs: 25,
     };
     if (authToken) options.authToken = authToken;
     handle = await startMultiDashboardServer(options);
@@ -164,5 +178,24 @@ describe("multi-server", () => {
     expect(res.status).toBe(404);
     const parsed = JSON.parse(res.body);
     expect(parsed.error).toBe("not_found");
+  });
+
+  it("stop() resolves after the shutdown grace while a client socket is open", async () => {
+    const h = await start();
+    const socket = await openRawConnection(h);
+    const stopping = h.stop();
+    try {
+      const outcome = await Promise.race([
+        stopping.then(() => "stopped" as const),
+        new Promise<"timeout">((resolve) =>
+          setTimeout(() => resolve("timeout"), 200),
+        ),
+      ]);
+      expect(outcome).toBe("stopped");
+    } finally {
+      socket.destroy();
+      await stopping.catch(() => undefined);
+      handle = null;
+    }
   });
 });

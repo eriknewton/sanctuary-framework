@@ -77,6 +77,39 @@ describe("startDashboardWithFallback — rc.2 MAX_PORT regression", () => {
     expect(attempts).toEqual([3511, 3512, 3513, 3514]);
   });
 
+  it("runs cleanup attached to each EADDRINUSE failure before retrying", async () => {
+    const attempts: number[] = [];
+    const cleaned: number[] = [];
+    const starter: DashboardStarter = async (opts) => {
+      attempts.push(opts.port);
+      if (opts.port < 3504) {
+        const err = new Error(`EADDRINUSE: port ${opts.port}`) as Error & {
+          code: string;
+          dashboardServerCleanup: () => Promise<void>;
+        };
+        err.code = "EADDRINUSE";
+        err.dashboardServerCleanup = async () => {
+          cleaned.push(opts.port);
+        };
+        throw err;
+      }
+      return {
+        url: `http://localhost:${opts.port}`,
+        port: opts.port,
+        host: "127.0.0.1",
+        stop: async () => {},
+        publish: () => {},
+        publishActivity: () => {},
+        publishApproval: () => {},
+      };
+    };
+
+    const handle = await startDashboardWithFallback(starter, 3501, "t", "test");
+    expect(handle.port).toBe(3504);
+    expect(attempts).toEqual([3501, 3502, 3503, 3504]);
+    expect(cleaned).toEqual([3501, 3502, 3503]);
+  });
+
   it("tries exactly PORT_FALLBACK_ATTEMPTS ports before giving up", async () => {
     const preferred = 3511;
     const busy: number[] = [];
