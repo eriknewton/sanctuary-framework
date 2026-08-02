@@ -58,6 +58,7 @@ import { resolveFleetCap } from "../entitlement/fleet-cap.js";
 import { isLicenseRevoked } from "../entitlement/revocation-list.js";
 import { revocationVerifiability } from "../entitlement/revocation-antirollback.js";
 import { openIssuer } from "./custody-unlock.js";
+import { dashboardRequest, DashboardRequestError } from "./dashboard-request.js";
 
 function write(stream: Writable, text: string): void {
   stream.write(text);
@@ -78,12 +79,28 @@ function hasFlag(argv: string[], name: string): boolean {
  * rollup are NOT on that response today - see the honest-`null` note below).
  * Injected as `fetchPosture` so tests never need a real daemon or network.
  *
- * The daemon route is a READ (no operator-bearer gate); it is a CONVENIENCE
- * source for the roster-derived fields, not a trust boundary the attestation
- * relies on for its signature - the signature covers whatever posture this
- * function returns, honest `null`s included for anything unmeasured. Any
- * failure (daemon unreachable, non-200, malformed body) resolves to the
- * honest "roster_unavailable" branch - never a fabricated count.
+ * The daemon route is a CONVENIENCE source for the roster-derived fields, not a
+ * trust boundary the attestation relies on for its signature - the signature
+ * covers whatever posture this function returns, honest `null`s included for
+ * anything unmeasured. A daemon that is DOWN (unreachable, non-200, malformed
+ * body) resolves to the honest "roster_unavailable" branch - never a fabricated
+ * count.
+ *
+ * CREDENTIAL (2026-08-02): the route now requires an operator-derived
+ * credential (loopback position alone is refused - a co-resident agent uid
+ * shares that position). `export` runs AS the operator, so it presents the
+ * operator bearer through the SAME channel every other API-client CLI verb
+ * uses: {@link dashboardRequest}, reading `SANCTUARY_DASHBOARD_AUTH_TOKEN`.
+ * No new credential channel is invented here.
+ *
+ * A daemon that is REACHABLE but REFUSES us is NOT the same event as a daemon
+ * that is down, and must never collapse into it: silently emitting the
+ * roster-unavailable branch would ship a DEGRADED attestation that says
+ * "no roster was found" when the truth is "a roster exists and we were not
+ * allowed to read it". That is exactly the silent security downgrade AGENTS.md
+ * constraint 5 forbids, so an auth refusal throws
+ * {@link DaemonPostureAuthError} and `export` fails loudly, non-zero, printing
+ * no document at all.
  */
 export type PostureFetcher = () => Promise<{
   centralNodesTotal: number;
@@ -102,46 +119,72 @@ export type PostureFetcher = () => Promise<{
 const DEFAULT_DASHBOARD_URL = "http://127.0.0.1:3502";
 
 /**
- * The DEFAULT posture fetcher: a best-effort unauthenticated GET against the
- * local daemon's read-only fleet-status route. Returns null (never throws) on
- * ANY failure so the caller can fall back to the honest roster-unavailable
- * branch - a daemon that is down, slow, or returns something unexpected must
- * never block or corrupt an attestation export.
+ * The daemon is REACHABLE but REFUSED the posture read (HTTP 401/403).
+ *
+ * Distinct from every other fetch failure on purpose. "The daemon is down" and
+ * "the daemon will not talk to us" are different facts about the fortress, and
+ * only the first one honestly maps to the attestation's roster-unavailable
+ * branch. Collapsing the second into the first would sign a document asserting
+ * a posture nobody measured, with nothing in it saying so.
+ */
+export class DaemonPostureAuthError extends Error {
+  constructor(detail: string) {
+    super(detail);
+    this.name = "DaemonPostureAuthError";
+  }
+}
+
+/**
+ * The DEFAULT posture fetcher: a best-effort GET against the local daemon's
+ * read-only fleet-status route, carrying the operator bearer from
+ * `SANCTUARY_DASHBOARD_AUTH_TOKEN` (the channel {@link dashboardRequest}
+ * already resolves for every API-client CLI verb).
+ *
+ * Returns null on a daemon that is down, slow, or returns something unexpected,
+ * so the caller falls back to the honest roster-unavailable branch. THROWS
+ * {@link DaemonPostureAuthError} when the daemon answers 401/403 - see the
+ * fetchDaemonPosture note above for why that one case must not be silent.
  */
 async function fetchDaemonPosture(
   dashboardUrl: string,
+  authToken: string,
 ): ReturnType<PostureFetcher> {
+  let body: Record<string, unknown>;
   try {
-    const res = await fetch(`${dashboardUrl}/api/fleet/status`, {
-      method: "GET",
-    });
-    if (!res.ok) return null;
-    const body = (await res.json()) as Record<string, unknown>;
-    const admitted =
-      typeof body.admitted_node_count === "number" ? body.admitted_node_count : 0;
-    const bannerState =
-      typeof body.banner_state === "string" ? body.banner_state : "unknown";
-    // The shipped `/api/fleet/status` response does not carry revoked/untrusted
-    // counts, the eviction serial, or the policy-distribution rollup (it is a
-    // BANNER endpoint, not a full roster dump). Report what it honestly gives
-    // us (admitted count + banner) and an explicit `null` (NOT a zero) for the
-    // rest, so a reader can distinguish "measured zero" from "never measured"
-    // (the A3 fix - do NOT fabricate precision the endpoint does not provide).
-    // A future daemon route (spec §2c) can widen this by wiring the real
-    // `buildFleetRoster` rollup without changing the attestation shape (that
-    // richer wiring is a flagged follow-up, not required for this fix).
-    return {
-      centralNodesTotal: admitted,
-      admitted,
-      revoked: null,
-      untrusted: null,
-      evictionSerial: null,
-      policyDistribution: null,
-      bannerState,
-    };
-  } catch {
+    body = (await dashboardRequest("/api/fleet/status", {}, {
+      dashboardUrl,
+      authToken,
+    })) as Record<string, unknown>;
+  } catch (cause) {
+    if (cause instanceof DashboardRequestError && cause.kind === "auth") {
+      throw new DaemonPostureAuthError(cause.message);
+    }
+    // Daemon down / not implemented / server error / malformed body: honestly
+    // unmeasured, and the attestation says so via "roster_unavailable".
     return null;
   }
+  const admitted =
+    typeof body.admitted_node_count === "number" ? body.admitted_node_count : 0;
+  const bannerState =
+    typeof body.banner_state === "string" ? body.banner_state : "unknown";
+  // The shipped `/api/fleet/status` response does not carry revoked/untrusted
+  // counts, the eviction serial, or the policy-distribution rollup (it is a
+  // BANNER endpoint, not a full roster dump). Report what it honestly gives
+  // us (admitted count + banner) and an explicit `null` (NOT a zero) for the
+  // rest, so a reader can distinguish "measured zero" from "never measured"
+  // (the A3 fix - do NOT fabricate precision the endpoint does not provide).
+  // A future daemon route (spec §2c) can widen this by wiring the real
+  // `buildFleetRoster` rollup without changing the attestation shape (that
+  // richer wiring is a flagged follow-up, not required for this fix).
+  return {
+    centralNodesTotal: admitted,
+    admitted,
+    revoked: null,
+    untrusted: null,
+    evictionSerial: null,
+    policyDistribution: null,
+    bannerState,
+  };
 }
 
 /** Map a resolved entitlement + activation record into the attestation's license view. */
@@ -299,8 +342,30 @@ async function runExport(
     let roster: Awaited<ReturnType<PostureFetcher>>;
     try {
       roster = await fetchPosture();
-    } catch {
-      // The posture fetcher must never abort or corrupt an export; any
+    } catch (cause) {
+      if (cause instanceof DaemonPostureAuthError) {
+        // The daemon is UP and REFUSED us. Falling through to the
+        // roster-unavailable zeros here would sign a document asserting "no
+        // roster was found" when the truth is "a roster exists and we were not
+        // allowed to read it" - a silently DEGRADED attestation, which is the
+        // security downgrade AGENTS.md constraint 5 forbids. Fail loudly,
+        // non-zero, printing no document at all (the same posture this command
+        // already takes when custody will not unlock), and name the credential
+        // channel so the operator can fix it in one step.
+        write(
+          err,
+          "attest export: the local daemon refused the fleet-posture read " +
+            "(operator credential required).\n" +
+            "  Export will NOT emit a degraded attestation that reports an " +
+            "unmeasured roster as absent.\n" +
+            "  Set SANCTUARY_DASHBOARD_AUTH_TOKEN to this fortress's operator " +
+            "token and re-run, or stop the daemon to attest the honestly " +
+            "roster-unavailable posture.\n" +
+            `  Detail: ${(cause as Error).message}\n`,
+        );
+        return 1;
+      }
+      // The posture fetcher must never abort or corrupt an export; any OTHER
       // failure (network, parse, unexpected shape) falls through to the
       // honest roster-unavailable zeros below.
       roster = null;
@@ -492,6 +557,12 @@ SANCTUARY_RECOVERY_KEY). export signs with the DEFAULT operator identity, the
 SAME key 'sanctuary license issue' signs licenses with. verify is OFFLINE and
 needs no custody unlock.
 
+Daemon posture (export only): the local daemon's fleet-status read requires an
+operator credential, so set SANCTUARY_DASHBOARD_AUTH_TOKEN to this fortress's
+operator token. A daemon that is DOWN yields the honest roster-unavailable
+posture; a daemon that is UP and refuses the read FAILS the export rather than
+signing an attestation that reports an unmeasured roster as absent.
+
 verify prints "VALID" ONLY when --operator-key/--pin (an independently known
 operator public key) is supplied and matches the document. Without a pin,
 verify prints "well-formed, self-consistent, provenance UNVERIFIED" - a doc
@@ -511,7 +582,15 @@ async function runAttestCommand(
     case "export": {
       const dashboardUrl =
         flagValue(rest, "--dashboard-url") ?? env.SANCTUARY_DASHBOARD_URL ?? DEFAULT_DASHBOARD_URL;
-      const posture = fetchPosture ?? (() => fetchDaemonPosture(dashboardUrl));
+      // The operator bearer, read from the SAME env var every other API-client
+      // CLI verb uses (see dashboard-request.ts). Threaded from the injected
+      // `env` rather than `process.env` so tests never mutate global state. The
+      // empty string sends NO Authorization header, which is the correct
+      // request to make against a daemon with auth disabled - the daemon, not
+      // this CLI, decides whether that is enough.
+      const authToken = env.SANCTUARY_DASHBOARD_AUTH_TOKEN ?? "";
+      const posture =
+        fetchPosture ?? (() => fetchDaemonPosture(dashboardUrl, authToken));
       return runExport(rest, out, err, env, posture);
     }
     case "verify":

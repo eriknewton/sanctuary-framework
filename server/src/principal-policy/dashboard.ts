@@ -728,12 +728,9 @@ function isDashboardReadStyleNonGet(method: string, path: string): boolean {
  * valid is what lets the browser console keep reading these routes. What is
  * removed is admission by network position alone.
  *
- * KNOWN, DELIBERATELY OUT OF SCOPE: `GET /api/pending` has the same loopback
- * admission, but it predates the fold on this surface (it is not one of the
- * routes #1071 moved) and the posture-home landing page reads it through
- * loopback auto-auth to render the operator's approval queue. Closing it needs
- * a paired client change so the page carries the bearer; that is a separate
- * change from this finding.
+ * This predicate names ONLY the folded set; {@link isOperatorOnlyReadRoute} is
+ * the chokepoint the request gate actually consults, and it adds the reads that
+ * predate the fold on this surface but need the same treatment.
  */
 export function isFoldedOperatorReadRoute(
   method: string,
@@ -744,6 +741,63 @@ export function isFoldedOperatorReadRoute(
     path === "/api/fleet/roster" ||
     path === "/api/templates" ||
     /^\/api\/templates\/[^/]+$/.test(path)
+  );
+}
+
+/**
+ * THE FLEET-POSTURE READS — the licensing/capacity reads that predate the fold
+ * on this surface and carry the same exposure the folded reads did:
+ *
+ *   GET /api/fleet/status          tier, node cap, downgrade-banner state
+ *   GET /api/fleet/capacity        enrollment headroom (active/remaining)
+ *   GET /api/fleet/downgrade-log   the operator-visible transition log
+ *
+ * They were never part of what #1071 moved, so #1075 left them alone; they were
+ * nonetheless admitting a TOKENLESS loopback caller through the v0.10.2
+ * auto-auth branch, which in the MCP threat model means a co-resident process
+ * (including a confined agent uid) could read the fortress's licensing tier,
+ * node counts, cap headroom, and downgrade history with no credential at all.
+ * Same fail-open, same reasoning, same fix.
+ */
+function isFleetPostureReadRoute(method: string, path: string): boolean {
+  if (method !== "GET" && method !== "HEAD") return false;
+  return (
+    path === "/api/fleet/status" ||
+    path === "/api/fleet/capacity" ||
+    path === "/api/fleet/downgrade-log"
+  );
+}
+
+/**
+ * THE CHOKEPOINT: every read on this surface that admits an operator-derived
+ * credential ONLY — the bearer, or a session/cookie minted FROM the bearer —
+ * and never admission by loopback network position.
+ *
+ * One predicate, consulted once at the shared request gate, so closing the next
+ * route of this class is a one-line addition here rather than a per-handler
+ * edit that a later route can silently skip.
+ *
+ * `requireToken` is deliberately NOT used for this class: a session token and
+ * the `sanctuary_session` cookie are both minted only by presenting the
+ * operator bearer to `POST /auth/session`, so they ARE operator-derived, and
+ * keeping them valid is what lets the browser console keep reading these
+ * routes. What is removed is admission by network position alone.
+ *
+ * Scope stays deliberately narrow: loopback auto-auth is intact on every read
+ * NOT named here. It is a considered affordance for the local browser client
+ * (the operator already proved custody with the passphrase at the terminal),
+ * and these findings do not support retiring it repo-wide.
+ *
+ * KNOWN, STILL OUT OF SCOPE: `GET /api/pending` has the same loopback
+ * admission. Closing it needs a paired change to the posture-home landing page,
+ * which reads it through loopback auto-auth and swallows failure into an empty
+ * list — gating the route alone would silently empty the operator's approval
+ * inbox. That pairing is a separate change.
+ */
+export function isOperatorOnlyReadRoute(method: string, path: string): boolean {
+  return (
+    isFoldedOperatorReadRoute(method, path) ||
+    isFleetPostureReadRoute(method, path)
   );
 }
 
@@ -5492,8 +5546,8 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * when no token is configured and accepts only a valid operator bearer. It
    * never accepts loopback auto-auth, ?session=, or sanctuary_session cookies.
    *
-   * `denyLoopbackAutoAuth` is the weaker sibling used by the FOLDED read
-   * routes (see {@link isFoldedOperatorReadRoute}): every operator-derived
+   * `denyLoopbackAutoAuth` is the weaker sibling used by the OPERATOR-ONLY
+   * read routes (see {@link isOperatorOnlyReadRoute}): every operator-derived
    * credential still passes (bearer, ?session=, cookie), but loopback network
    * position alone does not.
    *
@@ -5532,9 +5586,10 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     // v0.10.2: loopback auto-auth - see _autoAuthLocalhost comment. Strict
     // routes return above before this shortcut, so loopback can never release
     // a Tier-1 decision or mutate operator state by network position alone.
-    // The FOLDED read routes opt out via `denyLoopbackAutoAuth` (decision 2:
-    // the retired wrap surface's tokenless fail-open reads do NOT carry over),
-    // and fall through to the operator-derived credential checks below.
+    // The OPERATOR-ONLY read routes opt out via `denyLoopbackAutoAuth`
+    // (decision 2: the retired wrap surface's tokenless fail-open reads do NOT
+    // carry over), and fall through to the operator-derived credential checks
+    // below.
     if (
       !opts?.denyLoopbackAutoAuth &&
       this._autoAuthLocalhost &&
@@ -6388,12 +6443,12 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     // dashboard's live PII preview works without a bearer. GET/read routes keep
     // `{ allowSession: true }` as before.
     //
-    // The GET branch carries ONE extra restriction: the FOLDED read routes
-    // (see {@link isFoldedOperatorReadRoute}) refuse loopback auto-auth, so a
-    // co-resident process cannot read the fleet roster or the template
-    // registry by network position alone. Every operator-derived credential
-    // (bearer, ?session=, cookie) still passes, and auto-auth is untouched on
-    // every other route.
+    // The GET branch carries ONE extra restriction: the OPERATOR-ONLY read
+    // routes (see {@link isOperatorOnlyReadRoute}) refuse loopback auto-auth,
+    // so a co-resident process cannot read the fleet roster, the template
+    // registry, or the fleet licensing/capacity posture by network position
+    // alone. Every operator-derived credential (bearer, ?session=, cookie)
+    // still passes, and auto-auth is untouched on every other route.
     const requiresOperatorBearer =
       method !== "GET" &&
       method !== "HEAD" &&
@@ -6407,7 +6462,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
           ? { requireToken: true }
           : {
               allowSession: true,
-              denyLoopbackAutoAuth: isFoldedOperatorReadRoute(
+              denyLoopbackAutoAuth: isOperatorOnlyReadRoute(
                 method,
                 url.pathname,
               ),
@@ -6604,13 +6659,17 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         // Fleet control plane PR-3: the DOWNGRADE BANNER state. Reports the
         // current tier/cap, whether the plan is expiring/expired/revoked/over-cap
         // and why, and that renewing restores console management. Read-only; never
-        // gates security; carries no key material. Fire-and-forget (the async
-        // handler owns writing the response), matching this dispatch's contract.
+        // gates security; carries no key material. Requires an operator-derived
+        // credential (bearer, or a session/cookie minted from it) — loopback
+        // position alone is refused, see isOperatorOnlyReadRoute. Fire-and-forget
+        // (the async handler owns writing the response), matching this dispatch's
+        // contract.
         void this.handleFleetStatus(res);
       } else if (method === "GET" && url.pathname === "/api/fleet/downgrade-log") {
         // Fleet control plane PR-3: the OPERATOR-VISIBLE downgrade log. Answers
         // "these N nodes left the console because the plan lapsed - their walls
-        // are still up" in one read. Read-only; no key material.
+        // are still up" in one read. Read-only; no key material. Operator-derived
+        // credential required; loopback position refused (isOperatorOnlyReadRoute).
         void this.handleFleetDowngradeLog(res);
       } else if (
         method === "POST" &&
@@ -6628,7 +6687,9 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         // Fleet control plane, Add-Machine slice: the honest "enrollment
         // headroom" read the Add-Machine UI needs before it invites a node.
         // Read-only; fail-closed to the community floor on any read failure;
-        // never gates security; carries no key material.
+        // never gates security; carries no key material. Operator-derived
+        // credential required; loopback position refused
+        // (isOperatorOnlyReadRoute).
         void this.handleFleetCapacity(res);
       } else if (
         method === "POST" &&

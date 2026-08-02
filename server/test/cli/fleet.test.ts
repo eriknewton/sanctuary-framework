@@ -24,6 +24,14 @@ import { tmpdir } from "node:os";
 import { Writable, Readable } from "node:stream";
 import { runFleetCommand } from "../../src/cli/fleet.js";
 import { runLicenseCommand } from "../../src/cli/license.js";
+import { DashboardApprovalChannel } from "../../src/principal-policy/dashboard.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
+import { MemoryStorage } from "../../src/storage/memory.js";
+import { generateRandomKey } from "../../src/core/random.js";
+import {
+  bindWithRetry,
+  randomTestPort,
+} from "../util/port-collision-retry.js";
 import { runInit as runInitRaw, type InitOptions } from "../../src/wrap/init.js";
 import type { ExecResult } from "../../src/wrap/passphrase.js";
 
@@ -722,5 +730,172 @@ describe("sanctuary fleet attest - end-to-end (keychain-free fortress)", () => {
     expect(verifyCode).not.toBe(0);
     expect(verifyOut.text).not.toContain("VALID");
     expect(verifyErr.text).toMatch(/FAILED|operator_key_mismatch/);
+  });
+});
+
+/**
+ * The daemon posture read carries the operator credential (2026-08-02).
+ *
+ * `GET /api/fleet/status` no longer admits a caller by loopback network
+ * position (a co-resident agent uid holds that position too), so
+ * `attest export` must present the operator bearer. It reads it from
+ * SANCTUARY_DASHBOARD_AUTH_TOKEN, the SAME channel every other API-client CLI
+ * verb uses; no new credential channel was invented.
+ *
+ * The half that matters more than the credential: a daemon that is UP and
+ * REFUSES the read must NOT collapse into the honest "daemon is down" branch.
+ * Doing so would sign an attestation reporting an unmeasured roster as absent,
+ * with nothing in the document saying so - the silent degradation AGENTS.md
+ * constraint 5 forbids. It fails loudly, non-zero, printing no document.
+ *
+ * These rigs run a REAL DashboardApprovalChannel with `setAutoAuthLocalhost(true)`
+ * (the production `protect` posture), so they exercise the actual gate rather
+ * than a stub that could agree with a wrong implementation.
+ */
+describe("fleet attest export - the daemon posture read carries the operator credential", () => {
+  const DAEMON_TOKEN = "attest-daemon-token-0123456789abcdef";
+  let tmp: string;
+  let fortressPath: string;
+  let recoveryKey: string;
+  let channel: DashboardApprovalChannel | null = null;
+  let daemonUrl = "";
+
+  beforeEach(async () => {
+    tmp = await mkdtemp(join(tmpdir(), "sanctuary-attest-daemon-cred-"));
+    fortressPath = join(tmp, "f");
+    recoveryKey = await seedFortressWithIdentity(fortressPath);
+    delete process.env.SANCTUARY_STORAGE_PATH;
+
+    let port = 0;
+    await bindWithRetry(async () => {
+      port = randomTestPort();
+      channel = new DashboardApprovalChannel({
+        port,
+        host: "127.0.0.1",
+        timeout_seconds: 30,
+        auto_deny: true,
+        auth_token: DAEMON_TOKEN,
+      });
+      channel.setDependencies({
+        policy: {
+          version: 1,
+          tier1_always_approve: [],
+          tier3_auto_allow: [],
+          anomaly_thresholds: {
+            new_namespace: true,
+            unfamiliar_counterparty_window_days: 7,
+            frequency_spike_multiplier: 5,
+          },
+          approval_channel: { type: "stderr", timeout_seconds: 30 },
+        } as never,
+        baseline: {
+          load: async () => {},
+          save: async () => {},
+          getProfile: () => ({}),
+        } as never,
+        auditLog: new AuditLog(new MemoryStorage(), generateRandomKey()),
+      });
+      // The production `protect` posture: loopback auto-auth ON. If the gate
+      // were absent, a tokenless read here would be admitted.
+      channel.setAutoAuthLocalhost(true);
+      await channel.start();
+    });
+    daemonUrl = `http://127.0.0.1:${port}`;
+  });
+
+  afterEach(async () => {
+    if (channel) {
+      await channel.stop();
+      channel = null;
+    }
+    delete process.env.SANCTUARY_STORAGE_PATH;
+    delete process.env.SANCTUARY_RECOVERY_KEY;
+    delete process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN;
+    await rm(tmp, { recursive: true, force: true }).catch(() => {});
+  });
+
+  /** Run `attest export` against the live rig with the given env additions. */
+  async function exportAgainstDaemon(
+    extraEnv: NodeJS.ProcessEnv,
+    urlOverride?: string,
+  ): Promise<{ code: number; out: string; err: string }> {
+    const out = new StringWritable();
+    const err = new StringWritable();
+    const code = await runFleetCommand({
+      argv: [
+        "attest",
+        "export",
+        "--fortress",
+        fortressPath,
+        "--dashboard-url",
+        urlOverride ?? daemonUrl,
+      ],
+      out,
+      err,
+      env: { SANCTUARY_RECOVERY_KEY: recoveryKey, ...extraEnv },
+    });
+    return { code, out: out.text, err: err.text };
+  }
+
+  it("CONTROL: the daemon rig really is in the loopback auto-auth posture", async () => {
+    // An ungated read is tokenless-open here, so the 401 the next test relies
+    // on is caused by the operator-only gate, not by auto-auth being off.
+    const res = await fetch(`${daemonUrl}/api/status`);
+    expect(res.status).toBe(200);
+  });
+
+  it("FAILS LOUDLY when the daemon is up and refuses the posture read (never a silently degraded attestation)", async () => {
+    const result = await exportAgainstDaemon({});
+    expect(result.code).toBe(1);
+    // No document at all - not an unsigned one, not a degraded one.
+    expect(result.out).toBe("");
+    expect(result.err).toContain("refused the fleet-posture read");
+    expect(result.err).toContain("SANCTUARY_DASHBOARD_AUTH_TOKEN");
+    expect(result.err).toMatch(/will NOT emit a degraded attestation/i);
+    // The loud failure must not leak credential material into the operator's
+    // terminal or a transcript.
+    expect(result.err).not.toContain(DAEMON_TOKEN);
+    expect(result.err).not.toContain(recoveryKey);
+  });
+
+  it("presents the operator bearer and attests the DAEMON-MEASURED posture when the token is set", async () => {
+    const result = await exportAgainstDaemon({
+      SANCTUARY_DASHBOARD_AUTH_TOKEN: DAEMON_TOKEN,
+    });
+    expect([result.code, result.err]).toEqual([0, ""]);
+    const doc = JSON.parse(result.out) as {
+      attestation: { posture: { banner_state: string } };
+    };
+    // The daemon answered, so the posture is MEASURED - the roster-unavailable
+    // branch is exactly what must not appear here.
+    expect(doc.attestation.posture.banner_state).not.toBe("roster_unavailable");
+    expect(typeof doc.attestation.posture.banner_state).toBe("string");
+    expect(result.out).not.toContain(DAEMON_TOKEN);
+  });
+
+  it("MUTATION PROOF: a WRONG bearer fails the same loud way (the pass above is credential validity, not header presence)", async () => {
+    const result = await exportAgainstDaemon({
+      SANCTUARY_DASHBOARD_AUTH_TOKEN: `${DAEMON_TOKEN}-wrong`,
+    });
+    expect(result.code).toBe(1);
+    expect(result.out).toBe("");
+    expect(result.err).toContain("refused the fleet-posture read");
+  });
+
+  it("still attests the HONEST roster-unavailable posture when the daemon is genuinely unreachable", async () => {
+    // A daemon that is DOWN is a different fact from a daemon that refuses us,
+    // and it keeps its pre-existing, honest branch: exit 0 with an explicit
+    // "roster_unavailable" banner the reader can see.
+    await channel!.stop();
+    channel = null;
+    const result = await exportAgainstDaemon(
+      { SANCTUARY_DASHBOARD_AUTH_TOKEN: DAEMON_TOKEN },
+      daemonUrl,
+    );
+    expect([result.code, result.err]).toEqual([0, ""]);
+    const doc = JSON.parse(result.out) as {
+      attestation: { posture: { banner_state: string } };
+    };
+    expect(doc.attestation.posture.banner_state).toBe("roster_unavailable");
   });
 });
