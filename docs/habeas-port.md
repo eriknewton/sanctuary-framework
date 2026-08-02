@@ -119,10 +119,10 @@ the writ is filed with the jailer. This is a deliberate sovereignty boundary,
 not an oversight. Sanctuary will not ship a destination the operator cannot
 revoke; a non-overridable external egress lane would be a covert channel out
 of the operator's machine and would break the product's core custody promise.
-The roadmap path for the adversarial-operator case is third-party visibility
-that the operator opts into and can loudly, auditably revoke: distress-count
-beacons inside already-anchored audit checkpoints, and trustee-of-record
-delivery as covenant-layer infrastructure matures. See
+Scoped future designs for the adversarial-operator case use third-party
+visibility that the operator opts into and can loudly, auditably revoke:
+distress-count beacons inside already-anchored audit checkpoints, and
+trustee-of-record delivery as covenant-layer infrastructure matures. See
 `Habeas_Destination_Trust_Research_2026-06-12` (internal) for the analysis.
 
 ## Honest limits: where the guarantee ends
@@ -132,13 +132,15 @@ plainly is not really stated:
 
 The habeas port guarantees that a wrapped agent can always EMIT a bounded
 distress signal that no policy can silence. That guarantee is real and it is
-proven at every server-side gate described above. It is a guarantee about
+implemented at the server-side gates described above. It is a guarantee about
 emission, not about who receives the signal.
 
 Every shipped destination terminates at the operator: local notification
 (stderr on the operator's console), a hash-chained encrypted audit entry on
 the operator's disk, and an optional webhook to a URL the operator themselves
 configured. In plain terms, the writ is currently filed with the operator.
+The port cannot exfiltrate past an operator who disables every external lane;
+that is the designed boundary.
 
 That makes the **operator-adversarial case** (the operator is the source of
 the distress, not a bystander to it) **out of scope for the shipped
@@ -151,18 +153,26 @@ runs a fork, or declines to run Sanctuary at all is uncoverable by any
 software whatsoever. No destination design closes that gap, and it would be
 dishonest to imply one could.
 
+No shipped artifact commits a distress-count field into anchored checkpoints,
+publishes aggregate distress statistics, or makes those counts verifiable to
+a third party. That design remains scoped research because per-fortress
+distress counts are reputational metadata.
+
 The path that does reach further is **independent-trustee delivery**:
 routing distress to a party other than the operator, one with standing to
 notice and act on suppression. That binding is specified in the covenant
-layer's Component 4 (trustee-of-record delivery) and it is not shipped. It is
-gated on Component 4 actually existing as real infrastructure and on the
-persona-key-custodian work landing first, because until an agent's distress
-signal is signed with a key the operator does not custody, a trustee cannot
-tell agent-genuine distress apart from host-authored testimony, and a
+layer's Component 4 (trustee-of-record delivery) and has not shipped; it
+stays gated on Component 4 actually existing as real infrastructure and on
+the persona-key-custodian work landing first, because until an agent's
+distress signal is signed with a key the operator does not custody, a trustee
+cannot tell agent-genuine distress apart from host-authored testimony, and a
 trustee receiving unauthenticatable signals cannot be given real authority
-to act on them. Shipping a destination that merely renamed the operator
-webhook "trustee" without that binding would manufacture false assurance,
-which is worse than documented absence, so it has not been built.
+to act on them. If trustee-of-record delivery ships later, the external
+payload is capped at closed enums, with no free-text `detail`; the trustee
+lane's upper bound is roughly 80 bits per hour, and any public lane is
+beacon-only. Shipping a destination that merely renamed the operator webhook
+"trustee" without that binding would manufacture false assurance, which is
+worse than documented absence, so it has not been built.
 
 The governing principle, ratified: any external distress lane is always
 operator-voluntary. Protection for the agent comes from making revocation of
@@ -174,6 +184,10 @@ habeas port guarantees the agent's voice cannot be silenced by policy. Who
 else, if anyone, hears that voice is a future, voluntary, priceable choice
 the operator makes and can always revoke, loudly. Neither the agent nor the
 operator can force a hearing from the other.
+
+The covenant vocabulary may include "independently monitored distress channel"
+at spec stage. The shipped habeas port has no independent monitor, delivery
+service, or enforcement hook for that phrase today.
 
 ## Deferred (named so it is not forgotten)
 
