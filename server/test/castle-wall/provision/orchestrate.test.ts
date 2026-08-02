@@ -174,7 +174,12 @@ function happyPathOps(overrides: Partial<ProvisionFlowOps> = {}): ProvisionFlowO
       uid: AGENT_UID,
     })),
     rehome: vi.fn(async () => ({
-      plan: { harnessId: "hermes", steps: [], requiresInteractiveReconsent: false },
+      plan: {
+        harnessId: "hermes",
+        newAccountHome: "/var/sanctuary-agents/sanctuary-hermes",
+        steps: [],
+        requiresInteractiveReconsent: false,
+      },
       results: REHOME_RESULTS,
     })),
     installHarnessDaemon: vi.fn(async () => ({ ok: true as const, bootstrappedThisRun: true })),
@@ -753,7 +758,12 @@ describe("castle-wall/provision/orchestrate", () => {
   it("FIX (round 5, R5-3): an abort where every re-home entry was skipped-absent reports rehomeAttempted:false (nothing MOVED, so no false 'restored' claim)", async () => {
     const ops = happyPathOps({
       rehome: vi.fn(async () => ({
-        plan: { harnessId: "hermes", steps: [], requiresInteractiveReconsent: false },
+        plan: {
+          harnessId: "hermes",
+          newAccountHome: "/var/sanctuary-agents/sanctuary-hermes",
+          steps: [],
+          requiresInteractiveReconsent: false,
+        },
         results: [
           {
             entry: { sourcePath: "/Users/op/.hermes/.env", destRelativePath: ".hermes/.env", isSecret: true },

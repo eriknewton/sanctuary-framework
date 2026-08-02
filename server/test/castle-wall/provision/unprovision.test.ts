@@ -28,6 +28,8 @@ function mockRehomeOps(overrides: Partial<RehomeOps> = {}): RehomeOps & {
     restores,
     sourceDuplicateRestores,
     restoreCustodyCalls,
+    verifyDestinationHomeCustody: async () => {},
+    prepareDestinationParentCustody: async () => ({ revalidate: async () => {}, close: async () => {} }),
     pathExists: async () => true,
     pathExistsNoFollow: async () => true,
     hashPath: async (path) => ({ algorithm: "sha256", value: `hash-${path}` }),

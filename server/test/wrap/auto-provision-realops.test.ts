@@ -449,6 +449,8 @@ describe("castle-wall/provision/rehome real-ops chokepoint: RehomeExecutionError
   function mockOpsThatFailsOnThirdMove(): RehomeOps {
     let moveCount = 0;
     return {
+      verifyDestinationHomeCustody: async () => {},
+      prepareDestinationParentCustody: async () => ({ revalidate: async () => {}, close: async () => {} }),
       pathExists: async () => true,
       pathExistsNoFollow: async () => false,
       hashPath: async (path) => ({ algorithm: "sha256", value: `hash-${path}` }),
@@ -502,6 +504,8 @@ describe("castle-wall/provision/rehome real-ops chokepoint: RehomeExecutionError
   it("a throw on the FIRST step reports an empty partialResults (nothing completed yet, honestly)", async () => {
     const plan = planRehome(testAdapter, { operatorHome: "/Users/operator", newAccountHome: "/var/sanctuary-agents/x" });
     const ops: RehomeOps = {
+      verifyDestinationHomeCustody: async () => {},
+      prepareDestinationParentCustody: async () => ({ revalidate: async () => {}, close: async () => {} }),
       pathExists: async () => true,
       pathExistsNoFollow: async () => false,
       hashPath: async (path) => ({ algorithm: "sha256", value: `hash-${path}` }),
@@ -536,6 +540,8 @@ describe("castle-wall/provision/rehome real-ops chokepoint: RehomeExecutionError
     const plan = planRehome(testAdapter, { operatorHome: "/Users/operator", newAccountHome: "/var/sanctuary-agents/x" });
     let chownCount = 0;
     const ops: RehomeOps = {
+      verifyDestinationHomeCustody: async () => {},
+      prepareDestinationParentCustody: async () => ({ revalidate: async () => {}, close: async () => {} }),
       pathExists: async () => true,
       pathExistsNoFollow: async () => false,
       hashPath: async (path) => ({ algorithm: "sha256", value: `hash-${path}` }),
@@ -605,6 +611,136 @@ describe("install-preflight Build 2 re-home custody real-ops fixtures", () => {
       requiresInteractiveReconsent: () => false,
     };
   }
+
+  it.skipIf(uidGid.uid === uidGid.gid)(
+    "accepts a pre-existing account home owned by the agent uid with a macOS staff-style gid (uid!=gid)",
+    async () => {
+      const tmpRoot = await mkdtemp(join(tmpdir(), "sanctuary-home-staff-gid-"));
+      try {
+        const accountHome = join(tmpRoot, "sanctuary-hermes");
+        await mkdir(accountHome, { recursive: true });
+        await chmod(accountHome, 0o755);
+        const observed = await lstat(accountHome);
+        expect(observed.uid).toBe(uidGid.uid);
+        expect(observed.gid).toBe(uidGid.gid);
+        expect(observed.gid).not.toBe(observed.uid);
+
+        const staleUidEqualsGidAssumption = { uid: observed.uid, gid: observed.uid };
+        await expect(
+          realRehomeOps({ backupRoot: join(tmpRoot, "backups") }).verifyDestinationHomeCustody(
+            accountHome,
+            staleUidEqualsGidAssumption,
+          ),
+        ).resolves.toBeUndefined();
+      } finally {
+        await rm(tmpRoot, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it("refuses a symlinked prospective account home before moving a secret outside custody", async () => {
+    const tmpRoot = await mkdtemp(join(tmpdir(), "sanctuary-home-symlink-"));
+    try {
+      const backupRoot = join(tmpRoot, "backups");
+      const operatorHome = join(tmpRoot, "operator");
+      const agentsRoot = join(tmpRoot, "agents");
+      const outsideHome = join(tmpRoot, "outside-home");
+      const accountHome = join(agentsRoot, "sanctuary-hermes");
+      const sourcePath = join(operatorHome, ".hermes", "config.yaml");
+      const outsideDest = join(outsideHome, ".hermes", "config.yaml");
+      await mkdir(dirname(sourcePath), { recursive: true });
+      await mkdir(agentsRoot, { recursive: true });
+      await mkdir(outsideHome, { recursive: true });
+      await writeFile(sourcePath, "REAL_CONFIG_WITH_SECRET=symlink\n");
+      await symlink(outsideHome, accountHome);
+
+      const ops = realRehomeOps({ backupRoot });
+      const plan = planRehome(singleConfigAdapter(), { operatorHome, newAccountHome: accountHome });
+
+      await expect(executeRehomePlan(plan, ops, uidGid)).rejects.toThrow(/account home custody/i);
+      await expect(lstat(outsideDest)).rejects.toThrow();
+      expect(await readFile(sourcePath, "utf8")).toBe("REAL_CONFIG_WITH_SECRET=symlink\n");
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a symlinked destination parent inside a verified account home before moving a secret outside custody", async () => {
+    const tmpRoot = await mkdtemp(join(tmpdir(), "sanctuary-child-parent-symlink-"));
+    try {
+      const backupRoot = join(tmpRoot, "backups");
+      const operatorHome = join(tmpRoot, "operator");
+      const accountHome = join(tmpRoot, "account");
+      const outsideHermes = join(tmpRoot, "outside-hermes");
+      const sourcePath = join(operatorHome, ".hermes", "config.yaml");
+      const outsideDest = join(outsideHermes, "config.yaml");
+      await mkdir(dirname(sourcePath), { recursive: true });
+      await mkdir(accountHome, { recursive: true });
+      await chmod(accountHome, 0o755);
+      await mkdir(outsideHermes, { recursive: true });
+      await writeFile(sourcePath, "REAL_CONFIG_WITH_SECRET=child-parent\n");
+      await symlink(outsideHermes, join(accountHome, ".hermes"));
+
+      const ops = realRehomeOps({ backupRoot });
+      const plan = planRehome(singleConfigAdapter(), { operatorHome, newAccountHome: accountHome });
+
+      await expect(executeRehomePlan(plan, ops, uidGid)).rejects.toThrow(/destination parent custody|symlink/i);
+      await expect(lstat(outsideDest)).rejects.toThrow();
+      expect(await readFile(sourcePath, "utf8")).toBe("REAL_CONFIG_WITH_SECRET=child-parent\n");
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("allows an absent prospective account home and moves the secret into the fresh home", async () => {
+    const tmpRoot = await mkdtemp(join(tmpdir(), "sanctuary-home-fresh-"));
+    try {
+      const backupRoot = join(tmpRoot, "backups");
+      const operatorHome = join(tmpRoot, "operator");
+      const agentsRoot = join(tmpRoot, "agents");
+      const accountHome = join(agentsRoot, "sanctuary-hermes");
+      const sourcePath = join(operatorHome, ".hermes", "config.yaml");
+      const destPath = join(accountHome, ".hermes", "config.yaml");
+      await mkdir(dirname(sourcePath), { recursive: true });
+      await mkdir(agentsRoot, { recursive: true });
+      await writeFile(sourcePath, "REAL_CONFIG_WITH_SECRET=fresh\n");
+
+      const ops = realRehomeOps({ backupRoot });
+      const plan = planRehome(singleConfigAdapter(), { operatorHome, newAccountHome: accountHome });
+      const result = await executeRehomePlan(plan, ops, uidGid);
+
+      expect(result[0]?.status).toBe("moved");
+      expect(await readFile(destPath, "utf8")).toBe("REAL_CONFIG_WITH_SECRET=fresh\n");
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a pre-existing account home owned by a different uid before backup or move", async () => {
+    const tmpRoot = await mkdtemp(join(tmpdir(), "sanctuary-home-foreign-"));
+    try {
+      const backupRoot = join(tmpRoot, "backups");
+      const operatorHome = join(tmpRoot, "operator");
+      const agentsRoot = join(tmpRoot, "agents");
+      const accountHome = join(agentsRoot, "sanctuary-hermes");
+      const sourcePath = join(operatorHome, ".hermes", "config.yaml");
+      const destPath = join(accountHome, ".hermes", "config.yaml");
+      await mkdir(dirname(sourcePath), { recursive: true });
+      await mkdir(accountHome, { recursive: true });
+      await writeFile(sourcePath, "REAL_CONFIG_WITH_SECRET=foreign\n");
+
+      const ops = realRehomeOps({ backupRoot });
+      const plan = planRehome(singleConfigAdapter(), { operatorHome, newAccountHome: accountHome });
+      await expect(
+        executeRehomePlan(plan, ops, { uid: uidGid.uid + 1, gid: uidGid.gid }),
+      ).rejects.toThrow(/account home custody precheck failed/);
+
+      await expect(lstat(destPath)).rejects.toThrow();
+      expect(await readFile(sourcePath, "utf8")).toBe("REAL_CONFIG_WITH_SECRET=foreign\n");
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
 
   it("F-7/F-8 incident: rerun with a fresh source stub and existing real destination refuses before backup/move, leaving the real backup untouched", async () => {
     const tmpRoot = await mkdtemp(join(tmpdir(), "sanctuary-b2-incident-"));
@@ -1161,6 +1297,8 @@ describe("wrap/auto-provision real-ops chokepoint: realRehomeOps().restore confl
 });
 
 describe("wrap/auto-provision real-ops chokepoint: stale Hermes runtime retry cleanup", () => {
+  const uidGid = { uid: process.getuid?.() ?? 0, gid: process.getgid?.() ?? 0 };
+
   it("moves a stale non-secret Hermes runtime destination aside when the operator source also exists", async () => {
     const tmpRoot = await mkdtemp(join(tmpdir(), "sanctuary-stale-hermes-runtime-"));
     try {
@@ -1169,15 +1307,89 @@ describe("wrap/auto-provision real-ops chokepoint: stale Hermes runtime retry cl
       const { sourcePath, destPath } = hermesRuntimeRehomePaths(operatorHome, accountHome);
       await mkdir(sourcePath, { recursive: true });
       await mkdir(destPath, { recursive: true });
+      await chmod(accountHome, 0o755);
+      await chmod(dirname(destPath), 0o755);
       await writeFile(join(sourcePath, "source.txt"), "operator-runtime");
       await writeFile(join(destPath, "stale.txt"), "stale-runtime");
 
-      const conflictPath = await moveAsideStaleHermesRuntimeDestination(operatorHome, accountHome);
+      const conflictPath = await moveAsideStaleHermesRuntimeDestination(operatorHome, accountHome, uidGid);
 
       expect(conflictPath).toBe(`${destPath}.restored-conflict`);
       await expect(access(destPath)).rejects.toThrow();
       expect(await readFile(join(sourcePath, "source.txt"), "utf8")).toBe("operator-runtime");
       expect(await readFile(join(conflictPath!, "stale.txt"), "utf8")).toBe("stale-runtime");
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a symlinked account home before moving a stale runtime destination outside custody", async () => {
+    const tmpRoot = await mkdtemp(join(tmpdir(), "sanctuary-stale-hermes-runtime-symlink-"));
+    try {
+      const operatorHome = join(tmpRoot, "operator");
+      const agentsRoot = join(tmpRoot, "agents");
+      const outsideHome = join(tmpRoot, "outside-home");
+      const accountHome = join(agentsRoot, "sanctuary-hermes");
+      const { sourcePath } = hermesRuntimeRehomePaths(operatorHome, accountHome);
+      const outsideRuntime = join(outsideHome, ".hermes", "hermes-agent");
+      const outsideConflict = `${outsideRuntime}.restored-conflict`;
+      await mkdir(sourcePath, { recursive: true });
+      await mkdir(outsideRuntime, { recursive: true });
+      await mkdir(agentsRoot, { recursive: true });
+      await writeFile(join(sourcePath, "source.txt"), "operator-runtime");
+      await writeFile(join(outsideRuntime, "stale.txt"), "stale-runtime");
+      await symlink(outsideHome, accountHome);
+
+      let caught: unknown;
+      let conflictPath: string | undefined;
+      try {
+        conflictPath = await moveAsideStaleHermesRuntimeDestination(operatorHome, accountHome, uidGid);
+      } catch (err) {
+        caught = err;
+      }
+
+      expect(await readFile(join(outsideRuntime, "stale.txt"), "utf8")).toBe("stale-runtime");
+      await expect(access(outsideConflict)).rejects.toThrow();
+      expect(conflictPath).toBeUndefined();
+      expect(caught).toBeInstanceOf(Error);
+      expect((caught as Error).message).toMatch(/account home custody/i);
+      expect(await readFile(join(sourcePath, "source.txt"), "utf8")).toBe("operator-runtime");
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a symlinked .hermes parent before moving a stale runtime destination outside custody", async () => {
+    const tmpRoot = await mkdtemp(join(tmpdir(), "sanctuary-stale-hermes-runtime-parent-symlink-"));
+    try {
+      const operatorHome = join(tmpRoot, "operator");
+      const accountHome = join(tmpRoot, "account");
+      const outsideHermes = join(tmpRoot, "outside-hermes");
+      const { sourcePath } = hermesRuntimeRehomePaths(operatorHome, accountHome);
+      const outsideRuntime = join(outsideHermes, "hermes-agent");
+      const outsideConflict = `${outsideRuntime}.restored-conflict`;
+      await mkdir(sourcePath, { recursive: true });
+      await mkdir(accountHome, { recursive: true });
+      await mkdir(outsideRuntime, { recursive: true });
+      await chmod(accountHome, 0o755);
+      await writeFile(join(sourcePath, "source.txt"), "operator-runtime");
+      await writeFile(join(outsideRuntime, "stale.txt"), "stale-runtime");
+      await symlink(outsideHermes, join(accountHome, ".hermes"));
+
+      let caught: unknown;
+      let conflictPath: string | undefined;
+      try {
+        conflictPath = await moveAsideStaleHermesRuntimeDestination(operatorHome, accountHome, uidGid);
+      } catch (err) {
+        caught = err;
+      }
+
+      expect(await readFile(join(outsideRuntime, "stale.txt"), "utf8")).toBe("stale-runtime");
+      await expect(access(outsideConflict)).rejects.toThrow();
+      expect(conflictPath).toBeUndefined();
+      expect(caught).toBeInstanceOf(Error);
+      expect((caught as Error).message).toMatch(/symlink|custody|owner-write/i);
+      expect(await readFile(join(sourcePath, "source.txt"), "utf8")).toBe("operator-runtime");
     } finally {
       await rm(tmpRoot, { recursive: true, force: true });
     }
@@ -1192,7 +1404,7 @@ describe("wrap/auto-provision real-ops chokepoint: stale Hermes runtime retry cl
       await mkdir(destPath, { recursive: true });
       await writeFile(join(destPath, "stale.txt"), "stale-runtime");
 
-      const conflictPath = await moveAsideStaleHermesRuntimeDestination(operatorHome, accountHome);
+      const conflictPath = await moveAsideStaleHermesRuntimeDestination(operatorHome, accountHome, uidGid);
 
       expect(conflictPath).toBeUndefined();
       expect(await readFile(join(destPath, "stale.txt"), "utf8")).toBe("stale-runtime");

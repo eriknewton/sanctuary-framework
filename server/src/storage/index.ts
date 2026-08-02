@@ -2,11 +2,15 @@ export type { StorageBackend, StorageEntryMeta } from "./interface.js";
 export {
   CustodyFsError,
   isCustodyFsError,
+  openDirectoryCustodyWithinBase,
   readFileCustody,
   readFileCustodyWithStats,
+  verifyDirectoryCustodyWithinBase,
   writeFileCustody,
   type CustodyModeCheck,
   type DirectoryCustodyOptions,
+  type DirectoryWithinBaseCustodyOptions,
+  type NoFollowDirectoryGuard,
   type ReadFileCustodyOptions,
   type WriteFileCustodyOptions,
 } from "./custody-fs.js";

@@ -60,6 +60,11 @@ export interface RehomeChownReport {
   excludedPaths: string[];
 }
 
+export interface RehomeDirectoryGuard {
+  revalidate(): Promise<void>;
+  close(): Promise<void>;
+}
+
 /** Per-harness adapter: describes what to move and how to verify the move. */
 export interface AgentRehomeAdapter {
   /** Harness identifier, e.g. "hermes". */
@@ -81,6 +86,25 @@ export interface AgentRehomeAdapter {
 
 /** Operations injected so re-home planning/execution is unit-testable without touching the host. */
 export interface RehomeOps {
+  /**
+   * Verify the prospective account home before any secret backup/move.
+   * The real implementation must fail closed on symlinks or foreign custody;
+   * tests may use a no-op when they are exercising pure execution behavior.
+   */
+  verifyDestinationHomeCustody(
+    newAccountHome: string,
+    expectedUidGid: { uid: number; gid: number },
+  ): Promise<void>;
+  /**
+   * Prepare and hold the destination parent chain for one re-home entry. The
+   * real implementation must open directories no-follow and keep descriptors
+   * live until the entry's destination operations finish.
+   */
+  prepareDestinationParentCustody(
+    destPath: string,
+    newAccountHome: string,
+    expectedUidGid: { uid: number; gid: number },
+  ): Promise<RehomeDirectoryGuard>;
   /** True when `path` exists (file or directory). */
   pathExists(path: string): Promise<boolean>;
   /** True when the final path component exists, without following symlinks. */
@@ -124,7 +148,7 @@ export interface RehomeOps {
     sourcePath: string,
   ): Promise<{ restored: boolean; conflictPath?: string }>;
   /** Move (not copy) the file tree from `sourcePath` to `destPath`, creating parent dirs as needed. */
-  move(sourcePath: string, destPath: string): Promise<void>;
+  move(sourcePath: string, destPath: string, destinationParentGuard?: RehomeDirectoryGuard): Promise<void>;
   /** chown the path (recursively, if a directory) to the given uid/gid. */
   chown(path: string, uid: number, gid: number): Promise<RehomeChownReport>;
   /**
@@ -173,6 +197,7 @@ export interface RehomeStep {
 /** The full re-home plan. Pure: no I/O performed while building it. */
 export interface RehomePlan {
   harnessId: string;
+  newAccountHome: string;
   steps: RehomeStep[];
   requiresInteractiveReconsent: boolean;
 }
@@ -194,6 +219,7 @@ export function planRehome(
   }));
   return {
     harnessId: adapter.harnessId,
+    newAccountHome: options.newAccountHome,
     steps,
     requiresInteractiveReconsent: adapter.requiresInteractiveReconsent(),
   };
@@ -323,18 +349,27 @@ export async function executeRehomePlan(
   newAccountUidGid: { uid: number; gid: number },
   options: ExecuteRehomePlanOptions = {},
 ): Promise<RehomeStepResult[]> {
+  await ops.verifyDestinationHomeCustody(plan.newAccountHome, newAccountUidGid);
   const results: RehomeStepResult[] = [];
   for (const step of plan.steps) {
+    let destinationParentGuard: RehomeDirectoryGuard | undefined;
     try {
       const exists = await ops.pathExists(step.entry.sourcePath);
       if (!exists) {
         results.push({ entry: step.entry, destPath: step.destPath, status: "skipped-absent" });
         continue;
       }
+      destinationParentGuard = await ops.prepareDestinationParentCustody(
+        step.destPath,
+        plan.newAccountHome,
+        newAccountUidGid,
+      );
+      await destinationParentGuard.revalidate();
       const destExists = await ops.pathExistsNoFollow(step.destPath);
       let stepResult: RehomeStepResult | undefined;
       if (destExists) {
         const sourceHash = await ops.hashPath(step.entry.sourcePath);
+        await destinationParentGuard.revalidate();
         const destinationHash = await ops.hashPath(step.destPath);
         const provenance = await ops.readDestinationProvenance(step.entry.sourcePath, step.destPath);
         if (
@@ -374,6 +409,7 @@ export async function executeRehomePlan(
         if (options.overwriteDestination !== true) {
           throw new Error(destinationConflictMessage(step.entry.sourcePath, step.destPath, sourceHash, destinationHash));
         }
+        await destinationParentGuard.revalidate();
         const { displacedPath } = await ops.displaceDestination(step.destPath);
         stepResult = {
           entry: step.entry,
@@ -392,7 +428,7 @@ export async function executeRehomePlan(
         const backup = await ops.backup(step.entry.sourcePath);
         backupPath = backup.backupPath;
       }
-      await ops.move(step.entry.sourcePath, step.destPath);
+      await ops.move(step.entry.sourcePath, step.destPath, destinationParentGuard);
       // FIX G3: record the moved result NOW, before chown -- a chown failure
       // below must not strand this entry outside `results`/`partialResults`.
       if (stepResult === undefined) {
@@ -410,6 +446,8 @@ export async function executeRehomePlan(
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       throw new RehomeExecutionError(message, results, { cause: err });
+    } finally {
+      await destinationParentGuard?.close();
     }
   }
   return results;
