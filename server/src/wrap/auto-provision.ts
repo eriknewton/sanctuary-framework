@@ -95,6 +95,8 @@ import {
   parseServiceAccountIsHidden,
   AccountUidEnumerationError,
   type AgentEgressVerifyReport,
+  verifyTelegramAgentLivenessFromFortress,
+  type TelegramLivenessProbeAuditSink,
 } from "../castle-wall/provision/index.js";
 import { resolveCastleWallSocketPath } from "../castle-wall/runtime/socket-path.js";
 import {
@@ -904,6 +906,8 @@ export interface RunAutoProvisionForWrapOptions {
   cliBinary?: string;
   /** Print function for operator-facing output (defaults to console.error, matching the rest of wrap/cli.ts's stderr convention). */
   print?: (line: string) => void;
+  /** Optional already-unlocked audit sink for the liveness probe cycle. */
+  auditLog?: TelegramLivenessProbeAuditSink;
   /** Stop the wrap-started transient Castle Wall daemon before installing the persistent boot service. */
   stopTransientCastleWallDaemon?: () => Promise<void>;
   /**
@@ -1825,10 +1829,13 @@ export async function runAutoProvisionForWrap(
       }
       return restored;
     },
-    // No current Hermes round-trip prober is wired here. Honest outcome:
-    // liveness is unverified because there is no channel config/prober object,
-    // never inferred from `hermes status` or from the process being loaded.
-    verifyAgentLivenessAfterStandDown: async () => undefined,
+    verifyAgentLivenessAfterStandDown: async () =>
+      verifyTelegramAgentLivenessFromFortress({
+        fortressPath: wallFortressPath,
+        expectedOwnerUid: consoleOwnerUid,
+        ...(options.auditLog ? { audit: options.auditLog } : {}),
+        auditIdentityId: agentId,
+      }),
     // FIX R1 (BLOCKER, fix-round 2): honest, fail-closed probe list -- see
     // `hermesEndpointProbes` above. `resolvedAgentUidGid` is always set by
     // `installHarnessDaemon` before this is called (steps 6 -> 7); if it is

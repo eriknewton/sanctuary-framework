@@ -8,6 +8,7 @@ import {
   applyCustodyRollback,
   applyFortressCustodyRepairs,
   CUSTODY_REPAIR_MANIFEST_KIND,
+  FortressCustodyBaseError,
   isSafeManifestRelPath,
   manifestCarriesPrivilegeBits,
   normalizeFortressCustody,
@@ -15,6 +16,7 @@ import {
   planFortressCustodyRepairs,
   realFortressCustodyFsOps,
   resolveSudoIdentityDecision,
+  verifyFortressCustodyBase,
   walkFortressCustody,
   writeCustodyRepairManifest,
   type CustodyRepairManifest,
@@ -160,6 +162,33 @@ function mini2Fixture(): FakeFs {
 }
 
 const OPERATOR = { uid: 501, gid: 20 };
+
+describe("fortress-custody: base verify", () => {
+  it("requires an operator-owned 0700 non-root fortress root", async () => {
+    const ok = makeFakeFs(
+      { "/f": { type: "dir", uid: OPERATOR.uid, gid: OPERATOR.gid, mode: 0o700, ino: 1 } },
+      { "/f": [] },
+    );
+    await expect(
+      verifyFortressCustodyBase({ fortressPath: "/f", operatorUid: OPERATOR.uid, ops: ok.ops }),
+    ).resolves.toBeUndefined();
+
+    for (const [node, reason] of [
+      [{ type: "dir" as const, uid: 0, gid: 0, mode: 0o700, ino: 2 }, "root_owned"],
+      [{ type: "dir" as const, uid: OPERATOR.uid, gid: OPERATOR.gid, mode: 0o755, ino: 3 }, "mode_mismatch"],
+    ] as const) {
+      const fake = makeFakeFs({ "/f": node }, { "/f": [] });
+      await expect(
+        verifyFortressCustodyBase({ fortressPath: "/f", operatorUid: OPERATOR.uid, ops: fake.ops }),
+      ).rejects.toSatisfy((err: unknown) => {
+        expect(err).toBeInstanceOf(FortressCustodyBaseError);
+        expect((err as Error).message).toBe("fortress_custody_invalid");
+        expect((err as FortressCustodyBaseError).reason).toBe(reason);
+        return true;
+      });
+    }
+  });
+});
 
 describe("fortress-custody: walk", () => {
   it("walks a real temp tree, records relative paths + modes, and never descends through symlinks", async () => {

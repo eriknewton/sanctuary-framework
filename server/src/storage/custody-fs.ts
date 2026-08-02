@@ -39,6 +39,8 @@ export interface CustodyModeCheck {
   exact?: number;
   /** Reject any group/other permission bit. Useful for key and token files. */
   rejectGroupOrOther?: boolean;
+  /** Reject group/other write bits while allowing read/execute traversal. */
+  rejectGroupOrOtherWrite?: boolean;
 }
 
 export interface DirectoryCustodyOptions {
@@ -132,6 +134,7 @@ function modeRejected(mode: number, check: CustodyModeCheck | undefined): boolea
   if (!check) return false;
   if (check.exact !== undefined && mode !== check.exact) return true;
   if (check.rejectGroupOrOther === true && (mode & 0o077) !== 0) return true;
+  if (check.rejectGroupOrOtherWrite === true && (mode & 0o022) !== 0) return true;
   return false;
 }
 

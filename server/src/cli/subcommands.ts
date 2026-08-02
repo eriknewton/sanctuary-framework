@@ -29,6 +29,7 @@ export const TOP_LEVEL_SUBCOMMANDS = [
   "init",
   "intelligence",
   "license",
+  "liveness-probe",
   "nodes",
   "plugin",
   "policy",
