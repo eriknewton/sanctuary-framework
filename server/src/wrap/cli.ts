@@ -79,12 +79,11 @@ import {
   PassphraseUnreadableError,
   PassphraseKeyringUnreachableError,
 } from "./passphrase.js";
-import { startDashboard, type DashboardHandle } from "../dashboard/index.js";
+import { type DashboardHandle } from "../dashboard/index.js";
 import {
   cleanupFailedHttpServer,
   type HttpServerLifecycleTarget,
 } from "../http/server-lifecycle.js";
-import { buildWrapFleetRosterProvider } from "./fleet-roster-provider.js";
 import {
   DEFAULT_ENFORCEMENT_AVAILABILITY_FRESHNESS_MS,
   queryMacOSEnforcementAvailability,
@@ -118,10 +117,7 @@ import {
   EGRESS_GATE_REPAIR_WITH_STAND_DOWN_COMMAND,
   EGRESS_GATE_STAND_DOWN_EFFECT,
 } from "../egress-gate/operator-advice.js";
-import {
-  buildV11Bindings,
-  fortressIdFromStoragePath,
-} from "../dashboard/v1_1/wiring.js";
+import { fortressIdFromStoragePath } from "../dashboard/v1_1/wiring.js";
 import { upsertPersistedLocalAgent } from "../hub/agent-registry-persistence.js";
 import type {
   LocalAgentRecord,
@@ -169,8 +165,6 @@ import {
   protectionSubjectForUid,
   resolveProtectionSubjectFromFortressPath,
 } from "../castle-wall/subject-binding.js";
-import { SubstrateSelector } from "../intelligence/selector.js";
-import { installConsentGatedRedactor } from "../intelligence/privacy-tier2-redactor.js";
 import { SANCTUARY_VERSION } from "../config.js";
 import { recordWrappedHarnessRegistration } from "../workload-lifecycle/index.js";
 import {
@@ -179,7 +173,7 @@ import {
   resolveStoragePath,
   resolveDashboardPort,
 } from "../paths.js";
-import { writeTenantRuntime, clearTenantRuntime } from "../cli/agents/runtime.js";
+import { readTenantRuntime } from "../cli/agents/runtime.js";
 import {
   registerHostTenant,
   TENANTS_REGISTRY_FILE_NAME,
@@ -2738,8 +2732,25 @@ export interface RunWrapDeps {
    * full auto-provision darwin gate too.
    */
   osPlatform?: () => NodeJS.Platform;
-  /** Override dashboard starter (for tests). */
+  /**
+   * LEGACY dashboard starter seam (for tests). Dashboard-fold PR-4 retired
+   * the production path that consumed this directly (the wrap-spawned
+   * server); when provided WITHOUT `startOwnedDashboard`, it is adapted into
+   * the ensure-and-reuse flow via `adaptLegacyDashboardStarter` so the
+   * existing stub-injection suites keep exercising the real flow.
+   */
   startDashboard?: DashboardStarter;
+  /**
+   * Dashboard-fold PR-4 (ratified decision 1): start the ONE main dashboard
+   * in-process for this fortress when no live one exists. Production
+   * (src/cli.ts) injects a closure over `startStandaloneDashboard`;
+   * wrap/cli MUST NOT import dashboard-standalone itself (that edge would
+   * introduce a new import cycle — see the set-based baseline gate at
+   * test/structure/import-cycle-baseline.test.ts).
+   */
+  startOwnedDashboard?: OwnedDashboardStarter;
+  /** Override the live-dashboard health probe (for tests). */
+  probeDashboardHealth?: (baseUrl: string) => Promise<boolean>;
   /** Override browser opener (for tests). */
   openBrowser?: (url: string) => Promise<void>;
   /** Override passphrase resolver (for tests). */
@@ -4379,64 +4390,22 @@ export async function runWrap(
     return;
   }
 
-  // v1.2.1 (Finding III): track intelligence subsystem health for the
-  // success banner. Updated below when the substrate selector loads.
-  let intelligenceHealthy: boolean | undefined;
-  let intelligenceError: string | undefined;
-  // Rho-2.5: whether the consent-gated Tier B redactor was installed on the
-  // wrap-auto selector. Threaded into buildV11Bindings so the wrap-emitted
-  // dashboard's /api/query-anonymity/pii route reports the truthful state.
-  let wrapTierBPiiRedactorInstalled = false;
   let wrapAuditLog: AuditLog | undefined;
   let wrapAuditStorage: FilesystemStorage | undefined;
   let wrapAuditMasterKey: Uint8Array | undefined;
   let unregisterWrapAuditFlush: (() => void) | undefined;
 
-  // Start the dashboard in-process.
-  const authToken = generateAuthToken();
-
-  // Fleet Console: wire the wrap ("Protect") dashboard's fleet-roster panel to
-  // the REAL, read-only, disk-backed federation projection. Without this the
-  // panel's `GET /api/posture/fleet` (and `GET /api/fleet/roster`) always read
-  // the honest-absent shape even when federation IS provisioned, so a real fleet
-  // was invisible on the wrap dashboard. The provider reads the at-rest fortress
-  // records (trust root + durable revocation projection) under the custody
-  // master; it is strictly read-only (no sync loop, no mutation, no key
-  // material) and resolved lazily per request so a post-start
-  // `sanctuary federation provision` is observed without a wrap restart. Only
-  // wired when custody is established (federation records are encrypted under the
-  // master key); otherwise the panel stays honestly absent.
-  const wrapFleetRoster =
-    wrapCustody !== undefined
-      ? buildWrapFleetRosterProvider({
-          storage: new FilesystemStorage(`${storagePath}/state`),
-          masterKey: wrapCustody.masterKey,
-        })
-      : undefined;
-
-  const startFn: DashboardStarter =
-    deps.startDashboard ??
-    ((opts) =>
-      startDashboard({
-        port: opts.port,
-        ...(opts.host !== undefined ? { host: opts.host } : {}),
-        mode: opts.mode,
-        authToken: opts.authToken,
-        serverVersion: opts.serverVersion,
-        platform: process.platform,
-        resolveEnforcementAvailability: () =>
-          resolveWrapEnforcementAvailability(storagePath),
-        ...(wrapFleetRoster ? { fleetRoster: wrapFleetRoster } : {}),
-      }));
-  // Multi-tenancy: honour SANCTUARY_DASHBOARD_PORT so two wraps can pick
-  // distinct starting ports without both racing for 3501.
+  // Dashboard-fold PR-4 (ratified decision 1, 2026-08-02): `sanctuary protect`
+  // no longer spawns its own rival dashboard server (the retired wrap-served
+  // "server B" at server/src/dashboard/). The fortress-side effects below run
+  // first; afterwards `ensureMainDashboardForWrap` detects a live main
+  // dashboard for THIS fortress (runtime.json with PID-liveness + an HTTP
+  // health probe) and REUSES it, or starts the ONE main dashboard in-process
+  // via the caller-injected starter (src/cli.ts injects a closure over
+  // `startStandaloneDashboard`; wrap/cli must not import dashboard-standalone
+  // itself — import-cycle baseline). Multi-tenancy: SANCTUARY_DASHBOARD_PORT /
+  // --port still pick the starting port so two tenants don't race for 3501.
   const requestedPort = resolveDashboardPort(options.port);
-  const dashboard = await startDashboardWithFallback(
-    startFn,
-    requestedPort,
-    authToken,
-    readPackageVersion()
-  );
 
   // v1.1.2 hotfix (Finding V): bind v1.1 hub surfaces to the wrap-auto
   // dashboard so /v1.1, /api/hub/*, and /api/identities serve content
@@ -4498,57 +4467,13 @@ export async function runWrap(
         record: localAgentRecord,
       });
 
-      // HIGH never-overclaim fix (honesty/dashboard-rollup seam #2): resolve the
-      // pinned producer key over the SAME canonical storage path the wrap-auto
-      // Castle Wall daemon publishes it to (`<storagePath>/policy/egress/
-      // audit-producer.pub`, via loadFortressProducerKey) and feed it into the
-      // snapshot server's sources. Without this the wrap-auto dashboard read the
-      // wall posture on the bare channel basis, so on a key-bearing host a forged
-      // marker-only audit entry would arm the hero shield green. With the key
-      // present the reader re-verifies the producer signature and a forgery fails
-      // closed to amber, identical to the DashboardApprovalChannel path. `absent`
-      // (macOS / pre-provision) → honest channel basis; `unreadable` (a key is
-      // expected but malformed/locked) → fail honestly to amber via
-      // producerKeyExpectedButUnavailable, never the weaker channel basis.
-      try {
-        const { loadFortressProducerKey } = await import(
-          "../castle-wall/runtime/producer-signature.js"
-        );
-        const { loadBrokerProducerKey } = await import(
-          "../broker-mcp/producer-signature.js"
-        );
-        const producerKeyLoad = await loadFortressProducerKey(storagePath);
-        const brokerProducerKeyLoad = await loadBrokerProducerKey(storagePath);
-        dashboard.updateSources?.({
-          resolvePinnedProducerKey: () =>
-            producerKeyLoad.status === "present"
-              ? producerKeyLoad.keyB64url
-              : null,
-          ...(producerKeyLoad.status === "unreadable"
-            ? { producerKeyExpectedButUnavailable: true }
-            : {}),
-          resolveBrokerPinnedProducerKey: () =>
-            brokerProducerKeyLoad.status === "present"
-              ? brokerProducerKeyLoad.keyB64url
-              : null,
-          ...(brokerProducerKeyLoad.status === "unreadable"
-            ? { brokerProducerKeyExpectedButUnavailable: true }
-            : {}),
-          resolveProtectionClaimSubject: () =>
-            resolveProtectionSubjectFromFortressPath(
-              storagePath,
-              fortressIdFromStoragePath(storagePath),
-            ).then((result) => result.subject),
-          platform: process.platform,
-          resolveEnforcementAvailability: () =>
-            resolveWrapEnforcementAvailability(storagePath),
-        });
-      } catch {
-        // Never let the producer-key probe fail wrap. On any unexpected throw the
-        // snapshot server keeps its honest default (no producer key → channel
-        // basis); it never silently arms green on a forged entry because the
-        // aggregator's wall reader treats absent-key as the channel floor.
-      }
+      // Dashboard-fold PR-4: the producer-key/broker-key/enforcement resolver
+      // threading that lived here fed the RETIRED wrap-spawned snapshot
+      // server's sources. The surviving main dashboard resolves the same keys
+      // over the same fortress paths itself (ensureProducerKeyLoaded /
+      // ensureBrokerProducerKeyLoaded in principal-policy/dashboard.ts), so
+      // the honesty contract (a forged marker-only entry fails closed to
+      // amber) is preserved by the ONE server rather than re-threaded here.
       // Best-effort: a Castle Wall daemon startup failure (e.g. EACCES on
       // Linux when the fortress-scoped socket dir requires root, or any
       // platform where the pinned key is unavailable) does not fail wrap.
@@ -4587,10 +4512,9 @@ export async function runWrap(
             source: "wrap-auto",
           });
         }
-        dashboard.updateSources?.({
-          auditLog: wrapAuditLog,
-          identityManager: identityMgr,
-        });
+        // Dashboard-fold PR-4: the identity/audit-log source threading into
+        // the retired wrap-spawned server is gone; the surviving main
+        // dashboard wires its own identity manager + audit log at boot.
       } catch (err) {
         // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
         console.error(
@@ -4600,73 +4524,17 @@ export async function runWrap(
       }
 
       // WP-V1.2-5: construct + load the Intelligence Substrate Selector
-      // against the wrap-auto fortress. The selector reads / writes its
-      // config under the fortress storage namespace `_intelligence`,
-      // encrypted with the same master key the wrap path just derived.
-      let wrapIntelligenceSelector: SubstrateSelector | undefined;
-      try {
-        wrapIntelligenceSelector = new SubstrateSelector({
-          storage: v11Storage,
-          masterKey: derived.key,
-          auditLog: wrapAuditLog,
-          identityId: `fortress:${storagePath}`,
-        });
-        await wrapIntelligenceSelector.load();
-        // Rho-2.5 (HIGH privacy-leak fix): the wrap-auto dashboard mounts
-        // the /api/query-anonymity/pii route and serves concierge over the
-        // frontier substrate. Without this install the selector kept the
-        // passthrough IDENTITY_REDACTOR, so an operator who opted into
-        // Tier B here egressed query + context UNSCRUBBED. Route through
-        // THE shared chokepoint with the SAME hashed fortressId that the
-        // buildV11Bindings call below uses, so the route's PATCH and the
-        // live scrub read the same encrypted config.
-        wrapTierBPiiRedactorInstalled = installConsentGatedRedactor({
-          selector: wrapIntelligenceSelector,
-          storage: v11Storage,
-          masterKey: derived.key,
-          fortressId: fortressIdFromStoragePath(storagePath),
-        });
-        intelligenceHealthy = true;
-      } catch (err) {
-        intelligenceHealthy = false;
-        intelligenceError = (err as Error).message;
-        // wrapTierBPiiRedactorInstalled stays false (its initialized value):
-        // the install assignment above only completes when no throw occurred.
-        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
-        console.error(
-          `  Note: Intelligence panel unavailable on wrap URL ` +
-            `(${(err as Error).message}).`,
-        );
-        wrapIntelligenceSelector = undefined;
-      }
-      dashboard.setV11Bindings(
-        buildV11Bindings({
-          identityId: `fortress:${storagePath}`,
-          fortressId: fortressIdFromStoragePath(storagePath),
-          auditLog: wrapAuditLog,
-          // v1.1.5 (Finding Z): rehydrate from the file the upsert
-          // above just wrote, so the registry the wrap-auto dashboard
-          // serves contains this wrap plus any prior wraps against the
-          // same fortress.
-          storagePath,
-          ...(wrapIntelligenceSelector
-            ? { intelligenceSelector: wrapIntelligenceSelector }
-            : {}),
-          // WP-V1.2-4: forward the wrap-auto fortress's storage + master
-          // key so buildV11Bindings constructs the operator chat service.
-          // The wrap-emitted dashboard URL surfaces concierge + direct-
-          // agent chat from first launch.
-          storage: v11Storage,
-          masterKey: derived.key,
-          // Rho-2.5: the consent-gated redactor is installed on the
-          // wrap-auto selector, so report the truthful effective state.
-          tierBPiiRedactorInstalled: wrapTierBPiiRedactorInstalled,
-        }),
-      );
-      // The wrap-auto dashboard always binds 127.0.0.1. The printed URL
-      // carries only a short-lived session; loopback auto-auth keeps the
-      // v1.1 client one-click without putting the bearer token in a URL.
-      dashboard.setV11LoopbackAutoAuth(true);
+      // against the wrap-auto fortress -- RETIRED here by dashboard-fold
+      // PR-4. The selector + consent-gated Tier B redactor existed to serve
+      // concierge/query routes FROM THE RETIRED wrap-spawned server; this
+      // wrap process no longer serves any query path. The surviving main
+      // dashboard constructs its own selector and installs the SAME
+      // consent-gated redactor chokepoint at boot (dashboard-standalone /
+      // MCP-boot paths), reading the same encrypted `_intelligence` config
+      // for this fortress, so the Rho-2.5 privacy contract is unchanged on
+      // the ONE serving surface. The v1.1 bindings + loopback auto-auth
+      // wiring for the retired server is likewise gone: the main dashboard
+      // builds its own bindings at boot.
     } catch (err) {
       // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
       console.error(
@@ -4678,6 +4546,55 @@ export async function runWrap(
   }
 
   failIfAnchorOptInDropped();
+
+  // Dashboard-fold PR-4 (ratified decision 1): ensure-and-reuse the ONE main
+  // dashboard. Detection is tenant-scoped (THIS fortress's runtime.json, with
+  // PID-liveness on read, corroborated by an HTTP health probe) so a live
+  // dashboard for a DIFFERENT tenant is never mistaken for ours. When absent,
+  // start the main dashboard through the injected starter:
+  //   - production (src/cli.ts): a closure over `startStandaloneDashboard`,
+  //     so the serving process/module is the principal-policy dashboard (the
+  //     retired wrap-served server is never spawned);
+  //   - tests: the legacy `deps.startDashboard` seam is adapted below so the
+  //     existing stub-injection suites keep exercising the same flow.
+  // runtime.json single-writer BY CONSTRUCTION: this path no longer writes or
+  // clears runtime.json at all — the started main dashboard's own boot path
+  // (dashboard-standalone.ts) is the ONLY production writer, and a reused
+  // dashboard already owns its record.
+  const ownedStarter: OwnedDashboardStarter | undefined =
+    deps.startOwnedDashboard ??
+    (deps.startDashboard
+      ? adaptLegacyDashboardStarter(deps.startDashboard)
+      : undefined);
+  let ensuredDashboard: EnsuredMainDashboard | undefined;
+  if (ownedStarter === undefined) {
+    // No starter available in this embedding (a direct runWrap() call with
+    // neither seam injected). Fail HONESTLY toward "no dashboard" with a loud
+    // note rather than silently spawning the retired server: the harness IS
+    // wrapped; the dashboard is reachable via `sanctuary dashboard`.
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+    console.error(
+      `  Note: no dashboard starter available in this embedding. ` +
+        `Run \`sanctuary dashboard\` to serve the operator dashboard.`,
+    );
+  } else {
+    ensuredDashboard = await ensureMainDashboardForWrap({
+      storagePath,
+      requestedPort,
+      ...(passphraseValue !== undefined ? { passphrase: passphraseValue } : {}),
+      start: ownedStarter,
+      ...(deps.probeDashboardHealth
+        ? { probeHealth: deps.probeDashboardHealth }
+        : {}),
+    });
+    if (ensuredDashboard.reused) {
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error(
+        `  Reusing the running Sanctuary dashboard at ${ensuredDashboard.url} ` +
+          `(one serving surface; no second server spawned).`,
+      );
+    }
+  }
 
   // Auto-provision Step 2 (Build 1): see the matching call + comment in the
   // --no-dashboard branch above. Runs after the cooperative wrap (config +
@@ -4726,43 +4643,18 @@ export async function runWrap(
   // continues exactly like every other non-arming outcome, matching the
   // `--no-dashboard` branch's sibling handling of the same outcome kind.
 
-  const dashboardUrl = dashboard.createSessionUrl?.() ?? dashboard.url;
-
-  // Publish runtime state so `sanctuary agents` + the multi-agent
-  // dashboard aggregator can find this tenant's actual port. Best-effort:
-  // write failures must not block wrap, and we clean up on shutdown.
-  const webhookCallbackPortRaw = process.env.SANCTUARY_WEBHOOK_CALLBACK_PORT;
-  const webhookCallbackPort = webhookCallbackPortRaw
-    ? parseInt(webhookCallbackPortRaw, 10)
-    : undefined;
-  await writeTenantRuntime(storagePath, {
-    version: readPackageVersion(),
-    pid: process.pid,
-    started_at: new Date().toISOString(),
-    dashboard_host: dashboard.host,
-    dashboard_port: dashboard.port,
-    ...(webhookCallbackPort !== undefined &&
-    !Number.isNaN(webhookCallbackPort)
-      ? {
-          webhook_callback_port: webhookCallbackPort,
-          webhook_callback_host:
-            process.env.SANCTUARY_WEBHOOK_CALLBACK_HOST ?? "127.0.0.1",
-        }
-      : {}),
-    mode: "wrap",
-  });
-  const cleanupRuntime = async () => {
-    try {
-      await clearTenantRuntime(storagePath);
-    } catch {
-      /* best-effort: a shutdown cleanup must not throw out of the signal handler */
-    }
-  };
-  registerProcessShutdownCleanup(cleanupRuntime);
+  // Dashboard-fold PR-4: the runtime.json write + shutdown-clear that lived
+  // here were the WRAP side of the two-writer race on `runtime.json`
+  // (last-writer-wins with dashboard-standalone, either exit clearing the
+  // other's record). Both are deliberately GONE: the main dashboard's own
+  // boot path is now the single production writer/clearer of runtime.json,
+  // so the race is resolved by construction (asserted in
+  // test/wrap/protect-ensure-dashboard.test.ts).
+  const dashboardUrl = ensuredDashboard?.url;
 
   // Auto-open in browser.
   const toolName = toolNameFor(agentConfig.platform, agentConfig.servers);
-  if (!options.noOpen) {
+  if (!options.noOpen && dashboardUrl !== undefined) {
     try {
       const opener = deps.openBrowser ?? defaultOpenBrowser;
       await opener(dashboardUrl);
@@ -4791,12 +4683,14 @@ export async function runWrap(
     toolCount: countUpstreamTools(upstreamServers),
     serverCount: upstreamServers.length,
     platform: agentConfig.platform,
-    dashboardUrl,
-    browserOpened: !options.noOpen,
+    ...(dashboardUrl !== undefined ? { dashboardUrl } : {}),
+    ...(ensuredDashboard?.reused ? { dashboardReused: true } : {}),
+    browserOpened: !options.noOpen && dashboardUrl !== undefined,
     passphraseLocation,
     passphraseSource,
-    intelligenceHealthy,
-    intelligenceError,
+    // Dashboard-fold PR-4: the intelligence health banner inputs came from
+    // the retired wrap-spawned server's substrate selector; the ONE main
+    // dashboard reports its own intelligence health on its own surfaces.
     castleWallProtectionClaim,
     // 2026-07-02 hardening: the dead-pin warning must survive to the
     // terminal-final success surface, not only the mid-flow warning.
@@ -4804,7 +4698,163 @@ export async function runWrap(
   });
 }
 
-// ── Dashboard: port fallback ────────────────────────────────────────
+// ── Dashboard-fold PR-4: ensure-and-reuse the ONE main dashboard ─────
+
+/** Result of starting the main dashboard in-process. */
+export interface OwnedDashboardStart {
+  url: string;
+  port: number;
+}
+
+/**
+ * Starter for the ONE main dashboard (principal-policy). Injected by
+ * src/cli.ts as a closure over `startStandaloneDashboard`; wrap/cli must not
+ * import dashboard-standalone itself (import-cycle baseline).
+ */
+export type OwnedDashboardStarter = (opts: {
+  storagePath: string;
+  port: number;
+  passphrase?: string;
+}) => Promise<OwnedDashboardStart>;
+
+export interface EnsuredMainDashboard {
+  url: string;
+  port: number;
+  /** True when a live main dashboard for THIS fortress was reused. */
+  reused: boolean;
+}
+
+/**
+ * Adapt the legacy test seam (`RunWrapDeps.startDashboard`, the retired
+ * wrap-spawned server's starter shape) into an `OwnedDashboardStarter` so the
+ * existing stub-injection suites keep exercising the ensure-and-reuse flow.
+ * Production never routes through this: src/cli.ts injects
+ * `startOwnedDashboard`, which wins.
+ */
+export function adaptLegacyDashboardStarter(
+  legacy: DashboardStarter,
+): OwnedDashboardStarter {
+  return async ({ port }) => {
+    const handle = await legacy({
+      port,
+      mode: "co-located",
+      authToken: generateAuthToken(),
+      serverVersion: readPackageVersion(),
+    });
+    return { url: handle.url, port: handle.port };
+  };
+}
+
+/**
+ * Default live-dashboard health probe: GET `<baseUrl>/api/health` with a
+ * short abort timeout; healthy iff HTTP 200 with `ok: true`. Never throws.
+ */
+async function probeDashboardHealthDefault(baseUrl: string): Promise<boolean> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 1500);
+  try {
+    const res = await fetch(`${baseUrl}/api/health`, { signal: ctrl.signal });
+    if (!res.ok) return false;
+    const body = (await res.json()) as { ok?: unknown };
+    return body.ok === true;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+export interface EnsureMainDashboardOptions {
+  storagePath: string;
+  requestedPort: number;
+  passphrase?: string;
+  start: OwnedDashboardStarter;
+  /** Override the health probe (tests). Default: GET /api/health, 1.5s abort. */
+  probeHealth?: (baseUrl: string) => Promise<boolean>;
+  /** Override the runtime.json reader (tests). Default: readTenantRuntime. */
+  readRuntime?: typeof readTenantRuntime;
+}
+
+/**
+ * Dashboard-fold PR-4 (ratified decision 1): ensure-and-reuse the ONE main
+ * dashboard for a fortress.
+ *
+ *  1. DETECT, tenant-scoped: read THIS fortress's `runtime.json`
+ *     (`readTenantRuntime` already enforces PID-liveness on read) and
+ *     corroborate with an HTTP health probe. Both must pass — a stale file,
+ *     a dead PID, or a non-answering port all fall through to a fresh start;
+ *     a live dashboard for a DIFFERENT tenant is never matched because the
+ *     detection reads only this fortress's storage path.
+ *  2. START when absent, walking the same port range the retired
+ *     `startDashboardWithFallback` walked (`requestedPort` through
+ *     `requestedPort + PORT_FALLBACK_ATTEMPTS - 1`): attempt the start, and
+ *     on EADDRINUSE first re-check THIS tenant's runtime record (a
+ *     concurrent protect for the SAME fortress that won the race is REUSED,
+ *     never duplicated), then walk to the next port. Multi-tenant behavior
+ *     is preserved: two tenants defaulting to 3501 do not fail, the second
+ *     walks up with the same operator note as before.
+ *  3. Any non-EADDRINUSE failure rethrows — no silent degrade.
+ *
+ * runtime.json single-writer: this function never writes runtime.json. The
+ * started main dashboard's boot path owns the write; a reused dashboard
+ * already owns its record.
+ */
+export async function ensureMainDashboardForWrap(
+  opts: EnsureMainDashboardOptions,
+): Promise<EnsuredMainDashboard> {
+  const probe = opts.probeHealth ?? probeDashboardHealthDefault;
+  const readRuntime = opts.readRuntime ?? readTenantRuntime;
+
+  const reuseIfLive = async (): Promise<EnsuredMainDashboard | null> => {
+    const existing = await readRuntime(opts.storagePath);
+    if (!existing) return null;
+    const url = `http://${existing.dashboard_host}:${existing.dashboard_port}`;
+    if (!(await probe(url))) return null;
+    return { url, port: existing.dashboard_port, reused: true };
+  };
+
+  const preexisting = await reuseIfLive();
+  if (preexisting) return preexisting;
+
+  let lastErr: unknown;
+  for (let i = 0; i < PORT_FALLBACK_ATTEMPTS; i++) {
+    const port = opts.requestedPort + i;
+    try {
+      const started = await opts.start({
+        storagePath: opts.storagePath,
+        port,
+        ...(opts.passphrase !== undefined
+          ? { passphrase: opts.passphrase }
+          : {}),
+      });
+      if (port !== opts.requestedPort) {
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+        console.error(
+          `  Port ${opts.requestedPort} was unavailable. Dashboard bound to ${port}.`,
+        );
+      }
+      return { url: started.url, port: started.port, reused: false };
+    } catch (err) {
+      lastErr = err;
+      if (!isAddressInUse(err)) throw err;
+      // The port was taken between detection and bind. If a concurrent
+      // protect for the SAME fortress won the race, reuse it; otherwise a
+      // foreign process owns the port — walk to the next one.
+      const raced = await reuseIfLive();
+      if (raced) return raced;
+    }
+  }
+  const lastPort = opts.requestedPort + PORT_FALLBACK_ATTEMPTS - 1;
+  throw new Error(
+    `No free dashboard port in the range ${opts.requestedPort}-${lastPort} (all ${PORT_FALLBACK_ATTEMPTS} tried): ${
+      (lastErr as Error)?.message ?? "unknown"
+    }. Stop the other Sanctuary instance, or choose a port with: sanctuary wrap <your-flags> --port <port>.`,
+  );
+}
+
+// ── Dashboard: port fallback (RETIRED from the protect path by fold PR-4;
+//    kept exported for the legacy embedding/test seam until the PR-5
+//    retirement disposition) ─────────────────────────────────────────
 
 export async function startDashboardWithFallback(
   startFn: DashboardStarter,
@@ -4889,7 +4939,14 @@ interface WrapSuccessInfo {
    * the authoritative config.yaml routing message).
    */
   platform?: AgentPlatform;
-  dashboardUrl: string;
+  /**
+   * Dashboard-fold PR-4: absent when no dashboard could be ensured in this
+   * embedding (the banner then prints the `sanctuary dashboard` pointer
+   * instead of a URL — honest, never a fabricated URL).
+   */
+  dashboardUrl?: string;
+  /** True when an already-running main dashboard was REUSED (decision 1). */
+  dashboardReused?: boolean;
   browserOpened: boolean;
   passphraseLocation: string;
   passphraseSource: string;
@@ -4921,13 +4978,23 @@ export function formatWrapSuccess(info: WrapSuccessInfo): string {
     `  ${g(check)} Wrapped ${b(info.toolName)} with Sanctuary v${info.version}`
   );
   lines.push(`  ${g(check)} ${renderUpstreamCountLine(info)}`);
-  lines.push(
-    `  ${g(check)} Sovereignty Dashboard running at ${b(info.dashboardUrl)}`
-  );
-  if (info.browserOpened) {
-    lines.push(`  ${g(check)} Opened in your browser`);
+  if (info.dashboardUrl !== undefined) {
+    // Dashboard-fold PR-4 (decision 1): the reused-URL line is the product
+    // mechanic's banner surface — one serving surface, no rival spawned.
+    lines.push(
+      info.dashboardReused
+        ? `  ${g(check)} Sovereignty Dashboard already running at ${b(info.dashboardUrl)} ${d("(reused - one serving surface)")}`
+        : `  ${g(check)} Sovereignty Dashboard running at ${b(info.dashboardUrl)}`,
+    );
+    if (info.browserOpened) {
+      lines.push(`  ${g(check)} Opened in your browser`);
+    } else {
+      lines.push(`  ${d("(browser auto-open suppressed)")}`);
+    }
   } else {
-    lines.push(`  ${d("(browser auto-open suppressed)")}`);
+    lines.push(
+      `  ${d("Dashboard unavailable in this run. Run `sanctuary dashboard` to serve it.")}`,
+    );
   }
   lines.push("");
   // Named enforcement layers (L1-L4 numbering retired 2026-05-24). Mapping

@@ -306,9 +306,15 @@ describe("fresh-install onboarding smoke", () => {
       mode: "co-located",
     });
     expect(startCalls[0]?.authToken).toMatch(/^[A-Za-z0-9_-]+$/);
-    expect(openedUrls).toEqual([sessionUrl]);
-    expect(v11BindingsSet).toBe(true);
-    expect(loopbackAutoAuth).toBe(true);
+    // Dashboard-fold PR-4 (ratified decision 1): the wrap path no longer
+    // decorates a wrap-owned server handle. The browser opens the ensured
+    // dashboard's plain URL (the ONE main dashboard authenticates its own
+    // clients — loopback auto-auth after unlock lives in ITS boot path), and
+    // wrap performs no v1.1-binding or loopback-auto-auth wiring on any
+    // handle: the main dashboard builds its own bindings at boot.
+    expect(openedUrls).toEqual([`http://127.0.0.1:${assignedPort}`]);
+    expect(v11BindingsSet).toBe(false);
+    expect(loopbackAutoAuth).toBeUndefined();
     expect(castleWallMocks.runProvisionPin).toHaveBeenCalledWith(
       [],
       expect.objectContaining({
