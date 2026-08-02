@@ -34,6 +34,7 @@ import { resolveCastleWallSocketPath } from "../castle-wall/runtime/socket-path.
 import {
   DEFAULT_ENFORCEMENT_AVAILABILITY_FRESHNESS_MS,
   queryMacOSEnforcementAvailability,
+  type ResolvedEnforcementAvailability,
 } from "../castle-wall/runtime/enforcement-availability.js";
 import {
   loadBrokerProducerKey,
@@ -71,6 +72,7 @@ import {
 } from "../dashboard/v1_1/wiring.js";
 import { getProcessInstance, getProcessSince } from "../dashboard/process-identity.js";
 import {
+  composeAggregatorSources,
   getProtectionSnapshot,
   type AggregatorSources,
   type PendingApproval,
@@ -96,7 +98,7 @@ import {
   type PostureRouteDeps,
 } from "./posture-routes.js";
 import { renderPostureHomeHTML } from "./posture-home-html.js";
-import { buildFleetRoster } from "./fleet-roster.js";
+import { buildFleetRoster, type FleetRoster } from "./fleet-roster.js";
 import {
   applyFleetCap,
   resolveActivation,
@@ -925,6 +927,30 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     | (() => Promise<ExclusiveEgressStatus | null> | ExclusiveEgressStatus | null)
     | null = null;
 
+  // ── Dashboard-fold PR-1: injected dependency overrides ────────────────
+  // The wrap ("Protect") boot path resolves several read-only dependencies
+  // from the at-rest fortress records because it runs no live federation
+  // daemon (a disk-backed fleet-roster provider, the fortress producer-key
+  // load, and the wrap enforcement-availability resolver). When `protect`
+  // reuses/starts THIS server instead of spawning its own (PR-4), those
+  // resolvers arrive through `setDependencies`. Absent (every current
+  // production boot path), behavior is byte-identical to the pre-fold tree:
+  // this server resolves each dependency exactly as before.
+  /** Injected read-only fleet-roster provider; overrides the live federation-daemon roster when set. */
+  private injectedFleetRoster:
+    | (() => FleetRoster | Promise<FleetRoster>)
+    | null = null;
+  /** Injected pinned-producer-key resolver; overrides the config-path producer-key load when set. */
+  private injectedResolvePinnedProducerKey: (() => string | null) | null = null;
+  /** Injected fail-honest flag paired with the injected producer-key resolver. */
+  private injectedProducerKeyExpectedButUnavailable = false;
+  /** Injected enforcement-availability resolver; overrides the castle.sock query when set. */
+  private injectedResolveEnforcementAvailability:
+    | (() =>
+        | Promise<ResolvedEnforcementAvailability>
+        | ResolvedEnforcementAvailability)
+    | null = null;
+
   /**
    * Slice 2 (park-not-exit): true when this dashboard booted WITHOUT a master
    * key under the supervised LaunchAgent path (`--allow-park`). A parked
@@ -1262,6 +1288,34 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     clientManager?: ClientManager;
     /** Storage backend for the Recognition panel (bridge list + reputation read). */
     storage?: StorageBackend;
+    /**
+     * Dashboard-fold PR-1: read-only fleet-roster provider injected by a
+     * boot path that runs no live federation daemon (the wrap "Protect"
+     * reuse path reads the at-rest fortress records per request). When set
+     * it overrides the live federation-daemon roster for the posture fleet
+     * panel. Strictly read-only; carries no key material.
+     */
+    fleetRoster?: () => FleetRoster | Promise<FleetRoster>;
+    /**
+     * Dashboard-fold PR-1: pinned-producer-key resolver injected by the wrap
+     * boot path (resolved over the wrap fortress storage path via
+     * `loadFortressProducerKey`). Overrides this server's own config-path
+     * producer-key load. Pair with `producerKeyExpectedButUnavailable` for
+     * the fail-honest unreadable case; never inject a weaker basis than the
+     * consumer wrote with.
+     */
+    resolvePinnedProducerKey?: () => string | null;
+    /** Fail-honest flag paired with `resolvePinnedProducerKey` (key expected but unreadable ⇒ amber, never green). */
+    producerKeyExpectedButUnavailable?: boolean;
+    /**
+     * Dashboard-fold PR-1: enforcement-availability resolver injected by the
+     * wrap boot path (`resolveWrapEnforcementAvailability` over the wrap
+     * fortress storage path). Overrides the castle.sock query this server
+     * performs itself.
+     */
+    resolveEnforcementAvailability?: () =>
+      | Promise<ResolvedEnforcementAvailability>
+      | ResolvedEnforcementAvailability;
   }): void {
     this.policy = deps.policy;
     this.baseline = deps.baseline;
@@ -1273,6 +1327,16 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     if (deps.sanctuaryConfig) this._sanctuaryConfig = deps.sanctuaryConfig;
     if (deps.profileStore) this.profileStore = deps.profileStore;
     if (deps.clientManager) this.clientManager = deps.clientManager;
+    if (deps.fleetRoster) this.injectedFleetRoster = deps.fleetRoster;
+    if (deps.resolvePinnedProducerKey) {
+      this.injectedResolvePinnedProducerKey = deps.resolvePinnedProducerKey;
+      this.injectedProducerKeyExpectedButUnavailable =
+        deps.producerKeyExpectedButUnavailable === true;
+    }
+    if (deps.resolveEnforcementAvailability) {
+      this.injectedResolveEnforcementAvailability =
+        deps.resolveEnforcementAvailability;
+    }
   }
 
   /**
@@ -1898,25 +1962,35 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       // it and never touch a node's security. The count that drives the cap is
       // `summary.admitted` (active, non-revoked), already computed by
       // `buildFleetRoster` via the shared `isNodeRevoked` projection.
-      fleetRoster: async () => {
-        const roster = buildFleetRoster(this.buildV1FederationDeps(), {
-          evictionSerial: this._federationState.evictionMaxSerial,
-          operatorPolicy: this._federationState.operatorPolicy,
-        });
-        const cap = await this.resolveFleetCap();
-        return applyFleetCap(roster, cap).roster;
-      },
-      resolvePinnedProducerKey: () =>
-        load?.status === "present" ? load.keyB64url : null,
-      producerKeyExpectedButUnavailable: load?.status === "unreadable",
+      // Dashboard-fold PR-1: an injected provider (setDependencies, wrap-reuse
+      // path — a boot with no live federation daemon reads the at-rest fortress
+      // records) overrides the live daemon roster; absent, byte-identical to
+      // the pre-fold behavior below.
+      fleetRoster:
+        this.injectedFleetRoster ??
+        (async () => {
+          const roster = buildFleetRoster(this.buildV1FederationDeps(), {
+            evictionSerial: this._federationState.evictionMaxSerial,
+            operatorPolicy: this._federationState.operatorPolicy,
+          });
+          const cap = await this.resolveFleetCap();
+          return applyFleetCap(roster, cap).roster;
+        }),
+      resolvePinnedProducerKey:
+        this.injectedResolvePinnedProducerKey ??
+        (() => (load?.status === "present" ? load.keyB64url : null)),
+      producerKeyExpectedButUnavailable: this.injectedResolvePinnedProducerKey
+        ? this.injectedProducerKeyExpectedButUnavailable
+        : load?.status === "unreadable",
       resolveBrokerPinnedProducerKey: () =>
         brokerLoad?.status === "present" ? brokerLoad.keyB64url : null,
       brokerProducerKeyExpectedButUnavailable:
         brokerLoad?.status === "unreadable",
       resolveProtectionClaimSubject: () =>
         this.resolveProtectionClaimSubject(),
-      resolveEnforcementAvailability: () =>
-        this.resolveEnforcementAvailability(),
+      resolveEnforcementAvailability:
+        this.injectedResolveEnforcementAvailability ??
+        (() => this.resolveEnforcementAvailability()),
       // Wire the shared registry so the SSE live-refresh stream is available and
       // its concurrency cap is enforced server-wide. The stream reuses `buildHome`
       // (no new data, no new green paths) on a cadence plus a heartbeat.
@@ -7423,29 +7497,45 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     // (honest macOS / pre-provision); `unreadable` → fail honestly via
     // `producerKeyExpectedButUnavailable` (the shield goes amber, never green on
     // a weaker basis than the consumer wrote with).
-    await this.ensureProducerKeyLoaded();
-    const load = this._producerKeyLoad;
-    return {
+    // Dashboard-fold PR-1: an injected producer-key resolver (setDependencies,
+    // wrap-reuse path) overrides the config-path load; otherwise resolve the
+    // key exactly as before. The injected pair preserves the fail-honest
+    // contract: `producerKeyExpectedButUnavailable` forces amber, never green
+    // on a weaker basis.
+    let resolvePinnedProducerKey: () => string | null;
+    let producerKeyExpectedButUnavailable: boolean;
+    if (this.injectedResolvePinnedProducerKey) {
+      resolvePinnedProducerKey = this.injectedResolvePinnedProducerKey;
+      producerKeyExpectedButUnavailable =
+        this.injectedProducerKeyExpectedButUnavailable;
+    } else {
+      await this.ensureProducerKeyLoaded();
+      const load = this._producerKeyLoad;
+      resolvePinnedProducerKey = () =>
+        load?.status === "present" ? load.keyB64url : null;
+      producerKeyExpectedButUnavailable = load?.status === "unreadable";
+    }
+    // Dashboard-fold PR-1: assembled by the ONE shared builder so this path
+    // and the wrap-auto `startDashboard` path share identical include-or-omit
+    // semantics. S5-P is unchanged: the hero shield gets the SAME fail-closed
+    // exclusive-egress resolver every other surface uses, so the shield's wall
+    // arm-state (via the ONE canonical shaper) caps green identically.
+    return composeAggregatorSources({
       mode: this._standaloneMode ? "standalone" : "co-located",
-      server_version: PKG_VERSION,
+      serverVersion: PKG_VERSION,
       platform: process.platform,
-      ...(this.identityManager ? { identityManager: this.identityManager } : {}),
-      ...(this.auditLog ? { auditLog: this.auditLog } : {}),
-      ...(this.baseline ? { baseline: this.baseline } : {}),
-      ...(this.policy ? { policy: this.policy } : {}),
-      ...(this.clientManager ? { clientManager: this.clientManager } : {}),
-      resolvePinnedProducerKey: () =>
-        load?.status === "present" ? load.keyB64url : null,
-      ...(load?.status === "unreadable"
-        ? { producerKeyExpectedButUnavailable: true }
-        : {}),
-      // S5-P: hand the hero shield the SAME fail-closed exclusive-egress
-      // resolver every other surface uses, so the shield's wall arm-state
-      // (via the ONE canonical shaper) caps green identically.
+      identityManager: this.identityManager,
+      auditLog: this.auditLog,
+      baseline: this.baseline,
+      policy: this.policy,
+      clientManager: this.clientManager,
+      resolvePinnedProducerKey,
+      producerKeyExpectedButUnavailable,
       resolveExclusiveEgressPosture: () => this.resolveExclusiveEgressPosture(),
       resolveProtectionClaimSubject: () => this.resolveProtectionClaimSubject(),
-      resolveEnforcementAvailability: () =>
-        this.resolveEnforcementAvailability(),
+      resolveEnforcementAvailability:
+        this.injectedResolveEnforcementAvailability ??
+        (() => this.resolveEnforcementAvailability()),
       pendingApprovals: Array.from(this.pending.values()).map((p) => ({
         id: p.id,
         operation: p.request.operation,
@@ -7453,7 +7543,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         reason: p.request.reason,
         created_at: p.created_at,
       })),
-    };
+    });
   }
 
   /**
