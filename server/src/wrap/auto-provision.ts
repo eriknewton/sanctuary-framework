@@ -3281,9 +3281,10 @@ function realParkedInstallRevertOps(daemonOps: HarnessDaemonOps): ParkedInstallR
         daemonOps,
       );
     },
-    clearJobDisable: async () => {
-      await setAgentHarnessJobDisabled(daemonOps, false);
+    setJobDisabled: async (disabled) => {
+      await setAgentHarnessJobDisabled(daemonOps, disabled);
     },
+    ensureHoldDir: ensureAgentHarnessHoldDir,
     writeFile: daemonOps.writeFile,
     readFile: daemonOps.readFile,
     removeFile: daemonOps.removeFile,

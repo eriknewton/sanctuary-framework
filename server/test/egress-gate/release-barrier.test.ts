@@ -681,8 +681,15 @@ function makeParkedOps(overrides?: {
   running?: boolean;
   known?: boolean;
   ensureHoldDirError?: string;
+  /** launchd's persistent override state before this run. */
+  jobDisabled?: boolean;
+  /** Make the pre-mutation disabled-override read fail. */
+  printDisabledCode?: number;
+  printDisabledStderr?: string;
   /** Bytes the pre-existing harness plist holds, or undefined for a clean host. */
   priorPlist?: string;
+  /** Bytes of a pre-existing release hold file before this run. */
+  priorHoldFile?: string;
   /** Status samples returned in order (later ones drive the settle loop). */
   statusSamples?: Array<{ known: boolean; installed: boolean; running: boolean; pid?: number }>;
   /** Make the revert's verified restart fail (it throws, as production's does). */
@@ -696,11 +703,14 @@ function makeParkedOps(overrides?: {
     notices: [],
     sequence: [],
     files: new Map(),
-    jobDisabled: false,
+    jobDisabled: overrides?.jobDisabled ?? false,
     jobRunning: overrides?.statusSamples?.[0]?.running ?? overrides?.running ?? false,
   };
   if (overrides?.priorPlist !== undefined) {
     log.files.set(AGENT_HARNESS_DAEMON_PLIST_PATH, overrides.priorPlist);
+  }
+  if (overrides?.priorHoldFile !== undefined) {
+    log.files.set(holdFilePathForUid(503), overrides.priorHoldFile);
   }
   let statusCall = 0;
   const ops: ParkedInstallOps = {
@@ -735,13 +745,20 @@ function makeParkedOps(overrides?: {
       log.jobDisabled = false;
       log.jobRunning = true;
     },
-    async clearJobDisable() {
-      log.sequence.push("clearJobDisable");
-      log.jobDisabled = false;
+    async setJobDisabled(disabled) {
+      log.sequence.push(`setJobDisabled:${String(disabled)}`);
+      log.jobDisabled = disabled;
     },
     async runLaunchctl(args) {
       log.launchctl.push([...args]);
       log.sequence.push(`launchctl:${args.join(" ")}`);
+      if (args[0] === "print-disabled") {
+        return {
+          code: overrides?.printDisabledCode ?? 0,
+          stdout: log.jobDisabled ? `"${AGENT_HARNESS_DAEMON_LABEL}" => disabled\n` : "",
+          stderr: overrides?.printDisabledStderr ?? "",
+        };
+      }
       if (args[0] === "bootout") {
         const code = overrides?.bootoutCode ?? 0;
         if (code === 0) log.jobRunning = false;
@@ -808,6 +825,7 @@ describe("executeParkedHarnessInstall", () => {
       { path: plan.plistPath, mode: 0o644 },
     ]);
     expect(log.launchctl).toEqual([
+      ["print-disabled", "system"],
       ["disable", `system/${AGENT_HARNESS_DAEMON_LABEL}`],
       ["bootout", `system/${AGENT_HARNESS_DAEMON_LABEL}`],
     ]);
@@ -848,6 +866,18 @@ describe("executeParkedHarnessInstall", () => {
     await expect(executeParkedHarnessInstall(plan, ops)).rejects.toThrow(/trustworthy/);
   });
 
+  it("refuses before mutation when the prior launchd disabled override cannot be read", async () => {
+    const { ops, log } = makeParkedOps({
+      printDisabledCode: 5,
+      printDisabledStderr: "database locked",
+    });
+    await expect(executeParkedHarnessInstall(plan, ops)).rejects.toThrow(/disabled state is unknown BEFORE/);
+    expect(log.writes).toEqual([]);
+    expect(log.launchctl.filter(([verb]) => verb !== "print-disabled")).toEqual([]);
+    expect(log.removed).toEqual([]);
+    expect(log.ensured).toEqual([]);
+  });
+
   // ------------------------------------------------------------------
   // Drill D1 (2026-07-18): the wrapper was written into a root-owned
   // directory nothing in a first-ever install creates, so every clean-host
@@ -867,9 +897,9 @@ describe("executeParkedHarnessInstall", () => {
   it("D1: refuses the whole parked install when the hold directory cannot be ensured", async () => {
     const { ops, log } = makeParkedOps({ ensureHoldDirError: "EACCES: read-only /var/db" });
     await expect(executeParkedHarnessInstall(plan, ops)).rejects.toThrow(/EACCES/);
-    // Fail-closed: nothing was written and no launchctl state was touched.
+    // Fail-closed: nothing was written and no launchctl state was mutated.
     expect(log.writes).toEqual([]);
-    expect(log.launchctl).toEqual([]);
+    expect(log.launchctl.filter(([verb]) => verb !== "print-disabled")).toEqual([]);
   });
 
   it("D1: writeIntoHoldDir refuses a relative hold dir or a name that escapes it", async () => {
@@ -1002,10 +1032,11 @@ describe("executeParkedHarnessInstall", () => {
   it("D2: refuses when bootout fails for any OTHER reason (never a park it could not assert)", async () => {
     const { ops, log } = makeParkedOps({ bootoutCode: 1, bootoutStderr: "Operation not permitted" });
     await expect(executeParkedHarnessInstall(plan, ops)).rejects.toThrow(/stand down/);
-    // Fail-closed: the stale hold file removal and the parked-status claim
-    // never ran. Exactly ONE status call happened -- the read-only precondition
-    // probe; the post-stand-down assertion was never reached.
-    expect(log.removed).not.toContain(plan.holdFilePath);
+    // Fail-closed: the parked-status claim never ran. Exactly ONE status call
+    // happened -- the read-only precondition probe; the post-stand-down
+    // assertion was never reached. The revert now also verifies the prior
+    // "no hold file" state.
+    expect(log.files.has(plan.holdFilePath)).toBe(false);
     expect(log.sequence.filter((s) => s === "harnessStatus")).toHaveLength(1);
     // FIX-ROUND 2: and the clean host is CLEAN again. This run created the
     // parked plist and the disable from nothing, so undoing means removing
@@ -1042,7 +1073,7 @@ describe("executeParkedHarnessInstall", () => {
     await expect(executeParkedHarnessInstall(plan, ops)).rejects.toThrow(/BEFORE the parked install/);
     // The property, not the guard: nothing on this host changed.
     expect(log.writes).toEqual([]);
-    expect(log.launchctl).toEqual([]);
+    expect(log.launchctl.filter(([verb]) => verb !== "print-disabled")).toEqual([]);
     expect(log.removed).toEqual([]);
     expect(log.ensured).toEqual([]);
   });
@@ -1054,7 +1085,7 @@ describe("executeParkedHarnessInstall", () => {
     });
     await expect(executeParkedHarnessInstall(plan, ops)).rejects.toThrow(/sanctuary-someone-else/);
     expect(log.writes).toEqual([]);
-    expect(log.launchctl).toEqual([]);
+    expect(log.launchctl.filter(([verb]) => verb !== "print-disabled")).toEqual([]);
   });
 
   it("F1: accepts a pre-existing job that IS this run's account and reports it as modified", async () => {
@@ -1084,7 +1115,7 @@ describe("executeParkedHarnessInstall", () => {
     await expect(executeParkedHarnessInstall(plan, ops)).rejects.toThrow(/ALREADY running/);
     await expect(executeParkedHarnessInstall(plan, ops)).rejects.toThrow(/--repair-egress-gate/);
     expect(log.writes).toEqual([]);
-    expect(log.launchctl).toEqual([]);
+    expect(log.launchctl.filter(([verb]) => verb !== "print-disabled")).toEqual([]);
   });
 
   it("F3: a fine-grained plist whose job is NOT running is a parked leftover, not a live agent -- the install proceeds", async () => {
@@ -1240,7 +1271,7 @@ describe("executeParkedHarnessInstall", () => {
     await expect(executeParkedHarnessInstall(plan, ops)).rejects.toThrow(/could not undo|cannot undo/i);
     // Read-only refusal: the host is untouched.
     expect(log.writes).toEqual([]);
-    expect(log.launchctl).toEqual([]);
+    expect(log.launchctl.filter(([verb]) => verb !== "print-disabled")).toEqual([]);
     expect(log.ensured).toEqual([]);
     expect(log.jobRunning).toBe(true);
   });
@@ -1263,6 +1294,7 @@ describe("revertParkedHarnessInstall (drill-D2 fix-round: the stand-down is reve
   interface RevertLog {
     restarted: string[];
     disableCleared: number;
+    ensured: Array<{ path: string; mode: number }>;
     writes: Array<{ path: string; content: string }>;
     removed: string[];
     /** How many times the revert read the harness's launchd state. */
@@ -1282,7 +1314,14 @@ describe("revertParkedHarnessInstall (drill-D2 fix-round: the stand-down is reve
     ops: Parameters<typeof revertParkedHarnessInstall>[1];
     log: RevertLog;
   } {
-    const log: RevertLog = { restarted: [], disableCleared: 0, writes: [], removed: [], statusCalls: 0 };
+    const log: RevertLog = {
+      restarted: [],
+      disableCleared: 0,
+      ensured: [],
+      writes: [],
+      removed: [],
+      statusCalls: 0,
+    };
     // Backed by a real map (fix-round 3, 2026-07-19): `plistRestored` is now
     // READ BACK from disk rather than inferred from `writeFile` resolving, so
     // ops that forget what they were told can no longer assert the claim.
@@ -1295,8 +1334,11 @@ describe("revertParkedHarnessInstall (drill-D2 fix-round: the stand-down is reve
           log.restarted.push(plistContent);
           disk.set(AGENT_HARNESS_DAEMON_PLIST_PATH, plistContent);
         },
-        async clearJobDisable() {
-          log.disableCleared += 1;
+        async setJobDisabled(disabled) {
+          if (!disabled) log.disableCleared += 1;
+        },
+        async ensureHoldDir(path, mode) {
+          log.ensured.push({ path, mode });
         },
         async writeFile(path, content) {
           if (overrides?.writeError !== undefined) throw new Error(overrides.writeError);
@@ -1326,6 +1368,8 @@ describe("revertParkedHarnessInstall (drill-D2 fix-round: the stand-down is reve
   const PRIOR = priorPlistFor("sanctuary-hermes");
   const runningSnapshot = {
     priorPlistContent: PRIOR,
+    holdFilePath: holdFilePathForUid(503),
+    disabledBefore: false,
     wasInstalled: true,
     wasRunning: true,
     preexistingJobModified: true,
@@ -1339,14 +1383,22 @@ describe("revertParkedHarnessInstall (drill-D2 fix-round: the stand-down is reve
   // is not a read: a truncating writer, a full filesystem, or a path that is
   // not the file we think it is all resolve.
   it("R3: a write that RESOLVES but does not land reports plistRestored:false and restored:false", async () => {
-    const log: RevertLog = { restarted: [], disableCleared: 0, writes: [], removed: [], statusCalls: 0 };
+    const log: RevertLog = {
+      restarted: [],
+      disableCleared: 0,
+      ensured: [],
+      writes: [],
+      removed: [],
+      statusCalls: 0,
+    };
     const ops = {
       async restoreRunningHarness() {
         throw new Error("launchctl bootstrap exited 5");
       },
-      async clearJobDisable() {
-        log.disableCleared += 1;
+      async setJobDisabled(disabled: boolean) {
+        if (!disabled) log.disableCleared += 1;
       },
+      async ensureHoldDir() {},
       async writeFile(path: string, content: string) {
         // Resolves. Writes nothing.
         log.writes.push({ path, content });
@@ -1372,7 +1424,8 @@ describe("revertParkedHarnessInstall (drill-D2 fix-round: the stand-down is reve
   it("R3: a clean-host revert whose removal silently leaves the file reports plistRestored:false", async () => {
     const ops = {
       async restoreRunningHarness() {},
-      async clearJobDisable() {},
+      async setJobDisabled() {},
+      async ensureHoldDir() {},
       async writeFile() {},
       async readFile() {
         return "<plist><!-- STILL HERE --></plist>";
@@ -1425,6 +1478,96 @@ describe("revertParkedHarnessInstall (drill-D2 fix-round: the stand-down is reve
     expect(log.disableCleared).toBe(1);
   });
 
+  it("regression: park then abort restores a prior launchd disabled override instead of enabling it", async () => {
+    const parkPlan = planParkedHarnessInstall({
+      agentAccount: "sanctuary-hermes",
+      agentUid: 503,
+      harnessLaunch: testLaunch(["/usr/local/bin/node", "/opt/harness.js"]),
+      fortressPath: "/Users/op/.sanctuary",
+    });
+    const { ops, log } = makeParkedOps({
+      jobDisabled: true,
+      priorPlist: priorPlistFor("sanctuary-hermes"),
+    });
+    const snapshot = await executeParkedHarnessInstall(parkPlan, ops);
+    expect(log.jobDisabled).toBe(true);
+
+    const result = await revertParkedHarnessInstall(snapshot, ops);
+
+    expect(result.restored).toBe(true);
+    expect(log.jobDisabled).toBe(true);
+  });
+
+  it("regression: park then abort restores a prior hold file instead of destroying it", async () => {
+    const parkPlan = planParkedHarnessInstall({
+      agentAccount: "sanctuary-hermes",
+      agentUid: 503,
+      harnessLaunch: testLaunch(["/usr/local/bin/node", "/opt/harness.js"]),
+      fortressPath: "/Users/op/.sanctuary",
+    });
+    const priorHold = [
+      "sanctuary-agent-harness-release v1",
+      "generation_id=7",
+      "agent_uid=503",
+      "harness_label=ai.sanctuaryprotocol.agent-harness",
+      "argv_digest=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "boot_session_uuid=11111111-2222-3333-4444-555555555555",
+    ].join("\n");
+    const { ops, log } = makeParkedOps({
+      priorPlist: priorPlistFor("sanctuary-hermes"),
+      priorHoldFile: priorHold,
+    });
+    const snapshot = await executeParkedHarnessInstall(parkPlan, ops);
+    expect(log.files.has(parkPlan.holdFilePath)).toBe(false);
+
+    const result = await revertParkedHarnessInstall(snapshot, ops);
+
+    expect(result.restored).toBe(true);
+    expect(log.files.get(parkPlan.holdFilePath)).toBe(priorHold);
+  });
+
+  it("regression (restore ORDER): re-disables BEFORE writing back a prior hold file, so no window exists where an enabled job sees a release token", async () => {
+    // The end-state tests above prove BOTH surfaces come back. They cannot see
+    // the dangerous middle: a hold file present while the job is still ENABLED
+    // is exactly the state that authorizes a confined agent to start. The code
+    // orders this correctly today; this pins the order so a later refactor
+    // cannot silently invert it.
+    const parkPlan = planParkedHarnessInstall({
+      agentAccount: "sanctuary-hermes",
+      agentUid: 503,
+      harnessLaunch: testLaunch(["/usr/local/bin/node", "/opt/harness.js"]),
+      fortressPath: "/Users/op/.sanctuary",
+    });
+    const priorHold = [
+      "sanctuary-agent-harness-release v1",
+      "generation_id=7",
+      "agent_uid=503",
+      "harness_label=ai.sanctuaryprotocol.agent-harness",
+      "argv_digest=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "boot_session_uuid=11111111-2222-3333-4444-555555555555",
+    ].join("\n");
+    const { ops, log } = makeParkedOps({
+      jobDisabled: true,
+      priorPlist: priorPlistFor("sanctuary-hermes"),
+      priorHoldFile: priorHold,
+    });
+    const snapshot = await executeParkedHarnessInstall(parkPlan, ops);
+
+    const result = await revertParkedHarnessInstall(snapshot, ops);
+    expect(result.restored).toBe(true);
+
+    const restoreSeq = log.sequence.slice(log.sequence.lastIndexOf("setJobDisabled:true"));
+    expect(restoreSeq.length).toBeGreaterThan(0);
+    const reDisableAt = log.sequence.lastIndexOf("setJobDisabled:true");
+    const holdWriteAt = log.sequence.lastIndexOf(`write:${parkPlan.holdFilePath}`);
+    expect(holdWriteAt).toBeGreaterThanOrEqual(0);
+    expect(reDisableAt).toBeGreaterThanOrEqual(0);
+    expect(reDisableAt).toBeLessThan(holdWriteAt);
+    // and the end state is still correct
+    expect(log.jobDisabled).toBe(true);
+    expect(log.files.get(parkPlan.holdFilePath)).toBe(priorHold);
+  });
+
   it("on a CLEAN host removes the parked plist this run created and clears its disable, leaving no residue", async () => {
     const { ops, log } = makeRevertOps();
     const result = await revertParkedHarnessInstall(
@@ -1433,12 +1576,14 @@ describe("revertParkedHarnessInstall (drill-D2 fix-round: the stand-down is reve
         wasRunning: false,
         preexistingJobModified: false,
         plistPath: AGENT_HARNESS_DAEMON_PLIST_PATH,
+        holdFilePath: holdFilePathForUid(503),
+        disabledBefore: false,
         harnessLabel: AGENT_HARNESS_DAEMON_LABEL,
       },
       ops,
     );
     expect(result.nothingToRevert).toBe(true);
-    expect(log.removed).toEqual([AGENT_HARNESS_DAEMON_PLIST_PATH]);
+    expect(log.removed).toEqual([AGENT_HARNESS_DAEMON_PLIST_PATH, holdFilePathForUid(503)]);
     expect(log.disableCleared).toBe(1);
     expect(log.restarted).toEqual([]);
   });
@@ -1650,6 +1795,8 @@ describe("revertParkedHarnessInstall (drill-D2 fix-round: the stand-down is reve
           wasRunning: false,
           preexistingJobModified: false,
           plistPath: AGENT_HARNESS_DAEMON_PLIST_PATH,
+          holdFilePath: holdFilePathForUid(503),
+          disabledBefore: false,
           harnessLabel: AGENT_HARNESS_DAEMON_LABEL,
         },
         ops,
@@ -1753,7 +1900,7 @@ describe("parked install against a REAL, NON-EXISTENT hold directory (drill D1)"
       } finally {
         closeSync(wrapperFd);
       }
-      expect(launchctl.map((a) => a[0])).toEqual(["disable", "bootout"]);
+      expect(launchctl.map((a) => a[0])).toEqual(["print-disabled", "disable", "bootout"]);
     } finally {
       rmSync(tmpRoot, { recursive: true, force: true });
     }

@@ -2478,7 +2478,8 @@ describe("castle-wall/provision/orchestrate", () => {
         restoreRunningHarness: async () => {
           throw new Error("launchctl bootstrap exited 5");
         },
-        clearJobDisable: async () => {},
+        setJobDisabled: async () => {},
+        ensureHoldDir: async () => {},
         writeFile: async () => {},
         readFile: async () => "<plist>prior</plist>",
         removeFile: async () => {},
@@ -2490,6 +2491,8 @@ describe("castle-wall/provision/orchestrate", () => {
           preexistingJobModified: true,
           priorPlistContent: "<plist>prior</plist>",
           plistPath: HARNESS_LOCATOR.plistPath,
+          holdFilePath: "/var/db/sanctuary/agent-harness/503.release",
+          disabledBefore: false,
           harnessLabel: HARNESS_LOCATOR.harnessLabel,
         },
         revertOps,
