@@ -229,12 +229,19 @@ function bannerHarness(): BannerHarness {
   const wallEnd = html.indexOf("  // \"Never fake green\" for the agent grid");
   const bannerStart = html.indexOf("function renderBanner(home");
   const bannerEnd = html.indexOf("function renderAgents(home)");
+  // The banner's "Approvals waiting" value comes from this helper (it reports
+  // LOCKED, not a confident 0, when the queue read was denied). Slice in the
+  // REAL implementation so the harness never diverges from the page.
+  const waitingStart = html.indexOf("function approvalsWaitingValue(");
+  const waitingEnd = html.indexOf("function renderApprovals(approvalState)");
   expect(escStart).toBeGreaterThan(-1);
   expect(escEnd).toBeGreaterThan(escStart);
   expect(wallStart).toBeGreaterThan(-1);
   expect(wallEnd).toBeGreaterThan(wallStart);
   expect(bannerStart).toBeGreaterThan(-1);
   expect(bannerEnd).toBeGreaterThan(bannerStart);
+  expect(waitingStart).toBeGreaterThan(-1);
+  expect(waitingEnd).toBeGreaterThan(waitingStart);
 
   const originEl = { textContent: "" };
   const bannerEl = { innerHTML: "" };
@@ -251,6 +258,8 @@ function bannerHarness(): BannerHarness {
     html.slice(wallStart, wallEnd) +
     "\n" +
     REL_TIME_FN_SOURCE +
+    "\n" +
+    html.slice(waitingStart, waitingEnd) +
     "\n" +
     html.slice(bannerStart, bannerEnd) +
     "\nreturn { renderBanner: renderBanner };";
@@ -778,11 +787,17 @@ describe("posture home - folded approval controls", () => {
     const html = renderPostureHomeHTML();
     const start = html.indexOf("function refreshAuxiliary()");
     expect(start).toBeGreaterThan(-1);
-    const region = html.slice(start, start + 700);
+    const end = html.indexOf("// Apply a fresh home payload");
+    expect(end).toBeGreaterThan(start);
+    const region = html.slice(start, end);
     expect(region).toContain('api("/api/pending")');
     expect(region).toContain('api("/api/approval-inbox?status=pending")');
     expect(region).toContain('api("/api/status")');
-    expect(region).toContain("buildApprovalState(rest[0], rest[1], rest[2])");
+    // The 4th argument is the denied-read flag; see the locked-approvals suite
+    // below, which executes the behavior rather than asserting on this text.
+    expect(region).toContain(
+      "buildApprovalState(rest[0], rest[1], rest[2], approvalsDenied)",
+    );
   });
 
   it("default co-located mode renders decision routes against the legacy pending inbox", () => {
@@ -1157,5 +1172,298 @@ describe("posture home — Fleet Switcher nav affordance (C1 Finding 4)", () => 
     expect(headerStart).toBeGreaterThan(-1);
     expect(headerEnd).toBeGreaterThan(headerStart);
     expect(html.slice(headerStart, headerEnd)).toContain('href="/fleet"');
+  });
+});
+
+/**
+ * A DENIED approval-queue read is HIDDEN, never EMPTY (2026-08-02).
+ *
+ * `GET /api/pending` now requires an operator-derived credential (loopback
+ * position is not one, because a co-resident agent uid holds it too). The page
+ * used to swallow every failure on that read into `[]`, which would have turned
+ * the gate into a silent regression: the operator would see a calm "Nothing
+ * needs you" over a queue they were simply not allowed to read, with no error
+ * and no prompt until an operation they could not see timed out. That is a
+ * worse product outcome than the exposure the gate closes, which is why the
+ * route could not be gated without this change.
+ *
+ * These tests EXECUTE the page's own client source (sliced out of the rendered
+ * HTML and evaluated with stubbed globals) rather than asserting on its text,
+ * so they fail if the behavior regresses, not merely if the wording changes.
+ */
+describe("posture home - a denied approval-queue read renders locked, never empty", () => {
+  interface StubElement {
+    innerHTML: string;
+    querySelector: (selector: string) => { addEventListener: (type: string, fn: () => void) => void } | null;
+    querySelectorAll: () => never[];
+    clickUnlock: () => void;
+  }
+
+  function makeApprovalsElement(): StubElement {
+    const clickHandlers: Array<() => void> = [];
+    const el: StubElement = {
+      innerHTML: "",
+      querySelector: (selector: string) => {
+        if (
+          selector.indexOf("data-approvals-unlock") === -1 ||
+          el.innerHTML.indexOf("data-approvals-unlock") === -1
+        ) {
+          return null;
+        }
+        return {
+          addEventListener: (_type: string, fn: () => void) => {
+            clickHandlers.push(fn);
+          },
+        };
+      },
+      querySelectorAll: () => [],
+      clickUnlock: () => {
+        for (const fn of clickHandlers) fn();
+      },
+    };
+    return el;
+  }
+
+  interface RenderHarness {
+    el: StubElement;
+    buildApprovalState: (
+      legacyBody: unknown,
+      inboxBody: unknown,
+      status: unknown,
+      legacyDenied?: boolean,
+    ) => { rows: unknown[]; locked: boolean; can_decide: boolean };
+    renderApprovals: (state: unknown) => void;
+    approvalsWaitingValue: (state: unknown) => string | number;
+    prompts: number;
+    polls: number;
+  }
+
+  /**
+   * Evaluate the page's approvals region with a stubbed DOM. The slice ends at
+   * `wireApprovalButtons`, which the locked paths never reach (`can_decide` is
+   * false in every case here).
+   */
+  function renderHarness(opts?: { promptSucceeds?: boolean }): RenderHarness {
+    const html = renderPostureHomeHTML();
+    const start = html.indexOf("function normalizeLegacyApproval");
+    const end = html.indexOf("function wireApprovalButtons");
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const el = makeApprovalsElement();
+    const counters = { prompts: 0, polls: 0 };
+    const source =
+      html.slice(start, end) +
+      "\nreturn { buildApprovalState: buildApprovalState," +
+      " renderApprovals: renderApprovals," +
+      " approvalsWaitingValue: approvalsWaitingValue };";
+    // eslint-disable-next-line @typescript-eslint/no-implied-eval, no-new-func
+    const factory = new Function(
+      "document",
+      "esc",
+      "promptForToken",
+      "pollOnce",
+      source,
+    );
+    const api = factory(
+      { getElementById: () => el },
+      (v: unknown) => String(v),
+      () => {
+        counters.prompts += 1;
+        return opts?.promptSucceeds === false ? null : "pasted-operator-token";
+      },
+      () => {
+        counters.polls += 1;
+      },
+    ) as Omit<RenderHarness, "el" | "prompts" | "polls">;
+    return {
+      el,
+      ...api,
+      get prompts() {
+        return counters.prompts;
+      },
+      get polls() {
+        return counters.polls;
+      },
+    } as RenderHarness;
+  }
+
+  const NO_STATUS = {
+    standalone_mode: false,
+    decision_capable: false,
+    policy: { approval_redirect: { enabled: false, mode: "replace" } },
+  };
+
+  it("renders the locked notice, and NOT the calm empty state, when the queue read was denied", () => {
+    const h = renderHarness();
+    const state = h.buildApprovalState([], { data: { entries: [] } }, NO_STATUS, true);
+    expect(state.locked).toBe(true);
+    h.renderApprovals(state);
+    expect(h.el.innerHTML).toContain("Approvals are hidden, not empty");
+    expect(h.el.innerHTML).toContain("data-approvals-locked");
+    // The lie this whole change exists to prevent.
+    expect(h.el.innerHTML).not.toContain("Nothing needs you");
+  });
+
+  it("CONTROL: a genuinely empty queue still renders the calm empty state (so the test above discriminates)", () => {
+    const h = renderHarness();
+    const state = h.buildApprovalState([], { data: { entries: [] } }, NO_STATUS, false);
+    expect(state.locked).toBe(false);
+    h.renderApprovals(state);
+    expect(h.el.innerHTML).toContain("Nothing needs you");
+    expect(h.el.innerHTML).not.toContain("data-approvals-locked");
+  });
+
+  it("the locked notice offers the operator-token prompt and re-polls once a token is entered", () => {
+    const h = renderHarness();
+    h.renderApprovals(h.buildApprovalState([], { data: { entries: [] } }, NO_STATUS, true));
+    h.el.clickUnlock();
+    expect([h.prompts, h.polls]).toEqual([1, 1]);
+  });
+
+  it("does NOT re-poll when the operator dismisses the token prompt", () => {
+    const h = renderHarness({ promptSucceeds: false });
+    h.renderApprovals(h.buildApprovalState([], { data: { entries: [] } }, NO_STATUS, true));
+    h.el.clickUnlock();
+    expect([h.prompts, h.polls]).toEqual([1, 0]);
+  });
+
+  it("keeps the locked notice ABOVE rows another source did answer, so a partial view is never read as the whole", () => {
+    const h = renderHarness();
+    const state = h.buildApprovalState(
+      [],
+      {
+        data: {
+          entries: [
+            {
+              aggregator_id: "agg-1",
+              action_summary: "state export",
+              source_harness: "claude-code",
+            },
+          ],
+        },
+      },
+      NO_STATUS,
+      true,
+    );
+    expect(state.rows).toHaveLength(1);
+    h.renderApprovals(state);
+    expect(h.el.innerHTML).toContain("data-approvals-locked");
+    expect(h.el.innerHTML).toContain("state export");
+    expect(h.el.innerHTML.indexOf("data-approvals-locked")).toBeLessThan(
+      h.el.innerHTML.indexOf("state export"),
+    );
+  });
+
+  it('the "Approvals waiting" tile reports LOCKED, never a confident 0, when the read was denied', () => {
+    const h = renderHarness();
+    expect(String(h.approvalsWaitingValue({ locked: true, rows: [] }))).toContain(
+      "LOCKED",
+    );
+    // CONTROL: an unlocked state still reports the real count.
+    expect(h.approvalsWaitingValue({ locked: false, rows: [1, 2] })).toBe(2);
+    expect(h.approvalsWaitingValue({ locked: false, rows: [] })).toBe(0);
+  });
+
+  it("the rendered banner really prints LOCKED for a denied queue (the helper is wired, not dead code)", () => {
+    const { renderBanner, bannerEl } = bannerHarness();
+    const home = {
+      origin_machine: "home-mac",
+      federation: { available: false, enabled: false, fleet_node_count: 0 },
+      protection_requested_count: 0,
+      enforcement_confirmed_count: 0,
+      castle_wall: { arm_state: "armed" },
+      digest: { chain_verified: true },
+    };
+    renderBanner(home, { rows: [], locked: true }, []);
+    expect(bannerEl.innerHTML).toContain("Approvals waiting");
+    expect(bannerEl.innerHTML).toContain("LOCKED");
+
+    // CONTROL: an unlocked banner prints the real count and no LOCKED pill.
+    const second = bannerHarness();
+    second.renderBanner(home, { rows: [{}, {}], locked: false }, []);
+    expect(second.bannerEl.innerHTML).not.toContain("LOCKED");
+    expect(second.bannerEl.innerHTML).toContain("Approvals waiting");
+  });
+});
+
+/**
+ * The 401 must reach the approval state. The renderer above is only honest if
+ * something actually sets `locked`, so this executes `refreshAuxiliary` itself
+ * with a stubbed `api` and checks the flag it produces.
+ */
+describe("posture home - refreshAuxiliary distinguishes a denied queue read from an empty one", () => {
+  interface AuxHarness {
+    refreshAuxiliary: () => Promise<void>;
+    state: () => { locked: boolean; rows: unknown[] };
+  }
+
+  function auxHarness(pendingFailure: { status?: number } | null): AuxHarness {
+    const html = renderPostureHomeHTML();
+    const start = html.indexOf("var lastApprovals = ");
+    const end = html.indexOf("// Apply a fresh home payload");
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const source =
+      html.slice(start, end) +
+      "\nreturn { refreshAuxiliary: refreshAuxiliary," +
+      " state: function () { return lastApprovals; } };";
+    const api = (path: string): Promise<unknown> => {
+      if (path === "/api/pending") {
+        if (pendingFailure) {
+          const e = new Error("denied") as Error & { status?: number };
+          if (pendingFailure.status !== undefined) e.status = pendingFailure.status;
+          return Promise.reject(e);
+        }
+        return Promise.resolve([]);
+      }
+      if (path === "/api/approval-inbox?status=pending") {
+        return Promise.resolve({ data: { entries: [] } });
+      }
+      if (path === "/api/status") {
+        return Promise.resolve({
+          standalone_mode: false,
+          decision_capable: false,
+          policy: { approval_redirect: { enabled: false, mode: "replace" } },
+        });
+      }
+      return Promise.resolve({ findings: [] });
+    };
+    const buildApprovalState = (
+      _legacy: unknown,
+      _inbox: unknown,
+      _status: unknown,
+      legacyDenied?: boolean,
+    ): { locked: boolean; rows: unknown[] } => ({
+      locked: legacyDenied === true,
+      rows: [],
+    });
+    // eslint-disable-next-line @typescript-eslint/no-implied-eval, no-new-func
+    return new Function("api", "buildApprovalState", source)(
+      api,
+      buildApprovalState,
+    ) as AuxHarness;
+  }
+
+  it("marks the approval state LOCKED when /api/pending answers 401", async () => {
+    const h = auxHarness({ status: 401 });
+    await h.refreshAuxiliary();
+    expect(h.state().locked).toBe(true);
+  });
+
+  it("CONTROL: a successful /api/pending read is NOT locked", async () => {
+    const h = auxHarness(null);
+    await h.refreshAuxiliary();
+    expect(h.state().locked).toBe(false);
+  });
+
+  it("a non-401 failure is NOT a lock (a broken request is a retry, not a credential problem)", async () => {
+    const h = auxHarness({ status: 503 });
+    await h.refreshAuxiliary();
+    expect(h.state().locked).toBe(false);
+  });
+
+  it("never blocks the rest of the page: the other auxiliary reads still resolve through a denied queue", async () => {
+    const h = auxHarness({ status: 401 });
+    await expect(h.refreshAuxiliary()).resolves.toBeUndefined();
   });
 });

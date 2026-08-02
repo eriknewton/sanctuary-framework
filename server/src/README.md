@@ -182,7 +182,12 @@ these subsystems are largely independent. The fix is documentation, not deletion
   `GET /api/fleet/status`, `/api/fleet/capacity`, `/api/fleet/downgrade-log`. Their one non-browser
   client, `sanctuary fleet attest export` (`cli/fleet.ts`), presents the operator bearer through
   `cli/dashboard-request.ts` (`SANCTUARY_DASHBOARD_AUTH_TOKEN`) and FAILS LOUDLY on a refusal
-  rather than signing an attestation that reports an unmeasured roster as absent. The mobile PWA `/m/*` is ALSO served
+  rather than signing an attestation that reports an unmeasured roster as absent. `GET /api/pending`
+  (the approval queue) is in that same set; it landed last because gating it alone would have
+  silently emptied the operator's inbox, so it ships with the posture-home client change that
+  renders an explicit LOCKED state (`posture-home-html.ts`: `lockedApprovalsHTML`,
+  `approvalsWaitingValue`) instead of the calm "nothing needs you" over a queue it was refused.
+  The mobile PWA `/m/*` is ALSO served
   here, but its shell/manifest/service-worker are deliberately PUBLIC static assets (client-side
   auth, the same posture as the concierge SPA and as the wrap surface served them); only the PWA's
   DATA routes (`/api/pending` + the decision routes) sit behind the auth gate. Approvals

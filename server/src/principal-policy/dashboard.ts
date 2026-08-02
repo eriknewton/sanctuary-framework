@@ -787,18 +787,38 @@ function isFleetPostureReadRoute(method: string, path: string): boolean {
  * NOT named here. It is a considered affordance for the local browser client
  * (the operator already proved custody with the passphrase at the terminal),
  * and these findings do not support retiring it repo-wide.
- *
- * KNOWN, STILL OUT OF SCOPE: `GET /api/pending` has the same loopback
- * admission. Closing it needs a paired change to the posture-home landing page,
- * which reads it through loopback auto-auth and swallows failure into an empty
- * list — gating the route alone would silently empty the operator's approval
- * inbox. That pairing is a separate change.
  */
 export function isOperatorOnlyReadRoute(method: string, path: string): boolean {
   return (
     isFoldedOperatorReadRoute(method, path) ||
-    isFleetPostureReadRoute(method, path)
+    isFleetPostureReadRoute(method, path) ||
+    isApprovalQueueReadRoute(method, path)
   );
+}
+
+/**
+ * THE APPROVAL QUEUE READ — `GET /api/pending`, every operation waiting on the
+ * operator's decision, with its tier and reason.
+ *
+ * The most sensitive read of this class and the last to close, because it is
+ * the one with a client that BREAKS if the route is gated alone. The
+ * posture-home landing page fetched it through loopback auto-auth and swallowed
+ * failure into an empty array, so gating the route by itself would have
+ * silently emptied the operator's approval inbox: no approvals shown, no error
+ * shown, and no prompt for a credential until they tried to act on an item they
+ * could no longer see. That is a WORSE outcome than the exposure, which is why
+ * this route was deliberately left open by #1075 and by the fleet-posture
+ * change, and why it lands here paired with the client fix in
+ * `posture-home-html.ts` (the page now carries its credential and renders an
+ * explicit locked state instead of a calm, false "nothing needs you").
+ *
+ * The mobile PWA (`dashboard/mobile.ts`) already sends the operator token from
+ * `sessionStorage` on this read, and the `?session=` link `sanctuary protect`
+ * opens carries a session through `credentialedPath`, so both keep working.
+ */
+function isApprovalQueueReadRoute(method: string, path: string): boolean {
+  if (method !== "GET" && method !== "HEAD") return false;
+  return path === "/api/pending";
 }
 
 interface FederationDashboardState {
@@ -6555,6 +6575,11 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         // built from the dependencies this channel already holds.
         this.handleSnapshot(res);
       } else if (method === "GET" && url.pathname === "/api/pending") {
+        // The operator's approval queue. Requires an operator-derived
+        // credential (bearer, or a session/cookie minted from it); loopback
+        // position alone is refused, because a co-resident agent uid holds it
+        // too. See isApprovalQueueReadRoute for why this one needed a paired
+        // client change before it could be gated.
         this.handlePendingList(res);
       } else if (method === "GET" && url.pathname === "/api/fleet/roster") {
         // Dashboard-fold PR-2: the wrap dashboard's standalone-parity roster
