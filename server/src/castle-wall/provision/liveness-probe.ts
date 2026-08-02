@@ -196,7 +196,7 @@ export async function readTelegramLivenessProbeConfigFromFortress(input: {
       input.fortressPath,
       input.expectedOwnerUid,
     );
-  } catch (err) {
+  } catch {
     // Re-gate round 3: a MISSING FORTRESS is not "no probe channel configured".
     // Degrading it to `absent` made a nonexistent-or-vanished fortress read as
     // the benign unconfigured case, so a caller pointed at the wrong path (or a
@@ -241,7 +241,7 @@ export function parseTelegramLivenessProbeConfig(
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
-  } catch (err) {
+  } catch {
     throw configMalformed(source);
   }
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
