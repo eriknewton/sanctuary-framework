@@ -1188,7 +1188,14 @@ export function renderPostureHomeHTML(): string {
     return { rows: [], source: "none" };
   }
 
-  function buildApprovalState(legacyBody, inboxBody, status, legacyDenied) {
+  // queueDenied is true when EITHER approval source was refused: the legacy
+  // queue (/api/pending) or the cross-harness inbox (/api/approval-inbox).
+  // Both are operator-only reads now, either can be denied on its own, and
+  // either denial makes this view incomplete. Tracking only one of them would
+  // leave the other free to render a confident empty inbox over a queue we
+  // were not allowed to see -- and in standalone/redirect mode the inbox is
+  // the source that answers, so that is the LIKELIER half to be wrong.
+  function buildApprovalState(legacyBody, inboxBody, status, queueDenied) {
     var legacyList = legacyBody && legacyBody.pending ? legacyBody.pending : legacyBody;
     var inboxList = inboxBody && inboxBody.data && inboxBody.data.entries
       ? inboxBody.data.entries
@@ -1205,9 +1212,9 @@ export function renderPostureHomeHTML(): string {
       mode: status
         ? (status.standalone_mode === true ? "standalone" : "co-located")
         : "unknown",
-      // The approval-queue read was DENIED. Everything downstream must treat
+      // An approval-queue read was DENIED. Everything downstream must treat
       // this view as incomplete rather than empty.
-      locked: legacyDenied === true,
+      locked: queueDenied === true,
     };
   }
 
@@ -1275,7 +1282,13 @@ export function renderPostureHomeHTML(): string {
       html += '<div class="approval-row" data-approval-row="' + esc(p.id) + '">' +
         '<div class="approval-main"><div class="approval-title">' + esc(p.title) + "</div>" +
         (p.detail ? '<div class="approval-detail">' + esc(p.detail) + "</div>" : "") +
-        '<div class="approval-detail"><a href="' + esc(p.review_href) + '">review &rarr;</a></div>' +
+        // The "review" target is an operator-only read on BOTH sources now
+        // (/api/pending since #1077, /api/approval-inbox here). A plain anchor
+        // sends no Authorization header, so it must carry the page's session
+        // or the operator clicks through to a bare 401. credentialedPath is a
+        // no-op when the page has no session, which is honest: the link then
+        // fails loudly rather than pretending to work.
+        '<div class="approval-detail"><a href="' + esc(credentialedPath(p.review_href)) + '">review &rarr;</a></div>' +
         '<div class="approval-error" data-approval-error="' + esc(p.id) + '"></div></div>';
       if (approvalState && approvalState.can_decide) {
         html += '<div class="approval-actions">' +
@@ -1752,19 +1765,31 @@ export function renderPostureHomeHTML(): string {
   var lastApprovals = { rows: [], can_decide: false, mode: "unknown", source: "none", locked: false };
   var lastFindings = [];
   function refreshAuxiliary() {
-    // /api/pending requires an operator credential; loopback position is not
-    // one, because anything else running on this machine holds it too. A 401
-    // here therefore means "hidden", NOT "empty", and the two must never render
-    // the same. Swallowing the denial into [] (what this did before) would show
-    // the operator a calm, empty inbox while real operations sat waiting, with
-    // no error and no prompt until something they could not see timed out.
+    // BOTH approval reads require an operator credential; loopback position is
+    // not one, because anything else running on this machine holds it too. A
+    // 401 on either therefore means "hidden", NOT "empty", and the two must
+    // never render the same. Swallowing a denial into [] (what this did before)
+    // would show the operator a calm, empty inbox while real operations sat
+    // waiting, with no error and no prompt until something they could not see
+    // timed out.
+    //
+    // The two reads are tracked into ONE flag on purpose: the panel shows a
+    // single merged queue, so if either half was refused the panel is
+    // incomplete and must say so. Which half was refused is not a distinction
+    // the operator can act on -- the fix is the same credential either way.
     var approvalsDenied = false;
+    function noteDenied(e) {
+      if (e && e.status === 401) approvalsDenied = true;
+    }
     return Promise.all([
       api("/api/pending").catch(function (e) {
-        if (e && e.status === 401) approvalsDenied = true;
+        noteDenied(e);
         return [];
       }),
-      api("/api/approval-inbox?status=pending").catch(function () { return { data: { entries: [] } }; }),
+      api("/api/approval-inbox?status=pending").catch(function (e) {
+        noteDenied(e);
+        return { data: { entries: [] } };
+      }),
       api("/api/status").catch(function () { return null; }),
       api("/api/anomaly/findings").catch(function () { return { findings: [] }; }),
     ]).then(function (rest) {

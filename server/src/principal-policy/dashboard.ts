@@ -787,6 +787,13 @@ function isFleetPostureReadRoute(method: string, path: string): boolean {
  * NOT named here. It is a considered affordance for the local browser client
  * (the operator already proved custody with the passphrase at the terminal),
  * and these findings do not support retiring it repo-wide.
+ *
+ * NOT THE WHOLE CLASS: do not read this predicate as the full inventory of
+ * operator-only reads. `GET /api/approval-inbox*` belongs to the same class and
+ * carries the same rule, but it is gated in {@link dispatchApprovalInbox}
+ * instead, because `handleRequest` routes that prefix to its own router BEFORE
+ * `handleLegacyRequest` runs, so a path added here would never be evaluated for
+ * it. Adding one would be dead code that reads like coverage.
  */
 export function isOperatorOnlyReadRoute(method: string, path: string): boolean {
   return (
@@ -1785,12 +1792,58 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   /**
    * v1.3 WP-V1.3-10 dispatch entry point. Called from `handleRequest`
    * before the legacy approval route table. Returns true when served.
+   *
+   * SECURITY (2026-08-02, the third and last read of the class #1075 opened):
+   * the GET surface here refuses loopback network position, exactly like
+   * `GET /api/pending` (#1077) and the routes named by
+   * {@link isOperatorOnlyReadRoute}. It could NOT be closed by adding a path to
+   * that predicate, because this prefix is dispatched HERE, before
+   * `handleLegacyRequest` runs, so `checkAuth` and its chokepoint never see it.
+   * The router's own `authMiddleware` gated it instead, and that middleware's
+   * loopback shortcut admits every GET.
+   *
+   * What a tokenless co-resident uid could read: every operation waiting on the
+   * operator across ALL wrapped harnesses with its tier, reason, source harness
+   * and source agent id; the resolved history of every past decision; and the
+   * per-entry detail including the decrypted audited payload. That is a
+   * superset of the `/api/pending` exposure, on the same threat model (the
+   * wrapped agent shares loopback with the operator, so position is not
+   * identity).
+   *
+   * The gate is applied HERE rather than inside the router (the
+   * `dispatchDistress` precedent, set for the same mismatch) because
+   * `authMiddleware` reads neither `?session=` nor the `sanctuary_session`
+   * cookie, so tightening it there would 401 the operator's own browser.
+   * `checkAuth` honors both, so every operator-DERIVED credential still passes
+   * and only admission by network position is removed.
+   *
+   * Non-GET is deliberately untouched: `handleApprovalInboxRoute` already
+   * requires the operator bearer on every mutation (`requireToken`), which is
+   * strictly stronger than this read gate, and re-gating it here would only
+   * duplicate that check.
    */
   private async dispatchApprovalInbox(
     req: IncomingMessage,
     res: ServerResponse,
   ): Promise<boolean> {
     if (!this.approvalAggregator) return false;
+    const method = (req.method ?? "GET").toUpperCase();
+    if (method === "GET" || method === "HEAD") {
+      const url = new URL(
+        req.url ?? "/",
+        `http://${req.headers.host || "localhost"}`,
+      );
+      if (
+        !this.checkAuth(req, url, res, {
+          allowSession: true,
+          denyLoopbackAutoAuth: true,
+        })
+      ) {
+        // checkAuth wrote the 401 itself. Return true so the caller does not
+        // fall through to handleLegacyRequest and answer a second time.
+        return true;
+      }
+    }
     return handleApprovalInboxRoute(
       {
         authConfig: {

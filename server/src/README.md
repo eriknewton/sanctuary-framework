@@ -187,6 +187,16 @@ these subsystems are largely independent. The fix is documentation, not deletion
   silently emptied the operator's inbox, so it ships with the posture-home client change that
   renders an explicit LOCKED state (`posture-home-html.ts`: `lockedApprovalsHTML`,
   `approvalsWaitingValue`) instead of the calm "nothing needs you" over a queue it was refused.
+  `GET /api/approval-inbox*` (the cross-harness inbox: every waiting operation across ALL wrapped
+  harnesses, the resolved decision history, and the per-entry decrypted payload) carries the SAME
+  rule but is NOT reachable from `isOperatorOnlyReadRoute`: `handleRequest` routes that prefix to
+  `dispatchApprovalInbox` before `handleLegacyRequest` runs, so the gate lives at the dispatch site
+  (the `dispatchDistress` precedent) and a path added to the predicate would be dead code that reads
+  like coverage. It is gated through `checkAuth` rather than the router's own `authMiddleware`
+  because that middleware reads neither `?session=` nor the `sanctuary_session` cookie, so
+  tightening it there would 401 the operator's own browser. Same client pairing: a denial on EITHER
+  approval source now sets the one `locked` flag, and the per-row "review" anchor routes its href
+  through `credentialedPath` so the link is not a naked 401.
   The mobile PWA `/m/*` is ALSO served
   here, but its shell/manifest/service-worker are deliberately PUBLIC static assets (client-side
   auth, the same posture as the concierge SPA and as the wrap surface served them); only the PWA's

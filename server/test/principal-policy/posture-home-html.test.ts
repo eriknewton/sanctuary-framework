@@ -1230,18 +1230,25 @@ describe("posture home - a denied approval-queue read renders locked, never empt
       legacyBody: unknown,
       inboxBody: unknown,
       status: unknown,
-      legacyDenied?: boolean,
+      queueDenied?: boolean,
     ) => { rows: unknown[]; locked: boolean; can_decide: boolean };
     renderApprovals: (state: unknown) => void;
     approvalsWaitingValue: (state: unknown) => string | number;
     prompts: number;
     polls: number;
+    credentialed: string[];
   }
 
   /**
    * Evaluate the page's approvals region with a stubbed DOM. The slice ends at
    * `wireApprovalButtons`, which the locked paths never reach (`can_decide` is
    * false in every case here).
+   *
+   * `credentialedPath` is injected (2026-08-02): the "review" anchor now routes
+   * its href through it, because both approval reads it can target are
+   * operator-only and a bare anchor carries no Authorization header. The stub
+   * records its arguments so a test can prove the anchor is really wired
+   * through it rather than asserting on the page's source text.
    */
   function renderHarness(opts?: { promptSucceeds?: boolean }): RenderHarness {
     const html = renderPostureHomeHTML();
@@ -1251,6 +1258,7 @@ describe("posture home - a denied approval-queue read renders locked, never empt
     expect(end).toBeGreaterThan(start);
     const el = makeApprovalsElement();
     const counters = { prompts: 0, polls: 0 };
+    const credentialed: string[] = [];
     const source =
       html.slice(start, end) +
       "\nreturn { buildApprovalState: buildApprovalState," +
@@ -1262,6 +1270,7 @@ describe("posture home - a denied approval-queue read renders locked, never empt
       "esc",
       "promptForToken",
       "pollOnce",
+      "credentialedPath",
       source,
     );
     const api = factory(
@@ -1274,10 +1283,18 @@ describe("posture home - a denied approval-queue read renders locked, never empt
       () => {
         counters.polls += 1;
       },
-    ) as Omit<RenderHarness, "el" | "prompts" | "polls">;
+      (path: string) => {
+        credentialed.push(path);
+        return path + "?session=harness-session";
+      },
+    ) as Omit<
+      RenderHarness,
+      "el" | "prompts" | "polls" | "credentialed"
+    >;
     return {
       el,
       ...api,
+      credentialed,
       get prompts() {
         return counters.prompts;
       },
@@ -1397,7 +1414,17 @@ describe("posture home - refreshAuxiliary distinguishes a denied queue read from
     state: () => { locked: boolean; rows: unknown[] };
   }
 
-  function auxHarness(pendingFailure: { status?: number } | null): AuxHarness {
+  /**
+   * `inboxFailure` (2026-08-02) covers the OTHER approval source. Both
+   * `/api/pending` and `/api/approval-inbox` are operator-only reads now, so
+   * either can be refused on its own and either refusal must reach the locked
+   * state. In standalone/redirect mode the inbox is the source that answers,
+   * which makes it the likelier half to be wrong.
+   */
+  function auxHarness(
+    pendingFailure: { status?: number } | null,
+    inboxFailure?: { status?: number } | null,
+  ): AuxHarness {
     const html = renderPostureHomeHTML();
     const start = html.indexOf("var lastApprovals = ");
     const end = html.indexOf("// Apply a fresh home payload");
@@ -1407,16 +1434,18 @@ describe("posture home - refreshAuxiliary distinguishes a denied queue read from
       html.slice(start, end) +
       "\nreturn { refreshAuxiliary: refreshAuxiliary," +
       " state: function () { return lastApprovals; } };";
+    const rejection = (failure: { status?: number }): Promise<never> => {
+      const e = new Error("denied") as Error & { status?: number };
+      if (failure.status !== undefined) e.status = failure.status;
+      return Promise.reject(e);
+    };
     const api = (path: string): Promise<unknown> => {
       if (path === "/api/pending") {
-        if (pendingFailure) {
-          const e = new Error("denied") as Error & { status?: number };
-          if (pendingFailure.status !== undefined) e.status = pendingFailure.status;
-          return Promise.reject(e);
-        }
+        if (pendingFailure) return rejection(pendingFailure);
         return Promise.resolve([]);
       }
       if (path === "/api/approval-inbox?status=pending") {
+        if (inboxFailure) return rejection(inboxFailure);
         return Promise.resolve({ data: { entries: [] } });
       }
       if (path === "/api/status") {
@@ -1432,9 +1461,9 @@ describe("posture home - refreshAuxiliary distinguishes a denied queue read from
       _legacy: unknown,
       _inbox: unknown,
       _status: unknown,
-      legacyDenied?: boolean,
+      queueDenied?: boolean,
     ): { locked: boolean; rows: unknown[] } => ({
-      locked: legacyDenied === true,
+      locked: queueDenied === true,
       rows: [],
     });
     // eslint-disable-next-line @typescript-eslint/no-implied-eval, no-new-func
@@ -1465,5 +1494,147 @@ describe("posture home - refreshAuxiliary distinguishes a denied queue read from
   it("never blocks the rest of the page: the other auxiliary reads still resolve through a denied queue", async () => {
     const h = auxHarness({ status: 401 });
     await expect(h.refreshAuxiliary()).resolves.toBeUndefined();
+  });
+
+  /**
+   * The OTHER approval source (2026-08-02). `GET /api/approval-inbox` is now an
+   * operator-only read too, and this page swallowed its failure into an empty
+   * entries list with no denial signal at all. Gating the route without these
+   * would have re-created, on the cross-harness inbox, exactly the silent
+   * empty-inbox regression #1077 closed on the legacy queue -- and in
+   * standalone/redirect mode the inbox is the source that answers, so it is the
+   * half an operator is MORE likely to be reading.
+   */
+  it("marks the approval state LOCKED when /api/approval-inbox answers 401, even though the legacy queue succeeded", async () => {
+    const h = auxHarness(null, { status: 401 });
+    await h.refreshAuxiliary();
+    expect(h.state().locked).toBe(true);
+  });
+
+  it("marks the approval state LOCKED when BOTH approval reads answer 401", async () => {
+    const h = auxHarness({ status: 401 }, { status: 401 });
+    await h.refreshAuxiliary();
+    expect(h.state().locked).toBe(true);
+  });
+
+  it("CONTROL: a non-401 failure on the inbox read is NOT a lock (a broken request is a retry, not a credential problem)", async () => {
+    const h = auxHarness(null, { status: 503 });
+    await h.refreshAuxiliary();
+    expect(h.state().locked).toBe(false);
+  });
+
+  it("CONTROL: both approval reads succeeding is NOT locked (the denial flag discriminates)", async () => {
+    const h = auxHarness(null, null);
+    await h.refreshAuxiliary();
+    expect(h.state().locked).toBe(false);
+  });
+
+  it("never blocks the rest of the page when the INBOX read is the denied one", async () => {
+    const h = auxHarness(null, { status: 401 });
+    await expect(h.refreshAuxiliary()).resolves.toBeUndefined();
+  });
+});
+
+/**
+ * The "review" link points AT a gated route (2026-08-02).
+ *
+ * Each approval row renders `<a href="{review_href}">review</a>`, targeting
+ * `/api/pending` (legacy source) or `/api/approval-inbox/:id` (cross-harness
+ * source). Both are operator-only reads now. A browser following a plain
+ * anchor sends no Authorization header, so unless the href carries the page's
+ * session the operator clicks "review" and lands on a bare 401 JSON body.
+ *
+ * `credentialedPath` is the page's existing helper for exactly this (it
+ * appends the `?session=` the `sanctuary protect` link opened with, and is a
+ * no-op when there is no session). These tests execute the renderer rather
+ * than asserting on source text.
+ */
+describe("posture home - the approval review link carries the page credential", () => {
+  interface Row {
+    aggregator_id?: string;
+    action_summary?: string;
+    source_harness?: string;
+  }
+
+  function renderRows(rows: Row[]): { html: string; credentialed: string[] } {
+    const page = renderPostureHomeHTML();
+    const start = page.indexOf("function normalizeLegacyApproval");
+    const end = page.indexOf("function wireApprovalButtons");
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const el = { innerHTML: "", querySelector: () => null };
+    const credentialed: string[] = [];
+    const source =
+      page.slice(start, end) +
+      "\nreturn { buildApprovalState: buildApprovalState," +
+      " renderApprovals: renderApprovals };";
+    // eslint-disable-next-line @typescript-eslint/no-implied-eval, no-new-func
+    const api = new Function(
+      "document",
+      "esc",
+      "promptForToken",
+      "pollOnce",
+      "credentialedPath",
+      source,
+    )(
+      { getElementById: () => el },
+      (v: unknown) => String(v),
+      () => null,
+      () => {},
+      (path: string) => {
+        credentialed.push(path);
+        return path + "?session=harness-session";
+      },
+    ) as {
+      buildApprovalState: (
+        a: unknown,
+        b: unknown,
+        c: unknown,
+        d?: boolean,
+      ) => unknown;
+      renderApprovals: (state: unknown) => void;
+    };
+    const state = api.buildApprovalState(
+      [],
+      { data: { entries: rows } },
+      {
+        standalone_mode: true,
+        decision_capable: false,
+        policy: { approval_redirect: { enabled: true, mode: "replace" } },
+      },
+      false,
+    );
+    api.renderApprovals(state);
+    return { html: el.innerHTML, credentialed };
+  }
+
+  it("routes the cross-harness review href through credentialedPath, so the link is not a naked 401", () => {
+    const { html, credentialed } = renderRows([
+      {
+        aggregator_id: "agg-77",
+        action_summary: "state export",
+        source_harness: "claude-code",
+      },
+    ]);
+    // The renderer really called the helper, with the inbox detail route.
+    expect(credentialed).toContain("/api/approval-inbox/agg-77");
+    // And the credential the helper returned really reached the anchor.
+    expect(html).toContain(
+      'href="/api/approval-inbox/agg-77?session=harness-session"',
+    );
+    // MUTATION GUARD: the bare, uncredentialed href must NOT survive.
+    expect(html).not.toContain('href="/api/approval-inbox/agg-77"');
+  });
+
+  it("CONTROL: a row still renders its review link at all (the assertion above is not passing on an empty panel)", () => {
+    const { html } = renderRows([
+      {
+        aggregator_id: "agg-77",
+        action_summary: "state export",
+        source_harness: "claude-code",
+      },
+    ]);
+    expect(html).toContain("review");
+    expect(html).toContain("state export");
   });
 });
