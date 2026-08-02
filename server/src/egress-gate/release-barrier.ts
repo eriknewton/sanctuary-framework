@@ -74,13 +74,14 @@
  */
 
 import { createHash } from "node:crypto";
-import { isAbsolute, join } from "node:path";
+import { basename, dirname, isAbsolute, join } from "node:path";
 
 import {
   AGENT_HARNESS_DAEMON_LABEL,
   AGENT_HARNESS_DAEMON_PLIST_PATH,
   launchctlBootoutWasInProgress,
   launchctlBootoutWasNotLoaded,
+  readAgentHarnessJobDisabledOverride,
   renderAgentHarnessDaemonPlist,
   type AgentHarnessDaemonPlistOptions,
   type HarnessDaemonStatus,
@@ -936,8 +937,9 @@ export function planParkedHarnessInstall(options: ParkedHarnessInstallOptions): 
 export interface ParkedInstallOps extends HoldDirWriteOps, ParkedInstallRevertOps {
   /**
    * Read a file's contents, or `undefined` when it does not exist. Used to
-   * SNAPSHOT the pre-existing harness plist before this install overwrites it
-   * -- without the snapshot there is nothing to restore an aborted run to.
+   * SNAPSHOT the pre-existing harness plist and hold file before this install
+   * overwrites/removes them -- without the snapshot there is nothing to
+   * restore an aborted run to.
    */
   readFile(path: string): Promise<string | undefined>;
   /** Run launchctl with argv (never a shell). */
@@ -972,14 +974,21 @@ export interface ParkedInstallOps extends HoldDirWriteOps, ParkedInstallRevertOp
 export interface HarnessStandDownSnapshot {
   /** The plist bytes in place before the install, or undefined if there was none. */
   priorPlistContent?: string;
+  /** The hold-file bytes in place before the install, or undefined if there was none. */
+  priorHoldFileContent?: string;
+  /** Absolute path of this uid's hold file. */
+  holdFilePath: string;
+  /** launchd's persistent disabled override before this install touched it. */
+  disabledBefore: boolean;
   /** launchd knew (had bootstrapped) the job before the stand-down. */
   wasInstalled: boolean;
   /** launchd reported a live pid, stable or not, for the job before the stand-down. */
   wasRunning: boolean;
   /**
    * TRUE when this install modified state that existed before this run: a
-   * plist it overwrote, or a loaded job it booted out. This -- not
-   * `bootstrappedThisRun` -- is what an abort path must key its restore on.
+   * plist it overwrote, a hold file it removed, or a loaded job it booted
+   * out. This -- not `bootstrappedThisRun` -- is what an abort path must key
+   * its restore on.
    */
   preexistingJobModified: boolean;
   plistPath: string;
@@ -1083,6 +1092,14 @@ export async function executeParkedHarnessInstall(
   // here costs the operator nothing; the same refusal three lines later costs
   // them a stopped agent.
   const priorPlistContent = await ops.readFile(plan.plistPath);
+  const priorHoldFileContent = await ops.readFile(plan.holdFilePath);
+  const disabledBefore = await readAgentHarnessJobDisabledOverride(ops);
+  if (!disabledBefore.known) {
+    throw new ReleaseBarrierError(
+      `launchd disabled state is unknown BEFORE the parked install (${disabledBefore.reason}); refusing to ` +
+        "overwrite the harness plist, remove a hold file, or stand a job down against unknown launchd state",
+    );
+  }
   const before = await ops.harnessStatus();
   if (!before.known) {
     throw new ReleaseBarrierError(
@@ -1147,9 +1164,12 @@ export async function executeParkedHarnessInstall(
 
   const snapshot: HarnessStandDownSnapshot = {
     priorPlistContent,
+    priorHoldFileContent,
+    holdFilePath: plan.holdFilePath,
+    disabledBefore: disabledBefore.disabled,
     wasInstalled: before.installed,
     wasRunning: beforeLive,
-    preexistingJobModified: priorPlistContent !== undefined || before.installed,
+    preexistingJobModified: priorPlistContent !== undefined || priorHoldFileContent !== undefined || before.installed,
     plistPath: plan.plistPath,
     harnessLabel: plan.harnessLabel,
   };
@@ -1366,19 +1386,17 @@ export interface ParkedInstallRevertOps extends ParkedClaimProbeOps {
    */
   restoreRunningHarness(plistContent: string): Promise<void>;
   /**
-   * Clear the persistent launchd disable this install set.
+   * Restore the persistent launchd disabled override this install changed.
    *
-   * OBSERVED (fix-round 3, 2026-07-19). Production wires this to
-   * `setAgentHarnessJobDisabled(false)`, which through round 2 checked the
-   * `launchctl enable` EXIT CODE only -- disclosed as an honest bound, and
-   * both round-3 lenses said disclosure was the wrong resolution for a claim
-   * the codebase already had the means to observe. It now re-reads launchd's
-   * persistent override database (`print-disabled system`) and throws when the
-   * state does not match or cannot be read, so a `restored: true` verdict
-   * rests on an observed plist, an observed run-state, AND an observed
-   * override state.
+   * OBSERVED. Production wires this to `setAgentHarnessJobDisabled`, which
+   * re-reads launchd's persistent override database (`print-disabled system`)
+   * and throws when the state does not match or cannot be read, so a
+   * `restored: true` verdict rests on an observed plist, an observed
+   * run-state, an observed hold file, AND an observed override state.
    */
-  clearJobDisable(): Promise<void>;
+  setJobDisabled(disabled: boolean): Promise<void>;
+  /** Ensure the root-owned hold directory before restoring a prior hold file. */
+  ensureHoldDir(path: string, mode: number): Promise<void>;
   /** Write a file with a mode. */
   writeFile(path: string, content: string, mode: number): Promise<void>;
   /**
@@ -1522,6 +1540,50 @@ export async function revertParkedHarnessInstall(
   ops: ParkedInstallRevertOps,
 ): Promise<ParkedInstallRevertResult> {
   const errors: string[] = [];
+  const restoreDisabledState = async (): Promise<boolean> => {
+    try {
+      await ops.setJobDisabled(snapshot.disabledBefore);
+      return true;
+    } catch (err) {
+      errors.push(
+        `could not restore launchd disabled state for system/${snapshot.harnessLabel} to ` +
+          `${snapshot.disabledBefore ? "disabled" : "enabled"}: ${describeError(err)}`,
+      );
+      return false;
+    }
+  };
+  const restoreHoldFile = async (): Promise<boolean> => {
+    try {
+      if (snapshot.priorHoldFileContent !== undefined) {
+        await writeIntoHoldDir(
+          ops,
+          dirname(snapshot.holdFilePath),
+          basename(snapshot.holdFilePath),
+          snapshot.priorHoldFileContent,
+          0o644,
+        );
+      } else {
+        await ops.removeFile(snapshot.holdFilePath);
+      }
+      const observed = await ops.readFile(snapshot.holdFilePath);
+      if (observed !== snapshot.priorHoldFileContent) {
+        errors.push(
+          snapshot.priorHoldFileContent !== undefined
+            ? `hold file ${snapshot.holdFilePath} did not read back as the pre-run bytes`
+            : `hold file ${snapshot.holdFilePath} is STILL PRESENT after removing it`,
+        );
+        return false;
+      }
+      return true;
+    } catch (err) {
+      errors.push(
+        snapshot.priorHoldFileContent !== undefined
+          ? `could not restore hold file ${snapshot.holdFilePath}: ${describeError(err)}`
+          : `could not remove hold file ${snapshot.holdFilePath}: ${describeError(err)}`,
+      );
+      return false;
+    }
+  };
   if (!snapshot.preexistingJobModified) {
     // Clean host: this run created the parked plist and the disable from
     // nothing, so "restore" means remove them again rather than leave a
@@ -1540,11 +1602,8 @@ export async function revertParkedHarnessInstall(
     } catch (err) {
       errors.push(`could not remove the parked harness plist ${snapshot.plistPath}: ${describeError(err)}`);
     }
-    try {
-      await ops.clearJobDisable();
-    } catch (err) {
-      errors.push(`could not clear the launchd disable on system/${snapshot.harnessLabel}: ${describeError(err)}`);
-    }
+    const disabledStateRestored = await restoreDisabledState();
+    const holdFileRestored = await restoreHoldFile();
     // FIX-ROUND 6 (Claude Finding 6 / Codex LOW-1). `wasRunning` was
     // HARDCODED false here regardless of the snapshot. No production input
     // reaches this branch with a running job -- the install marks
@@ -1567,7 +1626,7 @@ export async function revertParkedHarnessInstall(
       plistRestored,
       harnessRestarted: false,
       wasRunning: snapshot.wasRunning,
-      restored: plistRestored && !snapshot.wasRunning && errors.length === 0,
+      restored: plistRestored && disabledStateRestored && holdFileRestored && !snapshot.wasRunning && errors.length === 0,
       errors,
       ...(cleanHostRunState !== undefined ? { runState: cleanHostRunState } : {}),
     };
@@ -1581,12 +1640,21 @@ export async function revertParkedHarnessInstall(
       // resolving is therefore evidence the job is up, which is the only basis
       // on which `harnessRestarted: true` may ever be claimed.
       await ops.restoreRunningHarness(snapshot.priorPlistContent);
+      const plistRestored = await confirmPlistOnDisk(ops, snapshot.plistPath, snapshot.priorPlistContent);
+      if (!plistRestored) {
+        errors.push(
+          `the harness plist ${snapshot.plistPath} does not match what was there before this run after the ` +
+            "restart (or could not be read back to confirm)",
+        );
+      }
+      const disabledStateRestored = await restoreDisabledState();
+      const holdFileRestored = await restoreHoldFile();
       return {
         nothingToRevert: false,
-        plistRestored: true,
+        plistRestored,
         harnessRestarted: true,
         wasRunning: true,
-        restored: true,
+        restored: plistRestored && disabledStateRestored && holdFileRestored && errors.length === 0,
         errors,
       };
     } catch (err) {
@@ -1618,11 +1686,8 @@ export async function revertParkedHarnessInstall(
   } catch (err) {
     errors.push(`could not restore the harness plist ${snapshot.plistPath}: ${describeError(err)}`);
   }
-  try {
-    await ops.clearJobDisable();
-  } catch (err) {
-    errors.push(`could not clear the launchd disable on system/${snapshot.harnessLabel}: ${describeError(err)}`);
-  }
+  const disabledStateRestored = await restoreDisabledState();
+  const holdFileRestored = await restoreHoldFile();
   // THE ONE PROBE (fix-round 5). Reaching here with `wasRunning` means this
   // run stood a live agent down and did NOT observe it come back, which is
   // precisely when the operator must be told what its run state IS. Round 4
@@ -1673,7 +1738,7 @@ export async function revertParkedHarnessInstall(
     // The conjunction, not the error count: a stand-down of a RUNNING job that
     // reaches here was never restarted, so it is not restored no matter how
     // cleanly the plist went back.
-    restored: plistRestored && !snapshot.wasRunning && errors.length === 0,
+    restored: plistRestored && disabledStateRestored && holdFileRestored && !snapshot.wasRunning && errors.length === 0,
     errors,
     ...(runState !== undefined ? { runState } : {}),
   };
