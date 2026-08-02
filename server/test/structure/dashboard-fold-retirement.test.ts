@@ -1,3 +1,4 @@
+// fail-before-exempt: guards behavior whose fix merged in PR #1073 (train predecessor); fail-before was proven there by blob-swap against the pre-fix tree (F3, PR body evidence) — against current main these guard tests pass by design.
 /**
  * Dashboard one-surface fold — structural retirement guard (fold PR-5).
  *
@@ -20,7 +21,10 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { readdirSync, readFileSync } from "node:fs";
+import { readdirSync, readFileSync, existsSync } from "node:fs";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { createServer } from "node:net";
+import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -83,4 +87,72 @@ describe("dashboard-fold retirement guard", () => {
         "startDashboardWithFallback.",
     ).toEqual([]);
   });
+
+  // ── Fix round 1, F3 (behavioral): a FAILED standalone boot must not leave
+  // a live-PID runtime.json behind. The unlocked-boot path writes the tenant
+  // record BEFORE the listener binds; without the F3 clear-on-start-failure,
+  // an EADDRINUSE from a FOREIGN port owner left a record whose pid is alive
+  // (it names the failed booter) and whose port answers (the foreign owner),
+  // which the protect ensure-and-reuse race-close could bless as "the running
+  // dashboard". F2(b) (self-pid records never reusable) is the ensure-side
+  // belt; this pins the chokepoint fix itself.
+  it("F3: a standalone boot that fails to bind leaves NO runtime.json behind", async () => {
+    const { startStandaloneDashboard } = await import(
+      "../../src/dashboard-standalone.js"
+    );
+    const tempDir = await mkdtemp(join(tmpdir(), "sanctuary-f3-runtime-"));
+    const escrowDir = await mkdtemp(join(tmpdir(), "sanctuary-f3-escrow-"));
+    const discoveryRoot = join(tempDir, "discovery-root");
+    const discoveryHome = join(tempDir, "discovery-home");
+    await mkdir(discoveryRoot, { recursive: true, mode: 0o700 });
+    await mkdir(discoveryHome, { recursive: true, mode: 0o700 });
+    const storagePath = join(tempDir, ".sanctuary");
+    const priorRecoveryOut = process.env.SANCTUARY_RECOVERY_OUT;
+    process.env.SANCTUARY_RECOVERY_OUT = join(escrowDir, "recovery.txt");
+
+    // Occupy a loopback port with a foreign (non-Sanctuary) listener.
+    const squatter = createServer();
+    await new Promise<void>((resolvePromise) =>
+      squatter.listen(0, "127.0.0.1", resolvePromise),
+    );
+    const addr = squatter.address();
+    const occupiedPort =
+      typeof addr === "object" && addr !== null ? addr.port : 0;
+
+    try {
+      await expect(
+        startStandaloneDashboard({
+          storagePath,
+          passphrase: "f3-test-passphrase",
+          port: occupiedPort,
+          host: "127.0.0.1",
+          noConfirm: true,
+          distressPort: 0,
+          discoveryOptions: {
+            root: discoveryRoot,
+            home: discoveryHome,
+            env: {},
+          },
+        }),
+      ).rejects.toThrow();
+
+      expect(
+        existsSync(join(storagePath, "runtime.json")),
+        "a failed bind must clear the pre-written tenant runtime record " +
+          "(F3): a surviving live-PID record points reuse at the port's " +
+          "FOREIGN owner",
+      ).toBe(false);
+    } finally {
+      await new Promise<void>((resolvePromise) =>
+        squatter.close(() => resolvePromise()),
+      );
+      if (priorRecoveryOut === undefined) {
+        delete process.env.SANCTUARY_RECOVERY_OUT;
+      } else {
+        process.env.SANCTUARY_RECOVERY_OUT = priorRecoveryOut;
+      }
+      await rm(tempDir, { recursive: true, force: true }).catch(() => {});
+      await rm(escrowDir, { recursive: true, force: true }).catch(() => {});
+    }
+  }, 30_000);
 });

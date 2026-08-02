@@ -172,8 +172,11 @@ these subsystems are largely independent. The fix is documentation, not deletion
   separate wrap server (`dashboard/api.ts`): it ensures-and-reuses the principal-policy dashboard
   (`wrap/cli.ts:ensureMainDashboardForWrap`), which now also serves the formerly-wrap-only groups
   under ITS stricter auth: read-only `GET /api/fleet/roster`, `/api/templates` (init behind the
-  Tier-1 approval gate), the `POST /api/approvals/:id/(allow|deny)` alias onto the same
-  `handleDecision` as `/api/approve/:id` + `/api/deny/:id`, and the mobile PWA `/m/*`. Approvals
+  Tier-1 approval gate), and the `POST /api/approvals/:id/(allow|deny)` alias onto the same
+  `handleDecision` as `/api/approve/:id` + `/api/deny/:id`. The mobile PWA `/m/*` is ALSO served
+  here, but its shell/manifest/service-worker are deliberately PUBLIC static assets (client-side
+  auth, the same posture as the concierge SPA and as the wrap surface served them); only the PWA's
+  DATA routes (`/api/pending` + the decision routes) sit behind the auth gate. Approvals
   are LIVE on this one surface; `/api/status`'s `decision_capable` is derived honestly
   (`!standalone_mode`), never hardcoded. The retired wrap router keeps its exports + tests only
   (see the `dashboard` row). Do NOT
