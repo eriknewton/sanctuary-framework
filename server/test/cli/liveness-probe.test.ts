@@ -74,6 +74,20 @@ async function runReachabilityProbe(
   return { code, out: out.text(), err: err.text() };
 }
 
+/**
+ * Exact hostname match for the probe fakes. Substring matching on a URL is a
+ * weak test (and CodeQL flags it): "api.venice.ai.evil.test" contains
+ * "api.venice.ai". These fakes stand in for real egress decisions, so they
+ * compare the parsed hostname.
+ */
+function hostOf(url: string): string {
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return "";
+  }
+}
+
 describe("sanctuary liveness-probe CLI", () => {
   it("prints help for the standalone verb", async () => {
     const out = new CaptureStream();
@@ -234,7 +248,7 @@ describe("sanctuary liveness-probe CLI", () => {
       await writeCommittedReachabilityConfig(dir);
       const result = await runReachabilityProbe(dir, async (_file, args) => {
         const url = args[args.length - 1]!;
-        if (url.includes("example.com")) throw new Error("blocked control");
+        if (hostOf(url) === "example.com") throw new Error("blocked control");
         return { stdout: "", stderr: "" };
       });
 
@@ -254,8 +268,8 @@ describe("sanctuary liveness-probe CLI", () => {
       await writeCommittedReachabilityConfig(dir);
       const result = await runReachabilityProbe(dir, async (_file, args) => {
         const url = args[args.length - 1]!;
-        if (url.includes("api.venice.ai")) throw new Error("endpoint blocked");
-        if (url.includes("example.com")) throw new Error("blocked control");
+        if (hostOf(url) === "api.venice.ai") throw new Error("endpoint blocked");
+        if (hostOf(url) === "example.com") throw new Error("blocked control");
         return { stdout: "", stderr: "" };
       });
 
