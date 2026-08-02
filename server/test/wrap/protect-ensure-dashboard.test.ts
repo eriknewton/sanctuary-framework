@@ -60,7 +60,7 @@ async function startStubDashboard(): Promise<{
 
 async function writeRuntimeRecord(
   storagePath: string,
-  opts: { pid: number; port: number },
+  opts: { pid: number; port: number; mode?: "standalone" | "wrap" },
 ): Promise<string> {
   const record = {
     version: "9.9.9-test",
@@ -68,12 +68,19 @@ async function writeRuntimeRecord(
     started_at: new Date().toISOString(),
     dashboard_host: "127.0.0.1",
     dashboard_port: opts.port,
-    mode: "standalone",
+    mode: opts.mode ?? "standalone",
   };
   const raw = JSON.stringify(record, null, 2);
   await writeFile(join(storagePath, RUNTIME_FILE_NAME), raw);
   return raw;
 }
+
+/**
+ * A live PID that is NOT this process: the test runner's parent. Fix round 1
+ * F2(b) makes a self-pid record never reusable, so reuse rigs must present a
+ * genuinely-other live writer, exactly like a real running dashboard would.
+ */
+const OTHER_LIVE_PID = process.ppid;
 
 const neverStarter: OwnedDashboardStarter = async () => {
   throw new Error("starter must NOT be called in this scenario");
@@ -90,7 +97,7 @@ describe("dashboard-fold PR-4: ensureMainDashboardForWrap", () => {
     const stub = await startStubDashboard();
     cleanups.push(() => new Promise((r) => stub.server.close(() => r())));
     const rawBefore = await writeRuntimeRecord(storagePath, {
-      pid: process.pid, // this test process is alive => PID-liveness passes
+      pid: OTHER_LIVE_PID, // a live OTHER process => PID-liveness passes, F2(b) does not trip
       port: stub.port,
     });
 
@@ -139,6 +146,54 @@ describe("dashboard-fold PR-4: ensureMainDashboardForWrap", () => {
     expect(entries).not.toContain(RUNTIME_FILE_NAME);
   });
 
+  it("F2(a): NEVER reuses a mode:\"wrap\" record, even with a live PID and an answering health probe", async () => {
+    const storagePath = await makeFortressDir();
+    const stub = await startStubDashboard();
+    cleanups.push(() => new Promise((r) => stub.server.close(() => r())));
+    // A still-running OLD-version wrap process: live writer, answering
+    // /api/health — but it is the RETIRED wrap-served server, not the one
+    // main dashboard. Blessing it would resurrect the retired surface.
+    await writeRuntimeRecord(storagePath, {
+      pid: OTHER_LIVE_PID,
+      port: stub.port,
+      mode: "wrap",
+    });
+    let startedPort: number | null = null;
+    const ensured = await ensureMainDashboardForWrap({
+      storagePath,
+      requestedPort: 3610,
+      start: async ({ port }) => {
+        startedPort = port;
+        return { url: `http://127.0.0.1:${port}`, port };
+      },
+    });
+    expect(ensured.reused).toBe(false);
+    expect(startedPort).toBe(3610);
+    // The probe was never consulted for the wrap-mode record.
+    expect(stub.requests).not.toContain("/api/health");
+  });
+
+  it("F2(b): NEVER reuses a SELF-pid record (a failed in-process boot's leftover), even if the port answers", async () => {
+    const storagePath = await makeFortressDir();
+    const stub = await startStubDashboard();
+    cleanups.push(() => new Promise((r) => stub.server.close(() => r())));
+    // A record naming THIS pid: trivially "alive", but it is our own
+    // leftover — the port's current owner could be a FOREIGN process that
+    // happens to answer a health probe. Reuse must refuse.
+    await writeRuntimeRecord(storagePath, {
+      pid: process.pid,
+      port: stub.port,
+    });
+    const ensured = await ensureMainDashboardForWrap({
+      storagePath,
+      requestedPort: 3611,
+      start: async ({ port }) => ({ url: `http://127.0.0.1:${port}`, port }),
+    });
+    expect(ensured.reused).toBe(false);
+    expect(ensured.port).toBe(3611);
+    expect(stub.requests).not.toContain("/api/health");
+  });
+
   it("ignores a STALE runtime record (dead PID) and starts fresh", async () => {
     const storagePath = await makeFortressDir();
     // PID 1 is init/launchd — process.kill(1, 0) from an unprivileged test
@@ -167,7 +222,7 @@ describe("dashboard-fold PR-4: ensureMainDashboardForWrap", () => {
   it("falls through to a fresh start when the runtime PID is live but nothing answers the health probe", async () => {
     const storagePath = await makeFortressDir();
     // Live PID (this process) but a port with no listener.
-    await writeRuntimeRecord(storagePath, { pid: process.pid, port: 3601 });
+    await writeRuntimeRecord(storagePath, { pid: OTHER_LIVE_PID, port: 3601 });
     const ensured = await ensureMainDashboardForWrap({
       storagePath,
       requestedPort: 3602,
@@ -187,7 +242,7 @@ describe("dashboard-fold PR-4: ensureMainDashboardForWrap", () => {
       // Simulate: between the free-port probe and the real bind, a
       // concurrent protect for the SAME fortress won the race.
       await writeRuntimeRecord(storagePath, {
-        pid: process.pid,
+        pid: OTHER_LIVE_PID,
         port: stub.port,
       });
       const err = new Error("listen EADDRINUSE") as NodeJS.ErrnoException;

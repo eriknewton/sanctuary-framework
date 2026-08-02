@@ -4808,6 +4808,19 @@ export async function ensureMainDashboardForWrap(
   const reuseIfLive = async (): Promise<EnsuredMainDashboard | null> => {
     const existing = await readRuntime(opts.storagePath);
     if (!existing) return null;
+    // Fix round 1, F2(a): only a MAIN-dashboard record is reusable. A
+    // still-running OLD-version wrap process left a `mode:"wrap"` record for
+    // the retired wrap-served server; blessing it as "the one dashboard"
+    // would resurrect exactly the surface the fold retired (weaker auth, no
+    // live approvals). Anything but the standalone main dashboard falls
+    // through to a fresh start.
+    if (existing.mode !== "standalone") return null;
+    // Fix round 1, F2(b): never reuse OUR OWN record. A failed in-process
+    // boot that left a record naming this pid must not satisfy reuse — the
+    // pid is trivially "alive" (it is us) and the port may now be owned by a
+    // FOREIGN process that answers a health probe. Self-records mean "no
+    // live dashboard", never "reuse".
+    if (existing.pid === process.pid) return null;
     const url = `http://${existing.dashboard_host}:${existing.dashboard_port}`;
     if (!(await probe(url))) return null;
     return { url, port: existing.dashboard_port, reused: true };

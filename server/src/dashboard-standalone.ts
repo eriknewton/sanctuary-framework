@@ -265,6 +265,18 @@ export interface StandaloneDashboardOptions {
    */
   authToken?: string;
   /**
+   * Fix round 1, F1 (dashboard fold, ratified decision 2): when true and NO
+   * auth token is configured by any source (options / env / sanctuary.json),
+   * mint one exactly the way the `"auto"` sentinel does, so the folded read
+   * routes never sit tokenless-open on a protect-started dashboard
+   * (`checkAuth` fail-opens non-strict routes when `authToken` is unset).
+   * A token configured by the operator ALWAYS wins — this never replaces
+   * one. Set by the `sanctuary protect` ensure-and-reuse starter
+   * (src/cli.ts); the manually-run `sanctuary dashboard` path leaves this
+   * unset and keeps its pre-existing posture.
+   */
+  mintAuthTokenIfAbsent?: boolean;
+  /**
    * TEST-ONLY. Bind port for the HABEAS local distress listener (127.0.0.1:8741
    * in production). Production callers leave this undefined so the listener
    * takes the fixed reserved port. Tests pass `0` so every parallel dashboard
@@ -653,7 +665,14 @@ export async function startStandaloneDashboard(
 
   let authToken = config.dashboard.auth_token;
   let generatedParkAuthToken = false;
-  if (authToken === "auto" || (options.allowPark && !authToken)) {
+  if (
+    authToken === "auto" ||
+    (options.allowPark && !authToken) ||
+    // Fix round 1, F1: the protect starter opts into a minted token when no
+    // source configured one (see StandaloneDashboardOptions doc). Reuses the
+    // exact "auto" mint + operator-token print machinery.
+    (options.mintAuthTokenIfAbsent && !authToken)
+  ) {
     authToken = randomBytes(32).toString("hex");
     generatedParkAuthToken = true;
   }
@@ -780,10 +799,39 @@ export async function startStandaloneDashboard(
     passphraseSource,
   });
 
-  await dashboard.start({ exitCleanOnAddrInUse: !!options.allowPark });
+  // Fix round 1, F3 (dashboard fold): `wireUnlockedDeps` above wrote this
+  // tenant's runtime.json BEFORE the listener binds. If the bind FAILS
+  // (EADDRINUSE from a foreign port owner, TLS refusal, ...), that record
+  // survives with a LIVE pid pointing at a port we never served — and a
+  // protect ensure-and-reuse pass could then bless the port's FOREIGN owner
+  // as "the running dashboard" (its health probe answers, the pid is alive).
+  // Clear the record at this one chokepoint before rethrowing, so a failed
+  // boot leaves no live-looking runtime record behind. The park path is
+  // untouched (it binds BEFORE any runtime write), and the allowPark
+  // single-owner stand-down below is untouched: there the port's owner is a
+  // SAME-tenant Sanctuary dashboard, so a surviving record that resolves to
+  // it stays truthful.
+  try {
+    await dashboard.start({ exitCleanOnAddrInUse: !!options.allowPark });
+  } catch (err) {
+    try {
+      await clearTenantRuntime(config.storage_path);
+    } catch {
+      /* best-effort: the bind failure below is the error that matters */
+    }
+    throw err;
+  }
   if (options.allowPark && dashboard.addrInUse()) {
     // Single-owner on the supervised unlocked path too: stand down cleanly.
     return dashboard;
+  }
+  if (generatedParkAuthToken && authToken) {
+    // Fix round 1, F1: a minted token must reach the operator on the
+    // UNLOCKED boot path too (the park path already prints it). Loopback
+    // auto-auth keeps the browser one-click after unlock; this full token is
+    // what the operator needs for the bearer-gated mutation routes.
+    // SAFETY: stderr is the operator-facing CLI channel for this generated token.
+    console.error(`Operator token: ${authToken}`);
   }
   return dashboard;
 }
