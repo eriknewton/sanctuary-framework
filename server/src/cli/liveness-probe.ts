@@ -1,39 +1,53 @@
 /**
  * `sanctuary liveness-probe`
  *
- * Runs one Telegram confined-round-trip probe cycle and prints the outcome.
+ * Runs the confined as-uid reachability differential and prints the outcome.
  */
 
+import { execFile } from "node:child_process";
+import { lstat } from "node:fs/promises";
 import { join } from "node:path";
 import { Writable } from "node:stream";
+import { promisify } from "node:util";
 
-import { resolveCliMasterKey } from "../core/master-custody.js";
-import { AuditLog } from "../operational/audit-log.js";
 import { resolveStoragePath } from "../paths.js";
-import { FilesystemStorage } from "../storage/filesystem.js";
+import { readFileCustody } from "../storage/custody-fs.js";
+import { validateAgentOrigin } from "../castle-wall/allowlist/agent-origin.js";
 import {
-  readTelegramLivenessProbeConfigFromFortress,
-  runTelegramLivenessProbe,
-  TelegramLivenessProbeConfigError,
-  type TelegramLivenessProbeConfig,
+  HERMES_ENDPOINT_SET,
+  readEgressRulesFromDisk,
+  type EndpointStaticCheck,
+  verifyProvisionedEgressStatically,
 } from "../castle-wall/provision/index.js";
 import {
-  cosLivenessFromProbeResult,
+  cosLivenessFromReachabilityReport,
+  isVerifiedCosLivenessReachabilityEvidence,
   type CosLivenessOutcome,
 } from "../castle-wall/provision/orchestrate.js";
+import { collectSystemResolvers } from "../castle-wall/runtime/system-resolvers.js";
+import { runAgentEgressProbesAsUid } from "../wrap/auto-provision.js";
+
+const execFileAsync = promisify(execFile);
+
+type ProbeExecFile = (
+  file: string,
+  args: string[],
+) => Promise<{ stdout: string; stderr: string }>;
 
 export interface LivenessProbeCommandArgs {
   argv: string[];
   out?: Writable;
   err?: Writable;
   env?: NodeJS.ProcessEnv;
+  /** Test seam. Production uses the existing sudo/curl as-uid prober. */
+  execFileFn?: ProbeExecFile;
+  /** Test seam. Production reads the host's current resolver set. */
+  collectSystemResolvers?: () => Promise<readonly unknown[]>;
+  now?: () => Date;
 }
 
 interface LivenessProbeOptions {
   fortress?: string;
-  passphrase?: string;
-  recoveryKey?: string;
-  timeoutMs?: number;
   json: boolean;
   help: boolean;
 }
@@ -60,56 +74,29 @@ export async function runLivenessProbeCommand(args: LivenessProbeCommandArgs): P
   }
 
   const fortressPath = parsed.fortress ?? resolveStoragePath(env);
-  let read;
   try {
-    read = await readTelegramLivenessProbeConfigFromFortress({
+    await assertFortressBaseReadable(fortressPath);
+    const uid = await readCommittedAgentUid(fortressPath);
+    const committedEndpoints = await verifyCommittedAllowlist({
       fortressPath,
-      ...(process.getuid !== undefined ? { expectedOwnerUid: process.getuid() } : {}),
+      collectResolvers: args.collectSystemResolvers ?? collectSystemResolvers,
+      now: parsedNow(args),
     });
+    const report = await runAgentEgressProbesAsUid(
+      uid,
+      args.execFileFn ?? (execFileAsync as ProbeExecFile),
+    );
+    const result = cosLivenessFromReachabilityReport(report, { committedEndpoints });
+    printResult(out, result, parsed.json);
+    return result.kind === "cos_liveness_verified" ? 0 : 1;
   } catch (configErr) {
     write(err, `liveness-probe config error: ${(configErr as Error).message}\n`);
     return 2;
   }
-  if (read.kind === "absent") {
-    const result = cosLivenessFromProbeResult(undefined);
-    printResult(out, result, parsed.json);
-    return 1;
-  }
+}
 
-  const config: TelegramLivenessProbeConfig = {
-    ...read.config,
-    ...(parsed.timeoutMs !== undefined ? { timeoutMs: parsed.timeoutMs } : {}),
-  };
-  const storage = new FilesystemStorage(join(fortressPath, "state"));
-  let masterKey: Uint8Array | undefined;
-  try {
-    const passphrase = parsed.passphrase ?? env.SANCTUARY_PASSPHRASE;
-    const recoveryKey = parsed.recoveryKey ?? env.SANCTUARY_RECOVERY_KEY;
-    masterKey = await resolveCliMasterKey(storage, {
-      ...(passphrase !== undefined ? { passphrase } : {}),
-      ...(recoveryKey !== undefined ? { recoveryKey } : {}),
-      storagePathHint: fortressPath,
-    });
-    const auditLog = new AuditLog(storage, masterKey);
-    const probe = await runTelegramLivenessProbe({
-      config,
-      audit: auditLog,
-      auditIdentityId: "liveness-probe",
-    });
-    await auditLog.flush();
-    const result = cosLivenessFromProbeResult(probe);
-    printResult(out, result, parsed.json);
-    return probe.kind === "round_trip" ? 0 : 1;
-  } catch (probeErr) {
-    const isConfigError = probeErr instanceof TelegramLivenessProbeConfigError;
-    write(
-      err,
-      `${isConfigError ? "liveness-probe config error" : "liveness-probe error"}: ${(probeErr as Error).message}\n`,
-    );
-    return 2;
-  } finally {
-    masterKey?.fill(0);
-  }
+function parsedNow(args: LivenessProbeCommandArgs): Date {
+  return (args.now ?? (() => new Date()))();
 }
 
 function parseLivenessProbeArgs(argv: string[]): LivenessProbeOptions {
@@ -122,12 +109,6 @@ function parseLivenessProbeArgs(argv: string[]): LivenessProbeOptions {
       opts.json = true;
     } else if (arg === "--fortress") {
       opts.fortress = requireValue(argv, ++i, "--fortress");
-    } else if (arg === "--passphrase") {
-      opts.passphrase = requireValue(argv, ++i, "--passphrase");
-    } else if (arg === "--recovery-key") {
-      opts.recoveryKey = requireValue(argv, ++i, "--recovery-key");
-    } else if (arg === "--timeout-ms") {
-      opts.timeoutMs = parsePositiveInteger(requireValue(argv, ++i, "--timeout-ms"), "--timeout-ms");
     } else {
       throw new Error(`Unknown liveness-probe option: ${arg}`);
     }
@@ -143,18 +124,72 @@ function requireValue(argv: string[], index: number, flag: string): string {
   return value;
 }
 
-function parsePositiveInteger(raw: string, flag: string): number {
-  if (!/^\d+$/.test(raw)) throw new Error(`${flag} must be a positive integer`);
-  const value = Number.parseInt(raw, 10);
-  if (!Number.isSafeInteger(value) || value <= 0) {
-    throw new Error(`${flag} must be a positive integer`);
+async function assertFortressBaseReadable(fortressPath: string): Promise<void> {
+  try {
+    const stats = await lstat(fortressPath);
+    if (!stats.isDirectory()) {
+      throw new Error("config_unreadable");
+    }
+  } catch {
+    throw new Error("config_unreadable");
   }
-  return value;
+}
+
+async function readCommittedAgentUid(fortressPath: string): Promise<number> {
+  const originPath = join(fortressPath, "policy", "egress", "agent-origin.json");
+  let raw: string;
+  try {
+    raw = await readFileCustody(originPath, { encoding: "utf8", verifyPathIdentity: true });
+  } catch (originErr) {
+    const code =
+      originErr instanceof Error && "code" in originErr
+        ? (originErr as NodeJS.ErrnoException).code
+        : undefined;
+    throw new Error(code === "ENOENT" ? "agent_origin_absent" : "agent_origin_unreadable");
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error("agent_origin_malformed");
+  }
+  const origin = validateAgentOrigin(parsed);
+  if (origin?.mode !== "uid" || typeof origin.agent_uid !== "number") {
+    throw new Error("agent_origin_invalid");
+  }
+  return origin.agent_uid;
+}
+
+async function verifyCommittedAllowlist(input: {
+  fortressPath: string;
+  collectResolvers: () => Promise<readonly unknown[]>;
+  now: Date;
+}): Promise<EndpointStaticCheck[]> {
+  let rules;
+  try {
+    rules = await readEgressRulesFromDisk(input.fortressPath);
+  } catch {
+    throw new Error("allowlist_unreadable");
+  }
+  const verify = verifyProvisionedEgressStatically(
+    rules,
+    HERMES_ENDPOINT_SET,
+    await input.collectResolvers(),
+    input.now.toISOString(),
+  );
+  if (!verify.ok) {
+    const failed = verify.checks.filter((check) => !check.allowed).map((check) => check.name);
+    const failedDetail =
+      failed.length > 0 ? `no allow match for ${failed.join(", ")}` : "declared endpoints unresolved";
+    const dnsDetail = verify.dnsRulePresent ? "" : "; scoped DNS allow unavailable";
+    throw new Error(`allowlist_unverified: ${failedDetail}${dnsDetail}`);
+  }
+  return verify.checks.filter((check) => check.host !== "");
 }
 
 function printResult(
   out: Writable,
-  result: ReturnType<typeof cosLivenessFromProbeResult>,
+  result: CosLivenessOutcome,
   json: boolean,
 ): void {
   if (json) {
@@ -166,20 +201,28 @@ function printResult(
 
 export function formatLivenessProbeResultLine(result: CosLivenessOutcome): string {
   if (result.kind === "cos_liveness_verified") {
-    return `verified: Telegram round trip verified on the confined path ` +
-      `channel=${result.roundTrip.channel} request=${result.roundTrip.requestId} response=${result.roundTrip.responseId}`;
+    const evidence = result.evidence;
+    if (!isVerifiedCosLivenessReachabilityEvidence(evidence)) {
+      return "unverified reason=declared_endpoints_unreachable detail=invalid_verified_evidence";
+    }
+    return (
+      `verified: confined path verified: the agent uid reaches all ` +
+      `${evidence.declaredEndpointCount} declared endpoints and remains blocked elsewhere.`
+    );
   }
+  const subreason = result.subreason !== undefined ? ` subreason=${result.subreason}` : "";
   const detail = result.detail !== undefined ? ` detail=${result.detail}` : "";
-  return `unverified reason=${result.reason}${detail}`;
+  return `unverified reason=${result.reason}${subreason}${detail}`;
 }
 
 function printUsage(out: Writable): void {
   write(
     out,
-    `Usage: sanctuary liveness-probe [--fortress <path>] [--passphrase <value> | --recovery-key <value>] [--timeout-ms <ms>] [--json]
+    `Usage: sanctuary liveness-probe [--fortress <path>] [--json]
 
-Runs one Telegram confined-round-trip liveness probe using:
-  <fortress>/config/liveness-probe/telegram.json
+Runs the as-uid reachability differential using:
+  <fortress>/policy/egress/agent-origin.json
+  <fortress>/policy/egress/rules/*.json
 
 Exit codes:
   0  verified

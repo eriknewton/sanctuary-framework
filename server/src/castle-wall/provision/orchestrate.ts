@@ -71,6 +71,11 @@ import type {
   OperatorTwinStandDownSnapshot,
 } from "./operator-twin.js";
 
+const VERIFIED_REACHABILITY_EVIDENCE: unique symbol = Symbol(
+  "sanctuary.cos_liveness.reachability.verified",
+);
+const verifiedReachabilityEvidence = new WeakSet<object>();
+
 /** Everything the orchestrator needs to decide + print, resolved once up front. */
 export interface ProvisionFlowContext {
   agentId: string;
@@ -974,7 +979,19 @@ interface OperatorTwinStandDownState {
 export type CosLivenessUnverifiedReason =
   | "no_channel_configured"
   | "network_unavailable"
-  | "provider_failed";
+  | "provider_failed"
+  | "channel_round_trip_only"
+  | "declared_endpoints_unreachable"
+  | "negative_control_reachable";
+
+export type CosLivenessUnverifiedSubreason =
+  | "telegram_round_trip_not_reachability"
+  | "committed_endpoint_count_unavailable"
+  | "declared_endpoint_rows_absent"
+  | "declared_endpoint_unreachable"
+  | "negative_control_reachable"
+  | "agent_egress_probe_unavailable"
+  | "invalid_verified_evidence";
 
 export interface CosLivenessRoundTrip {
   channel: string;
@@ -983,25 +1000,237 @@ export interface CosLivenessRoundTrip {
   detail?: string;
 }
 
+export interface CosLivenessReachabilityRow {
+  endpoint: string;
+  expected: "reachable" | "blocked";
+  observed: "reachable" | "blocked";
+  pass: boolean;
+}
+
+export interface CosLivenessCommittedEndpoint {
+  name: string;
+  host: string;
+  port: number;
+}
+
+export interface CosLivenessReachabilityEvidence {
+  kind: "reachability";
+  rows: readonly CosLivenessReachabilityRow[];
+  declaredEndpointCount: number;
+  reachableEndpointCount: number;
+  negativeControlBlocked: boolean;
+}
+
+export interface CosLivenessVerifiedReachabilityEvidence extends CosLivenessReachabilityEvidence {
+  readonly [VERIFIED_REACHABILITY_EVIDENCE]: true;
+}
+
+export type CosLivenessEvidence =
+  | { kind: "roundTrip"; roundTrip: CosLivenessRoundTrip }
+  | CosLivenessReachabilityEvidence;
+
 export type AgentLivenessProbeResult =
   | { kind: "round_trip"; roundTrip: CosLivenessRoundTrip }
   | { kind: "unverified"; reason: CosLivenessUnverifiedReason; detail?: string };
 
 export type CosLivenessOutcome =
-  | { kind: "cos_liveness_verified"; roundTrip: CosLivenessRoundTrip }
-  | { kind: "cos_liveness_unverified"; reason: CosLivenessUnverifiedReason; detail?: string };
+  | { kind: "cos_liveness_verified"; evidence: CosLivenessVerifiedReachabilityEvidence }
+  | {
+      kind: "cos_liveness_unverified";
+      reason: CosLivenessUnverifiedReason;
+      subreason?: CosLivenessUnverifiedSubreason;
+      detail?: string;
+      evidence?: CosLivenessEvidence;
+    };
 
 export function cosLivenessFromProbeResult(
   result: AgentLivenessProbeResult | undefined,
 ): CosLivenessOutcome {
   if (result?.kind === "round_trip") {
-    return { kind: "cos_liveness_verified", roundTrip: result.roundTrip };
+    return {
+      kind: "cos_liveness_unverified",
+      reason: "channel_round_trip_only",
+      subreason: "telegram_round_trip_not_reachability",
+      evidence: { kind: "roundTrip", roundTrip: result.roundTrip },
+    };
   }
   return {
     kind: "cos_liveness_unverified",
     reason: result?.reason ?? "no_channel_configured",
     ...(result?.detail !== undefined ? { detail: result.detail } : {}),
   };
+}
+
+export interface CosLivenessReachabilityReportContext {
+  committedEndpoints?: ReadonlyArray<CosLivenessCommittedEndpoint>;
+  /** Count is display-only fallback; it is never sufficient to verify reachability. */
+  committedEndpointCount?: number;
+}
+
+interface CommittedEndpointFacts {
+  ids: readonly string[];
+  labelsById: ReadonlyMap<string, string>;
+}
+
+export function cosLivenessFromReachabilityReport(
+  report: AgentEgressVerifyReport,
+  context: CosLivenessReachabilityReportContext = {},
+): CosLivenessOutcome {
+  const committedEndpointFacts = committedEndpointFactsFrom(context.committedEndpoints);
+  const committedEndpointCount =
+    committedEndpointFacts?.ids.length ?? normalizeCommittedEndpointCount(context.committedEndpointCount);
+  const reachableEndpointIds = reachableEndpointIdentitySet(report);
+  const missingCommittedEndpointIds =
+    committedEndpointFacts?.ids.filter((id) => !reachableEndpointIds.has(id)) ?? [];
+  const evidence = reachabilityEvidenceFromReport(
+    report,
+    committedEndpointCount ?? 0,
+    reachableEndpointIds,
+    committedEndpointFacts,
+  );
+  const allCommittedEndpointsReachable =
+    committedEndpointFacts !== undefined &&
+    committedEndpointFacts.ids.length > 0 &&
+    missingCommittedEndpointIds.length === 0;
+  if (report.ok && allCommittedEndpointsReachable && evidence.negativeControlBlocked) {
+    return { kind: "cos_liveness_verified", evidence: sealVerifiedReachabilityEvidence(evidence) };
+  }
+  const failedEndpoints = report.rows
+    .filter((row) => row.expected === "reachable" && row.host !== "" && row.observed !== "reachable")
+    .map((row) => row.name);
+  const failedControls = report.rows
+    .filter((row) => row.expected === "blocked" && row.observed !== "blocked")
+    .map((row) => row.name);
+  const detailParts: string[] = [];
+  if (failedEndpoints.length > 0) {
+    detailParts.push(`unreachable endpoint(s): ${failedEndpoints.join(", ")}`);
+  }
+  if (failedControls.length > 0) {
+    detailParts.push(`negative control reachable: ${failedControls.join(", ")}`);
+  }
+  if (committedEndpointFacts === undefined) {
+    detailParts.push("committed endpoint identities unavailable");
+  } else if (committedEndpointFacts.ids.length === 0) {
+    detailParts.push("no committed endpoints were available to verify");
+  } else if (missingCommittedEndpointIds.length > 0) {
+    const missingLabels = missingCommittedEndpointIds.map((id) => committedEndpointFacts.labelsById.get(id) ?? id);
+    detailParts.push(
+      `missing committed endpoint(s): ${missingLabels.join(", ")}`,
+    );
+  }
+  const subreason: CosLivenessUnverifiedSubreason =
+    failedControls.length > 0
+      ? "negative_control_reachable"
+      : committedEndpointFacts === undefined || committedEndpointFacts.ids.length === 0
+        ? "committed_endpoint_count_unavailable"
+        : missingCommittedEndpointIds.length > 0
+          ? "declared_endpoint_rows_absent"
+          : "declared_endpoint_unreachable";
+  return {
+    kind: "cos_liveness_unverified",
+    reason: failedControls.length > 0 ? "negative_control_reachable" : "declared_endpoints_unreachable",
+    subreason,
+    evidence,
+    ...(detailParts.length > 0 ? { detail: detailParts.join("; ") } : {}),
+  };
+}
+
+function reachabilityEvidenceFromReport(
+  report: AgentEgressVerifyReport,
+  committedEndpointCount: number,
+  reachableEndpointIds: ReadonlySet<string>,
+  committedEndpointFacts: CommittedEndpointFacts | undefined,
+): CosLivenessReachabilityEvidence {
+  const controlRows = report.rows.filter((row) => row.expected === "blocked");
+  const reachableEndpointCount =
+    committedEndpointFacts !== undefined
+      ? committedEndpointFacts.ids.filter((id) => reachableEndpointIds.has(id)).length
+      : reachableEndpointIds.size;
+  return {
+    kind: "reachability",
+    rows: Object.freeze(
+      report.rows.map((row) =>
+        Object.freeze({
+          endpoint: row.host ? `${row.name} (${row.host}:${row.port})` : row.name,
+          expected: row.expected,
+          observed: row.observed,
+          pass: row.pass,
+        }),
+      ),
+    ),
+    declaredEndpointCount: committedEndpointCount,
+    reachableEndpointCount,
+    negativeControlBlocked:
+      controlRows.length > 0 && controlRows.every((row) => row.observed === "blocked" && row.pass),
+  };
+}
+
+export function isVerifiedCosLivenessReachabilityEvidence(
+  value: unknown,
+): value is CosLivenessVerifiedReachabilityEvidence {
+  if (value === null || typeof value !== "object") return false;
+  const candidate = value as { [VERIFIED_REACHABILITY_EVIDENCE]?: unknown };
+  return candidate[VERIFIED_REACHABILITY_EVIDENCE] === true && verifiedReachabilityEvidence.has(value);
+}
+
+function sealVerifiedReachabilityEvidence(
+  evidence: CosLivenessReachabilityEvidence,
+): CosLivenessVerifiedReachabilityEvidence {
+  Object.defineProperty(evidence, VERIFIED_REACHABILITY_EVIDENCE, { value: true });
+  Object.freeze(evidence);
+  verifiedReachabilityEvidence.add(evidence);
+  return evidence as CosLivenessVerifiedReachabilityEvidence;
+}
+
+function committedEndpointFactsFrom(
+  endpoints: ReadonlyArray<CosLivenessCommittedEndpoint> | undefined,
+): CommittedEndpointFacts | undefined {
+  if (endpoints === undefined) return undefined;
+  const labelsById = new Map<string, string>();
+  for (const endpoint of endpoints) {
+    const identity = endpointIdentity(endpoint);
+    if (identity === undefined) continue;
+    labelsById.set(identity, endpointLabel(endpoint));
+  }
+  if (labelsById.size === 0) return undefined;
+  return Object.freeze({
+    ids: Object.freeze([...labelsById.keys()]),
+    labelsById,
+  });
+}
+
+function reachableEndpointIdentitySet(report: AgentEgressVerifyReport): ReadonlySet<string> {
+  const ids = new Set<string>();
+  for (const row of report.rows) {
+    if (row.expected !== "reachable" || row.observed !== "reachable" || !row.pass) continue;
+    const identity = endpointIdentity(row);
+    if (identity !== undefined) ids.add(identity);
+  }
+  return ids;
+}
+
+function endpointIdentity(endpoint: CosLivenessCommittedEndpoint): string | undefined {
+  if (endpoint.host === "") return undefined;
+  if (!Number.isSafeInteger(endpoint.port) || endpoint.port <= 0) return undefined;
+  return `${endpoint.name}\0${endpoint.host.toLowerCase()}\0${endpoint.port}`;
+}
+
+function endpointLabel(endpoint: CosLivenessCommittedEndpoint): string {
+  return `${endpoint.name} (${endpoint.host}:${endpoint.port})`;
+}
+
+function normalizeCommittedEndpointCount(count: number | undefined): number | undefined {
+  if (count === undefined) return undefined;
+  if (!Number.isSafeInteger(count) || count <= 0) return undefined;
+  return count;
+}
+
+function committedEndpointsFromStaticChecks(
+  checks: ReadonlyArray<EndpointStaticCheck>,
+): readonly CosLivenessCommittedEndpoint[] {
+  return checks
+    .filter((check) => check.host !== "")
+    .map((check) => ({ name: check.name, host: check.host, port: check.port }));
 }
 
 /**
@@ -1155,18 +1384,6 @@ function operatorTwinRestoreNote(restore: OperatorTwinRestoreReport): string {
     (restore.problems.length > 0 ? restore.problems.join("; ") : "no detail returned") +
     ". Check the operator LaunchAgent plist and launchd disabled state before re-running."
   );
-}
-
-async function verifyCosLivenessAfterStandDown(ops: ProvisionFlowOps): Promise<CosLivenessOutcome> {
-  try {
-    return cosLivenessFromProbeResult(await ops.verifyAgentLivenessAfterStandDown());
-  } catch (err) {
-    return {
-      kind: "cos_liveness_unverified",
-      reason: "provider_failed",
-      detail: err instanceof Error ? err.message : String(err),
-    };
-  }
 }
 
 /**
@@ -1781,6 +1998,7 @@ async function runProvisionFlowSteps(
   }
   const egressProvisionedThisRun = true;
   const provisionedEgressRuleIds = egress.ruleIds;
+  const committedEndpoints = committedEndpointsFromStaticChecks(egress.checks);
   ops.print(
     `Egress provisioned: ${egress.ruleIds.length} signed allow rule(s) published for the agent ` +
       `(${egress.ruleIds.join(", ")}); scoped DNS allow derived.`,
@@ -2019,14 +2237,28 @@ async function runProvisionFlowSteps(
   // the 2026-07-09 drill proved the DNS-only probes above cannot make
   // ((a) static without (b) dynamic is theater). Every declared endpoint
   // must complete a TCP+TLS connect as the agent uid, and the non-listed
-  // negative control must stay BLOCKED. Any failure triggers the same fix-B2
-  // fast-disarm rollback as step 10, plus the provisioned-rule scrub, and is
-  // reported as the DISTINCT local outcome `egress-unprovisioned-rolled-back`.
-  const egressVerify = await ops.verifyAgentEgressAfterArm(uid);
-  for (const line of renderAgentEgressReportLines(egressVerify)) {
-    ops.print(line);
+  // negative control must stay BLOCKED. A completed report with failed rows
+  // triggers the same fix-B2 fast-disarm rollback as step 10, plus the
+  // provisioned-rule scrub, and is reported as the DISTINCT local outcome
+  // `egress-unprovisioned-rolled-back`. If the probe cannot run at all, the
+  // provision flow keeps its normal outcome but the CoS liveness claim is
+  // explicitly unverified.
+  let egressVerify: AgentEgressVerifyReport | undefined;
+  let liveness: CosLivenessOutcome | undefined;
+  try {
+    egressVerify = await ops.verifyAgentEgressAfterArm(uid);
+    for (const line of renderAgentEgressReportLines(egressVerify)) {
+      ops.print(line);
+    }
+  } catch {
+    liveness = {
+      kind: "cos_liveness_unverified",
+      reason: "network_unavailable",
+      subreason: "agent_egress_probe_unavailable",
+      detail: "as-uid reachability probe unavailable; no confined-path liveness claim was made",
+    };
   }
-  if (!egressVerify.ok) {
+  if (egressVerify !== undefined && !egressVerify.ok) {
     const failedRows = egressVerify.rows.filter((r) => !r.pass).map((r) => r.name);
     const egressBaseReason =
       `post-arm as-uid egress verification failed for: ${failedRows.join(", ")}. ` +
@@ -2079,8 +2311,10 @@ async function runProvisionFlowSteps(
     agent_uid: uid,
     rule_ids: provisionedEgressRuleIds,
     endpoints: ctx.harnessEndpoints.endpoints.map((e) => `${e.host}:${e.port}`),
-    probe_rows: egressVerify.rows,
+    probe_rows: egressVerify?.rows ?? [],
+    probe_unavailable: egressVerify === undefined ? true : undefined,
   });
+  liveness ??= cosLivenessFromReachabilityReport(egressVerify!, { committedEndpoints });
 
   // F-GATEWAY-TWIN: the post-arm as-uid egress evidence has now proved the
   // confined path can reach its declared endpoints. Before any liveness
@@ -2108,9 +2342,9 @@ async function runProvisionFlowSteps(
       kind: "armed",
       uid: await observing(
         "provision-orchestrate.armed",
-        () => armedUidFromVerifiedEgress(uid, egressVerify),
+        () => egressVerify !== undefined ? armedUidFromVerifiedEgress(uid, egressVerify) : uid,
       ),
-      liveness: await verifyCosLivenessAfterStandDown(ops),
+      liveness,
     };
   }
 
@@ -2127,7 +2361,7 @@ async function runProvisionFlowSteps(
       kind: "armed-exclusive",
       uid,
       generationId: exclusive.generationId,
-      liveness: await verifyCosLivenessAfterStandDown(ops),
+      liveness,
     };
   }
   if (exclusive.kind === "exclusive-armed-repark-failed") {
@@ -2136,7 +2370,7 @@ async function runProvisionFlowSteps(
       uid,
       generationId: exclusive.generationId,
       reparkError: exclusive.reparkError,
-      liveness: await verifyCosLivenessAfterStandDown(ops),
+      liveness,
     };
   }
   return {

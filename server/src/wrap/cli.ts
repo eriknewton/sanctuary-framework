@@ -104,7 +104,10 @@ import type {
   DisarmNePreferenceOutcome,
   ProvisionFlowOutcome,
 } from "../castle-wall/provision/index.js";
-import { ProvisionLockHeldError } from "../castle-wall/provision/index.js";
+import {
+  isVerifiedCosLivenessReachabilityEvidence,
+  ProvisionLockHeldError,
+} from "../castle-wall/provision/index.js";
 import { harnessDispositionSentence } from "../egress-gate/parked-claim.js";
 import {
   EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE,
@@ -2516,16 +2519,24 @@ export function renderAutoProvisionOutcomeLines(summary: AutoProvisionSummary): 
 function renderCosLivenessOutcome(liveness: CosLivenessOutcome | undefined): string[] {
   if (liveness === undefined) return [];
   if (liveness.kind === "cos_liveness_verified") {
-    const roundTrip = liveness.roundTrip;
-    const detail = roundTrip.detail !== undefined ? `: ${roundTrip.detail}` : "";
+    const evidence = liveness.evidence;
+    if (!isVerifiedCosLivenessReachabilityEvidence(evidence)) {
+      return [
+        `  CoS liveness unverified (declared_endpoints_unreachable: invalid_verified_evidence); ` +
+          `no brain-routing or provider-chain claim was made.`,
+      ];
+    }
+    const count = evidence.declaredEndpointCount;
     return [
-      `  CoS liveness: Telegram round trip verified on the confined path (${roundTrip.channel}, ` +
-        `request ${roundTrip.requestId}, response ${roundTrip.responseId}${detail}).`,
+      `  CoS liveness: confined path verified: the agent uid reaches all ${count} ` +
+        `declared endpoints and remains blocked elsewhere.`,
     ];
   }
+  const subreason = liveness.subreason !== undefined ? `/${liveness.subreason}` : "";
   const detail = liveness.detail !== undefined ? `: ${liveness.detail}` : "";
   return [
-    `  CoS liveness unverified (${liveness.reason}${detail}); no brain-routing or provider-chain claim was made.`,
+    `  CoS liveness unverified (${liveness.reason}${subreason}${detail}); ` +
+      `no brain-routing or provider-chain claim was made.`,
   ];
 }
 
