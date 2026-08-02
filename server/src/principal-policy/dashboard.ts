@@ -99,6 +99,17 @@ import {
 } from "./posture-routes.js";
 import { renderPostureHomeHTML } from "./posture-home-html.js";
 import { buildFleetRoster, type FleetRoster } from "./fleet-roster.js";
+// Dashboard-fold PR-2: the template registry + init core the wrap dashboard's
+// /api/templates routes served; now served from THIS one surviving surface
+// (init behind the Tier-1 approval gate, ratified decision 5).
+import {
+  getTemplate,
+  getTemplateEntry,
+  listTemplates,
+  type TemplateName,
+} from "../templates/registry.js";
+import { initTemplate } from "../templates/init.js";
+import { findTenant } from "../cli/agents/discovery.js";
 import {
   applyFleetCap,
   resolveActivation,
@@ -952,6 +963,23 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     | null = null;
 
   /**
+   * Dashboard-fold PR-2: template-init identity/signing dependencies for the
+   * folded `POST /api/templates/:name/init` route. Mirrors the wrap
+   * dashboard's `APIDeps` fields (nodeId / nodePrivateKey / principalId /
+   * fortressId / isAgentWrapped). Every field is optional with the SAME
+   * defaults the wrap surface used (ephemeral signing key, tenant-discovery
+   * orphan check), so behavior is identical whether or not a boot path wires
+   * real values.
+   */
+  private templateInitDeps: {
+    nodeId?: string;
+    nodePrivateKey?: Uint8Array;
+    principalId?: string;
+    fortressId?: string;
+    isAgentWrapped?: (agentId: string) => Promise<boolean>;
+  } = {};
+
+  /**
    * Slice 2 (park-not-exit): true when this dashboard booted WITHOUT a master
    * key under the supervised LaunchAgent path (`--allow-park`). A parked
    * dashboard binds the listener, answers `/api/health` (`ok:true`), reports
@@ -1316,6 +1344,19 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     resolveEnforcementAvailability?: () =>
       | Promise<ResolvedEnforcementAvailability>
       | ResolvedEnforcementAvailability;
+    /**
+     * Dashboard-fold PR-2: identity/signing deps for the folded
+     * `POST /api/templates/:name/init` route (Tier-1-gated custody-class
+     * mutation). Optional; absent fields keep the wrap surface's historical
+     * defaults (ephemeral signing key, tenant-discovery orphan check).
+     */
+    templateInit?: {
+      nodeId?: string;
+      nodePrivateKey?: Uint8Array;
+      principalId?: string;
+      fortressId?: string;
+      isAgentWrapped?: (agentId: string) => Promise<boolean>;
+    };
   }): void {
     this.policy = deps.policy;
     this.baseline = deps.baseline;
@@ -1337,6 +1378,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       this.injectedResolveEnforcementAvailability =
         deps.resolveEnforcementAvailability;
     }
+    if (deps.templateInit) this.templateInitDeps = deps.templateInit;
   }
 
   /**
@@ -6319,6 +6361,65 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         this.handleSnapshot(res);
       } else if (method === "GET" && url.pathname === "/api/pending") {
         this.handlePendingList(res);
+      } else if (method === "GET" && url.pathname === "/api/fleet/roster") {
+        // Dashboard-fold PR-2: the wrap dashboard's standalone-parity roster
+        // read, folded onto the ONE surviving surface. Read-only SEE-not-manage
+        // (no admit/revoke/rotate here); behind the shared checkAuth gate above
+        // (bearer, session, or loopback auto-auth — decision 2: A's posture,
+        // never the wrap surface's tokenless fail-open) + the general rate
+        // limit. Serves the injected wrap provider when one was wired, else
+        // the live cap-applied federation roster (honest absent shape when
+        // federation is unprovisioned). Fire-and-forget: the async handler
+        // owns the response, matching this dispatch's contract.
+        void this.handleFleetRosterRead(res);
+      } else if (method === "GET" && url.pathname === "/api/templates") {
+        // Dashboard-fold PR-2: template registry list (read-only), folded from
+        // the wrap dashboard under A's auth gate (decision 2).
+        this.handleTemplatesList(res);
+      } else if (
+        method === "GET" &&
+        /^\/api\/templates\/[^/]+$/.test(url.pathname)
+      ) {
+        this.handleTemplateEntryGet(url.pathname, res);
+      } else if (
+        method === "POST" &&
+        /^\/api\/templates\/[^/]+\/init$/.test(url.pathname)
+      ) {
+        // Dashboard-fold PR-2 (ratified decision 5): template init AUTHORS and
+        // Ed25519-SIGNS a governance policy event — a custody-class mutation
+        // now living on an always-on server, so the widened exposure window is
+        // compensated by TWO gates: (1) the operator bearer token (the shared
+        // default-deny non-GET gate above already enforced requireToken; this
+        // local re-check makes the custody-class gate unmissable and
+        // independent of the shared exempt-set logic), and (2) the Tier-1
+        // human-approval gate inside the handler — the init executes ONLY
+        // after an explicit operator approval through this channel, and fails
+        // CLOSED (denied) on timeout or any approval-channel failure.
+        if (!this.checkAuth(req, url, res, { requireToken: true })) return;
+        if (!this.checkRateLimit(req, res, "decisions")) return;
+        void this.handleTemplateInit(url.pathname, req, res);
+      } else if (
+        method === "POST" &&
+        /^\/api\/approvals\/[^/]+\/(allow|deny)$/.test(url.pathname)
+      ) {
+        // Dashboard-fold PR-2 (ratified decision 4): the wrap dashboard's
+        // approval wire shape, aliased onto A's decision handler so existing
+        // clients (mobile PWA `/m`, wrap-surface tooling) keep working.
+        // `allow` maps to `approve`; the id segment is percent-decoded exactly
+        // as the wrap surface decoded it. Auth: the shared default-deny
+        // non-GET gate above already required the operator bearer token
+        // (never session/loopback), matching /api/approve/:id; decisions get
+        // the same tighter rate limit. Approvals are LIVE here (decision 3):
+        // this resolves the real pending map, not a read-only stub.
+        if (!this.checkRateLimit(req, res, "decisions")) return;
+        const aliasMatch =
+          /^\/api\/approvals\/([^/]+)\/(allow|deny)$/.exec(url.pathname)!;
+        const id = decodeURIComponent(aliasMatch[1]!);
+        this.handleDecision(
+          id,
+          aliasMatch[2] === "allow" ? "approve" : "deny",
+          res,
+        );
       } else if (method === "GET" && url.pathname === "/api/audit-log") {
         this.handleAuditLog(url, res);
       } else if (method === "GET" && url.pathname === "/api/sovereignty") {
@@ -7625,6 +7726,255 @@ export class DashboardApprovalChannel implements ApprovalChannel {
 
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify(list));
+  }
+
+  // ── Dashboard-fold PR-2: folded wrap-surface routes ─────────────────
+
+  /** Write a JSON response with the wrap surface's no-store cache posture. */
+  private writeFoldedJSON(
+    res: ServerResponse,
+    status: number,
+    payload: unknown,
+  ): void {
+    res.writeHead(status, {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store",
+    });
+    res.end(JSON.stringify(payload));
+  }
+
+  /**
+   * Bounded JSON body reader for the folded mutation route (256 KB cap,
+   * matching the wrap surface's reader byte-for-byte in behavior).
+   */
+  private async readFoldedJSONBody(
+    req: IncomingMessage,
+  ): Promise<Record<string, unknown>> {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    const MAX = 256 * 1024;
+    for await (const chunk of req) {
+      size += (chunk as Buffer).length;
+      if (size > MAX) throw new Error("request body too large");
+      chunks.push(chunk as Buffer);
+    }
+    const body = Buffer.concat(chunks).toString("utf-8");
+    if (!body) return {};
+    return JSON.parse(body) as Record<string, unknown>;
+  }
+
+  /**
+   * GET /api/fleet/roster (folded, decision 2): read-only roster with the
+   * SAME shape the wrap dashboard served. Injected wrap provider when wired;
+   * else the live cap-applied federation roster (the same builder the posture
+   * fleet panel uses — honest absent shape when federation is unprovisioned).
+   */
+  private async handleFleetRosterRead(res: ServerResponse): Promise<void> {
+    try {
+      const roster = this.injectedFleetRoster
+        ? await this.injectedFleetRoster()
+        : await (async () => {
+            const built = buildFleetRoster(this.buildV1FederationDeps(), {
+              evictionSerial: this._federationState.evictionMaxSerial,
+              operatorPolicy: this._federationState.operatorPolicy,
+            });
+            const cap = await this.resolveFleetCap();
+            return applyFleetCap(built, cap).roster;
+          })();
+      this.writeFoldedJSON(res, 200, roster);
+    } catch (err) {
+      logCaughtError(
+        err,
+        { route: "/api/fleet/roster", operation: "fleet_roster_read" },
+        { status: 500 },
+      );
+      if (!res.headersSent) {
+        this.writeFoldedJSON(res, 500, { error: "fleet_roster_failed" });
+      }
+    }
+  }
+
+  /** GET /api/templates (folded): registry list, read-only. */
+  private handleTemplatesList(res: ServerResponse): void {
+    try {
+      const templates = listTemplates();
+      this.writeFoldedJSON(res, 200, { templates });
+    } catch (err) {
+      logCaughtError(
+        err,
+        { route: "/api/templates", operation: "list_templates" },
+        { status: 500 },
+      );
+      this.writeFoldedJSON(res, 500, { error: "template_load_failed" });
+    }
+  }
+
+  /** GET /api/templates/:name (folded): single registry entry, read-only. */
+  private handleTemplateEntryGet(path: string, res: ServerResponse): void {
+    const match = /^\/api\/templates\/([^/]+)$/.exec(path);
+    const name = decodeURIComponent(match?.[1] ?? "");
+    try {
+      const entry = getTemplateEntry(name);
+      if (!entry) {
+        this.writeFoldedJSON(res, 404, { error: "template_not_found", name });
+        return;
+      }
+      this.writeFoldedJSON(res, 200, entry);
+    } catch (err) {
+      logCaughtError(
+        err,
+        { route: "/api/templates/:name", operation: "get_template" },
+        { status: 500 },
+      );
+      this.writeFoldedJSON(res, 500, { error: "template_load_failed" });
+    }
+  }
+
+  /**
+   * POST /api/templates/:name/init (folded, ratified decision 5): author +
+   * Ed25519-sign a governance policy event for a wrapped agent — a
+   * custody-class mutation, the same trust level as an approval decision.
+   *
+   * Gates, in order (caller already enforced operator bearer + decisions
+   * rate limit):
+   *   1. Validation identical to the wrap surface (template exists, agent
+   *      name shape, orphan-reject via tenant discovery) — cheap rejects
+   *      BEFORE any operator interruption.
+   *   2. Tier-1 HUMAN APPROVAL through this channel (`requestApproval`):
+   *      the init executes ONLY on an explicit `approve`. Timeout
+   *      auto-denies (SEC-002) and any approval-channel failure fails
+   *      CLOSED with 503 — the mutation NEVER proceeds unapproved.
+   *
+   * The signing path (`initTemplate`) and response shape are byte-identical
+   * to the wrap surface's route; denials are generic (invariant 7).
+   */
+  private async handleTemplateInit(
+    path: string,
+    req: IncomingMessage,
+    res: ServerResponse,
+  ): Promise<void> {
+    const pathMatch = /^\/api\/templates\/([^/]+)\/init$/.exec(path);
+    const name = decodeURIComponent(pathMatch?.[1] ?? "");
+    try {
+      // Validate template exists
+      const bundle = getTemplate(name);
+      if (!bundle) {
+        this.writeFoldedJSON(res, 404, { error: "template_not_found", name });
+        return;
+      }
+
+      // Read request body
+      const body = await this.readFoldedJSONBody(req);
+
+      // Validate required fields
+      if (!body.agent_name || typeof body.agent_name !== "string") {
+        this.writeFoldedJSON(res, 400, {
+          error: "validation_error",
+          message: "agent_name is required and must be a string",
+        });
+        return;
+      }
+
+      // Validate agent_name format (alphanumeric, hyphens, underscores)
+      if (!/^[a-zA-Z0-9_-]+$/.test(body.agent_name)) {
+        this.writeFoldedJSON(res, 400, {
+          error: "validation_error",
+          message:
+            "agent_name must contain only alphanumeric characters, hyphens, and underscores",
+        });
+        return;
+      }
+
+      // Orphan-reject: a channel-shape template binds to an already-wrapped
+      // harness. A template init against an agent_id with no fortress behind
+      // it would author a policy artifact bound to nothing.
+      const isAgentWrapped =
+        this.templateInitDeps.isAgentWrapped ??
+        (async (agentId: string) => {
+          const tenant = await findTenant(agentId);
+          if (!tenant) return false;
+          return tenant.initialized || tenant.has_profile;
+        });
+      if (!(await isAgentWrapped(body.agent_name))) {
+        this.writeFoldedJSON(res, 400, {
+          error: "orphan_agent_id",
+          message:
+            `No wrapped harness found for agent_id "${body.agent_name}". ` +
+            `Run \`sanctuary wrap\` to wrap the harness first, then retry template init.`,
+        });
+        return;
+      }
+
+      // Tier-1 approval gate (decision 5). Fail-closed: a throw from the
+      // approval channel means the mutation is NOT performed; timeout
+      // auto-denies inside requestApproval (SEC-002).
+      let approval: ApprovalResponse;
+      try {
+        approval = await this.requestApproval({
+          operation: "template_init",
+          tier: 1,
+          reason:
+            `Author and sign governance policy from template "${name}" ` +
+            `for agent "${body.agent_name}"`,
+          context: { template_name: name, agent_name: body.agent_name },
+          timestamp: new Date().toISOString(),
+        });
+      } catch (err) {
+        logCaughtError(
+          err,
+          { route: "/api/templates/:name/init", operation: "tier1_gate" },
+          { status: 503 },
+        );
+        this.writeFoldedJSON(res, 503, { error: "approval_unavailable" });
+        return;
+      }
+      if (approval.decision !== "approve") {
+        // Generic denial (invariant 7): no oracle about which rule/tier/actor
+        // produced the denial.
+        this.writeFoldedJSON(res, 403, { error: "approval_denied" });
+        return;
+      }
+
+      // Build init params, routing through the same code path as the CLI +
+      // the retired wrap surface (identical defaults: ephemeral signing key
+      // when no persistent node key is configured).
+      const nodeId = this.templateInitDeps.nodeId ?? "dashboard-node";
+      const nodePrivateKey =
+        this.templateInitDeps.nodePrivateKey ??
+        new Uint8Array(randomBytes(32));
+      const principalId =
+        this.templateInitDeps.principalId ?? "dashboard-principal";
+      const fortressId = this.templateInitDeps.fortressId ?? "default";
+
+      const result = initTemplate({
+        template_name: name as TemplateName,
+        agent_id: body.agent_name,
+        fortress_id: fortressId,
+        counterparty: "*",
+        policy_version: 1,
+        emitter_node: nodeId,
+        emitter_principal: principalId,
+        monotonic_seq: 1,
+        node_private_key: nodePrivateKey,
+      });
+
+      this.writeFoldedJSON(res, 200, {
+        agent_id: body.agent_name,
+        signed_event_id: result.signed_event.event_id,
+        policy_version: result.compiled.policy_version,
+        template_name: name,
+        attestation_panel_url: `/console#agent_roster`,
+      });
+    } catch (err) {
+      logCaughtError(
+        err,
+        { route: "/api/templates/:name/init", operation: "init_template" },
+        { status: 500 },
+      );
+      if (!res.headersSent) {
+        this.writeFoldedJSON(res, 500, { error: "template_init_failed" });
+      }
+    }
   }
 
   private handleAuditLog(url: URL, res: ServerResponse): void {
