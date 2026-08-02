@@ -35,6 +35,42 @@ interface TestRig {
   stop: () => Promise<void>;
 }
 
+async function readSseUntil(
+  res: Response,
+  needle: string,
+  maxReads = 8,
+): Promise<string> {
+  const reader = res.body!.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  try {
+    for (let i = 0; i < maxReads && !buf.includes(needle); i++) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+    }
+    return buf;
+  } finally {
+    await reader.cancel();
+  }
+}
+
+function extractDashboardConfig(html: string): Record<string, unknown> {
+  const match = /<script id="dashboard-config" type="application\/json">([^<]+)<\/script>/.exec(html);
+  if (!match) throw new Error("dashboard config script not found");
+  return JSON.parse(match[1]!) as Record<string, unknown>;
+}
+
+async function createSession(rig: TestRig): Promise<string> {
+  const exchange = await fetch(`${rig.baseUrl}/auth/session`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${rig.authToken}` },
+  });
+  expect(exchange.status).toBe(200);
+  const body = await exchange.json() as { session_id: string };
+  return body.session_id;
+}
+
 
 async function startRig(options: { host?: string; allowPlaintextRemote?: boolean } = {}): Promise<TestRig> {
   const storage = new MemoryStorage();
@@ -103,7 +139,7 @@ describe("DashboardApprovalChannel v1.1 routing (hotfix)", () => {
   });
 
   afterEach(async () => {
-    await rig.stop();
+    if (rig) await rig.stop();
   });
 
   it("GET /v1.1 returns the v1.1 dashboard HTML", async () => {
@@ -220,6 +256,79 @@ describe("DashboardApprovalChannel v1.1 routing (hotfix)", () => {
     expect(res.headers.get("content-type")).toMatch(/text\/html/);
     const html = await res.text();
     expect(html).toContain('id="main"');
+  });
+
+  it("renders a streamUrl that the standalone dashboard serves as SSE", async () => {
+    const shellRes = await fetch(`${rig.baseUrl}/dashboard`, {
+      headers: { Authorization: `Bearer ${rig.authToken}` },
+    });
+    expect(shellRes.status).toBe(200);
+    const html = await shellRes.text();
+    const config = extractDashboardConfig(html);
+    expect(config.streamUrl).toBe("/api/stream");
+
+    const sessionId = await createSession(rig);
+    const streamRes = await fetch(
+      `${rig.baseUrl}${config.streamUrl}?session=${encodeURIComponent(sessionId)}`,
+    );
+    expect(streamRes.status).toBe(200);
+    expect(streamRes.headers.get("content-type")).toContain("text/event-stream");
+    const text = await readSseUntil(streamRes, "event: snapshot");
+    expect(text).toContain("event: snapshot");
+    expect(text).toContain("\"layers\"");
+  });
+
+  it("emits SPA-compatible approval frames on the rendered standalone stream", async () => {
+    const sessionId = await createSession(rig);
+    const streamRes = await fetch(
+      `${rig.baseUrl}/api/stream?session=${encodeURIComponent(sessionId)}`,
+    );
+    expect(streamRes.status).toBe(200);
+
+    const reader = streamRes.body!.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    while (!buf.includes("event: snapshot")) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+    }
+    expect(buf).toContain("event: snapshot");
+
+    const approvalPromise = rig.dashboard.requestApproval({
+      operation: "state_export",
+      tier: 1,
+      reason: "Export requires operator approval",
+      context: { namespace: "test" },
+      timestamp: new Date().toISOString(),
+    });
+
+    buf = "";
+    for (let i = 0; i < 8 && !buf.includes("event: approval"); i++) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+    }
+    expect(buf).toContain("event: approval");
+    expect(buf).toContain("\"operation\":\"state_export\"");
+    expect(buf).toContain("\"tier\":1");
+
+    const pendingRes = await fetch(`${rig.baseUrl}/api/pending`, {
+      headers: { Authorization: `Bearer ${rig.authToken}` },
+    });
+    expect(pendingRes.status).toBe(200);
+    const pending = await pendingRes.json() as Array<{ id: string }>;
+    expect(pending).toHaveLength(1);
+    const denyRes = await fetch(
+      `${rig.baseUrl}/api/deny/${encodeURIComponent(pending[0]!.id)}`,
+      {
+        method: "POST",
+        headers: { Authorization: `Bearer ${rig.authToken}` },
+      },
+    );
+    expect(denyRes.status).toBe(200);
+    await expect(approvalPromise).resolves.toMatchObject({ decision: "deny" });
+    await reader.cancel();
   });
 
   it("GET /v1.1 continues to serve the v1.1 SPA (back-compat)", async () => {

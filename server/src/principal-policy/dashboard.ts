@@ -73,6 +73,7 @@ import { getProcessInstance, getProcessSince } from "../dashboard/process-identi
 import {
   getProtectionSnapshot,
   type AggregatorSources,
+  type PendingApproval,
 } from "../dashboard/aggregator.js";
 import { constantTimeEquals } from "../http/auth.js";
 import { logCaughtError } from "../http/error-envelope.js";
@@ -403,6 +404,96 @@ export type UnlockCredential =
   | { recoveryKey: string };
 
 type SSEClient = ServerResponse;
+type DashboardStreamEventName =
+  | "snapshot"
+  | "activity"
+  | "approval"
+  | "inbox"
+  | "agent_status";
+type DashboardStreamEvent = {
+  event: DashboardStreamEventName;
+  data: unknown;
+};
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === "object"
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function dashboardApprovalFromPendingRequest(data: unknown): PendingApproval | null {
+  const record = asRecord(data);
+  if (!record) return null;
+  const requestId = record.request_id;
+  const operation = record.operation;
+  const reason = record.reason;
+  const timestamp = record.timestamp;
+  const tier = record.tier;
+  if (
+    typeof requestId !== "string" ||
+    typeof operation !== "string" ||
+    typeof reason !== "string" ||
+    typeof timestamp !== "string" ||
+    (tier !== 1 && tier !== 2)
+  ) {
+    return null;
+  }
+  return {
+    id: requestId,
+    operation,
+    tier,
+    reason,
+    created_at: timestamp,
+  };
+}
+
+function dashboardActivityFromAuditEntry(data: unknown): Record<string, unknown> | null {
+  const record = asRecord(data);
+  if (!record) return null;
+  const timestamp = record.timestamp;
+  const operation = record.operation;
+  const identityId = record.identity_id;
+  if (
+    typeof timestamp !== "string" ||
+    typeof operation !== "string" ||
+    typeof identityId !== "string"
+  ) {
+    return null;
+  }
+  return {
+    version: "1.1",
+    entry_id: `audit:${timestamp}:${identityId}:${operation}`,
+    emitted_at: timestamp,
+    identity_id: identityId,
+    category: "other",
+    display_template_id: "activity.other",
+    display_template_args: [{ kind: "identity_id", value: identityId }],
+  };
+}
+
+function dashboardStreamEventForLegacyEvent(
+  event: string,
+  data: unknown,
+): DashboardStreamEvent | null {
+  switch (event) {
+    case "snapshot":
+    case "activity":
+    case "approval":
+    case "inbox":
+    case "agent_status":
+      return { event, data };
+    case "pending-request": {
+      const approval = dashboardApprovalFromPendingRequest(data);
+      return approval ? { event: "approval", data: approval } : null;
+    }
+    case "audit-entry": {
+      const activity = dashboardActivityFromAuditEntry(data);
+      return activity ? { event: "activity", data: activity } : null;
+    }
+    default:
+      return null;
+  }
+}
 
 /**
  * F1 E1: poll interval for the guardian-requirement break-glass countdown.
@@ -532,6 +623,7 @@ export function isDashboardViewRoute(method: string, path: string): boolean {
     path === "/fortress" ||
     path === "/fleet" ||
     path === "/events" ||
+    path === "/api/stream" ||
     path === POSTURE_HOME_PATH ||
     // The posture SSE live-refresh stream is a single long-lived connection per
     // operator tab, exactly like the v1.0 `/events` stream. It must be exempt
@@ -686,6 +778,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     createPostureStreamRegistry();
   private pending: Map<string, PendingRequest> = new Map();
   private sseClients: Set<SSEClient> = new Set();
+  private dashboardStreamClients: Set<SSEClient> = new Set();
   private httpServer: ReturnType<typeof createHttpServer> | null = null;
   private policy: PrincipalPolicy | null = null;
   private baseline: BaselineTracker | null = null;
@@ -5080,6 +5173,10 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       client.end();
     }
     this.sseClients.clear();
+    for (const client of this.dashboardStreamClients) {
+      client.end();
+    }
+    this.dashboardStreamClients.clear();
 
     // SEC-012: Clean up session state
     this.sessions.clear();
@@ -6061,7 +6158,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
 
     // Rate limiting: apply general limit to authenticated API requests only.
     // HTML view routes (`/`, `/dashboard`, `/fortress`) and the long-lived SSE
-    // stream (`/events`) are exempt - operator page loads and browser
+    // streams (`/events`, `/api/stream`) are exempt - operator page loads and browser
     // refreshes must never 429. Decision endpoints (approve/deny) and the
     // session-exchange endpoint keep their own stricter limits below.
     if (!isDashboardViewRoute(method, url.pathname)) {
@@ -6081,6 +6178,8 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         } else {
           this.serveDashboard(res);
         }
+      } else if (method === "GET" && url.pathname === "/api/stream") {
+        this.handleDashboardStream(req, res);
       } else if (method === "GET" && url.pathname === "/events") {
         this.handleSSE(req, res);
       } else if (method === "GET" && url.pathname === "/api/status") {
@@ -7225,6 +7324,41 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     });
   }
 
+  private handleDashboardStream(req: IncomingMessage, res: ServerResponse): void {
+    this.buildAggregatorSources()
+      .then((sources) => getProtectionSnapshot(sources))
+      .then((snapshot) => {
+        if (res.destroyed) return;
+        res.writeHead(200, {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache, no-transform",
+          "Connection": "keep-alive",
+          "X-Accel-Buffering": "no",
+        });
+        res.write(`event: snapshot\ndata: ${JSON.stringify(snapshot)}\n\n`);
+
+        this.dashboardStreamClients.add(res);
+        const cleanup = (): void => {
+          this.dashboardStreamClients.delete(res);
+        };
+        req.on("close", cleanup);
+        res.on("error", cleanup);
+      })
+      .catch((err) => {
+        logCaughtError(
+          err,
+          { route: "/api/stream", operation: "dashboard_stream_snapshot" },
+          { status: 500 },
+        );
+        if (!res.headersSent) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "stream_failed" }));
+        } else {
+          res.end();
+        }
+      });
+  }
+
   /**
    * Build the AggregatorSources bundle for getProtectionSnapshot from the
    * dependencies injected via setDependencies(). Mirrors what the
@@ -7308,7 +7442,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   private handleStatus(res: ServerResponse): void {
     const status: Record<string, unknown> = {
       pending_count: this.pending.size,
-      connected_clients: this.sseClients.size,
+      connected_clients: this.clientCount,
       standalone_mode: this._standaloneMode,
       decision_capable: !this._standaloneMode,
     };
@@ -7822,6 +7956,18 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         this.sseClients.delete(client);
       }
     }
+
+    const dashboardEvent = dashboardStreamEventForLegacyEvent(event, data);
+    if (!dashboardEvent) return;
+    const dashboardMessage =
+      `event: ${dashboardEvent.event}\ndata: ${JSON.stringify(dashboardEvent.data)}\n\n`;
+    for (const client of this.dashboardStreamClients) {
+      try {
+        client.write(dashboardMessage);
+      } catch {
+        this.dashboardStreamClients.delete(client);
+      }
+    }
   }
 
   /**
@@ -7954,6 +8100,6 @@ export class DashboardApprovalChannel implements ApprovalChannel {
 
   /** Get the number of connected SSE clients */
   get clientCount(): number {
-    return this.sseClients.size;
+    return this.sseClients.size + this.dashboardStreamClients.size;
   }
 }
