@@ -176,7 +176,13 @@ these subsystems are largely independent. The fix is documentation, not deletion
   `handleDecision` as `/api/approve/:id` + `/api/deny/:id`. Those folded READS additionally
   refuse loopback auto-auth (`isFoldedOperatorReadRoute` in `principal-policy/dashboard.ts`):
   they admit an operator-derived credential only (the bearer, or a session/cookie minted from
-  it), never network position, because a co-resident agent shares the loopback interface. The mobile PWA `/m/*` is ALSO served
+  it), never network position, because a co-resident agent shares the loopback interface.
+  `isOperatorOnlyReadRoute` is the CHOKEPOINT the request gate consults for that class, and it
+  adds the fleet-posture reads that predate the fold and carried the same exposure:
+  `GET /api/fleet/status`, `/api/fleet/capacity`, `/api/fleet/downgrade-log`. Their one non-browser
+  client, `sanctuary fleet attest export` (`cli/fleet.ts`), presents the operator bearer through
+  `cli/dashboard-request.ts` (`SANCTUARY_DASHBOARD_AUTH_TOKEN`) and FAILS LOUDLY on a refusal
+  rather than signing an attestation that reports an unmeasured roster as absent. The mobile PWA `/m/*` is ALSO served
   here, but its shell/manifest/service-worker are deliberately PUBLIC static assets (client-side
   auth, the same posture as the concierge SPA and as the wrap surface served them); only the PWA's
   DATA routes (`/api/pending` + the decision routes) sit behind the auth gate. Approvals
