@@ -698,6 +698,55 @@ function isDashboardReadStyleNonGet(method: string, path: string): boolean {
   return method === "POST" && path === `${PII_REWRITE_API_PREFIX}/rewrite`;
 }
 
+/**
+ * THE FOLDED READ ROUTES — the reads the dashboard fold (PR #1071) moved off
+ * the retired wrap surface onto this always-on one. They are auth-gated like
+ * every other read here, EXCEPT that they never accept loopback auto-auth:
+ * only an operator-derived credential (the bearer, or a session/cookie minted
+ * FROM the bearer) admits them.
+ *
+ * Why the extra strictness (drill finding, 2026-08-02, leg 2, 3/3 reps): on a
+ * `sanctuary protect`-started dashboard the operator token IS minted and
+ * loopback auto-auth IS enabled, and a TOKENLESS loopback
+ * `GET /api/fleet/roster` returned 200. Ratified decision 2 says the retired
+ * wrap surface's tokenless fail-open reads do NOT carry over — and a
+ * co-resident local process (including a confined agent uid) reading the fleet
+ * roster or the template registry with no bearer is precisely that fail-open,
+ * re-created on the surface that is now always on. In the MCP threat model the
+ * wrapped agent shares the loopback interface with the operator, so loopback
+ * position is not a proxy for operator identity (the same reasoning the
+ * decision/mutation routes already apply via `requireToken`).
+ *
+ * Scope is deliberately narrow: loopback auto-auth stays intact everywhere
+ * else. It is a considered pre-fold ergonomics affordance for the local
+ * browser client (the operator already proved custody with the passphrase at
+ * the terminal), and this finding does not support retiring it repo-wide.
+ *
+ * `requireToken` is NOT used here because a session token and the
+ * `sanctuary_session` cookie are both minted only by presenting the operator
+ * bearer to `POST /auth/session`, so they ARE operator-derived; keeping them
+ * valid is what lets the browser console keep reading these routes. What is
+ * removed is admission by network position alone.
+ *
+ * KNOWN, DELIBERATELY OUT OF SCOPE: `GET /api/pending` has the same loopback
+ * admission, but it predates the fold on this surface (it is not one of the
+ * routes #1071 moved) and the posture-home landing page reads it through
+ * loopback auto-auth to render the operator's approval queue. Closing it needs
+ * a paired client change so the page carries the bearer; that is a separate
+ * change from this finding.
+ */
+export function isFoldedOperatorReadRoute(
+  method: string,
+  path: string,
+): boolean {
+  if (method !== "GET" && method !== "HEAD") return false;
+  return (
+    path === "/api/fleet/roster" ||
+    path === "/api/templates" ||
+    /^\/api\/templates\/[^/]+$/.test(path)
+  );
+}
+
 interface FederationDashboardState {
   eventLog: FederationEvent[];
   revoked: Set<string>;
@@ -5443,13 +5492,22 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * when no token is configured and accepts only a valid operator bearer. It
    * never accepts loopback auto-auth, ?session=, or sanctuary_session cookies.
    *
+   * `denyLoopbackAutoAuth` is the weaker sibling used by the FOLDED read
+   * routes (see {@link isFoldedOperatorReadRoute}): every operator-derived
+   * credential still passes (bearer, ?session=, cookie), but loopback network
+   * position alone does not.
+   *
    * Returns true if auth passes, false if blocked (response already sent).
    */
   private checkAuth(
     req: IncomingMessage,
     url: URL,
     res: ServerResponse,
-    opts?: { requireToken?: boolean; allowSession?: boolean },
+    opts?: {
+      requireToken?: boolean;
+      allowSession?: boolean;
+      denyLoopbackAutoAuth?: boolean;
+    },
   ): boolean {
     const deny = (): false => {
       res.writeHead(401, { "Content-Type": "application/json" });
@@ -5474,7 +5532,11 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     // v0.10.2: loopback auto-auth - see _autoAuthLocalhost comment. Strict
     // routes return above before this shortcut, so loopback can never release
     // a Tier-1 decision or mutate operator state by network position alone.
+    // The FOLDED read routes opt out via `denyLoopbackAutoAuth` (decision 2:
+    // the retired wrap surface's tokenless fail-open reads do NOT carry over),
+    // and fall through to the operator-derived credential checks below.
     if (
+      !opts?.denyLoopbackAutoAuth &&
       this._autoAuthLocalhost &&
       this.isLoopbackRequest(req)
     ) {
@@ -6325,6 +6387,13 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     // result (no persistence, no state leak), kept loopback-readable so the
     // dashboard's live PII preview works without a bearer. GET/read routes keep
     // `{ allowSession: true }` as before.
+    //
+    // The GET branch carries ONE extra restriction: the FOLDED read routes
+    // (see {@link isFoldedOperatorReadRoute}) refuse loopback auto-auth, so a
+    // co-resident process cannot read the fleet roster or the template
+    // registry by network position alone. Every operator-derived credential
+    // (bearer, ?session=, cookie) still passes, and auto-auth is untouched on
+    // every other route.
     const requiresOperatorBearer =
       method !== "GET" &&
       method !== "HEAD" &&
@@ -6334,7 +6403,15 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         req,
         url,
         res,
-        requiresOperatorBearer ? { requireToken: true } : { allowSession: true },
+        requiresOperatorBearer
+          ? { requireToken: true }
+          : {
+              allowSession: true,
+              denyLoopbackAutoAuth: isFoldedOperatorReadRoute(
+                method,
+                url.pathname,
+              ),
+            },
       )
     )
       return;
@@ -6428,8 +6505,9 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         // Dashboard-fold PR-2: the wrap dashboard's standalone-parity roster
         // read, folded onto the ONE surviving surface. Read-only SEE-not-manage
         // (no admit/revoke/rotate here); behind the shared checkAuth gate above
-        // (bearer, session, or loopback auto-auth — decision 2: A's posture,
-        // never the wrap surface's tokenless fail-open) + the general rate
+        // (bearer or a session/cookie minted from it — NEVER loopback position;
+        // decision 2: A's posture, never the wrap surface's tokenless
+        // fail-open, see isFoldedOperatorReadRoute) + the general rate
         // limit. Serves the injected wrap provider when one was wired, else
         // the live cap-applied federation roster (honest absent shape when
         // federation is unprovisioned). Fire-and-forget: the async handler
@@ -6437,7 +6515,8 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         void this.handleFleetRosterRead(res);
       } else if (method === "GET" && url.pathname === "/api/templates") {
         // Dashboard-fold PR-2: template registry list (read-only), folded from
-        // the wrap dashboard under A's auth gate (decision 2).
+        // the wrap dashboard under A's auth gate (decision 2 — operator
+        // credential required, loopback position refused).
         this.handleTemplatesList(res);
       } else if (
         method === "GET" &&
