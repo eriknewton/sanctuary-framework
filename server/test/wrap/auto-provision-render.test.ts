@@ -67,10 +67,10 @@ describe("wrap/cli renderAutoProvisionOutcomeLines", () => {
     expect(out).toHaveLength(2);
     expect(out[0]).toMatch(/armed \(uid 502\)/);
     expect(out[1]).toMatch(/CoS liveness unverified \(no_channel_configured\)/);
-    expect(out[1]).toMatch(/no functional-through-wall claim was made/);
+    expect(out[1]).toMatch(/no brain-routing or provider-chain claim was made/);
   });
 
-  it("verified liveness is rendered only as a confined-path round trip", () => {
+  it("verified liveness is rendered only as a Telegram round trip on the confined path", () => {
     const out = lines({
       ran: true,
       outcome: {
@@ -86,8 +86,9 @@ describe("wrap/cli renderAutoProvisionOutcomeLines", () => {
         },
       },
     });
-    expect(out[1]).toMatch(/confined-path round trip/);
+    expect(out[1]).toMatch(/Telegram round trip verified on the confined path/);
     expect(out[1]).toMatch(/request request-1, response response-1/);
+    expect(out[1]).not.toMatch(/brain|provider/i);
   });
 
   it("operator-twin stand-down abort does not reuse the re-home restore failure frame", () => {

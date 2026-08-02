@@ -285,6 +285,12 @@ async function main(): Promise<void> {
     return drainAndExit(code);
   }
 
+  if (args[0] === "liveness-probe") {
+    const { runLivenessProbeCommand } = await import("./cli/liveness-probe.js");
+    const code = await runLivenessProbeCommand({ argv: args.slice(1) });
+    return drainAndExit(code);
+  }
+
   if (args[0] === "fleet") {
     const { runFleetCommand } = await import("./cli/fleet.js");
     const code = await runFleetCommand({ argv: args.slice(1) });

@@ -1964,6 +1964,7 @@ export const CLAIM_LITERAL_COUNTS: Readonly<Record<string, number>> = {
   [`${CW}/fortress-custody.ts`]: 1,
   [`${CW}/harness-argv.ts`]: 1,
   [`${CW}/index.ts`]: 0,
+  [`${CW}/liveness-probe.ts`]: 0,
   // lockfile.ts round-4 C1: `isEgressLockHolderAlive` returns a truthy
   // pid-liveness probe result for the lock-holder description; not a
   // protection claim.
