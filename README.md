@@ -171,6 +171,7 @@ If they pick an archetype, run:
 
 ```bash
 curl -X POST "http://localhost:3501/api/templates/<template-name>/init" \
+  -H "Authorization: Bearer <operator-dashboard-token>" \
   -H "Content-Type: application/json" \
   -d '{
     "agent_name": "<already-wrapped-agent-id>",
@@ -178,7 +179,7 @@ curl -X POST "http://localhost:3501/api/templates/<template-name>/init" \
   }'
 ```
 
-Substitute `<template-name>` with the archetype the operator picked (`research-assistant`, `coding-assistant`, etc.). The `agent_name` must match an already-wrapped harness; `template init` rejects an orphan `agent_id` that is not bound to a wrapped harness (the install-time check that locks Sanctuary to the operator's machine) and points the operator at `sanctuary protect`. Confirm the response includes a `signed_policy_event_id` and an `attestation_panel_url`. Open that URL in the operator's browser.
+Substitute `<template-name>` with the archetype the operator picked (`research-assistant`, `coding-assistant`, etc.). Template init authors and signs a governance policy for the agent, so it is protected like an approval decision: the request requires the operator's dashboard bearer token (printed when the dashboard starts; a tokenless request is rejected), and the operator then confirms a one-click Tier-1 approval card on the dashboard before the policy is signed. If the operator prefers, they can skip the curl and run the same init from the dashboard. The `agent_name` must match an already-wrapped harness; `template init` rejects an orphan `agent_id` that is not bound to a wrapped harness (the install-time check that locks Sanctuary to the operator's machine) and points the operator at `sanctuary protect`. Confirm the response includes a `signed_event_id` and an `attestation_panel_url`. Open that URL in the operator's browser.
 
 ### Step 5: Hand back to the operator
 

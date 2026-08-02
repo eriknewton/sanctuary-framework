@@ -7,6 +7,11 @@
  * Exposes a minimal event emitter (publish / subscribe) so callers
  * can push live activity + approval events to SSE clients without
  * the server layer needing to know about aggregator internals.
+ *
+ * RETIRED FROM PRODUCTION SPAWNING (dashboard one-surface fold, 2026-08-02):
+ * see the module-surface note in ./index.ts — the ONE production dashboard
+ * is the principal-policy DashboardApprovalChannel. `startDashboardServer`
+ * stays exported (pinned public surface + test anchors).
  */
 
 import { randomBytes } from "node:crypto";
