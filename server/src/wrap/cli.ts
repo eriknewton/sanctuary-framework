@@ -2288,6 +2288,7 @@ async function maybeRunAutoProvisionForWrap(
   options: WrapOptions,
   deps: RunWrapDeps,
   stopTransientCastleWallDaemon?: () => Promise<void>,
+  auditLog?: AuditLog,
 ): Promise<{ summary: AutoProvisionSummary; deferredSignal?: NodeJS.Signals }> {
   if (agentConfig.platform !== "hermes" || options.dryRun) {
     return { summary: { ran: false } };
@@ -2303,6 +2304,7 @@ async function maybeRunAutoProvisionForWrap(
         preAnsweredProvision: options.provisionAgentAccount,
         cliBinary: resolveAutoProvisionCliBinary(options),
         stopTransientCastleWallDaemon,
+        ...(auditLog ? { auditLog } : {}),
         beforeFirstMutation: () => {
           mutationWindowOpened = tryOpenAutoProvisionMutationWindow(options);
           return mutationWindowOpened;
@@ -2517,13 +2519,13 @@ function renderCosLivenessOutcome(liveness: CosLivenessOutcome | undefined): str
     const roundTrip = liveness.roundTrip;
     const detail = roundTrip.detail !== undefined ? `: ${roundTrip.detail}` : "";
     return [
-      `  CoS liveness verified by confined-path round trip (${roundTrip.channel}, ` +
+      `  CoS liveness: Telegram round trip verified on the confined path (${roundTrip.channel}, ` +
         `request ${roundTrip.requestId}, response ${roundTrip.responseId}${detail}).`,
     ];
   }
   const detail = liveness.detail !== undefined ? `: ${liveness.detail}` : "";
   return [
-    `  CoS liveness unverified (${liveness.reason}${detail}); no functional-through-wall claim was made.`,
+    `  CoS liveness unverified (${liveness.reason}${detail}); no brain-routing or provider-chain claim was made.`,
   ];
 }
 
@@ -4286,6 +4288,7 @@ export async function runWrap(
       options,
       deps,
       stopTransientCastleWallDaemonForAutoProvision,
+      ndAuditLog,
     );
     const autoProvisionSummary = autoProvisionRun.summary;
     renderAutoProvisionOutcome(autoProvisionSummary);
@@ -4637,6 +4640,7 @@ export async function runWrap(
     options,
     deps,
     stopTransientCastleWallDaemonForAutoProvision,
+    wrapAuditLog,
   );
   const autoProvisionSummary = autoProvisionRun.summary;
   renderAutoProvisionOutcome(autoProvisionSummary);

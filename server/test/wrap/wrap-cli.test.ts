@@ -405,7 +405,7 @@ describe("formatWrapSuccess", () => {
     expect(out).toContain("Castle Wall coarse-only");
   });
 
-  it("armed outcome renders the unverified-liveness line, never a functional-through-wall claim (F-GATEWAY-TWIN fix 8)", () => {
+  it("armed outcome renders the unverified-liveness line, never a brain-routing/provider-chain claim (F-GATEWAY-TWIN fix 8)", () => {
     // Pre-#F-GATEWAY-TWIN source ignored `liveness` entirely: the armed line
     // rendered alone and the operator could read a freshly-armed summary as
     // "the agent works through the wall" with zero evidence. The outcome now
@@ -417,7 +417,7 @@ describe("formatWrapSuccess", () => {
     const text = lines.join("\n");
     expect(text).toContain("Castle Wall armed (uid 503)");
     expect(text).toContain(
-      "CoS liveness unverified (no_channel_configured); no functional-through-wall claim was made.",
+      "CoS liveness unverified (no_channel_configured); no brain-routing or provider-chain claim was made.",
     );
     expect(text).not.toContain("liveness verified");
   });

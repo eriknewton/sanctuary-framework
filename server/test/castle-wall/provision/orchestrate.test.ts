@@ -16,6 +16,7 @@ import {
   type ProvisionFlowContext,
   type ProvisionFlowOps,
 } from "../../../src/castle-wall/provision/orchestrate.js";
+import { parseTelegramLivenessProbeConfig } from "../../../src/castle-wall/provision/liveness-probe.js";
 import type { ProvisionNeedResult } from "../../../src/castle-wall/provision/detect.js";
 import type { RehomeStepResult } from "../../../src/castle-wall/provision/rehome.js";
 import {
@@ -389,6 +390,30 @@ describe("castle-wall/provision/orchestrate", () => {
           detail: "telegram send failed",
         },
       });
+    });
+
+    it("does not return raw token-file contents when auto-provision renders config parse failures", async () => {
+      const distinctiveSecret = "AUTO_PROVISION_LIVENESS_CONFIG_SECRET_2e3459";
+      let configError: Error | undefined;
+      try {
+        parseTelegramLivenessProbeConfig(distinctiveSecret, "/tmp/f/config/liveness-probe/telegram.json");
+      } catch (err) {
+        configError = err as Error;
+      }
+      expect(configError).toBeDefined();
+
+      const result = await runProvisionFlow(
+        baseCtx(),
+        happyPathOps({
+          verifyAgentLivenessAfterStandDown: vi.fn(async () => {
+            throw configError;
+          }),
+        }),
+      );
+      const serialized = JSON.stringify(result);
+      expect(serialized).toContain("config_malformed");
+      expect(serialized).not.toContain(distinctiveSecret);
+      expect(serialized).not.toMatch(/Unexpected token|not valid JSON|JSON\.parse/i);
     });
   });
 
