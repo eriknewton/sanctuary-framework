@@ -173,7 +173,10 @@ these subsystems are largely independent. The fix is documentation, not deletion
   (`wrap/cli.ts:ensureMainDashboardForWrap`), which now also serves the formerly-wrap-only groups
   under ITS stricter auth: read-only `GET /api/fleet/roster`, `/api/templates` (init behind the
   Tier-1 approval gate), and the `POST /api/approvals/:id/(allow|deny)` alias onto the same
-  `handleDecision` as `/api/approve/:id` + `/api/deny/:id`. The mobile PWA `/m/*` is ALSO served
+  `handleDecision` as `/api/approve/:id` + `/api/deny/:id`. Those folded READS additionally
+  refuse loopback auto-auth (`isFoldedOperatorReadRoute` in `principal-policy/dashboard.ts`):
+  they admit an operator-derived credential only (the bearer, or a session/cookie minted from
+  it), never network position, because a co-resident agent shares the loopback interface. The mobile PWA `/m/*` is ALSO served
   here, but its shell/manifest/service-worker are deliberately PUBLIC static assets (client-side
   auth, the same posture as the concierge SPA and as the wrap surface served them); only the PWA's
   DATA routes (`/api/pending` + the decision routes) sit behind the auth gate. Approvals

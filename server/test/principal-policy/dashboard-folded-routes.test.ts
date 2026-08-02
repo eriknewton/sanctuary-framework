@@ -419,3 +419,88 @@ describe("dashboard-fold PR-2: folded wrap-surface routes on the main dashboard"
     expect(status.decision_capable).toBe(true);
   });
 });
+
+/**
+ * Decision 2, the loopback half — drill finding (2026-08-02, leg 2, 3/3 reps).
+ *
+ * The rigs above never enable loopback auto-auth, so they could not see the
+ * gap the drill found: on a `sanctuary protect`-started dashboard the operator
+ * token IS minted AND `setAutoAuthLocalhost(true)` is on, and a TOKENLESS
+ * loopback `GET /api/fleet/roster` returned 200. That is exactly the wrap
+ * surface's tokenless fail-open, re-created on the always-on surface: a
+ * co-resident local process (including a confined agent uid) holds loopback
+ * position, so network position must not stand in for the operator.
+ *
+ * These rigs turn auto-auth ON — the production `protect` posture — and assert
+ * the folded reads deny anyway, while an operator-derived credential (bearer
+ * or a session minted FROM the bearer) still passes and unfolded routes keep
+ * the auto-auth affordance.
+ */
+describe("folded reads require the operator bearer, never loopback position", () => {
+  const rigs: Rig[] = [];
+  afterEach(async () => {
+    for (const rig of rigs.splice(0)) await rig.stop();
+  });
+
+  /** A rig in the production `protect` posture: token minted AND auto-auth on. */
+  async function startLoopbackAutoAuthRig(): Promise<Rig> {
+    const rig = await startRig();
+    rig.channel.setAutoAuthLocalhost(true);
+    rigs.push(rig);
+    return rig;
+  }
+
+  it("DENIES a tokenless loopback GET /api/fleet/roster even with auto-auth enabled", async () => {
+    const rig = await startLoopbackAutoAuthRig();
+    const res = await fetch(`${rig.base}/api/fleet/roster`);
+    expect(res.status).toBe(401);
+    expect(await res.json()).toEqual({ error: "unauthorized" });
+  });
+
+  it("DENIES a tokenless loopback GET /api/templates even with auto-auth enabled", async () => {
+    const rig = await startLoopbackAutoAuthRig();
+    const res = await fetch(`${rig.base}/api/templates`);
+    expect(res.status).toBe(401);
+  });
+
+  it("DENIES a tokenless loopback GET /api/templates/:name even with auto-auth enabled", async () => {
+    const rig = await startLoopbackAutoAuthRig();
+    const res = await fetch(`${rig.base}/api/templates/research-assistant`);
+    expect(res.status).toBe(401);
+  });
+
+  it("still serves the folded reads to the operator bearer with auto-auth enabled", async () => {
+    const rig = await startLoopbackAutoAuthRig();
+    for (const path of [
+      "/api/fleet/roster",
+      "/api/templates",
+      "/api/templates/research-assistant",
+    ]) {
+      const res = await fetch(`${rig.base}${path}`, { headers: rig.bearer });
+      expect([path, res.status]).toEqual([path, 200]);
+    }
+  });
+
+  it("still serves the folded reads to a session minted from the operator bearer (the browser client keeps working)", async () => {
+    const rig = await startLoopbackAutoAuthRig();
+    const exchange = await fetch(`${rig.base}/auth/session`, {
+      method: "POST",
+      headers: rig.bearer,
+    });
+    expect(exchange.status).toBe(200);
+    const { session_id: sessionId } = (await exchange.json()) as {
+      session_id: string;
+    };
+    expect(typeof sessionId).toBe("string");
+    const res = await fetch(
+      `${rig.base}/api/fleet/roster?session=${encodeURIComponent(sessionId)}`,
+    );
+    expect(res.status).toBe(200);
+  });
+
+  it("leaves loopback auto-auth intact on the routes the fold did not move (scoped fix, not a repo-wide kill)", async () => {
+    const rig = await startLoopbackAutoAuthRig();
+    const res = await fetch(`${rig.base}/api/status`);
+    expect(res.status).toBe(200);
+  });
+});
