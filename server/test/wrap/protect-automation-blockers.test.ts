@@ -979,7 +979,14 @@ describe("runWrap: declined step-2 arm confirm does not exit, matching the accep
 
     expect(stopSpy).not.toHaveBeenCalled();
     expect(exitSpy).not.toHaveBeenCalled();
-    expect(__processShutdownCleanupCountForTest()).toBe(1);
+    // Dashboard-fold PR-4: the count this pinned was the tenant-runtime
+    // unlink cleanup registered right after runWrap's own runtime.json
+    // write. That write is GONE by design (runtime.json single-writer: the
+    // main dashboard's boot path owns the record now), so the accepted-arm
+    // path registers no persistent shutdown cleanup here. The wrap-audit
+    // flush cleanup is registered and then unregistered before this point,
+    // which is exactly why the honest resting count is now 0.
+    expect(__processShutdownCleanupCountForTest()).toBe(0);
   });
 });
 

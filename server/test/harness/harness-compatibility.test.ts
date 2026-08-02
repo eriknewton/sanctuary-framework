@@ -185,10 +185,17 @@ describe("harness compatibility matrix", () => {
           ],
         });
         expect(stderrText()).toContain("Sovereignty Dashboard running at");
-        expect(stderrText()).toMatch(/http:\/\/127\.0\.0\.1:35\d\d\?session=/);
+        // Dashboard-fold PR-4 (ratified decision 1): the banner prints the
+        // ensured main dashboard's PLAIN URL — wrap no longer mints a
+        // session on a wrap-owned handle (the ONE main dashboard runs its
+        // own client auth; loopback auto-auth after unlock lives in ITS
+        // boot path). The no-credential-in-URL contract stands: neither a
+        // ?token= nor a wrap-minted ?session= appears on the banner.
+        expect(stderrText()).toMatch(/http:\/\/127\.0\.0\.1:35\d\d/);
         expect(stderrText()).not.toContain("?token=");
+        expect(stderrText()).not.toContain("?session=");
         expect(dashboardUrls).toHaveLength(1);
-        expect(dashboardUrls[0]).toMatch(/http:\/\/127\.0\.0\.1:3501\?session=/);
+        expect(dashboardUrls[0]).toMatch(/http:\/\/127\.0\.0\.1:3501/);
         expect(dashboardUrls[0]).not.toContain("?token=");
         await expect(access(join(storagePath(), "identities"))).rejects.toThrow();
         await expect(access(join(storagePath(), "audit"))).rejects.toThrow();

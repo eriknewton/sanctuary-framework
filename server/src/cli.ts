@@ -136,7 +136,35 @@ async function main(): Promise<void> {
     const { parseWrapArgs, runWrap } = await import("./wrap/cli.js");
     const opts = parseWrapArgs(args.slice(1));
     if (args[0] === "protect") opts.protectCommand = true;
-    await runWrap(opts);
+    // Dashboard-fold PR-4 (ratified decision 1): inject the ONE main
+    // dashboard's in-process starter. `runWrap` detects-and-reuses a live
+    // main dashboard for the fortress and only calls this when none exists.
+    // The closure lives HERE because wrap/cli must not import
+    // dashboard-standalone itself (that edge would introduce a new import
+    // cycle; see test/structure/import-cycle-baseline.test.ts).
+    await runWrap(opts, {
+      startOwnedDashboard: async ({ storagePath, port, passphrase }) => {
+        const { startStandaloneDashboard } = await import(
+          "./dashboard-standalone.js"
+        );
+        await startStandaloneDashboard({
+          storagePath,
+          port,
+          ...(passphrase !== undefined ? { passphrase } : {}),
+          // Fix round 1, F1 (ratified decision 2): a protect-started
+          // dashboard must never sit tokenless-open on the folded read
+          // routes. When no source configures dashboard.auth_token, the
+          // boot mints one (and prints it as "Operator token:"); a
+          // configured token always wins. Loopback auto-auth after unlock
+          // keeps the browser UX.
+          mintAuthTokenIfAbsent: true,
+        });
+        // The standalone boot binds exactly the requested loopback port (no
+        // silent walk) and writes the tenant's runtime.json itself — the
+        // single production writer.
+        return { url: `http://127.0.0.1:${port}`, port };
+      },
+    });
     return;
   }
 
