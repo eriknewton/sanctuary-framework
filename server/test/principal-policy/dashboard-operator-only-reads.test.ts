@@ -181,3 +181,75 @@ describe("fleet-posture reads require the operator bearer, never loopback positi
     }
   });
 });
+
+/**
+ * `GET /api/pending` — the operator's approval queue.
+ *
+ * It predates the fold on this surface and kept the same loopback admission:
+ * a co-resident process (including a confined agent uid) could read every
+ * operation waiting on the operator's decision, with its tier and reason, using
+ * no credential at all.
+ *
+ * This one could not ship with #1075 because gating the route alone is a
+ * REGRESSION, not a fix: the posture-home landing page reads it through
+ * loopback auto-auth and swallows failure into an empty array, so a gated route
+ * would silently empty the operator's approval inbox. The paired client change
+ * lives in `principal-policy/posture-home-html.ts` and is covered by
+ * `posture-home-html.test.ts`.
+ */
+describe("the approval queue read requires the operator bearer, never loopback position", () => {
+  const rigs: Rig[] = [];
+  afterEach(async () => {
+    for (const rig of rigs.splice(0)) await rig.stop();
+  });
+
+  async function loopbackAutoAuthRig(): Promise<Rig> {
+    const rig = await startRig({ autoAuth: true });
+    rigs.push(rig);
+    return rig;
+  }
+
+  it("DENIES a tokenless loopback GET /api/pending even with auto-auth enabled", async () => {
+    const rig = await loopbackAutoAuthRig();
+    const res = await fetch(`${rig.base}/api/pending`);
+    expect(res.status).toBe(401);
+    expect(await res.json()).toEqual({ error: "unauthorized" });
+  });
+
+  it("still serves the approval queue to the operator bearer with auto-auth enabled", async () => {
+    const rig = await loopbackAutoAuthRig();
+    const res = await fetch(`${rig.base}/api/pending`, { headers: rig.bearer });
+    expect(res.status).toBe(200);
+    expect(Array.isArray(await res.json())).toBe(true);
+  });
+
+  it("REJECTS a wrong bearer on the approval queue", async () => {
+    const rig = await loopbackAutoAuthRig();
+    const res = await fetch(`${rig.base}/api/pending`, {
+      headers: { Authorization: `Bearer ${TOKEN}-wrong` },
+    });
+    expect(res.status).toBe(401);
+  });
+
+  it("still serves the approval queue to a session minted from the operator bearer (the auto-opened ?session= link keeps working)", async () => {
+    const rig = await loopbackAutoAuthRig();
+    const exchange = await fetch(`${rig.base}/auth/session`, {
+      method: "POST",
+      headers: rig.bearer,
+    });
+    expect(exchange.status).toBe(200);
+    const { session_id: sessionId } = (await exchange.json()) as {
+      session_id: string;
+    };
+    const res = await fetch(
+      `${rig.base}/api/pending?session=${encodeURIComponent(sessionId)}`,
+    );
+    expect(res.status).toBe(200);
+  });
+
+  it("REJECTS a bogus ?session= on the approval queue", async () => {
+    const rig = await loopbackAutoAuthRig();
+    const res = await fetch(`${rig.base}/api/pending?session=not-a-real-session`);
+    expect(res.status).toBe(401);
+  });
+});

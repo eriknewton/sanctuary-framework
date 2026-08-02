@@ -221,7 +221,14 @@ export function renderPostureHomeHTML(): string {
   .approval-actions button.approve { border-color: var(--sage); }
   .approval-actions button.deny { border-color: var(--rust); }
   .approval-actions button:disabled { opacity: .55; cursor: not-allowed; }
+  .approval-actions button.unlock { border-color: var(--ochre); }
   .approval-error { color: var(--rust); font-size: 12px; margin-top: 8px; }
+  .approval-locked {
+    padding: 10px 0 12px; border-bottom: 1px solid var(--rule);
+  }
+  .approval-locked:last-child { border-bottom: 0; }
+  .approval-locked-title { font-weight: 600; }
+  .approval-locked .approval-actions { margin-top: 8px; }
   .footer {
     margin: 24px 0 8px; padding: 14px 16px; background: var(--surface-2);
     border: 1px solid var(--rule); border-radius: 10px; color: var(--ink-3); font-size: 12px;
@@ -421,7 +428,15 @@ export function renderPostureHomeHTML(): string {
     if (token) opts.headers["Authorization"] = "Bearer " + token;
     var url = credentialedPath(path);
     return fetch(url, opts).then(function (r) {
-      if (!r.ok) throw new Error(path + " -> " + r.status);
+      if (!r.ok) {
+        // Carry the status on the error. A caller that swallows failures needs
+        // to tell "the server said no, you are not authenticated" apart from
+        // "the request broke", because those two deserve very different things
+        // on screen: one is a lock, the other is a retry.
+        var failure = new Error(path + " -> " + r.status);
+        failure.status = r.status;
+        throw failure;
+      }
       return r.json();
     });
   }
@@ -943,7 +958,9 @@ export function renderPostureHomeHTML(): string {
 
   function renderBanner(home, approvalState, anomalies) {
     var openAnomalies = (anomalies && anomalies.length) || 0;
-    var pendingCount = (approvalState && approvalState.rows && approvalState.rows.length) || 0;
+    // See approvalsWaitingValue: LOCKED, never a confident 0, when the
+    // approval-queue read was denied.
+    var pendingCount = approvalsWaitingValue(approvalState);
     var federation = home && home.federation;
     var originText = "Machine: " + home.origin_machine;
     if (federation && federation.available) {
@@ -1171,7 +1188,7 @@ export function renderPostureHomeHTML(): string {
     return { rows: [], source: "none" };
   }
 
-  function buildApprovalState(legacyBody, inboxBody, status) {
+  function buildApprovalState(legacyBody, inboxBody, status, legacyDenied) {
     var legacyList = legacyBody && legacyBody.pending ? legacyBody.pending : legacyBody;
     var inboxList = inboxBody && inboxBody.data && inboxBody.data.entries
       ? inboxBody.data.entries
@@ -1188,23 +1205,72 @@ export function renderPostureHomeHTML(): string {
       mode: status
         ? (status.standalone_mode === true ? "standalone" : "co-located")
         : "unknown",
+      // The approval-queue read was DENIED. Everything downstream must treat
+      // this view as incomplete rather than empty.
+      locked: legacyDenied === true,
     };
+  }
+
+  // The one thing this panel must never do is let a DENIED read look like an
+  // empty queue. "Nothing needs you" over a queue we were not allowed to see is
+  // the most consequential lie available on this surface, so a locked read gets
+  // its own state that says what happened and offers the one step that fixes
+  // it. It does not claim the queue is empty and it does not claim it is full.
+  function lockedApprovalsHTML() {
+    return '<div class="approval-locked" data-approvals-locked="1">' +
+      '<div class="approval-locked-title">Approvals are hidden, not empty.</div>' +
+      '<div class="approval-detail">This page could not read your approval queue. ' +
+      "It needs your operator token; being on this machine is not enough, because " +
+      "anything else running here would have the same access. " +
+      "Anything waiting on your decision is still waiting.</div>" +
+      '<div class="approval-actions">' +
+      '<button class="unlock" data-approvals-unlock="1">Paste operator token</button>' +
+      "</div></div>";
+  }
+
+  function wireApprovalsUnlock(el) {
+    var button = el.querySelector("[data-approvals-unlock]");
+    if (!button) return;
+    button.addEventListener("click", function () {
+      if (promptForToken()) pollOnce();
+    });
+  }
+
+  // The "Approvals waiting" banner tile. A denied read makes the count UNKNOWN,
+  // not zero, so it reports LOCKED in the same amber "unknown" vocabulary the
+  // wall and audit-chain pills use. A confident 0 there would be the same lie
+  // as the calm empty panel, in the tile an operator scans first.
+  function approvalsWaitingValue(approvalState) {
+    if (approvalState && approvalState.locked) {
+      return '<span class="pill amber">LOCKED</span>';
+    }
+    return (approvalState && approvalState.rows && approvalState.rows.length) || 0;
   }
 
   function renderApprovals(approvalState) {
     var pending = (approvalState && approvalState.rows) || [];
+    var locked = !!(approvalState && approvalState.locked);
+    var el = document.getElementById("approvals");
+    if (locked && !pending.length) {
+      el.innerHTML = lockedApprovalsHTML();
+      wireApprovalsUnlock(el);
+      return;
+    }
     if (!pending.length) {
       // S3 quiet empty state: earned calm. An empty approvals queue is a good
       // state, so it reads as one -- but the second clause keeps it honest
       // about WHY it is empty (nothing was held), not that nothing happened.
-      document.getElementById("approvals").innerHTML =
+      el.innerHTML =
         '<div class="quiet"><span class="quiet-mark">&#9679;</span>' +
         "<span>Nothing needs you." +
         '<span class="quiet-why"> No operation is waiting on your decision.</span>' +
         "</span></div>";
       return;
     }
-    var html = "";
+    // Rows we DID get (the approval-inbox source can answer while the legacy
+    // queue is denied). The lock notice stays above them so a partial view is
+    // never read as the whole picture.
+    var html = locked ? lockedApprovalsHTML() : "";
     pending.forEach(function (p) {
       html += '<div class="approval-row" data-approval-row="' + esc(p.id) + '">' +
         '<div class="approval-main"><div class="approval-title">' + esc(p.title) + "</div>" +
@@ -1219,8 +1285,8 @@ export function renderPostureHomeHTML(): string {
       }
       html += "</div>";
     });
-    var el = document.getElementById("approvals");
     el.innerHTML = html;
+    if (locked) wireApprovalsUnlock(el);
     if (approvalState && approvalState.can_decide) wireApprovalButtons(el);
   }
 
@@ -1683,16 +1749,26 @@ export function renderPostureHomeHTML(): string {
   // Not carried on the home payload, so refreshed alongside each home frame.
   // Failures degrade to empty (never block the home render); these are honest
   // empties, not green claims.
-  var lastApprovals = { rows: [], can_decide: false, mode: "unknown", source: "none" };
+  var lastApprovals = { rows: [], can_decide: false, mode: "unknown", source: "none", locked: false };
   var lastFindings = [];
   function refreshAuxiliary() {
+    // /api/pending requires an operator credential; loopback position is not
+    // one, because anything else running on this machine holds it too. A 401
+    // here therefore means "hidden", NOT "empty", and the two must never render
+    // the same. Swallowing the denial into [] (what this did before) would show
+    // the operator a calm, empty inbox while real operations sat waiting, with
+    // no error and no prompt until something they could not see timed out.
+    var approvalsDenied = false;
     return Promise.all([
-      api("/api/pending").catch(function () { return []; }),
+      api("/api/pending").catch(function (e) {
+        if (e && e.status === 401) approvalsDenied = true;
+        return [];
+      }),
       api("/api/approval-inbox?status=pending").catch(function () { return { data: { entries: [] } }; }),
       api("/api/status").catch(function () { return null; }),
       api("/api/anomaly/findings").catch(function () { return { findings: [] }; }),
     ]).then(function (rest) {
-      lastApprovals = buildApprovalState(rest[0], rest[1], rest[2]);
+      lastApprovals = buildApprovalState(rest[0], rest[1], rest[2], approvalsDenied);
       lastFindings = rest[3].findings || rest[3] || [];
     });
   }

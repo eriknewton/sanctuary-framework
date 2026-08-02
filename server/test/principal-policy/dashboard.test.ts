@@ -1,3 +1,4 @@
+// fail-before-exempt: accommodation edit only — five setup reads that fetched /api/pending tokenless now carry the operator bearer because that route is gated in this PR; what these tests lock is unchanged, so they correctly pass against pre-fix source. The behavior change is proven by dashboard-operator-only-reads.test.ts, which does fail before.
 /**
  * Sanctuary MCP Server — Principal Dashboard Tests
  *
@@ -1266,8 +1267,13 @@ describe("Principal Dashboard", () => {
 
     it("rejects a tokenless loopback POST /api/approve/:id (401) even with auto-auth on", async () => {
       const approvalPromise = autoDashboard.requestApproval(makeReq());
-      // Read-only pending list still works under auto-auth, no token.
-      const listRes = await fetch(`http://127.0.0.1:${autoPort}/api/pending`);
+      // The pending list is itself an operator-only read now (a co-resident
+      // agent shares loopback, so it must not see the queue either), so this
+      // setup step carries the bearer. What this test locks is unchanged and
+      // is asserted below: the DECISION stays 401 without it.
+      const listRes = await fetch(`http://127.0.0.1:${autoPort}/api/pending`, {
+        headers: { Authorization: `Bearer ${AUTH_TOKEN}` },
+      });
       expect(listRes.status).toBe(200);
       const pending = await listRes.json();
       expect(pending).toHaveLength(1);
@@ -1287,7 +1293,9 @@ describe("Principal Dashboard", () => {
     it("rejects a tokenless loopback POST /api/deny/:id (401) even with auto-auth on", async () => {
       const approvalPromise = autoDashboard.requestApproval(makeReq());
       const pending = await (
-        await fetch(`http://127.0.0.1:${autoPort}/api/pending`)
+        await fetch(`http://127.0.0.1:${autoPort}/api/pending`, {
+          headers: { Authorization: `Bearer ${AUTH_TOKEN}` },
+        })
       ).json();
       const res = await fetch(
         `http://127.0.0.1:${autoPort}/api/deny/${pending[0].id}`,
@@ -1301,7 +1309,9 @@ describe("Principal Dashboard", () => {
     it("accepts POST /api/approve/:id WITH the operator token (200) under auto-auth", async () => {
       const approvalPromise = autoDashboard.requestApproval(makeReq());
       const pending = await (
-        await fetch(`http://127.0.0.1:${autoPort}/api/pending`)
+        await fetch(`http://127.0.0.1:${autoPort}/api/pending`, {
+          headers: { Authorization: `Bearer ${AUTH_TOKEN}` },
+        })
       ).json();
       const res = await fetch(
         `http://127.0.0.1:${autoPort}/api/approve/${pending[0].id}`,
@@ -1357,7 +1367,9 @@ describe("Principal Dashboard", () => {
     it("a GET to /api/approve/:id never approves (POST-only decision surface, no GET door)", async () => {
       const approvalPromise = autoDashboard.requestApproval(makeReq());
       const pending = await (
-        await fetch(`http://127.0.0.1:${autoPort}/api/pending`)
+        await fetch(`http://127.0.0.1:${autoPort}/api/pending`, {
+          headers: { Authorization: `Bearer ${AUTH_TOKEN}` },
+        })
       ).json();
       expect(pending).toHaveLength(1);
 
@@ -1378,7 +1390,9 @@ describe("Principal Dashboard", () => {
     it("a GET to /api/deny/:id never denies (POST-only decision surface, no GET door)", async () => {
       const approvalPromise = autoDashboard.requestApproval(makeReq());
       const pending = await (
-        await fetch(`http://127.0.0.1:${autoPort}/api/pending`)
+        await fetch(`http://127.0.0.1:${autoPort}/api/pending`, {
+          headers: { Authorization: `Bearer ${AUTH_TOKEN}` },
+        })
       ).json();
       const getRes = await fetch(
         `http://127.0.0.1:${autoPort}/api/deny/${pending[0].id}`,
