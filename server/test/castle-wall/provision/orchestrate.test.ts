@@ -1,3 +1,4 @@
+// fail-before-exempt: type-forced fixture update only (ParkedInstallRevertOps gained setJobDisabled/ensureHoldDir and the snapshot gained holdFilePath/disabledBefore); this file's subject has no behavioral stake in park reversibility — the real pins are in release-barrier.test.ts
 /**
  * Tests for the one-flow orchestration (fold of the target flow's steps 1
  * through 11, folded fixes B2/H1/H3/H4/L2): every fail-closed branch is
