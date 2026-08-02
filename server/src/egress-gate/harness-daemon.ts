@@ -638,7 +638,7 @@ export function launchctlBootoutWasInProgress(result: LaunchctlResult): boolean 
  *
  * IT RETURNING IS AN OBSERVATION (fix-round 3, 2026-07-19). Through round 2
  * this checked the `launchctl enable`/`disable` EXIT CODE and never re-read
- * the override database, while callers -- `clearJobDisable`, the parked
+ * the override database, while callers -- `setJobDisabled`, the parked
  * install, the release sequence's re-park -- wrote the word "confirmed" around
  * it. Both round-3 lenses named it. The readback below closes it with the
  * mechanism the codebase already had (`print-disabled system`, the same table

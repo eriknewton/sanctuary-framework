@@ -1,4 +1,4 @@
-// fail-before-exempt: type-forced fixture update only (the rehome plan gained a required newAccountHome field); this file's subject has no behavioral stake in account-home custody — the real pins are in rehome.test.ts and auto-provision-realops.test.ts
+// fail-before-exempt: type-forced fixture updates only, from two separate contract changes — the rehome plan gained a required newAccountHome field (account-home custody), and ParkedInstallRevertOps gained setJobDisabled/ensureHoldDir plus snapshot holdFilePath/disabledBefore (park reversibility). This file's subject has a behavioral stake in neither; the real pins are in rehome.test.ts, auto-provision-realops.test.ts, and release-barrier.test.ts.
 /**
  * Tests for the one-flow orchestration (fold of the target flow's steps 1
  * through 11, folded fixes B2/H1/H3/H4/L2): every fail-closed branch is
@@ -2489,7 +2489,8 @@ describe("castle-wall/provision/orchestrate", () => {
         restoreRunningHarness: async () => {
           throw new Error("launchctl bootstrap exited 5");
         },
-        clearJobDisable: async () => {},
+        setJobDisabled: async () => {},
+        ensureHoldDir: async () => {},
         writeFile: async () => {},
         readFile: async () => "<plist>prior</plist>",
         removeFile: async () => {},
@@ -2501,6 +2502,8 @@ describe("castle-wall/provision/orchestrate", () => {
           preexistingJobModified: true,
           priorPlistContent: "<plist>prior</plist>",
           plistPath: HARNESS_LOCATOR.plistPath,
+          holdFilePath: "/var/db/sanctuary/agent-harness/503.release",
+          disabledBefore: false,
           harnessLabel: HARNESS_LOCATOR.harnessLabel,
         },
         revertOps,
