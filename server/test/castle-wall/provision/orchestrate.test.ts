@@ -1,3 +1,4 @@
+// fail-before-exempt: type-forced fixture update only (the rehome plan gained a required newAccountHome field); this file's subject has no behavioral stake in account-home custody — the real pins are in rehome.test.ts and auto-provision-realops.test.ts
 /**
  * Tests for the one-flow orchestration (fold of the target flow's steps 1
  * through 11, folded fixes B2/H1/H3/H4/L2): every fail-closed branch is

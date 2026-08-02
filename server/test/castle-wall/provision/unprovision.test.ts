@@ -1,3 +1,4 @@
+// fail-before-exempt: type-forced fixture update only (RehomeOps gained verifyDestinationHomeCustody/prepareDestinationParentCustody); unprovision does not move Tier-K data, so it has no behavioral stake here
 /**
  * Tests for the H2-a unprovision rollback: disarm -> uninstall daemon ->
  * restore re-home, each step attempted even if an earlier one failed
