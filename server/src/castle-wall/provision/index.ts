@@ -126,15 +126,26 @@ export type { HarnessArgvOps, InterpreterVersion, ResolvedHarnessArgv } from "./
 export { runProvisionFlow } from "./orchestrate.js";
 export type {
   AgentLivenessProbeResult,
+  CosLivenessCommittedEndpoint,
+  CosLivenessEvidence,
   CosLivenessOutcome,
+  CosLivenessReachabilityReportContext,
+  CosLivenessReachabilityEvidence,
+  CosLivenessReachabilityRow,
+  CosLivenessVerifiedReachabilityEvidence,
   CosLivenessRoundTrip,
   CosLivenessUnverifiedReason,
+  CosLivenessUnverifiedSubreason,
   DisarmNePreferenceOutcome,
   ProvisionFlowContext,
   ProvisionFlowOps,
   ProvisionFlowOutcome,
 } from "./orchestrate.js";
-export { cosLivenessFromProbeResult } from "./orchestrate.js";
+export {
+  cosLivenessFromProbeResult,
+  cosLivenessFromReachabilityReport,
+  isVerifiedCosLivenessReachabilityEvidence,
+} from "./orchestrate.js";
 
 export {
   hermesOperatorTwinDescriptor,

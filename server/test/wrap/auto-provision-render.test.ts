@@ -29,7 +29,13 @@ import {
   type ParkedClaim,
 } from "../../src/egress-gate/parked-claim.js";
 import type { HarnessDaemonStatus } from "../../src/egress-gate/harness-daemon.js";
-import { describeExclusiveRoutingResidueRefusal } from "../../src/castle-wall/provision/orchestrate.js";
+import {
+  cosLivenessFromReachabilityReport,
+  describeExclusiveRoutingResidueRefusal,
+  type CosLivenessOutcome,
+} from "../../src/castle-wall/provision/orchestrate.js";
+
+const LIVENESS_OVERCLAIM_PATTERN = /brain|provider|process|running|alive|healthy/i;
 
 function lines(summary: AutoProvisionSummary): string[] {
   return renderAutoProvisionOutcomeLines(summary);
@@ -70,7 +76,48 @@ describe("wrap/cli renderAutoProvisionOutcomeLines", () => {
     expect(out[1]).toMatch(/no brain-routing or provider-chain claim was made/);
   });
 
-  it("verified liveness is rendered only as a Telegram round trip on the confined path", () => {
+  it("verified reachability liveness is rendered only as the confined path differential", () => {
+    const committedEndpoints = Array.from({ length: 6 }, (_unused, i) => ({
+      name: `endpoint ${i + 1}`,
+      host: `endpoint-${i + 1}.example`,
+      port: 443,
+    }));
+    const liveness = cosLivenessFromReachabilityReport({
+      ok: true,
+      rows: [
+        ...committedEndpoints.map((endpoint) => ({
+          ...endpoint,
+          expected: "reachable" as const,
+          observed: "reachable" as const,
+          pass: true,
+        })),
+        {
+          name: "negative control (non-listed host must be blocked)",
+          host: "example.com",
+          port: 443,
+          expected: "blocked" as const,
+          observed: "blocked" as const,
+          pass: true,
+        },
+      ],
+    }, {
+      committedEndpoints,
+    });
+    const out = lines({
+      ran: true,
+      outcome: {
+        kind: "armed",
+        uid: 502,
+        liveness,
+      },
+    });
+    expect(out[1]).toContain(
+      "confined path verified: the agent uid reaches all 6 declared endpoints and remains blocked elsewhere.",
+    );
+    expect(out[1]).not.toMatch(LIVENESS_OVERCLAIM_PATTERN);
+  });
+
+  it("does not render a legacy verified Telegram branch as verified liveness", () => {
     const out = lines({
       ran: true,
       outcome: {
@@ -78,17 +125,68 @@ describe("wrap/cli renderAutoProvisionOutcomeLines", () => {
         uid: 502,
         liveness: {
           kind: "cos_liveness_verified",
-          roundTrip: {
-            channel: "telegram",
-            requestId: "request-1",
-            responseId: "response-1",
+          evidence: {
+            kind: "roundTrip",
+            roundTrip: {
+              channel: "telegram",
+              requestId: "request-1",
+              responseId: "response-1",
+            },
           },
-        },
+        } as unknown as CosLivenessOutcome,
       },
     });
-    expect(out[1]).toMatch(/Telegram round trip verified on the confined path/);
-    expect(out[1]).toMatch(/request request-1, response response-1/);
-    expect(out[1]).not.toMatch(/brain|provider/i);
+    expect(out[1]).toContain("CoS liveness unverified");
+    expect(out[1]).not.toMatch(/Telegram round trip verified/i);
+    expect(out[1]).not.toMatch(/confined path verified/i);
+  });
+
+  it("does not render hand-built malformed verified reachability evidence as verified liveness", () => {
+    const out = lines({
+      ran: true,
+      outcome: {
+        kind: "armed",
+        uid: 502,
+        liveness: {
+          kind: "cos_liveness_verified",
+          evidence: {
+            kind: "reachability",
+            declaredEndpointCount: 3,
+            reachableEndpointCount: 3,
+            negativeControlBlocked: true,
+            rows: [
+              {
+                endpoint: "A (a.example:443)",
+                expected: "reachable",
+                observed: "reachable",
+                pass: true,
+              },
+              {
+                endpoint: "A (a.example:443)",
+                expected: "reachable",
+                observed: "reachable",
+                pass: true,
+              },
+              {
+                endpoint: "B (b.example:443)",
+                expected: "reachable",
+                observed: "reachable",
+                pass: true,
+              },
+              {
+                endpoint: "negative control (control.example:443)",
+                expected: "blocked",
+                observed: "blocked",
+                pass: true,
+              },
+            ],
+          },
+        } as unknown as CosLivenessOutcome,
+      },
+    });
+
+    expect(out[1]).toContain("CoS liveness unverified");
+    expect(out[1]).not.toMatch(/confined path verified/i);
   });
 
   it("operator-twin stand-down abort does not reuse the re-home restore failure frame", () => {

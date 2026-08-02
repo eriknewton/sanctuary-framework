@@ -1,9 +1,9 @@
 /**
  * CoS round-trip liveness prober, Telegram v1.
  *
- * Scope is deliberately narrow: `cos_liveness_verified` means exactly a
- * confined Telegram round trip. This module does NOT certify brain routing,
- * provider-chain health, model billing, or general Castle Wall enforcement.
+ * Scope is deliberately narrow: this module can produce Telegram round-trip
+ * evidence only. It does NOT certify brain routing, provider-chain health,
+ * model billing, or general Castle Wall enforcement.
  *
  * v1 is mock-proven only. The local mock Bot API can prove the state machine,
  * nonce discipline, reply attribution, timeout, stale-drain behavior, and the

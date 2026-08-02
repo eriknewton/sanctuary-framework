@@ -11,6 +11,9 @@ import { describe, it, expect, vi } from "vitest";
 import {
   runProvisionFlow,
   cosLivenessFromProbeResult,
+  cosLivenessFromReachabilityReport,
+  type CosLivenessOutcome,
+  type CosLivenessReachabilityEvidence,
   describeObservedAgentConfinement,
   describeExclusiveRoutingResidueRefusal,
   exclusiveRoutingResidueRefusal,
@@ -157,6 +160,16 @@ function passingEgressReport() {
   };
 }
 
+function verifiedReachability(): Extract<CosLivenessOutcome, { kind: "cos_liveness_verified" }> {
+  const outcome = cosLivenessFromReachabilityReport(passingEgressReport(), {
+    committedEndpoints: [{ name: "LLM (Venice)", host: "api.venice.ai", port: 443 }],
+  });
+  if (outcome.kind !== "cos_liveness_verified") {
+    throw new Error(`expected verified reachability fixture, got ${outcome.kind}`);
+  }
+  return outcome;
+}
+
 function happyPathOps(overrides: Partial<ProvisionFlowOps> = {}): ProvisionFlowOps {
   return {
     confirm: vi.fn(async () => true),
@@ -259,7 +272,7 @@ describe("castle-wall/provision/orchestrate", () => {
   it("happy path: runs every step in order and arms", async () => {
     const ops = happyPathOps();
     const result = await runProvisionFlow(baseCtx(), ops);
-    expect(result).toEqual({ kind: "armed", uid: AGENT_UID, liveness: UNVERIFIED_NO_CHANNEL });
+    expect(result).toEqual({ kind: "armed", uid: AGENT_UID, liveness: verifiedReachability() });
     expect(ops.createAccount).toHaveBeenCalledTimes(1);
     expect(ops.rehome).toHaveBeenCalledWith(AGENT_UID, AGENT_UID);
     expect(ops.installHarnessDaemon).toHaveBeenCalledWith(AGENT_UID);
@@ -274,7 +287,7 @@ describe("castle-wall/provision/orchestrate", () => {
     const result = await runProvisionFlow(baseCtx({ detectResult: ALREADY_DEDICATED }), ops);
     // Fix F6: this must NEVER short-circuit to a bare "skipped" outcome --
     // it must actually reach arm, exactly like the fresh-provision path.
-    expect(result).toEqual({ kind: "armed", uid: AGENT_UID, liveness: UNVERIFIED_NO_CHANNEL });
+    expect(result).toEqual({ kind: "armed", uid: AGENT_UID, liveness: verifiedReachability() });
     expect(ops.createAccount).not.toHaveBeenCalled();
     expect(ops.rehome).not.toHaveBeenCalled();
     // FIX R4 (HIGH, 2026-07-07 fix-round 2): arming IS a privileged mutation
@@ -354,7 +367,7 @@ describe("castle-wall/provision/orchestrate", () => {
         });
     });
 
-    it("reports verified only from an explicit confined-path round trip", () => {
+    it("Telegram round trips are channel evidence only and can never mint verified liveness", () => {
       expect(
         cosLivenessFromProbeResult({
           kind: "round_trip",
@@ -365,40 +378,219 @@ describe("castle-wall/provision/orchestrate", () => {
           },
         }),
       ).toEqual({
-        kind: "cos_liveness_verified",
-        roundTrip: {
-          channel: "telegram",
-          requestId: "request-1",
-          responseId: "response-1",
+        kind: "cos_liveness_unverified",
+        reason: "channel_round_trip_only",
+        subreason: "telegram_round_trip_not_reachability",
+        evidence: {
+          kind: "roundTrip",
+          roundTrip: {
+            channel: "telegram",
+            requestId: "request-1",
+            responseId: "response-1",
+          },
         },
       });
     });
 
-    it("threads no-channel and provider-failure liveness through the terminal armed outcome", async () => {
-      const noChannel = await runProvisionFlow(baseCtx(), happyPathOps());
-      expect(noChannel).toMatchObject({ kind: "armed", liveness: UNVERIFIED_NO_CHANNEL });
+    it("partial reachability is unverified even if an aggregate report is incorrectly marked ok", () => {
+      const report = passingEgressReport();
+      report.rows[0] = {
+        ...report.rows[0]!,
+        observed: "blocked",
+        pass: false,
+      };
+      report.ok = true;
 
-      const providerFailed = await runProvisionFlow(
-        baseCtx(),
-        happyPathOps({
-          verifyAgentLivenessAfterStandDown: vi.fn(async () => ({
-            kind: "unverified" as const,
-            reason: "provider_failed" as const,
-            detail: "telegram send failed",
-          })),
-        }),
-      );
-      expect(providerFailed).toMatchObject({
+      const outcome = cosLivenessFromReachabilityReport(report);
+
+      expect(outcome).toMatchObject({
+        kind: "cos_liveness_unverified",
+        reason: "declared_endpoints_unreachable",
+      });
+      expect((outcome as { detail?: string }).detail).toContain("LLM (Venice)");
+    });
+
+    it("reachable negative control is unverified even if an aggregate report is incorrectly marked ok", () => {
+      const report = passingEgressReport();
+      report.rows[1] = {
+        ...report.rows[1]!,
+        observed: "reachable",
+        pass: false,
+      };
+      report.ok = true;
+
+      const outcome = cosLivenessFromReachabilityReport(report);
+
+      expect(outcome).toMatchObject({
+        kind: "cos_liveness_unverified",
+        reason: "negative_control_reachable",
+      });
+      expect((outcome as { detail?: string }).detail).toContain("negative control");
+    });
+
+    it("absent committed endpoint rows are unverified even when the partial report self-reports ok", async () => {
+      const committedChecks = [
+        { name: "LLM (Venice)", host: "api.venice.ai", port: 443, allowed: true },
+        { name: "Telegram Bot API", host: "api.telegram.org", port: 443, allowed: true },
+        { name: "Google Workspace MCP (Gmail API)", host: "gmail.googleapis.com", port: 443, allowed: true },
+        { name: "Google Workspace MCP (Calendar API)", host: "calendar-json.googleapis.com", port: 443, allowed: true },
+        { name: "Google OAuth (token refresh)", host: "oauth2.googleapis.com", port: 443, allowed: true },
+        { name: "Google OAuth (account endpoints)", host: "accounts.google.com", port: 443, allowed: true },
+      ];
+      const partialReport = passingEgressReport();
+      partialReport.ok = true;
+      const ops = happyPathOps({
+        provisionEgress: vi.fn(async () => ({
+          ok: true as const,
+          ruleIds: committedChecks.map((check, i) => `provisioned-hermes-${i}`),
+          checks: committedChecks,
+          dnsRulePresent: true,
+        })),
+        verifyAgentEgressAfterArm: vi.fn(async () => partialReport),
+      });
+
+      const result = await runProvisionFlow(baseCtx(), ops);
+
+      expect(result).toMatchObject({
         kind: "armed",
         liveness: {
           kind: "cos_liveness_unverified",
-          reason: "provider_failed",
-          detail: "telegram send failed",
+          reason: "declared_endpoints_unreachable",
+          subreason: "declared_endpoint_rows_absent",
+          evidence: {
+            kind: "reachability",
+            declaredEndpointCount: 6,
+            reachableEndpointCount: 1,
+            negativeControlBlocked: true,
+          },
         },
       });
     });
 
-    it("does not return raw token-file contents when auto-provision renders config parse failures", async () => {
+    it("duplicated reachable rows cannot substitute for a missing committed endpoint", () => {
+      const report = {
+        ok: true,
+        rows: [
+          {
+            name: "A",
+            host: "a.example",
+            port: 443,
+            expected: "reachable" as const,
+            observed: "reachable" as const,
+            pass: true,
+          },
+          {
+            name: "A",
+            host: "a.example",
+            port: 443,
+            expected: "reachable" as const,
+            observed: "reachable" as const,
+            pass: true,
+          },
+          {
+            name: "B",
+            host: "b.example",
+            port: 443,
+            expected: "reachable" as const,
+            observed: "reachable" as const,
+            pass: true,
+          },
+          {
+            name: "negative control",
+            host: "control.example",
+            port: 443,
+            expected: "blocked" as const,
+            observed: "blocked" as const,
+            pass: true,
+          },
+        ],
+      };
+
+      const outcome = cosLivenessFromReachabilityReport(report, {
+        committedEndpoints: [
+          { name: "A", host: "a.example", port: 443 },
+          { name: "B", host: "b.example", port: 443 },
+          { name: "C", host: "c.example", port: 443 },
+        ],
+      });
+
+      expect(outcome).toMatchObject({
+        kind: "cos_liveness_unverified",
+        reason: "declared_endpoints_unreachable",
+      });
+      expect((outcome as { detail?: string }).detail).toContain("C");
+    });
+
+    it("a missing committed endpoint count is unverified, never inferred from report rows", () => {
+      const outcome = (cosLivenessFromReachabilityReport as (...args: unknown[]) => CosLivenessOutcome)(
+        passingEgressReport(),
+      );
+
+      expect(outcome).toMatchObject({
+        kind: "cos_liveness_unverified",
+        reason: "declared_endpoints_unreachable",
+        subreason: "committed_endpoint_count_unavailable",
+      });
+    });
+
+    it("a throwing as-uid liveness probe weakens only the liveness claim and preserves the normal provision outcome", async () => {
+      const ops = happyPathOps({
+        verifyAgentEgressAfterArm: vi.fn(async () => {
+          throw new Error("sudo probe unavailable");
+        }),
+      });
+
+      await expect(runProvisionFlow(baseCtx(), ops)).resolves.toMatchObject({
+        kind: "armed",
+        uid: AGENT_UID,
+        liveness: {
+          kind: "cos_liveness_unverified",
+          reason: "network_unavailable",
+          subreason: "agent_egress_probe_unavailable",
+        },
+      });
+      expect(ops.standDownOperatorTwin).toHaveBeenCalledTimes(1);
+    });
+
+    it("retargets the terminal armed liveness outcome to the verified as-uid reachability differential", async () => {
+      const verifyAgentLivenessAfterStandDown = vi.fn(async () => undefined);
+      const result = await runProvisionFlow(
+        baseCtx(),
+        happyPathOps({ verifyAgentLivenessAfterStandDown }),
+      );
+
+      expect(result).toMatchObject({
+        kind: "armed",
+        liveness: {
+          kind: "cos_liveness_verified",
+          evidence: {
+            kind: "reachability",
+            declaredEndpointCount: 1,
+            reachableEndpointCount: 1,
+            negativeControlBlocked: true,
+          },
+        },
+      });
+      expect(verifyAgentLivenessAfterStandDown).not.toHaveBeenCalled();
+      const evidence = (result as Extract<typeof result, { kind: "armed" }>).liveness
+        .evidence as CosLivenessReachabilityEvidence;
+      expect(evidence.rows).toEqual([
+        {
+          endpoint: "LLM (Venice) (api.venice.ai:443)",
+          expected: "reachable",
+          observed: "reachable",
+          pass: true,
+        },
+        {
+          endpoint: "negative control (non-listed host must be blocked) (example.com:443)",
+          expected: "blocked",
+          observed: "blocked",
+          pass: true,
+        },
+      ]);
+    });
+
+    it("keeps dormant Telegram config parse failures sanitized", () => {
       const distinctiveSecret = "AUTO_PROVISION_LIVENESS_CONFIG_SECRET_2e3459";
       let configError: Error | undefined;
       try {
@@ -407,19 +599,9 @@ describe("castle-wall/provision/orchestrate", () => {
         configError = err as Error;
       }
       expect(configError).toBeDefined();
-
-      const result = await runProvisionFlow(
-        baseCtx(),
-        happyPathOps({
-          verifyAgentLivenessAfterStandDown: vi.fn(async () => {
-            throw configError;
-          }),
-        }),
-      );
-      const serialized = JSON.stringify(result);
-      expect(serialized).toContain("config_malformed");
-      expect(serialized).not.toContain(distinctiveSecret);
-      expect(serialized).not.toMatch(/Unexpected token|not valid JSON|JSON\.parse/i);
+      expect(configError!.message).toContain("config_malformed");
+      expect(configError!.message).not.toContain(distinctiveSecret);
+      expect(configError!.message).not.toMatch(/Unexpected token|not valid JSON|JSON\.parse/i);
     });
   });
 
@@ -879,7 +1061,7 @@ describe("castle-wall/provision/orchestrate", () => {
     it("happy path calls ensurePolicyDaemon with ctx.fortressPath BEFORE the harness install and before arm, still arms, tears down nothing", async () => {
       const ops = happyPathOps();
       const result = await runProvisionFlow(baseCtx(), ops);
-      expect(result).toEqual({ kind: "armed", uid: AGENT_UID, liveness: UNVERIFIED_NO_CHANNEL });
+      expect(result).toEqual({ kind: "armed", uid: AGENT_UID, liveness: verifiedReachability() });
       expect(ops.ensurePolicyDaemon).toHaveBeenCalledWith(FORTRESS_PATH);
       // ORDER CHANGE (drill-D2 fix-round, 2026-07-18): the policy daemon is
       // now ensured BEFORE the harness install, not after it. In fine-grained
@@ -903,7 +1085,7 @@ describe("castle-wall/provision/orchestrate", () => {
         ensurePolicyDaemon: vi.fn(async () => ({ ok: true as const, freshlyInstalled: true })),
       });
       const result = await runProvisionFlow(baseCtx(), ops);
-      expect(result).toEqual({ kind: "armed", uid: AGENT_UID, liveness: UNVERIFIED_NO_CHANNEL });
+      expect(result).toEqual({ kind: "armed", uid: AGENT_UID, liveness: verifiedReachability() });
       expect(ops.teardownPolicyDaemon).not.toHaveBeenCalled();
     });
 
@@ -1130,7 +1312,7 @@ describe("castle-wall/provision/orchestrate", () => {
     it("happy path: provisionEgress runs AFTER ensure-policy-daemon and BEFORE arm; as-uid verify runs AFTER arm; egress_provisioned is audited with the rule ids", async () => {
       const ops = happyPathOps();
       const result = await runProvisionFlow(baseCtx(), ops);
-      expect(result).toEqual({ kind: "armed", uid: AGENT_UID, liveness: UNVERIFIED_NO_CHANNEL });
+      expect(result).toEqual({ kind: "armed", uid: AGENT_UID, liveness: verifiedReachability() });
       const order = (fn: unknown) => (fn as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
       expect(order(ops.ensurePolicyDaemon)).toBeLessThan(order(ops.provisionEgress));
       expect(order(ops.provisionEgress)).toBeLessThan(order(ops.arm));
@@ -1613,7 +1795,7 @@ describe("castle-wall/provision/orchestrate", () => {
         kind: "armed-exclusive",
         uid: AGENT_UID,
         generationId: COMMITTED.generation_id,
-        liveness: UNVERIFIED_NO_CHANNEL,
+        liveness: verifiedReachability(),
       });
       // The twin stand-down runs after post-arm as-uid egress evidence and
       // before the liveness-bearing exclusive stage.
@@ -1645,7 +1827,7 @@ describe("castle-wall/provision/orchestrate", () => {
         uid: AGENT_UID,
         generationId: COMMITTED.generation_id,
         reparkError: "launchctl disable exited 1",
-        liveness: UNVERIFIED_NO_CHANNEL,
+        liveness: verifiedReachability(),
       });
     });
 
@@ -1701,7 +1883,7 @@ describe("castle-wall/provision/orchestrate", () => {
         installHarnessDaemon: vi.fn(async () => ({ ok: true as const, bootstrappedThisRun: true })),
       });
       const result = await runProvisionFlow(baseCtx(), ops);
-      expect(result).toEqual({ kind: "armed", uid: AGENT_UID, liveness: UNVERIFIED_NO_CHANNEL });
+      expect(result).toEqual({ kind: "armed", uid: AGENT_UID, liveness: verifiedReachability() });
       expect(exclusive.bringUpGeneration).not.toHaveBeenCalled();
     });
 
@@ -1720,7 +1902,7 @@ describe("castle-wall/provision/orchestrate", () => {
         kind: "armed-exclusive",
         uid: AGENT_UID,
         generationId: COMMITTED.generation_id,
-        liveness: UNVERIFIED_NO_CHANNEL,
+        liveness: verifiedReachability(),
       });
       const residue = ops.reconcileExclusiveRoutingResidue as ReturnType<typeof vi.fn>;
       // Judged once, cleared once.
@@ -1795,7 +1977,7 @@ describe("castle-wall/provision/orchestrate", () => {
     it("REGRESSION (coarse): a run with NO exclusive mode declared and NO exclusive ops wired STILL runs the residue gate", async () => {
       const ops = happyPathOps();
       const result = await runProvisionFlow(baseCtx(), ops);
-      expect(result).toEqual({ kind: "armed", uid: AGENT_UID, liveness: UNVERIFIED_NO_CHANNEL });
+      expect(result).toEqual({ kind: "armed", uid: AGENT_UID, liveness: verifiedReachability() });
       // Pre-fix this op did not exist on the coarse path at all: the self-heal
       // was gated on a mode the wedging component (the signing daemon) does
       // not read. With no marker on disk the judgement is the only call.
@@ -1859,7 +2041,7 @@ describe("castle-wall/provision/orchestrate", () => {
       const printed: string[] = [];
       (ops as { print: (line: string) => void }).print = (line: string) => printed.push(line);
       const result = await runProvisionFlow(baseCtx(), ops);
-      expect(result).toEqual({ kind: "armed", uid: AGENT_UID, liveness: UNVERIFIED_NO_CHANNEL });
+      expect(result).toEqual({ kind: "armed", uid: AGENT_UID, liveness: verifiedReachability() });
       // The removal is NAMED before the confirm, so the operator's yes covers it.
       expect(printed.join("\n")).toMatch(/will be cleared if you proceed/);
       // FIX F7: the flow does NOT re-print the self-heal fact. The production
