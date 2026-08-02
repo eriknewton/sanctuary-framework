@@ -23,10 +23,12 @@ import {
   type DashboardServerOptions,
 } from "./server.js";
 import type { ApprovalHandlers } from "./api.js";
+import { composeAggregatorSources } from "./aggregator.js";
 import type { FleetRoster } from "../principal-policy/fleet-roster.js";
 import type { ResolvedEnforcementAvailability } from "../castle-wall/runtime/enforcement-availability.js";
 
-export { getProtectionSnapshot } from "./aggregator.js";
+export { getProtectionSnapshot, composeAggregatorSources } from "./aggregator.js";
+export type { AggregatorSourcesInput } from "./aggregator.js";
 export { renderDashboardHTML, HERO_COPY } from "./html.js";
 export { handleRequest, isAuthorized, extractToken, constantTimeEquals } from "./api.js";
 export { startDashboardServer } from "./server.js";
@@ -140,43 +142,34 @@ export async function startDashboard(
     ? [...options.initialPendingApprovals]
     : [];
 
-  const sources = {
+  // Dashboard-fold PR-1: the sources bundle is assembled by the ONE shared
+  // builder (`composeAggregatorSources`), so this call site and the
+  // principal-policy dashboard's snapshot path share identical include-or-omit
+  // semantics. The producer-key threading (HIGH never-overclaim fix, seam #2)
+  // is unchanged: the resolver rides through by identity so a forged
+  // marker-only entry on a key-bearing host still fails closed to amber.
+  const sources = composeAggregatorSources({
     mode: options.mode,
-    server_version: options.serverVersion,
-    ...(options.auditLog ? { auditLog: options.auditLog } : {}),
-    ...(options.identityManager ? { identityManager: options.identityManager } : {}),
-    ...(options.clientManager ? { clientManager: options.clientManager } : {}),
-    ...(options.baseline ? { baseline: options.baseline } : {}),
-    ...(options.policy ? { policy: options.policy } : {}),
-    ...(options.reputation ? { reputation: options.reputation } : {}),
-    ...(options.teeAvailable != null ? { teeAvailable: options.teeAvailable } : {}),
-    ...(options.l4Evidence ? { l4Evidence: options.l4Evidence } : {}),
-    // HIGH never-overclaim fix (seam #2): thread the producer-key re-verification
-    // basis into the snapshot sources the same way the DashboardApprovalChannel
-    // path does, so a forged marker-only entry on a key-bearing host fails closed
-    // to amber here too. Absent on macOS / pre-provision → channel basis (honest).
-    ...(options.resolvePinnedProducerKey
-      ? { resolvePinnedProducerKey: options.resolvePinnedProducerKey }
-      : {}),
-    ...(options.producerKeyExpectedButUnavailable
-      ? { producerKeyExpectedButUnavailable: true }
-      : {}),
-    ...(options.resolveBrokerPinnedProducerKey
-      ? { resolveBrokerPinnedProducerKey: options.resolveBrokerPinnedProducerKey }
-      : {}),
-    ...(options.brokerProducerKeyExpectedButUnavailable
-      ? { brokerProducerKeyExpectedButUnavailable: true }
-      : {}),
-    ...(options.resolveProtectionClaimSubject
-      ? { resolveProtectionClaimSubject: options.resolveProtectionClaimSubject }
-      : {}),
-    ...(options.platform !== undefined ? { platform: options.platform } : {}),
-    ...(options.resolveEnforcementAvailability
-      ? { resolveEnforcementAvailability: options.resolveEnforcementAvailability }
-      : {}),
+    serverVersion: options.serverVersion,
+    auditLog: options.auditLog,
+    identityManager: options.identityManager,
+    clientManager: options.clientManager,
+    baseline: options.baseline,
+    policy: options.policy,
+    reputation: options.reputation,
+    teeAvailable: options.teeAvailable,
+    l4Evidence: options.l4Evidence,
+    resolvePinnedProducerKey: options.resolvePinnedProducerKey,
+    producerKeyExpectedButUnavailable: options.producerKeyExpectedButUnavailable,
+    resolveBrokerPinnedProducerKey: options.resolveBrokerPinnedProducerKey,
+    brokerProducerKeyExpectedButUnavailable:
+      options.brokerProducerKeyExpectedButUnavailable,
+    resolveProtectionClaimSubject: options.resolveProtectionClaimSubject,
+    platform: options.platform,
+    resolveEnforcementAvailability: options.resolveEnforcementAvailability,
     activity,
     pendingApprovals: pending,
-  };
+  });
 
   const serverOpts: DashboardServerOptions = {
     mode: options.mode,

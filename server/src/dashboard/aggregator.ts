@@ -256,6 +256,109 @@ export interface AggregatorSources {
 }
 
 /**
+ * Input bag for {@link composeAggregatorSources}. Field-for-field mirror of
+ * {@link AggregatorSources} except every optional field explicitly admits
+ * `undefined`/`null` so call sites can pass their possibly-unset dependencies
+ * straight through and let the ONE builder own the include-or-omit decision.
+ */
+export interface AggregatorSourcesInput {
+  mode: "co-located" | "standalone";
+  serverVersion: string;
+  identityManager?: IdentityManager | null | undefined;
+  auditLog?: AuditLog | null | undefined;
+  clientManager?: ClientManager | null | undefined;
+  baseline?: BaselineTracker | null | undefined;
+  policy?: PrincipalPolicy | null | undefined;
+  reputation?: ReputationLookup | null | undefined;
+  teeAvailable?: boolean | null | undefined;
+  l4Evidence?: ReputationEvidence | null | undefined;
+  platform?: NodeJS.Platform | undefined;
+  resolvePinnedProducerKey?: (() => string | null) | undefined;
+  producerKeyExpectedButUnavailable?: boolean | undefined;
+  resolveBrokerPinnedProducerKey?: (() => string | null) | undefined;
+  brokerProducerKeyExpectedButUnavailable?: boolean | undefined;
+  resolveExclusiveEgressPosture?:
+    | (() => Promise<ExclusiveEgressStatus | null>)
+    | undefined;
+  resolveProtectionClaimSubject?:
+    | (() => string | null | Promise<string | null>)
+    | undefined;
+  resolveEnforcementAvailability?:
+    | (() =>
+        | Promise<ResolvedEnforcementAvailability>
+        | ResolvedEnforcementAvailability)
+    | undefined;
+  activity?: ActivityEntry[] | undefined;
+  pendingApprovals?: PendingApproval[] | undefined;
+}
+
+/**
+ * Dashboard-fold PR-1: the ONE AggregatorSources construction site.
+ *
+ * Before this builder existed the sources bundle was hand-assembled in two
+ * places with subtly different conditional-spread rules (`dashboard/index.ts`
+ * `startDashboard` for the wrap-auto server, and the principal-policy
+ * dashboard's private `buildAggregatorSources` for the standalone/MCP-boot
+ * server). Both now call this function, so the include-or-omit semantics for
+ * every field live in exactly one place:
+ *
+ *  - object/function fields are included iff TRUTHY (matching both prior
+ *    sites' `...(x ? { x } : {})` spreads);
+ *  - `teeAvailable` is included iff `!= null` (false is a real answer);
+ *  - the two `...ExpectedButUnavailable` flags are included iff `true`
+ *    (an absent flag and a false flag mean the same honest thing);
+ *  - `platform` is included iff `!== undefined`;
+ *  - `activity`/`pendingApprovals` are included iff provided (an empty
+ *    array is a real, present value).
+ *
+ * Pure construction: no I/O, no defaulting beyond the rules above, function
+ * references pass through by identity (so callers can assert exactly which
+ * resolver a snapshot server is armed with).
+ */
+export function composeAggregatorSources(
+  input: AggregatorSourcesInput,
+): AggregatorSources {
+  return {
+    mode: input.mode,
+    server_version: input.serverVersion,
+    ...(input.identityManager ? { identityManager: input.identityManager } : {}),
+    ...(input.auditLog ? { auditLog: input.auditLog } : {}),
+    ...(input.clientManager ? { clientManager: input.clientManager } : {}),
+    ...(input.baseline ? { baseline: input.baseline } : {}),
+    ...(input.policy ? { policy: input.policy } : {}),
+    ...(input.reputation ? { reputation: input.reputation } : {}),
+    ...(input.teeAvailable != null ? { teeAvailable: input.teeAvailable } : {}),
+    ...(input.l4Evidence ? { l4Evidence: input.l4Evidence } : {}),
+    ...(input.platform !== undefined ? { platform: input.platform } : {}),
+    ...(input.resolvePinnedProducerKey
+      ? { resolvePinnedProducerKey: input.resolvePinnedProducerKey }
+      : {}),
+    ...(input.producerKeyExpectedButUnavailable
+      ? { producerKeyExpectedButUnavailable: true }
+      : {}),
+    ...(input.resolveBrokerPinnedProducerKey
+      ? { resolveBrokerPinnedProducerKey: input.resolveBrokerPinnedProducerKey }
+      : {}),
+    ...(input.brokerProducerKeyExpectedButUnavailable
+      ? { brokerProducerKeyExpectedButUnavailable: true }
+      : {}),
+    ...(input.resolveExclusiveEgressPosture
+      ? { resolveExclusiveEgressPosture: input.resolveExclusiveEgressPosture }
+      : {}),
+    ...(input.resolveProtectionClaimSubject
+      ? { resolveProtectionClaimSubject: input.resolveProtectionClaimSubject }
+      : {}),
+    ...(input.resolveEnforcementAvailability
+      ? { resolveEnforcementAvailability: input.resolveEnforcementAvailability }
+      : {}),
+    ...(input.activity ? { activity: input.activity } : {}),
+    ...(input.pendingApprovals
+      ? { pendingApprovals: input.pendingApprovals }
+      : {}),
+  };
+}
+
+/**
  * Severity → point impact for the SHR L4 layer score. Mirrors the
  * gateway-adapter DEGRADATION_IMPACT table so the dashboard and the SHR
  * gateway export agree on the number.
