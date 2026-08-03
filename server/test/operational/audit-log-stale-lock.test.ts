@@ -359,8 +359,28 @@ describe("AuditLog write-lock robustness (#944 cluster)", () => {
     const root = await mkdtemp(join(tmpdir(), "sanctuary-audit-lock-robust-"));
     dirs.push(root);
     const storagePath = join(root, "state");
+    // These tests pre-create the `_audit` namespace dir (below) owned by the
+    // CURRENT user, and use a SYNTHETIC `createOwner` (OWNER={501,20}) purely to
+    // assert the LOCK-FILE chown is applied. PR #1084's F2 deep-walk added a
+    // real-lstat directory-ownership precondition that would refuse whenever the
+    // host uid differs from the synthetic owner (passes on a 501/20 macOS box,
+    // fails on a Linux CI runner). Present the namespace dir as owner-matched so
+    // these lock-file tests stay decoupled from the host uid; the directory-walk
+    // behavior itself is covered by audit-log-namespace-dir-owner.test.ts.
+    const createOwner = (config as { createOwner?: { uid: number; gid: number } } | undefined)
+      ?.createOwner;
     const log = new AuditLog(new FilesystemStorage(storagePath), generateRandomKey(), {
       integrityMode: "lenient",
+      ...(createOwner !== undefined
+        ? {
+            namespaceDirLstat: async () => ({
+              uid: createOwner.uid,
+              gid: createOwner.gid,
+              isSymbolicLink: () => false,
+              isDirectory: () => true,
+            }),
+          }
+        : {}),
       ...config,
     });
     const lockPath = join(storagePath, "_audit", ".audit-write.lock");
