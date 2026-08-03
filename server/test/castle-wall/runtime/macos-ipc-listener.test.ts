@@ -30,12 +30,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ed25519 } from "@noble/curves/ed25519";
 
-import { canonicalize } from "../../../src/mesh/canonical-json.js";
 import { frame, parseFrame } from "../../../src/castle-wall/ipc/framing.js";
 import type {
   CastleWallMessage,
-  EnforcementAvailabilityReportNotification,
-  EnforcementAvailabilitySnapshot,
   FlowDecisionRecordedNotification,
   FlowPendingApprovalNotification,
   ManifestSubscribeRequest,
@@ -48,18 +45,15 @@ import {
   type MacOSManifestProvider,
 } from "../../../src/castle-wall/runtime/index.js";
 import {
-  producerSigningBytes,
   toBase64url,
 } from "../../../src/castle-wall/runtime/producer-signature.js";
-import {
-  CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1,
-} from "../../../src/castle-wall/constants.js";
-import {
-  ENFORCEMENT_AVAILABILITY_REPORT_OPERATION,
-} from "../../../src/castle-wall/runtime/enforcement-availability.js";
 import { protectionSubjectForUid } from "../../../src/castle-wall/subject-binding.js";
 import type { AllowlistRule } from "../../../src/castle-wall/allowlist/schema.js";
 import type { SignedManifest } from "../../../src/castle-wall/allowlist/manifest.js";
+import {
+  availabilitySnapshot,
+  signAvailabilityReport,
+} from "./availability-report-helper.js";
 
 const FORTRESS_ID = "fortress-test";
 
@@ -179,74 +173,6 @@ function envelope(message: CastleWallMessage): Uint8Array {
       params: message,
     }),
   );
-}
-
-function availabilitySnapshot(
-  overrides: Partial<EnforcementAvailabilitySnapshot> = {},
-): EnforcementAvailabilitySnapshot {
-  return {
-    protocol_version: 1,
-    source: "macos_extension",
-    lease_state: "live",
-    lease_reason: "ok",
-    manifest_state: "applied",
-    manifest_signature_b64url: "manifest-sig",
-    provider_bound: true,
-    producer_claimed_at: "1970-01-01T00:00:00.000Z",
-    ...overrides,
-  };
-}
-
-function availabilityIsGreen(snapshot: EnforcementAvailabilitySnapshot): boolean {
-  return (
-    snapshot.protocol_version === 1 &&
-    snapshot.source === "macos_extension" &&
-    snapshot.lease_state === "live" &&
-    snapshot.lease_reason === "ok" &&
-    snapshot.manifest_state === "applied" &&
-    typeof snapshot.manifest_signature_b64url === "string" &&
-    snapshot.provider_bound === true
-  );
-}
-
-function signAvailabilityReport(input: {
-  visibleReport: EnforcementAvailabilitySnapshot;
-  privateKey: Uint8Array;
-  seq?: number;
-  capturedAtUnixMs?: number;
-}): EnforcementAvailabilityReportNotification {
-  const seq = input.seq ?? 0;
-  const capturedAtUnixMs = input.capturedAtUnixMs ?? 1_780_000_000_000;
-  const eventCanonicalJson = canonicalize({
-    timestamp:
-      input.visibleReport.producer_claimed_at ??
-      new Date(capturedAtUnixMs).toISOString(),
-    layer: "l1",
-    operation: ENFORCEMENT_AVAILABILITY_REPORT_OPERATION,
-    identity_id: FORTRESS_ID,
-    result: availabilityIsGreen(input.visibleReport) ? "success" : "failure",
-    details: {
-      seq,
-      prior_sha256_hex: null,
-      enforcement: input.visibleReport,
-    },
-  });
-  const signature = ed25519.sign(
-    producerSigningBytes(eventCanonicalJson, capturedAtUnixMs, seq),
-    input.privateKey,
-  );
-  return {
-    type: "enforcement_availability_report",
-    enforcement: input.visibleReport,
-    producer: {
-      event_canonical_json: eventCanonicalJson,
-      captured_at_unix_ms: capturedAtUnixMs,
-      seq,
-      prior_sha256_hex: null,
-      signature_b64url: toBase64url(signature),
-      key_id: CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1,
-    },
-  };
 }
 
 /**
@@ -775,6 +701,33 @@ describe("MacOSFlowIpcListener", () => {
     // Allow event-loop drain for the close event to fire.
     await new Promise((r) => setTimeout(r, 50));
     expect(h.listener.getStats().activeConnections).toBe(0);
+  });
+
+  it("recycles a subscriber connection through socket close and counts it", async () => {
+    const h = await newHarness();
+    registerHarness(h);
+    const registerSpy = vi.spyOn(h.consumer, "registerSubscriber");
+    const { socket, buf } = await connectClient(h.socketPath);
+    track(socket);
+    await nextMessage(buf);
+    socket.write(envelope({ type: "manifest_subscribe", request_id: "req-recycle" }));
+    await nextMessage(buf);
+
+    const subscriberId = registerSpy.mock.calls[0]?.[0]?.subscriberId;
+    expect(subscriberId).toMatch(/^[0-9a-f]+$/);
+    expect(h.listener.recycleConnection("missing-subscriber", "test")).toBe(false);
+    expect(h.listener.getStats().connectionsRecycled).toBe(0);
+
+    const closeObserved = new Promise<void>((resolve) => {
+      socket.once("close", () => resolve());
+    });
+    expect(h.listener.recycleConnection(subscriberId!, "test_recycle")).toBe(true);
+    await closeObserved;
+    await tick();
+
+    expect(h.listener.getStats().connectionsRecycled).toBe(1);
+    expect(h.listener.getStats().activeConnections).toBe(0);
+    expect(h.consumer.getStats().subscribers).toBe(0);
   });
 
   it("broadcastManifestUpdate fans out to every active subscriber", async () => {

@@ -1,3 +1,4 @@
+// fail-before-exempt: type-forced stub only — this PR's delta adds an inert recycleConnection() to the fake listener because MacOSCastleWallListenerHandle widened; nothing this file locks changed here. The behavior change fails-before in lease-delivery-watchdog.test.ts (W1/W4/W6 RED on base).
 /**
  * Castle Wall macOS daemon — policy-reload hang-guard tests.
  *
@@ -150,6 +151,9 @@ describe("Castle Wall macOS daemon — policy reload hang guard", () => {
       },
       async broadcastArmLease() {
         return 0;
+      },
+      recycleConnection() {
+        return false;
       },
     });
     return {

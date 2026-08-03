@@ -1,3 +1,4 @@
+// fail-before-exempt: type-forced stub only — the fake listener gains an inert recycleConnection() because MacOSCastleWallListenerHandle widened in this PR; nothing this file locks changed. The behavior change fails-before in lease-delivery-watchdog.test.ts (W1/W4/W6 RED on base).
 import { afterEach, describe, expect, it } from "vitest";
 import { mkdir, mkdtemp, rm, stat, symlink } from "node:fs/promises";
 import { createServer, type Socket } from "node:net";
@@ -351,6 +352,9 @@ function realFakeListener(
     },
     async broadcastArmLease() {
       return 0;
+    },
+    recycleConnection() {
+      return false;
     },
   };
 }

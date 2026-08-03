@@ -1,3 +1,4 @@
+// fail-before-exempt: type-forced stub only — the fake listener gains an inert recycleConnection() because MacOSCastleWallListenerHandle widened in this PR; nothing this file locks changed. The behavior change fails-before in lease-delivery-watchdog.test.ts (W1/W4/W6 RED on base).
 import { afterEach, describe, expect, it } from "vitest";
 import { mkdtemp, readFile, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { createConnection, createServer, type Socket } from "node:net";
@@ -128,6 +129,9 @@ describe("Castle Wall macOS daemon integration", () => {
       },
       async broadcastArmLease() {
         return 0;
+      },
+      recycleConnection() {
+        return false;
       },
     };
   }
@@ -294,6 +298,9 @@ describe("Castle Wall macOS daemon integration", () => {
             broadcasts.push(lease);
             return 0;
           },
+          recycleConnection() {
+            return false;
+          },
         };
       },
     });
@@ -364,6 +371,9 @@ describe("Castle Wall macOS daemon integration", () => {
           async broadcastArmLease(lease: ArmLeaseNotification) {
             broadcasts.push(lease);
             return 0;
+          },
+          recycleConnection() {
+            return false;
           },
         };
       },
@@ -444,6 +454,9 @@ describe("Castle Wall macOS daemon integration", () => {
           async broadcastArmLease(lease: ArmLeaseNotification) {
             broadcasts.push(lease);
             return 0;
+          },
+          recycleConnection() {
+            return false;
           },
         };
       },

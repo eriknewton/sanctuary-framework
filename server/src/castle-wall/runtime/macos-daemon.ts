@@ -42,6 +42,7 @@ import type { SignedManifest } from "../allowlist/manifest.js";
 import type {
   ArmLeaseNotification,
   DecisionResponse,
+  EnforcementAvailabilitySnapshot,
   PolicyReloadRequest,
   PolicyReloadResponse,
 } from "../ipc/messages.js";
@@ -158,6 +159,33 @@ export const CASTLE_WALL_DEFAULT_AGENT_EGRESS_PROBE_INTERVAL_SECONDS = 21_600 as
  * onset.
  */
 export const CASTLE_WALL_DEFAULT_EMISSION_LIVENESS_TICK_SECONDS = 15 as const;
+
+export const CASTLE_WALL_DEFAULT_LEASE_DELIVERY_CONTRADICTION_THRESHOLD = 6 as const;
+
+function sanitizeLeaseDeliveryLogValue(value: string): string {
+  let sanitized = "";
+  for (const ch of value) {
+    const code = ch.charCodeAt(0);
+    if (!((code >= 0x00 && code <= 0x1f) || (code >= 0x7f && code <= 0x9f))) {
+      sanitized += ch;
+      continue;
+    }
+    switch (ch) {
+      case "\n":
+        sanitized += "\\n";
+        break;
+      case "\r":
+        sanitized += "\\r";
+        break;
+      case "\t":
+        sanitized += "\\t";
+        break;
+      default:
+        sanitized += `\\x${code.toString(16).padStart(2, "0")}`;
+    }
+  }
+  return sanitized;
+}
 
 /**
  * Resolve the as-agent-uid egress probe: the injected one (tests), else the
@@ -356,6 +384,13 @@ export interface MacOSCastleWallDaemonInput {
    */
   emissionLivenessTickSeconds?: number;
   /**
+   * Number of consecutive verified extension availability reports that may
+   * contradict the daemon's active arm-lease broadcast before the daemon
+   * recycles that IPC connection through reconnect/resubscribe recovery.
+   * Defaults to {@link CASTLE_WALL_DEFAULT_LEASE_DELIVERY_CONTRADICTION_THRESHOLD}.
+   */
+  leaseDeliveryContradictionThreshold?: number;
+  /**
    * Backstop deadline (ms) for the compose+sign phase of a `policy_reload`
    * (drill-found hang guard, 2026-07-12). Bounds custody reads + compose + the
    * helper re-sign so the reload can NEVER exceed the client's request deadline
@@ -398,6 +433,7 @@ export interface MacOSCastleWallListenerHandle {
   broadcastManifestUpdate(): Promise<number>;
   broadcastDecisionResponse(response: DecisionResponse): Promise<number>;
   broadcastArmLease(lease: ArmLeaseNotification): Promise<number>;
+  recycleConnection(subscriberId: string, reason: string): boolean;
 }
 
 export interface MacOSCastleWallDaemonHandle {
@@ -807,6 +843,20 @@ export async function startMacOSCastleWallDaemon(
       )})`,
     );
   }
+  const leaseDeliveryContradictionThreshold =
+    input.leaseDeliveryContradictionThreshold ??
+    CASTLE_WALL_DEFAULT_LEASE_DELIVERY_CONTRADICTION_THRESHOLD;
+  if (
+    !Number.isFinite(leaseDeliveryContradictionThreshold) ||
+    !Number.isInteger(leaseDeliveryContradictionThreshold) ||
+    leaseDeliveryContradictionThreshold <= 0
+  ) {
+    throw new Error(
+      `startMacOSCastleWallDaemon: leaseDeliveryContradictionThreshold must be a positive finite integer (got ${String(
+        input.leaseDeliveryContradictionThreshold,
+      )})`,
+    );
+  }
   let emissionLivenessTimer: NodeJS.Timeout | undefined;
   const stopEmissionLivenessTimer = (): void => {
     if (!emissionLivenessTimer) return;
@@ -822,6 +872,80 @@ export async function startMacOSCastleWallDaemon(
   // emission promise, so nothing observed after a revoke may mature into a
   // stall alarm (fix-round MED). A fresh operator arm clears it.
   let armLeaseRevoked = false;
+  const leaseDeliveryContradictions = new Map<string, number>();
+  let leaseDeliveryRecycles = 0;
+  let listener: MacOSCastleWallListenerHandle | null = null;
+  /**
+   * Lease-delivery watchdog (mini2 finding, 2026-08-03): on 2026-08-01 the
+   * daemon spent 2h09m broadcasting armed leases while the same connected
+   * extension kept sending verified `heartbeat_stopped` reports, so the wall
+   * was wrong-allow until chance reconnect. The clean-disconnect c26 shape is
+   * explicitly OUT: no connection means no verified reports and no counting,
+   * and the existing reconnect/resubscribe path already self-recovers it.
+   */
+  const noteVerifiedAvailabilityReport = (
+    subscriberId: string,
+    snapshot: EnforcementAvailabilitySnapshot,
+  ): void => {
+    try {
+      const deliveringArmedLease =
+        leaseHeartbeat !== undefined && !leaseExpired && !armLeaseRevoked;
+      if (!deliveringArmedLease) {
+        leaseDeliveryContradictions.delete(subscriberId);
+        return;
+      }
+      if (
+        snapshot.lease_reason !== "arm_lease_missing" &&
+        snapshot.lease_reason !== "heartbeat_stopped"
+      ) {
+        leaseDeliveryContradictions.delete(subscriberId);
+        return;
+      }
+      const consecutive =
+        (leaseDeliveryContradictions.get(subscriberId) ?? 0) + 1;
+      leaseDeliveryContradictions.set(subscriberId, consecutive);
+      if (consecutive < leaseDeliveryContradictionThreshold) {
+        return;
+      }
+
+      // `subscriberId` is generated as hex by the listener, and
+      // `lease_reason` is enum-validated upstream; keep the same defensive
+      // control-character escaping pattern used by the listener logs anyway.
+      const safeSubscriber = sanitizeLeaseDeliveryLogValue(subscriberId);
+      const safeReason = sanitizeLeaseDeliveryLogValue(snapshot.lease_reason);
+      // SAFETY: the loud reason-coded operator line fires FIRST,
+      // unconditionally, before the recycle (AGENTS.md constraint 5).
+      console.error(
+        `[castle-wall] LEASE-DELIVERY-WEDGE reason=lease_delivery_wedge subscriber=${safeSubscriber} lease_reason=${safeReason} consecutive=${consecutive} action=recycle_connection`,
+      );
+      const recycled =
+        listener?.recycleConnection(subscriberId, "lease_delivery_wedge") ??
+        false;
+      if (recycled) {
+        // Count ONLY actual recycles so the heartbeat's
+        // `lease_delivery_recycles` field stays literally true (gate finding,
+        // PR #1086): a wedge that fired after the connection was already gone
+        // is fully diagnosable from the skipped line below without inflating
+        // the recycle count.
+        leaseDeliveryRecycles += 1;
+      } else {
+        // SAFETY: operator-facing stderr; the wedge fired but the connection
+        // was already gone, which must stay diagnosable.
+        console.error(
+          `[castle-wall] LEASE-DELIVERY-WEDGE reason=lease_delivery_wedge subscriber=${safeSubscriber} lease_reason=${safeReason} consecutive=${consecutive} action=recycle_skipped_connection_gone`,
+        );
+      }
+      leaseDeliveryContradictions.delete(subscriberId);
+    } catch (err) {
+      // SAFETY: the watchdog bounds a wrong-allow window but must never crash
+      // the daemon or mutate enforcement on its own failure.
+      console.error(
+        `[castle-wall] LEASE-DELIVERY-WEDGE watchdog_error=${sanitizeLeaseDeliveryLogValue(
+          err instanceof Error ? err.message : String(err),
+        )}`,
+      );
+    }
+  };
   // Idempotent starter so the tick timer can be resumed after a revoke
   // stopped it (mirror of restartLeaseHeartbeat). Defined here, first started
   // in the startup try-block below.
@@ -948,6 +1072,13 @@ export async function startMacOSCastleWallDaemon(
     pinnedProducerKeyB64url: auditProducerKey?.keyB64url ?? null,
     fortressId: input.fortressId,
     emissionLiveness: emissionLivenessWatchdog,
+    onVerifiedAvailabilityReport: noteVerifiedAvailabilityReport,
+    // Per-connection watchdog state dies with the connection: without this, a
+    // below-threshold contradiction count survived a clean disconnect and
+    // fired early on a later connection reusing the id (gate-found, PR #1086).
+    onSubscriberUnregistered: (subscriberId) => {
+      leaseDeliveryContradictions.delete(subscriberId);
+    },
   });
 
   const listenerOptions: MacOSCastleWallListenerOptions = {
@@ -972,7 +1103,7 @@ export async function startMacOSCastleWallDaemon(
           return { ok: false, error: `no pending request matches ${response.request_id}` };
         }
         pendingRequests.delete(response.request_id);
-        await listener.broadcastDecisionResponse(response);
+        await listener!.broadcastDecisionResponse(response);
         await input.auditLog.append(
           "l1",
           "operator_decision",
@@ -1085,7 +1216,7 @@ export async function startMacOSCastleWallDaemon(
       }
     },
   };
-  const listener = input.listenerFactory
+  listener = input.listenerFactory
     ? input.listenerFactory(listenerOptions)
     : new MacOSFlowIpcListener(listenerOptions);
 
@@ -1214,6 +1345,9 @@ export async function startMacOSCastleWallDaemon(
             // `degradedCarry` declaration above for the exact semantics.
             ...(degradedCountThisBeat > 0
               ? { audit_write_degraded_count: degradedCountThisBeat }
+              : {}),
+            ...(leaseDeliveryRecycles > 0
+              ? { lease_delivery_recycles: leaseDeliveryRecycles }
               : {}),
             emission_liveness: {
               decided_total: emissionLivenessSnapshot.decidedTotal,
@@ -1463,7 +1597,7 @@ export async function startMacOSCastleWallDaemon(
         `policy reload did not compose and sign within ${reloadSignDeadlineMs}ms (signer helper or fortress read stalled)`,
       );
       const emitted = await withReloadDeadline(
-        listener.broadcastManifestUpdate(),
+        listener!.broadcastManifestUpdate(),
         reloadBroadcastDeadlineMs,
         `manifest broadcast did not complete within ${reloadBroadcastDeadlineMs}ms during policy reload`,
       );
