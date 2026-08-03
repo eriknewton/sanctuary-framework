@@ -57,6 +57,32 @@ async function readInitialSnapshotEvent(res: Response): Promise<Record<string, u
   throw new Error("snapshot event not received");
 }
 
+async function drainSSE(res: Response, ms: number): Promise<string> {
+  const reader = res.body!.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  const deadline = Date.now() + ms;
+  try {
+    while (Date.now() < deadline) {
+      const timer = new Promise<null>((resolve) =>
+        setTimeout(() => resolve(null), Math.max(1, deadline - Date.now())),
+      );
+      const next = await Promise.race([reader.read(), timer]);
+      if (next === null || next.done) break;
+      buf += decoder.decode(next.value, { stream: true });
+    }
+  } finally {
+    await reader.cancel().catch(() => undefined);
+  }
+  return buf;
+}
+
+function readEventData(raw: string, event: string): Record<string, unknown> {
+  const match = new RegExp(`event: ${event}\\ndata: ([^\\n]+)\\n\\n`).exec(raw);
+  if (!match) throw new Error(`${event} event not received:\n${raw}`);
+  return JSON.parse(match[1]!) as Record<string, unknown>;
+}
+
 describe("Dashboard HTTP API", () => {
   let handle: DashboardHandle | null = null;
 
@@ -341,6 +367,97 @@ describe("Dashboard HTTP API", () => {
     const encoded = JSON.stringify(snapshot);
     expect(encoded).not.toContain("secret-req-1");
     expect(encoded).not.toContain("secret reason must not leak");
+  });
+
+  it("redacts live approval deltas for tokenless loopback /api/stream clients opened before approval", async () => {
+    const approval: PendingApproval = {
+      id: "secret-req-1",
+      operation: "state_export",
+      tier: 1,
+      reason: "secret reason must not leak",
+      created_at: "2026-08-03T12:00:00.000Z",
+    };
+    handle = await startForTest({
+      authToken: "secret-xyz",
+      pendingApprovals: [],
+    });
+    handle.setV11LoopbackAutoAuth(true);
+
+    const res = await fetch(`${handle.url}/api/stream`);
+    expect(res.status).toBe(200);
+    const drained = drainSSE(res, 1200);
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    handle.updateSources({ pendingApprovals: [approval] });
+    handle.publishApproval(approval);
+
+    const seen = await drained;
+    const event = readEventData(seen, "approval");
+    expect(event.pending_approvals_redacted).toBe(true);
+    expect(event.pending_approvals_count).toBe(1);
+    const encoded = JSON.stringify(event);
+    expect(encoded).not.toContain("secret-req-1");
+    expect(encoded).not.toContain("secret reason must not leak");
+  });
+
+  it("CONTROL: serves full live approval deltas to an operator bearer /api/stream client", async () => {
+    const approval: PendingApproval = {
+      id: "secret-req-1",
+      operation: "state_export",
+      tier: 1,
+      reason: "secret reason must not leak",
+      created_at: "2026-08-03T12:00:00.000Z",
+    };
+    handle = await startForTest({
+      authToken: "secret-xyz",
+      pendingApprovals: [],
+    });
+    handle.setV11LoopbackAutoAuth(true);
+
+    const res = await fetch(`${handle.url}/api/stream`, {
+      headers: { Authorization: "Bearer secret-xyz" },
+    });
+    expect(res.status).toBe(200);
+    const drained = drainSSE(res, 1200);
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    handle.updateSources({ pendingApprovals: [approval] });
+    handle.publishApproval(approval);
+
+    const seen = await drained;
+    const event = readEventData(seen, "approval");
+    expect(event.id).toBe("secret-req-1");
+    expect(event.reason).toBe("secret reason must not leak");
+    expect(event.pending_approvals_redacted).toBeUndefined();
+  });
+
+  it("redacts approval_pending inbox events for tokenless loopback /api/stream clients", async () => {
+    handle = await startForTest({ authToken: "secret-xyz" });
+    handle.setV11LoopbackAutoAuth(true);
+    const res = await fetch(`${handle.url}/api/stream`);
+    expect(res.status).toBe(200);
+    const drained = drainSSE(res, 1200);
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    handle.publishInbox({
+      version: "1.1",
+      item_id: "secret-inbox-1",
+      kind: "approval_pending",
+      created_at: "2026-08-03T12:00:00.000Z",
+      agent_id: "secret-agent",
+      identity_id: "identity-1",
+      display_template_id: "approval_pending.tier1.state_export",
+      display_template_args: [{ kind: "agent_id", value: "secret-agent" }],
+      resolved: false,
+      tier: "tier1",
+      operation_category: "state_export",
+    });
+
+    const seen = await drained;
+    const event = readEventData(seen, "inbox");
+    expect(event.pending_approvals_redacted).toBe(true);
+    expect(event.pending_approvals_count).toBe(1);
+    const encoded = JSON.stringify(event);
+    expect(encoded).not.toContain("secret-inbox-1");
+    expect(encoded).not.toContain("secret-agent");
+    expect(encoded).not.toContain("state_export");
   });
 
   it("serves full pending approval rows to the retired router operator bearer and minted session", async () => {

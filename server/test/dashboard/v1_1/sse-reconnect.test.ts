@@ -30,6 +30,14 @@ describe("v1.1 dashboard SSE reconnect-and-restore", () => {
     expect(src).toContain("seenEventIds.add");
   });
 
+  it("renders a locked queue state when the inbox stream or fetch returns a redaction marker", () => {
+    const src = getClientScript();
+    expect(src).toContain("isPendingApprovalsRedactedMarker");
+    expect(src).toContain("state.inboxRedacted");
+    expect(src).toContain("Approvals are hidden, not empty.");
+    expect(src).not.toMatch(/state\.inbox\s*=\s*ir\.data\.items\s*\|\|\s*\[\]/);
+  });
+
   it("extractStreamEventId returns stable ids per event kind", () => {
     expect(
       extractStreamEventId({

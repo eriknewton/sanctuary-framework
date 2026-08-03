@@ -243,6 +243,28 @@ async function approvalsList(
   }
   const json = hasFlag(argv, "--json");
   const body = await request("/api/hub/inbox", undefined, ctx);
+  if (body.data?.pending_approvals_redacted === true) {
+    const pendingCount = body.data?.pending_approvals_count ?? 0;
+    if (json) {
+      out.write(
+        JSON.stringify(
+          {
+            locked: true,
+            pending_approvals_redacted: true,
+            pending_approvals_count: pendingCount,
+            items: [],
+          },
+          null,
+          2,
+        ) + "\n",
+      );
+    } else {
+      out.write(
+        `Approvals are hidden, not empty. Pending count: ${pendingCount}. Provide SANCTUARY_DASHBOARD_AUTH_TOKEN to list and decide them.\n`,
+      );
+    }
+    return 1;
+  }
   const items = (body.data?.items ?? []).filter(isPendingApproval);
   const lockdown_status = await readLockdownStatus(ctx.fortressPath);
   if (json) {

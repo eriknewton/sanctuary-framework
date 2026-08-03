@@ -27,6 +27,10 @@ import {
   redactPendingApprovalsForPositionOnly,
   redactPendingApprovalsFromSnapshotPayload,
 } from "./aggregator.js";
+import {
+  isHubApprovalPendingItem,
+  pendingApprovalsRedactedMarker,
+} from "./pending-redaction.js";
 import { renderDashboardHTML } from "./html.js";
 import { listTemplates, getTemplateEntry, getTemplate } from "../templates/registry.js";
 import { initTemplate } from "../templates/init.js";
@@ -846,10 +850,9 @@ async function handleStream(
   const unsubscribe = deps.onEvent
     ? deps.onEvent((event) => {
         try {
-          const data =
-            redactPendingApprovals && event.type === "snapshot"
-              ? redactPendingApprovalsFromSnapshotPayload(event.data)
-              : event.data;
+          const data = redactPendingApprovals
+            ? redactStreamEventForPositionOnly(event, deps)
+            : event.data;
           res.write(`event: ${event.type}\ndata: ${JSON.stringify(data)}\n\n`);
         } catch {
           // socket gone — cleanup happens in 'close'
@@ -872,6 +875,26 @@ async function handleStream(
 
   res.on("close", cleanup);
   res.on("error", cleanup);
+}
+
+function redactStreamEventForPositionOnly(
+  event: StreamEvent,
+  deps: APIDeps,
+): unknown {
+  switch (event.type) {
+    case "snapshot":
+      return redactPendingApprovalsFromSnapshotPayload(event.data);
+    case "approval":
+      return pendingApprovalsRedactedMarker(
+        Math.max(deps.sources.pendingApprovals?.length ?? 0, 1),
+      );
+    case "inbox":
+      return isHubApprovalPendingItem(event.data)
+        ? pendingApprovalsRedactedMarker(1)
+        : event.data;
+    default:
+      return event.data;
+  }
 }
 
 // Re-export helpers used by tests

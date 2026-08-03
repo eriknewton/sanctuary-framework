@@ -31,6 +31,7 @@ import type { ReputationEvidence } from "../shr/generator.js";
 import { deriveReputationDegradations } from "../shr/generator.js";
 import type { SHRDegradation } from "../shr/types.js";
 import type { SovereigntyTier } from "../reputation/tiers.js";
+import { pendingApprovalsRedactedMarker } from "./pending-redaction.js";
 
 export type LayerState = "full" | "degraded" | "compromised";
 export type OverallStatus = "healthy" | "degraded" | "compromised";
@@ -185,8 +186,7 @@ export function redactPendingApprovalsForPositionOnly(
   return {
     ...snapshot,
     pending_approvals: [],
-    pending_approvals_redacted: true,
-    pending_approvals_count: snapshot.pending_approvals.length,
+    ...pendingApprovalsRedactedMarker(snapshot.pending_approvals.length),
   };
 }
 

@@ -21,8 +21,10 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 
 import {
   authMiddleware,
+  resolveAuthAdmission,
   type AuthConfig,
 } from "../console/auth-middleware.js";
+import { redactApprovalPendingItemsForPositionOnly } from "../dashboard/pending-redaction.js";
 import {
   publicCodeForStatus,
   sendCaughtError,
@@ -376,11 +378,13 @@ export async function handleHubRoute(
   // rejected, never allowed.
   const requiresOperatorBearer =
     method !== "GET" && !isHubReadStyleExemptPath(method, path);
+  const authOptions = requiresOperatorBearer ? { requireToken: true } : undefined;
   const checkAuth = authMiddleware(
     deps.authConfig,
-    requiresOperatorBearer ? { requireToken: true } : undefined,
+    authOptions,
   );
   if (!checkAuth(req, res, url)) return true;
+  const authAdmission = resolveAuthAdmission(deps.authConfig, req, url, authOptions);
 
   try {
     rejectCrossFortressParams(url);
@@ -393,7 +397,13 @@ export async function handleHubRoute(
         HUB_INBOX_MAX_LIMIT,
       );
       const items = deps.service.listInbox().slice(0, limit);
-      writeJSON(res, 200, { ok: true, data: { items } });
+      writeJSON(res, 200, {
+        ok: true,
+        data:
+          authAdmission === "loopback_position"
+            ? redactApprovalPendingItemsForPositionOnly(items)
+            : { items },
+      });
       return true;
     }
 

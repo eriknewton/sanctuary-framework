@@ -1943,6 +1943,8 @@ export function generateDashboardHTML(options: {
     };
 
     let pendingRequests = new Map();
+    let pendingRequestsRedacted = false;
+    let pendingRequestsRedactedCount = 0;
     let activityLog = [];
     const maxActivityItems = 50;
 
@@ -1952,6 +1954,21 @@ export function generateDashboardHTML(options: {
       const div = document.createElement('div');
       div.textContent = text;
       return div.innerHTML;
+    }
+
+    function isPendingApprovalsRedactedMarker(value) {
+      return !!(
+        value &&
+        value.pending_approvals_redacted === true &&
+        typeof value.pending_approvals_count === 'number'
+      );
+    }
+
+    function setPendingRequestsRedacted(marker) {
+      pendingRequestsRedacted = true;
+      pendingRequestsRedactedCount = Math.max(0, marker.pending_approvals_count || 0);
+      pendingRequests.clear();
+      updatePendingDisplay();
     }
 
     function formatTime(isoString) {
@@ -2469,6 +2486,14 @@ export function generateDashboardHTML(options: {
 
       eventSource.addEventListener('init', (e) => {
         console.log('Connected to SSE');
+        try {
+          const data = JSON.parse(e.data);
+          if (isPendingApprovalsRedactedMarker(data)) {
+            setPendingRequestsRedacted(data);
+          } else if (Array.isArray(data.pending)) {
+            data.pending.forEach(addPendingRequest);
+          }
+        } catch (_) {}
       });
 
       eventSource.addEventListener('sovereignty-update', () => {
@@ -2512,6 +2537,10 @@ export function generateDashboardHTML(options: {
 
       eventSource.addEventListener('pending-request', (e) => {
         const data = JSON.parse(e.data);
+        if (isPendingApprovalsRedactedMarker(data)) {
+          setPendingRequestsRedacted(data);
+          return;
+        }
         addPendingRequest(data);
       });
 
@@ -2669,10 +2698,14 @@ export function generateDashboardHTML(options: {
 
     // Pending Requests
     function addPendingRequest(request) {
-      pendingRequests.set(request.requestId, {
-        id: request.requestId,
-        title: request.title,
-        details: request.details,
+      pendingRequestsRedacted = false;
+      pendingRequestsRedactedCount = 0;
+      const requestId = request.requestId || request.request_id;
+      if (!requestId) return;
+      pendingRequests.set(requestId, {
+        id: requestId,
+        title: request.title || request.operation || 'Pending approval',
+        details: request.details || request.reason || '',
         expiresAt: new Date(Date.now() + TIMEOUT_SECONDS * 1000),
       });
 
@@ -2681,12 +2714,16 @@ export function generateDashboardHTML(options: {
 
     function removePendingRequest(requestId) {
       pendingRequests.delete(requestId);
+      if (pendingRequestsRedacted && pendingRequestsRedactedCount > 0) {
+        pendingRequestsRedactedCount -= 1;
+        if (pendingRequestsRedactedCount === 0) pendingRequestsRedacted = false;
+      }
       updatePendingDisplay();
     }
 
     function updatePendingDisplay() {
       const badge = document.getElementById('pending-item-badge');
-      const count = pendingRequests.size;
+      const count = pendingRequestsRedacted ? pendingRequestsRedactedCount : pendingRequests.size;
 
       if (count > 0) {
         document.getElementById('pending-count').textContent = count;
@@ -2697,6 +2734,16 @@ export function generateDashboardHTML(options: {
 
       const overlay = document.getElementById('pending-overlay');
       const items = document.getElementById('pending-items');
+
+      if (pendingRequestsRedacted) {
+        items.innerHTML = \`
+          <div class="pending-item" data-pending-approvals-redacted="1">
+            <div class="pending-title">Approvals are hidden, not empty.</div>
+            <div class="pending-countdown">Pending count: \${esc(String(pendingRequestsRedactedCount))}</div>
+          </div>
+        \`;
+        return;
+      }
 
       if (count === 0) {
         items.innerHTML = '';

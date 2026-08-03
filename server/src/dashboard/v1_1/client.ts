@@ -66,6 +66,8 @@ const state = {
   route: "posture",
   agents: [],
   inbox: [],
+  inboxRedacted: false,
+  inboxRedactedCount: 0,
   inboxOps: {
     selected: {},
     filters: { search: "", source: "", severity: "", agent: "", from: "", to: "" },
@@ -2401,6 +2403,32 @@ async function saveInboxPrefs() {
   } catch (_) {}
 }
 
+function isPendingApprovalsRedactedMarker(value) {
+  return !!(
+    value &&
+    value.pending_approvals_redacted === true &&
+    typeof value.pending_approvals_count === "number"
+  );
+}
+
+function setInboxRedacted(marker) {
+  state.inboxRedacted = true;
+  state.inboxRedactedCount = Math.max(0, marker.pending_approvals_count || 0);
+  state.inbox = state.inbox.filter(function (i) {
+    return i.kind !== "approval_pending";
+  });
+}
+
+function applyInboxPayload(data) {
+  if (isPendingApprovalsRedactedMarker(data)) {
+    setInboxRedacted(data);
+  } else {
+    state.inboxRedacted = false;
+    state.inboxRedactedCount = 0;
+  }
+  state.inbox = (data && data.items) || [];
+}
+
 function inboxOption(value, bucket) {
   const selected = (bucket === "severity" ? state.inboxOps.filters.severity : state.inboxOps.filters.source) === value;
   return '<option value="' + escHtml(value) + '"' + (selected ? ' selected' : '') + '>' + escHtml(value) + '</option>';
@@ -2586,8 +2614,11 @@ function renderFortress() {
   const fortress = document.getElementById("fortress");
   if (!fortress) return;
   const pending = pendingApprovalItems();
-  const countCls = pending.length ? "count" : "count zero";
-  const queueBody = pending.length
+  const queueCount = state.inboxRedacted ? state.inboxRedactedCount : pending.length;
+  const countCls = queueCount ? "count" : "count zero";
+  const queueBody = state.inboxRedacted
+    ? '<div class="queue-empty" data-pending-approvals-redacted="1">Approvals are hidden, not empty. Pending count: ' + escHtml(state.inboxRedactedCount) + '.</div>'
+    : pending.length
     ? '<div class="approval-queue" id="approval-queue">' + pending.map(renderApprovalTile).join("") + '</div>'
     : '<div class="queue-empty"><span class="qe-check"></span>Nothing waiting on you.</div>';
 
@@ -2615,8 +2646,8 @@ function renderFortress() {
     ? "On" : "Off";
 
   fortress.innerHTML = [
-    '<div class="rail-section">',
-      '<div class="rail-section-label">Waiting on you <span class="' + countCls + '" id="queue-count">' + pending.length + '</span></div>',
+      '<div class="rail-section">',
+      '<div class="rail-section-label">Waiting on you <span class="' + countCls + '" id="queue-count">' + queueCount + '</span></div>',
       queueBody,
     '</div>',
     '<div class="rail-section">',
@@ -2629,7 +2660,7 @@ function renderFortress() {
         '<div class="ambient-line"><span class="lead">What is protecting you</span>' + escHtml(protectingLine) + '</div>',
         '<div class="ambient-stats">',
           '<div class="ambient-stat"><span class="n">' + wrapped + '</span><span class="l">Wrapped</span></div>',
-          '<div class="ambient-stat"><span class="n">' + pending.length + '</span><span class="l">Waiting</span></div>',
+          '<div class="ambient-stat"><span class="n">' + queueCount + '</span><span class="l">Waiting</span></div>',
           '<div class="ambient-stat"><span class="n">' + federationState + '</span><span class="l">Federation</span></div>',
         '</div>',
       '</div>',
@@ -2679,9 +2710,12 @@ function renderActivityScreen() {
       '<label>From<br><input class="input" data-action="inbox-filter-from" type="date" value="' + escHtml(state.inboxOps.filters.from) + '"></label>' +
       '<label>To<br><input class="input" data-action="inbox-filter-to" type="date" value="' + escHtml(state.inboxOps.filters.to) + '"></label>' +
     '</div>';
+  const redactedNotice = state.inboxRedacted
+    ? '<div class="banner-warn" data-pending-approvals-redacted="1">Approvals are hidden, not empty. Pending count: ' + escHtml(state.inboxRedactedCount) + '. Paste the operator token to review and decide them.</div>'
+    : '';
   var inboxRows;
   if (!visibleInbox.length) {
-    inboxRows = '<p class="muted">Nothing pending.</p>';
+    inboxRows = redactedNotice || '<p class="muted">Nothing pending.</p>';
   } else {
     var tier1Items = visibleInbox.filter(function (i) { return i.kind === "approval_pending" && i.tier === "tier1"; });
     var tier2Items = visibleInbox.filter(function (i) { return i.kind === "approval_pending" && i.tier === "tier2"; });
@@ -2708,7 +2742,7 @@ function renderActivityScreen() {
     if (tier1Items.length) sections.push('<h4 class="inbox-group-head">Tier 1 approvals</h4>' + tier1Items.map(renderInboxRow).join("\n"));
     if (tier2Items.length) sections.push('<h4 class="inbox-group-head">Tier 2 approvals</h4>' + tier2Items.map(renderInboxRow).join("\n"));
     if (otherItems.length) sections.push((tier1Items.length || tier2Items.length ? '<h4 class="inbox-group-head">Other</h4>' : '') + otherItems.map(renderInboxRow).join("\n"));
-    inboxRows = sections.join("\n");
+    inboxRows = redactedNotice + sections.join("\n");
   }
   const total = state.inbox.filter(function (i) { return !i.resolved; }).length;
   return [
@@ -2989,7 +3023,7 @@ async function fetchAll() {
   } catch (e) { /* tolerate */ }
   try {
     const ir = await api("/inbox");
-    state.inbox = ir.data.items || [];
+    applyInboxPayload(ir.data || {});
   } catch (e) { /* tolerate */ }
   try {
     const acr = await api("/activity");
@@ -3701,6 +3735,11 @@ function connectStream() {
     es.addEventListener("inbox", function (ev) {
       try {
         const item = JSON.parse(ev.data);
+        if (isPendingApprovalsRedactedMarker(item)) {
+          setInboxRedacted(item);
+          rerender();
+          return;
+        }
         if (state.seenEventIds.has(item.item_id)) return;
         state.seenEventIds.add(item.item_id);
         // Replace-or-prepend by item_id.

@@ -90,6 +90,10 @@ import {
   type AggregatorSources,
   type PendingApproval,
 } from "../dashboard/aggregator.js";
+import {
+  isHubApprovalPendingItem,
+  pendingApprovalsRedactedMarker,
+} from "../dashboard/pending-redaction.js";
 import { constantTimeEquals } from "../http/auth.js";
 import { logCaughtError } from "../http/error-envelope.js";
 import {
@@ -945,8 +949,8 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   private postureStreamRegistry: PostureStreamRegistry =
     createPostureStreamRegistry();
   private pending: Map<string, PendingRequest> = new Map();
-  private sseClients: Set<SSEClient> = new Set();
-  private dashboardStreamClients: Map<SSEClient, boolean> = new Map();
+  private sseClients: Map<SSEClient, DashboardAuthAdmission> = new Map();
+  private dashboardStreamClients: Map<SSEClient, DashboardAuthAdmission> = new Map();
   private httpServer:
     | ReturnType<typeof createHttpServer>
     | ReturnType<typeof createHttpsServer>
@@ -5524,7 +5528,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     this.pending.clear();
 
     // Close SSE connections
-    for (const client of this.sseClients) {
+    for (const client of this.sseClients.keys()) {
       client.end();
     }
     this.sseClients.clear();
@@ -6638,7 +6642,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       } else if (method === "GET" && url.pathname === "/api/stream") {
         this.handleDashboardStream(req, res, authAdmission);
       } else if (method === "GET" && url.pathname === "/events") {
-        this.handleSSE(req, res);
+        this.handleSSE(req, res, authAdmission);
       } else if (method === "GET" && url.pathname === "/api/status") {
         this.handleStatus(res);
       } else if (method === "GET" && url.pathname === "/api/snapshot") {
@@ -7801,7 +7805,11 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     this.broadcastSSE("proxy-call", data);
   }
 
-  private handleSSE(req: IncomingMessage, res: ServerResponse): void {
+  private handleSSE(
+    req: IncomingMessage,
+    res: ServerResponse,
+    authAdmission: DashboardAuthAdmission,
+  ): void {
     res.writeHead(200, {
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-cache",
@@ -7840,13 +7848,19 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       context: p.request.context,
       timestamp: p.request.timestamp,
     }));
-    if (pendingList.length > 0) {
+    if (
+      authAdmission === "loopback_position" &&
+      pendingList.length > 0
+    ) {
+      initData.pending = [];
+      Object.assign(initData, pendingApprovalsRedactedMarker(pendingList.length));
+    } else if (pendingList.length > 0) {
       initData.pending = pendingList;
     }
 
     res.write(`event: init\ndata: ${JSON.stringify(initData)}\n\n`);
 
-    this.sseClients.add(res);
+    this.sseClients.set(res, authAdmission);
 
     req.on("close", () => {
       this.sseClients.delete(res);
@@ -7858,7 +7872,6 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     res: ServerResponse,
     authAdmission: DashboardAuthAdmission,
   ): void {
-    const redactPendingApprovals = authAdmission === "loopback_position";
     this.buildAggregatorSources()
       .then((sources) => getProtectionSnapshot(sources))
       .then((snapshot) => {
@@ -7869,12 +7882,12 @@ export class DashboardApprovalChannel implements ApprovalChannel {
           "Connection": "keep-alive",
           "X-Accel-Buffering": "no",
         });
-        const visibleSnapshot = redactPendingApprovals
+        const visibleSnapshot = authAdmission === "loopback_position"
           ? redactPendingApprovalsForPositionOnly(snapshot)
           : snapshot;
         res.write(`event: snapshot\ndata: ${JSON.stringify(visibleSnapshot)}\n\n`);
 
-        this.dashboardStreamClients.set(res, redactPendingApprovals);
+        this.dashboardStreamClients.set(res, authAdmission);
         const cleanup = (): void => {
           this.dashboardStreamClients.delete(res);
         };
@@ -8757,8 +8770,13 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   // ── SSE Broadcasting ────────────────────────────────────────────────
 
   broadcastSSE(event: string, data: unknown): void {
-    const message = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
-    for (const client of this.sseClients) {
+    for (const [client, authAdmission] of this.sseClients) {
+      const visibleData = this.redactLegacySSEDataForAdmission(
+        event,
+        data,
+        authAdmission,
+      );
+      const message = `event: ${event}\ndata: ${JSON.stringify(visibleData)}\n\n`;
       try {
         client.write(message);
       } catch {
@@ -8768,11 +8786,11 @@ export class DashboardApprovalChannel implements ApprovalChannel {
 
     const dashboardEvent = dashboardStreamEventForLegacyEvent(event, data);
     if (!dashboardEvent) return;
-    for (const [client, redactPendingApprovals] of this.dashboardStreamClients) {
-      const eventData =
-        redactPendingApprovals && dashboardEvent.event === "snapshot"
-          ? redactPendingApprovalsFromSnapshotPayload(dashboardEvent.data)
-          : dashboardEvent.data;
+    for (const [client, authAdmission] of this.dashboardStreamClients) {
+      const eventData = this.redactDashboardStreamDataForAdmission(
+        dashboardEvent,
+        authAdmission,
+      );
       const dashboardMessage =
         `event: ${dashboardEvent.event}\ndata: ${JSON.stringify(eventData)}\n\n`;
       try {
@@ -8780,6 +8798,44 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       } catch {
         this.dashboardStreamClients.delete(client);
       }
+    }
+  }
+
+  private pendingApprovalRedactionCount(): number {
+    return Math.max(this.pending.size, 1);
+  }
+
+  private redactLegacySSEDataForAdmission(
+    event: string,
+    data: unknown,
+    authAdmission: DashboardAuthAdmission,
+  ): unknown {
+    if (authAdmission !== "loopback_position") return data;
+    if (event === "pending-request") {
+      return pendingApprovalsRedactedMarker(this.pendingApprovalRedactionCount());
+    }
+    if (event === "snapshot") {
+      return redactPendingApprovalsFromSnapshotPayload(data);
+    }
+    return data;
+  }
+
+  private redactDashboardStreamDataForAdmission(
+    dashboardEvent: DashboardStreamEvent,
+    authAdmission: DashboardAuthAdmission,
+  ): unknown {
+    if (authAdmission !== "loopback_position") return dashboardEvent.data;
+    switch (dashboardEvent.event) {
+      case "snapshot":
+        return redactPendingApprovalsFromSnapshotPayload(dashboardEvent.data);
+      case "approval":
+        return pendingApprovalsRedactedMarker(this.pendingApprovalRedactionCount());
+      case "inbox":
+        return isHubApprovalPendingItem(dashboardEvent.data)
+          ? pendingApprovalsRedactedMarker(1)
+          : dashboardEvent.data;
+      default:
+        return dashboardEvent.data;
     }
   }
 
