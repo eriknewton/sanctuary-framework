@@ -761,6 +761,14 @@ export async function startMacOSCastleWallDaemon(
    * unmarked).
    */
   const degradedCarry = createAuditWriteDegradedCarry();
+  // Audit-write lock recovery already fails loud on stderr before this callback
+  // fires. Count it here so the next `castle_wall_heartbeat` carries the same
+  // `audit_write_degraded_count` marker used for dropped reload audit writes,
+  // keeping the degradation visible in the tamper-evident chain without adding
+  // a new audit operation or enum.
+  input.auditLog.onWriteLockRecovery(() => {
+    degradedCarry.record();
+  });
   const agentEgressProbeIntervalSeconds =
     input.agentEgressProbeIntervalSeconds ??
     CASTLE_WALL_DEFAULT_AGENT_EGRESS_PROBE_INTERVAL_SECONDS;
