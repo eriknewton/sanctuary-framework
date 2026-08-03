@@ -64,6 +64,16 @@ import {
   type EnforcementAvailabilityVerification,
 } from "./enforcement-availability.js";
 
+const DUPLICATE_REPLAY_ROLLUP_COUNT = 100;
+const DUPLICATE_REPLAY_ROLLUP_INTERVAL_MS = 60_000;
+
+interface DuplicateReplayRollup {
+  pendingCount: number;
+  firstPendingAtMs: number | null;
+  rejectedSeq: number | null;
+  floor: number | null;
+}
+
 /** The runtime's view of a registered macOS subscriber. */
 export interface MacOSSubscriber {
   /** Stable identifier for the subscriber connection. */
@@ -169,6 +179,7 @@ export class MacOSFlowEventConsumer {
   private readonly now: () => number;
   private readonly enforcementAvailability: EnforcementAvailabilityStore;
   private readonly emissionLiveness: EmissionLivenessNotes | null;
+  private readonly duplicateReplayRollups = new Map<string, DuplicateReplayRollup>();
   private stats: MacOSFlowEventStats = {
     subscribers: 0,
     manifestSnapshotsEmitted: 0,
@@ -218,6 +229,7 @@ export class MacOSFlowEventConsumer {
   unregisterSubscriber(subscriberId: string): void {
     this.subscribers.delete(subscriberId);
     this.enforcementAvailability.unregisterConnection(subscriberId);
+    this.clearDuplicateReplayRollups(subscriberId);
     this.stats.subscribers = this.subscribers.size;
   }
 
@@ -519,12 +531,15 @@ export class MacOSFlowEventConsumer {
    * producer counter, but the two paths deliver asynchronously, so a
    * dedicated report signed at seq N legitimately arrives after a
    * flow-carried event signed at seq N+k (F-AVAIL-SEQ-FLAP: a single shared
-   * floor misread that interleaving as replay and flapped the armed surface
-   * to undetermined). Within one stream delivery is in signing order, so
-   * seq <= that stream's floor IS a genuine replay and is still rejected;
-   * cross-stream re-delivery is rejected earlier by the verifiers' signed
-   * `operation` binding. Never-green-on-absence is untouched: acceptance
-   * still requires a verified, signed, fortress-bound report inside the
+   * floor misread that interleaving as replay and flapped the armed surface to
+   * undetermined). Within-stream reordering is rare but real: a Mini2 24h
+   * drill observed 23 delta-1/delta-2 rejections in about 26h. A seq at or
+   * below that stream's floor is still rejected because a stale report must
+   * never overwrite fresher verified state; exact duplicates are rolled up in
+   * the operator log, while lower-seq reorders remain individually visible.
+   * Cross-stream re-delivery is rejected earlier by the verifiers' signed
+   * `operation` binding. Never-green-on-absence is untouched: acceptance still
+   * requires a verified, signed, fortress-bound report inside the
    * consumer-observed freshness window.
    */
   private recordVerifiedAvailability(
@@ -542,12 +557,11 @@ export class MacOSFlowEventConsumer {
       stream,
     );
     if (lastSeq !== null && verified.seq <= lastSeq) {
-      // SAFETY: stderr is the daemon's operator log channel; one line per
-      // rejected report is the only observable that can distinguish a
-      // duplicate redelivery from a within-stream reorder on hardware
-      // (F-AVAIL-REJECT-CLOBBER: the drill could not tell them apart).
-      console.error(
-        `[castle-wall] enforcement availability replay rejected stream=${stream} rejected_seq=${verified.seq} floor=${lastSeq}`
+      this.logRejectedAvailabilityReplay(
+        subscriberId,
+        stream,
+        verified.seq,
+        lastSeq,
       );
       this.enforcementAvailability.recordInvalidReport(
         subscriberId,
@@ -565,6 +579,110 @@ export class MacOSFlowEventConsumer {
     );
     this.stats.enforcementAvailabilityReportsRecorded += 1;
   }
+
+  private logRejectedAvailabilityReplay(
+    subscriberId: string,
+    stream: EnforcementAvailabilityStream,
+    rejectedSeq: number,
+    floor: number,
+  ): void {
+    const delta = floor - rejectedSeq;
+    if (delta === 0) {
+      this.recordDuplicateReplay(subscriberId, stream, rejectedSeq, floor);
+      return;
+    }
+    // SAFETY: stderr is the daemon operator log; lower-seq same-stream
+    // availability rejections are rare hardware-observed reorders, and each
+    // one must stay individually greppable apart from duplicate redelivery.
+    console.error(
+      `[castle-wall] enforcement availability replay reorder rejected stream=${stream} rejected_seq=${rejectedSeq} floor=${floor} delta=${delta}`,
+    );
+  }
+
+  private recordDuplicateReplay(
+    subscriberId: string,
+    stream: EnforcementAvailabilityStream,
+    rejectedSeq: number,
+    floor: number,
+  ): void {
+    const key = duplicateReplayRollupKey(subscriberId, stream);
+    let rollup = this.duplicateReplayRollups.get(key);
+    if (!rollup) {
+      rollup = {
+        pendingCount: 0,
+        firstPendingAtMs: null,
+        rejectedSeq: null,
+        floor: null,
+      };
+      this.duplicateReplayRollups.set(key, rollup);
+    }
+
+    if (
+      rollup.pendingCount > 0 &&
+      (rollup.rejectedSeq !== rejectedSeq || rollup.floor !== floor)
+    ) {
+      emitDuplicateReplayRollup(stream, rollup);
+      resetDuplicateReplayRollup(rollup);
+    }
+
+    const nowMs = this.now();
+    if (rollup.pendingCount === 0) {
+      rollup.firstPendingAtMs = nowMs;
+      rollup.rejectedSeq = rejectedSeq;
+      rollup.floor = floor;
+    }
+    rollup.pendingCount += 1;
+
+    if (
+      rollup.pendingCount >= DUPLICATE_REPLAY_ROLLUP_COUNT ||
+      (rollup.firstPendingAtMs !== null &&
+        nowMs - rollup.firstPendingAtMs >= DUPLICATE_REPLAY_ROLLUP_INTERVAL_MS)
+    ) {
+      emitDuplicateReplayRollup(stream, rollup);
+      resetDuplicateReplayRollup(rollup);
+    }
+  }
+
+  private clearDuplicateReplayRollups(subscriberId: string): void {
+    for (const key of this.duplicateReplayRollups.keys()) {
+      if (key.startsWith(`${subscriberId}\0`)) {
+        this.duplicateReplayRollups.delete(key);
+      }
+    }
+  }
+}
+
+function duplicateReplayRollupKey(
+  subscriberId: string,
+  stream: EnforcementAvailabilityStream,
+): string {
+  return `${subscriberId}\0${stream}`;
+}
+
+function emitDuplicateReplayRollup(
+  stream: EnforcementAvailabilityStream,
+  rollup: DuplicateReplayRollup,
+): void {
+  if (
+    rollup.pendingCount <= 0 ||
+    rollup.rejectedSeq === null ||
+    rollup.floor === null
+  ) {
+    return;
+  }
+  // SAFETY: stderr is the daemon operator log; exact duplicate replay
+  // redeliveries can be sustained and noisy, so they are emitted only as a
+  // bounded rollup that preserves count and stream signal.
+  console.error(
+    `[castle-wall] enforcement availability duplicate replays suppressed stream=${stream} count=${rollup.pendingCount} rejected_seq=${rollup.rejectedSeq} floor=${rollup.floor}`,
+  );
+}
+
+function resetDuplicateReplayRollup(rollup: DuplicateReplayRollup): void {
+  rollup.pendingCount = 0;
+  rollup.firstPendingAtMs = null;
+  rollup.rejectedSeq = null;
+  rollup.floor = null;
 }
 
 function buildProducerSignedEnvelope(
