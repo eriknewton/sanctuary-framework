@@ -921,14 +921,20 @@ export async function startMacOSCastleWallDaemon(
       const recycled =
         listener?.recycleConnection(subscriberId, "lease_delivery_wedge") ??
         false;
-      if (!recycled) {
+      if (recycled) {
+        // Count ONLY actual recycles so the heartbeat's
+        // `lease_delivery_recycles` field stays literally true (gate finding,
+        // PR #1086): a wedge that fired after the connection was already gone
+        // is fully diagnosable from the skipped line below without inflating
+        // the recycle count.
+        leaseDeliveryRecycles += 1;
+      } else {
         // SAFETY: operator-facing stderr; the wedge fired but the connection
         // was already gone, which must stay diagnosable.
         console.error(
           `[castle-wall] LEASE-DELIVERY-WEDGE reason=lease_delivery_wedge subscriber=${safeSubscriber} lease_reason=${safeReason} consecutive=${consecutive} action=recycle_skipped_connection_gone`,
         );
       }
-      leaseDeliveryRecycles += 1;
       leaseDeliveryContradictions.delete(subscriberId);
     } catch (err) {
       // SAFETY: the watchdog bounds a wrong-allow window but must never crash
@@ -1067,6 +1073,12 @@ export async function startMacOSCastleWallDaemon(
     fortressId: input.fortressId,
     emissionLiveness: emissionLivenessWatchdog,
     onVerifiedAvailabilityReport: noteVerifiedAvailabilityReport,
+    // Per-connection watchdog state dies with the connection: without this, a
+    // below-threshold contradiction count survived a clean disconnect and
+    // fired early on a later connection reusing the id (gate-found, PR #1086).
+    onSubscriberUnregistered: (subscriberId) => {
+      leaseDeliveryContradictions.delete(subscriberId);
+    },
   });
 
   const listenerOptions: MacOSCastleWallListenerOptions = {

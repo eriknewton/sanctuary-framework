@@ -349,6 +349,51 @@ describe("Castle Wall lease-delivery watchdog", () => {
     expect(listener.recycles).toEqual([]);
   });
 
+  it("W7 clears a below-threshold contradiction count when the connection unregisters (clean disconnect)", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const threshold = 3;
+    const { listener, consumer, producer } = await startHarness({ threshold });
+    const subscriberId = "2222222222222222";
+    listener.registerSubscriber(subscriberId);
+    let seq = 1;
+    for (let i = 0; i < threshold - 1; i += 1) {
+      feedReport({
+        consumer,
+        producer,
+        subscriberId,
+        seq: seq++,
+        snapshot: contradictingSnapshot(),
+      });
+    }
+    // Clean disconnect (the c26 shape): the consumer unregisters the
+    // subscriber. Gate-found on PR #1086: the contradiction count survived
+    // this and fired after ONE report on a same-id reconnect.
+    consumer.unregisterSubscriber(subscriberId);
+    listener.registerSubscriber(subscriberId);
+    for (let i = 0; i < threshold - 1; i += 1) {
+      feedReport({
+        consumer,
+        producer,
+        subscriberId,
+        seq: seq++,
+        snapshot: contradictingSnapshot(),
+      });
+    }
+    // Count restarted from zero: threshold-1 post-reconnect reports must NOT
+    // fire even though the pre-disconnect run left the total at 2(threshold-1).
+    expect(listener.recycles).toEqual([]);
+    feedReport({
+      consumer,
+      producer,
+      subscriberId,
+      seq: seq++,
+      snapshot: contradictingSnapshot(),
+    });
+    expect(listener.recycles).toEqual([
+      { subscriberId, reason: "lease_delivery_wedge" },
+    ]);
+  });
+
   it("W6 carries lease_delivery_recycles on the next castle_wall_heartbeat", async () => {
     vi.spyOn(console, "error").mockImplementation(() => undefined);
     const threshold = 3;

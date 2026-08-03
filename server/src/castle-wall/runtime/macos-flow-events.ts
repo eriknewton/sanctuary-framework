@@ -170,6 +170,15 @@ export interface MacOSFlowEventConsumerInput {
     connectionId: string,
     snapshot: EnforcementAvailabilitySnapshot,
   ) => void;
+  /**
+   * Optional companion to `onVerifiedAvailabilityReport`: called when a
+   * subscriber connection unregisters, so per-connection watchdog state keyed
+   * on the subscriber id is cleared with the connection and cannot leak onto
+   * a later connection that reuses the id (gate-found on PR #1086: a
+   * contradiction count of 2 survived a clean disconnect and fired after one
+   * report on a same-id reconnect).
+   */
+  onSubscriberUnregistered?: (connectionId: string) => void;
 }
 
 /**
@@ -189,6 +198,7 @@ export class MacOSFlowEventConsumer {
   private readonly now: () => number;
   private readonly enforcementAvailability: EnforcementAvailabilityStore;
   private readonly emissionLiveness: EmissionLivenessNotes | null;
+  private readonly onSubscriberUnregistered: (connectionId: string) => void;
   private readonly duplicateReplayRollups = new Map<string, DuplicateReplayRollup>();
   private stats: MacOSFlowEventStats = {
     subscribers: 0,
@@ -220,6 +230,8 @@ export class MacOSFlowEventConsumer {
       now: this.now,
       onVerifiedReport: input.onVerifiedAvailabilityReport,
     });
+    this.onSubscriberUnregistered =
+      input.onSubscriberUnregistered ?? (() => undefined);
     this.producerAuditConsumer =
       this.pinnedProducerKeyB64url !== null
         ? new AuditConsumer(input.auditSink, undefined, {
@@ -242,6 +254,11 @@ export class MacOSFlowEventConsumer {
     this.enforcementAvailability.unregisterConnection(subscriberId);
     this.clearDuplicateReplayRollups(subscriberId);
     this.stats.subscribers = this.subscribers.size;
+    try {
+      this.onSubscriberUnregistered(subscriberId);
+    } catch {
+      // Watchdog/telemetry consumers must never corrupt unregister cleanup.
+    }
   }
 
   /**

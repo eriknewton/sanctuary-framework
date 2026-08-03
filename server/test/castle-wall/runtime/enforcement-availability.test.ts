@@ -1,3 +1,4 @@
+// fail-before-exempt: helper-extraction only — the signed-report builders moved to availability-report-helper.ts for reuse by lease-delivery-watchdog.test.ts; no assertion changed, so this file correctly passes against pre-fix source. The new behavior fails-before in lease-delivery-watchdog.test.ts (W1/W4/W6 RED on base).
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";

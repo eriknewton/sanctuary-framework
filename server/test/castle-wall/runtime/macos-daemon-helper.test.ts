@@ -1,3 +1,4 @@
+// fail-before-exempt: type-forced stub only — the fake listener gains an inert recycleConnection() because MacOSCastleWallListenerHandle widened in this PR; nothing this file locks changed. The behavior change fails-before in lease-delivery-watchdog.test.ts (W1/W4/W6 RED on base).
 /**
  * B2 daemon helper-signing-path integration tests.
  *
