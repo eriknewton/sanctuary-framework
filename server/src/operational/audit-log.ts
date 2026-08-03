@@ -238,6 +238,20 @@ export interface AuditLogConfig {
    * fallback and the acquire-temp sweep consult it.
    */
   idlessStaleLockMs?: number;
+  /**
+   * Maximum time (ms) this process may hold the cross-process audit-write lock
+   * around one critical section. Defaults to 30s. Must be a positive finite
+   * number; invalid values fail construction rather than silently weakening the
+   * recovery bound.
+   */
+  writeLockHoldDeadlineMs?: number;
+  /**
+   * Same-process, same-boot lock age (ms) after which a later acquire may force
+   * release of its own stale lock. Defaults to 60s and must be strictly greater
+   * than the resolved write-lock hold deadline, so a legitimate holder has a
+   * chance to abandon and release before this recovery edge fires.
+   */
+  selfHeldStaleLockMs?: number;
 }
 
 export interface AuditIntegrityAnomalyEvent {
@@ -251,6 +265,23 @@ export interface AuditIntegrityAnomalyEvent {
 export type AuditIntegrityAnomalySubscriber = (
   event: AuditIntegrityAnomalyEvent
 ) => void | Promise<void>;
+
+export type AuditWriteLockRecoveryReason =
+  | "write_lock_hold_deadline_exceeded"
+  | "self_held_stale_forced_release";
+
+export interface AuditWriteLockRecoveryEvent {
+  reason: AuditWriteLockRecoveryReason;
+  lockPath: string;
+}
+
+export type AuditWriteLockRecoveryListener = (
+  event: AuditWriteLockRecoveryEvent
+) => void;
+
+interface AuditWriteLockAbortSignal {
+  aborted: boolean;
+}
 
 const DEFAULT_MAX_TOTAL_SIZE_BYTES = 100 * 1024 * 1024; // 100 MB
 const DEFAULT_MAX_ENTRIES = 100_000;
@@ -778,6 +809,8 @@ const AUDIT_INTEGRITY_ALERT_KEY = "audit-integrity-alert.log";
 const AUDIT_WRITE_LOCK_FILE = ".audit-write.lock";
 const AUDIT_WRITE_LOCK_TIMEOUT_MS = 5_000;
 const AUDIT_WRITE_LOCK_RETRY_MS = 100;
+const DEFAULT_AUDIT_WRITE_LOCK_HOLD_DEADLINE_MS = 30_000;
+const DEFAULT_AUDIT_SELF_HELD_STALE_LOCK_MS = 60_000;
 // Drill-found (Leg 5, MBA, 2026-07-15): a 0-byte / unparseable audit lock that
 // carries neither `pid` nor `acquired_at` cannot be proven stale by the two
 // content-based proofs in `breakStaleAuditLock`, so a torn acquire (crash
@@ -823,6 +856,41 @@ function resolveIdlessStaleLockMs(configured?: number): number {
     return env;
   }
   return AUDIT_WRITE_LOCK_IDLESS_STALE_MS;
+}
+
+function resolveWriteLockHoldDeadlineMs(configured?: number): number {
+  const resolved =
+    configured === undefined ? DEFAULT_AUDIT_WRITE_LOCK_HOLD_DEADLINE_MS : configured;
+  if (typeof resolved !== "number" || !Number.isFinite(resolved) || resolved <= 0) {
+    throw new Error(
+      `AuditLogConfig.writeLockHoldDeadlineMs must be a positive finite number (got ${String(
+        configured,
+      )})`,
+    );
+  }
+  return resolved;
+}
+
+function resolveSelfHeldStaleLockMs(
+  configured: number | undefined,
+  writeLockHoldDeadlineMs: number,
+): number {
+  const resolved =
+    configured === undefined ? DEFAULT_AUDIT_SELF_HELD_STALE_LOCK_MS : configured;
+  if (typeof resolved !== "number" || !Number.isFinite(resolved) || resolved <= 0) {
+    throw new Error(
+      `AuditLogConfig.selfHeldStaleLockMs must be a positive finite number (got ${String(
+        configured,
+      )})`,
+    );
+  }
+  if (resolved <= writeLockHoldDeadlineMs) {
+    throw new Error(
+      `AuditLogConfig.selfHeldStaleLockMs must be strictly greater than writeLockHoldDeadlineMs ` +
+        `(got ${resolved} <= ${writeLockHoldDeadlineMs})`,
+    );
+  }
+  return resolved;
 }
 // Read-consistency backstop. A reader does NOT take the write lock (audit reads
 // must work even if a crashed writer stranded a lock, and must never be blockable
@@ -948,6 +1016,20 @@ export class AuditLockContentionError extends Error {
         `recorded pid + a process check, not lsof.)`
     );
     this.name = "AuditLockContentionError";
+  }
+}
+
+export class AuditLockHoldDeadlineError extends Error {
+  constructor(
+    readonly lockPath: string,
+    readonly deadlineMs: number
+  ) {
+    super(
+      `audit write lock at '${lockPath}' exceeded its ${deadlineMs}ms hold deadline; ` +
+        `the in-flight append was abandoned and the lock was released so later audit ` +
+        `writes can continue.`
+    );
+    this.name = "AuditLockHoldDeadlineError";
   }
 }
 
@@ -1736,6 +1818,18 @@ export class AuditLog {
    * acquire-temp sweep; resolved once from config/env. See
    * {@link resolveIdlessStaleLockMs}. */
   private readonly idlessStaleLockMs: number;
+  /** Deadline-bounds a single acquired lock hold; see {@link withAuditWriteLock}. */
+  private readonly writeLockHoldDeadlineMs: number;
+  /** Same-pid stale-lock breaker bound; must exceed {@link writeLockHoldDeadlineMs}. */
+  private readonly selfHeldStaleLockMs: number;
+  /** Process-local count of forced audit-write-lock recovery events. */
+  private writeLockRecoveryCount = 0;
+  /**
+   * Process-local subscribers notified when the lock layer performs a forced
+   * recovery. Listeners are observability hooks only: they are fire-and-forget
+   * and can never veto or fail the append path.
+   */
+  private readonly writeLockRecoveryListeners: AuditWriteLockRecoveryListener[] = [];
   /** One-shot guard: the orphan `.acquire.*.tmp` sweep runs once per process on
    * the first write-lock acquire (crash-orphan temps can only predate this
    * process, so a single lazy startup sweep suffices to keep them from
@@ -1792,6 +1886,13 @@ export class AuditLog {
       config?.createOwnerChown ??
       ((handle, owner) => handle.chown(owner.uid, owner.gid));
     this.idlessStaleLockMs = resolveIdlessStaleLockMs(config?.idlessStaleLockMs);
+    this.writeLockHoldDeadlineMs = resolveWriteLockHoldDeadlineMs(
+      config?.writeLockHoldDeadlineMs
+    );
+    this.selfHeldStaleLockMs = resolveSelfHeldStaleLockMs(
+      config?.selfHeldStaleLockMs,
+      this.writeLockHoldDeadlineMs
+    );
     this.consultSplitBoundary = config?.consultSplitBoundary ?? true;
     this.splitBoundaryMacKey = deriveAuditStoreSplitBoundaryMacKey(masterKey);
     this.filesystemCapabilities = asFilesystemCapabilities(storage);
@@ -1810,6 +1911,38 @@ export class AuditLog {
       console.error(
         `[audit-log] cross-process file locking enabled: ${this.auditWriteLockPath}`
       );
+    }
+  }
+
+  /**
+   * Subscribe to audit-write-lock recovery events. The hook is intentionally
+   * process-local and observability-only: callbacks run fire-and-forget, and any
+   * thrown/rejected listener failure is swallowed so recovery cannot become a new
+   * audit append failure mode.
+   */
+  onWriteLockRecovery(listener: AuditWriteLockRecoveryListener): void {
+    this.writeLockRecoveryListeners.push(listener);
+  }
+
+  /** Process-local count of forced audit-write-lock recovery events. */
+  getWriteLockRecoveryCount(): number {
+    return this.writeLockRecoveryCount;
+  }
+
+  private recordWriteLockRecoveryEvent(event: AuditWriteLockRecoveryEvent): void {
+    this.writeLockRecoveryCount++;
+    for (const listener of this.writeLockRecoveryListeners) {
+      try {
+        const maybePromise = listener(event) as unknown;
+        if (
+          maybePromise &&
+          typeof (maybePromise as { then?: unknown }).then === "function"
+        ) {
+          void Promise.resolve(maybePromise).catch(() => undefined);
+        }
+      } catch {
+        // Listener hooks must never throw into the append path.
+      }
     }
   }
 
@@ -2051,9 +2184,12 @@ export class AuditLog {
       const encrypted = encrypt(serialized, this.encryptionKey);
       const encryptedBytes = stringToBytes(JSON.stringify(encrypted));
       const encryptedPayloadBytes = toBase64url(encryptedBytes);
-      await this.withAuditWriteLock(async () => {
+      await this.withAuditWriteLock(async (signal) => {
+        this.assertAuditWriteLockActive(signal);
         await this.ensureLoaded();
+        this.assertAuditWriteLockActive(signal);
         await this.freshenChainStateFromDisk();
+        this.assertAuditWriteLockActive(signal);
         const sequence = this.nextSequence;
         const prevHash = this.lastEntryHash;
         const entryHash = computeAuditEntryHash({
@@ -2074,12 +2210,18 @@ export class AuditLog {
         const key = `entry-${String(sequence).padStart(20, "0")}-${Date.now()}-${this.counter++}-${this.instanceKeyNonce}`;
         const persistedBytes = stringToBytes(JSON.stringify(envelope));
         try {
+          this.assertAuditWriteLockActive(signal);
           await this.writeAuditEntryBytes(key, persistedBytes);
+          this.assertAuditWriteLockActive(signal);
 
           if (options.verifyDurability) {
+            this.assertAuditWriteLockActive(signal);
             await this.verifyPersistedBytes(key, persistedBytes);
+            this.assertAuditWriteLockActive(signal);
           }
+          this.assertAuditWriteLockActive(signal);
           await this.writeHeadAnchor(sequence, entryHash);
+          this.assertAuditWriteLockActive(signal);
           // F2 Finding 1: the FIRST time this operator instance persists a
           // post-split SUFFIX entry (above the sealed tip) under boundary
           // consultation, record the operator-provenance "suffix established"
@@ -2096,11 +2238,13 @@ export class AuditLog {
             this.cachedSealedTip > 0
           ) {
             try {
+              this.assertAuditWriteLockActive(signal);
               await this.storage.write(
                 "_meta",
                 AUDIT_POST_SPLIT_SUFFIX_ESTABLISHED_KEY,
                 stringToBytes("1")
               );
+              this.assertAuditWriteLockActive(signal);
               this.postSplitSuffixMarkerEnsured = true;
             } catch {
               // Non-fatal; retried on the next suffix append.
@@ -2306,12 +2450,14 @@ export class AuditLog {
       // a no-op for non-filesystem backends. maybeRotate is called from
       // persistChainedEntry AFTER its own lock has been released, so this
       // re-acquisition cannot deadlock (mirrors writeCheckpointIfNeeded).
-      await this.withAuditWriteLock(async () => {
+      await this.withAuditWriteLock(async (signal) => {
         // Re-list INSIDE the lock: another rotator may have pruned since the
         // pre-check, so recompute the cut against the authoritative state.
+        this.assertAuditWriteLockActive(signal);
         const metas = (await this.storage.list(AUDIT_NAMESPACE)).filter(
           abovesSealedFloor
         );
+        this.assertAuditWriteLockActive(signal);
         metas.sort((a, b) => a.key.localeCompare(b.key));
         // Always keep at least one entry as the surviving anchor base — even
         // under degenerate caps (maxEntries: 0, or maxTotalSizeBytes smaller than
@@ -2336,14 +2482,18 @@ export class AuditLog {
         // fail-closed guarantee. Rotation retries on the next append.
         let safeToPrune = false;
         try {
+          this.assertAuditWriteLockActive(signal);
           const newBaseRaw = await this.storage.read(
             AUDIT_NAMESPACE,
             metas[toDelete]!.key
           );
+          this.assertAuditWriteLockActive(signal);
           if (newBaseRaw) {
             const parsed = JSON.parse(bytesToString(newBaseRaw));
             if (isPersistedAuditEnvelopeV2(parsed)) {
+              this.assertAuditWriteLockActive(signal);
               await this.writeRotationAnchor(parsed.sequence, parsed.prev_hash);
+              this.assertAuditWriteLockActive(signal);
             }
             // Reached only if the v2 anchor was written, or the cut is legacy/
             // non-v2 (no chained anchor needed) — both are safe to prune.
@@ -2355,7 +2505,9 @@ export class AuditLog {
         if (!safeToPrune) return;
 
         for (let i = 0; i < toDelete; i++) {
+          this.assertAuditWriteLockActive(signal);
           await this.storage.delete(AUDIT_NAMESPACE, metas[i]!.key);
+          this.assertAuditWriteLockActive(signal);
         }
       });
     } finally {
@@ -3700,8 +3852,42 @@ export class AuditLog {
     return true;
   }
 
-  private async withAuditWriteLock<T>(operation: () => Promise<T>): Promise<T> {
-    if (!this.auditWriteLockPath) return operation();
+  private auditLockHoldDeadlineError(): AuditLockHoldDeadlineError {
+    return new AuditLockHoldDeadlineError(
+      this.auditWriteLockPath ?? AUDIT_WRITE_LOCK_FILE,
+      this.writeLockHoldDeadlineMs
+    );
+  }
+
+  private assertAuditWriteLockActive(signal: AuditWriteLockAbortSignal): void {
+    if (signal.aborted) {
+      throw this.auditLockHoldDeadlineError();
+    }
+  }
+
+  /**
+   * Acquire the cross-process audit write lock for one deadline-bounded
+   * operation.
+   *
+   * Mini2 freeze, 2026-08-02 (finding documented 2026-08-03): the previous
+   * `try/finally` released the lock only after the awaited operation settled, so
+   * a hung filesystem/storage write kept a live same-boot lock on disk forever
+   * and every later append failed with contention. The operation now races a
+   * hold deadline: on expiry the append fails loudly, listeners are notified,
+   * and the existing inode-verified release path runs.
+   *
+   * Residual, documented by design: a hang INSIDE the storage write can still
+   * land bytes after abandonment. Entry keys are unique, so nothing is
+   * overwritten; the cooperative abort checks keep the abandoned operation from
+   * writing later steps or mutating in-memory head state, and full-chain
+   * verification surfaces any duplicate sequence as an integrity finding. Loud
+   * and chain-visible degradation beats frozen-forever.
+   */
+  private async withAuditWriteLock<T>(
+    operation: (signal: AuditWriteLockAbortSignal) => Promise<T>
+  ): Promise<T> {
+    const signal: AuditWriteLockAbortSignal = { aborted: false };
+    if (!this.auditWriteLockPath) return operation(signal);
 
     await mkdir(this.filesystemCapabilities!.namespacePath(AUDIT_NAMESPACE), {
       recursive: true,
@@ -3754,7 +3940,34 @@ export class AuditLog {
     }
 
     try {
-      return await operation();
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const operationPromise = Promise.resolve().then(() => operation(signal));
+      void operationPromise.catch(() => undefined);
+      try {
+        const deadlinePromise = new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(() => {
+            signal.aborted = true;
+            // SAFETY: forced lock recovery must be loud on operator-facing
+            // stderr BEFORE any other handling (AGENTS.md constraint 5).
+            console.error(
+              `[audit-log] AUDIT-WRITE-LOCK-RECOVERY reason=write_lock_hold_deadline_exceeded ` +
+                `lock=${this.auditWriteLockPath} deadline_ms=${this.writeLockHoldDeadlineMs} ` +
+                `- abandoning the in-flight append and releasing the lock; ` +
+                `the underlying operation may still be running`,
+            );
+            this.recordWriteLockRecoveryEvent({
+              reason: "write_lock_hold_deadline_exceeded",
+              lockPath: this.auditWriteLockPath!,
+            });
+            reject(this.auditLockHoldDeadlineError());
+          }, this.writeLockHoldDeadlineMs);
+          timer.unref?.();
+        });
+        return await Promise.race([operationPromise, deadlinePromise]);
+      } finally {
+        signal.aborted = true;
+        if (timer) clearTimeout(timer);
+      }
     } finally {
       // Inode-verified release (symmetric with the stale-break path). Delete the
       // lock only if it is still the file WE published; if a broken-and-republished
@@ -4159,6 +4372,32 @@ export class AuditLog {
         if (lockUptimeMs !== undefined && ourStartUptime !== undefined) {
           if (lockUptimeMs < ourStartUptime - AUDIT_LOCK_MONO_UPTIME_TOLERANCE_MS) {
             return this.unlinkIfSameInode(lockPath, proven);
+          }
+          // Mini2 2026-08-02 freeze recovery edge (finding 2026-08-03): with
+          // the hold deadline above, this process should never leave its own
+          // same-boot lock older than `selfHeldStaleLockMs`. If it does, the
+          // holder is a wedged/abandoned append or a failed graceful release,
+          // not legitimate contention. Use monotonic uptime age only after
+          // `boot_id` proved same boot; wall time is deliberately irrelevant.
+          if (currentUptime !== undefined) {
+            const heldForMs = currentUptime - lockUptimeMs;
+            if (
+              heldForMs >
+              this.selfHeldStaleLockMs + AUDIT_LOCK_MONO_UPTIME_TOLERANCE_MS
+            ) {
+              const roundedHeldForMs = Math.max(0, Math.round(heldForMs));
+              // SAFETY: forced lock recovery must be loud on operator-facing
+              // stderr BEFORE any other handling (AGENTS.md constraint 5).
+              console.error(
+                `[audit-log] AUDIT-WRITE-LOCK-RECOVERY reason=self_held_stale_forced_release ` +
+                  `lock=${lockPath} held_for_ms=${roundedHeldForMs} pid=${holderPid}`,
+              );
+              this.recordWriteLockRecoveryEvent({
+                reason: "self_held_stale_forced_release",
+                lockPath,
+              });
+              return this.unlinkIfSameInode(lockPath, proven);
+            }
           }
           return false;
         }
@@ -5057,8 +5296,10 @@ export class AuditLog {
     if (this.checkpointInFlight || this.hashesSinceCheckpoint.length === 0) return;
     this.checkpointInFlight = true;
     try {
-      await this.withAuditWriteLock(async () => {
+      await this.withAuditWriteLock(async (signal) => {
+        this.assertAuditWriteLockActive(signal);
         await this.freshenChainStateFromDisk();
+        this.assertAuditWriteLockActive(signal);
         // F2 Option A: never ask for hashes at or below a valid split
         // boundary's sealed tip, since those entries are the legacy region
         // this instance's routine paths must never attempt to read. A checkpoint
@@ -5070,12 +5311,14 @@ export class AuditLog {
         // that is unreadable at this privilege (a root-owned legacy file on an
         // armed box) instead of throwing EACCES out of the append/checkpoint path.
         const splitBoundary = await this.loadSplitBoundary();
+        this.assertAuditWriteLockActive(signal);
         const sealedTipSequence =
           splitBoundary.status === "valid"
             ? splitBoundary.boundary.sealed_tip_sequence
             : 0;
         const previousCheckpointSequence =
           await this.readHighestAuditCheckpointSequence(sealedTipSequence);
+        this.assertAuditWriteLockActive(signal);
         const checkpointSequence = this.nextSequence - 1;
         const fromSequence = Math.max(
           previousCheckpointSequence + 1,
@@ -5086,6 +5329,7 @@ export class AuditLog {
           checkpointSequence,
           sealedTipSequence
         );
+        this.assertAuditWriteLockActive(signal);
         if (hashes.length === 0) return;
         await this.writeCheckpointRecord({
           checkpoint_kind: "audit-checkpoint",
@@ -5095,6 +5339,7 @@ export class AuditLog {
           previous_checkpoint_sequence: previousCheckpointSequence,
           signed_at: new Date().toISOString(),
         });
+        this.assertAuditWriteLockActive(signal);
         this.lastCheckpointSequence = checkpointSequence;
         this.hashesSinceCheckpoint = [];
         this.criticalAppendsSinceCheckpoint = 0;

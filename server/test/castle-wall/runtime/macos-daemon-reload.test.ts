@@ -18,13 +18,13 @@
  */
 
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { mkdir, mkdtemp, rm, unlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, unlink, writeFile } from "node:fs/promises";
 import { type Socket } from "node:net";
-import { tmpdir } from "node:os";
+import { tmpdir, uptime as osUptime } from "node:os";
 import { join } from "node:path";
 
 import { ed25519 } from "@noble/curves/ed25519";
-import { AuditLog } from "../../../src/operational/audit-log.js";
+import { AuditLog, type AuditLogConfig } from "../../../src/operational/audit-log.js";
 import { FilesystemStorage } from "../../../src/storage/filesystem.js";
 import { generateRandomKey } from "../../../src/core/random.js";
 import { toBase64url } from "../../../src/core/encoding.js";
@@ -96,17 +96,32 @@ describe("Castle Wall macOS daemon — policy reload hang guard", () => {
     }
   });
 
-  async function provisionFortress() {
+  async function provisionFortress(auditConfig: AuditLogConfig = {}) {
     const fortressPath = await mkdtemp(join(tmpdir(), "cw-reload-"));
     tempDirs.push(fortressPath);
     const masterKey = generateRandomKey();
     const auditLog = new AuditLog(
       new FilesystemStorage(join(fortressPath, "state")),
       masterKey,
-      { integrityMode: "lenient" },
+      { integrityMode: "lenient", ...auditConfig },
     );
     return { fortressPath, masterKey, auditLog };
   }
+
+  type LockInternals = {
+    withAuditWriteLock<T>(operation: () => Promise<T>): Promise<T>;
+  };
+
+  async function currentStampedBootId(auditLog: AuditLog, lockPath: string): Promise<string> {
+    let id: unknown;
+    await (auditLog as unknown as LockInternals).withAuditWriteLock(async () => {
+      id = JSON.parse(await readFile(lockPath, "utf8")).boot_id;
+    });
+    expect(typeof id).toBe("string");
+    return id as string;
+  }
+
+  const waitMs = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
   /**
    * Fake listener whose broadcast phase is controllable. `broadcastManifestUpdate`
@@ -321,6 +336,71 @@ describe("Castle Wall macOS daemon — policy reload hang guard", () => {
     const stopped = entries.filter((e) => e.operation === "filter_stopped");
     expect(stopped.length).toBeGreaterThan(0);
     expect(stopped[stopped.length - 1]!.details?.audit_write_degraded_count).toBe(1);
+  });
+
+  it("carries audit write-lock recovery events on the next castle_wall_heartbeat", async () => {
+    const { fortressPath, masterKey, auditLog } = await provisionFortress({
+      writeLockHoldDeadlineMs: 2_000,
+      selfHeldStaleLockMs: 3_000,
+    });
+    const helper = makeControllableHelper();
+    const listener = makeControllableListener();
+    const lockPath = join(fortressPath, "state", "_audit", ".audit-write.lock");
+    const bootId = await currentStampedBootId(auditLog, lockPath);
+    // Plant the wedged lock BEFORE the daemon starts: once the daemon is up its
+    // 0.1s heartbeat appends acquire/release the lock continuously, and a
+    // concurrent holder's inode-verified release would unlink a lock file we
+    // overwrote in place (writeFile keeps the inode) before it is ever
+    // contended. Planting first makes the daemon's own startup append hit the
+    // stale self-held lock deterministically — the mini2 shape: a lock OUR OWN
+    // process stamped AFTER its start and then held past the bound. A stamp
+    // predating our start would hit the reused-self-pid orphan branch instead
+    // (silent break, no recovery event), so ensure the worker is older than
+    // selfHeldStaleLockMs + tolerance, then stamp just above our start.
+    const toleranceMs = 1_000; // AUDIT_LOCK_MONO_UPTIME_TOLERANCE_MS in src
+    const marginMs = 500;
+    const requiredAgeMs = 3_000 + toleranceMs + marginMs;
+    if (process.uptime() * 1000 < requiredAgeMs) {
+      await waitMs(requiredAgeMs - process.uptime() * 1000);
+    }
+    const currentUptimeMs = osUptime() * 1000;
+    const ourStartUptimeMs = currentUptimeMs - process.uptime() * 1000;
+    const lockUptimeMs = Math.max(1, Math.round(ourStartUptimeMs + marginMs / 2));
+    const heldForMs = currentUptimeMs - lockUptimeMs;
+    await writeFile(
+      lockPath,
+      JSON.stringify({
+        pid: process.pid,
+        acquired_at: new Date(Date.now() - heldForMs).toISOString(),
+        uptime_ms: lockUptimeMs,
+        boot_id: bootId,
+      }),
+    );
+    expect(auditLog.getWriteLockRecoveryCount()).toBe(0);
+    const handle = await startDaemon(fortressPath, auditLog, masterKey, helper, listener.factory, {
+      auditHeartbeatIntervalSeconds: 0.1,
+    });
+    try {
+      // The daemon's startup `filter_started` append contends the planted
+      // lock, forces the self-held release, and the awaited first heartbeat
+      // carries the degraded count.
+      expect(auditLog.getWriteLockRecoveryCount()).toBeGreaterThanOrEqual(1);
+      await waitMs(300);
+      const { entries } = await auditLog.query({ layer: "l1", limit: 500 });
+      const heartbeatRecoveryUnits = entries
+        .filter((entry) => entry.operation === "castle_wall_heartbeat")
+        .reduce(
+          (sum, entry) =>
+            sum +
+            (typeof entry.details?.audit_write_degraded_count === "number"
+              ? entry.details.audit_write_degraded_count
+              : 0),
+          0,
+        );
+      expect(heartbeatRecoveryUnits).toBeGreaterThanOrEqual(1);
+    } finally {
+      await handle.stop();
+    }
   });
 
   it("overlapping heartbeat carries never double-subtract; a later drop still emits a marker (fix-round HIGH)", async () => {
