@@ -9,7 +9,7 @@
  * can inspect what their agent has done.
  */
 
-import { mkdir, open, readFile, readdir, rm, link, stat, unlink } from "node:fs/promises";
+import { lstat, mkdir, open, readFile, readdir, rm, link, stat, unlink } from "node:fs/promises";
 import { readFileSync, type Stats } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
@@ -229,6 +229,18 @@ export interface AuditLogConfig {
     owner: { uid: number; gid: number },
   ) => Promise<void>;
   /**
+   * Test seam ONLY for the pre-existing-namespace-chain ownership check
+   * (PR #1084 gate F2); production uses `fs.lstat`. Lets tests simulate a
+   * root-owned or foreign-owned chain without privileges; callers should set
+   * only `createOwner`.
+   */
+  namespaceDirLstat?: (path: string) => Promise<{
+    uid: number;
+    gid: number;
+    isSymbolicLink(): boolean;
+    isDirectory(): boolean;
+  }>;
+  /**
    * Backstop interval (ms) between full on-disk re-verifications on the eager
    * read path. Defaults to {@link DEFAULT_AUDIT_EAGER_REVERIFY_INTERVAL_MS}
    * (30s); also overridable via the `AUDIT_EAGER_REVERIFY_INTERVAL_MS` env var.
@@ -371,9 +383,13 @@ const AUDIT_HEAD_ANCHOR_MAC_DOMAIN = "sanctuary.audit-head-anchor.v1\n";
 // (drill-verified 2026-07-14, finding F2). The fix is NOT to weaken this
 // check (that was the rejected Option C: it would blind the operator's own
 // integrity check to half of its own store); it is store separation: going
-// forward the daemon writes its own root-owned chain under `_audit-daemon`
+// forward the daemon writes its own SEPARATE chain under `_audit-daemon`
 // (see operational/audit-store-split.ts) while the operator keeps writing
-// this `_audit` chain, completely untouched.
+// this `_audit` chain, completely untouched. (Historical note: the daemon
+// chain's files were originally root-owned; since the fortress-ownership
+// create-with-fchown work (spec 2026-07-30, #1056) a root daemon hands its
+// chain's files to the fortress owner at creation via `createOwner`, so the
+// separation is by NAMESPACE and writer, not by file ownership.)
 //
 // The one remaining problem is HISTORY: an already-armed fortress has root
 // entries interleaved THROUGHOUT its existing single hash chain (the chain
@@ -1829,6 +1845,9 @@ export class AuditLog {
     leafDir: string,
     owner: AuditCreateOwner,
   ) => Promise<void>;
+  private readonly namespaceDirLstat: NonNullable<
+    AuditLogConfig["namespaceDirLstat"]
+  >;
   /** Age bound (ms) for the id-less 0-byte stale-lock fallback and the orphan
    * acquire-temp sweep; resolved once from config/env. See
    * {@link resolveIdlessStaleLockMs}. */
@@ -1902,6 +1921,7 @@ export class AuditLog {
       ((handle, owner) => handle.chown(owner.uid, owner.gid));
     this.createOwnerChownDirChain =
       config?.createOwnerChownDirChain ?? chownCreatedDirChain;
+    this.namespaceDirLstat = config?.namespaceDirLstat ?? ((path) => lstat(path));
     this.idlessStaleLockMs = resolveIdlessStaleLockMs(config?.idlessStaleLockMs);
     this.writeLockHoldDeadlineMs = resolveWriteLockHoldDeadlineMs(
       config?.writeLockHoldDeadlineMs
@@ -3900,6 +3920,56 @@ export class AuditLog {
    * verification surfaces any duplicate sequence as an integrity finding. Loud
    * and chain-visible degradation beats frozen-forever.
    */
+  /**
+   * PR #1084 gate F2: retry must not launder a failed ownership handback. If
+   * the created-chain chown failed (or the process crashed between mkdir and
+   * chown), the namespace directories exist ROOT-OWNED; the next append's
+   * recursive mkdir then returns undefined, and without this check the write
+   * would proceed silently, permanently reinstating the root-owned-chain
+   * defect for the segment. When the chain already exists and `createOwner`
+   * is set, verify ownership of the two directories this log owns (the
+   * storage base dir and the namespace dir) via no-follow lstat and:
+   *   - repair a root-owned or gid-drifted directory through the SAME
+   *     descriptor-verified `chownCreatedDirChain` path (#1051 safety
+   *     contract: `O_NOFOLLOW | O_DIRECTORY` opens, chown through handles) —
+   *     repair is correct here because these are the daemon's own audit
+   *     namespace directories, not arbitrary pre-existing dirs;
+   *   - REFUSE loudly on a symlinked/non-directory entry or a directory owned
+   *     by any OTHER uid (never seize a third party's directory); the append
+   *     fails with a diagnosable reason (hard constraint 5: no silent proceed
+   *     on wrong ownership).
+   * Cost: two lstats per locked write in the healthy case. Deliberately no
+   * caching, so an external ownership change mid-run stays detected.
+   */
+  private async verifyOrRepairNamespaceDirOwnership(
+    leafDir: string,
+    owner: AuditCreateOwner,
+  ): Promise<void> {
+    const dirsToCheck = [dirname(leafDir), leafDir];
+    let topmostRepair: string | undefined;
+    for (const dir of dirsToCheck) {
+      const stats = await this.namespaceDirLstat(dir);
+      if (stats.isSymbolicLink() || !stats.isDirectory()) {
+        throw new Error(
+          `audit namespace directory ${dir} is not a plain directory; refusing to write audit entries through it`
+        );
+      }
+      if (stats.uid !== 0 && stats.uid !== owner.uid) {
+        throw new Error(
+          `audit namespace directory ${dir} is owned by uid ${stats.uid} (neither root nor the fortress owner uid ${owner.uid}); refusing to write audit entries through it. Run 'sudo sanctuary castle-wall repair-custody' to repair operator custody.`
+        );
+      }
+      const needsRepair = stats.uid === 0 || stats.gid !== owner.gid;
+      if (needsRepair && topmostRepair === undefined) {
+        topmostRepair = dir;
+      }
+    }
+    if (topmostRepair !== undefined) {
+      // Fail-closed: a repair failure propagates and fails the append.
+      await this.createOwnerChownDirChain(topmostRepair, leafDir, owner);
+    }
+  }
+
   private async withAuditWriteLock<T>(
     operation: (signal: AuditWriteLockAbortSignal) => Promise<T>
   ): Promise<T> {
@@ -3912,17 +3982,26 @@ export class AuditLog {
       recursive: true,
       mode: 0o700,
     });
-    if (firstCreated !== undefined && this.createOwner !== undefined) {
-      /**
-       * Fortress-ownership spec 2026-07-30: recursive mkdir as root creates
-       * the missing namespace chain root-owned 0700; files inside are
-       * operator-owned but the operator cannot traverse the directories.
-       */
-      await this.createOwnerChownDirChain(
-        firstCreated,
-        auditNamespaceDir,
-        this.createOwner,
-      );
+    if (this.createOwner !== undefined) {
+      if (firstCreated !== undefined) {
+        /**
+         * Fortress-ownership spec 2026-07-30: recursive mkdir as root creates
+         * the missing namespace chain root-owned 0700; files inside are
+         * operator-owned but the operator cannot traverse the directories.
+         */
+        await this.createOwnerChownDirChain(
+          firstCreated,
+          auditNamespaceDir,
+          this.createOwner,
+        );
+      } else {
+        // PR #1084 gate F2: retry must not launder a failed handback. See
+        // {@link verifyOrRepairNamespaceDirOwnership}.
+        await this.verifyOrRepairNamespaceDirOwnership(
+          auditNamespaceDir,
+          this.createOwner,
+        );
+      }
     }
     // Once-per-process: GC any `.acquire.*.tmp` a prior process's crash/kill-9
     // stranded between `link()` and its cleanup (invisible to `list()`, litter
