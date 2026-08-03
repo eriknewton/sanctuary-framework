@@ -20,7 +20,7 @@ import type {
   FilesystemStorageCapabilities,
   StorageBackend,
 } from "../storage/interface.js";
-import { writeFileCustody } from "../storage/custody-fs.js";
+import { chownCreatedDirChain, writeFileCustody } from "../storage/custody-fs.js";
 import { encrypt, decrypt, type EncryptedPayload } from "../core/encryption.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
 import { hmacSha256 } from "../core/hashing.js";
@@ -217,6 +217,16 @@ export interface AuditLogConfig {
   createOwnerChown?: (
     handle: AuditLockFileHandle,
     owner: AuditCreateOwner,
+  ) => Promise<void>;
+  /**
+   * Test seam ONLY for the namespace-directory create-with-fchown chain;
+   * production uses `chownCreatedDirChain` (storage/custody-fs.ts); callers
+   * should set only `createOwner`.
+   */
+  createOwnerChownDirChain?: (
+    firstCreated: string,
+    leafDir: string,
+    owner: { uid: number; gid: number },
   ) => Promise<void>;
   /**
    * Backstop interval (ms) between full on-disk re-verifications on the eager
@@ -1814,6 +1824,11 @@ export class AuditLog {
     handle: AuditLockFileHandle,
     owner: AuditCreateOwner,
   ) => Promise<void>;
+  private readonly createOwnerChownDirChain: (
+    firstCreated: string,
+    leafDir: string,
+    owner: AuditCreateOwner,
+  ) => Promise<void>;
   /** Age bound (ms) for the id-less 0-byte stale-lock fallback and the orphan
    * acquire-temp sweep; resolved once from config/env. See
    * {@link resolveIdlessStaleLockMs}. */
@@ -1885,6 +1900,8 @@ export class AuditLog {
     this.createOwnerChown =
       config?.createOwnerChown ??
       ((handle, owner) => handle.chown(owner.uid, owner.gid));
+    this.createOwnerChownDirChain =
+      config?.createOwnerChownDirChain ?? chownCreatedDirChain;
     this.idlessStaleLockMs = resolveIdlessStaleLockMs(config?.idlessStaleLockMs);
     this.writeLockHoldDeadlineMs = resolveWriteLockHoldDeadlineMs(
       config?.writeLockHoldDeadlineMs
@@ -3889,10 +3906,24 @@ export class AuditLog {
     const signal: AuditWriteLockAbortSignal = { aborted: false };
     if (!this.auditWriteLockPath) return operation(signal);
 
-    await mkdir(this.filesystemCapabilities!.namespacePath(AUDIT_NAMESPACE), {
+    const auditNamespaceDir =
+      this.filesystemCapabilities!.namespacePath(AUDIT_NAMESPACE);
+    const firstCreated = await mkdir(auditNamespaceDir, {
       recursive: true,
       mode: 0o700,
     });
+    if (firstCreated !== undefined && this.createOwner !== undefined) {
+      /**
+       * Fortress-ownership spec 2026-07-30: recursive mkdir as root creates
+       * the missing namespace chain root-owned 0700; files inside are
+       * operator-owned but the operator cannot traverse the directories.
+       */
+      await this.createOwnerChownDirChain(
+        firstCreated,
+        auditNamespaceDir,
+        this.createOwner,
+      );
+    }
     // Once-per-process: GC any `.acquire.*.tmp` a prior process's crash/kill-9
     // stranded between `link()` and its cleanup (invisible to `list()`, litter
     // only). Bounded and best-effort so it can never block or fail an acquire.
