@@ -230,6 +230,51 @@ describe("Dashboard HTTP API", () => {
     await streamRes.body?.cancel();
   });
 
+  it("denies tokenless loopback GET /api/pending even with loopback auto-auth enabled", async () => {
+    handle = await startForTest({ authToken: "secret-xyz" });
+    handle.setV11LoopbackAutoAuth(true);
+    const res = await fetch(`${handle.url}/api/pending`);
+    expect(res.status).toBe(401);
+    expect(await res.json()).toEqual({ error: "unauthorized" });
+  });
+
+  it("control: keeps tokenless loopback GET /api/status open when loopback auto-auth is enabled", async () => {
+    handle = await startForTest({ authToken: "secret-xyz" });
+    handle.setV11LoopbackAutoAuth(true);
+    const res = await fetch(`${handle.url}/api/status`);
+    expect(res.status).toBe(200);
+  });
+
+  it("serves GET /api/pending to the operator bearer when loopback auto-auth is enabled", async () => {
+    const pending: PendingApproval = {
+      id: "req-v11-pending-1",
+      operation: "state_export",
+      tier: 1,
+      reason: "Export requires operator approval",
+      created_at: new Date().toISOString(),
+    };
+    handle = await startForTest({
+      authToken: "secret-xyz",
+      pendingApprovals: [pending],
+    });
+    handle.setV11LoopbackAutoAuth(true);
+    const res = await fetch(`${handle.url}/api/pending`, {
+      headers: { Authorization: "Bearer secret-xyz" },
+    });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual([pending]);
+  });
+
+  it("rejects a wrong bearer on GET /api/pending even with loopback auto-auth enabled", async () => {
+    handle = await startForTest({ authToken: "secret-xyz" });
+    handle.setV11LoopbackAutoAuth(true);
+    const res = await fetch(`${handle.url}/api/pending`, {
+      headers: { Authorization: "Bearer wrong-secret-xyz" },
+    });
+    expect(res.status).toBe(401);
+    expect(await res.json()).toEqual({ error: "unauthorized" });
+  });
+
   it("emits an initial 'snapshot' event on SSE connect", async () => {
     handle = await startForTest();
     const res = await fetch(`${handle.url}/api/stream`);
