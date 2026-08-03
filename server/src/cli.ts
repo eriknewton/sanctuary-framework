@@ -307,6 +307,12 @@ async function main(): Promise<void> {
     return drainAndExit(code);
   }
 
+  if (args[0] === "checkpoint") {
+    const { runCheckpointCommand } = await import("./cli/checkpoint.js");
+    const code = await runCheckpointCommand({ argv: args.slice(1) });
+    return drainAndExit(code);
+  }
+
   if (args[0] === "license") {
     const { runLicenseCommand } = await import("./cli/license.js");
     const code = await runLicenseCommand({ argv: args.slice(1) });
@@ -861,6 +867,7 @@ Usage:
   sanctuary check-updates                 # Explicitly check for updates
   sanctuary completion <bash|zsh|fish>    # Emit shell completion
   sanctuary audit search [opts]           # Search local audit log
+  sanctuary checkpoint <cmd> [opts]       # Local encrypted memory checkpoints
   sanctuary transparency <cmd> [opts]     # Signed enforcement checkpoints
   sanctuary verify-transparency [opts]    # Verify a checkpoint chain offline
   sanctuary generate systemd [opts]       # Emit systemd service unit
@@ -912,6 +919,10 @@ Subcommands:
 
   audit                Search local audit history.
                        Use "sanctuary audit --help" for options.
+
+  checkpoint           Create, list, show, and prune local encrypted memory
+                       checkpoints. Use "sanctuary checkpoint --help" for
+                       options.
 
   distress             Emit a distress signal through the reserved habeas
                        lane (operator test verb; same path the agent uses).

@@ -33,6 +33,7 @@
     { "label": "concierge-memory-store-v1", "class": "decryptable-store", "owner": "chat/concierge-memory-store.ts:151", "fixture": false, "fixture_via": "frozen-surfaces guard" },
     { "label": "query-anonymity-reverse-mapping-v1", "class": "decryptable-store", "owner": "query-anonymity/reverse-mapping-store.ts:46", "fixture": false, "fixture_via": "frozen-surfaces guard" },
     { "label": "sanctuary-v1.1-coordination-handoffs", "class": "decryptable-store", "owner": "coordination/handoff-store.ts:43", "fixture": false, "fixture_via": "frozen-surfaces guard" },
+    { "label": "memory-checkpoint-v1", "class": "decryptable-store", "owner": "memory-checkpoint/store.ts:43", "fixture": false, "fixture_via": "memory-checkpoint encrypted-at-rest test", "note": "Encrypts local StateStore export-bundle checkpoint snapshots under <fortress>/checkpoints/<id>/bundle.enc; record.json is non-secret metadata; scan-reconciled 2026-08-03." },
     { "label": "transparency-counter-floor", "class": "crypto-domain-label", "owner": "transparency/emitter.ts:426", "fixture": false, "note": "MAC key for the transparency counter-floor (anti-rollback)." },
     { "label": "transparency-anchor-signing-v1", "class": "crypto-domain-label", "owner": "transparency/anchor.ts:57", "fixture": false, "note": "Dedicated ECDSA P-256 anchoring signing key." },
     { "label": "transparency-anchor-config-mac-v1", "class": "crypto-domain-label", "owner": "transparency/anchor.ts:65", "fixture": false, "note": "MAC key authenticating the anchoring config." },
