@@ -1,3 +1,9 @@
+// fail-before-exempt: pins pre-existing #944/#1056 lock-recovery + lock-createOwner
+// semantics that are already on main; this PR's only edit is a test-helper stub
+// (makeLog's namespaceDirLstat) decoupling the #1056 createOwner tests from the
+// host uid after PR #1084's F2 deep-walk added a directory precondition. No test
+// here should go red-against-main; the deep-walk itself is covered by
+// audit-log-namespace-dir-owner.test.ts (which is not exempt).
 import { mkdtemp, rm, writeFile, readFile, rename, mkdir, stat, utimes, readdir } from "node:fs/promises";
 import { tmpdir, uptime as osUptime } from "node:os";
 import type { Stats } from "node:fs";
