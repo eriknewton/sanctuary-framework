@@ -53,11 +53,13 @@ export interface ResolvedEnforcementAvailability {
  * delivered asynchronously relative to each other, so seqs interleave across
  * paths: a dedicated report signed at seq N routinely arrives after a
  * flow-carried report signed at seq N+k. Replay floors are therefore kept
- * per stream: within one stream delivery is in signing order, so a seq at or
- * below that stream's floor is a genuine replay; across streams it is just
- * out-of-order delivery. Cross-stream replay (re-delivering one stream's
- * message on the other path) is structurally impossible because each
- * verifier checks the signed body's `operation` field
+ * per stream. Hardware has shown rare within-stream reorder as well (23
+ * delta-1/delta-2 rejections in about 26h on the Mini2 sustained drill), so a
+ * seq at or below that stream's floor is rejected because stale state must not
+ * overwrite fresher verified state. Across streams, lower sequence numbers
+ * are expected asynchronous delivery rather than replay. Cross-stream replay
+ * (re-delivering one stream's message on the other path) is structurally
+ * impossible because each verifier checks the signed body's `operation` field
  * (`enforcement_availability_report` vs `egress_approved`/`egress_blocked`).
  *
  * Scope (deliberate, and unchanged from the single-floor design this

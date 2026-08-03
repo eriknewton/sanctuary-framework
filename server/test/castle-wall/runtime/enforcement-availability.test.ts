@@ -623,9 +623,7 @@ describe("macOS extension-origin enforcement availability reports", () => {
     const replayError = vi.spyOn(console, "error").mockImplementation(() => undefined);
     try {
       await consumer.handleEnforcementAvailabilityReport(report, "ext-1");
-      expect(replayError).toHaveBeenCalledWith(
-        "[castle-wall] enforcement availability replay rejected stream=dedicated_report rejected_seq=3 floor=3"
-      );
+      expect(replayError).not.toHaveBeenCalled();
     } finally {
       replayError.mockRestore();
     }
@@ -635,6 +633,57 @@ describe("macOS extension-origin enforcement availability reports", () => {
     expect(replayResolved.reason).toBe("ok");
     expect(replayResolved.observed_at).toBe(new Date(NOW).toISOString());
     expect(consumer.getStats().enforcementAvailabilityReportsRejected).toBe(1);
+  });
+
+  it("F-AVAIL-REJECT-CLOBBER: duplicate redelivery is rolled up while same-stream reorder remains individually visible", async () => {
+    const privateKey = ed25519.utils.randomPrivateKey();
+    const publicKeyB64url = toBase64url(ed25519.getPublicKey(privateKey));
+    let now = NOW;
+    const consumer = makeConsumer({ publicKeyB64url, now: () => now });
+
+    const report = signAvailabilityReport({
+      visibleReport: greenSnapshot(),
+      privateKey,
+      seq: 3,
+    });
+    await consumer.handleEnforcementAvailabilityReport(report, "ext-1");
+
+    const replayError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      for (let i = 0; i < 99; i += 1) {
+        now += 1;
+        await consumer.handleEnforcementAvailabilityReport(report, "ext-1");
+      }
+      expect(replayError).not.toHaveBeenCalled();
+
+      now += 1;
+      await consumer.handleEnforcementAvailabilityReport(report, "ext-1");
+      expect(replayError).toHaveBeenCalledTimes(1);
+      expect(replayError).toHaveBeenNthCalledWith(
+        1,
+        "[castle-wall] enforcement availability duplicate replays suppressed stream=dedicated_report count=100 rejected_seq=3 floor=3",
+      );
+
+      now += 1;
+      await consumer.handleEnforcementAvailabilityReport(
+        signAvailabilityReport({
+          visibleReport: greenSnapshot(),
+          privateKey,
+          seq: 2,
+        }),
+        "ext-1",
+      );
+      expect(replayError).toHaveBeenCalledTimes(2);
+      expect(replayError).toHaveBeenNthCalledWith(
+        2,
+        "[castle-wall] enforcement availability replay reorder rejected stream=dedicated_report rejected_seq=2 floor=3 delta=1",
+      );
+    } finally {
+      replayError.mockRestore();
+    }
+
+    expect(consumer.getStats().enforcementAvailabilityReportsRecorded).toBe(1);
+    expect(consumer.getStats().enforcementAvailabilityReportsRejected).toBe(101);
   });
 
   it("F-AVAIL-SEQ-FLAP negative: the SAME dedicated report delivered twice is rejected without refreshing live state", async () => {
@@ -717,9 +766,9 @@ describe("macOS extension-origin enforcement availability reports", () => {
     );
     expect(consumer.resolveEnforcementAvailability().status).toBe("live");
 
-    // A distinct, validly-signed dedicated report at a LOWER seq. The
-    // dedicated stream is delivered in order on hardware, so a same-stream
-    // regression is treated as replay and rejected.
+    // A distinct, validly-signed dedicated report at a LOWER seq. Hardware
+    // has shown rare same-stream reordering, and stale reports must not
+    // overwrite fresher verified state.
     now = NOW + 10_000;
     const replayError = vi.spyOn(console, "error").mockImplementation(() => undefined);
     try {
@@ -730,6 +779,9 @@ describe("macOS extension-origin enforcement availability reports", () => {
           seq: 2,
         }),
         "ext-1",
+      );
+      expect(replayError).toHaveBeenCalledWith(
+        "[castle-wall] enforcement availability replay reorder rejected stream=dedicated_report rejected_seq=2 floor=4 delta=2",
       );
     } finally {
       replayError.mockRestore();
