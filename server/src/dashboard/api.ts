@@ -491,12 +491,11 @@ export async function handleRequest(
   }
 
   // ── Auth (all routes) ───────────────────────────────────────────────
-  const isFoldedReadAuxiliary =
+  const isAmbientReadAuxiliary =
     method === "GET" &&
     (path === "/api/status" ||
-      path === "/api/pending" ||
       path === "/api/stream");
-  const authorized = isFoldedReadAuxiliary
+  const authorized = isAmbientReadAuxiliary
     ? isAuthorizedForRead(deps, req, url)
     : isAuthorized(deps, req, url);
   if (!authorized) {

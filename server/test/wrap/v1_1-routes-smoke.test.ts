@@ -208,9 +208,15 @@ describe("wrap-auto dashboard exposes v1.1 surfaces (Finding V)", () => {
       mode: "replace",
     });
 
-    const pendingRes = await fetch(`${rig.baseUrl}/api/pending`);
-    expect(pendingRes.status).toBe(200);
-    expect(await pendingRes.json()).toEqual([]);
+    const tokenlessPendingRes = await fetch(`${rig.baseUrl}/api/pending`);
+    expect(tokenlessPendingRes.status).toBe(401);
+    expect(await tokenlessPendingRes.json()).toEqual({ error: "unauthorized" });
+
+    const bearerPendingRes = await fetch(`${rig.baseUrl}/api/pending`, {
+      headers: { Authorization: `Bearer ${rig.authToken}` },
+    });
+    expect(bearerPendingRes.status).toBe(200);
+    expect(await bearerPendingRes.json()).toEqual([]);
   });
 
   it("wrap-auto posture data route is mounted behind loopback read auth", async () => {
