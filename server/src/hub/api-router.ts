@@ -24,7 +24,10 @@ import {
   resolveAuthAdmission,
   type AuthConfig,
 } from "../console/auth-middleware.js";
-import { redactApprovalPendingItemsForPositionOnly } from "../dashboard/pending-redaction.js";
+import {
+  redactApprovalPendingItemsForPositionOnly,
+  redactPanelPendingApprovalsForPositionOnly,
+} from "../dashboard/pending-redaction.js";
 import {
   publicCodeForStatus,
   sendCaughtError,
@@ -669,7 +672,16 @@ export async function handleHubRoute(
       // a chat session. Synchronous open shape preserved.
       if (method === "POST" && remainder === "inspect/open") {
         const panel = await deps.service.openAgentInspectPanel(agentId);
-        writeJSON(res, 200, { ok: true, data: { panel } });
+        // The panel carries operator-only pending-approval rows. #806 keeps
+        // this route loopback-readable, but the rows themselves are the same
+        // operator-only class #1077 gated on /api/pending, so a position-only
+        // caller gets the count-only marker while a credentialed operator gets
+        // the full panel.
+        const data =
+          authAdmission === "loopback_position"
+            ? { panel: redactPanelPendingApprovalsForPositionOnly(panel) }
+            : { panel };
+        writeJSON(res, 200, { ok: true, data });
         return true;
       }
 

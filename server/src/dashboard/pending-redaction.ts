@@ -55,3 +55,20 @@ export function redactApprovalPendingItemsForPositionOnly<T>(
     ...pendingApprovalsRedactedMarker(hiddenCount),
   };
 }
+
+/**
+ * Redact the dedicated `pending_approvals` array on a hub inspect panel for a
+ * loopback-position caller: the operator-only rows are dropped to an empty
+ * array plus the count-only marker, so a co-resident agent learns how many
+ * approvals are pending but not their operation, tier, or item id. Any other
+ * panel field (recent activity, policy summary) is left untouched.
+ */
+export function redactPanelPendingApprovalsForPositionOnly<
+  P extends { pending_approvals: readonly unknown[] },
+>(panel: P): P & PendingApprovalsRedactedMarker {
+  return {
+    ...panel,
+    pending_approvals: [],
+    ...pendingApprovalsRedactedMarker(panel.pending_approvals.length),
+  };
+}
