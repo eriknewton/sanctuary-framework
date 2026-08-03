@@ -31,6 +31,7 @@ import type { ReputationEvidence } from "../shr/generator.js";
 import { deriveReputationDegradations } from "../shr/generator.js";
 import type { SHRDegradation } from "../shr/types.js";
 import type { SovereigntyTier } from "../reputation/tiers.js";
+import { pendingApprovalsRedactedMarker } from "./pending-redaction.js";
 
 export type LayerState = "full" | "degraded" | "compromised";
 export type OverallStatus = "healthy" | "degraded" | "compromised";
@@ -162,6 +163,14 @@ export interface ProtectionSnapshot {
     l4: ReputationStatus;
   };
   activity: ActivityEntry[];
+  /**
+   * Ambient liveness callers can read the snapshot document by loopback
+   * position, but approval rows are operator-only. When this marker is true,
+   * `pending_approvals` is intentionally empty and the count below is the only
+   * approval-queue oracle exposed to that caller.
+   */
+  pending_approvals_redacted?: true;
+  pending_approvals_count?: number;
   pending_approvals: PendingApproval[];
   audit: AuditEntry[];
   privacy: PrivacySummary;
@@ -169,6 +178,29 @@ export interface ProtectionSnapshot {
   mode: "co-located" | "standalone";
   server_version: string;
   generated_at: string;
+}
+
+export function redactPendingApprovalsForPositionOnly(
+  snapshot: ProtectionSnapshot,
+): ProtectionSnapshot {
+  return {
+    ...snapshot,
+    pending_approvals: [],
+    ...pendingApprovalsRedactedMarker(snapshot.pending_approvals.length),
+  };
+}
+
+export function redactPendingApprovalsFromSnapshotPayload(
+  payload: unknown,
+): unknown {
+  if (
+    payload === null ||
+    typeof payload !== "object" ||
+    !Array.isArray((payload as { pending_approvals?: unknown }).pending_approvals)
+  ) {
+    return payload;
+  }
+  return redactPendingApprovalsForPositionOnly(payload as ProtectionSnapshot);
 }
 
 export interface ReputationLookup {

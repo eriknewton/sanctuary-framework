@@ -39,6 +39,50 @@ async function startForTest(overrides: {
   } as Parameters<typeof startDashboardServer>[0] & { shutdownGraceMs?: number });
 }
 
+async function readInitialSnapshotEvent(res: Response): Promise<Record<string, unknown>> {
+  const reader = res.body!.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  try {
+    for (let i = 0; i < 8; i++) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const match = /event: snapshot\ndata: ([^\n]+)\n\n/.exec(buf);
+      if (match) return JSON.parse(match[1]!) as Record<string, unknown>;
+    }
+  } finally {
+    await reader.cancel().catch(() => undefined);
+  }
+  throw new Error("snapshot event not received");
+}
+
+async function drainSSE(res: Response, ms: number): Promise<string> {
+  const reader = res.body!.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  const deadline = Date.now() + ms;
+  try {
+    while (Date.now() < deadline) {
+      const timer = new Promise<null>((resolve) =>
+        setTimeout(() => resolve(null), Math.max(1, deadline - Date.now())),
+      );
+      const next = await Promise.race([reader.read(), timer]);
+      if (next === null || next.done) break;
+      buf += decoder.decode(next.value, { stream: true });
+    }
+  } finally {
+    await reader.cancel().catch(() => undefined);
+  }
+  return buf;
+}
+
+function readEventData(raw: string, event: string): Record<string, unknown> {
+  const match = new RegExp(`event: ${event}\\ndata: ([^\\n]+)\\n\\n`).exec(raw);
+  if (!match) throw new Error(`${event} event not received:\n${raw}`);
+  return JSON.parse(match[1]!) as Record<string, unknown>;
+}
+
 describe("Dashboard HTTP API", () => {
   let handle: DashboardHandle | null = null;
 
@@ -273,6 +317,208 @@ describe("Dashboard HTTP API", () => {
     });
     expect(res.status).toBe(401);
     expect(await res.json()).toEqual({ error: "unauthorized" });
+  });
+
+  it("redacts pending approvals from tokenless loopback GET /api/snapshot when loopback auto-auth is enabled", async () => {
+    const pending: PendingApproval = {
+      id: "secret-req-1",
+      operation: "state_export",
+      tier: 1,
+      reason: "secret reason must not leak",
+      created_at: "2026-08-03T12:00:00.000Z",
+    };
+    handle = await startForTest({
+      authToken: "secret-xyz",
+      pendingApprovals: [pending],
+    });
+    handle.setV11LoopbackAutoAuth(true);
+
+    const res = await fetch(`${handle.url}/api/snapshot`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.pending_approvals).toEqual([]);
+    expect(body.pending_approvals_redacted).toBe(true);
+    expect(body.pending_approvals_count).toBe(1);
+    const encoded = JSON.stringify(body);
+    expect(encoded).not.toContain("secret-req-1");
+    expect(encoded).not.toContain("secret reason must not leak");
+  });
+
+  it("redacts pending approvals from tokenless loopback /api/stream initial snapshot when loopback auto-auth is enabled", async () => {
+    const pending: PendingApproval = {
+      id: "secret-req-1",
+      operation: "state_export",
+      tier: 1,
+      reason: "secret reason must not leak",
+      created_at: "2026-08-03T12:00:00.000Z",
+    };
+    handle = await startForTest({
+      authToken: "secret-xyz",
+      pendingApprovals: [pending],
+    });
+    handle.setV11LoopbackAutoAuth(true);
+
+    const res = await fetch(`${handle.url}/api/stream`);
+    expect(res.status).toBe(200);
+    const snapshot = await readInitialSnapshotEvent(res);
+    expect(snapshot.pending_approvals).toEqual([]);
+    expect(snapshot.pending_approvals_redacted).toBe(true);
+    expect(snapshot.pending_approvals_count).toBe(1);
+    const encoded = JSON.stringify(snapshot);
+    expect(encoded).not.toContain("secret-req-1");
+    expect(encoded).not.toContain("secret reason must not leak");
+  });
+
+  it("redacts live approval deltas for tokenless loopback /api/stream clients opened before approval", async () => {
+    const approval: PendingApproval = {
+      id: "secret-req-1",
+      operation: "state_export",
+      tier: 1,
+      reason: "secret reason must not leak",
+      created_at: "2026-08-03T12:00:00.000Z",
+    };
+    handle = await startForTest({
+      authToken: "secret-xyz",
+      pendingApprovals: [],
+    });
+    handle.setV11LoopbackAutoAuth(true);
+
+    const res = await fetch(`${handle.url}/api/stream`);
+    expect(res.status).toBe(200);
+    const drained = drainSSE(res, 1200);
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    handle.updateSources({ pendingApprovals: [approval] });
+    handle.publishApproval(approval);
+
+    const seen = await drained;
+    const event = readEventData(seen, "approval");
+    expect(event.pending_approvals_redacted).toBe(true);
+    expect(event.pending_approvals_count).toBe(1);
+    const encoded = JSON.stringify(event);
+    expect(encoded).not.toContain("secret-req-1");
+    expect(encoded).not.toContain("secret reason must not leak");
+  });
+
+  it("CONTROL: serves full live approval deltas to an operator bearer /api/stream client", async () => {
+    const approval: PendingApproval = {
+      id: "secret-req-1",
+      operation: "state_export",
+      tier: 1,
+      reason: "secret reason must not leak",
+      created_at: "2026-08-03T12:00:00.000Z",
+    };
+    handle = await startForTest({
+      authToken: "secret-xyz",
+      pendingApprovals: [],
+    });
+    handle.setV11LoopbackAutoAuth(true);
+
+    const res = await fetch(`${handle.url}/api/stream`, {
+      headers: { Authorization: "Bearer secret-xyz" },
+    });
+    expect(res.status).toBe(200);
+    const drained = drainSSE(res, 1200);
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    handle.updateSources({ pendingApprovals: [approval] });
+    handle.publishApproval(approval);
+
+    const seen = await drained;
+    const event = readEventData(seen, "approval");
+    expect(event.id).toBe("secret-req-1");
+    expect(event.reason).toBe("secret reason must not leak");
+    expect(event.pending_approvals_redacted).toBeUndefined();
+  });
+
+  it("redacts approval_pending inbox events for tokenless loopback /api/stream clients", async () => {
+    handle = await startForTest({ authToken: "secret-xyz" });
+    handle.setV11LoopbackAutoAuth(true);
+    const res = await fetch(`${handle.url}/api/stream`);
+    expect(res.status).toBe(200);
+    const drained = drainSSE(res, 1200);
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    handle.publishInbox({
+      version: "1.1",
+      item_id: "secret-inbox-1",
+      kind: "approval_pending",
+      created_at: "2026-08-03T12:00:00.000Z",
+      agent_id: "secret-agent",
+      identity_id: "identity-1",
+      display_template_id: "approval_pending.tier1.state_export",
+      display_template_args: [{ kind: "agent_id", value: "secret-agent" }],
+      resolved: false,
+      tier: "tier1",
+      operation_category: "state_export",
+    });
+
+    const seen = await drained;
+    const event = readEventData(seen, "inbox");
+    expect(event.pending_approvals_redacted).toBe(true);
+    expect(event.pending_approvals_count).toBe(1);
+    const encoded = JSON.stringify(event);
+    expect(encoded).not.toContain("secret-inbox-1");
+    expect(encoded).not.toContain("secret-agent");
+    expect(encoded).not.toContain("state_export");
+  });
+
+  it("serves full pending approval rows to the retired router operator bearer and minted session", async () => {
+    const pending: PendingApproval = {
+      id: "secret-req-1",
+      operation: "state_export",
+      tier: 1,
+      reason: "secret reason must not leak",
+      created_at: "2026-08-03T12:00:00.000Z",
+    };
+    handle = await startForTest({
+      authToken: "secret-xyz",
+      pendingApprovals: [pending],
+    });
+    handle.setV11LoopbackAutoAuth(true);
+
+    const bearerSnapshot = await fetch(`${handle.url}/api/snapshot`, {
+      headers: { Authorization: "Bearer secret-xyz" },
+    });
+    expect(bearerSnapshot.status).toBe(200);
+    const bearerBody = await bearerSnapshot.json();
+    expect(bearerBody.pending_approvals).toEqual([pending]);
+    expect(bearerBody.pending_approvals_redacted).toBeUndefined();
+
+    const sessionRes = await fetch(`${handle.url}/auth/session`, {
+      method: "POST",
+      headers: { Authorization: "Bearer secret-xyz" },
+    });
+    expect(sessionRes.status).toBe(200);
+    const session = await sessionRes.json() as { session_id: string };
+    const streamRes = await fetch(
+      `${handle.url}/api/stream?session=${encodeURIComponent(session.session_id)}`,
+    );
+    expect(streamRes.status).toBe(200);
+    const streamSnapshot = await readInitialSnapshotEvent(streamRes);
+    expect(streamSnapshot.pending_approvals).toEqual([pending]);
+    expect(streamSnapshot.pending_approvals_redacted).toBeUndefined();
+  });
+
+  it("treats a wrong bearer on retired ambient snapshot reads as position-only", async () => {
+    const pending: PendingApproval = {
+      id: "secret-req-1",
+      operation: "state_export",
+      tier: 1,
+      reason: "secret reason must not leak",
+      created_at: "2026-08-03T12:00:00.000Z",
+    };
+    handle = await startForTest({
+      authToken: "secret-xyz",
+      pendingApprovals: [pending],
+    });
+    handle.setV11LoopbackAutoAuth(true);
+
+    const res = await fetch(`${handle.url}/api/snapshot`, {
+      headers: { Authorization: "Bearer wrong-secret-xyz" },
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.pending_approvals).toEqual([]);
+    expect(body.pending_approvals_redacted).toBe(true);
+    expect(body.pending_approvals_count).toBe(1);
   });
 
   it("emits an initial 'snapshot' event on SSE connect", async () => {

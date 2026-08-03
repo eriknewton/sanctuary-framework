@@ -269,6 +269,21 @@ describe("renderDashboardHTML", () => {
     expect(html).toContain("\"server_version\":\"0.9.0-test\"");
   });
 
+  it("renders redacted pending approvals as hidden, not as an empty inbox", () => {
+    const html = renderDashboardHTML({
+      snapshot: makeSnapshot({
+        pending_approvals: [],
+        pending_approvals_redacted: true,
+        pending_approvals_count: 1,
+      }),
+    });
+    expect(html).toContain('data-pending-approvals-redacted="1"');
+    expect(html).toContain("Approvals are hidden, not empty.");
+    expect(html).toContain("Pending count: 1");
+    const initialMarkup = html.slice(0, html.indexOf("<script>"));
+    expect(initialMarkup).not.toContain("No pending approvals");
+  });
+
   it("does not inject the auth token into the client bootstrap when provided", () => {
     const html = renderDashboardHTML({
       snapshot: makeSnapshot(),

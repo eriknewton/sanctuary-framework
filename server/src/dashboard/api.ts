@@ -22,7 +22,15 @@ import type {
   PendingApproval,
   ActivityEntry,
 } from "./aggregator.js";
-import { getProtectionSnapshot } from "./aggregator.js";
+import {
+  getProtectionSnapshot,
+  redactPendingApprovalsForPositionOnly,
+  redactPendingApprovalsFromSnapshotPayload,
+} from "./aggregator.js";
+import {
+  isHubApprovalPendingItem,
+  pendingApprovalsRedactedMarker,
+} from "./pending-redaction.js";
 import { renderDashboardHTML } from "./html.js";
 import { listTemplates, getTemplateEntry, getTemplate } from "../templates/registry.js";
 import { initTemplate } from "../templates/init.js";
@@ -155,6 +163,11 @@ export interface DashboardSessionStore {
   validate: (id: string) => boolean;
 }
 
+type DashboardReadAdmission =
+  | "auth_disabled"
+  | "operator_credential"
+  | "loopback_position";
+
 /**
  * SSE event taxonomy.
  *
@@ -184,15 +197,48 @@ export function extractToken(req: IncomingMessage, url: URL): string | null {
   return null;
 }
 
-export function isAuthorized(deps: APIDeps, req: IncomingMessage, url: URL): boolean {
-  if (!deps.authToken) return true;
+function parseCookie(req: IncomingMessage, name: string): string | null {
+  const cookie = req.headers.cookie;
+  if (!cookie) return null;
+  for (const part of cookie.split(";")) {
+    const [rawKey, ...rest] = part.trim().split("=");
+    if (rawKey === name) {
+      try {
+        return decodeURIComponent(rest.join("="));
+      } catch {
+        return null;
+      }
+    }
+  }
+  return null;
+}
+
+function resolveOperatorCredentialAdmission(
+  deps: APIDeps,
+  req: IncomingMessage,
+  url: URL,
+): DashboardReadAdmission | null {
+  if (!deps.authToken) return "auth_disabled";
   const token = extractToken(req, url);
-  if (token && constantTimeEquals(token, deps.authToken)) return true;
+  if (token && constantTimeEquals(token, deps.authToken)) {
+    return "operator_credential";
+  }
 
   const sessionId = url.searchParams.get("session");
-  if (sessionId && deps.sessions?.validate(sessionId)) return true;
+  if (sessionId && deps.sessions?.validate(sessionId)) {
+    return "operator_credential";
+  }
 
-  return false;
+  const cookieSession = parseCookie(req, "sanctuary_session");
+  if (cookieSession && deps.sessions?.validate(cookieSession)) {
+    return "operator_credential";
+  }
+
+  return null;
+}
+
+export function isAuthorized(deps: APIDeps, req: IncomingMessage, url: URL): boolean {
+  return resolveOperatorCredentialAdmission(deps, req, url) !== null;
 }
 
 function isAuthorizedWithBearerToken(deps: APIDeps, req: IncomingMessage, url: URL): boolean {
@@ -206,8 +252,21 @@ function isLoopbackRequest(req: IncomingMessage): boolean {
   return addr === "127.0.0.1" || addr === "::1" || addr === "localhost";
 }
 
+function resolveReadAdmission(
+  deps: APIDeps,
+  req: IncomingMessage,
+  url: URL,
+): DashboardReadAdmission | null {
+  const credentialAdmission = resolveOperatorCredentialAdmission(deps, req, url);
+  if (credentialAdmission !== null) return credentialAdmission;
+  if (deps.authToken && deps.loopbackAutoAuth === true && isLoopbackRequest(req)) {
+    return "loopback_position";
+  }
+  return null;
+}
+
 function isAuthorizedForRead(deps: APIDeps, req: IncomingMessage, url: URL): boolean {
-  return isAuthorized(deps, req, url) || (deps.loopbackAutoAuth === true && isLoopbackRequest(req));
+  return resolveReadAdmission(deps, req, url) !== null;
 }
 
 function writeJSON(res: ServerResponse, status: number, payload: unknown): void {
@@ -494,11 +553,12 @@ export async function handleRequest(
   const isAmbientReadAuxiliary =
     method === "GET" &&
     (path === "/api/status" ||
+      path === "/api/snapshot" ||
       path === "/api/stream");
-  const authorized = isAmbientReadAuxiliary
-    ? isAuthorizedForRead(deps, req, url)
-    : isAuthorized(deps, req, url);
-  if (!authorized) {
+  const readAdmission = isAmbientReadAuxiliary
+    ? resolveReadAdmission(deps, req, url)
+    : resolveOperatorCredentialAdmission(deps, req, url);
+  if (readAdmission === null) {
     writeJSON(res, 401, { error: "unauthorized" });
     return true;
   }
@@ -580,7 +640,13 @@ export async function handleRequest(
   // ── Snapshot JSON ───────────────────────────────────────────────────
   if (method === "GET" && path === "/api/snapshot") {
     const snapshot = await getProtectionSnapshot(deps.sources);
-    writeJSON(res, 200, snapshot);
+    writeJSON(
+      res,
+      200,
+      readAdmission === "loopback_position"
+        ? redactPendingApprovalsForPositionOnly(snapshot)
+        : snapshot,
+    );
     return true;
   }
 
@@ -614,7 +680,7 @@ export async function handleRequest(
 
   // ── SSE stream ──────────────────────────────────────────────────────
   if (method === "GET" && path === "/api/stream") {
-    await handleStream(deps, res);
+    await handleStream(deps, res, readAdmission);
     return true;
   }
 
@@ -761,7 +827,12 @@ export async function handleRequest(
   return false;
 }
 
-async function handleStream(deps: APIDeps, res: ServerResponse): Promise<void> {
+async function handleStream(
+  deps: APIDeps,
+  res: ServerResponse,
+  readAdmission: DashboardReadAdmission,
+): Promise<void> {
+  const redactPendingApprovals = readAdmission === "loopback_position";
   res.writeHead(200, {
     "Content-Type": "text/event-stream",
     "Cache-Control": "no-cache, no-transform",
@@ -771,12 +842,18 @@ async function handleStream(deps: APIDeps, res: ServerResponse): Promise<void> {
 
   // Initial snapshot
   const snapshot = await getProtectionSnapshot(deps.sources);
-  res.write(`event: snapshot\ndata: ${JSON.stringify(snapshot)}\n\n`);
+  const visibleSnapshot = redactPendingApprovals
+    ? redactPendingApprovalsForPositionOnly(snapshot)
+    : snapshot;
+  res.write(`event: snapshot\ndata: ${JSON.stringify(visibleSnapshot)}\n\n`);
 
   const unsubscribe = deps.onEvent
     ? deps.onEvent((event) => {
         try {
-          res.write(`event: ${event.type}\ndata: ${JSON.stringify(event.data)}\n\n`);
+          const data = redactPendingApprovals
+            ? redactStreamEventForPositionOnly(event, deps)
+            : event.data;
+          res.write(`event: ${event.type}\ndata: ${JSON.stringify(data)}\n\n`);
         } catch {
           // socket gone — cleanup happens in 'close'
         }
@@ -798,6 +875,26 @@ async function handleStream(deps: APIDeps, res: ServerResponse): Promise<void> {
 
   res.on("close", cleanup);
   res.on("error", cleanup);
+}
+
+function redactStreamEventForPositionOnly(
+  event: StreamEvent,
+  deps: APIDeps,
+): unknown {
+  switch (event.type) {
+    case "snapshot":
+      return redactPendingApprovalsFromSnapshotPayload(event.data);
+    case "approval":
+      return pendingApprovalsRedactedMarker(
+        Math.max(deps.sources.pendingApprovals?.length ?? 0, 1),
+      );
+    case "inbox":
+      return isHubApprovalPendingItem(event.data)
+        ? pendingApprovalsRedactedMarker(1)
+        : event.data;
+    default:
+      return event.data;
+  }
 }
 
 // Re-export helpers used by tests

@@ -49,6 +49,8 @@ export interface AuthOptions {
   requireToken?: boolean;
 }
 
+export type AuthAdmission = "operator_credential" | "loopback_position";
+
 /**
  * Check whether a request originates from loopback.
  */
@@ -59,6 +61,22 @@ export function isLoopback(req: IncomingMessage): boolean {
     addr === "::1" ||
     addr === "::ffff:127.0.0.1"
   );
+}
+
+export function resolveAuthAdmission(
+  config: AuthConfig,
+  req: IncomingMessage,
+  url: URL,
+  options?: AuthOptions,
+): AuthAdmission | null {
+  const token = config.authToken ? extractToken(req, url) : null;
+  if (token && config.authToken && constantTimeEquals(token, config.authToken)) {
+    return "operator_credential";
+  }
+  if (!options?.requireToken && config.loopbackAutoAuth && isLoopback(req)) {
+    return "loopback_position";
+  }
+  return null;
 }
 
 /**

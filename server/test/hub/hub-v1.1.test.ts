@@ -698,9 +698,100 @@ describe("Hub inbox: loopback auto-auth does not gate approve/deny", () => {
     expect(body.data.item.resolved).toBe(true);
   });
 
-  it("still serves read-only GET /inbox under loopback auto-auth without a token", async () => {
+  it("redacts approval_pending inbox items from tokenless loopback GET /inbox without hiding other inbox kinds", async () => {
     const res = await fetch(`${rig.url}${HUB_API_PREFIX}/inbox`);
     expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      ok: true;
+      data: {
+        items: HubInboxItem[];
+        pending_approvals_redacted?: true;
+        pending_approvals_count?: number;
+      };
+    };
+
+    expect(body.data.pending_approvals_redacted).toBe(true);
+    expect(body.data.pending_approvals_count).toBe(1);
+    expect(body.data.items.some((item) => item.kind === "approval_pending")).toBe(false);
+    expect(body.data.items.some((item) => item.kind === "blocked_egress")).toBe(true);
+    const encoded = JSON.stringify(body);
+    expect(encoded).not.toContain("approval-1");
+    expect(encoded).not.toContain("state_export");
+  });
+
+  it("CONTROL: serves full approval_pending inbox items with an operator bearer", async () => {
+    const res = await fetch(`${rig.url}${HUB_API_PREFIX}/inbox`, {
+      headers: withAuth({}, rig.authToken),
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      ok: true;
+      data: {
+        items: HubInboxItem[];
+        pending_approvals_redacted?: true;
+      };
+    };
+
+    expect(body.data.pending_approvals_redacted).toBeUndefined();
+    expect(body.data.items).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          item_id: "approval-1",
+          kind: "approval_pending",
+          operation_category: "state_export",
+        }),
+      ]),
+    );
+  });
+
+  // The inspect panel (POST .../inspect/open) is loopback-readable per #806,
+  // but its pending_approvals array is the same operator-only class. A
+  // position-only caller must get the count-only marker, not the rows.
+  it("redacts pending_approvals from a tokenless loopback inspect/open panel", async () => {
+    const res = await fetch(
+      `${rig.url}${HUB_API_PREFIX}/agents/agent-alpha/inspect/open`,
+      { method: "POST" },
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      ok: true;
+      data: {
+        panel: {
+          pending_approvals: unknown[];
+          pending_approvals_redacted?: true;
+          pending_approvals_count?: number;
+        };
+      };
+    };
+    expect(body.data.panel.pending_approvals).toEqual([]);
+    expect(body.data.panel.pending_approvals_redacted).toBe(true);
+    expect(body.data.panel.pending_approvals_count).toBe(1);
+    const encoded = JSON.stringify(body);
+    expect(encoded).not.toContain("approval-1");
+    expect(encoded).not.toContain("state_export");
+  });
+
+  it("CONTROL: serves full inspect/open pending_approvals with an operator bearer", async () => {
+    const res = await fetch(
+      `${rig.url}${HUB_API_PREFIX}/agents/agent-alpha/inspect/open`,
+      { method: "POST", headers: withAuth({}, rig.authToken) },
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      ok: true;
+      data: {
+        panel: {
+          pending_approvals: { item_id?: string }[];
+          pending_approvals_redacted?: true;
+        };
+      };
+    };
+    expect(body.data.panel.pending_approvals_redacted).toBeUndefined();
+    expect(
+      body.data.panel.pending_approvals.some(
+        (item) => item.item_id === "approval-1",
+      ),
+    ).toBe(true);
   });
 
   // #800 follow-on (operational-mutation chokepoint): inbox DISMISS is an
