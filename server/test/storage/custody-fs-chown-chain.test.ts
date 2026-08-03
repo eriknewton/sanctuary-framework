@@ -1,3 +1,6 @@
+// fail-before-exempt: pins pre-existing #1051 helper (chownCreatedDirChain)
+// semantics for gate F1; the helper is unchanged by this PR, so these tests
+// legitimately pass against main (nothing to go red-against-main here).
 /**
  * Unit tests for `chownCreatedDirChain`'s OWN semantics (PR #1084 gate F1):
  * the helper previously had no failing check anywhere -- a gate mutation that

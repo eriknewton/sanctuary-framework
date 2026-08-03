@@ -3927,27 +3927,52 @@ export class AuditLog {
    * recursive mkdir then returns undefined, and without this check the write
    * would proceed silently, permanently reinstating the root-owned-chain
    * defect for the segment. When the chain already exists and `createOwner`
-   * is set, verify ownership of the two directories this log owns (the
-   * storage base dir and the namespace dir) via no-follow lstat and:
-   *   - repair a root-owned or gid-drifted directory through the SAME
-   *     descriptor-verified `chownCreatedDirChain` path (#1051 safety
-   *     contract: `O_NOFOLLOW | O_DIRECTORY` opens, chown through handles) —
-   *     repair is correct here because these are the daemon's own audit
-   *     namespace directories, not arbitrary pre-existing dirs;
-   *   - REFUSE loudly on a symlinked/non-directory entry or a directory owned
-   *     by any OTHER uid (never seize a third party's directory); the append
-   *     fails with a diagnosable reason (hard constraint 5: no silent proceed
-   *     on wrong ownership).
-   * Cost: two lstats per locked write in the healthy case. Deliberately no
-   * caching, so an external ownership change mid-run stays detected.
+   * is set, this walks the FULL created-chain depth (re-gate F2-deep): a deep
+   * first-ever namespace such as `boot-audit/<fp>/_audit` creates three levels
+   * at once, so a crash mid-handback can leave `boot-audit` root-owned while a
+   * two-level recheck repaired only the lower pair, leaving the operator
+   * locked out one level up. The walk ascends the CONTIGUOUS run of
+   * deviating directories (root-owned, or operator-owned with a drifted gid)
+   * from the namespace dir upward and:
+   *   - repairs that run through the SAME descriptor-verified
+   *     `chownCreatedDirChain` path (#1051 safety contract: `O_NOFOLLOW |
+   *     O_DIRECTORY` opens, chown through handles, created-only, symlinked
+   *     component refused) — repair is correct here because these are the
+   *     daemon's own audit-store directories, not arbitrary pre-existing dirs;
+   *   - STOPS at the first healthy operator-owned ancestor, which under the
+   *     intended ownership model is the fortress root itself: that is the
+   *     ceiling, so the walk never ascends above the fortress/storage root
+   *     (same non-ancestor-stop safety as `chownCreatedDirChain`);
+   *   - REFUSES loudly on a symlinked/non-directory entry, a directory owned
+   *     by any OTHER uid (never seize a third party's directory), or a
+   *     deviating run that reaches the filesystem root or the runaway cap
+   *     without a healthy boundary (never chase ownership toward `/`); the
+   *     append fails with a diagnosable reason (hard constraint 5: no silent
+   *     proceed on wrong ownership).
+   * Cost: a handful of lstats per locked write in the healthy case (the walk
+   * stops at the first healthy ancestor, i.e. after one lstat once the tree is
+   * clean). Deliberately no caching, so an external ownership change mid-run
+   * stays detected.
    */
   private async verifyOrRepairNamespaceDirOwnership(
     leafDir: string,
     owner: AuditCreateOwner,
   ): Promise<void> {
-    const dirsToCheck = [dirname(leafDir), leafDir];
+    // Runaway guard doubling as the fortress-root ceiling: the deepest known
+    // audit-store namespace (`<fortress>/boot-audit/<fp>/_audit`) is three
+    // created levels below the fortress, so a healthy boundary is always found
+    // within a few hops. A deviating run that never reaches one is pathological
+    // (e.g. a root-owned fortress, which is `repair-custody`'s job, not this
+    // append path's) and is refused rather than chased toward `/`.
+    const MAX_NAMESPACE_ANCESTOR_WALK = 16;
     let topmostRepair: string | undefined;
-    for (const dir of dirsToCheck) {
+    let dir = leafDir;
+    for (let depth = 0; ; depth++) {
+      if (depth >= MAX_NAMESPACE_ANCESTOR_WALK) {
+        throw new Error(
+          `audit namespace directory ${leafDir} sits under an unbroken run of ${depth} non-operator-owned directories with no healthy ancestor; refusing to write audit entries (never chase ownership toward the filesystem root). Run 'sudo sanctuary castle-wall repair-custody' to repair operator custody.`
+        );
+      }
       const stats = await this.namespaceDirLstat(dir);
       if (stats.isSymbolicLink() || !stats.isDirectory()) {
         throw new Error(
@@ -3960,12 +3985,27 @@ export class AuditLog {
         );
       }
       const needsRepair = stats.uid === 0 || stats.gid !== owner.gid;
-      if (needsRepair && topmostRepair === undefined) {
-        topmostRepair = dir;
+      if (!needsRepair) {
+        // First healthy operator-owned ancestor: the pre-existing tree (the
+        // fortress root under the intended model). Stop here; never ascend
+        // into or above it.
+        break;
       }
+      topmostRepair = dir;
+      const parent = dirname(dir);
+      if (parent === dir) {
+        // Reached the filesystem root while still inside the deviating run:
+        // no healthy boundary exists. Refuse rather than seize up to `/`.
+        throw new Error(
+          `audit namespace directory ${leafDir} has no operator-owned ancestor before the filesystem root; refusing to write audit entries. Run 'sudo sanctuary castle-wall repair-custody' to repair operator custody.`
+        );
+      }
+      dir = parent;
     }
     if (topmostRepair !== undefined) {
-      // Fail-closed: a repair failure propagates and fails the append.
+      // Fail-closed: a repair failure propagates and fails the append. The
+      // topmost deviating directory is an ancestor of (or equal to) leafDir,
+      // so `chownCreatedDirChain` repairs the whole contiguous run in one pass.
       await this.createOwnerChownDirChain(topmostRepair, leafDir, owner);
     }
   }

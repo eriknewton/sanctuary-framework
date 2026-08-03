@@ -90,6 +90,32 @@ describe("AuditLog namespace directory create owner", () => {
     return fakeStats(OWNER.uid, OWNER.gid);
   }
 
+  /**
+   * Path-aware lstat fake for the upward ownership walk. Any path NOT listed
+   * is healthy (operator-owned) so the walk terminates at a boundary rather
+   * than chasing ownership to the runaway cap. `state` is mutable so a test
+   * can flip the chain to healthy after the repair seam runs (models the real
+   * repair actually fixing ownership across successive lock acquisitions).
+   */
+  function treeLstat(state: {
+    rootOwned?: Set<string>;
+    gidDrift?: Set<string>;
+    foreign?: Set<string>;
+    symlink?: Set<string>;
+    onStat?: (path: string) => void;
+  }) {
+    return async (path: string) => {
+      state.onStat?.(path);
+      if (state.symlink?.has(path)) {
+        return fakeStats(OWNER.uid, OWNER.gid, { symlink: true });
+      }
+      if (state.foreign?.has(path)) return fakeStats(4321, 4321);
+      if (state.rootOwned?.has(path)) return fakeStats(0, 0);
+      if (state.gidDrift?.has(path)) return fakeStats(OWNER.uid, 9999);
+      return healthyStats();
+    };
+  }
+
   it("chowns the created namespace directory chain", async () => {
     const { root, storage, storagePath } = await makeStorage(["a", "b", "state"]);
     const leafDir = storage.namespacePath("_audit");
@@ -178,17 +204,17 @@ describe("AuditLog namespace directory create owner", () => {
     const leafDir = storage.namespacePath("_audit");
     await mkdir(leafDir, { recursive: true, mode: 0o700 });
     const calls: DirChainChownCall[] = [];
-    // Stateful fake: the chain reads root-owned until the repair seam runs,
-    // then healthy (models the real repair actually fixing ownership).
-    let repaired = false;
+    // Two-level chain (`<base>/_audit` under `<base>`): both root-owned until
+    // the repair seam runs, healthy at the storage root above them.
+    const rootOwned = new Set([leafDir, dirname(leafDir)]);
     const log = new AuditLog(
       storage,
       generateRandomKey(),
       configWithRecorder(calls, {
-        namespaceDirLstat: async () => (repaired ? healthyStats() : fakeStats(0, 0)),
+        namespaceDirLstat: treeLstat({ rootOwned }),
         createOwnerChownDirChain: async (firstCreated, leafDir2, owner) => {
           calls.push({ firstCreated, leafDir: leafDir2, owner });
-          repaired = true;
+          rootOwned.clear();
         },
       }),
     );
@@ -201,6 +227,62 @@ describe("AuditLog namespace directory create owner", () => {
       leafDir,
       owner: OWNER,
     });
+  });
+
+  it("repairs the FULL created chain depth (boot-audit/<fp>/_audit), not just the lower two", async () => {
+    // Re-gate F2-deep: a deep first-ever namespace creates three levels at
+    // once, so a crash mid-handback can leave the topmost (`boot-audit`)
+    // root-owned while a two-level recheck would repair only the lower pair,
+    // leaving the operator locked out one level up. The walk must ascend the
+    // whole contiguous root-owned run to the first operator-owned ancestor.
+    const { root, storage } = await makeStorage(["boot-audit", "fp"]);
+    const leafDir = storage.namespacePath("_audit"); // <root>/boot-audit/fp/_audit
+    await mkdir(leafDir, { recursive: true, mode: 0o700 });
+    const bootAudit = join(root, "boot-audit");
+    const fp = join(root, "boot-audit", "fp");
+    const calls: DirChainChownCall[] = [];
+    const rootOwned = new Set([leafDir, fp, bootAudit]);
+    const log = new AuditLog(
+      storage,
+      generateRandomKey(),
+      configWithRecorder(calls, {
+        namespaceDirLstat: treeLstat({ rootOwned }),
+        createOwnerChownDirChain: async (firstCreated, leafDir2, owner) => {
+          calls.push({ firstCreated, leafDir: leafDir2, owner });
+          rootOwned.clear();
+        },
+      }),
+    );
+
+    await appendOne(log);
+
+    expect(calls).toHaveLength(1);
+    // Topmost repair target is `boot-audit` (the third level up), so
+    // chownCreatedDirChain repairs boot-audit, fp, and _audit in one pass.
+    expect(calls[0]).toEqual({ firstCreated: bootAudit, leafDir, owner: OWNER });
+  });
+
+  it("refuses rather than chase ownership to the filesystem root", async () => {
+    // A deviating run with no healthy operator-owned ancestor before the
+    // runaway cap is pathological (e.g. a root-owned fortress, repair-custody's
+    // job) and must REFUSE, never seize directories up toward `/`.
+    const { storage } = await makeStorage();
+    const leafDir = storage.namespacePath("_audit");
+    await mkdir(leafDir, { recursive: true, mode: 0o700 });
+    const calls: DirChainChownCall[] = [];
+    const log = new AuditLog(
+      storage,
+      generateRandomKey(),
+      configWithRecorder(calls, {
+        // EVERY ancestor reads root-owned: no healthy boundary exists.
+        namespaceDirLstat: async () => fakeStats(0, 0),
+      }),
+    );
+
+    await expect(
+      log.append("l1", "egress_allowed", "id-1", { n: 1 }),
+    ).rejects.toThrow(/filesystem root|refusing to write audit entries/);
+    expect(calls).toEqual([]);
   });
 
   it("repairs only from the topmost drifted directory (leaf gid drift)", async () => {
@@ -264,10 +346,11 @@ describe("AuditLog namespace directory create owner", () => {
     ).rejects.toThrow(/not a plain directory/);
   });
 
-  it("executes the ownership check on every pre-existing-chain append", async () => {
-    // Proves the check RUNS in the healthy case (a check that never executes
-    // is not a check): the lstat seam must be consulted for both the storage
-    // base dir and the namespace dir.
+  it("executes the ownership check and short-circuits at the first healthy ancestor", async () => {
+    // Proves the check RUNS (a check that never executes is not a check): the
+    // lstat seam is consulted for the namespace dir. In the healthy case the
+    // walk stops at the FIRST healthy ancestor (the leaf itself), so it does
+    // exactly one lstat -- the cheap common-case path.
     const { storage } = await makeStorage();
     const leafDir = storage.namespacePath("_audit");
     await mkdir(leafDir, { recursive: true, mode: 0o700 });
@@ -276,17 +359,16 @@ describe("AuditLog namespace directory create owner", () => {
       storage,
       generateRandomKey(),
       configWithRecorder([], {
-        namespaceDirLstat: async (path: string) => {
-          statted.push(path);
-          return healthyStats();
-        },
+        namespaceDirLstat: treeLstat({ onStat: (path) => statted.push(path) }),
       }),
     );
 
     await appendOne(log);
 
     expect(statted).toContain(leafDir);
-    expect(statted).toContain(dirname(leafDir));
+    // Healthy leaf -> the walk breaks immediately, never ascending to the
+    // parent (no wasted lstats when the tree is already clean).
+    expect(statted).not.toContain(dirname(leafDir));
   });
 
   it("uses the default directory-chain chown wiring", async () => {
