@@ -1,3 +1,9 @@
+// fail-before-exempt: pins pre-existing #944/#1056 lock-recovery + lock-createOwner
+// semantics that are already on main; this PR's only edit is a test-helper stub
+// (makeLog's namespaceDirLstat) decoupling the #1056 createOwner tests from the
+// host uid after PR #1084's F2 deep-walk added a directory precondition. No test
+// here should go red-against-main; the deep-walk itself is covered by
+// audit-log-namespace-dir-owner.test.ts (which is not exempt).
 import { mkdtemp, rm, writeFile, readFile, rename, mkdir, stat, utimes, readdir } from "node:fs/promises";
 import { tmpdir, uptime as osUptime } from "node:os";
 import type { Stats } from "node:fs";
@@ -359,8 +365,28 @@ describe("AuditLog write-lock robustness (#944 cluster)", () => {
     const root = await mkdtemp(join(tmpdir(), "sanctuary-audit-lock-robust-"));
     dirs.push(root);
     const storagePath = join(root, "state");
+    // These tests pre-create the `_audit` namespace dir (below) owned by the
+    // CURRENT user, and use a SYNTHETIC `createOwner` (OWNER={501,20}) purely to
+    // assert the LOCK-FILE chown is applied. PR #1084's F2 deep-walk added a
+    // real-lstat directory-ownership precondition that would refuse whenever the
+    // host uid differs from the synthetic owner (passes on a 501/20 macOS box,
+    // fails on a Linux CI runner). Present the namespace dir as owner-matched so
+    // these lock-file tests stay decoupled from the host uid; the directory-walk
+    // behavior itself is covered by audit-log-namespace-dir-owner.test.ts.
+    const createOwner = (config as { createOwner?: { uid: number; gid: number } } | undefined)
+      ?.createOwner;
     const log = new AuditLog(new FilesystemStorage(storagePath), generateRandomKey(), {
       integrityMode: "lenient",
+      ...(createOwner !== undefined
+        ? {
+            namespaceDirLstat: async () => ({
+              uid: createOwner.uid,
+              gid: createOwner.gid,
+              isSymbolicLink: () => false,
+              isDirectory: () => true,
+            }),
+          }
+        : {}),
       ...config,
     });
     const lockPath = join(storagePath, "_audit", ".audit-write.lock");
