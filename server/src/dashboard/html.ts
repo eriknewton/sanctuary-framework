@@ -167,6 +167,10 @@ export function renderDashboardHTML(options: DashboardHTMLOptions): string {
   const { snapshot } = options;
   const { overall, agent, layers, activity, pending_approvals, audit, privacy, upstream_servers } = snapshot;
   const heroCopy = protectionHeroCopyForLight(overall.light);
+  const approvalsRedacted = snapshot.pending_approvals_redacted === true;
+  const approvalCount = approvalsRedacted
+    ? snapshot.pending_approvals_count ?? pending_approvals.length
+    : pending_approvals.length;
 
   const activityRows = activity.length === 0
     ? `<tr class="empty"><td colspan="5">Waiting for tool calls…</td></tr>`
@@ -183,7 +187,9 @@ export function renderDashboardHTML(options: DashboardHTMLOptions): string {
         })
         .join("");
 
-  const approvalItems = pending_approvals.length === 0
+  const approvalItems = approvalsRedacted
+    ? `<div class="empty-block approval-redacted" data-pending-approvals-redacted="1">Approvals are hidden, not empty. Pending count: ${escHtml(approvalCount)}</div>`
+    : pending_approvals.length === 0
     ? `<div class="empty-block">No pending approvals</div>`
     : pending_approvals
         .map((p) => `<article class="approval" data-id="${escHtml(p.id)}">
@@ -604,7 +610,7 @@ details.audit-details .audit-filters { display: flex; gap: 6px; padding: 0 18px 
   </div>
 
   <section class="section" id="approval-section">
-    <h2>Needs approval <span class="count" id="approval-count">${pending_approvals.length}</span></h2>
+    <h2>Needs approval <span class="count" id="approval-count">${escHtml(approvalCount)}</span></h2>
     <div class="approval-list" id="approval-list">${approvalItems}</div>
   </section>
 
@@ -729,10 +735,15 @@ details.audit-details .audit-filters { display: flex; gap: 6px; padding: 0 18px 
     )).join("");
   }
 
-  function renderApprovals(list) {
+  function renderApprovals(list, redacted, redactedCount) {
     const container = document.getElementById("approval-list");
     const count = document.getElementById("approval-count");
     if (!container) return;
+    if (redacted) {
+      count.textContent = String(redactedCount || 0);
+      container.innerHTML = '<div class="empty-block approval-redacted" data-pending-approvals-redacted="1">Approvals are hidden, not empty. Pending count: ' + esc(redactedCount || 0) + '</div>';
+      return;
+    }
     count.textContent = String(list.length);
     if (!list.length) {
       container.innerHTML = '<div class="empty-block">No pending approvals</div>';
@@ -800,7 +811,11 @@ details.audit-details .audit-filters { display: flex; gap: 6px; padding: 0 18px 
     document.getElementById("agent-name").textContent = snap.agent.display_name;
     document.getElementById("agent-did").textContent = snap.agent.did_fingerprint || "unclaimed";
     renderActivity(snap.activity);
-    renderApprovals(snap.pending_approvals);
+    renderApprovals(
+      snap.pending_approvals,
+      snap.pending_approvals_redacted === true,
+      snap.pending_approvals_count || 0,
+    );
     renderPrivacy(snap.privacy);
     renderAudit(snap.audit, currentAuditFilter());
   }

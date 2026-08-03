@@ -85,6 +85,8 @@ import {
 import {
   composeAggregatorSources,
   getProtectionSnapshot,
+  redactPendingApprovalsForPositionOnly,
+  redactPendingApprovalsFromSnapshotPayload,
   type AggregatorSources,
   type PendingApproval,
 } from "../dashboard/aggregator.js";
@@ -446,6 +448,10 @@ type DashboardStreamEvent = {
   event: DashboardStreamEventName;
   data: unknown;
 };
+type DashboardAuthAdmission =
+  | "auth_disabled"
+  | "operator_credential"
+  | "loopback_position";
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === "object"
@@ -940,7 +946,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     createPostureStreamRegistry();
   private pending: Map<string, PendingRequest> = new Map();
   private sseClients: Set<SSEClient> = new Set();
-  private dashboardStreamClients: Set<SSEClient> = new Set();
+  private dashboardStreamClients: Map<SSEClient, boolean> = new Map();
   private httpServer:
     | ReturnType<typeof createHttpServer>
     | ReturnType<typeof createHttpsServer>
@@ -5522,7 +5528,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       client.end();
     }
     this.sseClients.clear();
-    for (const client of this.dashboardStreamClients) {
+    for (const client of this.dashboardStreamClients.keys()) {
       client.end();
     }
     this.dashboardStreamClients.clear();
@@ -5606,6 +5612,87 @@ export class DashboardApprovalChannel implements ApprovalChannel {
 
   // ── Authentication ──────────────────────────────────────────────────
 
+  private denyAuth(res: ServerResponse): false {
+    res.writeHead(401, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "unauthorized" }));
+    return false;
+  }
+
+  /**
+   * Classify dashboard authentication without writing a response.
+   *
+   * The split matters for snapshot routes: ambient liveness stays open to
+   * loopback position, while operator-only approval rows require the bearer or a
+   * session/cookie minted from it.
+   */
+  private resolveAuthAdmission(
+    req: IncomingMessage,
+    url: URL,
+    opts?: {
+      requireToken?: boolean;
+      allowSession?: boolean;
+      denyLoopbackAutoAuth?: boolean;
+    },
+  ): DashboardAuthAdmission | null {
+    const authHeader = req.headers.authorization;
+    const parts = authHeader?.split(" ");
+    const hasValidBearer =
+      !!this.authToken &&
+      parts?.length === 2 &&
+      parts[0] === "Bearer" &&
+      constantTimeEquals(parts[1]!, this.authToken);
+
+    if (opts?.requireToken) {
+      return hasValidBearer ? "operator_credential" : null;
+    }
+
+    if (!this.authToken) return "auth_disabled"; // Auth disabled for non-strict routes.
+
+    // Check operator-derived credentials before loopback position so a valid
+    // bearer/session on localhost keeps the full operator document.
+    if (hasValidBearer) {
+      return "operator_credential";
+    }
+
+    // SEC-012: Check ?session= query parameter for short-lived session tokens.
+    // This replaces the old ?token= query parameter that exposed the long-lived
+    // token, but only safe read/SSE routes opt into this branch.
+    if (opts?.allowSession) {
+      const sessionId = url.searchParams.get("session");
+      if (sessionId && this.validateSession(sessionId)) {
+        return "operator_credential";
+      }
+
+      // Check sanctuary_session cookie (set by login page flow)
+      const cookieSession = this.parseCookie(req, "sanctuary_session");
+      if (cookieSession && this.validateSession(cookieSession)) {
+        return "operator_credential";
+      }
+    }
+
+    // v0.10.2: loopback auto-auth - see _autoAuthLocalhost comment. Strict
+    // routes return above before this shortcut, so loopback can never release
+    // a Tier-1 decision or mutate operator state by network position alone.
+    // The OPERATOR-ONLY read routes opt out via `denyLoopbackAutoAuth`
+    // (decision 2: the retired wrap surface's tokenless fail-open reads do NOT
+    // carry over), and fall through to the operator-derived credential checks
+    // below.
+    if (
+      !opts?.denyLoopbackAutoAuth &&
+      this._autoAuthLocalhost &&
+      this.isLoopbackRequest(req)
+    ) {
+      return "loopback_position";
+    }
+
+    // SEC-012: Long-lived token in ?token= query parameter is explicitly REJECTED.
+    // This was the vulnerability - tokens in URLs leak to logs, history, and Referer headers.
+
+    // For GET / requests from browsers, serve login page instead of JSON 401
+    // (checked in handleRequest before checkAuth is called for this path)
+    return null;
+  }
+
   /**
    * Verify dashboard authentication.
    *
@@ -5636,68 +5723,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       denyLoopbackAutoAuth?: boolean;
     },
   ): boolean {
-    const deny = (): false => {
-      res.writeHead(401, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "unauthorized" }));
-      return false;
-    };
-
-    const authHeader = req.headers.authorization;
-    const parts = authHeader?.split(" ");
-    const hasValidBearer =
-      !!this.authToken &&
-      parts?.length === 2 &&
-      parts[0] === "Bearer" &&
-      constantTimeEquals(parts[1]!, this.authToken);
-
-    if (opts?.requireToken) {
-      return hasValidBearer || deny();
-    }
-
-    if (!this.authToken) return true; // Auth disabled for non-strict routes.
-
-    // v0.10.2: loopback auto-auth - see _autoAuthLocalhost comment. Strict
-    // routes return above before this shortcut, so loopback can never release
-    // a Tier-1 decision or mutate operator state by network position alone.
-    // The OPERATOR-ONLY read routes opt out via `denyLoopbackAutoAuth`
-    // (decision 2: the retired wrap surface's tokenless fail-open reads do NOT
-    // carry over), and fall through to the operator-derived credential checks
-    // below.
-    if (
-      !opts?.denyLoopbackAutoAuth &&
-      this._autoAuthLocalhost &&
-      this.isLoopbackRequest(req)
-    ) {
-      return true;
-    }
-
-    // Check Authorization: Bearer <token> header (primary auth method)
-    if (hasValidBearer) {
-      return true;
-    }
-
-    // SEC-012: Check ?session= query parameter for short-lived session tokens.
-    // This replaces the old ?token= query parameter that exposed the long-lived
-    // token, but only safe read/SSE routes opt into this branch.
-    if (opts?.allowSession) {
-      const sessionId = url.searchParams.get("session");
-      if (sessionId && this.validateSession(sessionId)) {
-        return true;
-      }
-
-      // Check sanctuary_session cookie (set by login page flow)
-      const cookieSession = this.parseCookie(req, "sanctuary_session");
-      if (cookieSession && this.validateSession(cookieSession)) {
-        return true;
-      }
-    }
-
-    // SEC-012: Long-lived token in ?token= query parameter is explicitly REJECTED.
-    // This was the vulnerability - tokens in URLs leak to logs, history, and Referer headers.
-
-    // For GET / requests from browsers, serve login page instead of JSON 401
-    // (checked in handleRequest before checkAuth is called for this path)
-    return deny();
+    return this.resolveAuthAdmission(req, url, opts) !== null || this.denyAuth(res);
   }
 
   /**
@@ -6526,23 +6552,20 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       method !== "GET" &&
       method !== "HEAD" &&
       !isDashboardReadStyleNonGet(method, url.pathname);
-    if (
-      !this.checkAuth(
-        req,
-        url,
-        res,
-        requiresOperatorBearer
-          ? { requireToken: true }
-          : {
-              allowSession: true,
-              denyLoopbackAutoAuth: isOperatorOnlyReadRoute(
-                method,
-                url.pathname,
-              ),
-            },
-      )
-    )
+    const authOptions = requiresOperatorBearer
+      ? { requireToken: true }
+      : {
+          allowSession: true,
+          denyLoopbackAutoAuth: isOperatorOnlyReadRoute(
+            method,
+            url.pathname,
+          ),
+        };
+    const authAdmission = this.resolveAuthAdmission(req, url, authOptions);
+    if (authAdmission === null) {
+      this.denyAuth(res);
       return;
+    }
 
     // Sovereignty Posture Dashboard: the authenticated posture surface, namely
     // the per-agent drill-down HTML at `/posture/agent/:id` and the JSON gap
@@ -6613,7 +6636,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
           this.serveDashboard(res);
         }
       } else if (method === "GET" && url.pathname === "/api/stream") {
-        this.handleDashboardStream(req, res);
+        this.handleDashboardStream(req, res, authAdmission);
       } else if (method === "GET" && url.pathname === "/events") {
         this.handleSSE(req, res);
       } else if (method === "GET" && url.pathname === "/api/status") {
@@ -6626,7 +6649,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         // client following the documented snapshot endpoint got a 404 in
         // standalone mode. Serve the same ProtectionSnapshot shape here,
         // built from the dependencies this channel already holds.
-        this.handleSnapshot(res);
+        this.handleSnapshot(res, authAdmission);
       } else if (method === "GET" && url.pathname === "/api/pending") {
         // The operator's approval queue. Requires an operator-derived
         // credential (bearer, or a session/cookie minted from it); loopback
@@ -7830,7 +7853,12 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     });
   }
 
-  private handleDashboardStream(req: IncomingMessage, res: ServerResponse): void {
+  private handleDashboardStream(
+    req: IncomingMessage,
+    res: ServerResponse,
+    authAdmission: DashboardAuthAdmission,
+  ): void {
+    const redactPendingApprovals = authAdmission === "loopback_position";
     this.buildAggregatorSources()
       .then((sources) => getProtectionSnapshot(sources))
       .then((snapshot) => {
@@ -7841,9 +7869,12 @@ export class DashboardApprovalChannel implements ApprovalChannel {
           "Connection": "keep-alive",
           "X-Accel-Buffering": "no",
         });
-        res.write(`event: snapshot\ndata: ${JSON.stringify(snapshot)}\n\n`);
+        const visibleSnapshot = redactPendingApprovals
+          ? redactPendingApprovalsForPositionOnly(snapshot)
+          : snapshot;
+        res.write(`event: snapshot\ndata: ${JSON.stringify(visibleSnapshot)}\n\n`);
 
-        this.dashboardStreamClients.add(res);
+        this.dashboardStreamClients.set(res, redactPendingApprovals);
         const cleanup = (): void => {
           this.dashboardStreamClients.delete(res);
         };
@@ -7934,15 +7965,22 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * handleLegacyRequest before this is reached, matching every other
    * legacy /api/* route.
    */
-  private handleSnapshot(res: ServerResponse): void {
+  private handleSnapshot(
+    res: ServerResponse,
+    authAdmission: DashboardAuthAdmission,
+  ): void {
+    const redactPendingApprovals = authAdmission === "loopback_position";
     this.buildAggregatorSources()
       .then((sources) => getProtectionSnapshot(sources))
       .then((snapshot) => {
+        const visibleSnapshot = redactPendingApprovals
+          ? redactPendingApprovalsForPositionOnly(snapshot)
+          : snapshot;
         res.writeHead(200, {
           "Content-Type": "application/json",
           "Cache-Control": "no-store",
         });
-        res.end(JSON.stringify(snapshot));
+        res.end(JSON.stringify(visibleSnapshot));
       })
       .catch((err) => {
         logCaughtError(
@@ -8730,9 +8768,13 @@ export class DashboardApprovalChannel implements ApprovalChannel {
 
     const dashboardEvent = dashboardStreamEventForLegacyEvent(event, data);
     if (!dashboardEvent) return;
-    const dashboardMessage =
-      `event: ${dashboardEvent.event}\ndata: ${JSON.stringify(dashboardEvent.data)}\n\n`;
-    for (const client of this.dashboardStreamClients) {
+    for (const [client, redactPendingApprovals] of this.dashboardStreamClients) {
+      const eventData =
+        redactPendingApprovals && dashboardEvent.event === "snapshot"
+          ? redactPendingApprovalsFromSnapshotPayload(dashboardEvent.data)
+          : dashboardEvent.data;
+      const dashboardMessage =
+        `event: ${dashboardEvent.event}\ndata: ${JSON.stringify(eventData)}\n\n`;
       try {
         client.write(dashboardMessage);
       } catch {

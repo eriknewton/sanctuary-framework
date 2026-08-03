@@ -61,6 +61,14 @@ const STUB_BASELINE = {
   getProfile: () => ({}),
 } as never;
 
+const SENSITIVE_APPROVAL = {
+  operation: "secret-req-1",
+  tier: 1 as const,
+  reason: "secret reason must not leak",
+  context: { secret: "hidden-from-position-only" },
+  timestamp: "2026-08-03T12:00:00.000Z",
+};
+
 interface Rig {
   channel: DashboardApprovalChannel;
   base: string;
@@ -120,6 +128,36 @@ async function startRig(opts: {
     bearer: { Authorization: `Bearer ${TOKEN}` },
     stop: async () => channel!.stop(),
   };
+}
+
+async function readInitialSnapshotEvent(res: Response): Promise<Record<string, unknown>> {
+  const reader = res.body!.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  try {
+    for (let i = 0; i < 8; i++) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const match = /event: snapshot\ndata: ([^\n]+)\n\n/.exec(buf);
+      if (match) return JSON.parse(match[1]!) as Record<string, unknown>;
+    }
+  } finally {
+    await reader.cancel().catch(() => undefined);
+  }
+  throw new Error("snapshot event not received");
+}
+
+async function denyFirstPending(rig: Rig): Promise<void> {
+  const res = await fetch(`${rig.base}/api/pending`, { headers: rig.bearer });
+  if (!res.ok) return;
+  const rows = (await res.json()) as Array<{ id: string }>;
+  const id = rows[0]?.id;
+  if (!id) return;
+  await fetch(`${rig.base}/api/deny/${encodeURIComponent(id)}`, {
+    method: "POST",
+    headers: rig.bearer,
+  });
 }
 
 describe("fleet-posture reads require the operator bearer, never loopback position", () => {
@@ -423,5 +461,146 @@ describe("the approval-inbox reads require the operator bearer, never loopback p
       { method: "POST" },
     );
     expect(res.status).toBe(401);
+  });
+});
+
+/**
+ * `GET /api/snapshot` and `GET /api/stream` stay ambient liveness reads, but
+ * their embedded approval queue is operator-only. A loopback-position caller
+ * gets the same snapshot posture document with approval rows redacted and a
+ * count-only marker, never the sensitive operation/reason rows and never a
+ * false empty inbox.
+ */
+describe("snapshot pending approvals redact for position-only callers", () => {
+  const rigs: Rig[] = [];
+  afterEach(async () => {
+    for (const rig of rigs.splice(0)) await rig.stop();
+  });
+
+  async function loopbackAutoAuthRig(): Promise<Rig> {
+    const rig = await startRig({ autoAuth: true });
+    rigs.push(rig);
+    return rig;
+  }
+
+  it("redacts pending approvals from tokenless loopback GET /api/snapshot while keeping the count marker", async () => {
+    const rig = await loopbackAutoAuthRig();
+    const decision = rig.channel.requestApproval(SENSITIVE_APPROVAL);
+    try {
+      const res = await fetch(`${rig.base}/api/snapshot`);
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.pending_approvals).toEqual([]);
+      expect(body.pending_approvals_redacted).toBe(true);
+      expect(body.pending_approvals_count).toBe(1);
+      const encoded = JSON.stringify(body);
+      expect(encoded).not.toContain("secret-req-1");
+      expect(encoded).not.toContain("secret reason must not leak");
+    } finally {
+      await denyFirstPending(rig);
+      await decision;
+    }
+  });
+
+  it("redacts pending approvals from the tokenless loopback /api/stream initial snapshot event", async () => {
+    const rig = await loopbackAutoAuthRig();
+    const decision = rig.channel.requestApproval(SENSITIVE_APPROVAL);
+    try {
+      const res = await fetch(`${rig.base}/api/stream`);
+      expect(res.status).toBe(200);
+      const snapshot = await readInitialSnapshotEvent(res);
+      expect(snapshot.pending_approvals).toEqual([]);
+      expect(snapshot.pending_approvals_redacted).toBe(true);
+      expect(snapshot.pending_approvals_count).toBe(1);
+      const encoded = JSON.stringify(snapshot);
+      expect(encoded).not.toContain("secret-req-1");
+      expect(encoded).not.toContain("secret reason must not leak");
+    } finally {
+      await denyFirstPending(rig);
+      await decision;
+    }
+  });
+
+  it("serves full pending approval rows to an operator bearer and to a session minted from it", async () => {
+    const rig = await loopbackAutoAuthRig();
+    const decision = rig.channel.requestApproval(SENSITIVE_APPROVAL);
+    try {
+      const bearerSnapshot = await fetch(`${rig.base}/api/snapshot`, {
+        headers: rig.bearer,
+      });
+      expect(bearerSnapshot.status).toBe(200);
+      const bearerBody = await bearerSnapshot.json();
+      expect(bearerBody.pending_approvals).toHaveLength(1);
+      expect(bearerBody.pending_approvals[0].operation).toBe("secret-req-1");
+      expect(bearerBody.pending_approvals_redacted).toBeUndefined();
+
+      const exchange = await fetch(`${rig.base}/auth/session`, {
+        method: "POST",
+        headers: rig.bearer,
+      });
+      expect(exchange.status).toBe(200);
+      const { session_id: sessionId } = (await exchange.json()) as {
+        session_id: string;
+      };
+
+      const sessionSnapshot = await fetch(
+        `${rig.base}/api/snapshot?session=${encodeURIComponent(sessionId)}`,
+      );
+      expect(sessionSnapshot.status).toBe(200);
+      const sessionBody = await sessionSnapshot.json();
+      expect(sessionBody.pending_approvals).toHaveLength(1);
+      expect(sessionBody.pending_approvals[0].reason).toBe(
+        "secret reason must not leak",
+      );
+      expect(sessionBody.pending_approvals_redacted).toBeUndefined();
+
+      const streamRes = await fetch(
+        `${rig.base}/api/stream?session=${encodeURIComponent(sessionId)}`,
+      );
+      expect(streamRes.status).toBe(200);
+      const streamSnapshot = await readInitialSnapshotEvent(streamRes);
+      expect(streamSnapshot.pending_approvals).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ operation: "secret-req-1" }),
+        ]),
+      );
+      expect(streamSnapshot.pending_approvals_redacted).toBeUndefined();
+    } finally {
+      await denyFirstPending(rig);
+      await decision;
+    }
+  });
+
+  it("treats a wrong bearer on ambient snapshot reads as position-only, matching the existing loopback fallback", async () => {
+    const rig = await loopbackAutoAuthRig();
+    const decision = rig.channel.requestApproval(SENSITIVE_APPROVAL);
+    try {
+      const res = await fetch(`${rig.base}/api/snapshot`, {
+        headers: { Authorization: `Bearer ${TOKEN}-wrong` },
+      });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.pending_approvals).toEqual([]);
+      expect(body.pending_approvals_redacted).toBe(true);
+      expect(body.pending_approvals_count).toBe(1);
+    } finally {
+      await denyFirstPending(rig);
+      await decision;
+    }
+  });
+
+  it("CONTROL: /api/status remains tokenless-open and exposes only the count oracle", async () => {
+    const rig = await loopbackAutoAuthRig();
+    const decision = rig.channel.requestApproval(SENSITIVE_APPROVAL);
+    try {
+      const res = await fetch(`${rig.base}/api/status`);
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.pending_count).toBe(1);
+      expect(JSON.stringify(body)).not.toContain("secret-req-1");
+    } finally {
+      await denyFirstPending(rig);
+      await decision;
+    }
   });
 });
