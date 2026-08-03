@@ -86,6 +86,10 @@ export type EnforcementAvailabilityVerification =
 export interface EnforcementAvailabilityStoreOptions {
   freshnessWindowMs?: number;
   now?: () => number;
+  onVerifiedReport?: (
+    connectionId: string,
+    snapshot: EnforcementAvailabilitySnapshot,
+  ) => void;
 }
 
 export interface EnforcementAvailabilitySocketQueryOptions {
@@ -108,12 +112,17 @@ interface ConnectionAvailabilityState {
 export class EnforcementAvailabilityStore {
   private readonly freshnessWindowMs: number;
   private readonly now: () => number;
+  private readonly onVerifiedReport: (
+    connectionId: string,
+    snapshot: EnforcementAvailabilitySnapshot,
+  ) => void;
   private readonly connections = new Map<string, ConnectionAvailabilityState>();
 
   constructor(options: EnforcementAvailabilityStoreOptions = {}) {
     this.freshnessWindowMs =
       options.freshnessWindowMs ?? DEFAULT_ENFORCEMENT_AVAILABILITY_FRESHNESS_MS;
     this.now = options.now ?? Date.now;
+    this.onVerifiedReport = options.onVerifiedReport ?? (() => undefined);
   }
 
   registerConnection(connectionId: string): void {
@@ -146,6 +155,11 @@ export class EnforcementAvailabilityStore {
     state.report = report;
     state.observedAtMs = observedAtMs;
     state.invalidReason = null;
+    try {
+      this.onVerifiedReport(connectionId, report);
+    } catch {
+      // Watchdog/telemetry consumers must never corrupt availability state.
+    }
   }
 
   recordInvalidReport(

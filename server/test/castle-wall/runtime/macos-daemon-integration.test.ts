@@ -129,6 +129,9 @@ describe("Castle Wall macOS daemon integration", () => {
       async broadcastArmLease() {
         return 0;
       },
+      recycleConnection() {
+        return false;
+      },
     };
   }
 
@@ -294,6 +297,9 @@ describe("Castle Wall macOS daemon integration", () => {
             broadcasts.push(lease);
             return 0;
           },
+          recycleConnection() {
+            return false;
+          },
         };
       },
     });
@@ -364,6 +370,9 @@ describe("Castle Wall macOS daemon integration", () => {
           async broadcastArmLease(lease: ArmLeaseNotification) {
             broadcasts.push(lease);
             return 0;
+          },
+          recycleConnection() {
+            return false;
           },
         };
       },
@@ -444,6 +453,9 @@ describe("Castle Wall macOS daemon integration", () => {
           async broadcastArmLease(lease: ArmLeaseNotification) {
             broadcasts.push(lease);
             return 0;
+          },
+          recycleConnection() {
+            return false;
           },
         };
       },

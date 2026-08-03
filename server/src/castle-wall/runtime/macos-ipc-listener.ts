@@ -199,6 +199,8 @@ export interface MacOSFlowIpcListenerStats {
   framesRejected: number;
   /** Handshake challenges sent across the lifetime. */
   handshakesSent: number;
+  /** Subscriber connections recycled by daemon-side recovery watchdogs. */
+  connectionsRecycled: number;
   /** Listening state (true once bind has completed). */
   isListening: boolean;
 }
@@ -211,6 +213,8 @@ export interface MacOSFlowIpcListenerStats {
  *  - `stop()` - close every active connection and unlink the socket path.
  *  - `broadcastManifestUpdate()` - fans the current manifest snapshot to
  *    every registered subscriber via the consumer's broadcast path.
+ *  - `recycleConnection()` - drops one registered IPC connection so the
+ *    extension re-enters the known-good reconnect + resubscribe path.
  *  - `getStats()` - observability counters.
  *
  * Lifecycle invariants:
@@ -246,6 +250,7 @@ export class MacOSFlowIpcListener {
     framesDecoded: 0,
     framesRejected: 0,
     handshakesSent: 0,
+    connectionsRecycled: 0,
     isListening: false,
   };
 
@@ -389,6 +394,23 @@ export class MacOSFlowIpcListener {
       emitted += 1;
     }
     return emitted;
+  }
+
+  /**
+   * Recycle one subscriber connection through the transport-close recovery
+   * edge. The existing socket `close` handler unregisters the subscriber and
+   * clears the connection map; this method deliberately does no duplicate
+   * cleanup. `reason` is part of the caller contract and reserved for a future
+   * hook; logging stays with the daemon, which owns reason-coded recovery.
+   */
+  recycleConnection(subscriberId: string, _reason: string): boolean {
+    const state = this.connections.get(subscriberId);
+    if (!state) {
+      return false;
+    }
+    this.stats.connectionsRecycled += 1;
+    state.socket.destroy();
+    return true;
   }
 
   /** Snapshot listener counters. */

@@ -8,7 +8,6 @@ import { ed25519 } from "@noble/curves/ed25519";
 
 import { canonicalize } from "../../../src/mesh/canonical-json.js";
 import type {
-  EnforcementAvailabilityReportNotification,
   EnforcementAvailabilitySnapshot,
   FlowDecisionRecordedNotification,
   ManifestSubscribeRequest,
@@ -21,7 +20,6 @@ import {
   toBase64url,
 } from "../../../src/castle-wall/runtime/producer-signature.js";
 import {
-  ENFORCEMENT_AVAILABILITY_REPORT_OPERATION,
   EnforcementAvailabilityStore,
   queryMacOSEnforcementAvailability,
 } from "../../../src/castle-wall/runtime/enforcement-availability.js";
@@ -38,6 +36,10 @@ import type { SignedManifest } from "../../../src/castle-wall/allowlist/manifest
 import { AuditLog } from "../../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../../src/storage/memory.js";
 import { generateRandomKey } from "../../../src/core/random.js";
+import {
+  availabilitySnapshot as greenSnapshot,
+  signAvailabilityReport,
+} from "./availability-report-helper.js";
 
 const FORTRESS_ID = "fortress-test";
 const NOW = 1_780_000_000_000;
@@ -120,93 +122,6 @@ function auditTokenForRuid(uid: number): string {
       return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
     })
     .join("");
-}
-
-function greenSnapshot(
-  overrides: Partial<EnforcementAvailabilitySnapshot> = {},
-): EnforcementAvailabilitySnapshot {
-  return {
-    protocol_version: 1,
-    source: "macos_extension",
-    lease_state: "live",
-    lease_reason: "ok",
-    manifest_state: "applied",
-    manifest_signature_b64url: "manifest-sig",
-    provider_bound: true,
-    producer_claimed_at: "1970-01-01T00:00:00.000Z",
-    ...overrides,
-  };
-}
-
-function isGreen(report: EnforcementAvailabilitySnapshot): boolean {
-  return (
-    report.protocol_version === 1 &&
-    report.source === "macos_extension" &&
-    report.lease_state === "live" &&
-    report.lease_reason === "ok" &&
-    report.manifest_state === "applied" &&
-    typeof report.manifest_signature_b64url === "string" &&
-    report.manifest_signature_b64url.length > 0 &&
-    report.provider_bound === true
-  );
-}
-
-function availabilityCanonicalJson(input: {
-  report: EnforcementAvailabilitySnapshot;
-  seq: number;
-  priorSha256Hex?: string | null;
-  capturedAtUnixMs?: number;
-  fortressId?: string;
-}): string {
-  return canonicalize({
-    timestamp: input.report.producer_claimed_at ?? new Date(input.capturedAtUnixMs ?? NOW).toISOString(),
-    layer: "l1",
-    operation: ENFORCEMENT_AVAILABILITY_REPORT_OPERATION,
-    identity_id: input.fortressId ?? FORTRESS_ID,
-    result: isGreen(input.report) ? "success" : "failure",
-    details: {
-      seq: input.seq,
-      prior_sha256_hex: input.priorSha256Hex ?? null,
-      enforcement: input.report,
-    },
-  });
-}
-
-function signAvailabilityReport(input: {
-  visibleReport: EnforcementAvailabilitySnapshot;
-  signedReport?: EnforcementAvailabilitySnapshot;
-  privateKey: Uint8Array;
-  seq?: number;
-  priorSha256Hex?: string | null;
-  capturedAtUnixMs?: number;
-  fortressId?: string;
-}): EnforcementAvailabilityReportNotification {
-  const seq = input.seq ?? 0;
-  const capturedAtUnixMs = input.capturedAtUnixMs ?? NOW;
-  const priorSha256Hex = input.priorSha256Hex ?? null;
-  const eventCanonicalJson = availabilityCanonicalJson({
-    report: input.signedReport ?? input.visibleReport,
-    seq,
-    priorSha256Hex,
-    capturedAtUnixMs,
-    fortressId: input.fortressId,
-  });
-  const signature = ed25519.sign(
-    producerSigningBytes(eventCanonicalJson, capturedAtUnixMs, seq),
-    input.privateKey,
-  );
-  return {
-    type: "enforcement_availability_report",
-    enforcement: input.visibleReport,
-    producer: {
-      event_canonical_json: eventCanonicalJson,
-      captured_at_unix_ms: capturedAtUnixMs,
-      seq,
-      prior_sha256_hex: priorSha256Hex,
-      signature_b64url: toBase64url(signature),
-      key_id: CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1,
-    },
-  };
 }
 
 function signedFlowWithAvailability(input: {

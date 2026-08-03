@@ -151,6 +151,9 @@ describe("Castle Wall macOS daemon — policy reload hang guard", () => {
       async broadcastArmLease() {
         return 0;
       },
+      recycleConnection() {
+        return false;
+      },
     });
     return {
       factory,

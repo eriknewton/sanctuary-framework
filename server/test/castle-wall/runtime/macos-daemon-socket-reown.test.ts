@@ -352,5 +352,8 @@ function realFakeListener(
     async broadcastArmLease() {
       return 0;
     },
+    recycleConnection() {
+      return false;
+    },
   };
 }

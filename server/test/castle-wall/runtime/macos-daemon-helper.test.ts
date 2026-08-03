@@ -79,6 +79,9 @@ describe("Castle Wall macOS daemon — helper signing path (B2)", () => {
       async broadcastArmLease() {
         return 0;
       },
+      recycleConnection() {
+        return false;
+      },
     };
   }
 

@@ -41,6 +41,7 @@ import type {
   AuditEmitNotification,
   AuditProducerSignatureNotification,
   EnforcementAvailabilityReportNotification,
+  EnforcementAvailabilitySnapshot,
   FlowDecisionRecordedNotification,
   FlowPendingApprovalNotification,
   IpcAgentAttribution,
@@ -160,6 +161,15 @@ export interface MacOSFlowEventConsumerInput {
    * watchdog's tick timer and loud outputs; this consumer only feeds it.
    */
   emissionLiveness?: EmissionLivenessNotes;
+  /**
+   * Optional lease-delivery watchdog feed. Called only after an extension
+   * availability report or flow-carried availability snapshot has passed the
+   * producer-signature and replay gates and updated the store.
+   */
+  onVerifiedAvailabilityReport?: (
+    connectionId: string,
+    snapshot: EnforcementAvailabilitySnapshot,
+  ) => void;
 }
 
 /**
@@ -208,6 +218,7 @@ export class MacOSFlowEventConsumer {
     this.now = input.now ?? Date.now;
     this.enforcementAvailability = new EnforcementAvailabilityStore({
       now: this.now,
+      onVerifiedReport: input.onVerifiedAvailabilityReport,
     });
     this.producerAuditConsumer =
       this.pinnedProducerKeyB64url !== null
