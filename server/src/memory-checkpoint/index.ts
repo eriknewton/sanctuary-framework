@@ -68,6 +68,24 @@ export {
   startMemoryCheckpointScheduler,
   startMemoryCheckpointSchedulerFromEnv,
 } from "./scheduler.js";
+
+export {
+  CheckpointRestoreAgentNotParkedError,
+  CheckpointRestoreCheckpointNotFoundError,
+  CheckpointRestoreForensicSourceError,
+  CheckpointRestoreBundleError,
+  CheckpointRestoreReservedNamespaceError,
+  CheckpointRestoreExportError,
+  CheckpointRestoreReconstructError,
+  CheckpointRestoreAuditError,
+  restoreCheckpoint,
+} from "./restore.js";
+export type {
+  CheckpointPoisonMap,
+  CheckpointRestoreReconstructProgress,
+  RestoreCheckpointDeps,
+  RestoreCheckpointResult,
+} from "./restore.js";
 export type {
   MemoryCheckpointSchedulerHandle,
   MemoryCheckpointSchedulerOptions,

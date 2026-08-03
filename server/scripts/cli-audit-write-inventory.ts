@@ -162,6 +162,7 @@ const COMMAND_TABLE: Record<string, CommandSpec> = {
   "checkpoint list":   { classification: "read-only", notes: "reads local record.json metadata only" },
   "checkpoint show":   { classification: "read-only", notes: "reads one local record.json metadata record only" },
   "checkpoint prune":  { classification: "mutator", auditOverride: true, notes: "AuditLog.append memory_checkpoint_pruned in pruneExpiredCheckpoints; deletes expired local checkpoint dirs" },
+  "checkpoint restore": { classification: "mutator", auditOverride: true, notes: "Tier-1 checkpoint restore; restoreCheckpoint emits AuditLog.appendCritical on success and failure" },
 
   // ---- intelligence ----
   "intelligence diagnose": { classification: "read-only" },

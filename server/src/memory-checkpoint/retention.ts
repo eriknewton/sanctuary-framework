@@ -100,6 +100,7 @@ export async function pruneExpired(
 
   const prunedIds: string[] = [];
   for (const record of records) {
+    if (record.source === "forensic_quarantine") continue;
     if (record.retention_expires_at === null) continue;
     const expiresMs = Date.parse(record.retention_expires_at);
     if (!Number.isFinite(expiresMs)) {

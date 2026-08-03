@@ -17,6 +17,7 @@
     "identity_rotate",
     "identity_sign",
     "lockdown",
+    "memory_checkpoint_restore",
     "memory_delete",
     "memory_insert",
     "operator_cloud_provision",

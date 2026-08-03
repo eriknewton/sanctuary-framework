@@ -293,10 +293,15 @@ describe("memory checkpoint scheduler and retention", () => {
         parseRetention("off"),
       ),
     });
+    const forensic = makeRecord("2026-08-02T02:00:00.000Z", "forensic", {
+      source: "forensic_quarantine",
+      retention_expires_at: "2026-08-02T03:00:00.000Z",
+    });
     for (const [record, bundle] of [
       [expired, "expired"],
       [future, "future"],
       [noExpiry, "no-expiry"],
+      [forensic, "forensic"],
     ] as const) {
       await fixture.checkpointStore.create({
         record,
@@ -312,7 +317,7 @@ describe("memory checkpoint scheduler and retention", () => {
 
     expect(pruned).toEqual([expired.id]);
     const remaining = (await fixture.checkpointStore.list()).map((record) => record.id).sort();
-    expect(remaining).toEqual([future.id, noExpiry.id].sort());
+    expect(remaining).toEqual([future.id, noExpiry.id, forensic.id].sort());
   });
 
   it("emits exact audit op strings on create and prune", async () => {

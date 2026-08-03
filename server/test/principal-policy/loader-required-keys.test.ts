@@ -105,6 +105,7 @@ approval_channel:
       "file_grant",
       "castle_wall_observe_promote",
       "enforcement_export_enabled",
+      "memory_checkpoint_restore",
     ]);
     expect(policy.approval_channel.type).toBe("stderr");
   });
@@ -131,6 +132,7 @@ approval_channel:
       "file_grant",
       "castle_wall_observe_promote",
       "enforcement_export_enabled",
+      "memory_checkpoint_restore",
     ]);
   });
 
