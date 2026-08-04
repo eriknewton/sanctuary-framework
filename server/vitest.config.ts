@@ -3,6 +3,9 @@ import { defineConfig } from "vitest/config";
 export default defineConfig({
   test: {
     globals: true,
+    // Installs an in-memory credential store for every test so nothing ever
+    // writes to the operator's real login keychain. See src/wrap/keychain-exec.ts.
+    setupFiles: ["./test/setup/keychain-fake.ts"],
     environment: "node",
     // No network egress from unit tests: the wrap-time pinned-version
     // resolvability probe (wrap/cli.ts) and the startup update check both
