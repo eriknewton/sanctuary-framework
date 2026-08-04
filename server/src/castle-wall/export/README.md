@@ -48,6 +48,26 @@ an explicit allowlist and **never** spreads or serializes the raw audit
   `allow`/`deny` derived from the event type, not the fine-grained
   `allow_once`/`deny_always`/`timeout_default_deny` disposition.
 
+## Neutral enforcement-evidence bundle body
+
+`enforcement-bundle.ts` builds a plain JSON-serializable body for Verascore's
+neutral enforcement-evidence format. It is pure: no signing, no file reads, no
+network calls, no ambient clock. The caller injects the clock and the existing
+Castle Wall producer-signature verifier options.
+
+What can leave the host is the same closed egress metadata listed above plus the
+public per-flow producer evidence already stored on the signed audit row:
+signature, key id, verbatim signed canonical string, WAL sequence, and capture
+timestamp. The builder never spreads raw `details`; it drops any row that the
+existing mapper does not re-verify, any row with malformed evidence carriers,
+and any signed body whose details would make the verbatim evidence string a
+carrier for non-public fields.
+
+This is operator-only and agent-unreachable. It must not be wired to an
+agent-facing tool or used on agent-redacted audit entries. The bundle is
+operator-produced enforcement evidence, not a third-party audit or
+certification, and it makes no `enforcement-verified` tier claim.
+
 ## Safe by default; outbound push is Tier-1 gated
 
 - The default sink is **`file`** (NDJSON via an injected writer / stdout). It

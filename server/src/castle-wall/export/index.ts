@@ -19,3 +19,4 @@ export * from "./audit-ops.js";
 export * from "./exporter.js";
 export * from "./cursor.js";
 export * from "./stream.js";
+export * from "./enforcement-bundle.js";
