@@ -577,7 +577,7 @@ describe("macOS extension-origin enforcement availability reports", () => {
       expect(replayError).toHaveBeenCalledTimes(1);
       expect(replayError).toHaveBeenNthCalledWith(
         1,
-        "[castle-wall] enforcement availability duplicate replays suppressed stream=dedicated_report count=100 rejected_seq=3 floor=3",
+        "[castle-wall] enforcement availability duplicate replays suppressed stream=dedicated_report count=100 distinct_seqs=1 seq_range=[3,3] floor_range=[3,3] window_ms=99",
       );
 
       now += 1;
@@ -600,6 +600,127 @@ describe("macOS extension-origin enforcement availability reports", () => {
 
     expect(consumer.getStats().enforcementAvailabilityReportsRecorded).toBe(1);
     expect(consumer.getStats().enforcementAvailabilityReportsRejected).toBe(101);
+  });
+
+  it("F-AVAIL-DUP-WINDOW: distinct-seq duplicate flood is bounded to count-window summaries", async () => {
+    const privateKey = ed25519.utils.randomPrivateKey();
+    const publicKeyB64url = toBase64url(ed25519.getPublicKey(privateKey));
+    let now = NOW;
+    const consumer = makeConsumer({ publicKeyB64url, now: () => now });
+    let duplicateLines: string[] = [];
+
+    const replayError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      for (let seq = 1; seq <= 300; seq += 1) {
+        now = NOW + seq;
+        const report = signAvailabilityReport({
+          visibleReport: greenSnapshot(),
+          privateKey,
+          seq,
+        });
+        await consumer.handleEnforcementAvailabilityReport(report, "ext-1");
+        await consumer.handleEnforcementAvailabilityReport(report, "ext-1");
+      }
+      duplicateLines = replayError.mock.calls
+        .map(([line]) => String(line))
+        .filter((line) => line.includes("duplicate replays suppressed"));
+    } finally {
+      replayError.mockRestore();
+    }
+
+    expect(duplicateLines).toHaveLength(3);
+    expect(duplicateLines[0]).toBe(
+      "[castle-wall] enforcement availability duplicate replays suppressed stream=dedicated_report count=100 distinct_seqs=100 seq_range=[1,100] floor_range=[1,100] window_ms=99",
+    );
+    expect(duplicateLines[1]).toBe(
+      "[castle-wall] enforcement availability duplicate replays suppressed stream=dedicated_report count=100 distinct_seqs=100 seq_range=[101,200] floor_range=[101,200] window_ms=99",
+    );
+    expect(duplicateLines[2]).toBe(
+      "[castle-wall] enforcement availability duplicate replays suppressed stream=dedicated_report count=100 distinct_seqs=100 seq_range=[201,300] floor_range=[201,300] window_ms=99",
+    );
+    expect(consumer.getStats().enforcementAvailabilityReportsRecorded).toBe(300);
+    expect(consumer.getStats().enforcementAvailabilityReportsRejected).toBe(300);
+  });
+
+  it("F-AVAIL-DUP-WINDOW: interval expiry flushes the prior under-threshold distinct-seq window", async () => {
+    const privateKey = ed25519.utils.randomPrivateKey();
+    const publicKeyB64url = toBase64url(ed25519.getPublicKey(privateKey));
+    let now = NOW;
+    const consumer = makeConsumer({ publicKeyB64url, now: () => now });
+    let duplicateLines: string[] = [];
+
+    const replayError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      for (let seq = 1; seq <= 5; seq += 1) {
+        now = NOW + seq;
+        const report = signAvailabilityReport({
+          visibleReport: greenSnapshot(),
+          privateKey,
+          seq,
+        });
+        await consumer.handleEnforcementAvailabilityReport(report, "ext-1");
+        await consumer.handleEnforcementAvailabilityReport(report, "ext-1");
+      }
+      expect(replayError).not.toHaveBeenCalled();
+
+      now = NOW + 60_011;
+      const nextReport = signAvailabilityReport({
+        visibleReport: greenSnapshot(),
+        privateKey,
+        seq: 6,
+      });
+      await consumer.handleEnforcementAvailabilityReport(nextReport, "ext-1");
+      await consumer.handleEnforcementAvailabilityReport(nextReport, "ext-1");
+      duplicateLines = replayError.mock.calls
+        .map(([line]) => String(line))
+        .filter((line) => line.includes("duplicate replays suppressed"));
+    } finally {
+      replayError.mockRestore();
+    }
+
+    expect(duplicateLines).toEqual([
+      "[castle-wall] enforcement availability duplicate replays suppressed stream=dedicated_report count=5 distinct_seqs=5 seq_range=[1,5] floor_range=[1,5] window_ms=4",
+    ]);
+  });
+
+  it("F-AVAIL-DUP-WINDOW: duplicate summary reports the floor range when floors vary", async () => {
+    const privateKey = ed25519.utils.randomPrivateKey();
+    const publicKeyB64url = toBase64url(ed25519.getPublicKey(privateKey));
+    let now = NOW;
+    const consumer = makeConsumer({ publicKeyB64url, now: () => now });
+    let duplicateLines: string[] = [];
+
+    const replayError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      for (let seq = 10; seq <= 11; seq += 1) {
+        now = NOW + seq;
+        const report = signAvailabilityReport({
+          visibleReport: greenSnapshot(),
+          privateKey,
+          seq,
+        });
+        await consumer.handleEnforcementAvailabilityReport(report, "ext-1");
+        await consumer.handleEnforcementAvailabilityReport(report, "ext-1");
+      }
+
+      now = NOW + 60_011;
+      const nextReport = signAvailabilityReport({
+        visibleReport: greenSnapshot(),
+        privateKey,
+        seq: 12,
+      });
+      await consumer.handleEnforcementAvailabilityReport(nextReport, "ext-1");
+      await consumer.handleEnforcementAvailabilityReport(nextReport, "ext-1");
+      duplicateLines = replayError.mock.calls
+        .map(([line]) => String(line))
+        .filter((line) => line.includes("duplicate replays suppressed"));
+    } finally {
+      replayError.mockRestore();
+    }
+
+    expect(duplicateLines).toEqual([
+      "[castle-wall] enforcement availability duplicate replays suppressed stream=dedicated_report count=2 distinct_seqs=2 seq_range=[10,11] floor_range=[10,11] window_ms=1",
+    ]);
   });
 
   it("F-AVAIL-SEQ-FLAP negative: the SAME dedicated report delivered twice is rejected without refreshing live state", async () => {
