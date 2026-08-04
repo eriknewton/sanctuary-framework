@@ -64,12 +64,21 @@ const WAL_OPERATION_TO_EVENT_TYPE: Readonly<Record<string, string>> = Object.fre
 /** Default batch cap per drain request. Matches a sane daemon snapshot ceiling. */
 export const DEFAULT_AUDIT_DRAIN_MAX_EVENTS = 256;
 
+/** Default ceiling for exponential backoff after repeated unsettled faults. */
+export const DEFAULT_AUDIT_DRAIN_MAX_FAULT_BACKOFF_MS = 30_000;
+
 /** Options for one drain cycle / the continuous loop. */
 export interface LinuxAuditDrainOptions {
   /** Max events to request per drain frame. Defaults to 256. */
   maxEvents?: number;
   /** Poll interval (ms) between drain cycles when running continuously. Default 1000. */
   pollIntervalMs?: number;
+  /**
+   * Maximum backoff delay after repeated same-cursor unsettled drain faults.
+   * Defaults to 30s. The first fault waits `pollIntervalMs`, then doubles up to
+   * this cap.
+   */
+  maxFaultBackoffMs?: number;
   /**
    * Seq to resume the loop's cursor from (exclusive - the first cycle pulls
    * strictly above it). Defaults to null (drain from the start). The activation
@@ -244,10 +253,18 @@ export async function drainOnce(
   maxEvents: number,
   onError?: (err: Error) => void,
   onDrainFault?: (err: Error) => void
-): Promise<{ nextAfterSeq: number | null; morePending: boolean; drained: number }> {
+): Promise<{
+  nextAfterSeq: number | null;
+  morePending: boolean;
+  drained: number;
+  faulted: boolean;
+  faultedSeq: number | null;
+}> {
   const response: AuditDrainResponse = await client.drainRequest(afterSeq, maxEvents);
   let cursor: number | null = afterSeq;
   let drained = 0;
+  let faulted = false;
+  let faultedSeq: number | null = null;
 
   for (const drainedEvent of response.events) {
     // The per-event ack IS the drain ack: the consumer invokes it on durable
@@ -269,6 +286,8 @@ export async function drainOnce(
       onDrainFault?.(
         new Error(`audit_drain: ${built.reason} at seq ${drainedEvent.seq}`)
       );
+      faulted = true;
+      faultedSeq = drainedEvent.seq;
       break;
     }
     let ingestError: Error | undefined;
@@ -312,14 +331,18 @@ export async function drainOnce(
             `audit_drain: event seq ${drainedEvent.seq} did not settle (no ack)`
           )
       );
+      faulted = true;
+      faultedSeq = drainedEvent.seq;
       break;
     }
   }
 
   return {
     nextAfterSeq: cursor,
-    morePending: response.more_pending,
+    morePending: !faulted && cursor !== afterSeq ? response.more_pending : false,
     drained,
+    faulted,
+    faultedSeq,
   };
 }
 
@@ -348,17 +371,24 @@ export function startLinuxAuditDrainLoop(
 ): LinuxAuditDrainHandle {
   const maxEvents = options.maxEvents ?? DEFAULT_AUDIT_DRAIN_MAX_EVENTS;
   const pollIntervalMs = options.pollIntervalMs ?? 1000;
+  const maxFaultBackoffMs = positiveIntegerOption(
+    options.maxFaultBackoffMs,
+    DEFAULT_AUDIT_DRAIN_MAX_FAULT_BACKOFF_MS
+  );
   const setTimer = options.setTimer ?? ((cb, ms) => setTimeout(cb, ms));
   const clearTimer = options.clearTimer ?? ((h) => clearTimeout(h as ReturnType<typeof setTimeout>));
 
   let stopped = false;
   let cursor: number | null = options.initialCursor ?? null;
   let lastAcked: number | null = null;
+  let consecutiveFaultCursor: number | null = null;
+  let consecutiveFaultsAtCursor = 0;
   let timer: unknown = null;
   let inflight: Promise<void> = Promise.resolve();
 
   const cycle = async (): Promise<void> => {
     if (stopped) return;
+    let faultedThisCycle = false;
     try {
       // Drain all currently-pending batches before sleeping.
       let morePending = true;
@@ -373,6 +403,7 @@ export function startLinuxAuditDrainLoop(
         );
         cursor = result.nextAfterSeq;
         if (result.drained > 0) lastAcked = cursor;
+        if (result.faulted) faultedThisCycle = true;
         morePending = result.morePending;
       }
     } catch (err) {
@@ -386,11 +417,43 @@ export function startLinuxAuditDrainLoop(
       const fault = err instanceof Error ? err : new Error(String(err));
       if (options.onDrainFault) options.onDrainFault(fault);
       else options.onError?.(fault);
+      faultedThisCycle = true;
+    }
+    if (faultedThisCycle) {
+      if (consecutiveFaultCursor === cursor) {
+        consecutiveFaultsAtCursor += 1;
+      } else {
+        consecutiveFaultCursor = cursor;
+        consecutiveFaultsAtCursor = 1;
+      }
+      // DELIBERATELY NO ACK-AND-DROP HERE. Bounding the RATE of re-delivery
+      // (the no-progress guard above plus the capped backoff below) is what
+      // removes the unbounded-allocation path. ACKing a never-persisted event
+      // to "make progress" would advance the daemon cursor past evidence the
+      // consumer never accepted, which either loses that evidence silently or
+      // leaves the next event's prior_sha256_hex chaining from a head the
+      // consumer never anchored - manufacturing the very chain fork the shared
+      // -basis fix exists to remove. A durable, inspectable quarantine (persist
+      // the faulted event + its signature metadata BEFORE any ack, and carry a
+      // verified continuity anchor across it) is the only sound way to skip a
+      // stuck event; that is deliberately out of scope here and tracked as its
+      // own build. Until then a persistently faulting cursor retries slowly and
+      // loudly forever, which is bounded and honest.
+    } else {
+      consecutiveFaultCursor = cursor;
+      consecutiveFaultsAtCursor = 0;
     }
     if (!stopped) {
+      const delayMs = faultedThisCycle
+        ? faultBackoffDelayMs(
+            pollIntervalMs,
+            maxFaultBackoffMs,
+            consecutiveFaultsAtCursor
+          )
+        : pollIntervalMs;
       timer = setTimer(() => {
         inflight = cycle();
-      }, pollIntervalMs);
+      }, delayMs);
     }
   };
 
@@ -405,4 +468,20 @@ export function startLinuxAuditDrainLoop(
     },
     lastAckedSeq: () => lastAcked,
   };
+}
+
+function positiveIntegerOption(value: number | undefined, fallback: number): number {
+  if (value === undefined) return fallback;
+  if (!Number.isFinite(value) || value < 1) return fallback;
+  return Math.floor(value);
+}
+
+function faultBackoffDelayMs(
+  pollIntervalMs: number,
+  maxFaultBackoffMs: number,
+  consecutiveFaultsAtCursor: number
+): number {
+  const exponent = Math.max(0, consecutiveFaultsAtCursor - 1);
+  const delay = pollIntervalMs * 2 ** exponent;
+  return Math.min(delay, maxFaultBackoffMs);
 }

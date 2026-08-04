@@ -1730,3 +1730,104 @@ describe("C4 — round-5 HIGH: initial-drain probe never skips an unsettled even
     expect(requested).not.toContain(null);
   });
 });
+
+describe("PR-C — bounded retention for persistent Linux audit drain faults", () => {
+  type ScheduledDrainCycle = { cb: () => void; ms: number };
+
+  async function waitForScheduledCount(
+    scheduled: ScheduledDrainCycle[],
+    count: number,
+  ): Promise<void> {
+    for (let i = 0; i < 50 && scheduled.length < count; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    expect(scheduled.length).toBeGreaterThanOrEqual(count);
+  }
+
+  it("PR-C fail-before: an unsettled event with more_pending=true falls through to the poll delay instead of hot-spinning", async () => {
+    const requested: Array<number | null> = [];
+    const scheduled: ScheduledDrainCycle[] = [];
+    const faultingEvent = forgedDrainEvent(1, null);
+    const client = {
+      async drainRequest(afterSeq: number | null): Promise<AuditDrainResponse> {
+        requested.push(afterSeq);
+        return {
+          events: requested.length <= 4 ? [faultingEvent] : [],
+          next_after_seq: afterSeq,
+          more_pending: requested.length <= 4,
+          wal_overflow_count: 0,
+        } as AuditDrainResponse;
+      },
+      async sendDrainAck(): Promise<void> {},
+    } as unknown as IpcClient;
+    const consumer = {
+      async ingestCritical(): Promise<void> {
+        throw new Error("audit disk unavailable (persistent)");
+      },
+    } as unknown as AuditConsumer;
+    const faults: Error[] = [];
+
+    const loop = startLinuxAuditDrainLoop(client, consumer, {
+      pollIntervalMs: 1000,
+      setTimer: (cb, ms) => {
+        scheduled.push({ cb: cb as () => void, ms });
+        return scheduled.length;
+      },
+      clearTimer: () => {},
+      onDrainFault: (err) => faults.push(err),
+    });
+
+    await waitForScheduledCount(scheduled, 1);
+    await loop.stop();
+
+    expect(scheduled).toHaveLength(1);
+    expect(scheduled[0]?.ms).toBe(1000);
+    expect(requested).toEqual([null]);
+    expect(faults).toHaveLength(1);
+  });
+
+  it("backs off exponentially, capped, when the same cursor keeps faulting", async () => {
+    const requested: Array<number | null> = [];
+    const scheduled: ScheduledDrainCycle[] = [];
+    const faultingEvent = forgedDrainEvent(1, null);
+    const client = {
+      async drainRequest(afterSeq: number | null): Promise<AuditDrainResponse> {
+        requested.push(afterSeq);
+        return {
+          events: [faultingEvent],
+          next_after_seq: afterSeq,
+          more_pending: false,
+          wal_overflow_count: 0,
+        } as AuditDrainResponse;
+      },
+      async sendDrainAck(): Promise<void> {},
+    } as unknown as IpcClient;
+    const consumer = {
+      async ingestCritical(): Promise<void> {
+        throw new Error("audit disk unavailable (persistent)");
+      },
+    } as unknown as AuditConsumer;
+
+    const loop = startLinuxAuditDrainLoop(client, consumer, {
+      pollIntervalMs: 10,
+      maxFaultBackoffMs: 25,
+      setTimer: (cb, ms) => {
+        scheduled.push({ cb: cb as () => void, ms });
+        return scheduled.length;
+      },
+      clearTimer: () => {},
+      onDrainFault: () => {},
+    });
+
+    await waitForScheduledCount(scheduled, 1);
+    scheduled[0]!.cb();
+    await waitForScheduledCount(scheduled, 2);
+    scheduled[1]!.cb();
+    await waitForScheduledCount(scheduled, 3);
+    await loop.stop();
+
+    expect(requested).toEqual([null, null, null]);
+    expect(scheduled.map((entry) => entry.ms)).toEqual([10, 20, 25]);
+  });
+
+});
