@@ -9,6 +9,7 @@
  * rejected and never persisted as evidence.
  */
 
+import { createHash } from "node:crypto";
 import { describe, it, expect, beforeEach } from "vitest";
 import { ed25519 } from "@noble/curves/ed25519";
 
@@ -43,7 +44,9 @@ class RecordingSink implements AuditSink {
     operation: string;
     details?: Record<string, unknown>;
     result: "success" | "failure";
+    flushCountBeforeAppend: number;
   }> = [];
+  flushedCount = 0;
   append(
     _layer: "l1",
     operation: string,
@@ -51,9 +54,16 @@ class RecordingSink implements AuditSink {
     details?: Record<string, unknown>,
     result: "success" | "failure" = "success"
   ): void {
-    this.entries.push({ operation, details, result });
+    this.entries.push({
+      operation,
+      details,
+      result,
+      flushCountBeforeAppend: this.flushedCount,
+    });
   }
-  async flush(): Promise<void> {}
+  async flush(): Promise<void> {
+    this.flushedCount += 1;
+  }
 }
 
 function toBase64url(bytes: Uint8Array): string {
@@ -69,6 +79,8 @@ const daemonPubB64 = toBase64url(ed25519.getPublicKey(daemonPriv));
 // timestamp just inside the window.
 const NOW = 1_750_000_000_000;
 const SIGNED_TS = NOW - 1000;
+const REANCHOR_THRESHOLD = 3;
+const REANCHOR_FRESHNESS_WINDOW_MS = 10 * 60 * 1000;
 
 const FORTRESS_ID = "f";
 const SIGNED_AGENT_UID = 503;
@@ -109,6 +121,18 @@ function blockedEvent(seq: number, priorHash: string | null): CastleWallAuditEve
   });
 }
 
+function signedBodyHash(eventCanonicalJson: string): string {
+  return createHash("sha256").update(eventCanonicalJson, "utf8").digest("hex");
+}
+
+function currentChainHash(consumer: AuditConsumer): string | null {
+  const state = consumer.getWalChainState() as {
+    lastEventChainHash?: string | null;
+    lastEventCanonicalHash?: string | null;
+  };
+  return state.lastEventChainHash ?? state.lastEventCanonicalHash ?? null;
+}
+
 /**
  * Produce the daemon's WAL `AuditEntry`-shaped canonical JSON for an event —
  * the same shape `build_audit_event_canonical_json` emits in Rust. This is the
@@ -126,6 +150,8 @@ function walBodyFor(event: CastleWallAuditEvent): string {
     details.dest_port = event.destination.port;
     details.dest_protocol = event.destination.protocol;
   }
+  details.seq = event.details.seq;
+  details.prior_sha256_hex = event.details.prior_sha256_hex;
   const operation =
     event.event_type === "egress_blocked"
       ? "egress_blocked"
@@ -168,6 +194,7 @@ function signedEnvelope(
     overrideTs?: number;
     bodyOverride?: string;
     omitSubjectBinding?: boolean;
+    ack?: () => Promise<void>;
   }
 ): CriticalEventEnvelope {
   const canonical = opts?.bodyOverride ?? walBodyFor(event);
@@ -176,7 +203,7 @@ function signedEnvelope(
   const sig = ed25519.sign(producerSigningBytes(canonical, ts, seq), signer);
   return {
     event,
-    ack: async () => {},
+    ack: opts?.ack ?? (async () => {}),
     producer: {
       eventCanonicalJson: canonical,
       capturedAtUnixMs: ts,
@@ -193,6 +220,10 @@ function signedEnvelope(
           },
         }),
   };
+}
+
+function forkEvent(seq: number, priorHash = "f".repeat(64)): CastleWallAuditEvent {
+  return blockedEvent(seq, priorHash);
 }
 
 describe("audit-consumer producer-authenticity (pinned key configured)", () => {
@@ -508,6 +539,275 @@ describe("audit-consumer producer-authenticity (pinned key configured)", () => {
     expect(fresh.getStats().producerSignatureRejections).toBe(1);
   });
 
+  it("anchors producer-signed events to the signed WAL body hash, not the reconstructed event hash", async () => {
+    const event0 = blockedEvent(0, null);
+    const env0 = signedEnvelope(event0, daemonPriv);
+    const producerHash0 = signedBodyHash(env0.producer!.eventCanonicalJson);
+    await consumer.ingestCritical(env0);
+
+    expect(currentChainHash(consumer)).toBe(producerHash0);
+    expect(currentChainHash(consumer)).not.toBe(
+      createHash("sha256").update(canonicalize(event0), "utf8").digest("hex"),
+    );
+
+    const event1 = blockedEvent(1, producerHash0);
+    await expect(
+      consumer.ingestCritical(signedEnvelope(event1, daemonPriv)),
+    ).resolves.toBeUndefined();
+    expect(consumer.getWalChainState().lastAckedSeq).toBe(1);
+  });
+
+  it("re-anchors a persistent fresh-signed fork to the signed-body hash, emits+flushes first, and resumes", async () => {
+    const acceptedHead = blockedEvent(0, null);
+    const acceptedEnv = signedEnvelope(acceptedHead, daemonPriv);
+    await consumer.ingestCritical(acceptedEnv);
+
+    const firstFork = forkEvent(1);
+    await expect(
+      consumer.ingestCritical(signedEnvelope(firstFork, daemonPriv)),
+    ).rejects.toThrow(/wal_chain_verification_failed/);
+    const secondFork = forkEvent(2);
+    await expect(
+      consumer.ingestCritical(signedEnvelope(secondFork, daemonPriv)),
+    ).rejects.toThrow(/wal_chain_verification_failed/);
+
+    const reanchored = forkEvent(3);
+    const reanchorEnv = signedEnvelope(reanchored, daemonPriv);
+    const reanchorTarget = signedBodyHash(reanchorEnv.producer!.eventCanonicalJson);
+    let acked = false;
+    await expect(
+      consumer.ingestCritical(
+        signedEnvelope(reanchored, daemonPriv, {
+          ack: async () => {
+            acked = true;
+          },
+        }),
+      ),
+    ).resolves.toBeUndefined();
+
+    expect(acked).toBe(true);
+    const reanchorIndex = sink.entries.findIndex(
+      (entry) => entry.operation === "chain_reanchored",
+    );
+    expect(reanchorIndex).toBeGreaterThanOrEqual(0);
+    const acceptedIndex = sink.entries.findIndex(
+      (entry, index) =>
+        index > reanchorIndex &&
+        entry.operation === "egress_blocked" &&
+        entry.details?.seq === 3,
+    );
+    expect(acceptedIndex).toBeGreaterThan(reanchorIndex);
+    expect(sink.entries[acceptedIndex]!.flushCountBeforeAppend).toBeGreaterThan(
+      sink.entries[reanchorIndex]!.flushCountBeforeAppend,
+    );
+    expect(sink.entries[reanchorIndex]!.details).toMatchObject({
+      previous_anchor_sha256_hex: signedBodyHash(
+        acceptedEnv.producer!.eventCanonicalJson,
+      ),
+      previous_acked_seq: 0,
+      new_anchor_seq: 3,
+      new_anchor_sha256_hex: reanchorTarget,
+      consecutive_fork_count: REANCHOR_THRESHOLD,
+      producer_key_id: CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1,
+      reason: "fork",
+    });
+    expect(currentChainHash(consumer)).toBe(reanchorTarget);
+
+    const next = blockedEvent(4, reanchorTarget);
+    await expect(
+      consumer.ingestCritical(signedEnvelope(next, daemonPriv)),
+    ).resolves.toBeUndefined();
+    expect(consumer.getWalChainState().lastAckedSeq).toBe(4);
+  });
+
+  it("same-seq fresh-signed re-delivery reaches the recovery threshold", async () => {
+    const acceptedHead = blockedEvent(0, null);
+    await consumer.ingestCritical(signedEnvelope(acceptedHead, daemonPriv));
+
+    const repeatedFork = forkEvent(1);
+    const repeatedEnv = signedEnvelope(repeatedFork, daemonPriv);
+    for (let i = 0; i < REANCHOR_THRESHOLD - 1; i += 1) {
+      await expect(
+        consumer.ingestCritical(signedEnvelope(repeatedFork, daemonPriv)),
+      ).rejects.toThrow(/wal_chain_verification_failed/);
+    }
+
+    await expect(consumer.ingestCritical(repeatedEnv)).resolves.toBeUndefined();
+    const reanchor = sink.entries.find(
+      (entry) => entry.operation === "chain_reanchored",
+    );
+    expect(reanchor?.details?.new_anchor_seq).toBe(1);
+    expect(reanchor?.details?.new_anchor_sha256_hex).toBe(
+      signedBodyHash(repeatedEnv.producer!.eventCanonicalJson),
+    );
+  });
+
+  it("stale and future-dated signed fork replays never re-anchor", async () => {
+    const acceptedHead = blockedEvent(0, null);
+    await consumer.ingestCritical(signedEnvelope(acceptedHead, daemonPriv));
+    const fork = forkEvent(1);
+
+    for (let i = 0; i < REANCHOR_THRESHOLD + 1; i += 1) {
+      await expect(
+        consumer.ingestCritical(
+          signedEnvelope(fork, daemonPriv, {
+            overrideTs: NOW - REANCHOR_FRESHNESS_WINDOW_MS - 1,
+          }),
+        ),
+      ).rejects.toThrow(/producer_signature_stale/);
+    }
+    for (let i = 0; i < REANCHOR_THRESHOLD + 1; i += 1) {
+      await expect(
+        consumer.ingestCritical(
+          signedEnvelope(fork, daemonPriv, {
+            overrideTs: NOW + 60_001,
+          }),
+        ),
+      ).rejects.toThrow(/producer_signature_future_dated/);
+    }
+    expect(
+      sink.entries.some((entry) => entry.operation === "chain_reanchored"),
+    ).toBe(false);
+    expect(consumer.getWalChainState().lastAckedSeq).toBe(0);
+  });
+
+  it("unsigned and signature-rejected forks never re-anchor", async () => {
+    const acceptedHead = blockedEvent(0, null);
+    await consumer.ingestCritical(signedEnvelope(acceptedHead, daemonPriv));
+    const fork = forkEvent(1);
+
+    for (let i = 0; i < REANCHOR_THRESHOLD; i += 1) {
+      await expect(
+        consumer.ingestCritical({
+          event: fork,
+          ack: async () => {},
+        }),
+      ).rejects.toThrow(/producer_signature_absent/);
+    }
+    const wrongSigner = ed25519.utils.randomPrivateKey();
+    for (let i = 0; i < REANCHOR_THRESHOLD; i += 1) {
+      await expect(
+        consumer.ingestCritical(signedEnvelope(fork, wrongSigner)),
+      ).rejects.toThrow(/producer_signature_verification_failed/);
+    }
+
+    expect(
+      sink.entries.some((entry) => entry.operation === "chain_reanchored"),
+    ).toBe(false);
+    expect(consumer.getWalChainState().lastAckedSeq).toBe(0);
+  });
+
+  it("subject-binding failure is re-checked on the threshold path before emitting chain_reanchored", async () => {
+    const acceptedHead = blockedEvent(0, null);
+    await consumer.ingestCritical(signedEnvelope(acceptedHead, daemonPriv));
+
+    await expect(
+      consumer.ingestCritical(signedEnvelope(forkEvent(1), daemonPriv)),
+    ).rejects.toThrow(/wal_chain_verification_failed/);
+    await expect(
+      consumer.ingestCritical(signedEnvelope(forkEvent(2), daemonPriv)),
+    ).rejects.toThrow(/wal_chain_verification_failed/);
+    await expect(
+      consumer.ingestCritical(
+        signedEnvelope(forkEvent(3), daemonPriv, {
+          omitSubjectBinding: true,
+        }),
+      ),
+    ).rejects.toThrow(/producer_signed_without_subject_binding/);
+
+    expect(
+      sink.entries.some((entry) => entry.operation === "chain_reanchored"),
+    ).toBe(false);
+    const rejection = sink.entries.find(
+      (entry) => entry.operation === "producer_signature_rejected",
+    );
+    expect(rejection?.details?.reason).toBe(
+      "producer_signed_without_subject_binding",
+    );
+    expect(consumer.getWalChainState().lastAckedSeq).toBe(0);
+  });
+
+  it("a single transient fork stays below threshold and a successful persist+ack resets the counter", async () => {
+    const acceptedHead = blockedEvent(0, null);
+    const acceptedEnv = signedEnvelope(acceptedHead, daemonPriv);
+    await consumer.ingestCritical(acceptedEnv);
+
+    await expect(
+      consumer.ingestCritical(signedEnvelope(forkEvent(1), daemonPriv)),
+    ).rejects.toThrow(/wal_chain_verification_failed/);
+
+    const producerHash0 = signedBodyHash(acceptedEnv.producer!.eventCanonicalJson);
+    await consumer.ingestCritical(
+      signedEnvelope(blockedEvent(1, producerHash0), daemonPriv),
+    );
+    expect(consumer.getWalChainState().lastAckedSeq).toBe(1);
+
+    await expect(
+      consumer.ingestCritical(signedEnvelope(forkEvent(2), daemonPriv)),
+    ).rejects.toThrow(/wal_chain_verification_failed/);
+    await expect(
+      consumer.ingestCritical(signedEnvelope(forkEvent(3), daemonPriv)),
+    ).rejects.toThrow(/wal_chain_verification_failed/);
+    expect(
+      sink.entries.some((entry) => entry.operation === "chain_reanchored"),
+    ).toBe(false);
+  });
+
+  it("backward seq remains seq_regression and never routes through re-anchor", async () => {
+    const head = blockedEvent(5, null);
+    await consumer.ingestCritical(signedEnvelope(head, daemonPriv));
+
+    const backward = blockedEvent(4, signedBodyHash(walBodyFor(head)));
+    for (let i = 0; i < REANCHOR_THRESHOLD + 1; i += 1) {
+      await expect(
+        consumer.ingestCritical(signedEnvelope(backward, daemonPriv)),
+      ).rejects.toThrow(/seq_regression/);
+    }
+    expect(
+      sink.entries.some((entry) => entry.operation === "chain_reanchored"),
+    ).toBe(false);
+    expect(sink.entries.at(-1)?.details?.reason).toBe("seq_regression");
+  });
+
+  it("marks a re-anchor from a legacy event-canonical head as basis_migration", async () => {
+    const legacySink = new RecordingSink();
+    const legacyConsumer = new AuditConsumer(legacySink, undefined, {
+      pinnedProducerKeyB64url: daemonPubB64,
+      now: () => NOW,
+    });
+    const legacyHead = buildAuditEvent({
+      timestamp: "2026-06-13T00:00:00Z",
+      fortress_id: FORTRESS_ID,
+      event_type: "policy_loaded",
+      details: { seq: 0, prior_sha256_hex: null },
+    });
+    await legacyConsumer.ingestCritical({
+      event: legacyHead,
+      ack: async () => {},
+    });
+    expect(currentChainHash(legacyConsumer)).toBe(
+      createHash("sha256").update(canonicalize(legacyHead), "utf8").digest("hex"),
+    );
+
+    for (let seq = 1; seq <= REANCHOR_THRESHOLD; seq += 1) {
+      const event = forkEvent(seq);
+      if (seq < REANCHOR_THRESHOLD) {
+        await expect(
+          legacyConsumer.ingestCritical(signedEnvelope(event, daemonPriv)),
+        ).rejects.toThrow(/wal_chain_verification_failed/);
+      } else {
+        await expect(
+          legacyConsumer.ingestCritical(signedEnvelope(event, daemonPriv)),
+        ).resolves.toBeUndefined();
+      }
+    }
+
+    const reanchor = legacySink.entries.find(
+      (entry) => entry.operation === "chain_reanchored",
+    );
+    expect(reanchor?.details?.reason).toBe("basis_migration");
+  });
+
   it("does NOT gate non-enforcement control events on a signature", async () => {
     // A policy_loaded control event with no producer signature is still
     // accepted (it is not enforcement evidence) and stamped channel-unsigned.
@@ -527,6 +827,27 @@ describe("audit-consumer producer-authenticity (pinned key configured)", () => {
 });
 
 describe("audit-consumer producer-authenticity (NO pinned key — legacy basis)", () => {
+  it("keeps fork re-anchor disabled entirely without a pinned producer key", async () => {
+    const sink = new RecordingSink();
+    const consumer = new AuditConsumer(sink);
+    const acceptedHead = blockedEvent(0, null);
+    await consumer.ingestCritical({ event: acceptedHead, ack: async () => {} });
+
+    for (let i = 0; i < REANCHOR_THRESHOLD + 1; i += 1) {
+      await expect(
+        consumer.ingestCritical({
+          event: forkEvent(1),
+          ack: async () => {},
+        }),
+      ).rejects.toThrow(/wal_chain_verification_failed/);
+    }
+
+    expect(
+      sink.entries.some((entry) => entry.operation === "chain_reanchored"),
+    ).toBe(false);
+    expect(consumer.getWalChainState().lastAckedSeq).toBe(0);
+  });
+
   it("accepts unsigned enforcement events and stamps channel-unsigned basis", async () => {
     const sink = new RecordingSink();
     const consumer = new AuditConsumer(sink); // no pinned key

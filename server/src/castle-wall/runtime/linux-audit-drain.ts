@@ -158,12 +158,12 @@ export function buildCriticalEnvelopeFromDrainEvent(
       ? (body.details as Record<string, unknown>)
       : {};
 
-  // The chain metadata (`seq`, `prior_sha256_hex`) lives on the WIRE entry, not
-  // inside the signed body - the consumer's WAL-chain validator reads it from
-  // `event.details`, so we graft it on. The signed body remains the
-  // authoritative source for evidence fields (the consumer re-parses
-  // `producer.eventCanonicalJson` and uses THAT, not these details, for signed
-  // evidence - so there is no staple/strip attack surface here).
+  // The wire entry repeats the signed chain metadata (`seq`,
+  // `prior_sha256_hex`) the consumer reads from `event.details`, so we graft it
+  // onto the reconstructed event. The consumer then cross-checks those copies
+  // against the verified signed body before accepting the entry. Evidence
+  // fields still come from `producer.eventCanonicalJson`, never from this
+  // consumer-shaped event.
   const details: Record<string, unknown> = {
     ...bodyDetails,
     seq: drained.seq,
@@ -300,7 +300,7 @@ export async function drainOnce(
     } else {
       // NOT SETTLED. A TRANSIENT persistence/transport failure threw before ack
       // (cursor stayed put). Continuing would feed seq N+1 to the consumer,
-      // which - with `lastEventCanonicalHash` still null because seq N never
+      // which - with `lastEventChainHash` still null because seq N never
       // persisted - would accept N+1 as a fresh bootstrap and ack
       // `audit_drain_ack(N+1)`, truncating the daemon WAL THROUGH the lost seq N
       // (silent audit data loss). This is an UNSETTLED FAULT → `onDrainFault`

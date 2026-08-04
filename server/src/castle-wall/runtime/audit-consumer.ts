@@ -60,6 +60,23 @@ export const ENFORCEMENT_EVIDENCE_EVENT_TYPES: ReadonlySet<CastleWallEventType> 
     ])
   );
 
+/**
+ * Fresh signed fork deliveries required before the consumer repairs a damaged
+ * local anchor. Same-seq re-delivery counts: Linux re-drains the same unacked
+ * WAL entry until it settles, so a distinct/advancing requirement is
+ * unreachable there.
+ */
+export const CASTLE_WALL_WAL_FORK_REANCHOR_THRESHOLD = 3;
+
+/**
+ * Signed `captured_at_unix_ms` freshness bound for producer frames. The
+ * producer and consumer run on the same host, so a tight 10-minute skew/replay
+ * window is sufficient for recovery while preventing old signed frames from
+ * being replayed into a new anchor.
+ */
+export const CASTLE_WALL_WAL_FORK_REANCHOR_FRESHNESS_WINDOW_MS =
+  10 * 60 * 1000;
+
 /** Shape the consumer pushes into; `AuditLog.append` matches structurally. */
 export interface AuditSink {
   /**
@@ -224,7 +241,10 @@ export class AuditConsumer {
     producerSignatureAccepted: 0,
   };
   private lastAckedSeq: number | null = null;
-  private lastEventCanonicalHash: string | null = null;
+  private lastEventChainHash: string | null = null;
+  private lastEventChainBasis: "producer_signed_body" | "event_canonical" | null =
+    null;
+  private consecutiveFreshSignedWalForkFailures = 0;
   /**
    * FIX 2 (codex CRITICAL - defense in depth against acking past an unpersisted
    * event). Set to the seq of an event that VALIDATED + chained cleanly but then
@@ -257,7 +277,8 @@ export class AuditConsumer {
    * resets to null) would otherwise re-arm the wall. The freshness window
    * closes that out-of-process replay. 0/undefined disables the check. Also
    * rejects events dated unreasonably far in the future (clock-skew / forged
-   * timestamp). (codex L1 HIGH #3.)
+   * timestamp). The default is the same 10-minute same-host bound used for fork
+   * recovery.
    */
   private readonly producerSigMaxAgeMs: number;
   private readonly producerSigMaxSkewMs: number;
@@ -268,7 +289,7 @@ export class AuditConsumer {
     private readonly inboxBridge?: UnifiedInboxBridge,
     options?: {
       pinnedProducerKeyB64url?: string | null;
-      /** Reject signed enforcement events older than this many ms. Default 5 min. */
+      /** Reject signed producer events older than this many ms. Default 10 min. */
       producerSigMaxAgeMs?: number;
       /** Reject signed enforcement events dated more than this far ahead. Default 1 min. */
       producerSigMaxSkewMs?: number;
@@ -277,7 +298,9 @@ export class AuditConsumer {
     },
   ) {
     this.pinnedProducerKeyB64url = options?.pinnedProducerKeyB64url ?? null;
-    this.producerSigMaxAgeMs = options?.producerSigMaxAgeMs ?? 5 * 60 * 1000;
+    this.producerSigMaxAgeMs =
+      options?.producerSigMaxAgeMs ??
+      CASTLE_WALL_WAL_FORK_REANCHOR_FRESHNESS_WINDOW_MS;
     this.producerSigMaxSkewMs = options?.producerSigMaxSkewMs ?? 60 * 1000;
     this.now = options?.now ?? Date.now;
   }
@@ -334,7 +357,7 @@ export class AuditConsumer {
     // other malformed event above, and it must NEVER be accepted/chained.
     // Computing the hash HERE, before the WAL-chain check or the persist call
     // even look at the event, means neither the chain's duplicate-hash
-    // comparison nor the post-persist `lastEventCanonicalHash` update below can
+    // comparison nor the post-persist `lastEventChainHash` update below can
     // ever throw: both reuse this already-proven-canonicalizable hash instead
     // of re-deriving it from an event that might not be. A forger that stapled
     // a bogus integer onto an otherwise-valid event must settle the same way a
@@ -369,7 +392,20 @@ export class AuditConsumer {
       await this.tryAck(envelope, "audit_event_rejected");
       return;
     }
-    const chainOutcome = this.validateWalChain(envelope.event, canonicalHash);
+    // Producer verification runs BEFORE the chain decision so fork recovery is
+    // signature-gated and freshness-gated. For verified producer frames the
+    // chain basis is the exact signed WAL body bytes, never a locally
+    // reconstructed CastleWallAuditEvent.
+    const sigOutcome = this.evaluateProducerSignature(envelope);
+    if (sigOutcome.kind === "rejected") {
+      await this.emitProducerSignatureRejected(envelope, sigOutcome.reason);
+      throw new AuditChainError(sigOutcome.reason);
+    }
+    if (sigOutcome.kind === "verified") {
+      this.stats.producerSignatureAccepted += 1;
+    }
+    const chainBasis = chainBasisFor(canonicalHash, sigOutcome);
+    const chainOutcome = this.validateWalChain(envelope.event, chainBasis.hash);
     if (chainOutcome.kind === "duplicate_replay") {
       // Daemon retried a critical event whose persistence completed but whose
       // ACK never landed. Drop the payload silently (no double-append) and
@@ -391,60 +427,41 @@ export class AuditConsumer {
       return;
     }
     if (chainOutcome.kind === "error") {
+      if (
+        await this.maybeReanchorAfterFreshSignedFork(
+          envelope,
+          chainOutcome.reason,
+          chainBasis.hash,
+          chainBasis.kind,
+          sigOutcome,
+        )
+      ) {
+        return;
+      }
       await this.emitVerificationFailure(chainOutcome.reason, envelope.event);
       throw new AuditChainError(chainOutcome.reason);
     }
 
-    // Slice L1 producer-authenticity gate. When a pinned producer key is
-    // configured and this event is enforcement evidence, the daemon's per-event
-    // signature MUST verify against the pinned key before we accept the event
-    // as evidence. This is the load-bearing fail-closed property: an in-process
-    // forger can mint the `cw_source` marker but cannot mint a valid signature
-    // over `seq ‖ timestamp ‖ canonical-bytes` against the daemon's key, and a
-    // replayed past signature is bound to a different seq so it does not verify.
-    const sigOutcome = this.evaluateProducerSignature(envelope);
-    if (sigOutcome.kind === "rejected") {
-      this.stats.producerSignatureRejections += 1;
-      await this.sink.append(
-        CASTLE_WALL_AUDIT_LAYER,
-        "producer_signature_rejected",
-        envelope.event.fortress_id ?? "unknown",
-        {
-          reason: sigOutcome.reason,
-          event_type: envelope.event.event_type,
-          seq: envelope.event.details.seq,
-        },
-        "failure"
-      );
-      await this.sink.flush();
-      // Fail closed: do NOT persist as enforcement evidence, do NOT advance the
-      // chain. We DO ACK so the daemon stops re-delivering a packet we have
-      // permanently refused; the refusal is durably recorded above for audit.
-      await this.tryAck(envelope, "producer_signature_rejected");
-      throw new AuditChainError(sigOutcome.reason);
-    }
-    if (sigOutcome.kind === "verified") {
-      this.stats.producerSignatureAccepted += 1;
-    }
+    const accepted = await this.persistAcceptedCriticalEvent(
+      envelope,
+      chainBasis.hash,
+      chainBasis.kind,
+      sigOutcome,
+    );
+    if (accepted) this.resetWalForkCounter();
+  }
+
+  private async persistAcceptedCriticalEvent(
+    envelope: CriticalEventEnvelope,
+    chainHash: string,
+    chainBasis: "producer_signed_body" | "event_canonical",
+    sigOutcome: SignatureOutcome,
+  ): Promise<boolean> {
     const identityOutcome = persistedIdentityForEvent(envelope, sigOutcome);
     if (identityOutcome.kind === "rejected") {
-      this.stats.producerSignatureRejections += 1;
-      await this.sink.append(
-        CASTLE_WALL_AUDIT_LAYER,
-        "producer_signature_rejected",
-        envelope.event.fortress_id ?? "unknown",
-        {
-          reason: identityOutcome.reason,
-          event_type: envelope.event.event_type,
-          seq: envelope.event.details.seq,
-        },
-        "failure"
-      );
-      await this.sink.flush();
-      await this.tryAck(envelope, "producer_signature_rejected");
+      await this.emitProducerSignatureRejected(envelope, identityOutcome.reason);
       throw new AuditChainError(identityOutcome.reason);
     }
-
     try {
       await this.sink.append(
         CASTLE_WALL_AUDIT_LAYER,
@@ -483,14 +500,12 @@ export class AuditConsumer {
     // a transport-layer ACK failure must NOT leave the consumer's chain view
     // out of sync with what is actually on disk.
     this.lastAckedSeq = Number(envelope.event.details.seq);
-    // Reuse the hash computed up front in `ingestCritical` (already proven
-    // canonicalizable there); do NOT re-derive it here, which would
-    // reintroduce a throw site after the event is already durably persisted.
-    this.lastEventCanonicalHash = canonicalHash;
+    this.lastEventChainHash = chainHash;
+    this.lastEventChainBasis = chainBasis;
     // The owed seq (if any) is now durable - clear the FIX 2 guard.
     this.pendingUnpersistedSeq = null;
     this.stats.acceptedCriticalEvents += 1;
-    await this.tryAck(envelope, envelope.event.event_type);
+    return await this.tryAck(envelope, envelope.event.event_type);
   }
 
   /**
@@ -502,9 +517,10 @@ export class AuditConsumer {
   private async tryAck(
     envelope: CriticalEventEnvelope,
     operationContext: string
-  ): Promise<void> {
+  ): Promise<boolean> {
     try {
       await envelope.ack();
+      return true;
     } catch (err) {
       this.stats.ackFailures += 1;
       await this.sink.append(
@@ -520,6 +536,7 @@ export class AuditConsumer {
         "failure"
       );
       await this.sink.flush();
+      return false;
     }
   }
 
@@ -543,21 +560,25 @@ export class AuditConsumer {
     return { ...this.stats };
   }
 
-  getWalChainState(): { lastAckedSeq: number | null; lastEventCanonicalHash: string | null } {
+  getWalChainState(): {
+    lastAckedSeq: number | null;
+    lastEventChainHash: string | null;
+  } {
     return {
       lastAckedSeq: this.lastAckedSeq,
-      lastEventCanonicalHash: this.lastEventCanonicalHash,
+      lastEventChainHash: this.lastEventChainHash,
     };
   }
 
   /**
    * Classify an inbound critical event against the WAL chain.
    *
-   * `canonicalHash` is the hash the caller already computed up front in
+   * `chainHash` is the hash the caller already selected up front in
    * `ingestCritical` (before this method runs) - reusing it here means this
    * method never itself calls `canonicalize()`/`computeCanonicalHash()` and
-   * so can never throw on an unrepresentable event; the caller's up-front
-   * check already routed that case to a settled rejection before we get here.
+   * so can never throw on an unrepresentable event. Producer-signed entries use
+   * sha256(envelope.producer.eventCanonicalJson); legacy unsigned entries use
+   * the raw event canonical hash only as their channel-authenticated fallback.
    *
    * Returns:
    *   - `{ kind: "ok" }` for fresh, well-chained events.
@@ -569,7 +590,7 @@ export class AuditConsumer {
    */
   private validateWalChain(
     event: CastleWallAuditEvent,
-    canonicalHash: string
+    chainHash: string
   ):
     | { kind: "ok" }
     | { kind: "duplicate_replay" }
@@ -610,19 +631,19 @@ export class AuditConsumer {
       // daemon WAL produces the latter.
       if (
         seq === this.lastAckedSeq &&
-        this.lastEventCanonicalHash !== null &&
-        canonicalHash === this.lastEventCanonicalHash
+        this.lastEventChainHash !== null &&
+        chainHash === this.lastEventChainHash
       ) {
         return { kind: "duplicate_replay" };
       }
       return { kind: "error", reason: "seq_regression" };
     }
-    if (this.lastEventCanonicalHash !== null && priorHash !== this.lastEventCanonicalHash) {
+    if (this.lastEventChainHash !== null && priorHash !== this.lastEventChainHash) {
       return { kind: "error", reason: "wal_chain_verification_failed" };
     }
     // FIX 2 (codex CRITICAL - never bootstrap-accept past an UNPERSISTED event).
     //
-    // We are in the BOOTSTRAP state here (`lastEventCanonicalHash === null`): no
+    // We are in the BOOTSTRAP state here (`lastEventChainHash === null`): no
     // verified on-disk chain anchor exists, so `priorHash` cannot be checked. A
     // genuine first event (genesis, or a from-null re-pull) is legitimately
     // accepted here. The dangerous case: a PRIOR event validated + chained but
@@ -663,11 +684,16 @@ export class AuditConsumer {
     const isEnforcementEvidence = ENFORCEMENT_EVIDENCE_EVENT_TYPES.has(
       envelope.event.event_type
     );
-    // No pinned key, or a non-evidence event: accept on the channel basis.
-    if (this.pinnedProducerKeyB64url === null || !isEnforcementEvidence) {
+    // No pinned key: accept on the documented channel-authenticated basis.
+    // Recovery is disabled on this path because no signature can bind a new
+    // anchor.
+    if (this.pinnedProducerKeyB64url === null) {
       return { kind: "unsigned" };
     }
     if (!envelope.producer) {
+      if (!isEnforcementEvidence) {
+        return { kind: "unsigned" };
+      }
       return { kind: "rejected", reason: "producer_signature_absent" };
     }
     // Parse the signed WAL body. The signature (verified below) is over THIS
@@ -686,7 +712,13 @@ export class AuditConsumer {
       return { kind: "rejected", reason: parsed.reason };
     }
     const mappedEventType = WAL_OPERATION_TO_EVENT_TYPE[parsed.operation];
-    if (mappedEventType === undefined || mappedEventType !== envelope.event.event_type) {
+    if (mappedEventType !== undefined && mappedEventType !== envelope.event.event_type) {
+      return {
+        kind: "rejected",
+        reason: "producer_signed_body_operation_event_type_mismatch",
+      };
+    }
+    if (isEnforcementEvidence && mappedEventType === undefined) {
       return {
         kind: "rejected",
         reason: "producer_signed_body_operation_event_type_mismatch",
@@ -764,6 +796,101 @@ export class AuditConsumer {
       eventCanonicalJson: envelope.producer.eventCanonicalJson,
       capturedAtUnixMs: envelope.producer.capturedAtUnixMs,
     };
+  }
+
+  private resetWalForkCounter(): void {
+    this.consecutiveFreshSignedWalForkFailures = 0;
+  }
+
+  private async maybeReanchorAfterFreshSignedFork(
+    envelope: CriticalEventEnvelope,
+    reason: string,
+    newAnchorHash: string,
+    newAnchorBasis: "producer_signed_body" | "event_canonical",
+    sigOutcome: SignatureOutcome,
+  ): Promise<boolean> {
+    if (reason !== "wal_chain_verification_failed") {
+      this.resetWalForkCounter();
+      return false;
+    }
+    if (sigOutcome.kind !== "verified") {
+      this.resetWalForkCounter();
+      return false;
+    }
+
+    this.consecutiveFreshSignedWalForkFailures += 1;
+    if (
+      this.consecutiveFreshSignedWalForkFailures <
+      CASTLE_WALL_WAL_FORK_REANCHOR_THRESHOLD
+    ) {
+      return false;
+    }
+
+    const identityOutcome = persistedIdentityForEvent(envelope, sigOutcome);
+    if (identityOutcome.kind === "rejected") {
+      await this.emitProducerSignatureRejected(envelope, identityOutcome.reason);
+      throw new AuditChainError(identityOutcome.reason);
+    }
+
+    await this.emitChainReanchored(envelope.event, newAnchorHash, sigOutcome);
+    const accepted = await this.persistAcceptedCriticalEvent(
+      envelope,
+      newAnchorHash,
+      newAnchorBasis,
+      sigOutcome,
+    );
+    if (accepted) this.resetWalForkCounter();
+    return true;
+  }
+
+  private async emitChainReanchored(
+    event: CastleWallAuditEvent,
+    newAnchorHash: string,
+    signature: Extract<SignatureOutcome, { kind: "verified" }>,
+  ): Promise<void> {
+    await this.sink.append(
+      CASTLE_WALL_AUDIT_LAYER,
+      "chain_reanchored",
+      event.fortress_id ?? "unknown",
+      {
+        previous_anchor_sha256_hex: this.lastEventChainHash,
+        previous_acked_seq: this.lastAckedSeq,
+        new_anchor_seq: event.details[CASTLE_WALL_WAL_SEQUENCE_DETAIL_KEY],
+        new_anchor_sha256_hex: newAnchorHash,
+        consecutive_fork_count: this.consecutiveFreshSignedWalForkFailures,
+        producer_key_id: signature.keyId,
+        reason:
+          this.lastEventChainBasis === "event_canonical"
+            ? "basis_migration"
+            : "fork",
+      },
+      "success",
+    );
+    await this.sink.flush();
+  }
+
+  private async emitProducerSignatureRejected(
+    envelope: CriticalEventEnvelope,
+    reason: string,
+  ): Promise<void> {
+    this.resetWalForkCounter();
+    this.stats.producerSignatureRejections += 1;
+    await this.sink.append(
+      CASTLE_WALL_AUDIT_LAYER,
+      "producer_signature_rejected",
+      envelope.event.fortress_id ?? "unknown",
+      {
+        reason,
+        event_type: envelope.event.event_type,
+        seq: envelope.event.details.seq,
+      },
+      "failure",
+    );
+    await this.sink.flush();
+    // Fail closed: do not persist as enforcement evidence and do not advance
+    // the chain. ACK permanently refused packets so the producer stops
+    // re-delivering an event we have durably refused.
+    await this.tryAck(envelope, "producer_signature_rejected");
   }
 
   private async emitVerificationFailure(
@@ -893,10 +1020,10 @@ function buildDetailsForEvent(
   // not the attacker-controllable `CastleWallAuditEvent`. We persist the signed
   // body's own `details` (agent_id, dest_*, decision_provenance, rule_id_matched,
   // ...) plus the verified signature. The event's chain bookkeeping fields (seq,
-  // prior_sha256_hex) are preserved from `event.details` because the WAL chain
-  // validation upstream already authenticated them and they are not part of the
-  // signed body. This structurally defeats stapling/stripping/fabrication: no
-  // evidence field is sourced from the untrusted event. (codex L1 R2–R5.)
+  // prior_sha256_hex) are preserved from `event.details` only after the
+  // signature gate has cross-checked those copies against the signed body. This
+  // structurally defeats stapling/stripping/fabrication: no evidence field is
+  // sourced from the untrusted event. (codex L1 R2–R5.)
   if (signature.kind === "verified") {
     const signedDetails =
       signature.signedBody.details !== null &&
@@ -1052,6 +1179,28 @@ function persistedIdentityForEvent(
 
 function computeCanonicalHash(event: CastleWallAuditEvent): string {
   return createHash("sha256").update(canonicalize(event), "utf8").digest("hex");
+}
+
+function computeSignedBodyHash(eventCanonicalJson: string): string {
+  return createHash("sha256")
+    .update(eventCanonicalJson, "utf8")
+    .digest("hex");
+}
+
+function chainBasisFor(
+  canonicalHash: string,
+  signature: SignatureOutcome,
+): {
+  hash: string;
+  kind: "producer_signed_body" | "event_canonical";
+} {
+  if (signature.kind === "verified") {
+    return {
+      hash: computeSignedBodyHash(signature.eventCanonicalJson),
+      kind: "producer_signed_body",
+    };
+  }
+  return { hash: canonicalHash, kind: "event_canonical" };
 }
 
 /**
