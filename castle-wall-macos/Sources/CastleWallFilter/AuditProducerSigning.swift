@@ -345,20 +345,17 @@ public final class AuditProducerChain {
     ) throws -> PendingDecision {
         let decision: String
         let matchedRuleId: String?
-        let eventType: String
         let operation: String
         let result: String
         switch outcome {
         case .allow(let ruleId):
             decision = "allow"
             matchedRuleId = ruleId
-            eventType = "egress_allowed"
             operation = "egress_approved"
             result = "success"
         case .drop(let ruleId):
             decision = "drop"
             matchedRuleId = ruleId
-            eventType = "egress_blocked"
             operation = "egress_blocked"
             result = "blocked"
         case .uncertain:
@@ -370,30 +367,6 @@ public final class AuditProducerChain {
         let agent = IPCBridgeNotifications.agentFor(flow: flow)
         let seq = nextSeq
         let prior = priorHashHex
-        let event = JSONValue.object([
-            "schema_version": .number(1),
-            "layer": .string("l1"),
-            "timestamp": .string(recordedAtString),
-            "fortress_id": .string(agent.id),
-            "event_type": .string(eventType),
-            "agent": .object([
-                "id": .string(agent.id),
-                "template": .string(agent.template),
-            ]),
-            "destination": .object([
-                "host": destination.host.map { .string($0) } ?? .null,
-                "ip": .string(destination.ip),
-                "port": .number(Double(destination.port)),
-                "protocol": .string(destination.protocolName),
-            ]),
-            "decision": .null,
-            "rule_id": matchedRuleId.map { .string($0) } ?? .null,
-            "details": .object([
-                "seq": .number(Double(seq)),
-                "prior_sha256_hex": prior.map { .string($0) } ?? .null,
-            ]),
-        ])
-        let eventCanonical = try canonicalJSONString(event)
         let signedDetails = signedDetailsFor(
             decision: decision,
             destination: destination,
@@ -426,7 +399,11 @@ public final class AuditProducerChain {
                 enforcement: enforcement
             ),
             eventCanonicalJson: walCanonical,
-            eventHashHex: sha256Hex(Data(eventCanonical.utf8)),
+            // Chain over the SIGNED body, matching the availability path below
+            // and the Rust producer (castle-wall-daemon/src/audit.rs). Hashing a
+            // separately-built raw event here forked the chain on every macOS
+            // deployment: the consumer could never reproduce these bytes.
+            eventHashHex: sha256Hex(Data(walCanonical.utf8)),
             signingBytes: signingBytes,
             capturedAtUnixMs: capturedAtUnixMs,
             seq: seq,
