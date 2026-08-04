@@ -154,6 +154,17 @@ export const NON_RELAXABLE_ENFORCEMENT_EXPORT_TIER1_OPERATIONS = [
   "enforcement_export_enabled",
 ] as const;
 
+/**
+ * Memory Integrity Slice A2: restoring a memory checkpoint overwrites the
+ * current exportable StateStore contents. It is an irreversible recovery
+ * operation and must never be relaxed into Tier 2 or Tier 3 by a hand-authored
+ * policy. Spread into the loader and runtime gate force-lists so policy-load
+ * normalization and live classification stay in lockstep.
+ */
+export const NON_RELAXABLE_MEMORY_INTEGRITY_TIER1_OPERATIONS = [
+  "memory_checkpoint_restore",
+] as const;
+
 const FORCED_TIER1_OPERATIONS = [
   RAW_IDENTITY_SIGN_OPERATION,
   "principal_policy_view",
@@ -168,6 +179,7 @@ const FORCED_TIER1_OPERATIONS = [
   ...NON_RELAXABLE_FILE_GRANT_TIER1_OPERATIONS,
   ...NON_RELAXABLE_CASTLE_WALL_OBSERVE_TIER1_OPERATIONS,
   ...NON_RELAXABLE_ENFORCEMENT_EXPORT_TIER1_OPERATIONS,
+  ...NON_RELAXABLE_MEMORY_INTEGRITY_TIER1_OPERATIONS,
 ] as const;
 
 /**
@@ -539,6 +551,11 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     // ALSO force-pinned via NON_RELAXABLE_ENFORCEMENT_EXPORT_TIER1_OPERATIONS so a
     // hand-authored policy cannot relax it out of Tier 1.
     "enforcement_export_enabled",
+    // Memory Integrity Slice A2: checkpoint restore overwrites current
+    // exportable state and is force-pinned via
+    // NON_RELAXABLE_MEMORY_INTEGRITY_TIER1_OPERATIONS so a hand-authored policy
+    // cannot relax it out of Tier 1.
+    "memory_checkpoint_restore",
   ],
   tier2_anomaly: DEFAULT_TIER2,
   tier3_always_allow: [

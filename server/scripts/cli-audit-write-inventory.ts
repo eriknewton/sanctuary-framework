@@ -157,6 +157,13 @@ const COMMAND_TABLE: Record<string, CommandSpec> = {
   "file-grant list":   { classification: "mutator", auditOverride: true, notes: "safe-direction mutator: calls reconcileFileGrantTree before listing (scrubs expired tree entries, flips expired status, emits file_grant_revoke/expired_ttl_scrub audits); also emits its own file_grant_list access audit (Tier-3 auto-allow + audit, recordFileGrantListAudit)" },
   "file-grant revoke": { classification: "mutator", auditOverride: true, notes: "AuditLog.appendCritical in revokeFileGrant (success, not-found, and scrub-failure paths); reconciles expired grants on this touch" },
 
+  // ---- checkpoint (local memory-checkpoint snapshots) ----
+  "checkpoint create": { classification: "mutator", auditOverride: true, notes: "AuditLog.append memory_checkpoint_created in createCheckpoint; local encrypted checkpoint write" },
+  "checkpoint list":   { classification: "read-only", notes: "reads local record.json metadata only" },
+  "checkpoint show":   { classification: "read-only", notes: "reads one local record.json metadata record only" },
+  "checkpoint prune":  { classification: "mutator", auditOverride: true, notes: "AuditLog.append memory_checkpoint_pruned in pruneExpiredCheckpoints; deletes expired local checkpoint dirs" },
+  "checkpoint restore": { classification: "mutator", auditOverride: true, notes: "Tier-1 checkpoint restore; restoreCheckpoint emits AuditLog.appendCritical on success and failure" },
+
   // ---- intelligence ----
   "intelligence diagnose": { classification: "read-only" },
 
@@ -234,6 +241,7 @@ function deriveParentCommand(filePath: string): string | null {
   if (base.endsWith("cli/auto-trigger")) return "auto-trigger";
   if (base.endsWith("cli/identity")) return "identity";
   if (base.endsWith("cli/file-grant")) return "file-grant";
+  if (base.endsWith("cli/checkpoint")) return "checkpoint";
   if (base.endsWith("cli/intelligence")) return "intelligence";
   if (base.endsWith("cli/inbox")) return "inbox";
   if (base.endsWith("cli/policy")) return "policy";

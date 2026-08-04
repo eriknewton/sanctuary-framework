@@ -7,6 +7,7 @@ export const TOP_LEVEL_SUBCOMMANDS = [
   "broker-server",
   "castle-wall",
   "check-updates",
+  "checkpoint",
   "completion",
   "compliance",
   "concierge",
