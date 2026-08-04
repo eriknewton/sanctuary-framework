@@ -920,9 +920,9 @@ Subcommands:
   audit                Search local audit history.
                        Use "sanctuary audit --help" for options.
 
-  checkpoint           Create, list, show, and prune local encrypted memory
-                       checkpoints. Use "sanctuary checkpoint --help" for
-                       options.
+  checkpoint           Create, list, show, prune, and restore local encrypted
+                       memory checkpoints. Use "sanctuary checkpoint --help"
+                       for options.
 
   distress             Emit a distress signal through the reserved habeas
                        lane (operator test verb; same path the agent uses).

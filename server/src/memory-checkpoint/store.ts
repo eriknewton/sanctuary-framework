@@ -212,7 +212,11 @@ export function parseMemoryCheckpointRecord(raw: string): MemoryCheckpointRecord
   if (
     typeof parsed.id !== "string" ||
     typeof parsed.created_at !== "string" ||
-    !(parsed.source === "on_demand" || parsed.source === "scheduled") ||
+    !(
+      parsed.source === "on_demand" ||
+      parsed.source === "scheduled" ||
+      parsed.source === "forensic_quarantine"
+    ) ||
     typeof parsed.total_keys !== "number" ||
     !Number.isInteger(parsed.total_keys) ||
     parsed.total_keys < 0 ||

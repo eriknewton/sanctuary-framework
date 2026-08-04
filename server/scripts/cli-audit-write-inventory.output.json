@@ -160,6 +160,46 @@
     "notes": "read-only; audit not required"
   },
   {
+    "subcommand": "sanctuary checkpoint create",
+    "file_path": "src/cli/checkpoint.ts",
+    "line_number": 222,
+    "classification": "mutator",
+    "audits_currently": true,
+    "notes": "AuditLog.append memory_checkpoint_created in createCheckpoint; local encrypted checkpoint write"
+  },
+  {
+    "subcommand": "sanctuary checkpoint list",
+    "file_path": "src/cli/checkpoint.ts",
+    "line_number": 228,
+    "classification": "read-only",
+    "audits_currently": null,
+    "notes": "reads local record.json metadata only"
+  },
+  {
+    "subcommand": "sanctuary checkpoint prune",
+    "file_path": "src/cli/checkpoint.ts",
+    "line_number": 240,
+    "classification": "mutator",
+    "audits_currently": true,
+    "notes": "AuditLog.append memory_checkpoint_pruned in pruneExpiredCheckpoints; deletes expired local checkpoint dirs"
+  },
+  {
+    "subcommand": "sanctuary checkpoint restore",
+    "file_path": "src/cli/checkpoint.ts",
+    "line_number": 246,
+    "classification": "mutator",
+    "audits_currently": true,
+    "notes": "Tier-1 checkpoint restore; restoreCheckpoint emits AuditLog.appendCritical on success and failure"
+  },
+  {
+    "subcommand": "sanctuary checkpoint show",
+    "file_path": "src/cli/checkpoint.ts",
+    "line_number": 234,
+    "classification": "read-only",
+    "audits_currently": null,
+    "notes": "reads one local record.json metadata record only"
+  },
+  {
     "subcommand": "sanctuary concierge ask",
     "file_path": "src/cli/concierge.ts",
     "line_number": 54,

@@ -10,6 +10,9 @@ misclassified `file-grant list` as read-only even after `cmdList` started
 calling `reconcileFileGrantTree` (a safe-direction mutator side effect). This
 patch adds the three `file-grant` rows below by hand from the current
 `COMMAND_TABLE` + source, WITHOUT re-running a full inventory generation.
+Memory Checkpoint A2 later added the five `checkpoint` rows by the same
+bounded patch path after the local `tsx` runner could not open its sandboxed
+IPC pipe.
 
 A full regen was attempted and reverted: it surfaces pre-existing drift that
 predates file-grant and is out of scope for this cleanup:
@@ -36,9 +39,9 @@ predates file-grant and is out of scope for this cleanup:
 
 | Metric | Count |
 |--------|-------|
-| Total CLI subcommands inventoried | 74 |
-| Mutators | 37 |
-| Read-only | 37 |
+| Total CLI subcommands inventoried | 79 |
+| Mutators | 40 |
+| Read-only | 39 |
 | Pure-UI | 0 |
 | **Mutators that do NOT audit (Batch 5b targets)** | **0** |
 | Uncertain (operator review needed) | 0 |
@@ -67,6 +70,11 @@ predates file-grant and is out of scope for this cleanup:
 | `sanctuary auto-trigger rules promote` | mutator | yes | src/cli/auto-trigger.ts | 234 |
 | `sanctuary auto-trigger rules set-threshold` | mutator | yes | src/cli/auto-trigger.ts | 238 |
 | `sanctuary auto-trigger rules show` | read-only | n/a | src/cli/auto-trigger.ts | 156 |
+| `sanctuary checkpoint create` | mutator | yes | src/cli/checkpoint.ts | 222 |
+| `sanctuary checkpoint list` | read-only | n/a | src/cli/checkpoint.ts | 228 |
+| `sanctuary checkpoint prune` | mutator | yes | src/cli/checkpoint.ts | 240 |
+| `sanctuary checkpoint restore` | mutator | yes | src/cli/checkpoint.ts | 246 |
+| `sanctuary checkpoint show` | read-only | n/a | src/cli/checkpoint.ts | 234 |
 | `sanctuary concierge ask` | read-only | n/a | src/cli/concierge.ts | 54 |
 | `sanctuary concierge status` | read-only | n/a | src/cli/concierge.ts | 55 |
 | `sanctuary did-web issue` | mutator | yes | src/cli/did-web.ts | 148 |

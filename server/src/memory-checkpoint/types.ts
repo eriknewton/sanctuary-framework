@@ -6,7 +6,10 @@
  * shape and diagnosable errors for the module.
  */
 
-export type MemoryCheckpointSource = "on_demand" | "scheduled";
+export type MemoryCheckpointSource =
+  | "on_demand"
+  | "scheduled"
+  | "forensic_quarantine";
 
 export interface MemoryCheckpointRecord {
   id: string;

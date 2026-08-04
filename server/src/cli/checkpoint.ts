@@ -3,20 +3,43 @@
  *
  * Operator-facing surface for local memory checkpoints: create encrypted
  * content-addressed StateStore export snapshots, list/show plaintext metadata,
- * and prune expired local checkpoint directories. Checkpoint creation is
- * ROUTINE and never opens a network or fleet-sync path.
+ * prune expired local checkpoint directories, and restore exportable state
+ * from a known-good checkpoint after compromise. Checkpoint creation is
+ * ROUTINE. Restore is Tier-1 and never opens a network or fleet-sync path.
  */
 
-import { mkdir } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { constants } from "node:fs";
+import { access, mkdir } from "node:fs/promises";
 import { join } from "node:path";
+import { createInterface } from "node:readline/promises";
 import { Writable } from "node:stream";
+import { promisify } from "node:util";
 
 import { StateStore } from "../cognitive/state-store.js";
 import { IdentityManager } from "../cognitive/tools.js";
+import { fromBase64url } from "../core/encoding.js";
 import type { StoredIdentity } from "../core/identity.js";
 import { resolveCliMasterKey } from "../core/master-custody.js";
 import { loadConfig, type SanctuaryConfig } from "../config.js";
+import {
+  AGENT_HARNESS_DAEMON_PLIST_PATH,
+  agentHarnessDaemonStatus,
+  type HarnessDaemonOps,
+} from "../egress-gate/harness-daemon.js";
+import {
+  assessHarnessParked,
+  type ParkedClaimProbeOps,
+} from "../egress-gate/parked-claim.js";
 import { AuditLog } from "../operational/audit-log.js";
+import type { ApprovalChannel } from "../principal-policy/approval-channel.js";
+import { BaselineTracker } from "../principal-policy/baseline.js";
+import { ApprovalGate } from "../principal-policy/gate.js";
+import { loadPrincipalPolicy } from "../principal-policy/loader.js";
+import type {
+  ApprovalRequest,
+  ApprovalResponse,
+} from "../principal-policy/types.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
 import {
   CHECKPOINT_RETENTION_ENV,
@@ -24,6 +47,8 @@ import {
   createCheckpoint,
   nodeMemoryCheckpointFsOps,
   pruneExpiredCheckpoints,
+  restoreCheckpoint,
+  type CheckpointPoisonMap,
   type MemoryCheckpointRecord,
 } from "../memory-checkpoint/index.js";
 
@@ -75,6 +100,8 @@ Commands:
   list       List checkpoint metadata. Read-only.
   show <id>  Show one checkpoint record. Read-only.
   prune      Delete checkpoints whose retention expiry has passed. Audited.
+  restore <id>
+             Restore exportable state from a checkpoint. Tier-1, audited.
 
 Run "sanctuary checkpoint <command> --help" for command-specific options.
 `,
@@ -153,6 +180,29 @@ Options:
   );
 }
 
+function printRestoreHelp(out: Writable): void {
+  write(
+    out,
+    `sanctuary checkpoint restore. Restore exportable state from a known-good checkpoint.
+
+Usage:
+  sanctuary checkpoint restore <checkpoint-id> [--fortress <path>] [--passphrase <val>]
+
+Description:
+  Refuses unless the local agent harness is observed stopped. Before any
+  destructive overwrite it seals current exportable state as a forensic
+  quarantine checkpoint, then reconstructs exportable namespaces from the
+  chosen checkpoint. Reserved namespaces such as _audit and _identities are not
+  restored or deleted by this command.
+
+Options:
+  --fortress <path>   Override the storage path.
+  --passphrase <val>  Passphrase for master-key derivation.
+  --help, -h          Show this help.
+`,
+  );
+}
+
 export async function runCheckpointCommand(
   args: CheckpointCommandArgs,
 ): Promise<number> {
@@ -193,6 +243,12 @@ export async function runCheckpointCommand(
         return 0;
       }
       return cmdPrune(rest, out, err, env);
+    case "restore":
+      if (hasFlag(rest, "--help") || hasFlag(rest, "-h")) {
+        printRestoreHelp(out);
+        return 0;
+      }
+      return cmdRestore(rest, out, err, env);
     default:
       write(err, `Unknown checkpoint command: ${command}\n`);
       printUsage(err);
@@ -207,6 +263,7 @@ interface Bootstrapped {
   stateStore: StateStore;
   auditLog: AuditLog;
   checkpointStore: MemoryCheckpointStore;
+  identityManager: IdentityManager;
   primary: StoredIdentity;
 }
 
@@ -279,6 +336,7 @@ async function bootstrap(
     stateStore,
     auditLog,
     checkpointStore,
+    identityManager,
     primary,
   };
 }
@@ -308,6 +366,119 @@ function renderRecord(record: MemoryCheckpointRecord): string {
   );
 }
 
+class CheckpointRestorePromptApprovalChannel implements ApprovalChannel {
+  async requestApproval(request: ApprovalRequest): Promise<ApprovalResponse> {
+    write(process.stderr, formatApprovalPrompt(request));
+
+    if (!process.stdin.isTTY) {
+      return {
+        decision: "deny",
+        decided_at: new Date().toISOString(),
+        decided_by: "stderr:non-interactive",
+      };
+    }
+
+    const rl = createInterface({ input: process.stdin, output: process.stderr });
+    try {
+      const answer = await rl.question("Approve this checkpoint restore? [y/N] ");
+      const approved = /^y(es)?$/i.test(answer.trim());
+      return {
+        decision: approved ? "approve" : "deny",
+        decided_at: new Date().toISOString(),
+        decided_by: "human",
+      };
+    } finally {
+      rl.close();
+    }
+  }
+}
+
+function formatApprovalPrompt(request: ApprovalRequest): string {
+  const contextLines = Object.entries(request.context)
+    .map(([k, v]) => `  ${k}: ${typeof v === "string" ? v : JSON.stringify(v)}`)
+    .join("\n");
+  return (
+    "\n" +
+    "Sanctuary: Tier-1 approval required\n" +
+    `  Operation: ${request.operation}\n` +
+    `  Reason:    ${request.reason}\n` +
+    "  Details:\n" +
+    contextLines +
+    "\n"
+  );
+}
+
+const execFileAsync = promisify(execFile);
+const LAUNCHCTL_TIMEOUT_MS = 5_000;
+
+async function runLaunchctl(
+  args: readonly string[],
+): Promise<{ code: number; stdout: string; stderr: string }> {
+  try {
+    const { stdout, stderr } = await execFileAsync("launchctl", [...args], {
+      timeout: LAUNCHCTL_TIMEOUT_MS,
+    });
+    return { code: 0, stdout, stderr };
+  } catch (err) {
+    const e = err as {
+      code?: number;
+      stdout?: string;
+      stderr?: string;
+      message?: string;
+    };
+    return {
+      code: typeof e.code === "number" ? e.code : 1,
+      stdout: e.stdout ?? "",
+      stderr: e.stderr ?? e.message ?? "",
+    };
+  }
+}
+
+async function fileExists(path: string): Promise<boolean> {
+  try {
+    await access(path, constants.F_OK);
+    return true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+    return false;
+  }
+}
+
+function unsupportedHarnessFsOp(): Promise<never> {
+  return Promise.reject(
+    new Error("checkpoint restore only probes harness status; filesystem mutation is unsupported here"),
+  );
+}
+
+async function buildRestoreParkedSource(): Promise<
+  { probe: ParkedClaimProbeOps } | { cannotProbe: string }
+> {
+  if (!(await fileExists(AGENT_HARNESS_DAEMON_PLIST_PATH))) {
+    return { cannotProbe: "no harness job is registered on this host" };
+  }
+
+  const ops: HarnessDaemonOps = {
+    writeFile: unsupportedHarnessFsOp,
+    readFile: async () => undefined,
+    removeFile: unsupportedHarnessFsOp,
+    runLaunchctl,
+  };
+  return {
+    probe: {
+      harnessStatus: () => agentHarnessDaemonStatus(ops),
+    },
+  };
+}
+
+function renderPoisonMap(poisonMap: CheckpointPoisonMap): string {
+  const renderList = (label: keyof CheckpointPoisonMap): string => {
+    const paths = poisonMap[label];
+    if (paths.length === 0) return `  ${label}: 0\n`;
+    return `  ${label}: ${paths.length}\n` + paths.map((path) => `    ${path}\n`).join("");
+  };
+  return renderList("added") + renderList("changed") + renderList("removed");
+}
+
 async function cmdCreate(
   argv: string[],
   out: Writable,
@@ -334,6 +505,84 @@ async function cmdCreate(
     return 0;
   } catch (createErr) {
     write(err, `Error: checkpoint create failed. ${errorMessage(createErr)}\n`);
+    return 1;
+  }
+}
+
+async function cmdRestore(
+  argv: string[],
+  out: Writable,
+  err: Writable,
+  env: NodeJS.ProcessEnv,
+): Promise<number> {
+  const id = positionalArgs(argv)[0];
+  if (!id) {
+    write(err, "Usage: sanctuary checkpoint restore <checkpoint-id>\n");
+    return 2;
+  }
+
+  const boot = await bootstrap(argv, err, env);
+  if (!boot) return 1;
+
+  const policy = await loadPrincipalPolicy(boot.config.storage_path);
+  const baseline = new BaselineTracker(boot.storage, boot.masterKey);
+  const channel = new CheckpointRestorePromptApprovalChannel();
+  const gate = new ApprovalGate(policy, baseline, channel, boot.auditLog);
+
+  const gateResult = await gate.evaluate("memory_checkpoint_restore", {
+    checkpoint_id: id,
+  });
+  if (!gateResult.allowed) {
+    try {
+      await boot.auditLog.appendCritical({
+        layer: "l1",
+        operation: "memory_checkpoint_restore",
+        identity_id: boot.primary.identity_id,
+        result: "failure",
+        details: {
+          checkpoint_id: id,
+          forensic_id: null,
+          poison_map_summary: { added: 0, changed: 0, removed: 0 },
+          error_reason: "approval_denied",
+        },
+      });
+    } catch (auditErr) {
+      write(
+        err,
+        `Error: checkpoint restore was denied, and critical audit failed. ${errorMessage(auditErr)}\n`,
+      );
+      return 1;
+    }
+    write(err, "Denied: checkpoint restore was not approved.\n");
+    return 1;
+  }
+
+  const publicKeyResolver = (kid: string): Uint8Array | null => {
+    const identity = boot.identityManager.get(kid);
+    if (!identity) return null;
+    return fromBase64url(identity.public_key);
+  };
+
+  try {
+    const result = await restoreCheckpoint({
+      stateStore: boot.stateStore,
+      checkpointStore: boot.checkpointStore,
+      masterKey: boot.masterKey,
+      auditLog: boot.auditLog,
+      identityId: boot.primary.identity_id,
+      checkpointId: id,
+      assessParked: async () => assessHarnessParked(await buildRestoreParkedSource()),
+      publicKeyResolver,
+    });
+    write(out, `Checkpoint restored: ${result.checkpoint_id}\n`);
+    write(out, `  forensic_id: ${result.forensic_id}\n`);
+    write(out, "  poison_map:\n");
+    write(out, renderPoisonMap(result.poison_map));
+    write(out, `  imported_keys: ${result.import_result.imported_keys}\n`);
+    write(out, "  agent_state: parked\n");
+    return 0;
+  } catch (restoreErr) {
+    write(err, `Error: checkpoint restore failed. ${errorMessage(restoreErr)}\n`);
     return 1;
   }
 }
