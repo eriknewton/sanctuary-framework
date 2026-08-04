@@ -696,6 +696,34 @@ describe("castle-wall/runtime/audit-consumer : ingestCritical", () => {
     );
   });
 
+  it("does NOT re-anchor when a single signed fork event is replayed at the same seq (only distinct advancing seqs count)", async () => {
+    // Adversarial: an in-process attacker replays one captured, validly-signed
+    // forked event N times. If same-seq retries counted toward the threshold, a
+    // single replay could force a re-anchor on demand. Only DISTINCT advancing
+    // fork seqs may count.
+    consumer = new AuditConsumer(sink, undefined, {
+      pinnedProducerKeyB64url: REANCHOR_PUBLIC_KEY_B64URL,
+      now: () => REANCHOR_NOW,
+    });
+    const acceptedHead = chainedEvent(0, null);
+    await consumer.ingestCritical(signedEnvelopeForForkRecovery(acceptedHead));
+
+    const forkedOnce = forkedEvents(5, 1)[0]!;
+    for (let i = 0; i < CASTLE_WALL_WAL_FORK_REANCHOR_THRESHOLD + 2; i += 1) {
+      await expect(
+        consumer.ingestCritical(signedEnvelopeForForkRecovery(forkedOnce)),
+      ).rejects.toThrow(/wal_chain_verification_failed/);
+    }
+    expect(
+      sink.entries.some((entry) => entry.operation === "chain_reanchored"),
+    ).toBe(false);
+    // Chain never advanced past the genuine accepted head.
+    expect(consumer.getWalChainState().lastAckedSeq).toBe(0);
+    expect(consumer.getWalChainState().lastEventCanonicalHash).toBe(
+      eventHash(acceptedHead),
+    );
+  });
+
   it("does not re-anchor an unsigned persistent fork when a pinned key is required", async () => {
     consumer = new AuditConsumer(sink, undefined, {
       pinnedProducerKeyB64url: REANCHOR_PUBLIC_KEY_B64URL,

@@ -233,6 +233,9 @@ export class AuditConsumer {
   private lastAckedSeq: number | null = null;
   private lastEventCanonicalHash: string | null = null;
   private consecutiveWalForkFailures = 0;
+  // The highest seq that has counted toward the re-anchor threshold. Guards the
+  // counter against same-seq replays (only distinct advancing seqs count).
+  private lastCountedForkSeq: number | null = null;
   /**
    * FIX 2 (codex CRITICAL - defense in depth against acking past an unpersisted
    * event). Set to the seq of an event that VALIDATED + chained cleanly but then
@@ -431,7 +434,7 @@ export class AuditConsumer {
             canonicalHash,
             reanchorSigOutcome,
           );
-          if (accepted) this.consecutiveWalForkFailures = 0;
+          if (accepted) this.resetWalForkCounter();
           return;
         }
         if (reanchorSigOutcome.kind === "rejected") {
@@ -467,7 +470,12 @@ export class AuditConsumer {
       canonicalHash,
       sigOutcome,
     );
-    if (accepted) this.consecutiveWalForkFailures = 0;
+    if (accepted) this.resetWalForkCounter();
+  }
+
+  private resetWalForkCounter(): void {
+    this.consecutiveWalForkFailures = 0;
+    this.lastCountedForkSeq = null;
   }
 
   private async persistAcceptedCriticalEvent(
@@ -817,6 +825,19 @@ export class AuditConsumer {
     ) {
       return null;
     }
+    // Count only DISTINCT, STRICTLY-ADVANCING fork seqs. A single captured
+    // producer-signed event replayed N times (same seq) must NOT reach the
+    // re-anchor threshold - the threshold means "a persistent fork spanning
+    // multiple new sequence numbers," which is what proves the producer really
+    // is on a divergent chain. Without this, one replayed valid signature could
+    // drive the counter to the threshold and force a re-anchor on demand.
+    if (
+      this.lastCountedForkSeq !== null &&
+      seq <= this.lastCountedForkSeq
+    ) {
+      return null;
+    }
+    this.lastCountedForkSeq = seq;
     this.consecutiveWalForkFailures += 1;
     return this.consecutiveWalForkFailures;
   }
