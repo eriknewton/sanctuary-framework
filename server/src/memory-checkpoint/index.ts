@@ -74,6 +74,7 @@ export {
   CheckpointRestoreCheckpointNotFoundError,
   CheckpointRestoreForensicSourceError,
   CheckpointRestoreBundleError,
+  CheckpointRestoreBundleHashMismatchError,
   CheckpointRestoreReservedNamespaceError,
   CheckpointRestoreExportError,
   CheckpointRestoreReconstructError,

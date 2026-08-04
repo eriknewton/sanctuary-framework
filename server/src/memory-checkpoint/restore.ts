@@ -10,6 +10,7 @@
 
 import type { StateStore } from "../cognitive/state-store.js";
 import { bytesToString, fromBase64url } from "../core/encoding.js";
+import { hashToString } from "../core/hashing.js";
 import type { AuditLog } from "../operational/audit-log.js";
 import type { ParkedClaim } from "../egress-gate/parked-claim.js";
 import { createCheckpoint } from "./create.js";
@@ -71,6 +72,8 @@ export class CheckpointRestoreCheckpointNotFoundError extends MemoryCheckpointEr
 export class CheckpointRestoreForensicSourceError extends MemoryCheckpointError {}
 
 export class CheckpointRestoreBundleError extends MemoryCheckpointError {}
+
+export class CheckpointRestoreBundleHashMismatchError extends MemoryCheckpointError {}
 
 export class CheckpointRestoreReservedNamespaceError extends MemoryCheckpointError {}
 
@@ -328,6 +331,22 @@ export async function restoreCheckpoint(
         }`,
         "checkpoint_bundle_read_failed",
         err,
+      );
+    }
+
+    // Verify the decrypted plaintext hashes to the recorded bundle_hash BEFORE
+    // any live state is overwritten. GCM+AAD already bind the ciphertext to the
+    // checkpoint id (which embeds the first 16 hex of bundle_hash), and
+    // parseMemoryCheckpointRecord already asserts id === buildId(created_at,
+    // bundle_hash). This closes the chain explicitly: plaintext-hash ===
+    // bundle_hash === id. A recorded bundle_hash that does not match the actual
+    // decrypted bytes fails closed here rather than being restored over the
+    // agent's current state.
+    const recomputedBundleHash = hashToString(fromBase64url(checkpointBundle));
+    if (recomputedBundleHash !== record.bundle_hash) {
+      throw new CheckpointRestoreBundleHashMismatchError(
+        `memory checkpoint restore refused: checkpoint ${deps.checkpointId} decrypted bundle hash ${recomputedBundleHash} does not match the recorded bundle_hash ${record.bundle_hash} (id-bound); refusing to overwrite current state`,
+        "bundle_hash_mismatch",
       );
     }
 

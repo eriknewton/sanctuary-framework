@@ -17,9 +17,10 @@ import {
   type StateExportCompletenessManifest,
   type StateStore,
 } from "../../src/cognitive/state-store.js";
-import { bytesToString, fromBase64url } from "../../src/core/encoding.js";
+import { bytesToString, fromBase64url, stringToBytes, toBase64url } from "../../src/core/encoding.js";
 import { createIdentity } from "../../src/core/identity.js";
 import { derivePurposeKey } from "../../src/core/key-derivation.js";
+import { hashToString } from "../../src/core/hashing.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import { assessHarnessParked } from "../../src/egress-gate/parked-claim.js";
 import type { AuditLog } from "../../src/operational/audit-log.js";
@@ -27,9 +28,11 @@ import { StateStore as RealStateStore } from "../../src/cognitive/state-store.js
 import { MemoryStorage } from "../../src/storage/memory.js";
 import {
   CheckpointRestoreAgentNotParkedError,
+  CheckpointRestoreBundleHashMismatchError,
   CheckpointRestoreForensicSourceError,
   CheckpointRestoreReconstructError,
   MemoryCheckpointStore,
+  buildMemoryCheckpointId,
   createCheckpoint,
   restoreCheckpoint,
   type CheckpointPoisonMap,
@@ -455,6 +458,66 @@ describe("restoreCheckpoint", () => {
       added: ["mem/P"],
       changed: ["mem/Q"],
       removed: [],
+    });
+  });
+
+  it("refuses (before any state change) when the decrypted bundle hash does not match the recorded bundle_hash", async () => {
+    const fixture = await makeFixture();
+    await writeEntry(fixture, "mem", "Q", "live-state");
+    const liveBefore = await exportEntries(fixture.stateStore);
+
+    // A record whose id/bundle_hash are internally consistent (so parse and the
+    // GCM AAD accept it) but whose stored bundle bytes hash to something else.
+    // store.create does not re-hash the bundle, so this models a bundle_hash
+    // that disagrees with the actual decrypted content.
+    const createdAt = "2026-08-03T12:07:00.000Z";
+    const declaredBundle = toBase64url(stringToBytes(JSON.stringify({ namespaces: [], data: {} })));
+    const declaredHash = hashToString(fromBase64url(declaredBundle));
+    const tamperedBundle = toBase64url(
+      stringToBytes(JSON.stringify({ namespaces: ["mem"], data: { mem: [] } })),
+    );
+    expect(hashToString(fromBase64url(tamperedBundle))).not.toBe(declaredHash);
+    const id = buildMemoryCheckpointId(createdAt, declaredHash);
+    await fixture.checkpointStore.create({
+      record: {
+        id,
+        created_at: createdAt,
+        source: "on_demand",
+        namespaces: [],
+        total_keys: 0,
+        bundle_hash: declaredHash,
+        completeness_summary: { namespace_count: 0, total_keys: 0, per_namespace: {} },
+        retention_expires_at: null,
+        format_version: 1,
+      },
+      bundle: tamperedBundle,
+      masterKey: fixture.masterKey,
+    });
+
+    await expect(
+      restoreCheckpoint({
+        stateStore: fixture.stateStore,
+        checkpointStore: fixture.checkpointStore,
+        masterKey: fixture.masterKey,
+        auditLog: fixture.audit.auditLog,
+        identityId: fixture.identity.storedIdentity.identity_id,
+        checkpointId: id,
+        assessParked: parkedClaim,
+        publicKeyResolver: publicKeyResolver(fixture),
+      }),
+    ).rejects.toThrow(CheckpointRestoreBundleHashMismatchError);
+
+    // No state overwritten and no forensic snapshot sealed (the check fires
+    // before any destructive step).
+    expect(await exportEntries(fixture.stateStore)).toEqual(liveBefore);
+    const forensic = (await fixture.checkpointStore.list()).find(
+      (record) => record.source === "forensic_quarantine",
+    );
+    expect(forensic).toBeUndefined();
+    const failureAudit = fixture.audit.criticalCalls.at(-1);
+    expect(failureAudit).toMatchObject({
+      operation: "memory_checkpoint_restore",
+      result: "failure",
     });
   });
 });
