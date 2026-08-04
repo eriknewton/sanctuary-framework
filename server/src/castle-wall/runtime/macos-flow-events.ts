@@ -71,8 +71,12 @@ const DUPLICATE_REPLAY_ROLLUP_INTERVAL_MS = 60_000;
 interface DuplicateReplayRollup {
   pendingCount: number;
   firstPendingAtMs: number | null;
-  rejectedSeq: number | null;
-  floor: number | null;
+  lastPendingAtMs: number | null;
+  distinctSeqs: Set<number>;
+  minSeq: number | null;
+  maxSeq: number | null;
+  minFloor: number | null;
+  maxFloor: number | null;
 }
 
 /** The runtime's view of a registered macOS subscriber. */
@@ -639,33 +643,38 @@ export class MacOSFlowEventConsumer {
       rollup = {
         pendingCount: 0,
         firstPendingAtMs: null,
-        rejectedSeq: null,
-        floor: null,
+        lastPendingAtMs: null,
+        distinctSeqs: new Set<number>(),
+        minSeq: null,
+        maxSeq: null,
+        minFloor: null,
+        maxFloor: null,
       };
       this.duplicateReplayRollups.set(key, rollup);
     }
 
-    if (
-      rollup.pendingCount > 0 &&
-      (rollup.rejectedSeq !== rejectedSeq || rollup.floor !== floor)
-    ) {
+    const nowMs = this.now();
+    if (duplicateReplayWindowExpired(rollup, nowMs)) {
       emitDuplicateReplayRollup(stream, rollup);
       resetDuplicateReplayRollup(rollup);
     }
 
-    const nowMs = this.now();
     if (rollup.pendingCount === 0) {
       rollup.firstPendingAtMs = nowMs;
-      rollup.rejectedSeq = rejectedSeq;
-      rollup.floor = floor;
     }
+    rollup.lastPendingAtMs = nowMs;
     rollup.pendingCount += 1;
+    rollup.distinctSeqs.add(rejectedSeq);
+    rollup.minSeq =
+      rollup.minSeq === null ? rejectedSeq : Math.min(rollup.minSeq, rejectedSeq);
+    rollup.maxSeq =
+      rollup.maxSeq === null ? rejectedSeq : Math.max(rollup.maxSeq, rejectedSeq);
+    rollup.minFloor =
+      rollup.minFloor === null ? floor : Math.min(rollup.minFloor, floor);
+    rollup.maxFloor =
+      rollup.maxFloor === null ? floor : Math.max(rollup.maxFloor, floor);
 
-    if (
-      rollup.pendingCount >= DUPLICATE_REPLAY_ROLLUP_COUNT ||
-      (rollup.firstPendingAtMs !== null &&
-        nowMs - rollup.firstPendingAtMs >= DUPLICATE_REPLAY_ROLLUP_INTERVAL_MS)
-    ) {
+    if (rollup.pendingCount >= DUPLICATE_REPLAY_ROLLUP_COUNT) {
       emitDuplicateReplayRollup(stream, rollup);
       resetDuplicateReplayRollup(rollup);
     }
@@ -691,26 +700,53 @@ function emitDuplicateReplayRollup(
   stream: EnforcementAvailabilityStream,
   rollup: DuplicateReplayRollup,
 ): void {
+  const firstPendingAtMs = rollup.firstPendingAtMs;
+  const lastPendingAtMs = rollup.lastPendingAtMs;
+  const minSeq = rollup.minSeq;
+  const maxSeq = rollup.maxSeq;
+  const minFloor = rollup.minFloor;
+  const maxFloor = rollup.maxFloor;
   if (
     rollup.pendingCount <= 0 ||
-    rollup.rejectedSeq === null ||
-    rollup.floor === null
+    firstPendingAtMs === null ||
+    lastPendingAtMs === null ||
+    minSeq === null ||
+    maxSeq === null ||
+    minFloor === null ||
+    maxFloor === null ||
+    rollup.distinctSeqs.size <= 0
   ) {
     return;
   }
-  // SAFETY: stderr is the daemon operator log; exact duplicate replay
-  // redeliveries can be sustained and noisy, so they are emitted only as a
-  // bounded rollup that preserves count and stream signal.
+  const windowMs = Math.max(0, lastPendingAtMs - firstPendingAtMs);
+  // SAFETY: stderr is the daemon operator log; distinct-seq duplicate
+  // redeliveries can be sustained and noisy, so they are emitted as bounded
+  // windows that preserve total count, distinct seq count, ranges, and stream.
   console.error(
-    `[castle-wall] enforcement availability duplicate replays suppressed stream=${stream} count=${rollup.pendingCount} rejected_seq=${rollup.rejectedSeq} floor=${rollup.floor}`,
+    `[castle-wall] enforcement availability duplicate replays suppressed stream=${stream} count=${rollup.pendingCount} distinct_seqs=${rollup.distinctSeqs.size} seq_range=[${minSeq},${maxSeq}] floor_range=[${minFloor},${maxFloor}] window_ms=${windowMs}`,
   );
 }
 
 function resetDuplicateReplayRollup(rollup: DuplicateReplayRollup): void {
   rollup.pendingCount = 0;
   rollup.firstPendingAtMs = null;
-  rollup.rejectedSeq = null;
-  rollup.floor = null;
+  rollup.lastPendingAtMs = null;
+  rollup.distinctSeqs.clear();
+  rollup.minSeq = null;
+  rollup.maxSeq = null;
+  rollup.minFloor = null;
+  rollup.maxFloor = null;
+}
+
+function duplicateReplayWindowExpired(
+  rollup: DuplicateReplayRollup,
+  nowMs: number,
+): boolean {
+  return (
+    rollup.pendingCount > 0 &&
+    rollup.firstPendingAtMs !== null &&
+    nowMs - rollup.firstPendingAtMs >= DUPLICATE_REPLAY_ROLLUP_INTERVAL_MS
+  );
 }
 
 function buildProducerSignedEnvelope(
