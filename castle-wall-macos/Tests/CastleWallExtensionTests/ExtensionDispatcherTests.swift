@@ -86,8 +86,6 @@ final class ExtensionDispatcherTests: XCTestCase {
         }
     }
 
-    // MARK: - Helpers
-
     func makeFlow(
         host: String? = "api.anthropic.com",
         ip: String = "104.18.32.10",
@@ -765,4 +763,86 @@ final class ExtensionDispatcherTests: XCTestCase {
         XCTAssertEqual(signSeq("first"), 0)
         XCTAssertEqual(signSeq("second"), 1)
     }
+
+    func test_auditProducerChain_chainsFlowAndAvailabilityOverSignedWalBody() throws {
+        let privateKey = Curve25519.Signing.PrivateKey()
+        let signer = ImmediateAuditProducerSigner(privateKey: privateKey)
+        let chain = AuditProducerChain()
+
+        func hashSignedBody(_ canonicalJson: String) -> String {
+            let digest = SHA256.hash(data: Data(canonicalJson.utf8))
+            return digest.map { String(format: "%02x", $0) }.joined()
+        }
+
+        func signFlow(_ label: String) throws -> AuditProducerSignatureBody {
+            let exp = expectation(description: label)
+            var result: Result<IpcMessage, AuditProducerSigningError>?
+            chain.buildSignedFlowDecision(
+                outcome: .allow(matchedRuleId: "r-allow"),
+                flow: makeFlow(),
+                recordedAt: Date(timeIntervalSince1970: 1_760_000_000),
+                signer: signer
+            ) { r in
+                result = r
+                exp.fulfill()
+            }
+            wait(for: [exp], timeout: 2)
+            let message = try XCTUnwrap(result).get()
+            guard case .flowDecisionRecorded(let body) = message else {
+                XCTFail("expected signed flowDecisionRecorded")
+                throw NSError(domain: "ExtensionDispatcherTests", code: 1)
+            }
+            return try XCTUnwrap(body.producer)
+        }
+
+        func signAvailability(_ label: String) throws -> AuditProducerSignatureBody {
+            let enforcement = EnforcementAvailabilitySnapshotBody(
+                leaseState: "live",
+                leaseReason: "ok",
+                manifestState: "applied",
+                manifestSignatureB64url: "manifest-signature",
+                providerBound: true,
+                producerClaimedAt: "2025-10-09T08:53:20Z"
+            )
+            let exp = expectation(description: label)
+            var result: Result<IpcMessage, AuditProducerSigningError>?
+            chain.buildSignedAvailabilityReport(
+                enforcement: enforcement,
+                fortressId: "agent-7",
+                reportedAt: Date(timeIntervalSince1970: 1_760_000_001),
+                signer: signer
+            ) { r in
+                result = r
+                exp.fulfill()
+            }
+            wait(for: [exp], timeout: 2)
+            let message = try XCTUnwrap(result).get()
+            guard case .enforcementAvailabilityReport(let body) = message else {
+                XCTFail("expected signed enforcementAvailabilityReport")
+                throw NSError(domain: "ExtensionDispatcherTests", code: 2)
+            }
+            return try XCTUnwrap(body.producer)
+        }
+
+        let flowProducer = try signFlow("signed flow")
+        XCTAssertEqual(flowProducer.seq, 0)
+        XCTAssertNil(flowProducer.priorSha256Hex)
+
+        let availabilityProducer = try signAvailability("signed availability")
+        XCTAssertEqual(availabilityProducer.seq, 1)
+        XCTAssertEqual(
+            availabilityProducer.priorSha256Hex,
+            hashSignedBody(flowProducer.eventCanonicalJson),
+            "availability prior must chain from the flow decision's signed WAL body"
+        )
+
+        let nextFlowProducer = try signFlow("signed flow after availability")
+        XCTAssertEqual(nextFlowProducer.seq, 2)
+        XCTAssertEqual(
+            nextFlowProducer.priorSha256Hex,
+            hashSignedBody(availabilityProducer.eventCanonicalJson),
+            "flow prior must chain from the availability report's signed WAL body"
+        )
+    }
+
 }
