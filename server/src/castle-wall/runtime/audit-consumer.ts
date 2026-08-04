@@ -60,6 +60,13 @@ export const ENFORCEMENT_EVIDENCE_EVENT_TYPES: ReadonlySet<CastleWallEventType> 
     ])
   );
 
+/**
+ * A fork must persist across multiple deliveries before re-anchor. Three
+ * deliveries recovers within seconds under steady traffic while ignoring a
+ * single transient reorder.
+ */
+export const CASTLE_WALL_WAL_FORK_REANCHOR_THRESHOLD = 3;
+
 /** Shape the consumer pushes into; `AuditLog.append` matches structurally. */
 export interface AuditSink {
   /**
@@ -225,6 +232,7 @@ export class AuditConsumer {
   };
   private lastAckedSeq: number | null = null;
   private lastEventCanonicalHash: string | null = null;
+  private consecutiveWalForkFailures = 0;
   /**
    * FIX 2 (codex CRITICAL - defense in depth against acking past an unpersisted
    * event). Set to the seq of an event that VALIDATED + chained cleanly but then
@@ -391,6 +399,49 @@ export class AuditConsumer {
       return;
     }
     if (chainOutcome.kind === "error") {
+      const forkFailures = this.recordWalForkFailure(
+        chainOutcome.reason,
+        envelope.event,
+      );
+      if (
+        forkFailures !== null &&
+        forkFailures >= CASTLE_WALL_WAL_FORK_REANCHOR_THRESHOLD
+      ) {
+        const reanchorSigOutcome = this.evaluateProducerSignature(envelope);
+        if (reanchorSigOutcome.kind === "verified") {
+          this.stats.producerSignatureAccepted += 1;
+          const identityOutcome = persistedIdentityForEvent(
+            envelope,
+            reanchorSigOutcome,
+          );
+          if (identityOutcome.kind === "rejected") {
+            await this.emitProducerSignatureRejected(
+              envelope,
+              identityOutcome.reason,
+            );
+            throw new AuditChainError(identityOutcome.reason);
+          }
+          await this.emitChainReanchored(
+            envelope.event,
+            canonicalHash,
+            reanchorSigOutcome,
+          );
+          const accepted = await this.persistAcceptedCriticalEvent(
+            envelope,
+            canonicalHash,
+            reanchorSigOutcome,
+          );
+          if (accepted) this.consecutiveWalForkFailures = 0;
+          return;
+        }
+        if (reanchorSigOutcome.kind === "rejected") {
+          await this.emitProducerSignatureRejected(
+            envelope,
+            reanchorSigOutcome.reason,
+          );
+          throw new AuditChainError(reanchorSigOutcome.reason);
+        }
+      }
       await this.emitVerificationFailure(chainOutcome.reason, envelope.event);
       throw new AuditChainError(chainOutcome.reason);
     }
@@ -404,44 +455,29 @@ export class AuditConsumer {
     // replayed past signature is bound to a different seq so it does not verify.
     const sigOutcome = this.evaluateProducerSignature(envelope);
     if (sigOutcome.kind === "rejected") {
-      this.stats.producerSignatureRejections += 1;
-      await this.sink.append(
-        CASTLE_WALL_AUDIT_LAYER,
-        "producer_signature_rejected",
-        envelope.event.fortress_id ?? "unknown",
-        {
-          reason: sigOutcome.reason,
-          event_type: envelope.event.event_type,
-          seq: envelope.event.details.seq,
-        },
-        "failure"
-      );
-      await this.sink.flush();
-      // Fail closed: do NOT persist as enforcement evidence, do NOT advance the
-      // chain. We DO ACK so the daemon stops re-delivering a packet we have
-      // permanently refused; the refusal is durably recorded above for audit.
-      await this.tryAck(envelope, "producer_signature_rejected");
+      await this.emitProducerSignatureRejected(envelope, sigOutcome.reason);
       throw new AuditChainError(sigOutcome.reason);
     }
     if (sigOutcome.kind === "verified") {
       this.stats.producerSignatureAccepted += 1;
     }
+
+    const accepted = await this.persistAcceptedCriticalEvent(
+      envelope,
+      canonicalHash,
+      sigOutcome,
+    );
+    if (accepted) this.consecutiveWalForkFailures = 0;
+  }
+
+  private async persistAcceptedCriticalEvent(
+    envelope: CriticalEventEnvelope,
+    canonicalHash: string,
+    sigOutcome: SignatureOutcome,
+  ): Promise<boolean> {
     const identityOutcome = persistedIdentityForEvent(envelope, sigOutcome);
     if (identityOutcome.kind === "rejected") {
-      this.stats.producerSignatureRejections += 1;
-      await this.sink.append(
-        CASTLE_WALL_AUDIT_LAYER,
-        "producer_signature_rejected",
-        envelope.event.fortress_id ?? "unknown",
-        {
-          reason: identityOutcome.reason,
-          event_type: envelope.event.event_type,
-          seq: envelope.event.details.seq,
-        },
-        "failure"
-      );
-      await this.sink.flush();
-      await this.tryAck(envelope, "producer_signature_rejected");
+      await this.emitProducerSignatureRejected(envelope, identityOutcome.reason);
       throw new AuditChainError(identityOutcome.reason);
     }
 
@@ -490,7 +526,7 @@ export class AuditConsumer {
     // The owed seq (if any) is now durable - clear the FIX 2 guard.
     this.pendingUnpersistedSeq = null;
     this.stats.acceptedCriticalEvents += 1;
-    await this.tryAck(envelope, envelope.event.event_type);
+    return await this.tryAck(envelope, envelope.event.event_type);
   }
 
   /**
@@ -502,9 +538,10 @@ export class AuditConsumer {
   private async tryAck(
     envelope: CriticalEventEnvelope,
     operationContext: string
-  ): Promise<void> {
+  ): Promise<boolean> {
     try {
       await envelope.ack();
+      return true;
     } catch (err) {
       this.stats.ackFailures += 1;
       await this.sink.append(
@@ -520,6 +557,7 @@ export class AuditConsumer {
         "failure"
       );
       await this.sink.flush();
+      return false;
     }
   }
 
@@ -764,6 +802,67 @@ export class AuditConsumer {
       eventCanonicalJson: envelope.producer.eventCanonicalJson,
       capturedAtUnixMs: envelope.producer.capturedAtUnixMs,
     };
+  }
+
+  private recordWalForkFailure(
+    reason: string,
+    event: CastleWallAuditEvent,
+  ): number | null {
+    if (reason !== "wal_chain_verification_failed") return null;
+    const seq = event.details?.[CASTLE_WALL_WAL_SEQUENCE_DETAIL_KEY];
+    if (
+      typeof seq !== "number" ||
+      !Number.isSafeInteger(seq) ||
+      (this.lastAckedSeq !== null && seq <= this.lastAckedSeq)
+    ) {
+      return null;
+    }
+    this.consecutiveWalForkFailures += 1;
+    return this.consecutiveWalForkFailures;
+  }
+
+  private async emitChainReanchored(
+    event: CastleWallAuditEvent,
+    canonicalHash: string,
+    signature: Extract<SignatureOutcome, { kind: "verified" }>,
+  ): Promise<void> {
+    await this.sink.append(
+      CASTLE_WALL_AUDIT_LAYER,
+      "chain_reanchored",
+      event.fortress_id ?? "unknown",
+      {
+        previous_anchor_sha256_hex: this.lastEventCanonicalHash,
+        previous_acked_seq: this.lastAckedSeq,
+        new_anchor_seq: event.details[CASTLE_WALL_WAL_SEQUENCE_DETAIL_KEY],
+        new_anchor_sha256_hex: canonicalHash,
+        consecutive_fork_failures: this.consecutiveWalForkFailures,
+        producer_key_id: signature.keyId,
+      },
+      "success",
+    );
+    await this.sink.flush();
+  }
+
+  private async emitProducerSignatureRejected(
+    envelope: CriticalEventEnvelope,
+    reason: string,
+  ): Promise<void> {
+    this.stats.producerSignatureRejections += 1;
+    await this.sink.append(
+      CASTLE_WALL_AUDIT_LAYER,
+      "producer_signature_rejected",
+      envelope.event.fortress_id ?? "unknown",
+      {
+        reason,
+        event_type: envelope.event.event_type,
+        seq: envelope.event.details.seq,
+      },
+      "failure",
+    );
+    await this.sink.flush();
+    // Fail closed: do not persist as enforcement evidence and do not advance
+    // the chain. ACK permanently refused packets so the daemon stops retrying.
+    await this.tryAck(envelope, "producer_signature_rejected");
   }
 
   private async emitVerificationFailure(

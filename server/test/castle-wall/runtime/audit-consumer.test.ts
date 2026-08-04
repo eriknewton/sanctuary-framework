@@ -7,20 +7,28 @@
 
 import { createHash } from "node:crypto";
 import { describe, it, expect, beforeEach } from "vitest";
+import { ed25519 } from "@noble/curves/ed25519";
 
 import {
   ACCEPTED_EVENT_TYPES,
   AuditChainError,
   AuditConsumer,
+  CASTLE_WALL_WAL_FORK_REANCHOR_THRESHOLD,
   validateEvent,
   type AuditSink,
+  type CriticalEventEnvelope,
 } from "../../../src/castle-wall/runtime/audit-consumer.js";
 import {
   buildAuditEvent,
   canonicalizeAuditEvent,
 } from "../../../src/castle-wall/audit/builder.js";
-import { CASTLE_WALL_AUDIT_LAYER } from "../../../src/castle-wall/constants.js";
+import {
+  CASTLE_WALL_AUDIT_LAYER,
+  CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1,
+} from "../../../src/castle-wall/constants.js";
 import type { CastleWallAuditEvent } from "../../../src/castle-wall/audit/events.js";
+import { canonicalize } from "../../../src/mesh/canonical-json.js";
+import { producerSigningBytes } from "../../../src/castle-wall/runtime/producer-signature.js";
 
 class RecordingSink implements AuditSink {
   entries: Array<{
@@ -71,6 +79,75 @@ function chainedEvent(seq: number, prior_sha256_hex: string | null): CastleWallA
     event_type: "egress_allowed",
     details: { seq, prior_sha256_hex },
   });
+}
+
+function toBase64url(bytes: Uint8Array): string {
+  let bin = "";
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+const REANCHOR_PRIVATE_KEY = ed25519.utils.randomPrivateKey();
+const REANCHOR_PUBLIC_KEY_B64URL = toBase64url(ed25519.getPublicKey(REANCHOR_PRIVATE_KEY));
+const REANCHOR_NOW = 1_750_000_000_000;
+const REANCHOR_SIGNED_AT = REANCHOR_NOW - 1000;
+
+function signedWalBodyFor(event: CastleWallAuditEvent): string {
+  return canonicalize({
+    timestamp: event.timestamp,
+    layer: "l1",
+    operation:
+      event.event_type === "egress_blocked"
+        ? "egress_blocked"
+        : event.event_type === "egress_allowed"
+          ? "egress_approved"
+          : "egress_pending",
+    identity_id: "signed-agent",
+    result: event.event_type === "egress_blocked" ? "blocked" : "success",
+    details: {},
+  });
+}
+
+function signedEnvelopeForForkRecovery(
+  event: CastleWallAuditEvent,
+  opts?: {
+    ack?: () => Promise<void>;
+    signer?: Uint8Array;
+    omitSubjectBinding?: boolean;
+  },
+): CriticalEventEnvelope {
+  const canonical = signedWalBodyFor(event);
+  const seq = event.details.seq as number;
+  const signer = opts?.signer ?? REANCHOR_PRIVATE_KEY;
+  const sig = ed25519.sign(
+    producerSigningBytes(canonical, REANCHOR_SIGNED_AT, seq),
+    signer,
+  );
+  return {
+    event,
+    ack: opts?.ack ?? (async () => {}),
+    producer: {
+      eventCanonicalJson: canonical,
+      capturedAtUnixMs: REANCHOR_SIGNED_AT,
+      seq,
+      signatureB64url: toBase64url(sig),
+      keyId: CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1,
+    },
+    ...(opts?.omitSubjectBinding === true
+      ? {}
+      : { producerSubjectBinding: { kind: "signed_identity_id" as const } }),
+  };
+}
+
+function forkedEvents(startSeq: number, count: number): CastleWallAuditEvent[] {
+  const events: CastleWallAuditEvent[] = [];
+  let priorHash = "fork-root";
+  for (let offset = 0; offset < count; offset += 1) {
+    const event = chainedEvent(startSeq + offset, priorHash);
+    events.push(event);
+    priorHash = eventHash(event);
+  }
+  return events;
 }
 
 describe("castle-wall/runtime/audit-consumer : validateEvent", () => {
@@ -539,6 +616,232 @@ describe("castle-wall/runtime/audit-consumer : ingestCritical", () => {
     expect(consumer.getStats().acceptedCriticalEvents).toBe(1);
     expect(consumer.getWalChainState().lastAckedSeq).toBe(5);
     expect(consumer.getWalChainState().lastEventCanonicalHash).toBe(eventHash(genuine));
+  });
+
+  it("re-anchors a persistent signed advancing WAL fork and resumes emission", async () => {
+    consumer = new AuditConsumer(sink, undefined, {
+      pinnedProducerKeyB64url: REANCHOR_PUBLIC_KEY_B64URL,
+      now: () => REANCHOR_NOW,
+    });
+    const acceptedHead = chainedEvent(0, null);
+    await consumer.ingestCritical(signedEnvelopeForForkRecovery(acceptedHead));
+
+    const fork = forkedEvents(1, CASTLE_WALL_WAL_FORK_REANCHOR_THRESHOLD);
+    for (let i = 0; i < CASTLE_WALL_WAL_FORK_REANCHOR_THRESHOLD - 1; i += 1) {
+      let acked = false;
+      await expect(
+        consumer.ingestCritical(
+          signedEnvelopeForForkRecovery(fork[i]!, {
+            ack: async () => {
+              acked = true;
+            },
+          }),
+        ),
+      ).rejects.toThrow(/wal_chain_verification_failed/);
+      expect(acked).toBe(false);
+    }
+
+    const reanchoredEvent = fork[CASTLE_WALL_WAL_FORK_REANCHOR_THRESHOLD - 1]!;
+    let reanchorAcked = false;
+    await expect(
+      consumer.ingestCritical(
+        signedEnvelopeForForkRecovery(reanchoredEvent, {
+          ack: async () => {
+            reanchorAcked = true;
+          },
+        }),
+      ),
+    ).resolves.toBeUndefined();
+    expect(reanchorAcked).toBe(true);
+
+    const reanchorIndex = sink.entries.findIndex(
+      (entry) => entry.operation === "chain_reanchored",
+    );
+    expect(reanchorIndex).toBeGreaterThanOrEqual(0);
+    const reanchor = sink.entries[reanchorIndex]!;
+    expect(reanchor.details).toEqual({
+      previous_anchor_sha256_hex: eventHash(acceptedHead),
+      previous_acked_seq: 0,
+      new_anchor_seq: reanchoredEvent.details.seq,
+      new_anchor_sha256_hex: eventHash(reanchoredEvent),
+      consecutive_fork_failures: CASTLE_WALL_WAL_FORK_REANCHOR_THRESHOLD,
+      producer_key_id: CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1,
+    });
+    const acceptedReanchorIndex = sink.entries.findIndex(
+      (entry, index) =>
+        index > reanchorIndex &&
+        entry.operation === "egress_allowed" &&
+        entry.details?.seq === reanchoredEvent.details.seq,
+    );
+    expect(acceptedReanchorIndex).toBeGreaterThan(reanchorIndex);
+
+    const nextEvent = chainedEvent(
+      CASTLE_WALL_WAL_FORK_REANCHOR_THRESHOLD + 1,
+      eventHash(reanchoredEvent),
+    );
+    let nextAcked = false;
+    await consumer.ingestCritical(
+      signedEnvelopeForForkRecovery(nextEvent, {
+        ack: async () => {
+          nextAcked = true;
+        },
+      }),
+    );
+    expect(nextAcked).toBe(true);
+    expect(consumer.getWalChainState().lastAckedSeq).toBe(
+      CASTLE_WALL_WAL_FORK_REANCHOR_THRESHOLD + 1,
+    );
+    expect(consumer.getWalChainState().lastEventCanonicalHash).toBe(
+      eventHash(nextEvent),
+    );
+  });
+
+  it("does not re-anchor an unsigned persistent fork when a pinned key is required", async () => {
+    consumer = new AuditConsumer(sink, undefined, {
+      pinnedProducerKeyB64url: REANCHOR_PUBLIC_KEY_B64URL,
+      now: () => REANCHOR_NOW,
+    });
+    const acceptedHead = chainedEvent(0, null);
+    await consumer.ingestCritical(signedEnvelopeForForkRecovery(acceptedHead));
+
+    const fork = forkedEvents(1, CASTLE_WALL_WAL_FORK_REANCHOR_THRESHOLD);
+    for (let i = 0; i < CASTLE_WALL_WAL_FORK_REANCHOR_THRESHOLD - 1; i += 1) {
+      await expect(
+        consumer.ingestCritical({ event: fork[i]!, ack: async () => {} }),
+      ).rejects.toThrow(/wal_chain_verification_failed/);
+    }
+    let thresholdAcked = false;
+    await expect(
+      consumer.ingestCritical({
+        event: fork[CASTLE_WALL_WAL_FORK_REANCHOR_THRESHOLD - 1]!,
+        ack: async () => {
+          thresholdAcked = true;
+        },
+      }),
+    ).rejects.toThrow(/producer_signature_absent/);
+
+    expect(thresholdAcked).toBe(true);
+    expect(sink.entries.some((entry) => entry.operation === "chain_reanchored")).toBe(false);
+    const rejection = sink.entries.find(
+      (entry) => entry.operation === "producer_signature_rejected",
+    );
+    expect(rejection?.details?.reason).toBe("producer_signature_absent");
+    expect(consumer.getWalChainState().lastAckedSeq).toBe(0);
+    expect(consumer.getStats().acceptedCriticalEvents).toBe(1);
+  });
+
+  it("does not emit chain_reanchored when a signed fork fails subject binding", async () => {
+    consumer = new AuditConsumer(sink, undefined, {
+      pinnedProducerKeyB64url: REANCHOR_PUBLIC_KEY_B64URL,
+      now: () => REANCHOR_NOW,
+    });
+    const acceptedHead = chainedEvent(0, null);
+    await consumer.ingestCritical(signedEnvelopeForForkRecovery(acceptedHead));
+
+    const fork = forkedEvents(1, CASTLE_WALL_WAL_FORK_REANCHOR_THRESHOLD);
+    for (let i = 0; i < CASTLE_WALL_WAL_FORK_REANCHOR_THRESHOLD - 1; i += 1) {
+      await expect(
+        consumer.ingestCritical(signedEnvelopeForForkRecovery(fork[i]!)),
+      ).rejects.toThrow(/wal_chain_verification_failed/);
+    }
+    await expect(
+      consumer.ingestCritical(
+        signedEnvelopeForForkRecovery(
+          fork[CASTLE_WALL_WAL_FORK_REANCHOR_THRESHOLD - 1]!,
+          { omitSubjectBinding: true },
+        ),
+      ),
+    ).rejects.toThrow(/producer_signed_without_subject_binding/);
+
+    expect(sink.entries.some((entry) => entry.operation === "chain_reanchored")).toBe(false);
+    const rejection = sink.entries.find(
+      (entry) => entry.operation === "producer_signature_rejected",
+    );
+    expect(rejection?.details?.reason).toBe(
+      "producer_signed_without_subject_binding",
+    );
+    expect(consumer.getWalChainState().lastAckedSeq).toBe(0);
+  });
+
+  it("keeps fork re-anchor disabled when no producer key is pinned", async () => {
+    const acceptedHead = chainedEvent(0, null);
+    await consumer.ingestCritical({ event: acceptedHead, ack: async () => {} });
+
+    const fork = forkedEvents(1, CASTLE_WALL_WAL_FORK_REANCHOR_THRESHOLD + 1);
+    for (const event of fork) {
+      let acked = false;
+      await expect(
+        consumer.ingestCritical({
+          event,
+          ack: async () => {
+            acked = true;
+          },
+        }),
+      ).rejects.toThrow(/wal_chain_verification_failed/);
+      expect(acked).toBe(false);
+    }
+
+    expect(sink.entries.some((entry) => entry.operation === "chain_reanchored")).toBe(false);
+    expect(sink.entries.filter((entry) => entry.operation === "egress_allowed")).toHaveLength(1);
+    expect(consumer.getWalChainState().lastAckedSeq).toBe(0);
+  });
+
+  it("keeps a single transient mismatch below threshold and resets after a good ACK", async () => {
+    consumer = new AuditConsumer(sink, undefined, {
+      pinnedProducerKeyB64url: REANCHOR_PUBLIC_KEY_B64URL,
+      now: () => REANCHOR_NOW,
+    });
+    const acceptedHead = chainedEvent(0, null);
+    await consumer.ingestCritical(signedEnvelopeForForkRecovery(acceptedHead));
+
+    const transientFork = chainedEvent(1, "transient-bad-prior");
+    await expect(
+      consumer.ingestCritical(signedEnvelopeForForkRecovery(transientFork)),
+    ).rejects.toThrow(/wal_chain_verification_failed/);
+
+    const correctContinuation = chainedEvent(1, eventHash(acceptedHead));
+    await consumer.ingestCritical(signedEnvelopeForForkRecovery(correctContinuation));
+    expect(sink.entries.some((entry) => entry.operation === "chain_reanchored")).toBe(false);
+    expect(consumer.getWalChainState().lastAckedSeq).toBe(1);
+
+    const laterFork = forkedEvents(2, CASTLE_WALL_WAL_FORK_REANCHOR_THRESHOLD - 1);
+    for (const event of laterFork) {
+      await expect(
+        consumer.ingestCritical(signedEnvelopeForForkRecovery(event)),
+      ).rejects.toThrow(/wal_chain_verification_failed/);
+    }
+    expect(sink.entries.some((entry) => entry.operation === "chain_reanchored")).toBe(false);
+  });
+
+  it("does not route duplicate replay or backward seq through fork re-anchor", async () => {
+    consumer = new AuditConsumer(sink, undefined, {
+      pinnedProducerKeyB64url: REANCHOR_PUBLIC_KEY_B64URL,
+      now: () => REANCHOR_NOW,
+    });
+    const eventSeq5 = chainedEvent(5, null);
+    await consumer.ingestCritical(signedEnvelopeForForkRecovery(eventSeq5));
+
+    let duplicateAcked = false;
+    await consumer.ingestCritical(
+      signedEnvelopeForForkRecovery(eventSeq5, {
+        ack: async () => {
+          duplicateAcked = true;
+        },
+      }),
+    );
+    expect(duplicateAcked).toBe(true);
+    expect(
+      sink.entries.some((entry) => entry.operation === "critical_event_duplicate_dropped"),
+    ).toBe(true);
+
+    const eventSeq4 = chainedEvent(4, eventHash(eventSeq5));
+    for (let i = 0; i < CASTLE_WALL_WAL_FORK_REANCHOR_THRESHOLD + 1; i += 1) {
+      await expect(
+        consumer.ingestCritical(signedEnvelopeForForkRecovery(eventSeq4)),
+      ).rejects.toThrow(/seq_regression/);
+    }
+    expect(sink.entries.some((entry) => entry.operation === "chain_reanchored")).toBe(false);
+    expect(sink.entries.at(-1)!.details?.reason).toBe("seq_regression");
   });
 });
 
