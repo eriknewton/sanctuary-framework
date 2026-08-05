@@ -36,6 +36,7 @@ import {
   type ExitBundleVerifierResult,
 } from "../contracts/v1.1/exit-bundle-manifest.js";
 import { fromBase64url, stringToBytes } from "../core/encoding.js";
+import { parseKeyDerivationParams } from "../core/key-derivation.js";
 import { hash } from "../core/hashing.js";
 import { canonicalize, canonicalizeToBytes } from "../mesh/canonical-json.js";
 import {
@@ -49,12 +50,57 @@ import {
   readFileCustodyWithStats,
 } from "../storage/custody-fs.js";
 
+/**
+ * What the encrypted_state artifact says about itself, read from the parsed
+ * JSON without trusting any declared type. Deliberately structural: the
+ * verifier must not import `ExitEncryptedStateBundle` from bundle.ts (bundle.ts
+ * already imports this module, and the reverse edge would be an import cycle),
+ * and a verifier that narrows untrusted JSON itself is the right posture anyway.
+ */
+export interface ExitEncryptedStateSummary {
+  /**
+   * How many state entries the artifact carries, or `null` when its `entries`
+   * field is absent or is not an array.
+   *
+   * INVARIANT: `null` is NOT `0`, and collapsing the two is the defect this
+   * field's type exists to prevent. A malformed artifact reported as zero
+   * entries reads to an operator as a benign empty bundle, and the import that
+   * follows dereferences `entries.length` on the same artifact and does not
+   * agree. Absent is not empty; every consumer must branch on it.
+   */
+  entry_count: number | null;
+  namespace_count: number;
+  namespaces: string[];
+  ownership_partitioned: boolean;
+  /**
+   * CONTRACT PIN (server/src/exit/bundle.ts `EXIT_EMPTY_REASONS`): the token
+   * set is owned there; this field carries whatever the artifact declared,
+   * verbatim, so an unknown future token surfaces rather than being erased.
+   */
+  empty_reason?: string;
+  /**
+   * True IFF the artifact carries a READABLE, EMPTY entry list and declares no
+   * `empty_reason`. False when `entry_count` is `null`: an artifact whose
+   * entries cannot be read is a different, louder problem, and reporting a
+   * missing empty-marker for it would name the wrong defect.
+   */
+  empty_reason_missing: boolean;
+  legacy_kdf_params: "absent" | "valid" | "malformed";
+}
+
 export interface ExitBundleDetailedVerifierResult
   extends ExitBundleVerifierResult {
   manifest_path: string;
   manifest_hash: string | null;
   warnings: string[];
   unsupported_artifacts: string[];
+  /**
+   * Additive: what the encrypted_state artifact carries and which credential
+   * re-keys it. Absent when the bundle has no encrypted_state artifact or the
+   * verifier failed before the artifact pass. This is a verifier-local
+   * interface, NOT the frozen `ExitBundleVerifierResult` contract type.
+   */
+  state?: ExitEncryptedStateSummary;
   identity?: {
     signature_valid: boolean;
     identity_id?: string;
@@ -206,6 +252,57 @@ function findPrivateMaterial(value: unknown, path = "$"): string[] {
     findings.push(...findPrivateMaterial(child, `${path}.${key}`));
   }
   return findings;
+}
+
+/**
+ * Summarize a parsed `artifacts/encrypted_state.json`. Pure, total, and
+ * defensive: every field is narrowed from `unknown`, so a hand-crafted or
+ * truncated artifact yields a conservative summary rather than throwing.
+ *
+ * @param artifact - the parsed encrypted_state JSON (already hash-verified
+ *   against the signed manifest by the caller).
+ */
+export function summarizeEncryptedState(
+  artifact: unknown
+): ExitEncryptedStateSummary {
+  const record =
+    artifact !== null && typeof artifact === "object" && !Array.isArray(artifact)
+      ? (artifact as Record<string, unknown>)
+      : {};
+  // INVARIANT: an unreadable `entries` field becomes `null`, never `[]`. The
+  // substitution that reads naturally here - default to an empty array and
+  // report its length - is precisely the absent-as-benign conflation: it turns
+  // a corrupt artifact into a confident "0 entries" for the operator while the
+  // import path, which reads `entries.length` off the same JSON, does something
+  // else entirely.
+  const entries: unknown[] | null = Array.isArray(record.entries)
+    ? record.entries
+    : null;
+  const namespaces = Array.isArray(record.namespaces)
+    ? record.namespaces.filter((n): n is string => typeof n === "string")
+    : [];
+  const emptyReason =
+    typeof record.empty_reason === "string" ? record.empty_reason : undefined;
+
+  // CONTRACT PIN (server/src/core/key-derivation.ts parseKeyDerivationParams):
+  // the same validator the export embed-gate and the import derive-gate use, so
+  // "malformed" here means exactly what makes an import refuse.
+  const legacyKdfParams: ExitEncryptedStateSummary["legacy_kdf_params"] =
+    record.source_key_derivation === undefined
+      ? "absent"
+      : parseKeyDerivationParams(record.source_key_derivation).ok
+        ? "valid"
+        : "malformed";
+
+  return {
+    entry_count: entries === null ? null : entries.length,
+    namespace_count: namespaces.length,
+    namespaces,
+    ownership_partitioned: record.ownership_partitioned === true,
+    ...(emptyReason !== undefined ? { empty_reason: emptyReason } : {}),
+    empty_reason_missing: entries?.length === 0 && emptyReason === undefined,
+    legacy_kdf_params: legacyKdfParams,
+  };
 }
 
 export async function readManifest(bundleDir: string): Promise<ExitBundleManifest> {
@@ -445,6 +542,11 @@ export async function verifyExitBundle(
   let artifactFailure:
     | NonNullable<ExitBundleVerifierResult["failure_class"]>
     | null = null;
+  // Captured from the artifact-hash pass below rather than re-read afterwards:
+  // the loop already parses every artifact for the private-material scan, and a
+  // second read could observe a DIFFERENT file than the one just hash-verified.
+  let encryptedStateJson: unknown;
+  let sawEncryptedState = false;
 
   for (const artifact of body.artifacts) {
     const artifactPath = join(root, artifact.path);
@@ -503,6 +605,10 @@ export async function verifyExitBundle(
 
     try {
       const parsed = JSON.parse(Buffer.from(bytes).toString("utf8"));
+      if (artifact.kind === "encrypted_state") {
+        encryptedStateJson = parsed;
+        sawEncryptedState = true;
+      }
       const privateFindings = findPrivateMaterial(parsed);
       if (privateFindings.length > 0) {
         artifactFailure = "private_material_present";
@@ -521,6 +627,33 @@ export async function verifyExitBundle(
       manifest_hash: sha256Hex(manifestBytes),
       artifact_results: artifactResults,
     };
+  }
+
+  const stateSummary = sawEncryptedState
+    ? summarizeEncryptedState(encryptedStateJson)
+    : undefined;
+  if (stateSummary !== undefined && stateSummary.entry_count === null) {
+    warnings.push(
+      "encrypted state carries no readable entries list (the `entries` field " +
+        "is absent or is not an array): this artifact is signed and " +
+        "hash-verified but structurally damaged, and it is NOT an empty " +
+        "bundle - re-export from the source fortress"
+    );
+  }
+  if (stateSummary?.empty_reason_missing === true) {
+    warnings.push(
+      "encrypted state carries zero entries and no empty_reason marker: " +
+        "exported by a pre-marker (or buggy) exporter; cannot distinguish an " +
+        "empty fortress from a broken export - verify the source fortress " +
+        "before treating this as a complete exit"
+    );
+  }
+  if (stateSummary?.legacy_kdf_params === "malformed") {
+    warnings.push(
+      "encrypted state carries malformed legacy re-key parameters " +
+        "(source_key_derivation): the bundle is signed and intact, but its " +
+        "passphrase re-key path cannot run. Re-export from the source fortress"
+    );
   }
 
   const publicKeysByDid = new Map<string, Uint8Array>();
@@ -673,6 +806,7 @@ export async function verifyExitBundle(
     identity,
     audit,
     reputation,
+    ...(stateSummary !== undefined ? { state: stateSummary } : {}),
     failure_class: detailedFailureClass,
   };
 }

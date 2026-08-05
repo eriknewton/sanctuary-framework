@@ -3,6 +3,8 @@ export {
   importExitBundle,
   exitBundleManifestShape,
   ExitBundleImportError,
+  EXIT_EMPTY_REASONS,
+  type ExitEmptyReason,
   type ExportExitBundleOptions,
   type ExportExitBundleResult,
   type ImportExitBundleOptions,
@@ -20,7 +22,9 @@ export {
   verifyExitBundle,
   readManifest,
   loadExitArtifact,
+  summarizeEncryptedState,
   type ExitBundleDetailedVerifierResult,
+  type ExitEncryptedStateSummary,
   type LoadedExitArtifact,
   type VerifyExitBundleOptions,
 } from "./verifier.js";

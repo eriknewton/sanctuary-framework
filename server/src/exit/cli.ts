@@ -211,6 +211,11 @@ Options:
                                     use the bundle re-key key instead)
   --source-recovery-key <value>     Bundle re-key key (displayed at export) or
                                     legacy source recovery key for state re-key
+  --legacy-source-master            On import, with --source-recovery-key: confirm
+                                    the key is the SOURCE FORTRESS MASTER, not a
+                                    bundle re-key key. Required for bundles with
+                                    no source_custody block; without it the import
+                                    refuses rather than guessing.
   --destination-identity-id <id>    Destination signer for re-keyed state
   --import-state                    Import encrypted state during activation.
                                     Requires --activate and source credentials.
@@ -372,6 +377,23 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
             out,
             `reputation completeness: ${result.reputation.completeness}\n`
           );
+        }
+        // ADDITIVE ONLY: every line above this point is a shipped display
+        // string and stays byte-identical (frozen-surface rule). The state
+        // lines are appended, never interleaved, so an operator script that
+        // greps for `identity:` or `artifacts:` is unaffected.
+        if (result.state) {
+          // `entry_count === null` means the artifact's entries list could not
+          // be read at all. Printing `0` there would be the absent-as-empty
+          // conflation on the operator's screen, so it gets its own token and
+          // a warning (pushed by the verifier) rather than a plausible number.
+          write(
+            out,
+            `state_entries: ${result.state.entry_count ?? "unreadable"}\n`
+          );
+          if (result.state.empty_reason !== undefined) {
+            write(out, `empty_reason: ${result.state.empty_reason}\n`);
+          }
         }
         for (const warning of result.warnings) write(out, `warning: ${warning}\n`);
         for (const item of result.unsupported_artifacts) {
@@ -643,6 +665,18 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
       const forceRebind = hasFlag(argv, "--force-rebind");
       const sourcePassphrase = flagValue(argv, "--source-passphrase");
       const sourceRecoveryKey = flagValue(argv, "--source-recovery-key");
+      // A4: the named confirmation that a recovery key on a bundle WITHOUT a
+      // source_custody block is the source fortress's raw master. Meaningless
+      // on its own, so refuse the shape rather than ignoring the flag.
+      const legacySourceMaster = hasFlag(argv, "--legacy-source-master");
+      if (legacySourceMaster && !sourceRecoveryKey) {
+        write(
+          err,
+          "--legacy-source-master requires --source-recovery-key (it confirms " +
+            "how that key is interpreted)\n",
+        );
+        return 2;
+      }
       if (importState && !activate) {
         write(err, "--import-state requires --activate\n");
         return 2;
@@ -721,6 +755,9 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
             : {}),
           ...(importState && sourceRecoveryKey
             ? { sourceRecoveryKey }
+            : {}),
+          ...(importState && sourceRecoveryKey && legacySourceMaster
+            ? { legacyRecoveryKeyIsMaster: true }
             : {}),
           destinationSignerIdentityId: flagValue(argv, "--destination-identity-id"),
           ...(didWebAllowedHosts.length > 0
