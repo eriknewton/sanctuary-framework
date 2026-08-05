@@ -325,7 +325,10 @@ function verifyRecordSignature(
     // Stated as literals on purpose: this file's STANDALONE PROPERTY (header)
     // forbids importing any Sanctuary server module, so it cannot reference
     // `ED25519_PUBLIC_KEY_BYTES` / `ED25519_SIGNATURE_BYTES` in
-    // `core/crypto-suite-registry.ts`. The values must match those constants;
+    // `core/crypto-suite-registry.ts`. The property is this file plus
+    // `anchor-verify.ts` and `offline-cli.ts` ONLY; the rest of `transparency/`
+    // (`against-log.ts`, `checkpoint.ts`, `emitter.ts`, `signer.ts`) imports
+    // server modules freely. The values must match those constants;
     // `test/structure/key-length-constants.test.ts` asserts that they do.
     if (key.length !== 32) return false;
     const sig = fromBase64url(record.signature);

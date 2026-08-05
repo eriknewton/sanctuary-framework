@@ -31,7 +31,7 @@ import {
 import { generateKeypair } from "../core/identity.js";
 import { randomBytes } from "../core/random.js";
 import {
-  ED25519_PUBLIC_KEY_BYTES,
+  ED25519_PRIVATE_KEY_BYTES,
   ML_DSA_65_SECRET_KEY_BYTES,
 } from "../core/crypto-suite-registry.js";
 import { CAP_STANDARD_FORTRESS_NODE, type NodeMode } from "./constants.js";
@@ -476,6 +476,8 @@ export function mintFederationTrustRootRecord(params: {
   const master = generateFortressMaster();
   const principal = generateKeypair();
   const node = generateKeypair();
+  // 32 = a 256-bit symmetric HKDF source (see the `master_secret` field note
+  // above); deliberately NOT the Ed25519 master key, so no `ED25519_*` applies.
   const masterSecret = randomBytes(32);
   try {
     const fortressId = master.public.fortress_id;
@@ -561,7 +563,7 @@ function encodeHybridPrivateKeys(
 ): PersistedHybridPrivateKeyMaterial {
   assertExactLength(
     keys.ed25519.private_key,
-    ED25519_PUBLIC_KEY_BYTES,
+    ED25519_PRIVATE_KEY_BYTES,
     "hybrid ed25519 private_key",
   );
   assertExactLength(
@@ -668,7 +670,7 @@ function decodeHybridPrivateKeys(
   try {
     ed25519PrivateKey = decodeKeyExact(
       readString(ed, "private_key"),
-      ED25519_PUBLIC_KEY_BYTES,
+      ED25519_PRIVATE_KEY_BYTES,
       `${where}.ed25519.private_key`,
     );
     mlDsa65SecretKey = decodeKeyExact(
@@ -949,7 +951,7 @@ function assertHybridPrivateDerivesPublic(
   }
   assertExactLength(
     privateKeys.ed25519.private_key,
-    ED25519_PUBLIC_KEY_BYTES,
+    ED25519_PRIVATE_KEY_BYTES,
     `${label} ed25519 private_key`,
   );
   assertExactLength(
@@ -986,12 +988,17 @@ function assertHybridPrivateDerivesPublic(
 }
 
 /**
- * 32 is correct for EVERY key this store holds, but for two different reasons:
- * `master_secret` is a 256-bit symmetric secret, while `master_private_key` and
- * `local_node_private_key` are 32-byte Ed25519 seeds (RFC 8032 §5.1.5). Because
- * the helper is label-driven and spans both families, it deliberately keeps the
- * literal instead of naming one of them: `ED25519_PRIVATE_KEY_BYTES` would be a
- * false label on the `master_secret` call site in `validateRecord`.
+ * SCOPE: the values routed through THIS helper, not every key the store holds.
+ * The store also holds ML-DSA-65 secret keys, which are 4032 bytes and are
+ * checked against `ML_DSA_65_SECRET_KEY_BYTES` elsewhere in this file.
+ *
+ * Of the values that do reach here, 32 is correct for two different reasons:
+ * `master_secret` is a 256-bit symmetric secret, while `master_private_key`,
+ * `issuing_principal_private_key`, and `local_node_private_key` are 32-byte
+ * Ed25519 seeds (RFC 8032 §5.1.5). Because the helper is label-driven and spans
+ * both families it keeps the literal instead of naming one of them:
+ * `ED25519_PRIVATE_KEY_BYTES` would be a false label on the `master_secret`
+ * call site in `validateRecord`.
  */
 function assertKeyLength(value: Uint8Array, label: string): void {
   if (value.length !== 32) {

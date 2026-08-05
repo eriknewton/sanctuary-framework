@@ -6,35 +6,62 @@
  * the AES-256 key size, the SHA-256 digest size, the handshake nonce width, and
  * the symmetric fortress master-key size, and `64` is ALSO the legacy
  * `seed || public_key` private-key layout AND the hex character count of a
- * SHA-256 digest. A reader cannot tell which meaning a literal carries, and a
- * mechanical "replace 32 with the key constant" sweep silently mislabels the
- * ones that are not key lengths.
+ * SHA-256 digest. A reader cannot tell which meaning a literal carries.
  *
- * PR-4 named the widths at every site that genuinely IS an Ed25519 key or
- * signature length. This test is the durability layer for that work. It makes
- * two assertions:
+ * There are TWO ways to get this wrong, and they are not equally easy to catch:
+ *
+ *   A. a bare literal survives, so the site still says nothing; and
+ *   B. a NAMED constant is used against the wrong key class, e.g. checking an
+ *      Ed25519 PRIVATE key against `ED25519_PUBLIC_KEY_BYTES`. Both are 32, so
+ *      it compiles, passes every test, and reads as intentional.
+ *
+ * B is the dangerous one and it is what this suite exists for. It was not
+ * hypothetical: the first draft of PR-4 fixed that exact shape in
+ * `mesh/trust-root-hybrid.ts` and `v1/federation-revocation.ts` and left three
+ * live instances in `mesh/federation-trust-root-store.ts`, in a file the same
+ * PR edited. An earlier version of THIS file scanned only bare literals in a
+ * hand-listed file set and would have stayed green through all three.
+ *
+ * So the suite now has four parts:
  *
  *   1. RECONCILIATION: the byte-width constants that must agree across files
- *      actually do. `core/identity.ts` and the standalone offline verifiers
- *      cannot import `core/crypto-suite-registry.ts` (identity.ts because the
- *      registry imports IT, so the reverse edge would close a dependency cycle;
- *      the verifiers because their documented standalone property forbids any
- *      Sanctuary server import). Those files therefore carry literals with a
- *      "must match" pin comment, and this check is what gives the pin teeth.
+ *      that cannot import each other actually do.
+ *   2. WRONG-CONSTANT SCAN (the B case): over ALL of `server/src`, every use of
+ *      an Ed25519 width constant is paired with its subject expression, and the
+ *      constant's key class must match the subject's. See LIMITATIONS below for
+ *      exactly what this does and does not reach.
+ *   3. NO BARE LITERAL (the A case): the files PR-4 converted contain no
+ *      bare-literal Ed25519 length comparison.
+ *   4. SELF-CHECK: both scanners are fed known-bad and known-good fixtures, so
+ *      neither can pass vacuously if a regex breaks.
  *
- *   2. NO REGRESSION: the files PR-4 converted contain no bare-literal Ed25519
- *      key or signature length comparison. A new `pubkey.length !== 32` in any
- *      of them reds here, which is how the convention survives the next editor.
+ * LIMITATIONS of the wrong-constant scan, stated plainly so nobody reads more
+ * coverage into it than it has:
  *
- * Failure mode when this reds: the message names the file and the offending
- * line. The fix is to import the named constant, NOT to add the file to an
- * exclusion list. If a genuinely new 32-or-64-byte value appears that is not an
- * Ed25519 width (say another symmetric key), give it its own named constant or
- * an inline derivation comment and it will not match the patterns below.
+ *   - It pairs a constant with the nearest preceding subject token inside the
+ *     same statement or argument list. It does NOT parse TypeScript.
+ *   - It can only classify a subject whose IDENTIFIER names its key class
+ *     (`publicKey`, `private_key`, `seed`, `signature`, `sig`, `...Pub`). At the
+ *     time of writing it classifies 67 of 100 use sites; the other 33 are
+ *     generically named (`bytes`, `key`, `value`, `raw`) and are NOT checked.
+ *     A wrong constant against a generically named variable will not be caught.
+ *   - It does not follow a value through an assignment, a parameter, or a
+ *     helper call. `assertKeyLength(value, label)` style helpers are opaque to
+ *     it by construction.
+ *   - `ED25519_LEGACY_SEED_AND_PUBKEY_BYTES` is deliberately exempt: it names a
+ *     concatenation of both classes, so no single subject class is correct.
+ *
+ * The floor assertions in part 2 exist so those limits cannot quietly widen: if
+ * a refactor breaks the scan, the site count or the classified count drops and
+ * the suite reds instead of reporting a vacuous zero violations.
+ *
+ * When this reds: the message names file, line, subject class, and constant.
+ * The fix is to use the right constant, NOT to rename the variable so the
+ * scanner stops classifying it.
  */
 
 import { describe, it, expect } from "vitest";
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -55,22 +82,140 @@ function declaredInt(source: string, name: string): number | null {
   return m ? Number(m[1]) : null;
 }
 
+function tsFilesUnder(dir: string, out: string[] = []): string[] {
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const p = join(dir, entry.name);
+    if (entry.isDirectory()) tsFilesUnder(p, out);
+    else if (entry.name.endsWith(".ts")) out.push(p);
+  }
+  return out;
+}
+
+// ── The wrong-constant scanner ──────────────────────────────────────────
+
+type KeyClass = "public" | "private" | "signature";
+
+const CLASS_OF_CONSTANT: Record<string, KeyClass> = {
+  ED25519_PUBLIC_KEY_BYTES: "public",
+  ED25519_PRIVATE_KEY_BYTES: "private",
+  ED25519_SIGNATURE_BYTES: "signature",
+};
+
 /**
- * A comparison of some *.length against a bare 32 or 64.
- *
- * Deliberately narrow: it only matches when the compared expression's name
- * looks like Ed25519 key or signature material, so the many legitimate 32s
- * (symmetric keys, digests, nonces) do not produce false reds. Verifying that
- * this pattern actually fires is the job of the self-check test below; a
- * regex guard that cannot match anything is a guard that never protects.
+ * Identifier shapes that reveal what class of material a subject holds. All are
+ * applied case-insensitively, so `publicKey`, `public_key`, and `pub` all
+ * classify; that is what lets the scan reach camelCase and snake_case sites in
+ * the same pass.
+ */
+const SUBJECT_TOKENS: ReadonlyArray<readonly [RegExp, KeyClass]> = [
+  [/public_?key|pubkey|pub\b/, "public"],
+  [/private_?key|secret_?key|seed|priv\b/, "private"],
+  [/signature|(^|[^a-z])sig([^a-z]|$)/, "signature"],
+];
+
+/**
+ * Statement / argument boundaries. A CLOSING paren is deliberately NOT a
+ * boundary: in `decodeKeyExact(readString(ed, "private_key"), CONST, ...)` the
+ * subject sits inside a nested call that has already closed, and treating `)`
+ * as a boundary hides exactly that shape. This was measured, not guessed: with
+ * `)` included, 2 of the 3 known-bad sites were caught; without it, 3 of 3.
+ */
+const BOUNDARY = /[;{}(]|\|\||&&/g;
+
+/** Blank out comments, preserving offsets so line numbers stay correct. */
+function stripComments(src: string): string {
+  return src
+    .replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, " "))
+    .replace(/\/\/[^\n]*/g, (m) => " ".repeat(m.length));
+}
+
+function classifySubject(text: string): KeyClass | null {
+  let best: KeyClass | null = null;
+  let bestIdx = -1;
+  for (const [re, cls] of SUBJECT_TOKENS) {
+    const g = new RegExp(re.source, "gi");
+    let m: RegExpExecArray | null;
+    let last: RegExpExecArray | null = null;
+    while ((m = g.exec(text)) !== null) last = m;
+    if (last && last.index > bestIdx) {
+      bestIdx = last.index;
+      best = cls;
+    }
+  }
+  return best;
+}
+
+interface UseSite {
+  rel: string;
+  line: number;
+  constant: string;
+  expected: KeyClass;
+  subject: KeyClass | null;
+  text: string;
+}
+
+function scanUseSites(
+  sources: ReadonlyArray<{ rel: string; text: string }>,
+): UseSite[] {
+  const sites: UseSite[] = [];
+  for (const { rel, text: raw } of sources) {
+    const src = stripComments(raw);
+    for (const [constant, expected] of Object.entries(CLASS_OF_CONSTANT)) {
+      const g = new RegExp(`\\b${constant}\\b`, "g");
+      let m: RegExpExecArray | null;
+      while ((m = g.exec(src)) !== null) {
+        const lineStart = src.lastIndexOf("\n", m.index) + 1;
+        const nl = src.indexOf("\n", m.index);
+        const lineText = src.slice(lineStart, nl === -1 ? src.length : nl);
+        // Skip the declaration itself and any import statement.
+        if (/^\s*(export\s+)?const\s/.test(lineText)) continue;
+        if (/^\s*import\b|^\s*\}\s*from\b/.test(lineText)) continue;
+        const before = src.slice(Math.max(0, m.index - 400), m.index);
+        if (before.lastIndexOf("import {") > before.lastIndexOf("} from")) continue;
+
+        const head = src.slice(0, m.index);
+        let cut = 0;
+        BOUNDARY.lastIndex = 0;
+        let b: RegExpExecArray | null;
+        while ((b = BOUNDARY.exec(head)) !== null) cut = b.index + b[0].length;
+        // A CONSTANT name is never the subject; strip SCREAMING_CASE first.
+        const window = head.slice(cut).replace(/\b[A-Z][A-Z0-9_]{2,}\b/g, " ");
+        sites.push({
+          rel,
+          line: src.slice(0, m.index).split("\n").length,
+          constant,
+          expected,
+          subject: classifySubject(window),
+          text: lineText.trim(),
+        });
+      }
+    }
+  }
+  return sites;
+}
+
+function serverSrcSources(): Array<{ rel: string; text: string }> {
+  return tsFilesUnder(SERVER_SRC).map((abs) => ({
+    rel: abs.slice(SERVER_SRC.length + 1),
+    text: readFileSync(abs, "utf8"),
+  }));
+}
+
+// ── The bare-literal scanner ────────────────────────────────────────────
+
+/**
+ * A comparison of some *.length against a bare 32 or 64, narrowed to subjects
+ * whose names look like Ed25519 material so the many legitimate 32s (symmetric
+ * keys, digests, nonces) do not red.
  */
 const BARE_ED25519_LENGTH =
   /\b(?:[A-Za-z_$][\w$]*)?(?:[Pp]ub(?:lic)?[Kk]ey|[Pp]ubkey|[Pp]rivate[Kk]ey|[Ss]ignature|[Ss]ig|[Ss]eed)\w*\.length\s*(?:!==|===|!=|==)\s*(?:32|64)\b/;
 
 /**
- * The files PR-4 converted to named constants. Listed explicitly rather than
- * globbed: a glob would silently start covering (or stop covering) files as the
- * tree moves, and the point of this list is that it is a reviewed decision.
+ * The files PR-4 converted. Listed explicitly rather than globbed: a glob would
+ * silently start or stop covering files as the tree moves, and the point of
+ * this list is that it is a reviewed decision. Note this list bounds part 3
+ * ONLY; part 2 scans all of `server/src`.
  */
 const CONVERTED_FILES = [
   "agent-contract/identity-bind.ts",
@@ -91,6 +236,7 @@ const CONVERTED_FILES = [
   "entitlement/token.ts",
   "mesh/federation-joiner-trust-root-store.ts",
   "mesh/federation-rotate-root.ts",
+  "mesh/federation-trust-root-store.ts",
   "mesh/guardian/guardian-roster.ts",
   "mesh/libp2p-transport/peer-id.ts",
   "mesh/lifecycle/node-key-binding.ts",
@@ -107,6 +253,20 @@ const CONVERTED_FILES = [
   "v1/session-service.ts",
   "workload-lifecycle/host-attestation.ts",
   "workload-lifecycle/undeclared-finding.ts",
+];
+
+/**
+ * The standalone offline verifier subset: these three files import only each
+ * other, `@noble/*`, and `node:` builtins, so a third party can compile and run
+ * them without a Sanctuary server. This is NOT a property of `transparency/` at
+ * large: `against-log.ts`, `checkpoint.ts`, `emitter.ts`, and `signer.ts` all
+ * import server modules. Scoping this list correctly matters because the
+ * "cannot import" claim is what justifies their bare literals.
+ */
+const STANDALONE_VERIFIER_SUBSET = [
+  "transparency/verify.ts",
+  "transparency/anchor-verify.ts",
+  "transparency/offline-cli.ts",
 ];
 
 describe("Ed25519 byte-width constants", () => {
@@ -171,31 +331,151 @@ describe("Ed25519 byte-width constants", () => {
     expect(declaredInt(registry, "ED25519_SIGNATURE_BYTES")).toBe(64);
   });
 
-  it("keeps the standalone offline verifier's literals equal to the registry", () => {
-    // transparency/verify.ts documents a STANDALONE PROPERTY: it imports only
-    // @noble and Node builtins so a third party can compile it alone. Verified
-    // against its real import list below, not against its header prose.
-    const verify = read("transparency/verify.ts");
-    const imports = [...verify.matchAll(/^import[\s\S]*?from\s+["']([^"']+)["'];/gm)].map(
-      (m) => m[1]!,
-    );
-    const sanctuaryImports = imports.filter(
-      (spec) => spec.startsWith(".") || spec.startsWith("/"),
-    );
-    expect(sanctuaryImports).toEqual([]);
+  it("keeps the standalone verifier SUBSET self-contained and equal to the registry", () => {
+    // Derived from the real import list of each file, never from header prose.
+    // The subset's closure may reach only itself, @noble, and node: builtins.
+    for (const rel of STANDALONE_VERIFIER_SUBSET) {
+      const specs = [
+        ...read(rel).matchAll(/^import[\s\S]*?from\s+["']([^"']+)["'];/gm),
+      ].map((m) => m[1]!);
+      for (const spec of specs) {
+        if (spec.startsWith(".")) {
+          const resolved = `transparency/${spec
+            .replace(/^\.\//, "")
+            .replace(/\.js$/, ".ts")}`;
+          expect(
+            STANDALONE_VERIFIER_SUBSET,
+            `${rel} imports ${spec}, which is outside the standalone subset`,
+          ).toContain(resolved);
+        } else {
+          expect(
+            spec.startsWith("@noble/") || spec.startsWith("node:"),
+            `${rel} imports ${spec}, which is neither @noble nor a node: builtin`,
+          ).toBe(true);
+        }
+      }
+    }
 
-    // Its two literals must equal the registry's named widths.
-    expect(verify).toContain("if (key.length !== 32) return false;");
-    expect(verify).toContain("if (sig.length !== 64) return false;");
+    // ...and the claim is scoped: the rest of transparency/ is NOT standalone,
+    // so a future edit cannot widen the wording and stay green.
+    expect(read("transparency/against-log.ts")).toMatch(
+      /^import .*from "\.\.\/audit\/chain\.js";$/m,
+    );
+
+    expect(read("transparency/verify.ts")).toContain(
+      "if (key.length !== 32) return false;",
+    );
+    expect(read("transparency/verify.ts")).toContain(
+      "if (sig.length !== 64) return false;",
+    );
     expect(declaredInt(registry, "ED25519_PUBLIC_KEY_BYTES")).toBe(32);
     expect(declaredInt(registry, "ED25519_SIGNATURE_BYTES")).toBe(64);
   });
 });
 
+describe("no Ed25519 width constant used against the wrong key class", () => {
+  const sites = scanUseSites(serverSrcSources());
+
+  it("fires on the exact shape that shipped past the previous guard (self-check)", () => {
+    // The real instances found in mesh/federation-trust-root-store.ts,
+    // reproduced verbatim, including the nested-call form that a closing-paren
+    // boundary would have hidden.
+    const knownBad = [
+      {
+        rel: "fixture-a.ts",
+        text: [
+          "assertExactLength(",
+          "  keys.ed25519.private_key,",
+          "  ED25519_PUBLIC_KEY_BYTES,",
+          '  "hybrid ed25519 private_key",',
+          ");",
+        ].join("\n"),
+      },
+      {
+        rel: "fixture-b.ts",
+        text: [
+          "ed25519PrivateKey = decodeKeyExact(",
+          '  readString(ed, "private_key"),',
+          "  ED25519_PUBLIC_KEY_BYTES,",
+          "  `${where}.ed25519.private_key`,",
+          ");",
+        ].join("\n"),
+      },
+      {
+        rel: "fixture-c.ts",
+        text: "if (params.signer.publicKey.length !== ED25519_SIGNATURE_BYTES) {",
+      },
+      {
+        rel: "fixture-d.ts",
+        text: "if (signature.length !== ED25519_PUBLIC_KEY_BYTES) return false;",
+      },
+    ];
+    const caught = scanUseSites(knownBad).filter(
+      (s) => s.subject !== null && s.subject !== s.expected,
+    );
+    expect(caught.map((s) => s.rel).sort()).toEqual([
+      "fixture-a.ts",
+      "fixture-b.ts",
+      "fixture-c.ts",
+      "fixture-d.ts",
+    ]);
+  });
+
+  it("stays quiet on correct pairings (self-check)", () => {
+    const knownGood = [
+      {
+        rel: "ok-a.ts",
+        text: [
+          "assertExactLength(",
+          "  keys.ed25519.private_key,",
+          "  ED25519_PRIVATE_KEY_BYTES,",
+          ");",
+        ].join("\n"),
+      },
+      {
+        rel: "ok-b.ts",
+        text:
+          "if (nodePubkey.length !== ED25519_PUBLIC_KEY_BYTES || signature.length !== ED25519_SIGNATURE_BYTES) {",
+      },
+      {
+        rel: "ok-c.ts",
+        text: "if (seed.length !== ED25519_PRIVATE_KEY_BYTES) {",
+      },
+      {
+        rel: "ok-d.ts",
+        // The legacy layout is exempt by construction: its own name is stripped
+        // before classification and it is not in CLASS_OF_CONSTANT.
+        text: "if (privateKey.length === ED25519_LEGACY_SEED_AND_PUBKEY_BYTES) {",
+      },
+    ];
+    const caught = scanUseSites(knownGood).filter(
+      (s) => s.subject !== null && s.subject !== s.expected,
+    );
+    expect(caught).toEqual([]);
+  });
+
+  it("still reaches the tree (anti-vacuity floor)", () => {
+    // A zero-violation result means nothing if the scan went blind. These floors
+    // are what make the green in the next test positive evidence rather than
+    // absence of evidence. Raise them when the tree grows; never lower them to
+    // silence a red.
+    expect(sites.length).toBeGreaterThanOrEqual(90);
+    expect(sites.filter((s) => s.subject !== null).length).toBeGreaterThanOrEqual(60);
+  });
+
+  it("pairs every classifiable use site with the matching key class", () => {
+    const violations = sites
+      .filter((s) => s.subject !== null && s.subject !== s.expected)
+      .map(
+        (s) =>
+          `${s.rel}:${s.line} subject=${s.subject} constant=${s.constant} :: ${s.text}`,
+      );
+    expect(violations).toEqual([]);
+  });
+});
+
 describe("no bare Ed25519 length literals in the converted files", () => {
   it("the scan pattern actually matches a bare literal (self-check)", () => {
-    // Mutation-proofs the guard itself: if the regex is broken, this fails
-    // before the real assertion can pass vacuously.
     expect(BARE_ED25519_LENGTH.test("if (publicKey.length !== 32) {")).toBe(true);
     expect(BARE_ED25519_LENGTH.test("if (signature.length !== 64) {")).toBe(true);
     expect(BARE_ED25519_LENGTH.test("if (nodePubkey.length !== 32) {")).toBe(true);
