@@ -161,9 +161,16 @@ Out of scope for v0.1:
        --destination-identity-id "$DESTINATION_SIGNER_ID"
      ```
 
-   Start with `--source-recovery-key` whenever you have a key to supply. If the
-   bundle turns out to be legacy, the CLI says so and you fall back to the form
-   above. Do not try to decide this by reading fields out of
+   Start with `--source-recovery-key` whenever you have a key to supply, and let
+   the possession rule above decide the rest. Do not expect the recovery-key path
+   to announce a legacy bundle: when the bundle carries no re-key material, that
+   path falls through to pre-envelope semantics and treats whatever you supplied
+   AS the source master key, with no error and no warning. Your first signal is a
+   downstream `SOURCE_KEY_MISMATCH` after every entry fails to decrypt, which
+   names the symptom and never the cause. The loud message runs the other way:
+   reach for `--source-passphrase` against an envelope bundle and the import
+   refuses with `SOURCE_PASSPHRASE_UNSUPPORTED`, naming the flag you actually
+   want. Do not try to decide this by reading fields out of
    `artifacts/encrypted_state.json`: the file has no field that reliably answers
    the question, and guessing wrong sends you down the passphrase path with the
    source host possibly already decommissioned.
