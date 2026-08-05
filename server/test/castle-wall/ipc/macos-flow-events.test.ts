@@ -1095,6 +1095,7 @@ describe("MacOSFlowEventConsumer : extension diagnostics", () => {
           cw_chain_basis: "producer_signed_body",
           cw_evidence_basis: "producer_signed",
           cw_producer_subject_binding: "signed_identity_id",
+          cw_chain_prior_unconsumed: true,
         },
       },
     };
@@ -1116,6 +1117,7 @@ describe("MacOSFlowEventConsumer : extension diagnostics", () => {
       "cw_chain_basis",
       "cw_evidence_basis",
       "cw_producer_subject_binding",
+      "cw_chain_prior_unconsumed",
     ]) {
       expect(details).not.toHaveProperty(key);
     }
