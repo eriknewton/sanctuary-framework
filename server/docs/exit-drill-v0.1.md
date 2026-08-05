@@ -37,19 +37,39 @@ Out of scope for v0.1:
 1. On the source machine, confirm the current tenant:
 
    ```bash
-   sanctuary agents
+   sanctuary agents list
    ```
 
-2. Export the complete exit bundle through the approved Tier 1 flow:
+   Failure mode: the subcommand is required. Bare `sanctuary agents` prints the
+   usage block and exits 0, which in a scripted drill scrolls past as a screenful
+   of successful-looking output while confirming nothing. Expect a table with a
+   `NAME` header and one row per tenant.
+
+2. Export the complete exit bundle through the approved Tier 1 flow. Name every
+   state namespace you intend to carry across:
 
    ```bash
-   sanctuary exit export --out ./sanctuary-exit-bundle
+   sanctuary exit export --out ./sanctuary-exit-bundle \
+     --state-namespace <namespace> [--state-namespace <namespace> ...]
    ```
 
    Acceptance: the export requires human approval and produces a
    `SANCTUARY_EXIT_BUNDLE_V1` directory containing public identity, encrypted
    state, policy, audit receipts, reputation bundle, commitments,
-   placeholder-vault metadata, artifact hashes, and a signed manifest.
+   placeholder-vault metadata, artifact hashes, and a signed manifest. When
+   state is exported it also prints a one-time **BUNDLE RE-KEY KEY** on the
+   terminal. That key is the credential step 6 needs, it is never written into
+   the bundle, and it is displayed exactly once. Capture it now.
+
+   Failure mode: `--state-namespace` is not optional in practice. With the flag
+   omitted the export still succeeds, still writes `artifacts/encrypted_state.json`,
+   and still reports a signed manifest, but that artifact comes back
+   `"namespaces": [], "total_keys": 0` and no re-key key is printed. Verified by
+   differential run against one fortress holding one namespace: with the flag,
+   `namespaces: ["memories"], total_keys: 1` plus a re-key key; without it, zero
+   and silence. From the outside the two exports look alike, and the gap only
+   surfaces at step 6 when there is nothing to import. Confirm `total_keys` in
+   `artifacts/encrypted_state.json` before you move the bundle anywhere.
 
 3. Verify the bundle before moving or importing it:
 
@@ -64,44 +84,92 @@ Out of scope for v0.1:
 
 4. Move the exported bundle to the destination machine through operator-approved storage.
 
+   Failure mode: the bundle's state entries are encrypted, but the bundle as a
+   whole is a plaintext directory. Public identity material, the policy set,
+   audit receipts, commitments, and namespace names all travel readable. Anything
+   that touches the bundle in transit sees them: a cloud drive, a chat upload, an
+   emailed archive, a shared `/tmp`, a backup agent watching the directory. The
+   failure is silent by nature, since a successful copy and a copied-and-read
+   copy look identical afterward. Move it over an encrypted channel to a path only
+   the destination operator can read, and delete the intermediate copies once
+   step 6 passes. Carry the re-key key from step 2 separately from the bundle;
+   putting both in the same transfer defeats the reason it was never written into
+   the bundle.
+
 5. Install or update Sanctuary on the destination machine:
 
    ```bash
-   npm install -g @sanctuary-framework/mcp-server@next
+   npm install -g @sanctuary-framework/mcp-server@<exact-version>
    ```
+
+   Failure mode: pin the version. `@next` and other floating tags resolve at the
+   moment the command runs, so a drill run on Tuesday and a rerun on Thursday can
+   install different builds, and the source and destination machines in the same
+   drill can end up on different ones. Nothing in the run announces that: the
+   command prints a successful install either way, and the drill's evidence then
+   records a result that no one can reproduce, because "it passed on `@next`" does
+   not name a build. Record the exact version on both machines as part of the drill
+   evidence, and prefer the version that produced the bundle.
 
 6. Import and activate the verified bundle on the destination tenant.
 
-   Set the source passphrase with a silent prompt so it is never typed into the
-   command line itself (a literal passphrase on the command line would be
-   recorded in shell history):
+   The credential that re-keys the state is the **bundle re-key key** printed by
+   the export in step 2, supplied as `--source-recovery-key`. Read it in with a
+   silent prompt so it is never typed into the command line itself (a literal
+   credential on the command line would be recorded in shell history):
 
    ```bash
-   read -s SOURCE_SANCTUARY_PASSPHRASE
+   read -s BUNDLE_REKEY_KEY
    ```
 
    ```bash
    sanctuary exit import ./sanctuary-exit-bundle \
      --activate \
      --import-state \
-     --source-passphrase "$SOURCE_SANCTUARY_PASSPHRASE" \
+     --source-recovery-key "$BUNDLE_REKEY_KEY" \
      --destination-identity-id "$DESTINATION_SIGNER_ID"
    ```
 
-   `--import-state` is required: the CLI rejects `--source-passphrase` without
-   it (exit code 2), because the source credentials exist only to decrypt the
-   exported state. If you omit it, the import fails closed with that message
+   `--source-passphrase` is the **legacy-bundle** path and does not work here. A
+   bundle exported from an envelope-custody fortress (any fortress a current
+   Sanctuary creates) deliberately carries no passphrase-checkable material, so
+   that there is no offline guessing oracle inside a bundle that travels. Supply a
+   passphrase against such a bundle and the import fails closed with
+   `SOURCE_PASSPHRASE_UNSUPPORTED`, pointing you at the re-key key. Reach for
+   `--source-passphrase` only when the source fortress predates envelope custody.
+
+   `--import-state` is required: the CLI rejects the source-credential flags
+   without it (exit code 2), because the source credentials exist only to decrypt
+   the exported state. If you omit it, the import fails closed with that message
    before touching anything.
 
-   Known exposure, accepted for v0.1: the CLI takes the source passphrase only
-   as a command-line flag, so the expanded value is visible in the process list
+   Known exposure, accepted for v0.1: the CLI takes the source credential only as
+   a command-line flag, so the expanded value is visible in the process list
    (`ps`) for the duration of the import, to other processes on the same host.
    The `read -s` step keeps it out of shell history but cannot close the `ps`
    window. Run the import on a host with no untrusted local users or agent
    processes, which a fortress migration target should be anyway. (CLI
-   follow-up filed: accept the source passphrase from an environment variable
+   follow-up filed: accept the source credential from an environment variable
    or stdin, as `SANCTUARY_PASSPHRASE` already is for the destination
    fortress.)
+
+   Failure mode, and the one worth rehearsing: **a clean-looking import that moved
+   no state.** The command's exit code and its `verdict:` line report whether the
+   *bundle* verified, not whether state landed. The state outcome is a separate
+   line, `state_status:`, and three of its four values mean nothing was imported:
+
+   | `state_status` | What happened | Trigger |
+   |---|---|---|
+   | `rekeyed` | state was re-keyed under the destination master | the good case; check `state_imported_keys` |
+   | `not_requested` | the bundle carried no state entries | `--state-namespace` omitted at export (step 2), or `--import-state` omitted here |
+   | `staged_requires_source_key` | entries arrived and stayed encrypted | `--import-state` omitted, so no source credential reached the re-key step |
+   | `skipped_no_destination_signer` | every entry skipped for want of a signer | `--destination-identity-id` omitted and the destination has no default identity |
+
+   A credential that is present but wrong is the safe case: it fails closed and
+   loudly, with `SOURCE_CREDENTIAL_INVALID`. Only the `not_requested` case prints a
+   loud multi-line warning. The other two appear as one line in a block of
+   counters, under `verdict: PASS`, at exit code 0. Read `state_status` and
+   `state_imported_keys` on every run and record both in the drill evidence.
 
    Acceptance: import verifies the bundle before activation, reports conflicts,
    imports reputation attestations that verify against included public identity
@@ -122,6 +190,21 @@ Out of scope for v0.1:
     - Recent audit continuity is visible.
     - Reputation evidence is visible or marked as pending verification.
     - Source platform is not required for the destination agent to operate.
+
+   Read "recent audit continuity" strictly. The dashboard renders the destination
+   fortress's own audit log, and imported receipts are staged under
+   `_exit_audit_receipts` rather than replayed into `_audit`, so what you are
+   looking at is the destination's short post-import history and not the source's
+   record. A screen that fills up after the migration is evidence the destination
+   is live, and it is not evidence that the source history came across. That
+   archive-only boundary is a stated gap below, not a defect to chase.
+
+   Failure mode after a successful import: the staged `_exit_*` namespaces are
+   left in place on purpose, for inspection, and **master rotation refuses to run
+   while any of them holds entries.** Rotation preflight rejects them by name
+   (they are a named unsupported subsystem, not a silent skip), so the first
+   symptom is a rotation attempt that aborts on a fortress the operator believes
+   is finished migrating. Export or clear the staged namespaces, then rotate.
 
 ## Pass Criteria
 
