@@ -113,29 +113,14 @@ runs:
         fi
         secret-tool clear service smoke-svc account smoke-acct
 
-        # Mint the run-specific disposable-keyring proof, AFTER the smoke test
-        # showed this action's own backend is the one answering on the bus.
-        # Single script, shared with
-        # .github/workflows/keychain-linux-real-backend.yml, so the two
-        # provisioning sites cannot drift apart. It stores a fresh nonce INTO
-        # this keyring and records it next to the live bus address;
-        # server/test/support/real-backend-guard.ts reads the nonce back through
-        # secret-tool and refuses to take the in-memory credential store off
-        # unless it matches. The old value here was a literal "1", which a
-        # developer's stale shell export satisfied just as well.
+        # NOTE: nothing here declares the keyring "disposable" any more.
+        # server/test/support/real-backend-guard.ts decides that from
+        # GITHUB_ACTIONS, because an ephemeral GitHub-hosted runner is disposable
+        # by construction, and three attempts to prove disposability from a
+        # provisioned token each shipped a proof weaker than the claim (a bare
+        # env var; a nonce round trip that only showed the service answered; a
+        # socket-path shape a developer's own dbus-launch produces too).
         #
-        # Failure mode: the script exits non-zero on every problem rather than
-        # emitting a weaker token, because a missing declaration errors nothing
-        # on its own. The integration file simply skips, the suite stays green,
-        # and the loss shows up only as a lower passing count that the
-        # exact-match floor in .github/workflows/test-baseline-guard.yml
-        # rejects.
-        # A bare assignment, deliberately. `export VAR="$(cmd)"` takes its exit
-        # status from `export`, not from cmd, so `set -e` does NOT abort when
-        # the provisioning fails: you get an empty token and a job that carries
-        # on to run a suite that skips everything. That is exactly what happened
-        # in the copy of this setup that used to live inline in
-        # keychain-linux-real-backend.yml. A plain `var="$(cmd)"` propagates
-        # cmd's status, so a failure stops the job here, where the error is.
-        token_path="$("${GITHUB_WORKSPACE}/scripts/ci/provision-disposable-keyring.sh")"
-        echo "SANCTUARY_TEST_DISPOSABLE_KEYRING=$token_path" >> "$GITHUB_ENV"
+        # Failure mode: if the smoke test above passes but the suite still runs
+        # zero real-backend cases, read the suite's own printed skip reason. It
+        # says which condition failed.

@@ -33,14 +33,14 @@
  * built to prevent, so this file removes the store for its own duration
  * (`beforeAll`) and puts it back (`afterAll`).
  *
- * Removing the store is safe ONLY against a throwaway keyring, so the
- * skip guard below additionally requires PROOF that the keyring on this
- * host was provisioned by this CI run: a nonce that round-trips through
- * the Secret Service on this exact bus. On a developer's Linux desktop
- * `secret-tool` and a session bus are both present, and without that
- * fourth condition this file would shell out to their personal keyring.
- * The predicate lives in `test/support/real-backend-guard.ts` so its
- * truth table can be tested directly rather than asserted about.
+ * Removing the store is safe ONLY against a keyring nobody owns, so this
+ * file is CI-ONLY. On a developer's Linux desktop `secret-tool` and a
+ * session bus are both present, and their keyring is real, so the suite
+ * skips there unconditionally. Three earlier attempts to PROVE a keyring
+ * disposable from inside the test each shipped a proof weaker than its
+ * claim; `test/support/real-backend-guard.ts` records what the current
+ * gate does and does not establish, and holds the predicate as a
+ * callable so its truth table can be tested directly.
  */
 
 import { describe, it, expect, beforeAll, beforeEach, afterAll, afterEach } from "vitest";
@@ -58,7 +58,7 @@ import {
   OS_KEYRING_LOCATION_LINUX,
 } from "../src/wrap/passphrase.js";
 import {
-  probeDisposableKeyring,
+  probeDisposableCiRunnerFromEnv,
   shouldSkipRealBackend,
   enterRealBackendMode,
   leaveRealBackendMode,
@@ -80,21 +80,13 @@ const hasSecretTool = (() => {
 
 const hasDbus = !!process.env.DBUS_SESSION_BUS_ADDRESS;
 
-/**
- * Only probe the keyring when the cheap conditions already hold: the probe
- * spawns `secret-tool`, which is pointless on macOS and would be one more
- * process for every worker on a host that is going to skip anyway.
- */
-const disposableVerdict =
-  isLinux && hasSecretTool && hasDbus
-    ? probeDisposableKeyring()
-    : { disposable: false, reason: "not a Linux host with a session bus" };
+const disposableVerdict = probeDisposableCiRunnerFromEnv();
 
 const realBackendProbe = {
   isLinux,
   hasSecretTool,
   hasDbus,
-  keyringIsDisposable: disposableVerdict.disposable,
+  onDisposableCiRunner: disposableVerdict.disposable,
 };
 
 const skipUnlessRealBackend = shouldSkipRealBackend(realBackendProbe);
@@ -104,10 +96,7 @@ const skipUnlessRealBackend = shouldSkipRealBackend(realBackendProbe);
 // had been computed and thrown away. On a host that looks like it SHOULD have
 // run this suite, say why it did not.
 if (skipUnlessRealBackend && isLinux && hasSecretTool && hasDbus) {
-  console.warn(
-    `[real-backend] skipping: ${disposableVerdict.reason}. ` +
-      `Provision with scripts/ci/provision-disposable-keyring.sh.`
-  );
+  console.warn(`[real-backend] skipping: ${disposableVerdict.reason}.`);
 }
 
 // ── Cleanup helper ──────────────────────────────────────────────────

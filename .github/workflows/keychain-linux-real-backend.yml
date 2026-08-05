@@ -57,7 +57,6 @@ on:
       - "server/test/support/real-backend-guard.ts"
       - "server/package.json"
       - "server/package-lock.json"
-      - "scripts/ci/provision-disposable-keyring.sh"
       - ".github/workflows/keychain-linux-real-backend.yml"
   pull_request:
     branches: [main]
@@ -71,7 +70,6 @@ on:
       - "server/test/support/real-backend-guard.ts"
       - "server/package.json"
       - "server/package-lock.json"
-      - "scripts/ci/provision-disposable-keyring.sh"
       - ".github/workflows/keychain-linux-real-backend.yml"
   workflow_dispatch:
 
@@ -92,11 +90,12 @@ jobs:
           cache-dependency-path: server/package-lock.json
 
       # Installs libsecret + pass-secret-service, starts a session bus,
-      # smoke-tests it, and mints the disposable-keyring token. Exports
-      # DBUS_SESSION_BUS_ADDRESS and SANCTUARY_TEST_DISPOSABLE_KEYRING.
-      # It fails the job on any problem rather than emitting a weaker
-      # declaration, because a missing token makes the suite skip and a
-      # fully skipped suite still exits 0.
+      # and smoke-tests it, exporting DBUS_SESSION_BUS_ADDRESS. It fails
+      # the job on any problem rather than continuing degraded, because a
+      # missing Secret Service makes the suite skip and a fully skipped
+      # suite still exits 0. Whether the keyring counts as disposable is
+      # decided by server/test/support/real-backend-guard.ts from
+      # GITHUB_ACTIONS, not by anything this action exports.
       - name: Install libsecret + Secret Service backend
         uses: ./.github/actions/setup-linux-secret-service
 
@@ -150,7 +149,7 @@ jobs:
                /tmp/real-backend-vitest.log; then
             echo "real-backend suite did not report exactly ${expected} passing tests." >&2
             echo "A skipped or partially-skipped suite still exits 0, so this is the check that catches it." >&2
-            echo "Skip conditions: linux + secret-tool + DBUS_SESSION_BUS_ADDRESS + a valid disposable-keyring token." >&2
+            echo "Skip conditions: linux + secret-tool + DBUS_SESSION_BUS_ADDRESS + an ephemeral CI runner." >&2
             grep -E "^[[:space:]]*Tests|real-backend. skipping" /tmp/real-backend-vitest.log >&2 || true
             exit 1
           fi

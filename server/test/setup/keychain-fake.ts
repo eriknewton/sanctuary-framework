@@ -218,6 +218,43 @@ function tokenizeBatchLine(line: string): string[] {
   return tokens;
 }
 
+/**
+ * Answer for a NAMED keychain file only when this fake is the thing that created
+ * it, and refuse loudly otherwise.
+ *
+ * The alternative, returning success for any path that happens to exist, is the
+ * original defect class reappearing inside the test double: a dead or stale
+ * broker keychain would read as unlocked, and the suite would keep passing while
+ * proving nothing. Real `security` rejects a wrong passphrase and rejects a file
+ * that is not a keychain; a fake that is more permissive than the tool it stands
+ * in for teaches tests a behavior production does not have.
+ *
+ * A refusal is the safe answer, a false success is not. The refusal is also
+ * self-diagnosing: the fake's per-test reset clears this map, so the message
+ * names the most likely cause, which is a keychain created in a `beforeAll`.
+ */
+function refuseUnlessCreatedHere(
+  path: string
+): { record: { passphrase: string }; error?: undefined } | { record?: undefined; error: ExecResult } {
+  const record = keychains.get(canonical(path));
+  if (record !== undefined) return { record };
+  if (!existsSync(path)) {
+    return {
+      error: fail(NOT_FOUND_CODE, "security: The specified keychain could not be found."),
+    };
+  }
+  return {
+    error: fail(
+      1,
+      `security: test keychain fake will not answer for '${path}', which it did not create. ` +
+        `Real security(1) would validate the file and its passphrase; answering "unlocked" for ` +
+        `an unknown file would make a dead keychain look alive. Create it in the test (the ` +
+        `fake's store resets before EACH test, so a beforeAll-created keychain is gone by the ` +
+        `time the test runs).`
+    ),
+  };
+}
+
 function runSecurityVerb(tokens: string[]): ExecResult {
   const { verb, flags, booleans, positionals } = parseSecurityCommand(tokens);
   const account = flags.get("-a");
@@ -264,23 +301,24 @@ function runSecurityVerb(tokens: string[]): ExecResult {
 
   if (verb === "unlock-keychain") {
     const path = positionals[0];
-    if (path !== undefined && !existsSync(path)) {
-      return fail(NOT_FOUND_CODE, "security: The specified keychain could not be found.");
-    }
-    const known = path === undefined ? undefined : keychains.get(canonical(path));
-    if (known !== undefined && known.passphrase !== (flags.get("-p") ?? "")) {
-      return fail(
-        AUTH_FAILED_CODE,
-        "security: The user name or passphrase you entered is not correct."
-      );
+    if (path !== undefined) {
+      const known = refuseUnlessCreatedHere(path);
+      if (known.error !== undefined) return known.error;
+      if (known.record.passphrase !== (flags.get("-p") ?? "")) {
+        return fail(
+          AUTH_FAILED_CODE,
+          "security: The user name or passphrase you entered is not correct."
+        );
+      }
     }
     return ok();
   }
 
   if (verb === "dump-keychain") {
     const path = positionals[0];
-    if (path !== undefined && !existsSync(path)) {
-      return fail(NOT_FOUND_CODE, "security: The specified keychain could not be found.");
+    if (path !== undefined) {
+      const known = refuseUnlessCreatedHere(path);
+      if (known.error !== undefined) return known.error;
     }
     // One `keychain: ` block per item: keychain-backend.ts `listSecretNames`
     // splits on /^keychain: /m and reads one "acct" per block.

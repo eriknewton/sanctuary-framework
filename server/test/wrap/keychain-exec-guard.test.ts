@@ -10,7 +10,8 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { readdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -27,12 +28,9 @@ import {
 import { installInMemoryKeychainStore } from "../setup/keychain-fake.js";
 import {
   credentialStoreIsInstalled,
-  dbusSocketIdentifier,
   enterRealBackendMode,
+  probeDisposableCiRunner,
   shouldSkipRealBackend,
-  verifyDisposableKeyring,
-  TOKEN_MAX_AGE_MS,
-  type DisposableKeyringProbe,
   type RealBackendProbe,
 } from "../support/real-backend-guard.js";
 
@@ -156,7 +154,7 @@ describe("the real-backend skip predicate (truth table, not substrings)", () => 
     isLinux: true,
     hasSecretTool: true,
     hasDbus: true,
-    keyringIsDisposable: true,
+    onDisposableCiRunner: true,
   };
 
   beforeEach(() => {
@@ -175,7 +173,7 @@ describe("the real-backend skip predicate (truth table, not substrings)", () => 
     "isLinux",
     "hasSecretTool",
     "hasDbus",
-    "keyringIsDisposable",
+    "onDisposableCiRunner",
   ] as const) {
     it(`skips when ${condition} is false, so the four conditions are ANDed`, () => {
       expect(shouldSkipRealBackend({ ...qualifies, [condition]: false })).toBe(true);
@@ -184,7 +182,7 @@ describe("the real-backend skip predicate (truth table, not substrings)", () => 
 
   it("REFUSES to remove the credential store when the run does not qualify", async () => {
     expect(() =>
-      enterRealBackendMode({ ...qualifies, keyringIsDisposable: false })
+      enterRealBackendMode({ ...qualifies, onDisposableCiRunner: false })
     ).toThrow(/refusing to remove the in-memory credential store/);
     // The refusal is only worth anything if the store is still serving after it.
     expect(await credentialStoreIsInstalled()).toBe(true);
@@ -196,114 +194,131 @@ describe("the real-backend skip predicate (truth table, not substrings)", () => 
   });
 });
 
-describe("disposable-keyring proof (an env var is a declaration, not evidence)", () => {
-  const NONCE = "a".repeat(64);
-  const BUS = "unix:abstract=/tmp/dbus-Ab3xKq9Z,guid=deadbeef";
-  const NOW = 1_760_000_000_000;
+describe("the real-backend suite is CI-only, and says so", () => {
+  /**
+   * The gate no longer tries to PROVE a keyring disposable; three attempts at
+   * that each shipped a proof weaker than its claim (a bare env var, a nonce
+   * round trip that only proved the service answered, and a socket-path shape
+   * test that a developer's own `dbus-launch` satisfies). It now identifies the
+   * one execution context that is disposable by construction, and the tests
+   * below pin exactly that and nothing more.
+   */
 
-  function validProbe(
-    overrides: Partial<DisposableKeyringProbe> = {}
-  ): DisposableKeyringProbe {
-    return {
-      tokenPath: "/tmp/runner/sanctuary-disposable-keyring.json",
-      busAddress: BUS,
-      readToken: () =>
-        JSON.stringify({ nonce: NONCE, dbusAddress: BUS, createdAtMs: NOW - 1000 }),
-      lookupNonce: () => `${NONCE}\n`,
-      now: NOW,
-      tempRoots: ["/tmp"],
-      ...overrides,
-    };
+  it("runs on an ephemeral GitHub-hosted runner", () => {
+    expect(
+      probeDisposableCiRunner({ githubActions: "true", runnerEnvironment: "github-hosted" })
+        .disposable
+    ).toBe(true);
+  });
+
+  it("tolerates RUNNER_ENVIRONMENT being absent, because it is checked negatively", () => {
+    // Deliberate: requiring it positively would turn an unverified assumption
+    // about the runner image into a red CI.
+    expect(
+      probeDisposableCiRunner({ githubActions: "true", runnerEnvironment: undefined }).disposable
+    ).toBe(true);
+  });
+
+  it("refuses a developer machine, which is every machine that is not CI", () => {
+    const verdict = probeDisposableCiRunner({
+      githubActions: undefined,
+      runnerEnvironment: undefined,
+    });
+    expect(verdict.disposable).toBe(false);
+    expect(verdict.reason).toMatch(/CI-only/);
+  });
+
+  it("refuses a self-hosted runner, whose machine outlives the job", () => {
+    const verdict = probeDisposableCiRunner({
+      githubActions: "true",
+      runnerEnvironment: "self-hosted",
+    });
+    expect(verdict.disposable).toBe(false);
+    expect(verdict.reason).toMatch(/outlives the job/);
+  });
+
+  it("requires the exact string \"true\", not any truthy value", () => {
+    for (const value of ["1", "TRUE", "yes", ""]) {
+      expect(
+        probeDisposableCiRunner({ githubActions: value, runnerEnvironment: undefined }).disposable
+      ).toBe(false);
+    }
+  });
+});
+
+describe("the in-memory fake refuses what the real tool refuses", () => {
+  /**
+   * A test double that is MORE permissive than the tool it replaces teaches
+   * tests a behavior production does not have. The specific shape that matters
+   * here is the one this whole change exists to kill: answering "unlocked" for a
+   * keychain the fake knows nothing about would make a dead or stale broker
+   * keychain read as alive, and the suite would keep passing while proving
+   * nothing. A refusal is an acceptable answer; a false success is not.
+   */
+  const PASSPHRASE = "fake-kc-passphrase";
+  let dir: string;
+
+  beforeEach(() => {
+    installInMemoryKeychainStore();
+    dir = mkdtempSync(join(tmpdir(), "sanctuary-fake-kc-"));
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  async function createKeychain(path: string) {
+    return execKeychain("/usr/bin/security", ["-i"], `create-keychain -p "${PASSPHRASE}" "${path}"\n`);
+  }
+  async function unlockKeychain(path: string, passphrase: string) {
+    return execKeychain("/usr/bin/security", ["-i"], `unlock-keychain -p "${passphrase}" "${path}"\n`);
   }
 
-  it("accepts a run whose own provisioning step minted the proof", () => {
-    expect(verifyDisposableKeyring(validProbe()).disposable).toBe(true);
+  it("unlocks a keychain it created, with the right passphrase", async () => {
+    const path = join(dir, "created.keychain-db");
+    expect((await createKeychain(path)).code).toBe(0);
+    expect((await unlockKeychain(path, PASSPHRASE)).code).toBe(0);
   });
 
-  it("rejects the superseded bare declaration SANCTUARY_TEST_DISPOSABLE_KEYRING=1", () => {
-    // The exact value that used to be sufficient. A stale export of it in a
-    // developer's shell profile is the scenario this whole mechanism exists for.
-    const verdict = verifyDisposableKeyring(validProbe({ tokenPath: "1" }));
-    expect(verdict.disposable).toBe(false);
-    expect(verdict.reason).toMatch(/absolute path/);
+  it("rejects the WRONG passphrase instead of waving it through", async () => {
+    const path = join(dir, "created.keychain-db");
+    await createKeychain(path);
+    const result = await unlockKeychain(path, "not-the-passphrase");
+    expect(result.code).not.toBe(0);
+    expect(result.stderr).toMatch(/passphrase you entered is not correct/);
   });
 
-  it("rejects an unset declaration", () => {
-    expect(verifyDisposableKeyring(validProbe({ tokenPath: undefined })).disposable).toBe(
-      false
-    );
+  it("REFUSES to unlock a file it did not create, rather than reporting success", async () => {
+    // The regression this pins: an ordinary file that merely EXISTS used to
+    // satisfy the unlock path, so a stale keychain looked unlocked.
+    const path = join(dir, "not-a-keychain.keychain-db");
+    writeFileSync(path, "this is not a keychain");
+    const result = await unlockKeychain(path, PASSPHRASE);
+    expect(result.code).not.toBe(0);
+    expect(result.stderr).toMatch(/did not create/);
   });
 
-  it("rejects a token file that cannot be read", () => {
-    expect(
-      verifyDisposableKeyring(validProbe({ readToken: () => undefined })).disposable
-    ).toBe(false);
+  it("reports a missing keychain as not-found, distinct from refusing a foreign one", async () => {
+    const result = await unlockKeychain(join(dir, "absent.keychain-db"), PASSPHRASE);
+    expect(result.code).not.toBe(0);
+    expect(result.stderr).toMatch(/could not be found/);
   });
 
-  it("rejects a malformed token", () => {
-    expect(
-      verifyDisposableKeyring(validProbe({ readToken: () => "{}" })).disposable
-    ).toBe(false);
+  it("REFUSES to dump a keychain it did not create, rather than reporting it empty", async () => {
+    // An empty dump is the same lie in a different costume: "this keychain holds
+    // no secrets" is a positive claim the fake cannot make about a foreign file.
+    const path = join(dir, "foreign.keychain-db");
+    writeFileSync(path, "");
+    const result = await execKeychain("/usr/bin/security", ["dump-keychain", path]);
+    expect(result.code).not.toBe(0);
+    expect(result.stdout).toBe("");
   });
 
-  it("rejects a token minted by an earlier run", () => {
-    const verdict = verifyDisposableKeyring(
-      validProbe({ now: NOW + TOKEN_MAX_AGE_MS + 1 })
-    );
-    expect(verdict.disposable).toBe(false);
-    expect(verdict.reason).toMatch(/stale/);
-  });
-
-  it("rejects a token whose recorded bus is not the live one", () => {
-    // A token cannot outlive its bus: this is what kills a stale shell export
-    // pointing at a leftover file.
-    const verdict = verifyDisposableKeyring(
-      validProbe({ busAddress: "unix:abstract=/tmp/dbus-OtherBus,guid=1" })
-    );
-    expect(verdict.disposable).toBe(false);
-    expect(verdict.reason).toMatch(/not the one the provisioning step recorded/);
-  });
-
-  it("rejects a login-session bus, which is what a developer's desktop has", () => {
-    // The structural condition. /run/user/<uid>/bus is a human's session, and
-    // the keyring on it is their real one no matter what any token claims.
-    const desktopBus = "unix:path=/run/user/1000/bus";
-    const verdict = verifyDisposableKeyring(
-      validProbe({
-        busAddress: desktopBus,
-        readToken: () =>
-          JSON.stringify({
-            nonce: NONCE,
-            dbusAddress: desktopBus,
-            createdAtMs: NOW - 1000,
-          }),
-      })
-    );
-    expect(verdict.disposable).toBe(false);
-    expect(verdict.reason).toMatch(/not a throwaway bus/);
-  });
-
-  it("rejects a keyring holding no provisioning nonce", () => {
-    expect(
-      verifyDisposableKeyring(validProbe({ lookupNonce: () => undefined })).disposable
-    ).toBe(false);
-  });
-
-  it("rejects a keyring whose nonce is not this run's", () => {
-    // Proves the round trip is compared, not merely performed: some other
-    // Secret Service answering on this bus must not qualify.
-    const verdict = verifyDisposableKeyring(
-      validProbe({ lookupNonce: () => `${"b".repeat(64)}\n` })
-    );
-    expect(verdict.disposable).toBe(false);
-    expect(verdict.reason).toMatch(/not the one this run provisioned/);
-  });
-
-  it("reads the socket out of both D-Bus address forms", () => {
-    expect(dbusSocketIdentifier(BUS)).toBe("/tmp/dbus-Ab3xKq9Z");
-    expect(dbusSocketIdentifier("unix:path=/run/user/1000/bus")).toBe(
-      "/run/user/1000/bus"
-    );
+  it("refuses to create a keychain outside the temp root", async () => {
+    const result = await createKeychain("/etc/sanctuary-should-never-exist.keychain-db");
+    expect(result.code).not.toBe(0);
+    expect(result.stderr).toMatch(/outside the temp root/);
+    expect(existsSync("/etc/sanctuary-should-never-exist.keychain-db")).toBe(false);
   });
 });
 
