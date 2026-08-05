@@ -1131,8 +1131,10 @@ describe("MacOSFlowEventConsumer : extension diagnostics", () => {
             details: e.details,
           })),
           total: auditSinkBundle.entries.length,
-          integrity_findings: [],
         };
+      },
+      async getAuditChainVerdict() {
+        return { status: "verified" as const };
       },
     })();
     expect(anchor).toBeNull();

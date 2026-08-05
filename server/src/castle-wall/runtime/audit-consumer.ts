@@ -36,6 +36,10 @@ import {
   CASTLE_WALL_WAL_SEQUENCE_DETAIL_KEY,
 } from "../constants.js";
 import { canonicalize } from "../../mesh/canonical-json.js";
+import {
+  auditChainVerdictUntampered,
+  type AuditChainVerdict,
+} from "../../operational/audit-log.js";
 import type {
   CastleWallAuditEvent,
   CastleWallEventType,
@@ -1514,8 +1518,15 @@ export interface ChainAnchorAuditLogReader {
       details?: Record<string, unknown>;
     }>;
     total: number;
-    integrity_findings: ReadonlyArray<unknown>;
   }>;
+  /**
+   * The SHARED audit-chain verdict chokepoint. Deliberately used instead of
+   * `query().integrity_findings`: the routine findings skip the sealed-region
+   * crypto verdict, so a log damaged inside the sealed region reads clean
+   * there. Adopting a chain anchor out of a log we cannot call untampered is
+   * exactly the mistake that check exists to prevent.
+   */
+  getAuditChainVerdict(): Promise<AuditChainVerdict>;
 }
 
 /**
@@ -1542,13 +1553,16 @@ export function buildChainAnchorSourceFromAuditLog(
   log: ChainAnchorAuditLogReader,
 ): ChainAnchorSource {
   return async () => {
+    // Cleanliness is decided by the SHARED verdict chokepoint, which folds the
+    // sealed-region crypto verdict that the routine findings omit. Checked
+    // BEFORE the scan so a damaged log never yields an anchor candidate.
+    if (!auditChainVerdictUntampered(await log.getAuditChainVerdict())) {
+      return { kind: "unavailable", reason: "audit_log_integrity_findings" };
+    }
     const result = await log.query({
       layer: CASTLE_WALL_AUDIT_LAYER,
       limit: CHAIN_ANCHOR_SCAN_LIMIT,
     });
-    if (result.integrity_findings.length > 0) {
-      return { kind: "unavailable", reason: "audit_log_integrity_findings" };
-    }
     for (let i = result.entries.length - 1; i >= 0; i -= 1) {
       const entry = result.entries[i]!;
       const details = entry.details;

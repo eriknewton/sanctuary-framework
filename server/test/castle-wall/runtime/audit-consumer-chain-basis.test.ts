@@ -61,6 +61,7 @@ import {
   CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY,
 } from "../../../src/castle-wall/constants.js";
 import { canonicalize } from "../../../src/mesh/canonical-json.js";
+import type { AuditChainVerdict } from "../../../src/operational/audit-log.js";
 
 /** Sink that records entries AND the flush count each append happened after. */
 class RecordingSink implements AuditSink {
@@ -789,15 +790,14 @@ describe("buildChainAnchorSourceFromAuditLog", () => {
       identity_id: string;
       details?: Record<string, unknown>;
     }>,
-    integrityFindings: unknown[] = [],
+    verdictStatus: "verified" | "verified_suffix_only" | "findings" = "verified",
   ) {
     return {
       async query() {
-        return {
-          entries,
-          total: entries.length,
-          integrity_findings: integrityFindings,
-        };
+        return { entries, total: entries.length };
+      },
+      async getAuditChainVerdict() {
+        return { status: verdictStatus } as AuditChainVerdict;
       },
     };
   }
@@ -879,13 +879,63 @@ describe("buildChainAnchorSourceFromAuditLog", () => {
             },
           },
         ],
-        [{ finding: "hash mismatch at entry 3" }],
+        "findings",
       ),
     );
     expect(await source()).toMatchObject({
       kind: "unavailable",
       reason: "audit_log_integrity_findings",
     });
+  });
+
+
+  it("a sealed-region tamper the routine findings would MISS still blocks the anchor", async () => {
+    // The routine integrity findings deliberately skip the sealed-region crypto
+    // verdict; reading them directly would call this log clean and adopt an
+    // anchor out of a tampered history. The shared verdict catches it.
+    const source = buildChainAnchorSourceFromAuditLog(
+      fakeLog(
+        [
+          {
+            operation: "egress_blocked",
+            identity_id: "agent-a",
+            details: {
+              seq: 5,
+              prior_sha256_hex: null,
+              [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
+            },
+          },
+        ],
+        "findings",
+      ),
+    );
+    expect(await source()).toMatchObject({
+      kind: "unavailable",
+      reason: "audit_log_integrity_findings",
+    });
+  });
+
+  it("verified_suffix_only (sealed unreadable at this privilege) does NOT wedge the chain", async () => {
+    // An armed box's daemon uid cannot read the root-owned sealed region. That
+    // is not tamper, and treating it as such would leave every armed fortress
+    // permanently stuck after a restart.
+    const source = buildChainAnchorSourceFromAuditLog(
+      fakeLog(
+        [
+          {
+            operation: "egress_blocked",
+            identity_id: "agent-a",
+            details: {
+              seq: 5,
+              prior_sha256_hex: null,
+              [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
+            },
+          },
+        ],
+        "verified_suffix_only",
+      ),
+    );
+    expect(await source()).toMatchObject({ kind: "persisted", seq: 5 });
   });
 
   it("an unsigned last accepted entry surfaces signedCanonicalJson: null", async () => {
