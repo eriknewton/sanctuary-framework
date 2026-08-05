@@ -271,7 +271,7 @@ describe.skipIf(skipUnlessRealBackend)(
     // only one here that a stubbed credential store cannot fake, because
     // a stub answers the same whether or not the bus is reachable. If it
     // ever reports `source: "keychain"`, the suite is talking to a stub
-    // and the other four cases below are vacuous.
+    // and the four cases above it are vacuous.
 
     it("graceful-degrades to fallback file when DBUS_SESSION_BUS_ADDRESS is suppressed", async () => {
       const tenant = join(home, "no-dbus");
