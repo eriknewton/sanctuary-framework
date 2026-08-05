@@ -301,6 +301,10 @@ function extractRecords(parsed: unknown): VerifierCheckpointRecord[] {
 }
 
 function decodeKeyBytes(bytes: Uint8Array): string {
+  // 32 = RFC 8032 Ed25519 public key. Literal rather than an import because this
+  // CLI is part of the standalone offline verifier (see `verify.ts`), which must
+  // compile without any Sanctuary server module. Must match
+  // `ED25519_PUBLIC_KEY_BYTES` in `core/crypto-suite-registry.ts`.
   if (bytes.length === 32) return toBase64url(bytes);
   const text = Buffer.from(bytes).toString("utf8").trim();
   const decoded = fromBase64url(text);

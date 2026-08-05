@@ -1666,6 +1666,9 @@ export async function rotateMaster(
   verifyEnvelopeMac(oldEnvelope, oldMaster);
 
   const newMaster = generateRandomKey();
+  // 12 = 96 random bits taken from the 32-byte CSPRNG draw, chosen because 12
+  // bytes is exactly 16 base64url characters with no padding. A rotation id is
+  // an opaque log/journal label, not key material.
   const rotationId = toBase64url(generateRandomKey().subarray(0, 12));
   const ctx: Ctx = {
     storage,

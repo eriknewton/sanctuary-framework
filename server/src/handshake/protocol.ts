@@ -67,6 +67,9 @@ export function isSessionExpired(
 
 /** Generate a cryptographic nonce for handshake */
 function generateNonce(): string {
+  // 32 = 256 random bits. A handshake nonce is anti-replay material, not a key;
+  // the width is chosen so collisions are infeasible, and it is unrelated to the
+  // 32-byte Ed25519 key size it happens to share.
   const nonce = randomBytes(32);
   if (!nonce || nonce.length !== 32) {
     throw new Error("Nonce generation failed: randomBytes returned unexpected length");

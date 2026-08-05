@@ -107,6 +107,7 @@ import {
   type SourceReadOutcome,
   type VerifiedEmpty,
 } from "../claim-witness.js";
+import { ED25519_PUBLIC_KEY_BYTES } from "../core/crypto-suite-registry.js";
 
 /** Same on-disk filenames `runProvisionPin` (cli/castle-wall.ts) establishes under the fortress root. Re-declared here (that module keeps them private) rather than reused, since they are plain filename literals, not secret material. */
 const CASTLE_PINNED_PUBKEY = "castle-pinned-pubkey.bin";
@@ -1254,7 +1255,7 @@ export async function readAllowlistForRefresh(fortressPath: string): Promise<Ref
   let pinnedPublicKey: Uint8Array;
   try {
     const pub = await readFile(join(fortressPath, CASTLE_PINNED_PUBKEY));
-    if (pub.length !== 32) {
+    if (pub.length !== ED25519_PUBLIC_KEY_BYTES) {
       return {
         status: "unverified",
         reason: `pinned public key must be 32 bytes (found ${pub.length})`,
@@ -1572,7 +1573,7 @@ async function loadPinnedPublicKey(fortressPath: string, err: Writable): Promise
   const pubPath = join(fortressPath, CASTLE_PINNED_PUBKEY);
   try {
     const pub = await readFile(pubPath);
-    if (pub.length !== 32) {
+    if (pub.length !== ED25519_PUBLIC_KEY_BYTES) {
       write(err, `Error: pinned public key at ${pubPath} must be 32 bytes (found ${pub.length}).\n`);
       return null;
     }

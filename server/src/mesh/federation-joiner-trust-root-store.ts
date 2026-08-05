@@ -34,6 +34,7 @@
  */
 
 import { ed25519 } from "@noble/curves/ed25519";
+import { ED25519_PRIVATE_KEY_BYTES } from "../core/crypto-suite-registry.js";
 import type { StorageBackend } from "../storage/interface.js";
 import { withCrossProcessLock } from "../storage/cross-process-lock.js";
 import { encrypt, decrypt, type EncryptedPayload } from "../core/encryption.js";
@@ -1253,8 +1254,14 @@ export function validateJoinerRecord(
   );
 }
 
+/**
+ * Every value routed through here is `local_node_private_key`, a 32-byte Ed25519
+ * seed (RFC 8032 §5.1.5). The joiner record holds no symmetric master secret (see
+ * the header note), so unlike the mirror helper in
+ * `mesh/federation-trust-root-store.ts` this one can name the Ed25519 constant.
+ */
 function assertKeyLength(value: Uint8Array, label: string): void {
-  if (value.length !== 32) {
+  if (value.length !== ED25519_PRIVATE_KEY_BYTES) {
     throw new FederationJoinerTrustRootStoreError(`${label} must be 32 bytes`);
   }
 }

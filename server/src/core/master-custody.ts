@@ -500,10 +500,15 @@ function custodyAad(type: CustodyWrapType, id: string): Uint8Array {
 }
 
 function newWrapId(): string {
+  // 16 = 128 random bits, taken from the 32-byte CSPRNG draw. A wrap id is an
+  // opaque collision-resistant label, not key material, so 128 bits of entropy
+  // is the whole requirement; the remaining 16 bytes are discarded.
   return toBase64url(generateRandomKey().subarray(0, 16));
 }
 
 function recoveryWrapKey(recoveryKeyBytes: Uint8Array): Uint8Array {
+  // 32 = the 256-bit recovery key minted by `generateRandomKey()`. Symmetric
+  // key material; the Ed25519 constants do not apply here.
   if (recoveryKeyBytes.length !== 32) {
     throw new CustodyUnlockError(
       "Sanctuary: recovery key has incorrect length. Use the exact recovery key captured at creation."
@@ -519,6 +524,8 @@ function recoveryWrapKey(recoveryKeyBytes: Uint8Array): Uint8Array {
 }
 
 function keychainWrapKey(custodyKeyBytes: Uint8Array): Uint8Array {
+  // 32 = the 256-bit keychain custody key; same symmetric size as the recovery
+  // key above, and the same reason it is not an Ed25519 constant.
   if (custodyKeyBytes.length !== 32) {
     throw new CustodyUnlockError(
       "Sanctuary: keychain custody key has incorrect length."
@@ -534,6 +541,9 @@ function keychainWrapKey(custodyKeyBytes: Uint8Array): Uint8Array {
 }
 
 function assertMaster(master: Uint8Array): void {
+  // 32 = the 256-bit fortress master key; must match the check in
+  // `core/key-derivation.ts` (deriveNamespaceKey / derivePurposeKey), which
+  // consumes the same value.
   if (master.length !== 32) {
     throw new Error("Master key must be 32 bytes");
   }
@@ -1128,6 +1138,8 @@ function decodeRecoveryKey(recoveryKey: string): Uint8Array {
         "Use the exact recovery key captured at creation."
     );
   }
+  // 32 = the 256-bit recovery key; must match `recoveryWrapKey` above, which is
+  // where the decoded value is consumed.
   if (bytes.length !== 32) {
     throw new CustodyUnlockError(
       "Sanctuary: SANCTUARY_RECOVERY_KEY has incorrect length. " +

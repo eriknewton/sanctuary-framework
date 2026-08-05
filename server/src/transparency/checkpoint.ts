@@ -207,6 +207,12 @@ export function verifyEnforcementCheckpointSignature(
   try {
     const keyBytes =
       typeof publicKey === "string" ? fromBase64url(publicKey) : publicKey;
+    // 32 = RFC 8032 Ed25519 public key, the compressed Edwards point encoding.
+    // Kept as a literal on purpose: this module is a LEGACY FROZEN SERIALIZER,
+    // and `test/structure/pqc-slice1-additive.test.ts` forbids it from even
+    // naming the signature-suite registry, so that frozen v1 signatures stay
+    // byte-stable. The value must equal `ED25519_PUBLIC_KEY_BYTES`;
+    // `test/structure/key-length-constants.test.ts` asserts that it does.
     if (keyBytes.length !== 32) return false;
     return verifyEd25519(
       checkpointSigningBytes(checkpointPayloadOf(record)),

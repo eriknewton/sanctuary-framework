@@ -48,6 +48,10 @@ import {
   CASTLE_WALL_PRODUCER_SIG_DOMAIN_PREFIX,
   CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1,
 } from "../constants.js";
+import {
+  ED25519_PUBLIC_KEY_BYTES,
+  ED25519_SIGNATURE_BYTES,
+} from "../../core/crypto-suite-registry.js";
 
 const ENCODER = new TextEncoder();
 
@@ -199,7 +203,7 @@ async function loadProducerKeyFromPath(pubKeyPath: string): Promise<ProducerKeyL
       }`,
     };
   }
-  if (bytes.length !== 32) {
+  if (bytes.length !== ED25519_PUBLIC_KEY_BYTES) {
     // A present-but-malformed key is expected-but-broken, not absent.
     return {
       status: "unreadable",
@@ -227,7 +231,7 @@ export async function loadPinnedProducerKeyB64url(
   pubKeyPath: string
 ): Promise<string> {
   const bytes = new Uint8Array(await readFile(pubKeyPath));
-  if (bytes.length !== 32) {
+  if (bytes.length !== ED25519_PUBLIC_KEY_BYTES) {
     throw new Error(
       `audit-producer public key at ${pubKeyPath} is ${bytes.length} bytes, expected 32`
     );
@@ -345,11 +349,11 @@ export function verifyProducerSignature(
   }
   try {
     const key = fromBase64url(pinnedProducerKeyB64url);
-    if (key.length !== 32) {
+    if (key.length !== ED25519_PUBLIC_KEY_BYTES) {
       return { ok: false, reason: "pinned_producer_key_wrong_length" };
     }
     const sig = fromBase64url(input.signatureB64url);
-    if (sig.length !== 64) {
+    if (sig.length !== ED25519_SIGNATURE_BYTES) {
       return { ok: false, reason: "producer_signature_wrong_length" };
     }
     const message = producerSigningBytes(

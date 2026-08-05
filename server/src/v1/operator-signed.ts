@@ -114,6 +114,12 @@ export function verifyOperatorSignature(input: {
   try {
     const message = buildOperatorSignedMessage(input.action, input.payload);
     const signature = fromBase64url(input.signature);
+    // 64 = RFC 8032 Ed25519 signature (R||S, 32 bytes each). Kept as a literal
+    // on purpose: this module is a LEGACY FROZEN SERIALIZER, and
+    // `test/structure/pqc-slice1-additive.test.ts` forbids it from even naming
+    // the signature-suite registry. The value must equal
+    // `ED25519_SIGNATURE_BYTES`;
+    // `test/structure/key-length-constants.test.ts` asserts that it does.
     if (signature.length !== 64) return false;
     return verify(message, signature, input.operatorPublicKey);
   } catch {

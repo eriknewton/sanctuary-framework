@@ -263,6 +263,8 @@ async function readKeyClassified(
       // unreachable (the operator should investigate) rather than "not-found".
       return { status: "unreachable", detail: "keychain item is malformed" };
     }
+    // 32 = the 256-bit custody key held in the keychain item; must match
+    // `keychainWrapKey` in `core/master-custody.ts`, which consumes it.
     if (bytes.length !== 32) {
       return { status: "unreachable", detail: "keychain item has wrong length" };
     }
@@ -448,6 +450,8 @@ export async function storeRecoveryKeyInKeychain(
   }
 
   try {
+    // 32 = the 256-bit recovery key; must match `decodeRecoveryKey` in
+    // `core/master-custody.ts`, which consumes what this stores.
     if (recoveryKeyBytes.length !== 32) {
       throw new RecoveryKeyKeychainStoreError(service);
     }

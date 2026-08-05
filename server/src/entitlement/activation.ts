@@ -58,6 +58,7 @@ import {
   type FleetCap,
   type ResolvedEntitlementView,
 } from "./fleet-cap.js";
+import { ED25519_PUBLIC_KEY_BYTES } from "../core/crypto-suite-registry.js";
 
 /**
  * The community node floor used when the activation record itself is UNREADABLE
@@ -509,7 +510,7 @@ export function decodeIssuerPublicKey(
   try {
     // Accept both base64url (identity records) and standard base64.
     const key = Buffer.from(b64.replace(/-/g, "+").replace(/_/g, "/"), "base64");
-    return key.length === 32 ? new Uint8Array(key) : null;
+    return key.length === ED25519_PUBLIC_KEY_BYTES ? new Uint8Array(key) : null;
   } catch {
     return null;
   }

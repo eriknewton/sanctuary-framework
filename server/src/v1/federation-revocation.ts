@@ -27,7 +27,9 @@ import { verify } from "../core/identity.js";
 import {
   cryptoSuiteRegistry,
   createHybridSuitePublicKeys,
+  ED25519_PRIVATE_KEY_BYTES,
   ED25519_PUBLIC_KEY_BYTES,
+  ED25519_SIGNATURE_BYTES,
   HYBRID_SIGNATURE_SUITE_ID,
   ML_DSA_65_PUBLIC_KEY_BYTES,
   ML_DSA_65_SECRET_KEY_BYTES,
@@ -391,7 +393,7 @@ export function verifyFederationNodeEvictionEvent(input: {
   } catch {
     return { ok: false, reason: "operator_signature_invalid" };
   }
-  if (signature.length !== 64) {
+  if (signature.length !== ED25519_SIGNATURE_BYTES) {
     return { ok: false, reason: "operator_signature_invalid" };
   }
   const signedBody = {
@@ -830,7 +832,7 @@ export async function signFederationRootRevocationPayloadHybrid(params: {
 }): Promise<FederationRootRevocationPayload> {
   if (
     params.newHybridPrincipalPrivateKeys.ed25519.private_key.length !==
-    ED25519_PUBLIC_KEY_BYTES
+    ED25519_PRIVATE_KEY_BYTES
   ) {
     throw new Error("hybrid revocation Ed25519 private key must be 32 bytes");
   }
@@ -1008,7 +1010,7 @@ export async function verifyFederationRootRevocationEvent(input: {
   } catch {
     return { ok: false, reason: "operator_signature_invalid" };
   }
-  if (signature.length !== 64) {
+  if (signature.length !== ED25519_SIGNATURE_BYTES) {
     return { ok: false, reason: "operator_signature_invalid" };
   }
   const signedBody = {

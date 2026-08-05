@@ -287,6 +287,7 @@ import {
   UnifiedInboxRetentionPolicy,
   type UnifiedInboxRetentionPolicyStore,
 } from "./unified-inbox-retention-policy.js";
+import { ED25519_PUBLIC_KEY_BYTES } from "../core/crypto-suite-registry.js";
 
 // ── Types ───────────────────────────────────────────────────────────────
 
@@ -2821,7 +2822,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     if (!identity?.public_key) return null;
     try {
       const key = fromBase64url(identity.public_key);
-      return key.length === 32 ? key : null;
+      return key.length === ED25519_PUBLIC_KEY_BYTES ? key : null;
     } catch {
       return null;
     }

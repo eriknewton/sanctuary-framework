@@ -95,6 +95,8 @@ export function deriveNamespaceKey(
   masterKey: Uint8Array,
   namespace: string
 ): Uint8Array {
+  // 32 = the 256-bit master key produced by `generateRandomKey()` (core/random.ts).
+  // A symmetric secret, not an Ed25519 key, despite sharing the byte count.
   if (masterKey.length !== 32) {
     throw new Error("Master key must be 32 bytes");
   }
@@ -120,6 +122,7 @@ export function derivePurposeKey(
   masterKey: Uint8Array,
   purpose: string
 ): Uint8Array {
+  // Same 256-bit master-key size as `deriveNamespaceKey` above.
   if (masterKey.length !== 32) {
     throw new Error("Master key must be 32 bytes");
   }

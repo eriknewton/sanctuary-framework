@@ -50,6 +50,10 @@
 import { canonicalJson } from "../audit/chain.js";
 import { toBase64url, fromBase64urlStrict } from "../core/encoding.js";
 import { verify as verifyEd25519 } from "../core/identity.js";
+import {
+  ED25519_PUBLIC_KEY_BYTES,
+  ED25519_SIGNATURE_BYTES,
+} from "../core/crypto-suite-registry.js";
 
 /**
  * FROZEN domain / schema label for the attestation document. This is a
@@ -387,13 +391,13 @@ export function verifySignedAttestation(
   } catch {
     return { ok: false, reason: "bad_public_key" };
   }
-  if (publicKey.length !== 32) {
+  if (publicKey.length !== ED25519_PUBLIC_KEY_BYTES) {
     return { ok: false, reason: "bad_public_key" };
   }
 
   const pinned = opts?.pinnedOperatorKey;
   if (pinned !== undefined) {
-    if (pinned.length !== 32 || !timingSafeEqualBytes(pinned, publicKey)) {
+    if (pinned.length !== ED25519_PUBLIC_KEY_BYTES || !timingSafeEqualBytes(pinned, publicKey)) {
       return { ok: false, reason: "operator_key_mismatch" };
     }
   }
@@ -404,7 +408,7 @@ export function verifySignedAttestation(
   } catch {
     return { ok: false, reason: "bad_signature_encoding" };
   }
-  if (sigBytes.length !== 64) {
+  if (sigBytes.length !== ED25519_SIGNATURE_BYTES) {
     return { ok: false, reason: "bad_signature_encoding" };
   }
 

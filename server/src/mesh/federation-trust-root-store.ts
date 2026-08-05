@@ -985,6 +985,14 @@ function assertHybridPrivateDerivesPublic(
   }
 }
 
+/**
+ * 32 is correct for EVERY key this store holds, but for two different reasons:
+ * `master_secret` is a 256-bit symmetric secret, while `master_private_key` and
+ * `local_node_private_key` are 32-byte Ed25519 seeds (RFC 8032 §5.1.5). Because
+ * the helper is label-driven and spans both families, it deliberately keeps the
+ * literal instead of naming one of them: `ED25519_PRIVATE_KEY_BYTES` would be a
+ * false label on the `master_secret` call site in `validateRecord`.
+ */
 function assertKeyLength(value: Uint8Array, label: string): void {
   if (value.length !== 32) {
     throw new FederationTrustRootStoreError(`${label} must be 32 bytes`);

@@ -41,6 +41,7 @@ import type { EncryptedPayload } from "../core/encryption.js";
 import { loadConfig } from "../config.js";
 import type { StorageBackend } from "../storage/interface.js";
 import type { IssuerSigner } from "../entitlement/ledger.js";
+import { ED25519_PUBLIC_KEY_BYTES } from "../core/crypto-suite-registry.js";
 
 /**
  * Open the fortress and pin the DEFAULT operator identity as a VERIFIER: the
@@ -166,7 +167,7 @@ function decodePublicKey(b64: string): Uint8Array | null {
       b64.replace(/-/g, "+").replace(/_/g, "/"),
       "base64",
     );
-    return key.length === 32 ? new Uint8Array(key) : null;
+    return key.length === ED25519_PUBLIC_KEY_BYTES ? new Uint8Array(key) : null;
   } catch {
     return null;
   }

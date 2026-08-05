@@ -16,6 +16,7 @@ import type {
   PrincipalCertificate,
 } from "../mesh/types.js";
 import { canonicalJson } from "./operator-signed.js";
+import { ED25519_SIGNATURE_BYTES } from "../core/crypto-suite-registry.js";
 
 export const FEDERATION_POLICY_BUNDLE_EVENT_KIND =
   "operator_policy_bundle" as const;
@@ -211,7 +212,7 @@ export function verifyFederationPolicyBundleEvent(input: {
   } catch {
     return { ok: false, reason: "operator_signature_invalid" };
   }
-  if (signature.length !== 64) {
+  if (signature.length !== ED25519_SIGNATURE_BYTES) {
     return { ok: false, reason: "operator_signature_invalid" };
   }
   const signedBody = {

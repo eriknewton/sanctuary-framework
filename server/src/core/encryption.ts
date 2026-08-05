@@ -43,6 +43,8 @@ export function encrypt(
   key: Uint8Array,
   aad?: Uint8Array
 ): EncryptedPayload {
+  // 32 = the AES-256 key size (256 bits / 8). NOT an Ed25519 key length, which
+  // is also 32 bytes: `ED25519_PUBLIC_KEY_BYTES` must never be substituted here.
   if (key.length !== 32) {
     throw new Error("Key must be exactly 32 bytes (256 bits)");
   }
@@ -75,6 +77,8 @@ export function decrypt(
   key: Uint8Array,
   aad?: Uint8Array
 ): Uint8Array {
+  // 32 = the AES-256 key size (256 bits / 8); must match the check in `encrypt`
+  // above. Not an asymmetric key length.
   if (key.length !== 32) {
     throw new Error("Key must be exactly 32 bytes (256 bits)");
   }

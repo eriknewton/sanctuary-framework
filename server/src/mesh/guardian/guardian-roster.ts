@@ -37,6 +37,7 @@ import type {
   GuardianRoster,
   MasterRotationQuorumInput,
 } from "./types.js";
+import { ED25519_PUBLIC_KEY_BYTES } from "../../core/crypto-suite-registry.js";
 
 // ═══════════════════════════════════════════════════════════════════════
 // Canonical guardian-key identity
@@ -63,7 +64,7 @@ export function canonicalGuardianKey(public_key: string): string {
       `guardian public_key is not valid base64url`
     );
   }
-  if (decoded.length !== 32) {
+  if (decoded.length !== ED25519_PUBLIC_KEY_BYTES) {
     throw new GuardianRosterError(
       `guardian public_key must decode to 32 bytes (Ed25519); got ${decoded.length}`
     );

@@ -212,7 +212,11 @@ export interface HybridCertificatePublicKeys {
   };
   readonly ml_dsa_65: {
     readonly key_ref: string;
-    /** Base64url-encoded ML-DSA-65 public key (1952 bytes). */
+    /**
+     * Base64url-encoded ML-DSA-65 public key. 1952 bytes per FIPS 204; must
+     * match `ML_DSA_65_PUBLIC_KEY_BYTES` in `core/crypto-suite-registry.ts`,
+     * which is what actually enforces the width at the verify sites.
+     */
     readonly public_key: string;
   };
 }
