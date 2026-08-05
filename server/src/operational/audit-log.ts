@@ -926,8 +926,24 @@ function resolveSelfHeldStaleLockMs(
 // rotation on a loaded CI host can outrun any small fixed ceiling (the original
 // false-fail), while an attacker who keeps the store permanently mid-update still
 // fails closed once the deadline passes.
+// `AUDIT_READ_CONSISTENCY_MAX_MS` must stay below the stall in
+// `ONE_PASS_OUTLIVES_THE_BUDGET_MS` in
+// `test/operational/audit-log-concurrent-append-anchor.test.ts`, which pins the
+// mandatory-retry behavior by making one pass spend the entire budget.
 const AUDIT_READ_CONSISTENCY_MAX_MS = 2_000;
 const AUDIT_READ_CONSISTENCY_RETRY_MS = 10;
+
+/**
+ * Outcome of reading the MAC'd head anchor. `unreadable_sealed` is the
+ * operator-uid-cannot-read-the-root-owned-legacy-anchor case (F2 Option A), NOT
+ * a tamper verdict; see {@link AuditLog.verifyHeadAnchor} for how each status is
+ * adjudicated.
+ */
+type HeadAnchorReadResult =
+  | { status: "valid"; highest_sequence: number; head_hash: string }
+  | { status: "absent" }
+  | { status: "invalid" }
+  | { status: "unreadable_sealed" };
 // Eager-read backstop throttle. The posture dashboard composes several full-chain
 // reads per board paint and pushes the same payload on an SSE cadence; re-reading
 // + re-decrypting + re-verifying a 10k-entry / 40MB chain from disk on EVERY such
@@ -2257,6 +2273,12 @@ export class AuditLog {
             this.assertAuditWriteLockActive(signal);
           }
           this.assertAuditWriteLockActive(signal);
+          // ORDERING INVARIANT (must match the anchor-before-listing read order
+          // in `loadPersistedEntries`): the entry file is durably on disk BEFORE
+          // the anchor claims its sequence, so an anchor floor of N always
+          // implies entry N already exists. A reader that samples the anchor
+          // AFTER listing the entries breaks that implication (an append can
+          // land in between) and reports a live append as tail truncation.
           await this.writeHeadAnchor(sequence, entryHash);
           this.assertAuditWriteLockActive(signal);
           // F2 Finding 1: the FIRST time this operator instance persists a
@@ -2913,6 +2935,12 @@ export class AuditLog {
     );
   }
 
+  /**
+   * Outcome of one head-anchor read. Named so the load path can sample the
+   * anchor early (before the entry listing) and hand the SAME result to
+   * {@link verifyHeadAnchor} later in the pass; see the ordering invariant in
+   * {@link loadPersistedEntries}.
+   */
   private async loadHeadAnchor(
     findings: AuditIntegrityFinding[],
     // F2 Option A: whether a VALID split boundary seals a legacy region. On an
@@ -2924,12 +2952,7 @@ export class AuditLog {
     // treat it as "no usable anchor for the post-split suffix" and re-establish
     // the operator's OWN anchor, instead of failing the whole load closed.
     boundaryIsValid = false
-  ): Promise<
-    | { status: "valid"; highest_sequence: number; head_hash: string }
-    | { status: "absent" }
-    | { status: "invalid" }
-    | { status: "unreadable_sealed" }
-  > {
+  ): Promise<HeadAnchorReadResult> {
     let raw: Uint8Array | null;
     try {
       raw = await this.storage.read(
@@ -2998,16 +3021,26 @@ export class AuditLog {
     };
   }
 
+  /**
+   * Adjudicate the head anchor against the surviving chain.
+   *
+   * `anchor` is read by the CALLER, before it lists the entries, and handed in
+   * here (it is never re-read at this point in the pass). That ordering is the
+   * anti-false-truncation invariant: the append path writes the entry file
+   * before the anchor that names it (see `persistChainedEntry`), so an anchor
+   * sampled BEFORE the listing can only name entries the listing also sees.
+   * Sampling it after the listing admits an append that landed in between and
+   * turns a live, healthy writer into a `tail_anchor_invalid` tamper verdict.
+   */
   private async verifyHeadAnchor(
+    anchor: HeadAnchorReadResult,
     highestChainedSeq: number,
     highestChainedHash: string,
     hasLegacyEntries: boolean,
     hasChainedEntries: boolean,
     findings: AuditIntegrityFinding[],
-    boundaryIsValid = false,
     sealedTipSequence = 0
   ): Promise<void> {
-    const anchor = await this.loadHeadAnchor(findings, boundaryIsValid);
     if (anchor.status === "valid") {
       if (highestChainedSeq < anchor.highest_sequence) {
         findings.push({
@@ -3820,9 +3853,6 @@ export class AuditLog {
       if (this.integrityFindings.length === 0) {
         return; // clean read
       }
-      if (Date.now() >= deadline) {
-        return; // bounded backstop; surfaced in strict mode by the caller
-      }
       // Give-up discriminator (attacker safety) is STORE STABILITY, not the
       // finding kind. Retry only while the store is DEMONSTRABLY mid-mutation:
       // a writer marker is currently held, OR the entry listing changed since the
@@ -3836,7 +3866,7 @@ export class AuditLog {
       // pruned listing, entries pruned out from under a scan, a half-updated
       // checkpoint root) are tolerated WITHOUT ever classifying a genuine tamper
       // signal as "transient". The first attempt with findings always retries once
-      // to establish the listing baseline. The wall-clock deadline above bounds an
+      // to establish the listing baseline. The wall-clock deadline below bounds an
       // attacker who keeps the store permanently churning.
       const signature = await this.auditEntryListingSignature();
       const hadBaseline = lastSignature !== null;
@@ -3846,6 +3876,17 @@ export class AuditLog {
         listingChanged || (await this.isAuditWriterInProgress());
       if (hadBaseline && !storeIsMutating) {
         return; // static store with findings → fail closed (no masking)
+      }
+      // The deadline is checked only AFTER a baseline exists, so the one
+      // mandatory retry above is real work rather than a claim. Checking it
+      // first (the pre-2026-08-06 order) silently deleted that retry on any
+      // store where a SINGLE pass outlives the whole budget, which is the
+      // normal case at scale: one full decrypt+verify pass costs 11-30s
+      // on a 10k-entry chain (see the #714 note on the eager-read backstop) and
+      // the budget is 2s. Every transient tear on a large log therefore became
+      // a hard tamper verdict on the first look, with no second look at all.
+      if (hadBaseline && Date.now() >= deadline) {
+        return; // bounded backstop; surfaced in strict mode by the caller
       }
       await sleep(AUDIT_READ_CONSISTENCY_RETRY_MS);
     }
@@ -4842,6 +4883,20 @@ export class AuditLog {
       // F2 Finding 1: remember the trusted sealed tip so the append path can
       // classify a post-split suffix entry without re-reading the boundary.
       this.cachedSealedTip = effectiveSealedTip;
+      // ORDERING INVARIANT (must match the entry-then-anchor write order in
+      // `persistChainedEntry`): sample the MAC'd head anchor BEFORE listing the
+      // entries. An append writes its entry file first and its anchor second, so
+      // an anchor read at this point can only claim a floor whose entry is
+      // already on disk, hence in the listing taken below. Reading the anchor
+      // after the listing instead (the pre-2026-08-06 order) let an append that
+      // landed mid-pass raise a floor the just-taken listing could not reach,
+      // reporting a healthy concurrent writer as tail truncation. Sampling
+      // EARLIER never weakens the guard: a real truncation removes entries the
+      // listing then lacks, and an older floor is still a floor.
+      const headAnchor = await this.loadHeadAnchor(
+        findings,
+        splitBoundary.status === "valid"
+      );
       const storedEntriesRaw = await this.storage.list(AUDIT_NAMESPACE);
       // BLOCKER-1: with a valid boundary, prove from the LISTING that the sealed
       // region is complete (gap-free run ending at the tip). This catches
@@ -5076,12 +5131,12 @@ export class AuditLog {
           ? splitBoundary.boundary.sealed_tip_entry_hash
           : legacyAnchorHash);
       await this.verifyHeadAnchor(
+        headAnchor,
         highestChainedSeq,
         highestChainedHash,
         legacyRawEntries.length > 0,
         chainedEntries.length > 0,
         findings,
-        splitBoundary.status === "valid",
         effectiveSealedTip
       );
       this.nextSequence = highestChainedSeq + 1;
