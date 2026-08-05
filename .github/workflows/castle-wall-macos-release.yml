@@ -28,7 +28,7 @@ jobs:
       # extension when the version INCREASES. A shallow checkout makes the count 1,
       # so a CI-built extension can never upgrade a locally-built install (the
       # v1.7.2 artifact shipped as 0.1.0/1 against an active 0.1.0/1235 for
-      # exactly this reason — confirmed 2026-08-06 by reading the artifact plist).
+      # exactly this reason — confirmed 2026-08-05 by reading the artifact plist).
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
