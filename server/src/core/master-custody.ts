@@ -1138,8 +1138,9 @@ function decodeRecoveryKey(recoveryKey: string): Uint8Array {
         "Use the exact recovery key captured at creation."
     );
   }
-  // 32 = the 256-bit recovery key; must match `recoveryWrapKey` above, which is
-  // where the decoded value is consumed.
+  // 32 = the 256-bit recovery key. The decoded value reaches `recoveryWrapKey`
+  // above, and on the legacy virgin-init path it IS the master key, so this
+  // width must satisfy `assertMaster` too.
   if (bytes.length !== 32) {
     throw new CustodyUnlockError(
       "Sanctuary: SANCTUARY_RECOVERY_KEY has incorrect length. " +
