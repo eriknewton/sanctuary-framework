@@ -282,6 +282,17 @@ jobs:
             # passing suite. The guard below is what makes that loud here.
             export SANCTUARY_TEST_DISPOSABLE_KEYRING=1
 
+            # NO_COLOR / FORCE_COLOR=0 keep vitest ANSI-free so the summary
+            # grep below can parse it, exactly as
+            # .github/workflows/test-baseline-guard.yml does for its own gates.
+            # Failure mode without this: vitest prints
+            # `Tests \e[22m \e[1m\e[32m5 passed\e[39m`, so a
+            # `Tests[[:space:]]+[0-9]+ passed` pattern fails to match a run that
+            # passed all five tests, and the job reports the opposite of what
+            # happened.
+            export NO_COLOR=1
+            export FORCE_COLOR=0
+
             cd server
             npm test -- keychain-linux-real-backend-integration.test.ts 2>&1 \
               | tee /tmp/real-backend-vitest.log
