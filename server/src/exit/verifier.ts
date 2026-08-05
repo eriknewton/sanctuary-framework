@@ -49,6 +49,58 @@ import {
   readFileCustody,
   readFileCustodyWithStats,
 } from "../storage/custody-fs.js";
+import {
+  readSourceCustodyState,
+  type SourceCustodyState,
+} from "./source-custody.js";
+
+/**
+ * Which re-key material the encrypted_state artifact DECLARES it needs, read
+ * from the artifact alone (no fortress access, no operator secret).
+ *
+ * This is deliberately a statement about the ARTIFACT, not a prediction about
+ * an import. Three successive attempts to make it the latter failed the same
+ * way: a classifier that has no credential cannot know whether an import will
+ * succeed, and each time it claimed to, the claim was wrong for some bundle.
+ * Read every member below as "the bundle says it needs X", never as "X will
+ * work":
+ *
+ *  `bundle-rekey-key`     a well-formed `source_custody` block is present, so
+ *                         the bundle re-key key minted at export is the
+ *                         credential it names.
+ *  `legacy-passphrase`    no custody block, but well-formed legacy
+ *                         `source_key_derivation` parameters, so the bundle
+ *                         names the source fortress passphrase.
+ *  `none-declared`        the artifact carries state and declares NO re-key
+ *                         material of either kind. Pre-envelope bundles look
+ *                         like this, and for them the source recovery key IS
+ *                         the master - but nothing in the artifact says so, and
+ *                         inspect does not guess (see the `--legacy-source-master`
+ *                         opt-in on the import branch of `cli.ts`).
+ *  `no-state`             the artifact carries a readable, empty entry list, so
+ *                         it declares no re-key material because there is
+ *                         nothing to re-key.
+ *  `damaged`              the artifact DECLARES re-key material and that
+ *                         material does not have a usable shape, or its entry
+ *                         list cannot be read at all. Something is wrong with
+ *                         the artifact itself; this one is a statement about
+ *                         damage, not about what an import would do with it.
+ *
+ * CONTRACT PIN (server/src/exit/source-custody.ts `isValidSourceCustody` and
+ * server/src/core/key-derivation.ts `parseKeyDerivationParams`): the two
+ * shape-checks are not restated here - both sides call the same validators, so
+ * `valid` and `malformed` mean here exactly what they mean at the import gate.
+ * Held mechanically by the custody differential in
+ * server/test/exit/exit-inspect-declares.test.ts, which drives every crafted
+ * block through both `exit inspect` and a real `importExitBundle` and asserts
+ * they never CONTRADICT each other.
+ */
+export type ExitBundleDeclaredRekeyMaterial =
+  | "bundle-rekey-key"
+  | "legacy-passphrase"
+  | "none-declared"
+  | "no-state"
+  | "damaged";
 
 /**
  * What the encrypted_state artifact says about itself, read from the parsed
@@ -86,6 +138,14 @@ export interface ExitEncryptedStateSummary {
    */
   empty_reason_missing: boolean;
   legacy_kdf_params: "absent" | "valid" | "malformed";
+  /**
+   * The same three-state read of `source_custody` the import gate performs.
+   * Reported alongside {@link declared_rekey_material} because both a damaged
+   * custody block and a damaged legacy marker collapse to `damaged`, and the
+   * operator needs to know WHICH block is broken to know what to re-export.
+   */
+  source_custody: SourceCustodyState;
+  declared_rekey_material: ExitBundleDeclaredRekeyMaterial;
 }
 
 export interface ExitBundleDetailedVerifierResult
@@ -294,6 +354,32 @@ export function summarizeEncryptedState(
         ? "valid"
         : "malformed";
 
+  // CONTRACT PIN (server/src/exit/source-custody.ts `readSourceCustodyState`):
+  // the same predicate import's `validateSourceCustody` refuses on, so
+  // "malformed" here means exactly what makes an import throw
+  // SOURCE_CUSTODY_MALFORMED. An object-shape check was NOT enough: it reported
+  // a live re-key path for a block no import would accept.
+  const sourceCustody = readSourceCustodyState(record.source_custody);
+
+  let declared: ExitBundleDeclaredRekeyMaterial;
+  if (entries === null) {
+    // An unreadable entry list is damage, and it is NOT the zero-entry case:
+    // reporting "no state, no credential needed" for an artifact whose entries
+    // cannot be read is the absent-as-benign conflation, and the import reads
+    // `entries.length` off the same JSON and does not agree.
+    declared = "damaged";
+  } else if (entries.length === 0) {
+    declared = "no-state";
+  } else if (sourceCustody === "malformed" || legacyKdfParams === "malformed") {
+    declared = "damaged";
+  } else if (sourceCustody === "valid") {
+    declared = "bundle-rekey-key";
+  } else if (legacyKdfParams === "valid") {
+    declared = "legacy-passphrase";
+  } else {
+    declared = "none-declared";
+  }
+
   return {
     entry_count: entries === null ? null : entries.length,
     namespace_count: namespaces.length,
@@ -302,6 +388,8 @@ export function summarizeEncryptedState(
     ...(emptyReason !== undefined ? { empty_reason: emptyReason } : {}),
     empty_reason_missing: entries?.length === 0 && emptyReason === undefined,
     legacy_kdf_params: legacyKdfParams,
+    source_custody: sourceCustody,
+    declared_rekey_material: declared,
   };
 }
 

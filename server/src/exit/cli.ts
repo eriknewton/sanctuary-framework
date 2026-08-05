@@ -23,6 +23,7 @@ import type {
   ExitBundleVerifierResult,
 } from "../contracts/v1.1/exit-bundle-manifest.js";
 import { verifyExitBundle, InvalidExitBundleError } from "./verifier.js";
+import { inspectExitBundle, inspectExitCode } from "./inspect.js";
 import { loadFortressDidWebRecord } from "../recognition/did-web.js";
 
 const EXIT_EXPORT_ABORTED_EXIT_CODE = 78;
@@ -203,6 +204,9 @@ Commands:
   verify <dir>                Verify manifest, artifacts, signatures, and exported-set completeness
   import <dir> [--activate]   Verify, report conflicts, and optionally activate
   manifest-shape              Print the v1.1 manifest shape
+  inspect <dir>               Read-only: what the bundle carries and WHICH
+                              credential it DECLARES it needs. No passphrase,
+                              no writes, and no import is attempted.
 
 Options:
   --passphrase <value>              Current destination/source passphrase
@@ -401,6 +405,60 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
         }
       }
       return result.passed ? 0 : 1;
+    }
+
+    if (command === "inspect") {
+      const dir = argv[1];
+      if (!dir) {
+        write(err, "Usage: sanctuary exit inspect <dir>\n");
+        return 2;
+      }
+      let report;
+      try {
+        report = await inspectExitBundle(dir);
+      } catch (e) {
+        if (e instanceof InvalidExitBundleError) {
+          write(err, `Error: ${e.message}\n`);
+          return 1;
+        }
+        throw e;
+      }
+      if (json) {
+        write(out, JSON.stringify(report, null, 2) + "\n");
+      } else {
+        write(out, `verdict: ${report.verdict}\n`);
+        write(out, `identity: ${report.identity_id}\n`);
+        write(out, `fortress: ${report.fortress_id}\n`);
+        write(out, `exported_at: ${report.exported_at}\n`);
+        write(out, `artifacts: ${report.artifact_count}\n`);
+        // `unreadable` and `unknown` are distinct and neither is `0`: the first
+        // means the artifact's entry list could not be read, the second that
+        // there is no encrypted_state artifact at all. Printing a number for
+        // either would be the absent-as-benign conflation on screen.
+        write(
+          out,
+          `state_entries: ${report.state === undefined ? "unknown" : (report.state.entry_count ?? "unreadable")}\n`
+        );
+        write(
+          out,
+          `namespaces: ${report.state?.namespaces.join(", ") ?? "unknown"}\n`,
+        );
+        if (report.state?.empty_reason !== undefined) {
+          write(out, `empty_reason: ${report.state.empty_reason}\n`);
+        }
+        write(out, `legacy_kdf_params: ${report.legacy_kdf_params}\n`);
+        write(out, `source_custody: ${report.source_custody}\n`);
+        write(out, `declares: ${report.declared_rekey_material}\n`);
+        write(out, `to try: ${report.suggested_command}\n`);
+        // Printed unconditionally, including on the happy path: the whole
+        // defect this command exists to close was an answer that sounded more
+        // certain than it was. A limit shown only on failures is not a limit.
+        write(out, `credential check: ${report.credential_bound}\n`);
+        for (const warning of report.warnings) {
+          write(out, `warning: ${warning}\n`);
+        }
+      }
+      return inspectExitCode(report);
     }
 
     if (command === "export") {
