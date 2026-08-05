@@ -18,7 +18,12 @@
    Failure mode: a drifted mirror still parses and still renders. It looks
    almost right, so the divergence surfaces as "the prototype and the product
    are subtly different colors" long after the change that caused it. Change a
-   value in the canonical constant and in this file in the SAME PR. */
+   value in the canonical constant and in this file in the SAME PR.
+
+   Enforced by server/test/structure/design-token-mirror-reconciliation.test.ts,
+   which reparses this file and fails on any token shared with the canonical
+   constant at a different value. Omitting a token is allowed; declaring one at
+   a different value is not. */
 
 :root {
   --paper: #f7f5f0;

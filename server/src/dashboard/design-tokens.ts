@@ -55,8 +55,13 @@
  * value drift); neither mirrors the semantic `--color-*` layer, and neither
  * mirrors `--slate`/`--slate-bg`, because neither surface renders an unknown
  * status today. Changing a value here means changing it in both mirrors in the
- * SAME PR. Nothing enforces this mechanically: a drifted mirror compiles,
- * renders, and looks almost right, which is exactly how it goes unnoticed.
+ * SAME PR.
+ *
+ * `test/structure/design-token-mirror-reconciliation.test.ts` is the gate for
+ * all of the above: it reparses both mirrors and fails on any token they share
+ * with this constant at a different value. Without it a drifted mirror
+ * compiles, renders, and looks almost right, which is exactly how it goes
+ * unnoticed.
  */
 export const PAPER_INK_ROOT_TOKENS_CSS = `:root {
   --paper: #f7f5f0;

@@ -30,7 +30,12 @@
  * Failure mode: a drifted mirror still parses and still renders. The menubar
  * simply becomes a slightly different shade than the console it reports on,
  * which reads as a rendering quirk rather than as a stale copy. Change a value
- * in the canonical constant and here in the SAME PR. */
+ * in the canonical constant and here in the SAME PR.
+ *
+ * Enforced by server/test/structure/design-token-mirror-reconciliation.test.ts,
+ * which reparses this file and fails on any token shared with the canonical
+ * constant at a different value. Omitting a token is allowed; declaring one at
+ * a different value is not. */
 
 :root {
   --paper: #f7f5f0;
