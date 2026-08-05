@@ -167,6 +167,16 @@ cp node_modules/@sanctuary-framework/mcp-server/src/principal-policy/templates/p
 
 Or reference it in the [template directory](../src/principal-policy/templates/persistent-agent.yaml).
 
+**This step weakens the approval gate, and the change is invisible from the outside.** With the
+default policy, Tier 1 operations pause and wait for a human; with `persistent-agent`, routine
+operations proceed on their own and only destructive or external-facing actions still gate. From
+the operator's seat the symptom of this posture is *approval requests that never arrive*: if you
+expected to be asked and weren't, check which policy file is active before assuming the gate is
+broken. The policy loads once at startup, so the swap takes effect on the next server start, not
+immediately, and reverting requires restoring the default template and restarting. Do not use this
+template on a fortress whose approval pauses are the point (for example, one holding real
+credentials or real reputation state) unless you have deliberately accepted that trade.
+
 ## Rollback
 
 Remove from Claude Code:
