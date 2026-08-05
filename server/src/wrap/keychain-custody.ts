@@ -263,8 +263,11 @@ async function readKeyClassified(
       // unreachable (the operator should investigate) rather than "not-found".
       return { status: "unreachable", detail: "keychain item is malformed" };
     }
-    // 32 = the 256-bit custody key held in the keychain item; must match
-    // `keychainWrapKey` in `core/master-custody.ts`, which consumes it.
+    // 32 = the 256-bit width of every key this reader classifies. It is
+    // generic over the two keyring items (the custody key read by
+    // `readKeychainCustodyKey` and the recovery key probed by
+    // `probeKeychainRecoveryKey`), so it names neither; both are consumed at
+    // that width in `core/master-custody.ts`.
     if (bytes.length !== 32) {
       return { status: "unreachable", detail: "keychain item has wrong length" };
     }
@@ -450,8 +453,9 @@ export async function storeRecoveryKeyInKeychain(
   }
 
   try {
-    // 32 = the 256-bit recovery key; must match `decodeRecoveryKey` in
-    // `core/master-custody.ts`, which consumes what this stores.
+    // 32 = the 256-bit recovery key. Same minted value the operator is shown
+    // once (see this function's doc comment), so the width must match
+    // `decodeRecoveryKey` in `core/master-custody.ts`, which accepts it.
     if (recoveryKeyBytes.length !== 32) {
       throw new RecoveryKeyKeychainStoreError(service);
     }

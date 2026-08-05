@@ -386,9 +386,10 @@ export async function runFederationJoin(args: {
       err.write("sanctuary federation join: --delivery-key is not valid base64url\n");
       return 1;
     }
-    // 32 = the 256-bit symmetric delivery key; must match the check in
-    // `buildOperatorCloudProvisionBundle` (mesh/operator-cloud-provision.ts),
-    // which uses it as the AES-256 key for the scoped secret.
+    // 32 = the 256-bit symmetric delivery key. The bundle builder
+    // (`buildOperatorCloudProvisionBundle` in mesh/operator-cloud-provision.ts)
+    // checks the same width and uses it as the AES-256 key for the scoped
+    // secret, so a mismatch here would surface only as a decrypt failure.
     if (deliveryKey.length !== 32) {
       err.write("sanctuary federation join: delivery key must be 32 bytes\n");
       return 1;

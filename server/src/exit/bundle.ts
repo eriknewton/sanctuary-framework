@@ -1353,9 +1353,9 @@ function validateSourceCustody(custody: ExitSourceCustody): void {
 
 function decodeSourceRecoveryKey(sourceRecoveryKey: string): Uint8Array {
   const key = fromBase64url(sourceRecoveryKey);
-  // 32 = the 256-bit recovery key minted by `generateRandomKey()`; must match
-  // `decodeRecoveryKey` in `core/master-custody.ts`, which reads the same value
-  // from `SANCTUARY_RECOVERY_KEY`. Symmetric material, not an Ed25519 key.
+  // 32 = the 256-bit recovery key minted by `generateRandomKey()`. The SOURCE
+  // fortress's recovery key, so the width must match `decodeRecoveryKey` in
+  // `core/master-custody.ts`. Symmetric material, not an Ed25519 key.
   if (key.length !== 32) {
     throw new Error("Source recovery key must decode to 32 bytes.");
   }
