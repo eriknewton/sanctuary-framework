@@ -520,6 +520,39 @@ describe("anchor restore + one-time basis migration", () => {
   });
   const anchorHash = sha256Hex(anchorBody);
 
+  /** A persisted anchor carrying VALID producer signature material. */
+  function signedAnchor(over: Partial<{
+    seq: number;
+    signedCanonicalJson: string | null;
+    signatureB64url: string | null;
+    keyId: string | null;
+    capturedAtUnixMs: number | null;
+    chainBasis: string | null;
+    identityId: string;
+  }> = {}) {
+    const seq = over.seq ?? 41;
+    const body =
+      over.signedCanonicalJson !== undefined
+        ? over.signedCanonicalJson
+        : anchorBody;
+    return {
+      kind: "persisted" as const,
+      seq,
+      signedCanonicalJson: body,
+      signatureB64url:
+        over.signatureB64url !== undefined
+          ? over.signatureB64url
+          : body === null
+            ? null
+            : signBody(body, seq),
+      keyId: over.keyId !== undefined ? over.keyId : CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1,
+      capturedAtUnixMs:
+        over.capturedAtUnixMs !== undefined ? over.capturedAtUnixMs : SIGNED_TS,
+      chainBasis: over.chainBasis !== undefined ? over.chainBasis : null,
+      identityId: over.identityId ?? "agent-a",
+    };
+  }
+
   function sourceReturning(
     value: Awaited<ReturnType<ChainAnchorSource>>,
   ): ChainAnchorSource {
@@ -529,13 +562,7 @@ describe("anchor restore + one-time basis migration", () => {
   it("old-basis history (no stored basis) migrates exactly once, record flushed BEFORE use", async () => {
     const sink = new RecordingSink();
     const consumer = completeConsumer(sink, {
-      chainAnchorSource: sourceReturning({
-        kind: "persisted",
-        seq: 41,
-        signedCanonicalJson: anchorBody,
-        chainBasis: null,
-        identityId: "agent-a",
-      }),
+      chainAnchorSource: sourceReturning(signedAnchor()),
     });
     const body42 = rustWalBody({ seq: 42, prior: anchorHash, timestamp: "2026-08-05T00:00:00Z" });
     await consumer.ingestCritical(
@@ -564,13 +591,9 @@ describe("anchor restore + one-time basis migration", () => {
   it("new-basis history restores silently (no second migration) and closes the restart replay hole", async () => {
     const sink = new RecordingSink();
     const consumer = completeConsumer(sink, {
-      chainAnchorSource: sourceReturning({
-        kind: "persisted",
-        seq: 41,
-        signedCanonicalJson: anchorBody,
-        chainBasis: CASTLE_WALL_CHAIN_BASIS_PRODUCER_SIGNED_BODY,
-        identityId: "agent-a",
-      }),
+      chainAnchorSource: sourceReturning(
+        signedAnchor({ chainBasis: CASTLE_WALL_CHAIN_BASIS_PRODUCER_SIGNED_BODY }),
+      ),
     });
     // A captured OLD signed frame replayed into the "fresh" consumer: without
     // the restore this would bootstrap-accept; with it, the restored seq floor
@@ -595,13 +618,9 @@ describe("anchor restore + one-time basis migration", () => {
   it("an unsigned last entry latches chain_migration_unavailable: loud once, stuck, never ACKed", async () => {
     const sink = new RecordingSink();
     const consumer = completeConsumer(sink, {
-      chainAnchorSource: sourceReturning({
-        kind: "persisted",
-        seq: 41,
-        signedCanonicalJson: null,
-        chainBasis: null,
-        identityId: "agent-a",
-      }),
+      chainAnchorSource: sourceReturning(
+        signedAnchor({ signedCanonicalJson: null }),
+      ),
     });
     let acked = 0;
     const body = rustWalBody({ seq: 42, prior: sha256Hex("whatever"), timestamp: "2026-08-05T00:00:00Z" });
@@ -627,6 +646,60 @@ describe("anchor restore + one-time basis migration", () => {
     ).toHaveLength(1);
     expect(acked).toBe(0);
     expect(consumer.getStats().acceptedCriticalEvents).toBe(0);
+  });
+
+
+  it("REGRESSION (gate #1103 R1): a persisted anchor with an INVALID signature is refused, not adopted", async () => {
+    const sink = new RecordingSink();
+    const consumer = completeConsumer(sink, {
+      // A row planted by some other writer: plausible shape, bogus signature.
+      chainAnchorSource: sourceReturning(
+        signedAnchor({
+          seq: 9_000,
+          signatureB64url: signBody(rustWalBody({
+            seq: 9_000,
+            prior: null,
+            timestamp: "2026-08-04T00:00:00Z",
+          }), 9_000),
+        }),
+      ),
+    });
+    const body = rustWalBody({ seq: 42, prior: anchorHash, timestamp: "2026-08-05T00:00:00Z" });
+    await expect(
+      consumer.ingestCritical(rustDrainEnvelope({ canonical: body, seq: 42, prior: anchorHash })),
+    ).rejects.toThrow("chain_migration_unavailable");
+    const latch = sink.entries.find((e) => e.operation === "chain_migration_unavailable");
+    expect(String(latch?.details?.reason)).toContain("persisted_anchor_signature_invalid");
+  });
+
+  it("REGRESSION: a genuine signed body re-filed under a CHOSEN seq is refused (seq must be signature-bound)", async () => {
+    const sink = new RecordingSink();
+    const consumer = completeConsumer(sink, {
+      // anchorBody's signed details say seq 41; the row claims seq 9000, and
+      // the signature is recomputed over the chosen seq so it verifies.
+      chainAnchorSource: sourceReturning(signedAnchor({ seq: 9_000 })),
+    });
+    const body = rustWalBody({ seq: 9_001, prior: anchorHash, timestamp: "2026-08-05T00:00:00Z" });
+    await expect(
+      consumer.ingestCritical(rustDrainEnvelope({ canonical: body, seq: 9_001, prior: anchorHash })),
+    ).rejects.toThrow("chain_migration_unavailable");
+    expect(
+      sink.entries.find((e) => e.operation === "chain_migration_unavailable")?.details?.reason,
+    ).toBe("persisted_anchor_seq_not_signature_bound");
+  });
+
+  it("REGRESSION: signature material stripped from the row is refused, never adopted unverified", async () => {
+    const sink = new RecordingSink();
+    const consumer = completeConsumer(sink, {
+      chainAnchorSource: sourceReturning(signedAnchor({ signatureB64url: null })),
+    });
+    const body = rustWalBody({ seq: 42, prior: anchorHash, timestamp: "2026-08-05T00:00:00Z" });
+    await expect(
+      consumer.ingestCritical(rustDrainEnvelope({ canonical: body, seq: 42, prior: anchorHash })),
+    ).rejects.toThrow("chain_migration_unavailable");
+    expect(
+      sink.entries.find((e) => e.operation === "chain_migration_unavailable")?.details?.reason,
+    ).toBe("persisted_anchor_signature_material_missing");
   });
 
   it("audit-log integrity findings latch the unavailable state", async () => {

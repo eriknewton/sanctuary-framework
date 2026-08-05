@@ -102,6 +102,17 @@ export type PersistedChainAnchor =
        */
       signedCanonicalJson: string | null;
       /**
+       * The rest of the persisted `ProducerSignatureInput`
+       * (`cw_producer_sig` / `cw_producer_kid` / `cw_producer_captured_at_ms`).
+       * The restore RE-VERIFIES the signature over these before adopting the
+       * anchor, so a persisted row is never trusted because of where it sits
+       * or what marker it carries — only because the pinned producer key
+       * signed those exact bytes.
+       */
+      signatureB64url: string | null;
+      keyId: string | null;
+      capturedAtUnixMs: number | null;
+      /**
        * The recorded chain basis (`cw_chain_basis`), or null for entries
        * written before the basis was recorded — which by construction means
        * the legacy `event_canonical` basis.
@@ -738,6 +749,67 @@ export class AuditConsumer {
       await this.latchMigrationUnavailable(
         anchor.identityId,
         "last_accepted_entry_unsigned",
+      );
+      return;
+    }
+    // DEFENSE IN DEPTH (gate finding, PR #1103 round 1): never adopt an anchor
+    // because of WHERE a row sits or WHICH marker it carries. Any writer that
+    // can append to this log could otherwise plant a chain position the
+    // restore reads back as its own history. Re-verify the pinned producer's
+    // signature over the persisted bytes, and require the signed seq to match
+    // the row's seq, so the adopted anchor is cryptographically bound to a
+    // real producer event. Freshness is deliberately NOT applied here: a
+    // durable anchor is legitimately old, and the anti-replay property comes
+    // from the restored monotonic seq floor, never from a time window.
+    if (
+      anchor.signatureB64url === null ||
+      anchor.keyId === null ||
+      anchor.capturedAtUnixMs === null
+    ) {
+      await this.latchMigrationUnavailable(
+        anchor.identityId,
+        "persisted_anchor_signature_material_missing",
+      );
+      return;
+    }
+    const verdict = verifyProducerSignature(
+      {
+        eventCanonicalJson: anchor.signedCanonicalJson,
+        capturedAtUnixMs: anchor.capturedAtUnixMs,
+        seq: anchor.seq,
+        signatureB64url: anchor.signatureB64url,
+        keyId: anchor.keyId,
+      },
+      this.pinnedProducerKeyB64url,
+    );
+    if (!verdict.ok) {
+      await this.latchMigrationUnavailable(
+        anchor.identityId,
+        `persisted_anchor_signature_invalid:${verdict.reason}`,
+      );
+      return;
+    }
+    const parsedAnchorBody = parseSignedBody(anchor.signedCanonicalJson);
+    if (parsedAnchorBody.kind === "error") {
+      await this.latchMigrationUnavailable(
+        anchor.identityId,
+        `persisted_anchor_body_unparseable:${parsedAnchorBody.reason}`,
+      );
+      return;
+    }
+    const signedAnchorDetails = signedDetailsFromBody(parsedAnchorBody.body);
+    if (
+      Object.prototype.hasOwnProperty.call(
+        signedAnchorDetails,
+        CASTLE_WALL_WAL_SEQUENCE_DETAIL_KEY,
+      ) &&
+      signedAnchorDetails[CASTLE_WALL_WAL_SEQUENCE_DETAIL_KEY] !== anchor.seq
+    ) {
+      // The row's seq must be the one inside the signed bytes; otherwise a
+      // genuine signed body could be re-filed under a chosen seq floor.
+      await this.latchMigrationUnavailable(
+        anchor.identityId,
+        "persisted_anchor_seq_not_signature_bound",
       );
       return;
     }
@@ -1504,10 +1576,19 @@ export function buildChainAnchorSourceFromAuditLog(
       if (typeof seq !== "number" || !hasPrior) continue;
       const signed = details[CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY];
       const basis = details[CASTLE_WALL_CHAIN_BASIS_DETAIL_KEY];
+      const sig = details[CASTLE_WALL_PRODUCER_SIG_DETAIL_KEY];
+      const kid = details[CASTLE_WALL_PRODUCER_KID_DETAIL_KEY];
+      const capturedAt = details[CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY];
+      // Everything here is a CANDIDATE only: the consumer re-verifies the
+      // producer signature over these bytes before adopting any of it. This
+      // scan deliberately makes no trust decision.
       return {
         kind: "persisted",
         seq,
         signedCanonicalJson: typeof signed === "string" ? signed : null,
+        signatureB64url: typeof sig === "string" ? sig : null,
+        keyId: typeof kid === "string" ? kid : null,
+        capturedAtUnixMs: typeof capturedAt === "number" ? capturedAt : null,
         chainBasis: typeof basis === "string" ? basis : null,
         identityId: entry.identity_id,
       };

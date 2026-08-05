@@ -30,6 +30,7 @@ import type { SignedManifest } from "../allowlist/manifest.js";
 import {
   CASTLE_WALL_AUDIT_LAYER,
   CASTLE_WALL_AUDIT_PROVENANCE_KEY,
+  CASTLE_WALL_SIGNED_ROW_BINDING_IGNORED_DETAIL_KEYS,
   CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
 } from "../constants.js";
 import { buildAuditEvent } from "../audit/builder.js";
@@ -535,7 +536,17 @@ export class MacOSFlowEventConsumer {
       event.event_type,
       event.fortress_id,
       {
-        ...event.details,
+        // The extension's `details` are UNTRUSTED wire input, and this entry
+        // is stamped with the consumer provenance marker below. Strip every
+        // consumer-added carrier key first: those keys are the vocabulary
+        // read-side consumers use to identify chain-participating, signature-
+        // bearing entries (chain seq/prior, producer signature material,
+        // evidence + chain basis). Without this, a diagnostic frame could
+        // plant a fabricated chain position that the startup anchor restore
+        // would later read back as its own history. Mirrors the same
+        // strip-then-stamp rule the unsigned branch of `buildDetailsForEvent`
+        // enforces in audit-consumer.ts.
+        ...stripConsumerCarrierDetailKeys(event.details),
         timestamp: event.timestamp,
         [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
       },
@@ -808,6 +819,26 @@ function buildProducerSignedEnvelope(
       fortressId,
     },
   };
+}
+
+/**
+ * Remove every consumer-added carrier key from an UNTRUSTED wire `details`
+ * blob before it is persisted under the consumer provenance marker. Must stay
+ * in sync with `CASTLE_WALL_SIGNED_ROW_BINDING_IGNORED_DETAIL_KEYS` in
+ * `castle-wall/constants.ts` — that list is the authoritative inventory of
+ * keys the consumer itself writes (chain seq/prior, producer signature
+ * material, evidence + chain basis, provenance), and read-side consumers treat
+ * them as consumer-authored facts.
+ */
+function stripConsumerCarrierDetailKeys(
+  details: Record<string, unknown> | null | undefined,
+): Record<string, unknown> {
+  if (details === null || details === undefined) return {};
+  const out: Record<string, unknown> = { ...details };
+  for (const key of CASTLE_WALL_SIGNED_ROW_BINDING_IGNORED_DETAIL_KEYS) {
+    delete out[key];
+  }
+  return out;
 }
 
 function macOSFlowProtectionSubject(fortressId: string, agentId: string): string {

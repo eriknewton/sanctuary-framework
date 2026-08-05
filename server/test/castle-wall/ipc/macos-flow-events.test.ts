@@ -31,6 +31,7 @@ import type {
   ManifestUpdatedNotification,
 } from "../../../src/castle-wall/ipc/messages.js";
 import { canonicalize } from "../../../src/mesh/canonical-json.js";
+import { buildChainAnchorSourceFromAuditLog } from "../../../src/castle-wall/runtime/audit-consumer.js";
 import {
   MacOSFlowEventConsumer,
   validateFlowDecisionRecorded,
@@ -1058,6 +1059,81 @@ describe("MacOSFlowEventConsumer : extension diagnostics", () => {
     });
     expect(consumer.getStats().extensionDiagnosticsRecorded).toBe(1);
     expect(consumer.getStats().extensionDiagnosticsRejected).toBe(0);
+  });
+
+
+  it("REGRESSION (gate #1103 R1): a hostile diagnostic cannot plant chain/signature carrier fields", async () => {
+    // The direct diagnostic append stamps the consumer provenance marker, and
+    // the startup anchor restore reads persisted rows back as its own history.
+    // If the extension's untrusted `details` survived verbatim, a diagnostic
+    // frame could fabricate a chain position (seq / prior / signed canonical /
+    // chain basis) that the restore would later adopt. Every consumer-added
+    // carrier key must be stripped before the marker is stamped.
+    const { consumer, auditSinkBundle } = buildConsumer();
+    const notification: AuditEmitNotification = {
+      type: "audit_emit",
+      event: {
+        schema_version: 1,
+        layer: "l1",
+        timestamp: "2026-06-11T00:00:00.000Z",
+        fortress_id: "fortress-test",
+        event_type: "provider_unbound",
+        agent: null,
+        destination: null,
+        decision: null,
+        rule_id: null,
+        details: {
+          source: "macos_extension",
+          trigger: "verdict",
+          // Hostile payload: a fabricated chain position + signature carriers.
+          seq: 999_999,
+          prior_sha256_hex: "de".repeat(32),
+          cw_producer_signed_canonical: '{"layer":"l1","operation":"egress_blocked"}',
+          cw_producer_sig: "forged-signature",
+          cw_producer_kid: "castle-wall-producer-v1",
+          cw_producer_captured_at_ms: 1_750_000_000_000,
+          cw_chain_basis: "producer_signed_body",
+          cw_evidence_basis: "producer_signed",
+          cw_producer_subject_binding: "signed_identity_id",
+        },
+      },
+    };
+
+    await consumer.handleAuditEmit(notification);
+
+    expect(auditSinkBundle.entries).toHaveLength(1);
+    const details = auditSinkBundle.entries[0]?.details ?? {};
+    // Benign diagnostic fields survive.
+    expect(details).toMatchObject({ source: "macos_extension", trigger: "verdict" });
+    // Every carrier key is gone.
+    for (const key of [
+      "seq",
+      "prior_sha256_hex",
+      "cw_producer_signed_canonical",
+      "cw_producer_sig",
+      "cw_producer_kid",
+      "cw_producer_captured_at_ms",
+      "cw_chain_basis",
+      "cw_evidence_basis",
+      "cw_producer_subject_binding",
+    ]) {
+      expect(details).not.toHaveProperty(key);
+    }
+    // The entry therefore cannot pass the anchor source's chain filters.
+    const anchor = await buildChainAnchorSourceFromAuditLog({
+      async query() {
+        return {
+          entries: auditSinkBundle.entries.map((e) => ({
+            operation: e.operation,
+            identity_id: e.identityId,
+            details: e.details,
+          })),
+          total: auditSinkBundle.entries.length,
+          integrity_findings: [],
+        };
+      },
+    })();
+    expect(anchor).toBeNull();
   });
 
   it("rejects non-provider extension audit events", async () => {
