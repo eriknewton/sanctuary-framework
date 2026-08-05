@@ -140,7 +140,12 @@ async function exportFromSource(
     reputationStore: source.reputationStore,
     policy: DEFAULT_POLICY,
     config: defaultConfig(),
-    stateNamespaces: namespaces,
+    // Omit rather than forward an empty list: the exporter rejects a
+    // supplied-but-empty selection, because that shape is what a flag parser
+    // emits when the operator named nothing and it must mean "export all."
+    // This harness passes no stateStoragePath, so omitting still discovers
+    // nothing and the zero-state cases below keep their meaning.
+    ...(namespaces.length > 0 ? { stateNamespaces: namespaces } : {}),
     keySource: "recovery-key",
     ...extra,
   });

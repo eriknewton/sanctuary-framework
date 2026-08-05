@@ -93,7 +93,10 @@ async function exportFromSource(
     reputationStore: source.reputationStore,
     policy: DEFAULT_POLICY,
     config: defaultConfig(),
-    stateNamespaces,
+    // Omit rather than forward an empty list: the exporter rejects a
+    // supplied-but-empty selection, because that shape is what a flag parser
+    // emits when the operator named nothing and it must mean "export all."
+    ...(stateNamespaces.length > 0 ? { stateNamespaces } : {}),
     keySource: "recovery-key",
   });
 }
@@ -355,7 +358,8 @@ describe("Exit bundle hardening (full-sweep #54 + #55)", () => {
       reputationStore: source.reputationStore,
       policy: DEFAULT_POLICY,
       config: defaultConfig(),
-      stateNamespaces: [],
+      // No stateStoragePath is supplied, so discovery finds nothing; the
+      // exporter rejects an explicit empty list, so omit it.
       keySource: "recovery-key",
       didWeb: { identifier: DID_URI, authority_host: AUTHORITY_HOST },
     });

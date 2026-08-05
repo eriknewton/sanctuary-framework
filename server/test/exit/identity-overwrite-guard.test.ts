@@ -100,7 +100,8 @@ describe("Finding RRR: identity overwrite guard for mismatched identities", () =
       reputationStore: fortressA.reputationStore,
       policy: DEFAULT_POLICY,
       config: defaultConfig(),
-      stateNamespaces: [],
+      // No stateStoragePath is supplied, so discovery finds nothing; the
+      // exporter rejects an explicit empty list, so omit it.
       keySource: "recovery-key",
     });
 

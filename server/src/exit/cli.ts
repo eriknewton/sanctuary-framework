@@ -214,7 +214,8 @@ Options:
   --destination-identity-id <id>    Destination signer for re-keyed state
   --import-state                    Import encrypted state during activation.
                                     Requires --activate and source credentials.
-  --state-namespace <name>          Export a namespace; repeatable
+  --state-namespace <name>          Restrict the export to a namespace; repeatable.
+                                    Omit it to export EVERY namespace.
   --conflict <skip|overwrite|version>
   --force-rebind                    On import: explicitly replace an existing fortress
                                     public identity (Tier 1 confirmation)
@@ -272,7 +273,9 @@ Description:
 Options:
   --out <dir>                       Destination bundle directory.
   --passphrase <value>              Current fortress passphrase.
-  --state-namespace <name>          Export a namespace; repeatable.
+  --state-namespace <name>          Restrict the export to a namespace; repeatable.
+                                    Omit it to export EVERY namespace found in the
+                                    fortress state directory.
   --did-web <identifier>            Embed a specific did:web identifier.
   --did-web-authority-host <host>   Required with --did-web.
   --did-web-published-at <iso8601>  Claimed DID Document publication time.
@@ -479,6 +482,15 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
           didWebSource = "no-record";
         }
       }
+      // `--state-namespace` is repeatable and OPTIONAL. When the operator names
+      // none, `repeatedFlagValues` returns [], which must NOT be forwarded:
+      // passing an empty selection meant "export nothing" and produced a signed
+      // bundle with zero state entries. Spread it conditionally so "named none"
+      // reaches the exporter as an absent option, which is its contract for
+      // "discover and export every namespace." Same shape as
+      // `didWebAllowedHosts` on the import path below; `exportEncryptedState`
+      // now throws on an empty array so this cannot silently regress.
+      const stateNamespaces = repeatedFlagValues(argv, "--state-namespace");
       const result = await exportExitBundle({
         bundleDir: outDir,
         storage: ctx.storage,
@@ -489,7 +501,7 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
         policy,
         config,
         stateStoragePath: ctx.stateStoragePath,
-        stateNamespaces: repeatedFlagValues(argv, "--state-namespace"),
+        ...(stateNamespaces.length > 0 ? { stateNamespaces } : {}),
         keySource: ctx.keySource,
         // The CLI is an operator terminal: safe to mint + display the
         // bundle re-key key (it is never written into the bundle).
@@ -512,6 +524,12 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
       } else {
         write(out, `exported: ${result.bundle_dir}\n`);
         write(out, `manifest_hash: ${result.manifest_hash}\n`);
+        // How much state actually travelled is the one number an operator needs
+        // to sanity-check an exit bundle, and until now the export path printed
+        // neither it nor `result.warnings` (verify and import both print
+        // warnings). A successful-looking export with no state count is how a
+        // silently-empty bundle passed for a good one.
+        write(out, `state_entries: ${result.state_entry_count}\n`);
         if (didWebSource === "fortress-config" && exportDidWeb) {
           write(
             out,
@@ -529,6 +547,9 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
             out,
             `did:web: not included (no fortress config; run "sanctuary did-web issue" to register)\n`,
           );
+        }
+        for (const warning of result.warnings ?? []) {
+          write(out, `warning: ${warning}\n`);
         }
         for (const item of result.unsupported_artifacts) {
           write(out, `unsupported: ${item}\n`);
@@ -549,6 +570,36 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
             ].join("\n")
           );
         }
+      }
+      // Outside the --json branch on purpose: a zero-state export is the one
+      // outcome an operator must not be able to miss, and it goes to stderr so
+      // it survives `sanctuary exit export --json > bundle.json`. Symmetric with
+      // the import path's "NO STATE was imported" block below. It is a WARNING,
+      // not a failure: a fresh fortress with no state has nothing to export, and
+      // the bundle still carries a usable identity, policy set, and audit
+      // receipts. The exporter no longer has a silent way to reach zero, so a
+      // zero here means the source fortress really is empty.
+      if (result.state_entry_count === 0) {
+        write(
+          err,
+          [
+            "",
+            "WARNING: NO STATE was exported. This bundle carries zero state entries.",
+            stateNamespaces.length > 0
+              ? `The named namespaces matched nothing: ${stateNamespaces.join(", ")}`
+              : "Every namespace under the fortress state directory was searched.",
+            "It can restore identity, policy, and audit receipts, but no memory or",
+            "namespace data, and no bundle re-key key was minted (nothing to re-key).",
+            "Confirm the source fortress is genuinely empty before treating this as",
+            // A concrete path the operator can list, not a CLI command: state
+            // enumeration is an MCP tool (state_list), so naming a `sanctuary
+            // state ...` command here would send them to something that does
+            // not exist.
+            `a complete exit. Each namespace is a directory under:`,
+            `  ${ctx.stateStoragePath}`,
+            "",
+          ].join("\n")
+        );
       }
       return 0;
     }
