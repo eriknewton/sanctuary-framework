@@ -2,9 +2,10 @@
 
    MUST MATCH `PAPER_INK_ROOT_TOKENS_CSS` in
    server/src/dashboard/design-tokens.ts. That constant is the canonical source
-   every shipped web surface interpolates; this file is a hand-copied mirror for
-   the prototype and no build step reads the constant, so nothing keeps the two
-   in step but this comment. (An earlier version of this header named
+   for the paper/ink surfaces (it does not reach the legacy approval board,
+   which keeps its own GitHub-dark palette); this file is a hand-copied mirror
+   for the prototype and no build step reads the constant, so nothing keeps the
+   two in step but this comment. (An earlier version of this header named
    server/src/dashboard/v1_1/html.ts as the source; that file now imports the
    constant and carries no `:root` block of its own.)
 

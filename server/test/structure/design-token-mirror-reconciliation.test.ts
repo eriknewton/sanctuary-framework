@@ -1,15 +1,28 @@
-// fail-before-exempt: structural reconciliation guard, not a bug fix. It pins an
-// invariant that already held before this PR (the two out-of-build CSS mirrors
-// carry zero value drift from the canonical token constant); there is no "before"
-// state where it fails, by design. The PR's own claim is that visual output is
-// UNCHANGED, so a test that failed pre-fix would mean the PR changed rendering.
-// This test exists to turn that PR's pin comments into a gate.
 /**
  * Design-token mirror reconciliation guard.
  *
+ * This file carried a `fail-before-exempt` marker when it was first pushed,
+ * claiming there was no pre-fix state in which it failed. That was WRONG, and
+ * an adversarial review caught it. Measured against pre-fix source it fails:
+ *
+ *   - 4 of 12 against a full `origin/main` archive: both "carries the
+ *     must-match pin" assertions (the pins did not exist yet) plus the two
+ *     alias assertions (the `--color-*` layer did not exist yet).
+ *   - 2 of 12 under CI's actual method, which reverts only `server/src` and
+ *     leaves the mirror CSS in place: the two alias assertions.
+ *
+ * So the exemption was both false and unnecessary, and it is gone. Only the
+ * value-drift half of this file describes an invariant that already held; the
+ * pin and alias halves are genuinely new. A false exemption is the same class
+ * of defect as the stale pin comment this PR exists to fix, which is the reason
+ * it is written down here instead of quietly deleted.
+ *
  * `PAPER_INK_ROOT_TOKENS_CSS` (server/src/dashboard/design-tokens.ts) is the
- * canonical palette every shipped web surface interpolates. Two files copy a
- * SUBSET of those values by hand and cannot import the constant:
+ * canonical palette for the paper/ink surfaces. It is not the palette of every
+ * page the server serves: the legacy approval board (`generateDashboardHTML`)
+ * still runs on its own GitHub-dark `:root`, and this test does not cover it.
+ * Two files copy a SUBSET of the canonical values by hand and cannot import the
+ * constant:
  *
  *   - server/docs/design-refs/sprint-piece-2/tokens.css: a static design
  *     reference; no build step reads TypeScript.

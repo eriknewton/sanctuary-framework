@@ -9,8 +9,9 @@
  * the posture pages in a generic GitHub-dark palette, the Fleet Switcher in a
  * hand-copied light-only "scoped mirror" with no dark theme. Three visual
  * languages across four surfaces. This constant promotes the v1.1 block to the
- * one shared source every web surface interpolates, so the palette, the warm
- * dark theme, and the type/spacing scale can no longer drift per surface.
+ * one shared source every PAPER/INK surface interpolates, so the palette, the
+ * warm dark theme, and the type/spacing scale can no longer drift per surface.
+ * (It does not reach the legacy approval board; see the collision note below.)
  *
  * The block is a byte-faithful extraction of the tokens that already shipped on
  * the v1.1 board, with two additive tokens the audit called out:
@@ -32,18 +33,26 @@
  * Consumed as a RAW CSS string interpolated verbatim into each page's inline
  * `<style>` tag. Keep it dependency free and side-effect free.
  *
- * IN-REPO CONSUMERS (all interpolate this constant and declare no `:root` of
- * their own): `dashboard/v1_1/html.ts`, `dashboard/mobile.ts`,
+ * IN-REPO CONSUMERS (each interpolates this constant and declares no `:root` of
+ * its own): `dashboard/v1_1/html.ts`, `dashboard/mobile.ts`,
  * `principal-policy/posture-html-shared.ts` (re-exported as
  * `POSTURE_ROOT_TOKENS_CSS`), and `principal-policy/dashboard-html.ts` in
- * `generateLoginHTML` and `generateFleetSwitcherHTML`.
+ * `generateLoginHTML` and `generateFleetSwitcherHTML`. That list is exhaustive:
+ * this constant is NOT the source for every page the server serves.
  *
  * ONE SURFACE IS STILL OUTSIDE THIS SYSTEM: `generateDashboardHTML` in
  * `principal-policy/dashboard-html.ts` carries its own GitHub-dark `:root`
- * (`--bg`, `--green`, `--red`, `--blue`, ...) with no paper/ink token in it.
- * That is the legacy approval-channel board; porting it is a visual change and
- * is deliberately NOT part of this token work. Do not read the pin above as
- * covering it.
+ * (`--bg`, `--green`, `--red`, `--blue`, ...). That is the legacy
+ * approval-channel board; porting it is a visual change and is deliberately NOT
+ * part of this token work. Do not read the pin above as covering it.
+ *
+ * ONE TOKEN NAME COLLIDES ACROSS THE TWO SYSTEMS: `--surface`. The legacy board
+ * defines it as `#161b22`; this constant defines it as `#fdfcf8` (light) and
+ * `#1a1a17` (dark). Every other legacy name (`--bg`, `--border`,
+ * `--text-primary`, `--green`, ...) is absent here, so `--surface` is the one
+ * place a partial merge of the two blocks silently recolors cards instead of
+ * failing loudly. The same warning is pinned at the legacy block itself; the
+ * two must keep agreeing.
  *
  * OUT-OF-BUILD MIRRORS. Two files outside this module's import graph hand-copy
  * a SUBSET of these values and must match them:
@@ -118,8 +127,8 @@ export const PAPER_INK_ROOT_TOKENS_CSS = `:root {
      for the semantic name so the status vocabulary this system enforces is
      legible in the stylesheet rather than only in the prose above.
 
-     Why the alias layer exists rather than a comment: the status set has five
-     members and "unknown" is one of them, with its own hue and its own name.
+     Why the layer is worth its lines: the status set has five members, and
+     "unknown" is one of them, with its own hue and its own name.
      Green must mean "checked and passed," never "no data." A surface with no
      result has --color-status-unknown to reach for, so it never has to borrow
      the pass color for want of a token. The wired mapping of these five onto

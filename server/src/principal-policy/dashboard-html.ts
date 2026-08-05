@@ -12,14 +12,19 @@ export function generateLoginHTML(options: { serverVersion: string }): string {
   <title>Sanctuary — Principal Dashboard</title>
   <style>
     /* v1.1 "paper/ink" design tokens. Must match PAPER_INK_ROOT_TOKENS_CSS in
-       server/src/dashboard/design-tokens.ts, which is the canonical source
-       every web surface interpolates (the v1.1 board no longer carries its own
-       :root block either). This page used to hand-copy a light-only subset
-       here; that copy is gone, so the palette cannot drift on the login screen
-       alone. Interpolating the shared constant is additive for this page: the
-       22 tokens the old copy declared were byte-identical to the canonical
-       values, and none of the tokens the shared block adds are referenced by
-       the CSS below.
+       server/src/dashboard/design-tokens.ts, the canonical source for the
+       paper/ink surfaces: the v1.1 board, the mobile view, the three posture
+       pages, this login page, and the Fleet Switcher. It is NOT the source for
+       every page this server can serve. generateDashboardHTML further down
+       THIS FILE still declares its own GitHub-dark :root, and that block
+       defines --surface at a different value than paper/ink does. Read the
+       comment above that block before touching either.
+
+       This page used to hand-copy a light-only subset here; that copy is gone,
+       so the palette cannot drift on the login screen alone. Interpolating the
+       shared constant is additive for this page: the 22 tokens the old copy
+       declared were byte-identical to the canonical values, and none of the
+       tokens the shared block adds are referenced by the CSS below.
 
        This page intentionally does NOT emit THEME_BOOTSTRAP_SCRIPT, so nothing
        ever sets data-theme and the shared block's dark rules never match: the
@@ -322,12 +327,21 @@ export function generateDashboardHTML(options: {
     /* Legacy GitHub-dark palette, deliberately NOT the paper/ink system. This
        block does NOT mirror PAPER_INK_ROOT_TOKENS_CSS in
        server/src/dashboard/design-tokens.ts and must not be "reconciled" with
-       it token by token: the names do not correspond (--bg vs --paper,
-       --text-primary vs --ink, --green/--red vs --sage/--rust) and every rule
-       below is written against these names. Porting this board onto the shared
-       tokens is a real visual change and needs its own PR. Note --surface
-       exists in BOTH systems with different values (#161b22 here,
-       #fdfcf8 / #1a1a17 there), so a partial merge silently recolors cards. */
+       it token by token. Twelve of the thirteen names here have no paper/ink
+       counterpart at all (--bg, --border, --text-primary, --text-secondary,
+       --green, --amber, --red, --blue, --success, --warning, --error,
+       --muted), and every rule below is written against these names.
+
+       The thirteenth is the trap: --surface exists in BOTH systems at
+       different values (#161b22 here; #fdfcf8 light / #1a1a17 dark there). A
+       partial merge of the two blocks therefore recolors every card on this
+       board and fails no build, so it surfaces as "the approval board went
+       pale" with nothing pointing back at the merge. The same collision is
+       recorded in the design-tokens.ts header; the two notes must keep
+       agreeing.
+
+       Porting this board onto the shared tokens is a real visual change and
+       needs its own PR. */
     :root {
       --bg: #0d1117;
       --surface: #161b22;

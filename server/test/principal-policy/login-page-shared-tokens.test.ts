@@ -71,10 +71,16 @@ describe("login page design tokens - one shared source, no scoped mirror", () =>
   });
 
   it("keeps every token value the retired scoped mirror declared", () => {
-    // The visual-identity claim, spelled out: these are the 22 tokens the
-    // deleted copy declared, at the values it declared them. The page's CSS
-    // rules are written against these names, so any drift here repaints the
-    // login screen.
+    // The visual-identity claim, spelled out: all 22 tokens the deleted copy
+    // declared, at the values it declared them (origin/main
+    // principal-policy/dashboard-html.ts:19-42). The page's CSS rules are
+    // written against these names, so any drift here repaints the login screen.
+    //
+    // The three font stacks matter as much as the colors here and are easy to
+    // omit from a list like this because they are not hex values. The page
+    // makes seven var(--mono) / var(--sans) / var(--serif) references, so a
+    // changed stack restyles every label, input, and title on the screen while
+    // every color assertion still passes.
     const RETIRED_MIRROR: Record<string, string> = {
       "--paper": "#f7f5f0",
       "--paper-2": "#efece5",
@@ -87,6 +93,11 @@ describe("login page design tokens - one shared source, no scoped mirror", () =>
       "--surface-2": "#f1eee6",
       "--rust": "oklch(55% 0.11 35)",
       "--rust-bg": "oklch(94% 0.03 35)",
+      "--mono":
+        'ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace',
+      "--sans":
+        '-apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif',
+      "--serif": '"Iowan Old Style", "Charter", "Georgia", serif',
       "--rad": "6px",
       "--rad-lg": "10px",
       "--shadow": "0 1px 2px rgba(0,0,0,0.04), 0 0 0 1px rgba(0,0,0,0.02)",
@@ -96,6 +107,9 @@ describe("login page design tokens - one shared source, no scoped mirror", () =>
       "--text-base": "13px",
       "--text-lg": "16px",
     };
+    // Pins the list against the count in the comment above, so a future edit
+    // cannot quietly drop a token and leave the "all 22" claim standing.
+    expect(Object.keys(RETIRED_MIRROR)).toHaveLength(22);
     for (const [name, value] of Object.entries(RETIRED_MIRROR)) {
       expect(LOGIN_HTML, `${name} must still resolve to ${value}`).toContain(
         `${name}: ${value};`,
