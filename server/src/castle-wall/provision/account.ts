@@ -47,16 +47,33 @@ import { setTimeout as sleep } from "node:timers/promises";
 export const SAFE_SERVICE_ACCOUNT_RE = /^[a-z_][a-z0-9._-]{0,63}$/;
 
 /**
- * Privileged account names an agent service account must never collide with.
+ * Privileged account names no Sanctuary-provisioned service account may take.
  *
- * NOT a mirror of the reserved-name checks in `egress-gate/gate-daemon.ts` and
- * `egress-gate/harness-daemon.ts`, and the difference is real, not a typo:
- * those two refuse `root`/`_root`/`daemon`/`wheel` only, so `admin` is a legal
- * gate or harness daemon account name and an illegal agent account name. The
- * charset regex above IS shared; this set is not. Do not "reconcile" the two
- * without deciding which behavior is correct -- widening the daemon side is a
- * behavior change that can refuse an account name an existing host already
- * uses.
+ * CROSS-FILE CONTRACT. This is the CANONICAL declaration; it must match
+ * `RESERVED_ACCOUNT_NAMES` in `egress-gate/gate-daemon.ts` and
+ * `RESERVED_ACCOUNT_NAMES` in `egress-gate/harness-daemon.ts`, both of which
+ * re-declare the same set locally for exactly the reason the charset regex
+ * above is re-declared (those two render world-readable LaunchDaemon plists
+ * and deliberately keep their input validation free of a castle-wall import).
+ * Enforced by `test/structure/cross-file-contract-pins.test.ts`, which
+ * compares the declared MEMBERS on every side rather than merely checking
+ * that each side has a reserved-name check at all.
+ *
+ * DECISION 2026-08-06 (Erik-ratified: WIDEN). An earlier version of this
+ * comment recorded the daemon-side asymmetry as deliberate and warned against
+ * reconciling it: the two daemons refused `root`/`_root`/`daemon`/`wheel`
+ * only, so `admin` was an illegal agent account name and a LEGAL gate or
+ * harness daemon account name. That guidance is retired, and this comment now
+ * says the opposite of what it used to. On macOS an account named `admin` is
+ * conventionally in the `admin` group and therefore holds sudo, so a gate or
+ * harness running as it could rewrite the very policy its confinement exists
+ * to enforce. All three sites now refuse the same five names.
+ *
+ * The widening cannot orphan a live host: every account name the product
+ * derives is prefixed (`deriveAgentAccountName` -> `sanctuary-<agentId>`,
+ * `deriveGateAccountName` -> `sanctuary-gate-<agentId>`), so no derived name
+ * can equal a reserved one, and a repo-wide scan before the change found no
+ * provisioning default, fixture, doc, or test naming any account `admin`.
  */
 const RESERVED_ACCOUNT_NAMES = new Set(["root", "_root", "daemon", "wheel", "admin"]);
 
@@ -478,6 +495,11 @@ export function planAccountCreate(
   if (!SAFE_SERVICE_ACCOUNT_RE.test(accountName)) {
     throw new Error(`Account name is not a safe service-account name (got: ${JSON.stringify(accountName)}).`);
   }
+  // INVARIANT: the whole point of a dedicated agent account is that the wall
+  // can attribute and confine it by its own uid. Provisioning onto a
+  // privileged existing name would instead hand the agent that name's
+  // authority (root, or an `admin` account's sudo) and collapse the
+  // attribution onto a uid shared with the operator.
   if (RESERVED_ACCOUNT_NAMES.has(accountName)) {
     throw new Error(`Refusing to plan a dedicated agent account named "${accountName}" (privileged/reserved name).`);
   }

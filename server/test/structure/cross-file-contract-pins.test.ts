@@ -167,6 +167,31 @@ function tsConst(source: string, name: string): string | null {
 }
 
 /**
+ * Extract the string members of a TypeScript `const NAME = new Set([...])` (or
+ * plain array) declaration, returned SORTED and comma-joined.
+ *
+ * WHY NOT `tsConst` FOR THIS: `tsConst` compares declaration TEXT, so two files
+ * holding the same set would compare unequal after a reorder or a line wrap,
+ * and its `[^;]+` capture mis-reads a multi-line initializer. The contract for
+ * a reserved-name list is its MEMBERSHIP, so this extractor parses the members
+ * and normalizes their order.
+ *
+ * Returns null when the declaration is absent or holds no string members.
+ * Returning `""` instead would let a missing declaration on one side compare
+ * equal to a missing declaration on the other, which is the vacuous-gate
+ * failure this whole suite exists to prevent.
+ */
+function tsStringSetMembers(source: string, name: string): string | null {
+  const m = new RegExp(
+    `const\\s+${name}(?:\\s*:\\s*[^=]+?)?\\s*=\\s*(?:new\\s+Set\\s*\\(\\s*)?\\[([^\\]]*)\\]`
+  ).exec(source);
+  if (!m) return null;
+  const members = [...m[1]!.matchAll(/["']([^"']+)["']/g)].map((x) => x[1]!);
+  if (members.length === 0) return null;
+  return [...members].sort().join(",");
+}
+
+/**
  * Extract a Rust `const NAME: T = <value>;` declaration. The type pattern must
  * admit `&str` as well as `u32`/`u64`/`usize`; an extractor that silently
  * returns null for the reference types would make this whole suite pass by
@@ -223,6 +248,22 @@ describe("the scanner itself", () => {
   it("counts both quote styles and repeated occurrences", () => {
     const source = `const a = "${FROZEN}"; const b = '${FROZEN}';`;
     expect(countQuotedOccurrences(source, FROZEN)).toBe(2);
+  });
+
+  it("tsStringSetMembers normalizes order and formatting, and refuses to invent a value", () => {
+    // Order and line wrapping must not matter; membership must.
+    const oneLine = 'const R = new Set(["root", "wheel", "admin"]);';
+    const wrapped = "const R = new Set([\n  'admin',\n  'root',\n  'wheel',\n]);";
+    expect(tsStringSetMembers(oneLine, "R")).toBe("admin,root,wheel");
+    expect(tsStringSetMembers(wrapped, "R")).toBe("admin,root,wheel");
+    // A dropped member must change the value, or the pin below cannot fail.
+    expect(tsStringSetMembers('const R = new Set(["root", "wheel"]);', "R")).toBe(
+      "root,wheel"
+    );
+    // Absent or empty must be null, never "" -- two missing declarations must
+    // not compare equal to each other.
+    expect(tsStringSetMembers(oneLine, "NOPE")).toBeNull();
+    expect(tsStringSetMembers("const R = new Set([]);", "R")).toBeNull();
   });
 
   it("does not fire on a bare or backticked prose mention", () => {
@@ -446,7 +487,7 @@ describe("mirrored declarations hold equal values and name their counterpart", (
       ],
     },
     {
-      label: "service-account name charset",
+      label: "service-account name charset and reserved names",
       canonical: "server/src/castle-wall/provision/account.ts",
       mirrors: [
         "server/src/egress-gate/harness-daemon.ts",
@@ -454,6 +495,20 @@ describe("mirrored declarations hold equal values and name their counterpart", (
       ],
       pairs: [
         { canonicalName: "SAFE_SERVICE_ACCOUNT_RE", mirrorName: "SAFE_ACCOUNT_RE" },
+        {
+          // The charset regex was pinned here from the start; the reserved-NAME
+          // SET was not, and it drifted (2026-08-06 register G1): the two
+          // daemons refused only root/_root/daemon/wheel, so `admin` was a
+          // legal account for two daemons whose stated purpose is refusing
+          // privileged accounts. Erik ratified widening the daemons to the
+          // canonical five. This pair is what stops the set forking again.
+          canonicalName: "RESERVED_ACCOUNT_NAMES",
+          mirrorName: "RESERVED_ACCOUNT_NAMES",
+          resolveCanonical: (source) =>
+            tsStringSetMembers(source, "RESERVED_ACCOUNT_NAMES"),
+          resolveMirror: (source) =>
+            tsStringSetMembers(source, "RESERVED_ACCOUNT_NAMES"),
+        },
       ],
     },
     {
@@ -536,6 +591,45 @@ describe("mirrored declarations hold equal values and name their counterpart", (
       });
     });
   }
+});
+
+describe("the reserved-name set is the set each site actually enforces", () => {
+  /**
+   * The value-equality pair above proves the three DECLARATIONS agree. It does
+   * not, on its own, prove any of them is consulted: a site could declare the
+   * canonical five and still test a hand-typed subset, which is strictly worse
+   * than an unpinned copy because CI would then report the contract as held.
+   * These two assertions close that hole, which is exactly the shape the
+   * drift took (`["root", "_root", "daemon", "wheel"].includes(...)` sitting
+   * beside a correctly-pinned charset regex).
+   */
+  const SITES = [
+    "server/src/castle-wall/provision/account.ts",
+    "server/src/egress-gate/gate-daemon.ts",
+    "server/src/egress-gate/harness-daemon.ts",
+  ];
+
+  it("every site consults the named set rather than an inline list", () => {
+    for (const file of SITES) {
+      expect(
+        read(file).includes("RESERVED_ACCOUNT_NAMES.has("),
+        `${file} declares RESERVED_ACCOUNT_NAMES but must also USE it to refuse`
+      ).toBe(true);
+    }
+  });
+
+  it("no site re-types a privileged name outside the declaration", () => {
+    // `wheel` is the sentinel: it is meaningful in these files only as a
+    // reserved account name, so a second quoted occurrence is a hand-typed
+    // second list. `root` cannot serve as the sentinel because account.ts
+    // legitimately compares against it in the uid-0 census.
+    for (const file of SITES) {
+      expect(
+        countQuotedOccurrences(read(file), "wheel"),
+        `${file} should quote "wheel" exactly once, in the RESERVED_ACCOUNT_NAMES declaration`
+      ).toBe(1);
+    }
+  });
 });
 
 describe("castle-wall wire constants agree across TypeScript, Rust, and Swift", () => {

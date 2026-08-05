@@ -121,7 +121,11 @@ describe("egress-gate/harness-daemon", () => {
       expect(plist).toContain("<true/>");
     });
 
-    it.each(["root", "_root", "daemon", "wheel"])(
+    // `admin` added 2026-08-06 (register G1, Erik-ratified WIDEN): this
+    // renderer used to accept it while account provisioning refused it, so a
+    // daemon whose stated purpose is refusing privileged accounts would run as
+    // one that, on macOS, conventionally holds sudo.
+    it.each(["root", "_root", "daemon", "wheel", "admin"])(
       "refuses to render a daemon running as privileged account %s",
       (account) => {
         expect(() =>
