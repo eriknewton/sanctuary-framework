@@ -13,15 +13,28 @@ argument and ignores it, falling back to `~/.sanctuary`.
 
 ```bash
 sanctuary --fortress ~/.sanctuary-work secrets list   # inspects ~/.sanctuary-work
-sanctuary secrets list --fortress ~/.sanctuary-work   # inspects ~/.sanctuary
+sanctuary secrets list --fortress ~/.sanctuary-work   # refused, exit 2
 ```
 
-Verified: the second form reads the default fortress and prints an ordinary result for
-it. Nothing warns, nothing errors, and the output of "no secrets stored" is a true
-statement about the wrong fortress. Some subcommands (`doctor`, `agents`) parse the flag
-in either position, which is what makes the habit easy to form and the exception easy to
-miss. On a multi-fortress host, put the flag first every time, and confirm the path in
-the command's own output before you trust the answer.
+Verified: a subcommand that does not parse the flag reads the default fortress and
+prints an ordinary result for it. Nothing warns, nothing errors, and the output of
+"no secrets stored" is a true statement about the wrong fortress. Some subcommands
+(`doctor`, `agents`, `intelligence`) parse the flag in either position, which is what
+makes the habit easy to form and the exception easy to miss. On a multi-fortress host,
+put the flag first every time, and confirm the path in the command's own output before
+you trust the answer.
+
+`secrets` is the one subcommand that refuses the trailing form outright (exit 2, since
+2026-08-05), because on `add`, `rotate` and `delete` the dropped flag wrote a credential
+into the default fortress and reported success. That refusal is scoped to `secrets`
+alone and is not a general fix.
+
+Failure mode to watch for: every other subcommand that does not parse `--fortress`
+still ignores it silently, and the result looks exactly like a correct answer for the
+fortress you named. There is no way to tell from the output which fortress answered,
+short of a command that prints the path. The general fix is a single shared flag parser
+so that no handler can silently drop a flag; until that lands, the leading position is
+the only form that is safe everywhere.
 
 ## `sanctuary doctor`
 

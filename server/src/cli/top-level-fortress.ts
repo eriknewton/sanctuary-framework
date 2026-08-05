@@ -23,6 +23,15 @@
  * after the subcommand word (`init`, `protect`/`wrap`, `reset-passphrase`,
  * `audit-chain export`) keep ownership of those occurrences; this module
  * never touches argv past the subcommand boundary.
+ *
+ * That scope has a cost: a subcommand that does NOT parse the flag receives it
+ * as an ordinary argv token and drops it, running against the ambient fortress.
+ * `secrets` is the case where that was demonstrated to write a credential to
+ * the wrong fortress while reporting success, and it refuses the flag itself
+ * (`assertNoFortressFlag` in `secrets.ts`, whose accepted spellings must match
+ * the two accepted below; adding a third spelling here without adding it there
+ * reopens the silent-drop path). Other non-parsing subcommands are still
+ * exposed; the general fix is one shared flag parser, not a list here.
  */
 
 export interface TopLevelFortressResult {
