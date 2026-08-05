@@ -19,10 +19,10 @@
  * FOUR KINDS OF ASSERTION, and the difference matters:
  *
  *   1. SOLE-DECLARATION. A frozen wire string that HAS a canonical exported
- *      constant must not be re-typed as a literal anywhere else in server/src.
- *      This scans EVERY .ts file under server/src, not a hand-listed set, with
- *      an explicit allowlist for the places a bare literal is legitimate
- *      (operator-visible help text). An unlisted occurrence fails.
+ *      constant must not be re-typed as a QUOTED string anywhere else in
+ *      server/src. This scans EVERY .ts file under server/src, not a
+ *      hand-listed set, over the RAW source with nothing stripped first, and
+ *      an unlisted occurrence fails. Both allowlists are empty today.
  *   2. DECLARED-VALUE EQUALITY. For each mirrored pair, the test extracts the
  *      value from the NAMED declaration on each side and compares the parsed
  *      values, rather than asking whether a literal appears somewhere in the
@@ -34,11 +34,25 @@
  *   4. PIN PRESENCE. Every duplicating site must NAME its counterpart.
  *
  * WHAT THIS SUITE DOES NOT COVER, stated so no comment elsewhere claims it
- * does: it does not compare the Rust or Swift enforcement LOGIC to the
- * TypeScript, only the declared constants; it does not verify that a mirrored
- * value is semantically correct, only that the copies agree; and it does not
- * cover `/^[0-9a-f]{64}$/`, which is an independent local validator in each of
- * the 10 files that declare it rather than a mirror of one declaration.
+ * does:
+ *
+ *   - It does not compare the Rust or Swift enforcement LOGIC to the
+ *     TypeScript, only the declared constants.
+ *   - It does not verify that a mirrored value is semantically correct, only
+ *     that the copies agree.
+ *   - It does not cover `/^[0-9a-f]{64}$/`, an independent local validator in
+ *     each of the 10 files that declare it rather than a mirror.
+ *   - The sole-declaration scan is QUOTE-ANCHORED. It will not catch a re-type
+ *     built by string concatenation, written as a template literal, or spelled
+ *     bare inside a larger string (which is how `cli/cortex-export.ts`'s help
+ *     text mentions the schema version). This is the deliberate residual hole
+ *     left by deleting a comment-stripper that was silently hiding literals;
+ *     the reasoning is on `countQuotedOccurrences` and the residual is smaller
+ *     and, unlike the stripper's, bounded and stated.
+ *   - The declaration extractors (`tsConst`, `rustConst`, `swiftConst`) read
+ *     raw source and would match a commented-out declaration. That direction
+ *     is safe: it produces a wrong value and a LOUD comparison failure, never a
+ *     silent pass.
  *
  * FAIL-BEFORE (this file is not exempt, and must not be marked exempt).
  * Measured, not assumed, against the pre-PR tree; the counts are in the PR
@@ -66,18 +80,47 @@ function read(relativeToRepoRoot: string): string {
 }
 
 /**
- * Strip line and block comments, so a literal MENTIONED in prose is never
- * counted as a declaration. Works for TypeScript, Rust (including `///` doc
- * comments, which begin with `//`), and Swift.
+ * Count occurrences of `literal` written as a single- or double-QUOTED string.
  *
- * Deliberately conservative: it does not respect string literals containing
- * "//", so a URL inside a string would truncate that line. No file scanned
- * here contains one. The failure direction is safe for the sole-declaration
- * scan, which looks for occurrences: over-stripping can only hide an
- * occurrence, never invent one.
+ * WHY QUOTED, AND WHY NO COMMENT STRIPPING (rewritten 2026-08-05, third round
+ * of this gate). The previous version stripped comments with a regex so that
+ * prose mentions would not be counted, and that stripper treated `//` inside a
+ * STRING as a comment start. A line containing a URL literal therefore erased
+ * itself from the scan, and a forbidden literal sharing that line went
+ * undetected. Making the stripper correct is not a small fix: this repo
+ * contains regex literals whose escaped trailing slash abuts the terminator
+ * (`substrate/paths.ts:57`, `/^[a-zA-Z]+:\/\//`), so a correct stripper would
+ * have to disambiguate regex literals from division, which is a parser.
+ *
+ * So the stripper is GONE rather than repaired. A re-typed constant is by
+ * definition a quoted string, and this scan looks for exactly that, in the RAW
+ * source. Nothing is hidden from it, because nothing is removed before it
+ * runs. Verified 2026-08-05: across all of `server/src`, each frozen literal
+ * below appears in quoted form exactly once (at its declaration), so the
+ * quoted form does not collide with the prose mentions, which spell the string
+ * bare or inside backticks.
+ *
+ * LIMITS, stated because the previous version's limits were not: this does not
+ * detect a re-type assembled by concatenation, nor one written as a template
+ * literal, nor a bare unquoted mention (which cannot be a constant). A quoted
+ * mention inside a comment WOULD be reported; that is a false positive, which
+ * is the safe direction, and the fix is an allowlist entry with a reason.
  */
-function stripComments(source: string): string {
-  return source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
+function countQuotedOccurrences(source: string, literal: string): number {
+  let count = 0;
+  for (const quote of ['"', "'"]) {
+    const needle = `${quote}${literal}${quote}`;
+    let index = source.indexOf(needle);
+    while (index !== -1) {
+      count += 1;
+      index = source.indexOf(needle, index + needle.length);
+    }
+  }
+  return count;
+}
+
+function containsQuotedLiteral(source: string, literal: string): boolean {
+  return countQuotedOccurrences(source, literal) > 0;
 }
 
 /** Every .ts file under server/src, repo-root-relative. */
@@ -119,7 +162,7 @@ function normalizeValue(raw: string): string {
 function tsConst(source: string, name: string): string | null {
   const m = new RegExp(
     `(?:export\\s+)?const\\s+${name}(?:\\s*:\\s*[^=]+?)?\\s*=\\s*([^;]+);`
-  ).exec(stripComments(source));
+  ).exec(source);
   return m ? normalizeValue(m[1]!) : null;
 }
 
@@ -132,7 +175,7 @@ function tsConst(source: string, name: string): string | null {
 function rustConst(source: string, name: string): string | null {
   const m = new RegExp(
     `const\\s+${name}\\s*:\\s*&?\\s*[A-Za-z0-9_]+\\s*=\\s*([^;]+);`
-  ).exec(stripComments(source));
+  ).exec(source);
   return m ? normalizeValue(m[1]!) : null;
 }
 
@@ -140,28 +183,75 @@ function rustConst(source: string, name: string): string | null {
 function swiftConst(source: string, name: string): string | null {
   const m = new RegExp(
     `static\\s+let\\s+${name}(?:\\s*:\\s*[A-Za-z0-9_]+)?\\s*=\\s*(.+)`
-  ).exec(stripComments(source));
+  ).exec(source);
   return m ? normalizeValue(m[1]!.split("\n")[0]!) : null;
 }
 
+describe("the scanner itself", () => {
+  // The suite is only worth its assertions if the detector cannot be hidden
+  // from. Round 3 of this gate found that it could: the previous
+  // comment-stripping scanner missed a forbidden literal that shared a line
+  // with a URL string, because `//` inside the URL read as a comment start.
+  const FROZEN = "sanctuary.enforcement-event.v1";
+
+  it("sees a forbidden literal sharing a line with a URL string (the round-3 slip)", () => {
+    // Verbatim from the adversarial review's reproduction, which it inserted at
+    // server/src/sanctuary-tools.ts:52 and which the old scanner passed 33/33.
+    const slip =
+      'const __scanSlip = "https://example.invalid"; const __badSchemaCopy = "sanctuary.enforcement-event.v1";';
+    expect(containsQuotedLiteral(slip, FROZEN)).toBe(true);
+  });
+
+  it("sees a literal on a line following a URL-bearing line", () => {
+    const source = [
+      'const url = "https://example.invalid";',
+      'const copy = "sanctuary.enforcement-event.v1";',
+    ].join("\n");
+    expect(countQuotedOccurrences(source, FROZEN)).toBe(1);
+  });
+
+  it("sees a literal inside a file containing regex literals with abutting slashes", () => {
+    // substrate/paths.ts:57 shape: the escaped trailing slash abuts the regex
+    // terminator, which is what makes a correct comment-stripper a parser.
+    const source = [
+      'if (/^[a-zA-Z]+:\\/\\//.test(p) || p.startsWith("//")) { return; }',
+      "const copy = 'sanctuary.enforcement-event.v1';",
+    ].join("\n");
+    expect(countQuotedOccurrences(source, FROZEN)).toBe(1);
+  });
+
+  it("counts both quote styles and repeated occurrences", () => {
+    const source = `const a = "${FROZEN}"; const b = '${FROZEN}';`;
+    expect(countQuotedOccurrences(source, FROZEN)).toBe(2);
+  });
+
+  it("does not fire on a bare or backticked prose mention", () => {
+    // This is the deliberate narrowing: prose spells the string bare or in
+    // backticks, and neither is a constant.
+    const source = `/* the frozen \`${FROZEN}\` schema */\n// see ${FROZEN} for detail`;
+    expect(containsQuotedLiteral(source, FROZEN)).toBe(false);
+  });
+});
+
 describe("frozen wire strings have exactly one declaration in server/src", () => {
   /**
-   * `allowedElsewhere` lists the files permitted to contain the bare literal
+   * `allowedElsewhere` lists files permitted to contain the QUOTED literal
    * despite not declaring it, each with a stated reason. Anything NOT on the
    * list fails: a re-typed copy is how a `.v2` mint ships a half-migrated
    * stream that no error surfaces on either side.
+   *
+   * Both allowlists are empty today. `cli/cortex-export.ts` used to need an
+   * entry, and no longer does: its `--help` text spells the version BARE inside
+   * a template string, which is prose and not a quoted constant, so the
+   * quote-anchored scan does not see it at all. That is a deliberate narrowing,
+   * recorded here rather than left as a surprise.
    */
   const soleDeclarations = [
     {
       label: "ENFORCEMENT_EVENT_SCHEMA",
       literal: "sanctuary.enforcement-event.v1",
       declaredIn: "server/src/castle-wall/export/schema.ts",
-      allowedElsewhere: {
-        // Operator-visible `--help` text inside a template string. It DESCRIBES
-        // the stream shape; nothing parses or emits it. A version bump must
-        // update this copy in the same PR or the help text lies.
-        "server/src/cli/cortex-export.ts": "operator --help text",
-      } as Record<string, string>,
+      allowedElsewhere: {} as Record<string, string>,
       mustReference: ["server/src/castle-wall/export/sink.ts"],
     },
     {
@@ -179,7 +269,7 @@ describe("frozen wire strings have exactly one declaration in server/src", () =>
       for (const file of allServerSrcFiles()) {
         if (file === entry.declaredIn) continue;
         if (file in entry.allowedElsewhere) continue;
-        if (stripComments(read(file)).includes(entry.literal)) offenders.push(file);
+        if (containsQuotedLiteral(read(file), entry.literal)) offenders.push(file);
       }
       expect(
         offenders,
@@ -188,8 +278,9 @@ describe("frozen wire strings have exactly one declaration in server/src", () =>
     });
 
     it(`${entry.label} is declared exactly once in ${entry.declaredIn}`, () => {
-      const declaring = stripComments(read(entry.declaredIn));
-      expect(declaring.split(entry.literal).length - 1).toBe(1);
+      // Quoted occurrences only: the declaring file's own doc comments mention
+      // the string in prose repeatedly, and those are not declarations.
+      expect(countQuotedOccurrences(read(entry.declaredIn), entry.literal)).toBe(1);
     });
 
     it(`${entry.label}: every allowlisted file still contains the literal`, () => {
@@ -197,7 +288,7 @@ describe("frozen wire strings have exactly one declaration in server/src", () =>
       // silently widen the scan's blind spot.
       for (const [file, reason] of Object.entries(entry.allowedElsewhere)) {
         expect(
-          stripComments(read(file)).includes(entry.literal),
+          containsQuotedLiteral(read(file), entry.literal),
           `${file} is allowlisted (${reason}) but no longer contains the literal; drop the entry`
         ).toBe(true);
       }
@@ -235,12 +326,12 @@ describe("audit chain constants are shared, not mirrored", () => {
   it("the zero-import module still has zero imports", () => {
     // The whole hoist depends on this. If it ever imports anything, the
     // standalone verifier silently inherits that dependency.
-    expect(/^\s*import\s/m.test(stripComments(read(SHAPE)))).toBe(false);
+    expect(/^\s*import\s[^\n]*from\s/m.test(read(SHAPE))).toBe(false);
   });
 
   it("neither chain.ts nor the verifier re-declares them", () => {
     for (const file of [CHAIN, VERIFIER]) {
-      const source = stripComments(read(file));
+      const source = read(file);
       for (const name of NAMES) {
         expect(
           new RegExp(`const\\s+${name}\\s*=`).test(source),
@@ -273,9 +364,7 @@ describe("audit chain constants are shared, not mirrored", () => {
       }
       return source.slice(from, i + 1).replace(/\s+/g, " ").trim();
     };
-    expect(extract(stripComments(read(VERIFIER)))).toBe(
-      extract(stripComments(read(CHAIN)))
-    );
+    expect(extract(read(VERIFIER))).toBe(extract(read(CHAIN)));
   });
 });
 
@@ -299,7 +388,7 @@ describe("mirrored declarations hold equal values and name their counterpart", (
   const literalPresence =
     (literal: string) =>
     (source: string): string | null =>
-      stripComments(source).includes(literal) ? literal : null;
+      containsQuotedLiteral(source, literal) ? literal : null;
 
   const SPKI_PREFIX = "3059301306072a8648ce3d020106082a8648ce3d030107034200";
 
@@ -540,7 +629,7 @@ describe("shared encoding vocabulary is spelled uniformly", () => {
     // A surface added later without being listed would sit outside the note in
     // checkpoint-shape.ts, which claims to enumerate them.
     const actual = allServerSrcFiles().filter((file) =>
-      stripComments(read(file)).includes(ENCODING)
+      containsQuotedLiteral(read(file), ENCODING)
     );
     expect(actual.sort()).toEqual([...surfaces].sort());
   });

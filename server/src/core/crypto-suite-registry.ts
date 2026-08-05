@@ -16,12 +16,12 @@ import type { EncryptedPayload } from "./encryption.js";
  * the second parser of the shape (`parseSignatureBundle` in
  * `v1/federation-revocation.ts`) imports it rather than re-typing the literal.
  * `test/structure/cross-file-contract-pins.test.ts` walks EVERY .ts file under
- * `server/src` with comments stripped and fails on any occurrence outside this
- * declaration; unlike the enforcement-event schema, this one has no allowlisted
- * prose copy. (The scan is TypeScript-only and does not cover markdown.) A
- * re-typed copy keeps compiling after a `.v2` mint and then rejects every
- * bundle this registry produces, surfacing only as "invalid signature bundle"
- * on otherwise-valid revocation traffic.
+ * `server/src` over RAW source and fails on any occurrence of this string
+ * written as a QUOTED literal outside this declaration. It does not see a bare
+ * or concatenated mention, and it does not cover markdown. A re-typed copy
+ * keeps compiling after a `.v2` mint and then rejects every bundle this
+ * registry produces, surfacing only as "invalid signature bundle" on
+ * otherwise-valid revocation traffic.
  */
 export const SIGNATURE_BUNDLE_VERSION = "sanctuary.signature-bundle.v1";
 export const SIGNED_SURFACE_DOMAIN = "sanctuary.signed-surface.v1";

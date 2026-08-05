@@ -36,13 +36,15 @@ import type { DistressReason, DistressSeverity } from "../../distress/tools.js";
  * versions.
  *
  * `test/structure/cross-file-contract-pins.test.ts` walks EVERY .ts file under
- * `server/src` with comments stripped and fails on any occurrence of the
- * literal outside this declaration, EXCEPT for one allowlisted file named in
- * that test with its reason: `cli/cortex-export.ts`, whose operator `--help`
- * text spells the version for a human reader. (`./README.md` also names it in
- * prose; the scan is TypeScript-only and does not cover markdown.) Both prose
- * copies are descriptions, not second declarations, and must be updated
- * alongside a version bump.
+ * `server/src` over RAW source and fails on any occurrence of this string
+ * written as a QUOTED literal outside this declaration. Its allowlist is empty.
+ *
+ * What that scan does NOT see, stated because an earlier version of this
+ * comment claimed more than the code did: a bare, unquoted mention. Both
+ * `cli/cortex-export.ts` (operator `--help` text) and `./README.md` spell the
+ * version bare, so neither is detected, and neither is a declaration. Both are
+ * descriptions that must be updated alongside a version bump, and nothing
+ * mechanical will remind you.
  *
  * Why the scan and not just this comment: a re-typed copy is how a `.v2` mint
  * ships a half-migrated stream, and a consumer keying its ingestion rules off

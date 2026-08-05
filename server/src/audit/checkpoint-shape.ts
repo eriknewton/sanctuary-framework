@@ -33,13 +33,19 @@ export const AUDIT_CHECKPOINT_SCHEMA_VERSION = 1;
 /**
  * Audit-chain wire constants, moved here 2026-08-05 for the SAME reason the
  * checkpoint shape predicate was (G1): the standalone external verifier
- * `cli/audit-chain-verify.ts` re-typed all four as local literals because
- * importing them from `audit/chain.ts` would have dragged in
- * `core/identity.ts` -> `core/encryption.ts` and the rest of the crypto
- * runtime. This module has ZERO imports, so the verifier can import from here
- * at no dependency cost, exactly as `cli/audit-chain-export.ts` already does
- * for the checkpoint shape. `audit/chain.ts` re-exports all four, so every
- * existing importer is unchanged.
+ * `cli/audit-chain-verify.ts` re-typed THREE of them as local constants
+ * (`AUDIT_CHAIN_GENESIS`, `AUDIT_CHAIN_SCHEMA_VERSION`, and
+ * `AUDIT_CHECKPOINT_DOMAIN_PREFIX`) because importing them from
+ * `audit/chain.ts` would have dragged in `core/identity.ts` ->
+ * `core/encryption.ts` and the rest of the crypto runtime. The fourth,
+ * `AUDIT_CHECKPOINT_DOMAIN`, was never a separate declaration there: it
+ * existed only spelled out inside that prefix string, which is the more
+ * dangerous shape, since a domain change had no named constant to grep for.
+ *
+ * This module has ZERO imports, so the verifier can import from here at no
+ * dependency cost, exactly as `cli/audit-chain-export.ts` already does for the
+ * checkpoint shape. `audit/chain.ts` re-exports all four, so every existing
+ * importer is unchanged.
  *
  * The literals are LIVE at-rest and signing-domain values; never edit them.
  * `AUDIT_CHECKPOINT_DOMAIN_PREFIX`'s trailing newline is part of the signed
@@ -123,10 +129,11 @@ export interface AuditCheckpointRecord extends AuditCheckpointSigningPayload {
    * SAME name for two different byte-level encodings, because an external
    * verifier reads the name and reconstructs the signing bytes from it.
    * `test/structure/cross-file-contract-pins.test.ts` asserts that the set of
-   * `server/src` files containing this exact spelling is EXACTLY the list
-   * above, so a surface added later without being listed here fails. It cannot
-   * detect a surface that invents a DIFFERENT name for the same encoding;
-   * nothing mechanical can, which is why the name is documented as vocabulary.
+   * `server/src` files spelling this name as a QUOTED string is EXACTLY the
+   * list above, so a surface added later without being listed here fails. Two
+   * things it cannot do: detect a surface that invents a DIFFERENT name for
+   * the same encoding (nothing mechanical can, which is why this is documented
+   * as vocabulary), and detect a mention that is not quote-delimited.
    */
   payload_encoding: "domain-separated-canonical-json-v1";
   unsigned: boolean;
