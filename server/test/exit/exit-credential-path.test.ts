@@ -18,7 +18,7 @@
  *  A5: nothing answered "which credential does this bundle actually need?".
  *      `sanctuary exit inspect <dir>` answers it read-only.
  *
- * Fix round (2026-08-05): A5's first cut classified ANY object-shaped
+ * Fix round 1 (2026-08-05): A5's first cut classified ANY object-shaped
  * `source_custody` as the bundle re-key path, while import ran the full
  * shape-check and refused a malformed one. `exit inspect` therefore printed the
  * re-key import command and exited 0 for a bundle no key could ever open. The
@@ -26,6 +26,26 @@
  * SAME crafted bundles through `exit inspect` and a real `importExitBundle` and
  * asserts they agree case for case, so the "must mirror import" pin in
  * server/src/exit/verifier.ts is checked rather than asserted.
+ *
+ * Fix round 2 (2026-08-05): the same bug one level down. Round 1's shared
+ * predicate checked the BLOCK and the wrap's declared fields but stopped at
+ * `typeof payload === "object"`, so a wrap carrying `payload: null`, a missing
+ * `iv`, or a ciphertext of the wrong length still classified `valid` and still
+ * printed `credential: bundle-rekey-key` for a bundle that imports with
+ * SOURCE_CREDENTIAL_INVALID. The differential table is therefore no longer a
+ * list of reported bugs: it enumerates the class - block shape, wrap shape, and
+ * every field the unwrap path reads, in each way it can be wrong - and it
+ * carries three kinds of row on purpose:
+ *
+ *   `malformed`             no credential can open it; both sides must refuse.
+ *   `opens`                 must survive; these are what stop the classifier
+ *                           from degenerating to "everything is unusable", and
+ *                           three of them mutate fields the unwrap path never
+ *                           reads so an OVER-strict predicate fails too.
+ *   `credential-dependent`  structurally perfect, opens only for the right
+ *                           secret. Inspect names the path AND must print the
+ *                           limit; this row is where the tool's honesty about
+ *                           what it did not check is enforced.
  */
 
 import { afterEach, describe, expect, it } from "vitest";
@@ -617,45 +637,88 @@ describe("exit cluster A3/A4/A5: which credential opens this bundle", () => {
   // ---- A5 fix round: inspect must agree with import about custody ---------
 
   /**
+   * What `exit inspect` is allowed to conclude about a `source_custody` block,
+   * holding NO credential.
+   *
+   *  - `opens`: the block is intact and the real re-key key imports it.
+   *  - `malformed`: NO credential of any kind can open it, so inspect must say
+   *    so and exit non-zero. Import refuses it with SOURCE_CUSTODY_MALFORMED.
+   *  - `credential-dependent`: the block is structurally everything import can
+   *    check before it needs a secret, and only the secret itself can decide.
+   *    Inspect names the re-key path AND must state that bound; import with the
+   *    right-shaped-but-non-authenticating wrap fails SOURCE_CREDENTIAL_INVALID.
+   *    This row is the honest edge of the tool, not a hole in it.
+   */
+  type CustodyOutcome = "opens" | "malformed" | "credential-dependent";
+
+  /** Replace the single minted wrap's payload, leaving the rest of the block. */
+  function withPayload(
+    real: Record<string, unknown>,
+    patch: (payload: Record<string, unknown>) => unknown
+  ): unknown {
+    const wrap = { ...((real.wraps as Record<string, unknown>[])[0] ?? {}) };
+    const payload = { ...(wrap.payload as Record<string, unknown>) };
+    const replacement = patch(payload);
+    if (replacement === undefined) delete wrap.payload;
+    else wrap.payload = replacement;
+    return { ...real, wraps: [wrap] };
+  }
+
+  /** A base64url string that decodes to exactly `n` bytes. */
+  function b64OfLength(n: number): string {
+    return toBase64url(new Uint8Array(n).fill(0x41));
+  }
+
+  /**
    * Every way a `source_custody` block can be damaged, plus the untouched
    * control. Each case is applied to a REAL minted bundle and re-signed, so the
    * only thing under test is the block itself.
    *
+   * The table is the enumeration of the equivalence class, not a list of
+   * reported bugs: block shape, wrap shape, and then EVERY field the unwrap
+   * path (`core/master-custody.ts` unwrapMatchingWrap -> `core/encryption.ts`
+   * decrypt) actually reads, in each way it can be wrong - absent, wrong type,
+   * wrong constant, undecodable, wrong decoded length.
+   *
    * FAILURE MODE if a case is written wrong: a mutation that leaves the block
    * VALID makes the case assert the happy path twice and prove nothing. The
-   * control row is what keeps the whole table honest - if the classifier ever
-   * degenerates to "everything is unusable", `valid custody` fails.
+   * `opens` rows are what keep the whole table honest - if the classifier ever
+   * degenerates to "everything is unusable", every one of them fails. Three of
+   * them mutate fields the unwrap path never reads (`ts`, `verified`,
+   * `created_at`) or duplicate a wrap id, precisely so an over-strict predicate
+   * that validates the DECLARED type instead of the CONSUMED fields is caught.
    */
   const custodyCases: Array<{
     label: string;
     /** Returns the replacement block, given the real minted one. */
     mutate: (real: Record<string, unknown>) => unknown;
-    importAccepts: boolean;
+    outcome: CustodyOutcome;
   }> = [
+    // ---- block shape ----
     {
       label: "valid custody (control)",
       mutate: (real) => real,
-      importAccepts: true,
+      outcome: "opens",
     },
     {
       label: "wrong format token",
       mutate: (real) => ({ ...real, format: "SANCTUARY_EXIT_SOURCE_CUSTODY_V2" }),
-      importAccepts: false,
+      outcome: "malformed",
     },
     {
       label: "format field missing entirely",
       mutate: (real) => ({ wraps: real.wraps }),
-      importAccepts: false,
+      outcome: "malformed",
     },
     {
       label: "wraps is not an array",
       mutate: (real) => ({ ...real, wraps: { id: "w1" } }),
-      importAccepts: false,
+      outcome: "malformed",
     },
     {
       label: "wraps is empty",
       mutate: (real) => ({ ...real, wraps: [] }),
-      importAccepts: false,
+      outcome: "malformed",
     },
     {
       label: "more wraps than the cap allows",
@@ -666,8 +729,14 @@ describe("exit cluster A3/A4/A5: which credential opens this bundle", () => {
         ...real,
         wraps: Array.from({ length: 5 }, () => (real.wraps as unknown[])[0]),
       }),
-      importAccepts: false,
+      outcome: "malformed",
     },
+    {
+      label: "source_custody is null",
+      mutate: () => null,
+      outcome: "malformed",
+    },
+    // ---- wrap shape ----
     {
       label: "passphrase-type wrap smuggled in",
       // The security-relevant case: a passphrase wrap here would reintroduce
@@ -683,7 +752,7 @@ describe("exit cluster A3/A4/A5: which credential opens this bundle", () => {
           },
         ],
       }),
-      importAccepts: false,
+      outcome: "malformed",
     },
     {
       label: "wrap missing its id",
@@ -692,12 +761,248 @@ describe("exit cluster A3/A4/A5: which credential opens this bundle", () => {
         delete wrap.id;
         return { ...real, wraps: [wrap] };
       },
-      importAccepts: false,
+      outcome: "malformed",
+    },
+    // ---- wrap payload container ----
+    {
+      label: "wrap payload is null",
+      // `typeof null === "object"`, which is exactly how the round-2 predicate
+      // let this through while import died on `payload.v`.
+      mutate: (real) => withPayload(real, () => null),
+      outcome: "malformed",
     },
     {
-      label: "source_custody is null",
-      mutate: () => null,
-      importAccepts: false,
+      label: "wrap payload is an array",
+      mutate: (real) => withPayload(real, () => []),
+      outcome: "malformed",
+    },
+    {
+      label: "wrap payload is a string",
+      mutate: (real) => withPayload(real, () => "not-a-payload"),
+      outcome: "malformed",
+    },
+    {
+      label: "wrap payload missing entirely",
+      mutate: (real) => withPayload(real, () => undefined),
+      outcome: "malformed",
+    },
+    // ---- payload version / algorithm ----
+    {
+      label: "payload version missing",
+      mutate: (real) =>
+        withPayload(real, (payload) => {
+          delete payload.v;
+          return payload;
+        }),
+      outcome: "malformed",
+    },
+    {
+      label: "payload version is 2",
+      mutate: (real) => withPayload(real, (payload) => ({ ...payload, v: 2 })),
+      outcome: "malformed",
+    },
+    {
+      label: "payload version is the string \"1\"",
+      // decrypt compares with `!==`, so "1" is a different value, not a
+      // coercible one. A predicate using `==` would wrongly pass this.
+      mutate: (real) => withPayload(real, (payload) => ({ ...payload, v: "1" })),
+      outcome: "malformed",
+    },
+    {
+      label: "payload alg missing",
+      mutate: (real) =>
+        withPayload(real, (payload) => {
+          delete payload.alg;
+          return payload;
+        }),
+      outcome: "malformed",
+    },
+    {
+      label: "payload alg is aes-128-gcm",
+      mutate: (real) =>
+        withPayload(real, (payload) => ({ ...payload, alg: "aes-128-gcm" })),
+      outcome: "malformed",
+    },
+    // ---- payload iv ----
+    {
+      label: "payload iv missing",
+      mutate: (real) =>
+        withPayload(real, (payload) => {
+          delete payload.iv;
+          return payload;
+        }),
+      outcome: "malformed",
+    },
+    {
+      label: "payload iv is a number",
+      mutate: (real) => withPayload(real, (payload) => ({ ...payload, iv: 12 })),
+      outcome: "malformed",
+    },
+    {
+      label: "payload iv is empty",
+      mutate: (real) => withPayload(real, (payload) => ({ ...payload, iv: "" })),
+      outcome: "malformed",
+    },
+    {
+      label: "payload iv decodes below the GCM nonce floor",
+      // 6 < 8. `fromBase64url` is lenient, so the ONLY observable defect is the
+      // decoded byte count; the AES-GCM construction refuses it outright.
+      mutate: (real) =>
+        withPayload(real, (payload) => ({ ...payload, iv: b64OfLength(6) })),
+      outcome: "malformed",
+    },
+    {
+      label: "payload iv is not base64url at all",
+      // Lenient decoding drops every out-of-alphabet character, so this decodes
+      // to zero bytes rather than throwing - a classifier that only checks
+      // `typeof iv === "string"` sees nothing wrong.
+      mutate: (real) =>
+        withPayload(real, (payload) => ({ ...payload, iv: "!!!!" })),
+      outcome: "malformed",
+    },
+    // ---- payload ciphertext ----
+    {
+      label: "payload ct missing",
+      mutate: (real) =>
+        withPayload(real, (payload) => {
+          delete payload.ct;
+          return payload;
+        }),
+      outcome: "malformed",
+    },
+    {
+      label: "payload ct is a number",
+      mutate: (real) => withPayload(real, (payload) => ({ ...payload, ct: 0 })),
+      outcome: "malformed",
+    },
+    {
+      label: "payload ct is empty",
+      mutate: (real) => withPayload(real, (payload) => ({ ...payload, ct: "" })),
+      outcome: "malformed",
+    },
+    {
+      label: "payload ct is one byte short of master+tag",
+      mutate: (real) =>
+        withPayload(real, (payload) => ({ ...payload, ct: b64OfLength(47) })),
+      outcome: "malformed",
+    },
+    {
+      label: "payload ct is longer than master+tag",
+      mutate: (real) =>
+        withPayload(real, (payload) => ({ ...payload, ct: b64OfLength(64) })),
+      outcome: "malformed",
+    },
+    // ---- structurally perfect, only the credential can tell ----
+    {
+      label: "payload ct is the right length but does not authenticate",
+      // THE BOUND. Nothing readable without the re-key key distinguishes this
+      // from the control; only GCM authentication does. Inspect must still name
+      // the re-key path and must say, in its own output, that it checked shape
+      // and not the key.
+      mutate: (real) =>
+        withPayload(real, (payload) => ({ ...payload, ct: b64OfLength(48) })),
+      outcome: "credential-dependent",
+    },
+    // ---- fields the unwrap path never reads: must NOT be rejected ----
+    {
+      label: "payload ts removed (never read by decrypt)",
+      mutate: (real) =>
+        withPayload(real, (payload) => {
+          delete payload.ts;
+          return payload;
+        }),
+      outcome: "opens",
+    },
+    {
+      label: "wrap verified/created_at removed (never read by unwrap)",
+      mutate: (real) => {
+        const wrap = { ...((real.wraps as Record<string, unknown>[])[0] ?? {}) };
+        delete wrap.verified;
+        delete wrap.created_at;
+        return { ...real, wraps: [wrap] };
+      },
+      outcome: "opens",
+    },
+    {
+      label: "one intact wrap and one damaged wrap",
+      // Adversarial: the damaged wrap is not the one a key would open, so a
+      // classifier that stopped at the first usable wrap would call this
+      // openable. Import runs the shape gate over EVERY wrap before it tries
+      // any of them, so it refuses the block whole; inspect must do the same.
+      mutate: (real) => {
+        const wrap = (real.wraps as Record<string, unknown>[])[0]!;
+        return {
+          ...real,
+          wraps: [wrap, { ...wrap, id: "second-wrap", payload: null }],
+        };
+      },
+      outcome: "malformed",
+    },
+    {
+      label: "ciphertext carries a newline the lenient decoder drops",
+      // Adversarial, and the reason this file decodes with `fromBase64url` and
+      // not `fromBase64urlStrict`: Node's base64 decoder silently drops
+      // whitespace, so this still decodes to the same 48 real bytes and the
+      // import opens it. A predicate that decoded STRICTLY would report
+      // `unusable` for a bundle that works - the same disagreement, inverted.
+      mutate: (real) => {
+        const wrap = { ...((real.wraps as Record<string, unknown>[])[0] ?? {}) };
+        const payload = { ...(wrap.payload as Record<string, unknown>) };
+        const ct = payload.ct as string;
+        payload.ct = ct.slice(0, 10) + "\n" + ct.slice(10);
+        wrap.payload = payload;
+        return { ...real, wraps: [wrap] };
+      },
+      outcome: "opens",
+    },
+    {
+      label: "a non-authenticating wrap listed BEFORE the real one",
+      // Adversarial: `unwrapMatchingWrap` walks wraps in order and returns on
+      // the first that authenticates, so a decoy in front does not stop the
+      // import. Inspect must not treat "some wrap is a decoy" as unusable.
+      mutate: (real) => {
+        const wrap = (real.wraps as Record<string, unknown>[])[0]!;
+        const decoy = {
+          ...wrap,
+          id: "decoy-wrap",
+          payload: {
+            ...(wrap.payload as Record<string, unknown>),
+            ct: b64OfLength(48),
+          },
+        };
+        return { ...real, wraps: [decoy, wrap] };
+      },
+      outcome: "opens",
+    },
+    {
+      label: "wrap id rewritten so no AAD can match",
+      // Adversarial, and a SECOND member of the credential-dependent class with
+      // a different mechanism than a corrupted ciphertext: the id is bound into
+      // the AEAD's associated data, so rewriting it breaks authentication while
+      // leaving every readable field perfect. Nothing without the key can tell
+      // this from the control, and inspect must not pretend otherwise.
+      mutate: (real) => ({
+        ...real,
+        wraps: [
+          {
+            ...((real.wraps as Record<string, unknown>[])[0] ?? {}),
+            id: "rewritten-wrap-id",
+          },
+        ],
+      }),
+      outcome: "credential-dependent",
+    },
+    {
+      label: "the same wrap listed twice (duplicate ids)",
+      // Enumerated and DELIBERATELY not rejected: `unwrapMatchingWrap` tries
+      // wraps in order and the first one authenticates, so a duplicate id does
+      // not stop an import. Rejecting it would make inspect say "unusable"
+      // about a bundle that opens - the same disagreement, mirrored.
+      mutate: (real) => ({
+        ...real,
+        wraps: [(real.wraps as unknown[])[0], (real.wraps as unknown[])[0]],
+      }),
+      outcome: "opens",
     },
   ];
 
@@ -753,23 +1058,91 @@ describe("exit cluster A3/A4/A5: which credential opens this bundle", () => {
       }
 
       // THE ASSERTION: the advice and the reality are the same answer.
-      expect(importSucceeded).toBe(custodyCase.importAccepts);
-      expect(inspectSaysOpenable).toBe(custodyCase.importAccepts);
-
-      if (custodyCase.importAccepts) {
+      if (custodyCase.outcome === "opens") {
+        expect(importSucceeded).toBe(true);
+        expect(inspectSaysOpenable).toBe(true);
         expect(printed).toContain("source_custody: valid");
+        expect(inspectCode).toBe(0);
         return;
       }
+
+      if (custodyCase.outcome === "credential-dependent") {
+        // Inspect still names the re-key path (it cannot know better), and the
+        // import fails on AUTHENTICATION, not on shape. The two are only
+        // consistent because inspect states the limit in its own output; an
+        // unqualified "bundle-rekey-key" here would be the original overclaim.
+        expect(importSucceeded).toBe(false);
+        expect(importCode).toBe("SOURCE_CREDENTIAL_INVALID");
+        expect(inspectSaysOpenable).toBe(true);
+        expect(printed).toContain("source_custody: valid");
+        expect(printed).toContain(
+          "credential check: structure only (no credential held)"
+        );
+        expect(inspectCode).toBe(0);
+        return;
+      }
+
+      expect(importSucceeded).toBe(false);
       expect(importCode).toBe("SOURCE_CUSTODY_MALFORMED");
       // Not merely "not bundle-rekey-key": a verified-but-unopenable bundle is
       // a FAILURE for this command, and the report must name the damaged block
       // so the operator knows what to re-export.
+      expect(inspectSaysOpenable).toBe(false);
       expect(printed).toContain("credential: unusable");
       expect(printed).toContain("source_custody: malformed");
       expect(printed).toContain("re-key block (source_custody) is malformed");
       expect(inspectCode).toBe(1);
     });
   }
+
+  it("A5 pin scope: a programmatic sourceMasterKey import bypasses the custody gate inspect reports on", async () => {
+    // The contract pin in server/src/exit/verifier.ts used to claim inspect
+    // mirrors `resolveSourceMasterKey` outright. It does not: that function
+    // returns `opts.sourceMasterKey` BEFORE `validateSourceCustody`, so this
+    // import succeeds on a bundle inspect calls `unusable`. The pin now scopes
+    // itself to the CLI credential paths, and this test is what holds it there
+    // instead of prose. If a `--source-master-key` CLI flag is ever added, this
+    // divergence becomes reachable by an operator and inspect's verdict becomes
+    // wrong; this test is the place that will look wrong first.
+    const source = await makeSource("a5-pin-scope-source");
+    const bundleDir = await newBundleDir("sanctuary-a5-pinscope-");
+    await exportBundle(source, bundleDir, { mint: true });
+    await patchEncryptedStateAndResign(bundleDir, source, (artifact) => {
+      const custody = artifact.source_custody as Record<string, unknown>;
+      const wrap = { ...((custody.wraps as Record<string, unknown>[])[0] ?? {}) };
+      wrap.payload = null;
+      artifact.source_custody = { ...custody, wraps: [wrap] };
+    });
+
+    const { chunks, out, err } = captureCli();
+    const inspectCode = await runExitCommand({ argv: ["inspect", bundleDir], out, err });
+    const printed = chunks.join("");
+    expect(inspectCode).toBe(1);
+    expect(printed).toContain("credential: unusable");
+
+    // No CLI flag reaches this option; only a programmatic caller can.
+    const cliSource = await readFile(
+      new URL("../../src/exit/cli.ts", import.meta.url),
+      "utf8"
+    );
+    expect(cliSource).not.toContain("sourceMasterKey");
+
+    const destination = await makeDestination();
+    const result = await importExitBundle({
+      bundleDir,
+      storage: destination.storage,
+      masterKey: destination.masterKey,
+      identityManager: destination.identityManager,
+      auditLog: destination.auditLog,
+      reputationStore: destination.reputationStore,
+      activate: true,
+      forceRebind: true,
+      sourceMasterKey: source.masterKey,
+      destinationSignerIdentityId: destination.identityId,
+    });
+    expect(result.state.status).toBe("rekeyed");
+    expect(result.state.imported_keys).toBeGreaterThan(0);
+  });
 
   it("A5 differential: a malformed custody block outranks a usable legacy marker", async () => {
     // Import validates custody BEFORE it looks at anything else, so a damaged

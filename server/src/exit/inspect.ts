@@ -32,6 +32,14 @@ export interface ExitBundleInspectionReport {
   credential_path: ExitBundleCredentialPath | "unknown";
   /** The exact command line that imports this bundle's state, if any can. */
   credential_instruction: string;
+  /**
+   * How far this answer was actually checked. Inspect holds no credential, so
+   * on the paths that need one it can only confirm that the bundle's re-key
+   * material is well formed, never that a particular secret opens it. Reported
+   * as its own field so the limit travels with the answer instead of living in
+   * a doc-comment nobody reads at 2am.
+   */
+  credential_bound: string;
   legacy_kdf_params: "absent" | "valid" | "malformed" | "unknown";
   /** Which re-key block is present, and whether import would accept it. */
   source_custody: SourceCustodyState | "unknown";
@@ -87,6 +95,57 @@ function credentialInstruction(state: ExitEncryptedStateSummary): string {
 }
 
 /**
+ * What the report's answer is worth, per path.
+ *
+ * The distinction is not cosmetic. `unusable` and `none-required` are decided
+ * entirely from the artifact, so inspect is as certain as the import would be.
+ * Every other path ends in a cryptographic check against a secret inspect does
+ * not have, and the honest report says which half was verified. This is the
+ * bound named in server/src/exit/source-custody.ts: the shared predicate
+ * answers "could ANY key open this?", never "will YOUR key open this?".
+ *
+ * CONTRACT PIN (server/test/exit/exit-credential-path.test.ts, the
+ * `credential-dependent` row of the custody differential): that case drives a
+ * structurally perfect wrap whose ciphertext does not authenticate through both
+ * `exit inspect` and a real `importExitBundle`, and asserts inspect still names
+ * the re-key path AND prints this line. Reword the `bundle-rekey-key` string
+ * and that test fails, which is the point of writing it here.
+ */
+function credentialCheckBound(state: ExitEncryptedStateSummary): string {
+  switch (state.credential_path) {
+    case "bundle-rekey-key":
+      return (
+        "structure only (no credential held): the wrap type, payload version, " +
+        "algorithm, and IV/ciphertext encoding and length are everything the " +
+        "import checks before it needs a secret, and they are intact. Whether " +
+        "the key you hold actually authenticates against this wrap is decided " +
+        "by AES-GCM inside the import, and inspect cannot answer it."
+      );
+    case "source-passphrase-legacy":
+      return (
+        "structure only (no credential held): the bundle's legacy derivation " +
+        "parameters are within bounds and will run. Whether your passphrase " +
+        "derives the source master is decided inside the import."
+      );
+    case "legacy-recovery-key-as-master":
+      return (
+        "shape only (no credential held): this bundle declares no re-key " +
+        "material at all, so there is nothing here to check a key against. " +
+        "The legacy interpretation is a guess the operator must confirm, and " +
+        "a wrong key surfaces as SOURCE_KEY_MISMATCH during the import."
+      );
+    case "none-required":
+      return "conclusive: there is no encrypted state to re-key.";
+    case "unusable":
+      return (
+        "conclusive: no credential is needed to know this bundle's state " +
+        "cannot be re-keyed, because the material the import requires is " +
+        "damaged in the artifact itself."
+      );
+  }
+}
+
+/**
  * Verify a bundle directory and report what it carries plus which credential
  * re-keys it. Throws `InvalidExitBundleError` (from the verifier) when the
  * directory is not an exit bundle at all; a bundle that IS one but fails
@@ -113,6 +172,10 @@ export async function inspectExitBundle(
       state !== undefined
         ? credentialInstruction(state)
         : "unknown: this bundle carries no encrypted_state artifact",
+    credential_bound:
+      state !== undefined
+        ? credentialCheckBound(state)
+        : "nothing checked: this bundle carries no encrypted_state artifact",
     legacy_kdf_params: state?.legacy_kdf_params ?? "unknown",
     source_custody: state?.source_custody ?? "unknown",
     warnings: result.warnings,

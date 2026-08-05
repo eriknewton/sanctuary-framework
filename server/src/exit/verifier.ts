@@ -59,22 +59,40 @@ import {
  * artifact alone (no fortress access, no operator secret).
  *
  * CONTRACT PIN (server/src/exit/bundle.ts `resolveSourceMasterKey`): this
- * classification MUST mirror that function's precedence exactly (zero entries
- * => nothing to re-key, and import returns before any custody check;
- * MALFORMED source_custody => import throws SOURCE_CUSTODY_MALFORMED before
- * every other branch, so nothing can open the bundle; VALID source_custody =>
- * bundle re-key key; valid source_key_derivation => legacy passphrase;
- * malformed source_key_derivation => import throws SOURCE_KDF_PARAMS_MALFORMED;
- * neither => legacy recovery-key-as-master behind the explicit
- * `legacyRecoveryKeyIsMaster` opt-in). The two shape-checks are not restated
- * here: both sides call `parseKeyDerivationParams` and
- * `isValidSourceCustody`/`readSourceCustodyState`. The custody half of the
- * mirror is verified mechanically by the custody differential in
- * server/test/exit/exit-credential-path.test.ts, which drives nine crafted
- * blocks plus an untouched control through BOTH `exit inspect` and a real
- * `importExitBundle` and asserts the two agree case for case; the KDF half is
- * covered by the paired A3 import/inspect cases in the same file, which apply
- * the identical mutation to both sides.
+ * classification mirrors the precedence that function applies to the
+ * credentials an OPERATOR can supply, which is what `exit inspect` advises
+ * about (zero entries => nothing to re-key, and import returns before any
+ * custody check; MALFORMED source_custody => import throws
+ * SOURCE_CUSTODY_MALFORMED before every other operator branch, so nothing an
+ * operator holds can open the bundle; VALID source_custody => bundle re-key
+ * key; valid source_key_derivation => legacy passphrase; malformed
+ * source_key_derivation => import throws SOURCE_KDF_PARAMS_MALFORMED; neither
+ * => legacy recovery-key-as-master behind the explicit
+ * `legacyRecoveryKeyIsMaster` opt-in).
+ *
+ * THE ONE BRANCH IT DOES NOT MIRROR, named because a pin that overstates its
+ * own reach is worse than no pin: `resolveSourceMasterKey` returns
+ * `opts.sourceMasterKey` at the very top, BEFORE `validateSourceCustody` runs.
+ * A programmatic caller holding the raw source master therefore imports a
+ * bundle this classifier calls `unusable`. That is not a contradiction to fix
+ * in either direction - there is no CLI flag for a raw master key (see
+ * `runExitCommand`'s import branch), so no operator reading this report has
+ * that option, and inspect describing it would be advice nobody can take. The
+ * scope of this pin is the CLI credential paths, not every programmatic entry
+ * point. Mechanically held by the `sourceMasterKey` case in
+ * server/test/exit/exit-credential-path.test.ts, which asserts exactly this
+ * divergence rather than leaving it to prose.
+ *
+ * The two shape-checks are not restated here: both sides call
+ * `parseKeyDerivationParams` and `isValidSourceCustody`/
+ * `readSourceCustodyState`. The custody half of the mirror is verified
+ * mechanically by the custody differential in
+ * server/test/exit/exit-credential-path.test.ts, which drives every crafted
+ * block in its table (block shape, wrap shape, and each field of the wrap
+ * payload the unwrap path reads) plus untouched controls through BOTH
+ * `exit inspect` and a real `importExitBundle` and asserts the two agree case
+ * for case; the KDF half is covered by the paired A3 import/inspect cases in
+ * the same file, which apply the identical mutation to both sides.
  */
 export type ExitBundleCredentialPath =
   | "bundle-rekey-key"

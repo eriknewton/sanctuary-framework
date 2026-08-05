@@ -436,6 +436,10 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
         write(out, `source_custody: ${report.source_custody}\n`);
         write(out, `credential: ${report.credential_path}\n`);
         write(out, `to import state: ${report.credential_instruction}\n`);
+        // Printed unconditionally, including on the happy path: the whole
+        // defect this command exists to close was an answer that sounded more
+        // certain than it was. A limit shown only on failures is not a limit.
+        write(out, `credential check: ${report.credential_bound}\n`);
         for (const warning of report.warnings) {
           write(out, `warning: ${warning}\n`);
         }

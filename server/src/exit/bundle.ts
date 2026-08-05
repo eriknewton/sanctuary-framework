@@ -1539,6 +1539,14 @@ async function resolveSourceMasterKey(
   opts: ImportExitBundleOptions
 ): Promise<Uint8Array | null> {
   if (!encryptedState || encryptedState.entries.length === 0) return null;
+  // CONTRACT PIN (server/src/exit/verifier.ts `ExitBundleCredentialPath`): this
+  // return is the ONE branch `exit inspect` does not mirror, and the pin over
+  // there says so. It precedes `validateSourceCustody` deliberately - a caller
+  // who already holds the source master needs no re-key material at all, so a
+  // damaged `source_custody` block is irrelevant to them. There is no CLI flag
+  // for it (`cli.ts` import branch), so it is unreachable by the operator whom
+  // inspect advises. Adding one WOULD make inspect's `unusable` verdict wrong,
+  // and this comment is the tripwire for that.
   if (opts.sourceMasterKey) return opts.sourceMasterKey;
 
   const sourceCustody = encryptedState.source_custody;
