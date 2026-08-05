@@ -37,6 +37,20 @@ sanctuary secrets audit
 
 That's the entire administrative workflow. Your skills now request tokens through the broker MCP server instead of reading from `.env`.
 
+Failure mode: the "never appears in argv" guarantee belongs to the prompt form shown
+above, and `add` also accepts the value as a second positional argument. That form is the
+one people reach for when scripting the migration, and it puts the credential in `ps aux`
+for the life of the process and in shell history permanently. The command's own help says
+so; the workflow above is where the habit gets set. For anything scripted, pipe the value
+instead: `printf %s "$VALUE" | sanctuary secrets add gmail_oauth_token`. The same
+precedence applies to `sanctuary secrets rotate`.
+
+Failure mode: `--fortress` must precede the subcommand. `sanctuary secrets list --fortress
+<path>` silently ignores the flag and operates on `~/.sanctuary`, so on a multi-fortress
+host you can add a secret to, or read a secret from, a fortress you did not mean to touch,
+with no warning and a perfectly ordinary-looking result. Write it as `sanctuary --fortress
+<path> secrets list`. See [cli-operator-verbs.md](cli-operator-verbs.md).
+
 ---
 
 ## How skills request credentials
@@ -129,6 +143,16 @@ This listens on stdio by default, add it to your harness's MCP server config the
 ```
 
 The first invocation creates the keychain (`~/Library/Keychains/sanctuary.keychain-db`) and prompts for a passphrase. Subsequent invocations use the passphrase cached by the Sanctuary wrap flow (same passphrase that protects the master key).
+
+Failure mode: that filename is the **default fortress** only. Broker storage is scoped per
+fortress: a fortress at any path other than `~/.sanctuary` gets its own keychain file named
+`sanctuary-broker-<digest>.keychain-db`, its own service name, and its own account
+namespace, where the digest derives from the fortress path. Two consequences on a
+multi-fortress host. Secrets stored under one fortress are invisible from another, which
+looks like the broker lost them rather than like you are asking the wrong fortress. And an
+operator following the path above in Keychain Access will not find the file at all, because
+it is named after a digest they have no obvious way to compute. Confirm which fortress a
+broker command targeted before concluding a secret is missing.
 
 ---
 

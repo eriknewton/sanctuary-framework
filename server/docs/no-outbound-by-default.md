@@ -36,8 +36,8 @@ The only outbound destinations a fresh Sanctuary install reaches are:
 running Sanctuary as the operator-sovereign agent control plane reject
 any vendor-controlled network egress on principle. A single
 Sanctuary-initiated connection to a vendor endpoint disqualifies the
-product for the segment we are building for. The rule is load-bearing
-to the substrate-position thesis.
+product for the segment we are building for. The substrate-position
+thesis rests on this rule.
 
 **The Castle Layer 1 enforcement story (RFC-0003) layers on this.**
 Once the OS-level egress filter ships, even prompt-injected wrapped
@@ -71,7 +71,7 @@ construction. The rule keeps the log honest.
   for the soak window (`SOAK_SECONDS`, default 60), and asserts every
   destination is in the allowed-pattern list (localhost variants only
   by default).
-- The process-tree refresh on each tick is load-bearing: a child process
+- The process-tree refresh on each tick is what makes the soak complete: a child process
   spawned mid-soak (Concordia sidecar, substrate worker, future helper)
   is picked up the next tick, so its outbound is captured. Filtering by
   parent PID alone would miss those connections.
@@ -107,6 +107,17 @@ outbound channels by configuring them:
   signature from a dedicated derived key, and that key's public half,
   never state content, counts, policy data, or fortress identifiers.
   See `docs/transparency-checkpoints.md`, "External anchoring".
+
+  Failure mode: this opt-in is the one that does not come back. A public
+  transparency log is append-only by construction, so an anchor published by
+  mistake (wrong fortress, a test run against the production log, an operator
+  who meant to try it once) cannot be withdrawn by disabling the setting
+  afterward. Turning anchoring off stops future publication and leaves every
+  prior entry public and permanent. What the entries reveal is bounded by
+  design, a salted digest and a signature from a dedicated derived key, and
+  the timing and cadence of your checkpoints are visible regardless. Point
+  `--rekor-url` at a test log for any trial run, and treat the first
+  production anchor as the irreversible step it is.
 
 ### Update and pin probes (default OFF, operator opt-in)
 
