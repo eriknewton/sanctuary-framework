@@ -1,3 +1,9 @@
+// fail-before-exempt: adapted to the exporter's new contract only. This PR makes
+// a supplied-but-empty stateNamespaces array throw, so these call sites now omit
+// the option instead of passing []. Behavior is unchanged (they pass no
+// stateStoragePath, so discovery finds nothing either way) and no assertion was
+// added here, so nothing in this file can fail against pre-fix source. The
+// binding test for the fix is test/exit/exit-export-namespace-discovery.test.ts.
 /**
  * Regression test for drill Finding RRR (P2, 2026-05-08).
  *
