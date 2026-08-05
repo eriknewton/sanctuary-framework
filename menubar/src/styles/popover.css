@@ -10,7 +10,27 @@
  *
  * State machine is preserved verbatim; full onboarding flow (substrate
  * selection, first concierge round-trip, persistence) is Sprint Piece 3
- * territory and not in scope here. */
+ * territory and not in scope here.
+ *
+ * TOKEN BLOCK BELOW: MUST MATCH `PAPER_INK_ROOT_TOKENS_CSS` in
+ * server/src/dashboard/design-tokens.ts. The menubar is a separate
+ * Tauri build with no import path into server/src, so the tokens are
+ * hand-copied and nothing enforces the match but this comment.
+ *
+ * Verified 2026-08-04: value-faithful subset, zero value drift across all 29
+ * light and 17 dark tokens present here. This file DOES carry the
+ * `[data-theme="dark"]` block. Deliberately not mirrored:
+ * `--indigo`/`--indigo-bg` (informational hue, unused here),
+ * `--slate`/`--slate-bg` (the unknown-status hue; the menubar's status set is
+ * the closed union `'connected' | 'degraded' | 'disconnected'` on
+ * `FleetSnapshot.connection_status` in menubar/src/api/client.ts:36, with no
+ * unknown member, so there is nothing here to color slate today),
+ * `--accent`, the `--text-*` scale, and the semantic `--color-*` alias layer.
+ *
+ * Failure mode: a drifted mirror still parses and still renders. The menubar
+ * simply becomes a slightly different shade than the console it reports on,
+ * which reads as a rendering quirk rather than as a stale copy. Change a value
+ * in the canonical constant and here in the SAME PR. */
 
 :root {
   --paper: #f7f5f0;

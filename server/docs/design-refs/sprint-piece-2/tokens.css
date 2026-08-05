@@ -1,5 +1,24 @@
-/* Sanctuary v1.2 design tokens — lifted from server/src/dashboard/v1_1/html.ts.
-   Source of truth is the dashboard. This file mirrors it for the prototype. */
+/* Sanctuary v1.2 design tokens, static design reference.
+
+   MUST MATCH `PAPER_INK_ROOT_TOKENS_CSS` in
+   server/src/dashboard/design-tokens.ts. That constant is the canonical source
+   every shipped web surface interpolates; this file is a hand-copied mirror for
+   the prototype and no build step reads the constant, so nothing keeps the two
+   in step but this comment. (An earlier version of this header named
+   server/src/dashboard/v1_1/html.ts as the source; that file now imports the
+   constant and carries no `:root` block of its own.)
+
+   Verified 2026-08-04: value-faithful subset, zero value drift across all 31
+   light and 19 dark tokens present here. Deliberately not mirrored:
+   `--slate`/`--slate-bg` (the unknown-status hue, which these reference
+   surfaces do not render), `--accent`, the `--text-*` scale, and the semantic
+   `--color-*` alias layer. `--space-7` is local to this file and has no
+   canonical counterpart.
+
+   Failure mode: a drifted mirror still parses and still renders. It looks
+   almost right, so the divergence surfaces as "the prototype and the product
+   are subtly different colors" long after the change that caused it. Change a
+   value in the canonical constant and in this file in the SAME PR. */
 
 :root {
   --paper: #f7f5f0;

@@ -22,8 +22,41 @@
  *     `posture-html-shared.ts`). Green must mean "checked and passed," never
  *     "no data"; unknown gets its own full-weight gray, not a whisper.
  *
+ * On top of that physical ladder sits a SEMANTIC alias layer (the
+ * `--color-*` names at the end of the `:root` block). It encodes the paragraph
+ * above in token names instead of prose: `unknown` has its own name and its own
+ * hue, so a surface with no result never has to borrow the pass color. The
+ * aliases are additive and change no rendered value; the rationale and the
+ * per-element `var()` mechanics are at the enforcement site itself.
+ *
  * Consumed as a RAW CSS string interpolated verbatim into each page's inline
  * `<style>` tag. Keep it dependency free and side-effect free.
+ *
+ * IN-REPO CONSUMERS (all interpolate this constant and declare no `:root` of
+ * their own): `dashboard/v1_1/html.ts`, `dashboard/mobile.ts`,
+ * `principal-policy/posture-html-shared.ts` (re-exported as
+ * `POSTURE_ROOT_TOKENS_CSS`), and `principal-policy/dashboard-html.ts` in
+ * `generateLoginHTML` and `generateFleetSwitcherHTML`.
+ *
+ * ONE SURFACE IS STILL OUTSIDE THIS SYSTEM: `generateDashboardHTML` in
+ * `principal-policy/dashboard-html.ts` carries its own GitHub-dark `:root`
+ * (`--bg`, `--green`, `--red`, `--blue`, ...) with no paper/ink token in it.
+ * That is the legacy approval-channel board; porting it is a visual change and
+ * is deliberately NOT part of this token work. Do not read the pin above as
+ * covering it.
+ *
+ * OUT-OF-BUILD MIRRORS. Two files outside this module's import graph hand-copy
+ * a SUBSET of these values and must match them:
+ *   - `server/docs/design-refs/sprint-piece-2/tokens.css` (static design
+ *     reference; no build step reads this constant)
+ *   - `menubar/src/styles/popover.css` (separate Tauri/menubar build)
+ * Both carry a "must match `PAPER_INK_ROOT_TOKENS_CSS` in this file" pin. Both
+ * are value-faithful subsets as of 2026-08-04 (verified token by token, zero
+ * value drift); neither mirrors the semantic `--color-*` layer, and neither
+ * mirrors `--slate`/`--slate-bg`, because neither surface renders an unknown
+ * status today. Changing a value here means changing it in both mirrors in the
+ * SAME PR. Nothing enforces this mechanically: a drifted mirror compiles,
+ * renders, and looks almost right, which is exactly how it goes unnoticed.
  */
 export const PAPER_INK_ROOT_TOKENS_CSS = `:root {
   --paper: #f7f5f0;
@@ -74,6 +107,57 @@ export const PAPER_INK_ROOT_TOKENS_CSS = `:root {
   --space-4: 16px;
   --space-5: 24px;
   --space-6: 32px;
+  /* Semantic alias layer. Everything above is PHYSICAL: the name says what the
+     value looks like (--sage, --ink-3, --surface-2). Everything below is
+     SEMANTIC: the name says what the value MEANS. Component CSS should reach
+     for the semantic name so the status vocabulary this system enforces is
+     legible in the stylesheet rather than only in the prose above.
+
+     Why the alias layer exists rather than a comment: the status set has five
+     members and "unknown" is one of them, with its own hue and its own name.
+     Green must mean "checked and passed," never "no data." A surface with no
+     result has --color-status-unknown to reach for, so it never has to borrow
+     the pass color for want of a token. The wired mapping of these five onto
+     .pill classes is STATUS_PILL_CSS in
+     principal-policy/posture-html-shared.ts.
+
+     Aliases are strictly ADDITIVE: each resolves to a physical token declared
+     above, so introducing them changes no rendered value on any surface.
+     var() substitution is computed per element, and the dark palette
+     redeclares the physical tokens on this same element (html), so an alias
+     declared once here tracks the theme with no dark-block counterpart. Same
+     mechanism as --accent: var(--indigo) above; that is why the dark block
+     below repeats no alias.
+
+     This comment lives inside a TypeScript template literal: no backticks and
+     no dollar-brace here, or the CSS string terminates mid-block. */
+  --color-status-pass: var(--sage);
+  --color-status-pass-bg: var(--sage-bg);
+  --color-status-attention: var(--ochre);
+  --color-status-attention-bg: var(--ochre-bg);
+  --color-status-fault: var(--rust);
+  --color-status-fault-bg: var(--rust-bg);
+  --color-status-neutral: var(--ink-3);
+  --color-status-neutral-bg: var(--surface-2);
+  --color-status-unknown: var(--slate);
+  --color-status-unknown-bg: var(--slate-bg);
+  /* Informational, never a status hue: an evidence link must not be readable
+     as a state signal (see EVIDENCE_SPINE_CSS in posture-html-shared.ts). */
+  --color-info: var(--indigo);
+  --color-info-bg: var(--indigo-bg);
+  --color-text-primary: var(--ink);
+  --color-text-secondary: var(--ink-2);
+  --color-text-muted: var(--ink-3);
+  --color-text-faint: var(--ink-4);
+  /* Surfaces are named by role, not by elevation. The physical ladder inverts
+     between themes (in light, --surface is lighter than --surface-2; in dark it
+     is darker), so "raised"/"sunken" would be true in one theme and false in
+     the other. */
+  --color-surface-page: var(--paper);
+  --color-surface-card: var(--surface);
+  --color-surface-subtle: var(--surface-2);
+  --color-border: var(--rule);
+  --color-border-strong: var(--rule-2);
 }
 [data-theme="dark"] {
   --paper: #121210;

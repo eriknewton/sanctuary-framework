@@ -11,35 +11,22 @@ export function generateLoginHTML(options: { serverVersion: string }): string {
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Sanctuary — Principal Dashboard</title>
   <style>
-    /* v1.1 "paper/ink" design tokens. Canonical source of truth is the
-       dashboard board at server/src/dashboard/v1_1/html.ts (:root at :47).
-       These are a scoped mirror (Option A) of the subset this page uses;
-       do not diverge the values. A shared tokens module is a logged
-       follow-up. */
-    :root {
-      --paper: #f7f5f0;
-      --paper-2: #efece5;
-      --ink: #1a1a17;
-      --ink-2: #39362f;
-      --ink-3: #6a6659;
-      --ink-4: #9a9585;
-      --rule: #d8d4c8;
-      --surface: #fdfcf8;
-      --surface-2: #f1eee6;
-      --rust: oklch(55% 0.11 35);
-      --rust-bg: oklch(94% 0.03 35);
-      --mono: ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
-      --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
-      --serif: "Iowan Old Style", "Charter", "Georgia", serif;
-      --rad: 6px;
-      --rad-lg: 10px;
-      --shadow: 0 1px 2px rgba(0,0,0,0.04), 0 0 0 1px rgba(0,0,0,0.02);
-      --text-xs: 11px;
-      --text-sm: 12px;
-      --text-md: 14px;
-      --text-base: 13px;
-      --text-lg: 16px;
-    }
+    /* v1.1 "paper/ink" design tokens. Must match PAPER_INK_ROOT_TOKENS_CSS in
+       server/src/dashboard/design-tokens.ts, which is the canonical source
+       every web surface interpolates (the v1.1 board no longer carries its own
+       :root block either). This page used to hand-copy a light-only subset
+       here; that copy is gone, so the palette cannot drift on the login screen
+       alone. Interpolating the shared constant is additive for this page: the
+       22 tokens the old copy declared were byte-identical to the canonical
+       values, and none of the tokens the shared block adds are referenced by
+       the CSS below.
+
+       This page intentionally does NOT emit THEME_BOOTSTRAP_SCRIPT, so nothing
+       ever sets data-theme and the shared block's dark rules never match: the
+       login screen renders light-only, exactly as before. Adding the bootstrap
+       here would be a real visual change and belongs in its own change, not
+       this one. */
+    ${PAPER_INK_ROOT_TOKENS_CSS}
 
     * {
       margin: 0;
@@ -332,6 +319,15 @@ export function generateDashboardHTML(options: {
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Sanctuary — Principal Dashboard</title>
   <style>
+    /* Legacy GitHub-dark palette, deliberately NOT the paper/ink system. This
+       block does NOT mirror PAPER_INK_ROOT_TOKENS_CSS in
+       server/src/dashboard/design-tokens.ts and must not be "reconciled" with
+       it token by token: the names do not correspond (--bg vs --paper,
+       --text-primary vs --ink, --green/--red vs --sage/--rust) and every rule
+       below is written against these names. Porting this board onto the shared
+       tokens is a real visual change and needs its own PR. Note --surface
+       exists in BOTH systems with different values (#161b22 here,
+       #fdfcf8 / #1a1a17 there), so a partial merge silently recolors cards. */
     :root {
       --bg: #0d1117;
       --surface: #161b22;
