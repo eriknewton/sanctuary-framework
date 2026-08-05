@@ -24,6 +24,7 @@ import {
   getOrCreateKeychainCustodyKey,
   readKeychainCustodyKey,
 } from "../../src/wrap/keychain-custody.js";
+import { installInMemoryKeychainStore } from "../setup/keychain-fake.js";
 import {
   credentialStoreIsInstalled,
   dbusSocketIdentifier,
@@ -157,6 +158,14 @@ describe("the real-backend skip predicate (truth table, not substrings)", () => 
     hasDbus: true,
     keyringIsDisposable: true,
   };
+
+  beforeEach(() => {
+    // Order-independence: an earlier case in this file swaps the injected store
+    // out, and the refusal case below asserts the store is STILL serving after
+    // a refusal. Without this, that assertion would depend on which cases ran
+    // first, which is how a test starts passing for the wrong reason.
+    installInMemoryKeychainStore();
+  });
 
   it("runs when every condition holds", () => {
     expect(shouldSkipRealBackend(qualifies)).toBe(false);
