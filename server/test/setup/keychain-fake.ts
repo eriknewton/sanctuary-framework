@@ -20,12 +20,14 @@
  * a fake that knows three verbs forces the fourth call site to keep its own
  * `spawn`, and one unrouted call site falsifies the whole guarantee.
  *
- * ONE FILE OPTS OUT: `test/keychain-linux-real-backend-integration.test.ts`
- * exists to exercise the genuine `secret-tool` shell-out, so serving it from
- * this fake would defeat its purpose - and worse, would make a DEAD Secret
- * Service look alive, because the fake answers happily no matter what
- * DBUS_SESSION_BUS_ADDRESS points at. That file calls
- * {@link installInMemoryKeychainStore} in its `afterAll` to put the fake back.
+ * NOTHING OPTS OUT ANY MORE. One file used to: the Linux real-backend
+ * integration test removed the store so it could shell out to a genuine
+ * `secret-tool`. Three attempts to gate that removal each shipped a check
+ * weaker than its claim, so the capability was removed instead of guarded, and
+ * `setKeychainExec` can no longer be un-set. The real shell-out is exercised by
+ * `scripts/real-backend-check.ts`, which runs outside vitest as a plain node
+ * process. Under the suite this fake serves every credential call on every
+ * platform, with no escape hatch to get wrong.
  */
 
 import { existsSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
@@ -261,6 +263,23 @@ function runSecurityVerb(tokens: string[]): ExecResult {
   const service = flags.get("-s");
   const keychain = positionals[0] ?? DEFAULT_KEYCHAIN;
 
+  // ONE gate for every verb that names a keychain file, rather than a check
+  // bolted onto each handler. Fixing this per-verb is the whack-a-mole shape
+  // that produced the bug it guards against: `unlock-keychain` and
+  // `dump-keychain` were hardened first, and the three generic-password verbs
+  // silently kept answering for keychains the fake never created. A new verb
+  // added below inherits the refusal instead of having to remember it.
+  //
+  // `create-keychain` is the sole exemption, and necessarily so: it is the verb
+  // whose whole job is to make a keychain the fake does not yet know.
+  const namedKeychainPath = verb === "create-keychain" ? undefined : positionals[0];
+  let namedKeychain: { passphrase: string } | undefined;
+  if (namedKeychainPath !== undefined) {
+    const known = refuseUnlessCreatedHere(namedKeychainPath);
+    if (known.error !== undefined) return known.error;
+    namedKeychain = known.record;
+  }
+
   if (verb === "create-keychain") {
     const path = positionals[0];
     if (path === undefined) {
@@ -300,26 +319,16 @@ function runSecurityVerb(tokens: string[]): ExecResult {
   }
 
   if (verb === "unlock-keychain") {
-    const path = positionals[0];
-    if (path !== undefined) {
-      const known = refuseUnlessCreatedHere(path);
-      if (known.error !== undefined) return known.error;
-      if (known.record.passphrase !== (flags.get("-p") ?? "")) {
-        return fail(
-          AUTH_FAILED_CODE,
-          "security: The user name or passphrase you entered is not correct."
-        );
-      }
+    if (namedKeychain !== undefined && namedKeychain.passphrase !== (flags.get("-p") ?? "")) {
+      return fail(
+        AUTH_FAILED_CODE,
+        "security: The user name or passphrase you entered is not correct."
+      );
     }
     return ok();
   }
 
   if (verb === "dump-keychain") {
-    const path = positionals[0];
-    if (path !== undefined) {
-      const known = refuseUnlessCreatedHere(path);
-      if (known.error !== undefined) return known.error;
-    }
     // One `keychain: ` block per item: keychain-backend.ts `listSecretNames`
     // splits on /^keychain: /m and reads one "acct" per block.
     let out = "";

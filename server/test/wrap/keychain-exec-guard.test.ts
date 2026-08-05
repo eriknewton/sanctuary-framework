@@ -16,9 +16,9 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
+  decideKeychainExecution,
   execKeychain,
   setKeychainExec,
-  ALLOW_REAL_KEYCHAIN_ENV,
   type KeychainExec,
 } from "../../src/wrap/keychain-exec.js";
 import {
@@ -26,29 +26,6 @@ import {
   readKeychainCustodyKey,
 } from "../../src/wrap/keychain-custody.js";
 import { installInMemoryKeychainStore } from "../setup/keychain-fake.js";
-import {
-  credentialStoreIsInstalled,
-  enterRealBackendMode,
-  probeDisposableCiRunner,
-  shouldSkipRealBackend,
-  type RealBackendProbe,
-} from "../support/real-backend-guard.js";
-
-/**
- * The global setup file (test/setup/keychain-fake.ts) installs the in-memory
- * store for every test. These cases deliberately remove it to prove the guard
- * underneath, so each one restores it.
- */
-function withNoStore<T>(fn: () => T): T {
-  // Capture nothing: the setup file re-installs per worker, and afterEach below
-  // restores a working fake so later tests in this file are unaffected.
-  setKeychainExec(null);
-  try {
-    return fn();
-  } finally {
-    setKeychainExec(memoryFake);
-  }
-}
 
 const memoryStore = new Map<string, string>();
 const memoryFake: KeychainExec = async (cmd, args, input) => {
@@ -67,43 +44,56 @@ const memoryFake: KeychainExec = async (cmd, args, input) => {
   return { stdout: "", stderr: "unsupported", code: 1 };
 };
 
-// Cleared on BOTH sides of every case. Clearing only afterwards would leave the
-// refusal cases below at the mercy of the ambient environment: a CI job that
-// exported the opt-in would make them pass while asserting nothing, which is
-// the same fail-open shape this whole chokepoint exists to prevent.
-beforeEach(() => {
-  delete process.env[ALLOW_REAL_KEYCHAIN_ENV];
-});
-
 afterEach(() => {
-  delete process.env[ALLOW_REAL_KEYCHAIN_ENV];
   memoryStore.clear();
+  installInMemoryKeychainStore();
 });
 
-describe("keychain exec chokepoint", () => {
-  it("REFUSES to spawn the real credential CLI from a test with no store installed", async () => {
-    const attempt = withNoStore(() =>
-      execKeychain("security", ["find-generic-password", "-a", "sanctuary", "-s", "probe", "-w"])
+describe("the credential CLI is UNREACHABLE from the suite", () => {
+  /**
+   * The decision is a pure function of two inputs, which is what makes the
+   * property checkable rather than assertable. These cases used to work by
+   * calling `setKeychainExec(null)` to drop the store and observe the refusal.
+   * That capability is gone: `setKeychainExec` no longer accepts null and there
+   * is no reset, so nothing in the suite can restore the spawn path. The truth
+   * table below is how the refusal is verified now.
+   */
+
+  it("never yields spawn-real while under test, for ANY store state", () => {
+    // The whole security property, as one assertion over the entire input space.
+    for (const hasStore of [true, false]) {
+      expect(decideKeychainExecution(hasStore, true)).not.toBe("spawn-real");
+    }
+  });
+
+  it("refuses under test when no store is installed", () => {
+    expect(decideKeychainExecution(false, true)).toBe("refuse-under-test");
+  });
+
+  it("uses the installed store under test", () => {
+    expect(decideKeychainExecution(true, true)).toBe("installed-store");
+  });
+
+  it("spawns for real ONLY outside the test suite with no store installed", () => {
+    // This is the branch scripts/real-backend-check.ts runs on: a plain node
+    // process, where spawning the credential CLI is ordinary behavior.
+    expect(decideKeychainExecution(false, false)).toBe("spawn-real");
+  });
+
+  it("prefers an injected store even outside tests, so production wiring is honored", () => {
+    expect(decideKeychainExecution(true, false)).toBe("installed-store");
+  });
+
+  it("offers no way to un-set the store: setKeychainExec rejects null at the type level", () => {
+    // A type-level guarantee is only worth something if something checks it, and
+    // `npm run typecheck` is that something. This case pins the runtime half:
+    // there is no reset export to reach for.
+    const surface = readFileSync(
+      fileURLToPath(new URL("../../src/wrap/keychain-exec.ts", import.meta.url)),
+      "utf8"
     );
-    await expect(attempt).rejects.toThrow(/Refusing to run 'security' against the real OS credential store/);
-  });
-
-  it("names the remedy in the refusal so a new call site is fixable without archaeology", async () => {
-    const attempt = withNoStore(() => execKeychain("security", ["-i"], "add-generic-password\n"));
-    await expect(attempt).rejects.toThrow(/in-memory store|setKeychainExec/);
-  });
-
-  it("still refuses for the Linux Secret Service path, not just macOS", async () => {
-    const attempt = withNoStore(() => execKeychain("secret-tool", ["store", "--label", "x"], "secret"));
-    await expect(attempt).rejects.toThrow(/Refusing to run 'secret-tool'/);
-  });
-
-  it("allows the real CLI only when a test EXPLICITLY opts in", async () => {
-    process.env[ALLOW_REAL_KEYCHAIN_ENV] = "1";
-    // Proves the guard consults the opt-in. A command that cannot touch any
-    // credential store is used so the test never writes anywhere real.
-    const result = await withNoStore(() => execKeychain("/usr/bin/true", []));
-    expect(result.code).toBe(0);
+    expect(surface).not.toMatch(/export function resetKeychainExec/);
+    expect(surface).toMatch(/export function setKeychainExec\(fn: KeychainExec\): void/);
   });
 
   it("routes through an installed store instead of spawning anything", async () => {
@@ -133,116 +123,6 @@ describe("the default in-memory store serves a real custody round-trip", () => {
     );
     expect(readBack).not.toBeNull();
     expect(Array.from(readBack!)).toEqual(Array.from(created!));
-  });
-});
-
-/**
- * The in-memory store is installed for EVERY test file, which is wrong for
- * exactly one of them: the Linux real-backend integration test exists to
- * exercise the genuine `secret-tool` shell-out. Served by the store it keeps
- * passing while proving nothing, and its degrade case actively lies, because an
- * in-memory store answers the same whether or not D-Bus is reachable.
- *
- * These cases used to grep that file for strings like
- * `SANCTUARY_TEST_DISPOSABLE_KEYRING`. That check would have passed if the
- * condition were ORed instead of ANDed, checked after the store was already
- * removed, or read into a variable nobody used. The predicate is now a callable
- * in `test/support/real-backend-guard.ts` and what follows exercises it.
- */
-describe("the real-backend skip predicate (truth table, not substrings)", () => {
-  const qualifies: RealBackendProbe = {
-    isLinux: true,
-    hasSecretTool: true,
-    hasDbus: true,
-    onDisposableCiRunner: true,
-  };
-
-  beforeEach(() => {
-    // Order-independence: an earlier case in this file swaps the injected store
-    // out, and the refusal case below asserts the store is STILL serving after
-    // a refusal. Without this, that assertion would depend on which cases ran
-    // first, which is how a test starts passing for the wrong reason.
-    installInMemoryKeychainStore();
-  });
-
-  it("runs when every condition holds", () => {
-    expect(shouldSkipRealBackend(qualifies)).toBe(false);
-  });
-
-  for (const condition of [
-    "isLinux",
-    "hasSecretTool",
-    "hasDbus",
-    "onDisposableCiRunner",
-  ] as const) {
-    it(`skips when ${condition} is false, so the four conditions are ANDed`, () => {
-      expect(shouldSkipRealBackend({ ...qualifies, [condition]: false })).toBe(true);
-    });
-  }
-
-  it("REFUSES to remove the credential store when the run does not qualify", async () => {
-    expect(() =>
-      enterRealBackendMode({ ...qualifies, onDisposableCiRunner: false })
-    ).toThrow(/refusing to remove the in-memory credential store/);
-    // The refusal is only worth anything if the store is still serving after it.
-    expect(await credentialStoreIsInstalled()).toBe(true);
-  });
-
-  it("leaves the opt-in env var untouched when it refuses", () => {
-    expect(() => enterRealBackendMode({ ...qualifies, isLinux: false })).toThrow();
-    expect(process.env[ALLOW_REAL_KEYCHAIN_ENV]).toBeUndefined();
-  });
-});
-
-describe("the real-backend suite is CI-only, and says so", () => {
-  /**
-   * The gate no longer tries to PROVE a keyring disposable; three attempts at
-   * that each shipped a proof weaker than its claim (a bare env var, a nonce
-   * round trip that only proved the service answered, and a socket-path shape
-   * test that a developer's own `dbus-launch` satisfies). It now identifies the
-   * one execution context that is disposable by construction, and the tests
-   * below pin exactly that and nothing more.
-   */
-
-  it("runs on an ephemeral GitHub-hosted runner", () => {
-    expect(
-      probeDisposableCiRunner({ githubActions: "true", runnerEnvironment: "github-hosted" })
-        .disposable
-    ).toBe(true);
-  });
-
-  it("tolerates RUNNER_ENVIRONMENT being absent, because it is checked negatively", () => {
-    // Deliberate: requiring it positively would turn an unverified assumption
-    // about the runner image into a red CI.
-    expect(
-      probeDisposableCiRunner({ githubActions: "true", runnerEnvironment: undefined }).disposable
-    ).toBe(true);
-  });
-
-  it("refuses a developer machine, which is every machine that is not CI", () => {
-    const verdict = probeDisposableCiRunner({
-      githubActions: undefined,
-      runnerEnvironment: undefined,
-    });
-    expect(verdict.disposable).toBe(false);
-    expect(verdict.reason).toMatch(/CI-only/);
-  });
-
-  it("refuses a self-hosted runner, whose machine outlives the job", () => {
-    const verdict = probeDisposableCiRunner({
-      githubActions: "true",
-      runnerEnvironment: "self-hosted",
-    });
-    expect(verdict.disposable).toBe(false);
-    expect(verdict.reason).toMatch(/outlives the job/);
-  });
-
-  it("requires the exact string \"true\", not any truthy value", () => {
-    for (const value of ["1", "TRUE", "yes", ""]) {
-      expect(
-        probeDisposableCiRunner({ githubActions: value, runnerEnvironment: undefined }).disposable
-      ).toBe(false);
-    }
   });
 });
 
@@ -314,6 +194,44 @@ describe("the in-memory fake refuses what the real tool refuses", () => {
     expect(result.stdout).toBe("");
   });
 
+  it("REFUSES every NAMED-keychain verb for a file it did not create", async () => {
+    // The gate found this class three times: unlock, then dump, then the
+    // generic-password verbs. The refusal is now one check at the dispatch
+    // point, so this case sweeps the whole verb surface rather than the two
+    // that happened to be reported.
+    const path = join(dir, "foreign.keychain-db");
+    writeFileSync(path, "");
+    const named: Array<[string, string[], string | undefined]> = [
+      ["find-generic-password", ["find-generic-password", "-s", "svc", "-a", "acct", "-w", path], undefined],
+      ["delete-generic-password", ["delete-generic-password", "-s", "svc", "-a", "acct", path], undefined],
+      ["dump-keychain", ["dump-keychain", path], undefined],
+      ["add-generic-password", ["-i"], `add-generic-password -s "svc" -a "acct" -w "v" "${path}"\n`],
+      ["unlock-keychain", ["-i"], `unlock-keychain -p "${PASSPHRASE}" "${path}"\n`],
+    ];
+    for (const [label, args, input] of named) {
+      const result = await execKeychain("/usr/bin/security", args, input);
+      expect(result.code, `${label} must refuse a foreign keychain`).not.toBe(0);
+      expect(result.stderr, `${label} must say why`).toMatch(/did not create/);
+    }
+  });
+
+  it("still serves the DEFAULT keychain, which names no file and is the fake's own", async () => {
+    // The refusal must not swallow the unnamed-keychain path that
+    // wrap/keychain-custody.ts and wrap/passphrase.ts use; if it did, most of
+    // the suite would break loudly, but a narrower version of this mistake
+    // could break only one call site.
+    const write = await execKeychain(
+      "/usr/bin/security",
+      ["-i"],
+      'add-generic-password -U -a "sanctuary" -s "default-svc" -w "v"\n'
+    );
+    expect(write.code).toBe(0);
+    const read = await execKeychain("/usr/bin/security", [
+      "find-generic-password", "-a", "sanctuary", "-s", "default-svc", "-w",
+    ]);
+    expect(read.stdout.trim()).toBe("v");
+  });
+
   it("refuses to create a keychain outside the temp root", async () => {
     const result = await createKeychain("/etc/sanctuary-should-never-exist.keychain-db");
     expect(result.code).not.toBe(0);
@@ -376,49 +294,114 @@ describe("nothing else in the tree spawns a credential CLI", () => {
   });
 });
 
-describe("the one file that opts out routes through the guarded entry point", () => {
+describe("no code path in server/test can reach the real credential binary", () => {
   /**
-   * The single remaining source assertion in this file, and it is here because
-   * nothing executable can prove a NEGATIVE about another file: that it does not
-   * reach past the guard and call `setKeychainExec(null)` itself. Everything
-   * else about the opt-out is exercised as behavior above.
+   * The property, as a check rather than a claim. Three ways it could regress,
+   * all swept here.
+   *
+   * SCOPE, stated honestly: this covers direct spawns and attempts to un-install
+   * the store. A test that spawns the built CLI as a SUBPROCESS is covered by a
+   * different mechanism, and the last case verifies it rather than assuming it:
+   * the child inherits VITEST, so the chokepoint refuses inside the child too.
+   * A test that deliberately scrubs the child env is governed by the AGENTS.md
+   * rule requiring a per-run temporary keychain, which no scanner can enforce.
    */
-  const source = readFileSync(
-    fileURLToPath(
-      new URL("../keychain-linux-real-backend-integration.test.ts", import.meta.url)
-    ),
-    "utf8"
-  );
+  const testRoot = fileURLToPath(new URL("..", import.meta.url));
 
-  it("removes the store only via enterRealBackendMode, never directly", () => {
-    expect(source).toContain("enterRealBackendMode(");
-    expect(source).not.toContain("setKeychainExec(");
+  /**
+   * The bypass shape, as the conjunction of two signals. Both halves were
+   * arrived at by planting the bypass and watching a weaker rule miss it:
+   *
+   *  - Keying on the callee name (`spawn|spawnSync|execFile`) missed a planted
+   *    `import { spawnSync as plantedSpawn }` alias entirely. So the binary is
+   *    matched in FIRST-ARGUMENT position instead, which no alias changes.
+   *  - That alone flags `searchMessages("security")` in chat-v1.test.ts. So the
+   *    file must ALSO import child_process, which is what reaching a subprocess
+   *    actually requires.
+   *
+   * The conjunction clears both known false positives: chat-v1 imports no
+   * child_process, and mcp-child/fortress-refusal.test.ts spawns the built CLI
+   * but mentions "security" only after `!==`, inside an injected mock. A scanner
+   * everyone learns to edit around protects nothing.
+   */
+  const CREDENTIAL_BINARY_AS_FIRST_ARG =
+    /\(\s*["'`](?:\/usr\/bin\/)?(?:security|secret-tool)["'`]/;
+  const IMPORTS_CHILD_PROCESS =
+    /(?:from|import|require)\s*\(?\s*["']node:child_process["']/;
+
+  /**
+   * This file names the forbidden constructs in order to search for them, so it
+   * would match itself. Excluded by exact path, and it is the guard under review
+   * whenever it changes.
+   */
+  const SCANNER_ITSELF = "wrap/keychain-exec-guard.test.ts";
+
+  function walkTests(dir: string): string[] {
+    return readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) return walkTests(full);
+      return entry.isFile() && full.endsWith(".ts") ? [full] : [];
+    });
+  }
+
+  const files = walkTests(testRoot)
+    .map((file) => ({ relative: file.slice(testRoot.length), source: readFileSync(file, "utf8") }))
+    .filter((f) => f.relative !== SCANNER_ITSELF);
+
+  it("scans a non-trivial number of test files, so a broken walk cannot pass vacuously", () => {
+    // An empty file list would make both cases below pass while checking nothing.
+    expect(files.length).toBeGreaterThan(100);
   });
 
-  it("puts the store back afterwards so the removal cannot outlive that file", () => {
-    expect(source).toContain("leaveRealBackendMode(");
+  /**
+   * Only the setup file may touch the injection point at all. An allowlist on
+   * the IDENTIFIER, rather than a pattern on the argument, is deliberate: a
+   * planted `(setKeychainExec as unknown as (f: null) => void)(null)` slipped
+   * straight past an argument-shaped check, and any future cast would too.
+   * Matching the name catches every spelling.
+   *
+   * Tests that need bespoke credential behavior have a supported route that does
+   * not touch this: nearly all of them already pass an `exec` through
+   * KeychainCustodyOptions.
+   */
+  const MAY_INJECT = ["setup/keychain-fake.ts", SCANNER_ITSELF];
+
+  it("finds no attempt to un-install or re-point the credential store", () => {
+    const offenders = files
+      .filter((f) => !MAY_INJECT.includes(f.relative))
+      .filter(
+        (f) =>
+          /setKeychainExec/.test(f.source) ||
+          /resetKeychainExec/.test(f.source) ||
+          /SANCTUARY_TEST_ALLOW_REAL_KEYCHAIN/.test(f.source)
+      )
+      .map((f) => f.relative);
+    expect(offenders).toEqual([]);
   });
 
-  it("declares a case count the CI zero-test guard can hold it to", () => {
-    // `.github/workflows/keychain-linux-real-backend.yml` requires the run to
-    // report EXACTLY this many passing tests. Without the exact number, a
-    // summary of `Tests 1 passed | 4 skipped` satisfies a "some tests passed"
-    // grep while most real-backend assertions have vanished.
-    //
-    // Failure mode this catches: someone adds a case to the integration file
-    // and the workflow's expectation silently no longer covers it. Adding a
-    // case now fails HERE, in ordinary CI on every platform, until the declared
-    // count is bumped.
-    const declared = readFileSync(
-      fileURLToPath(
-        new URL(
-          "../keychain-linux-real-backend-integration.expected-cases",
-          import.meta.url
-        )
-      ),
-      "utf8"
-    ).trim();
-    const actual = source.match(/^\s*it\(/gm)?.length ?? 0;
-    expect(actual).toBe(Number(declared));
+  it("finds no test spawning a credential binary directly, bypassing the chokepoint", () => {
+    // The chokepoint is only a chokepoint if nothing goes around it. A test that
+    // spawns `secret-tool` itself reaches the operator's keyring no matter what
+    // the installed store is doing.
+    const offenders = files
+      .filter(
+        (f) => IMPORTS_CHILD_PROCESS.test(f.source) && CREDENTIAL_BINARY_AS_FIRST_ARG.test(f.source)
+      )
+      .map((f) => f.relative);
+    expect(offenders).toEqual([]);
+  });
+
+  it("passes VITEST down to child processes, so a spawned CLI is refused too", async () => {
+    // The assumption the subprocess case rests on, verified instead of asserted:
+    // if VITEST did NOT reach the child, a test that spawns the built CLI would
+    // run it with `underTest()` false and the chokepoint would spawn the real
+    // credential binary inside that child.
+    const { spawnSync: spawnChild } = await import("node:child_process");
+    const result = spawnChild(
+      process.execPath,
+      ["-e", "process.stdout.write(String(process.env.VITEST))"],
+      { encoding: "utf8" }
+    );
+    expect(result.stdout).not.toBe("undefined");
   });
 });

@@ -47,23 +47,41 @@ export type KeychainExec = (
   input?: string
 ) => Promise<ExecResult>;
 
-/**
- * Env var a test sets when it genuinely means to exercise the REAL credential
- * CLI. Such a test must target a temporary keychain it creates and deletes -
- * never the login keychain. Deliberately verbose: it should be obvious in a
- * diff that a test opted out of the safety net.
- */
-export const ALLOW_REAL_KEYCHAIN_ENV = "SANCTUARY_TEST_ALLOW_REAL_KEYCHAIN";
-
 let override: KeychainExec | null = null;
 
 /**
  * Install a credential-store implementation (the in-memory fake in tests).
- * Passing null restores the real spawn path. Exported for the vitest setup file
- * and for tests that want a bespoke stub; production never calls this.
+ * Exported for the vitest setup file and for tests that want a bespoke stub;
+ * production never calls this.
+ *
+ * THERE IS DELIBERATELY NO WAY TO UN-SET IT. The parameter cannot be null and no
+ * reset function exists, so once the setup file installs the fake, no code path
+ * inside the suite can restore the real spawn path. That is the difference
+ * between a guarded capability and an absent one: a test file that could remove
+ * the isolation was a loaded weapon on every machine that runs `npm test`, and
+ * three attempts to gate it correctly each shipped a check weaker than its
+ * claim. The real shell-out is verified by `scripts/real-backend-check.ts`,
+ * which runs as a plain node process where spawning is ordinary behavior.
  */
-export function setKeychainExec(fn: KeychainExec | null): void {
+export function setKeychainExec(fn: KeychainExec): void {
   override = fn;
+}
+
+/**
+ * What `execKeychain` should do, as a pure function of the two inputs that
+ * decide it. Extracted so the truth table is testable directly: the property
+ * that matters is that NO combination yields `spawn-real` while under test, and
+ * that is checked mechanically in `test/wrap/keychain-exec-guard.test.ts` rather
+ * than asserted in a comment.
+ */
+export type KeychainExecDecision = "installed-store" | "refuse-under-test" | "spawn-real";
+
+export function decideKeychainExecution(
+  hasInstalledStore: boolean,
+  isUnderTest: boolean
+): KeychainExecDecision {
+  if (hasInstalledStore) return "installed-store";
+  return isUnderTest ? "refuse-under-test" : "spawn-real";
 }
 
 /** True when running under vitest, or an explicit test NODE_ENV. */
@@ -111,20 +129,23 @@ export async function execKeychain(
   args: string[],
   input?: string
 ): Promise<ExecResult> {
-  if (override !== null) return override(cmd, args, input);
-
-  if (underTest() && process.env[ALLOW_REAL_KEYCHAIN_ENV] !== "1") {
-    throw new Error(
-      `Refusing to run '${cmd}' against the real OS credential store from a test. ` +
-        `Tests must never touch the operator's login keychain: entries accumulate in a ` +
-        `personal credential store, and under parallel workers the serialized keychain ` +
-        `daemon causes timeouts whose workers survive and poison later runs. ` +
-        `Fix: let the default in-memory store handle it (test/setup/keychain-fake.ts, ` +
-        `installed for every test), or inject your own via setKeychainExec(). ` +
-        `If this test genuinely must exercise the real CLI, it must create and delete a ` +
-        `TEMPORARY keychain and set ${ALLOW_REAL_KEYCHAIN_ENV}=1.`
-    );
+  switch (decideKeychainExecution(override !== null, underTest())) {
+    case "installed-store":
+      // Non-null by construction: that is the branch's condition.
+      return override!(cmd, args, input);
+    case "refuse-under-test":
+      throw new Error(
+        `Refusing to run '${cmd}' against the real OS credential store from a test. ` +
+          `Tests must never touch the operator's login keychain: entries accumulate in a ` +
+          `personal credential store, and under parallel workers the serialized keychain ` +
+          `daemon causes timeouts whose workers survive and poison later runs. ` +
+          `There is NO opt-in; the real credential CLI is unreachable from the suite by ` +
+          `design. Fix: let the default in-memory store handle it ` +
+          `(test/setup/keychain-fake.ts, installed for every test), or inject your own via ` +
+          `setKeychainExec(). To exercise the genuine CLI, add a case to ` +
+          `scripts/real-backend-check.ts, which runs outside vitest.`
+      );
+    case "spawn-real":
+      return spawnReal(cmd, args, input);
   }
-
-  return spawnReal(cmd, args, input);
 }
