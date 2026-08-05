@@ -71,10 +71,6 @@ import {
 } from "../reputation/reputation-store.js";
 import { verifyExitBundle, readManifest, loadExitArtifact } from "./verifier.js";
 import {
-  isValidSourceCustody,
-  SOURCE_CUSTODY_FORMAT,
-} from "./source-custody.js";
-import {
   partitionByMemoryClass,
   type PartitionConsentRelease,
   type PartitionCandidate,
@@ -652,6 +648,12 @@ const EXIT_EXPORT_REFUSED_MALFORMED_KDF_MARKER_OP =
   "exit_bundle_export_refused_malformed_kdf_marker";
 
 /**
+ * Maximum wraps accepted in a bundle's source_custody block. Export emits
+ * exactly one; the cap bounds work on crafted bundles (codex round-1 LOW).
+ */
+const SOURCE_CUSTODY_MAX_WRAPS = 4;
+
+/**
  * Mint the bundle re-key key and the source_custody block that carries the
  * source master wrapped under it. The key is returned for operator
  * disclosure and is NEVER written into the bundle - it is the only
@@ -672,9 +674,7 @@ function mintSourceCustody(masterKey: Uint8Array): {
   const rekeyKey = toBase64url(rekeyKeyBytes);
   rekeyKeyBytes.fill(0);
   return {
-    // The mint and the validator read the token from one declaration, so a
-    // freshly minted block can never fail its own shape-check.
-    custody: { format: SOURCE_CUSTODY_FORMAT, wraps: [wrap] },
+    custody: { format: "SANCTUARY_EXIT_SOURCE_CUSTODY_V1", wraps: [wrap] },
     rekeyKey,
   };
 }
@@ -1472,17 +1472,54 @@ function importIdForManifest(manifest: ExitBundleManifest): string {
  * than being silently ignored (which would demote the import to the legacy
  * derivation path - a downgrade, #5).
  *
- * CONTRACT PIN (server/src/exit/source-custody.ts `isValidSourceCustody`): the
- * rules live in that one predicate, which the verifier's
- * `summarizeEncryptedState` also classifies through, so `exit inspect` can
- * never name a credential path this gate would refuse. Verified mechanically
- * by the custody differential in
- * server/test/exit/exit-credential-path.test.ts, which drives the same crafted
- * blocks through BOTH `exit inspect` and a real `importExitBundle` and asserts
- * they agree case for case.
+ * INVARIANT: the last per-wrap condition stops at `typeof payload === "object"`
+ * and does NOT look inside the payload, and that shallowness is load-bearing
+ * rather than an oversight. `unwrapMatchingWrap`
+ * (server/src/core/master-custody.ts) walks the wraps in order, catches each
+ * wrap's failure individually, and returns on the first that authenticates, so
+ * a block carrying one intact wrap beside one damaged wrap IS importable today.
+ * A gate that demanded a decryptable-looking payload from EVERY wrap would
+ * refuse that bundle - on the exit path, where the source fortress may already
+ * be gone and a refusal is unrecoverable. Note in particular that
+ * `typeof null === "object"`, so a `payload: null` wrap passes here on purpose:
+ * the unwrap loop is what decides whether any wrap actually opens.
+ *
+ * The other three per-wrap conditions (object-shaped, string `id`, and the
+ * recovery-key-only `type` rule) are properties the whole block must have
+ * regardless of which wrap opens it - see the type rule's own note below for
+ * why THAT one cannot be relaxed to "some wrap is safe".
+ *
+ * FAILURE MODE if this drifts: deepening the payload condition reads as
+ * harmless hardening in review, passes every test written against a
+ * single-wrap bundle, and silently converts "imports fine" into
+ * SOURCE_CUSTODY_MALFORMED for a mixed block. The regression test that holds
+ * this is the mixed intact/damaged wrap case in
+ * server/test/exit/exit-credential-path.test.ts.
  */
 function validateSourceCustody(custody: ExitSourceCustody): void {
-  if (!isValidSourceCustody(custody)) {
+  const malformed =
+    custody === null ||
+    typeof custody !== "object" ||
+    custody.format !== "SANCTUARY_EXIT_SOURCE_CUSTODY_V1" ||
+    !Array.isArray(custody.wraps) ||
+    custody.wraps.length === 0 ||
+    // Bounded, and recovery-key wraps ONLY: a passphrase-type wrap here
+    // would both reintroduce the offline passphrase oracle and feed
+    // bundle-controlled Argon2id parameters into the unwrap path
+    // (codex round-1 findings 1 and 2). The HKDF unwrap for recovery-key
+    // wraps carries no attacker-tunable cost parameters. This one IS a
+    // per-wrap rule because a single smuggled passphrase wrap is enough to
+    // reopen the oracle, so "some wrap is safe" would not be a safety claim.
+    custody.wraps.length > SOURCE_CUSTODY_MAX_WRAPS ||
+    custody.wraps.some(
+      (wrap) =>
+        wrap === null ||
+        typeof wrap !== "object" ||
+        typeof wrap.id !== "string" ||
+        wrap.type !== "recovery-key" ||
+        typeof wrap.payload !== "object"
+    );
+  if (malformed) {
     throw new ExitBundleImportError(
       "SOURCE_CUSTODY_MALFORMED",
       "This bundle's source_custody block is malformed or carries a wrap type " +
@@ -1539,14 +1576,11 @@ async function resolveSourceMasterKey(
   opts: ImportExitBundleOptions
 ): Promise<Uint8Array | null> {
   if (!encryptedState || encryptedState.entries.length === 0) return null;
-  // CONTRACT PIN (server/src/exit/verifier.ts `ExitBundleCredentialPath`): this
-  // return is the ONE branch `exit inspect` does not mirror, and the pin over
-  // there says so. It precedes `validateSourceCustody` deliberately - a caller
-  // who already holds the source master needs no re-key material at all, so a
+  // This return precedes `validateSourceCustody` deliberately: a caller who
+  // already holds the source master needs no re-key material at all, so a
   // damaged `source_custody` block is irrelevant to them. There is no CLI flag
-  // for it (`cli.ts` import branch), so it is unreachable by the operator whom
-  // inspect advises. Adding one WOULD make inspect's `unusable` verdict wrong,
-  // and this comment is the tripwire for that.
+  // for it (see the import branch of `cli.ts`), so only a programmatic caller
+  // reaches it.
   if (opts.sourceMasterKey) return opts.sourceMasterKey;
 
   const sourceCustody = encryptedState.source_custody;

@@ -49,57 +49,6 @@ import {
   readFileCustody,
   readFileCustodyWithStats,
 } from "../storage/custody-fs.js";
-import {
-  readSourceCustodyState,
-  type SourceCustodyState,
-} from "./source-custody.js";
-
-/**
- * Which credential re-keys this bundle's encrypted state, derived from the
- * artifact alone (no fortress access, no operator secret).
- *
- * CONTRACT PIN (server/src/exit/bundle.ts `resolveSourceMasterKey`): this
- * classification mirrors the precedence that function applies to the
- * credentials an OPERATOR can supply, which is what `exit inspect` advises
- * about (zero entries => nothing to re-key, and import returns before any
- * custody check; MALFORMED source_custody => import throws
- * SOURCE_CUSTODY_MALFORMED before every other operator branch, so nothing an
- * operator holds can open the bundle; VALID source_custody => bundle re-key
- * key; valid source_key_derivation => legacy passphrase; malformed
- * source_key_derivation => import throws SOURCE_KDF_PARAMS_MALFORMED; neither
- * => legacy recovery-key-as-master behind the explicit
- * `legacyRecoveryKeyIsMaster` opt-in).
- *
- * THE ONE BRANCH IT DOES NOT MIRROR, named because a pin that overstates its
- * own reach is worse than no pin: `resolveSourceMasterKey` returns
- * `opts.sourceMasterKey` at the very top, BEFORE `validateSourceCustody` runs.
- * A programmatic caller holding the raw source master therefore imports a
- * bundle this classifier calls `unusable`. That is not a contradiction to fix
- * in either direction - there is no CLI flag for a raw master key (see
- * `runExitCommand`'s import branch), so no operator reading this report has
- * that option, and inspect describing it would be advice nobody can take. The
- * scope of this pin is the CLI credential paths, not every programmatic entry
- * point. Mechanically held by the `sourceMasterKey` case in
- * server/test/exit/exit-credential-path.test.ts, which asserts exactly this
- * divergence rather than leaving it to prose.
- *
- * The two shape-checks are not restated here: both sides call
- * `parseKeyDerivationParams` and `isValidSourceCustody`/
- * `readSourceCustodyState`. The custody half of the mirror is verified
- * mechanically by the custody differential in
- * server/test/exit/exit-credential-path.test.ts, which drives every crafted
- * block in its table (block shape, wrap shape, and each field of the wrap
- * payload the unwrap path reads) plus untouched controls through BOTH
- * `exit inspect` and a real `importExitBundle` and asserts the two agree case
- * for case; the KDF half is covered by the paired A3 import/inspect cases in
- * the same file, which apply the identical mutation to both sides.
- */
-export type ExitBundleCredentialPath =
-  | "bundle-rekey-key"
-  | "source-passphrase-legacy"
-  | "legacy-recovery-key-as-master"
-  | "none-required"
-  | "unusable";
 
 /**
  * What the encrypted_state artifact says about itself, read from the parsed
@@ -109,7 +58,17 @@ export type ExitBundleCredentialPath =
  * and a verifier that narrows untrusted JSON itself is the right posture anyway.
  */
 export interface ExitEncryptedStateSummary {
-  entry_count: number;
+  /**
+   * How many state entries the artifact carries, or `null` when its `entries`
+   * field is absent or is not an array.
+   *
+   * INVARIANT: `null` is NOT `0`, and collapsing the two is the defect this
+   * field's type exists to prevent. A malformed artifact reported as zero
+   * entries reads to an operator as a benign empty bundle, and the import that
+   * follows dereferences `entries.length` on the same artifact and does not
+   * agree. Absent is not empty; every consumer must branch on it.
+   */
+  entry_count: number | null;
   namespace_count: number;
   namespaces: string[];
   ownership_partitioned: boolean;
@@ -119,17 +78,14 @@ export interface ExitEncryptedStateSummary {
    * verbatim, so an unknown future token surfaces rather than being erased.
    */
   empty_reason?: string;
-  /** True IFF the artifact has zero entries AND declares no `empty_reason`. */
-  empty_reason_missing: boolean;
-  credential_path: ExitBundleCredentialPath;
-  legacy_kdf_params: "absent" | "valid" | "malformed";
   /**
-   * The same three-state read of `source_custody` the import path performs.
-   * Reported alongside `credential_path` because both a malformed custody block
-   * and a malformed legacy marker collapse to `unusable`, and the operator
-   * needs to know WHICH block is damaged to know what to re-export.
+   * True IFF the artifact carries a READABLE, EMPTY entry list and declares no
+   * `empty_reason`. False when `entry_count` is `null`: an artifact whose
+   * entries cannot be read is a different, louder problem, and reporting a
+   * missing empty-marker for it would name the wrong defect.
    */
-  source_custody: SourceCustodyState;
+  empty_reason_missing: boolean;
+  legacy_kdf_params: "absent" | "valid" | "malformed";
 }
 
 export interface ExitBundleDetailedVerifierResult
@@ -299,11 +255,9 @@ function findPrivateMaterial(value: unknown, path = "$"): string[] {
 }
 
 /**
- * Summarize a parsed `artifacts/encrypted_state.json` and classify which
- * credential re-keys it. Pure, total, and defensive: every field is narrowed
- * from `unknown`, so a hand-crafted or truncated artifact yields a conservative
- * summary rather than throwing. Shared by `exit verify` and `exit inspect` so
- * the two can never disagree about a bundle.
+ * Summarize a parsed `artifacts/encrypted_state.json`. Pure, total, and
+ * defensive: every field is narrowed from `unknown`, so a hand-crafted or
+ * truncated artifact yields a conservative summary rather than throwing.
  *
  * @param artifact - the parsed encrypted_state JSON (already hash-verified
  *   against the signed manifest by the caller).
@@ -315,7 +269,15 @@ export function summarizeEncryptedState(
     artifact !== null && typeof artifact === "object" && !Array.isArray(artifact)
       ? (artifact as Record<string, unknown>)
       : {};
-  const entries = Array.isArray(record.entries) ? record.entries : [];
+  // INVARIANT: an unreadable `entries` field becomes `null`, never `[]`. The
+  // substitution that reads naturally here - default to an empty array and
+  // report its length - is precisely the absent-as-benign conflation: it turns
+  // a corrupt artifact into a confident "0 entries" for the operator while the
+  // import path, which reads `entries.length` off the same JSON, does something
+  // else entirely.
+  const entries: unknown[] | null = Array.isArray(record.entries)
+    ? record.entries
+    : null;
   const namespaces = Array.isArray(record.namespaces)
     ? record.namespaces.filter((n): n is string => typeof n === "string")
     : [];
@@ -332,46 +294,14 @@ export function summarizeEncryptedState(
         ? "valid"
         : "malformed";
 
-  // CONTRACT PIN (server/src/exit/source-custody.ts `readSourceCustodyState`):
-  // the same predicate import's `validateSourceCustody` refuses on, so
-  // "malformed" here means exactly what makes an import throw
-  // SOURCE_CUSTODY_MALFORMED. An object-shape check was NOT enough: it named
-  // the bundle re-key path for a block no import would accept.
-  const sourceCustody = readSourceCustodyState(record.source_custody);
-
-  let credentialPath: ExitBundleCredentialPath;
-  if (entries.length === 0) {
-    // Import returns before it looks at custody at all when there is nothing
-    // to re-key, so a damaged block on a zero-entry bundle is inert.
-    credentialPath = "none-required";
-  } else if (sourceCustody === "malformed") {
-    // Import validates custody FIRST and throws, so a damaged block kills every
-    // other path with it - including a legacy marker that would otherwise be
-    // usable. Nothing opens this bundle's state.
-    credentialPath = "unusable";
-  } else if (sourceCustody === "valid") {
-    credentialPath = "bundle-rekey-key";
-  } else if (legacyKdfParams === "valid") {
-    credentialPath = "source-passphrase-legacy";
-  } else if (legacyKdfParams === "malformed") {
-    // The bundle DECLARES a legacy passphrase path and that path is dead: the
-    // import derive-gate refuses it with SOURCE_KDF_PARAMS_MALFORMED. This is
-    // the A3-damaged shape already in the wild.
-    credentialPath = "unusable";
-  } else {
-    credentialPath = "legacy-recovery-key-as-master";
-  }
-
   return {
-    entry_count: entries.length,
+    entry_count: entries === null ? null : entries.length,
     namespace_count: namespaces.length,
     namespaces,
     ownership_partitioned: record.ownership_partitioned === true,
     ...(emptyReason !== undefined ? { empty_reason: emptyReason } : {}),
-    empty_reason_missing: entries.length === 0 && emptyReason === undefined,
-    credential_path: credentialPath,
+    empty_reason_missing: entries?.length === 0 && emptyReason === undefined,
     legacy_kdf_params: legacyKdfParams,
-    source_custody: sourceCustody,
   };
 }
 
@@ -702,6 +632,14 @@ export async function verifyExitBundle(
   const stateSummary = sawEncryptedState
     ? summarizeEncryptedState(encryptedStateJson)
     : undefined;
+  if (stateSummary !== undefined && stateSummary.entry_count === null) {
+    warnings.push(
+      "encrypted state carries no readable entries list (the `entries` field " +
+        "is absent or is not an array): this artifact is signed and " +
+        "hash-verified but structurally damaged, and it is NOT an empty " +
+        "bundle - re-export from the source fortress"
+    );
+  }
   if (stateSummary?.empty_reason_missing === true) {
     warnings.push(
       "encrypted state carries zero entries and no empty_reason marker: " +

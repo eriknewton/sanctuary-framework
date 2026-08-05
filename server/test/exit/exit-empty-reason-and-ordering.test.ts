@@ -283,7 +283,6 @@ describe("exit cluster A8: an empty bundle must say why it is empty", () => {
     expect(result.state?.entry_count).toBe(0);
     expect(result.state?.empty_reason).toBe("fortress_state_empty");
     expect(result.state?.empty_reason_missing).toBe(false);
-    expect(result.state?.credential_path).toBe("none-required");
 
     const { chunks, out, err } = captureCli();
     await runExitCommand({ argv: ["verify", bundleDir], out, err });

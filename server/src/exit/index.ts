@@ -23,18 +23,11 @@ export {
   readManifest,
   loadExitArtifact,
   summarizeEncryptedState,
-  type ExitBundleCredentialPath,
   type ExitBundleDetailedVerifierResult,
   type ExitEncryptedStateSummary,
   type LoadedExitArtifact,
   type VerifyExitBundleOptions,
 } from "./verifier.js";
-
-export {
-  inspectExitBundle,
-  inspectExitCode,
-  type ExitBundleInspectionReport,
-} from "./inspect.js";
 
 export {
   runExitCommand,

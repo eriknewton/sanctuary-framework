@@ -23,7 +23,6 @@ import type {
   ExitBundleVerifierResult,
 } from "../contracts/v1.1/exit-bundle-manifest.js";
 import { verifyExitBundle, InvalidExitBundleError } from "./verifier.js";
-import { inspectExitBundle, inspectExitCode } from "./inspect.js";
 import { loadFortressDidWebRecord } from "../recognition/did-web.js";
 
 const EXIT_EXPORT_ABORTED_EXIT_CODE = 78;
@@ -204,9 +203,6 @@ Commands:
   verify <dir>                Verify manifest, artifacts, signatures, and exported-set completeness
   import <dir> [--activate]   Verify, report conflicts, and optionally activate
   manifest-shape              Print the v1.1 manifest shape
-  inspect <dir>               Read-only: what the bundle carries and WHICH
-                              credential re-keys its state. No passphrase, no
-                              writes.
 
 Options:
   --passphrase <value>              Current destination/source passphrase
@@ -387,7 +383,14 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
         // lines are appended, never interleaved, so an operator script that
         // greps for `identity:` or `artifacts:` is unaffected.
         if (result.state) {
-          write(out, `state_entries: ${result.state.entry_count}\n`);
+          // `entry_count === null` means the artifact's entries list could not
+          // be read at all. Printing `0` there would be the absent-as-empty
+          // conflation on the operator's screen, so it gets its own token and
+          // a warning (pushed by the verifier) rather than a plausible number.
+          write(
+            out,
+            `state_entries: ${result.state.entry_count ?? "unreadable"}\n`
+          );
           if (result.state.empty_reason !== undefined) {
             write(out, `empty_reason: ${result.state.empty_reason}\n`);
           }
@@ -398,53 +401,6 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
         }
       }
       return result.passed ? 0 : 1;
-    }
-
-    if (command === "inspect") {
-      const dir = argv[1];
-      if (!dir) {
-        write(err, "Usage: sanctuary exit inspect <dir>\n");
-        return 2;
-      }
-      let report;
-      try {
-        report = await inspectExitBundle(dir);
-      } catch (e) {
-        if (e instanceof InvalidExitBundleError) {
-          write(err, `Error: ${e.message}\n`);
-          return 1;
-        }
-        throw e;
-      }
-      if (json) {
-        write(out, JSON.stringify(report, null, 2) + "\n");
-      } else {
-        write(out, `verdict: ${report.verdict}\n`);
-        write(out, `identity: ${report.identity_id}\n`);
-        write(out, `fortress: ${report.fortress_id}\n`);
-        write(out, `exported_at: ${report.exported_at}\n`);
-        write(out, `artifacts: ${report.artifact_count}\n`);
-        write(out, `state_entries: ${report.state?.entry_count ?? "unknown"}\n`);
-        write(
-          out,
-          `namespaces: ${report.state?.namespaces.join(", ") ?? "unknown"}\n`,
-        );
-        if (report.state?.empty_reason !== undefined) {
-          write(out, `empty_reason: ${report.state.empty_reason}\n`);
-        }
-        write(out, `legacy_kdf_params: ${report.legacy_kdf_params}\n`);
-        write(out, `source_custody: ${report.source_custody}\n`);
-        write(out, `credential: ${report.credential_path}\n`);
-        write(out, `to import state: ${report.credential_instruction}\n`);
-        // Printed unconditionally, including on the happy path: the whole
-        // defect this command exists to close was an answer that sounded more
-        // certain than it was. A limit shown only on failures is not a limit.
-        write(out, `credential check: ${report.credential_bound}\n`);
-        for (const warning of report.warnings) {
-          write(out, `warning: ${warning}\n`);
-        }
-      }
-      return inspectExitCode(report);
     }
 
     if (command === "export") {
