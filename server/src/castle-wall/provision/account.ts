@@ -55,11 +55,12 @@ export const SAFE_SERVICE_ACCOUNT_RE = /^[a-z_][a-z0-9._-]{0,63}$/;
  * re-declare the same set locally for exactly the reason the charset regex
  * above is re-declared (those two render world-readable LaunchDaemon plists
  * and deliberately keep their input validation free of a castle-wall import).
- * Enforced by `test/structure/cross-file-contract-pins.test.ts`, which
- * compares the declared MEMBERS on every side rather than merely checking
- * that each side has a reserved-name check at all.
+ * Enforced by `test/structure/cross-file-contract-pins.test.ts`, which both
+ * compares the declared MEMBERS on every side AND drives each of the three
+ * refusal sites with every member of this set, so a site that declares the
+ * full set and enforces a subset fails.
  *
- * DECISION 2026-08-06 (Erik-ratified: WIDEN). An earlier version of this
+ * DECISION 2026-08-05 (Erik-ratified: WIDEN). An earlier version of this
  * comment recorded the daemon-side asymmetry as deliberate and warned against
  * reconciling it: the two daemons refused `root`/`_root`/`daemon`/`wheel`
  * only, so `admin` was an illegal agent account name and a LEGAL gate or
@@ -69,13 +70,37 @@ export const SAFE_SERVICE_ACCOUNT_RE = /^[a-z_][a-z0-9._-]{0,63}$/;
  * harness running as it could rewrite the very policy its confinement exists
  * to enforce. All three sites now refuse the same five names.
  *
- * The widening cannot orphan a live host: every account name the product
- * derives is prefixed (`deriveAgentAccountName` -> `sanctuary-<agentId>`,
- * `deriveGateAccountName` -> `sanctuary-gate-<agentId>`), so no derived name
- * can equal a reserved one, and a repo-wide scan before the change found no
- * provisioning default, fixture, doc, or test naming any account `admin`.
+ * WHAT THE WIDENING WAS CHECKED AGAINST, stated exactly as narrowly as it was
+ * checked. In THIS REPO nothing is affected: every account name the product
+ * uses is prefix-derived (`deriveAgentAccountName` -> `sanctuary-<agentId>`,
+ * `deriveGateAccountName` -> `sanctuary-gate-<agentId>`), no CLI flag lets an
+ * operator supply an account name, and a repo-wide scan found no default,
+ * fixture, doc, test, or derived name equal to a reserved one. That is a
+ * statement about the repo, NOT about hosts in the field. The only host
+ * evidence is a coordinator check of two machines on 2026-08-05 (Mini1 and
+ * Mini2): no Sanctuary daemon runs as `admin` on either -- the harness and
+ * the LT executor run as `sanctuary-hermes`, and the castle-wall daemons and
+ * signer helpers run as root. Nothing is known about any other host.
+ *
+ * KNOWN BEHAVIOR CHANGE, and it is a refusal, not a migration: a plist naming
+ * `admin` -- hand-written, or re-rendered from a stale persisted
+ * `gateAccountName` -- now throws at render time where it previously
+ * rendered. Failure mode from the outside: an install or re-arm that used to
+ * complete stops with a "refusing to render ... privileged account" error,
+ * which is the intended outcome and is loud, never a silent downgrade.
+ *
+ * EXPORTED so the structural guard can iterate the real runtime set and drive
+ * every member through each refusal site. Production code inside this module
+ * uses it directly; the two daemons keep their own copies on purpose (above).
+ * Typed `ReadonlySet` so no consumer can add or remove a member at runtime.
  */
-const RESERVED_ACCOUNT_NAMES = new Set(["root", "_root", "daemon", "wheel", "admin"]);
+export const RESERVED_ACCOUNT_NAMES: ReadonlySet<string> = new Set([
+  "root",
+  "_root",
+  "daemon",
+  "wheel",
+  "admin",
+]);
 
 /** Derive the canonical dedicated account name for an agent id, e.g. "hermes" -> "sanctuary-hermes". */
 export function deriveAgentAccountName(agentId: string): string {

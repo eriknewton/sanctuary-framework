@@ -32,6 +32,15 @@
  *      (`canonicalJson`), the two bodies are compared after whitespace
  *      normalization.
  *   4. PIN PRESENCE. Every duplicating site must NAME its counterpart.
+ *   5. ENFORCED BEHAVIOR. For the reserved-account-name set, declaration
+ *      equality is not enough: this file IMPORTS the three refusal sites and
+ *      calls each one once per member of the canonical set. A source-text
+ *      check cannot tell `RESERVED_ACCOUNT_NAMES.has(x)` from
+ *      `RESERVED_ACCOUNT_NAMES.has(x) && x !== "admin"`, and a guard that
+ *      certifies a contract it does not actually check is worse than no
+ *      guard, because CI then reports the contract as held. Only the fifth
+ *      kind is safe from that, so any future "the set each site enforces"
+ *      claim belongs here and not in a scan.
  *
  * WHAT THIS SUITE DOES NOT COVER, stated so no comment elsewhere claims it
  * does:
@@ -68,6 +77,15 @@ import { describe, it, expect } from "vitest";
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+
+// The fifth kind of assertion (see the header) is behavioral, so the three
+// reserved-name refusal sites are imported and CALLED, not scanned.
+import {
+  RESERVED_ACCOUNT_NAMES,
+  planAccountCreate,
+} from "../../src/castle-wall/provision/account.js";
+import { renderEgressGateDaemonPlist } from "../../src/egress-gate/gate-daemon.js";
+import { renderAgentHarnessDaemonPlist } from "../../src/egress-gate/harness-daemon.js";
 
 const HERE = fileURLToPath(import.meta.url);
 // test/structure/<this file> -> test/ -> server/ -> repo root. Rust, Swift,
@@ -183,7 +201,7 @@ function tsConst(source: string, name: string): string | null {
  */
 function tsStringSetMembers(source: string, name: string): string | null {
   const m = new RegExp(
-    `const\\s+${name}(?:\\s*:\\s*[^=]+?)?\\s*=\\s*(?:new\\s+Set\\s*\\(\\s*)?\\[([^\\]]*)\\]`
+    `(?:export\\s+)?const\\s+${name}(?:\\s*:\\s*[^=]+?)?\\s*=\\s*(?:new\\s+Set\\s*\\(\\s*)?\\[([^\\]]*)\\]`
   ).exec(source);
   if (!m) return null;
   const members = [...m[1]!.matchAll(/["']([^"']+)["']/g)].map((x) => x[1]!);
@@ -256,6 +274,13 @@ describe("the scanner itself", () => {
     const wrapped = "const R = new Set([\n  'admin',\n  'root',\n  'wheel',\n]);";
     expect(tsStringSetMembers(oneLine, "R")).toBe("admin,root,wheel");
     expect(tsStringSetMembers(wrapped, "R")).toBe("admin,root,wheel");
+    // The canonical declaration's actual shape: exported and type-annotated.
+    expect(
+      tsStringSetMembers(
+        'export const R: ReadonlySet<string> = new Set(["wheel", "admin", "root"]);',
+        "R"
+      )
+    ).toBe("admin,root,wheel");
     // A dropped member must change the value, or the pin below cannot fail.
     expect(tsStringSetMembers('const R = new Set(["root", "wheel"]);', "R")).toBe(
       "root,wheel"
@@ -497,11 +522,13 @@ describe("mirrored declarations hold equal values and name their counterpart", (
         { canonicalName: "SAFE_SERVICE_ACCOUNT_RE", mirrorName: "SAFE_ACCOUNT_RE" },
         {
           // The charset regex was pinned here from the start; the reserved-NAME
-          // SET was not, and it drifted (2026-08-06 register G1): the two
+          // SET was not, and it drifted (2026-08-05 register G1): the two
           // daemons refused only root/_root/daemon/wheel, so `admin` was a
           // legal account for two daemons whose stated purpose is refusing
           // privileged accounts. Erik ratified widening the daemons to the
-          // canonical five. This pair is what stops the set forking again.
+          // canonical five. This pair stops the DECLARATIONS forking again;
+          // the behavior suite at the bottom of this file is what proves each
+          // site enforces what it declares.
           canonicalName: "RESERVED_ACCOUNT_NAMES",
           mirrorName: "RESERVED_ACCOUNT_NAMES",
           resolveCanonical: (source) =>
@@ -593,15 +620,135 @@ describe("mirrored declarations hold equal values and name their counterpart", (
   }
 });
 
-describe("the reserved-name set is the set each site actually enforces", () => {
+describe("every reserved name is refused by the real function at all three sites", () => {
   /**
-   * The value-equality pair above proves the three DECLARATIONS agree. It does
-   * not, on its own, prove any of them is consulted: a site could declare the
-   * canonical five and still test a hand-typed subset, which is strictly worse
-   * than an unpinned copy because CI would then report the contract as held.
-   * These two assertions close that hole, which is exactly the shape the
-   * drift took (`["root", "_root", "daemon", "wheel"].includes(...)` sitting
-   * beside a correctly-pinned charset regex).
+   * BEHAVIORAL, and deliberately so. The value-equality pair above proves the
+   * three DECLARATIONS agree; it cannot prove any of them is obeyed. An
+   * earlier version of this block tried to close that with source text (a
+   * scan for `RESERVED_ACCOUNT_NAMES.has(` plus a sentinel count) and left a
+   * hole a partial guard walks straight through:
+   * `RESERVED_ACCOUNT_NAMES.has(name) && name !== "admin"` satisfies both
+   * scans while letting the widened member through. Telling those two lines
+   * apart is parsing, and the standing repo lesson is that a cleverer regex is
+   * not one of the honest endings.
+   *
+   * So this drives the real functions. The cases are generated by iterating
+   * the canonical set at RUNTIME, never from a re-listed array, so a member
+   * added to the set is demanded of all three sites in the same run that adds
+   * it, with no test edit.
+   *
+   * EACH ASSERTION MATCHES THE RESERVED-NAME REFUSAL MESSAGE SPECIFICALLY, not
+   * merely "it threw". Every site validates the charset first, so a name that
+   * threw for some other reason (or a future member that is not charset-legal)
+   * fails here instead of being scored as a refusal.
+   */
+  const RESERVED = [...RESERVED_ACCOUNT_NAMES];
+
+  // Any legal values: every site checks the NAME before it looks at uids or
+  // paths, so these only have to pass their own validators.
+  // `highestAssignedUid` is CEILING - 1 so a name that slipped through would
+  // produce a `create` plan rather than an unrelated error.
+  const CEILING = 700;
+  const AGENT_UID = 502;
+  const FORTRESS = "/Users/operator/.sanctuary";
+
+  it("the canonical set is non-empty, so the generated cases below cannot be vacuous", () => {
+    // A set emptied by a bad edit would register ZERO `it.each` cases, and a
+    // suite that asserts nothing reports green.
+    expect(RESERVED.length).toBeGreaterThan(0);
+  });
+
+  it("a normal derived account name is ACCEPTED at all three sites", () => {
+    // Control. Without it, a site that threw unconditionally would satisfy
+    // every refusal case below and this guard would prove nothing.
+    expect(
+      planAccountCreate(
+        {
+          accountName: "sanctuary-hermes",
+          ceiling: CEILING,
+          homeDirectory: "/var/sanctuary-agents/sanctuary-hermes",
+        },
+        { existingUid: undefined, highestAssignedUid: CEILING - 1 }
+      ).action
+    ).toBe("create");
+    expect(
+      renderEgressGateDaemonPlist({
+        agentUid: AGENT_UID,
+        gateAccount: "sanctuary-gate-hermes",
+        gateHomeDirectory: "/var/sanctuary-agents/sanctuary-gate-hermes",
+        programArguments: ["/usr/local/bin/sanctuary", "castle-wall", "egress-gate-daemon"],
+        fortressPath: FORTRESS,
+      })
+    ).toContain("<string>sanctuary-gate-hermes</string>");
+    expect(
+      renderAgentHarnessDaemonPlist({
+        agentAccount: "sanctuary-hermes",
+        programArguments: ["/usr/local/bin/node", "/opt/sanctuary/harness.js"],
+        fortressPath: FORTRESS,
+      })
+    ).toContain("<string>sanctuary-hermes</string>");
+  });
+
+  it.each(RESERVED)(
+    "castle-wall/provision/account.ts planAccountCreate refuses %s",
+    (name) => {
+      expect(() =>
+        planAccountCreate(
+          {
+            accountName: name,
+            ceiling: CEILING,
+            homeDirectory: `/var/sanctuary-agents/${name}`,
+          },
+          { existingUid: undefined, highestAssignedUid: CEILING - 1 }
+        )
+      ).toThrow(/privileged\/reserved name/);
+    }
+  );
+
+  it.each(RESERVED)(
+    "egress-gate/gate-daemon.ts renderEgressGateDaemonPlist refuses %s",
+    (name) => {
+      expect(() =>
+        renderEgressGateDaemonPlist({
+          agentUid: AGENT_UID,
+          gateAccount: name,
+          // Home kept consistent with the account under test so the later
+          // cross-account log check cannot be what refuses.
+          gateHomeDirectory: `/var/sanctuary-agents/${name}`,
+          programArguments: ["/usr/local/bin/sanctuary", "castle-wall", "egress-gate-daemon"],
+          fortressPath: FORTRESS,
+        })
+      ).toThrow(/must never hold root or any other privileged account/);
+    }
+  );
+
+  it.each(RESERVED)(
+    "egress-gate/harness-daemon.ts renderAgentHarnessDaemonPlist refuses %s",
+    (name) => {
+      expect(() =>
+        renderAgentHarnessDaemonPlist({
+          agentAccount: name,
+          programArguments: ["/usr/local/bin/node", "/opt/sanctuary/harness.js"],
+          fortressPath: FORTRESS,
+        })
+      ).toThrow(/Refusing to render an agent-harness daemon running as/);
+    }
+  );
+});
+
+describe("no site keeps a second, hand-typed copy of the privileged-name list", () => {
+  /**
+   * NARROW CLAIM, stated as exactly what it checks: this counts QUOTED
+   * occurrences of one sentinel string per file. It does not prove
+   * enforcement (the behavior suite above does that), and it would not see a
+   * second list built by concatenation or spelled with different members. Its
+   * only job is to catch the literal shape the 2026-08-05 drift took: an
+   * inline `["root", "_root", "daemon", "wheel"]` sitting beside a
+   * correctly-pinned declaration.
+   *
+   * `wheel` is the sentinel because it is meaningful in these files only as a
+   * reserved account name. `root` cannot serve: account.ts legitimately
+   * compares against it in the uid-0 census.
    */
   const SITES = [
     "server/src/castle-wall/provision/account.ts",
@@ -609,20 +756,7 @@ describe("the reserved-name set is the set each site actually enforces", () => {
     "server/src/egress-gate/harness-daemon.ts",
   ];
 
-  it("every site consults the named set rather than an inline list", () => {
-    for (const file of SITES) {
-      expect(
-        read(file).includes("RESERVED_ACCOUNT_NAMES.has("),
-        `${file} declares RESERVED_ACCOUNT_NAMES but must also USE it to refuse`
-      ).toBe(true);
-    }
-  });
-
-  it("no site re-types a privileged name outside the declaration", () => {
-    // `wheel` is the sentinel: it is meaningful in these files only as a
-    // reserved account name, so a second quoted occurrence is a hand-typed
-    // second list. `root` cannot serve as the sentinel because account.ts
-    // legitimately compares against it in the uid-0 census.
+  it("each site quotes the sentinel privileged name exactly once", () => {
     for (const file of SITES) {
       expect(
         countQuotedOccurrences(read(file), "wheel"),

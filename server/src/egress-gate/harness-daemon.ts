@@ -173,10 +173,11 @@ const SAFE_ACCOUNT_RE = /^[a-z_][a-z0-9._-]{0,63}$/;
  * `RESERVED_ACCOUNT_NAMES` in `egress-gate/gate-daemon.ts`. Re-declared
  * rather than imported for the same reason as the charset regex above.
  * Enforced by `server/test/structure/cross-file-contract-pins.test.ts`, which
- * compares the declared MEMBERS on every side, not just the presence of a
- * check here.
+ * compares the declared MEMBERS on every side AND calls
+ * `renderAgentHarnessDaemonPlist` once per member to prove this file refuses
+ * each of them, so a partial check here fails even with a correct set above.
  *
- * WIDENED 2026-08-06 (Erik-ratified) to add `admin`, which this file
+ * WIDENED 2026-08-05 (Erik-ratified) to add `admin`, which this file
  * previously accepted while provisioning refused it. Same failure mode as the
  * charset drift above: a name blessed at one step of an install and refused at
  * the next reads as a broken install rather than as a stale copy of a list.

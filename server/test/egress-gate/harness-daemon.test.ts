@@ -121,7 +121,7 @@ describe("egress-gate/harness-daemon", () => {
       expect(plist).toContain("<true/>");
     });
 
-    // `admin` added 2026-08-06 (register G1, Erik-ratified WIDEN): this
+    // `admin` added 2026-08-05 (register G1, Erik-ratified WIDEN): this
     // renderer used to accept it while account provisioning refused it, so a
     // daemon whose stated purpose is refusing privileged accounts would run as
     // one that, on macOS, conventionally holds sudo.
