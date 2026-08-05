@@ -99,6 +99,17 @@ const realBackendProbe = {
 
 const skipUnlessRealBackend = shouldSkipRealBackend(realBackendProbe);
 
+// A silent skip cost a full CI cycle to diagnose: the workflow's count guard
+// fired, correctly, but the log said only "5 skipped" and the guard's own reason
+// had been computed and thrown away. On a host that looks like it SHOULD have
+// run this suite, say why it did not.
+if (skipUnlessRealBackend && isLinux && hasSecretTool && hasDbus) {
+  console.warn(
+    `[real-backend] skipping: ${disposableVerdict.reason}. ` +
+      `Provision with scripts/ci/provision-disposable-keyring.sh.`
+  );
+}
+
 // ── Cleanup helper ──────────────────────────────────────────────────
 //
 // Each test creates one or more entries in the live keyring keyed by the

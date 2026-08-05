@@ -239,13 +239,25 @@ function runSecurityVerb(tokens: string[]): ExecResult {
           `(${TEMP_ROOT}). Point the test at a mkdtemp() directory.`
       );
     }
-    if (existsSync(path)) {
-      return fail(DUPLICATE_ITEM_CODE, "security: A keychain with the same name already exists.");
-    }
     mkdirSync(dirname(resolve(path)), { recursive: true });
+    // `wx` is O_CREAT|O_EXCL: the "already exists" answer comes from the create
+    // itself, atomically. An `existsSync` guard ahead of the write would be a
+    // check-then-use race (CodeQL js/file-system-race), the same TOCTOU shape
+    // this repo has been bitten by before.
+    //
     // Content is irrelevant: nothing reads the file, but `existsSync` on it is
     // what keychain-backend.ts checks. 0o600 mirrors the real CLI's mode.
-    writeFileSync(path, "", { mode: 0o600 });
+    try {
+      writeFileSync(path, "", { flag: "wx", mode: 0o600 });
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "EEXIST") {
+        return fail(
+          DUPLICATE_ITEM_CODE,
+          "security: A keychain with the same name already exists."
+        );
+      }
+      return fail(1, `security: could not create keychain: ${(err as Error).message}`);
+    }
     keychains.set(canonical(path), { passphrase: flags.get("-p") ?? "" });
     return ok();
   }

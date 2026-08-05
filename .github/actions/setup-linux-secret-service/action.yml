@@ -130,5 +130,12 @@ runs:
         # and the loss shows up only as a lower passing count that the
         # exact-match floor in .github/workflows/test-baseline-guard.yml
         # rejects.
+        # A bare assignment, deliberately. `export VAR="$(cmd)"` takes its exit
+        # status from `export`, not from cmd, so `set -e` does NOT abort when
+        # the provisioning fails: you get an empty token and a job that carries
+        # on to run a suite that skips everything. That is exactly what happened
+        # in the copy of this setup that used to live inline in
+        # keychain-linux-real-backend.yml. A plain `var="$(cmd)"` propagates
+        # cmd's status, so a failure stops the job here, where the error is.
         token_path="$("${GITHUB_WORKSPACE}/scripts/ci/provision-disposable-keyring.sh")"
         echo "SANCTUARY_TEST_DISPOSABLE_KEYRING=$token_path" >> "$GITHUB_ENV"
