@@ -1,3 +1,9 @@
+// fail-before-exempt: adapted to the exporter's new contract only. This PR makes
+// a supplied-but-empty stateNamespaces array throw, so these call sites now omit
+// the option instead of passing []. Behavior is unchanged (they pass no
+// stateStoragePath, so discovery finds nothing either way) and no assertion was
+// added here, so nothing in this file can fail against pre-fix source. The
+// binding test for the fix is test/exit/exit-export-namespace-discovery.test.ts.
 /**
  * Exit-flow harden findings (2026-06-25).
  *
@@ -140,7 +146,12 @@ async function exportFromSource(
     reputationStore: source.reputationStore,
     policy: DEFAULT_POLICY,
     config: defaultConfig(),
-    stateNamespaces: namespaces,
+    // Omit rather than forward an empty list: the exporter rejects a
+    // supplied-but-empty selection, because that shape is what a flag parser
+    // emits when the operator named nothing and it must mean "export all."
+    // This harness passes no stateStoragePath, so omitting still discovers
+    // nothing and the zero-state cases below keep their meaning.
+    ...(namespaces.length > 0 ? { stateNamespaces: namespaces } : {}),
     keySource: "recovery-key",
     ...extra,
   });

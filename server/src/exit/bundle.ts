@@ -274,6 +274,19 @@ export interface ExportExitBundleOptions {
   config?: SanctuaryConfig;
   reputationStore?: ReputationStore;
   stateStoragePath?: string;
+  /**
+   * Restrict the encrypted-state export to these namespaces. OMIT the option
+   * to export every namespace discovered under `stateStoragePath`; that is the
+   * behavior an operator-driven full-fortress export wants.
+   *
+   * Supplying an EMPTY array throws. It is never "export zero state": an empty
+   * array is what a repeated-flag parser produces when the operator passed no
+   * flag at all, and treating it as a real selection is what made
+   * `sanctuary exit export` emit signed, empty bundles. Callers that build this
+   * from CLI flags must spread it conditionally
+   * (`...(names.length > 0 ? { stateNamespaces: names } : {})`), the same shape
+   * the import path uses for `didWebAllowedHosts`.
+   */
   stateNamespaces?: string[];
   keySource?: "passphrase" | "recovery-key" | "unknown";
   /**
@@ -369,6 +382,13 @@ export interface ExportExitBundleResult {
   manifest_hash: string;
   artifact_count: number;
   unsupported_artifacts: string[];
+  /**
+   * Number of state entries carried in `encrypted_state.json`. Always present,
+   * including when it is 0, so a caller can gate on "did this export actually
+   * carry state" without parsing an artifact or a warning string. Mirrors the
+   * import path's `state.imported_keys`.
+   */
+  state_entry_count: number;
   /**
    * The minted bundle re-key key (base64url, 32 bytes), present only when
    * `mintStateRekeyKey` was set and the bundle carries state entries. It is
@@ -602,6 +622,23 @@ async function exportEncryptedState(
   rekeyKey?: string;
   partition?: PartitionResult;
 }> {
+  // "The caller named no namespaces" MUST resolve to discover-and-export
+  // everything, never to an empty selection. A supplied-but-empty array is
+  // exactly what a repeated-flag parser returns when the operator omitted the
+  // flag, so honoring it as "export zero namespaces" is how `sanctuary exit
+  // export` produced signed, well-formed, TOTALLY EMPTY bundles. Reject the
+  // ambiguous shape at the boundary instead of interpreting it: a caller that
+  // wants everything omits the option, and no caller has a legitimate reason to
+  // ask for precisely zero namespaces (a fortress with no state already yields
+  // an empty discovery). This is the same fail-closed posture as the
+  // partition/legacy-opt-out check below.
+  if (opts.stateNamespaces !== undefined && opts.stateNamespaces.length === 0) {
+    throw new Error(
+      "exit-bundle: stateNamespaces was supplied but empty. Omit the option to " +
+        "export every discoverable namespace; an empty list is never a request " +
+        "to export zero state.",
+    );
+  }
   const namespaceSet = new Set(
     opts.stateNamespaces ??
       (await discoverFilesystemStateNamespaces(opts.stateStoragePath))
@@ -930,6 +967,20 @@ export async function exportExitBundle(
     )
   );
   const encryptedStateExport = await exportEncryptedState(opts);
+  // A zero-entry export is a legitimate outcome for a fresh fortress, but it
+  // must never READ as a successful state export: the bundle still carries a
+  // valid signed manifest and an `encrypted_state.json`, so an operator running
+  // an exit drill cannot tell an empty fortress from a broken selection by
+  // looking at the bundle. Say it out loud on every surface (result warning,
+  // audit trail, CLI) rather than letting the silence imply success.
+  if (encryptedStateExport.bundle.total_keys === 0) {
+    exportWarnings.push(
+      "NO STATE EXPORTED: this bundle carries zero state entries. It can " +
+        "restore identity, policy, and audit receipts, but no memory or " +
+        "namespace data. Confirm the source fortress is genuinely empty " +
+        "before treating this bundle as a complete exit.",
+    );
+  }
   artifacts.push(
     await writeJsonArtifact(
       bundleDir,
@@ -1079,6 +1130,37 @@ export async function exportExitBundle(
       },
     );
   }
+  // Same honesty posture for a zero-state export: record it where an exit-drill
+  // operator queries after the fact, so "the bundle was empty" is provable from
+  // the source fortress rather than only inferable from the bundle.
+  //
+  // `appendCritical` and AWAITED, not `void append(...)`: `append`'s own
+  // contract reserves itself for low-risk telemetry and states that export/exit
+  // operations MUST use `appendCritical()`. The await is part of that contract,
+  // not style. `appendCritical` never registers in `pendingWrites`, and
+  // `enqueueAppend` swallows the rejection on `appendQueue`
+  // (`task.then(() => undefined, () => undefined)`), so a voided call's
+  // durability failure would be dropped on the floor by the `flush()` below.
+  // Awaiting is what makes a failed durable write fail the export instead
+  // (never silently degrade, AGENTS.md #5).
+  if (encryptedStateExport.bundle.total_keys === 0) {
+    await opts.auditLog.appendCritical({
+      layer: "l1",
+      operation: "exit_bundle_export_no_state",
+      identity_id: identity.identity_id,
+      result: "success",
+      details: {
+        approval_id: exportApprovalAuditId,
+        namespaces_requested: opts.stateNamespaces ?? null,
+        state_storage_path_supplied: opts.stateStoragePath !== undefined,
+      },
+    });
+  }
+  // Still required and still correct after the change above: the zero-state
+  // entry is already durably verified by the time control reaches here, so this
+  // flush is draining the sibling `void append(...)` calls (partition summary,
+  // receipts truncation) and the append queue. Same order as
+  // exit/consent.ts: appendCritical, then flush.
   await opts.auditLog.flush();
 
   const statePartitionSummary =
@@ -1094,6 +1176,7 @@ export async function exportExitBundle(
     unsupported_artifacts: [
       "audit_receipts: legacy L2 audit entries are manifest-pinned but not individually signed",
     ],
+    state_entry_count: encryptedStateExport.bundle.total_keys,
     ...(encryptedStateExport.rekeyKey !== undefined
       ? { state_rekey_key: encryptedStateExport.rekeyKey }
       : {}),
