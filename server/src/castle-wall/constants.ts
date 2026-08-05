@@ -5,6 +5,30 @@
  * Sanctuary main / filter daemon boundary. Bumping a value means a wire
  * incompatibility; PR 6 adds the cross-language vector tests that gate any
  * change.
+ *
+ * CROSS-LANGUAGE CONTRACT (reciprocal of the "synchronized with
+ * server/src/castle-wall/constants.ts" headers those two files already carry):
+ *
+ *   - `castle-wall-daemon/src/lib.rs`, module `constants` -- the Linux Rust
+ *     daemon. Mirrors twelve values: `SCHEMA_VERSION_V1`, `AUDIT_LAYER`,
+ *     `SIGNATURE_SCHEME_V1`, `IPC_CONTENT_LENGTH_HEADER`, `IPC_NAMESPACE`,
+ *     `REQUEST_ID_NONCE_BYTES`, `DEFAULT_PROMPT_TIMEOUT_SECONDS`,
+ *     `DEFAULT_NO_WALL_DURATION_SECONDS`, `DEFAULT_WAL_TTL_SECONDS`,
+ *     `DEFAULT_WAL_SIZE_CAP_BYTES`, `PRODUCER_SIG_DOMAIN_PREFIX`,
+ *     `PRODUCER_SIG_KEY_ID_V1` (each prefixed `CASTLE_WALL_` here).
+ *   - `castle-wall-macos/Sources/CastleWallIPC/Constants.swift`, enum
+ *     `CastleWallConstants` -- the macOS system extension. Mirrors six:
+ *     `schemaVersionV1`, `auditLayer`, `signatureSchemeV1`,
+ *     `ipcContentLengthHeader`, `ipcNamespace`, `requestIdNonceBytes`. Its
+ *     `challengeNonceBytes` has NO counterpart here and is not part of this
+ *     contract.
+ *
+ * Nothing in the build makes the three files agree: TypeScript, Rust, and
+ * Swift compile independently. Failure mode of a drift is therefore silent at
+ * build time and shows up as an enforcer that refuses every frame or every
+ * signature the server sends -- a wall that reads as "installed but never
+ * decides anything" rather than as a mismatched constant. Change a mirrored
+ * value in all three files in the SAME PR.
  */
 
 /** Schema version for v1 allowlist rules + manifest + signed envelopes. */

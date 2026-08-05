@@ -17,6 +17,7 @@
  * secret is attached to the body, headers, or any log line here.
  */
 
+import { ENFORCEMENT_EVENT_SCHEMA } from "./schema.js";
 import type { EnforcementEventClass } from "./schema.js";
 import type { EnforcementEvent } from "./schema.js";
 import type { EnforcementExportSinkKind } from "./config.js";
@@ -111,8 +112,14 @@ export class HttpCollectorSink implements EnforcementExportSink {
   async deliver(events: readonly EnforcementEvent[]): Promise<DeliveryResult> {
     // Body is metadata only: the mapped events plus a schema tag and a count.
     // No secret, no key, no token is attached anywhere.
+    // The batch envelope's `schema` tag is the SAME frozen discriminator every
+    // event inside the batch carries; it must match `ENFORCEMENT_EVENT_SCHEMA`
+    // in ./schema.ts. Interpolating the constant rather than re-typing the
+    // literal is what keeps a `.v2` mint from shipping a batch envelope still
+    // announcing v1 while its events announce v2 (a consumer keying its
+    // ingestion rules off the envelope would then silently mis-model the batch).
     const body = JSON.stringify({
-      schema: "sanctuary.enforcement-event.v1",
+      schema: ENFORCEMENT_EVENT_SCHEMA,
       count: events.length,
       events,
     });

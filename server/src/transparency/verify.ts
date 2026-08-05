@@ -68,12 +68,26 @@ function sha256Hex(input: string): string {
 }
 
 // ---- Format constants (duplicated from checkpoint.ts for standalone use) ---
-
+//
+// Each of these four must match the same-named export in
+// `server/src/transparency/checkpoint.ts` (there
+// `TRANSPARENCY_CHECKPOINT_DOMAIN_PREFIX` is spelled
+// `${TRANSPARENCY_CHECKPOINT_DOMAIN}\n`; the trailing newline is part of the
+// value). They are re-typed rather than imported because of this module's
+// STANDALONE PROPERTY stated in the header. Failure mode of a drifted copy:
+// the verifier reports a signature or schema FAILURE on a bundle the fortress
+// considers valid, which an auditor reads as tampering, not as a stale mirror.
+// Enforced by `server/test/structure/cross-file-contract-pins.test.ts`.
 const TRANSPARENCY_CHECKPOINT_SCHEMA_VERSION = 1;
 const TRANSPARENCY_CHECKPOINT_DOMAIN_PREFIX =
   "sanctuary.enforcement-checkpoint.v1\n";
 const TRANSPARENCY_CHECKPOINT_GENESIS = "GENESIS";
 const TRANSPARENCY_BUNDLE_FORMAT = "SANCTUARY_TRANSPARENCY_BUNDLE_V1";
+// Lowercase 64-char SHA-256 hex. Not a cross-file contract: every module that
+// validates a hash digest declares its own copy of this shape (10 sites in
+// server/src), and they are independent local validators, not mirrors of one
+// canonical declaration. Deliberately NOT hoisted -- see the same note in
+// checkpoint.ts.
 const HEX64 = /^[0-9a-f]{64}$/;
 
 /** Checkpoint record shape (structural mirror of checkpoint.ts). */

@@ -83,6 +83,16 @@ function sha256Hex(input: string): string {
   return toHex(sha256(bytes));
 }
 
+// Each of these three must match the same-named export in
+// `server/src/audit/chain.ts` (`AUDIT_CHECKPOINT_DOMAIN_PREFIX` is spelled
+// there as `${AUDIT_CHECKPOINT_DOMAIN}\n`; the trailing newline is part of the
+// value). They are re-typed rather than imported because this module's
+// STANDALONE PROPERTY (see the header) forbids importing any Sanctuary server
+// module. `canonicalJson`, `computeAuditEntryHash`, `computeAuditRoot`, and
+// `checkpointSigningBytes` below are duplicated from that same file for the
+// same reason. A drifted copy compiles and runs; it just reports a signature
+// FAILURE on a valid chain, which reads as tampering rather than as drift.
+// Enforced by `server/test/structure/cross-file-contract-pins.test.ts`.
 const AUDIT_CHAIN_GENESIS = "GENESIS";
 const AUDIT_CHAIN_SCHEMA_VERSION = 2;
 const AUDIT_CHECKPOINT_DOMAIN_PREFIX = "sanctuary.audit-checkpoint.v1\n";

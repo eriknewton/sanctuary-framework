@@ -66,9 +66,21 @@ import {
 
 export const TRANSPARENCY_ANCHORS_EXPORT_FORMAT =
   "SANCTUARY_TRANSPARENCY_ANCHORS_V1";
+// These two must match `TRANSPARENCY_ANCHOR_SCHEMA_VERSION` and
+// `TRANSPARENCY_ANCHOR_COMMITMENT_DOMAIN` in `transparency/anchor.ts`; so must
+// the commitment preimage this file rebuilds at the recompute site below.
+// Re-typed rather than imported to keep this file on the offline
+// standalone-verifier side. Enforced by
+// `server/test/structure/cross-file-contract-pins.test.ts`.
 const ANCHOR_SCHEMA_VERSION = 1;
 const ANCHOR_COMMITMENT_DOMAIN = "sanctuary.transparency.anchor-commitment.v1";
-/** SPKI DER prefix for an uncompressed P-256 public point (65 bytes). */
+/**
+ * SPKI DER prefix for an uncompressed P-256 public point (65 bytes).
+ * Must match the prefix `anchorPublicKeyPem` prepends in
+ * `transparency/anchor.ts`; that function is the producer of every PEM this
+ * one parses. 26 prefix bytes (id-ecPublicKey + prime256v1 + BIT STRING
+ * header) + 65 point bytes = the 91-byte DER length checked below.
+ */
 const SPKI_P256_PREFIX_HEX =
   "3059301306072a8648ce3d020106082a8648ce3d030107034200";
 /** Signed-note signature-line prefix (EM DASH, space) per the note format. */

@@ -27,7 +27,22 @@
 
 import type { DistressReason, DistressSeverity } from "../../distress/tools.js";
 
-/** The FROZEN schema discriminator carried by every exported event. */
+/**
+ * The FROZEN schema discriminator carried by every exported event.
+ *
+ * This is the SOLE declaration of the literal in `server/src`. The batch
+ * envelope `HttpCollectorSink` POSTs in `./sink.ts` tags itself with this same
+ * constant by import, so envelope and events can never announce different
+ * versions. `test/structure/cross-file-contract-pins.test.ts` fails if the
+ * literal reappears anywhere else in `server/src` outside a comment: a
+ * re-typed copy is how a `.v2` mint ships a half-migrated stream, and a
+ * consumer keying its ingestion rules off the version would mis-model the
+ * batch without any error surfacing on either side.
+ *
+ * `cli/cortex-export.ts` and `./README.md` name the string in prose (operator
+ * help text and docs); those are descriptions, not second declarations, and
+ * must be updated alongside a version bump.
+ */
 export const ENFORCEMENT_EVENT_SCHEMA = "sanctuary.enforcement-event.v1" as const;
 
 /** The FROZEN distress-envelope schema string this exporter forwards verbatim. */

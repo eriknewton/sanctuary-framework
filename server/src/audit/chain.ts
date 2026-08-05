@@ -2,6 +2,25 @@ import { createHash } from "node:crypto";
 import { fromBase64url, stringToBytes } from "../core/encoding.js";
 import { verify as verifyIdentitySignature } from "../core/identity.js";
 
+/**
+ * CROSS-FILE CONTRACT. These four values, `canonicalJson` below, and
+ * `checkpointSigningBytes`'s prefix+canonical-JSON composition are DUPLICATED
+ * verbatim in `cli/audit-chain-verify.ts` (its `AUDIT_CHAIN_GENESIS`,
+ * `AUDIT_CHAIN_SCHEMA_VERSION`, `AUDIT_CHECKPOINT_DOMAIN_PREFIX`,
+ * `canonicalJson`, `checkpointSigningBytes`). The duplication is DELIBERATE:
+ * that module's documented STANDALONE PROPERTY is that it imports only
+ * @noble/* and Node builtins, so a third party can verify an exported chain
+ * with no Sanctuary server present. Importing these constants from here would
+ * drag the server runtime in and destroy that property, so the copy stays and
+ * this pin is the tripwire.
+ *
+ * Failure mode of a drifted copy: nothing throws and nothing fails to compile.
+ * The external verifier simply recomputes different signing bytes and reports
+ * a signature FAILURE on a chain the fortress considers perfectly valid, which
+ * reads to an auditor as evidence of tampering rather than as a stale mirror.
+ * Change a value here and in `cli/audit-chain-verify.ts` in the SAME PR.
+ * Enforced by `test/structure/cross-file-contract-pins.test.ts`.
+ */
 export const AUDIT_CHAIN_GENESIS = "GENESIS";
 export const AUDIT_CHAIN_SCHEMA_VERSION = 2;
 export const AUDIT_CHECKPOINT_DOMAIN = "sanctuary.audit-checkpoint.v1";

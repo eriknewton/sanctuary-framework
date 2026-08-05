@@ -44,9 +44,24 @@ import { canonicalJson, sha256Hex } from "../audit/chain.js";
 import { stringToBytes } from "../core/encoding.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
 
+/**
+ * CROSS-FILE CONTRACT. Must match `ANCHOR_SCHEMA_VERSION` in
+ * `transparency/anchor-verify.ts`, which re-types it rather than importing it
+ * (that module is part of the offline standalone-verifier surface).
+ */
 export const TRANSPARENCY_ANCHOR_SCHEMA_VERSION = 1;
 
-/** Domain separator for the salted commitment preimage. */
+/**
+ * Domain separator for the salted commitment preimage.
+ *
+ * CROSS-FILE CONTRACT. Must match `ANCHOR_COMMITMENT_DOMAIN` in
+ * `transparency/anchor-verify.ts`, AND the preimage composition below
+ * (`DOMAIN \n salt \n counter \n checkpointHash`) must match the one that file
+ * rebuilds when it recomputes a commitment. Failure mode of a drift: the
+ * verifier recomputes a different digest and reports the anchor as NOT
+ * matching its checkpoint, which is exactly the signal a real rollback
+ * produces, so a stale mirror is indistinguishable from an attack.
+ */
 export const TRANSPARENCY_ANCHOR_COMMITMENT_DOMAIN =
   "sanctuary.transparency.anchor-commitment.v1";
 
@@ -151,6 +166,10 @@ export function anchorPublicKeyPem(publicKey: Uint8Array): string {
     throw new Error("anchor public key must be a 65-byte uncompressed P-256 point");
   }
   // SPKI prefix for id-ecPublicKey + prime256v1 with a 65-byte BIT STRING.
+  // Must match `SPKI_P256_PREFIX_HEX` in `transparency/anchor-verify.ts`, which
+  // strips exactly this prefix back off when it parses the PEM this function
+  // writes. 26 prefix bytes + the 65-byte point = the 91-byte DER length that
+  // file's parser checks for.
   const prefix = Buffer.from(
     "3059301306072a8648ce3d020106082a8648ce3d030107034200",
     "hex"

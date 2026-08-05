@@ -77,6 +77,33 @@ export interface AuditCheckpointRecord extends AuditCheckpointSigningPayload {
   signer_kid: string | null;
   signature: string | null;
   signature_algorithm: "Ed25519" | null;
+  /**
+   * SHARED VOCABULARY, not a two-sided contract. The string
+   * `domain-separated-canonical-json-v1` names ONE encoding (a domain prefix
+   * followed by the sorted-key, undefined-filtered canonical JSON that
+   * `audit/chain.ts:canonicalJson` produces) and is declared independently by
+   * every signed surface that uses it, because those surfaces version
+   * separately:
+   *
+   *   - this checkpoint record (emitted at `operational/audit-log.ts`, where
+   *     the literal is re-typed for the SAME zero-import reason as the rest of
+   *     this module)
+   *   - the transparency checkpoint (`transparency/checkpoint.ts` and its
+   *     standalone mirror `transparency/verify.ts`)
+   *   - `InternalSigningResult` (`cognitive/tools.ts`)
+   *   - `WORKLOAD_HOST_ATTESTATION_PAYLOAD_ENCODING`
+   *     (`workload-lifecycle/host-attestation.ts`)
+   *   - `WORKLOAD_UNDECLARED_FINDING_PAYLOAD_ENCODING`
+   *     (`workload-lifecycle/undeclared-finding.ts`)
+   *
+   * There is deliberately no central constant: these are not mirrors of one
+   * declaration and MAY legitimately diverge if one surface ever adopts a
+   * different encoding. What must never happen is two surfaces claiming this
+   * SAME name for two different byte-level encodings, because an external
+   * verifier reads the name and reconstructs the signing bytes from it.
+   * `test/structure/cross-file-contract-pins.test.ts` asserts the spelling is
+   * uniform wherever it appears.
+   */
   payload_encoding: "domain-separated-canonical-json-v1";
   unsigned: boolean;
   unsigned_reason?: string;

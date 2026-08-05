@@ -225,6 +225,13 @@ export interface HybridCertificatePublicKeys {
  * it in encrypted state and zero the plaintext.
  */
 export interface FortressMasterPublicKeysV2Hybrid {
+  /**
+   * Must match `FORTRESS_MASTER_KEY_VERSION_V2_HYBRID` in
+   * `mesh/trust-root-hybrid.ts`. Spelled as a literal rather than
+   * `typeof FORTRESS_MASTER_KEY_VERSION_V2_HYBRID` because that file imports
+   * this one; a back-reference would close an import cycle. The same literal
+   * recurs in `NodeIdentityCertificateV2Hybrid.parent_chain` below.
+   */
   readonly key_version: "sanctuary.fortress-master.v2.hybrid-ed25519-ml-dsa-65";
   readonly signature_suite: "ed25519+ml-dsa-v1";
   readonly fortress_id: string;
@@ -234,6 +241,11 @@ export interface FortressMasterPublicKeysV2Hybrid {
 
 /** Principal certificate signed by the v2 hybrid fortress-master key. */
 export interface PrincipalCertificateV2Hybrid {
+  /**
+   * Must match `PRINCIPAL_CERTIFICATE_VERSION_V2_HYBRID` in
+   * `mesh/trust-root-hybrid.ts` (literal, not `typeof`, for the import-cycle
+   * reason noted on `FortressMasterPublicKeysV2Hybrid.key_version`).
+   */
   readonly certificate_version: "sanctuary.principal-cert.v2.hybrid-ed25519-ml-dsa-65";
   readonly signature_suite: "ed25519+ml-dsa-v1";
   readonly principal_id: string;
@@ -247,6 +259,11 @@ export interface PrincipalCertificateV2Hybrid {
 
 /** Per-node certificate signed by both principal and fortress-master v2 keys. */
 export interface NodeIdentityCertificateV2Hybrid {
+  /**
+   * Must match `NODE_IDENTITY_CERTIFICATE_VERSION_V2_HYBRID` in
+   * `mesh/trust-root-hybrid.ts` (literal, not `typeof`, for the import-cycle
+   * reason noted on `FortressMasterPublicKeysV2Hybrid.key_version`).
+   */
   readonly certificate_version: "sanctuary.node-cert.v2.hybrid-ed25519-ml-dsa-65";
   readonly signature_suite: "ed25519+ml-dsa-v1";
   readonly node_id: string;
