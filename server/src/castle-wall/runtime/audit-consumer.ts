@@ -18,6 +18,10 @@ import {
   CASTLE_WALL_AUDIT_LAYER,
   CASTLE_WALL_AUDIT_PROVENANCE_KEY,
   CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
+  CASTLE_WALL_CHAIN_BASIS_DETAIL_KEY,
+  CASTLE_WALL_CHAIN_BASIS_EVENT_CANONICAL,
+  CASTLE_WALL_CHAIN_BASIS_PRODUCER_SIGNED_BODY,
+  CASTLE_WALL_CHAIN_PRIOR_UNCONSUMED_DETAIL_KEY,
   CASTLE_WALL_PRODUCER_SIG_DETAIL_KEY,
   CASTLE_WALL_PRODUCER_KID_DETAIL_KEY,
   CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY,
@@ -77,6 +81,51 @@ export interface AuditSink {
   /** Block until all in-flight `append` calls have settled. */
   flush(): Promise<void>;
 }
+
+/**
+ * The consumer's own last persisted chain position, read back from LOCAL
+ * storage at startup. This is the only input the startup anchor restore
+ * accepts: the migrated anchor is recomputed from data we already persisted and
+ * already verified, with ZERO incoming-event trust (the #1096 gate refuted
+ * every wire-driven recovery variant as attacker-steerable).
+ */
+export type PersistedChainAnchor =
+  | {
+      kind: "persisted";
+      /** The `details.seq` of the last accepted chain-participating entry. */
+      seq: number;
+      /**
+       * The verbatim producer-signed canonical body persisted with that entry
+       * (`cw_producer_signed_canonical`), or null when the entry was accepted
+       * on the channel-unsigned basis (that path deliberately strips the
+       * signed body, so local recomputation is impossible).
+       */
+      signedCanonicalJson: string | null;
+      /**
+       * The recorded chain basis (`cw_chain_basis`), or null for entries
+       * written before the basis was recorded — which by construction means
+       * the legacy `event_canonical` basis.
+       */
+      chainBasis: string | null;
+      /** Identity to attribute restore/migration audit records to. */
+      identityId: string;
+    }
+  | {
+      /**
+       * Local history exists but cannot anchor a chain (e.g. the audit log
+       * reports integrity findings). The consumer latches the loud stuck state
+       * rather than guessing.
+       */
+      kind: "unavailable";
+      reason: string;
+    };
+
+/**
+ * Async reader for the consumer's persisted chain position. Returns null when
+ * no chain-participating entry has ever been persisted (fresh install →
+ * genesis bootstrap). Wire it with {@link buildChainAnchorSourceFromAuditLog}.
+ */
+export type ChainAnchorSource = () => Promise<PersistedChainAnchor | null>;
 
 /** A single critical-event ACK callback the consumer invokes after persistence. */
 export type CriticalAckCallback = () => Promise<void>;
@@ -224,7 +273,34 @@ export class AuditConsumer {
     producerSignatureAccepted: 0,
   };
   private lastAckedSeq: number | null = null;
-  private lastEventCanonicalHash: string | null = null;
+  /**
+   * The chain anchor: for producer-signed entries this is
+   * `sha256(utf8(cw_producer_signed_canonical))` — the exact bytes every
+   * producer hashes into its own `prior_sha256_hex` (Rust `audit.rs`, macOS
+   * flow + availability paths). Anchoring on a locally-reconstructed
+   * `CastleWallAuditEvent` hash forked the chain on every deployment because
+   * no producer ever hashed that shape (#1096 root cause).
+   */
+  private lastEventChainHash: string | null = null;
+  /**
+   * Startup anchor restore state. `restorePromise` memoizes an in-flight
+   * restore so concurrent first ingests share one attempt; a FAILED attempt
+   * clears it so a transient storage fault is retried (fail-closed in the
+   * meantime: the thrown error keeps the event unsettled, so nothing is
+   * accepted or ACKed on an unrestored chain).
+   */
+  private restoreSettled = false;
+  private restorePromise: Promise<void> | null = null;
+  /**
+   * Latched when local history exists but cannot anchor the chain (last
+   * accepted entry unsigned, malformed anchor record, or audit-log integrity
+   * findings). While latched, every critical event is refused UNSETTLED (no
+   * persist, no chain advance, no ACK — an ACK would let the daemon truncate
+   * its WAL through evidence we never accepted). A stuck chain an operator
+   * must clear is honest; any self-healing fallback here would have to trust
+   * the wire, which is exactly what the #1096 gate refuted.
+   */
+  private chainMigrationUnavailableReason: string | null = null;
   /**
    * FIX 2 (codex CRITICAL - defense in depth against acking past an unpersisted
    * event). Set to the seq of an event that VALIDATED + chained cleanly but then
@@ -262,6 +338,8 @@ export class AuditConsumer {
   private readonly producerSigMaxAgeMs: number;
   private readonly producerSigMaxSkewMs: number;
   private readonly now: () => number;
+  private readonly chainAnchorSource: ChainAnchorSource | undefined;
+  private readonly chainContinuity: "complete" | "producer_subset";
 
   constructor(
     private readonly sink: AuditSink,
@@ -274,12 +352,47 @@ export class AuditConsumer {
       producerSigMaxSkewMs?: number;
       /** Clock injection for tests. */
       now?: () => number;
+      /**
+       * Reader for the consumer's own last persisted chain position. When set
+       * (and a pinned producer key is configured), the first ingest restores
+       * the anchor from LOCAL storage before any incoming event is considered
+       * — closing both the old-basis upgrade fork and the restart bootstrap
+       * replay hole. When absent, the consumer bootstraps from null exactly as
+       * before (path-less tests / legacy callers).
+       */
+      chainAnchorSource?: ChainAnchorSource;
+      /**
+       * How much of the producer's chain this consumer receives.
+       *
+       * `complete` (default): the consumer sees EVERY producer chain event
+       * (the Linux drain walks the daemon's full WAL). A prior-hash mismatch
+       * is a hard fork — real damage, chain stops, no self-heal.
+       *
+       * `producer_subset`: the consumer receives only a SUBSET of the
+       * producer's chain by construction (the macOS extension signs flow
+       * decisions AND availability reports into one shared seq/prior chain,
+       * but only flow decisions arrive here — availability reports go to the
+       * enforcement-availability store on their own delivery path). Prior-hash
+       * contiguity across a gap is therefore UNVERIFIABLE locally, not
+       * evidence of damage: continuity is enforced as verified producer
+       * signature + strictly monotonic seq (the anti-replay primitive), the
+       * prior hash is still asserted whenever the events are adjacent, and a
+       * non-adjacent accept records `cw_chain_prior_unconsumed` on the
+       * persisted entry so the audit trail never claims a continuity check it
+       * could not perform. This is NOT the refuted fork recovery: there is no
+       * threshold, no window, no re-anchor to a wire-chosen head — an
+       * unverified or seq-regressing frame is rejected identically in both
+       * modes, and the macOS ACK is a no-op so acceptance destroys nothing.
+       */
+      chainContinuity?: "complete" | "producer_subset";
     },
   ) {
     this.pinnedProducerKeyB64url = options?.pinnedProducerKeyB64url ?? null;
     this.producerSigMaxAgeMs = options?.producerSigMaxAgeMs ?? 5 * 60 * 1000;
     this.producerSigMaxSkewMs = options?.producerSigMaxSkewMs ?? 60 * 1000;
     this.now = options?.now ?? Date.now;
+    this.chainAnchorSource = options?.chainAnchorSource;
+    this.chainContinuity = options?.chainContinuity ?? "complete";
   }
 
   /** Whether per-producer signature enforcement is active for this consumer. */
@@ -310,6 +423,17 @@ export class AuditConsumer {
    *     log integrity is preserved (no silent duplicate entries).
    */
   async ingestCritical(envelope: CriticalEventEnvelope): Promise<void> {
+    // The anchor must be restored from LOCAL storage before the first incoming
+    // event is even looked at: an event examined against a null anchor is
+    // bootstrap-accepted, which is precisely the wire-trust the restore exists
+    // to remove. A restore failure throws (unsettled — no persist, no ACK) so
+    // a transient storage fault fails closed and is retried.
+    await this.ensureChainAnchorRestored();
+    if (this.chainMigrationUnavailableReason !== null) {
+      // Latched stuck state (see the field's invariant comment): refuse
+      // UNSETTLED so the daemon's WAL retains the evidence for operator repair.
+      throw new AuditChainError("chain_migration_unavailable");
+    }
     const reason = validateEvent(envelope.event);
     if (reason) {
       this.stats.rejectedEvents += 1;
@@ -334,7 +458,7 @@ export class AuditConsumer {
     // other malformed event above, and it must NEVER be accepted/chained.
     // Computing the hash HERE, before the WAL-chain check or the persist call
     // even look at the event, means neither the chain's duplicate-hash
-    // comparison nor the post-persist `lastEventCanonicalHash` update below can
+    // comparison nor the post-persist `lastEventChainHash` update below can
     // ever throw: both reuse this already-proven-canonicalizable hash instead
     // of re-deriving it from an event that might not be. A forger that stapled
     // a bogus integer onto an otherwise-valid event must settle the same way a
@@ -369,7 +493,25 @@ export class AuditConsumer {
       await this.tryAck(envelope, "audit_event_rejected");
       return;
     }
-    const chainOutcome = this.validateWalChain(envelope.event, canonicalHash);
+    // Producer verification runs BEFORE the chain decision because the chain
+    // basis for a verified event is the SIGNED BODY's own hash — the exact
+    // bytes the producer hashed into its `prior_sha256_hex` — never a locally
+    // reconstructed CastleWallAuditEvent (which no producer hashes; anchoring
+    // on it forked the chain on every deployment, #1096 root cause).
+    const sigOutcome = this.evaluateProducerSignature(envelope);
+    if (sigOutcome.kind === "rejected") {
+      await this.emitProducerSignatureRejected(envelope, sigOutcome.reason);
+      throw new AuditChainError(sigOutcome.reason);
+    }
+    if (sigOutcome.kind === "verified") {
+      this.stats.producerSignatureAccepted += 1;
+    }
+    const chainBasis = chainBasisFor(canonicalHash, sigOutcome);
+    const chainOutcome = this.validateWalChain(
+      envelope.event,
+      chainBasis.hash,
+      sigOutcome.kind === "verified",
+    );
     if (chainOutcome.kind === "duplicate_replay") {
       // Daemon retried a critical event whose persistence completed but whose
       // ACK never landed. Drop the payload silently (no double-append) and
@@ -391,57 +533,19 @@ export class AuditConsumer {
       return;
     }
     if (chainOutcome.kind === "error") {
+      // A fork now means real damage (crash mid-write, force-clear, rolled-back
+      // producer WAL): stop the chain LOUDLY and do not self-heal. There is
+      // deliberately no automatic recovery here — every wire-driven re-anchor
+      // variant was gate-refuted as attacker-steerable (#1096 Q3/Q4), and a
+      // stuck chain an operator must clear is honest where a self-healing one
+      // an attacker can steer is not.
       await this.emitVerificationFailure(chainOutcome.reason, envelope.event);
       throw new AuditChainError(chainOutcome.reason);
     }
 
-    // Slice L1 producer-authenticity gate. When a pinned producer key is
-    // configured and this event is enforcement evidence, the daemon's per-event
-    // signature MUST verify against the pinned key before we accept the event
-    // as evidence. This is the load-bearing fail-closed property: an in-process
-    // forger can mint the `cw_source` marker but cannot mint a valid signature
-    // over `seq ‖ timestamp ‖ canonical-bytes` against the daemon's key, and a
-    // replayed past signature is bound to a different seq so it does not verify.
-    const sigOutcome = this.evaluateProducerSignature(envelope);
-    if (sigOutcome.kind === "rejected") {
-      this.stats.producerSignatureRejections += 1;
-      await this.sink.append(
-        CASTLE_WALL_AUDIT_LAYER,
-        "producer_signature_rejected",
-        envelope.event.fortress_id ?? "unknown",
-        {
-          reason: sigOutcome.reason,
-          event_type: envelope.event.event_type,
-          seq: envelope.event.details.seq,
-        },
-        "failure"
-      );
-      await this.sink.flush();
-      // Fail closed: do NOT persist as enforcement evidence, do NOT advance the
-      // chain. We DO ACK so the daemon stops re-delivering a packet we have
-      // permanently refused; the refusal is durably recorded above for audit.
-      await this.tryAck(envelope, "producer_signature_rejected");
-      throw new AuditChainError(sigOutcome.reason);
-    }
-    if (sigOutcome.kind === "verified") {
-      this.stats.producerSignatureAccepted += 1;
-    }
     const identityOutcome = persistedIdentityForEvent(envelope, sigOutcome);
     if (identityOutcome.kind === "rejected") {
-      this.stats.producerSignatureRejections += 1;
-      await this.sink.append(
-        CASTLE_WALL_AUDIT_LAYER,
-        "producer_signature_rejected",
-        envelope.event.fortress_id ?? "unknown",
-        {
-          reason: identityOutcome.reason,
-          event_type: envelope.event.event_type,
-          seq: envelope.event.details.seq,
-        },
-        "failure"
-      );
-      await this.sink.flush();
-      await this.tryAck(envelope, "producer_signature_rejected");
+      await this.emitProducerSignatureRejected(envelope, identityOutcome.reason);
       throw new AuditChainError(identityOutcome.reason);
     }
 
@@ -450,7 +554,12 @@ export class AuditConsumer {
         CASTLE_WALL_AUDIT_LAYER,
         envelope.event.event_type,
         identityOutcome.identityId,
-        buildDetailsForEvent(envelope, sigOutcome),
+        buildDetailsForEvent(
+          envelope,
+          sigOutcome,
+          chainBasis.kind,
+          chainOutcome.kind === "ok_gap",
+        ),
         resultForSignatureOutcome(sigOutcome),
       );
       if (this.inboxBridge && envelope.event.event_type === "egress_blocked") {
@@ -483,10 +592,10 @@ export class AuditConsumer {
     // a transport-layer ACK failure must NOT leave the consumer's chain view
     // out of sync with what is actually on disk.
     this.lastAckedSeq = Number(envelope.event.details.seq);
-    // Reuse the hash computed up front in `ingestCritical` (already proven
-    // canonicalizable there); do NOT re-derive it here, which would
+    // Reuse the basis hash selected up front in `ingestCritical` (already
+    // proven derivable there); do NOT re-derive it here, which would
     // reintroduce a throw site after the event is already durably persisted.
-    this.lastEventCanonicalHash = canonicalHash;
+    this.lastEventChainHash = chainBasis.hash;
     // The owed seq (if any) is now durable - clear the FIX 2 guard.
     this.pendingUnpersistedSeq = null;
     this.stats.acceptedCriticalEvents += 1;
@@ -543,21 +652,151 @@ export class AuditConsumer {
     return { ...this.stats };
   }
 
-  getWalChainState(): { lastAckedSeq: number | null; lastEventCanonicalHash: string | null } {
+  getWalChainState(): {
+    lastAckedSeq: number | null;
+    lastEventChainHash: string | null;
+  } {
     return {
       lastAckedSeq: this.lastAckedSeq,
-      lastEventCanonicalHash: this.lastEventCanonicalHash,
+      lastEventChainHash: this.lastEventChainHash,
     };
+  }
+
+  /**
+   * Restore the chain anchor from the consumer's OWN persisted history, once,
+   * before the first incoming event is examined. See
+   * {@link restoreChainAnchorOnce} for the migration semantics.
+   */
+  private ensureChainAnchorRestored(): Promise<void> {
+    if (this.restoreSettled) return Promise.resolve();
+    if (this.restorePromise === null) {
+      this.restorePromise = this.restoreChainAnchorOnce().then(
+        () => {
+          this.restoreSettled = true;
+        },
+        (err) => {
+          // A transient reader fault must be retryable, not latched: clear the
+          // memo so the NEXT ingest attempts the restore again. The rethrow
+          // keeps the current event unsettled (fail closed).
+          this.restorePromise = null;
+          throw err;
+        },
+      );
+    }
+    return this.restorePromise;
+  }
+
+  /**
+   * One-time LOCAL anchor restore + basis migration.
+   *
+   * On first boot after the basis fix, persisted history was chained under the
+   * legacy `event_canonical` basis, so a null-anchor bootstrap would either
+   * fork against the first live event (stuck chain) or blindly accept it (the
+   * restart replay hole). The bridge recomputes the anchor from the last
+   * accepted entry's OWN persisted signed canonical body: verification
+   * recomputes the commitment from stored, already-verified bytes — an anchor
+   * claimed by an incoming frame is never trusted (every wire-driven recovery
+   * variant was gate-refuted as attacker-steerable, #1096 Q3/Q4).
+   *
+   * "Was this written under the old basis" is a STORED FACT
+   * (`cw_chain_basis` on the persisted entry), never an inference from
+   * in-memory state (the Q5 defect); after one migration the stored basis on
+   * new entries is `producer_signed_body`, so the migration is one-time by
+   * construction. The migration record is flushed BEFORE the migrated anchor
+   * is used.
+   */
+  private async restoreChainAnchorOnce(): Promise<void> {
+    if (this.chainAnchorSource === undefined) return;
+    if (this.pinnedProducerKeyB64url === null) {
+      // Channel-unsigned basis: no signature can bind an anchor, so a restored
+      // anchor would add nothing a forged frame could not also produce. The
+      // chain keeps its documented channel-authenticated bootstrap semantics.
+      return;
+    }
+    const anchor = await this.chainAnchorSource();
+    if (anchor === null) {
+      // No chain-participating history: genuine genesis bootstrap.
+      return;
+    }
+    if (anchor.kind === "unavailable") {
+      await this.latchMigrationUnavailable("unknown", anchor.reason);
+      return;
+    }
+    if (!Number.isSafeInteger(anchor.seq) || anchor.seq < 0) {
+      // Our own anchor record is malformed: that is damage, not a fresh chain.
+      await this.latchMigrationUnavailable(
+        anchor.identityId,
+        "persisted_anchor_seq_invalid",
+      );
+      return;
+    }
+    if (anchor.signedCanonicalJson === null) {
+      // The last accepted entry was channel-unsigned: its signed body was
+      // deliberately stripped at persist time, so local recomputation is
+      // impossible. Do NOT fall back to trusting the wire — surface the stuck
+      // state loudly and leave repair to the operator.
+      await this.latchMigrationUnavailable(
+        anchor.identityId,
+        "last_accepted_entry_unsigned",
+      );
+      return;
+    }
+    const anchorHash = computeSignedBodyHash(anchor.signedCanonicalJson);
+    if (anchor.chainBasis !== CASTLE_WALL_CHAIN_BASIS_PRODUCER_SIGNED_BODY) {
+      // Old-basis (or pre-recording) history: this is the one-time migration.
+      // Record it first-class and FLUSH before the anchor is adopted, so the
+      // audit trail explains the basis change before any event chains on it.
+      await this.sink.append(
+        CASTLE_WALL_AUDIT_LAYER,
+        "chain_basis_migrated",
+        anchor.identityId,
+        {
+          previous_basis:
+            anchor.chainBasis ?? CASTLE_WALL_CHAIN_BASIS_EVENT_CANONICAL,
+          new_basis: CASTLE_WALL_CHAIN_BASIS_PRODUCER_SIGNED_BODY,
+          anchor_seq: anchor.seq,
+          anchor_sha256_hex: anchorHash,
+          anchor_source: "persisted_signed_canonical_body",
+        },
+        "success",
+      );
+      await this.sink.flush();
+    }
+    this.lastAckedSeq = anchor.seq;
+    this.lastEventChainHash = anchorHash;
+  }
+
+  private async latchMigrationUnavailable(
+    identityId: string,
+    reason: string,
+  ): Promise<void> {
+    this.chainMigrationUnavailableReason = reason;
+    // One durable record at latch time (not one per refused event — a
+    // per-event append would flood the log for as long as the daemon retries).
+    await this.sink.append(
+      CASTLE_WALL_AUDIT_LAYER,
+      "chain_migration_unavailable",
+      identityId,
+      { reason },
+      "failure",
+    );
+    await this.sink.flush();
+    // SAFETY: one greppable operator line for the stuck chain; the per-event
+    // refusals surface only as unsettled faults on the drain/flow paths.
+    console.error(
+      `[castle-wall] audit chain anchor migration UNAVAILABLE (${reason}): the chain is stopped fail-closed until an operator repairs the anchor; incoming critical events are refused unsettled.`,
+    );
   }
 
   /**
    * Classify an inbound critical event against the WAL chain.
    *
-   * `canonicalHash` is the hash the caller already computed up front in
+   * `chainHash` is the basis hash the caller already selected up front in
    * `ingestCritical` (before this method runs) - reusing it here means this
    * method never itself calls `canonicalize()`/`computeCanonicalHash()` and
-   * so can never throw on an unrepresentable event; the caller's up-front
-   * check already routed that case to a settled rejection before we get here.
+   * so can never throw on an unrepresentable event. Producer-signed events
+   * chain on `sha256(envelope.producer.eventCanonicalJson)` (the producers'
+   * own basis); channel-unsigned events keep the legacy event-canonical hash.
    *
    * Returns:
    *   - `{ kind: "ok" }` for fresh, well-chained events.
@@ -569,9 +808,11 @@ export class AuditConsumer {
    */
   private validateWalChain(
     event: CastleWallAuditEvent,
-    canonicalHash: string
+    chainHash: string,
+    signatureVerified: boolean,
   ):
     | { kind: "ok" }
+    | { kind: "ok_gap" }
     | { kind: "duplicate_replay" }
     | { kind: "error"; reason: string } {
     // Defense in depth: `details` is typed `Record<string, unknown>` and the
@@ -610,19 +851,34 @@ export class AuditConsumer {
       // daemon WAL produces the latter.
       if (
         seq === this.lastAckedSeq &&
-        this.lastEventCanonicalHash !== null &&
-        canonicalHash === this.lastEventCanonicalHash
+        this.lastEventChainHash !== null &&
+        chainHash === this.lastEventChainHash
       ) {
         return { kind: "duplicate_replay" };
       }
       return { kind: "error", reason: "seq_regression" };
     }
-    if (this.lastEventCanonicalHash !== null && priorHash !== this.lastEventCanonicalHash) {
+    if (this.lastEventChainHash !== null && priorHash !== this.lastEventChainHash) {
+      // Subset consumption (macOS flow): a prior referencing a producer event
+      // we never received is the NORMAL shape whenever an availability report
+      // interleaved in the shared producer chain — not evidence of damage.
+      // Acceptance across the gap still requires a VERIFIED producer signature
+      // (seq + prior live inside the signed bytes) and the strict seq
+      // monotonicity already enforced above; an unsigned or replayed frame is
+      // rejected identically in both modes. Complete-chain consumers treat the
+      // same mismatch as a hard fork, because there a missing link IS damage.
+      if (
+        this.chainContinuity === "producer_subset" &&
+        signatureVerified &&
+        typeof priorHash === "string"
+      ) {
+        return { kind: "ok_gap" };
+      }
       return { kind: "error", reason: "wal_chain_verification_failed" };
     }
     // FIX 2 (codex CRITICAL - never bootstrap-accept past an UNPERSISTED event).
     //
-    // We are in the BOOTSTRAP state here (`lastEventCanonicalHash === null`): no
+    // We are in the BOOTSTRAP state here (`lastEventChainHash === null`): no
     // verified on-disk chain anchor exists, so `priorHash` cannot be checked. A
     // genuine first event (genesis, or a from-null re-pull) is legitimately
     // accepted here. The dangerous case: a PRIOR event validated + chained but
@@ -663,13 +919,24 @@ export class AuditConsumer {
     const isEnforcementEvidence = ENFORCEMENT_EVIDENCE_EVENT_TYPES.has(
       envelope.event.event_type
     );
-    // No pinned key, or a non-evidence event: accept on the channel basis.
-    if (this.pinnedProducerKeyB64url === null || !isEnforcementEvidence) {
+    // No pinned key: accept on the documented channel-authenticated basis.
+    if (this.pinnedProducerKeyB64url === null) {
       return { kind: "unsigned" };
     }
     if (!envelope.producer) {
+      if (!isEnforcementEvidence) {
+        // Control/diagnostic events are not signature-gated; without a
+        // producer block they keep the channel basis (and the legacy
+        // event-canonical chain basis, since there is no signed body to hash).
+        return { kind: "unsigned" };
+      }
       return { kind: "rejected", reason: "producer_signature_absent" };
     }
+    // A producer block IS present: with a pinned key it must verify — for ANY
+    // event type. Verifying non-enforcement signed frames too is what lets
+    // every producer-signed event chain on the signed-body basis, and it
+    // fail-closes a stapled/broken signature instead of quietly downgrading
+    // the entry to the unsigned basis (rule 5: never silently degrade).
     // Parse the signed WAL body. The signature (verified below) is over THIS
     // body; once verified, the body - not the attacker-controllable
     // `envelope.event` - is the authoritative source for the persisted
@@ -685,6 +952,11 @@ export class AuditConsumer {
     if (parsed.kind === "error") {
       return { kind: "rejected", reason: parsed.reason };
     }
+    // STRICT binding: the signed `operation` must map to exactly the
+    // `event_type` slot the entry is filed under. An unmapped operation is a
+    // rejection, never a pass-through — accepting unknown signed operations
+    // for any event type would let a captured signature over one body be
+    // stapled onto a differently-typed event (#1096 regression, reverted).
     const mappedEventType = WAL_OPERATION_TO_EVENT_TYPE[parsed.operation];
     if (mappedEventType === undefined || mappedEventType !== envelope.event.event_type) {
       return {
@@ -766,6 +1038,29 @@ export class AuditConsumer {
     };
   }
 
+  private async emitProducerSignatureRejected(
+    envelope: CriticalEventEnvelope,
+    reason: string,
+  ): Promise<void> {
+    this.stats.producerSignatureRejections += 1;
+    await this.sink.append(
+      CASTLE_WALL_AUDIT_LAYER,
+      "producer_signature_rejected",
+      envelope.event.fortress_id ?? "unknown",
+      {
+        reason,
+        event_type: envelope.event.event_type,
+        seq: envelope.event.details.seq,
+      },
+      "failure",
+    );
+    await this.sink.flush();
+    // Fail closed: do NOT persist as enforcement evidence, do NOT advance the
+    // chain. We DO ACK so the daemon stops re-delivering a packet we have
+    // permanently refused; the refusal is durably recorded above for audit.
+    await this.tryAck(envelope, "producer_signature_rejected");
+  }
+
   private async emitVerificationFailure(
     reason: string,
     event: CastleWallAuditEvent
@@ -834,10 +1129,18 @@ type SignatureOutcome =
 
 /**
  * Map from the daemon's WAL `operation` tag to the consumer's `event_type` for
- * the enforcement-evidence verdicts. Mirrors `operation_for_verdict` in the
- * daemon (`castle-wall-daemon/src/policy.rs`). Used to corroborate that a
- * signed WAL body describes the same enforcement outcome as the event we
- * persist, across the two distinct JSON shapes.
+ * the enforcement-evidence verdicts. Used to corroborate that a signed WAL
+ * body describes the same enforcement outcome as the event we persist, across
+ * the two distinct JSON shapes.
+ *
+ * COVERAGE CONTRACT: this map must list EVERY operation any producer signs
+ * into `ingestCritical` — must match `operation_for_verdict` in
+ * `castle-wall-daemon/src/policy.rs` and the flow-decision operations in
+ * `castle-wall-macos/Sources/CastleWallFilter/AuditProducerSigning.swift`.
+ * The strict check in `evaluateProducerSignature` REJECTS any signed body
+ * whose operation is absent here, so a producer that starts signing a new
+ * operation without a row added in the same change is refused fail-closed
+ * (loud in CI/drills), never accepted un-corroborated.
  */
 const WAL_OPERATION_TO_EVENT_TYPE: Readonly<Record<string, CastleWallEventType>> =
   Object.freeze({
@@ -886,7 +1189,11 @@ function parseSignedBody(
 /** Build the `details` payload from an event, omitting redundant top-level fields. */
 function buildDetailsForEvent(
   envelope: CriticalEventEnvelope,
-  signature: SignatureOutcome
+  signature: SignatureOutcome,
+  chainBasis:
+    | typeof CASTLE_WALL_CHAIN_BASIS_PRODUCER_SIGNED_BODY
+    | typeof CASTLE_WALL_CHAIN_BASIS_EVENT_CANONICAL,
+  chainPriorUnconsumed: boolean,
 ): Record<string, unknown> {
   const { event } = envelope;
   // For a PRODUCER-SIGNED entry the authoritative evidence is the SIGNED BODY,
@@ -944,6 +1251,15 @@ function buildDetailsForEvent(
     }
     out[CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY] =
       CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED;
+    // The chain basis is recorded as a STORED FACT so the startup anchor
+    // restore can decide "was this written under the old basis" without
+    // inferring from in-memory state (#1096 Q5 defect).
+    out[CASTLE_WALL_CHAIN_BASIS_DETAIL_KEY] = chainBasis;
+    if (chainPriorUnconsumed) {
+      // Honesty marker: prior-hash contiguity was not locally assertable for
+      // this hop (subset consumption); see the constant's invariant comment.
+      out[CASTLE_WALL_CHAIN_PRIOR_UNCONSUMED_DETAIL_KEY] = true;
+    }
     out[CASTLE_WALL_AUDIT_PROVENANCE_KEY] = CASTLE_WALL_AUDIT_PROVENANCE_VALUE;
     return out;
   }
@@ -964,6 +1280,7 @@ function buildDetailsForEvent(
   delete out[CASTLE_WALL_PRODUCER_SUBJECT_BINDING_DETAIL_KEY];
   out[CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY] =
     CASTLE_WALL_EVIDENCE_BASIS_CHANNEL_UNSIGNED;
+  out[CASTLE_WALL_CHAIN_BASIS_DETAIL_KEY] = chainBasis;
   // Provenance LAST, so a forged `event.details.cw_source` cannot survive into
   // the stored entry. Consumers reasoning about "actual enforcement" require
   // this marker (see CASTLE_WALL_AUDIT_PROVENANCE_KEY).
@@ -1055,6 +1372,42 @@ function computeCanonicalHash(event: CastleWallAuditEvent): string {
 }
 
 /**
+ * The shared chain basis: `sha256(utf8(eventCanonicalJson))` over the VERBATIM
+ * signed body string. Must byte-match what every producer hashes for its own
+ * `prior_sha256_hex` — `sha256_hex(canonical)` in
+ * `castle-wall-daemon/src/audit.rs` and `sha256Hex(Data(walCanonical.utf8))`
+ * in `castle-wall-macos/.../AuditProducerSigning.swift`. Never re-canonicalize
+ * here: re-encoding could drift the bytes and fork the chain.
+ */
+function computeSignedBodyHash(eventCanonicalJson: string): string {
+  return createHash("sha256").update(eventCanonicalJson, "utf8").digest("hex");
+}
+
+/**
+ * Select the chain basis for one event. A VERIFIED producer signature pins the
+ * chain to the signed body's hash (signature-bound by construction: `seq` and
+ * `prior_sha256_hex` live inside the signed bytes). Anything else keeps the
+ * legacy consumer-local event hash on the channel-authenticated basis.
+ */
+function chainBasisFor(
+  canonicalHash: string,
+  signature: SignatureOutcome,
+): {
+  hash: string;
+  kind:
+    | typeof CASTLE_WALL_CHAIN_BASIS_PRODUCER_SIGNED_BODY
+    | typeof CASTLE_WALL_CHAIN_BASIS_EVENT_CANONICAL;
+} {
+  if (signature.kind === "verified") {
+    return {
+      hash: computeSignedBodyHash(signature.eventCanonicalJson),
+      kind: CASTLE_WALL_CHAIN_BASIS_PRODUCER_SIGNED_BODY,
+    };
+  }
+  return { hash: canonicalHash, kind: CASTLE_WALL_CHAIN_BASIS_EVENT_CANONICAL };
+}
+
+/**
  * Canonicalize a value for a DIAGNOSTIC audit field only - e.g. the
  * `event_canonical` detail attached to a rejection entry - never for the WAL
  * hash chain. Mesh `canonicalize()` (#924) throws on values it cannot
@@ -1074,4 +1427,91 @@ function safeCanonicalizeForDiagnostic(value: unknown): string {
   } catch (err) {
     return `<uncanonicalizable: ${err instanceof Error ? err.message : String(err)}>`;
   }
+}
+
+/**
+ * Minimal read surface the anchor restore needs from the persisted audit log.
+ * `AuditLog.query` matches structurally (same pattern as `AuditSink` /
+ * `AuditLog.append`).
+ */
+export interface ChainAnchorAuditLogReader {
+  query(options: { layer: "l1"; limit?: number }): Promise<{
+    entries: Array<{
+      operation: string;
+      identity_id: string;
+      details?: Record<string, unknown>;
+    }>;
+    total: number;
+    integrity_findings: ReadonlyArray<unknown>;
+  }>;
+}
+
+/**
+ * Scan bound for the anchor lookup: effectively "the whole log". The last
+ * chain-participating entry may sit arbitrarily deep behind non-chain entries
+ * (metric batches, rejection diagnostics, lifecycle records), and a bounded
+ * page that missed it would silently degrade the restore to a genesis
+ * bootstrap — reopening the very wire-trust hole the restore closes (rule 5).
+ * `query` slices from the tail in memory, so the large limit costs nothing
+ * beyond the read it already does.
+ */
+const CHAIN_ANCHOR_SCAN_LIMIT = Number.MAX_SAFE_INTEGER;
+
+/**
+ * Build a {@link ChainAnchorSource} over the fortress's own persisted audit
+ * log. Finds the most recent ACCEPTED chain-participating castle-wall entry
+ * (consumer provenance marker + chain bookkeeping fields present) and returns
+ * its persisted signed canonical body + recorded chain basis. Refuses to
+ * anchor (kind `unavailable`) when the log itself reports integrity findings:
+ * damaged local history must latch the loud stuck state, never silently seed
+ * a fresh chain.
+ */
+export function buildChainAnchorSourceFromAuditLog(
+  log: ChainAnchorAuditLogReader,
+): ChainAnchorSource {
+  return async () => {
+    const result = await log.query({
+      layer: CASTLE_WALL_AUDIT_LAYER,
+      limit: CHAIN_ANCHOR_SCAN_LIMIT,
+    });
+    if (result.integrity_findings.length > 0) {
+      return { kind: "unavailable", reason: "audit_log_integrity_findings" };
+    }
+    for (let i = result.entries.length - 1; i >= 0; i -= 1) {
+      const entry = result.entries[i]!;
+      const details = entry.details;
+      if (details === undefined || details === null) continue;
+      // Only entries this consumer accepted participate in the chain: the
+      // provenance marker is stamped by the consumer at persist time, and the
+      // operation must be an accepted critical event type (rejection and
+      // diagnostic records use non-accepted operation names).
+      if (
+        details[CASTLE_WALL_AUDIT_PROVENANCE_KEY] !==
+        CASTLE_WALL_AUDIT_PROVENANCE_VALUE
+      ) {
+        continue;
+      }
+      if (!ACCEPTED_EVENT_TYPES.has(entry.operation as CastleWallEventType)) {
+        continue;
+      }
+      const seq = details[CASTLE_WALL_WAL_SEQUENCE_DETAIL_KEY];
+      const hasPrior = Object.prototype.hasOwnProperty.call(
+        details,
+        CASTLE_WALL_WAL_PRIOR_SHA256_HEX_DETAIL_KEY,
+      );
+      // Metric batches and other non-chain accepted entries carry no chain
+      // bookkeeping; they cannot anchor the chain.
+      if (typeof seq !== "number" || !hasPrior) continue;
+      const signed = details[CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY];
+      const basis = details[CASTLE_WALL_CHAIN_BASIS_DETAIL_KEY];
+      return {
+        kind: "persisted",
+        seq,
+        signedCanonicalJson: typeof signed === "string" ? signed : null,
+        chainBasis: typeof basis === "string" ? basis : null,
+        identityId: entry.identity_id,
+      };
+    }
+    return null;
+  };
 }

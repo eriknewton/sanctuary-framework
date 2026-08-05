@@ -32,7 +32,7 @@
  */
 
 import { startCastleWall, type CastleWallLifecycleHandle } from "./lifecycle.js";
-import type { AuditSink } from "./audit-consumer.js";
+import type { AuditSink, ChainAnchorSource } from "./audit-consumer.js";
 import type { ClientKeyMaterial } from "./ipc-client.js";
 import {
   launchLinuxCastleWallDaemon,
@@ -93,6 +93,13 @@ export interface ActivateLinuxProducerSignedInput {
   key: ClientKeyMaterial;
   /** The audit sink (typically the fortress `AuditLog`). */
   auditSink: AuditSink;
+  /**
+   * Reader for the consumer's own last persisted chain position (wire it with
+   * `buildChainAnchorSourceFromAuditLog` over the same audit log `auditSink`
+   * appends to). Enables the startup LOCAL anchor restore + one-time basis
+   * migration; omitted → legacy null-anchor bootstrap.
+   */
+  chainAnchorSource?: ChainAnchorSource;
   /** Platform override (tests). Defaults to `process.platform`. */
   platform?: NodeJS.Platform;
   /** Explicit opt-in override; when omitted the env flag governs. */
@@ -313,6 +320,9 @@ export async function activateLinuxProducerSignedCastleWall(
       auditSink: input.auditSink,
       fortressStoragePath: input.fortressStoragePath,
       producerKeyLoadOptions: { platform: "linux" },
+      ...(input.chainAnchorSource !== undefined
+        ? { chainAnchorSource: input.chainAnchorSource }
+        : {}),
     });
   } catch (err) {
     // Best-effort close the transport we opened before failing closed.

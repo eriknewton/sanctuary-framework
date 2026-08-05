@@ -3587,6 +3587,11 @@ export async function runWrap(
         fortressStoragePath: storagePath,
         key,
         auditSink: auditLog,
+        // Startup LOCAL anchor restore (+ one-time basis migration): the
+        // consumer re-anchors from entries it persisted in this same log,
+        // never from the wire.
+        chainAnchorSource:
+          runtime.buildChainAnchorSourceFromAuditLog(auditLog),
       });
       // The gate returns activated:false only when NOT opted in / not Linux -
       // neither is possible here (we just checked both), so an inactive outcome

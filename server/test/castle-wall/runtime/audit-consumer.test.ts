@@ -254,7 +254,7 @@ describe("castle-wall/runtime/audit-consumer : ingestCritical", () => {
 
     expect(sink.entries.length).toBe(2);
     expect(consumer.getWalChainState().lastAckedSeq).toBe(6);
-    expect(consumer.getWalChainState().lastEventCanonicalHash).toBe(eventHash(eventSeq6));
+    expect(consumer.getWalChainState().lastEventChainHash).toBe(eventHash(eventSeq6));
   });
 
   it("does not ACK or advance chain when critical persistence fails (#104)", async () => {
@@ -274,7 +274,7 @@ describe("castle-wall/runtime/audit-consumer : ingestCritical", () => {
 
     expect(acked).toBe(false);
     expect(faultingConsumer.getWalChainState().lastAckedSeq).toBeNull();
-    expect(faultingConsumer.getWalChainState().lastEventCanonicalHash).toBeNull();
+    expect(faultingConsumer.getWalChainState().lastEventChainHash).toBeNull();
     expect(faultingConsumer.getStats().acceptedCriticalEvents).toBe(0);
     expect(faultingConsumer.getStats().persistenceFailures).toBe(1);
     expect(faultingSink.entries).toHaveLength(1);
@@ -298,7 +298,7 @@ describe("castle-wall/runtime/audit-consumer : ingestCritical", () => {
     ).rejects.toThrow("audit disk unavailable");
     // Anchor never advanced: no durable seq 1.
     expect(faultingConsumer.getWalChainState().lastAckedSeq).toBeNull();
-    expect(faultingConsumer.getWalChainState().lastEventCanonicalHash).toBeNull();
+    expect(faultingConsumer.getWalChainState().lastEventChainHash).toBeNull();
 
     // seq 2 chains off the (unpersisted) seq 1 → non-null prior-hash in the
     // still-bootstrap state → MUST be refused, MUST NOT ack.
@@ -344,7 +344,7 @@ describe("castle-wall/runtime/audit-consumer : ingestCritical", () => {
     expect(consumer.getStats().ackFailures).toBe(1);
     // State updated even though ACK failed: flush completed before ACK.
     expect(consumer.getWalChainState().lastAckedSeq).toBe(5);
-    expect(consumer.getWalChainState().lastEventCanonicalHash).toBe(
+    expect(consumer.getWalChainState().lastEventChainHash).toBe(
       eventHash(eventSeq5)
     );
   });
@@ -474,7 +474,7 @@ describe("castle-wall/runtime/audit-consumer : ingestCritical", () => {
     expect(consumer.getStats().acceptedCriticalEvents).toBe(0);
     expect(consumer.getStats().rejectedEvents).toBe(1);
     expect(consumer.getWalChainState().lastAckedSeq).toBeNull();
-    expect(consumer.getWalChainState().lastEventCanonicalHash).toBeNull();
+    expect(consumer.getWalChainState().lastEventChainHash).toBeNull();
     // Recorded as a rejection, not silently dropped or accepted as evidence.
     const rejected = sink.entries.find((e) => e.operation === "audit_event_rejected");
     expect(rejected).toBeDefined();
@@ -538,7 +538,7 @@ describe("castle-wall/runtime/audit-consumer : ingestCritical", () => {
     await consumer.ingestCritical({ event: genuine, ack: async () => {} });
     expect(consumer.getStats().acceptedCriticalEvents).toBe(1);
     expect(consumer.getWalChainState().lastAckedSeq).toBe(5);
-    expect(consumer.getWalChainState().lastEventCanonicalHash).toBe(eventHash(genuine));
+    expect(consumer.getWalChainState().lastEventChainHash).toBe(eventHash(genuine));
   });
 });
 

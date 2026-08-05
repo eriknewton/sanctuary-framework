@@ -53,6 +53,7 @@ import {
   AuditChainError,
   AuditConsumer,
   type AuditSink,
+  type ChainAnchorSource,
   type CriticalEventEnvelope,
 } from "./audit-consumer.js";
 import { protectionSubjectFromMacOSAuditToken } from "../subject-binding.js";
@@ -156,6 +157,15 @@ export interface MacOSFlowEventConsumerInput {
    * channel-authenticated floor.
    */
   pinnedProducerKeyB64url?: string | null;
+  /**
+   * Reader for the flow consumer's own last persisted chain position (wire it
+   * with `buildChainAnchorSourceFromAuditLog` over the same audit log
+   * `auditSink` appends to). With a pinned producer key, the producer-signed
+   * flow chain restores its anchor from LOCAL persisted history before the
+   * first flow decision — including the one-time old-basis migration. Omitting
+   * it keeps the legacy null-anchor bootstrap.
+   */
+  chainAnchorSource?: ChainAnchorSource;
   now?: () => number;
   /**
    * Optional decided-vs-emitted divergence feed (Slice M emission-liveness
@@ -241,6 +251,15 @@ export class MacOSFlowEventConsumer {
         ? new AuditConsumer(input.auditSink, undefined, {
             pinnedProducerKeyB64url: this.pinnedProducerKeyB64url,
             now: this.now,
+            // The extension signs flow decisions AND availability reports into
+            // ONE shared seq/prior chain, but only flow decisions arrive here
+            // — subset continuity (signature + strict seq monotonicity), never
+            // complete-chain prior-hash contiguity, which is unsatisfiable for
+            // this consumer by construction.
+            chainContinuity: "producer_subset",
+            ...(input.chainAnchorSource !== undefined
+              ? { chainAnchorSource: input.chainAnchorSource }
+              : {}),
           })
         : null;
   }
