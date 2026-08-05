@@ -27,20 +27,34 @@ apart can run two different builds of Sanctuary against the same fortress.
 ### Global install
 
 ```bash
-npm install -g @sanctuary-framework/mcp-server@0.8.0
+npm install -g @sanctuary-framework/mcp-server
 ```
 
 Faster startup (no network on launch), but version pinning is manual. You must remember to update.
+
+Failure mode: pinning a version here by hand is how a deployment ends up years behind. This
+guide deliberately names no version number, because a number written into a document goes stale
+silently and the operator has no way to tell. An old pin does not look broken from the outside;
+the server starts, the dashboard loads, and the enforcement, audit-chain, and custody behavior
+you read about elsewhere is simply absent. Run `npm ls -g @sanctuary-framework/mcp-server`
+against `npm view @sanctuary-framework/mcp-server version` when you want to know where you are.
 
 ### Local project install (recommended for production)
 
 ```bash
 mkdir sanctuary && cd sanctuary
 npm init -y
-npm install @sanctuary-framework/mcp-server@0.8.0 --save-exact
+npm install @sanctuary-framework/mcp-server --save-exact
 ```
 
-Pin an exact version. No network on restart. Update deliberately with `npm update`. This is the recommended approach for persistent services.
+`--save-exact` resolves the current release and writes that exact version into `package.json`,
+so the pin is created at install time from what npm actually served rather than copied out of a
+document. No network on restart. Update deliberately with `npm update`. This is the recommended
+approach for persistent services.
+
+Failure mode: if you instead type a version number taken from a guide, you get whatever was
+current when that guide was written, and `--save-exact` then holds you there. Check the pin npm
+wrote (`grep sanctuary-framework package.json`) before you deploy.
 
 ## Passphrase Management
 
