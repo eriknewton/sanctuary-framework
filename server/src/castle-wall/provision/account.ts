@@ -83,16 +83,24 @@ export const SAFE_SERVICE_ACCOUNT_RE = /^[a-z_][a-z0-9._-]{0,63}$/;
  * signer helpers run as root. Nothing is known about any other host.
  *
  * KNOWN BEHAVIOR CHANGE, and it is a refusal, not a migration: a plist naming
- * `admin` -- hand-written, or re-rendered from a stale persisted
- * `gateAccountName` -- now throws at render time where it previously
- * rendered. Failure mode from the outside: an install or re-arm that used to
+ * `admin` -- hand-written, or re-rendered from any path that supplies an
+ * operator-chosen account name -- now throws at render time where it
+ * previously rendered. (An earlier draft of this note claimed a stale
+ * PERSISTED `gateAccountName` field was such a path; a re-gate found no
+ * reader for one. `arming-wiring.ts` holds the name in memory, and boot
+ * derives the gate account from the marker, so the persisted-field route
+ * named here did not exist.) Failure mode from the outside: an install or re-arm that used to
  * complete stops with a "refusing to render ... privileged account" error,
  * which is the intended outcome and is loud, never a silent downgrade.
  *
  * EXPORTED so the structural guard can iterate the real runtime set and drive
  * every member through each refusal site. Production code inside this module
  * uses it directly; the two daemons keep their own copies on purpose (above).
- * Typed `ReadonlySet` so no consumer can add or remove a member at runtime.
+ * Typed `ReadonlySet`, which is a COMPILE-TIME constraint only: the value is
+ * a normal mutable `Set`, so a determined consumer could still mutate it at
+ * runtime. It is not re-exported through the barrel, and the structural guard
+ * is its only importer outside this module, which is what actually bounds the
+ * exposure.
  */
 export const RESERVED_ACCOUNT_NAMES: ReadonlySet<string> = new Set([
   "root",
