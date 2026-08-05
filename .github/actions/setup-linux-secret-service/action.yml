@@ -112,3 +112,16 @@ runs:
           exit 1
         fi
         secret-tool clear service smoke-svc account smoke-acct
+
+        # Declare the keyring disposable, AFTER the smoke test proved this
+        # action's own backend is the one answering on the bus. Read by
+        # server/test/keychain-linux-real-backend-integration.test.ts, which
+        # runs only when this is set and then removes the in-memory
+        # credential store so it shells out to the real secret-tool. Keep the
+        # name in sync with DISPOSABLE_KEYRING_ENV in that file.
+        #
+        # Failure mode: if this line is dropped, nothing errors. The
+        # integration file simply skips, the suite stays green, and the loss
+        # shows up only as a lower passing count that the exact-match floor in
+        # .github/workflows/test-baseline-guard.yml rejects.
+        echo "SANCTUARY_TEST_DISPOSABLE_KEYRING=1" >> "$GITHUB_ENV"

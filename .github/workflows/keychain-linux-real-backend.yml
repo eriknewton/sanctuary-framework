@@ -269,5 +269,31 @@ jobs:
             secret-tool clear service smoke-svc account smoke-acct
             echo "=== smoke test passed ==="
 
-            cd server && npm test -- keychain-linux-real-backend-integration.test.ts
+            # Declare the keyring disposable, only now that the smoke test has
+            # proved the backend this script started is the one on the bus.
+            # server/test/keychain-linux-real-backend-integration.test.ts skips
+            # unless this is set, and when set it removes the in-memory
+            # credential store installed for every test so the production code
+            # shells out to the real secret-tool. Keep the name in sync with
+            # DISPOSABLE_KEYRING_ENV in that file.
+            #
+            # Failure mode: drop this and the job still exits 0 while running
+            # zero real-backend assertions, because a fully skipped suite is a
+            # passing suite. The guard below is what makes that loud here.
+            export SANCTUARY_TEST_DISPOSABLE_KEYRING=1
+
+            cd server
+            npm test -- keychain-linux-real-backend-integration.test.ts 2>&1 \
+              | tee /tmp/real-backend-vitest.log
+            status="${PIPESTATUS[0]}"
+            if [ "$status" != "0" ]; then
+              exit "$status"
+            fi
+            # A skipped suite exits 0, so the point of this workflow can
+            # evaporate silently. Require that the real-backend cases actually
+            # ran: vitest prints "Tests  N passed" only for executed tests.
+            if ! grep -qE "Tests[[:space:]]+[0-9]+ passed" /tmp/real-backend-vitest.log; then
+              echo "real-backend suite ran ZERO tests: the skip guard in keychain-linux-real-backend-integration.test.ts was not satisfied (linux + secret-tool + DBUS_SESSION_BUS_ADDRESS + SANCTUARY_TEST_DISPOSABLE_KEYRING=1)" >&2
+              exit 1
+            fi
           '

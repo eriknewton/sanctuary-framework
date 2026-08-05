@@ -9,7 +9,9 @@
  * finish inside 30 minutes with zero code change.
  */
 
-import { describe, it, expect, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
 import {
   execKeychain,
@@ -54,6 +56,14 @@ const memoryFake: KeychainExec = async (cmd, args, input) => {
   }
   return { stdout: "", stderr: "unsupported", code: 1 };
 };
+
+// Cleared on BOTH sides of every case. Clearing only afterwards would leave the
+// refusal cases below at the mercy of the ambient environment: a CI job that
+// exported the opt-in would make them pass while asserting nothing, which is
+// the same fail-open shape this whole chokepoint exists to prevent.
+beforeEach(() => {
+  delete process.env[ALLOW_REAL_KEYCHAIN_ENV];
+});
 
 afterEach(() => {
   delete process.env[ALLOW_REAL_KEYCHAIN_ENV];
@@ -113,5 +123,46 @@ describe("the default in-memory store serves a real custody round-trip", () => {
     );
     expect(readBack).not.toBeNull();
     expect(Array.from(readBack!)).toEqual(Array.from(created!));
+  });
+});
+
+describe("the one file that opts out of the store still opts out", () => {
+  /**
+   * The in-memory store is installed for EVERY test file, which is wrong for
+   * exactly one of them: the Linux real-backend integration test exists to
+   * exercise the genuine `secret-tool` shell-out. Served by the store it keeps
+   * passing while proving nothing, and its degrade case actively lies, because
+   * an in-memory store answers the same whether or not D-Bus is reachable.
+   *
+   * A comment saying "that file opts out" is a claim, not a check. This is the
+   * check: delete the opt-out and this fails, in ordinary CI, on every
+   * platform, without needing a Secret Service to be present.
+   */
+  const source = readFileSync(
+    fileURLToPath(
+      new URL("../keychain-linux-real-backend-integration.test.ts", import.meta.url)
+    ),
+    "utf8"
+  );
+
+  it("removes the injected store, which is what actually restores the spawn path", () => {
+    // `execKeychain` consults the store before the opt-in env var, so setting
+    // the env var without this line leaves the store serving every call.
+    expect(source).toContain("setKeychainExec(null)");
+  });
+
+  it("sets the opt-in env var, without which the guard refuses to spawn", () => {
+    expect(source).toContain("ALLOW_REAL_KEYCHAIN_ENV");
+  });
+
+  it("puts the store back afterwards so the removal cannot outlive that file", () => {
+    expect(source).toContain("installInMemoryKeychainStore()");
+  });
+
+  it("runs only against a keyring CI declared disposable, never a developer's own", () => {
+    // secret-tool + a session bus are both present on an ordinary Linux
+    // desktop; this third condition is the only one that distinguishes a
+    // throwaway CI keyring from the operator's real one.
+    expect(source).toContain("SANCTUARY_TEST_DISPOSABLE_KEYRING");
   });
 });

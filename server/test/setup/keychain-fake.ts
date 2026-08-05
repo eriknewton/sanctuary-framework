@@ -12,6 +12,13 @@
  *
  * The store is per-worker-process and cleared before each test, so tests cannot
  * leak credentials into each other.
+ *
+ * ONE FILE OPTS OUT: `test/keychain-linux-real-backend-integration.test.ts`
+ * exists to exercise the genuine `secret-tool` shell-out, so serving it from
+ * this fake would defeat its purpose - and worse, would make a DEAD Secret
+ * Service look alive, because the fake answers happily no matter what
+ * DBUS_SESSION_BUS_ADDRESS points at. That file calls
+ * {@link installInMemoryKeychainStore} in its `afterAll` to put the fake back.
  */
 
 import { beforeEach } from "vitest";
@@ -165,7 +172,17 @@ const fakeExec: KeychainExec = async (cmd, args, input) => {
   return { stdout: "", stderr: `unsupported command '${cmd}' in test keychain fake`, code: 1 };
 };
 
-setKeychainExec(fakeExec);
+/**
+ * (Re)install the in-memory store as the credential-CLI implementation. Called
+ * once at setup time for every test file, and again by any file that
+ * deliberately removed it, so the removal cannot outlive the suite that asked
+ * for it even if that suite fails or times out.
+ */
+export function installInMemoryKeychainStore(): void {
+  setKeychainExec(fakeExec);
+}
+
+installInMemoryKeychainStore();
 
 beforeEach(() => {
   store.clear();
