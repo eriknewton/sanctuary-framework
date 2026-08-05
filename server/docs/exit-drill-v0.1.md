@@ -137,20 +137,17 @@ Out of scope for v0.1:
    against such a bundle and the import fails closed with
    `SOURCE_PASSPHRASE_UNSUPPORTED`, pointing you at the re-key key.
 
-   **Which path a given bundle needs is observable, so check rather than guess.**
-   Open `artifacts/encrypted_state.json` in the bundle:
+   **Which path you need is decided by what you are holding, not by anything you
+   have to inspect in the bundle.** The export mints the bundle re-key key and the
+   bundle's re-key material together, in one step, so the two always travel as a
+   pair:
 
-   ```bash
-   grep -o 'source_key_derivation' ./sanctuary-exit-bundle/artifacts/encrypted_state.json
-   ```
-
-   - **No match** (verified on a fresh envelope-custody export): the bundle carries
-     `source_custody` only. Use `--source-recovery-key`, as above.
-   - **Match**: the source fortress still holds the pre-envelope `key-params`
-     marker, which is the case for a fortress that migrated into envelope custody
-     rather than being created under it. Such a bundle accepts either credential,
-     and the passphrase form is the one to use when the export's re-key key was
-     never captured:
+   - **You have a re-key key from step 2.** Use `--source-recovery-key`, as above.
+     Every bundle a current `sanctuary exit export` produces with state in it takes
+     this path.
+   - **The export never printed one**, because it came from a Sanctuary that
+     predates the re-key key. That is a legacy pre-envelope bundle, and the
+     passphrase form is its path:
 
      ```bash
      read -s SOURCE_SANCTUARY_PASSPHRASE
@@ -164,9 +161,12 @@ Out of scope for v0.1:
        --destination-identity-id "$DESTINATION_SIGNER_ID"
      ```
 
-   Every bundle a current `sanctuary exit export` produces with state in it carries
-   `source_custody`, so `--source-recovery-key` is the path that always works when
-   you still have the key from step 2.
+   Start with `--source-recovery-key` whenever you have a key to supply. If the
+   bundle turns out to be legacy, the CLI says so and you fall back to the form
+   above. Do not try to decide this by reading fields out of
+   `artifacts/encrypted_state.json`: the file has no field that reliably answers
+   the question, and guessing wrong sends you down the passphrase path with the
+   source host possibly already decommissioned.
 
    `--import-state` is required: the CLI rejects the source-credential flags
    without it (exit code 2), because the source credentials exist only to decrypt
@@ -193,7 +193,7 @@ Out of scope for v0.1:
    | `rekeyed` | state was re-keyed under the destination master | the good case; check `state_imported_keys` |
    | `not_requested` | **the bundle itself carried no state entries**, so there was never anything to re-key | `--state-namespace` omitted at export (step 2). This is a defect in the bundle, and no import flag can repair it |
    | `staged_requires_source_key` | **entries arrived and stayed encrypted**, because no source master key was resolved | `--activate` run without `--import-state`, so no source credential reached the re-key step. The entries are on the destination and still locked to the source master |
-   | `skipped_no_destination_signer` | entries arrived and decrypted, then every one was skipped for want of a signer to re-sign them under | `--destination-identity-id` omitted and the destination fortress has no default identity |
+   | `skipped_no_destination_signer` | **no decryption was attempted at all.** The signer is resolved before the entry loop starts, so the run stopped there and every entry was counted as skipped | `--destination-identity-id` omitted while the destination fortress has no default identity, **or** supplied with an id that does not exist on the destination |
 
    The first two are the pair that get confused, and they call for opposite
    responses. `not_requested` means go back to the source machine and re-export
@@ -207,6 +207,13 @@ Out of scope for v0.1:
    credential without `--import-state`, and `--import-state` without a source
    credential, each at exit 2 before touching anything. The only route to that
    status is leaving `--import-state` off entirely.
+
+   `skipped_no_destination_signer` carries a trap of its own for the drill record:
+   because it returns before any decryption is attempted, **it tells you nothing
+   about whether your source credential is good.** A run that ends here leaves the
+   credential unproven. Fix the signer, re-run, and expect the credential to be
+   tested for the first time on that second run. Do not record the first run as
+   evidence that the source key worked.
 
    A credential that is present but wrong is the safe case: it fails closed and
    loudly, with `SOURCE_CREDENTIAL_INVALID` on the re-key-key path or
