@@ -1,5 +1,5 @@
 /**
- * Register C6 (Mini2, 2026-08-06): a live append read as tail truncation.
+ * Register C6 (Mini2, 2026-08-05): a live append read as tail truncation.
  *
  * On the production host every `flow_decision_recorded` was refused with
  * `audit head anchor floor N exceeds highest surviving sequence N-1 (tail

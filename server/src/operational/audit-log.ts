@@ -2239,6 +2239,11 @@ export class AuditLog {
       const encryptedPayloadBytes = toBase64url(encryptedBytes);
       await this.withAuditWriteLock(async (signal) => {
         this.assertAuditWriteLockActive(signal);
+        // LOCK-HOLD COST: on this process's FIRST append this is a full
+        // load-and-verify pass held inside the cross-process write lock, and the
+        // read-consistency retry can make it two. See the KNOWN LATENCY EXPOSURE
+        // note in `loadPersistedEntriesWithReadConsistency` for the measured
+        // bound and why it is accepted rather than mitigated here.
         await this.ensureLoaded();
         this.assertAuditWriteLockActive(signal);
         await this.freshenChainStateFromDisk();
@@ -2275,10 +2280,13 @@ export class AuditLog {
           this.assertAuditWriteLockActive(signal);
           // ORDERING INVARIANT (must match the anchor-before-listing read order
           // in `loadPersistedEntries`): the entry file is durably on disk BEFORE
-          // the anchor claims its sequence, so an anchor floor of N always
-          // implies entry N already exists. A reader that samples the anchor
-          // AFTER listing the entries breaks that implication (an append can
+          // the anchor claims its sequence, so a floor of N is only ever
+          // published after entry N was written. A reader that samples the
+          // anchor AFTER listing the entries loses that ordering (an append can
           // land in between) and reports a live append as tail truncation.
+          // The converse is deliberately NOT claimed: a floor of N does not
+          // prove entry N still exists at read time, and an N that has since
+          // been deleted is precisely the truncation `verifyHeadAnchor` catches.
           await this.writeHeadAnchor(sequence, entryHash);
           this.assertAuditWriteLockActive(signal);
           // F2 Finding 1: the FIRST time this operator instance persists a
@@ -3025,12 +3033,21 @@ export class AuditLog {
    * Adjudicate the head anchor against the surviving chain.
    *
    * `anchor` is read by the CALLER, before it lists the entries, and handed in
-   * here (it is never re-read at this point in the pass). That ordering is the
-   * anti-false-truncation invariant: the append path writes the entry file
-   * before the anchor that names it (see `persistChainedEntry`), so an anchor
-   * sampled BEFORE the listing can only name entries the listing also sees.
-   * Sampling it after the listing admits an append that landed in between and
-   * turns a live, healthy writer into a `tail_anchor_invalid` tamper verdict.
+   * here (it is never re-read at this point in the pass). State the property
+   * that ordering buys exactly, because it is narrower than "the listing also
+   * sees it": on the LEGITIMATE append path the entry file is written before the
+   * anchor that names it (see `persistChainedEntry`), so an anchor sampled
+   * before the listing can only name an entry that was already on disk. It does
+   * NOT guarantee the later listing still contains that entry — an adversarial
+   * delete or rollback between the two reads removes it — and that case must
+   * fail, not be excused: an entry the anchor names but the listing lacks leaves
+   * `highestChainedSeq < anchor.highest_sequence`, which is reported as
+   * `tail_anchor_invalid` below and fails the load closed.
+   *
+   * So the early sample removes only the FALSE verdict. Sampling AFTER the
+   * listing instead admits an append that landed mid-pass, raising a floor the
+   * already-taken listing could not have reached, and turns a live, healthy
+   * writer into that same tamper verdict.
    */
   private async verifyHeadAnchor(
     anchor: HeadAnchorReadResult,
@@ -3879,12 +3896,47 @@ export class AuditLog {
       }
       // The deadline is checked only AFTER a baseline exists, so the one
       // mandatory retry above is real work rather than a claim. Checking it
-      // first (the pre-2026-08-06 order) silently deleted that retry on any
+      // first (the pre-2026-08-05 order) silently deleted that retry on any
       // store where a SINGLE pass outlives the whole budget, which is the
       // normal case at scale: one full decrypt+verify pass costs 11-30s
       // on a 10k-entry chain (see the #714 note on the eager-read backstop) and
       // the budget is 2s. Every transient tear on a large log therefore became
       // a hard tamper verdict on the first look, with no second look at all.
+      //
+      // KNOWN LATENCY EXPOSURE (availability, not tamper weakening; accepted
+      // 2026-08-05, unmitigated on purpose). In the case this change is about —
+      // one pass outliving the 2s budget — making the retry mandatory costs
+      // exactly ONE extra full pass: the second pass establishes the baseline
+      // with the deadline already blown, so this check ends the loop. (Further
+      // passes remain possible in general, but only while the store is
+      // demonstrably mutating AND the whole loop is still inside the budget,
+      // i.e. only when passes are cheap.) But `persistChainedEntry`
+      // calls `ensureLoaded()` INSIDE `withAuditWriteLock`, so on an appending
+      // process's FIRST load that extra pass is paid while the cross-process
+      // write lock is held.
+      //
+      // The size of that extra pass, measured rather than assumed. A cold full
+      // pass is LINEAR in entry count, not quadratic: timed on this branch
+      // (macOS, ~250-byte entries) at 250/500/1000/2000 entries the pass took
+      // 28/50/95/193ms, a flat ~0.1ms per entry. The per-entry constant, though,
+      // tracks PAYLOAD size, so it is not one number: the #714 profile (10k
+      // entries at ~40MB, so ~4KB each) measured 11-30s per pass, i.e. ~1.1-3ms
+      // per entry, ~10-30x the small-entry constant above. At the ~166k entries
+      // the register-C6 production host carries, the extra pass is therefore
+      // ~16s of decrypt+verify with small entries and ~180-500s with #714-sized
+      // ones. The upper half of that range blows
+      // `DEFAULT_AUDIT_WRITE_LOCK_HOLD_DEADLINE_MS` (30s), which aborts the hold
+      // via the `signal` and runs lock recovery, while concurrent appenders
+      // waiting to acquire give up after `AUDIT_WRITE_LOCK_TIMEOUT_MS` (5s) with
+      // `AuditLockContentionError`. The
+      // trigger is narrow (a first load that both finds a transient tear and
+      // outruns the budget), and every cheap mitigation is worse than the
+      // exposure: skipping the retry when the caller holds the write lock
+      // reinstates exactly the first-look-is-final tamper verdict this change
+      // exists to remove, and scaling the budget by chain size only permits MORE
+      // passes. A real fix is an incremental/cheap re-verify so a second look is
+      // not a second full pass; that is its own design, tracked as follow-up, and
+      // deliberately NOT attempted here.
       if (hadBaseline && Date.now() >= deadline) {
         return; // bounded backstop; surfaced in strict mode by the caller
       }
@@ -4885,14 +4937,20 @@ export class AuditLog {
       this.cachedSealedTip = effectiveSealedTip;
       // ORDERING INVARIANT (must match the entry-then-anchor write order in
       // `persistChainedEntry`): sample the MAC'd head anchor BEFORE listing the
-      // entries. An append writes its entry file first and its anchor second, so
-      // an anchor read at this point can only claim a floor whose entry is
-      // already on disk, hence in the listing taken below. Reading the anchor
-      // after the listing instead (the pre-2026-08-06 order) let an append that
+      // entries. The property this buys is narrow, so claim it precisely: a
+      // LEGITIMATE append writes its entry file first and its anchor second, so
+      // an anchor read here can only name an entry that was already on disk. It
+      // does NOT promise the listing taken below still contains that entry — a
+      // delete or rollback landing between the two reads removes it — and that
+      // must fail closed, which it does: `verifyHeadAnchor` then sees
+      // `highestChainedSeq < anchor.highest_sequence` and raises
+      // `tail_anchor_invalid`.
+      // What the early sample removes is only the FALSE verdict: reading the
+      // anchor after the listing (the pre-2026-08-05 order) let an append that
       // landed mid-pass raise a floor the just-taken listing could not reach,
       // reporting a healthy concurrent writer as tail truncation. Sampling
-      // EARLIER never weakens the guard: a real truncation removes entries the
-      // listing then lacks, and an older floor is still a floor.
+      // EARLIER never weakens the guard, because an append after the sample only
+      // makes the anchor a lower floor, and an older floor is still a floor.
       const headAnchor = await this.loadHeadAnchor(
         findings,
         splitBoundary.status === "valid"
