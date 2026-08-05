@@ -34,10 +34,13 @@
  * (`beforeAll`) and puts it back (`afterAll`).
  *
  * Removing the store is safe ONLY against a throwaway keyring, so the
- * skip guard below additionally requires the CI-provisioned-disposable
- * declaration. On a developer's Linux desktop `secret-tool` and a
- * session bus are both present, and without that third condition this
- * file would shell out to their personal keyring.
+ * skip guard below additionally requires PROOF that the keyring on this
+ * host was provisioned by this CI run: a nonce that round-trips through
+ * the Secret Service on this exact bus. On a developer's Linux desktop
+ * `secret-tool` and a session bus are both present, and without that
+ * fourth condition this file would shell out to their personal keyring.
+ * The predicate lives in `test/support/real-backend-guard.ts` so its
+ * truth table can be tested directly rather than asserted about.
  */
 
 import { describe, it, expect, beforeAll, beforeEach, afterAll, afterEach } from "vitest";
@@ -55,27 +58,14 @@ import {
   OS_KEYRING_LOCATION_LINUX,
 } from "../src/wrap/passphrase.js";
 import {
-  setKeychainExec,
-  ALLOW_REAL_KEYCHAIN_ENV,
-} from "../src/wrap/keychain-exec.js";
-import { installInMemoryKeychainStore } from "./setup/keychain-fake.js";
+  probeDisposableKeyring,
+  shouldSkipRealBackend,
+  enterRealBackendMode,
+  leaveRealBackendMode,
+  type RealBackendModeState,
+} from "./support/real-backend-guard.js";
 
 // ── Skip-unless-real-backend guard ──────────────────────────────────
-
-/**
- * Set by CI once, and only once, a Secret Service backend it provisioned
- * itself has answered a smoke store/lookup/clear. It means "the keyring on
- * this host is disposable: it was created for this run and dies with the
- * runner." Presence of `secret-tool` plus a session bus cannot carry that
- * meaning, because a developer's desktop has both and their keyring is not
- * disposable.
- *
- * MUST MATCH the exported name in
- * `.github/actions/setup-linux-secret-service/action.yml` and in
- * `.github/workflows/keychain-linux-real-backend.yml`. Both sides carry a
- * pointer back here.
- */
-const DISPOSABLE_KEYRING_ENV = "SANCTUARY_TEST_DISPOSABLE_KEYRING";
 
 const isLinux = process.platform === "linux";
 
@@ -90,10 +80,24 @@ const hasSecretTool = (() => {
 
 const hasDbus = !!process.env.DBUS_SESSION_BUS_ADDRESS;
 
-const keyringIsDisposable = process.env[DISPOSABLE_KEYRING_ENV] === "1";
+/**
+ * Only probe the keyring when the cheap conditions already hold: the probe
+ * spawns `secret-tool`, which is pointless on macOS and would be one more
+ * process for every worker on a host that is going to skip anyway.
+ */
+const disposableVerdict =
+  isLinux && hasSecretTool && hasDbus
+    ? probeDisposableKeyring()
+    : { disposable: false, reason: "not a Linux host with a session bus" };
 
-const skipUnlessRealBackend =
-  !isLinux || !hasSecretTool || !hasDbus || !keyringIsDisposable;
+const realBackendProbe = {
+  isLinux,
+  hasSecretTool,
+  hasDbus,
+  keyringIsDisposable: disposableVerdict.disposable,
+};
+
+const skipUnlessRealBackend = shouldSkipRealBackend(realBackendProbe);
 
 // ── Cleanup helper ──────────────────────────────────────────────────
 //
@@ -116,27 +120,19 @@ describe.skipIf(skipUnlessRealBackend)(
   () => {
     let home: string;
     const touchedServices: string[] = [];
-    let savedAllowReal: string | undefined;
+    let realBackendMode: RealBackendModeState;
 
     // Hooks inside a `describe.skipIf`-skipped suite do not run, so the store
-    // stays installed on every host that fails the guard above.
+    // stays installed on every host that fails the guard above. The entry point
+    // re-checks the same predicate anyway and throws rather than removing the
+    // store, so a skip guard that ever drifts fails loudly instead of writing
+    // to somebody's keyring.
     beforeAll(() => {
-      // `execKeychain` consults the installed store BEFORE the opt-in env var,
-      // so removing the store is what actually restores the spawn path; the
-      // env var alone would be inert. Both are required: the store removal to
-      // reach `spawn`, the env var to get past the under-test refusal.
-      savedAllowReal = process.env[ALLOW_REAL_KEYCHAIN_ENV];
-      process.env[ALLOW_REAL_KEYCHAIN_ENV] = "1";
-      setKeychainExec(null);
+      realBackendMode = enterRealBackendMode(realBackendProbe);
     });
 
     afterAll(() => {
-      installInMemoryKeychainStore();
-      if (savedAllowReal !== undefined) {
-        process.env[ALLOW_REAL_KEYCHAIN_ENV] = savedAllowReal;
-      } else {
-        delete process.env[ALLOW_REAL_KEYCHAIN_ENV];
-      }
+      leaveRealBackendMode(realBackendMode);
     });
 
     beforeEach(async () => {

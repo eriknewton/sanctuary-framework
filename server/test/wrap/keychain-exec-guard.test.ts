@@ -10,7 +10,8 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -23,6 +24,16 @@ import {
   getOrCreateKeychainCustodyKey,
   readKeychainCustodyKey,
 } from "../../src/wrap/keychain-custody.js";
+import {
+  credentialStoreIsInstalled,
+  dbusSocketIdentifier,
+  enterRealBackendMode,
+  shouldSkipRealBackend,
+  verifyDisposableKeyring,
+  TOKEN_MAX_AGE_MS,
+  type DisposableKeyringProbe,
+  type RealBackendProbe,
+} from "../support/real-backend-guard.js";
 
 /**
  * The global setup file (test/setup/keychain-fake.ts) installs the in-memory
@@ -126,17 +137,227 @@ describe("the default in-memory store serves a real custody round-trip", () => {
   });
 });
 
-describe("the one file that opts out of the store still opts out", () => {
+/**
+ * The in-memory store is installed for EVERY test file, which is wrong for
+ * exactly one of them: the Linux real-backend integration test exists to
+ * exercise the genuine `secret-tool` shell-out. Served by the store it keeps
+ * passing while proving nothing, and its degrade case actively lies, because an
+ * in-memory store answers the same whether or not D-Bus is reachable.
+ *
+ * These cases used to grep that file for strings like
+ * `SANCTUARY_TEST_DISPOSABLE_KEYRING`. That check would have passed if the
+ * condition were ORed instead of ANDed, checked after the store was already
+ * removed, or read into a variable nobody used. The predicate is now a callable
+ * in `test/support/real-backend-guard.ts` and what follows exercises it.
+ */
+describe("the real-backend skip predicate (truth table, not substrings)", () => {
+  const qualifies: RealBackendProbe = {
+    isLinux: true,
+    hasSecretTool: true,
+    hasDbus: true,
+    keyringIsDisposable: true,
+  };
+
+  it("runs when every condition holds", () => {
+    expect(shouldSkipRealBackend(qualifies)).toBe(false);
+  });
+
+  for (const condition of [
+    "isLinux",
+    "hasSecretTool",
+    "hasDbus",
+    "keyringIsDisposable",
+  ] as const) {
+    it(`skips when ${condition} is false, so the four conditions are ANDed`, () => {
+      expect(shouldSkipRealBackend({ ...qualifies, [condition]: false })).toBe(true);
+    });
+  }
+
+  it("REFUSES to remove the credential store when the run does not qualify", async () => {
+    expect(() =>
+      enterRealBackendMode({ ...qualifies, keyringIsDisposable: false })
+    ).toThrow(/refusing to remove the in-memory credential store/);
+    // The refusal is only worth anything if the store is still serving after it.
+    expect(await credentialStoreIsInstalled()).toBe(true);
+  });
+
+  it("leaves the opt-in env var untouched when it refuses", () => {
+    expect(() => enterRealBackendMode({ ...qualifies, isLinux: false })).toThrow();
+    expect(process.env[ALLOW_REAL_KEYCHAIN_ENV]).toBeUndefined();
+  });
+});
+
+describe("disposable-keyring proof (an env var is a declaration, not evidence)", () => {
+  const NONCE = "a".repeat(64);
+  const BUS = "unix:abstract=/tmp/dbus-Ab3xKq9Z,guid=deadbeef";
+  const NOW = 1_760_000_000_000;
+
+  function validProbe(
+    overrides: Partial<DisposableKeyringProbe> = {}
+  ): DisposableKeyringProbe {
+    return {
+      tokenPath: "/tmp/runner/sanctuary-disposable-keyring.json",
+      busAddress: BUS,
+      readToken: () =>
+        JSON.stringify({ nonce: NONCE, dbusAddress: BUS, createdAtMs: NOW - 1000 }),
+      lookupNonce: () => `${NONCE}\n`,
+      now: NOW,
+      tempRoots: ["/tmp"],
+      ...overrides,
+    };
+  }
+
+  it("accepts a run whose own provisioning step minted the proof", () => {
+    expect(verifyDisposableKeyring(validProbe()).disposable).toBe(true);
+  });
+
+  it("rejects the superseded bare declaration SANCTUARY_TEST_DISPOSABLE_KEYRING=1", () => {
+    // The exact value that used to be sufficient. A stale export of it in a
+    // developer's shell profile is the scenario this whole mechanism exists for.
+    const verdict = verifyDisposableKeyring(validProbe({ tokenPath: "1" }));
+    expect(verdict.disposable).toBe(false);
+    expect(verdict.reason).toMatch(/absolute path/);
+  });
+
+  it("rejects an unset declaration", () => {
+    expect(verifyDisposableKeyring(validProbe({ tokenPath: undefined })).disposable).toBe(
+      false
+    );
+  });
+
+  it("rejects a token file that cannot be read", () => {
+    expect(
+      verifyDisposableKeyring(validProbe({ readToken: () => undefined })).disposable
+    ).toBe(false);
+  });
+
+  it("rejects a malformed token", () => {
+    expect(
+      verifyDisposableKeyring(validProbe({ readToken: () => "{}" })).disposable
+    ).toBe(false);
+  });
+
+  it("rejects a token minted by an earlier run", () => {
+    const verdict = verifyDisposableKeyring(
+      validProbe({ now: NOW + TOKEN_MAX_AGE_MS + 1 })
+    );
+    expect(verdict.disposable).toBe(false);
+    expect(verdict.reason).toMatch(/stale/);
+  });
+
+  it("rejects a token whose recorded bus is not the live one", () => {
+    // A token cannot outlive its bus: this is what kills a stale shell export
+    // pointing at a leftover file.
+    const verdict = verifyDisposableKeyring(
+      validProbe({ busAddress: "unix:abstract=/tmp/dbus-OtherBus,guid=1" })
+    );
+    expect(verdict.disposable).toBe(false);
+    expect(verdict.reason).toMatch(/not the one the provisioning step recorded/);
+  });
+
+  it("rejects a login-session bus, which is what a developer's desktop has", () => {
+    // The structural condition. /run/user/<uid>/bus is a human's session, and
+    // the keyring on it is their real one no matter what any token claims.
+    const desktopBus = "unix:path=/run/user/1000/bus";
+    const verdict = verifyDisposableKeyring(
+      validProbe({
+        busAddress: desktopBus,
+        readToken: () =>
+          JSON.stringify({
+            nonce: NONCE,
+            dbusAddress: desktopBus,
+            createdAtMs: NOW - 1000,
+          }),
+      })
+    );
+    expect(verdict.disposable).toBe(false);
+    expect(verdict.reason).toMatch(/not a throwaway bus/);
+  });
+
+  it("rejects a keyring holding no provisioning nonce", () => {
+    expect(
+      verifyDisposableKeyring(validProbe({ lookupNonce: () => undefined })).disposable
+    ).toBe(false);
+  });
+
+  it("rejects a keyring whose nonce is not this run's", () => {
+    // Proves the round trip is compared, not merely performed: some other
+    // Secret Service answering on this bus must not qualify.
+    const verdict = verifyDisposableKeyring(
+      validProbe({ lookupNonce: () => `${"b".repeat(64)}\n` })
+    );
+    expect(verdict.disposable).toBe(false);
+    expect(verdict.reason).toMatch(/not the one this run provisioned/);
+  });
+
+  it("reads the socket out of both D-Bus address forms", () => {
+    expect(dbusSocketIdentifier(BUS)).toBe("/tmp/dbus-Ab3xKq9Z");
+    expect(dbusSocketIdentifier("unix:path=/run/user/1000/bus")).toBe(
+      "/run/user/1000/bus"
+    );
+  });
+});
+
+describe("nothing else in the tree spawns a credential CLI", () => {
   /**
-   * The in-memory store is installed for EVERY test file, which is wrong for
-   * exactly one of them: the Linux real-backend integration test exists to
-   * exercise the genuine `secret-tool` shell-out. Served by the store it keeps
-   * passing while proving nothing, and its degrade case actively lies, because
-   * an in-memory store answers the same whether or not D-Bus is reachable.
-   *
-   * A comment saying "that file opts out" is a claim, not a check. This is the
-   * check: delete the opt-out and this fails, in ordinary CI, on every
-   * platform, without needing a Secret Service to be present.
+   * The claim this PR makes is a COMPLETENESS claim: every credential-CLI spawn
+   * goes through `execKeychain`. Four modules held their own `spawn` before;
+   * routing three of them and leaving the fourth would make the claim false
+   * while every test still passed. This is a source scan on purpose. It is a
+   * lint over the whole tree, which is the one job a source scan is right for,
+   * and it is the only mechanical way to catch a FIFTH call site that a future
+   * change adds and no existing test reaches.
+   */
+  const srcRoot = fileURLToPath(new URL("../../src", import.meta.url));
+  const CREDENTIAL_BINARIES = ["security", "secret-tool"];
+  /** The chokepoint itself is the one module allowed to spawn. */
+  const ALLOWED = ["wrap/keychain-exec.ts"];
+
+  function walk(dir: string): string[] {
+    return readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) return walk(full);
+      return entry.isFile() && full.endsWith(".ts") ? [full] : [];
+    });
+  }
+
+  /**
+   * Reaching a subprocess at all requires pulling in `node:child_process`.
+   * Matching on that import rather than on a bare `exec(` call is what keeps
+   * this precise: `keychain-custody.ts`, `passphrase.ts`, and
+   * `cli/reset-passphrase.ts` all CALL something named `exec`, but it is the
+   * injected executor that ends at the chokepoint, and flagging them would have
+   * made this test noise everyone learns to edit around.
+   */
+  const IMPORTS_CHILD_PROCESS = /(?:from|import|require)\s*\(?\s*["']node:child_process["']/;
+
+  it("no module outside the chokepoint spawns `security` or `secret-tool`", () => {
+    const offenders: string[] = [];
+    for (const file of walk(srcRoot)) {
+      const relative = file.slice(srcRoot.length + 1);
+      if (ALLOWED.includes(relative)) continue;
+      const source = readFileSync(file, "utf8");
+      if (!IMPORTS_CHILD_PROCESS.test(source)) continue;
+      // A module may spawn plenty of other things (git, launchctl, pfctl);
+      // only naming a credential binary in the same file is a bypass.
+      if (
+        CREDENTIAL_BINARIES.some((bin) =>
+          new RegExp(`["'\`](?:/usr/bin/)?${bin}["'\`]`).test(source)
+        )
+      ) {
+        offenders.push(relative);
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+});
+
+describe("the one file that opts out routes through the guarded entry point", () => {
+  /**
+   * The single remaining source assertion in this file, and it is here because
+   * nothing executable can prove a NEGATIVE about another file: that it does not
+   * reach past the guard and call `setKeychainExec(null)` itself. Everything
+   * else about the opt-out is exercised as behavior above.
    */
   const source = readFileSync(
     fileURLToPath(
@@ -145,24 +366,35 @@ describe("the one file that opts out of the store still opts out", () => {
     "utf8"
   );
 
-  it("removes the injected store, which is what actually restores the spawn path", () => {
-    // `execKeychain` consults the store before the opt-in env var, so setting
-    // the env var without this line leaves the store serving every call.
-    expect(source).toContain("setKeychainExec(null)");
-  });
-
-  it("sets the opt-in env var, without which the guard refuses to spawn", () => {
-    expect(source).toContain("ALLOW_REAL_KEYCHAIN_ENV");
+  it("removes the store only via enterRealBackendMode, never directly", () => {
+    expect(source).toContain("enterRealBackendMode(");
+    expect(source).not.toContain("setKeychainExec(");
   });
 
   it("puts the store back afterwards so the removal cannot outlive that file", () => {
-    expect(source).toContain("installInMemoryKeychainStore()");
+    expect(source).toContain("leaveRealBackendMode(");
   });
 
-  it("runs only against a keyring CI declared disposable, never a developer's own", () => {
-    // secret-tool + a session bus are both present on an ordinary Linux
-    // desktop; this third condition is the only one that distinguishes a
-    // throwaway CI keyring from the operator's real one.
-    expect(source).toContain("SANCTUARY_TEST_DISPOSABLE_KEYRING");
+  it("declares a case count the CI zero-test guard can hold it to", () => {
+    // `.github/workflows/keychain-linux-real-backend.yml` requires the run to
+    // report EXACTLY this many passing tests. Without the exact number, a
+    // summary of `Tests 1 passed | 4 skipped` satisfies a "some tests passed"
+    // grep while most real-backend assertions have vanished.
+    //
+    // Failure mode this catches: someone adds a case to the integration file
+    // and the workflow's expectation silently no longer covers it. Adding a
+    // case now fails HERE, in ordinary CI on every platform, until the declared
+    // count is bumped.
+    const declared = readFileSync(
+      fileURLToPath(
+        new URL(
+          "../keychain-linux-real-backend-integration.expected-cases",
+          import.meta.url
+        )
+      ),
+      "utf8"
+    ).trim();
+    const actual = source.match(/^\s*it\(/gm)?.length ?? 0;
+    expect(actual).toBe(Number(declared));
   });
 });

@@ -34,19 +34,29 @@ on:
     branches: [main]
     paths:
       - "server/src/wrap/passphrase.ts"
+      - "server/src/wrap/keychain-exec.ts"
       - "server/test/keychain-linux-real-backend-integration.test.ts"
+      - "server/test/keychain-linux-real-backend-integration.expected-cases"
       - "server/test/keychain-linux-secret-service.test.ts"
+      - "server/test/setup/keychain-fake.ts"
+      - "server/test/support/real-backend-guard.ts"
       - "server/package.json"
       - "server/package-lock.json"
+      - "scripts/ci/provision-disposable-keyring.sh"
       - ".github/workflows/keychain-linux-real-backend.yml"
   pull_request:
     branches: [main]
     paths:
       - "server/src/wrap/passphrase.ts"
+      - "server/src/wrap/keychain-exec.ts"
       - "server/test/keychain-linux-real-backend-integration.test.ts"
+      - "server/test/keychain-linux-real-backend-integration.expected-cases"
       - "server/test/keychain-linux-secret-service.test.ts"
+      - "server/test/setup/keychain-fake.ts"
+      - "server/test/support/real-backend-guard.ts"
       - "server/package.json"
       - "server/package-lock.json"
+      - "scripts/ci/provision-disposable-keyring.sh"
       - ".github/workflows/keychain-linux-real-backend.yml"
   workflow_dispatch:
 
@@ -269,18 +279,22 @@ jobs:
             secret-tool clear service smoke-svc account smoke-acct
             echo "=== smoke test passed ==="
 
-            # Declare the keyring disposable, only now that the smoke test has
-            # proved the backend this script started is the one on the bus.
-            # server/test/keychain-linux-real-backend-integration.test.ts skips
-            # unless this is set, and when set it removes the in-memory
-            # credential store installed for every test so the production code
-            # shells out to the real secret-tool. Keep the name in sync with
-            # DISPOSABLE_KEYRING_ENV in that file.
+            # Mint the run-specific proof that this bus carries a throwaway
+            # keyring, only now that the smoke test has shown the backend this
+            # script started is the one answering. The script stores a fresh
+            # nonce INTO the keyring and records it alongside the live bus
+            # address; server/test/support/real-backend-guard.ts re-reads the
+            # nonce through secret-tool and refuses to remove the in-memory
+            # credential store unless it matches. An exported "1" used to be the
+            # whole condition, which a developer's stale shell profile satisfied.
             #
-            # Failure mode: drop this and the job still exits 0 while running
-            # zero real-backend assertions, because a fully skipped suite is a
-            # passing suite. The guard below is what makes that loud here.
-            export SANCTUARY_TEST_DISPOSABLE_KEYRING=1
+            # Failure mode: the script exits non-zero on every problem rather
+            # than producing a weaker token, because a missing declaration makes
+            # the suite skip, and a fully skipped suite is a passing suite. The
+            # exact-count guard below is the second line of defense.
+            export SANCTUARY_TEST_DISPOSABLE_KEYRING="$(
+              bash "$GITHUB_WORKSPACE/scripts/ci/provision-disposable-keyring.sh"
+            )"
 
             # NO_COLOR / FORCE_COLOR=0 keep vitest ANSI-free so the summary
             # grep below can parse it, exactly as
@@ -301,10 +315,30 @@ jobs:
               exit "$status"
             fi
             # A skipped suite exits 0, so the point of this workflow can
-            # evaporate silently. Require that the real-backend cases actually
-            # ran: vitest prints "Tests  N passed" only for executed tests.
-            if ! grep -qE "Tests[[:space:]]+[0-9]+ passed" /tmp/real-backend-vitest.log; then
-              echo "real-backend suite ran ZERO tests: the skip guard in keychain-linux-real-backend-integration.test.ts was not satisfied (linux + secret-tool + DBUS_SESSION_BUS_ADDRESS + SANCTUARY_TEST_DISPOSABLE_KEYRING=1)" >&2
+            # evaporate silently. Requiring merely "some tests passed" is not
+            # enough: vitest reports `Tests  1 passed | 4 skipped` when four of
+            # the five cases vanish, and that satisfies any "N passed" pattern.
+            # So require the EXACT count.
+            #
+            # The expectation lives in
+            # server/test/keychain-linux-real-backend-integration.expected-cases,
+            # which server/test/wrap/keychain-exec-guard.test.ts holds equal to
+            # the number of `it(` cases in the suite. Adding a case therefore
+            # fails in ordinary CI until the file is bumped, rather than
+            # silently reopening this hole here.
+            #
+            # Failure mode: a mismatch means either a case was added without
+            # bumping the count, or cases are being skipped at runtime. Both are
+            # loud; neither is ignorable.
+            # cwd is `server` from the `cd server` above.
+            expected="$(tr -d '[:space:]' \
+              < test/keychain-linux-real-backend-integration.expected-cases)"
+            if ! grep -qE "Tests[[:space:]]+${expected} passed \(${expected}\)" \
+                 /tmp/real-backend-vitest.log; then
+              echo "real-backend suite did not report exactly ${expected} passing tests." >&2
+              echo "A skipped or partially-skipped suite still exits 0, so this is the check that catches it." >&2
+              echo "Skip conditions: linux + secret-tool + DBUS_SESSION_BUS_ADDRESS + a valid disposable-keyring token." >&2
+              grep -E "^[[:space:]]*Tests" /tmp/real-backend-vitest.log >&2 || true
               exit 1
             fi
           '

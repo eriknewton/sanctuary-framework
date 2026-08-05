@@ -1,8 +1,9 @@
 /**
  * Sanctuary wrap - the SINGLE chokepoint for spawning the OS credential CLI.
  *
- * WHY THIS EXISTS (2026-08-04). Three modules each spawned `security` on their
- * own (`keychain-custody.ts`, `passphrase.ts`, and the broker backend). Two of
+ * WHY THIS EXISTS (2026-08-04). Four modules each spawned the credential CLI on
+ * their own: `keychain-custody.ts`, `passphrase.ts`, `cli/reset-passphrase.ts`,
+ * and `disclosure/broker/keychain-backend.ts`. Two of
  * them target the DEFAULT keychain, which under test is the developer's REAL
  * login keychain. A full local suite run wrote ~61 entries into it. That is bad
  * on its own (an operator's personal credential store is not test scratch
@@ -15,9 +16,15 @@
  * counts of 4 -> 32 -> 18 across successive runs and ZERO code change between
  * them.
  *
- * Fixing the three call sites individually is whack-a-mole; a fourth would
+ * Fixing the call sites individually is whack-a-mole; the next one added would
  * reintroduce it. So every credential-CLI spawn goes through `execKeychain`,
  * and the guard lives here.
+ *
+ * That completeness is a CLAIM, so it has a check: "nothing else in the tree
+ * spawns a credential CLI" in `test/wrap/keychain-exec-guard.test.ts` fails if
+ * any module outside this one both imports `node:child_process` and names
+ * `security` or `secret-tool`. Adding a call site that forgets to route here is
+ * therefore a red test, not a silent hole.
  *
  * THE RULE: tests never touch the operator's login keychain. Under test this
  * module refuses to spawn the real binary unless a test EXPLICITLY opts in, and

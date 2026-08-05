@@ -113,15 +113,22 @@ runs:
         fi
         secret-tool clear service smoke-svc account smoke-acct
 
-        # Declare the keyring disposable, AFTER the smoke test proved this
-        # action's own backend is the one answering on the bus. Read by
-        # server/test/keychain-linux-real-backend-integration.test.ts, which
-        # runs only when this is set and then removes the in-memory
-        # credential store so it shells out to the real secret-tool. Keep the
-        # name in sync with DISPOSABLE_KEYRING_ENV in that file.
+        # Mint the run-specific disposable-keyring proof, AFTER the smoke test
+        # showed this action's own backend is the one answering on the bus.
+        # Single script, shared with
+        # .github/workflows/keychain-linux-real-backend.yml, so the two
+        # provisioning sites cannot drift apart. It stores a fresh nonce INTO
+        # this keyring and records it next to the live bus address;
+        # server/test/support/real-backend-guard.ts reads the nonce back through
+        # secret-tool and refuses to take the in-memory credential store off
+        # unless it matches. The old value here was a literal "1", which a
+        # developer's stale shell export satisfied just as well.
         #
-        # Failure mode: if this line is dropped, nothing errors. The
-        # integration file simply skips, the suite stays green, and the loss
-        # shows up only as a lower passing count that the exact-match floor in
-        # .github/workflows/test-baseline-guard.yml rejects.
-        echo "SANCTUARY_TEST_DISPOSABLE_KEYRING=1" >> "$GITHUB_ENV"
+        # Failure mode: the script exits non-zero on every problem rather than
+        # emitting a weaker token, because a missing declaration errors nothing
+        # on its own. The integration file simply skips, the suite stays green,
+        # and the loss shows up only as a lower passing count that the
+        # exact-match floor in .github/workflows/test-baseline-guard.yml
+        # rejects.
+        token_path="$("${GITHUB_WORKSPACE}/scripts/ci/provision-disposable-keyring.sh")"
+        echo "SANCTUARY_TEST_DISPOSABLE_KEYRING=$token_path" >> "$GITHUB_ENV"
