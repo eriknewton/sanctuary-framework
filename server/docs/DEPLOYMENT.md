@@ -69,12 +69,30 @@ Failure modes at boot, and what each one looks like from the outside:
 
 The passphrase alone is not the whole custody story. On the very first boot against a brand new
 fortress, Sanctuary mints a recovery key, refuses to write it inside the fortress directory, and
-refuses to print it to a log or pipe. A service manager gives the process no terminal, so that
-first boot fails closed with `BootRecoveryKeyEscrowRequiredError` unless a durable target exists:
-either `SANCTUARY_RECOVERY_OUT` pointing at a path outside the fortress, or a passphrase, which
-lets the recovery key be escrowed in the OS keyring. From the outside this looks like a service
-that will not start on a machine where nothing is wrong yet. Provision the fortress interactively
-with `sanctuary init` before you enable the unit and this never fires.
+refuses to print it to a log or pipe. A service manager gives the process no terminal, so the only
+way that boot can finish is with a **durable escrow target**, and exactly two things count as one:
+
+1. `SANCTUARY_RECOVERY_OUT` set to a path outside the fortress directory. Always available, on
+   every platform.
+2. A **successful, read-back-verified** write into the OS keyring. Attempted only when
+   `SANCTUARY_PASSPHRASE` is set, and only on macOS (through `/usr/bin/security`) or Linux
+   (through `secret-tool`). Windows never satisfies this.
+
+Setting a passphrase does not by itself satisfy the gate. It only makes Sanctuary *attempt* the
+keyring write, and a write that fails, a keyring that is locked, a missing `secret-tool`, or a
+read-back that does not match all leave the gate unsatisfied. The attempt is deliberately
+non-fatal and silent at the moment it fails, so nothing in the log names the keyring; the first
+and only evidence is that the boot ends with `BootRecoveryKeyEscrowRequiredError` and exit 1.
+
+The two environments where this bites are exactly the ones people deploy into. A systemd `--user`
+unit over SSH normally has no D-Bus session bus, so `secret-tool` has no Secret Service to talk
+to. A macOS launchd job before or without a GUI login has a locked login keychain. In both cases
+the operator has set `SANCTUARY_PASSPHRASE`, believes custody is handled, and gets a service that
+will not start on a machine where nothing is wrong yet.
+
+Set `SANCTUARY_RECOVERY_OUT` for any headless first boot, or, better, provision the fortress
+interactively with `sanctuary init` before you enable the unit, capture the recovery key it
+prints, and this never fires at all.
 
 ## Parallel MCP Server Configuration
 

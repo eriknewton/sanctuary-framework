@@ -130,13 +130,43 @@ Out of scope for v0.1:
      --destination-identity-id "$DESTINATION_SIGNER_ID"
    ```
 
-   `--source-passphrase` is the **legacy-bundle** path and does not work here. A
-   bundle exported from an envelope-custody fortress (any fortress a current
-   Sanctuary creates) deliberately carries no passphrase-checkable material, so
-   that there is no offline guessing oracle inside a bundle that travels. Supply a
-   passphrase against such a bundle and the import fails closed with
-   `SOURCE_PASSPHRASE_UNSUPPORTED`, pointing you at the re-key key. Reach for
-   `--source-passphrase` only when the source fortress predates envelope custody.
+   `--source-passphrase` is the **legacy-bundle** path. A bundle exported from an
+   envelope-custody fortress (any fortress a current Sanctuary creates from
+   scratch) deliberately carries no passphrase-checkable material, so that there
+   is no offline guessing oracle inside a bundle that travels. Supply a passphrase
+   against such a bundle and the import fails closed with
+   `SOURCE_PASSPHRASE_UNSUPPORTED`, pointing you at the re-key key.
+
+   **Which path a given bundle needs is observable, so check rather than guess.**
+   Open `artifacts/encrypted_state.json` in the bundle:
+
+   ```bash
+   grep -o 'source_key_derivation' ./sanctuary-exit-bundle/artifacts/encrypted_state.json
+   ```
+
+   - **No match** (verified on a fresh envelope-custody export): the bundle carries
+     `source_custody` only. Use `--source-recovery-key`, as above.
+   - **Match**: the source fortress still holds the pre-envelope `key-params`
+     marker, which is the case for a fortress that migrated into envelope custody
+     rather than being created under it. Such a bundle accepts either credential,
+     and the passphrase form is the one to use when the export's re-key key was
+     never captured:
+
+     ```bash
+     read -s SOURCE_SANCTUARY_PASSPHRASE
+     ```
+
+     ```bash
+     sanctuary exit import ./sanctuary-exit-bundle \
+       --activate \
+       --import-state \
+       --source-passphrase "$SOURCE_SANCTUARY_PASSPHRASE" \
+       --destination-identity-id "$DESTINATION_SIGNER_ID"
+     ```
+
+   Every bundle a current `sanctuary exit export` produces with state in it carries
+   `source_custody`, so `--source-recovery-key` is the path that always works when
+   you still have the key from step 2.
 
    `--import-state` is required: the CLI rejects the source-credential flags
    without it (exit code 2), because the source credentials exist only to decrypt
@@ -161,14 +191,28 @@ Out of scope for v0.1:
    | `state_status` | What happened | Trigger |
    |---|---|---|
    | `rekeyed` | state was re-keyed under the destination master | the good case; check `state_imported_keys` |
-   | `not_requested` | the bundle carried no state entries | `--state-namespace` omitted at export (step 2), or `--import-state` omitted here |
-   | `staged_requires_source_key` | entries arrived and stayed encrypted | `--import-state` omitted, so no source credential reached the re-key step |
-   | `skipped_no_destination_signer` | every entry skipped for want of a signer | `--destination-identity-id` omitted and the destination has no default identity |
+   | `not_requested` | **the bundle itself carried no state entries**, so there was never anything to re-key | `--state-namespace` omitted at export (step 2). This is a defect in the bundle, and no import flag can repair it |
+   | `staged_requires_source_key` | **entries arrived and stayed encrypted**, because no source master key was resolved | `--activate` run without `--import-state`, so no source credential reached the re-key step. The entries are on the destination and still locked to the source master |
+   | `skipped_no_destination_signer` | entries arrived and decrypted, then every one was skipped for want of a signer to re-sign them under | `--destination-identity-id` omitted and the destination fortress has no default identity |
+
+   The first two are the pair that get confused, and they call for opposite
+   responses. `not_requested` means go back to the source machine and re-export
+   with `--state-namespace`; the bundle you are holding is not worth re-importing.
+   `staged_requires_source_key` means the bundle is fine and the import command was
+   incomplete; re-run it with `--import-state` and the source credential. Preserve
+   the bundle in the first case and the import transcript in the second.
+
+   The CLI will not let you reach `staged_requires_source_key` by supplying a
+   credential wrongly. It rejects `--import-state` without `--activate`, a source
+   credential without `--import-state`, and `--import-state` without a source
+   credential, each at exit 2 before touching anything. The only route to that
+   status is leaving `--import-state` off entirely.
 
    A credential that is present but wrong is the safe case: it fails closed and
-   loudly, with `SOURCE_CREDENTIAL_INVALID`. Only the `not_requested` case prints a
-   loud multi-line warning. The other two appear as one line in a block of
-   counters, under `verdict: PASS`, at exit code 0. Read `state_status` and
+   loudly, with `SOURCE_CREDENTIAL_INVALID` on the re-key-key path or
+   `SOURCE_KEY_MISMATCH` on the legacy passphrase path. Only `not_requested`
+   prints a loud multi-line warning. The other two appear as one line in a block
+   of counters, under `verdict: PASS`, at exit code 0. Read `state_status` and
    `state_imported_keys` on every run and record both in the drill evidence.
 
    Acceptance: import verifies the bundle before activation, reports conflicts,
