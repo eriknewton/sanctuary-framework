@@ -1133,18 +1133,34 @@ export async function exportExitBundle(
   // Same honesty posture for a zero-state export: record it where an exit-drill
   // operator queries after the fact, so "the bundle was empty" is provable from
   // the source fortress rather than only inferable from the bundle.
+  //
+  // `appendCritical` and AWAITED, not `void append(...)`: `append`'s own
+  // contract reserves itself for low-risk telemetry and states that export/exit
+  // operations MUST use `appendCritical()`. The await is part of that contract,
+  // not style. `appendCritical` never registers in `pendingWrites`, and
+  // `enqueueAppend` swallows the rejection on `appendQueue`
+  // (`task.then(() => undefined, () => undefined)`), so a voided call's
+  // durability failure would be dropped on the floor by the `flush()` below.
+  // Awaiting is what makes a failed durable write fail the export instead
+  // (never silently degrade, AGENTS.md #5).
   if (encryptedStateExport.bundle.total_keys === 0) {
-    void opts.auditLog.append(
-      "l1",
-      "exit_bundle_export_no_state",
-      identity.identity_id,
-      {
+    await opts.auditLog.appendCritical({
+      layer: "l1",
+      operation: "exit_bundle_export_no_state",
+      identity_id: identity.identity_id,
+      result: "success",
+      details: {
         approval_id: exportApprovalAuditId,
         namespaces_requested: opts.stateNamespaces ?? null,
         state_storage_path_supplied: opts.stateStoragePath !== undefined,
       },
-    );
+    });
   }
+  // Still required and still correct after the change above: the zero-state
+  // entry is already durably verified by the time control reaches here, so this
+  // flush is draining the sibling `void append(...)` calls (partition summary,
+  // receipts truncation) and the append queue. Same order as
+  // exit/consent.ts: appendCritical, then flush.
   await opts.auditLog.flush();
 
   const statePartitionSummary =

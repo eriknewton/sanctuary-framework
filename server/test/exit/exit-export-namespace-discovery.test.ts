@@ -99,6 +99,12 @@ async function bootstrapFortress(): Promise<{
   storagePath: string;
   identityId: string;
   tools: ToolLike[];
+  /**
+   * A reader over the SAME storage and master key the CLI will use, so a test
+   * can query the audit chain the export actually wrote. Constructed fresh
+   * rather than reusing the bootstrap instance so the read goes to disk.
+   */
+  readAuditOperations: () => Promise<string[]>;
 }> {
   const storagePath = await mkdtemp(join(tmpdir(), "sanctuary-exit-disc-"));
   const stateStoragePath = join(storagePath, "state");
@@ -131,6 +137,11 @@ async function bootstrapFortress(): Promise<{
     storagePath,
     identityId: created.identity_id as string,
     tools: tools as ToolLike[],
+    readAuditOperations: async () => {
+      const reader = new AuditLog(new FilesystemStorage(stateStoragePath), masterKey);
+      const { entries } = await reader.query({ limit: 500 });
+      return entries.map((entry) => entry.operation);
+    },
   };
 }
 
@@ -146,7 +157,7 @@ async function readEncryptedState(
 
 // ── Tests ───────────────────────────────────────────────────────────
 
-describe("sanctuary exit export — state-namespace resolution", () => {
+describe("sanctuary exit export: state-namespace resolution", () => {
   let originalEnvStoragePath: string | undefined;
   const cleanup: string[] = [];
 
@@ -165,7 +176,9 @@ describe("sanctuary exit export — state-namespace resolution", () => {
     }
   });
 
-  async function seededFortress(): Promise<string> {
+  async function seededFortress(): Promise<
+    Awaited<ReturnType<typeof bootstrapFortress>>
+  > {
     const fortress = await bootstrapFortress();
     cleanup.push(fortress.storagePath);
     for (const [namespace, key] of [
@@ -181,7 +194,7 @@ describe("sanctuary exit export — state-namespace resolution", () => {
       });
     }
     process.env.SANCTUARY_STORAGE_PATH = fortress.storagePath;
-    return fortress.storagePath;
+    return fortress;
   }
 
   it("exports EVERY discoverable namespace when no --state-namespace is passed", async () => {
@@ -283,9 +296,55 @@ describe("sanctuary exit export — state-namespace resolution", () => {
     const state = await readEncryptedState(bundleDir);
     expect(state.total_keys).toBe(0);
   });
+
+  it("records exit_bundle_export_no_state on the source fortress, and only when the export really was empty", async () => {
+    // The audit marker is what an exit-drill operator queries after the fact,
+    // so "the bundle was empty" is provable from the source fortress and not
+    // only inferable from the bundle. Both directions are asserted: a marker
+    // that fired unconditionally would carry no information, so presence alone
+    // is not enough to call this tested.
+    const empty = await bootstrapFortress();
+    cleanup.push(empty.storagePath);
+    process.env.SANCTUARY_STORAGE_PATH = empty.storagePath;
+    const emptyBundle = await mkdtemp(join(tmpdir(), "sanctuary-bundle-audit0-"));
+    cleanup.push(emptyBundle);
+
+    expect(
+      await runExitCommand({
+        argv: ["export", "--out", emptyBundle, "--yes"],
+        out: new StringWritable(),
+        err: new StringWritable(),
+        env: { SANCTUARY_PASSPHRASE: TEST_PASSPHRASE },
+      }),
+    ).toBe(0);
+
+    const emptyOps = await empty.readAuditOperations();
+    expect(emptyOps).toContain("exit_bundle_export_no_state");
+    // The export itself was still audited; the marker is additive, not a
+    // replacement for the normal export entry.
+    expect(emptyOps).toContain("exit_bundle_export");
+
+    // Same command against a fortress that HAS state must not claim emptiness.
+    const seeded = await seededFortress();
+    const seededBundle = await mkdtemp(join(tmpdir(), "sanctuary-bundle-audit3-"));
+    cleanup.push(seededBundle);
+
+    expect(
+      await runExitCommand({
+        argv: ["export", "--out", seededBundle, "--yes"],
+        out: new StringWritable(),
+        err: new StringWritable(),
+        env: { SANCTUARY_PASSPHRASE: TEST_PASSPHRASE },
+      }),
+    ).toBe(0);
+
+    const seededOps = await seeded.readAuditOperations();
+    expect(seededOps).toContain("exit_bundle_export");
+    expect(seededOps).not.toContain("exit_bundle_export_no_state");
+  });
 });
 
-describe("exportExitBundle — empty stateNamespaces is rejected, not honored", () => {
+describe("exportExitBundle: empty stateNamespaces is rejected, not honored", () => {
   it("throws rather than silently exporting zero state", async () => {
     // The by-construction guard: the CLI now omits the option, but any future
     // caller that forwards a flag parser's empty array must fail loudly rather
