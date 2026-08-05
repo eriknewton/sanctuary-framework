@@ -29,6 +29,11 @@ import {
   readFileCustodyWithStats,
 } from "../storage/custody-fs.js";
 import { TransparencyEmitError, type TransparencySigner } from "./emitter.js";
+import {
+  ED25519_LEGACY_SEED_AND_PUBKEY_BYTES,
+  ED25519_PRIVATE_KEY_BYTES,
+  ED25519_PUBLIC_KEY_BYTES,
+} from "../core/crypto-suite-registry.js";
 
 const CASTLE_PINNED_PUBKEY = "castle-pinned-pubkey.bin";
 const CASTLE_PINNED_PRIVKEY = "castle-pinned-privkey.enc";
@@ -143,7 +148,7 @@ async function loadLocalTransparencySigner(
       `local signing key unavailable (${err instanceof Error ? err.message : String(err)}): run 'sanctuary castle-wall provision-pin' first, or use the helper path; refusing to emit unsigned`
     );
   }
-  if (publicKey.length !== 32) {
+  if (publicKey.length !== ED25519_PUBLIC_KEY_BYTES) {
     throw new TransparencyEmitError(
       `pinned public key must be 32 bytes (found ${publicKey.length}); refusing to emit`
     );
@@ -159,9 +164,9 @@ async function loadLocalTransparencySigner(
     );
   }
   try {
-    if (privateKey.length === 64) {
-      encryptedPrivateKey = encrypt(privateKey.slice(0, 32), masterKey);
-    } else if (privateKey.length !== 32) {
+    if (privateKey.length === ED25519_LEGACY_SEED_AND_PUBKEY_BYTES) {
+      encryptedPrivateKey = encrypt(privateKey.slice(0, ED25519_PRIVATE_KEY_BYTES), masterKey);
+    } else if (privateKey.length !== ED25519_PRIVATE_KEY_BYTES) {
       throw new TransparencyEmitError(
         `pinned private key must decrypt to 32 bytes (found ${privateKey.length}); refusing to emit`
       );

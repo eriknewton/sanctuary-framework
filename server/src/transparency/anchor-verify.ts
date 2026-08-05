@@ -402,6 +402,8 @@ export function parseSignedNote(note: string): ParsedSignedNote | null {
   } catch {
     return null;
   }
+  // 32 = a SHA-256 digest (256 bits / 8), the Merkle root width in the
+  // checkpoint note. NOT a key length despite being the same number.
   if (rootHash.length !== 32) return null;
   const signatureBlobs: Uint8Array[] = [];
   for (const line of note.slice(separator + 2).split("\n")) {
@@ -897,6 +899,9 @@ function checkAnchoredReceipt(input: {
       // 2b. UUID binding: the entry UUID's leaf-hash part must recompute
       // from the body bytes (RFC 6962 leaf hashing).
       leafHashHex = bytesToHex(rfc6962LeafHash(bodyBytes));
+      // 64 = the hex character count of a SHA-256 leaf hash (32 bytes * 2).
+      // Rekor UUIDs may carry a tree-id prefix, so the leaf part is the LAST 64
+      // hex characters; a shorter uuid is used whole and fails `HEX64` below.
       const uuidLeaf =
         material.uuid.length >= 64 ? material.uuid.slice(-64) : material.uuid;
       if (!HEX64.test(uuidLeaf) || uuidLeaf !== leafHashHex) {

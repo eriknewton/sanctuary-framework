@@ -18,7 +18,17 @@ import { randomBytes } from "./random.js";
 
 const BASE58BTC_ALPHABET =
   "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+/** `0xed 0x01` = the multicodec varint for `ed25519-pub`, per the multicodec table. */
 const ED25519_MULTICODEC_PREFIX = new Uint8Array([0xed, 0x01]);
+/**
+ * 32 = RFC 8032 §5.1.2, the compressed encoding of an Edwards point.
+ *
+ * Must match `ED25519_PUBLIC_KEY_BYTES` in `core/crypto-suite-registry.ts`.
+ * This module deliberately declares its own copy rather than importing it:
+ * `crypto-suite-registry.ts` imports `sign`/`verify` from THIS file, so an
+ * import back would close a dependency cycle. `test/structure/`
+ * `key-length-constants.test.ts` asserts the two declarations stay equal.
+ */
 const ED25519_PUBLIC_KEY_LENGTH = 32;
 
 /** Public identity information (safe to share) */

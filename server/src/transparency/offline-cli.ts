@@ -301,6 +301,12 @@ function extractRecords(parsed: unknown): VerifierCheckpointRecord[] {
 }
 
 function decodeKeyBytes(bytes: Uint8Array): string {
+  // 32 = RFC 8032 Ed25519 public key. Literal rather than an import because this
+  // CLI is one of the three files in the standalone offline verifier subset
+  // (`verify.ts`, `anchor-verify.ts`, this file). Those three import only each
+  // other, `@noble/*`, and `node:` builtins, so the subset compiles without any
+  // Sanctuary server module; that is NOT a property of `transparency/` at large.
+  // Must match `ED25519_PUBLIC_KEY_BYTES` in `core/crypto-suite-registry.ts`.
   if (bytes.length === 32) return toBase64url(bytes);
   const text = Buffer.from(bytes).toString("utf8").trim();
   const decoded = fromBase64url(text);

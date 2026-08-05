@@ -83,6 +83,10 @@ import {
   type FederationTrustRootRecord,
 } from "./federation-trust-root-store.js";
 import type { FederationRootRotationCertificate } from "./types.js";
+import {
+  ED25519_PRIVATE_KEY_BYTES,
+  ML_DSA_65_SECRET_KEY_BYTES,
+} from "../core/crypto-suite-registry.js";
 
 /**
  * Staged record (the minted-but-not-yet-promoted new root). A crash with this
@@ -132,12 +136,12 @@ export function assertHybridRecordWellFormedForRotation(
       "this fortress has a hybrid federation root but its hybrid material is incomplete; refusing to rotate (a rotation must never silently drop the ML-DSA component and downgrade to a classical-only root)",
     );
   }
-  if (hybrid.master_private_keys.ed25519.private_key.length !== 32) {
+  if (hybrid.master_private_keys.ed25519.private_key.length !== ED25519_PRIVATE_KEY_BYTES) {
     throw new HybridRotateDowngradeError(
       "hybrid master Ed25519 private key is malformed (not 32 bytes); refusing to rotate fail-closed",
     );
   }
-  if (hybrid.master_private_keys.ml_dsa_65.secret_key.length !== 4032) {
+  if (hybrid.master_private_keys.ml_dsa_65.secret_key.length !== ML_DSA_65_SECRET_KEY_BYTES) {
     throw new HybridRotateDowngradeError(
       "hybrid master ML-DSA-65 secret key is malformed (not 4032 bytes); refusing to rotate fail-closed",
     );
@@ -451,6 +455,11 @@ function parseStagedRecord(json: string): FederationTrustRootRecord {
     );
   }
   const decodedSecrets: Uint8Array[] = [];
+  // 32 is correct for every field this decodes, but for two different reasons:
+  // `master_secret` is a 256-bit symmetric secret while the three private-key
+  // fields are 32-byte Ed25519 seeds (RFC 8032 §5.1.5). Because the helper spans
+  // both families it keeps the literal; `ED25519_PRIVATE_KEY_BYTES` would be a
+  // false label on the `master_secret` call below.
   const decode32 = (b64: unknown, label: string): Uint8Array => {
     if (typeof b64 !== "string") {
       throw new FederationRotateRootResumeError(`${label} missing in staged record`);

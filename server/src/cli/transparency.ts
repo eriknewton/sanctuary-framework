@@ -61,6 +61,7 @@ import {
 } from "../transparency/anchor-verify.js";
 import { verifyAgainstLog } from "../transparency/against-log.js";
 import type { FetchLike } from "../transparency/rekor-client.js";
+import { ED25519_PUBLIC_KEY_BYTES } from "../core/crypto-suite-registry.js";
 
 // Canonical version source. The previous `require("../../package.json")`
 // resolved to the repo-root package.json (which has no `version`) once this
@@ -1031,7 +1032,7 @@ async function resolveVerificationKey(
     ]) {
       try {
         const bytes = await readFile(candidate);
-        if (bytes.length === 32) {
+        if (bytes.length === ED25519_PUBLIC_KEY_BYTES) {
           return {
             status: "ok",
             publicKey: toBase64url(bytes),
@@ -1048,10 +1049,10 @@ async function resolveVerificationKey(
 }
 
 function decodeKeyBytes(bytes: Uint8Array): string {
-  if (bytes.length === 32) return toBase64url(bytes);
+  if (bytes.length === ED25519_PUBLIC_KEY_BYTES) return toBase64url(bytes);
   const text = bytesToString(bytes).trim();
   const decoded = fromBase64url(text);
-  if (decoded.length !== 32) {
+  if (decoded.length !== ED25519_PUBLIC_KEY_BYTES) {
     throw new Error(
       `public key file must contain raw 32 bytes or a base64url 32-byte key (decoded ${decoded.length} bytes)`
     );

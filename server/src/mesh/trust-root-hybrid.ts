@@ -9,6 +9,7 @@
 import { ed25519 } from "@noble/curves/ed25519";
 import { ml_dsa65 } from "@noble/post-quantum/ml-dsa.js";
 import {
+  ED25519_PRIVATE_KEY_BYTES,
   ED25519_PUBLIC_KEY_BYTES,
   ED25519_SIGNATURE_SUITE_ID,
   HYBRID_SIGNATURE_SUITE_ID,
@@ -822,7 +823,7 @@ function hybridKeyRefs(
 function hybridSignerFromPrivateKeys(
   keys: HybridPrivateKeyMaterial
 ): SuiteSigner {
-  if (keys.ed25519.private_key.length !== ED25519_PUBLIC_KEY_BYTES) {
+  if (keys.ed25519.private_key.length !== ED25519_PRIVATE_KEY_BYTES) {
     throw new MeshChainError("hybrid Ed25519 private key must be 32 bytes");
   }
   if (keys.ml_dsa_65.secret_key.length !== ML_DSA_65_SECRET_KEY_BYTES) {

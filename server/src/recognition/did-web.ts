@@ -58,6 +58,10 @@ import { ed25519 } from "@noble/curves/ed25519";
 import { fromBase64url, toBase64url, stringToBytes } from "../core/encoding.js";
 import { hashToString } from "../core/hashing.js";
 import { generateKeypair } from "../core/identity.js";
+import {
+  ED25519_PRIVATE_KEY_BYTES,
+  ED25519_PUBLIC_KEY_BYTES,
+} from "../core/crypto-suite-registry.js";
 
 // ── Public types ─────────────────────────────────────────────────────
 
@@ -316,7 +320,7 @@ export async function issueDidWeb(
       `did-web: agent_label '${opts.agent_label}' is not a valid label`,
     );
   }
-  if (opts.public_key.length !== 32) {
+  if (opts.public_key.length !== ED25519_PUBLIC_KEY_BYTES) {
     throw new Error(
       `did-web: public_key must be exactly 32 bytes (Ed25519), got ${opts.public_key.length}`,
     );
@@ -400,7 +404,7 @@ export async function rotateDidWebKey(
   const generated = opts.new_public_key ? undefined : generateKeypair();
   const newPublicKey = opts.new_public_key ?? generated!.publicKey;
   generated?.privateKey.fill(0);
-  if (newPublicKey.length !== 32) {
+  if (newPublicKey.length !== ED25519_PUBLIC_KEY_BYTES) {
     throw new Error(
       `did-web: new public key must be exactly 32 bytes (Ed25519), got ${newPublicKey.length}`,
     );
@@ -1198,7 +1202,7 @@ export async function deriveDidWebFromPrivateKey(opts: {
   private_key: Uint8Array;
   now?: () => Date;
 }): Promise<DidWebIdentifier> {
-  if (opts.private_key.length !== 32) {
+  if (opts.private_key.length !== ED25519_PRIVATE_KEY_BYTES) {
     throw new Error("did-web: private_key must be 32-byte Ed25519 seed");
   }
   const publicKey = ed25519.getPublicKey(opts.private_key);

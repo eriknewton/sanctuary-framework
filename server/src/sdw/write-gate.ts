@@ -698,6 +698,9 @@ function isAllowedPlaceholder(value: string): boolean {
 // avoid flagging content hashes/ids that legitimately appear in records. A secret that
 // is exactly a hash length may pass even with a nearby keyword. Defense-in-depth only.
 function isKnownHashLength(value: string): boolean {
+  // 32 / 40 / 64 are HEX CHARACTER counts, not byte counts: md5 (16 bytes),
+  // sha1 (20 bytes), and sha256 (32 bytes) each rendered as two hex chars per
+  // byte. These are not key lengths.
   return /^[A-Fa-f0-9]+$/.test(value) && (value.length === 32 || value.length === 40 || value.length === 64);
 }
 

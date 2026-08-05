@@ -56,6 +56,11 @@ import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { decrypt, encrypt, type EncryptedPayload } from "../../core/encryption.js";
 import { toBase64url } from "../../core/encoding.js";
+import {
+  ED25519_LEGACY_SEED_AND_PUBKEY_BYTES,
+  ED25519_PRIVATE_KEY_BYTES,
+  ED25519_PUBLIC_KEY_BYTES,
+} from "../../core/crypto-suite-registry.js";
 
 /**
  * The capability flag that OPTS IN to the Linux producer-signed close.
@@ -581,7 +586,7 @@ export async function buildLinuxIpcClientKeyMaterial(input: {
   const publicKey = new Uint8Array(
     await readFile(join(input.fortressPath, CASTLE_PINNED_PUBKEY_RELPATH))
   );
-  if (publicKey.length !== 32) {
+  if (publicKey.length !== ED25519_PUBLIC_KEY_BYTES) {
     throw new RuntimeLinuxActivationError(
       `Castle Wall Linux activation: pinned public key must be 32 bytes (found ${publicKey.length}).`,
       "handshake_failed"
@@ -594,9 +599,9 @@ export async function buildLinuxIpcClientKeyMaterial(input: {
   let encryptedPrivateKey: EncryptedPayload;
   try {
     const seed =
-      privateKey.length === 64
-        ? privateKey.slice(0, 32)
-        : privateKey.length === 32
+      privateKey.length === ED25519_LEGACY_SEED_AND_PUBKEY_BYTES
+        ? privateKey.slice(0, ED25519_PRIVATE_KEY_BYTES)
+        : privateKey.length === ED25519_PRIVATE_KEY_BYTES
           ? privateKey
           : null;
     if (seed === null) {

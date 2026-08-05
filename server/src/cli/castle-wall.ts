@@ -103,6 +103,7 @@ import type {
   PolicyReloadResponse,
 } from "../castle-wall/ipc/messages.js";
 import { observing, type Observed } from "../claim-witness.js";
+import { ED25519_PUBLIC_KEY_BYTES } from "../core/crypto-suite-registry.js";
 
 const CASTLE_PINNED_PUBKEY = "castle-pinned-pubkey.bin";
 const CASTLE_PINNED_PRIVKEY = "castle-pinned-privkey.enc";
@@ -871,7 +872,7 @@ export async function runProvisionPin(
 
     try {
       const existingPub = await readFile(pubPath);
-      if (existingPub.length !== 32) {
+      if (existingPub.length !== ED25519_PUBLIC_KEY_BYTES) {
         throw new Error(
           `Pinned public key at ${pubPath} must be 32 bytes (found ${existingPub.length}).`
         );
@@ -1183,7 +1184,7 @@ export async function runRePin(
     write(err, `Error: ${error instanceof Error ? error.message : String(error)}\n`);
     return 1;
   }
-  if (helperPub.length !== 32) {
+  if (helperPub.length !== ED25519_PUBLIC_KEY_BYTES) {
     write(err, `Helper returned a ${helperPub.length}-byte key (expected 32).\n`);
     return 1;
   }
@@ -1232,7 +1233,7 @@ export async function runRePin(
       err,
     });
 
-    if (oldPub && oldPub.length === 32 && oldEnc) {
+    if (oldPub && oldPub.length === ED25519_PUBLIC_KEY_BYTES && oldEnc) {
       const oldFingerprint = fingerprintFromPublicKey(oldPub);
       if (oldFingerprint === helperFingerprint) {
         // Already migrated (K_old already equals K_helper would be unusual, but
@@ -1331,7 +1332,7 @@ async function readGlobalPinForStatus(
     ctx.globalPinReader ?? (() => readFile(CASTLE_GLOBAL_PINNED_PUBKEY_PATH));
   try {
     const key = await reader();
-    if (key.length !== 32) return "unreadable";
+    if (key.length !== ED25519_PUBLIC_KEY_BYTES) return "unreadable";
     return key;
   } catch (error) {
     const code =
@@ -1446,7 +1447,7 @@ export async function runStatus(
   let localFingerprint: string | null = null;
   try {
     const publicKey = await readFile(pubPath);
-    if (publicKey.length !== 32) {
+    if (publicKey.length !== ED25519_PUBLIC_KEY_BYTES) {
       throw new Error(
         `Pinned public key at ${pubPath} must be 32 bytes (found ${publicKey.length}).`
       );
@@ -1659,7 +1660,7 @@ export async function runDaemon(
     } else {
       publicKey = await readFile(pubPath);
     }
-    if (publicKey.length !== 32) {
+    if (publicKey.length !== ED25519_PUBLIC_KEY_BYTES) {
       write(err, `Pinned public key must be 32 bytes (found ${publicKey.length}).\n`);
       return 1;
     }

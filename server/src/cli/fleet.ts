@@ -59,6 +59,7 @@ import { isLicenseRevoked } from "../entitlement/revocation-list.js";
 import { revocationVerifiability } from "../entitlement/revocation-antirollback.js";
 import { openIssuer } from "./custody-unlock.js";
 import { dashboardRequest, DashboardRequestError } from "./dashboard-request.js";
+import { ED25519_PUBLIC_KEY_BYTES } from "../core/crypto-suite-registry.js";
 
 function write(stream: Writable, text: string): void {
   stream.write(text);
@@ -455,7 +456,7 @@ async function runVerify(
       write(err, "attest verify: --operator-key/--pin is not valid base64url\n");
       return 1;
     }
-    if (pinnedOperatorKey.length !== 32) {
+    if (pinnedOperatorKey.length !== ED25519_PUBLIC_KEY_BYTES) {
       write(
         err,
         "attest verify: --operator-key/--pin must decode to a 32-byte Ed25519 public key\n",

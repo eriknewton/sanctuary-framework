@@ -34,6 +34,7 @@ import type {
   PrincipalCertificate,
 } from "../types.js";
 import type { JoinApprovalResult, JoinApprover, JoinRequest } from "./types.js";
+import { ED25519_PUBLIC_KEY_BYTES } from "../../core/crypto-suite-registry.js";
 
 /** At-rest namespace + record key + HKDF label for the durable claim set. */
 export const OPERATOR_CLOUD_CLAIM_STORE_NAMESPACE = "_federation";
@@ -295,7 +296,7 @@ export function createOperatorCloudJoinApprover(
       }
       // Defense-in-depth: reject a malformed node pubkey before issuance.
       try {
-        if (fromBase64url(request.node_pubkey).length !== 32) {
+        if (fromBase64url(request.node_pubkey).length !== ED25519_PUBLIC_KEY_BYTES) {
           return { approved: false, denial_reason: "node_pubkey is not a 32-byte key" };
         }
       } catch {

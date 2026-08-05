@@ -32,6 +32,7 @@ import { validateAgentOrigin } from "../allowlist/agent-origin.js";
 import { validateOperatorBaseline } from "../allowlist/operator-baseline.js";
 import type { AllowlistRule } from "../allowlist/schema.js";
 import { RuntimeManifestPublishError } from "./errors.js";
+import { ED25519_SIGNATURE_BYTES } from "../../core/crypto-suite-registry.js";
 
 /**
  * Encrypted private-key material for the LOCAL (dev/test) signing path. Under
@@ -187,7 +188,7 @@ export async function buildSignedManifest(input: BuildSignedManifestInput): Prom
       `manifest signing failed: ${(err as Error).message}`
     );
   }
-  if (signatureBytes.length !== 64) {
+  if (signatureBytes.length !== ED25519_SIGNATURE_BYTES) {
     throw new RuntimeManifestPublishError(
       `manifest signing produced ${signatureBytes.length}-byte signature (expected 64)`
     );

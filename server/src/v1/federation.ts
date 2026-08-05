@@ -92,6 +92,10 @@ import {
   evaluateGuardianRevocationSignOff,
   type GuardianRevocationRequirement,
 } from "./federation-revocation-guardian-gate.js";
+import {
+  ED25519_PUBLIC_KEY_BYTES,
+  ED25519_SIGNATURE_BYTES,
+} from "../core/crypto-suite-registry.js";
 
 const NODE_MODES: readonly NodeMode[] = [
   "local",
@@ -417,7 +421,7 @@ export class JoinCeremony {
     // 5. node_pubkey must be a well-formed Ed25519 key.
     try {
       const key = fromBase64url(request.node_pubkey);
-      if (key.length !== 32) {
+      if (key.length !== ED25519_PUBLIC_KEY_BYTES) {
         return { approved: false, denialReason: "node_pubkey is not a 32-byte key" };
       }
     } catch {
@@ -1851,7 +1855,7 @@ function reissueNodeCertificate(
   } catch {
     throw new ReissueNodeCertFailure("proof_invalid");
   }
-  if (nodePubkey.length !== 32 || signature.length !== 64) {
+  if (nodePubkey.length !== ED25519_PUBLIC_KEY_BYTES || signature.length !== ED25519_SIGNATURE_BYTES) {
     throw new ReissueNodeCertFailure("proof_invalid");
   }
   const proofMessage = buildFederationReissueNodeCertProofMessage({
