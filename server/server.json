@@ -1,7 +1,7 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "ai.sanctuaryprotocol/sanctuary",
-  "description": "Security and privacy layer for AI agents under operator custody: encrypted local state, human approval gates for high-risk operations, a tamper-evident audit log, and OS-level egress enforcement on macOS and Linux.",
+  "description": "Security and privacy layer for AI agents under operator custody: encrypted local state, human approval gates for high-risk operations, a tamper-evident audit log, and OS-level egress enforcement on macOS and Linux. Control your entire fleet in one place: one dashboard to secure them all.",
   "repository": {
     "url": "https://github.com/eriknewton/sanctuary-framework",
     "source": "github"
