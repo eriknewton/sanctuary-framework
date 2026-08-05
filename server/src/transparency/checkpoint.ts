@@ -32,6 +32,25 @@ import { canonicalJson, sha256Hex } from "../audit/chain.js";
 import { fromBase64url, stringToBytes } from "../core/encoding.js";
 import { verify as verifyEd25519 } from "../core/identity.js";
 
+/**
+ * CROSS-FILE CONTRACT. `TRANSPARENCY_CHECKPOINT_SCHEMA_VERSION`,
+ * `TRANSPARENCY_CHECKPOINT_DOMAIN_PREFIX`, `TRANSPARENCY_CHECKPOINT_GENESIS`,
+ * and `TRANSPARENCY_BUNDLE_FORMAT` are duplicated verbatim in
+ * `transparency/verify.ts`, which imports no Sanctuary module at all. It could
+ * not import them from here without acquiring this file's own imports
+ * (`audit/chain.ts`, `core/encoding.ts`, `core/identity.ts`, and through
+ * identity the crypto runtime), which is precisely the dependency graph an
+ * offline verifier must not have. `TRANSPARENCY_CHECKPOINT_DOMAIN` and
+ * `TRANSPARENCY_RULE_LABEL_DOMAIN` are not duplicated: verify.ts only ever
+ * needs the newline-suffixed prefix form.
+ *
+ * Failure mode of a drifted copy: nothing fails to compile. The offline
+ * verifier reports a signature or schema FAILURE on a bundle the fortress
+ * signed correctly, and an auditor reads that as evidence of tampering rather
+ * than as a stale mirror. Change a value here and in `transparency/verify.ts`
+ * in the SAME PR. Enforced by
+ * `test/structure/cross-file-contract-pins.test.ts`.
+ */
 export const TRANSPARENCY_CHECKPOINT_SCHEMA_VERSION = 1;
 export const TRANSPARENCY_CHECKPOINT_DOMAIN =
   "sanctuary.enforcement-checkpoint.v1";
@@ -199,6 +218,11 @@ export function verifyEnforcementCheckpointSignature(
   }
 }
 
+// Lowercase 64-char SHA-256 hex. NOT a cross-file contract: every module that
+// validates a hash digest declares its own copy of this shape (10 files, 14
+// occurrences in server/src as of 2026-08-05), and they are independent local
+// validators rather than mirrors of one canonical declaration. Deliberately
+// not hoisted; the same note is on the counterpart in `verify.ts`.
 const HEX64 = /^[0-9a-f]{64}$/;
 
 function isRecord(value: unknown): value is Record<string, unknown> {

@@ -153,6 +153,18 @@ export function harnessLaunchSpec(input: {
  * POSIX-ish service-account name: lowercase start, then a conservative
  * charset. Deliberately rejects anything that could smuggle plist markup or
  * spaces, and `root`/`_root` style privileged names are checked separately.
+ *
+ * Must match `SAFE_SERVICE_ACCOUNT_RE` in
+ * `castle-wall/provision/account.ts` (the canonical declaration) and
+ * `SAFE_ACCOUNT_RE` in `egress-gate/gate-daemon.ts`. Re-declared rather than
+ * imported to keep this plist renderer free of a castle-wall dependency.
+ * Failure mode of a drift: a name this file accepts but provisioning rejects
+ * (or the reverse) fails at a DIFFERENT step of the same install, so the
+ * operator sees a mid-flow refusal on a name an earlier step already blessed.
+ * Enforced by `server/test/structure/cross-file-contract-pins.test.ts`.
+ *
+ * The reserved-name check below is NOT a mirror: account.ts additionally
+ * reserves `admin`.
  */
 const SAFE_ACCOUNT_RE = /^[a-z_][a-z0-9._-]{0,63}$/;
 
