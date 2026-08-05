@@ -433,6 +433,7 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
           write(out, `empty_reason: ${report.state.empty_reason}\n`);
         }
         write(out, `legacy_kdf_params: ${report.legacy_kdf_params}\n`);
+        write(out, `source_custody: ${report.source_custody}\n`);
         write(out, `credential: ${report.credential_path}\n`);
         write(out, `to import state: ${report.credential_instruction}\n`);
         for (const warning of report.warnings) {

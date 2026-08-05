@@ -1,5 +1,5 @@
 /**
- * Exit-cluster defects A3 / A4 / A5 (2026-08-06).
+ * Exit-cluster defects A3 / A4 / A5 (2026-08-05).
  *
  * One operator story, three composing failures:
  *
@@ -17,6 +17,15 @@
  *      interpretation with --legacy-source-master.
  *  A5: nothing answered "which credential does this bundle actually need?".
  *      `sanctuary exit inspect <dir>` answers it read-only.
+ *
+ * Fix round (2026-08-05): A5's first cut classified ANY object-shaped
+ * `source_custody` as the bundle re-key path, while import ran the full
+ * shape-check and refused a malformed one. `exit inspect` therefore printed the
+ * re-key import command and exited 0 for a bundle no key could ever open. The
+ * custody differential below is the mechanical form of that fix: it drives the
+ * SAME crafted bundles through `exit inspect` and a real `importExitBundle` and
+ * asserts they agree case for case, so the "must mirror import" pin in
+ * server/src/exit/verifier.ts is checked rather than asserted.
  */
 
 import { afterEach, describe, expect, it } from "vitest";
@@ -603,6 +612,204 @@ describe("exit cluster A3/A4/A5: which credential opens this bundle", () => {
     const code = await runExitCommand({ argv: ["inspect", dir], out, err, env: {} });
     expect(code).toBe(1);
     expect(chunks.join("")).toContain("Not a valid SANCTUARY_EXIT_BUNDLE_V1 directory");
+  });
+
+  // ---- A5 fix round: inspect must agree with import about custody ---------
+
+  /**
+   * Every way a `source_custody` block can be damaged, plus the untouched
+   * control. Each case is applied to a REAL minted bundle and re-signed, so the
+   * only thing under test is the block itself.
+   *
+   * FAILURE MODE if a case is written wrong: a mutation that leaves the block
+   * VALID makes the case assert the happy path twice and prove nothing. The
+   * control row is what keeps the whole table honest - if the classifier ever
+   * degenerates to "everything is unusable", `valid custody` fails.
+   */
+  const custodyCases: Array<{
+    label: string;
+    /** Returns the replacement block, given the real minted one. */
+    mutate: (real: Record<string, unknown>) => unknown;
+    importAccepts: boolean;
+  }> = [
+    {
+      label: "valid custody (control)",
+      mutate: (real) => real,
+      importAccepts: true,
+    },
+    {
+      label: "wrong format token",
+      mutate: (real) => ({ ...real, format: "SANCTUARY_EXIT_SOURCE_CUSTODY_V2" }),
+      importAccepts: false,
+    },
+    {
+      label: "format field missing entirely",
+      mutate: (real) => ({ wraps: real.wraps }),
+      importAccepts: false,
+    },
+    {
+      label: "wraps is not an array",
+      mutate: (real) => ({ ...real, wraps: { id: "w1" } }),
+      importAccepts: false,
+    },
+    {
+      label: "wraps is empty",
+      mutate: (real) => ({ ...real, wraps: [] }),
+      importAccepts: false,
+    },
+    {
+      label: "more wraps than the cap allows",
+      // 5 > SOURCE_CUSTODY_MAX_WRAPS (4). The cap bounds unwrap work on a
+      // crafted bundle; a classifier that ignores it advertises a re-key path
+      // the import gate will refuse.
+      mutate: (real) => ({
+        ...real,
+        wraps: Array.from({ length: 5 }, () => (real.wraps as unknown[])[0]),
+      }),
+      importAccepts: false,
+    },
+    {
+      label: "passphrase-type wrap smuggled in",
+      // The security-relevant case: a passphrase wrap here would reintroduce
+      // the offline guessing oracle and feed bundle-controlled Argon2id
+      // parameters into the unwrap path. Import refuses it, so inspect must
+      // never present it as an openable bundle.
+      mutate: (real) => ({
+        ...real,
+        wraps: [
+          {
+            ...((real.wraps as Record<string, unknown>[])[0] ?? {}),
+            type: "passphrase",
+          },
+        ],
+      }),
+      importAccepts: false,
+    },
+    {
+      label: "wrap missing its id",
+      mutate: (real) => {
+        const wrap = { ...((real.wraps as Record<string, unknown>[])[0] ?? {}) };
+        delete wrap.id;
+        return { ...real, wraps: [wrap] };
+      },
+      importAccepts: false,
+    },
+    {
+      label: "source_custody is null",
+      mutate: () => null,
+      importAccepts: false,
+    },
+  ];
+
+  for (const custodyCase of custodyCases) {
+    it(`A5 differential: inspect and import agree on "${custodyCase.label}"`, async () => {
+      const source = await makeSource("a5-differential-source");
+      const bundleDir = await newBundleDir("sanctuary-a5-diff-");
+      const exported = await exportBundle(source, bundleDir, { mint: true });
+      const rekeyKey = exported.state_rekey_key!;
+      expect(rekeyKey).toBeDefined();
+
+      const artifactPath = join(bundleDir, "artifacts", "encrypted_state.json");
+      const realCustody = (
+        JSON.parse(await readFile(artifactPath, "utf8")) as {
+          source_custody: Record<string, unknown>;
+        }
+      ).source_custody;
+      await patchEncryptedStateAndResign(bundleDir, source, (artifact) => {
+        artifact.source_custody = custodyCase.mutate(realCustody);
+      });
+
+      // What the operator is told, read-only, with the source fortress gone.
+      const { chunks, out, err } = captureCli();
+      const inspectCode = await runExitCommand({
+        argv: ["inspect", bundleDir],
+        out,
+        err,
+      });
+      const printed = chunks.join("");
+      const inspectSaysOpenable =
+        inspectCode === 0 && printed.includes("credential: bundle-rekey-key");
+
+      // What actually happens when they try it, with the real re-key key.
+      const destination = await makeDestination();
+      let importCode: string | undefined;
+      let importSucceeded = false;
+      try {
+        const result = await importExitBundle({
+          bundleDir,
+          storage: destination.storage,
+          masterKey: destination.masterKey,
+          identityManager: destination.identityManager,
+          auditLog: destination.auditLog,
+          reputationStore: destination.reputationStore,
+          activate: true,
+          forceRebind: true,
+          sourceRecoveryKey: rekeyKey,
+          destinationSignerIdentityId: destination.identityId,
+        });
+        importSucceeded = result.state.status === "rekeyed";
+      } catch (e) {
+        importCode = (e as { code?: string }).code;
+      }
+
+      // THE ASSERTION: the advice and the reality are the same answer.
+      expect(importSucceeded).toBe(custodyCase.importAccepts);
+      expect(inspectSaysOpenable).toBe(custodyCase.importAccepts);
+
+      if (custodyCase.importAccepts) {
+        expect(printed).toContain("source_custody: valid");
+        return;
+      }
+      expect(importCode).toBe("SOURCE_CUSTODY_MALFORMED");
+      // Not merely "not bundle-rekey-key": a verified-but-unopenable bundle is
+      // a FAILURE for this command, and the report must name the damaged block
+      // so the operator knows what to re-export.
+      expect(printed).toContain("credential: unusable");
+      expect(printed).toContain("source_custody: malformed");
+      expect(printed).toContain("re-key block (source_custody) is malformed");
+      expect(inspectCode).toBe(1);
+    });
+  }
+
+  it("A5 differential: a malformed custody block outranks a usable legacy marker", async () => {
+    // Import validates custody BEFORE it looks at anything else, so a damaged
+    // block kills the legacy passphrase path with it. A classifier that checked
+    // the legacy marker first would print a passphrase command that cannot run.
+    const source = await makeSource("a5-custody-outranks-source");
+    const { params } = await deriveMasterKey(SOURCE_PASSPHRASE);
+    await source.storage.write(
+      "_meta",
+      "key-params",
+      stringToBytes(JSON.stringify(params))
+    );
+    const bundleDir = await newBundleDir("sanctuary-a5-outrank-");
+    await exportBundle(source, bundleDir, { mint: true });
+    await patchEncryptedStateAndResign(bundleDir, source, (artifact) => {
+      artifact.source_custody = { format: "nope", wraps: [] };
+    });
+
+    const { chunks, out, err } = captureCli();
+    const code = await runExitCommand({ argv: ["inspect", bundleDir], out, err });
+    const printed = chunks.join("");
+    expect(printed).toContain("legacy_kdf_params: valid");
+    expect(printed).toContain("credential: unusable");
+    expect(code).toBe(1);
+
+    const destination = await makeDestination();
+    await expect(
+      importExitBundle({
+        bundleDir,
+        storage: destination.storage,
+        masterKey: destination.masterKey,
+        identityManager: destination.identityManager,
+        auditLog: destination.auditLog,
+        reputationStore: destination.reputationStore,
+        activate: true,
+        forceRebind: true,
+        sourcePassphrase: SOURCE_PASSPHRASE,
+        destinationSignerIdentityId: destination.identityId,
+      })
+    ).rejects.toMatchObject({ code: "SOURCE_CUSTODY_MALFORMED" });
   });
 
   // ---- Frozen-surface regression ------------------------------------------

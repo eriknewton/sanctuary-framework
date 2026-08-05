@@ -1,5 +1,5 @@
 /**
- * Exit-cluster defects A8 / A9 (2026-08-06).
+ * Exit-cluster defects A8 / A9 (2026-08-05).
  *
  *  A8: a zero-entry `encrypted_state.json` was indistinguishable from an
  *      export bug. The signed manifest covers an empty artifact exactly as a
@@ -25,7 +25,10 @@ import { Writable } from "node:stream";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import { stringToBytes, toBase64url } from "../../src/core/encoding.js";
-import { derivePurposeKey } from "../../src/core/key-derivation.js";
+import {
+  deriveMasterKey,
+  derivePurposeKey,
+} from "../../src/core/key-derivation.js";
 import { hash } from "../../src/core/hashing.js";
 import { sign as identitySign } from "../../src/core/identity.js";
 import { canonicalize, canonicalizeToBytes } from "../../src/mesh/canonical-json.js";
@@ -384,6 +387,121 @@ describe("exit cluster A8: an empty bundle must say why it is empty", () => {
     });
     expect(result.state.status).toBe("not_requested");
     expect(result.warnings.join("\n")).toContain("NO empty_reason marker");
+  });
+});
+
+/**
+ * Fix round (2026-08-05): A3's export refusal was entries-gated, so it could not
+ * see a corrupt marker on an empty bundle.
+ *
+ * `_meta/key-params` was read only when `entries.length > 0`. A zero-entry
+ * export - an empty fortress, or a partition that withheld everything - skipped
+ * the read entirely and signed an artifact asserting the legacy params were
+ * ABSENT while the on-disk marker was in fact CORRUPT. That is source-metadata
+ * corruption hidden at the exact moment the source fortress is about to
+ * disappear, dressed up as a clean `fortress_state_empty` bundle.
+ */
+describe("exit A3 fix round: a corrupt marker is caught at ANY entry count", () => {
+  const tempDirs: string[] = [];
+
+  afterEach(async () => {
+    for (const dir of tempDirs.splice(0)) {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  async function newBundleDir(prefix: string): Promise<string> {
+    const dir = await mkdtemp(join(tmpdir(), prefix));
+    tempDirs.push(dir);
+    return dir;
+  }
+
+  it("an EMPTY fortress with a malformed marker is refused, not signed as empty", async () => {
+    const source = await makeHarness();
+    await callTool(source.tools, "identity_create", { label: "empty-corrupt" });
+    await source.storage.write(
+      "_meta",
+      "key-params",
+      stringToBytes("{ this is not json")
+    );
+    const bundleDir = await newBundleDir("sanctuary-a3-empty-corrupt-");
+
+    await expect(exportFrom(source, bundleDir)).rejects.toThrow(
+      /_meta\/key-params is malformed/
+    );
+    // The A8 interaction: pre-fix this produced a signed, verifying bundle
+    // marked empty_reason=fortress_state_empty, which reads as "nothing to
+    // carry" when the truth is "your source metadata is damaged".
+    expect(
+      await exists(join(bundleDir, "artifacts", "encrypted_state.json"))
+    ).toBe(false);
+    expect(await exists(join(bundleDir, "manifest.json"))).toBe(false);
+  });
+
+  it("a partition that excluded everything is refused too", async () => {
+    const source = await makeHarness();
+    const identity = await callTool(source.tools, "identity_create", {
+      label: "partition-corrupt",
+    });
+    await callTool(source.tools, "state_write", {
+      namespace: "user-data",
+      key: "k1",
+      value: "v1",
+      identity_id: identity.identity_id as string,
+    });
+    await source.storage.write(
+      "_meta",
+      "key-params",
+      stringToBytes(JSON.stringify({ alg: "scrypt", salt: 42 }))
+    );
+    const bundleDir = await newBundleDir("sanctuary-a3-partition-corrupt-");
+
+    // The fortress HAS state; the partition withholds all of it, so the export
+    // reaches the same zero-entry path as an empty fortress.
+    await expect(
+      exportExitBundle({
+        bundleDir,
+        storage: source.storage,
+        masterKey: source.masterKey,
+        identityManager: source.identityManager,
+        auditLog: source.auditLog,
+        reputationStore: source.reputationStore,
+        policy: DEFAULT_POLICY,
+        config: defaultConfig(),
+        stateNamespaces: ["user-data"],
+        keySource: "recovery-key",
+        memoryClassPartition: {},
+      })
+    ).rejects.toThrow(/_meta\/key-params is malformed/);
+  });
+
+  it("a GENUINE marker on an empty fortress still exports, and is NOT embedded", async () => {
+    // The other half of the fix: detection moved out from behind the entries
+    // gate, but EMBEDDING stayed behind it. An empty bundle has nothing to
+    // re-key, so it must not ship the fortress's Argon2id salt and cost
+    // profile. Without this case the fix could "pass" by simply reading and
+    // embedding unconditionally.
+    const source = await makeHarness();
+    await callTool(source.tools, "identity_create", { label: "empty-genuine" });
+    const { params } = await deriveMasterKey("legacy-fortress-passphrase");
+    await source.storage.write(
+      "_meta",
+      "key-params",
+      stringToBytes(JSON.stringify(params))
+    );
+    const bundleDir = await newBundleDir("sanctuary-a3-empty-genuine-");
+    await exportFrom(source, bundleDir);
+
+    const artifact = JSON.parse(
+      await readFile(join(bundleDir, "artifacts", "encrypted_state.json"), "utf8")
+    ) as {
+      total_keys: number;
+      empty_reason?: string;
+      source_key_derivation?: unknown;
+    };
+    expect(artifact.total_keys).toBe(0);
+    expect(artifact.empty_reason).toBe("fortress_state_empty");
+    expect(artifact.source_key_derivation).toBeUndefined();
   });
 });
 

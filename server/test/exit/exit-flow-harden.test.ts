@@ -4,7 +4,7 @@
 // stateStoragePath, so discovery finds nothing either way) and no assertion was
 // added here, so nothing in this file can fail against pre-fix source. The
 // binding test for the fix is test/exit/exit-export-namespace-discovery.test.ts.
-// Extended 2026-08-06 for the exit cluster (A4): the H1(b) case now passes
+// Extended 2026-08-05 for the exit cluster (A4): the H1(b) case now passes
 // `legacyRecoveryKeyIsMaster: true` because the raw-master reading of a
 // recovery key is an explicit opt-in rather than a silent guess. Against
 // pre-fix source the unknown option is simply ignored and the test passes
@@ -349,7 +349,7 @@ describe("Exit-flow harden H1: caller-supplied sourceMasterKey is never zeroed",
       activate: true,
       forceRebind: true,
       sourceRecoveryKey: recoveryKey,
-      // A4 (2026-08-06): this bundle has no source_custody block, so the raw-
+      // A4 (2026-08-05): this bundle has no source_custody block, so the raw-
       // master interpretation of a recovery key is now an explicit opt-in
       // rather than a silent guess. The H1 property under test (the import
       // zeroes the buffer it derived) is unchanged; only the way the caller

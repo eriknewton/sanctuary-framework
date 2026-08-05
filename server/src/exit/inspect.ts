@@ -18,6 +18,7 @@ import {
   type ExitBundleDetailedVerifierResult,
   type ExitEncryptedStateSummary,
 } from "./verifier.js";
+import type { SourceCustodyState } from "./source-custody.js";
 
 export interface ExitBundleInspectionReport {
   verdict: "PASS" | "FAIL";
@@ -32,6 +33,8 @@ export interface ExitBundleInspectionReport {
   /** The exact command line that imports this bundle's state, if any can. */
   credential_instruction: string;
   legacy_kdf_params: "absent" | "valid" | "malformed" | "unknown";
+  /** Which re-key block is present, and whether import would accept it. */
+  source_custody: SourceCustodyState | "unknown";
   warnings: string[];
 }
 
@@ -44,8 +47,8 @@ export interface ExitBundleInspectionReport {
  * A flag renamed there must be renamed here in the same commit, or the
  * inspector prints a command that does not parse.
  */
-function credentialInstruction(path: ExitBundleCredentialPath): string {
-  switch (path) {
+function credentialInstruction(state: ExitEncryptedStateSummary): string {
+  switch (state.credential_path) {
     case "bundle-rekey-key":
       return (
         "sanctuary exit import <dir> --activate --import-state " +
@@ -65,13 +68,21 @@ function credentialInstruction(path: ExitBundleCredentialPath): string {
     case "none-required":
       return "no source credential required: this bundle carries zero state entries";
     case "unusable":
-      return (
-        "no usable credential: this bundle's only declared re-key material " +
-        "(source_key_derivation) is malformed, so the passphrase path cannot " +
-        "run. Re-export from the source fortress. If that fortress used a " +
-        "recovery key AS its master, --source-recovery-key <key> " +
-        "--legacy-source-master may still recover it."
-      );
+      // Two different damaged blocks land here and they have DIFFERENT
+      // remedies, so the text must name which one is broken. Custody is
+      // checked first: a malformed custody block kills the import before it
+      // ever looks at the legacy marker, so it dominates the message.
+      return state.source_custody === "malformed"
+        ? "no usable credential: this bundle's re-key block (source_custody) " +
+            "is malformed, so import refuses it (SOURCE_CUSTODY_MALFORMED) " +
+            "and will not fall back to legacy key derivation. No key of any " +
+            "kind opens this bundle's state. Re-export from the source " +
+            "fortress."
+        : "no usable credential: this bundle's only declared re-key material " +
+            "(source_key_derivation) is malformed, so the passphrase path " +
+            "cannot run. Re-export from the source fortress. If that fortress " +
+            "used a recovery key AS its master, --source-recovery-key <key> " +
+            "--legacy-source-master may still recover it.";
   }
 }
 
@@ -100,9 +111,10 @@ export async function inspectExitBundle(
     credential_path: state?.credential_path ?? "unknown",
     credential_instruction:
       state !== undefined
-        ? credentialInstruction(state.credential_path)
+        ? credentialInstruction(state)
         : "unknown: this bundle carries no encrypted_state artifact",
     legacy_kdf_params: state?.legacy_kdf_params ?? "unknown",
+    source_custody: state?.source_custody ?? "unknown",
     warnings: result.warnings,
   };
 }

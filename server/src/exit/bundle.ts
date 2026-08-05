@@ -71,6 +71,10 @@ import {
 } from "../reputation/reputation-store.js";
 import { verifyExitBundle, readManifest, loadExitArtifact } from "./verifier.js";
 import {
+  isValidSourceCustody,
+  SOURCE_CUSTODY_FORMAT,
+} from "./source-custody.js";
+import {
   partitionByMemoryClass,
   type PartitionConsentRelease,
   type PartitionCandidate,
@@ -648,12 +652,6 @@ const EXIT_EXPORT_REFUSED_MALFORMED_KDF_MARKER_OP =
   "exit_bundle_export_refused_malformed_kdf_marker";
 
 /**
- * Maximum wraps accepted in a bundle's source_custody block. Export emits
- * exactly one; the cap bounds work on crafted bundles (codex round-1 LOW).
- */
-const SOURCE_CUSTODY_MAX_WRAPS = 4;
-
-/**
  * Mint the bundle re-key key and the source_custody block that carries the
  * source master wrapped under it. The key is returned for operator
  * disclosure and is NEVER written into the bundle - it is the only
@@ -674,7 +672,9 @@ function mintSourceCustody(masterKey: Uint8Array): {
   const rekeyKey = toBase64url(rekeyKeyBytes);
   rekeyKeyBytes.fill(0);
   return {
-    custody: { format: "SANCTUARY_EXIT_SOURCE_CUSTODY_V1", wraps: [wrap] },
+    // The mint and the validator read the token from one declaration, so a
+    // freshly minted block can never fail its own shape-check.
+    custody: { format: SOURCE_CUSTODY_FORMAT, wraps: [wrap] },
     rekeyKey,
   };
 }
@@ -829,15 +829,16 @@ async function exportEncryptedState(
       ? mintSourceCustody(opts.masterKey)
       : undefined;
 
-  // Only read the source KDF profile (Argon2id salt + cost) when there is
-  // re-keyable state. An empty/zero-state bundle has nothing to re-key, so
-  // leaking the fortress salt + cost profile for it is gratuitous - gate it
-  // symmetrically with `source_custody` (which is already entries-gated via
-  // `minted`).
-  const keyParams: SourceKeyParamsRead =
-    entries.length > 0
-      ? await readSourceKeyParams(opts.storage)
-      : { state: "absent" };
+  // DETECTION is unconditional; EMBEDDING is entries-gated. Reading the marker
+  // for every export is what makes the A3 refusal below fire on an empty
+  // fortress too: an entries-gated READ let a zero-entry export (empty
+  // fortress, or a partition that withheld everything) sail past a CORRUPT
+  // marker and sign an artifact asserting the legacy params are ABSENT, which
+  // is source-metadata corruption hidden at the worst possible moment. The
+  // embed stays gated because an empty bundle has nothing to re-key, so
+  // shipping the fortress's Argon2id salt + cost profile with it is gratuitous
+  // (symmetric with `source_custody`, entries-gated above via `minted`).
+  const keyParams: SourceKeyParamsRead = await readSourceKeyParams(opts.storage);
   // INVARIANT (A3): _meta/key-params is untrusted bytes until shape-checked.
   // Whatever passes this gate is embedded VERBATIM in encrypted_state.json and
   // pinned by the Ed25519-signed manifest, so a malformed marker here becomes a
@@ -882,7 +883,10 @@ async function exportEncryptedState(
       key_source: opts.keySource ?? "unknown",
       ownership_partitioned: opts.memoryClassPartition !== undefined,
       ...(emptyReason !== undefined ? { empty_reason: emptyReason } : {}),
-      ...(keyParams.state === "ok"
+      // The entries-gate that used to sit on the READ (see the A3 detection
+      // note above) lives here instead: an empty bundle has nothing to re-key,
+      // so it must not carry the fortress's Argon2id salt + cost profile.
+      ...(entries.length > 0 && keyParams.state === "ok"
         ? { source_key_derivation: keyParams.params }
         : {}),
       ...(minted !== undefined ? { source_custody: minted.custody } : {}),
@@ -1467,29 +1471,18 @@ function importIdForManifest(manifest: ExitBundleManifest): string {
  * A crafted or corrupted block fails closed with a structured error rather
  * than being silently ignored (which would demote the import to the legacy
  * derivation path - a downgrade, #5).
+ *
+ * CONTRACT PIN (server/src/exit/source-custody.ts `isValidSourceCustody`): the
+ * rules live in that one predicate, which the verifier's
+ * `summarizeEncryptedState` also classifies through, so `exit inspect` can
+ * never name a credential path this gate would refuse. Verified mechanically
+ * by the custody differential in
+ * server/test/exit/exit-credential-path.test.ts, which drives the same crafted
+ * blocks through BOTH `exit inspect` and a real `importExitBundle` and asserts
+ * they agree case for case.
  */
 function validateSourceCustody(custody: ExitSourceCustody): void {
-  const malformed =
-    custody === null ||
-    typeof custody !== "object" ||
-    custody.format !== "SANCTUARY_EXIT_SOURCE_CUSTODY_V1" ||
-    !Array.isArray(custody.wraps) ||
-    custody.wraps.length === 0 ||
-    // Bounded, and recovery-key wraps ONLY: a passphrase-type wrap here
-    // would both reintroduce the offline passphrase oracle and feed
-    // bundle-controlled Argon2id parameters into the unwrap path
-    // (codex round-1 findings 1 and 2). The HKDF unwrap for recovery-key
-    // wraps carries no attacker-tunable cost parameters.
-    custody.wraps.length > SOURCE_CUSTODY_MAX_WRAPS ||
-    custody.wraps.some(
-      (wrap) =>
-        wrap === null ||
-        typeof wrap !== "object" ||
-        typeof wrap.id !== "string" ||
-        wrap.type !== "recovery-key" ||
-        typeof wrap.payload !== "object"
-    );
-  if (malformed) {
+  if (!isValidSourceCustody(custody)) {
     throw new ExitBundleImportError(
       "SOURCE_CUSTODY_MALFORMED",
       "This bundle's source_custody block is malformed or carries a wrap type " +
