@@ -48,8 +48,16 @@
  *   - It does not follow a value through an assignment, a parameter, or a
  *     helper call. `assertKeyLength(value, label)` style helpers are opaque to
  *     it by construction.
- *   - `ED25519_LEGACY_SEED_AND_PUBKEY_BYTES` is deliberately exempt: it names a
- *     concatenation of both classes, so no single subject class is correct.
+ *   - It matches constants by NAME, so an aliased import
+ *     (`import { ED25519_PUBLIC_KEY_BYTES as PK }`) would rename the constant
+ *     out of the scan's sight and a wrong pairing written as `x.length === PK`
+ *     would pass silently. Rather than build an alias resolver for an idiom this
+ *     codebase does not use, part 2 REFUSES aliased imports of a tracked
+ *     constant outright: the gap is closed by a loud failure, not by coverage.
+ *     A re-export (`export { X as Y }`) is refused for the same reason.
+ *   - `ED25519_LEGACY_SEED_AND_PUBKEY_BYTES` is deliberately exempt from the
+ *     class check: it names a concatenation of both classes, so no single
+ *     subject class is correct. It is NOT exempt from the alias refusal.
  *
  * The floor assertions in part 2 exist so those limits cannot quietly widen: if
  * a refactor breaks the scan, the site count or the classified count drops and
@@ -192,6 +200,48 @@ function scanUseSites(
     }
   }
   return sites;
+}
+
+/**
+ * Constants whose NAME the subject scan depends on. The legacy width is here
+ * even though it is exempt from the class check: aliasing it would still hide a
+ * use site from every count, including the anti-vacuity floors.
+ */
+const ALIAS_TRACKED = [
+  ...Object.keys(CLASS_OF_CONSTANT),
+  "ED25519_LEGACY_SEED_AND_PUBKEY_BYTES",
+];
+
+/**
+ * Aliased imports/re-exports of a tracked constant.
+ *
+ * Scoped to import and export STATEMENTS so a TypeScript cast (`X as number`)
+ * elsewhere in a file cannot false-positive. Refusing is deliberately cheaper
+ * than resolving: an alias resolver would have to track per-file rename maps
+ * for a pattern that appears zero times in this codebase.
+ */
+function aliasedTrackedImports(
+  sources: ReadonlyArray<{ rel: string; text: string }>,
+): string[] {
+  const found: string[] = [];
+  for (const { rel, text } of sources) {
+    const src = stripComments(text);
+    const stmts = src.matchAll(
+      /^(?:import|export)\b[\s\S]*?from\s+["'][^"']+["'];/gm,
+    );
+    for (const stmt of stmts) {
+      for (const constant of ALIAS_TRACKED) {
+        const alias = new RegExp(`\\b${constant}\\s+as\\s+([A-Za-z_$][\\w$]*)`).exec(
+          stmt[0],
+        );
+        if (alias) {
+          const line = src.slice(0, stmt.index! + alias.index).split("\n").length;
+          found.push(`${rel}:${line} imports ${constant} as ${alias[1]}`);
+        }
+      }
+    }
+  }
+  return found;
 }
 
 function serverSrcSources(): Array<{ rel: string; text: string }> {
@@ -452,6 +502,47 @@ describe("no Ed25519 width constant used against the wrong key class", () => {
       (s) => s.subject !== null && s.subject !== s.expected,
     );
     expect(caught).toEqual([]);
+  });
+
+  it("refuses an aliased import of a tracked constant (self-check)", () => {
+    // The scan matches by name, so an alias would hide a use site from it AND
+    // from the floors below. Refusing is the cheap correct answer.
+    const aliased = [
+      {
+        rel: "aliased.ts",
+        text: [
+          'import { ED25519_PUBLIC_KEY_BYTES as __PK } from "../core/crypto-suite-registry.js";',
+          "return private_key.length === __PK;",
+        ].join("\n"),
+      },
+      {
+        rel: "reexported.ts",
+        text: 'export { ED25519_SIGNATURE_BYTES as SIG_LEN } from "./crypto-suite-registry.js";',
+      },
+    ];
+    expect(aliasedTrackedImports(aliased)).toEqual([
+      "aliased.ts:1 imports ED25519_PUBLIC_KEY_BYTES as __PK",
+      "reexported.ts:1 imports ED25519_SIGNATURE_BYTES as SIG_LEN",
+    ]);
+
+    // ...and a plain import, or a cast that merely reads like an alias, is fine.
+    expect(
+      aliasedTrackedImports([
+        {
+          rel: "plain.ts",
+          text: [
+            'import { ED25519_PUBLIC_KEY_BYTES } from "../core/crypto-suite-registry.js";',
+            "const n = ED25519_PUBLIC_KEY_BYTES as number;",
+          ].join("\n"),
+        },
+      ]),
+    ).toEqual([]);
+  });
+
+  it("has no aliased import of a tracked constant anywhere in server/src", () => {
+    // If this reds, do not build a resolver: import the constant under its own
+    // name. The scan's whole subject-pairing model assumes the name is intact.
+    expect(aliasedTrackedImports(serverSrcSources())).toEqual([]);
   });
 
   it("still reaches the tree (anti-vacuity floor)", () => {
