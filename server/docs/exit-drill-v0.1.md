@@ -98,7 +98,7 @@ Out of scope for v0.1:
    (`ps`) for the duration of the import, to other processes on the same host.
    The `read -s` step keeps it out of shell history but cannot close the `ps`
    window. Run the import on a host with no untrusted local users or agent
-   processes — which a fortress migration target should be anyway. (CLI
+   processes, which a fortress migration target should be anyway. (CLI
    follow-up filed: accept the source passphrase from an environment variable
    or stdin, as `SANCTUARY_PASSPHRASE` already is for the destination
    fortress.)
