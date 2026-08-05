@@ -49,6 +49,7 @@ import {
   deriveMasterKey,
   deriveNamespaceKey,
   derivePurposeKey,
+  parseKeyDerivationParams,
   type KeyDerivationParams,
 } from "../core/key-derivation.js";
 import { decrypt, type EncryptedPayload } from "../core/encryption.js";
@@ -149,10 +150,41 @@ export interface ExitSourceCustody {
   wraps: CustodyWrap[];
 }
 
+/**
+ * Why a zero-entry `encrypted_state.json` is empty.
+ *
+ * `fortress_state_empty`   - the source fortress had no exportable state.
+ * `partition_excluded_all` - state existed but the ownership partition
+ *                            withheld every entry (they stay with the operator).
+ *
+ * CONTRACT PIN (server/src/exit/verifier.ts `summarizeEncryptedState`): the
+ * verifier reports these tokens verbatim and treats a zero-entry artifact
+ * WITHOUT one as pre-marker evidence. Adding a member here means adding it
+ * there in the same commit.
+ */
+export const EXIT_EMPTY_REASONS = {
+  FORTRESS_STATE_EMPTY: "fortress_state_empty",
+  PARTITION_EXCLUDED_ALL: "partition_excluded_all",
+} as const;
+
+export type ExitEmptyReason =
+  (typeof EXIT_EMPTY_REASONS)[keyof typeof EXIT_EMPTY_REASONS];
+
 export interface ExitEncryptedStateBundle {
   format: "SANCTUARY_EXIT_ENCRYPTED_STATE_V1";
   exported_at: string;
   key_source: "passphrase" | "recovery-key" | "unknown";
+  /**
+   * Present IFF `entries` is empty: names why. Absent on every non-empty
+   * bundle and on every bundle written before this marker existed, so an
+   * absent marker on a zero-entry artifact means "pre-marker or buggy
+   * exporter", never "the fortress was empty".
+   *
+   * It lives in the ARTIFACT, not the manifest, so it is covered by the
+   * Ed25519-signed manifest transitively through the artifact's sha256 +
+   * size pins - no `manifest_version` bump, no `contracts/v1.1` edit.
+   */
+  empty_reason?: ExitEmptyReason;
   /**
    * Additive Slice-2 signal: true when this artifact was filtered through the
    * verified ownership partition, false/absent for legacy full-fortress exports.
@@ -430,6 +462,16 @@ export interface ImportExitBundleOptions {
   conflictResolution?: "skip" | "overwrite" | "version";
   sourcePassphrase?: string;
   sourceRecoveryKey?: string;
+  /**
+   * Confirm the LEGACY interpretation of `sourceRecoveryKey`: on a bundle that
+   * carries no `source_custody` block, treat the supplied key as the source
+   * fortress's raw master rather than as a bundle re-key key. Required because
+   * those two meanings are indistinguishable from the bundle alone, and
+   * guessing produced a downstream SOURCE_KEY_MISMATCH that named the symptom
+   * instead of the cause. CLI surface: `--legacy-source-master` (only
+   * meaningful together with `--source-recovery-key`).
+   */
+  legacyRecoveryKeyIsMaster?: boolean;
   sourceMasterKey?: Uint8Array;
   destinationSignerIdentityId?: string;
   /**
@@ -505,8 +547,15 @@ export interface ImportExitBundleResult {
   activated: boolean;
   conflicts: ExitBundleConflictReport;
   state: {
+    /**
+     * `empty_bundle` (additive) is the honest answer to "I asked for state and
+     * supplied credentials, and the bundle carried none": it used to report
+     * `not_requested`, which is false and also suppresses nothing, so the CLI's
+     * "re-run with --import-state" advice fired at an operator who already had.
+     */
     status:
       | "not_requested"
+      | "empty_bundle"
       | "rekeyed"
       | "staged_requires_source_key"
       | "skipped_no_destination_signer";
@@ -555,13 +604,48 @@ async function writeJsonArtifact(
   };
 }
 
+/**
+ * Three-state read of the legacy `_meta/key-params` marker.
+ *
+ * `absent`    - no marker on disk (envelope-era or never-migrated fortress).
+ * `ok`        - marker parsed AND passed `parseKeyDerivationParams`.
+ * `malformed` - marker exists but is unparseable or out of accepted bounds;
+ *               `reason` names the failing field for the operator.
+ */
+type SourceKeyParamsRead =
+  | { state: "absent" }
+  | { state: "ok"; params: KeyDerivationParams }
+  | { state: "malformed"; reason: string };
+
 async function readSourceKeyParams(
   storage: StorageBackend
-): Promise<KeyDerivationParams | undefined> {
+): Promise<SourceKeyParamsRead> {
   const raw = await storage.read("_meta", "key-params");
-  if (!raw) return undefined;
-  return JSON.parse(bytesToString(raw)) as KeyDerivationParams;
+  if (!raw) return { state: "absent" };
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(bytesToString(raw));
+  } catch (err) {
+    return {
+      state: "malformed",
+      reason: `not parseable JSON (${err instanceof Error ? err.message : String(err)})`,
+    };
+  }
+  // CONTRACT PIN (server/src/core/key-derivation.ts parseKeyDerivationParams):
+  // the export embed-gate, the import derive-gate below, and the verifier's
+  // `legacy_kdf_params` report all classify through that one validator.
+  const checked = parseKeyDerivationParams(parsed);
+  return checked.ok
+    ? { state: "ok", params: checked.params }
+    : { state: "malformed", reason: checked.reason };
 }
+
+/**
+ * Audit op emitted when an export refuses to sign a bundle because the
+ * fortress's legacy `_meta/key-params` marker is malformed.
+ */
+const EXIT_EXPORT_REFUSED_MALFORMED_KDF_MARKER_OP =
+  "exit_bundle_export_refused_malformed_kdf_marker";
 
 /**
  * Maximum wraps accepted in a bundle's source_custody block. Export emits
@@ -615,13 +699,13 @@ async function discoverFilesystemStateNamespaces(
   }
 }
 
-async function exportEncryptedState(
-  opts: ExportExitBundleOptions
-): Promise<{
-  bundle: ExitEncryptedStateBundle;
-  rekeyKey?: string;
-  partition?: PartitionResult;
-}> {
+/**
+ * Every option-SHAPE refusal for an export, in one place, so it can run before
+ * the first side effect (see the A9 invariant at the `exportExitBundle` call
+ * site) and again inside `exportEncryptedState` as defense in depth for any
+ * future direct caller. Pure: reads only `opts`, touches no storage.
+ */
+function assertExportOptionsShape(opts: ExportExitBundleOptions): void {
   // "The caller named no namespaces" MUST resolve to discover-and-export
   // everything, never to an empty selection. A supplied-but-empty array is
   // exactly what a repeated-flag parser returns when the operator omitted the
@@ -639,6 +723,32 @@ async function exportEncryptedState(
         "to export zero state.",
     );
   }
+
+  // Exit machinery Slice 1: apply the conservative ownership partition. The
+  // caller MUST make an explicit choice (codex HIGH): supply
+  // `memoryClassPartition` (partition on) OR `unpartitionedLegacyExport: true`
+  // (loud, named full-export opt-out). Supplying neither - or both - throws, so
+  // an agent-exit caller cannot silently fall through to "export everything."
+  const hasPartition = opts.memoryClassPartition !== undefined;
+  const hasLegacyOptOut = opts.unpartitionedLegacyExport === true;
+  if (hasPartition === hasLegacyOptOut) {
+    throw new Error(
+      "exit-bundle: exactly one of memoryClassPartition or " +
+        "unpartitionedLegacyExport must be supplied. The ownership partition is " +
+        "not silently skippable; pass memoryClassPartition for an ownership-classed " +
+        "exit, or unpartitionedLegacyExport: true to deliberately export all state.",
+    );
+  }
+}
+
+async function exportEncryptedState(
+  opts: ExportExitBundleOptions
+): Promise<{
+  bundle: ExitEncryptedStateBundle;
+  rekeyKey?: string;
+  partition?: PartitionResult;
+}> {
+  assertExportOptionsShape(opts);
   const namespaceSet = new Set(
     opts.stateNamespaces ??
       (await discoverFilesystemStateNamespaces(opts.stateStoragePath))
@@ -663,22 +773,6 @@ async function exportEncryptedState(
         // Corrupt state is omitted rather than trusted into the exit bundle.
       }
     }
-  }
-
-  // Exit machinery Slice 1: apply the conservative ownership partition. The
-  // caller MUST make an explicit choice (codex HIGH): supply
-  // `memoryClassPartition` (partition on) OR `unpartitionedLegacyExport: true`
-  // (loud, named full-export opt-out). Supplying neither - or both - throws, so
-  // an agent-exit caller cannot silently fall through to "export everything."
-  const hasPartition = opts.memoryClassPartition !== undefined;
-  const hasLegacyOptOut = opts.unpartitionedLegacyExport === true;
-  if (hasPartition === hasLegacyOptOut) {
-    throw new Error(
-      "exit-bundle: exactly one of memoryClassPartition or " +
-        "unpartitionedLegacyExport must be supplied. The ownership partition is " +
-        "not silently skippable; pass memoryClassPartition for an ownership-classed " +
-        "exit, or unpartitionedLegacyExport: true to deliberately export all state.",
-    );
   }
 
   // An entry travels in the outbound bundle ONLY when it carries a live sealed
@@ -735,19 +829,61 @@ async function exportEncryptedState(
       ? mintSourceCustody(opts.masterKey)
       : undefined;
 
+  // Only read the source KDF profile (Argon2id salt + cost) when there is
+  // re-keyable state. An empty/zero-state bundle has nothing to re-key, so
+  // leaking the fortress salt + cost profile for it is gratuitous - gate it
+  // symmetrically with `source_custody` (which is already entries-gated via
+  // `minted`).
+  const keyParams: SourceKeyParamsRead =
+    entries.length > 0
+      ? await readSourceKeyParams(opts.storage)
+      : { state: "absent" };
+  // INVARIANT (A3): _meta/key-params is untrusted bytes until shape-checked.
+  // Whatever passes this gate is embedded VERBATIM in encrypted_state.json and
+  // pinned by the Ed25519-signed manifest, so a malformed marker here becomes a
+  // signed re-key path that NO import can use. Malformed => structured throw at
+  // export; never embed unvalidated, never silently omit (hard constraint 5).
+  if (keyParams.state === "malformed") {
+    await opts.auditLog.appendCritical({
+      layer: "l1",
+      operation: EXIT_EXPORT_REFUSED_MALFORMED_KDF_MARKER_OP,
+      identity_id: opts.identityManager.getDefault()?.identity_id ?? "unknown",
+      result: "failure",
+      details: { reason: keyParams.reason },
+    });
+    throw new Error(
+      "exit-bundle: refusing to export. The fortress's legacy re-key marker at " +
+        `_meta/key-params is malformed (${keyParams.reason}). Embedding it would ` +
+        "produce a cryptographically valid, signed bundle whose legacy re-key " +
+        "path no import can ever use, and the failure would only surface after " +
+        "the source fortress is gone. Repair the marker, or - if this is an " +
+        "envelope-custody fortress where the marker is vestigial - remove " +
+        "_meta/key-params and re-export; the authoritative re-key path is the " +
+        "bundle re-key key printed at export.",
+    );
+  }
+
+  // INVARIANT (A8): a zero-entry artifact MUST name why it is empty. The signed
+  // manifest covers an empty artifact exactly as a full one, so without this
+  // marker verify/import cannot distinguish "fortress was empty" from "an export
+  // bug dropped everything". Enum, not free text; a zero-entry artifact WITHOUT
+  // this marker is downstream evidence of a pre-marker or buggy exporter.
+  const emptyReason: ExitEmptyReason | undefined =
+    entries.length > 0
+      ? undefined
+      : collected.length > 0
+        ? EXIT_EMPTY_REASONS.PARTITION_EXCLUDED_ALL
+        : EXIT_EMPTY_REASONS.FORTRESS_STATE_EMPTY;
+
   return {
     bundle: {
       format: "SANCTUARY_EXIT_ENCRYPTED_STATE_V1",
       exported_at: new Date().toISOString(),
       key_source: opts.keySource ?? "unknown",
       ownership_partitioned: opts.memoryClassPartition !== undefined,
-      // Only emit the source KDF profile (Argon2id salt + cost) when there is
-      // re-keyable state. An empty/zero-state bundle has nothing to re-key, so
-      // leaking the fortress salt + cost profile for it is gratuitous - gate it
-      // symmetrically with `source_custody` (which is already entries-gated via
-      // `minted`).
-      ...(entries.length > 0
-        ? { source_key_derivation: await readSourceKeyParams(opts.storage) }
+      ...(emptyReason !== undefined ? { empty_reason: emptyReason } : {}),
+      ...(keyParams.state === "ok"
+        ? { source_key_derivation: keyParams.params }
         : {}),
       ...(minted !== undefined ? { source_custody: minted.custody } : {}),
       namespaces: [...new Set(entries.map((entry) => entry.namespace))].sort(),
@@ -936,6 +1072,34 @@ async function exportPlaceholderVaultMetadata(
 export async function exportExitBundle(
   opts: ExportExitBundleOptions
 ): Promise<ExportExitBundleResult> {
+  // INVARIANT (A9): every option-shape refusal fires BEFORE the first side
+  // effect (mkdir / audit append / artifact write). A throw after
+  // public_identity.json lands leaves a partial, unsigned artifact directory a
+  // later run may mistake for a bundle. There are exactly three such refusals
+  // and both statements below run before the first `mkdir`:
+  // `assertExportOptionsShape` (the empty-stateNamespaces and the
+  // partition/legacy-opt-out XOR) and `validateExportDidWeb` (the did:web
+  // shape + host-agreement checks). Both are pure functions of `opts`. The
+  // identical checks deeper in exportEncryptedState are retained as defense in
+  // depth for any future direct caller of that function.
+  assertExportOptionsShape(opts);
+  // Recognition-Layer Path C primary build 2: validate + embed the
+  // did:web pointer when the caller supplied one. Two structural
+  // checks before embedding so a malformed binding fails loudly at
+  // export rather than at the receiving regime's resolver:
+  //
+  //   1. `identifier` parses as a did:web URI under the supplied
+  //      `authority_host` (`parseDidWeb` throws on shape mismatch).
+  //   2. The parsed `authority_host` matches `binding.authority_host`
+  //      (defends against an operator typo where the URI's host and
+  //      the published host diverge).
+  //
+  // Pubkey match is the import-side verifier's job: the receiving
+  // regime is the one that benefits from confirming the operator's
+  // claimed pubkey matches the resolved DID Document. The export
+  // side does not re-fetch the published document; it embeds the
+  // pointer the operator declared.
+  const didWebBinding = validateExportDidWeb(opts.didWeb);
   const bundleDir = resolve(opts.bundleDir);
   await mkdir(bundleDir, { recursive: true, mode: 0o700 });
   await mkdir(join(bundleDir, ARTIFACT_DIR), { recursive: true, mode: 0o700 });
@@ -1037,24 +1201,8 @@ export async function exportExitBundle(
     )
   );
 
-  // Recognition-Layer Path C primary build 2: validate + embed the
-  // did:web pointer when the caller supplied one. Two structural
-  // checks before embedding so a malformed binding fails loudly at
-  // export rather than at the receiving regime's resolver:
-  //
-  //   1. `identifier` parses as a did:web URI under the supplied
-  //      `authority_host` (`parseDidWeb` throws on shape mismatch).
-  //   2. The parsed `authority_host` matches `binding.authority_host`
-  //      (defends against an operator typo where the URI's host and
-  //      the published host diverge).
-  //
-  // Pubkey match is the import-side verifier's job: the receiving
-  // regime is the one that benefits from confirming the operator's
-  // claimed pubkey matches the resolved DID Document. The export
-  // side does not re-fetch the published document; it embeds the
-  // pointer the operator declared.
-  const didWebBinding = validateExportDidWeb(opts.didWeb);
-
+  // `didWebBinding` was validated at the top of this function, before the
+  // first side effect (A9), and is embedded here unchanged.
   const body: ExitBundleManifestBody = {
     manifest_version: EXIT_BUNDLE_MANIFEST_VERSION,
     exported_at: new Date().toISOString(),
@@ -1370,8 +1518,9 @@ function decodeSourceRecoveryKey(sourceRecoveryKey: string): Uint8Array {
  *  2. Passphrase + legacy `source_key_derivation`: the explicit legacy path
  *     (`master = Argon2id(passphrase, params)`, pre-envelope semantics).
  *     Kept for migrated fortresses, whose bundles carry the legacy params
- *     by design; a wrong passphrase is caught by the all-entries-failed
- *     check in `rekeyState` (SOURCE_KEY_MISMATCH).
+ *     by design; the params are shape/cost-checked first
+ *     (SOURCE_KDF_PARAMS_MALFORMED), and a wrong passphrase is caught by the
+ *     all-entries-failed check in `rekeyState` (SOURCE_KEY_MISMATCH).
  *  3. Passphrase WITHOUT legacy params: fails closed. Envelope-era bundles
  *     deliberately carry no passphrase-checkable material (no offline
  *     oracle), so a passphrase cannot re-key them - the error points the
@@ -1381,8 +1530,11 @@ function decodeSourceRecoveryKey(sourceRecoveryKey: string): Uint8Array {
  *     unwraps nothing FAILS CLOSED with `SOURCE_CREDENTIAL_INVALID` -
  *     never falls through to the legacy raw-key path (that would silently
  *     treat an arbitrary 32 bytes as the master and drop every entry).
- *  5. Recovery key on a legacy bundle: pre-envelope semantics (the
- *     recovery key IS the master), mismatch-checked in `rekeyState`.
+ *  5. Recovery key on a bundle with NO `source_custody`: AMBIGUOUS, and
+ *     refused by default (`SOURCE_RECOVERY_KEY_AMBIGUOUS`). The pre-envelope
+ *     semantics (the recovery key IS the master) run only under the explicit
+ *     `legacyRecoveryKeyIsMaster` opt-in, and a wrong key there is still
+ *     mismatch-checked in `rekeyState`.
  *
  * The recovered master is transient: it only decrypts bundle entries, which
  * are immediately re-encrypted and re-signed under the DESTINATION
@@ -1401,10 +1553,27 @@ async function resolveSourceMasterKey(
 
   if (opts.sourcePassphrase) {
     if (encryptedState.source_key_derivation) {
-      return (await deriveMasterKey(
-        opts.sourcePassphrase,
+      // INVARIANT (A3): bundle-carried KDF params are attacker-influenceable
+      // input to Argon2id. Shape + cost bounds are enforced here, at the single
+      // site that feeds them to deriveMasterKey; out-of-bounds params fail
+      // closed with SOURCE_KDF_PARAMS_MALFORMED rather than burning unbounded
+      // memory or deriving a garbage master that dies later as
+      // SOURCE_KEY_MISMATCH. CONTRACT PIN (server/src/core/key-derivation.ts
+      // parseKeyDerivationParams): same validator as the export embed-gate.
+      const checked = parseKeyDerivationParams(
         encryptedState.source_key_derivation
-      )).key;
+      );
+      if (!checked.ok) {
+        throw new ExitBundleImportError(
+          "SOURCE_KDF_PARAMS_MALFORMED",
+          "This bundle's legacy re-key parameters (source_key_derivation) are " +
+            `unusable: ${checked.reason}. A passphrase cannot recover the source ` +
+            "master from them, and Sanctuary will not run a key derivation on " +
+            "parameters it cannot validate. Re-export the bundle from the source " +
+            "fortress, or supply the source master key programmatically.",
+        );
+      }
+      return (await deriveMasterKey(opts.sourcePassphrase, checked.params)).key;
     }
     if (sourceCustody !== undefined) {
       throw new ExitBundleImportError(
@@ -1442,11 +1611,83 @@ async function resolveSourceMasterKey(
       }
       return master;
     }
-    // Legacy semantics: the recovery key IS the master.
+    // INVARIANT (A4): a recovery key with NO source_custody block is AMBIGUOUS -
+    // either a bundle re-key key aimed at a bundle that cannot use it, or a
+    // legacy (pre-envelope) source recovery key that IS the master. Guessing
+    // "raw master" silently was how the operator's first signal became a
+    // downstream SOURCE_KEY_MISMATCH naming the symptom, never the cause.
+    // Refuse by default (symmetric with SOURCE_PASSPHRASE_UNSUPPORTED above);
+    // the legacy interpretation requires the explicit
+    // legacyRecoveryKeyIsMaster opt-in.
+    if (opts.legacyRecoveryKeyIsMaster !== true) {
+      throw new ExitBundleImportError(
+        "SOURCE_RECOVERY_KEY_AMBIGUOUS",
+        "This bundle carries no source_custody block, so the supplied " +
+          "--source-recovery-key has two possible meanings and Sanctuary will " +
+          "not guess between them. Either (a) it is a BUNDLE RE-KEY KEY from a " +
+          "different export and this is the wrong bundle (or a pre-envelope " +
+          "one) - in which case re-export from the source fortress and use the " +
+          "re-key key that export prints; or (b) this is a LEGACY bundle whose " +
+          "fortress used recovery-key custody, where the recovery key IS the " +
+          "source master - in which case confirm that interpretation by " +
+          "re-running with --legacy-source-master: " +
+          "sanctuary exit import <dir> --activate --import-state " +
+          "--source-recovery-key <key> --legacy-source-master",
+      );
+    }
+    // Legacy semantics, explicitly confirmed by the operator: the recovery key
+    // IS the master. A wrong key is still caught downstream by rekeyState's
+    // all-entries-failed SOURCE_KEY_MISMATCH.
     return decodeSourceRecoveryKey(opts.sourceRecoveryKey);
   }
 
   return null;
+}
+
+/**
+ * True when the caller supplied ANY source credential, i.e. explicitly asked
+ * for the bundle's encrypted state. Mirrors the credentials
+ * `resolveSourceMasterKey` accepts; keep the two in step.
+ */
+function importRequestedSourceCredential(
+  opts: ImportExitBundleOptions
+): boolean {
+  return (
+    opts.sourcePassphrase !== undefined ||
+    opts.sourceRecoveryKey !== undefined ||
+    opts.sourceMasterKey !== undefined
+  );
+}
+
+/**
+ * Operator-facing warning for a zero-entry encrypted_state artifact, keyed on
+ * the A8 marker. An ABSENT marker is the louder case: it means a pre-marker or
+ * buggy exporter wrote this bundle, so nothing in it distinguishes an empty
+ * fortress from an export that dropped everything.
+ */
+function emptyStateWarning(encryptedState: ExitEncryptedStateBundle): string {
+  switch (encryptedState.empty_reason) {
+    case EXIT_EMPTY_REASONS.FORTRESS_STATE_EMPTY:
+      return (
+        "this bundle carries zero state entries and its exporter recorded " +
+        `empty_reason=${EXIT_EMPTY_REASONS.FORTRESS_STATE_EMPTY}: the source ` +
+        "fortress had no exportable state."
+      );
+    case EXIT_EMPTY_REASONS.PARTITION_EXCLUDED_ALL:
+      return (
+        "this bundle carries zero state entries and its exporter recorded " +
+        `empty_reason=${EXIT_EMPTY_REASONS.PARTITION_EXCLUDED_ALL}: the source ` +
+        "fortress had state, but the ownership partition withheld every entry."
+      );
+    default:
+      return (
+        "this bundle carries zero state entries and NO empty_reason marker: it " +
+        "was written by a pre-marker (or buggy) exporter, so an empty source " +
+        "fortress cannot be distinguished from an export that dropped " +
+        "everything. Verify the source fortress before treating this as a " +
+        "complete exit."
+      );
+  }
 }
 
 /**
@@ -1619,6 +1860,27 @@ function activationSnapshotLocations(
   return locations;
 }
 
+/**
+ * One phrase naming which credential semantics `resolveSourceMasterKey`
+ * applied, for the SOURCE_KEY_MISMATCH message. Mirrors that function's
+ * precedence; if the precedence changes, change this in the same commit.
+ */
+function describeSourceCredentialInterpretation(
+  encryptedState: ExitEncryptedStateBundle,
+  opts: ImportExitBundleOptions
+): string {
+  if (opts.sourceMasterKey) return "the caller supplied the source master key directly";
+  if (opts.sourcePassphrase) {
+    return "the passphrase was run through the bundle's legacy source_key_derivation parameters";
+  }
+  if (opts.sourceRecoveryKey) {
+    return encryptedState.source_custody !== undefined
+      ? "the key was unwrapped from the bundle's source_custody block"
+      : "the key was applied under legacy raw-master semantics (--legacy-source-master)";
+  }
+  return "no source credential was supplied";
+}
+
 async function rekeyState(
   encryptedState: ExitEncryptedStateBundle,
   opts: ImportExitBundleOptions,
@@ -1773,7 +2035,11 @@ async function rekeyState(
         "The source credential does not match the key this state was actually " +
         "encrypted under (on legacy bundles this can indicate a fortress whose " +
         "passphrase-derived key diverged from its true master). Re-run with the " +
-        "correct source credential, or re-export the bundle from the source fortress."
+        "correct source credential, or re-export the bundle from the source fortress. " +
+        // A4 follow-through: name the INTERPRETATION that was in effect, so even
+        // the residual mismatch says which credential semantics were applied
+        // rather than leaving the operator to infer it from the flags they typed.
+        `Interpretation in effect: ${describeSourceCredentialInterpretation(encryptedState, opts)}.`
     );
   }
 
@@ -2323,13 +2589,25 @@ export async function importExitBundle(
               conflicts: conflicts.state_conflicts.length,
             }
         : {
-            status: "not_requested" as const,
+            // INVARIANT (A8): "the bundle carried zero entries" is NOT
+            // "no state import was requested". When the operator supplied a
+            // source credential they explicitly asked for state, so reporting
+            // `not_requested` here was a false negative that also mis-fired the
+            // CLI's "re-run with --import-state" advice. Credentials supplied
+            // => `empty_bundle`; no credentials => `not_requested` stays, plus
+            // a warning naming the empty_reason marker (or its absence).
+            status: importRequestedSourceCredential(opts)
+              ? ("empty_bundle" as const)
+              : ("not_requested" as const),
             imported_keys: 0,
             skipped_keys: 0,
             skipped_invalid_sig: 0,
             skipped_unknown_kid: 0,
             conflicts: 0,
           };
+    if (encryptedState && encryptedState.json.entries.length === 0) {
+      importWarnings.push(emptyStateWarning(encryptedState.json));
+    }
     // M2-slice (warn): the destination `stateStore.write` mints a fresh
     // `written_at` and a fresh monotonic `ver` - both are bound into the
     // signed envelope, so they cannot be back-stamped to the source values

@@ -23,6 +23,7 @@ import type {
   ExitBundleVerifierResult,
 } from "../contracts/v1.1/exit-bundle-manifest.js";
 import { verifyExitBundle, InvalidExitBundleError } from "./verifier.js";
+import { inspectExitBundle, inspectExitCode } from "./inspect.js";
 import { loadFortressDidWebRecord } from "../recognition/did-web.js";
 
 const EXIT_EXPORT_ABORTED_EXIT_CODE = 78;
@@ -203,6 +204,9 @@ Commands:
   verify <dir>                Verify manifest, artifacts, signatures, and exported-set completeness
   import <dir> [--activate]   Verify, report conflicts, and optionally activate
   manifest-shape              Print the v1.1 manifest shape
+  inspect <dir>               Read-only: what the bundle carries and WHICH
+                              credential re-keys its state. No passphrase, no
+                              writes.
 
 Options:
   --passphrase <value>              Current destination/source passphrase
@@ -211,6 +215,11 @@ Options:
                                     use the bundle re-key key instead)
   --source-recovery-key <value>     Bundle re-key key (displayed at export) or
                                     legacy source recovery key for state re-key
+  --legacy-source-master            On import, with --source-recovery-key: confirm
+                                    the key is the SOURCE FORTRESS MASTER, not a
+                                    bundle re-key key. Required for bundles with
+                                    no source_custody block; without it the import
+                                    refuses rather than guessing.
   --destination-identity-id <id>    Destination signer for re-keyed state
   --import-state                    Import encrypted state during activation.
                                     Requires --activate and source credentials.
@@ -373,12 +382,64 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
             `reputation completeness: ${result.reputation.completeness}\n`
           );
         }
+        // ADDITIVE ONLY: every line above this point is a shipped display
+        // string and stays byte-identical (frozen-surface rule). The state
+        // lines are appended, never interleaved, so an operator script that
+        // greps for `identity:` or `artifacts:` is unaffected.
+        if (result.state) {
+          write(out, `state_entries: ${result.state.entry_count}\n`);
+          if (result.state.empty_reason !== undefined) {
+            write(out, `empty_reason: ${result.state.empty_reason}\n`);
+          }
+        }
         for (const warning of result.warnings) write(out, `warning: ${warning}\n`);
         for (const item of result.unsupported_artifacts) {
           write(out, `unsupported: ${item}\n`);
         }
       }
       return result.passed ? 0 : 1;
+    }
+
+    if (command === "inspect") {
+      const dir = argv[1];
+      if (!dir) {
+        write(err, "Usage: sanctuary exit inspect <dir>\n");
+        return 2;
+      }
+      let report;
+      try {
+        report = await inspectExitBundle(dir);
+      } catch (e) {
+        if (e instanceof InvalidExitBundleError) {
+          write(err, `Error: ${e.message}\n`);
+          return 1;
+        }
+        throw e;
+      }
+      if (json) {
+        write(out, JSON.stringify(report, null, 2) + "\n");
+      } else {
+        write(out, `verdict: ${report.verdict}\n`);
+        write(out, `identity: ${report.identity_id}\n`);
+        write(out, `fortress: ${report.fortress_id}\n`);
+        write(out, `exported_at: ${report.exported_at}\n`);
+        write(out, `artifacts: ${report.artifact_count}\n`);
+        write(out, `state_entries: ${report.state?.entry_count ?? "unknown"}\n`);
+        write(
+          out,
+          `namespaces: ${report.state?.namespaces.join(", ") ?? "unknown"}\n`,
+        );
+        if (report.state?.empty_reason !== undefined) {
+          write(out, `empty_reason: ${report.state.empty_reason}\n`);
+        }
+        write(out, `legacy_kdf_params: ${report.legacy_kdf_params}\n`);
+        write(out, `credential: ${report.credential_path}\n`);
+        write(out, `to import state: ${report.credential_instruction}\n`);
+        for (const warning of report.warnings) {
+          write(out, `warning: ${warning}\n`);
+        }
+      }
+      return inspectExitCode(report);
     }
 
     if (command === "export") {
@@ -643,6 +704,18 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
       const forceRebind = hasFlag(argv, "--force-rebind");
       const sourcePassphrase = flagValue(argv, "--source-passphrase");
       const sourceRecoveryKey = flagValue(argv, "--source-recovery-key");
+      // A4: the named confirmation that a recovery key on a bundle WITHOUT a
+      // source_custody block is the source fortress's raw master. Meaningless
+      // on its own, so refuse the shape rather than ignoring the flag.
+      const legacySourceMaster = hasFlag(argv, "--legacy-source-master");
+      if (legacySourceMaster && !sourceRecoveryKey) {
+        write(
+          err,
+          "--legacy-source-master requires --source-recovery-key (it confirms " +
+            "how that key is interpreted)\n",
+        );
+        return 2;
+      }
       if (importState && !activate) {
         write(err, "--import-state requires --activate\n");
         return 2;
@@ -721,6 +794,9 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
             : {}),
           ...(importState && sourceRecoveryKey
             ? { sourceRecoveryKey }
+            : {}),
+          ...(importState && sourceRecoveryKey && legacySourceMaster
+            ? { legacyRecoveryKeyIsMaster: true }
             : {}),
           destinationSignerIdentityId: flagValue(argv, "--destination-identity-id"),
           ...(didWebAllowedHosts.length > 0

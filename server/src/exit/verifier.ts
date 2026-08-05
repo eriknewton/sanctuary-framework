@@ -36,6 +36,7 @@ import {
   type ExitBundleVerifierResult,
 } from "../contracts/v1.1/exit-bundle-manifest.js";
 import { fromBase64url, stringToBytes } from "../core/encoding.js";
+import { parseKeyDerivationParams } from "../core/key-derivation.js";
 import { hash } from "../core/hashing.js";
 import { canonicalize, canonicalizeToBytes } from "../mesh/canonical-json.js";
 import {
@@ -49,12 +50,61 @@ import {
   readFileCustodyWithStats,
 } from "../storage/custody-fs.js";
 
+/**
+ * Which credential re-keys this bundle's encrypted state, derived from the
+ * artifact alone (no fortress access, no operator secret).
+ *
+ * CONTRACT PIN (server/src/exit/bundle.ts `resolveSourceMasterKey`): this
+ * classification MUST mirror that function's precedence exactly
+ * (source_custody => bundle re-key key; valid source_key_derivation => legacy
+ * passphrase; neither => legacy recovery-key-as-master behind the explicit
+ * `legacyRecoveryKeyIsMaster` opt-in; zero entries => nothing to re-key). If
+ * either side changes, change both in the same commit.
+ */
+export type ExitBundleCredentialPath =
+  | "bundle-rekey-key"
+  | "source-passphrase-legacy"
+  | "legacy-recovery-key-as-master"
+  | "none-required"
+  | "unusable";
+
+/**
+ * What the encrypted_state artifact says about itself, read from the parsed
+ * JSON without trusting any declared type. Deliberately structural: the
+ * verifier must not import `ExitEncryptedStateBundle` from bundle.ts (bundle.ts
+ * already imports this module, and the reverse edge would be an import cycle),
+ * and a verifier that narrows untrusted JSON itself is the right posture anyway.
+ */
+export interface ExitEncryptedStateSummary {
+  entry_count: number;
+  namespace_count: number;
+  namespaces: string[];
+  ownership_partitioned: boolean;
+  /**
+   * CONTRACT PIN (server/src/exit/bundle.ts `EXIT_EMPTY_REASONS`): the token
+   * set is owned there; this field carries whatever the artifact declared,
+   * verbatim, so an unknown future token surfaces rather than being erased.
+   */
+  empty_reason?: string;
+  /** True IFF the artifact has zero entries AND declares no `empty_reason`. */
+  empty_reason_missing: boolean;
+  credential_path: ExitBundleCredentialPath;
+  legacy_kdf_params: "absent" | "valid" | "malformed";
+}
+
 export interface ExitBundleDetailedVerifierResult
   extends ExitBundleVerifierResult {
   manifest_path: string;
   manifest_hash: string | null;
   warnings: string[];
   unsupported_artifacts: string[];
+  /**
+   * Additive: what the encrypted_state artifact carries and which credential
+   * re-keys it. Absent when the bundle has no encrypted_state artifact or the
+   * verifier failed before the artifact pass. This is a verifier-local
+   * interface, NOT the frozen `ExitBundleVerifierResult` contract type.
+   */
+  state?: ExitEncryptedStateSummary;
   identity?: {
     signature_valid: boolean;
     identity_id?: string;
@@ -206,6 +256,73 @@ function findPrivateMaterial(value: unknown, path = "$"): string[] {
     findings.push(...findPrivateMaterial(child, `${path}.${key}`));
   }
   return findings;
+}
+
+/**
+ * Summarize a parsed `artifacts/encrypted_state.json` and classify which
+ * credential re-keys it. Pure, total, and defensive: every field is narrowed
+ * from `unknown`, so a hand-crafted or truncated artifact yields a conservative
+ * summary rather than throwing. Shared by `exit verify` and `exit inspect` so
+ * the two can never disagree about a bundle.
+ *
+ * @param artifact - the parsed encrypted_state JSON (already hash-verified
+ *   against the signed manifest by the caller).
+ */
+export function summarizeEncryptedState(
+  artifact: unknown
+): ExitEncryptedStateSummary {
+  const record =
+    artifact !== null && typeof artifact === "object" && !Array.isArray(artifact)
+      ? (artifact as Record<string, unknown>)
+      : {};
+  const entries = Array.isArray(record.entries) ? record.entries : [];
+  const namespaces = Array.isArray(record.namespaces)
+    ? record.namespaces.filter((n): n is string => typeof n === "string")
+    : [];
+  const emptyReason =
+    typeof record.empty_reason === "string" ? record.empty_reason : undefined;
+
+  // CONTRACT PIN (server/src/core/key-derivation.ts parseKeyDerivationParams):
+  // the same validator the export embed-gate and the import derive-gate use, so
+  // "malformed" here means exactly what makes an import refuse.
+  const legacyKdfParams: ExitEncryptedStateSummary["legacy_kdf_params"] =
+    record.source_key_derivation === undefined
+      ? "absent"
+      : parseKeyDerivationParams(record.source_key_derivation).ok
+        ? "valid"
+        : "malformed";
+
+  const hasCustody =
+    record.source_custody !== null &&
+    typeof record.source_custody === "object" &&
+    !Array.isArray(record.source_custody);
+
+  let credentialPath: ExitBundleCredentialPath;
+  if (entries.length === 0) {
+    credentialPath = "none-required";
+  } else if (hasCustody) {
+    credentialPath = "bundle-rekey-key";
+  } else if (legacyKdfParams === "valid") {
+    credentialPath = "source-passphrase-legacy";
+  } else if (legacyKdfParams === "malformed") {
+    // The bundle DECLARES a legacy passphrase path and that path is dead: the
+    // import derive-gate refuses it with SOURCE_KDF_PARAMS_MALFORMED. This is
+    // the A3-damaged shape already in the wild.
+    credentialPath = "unusable";
+  } else {
+    credentialPath = "legacy-recovery-key-as-master";
+  }
+
+  return {
+    entry_count: entries.length,
+    namespace_count: namespaces.length,
+    namespaces,
+    ownership_partitioned: record.ownership_partitioned === true,
+    ...(emptyReason !== undefined ? { empty_reason: emptyReason } : {}),
+    empty_reason_missing: entries.length === 0 && emptyReason === undefined,
+    credential_path: credentialPath,
+    legacy_kdf_params: legacyKdfParams,
+  };
 }
 
 export async function readManifest(bundleDir: string): Promise<ExitBundleManifest> {
@@ -445,6 +562,11 @@ export async function verifyExitBundle(
   let artifactFailure:
     | NonNullable<ExitBundleVerifierResult["failure_class"]>
     | null = null;
+  // Captured from the artifact-hash pass below rather than re-read afterwards:
+  // the loop already parses every artifact for the private-material scan, and a
+  // second read could observe a DIFFERENT file than the one just hash-verified.
+  let encryptedStateJson: unknown;
+  let sawEncryptedState = false;
 
   for (const artifact of body.artifacts) {
     const artifactPath = join(root, artifact.path);
@@ -503,6 +625,10 @@ export async function verifyExitBundle(
 
     try {
       const parsed = JSON.parse(Buffer.from(bytes).toString("utf8"));
+      if (artifact.kind === "encrypted_state") {
+        encryptedStateJson = parsed;
+        sawEncryptedState = true;
+      }
       const privateFindings = findPrivateMaterial(parsed);
       if (privateFindings.length > 0) {
         artifactFailure = "private_material_present";
@@ -521,6 +647,25 @@ export async function verifyExitBundle(
       manifest_hash: sha256Hex(manifestBytes),
       artifact_results: artifactResults,
     };
+  }
+
+  const stateSummary = sawEncryptedState
+    ? summarizeEncryptedState(encryptedStateJson)
+    : undefined;
+  if (stateSummary?.empty_reason_missing === true) {
+    warnings.push(
+      "encrypted state carries zero entries and no empty_reason marker: " +
+        "exported by a pre-marker (or buggy) exporter; cannot distinguish an " +
+        "empty fortress from a broken export - verify the source fortress " +
+        "before treating this as a complete exit"
+    );
+  }
+  if (stateSummary?.legacy_kdf_params === "malformed") {
+    warnings.push(
+      "encrypted state carries malformed legacy re-key parameters " +
+        "(source_key_derivation): the bundle is signed and intact, but its " +
+        "passphrase re-key path cannot run. Re-export from the source fortress"
+    );
   }
 
   const publicKeysByDid = new Map<string, Uint8Array>();
@@ -673,6 +818,7 @@ export async function verifyExitBundle(
     identity,
     audit,
     reputation,
+    ...(stateSummary !== undefined ? { state: stateSummary } : {}),
     failure_class: detailedFailureClass,
   };
 }
