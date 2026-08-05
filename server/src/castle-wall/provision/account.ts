@@ -28,15 +28,36 @@ import { setTimeout as sleep } from "node:timers/promises";
  */
 
 /**
- * POSIX-ish service-account name, deliberately the SAME conservative charset
- * as harness-daemon.ts's SAFE_ACCOUNT_RE (kept in lockstep by a structural
- * test): lowercase start, then a conservative charset. This rejects anything
- * that could smuggle shell metacharacters or spaces into a `dscl`/
- * `sysadminctl` argv.
+ * POSIX-ish service-account name: lowercase start, then a conservative
+ * charset. This rejects anything that could smuggle shell metacharacters or
+ * spaces into a `dscl`/`sysadminctl` argv.
+ *
+ * CROSS-FILE CONTRACT. This is the CANONICAL declaration; it must match
+ * `SAFE_ACCOUNT_RE` in `egress-gate/harness-daemon.ts` and `SAFE_ACCOUNT_RE`
+ * in `egress-gate/gate-daemon.ts`, both of which re-declare the same pattern
+ * locally (those two modules render world-readable LaunchDaemon plists and
+ * deliberately keep their input validation free of a castle-wall import).
+ * Enforced by `test/structure/cross-file-contract-pins.test.ts`.
+ *
+ * NOTE (2026-08-05): this doc-comment previously claimed the lockstep was
+ * "kept by a structural test". No such test existed anywhere in `server/test`
+ * when that was written; the test named above is the first one. The claim is
+ * now true.
  */
 export const SAFE_SERVICE_ACCOUNT_RE = /^[a-z_][a-z0-9._-]{0,63}$/;
 
-/** Privileged account names an agent service account must never collide with. */
+/**
+ * Privileged account names an agent service account must never collide with.
+ *
+ * NOT a mirror of the reserved-name checks in `egress-gate/gate-daemon.ts` and
+ * `egress-gate/harness-daemon.ts`, and the difference is real, not a typo:
+ * those two refuse `root`/`_root`/`daemon`/`wheel` only, so `admin` is a legal
+ * gate or harness daemon account name and an illegal agent account name. The
+ * charset regex above IS shared; this set is not. Do not "reconcile" the two
+ * without deciding which behavior is correct -- widening the daemon side is a
+ * behavior change that can refuse an account name an existing host already
+ * uses.
+ */
 const RESERVED_ACCOUNT_NAMES = new Set(["root", "_root", "daemon", "wheel", "admin"]);
 
 /** Derive the canonical dedicated account name for an agent id, e.g. "hermes" -> "sanctuary-hermes". */

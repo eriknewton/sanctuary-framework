@@ -243,6 +243,18 @@ body {
   background: var(--sage);
 }
 
+/* These two selectors have NO literal counterpart in the TypeScript. Their
+ * producer builds the class name at runtime -- `status-${connection_status}` in
+ * menubar/src/popover/popover.ts, renderFooter -- so grepping for
+ * `status-degraded` finds only this file and reads as dead CSS. It is not.
+ * The suffixes must stay equal to the members of the
+ * `FleetSnapshot.connection_status` union in menubar/src/api/client.ts
+ * ('connected' | 'degraded' | 'disconnected'); `connected` intentionally has no
+ * rule because the base .status-dot colour above is the connected state.
+ *
+ * Failure mode: a renamed union member breaks nothing loudly. The selector
+ * stops matching and the dot falls back to the connected colour, so a
+ * disconnected fortress reports as healthy in the menubar. */
 .status-degraded .status-dot {
   background: var(--ochre);
 }
