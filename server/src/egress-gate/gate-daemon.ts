@@ -170,6 +170,20 @@ export function parseEgressGateRuntimeState(text: string, path: string): EgressG
   };
 }
 
+/**
+ * POSIX-ish service-account name: lowercase start, then a conservative
+ * charset, so nothing that could smuggle plist markup or spaces reaches the
+ * rendered LaunchDaemon.
+ *
+ * Must match `SAFE_SERVICE_ACCOUNT_RE` in
+ * `castle-wall/provision/account.ts` (the canonical declaration) and
+ * `SAFE_ACCOUNT_RE` in `egress-gate/harness-daemon.ts`. Re-declared rather
+ * than imported to keep this plist renderer free of a castle-wall dependency.
+ * Enforced by `server/test/structure/cross-file-contract-pins.test.ts`.
+ *
+ * The reserved-name check further down is NOT a mirror: account.ts
+ * additionally reserves `admin`.
+ */
 const SAFE_ACCOUNT_RE = /^[a-z_][a-z0-9._-]{0,63}$/;
 const GATE_DAEMON_LOG_DIR_NAME = "logs";
 

@@ -27,7 +27,30 @@
 
 import type { DistressReason, DistressSeverity } from "../../distress/tools.js";
 
-/** The FROZEN schema discriminator carried by every exported event. */
+/**
+ * The FROZEN schema discriminator carried by every exported event.
+ *
+ * This is the SOLE declaration of the literal in `server/src`. The batch
+ * envelope `HttpCollectorSink` POSTs in `./sink.ts` tags itself with this same
+ * constant by import, so envelope and events can never announce different
+ * versions.
+ *
+ * `test/structure/cross-file-contract-pins.test.ts` walks EVERY .ts file under
+ * `server/src` over RAW source and fails on any occurrence of this string
+ * written as a QUOTED literal outside this declaration. Its allowlist is empty.
+ *
+ * What that scan does NOT see, stated because an earlier version of this
+ * comment claimed more than the code did: a bare, unquoted mention. Both
+ * `cli/cortex-export.ts` (operator `--help` text) and `./README.md` spell the
+ * version bare, so neither is detected, and neither is a declaration. Both are
+ * descriptions that must be updated alongside a version bump, and nothing
+ * mechanical will remind you.
+ *
+ * Why the scan and not just this comment: a re-typed copy is how a `.v2` mint
+ * ships a half-migrated stream, and a consumer keying its ingestion rules off
+ * the version would mis-model the batch without any error surfacing on either
+ * side.
+ */
 export const ENFORCEMENT_EVENT_SCHEMA = "sanctuary.enforcement-event.v1" as const;
 
 /** The FROZEN distress-envelope schema string this exporter forwards verbatim. */
