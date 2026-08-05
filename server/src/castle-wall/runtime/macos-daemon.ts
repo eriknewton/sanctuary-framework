@@ -64,6 +64,7 @@ import {
   writeFileCustody,
 } from "../../storage/custody-fs.js";
 import { MacOSFlowEventConsumer } from "./macos-flow-events.js";
+import { buildChainAnchorSourceFromAuditLog } from "./audit-consumer.js";
 import { MacOSFlowIpcListener } from "./macos-ipc-listener.js";
 import { protectionSubjectFromAgentOrigin } from "../subject-binding.js";
 import {
@@ -1068,6 +1069,11 @@ export async function startMacOSCastleWallDaemon(
       },
     },
     auditSink: input.auditLog,
+    // Restore the producer-signed flow chain's anchor from the fortress's OWN
+    // persisted audit log at startup (one-time old-basis migration included).
+    // Same log instance the sink appends to — the anchor is recomputed from
+    // entries this consumer persisted, never from the wire.
+    chainAnchorSource: buildChainAnchorSourceFromAuditLog(input.auditLog),
     defaultApprovalTimeoutSeconds: 30,
     pinnedProducerKeyB64url: auditProducerKey?.keyB64url ?? null,
     fortressId: input.fortressId,

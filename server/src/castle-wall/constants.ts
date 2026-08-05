@@ -183,6 +183,41 @@ export const CASTLE_WALL_EVIDENCE_BASIS_CHANNEL_UNSIGNED =
 export const CASTLE_WALL_EVIDENCE_BASIS_DRAIN_FAULT_UNSIGNED =
   "drain_fault_unsigned" as const;
 
+/**
+ * `details` key recording which CHAIN BASIS the consumer used when it chained
+ * this accepted entry. `producer_signed_body` means the entry's chain hash is
+ * `sha256(utf8(cw_producer_signed_canonical))` — the exact bytes every producer
+ * (Rust WAL, macOS flow + availability) hashes for its own `prior_sha256_hex`.
+ * `event_canonical` is the legacy consumer-local basis (hash of the
+ * reconstructed `CastleWallAuditEvent`) that no producer ever hashed; entries
+ * written before this key existed carry no basis key and are treated as
+ * `event_canonical`. The startup anchor restore reads this as a STORED FACT to
+ * decide whether the one-time basis migration is owed — it must never be
+ * inferred from in-memory state (the #1096 Q5 defect).
+ */
+export const CASTLE_WALL_CHAIN_BASIS_DETAIL_KEY = "cw_chain_basis" as const;
+export const CASTLE_WALL_CHAIN_BASIS_PRODUCER_SIGNED_BODY =
+  "producer_signed_body" as const;
+export const CASTLE_WALL_CHAIN_BASIS_EVENT_CANONICAL =
+  "event_canonical" as const;
+
+/**
+ * `details` key marking an accepted producer-signed entry whose signed
+ * `prior_sha256_hex` references a producer event OUTSIDE the stream this
+ * consumer receives. The macOS extension signs flow decisions and enforcement
+ * availability reports into ONE shared seq/prior chain, but only flow
+ * decisions reach the flow chain consumer — so a flow decision immediately
+ * preceded by an availability event carries a prior hash the consumer has
+ * never seen, by construction, on a healthy system. The entry is still fully
+ * signature-verified and strictly seq-monotonic; this marker keeps the
+ * persisted record honest that prior-hash CONTIGUITY was not locally
+ * assertable for this hop (never a claim of verified continuity it does not
+ * have). Complete-chain consumers (the Linux drain) never set it — a prior
+ * mismatch there is a hard fork.
+ */
+export const CASTLE_WALL_CHAIN_PRIOR_UNCONSUMED_DETAIL_KEY =
+  "cw_chain_prior_unconsumed" as const;
+
 /** WAL-chain sequence key grafted onto persisted details by the audit consumer. */
 export const CASTLE_WALL_WAL_SEQUENCE_DETAIL_KEY = "seq" as const;
 
@@ -209,6 +244,11 @@ export const CASTLE_WALL_SIGNED_ROW_BINDING_IGNORED_DETAIL_KEYS = [
   CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY,
   CASTLE_WALL_PRODUCER_SUBJECT_BINDING_DETAIL_KEY,
   CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY,
+  // Chain-basis bookkeeping is consumer-added (like seq/prior above): it
+  // records how the consumer chained the entry, and is never part of the
+  // producer's signed body.
+  CASTLE_WALL_CHAIN_BASIS_DETAIL_KEY,
+  CASTLE_WALL_CHAIN_PRIOR_UNCONSUMED_DETAIL_KEY,
   // Consumer provenance is stamped after the producer body is accepted.
   CASTLE_WALL_AUDIT_PROVENANCE_KEY,
 ] as const;
