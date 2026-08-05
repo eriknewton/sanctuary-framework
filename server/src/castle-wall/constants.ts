@@ -23,12 +23,18 @@
  *     `challengeNonceBytes` has NO counterpart here and is not part of this
  *     contract.
  *
- * Nothing in the build makes the three files agree: TypeScript, Rust, and
- * Swift compile independently. Failure mode of a drift is therefore silent at
- * build time and shows up as an enforcer that refuses every frame or every
- * signature the server sends -- a wall that reads as "installed but never
- * decides anything" rather than as a mismatched constant. Change a mirrored
- * value in all three files in the SAME PR.
+ * Nothing in the BUILD makes the three files agree: TypeScript, Rust, and
+ * Swift compile independently, so a drift is silent at build time and shows up
+ * as an enforcer that refuses every frame or every signature the server sends
+ * -- a wall that reads as "installed but never decides anything" rather than
+ * as a mismatched constant.
+ *
+ * `server/test/structure/cross-file-contract-pins.test.ts` closes that gap for
+ * exactly the constants enumerated above, by parsing each declaration out of
+ * all three files and comparing the parsed values (numerics included, so a
+ * one-sided schema-version bump fails). It covers ONLY those declarations: it
+ * compares no enforcement logic, no message shapes, and no constant not on the
+ * two lists. Change a mirrored value in all three files in the SAME PR.
  */
 
 /** Schema version for v1 allowlist rules + manifest + signed envelopes. */

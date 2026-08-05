@@ -69,9 +69,10 @@ export const TRANSPARENCY_ANCHORS_EXPORT_FORMAT =
 // These two must match `TRANSPARENCY_ANCHOR_SCHEMA_VERSION` and
 // `TRANSPARENCY_ANCHOR_COMMITMENT_DOMAIN` in `transparency/anchor.ts`; so must
 // the commitment preimage this file rebuilds at the recompute site below.
-// Re-typed rather than imported to keep this file on the offline
-// standalone-verifier side. Enforced by
-// `server/test/structure/cross-file-contract-pins.test.ts`.
+// Re-typed rather than imported for a concrete reason: `anchor.ts` imports
+// `core/key-derivation.ts` (it derives the anchoring signing key), which an
+// offline verifier holding no master key must never pull in.
+// Enforced by `server/test/structure/cross-file-contract-pins.test.ts`.
 const ANCHOR_SCHEMA_VERSION = 1;
 const ANCHOR_COMMITMENT_DOMAIN = "sanctuary.transparency.anchor-commitment.v1";
 /**

@@ -49,8 +49,11 @@ import type {
  *
  * The literals there are NOT written as `typeof <const>` on purpose: this file
  * imports `./types.js`, so a `typeof` reference would make types.ts import
- * back and close an import cycle. The duplication is the price of the acyclic
- * direction.
+ * back. TypeScript itself would tolerate that (an `import type` is erased and
+ * creates no runtime cycle), but `scripts/check-import-cycles.ts` is a regex
+ * scanner that does not distinguish type-only specifiers, so the repo's own
+ * cycle gate would count it. The duplication is the price of the acyclic
+ * direction as this repo measures it.
  *
  * Failure mode of a drift: TypeScript catches an assignment mismatch at
  * compile time IF both sides are in the same assignment, but a hand-parsed

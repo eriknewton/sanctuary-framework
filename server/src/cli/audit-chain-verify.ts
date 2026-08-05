@@ -17,11 +17,24 @@
  *      MAC (the export carries it for exactly that purpose). The report states
  *      this bound in `rotation_anchor_scope`.
  *
- * STANDALONE PROPERTY: This module imports only @noble/curves, @noble/hashes,
- * and Node builtins (node:fs, node:crypto). It does NOT import from any
- * Sanctuary server module (no storage backend, no AuditLog, no encryption
- * key required). A security reviewer can run it against an exported chain
- * without a running Sanctuary server.
+ * STANDALONE PROPERTY, stated precisely (corrected 2026-08-05; the previous
+ * wording claimed this module imports NO Sanctuary server module, which was
+ * already false when it was written). What is true, and what the property
+ * actually buys, is that NOTHING on this module's transitive import graph
+ * requires a running server, a fortress, storage, or key material:
+ *
+ *   - `@noble/curves`, `@noble/hashes`, and Node builtins.
+ *   - `../lockdown/status.js`, whose own imports are `node:fs/promises` and
+ *     `node:path` and nothing else.
+ *   - `../audit/checkpoint-shape.js`, which has ZERO imports of any kind and
+ *     exists specifically so this file and the raw exporter can share
+ *     definitions rather than hand-copy them.
+ *
+ * So: no storage backend, no AuditLog, no encryption key, no passphrase. A
+ * security reviewer can run it against an exported chain without a running
+ * Sanctuary server. The rule for future edits is the CAPABILITY bound above,
+ * not a literal no-server-imports rule: adding an import is fine only if it
+ * drags in nothing that needs a live fortress.
  *
  * Usage:
  *   sanctuary audit-chain verify --input chain.jsonl [--public-key <base64url>]
@@ -32,6 +45,11 @@ import { readFileSync } from "node:fs";
 import { ed25519 } from "@noble/curves/ed25519";
 import { sha256 } from "@noble/hashes/sha256";
 import { lockdownBanner, readLockdownStatus } from "../lockdown/status.js";
+import {
+  AUDIT_CHAIN_GENESIS,
+  AUDIT_CHAIN_SCHEMA_VERSION,
+  AUDIT_CHECKPOINT_DOMAIN_PREFIX,
+} from "../audit/checkpoint-shape.js";
 
 // ---- Minimal canonical-JSON implementation (no server imports) ---------------
 
@@ -83,19 +101,17 @@ function sha256Hex(input: string): string {
   return toHex(sha256(bytes));
 }
 
-// Each of these three must match the same-named export in
-// `server/src/audit/chain.ts` (`AUDIT_CHECKPOINT_DOMAIN_PREFIX` is spelled
-// there as `${AUDIT_CHECKPOINT_DOMAIN}\n`; the trailing newline is part of the
-// value). They are re-typed rather than imported because this module's
-// STANDALONE PROPERTY (see the header) forbids importing any Sanctuary server
-// module. `canonicalJson`, `computeAuditEntryHash`, `computeAuditRoot`, and
-// `checkpointSigningBytes` below are duplicated from that same file for the
-// same reason. A drifted copy compiles and runs; it just reports a signature
-// FAILURE on a valid chain, which reads as tampering rather than as drift.
+// These three are IMPORTED from `audit/checkpoint-shape.js` at the top of this
+// file, not re-typed, so they cannot drift. That module has ZERO imports (it
+// exists precisely so the raw exporter and this verifier can share definitions
+// without pulling the server runtime in), which is why importing it costs this
+// module nothing. `canonicalJson`, `computeAuditEntryHash`, `computeAuditRoot`,
+// and `checkpointSigningBytes` below are still hand-duplicated from
+// `audit/chain.ts`, because `checkpointSigningBytes` needs `stringToBytes` from
+// `core/encoding.ts` and cannot move to the zero-import module. A drifted copy
+// of THOSE compiles and runs; it just reports a signature FAILURE on a valid
+// chain, which reads as tampering rather than as drift.
 // Enforced by `server/test/structure/cross-file-contract-pins.test.ts`.
-const AUDIT_CHAIN_GENESIS = "GENESIS";
-const AUDIT_CHAIN_SCHEMA_VERSION = 2;
-const AUDIT_CHECKPOINT_DOMAIN_PREFIX = "sanctuary.audit-checkpoint.v1\n";
 
 interface AuditEntryHashInput {
   sequence: number;

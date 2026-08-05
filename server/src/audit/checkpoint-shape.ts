@@ -31,6 +31,26 @@
 export const AUDIT_CHECKPOINT_SCHEMA_VERSION = 1;
 
 /**
+ * Audit-chain wire constants, moved here 2026-08-05 for the SAME reason the
+ * checkpoint shape predicate was (G1): the standalone external verifier
+ * `cli/audit-chain-verify.ts` re-typed all four as local literals because
+ * importing them from `audit/chain.ts` would have dragged in
+ * `core/identity.ts` -> `core/encryption.ts` and the rest of the crypto
+ * runtime. This module has ZERO imports, so the verifier can import from here
+ * at no dependency cost, exactly as `cli/audit-chain-export.ts` already does
+ * for the checkpoint shape. `audit/chain.ts` re-exports all four, so every
+ * existing importer is unchanged.
+ *
+ * The literals are LIVE at-rest and signing-domain values; never edit them.
+ * `AUDIT_CHECKPOINT_DOMAIN_PREFIX`'s trailing newline is part of the signed
+ * bytes.
+ */
+export const AUDIT_CHAIN_GENESIS = "GENESIS";
+export const AUDIT_CHAIN_SCHEMA_VERSION = 2;
+export const AUDIT_CHECKPOINT_DOMAIN = "sanctuary.audit-checkpoint.v1";
+export const AUDIT_CHECKPOINT_DOMAIN_PREFIX = `${AUDIT_CHECKPOINT_DOMAIN}\n`;
+
+/**
  * Fixed `_audit_checkpoints` storage key of the MAC-authenticated audit head
  * anchor (anti-rollback). A control record, never exported as a checkpoint.
  */
@@ -88,8 +108,9 @@ export interface AuditCheckpointRecord extends AuditCheckpointSigningPayload {
    *   - this checkpoint record (emitted at `operational/audit-log.ts`, where
    *     the literal is re-typed for the SAME zero-import reason as the rest of
    *     this module)
-   *   - the transparency checkpoint (`transparency/checkpoint.ts` and its
-   *     standalone mirror `transparency/verify.ts`)
+   *   - the transparency checkpoint: its shape in `transparency/checkpoint.ts`,
+   *     the producer that stamps it in `transparency/emitter.ts`, and the
+   *     standalone mirror `transparency/verify.ts`
    *   - `InternalSigningResult` (`cognitive/tools.ts`)
    *   - `WORKLOAD_HOST_ATTESTATION_PAYLOAD_ENCODING`
    *     (`workload-lifecycle/host-attestation.ts`)
@@ -101,8 +122,11 @@ export interface AuditCheckpointRecord extends AuditCheckpointSigningPayload {
    * different encoding. What must never happen is two surfaces claiming this
    * SAME name for two different byte-level encodings, because an external
    * verifier reads the name and reconstructs the signing bytes from it.
-   * `test/structure/cross-file-contract-pins.test.ts` asserts the spelling is
-   * uniform wherever it appears.
+   * `test/structure/cross-file-contract-pins.test.ts` asserts that the set of
+   * `server/src` files containing this exact spelling is EXACTLY the list
+   * above, so a surface added later without being listed here fails. It cannot
+   * detect a surface that invents a DIFFERENT name for the same encoding;
+   * nothing mechanical can, which is why the name is documented as vocabulary.
    */
   payload_encoding: "domain-separated-canonical-json-v1";
   unsigned: boolean;

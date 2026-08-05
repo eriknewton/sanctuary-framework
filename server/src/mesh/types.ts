@@ -229,8 +229,10 @@ export interface FortressMasterPublicKeysV2Hybrid {
    * Must match `FORTRESS_MASTER_KEY_VERSION_V2_HYBRID` in
    * `mesh/trust-root-hybrid.ts`. Spelled as a literal rather than
    * `typeof FORTRESS_MASTER_KEY_VERSION_V2_HYBRID` because that file imports
-   * this one; a back-reference would close an import cycle. The same literal
-   * recurs in `NodeIdentityCertificateV2Hybrid.parent_chain` below.
+   * this one, and although an `import type` back-reference is erased by
+   * TypeScript, `scripts/check-import-cycles.ts` is a regex scanner that would
+   * still count it as a cycle. The same literal recurs in
+   * `NodeIdentityCertificateV2Hybrid.parent_chain` below.
    */
   readonly key_version: "sanctuary.fortress-master.v2.hybrid-ed25519-ml-dsa-65";
   readonly signature_suite: "ed25519+ml-dsa-v1";
