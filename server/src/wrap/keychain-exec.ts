@@ -71,6 +71,20 @@ export function setKeychainExec(fn: KeychainExec): void {
 }
 
 /**
+ * The marker's path, for the refusal message. A refusal that does not name the
+ * file leaves an operator staring at "the CLI suddenly cannot reach my
+ * keychain", which is the exact confusion the marker's runbook note exists to
+ * prevent. Falls back to the bare filename if the root cannot be resolved,
+ * because a partial hint beats none.
+ */
+function markerPathForDiagnostics(): string {
+  const root = packageRoot();
+  return root === null
+    ? TEST_RUN_MARKER_FILENAME
+    : join(root, TEST_RUN_MARKER_FILENAME);
+}
+
+/**
  * What `execKeychain` should do, as a pure function of the two inputs that
  * decide it. Extracted so the truth table is testable directly: the property
  * that matters is that NO combination yields `spawn-real` while under test, and
@@ -121,19 +135,49 @@ function packageRoot(): string | null {
   return null;
 }
 
+function markerOnDiskNow(): boolean {
+  const root = packageRoot();
+  return root !== null && existsSync(join(root, TEST_RUN_MARKER_FILENAME));
+}
+
 /**
- * Cached: a spawned child is a fresh process and the marker is written before
- * any child starts, so one stat per process is both correct and enough.
- * `underTest()` is evaluated on EVERY credential call, so this matters.
+ * LATCH. Evaluated at module load, and only ever assigned `true` afterwards.
+ *
+ * Why at module load: a child spawned during the suite imports this module while
+ * the marker still exists. Latching there means the child stays under-test for
+ * its entire lifetime no matter when it first asks for a credential. Deciding
+ * lazily on the first credential call left a real race, verified on 9a8a3ce6: a
+ * scrubbed-env child that outlives global teardown makes its first call after
+ * the marker is gone, `underTest()` answers false, and an ordinary call site
+ * spawns the real binary. A synchronous `spawnSync` plant cannot see it, because
+ * the child always calls while the marker is still there.
+ *
+ * Why the negative is NEVER cached: a process that started moments BEFORE the
+ * marker appeared would otherwise latch "production" permanently and stay wrong
+ * for the whole run. So a false reading is recomputed on every call and never
+ * stored. The only assignment to this variable after initialization is `= true`.
  */
-let markerPresent: boolean | undefined;
+let observedTestRunMarker = markerOnDiskNow();
+
+/**
+ * Latch semantics as a pure function, so the state transition that matters can
+ * be tested directly rather than reasoned about: once observed, the marker
+ * disappearing must NOT reclassify this process as production.
+ */
+export function latchUnderTest(
+  previouslyObserved: boolean,
+  markerOnDisk: boolean
+): boolean {
+  return previouslyObserved || markerOnDisk;
+}
 
 function testRunMarkerPresent(): boolean {
-  if (markerPresent === undefined) {
-    const root = packageRoot();
-    markerPresent = root !== null && existsSync(join(root, TEST_RUN_MARKER_FILENAME));
+  if (observedTestRunMarker) return true;
+  // Recompute; store ONLY a true result.
+  if (markerOnDiskNow()) {
+    observedTestRunMarker = true;
   }
-  return markerPresent;
+  return latchUnderTest(observedTestRunMarker, false);
 }
 
 /**
@@ -215,7 +259,11 @@ export async function execKeychain(
           `design. Fix: let the default in-memory store handle it ` +
           `(test/setup/keychain-fake.ts, installed for every test), or inject your own via ` +
           `setKeychainExec(). To exercise the genuine CLI, add a case to ` +
-          `scripts/real-backend-check.ts, which runs outside vitest.`
+          `scripts/real-backend-check.ts, which runs outside vitest.\n` +
+          `\n` +
+          `NOT running a test? Then a previous run was killed before it could clean up, ` +
+          `and its marker file is still on disk. Delete it and this refusal stops:\n` +
+          `  rm ${markerPathForDiagnostics()}`
       );
     case "spawn-real":
       return spawnReal(cmd, args, input);

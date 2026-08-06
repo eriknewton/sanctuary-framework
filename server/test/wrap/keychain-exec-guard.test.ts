@@ -18,6 +18,7 @@ import { fileURLToPath } from "node:url";
 import {
   decideKeychainExecution,
   execKeychain,
+  latchUnderTest,
   setKeychainExec,
   type KeychainExec,
 } from "../../src/wrap/keychain-exec.js";
@@ -402,6 +403,82 @@ describe("no code path in server/test can reach the real credential binary", () 
     );
     expect(result.stdout).not.toBe("undefined");
   });
+
+  it("stays under test after the marker disappears (latch, pure form)", () => {
+    // THE RACE, as a state transition. Global teardown deletes the marker while
+    // a child that started during the suite is still alive; that child must not
+    // be reclassified as production when it finally makes its first call.
+    expect(latchUnderTest(true, false)).toBe(true);
+    // And the reverse must still work: a process that started just BEFORE the
+    // marker appeared has to be able to observe it later, which is why a false
+    // reading is never cached.
+    expect(latchUnderTest(false, true)).toBe(true);
+    expect(latchUnderTest(true, true)).toBe(true);
+    expect(latchUnderTest(false, false)).toBe(false);
+  });
+
+  it(
+    "REFUSES in a child whose marker is deleted BEFORE its first credential call",
+    async () => {
+      /**
+       * The race end-to-end, on an ISOLATED copy of the chokepoint so deleting a
+       * marker cannot affect other vitest workers running in parallel. The child
+       * imports the module (latching while the marker exists), then deletes its
+       * own marker to simulate global teardown, then makes its first call. A
+       * lazily-evaluated check answers "production" here; the latch does not.
+       *
+       * The synchronous `env: {}` case below cannot cover this: spawnSync means
+       * the child always calls while the marker is still present.
+       */
+      const { spawnSync: spawnChild } = await import("node:child_process");
+      const serverDir = fileURLToPath(new URL("../..", import.meta.url));
+      const probeDir = mkdtempSync(join(tmpdir(), "sanctuary-latch-probe-"));
+      try {
+        // Copy the REAL module rather than a paraphrase, so this can never drift
+        // from what production does.
+        for (const file of ["keychain-exec.ts", "exec-result.ts"]) {
+          writeFileSync(
+            join(probeDir, file),
+            readFileSync(join(serverDir, "src", "wrap", file), "utf8")
+          );
+        }
+        writeFileSync(
+          join(probeDir, "package.json"),
+          JSON.stringify({ name: "latch-probe", type: "module", private: true })
+        );
+        writeFileSync(join(probeDir, ".sanctuary-test-run"), "probe");
+        writeFileSync(
+          join(probeDir, "probe.ts"),
+          [
+            'import { rmSync } from "node:fs";',
+            'import { fileURLToPath } from "node:url";',
+            // Importing latches the marker, which exists right now.
+            'import { execKeychain } from "./keychain-exec.js";',
+            // Simulate global teardown removing it before the first call.
+            'rmSync(fileURLToPath(new URL("./.sanctuary-test-run", import.meta.url)), { force: true });',
+            "try {",
+            '  await execKeychain("security", ["find-generic-password", "-s", "sanctuary-latch-probe-never-exists", "-a", "sanctuary", "-w"]);',
+            '  process.stdout.write("SPAWNED_REAL");',
+            "} catch (err) {",
+            "  const message = (err as Error).message;",
+            '  process.stdout.write(message.includes("Refusing to run") ? "REFUSED" : `OTHER:${message}`);',
+            "}",
+            "",
+          ].join("\n")
+        );
+
+        const result = spawnChild(
+          process.execPath,
+          ["--import", "tsx", join(probeDir, "probe.ts")],
+          { env: {}, cwd: serverDir, encoding: "utf8", timeout: 60_000 }
+        );
+        expect(result.stdout, `child stderr: ${result.stderr}`).toBe("REFUSED");
+      } finally {
+        rmSync(probeDir, { recursive: true, force: true });
+      }
+    },
+    90_000
+  );
 
   it(
     "REFUSES inside a child spawned with `env: {}`, where no env signal survives",
