@@ -51,6 +51,7 @@ import {
 import { lockdownBanner, readLockdownStatus } from "../lockdown/status.js";
 import { readStoredPassphrase } from "../wrap/passphrase.js";
 import { resolveStoragePath } from "../paths.js";
+import { flagValue } from "./argv.js";
 
 export interface DidWebCommandArgs {
   argv: string[];
@@ -61,12 +62,6 @@ export interface DidWebCommandArgs {
 
 function write(stream: Writable, text: string): void {
   stream.write(text);
-}
-
-function flagValue(argv: string[], name: string): string | undefined {
-  const i = argv.indexOf(name);
-  if (i === -1) return undefined;
-  return argv[i + 1];
 }
 
 function hasFlag(argv: string[], name: string): boolean {

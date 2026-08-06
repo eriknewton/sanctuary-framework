@@ -10,6 +10,7 @@ import { resolve } from "node:path";
 import { Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { OPERATOR_CLOUD_DISCLOSURE } from "../mesh/node-posture.js";
+import { flagValue } from "./argv.js";
 
 export interface DeployCommandArgs {
   argv: string[];
@@ -259,12 +260,6 @@ function shellQuote(value: string): string {
   return `'${value.replace(/'/g, "'\\''")}'`;
 }
 
-function flagValue(argv: string[], name: string): string | undefined {
-  const index = argv.indexOf(name);
-  if (index !== -1) return argv[index + 1];
-  const prefixed = argv.find((arg) => arg.startsWith(`${name}=`));
-  return prefixed?.slice(name.length + 1);
-}
 
 function indent(text: string, spaces: number): string {
   const prefix = " ".repeat(spaces);

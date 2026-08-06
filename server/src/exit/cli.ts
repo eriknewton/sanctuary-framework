@@ -25,6 +25,7 @@ import type {
 import { verifyExitBundle, InvalidExitBundleError } from "./verifier.js";
 import { inspectExitBundle, inspectExitCode } from "./inspect.js";
 import { loadFortressDidWebRecord } from "../recognition/did-web.js";
+import { flagValue, flagValues } from "../cli/argv.js";
 
 const EXIT_EXPORT_ABORTED_EXIT_CODE = 78;
 
@@ -85,22 +86,8 @@ function write(stream: Writable, text: string): void {
   stream.write(text);
 }
 
-function flagValue(argv: string[], name: string): string | undefined {
-  const index = argv.indexOf(name);
-  if (index === -1) return undefined;
-  return argv[index + 1];
-}
-
 function hasFlag(argv: string[], name: string): boolean {
   return argv.includes(name);
-}
-
-function repeatedFlagValues(argv: string[], name: string): string[] {
-  const values: string[] = [];
-  for (let i = 0; i < argv.length; i++) {
-    if (argv[i] === name && argv[i + 1]) values.push(argv[++i]!);
-  }
-  return values;
 }
 
 export async function confirmTier1(
@@ -563,14 +550,14 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
         }
       }
       // `--state-namespace` is repeatable and OPTIONAL. When the operator names
-      // none, `repeatedFlagValues` returns [], which must NOT be forwarded:
+      // none, `flagValues` returns [], which must NOT be forwarded:
       // passing an empty selection meant "export nothing" and produced a signed
       // bundle with zero state entries. Spread it conditionally so "named none"
       // reaches the exporter as an absent option, which is its contract for
       // "discover and export every namespace." Same shape as
       // `didWebAllowedHosts` on the import path below; `exportEncryptedState`
       // now throws on an empty array so this cannot silently regress.
-      const stateNamespaces = repeatedFlagValues(argv, "--state-namespace");
+      const stateNamespaces = flagValues(argv, "--state-namespace");
       const result = await exportExitBundle({
         bundleDir: outDir,
         storage: ctx.storage,
@@ -791,7 +778,7 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
       // by-default) and surfaces a warning if the manifest carries a
       // did_web binding. --skip-did-web-verify is the explicit
       // operator override for accepting the manifest signature alone.
-      const didWebAllowedHosts = repeatedFlagValues(
+      const didWebAllowedHosts = flagValues(
         argv,
         "--did-web-allowed-host",
       );
