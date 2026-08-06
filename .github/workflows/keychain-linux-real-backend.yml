@@ -26,16 +26,33 @@ name: Keychain Linux Real-Backend Integration
 #
 # The mock test at server/test/keychain-linux-secret-service.test.ts
 # remains authoritative for unit-level behavior and runs in standard CI
-# on every PR via ci.yml. This workflow is the belt-and-suspenders layer
-# for shell-out drift the mocks cannot see.
+# on every PR via ci.yml. This workflow is the second layer, for
+# shell-out drift the mocks cannot see.
+#
+# Setup lives in .github/actions/setup-linux-secret-service, shared with
+# ci.yml, test-baseline-guard.yml, and publish-on-tag.yml. This workflow
+# used to carry its own copy of the whole stack (apt, venv, the
+# pass-secret-service source patches, GPG, `pass init`, daemon start,
+# smoke test) wrapped in `dbus-run-session -- bash -e -c '...'`. Two
+# copies of a 120-line setup drift, and they had already: the inline copy
+# ran the disposable-keyring provisioning inside `export VAR="$(...)"`,
+# where a command substitution masks the exit status from `set -e`, so a
+# provisioning failure produced an empty token and the job sailed on to
+# run a suite that skipped every case.
+#
+# Failure mode to recognize: if this job reports zero real-backend tests,
+# the setup action is what to read, not this file. The suite prints its
+# own skip reason on any Linux host that has secret-tool and a bus.
 
 on:
   push:
     branches: [main]
     paths:
       - "server/src/wrap/passphrase.ts"
-      - "server/test/keychain-linux-real-backend-integration.test.ts"
+      - "server/src/wrap/keychain-exec.ts"
+      - "server/scripts/real-backend-check.ts"
       - "server/test/keychain-linux-secret-service.test.ts"
+      - "server/test/setup/keychain-fake.ts"
       - "server/package.json"
       - "server/package-lock.json"
       - ".github/workflows/keychain-linux-real-backend.yml"
@@ -43,8 +60,10 @@ on:
     branches: [main]
     paths:
       - "server/src/wrap/passphrase.ts"
-      - "server/test/keychain-linux-real-backend-integration.test.ts"
+      - "server/src/wrap/keychain-exec.ts"
+      - "server/scripts/real-backend-check.ts"
       - "server/test/keychain-linux-secret-service.test.ts"
+      - "server/test/setup/keychain-fake.ts"
       - "server/package.json"
       - "server/package-lock.json"
       - ".github/workflows/keychain-linux-real-backend.yml"
@@ -56,17 +75,6 @@ permissions:
 jobs:
   real-backend-test:
     runs-on: ubuntu-24.04
-    env:
-      # GNUPGHOME is workspace-scoped so the runner's default GnuPG
-      # config stays untouched. pass-secret-service relies on pypass,
-      # which (unlike the pass CLI itself) hardcodes ~/.password-store
-      # and ignores PASSWORD_STORE_DIR. We let `pass init` use the
-      # default location too so the daemon and the CLI agree on where
-      # the store lives. CI run 25611555916 was the proof: with
-      # PASSWORD_STORE_DIR pointed at a workspace path, pass init
-      # populated the workspace store but the daemon hit pypass's
-      # default and raised "could not find .gpg-id file".
-      GNUPGHOME: ${{ github.workspace }}/.gnupg-ci
     steps:
       - uses: actions/checkout@v7
 
@@ -77,84 +85,14 @@ jobs:
           cache: npm
           cache-dependency-path: server/package-lock.json
 
-      - name: Install Secret Service stack (pass-secret-service backend)
-        run: |
-          set -e
-          sudo apt-get update -qq
-          # Build deps for the from-source compile of PyGObject below:
-          # libcairo2-dev (pycairo headers), libgirepository1.0-dev
-          # (GObject introspection 1.x headers, the version Ubuntu 24.04
-          # ships; 2.0 is not in noble's archive), pkg-config + python3-dev
-          # for the meson configure step. gir1.2-glib-2.0 is the runtime
-          # typelib PyGObject loads on import.
-          sudo apt-get install -y -qq \
-            dbus dbus-x11 \
-            gnupg \
-            pass \
-            libsecret-tools \
-            python3-venv \
-            python3-dev \
-            libcairo2-dev \
-            libgirepository1.0-dev \
-            pkg-config \
-            gir1.2-glib-2.0
-          # pass-secret-service has shipped only one PyPI release (0.1a0,
-          # 2018) and its imports drifted out of compatibility with
-          # current Ubuntu defaults on two fronts:
-          #   1. cryptography.utils.int_from_bytes was removed in modern
-          #      cryptography releases. Rather than chase an exact
-          #      version pin (the removal landed somewhere in 35.x-38.x;
-          #      runs 25611180020 and 25611237849 confirmed both <41 and
-          #      <39 still resolve to a cryptography that lacks the
-          #      symbol), we install a sitecustomize.py shim that
-          #      backfills int_from_bytes from int.from_bytes (they are
-          #      semantically identical). This works for any cryptography
-          #      version pip picks.
-          #   2. PyGObject 3.50+ requires libgirepository-2.0-dev, a
-          #      package Ubuntu 24.04 does not ship; pin <3.50 so the
-          #      build links against libgirepository1.0-dev instead.
-          # Plain venv (not pipx) gives exact control of dep resolution.
-          # Entry point inside the venv is pass_secret_service
-          # (underscores; the hyphenated name is the PyPI package, the
-          # underscored name is the console_script).
-          python3 -m venv "$HOME/pss-venv"
-          "$HOME/pss-venv/bin/pip" install --quiet --upgrade pip wheel
-          # cryptography is not declared in pass-secret-service 0.1a0's
-          # install_requires (verified by removing it and watching the
-          # daemon fail with ModuleNotFoundError in CI run 25611385152),
-          # so name it explicitly. Any version is fine; the
-          # sitecustomize shim below backfills the int_from_bytes symbol.
-          "$HOME/pss-venv/bin/pip" install --quiet \
-            "pygobject<3.50" \
-            cryptography \
-            pass-secret-service
-          # Patch session.py inside the installed package. Three small
-          # fixes, each independent and observed in successive CI runs:
-          #
-          # 1. cryptography.utils.int_from_bytes was removed in modern
-          #    cryptography. Drop the import and rewrite call sites to
-          #    int.from_bytes (semantically identical since Python 3.2).
-          # 2. _decode_secret calls decryptor.update(password) where
-          #    password = secret[2] -- a value pydbus delivers as
-          #    list[int]. cryptography wants bytes. The author already
-          #    handles secret[1] (the IV) the same way; mirror it for
-          #    secret[2]. Without this, CreateItem fails with
-          #    "Cannot convert '<class 'list'>' instance to a buffer"
-          #    (CI run 25611693756).
-          # 3. _create_dh calls int.from_bytes(input, 'big') where the
-          #    DH peer key arrives over pydbus. Defensive bytes() wrap
-          #    matches the secret[1] / secret[2] pattern.
-          SESSION_FILE="$(find "$HOME/pss-venv/lib" -path '*/pass_secret_service/interfaces/session.py' -print -quit)"
-          if [ -z "$SESSION_FILE" ]; then
-            echo "could not locate pass_secret_service session.py inside venv" >&2
-            exit 1
-          fi
-          sed -i '/^from cryptography\.utils import int_from_bytes$/d' "$SESSION_FILE"
-          sed -i 's/\bint_from_bytes\b/int.from_bytes/g' "$SESSION_FILE"
-          sed -i 's|password = secret\[2\]|password = bytes(secret[2])|' "$SESSION_FILE"
-          sed -i "s|int\.from_bytes(input, 'big')|int.from_bytes(bytes(input), 'big')|" "$SESSION_FILE"
-          echo "patched $SESSION_FILE"
-          echo "$HOME/pss-venv/bin" >> "$GITHUB_PATH"
+      # Installs libsecret + pass-secret-service, starts a session bus,
+      # and smoke-tests it, exporting DBUS_SESSION_BUS_ADDRESS. It fails
+      # the job on any problem rather than continuing degraded: the check
+      # script below refuses to run without a session bus, because every
+      # case would then degrade to the fallback file and four of the five
+      # would pass while proving nothing about libsecret.
+      - name: Install libsecret + Secret Service backend
+        uses: ./.github/actions/setup-linux-secret-service
 
       - name: Install npm deps
         working-directory: server
@@ -164,110 +102,22 @@ jobs:
         working-directory: server
         run: npm run build
 
-      - name: Initialize ephemeral GPG key + pass store
+      - name: Verify the real secret-tool path against pass-secret-service
+        working-directory: server
         run: |
-          set -e
-          mkdir -p "$GNUPGHOME"
-          chmod 700 "$GNUPGHOME"
+          set -o pipefail
+          npx tsx scripts/real-backend-check.ts 2>&1 \
+            | tee /tmp/real-backend-check.log
 
-          # Loopback pinentry: GnuPG 2.x asks an external pinentry binary
-          # for passphrases by default, which has no TTY on a headless
-          # runner. Loopback mode plus an empty passphrase keeps the
-          # whole flow non-interactive.
-          echo "allow-loopback-pinentry" > "$GNUPGHOME/gpg-agent.conf"
-          gpgconf --kill gpg-agent || true
-
-          # %no-protection generates a passphrase-less RSA key. The key
-          # is ephemeral to this runner and never leaves the workspace;
-          # its only job is to satisfy `pass init` so pass-secret-service
-          # can store and read items via GPG-encrypted files.
-          cat > "$GNUPGHOME/key-batch" <<'EOF'
-          %no-protection
-          Key-Type: RSA
-          Key-Length: 2048
-          Name-Real: Sanctuary CI
-          Name-Email: ci@sanctuary-framework.invalid
-          Expire-Date: 0
-          %commit
-          EOF
-          gpg --batch --pinentry-mode loopback --gen-key "$GNUPGHOME/key-batch"
-
-          GPG_KEY="$(gpg --list-secret-keys --with-colons \
-            | awk -F: '/^fpr:/ { print $10; exit }')"
-          if [ -z "$GPG_KEY" ]; then
-            echo "GPG key generation produced no fingerprint" >&2
+          # The script exits non-zero on any failed check and asserts its own
+          # check count, so a check that stops running fails there. What this
+          # grep adds is the case the exit status cannot cover: a script that
+          # never ran at all, or died before doing any work, must not read as a
+          # pass. The marker is printed last, after the count assertion.
+          #
+          # Failure mode: no marker means the script did not reach the end. Read
+          # the log above for which check threw, not this message.
+          if ! grep -qE "^REAL_BACKEND_CHECKS_PASSED=[1-9][0-9]*$" /tmp/real-backend-check.log; then
+            echo "real-backend-check produced no success marker: it ran zero checks or died early." >&2
             exit 1
           fi
-          echo "Generated ephemeral GPG key: $GPG_KEY"
-
-          # No PASSWORD_STORE_DIR override: pass-secret-service's pypass
-          # backend hardcodes ~/.password-store, so we let pass CLI use
-          # the same default. ~/.password-store does not exist yet on a
-          # fresh runner; `pass init` creates it.
-          pass init "$GPG_KEY"
-
-      - name: Run real-backend integration test against pass-secret-service
-        run: |
-          set -e
-
-          # dbus-run-session provides a clean session bus for the test
-          # shell and exports DBUS_SESSION_BUS_ADDRESS for child
-          # processes. The integration test reads that env var to decide
-          # whether to skip; here it must be present so the suite
-          # actually runs end-to-end.
-          dbus-run-session -- bash -e -c '
-            # pass-secret-service implements the org.freedesktop.secrets
-            # D-Bus interface on top of the password store we just
-            # initialized. It claims the well-known name on the session
-            # bus once it has finished initializing.
-            pass_secret_service > /tmp/pass-secret-service.log 2>&1 &
-            PSS_PID=$!
-            # Make the daemon log visible on every exit path so a
-            # registration failure does not require a workflow re-run to
-            # diagnose. Tear the daemon down too.
-            trap "kill $PSS_PID 2>/dev/null || true; \
-                  echo \"=== pass-secret-service log ===\"; \
-                  cat /tmp/pass-secret-service.log || true" EXIT
-
-            # Poll for the well-known name on the bus. Without this the
-            # first secret-tool call races daemon startup and can fail
-            # transiently. Twenty seconds is generous; in practice
-            # registration takes well under a second on a warm runner.
-            for i in $(seq 1 40); do
-              if dbus-send --session --print-reply \
-                   --dest=org.freedesktop.secrets \
-                   /org/freedesktop/secrets \
-                   org.freedesktop.DBus.Peer.Ping >/dev/null 2>&1; then
-                echo "pass-secret-service registered on session bus (attempt $i)"
-                break
-              fi
-              if [ "$i" = "40" ]; then
-                echo "pass-secret-service did not register within 20s" >&2
-                exit 1
-              fi
-              sleep 0.5
-            done
-
-            echo "=== Environment ==="
-            echo "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS"
-            echo "GNUPGHOME=$GNUPGHOME"
-            echo "PASSWORD_STORE_DIR=${PASSWORD_STORE_DIR:-$HOME/.password-store (default)}"
-            secret-tool --version 2>/dev/null || true
-
-            # Smoke test against secret-tool before the suite runs so
-            # any future regression in the bus / backend setup chain
-            # surfaces a single-line diagnostic of which layer broke,
-            # rather than reading it out of vitest output.
-            echo "=== secret-tool smoke test ==="
-            printf "smokevalue" | secret-tool store --label=smoke \
-              service smoke-svc account smoke-acct
-            smoke_value="$(secret-tool lookup service smoke-svc account smoke-acct)"
-            if [ "$smoke_value" != "smokevalue" ]; then
-              echo "smoke lookup mismatch: expected smokevalue, got $smoke_value" >&2
-              exit 1
-            fi
-            secret-tool clear service smoke-svc account smoke-acct
-            echo "=== smoke test passed ==="
-
-            cd server && npm test -- keychain-linux-real-backend-integration.test.ts
-          '
