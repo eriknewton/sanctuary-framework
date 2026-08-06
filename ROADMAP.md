@@ -90,7 +90,7 @@ Outbound queries strip operator-identifying headers (client-IP, fingerprint, cor
 
 Operator can export their full identity bundle (keys, state, reputation, audit chain) and import on a fresh machine or fresh harness. Recovery key for lost-passphrase scenarios. Tier-1 approval required for export and import. **Why it matters:** the "exit" guarantee is structural, not contractual. Nothing the operator builds up in Sanctuary is locked to the platform; everything is portable, encrypted, and operator-controlled.
 
-*Status: shipped. ASSURANCE_MATRIX row "Export / exit bundle" is proven.*
+*Status: shipped. ASSURANCE_MATRIX row "Export / exit bundle" is proven. Adds `sanctuary exit inspect <dir>`: a read-only report of what a bundle carries and which credential it DECLARES it needs, so an operator can tell whether the key in their hand is the right KIND of key without running an import. It never opens a fortress, never asks for a passphrase, never writes, and deliberately makes no claim that any import will succeed; its `credential check:` line prints, on every path, exactly what was and was not checked.*
 
 ### Local multi-agent coordination and Sovereignty Dashboard
 
