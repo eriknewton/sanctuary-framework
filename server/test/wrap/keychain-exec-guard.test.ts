@@ -626,6 +626,31 @@ describe("no test may spawn a child with a scrubbed environment", () => {
    */
   const INHERITS_OR_PROPAGATES = /process\.env|VITEST|SANCTUARY_TEST_RUN/;
 
+  /**
+   * Text to judge an `env` value by. An identifier is resolved to its
+   * declaration in the same file, so `const env = { ...process.env }` reads as
+   * safe while `const env = {}` does not. Unresolvable identifiers return the
+   * bare name, which fails the check: a value this cannot see is treated as
+   * scrubbed, not assumed safe.
+   */
+  function envValueText(expr: ts.Expression, sf: ts.SourceFile): string {
+    if (!ts.isIdentifier(expr)) return expr.getText(sf);
+    let resolved: string | null = null;
+    const find = (node: ts.Node): void => {
+      if (
+        ts.isVariableDeclaration(node) &&
+        ts.isIdentifier(node.name) &&
+        node.name.text === expr.text &&
+        node.initializer !== undefined
+      ) {
+        resolved = node.initializer.getText(sf);
+      }
+      node.forEachChild(find);
+    };
+    find(sf);
+    return resolved ?? expr.text;
+  }
+
   function scrubbedEnvSpawns(sf: ts.SourceFile): number[] {
     const spawners = childProcessBindings(sf);
     if (spawners.size === 0) return [];
@@ -643,13 +668,25 @@ describe("no test may spawn a child with a scrubbed environment", () => {
           for (const arg of node.arguments) {
             if (!ts.isObjectLiteralExpression(arg)) continue;
             for (const prop of arg.properties) {
+              // BOTH object-literal spellings. `{ env: x }` is a
+              // PropertyAssignment; `{ env }` is a ShorthandPropertyAssignment
+              // and is a different AST node, so handling only the first left the
+              // shorthand form walking straight through the tripwire. Same
+              // "covers the forms you thought of" shape as the aliased import.
+              let value: ts.Expression | undefined;
               if (
-                !ts.isPropertyAssignment(prop) ||
-                prop.name.getText(sf).replace(/["']/g, "") !== "env"
+                ts.isPropertyAssignment(prop) &&
+                prop.name.getText(sf).replace(/["']/g, "") === "env"
               ) {
-                continue;
+                value = prop.initializer;
+              } else if (
+                ts.isShorthandPropertyAssignment(prop) &&
+                prop.name.text === "env"
+              ) {
+                value = prop.name;
               }
-              if (!INHERITS_OR_PROPAGATES.test(prop.initializer.getText(sf))) {
+              if (value === undefined) continue;
+              if (!INHERITS_OR_PROPAGATES.test(envValueText(value, sf))) {
                 lines.push(sf.getLineAndCharacterOfPosition(prop.getStart(sf)).line + 1);
               }
             }
@@ -660,6 +697,17 @@ describe("no test may spawn a child with a scrubbed environment", () => {
     };
     visit(sf);
     return lines;
+  }
+
+  /**
+   * Parse diagnostics from `ts.createSourceFile`. A file the scanner cannot
+   * fully parse contributes zero violations, which is indistinguishable from a
+   * clean file: absence of evidence reading as a pass, the same shape this whole
+   * change exists to remove. So a parse error fails the check by name.
+   */
+  function parseErrors(sf: ts.SourceFile): number {
+    const withDiagnostics = sf as unknown as { parseDiagnostics?: readonly ts.Diagnostic[] };
+    return withDiagnostics.parseDiagnostics?.length ?? 0;
   }
 
   function walkTests(dir: string): string[] {
@@ -684,11 +732,29 @@ describe("no test may spawn a child with a scrubbed environment", () => {
     expect(scanned.length).toBeGreaterThan(100);
   });
 
+  it("parses every test file, so an unreadable one cannot pass as clean", () => {
+    const unparseable: string[] = [];
+    for (const file of scanned) {
+      const sf = ts.createSourceFile(
+        file,
+        readFileSync(file, "utf8"),
+        ts.ScriptTarget.Latest,
+        true,
+        ts.ScriptKind.TS
+      );
+      if (parseErrors(sf) > 0) unparseable.push(file.slice(testRoot.length));
+    }
+    expect(unparseable).toEqual([]);
+  });
+
   it("finds no child spawned with an environment that drops VITEST", () => {
     const violations: string[] = [];
     for (const file of scanned) {
       const source = readFileSync(file, "utf8");
-      const sf = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true);
+      const sf = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+      // A file that did not parse is reported by the case above; counting its
+      // (necessarily zero) violations here would launder the failure into a pass.
+      if (parseErrors(sf) > 0) continue;
       for (const line of scrubbedEnvSpawns(sf)) {
         violations.push(`${file.slice(testRoot.length)}:${line}`);
       }
