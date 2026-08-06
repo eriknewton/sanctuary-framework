@@ -13,15 +13,28 @@ argument and ignores it, falling back to `~/.sanctuary`.
 
 ```bash
 sanctuary --fortress ~/.sanctuary-work secrets list   # inspects ~/.sanctuary-work
-sanctuary secrets list --fortress ~/.sanctuary-work   # inspects ~/.sanctuary
+sanctuary secrets list --fortress ~/.sanctuary-work   # refused, exit 2
 ```
 
-Verified: the second form reads the default fortress and prints an ordinary result for
-it. Nothing warns, nothing errors, and the output of "no secrets stored" is a true
-statement about the wrong fortress. Some subcommands (`doctor`, `agents`) parse the flag
-in either position, which is what makes the habit easy to form and the exception easy to
-miss. On a multi-fortress host, put the flag first every time, and confirm the path in
-the command's own output before you trust the answer.
+Verified: a subcommand that does not parse the flag reads the default fortress and
+prints an ordinary result for it. Nothing warns, nothing errors, and the output of
+"no secrets stored" is a true statement about the wrong fortress. Some subcommands
+(`doctor`, `agents`, `intelligence`) parse the flag in either position, which is what
+makes the habit easy to form and the exception easy to miss. On a multi-fortress host,
+put the flag first every time, and confirm the path in the command's own output before
+you trust the answer.
+
+`secrets` is the one subcommand that refuses the trailing form outright (exit 2, since
+2026-08-05), because on `add`, `rotate` and `delete` the dropped flag wrote a credential
+into the default fortress and reported success. That refusal is scoped to `secrets`
+alone and is not a general fix.
+
+Failure mode to watch for: every other subcommand that does not parse `--fortress`
+still ignores it silently, and the result looks exactly like a correct answer for the
+fortress you named. There is no way to tell from the output which fortress answered,
+short of a command that prints the path. The general fix is a single shared flag parser
+so that no handler can silently drop a flag; until that lands, the leading position is
+the only form that is safe everywhere.
 
 ## `sanctuary doctor`
 
@@ -110,13 +123,17 @@ This command is pure string templating. It does not read or write Sanctuary
 state. On macOS it still emits the Linux unit and includes a comment noting
 that launchd is separate.
 
-Read the emitted unit before you install it. Because the command templates rather than
-inspects, nothing here is validated, and two defaults are wrong on a stock install:
+Read the emitted unit before you install it. As of 2026-08-05 the generator refuses
+rather than emitting a unit it knows will not start, but the paths it writes are still
+**this host's** paths:
 
-| Line to check | What it emits by default | What to do |
+| Line to check | What it emits | Failure mode |
 |---|---|---|
-| `ExecStart=` | The published package is a single bundled `dist/cli.js`, so the internal path probe for the CLI entrypoint does not match and the fallback emits the **node executable** with no script: `ExecStart=/usr/local/bin/node dashboard --no-confirm`. systemd accepts the line, and the service fails at first start because node has no `dashboard` script | pass `--binary /path/to/sanctuary` (or the absolute path to `dist/cli.js`) and confirm the rendered line names it |
-| `Environment=SANCTUARY_STORAGE_PATH=` | The literal string `~/.sanctuary`. systemd performs no tilde expansion in `Environment=`, so the service receives a relative path beginning with a tilde character rather than the operator's home directory. Combined with `WorkingDirectory=/` the fortress does not resolve where anyone expects | pass `--state-dir` with an absolute path |
+| `ExecStart=` | This host's node plus the resolved CLI entry, or the `--binary` value verbatim | A path that exists here and not on the target host gives a bare `status=203/EXEC` with no Sanctuary output at all, which reads like a Sanctuary startup failure and is not one. Generating from a source checkout run under `tsx` is refused outright, because the entry there is TypeScript and the unit's plain `node` cannot execute it; pass `--binary`, or generate from an installed package |
+| `Environment=SANCTUARY_STORAGE_PATH=` | An absolute path, quoted when it contains a space or a `%` | A tilde, a relative path, or a `~user` form is refused: systemd performs no tilde expansion, so an unexpanded `~` would become a literal directory and the service would behave as though the fortress were empty. Pass `--state-dir` with an absolute path for a service user other than yourself, since this command cannot know another user's home directory |
+
+Both of those lines were defects before 2026-08-05: `ExecStart` named the node binary with
+no script on every installed package, and `Environment=` carried a literal `~/.sanctuary`.
 
 The unit also runs `dashboard`, the long-lived HTTP process, while its `Description=` reads
 `Sanctuary MCP Server`. The dashboard is the correct thing to supervise; the description is

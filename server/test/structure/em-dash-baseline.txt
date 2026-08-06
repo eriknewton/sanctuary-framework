@@ -128,7 +128,6 @@
 4	server/src/dashboard/aggregator.ts
 1	server/src/dashboard/html.ts
 5	server/src/dashboard/multi-html.ts
-1	server/src/disclosure/broker/keychain-backend.ts
 1	server/src/disclosure/tools.ts
 1	server/src/distress/local-secret.ts
 2	server/src/distress/tools.ts

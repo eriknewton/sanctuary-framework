@@ -19,7 +19,6 @@
  * passphrases again unless they want to export / migrate.
  */
 
-import { spawn } from "node:child_process";
 import { mkdir } from "node:fs/promises";
 import { homedir, hostname, platform, userInfo } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -31,6 +30,7 @@ import { resolveStoragePath, DEFAULT_STORAGE_DIR } from "../paths.js";
 import { fromBase64url, toBase64url } from "../core/encoding.js";
 import { readFileCustody, writeFileCustody } from "../storage/custody-fs.js";
 import type { ExecResult } from "./exec-result.js";
+import { execKeychain } from "./keychain-exec.js";
 import {
   classifyDarwinFailure,
   classifyLinuxFailure,
@@ -881,17 +881,7 @@ async function defaultExec(
   args: string[],
   input?: string
 ): Promise<ExecResult> {
-  return new Promise((resolve, reject) => {
-    const child = spawn(cmd, args, { stdio: ["pipe", "pipe", "pipe"] });
-    let stdout = "";
-    let stderr = "";
-    child.stdout.on("data", (d) => { stdout += d.toString(); });
-    child.stderr.on("data", (d) => { stderr += d.toString(); });
-    child.on("error", reject);
-    child.on("close", (code) => resolve({ stdout, stderr, code }));
-    if (input !== undefined) {
-      child.stdin.write(input);
-    }
-    child.stdin.end();
-  });
+  // Routed through the single credential-CLI chokepoint so tests can never
+  // reach the operator's real login keychain. See src/wrap/keychain-exec.ts.
+  return execKeychain(cmd, args, input);
 }

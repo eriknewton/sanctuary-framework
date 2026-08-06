@@ -17,11 +17,151 @@ public enum AuditProducerSigningError: Error, Equatable {
     case canonicalizationFailed(String)
     case signerUnavailable(String)
     case emptySignature
+    case statePersistenceFailed(String)
+    case chainAdvancedBeforeSignReply
 }
 
 public enum AuditProducerSigningConstants {
     public static let keyId = "cw-audit-producer-v1"
     public static let domainPrefix = "sanctuary.castle-wall.audit-producer.v1\n"
+}
+
+public struct AuditProducerChainState: Codable, Equatable {
+    public let schemaVersion: Int
+    public let nextSeq: UInt64
+    public let priorSha256Hex: String?
+
+    public init(
+        schemaVersion: Int = 1,
+        nextSeq: UInt64,
+        priorSha256Hex: String?
+    ) {
+        self.schemaVersion = schemaVersion
+        self.nextSeq = nextSeq
+        self.priorSha256Hex = priorSha256Hex
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case schemaVersion = "schema_version"
+        case nextSeq = "next_seq"
+        case priorSha256Hex = "prior_sha256_hex"
+    }
+}
+
+public protocol AuditProducerChainStateStore {
+    func load() throws -> AuditProducerChainState?
+    func save(_ state: AuditProducerChainState) throws
+}
+
+public enum AuditProducerChainStateError: Error, Equatable, CustomStringConvertible {
+    case invalid(String)
+
+    public var description: String {
+        switch self {
+        case .invalid(let reason):
+            return reason
+        }
+    }
+}
+
+public final class FileAuditProducerChainStateStore: AuditProducerChainStateStore {
+    private let url: URL
+
+    public init(url: URL) {
+        self.url = url
+    }
+
+    public static func defaultURL() -> URL? {
+        guard let base = FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first else {
+            return nil
+        }
+        return base
+            .appendingPathComponent("Sanctuary", isDirectory: true)
+            .appendingPathComponent("CastleWall", isDirectory: true)
+            .appendingPathComponent("audit-producer-chain-state.json")
+    }
+
+    public static func defaultStore() -> AuditProducerChainStateStore {
+        guard let url = defaultURL() else {
+            return UnavailableAuditProducerChainStateStore(
+                reason: "application support directory unavailable"
+            )
+        }
+        return FileAuditProducerChainStateStore(url: url)
+    }
+
+    public func load() throws -> AuditProducerChainState? {
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            return nil
+        }
+        let data = try Data(contentsOf: url)
+        let state = try JSONDecoder().decode(AuditProducerChainState.self, from: data)
+        try Self.validate(state)
+        return state
+    }
+
+    public func save(_ state: AuditProducerChainState) throws {
+        try Self.validate(state)
+        let dir = url.deletingLastPathComponent()
+        try FileManager.default.createDirectory(
+            at: dir,
+            withIntermediateDirectories: true
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        let data = try encoder.encode(state)
+        try data.write(to: url, options: [.atomic])
+    }
+
+    public static func validate(_ state: AuditProducerChainState) throws {
+        guard state.schemaVersion == 1 else {
+            throw AuditProducerChainStateError.invalid("unsupported schema_version \(state.schemaVersion)")
+        }
+        if state.nextSeq == 0 {
+            guard state.priorSha256Hex == nil else {
+                throw AuditProducerChainStateError.invalid("genesis state must not carry prior_sha256_hex")
+            }
+            return
+        }
+        guard let prior = state.priorSha256Hex else {
+            throw AuditProducerChainStateError.invalid("non-genesis state must carry prior_sha256_hex")
+        }
+        guard prior.count == 64 && prior.allSatisfy({ $0.isHexDigit }) else {
+            throw AuditProducerChainStateError.invalid("prior_sha256_hex must be a 64-character hex digest")
+        }
+    }
+}
+
+public final class UnavailableAuditProducerChainStateStore: AuditProducerChainStateStore {
+    private let reason: String
+
+    public init(reason: String) {
+        self.reason = reason
+    }
+
+    public func load() throws -> AuditProducerChainState? {
+        throw AuditProducerChainStateError.invalid(reason)
+    }
+
+    public func save(_ state: AuditProducerChainState) throws {
+        throw AuditProducerChainStateError.invalid(reason)
+    }
+}
+
+/// Explicit test seam for flows that need the pre-existing in-memory behavior.
+/// Production uses `FileAuditProducerChainStateStore.defaultStore()`, which
+/// returns a failing store rather than silently losing durability.
+public final class VolatileAuditProducerChainStateStore: AuditProducerChainStateStore {
+    public init() {}
+
+    public func load() throws -> AuditProducerChainState? {
+        return nil
+    }
+
+    public func save(_ state: AuditProducerChainState) throws {}
 }
 
 public protocol AuditProducerSigning {
@@ -114,6 +254,8 @@ public final class XpcAuditProducerSigner: AuditProducerSigning {
 public final class AuditProducerChain {
     private var nextSeq: UInt64
     private var priorHashHex: String?
+    private let stateStore: AuditProducerChainStateStore
+    private var stateLoadError: Error?
     private let stateQueue = DispatchQueue(
         label: "ai.sanctuaryprotocol.castle-wall.audit-producer-chain"
     )
@@ -143,10 +285,26 @@ public final class AuditProducerChain {
     public init(
         nextSeq: UInt64 = 0,
         priorHashHex: String? = nil,
-        signTimeoutSeconds: TimeInterval = 5.0
+        signTimeoutSeconds: TimeInterval = 5.0,
+        stateStore: AuditProducerChainStateStore = FileAuditProducerChainStateStore.defaultStore()
     ) {
-        self.nextSeq = nextSeq
-        self.priorHashHex = priorHashHex
+        var initialNextSeq = nextSeq
+        var initialPriorHashHex = priorHashHex
+        var initialLoadError: Error?
+        if nextSeq == 0 && priorHashHex == nil {
+            do {
+                if let loaded = try stateStore.load() {
+                    initialNextSeq = loaded.nextSeq
+                    initialPriorHashHex = loaded.priorSha256Hex
+                }
+            } catch {
+                initialLoadError = error
+            }
+        }
+        self.nextSeq = initialNextSeq
+        self.priorHashHex = initialPriorHashHex
+        self.stateStore = stateStore
+        self.stateLoadError = initialLoadError
         self.signTimeoutSeconds = signTimeoutSeconds
     }
 
@@ -203,11 +361,12 @@ public final class AuditProducerChain {
             didComplete = true
             completionLock.unlock()
             if let advance, let self {
-                self.stateQueue.sync {
-                    if self.nextSeq == advance.seq {
-                        self.nextSeq = advance.seq + 1
-                        self.priorHashHex = advance.hash
-                    }
+                if let error = self.advanceAfterSignedResult(
+                    seq: advance.seq,
+                    hash: advance.hash
+                ) {
+                    completion(.failure(error))
+                    return
                 }
             }
             completion(result)
@@ -290,11 +449,12 @@ public final class AuditProducerChain {
             didComplete = true
             completionLock.unlock()
             if let advance, let self {
-                self.stateQueue.sync {
-                    if self.nextSeq == advance.seq {
-                        self.nextSeq = advance.seq + 1
-                        self.priorHashHex = advance.hash
-                    }
+                if let error = self.advanceAfterSignedResult(
+                    seq: advance.seq,
+                    hash: advance.hash
+                ) {
+                    completion(.failure(error))
+                    return
                 }
             }
             completion(result)
@@ -343,6 +503,7 @@ public final class AuditProducerChain {
         enforcement: EnforcementAvailabilitySnapshotBody?,
         recordedAt: Date
     ) throws -> PendingDecision {
+        try assertStateLoadSucceededLocked()
         let decision: String
         let matchedRuleId: String?
         let operation: String
@@ -446,6 +607,7 @@ public final class AuditProducerChain {
         fortressId: String,
         reportedAt: Date
     ) throws -> PendingAvailability {
+        try assertStateLoadSucceededLocked()
         let seq = nextSeq
         let prior = priorHashHex
         let reportedAtString = enforcement.producerClaimedAt ?? IPCBridgeNotifications.iso8601(reportedAt)
@@ -515,6 +677,41 @@ public final class AuditProducerChain {
     private func sha256Hex(_ data: Data) -> String {
         let digest = SHA256.hash(data: data)
         return digest.map { String(format: "%02x", $0) }.joined()
+    }
+
+    private func assertStateLoadSucceededLocked() throws {
+        if let stateLoadError {
+            throw AuditProducerSigningError.statePersistenceFailed(
+                "audit producer chain state could not be loaded: \(stateLoadError)"
+            )
+        }
+    }
+
+    private func advanceAfterSignedResult(seq: UInt64, hash: String) -> AuditProducerSigningError? {
+        return stateQueue.sync {
+            if let stateLoadError {
+                return .statePersistenceFailed(
+                    "audit producer chain state could not be loaded: \(stateLoadError)"
+                )
+            }
+            guard nextSeq == seq else {
+                return .chainAdvancedBeforeSignReply
+            }
+            let advancedState = AuditProducerChainState(
+                nextSeq: seq + 1,
+                priorSha256Hex: hash
+            )
+            do {
+                try stateStore.save(advancedState)
+            } catch {
+                return .statePersistenceFailed(
+                    "audit producer chain state could not be saved: \(error)"
+                )
+            }
+            nextSeq = advancedState.nextSeq
+            priorHashHex = advancedState.priorSha256Hex
+            return nil
+        }
     }
 
     private struct PendingDecision {

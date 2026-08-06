@@ -47,7 +47,6 @@
  */
 
 import { createInterface, Interface as ReadlineInterface } from "node:readline";
-import { spawn } from "node:child_process";
 import {
   readdir,
   rm,
@@ -60,6 +59,7 @@ import { homedir } from "node:os";
 import { basename, join } from "node:path";
 
 import { resolveStoragePath } from "../paths.js";
+import { execKeychain } from "../wrap/keychain-exec.js";
 import { keychainServiceFor } from "../wrap/passphrase.js";
 
 // ── Types ───────────────────────────────────────────────────────────
@@ -792,21 +792,17 @@ export function zeroizeBuffers(
   }
 }
 
+/**
+ * Default credential-CLI runner. Routed through the single chokepoint
+ * (`wrap/keychain-exec`) rather than spawning `security` here: this module is
+ * the FOURTH call site, and the chokepoint exists precisely because per-site
+ * spawns are whack-a-mole. Under test the chokepoint refuses the real binary,
+ * so a reset path can never delete from the operator's real login keychain.
+ */
 async function defaultExec(
   cmd: string,
   args: string[]
 ): Promise<{ stdout: string; stderr: string; code: number | null }> {
-  return await new Promise((resolve, reject) => {
-    const child = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
-    let stdout = "";
-    let stderr = "";
-    child.stdout.on("data", (d) => {
-      stdout += d.toString();
-    });
-    child.stderr.on("data", (d) => {
-      stderr += d.toString();
-    });
-    child.on("error", reject);
-    child.on("close", (code) => resolve({ stdout, stderr, code }));
-  });
+  const result = await execKeychain(cmd, args);
+  return { stdout: result.stdout, stderr: result.stderr, code: result.code };
 }

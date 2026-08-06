@@ -45,11 +45,19 @@ so; the workflow above is where the habit gets set. For anything scripted, pipe 
 instead: `printf %s "$VALUE" | sanctuary secrets add gmail_oauth_token`. The same
 precedence applies to `sanctuary secrets rotate`.
 
-Failure mode: `--fortress` must precede the subcommand. `sanctuary secrets list --fortress
-<path>` silently ignores the flag and operates on `~/.sanctuary`, so on a multi-fortress
-host you can add a secret to, or read a secret from, a fortress you did not mean to touch,
-with no warning and a perfectly ordinary-looking result. Write it as `sanctuary --fortress
-<path> secrets list`. See [cli-operator-verbs.md](cli-operator-verbs.md).
+Failure mode: `--fortress` must precede the subcommand. `sanctuary secrets list
+--fortress <path>` is refused with exit 2; write it as `sanctuary --fortress <path>
+secrets list`, or export `SANCTUARY_STORAGE_PATH` for the whole shell.
+
+The refusal was added on 2026-08-05 because `secrets` does not parse `--fortress` at
+all. Before it, `sanctuary secrets add NAME VALUE --fortress <other>` stored the
+credential in `~/.sanctuary`, left `<other>` empty, and printed `Stored secret: NAME`.
+The read verbs had the same shape, listing the default fortress's secrets under the
+other fortress's name. Both spellings (`--fortress <path>` and `--fortress=<path>`) and
+the missing-value form are refused, and the refusal returns before the broker opens, so
+no keychain is touched and nothing is written. See
+[cli-operator-verbs.md](cli-operator-verbs.md), which also notes that this refusal
+covers `secrets` only.
 
 ---
 
