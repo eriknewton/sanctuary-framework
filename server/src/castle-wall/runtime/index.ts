@@ -21,6 +21,7 @@ export * from "./approval-stub.js";
 export * from "./ipc-client.js";
 export * from "./lifecycle.js";
 export * from "./macos-flow-events.js";
+export * from "./macos-audit-producer-state.js";
 export * from "./macos-ipc-listener.js";
 export * from "./enforcement-availability.js";
 export * from "./system-resolvers.js";

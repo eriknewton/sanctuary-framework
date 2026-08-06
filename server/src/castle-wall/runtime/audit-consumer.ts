@@ -142,6 +142,112 @@ export type PersistedChainAnchor =
  */
 export type ChainAnchorSource = () => Promise<PersistedChainAnchor | null>;
 
+export type ResolvedProducerCursorAnchor =
+  | {
+      kind: "ok";
+      /** The last locally accepted, signature-verified producer sequence. */
+      seq: number;
+      /** The producer cursor the next signed event must use. */
+      nextSeq: number;
+      /** `sha256(utf8(signedCanonicalJson))`, the producer chain prior. */
+      priorSha256Hex: string;
+      chainBasis: string | null;
+      identityId: string;
+    }
+  | {
+      kind: "unavailable";
+      identityId: string;
+      reason: string;
+    };
+
+export function resolveProducerCursorFromPersistedChainAnchor(
+  anchor: PersistedChainAnchor,
+  pinnedProducerKeyB64url: string,
+): ResolvedProducerCursorAnchor {
+  if (anchor.kind === "unavailable") {
+    return { kind: "unavailable", identityId: "unknown", reason: anchor.reason };
+  }
+  if (!Number.isSafeInteger(anchor.seq) || anchor.seq < 0) {
+    return {
+      kind: "unavailable",
+      identityId: anchor.identityId,
+      reason: "persisted_anchor_seq_invalid",
+    };
+  }
+  if (anchor.seq >= Number.MAX_SAFE_INTEGER) {
+    return {
+      kind: "unavailable",
+      identityId: anchor.identityId,
+      reason: "persisted_anchor_next_seq_unsafe",
+    };
+  }
+  if (anchor.signedCanonicalJson === null) {
+    return {
+      kind: "unavailable",
+      identityId: anchor.identityId,
+      reason: "last_accepted_entry_unsigned",
+    };
+  }
+  if (
+    anchor.signatureB64url === null ||
+    anchor.keyId === null ||
+    anchor.capturedAtUnixMs === null
+  ) {
+    return {
+      kind: "unavailable",
+      identityId: anchor.identityId,
+      reason: "persisted_anchor_signature_material_missing",
+    };
+  }
+  const verdict = verifyProducerSignature(
+    {
+      eventCanonicalJson: anchor.signedCanonicalJson,
+      capturedAtUnixMs: anchor.capturedAtUnixMs,
+      seq: anchor.seq,
+      signatureB64url: anchor.signatureB64url,
+      keyId: anchor.keyId,
+    },
+    pinnedProducerKeyB64url,
+  );
+  if (!verdict.ok) {
+    return {
+      kind: "unavailable",
+      identityId: anchor.identityId,
+      reason: `persisted_anchor_signature_invalid:${verdict.reason}`,
+    };
+  }
+  const parsedAnchorBody = parseSignedBody(anchor.signedCanonicalJson);
+  if (parsedAnchorBody.kind === "error") {
+    return {
+      kind: "unavailable",
+      identityId: anchor.identityId,
+      reason: `persisted_anchor_body_unparseable:${parsedAnchorBody.reason}`,
+    };
+  }
+  const signedAnchorDetails = signedDetailsFromBody(parsedAnchorBody.body);
+  if (
+    Object.prototype.hasOwnProperty.call(
+      signedAnchorDetails,
+      CASTLE_WALL_WAL_SEQUENCE_DETAIL_KEY,
+    ) &&
+    signedAnchorDetails[CASTLE_WALL_WAL_SEQUENCE_DETAIL_KEY] !== anchor.seq
+  ) {
+    return {
+      kind: "unavailable",
+      identityId: anchor.identityId,
+      reason: "persisted_anchor_seq_not_signature_bound",
+    };
+  }
+  return {
+    kind: "ok",
+    seq: anchor.seq,
+    nextSeq: anchor.seq + 1,
+    priorSha256Hex: computeSignedBodyHash(anchor.signedCanonicalJson),
+    chainBasis: anchor.chainBasis,
+    identityId: anchor.identityId,
+  };
+}
+
 /** A single critical-event ACK callback the consumer invokes after persistence. */
 export type CriticalAckCallback = () => Promise<void>;
 
@@ -733,29 +839,6 @@ export class AuditConsumer {
       // No chain-participating history: genuine genesis bootstrap.
       return;
     }
-    if (anchor.kind === "unavailable") {
-      await this.latchMigrationUnavailable("unknown", anchor.reason);
-      return;
-    }
-    if (!Number.isSafeInteger(anchor.seq) || anchor.seq < 0) {
-      // Our own anchor record is malformed: that is damage, not a fresh chain.
-      await this.latchMigrationUnavailable(
-        anchor.identityId,
-        "persisted_anchor_seq_invalid",
-      );
-      return;
-    }
-    if (anchor.signedCanonicalJson === null) {
-      // The last accepted entry was channel-unsigned: its signed body was
-      // deliberately stripped at persist time, so local recomputation is
-      // impossible. Do NOT fall back to trusting the wire — surface the stuck
-      // state loudly and leave repair to the operator.
-      await this.latchMigrationUnavailable(
-        anchor.identityId,
-        "last_accepted_entry_unsigned",
-      );
-      return;
-    }
     // DEFENSE IN DEPTH (gate finding, PR #1103 round 1): never adopt an anchor
     // because of WHERE a row sits or WHICH marker it carries. Any writer that
     // can append to this log could otherwise plant a chain position the
@@ -765,81 +848,39 @@ export class AuditConsumer {
     // real producer event. Freshness is deliberately NOT applied here: a
     // durable anchor is legitimately old, and the anti-replay property comes
     // from the restored monotonic seq floor, never from a time window.
-    if (
-      anchor.signatureB64url === null ||
-      anchor.keyId === null ||
-      anchor.capturedAtUnixMs === null
-    ) {
-      await this.latchMigrationUnavailable(
-        anchor.identityId,
-        "persisted_anchor_signature_material_missing",
-      );
-      return;
-    }
-    const verdict = verifyProducerSignature(
-      {
-        eventCanonicalJson: anchor.signedCanonicalJson,
-        capturedAtUnixMs: anchor.capturedAtUnixMs,
-        seq: anchor.seq,
-        signatureB64url: anchor.signatureB64url,
-        keyId: anchor.keyId,
-      },
+    const resolvedAnchor = resolveProducerCursorFromPersistedChainAnchor(
+      anchor,
       this.pinnedProducerKeyB64url,
     );
-    if (!verdict.ok) {
+    if (resolvedAnchor.kind === "unavailable") {
       await this.latchMigrationUnavailable(
-        anchor.identityId,
-        `persisted_anchor_signature_invalid:${verdict.reason}`,
+        resolvedAnchor.identityId,
+        resolvedAnchor.reason,
       );
       return;
     }
-    const parsedAnchorBody = parseSignedBody(anchor.signedCanonicalJson);
-    if (parsedAnchorBody.kind === "error") {
-      await this.latchMigrationUnavailable(
-        anchor.identityId,
-        `persisted_anchor_body_unparseable:${parsedAnchorBody.reason}`,
-      );
-      return;
-    }
-    const signedAnchorDetails = signedDetailsFromBody(parsedAnchorBody.body);
-    if (
-      Object.prototype.hasOwnProperty.call(
-        signedAnchorDetails,
-        CASTLE_WALL_WAL_SEQUENCE_DETAIL_KEY,
-      ) &&
-      signedAnchorDetails[CASTLE_WALL_WAL_SEQUENCE_DETAIL_KEY] !== anchor.seq
-    ) {
-      // The row's seq must be the one inside the signed bytes; otherwise a
-      // genuine signed body could be re-filed under a chosen seq floor.
-      await this.latchMigrationUnavailable(
-        anchor.identityId,
-        "persisted_anchor_seq_not_signature_bound",
-      );
-      return;
-    }
-    const anchorHash = computeSignedBodyHash(anchor.signedCanonicalJson);
-    if (anchor.chainBasis !== CASTLE_WALL_CHAIN_BASIS_PRODUCER_SIGNED_BODY) {
+    if (resolvedAnchor.chainBasis !== CASTLE_WALL_CHAIN_BASIS_PRODUCER_SIGNED_BODY) {
       // Old-basis (or pre-recording) history: this is the one-time migration.
       // Record it first-class and FLUSH before the anchor is adopted, so the
       // audit trail explains the basis change before any event chains on it.
       await this.sink.append(
         CASTLE_WALL_AUDIT_LAYER,
         "chain_basis_migrated",
-        anchor.identityId,
+        resolvedAnchor.identityId,
         {
           previous_basis:
-            anchor.chainBasis ?? CASTLE_WALL_CHAIN_BASIS_EVENT_CANONICAL,
+            resolvedAnchor.chainBasis ?? CASTLE_WALL_CHAIN_BASIS_EVENT_CANONICAL,
           new_basis: CASTLE_WALL_CHAIN_BASIS_PRODUCER_SIGNED_BODY,
-          anchor_seq: anchor.seq,
-          anchor_sha256_hex: anchorHash,
+          anchor_seq: resolvedAnchor.seq,
+          anchor_sha256_hex: resolvedAnchor.priorSha256Hex,
           anchor_source: "persisted_signed_canonical_body",
         },
         "success",
       );
       await this.sink.flush();
     }
-    this.lastAckedSeq = anchor.seq;
-    this.lastEventChainHash = anchorHash;
+    this.lastAckedSeq = resolvedAnchor.seq;
+    this.lastEventChainHash = resolvedAnchor.priorSha256Hex;
   }
 
   private async latchMigrationUnavailable(
