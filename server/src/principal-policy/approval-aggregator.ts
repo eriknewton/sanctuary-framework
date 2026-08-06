@@ -33,27 +33,15 @@ import { encrypt, decrypt, type EncryptedPayload } from "../core/encryption.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
 import { stringToBytes, bytesToString } from "../core/encoding.js";
 import type { AggregatorPayloadStore } from "./aggregator-store.js";
+import { APPROVAL_AGGREGATOR_AUDIT_OPS } from "./approval-aggregator-ops.js";
+
+export { APPROVAL_AGGREGATOR_AUDIT_OPS } from "./approval-aggregator-ops.js";
 
 /** Reserved storage namespace for aggregator records. */
 export const APPROVAL_AGGREGATOR_NAMESPACE = "_approval_aggregator";
 
 /** HKDF info string for the aggregator's per-fortress encryption key. */
 export const APPROVAL_AGGREGATOR_HKDF_INFO = "l2-approval-aggregator-v1";
-
-/**
- * Audit-event operation names emitted by the aggregator. Additive to the
- * existing free-form `operation` field on `AuditEntry`. The first three
- * names ship with Upsilon-1; the remaining three (replay surface) ship
- * with Upsilon-3.
- */
-export const APPROVAL_AGGREGATOR_AUDIT_OPS = {
-  AGGREGATED: "cross_harness_approval_aggregated",
-  RESOLVED: "cross_harness_approval_resolved",
-  DEDUPED: "cross_harness_approval_deduped",
-  PAYLOAD_DECRYPTED: "cross_harness_approval_payload_decrypted",
-  AUDIT_TRAIL_VIEWED: "cross_harness_approval_audit_trail_viewed",
-  REPLAYED: "cross_harness_approval_replayed",
-} as const;
 
 /**
  * Coordinator-CTO defaults baked in. v1.3 Upsilon-1 ships with one set of

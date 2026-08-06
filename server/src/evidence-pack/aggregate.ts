@@ -17,6 +17,7 @@
  */
 
 import type { AuditEntry } from "../operational/audit-log.js";
+import { APPROVAL_AGGREGATOR_AUDIT_OPS } from "../principal-policy/approval-aggregator-ops.js";
 import type {
   DecisionCategory,
   QuarterAggregation,
@@ -61,9 +62,8 @@ function quoteUnusableValue(value: unknown): string {
 
 /**
  * The operation string the approval aggregator writes when a cross-harness
- * Tier-1 approval is resolved. Mirrored here (not imported) so this pure layer
- * does not couple to the aggregator's internals; it is a wire-string constant,
- * not behavior. Kept in lockstep with `APPROVAL_AGGREGATOR_AUDIT_OPS.RESOLVED`.
+ * Tier-1 approval is resolved. Imported from the side-effect-free wire-string
+ * catalog so this pure layer does not duplicate the aggregator's op literal.
  *
  * DE-DUP (sweep HIGH-1): this op is DELIBERATELY treated as observational
  * (`other`), NOT a human decision count. When the cross-harness approval inbox
@@ -76,7 +76,8 @@ function quoteUnusableValue(value: unknown): string {
  * aggregator op is a paired observation of the same decision, so it is not
  * counted a second time.
  */
-const CROSS_HARNESS_APPROVAL_RESOLVED = "cross_harness_approval_resolved";
+const CROSS_HARNESS_APPROVAL_RESOLVED =
+  APPROVAL_AGGREGATOR_AUDIT_OPS.RESOLVED;
 
 /** Every decision category, so `by_category` is always fully zero-filled. */
 const ALL_CATEGORIES: DecisionCategory[] = [
