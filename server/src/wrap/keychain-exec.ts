@@ -37,6 +37,9 @@
  */
 
 import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import type { ExecResult } from "./exec-result.js";
 
@@ -84,12 +87,81 @@ export function decideKeychainExecution(
   return isUnderTest ? "refuse-under-test" : "spawn-real";
 }
 
-/** True when running under vitest, or an explicit test NODE_ENV. */
+/**
+ * Filename of the marker a test run leaves at this package's root for its whole
+ * duration.
+ *
+ * MUST MATCH the path built in `test/setup/test-run-marker.ts`, which is the
+ * vitest `globalSetup` that creates and removes it. Both sides derive the
+ * directory the same way, from the package root; that file carries a pointer
+ * back here.
+ */
+export const TEST_RUN_MARKER_FILENAME = ".sanctuary-test-run";
+
+/**
+ * This package's root, found by walking up from this module to the directory
+ * holding package.json. Works from `src/wrap/` under vitest or tsx and from the
+ * bundled `dist/` in a spawned CLI, because both resolve to the same root.
+ */
+function packageRoot(): string | null {
+  try {
+    let dir = dirname(fileURLToPath(import.meta.url));
+    // 10 = far more levels than src/wrap (2) or dist (1) ever needs; the loop
+    // also stops at the filesystem root, so this only bounds a pathological case.
+    for (let i = 0; i < 10; i++) {
+      if (existsSync(join(dir, "package.json"))) return dir;
+      const parent = dirname(dir);
+      if (parent === dir) return null;
+      dir = parent;
+    }
+  } catch {
+    // No import.meta (an exotic CJS consumer) or an unreadable path. Falls back
+    // to the env signals below, which is the pre-existing behavior.
+  }
+  return null;
+}
+
+/**
+ * Cached: a spawned child is a fresh process and the marker is written before
+ * any child starts, so one stat per process is both correct and enough.
+ * `underTest()` is evaluated on EVERY credential call, so this matters.
+ */
+let markerPresent: boolean | undefined;
+
+function testRunMarkerPresent(): boolean {
+  if (markerPresent === undefined) {
+    const root = packageRoot();
+    markerPresent = root !== null && existsSync(join(root, TEST_RUN_MARKER_FILENAME));
+  }
+  return markerPresent;
+}
+
+/**
+ * True when this process is part of a test run.
+ *
+ * WHY THIS IS NOT PURELY ENV-DERIVED. The env signals are inherited by children
+ * BY DEFAULT, but a test that spawns the CLI with `env: {}` produces a child
+ * where VITEST is undefined, vitest setup never loads, no store is installed,
+ * and the old purely-env answer was "production", i.e. spawn the real
+ * credential binary against the operator's own keychain. That is how the login
+ * keychain accumulated tens of thousands of `sanctuary-*` artifacts. Absence of
+ * evidence was being read as production.
+ *
+ * The marker file closes it because a scrubbed environment cannot erase a file.
+ * It is a POSITIVE signal for "a test run is in progress" and is scoped to this
+ * checkout, so it does not affect an installed package or a drill running the
+ * CLI outside `npm test`.
+ *
+ * Fail direction: if the marker cannot be resolved, this degrades to the env
+ * signals, which is the previous behavior; it never turns a test run into
+ * production. The case that matters, a child of the suite, always resolves.
+ */
 function underTest(): boolean {
   return (
     process.env.VITEST !== undefined ||
     process.env.VITEST_WORKER_ID !== undefined ||
-    process.env.NODE_ENV === "test"
+    process.env.NODE_ENV === "test" ||
+    testRunMarkerPresent()
   );
 }
 

@@ -391,11 +391,9 @@ describe("no code path in server/test can reach the real credential binary", () 
     expect(offenders).toEqual([]);
   });
 
-  it("passes VITEST down to child processes, so a spawned CLI is refused too", async () => {
-    // The assumption the subprocess case rests on, verified instead of asserted:
-    // if VITEST did NOT reach the child, a test that spawns the built CLI would
-    // run it with `underTest()` false and the chokepoint would spawn the real
-    // credential binary inside that child.
+  it("passes VITEST down to child processes spawned with the DEFAULT env", async () => {
+    // Verified rather than asserted. This covers the common case only; the
+    // scrubbed-env case below is the one that used to be open.
     const { spawnSync: spawnChild } = await import("node:child_process");
     const result = spawnChild(
       process.execPath,
@@ -404,4 +402,41 @@ describe("no code path in server/test can reach the real credential binary", () 
     );
     expect(result.stdout).not.toBe("undefined");
   });
+
+  it(
+    "REFUSES inside a child spawned with `env: {}`, where no env signal survives",
+    async () => {
+      /**
+       * The hole this closes. `underTest()` used to be purely env-derived, so a
+       * child spawned with a scrubbed environment saw no VITEST, loaded no
+       * vitest setup, had no store installed, and got `spawn-real`: the real
+       * credential binary against the operator's own keychain. That is the
+       * mechanism behind the tens of thousands of `sanctuary-*` artifacts found
+       * in the login keychain.
+       *
+       * The fix is a marker FILE at the package root, which `env: {}` cannot
+       * erase. This case runs the real thing: a child, genuinely scrubbed,
+       * importing the same module, attempting a genuine credential read.
+       */
+      const { spawnSync: spawnChild } = await import("node:child_process");
+      const serverDir = fileURLToPath(new URL("../..", import.meta.url));
+      const fixture = fileURLToPath(
+        new URL("../fixtures/scrubbed-env-child.ts", import.meta.url)
+      );
+
+      const result = spawnChild(process.execPath, ["--import", "tsx", fixture], {
+        // The whole point: nothing inherited. Not VITEST, not NODE_ENV, not HOME.
+        env: {},
+        cwd: serverDir,
+        encoding: "utf8",
+        timeout: 60_000,
+      });
+
+      // Assert the postcondition, not the exit code: the child prints exactly
+      // which branch it took, so "REFUSED" cannot be confused with a child that
+      // failed to start.
+      expect(result.stdout, `child stderr: ${result.stderr}`).toBe("REFUSED");
+    },
+    90_000
+  );
 });
