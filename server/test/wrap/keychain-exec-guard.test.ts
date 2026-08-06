@@ -14,6 +14,7 @@ import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSy
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import ts from "typescript";
 
 import {
   decideKeychainExecution,
@@ -417,65 +418,98 @@ describe("no code path in server/test can reach the real credential binary", () 
     expect(latchUnderTest(false, false)).toBe(false);
   });
 
+  /**
+   * Run a probe against an ISOLATED copy of the chokepoint, in a child spawned
+   * with `env: {}`.
+   *
+   * Isolated on purpose: these probes create and delete a marker, and doing that
+   * to the real one mid-suite would change the answer for other vitest workers
+   * running in parallel. The module is COPIED from src at run time, so the probe
+   * can never drift from what production does.
+   */
+  async function runIsolatedProbe(opts: {
+    markerPresentAtImport: boolean;
+    /** Statements run after import, before the first credential call. */
+    betweenImportAndCall: string[];
+  }): Promise<{ stdout: string; stderr: string }> {
+    const { spawnSync: spawnChild } = await import("node:child_process");
+    const serverDir = fileURLToPath(new URL("../..", import.meta.url));
+    const probeDir = mkdtempSync(join(tmpdir(), "sanctuary-latch-probe-"));
+    try {
+      for (const file of ["keychain-exec.ts", "exec-result.ts"]) {
+        writeFileSync(
+          join(probeDir, file),
+          readFileSync(join(serverDir, "src", "wrap", file), "utf8")
+        );
+      }
+      writeFileSync(
+        join(probeDir, "package.json"),
+        JSON.stringify({ name: "latch-probe", type: "module", private: true })
+      );
+      if (opts.markerPresentAtImport) {
+        writeFileSync(join(probeDir, ".sanctuary-test-run"), "probe");
+      }
+      writeFileSync(
+        join(probeDir, "probe.ts"),
+        [
+          'import { rmSync, writeFileSync } from "node:fs";',
+          'import { fileURLToPath } from "node:url";',
+          'const marker = fileURLToPath(new URL("./.sanctuary-test-run", import.meta.url));',
+          'void rmSync; void writeFileSync; void marker;',
+          // The import is where the latch initializes.
+          'import { execKeychain } from "./keychain-exec.js";',
+          ...opts.betweenImportAndCall,
+          "try {",
+          '  await execKeychain("security", ["find-generic-password", "-s", "sanctuary-latch-probe-never-exists", "-a", "sanctuary", "-w"]);',
+          '  process.stdout.write("SPAWNED_REAL");',
+          "} catch (err) {",
+          "  const message = (err as Error).message;",
+          '  process.stdout.write(message.includes("Refusing to run") ? "REFUSED" : `OTHER:${message}`);',
+          "}",
+          "",
+        ].join("\n")
+      );
+
+      const result = spawnChild(
+        process.execPath,
+        ["--import", "tsx", join(probeDir, "probe.ts")],
+        { env: {}, cwd: serverDir, encoding: "utf8", timeout: 60_000 }
+      );
+      return { stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
+    } finally {
+      rmSync(probeDir, { recursive: true, force: true });
+    }
+  }
+
   it(
     "REFUSES in a child whose marker is deleted BEFORE its first credential call",
     async () => {
-      /**
-       * The race end-to-end, on an ISOLATED copy of the chokepoint so deleting a
-       * marker cannot affect other vitest workers running in parallel. The child
-       * imports the module (latching while the marker exists), then deletes its
-       * own marker to simulate global teardown, then makes its first call. A
-       * lazily-evaluated check answers "production" here; the latch does not.
-       *
-       * The synchronous `env: {}` case below cannot cover this: spawnSync means
-       * the child always calls while the marker is still present.
-       */
-      const { spawnSync: spawnChild } = await import("node:child_process");
-      const serverDir = fileURLToPath(new URL("../..", import.meta.url));
-      const probeDir = mkdtempSync(join(tmpdir(), "sanctuary-latch-probe-"));
-      try {
-        // Copy the REAL module rather than a paraphrase, so this can never drift
-        // from what production does.
-        for (const file of ["keychain-exec.ts", "exec-result.ts"]) {
-          writeFileSync(
-            join(probeDir, file),
-            readFileSync(join(serverDir, "src", "wrap", file), "utf8")
-          );
-        }
-        writeFileSync(
-          join(probeDir, "package.json"),
-          JSON.stringify({ name: "latch-probe", type: "module", private: true })
-        );
-        writeFileSync(join(probeDir, ".sanctuary-test-run"), "probe");
-        writeFileSync(
-          join(probeDir, "probe.ts"),
-          [
-            'import { rmSync } from "node:fs";',
-            'import { fileURLToPath } from "node:url";',
-            // Importing latches the marker, which exists right now.
-            'import { execKeychain } from "./keychain-exec.js";',
-            // Simulate global teardown removing it before the first call.
-            'rmSync(fileURLToPath(new URL("./.sanctuary-test-run", import.meta.url)), { force: true });',
-            "try {",
-            '  await execKeychain("security", ["find-generic-password", "-s", "sanctuary-latch-probe-never-exists", "-a", "sanctuary", "-w"]);',
-            '  process.stdout.write("SPAWNED_REAL");',
-            "} catch (err) {",
-            "  const message = (err as Error).message;",
-            '  process.stdout.write(message.includes("Refusing to run") ? "REFUSED" : `OTHER:${message}`);',
-            "}",
-            "",
-          ].join("\n")
-        );
+      // THE RACE. The child imports while the marker exists (latching), then
+      // deletes it to simulate global teardown, then makes its first call. A
+      // lazily-evaluated check answers "production" here; the latch does not.
+      // The synchronous `env: {}` case below cannot cover this, because
+      // spawnSync means that child always calls while the marker still exists.
+      const { stdout, stderr } = await runIsolatedProbe({
+        markerPresentAtImport: true,
+        betweenImportAndCall: ["rmSync(marker, { force: true });"],
+      });
+      expect(stdout, `child stderr: ${stderr}`).toBe("REFUSED");
+    },
+    90_000
+  );
 
-        const result = spawnChild(
-          process.execPath,
-          ["--import", "tsx", join(probeDir, "probe.ts")],
-          { env: {}, cwd: serverDir, encoding: "utf8", timeout: 60_000 }
-        );
-        expect(result.stdout, `child stderr: ${result.stderr}`).toBe("REFUSED");
-      } finally {
-        rmSync(probeDir, { recursive: true, force: true });
-      }
+  it(
+    "still observes a marker that appears AFTER import, because no negative is cached",
+    async () => {
+      // The mirror property, and it was uncovered: caching the negative passed
+      // every test. A process that starts moments BEFORE the marker appears must
+      // still be able to see it, otherwise it latches "production" for the whole
+      // run. Here the child imports with NO marker, then one appears.
+      const { stdout, stderr } = await runIsolatedProbe({
+        markerPresentAtImport: false,
+        betweenImportAndCall: ['writeFileSync(marker, "appeared after import");'],
+      });
+      expect(stdout, `child stderr: ${stderr}`).toBe("REFUSED");
     },
     90_000
   );
@@ -516,4 +550,149 @@ describe("no code path in server/test can reach the real credential binary", () 
     },
     90_000
   );
+});
+
+describe("no test may spawn a child with a scrubbed environment", () => {
+  /**
+   * The one pattern that reopens the credential hole, refused at the authoring
+   * point.
+   *
+   * WHY THIS EXISTS EVEN THOUGH THERE ARE ZERO VIOLATIONS TODAY. The sentinel in
+   * keychain-exec.ts covers every child that loads the module while the marker
+   * exists, which is every child any current test spawns. What it cannot cover
+   * is a child that starts during the suite and first loads the module AFTER
+   * global teardown. No test does that now, and this rule is what keeps one from
+   * being added: a scrubbed env is the only way to get there, so the rule is
+   * trivially satisfied today and costs nothing to keep.
+   *
+   * SCOPE, deliberately narrow. It looks ONLY at call sites whose callee is a
+   * binding imported from node:child_process, and only at the `env` property of
+   * an object-literal argument to those calls. It is not a style gate: an `env`
+   * key anywhere else is invisible to it, which is why the ten in-process
+   * `env: {}` parameters elsewhere in the suite (runNodesCommand and friends)
+   * are correctly ignored.
+   *
+   * A child that inherits (no `env` at all, or one spreading `process.env`)
+   * carries VITEST and is already covered.
+   */
+  const testRoot = fileURLToPath(new URL("..", import.meta.url));
+
+  /** Names bound to a child_process import, including aliases and namespaces. */
+  function childProcessBindings(sf: ts.SourceFile): Set<string> {
+    const names = new Set<string>();
+    const isChildProcess = (text: string): boolean =>
+      text === "node:child_process" || text === "child_process";
+
+    const visit = (node: ts.Node): void => {
+      if (
+        ts.isImportDeclaration(node) &&
+        ts.isStringLiteral(node.moduleSpecifier) &&
+        isChildProcess(node.moduleSpecifier.text)
+      ) {
+        const clause = node.importClause;
+        if (clause?.name) names.add(clause.name.text);
+        const bindings = clause?.namedBindings;
+        if (bindings && ts.isNamedImports(bindings)) {
+          // `spawnSync as plantedSpawn` binds the LOCAL name, which is what a
+          // callee-name check has to match. An earlier text-based rule missed
+          // exactly this.
+          for (const element of bindings.elements) names.add(element.name.text);
+        }
+        if (bindings && ts.isNamespaceImport(bindings)) names.add(bindings.name.text);
+      }
+      // `const { spawnSync: x } = await import("node:child_process")`
+      if (
+        ts.isVariableDeclaration(node) &&
+        node.initializer !== undefined &&
+        /import\s*\(\s*["']node:child_process["']\s*\)/.test(node.initializer.getText(sf))
+      ) {
+        if (ts.isObjectBindingPattern(node.name)) {
+          for (const element of node.name.elements) {
+            if (ts.isIdentifier(element.name)) names.add(element.name.text);
+          }
+        } else if (ts.isIdentifier(node.name)) {
+          names.add(node.name.text);
+        }
+      }
+      node.forEachChild(visit);
+    };
+    visit(sf);
+    return names;
+  }
+
+  /**
+   * An env argument is safe when it inherits the parent environment (so VITEST
+   * reaches the child) or explicitly propagates the test-run signal.
+   */
+  const INHERITS_OR_PROPAGATES = /process\.env|VITEST|SANCTUARY_TEST_RUN/;
+
+  function scrubbedEnvSpawns(sf: ts.SourceFile): number[] {
+    const spawners = childProcessBindings(sf);
+    if (spawners.size === 0) return [];
+    const lines: number[] = [];
+
+    const visit = (node: ts.Node): void => {
+      if (ts.isCallExpression(node)) {
+        const callee = node.expression;
+        const isSpawn =
+          (ts.isIdentifier(callee) && spawners.has(callee.text)) ||
+          (ts.isPropertyAccessExpression(callee) &&
+            ts.isIdentifier(callee.expression) &&
+            spawners.has(callee.expression.text));
+        if (isSpawn) {
+          for (const arg of node.arguments) {
+            if (!ts.isObjectLiteralExpression(arg)) continue;
+            for (const prop of arg.properties) {
+              if (
+                !ts.isPropertyAssignment(prop) ||
+                prop.name.getText(sf).replace(/["']/g, "") !== "env"
+              ) {
+                continue;
+              }
+              if (!INHERITS_OR_PROPAGATES.test(prop.initializer.getText(sf))) {
+                lines.push(sf.getLineAndCharacterOfPosition(prop.getStart(sf)).line + 1);
+              }
+            }
+          }
+        }
+      }
+      node.forEachChild(visit);
+    };
+    visit(sf);
+    return lines;
+  }
+
+  function walkTests(dir: string): string[] {
+    return readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) return walkTests(full);
+      return entry.isFile() && full.endsWith(".ts") ? [full] : [];
+    });
+  }
+
+  /**
+   * This file is the exception, and it has to be: the two isolated probes above
+   * spawn with `env: {}` ON PURPOSE, because that is the condition being proven
+   * safe. They run against a copied module in a temp package, never the suite's
+   * own marker.
+   */
+  const SCANNER_ITSELF_ABS = fileURLToPath(import.meta.url);
+
+  const scanned = walkTests(testRoot).filter((f) => f !== SCANNER_ITSELF_ABS);
+
+  it("scans the test tree, so a broken walk cannot pass vacuously", () => {
+    expect(scanned.length).toBeGreaterThan(100);
+  });
+
+  it("finds no child spawned with an environment that drops VITEST", () => {
+    const violations: string[] = [];
+    for (const file of scanned) {
+      const source = readFileSync(file, "utf8");
+      const sf = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true);
+      for (const line of scrubbedEnvSpawns(sf)) {
+        violations.push(`${file.slice(testRoot.length)}:${line}`);
+      }
+    }
+    expect(violations).toEqual([]);
+  });
 });

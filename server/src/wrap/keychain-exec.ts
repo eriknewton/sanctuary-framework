@@ -172,12 +172,17 @@ export function latchUnderTest(
 }
 
 function testRunMarkerPresent(): boolean {
-  if (observedTestRunMarker) return true;
-  // Recompute; store ONLY a true result.
-  if (markerOnDiskNow()) {
-    observedTestRunMarker = true;
-  }
-  return latchUnderTest(observedTestRunMarker, false);
+  // `latchUnderTest` is the ONLY decision, on every call, with no short-circuit
+  // in front of it. An earlier version returned early when the latch was already
+  // set, which left the pure function off the runtime path: mutating it changed
+  // nothing but its own unit test, so a plant against it was self-confirming.
+  // Re-stat only while the marker has never been seen; once latched, the disk is
+  // irrelevant and skipping the stat is just the fast path.
+  const markerOnDisk = observedTestRunMarker ? false : markerOnDiskNow();
+  const result = latchUnderTest(observedTestRunMarker, markerOnDisk);
+  // Store ONLY a true result. See the declaration for why a false is never cached.
+  if (result) observedTestRunMarker = true;
+  return result;
 }
 
 /**
@@ -199,6 +204,28 @@ function testRunMarkerPresent(): boolean {
  * Fail direction: if the marker cannot be resolved, this degrades to the env
  * signals, which is the previous behavior; it never turns a test run into
  * production. The case that matters, a child of the suite, always resolves.
+ *
+ * ── WHAT IS COVERED, AND THE ONE THING THAT IS NOT ──────────────────────
+ *
+ * This protection is NOT total, and the boundary is exact.
+ *
+ * COVERED: every child that loads this module while the marker exists. The
+ * latch is taken at module load, so such a child stays under test for its whole
+ * lifetime however late its first credential call comes, including after global
+ * teardown has deleted the marker.
+ *
+ * NOT COVERED: a child that starts during the suite and first loads this module
+ * AFTER teardown. It initializes the latch false, finds no env signal, and would
+ * spawn the real binary. Reaching that state requires spawning a child with a
+ * scrubbed environment AND deferring the module load past the end of the run.
+ *
+ * No test in this repo does that: every `env:` option at a child-spawn call site
+ * inherits the parent environment. Keeping it that way is enforced, not hoped
+ * for, by "no test may spawn a child with a scrubbed environment" in
+ * `test/wrap/keychain-exec-guard.test.ts`, which parses each test file and fails
+ * on any child_process call whose `env` drops VITEST. That rule is the reason
+ * this residual stays unreachable; it is not a claim that the residual does not
+ * exist.
  */
 function underTest(): boolean {
   return (
