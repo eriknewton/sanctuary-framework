@@ -64,6 +64,11 @@ function canonicalJson(value: unknown): string {
   const record = value as Record<string, unknown>;
   return `{${Object.keys(record)
     .sort()
+    // Invariant: `undefined` means "field absent," never signable data. Without
+    // this filter the hand-built object path would emit `"key":undefined`,
+    // while JSON object serialization drops the same field entirely; the
+    // standalone verifier carries this exact rule and the structure gate keeps
+    // the two bodies byte-equivalent.
     .filter((key) => record[key] !== undefined)
     .map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
     .join(",")}}`;
@@ -87,6 +92,22 @@ function fromBase64url(s: string): Uint8Array {
   const out = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
   return out;
+}
+
+function toBase64url(bytes: Uint8Array): string {
+  const base64 = Buffer.from(bytes).toString("base64");
+  return base64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function fromBase64urlStrict(s: string): Uint8Array {
+  if (!/^[A-Za-z0-9\-_]*$/.test(s) || s.length % 4 === 1) {
+    throw new TypeError("non-canonical base64url");
+  }
+  const decoded = fromBase64url(s);
+  if (toBase64url(decoded) !== s) {
+    throw new TypeError("non-canonical base64url");
+  }
+  return decoded;
 }
 
 function toHex(bytes: Uint8Array): string {
@@ -151,8 +172,8 @@ function verifyEd25519(
   publicKeyB64: string
 ): boolean {
   try {
-    const sig = fromBase64url(signatureB64);
-    const pub = fromBase64url(publicKeyB64);
+    const sig = fromBase64urlStrict(signatureB64);
+    const pub = fromBase64urlStrict(publicKeyB64);
     return ed25519.verify(sig, message, pub);
   } catch {
     return false;

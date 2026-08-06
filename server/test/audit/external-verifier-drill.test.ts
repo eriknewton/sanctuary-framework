@@ -27,6 +27,7 @@ import {
 } from "../../src/core/identity.js";
 import {
   checkpointSigningBytes,
+  verifyCheckpointSignature,
   type AuditCheckpointSigningPayload,
 } from "../../src/audit/chain.js";
 import { derivePurposeKey } from "../../src/core/key-derivation.js";
@@ -36,7 +37,6 @@ import {
   exportAuditChain,
   parseExportArgs,
   runExport,
-  type ExportRecord,
   type EntryExportRecord,
   type CheckpointExportRecord,
 } from "../../src/cli/audit-chain-export.js";
@@ -44,6 +44,8 @@ import {
   verifyAuditChainRecords,
   parseJsonl,
   verifyAuditChainContent,
+  type ExportRecord as VerifierExportRecord,
+  type CheckpointExportRecord as VerifierCheckpointExportRecord,
 } from "../../src/cli/audit-chain-verify.js";
 
 // ---------------------------------------------------------------------------
@@ -69,6 +71,34 @@ function mutateByte(b64: string, index = Math.floor(b64.length / 2)): string {
   const original = b64[index]!;
   const replacement = chars.find((c) => c !== original) ?? "A";
   return b64.slice(0, index) + replacement + b64.slice(index + 1);
+}
+
+type SignedCheckpointRecord = VerifierCheckpointExportRecord & {
+  signature: string;
+  public_key: string;
+};
+
+function firstSignedCheckpoint(
+  records: readonly VerifierExportRecord[]
+): SignedCheckpointRecord {
+  const checkpoint = records.find(
+    (r): r is VerifierCheckpointExportRecord => r.type === "checkpoint"
+  );
+  if (!checkpoint?.signature || !checkpoint.public_key) {
+    throw new Error("expected a signed checkpoint with an embedded public key");
+  }
+  return checkpoint as SignedCheckpointRecord;
+}
+
+function checkpointPayload(record: VerifierCheckpointExportRecord): AuditCheckpointSigningPayload {
+  return {
+    checkpoint_kind: record.checkpoint_kind,
+    checkpoint_sequence: record.checkpoint_sequence,
+    from_sequence: record.from_sequence,
+    root_hash: record.root_hash,
+    previous_checkpoint_sequence: record.previous_checkpoint_sequence,
+    signed_at: record.signed_at,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -379,5 +409,49 @@ describe("external-verifier-drill: Scenario C - checkpoint signature invalidatio
         f.kind === "sequence_gap"
     );
     expect(entryFindings).toHaveLength(0);
+  });
+
+  it("runtime checkpoint verification rejects non-canonical base64url signature material", async () => {
+    const { storage } = await buildSignedAuditChain();
+    const checkpoint = firstSignedCheckpoint(parseJsonl(await collectExport(storage)));
+    const payload = checkpointPayload(checkpoint);
+
+    expect(verifyCheckpointSignature(payload, checkpoint.signature, checkpoint.public_key)).toBe(
+      true
+    );
+    expect(
+      verifyCheckpointSignature(payload, `${checkpoint.signature}!`, checkpoint.public_key)
+    ).toBe(false);
+    expect(
+      verifyCheckpointSignature(payload, checkpoint.signature, `${checkpoint.public_key}!`)
+    ).toBe(false);
+  });
+
+  it("standalone verification rejects non-canonical base64url checkpoint strings", async () => {
+    const { storage } = await buildSignedAuditChain();
+    const records = parseJsonl(await collectExport(storage));
+    const checkpoint = firstSignedCheckpoint(records);
+
+    const nonCanonicalSignature = records.map((record) =>
+      record === checkpoint
+        ? { ...checkpoint, signature: `${checkpoint.signature}!` }
+        : record
+    );
+    const signatureReport = verifyAuditChainRecords(nonCanonicalSignature);
+    expect(signatureReport.verdict).toBe("FAIL");
+    expect(
+      signatureReport.findings.some((f) => f.kind === "checkpoint_signature_invalid")
+    ).toBe(true);
+
+    const nonCanonicalKey = records.map((record) =>
+      record === checkpoint
+        ? { ...checkpoint, public_key: `${checkpoint.public_key}!` }
+        : record
+    );
+    const keyReport = verifyAuditChainRecords(nonCanonicalKey);
+    expect(keyReport.verdict).toBe("FAIL");
+    expect(keyReport.findings.some((f) => f.kind === "checkpoint_signature_invalid")).toBe(
+      true
+    );
   });
 });

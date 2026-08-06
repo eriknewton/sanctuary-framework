@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { fromBase64url, stringToBytes } from "../core/encoding.js";
+import { fromBase64urlStrict, stringToBytes } from "../core/encoding.js";
 import { verify as verifyIdentitySignature } from "../core/identity.js";
 
 /**
@@ -84,6 +84,11 @@ export function canonicalJson(value: unknown): string {
   const record = value as Record<string, unknown>;
   return `{${Object.keys(record)
     .sort()
+    // Invariant: `undefined` means "field absent," never signable data. Without
+    // this filter the hand-built object path would emit `"key":undefined`,
+    // while JSON object serialization drops the same field entirely; the
+    // standalone verifier carries this exact rule and the structure gate keeps
+    // the two bodies byte-equivalent.
     .filter((key) => record[key] !== undefined)
     .map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
     .join(",")}}`;
@@ -104,6 +109,10 @@ export function computeAuditRoot(entryHashes: readonly string[]): string {
 export function checkpointSigningBytes(
   payload: AuditCheckpointSigningPayload
 ): Uint8Array {
+  // Invariant: checkpoint signatures never range over bare canonical JSON. The
+  // domain prefix, including its trailing newline, separates audit checkpoints
+  // from other Sanctuary Ed25519 signing surfaces that may carry the same JSON
+  // shape.
   return stringToBytes(`${AUDIT_CHECKPOINT_DOMAIN_PREFIX}${canonicalJson(payload)}`);
 }
 
@@ -112,11 +121,20 @@ export function verifyCheckpointSignature(
   signature: string,
   publicKey: string | Uint8Array
 ): boolean {
-  const keyBytes =
-    typeof publicKey === "string" ? fromBase64url(publicKey) : publicKey;
-  return verifyIdentitySignature(
-    checkpointSigningBytes(payload),
-    fromBase64url(signature),
-    keyBytes
-  );
+  try {
+    // Invariant: callers supply logical payload fields, never precomputed
+    // signing bytes. This verifier reconstructs the domain-separated bytes and
+    // accepts only canonical no-padding base64url signature material; lenient
+    // decoding would let altered strings such as `${signature}!` verify as the
+    // original bytes.
+    const keyBytes =
+      typeof publicKey === "string" ? fromBase64urlStrict(publicKey) : publicKey;
+    return verifyIdentitySignature(
+      checkpointSigningBytes(payload),
+      fromBase64urlStrict(signature),
+      keyBytes
+    );
+  } catch {
+    return false;
+  }
 }
