@@ -18,7 +18,7 @@
  * WHEN a concurrent event lands relative to the pass, which is the whole
  * mechanism under test.
  */
-import { mkdtemp, readFile, readdir, rm, unlink, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -111,6 +111,29 @@ class HookedAuditListing implements StorageBackend {
   }
   namespacePath(ns: string): string {
     return this.inner.namespacePath(ns);
+  }
+}
+
+async function exists(path: string): Promise<boolean> {
+  try {
+    await stat(path);
+    return true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw err;
+  }
+}
+
+class LockObservingFilesystemStorage extends FilesystemStorage {
+  readonly fullPassLockHeld: boolean[] = [];
+
+  override async list(ns: string, prefix?: string): Promise<StorageEntryMeta[]> {
+    if (ns === "_audit" && prefix === undefined) {
+      this.fullPassLockHeld.push(
+        await exists(join(this.namespacePath("_audit"), ".audit-write.lock"))
+      );
+    }
+    return super.list(ns, prefix);
   }
 }
 
@@ -210,6 +233,47 @@ describe("AuditLog read-vs-append ordering (register C6)", () => {
       expect(await reader.getIntegrityFindings()).toEqual([]);
       // The clean verdict came from a SECOND pass, not from a lenient first one.
       expect(hooked.auditListCalls).toBeGreaterThanOrEqual(2);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it("rechecks a cached dirty verdict outside the append lock before refusing another append", async () => {
+    const root = await mkdtemp(join(tmpdir(), "sanctuary-c7-stale-verdict-"));
+    try {
+      const storage = new LockObservingFilesystemStorage(join(root, "state"));
+      const masterKey = MASTER_KEY();
+      const seeder = new AuditLog(storage, masterKey, { checkpointInterval: 0 });
+      for (let i = 0; i < 5; i++) await appendCritical(seeder, `seed-${i}`);
+      await seeder.flush();
+
+      const files = await auditEntryFiles(storage);
+      const torn = files[2]!;
+      const tornBytes = await readFile(torn);
+      await unlink(torn);
+
+      const victim = new AuditLog(storage, masterKey, { checkpointInterval: 0 });
+      await expect(appendCritical(victim, "fails-over-gap")).rejects.toMatchObject({
+        name: "AuditIntegrityError",
+        findings: expect.arrayContaining([
+          expect.objectContaining({ kind: "sequence_gap_or_reorder" }),
+        ]),
+      });
+      expect(storage.fullPassLockHeld).toContain(true);
+
+      await writeFile(torn, tornBytes, { mode: 0o600 });
+      const quiet = new AuditLog(storage, masterKey, { checkpointInterval: 0 });
+      expect(await quiet.getIntegrityFindings()).toEqual([]);
+
+      const observationsBeforeRetry = storage.fullPassLockHeld.length;
+      await expect(appendCritical(victim, "after-heal")).resolves.toBeUndefined();
+
+      const retryObservations = storage.fullPassLockHeld.slice(observationsBeforeRetry);
+      expect(retryObservations).toContain(false);
+      expect(retryObservations).not.toContain(true);
+
+      const verified = new AuditLog(storage, masterKey, { checkpointInterval: 0 });
+      expect(await verified.getIntegrityFindings()).toEqual([]);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
