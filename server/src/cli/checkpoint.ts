@@ -51,6 +51,7 @@ import {
   type CheckpointPoisonMap,
   type MemoryCheckpointRecord,
 } from "../memory-checkpoint/index.js";
+import { flagValue } from "./argv.js";
 
 export interface CheckpointCommandArgs {
   argv: string[];
@@ -61,12 +62,6 @@ export interface CheckpointCommandArgs {
 
 function write(stream: Writable, text: string): void {
   stream.write(text);
-}
-
-function flagValue(argv: string[], name: string): string | undefined {
-  const index = argv.indexOf(name);
-  if (index === -1) return undefined;
-  return argv[index + 1];
 }
 
 function hasFlag(argv: string[], name: string): boolean {

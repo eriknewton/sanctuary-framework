@@ -60,14 +60,10 @@ import { revocationVerifiability } from "../entitlement/revocation-antirollback.
 import { openIssuer } from "./custody-unlock.js";
 import { dashboardRequest, DashboardRequestError } from "./dashboard-request.js";
 import { ED25519_PUBLIC_KEY_BYTES } from "../core/crypto-suite-registry.js";
+import { flagValue } from "./argv.js";
 
 function write(stream: Writable, text: string): void {
   stream.write(text);
-}
-
-function flagValue(argv: string[], name: string): string | undefined {
-  const i = argv.indexOf(name);
-  return i >= 0 && i + 1 < argv.length ? argv[i + 1] : undefined;
 }
 
 function hasFlag(argv: string[], name: string): boolean {

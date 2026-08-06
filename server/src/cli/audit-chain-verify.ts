@@ -45,6 +45,7 @@ import { readFileSync } from "node:fs";
 import { ed25519 } from "@noble/curves/ed25519";
 import { sha256 } from "@noble/hashes/sha256";
 import { lockdownBanner, readLockdownStatus } from "../lockdown/status.js";
+import { flagValue } from "./argv.js";
 import {
   AUDIT_CHAIN_GENESIS,
   AUDIT_CHAIN_SCHEMA_VERSION,
@@ -617,10 +618,4 @@ export async function runVerify(args: VerifyArgs): Promise<void> {
   if (args.strict && report.verdict === "FAIL") {
     process.exit(1);
   }
-}
-
-function flagValue(argv: string[], name: string): string | undefined {
-  const index = argv.indexOf(name);
-  if (index === -1) return undefined;
-  return argv[index + 1];
 }

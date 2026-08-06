@@ -9,6 +9,7 @@
 import { resolve } from "node:path";
 import { existsSync, readdirSync } from "node:fs";
 import { BACKEND_FALLBACK_STRINGS } from "../intelligence/templates.js";
+import { flagValue } from "./argv.js";
 
 /**
  * Print the model-choice privacy tradeoff to the operator-facing CLI channel.
@@ -38,12 +39,6 @@ function printSubstratePrivacyNote(): void {
 
 interface IntelligenceCommandOpts {
   argv: string[];
-}
-
-function flagValue(argv: string[], name: string): string | undefined {
-  const index = argv.indexOf(name);
-  if (index === -1) return undefined;
-  return argv[index + 1];
 }
 
 function hasFlag(argv: string[], name: string): boolean {

@@ -24,6 +24,7 @@ import { homedir, userInfo } from "node:os";
 import { basename, dirname, extname, isAbsolute, join, sep } from "node:path";
 import { Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
+import { flagValue } from "./argv.js";
 
 export interface GenerateCommandArgs {
   argv: string[];
@@ -484,11 +485,4 @@ function escapeForSystemd(value: string): string {
  */
 function escapeForCommandLine(value: string): string {
   return escapeForSystemd(value).replace(/\$/g, "$$$$");
-}
-
-function flagValue(argv: string[], name: string): string | undefined {
-  const index = argv.indexOf(name);
-  if (index !== -1) return argv[index + 1];
-  const prefixed = argv.find((arg) => arg.startsWith(`${name}=`));
-  return prefixed?.slice(name.length + 1);
 }

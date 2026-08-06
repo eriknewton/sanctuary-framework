@@ -6,6 +6,7 @@ import {
   type TaskStatus,
 } from "../operational/task-coordination/index.js";
 import { lockdownBanner, readLockdownStatus } from "../lockdown/status.js";
+import { flagValue } from "./argv.js";
 
 export interface TaskCliArgs {
   argv: string[];
@@ -311,12 +312,6 @@ function setFlag(
 
 function hasFlag(argv: string[], flag: string): boolean {
   return argv.includes(flag);
-}
-
-function flagValue(argv: string[], flag: string): string | null {
-  const idx = argv.indexOf(flag);
-  if (idx < 0 || idx + 1 >= argv.length) return null;
-  return argv[idx + 1] ?? null;
 }
 
 function operatorLabel(): string {

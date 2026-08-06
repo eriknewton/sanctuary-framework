@@ -66,6 +66,7 @@ import {
   hashOfEnglishDraft,
 } from "./honeypot-compiler.js";
 import { TrapRegistry } from "./trap-registry.js";
+import { flagValue } from "../cli/argv.js";
 
 export interface HoneypotCliDeps {
   registry: TrapRegistry;
@@ -107,19 +108,6 @@ export interface HoneypotCliArgs {
 
 function write(stream: Writable | undefined, text: string): void {
   if (stream) stream.write(text);
-}
-
-function flagValue(argv: string[], name: string): string | undefined {
-  const prefix = `${name}=`;
-  for (const arg of argv) {
-    if (arg.startsWith(prefix)) return arg.slice(prefix.length);
-    if (arg === name) {
-      const idx = argv.indexOf(arg);
-      const next = argv[idx + 1];
-      if (next !== undefined && !next.startsWith("--")) return next;
-    }
-  }
-  return undefined;
 }
 
 function hasFlag(argv: string[], name: string): boolean {

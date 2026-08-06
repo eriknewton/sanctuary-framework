@@ -32,6 +32,7 @@ import {
   verifyAuditChainRecords,
   type ExportRecord,
 } from "./audit-chain-verify.js";
+import { flagValue } from "./argv.js";
 
 // Canonical version source. A bare `require("../../package.json")` resolves to
 // the repo-root package.json (no `version`) when bundled to server/dist/; the
@@ -523,11 +524,4 @@ policy, audit-chain integrity, runtime versions, the Hermes config parser,
 and Castle Wall status.
 `,
   );
-}
-
-function flagValue(argv: string[], name: string): string | undefined {
-  const index = argv.indexOf(name);
-  if (index !== -1) return argv[index + 1];
-  const prefixed = argv.find((arg) => arg.startsWith(`${name}=`));
-  return prefixed?.slice(name.length + 1);
 }

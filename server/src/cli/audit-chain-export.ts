@@ -34,6 +34,7 @@ import {
 } from "../audit/checkpoint-shape.js";
 import { lockdownBanner, readLockdownStatus } from "../lockdown/status.js";
 import { homeFortressPath } from "../paths.js";
+import { flagValue } from "./argv.js";
 
 export const AUDIT_EXPORT_NAMESPACE = "_audit";
 export const AUDIT_EXPORT_CHECKPOINT_NAMESPACE = "_audit_checkpoints";
@@ -501,9 +502,3 @@ function isPersistedAuditEnvelopeV2(value: unknown): value is PersistedAuditEnve
 // `isAuditRotationAnchorEnvelope` from `audit/checkpoint-shape.ts`, which
 // additionally requires `mac` to be a canonical 43-char base64url encoding
 // of the 32-byte MAC, the only strings the legitimate writer can emit.
-
-function flagValue(argv: string[], name: string): string | undefined {
-  const index = argv.indexOf(name);
-  if (index === -1) return undefined;
-  return argv[index + 1];
-}
