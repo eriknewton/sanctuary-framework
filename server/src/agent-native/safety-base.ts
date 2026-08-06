@@ -313,7 +313,7 @@ export async function classifyApprovalRequest(params: {
     throw error;
   }
   try {
-    handlerArgs = tool.approvalTargetArgs?.(handlerArgs) ?? handlerArgs;
+    handlerArgs = (await tool.approvalTargetArgs?.(handlerArgs)) ?? handlerArgs;
   } catch {
     throw new Error(FIXED_DENIAL_MESSAGE);
   }

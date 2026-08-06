@@ -2034,11 +2034,7 @@ export class AuditLog {
       result,
       details,
     }, { verifyDurability: false, critical: false });
-    this.pendingWrites.add(writePromise);
-    void writePromise.then(
-      () => this.pendingWrites.delete(writePromise),
-      () => this.pendingWrites.delete(writePromise)
-    );
+    this.trackPendingWrite(writePromise);
     return writePromise;
   }
 
@@ -2051,10 +2047,18 @@ export class AuditLog {
    * so this method treats a completed write plus exact read-after-write
    * verification as the backend-equivalent durability barrier. Storage
    * failures, disk-full conditions, permission failures, and partial/torn
-   * writes throw `AuditPersistenceError` with a classification.
+   * writes throw `AuditPersistenceError` with a classification. Like
+   * `append()`, the returned promise is tracked until it settles: an awaited
+   * caller gets the rejection at the call site, and a fire-and-forget caller's
+   * failure is rethrown by `flush()`.
    */
-  async appendCritical(entry: AuditEntryInput): Promise<void> {
-    await this.enqueueAppend(entry, { verifyDurability: true, critical: true });
+  appendCritical(entry: AuditEntryInput): Promise<void> {
+    const writePromise = this.enqueueAppend(entry, {
+      verifyDurability: true,
+      critical: true,
+    });
+    this.trackPendingWrite(writePromise);
+    return writePromise;
   }
 
   async runAllowingIntegrityFindings<T>(fn: () => Promise<T>): Promise<T> {
@@ -2065,6 +2069,14 @@ export class AuditLog {
     await this.appendQueue;
     await this.ensureLoaded({ allowIntegrityFindings: true });
     return [...this.integrityFindings];
+  }
+
+  private trackPendingWrite(writePromise: Promise<void>): void {
+    this.pendingWrites.add(writePromise);
+    void writePromise.then(
+      () => this.pendingWrites.delete(writePromise),
+      () => this.pendingWrites.delete(writePromise)
+    );
   }
 
   /**

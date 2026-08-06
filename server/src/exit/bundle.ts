@@ -1290,12 +1290,10 @@ export async function exportExitBundle(
   // `appendCritical` and AWAITED, not `void append(...)`: `append`'s own
   // contract reserves itself for low-risk telemetry and states that export/exit
   // operations MUST use `appendCritical()`. The await is part of that contract,
-  // not style. `appendCritical` never registers in `pendingWrites`, and
-  // `enqueueAppend` swallows the rejection on `appendQueue`
-  // (`task.then(() => undefined, () => undefined)`), so a voided call's
-  // durability failure would be dropped on the floor by the `flush()` below.
-  // Awaiting is what makes a failed durable write fail the export instead
-  // (never silently degrade, AGENTS.md #5).
+  // not style. Even though critical writes are also tracked for shutdown
+  // flushes, this export must fail at the local durability boundary if the
+  // zero-state evidence cannot be persisted (never silently degrade,
+  // AGENTS.md #5).
   if (encryptedStateExport.bundle.total_keys === 0) {
     await opts.auditLog.appendCritical({
       layer: "l1",
