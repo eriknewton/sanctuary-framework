@@ -269,8 +269,9 @@ function isHubInboxAction(value: string): value is HubInboxAction {
 /**
  * State-changing approval DECISIONS on the hub inbox: approve / deny
  * resolve a pending Tier-1 approval. `dismiss` is housekeeping, not a
- * release, so it is excluded. Kept in lockstep with the dispatch table's
- * `matchInboxRoute` so the auth gate cannot drift from routing.
+ * release, so it is excluded from the approval-decision error-suppression
+ * path. The route match itself comes from `matchInboxRoute`, the same parser
+ * used by the POST dispatcher below.
  */
 const HUB_APPROVAL_DECISION_ACTIONS = new Set(["approve", "deny"]);
 
