@@ -86,6 +86,47 @@ final class ExtensionDispatcherTests: XCTestCase {
         }
     }
 
+    final class HoldingAuditProducerSigner: AuditProducerSigning {
+        let privateKey: Curve25519.Signing.PrivateKey
+        private(set) var replies: [() -> Void] = []
+
+        init(privateKey: Curve25519.Signing.PrivateKey) {
+            self.privateKey = privateKey
+        }
+
+        func signAuditProducerPayload(
+            _ payload: Data,
+            reply: @escaping (Data?, String?) -> Void
+        ) {
+            let key = privateKey
+            replies.append {
+                reply(try? key.signature(for: payload), nil)
+            }
+        }
+
+        func resolve(_ index: Int) {
+            replies[index]()
+        }
+    }
+
+    enum StateStoreError: Error {
+        case refused
+    }
+
+    final class FailingAuditProducerStateStore: AuditProducerChainStateStore {
+        func load() throws -> AuditProducerChainState? {
+            return nil
+        }
+
+        func save(_ state: AuditProducerChainState) throws {
+            throw StateStoreError.refused
+        }
+    }
+
+    func volatileStateStore() -> AuditProducerChainStateStore {
+        return VolatileAuditProducerChainStateStore()
+    }
+
     func makeFlow(
         host: String? = "api.anthropic.com",
         ip: String = "104.18.32.10",
@@ -613,7 +654,7 @@ final class ExtensionDispatcherTests: XCTestCase {
     func test_auditProducerChain_signsAllowVerdictWithDomainSeparatedBytes() throws {
         let privateKey = Curve25519.Signing.PrivateKey()
         let signer = ImmediateAuditProducerSigner(privateKey: privateKey)
-        let chain = AuditProducerChain()
+        let chain = AuditProducerChain(stateStore: volatileStateStore())
         let flow = makeFlow()
         let recordedAt = Date(timeIntervalSince1970: 1_760_000_000)
         let exp = expectation(description: "signed verdict")
@@ -662,7 +703,7 @@ final class ExtensionDispatcherTests: XCTestCase {
     // vanishing (AGENTS.md rule 5).
     func test_auditProducerChain_droppedReply_firesLoudTimeoutFailure() {
         let signer = NeverRepliesAuditProducerSigner()
-        let chain = AuditProducerChain(signTimeoutSeconds: 0.15)
+        let chain = AuditProducerChain(signTimeoutSeconds: 0.15, stateStore: volatileStateStore())
         let exp = expectation(description: "timeout failure")
         var result: Result<IpcMessage, AuditProducerSigningError>?
 
@@ -696,7 +737,12 @@ final class ExtensionDispatcherTests: XCTestCase {
         // never a second completion, and never advance the chain for a flow
         // already reported dropped.
         let privateKey = Curve25519.Signing.PrivateKey()
-        let chain = AuditProducerChain(signTimeoutSeconds: 0.1)
+        let stateURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("audit-producer-timeout-\(UUID().uuidString)")
+            .appendingPathComponent("state.json")
+        defer { try? FileManager.default.removeItem(at: stateURL.deletingLastPathComponent()) }
+        let store = FileAuditProducerChainStateStore(url: stateURL)
+        let chain = AuditProducerChain(signTimeoutSeconds: 0.1, stateStore: store)
 
         let firstExp = expectation(description: "first completion (timeout)")
         var completionCount = 0
@@ -717,22 +763,26 @@ final class ExtensionDispatcherTests: XCTestCase {
         Thread.sleep(forTimeInterval: 0.6)
         XCTAssertEqual(completionCount, 1, "the late reply must not fire a second completion")
 
-        // The chain must NOT have advanced for the dropped flow: the next signed
-        // flow still uses seq 0 (proving the late reply did not advance the seq).
-        let nextExp = expectation(description: "next flow keeps seq 0")
-        var nextSeq: UInt64?
-        chain.buildSignedFlowDecision(
+        // The persistent cursor must remain unadvanced across a restart;
+        // otherwise a timeout would hide a flow by saving past an unsent event.
+        let restartExp = expectation(description: "restart after timeout keeps seq 0")
+        var restartSeq: UInt64?
+        AuditProducerChain(stateStore: store).buildSignedFlowDecision(
             outcome: .allow(matchedRuleId: "r-allow"),
             flow: makeFlow(),
             signer: ImmediateAuditProducerSigner(privateKey: privateKey)
         ) { r in
             if case .success(.flowDecisionRecorded(let body)) = r {
-                nextSeq = body.producer?.seq
+                restartSeq = body.producer?.seq
             }
-            nextExp.fulfill()
+            restartExp.fulfill()
         }
-        wait(for: [nextExp], timeout: 2)
-        XCTAssertEqual(nextSeq, 0, "a dropped/timed-out flow must not advance the producer chain seq")
+        wait(for: [restartExp], timeout: 2)
+        XCTAssertEqual(
+            restartSeq,
+            0,
+            "a dropped/timed-out flow must not advance the durable cursor"
+        )
     }
 
     func test_auditProducerChain_successAdvancesSeqAcrossFlows() {
@@ -741,7 +791,7 @@ final class ExtensionDispatcherTests: XCTestCase {
         // success, unchanged behavior).
         let privateKey = Curve25519.Signing.PrivateKey()
         let signer = ImmediateAuditProducerSigner(privateKey: privateKey)
-        let chain = AuditProducerChain()
+        let chain = AuditProducerChain(stateStore: volatileStateStore())
 
         func signSeq(_ label: String) -> UInt64? {
             let exp = expectation(description: label)
@@ -764,10 +814,157 @@ final class ExtensionDispatcherTests: XCTestCase {
         XCTAssertEqual(signSeq("second"), 1)
     }
 
+    func test_auditProducerChain_persistsSeqAcrossChainInstances() throws {
+        let privateKey = Curve25519.Signing.PrivateKey()
+        let signer = ImmediateAuditProducerSigner(privateKey: privateKey)
+        let stateURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("audit-producer-chain-\(UUID().uuidString)")
+            .appendingPathComponent("state.json")
+        defer { try? FileManager.default.removeItem(at: stateURL.deletingLastPathComponent()) }
+        let store = FileAuditProducerChainStateStore(url: stateURL)
+
+        func hashSignedBody(_ canonicalJson: String) -> String {
+            let digest = SHA256.hash(data: Data(canonicalJson.utf8))
+            return digest.map { String(format: "%02x", $0) }.joined()
+        }
+
+        func signFlow(_ chain: AuditProducerChain, label: String) throws -> AuditProducerSignatureBody {
+            let exp = expectation(description: label)
+            var result: Result<IpcMessage, AuditProducerSigningError>?
+            chain.buildSignedFlowDecision(
+                outcome: .allow(matchedRuleId: "r-allow"),
+                flow: makeFlow(),
+                signer: signer
+            ) { r in
+                result = r
+                exp.fulfill()
+            }
+            wait(for: [exp], timeout: 2)
+            let message = try XCTUnwrap(result).get()
+            guard case .flowDecisionRecorded(let body) = message else {
+                XCTFail("expected signed flowDecisionRecorded")
+                throw NSError(domain: "ExtensionDispatcherTests", code: 3)
+            }
+            return try XCTUnwrap(body.producer)
+        }
+
+        let first = try signFlow(
+            AuditProducerChain(stateStore: store),
+            label: "first chain instance"
+        )
+        let afterRestart = try signFlow(
+            AuditProducerChain(stateStore: store),
+            label: "second chain instance"
+        )
+
+        XCTAssertEqual(first.seq, 0)
+        XCTAssertNil(first.priorSha256Hex)
+        XCTAssertEqual(afterRestart.seq, 1)
+        XCTAssertEqual(afterRestart.priorSha256Hex, hashSignedBody(first.eventCanonicalJson))
+    }
+
+    func test_auditProducerChain_unavailableDefaultStoreFailsClosed() {
+        let privateKey = Curve25519.Signing.PrivateKey()
+        let signer = ImmediateAuditProducerSigner(privateKey: privateKey)
+        let chain = AuditProducerChain(
+            stateStore: UnavailableAuditProducerChainStateStore(
+                reason: "simulated missing application support directory"
+            )
+        )
+        let exp = expectation(description: "unavailable store")
+        var result: Result<IpcMessage, AuditProducerSigningError>?
+
+        chain.buildSignedFlowDecision(
+            outcome: .allow(matchedRuleId: "r-allow"),
+            flow: makeFlow(),
+            signer: signer
+        ) { r in
+            result = r
+            exp.fulfill()
+        }
+        wait(for: [exp], timeout: 2)
+
+        guard case .failure(let error)? = result else {
+            return XCTFail("unavailable durable store must fail closed")
+        }
+        guard case .statePersistenceFailed(let detail) = error else {
+            return XCTFail("expected statePersistenceFailed, got \(error)")
+        }
+        XCTAssertTrue(detail.contains("could not be loaded"))
+    }
+
+    func test_auditProducerChain_saveFailureDropsSignedEvent() {
+        let privateKey = Curve25519.Signing.PrivateKey()
+        let signer = ImmediateAuditProducerSigner(privateKey: privateKey)
+        let chain = AuditProducerChain(stateStore: FailingAuditProducerStateStore())
+        let exp = expectation(description: "state save failure")
+        var result: Result<IpcMessage, AuditProducerSigningError>?
+
+        chain.buildSignedFlowDecision(
+            outcome: .allow(matchedRuleId: "r-allow"),
+            flow: makeFlow(),
+            signer: signer
+        ) { r in
+            result = r
+            exp.fulfill()
+        }
+        wait(for: [exp], timeout: 2)
+
+        guard case .failure(let error)? = result else {
+            return XCTFail("state persistence failure must drop the signed event")
+        }
+        guard case .statePersistenceFailed(let detail) = error else {
+            return XCTFail("expected statePersistenceFailed, got \(error)")
+        }
+        XCTAssertTrue(detail.contains("could not be saved"))
+    }
+
+    func test_auditProducerChain_staleConcurrentSignReplyDoesNotEmitDuplicateSeq() {
+        let privateKey = Curve25519.Signing.PrivateKey()
+        let signer = HoldingAuditProducerSigner(privateKey: privateKey)
+        let chain = AuditProducerChain(stateStore: volatileStateStore())
+        let firstExp = expectation(description: "first completion")
+        let secondExp = expectation(description: "second completion")
+        var firstResult: Result<IpcMessage, AuditProducerSigningError>?
+        var secondResult: Result<IpcMessage, AuditProducerSigningError>?
+
+        chain.buildSignedFlowDecision(
+            outcome: .allow(matchedRuleId: "r-allow-1"),
+            flow: makeFlow(host: "api.openai.com"),
+            signer: signer
+        ) { r in
+            firstResult = r
+            firstExp.fulfill()
+        }
+        chain.buildSignedFlowDecision(
+            outcome: .allow(matchedRuleId: "r-allow-2"),
+            flow: makeFlow(host: "api.anthropic.com"),
+            signer: signer
+        ) { r in
+            secondResult = r
+            secondExp.fulfill()
+        }
+        XCTAssertEqual(signer.replies.count, 2)
+
+        signer.resolve(1)
+        wait(for: [secondExp], timeout: 2)
+        guard case .success(.flowDecisionRecorded(let winningBody))? = secondResult else {
+            return XCTFail("one in-flight signer reply should win")
+        }
+        XCTAssertEqual(winningBody.producer?.seq, 0)
+
+        signer.resolve(0)
+        wait(for: [firstExp], timeout: 2)
+        guard case .failure(let staleError)? = firstResult else {
+            return XCTFail("the stale same-seq reply must not emit")
+        }
+        XCTAssertEqual(staleError, .chainAdvancedBeforeSignReply)
+    }
+
     func test_auditProducerChain_chainsFlowAndAvailabilityOverSignedWalBody() throws {
         let privateKey = Curve25519.Signing.PrivateKey()
         let signer = ImmediateAuditProducerSigner(privateKey: privateKey)
-        let chain = AuditProducerChain()
+        let chain = AuditProducerChain(stateStore: volatileStateStore())
 
         func hashSignedBody(_ canonicalJson: String) -> String {
             let digest = SHA256.hash(data: Data(canonicalJson.utf8))
