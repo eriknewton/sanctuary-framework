@@ -18,6 +18,10 @@ Every commit to Sanctuary main MUST run `npm run typecheck && npm test` against 
 
 See `docs/audit/test-baseline-hardening-plan.md` for the full three-layer hardening plan, `docs/audit/commit-4ac95830-postmortem.md` for the trigger incident, and `docs/audit/branch-protection-setup.md` for the GitHub branch-protection runbook.
 
+### Test isolation: the operator's machine is not a fixture (MANDATORY)
+
+Tests must never read from or write to the operator's real login keychain, real `~/.sanctuary` state, or any other operator-owned credential store. Under test, credential access goes through the keychain chokepoint with an injected in-memory store, so no `security` subprocess is spawned at all. Tests that genuinely exercise keychain integration (including any that spawn the real CLI as a subprocess) use a per-run temporary keychain created in a temp path, scoped to the run's search list, and deleted on teardown; teardown must also reap every server and worker the test spawned, and both must happen even when the test fails or times out. A timed-out test that leaves a live process or a keychain entry behind poisons every later run on the same machine, and the damage looks like unrelated flakes. A structural guard in the suite enforces the no-login-keychain rule; this text records the intent so a reviewer can cite it.
+
 ---
 
 ## Architecture & reference (load on demand)
@@ -33,6 +37,16 @@ The TypeScript MCP server is large (56 modules) and several names collide. Befor
 - **Frozen surfaces never move.** A reorganization may move directory names and relative import paths; the surfaces in [`server/reorg-surface-manifest.md`](server/reorg-surface-manifest.md) must survive byte-for-byte: MCP tool names and schemas, route paths, HKDF/crypto labels, persisted at-rest keys, the `L1Status..L4Status` exports, and user-visible display strings. Rule of thumb: paths and imports move; anything on the wire, on disk, or on screen does not. The `l1`-`l4` tokens are LIVE wire and at-rest contracts even though the L-number numbering is being retired in prose; never edit the token itself.
 - **Forward documentation rule.** New public surface gets a consumer-written doc-comment. The ~90 MCP tool `description` fields are product copy for an AI-agent audience (an agent reads them to decide whether and how to call a tool); keep them accurate and never overclaim. See the forward rule in [CONTRIBUTING.md](CONTRIBUTING.md).
 - **Structural-health snapshot.** `npm run refresh-reorg-evidence` (live module / importer / god-file counts) and `npm run check-import-cycles` (dependency-cycle baseline) report the codebase's structural health; run them before any reorg PR.
+
+### Prose hygiene (adopted 2026-08-04)
+
+These apply to every edit, new code and retrofits alike. They govern the words around the code; none of them changes behavior.
+
+- **Invariant comments live at the enforcement site.** Where a line enforces a security or trust invariant, it carries a one-sentence rationale stating why the code must be this way, at that line. Example shape: "verification recomputes the commitment from the terms; a hash claimed in the payload is never trusted." Central docs explain the architecture; the enforcement site explains itself. A comment that narrates what the next line does is still noise; this rule is about *why*, at the exact place the *why* binds.
+- **Cross-file contracts are pinned on both sides.** Wherever two files must agree (mirrored constants, wire field names, HKDF/crypto labels, paired client/server validation), each side carries a "must match `<name>` in `<file>`" comment. [`server/reorg-surface-manifest.md`](server/reorg-surface-manifest.md) remains the authoritative inventory; the pin comments are in-place tripwires so an editor touching one side is warned before CI has to catch it.
+- **Runbooks state the failure mode.** In operational docs (deploy guides, drill docs, `docs/audit/` runbooks), every step that can be done subtly wrong gets a one-line note on what the mistake looks like from the outside, e.g. "a misowned database reads fine and fails only on the first write." Procedure tells you what to type; the failure-mode note is what you need at 2am.
+- **No bare magic numbers.** A numeric literal is either computed from named constants or annotated with its derivation (e.g. "87 = base64url length of a 65-byte raw P-256 point, no padding"). If you cannot write the derivation, that is a finding, not a comment to skip.
+- **Protocol state machines name their states.** Multi-step handshake, approval, and federation flows use explicit state-named handlers (`state_CHALLENGE`, `state_AUTHENTICATED`) or equivalent state-labeled structure, so the flow reads as a diagram without a debugger.
 
 [`SANCTUARY_ARCHITECTURE.md`](SANCTUARY_ARCHITECTURE.md) is the *why* (architecture, data flow, trust model); the module map is the *where*.
 

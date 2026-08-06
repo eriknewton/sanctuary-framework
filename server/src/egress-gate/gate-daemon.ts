@@ -170,7 +170,39 @@ export function parseEgressGateRuntimeState(text: string, path: string): EgressG
   };
 }
 
+/**
+ * POSIX-ish service-account name: lowercase start, then a conservative
+ * charset, so nothing that could smuggle plist markup or spaces reaches the
+ * rendered LaunchDaemon.
+ *
+ * Must match `SAFE_SERVICE_ACCOUNT_RE` in
+ * `castle-wall/provision/account.ts` (the canonical declaration) and
+ * `SAFE_ACCOUNT_RE` in `egress-gate/harness-daemon.ts`. Re-declared rather
+ * than imported to keep this plist renderer free of a castle-wall dependency.
+ * Enforced by `server/test/structure/cross-file-contract-pins.test.ts`.
+ */
 const SAFE_ACCOUNT_RE = /^[a-z_][a-z0-9._-]{0,63}$/;
+
+/**
+ * Privileged account names this gate daemon must never run as.
+ *
+ * Must match `RESERVED_ACCOUNT_NAMES` in
+ * `castle-wall/provision/account.ts` (the canonical declaration) and
+ * `RESERVED_ACCOUNT_NAMES` in `egress-gate/harness-daemon.ts`. Re-declared
+ * rather than imported for the same reason as the charset regex above.
+ * Enforced by `server/test/structure/cross-file-contract-pins.test.ts`, which
+ * compares the declared MEMBERS on every side AND calls
+ * `renderEgressGateDaemonPlist` once per member to prove this file refuses
+ * each of them, so a partial check here fails even with a correct set above.
+ *
+ * WIDENED 2026-08-05 (Erik-ratified) to add `admin`, which this file
+ * previously accepted while provisioning refused it. Failure mode of that
+ * drift, and of any future one: a name one side blesses and the other refuses
+ * surfaces as a mid-install refusal on an account an earlier step of the same
+ * flow already created, which reads to the operator as a broken install
+ * rather than as a stale copy of a list.
+ */
+const RESERVED_ACCOUNT_NAMES = new Set(["root", "_root", "daemon", "wheel", "admin"]);
 const GATE_DAEMON_LOG_DIR_NAME = "logs";
 
 function xmlEscape(value: string): string {
@@ -264,8 +296,14 @@ export function renderEgressGateDaemonPlist(options: EgressGateDaemonPlistOption
   if (!SAFE_ACCOUNT_RE.test(options.gateAccount)) {
     throw new Error(`gate account name is not a safe service-account name (got ${JSON.stringify(options.gateAccount)})`);
   }
-  if (["root", "_root", "daemon", "wheel"].includes(options.gateAccount)) {
-    throw new Error(`refusing to render an egress-gate daemon running as "${options.gateAccount}" (the gate is TCB but must never hold root)`);
+  // INVARIANT: the gate is inside the TCB but must hold no privilege of its
+  // own. A privileged UserName -- root, or an `admin` account, which on macOS
+  // conventionally carries sudo -- could rewrite the gate policy this daemon
+  // loads and enforces, so the confinement would be self-revocable. The wall
+  // also classifies flows by ruid, so a shared privileged uid erases the
+  // per-agent attribution the gate exists to produce.
+  if (RESERVED_ACCOUNT_NAMES.has(options.gateAccount)) {
+    throw new Error(`refusing to render an egress-gate daemon running as "${options.gateAccount}" (the gate is TCB but must never hold root or any other privileged account)`);
   }
   if (options.programArguments.length === 0 || !isAbsolute(options.programArguments[0]!)) {
     throw new Error("gate daemon programArguments must be non-empty with an absolute program path first");

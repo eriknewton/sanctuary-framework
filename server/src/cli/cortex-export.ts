@@ -7,6 +7,12 @@
  * sink. It is the operator control for the "the wall enforces on the host; the
  * console sees every denial" rail (PANW Cortex content pack).
  *
+ * The version string above and in the `--help` text below is PROSE describing
+ * `ENFORCEMENT_EVENT_SCHEMA` in `castle-wall/export/schema.ts`, never a second
+ * declaration. Nothing here parses or emits it; a `.v2` mint must update this
+ * operator copy in the same PR or the help text will describe a stream shape
+ * the exporter no longer produces.
+ *
  * SAFE BY DEFAULT: with no `cortex-export.json` config file, or a `sink: "file"`
  * config, this writes the metadata stream LOCALLY (NDJSON to stdout or a file)
  * and touches NO network and needs NO approval. Turning on the OUTBOUND push

@@ -68,6 +68,10 @@ import {
   FEDERATION_SYNC_WIRE_VERSION,
   isFederationOperatorAuthorityEvent,
 } from "./federation-revocation.js";
+import {
+  ED25519_PUBLIC_KEY_BYTES,
+  ED25519_SIGNATURE_BYTES,
+} from "../core/crypto-suite-registry.js";
 
 /** Current peer-sync envelope wire version. Peers must run lockstep. */
 export const FEDERATION_SYNC_ENVELOPE_WIRE_VERSION =
@@ -362,7 +366,7 @@ export function verifySyncEnvelope(input: {
   } catch {
     return { ok: false, reason: "malformed_envelope" };
   }
-  if (nodePubkey.length !== 32 || signature.length !== 64) {
+  if (nodePubkey.length !== ED25519_PUBLIC_KEY_BYTES || signature.length !== ED25519_SIGNATURE_BYTES) {
     return { ok: false, reason: "malformed_envelope" };
   }
   const message = buildSyncEnvelopeMessage({

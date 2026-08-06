@@ -19,6 +19,11 @@ import {
   BROKER_DAEMON_HEARTBEAT_OPERATION,
   BROKER_DAEMON_STAND_DOWN_OPERATION,
 } from "./liveness-constants.js";
+import {
+  ED25519_PRIVATE_KEY_BYTES,
+  ED25519_PUBLIC_KEY_BYTES,
+  ED25519_SIGNATURE_BYTES,
+} from "../core/crypto-suite-registry.js";
 
 const ENCODER = new TextEncoder();
 
@@ -107,7 +112,7 @@ export async function loadBrokerProducerKey(
       }`,
     };
   }
-  if (bytes.length !== 32) {
+  if (bytes.length !== ED25519_PUBLIC_KEY_BYTES) {
     return {
       status: "unreadable",
       reason: `broker_producer_key_wrong_length: ${bytes.length} (expected 32) at ${pubKeyPath}`,
@@ -164,7 +169,7 @@ export async function loadOrCreateBrokerProducerSigner(
     privateKey = ed25519.utils.randomPrivateKey();
     await writeRestrictedFile(privKeyPath, privateKey, 0o600);
   }
-  if (privateKey.length !== 32) {
+  if (privateKey.length !== ED25519_PRIVATE_KEY_BYTES) {
     throw new Error(
       `broker liveness private key at ${privKeyPath} is ${privateKey.length} bytes, expected 32`,
     );
@@ -265,11 +270,11 @@ export function verifyBrokerProducerSignature(
   }
   try {
     const key = fromBase64url(pinnedProducerKeyB64url);
-    if (key.length !== 32) {
+    if (key.length !== ED25519_PUBLIC_KEY_BYTES) {
       return { ok: false, reason: "broker_pinned_producer_key_wrong_length" };
     }
     const sig = fromBase64url(input.signatureB64url);
-    if (sig.length !== 64) {
+    if (sig.length !== ED25519_SIGNATURE_BYTES) {
       return { ok: false, reason: "broker_producer_signature_wrong_length" };
     }
     const message = brokerProducerSigningBytes(

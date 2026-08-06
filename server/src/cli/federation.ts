@@ -118,6 +118,7 @@ import {
   type OperatorSigner,
 } from "./federation-operator-signing.js";
 import { openV1Session } from "./v1-session.js";
+import { ED25519_PUBLIC_KEY_BYTES } from "../core/crypto-suite-registry.js";
 
 export interface AssembledJoin {
   joinRequest: JoinRequest;
@@ -385,6 +386,10 @@ export async function runFederationJoin(args: {
       err.write("sanctuary federation join: --delivery-key is not valid base64url\n");
       return 1;
     }
+    // 32 = the 256-bit symmetric delivery key. The bundle builder
+    // (`buildOperatorCloudProvisionBundle` in mesh/operator-cloud-provision.ts)
+    // checks the same width and uses it as the AES-256 key for the scoped
+    // secret, so a mismatch here would surface only as a decrypt failure.
     if (deliveryKey.length !== 32) {
       err.write("sanctuary federation join: delivery key must be 32 bytes\n");
       return 1;
@@ -441,6 +446,9 @@ export async function runFederationJoin(args: {
       err.write("sanctuary federation join: --master-secret is not valid base64url\n");
       return 1;
     }
+    // 32 = the 256-bit symmetric federation master secret; the store's own
+    // `assertKeyLength` (mesh/federation-trust-root-store.ts) applies the same
+    // width. Not an Ed25519 key despite the shared byte count.
     if (masterSecret.length !== 32) {
       err.write("sanctuary federation join: master secret must be 32 bytes\n");
       return 1;
@@ -1376,7 +1384,7 @@ function parsePositiveInt(raw: string | undefined): number | null {
 function isBase64urlEd25519Pubkey(raw: string): boolean {
   try {
     const decoded = fromBase64urlStrict(raw);
-    const ok = decoded.length === 32;
+    const ok = decoded.length === ED25519_PUBLIC_KEY_BYTES;
     decoded.fill(0);
     return ok;
   } catch {

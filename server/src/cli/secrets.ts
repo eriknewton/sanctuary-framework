@@ -21,6 +21,15 @@
  * The grant/revoke commands edit ~/.sanctuary/broker-policy.json so the
  * next broker startup picks up the change. Running brokers can call
  * `reloadPolicy()` explicitly (exposed via MCP tool).
+ *
+ * This module does NOT parse `--fortress`. The fortress comes from
+ * `SecretsArgs.storagePath`, or failing that from `loadConfig()` inside
+ * `openBroker`, which reads `SANCTUARY_STORAGE_PATH`. `cli.ts` promotes a
+ * LEADING `--fortress <path>` into that environment variable before dispatch,
+ * so `sanctuary --fortress <path> secrets ...` works. A `--fortress` typed
+ * after the word `secrets` reaches this file as an ordinary argv token and is
+ * dropped, which is why `assertNoFortressFlag` below refuses it rather than
+ * letting it through. See that function for the reproduction.
  */
 
 import { createInterface } from "node:readline";
@@ -54,6 +63,20 @@ export async function runSecretsCommand(args: SecretsArgs): Promise<number> {
   if (!sub || sub === "--help" || sub === "-h") {
     printUsage(out);
     return 0;
+  }
+
+  // ENFORCEMENT SITE for "this command never writes a credential into a
+  // fortress the operator did not name": nothing below this line reads
+  // `--fortress`, so the flag must be refused here or it is silently dropped.
+  // Placed before the dispatch switch so it covers every verb, including the
+  // three that write (`add`, `rotate`, `delete`).
+  const fortressRefusal = assertNoFortressFlag(rest);
+  if (fortressRefusal !== undefined) {
+    err.write(fortressRefusal);
+    // 2 is this command's usage-error code, matching the unknown-subcommand
+    // arm of the switch below. 1 is reserved for an operation that ran and
+    // failed; nothing ran here.
+    return 2;
   }
 
   try {
@@ -341,6 +364,73 @@ async function cmdAudit(
 }
 
 // ── helpers ─────────────────────────────────────────────────────────
+
+/**
+ * The flag this file refuses, plus the equals-spelling prefix derived from it
+ * so the two spellings can never drift apart.
+ *
+ * Must match the spellings `extractTopLevelFortressFlag` accepts in
+ * `top-level-fortress.ts` (`--fortress <path>` and `--fortress=<path>`). A
+ * spelling honored there but unrecognized here would reach this file and be
+ * dropped, which is the defect below.
+ */
+const FORTRESS_FLAG = "--fortress";
+const FORTRESS_EQUALS_PREFIX = `${FORTRESS_FLAG}=`;
+
+/**
+ * Refuse a `--fortress` typed after the word `secrets`.
+ *
+ * Returns the operator-facing message when the flag is present, `undefined`
+ * when it is not.
+ *
+ * Reproduced end to end on 2026-08-05 against the built CLI, with
+ * `SANCTUARY_STORAGE_PATH=$DEFAULT` and an empty `$OTHER`:
+ *
+ *   sanctuary secrets add demo_token supersecret --fortress $OTHER
+ *     -> exit 0, "Stored secret: demo_token"
+ *     -> $DEFAULT/state/ gained the audit entry and custody envelope
+ *     -> $OTHER stayed empty
+ *
+ * A credential written to the wrong fortress, reported as success. That is a
+ * "never silently degrade to a less-secure behavior" violation (AGENTS.md
+ * constraint #5): the operator asked for isolation and got the ambient
+ * fortress with no signal. `secrets list --fortress $OTHER` has the same shape
+ * on the read side, printing the DEFAULT fortress's secrets under the other
+ * fortress's name.
+ *
+ * Refusing rather than rewriting argv is deliberate. Two earlier attempts to
+ * repair the operator's argv (normalizing `--fortress=<path>`, then routing by
+ * an allowlist of commands believed to parse the flag) each traded this defect
+ * for a new one, because telling a flag's VALUE from a flag needs a per-handler
+ * argv grammar this CLI does not have. A refusal cannot corrupt anything and
+ * costs one line to recover from.
+ *
+ * Scope is deliberately this one subcommand, and only because its
+ * non-parsing was demonstrated directly. Other subcommands that ignore a
+ * trailing `--fortress` are NOT covered here; the general fix is a single
+ * shared flag parser, which is tracked separately.
+ *
+ * The equality and prefix tests are separate so a future `--fortress-url` or
+ * `--fortress-path` flag on this command would not be caught by accident.
+ */
+function assertNoFortressFlag(argv: readonly string[]): string | undefined {
+  const present = argv.some(
+    (token) =>
+      token === FORTRESS_FLAG || token.startsWith(FORTRESS_EQUALS_PREFIX)
+  );
+  if (!present) return undefined;
+
+  return (
+    `sanctuary secrets: ${FORTRESS_FLAG} is not read after the subcommand and ` +
+    `would have been ignored, running against the fortress in ` +
+    `SANCTUARY_STORAGE_PATH (default ~/.sanctuary) instead of the one you ` +
+    `named. On 'add', 'rotate' and 'delete' that writes a credential to the ` +
+    `wrong fortress.\n` +
+    `  Put the flag before the subcommand:\n` +
+    `    sanctuary ${FORTRESS_FLAG} <path> secrets ...\n` +
+    `  Or set SANCTUARY_STORAGE_PATH for the whole shell.\n`
+  );
+}
 
 function requirePositional(argv: string[], i: number, usage: string): string {
   const v = argv[i];

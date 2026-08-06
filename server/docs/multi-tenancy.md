@@ -158,6 +158,20 @@ Keychain item (macOS only), which is namespaced to the path.
 
 ## Common gotchas
 
+- **`--fortress` goes before the subcommand, and getting it wrong is usually silent.**
+  The top-level parser reads the flag only from the position ahead of the
+  subcommand. A subcommand that does not parse it itself ignores it and falls
+  back to `~/.sanctuary`, so `sanctuary <cmd> --fortress ~/.sanctuary/nsa`
+  reports on the default fortress and looks exactly like a correct answer.
+  Write it as `sanctuary --fortress ~/.sanctuary/nsa <cmd>`, or export
+  `SANCTUARY_STORAGE_PATH` for the whole shell as the recipe above does, which
+  is the harder shape to get wrong. `doctor`, `agents` and `intelligence` happen
+  to accept the flag in either position, which is what makes the habit easy to
+  form. `secrets` is the one command that refuses the trailing form (exit 2)
+  rather than ignoring it, because there the dropped flag wrote a credential
+  into the wrong fortress. Every other non-parsing command is still silent, so
+  do not read the `secrets` refusal as a guarantee that a missing refusal means
+  the flag was honored.
 - **Sharing `SANCTUARY_STORAGE_PATH` across two agents is unsupported.**
   Concurrent writes from two Sanctuary instances to the same storage root
   will race on audit log rotation and version metadata. Always set a

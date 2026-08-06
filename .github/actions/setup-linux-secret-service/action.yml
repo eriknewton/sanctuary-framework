@@ -112,3 +112,14 @@ runs:
           exit 1
         fi
         secret-tool clear service smoke-svc account smoke-acct
+
+        # NOTE: nothing here declares the keyring "disposable", and nothing
+        # here decides whether a test may reach the real backend. That question
+        # no longer exists: the vitest suite cannot reach the credential binary
+        # at all (src/wrap/keychain-exec.ts). The real shell-out is exercised by
+        # server/scripts/real-backend-check.ts, which the
+        # keychain-linux-real-backend workflow invokes directly.
+        #
+        # Failure mode: if the smoke test above passes but that job still
+        # reports no checks, read the script's own output. It names the check
+        # that threw, and it refuses outright when there is no session bus.

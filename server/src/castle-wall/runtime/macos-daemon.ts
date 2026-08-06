@@ -64,6 +64,7 @@ import {
   writeFileCustody,
 } from "../../storage/custody-fs.js";
 import { MacOSFlowEventConsumer } from "./macos-flow-events.js";
+import { buildChainAnchorSourceFromAuditLog } from "./audit-consumer.js";
 import { MacOSFlowIpcListener } from "./macos-ipc-listener.js";
 import { protectionSubjectFromAgentOrigin } from "../subject-binding.js";
 import {
@@ -84,6 +85,11 @@ import {
   EGRESS_PROBE_FAILED_AUDIT_OP,
   asUidTlsProbeArgv,
 } from "../provision/egress.js";
+import {
+  ED25519_LEGACY_SEED_AND_PUBKEY_BYTES,
+  ED25519_PRIVATE_KEY_BYTES,
+  ED25519_PUBLIC_KEY_BYTES,
+} from "../../core/crypto-suite-registry.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -1068,6 +1074,11 @@ export async function startMacOSCastleWallDaemon(
       },
     },
     auditSink: input.auditLog,
+    // Restore the producer-signed flow chain's anchor from the fortress's OWN
+    // persisted audit log at startup (one-time old-basis migration included).
+    // Same log instance the sink appends to — the anchor is recomputed from
+    // entries this consumer persisted, never from the wire.
+    chainAnchorSource: buildChainAnchorSourceFromAuditLog(input.auditLog),
     defaultApprovalTimeoutSeconds: 30,
     pinnedProducerKeyB64url: auditProducerKey?.keyB64url ?? null,
     fortressId: input.fortressId,
@@ -1974,7 +1985,7 @@ async function loadSigningKey(input: MacOSCastleWallDaemonInput): Promise<Daemon
     ...(input.signerClientInvoke ? { invoke: input.signerClientInvoke } : {}),
   });
   const publicKey = await client.getPublicKey();
-  if (publicKey.length !== 32) {
+  if (publicKey.length !== ED25519_PUBLIC_KEY_BYTES) {
     throw new Error(`Helper public key must be 32 bytes (found ${publicKey.length}).`);
   }
   return {
@@ -1994,7 +2005,7 @@ async function loadLocalSigningKey(
   const publicKey = await readFileCustody(join(fortressPath, CASTLE_PINNED_PUBKEY), {
     verifyPathIdentity: true,
   });
-  if (publicKey.length !== 32) {
+  if (publicKey.length !== ED25519_PUBLIC_KEY_BYTES) {
     throw new Error(`Pinned public key must be 32 bytes (found ${publicKey.length}).`);
   }
   let encryptedPrivateKey = JSON.parse(
@@ -2005,9 +2016,9 @@ async function loadLocalSigningKey(
   ) as EncryptedPayload;
   const privateKey = decrypt(encryptedPrivateKey, masterKey);
   try {
-    if (privateKey.length === 64) {
-      encryptedPrivateKey = encrypt(privateKey.slice(0, 32), masterKey);
-    } else if (privateKey.length !== 32) {
+    if (privateKey.length === ED25519_LEGACY_SEED_AND_PUBKEY_BYTES) {
+      encryptedPrivateKey = encrypt(privateKey.slice(0, ED25519_PRIVATE_KEY_BYTES), masterKey);
+    } else if (privateKey.length !== ED25519_PRIVATE_KEY_BYTES) {
       throw new Error(`Pinned private key must decrypt to 32 bytes (found ${privateKey.length}).`);
     }
   } finally {
@@ -2102,7 +2113,7 @@ async function loadMacOSAuditProducerPublicKey(
       { cause: error },
     );
   }
-  if (bytes.length !== 32) {
+  if (bytes.length !== ED25519_PUBLIC_KEY_BYTES) {
     throw new Error(
       `Castle Wall macOS audit-producer key at ${path} is ${bytes.length} bytes (expected 32).`,
     );

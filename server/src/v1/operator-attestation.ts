@@ -28,6 +28,10 @@ import { ed25519 } from "@noble/curves/ed25519";
 import { timingSafeEqual } from "node:crypto";
 import { fromBase64url, toBase64url } from "../core/encoding.js";
 import { verify } from "../core/identity.js";
+import {
+  ED25519_PUBLIC_KEY_BYTES,
+  ED25519_SIGNATURE_BYTES,
+} from "../core/crypto-suite-registry.js";
 
 /** Domain separator for durable operator attestations (versioned under v1). */
 export const V1_OPERATOR_ATTESTATION_DOMAIN = "sanctuary.v1.operator-attestation";
@@ -113,7 +117,7 @@ export function verifyOperatorAttestation(input: {
   futureSkewMs?: number;
 }): boolean {
   const resolved = input.resolvedOperatorPubkey;
-  if (!resolved || resolved.length !== 32) return false;
+  if (!resolved || resolved.length !== ED25519_PUBLIC_KEY_BYTES) return false;
 
   const att = input.attestation;
   if (typeof att !== "object" || att === null) return false;
@@ -136,7 +140,7 @@ export function verifyOperatorAttestation(input: {
   } catch {
     return false;
   }
-  if (operatorKey.length !== 32 || sig.length !== 64) return false;
+  if (operatorKey.length !== ED25519_PUBLIC_KEY_BYTES || sig.length !== ED25519_SIGNATURE_BYTES) return false;
 
   // The presented operator key MUST be THE configured operator identity —
   // constant-time over fixed 32-byte keys (no key-content timing oracle).

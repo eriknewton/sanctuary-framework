@@ -23,7 +23,15 @@ jobs:
     # PR-check workflow (castle-wall-macos.yml, PR #376) and COWORK lesson #78.
     runs-on: macos-26
     steps:
+      # Full history is REQUIRED: build-signed.sh derives CFBundleVersion from
+      # `git rev-list --count HEAD`, and macOS only replaces an activated system
+      # extension when the version INCREASES. A shallow checkout makes the count 1,
+      # so a CI-built extension can never upgrade a locally-built install (the
+      # v1.7.2 artifact shipped as 0.1.0/1 against an active 0.1.0/1235 for
+      # exactly this reason — confirmed 2026-08-05 by reading the artifact plist).
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
       - name: Show toolchain
         run: |

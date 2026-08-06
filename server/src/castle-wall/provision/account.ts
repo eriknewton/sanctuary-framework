@@ -28,16 +28,87 @@ import { setTimeout as sleep } from "node:timers/promises";
  */
 
 /**
- * POSIX-ish service-account name, deliberately the SAME conservative charset
- * as harness-daemon.ts's SAFE_ACCOUNT_RE (kept in lockstep by a structural
- * test): lowercase start, then a conservative charset. This rejects anything
- * that could smuggle shell metacharacters or spaces into a `dscl`/
- * `sysadminctl` argv.
+ * POSIX-ish service-account name: lowercase start, then a conservative
+ * charset. This rejects anything that could smuggle shell metacharacters or
+ * spaces into a `dscl`/`sysadminctl` argv.
+ *
+ * CROSS-FILE CONTRACT. This is the CANONICAL declaration; it must match
+ * `SAFE_ACCOUNT_RE` in `egress-gate/harness-daemon.ts` and `SAFE_ACCOUNT_RE`
+ * in `egress-gate/gate-daemon.ts`, both of which re-declare the same pattern
+ * locally (those two modules render world-readable LaunchDaemon plists and
+ * deliberately keep their input validation free of a castle-wall import).
+ * Enforced by `test/structure/cross-file-contract-pins.test.ts`.
+ *
+ * NOTE (2026-08-05): this doc-comment previously claimed the lockstep was
+ * "kept by a structural test". No such test existed anywhere in `server/test`
+ * when that was written; the test named above is the first one. The claim is
+ * now true.
  */
 export const SAFE_SERVICE_ACCOUNT_RE = /^[a-z_][a-z0-9._-]{0,63}$/;
 
-/** Privileged account names an agent service account must never collide with. */
-const RESERVED_ACCOUNT_NAMES = new Set(["root", "_root", "daemon", "wheel", "admin"]);
+/**
+ * Privileged account names no Sanctuary-provisioned service account may take.
+ *
+ * CROSS-FILE CONTRACT. This is the CANONICAL declaration; it must match
+ * `RESERVED_ACCOUNT_NAMES` in `egress-gate/gate-daemon.ts` and
+ * `RESERVED_ACCOUNT_NAMES` in `egress-gate/harness-daemon.ts`, both of which
+ * re-declare the same set locally for exactly the reason the charset regex
+ * above is re-declared (those two render world-readable LaunchDaemon plists
+ * and deliberately keep their input validation free of a castle-wall import).
+ * Enforced by `test/structure/cross-file-contract-pins.test.ts`, which both
+ * compares the declared MEMBERS on every side AND drives each of the three
+ * refusal sites with every member of this set, so a site that declares the
+ * full set and enforces a subset fails.
+ *
+ * DECISION 2026-08-05 (Erik-ratified: WIDEN). An earlier version of this
+ * comment recorded the daemon-side asymmetry as deliberate and warned against
+ * reconciling it: the two daemons refused `root`/`_root`/`daemon`/`wheel`
+ * only, so `admin` was an illegal agent account name and a LEGAL gate or
+ * harness daemon account name. That guidance is retired, and this comment now
+ * says the opposite of what it used to. On macOS an account named `admin` is
+ * conventionally in the `admin` group and therefore holds sudo, so a gate or
+ * harness running as it could rewrite the very policy its confinement exists
+ * to enforce. All three sites now refuse the same five names.
+ *
+ * WHAT THE WIDENING WAS CHECKED AGAINST, stated exactly as narrowly as it was
+ * checked. In THIS REPO nothing is affected: every account name the product
+ * uses is prefix-derived (`deriveAgentAccountName` -> `sanctuary-<agentId>`,
+ * `deriveGateAccountName` -> `sanctuary-gate-<agentId>`), no CLI flag lets an
+ * operator supply an account name, and a repo-wide scan found no default,
+ * fixture, doc, test, or derived name equal to a reserved one. That is a
+ * statement about the repo, NOT about hosts in the field. The only host
+ * evidence is a coordinator check of two machines on 2026-08-05 (Mini1 and
+ * Mini2): no Sanctuary daemon runs as `admin` on either -- the harness and
+ * the LT executor run as `sanctuary-hermes`, and the castle-wall daemons and
+ * signer helpers run as root. Nothing is known about any other host.
+ *
+ * KNOWN BEHAVIOR CHANGE, and it is a refusal, not a migration: a plist naming
+ * `admin` -- hand-written, or re-rendered from any path that supplies an
+ * operator-chosen account name -- now throws at render time where it
+ * previously rendered. (An earlier draft of this note claimed a stale
+ * PERSISTED `gateAccountName` field was such a path; a re-gate found no
+ * reader for one. `arming-wiring.ts` holds the name in memory, and boot
+ * derives the gate account from the marker, so the persisted-field route
+ * named here did not exist.) Failure mode from the outside: an install or re-arm that used to
+ * complete stops with a "refusing to render ... privileged account" error,
+ * which is the intended outcome and is loud, never a silent downgrade.
+ *
+ * EXPORTED so the structural guard can iterate the real runtime set and drive
+ * every member through each refusal site. Production code inside this module
+ * uses it directly; the two daemons keep their own copies on purpose (above).
+ * Typed `ReadonlySet`, which is a COMPILE-TIME constraint only: the value is
+ * a normal mutable `Set`, so a determined consumer could still mutate it at
+ * runtime. It is not re-exported through the barrel, and the structural guard
+ * is its only importer outside this module, which is what actually bounds the
+ * exposure.
+ */
+export const RESERVED_ACCOUNT_NAMES: ReadonlySet<string> = new Set([
+  "root",
+  "_root",
+  "daemon",
+  "wheel",
+  "admin",
+]);
 
 /** Derive the canonical dedicated account name for an agent id, e.g. "hermes" -> "sanctuary-hermes". */
 export function deriveAgentAccountName(agentId: string): string {
@@ -457,6 +528,11 @@ export function planAccountCreate(
   if (!SAFE_SERVICE_ACCOUNT_RE.test(accountName)) {
     throw new Error(`Account name is not a safe service-account name (got: ${JSON.stringify(accountName)}).`);
   }
+  // INVARIANT: the whole point of a dedicated agent account is that the wall
+  // can attribute and confine it by its own uid. Provisioning onto a
+  // privileged existing name would instead hand the agent that name's
+  // authority (root, or an `admin` account's sudo) and collapse the
+  // attribution onto a uid shared with the operator.
   if (RESERVED_ACCOUNT_NAMES.has(accountName)) {
     throw new Error(`Refusing to plan a dedicated agent account named "${accountName}" (privileged/reserved name).`);
   }

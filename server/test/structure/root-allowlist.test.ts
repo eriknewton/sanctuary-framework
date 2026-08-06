@@ -44,6 +44,9 @@ const REPO_ROOT = join(fileURLToPath(import.meta.url), "..", "..", "..", "..");
  */
 const ALLOWLIST: ReadonlyArray<string> = [
   ".claude",
+  // Claude Code plugin-marketplace manifest; must live at repo root for
+  // `/plugin marketplace add eriknewton/sanctuary-framework` to resolve.
+  ".claude-plugin",
   ".editorconfig",
   ".gitattributes",
   ".githooks",

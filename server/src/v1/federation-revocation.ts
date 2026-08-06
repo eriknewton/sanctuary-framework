@@ -27,10 +27,13 @@ import { verify } from "../core/identity.js";
 import {
   cryptoSuiteRegistry,
   createHybridSuitePublicKeys,
+  ED25519_PRIVATE_KEY_BYTES,
   ED25519_PUBLIC_KEY_BYTES,
+  ED25519_SIGNATURE_BYTES,
   HYBRID_SIGNATURE_SUITE_ID,
   ML_DSA_65_PUBLIC_KEY_BYTES,
   ML_DSA_65_SECRET_KEY_BYTES,
+  SIGNATURE_BUNDLE_VERSION,
   type SignatureBundle,
   type SuiteSigner,
 } from "../core/crypto-suite-registry.js";
@@ -390,7 +393,7 @@ export function verifyFederationNodeEvictionEvent(input: {
   } catch {
     return { ok: false, reason: "operator_signature_invalid" };
   }
-  if (signature.length !== 64) {
+  if (signature.length !== ED25519_SIGNATURE_BYTES) {
     return { ok: false, reason: "operator_signature_invalid" };
   }
   const signedBody = {
@@ -829,7 +832,7 @@ export async function signFederationRootRevocationPayloadHybrid(params: {
 }): Promise<FederationRootRevocationPayload> {
   if (
     params.newHybridPrincipalPrivateKeys.ed25519.private_key.length !==
-    ED25519_PUBLIC_KEY_BYTES
+    ED25519_PRIVATE_KEY_BYTES
   ) {
     throw new Error("hybrid revocation Ed25519 private key must be 32 bytes");
   }
@@ -1007,7 +1010,7 @@ export async function verifyFederationRootRevocationEvent(input: {
   } catch {
     return { ok: false, reason: "operator_signature_invalid" };
   }
-  if (signature.length !== 64) {
+  if (signature.length !== ED25519_SIGNATURE_BYTES) {
     return { ok: false, reason: "operator_signature_invalid" };
   }
   const signedBody = {
@@ -1234,8 +1237,14 @@ function parseSignatureBundle(
   if (value === undefined) return undefined;
   if (typeof value !== "object" || value === null) return "invalid";
   const bundle = value as Record<string, unknown>;
+  // The accepted version must match `SIGNATURE_BUNDLE_VERSION` in
+  // core/crypto-suite-registry.ts, the one place the bundle shape is defined
+  // (`SignatureBundle.bundle_version` is typed `typeof SIGNATURE_BUNDLE_VERSION`).
+  // A re-typed literal here would keep compiling after a `.v2` mint and would
+  // then reject every bundle the registry produces, with the only symptom an
+  // "invalid signature bundle" on otherwise-valid revocation traffic.
   if (
-    bundle.bundle_version !== "sanctuary.signature-bundle.v1" ||
+    bundle.bundle_version !== SIGNATURE_BUNDLE_VERSION ||
     typeof bundle.signature_suite !== "string" ||
     bundle.signature_suite.length === 0 ||
     !Array.isArray(bundle.components)
@@ -1259,7 +1268,7 @@ function parseSignatureBundle(
   });
   if (components.some((component) => component === "invalid")) return "invalid";
   return {
-    bundle_version: "sanctuary.signature-bundle.v1",
+    bundle_version: SIGNATURE_BUNDLE_VERSION,
     signature_suite: bundle.signature_suite,
     components: components as SignatureBundle["components"],
   };

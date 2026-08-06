@@ -72,9 +72,19 @@ export const REL_TIME_FN_SOURCE = `function relTime(iso) {
 
 /**
  * The shared design-token block for the three posture pages (Home, per-agent
- * drill-down, Evidence view). This is now the canonical "paper/ink" token
- * block - the SAME `PAPER_INK_ROOT_TOKENS_CSS` the v1.1 dashboard and the Fleet
- * Switcher interpolate - so all four web surfaces speak one visual language.
+ * drill-down, Evidence view). This is a re-export of the canonical "paper/ink"
+ * token block, `PAPER_INK_ROOT_TOKENS_CSS` in
+ * `server/src/dashboard/design-tokens.ts`.
+ *
+ * SCOPE, precisely: the surfaces that interpolate that constant are the v1.1
+ * board (`dashboard/v1_1/html.ts`), the mobile view (`dashboard/mobile.ts`),
+ * the login page and the Fleet Switcher (both in
+ * `principal-policy/dashboard-html.ts`), and these three posture pages. That
+ * is NOT every page this server serves: `generateDashboardHTML` (the approval
+ * board, same file as the login page) still declares its own legacy
+ * GitHub-dark `:root`, and one name, `--surface`, exists in both systems at
+ * different values. The note above that block is the authoritative warning;
+ * do not read this comment as a claim that the token system is universal.
  *
  * Before this change the three posture pages carried a generic GitHub-dark
  * palette (`--bg: #0e1116; --green: #2ea043; --accent: #58a6ff; ...`) that read

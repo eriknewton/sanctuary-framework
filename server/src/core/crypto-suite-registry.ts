@@ -10,18 +10,71 @@ import { fromBase64url, stringToBytes, toBase64url } from "./encoding.js";
 import { sign as identitySign, verify as identityVerify } from "./identity.js";
 import type { EncryptedPayload } from "./encryption.js";
 
+/**
+ * SOLE declaration of the signature-bundle wire version in `server/src`.
+ * `SignatureBundle.bundle_version` below is typed `typeof` this constant, and
+ * the second parser of the shape (`parseSignatureBundle` in
+ * `v1/federation-revocation.ts`) imports it rather than re-typing the literal.
+ * `test/structure/cross-file-contract-pins.test.ts` walks EVERY .ts file under
+ * `server/src` over RAW source and fails on any occurrence of this string
+ * written as a QUOTED literal outside this declaration. It does not see a bare
+ * or concatenated mention, and it does not cover markdown. A re-typed copy
+ * keeps compiling after a `.v2` mint and then rejects every bundle this
+ * registry produces, surfacing only as "invalid signature bundle" on
+ * otherwise-valid revocation traffic.
+ */
 export const SIGNATURE_BUNDLE_VERSION = "sanctuary.signature-bundle.v1";
 export const SIGNED_SURFACE_DOMAIN = "sanctuary.signed-surface.v1";
 export const ED25519_SIGNATURE_SUITE_ID = "ed25519-v1";
 export const ML_DSA_65_COMPONENT_ALG = "ml-dsa-65-v1";
 export const HYBRID_SIGNATURE_SUITE_ID = "ed25519+ml-dsa-v1";
 
+// ── Wire byte lengths ───────────────────────────────────────────────────
+// Every literal below is a fixed property of the algorithm, not a tunable.
+// They are grouped here so a length check anywhere in the tree reads as the
+// thing it is checking rather than as a bare number. Three of them are 32 and
+// two are 64; the names are what stop a 32 that means "AES-256 key" or a 64
+// that means "seed||pubkey" from being silently substituted for a key length.
+
+/** RFC 8032 §5.1.2: an Ed25519 public key is the 32-byte compressed encoding of an Edwards point. */
 export const ED25519_PUBLIC_KEY_BYTES = 32;
+/**
+ * RFC 8032 §5.1.5: an Ed25519 private key is a 32-byte seed.
+ *
+ * Numerically equal to `ED25519_PUBLIC_KEY_BYTES` by coincidence of the curve
+ * (both are 32-byte encodings over the same field), NOT by definition, so the
+ * two names are deliberately separate and must not be collapsed.
+ */
+export const ED25519_PRIVATE_KEY_BYTES = 32;
+/**
+ * 64 = the legacy on-disk private-key layout `seed || public_key`.
+ *
+ * Sanctuary's pinned Castle Wall / transparency private keys were once written
+ * in this concatenated form. Loaders normalize by taking the leading seed.
+ * This is NOT a signature length even though it is also 64 bytes: substituting
+ * `ED25519_SIGNATURE_BYTES` here would compile, pass, and be wrong.
+ */
+export const ED25519_LEGACY_SEED_AND_PUBKEY_BYTES =
+  ED25519_PRIVATE_KEY_BYTES + ED25519_PUBLIC_KEY_BYTES;
+/** RFC 8032 §5.1.6: an Ed25519 signature is `R || S`, 32 bytes each. */
 export const ED25519_SIGNATURE_BYTES = 64;
+/** FIPS 204 ML-DSA-65 public key size. */
 export const ML_DSA_65_PUBLIC_KEY_BYTES = 1952;
+/** FIPS 204 ML-DSA-65 private (secret) key size. */
 export const ML_DSA_65_SECRET_KEY_BYTES = 4032;
+/** FIPS 204 ML-DSA-65 signature size. */
 export const ML_DSA_65_SIGNATURE_BYTES = 3309;
+/**
+ * 86 = unpadded base64url length of `ED25519_SIGNATURE_BYTES` (64):
+ * 63 bytes -> 21 full 3-byte groups -> 84 chars, plus 1 trailing byte -> 2 chars.
+ * Bounds the input BEFORE decode; the exact byte length is checked after.
+ */
 export const ED25519_SIGNATURE_B64URL_MAX_CHARS = 86;
+/**
+ * 4412 = unpadded base64url length of `ML_DSA_65_SIGNATURE_BYTES` (3309):
+ * 3309 is exactly 1103 * 3, so 1103 * 4 chars with no trailing group.
+ * Bounds the input BEFORE decode; the exact byte length is checked after.
+ */
 export const ML_DSA_65_SIGNATURE_B64URL_MAX_CHARS = 4412;
 
 export type SignatureSuiteId =

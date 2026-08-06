@@ -35,6 +35,7 @@ import {
 import { stringToBytes } from "../../core/encoding.js";
 import { HKDF_NODE_KEY_WRAP_INFO_PREFIX } from "./constants.js";
 import type { NodeKeyStore } from "./types.js";
+import { ED25519_PRIVATE_KEY_BYTES } from "../../core/crypto-suite-registry.js";
 
 /**
  * Derive the per-node at-rest wrapping key.
@@ -67,7 +68,7 @@ export function wrapNodePrivateKey(params: {
   fortress_master_secret: Uint8Array;
   node_id: string;
 }): EncryptedPayload {
-  if (params.node_private_key.length !== 32) {
+  if (params.node_private_key.length !== ED25519_PRIVATE_KEY_BYTES) {
     throw new Error(
       `wrapNodePrivateKey: expected 32-byte Ed25519 private key seed; got ${params.node_private_key.length}`
     );

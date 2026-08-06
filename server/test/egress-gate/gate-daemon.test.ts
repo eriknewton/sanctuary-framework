@@ -107,9 +107,16 @@ describe("egress-gate/gate-daemon renderEgressGateDaemonPlist", () => {
     ).toThrow(/cross-account logs/);
   });
 
-  it("REFUSES to render a gate daemon running as root (the gate is TCB but must never hold root)", () => {
-    expect(() => renderEgressGateDaemonPlist({ ...base, gateAccount: "root" })).toThrow(/never hold root/);
-  });
+  it.each(["root", "_root", "daemon", "wheel", "admin"])(
+    "REFUSES to render a gate daemon running as privileged account %s (the gate is TCB but holds no privilege)",
+    (gateAccount) => {
+      // `admin` added 2026-08-05 (register G1, Erik-ratified WIDEN): this
+      // renderer accepted it while account provisioning refused it, and an
+      // `admin` account on macOS conventionally carries sudo, so the gate
+      // could have rewritten the policy it exists to enforce.
+      expect(() => renderEgressGateDaemonPlist({ ...base, gateAccount })).toThrow(/never hold root/);
+    },
+  );
 
   it("refuses an unsafe account name, control characters in argv, and relative paths", () => {
     expect(() => renderEgressGateDaemonPlist({ ...base, gateAccount: "bad name!" })).toThrow(/safe service-account/);

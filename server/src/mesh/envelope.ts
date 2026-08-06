@@ -111,7 +111,42 @@ export function packSignedEvent<Payload>(
   return evt;
 }
 
+/**
+ * Event ids are ULIDs. Every numeric literal in the encoder below derives from
+ * the ULID spec, so they are stated once here rather than repeated inline:
+ *
+ *   - the alphabet is Crockford base32, so it has 32 symbols and each symbol
+ *     carries 5 bits (hence the `& 31` masks and the `>= 5` bit drain);
+ *   - a ULID is 48 bits of timestamp + 80 bits of randomness = 128 bits, which
+ *     is 26 base32 characters (ceil(128 / 5)), split 10 + 16;
+ *   - 48 bits of timestamp is why the range guard is `0xffffffffffff`, and
+ *     80 bits of randomness is why the draw is `randomBytes(10)`;
+ *   - the random section therefore starts at character index 10.
+ *
+ * Monotonicity within a millisecond comes from incrementing the previous random
+ * component rather than redrawing, so ids from one emitter sort in emit order.
+ */
 const ULID_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+/** 5 bits per Crockford base32 symbol. */
+const ULID_BITS_PER_CHAR = 5;
+/** 32 = the alphabet size, i.e. the base the timestamp section is written in. */
+const ULID_RADIX = 2 ** ULID_BITS_PER_CHAR;
+/** 31 = the low-5-bits mask used to pull one symbol out of a bit buffer. */
+const ULID_CHAR_MASK = ULID_RADIX - 1;
+/** 48-bit millisecond timestamp -> ceil(48 / 5) = 10 characters. */
+const ULID_TIME_CHARS = 10;
+/** 80 bits of randomness -> 10 bytes -> 80 / 5 = 16 characters. */
+const ULID_RANDOM_BYTES = 10;
+const ULID_RANDOM_CHARS = 16;
+/** A ULID is the two sections concatenated: 10 + 16 = 26 characters. */
+const ULID_CHARS = ULID_TIME_CHARS + ULID_RANDOM_CHARS;
+/** 48 bits of millisecond timestamp; `2 ** 48 - 1` is the largest value it holds. */
+const ULID_TIMESTAMP_BITS = 48;
+const ULID_MAX_TIMESTAMP_MS = 2 ** ULID_TIMESTAMP_BITS - 1;
+/** Byte width, named so the 8-bit shifts in the base32 encoder read as bytes. */
+const BITS_PER_BYTE = 8;
+/** 255 = the all-ones byte, the carry mask for the monotonic-random increment. */
+const BYTE_MASK = 2 ** BITS_PER_BYTE - 1;
 const lastUlidByEmitter = new Map<string, { timestampMs: number; random: Uint8Array }>();
 
 function generateEventId(emitterNode: string, emittedAt: string): string {
@@ -123,7 +158,7 @@ function generateEventId(emitterNode: string, emittedAt: string): string {
   const entropy =
     previous && timestampMs === previous.timestampMs
       ? incrementUlidRandom(previous.random)
-      : randomBytes(10);
+      : randomBytes(ULID_RANDOM_BYTES);
   lastUlidByEmitter.set(emitterNode, {
     timestampMs,
     random: new Uint8Array(entropy),
@@ -134,36 +169,41 @@ function generateEventId(emitterNode: string, emittedAt: string): string {
 function incrementUlidRandom(previous: Uint8Array): Uint8Array {
   const next = new Uint8Array(previous);
   for (let i = next.length - 1; i >= 0; i--) {
-    next[i] = (next[i] + 1) & 0xff;
+    next[i] = (next[i] + 1) & BYTE_MASK;
     if (next[i] !== 0) return next;
   }
   throw new Error("ULID random component exhausted for emitter in one millisecond");
 }
 
 function encodeUlid(timestampMs: number, random: Uint8Array): string {
-  if (timestampMs < 0 || timestampMs > 0xffffffffffff) {
+  if (timestampMs < 0 || timestampMs > ULID_MAX_TIMESTAMP_MS) {
     throw new Error(`ULID timestamp out of range: ${timestampMs}`);
   }
   let time = Math.floor(timestampMs);
-  const chars = new Array<string>(26);
-  for (let i = 9; i >= 0; i--) {
-    chars[i] = ULID_ALPHABET[time & 31];
-    time = Math.floor(time / 32);
+  const chars = new Array<string>(ULID_CHARS);
+  // Timestamp section, written least-significant symbol first.
+  for (let i = ULID_TIME_CHARS - 1; i >= 0; i--) {
+    chars[i] = ULID_ALPHABET[time & ULID_CHAR_MASK];
+    time = Math.floor(time / ULID_RADIX);
   }
 
+  // Random section: shift bytes in 8 bits at a time and drain 5-bit symbols.
   let bitBuffer = 0;
   let bitCount = 0;
-  let out = 10;
+  let out = ULID_TIME_CHARS;
   for (const byte of random) {
-    bitBuffer = (bitBuffer << 8) | byte;
-    bitCount += 8;
-    while (bitCount >= 5) {
-      bitCount -= 5;
-      chars[out++] = ULID_ALPHABET[(bitBuffer >> bitCount) & 31];
+    bitBuffer = (bitBuffer << BITS_PER_BYTE) | byte;
+    bitCount += BITS_PER_BYTE;
+    while (bitCount >= ULID_BITS_PER_CHAR) {
+      bitCount -= ULID_BITS_PER_CHAR;
+      chars[out++] = ULID_ALPHABET[(bitBuffer >> bitCount) & ULID_CHAR_MASK];
     }
   }
+  // 80 bits is an exact multiple of 5, so this tail never runs for a full-size
+  // random section; it is kept so the encoder stays correct for a shorter one.
   if (bitCount > 0) {
-    chars[out] = ULID_ALPHABET[(bitBuffer << (5 - bitCount)) & 31];
+    chars[out] =
+      ULID_ALPHABET[(bitBuffer << (ULID_BITS_PER_CHAR - bitCount)) & ULID_CHAR_MASK];
   }
   return chars.join("");
 }

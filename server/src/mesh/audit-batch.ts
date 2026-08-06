@@ -116,6 +116,8 @@ export function sealAuditBatch(params: SealParams): AuditBatch {
 }
 
 function generateBatchId(): string {
+  // 16 = 128 random bits, rendered below as 32 hex characters. A batch id is an
+  // opaque collision-resistant label, not key material.
   const bytes = randomBytes(16);
   let hex = "";
   for (const b of bytes) hex += b.toString(16).padStart(2, "0");

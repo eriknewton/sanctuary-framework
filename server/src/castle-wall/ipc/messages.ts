@@ -172,7 +172,7 @@ export interface AuditProducerSignatureNotification {
   captured_at_unix_ms: number;
   /** Monotonic extension-side sequence bound into the signature. */
   seq: number;
-  /** Prior CastleWallAuditEvent canonical hash, or null for genesis. */
+  /** Prior producer signed-body chain hash, or null for genesis. */
   prior_sha256_hex: string | null;
   /** base64url-no-pad of the 64-byte Ed25519 producer signature. */
   signature_b64url: string;

@@ -11,7 +11,11 @@
 
 import { CASTLE_WALL_DEFAULT_PROMPT_TIMEOUT_SECONDS } from "../constants.js";
 import { ApprovalStub } from "./approval-stub.js";
-import { AuditConsumer, type AuditSink } from "./audit-consumer.js";
+import {
+  AuditConsumer,
+  type AuditSink,
+  type ChainAnchorSource,
+} from "./audit-consumer.js";
 import { IpcClient, type IpcTransport, type ClientKeyMaterial } from "./ipc-client.js";
 import { RuntimeIpcError } from "./errors.js";
 import {
@@ -74,6 +78,15 @@ export interface StartCastleWallInput {
    * this; tests use it to pin Linux vs macOS behavior deterministically.
    */
   producerKeyLoadOptions?: ProducerKeyLoadOptions;
+  /**
+   * Reader for the consumer's own last persisted chain position (wire it with
+   * `buildChainAnchorSourceFromAuditLog` over the same audit log `auditSink`
+   * appends to). With a pinned producer key, the consumer restores its chain
+   * anchor from LOCAL persisted history before the first incoming event —
+   * including the one-time old-basis migration. Omitting it keeps the legacy
+   * null-anchor bootstrap (tests / callers without a queryable log).
+   */
+  chainAnchorSource?: ChainAnchorSource;
   promptTimeoutMs?: number;
   strictMode?: boolean;
   /** Optional override for handshake timeout; defaults to 5s. */
@@ -154,6 +167,9 @@ export async function startCastleWall(
 
   const audit = new AuditConsumer(input.auditSink, undefined, {
     pinnedProducerKeyB64url: consumerPinnedKey,
+    ...(input.chainAnchorSource !== undefined
+      ? { chainAnchorSource: input.chainAnchorSource }
+      : {}),
   });
   let state: CastleWallLifecycleState = "handshaking";
 

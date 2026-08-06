@@ -52,6 +52,10 @@ import {
   AUTH_DISABLED_ATTESTATION_REF,
 } from "./ceremony.js";
 import { verifyOperatorAttestation } from "./operator-attestation.js";
+import {
+  ED25519_PUBLIC_KEY_BYTES,
+  ED25519_SIGNATURE_BYTES,
+} from "../core/crypto-suite-registry.js";
 
 /** Challenge TTL (RFC v7 §5.2: 60 seconds). */
 export const V1_CHALLENGE_TTL_MS = 60_000;
@@ -166,7 +170,7 @@ export class V1SessionService {
     } catch {
       return { ok: false };
     }
-    if (clientPubkey.length !== 32) return { ok: false };
+    if (clientPubkey.length !== ED25519_PUBLIC_KEY_BYTES) return { ok: false };
 
     // Attestation is validated AGAINST this client key: a durable operator
     // attestation binds the operator's signature to exactly this ephemeral
@@ -233,7 +237,7 @@ export class V1SessionService {
     } catch {
       return { ok: false };
     }
-    if (signature.length !== 64) return { ok: false };
+    if (signature.length !== ED25519_SIGNATURE_BYTES) return { ok: false };
 
     const message = buildChallengeMessage(
       record.clientPubkey,

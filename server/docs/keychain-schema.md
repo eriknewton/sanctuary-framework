@@ -454,17 +454,25 @@ because doing so would permanently destroy the original encrypted material.
 The remediation path is restoring the matching backup or, if the data is
 not recoverable, wiping the tenant directory and re-wrapping.
 
-## Real-backend integration test
+## Real-backend verification
 
-The Linux Secret Service backend has an integration test file at
-`server/test/keychain-linux-real-backend-integration.test.ts` that
-exercises the production `secret-tool` shell-out against a live
-`gnome-keyring-daemon`. The file is gated by `describe.skipIf` so it
-skips cleanly on macOS, Windows, and any Linux host without
-`secret-tool` or `DBUS_SESSION_BUS_ADDRESS` set. Developers running
-`npm test` on macOS see the file as a skipped suite, not a failure.
+The Linux Secret Service backend is verified by a standalone script at
+`server/scripts/real-backend-check.ts`, which exercises the production
+`secret-tool` shell-out against a live Secret Service.
 
-Test cases covered:
+It is deliberately NOT part of the vitest suite. Reaching the real
+credential binary requires removing the in-memory credential store that
+`test/setup/keychain-fake.ts` installs for every test, and a test file
+that can do that is a capability present on every machine that runs
+`npm test`. Three attempts to gate it correctly each shipped a check
+weaker than its claim, so the capability was removed rather than guarded:
+`setKeychainExec` cannot be un-set, and under a test run the chokepoint
+either uses the fake or throws. The script runs as a plain node process,
+where spawning the credential CLI is ordinary behavior.
+
+`npm test` never runs it, on any platform. There is nothing to skip.
+
+Checks covered:
 
 1. Round-trip via `getOrCreatePassphrase` (generate then read back).
 2. Round-trip via `persistUserProvidedPassphrase` plus `readStoredPassphrase`.
@@ -475,18 +483,30 @@ Test cases covered:
    suppressed (verifies invariant 5: fail-closed-but-encrypted, not silent
    plaintext).
 
-To exercise the test on a real Linux desktop session:
+`server/test/keychain-linux-secret-service.test.ts` remains authoritative
+for unit-level behavior and proves the degrade path with an injected
+`storeFailure`, on every platform, in ordinary CI. The script confirms
+real-`secret-tool` behavior (binary path, exit-code semantics, stdin
+handling, attribute serialization) rather than being the only coverage.
+
+To run it on a real Linux session:
 
 ```sh
 # Inside any libsecret-compatible session (gnome-shell, KDE Plasma, etc.)
-cd server && npm test -- keychain-linux-real-backend-integration
+cd server && npx tsx scripts/real-backend-check.ts
 ```
+
+It refuses to run without `DBUS_SESSION_BUS_ADDRESS`, because every check
+would otherwise degrade to the fallback file and four of the five would
+pass while proving nothing about libsecret. It asserts its own check
+count and prints `REAL_BACKEND_CHECKS_PASSED=<n>` last, which is what the
+workflow requires.
 
 The `Keychain Linux Real-Backend Integration` workflow at
 `.github/workflows/keychain-linux-real-backend.yml` runs the suite in
 automated CI on every push and pull request that touches
-`server/src/wrap/passphrase.ts`, the keychain test files, or the
-workflow itself. The workflow stands up `pass-secret-service` (a
+`server/src/wrap/passphrase.ts`, the keychain chokepoint, the check
+script, or the workflow itself. The workflow stands up `pass-secret-service` (a
 libsecret-compatible Secret Service implementation backed by `pass`,
 GPG-encrypted password store) on a `dbus-run-session` session bus so the
 production `secret-tool` shell-out exercises a real D-Bus + libsecret

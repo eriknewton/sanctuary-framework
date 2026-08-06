@@ -2,10 +2,38 @@ import { createHash } from "node:crypto";
 import { fromBase64url, stringToBytes } from "../core/encoding.js";
 import { verify as verifyIdentitySignature } from "../core/identity.js";
 
-export const AUDIT_CHAIN_GENESIS = "GENESIS";
-export const AUDIT_CHAIN_SCHEMA_VERSION = 2;
-export const AUDIT_CHECKPOINT_DOMAIN = "sanctuary.audit-checkpoint.v1";
-export const AUDIT_CHECKPOINT_DOMAIN_PREFIX = `${AUDIT_CHECKPOINT_DOMAIN}\n`;
+/**
+ * These four constants are DECLARED in `./checkpoint-shape.ts` (the zero-import
+ * module) and re-exported here so existing importers are unchanged. They live
+ * there so the standalone external verifier `cli/audit-chain-verify.ts` can
+ * import them instead of re-typing them: importing from THIS file would pull
+ * `core/identity.ts` -> `core/encryption.ts` and the crypto runtime along with
+ * it. See the note at the declaration.
+ *
+ * `canonicalJson` and `checkpointSigningBytes` below are still hand-duplicated
+ * in that verifier. `checkpointSigningBytes` cannot move to the zero-import
+ * module because it needs `stringToBytes` from `core/encoding.ts`, and
+ * `canonicalJson` is left beside it so the two stay together. Both are pinned
+ * on each side, and `test/structure/cross-file-contract-pins.test.ts` compares
+ * the two `canonicalJson` function bodies after whitespace normalization. It
+ * does NOT compare `checkpointSigningBytes`: the two are byte-equivalent but
+ * not textually identical (this one calls `stringToBytes`, which is itself
+ * `new TextEncoder().encode(str)`, while the verifier inlines the
+ * `TextEncoder`), so a body comparison would fail on a difference that does
+ * not matter. That pair is watched by the pin comments only.
+ *
+ * Failure mode of a drifted copy: nothing throws and nothing fails to compile.
+ * The external verifier simply recomputes different signing bytes and reports
+ * a signature FAILURE on a chain the fortress considers perfectly valid, which
+ * reads to an auditor as evidence of tampering rather than as a stale mirror.
+ */
+export {
+  AUDIT_CHAIN_GENESIS,
+  AUDIT_CHAIN_SCHEMA_VERSION,
+  AUDIT_CHECKPOINT_DOMAIN,
+  AUDIT_CHECKPOINT_DOMAIN_PREFIX,
+} from "./checkpoint-shape.js";
+import { AUDIT_CHECKPOINT_DOMAIN_PREFIX } from "./checkpoint-shape.js";
 
 // G1 (post-#969 sweep re-gate): the checkpoint record shape, its schema
 // version, the strict shape predicate, and the `_audit_checkpoints`

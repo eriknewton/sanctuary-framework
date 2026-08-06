@@ -9,6 +9,7 @@
 import { ed25519 } from "@noble/curves/ed25519";
 import { ml_dsa65 } from "@noble/post-quantum/ml-dsa.js";
 import {
+  ED25519_PRIVATE_KEY_BYTES,
   ED25519_PUBLIC_KEY_BYTES,
   ED25519_SIGNATURE_SUITE_ID,
   HYBRID_SIGNATURE_SUITE_ID,
@@ -39,6 +40,29 @@ import type {
   PrincipalCertificateV2Hybrid,
 } from "./types.js";
 
+/**
+ * CROSS-FILE CONTRACT. These three at-rest version strings are ALSO spelled as
+ * literal types in `mesh/types.ts` -- `FortressMasterPublicKeysV2Hybrid
+ * .key_version`, `PrincipalCertificateV2Hybrid.certificate_version`,
+ * `NodeIdentityCertificateV2Hybrid.certificate_version`, and again inside
+ * `NodeIdentityCertificateV2Hybrid.parent_chain` as
+ * `fortress_master_key_version` / `principal_certificate_version`.
+ *
+ * The literals there are NOT written as `typeof <const>` on purpose: this file
+ * imports `./types.js`, so a `typeof` reference would make types.ts import
+ * back. TypeScript itself would tolerate that (an `import type` is erased and
+ * creates no runtime cycle), but `scripts/check-import-cycles.ts` is a regex
+ * scanner that does not distinguish type-only specifiers, so the repo's own
+ * cycle gate would count it. The duplication is the price of the acyclic
+ * direction as this repo measures it.
+ *
+ * Failure mode of a drift: TypeScript catches an assignment mismatch at
+ * compile time IF both sides are in the same assignment, but a hand-parsed
+ * certificate read off disk is checked against whichever copy that code path
+ * happens to reference, so a partially-updated pair rejects genuine stored
+ * certificates as the wrong version. Change all copies in the SAME PR.
+ * Enforced by `test/structure/cross-file-contract-pins.test.ts`.
+ */
 export const FORTRESS_MASTER_KEY_VERSION_V2_HYBRID =
   "sanctuary.fortress-master.v2.hybrid-ed25519-ml-dsa-65" as const;
 export const PRINCIPAL_CERTIFICATE_VERSION_V2_HYBRID =
@@ -799,7 +823,7 @@ function hybridKeyRefs(
 function hybridSignerFromPrivateKeys(
   keys: HybridPrivateKeyMaterial
 ): SuiteSigner {
-  if (keys.ed25519.private_key.length !== ED25519_PUBLIC_KEY_BYTES) {
+  if (keys.ed25519.private_key.length !== ED25519_PRIVATE_KEY_BYTES) {
     throw new MeshChainError("hybrid Ed25519 private key must be 32 bytes");
   }
   if (keys.ml_dsa_65.secret_key.length !== ML_DSA_65_SECRET_KEY_BYTES) {

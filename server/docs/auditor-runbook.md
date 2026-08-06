@@ -79,6 +79,15 @@ prove packets were blocked on the wire.
    Compare the output to the fingerprint the operator published through a
    separate channel.
 
+   Failure mode: this step is worth nothing if the key file and the fingerprint
+   reached you together. Hashing a file and comparing it to a hash that travelled
+   in the same email, the same archive, or the same repository proves only that
+   the file was not corrupted in transit, and it prints the same reassuring match
+   an attacker who substituted both would produce. The check has teeth only when
+   the fingerprint arrived over a channel the bundle did not touch. If you cannot
+   name that second channel, record the verification as unperformed rather than
+   as passed.
+
 3. Run the offline verifier:
 
    ```sh
