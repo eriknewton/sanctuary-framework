@@ -404,13 +404,12 @@ export function createSdwTools(options: SdwToolsOptions): ToolDefinition[] {
       },
       required: ["bundle", "source_key_ref"],
     },
-    // Verify-before-prompt. On failure: digest+category audit (async,
-    // fire-and-forget — appendCritical chains onto the audit queue) and a
-    // throw, which the router converts to a fixed denial WITHOUT prompting.
+    // Verify-before-prompt. On failure: digest+category audit is awaited before
+    // the throw, which the router converts to a fixed denial WITHOUT prompting.
     // On success the gate context carries metadata only — the bundle string
     // itself is deliberately absent (constraint #1); the manifest digest
     // binds it into the approval and into any approval proof.
-    approvalTargetArgs: (args) => {
+    approvalTargetArgs: async (args) => {
       const sourceKeyRef = args.source_key_ref;
       if (typeof sourceKeyRef !== "string" || sourceKeyRef.length === 0) {
         // Fail closed pre-prompt; the router converts the throw to the fixed
@@ -453,7 +452,7 @@ export function createSdwTools(options: SdwToolsOptions): ToolDefinition[] {
           error instanceof SdwImportVerificationError ? error.category : "malformed_bundle";
         const digest =
           error instanceof SdwImportVerificationError ? error.manifestBodyDigest : null;
-        void options.auditLog.appendCritical({
+        await options.auditLog.appendCritical({
           layer: "l1",
           operation: "sdw_import_manifest_rejected",
           identity_id: "system",

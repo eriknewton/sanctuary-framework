@@ -40,7 +40,9 @@ export interface ToolDefinition {
   tool_class?: "read" | "write";
   inputSchema: Record<string, unknown>;
   approvalTargetToolName?: string;
-  approvalTargetArgs?: (args: Record<string, unknown>) => Record<string, unknown>;
+  approvalTargetArgs?: (
+    args: Record<string, unknown>
+  ) => Record<string, unknown> | Promise<Record<string, unknown>>;
   handler: ToolHandler;
 }
 
@@ -201,7 +203,7 @@ export function createServer(
     if (gate) {
       let gateArgs: Record<string, unknown>;
       try {
-        gateArgs = tool.approvalTargetArgs?.(handlerArgs) ?? handlerArgs;
+        gateArgs = (await tool.approvalTargetArgs?.(handlerArgs)) ?? handlerArgs;
       } catch {
         const errorPayload = fixedDenial(
           `audit:gate:${name}`,

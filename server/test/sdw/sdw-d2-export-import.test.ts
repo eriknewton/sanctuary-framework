@@ -333,7 +333,7 @@ async function callThroughGate(
 ): Promise<RouterCallResult> {
   let gateArgs: Record<string, unknown>;
   try {
-    gateArgs = tool.approvalTargetArgs?.(args) ?? args;
+    gateArgs = (await tool.approvalTargetArgs?.(args)) ?? args;
   } catch {
     return { kind: "denied_pre_prompt" };
   }
@@ -1009,6 +1009,53 @@ describe("SDW D2 import verify-before-prompt + digest-only logging (invariant 5)
     );
     expect(result.kind).toBe("denied_pre_prompt");
     expect(prompts).toHaveLength(0);
+  });
+
+  it("does not leak an unhandled audit rejection while denying a malformed manifest pre-prompt", async () => {
+    const harness = await makeExportHarness();
+    const bundle = await exportedBundle(harness);
+    const forged: SdwStateExportBundle = {
+      ...bundle,
+      manifest: {
+        ...bundle.manifest,
+        body: { ...bundle.manifest.body, created_at: "2027-01-01T00:00:00.000Z" },
+      },
+    };
+    const target = makeFortress(TARGET_FORTRESS);
+    const rejectingAuditLog = new (class extends AuditLog {
+      override appendCritical(): Promise<void> {
+        return Promise.reject(new Error("audit disk unavailable"));
+      }
+    })(new MemoryStorage(), generateRandomKey());
+    const prompts: ApprovalRequest[] = [];
+    const gate = makeGate(
+      rejectingAuditLog,
+      new CallbackApprovalChannel(async (request) => {
+        prompts.push(request);
+        return { decision: "approve", decided_at: NOW, decided_by: "human" };
+      }),
+    );
+    const tools = createSdwTools({
+      storage: target.vault,
+      inventory: target.vault,
+      auditLog: rejectingAuditLog,
+      fortressId: TARGET_FORTRESS,
+      exportDir: harness.exportDir,
+      signingKey: makeSigning().signingKey,
+      resolvePublicKey: harness.signing.resolvePublicKey,
+      resolveSourceMasterKey: () => harness.source.masterKey,
+      targetMasterKey: target.masterKey,
+    });
+
+    const result = await callThroughGate(
+      findTool(tools, "sdw_import"),
+      { bundle: encodeBundle(forged), source_key_ref: "slot" },
+      gate,
+    );
+
+    expect(result.kind).toBe("denied_pre_prompt");
+    expect(prompts).toHaveLength(0);
+    expect(target.vault.countForTest()).toBe(0);
   });
 
   it("an unlisted record, a missing listed record, an unknown signer, and a fortress-id mismatch are all rejected", async () => {
