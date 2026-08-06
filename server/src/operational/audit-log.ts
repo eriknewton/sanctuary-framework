@@ -2233,6 +2233,7 @@ export class AuditLog {
   ): Promise<void> {
     try {
       const normalized = this.normalizeEntry(entry);
+      await this.reverifyCachedIntegrityFindingsBeforeAppend();
       const serialized = stringToBytes(JSON.stringify(normalized));
       const encrypted = encrypt(serialized, this.encryptionKey);
       const encryptedBytes = stringToBytes(JSON.stringify(encrypted));
@@ -3815,6 +3816,21 @@ export class AuditLog {
     } catch {
       // Leave the prior fingerprint in place; do not mask drift with a stale-clear.
     }
+  }
+
+  private async reverifyCachedIntegrityFindingsBeforeAppend(): Promise<void> {
+    if (
+      this.integrityMode !== "strict" ||
+      !this.loaded ||
+      this.integrityFindings.length === 0
+    ) {
+      return;
+    }
+    // C7: this instance already failed closed once. Before refusing the next
+    // append with that cached verdict, take one fresh look WITHOUT holding the
+    // append write lock. If the store is still dirty, strict reload throws here;
+    // if a transient healed, the normal locked append path can proceed.
+    await this.reloadPersistedEntries();
   }
 
   private async ensureLoaded(options?: { allowIntegrityFindings?: boolean }): Promise<void> {
