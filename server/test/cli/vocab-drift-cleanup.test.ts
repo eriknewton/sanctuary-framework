@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { Writable } from "node:stream";
 
 import { runAnomalyCommand } from "../../src/cli/anomaly.js";
-import { runExitCommand } from "../../src/exit/cli.js";
+import { printExitExportHelp, runExitCommand } from "../../src/exit/cli.js";
 import { runIntelligenceCommand } from "../../src/cli/intelligence.js";
 
 class StringWritable extends Writable {
@@ -89,5 +89,15 @@ describe("CLI vocabulary drift cleanup (F-GA-10/11/12)", () => {
     expect(out.text).toContain("Usage: sanctuary exit <command> [options]");
     expect(out.text).toContain("SANCTUARY_EXIT_BUNDLE_V1");
     expect(err.text).toBe("");
+  });
+
+  it("sanctuary exit export help uses ASCII punctuation for the re-key warning", () => {
+    const out = new StringWritable();
+
+    printExitExportHelp(out);
+
+    expect(out.text).toContain("It is never written into the bundle; store it");
+    expect(out.text).not.toContain("—");
+    expect(out.text).not.toContain("–");
   });
 });

@@ -263,7 +263,7 @@ Description:
 
   When state is exported, a one-time BUNDLE RE-KEY KEY is displayed: it is the
   credential that re-keys the bundle's encrypted state at import
-  (--source-recovery-key). It is never written into the bundle — store it
+  (--source-recovery-key). It is never written into the bundle; store it
   separately. Fortress credentials never travel inside the bundle.
 
 Options:
