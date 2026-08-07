@@ -144,6 +144,7 @@ describe("Castle Wall lease-delivery watchdog", () => {
   async function startHarness(input: {
     threshold?: number;
     auditHeartbeatIntervalSeconds?: number;
+    configureAuditLog?: (auditLog: AuditLog) => void;
   } = {}): Promise<{
     auditLog: AuditLog;
     handle: MacOSCastleWallDaemonHandle;
@@ -159,6 +160,7 @@ describe("Castle Wall lease-delivery watchdog", () => {
       masterKey,
       { integrityMode: "lenient" },
     );
+    input.configureAuditLog?.(auditLog);
     const producer = makeAvailabilityProducerKey();
     const producerKeyPath = join(fortressPath, "audit-producer.pub");
     await writeFile(producerKeyPath, producer.publicKey);
@@ -422,5 +424,102 @@ describe("Castle Wall lease-delivery watchdog", () => {
           (entry.details as Record<string, unknown>).lease_delivery_recycles === 1,
       ),
     ).toBe(true);
+  });
+
+  it("W8 serializes audit heartbeats when the write path is slower than the cadence", async () => {
+    const releaseBlockedHeartbeats: { current?: () => void } = {};
+    let observedFirstBlockedHeartbeat: (() => void) | null = null;
+    const firstBlockedHeartbeat = new Promise<void>((resolve) => {
+      observedFirstBlockedHeartbeat = resolve;
+    });
+    const blockedHeartbeats = new Promise<void>((resolve) => {
+      releaseBlockedHeartbeats.current = resolve;
+    });
+    let heartbeatAppends = 0;
+    let blockedHeartbeatAppends = 0;
+    let maxBlockedHeartbeatAppends = 0;
+
+    await startHarness({
+      auditHeartbeatIntervalSeconds: 0.001,
+      configureAuditLog(auditLog) {
+        const append = auditLog.append.bind(auditLog);
+        vi.spyOn(auditLog, "append").mockImplementation(
+          async (...args: Parameters<AuditLog["append"]>) => {
+            if (args[1] === CASTLE_WALL_HEARTBEAT_OPERATION) {
+              heartbeatAppends += 1;
+              if (heartbeatAppends > 1) {
+                blockedHeartbeatAppends += 1;
+                maxBlockedHeartbeatAppends = Math.max(
+                  maxBlockedHeartbeatAppends,
+                  blockedHeartbeatAppends,
+                );
+                observedFirstBlockedHeartbeat?.();
+                try {
+                  await blockedHeartbeats;
+                } finally {
+                  blockedHeartbeatAppends -= 1;
+                }
+              }
+            }
+            return append(...args);
+          },
+        );
+      },
+    });
+
+    await firstBlockedHeartbeat;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    releaseBlockedHeartbeats.current?.();
+    expect(maxBlockedHeartbeatAppends).toBe(1);
+  });
+
+  it("W9 drains an in-flight heartbeat before writing filter_stopped", async () => {
+    const releaseBlockedHeartbeat: { current?: () => void } = {};
+    let observedBlockedHeartbeat: (() => void) | null = null;
+    const blockedHeartbeatObserved = new Promise<void>((resolve) => {
+      observedBlockedHeartbeat = resolve;
+    });
+    const blockedHeartbeatReleased = new Promise<void>((resolve) => {
+      releaseBlockedHeartbeat.current = resolve;
+    });
+    const operations: string[] = [];
+    let heartbeatAppends = 0;
+
+    const { handle } = await startHarness({
+      auditHeartbeatIntervalSeconds: 0.001,
+      configureAuditLog(auditLog) {
+        const append = auditLog.append.bind(auditLog);
+        vi.spyOn(auditLog, "append").mockImplementation(
+          async (...args: Parameters<AuditLog["append"]>) => {
+            if (args[1] === CASTLE_WALL_HEARTBEAT_OPERATION) {
+              heartbeatAppends += 1;
+              if (heartbeatAppends > 1) {
+                observedBlockedHeartbeat?.();
+                await blockedHeartbeatReleased;
+              }
+            }
+            operations.push(String(args[1]));
+            return append(...args);
+          },
+        );
+      },
+    });
+
+    await blockedHeartbeatObserved;
+    const stopPromise = handle.stop();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(operations).not.toContain("filter_stopped");
+
+    releaseBlockedHeartbeat.current?.();
+    await stopPromise;
+    const liveHandleIndex = liveHandles.indexOf(handle);
+    if (liveHandleIndex >= 0) {
+      liveHandles.splice(liveHandleIndex, 1);
+    }
+
+    const heartbeatIndex = operations.lastIndexOf(CASTLE_WALL_HEARTBEAT_OPERATION);
+    const stoppedIndex = operations.lastIndexOf("filter_stopped");
+    expect(heartbeatIndex).toBeGreaterThanOrEqual(0);
+    expect(stoppedIndex).toBeGreaterThan(heartbeatIndex);
   });
 });
