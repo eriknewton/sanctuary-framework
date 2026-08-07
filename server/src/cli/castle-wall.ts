@@ -64,7 +64,12 @@ import {
 import { validateAgentOrigin } from "../castle-wall/allowlist/agent-origin.js";
 import { validateRule, type AllowlistRule } from "../castle-wall/allowlist/schema.js";
 import { HABEAS_RULE_ID_PREFIX } from "../castle-wall/allowlist/habeas-port.js";
-import { EGRESS_PROVISION_REFUSED_AUDIT_OP } from "../castle-wall/provision/egress.js";
+import {
+  AGENT_EGRESS_NEGATIVE_CONTROL_HOST,
+  EGRESS_PROVISION_REFUSED_AUDIT_OP,
+  asUidProbeReachableDecision,
+  asUidTlsProbeArgv,
+} from "../castle-wall/provision/egress.js";
 import {
   normalizeFortressCustody,
   resolveSudoIdentityDecision,
@@ -109,6 +114,7 @@ const CASTLE_PINNED_PUBKEY = "castle-pinned-pubkey.bin";
 const CASTLE_PINNED_PRIVKEY = "castle-pinned-privkey.enc";
 const CASTLE_GLOBAL_PINNED_PUBKEY_DIR = "/Library/Application Support/Sanctuary";
 const CASTLE_GLOBAL_PINNED_PUBKEY_PATH = `${CASTLE_GLOBAL_PINNED_PUBKEY_DIR}/${CASTLE_PINNED_PUBKEY}`;
+const DENY_ALL_QUARANTINE_PROBE_TIMEOUT_MS = 12_000;
 
 export interface CastleWallCommandContext {
   out?: Writable;
@@ -242,6 +248,14 @@ export interface CastleWallCommandContext {
    */
   egressAllowRuleCountProbe?: (fortressPath: string) => Promise<number>;
   /**
+   * Override the final deny-all quarantine smoke used only after an explicit
+   * `enable --allow-no-egress`. Defaults to running the same direct as-uid
+   * curl probe shape as the provisioned-egress verifier.
+   */
+  denyAllQuarantineProbe?: (
+    input: DenyAllQuarantineProbeInput,
+  ) => Promise<DenyAllQuarantineProbeResult>;
+  /**
    * Inject the FULL operator-daemon start function (Slice M; tests pass a fake
    * that captures the resolved {@link MacOSCastleWallDaemonInput}, so the
    * key-resolution + producer-key threading can be exercised without a real
@@ -319,6 +333,25 @@ export type HostAppInvoker = (
   binaryPath: string,
   args: string[],
 ) => Promise<{ stdout: string; stderr: string; exitCode: number }>;
+
+export interface DenyAllQuarantineProbeInput {
+  agentUid: number;
+  host: string;
+  port: number;
+}
+
+export interface DenyAllQuarantineProbeResult {
+  /** True only when the direct as-uid probe positively reached the host. */
+  reachable: boolean;
+  /**
+   * True when the probe itself ran far enough to distinguish reachable from
+   * blocked. A sudo/spawn/timeout failure is not proof that quarantine works.
+   */
+  verified: boolean;
+  exitCode: number | null;
+  stderr?: string;
+  command?: readonly string[];
+}
 
 export type DisableNePreferenceOutcome =
   | "corroborated_off"
@@ -3218,13 +3251,99 @@ async function readAgentOriginModeBestEffort(
   fortressPath: string,
 ): Promise<"uid" | "nat" | null> {
   try {
-    const raw = await readFile(agentOriginDescriptorPath(fortressPath), "utf8");
-    const validated = validateAgentOrigin(JSON.parse(raw));
+    const validated = await readAgentOriginDescriptorBestEffort(fortressPath);
     if (validated === null) return null;
     return validated.mode === "uid" ? "uid" : "nat";
   } catch {
     return null;
   }
+}
+
+async function readAgentOriginDescriptorBestEffort(
+  fortressPath: string,
+): Promise<ReturnType<typeof validateAgentOrigin>> {
+  try {
+    const raw = await readFile(agentOriginDescriptorPath(fortressPath), "utf8");
+    return validateAgentOrigin(JSON.parse(raw));
+  } catch {
+    return null;
+  }
+}
+
+async function readAgentOriginUidBestEffort(fortressPath: string): Promise<number | null> {
+  const descriptor = await readAgentOriginDescriptorBestEffort(fortressPath);
+  if (descriptor?.mode !== "uid" || descriptor.agent_uid === undefined) return null;
+  return descriptor.agent_uid;
+}
+
+function defaultDenyAllQuarantineProbe(
+  input: DenyAllQuarantineProbeInput,
+): Promise<DenyAllQuarantineProbeResult> {
+  const probe = asUidTlsProbeArgv(input.agentUid, input.host, input.port);
+  return new Promise((resolvePromise) => {
+    nodeExecFile(
+      probe.file,
+      probe.args,
+      {
+        encoding: "utf8",
+        timeout: DENY_ALL_QUARANTINE_PROBE_TIMEOUT_MS,
+      },
+      (error, _stdout, stderr) => {
+        const exitCode = error
+          ? typeof error.code === "number"
+            ? error.code
+            : null
+          : 0;
+        const stderrText = stderr ?? "";
+        const errorText =
+          error && exitCode === null ? `${error.name}: ${error.message}` : "";
+        const combinedStderr = [stderrText, errorText].filter(Boolean).join("\n");
+        resolvePromise({
+          reachable: asUidProbeReachableDecision(exitCode),
+          // Exit 0 or a curl-originated nonzero exit proves sudo reached curl
+          // as the target uid. A sudo/spawn/timeout failure is unverified.
+          verified:
+            exitCode === 0 ||
+            (exitCode !== null && /\bcurl: \(\d+\)/.test(combinedStderr)),
+          exitCode,
+          ...(combinedStderr ? { stderr: combinedStderr } : {}),
+          command: [probe.file, ...probe.args],
+        });
+      },
+    );
+  });
+}
+
+function formatProbeCommand(command: readonly string[] | undefined): string {
+  if (command === undefined || command.length === 0) return "(probe command unavailable)";
+  return command
+    .map((part) => (/^[A-Za-z0-9_./:=@%+#-]+$/.test(part) ? part : JSON.stringify(part)))
+    .join(" ");
+}
+
+function renderDenyAllQuarantineProbeRefusal(
+  input: DenyAllQuarantineProbeInput,
+  result: DenyAllQuarantineProbeResult,
+): string {
+  const details = [
+    `probe: ${formatProbeCommand(result.command)}`,
+    `exit_code: ${result.exitCode === null ? "none" : result.exitCode}`,
+    ...(result.stderr?.trim() ? [`stderr: ${result.stderr.trim()}`] : []),
+  ].join("\n");
+  if (!result.verified) {
+    return (
+      "Castle Wall arm saved by the host app, but the deny-all quarantine smoke could not verify the direct as-uid path.\n" +
+      `Expected uid ${input.agentUid} to be unable to reach ${input.host}:${input.port} with --noproxy '*', but the probe itself was inconclusive.\n` +
+      `${details}\n` +
+      "Treat the quarantine as unverified; run 'sanctuary castle-wall disable' before continuing.\n"
+    );
+  }
+  return (
+    "Castle Wall arm saved by the host app, but the deny-all quarantine smoke FAILED.\n" +
+    `uid ${input.agentUid} reached ${input.host}:${input.port} on the direct --noproxy path despite ZERO agent-matchable allow rules.\n` +
+    `${details}\n` +
+    "Treat this as fail-open for the confined uid; run 'sanctuary castle-wall disable' before continuing.\n"
+  );
 }
 
 /**
@@ -4471,6 +4590,7 @@ async function runArmDisarmInner(
   // (the CLI does not know harness endpoints); the endpoint-specific static +
   // as-uid verification lives in the auto-provision flow.
   let allowNoEgressOverrideUsed = false;
+  let allowNoEgressQuarantineUid: number | null = null;
   if (action === "enable") {
     const originMode = await readAgentOriginModeBestEffort(fortressPath);
     if (originMode === "uid") {
@@ -4503,6 +4623,7 @@ async function runArmDisarmInner(
           return 1;
         }
         allowNoEgressOverrideUsed = true;
+        allowNoEgressQuarantineUid = await readAgentOriginUidBestEffort(fortressPath);
         write(
           err,
           "WARNING: --allow-no-egress: arming a uid-mode wall with ZERO agent-matchable\n" +
@@ -4686,6 +4807,67 @@ async function runArmDisarmInner(
         ),
       );
       return 1;
+    }
+    if (allowNoEgressOverrideUsed) {
+      if (allowNoEgressQuarantineUid === null) {
+        write(
+          err,
+          "Castle Wall arm saved by the host app, but the deny-all quarantine smoke could not resolve the uid-mode agent-origin descriptor.\n" +
+            "Treat the quarantine as unverified; run 'sanctuary castle-wall disable' before continuing.\n",
+        );
+        await appendCastleWallCliAuditBestEffort(
+          EGRESS_PROVISION_REFUSED_AUDIT_OP,
+          {
+            source: "castle-wall-cli",
+            guard: "deny-all-quarantine-smoke",
+            agent_origin_mode: "uid",
+            negative_control_host: AGENT_EGRESS_NEGATIVE_CONTROL_HOST,
+            negative_control_port: 443,
+            observed: "unverified",
+            disarm_outcome: "operator-action-needed",
+          },
+          fortressPath,
+          env,
+          err,
+        );
+        return 1;
+      }
+      const smokeInput: DenyAllQuarantineProbeInput = {
+        agentUid: allowNoEgressQuarantineUid,
+        host: AGENT_EGRESS_NEGATIVE_CONTROL_HOST,
+        port: 443,
+      };
+      const smokeProbe = ctx.denyAllQuarantineProbe ?? defaultDenyAllQuarantineProbe;
+      const smokeResult = await smokeProbe(smokeInput);
+      if (!smokeResult.verified || smokeResult.reachable) {
+        write(err, renderDenyAllQuarantineProbeRefusal(smokeInput, smokeResult));
+        await appendCastleWallCliAuditBestEffort(
+          EGRESS_PROVISION_REFUSED_AUDIT_OP,
+          {
+            source: "castle-wall-cli",
+            guard: "deny-all-quarantine-smoke",
+            agent_origin_mode: "uid",
+            agent_uid: smokeInput.agentUid,
+            negative_control_host: smokeInput.host,
+            negative_control_port: smokeInput.port,
+            observed: smokeResult.reachable
+              ? "reachable"
+              : smokeResult.verified
+                ? "blocked"
+                : "unverified",
+            exit_code: smokeResult.exitCode,
+            disarm_outcome: "operator-action-needed",
+          },
+          fortressPath,
+          env,
+          err,
+        );
+        return 1;
+      }
+      write(
+        out,
+        `Deny-all quarantine smoke passed: uid ${smokeInput.agentUid} could not reach ${smokeInput.host}:${smokeInput.port} on the direct --noproxy path.\n`,
+      );
     }
     const verifiedArmClaim = renderVerifiedArmClaimLine(armClaimBasis);
     write(

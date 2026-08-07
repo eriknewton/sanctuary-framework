@@ -1865,6 +1865,8 @@ describe("castle-wall enable/disable CLI verbs", () => {
       await writeFile(plistPath, makeBootPlist(`${fixture.fortressPath}/`));
       await writeUidDescriptor(fixture.fortressPath);
       const err = new CaptureStream();
+      const out = new CaptureStream();
+      let probeInput: { agentUid: number; host: string; port: number } | undefined;
       const { invoke } = makeInvoker({
         enable: { stdout: reportLine("enable", "enabled", true), exitCode: 0 },
         status: { stdout: reportLine("status", "enabled", true), exitCode: 0 },
@@ -1872,12 +1874,26 @@ describe("castle-wall enable/disable CLI verbs", () => {
 
       const code = await runEnable(
         ["--fortress", fixture.fortressPath, "--no-ttl", "--allow-no-egress"],
-        guardCtx(fixture, plistPath, err, invoke),
+        guardCtx(fixture, plistPath, err, invoke, {
+          out,
+          denyAllQuarantineProbe: async (input: { agentUid: number; host: string; port: number }) => {
+            probeInput = input;
+            return {
+              reachable: false,
+              verified: true,
+              exitCode: 28,
+              stderr: "curl: (28) Operation timed out",
+              command: ["/usr/bin/sudo", "-n", "-u", "#502", "/usr/bin/curl", "--noproxy", "*"],
+            };
+          },
+        }),
       );
 
       expect(code).toBe(0);
       expect(err.text()).toContain("--allow-no-egress");
       expect(err.text()).toContain("deliberate quarantine");
+      expect(out.text()).toContain("Deny-all quarantine smoke passed");
+      expect(probeInput).toMatchObject({ agentUid: 502, host: "example.com", port: 443 });
 
       const storage = new FilesystemStorage(join(fixture.fortressPath, "state"));
       const { establishMaster } = await import("../../src/core/master-custody.js");
@@ -1892,6 +1908,100 @@ describe("castle-wall enable/disable CLI verbs", () => {
       const armed = entries.find((e) => e.operation === "wall_armed");
       expect(armed).toBeDefined();
       expect(armed?.details).toMatchObject({ allow_no_egress_override: true });
+    });
+
+    it("--allow-no-egress refuses the armed claim when the direct negative-control probe is reachable", async () => {
+      const fixture = await makeFixture();
+      const plistPath = join(fixture.fortressPath, "boot.plist");
+      await writeFile(plistPath, makeBootPlist(`${fixture.fortressPath}/`));
+      await writeUidDescriptor(fixture.fortressPath);
+      const out = new CaptureStream();
+      const err = new CaptureStream();
+      const { invoke } = makeInvoker({
+        enable: { stdout: reportLine("enable", "enabled", true), exitCode: 0 },
+        status: { stdout: reportLine("status", "enabled", true), exitCode: 0 },
+      });
+
+      const code = await runEnable(
+        ["--fortress", fixture.fortressPath, "--no-ttl", "--allow-no-egress"],
+        guardCtx(fixture, plistPath, err, invoke, {
+          out,
+          denyAllQuarantineProbe: async () => ({
+            reachable: true,
+            verified: true,
+            exitCode: 0,
+            command: [
+              "/usr/bin/sudo",
+              "-n",
+              "-u",
+              "#502",
+              "/usr/bin/curl",
+              "--noproxy",
+              "*",
+              "https://example.com:443/",
+            ],
+          }),
+        }),
+      );
+
+      expect(code).toBe(1);
+      expect(err.text()).toContain("deny-all quarantine smoke FAILED");
+      expect(err.text()).toContain("uid 502 reached example.com:443");
+      expect(err.text()).toContain("--noproxy");
+      expect(out.text()).not.toContain("Castle Wall armed");
+
+      const storage = new FilesystemStorage(join(fixture.fortressPath, "state"));
+      const { establishMaster } = await import("../../src/core/master-custody.js");
+      const { masterKey } = await establishMaster({
+        storage,
+        recoveryKey: fixture.env.SANCTUARY_RECOVERY_KEY!,
+        firstRun: { installMode: "headless", mintRecoveryKey: false },
+        storagePathHint: fixture.fortressPath,
+      });
+      const auditLog = new AuditLog(storage, masterKey);
+      const { entries } = await auditLog.query({ layer: "l1", limit: 100 });
+      const refusal = entries.find(
+        (e) =>
+          e.operation === "egress_provision_refused" &&
+          (e.details as Record<string, unknown>).guard === "deny-all-quarantine-smoke",
+      );
+      expect(refusal?.details).toMatchObject({
+        observed: "reachable",
+        agent_uid: 502,
+        negative_control_host: "example.com",
+      });
+    });
+
+    it("--allow-no-egress refuses the armed claim when the direct negative-control probe is inconclusive", async () => {
+      const fixture = await makeFixture();
+      const plistPath = join(fixture.fortressPath, "boot.plist");
+      await writeFile(plistPath, makeBootPlist(`${fixture.fortressPath}/`));
+      await writeUidDescriptor(fixture.fortressPath);
+      const out = new CaptureStream();
+      const err = new CaptureStream();
+      const { invoke } = makeInvoker({
+        enable: { stdout: reportLine("enable", "enabled", true), exitCode: 0 },
+        status: { stdout: reportLine("status", "enabled", true), exitCode: 0 },
+      });
+
+      const code = await runEnable(
+        ["--fortress", fixture.fortressPath, "--no-ttl", "--allow-no-egress"],
+        guardCtx(fixture, plistPath, err, invoke, {
+          out,
+          denyAllQuarantineProbe: async () => ({
+            reachable: false,
+            verified: false,
+            exitCode: 1,
+            stderr: "sudo: a password is required",
+            command: ["/usr/bin/sudo", "-n", "-u", "#502", "/usr/bin/curl"],
+          }),
+        }),
+      );
+
+      expect(code).toBe(1);
+      expect(err.text()).toContain("could not verify the direct as-uid path");
+      expect(err.text()).toContain("sudo: a password is required");
+      expect(out.text()).not.toContain("Castle Wall armed");
     });
 
     it("arms WITHOUT the override when an agent-matchable allow rule exists on disk (real countAgentMatchableAllowRules path)", async () => {
