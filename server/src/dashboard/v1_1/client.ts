@@ -1916,7 +1916,7 @@ async function fetchIntelligenceState() {
       return;
     }
     if (e.status === 401) {
-      state.intelligence.loadError = "Dashboard authentication required. Reload the page or re-launch the dashboard with: sanctuary dashboard --fortress <path>";
+      state.intelligence.loadError = "Dashboard authentication required. Reload the page or re-launch the dashboard with: sanctuary --fortress <path> dashboard";
       return;
     }
     state.intelligence.loadError = e.message;
@@ -1931,7 +1931,7 @@ async function fetchIntelligenceState() {
       return;
     }
     if (e.status === 401) {
-      state.intelligence.loadError = "Dashboard authentication required. Reload the page or re-launch the dashboard with: sanctuary dashboard --fortress <path>";
+      state.intelligence.loadError = "Dashboard authentication required. Reload the page or re-launch the dashboard with: sanctuary --fortress <path> dashboard";
       return;
     }
     state.intelligence.loadError = e.message;
