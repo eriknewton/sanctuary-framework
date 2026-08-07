@@ -104,16 +104,18 @@ export interface MemoryBackendAdapter {
   insertPassage(input: MemoryPassageInput, taint: PersistableTaint): Promise<MemoryPassage>;
 
   /**
-   * Insert-or-replace a whole SET of passages as ONE all-or-nothing unit.
+   * Insert-or-replace a whole SET of passages as one verified unit.
    *
    * Every input MUST carry an explicit passage_id: replace semantics need a
    * caller-stable id, and a generated one would make every run a fresh insert.
    *
-   * The atomicity contract is the point of this method. A mirror that commits
-   * a prefix of its passages and then throws leaves a vault the operator
-   * cannot re-import (each committed id now collides) and cannot distinguish
-   * from a complete one. On success every input is durable; on failure the
-   * owner scope is left as it was before the call.
+   * A mirror that commits a prefix of its passages and then throws leaves a
+   * vault the operator cannot re-import (each committed id now collides) and
+   * cannot distinguish from a complete one. On success every input is durable.
+   * On a recoverable write failure, rollback is verified against the raw owner
+   * scope before the original error is surfaced. If rollback cannot be verified,
+   * the implementation MUST fail with a partial_scope category so the caller and
+   * audit trail do not report the run as a clean all-or-nothing failure.
    */
   putPassages(
     inputs: readonly MemoryPassageInput[],

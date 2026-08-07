@@ -268,7 +268,7 @@ describe("Claude Code memory-file adapter", () => {
     const source = await copyFixtureSet("basic");
     // The classifier refuses this on the "principal policy" probe. Sorted after
     // MEMORY.md and concise-updates.md, so a whole-run abort here would leave a
-    // committed prefix behind: exactly the wedge this test pins.
+    // committed prefix behind: exactly the failure this test pins.
     await writeFile(
       join(source, "note-with-secret.md"),
       "# Ops note\n\nThe principal policy file lives in the fortress root.\n",
@@ -319,6 +319,7 @@ describe("Claude Code memory-file adapter", () => {
     // already through, so a non-atomic ingest would leave a committed prefix.
     const storage = new FailAfterNWritesStorage(new FilesystemStorage(storagePath), 4);
     const adapter = makeAdapter(storage, "cc-atomic");
+    const beforeRawCorpusKeys = await rawCorpusKeys(storage);
 
     await expect(
       ingestClaudeCodeMemoryDirectory(adapter, source, { ingestedAt: INGESTED_AT }),
@@ -326,6 +327,7 @@ describe("Claude Code memory-file adapter", () => {
 
     expect(await adapter.countPassages()).toBe(0);
     expect(await adapter.listPassages()).toEqual([]);
+    expect(await rawCorpusKeys(storage)).toEqual(beforeRawCorpusKeys);
   });
 
   it("never writes the memory topic file name into an on-disk storage key", async () => {
@@ -439,6 +441,12 @@ async function readRawCorpusFiles(storagePath: string): Promise<readonly Uint8Ar
     out.push(new Uint8Array(await readFile(join(corpusDir, entry))));
   }
   return out;
+}
+
+async function rawCorpusKeys(storage: StorageBackend): Promise<readonly string[]> {
+  return (await storage.list(SDW_DOCUMENT_CORPUS_NAMESPACE))
+    .map((entry) => entry.key)
+    .sort();
 }
 
 async function firstChunkFileForPassage(

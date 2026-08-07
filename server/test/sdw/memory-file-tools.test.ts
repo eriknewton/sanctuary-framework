@@ -7,7 +7,9 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import type { AuditLog } from "../../src/operational/audit-log.js";
 import type { ToolDefinition } from "../../src/router.js";
+import type { MemoryBackendAdapter } from "../../src/sdw/adapters/memory-backend.js";
 import { SdwMemoryBackendAdapter } from "../../src/sdw/adapters/sdw-memory-backend.js";
+import { SdwValidationError } from "../../src/sdw/errors.js";
 import { createSdwMemoryFileTools, memoryFileApprovalArgs } from "../../src/sdw/memory-file-tools.js";
 import { createMultiAgentIsolationGuard } from "../../src/sdw/memory-isolation.js";
 import { createSdwMemoryTools } from "../../src/sdw/memory-tools.js";
@@ -254,6 +256,59 @@ describe("SDW memory file tools", () => {
     expect(auditCalls.at(-1)).toMatchObject({
       operation: "memory_ingest_denied",
       result: "failure",
+    });
+  });
+
+  it("carries a backend partial_scope failure into the ingest denial audit", async () => {
+    const auditCalls: AuditCall[] = [];
+    const auditLog = {
+      async appendCritical(entry: {
+        readonly operation: string;
+        readonly result: "success" | "failure";
+        readonly details?: Record<string, unknown>;
+      }): Promise<void> {
+        auditCalls.push({
+          operation: entry.operation,
+          result: entry.result,
+          details: entry.details ?? {},
+        });
+      },
+    } as unknown as AuditLog;
+    const adapter: MemoryBackendAdapter = {
+      ownerRef: "fleet-self",
+      derivePassageId: (_domain, label) => label.replace(/[^A-Za-z0-9._:@+-]/g, "."),
+      screenPassage: () => ({ ok: true }),
+      putPassages: async () => {
+        throw new SdwValidationError("partial_scope", "rollback could not verify scope");
+      },
+      insertPassage: async () => {
+        throw new Error("not used");
+      },
+      getPassage: async () => null,
+      searchPassages: async () => [],
+      listPassages: async () => [],
+      deletePassage: async () => false,
+      countPassages: async () => 0,
+    };
+    const tools = new Map(
+      createSdwMemoryFileTools({ adapter, auditLog, now: () => NOW }).map((tool) => [
+        tool.name,
+        tool,
+      ]),
+    );
+
+    const denied = parse(
+      await tools.get("memory_ingest")!.handler({
+        harness: "claude-code",
+        dir: join(FIXTURE_ROOT, "basic"),
+      }),
+    );
+
+    expect(denied.denied).toBe(true);
+    expect(auditCalls.at(-1)).toMatchObject({
+      operation: "memory_ingest_denied",
+      result: "failure",
+      details: { denial_class: "partial_scope" },
     });
   });
 

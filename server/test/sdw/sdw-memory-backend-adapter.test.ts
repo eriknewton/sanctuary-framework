@@ -223,7 +223,7 @@ describe("SDW memory-backend adapter: write-gate enforcement", () => {
     expect(storage.data.size).toBe(0);
   });
 
-  it("rolls back all written keys without masking the original write failure", async () => {
+  it("signals partial_scope when insert rollback leaves a written key behind", async () => {
     const documentId = "mem.letta-archive-1.rollback-1";
     const docKey = documentKey(documentId);
     const chunk0 = documentChunkKey(documentId, "000000", "c000000");
@@ -234,12 +234,32 @@ describe("SDW memory-backend adapter: write-gate enforcement", () => {
 
     await expect(
       adapter.insertPassage({ passage_id: "rollback-1", text: "abcdef" }, "user_content"),
-    ).rejects.toThrow("simulated document write failure");
+    ).rejects.toMatchObject({ category: "partial_scope" });
 
     expect(storage.deleteCalls).toEqual([chunk2, chunk1, chunk0, docKey]);
     expect(storage.data.has(`${SDW_DOCUMENT_CORPUS_NAMESPACE}\0${chunk0}`)).toBe(false);
     expect(storage.data.has(`${SDW_DOCUMENT_CORPUS_NAMESPACE}\0${chunk1}`)).toBe(true);
     expect(storage.data.has(`${SDW_DOCUMENT_CORPUS_NAMESPACE}\0${chunk2}`)).toBe(false);
+  });
+
+  it("signals partial_scope when batch rollback cannot verify raw owner-scope keys", async () => {
+    const documentId = "mem.letta-archive-1.batch-2";
+    const docKey = documentKey(documentId);
+    const chunk0 = documentChunkKey(documentId, "000000", "c000000");
+    const storage = new RollbackFailureStorage(docKey, chunk0);
+    const adapter = makeAdapter(storage, { maxChunkChars: 2 });
+
+    await expect(
+      adapter.putPassages(
+        [
+          { passage_id: "batch-1", text: "ok" },
+          { passage_id: "batch-2", text: "abcd" },
+        ],
+        "user_content",
+      ),
+    ).rejects.toMatchObject({ category: "partial_scope" });
+
+    expect(storage.data.has(`${SDW_DOCUMENT_CORPUS_NAMESPACE}\0${chunk0}`)).toBe(true);
   });
 });
 

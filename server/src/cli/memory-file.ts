@@ -21,6 +21,7 @@ import {
   ingestClaudeCodeMemorySnapshot,
   readClaudeCodeMemoryDirectory,
 } from "../sdw/adapters/claude-code-file-adapter.js";
+import { SdwValidationError } from "../sdw/errors.js";
 import { SdwMemoryBackendAdapter } from "../sdw/adapters/sdw-memory-backend.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
 import { flagValue, hasFlag } from "./argv.js";
@@ -130,6 +131,7 @@ export async function runMemoryIngestCommand(
       harness: parsed.harness,
       owner_ref: parsed.ownerRef,
       error_class: errorName(error),
+      ...errorCategoryDetail(error),
     });
     write(err, `memory_ingest failed: ${errorMessage(error)}\n`);
     return 1;
@@ -193,6 +195,7 @@ export async function runMemoryEmitCommand(
       harness: parsed.harness,
       owner_ref: parsed.ownerRef,
       error_class: errorName(error),
+      ...errorCategoryDetail(error),
     });
     write(err, `memory_emit failed: ${errorMessage(error)}\n`);
     return 1;
@@ -245,7 +248,7 @@ function parseCommonArgs(
  * Read one line from stdin as the fortress passphrase.
  *
  * Failure mode to watch for: a caller that passes `--passphrase-stdin` and then
- * never writes to the pipe. That looks like a wedged command rather than a
+ * never writes to the pipe. That looks like a stuck command rather than a
  * credential problem, so the read is deadline-bounded and an empty result falls
  * through to the normal refusal.
  */
@@ -398,4 +401,8 @@ function errorMessage(error: unknown): string {
 
 function errorName(error: unknown): string {
   return error instanceof Error ? error.name : "Error";
+}
+
+function errorCategoryDetail(error: unknown): Record<string, string> {
+  return error instanceof SdwValidationError ? { error_category: error.category } : {};
 }

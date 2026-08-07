@@ -85,6 +85,10 @@ interface PriorPassage {
   readonly text: string | null;
 }
 
+interface OwnerScopeSnapshot {
+  readonly keys: readonly string[];
+}
+
 export interface SdwMemoryBackendAdapterOptions {
   readonly storage: StorageBackend;
   readonly masterKey: Uint8Array;
@@ -233,6 +237,7 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
     const documentIds = prepared.map((item) => item.documentId);
     return this.withDocumentLocks(documentIds, async () => {
       const prior = await this.capturePriorPassages(prepared);
+      const beforeOwnerScope = await this.captureOwnerScopeSnapshot();
       const transactional = asSdwTransactional(this.storage);
       if (transactional !== null) {
         await transactional.sdwTransaction(async (txn) => {
@@ -252,7 +257,7 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
             await this.corpus.putDocument(item.documentRecord, taint);
           }
         } catch (error) {
-          await this.restorePriorPassages(prior, taint);
+          await this.restoreAndVerifyPriorPassages(prepared, prior, taint, beforeOwnerScope);
           throw error;
         }
       }
@@ -434,29 +439,79 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
 
   /**
    * Compensating undo for a partially applied non-transactional batch: restore
-   * what existed, delete what did not. Best effort by construction, because the
-   * original write error is what the caller must see; a restore that itself
-   * fails leaves a partially updated scope, which is why the transactional
-   * backend is preferred and this path exists only for backends without one.
+   * what existed, delete what did not, then verify the raw owner-scope key
+   * listing and restored contents. If verification cannot prove the pre-state,
+   * the caller gets an explicit partial_scope failure instead of an
+   * all-or-nothing-looking write error.
    */
-  private async restorePriorPassages(
+  private async restoreAndVerifyPriorPassages(
+    prepared: readonly PreparedPassage[],
     prior: readonly PriorPassage[],
     taint: PersistableTaint,
+    beforeOwnerScope: OwnerScopeSnapshot,
   ): Promise<void> {
-    for (const item of [...prior].reverse()) {
+    const failures: unknown[] = [];
+    const attempt = async (fn: () => Promise<void>): Promise<void> => {
       try {
-        if (item.record === null || item.text === null) {
-          await this.deletePassage(this.passageIdOf(item.documentId));
-          continue;
+        await fn();
+      } catch (error) {
+        failures.push(error);
+      }
+    };
+    const preparedByDocumentId = new Map(
+      prepared.map((item) => [item.documentId, item]),
+    );
+
+    for (const item of [...prior].reverse()) {
+      const preparedItem = preparedByDocumentId.get(item.documentId);
+      if (preparedItem === undefined) {
+        failures.push(new Error("SDW memory rollback target missing"));
+        continue;
+      }
+
+      if (item.record === null || item.text === null) {
+        for (const chunkRecord of [...preparedItem.chunkRecords].reverse()) {
+          const key = documentChunkStorageKey(chunkRecord);
+          await attempt(async () => {
+            await this.storage.delete(SDW_DOCUMENT_CORPUS_NAMESPACE, key, true);
+          });
         }
-        for (const chunkRecord of this.rebuildChunkRecords(item.record, item.text)) {
+        await attempt(async () => {
+          await this.storage.delete(
+            SDW_DOCUMENT_CORPUS_NAMESPACE,
+            documentKey(item.documentId),
+            true,
+          );
+        });
+        continue;
+      }
+
+      for (const chunkRecord of this.rebuildChunkRecords(item.record, item.text)) {
+        await attempt(async () => {
           await this.corpus.putChunk(chunkRecord, taint);
-        }
-        await this.corpus.putDocument(item.record, taint);
-      } catch {
-        // Keep undoing the rest; the original insert error stays the thrown one.
+        });
+      }
+      await attempt(async () => {
+        await this.corpus.putDocument(item.record!, taint);
+      });
+
+      for (
+        let ordinal = item.record.chunk_count;
+        ordinal < preparedItem.chunkRecords.length;
+        ordinal++
+      ) {
+        const chunkRecord = preparedItem.chunkRecords[ordinal]!;
+        const key = documentChunkStorageKey(chunkRecord);
+        await attempt(async () => {
+          await this.storage.delete(SDW_DOCUMENT_CORPUS_NAMESPACE, key, true);
+        });
       }
     }
+
+    if (failures.length > 0) {
+      throw partialScopeError();
+    }
+    await this.verifyPriorPassagesRestored(beforeOwnerScope, prior);
   }
 
   private rebuildChunkRecords(
@@ -499,6 +554,42 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
     }
   }
 
+  private async captureOwnerScopeSnapshot(): Promise<OwnerScopeSnapshot> {
+    return { keys: await this.ownerScopeCorpusKeys() };
+  }
+
+  private async verifyPriorPassagesRestored(
+    beforeOwnerScope: OwnerScopeSnapshot,
+    prior: readonly PriorPassage[],
+  ): Promise<void> {
+    const afterKeys = await this.ownerScopeCorpusKeys();
+    if (!sameStrings(afterKeys, beforeOwnerScope.keys)) {
+      throw partialScopeError();
+    }
+    for (const item of prior) {
+      const document = await this.corpus.getDocument(item.documentId);
+      if (item.record === null || item.text === null) {
+        if (document !== null) throw partialScopeError();
+        continue;
+      }
+      if (document === null) throw partialScopeError();
+      if (JSON.stringify(document) !== JSON.stringify(item.record)) {
+        throw partialScopeError();
+      }
+      if ((await this.readPassageText(document)) !== item.text) {
+        throw partialScopeError();
+      }
+    }
+  }
+
+  private async ownerScopeCorpusKeys(): Promise<readonly string[]> {
+    const entries = [
+      ...(await this.storage.list(SDW_DOCUMENT_CORPUS_NAMESPACE, this.documentKeyPrefix())),
+      ...(await this.storage.list(SDW_DOCUMENT_CORPUS_NAMESPACE, this.documentChunkKeyPrefix())),
+    ];
+    return [...new Set(entries.map((entry) => entry.key))].sort();
+  }
+
   private documentId(passageId: string): string {
     assertSdwIdentifier(passageId, "passage_id");
     const documentId = `${MEMORY_PASSAGE_DOCUMENT_PREFIX}.${this.ownerRef}.${passageId}`;
@@ -513,6 +604,10 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
 
   private documentKeyPrefix(): string {
     return `doc.${MEMORY_PASSAGE_DOCUMENT_PREFIX}.${this.ownerRef}.`;
+  }
+
+  private documentChunkKeyPrefix(): string {
+    return `chunk.${MEMORY_PASSAGE_DOCUMENT_PREFIX}.${this.ownerRef}.`;
   }
 
   private async assertDocumentAbsent(documentId: string, txn?: SdwCorpusTxn): Promise<void> {
@@ -546,18 +641,21 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
   }
 
   private async rollbackInsert(documentId: string, writtenChunkKeys: readonly string[]): Promise<void> {
+    const failures: unknown[] = [];
     for (const key of [...writtenChunkKeys].reverse()) {
       try {
         await this.storage.delete(SDW_DOCUMENT_CORPUS_NAMESPACE, key, true);
-      } catch {
-        // Best effort: keep deleting other rollback targets and preserve the
-        // original insert error.
+      } catch (error) {
+        failures.push(error);
       }
     }
     try {
       await this.storage.delete(SDW_DOCUMENT_CORPUS_NAMESPACE, documentKey(documentId), true);
-    } catch {
-      // Best effort: rollback failures must not replace the insert failure.
+    } catch (error) {
+      failures.push(error);
+    }
+    if (failures.length > 0) {
+      throw partialScopeError();
     }
   }
 
@@ -664,6 +762,18 @@ function asSdwTransactional(storage: StorageBackend): SdwTransactionalStorage | 
   return typeof candidate.sdwTransaction === "function"
     ? (candidate as SdwTransactionalStorage)
     : null;
+}
+
+function partialScopeError(): SdwValidationError {
+  return new SdwValidationError(
+    "partial_scope",
+    "SDW memory write failed and rollback could not verify the owner scope; inspect the audit record before retrying",
+  );
+}
+
+function sameStrings(a: readonly string[], b: readonly string[]): boolean {
+  if (a.length !== b.length) return false;
+  return a.every((value, index) => value === b[index]);
 }
 
 function validatePassageDecorators(

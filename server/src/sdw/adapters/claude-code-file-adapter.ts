@@ -170,7 +170,7 @@ export async function ingestClaudeCodeMemoryDirectory(
 }
 
 /**
- * Mirror a snapshot into the vault as ONE all-or-nothing unit, skipping (and
+ * Mirror a snapshot into the vault as one verified unit, skipping (and
  * reporting) any individual file the SDW write gate refuses.
  *
  * Two properties this function must keep, both learned from a real 405-file
@@ -179,9 +179,10 @@ export async function ingestClaudeCodeMemoryDirectory(
  *  - A refused file is a REPORTED SKIP, never a whole-run abort. It is also
  *    never an exemption: the same gate still runs on everything written, and
  *    the refused bytes never reach the vault.
- *  - Whatever is written commits together. A run that committed a prefix and
- *    then threw left a vault that could not be re-imported (every committed id
- *    collides) and could not be told apart from a complete one.
+ *  - A thrown storage failure must either restore the owner scope to its
+ *    pre-write state or surface partial_scope. A run that committed a prefix
+ *    and then threw left a vault that could not be re-imported (every committed
+ *    id collides) and could not be told apart from a complete one.
  *
  * Re-ingest of a changed directory REPLACES the prior passages in place: ids
  * are derived from the source path, so the mirror tracks the source instead of
