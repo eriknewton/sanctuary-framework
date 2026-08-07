@@ -90,6 +90,15 @@ export {
 } from "./local-provisioning-store.js";
 
 export {
+  buildLocalProvisioningActionPreview,
+  type LocalProvisioningAction,
+  type LocalProvisioningActionKind,
+  type LocalProvisioningActionPreview,
+  type LocalProvisioningActionPreviewStatus,
+  type LocalProvisioningActionReason,
+} from "./local-provisioning-actions.js";
+
+export {
   BADGE_LABEL_KEYS,
   BADGE_TRADEOFF_KEYS,
   BACKEND_FALLBACK_STRINGS,
