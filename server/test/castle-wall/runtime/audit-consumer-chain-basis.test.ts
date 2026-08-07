@@ -10,12 +10,10 @@
  *     reconstructed CastleWallAuditEvent (which no producer hashes — the
  *     #1096 root cause).
  *
- *     HONESTY NOTE (stated, not papered over): these vectors rebuild the
- *     producer bodies in TypeScript, so they prove the consumer picks the
- *     signed-body hash — NOT that it matches real Rust/Swift bytes. The Rust
- *     side is covered by the captured cross-language fixture in
- *     `producer-sig-cross-lang.test.ts`; a captured Swift flow-decision
- *     fixture is DEBT (follow-up named in the PR).
+ *     The Rust side is covered by the captured cross-language fixture in
+ *     `producer-sig-cross-lang.test.ts`; the macOS Swift flow-decision path is
+ *     covered below by `swift-flow-decision-vector.json`, which is regenerated
+ *     and checked on the Swift side by `SwiftFlowDecisionFixtureTests`.
  *
  *  2. CONTINUITY MODES — the Linux drain consumes the daemon's COMPLETE WAL
  *     chain, so a prior-hash mismatch is a hard fork (stop, loud, no
@@ -33,6 +31,9 @@
  */
 
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { describe, it, expect, beforeEach } from "vitest";
 import { ed25519 } from "@noble/curves/ed25519";
@@ -46,7 +47,10 @@ import {
   type CriticalEventEnvelope,
 } from "../../../src/castle-wall/runtime/audit-consumer.js";
 import { buildCriticalEnvelopeFromDrainEvent } from "../../../src/castle-wall/runtime/linux-audit-drain.js";
-import { producerSigningBytes } from "../../../src/castle-wall/runtime/producer-signature.js";
+import {
+  producerSigningBytes,
+  verifyProducerSignature,
+} from "../../../src/castle-wall/runtime/producer-signature.js";
 import { buildAuditEvent } from "../../../src/castle-wall/audit/builder.js";
 import type { CastleWallAuditEvent } from "../../../src/castle-wall/audit/events.js";
 import type { AuditDrainEvent } from "../../../src/castle-wall/ipc/messages.js";
@@ -109,6 +113,41 @@ const daemonPubB64 = toBase64url(ed25519.getPublicKey(daemonPriv));
 const NOW = 1_750_000_000_000;
 const SIGNED_TS = NOW - 1000;
 const FORTRESS_ID = "f";
+
+interface SwiftFlowDecisionVector {
+  pubkey_b64url: string;
+  canonical: string;
+  canonical_sha256_hex: string;
+  captured_at_unix_ms: number;
+  seq: number;
+  prior_sha256_hex: string | null;
+  key_id: string;
+  sig_b64url: string;
+  flow: {
+    fortress_id: string;
+    event_type: "egress_blocked" | "egress_allowed";
+    agent_id: string;
+    agent_template: string;
+    dest_host: string | null;
+    dest_ip: string;
+    dest_port: number;
+    dest_protocol: "tcp" | "udp";
+    decision: "drop" | "allow";
+    matched_rule_id: string | null;
+    recorded_at: string;
+  };
+}
+
+function loadSwiftFlowDecisionVector(): SwiftFlowDecisionVector {
+  const here = dirname(fileURLToPath(import.meta.url));
+  const fixturePath = join(
+    here,
+    "..",
+    "fixtures",
+    "swift-flow-decision-vector.json",
+  );
+  return JSON.parse(readFileSync(fixturePath, "utf8")) as SwiftFlowDecisionVector;
+}
 
 /** Valid macOS audit_token_t hex for a non-root uid (mirrors producer-auth tests). */
 function auditTokenForRuid(uid: number): string {
@@ -261,6 +300,39 @@ function macFlowEnvelope(input: {
   };
 }
 
+function swiftFixtureFlowEnvelope(v: SwiftFlowDecisionVector): CriticalEventEnvelope {
+  const event: CastleWallAuditEvent = buildAuditEvent({
+    timestamp: v.flow.recorded_at,
+    fortress_id: v.flow.fortress_id,
+    event_type: v.flow.event_type,
+    agent: { id: v.flow.agent_id, template: v.flow.agent_template },
+    destination: {
+      host: v.flow.dest_host,
+      ip: v.flow.dest_ip,
+      port: v.flow.dest_port,
+      protocol: v.flow.dest_protocol,
+    },
+    decision: null,
+    rule_id: v.flow.matched_rule_id,
+    details: { seq: v.seq, prior_sha256_hex: v.prior_sha256_hex },
+  });
+  return {
+    event,
+    ack: async () => {},
+    producer: {
+      eventCanonicalJson: v.canonical,
+      capturedAtUnixMs: v.captured_at_unix_ms,
+      seq: v.seq,
+      signatureB64url: v.sig_b64url,
+      keyId: v.key_id,
+    },
+    producerSubjectBinding: {
+      kind: "macos_audit_token",
+      fortressId: v.flow.fortress_id,
+    },
+  };
+}
+
 function completeConsumer(
   sink: AuditSink,
   extra?: ConstructorParameters<typeof AuditConsumer>[2],
@@ -318,6 +390,41 @@ describe("chain basis vectors: consumer head == producer next-prior", () => {
         rustDrainEnvelope({ canonical: body2, seq: 1, prior: oldBasisPrior }),
       ),
     ).rejects.toThrow("wal_chain_verification_failed");
+  });
+
+  it("macOS Swift fixture: TS verifies and chains over the exact Swift-emitted body", async () => {
+    const fixture = loadSwiftFlowDecisionVector();
+    expect(fixture.key_id).toBe(CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1);
+    expect(sha256Hex(fixture.canonical)).toBe(fixture.canonical_sha256_hex);
+    expect(
+      verifyProducerSignature(
+        {
+          eventCanonicalJson: fixture.canonical,
+          capturedAtUnixMs: fixture.captured_at_unix_ms,
+          seq: fixture.seq,
+          signatureB64url: fixture.sig_b64url,
+          keyId: fixture.key_id,
+        },
+        fixture.pubkey_b64url,
+      ),
+    ).toEqual({ ok: true });
+
+    const sink = new RecordingSink();
+    const consumer = subsetConsumer(sink, {
+      pinnedProducerKeyB64url: fixture.pubkey_b64url,
+    });
+    await consumer.ingestCritical(swiftFixtureFlowEnvelope(fixture));
+
+    expect(consumer.getWalChainState().lastEventChainHash).toBe(
+      fixture.canonical_sha256_hex,
+    );
+    const accepted = sink.entries.find((e) => e.operation === "egress_blocked");
+    expect(accepted?.details?.[CASTLE_WALL_CHAIN_BASIS_DETAIL_KEY]).toBe(
+      CASTLE_WALL_CHAIN_BASIS_PRODUCER_SIGNED_BODY,
+    );
+    expect(
+      accepted?.details?.[CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY],
+    ).toBe(fixture.canonical);
   });
 
   it("macOS flow writer: head after decision 1 is sha256(signed body 1); adjacent decision 2 chains", async () => {
