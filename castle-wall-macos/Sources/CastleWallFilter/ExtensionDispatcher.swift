@@ -345,6 +345,8 @@ public final class ExtensionDispatcher {
             return "state-persistence-failed(\(detail))"
         case .chainAdvancedBeforeSignReply:
             return "chain-advanced-before-sign-reply"
+        case .signingQueueFull(let maxQueued, let droppedCount):
+            return "signing-queue-full(max_queued=\(maxQueued),dropped_count=\(droppedCount))"
         }
     }
 
