@@ -1,4 +1,5 @@
 export const TOP_LEVEL_SUBCOMMANDS = [
+  "agent",
   "agents",
   "anomaly",
   "audit",
@@ -23,6 +24,7 @@ export const TOP_LEVEL_SUBCOMMANDS = [
   "export-passphrase",
   "federation",
   "file-grant",
+  "fleet",
   "generate",
   "identity",
   "import-exit-bundle",
