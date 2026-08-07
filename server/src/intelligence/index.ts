@@ -117,6 +117,11 @@ export {
 } from "./local-provisioning-consent.js";
 
 export {
+  buildLocalProvisioningDegradedSurfaceStatuses,
+  type BuildLocalProvisioningDegradedSurfaceStatusesOptions,
+} from "./local-provisioning-status.js";
+
+export {
   BADGE_LABEL_KEYS,
   BADGE_TRADEOFF_KEYS,
   BACKEND_FALLBACK_STRINGS,
