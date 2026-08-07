@@ -39,12 +39,12 @@ import type {
   LifecycleEvent,
   UsageEvent,
 } from "./types.js";
+import { isBase64urlToken } from "../core/token-grammar.js";
 
 // ═══════════════════════════════════════════════════════════════════════
 // Primitives
 // ═══════════════════════════════════════════════════════════════════════
 
-const BASE64URL = /^[A-Za-z0-9_-]+$/;
 /**
  * ISO 8601 UTC with required `Z` terminator and second precision or finer.
  * Rejects offsets other than `Z` so receivers don't need timezone math.
@@ -56,7 +56,7 @@ function isNonEmptyString(v: unknown): v is string {
 }
 
 function isBase64url(v: unknown): v is string {
-  return typeof v === "string" && v.length > 0 && BASE64URL.test(v);
+  return isBase64urlToken(v);
 }
 
 function isISOUtc(v: unknown): v is string {

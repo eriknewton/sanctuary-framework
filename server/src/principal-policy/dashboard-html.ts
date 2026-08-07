@@ -2,6 +2,12 @@ import {
   PAPER_INK_ROOT_TOKENS_CSS,
   THEME_BOOTSTRAP_SCRIPT,
 } from "../dashboard/design-tokens.js";
+import { ASCII_LABEL_RE_SOURCE } from "../core/token-grammar.js";
+
+// Emit this regex source inside an inline `<script>`. JSON.stringify escapes JS
+// string syntax; escaping `<` separately prevents a future `</script>` sequence
+// in the shared source from becoming an HTML parser break-out.
+const INLINE_ASCII_LABEL_RE_SOURCE = JSON.stringify(ASCII_LABEL_RE_SOURCE).replace(/</g, "\\u003c");
 
 export function generateLoginHTML(options: { serverVersion: string }): string {
   return `<!DOCTYPE html>
@@ -3224,6 +3230,7 @@ export function generateDashboardHTML(options: {
       const transportSelect = document.getElementById('new-server-transport');
       const stdioFields = document.getElementById('stdio-fields');
       const sseFields = document.getElementById('sse-fields');
+      const serverNameRe = new RegExp(${INLINE_ASCII_LABEL_RE_SOURCE});
 
       if (!addBtn || !form) return;
 
@@ -3251,7 +3258,7 @@ export function generateDashboardHTML(options: {
         const tier = parseInt(document.getElementById('new-server-tier').value, 10);
 
         if (!name) { alert('Server name is required'); return; }
-        if (!/^[a-zA-Z0-9_-]+$/.test(name)) { alert('Name must contain only letters, numbers, hyphens, and underscores'); return; }
+        if (!serverNameRe.test(name)) { alert('Name must contain only letters, numbers, hyphens, and underscores'); return; }
 
         const transport = { type };
         if (type === 'stdio') {
