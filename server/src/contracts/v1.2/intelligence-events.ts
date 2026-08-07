@@ -55,6 +55,7 @@ import type {
   SubstrateChoice,
   SubstrateFailureClass,
 } from "../../intelligence/types.js";
+import type { ModelManifestTier } from "../../intelligence/model-manifest.js";
 
 /**
  * Common metadata header on every v1.2 intelligence audit payload.
@@ -224,6 +225,67 @@ export interface IntelligenceTier2BindingPinnedPayload extends IntelligenceAudit
   pinned_to: "local";
 }
 
+export type IntelligenceLocalModelRuntime = "ollama";
+
+export type IntelligenceModelProvisionRefusalReason =
+  | "ollama_unreachable"
+  | "operator_declined"
+  | "hardware_below_baseline"
+  | "tier_exceeds_hardware"
+  | "manifest_untrusted"
+  | "model_missing"
+  | "pull_failed"
+  | "digest_unavailable"
+  | "digest_mismatch";
+
+/**
+ * A consented local model pull finished and the pulled model's observed
+ * manifest digest still matched the signed model manifest. This contract is
+ * reserved for the future provisioning executor; declaring it here does not
+ * wire an emitter or perform any host mutation.
+ */
+export interface IntelligenceModelPullPayload extends IntelligenceAuditPayloadHeader {
+  kind: "model_pull";
+  surfaces: Surface[];
+  tier: ModelManifestTier;
+  model_id: string;
+  runtime: IntelligenceLocalModelRuntime;
+  runtime_tag: string;
+  manifest_version: string;
+  expected_weights_sha256: string;
+  observed_manifest_digest_sha256: string;
+  operator_consent_event_id: string;
+  latency_ms: number;
+  requires_operator_consent: true;
+  requires_network_egress: true;
+  mutates_host: true;
+  writes_fortress_state: false;
+}
+
+/**
+ * Local provisioning refused before claiming any model usable. Emitted by the
+ * future provisioning executor for fail-closed paths only; source-only planning
+ * and receipt slices may construct this shape for previews/tests but do not
+ * append audit entries.
+ */
+export interface IntelligenceModelProvisionRefusedPayload extends IntelligenceAuditPayloadHeader {
+  kind: "model_provision_refused";
+  surfaces: Surface[];
+  tier: ModelManifestTier | null;
+  model_id: string | null;
+  runtime: IntelligenceLocalModelRuntime | null;
+  runtime_tag: string | null;
+  manifest_version: string | null;
+  expected_weights_sha256: string | null;
+  observed_manifest_digest_sha256: string | null;
+  reason: IntelligenceModelProvisionRefusalReason;
+  operator_consent_event_id: string | null;
+  requires_operator_consent: boolean;
+  requires_network_egress: boolean;
+  mutates_host: false;
+  writes_fortress_state: false;
+}
+
 /** Discriminated union of every v1.2 intelligence audit payload. */
 export type IntelligenceAuditPayload =
   | IntelligenceSubstrateChosenPayload
@@ -233,4 +295,6 @@ export type IntelligenceAuditPayload =
   | IntelligenceConfigLoadedPayload
   | IntelligenceConfigResetPayload
   | IntelligenceBulkSubstrateChosenPayload
-  | IntelligenceTier2BindingPinnedPayload;
+  | IntelligenceTier2BindingPinnedPayload
+  | IntelligenceModelPullPayload
+  | IntelligenceModelProvisionRefusedPayload;
