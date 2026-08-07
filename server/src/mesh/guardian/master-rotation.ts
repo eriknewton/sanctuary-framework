@@ -76,6 +76,11 @@ export function buildMasterRotationPayload(params: {
     proof,
     pinned_roster: params.pinned_roster,
   });
+  // Producer mapping invariant: the ceremony collects signatures by guardian_id,
+  // but the wire payload carries guardian_pubkey so receivers bind the proof to
+  // their own pinned roster, not to producer-supplied ids. The non-null lookup
+  // below is safe only because verifyGuardianQuorum already proved every id is
+  // in the pinned roster and that each signature covers this canonical input.
   return {
     old_master_pubkey: params.input.old_master_pubkey,
     new_master_pubkey: params.input.new_master_pubkey,
@@ -152,8 +157,16 @@ export function acceptMasterRotation(
         `quorum signature from unknown guardian pubkey ${s.guardian_pubkey} (not in pinned roster v${pinned_roster.version})`
       );
     }
+    // Receiver identity-reducer invariant: the event carries public keys, but
+    // quorum counting happens on pinned guardian_id entries. A pubkey that does
+    // not resolve in the receiver's roster contributes nothing; the sender's
+    // roster version or claimed ids are never trusted across the wire.
     return { guardian_id: guardian.guardian_id, signature: s.signature };
   });
+  // Receiver canonical-input invariant: rebuild the exact input from accepted
+  // event fields plus the receiver's pinned fortress_id, then let
+  // verifyGuardianQuorum enforce roster_version, distinct ids, threshold, and
+  // Ed25519 signatures. The payload cannot smuggle an alternate fortress_id.
   verifyGuardianQuorum({
     input,
     proof: {
