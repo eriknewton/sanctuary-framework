@@ -109,6 +109,8 @@ export {
   OllamaClient,
   LOCAL_CAPABILITY,
   type OllamaClientConfig,
+  type OllamaModelDigestReport,
+  type OllamaPullResult,
 } from "./substrates/local.js";
 
 export {

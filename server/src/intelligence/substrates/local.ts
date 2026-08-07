@@ -59,6 +59,29 @@ export interface OllamaTagsResponse {
   }>;
 }
 
+export interface OllamaModelDigestReport {
+  /** The requested Ollama model tag. */
+  model: string;
+  /** Top-level Ollama manifest digest, when the daemon reports one. */
+  manifestDigestSha256: string | null;
+  /** Constituent content-addressed blob digests reported by Ollama. */
+  blobSha256: string[];
+}
+
+export type OllamaPullResult =
+  | {
+      ok: true;
+      status: string;
+      completedAt: string;
+    }
+  | {
+      ok: false;
+      failureClass: SubstrateResponse["failureClass"];
+      message: string;
+      statusCode?: number;
+      completedAt: string;
+    };
+
 export class OllamaClient {
   private endpoint: string;
   private timeoutMs: number;
@@ -91,6 +114,90 @@ export class OllamaClient {
       }
     } catch {
       return null;
+    }
+  }
+
+  /**
+   * Ask Ollama for model metadata and normalize any SHA-256 material it
+   * reports. P1 provisioning treats missing digests as a refusal later; this
+   * method only models what the daemon said, without inventing trust.
+   */
+  async showModel(model: string): Promise<OllamaModelDigestReport | null> {
+    try {
+      const ctl = new AbortController();
+      const timer = setTimeout(() => ctl.abort(), HARDWARE_PROBE_TIMEOUT_MS);
+      try {
+        // Ollama's public API uses POST /api/show. The "verbose" flag asks for
+        // the richest daemon metadata available so later P1 digest checks can
+        // compare against Sanctuary's signed manifest without another round trip.
+        const res = await this.fetchImpl(`${this.endpoint}/api/show`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ model, verbose: true }),
+          signal: ctl.signal,
+        });
+        if (!res.ok) return null;
+        const body = await res.json();
+        return normalizeShowResponse(model, body);
+      } finally {
+        clearTimeout(timer);
+      }
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Pull a model through Ollama. This only wraps the daemon primitive; callers
+   * still owe consent, egress disclosure, signed-manifest verification, and
+   * post-pull digest comparison before marking any surface provisioned.
+   */
+  async pullModel(model: string): Promise<OllamaPullResult> {
+    try {
+      const ctl = new AbortController();
+      const timer = setTimeout(() => ctl.abort(), this.timeoutMs);
+      try {
+        const res = await this.fetchImpl(`${this.endpoint}/api/pull`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ model, stream: false }),
+          signal: ctl.signal,
+        });
+        const text = await res.text().catch(() => "");
+        if (!res.ok) {
+          return {
+            ok: false,
+            failureClass: classifyHttpError(res.status, text),
+            message: `ollama pull HTTP ${res.status}`,
+            statusCode: res.status,
+            completedAt: new Date().toISOString(),
+          };
+        }
+        const body = parseJsonObject(text);
+        if (typeof body?.error === "string" && body.error.length > 0) {
+          return {
+            ok: false,
+            failureClass: "substrate_misconfigured",
+            message: "ollama pull failed",
+            completedAt: new Date().toISOString(),
+          };
+        }
+        const status =
+          typeof body?.status === "string" && body.status.length > 0
+            ? body.status
+            : "success";
+        return { ok: true, status, completedAt: new Date().toISOString() };
+      } finally {
+        clearTimeout(timer);
+      }
+    } catch (err) {
+      const aborted = err instanceof Error && err.name === "AbortError";
+      return {
+        ok: false,
+        failureClass: aborted ? "substrate_timeout" : "substrate_unavailable",
+        message: aborted ? "ollama pull timeout" : "ollama unreachable",
+        completedAt: new Date().toISOString(),
+      };
     }
   }
 
@@ -241,6 +348,72 @@ function classifyHttpError(
   if (status === 404 && /model.*not found/i.test(body)) return "substrate_misconfigured";
   if (status >= 500) return "substrate_unavailable";
   return "substrate_capability_unsupported";
+}
+
+function parseJsonObject(text: string): Record<string, unknown> | null {
+  try {
+    const parsed = JSON.parse(text);
+    return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+const SHA256_REFERENCE = /\bsha256[:-]([0-9a-fA-F]{64})\b/g;
+
+function normalizeShowResponse(
+  model: string,
+  body: unknown,
+): OllamaModelDigestReport {
+  const manifestDigestSha256 = normalizeDigest(
+    readStringProperty(body, "digest") ?? readStringProperty(body, "manifest_digest"),
+  );
+  const blobSha256 = extractSha256Digests(body);
+  return {
+    model,
+    manifestDigestSha256,
+    blobSha256: blobSha256.filter((digest) => digest !== manifestDigestSha256),
+  };
+}
+
+function readStringProperty(value: unknown, key: string): string | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return null;
+  }
+  const found = (value as Record<string, unknown>)[key];
+  return typeof found === "string" ? found : null;
+}
+
+function normalizeDigest(value: string | null): string | null {
+  if (value === null) return null;
+  const match = /^sha256[:-]([0-9a-fA-F]{64})$/.exec(value);
+  return match?.[1]?.toLowerCase() ?? null;
+}
+
+function extractSha256Digests(value: unknown): string[] {
+  const found = new Set<string>();
+  const visit = (node: unknown): void => {
+    if (typeof node === "string") {
+      for (const match of node.matchAll(SHA256_REFERENCE)) {
+        const digest = match[1];
+        if (digest !== undefined) found.add(digest.toLowerCase());
+      }
+      return;
+    }
+    if (Array.isArray(node)) {
+      for (const item of node) visit(item);
+      return;
+    }
+    if (typeof node === "object" && node !== null) {
+      for (const item of Object.values(node as Record<string, unknown>)) {
+        visit(item);
+      }
+    }
+  };
+  visit(value);
+  return [...found].sort();
 }
 
 function failure(args: {
