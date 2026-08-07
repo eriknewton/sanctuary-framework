@@ -88,7 +88,13 @@ final class ExtensionDispatcherTests: XCTestCase {
 
     final class HoldingAuditProducerSigner: AuditProducerSigning {
         let privateKey: Curve25519.Signing.PrivateKey
-        private(set) var replies: [() -> Void] = []
+        private let lock = NSLock()
+        private var storedReplies: [() -> Void] = []
+        var replies: [() -> Void] {
+            lock.lock()
+            defer { lock.unlock() }
+            return storedReplies
+        }
 
         init(privateKey: Curve25519.Signing.PrivateKey) {
             self.privateKey = privateKey
@@ -99,13 +105,16 @@ final class ExtensionDispatcherTests: XCTestCase {
             reply: @escaping (Data?, String?) -> Void
         ) {
             let key = privateKey
-            replies.append {
+            lock.lock()
+            storedReplies.append {
                 reply(try? key.signature(for: payload), nil)
             }
+            lock.unlock()
         }
 
         func resolve(_ index: Int) {
-            replies[index]()
+            let reply = replies[index]
+            reply()
         }
     }
 
@@ -125,6 +134,11 @@ final class ExtensionDispatcherTests: XCTestCase {
 
     func volatileStateStore() -> AuditProducerChainStateStore {
         return VolatileAuditProducerChainStateStore()
+    }
+
+    func hashSignedBody(_ canonicalJson: String) -> String {
+        let digest = SHA256.hash(data: Data(canonicalJson.utf8))
+        return digest.map { String(format: "%02x", $0) }.joined()
     }
 
     func makeFlow(
@@ -985,46 +999,142 @@ final class ExtensionDispatcherTests: XCTestCase {
         XCTAssertTrue(detail.contains("could not be saved"))
     }
 
-    func test_auditProducerChain_staleConcurrentSignReplyDoesNotEmitDuplicateSeq() {
+    func test_auditProducerChain_serializesOverlappingFlowAndAvailabilitySignRequests() throws {
         let privateKey = Curve25519.Signing.PrivateKey()
         let signer = HoldingAuditProducerSigner(privateKey: privateKey)
         let chain = AuditProducerChain(stateStore: volatileStateStore())
-        let firstExp = expectation(description: "first completion")
-        let secondExp = expectation(description: "second completion")
-        var firstResult: Result<IpcMessage, AuditProducerSigningError>?
-        var secondResult: Result<IpcMessage, AuditProducerSigningError>?
+        let flowExp = expectation(description: "flow completion")
+        let availabilityExp = expectation(description: "availability completion")
+        var flowResult: Result<IpcMessage, AuditProducerSigningError>?
+        var availabilityResult: Result<IpcMessage, AuditProducerSigningError>?
+        let enforcement = EnforcementAvailabilitySnapshotBody(
+            leaseState: "live",
+            leaseReason: "ok",
+            manifestState: "applied",
+            manifestSignatureB64url: "manifest-signature",
+            providerBound: true,
+            producerClaimedAt: "2025-10-09T08:53:20Z"
+        )
 
         chain.buildSignedFlowDecision(
             outcome: .allow(matchedRuleId: "r-allow-1"),
             flow: makeFlow(host: "api.openai.com"),
+            recordedAt: Date(timeIntervalSince1970: 1_760_000_000),
             signer: signer
         ) { r in
-            firstResult = r
+            flowResult = r
+            flowExp.fulfill()
+        }
+        chain.buildSignedAvailabilityReport(
+            enforcement: enforcement,
+            fortressId: "agent-7",
+            reportedAt: Date(timeIntervalSince1970: 1_760_000_001),
+            signer: signer
+        ) { r in
+            availabilityResult = r
+            availabilityExp.fulfill()
+        }
+        let activeDeadline = Date().addingTimeInterval(1)
+        while signer.replies.count < 1 && Date() < activeDeadline {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.01))
+        }
+        XCTAssertEqual(
+            signer.replies.count,
+            1,
+            "only one audit-producer sign call may be in flight before the cursor advances"
+        )
+        signer.resolve(0)
+        wait(for: [flowExp], timeout: 2)
+        guard case .success(.flowDecisionRecorded(let flowBody))? = flowResult else {
+            return XCTFail("first flow should sign successfully before availability starts")
+        }
+        let flowProducer = try XCTUnwrap(flowBody.producer)
+        XCTAssertEqual(flowProducer.seq, 0)
+
+        let queuedDeadline = Date().addingTimeInterval(1)
+        while signer.replies.count < 2 && Date() < queuedDeadline {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.01))
+        }
+        XCTAssertEqual(
+            signer.replies.count,
+            2,
+            "queued availability signing should start after the flow advances the cursor"
+        )
+        signer.resolve(1)
+        wait(for: [availabilityExp], timeout: 2)
+        guard case .success(.enforcementAvailabilityReport(let availabilityBody))? = availabilityResult else {
+            return XCTFail("queued availability report should sign successfully")
+        }
+        let availabilityProducer = try XCTUnwrap(availabilityBody.producer)
+        XCTAssertEqual(availabilityProducer.seq, 1)
+        XCTAssertEqual(
+            availabilityProducer.priorSha256Hex,
+            hashSignedBody(flowProducer.eventCanonicalJson)
+        )
+    }
+
+    func test_auditProducerChain_failsLoudlyWhenSigningQueueOverflows() {
+        let privateKey = Curve25519.Signing.PrivateKey()
+        let signer = HoldingAuditProducerSigner(privateKey: privateKey)
+        let chain = AuditProducerChain(
+            maxQueuedSigningJobs: 1,
+            stateStore: volatileStateStore()
+        )
+        let firstExp = expectation(description: "active signing completion")
+        let queuedExp = expectation(description: "queued signing completion")
+        let overflowExp = expectation(description: "overflow signing completion")
+        var queuedSeq: UInt64?
+        var overflowResult: Result<IpcMessage, AuditProducerSigningError>?
+
+        chain.buildSignedFlowDecision(
+            outcome: .allow(matchedRuleId: "r-active"),
+            flow: makeFlow(host: "api.active.example"),
+            signer: signer
+        ) { _ in
             firstExp.fulfill()
         }
         chain.buildSignedFlowDecision(
-            outcome: .allow(matchedRuleId: "r-allow-2"),
-            flow: makeFlow(host: "api.anthropic.com"),
+            outcome: .allow(matchedRuleId: "r-queued"),
+            flow: makeFlow(host: "api.queued.example"),
             signer: signer
         ) { r in
-            secondResult = r
-            secondExp.fulfill()
+            if case .success(.flowDecisionRecorded(let body)) = r {
+                queuedSeq = body.producer?.seq
+            }
+            queuedExp.fulfill()
         }
-        XCTAssertEqual(signer.replies.count, 2)
-
-        signer.resolve(1)
-        wait(for: [secondExp], timeout: 2)
-        guard case .success(.flowDecisionRecorded(let winningBody))? = secondResult else {
-            return XCTFail("one in-flight signer reply should win")
+        chain.buildSignedFlowDecision(
+            outcome: .allow(matchedRuleId: "r-overflow"),
+            flow: makeFlow(host: "api.overflow.example"),
+            signer: signer
+        ) { r in
+            overflowResult = r
+            overflowExp.fulfill()
         }
-        XCTAssertEqual(winningBody.producer?.seq, 0)
 
+        wait(for: [overflowExp], timeout: 2)
+        guard case .failure(.signingQueueFull(let maxQueued, let droppedCount))? = overflowResult else {
+            return XCTFail("overflow must fail loudly as signingQueueFull")
+        }
+        XCTAssertEqual(maxQueued, 1)
+        XCTAssertEqual(droppedCount, 1)
+
+        let activeDeadline = Date().addingTimeInterval(1)
+        while signer.replies.count < 1 && Date() < activeDeadline {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.01))
+        }
+        XCTAssertEqual(signer.replies.count, 1)
         signer.resolve(0)
         wait(for: [firstExp], timeout: 2)
-        guard case .failure(let staleError)? = firstResult else {
-            return XCTFail("the stale same-seq reply must not emit")
+
+        let queuedDeadline = Date().addingTimeInterval(1)
+        while signer.replies.count < 2 && Date() < queuedDeadline {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.01))
         }
-        XCTAssertEqual(staleError, .chainAdvancedBeforeSignReply)
+        XCTAssertEqual(signer.replies.count, 2)
+        signer.resolve(1)
+        wait(for: [queuedExp], timeout: 2)
+        XCTAssertEqual(queuedSeq, 1)
     }
 
     func test_auditProducerChain_chainsFlowAndAvailabilityOverSignedWalBody() throws {
