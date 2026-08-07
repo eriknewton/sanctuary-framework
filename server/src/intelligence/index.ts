@@ -61,6 +61,17 @@ export {
 } from "./model-manifest.js";
 
 export {
+  buildLocalProvisioningPlan,
+  type BuildLocalProvisioningPlanParams,
+  type LocalProvisioningBlockReason,
+  type LocalProvisioningModelPlan,
+  type LocalProvisioningModelStatus,
+  type LocalProvisioningPlan,
+  type LocalProvisioningPlanStatus,
+  type LocalProvisioningSurfaceBinding,
+} from "./local-provisioning-plan.js";
+
+export {
   BADGE_LABEL_KEYS,
   BADGE_TRADEOFF_KEYS,
   BACKEND_FALLBACK_STRINGS,
