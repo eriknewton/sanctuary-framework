@@ -770,6 +770,8 @@ describe("castle-wall wire constants agree across TypeScript, Rust, and Swift", 
   const TS = "server/src/castle-wall/constants.ts";
   const RUST = "castle-wall-daemon/src/lib.rs";
   const SWIFT = "castle-wall-macos/Sources/CastleWallIPC/Constants.swift";
+  const SWIFT_FRAMING_TEST =
+    "castle-wall-macos/Tests/CastleWallIPCTests/FramingTests.swift";
 
   /** Mirrored in all three languages. Numerics included deliberately. */
   const triLingual: ReadonlyArray<readonly [string, string, string]> = [
@@ -832,6 +834,24 @@ describe("castle-wall wire constants agree across TypeScript, Rust, and Swift", 
     ).toBe(true);
     expect(read(RUST).includes("server/src/castle-wall/constants.ts")).toBe(true);
     expect(read(SWIFT).includes("server/src/castle-wall/constants.ts")).toBe(true);
+  });
+
+  it("Swift framing tests reference the shared Content-Length constant", () => {
+    expect(read(SWIFT_FRAMING_TEST)).toContain(
+      "CastleWallConstants.ipcContentLengthHeader"
+    );
+  });
+
+  it("Swift framing tests do not re-type Content-Length frame literals", () => {
+    const hardcoded = read(SWIFT_FRAMING_TEST)
+      .split("\n")
+      .filter(
+        (line) =>
+          /["']Content-Length/i.test(line) &&
+          !line.includes("ipcContentLengthHeader")
+      )
+      .map((line) => line.trim());
+    expect(hardcoded).toEqual([]);
   });
 });
 
