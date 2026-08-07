@@ -82,6 +82,14 @@ export {
 } from "./local-provisioning-receipt.js";
 
 export {
+  applyLocalProvisioningReceiptToStore,
+  type ApplyLocalProvisioningReceiptToStoreParams,
+  type ApplyLocalProvisioningReceiptToStoreResult,
+  type LocalProvisioningStoreApplyRefusalReason,
+  type LocalProvisioningStoreApplyStatus,
+} from "./local-provisioning-store.js";
+
+export {
   BADGE_LABEL_KEYS,
   BADGE_TRADEOFF_KEYS,
   BACKEND_FALLBACK_STRINGS,
