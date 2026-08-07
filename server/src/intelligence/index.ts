@@ -122,6 +122,13 @@ export {
 } from "./local-provisioning-status.js";
 
 export {
+  applyLocalProvisioningStatusOverlay,
+  LocalProvisioningStatusOverlayError,
+  type ApplyLocalProvisioningStatusOverlayResult,
+  type LocalProvisioningStatusOverlayErrorCode,
+} from "./local-provisioning-status-overlay.js";
+
+export {
   BADGE_LABEL_KEYS,
   BADGE_TRADEOFF_KEYS,
   BACKEND_FALLBACK_STRINGS,
