@@ -17,6 +17,18 @@ export const INTEL_OPS = {
   CONFIG_LOADED: "intelligence_config_loaded",
   CONFIG_RESET: "intelligence_config_reset",
   /**
+   * Reserved for the local-intelligence provisioning executor's successful
+   * model download. Defining the op string here before wiring emission keeps
+   * future audit producers from inventing ad hoc names.
+   */
+  MODEL_PULL: "intelligence_model_pull",
+  /**
+   * Reserved for fail-closed provisioning paths: absent runtime, operator
+   * decline, below-baseline hardware, bad manifest, pull failure, or digest
+   * mismatch. Emission wiring is deliberately outside this source-only slice.
+   */
+  MODEL_PROVISION_REFUSED: "intelligence_model_provision_refused",
+  /**
    * Operator picked a substrate and applied it to every surface at once
    * via the "Apply to all surfaces" affordance (Finding SS,
    * v1.2.0-rc.1). One audit entry per bulk apply, even though the

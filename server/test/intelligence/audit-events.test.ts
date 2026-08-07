@@ -12,9 +12,21 @@ describe("audit operation name constants", () => {
       PII_REDACTION_EVENT: "intelligence_pii_redaction_event",
       CONFIG_LOADED: "intelligence_config_loaded",
       CONFIG_RESET: "intelligence_config_reset",
+      MODEL_PULL: "intelligence_model_pull",
+      MODEL_PROVISION_REFUSED: "intelligence_model_provision_refused",
       BULK_SUBSTRATE_CHOSEN: "intelligence_bulk_substrate_chosen",
       TIER2_BINDING_PINNED: "query_anonymity_tier2_binding_pinned",
     });
+  });
+
+  it("names local model provisioning audit ops under the intelligence prefix", () => {
+    expect([
+      INTEL_OPS.MODEL_PULL,
+      INTEL_OPS.MODEL_PROVISION_REFUSED,
+    ]).toEqual([
+      "intelligence_model_pull",
+      "intelligence_model_provision_refused",
+    ]);
   });
 
   it("maps operator chat operation keys to stable audit operation names", () => {
