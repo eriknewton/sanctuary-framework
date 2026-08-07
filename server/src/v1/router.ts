@@ -88,8 +88,15 @@ function sessionClaims(
 ): V1SessionClaims | null {
   const header = req.headers.authorization;
   if (!header) return null;
+  // Bearer-boundary invariant: /v1 accepts only the ceremony-minted
+  // SESSION_TOKEN shape (`Authorization: Bearer <token>`). The long-lived
+  // dashboard auth token, alternate schemes, malformed spacing, and empty
+  // bearer values all collapse to null so the router emits the same generic
+  // 401 and never reveals which credential class failed.
   const parts = header.split(" ");
   if (parts.length !== 2 || parts[0] !== "Bearer" || !parts[1]) return null;
+  // validateToken owns the cryptographic checks (GCM tag, expiry, generation);
+  // the router never decodes header bytes into claims itself.
   return ctx.sessions.validateToken(parts[1]);
 }
 
