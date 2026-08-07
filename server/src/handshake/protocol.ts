@@ -199,7 +199,11 @@ export function completeHandshake(
     return { error: `Responder SHR verification failed: ${shrResult.errors.join(", ")}` };
   }
 
-  // Verify the responder signed our nonce correctly
+  // HS-3 liveness gate: this is the initiator-side trust-upgrade boundary.
+  // SHR validity alone proves only that the SHR is well signed; the responder
+  // earns verified:true / liveness_proven:true only after signing OUR session
+  // nonce with the key named by response.shr.signed_by. Do not move either
+  // trust flag above this check.
   const responderPublicKey = fromBase64url(response.shr.signed_by);
   const ourNonceBytes = stringToBytes(session.our_nonce);
   const nonceSignatureBytes = fromBase64url(response.initiator_nonce_signature);
@@ -299,7 +303,9 @@ export function verifyCompletion(
     };
   }
 
-  // Verify the initiator signed our nonce
+  // HS-3 responder-side mirror: the responder marks the handshake verified
+  // only if the initiator signs OUR responder nonce. Do not derive `verified`,
+  // trust_tier, or liveness_proven from SHR validity alone.
   const initiatorPublicKey = fromBase64url(session.their_shr.signed_by);
   const ourNonceBytes = stringToBytes(session.our_nonce);
   const nonceSignatureBytes = fromBase64url(completion.responder_nonce_signature);
