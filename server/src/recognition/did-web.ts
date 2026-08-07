@@ -58,6 +58,7 @@ import { ed25519 } from "@noble/curves/ed25519";
 import { fromBase64url, toBase64url, stringToBytes } from "../core/encoding.js";
 import { hashToString } from "../core/hashing.js";
 import { generateKeypair } from "../core/identity.js";
+import { isAsciiLabel } from "../core/token-grammar.js";
 import {
   ED25519_PRIVATE_KEY_BYTES,
   ED25519_PUBLIC_KEY_BYTES,
@@ -293,8 +294,6 @@ const DEFAULT_RECOMMENDED_PERIODIC_DAYS = 365;
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
 
 const HOST_RE = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$/i;
-const FORTRESS_LABEL_RE = /^[a-zA-Z0-9_-]{1,64}$/;
-const AGENT_LABEL_RE = /^[a-zA-Z0-9_-]{1,64}$/;
 const METADATA_AUTHORITY_HOSTS = new Set([
   "metadata.google.internal",
   "metadata.goog",
@@ -310,12 +309,12 @@ export async function issueDidWeb(
       `did-web: authority_host '${opts.authority_host}' is not a valid DNS host`,
     );
   }
-  if (!FORTRESS_LABEL_RE.test(opts.fortress_id)) {
+  if (!isAsciiLabel(opts.fortress_id, { maxLength: 64 })) {
     throw new Error(
       `did-web: fortress_id '${opts.fortress_id}' is not a valid label`,
     );
   }
-  if (opts.agent_label !== undefined && !AGENT_LABEL_RE.test(opts.agent_label)) {
+  if (opts.agent_label !== undefined && !isAsciiLabel(opts.agent_label, { maxLength: 64 })) {
     throw new Error(
       `did-web: agent_label '${opts.agent_label}' is not a valid label`,
     );
@@ -666,12 +665,12 @@ export function parseDidWeb(did: string): ParsedDidWeb {
   ) {
     const fortressId = segments[2]!;
     const agentLabel = segments[4]!;
-    if (!FORTRESS_LABEL_RE.test(fortressId)) {
+    if (!isAsciiLabel(fortressId, { maxLength: 64 })) {
       throw new Error(
         `did-web: fortress_id '${fortressId}' is not a valid label`,
       );
     }
-    if (!AGENT_LABEL_RE.test(agentLabel)) {
+    if (!isAsciiLabel(agentLabel, { maxLength: 64 })) {
       throw new Error(
         `did-web: agent_label '${agentLabel}' is not a valid label`,
       );

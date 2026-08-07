@@ -40,6 +40,7 @@ import {
   loadBrokerProducerKey,
   type BrokerProducerKeyLoad,
 } from "../broker-mcp/producer-signature.js";
+import { ASCII_LABEL_RE } from "../core/token-grammar.js";
 import { SANCTUARY_VERSION as PKG_VERSION } from "../config.js";
 import type { SanctuaryConfig } from "../config.js";
 import type { ApprovalChannel } from "./approval-channel.js";
@@ -8209,7 +8210,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       }
 
       // Validate agent_name format (alphanumeric, hyphens, underscores)
-      if (!/^[a-zA-Z0-9_-]+$/.test(body.agent_name)) {
+      if (!ASCII_LABEL_RE.test(body.agent_name)) {
         this.writeFoldedJSON(res, 400, {
           error: "validation_error",
           message:

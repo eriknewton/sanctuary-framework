@@ -20,6 +20,7 @@ import type { StorageBackend } from "./storage/interface.js";
 import { encrypt, decrypt, type EncryptedPayload } from "./core/encryption.js";
 import { derivePurposeKey } from "./core/key-derivation.js";
 import { stringToBytes, bytesToString } from "./core/encoding.js";
+import { ASCII_LABEL_RE } from "./core/token-grammar.js";
 import { ProfileLoadError, type ProfileFailureClassification } from "./errors/profile-error.js";
 
 // ── Types ───────────────────────────────────────────────────────────────
@@ -258,7 +259,7 @@ export class SovereigntyProfileStore {
           throw new Error("Upstream server name must be 128 characters or fewer");
         }
         // Validate name is safe for use in tool namespaces (alphanumeric, hyphens, underscores)
-        if (!/^[a-zA-Z0-9_-]+$/.test(server.name)) {
+        if (!ASCII_LABEL_RE.test(server.name)) {
           throw new Error("Upstream server name must contain only alphanumeric characters, hyphens, and underscores");
         }
         if (!server.transport || typeof server.transport !== "object") {
@@ -434,7 +435,7 @@ function assertUpstreamServersShape(value: unknown): asserts value is UpstreamSe
     if (typeof s.name !== "string" || s.name.length === 0 || s.name.length > 128) {
       throw new ProfileSchemaError("each upstream server must have a name of 1 to 128 characters");
     }
-    if (!/^[a-zA-Z0-9_-]+$/.test(s.name)) {
+    if (!ASCII_LABEL_RE.test(s.name)) {
       throw new ProfileSchemaError("upstream server name must contain only alphanumeric characters, hyphens, and underscores");
     }
     if (!s.transport || typeof s.transport !== "object" || Array.isArray(s.transport)) {
