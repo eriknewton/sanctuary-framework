@@ -15,6 +15,10 @@ import {
   COOPERATIVE_CAPABILITIES,
   buildServerInstructions,
 } from "../../src/agent-native/capabilities-catalog.js";
+import {
+  CATALOG_COOPERATIVE_TOOL_NAMES,
+  COOPERATIVE_TOOL_NAMES,
+} from "../../src/agent-native/tool-names.js";
 
 async function callTool(
   tools: ToolDefinition[],
@@ -66,7 +70,7 @@ describe("first-class tool surfacing", () => {
   describe("move 1: capabilities discovery surface", () => {
     it("registers a read-only sanctuary_capabilities tool taking no arguments", async () => {
       const { facadeTools } = await setup();
-      const tool = facadeTools.find((candidate) => candidate.name === "sanctuary_capabilities");
+      const tool = facadeTools.find((candidate) => candidate.name === COOPERATIVE_TOOL_NAMES.capabilities);
       expect(tool).toBeDefined();
       expect(tool!.tool_class).toBe("read");
       expect(tool!.inputSchema).toEqual({ type: "object", properties: {} });
@@ -74,9 +78,10 @@ describe("first-class tool surfacing", () => {
 
     it("returns the full cooperative catalog with does/when for each tool", async () => {
       const { facadeTools } = await setup();
-      const result = await callTool(facadeTools, "sanctuary_capabilities");
+      const result = await callTool(facadeTools, COOPERATIVE_TOOL_NAMES.capabilities);
       const capabilities = result.capabilities as Array<Record<string, string>>;
       expect(capabilities).toHaveLength(COOPERATIVE_CAPABILITIES.length);
+      expect(capabilities.map((entry) => entry.tool)).toEqual(CATALOG_COOPERATIVE_TOOL_NAMES);
       for (const entry of capabilities) {
         expect(typeof entry.tool).toBe("string");
         expect(entry.does.length).toBeGreaterThan(0);
@@ -88,6 +93,7 @@ describe("first-class tool surfacing", () => {
     it("only lists tools that are actually registered on the surface", async () => {
       const { facadeTools } = await setup();
       const registered = new Set(facadeTools.map((candidate) => candidate.name));
+      expect([...registered].sort()).toEqual([...Object.values(COOPERATIVE_TOOL_NAMES)].sort());
       for (const entry of COOPERATIVE_CAPABILITIES) {
         expect(registered.has(entry.tool), entry.tool).toBe(true);
       }
@@ -95,8 +101,8 @@ describe("first-class tool surfacing", () => {
 
     it("builds MCP server instructions naming the discovery entrypoints and every catalog tool", () => {
       const instructions = buildServerInstructions();
-      expect(instructions).toContain("sanctuary_help");
-      expect(instructions).toContain("sanctuary_capabilities");
+      expect(instructions).toContain(COOPERATIVE_TOOL_NAMES.help);
+      expect(instructions).toContain(COOPERATIVE_TOOL_NAMES.capabilities);
       for (const entry of COOPERATIVE_CAPABILITIES) {
         expect(instructions, entry.tool).toContain(entry.tool);
       }
@@ -112,15 +118,15 @@ describe("first-class tool surfacing", () => {
       const { facadeTools } = await setup();
       // A recall of a never-stored key denies (unverified read); the denial must
       // carry the static discovery pointer.
-      const denied = await callTool(facadeTools, "sanctuary_recall", { key: "never_stored" });
+      const denied = await callTool(facadeTools, COOPERATIVE_TOOL_NAMES.recall, { key: "never_stored" });
       expect(denied.denied).toBe(true);
       expect(denied.discovery_hint).toBe(COOPERATIVE_DENIAL_DISCOVERY_HINT);
     });
 
     it("keeps the discovery_hint IDENTICAL across different denials (no policy leak)", async () => {
       const { facadeTools } = await setup();
-      const recallDenied = await callTool(facadeTools, "sanctuary_recall", { key: "absent_a" });
-      const forgetDenied = await callTool(facadeTools, "sanctuary_forget", {
+      const recallDenied = await callTool(facadeTools, COOPERATIVE_TOOL_NAMES.recall, { key: "absent_a" });
+      const forgetDenied = await callTool(facadeTools, COOPERATIVE_TOOL_NAMES.forget, {
         key: "absent_b",
         mode: "plain",
         approval_ref: "approval:missing",
@@ -136,9 +142,14 @@ describe("first-class tool surfacing", () => {
     it("names only general discovery entrypoints, never a per-request tool", () => {
       // The hint must not name any operation-specific tool (which would leak
       // the attempted operation class); only sanctuary_help / sanctuary_capabilities.
-      expect(COOPERATIVE_DENIAL_DISCOVERY_HINT).toContain("sanctuary_help");
-      expect(COOPERATIVE_DENIAL_DISCOVERY_HINT).toContain("sanctuary_capabilities");
-      for (const leaky of ["sanctuary_forget", "sanctuary_remember", "sanctuary_recall", "sanctuary_hide"]) {
+      expect(COOPERATIVE_DENIAL_DISCOVERY_HINT).toContain(COOPERATIVE_TOOL_NAMES.help);
+      expect(COOPERATIVE_DENIAL_DISCOVERY_HINT).toContain(COOPERATIVE_TOOL_NAMES.capabilities);
+      for (const leaky of [
+        COOPERATIVE_TOOL_NAMES.forget,
+        COOPERATIVE_TOOL_NAMES.remember,
+        COOPERATIVE_TOOL_NAMES.recall,
+        COOPERATIVE_TOOL_NAMES.hide,
+      ]) {
         expect(COOPERATIVE_DENIAL_DISCOVERY_HINT).not.toContain(leaky);
       }
     });
