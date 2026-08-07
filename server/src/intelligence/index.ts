@@ -109,6 +109,14 @@ export {
 } from "./local-provisioning-audit.js";
 
 export {
+  buildLocalProvisioningConsentPacket,
+  type LocalProvisioningConsentAction,
+  type LocalProvisioningConsentPacket,
+  type LocalProvisioningConsentPacketStatus,
+  type LocalProvisioningConsentScope,
+} from "./local-provisioning-consent.js";
+
+export {
   BADGE_LABEL_KEYS,
   BADGE_TRADEOFF_KEYS,
   BACKEND_FALLBACK_STRINGS,
