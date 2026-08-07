@@ -28,7 +28,7 @@ See `Wiki/concepts/seven-principles-of-sovereignty.md` for the canonical lookup.
 
 Sanctuary's enforcement model is the Castle Architecture. Four layers, each with a distinct enforcement contract.
 
-**Layer 1, Castle Wall.** OS-level egress filtering at the operator-external boundary. Linux netfilter / NFQUEUE, macOS Network Extension or pf rules, Windows Filtering Platform. The kernel itself blocks unauthorized cross-boundary calls. Even prompt-injected agents cannot bypass. Phase 1 (macOS plus Linux) ships in v1.x; Windows is Phase 2; container or microVM isolation is Phase 3 for highest-assurance enterprises.
+**Layer 1, Castle Wall.** OS-level egress filtering at the operator-external boundary. macOS Network Extension or pf rules today; Linux netfilter / NFQUEUE and Windows Filtering Platform are the source and roadmap paths. Where the wall is installed, the kernel itself blocks unauthorized cross-boundary calls and a prompt-injected agent cannot bypass it. Phase 1 ships as live enforcement on macOS only in v1.x: the Linux modules are tested against a real kernel and the shipped daemon does not install them, so the Assurance Matrix row is `not_implemented` (open defect: **IC-02, IC-03, IC-04**, see `docs/audit/inert-capability-register.md`). Windows is Phase 2; container or microVM isolation is Phase 3 for highest-assurance enterprises.
 
 **Layer 2, Sentinels.** Internal observation, not enforcement. Behavioral baselining via process introspection and eBPF. Anomalies surface to the operator via menubar and OS notifications. Sentinels watch internal patterns the wall cannot see (file access, internal LLM calls, cross-agent coordination); they observe and surface; they do not block. Sentinels ship in v1.3.
 
@@ -97,7 +97,7 @@ On first launch, Sanctuary will:
 1. Derive a master encryption key from your passphrase (Argon2id)
 2. Create the storage directory (`~/.sanctuary/`)
 3. Display a recovery key if no passphrase is set (save it; shown once)
-4. Walk you through the first-run wizard for the egress filter (which endpoints to pre-allow vs prompt for); macOS plus Linux Phase 1, Windows Phase 2
+4. Walk you through the first-run wizard for the egress filter (which endpoints to pre-allow vs prompt for); the wizard's rules reach live enforcement on macOS Phase 1 only, with Linux Phase 1 unshipped (**IC-02, IC-03, IC-04**) and Windows on Phase 2
 
 ## Key protection modes
 

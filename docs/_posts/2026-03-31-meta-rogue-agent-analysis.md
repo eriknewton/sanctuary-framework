@@ -45,7 +45,7 @@ These are not the same vulnerability as Meta's incident. But they share the same
 
 ## What Sanctuary Prevents
 
-Sanctuary's architecture is built to contain Meta's failure class. When this post was written the gates were cooperative; kernel-level enforcement has since been proven on macOS (see the editor's note above for exactly what is proven and where). On Linux the enforcement modules are tested against a real kernel, and the shipped daemon does not install them. Open defect: **IC-02, IC-03, IC-04** (`Review/Sanctuary/Inert_Capability_Sweep_2026-08-07.md`). Here's the design, layer by layer.
+Sanctuary's architecture is built to contain Meta's failure class. When this post was written the gates were cooperative; kernel-level enforcement has since been proven on macOS (see the editor's note above for exactly what is proven and where). On Linux the enforcement modules are tested against a real kernel, and the shipped daemon does not install them. Open defect: **IC-02, IC-03, IC-04** (`docs/audit/inert-capability-register.md`). Here's the design, layer by layer.
 
 **L1; Cognitive Sovereignty: The agent's knowledge is encrypted and access-controlled.**
 

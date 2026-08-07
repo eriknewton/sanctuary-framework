@@ -36,7 +36,7 @@ import {
 // unsigned: true` and both verifiers skip the signature leg. What these
 // fixtures exercise is the checkpoint FORMAT and the verifier's behavior when a
 // signer IS present; they do not exercise any code path an operator runs.
-// Open defect: IC-05 (Review/Sanctuary/Inert_Capability_Sweep_2026-08-07.md).
+// Open defect: IC-05 (docs/audit/inert-capability-register.md).
 // Deleting the injected signer here would not fix that; the fix is to supply a
 // signer at the production construction sites.
 

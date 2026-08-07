@@ -32,7 +32,7 @@ The only outbound destinations a fresh Sanctuary install reaches are:
    `principal-policy.yaml` do not select the webhook channel in shipped
    code, and regulator-facing generated docs can therefore print the
    wrong channel. Open defect: **IC-14**
-   (`Review/Sanctuary/Inert_Capability_Sweep_2026-08-07.md`). All such
+   (`docs/audit/inert-capability-register.md`). All such
    channels remain explicit operator opt-in, default off.
 
 ## Why
@@ -99,7 +99,7 @@ outbound channels by configuring them:
   metadata, never state content. Current bound: setting
   `approval_channel.type: webhook` in `principal-policy.yaml` alone does
   not select the live channel. Open defect: **IC-14**
-  (`Review/Sanctuary/Inert_Capability_Sweep_2026-08-07.md`).
+  (`docs/audit/inert-capability-register.md`).
 - **Future daily digest delivery:** when daily digest ships, default is
   OS notification + dashboard view + signed local file write. Email
   (operator-chosen SMTP), Slack webhook, Telegram bot are explicit
@@ -204,7 +204,7 @@ Each probe above must be:
 - RFC-0003 Castle Architecture (`server/rfcs/`, queued).
 - WP-V1.x-CASTLE-WALL milestone (macOS egress filter proven; Linux source path
   partial until **IC-02, IC-03, IC-04** are fixed:
-  `Review/Sanctuary/Inert_Capability_Sweep_2026-08-07.md`).
+  `docs/audit/inert-capability-register.md`).
 - Substrate selector (`server/src/intelligence/selector.ts`) is the
   canonical inference egress point.
 - Webhook approval channel

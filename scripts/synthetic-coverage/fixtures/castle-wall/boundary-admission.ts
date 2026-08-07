@@ -16,7 +16,7 @@ import {
 // binds no NFQUEUE, creates no cgroup scope, and never calls the deny-by-default
 // evaluator. A green row here is format and policy-shape coverage, never
 // evidence that a Linux host is enforcing.
-// Open defect: IC-02, IC-04 (Review/Sanctuary/Inert_Capability_Sweep_2026-08-07.md).
+// Open defect: IC-02, IC-04 (docs/audit/inert-capability-register.md).
 const CLAIM_ID = "9";
 const CLAIM_LABEL = "Egress enforcement: Linux (Castle Wall Phase 1)";
 

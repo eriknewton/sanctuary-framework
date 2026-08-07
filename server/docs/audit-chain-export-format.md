@@ -5,7 +5,7 @@ Produced by: `sanctuary audit-chain export`
 Verified by: `sanctuary audit-chain verify`, with current bounds below.
 Production checkpoints are unsigned today, and `--no-strict` can report PASS
 even when findings are present. Open defect: **IC-05, IC-06**
-(`Review/Sanctuary/Inert_Capability_Sweep_2026-08-07.md`).
+(`docs/audit/inert-capability-register.md`).
 
 ## Overview
 
@@ -140,10 +140,10 @@ A verifier reading a JSONL export MUST:
 4. **prev_hash walk:** Assert that each entry's `prev_hash` equals the `entry_hash` of the previous entry (or `"GENESIS"` for the first, or the legacy anchor `root_hash` after migration).
 5. **Hash recomputation:** For each entry, recompute `entry_hash` from the envelope fields and compare to the stored value.
 6. **Checkpoint root:** For each checkpoint, collect the `entry_hash` values for `[from_sequence, checkpoint_sequence]` and recompute the root hash; compare to `root_hash`.
-7. **Checkpoint signature:** For each non-unsigned checkpoint, verify the Ed25519 signature over the domain-separated signing payload using the `public_key` field (or a supplied trusted key). Current bound: production checkpoints are unsigned because no production boot path supplies the checkpoint signer, so this leg is skipped on shipped installs. Open defect: **IC-05** (`Review/Sanctuary/Inert_Capability_Sweep_2026-08-07.md`).
+7. **Checkpoint signature:** For each non-unsigned checkpoint, verify the Ed25519 signature over the domain-separated signing payload using the `public_key` field (or a supplied trusted key). Current bound: production checkpoints are unsigned because no production boot path supplies the checkpoint signer, so this leg is skipped on shipped installs. Open defect: **IC-05** (`docs/audit/inert-capability-register.md`).
 8. **Legacy anchor:** Assert that `root_hash` is a valid 64-character hex string.
 
-In strict mode (default), any single failure causes the verdict to be `FAIL`; that path is sound. Current bound, confined to `--no-strict`: non-strict mode reports `PASS` even when findings are present, so do not use `--no-strict` as audit evidence until **IC-06** is fixed (`Review/Sanctuary/Inert_Capability_Sweep_2026-08-07.md`).
+In strict mode (default), any single failure causes the verdict to be `FAIL`; that path is sound. Current bound, confined to `--no-strict`: non-strict mode reports `PASS` even when findings are present, so do not use `--no-strict` as audit evidence until **IC-06** is fixed (`docs/audit/inert-capability-register.md`).
 
 ## Verification Report Schema
 
@@ -189,4 +189,4 @@ The verifier (`server/src/cli/audit-chain-verify.ts`) imports only:
 - `@noble/hashes/sha256` -- SHA-256 hashing
 - `node:fs` -- reading the JSONL file
 
-It does not import from the Sanctuary server runtime (no storage backend, no encryption key, no audit log class). A security reviewer can copy `audit-chain-verify.ts`, install `@noble/curves` and `@noble/hashes`, and run it against an exported chain file without a Sanctuary installation. Current bound: unsigned production checkpoints and the `--no-strict` false-PASS path remain open defects: **IC-05, IC-06** (`Review/Sanctuary/Inert_Capability_Sweep_2026-08-07.md`).
+It does not import from the Sanctuary server runtime (no storage backend, no encryption key, no audit log class). A security reviewer can copy `audit-chain-verify.ts`, install `@noble/curves` and `@noble/hashes`, and run it against an exported chain file without a Sanctuary installation. Current bound: unsigned production checkpoints and the `--no-strict` false-PASS path remain open defects: **IC-05, IC-06** (`docs/audit/inert-capability-register.md`).

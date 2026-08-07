@@ -1,5 +1,5 @@
 title: Sanctuary Protocol
-description: Security for AI agents with no vendor in the path. Kernel-enforced egress control on macOS and Linux, keys only the operator holds, tamper-evident audit. One command protects Claude Code, Cursor, or any MCP harness.
+description: Security for AI agents with no vendor in the path. Kernel-enforced egress control on macOS, keys only the operator holds, tamper-evident audit. One command protects Claude Code, Cursor, or any MCP harness.
 url: "https://sanctuaryprotocol.ai"
 baseurl: ""
 

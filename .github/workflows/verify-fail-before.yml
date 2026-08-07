@@ -4,20 +4,25 @@ on:
   pull_request:
     branches: [main]
     paths:
-      # Must match the CHANGED_SRC filter in scripts/verify-fail-before.sh: the
-      # guard only reasons about TypeScript source, so a docs-only edit under
-      # server/src (for example server/src/README.md) must not trigger it.
-      # Failure mode when these drift apart: the job starts on a PR with no
-      # TypeScript change and reds asking for a failing test that cannot exist.
-      # Both the flat and nested forms are listed on purpose. GitHub's `**`
-      # spans slashes, so `server/src/**/*.ts` requires at least one directory
+      # Must match the CHANGED_SRC filter in scripts/verify-fail-before.sh,
+      # which is a DOCUMENTATION DENYLIST, not an extension allowlist: every
+      # file under server/src triggers this job except prose, because behavior
+      # there also lives in .mjs plugin executables, .yaml policy templates,
+      # .json template payloads and trust anchors, .rs probe loaders, and
+      # .txt/.hosts rules data. An allowlist of `.ts`/`.tsx` here would let a
+      # PR touching only those files skip the guard entirely.
+      # Failure mode when these drift apart: over-trigger reds the job on a PR
+      # with no behavior change, asking for a failing test that cannot exist;
+      # under-trigger disables the guard with no visible signal at all, which is
+      # the worse half and the reason the default is now "guard it".
+      # Both the flat and nested negations are listed on purpose. GitHub's `**`
+      # spans slashes, so `server/src/**/*.md` requires at least one directory
       # level and would silently skip top-level files such as
-      # server/src/index.ts. Under-triggering disables the guard without any
-      # visible signal, which is worse than the over-trigger being fixed here.
-      - "server/src/*.ts"
-      - "server/src/*.tsx"
-      - "server/src/**/*.ts"
-      - "server/src/**/*.tsx"
+      # server/src/README.md, leaving the over-trigger in place for exactly the
+      # file that motivated the exemption.
+      - "server/src/**"
+      - "!server/src/*.md"
+      - "!server/src/**/*.md"
       - "server/test/**/*.test.ts"
       - "scripts/verify-fail-before.sh"
       - ".github/workflows/verify-fail-before.yml"

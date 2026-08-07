@@ -3,9 +3,9 @@
 The Linux Castle Wall source crate. Its nftables, cgroup, and NFQUEUE modules
 are tested against a real kernel, but the shipped daemon boot path does not
 install those modules into live enforcement yet. Open defect: **IC-02, IC-03,
-IC-04** (`Review/Sanctuary/Inert_Capability_Sweep_2026-08-07.md`).
+IC-04** (`docs/audit/inert-capability-register.md`).
 Cooperative MCP gates sit on top for compliant agents; Linux kernel enforcement
-is still partial until the shipped daemon assembles the tested loop.
+is not implemented until the shipped daemon assembles the tested loop.
 
 ## Status
 
@@ -14,7 +14,7 @@ the kernel-touching modules (`nftables`, `cgroup`, `nfqueue`), but
 `daemon::boot` does not install an nftables table, bind NFQUEUE, create cgroup
 scopes, or call the deny-by-default evaluator. The shipped systemd unit is also
 `Type=notify` while the daemon never sends readiness. Open defect: **IC-02,
-IC-03, IC-04** (`Review/Sanctuary/Inert_Capability_Sweep_2026-08-07.md`).
+IC-03, IC-04** (`docs/audit/inert-capability-register.md`).
 
 Phase 2 macOS Network Extension: queued behind Apple Developer Program
 filing.
@@ -39,11 +39,11 @@ Three layers of source, named after the surface they own.
    `src/nfqueue.rs` implement and test the intended `sanctuary-castle`
    table, per-agent cgroup scopes, and NFQUEUE verdict loop. The shipped
    daemon boot path does not call them yet. Open defect: **IC-02, IC-04**
-   (`Review/Sanctuary/Inert_Capability_Sweep_2026-08-07.md`).
+   (`docs/audit/inert-capability-register.md`).
 
 `src/daemon.rs` owns the boot sequence but currently starts IPC and WAL
 handling without installing kernel enforcement. Open defect: **IC-02, IC-04**
-(`Review/Sanctuary/Inert_Capability_Sweep_2026-08-07.md`). `src/failure.rs`
+(`docs/audit/inert-capability-register.md`). `src/failure.rs`
 maps failure modes to fail-closed, fail-degraded, or refuse-to-start
 dispositions with operator-facing messages.
 

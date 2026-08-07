@@ -315,7 +315,7 @@ SANCTUARY_MULTI_DASHBOARD_PORT=4000 sanctuary dashboard --multi
 Do not bind the multi-agent dashboard to a non-loopback host today. The
 `--multi` path drops the remote-plaintext guard and the `auto` token mint, so
 `--host 0.0.0.0` exposes tenant metadata plaintext and unauthenticated. Open
-defect: **IC-17** (`Review/Sanctuary/Inert_Capability_Sweep_2026-08-07.md`).
+defect: **IC-17** (`docs/audit/inert-capability-register.md`).
 
 The portal:
 

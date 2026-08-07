@@ -8,7 +8,7 @@
     {
       "name": "sanctuary-framework",
       "source": "./plugin",
-      "description": "The open source standard for secure, private AI: a wall the operating system enforces in both directions, and your data under your own keys, portable anywhere. Wraps any MCP-compatible agent with encrypted state, approval gates, a portable identity and reputation, and an audit tool that finds security and privacy gaps in your current setup."
+      "description": "The open source standard for secure, private AI: a wall the operating system enforces where the platform row is proven, and your data under your own keys with current portability bounds called out in the Assurance Matrix. Wraps any MCP-compatible agent with encrypted state, approval gates, a portable identity and reputation, and an audit tool that finds security and privacy gaps in your current setup."
     }
   ]
 }

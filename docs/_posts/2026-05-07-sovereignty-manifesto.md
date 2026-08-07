@@ -78,7 +78,7 @@ These are not aspirational. They are buildable. We are building them. The v1.2 s
 > or call the deny-by-default evaluator, so Linux Castle Wall is not live
 > enforcement. macOS Phase 1 did later ship and is proven in the Assurance
 > Matrix. Open defect: **IC-02, IC-03, IC-04**
-> (`Review/Sanctuary/Inert_Capability_Sweep_2026-08-07.md`).
+> (`docs/audit/inert-capability-register.md`).
 
 ## The Castle Architecture
 
@@ -164,7 +164,7 @@ If you are an enterprise buyer evaluating sovereign deployment: pilot conversati
 > Live kernel enforcement is proven on macOS; the shipped Linux daemon installs
 > no kernel enforcement, so a Linux pilot demo cannot be offered on that basis.
 > Open defect: **IC-02, IC-03, IC-04**
-> (`Review/Sanctuary/Inert_Capability_Sweep_2026-08-07.md`).
+> (`docs/audit/inert-capability-register.md`).
 
 If you are a partner building a payment rail, mandate framework, identity registry, or reputation engine: compose with us. The substrate is open source and free always. We ship reference integrations against your primitives. We contribute upstream as the operator-side complement to your work. The operator-sovereign reference implementation is the most useful partner you can have if your goal is genuine portability rather than soft lock-in.
 

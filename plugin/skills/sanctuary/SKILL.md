@@ -203,7 +203,7 @@ Sanctuary's cooperative MCP surface is organized in four named layers:
 - **Selective Disclosure:** Commitment-based proofs, zero-knowledge proofs (Pedersen/Ristretto255/Schnorr), disclosure policies
 - **Verifiable Reputation:** Signed attestations (posture-weighted), portable reputation, trust bootstrapping, handshakes, MCP-to-MCP federation
 
-Beneath the cooperative surface, the Castle Wall enforces egress policy at the operating-system level on Linux and macOS, so the perimeter holds even when an agent is prompt-injected or disobedient. See the repo README for the current per-platform enforcement status and its proven bounds.
+Beneath the cooperative surface, the Castle Wall enforces egress policy at the operating-system level on macOS, so the perimeter holds even when an agent is prompt-injected or disobedient. Linux ships no egress enforcement: the modules are tested against a real kernel and the shipped daemon does not install them (**IC-02, IC-03, IC-04**). See the repo README for the current per-platform enforcement status and its proven bounds.
 
 All state is encrypted with AES-256-GCM. Keys are derived via Argon2id. Integrity is verified via Merkle trees. Identity is Ed25519 with key rotation support. No plaintext ever touches persistent storage.
 
