@@ -39,6 +39,28 @@ export {
 } from "./audit-events.js";
 
 export {
+  MODEL_MANIFEST_DOMAIN,
+  MODEL_MANIFEST_TIERS,
+  PINNED_MODEL_MANIFEST_SIGNING_PUBLIC_KEY_B64URL,
+  buildModelManifestMessage,
+  loadPinnedModelManifestKey,
+  provenanceFromModelManifestModel,
+  resolveModelForSurface,
+  verifyModelManifest,
+  verifyModelManifestWithKey,
+  type ModelManifestBody,
+  type ModelManifestModel,
+  type ModelManifestRefusalReason,
+  type ModelManifestSurfaceDefaults,
+  type ModelManifestTier,
+  type ModelManifestTierBundle,
+  type ModelManifestVerificationOptions,
+  type ModelManifestVerificationResult,
+  type ModelRuntime,
+  type SignedModelManifest,
+} from "./model-manifest.js";
+
+export {
   BADGE_LABEL_KEYS,
   BADGE_TRADEOFF_KEYS,
   BACKEND_FALLBACK_STRINGS,

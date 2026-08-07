@@ -265,6 +265,8 @@ describe("ModelProvenanceStore", () => {
       expect(preset.open_source).toBe(false);
       expect(preset.local_inference).toBe(true);
       expect(preset.provider).toBe("Alibaba Cloud");
+      expect(preset.license).toBe("Qwen Research License");
+      expect(preset.license).not.toBe("Apache-2.0");
     });
 
     it("llama33Local has correct properties", () => {
@@ -272,9 +274,11 @@ describe("ModelProvenanceStore", () => {
 
       expect(preset.model_id).toBe("llama-3.3-70b-instruct");
       expect(preset.open_weights).toBe(true);
-      expect(preset.open_source).toBe(true);
+      expect(preset.open_source).toBe(false);
       expect(preset.local_inference).toBe(true);
       expect(preset.provider).toBe("Meta");
+      expect(preset.license).toBe("Llama Community License");
+      expect(preset.license).not.toBe("Apache-2.0");
     });
 
     it("mistral7bLocal has correct properties", () => {
@@ -305,7 +309,7 @@ describe("ModelProvenanceStore", () => {
       const preset2 = MODEL_PRESETS.qwen35Local();
 
       preset1.license = "MIT";
-      expect(preset2.license).toBe("Apache-2.0");
+      expect(preset2.license).toBe("Qwen Research License");
     });
   });
 
@@ -329,12 +333,13 @@ describe("ModelProvenanceStore", () => {
     });
 
     it("agent operator can verify model transparency", () => {
-      // Open weights + open source = most transparent
+      // Mistral remains the open-source local preset.
       const transparent = MODEL_PRESETS.llama33Local();
       store.declare(transparent);
 
       const m = store.primary()!;
-      expect(m.open_weights && m.open_source).toBe(true);
+      expect(m.open_weights).toBe(true);
+      expect(m.open_source).toBe(false);
 
       // Proprietary = highest risk per Vitalik's post
       const proprietary = MODEL_PRESETS.claudeOpus4();
