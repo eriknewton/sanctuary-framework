@@ -509,6 +509,13 @@ export class ApprovalGate {
       risk_tier: classification.tier,
     };
 
+    // Approval-proof invariant: a bearer approval_ref is not authority by
+    // itself. Rebuild the canonical envelope from THIS call before trusting it:
+    // hash equality binds the current args hash / tier / target / requester,
+    // "approved" rejects queued or denied records, absent plan_hash+step_id keeps
+    // compound-plan proofs out of the direct-tool path, expiry bounds capture
+    // replay, requester_fingerprint blocks cross-session proof theft, and nonce /
+    // target_resource / tool_name equality reject field-splice substitutions.
     const proofMatches =
       approvalEnvelopeHash(rebuilt) === record.envelope_hash &&
       record.decision === "approved" &&
@@ -524,6 +531,9 @@ export class ApprovalGate {
       return this.denyProof(toolName, args, classification.tier);
     }
 
+    // Single-use replay invariant: every check above is read-only; this consume
+    // is the linearization point. If another call already spent the same
+    // approval_ref, deny instead of reusing a once-valid human approval.
     const consumed = this.approvalProofStore.consumeIfUnconsumed(approvalRef);
     if (!consumed) {
       return this.denyProof(toolName, args, classification.tier);
