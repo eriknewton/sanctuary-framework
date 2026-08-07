@@ -10,6 +10,14 @@ import XCTest
 @testable import CastleWallIPC
 
 final class FramingTests: XCTestCase {
+    private func contentLengthFrame(length: Int, body: String = "") -> String {
+        "\(CastleWallConstants.ipcContentLengthHeader): \(length)\r\n\r\n\(body)"
+    }
+
+    private func partialContentLengthHeader(length: Int) -> String {
+        "\(CastleWallConstants.ipcContentLengthHeader): \(length)\r\n"
+    }
+
     func testFrameRoundTripsSimpleBody() {
         let framed = Framing.frame("{\"x\":1}")
         guard case .complete(let body, let consumed) = Framing.parseFrame(framed) else {
@@ -21,22 +29,22 @@ final class FramingTests: XCTestCase {
     }
 
     func testParseSignalsNeedMoreForPartialHeader() {
-        let buf = Data("Content-Length: 5\r\n".utf8)
+        let buf = Data(partialContentLengthHeader(length: 5).utf8)
         XCTAssertEqual(Framing.parseFrame(buf), .needMore)
     }
 
     func testParseSignalsNeedMoreForPartialBody() {
-        let buf = Data("Content-Length: 10\r\n\r\nshort".utf8)
+        let buf = Data(contentLengthFrame(length: 10, body: "short").utf8)
         XCTAssertEqual(Framing.parseFrame(buf), .needMore)
     }
 
     func testParseRejectsNegativeLength() {
-        let buf = Data("Content-Length: -1\r\n\r\n".utf8)
+        let buf = Data(contentLengthFrame(length: -1).utf8)
         guard case .error(let reason) = Framing.parseFrame(buf) else {
             XCTFail("expected error")
             return
         }
-        XCTAssertTrue(reason.contains("invalid Content-Length"))
+        XCTAssertTrue(reason.contains("invalid \(CastleWallConstants.ipcContentLengthHeader)"))
     }
 
     func testParseRejectsMissingContentLength() {
@@ -45,12 +53,13 @@ final class FramingTests: XCTestCase {
             XCTFail("expected error")
             return
         }
-        XCTAssertTrue(reason.contains("missing Content-Length"))
+        XCTAssertTrue(reason.contains("missing \(CastleWallConstants.ipcContentLengthHeader)"))
     }
 
     func testHeaderMatchIsCaseInsensitive() {
         let body = "{\"x\":1}"
-        let frameStr = "content-length: \(body.utf8.count)\r\n\r\n\(body)"
+        let frameStr = "\(CastleWallConstants.ipcContentLengthHeader.lowercased()): " +
+            "\(body.utf8.count)\r\n\r\n\(body)"
         let buf = Data(frameStr.utf8)
         guard case .complete(let parsed, _) = Framing.parseFrame(buf) else {
             XCTFail("expected complete")
@@ -78,7 +87,7 @@ final class FramingTests: XCTestCase {
         // test corpus.
         let body = "{\"jsonrpc\":\"2.0\",\"method\":\"castle-wall.status_request\",\"params\":{\"type\":\"status_request\",\"request_id\":\"abc\"}}"
         let framed = Framing.frame(body)
-        let expectedHeader = "Content-Length: \(body.utf8.count)\r\n\r\n"
+        let expectedHeader = contentLengthFrame(length: body.utf8.count)
         XCTAssertEqual(framed.prefix(expectedHeader.utf8.count), Data(expectedHeader.utf8))
         XCTAssertEqual(framed.suffix(body.utf8.count), Data(body.utf8))
     }
