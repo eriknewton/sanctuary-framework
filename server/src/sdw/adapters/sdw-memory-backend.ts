@@ -17,7 +17,8 @@
 import { randomBytes } from "node:crypto";
 import type { StorageBackend } from "../../storage/interface.js";
 import { stringToBytes, toBase64url } from "../../core/encoding.js";
-import { hash } from "../../core/hashing.js";
+import { hash, hmacSha256 } from "../../core/hashing.js";
+import { derivePurposeKey } from "../../core/key-derivation.js";
 import {
   SdwDocumentCorpusStore,
   type SdwCorpusTxn,
@@ -30,6 +31,7 @@ import {
   documentChunkKey,
   documentKey,
   isSdwIdentifier,
+  lengthPrefixedUtf8,
 } from "../grammar.js";
 import {
   SDW_DOCUMENT_CORPUS_NAMESPACE,
@@ -43,6 +45,7 @@ import type {
   MemoryListOptions,
   MemoryPassage,
   MemoryPassageInput,
+  MemoryPassageScreen,
   MemorySearchQuery,
   MemorySearchResult,
 } from "./memory-backend.js";
@@ -50,9 +53,37 @@ import type {
 /** Document ids minted by this adapter are namespaced under this prefix. */
 export const MEMORY_PASSAGE_DOCUMENT_PREFIX = "mem";
 
+/**
+ * HKDF label for the passage-id derivation key. FROZEN: changing this string
+ * re-derives every id from derivePassageId, so a re-ingest would land on new
+ * passages instead of replacing the existing ones and the old records would be
+ * orphaned. Treat it like the at-rest labels in reorg-surface-manifest.md.
+ */
+const MEMORY_PASSAGE_ID_HKDF_INFO = "sdw-memory-passage-id-v1";
+/** Domain separator inside the id MAC; distinct from the HKDF label above. */
+const MEMORY_PASSAGE_ID_MAC_DOMAIN = "sanctuary.sdw-memory-passage-id.v1";
+// 32 hex chars = 128 bits of the SHA-256 MAC. Hex (not base64url) because the
+// SDW identifier grammar excludes "_", which base64url emits.
+const MEMORY_PASSAGE_ID_HEX_CHARS = 32;
+
 const DEFAULT_MAX_CHUNK_CHARS = 8192;
 const MAX_CONFIGURABLE_CHUNK_CHARS = 100_000;
 const DEFAULT_SEARCH_LIMIT = 10;
+
+/** Everything an insert-or-replace needs, computed before any write happens. */
+interface PreparedPassage {
+  readonly documentId: string;
+  readonly text: string;
+  readonly documentRecord: SdwDocumentRecord;
+  readonly chunkRecords: readonly SdwDocumentChunkRecord[];
+}
+
+/** The prior state of one passage, captured so a failed batch can restore it. */
+interface PriorPassage {
+  readonly documentId: string;
+  readonly record: SdwDocumentRecord | null;
+  readonly text: string | null;
+}
 
 export interface SdwMemoryBackendAdapterOptions {
   readonly storage: StorageBackend;
@@ -73,7 +104,8 @@ export interface SdwMemoryBackendAdapterOptions {
 export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
   private readonly storage: StorageBackend;
   private readonly corpus: SdwDocumentCorpusStore;
-  private readonly ownerRef: string;
+  readonly ownerRef: string;
+  private readonly passageIdKey: Uint8Array;
   private readonly maxChunkChars: number;
   private readonly now: () => string;
   /**
@@ -110,6 +142,7 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
       fortressId: options.fortressId,
     });
     this.ownerRef = options.ownerRef;
+    this.passageIdKey = derivePurposeKey(options.masterKey, MEMORY_PASSAGE_ID_HKDF_INFO);
     this.maxChunkChars = maxChunkChars;
     this.now = options.now ?? (() => new Date().toISOString());
   }
@@ -118,41 +151,8 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
     input: MemoryPassageInput,
     taint: PersistableTaint,
   ): Promise<MemoryPassage> {
-    const passageId = input.passage_id ?? generatePassageId();
-    const documentId = this.documentId(passageId);
-    const createdAt = input.created_at ?? this.now();
-    const tags = input.tags ?? [];
-    const metadata = input.metadata ?? [];
-    validatePassageText(input.text);
-    validatePassageDecorators(tags, metadata);
-    assertSdwClassifierCleanText(input.text);
-    const contentHash = passageContentHash(input.text);
-    const chunks = chunkText(input.text, this.maxChunkChars);
-    const chunkRecords = chunks.map(
-      (text, ordinal): SdwDocumentChunkRecord => ({
-        kind: "document_chunk",
-        version: 1,
-        chunk_id: chunkId(ordinal),
-        document_id: documentId,
-        chunk_ordinal: ordinal,
-        text,
-        content_hash: passageContentHash(text),
-        created_at: createdAt,
-      }),
-    );
-    const documentRecord: SdwDocumentRecord = {
-      kind: "document",
-      version: 1,
-      document_id: documentId,
-      source: { kind: "internal" },
-      content_hash: contentHash,
-      chunk_count: chunks.length,
-      byte_length: stringToBytes(input.text).length,
-      created_at: createdAt,
-      updated_at: createdAt,
-      tags,
-      metadata,
-    };
+    const prepared = this.preparePassage(input);
+    const { documentId, documentRecord, chunkRecords } = prepared;
 
     const transactional = asSdwTransactional(this.storage);
     if (transactional !== null) {
@@ -179,7 +179,102 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
         }
       });
     }
-    return this.toPassage(documentRecord, input.text);
+    return this.toPassage(documentRecord, prepared.text);
+  }
+
+  screenPassage(input: MemoryPassageInput, taint: PersistableTaint): MemoryPassageScreen {
+    try {
+      const prepared = this.preparePassage(input);
+      // Mint (and discard) every record the real write would persist. Minting
+      // is the enforcement point for the grammar checks and the fail-closed
+      // secret classifier and has no side effects, so this screen cannot drift
+      // from the gate putPassages re-runs on the same records.
+      this.corpus.mintDocument(prepared.documentRecord, taint);
+      for (const chunkRecord of prepared.chunkRecords) {
+        this.corpus.mintChunk(chunkRecord, taint);
+      }
+      return { ok: true };
+    } catch (error) {
+      if (error instanceof SdwValidationError) {
+        return { ok: false, category: error.category, message: error.message };
+      }
+      throw error;
+    }
+  }
+
+  async putPassages(
+    inputs: readonly MemoryPassageInput[],
+    taint: PersistableTaint,
+  ): Promise<readonly MemoryPassage[]> {
+    if (inputs.length === 0) return [];
+    for (const input of inputs) {
+      if (input.passage_id === undefined) {
+        throw new SdwValidationError(
+          "invalid_identifier",
+          "SDW memory batch write requires an explicit passage_id per passage",
+        );
+      }
+    }
+    // Prepare (and therefore validate and classify) EVERYTHING before the first
+    // byte is written. A rejection found halfway through would otherwise be the
+    // partial-commit this method exists to prevent.
+    const prepared = inputs.map((input) => this.preparePassage(input));
+    const seen = new Set<string>();
+    for (const item of prepared) {
+      if (seen.has(item.documentId)) {
+        throw new SdwValidationError(
+          "duplicate_passage",
+          "SDW memory batch write contains the same passage_id twice",
+        );
+      }
+      seen.add(item.documentId);
+    }
+
+    const documentIds = prepared.map((item) => item.documentId);
+    return this.withDocumentLocks(documentIds, async () => {
+      const prior = await this.capturePriorPassages(prepared);
+      const transactional = asSdwTransactional(this.storage);
+      if (transactional !== null) {
+        await transactional.sdwTransaction(async (txn) => {
+          for (const item of prepared) {
+            for (const chunkRecord of item.chunkRecords) {
+              await this.corpus.putChunk(chunkRecord, taint, txn);
+            }
+            await this.corpus.putDocument(item.documentRecord, taint, txn);
+          }
+        });
+      } else {
+        try {
+          for (const item of prepared) {
+            for (const chunkRecord of item.chunkRecords) {
+              await this.corpus.putChunk(chunkRecord, taint);
+            }
+            await this.corpus.putDocument(item.documentRecord, taint);
+          }
+        } catch (error) {
+          await this.restorePriorPassages(prior, taint);
+          throw error;
+        }
+      }
+      // Post-commit only. A replaced passage that shrank leaves chunks past the
+      // new chunk_count; reads are bounded by chunk_count so they are already
+      // unreachable, and this removes the stale ciphertext. A failure here
+      // leaves garbage, never a wrong read, so it must not fail the write.
+      await this.pruneOrphanChunks(prepared, prior);
+      return prepared.map((item) => this.toPassage(item.documentRecord, item.text));
+    });
+  }
+
+  derivePassageId(domain: string, label: string): string {
+    assertSdwIdentifier(domain, "passage_id_domain");
+    const mac = hmacSha256(
+      this.passageIdKey,
+      lengthPrefixedUtf8([MEMORY_PASSAGE_ID_MAC_DOMAIN, domain, this.ownerRef, label]),
+    );
+    const id = Buffer.from(mac).toString("hex").slice(0, MEMORY_PASSAGE_ID_HEX_CHARS);
+    // Hex is a strict subset of the SDW identifier grammar; assert anyway so a
+    // future encoding change cannot silently mint an invalid storage key.
+    return assertSdwIdentifier(id, "passage_id");
   }
 
   async getPassage(passageId: string): Promise<MemoryPassage | null> {
@@ -253,6 +348,155 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
       this.documentKeyPrefix(),
     );
     return entries.length;
+  }
+
+  /**
+   * Build every record a passage write persists. Pure: it validates, classifies,
+   * and returns records, and touches no storage. insertPassage, putPassages, and
+   * screenPassage all go through here so the three cannot disagree about what
+   * "acceptable" means.
+   */
+  private preparePassage(input: MemoryPassageInput): PreparedPassage {
+    const passageId = input.passage_id ?? generatePassageId();
+    const documentId = this.documentId(passageId);
+    const createdAt = input.created_at ?? this.now();
+    const tags = input.tags ?? [];
+    const metadata = input.metadata ?? [];
+    validatePassageText(input.text);
+    validatePassageDecorators(tags, metadata);
+    assertSdwClassifierCleanText(input.text);
+    const chunks = chunkText(input.text, this.maxChunkChars);
+    const chunkRecords = chunks.map(
+      (text, ordinal): SdwDocumentChunkRecord => ({
+        kind: "document_chunk",
+        version: 1,
+        chunk_id: chunkId(ordinal),
+        document_id: documentId,
+        chunk_ordinal: ordinal,
+        text,
+        content_hash: passageContentHash(text),
+        created_at: createdAt,
+      }),
+    );
+    const documentRecord: SdwDocumentRecord = {
+      kind: "document",
+      version: 1,
+      document_id: documentId,
+      source: { kind: "internal" },
+      content_hash: passageContentHash(input.text),
+      chunk_count: chunks.length,
+      byte_length: stringToBytes(input.text).length,
+      created_at: createdAt,
+      updated_at: createdAt,
+      tags,
+      metadata,
+    };
+    return { documentId, text: input.text, documentRecord, chunkRecords };
+  }
+
+  /**
+   * Hold the per-document locks for a whole batch. Ids are acquired in sorted
+   * order, so two overlapping batches acquire shared documents in the same
+   * order and cannot deadlock against each other.
+   */
+  private async withDocumentLocks<T>(
+    documentIds: readonly string[],
+    fn: () => Promise<T>,
+  ): Promise<T> {
+    const ordered = [...new Set(documentIds)].sort();
+    const acquire = async (index: number): Promise<T> =>
+      index >= ordered.length
+        ? fn()
+        : this.withDocumentLock(ordered[index]!, () => acquire(index + 1));
+    return acquire(0);
+  }
+
+  /**
+   * Read the pre-write state of every batch target so a failed non-transactional
+   * batch can be undone. Decrypted plaintext is captured, not raw ciphertext:
+   * restoring goes back through the minted write path, which is the only
+   * authorized way into an SDW namespace.
+   */
+  private async capturePriorPassages(
+    prepared: readonly PreparedPassage[],
+  ): Promise<readonly PriorPassage[]> {
+    const prior: PriorPassage[] = [];
+    for (const item of prepared) {
+      const record = await this.corpus.getDocument(item.documentId);
+      prior.push({
+        documentId: item.documentId,
+        record,
+        text: record === null ? null : await this.readPassageText(record),
+      });
+    }
+    return prior;
+  }
+
+  /**
+   * Compensating undo for a partially applied non-transactional batch: restore
+   * what existed, delete what did not. Best effort by construction, because the
+   * original write error is what the caller must see; a restore that itself
+   * fails leaves a partially updated scope, which is why the transactional
+   * backend is preferred and this path exists only for backends without one.
+   */
+  private async restorePriorPassages(
+    prior: readonly PriorPassage[],
+    taint: PersistableTaint,
+  ): Promise<void> {
+    for (const item of [...prior].reverse()) {
+      try {
+        if (item.record === null || item.text === null) {
+          await this.deletePassage(this.passageIdOf(item.documentId));
+          continue;
+        }
+        for (const chunkRecord of this.rebuildChunkRecords(item.record, item.text)) {
+          await this.corpus.putChunk(chunkRecord, taint);
+        }
+        await this.corpus.putDocument(item.record, taint);
+      } catch {
+        // Keep undoing the rest; the original insert error stays the thrown one.
+      }
+    }
+  }
+
+  private rebuildChunkRecords(
+    record: SdwDocumentRecord,
+    text: string,
+  ): readonly SdwDocumentChunkRecord[] {
+    const parts = chunkText(text, this.maxChunkChars);
+    return parts.map((chunk, ordinal) => ({
+      kind: "document_chunk" as const,
+      version: 1 as const,
+      chunk_id: chunkId(ordinal),
+      document_id: record.document_id,
+      chunk_ordinal: ordinal,
+      text: chunk,
+      content_hash: passageContentHash(chunk),
+      created_at: record.created_at,
+    }));
+  }
+
+  private async pruneOrphanChunks(
+    prepared: readonly PreparedPassage[],
+    prior: readonly PriorPassage[],
+  ): Promise<void> {
+    const priorCounts = new Map(
+      prior.map((item) => [item.documentId, item.record?.chunk_count ?? 0]),
+    );
+    for (const item of prepared) {
+      const before = priorCounts.get(item.documentId) ?? 0;
+      for (let ordinal = item.chunkRecords.length; ordinal < before; ordinal++) {
+        try {
+          await this.storage.delete(
+            SDW_DOCUMENT_CORPUS_NAMESPACE,
+            documentChunkKey(item.documentId, padChunkOrdinal(ordinal), chunkId(ordinal)),
+            true,
+          );
+        } catch {
+          // Unreachable ciphertext left behind is not a correctness failure.
+        }
+      }
+    }
   }
 
   private documentId(passageId: string): string {

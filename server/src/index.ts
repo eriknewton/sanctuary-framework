@@ -103,6 +103,8 @@ import { createGovernorTools } from "./operational/governor-tools.js";
 import { createSanctuaryTools } from "./sanctuary-tools.js";
 import { createMemoryAttestTools } from "./cognitive/memory-attest.js";
 import { createSdwMemoryTools, memoryInsertApprovalArgs } from "./sdw/memory-tools.js";
+import { createSdwMemoryFileTools } from "./sdw/memory-file-tools.js";
+import { createMultiAgentIsolationGuard } from "./sdw/memory-isolation.js";
 import { createSdwMemoryProvenanceTool } from "./sdw/memory-provenance-tool.js";
 import { SdwMemoryBackendAdapter } from "./sdw/adapters/sdw-memory-backend.js";
 import { createComplianceTools } from "./compliance/eu_ai_act/generator.js";
@@ -1440,17 +1442,25 @@ export async function createSanctuaryServer(options?: {
     fortressId: fortressIdFromStoragePath(config.storage_path),
     ownerRef: "fleet-self",
   });
+  // Fail-closed multi-agent isolation guard: the adapter above is bound to ONE
+  // shared `fleet-self` owner scope reused for every caller, so SDW memory has
+  // no per-agent custody isolation yet. Resolving the SAME caller identity the
+  // router uses (`SANCTUARY_AGENT_ID`) lets the guard pin the single identity
+  // the shared scope serves and REFUSE any second, distinct wrapped-agent
+  // identity until real per-agent isolation lands. For single-coordinator use
+  // this resolves a stable value (or stable undefined) and is a strict NO-OP.
+  //
+  // ONE guard instance is shared by every tool family that reaches this scope
+  // (read/write tools AND the memory-file transcode tools). A per-family guard
+  // pins each family's own first caller, so the agent refused by memory_get
+  // would be the FIRST caller of memory_emit and could dump the whole shared
+  // corpus as plaintext files.
+  const sdwMemoryIdentity = (): string | undefined => process.env.SANCTUARY_AGENT_ID;
+  const sdwMemoryIsolationGuard = createMultiAgentIsolationGuard(sdwMemoryIdentity);
   const sdwMemoryTools = createSdwMemoryTools({
     adapter: sdwMemoryAdapter,
     auditLog,
-    // Fail-closed multi-agent isolation guard: the adapter above is bound to ONE
-    // shared `fleet-self` owner scope reused for every caller, so SDW memory has
-    // no per-agent custody isolation yet. Resolving the SAME caller identity the
-    // router uses (`SANCTUARY_AGENT_ID`) lets the guard pin the single identity
-    // the shared scope serves and REFUSE any second, distinct wrapped-agent
-    // identity until real per-agent isolation lands. For single-coordinator use
-    // this resolves a stable value (or stable undefined) and is a strict NO-OP.
-    ownerIdentity: () => process.env.SANCTUARY_AGENT_ID,
+    isolationGuard: sdwMemoryIsolationGuard,
   }).map((tool) =>
     tool.name === "memory_insert"
       ? {
@@ -1467,6 +1477,16 @@ export async function createSanctuaryServer(options?: {
   const sdwMemoryProvenanceTool = createSdwMemoryProvenanceTool({
     adapter: sdwMemoryAdapter,
     auditLog,
+  });
+  const sdwMemoryFileTools = createSdwMemoryFileTools({
+    adapter: sdwMemoryAdapter,
+    auditLog,
+    // Same resolver AND the same guard instance as the read/write tools above:
+    // memory_emit materializes the entire shared corpus as plaintext, so it has
+    // to sit behind the identical pin, and the approval projection uses the
+    // resolver to tell the operator whose memory a dump moves.
+    ownerIdentity: sdwMemoryIdentity,
+    isolationGuard: sdwMemoryIsolationGuard,
   });
 
   // 16b2. Create EU AI Act compliance bundle tools (Tier 3 auto-allow —
@@ -1656,6 +1676,7 @@ export async function createSanctuaryServer(options?: {
     ...memoryAttestTools,
     ...sdwMemoryTools,
     sdwMemoryProvenanceTool,
+    ...sdwMemoryFileTools,
     ...complianceTools,
     ...erc8004Tools,
     ...erc8004ResolveTools,

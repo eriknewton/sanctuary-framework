@@ -4,6 +4,7 @@ export * from "./document-corpus-store.js";
 export * from "./errors.js";
 export * from "./export.js";
 export * from "./import.js";
+export * from "./memory-file-tools.js";
 export * from "./tools.js";
 export * from "./grammar.js";
 export * from "./lmdb-backend.js";

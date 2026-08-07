@@ -36,14 +36,34 @@ export class SdwDocumentCorpusStore {
     this.fortressId = options.fortressId;
   }
 
-  async putDocument(record: SdwDocumentRecord, taint: Taint, txn?: SdwCorpusTxn): Promise<void> {
-    const storageKey = documentKey(record.document_id);
-    const persistable = mintPersistable(
+  /**
+   * Mint a document persistable WITHOUT writing it. Minting runs the grammar
+   * checks and the fail-closed secret classifier and has no side effects, so a
+   * caller that wants to know whether a record WOULD be accepted must call this
+   * rather than reimplement the checks; a reimplementation is free to drift
+   * from the enforced gate, this cannot.
+   */
+  mintDocument(record: SdwDocumentRecord, taint: Taint): Persistable<SdwDocumentRecord> {
+    return mintPersistable(
       { value: record, taint },
       SDW_DOCUMENT_CORPUS_NAMESPACE,
-      storageKey,
+      documentKey(record.document_id),
       this.fortressId,
     );
+  }
+
+  /** Chunk counterpart of {@link mintDocument}: same gate, no side effects. */
+  mintChunk(record: SdwDocumentChunkRecord, taint: Taint): Persistable<SdwDocumentChunkRecord> {
+    return mintPersistable(
+      { value: record, taint },
+      SDW_DOCUMENT_CORPUS_NAMESPACE,
+      documentChunkStorageKey(record),
+      this.fortressId,
+    );
+  }
+
+  async putDocument(record: SdwDocumentRecord, taint: Taint, txn?: SdwCorpusTxn): Promise<void> {
+    const persistable = this.mintDocument(record, taint);
     if (txn !== undefined) {
       await txn.writePersistable(persistable, this.encryptionKey, this.fortressId);
       return;
@@ -52,13 +72,7 @@ export class SdwDocumentCorpusStore {
   }
 
   async putChunk(record: SdwDocumentChunkRecord, taint: Taint, txn?: SdwCorpusTxn): Promise<void> {
-    const storageKey = documentChunkStorageKey(record);
-    const persistable = mintPersistable(
-      { value: record, taint },
-      SDW_DOCUMENT_CORPUS_NAMESPACE,
-      storageKey,
-      this.fortressId,
-    );
+    const persistable = this.mintChunk(record, taint);
     if (txn !== undefined) {
       await txn.writePersistable(persistable, this.encryptionKey, this.fortressId);
       return;
