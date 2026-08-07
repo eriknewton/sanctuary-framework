@@ -40,7 +40,7 @@ The v1.x mechanism, at the architectural level:
 
 5. **Writes are not enabled** in this v1.x first cut. If authorized at v1.x+N, they flow through the same per-client policy gate and per-client attestation context Drew would encounter if Drew were physically at the client's console, i.e., the write is recorded as a guardian-delegated-write commitment with the client's principal as the ultimate authorizing signature.
 
-Cross-operator trust is **not** added to the federation-protocol trust model. Cross-operator trust is established at the Concordia-commitment layer (the signed grant). Federation just transports the resulting messages. This is load-bearing and gets its own walkthrough in §3.
+Cross-operator trust is **not** added to the federation-protocol trust model. Cross-operator trust is established at the Concordia-commitment layer (the signed grant). Federation just transports the resulting messages. This boundary is critical enough to get its own walkthrough in §3.
 
 ---
 
