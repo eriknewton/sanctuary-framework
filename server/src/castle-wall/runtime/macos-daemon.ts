@@ -65,6 +65,7 @@ import {
 } from "../../storage/custody-fs.js";
 import { MacOSFlowEventConsumer } from "./macos-flow-events.js";
 import { buildChainAnchorSourceFromAuditLog } from "./audit-consumer.js";
+import { seedMacOSAuditProducerStateFromLocalAnchor } from "./macos-audit-producer-state.js";
 import { MacOSFlowIpcListener } from "./macos-ipc-listener.js";
 import { protectionSubjectFromAgentOrigin } from "../subject-binding.js";
 import {
@@ -333,6 +334,12 @@ export interface MacOSCastleWallDaemonInput {
    * channel-authenticated floor remains in effect.
    */
   auditProducerPublicKeyPath?: string;
+  /**
+   * Root application-support cursor used by the macOS system extension's
+   * audit producer. Undefined means the production root path is used only for a
+   * real root-on-darwin daemon; null disables seeding; tests pass a temp path.
+   */
+  auditProducerStatePath?: string | null;
   /**
    * Provider-side dead-man lease. Undefined/null means durable arming
    * (--no-ttl); a positive number means the extension fails open after that
@@ -674,12 +681,26 @@ export async function startMacOSCastleWallDaemon(
   const auditProducerKey = await loadMacOSAuditProducerPublicKey(
     input.auditProducerPublicKeyPath ?? CASTLE_GLOBAL_AUDIT_PRODUCER_PUBKEY_PATH,
   );
+  const chainAnchorSource = buildChainAnchorSourceFromAuditLog(input.auditLog);
   if (auditProducerKey !== null) {
     await publishFortressAuditProducerPublicKey(
       input.fortressPath,
       auditProducerKey.bytes,
       fortressCreateOwner,
     );
+    const cursorSeed = await seedMacOSAuditProducerStateFromLocalAnchor({
+      chainAnchorSource,
+      pinnedProducerKeyB64url: auditProducerKey.keyB64url,
+      ...(input.auditProducerStatePath !== undefined
+        ? { statePath: input.auditProducerStatePath }
+        : {}),
+    });
+    if (cursorSeed.kind === "seeded") {
+      // SAFETY: Castle Wall launchd diagnostics are operator-facing stderr.
+      console.error(
+        `[castle-wall] audit producer cursor seeded from verified local anchor state_path=${cursorSeed.statePath} previous_next_seq=${cursorSeed.previousNextSeq ?? "none"} next_seq=${cursorSeed.nextSeq} replaced_invalid_state=${cursorSeed.replacedInvalidState}`,
+      );
+    }
   }
   const pinnedPublicKeySha256 = sha256Hex(signer.publicKey);
   const agentOrigin = await resolveAgentOrigin(input.fortressPath, input.agentOrigin);
@@ -1078,7 +1099,7 @@ export async function startMacOSCastleWallDaemon(
     // persisted audit log at startup (one-time old-basis migration included).
     // Same log instance the sink appends to — the anchor is recomputed from
     // entries this consumer persisted, never from the wire.
-    chainAnchorSource: buildChainAnchorSourceFromAuditLog(input.auditLog),
+    chainAnchorSource,
     defaultApprovalTimeoutSeconds: 30,
     pinnedProducerKeyB64url: auditProducerKey?.keyB64url ?? null,
     fortressId: input.fortressId,

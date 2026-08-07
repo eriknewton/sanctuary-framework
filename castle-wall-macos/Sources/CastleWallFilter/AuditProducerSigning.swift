@@ -504,6 +504,7 @@ public final class AuditProducerChain {
         recordedAt: Date
     ) throws -> PendingDecision {
         try assertStateLoadSucceededLocked()
+        try refreshFromDurableStateLocked()
         let decision: String
         let matchedRuleId: String?
         let operation: String
@@ -608,6 +609,7 @@ public final class AuditProducerChain {
         reportedAt: Date
     ) throws -> PendingAvailability {
         try assertStateLoadSucceededLocked()
+        try refreshFromDurableStateLocked()
         let seq = nextSeq
         let prior = priorHashHex
         let reportedAtString = enforcement.producerClaimedAt ?? IPCBridgeNotifications.iso8601(reportedAt)
@@ -687,11 +689,36 @@ public final class AuditProducerChain {
         }
     }
 
+    private func refreshFromDurableStateLocked() throws {
+        guard let loaded = try stateStore.load() else {
+            return
+        }
+        if loaded.nextSeq > nextSeq {
+            nextSeq = loaded.nextSeq
+            priorHashHex = loaded.priorSha256Hex
+            return
+        }
+        if loaded.nextSeq == nextSeq && loaded.priorSha256Hex != priorHashHex {
+            throw AuditProducerSigningError.statePersistenceFailed(
+                "audit producer chain state conflicts with in-memory cursor at next_seq \(nextSeq)"
+            )
+        }
+    }
+
     private func advanceAfterSignedResult(seq: UInt64, hash: String) -> AuditProducerSigningError? {
         return stateQueue.sync {
             if let stateLoadError {
                 return .statePersistenceFailed(
                     "audit producer chain state could not be loaded: \(stateLoadError)"
+                )
+            }
+            do {
+                try refreshFromDurableStateLocked()
+            } catch let error as AuditProducerSigningError {
+                return error
+            } catch {
+                return .statePersistenceFailed(
+                    "audit producer chain state could not be loaded: \(error)"
                 )
             }
             guard nextSeq == seq else {

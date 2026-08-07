@@ -863,6 +863,72 @@ final class ExtensionDispatcherTests: XCTestCase {
         XCTAssertEqual(afterRestart.priorSha256Hex, hashSignedBody(first.eventCanonicalJson))
     }
 
+    func test_auditProducerChain_adoptsHigherDurableRepairBeforeSigning() throws {
+        let privateKey = Curve25519.Signing.PrivateKey()
+        let signer = ImmediateAuditProducerSigner(privateKey: privateKey)
+        let stateURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("audit-producer-repair-\(UUID().uuidString)")
+            .appendingPathComponent("state.json")
+        defer { try? FileManager.default.removeItem(at: stateURL.deletingLastPathComponent()) }
+        let store = FileAuditProducerChainStateStore(url: stateURL)
+        let lowHash = String(repeating: "a", count: 64)
+        let repairedHash = String(repeating: "b", count: 64)
+        try store.save(AuditProducerChainState(nextSeq: 576, priorSha256Hex: lowHash))
+        let chain = AuditProducerChain(stateStore: store)
+
+        try store.save(AuditProducerChainState(nextSeq: 28_174, priorSha256Hex: repairedHash))
+
+        let exp = expectation(description: "repaired cursor adopted")
+        var producer: AuditProducerSignatureBody?
+        chain.buildSignedFlowDecision(
+            outcome: .allow(matchedRuleId: "r-allow"),
+            flow: makeFlow(),
+            signer: signer
+        ) { result in
+            if case .success(.flowDecisionRecorded(let body)) = result {
+                producer = body.producer
+            }
+            exp.fulfill()
+        }
+        wait(for: [exp], timeout: 2)
+
+        XCTAssertEqual(producer?.seq, 28_174)
+        XCTAssertEqual(producer?.priorSha256Hex, repairedHash)
+    }
+
+    func test_auditProducerChain_doesNotOverwriteHigherDurableRepairWithLateLowReply() throws {
+        let privateKey = Curve25519.Signing.PrivateKey()
+        let stateURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("audit-producer-late-low-\(UUID().uuidString)")
+            .appendingPathComponent("state.json")
+        defer { try? FileManager.default.removeItem(at: stateURL.deletingLastPathComponent()) }
+        let store = FileAuditProducerChainStateStore(url: stateURL)
+        let repairedHash = String(repeating: "c", count: 64)
+        let chain = AuditProducerChain(stateStore: store)
+
+        let exp = expectation(description: "late low reply rejected")
+        var result: Result<IpcMessage, AuditProducerSigningError>?
+        chain.buildSignedFlowDecision(
+            outcome: .allow(matchedRuleId: "r-allow"),
+            flow: makeFlow(),
+            signer: DelayedAuditProducerSigner(privateKey: privateKey, delay: 0.2)
+        ) { r in
+            result = r
+            exp.fulfill()
+        }
+
+        try store.save(AuditProducerChainState(nextSeq: 28_174, priorSha256Hex: repairedHash))
+        wait(for: [exp], timeout: 2)
+
+        guard case .failure(let error)? = result else {
+            return XCTFail("the stale low-seq sign reply must be dropped")
+        }
+        XCTAssertEqual(error, .chainAdvancedBeforeSignReply)
+        let persisted = try XCTUnwrap(store.load())
+        XCTAssertEqual(persisted.nextSeq, 28_174)
+        XCTAssertEqual(persisted.priorSha256Hex, repairedHash)
+    }
+
     func test_auditProducerChain_unavailableDefaultStoreFailsClosed() {
         let privateKey = Curve25519.Signing.PrivateKey()
         let signer = ImmediateAuditProducerSigner(privateKey: privateKey)
