@@ -1,7 +1,8 @@
 # Castle Wall Linux - operator deploy guide
 
 This guide is currently a source-validation reference, not a production
-activation runbook. Castle Wall Linux Phase 1 is partial: the nftables,
+activation runbook. Castle Wall Linux Phase 1 ships no enforcement (Assurance Matrix
+`not_implemented`): the nftables,
 cgroup v2, and NFQUEUE modules are integration-tested, but the shipped daemon
 does not install the table, bind NFQUEUE, create cgroup scopes, or call the
 deny-by-default evaluator. The shipped systemd unit is also `Type=notify`

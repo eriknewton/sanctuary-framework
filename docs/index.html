@@ -154,9 +154,12 @@ layout: null
               <p class="provisioning__body">
                 The Castle Wall blocks unauthorized outbound calls at the operating system. A
                 prompt-injected agent cannot route around it because the kernel itself enforces.
-                DNS, DoH, DoT, raw sockets, all covered. Live on Linux and macOS: the wall
-                enforces a signed operator policy, with a clean per-account allow/deny
-                demonstration and 5/5 reboot survival behind the claim.
+                Live on macOS: the wall enforces a signed operator policy, with a clean
+                per-account allow/deny demonstration and 5/5 reboot survival behind the claim.
+                On Linux the nftables, cgroup, and NFQUEUE modules are tested against a real
+                kernel, DNS, DoH, DoT and raw sockets included, and the shipped daemon does not
+                install that path yet, so Linux is source coverage today rather than live
+                enforcement.
               </p>
             </div>
           </li>
@@ -205,9 +208,10 @@ layout: null
           <span class="layer__id">Perimeter</span>
           <h3 class="layer__title">Castle Wall</h3>
           <p class="layer__body">
-            Operating-system-level egress filtering. nftables, cgroup v2, and NFQUEUE on Linux.
-            Network Extension on macOS. Plain DNS, DoH, DoT, and raw-socket bypass coverage all
-            verified end-to-end against real kernel bindings. Phase 1 shipped.
+            Operating-system-level egress filtering. Network Extension on macOS, where Phase 1
+            is proven on a signed and notarized build. On Linux the nftables, cgroup v2, and
+            NFQUEUE modules carry plain-DNS, DoH, DoT, and raw-socket bypass coverage against
+            real kernel bindings, and the shipped daemon does not install that path yet.
           </p>
           <div class="layer__tags">
             <span class="layer__tag">kernel-binding</span>
@@ -442,11 +446,11 @@ sanctuary = MCPTool.from_stdio(
             <span>Architecture</span>
             <span>2026-05-08</span>
           </div>
-          <h3 class="journal__title">The Castle Wall, Live on Linux</h3>
+          <h3 class="journal__title">The Castle Wall, Linux Phase 1 Source Path</h3>
           <p class="journal__excerpt">
             Cooperative gates do not stop a prompt-injected agent. Kernel-level enforcement does.
-            Castle Wall Phase 1 shipped on Linux: 203 Rust tests against a real kernel binding,
-            with plain-DNS, DoH, and DoT bypass coverage verified end-to-end.
+            Current correction: Linux Phase 1 source modules are tested against a real kernel
+            binding, and the shipped daemon does not assemble live enforcement.
           </p>
           <span class="btn btn--terminal">Read the post</span>
         </a>

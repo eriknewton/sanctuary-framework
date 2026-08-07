@@ -12,7 +12,7 @@ Last updated: 2026-08-02. Freshness is enforced: a CI guard requires feature PRs
 
 Sanctuary's enforcement model is the Castle Architecture, codified at [`server/rfcs/RFC-0003-castle-architecture.md`](server/rfcs/RFC-0003-castle-architecture.md). Five named mechanisms, each with a distinct enforcement contract.
 
-- **Castle Wall (the perimeter).** OS-level egress enforcement at the operator-external boundary. macOS is proven: per-uid allow/deny plus reboot-survival (N=5) on a Dev-ID-signed and notarized binary, drills 2026-06-11 through 2026-06-22; the per-flow rule-attributed audit trail is the named remaining gap. Linux is partial, not shipped as live enforcement: the source modules are integration-proven, but the shipped daemon does not install the nftables table, bind NFQUEUE, create cgroup scopes, or call the deny-by-default evaluator. Open defect: **IC-02, IC-03, IC-04** (`Review/Sanctuary/Inert_Capability_Sweep_2026-08-07.md`). Windows is on the roadmap.
+- **Castle Wall (the perimeter).** OS-level egress enforcement at the operator-external boundary. macOS is proven: per-uid allow/deny plus reboot-survival (N=5) on a Dev-ID-signed and notarized binary, drills 2026-06-11 through 2026-06-22; the per-flow rule-attributed audit trail is the named remaining gap. Linux ships no egress enforcement at all: the source modules are integration-proven, and the shipped daemon does not install the nftables table, bind NFQUEUE, create cgroup scopes, or call the deny-by-default evaluator, so the matrix row is `not_implemented` rather than partial. Open defect: **IC-02, IC-03, IC-04** (`Review/Sanctuary/Inert_Capability_Sweep_2026-08-07.md`). Windows is on the roadmap.
 - **Sentinels (the nerves).** Internal observation via process introspection and behavioral baselining. Anomalies surface to the operator via menubar and notifications. Observation, not enforcement.
 - **Charter (the will).** Cooperative MCP surface for compliant agents. Encrypted state, hash-chained audit with current signed-checkpoint bounds, mandate primitives, four canonical policy slots, substrate selector, Concordia receipt integration, Verascore reputation hooks. Open defect: **IC-05, IC-06** (`Review/Sanctuary/Inert_Capability_Sweep_2026-08-07.md`).
 - **Heralds (the voice).** Concordia receipts for cross-castle commitments, Verascore reputation aggregating across operators. Cross-castle accountability post-action.
@@ -34,7 +34,7 @@ Castle-walking principle: real enforcement AND delightful operator experience. H
 
 Target: OS-level egress filtering via netfilter / NFQUEUE with per-process cgroup routing, so outbound calls are blocked at the kernel even when the agent is prompt-injected, jailbroken, or simply not bothering to cooperate. Current bound: the Linux modules are proven in integration tests, but the shipped daemon does not assemble that enforcement loop. **Why it matters:** this is the security claim the Linux row must earn before it can be called shipped.
 
-*Status: partial, not shipped as live enforcement. ASSURANCE_MATRIX row "Egress enforcement: Linux (Castle Wall Phase 1)" is partial. Open defect: **IC-02, IC-03, IC-04** (`Review/Sanctuary/Inert_Capability_Sweep_2026-08-07.md`).*
+*Status: not shipped as enforcement. ASSURANCE_MATRIX row "Egress enforcement: Linux (Castle Wall Phase 1)" is `not_implemented`, so marketing and release copy may not trace a Linux enforcement claim to it. Open defect: **IC-02, IC-03, IC-04** (`Review/Sanctuary/Inert_Capability_Sweep_2026-08-07.md`).*
 
 ### Castle Wall on macOS: signed system extension, enforced and reboot-surviving
 
@@ -150,7 +150,7 @@ Today the macOS wall enforces and a per-rule read-out exists, but the unforgeabl
 
 #### Castle Wall on Windows
 
-Windows Filtering Platform backend. Same drill discipline as Linux Phase 1 and macOS. **Why it matters:** Windows operators get the same kernel-level enforcement everyone else has. Sequenced after the macOS discipline held end to end so the cross-platform bar stays consistent.
+Windows Filtering Platform backend. Same drill discipline as macOS. **Why it matters:** Windows operators get kernel-level enforcement held to the macOS bar, which is the only platform where the shipped artifact enforces today; Linux is `not_implemented` until **IC-02, IC-03, IC-04** are fixed (`Review/Sanctuary/Inert_Capability_Sweep_2026-08-07.md`). Sequenced after the macOS discipline held end to end so the cross-platform bar stays consistent.
 
 *Status: planning.*
 

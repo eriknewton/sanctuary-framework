@@ -75,7 +75,7 @@ Current capability summary:
 | Local multi-agent coordination, fortress-local hub APIs, audit chain | Shipped with audit-chain verifier caveats: production checkpoints are unsigned and `--no-strict` can report PASS with findings. Open defect: **IC-05, IC-06** (`Review/Sanctuary/Inert_Capability_Sweep_2026-08-07.md`) |
 | Federation Protocol v0.1 foundation | Shipped; cross-operator federation hardening underway per Wave 1 design (2026-05-26) |
 | Concordia composition (negotiation receipts), Verascore composition (reputation) | Optional, default off; both shipped |
-| Castle Wall (OS-level egress enforcement): Linux | Partial, not shipped as live enforcement. Source modules are integration-proven; the shipped daemon does not install enforcement. Open defect: **IC-02, IC-03, IC-04** (`Review/Sanctuary/Inert_Capability_Sweep_2026-08-07.md`) |
+| Castle Wall (OS-level egress enforcement): Linux | Not implemented. Source modules are integration-proven; the shipped daemon installs no enforcement, so the Assurance Matrix row is `not_implemented` and no claim may trace to it. Open defect: **IC-02, IC-03, IC-04** (`Review/Sanctuary/Inert_Capability_Sweep_2026-08-07.md`) |
 | Castle Wall macOS: signed sysext, host app, content-filter provider, retail UX | Shipped; enforces a signed operator policy with a clean per-uid allow/deny demonstration that survives reboot (N=5, drill 2026-06-22, one host / one OS version, Dev-ID-signed and notarized). Not an audited per-rule-per-flow trail |
 | Castle Wall Windows | Roadmapped |
 | Mobile (PWA) operator companion | Roadmapped |
@@ -183,7 +183,9 @@ Substitute `<template-name>` with the archetype the operator picked (`research-a
 
 ### Step 5: Hand back to the operator
 
-Tell them: "Sanctuary is installed and your first sub-agent is scaffolded. Open the Sovereignty Dashboard at http://localhost:3501 to see what your agents are doing in real time. Your passphrase is in your macOS Keychain; if you want a printable backup, run `sanctuary export-passphrase`."
+Tell them: "Sanctuary is installed and your first sub-agent is scaffolded. Open the Sovereignty Dashboard at http://localhost:3501 to review what your agents are doing, and reload the page when you want current data. Your passphrase is in your macOS Keychain; if you want a printable backup, run `sanctuary export-passphrase`."
+
+Current bound: this line previously said "in real time", and the dashboard has no live-update path. The `inbox` and `agent_status` SSE events are declared but never broadcast, and no periodic refetch runs, so five of the six inbox sources and every per-agent status change go stale until the operator reloads. Do not describe the dashboard as a real-time view. Open defect: **IC-12** (`Review/Sanctuary/Inert_Capability_Sweep_2026-08-07.md`).
 
 ### Raw MCP server path (Step 4 alternative)
 
@@ -300,7 +302,7 @@ The operator remains the custody root in every mode. Commodity operator-cloud mo
 
 Sanctuary installs the protections your body used to provide by default: a perimeter, custody, memory, and a record of what happened. Everything it protects for you together is **your Sanctuary**: each machine is a rampart the Castle Wall holds, each fortress is a keep inside those walls, and each agent is a resident of exactly one keep. The unit never blurs: one agent, one account, one fortress, one master key. Architecturally it ships as five named mechanisms.
 
-**Castle Wall: the perimeter.** What the world cannot cross without your consent. OS-level egress enforcement at the operator-external boundary. macOS enforces a signed operator policy with a proven per-uid allow/deny demonstration that survives reboot, captured on a real host (drills 2026-06-11 through 2026-06-22, boot survival 5 of 5 on a Dev-ID-signed and notarized binary): agent egress to a non-allowlisted address blocked, allowlisted egress allowed, operator egress unaffected, and enforcement live again after every reboot. Linux is partial, not shipped as live enforcement: the tested nftables, cgroup, and NFQUEUE modules are not wired into the shipped daemon boot path. Open defect: **IC-02, IC-03, IC-04** (`Review/Sanctuary/Inert_Capability_Sweep_2026-08-07.md`). The macOS proof is one host and one OS version, not an audited per-rule-per-flow trail. Windows on the roadmap.
+**Castle Wall: the perimeter.** What the world cannot cross without your consent. OS-level egress enforcement at the operator-external boundary. macOS enforces a signed operator policy with a proven per-uid allow/deny demonstration that survives reboot, captured on a real host (drills 2026-06-11 through 2026-06-22, boot survival 5 of 5 on a Dev-ID-signed and notarized binary): agent egress to a non-allowlisted address blocked, allowlisted egress allowed, operator egress unaffected, and enforcement live again after every reboot. Linux ships no egress enforcement: the tested nftables, cgroup, and NFQUEUE modules are not wired into the shipped daemon boot path, and the Assurance Matrix row is `not_implemented`. Open defect: **IC-02, IC-03, IC-04** (`Review/Sanctuary/Inert_Capability_Sweep_2026-08-07.md`). The macOS proof is one host and one OS version, not an audited per-rule-per-flow trail. Windows on the roadmap.
 
 **Sentinels: the nerves.** What surfaces what's happening to your awareness. Internal observation via process introspection and behavioral baselining. Anomalies surface through the menubar or notifications. Observation, not enforcement.
 

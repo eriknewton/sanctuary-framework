@@ -15,8 +15,9 @@ claims_era_note: true
 
 # The Castle Wall, Linux Phase 1 Source Path
 
-> **Current correction, 2026-08-07:** Linux Castle Wall is partial, not shipped
-> as live enforcement. The nftables, cgroup, and NFQUEUE modules are tested
+> **Current correction, 2026-08-07:** Linux Castle Wall ships no enforcement.
+> The Assurance Matrix row is `not_implemented`, so no marketing or release copy
+> may trace a Linux enforcement claim to it. The nftables, cgroup, and NFQUEUE modules are tested
 > against a real kernel, but the shipped daemon does not install the table, bind
 > NFQUEUE, create cgroup scopes, or call the deny-by-default evaluator. The
 > systemd unit is also `Type=notify` while the daemon never sends readiness.
@@ -71,7 +72,7 @@ Castle Wall Phase 1 on Linux landed source modules in PRs #124 and #125, with th
 
 **CI surface.** The Linux daemon builds on every PR. Cargo audit gates against the RustSec advisory database with `--deny warnings`, so any unmaintained dependency or fresh CVE breaks CI before it lands on main. A cross-compilation gate verifies the daemon builds on macOS-host CI for Phase 2 readiness.
 
-203 tests passing on a CI run against a real kernel binding is source evidence, not proof that the shipped daemon enforces. Operators should treat Linux Castle Wall as partial until **IC-02, IC-03, IC-04** are fixed (`Review/Sanctuary/Inert_Capability_Sweep_2026-08-07.md`).
+203 tests passing on a CI run against a real kernel binding is source evidence, not proof that the shipped daemon enforces. Operators should treat Linux Castle Wall as unshipped until **IC-02, IC-03, IC-04** are fixed (`Review/Sanctuary/Inert_Capability_Sweep_2026-08-07.md`).
 
 ## Composition, not substitution
 
@@ -83,7 +84,7 @@ Composition holds across the partner surface, too. Sanctuary signs Coinbase x402
 
 ## What's next
 
-Linux Phase 1 does not ship as live enforcement today; the source path is partial until **IC-02, IC-03, IC-04** are fixed (`Review/Sanctuary/Inert_Capability_Sweep_2026-08-07.md`). macOS later shipped a separate Network Extension path and is proven in the current Assurance Matrix.
+Linux Phase 1 does not ship as live enforcement today; the source path stays unshipped until **IC-02, IC-03, IC-04** are fixed (`Review/Sanctuary/Inert_Capability_Sweep_2026-08-07.md`). macOS later shipped a separate Network Extension path and is proven in the current Assurance Matrix.
 
 Windows Phase 2 sits behind macOS, using Windows Filtering Platform. Container and microVM isolation, Phase 3, is queued for the highest-assurance enterprise deployments where additional isolation between the wrapped agent and the operator's host filesystem matters.
 

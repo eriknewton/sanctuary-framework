@@ -143,7 +143,7 @@ A verifier reading a JSONL export MUST:
 7. **Checkpoint signature:** For each non-unsigned checkpoint, verify the Ed25519 signature over the domain-separated signing payload using the `public_key` field (or a supplied trusted key). Current bound: production checkpoints are unsigned because no production boot path supplies the checkpoint signer, so this leg is skipped on shipped installs. Open defect: **IC-05** (`Review/Sanctuary/Inert_Capability_Sweep_2026-08-07.md`).
 8. **Legacy anchor:** Assert that `root_hash` is a valid 64-character hex string.
 
-In strict mode (default), any single failure is intended to cause the verdict to be `FAIL`. Current bound: non-strict mode (`--no-strict`) can report `PASS` even when findings are present, so do not use `--no-strict` as audit evidence until **IC-06** is fixed (`Review/Sanctuary/Inert_Capability_Sweep_2026-08-07.md`).
+In strict mode (default), any single failure causes the verdict to be `FAIL`; that path is sound. Current bound, confined to `--no-strict`: non-strict mode reports `PASS` even when findings are present, so do not use `--no-strict` as audit evidence until **IC-06** is fixed (`Review/Sanctuary/Inert_Capability_Sweep_2026-08-07.md`).
 
 ## Verification Report Schema
 

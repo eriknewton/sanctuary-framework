@@ -48,7 +48,7 @@
     {
       "assurance_row_id": "4",
       "label": "Tamper-evident audit chain",
-      "assurance_status": "proven",
+      "assurance_status": "partial",
       "fixtures_passed": 8,
       "coverage_state": "covered",
       "passing_fixture_names": [
@@ -119,7 +119,7 @@
     {
       "assurance_row_id": "9",
       "label": "Egress enforcement: Linux (Castle Wall Phase 1)",
-      "assurance_status": "proven",
+      "assurance_status": "not_implemented",
       "fixtures_passed": 5,
       "coverage_state": "covered",
       "passing_fixture_names": [
@@ -154,7 +154,7 @@
     {
       "assurance_row_id": "12",
       "label": "Export / exit bundle",
-      "assurance_status": "proven",
+      "assurance_status": "partial",
       "fixtures_passed": 5,
       "coverage_state": "covered",
       "passing_fixture_names": [

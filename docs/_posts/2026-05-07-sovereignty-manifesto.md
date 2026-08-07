@@ -72,6 +72,14 @@ Underneath each of those experiences is the same architecture. The agent runs as
 
 These are not aspirational. They are buildable. We are building them. The v1.2 substrate is shipping today, and Castle Wall Phase 1 enforcement went live on Linux this week. macOS Phase 1 follows once the platform's developer-program review clears.
 
+> **Current correction, 2026-08-07:** the Linux claim above did not hold up. The
+> nftables, cgroup, and NFQUEUE modules are tested against a real kernel, and the
+> shipped daemon does not install the table, bind NFQUEUE, create cgroup scopes,
+> or call the deny-by-default evaluator, so Linux Castle Wall is not live
+> enforcement. macOS Phase 1 did later ship and is proven in the Assurance
+> Matrix. Open defect: **IC-02, IC-03, IC-04**
+> (`Review/Sanctuary/Inert_Capability_Sweep_2026-08-07.md`).
+
 ## The Castle Architecture
 
 Sanctuary's enforcement model has four layers. They work together just like the living community in a real castle. The Castle Wall holds the perimeter. Sentinels in the watchtowers observe and call out. The Charter governs the inhabitants inside who choose to work under its terms. The Heralds carry verified accounts of deeds across castles. Each layer has a distinct contract. The contracts compose; none of them substitute for another.
@@ -151,6 +159,12 @@ The substrate that defends the operator defends the agent. The rights we defend 
 If you are a technical operator: install Sanctuary. The substrate is shipping now on npm. Wrap an agent. Watch it run on your machine, with keys you derived. Run a recovery drill. Try the substrate selector. Test the export-and-walk path on a fresh fortress and confirm your record arrived intact. The framework alone is operational with zero external dependency.
 
 If you are an enterprise buyer evaluating sovereign deployment: pilot conversations are open. Castle Wall Phase 1 is live on Linux today. macOS Phase 1 follows once the platform's developer-program review clears. Pilot demos include a prompt-injection scenario showing the wall blocking unauthorized egress at the kernel and the operator approving in under ten seconds.
+
+> **Current correction, 2026-08-07:** read the Linux sentence above as retired.
+> Live kernel enforcement is proven on macOS; the shipped Linux daemon installs
+> no kernel enforcement, so a Linux pilot demo cannot be offered on that basis.
+> Open defect: **IC-02, IC-03, IC-04**
+> (`Review/Sanctuary/Inert_Capability_Sweep_2026-08-07.md`).
 
 If you are a partner building a payment rail, mandate framework, identity registry, or reputation engine: compose with us. The substrate is open source and free always. We ship reference integrations against your primitives. We contribute upstream as the operator-side complement to your work. The operator-sovereign reference implementation is the most useful partner you can have if your goal is genuine portability rather than soft lock-in.
 

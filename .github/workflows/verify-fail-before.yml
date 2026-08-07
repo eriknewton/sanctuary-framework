@@ -4,7 +4,20 @@ on:
   pull_request:
     branches: [main]
     paths:
-      - "server/src/**"
+      # Must match the CHANGED_SRC filter in scripts/verify-fail-before.sh: the
+      # guard only reasons about TypeScript source, so a docs-only edit under
+      # server/src (for example server/src/README.md) must not trigger it.
+      # Failure mode when these drift apart: the job starts on a PR with no
+      # TypeScript change and reds asking for a failing test that cannot exist.
+      # Both the flat and nested forms are listed on purpose. GitHub's `**`
+      # spans slashes, so `server/src/**/*.ts` requires at least one directory
+      # level and would silently skip top-level files such as
+      # server/src/index.ts. Under-triggering disables the guard without any
+      # visible signal, which is worse than the over-trigger being fixed here.
+      - "server/src/*.ts"
+      - "server/src/*.tsx"
+      - "server/src/**/*.ts"
+      - "server/src/**/*.tsx"
       - "server/test/**/*.test.ts"
       - "scripts/verify-fail-before.sh"
       - ".github/workflows/verify-fail-before.yml"

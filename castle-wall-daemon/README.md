@@ -9,7 +9,7 @@ is still partial until the shipped daemon assembles the tested loop.
 
 ## Status
 
-Phase 1 Linux: partial, not shipped as live enforcement. PR 2b landed and tests
+Phase 1 Linux: no shipped enforcement (Assurance Matrix `not_implemented`). PR 2b landed and tests
 the kernel-touching modules (`nftables`, `cgroup`, `nfqueue`), but
 `daemon::boot` does not install an nftables table, bind NFQUEUE, create cgroup
 scopes, or call the deny-by-default evaluator. The shipped systemd unit is also

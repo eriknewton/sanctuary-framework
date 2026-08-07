@@ -86,11 +86,22 @@ if ! git rev-parse --verify "$BASE_REF^{commit}" >/dev/null 2>&1; then
   exit 2
 fi
 
+# Both sides of this check MUST filter to the same file kinds. The test side
+# below is filtered to `.test.tsx?`, so the source side is filtered to `.tsx?`:
+# without it a docs-only edit to server/src/README.md counts as a source change
+# and the guard demands a failing test that no source change could produce.
+# Failure mode when this drifts: the check reds with "server/src changed, but no
+# changed server/test/*.test.ts files were found" on a PR that touched zero
+# TypeScript. Must match the `server/src/**/*.ts` path filter in
+# .github/workflows/verify-fail-before.yml.
 CHANGED_SRC=()
 while IFS= read -r changed_src; do
   [[ -z "$changed_src" ]] && continue
   CHANGED_SRC+=("$changed_src")
-done < <(git diff --name-only "$BASE_REF"...HEAD -- server/src)
+done < <(
+  git diff --name-only "$BASE_REF"...HEAD -- server/src \
+    | grep -E '\.tsx?$' || true
+)
 
 CHANGED_TESTS=()
 while IFS= read -r changed_test; do
