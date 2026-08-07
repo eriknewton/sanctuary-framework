@@ -99,6 +99,16 @@ export {
 } from "./local-provisioning-actions.js";
 
 export {
+  buildLocalProvisioningModelPullAuditPayload,
+  buildLocalProvisioningRefusalAuditPayload,
+  type BuildLocalProvisioningModelPullAuditPayloadParams,
+  type BuildLocalProvisioningRefusalAuditPayloadParams,
+  type LocalProvisioningAuditOperation,
+  type LocalProvisioningAuditPayloadBuildError,
+  type LocalProvisioningAuditPayloadBuildResult,
+} from "./local-provisioning-audit.js";
+
+export {
   BADGE_LABEL_KEYS,
   BADGE_TRADEOFF_KEYS,
   BACKEND_FALLBACK_STRINGS,
