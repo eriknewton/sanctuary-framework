@@ -35,17 +35,18 @@ The three claims taking the most damage are ours, and all three are named in the
   and any fortress that has ever rotated its identity key loses all pre-rotation
   state on import (IC-07, IC-08, IC-09).
 
-The macOS Castle Wall row is **not** among the damaged claims. It is the row the
-enforcement thesis rests on, and it survived the sweep intact.
+The macOS Castle Wall row was not changed by this wiring sweep. Its proof
+remains the drill evidence named in the Assurance Matrix.
 
 ## What the sweep did not examine
 
 This was a wiring sweep: it asked, for each capability, whether a shipping caller
 exists. It did not audit cryptographic correctness, concurrency, or crash
-consistency. Across all 32 findings it found no misused primitive, no signature
-verified against the wrong bytes, and no check written backwards. The
-implementations are sound and the wiring is where they break. A clean result here
-says nothing about defect classes the sweep did not look for.
+consistency.
+
+Bound of this result: the sweep did not identify those defect classes in the
+wiring paths it examined. It does not establish implementation soundness, and no
+separate cryptographic or security review has been run for this register.
 
 Two findings are inference rather than observation, and are marked as such below:
 IC-01 (macOS paused-flow semantics) and IC-03 (systemd `Type=notify` timeout
@@ -117,7 +118,7 @@ per-uid allow/deny enforcement demonstration that closed the enforcement thesis
 gate on 2026-06-15. Had it been inert, the macOS Castle Wall row in the Assurance
 Matrix would have been in question. It is not.
 
-Zero candidates were left uncertain. Every one resolved to confirmed-inert or
+Within this wiring sweep, every candidate resolved to confirmed-inert or
 refuted.
 
 ## Related

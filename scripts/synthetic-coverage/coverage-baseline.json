@@ -120,15 +120,9 @@
       "assurance_row_id": "9",
       "label": "Egress enforcement: Linux (Castle Wall Phase 1)",
       "assurance_status": "not_implemented",
-      "fixtures_passed": 5,
-      "coverage_state": "covered",
-      "passing_fixture_names": [
-        "boundary-admission: deny on expired token",
-        "boundary-admission: deny on missing token",
-        "boundary-admission: deny on revoked principal",
-        "boundary-admission: happy admit",
-        "boundary-admission: replay rejection"
-      ]
+      "fixtures_passed": 0,
+      "coverage_state": "not_implemented",
+      "passing_fixture_names": []
     },
     {
       "assurance_row_id": "10",

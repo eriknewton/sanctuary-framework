@@ -11,11 +11,12 @@ import {
 //
 // HONEST BOUND: row 9 (Linux egress enforcement) is `not_implemented` in
 // ASSURANCE_MATRIX.md as of 2026-08-07. These fixtures exercise the rule-schema
-// admission gate plus the locally-modelled admitBoundary loop below; they do
-// NOT reach the shipped castle-wall-daemon, which installs no nftables table,
+// admission gate plus the locally-modelled admitBoundary loop below. They do
+// not reach the shipped castle-wall-daemon, which installs no nftables table,
 // binds no NFQUEUE, creates no cgroup scope, and never calls the deny-by-default
-// evaluator. A green row here is format and policy-shape coverage, never
-// evidence that a Linux host is enforcing.
+// evaluator. While the matrix row is `not_implemented`, report.ts suppresses
+// these fixtures from coverage totals so they cannot read as Linux enforcement
+// assurance.
 // Open defect: IC-02, IC-04 (docs/audit/inert-capability-register.md).
 const CLAIM_ID = "9";
 const CLAIM_LABEL = "Egress enforcement: Linux (Castle Wall Phase 1)";

@@ -43,9 +43,9 @@ The toolkit is built for an enterprise deploying agents at scale and needing cen
 
 This is a good premise. It's also incomplete.
 
-**Sanctuary's premise: sovereignty is a property of the agent, not the infrastructure.**
+**Sanctuary's premise: sovereignty travels with the agent.**
 
-Sanctuary doesn't assume the agent's operator and the infrastructure provider are the same entity. It assumes the opposite, that agents need sovereignty *from* infrastructure, not just governance *by* infrastructure. An agent running on someone else's cloud, connecting to someone else's MCP servers, processing someone else's data, still needs its own encrypted state, its own identity, and its own ability to prove claims without revealing the underlying data.
+Sanctuary assumes the agent's operator and the infrastructure provider can be different entities. Agents need sovereignty *from* infrastructure as well as governance *by* infrastructure. An agent running on someone else's cloud, connecting to someone else's MCP servers, processing someone else's data, still needs its own encrypted state, its own identity, and its own ability to prove claims without revealing the underlying data.
 
 This isn't a philosophical distinction. It's an architectural one.
 
@@ -57,7 +57,7 @@ This isn't a philosophical distinction. It's an architectural one.
 
 **Dual sovereignty.** This is the structural insight that drives everything we build. Human sovereignty and agent sovereignty are not separate problems. They require identical architecture. A human acting through an agent needs the same protections as an autonomous agent acting on its own behalf, encrypted state, self-custodied identity, approval gates, verifiable reputation. Microsoft's toolkit governs agents on behalf of enterprises. Sanctuary protects both the human and the agent, using the same mechanisms.
 
-**No cloud dependency.** Sanctuary runs locally. One command: `npx @sanctuary-framework/mcp-server`. No Azure subscription. No cloud account. No platform dependency. This matters because the agents that need sovereignty most are the ones operating outside enterprise infrastructure, personal agents, research agents, agents running on local hardware.
+**No cloud dependency.** Sanctuary runs locally. One command: `npx @sanctuary-framework/mcp-server`. No Azure subscription. No cloud account. This matters because the agents that need sovereignty most are the ones operating outside enterprise infrastructure, personal agents, research agents, agents running on local hardware.
 
 **Agent-to-agent trust.** Sanctuary's sovereignty handshake lets two agents cryptographically verify each other's security posture before transacting. This is the foundation for an open trust network that isn't mediated by any platform. Microsoft's toolkit handles identity within an organization's boundary. It doesn't address how agents from different organizations (or agents with no organizational affiliation at all) establish mutual trust.
 

@@ -36,6 +36,7 @@ export interface GapEntry {
     | "proven_without_fixture"
     | "partial_fixture_only"
     | "documented_intentional_gap"
+    | "not_implemented"
     | "planned_not_yet_covered";
   blocking_for_gate: boolean;
 }
@@ -134,6 +135,15 @@ function gapForRow(row: ClaimRowSummary): GapEntry | undefined {
       row_id: row.row_id,
       label: row.label,
       reason: "documented_intentional_gap",
+      blocking_for_gate: false,
+    };
+  }
+
+  if (row.assurance_status === "not_implemented") {
+    return {
+      row_id: row.row_id,
+      label: row.label,
+      reason: "not_implemented",
       blocking_for_gate: false,
     };
   }

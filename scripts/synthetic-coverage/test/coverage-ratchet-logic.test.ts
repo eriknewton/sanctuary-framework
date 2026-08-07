@@ -40,6 +40,7 @@ function report(rows: CoverageRow[]): CoverageReport {
       total_rows: rows.length,
       rows_with_fixtures: rows.filter((r) => r.fixtures_run > 0).length,
       rows_no_fixture: rows.filter((r) => r.coverage_state === "no_fixture").length,
+      rows_not_implemented: rows.filter((r) => r.coverage_state === "not_implemented").length,
       rows_failing: rows.filter((r) => r.fixtures_failed > 0).length,
     },
   };
@@ -119,6 +120,26 @@ describe("diffAgainstBaseline", () => {
     ]);
     const v = diffAgainstBaseline(live, BASELINE);
     expect(v.map((x) => x.kind)).toContain("coverage_state_regressed");
+  });
+
+  it("does not treat a not_implemented baseline row as passing assurance", () => {
+    const live = report([
+      row({ assurance_row_id: "9", fixtures_passed: 0, coverage_state: "not_implemented" }),
+    ]);
+    const baseline: CoverageBaseline = {
+      rows: [
+        {
+          assurance_row_id: "9",
+          label: "row 9",
+          assurance_status: "not_implemented",
+          fixtures_passed: 0,
+          coverage_state: "not_implemented",
+          passing_fixture_names: [],
+        },
+      ],
+    };
+
+    expect(diffAgainstBaseline(live, baseline)).toEqual([]);
   });
 
   it("REDS when a fixture is now failing (even if counts otherwise hold)", () => {

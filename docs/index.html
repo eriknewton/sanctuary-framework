@@ -115,8 +115,9 @@ layout: null
         <span class="eyebrow">Local node</span>
         <h2 id="provisioning-title">One command. <span class="text-gradient">Full stack, running locally.</span></h2>
         <p>
-          Sanctuary runs on your hardware with your keys. Nothing leaves the machine unless you
-          approve it. Point any MCP-compatible agent at it and the whole substrate is live.
+          Sanctuary runs on your hardware with your keys. Policy-gated calls route through local
+          approval surfaces, and Castle Wall enforcement follows the platform bounds in the
+          Assurance Matrix. Point any MCP-compatible agent at it and the cooperative substrate is live.
         </p>
       </div>
 
@@ -153,10 +154,11 @@ layout: null
             <div>
               <h3 class="provisioning__heading">Kernel-level egress wall</h3>
               <p class="provisioning__body">
-                The Castle Wall blocks unauthorized outbound calls at the operating system. A
-                prompt-injected agent cannot route around it because the kernel itself enforces.
+                Where the platform row is proven, the Castle Wall blocks unauthorized outbound
+                calls at the operating system. A prompt-injected agent cannot route around that
+                path because the kernel itself enforces.
                 Live on macOS: the wall enforces a signed operator policy, with a clean
-                per-account allow/deny demonstration and 5/5 reboot survival behind the claim.
+                per-account allow/deny demonstration and 5/5 attended reboot survival behind the claim.
                 On Linux the nftables, cgroup, and NFQUEUE modules are tested against a real
                 kernel, DNS, DoH, DoT and raw sockets included, and the shipped daemon does not
                 install that path yet, so Linux is source coverage today rather than live
@@ -179,8 +181,8 @@ layout: null
             <div>
               <h3 class="provisioning__heading">Local approval dashboard</h3>
               <p class="provisioning__body">
-                Dark-theme web UI on <code class="mono">127.0.0.1:3501</code>. Real-time SSE,
-                approve and deny buttons, audit viewer. Optional TLS and webhook channels for
+                Dark-theme web UI on <code class="mono">127.0.0.1:3501</code>. Approve and deny
+                buttons, audit viewer. Optional TLS and webhook channels for
                 headless setups.
               </p>
             </div>
@@ -197,7 +199,8 @@ layout: null
         <span class="eyebrow">Architecture</span>
         <h2 id="layers-title">The Castle Architecture.</h2>
         <p>
-          Five layers, each with a distinct contract. Real enforcement at the perimeter,
+          Five layers, each with a distinct contract. Operating-system enforcement at the perimeter
+          where the platform row is proven,
           observation inside, an encrypted state surface for compliant agents, receipts and reputation
           across vendors, and an install-time substrate that binds it all to the operator.
           The layers compose. None of them substitute for another.
@@ -242,7 +245,8 @@ layout: null
           <p class="layer__body">
             Encrypted state, signed audit, mandate primitives, canonical policy slots,
             and substrate selector. Compliant agents that voluntarily route through Sanctuary
-            get the full surface. Non-compliant agents still hit the Castle Wall and the Sentinels.
+            get the full surface. On platforms with a live Castle Wall, non-compliant agents still
+            hit the wall and the Sentinels.
           </p>
           <div class="layer__tags">
             <span class="layer__tag">approval-gates</span>
@@ -392,7 +396,7 @@ sanctuary = MCPTool.from_stdio(
         <article class="step surface-card">
           <span class="step__number">Step 03 · Approve</span>
           <h3 class="step__heading">Open the dashboard</h3>
-          <p class="step__body">Approve sensitive operations in real time at the local dashboard URL.</p>
+          <p class="step__body">Approve sensitive operations at the local dashboard URL.</p>
 <pre class="step__code"><code><span class="token--dim">$</span> open http://127.0.0.1:3501</code></pre>
         </article>
       </div>
@@ -468,8 +472,8 @@ sanctuary = MCPTool.from_stdio(
     <div class="container">
       <div class="cta surface-card">
         <span class="eyebrow">Ship agents you actually control</span>
-        <h2 id="cta-title">Give your agent a real firewall in one command.</h2>
-        <p>Open source. Runs locally. No platform dependency. No blockchain. No telemetry.</p>
+        <h2 id="cta-title">Put the Sanctuary wall around your agent.</h2>
+        <p>Open source and local-first. Castle Wall enforcement is proven on macOS; Linux is <code>not_implemented</code> in the Assurance Matrix. Telemetry-free and blockchain-free.</p>
         <div class="btn-row" style="justify-content: center;">
           <a class="btn btn--primary" href="https://github.com/eriknewton/sanctuary-framework">View on GitHub</a>
           <a class="btn btn--secondary" href="https://www.npmjs.com/package/@sanctuary-framework/mcp-server">Install from npm</a>
@@ -490,8 +494,8 @@ sanctuary = MCPTool.from_stdio(
           Sanctuary
         </a>
         <p>
-          A firewall and custody substrate for AI agents. Real egress enforcement,
-          portable reputation, no platform dependency.
+          A custody substrate for AI agents: a wall the operating system enforces where the
+          platform row is proven, portable reputation, and current bounds in the Assurance Matrix.
         </p>
       </div>
 

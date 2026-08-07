@@ -10,9 +10,17 @@ export interface CoverageReport {
     total_rows: number;
     rows_with_fixtures: number;
     rows_no_fixture: number;
+    rows_not_implemented: number;
     rows_failing: number;
   };
 }
+
+export type CoverageState =
+  | "not_implemented"
+  | "no_fixture"
+  | "documented_gap"
+  | "partial"
+  | "covered";
 
 export interface CoverageRow {
   assurance_row_id: string;
@@ -22,7 +30,7 @@ export interface CoverageRow {
   fixtures_run: number;
   fixtures_passed: number;
   fixtures_failed: number;
-  coverage_state: "covered" | "partial" | "no_fixture" | "documented_gap";
+  coverage_state: CoverageState;
 }
 
 export interface CoverageFixtureOutcome {
@@ -54,20 +62,28 @@ export async function buildReport(opts: {
       });
     }
 
-    const fixturesRun = outcomes.length;
-    const fixturesFailed = outcomes.filter((outcome) => !outcome.passed).length;
+    const isNotImplemented = assuranceRow.status === "not_implemented";
+    const reportedOutcomes = isNotImplemented ? [] : outcomes;
+    const fixturesRun = reportedOutcomes.length;
+    const fixturesFailed = reportedOutcomes.filter((outcome) => !outcome.passed).length;
     const fixturesPassed = fixturesRun - fixturesFailed;
 
     rows.push({
       assurance_row_id: assuranceRow.id,
       label: assuranceRow.label,
       assurance_status: assuranceRow.status,
-      fixtures: outcomes,
+      fixtures: reportedOutcomes,
       fixtures_run: fixturesRun,
       fixtures_passed: fixturesPassed,
       fixtures_failed: fixturesFailed,
       coverage_state:
-        fixturesRun === 0 ? "no_fixture" : fixturesFailed === 0 ? "covered" : "partial",
+        isNotImplemented
+          ? "not_implemented"
+          : fixturesRun === 0
+            ? "no_fixture"
+            : fixturesFailed === 0
+              ? "covered"
+              : "partial",
     });
   }
 
@@ -80,6 +96,7 @@ export async function buildReport(opts: {
       total_rows: rows.length,
       rows_with_fixtures: rows.filter((row) => row.fixtures_run > 0).length,
       rows_no_fixture: rows.filter((row) => row.coverage_state === "no_fixture").length,
+      rows_not_implemented: rows.filter((row) => row.coverage_state === "not_implemented").length,
       rows_failing: rows.filter((row) => row.fixtures_failed > 0).length,
     },
   };
@@ -94,6 +111,7 @@ export function renderMarkdownSummary(report: CoverageReport): string {
     `- Total rows: ${report.summary.total_rows}`,
     `- Rows with fixtures: ${report.summary.rows_with_fixtures}`,
     `- Rows without fixtures: ${report.summary.rows_no_fixture}`,
+    `- Rows not implemented: ${report.summary.rows_not_implemented}`,
     `- Rows failing: ${report.summary.rows_failing}`,
     "",
     "| ID | Claim | Assurance | Fixtures | State |",
