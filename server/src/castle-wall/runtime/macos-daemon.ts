@@ -778,6 +778,11 @@ export async function startMacOSCastleWallDaemon(
     input.auditHeartbeatIntervalSeconds ??
     CASTLE_WALL_DEFAULT_AUDIT_HEARTBEAT_INTERVAL_SECONDS;
   let auditHeartbeat: NodeJS.Timeout | undefined;
+  let auditHeartbeatInFlight: Promise<void> | undefined;
+  const waitForAuditHeartbeatIdle = async (): Promise<void> => {
+    const inFlight = auditHeartbeatInFlight;
+    if (inFlight) await inFlight;
+  };
   const stopAuditHeartbeat = (): void => {
     if (!auditHeartbeat) return;
     clearInterval(auditHeartbeat);
@@ -1405,9 +1410,19 @@ export async function startMacOSCastleWallDaemon(
         degradedCarry.restore(degradedCountThisBeat);
       }
     };
+    const runAuditHeartbeat = (): Promise<void> => {
+      if (auditHeartbeatInFlight) return auditHeartbeatInFlight;
+      const heartbeat = emitAuditHeartbeat().finally(() => {
+        if (auditHeartbeatInFlight === heartbeat) {
+          auditHeartbeatInFlight = undefined;
+        }
+      });
+      auditHeartbeatInFlight = heartbeat;
+      return heartbeat;
+    };
     const startAuditHeartbeatInterval = (): void => {
       auditHeartbeat = setInterval(() => {
-        void emitAuditHeartbeat();
+        void runAuditHeartbeat();
       }, auditHeartbeatIntervalSeconds * 1000);
       auditHeartbeat.unref();
     };
@@ -1418,16 +1433,15 @@ export async function startMacOSCastleWallDaemon(
       // audit-cadence interval, mirroring the awaited first beat of the
       // initial start below. emitAuditHeartbeat handles its own write
       // failures, so nothing here can throw into the arm path.
-      void emitAuditHeartbeat();
+      void runAuditHeartbeat();
       startAuditHeartbeatInterval();
     };
-    await emitAuditHeartbeat();
-    startAuditHeartbeatInterval();
-
     // Slice M emission-liveness tick (definition next to
     // stopEmissionLivenessTimer above; restarted by a fresh operator arm
     // after a revoke stopped it).
     startEmissionLivenessTimer();
+    await runAuditHeartbeat();
+    startAuditHeartbeatInterval();
 
     // Confined-agent egress MED-3 (secondary signal): periodic AS-AGENT-UID
     // egress liveness probe over the provisioned-* allow rules in the loaded
@@ -1518,6 +1532,7 @@ export async function startMacOSCastleWallDaemon(
   } catch (err) {
     stopLeaseHeartbeat();
     stopAuditHeartbeat();
+    await waitForAuditHeartbeatIdle();
     stopAgentEgressProbeTimer();
     stopEmissionLivenessTimer();
     if (activeConfigWritten) {
@@ -1679,6 +1694,7 @@ export async function startMacOSCastleWallDaemon(
         // Stop the audit liveness heartbeat in the SAME teardown that stops the
         // IPC lease heartbeat, so a stopped daemon stops claiming liveness.
         stopAuditHeartbeat();
+        await waitForAuditHeartbeatIdle();
         stopAgentEgressProbeTimer();
         stopEmissionLivenessTimer();
         await listener.broadcastArmLease(buildArmLease({
