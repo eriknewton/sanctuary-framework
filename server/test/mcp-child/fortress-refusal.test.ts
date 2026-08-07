@@ -1,17 +1,28 @@
 import { spawn } from "node:child_process";
-import { mkdir, mkdtemp, rm, stat } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
+import { mcpChildFortressExists } from "../../src/mcp-child-fortress-refusal.js";
 import { runInit } from "../../src/wrap/init.js";
 import type { ExecResult } from "../../src/wrap/passphrase.js";
 
 const CLI_PATH = join(process.cwd(), "dist", "cli.js");
 
 type ExecCall = { cmd: string; args: string[]; input?: string };
+
+const FORTRESS_MARKER_TEST_CASES = [
+  { name: "custody-envelope", path: ["state", "_meta", "custody-envelope.enc"] },
+  { name: "custody-sentinel", path: ["state", "_meta", "custody-sentinel.enc"] },
+  { name: "legacy-key-params", path: ["state", "_meta", "key-params.enc"] },
+  {
+    name: "legacy-recovery-key-hash",
+    path: ["state", "_meta", "recovery-key-hash.enc"],
+  },
+] as const;
 
 function unescapeSecurityToken(value: string): string {
   return value.replace(/\\(.)/g, "$1");
@@ -137,6 +148,23 @@ function runCliUntilStarted(fortressPath: string): Promise<{
   });
 }
 
+async function withSanctuaryPassphrase<T>(
+  passphrase: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const previous = process.env.SANCTUARY_PASSPHRASE;
+  process.env.SANCTUARY_PASSPHRASE = passphrase;
+  try {
+    return await fn();
+  } finally {
+    if (previous === undefined) {
+      delete process.env.SANCTUARY_PASSPHRASE;
+    } else {
+      process.env.SANCTUARY_PASSPHRASE = previous;
+    }
+  }
+}
+
 describe("MCP child fortress refusal", () => {
   let tmp: string;
 
@@ -169,15 +197,79 @@ describe("MCP child fortress refusal", () => {
     expect(existsSync(fortressPath)).toBe(false);
   });
 
-  it("boots normally when the resolved fortress path already exists", async () => {
-    const fortressPath = join(tmp, "existing-fortress");
+  it("refuses to boot against an empty existing directory", async () => {
+    const fortressPath = join(tmp, "empty-fortress");
     await mkdir(fortressPath, { recursive: true, mode: 0o700 });
 
-    const result = await runCliUntilStarted(fortressPath);
+    const result = await runCliUntilExit(fortressPath);
+    const jsonLine = result.stderr
+      .split(/\r?\n/)
+      .find((line) => line.includes('"FORTRESS_NOT_FOUND"'));
 
-    expect(result.stderr).not.toContain("FORTRESS_NOT_FOUND");
-    expect(result.stderr).toContain("Sanctuary MCP Server");
+    expect(result.code).toBe(78);
+    expect(jsonLine).toBeDefined();
     expect((await stat(fortressPath)).isDirectory()).toBe(true);
+    expect(existsSync(join(fortressPath, "state"))).toBe(false);
+  });
+
+  it("recognizes current and legacy fortress markers instead of path existence", async () => {
+    const emptyFortressPath = join(tmp, "empty-markerless-fortress");
+    const markerlessStatePath = join(tmp, "markerless-state-fortress");
+    await mkdir(emptyFortressPath, { recursive: true, mode: 0o700 });
+    await mkdir(join(markerlessStatePath, "state"), {
+      recursive: true,
+      mode: 0o700,
+    });
+
+    expect(await mcpChildFortressExists(emptyFortressPath)).toBe(false);
+    expect(await mcpChildFortressExists(markerlessStatePath)).toBe(false);
+
+    for (const marker of FORTRESS_MARKER_TEST_CASES) {
+      const fortressPath = join(tmp, `marker-${marker.name}`);
+      const markerPath = join(fortressPath, ...marker.path);
+      await mkdir(dirname(markerPath), { recursive: true, mode: 0o700 });
+      await writeFile(markerPath, "{}", { mode: 0o600 });
+
+      expect(await mcpChildFortressExists(fortressPath)).toBe(true);
+    }
+
+    const symlinkMarkerFortressPath = join(tmp, "symlink-marker-fortress");
+    const symlinkMarker = FORTRESS_MARKER_TEST_CASES[0]!;
+    const symlinkMarkerPath = join(
+      symlinkMarkerFortressPath,
+      ...symlinkMarker.path,
+    );
+    const symlinkTargetPath = join(tmp, "external-marker-target");
+    await mkdir(dirname(symlinkMarkerPath), { recursive: true, mode: 0o700 });
+    await writeFile(symlinkTargetPath, "{}", { mode: 0o600 });
+    await symlink(symlinkTargetPath, symlinkMarkerPath);
+
+    expect(await mcpChildFortressExists(symlinkMarkerFortressPath)).toBe(false);
+  });
+
+  it("boots normally when the resolved fortress path has initialized custody markers", async () => {
+    const fortressPath = join(tmp, "initialized-fortress");
+    const keychain = makeRecoveryKeychainMock();
+
+    await withSanctuaryPassphrase("mcp-child-test-passphrase", async () => {
+      await runInit(
+        { fortress: fortressPath, noConfirm: true },
+        {
+          recoveryKeychain: {
+            home: "/tmp/sanctuary-test-home",
+            platformOverride: "darwin",
+            exec: keychain.exec,
+          },
+        },
+      );
+
+      expect(await mcpChildFortressExists(fortressPath)).toBe(true);
+
+      const result = await runCliUntilStarted(fortressPath);
+
+      expect(result.stderr).not.toContain("FORTRESS_NOT_FOUND");
+      expect(result.stderr).toContain("Sanctuary MCP Server");
+    });
   });
 
   it("leaves explicit sanctuary init able to create a missing fortress", async () => {
@@ -197,5 +289,6 @@ describe("MCP child fortress refusal", () => {
 
     expect(result.fortressPath).toBe(fortressPath);
     expect((await stat(fortressPath)).isDirectory()).toBe(true);
+    expect(await mcpChildFortressExists(fortressPath)).toBe(true);
   });
 });
