@@ -72,6 +72,16 @@ export {
 } from "./local-provisioning-plan.js";
 
 export {
+  buildLocalProvisioningReceipt,
+  type BuildLocalProvisioningReceiptParams,
+  type LocalProvisioningDeclaredModel,
+  type LocalProvisioningReceipt,
+  type LocalProvisioningReceiptRefusalReason,
+  type LocalProvisioningReceiptStatus,
+  type LocalProvisioningRefusedModel,
+} from "./local-provisioning-receipt.js";
+
+export {
   BADGE_LABEL_KEYS,
   BADGE_TRADEOFF_KEYS,
   BACKEND_FALLBACK_STRINGS,
