@@ -25,6 +25,19 @@ describe("sanctuary completion", () => {
     }
   });
 
+  it("keeps completion entries for dispatched fleet and agent commands", async () => {
+    expect(TOP_LEVEL_SUBCOMMANDS).toContain("agent");
+    expect(TOP_LEVEL_SUBCOMMANDS).toContain("fleet");
+
+    for (const shell of ["bash", "zsh", "fish"]) {
+      const out = new Capture();
+      const code = await runCompletionCommand({ argv: [shell], out });
+      expect(code).toBe(0);
+      expect(out.text()).toMatch(/\bagent\b/);
+      expect(out.text()).toMatch(/\bfleet\b/);
+    }
+  });
+
   it("emits zsh completions", async () => {
     const out = new Capture();
     const code = await runCompletionCommand({ argv: ["zsh"], out });
