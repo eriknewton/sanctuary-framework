@@ -238,6 +238,9 @@ export function verify(
   publicKey: Uint8Array
 ): boolean {
   try {
+    // Generic Ed25519 verification funnel used by tool-level and suite-level
+    // verifiers. Malformed signature or public-key bytes must return `false`
+    // here, not escape as caller-dependent exception handling.
     return ed25519.verify(signature, payload, publicKey);
   } catch {
     return false;

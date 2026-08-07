@@ -230,6 +230,10 @@ export class CryptoSuiteRegistry {
     keys: SuitePublicKeys
   ): Promise<boolean> {
     try {
+      // The descriptor names the suite the caller asked to verify. Check it
+      // before registry dispatch, then check the second copy inside
+      // `bundleMatchesSuitePolicy`, so unsigned bundle metadata cannot steer
+      // verification onto a different algorithm.
       if (bundle.signature_suite !== descriptor.signature_suite) return false;
       const suite = this.suites.get(descriptor.signature_suite);
       if (!suite) return false;
@@ -386,6 +390,9 @@ function createEd25519Suite(): RegisteredSignatureSuite {
       };
     },
     async verify(bytes, bundle, keys) {
+      // The full suite policy must pass before reading components[0]; otherwise
+      // an empty, extra, relabeled, or reordered component list could be
+      // interpreted as the one Ed25519 signature this suite expects.
       if (!bundleMatchesSuitePolicy(bundle, this)) return false;
       const ed25519Key = keys.ed25519;
       if (!ed25519Key) return false;
@@ -450,6 +457,9 @@ function createHybridEd25519MlDsa65Suite(): RegisteredSignatureSuite {
       };
     },
     async verify(bytes, bundle, keys) {
+      // The hybrid suite is an AND over two ordered components, so the policy
+      // gate must run before either half is trusted as the Ed25519 or ML-DSA-65
+      // half of this bundle.
       if (!bundleMatchesSuitePolicy(bundle, this)) return false;
       const ed25519Key = keys.ed25519;
       const mlDsa65Key = keys.ml_dsa_65;
@@ -492,6 +502,9 @@ function bundleMatchesSuitePolicy(
     const expectedAlg = suite.components[i]!;
     const component = bundle.components[i];
     if (!component) return false;
+    // Ordered `alg` equality is the suite policy: stripping, duplicating,
+    // swapping, or relabeling a component must fail before signature bytes are
+    // handed to a primitive verifier.
     if (component.alg !== expectedAlg) return false;
     if (seen.has(component.alg)) return false;
     seen.add(component.alg);
@@ -508,6 +521,9 @@ function decodeCanonicalBase64url(
   if (value.length > maxEncodedChars) return null;
   if (!/^[A-Za-z0-9_-]+$/.test(value)) return null;
   const decoded = fromBase64url(value);
+  // `fromBase64url` is intentionally lenient for older callers. Signature
+  // bundles are not: one byte string must have one canonical wire spelling.
+  // Canonical round-trip closes that gap before the byte-length check below.
   if (toBase64url(decoded) !== value) return null;
   return decoded;
 }
