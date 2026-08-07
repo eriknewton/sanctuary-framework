@@ -63,10 +63,12 @@ prefix, so multiple engines under one operator stay isolated and listable.
 
 Duplicate passage-id protection is scoped to the backend's real coordination
 primitive. The non-transactional fallback uses a process-local per-document
-lock, so it only serializes inserts inside one Node.js process and must not be
-treated as a cross-process lock for filesystem storage. Multi-process
-deployments need a backend-level conditional write or transaction guard, such
-as the LMDB-backed SDW path, for cross-process duplicate-insert protection.
+lock for single-passage inserts. Batch replacement on filesystem storage also
+takes a cross-process owner-scope advisory lock before it captures prior state,
+writes, rolls back, verifies the raw owner-scope listing, and prunes stale
+chunks. Non-filesystem test stores have no cross-process surface and run
+directly; transactional backends such as the LMDB-backed SDW path use their own
+transaction primitive.
 
 ## Custody invariants preserved
 

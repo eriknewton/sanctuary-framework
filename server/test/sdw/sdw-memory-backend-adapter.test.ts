@@ -1,3 +1,7 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { describe, expect, it } from "vitest";
 import type { StorageBackend, StorageEntryMeta } from "../../src/storage/interface.js";
 import {
@@ -85,6 +89,69 @@ class RollbackFailureStorage extends MemoryStorage {
   }
 }
 
+class ConfigurableWriteFailureStorage extends MemoryStorage {
+  writeFailureKey: string | null = null;
+  writeFailureMessage = "simulated document write failure";
+
+  override async write(namespace: string, key: string, data: Uint8Array): Promise<void> {
+    if (key === this.writeFailureKey) {
+      this.writeFailureKey = null;
+      throw new Error(this.writeFailureMessage);
+    }
+    await super.write(namespace, key, data);
+  }
+}
+
+class NoopDeleteAfterWriteFailureStorage extends ConfigurableWriteFailureStorage {
+  readonly deleteCalls: string[] = [];
+
+  constructor(private readonly noopDeleteKey: string) {
+    super();
+  }
+
+  override async delete(namespace: string, key: string, secureOverwrite?: boolean): Promise<boolean> {
+    this.deleteCalls.push(key);
+    if (key === this.noopDeleteKey) {
+      if (secureOverwrite === true) this.secureDeletes.push(`${namespace}\0${key}`);
+      return true;
+    }
+    return super.delete(namespace, key, secureOverwrite);
+  }
+}
+
+class FailVerificationListStorage extends ConfigurableWriteFailureStorage {
+  private listCalls = 0;
+
+  constructor(private readonly failAfterListCalls: number) {
+    super();
+  }
+
+  override async list(namespace: string, prefix = ""): Promise<StorageEntryMeta[]> {
+    this.listCalls += 1;
+    if (this.listCalls > this.failAfterListCalls) {
+      throw new Error("injected list failure");
+    }
+    return super.list(namespace, prefix);
+  }
+}
+
+class LockTrackingStorage extends MemoryStorage {
+  readonly lockNamespaces: string[] = [];
+
+  constructor(private readonly lockRoot: string) {
+    super();
+  }
+
+  namespacePath(namespace: string): string {
+    this.lockNamespaces.push(namespace);
+    return join(this.lockRoot, namespace);
+  }
+
+  async writeDurable(namespace: string, key: string, data: Uint8Array): Promise<void> {
+    await this.write(namespace, key, data);
+  }
+}
+
 function makeAdapter(
   storage: MemoryStorage,
   overrides: { ownerRef?: string; maxChunkChars?: number } = {},
@@ -97,6 +164,17 @@ function makeAdapter(
     maxChunkChars: overrides.maxChunkChars,
     now: () => NOW,
   });
+}
+
+async function ownerScopeCorpusKeys(
+  storage: MemoryStorage,
+  ownerRef = "letta-archive-1",
+): Promise<readonly string[]> {
+  const entries = [
+    ...(await storage.list(SDW_DOCUMENT_CORPUS_NAMESPACE, `doc.mem.${ownerRef}.`)),
+    ...(await storage.list(SDW_DOCUMENT_CORPUS_NAMESPACE, `chunk.mem.${ownerRef}.`)),
+  ];
+  return [...new Set(entries.map((entry) => entry.key))].sort();
 }
 
 describe("SDW memory-backend adapter: insert + get", () => {
@@ -260,6 +338,107 @@ describe("SDW memory-backend adapter: write-gate enforcement", () => {
     ).rejects.toMatchObject({ category: "partial_scope" });
 
     expect(storage.data.has(`${SDW_DOCUMENT_CORPUS_NAMESPACE}\0${chunk0}`)).toBe(true);
+  });
+
+  it("signals partial_scope when rollback deletes report success but verification finds a leftover key", async () => {
+    const documentId = "mem.letta-archive-1.batch-verify";
+    const docKey = documentKey(documentId);
+    const chunk0 = documentChunkKey(documentId, "000000", "c000000");
+    const storage = new NoopDeleteAfterWriteFailureStorage(chunk0);
+    storage.writeFailureKey = docKey;
+    const adapter = makeAdapter(storage, { maxChunkChars: 2 });
+
+    let caught: unknown;
+    try {
+      await adapter.putPassages(
+        [
+          { passage_id: "batch-ok", text: "ok" },
+          { passage_id: "batch-verify", text: "abcd" },
+        ],
+        "user_content",
+      );
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBeInstanceOf(SdwValidationError);
+    expect(caught).toMatchObject({ category: "partial_scope" });
+    expect((caught as Error).cause).toBeInstanceOf(Error);
+    expect(((caught as Error).cause as Error).message).toContain(
+      "owner-scope key listing mismatch",
+    );
+    expect(storage.deleteCalls).toContain(chunk0);
+    expect(storage.data.has(`${SDW_DOCUMENT_CORPUS_NAMESPACE}\0${chunk0}`)).toBe(true);
+  });
+
+  it("restores raw keys and decrypted text when failed re-ingest grows or shrinks chunk count", async () => {
+    for (const row of [
+      { passageId: "reingest-grow", before: "aa", after: "aabbcc" },
+      { passageId: "reingest-shrink", before: "aabbcc", after: "zz" },
+    ]) {
+      const documentId = `mem.letta-archive-1.${row.passageId}`;
+      const storage = new ConfigurableWriteFailureStorage();
+      const adapter = makeAdapter(storage, { maxChunkChars: 2 });
+      await adapter.putPassages(
+        [{ passage_id: row.passageId, text: row.before }],
+        "user_content",
+      );
+      const beforeKeys = await ownerScopeCorpusKeys(storage);
+
+      storage.writeFailureKey = documentKey(documentId);
+      await expect(
+        adapter.putPassages(
+          [{ passage_id: row.passageId, text: row.after }],
+          "user_content",
+        ),
+      ).rejects.toThrow("simulated document write failure");
+
+      expect(await ownerScopeCorpusKeys(storage)).toEqual(beforeKeys);
+      await expect(adapter.getPassage(row.passageId)).resolves.toMatchObject({
+        text: row.before,
+      });
+    }
+  });
+
+  it("maps verification read failures to partial_scope with the original cause", async () => {
+    const documentId = "mem.letta-archive-1.batch-list-fail";
+    const docKey = documentKey(documentId);
+    const storage = new FailVerificationListStorage(2);
+    storage.writeFailureKey = docKey;
+    const adapter = makeAdapter(storage, { maxChunkChars: 2 });
+
+    let caught: unknown;
+    try {
+      await adapter.putPassages(
+        [
+          { passage_id: "batch-ok", text: "ok" },
+          { passage_id: "batch-list-fail", text: "abcd" },
+        ],
+        "user_content",
+      );
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBeInstanceOf(SdwValidationError);
+    expect(caught).toMatchObject({ category: "partial_scope" });
+    expect((caught as Error).cause).toBeInstanceOf(Error);
+    expect(((caught as Error).cause as Error).message).toBe("injected list failure");
+  });
+
+  it("takes the filesystem-style owner-scope lock around non-transactional batch replacement", async () => {
+    const lockRoot = await mkdtemp(join(tmpdir(), "sdw-memory-lock-"));
+    try {
+      const storage = new LockTrackingStorage(lockRoot);
+      const adapter = makeAdapter(storage);
+
+      await adapter.putPassages([{ passage_id: "locked-batch", text: "ok" }], "user_content");
+
+      expect(storage.lockNamespaces).toEqual(["sdw_memory_locks"]);
+      await expect(adapter.getPassage("locked-batch")).resolves.toMatchObject({ text: "ok" });
+    } finally {
+      await rm(lockRoot, { recursive: true, force: true });
+    }
   });
 });
 

@@ -16,6 +16,7 @@
 
 import { randomBytes } from "node:crypto";
 import type { StorageBackend } from "../../storage/interface.js";
+import { withCrossProcessLock } from "../../storage/cross-process-lock.js";
 import { stringToBytes, toBase64url } from "../../core/encoding.js";
 import { hash, hmacSha256 } from "../../core/hashing.js";
 import { derivePurposeKey } from "../../core/key-derivation.js";
@@ -65,6 +66,8 @@ const MEMORY_PASSAGE_ID_MAC_DOMAIN = "sanctuary.sdw-memory-passage-id.v1";
 // 32 hex chars = 128 bits of the SHA-256 MAC. Hex (not base64url) because the
 // SDW identifier grammar excludes "_", which base64url emits.
 const MEMORY_PASSAGE_ID_HEX_CHARS = 32;
+const MEMORY_BATCH_LOCK_NAMESPACE = "sdw_memory_locks";
+const MEMORY_BATCH_LOCK_FILE = "batch-replace.lock";
 
 const DEFAULT_MAX_CHUNK_CHARS = 8192;
 const MAX_CONFIGURABLE_CHUNK_CHARS = 100_000;
@@ -236,10 +239,9 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
 
     const documentIds = prepared.map((item) => item.documentId);
     return this.withDocumentLocks(documentIds, async () => {
-      const prior = await this.capturePriorPassages(prepared);
-      const beforeOwnerScope = await this.captureOwnerScopeSnapshot();
       const transactional = asSdwTransactional(this.storage);
       if (transactional !== null) {
+        const prior = await this.capturePriorPassages(prepared);
         await transactional.sdwTransaction(async (txn) => {
           for (const item of prepared) {
             for (const chunkRecord of item.chunkRecords) {
@@ -248,25 +250,37 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
             await this.corpus.putDocument(item.documentRecord, taint, txn);
           }
         });
+        await this.pruneOrphanChunks(prepared, prior);
+        return prepared.map((item) => this.toPassage(item.documentRecord, item.text));
       } else {
-        try {
-          for (const item of prepared) {
-            for (const chunkRecord of item.chunkRecords) {
-              await this.corpus.putChunk(chunkRecord, taint);
+        return withCrossProcessLock(
+          this.storage,
+          MEMORY_BATCH_LOCK_NAMESPACE,
+          this.ownerScopeBatchLockFile(),
+          async () => {
+            const prior = await this.capturePriorPassages(prepared);
+            const beforeOwnerScope = await this.captureOwnerScopeSnapshot();
+            try {
+              for (const item of prepared) {
+                for (const chunkRecord of item.chunkRecords) {
+                  await this.corpus.putChunk(chunkRecord, taint);
+                }
+                await this.corpus.putDocument(item.documentRecord, taint);
+              }
+            } catch (error) {
+              await this.restoreAndVerifyPriorPassages(prepared, prior, taint, beforeOwnerScope);
+              throw error;
             }
-            await this.corpus.putDocument(item.documentRecord, taint);
-          }
-        } catch (error) {
-          await this.restoreAndVerifyPriorPassages(prepared, prior, taint, beforeOwnerScope);
-          throw error;
-        }
+            // Post-commit only. A replaced passage that shrank leaves chunks
+            // past the new chunk_count; reads are bounded by chunk_count so
+            // they are already unreachable, and this removes the stale
+            // ciphertext. A failure here leaves garbage, never a wrong read,
+            // so it must not fail the write.
+            await this.pruneOrphanChunks(prepared, prior);
+            return prepared.map((item) => this.toPassage(item.documentRecord, item.text));
+          },
+        );
       }
-      // Post-commit only. A replaced passage that shrank leaves chunks past the
-      // new chunk_count; reads are bounded by chunk_count so they are already
-      // unreachable, and this removes the stale ciphertext. A failure here
-      // leaves garbage, never a wrong read, so it must not fail the write.
-      await this.pruneOrphanChunks(prepared, prior);
-      return prepared.map((item) => this.toPassage(item.documentRecord, item.text));
     });
   }
 
@@ -509,9 +523,13 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
     }
 
     if (failures.length > 0) {
-      throw partialScopeError();
+      throw partialScopeError(rollbackFailureCause(failures));
     }
-    await this.verifyPriorPassagesRestored(beforeOwnerScope, prior);
+    try {
+      await this.verifyPriorPassagesRestored(beforeOwnerScope, prior);
+    } catch (error) {
+      throw partialScopeError(error);
+    }
   }
 
   private rebuildChunkRecords(
@@ -564,20 +582,24 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
   ): Promise<void> {
     const afterKeys = await this.ownerScopeCorpusKeys();
     if (!sameStrings(afterKeys, beforeOwnerScope.keys)) {
-      throw partialScopeError();
+      throw new Error("SDW memory rollback owner-scope key listing mismatch");
     }
     for (const item of prior) {
       const document = await this.corpus.getDocument(item.documentId);
       if (item.record === null || item.text === null) {
-        if (document !== null) throw partialScopeError();
+        if (document !== null) {
+          throw new Error(`SDW memory rollback left unexpected document ${item.documentId}`);
+        }
         continue;
       }
-      if (document === null) throw partialScopeError();
+      if (document === null) {
+        throw new Error(`SDW memory rollback did not restore document ${item.documentId}`);
+      }
       if (JSON.stringify(document) !== JSON.stringify(item.record)) {
-        throw partialScopeError();
+        throw new Error(`SDW memory rollback restored wrong document ${item.documentId}`);
       }
       if ((await this.readPassageText(document)) !== item.text) {
-        throw partialScopeError();
+        throw new Error(`SDW memory rollback restored wrong text ${item.documentId}`);
       }
     }
   }
@@ -608,6 +630,13 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
 
   private documentChunkKeyPrefix(): string {
     return `chunk.${MEMORY_PASSAGE_DOCUMENT_PREFIX}.${this.ownerRef}.`;
+  }
+
+  private ownerScopeBatchLockFile(): string {
+    // The lock spans every passage in this owner scope because rollback verifies
+    // the whole raw owner-scope key listing. A narrower lock could treat another
+    // process's committed passage as rollback damage.
+    return `${MEMORY_PASSAGE_DOCUMENT_PREFIX}.${this.ownerRef}.${MEMORY_BATCH_LOCK_FILE}`;
   }
 
   private async assertDocumentAbsent(documentId: string, txn?: SdwCorpusTxn): Promise<void> {
@@ -655,7 +684,7 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
       failures.push(error);
     }
     if (failures.length > 0) {
-      throw partialScopeError();
+      throw partialScopeError(rollbackFailureCause(failures));
     }
   }
 
@@ -764,11 +793,18 @@ function asSdwTransactional(storage: StorageBackend): SdwTransactionalStorage | 
     : null;
 }
 
-function partialScopeError(): SdwValidationError {
+function partialScopeError(cause?: unknown): SdwValidationError {
   return new SdwValidationError(
     "partial_scope",
     "SDW memory write failed and rollback could not verify the owner scope; inspect the audit record before retrying",
+    cause === undefined ? undefined : { cause },
   );
+}
+
+function rollbackFailureCause(failures: readonly unknown[]): unknown {
+  return failures.length === 1
+    ? failures[0]
+    : new AggregateError(failures, "SDW memory rollback had multiple restore failures");
 }
 
 function sameStrings(a: readonly string[], b: readonly string[]): boolean {

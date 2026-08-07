@@ -92,6 +92,21 @@ function denialCategory(error: unknown, fallback: string): string {
   return error instanceof SdwValidationError ? error.category : fallback;
 }
 
+function errorCauseDetail(error: unknown): Record<string, string> {
+  if (!(error instanceof SdwValidationError)) return {};
+  const cause = errorCauseMessage(error.cause);
+  return cause === undefined ? {} : { error_cause: cause };
+}
+
+function errorCauseMessage(cause: unknown): string | undefined {
+  if (cause === undefined) return undefined;
+  if (cause instanceof AggregateError) {
+    return cause.errors.map((item) => errorCauseMessage(item) ?? String(item)).join("; ");
+  }
+  if (cause instanceof Error) return cause.message;
+  return String(cause);
+}
+
 export function createSdwMemoryFileTools(options: SdwMemoryFileToolsOptions): ToolDefinition[] {
   const { adapter, auditLog } = options;
   const now = options.now ?? (() => new Date().toISOString());
@@ -218,6 +233,7 @@ export function createSdwMemoryFileTools(options: SdwMemoryFileToolsOptions): To
       } catch (error) {
         await auditFailure("memory_ingest_denied", {
           denial_class: denialCategory(error, "ingest_failed"),
+          ...errorCauseDetail(error),
           harness,
           owner_ref: adapter.ownerRef,
           source_file_count: fileCount,
@@ -231,8 +247,9 @@ export function createSdwMemoryFileTools(options: SdwMemoryFileToolsOptions): To
   const memoryEmit: ToolDefinition = {
     name: "memory_emit",
     description:
-      "Manually emit Claude Code memory files from the SDW vault into an empty " +
-      "operator-named directory. Emitted files are plaintext for the harness; " +
+      "Manually emit Claude Code memory files from the SDW vault into an " +
+      "operator-named output directory. Existing memory files are never " +
+      "overwritten. Emitted files are plaintext for the harness; " +
       "this does not sync or write back to the source memory directory, and " +
       "memory later sent to a model vendor is exposed to that vendor at inference.",
     tool_class: "write",
@@ -285,6 +302,7 @@ export function createSdwMemoryFileTools(options: SdwMemoryFileToolsOptions): To
       } catch (error) {
         await auditFailure("memory_emit_denied", {
           denial_class: denialCategory(error, "emit_failed"),
+          ...errorCauseDetail(error),
           harness,
           owner_ref: adapter.ownerRef,
           emitted_file_count: 0,

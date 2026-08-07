@@ -112,9 +112,11 @@ export interface MemoryBackendAdapter {
    * A mirror that commits a prefix of its passages and then throws leaves a
    * vault the operator cannot re-import (each committed id now collides) and
    * cannot distinguish from a complete one. On success every input is durable.
-   * On a recoverable write failure, rollback is verified against the raw owner
-   * scope before the original error is surfaced. If rollback cannot be verified,
-   * the implementation MUST fail with a partial_scope category so the caller and
+   * On non-transactional filesystem storage, replacement is owner-scope locked
+   * across processes because rollback verifies the raw owner-scope key listing.
+   * On a recoverable write failure, rollback is verified against that listing
+   * before the original error is surfaced. If rollback cannot be verified, the
+   * implementation MUST fail with a partial_scope category so the caller and
    * audit trail do not report the run as a clean all-or-nothing failure.
    */
   putPassages(

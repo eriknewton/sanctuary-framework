@@ -118,6 +118,8 @@ describe("SDW memory file tools", () => {
     }
     // The ingest description tells an agent that a partial mirror is possible.
     expect(tools.get("memory_ingest")!.description).toContain("skipped_file_count");
+    expect(tools.get("memory_emit")!.description).toContain("Existing memory files are never overwritten");
+    expect(tools.get("memory_emit")!.description).not.toContain("empty operator-named directory");
   });
 
   it("approval projection carries command metadata AND whose memory moves, never memory file bytes", () => {
@@ -279,7 +281,9 @@ describe("SDW memory file tools", () => {
       derivePassageId: (_domain, label) => label.replace(/[^A-Za-z0-9._:@+-]/g, "."),
       screenPassage: () => ({ ok: true }),
       putPassages: async () => {
-        throw new SdwValidationError("partial_scope", "rollback could not verify scope");
+        throw new SdwValidationError("partial_scope", "rollback could not verify scope", {
+          cause: new Error("injected rollback verifier failure"),
+        });
       },
       insertPassage: async () => {
         throw new Error("not used");
@@ -308,7 +312,10 @@ describe("SDW memory file tools", () => {
     expect(auditCalls.at(-1)).toMatchObject({
       operation: "memory_ingest_denied",
       result: "failure",
-      details: { denial_class: "partial_scope" },
+      details: {
+        denial_class: "partial_scope",
+        error_cause: "injected rollback verifier failure",
+      },
     });
   });
 

@@ -396,7 +396,9 @@ Options:
 }
 
 function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  const message = error instanceof Error ? error.message : String(error);
+  const cause = errorCauseMessage(errorCause(error));
+  return cause === undefined ? message : `${message}; cause: ${cause}`;
 }
 
 function errorName(error: unknown): string {
@@ -404,5 +406,23 @@ function errorName(error: unknown): string {
 }
 
 function errorCategoryDetail(error: unknown): Record<string, string> {
-  return error instanceof SdwValidationError ? { error_category: error.category } : {};
+  if (!(error instanceof SdwValidationError)) return {};
+  const cause = errorCauseMessage(errorCause(error));
+  return {
+    error_category: error.category,
+    ...(cause === undefined ? {} : { error_cause: cause }),
+  };
+}
+
+function errorCause(error: unknown): unknown {
+  return error instanceof Error ? error.cause : undefined;
+}
+
+function errorCauseMessage(cause: unknown): string | undefined {
+  if (cause === undefined) return undefined;
+  if (cause instanceof AggregateError) {
+    return cause.errors.map((item) => errorCauseMessage(item) ?? String(item)).join("; ");
+  }
+  if (cause instanceof Error) return cause.message;
+  return String(cause);
 }
