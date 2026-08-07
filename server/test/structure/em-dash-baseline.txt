@@ -30,7 +30,6 @@
 #
 4	.github/ISSUE_TEMPLATE/implementation-experience.yml
 6	.github/ISSUE_TEMPLATE/specification-feedback.yml
-1	CHANGELOG.md
 3	CODE_OF_CONDUCT.md
 1	GOVERNANCE.md
 51	SANCTUARY_ARCHITECTURE.md
@@ -81,7 +80,6 @@
 3	server/docs/federation-protocol-v0.1-spec.md
 9	server/docs/federation-v0.1-hard-gate-walkthrough.md
 13	server/docs/keychain-schema.md
-15	server/docs/multi-tenancy.md
 12	server/docs/query-anonymity-tiers.md
 8	server/docs/test-concurrency-discipline.md
 8	server/docs/test-port-discipline.md

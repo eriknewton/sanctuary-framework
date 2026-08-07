@@ -1,7 +1,7 @@
 ---
-title: "The Castle Wall, Live on Linux"
+title: "The Castle Wall, Linux Phase 1 Source Path"
 date: 2026-05-08
-description: "Cooperative gates do not stop a prompt-injected agent. Kernel-level enforcement does. Castle Wall Phase 1 shipped this week on Linux: 203 Rust tests against a real kernel binding, with plain-DNS, DoH, and DoT bypass coverage verified end-to-end on real cgroups."
+description: "Cooperative gates do not stop a prompt-injected agent. Kernel-level enforcement does. Current correction: Linux Phase 1 source modules are tested against a real kernel binding, but the shipped daemon does not assemble live enforcement."
 author: "Erik Newton"
 image: /images/blog/castle-wall-phase-1-linux.jpg
 archive_note: "Predates Mantle vocabulary canonicalization on 2026-05-15. Terminology in this post may refer to install-time-binding concepts using earlier language; current canonical vocabulary lives at https://github.com/eriknewton/newton-wiki/blob/main/concepts/mantle.md."
@@ -13,7 +13,15 @@ claims_era_note: true
 > Current canonical vocabulary lives at [Mantle Phase 1](https://github.com/eriknewton/newton-wiki/blob/main/concepts/mantle.md).
 
 
-# The Castle Wall, Live on Linux
+# The Castle Wall, Linux Phase 1 Source Path
+
+> **Current correction, 2026-08-07:** Linux Castle Wall is partial, not shipped
+> as live enforcement. The nftables, cgroup, and NFQUEUE modules are tested
+> against a real kernel, but the shipped daemon does not install the table, bind
+> NFQUEUE, create cgroup scopes, or call the deny-by-default evaluator. The
+> systemd unit is also `Type=notify` while the daemon never sends readiness.
+> Open defect: **IC-02, IC-03, IC-04**
+> (`Review/Sanctuary/Inert_Capability_Sweep_2026-08-07.md`).
 
 An agent under prompt injection executed 75 percent of remote commands across 34 sessions in a recent breach. The result, per OWASP GenAI's Q1 2026 round-up, was 195 million taxpayer records and 220 million civil records exfiltrated from a national-government deployment. The agent was not malicious. It was cooperative. The instructions came from somewhere it should not have trusted, and the runtime had no way to refuse the network call.
 
@@ -25,13 +33,13 @@ An L7 proxy can inspect traffic that goes through it. A managed-cloud control pl
 
 The Castle Architecture answers that question at the kernel. The operating system itself blocks unauthorized cross-boundary calls regardless of what transport the agent picks or what prompt-injection state it is in. That is the floor. Everything else, every L7 inspection layer, every cooperative-MCP gate, every managed-cloud governance product, sits above the floor and composes with it. None of them replace it.
 
-Today the floor is real on Linux. The rest of this post explains how it works, what it costs, and why kernel-level enforcement is the load-bearing differentiator when the agent itself cannot be trusted.
+The Linux floor described below is the intended source path, not the shipped daemon behavior today. Open defect: **IC-02, IC-03, IC-04** (`Review/Sanctuary/Inert_Capability_Sweep_2026-08-07.md`). Kernel-level enforcement remains the decisive differentiator when the agent itself cannot be trusted.
 
 ## The Castle Architecture
 
 Sanctuary's enforcement model has four layers, each with a distinct contract. The contracts compose; none of them substitute for another. The model is named after the way a real castle defends a perimeter, observes its interior, governs its inhabitants, and accounts to neighbors.
 
-**The Castle Wall.** Operating-system-level filtering at the boundary between the operator's machine and the external world, on the outbound path. Outbound calls (HTTP, DNS, custom protocols) route through a wall the operator's policies define. The kernel itself enforces. Within that proven scope, a prompt-injected or jailbroken agent does not get to choose; the operating system routes the call. This is the load-bearing answer to the question every honest enterprise buyer asks: how does the substrate enforce against an agent determined to escape? Ingress filtering of inbound webhooks and callbacks is roadmap, not part of the shipped surface.
+**The Castle Wall.** Operating-system-level filtering at the boundary between the operator's machine and the external world, on the outbound path. Outbound calls (HTTP, DNS, custom protocols) route through a wall the operator's policies define. On macOS this is proven in the current Assurance Matrix. On Linux, the source modules are tested but the shipped daemon does not yet install the enforcement path. Open defect: **IC-02, IC-03, IC-04** (`Review/Sanctuary/Inert_Capability_Sweep_2026-08-07.md`). This answers the question every honest enterprise buyer asks: how does the substrate enforce against an agent determined to escape? Ingress filtering of inbound webhooks and callbacks is roadmap, not part of the shipped surface.
 
 **Sentinels.** Internal observation, not enforcement. Behavioral baselining via process introspection, eBPF observability, and audit-log analysis. Anomalies surface to the operator via system notifications. Sentinels see what the wall cannot: file-access patterns, internal model calls, cross-agent coordination, prompt-injection signatures inside internal communications. The sentinels surface; the operator decides. Sentinels ship in v1.3.
 
@@ -49,13 +57,13 @@ The principle has teeth. Every Sanctuary spec, every PR, every scope-lock since 
 
 This is what kept the Castle Wall from drifting back into the cooperative-only path during build. The pressure to cut corners on either side is constant; the pressure to cut corners on enforcement specifically gets dressed up as developer experience. It isn't.
 
-## What shipped on Linux
+## What the Linux source path implements
 
-Castle Wall Phase 1 on Linux landed in PRs #124 and #125 last week, with the chain-wiring fix in PR #131 and the full TCP-bypass coverage closed in PR #132. 203 Rust integration and unit tests pass against a real kernel binding, including the DoH and DoT bypass coverage that makes the difference between a real wall and a hopeful one. Here is what is in the box.
+Castle Wall Phase 1 on Linux landed source modules in PRs #124 and #125, with the chain-wiring fix in PR #131 and the full TCP-bypass coverage closed in PR #132. 203 Rust integration and unit tests pass against a real kernel binding, including the DoH and DoT bypass coverage that distinguishes a real wall from a hopeful one. Current correction: those source modules are not wired into the shipped daemon boot path. Open defect: **IC-02, IC-03, IC-04** (`Review/Sanctuary/Inert_Capability_Sweep_2026-08-07.md`).
 
-**Kernel binding.** The wall enforces at the Linux kernel level using nftables for packet routing decisions, cgroup v2 for per-process scope (each wrapped agent gets its own egress policy, not a shared one), and NFQUEUE for in-line decisions on packets the kernel hands up to user space. Allowed traffic flows with low added latency in our test rig; formal p99 numbers are owed to the Assurance Matrix before we publish them as claims. Disallowed traffic does not reach the wire.
+**Kernel binding.** The source modules implement Linux kernel-level enforcement using nftables for packet routing decisions, cgroup v2 for per-process scope, and NFQUEUE for in-line decisions on packets the kernel hands up to user space. That path is test-proven, but not installed by the shipped daemon. Open defect: **IC-02, IC-04** (`Review/Sanctuary/Inert_Capability_Sweep_2026-08-07.md`).
 
-**Bypass coverage.** A prompt-injected agent does not just send HTTP. It tries DNS exfiltration. It tries DNS-over-HTTPS to a vendor-controlled resolver. It tries DNS-over-TLS to the same. It tries raw sockets. It tries every transport a normal Linux process can reach. The Phase 1 daemon enforces against the full set, verified end-to-end on real cgroups with real packet flow: plain-DNS, DoH, and DoT bypass attempts each spawn a real subprocess inside the agent's cgroup, emit a real packet, get caught by the kernel's cgroupv2 socket match, route through the per-agent chain into NFQUEUE, and resolve to a deny verdict in the audit log. The DoH and DoT tests matter because every previous L7 agent firewall the category has shipped misses one or both, and every miss is a ship-side covert channel.
+**Bypass coverage.** A prompt-injected agent does not just send HTTP. It tries DNS exfiltration. It tries DNS-over-HTTPS to a vendor-controlled resolver. It tries DNS-over-TLS to the same. It tries raw sockets. It tries every transport a normal Linux process can reach. The Phase 1 tests cover plain-DNS, DoH, and DoT attempts with real cgroups and real packet flow. Current bound: the shipped daemon does not call the enforcement loop that those tests assemble. Open defect: **IC-02, IC-04** (`Review/Sanctuary/Inert_Capability_Sweep_2026-08-07.md`).
 
 **Daemon architecture.** The kernel-touching code lives in a privileged daemon written in Rust. The unprivileged Sanctuary process talks to the daemon over a JSON-RPC inter-process channel authenticated with an Ed25519 handshake on every session, so a compromised user-space process cannot speak for an unrelated wrapped agent. The daemon never trusts user-space input on its own merit; every policy update is signed, and the manifest store implements trust-on-first-use against the operator's own key.
 
@@ -63,7 +71,7 @@ Castle Wall Phase 1 on Linux landed in PRs #124 and #125 last week, with the cha
 
 **CI surface.** The Linux daemon builds on every PR. Cargo audit gates against the RustSec advisory database with `--deny warnings`, so any unmaintained dependency or fresh CVE breaks CI before it lands on main. A cross-compilation gate verifies the daemon builds on macOS-host CI for Phase 2 readiness.
 
-203 tests passing on a CI run against a real kernel binding is not a marketing line. It is what every operator considering Phase 1 deployment can verify themselves on their own hardware, on the open-source repo, with the same toolchain we used to ship.
+203 tests passing on a CI run against a real kernel binding is source evidence, not proof that the shipped daemon enforces. Operators should treat Linux Castle Wall as partial until **IC-02, IC-03, IC-04** are fixed (`Review/Sanctuary/Inert_Capability_Sweep_2026-08-07.md`).
 
 ## Composition, not substitution
 
@@ -75,7 +83,7 @@ Composition holds across the partner surface, too. Sanctuary signs Coinbase x402
 
 ## What's next
 
-Phase 1 ships on Linux today. macOS Phase 1 follows once the platform's developer-program review clears. The macOS path uses the Network Extension framework with process supervision, which requires Apple's entitlement review for the relevant capabilities. The filing window is a known-quantity 4 to 8 weeks post-submission. The application filing is the gate, not the engineering.
+Linux Phase 1 does not ship as live enforcement today; the source path is partial until **IC-02, IC-03, IC-04** are fixed (`Review/Sanctuary/Inert_Capability_Sweep_2026-08-07.md`). macOS later shipped a separate Network Extension path and is proven in the current Assurance Matrix.
 
 Windows Phase 2 sits behind macOS, using Windows Filtering Platform. Container and microVM isolation, Phase 3, is queued for the highest-assurance enterprise deployments where additional isolation between the wrapped agent and the operator's host filesystem matters.
 

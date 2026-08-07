@@ -25,10 +25,15 @@ The only outbound destinations a fresh Sanctuary install reaches are:
 2. **Operator-configured substrate endpoints** declared in the
    intelligence-layer config (Venice.ai, frontier provider with filter,
    custom endpoints).
-3. **Operator-configured outbound channels** declared in the principal
-   policy or hub config (webhook approval channel pointed at an
+3. **Operator-configured outbound channels** declared in live runtime or
+   hub configuration (webhook approval channel pointed at an
    operator-chosen URL, future operator-chosen SMTP for daily digest,
-   etc.). All such channels are explicit operator opt-in, default off.
+   etc.). Current bound: `approval_channel` fields in
+   `principal-policy.yaml` do not select the webhook channel in shipped
+   code, and regulator-facing generated docs can therefore print the
+   wrong channel. Open defect: **IC-14**
+   (`Review/Sanctuary/Inert_Capability_Sweep_2026-08-07.md`). All such
+   channels remain explicit operator opt-in, default off.
 
 ## Why
 
@@ -89,9 +94,12 @@ outbound channels by configuring them:
   (Venice, frontier with filter, custom). The substrate selector is the
   single authority for inference egress; no other module calls vendor
   inference endpoints.
-- **Webhook approval channel:** `principal-policy/channel` set to
-  `webhook` with operator-chosen URL. HMAC-signed POSTs only; payload
-  is operation metadata, never state content.
+- **Webhook approval channel:** runtime webhook configuration with an
+  operator-chosen URL. HMAC-signed POSTs only; payload is operation
+  metadata, never state content. Current bound: setting
+  `approval_channel.type: webhook` in `principal-policy.yaml` alone does
+  not select the live channel. Open defect: **IC-14**
+  (`Review/Sanctuary/Inert_Capability_Sweep_2026-08-07.md`).
 - **Future daily digest delivery:** when daily digest ships, default is
   OS notification + dashboard view + signed local file write. Email
   (operator-chosen SMTP), Slack webhook, Telegram bot are explicit
@@ -194,7 +202,9 @@ Each probe above must be:
 ## Related
 
 - RFC-0003 Castle Architecture (`server/rfcs/`, queued).
-- WP-V1.x-CASTLE-WALL milestone (Phase 1 macOS+Linux egress filter).
+- WP-V1.x-CASTLE-WALL milestone (macOS egress filter proven; Linux source path
+  partial until **IC-02, IC-03, IC-04** are fixed:
+  `Review/Sanctuary/Inert_Capability_Sweep_2026-08-07.md`).
 - Substrate selector (`server/src/intelligence/selector.ts`) is the
   canonical inference egress point.
 - Webhook approval channel
