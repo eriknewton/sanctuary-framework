@@ -314,7 +314,10 @@ export function createBridgeTools(
         const { commitment: storedCommitment, outcome: storedOutcome } = record;
         const outcome = revealedOutcome ?? storedOutcome;
 
-        // Resolve the committer's public key
+        // Resolve the committer's public key. An operator-supplied key is still
+        // counterparty-controlled input, so it must derive back to the DID stored
+        // in the commitment before verifyBridgeCommitment can make an identity
+        // claim from its signature result.
         let publicKey: Uint8Array;
         if (externalPublicKey) {
           publicKey = fromBase64url(externalPublicKey);
@@ -460,6 +463,10 @@ export function createBridgeTools(
           });
         }
 
+        // bridge_attest writes L4 reputation, so it refuses the external-key
+        // escape hatch used by read-only bridge_verify. The committer key must be
+        // one Sanctuary already resolves for commitment.committer_did before an
+        // attestation can amplify the bridge result.
         const committerPublicKey = localPublicKeyForDid(commitment.committer_did);
         if (!committerPublicKey) {
           return toolResult({

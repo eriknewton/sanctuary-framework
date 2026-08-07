@@ -211,6 +211,11 @@ export function verifyBridgeCommitment(
   // 2. Signature check (must match the signing payload exactly)
   //    Uses stableStringify (not JSON.stringify) for deterministic key ordering
   //    across languages — required for cross-repo signature verification (SEC-003).
+  //    Trust-boundary invariant: `committerPublicKey` is supplied by the caller.
+  //    This function proves only "this key signed this commitment payload"; callers
+  //    that surface an identity claim must first bind the key to
+  //    `commitment.committer_did` (bridge_verify does this via publicKeyToDid;
+  //    bridge_attest uses only a locally resolved identity key).
   const commitmentPayload = {
     bridge_commitment_id: commitment.bridge_commitment_id,
     session_id: commitment.session_id,
