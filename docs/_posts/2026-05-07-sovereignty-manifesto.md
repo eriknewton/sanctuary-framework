@@ -34,7 +34,7 @@ The substrate is being chosen right now, this quarter. Once it locks in, it stay
 
 By default, an operator who plugs an agent into the modern stack signs every transaction with a key a platform holds. Every commitment lands in a registry someone else arbitrates. Every behavior gets priced by a reputation engine someone else controls. The platform sees the keys. The platform sees the data. The platform owns the record. The operator visits as a second-class citizen.
 
-That default is not a law of nature. It is a choice the hyperscalers made for you because it makes them money. The choice can be different. We have been building the different. It is called Sanctuary.
+That default is a choice the hyperscalers made for you because it makes them money. The choice can be different. We have been building the different. It is called Sanctuary.
 
 ## The trap inside the default
 
@@ -64,11 +64,11 @@ A regulated professional, a lawyer or a doctor or a financial advisor, can use a
 
 A small business owner who hires an agent to run procurement does not have to trust a payment platform to handle the keys. The keys live on the laptop. The agent operates under explicit, time-bounded, scope-bounded authority. When the project ends, authority ends, and the audit trail moves with the small business owner rather than being locked in by the platform.
 
-An operator running a fleet of agents with real budget authority, marketing campaigns at six figures a month, ad spend across three platforms, supplier procurement across a dozen vendors, can answer a hard question: when an agent under prompt injection tries to exfiltrate credentials or initiate an unauthorized payment, what stops it? The answer is a wall in the kernel of the operator's machine, not a cooperative gate the agent could politely refuse to honor.
+An operator running a fleet of agents with real budget authority, marketing campaigns at six figures a month, ad spend across three platforms, supplier procurement across a dozen vendors, can answer a hard question: when an agent under prompt injection tries to exfiltrate credentials or initiate an unauthorized payment, what stops it? On macOS within the proven scope, the answer is a wall in the kernel of the operator's machine, not a cooperative gate the agent could politely refuse to honor.
 
-An organization migrating away from a vendor can take its agent history with it. Seven years of negotiation outcomes, supplier scoring, and process knowledge walk out as a sealed bundle. The next vendor inherits a verified track record, not a fresh slate. The reputation an agent built across a year of work belongs to the operator. When the platform changes terms, the year does not reset.
+An organization migrating away from a vendor can take its agent history through the current exit path, with the caveats named in **IC-07, IC-08, IC-09**. Seven years of negotiation outcomes, supplier scoring, and process knowledge can be exported, but full exit remains partial until dashboard re-key export, skipped-entry import visibility, and rotated-key imports are fixed. The reputation an agent built across a year of work belongs to the operator. When the platform changes terms, the year does not reset.
 
-Underneath each of those experiences is the same architecture. The agent runs as a normal process on the operator's machine (cloud or otherwise). The keys derive from an operator-set passphrase on operator hardware. The operator's machine blocks unauthorized cross-boundary calls at the operating-system level, even when the agent is under prompt injection. Every approved action produces a signed audit entry the operator controls. When the operator wants to leave, the substrate walks out with them.
+Underneath each of those experiences is the same architecture. The agent runs as a normal process on the operator's machine (cloud or otherwise). The keys derive from an operator-set passphrase on operator hardware. On macOS, within the proven Assurance Matrix scope, the operator's machine blocks unauthorized cross-boundary calls at the operating-system level, even when the agent is under prompt injection. Approved actions produce hash-chained audit entries the operator controls; production audit checkpoints are currently unsigned. When the operator wants to leave, the export path exists, but full exit is partial until the dashboard export, skipped-counter import, and rotated-key import gaps close.
 
 These are not aspirational. They are buildable. We are building them. The v1.2 substrate is shipping today, and Castle Wall Phase 1 enforcement went live on Linux this week. macOS Phase 1 follows once the platform's developer-program review clears.
 
@@ -84,11 +84,11 @@ These are not aspirational. They are buildable. We are building them. The v1.2 s
 
 Sanctuary's enforcement model has four layers. They work together just like the living community in a real castle. The Castle Wall holds the perimeter. Sentinels in the watchtowers observe and call out. The Charter governs the inhabitants inside who choose to work under its terms. The Heralds carry verified accounts of deeds across castles. Each layer has a distinct contract. The contracts compose; none of them substitute for another.
 
-**The Castle Wall.** The perimeter holds whether or not anyone inside is paying attention. Operating-system-level filtering at the boundary between the operator's machine and the external world, on the outbound path. The kernel itself blocks unauthorized egress. Exfiltration attempts, identity assertions, payments, and commitments all route through a wall the operator's policies define. A prompt-injected or jailbroken agent does not get a vote at this layer: the operating system routes the call, within the proven scope and platform bounds in the editor's note above. This is the load-bearing answer to the question every honest enterprise buyer asks: how does the substrate enforce against an agent determined to escape? Ingress filtering of inbound webhooks and callbacks is roadmap, not part of the proven surface, and an attacker who can reach an agent through an inbound channel remains a real threat model to design for.
+**The Castle Wall.** The perimeter holds whether or not anyone inside is paying attention. Operating-system-level filtering at the boundary between the operator's machine and the external world, on the outbound path. The kernel itself blocks unauthorized egress. Exfiltration attempts, identity assertions, payments, and commitments all route through a wall the operator's policies define. A prompt-injected or jailbroken agent does not get a vote at this layer: the operating system routes the call, within the proven scope and platform bounds in the editor's note above. This is the technical answer to the question every honest enterprise buyer asks: how does the substrate enforce against an agent determined to escape? Ingress filtering of inbound webhooks and callbacks is roadmap, not part of the proven surface, and an attacker who can reach an agent through an inbound channel remains a real threat model to design for.
 
 **Sentinels.** The watchtowers do not block; they see, and they call out. Internal observation, not enforcement. Behavioral baselining via process introspection. Anomalies surface to the operator via menubar and operating-system notifications. Sentinels see what the wall cannot: file-access patterns, internal model calls, cross-agent coordination, prompt-injection signatures in internal communications. The sentinels surface. The operator decides.
 
-**The Charter.** Inside the walls, those who choose to work under the castle's terms gain the full measure of sovereignty. Additive sovereignty surface for compliant agents. Encrypted state, signed audit, mandate primitives, four canonical policy slots, substrate selector, receipt integration. Compliant agents that voluntarily route through the Sanctuary surface get the full sovereignty primitives. Non-compliant agents do not break the castle; they hit the wall at the boundary and the sentinels inside.
+**The Charter.** Inside the walls, those who choose to work under the castle's terms gain the full measure of sovereignty. Additive sovereignty surface for compliant agents. Encrypted state, hash-chained audit, mandate primitives, four canonical policy slots, substrate selector, receipt integration. Production checkpoint signatures are still partial: production boot paths write unsigned checkpoints, and `audit-chain verify --no-strict` can return PASS with findings. Open defect: **IC-05, IC-06** (`docs/audit/inert-capability-register.md`). Compliant agents that voluntarily route through the Sanctuary surface get the full sovereignty primitives. Non-compliant agents do not break the castle; they hit the wall at the boundary and the sentinels inside.
 
 **The Heralds.** The carriers of verified accounts between castles make commerce honest without prior trust. Receipts on cross-castle transactions. Reputation aggregating across operators. Cross-castle accountability after the action. Portable reputation that survives vendor churn. This is how operators hold each other honest when they have no prior relationship.
 
@@ -104,9 +104,9 @@ Five operator rights are foundational. The substrate guarantees all five at zero
 
 **Data.** The operator's working memory, audit log, and durable record are encrypted at rest with operator-held keys. No vendor reads the operator's bytes by default.
 
-**Portability.** The operator's identity and record can be exported as a sealed bundle and imported on a fresh machine, a fresh harness, or a fresh vendor relationship, intact.
+**Portability.** The operator's identity and record can be exported as a sealed bundle and imported through current exit paths, but exit remains partial: dashboard export omits the state re-key key, import hides skipped-entry counters, and rotated-key imports can lose pre-rotation state. Open defect: **IC-07, IC-08, IC-09** (`docs/audit/inert-capability-register.md`).
 
-**Attestation.** Every action the operator approves produces a signed entry that any counterparty can verify. Attestation is not gated by a vendor's signing authority.
+**Attestation.** Approved actions produce hash-chained audit entries the operator controls. Counterparty-verifiable evidence is strongest at checkpoint and receipt surfaces where a signer is actually wired; production audit checkpoints are unsigned until **IC-05** closes. Attestation is not gated by a vendor's signing authority.
 
 **Exit.** When the operator wants to leave a vendor, the operator's substrate walks out with them. The vendor does not own the operator's history.
 
@@ -120,15 +120,15 @@ This is what happens when the substrate the agent runs on does not belong to the
 
 The Castle Wall is the answer to this class of compromise: prompt-inject the agent if you can, but you cannot exfiltrate past the kernel boundary. Sentinels are the answer to the next class: observe the agent inside the walls and surface anomalies the wall cannot see. Charter and Heralds are the answer to the trust question: the operator's actions are signed and portable; the operator's reputation does not evaporate when the platform's terms change.
 
-This is a category, not a feature. The L7 governance market just consolidated last week and that consolidation does not include operator-side enforcement at the kernel. That gap is the substrate position. We are in it.
+This is a category-level move. The L7 governance market just consolidated last week and that consolidation does not include operator-side enforcement at the kernel. That gap is the substrate position. We are in it.
 
 ## Why now
 
 The window is short. Microsoft Agent 365 went GA May 1, bundling agent governance into M365 E7 Frontier at $99 per user per month and giving Microsoft an enterprise-default agent control plane overnight. Pipelock OSS shipped May 4 as a single-binary L7 agent firewall, claiming the developer-friendly slot. AWS Bedrock plus Network Firewall shipped managed egress filtering the same week, anchoring the hyperscaler tier. The Visa, Cloudflare, Skyfire, and Experian agent-payments stack moved into formal multi-vendor alignment with a working consumer-side demonstration. Each of those moves locks vocabulary, partner relationships, and category definitions. The substrate position is best claimed before the operator-sovereign distinction becomes background noise inside a larger consolidation narrative.
 
-We have done this before. We locked the open web. We locked social platforms. We locked mobile app stores. Each time, the substrate was chosen to benefit the platform, not the operator. We have a short window to get this right for once.
+We have done this before. We locked the open web. We locked social platforms. We locked mobile app stores. Each time, the substrate was chosen to benefit the platform over the operator. We have a short window to get this right for once.
 
-This is not panic. It is structural timeline. Once hundreds of thousands of operators have integrated against a vendor-keyed substrate, changing the architecture becomes a migration problem at the scale of the whole stack. The cost of getting it wrong later is the cost of fixing it now, multiplied by every transaction the substrate processes between now and then.
+This is structural timeline. Once hundreds of thousands of operators have integrated against a vendor-keyed substrate, changing the architecture becomes a migration problem at the scale of the whole stack. The cost of getting it wrong later is the cost of fixing it now, multiplied by every transaction the substrate processes between now and then.
 
 ## Composition, not substitution
 
@@ -142,7 +142,7 @@ Anthropic's Model Context Protocol provides the tool surface every modern harnes
 
 The list extends across the standards and partnership surface: ERC-8004 for on-chain identity registries, DIF KYA-OS for agent identity at the protocol layer, W3C AIVS for the verification specification, the A2A and A2CN coordination work for cross-protocol mandate alignment. Sanctuary contributes upstream as a Verifier-role reference implementation. It does not stand up parallel coordinating organizations. It does not compete on standards governance. It provides the operator-sovereign reference implementation that makes the standards honest about portability.
 
-The substrate position is not an alternative to the agent stack. It is the layer that makes the agent stack honest about who owns the operator's record.
+The substrate position is the ownership layer that makes the agent stack honest about who owns the operator's record.
 
 ## Sovereignty for agents and humans
 
@@ -156,7 +156,7 @@ The substrate that defends the operator defends the agent. The rights we defend 
 
 ## What we are asking for
 
-If you are a technical operator: install Sanctuary. The substrate is shipping now on npm. Wrap an agent. Watch it run on your machine, with keys you derived. Run a recovery drill. Try the substrate selector. Test the export-and-walk path on a fresh fortress and confirm your record arrived intact. The framework alone is operational with zero external dependency.
+If you are a technical operator: install Sanctuary. The substrate is shipping now on npm. Wrap an agent. Watch it run on your machine, with keys you derived. Run a recovery drill. Try the substrate selector. Use CLI export and offline verification for the current exit path, then treat fresh-fortress import as partial until skipped-entry visibility, dashboard re-key export, and rotated-key import are fixed. The framework alone is operational with zero external dependency.
 
 If you are an enterprise buyer evaluating sovereign deployment: pilot conversations are open. Castle Wall Phase 1 is live on Linux today. macOS Phase 1 follows once the platform's developer-program review clears. Pilot demos include a prompt-injection scenario showing the wall blocking unauthorized egress at the kernel and the operator approving in under ten seconds.
 

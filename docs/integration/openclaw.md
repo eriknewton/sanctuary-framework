@@ -4,7 +4,7 @@
 > to your OpenClaw agent in under 60 seconds.
 
 Verified working on Mac Mini M4 running OpenClaw 2026.4.2 + Sanctuary v1.3.0-rc.1
-(68 tools registered, sovereignty handshakes completed, Verascore publish proven).
+(80+ tools registered, sovereignty handshakes completed, Verascore publish proven).
 The config below uses the explicit-binary npx form
 (`-p @sanctuary-framework/mcp-server sanctuary-mcp-server`), which resolves an
 executable on every published version, so it tracks the latest release instead
@@ -77,7 +77,7 @@ Visit `https://verascore.ai/agent/{did}` to see the live profile.
 | Before Sanctuary | After Sanctuary |
 |-----------------|-----------------|
 | No agent identity | Ed25519 keypair + W3C DID |
-| Default logging | Encrypted, tamper-proof audit trail |
+| Default logging | Encrypted, tamper-evident hash-chained audit trail; production checkpoint signatures are partial until **IC-05, IC-06** close |
 | No reputation | Verifiable Verascore profile |
 | Platform-locked trust | Portable across any runtime |
 | No sovereignty proof | L1-L4 Sovereignty Health Report |

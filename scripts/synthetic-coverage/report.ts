@@ -63,6 +63,7 @@ export async function buildReport(opts: {
     }
 
     const isNotImplemented = assuranceRow.status === "not_implemented";
+    // Invariant: fixtures on a not_implemented row still execute; every outcome is discarded here so the ratchet cannot turn the row red until the status is deliberately changed.
     const reportedOutcomes = isNotImplemented ? [] : outcomes;
     const fixturesRun = reportedOutcomes.length;
     const fixturesFailed = reportedOutcomes.filter((outcome) => !outcome.passed).length;

@@ -113,7 +113,8 @@ Both jobs must be green before this PR can be marked ready-for-review.
 - `Review/Sanctuary/Castle_Wall_Phase1_Scope_Lock_2026-05-03.md`
   (ratified post-Codex amendments).
 - `Review/Sanctuary/Castle_Architecture_ADR_2026-04-30.md` (parent ADR;
-  the architectural intent that this crate enforces).
+  the architectural intent this crate is meant to serve once the daemon boot
+  path is wired to live enforcement).
 - PR #117 (PR 1: TypeScript interfaces and types).
 - PR #119 (PR 2a: IPC contract path plus Rust scaffold).
 - PR #124 (PR 2b: kernel enforcement binding).

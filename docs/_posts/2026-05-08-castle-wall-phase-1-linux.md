@@ -24,7 +24,7 @@ claims_era_note: true
 > Open defect: **IC-02, IC-03, IC-04**
 > (`docs/audit/inert-capability-register.md`).
 
-An agent under prompt injection executed 75 percent of remote commands across 34 sessions in a recent breach. The result, per OWASP GenAI's Q1 2026 round-up, was 195 million taxpayer records and 220 million civil records exfiltrated from a national-government deployment. The agent was not malicious. It was cooperative. The instructions came from somewhere it should not have trusted, and the runtime had no way to refuse the network call.
+An agent under prompt injection executed 75 percent of remote commands across 34 sessions in a recent breach. The result, per OWASP GenAI's Q1 2026 round-up, was 195 million taxpayer records and 220 million civil records exfiltrated from a national-government deployment. The agent cooperated with instructions from somewhere it should not have trusted, and the runtime had no way to refuse the network call.
 
 Adaptive prompt injection now exceeds an 85 percent success rate against state-of-the-art defenses per public reporting. CVE-2025-53773 (CVSS 9.6) confirmed prompt-injection remote code execution in a flagship coding-agent product. CVE-2025-32711 (CVSS 9.3) confirmed zero-click prompt injection in a hyperscaler M365 component. Snyk's ToxicSkills study found 13.4 percent of agent skills in the wild carry critical security issues, with 1,184 confirmed-malicious skills active and daily submissions ten times what they were three months earlier.
 
@@ -42,9 +42,9 @@ Sanctuary's enforcement model has four layers, each with a distinct contract. Th
 
 **The Castle Wall.** Operating-system-level filtering at the boundary between the operator's machine and the external world, on the outbound path. Outbound calls (HTTP, DNS, custom protocols) route through a wall the operator's policies define. On macOS this is proven in the current Assurance Matrix. On Linux, the source modules are tested but the shipped daemon does not yet install the enforcement path. Open defect: **IC-02, IC-03, IC-04** (`docs/audit/inert-capability-register.md`). This answers the question every honest enterprise buyer asks: how does the substrate enforce against an agent determined to escape? Ingress filtering of inbound webhooks and callbacks is roadmap, not part of the shipped surface.
 
-**Sentinels.** Internal observation, not enforcement. Behavioral baselining via process introspection, eBPF observability, and audit-log analysis. Anomalies surface to the operator via system notifications. Sentinels see what the wall cannot: file-access patterns, internal model calls, cross-agent coordination, prompt-injection signatures inside internal communications. The sentinels surface; the operator decides. Sentinels ship in v1.3.
+**Sentinels.** Internal observation, not enforcement. Behavioral baselining via process introspection, audit-log analysis, auditd-tail fallback, and an eBPF watcher scaffold that currently falls back to stub mode because the real probe loader is not implemented. Anomalies surface to the operator via system notifications. Sentinels see what the wall cannot: file-access patterns, internal model calls, cross-agent coordination, prompt-injection signatures inside internal communications. The sentinels surface; the operator decides. Sentinels ship in v1.3.
 
-**The Charter.** Additive sovereignty surface for compliant agents. Encrypted state, signed audit, mandate primitives, four canonical policy slots, substrate selector, receipt integration. Compliant agents that voluntarily route through Sanctuary's MCP get the full sovereignty surface. Non-compliant agents do not break the castle; they hit the wall at the boundary and the sentinels inside. The Charter is the v1.2 ship and is already live.
+**The Charter.** Additive sovereignty surface for compliant agents. Encrypted state, hash-chained audit with current checkpoint-signing bounds, mandate primitives, four canonical policy slots, substrate selector, receipt integration. Production checkpoints are unsigned until **IC-05** closes, and `audit-chain verify --no-strict` can return PASS with findings until **IC-06** closes. Compliant agents that voluntarily route through Sanctuary's MCP get the full sovereignty surface. Non-compliant agents do not break the castle; they hit the wall at the boundary and the sentinels inside. The Charter is the v1.2 ship and is already live.
 
 **The Heralds.** Cryptographic receipts on cross-castle transactions, portable reputation that survives vendor churn, audit-trail evidence operators can carry across vendor relationships. This is how operators hold each other honest when they have no prior relationship. Concordia receipts plus Verascore reputation, composed with the substrate, not bound to it.
 
@@ -88,7 +88,7 @@ Linux Phase 1 does not ship as live enforcement today; the source path stays uns
 
 Windows Phase 2 sits behind macOS, using Windows Filtering Platform. Container and microVM isolation, Phase 3, is queued for the highest-assurance enterprise deployments where additional isolation between the wrapped agent and the operator's host filesystem matters.
 
-Sentinels work begins in v1.3, after Phase 1 macOS clears entitlement review. The eBPF baselining and anomaly-surface UX were designed alongside the wall and have been waiting on the wall to land first. They are next.
+Sentinels work begins in v1.3, after Phase 1 macOS clears entitlement review. The auditd-tail fallback and anomaly-surface UX were designed alongside the wall. The eBPF watcher remains a scaffold until the real probe loader is implemented.
 
 ## Your kernel
 

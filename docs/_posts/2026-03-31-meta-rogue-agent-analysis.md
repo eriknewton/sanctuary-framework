@@ -49,7 +49,7 @@ Sanctuary's architecture is built to contain Meta's failure class. When this pos
 
 **L1; Cognitive Sovereignty: The agent's knowledge is encrypted and access-controlled.**
 
-Sanctuary encrypts all agent state at rest with AES-256-GCM, keys derived via Argon2id, held by the participant, not the platform. The agent can't casually access "proprietary code, business strategies, and user datasets" because that data would need to be explicitly provisioned to the agent's encrypted state store with participant-held keys. The default is encrypted and inaccessible, not plaintext and available.
+Sanctuary encrypts all agent state at rest with AES-256-GCM, keys derived via Argon2id, held by the participant instead of the platform. The agent can't casually access "proprietary code, business strategies, and user datasets" because that data would need to be explicitly provisioned to the agent's encrypted state store with participant-held keys. The default is encrypted and inaccessible rather than plaintext and available.
 
 **L2; Operational Isolation: The approval gate is mandatory, not advisory.**
 
@@ -72,7 +72,7 @@ Sanctuary's sovereignty-gated reputation tiers mean that an agent's history of a
 Sanctuary's SHR (Sovereignty Health Report) provides a machine-readable, Ed25519-signed document that describes an agent's sovereignty posture before it operates. A pre-deployment SHR check on Meta's agent would have shown:
 
 - L1: No encryption at rest. State access unrestricted. **FAIL.**
-- L2: Approval gate advisory, not enforced. No behavioral baseline. No context gating. **FAIL.**
+- L2: Approval gate advisory only. No behavioral baseline. No context gating. **FAIL.**
 - L3: No selective disclosure. No minimum-necessary revelation. **FAIL.**
 - L4: No verifiable reputation. No action history. **FAIL.**
 
@@ -98,8 +98,8 @@ npx @sanctuary-framework/mcp-server
 
 Run `sanctuary/sovereignty_audit` on your current agent setup. It will tell you which of these gaps exist in your environment, before the next Sev 1 teaches you the hard way.
 
-The full source is at [github.com/eriknewton/sanctuary-framework](https://github.com/eriknewton/sanctuary-framework). 51 MCP tools. 420 tests. Apache-2.0.
+The full source is at [github.com/eriknewton/sanctuary-framework](https://github.com/eriknewton/sanctuary-framework). Current releases expose 80+ MCP tools. Apache-2.0.
 
 ---
 
-*Sanctuary defines custody infrastructure for the agentic economy. The Meta incident is precisely the class of failure this architecture is built against: not by telling agents what to do, but by putting enforcement where a misbehaving agent does not get a vote.*
+*Sanctuary defines custody infrastructure for the agentic economy. The Meta incident is precisely the class of failure this architecture is built against: on macOS within the proven scope, enforcement sits where a misbehaving agent does not get a vote.*

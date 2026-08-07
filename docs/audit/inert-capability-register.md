@@ -115,8 +115,9 @@ rules do match real flows on macOS.
 
 This matters more than it looks. It is the scoping mechanism underneath the
 per-uid allow/deny enforcement demonstration that closed the enforcement thesis
-gate on 2026-06-15. Had it been inert, the macOS Castle Wall row in the Assurance
-Matrix would have been in question. It is not.
+gate on 2026-06-15. Had this candidate been inert, the per-uid allow/deny
+evidence for this specific candidate would have been in question. This candidate
+is refuted.
 
 Within this wiring sweep, every candidate resolved to confirmed-inert or
 refuted.

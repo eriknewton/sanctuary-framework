@@ -1,6 +1,6 @@
 # Sanctuary Framework Plugin
 
-The firewall and control panel for your AI agents, as a Cowork/Claude Code plugin.
+The cooperative control panel for your AI agents, as a Cowork/Claude Code plugin. Operating-system enforcement is a separate macOS arming path outside this plugin.
 
 ## What it does
 
@@ -42,7 +42,7 @@ Then run `sanctuary/sovereignty_audit` to see what Sanctuary adds on top of your
 - **Cryptographic identity**: OpenClaw has no agent identity. Sanctuary provides Ed25519 keypairs.
 - **Graduated approval**: OpenClaw's `requireApproval` is binary. Sanctuary adds three-tier approval with anomaly detection.
 - **Selective disclosure**: Prove claims without revealing underlying data.
-- **Portable reputation**: Signed attestations you own and can take anywhere.
+- **Portable reputation**: Signed attestations you own and can export through current paths, with full exit still partial until **IC-07, IC-08, IC-09** close.
 
 ## Requirements
 
@@ -51,7 +51,7 @@ Then run `sanctuary/sovereignty_audit` to see what Sanctuary adds on top of your
 
 ## Tools provided
 
-90+ MCP tools across the named layers (Cognitive, Operational, Selective Disclosure, Verifiable Reputation), plus the audit tool, context gating, operational hardening, gateway export, federation, the Concordia bridge, and system tools. See the skill documentation for the featured workflows.
+80+ MCP tools across the named layers (Cognitive, Operational, Selective Disclosure, Verifiable Reputation), plus the audit tool, context gating, operational hardening, gateway export, federation, the Concordia bridge, and system tools. See the skill documentation for the featured workflows.
 
 ## License
 

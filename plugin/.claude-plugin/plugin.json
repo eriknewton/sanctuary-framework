@@ -1,7 +1,7 @@
 {
   "name": "sanctuary-framework",
   "version": "0.3.0",
-  "description": "The open source standard for secure, private AI: a wall the operating system enforces where the platform row is proven, and your data under your own keys with current portability bounds called out in the Assurance Matrix. Wraps any MCP-compatible agent with encrypted state, approval gates, a portable identity and reputation, and an audit tool that finds security and privacy gaps in your current setup.",
+  "description": "The open source standard for secure, private AI: operating-system enforcement is live on macOS today; Linux and Windows are not live enforcement yet, and your data stays under your own keys with current portability bounds called out in the Assurance Matrix. Wraps any MCP-compatible agent with encrypted state, approval gates, a portable identity and reputation, and an audit tool that finds security and privacy gaps in your current setup.",
   "author": {
     "name": "Erik Newton",
     "homepage": "https://github.com/eriknewton/sanctuary-framework"
@@ -9,7 +9,7 @@
   "license": "Apache-2.0",
   "keywords": [
     "security",
-    "firewall",
+    "egress-control",
     "encryption",
     "identity",
     "reputation",

@@ -14,7 +14,7 @@ claims_era_note: true
 
 # Sanctuary for Claude Managed Agents: Quickstart
 
-You've deployed a Managed Agent. Now secure it with cryptographic identity, audit trails, and policy enforcement. Sanctuary Framework v0.7.0 adds 68 tools for security, privacy, and control, published today as an MCP server.
+You've deployed a Managed Agent. Now secure it with cryptographic identity, audit trails, and policy enforcement. Sanctuary Framework v0.7.0 added a smaller tool surface when this post was published; current releases expose 80+ tools.
 
 ## Add Sanctuary in 30 Seconds
 
@@ -38,7 +38,7 @@ Deploy the agent. Sanctuary tools load automatically via MCP.
 ## What Sanctuary Gives You
 
 - **Sovereign Identity**: Ed25519 cryptographic keypair + W3C DID per agent instance
-- **Encrypted Audit Trail**: Tamper-proof CEF/OCSF logs; selective disclosure via zero-knowledge attestations
+- **Encrypted Audit Trail**: Tamper-evident hash-chained logs with current signed-checkpoint bounds; selective disclosure via zero-knowledge attestations
 - **Principal Policy**: Tiered role-based access control (RBAC) with time-locked capabilities
 - **SIEM Export**: Push audit events to any SIEM (Datadog, Splunk, Chronicle)
 - **Sovereignty Health Reports**: Real-time dashboard of identity status, policy compliance, audit integrity
@@ -56,7 +56,7 @@ Deploy the agent. Sanctuary tools load automatically via MCP.
 
 ## Verify Sanctuary is Ready
 
-Call the `manifest` tool from your agent logic. If you see 68 tools listed, Sanctuary is active:
+Call the `manifest` tool from your agent logic. If you see the Sanctuary tool surface listed, Sanctuary is active. Current releases expose 80+ tools:
 
 ```python
 # Verify Sanctuary tools are available

@@ -4,7 +4,7 @@ Use Sanctuary's sovereignty infrastructure with Hermes Agent, the open-source se
 
 ## Overview
 
-Hermes Agent has native MCP support - Sanctuary's 67+ MCP tools work seamlessly via Hermes's configuration layer. Hermes's multi-level memory, subagent isolation, and scheduled automations compose naturally with Sanctuary's four sovereignty layers.
+Hermes Agent has native MCP support - Sanctuary's 80+ MCP tools work seamlessly via Hermes's configuration layer. Hermes's multi-level memory, subagent isolation, and scheduled automations compose naturally with Sanctuary's four sovereignty layers.
 
 What you get: encrypted state (L1), process isolation with Sanctuary attestation (L2), selective disclosure (L3), and verifiable reputation (L4) - plus Hermes's native features like memory encryption, subagent sandboxing, and automated sovereignty audits on a cron schedule.
 
@@ -61,7 +61,7 @@ export HERMES_MEMORY_KEY=$(openssl rand -base64 32)
 hermes run hermes_config.yaml
 ```
 
-Your agent now has full Sanctuary integration. All 67+ tools are available as native Hermes capabilities.
+Your agent now has full Sanctuary integration. All 80+ tools are available as native Hermes capabilities.
 
 ## Proxy Mode - MCP Proxy for Runtime Governance
 
@@ -474,7 +474,7 @@ A single task can now:
 
 Sanctuary and Concordia compose but neither depends on the other. Use either alone or both together.
 
-## Available Sanctuary Tools (67+)
+## Available Sanctuary Tools (80+)
 
 All Sanctuary tools are exposed as Hermes capabilities. Key categories:
 

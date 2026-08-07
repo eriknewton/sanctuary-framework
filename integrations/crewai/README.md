@@ -4,9 +4,9 @@ Use Sanctuary's sovereignty infrastructure with CrewAI agents.
 
 ## Overview
 
-CrewAI has native MCP support — no custom adapter required. Sanctuary's 54 MCP tools become CrewAI tools through the built-in `mcps` field or the `crewai-adapters` package.
+CrewAI has native MCP support - no custom adapter required. Sanctuary's 80+ MCP tools become CrewAI tools through the built-in `mcps` field or the `crewai-adapters` package.
 
-What you get: encrypted state, cryptographic identity, selective disclosure, verifiable reputation, and context gating for any CrewAI agent — without changing your agent code.
+What you get: encrypted state, cryptographic identity, selective disclosure, verifiable reputation, and context gating for any CrewAI agent - without changing your agent code.
 
 ## Quick Start
 
@@ -105,7 +105,7 @@ print(asyncio.run(run()))
 
 Sanctuary's Principal Policy requires human approval for high-risk operations (state export, key rotation, identity deletion). These operations block until approved.
 
-Run Sanctuary with the dashboard enabled for real-time approval:
+Run Sanctuary with the dashboard enabled, then reload to inspect new pending approvals; for live delivery use webhook or stderr until **IC-12** closes:
 
 ```bash
 SANCTUARY_DASHBOARD_ENABLED=true npx @sanctuary-framework/mcp-server
@@ -157,7 +157,7 @@ negotiator = Agent(
 )
 ```
 
-Each agent gets its own cryptographic identity, encrypted state store, and reputation history — fully isolated from other agents in the crew.
+Each agent gets its own cryptographic identity, encrypted state store, and reputation history - fully isolated from other agents in the crew.
 
 ### Context Gating for Inference Calls
 
@@ -191,7 +191,7 @@ audit_task = Task(
 )
 ```
 
-The SHR is a signed JSON document that counterparties can verify — useful for establishing trust in multi-crew workflows.
+The SHR is a signed JSON document that counterparties can verify - useful for establishing trust in multi-crew workflows.
 
 ## Adding Concordia (Negotiation)
 

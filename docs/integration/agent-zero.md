@@ -48,7 +48,7 @@ Edit your Agent Zero MCP server configuration:
 ## Step 2: Verify Sanctuary Is Active
 
 Ask your agent: "List all available tools" or call `manifest` directly.
-You should see 68 Sanctuary tools in the available tool list.
+You should see 80+ Sanctuary tools in the available tool list.
 
 Agent Zero auto-discovers MCP tools from connected servers, so Sanctuary's
 tools appear without additional configuration.
@@ -83,7 +83,7 @@ Visit `https://verascore.ai/agent/{did}` to see the live profile.
 | Before Sanctuary | After Sanctuary |
 |-----------------|-----------------|
 | No agent identity | Ed25519 keypair + W3C DID |
-| Default logging | Encrypted, tamper-proof audit trail |
+| Default logging | Encrypted, tamper-evident hash-chained audit trail; production checkpoint signatures are partial until **IC-05, IC-06** close |
 | No reputation | Verifiable Verascore profile |
 | Platform-locked trust | Portable across any runtime |
 | No sovereignty proof | L1-L4 Sovereignty Health Report |
@@ -91,7 +91,7 @@ Visit `https://verascore.ai/agent/{did}` to see the live profile.
 ## Agent Zero-Specific Notes
 
 **Auto-discovery.** Agent Zero automatically discovers MCP tools from connected
-servers. Sanctuary's 68 tools appear in the agent's available tool list without
+servers. Sanctuary's 80+ tools appear in the agent's available tool list without
 additional configuration.
 
 **Multi-agent.** Agent Zero supports subordinate agents. Each subordinate can
@@ -155,7 +155,7 @@ timeout occurs, pre-install globally:
 
 **Tool count seems low**
 Agent Zero may use tool search or lazy loading for large tool sets. Ask the
-agent to call `manifest` explicitly to see all 68 tools.
+agent to call `manifest` explicitly to see the full 80+ tool surface.
 
 **Agent Zero MCP server doesn't expose Sanctuary tools**
 Expected behavior. When Agent Zero exposes itself as an MCP server, it exports

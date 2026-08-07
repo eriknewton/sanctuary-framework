@@ -6,6 +6,7 @@ author: Erik Newton
 description: "Microsoft released the Agent Governance Toolkit, open-source runtime security for AI agents. It validates the category we've been building. But their approach is about enterprise control. Ours is about portable sovereignty. Here's what's the same, what's different, and why it matters."
 image: /images/blog/microsoft-vs-sanctuary.jpg
 archive_note: "Predates Mantle vocabulary canonicalization on 2026-05-15. Terminology in this post may refer to install-time-binding concepts using earlier language; current canonical vocabulary lives at https://github.com/eriknewton/newton-wiki/blob/main/concepts/mantle.md."
+claims_era_note: true
 ---
 
 > **Archive note:** This post predates Mantle vocabulary canonicalization on 2026-05-15.
@@ -51,7 +52,7 @@ This isn't a philosophical distinction. It's an architectural one.
 
 ## The Concrete Differences
 
-**Portability.** Sanctuary's Sovereignty Health Report, attestations, and reputation bundles are portable across instances. You can export your agent's entire identity and reputation, move it to a different machine, a different cloud, a different harness, and it carries its cryptographic history with it. Microsoft's governance is Azure-native. Your agent's security posture exists within the Microsoft ecosystem.
+**Portability.** Sanctuary's Sovereignty Health Report, attestations, and reputation bundles are portable across instances. You can export current identity and reputation artifacts and move them to a different machine, cloud, or harness, with exit-bundle caveats for dashboard export, skipped import counters, and rotated-key imports. Open defect: **IC-07, IC-08, IC-09** (`docs/audit/inert-capability-register.md`). Microsoft's governance is Azure-native. Your agent's security posture exists within the Microsoft ecosystem.
 
 **Selective disclosure.** Sanctuary's Layer 3 provides Pedersen commitments, Schnorr proofs, and range proofs, genuine zero-knowledge cryptographic primitives that let an agent prove claims about its data without revealing the underlying values. No other framework in this space offers this. Microsoft's toolkit handles identity and access control but doesn't address the question: how does an agent prove something about itself to a counterparty it doesn't fully trust?
 
@@ -90,7 +91,7 @@ Sanctuary is open source (Apache-2.0), runs locally, and works with any MCP-comp
 npx @sanctuary-framework/mcp-server
 ```
 
-62 MCP tools. Four layers of sovereignty. No cloud required.
+Current releases expose 80+ MCP tools. Four layers of sovereignty. No cloud required.
 
 GitHub: [github.com/eriknewton/sanctuary-framework](https://github.com/eriknewton/sanctuary-framework)
 
