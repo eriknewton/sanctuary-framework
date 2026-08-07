@@ -131,7 +131,6 @@
 1	server/src/disclosure/tools.ts
 1	server/src/distress/local-secret.ts
 2	server/src/distress/tools.ts
-1	server/src/exit/cli.ts
 4	server/src/federation/registry.ts
 2	server/src/federation/tools.ts
 2	server/src/handshake/protocol.ts
