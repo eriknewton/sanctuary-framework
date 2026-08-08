@@ -29,7 +29,7 @@
 // Exit codes: 0 = all invariants hold; 1 = one or more violations.
 
 import { readFileSync, existsSync } from "node:fs";
-import { dirname, resolve, join } from "node:path";
+import { dirname, resolve, join, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -43,8 +43,13 @@ const MATRIX_PATH = join(REPO_ROOT, "ASSURANCE_MATRIX.md");
 // suite cannot prove — only a drill on the real platform can. Keep this list in
 // sync with the assurance-discipline section of AGENTS.md; the two are a cross-file
 // contract. The platform column then tells you WHICH platform's drill is required.
+// Matched as STEMS, not whole words: `\bwrap\b` would miss "wrapping",
+// `\bconfine\b` would miss "confinement", `\bcontain\b` would miss "containment".
+// A trailing `\b` here is a silent bypass, so there is deliberately none. The
+// stems cover every enforcement term named in the AGENTS.md assurance-discipline
+// section (this is the cross-file contract pin).
 const ENFORCEMENT_CLAIM_RE =
-  /\b(enforcement|egress|containment|reboot|install|firewall|jail|confine|wrap)\b/i;
+  /\b(enforc|egress|contain|reboot|install|firewall|jail|confin|wrap)/i;
 
 // Drill evidence = a captured artifact under docs/audit/, OR the token "drill"
 // accompanied by an ISO date. Either proves someone ran the real thing on a date.
@@ -96,17 +101,32 @@ function main() {
     if (!inTable) continue;
 
     // Split into cells; a leading and trailing pipe produce empty edge cells.
+    // Require EXACTLY 6 columns. Fewer is a malformed row; more means a cell
+    // contained a literal `|` (markdown escapes it as `\|`), which would silently
+    // misalign the Status/Evidence extraction below. Both must fail loudly.
     const cells = line.split("|").slice(1, -1).map((c) => c.trim());
-    if (cells.length < 6) {
-      violations.push(`Row after "${cells[0] ?? "?"}" has ${cells.length} columns, expected 6.`);
+    if (cells.length !== 6) {
+      violations.push(`Row after "${cells[0] ?? "?"}" has ${cells.length} columns, expected exactly 6 (a literal '|' in a cell must be escaped as '\\|').`);
       continue;
     }
     rowNum++;
     const [claim, platform, status, evidence] = cells;
 
-    // Invariant 1: every repo-relative evidence link resolves.
+    // Invariant 1: every repo-relative evidence link resolves AND stays inside
+    // the repo. An absolute path or a `..` escape that happens to resolve to a
+    // real file on the build host (e.g. /etc/passwd) is not valid evidence; the
+    // matrix may only cite artifacts that ship in this repository.
     for (const target of relativeLinkTargets(evidence)) {
+      if (target.startsWith("/")) {
+        violations.push(`"${claim}": evidence link is an absolute path, not a repo-relative one: ${target}`);
+        continue;
+      }
       const abs = resolve(REPO_ROOT, target);
+      const withinRepo = abs === REPO_ROOT || abs.startsWith(REPO_ROOT + sep);
+      if (!withinRepo) {
+        violations.push(`"${claim}": evidence link escapes the repository: ${target}`);
+        continue;
+      }
       if (!existsSync(abs)) {
         violations.push(`"${claim}": evidence link does not resolve: ${target}`);
       }
