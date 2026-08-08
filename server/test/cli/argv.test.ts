@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
 
-import { flagValue, flagValues, hasFlag } from "../../src/cli/argv.js";
+import {
+  consumeFlagValue,
+  flagValue,
+  flagValues,
+  hasFlag,
+  unknownFlagWithPrefix,
+} from "../../src/cli/argv.js";
 import { parseExportArgs } from "../../src/cli/audit-chain-export.js";
 
 describe("shared CLI argv flag parser", () => {
@@ -40,6 +46,40 @@ describe("shared CLI argv flag parser", () => {
     expect(hasFlag(["--fortress-path", "/tmp/sanctuary"], "--fortress")).toBe(
       false,
     );
+  });
+
+  it("consumes split and equals value flags while preserving the rest", () => {
+    expect(consumeFlagValue(["list", "--fortress", "/tmp/a", "--json"], "--fortress")).toEqual({
+      argv: ["list", "--json"],
+      value: "/tmp/a",
+    });
+    expect(consumeFlagValue(["list", "--fortress=/tmp/a", "--json"], "--fortress")).toEqual({
+      argv: ["list", "--json"],
+      value: "/tmp/a",
+    });
+  });
+
+  it("returns loud errors for missing, empty, and duplicate values", () => {
+    expect(consumeFlagValue(["--fortress"], "--fortress").error).toBe(
+      "--fortress requires a value",
+    );
+    expect(consumeFlagValue(["--fortress="], "--fortress").error).toBe(
+      "--fortress requires a value",
+    );
+    expect(
+      consumeFlagValue(["--fortress=/tmp/a", "--fortress", "/tmp/b"], "--fortress").error,
+    ).toBe("--fortress may only be provided once");
+  });
+
+  it("detects unknown fortress-prefixed flags while allowing known relatives", () => {
+    expect(unknownFlagWithPrefix(["--fortress-path=/tmp/a"], "--fortress")).toBe(
+      "--fortress-path",
+    );
+    expect(
+      unknownFlagWithPrefix(["--fortress-url=http://127.0.0.1:9"], "--fortress", [
+        "--fortress-url",
+      ]),
+    ).toBeUndefined();
   });
 
   it("keeps audit-chain export from silently dropping equals-form paths", () => {

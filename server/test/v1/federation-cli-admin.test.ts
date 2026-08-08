@@ -550,6 +550,46 @@ describe("federation join --persist -- out-of-band pinned master", () => {
     expect(err.get()).toMatch(/unlocked operator identity|SANCTUARY_PASSPHRASE/);
   });
 
+  it("passes --fortress=<path> to the joiner persistence layer", async () => {
+    const bootstrapToken = new JoinCeremony(issuerContextWithApprover(issuer)).authorizeInit({
+      intendedNodeId: "joiner-linux",
+      intendedNodeMode: "local",
+    });
+    const joinerPath = await mkdtemp(join(tmpdir(), "slice3b-joiner-equals-"));
+    let capturedFortressPath: string | undefined;
+    try {
+      const code = await runFederationJoin({
+        argv: [
+          "--fortress-url",
+          "http://127.0.0.1:9",
+          "--bootstrap-token",
+          JSON.stringify(bootstrapToken),
+          "--master-secret",
+          toBase64url(issuer.masterSecret),
+          "--persist",
+          "--pinned-master",
+          JSON.stringify(issuer.pinnedMaster),
+          `--fortress=${joinerPath}`,
+        ],
+        env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
+        out: capture().stream,
+        err: capture().stream,
+        request: async () => ({
+          certificate: { node_id: "joiner-linux" },
+          issuing_principal_cert: { principal_id: "issuer" },
+        }),
+        persistJoinerTrustRoot: async (params) => {
+          capturedFortressPath = params.fortressPath;
+        },
+      });
+
+      expect(code).toBe(0);
+      expect(capturedFortressPath).toBe(joinerPath);
+    } finally {
+      await rm(joinerPath, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+    }
+  });
+
   it("persists a joiner trust root from a REAL join and refuses a non-chaining cert", async () => {
     // The issuer responder runs the REAL JoinCeremony against the JoinRequest the
     // VERB submits, so the issued cert binds to the verb's freshly-generated node

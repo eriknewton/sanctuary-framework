@@ -130,6 +130,14 @@ describeIfDarwin("sanctuary secrets CLI", () => {
     expect(body.skills[0].secrets[0]).toMatchObject({ name: "gmail_oauth", scope: "read", ttl: 600 });
   });
 
+  it("grant accepts equals-form value flags", async () => {
+    await run(["add", "gmail_oauth"], "v\n");
+    const r = await run(["grant", "gmail-triage", "gmail_oauth", "--scope=rotate", "--ttl=600"]);
+    expect(r.code).toBe(0);
+    const body = JSON.parse(readFileSync(join(tempDir, "broker-policy.json"), "utf8"));
+    expect(body.skills[0].secrets[0]).toMatchObject({ scope: "rotate", ttl: 600 });
+  });
+
   it("revoke removes the grant", async () => {
     await run(["add", "gmail_oauth"], "v\n");
     await run(["grant", "gmail-triage", "gmail_oauth"]);

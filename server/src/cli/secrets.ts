@@ -39,6 +39,7 @@ import {
   loadBrokerPolicyRaw,
   saveBrokerPolicy,
 } from "../disclosure/broker/open.js";
+import { flagValue } from "./argv.js";
 
 export interface SecretsArgs {
   argv: string[];
@@ -245,8 +246,8 @@ async function cmdGrant(
 ): Promise<number> {
   const skill = requirePositional(argv, 0, "grant <skill> <secret>");
   const secret = requirePositional(argv, 1, "grant <skill> <secret>");
-  const scopeFlag = parseFlag(argv, "--scope");
-  const ttlFlag = parseFlag(argv, "--ttl");
+  const scopeFlag = flagValue(argv, "--scope");
+  const ttlFlag = flagValue(argv, "--ttl");
   const scope: SecretScope = (scopeFlag as SecretScope | undefined) ?? "read";
   if (scope !== "read" && scope !== "rotate") {
     ctx.err.write(`--scope must be "read" or "rotate" (got ${scopeFlag})\n`);
@@ -334,8 +335,8 @@ async function cmdAudit(
   argv: string[],
   ctx: { out: NodeJS.WritableStream; err: NodeJS.WritableStream; args: SecretsArgs }
 ): Promise<number> {
-  const since = parseFlag(argv, "--since");
-  const limit = Number(parseFlag(argv, "--limit") ?? "200");
+  const since = flagValue(argv, "--since");
+  const limit = Number(flagValue(argv, "--limit") ?? "200");
   const { broker, close } = await openBroker({
     passphrase: ctx.args.passphrase,
     storagePath: ctx.args.storagePath,
@@ -446,12 +447,6 @@ function optionalPositional(argv: string[], i: number): string | undefined {
   const v = argv[i];
   if (!v || v.startsWith("--")) return undefined;
   return v;
-}
-
-function parseFlag(argv: string[], name: string): string | undefined {
-  const idx = argv.indexOf(name);
-  if (idx === -1) return undefined;
-  return argv[idx + 1];
 }
 
 /** Deadline on non-TTY stdin reads. Prevents the v0.10.0-rc.1 soak failure
