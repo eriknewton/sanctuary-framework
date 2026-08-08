@@ -19,6 +19,8 @@
     "lockdown",
     "memory_checkpoint_restore",
     "memory_delete",
+    "memory_emit",
+    "memory_ingest",
     "memory_insert",
     "operator_cloud_provision",
     "policy_change",

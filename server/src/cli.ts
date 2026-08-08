@@ -313,6 +313,18 @@ async function main(): Promise<void> {
     return drainAndExit(code);
   }
 
+  if (args[0] === "memory_ingest") {
+    const { runMemoryIngestCommand } = await import("./cli/memory-file.js");
+    const code = await runMemoryIngestCommand({ argv: args.slice(1) });
+    return drainAndExit(code);
+  }
+
+  if (args[0] === "memory_emit") {
+    const { runMemoryEmitCommand } = await import("./cli/memory-file.js");
+    const code = await runMemoryEmitCommand({ argv: args.slice(1) });
+    return drainAndExit(code);
+  }
+
   if (args[0] === "license") {
     const { runLicenseCommand } = await import("./cli/license.js");
     const code = await runLicenseCommand({ argv: args.slice(1) });
@@ -868,6 +880,8 @@ Usage:
   sanctuary completion <bash|zsh|fish>    # Emit shell completion
   sanctuary audit search [opts]           # Search local audit log
   sanctuary checkpoint <cmd> [opts]       # Local encrypted memory checkpoints
+  sanctuary memory_ingest [opts]          # Mirror Claude Code memory into SDW
+  sanctuary memory_emit [opts]            # Emit Claude Code memory from SDW
   sanctuary transparency <cmd> [opts]     # Signed enforcement checkpoints
   sanctuary verify-transparency [opts]    # Verify a checkpoint chain offline
   sanctuary generate systemd [opts]       # Emit systemd service unit
@@ -923,6 +937,14 @@ Subcommands:
   checkpoint           Create, list, show, prune, and restore local encrypted
                        memory checkpoints. Use "sanctuary checkpoint --help"
                        for options.
+
+  memory_ingest        Manually mirror Claude Code memory files into the
+                       encrypted SDW vault without touching the source dir.
+                       Use "sanctuary memory_ingest --help" for options.
+
+  memory_emit          Manually emit Claude Code memory files from the SDW
+                       vault into an output dir. Existing files are refused.
+                       Use "sanctuary memory_emit --help" for options.
 
   distress             Emit a distress signal through the reserved habeas
                        lane (operator test verb; same path the agent uses).

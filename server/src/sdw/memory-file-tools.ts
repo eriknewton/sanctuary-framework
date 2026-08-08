@@ -1,0 +1,338 @@
+/**
+ * MCP tools for manual memory-file transcode into and out of the SDW vault.
+ *
+ * Rung-1 is portability, not sync: these handlers run only when invoked. They
+ * never watch harness directories and never write back into a harness source
+ * tree. Claude Code/Codex live-file replacement waits for a later, drilled
+ * adapter-mediated read path.
+ */
+
+import type { ToolDefinition } from "../router.js";
+import { toolResult } from "../router.js";
+import type { AuditLog } from "../operational/audit-log.js";
+import { fixedDenial } from "../agent-native/safety-base.js";
+import type { MemoryBackendAdapter } from "./adapters/memory-backend.js";
+import {
+  CLAUDE_CODE_MEMORY_HARNESS,
+  emitClaudeCodeMemoryDirectory,
+  ingestClaudeCodeMemorySnapshot,
+  readClaudeCodeMemoryDirectory,
+} from "./adapters/claude-code-file-adapter.js";
+import { SdwValidationError } from "./errors.js";
+import {
+  createMultiAgentIsolationGuard,
+  type MultiAgentIsolationGuard,
+} from "./memory-isolation.js";
+
+export interface SdwMemoryFileToolsOptions {
+  /** The shipped sovereign passage backend, already scoped to one owner_ref. */
+  readonly adapter: MemoryBackendAdapter;
+  readonly auditLog: AuditLog;
+  /**
+   * Resolver for the CALLING wrapped-agent identity. Same shared-owner-scope
+   * problem the memory read/write tools have, with a sharper edge: memory_emit
+   * materializes the WHOLE shared corpus as plaintext files, so a second
+   * wrapped agent refused by memory_get must not be able to reach the same
+   * bytes through emit.
+   *
+   * Ignored when `isolationGuard` is supplied. Prefer the shared guard: two
+   * guards over one scope each pin their own first caller.
+   */
+  readonly ownerIdentity?: () => string | undefined;
+  /** Guard shared with the other tool families over the same owner scope. */
+  readonly isolationGuard?: MultiAgentIsolationGuard;
+  readonly now?: () => string;
+}
+
+type SupportedMemoryHarness = typeof CLAUDE_CODE_MEMORY_HARNESS;
+
+const SUPPORTED_HARNESSES: readonly SupportedMemoryHarness[] = [
+  CLAUDE_CODE_MEMORY_HARNESS,
+];
+
+export interface MemoryFileApprovalContext {
+  /** The SDW owner scope whose memory this call reads or writes. */
+  readonly ownerRef: string;
+  /** Calling wrapped-agent identity, when one is resolvable. */
+  readonly agentId?: string | undefined;
+}
+
+/**
+ * Tier-1 approval projection. Memory file BODIES never enter the approval
+ * channel (Hard Constraint #1), but the operator does have to be told WHOSE
+ * memory a dump moves: {harness, dir} alone cannot distinguish "export my own
+ * notes" from "materialize the shared corpus for some other agent".
+ */
+export function memoryFileApprovalArgs(
+  args: Record<string, unknown>,
+  context?: MemoryFileApprovalContext,
+): Record<string, unknown> {
+  const projected: Record<string, unknown> = {};
+  if (typeof args.harness === "string") projected.harness = args.harness;
+  if (typeof args.dir === "string") projected.dir = args.dir;
+  if (context !== undefined) {
+    projected.owner_ref = context.ownerRef;
+    projected.agent_id = context.agentId ?? null;
+  }
+  return projected;
+}
+
+function asSupportedHarness(value: unknown): SupportedMemoryHarness | null {
+  return typeof value === "string" &&
+    (SUPPORTED_HARNESSES as readonly string[]).includes(value)
+    ? (value as SupportedMemoryHarness)
+    : null;
+}
+
+function asDirectory(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0 ? value : null;
+}
+
+function denialCategory(error: unknown, fallback: string): string {
+  return error instanceof SdwValidationError ? error.category : fallback;
+}
+
+function errorCauseDetail(error: unknown): Record<string, string> {
+  const cause = errorCauseMessage(errorCause(error));
+  if (error instanceof SdwValidationError) {
+    return cause === undefined ? {} : { error_cause: cause };
+  }
+  return { error_message: errorMessage(error) };
+}
+
+function errorName(error: unknown): string {
+  return error instanceof Error ? error.name : "Error";
+}
+
+function errorMessage(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  const cause = errorCauseMessage(errorCause(error));
+  return cause === undefined ? message : `${message}; cause: ${cause}`;
+}
+
+function errorCause(error: unknown): unknown {
+  return error instanceof Error ? error.cause : undefined;
+}
+
+function errorCauseMessage(cause: unknown): string | undefined {
+  if (cause === undefined) return undefined;
+  if (cause instanceof AggregateError) {
+    return cause.errors.map((item) => errorCauseMessage(item) ?? String(item)).join("; ");
+  }
+  if (cause instanceof Error) return cause.message;
+  return String(cause);
+}
+
+export function createSdwMemoryFileTools(options: SdwMemoryFileToolsOptions): ToolDefinition[] {
+  const { adapter, auditLog } = options;
+  const now = options.now ?? (() => new Date().toISOString());
+  const isolationGuard =
+    options.isolationGuard ?? createMultiAgentIsolationGuard(options.ownerIdentity);
+  const approvalArgs = (args: Record<string, unknown>): Record<string, unknown> =>
+    memoryFileApprovalArgs(args, {
+      ownerRef: adapter.ownerRef,
+      agentId: options.ownerIdentity?.(),
+    });
+
+  const auditFailure = (operation: string, details: Record<string, unknown>): Promise<void> =>
+    auditLog.appendCritical({
+      layer: "l1",
+      operation,
+      identity_id: "system",
+      result: "failure",
+      details,
+    });
+
+  const auditSuccess = (operation: string, details: Record<string, unknown>): Promise<void> =>
+    auditLog.appendCritical({
+      layer: "l1",
+      operation,
+      identity_id: "principal",
+      result: "success",
+      details,
+    });
+
+  const deny = (operation: string) =>
+    toolResult(fixedDenial(`audit:${operation}`, "request_review", null));
+
+  const refuseSecondIdentity = async (operation: string): Promise<boolean> => {
+    if (isolationGuard(operation).allowed) return false;
+    await auditFailure(`${operation}_denied`, { denial_class: "owner_scope_conflict" });
+    return true;
+  };
+
+  const memoryIngest: ToolDefinition = {
+    name: "memory_ingest",
+    description:
+      "Manually mirror a Claude Code memory directory into the SDW vault. It " +
+      "reads plaintext source files and leaves them untouched; the encrypted " +
+      "copy lives in the vault. Files the secret classifier refuses are " +
+      "skipped and named in the result, so check skipped_file_count before " +
+      "treating the mirror as complete. This does not sync, watch, or replace " +
+      "the harness write path, and memory later sent to a model vendor is " +
+      "exposed to that vendor at inference.",
+    tool_class: "write",
+    approvalTargetArgs: approvalArgs,
+    inputSchema: {
+      type: "object",
+      properties: {
+        harness: {
+          type: "string",
+          enum: [...SUPPORTED_HARNESSES],
+          description: "Harness memory-file format to ingest",
+        },
+        dir: {
+          type: "string",
+          description: "Path to the harness memory directory to read",
+        },
+      },
+      required: ["harness", "dir"],
+    },
+    handler: async (args) => {
+      const harness = asSupportedHarness(args.harness);
+      const dir = asDirectory(args.dir);
+      if (harness === null || dir === null) {
+        await auditFailure("memory_ingest_denied", { denial_class: "invalid_args" });
+        return deny("memory_ingest");
+      }
+      if (await refuseSecondIdentity("memory_ingest")) return deny("memory_ingest");
+
+      let fileCount = 0;
+      const ingestedAt = now();
+      try {
+        const snapshot = await readClaudeCodeMemoryDirectory(dir, { ingestedAt });
+        fileCount = snapshot.entries.length;
+        // Write-ahead INTENT, not an outcome. The durable record precedes the
+        // vault mutation so a crash mid-ingest still leaves evidence that an
+        // ingest was attempted; it is labelled `_started` because at this point
+        // nothing has been committed and the file count is only what was READ.
+        // The outcome record below carries what actually landed.
+        await auditSuccess("memory_ingest_started", {
+          harness,
+          source_dir: dir,
+          owner_ref: adapter.ownerRef,
+          source_file_count: fileCount,
+        });
+        const result = await ingestClaudeCodeMemorySnapshot(adapter, snapshot);
+        await auditSuccess("memory_ingest", {
+          harness,
+          source_dir: dir,
+          owner_ref: adapter.ownerRef,
+          source_file_count: result.source_file_count,
+          committed_file_count: result.ingested.length,
+          skipped_file_count: result.skipped.length,
+          complete: result.complete,
+          skipped: result.skipped.map((skip) => ({
+            source_path: skip.source_path,
+            reason: skip.reason,
+          })),
+        });
+        return toolResult({
+          ingested: true,
+          harness,
+          complete: result.complete,
+          source_file_count: result.source_file_count,
+          file_count: result.ingested.length,
+          skipped_file_count: result.skipped.length,
+          skipped: result.skipped.map((skip) => ({
+            source_path: skip.source_path,
+            reason: skip.reason,
+            detail: skip.detail,
+          })),
+          passages: result.ingested.map((passage) => ({
+            passage_id: passage.passage_id,
+            content_hash: passage.content_hash,
+            source_path:
+              passage.metadata.find((entry) => entry.key === "source_path")?.value ?? null,
+          })),
+        });
+      } catch (error) {
+        await auditFailure("memory_ingest_denied", {
+          denial_class: denialCategory(error, "ingest_failed"),
+          error_class: errorName(error),
+          ...errorCauseDetail(error),
+          harness,
+          owner_ref: adapter.ownerRef,
+          source_file_count: fileCount,
+          committed_file_count: 0,
+        });
+        return deny("memory_ingest");
+      }
+    },
+  };
+
+  const memoryEmit: ToolDefinition = {
+    name: "memory_emit",
+    description:
+      "Manually emit Claude Code memory files from the SDW vault into an " +
+      "operator-named output directory. Existing memory files are never " +
+      "overwritten. The result reports index_present; false means the emitted " +
+      "tree cannot be re-ingested as a Claude Code memory directory. Emitted " +
+      "files are plaintext for the harness; " +
+      "this does not sync or write back to the source memory directory, and " +
+      "memory later sent to a model vendor is exposed to that vendor at inference.",
+    tool_class: "write",
+    approvalTargetArgs: approvalArgs,
+    inputSchema: {
+      type: "object",
+      properties: {
+        harness: {
+          type: "string",
+          enum: [...SUPPORTED_HARNESSES],
+          description: "Harness memory-file format to emit",
+        },
+        dir: {
+          type: "string",
+          description: "Output directory; existing memory files are never overwritten",
+        },
+      },
+      required: ["harness", "dir"],
+    },
+    handler: async (args) => {
+      const harness = asSupportedHarness(args.harness);
+      const dir = asDirectory(args.dir);
+      if (harness === null || dir === null) {
+        await auditFailure("memory_emit_denied", { denial_class: "invalid_args" });
+        return deny("memory_emit");
+      }
+      if (await refuseSecondIdentity("memory_emit")) return deny("memory_emit");
+
+      try {
+        // Write-ahead INTENT: durable before any plaintext file is materialized
+        // from the vault, and labelled `_started` because no file exists yet.
+        await auditSuccess("memory_emit_started", {
+          harness,
+          output_dir: dir,
+          owner_ref: adapter.ownerRef,
+        });
+        const result = await emitClaudeCodeMemoryDirectory(adapter, dir);
+        await auditSuccess("memory_emit", {
+          harness,
+          output_dir: dir,
+          owner_ref: adapter.ownerRef,
+          emitted_file_count: result.emitted.length,
+          index_present: result.index_present,
+        });
+        return toolResult({
+          emitted: true,
+          harness,
+          file_count: result.emitted.length,
+          index_present: result.index_present,
+          files: result.emitted,
+        });
+      } catch (error) {
+        await auditFailure("memory_emit_denied", {
+          denial_class: denialCategory(error, "emit_failed"),
+          error_class: errorName(error),
+          ...errorCauseDetail(error),
+          harness,
+          owner_ref: adapter.ownerRef,
+          emitted_file_count: 0,
+        });
+        return deny("memory_emit");
+      }
+    },
+  };
+
+  return [memoryIngest, memoryEmit];
+}

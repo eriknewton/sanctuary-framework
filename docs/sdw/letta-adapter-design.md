@@ -63,10 +63,22 @@ prefix, so multiple engines under one operator stay isolated and listable.
 
 Duplicate passage-id protection is scoped to the backend's real coordination
 primitive. The non-transactional fallback uses a process-local per-document
-lock, so it only serializes inserts inside one Node.js process and must not be
-treated as a cross-process lock for filesystem storage. Multi-process
-deployments need a backend-level conditional write or transaction guard, such
-as the LMDB-backed SDW path, for cross-process duplicate-insert protection.
+lock for single-passage inserts. Batch replacement on filesystem storage also
+takes a cross-process owner-scope advisory lock before it captures prior state,
+writes, rolls back, verifies the raw owner-scope listing, and prunes stale
+chunks. Non-filesystem test stores have no cross-process surface and run
+directly; transactional backends such as the LMDB-backed SDW path use their own
+transaction primitive.
+
+The filesystem batch lock waits up to 30 seconds. That budget is based on a
+2026-08-07 measurement of a real 413-file Claude Code memory directory: 7184 ms
+for first ingest and 8052 ms for re-ingest. If another process still holds the
+lock beyond that budget, the caller sees a `CrossProcessLockError` whose message
+names the lock path and includes the manual recovery command. There is no
+automatic stale-break; a dead holder is recovered by manually removing that exact
+lock path after confirming no other Sanctuary process is running. At the MCP
+tool surface, the agent caller receives the fixed denial shape; the lock-path
+recovery hint reaches the operator-readable denial audit record.
 
 ## Custody invariants preserved
 
