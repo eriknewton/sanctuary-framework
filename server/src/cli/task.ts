@@ -6,7 +6,7 @@ import {
   type TaskStatus,
 } from "../operational/task-coordination/index.js";
 import { lockdownBanner, readLockdownStatus } from "../lockdown/status.js";
-import { flagValue } from "./argv.js";
+import { consumeFlagValue, flagValue, unknownFlagWithPrefix } from "./argv.js";
 
 export interface TaskCliArgs {
   argv: string[];
@@ -226,27 +226,30 @@ async function resolveContext(
   argv: string[],
   err: NodeJS.WritableStream,
 ): Promise<TaskCliContext | null> {
-  const fortressIdx = argv.indexOf("--fortress");
-  if (fortressIdx < 0) {
+  const unknownFortressFlag = unknownFlagWithPrefix(argv, "--fortress");
+  if (unknownFortressFlag) {
+    err.write(`task unknown fortress flag ${unknownFortressFlag}\n`);
+    return null;
+  }
+  const parsed = consumeFlagValue(argv, "--fortress");
+  if (parsed.error) {
+    err.write(`task ${parsed.error}\n`);
+    return null;
+  }
+  if (parsed.value === undefined) {
     return {
-      argv,
+      argv: parsed.argv,
       fortressPath:
         process.env.SANCTUARY_STORAGE_PATH ?? process.env.SANCTUARY_FORTRESS_PATH,
     };
   }
-  const fortress = argv[fortressIdx + 1];
-  if (!fortress) {
-    err.write("task --fortress requires a path\n");
-    return null;
-  }
-  const filtered = [...argv];
-  filtered.splice(fortressIdx, 2);
+  const fortress = parsed.value;
   const runtime = await readTenantRuntime(fortress);
   if (!runtime) {
     throw new Error(`no readable runtime.json for fortress ${fortress}`);
   }
   return {
-    argv: filtered,
+    argv: parsed.argv,
     dashboardUrl: `http://${runtime.dashboard_host}:${runtime.dashboard_port}`,
     fortressPath: fortress,
   };

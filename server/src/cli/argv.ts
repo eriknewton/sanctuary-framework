@@ -8,6 +8,110 @@ export function flagValue(argv: string[], name: string): string | undefined {
   return undefined;
 }
 
+export interface ConsumedFlagValue {
+  argv: string[];
+  value?: string;
+  error?: string;
+}
+
+export function consumeFlagValue(argv: string[], name: string): ConsumedFlagValue {
+  const prefix = `${name}=`;
+  const filtered: string[] = [];
+  let value: string | undefined;
+
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i]!;
+    if (arg === name) {
+      const next = argv[i + 1];
+      if (next === undefined || next.length === 0 || next.startsWith("--")) {
+        return { argv, error: `${name} requires a value` };
+      }
+      if (value !== undefined) {
+        return { argv, error: `${name} may only be provided once` };
+      }
+      value = next;
+      i += 1;
+      continue;
+    }
+    if (arg.startsWith(prefix)) {
+      const next = arg.slice(prefix.length);
+      if (next.length === 0) {
+        return { argv, error: `${name} requires a value` };
+      }
+      if (value !== undefined) {
+        return { argv, error: `${name} may only be provided once` };
+      }
+      value = next;
+      continue;
+    }
+    filtered.push(arg);
+  }
+
+  return value === undefined ? { argv: filtered } : { argv: filtered, value };
+}
+
+export function unknownFlagWithPrefix(
+  argv: string[],
+  name: string,
+  allowedRelatedFlags: string[] = [],
+): string | undefined {
+  const knownFlags = [name, ...allowedRelatedFlags];
+  const allowed = new Set(knownFlags);
+  for (const arg of argv) {
+    const flagName = flagNameFromToken(arg);
+    if (flagName === undefined || allowed.has(flagName)) continue;
+    if (flagName.startsWith(name)) return flagName;
+    if (knownFlags.some((known) => isEditDistanceAtMostOne(flagName, known))) {
+      return flagName;
+    }
+  }
+  return undefined;
+}
+
+function flagNameFromToken(arg: string): string | undefined {
+  if (!arg.startsWith("--") || arg === "--") return undefined;
+  return arg.split("=", 1)[0];
+}
+
+function isEditDistanceAtMostOne(a: string, b: string): boolean {
+  if (a === b) return true;
+  const lengthDelta = Math.abs(a.length - b.length);
+  if (lengthDelta > 1) return false;
+
+  if (a.length === b.length) {
+    let firstMismatch = -1;
+    let mismatchCount = 0;
+    for (let i = 0; i < a.length; i++) {
+      if (a[i] === b[i]) continue;
+      if (firstMismatch === -1) firstMismatch = i;
+      mismatchCount += 1;
+      if (mismatchCount > 2) return false;
+    }
+    if (mismatchCount === 1) return true;
+    if (mismatchCount !== 2 || firstMismatch < 0 || firstMismatch + 1 >= a.length) {
+      return false;
+    }
+    return (
+      a[firstMismatch] === b[firstMismatch + 1] &&
+      a[firstMismatch + 1] === b[firstMismatch] &&
+      a.slice(firstMismatch + 2) === b.slice(firstMismatch + 2)
+    );
+  }
+
+  const shorter = a.length < b.length ? a : b;
+  const longer = a.length < b.length ? b : a;
+  let skipped = false;
+  for (let shortIndex = 0, longIndex = 0; longIndex < longer.length; longIndex++) {
+    if (shorter[shortIndex] === longer[longIndex]) {
+      shortIndex += 1;
+      continue;
+    }
+    if (skipped) return false;
+    skipped = true;
+  }
+  return true;
+}
+
 export function flagValues(argv: string[], name: string): string[] {
   const values: string[] = [];
   const prefix = `${name}=`;

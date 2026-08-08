@@ -4,6 +4,7 @@ import {
   DashboardRequestError,
   type DashboardRequestContext,
 } from "./dashboard-request.js";
+import { flagValue } from "./argv.js";
 
 interface NodesFlags {
   dashboardUrl?: string;
@@ -12,15 +13,11 @@ interface NodesFlags {
 }
 
 function parseNodesFlags(argv: string[], env: NodeJS.ProcessEnv): NodesFlags | null {
-  const flag = (name: string): string | undefined => {
-    const i = argv.indexOf(name);
-    return i >= 0 && i + 1 < argv.length ? argv[i + 1] : undefined;
-  };
-  const output = flag("--output") ?? "table";
+  const output = flagValue(argv, "--output") ?? "table";
   if (output !== "json" && output !== "table") return null;
   return {
-    dashboardUrl: flag("--dashboard-url") ?? env.SANCTUARY_DASHBOARD_URL,
-    sessionToken: flag("--session-token") ?? env.SANCTUARY_V1_SESSION_TOKEN,
+    dashboardUrl: flagValue(argv, "--dashboard-url") ?? env.SANCTUARY_DASHBOARD_URL,
+    sessionToken: flagValue(argv, "--session-token") ?? env.SANCTUARY_V1_SESSION_TOKEN,
     output,
   };
 }
