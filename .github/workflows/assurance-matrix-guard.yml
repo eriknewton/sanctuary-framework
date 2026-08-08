@@ -1,0 +1,44 @@
+# Keeps ASSURANCE_MATRIX.md honest against the tree.
+#
+# Enforces two invariants on every PR and every push to main (see
+# scripts/check-assurance-matrix.mjs for the full rationale):
+#   1. Every repo-relative evidence link resolves to a file that exists.
+#   2. A `proven` platform-enforcement claim cites drill evidence (a docs/audit/
+#      link or a dated "drill" citation), never test/PR links alone.
+#
+# WHY: the 46-agent inert-capability sweep (2026-08-08) found row 17 marking Linux
+# egress enforcement `proven` while the shipped daemon wired no kernel enforcement;
+# the row cited passing integration tests. The thesis-gate discipline ("no
+# capability claim without a drill on the platform that matters") existed only as a
+# convention applied to one row. This makes it structural. Mirrors the other
+# drift-gating workflows here (test-baseline-guard, roadmap-freshness).
+
+name: assurance-matrix-guard
+
+on:
+  pull_request:
+    paths:
+      - "ASSURANCE_MATRIX.md"
+      - "scripts/check-assurance-matrix.mjs"
+      - ".github/workflows/assurance-matrix-guard.yml"
+  push:
+    branches: [main]
+    paths:
+      - "ASSURANCE_MATRIX.md"
+      - "scripts/check-assurance-matrix.mjs"
+      - ".github/workflows/assurance-matrix-guard.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Assurance matrix guard
+        run: node scripts/check-assurance-matrix.mjs
