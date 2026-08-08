@@ -17,7 +17,13 @@ import { ReputationStore } from "../reputation/reputation-store.js";
 import { loadConfig } from "../config.js";
 import { loadPrincipalPolicy, MalformedPrincipalPolicyError } from "../principal-policy/loader.js";
 import { resolveCliMasterKey } from "../core/master-custody.js";
-import { exportExitBundle, importExitBundle, exitBundleManifestShape } from "./bundle.js";
+import {
+  exportExitBundle,
+  importExitBundle,
+  exitBundleManifestShape,
+  ExitBundleStateImportIncompleteError,
+  type ImportExitBundleResult,
+} from "./bundle.js";
 import type {
   ExitBundleDidWebBinding,
   ExitBundleVerifierResult,
@@ -84,6 +90,15 @@ interface ExitContext {
 
 function write(stream: Writable, text: string): void {
   stream.write(text);
+}
+
+function writeStateSkippedCounters(
+  stream: Writable,
+  state: ImportExitBundleResult["state"],
+): void {
+  write(stream, `state_skipped_keys: ${state.skipped_keys}\n`);
+  write(stream, `state_skipped_invalid_sig: ${state.skipped_invalid_sig}\n`);
+  write(stream, `state_skipped_unknown_kid: ${state.skipped_unknown_kid}\n`);
 }
 
 function hasFlag(argv: string[], name: string): boolean {
@@ -815,6 +830,22 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
           write(err, `Error: ${e.message}\n`);
           return 1;
         }
+        if (e instanceof ExitBundleStateImportIncompleteError) {
+          if (json) {
+            write(
+              out,
+              JSON.stringify(
+                { verdict: "FAIL", error: e.message, state: e.state },
+                null,
+                2,
+              ) + "\n",
+            );
+          } else {
+            writeStateSkippedCounters(err, e.state);
+          }
+          write(err, `Error: ${e.message}\n`);
+          return 1;
+        }
         throw e;
       }
       if (json) {
@@ -834,6 +865,7 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
         write(out, `reputation_conflicts: ${result.conflicts.reputation_conflicts.length}\n`);
         write(out, `state_status: ${result.state.status}\n`);
         write(out, `state_imported_keys: ${result.state.imported_keys}\n`);
+        writeStateSkippedCounters(out, result.state);
         write(out, `reputation_imported_attestations: ${result.reputation.imported_attestations}\n`);
         for (const warning of result.warnings) write(out, `warning: ${warning}\n`);
         for (const item of result.unsupported_artifacts) {

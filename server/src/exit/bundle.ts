@@ -581,6 +581,49 @@ export interface ImportExitBundleResult {
   unsupported_artifacts: string[];
 }
 
+function stateHasNonConflictSkippedEntries(
+  state: ImportExitBundleResult["state"]
+): boolean {
+  return (
+    state.skipped_invalid_sig > 0 ||
+    state.skipped_unknown_kid > 0 ||
+    state.skipped_keys > state.conflicts
+  );
+}
+
+function stateSkippedOnlyConflicts(
+  state: ImportExitBundleResult["state"]
+): boolean {
+  return state.skipped_keys > 0 && !stateHasNonConflictSkippedEntries(state);
+}
+
+function stateImportIncompleteMessage(
+  state: ImportExitBundleResult["state"]
+): string {
+  return (
+    "state import incomplete: " +
+    `state_skipped_keys=${state.skipped_keys}, ` +
+    `state_skipped_invalid_sig=${state.skipped_invalid_sig}, ` +
+    `state_skipped_unknown_kid=${state.skipped_unknown_kid}. ` +
+    "Refusing activation and rolling back staged artifacts; inspect or " +
+    "re-export the source bundle before retrying."
+  );
+}
+
+export class ExitBundleStateImportIncompleteError extends ExitBundleImportError {
+  readonly state: ImportExitBundleResult["state"];
+
+  constructor(
+    state: ImportExitBundleResult["state"],
+    message = stateImportIncompleteMessage(state),
+    options?: { cause?: unknown },
+  ) {
+    super("STATE_IMPORT_INCOMPLETE", message, options);
+    this.name = "ExitBundleStateImportIncompleteError";
+    this.state = state;
+  }
+}
+
 function sha256Hex(bytes: Uint8Array): string {
   return Array.from(hash(bytes))
     .map((b) => b.toString(16).padStart(2, "0"))
@@ -2150,6 +2193,13 @@ export async function importExitBundle(
     manifest,
     "public_identity"
   );
+  if ((identityArtifact?.json.bundle.rotation_history?.length ?? 0) > 0) {
+    // An unconsumed rotation history must be surfaced, never reported as a successful import.
+    throw new ExitBundleImportError(
+      "ROTATION_HISTORY_UNSUPPORTED",
+      "this bundle is from a fortress that rotated its identity key; importing it would lose pre-rotation state because this importer cannot consume rotation_history yet. Keep the source fortress intact and re-export after Sanctuary supports rotation-history replay; do not activate this bundle into a destination fortress."
+    );
+  }
   const encryptedState = await loadExitArtifact<ExitEncryptedStateBundle>(
     opts.bundleDir,
     manifest,
@@ -2632,6 +2682,21 @@ export async function importExitBundle(
     if (encryptedState && encryptedState.json.entries.length === 0) {
       importWarnings.push(emptyStateWarning(encryptedState.json));
     }
+    if (stateHasNonConflictSkippedEntries(stateResult)) {
+      // A dropped state entry must be surfaced, never reported as a successful import.
+      throw new ExitBundleStateImportIncompleteError(stateResult);
+    }
+    if (stateSkippedOnlyConflicts(stateResult)) {
+      importWarnings.push(
+        `state import skipped ${stateResult.skipped_keys} existing destination ` +
+          `entr${stateResult.skipped_keys === 1 ? "y" : "ies"} due to ` +
+          `conflict policy; state_skipped_keys=${stateResult.skipped_keys}, ` +
+          `state_skipped_invalid_sig=${stateResult.skipped_invalid_sig}, ` +
+          `state_skipped_unknown_kid=${stateResult.skipped_unknown_kid}. ` +
+          `Re-run with --conflict overwrite or --conflict version if these ` +
+          `source entries should replace destination state.`
+      );
+    }
     // M2-slice (warn): the destination `stateStore.write` mints a fresh
     // `written_at` and a fresh monotonic `ver` - both are bound into the
     // signed envelope, so they cannot be back-stamped to the source values
@@ -2693,17 +2758,24 @@ export async function importExitBundle(
       : stateRekeyStarted
         ? "REKEY_FAILED_AND_CLEANED"
         : "ACTIVATION_FAILED_AND_CLEANED";
-    throw new ExitBundleImportError(
+    const cleanupMessage =
       // Preserve structured fail-closed codes (SOURCE_CREDENTIAL_INVALID,
       // SOURCE_KEY_MISMATCH, ...) so callers can branch on the cause; the
       // generic code covers non-structured failures (disk full, etc.).
-      err instanceof ExitBundleImportError ? err.code : fallbackCode,
       `Exit-bundle ${failureKind} failed: ${originalMessage}. ` +
         `Cleanup removed ${cleanup.removed} and restored ${cleanup.restored} of ` +
         `${activationSnapshots.length} snapshotted paths ` +
         `plus ${activationNamespaceSnapshots.length} snapshotted namespaces ` +
         `(${importedRekeyEntries.length} re-keyed entries plus ${stagedLocations.length} staged artifacts; ` +
-        `${cleanup.failed.length} cleanup writes/deletes failed).`,
+        `${cleanup.failed.length} cleanup writes/deletes failed).`;
+    if (err instanceof ExitBundleStateImportIncompleteError) {
+      throw new ExitBundleStateImportIncompleteError(err.state, cleanupMessage, {
+        cause: err,
+      });
+    }
+    throw new ExitBundleImportError(
+      err instanceof ExitBundleImportError ? err.code : fallbackCode,
+      cleanupMessage,
       { cause: err }
     );
   } finally {

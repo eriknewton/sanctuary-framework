@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { Writable } from "node:stream";
@@ -12,9 +12,11 @@ import {
   deriveMasterKey,
   derivePurposeKey,
 } from "../../src/core/key-derivation.js";
-import { stringToBytes } from "../../src/core/encoding.js";
-import { createIdentity } from "../../src/core/identity.js";
+import { stringToBytes, toBase64url } from "../../src/core/encoding.js";
+import { createIdentity, sign as identitySign } from "../../src/core/identity.js";
 import type { StoredIdentity } from "../../src/core/identity.js";
+import { hash } from "../../src/core/hashing.js";
+import { canonicalize, canonicalizeToBytes } from "../../src/mesh/canonical-json.js";
 
 class StringWritable extends Writable {
   chunks: string[] = [];
@@ -42,6 +44,115 @@ interface Fortress {
   masterKey: Uint8Array;
   identityEncryptionKey: Uint8Array;
   identity: StoredIdentity;
+}
+
+function sha256Hex(bytes: Uint8Array): string {
+  return Array.from(hash(bytes))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+function jsonBytes(value: unknown): Uint8Array {
+  return stringToBytes(JSON.stringify(value, null, 2) + "\n");
+}
+
+async function patchArtifactAndResign(
+  bundleDir: string,
+  source: Fortress,
+  artifactKind: string,
+  mutate: (artifact: Record<string, unknown>) => Record<string, unknown>,
+): Promise<void> {
+  const manifestPath = join(bundleDir, "manifest.json");
+  const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+    body: {
+      artifacts: Array<{
+        kind: string;
+        path: string;
+        hash: string;
+        size_bytes: number;
+      }>;
+      artifacts_aggregate_hash: string;
+    };
+    signature: string;
+  };
+  const manifestEntry = manifest.body.artifacts.find(
+    (entry) => entry.kind === artifactKind,
+  );
+  if (!manifestEntry) {
+    throw new Error(`missing artifact kind ${artifactKind}`);
+  }
+
+  const artifactPath = join(bundleDir, manifestEntry.path);
+  const artifact = JSON.parse(await readFile(artifactPath, "utf8")) as Record<
+    string,
+    unknown
+  >;
+  const updated = mutate(artifact);
+  const bytes = jsonBytes(updated);
+  await writeFile(artifactPath, bytes);
+
+  for (const entry of manifest.body.artifacts) {
+    const artifactBytes = new Uint8Array(await readFile(join(bundleDir, entry.path)));
+    entry.hash = sha256Hex(artifactBytes);
+    entry.size_bytes = artifactBytes.length;
+  }
+  manifest.body.artifacts_aggregate_hash = sha256Hex(
+    stringToBytes(canonicalize(manifest.body.artifacts)),
+  );
+  manifest.signature = toBase64url(
+    identitySign(
+      canonicalizeToBytes(manifest.body),
+      source.identity.encrypted_private_key,
+      source.identityEncryptionKey,
+    ),
+  );
+  await writeFile(manifestPath, jsonBytes(manifest));
+}
+
+async function addReservedStateEntryAndResign(
+  bundleDir: string,
+  source: Fortress,
+): Promise<void> {
+  await patchArtifactAndResign(bundleDir, source, "encrypted_state", (artifact) => {
+    const entries = artifact.entries as Array<Record<string, unknown>>;
+    const first = entries[0];
+    if (!first) throw new Error("expected encrypted_state entry");
+    entries.push({
+      ...first,
+      namespace: "_identities",
+      key: "crafted-reserved-entry",
+    });
+    artifact.total_keys = entries.length;
+    artifact.namespaces = [
+      ...new Set([...(artifact.namespaces as string[]), "_identities"]),
+    ].sort();
+    return artifact;
+  });
+}
+
+async function addRotationHistoryAndResign(
+  bundleDir: string,
+  source: Fortress,
+): Promise<void> {
+  await patchArtifactAndResign(bundleDir, source, "public_identity", (artifact) => {
+    const bundle = artifact.bundle as Record<string, unknown>;
+    bundle.rotation_history = [
+      {
+        old_public_key: source.identity.public_key,
+        new_public_key: source.identity.public_key,
+        rotation_event: toBase64url(stringToBytes("signed-rotation-event")),
+        rotated_at: "2026-08-08T00:00:00.000Z",
+      },
+    ];
+    artifact.signature = toBase64url(
+      identitySign(
+        canonicalizeToBytes(bundle),
+        source.identity.encrypted_private_key,
+        source.identityEncryptionKey,
+      ),
+    );
+    return artifact;
+  });
 }
 
 async function bootstrapFortress(
@@ -198,7 +309,11 @@ describe("exit import state warning", () => {
 
     expect(code).toBe(0);
     expect(out.text).toContain("state_imported_keys: 1");
+    expect(out.text).toContain("state_skipped_keys: 0");
+    expect(out.text).toContain("state_skipped_invalid_sig: 0");
+    expect(out.text).toContain("state_skipped_unknown_kid: 0");
     expect(err.text).not.toContain("NO STATE was imported");
+    expect(err.text).not.toContain("state import incomplete");
 
     const destinationState = new StateStore(
       destination.storage,
@@ -278,6 +393,120 @@ describe("exit import state warning", () => {
       destination.masterKey,
     );
     expect(freeze.frozen).toBe(false);
+  });
+
+  it("refuses and prints skipped counters when state import drops an entry", async () => {
+    const source = await bootstrapFortress(SOURCE_PASSPHRASE, "source");
+    cleanup.push(source.storagePath);
+    const stateStore = new StateStore(source.storage, source.masterKey);
+    await stateStore.write(
+      "agent-memory",
+      "handoff",
+      "partial imports must not look successful",
+      source.identity.identity_id,
+      source.identity.encrypted_private_key,
+      source.identityEncryptionKey,
+    );
+    const bundleDir = await exportBundle(source, ["agent-memory"]);
+    await addReservedStateEntryAndResign(bundleDir, source);
+
+    const destination = await bootstrapFortress(
+      DESTINATION_PASSPHRASE,
+      "destination",
+    );
+    cleanup.push(destination.storagePath);
+    process.env.SANCTUARY_STORAGE_PATH = destination.storagePath;
+
+    const out = new StringWritable();
+    const err = new StringWritable();
+    const code = await runExitCommand({
+      argv: [
+        "import",
+        bundleDir,
+        "--activate",
+        "--import-state",
+        "--source-passphrase",
+        SOURCE_PASSPHRASE,
+        "--destination-identity-id",
+        destination.identity.identity_id,
+        "--force-rebind",
+        "--yes",
+      ],
+      out,
+      err,
+      env: { SANCTUARY_PASSPHRASE: DESTINATION_PASSPHRASE },
+    });
+
+    expect(code).toBe(1);
+    expect(out.text).not.toContain("verdict: PASS");
+    expect(err.text).toContain("state_skipped_keys: 1");
+    expect(err.text).toContain("state_skipped_invalid_sig: 0");
+    expect(err.text).toContain("state_skipped_unknown_kid: 0");
+    expect(err.text).toContain("state import incomplete");
+
+    const destinationState = new StateStore(
+      destination.storage,
+      destination.masterKey,
+    );
+    const imported = await destinationState.read("agent-memory", "handoff");
+    expect(imported).toBeNull();
+  });
+
+  it("refuses rotated-fortress bundles before writing destination state", async () => {
+    const source = await bootstrapFortress(SOURCE_PASSPHRASE, "source");
+    cleanup.push(source.storagePath);
+    const stateStore = new StateStore(source.storage, source.masterKey);
+    await stateStore.write(
+      "agent-memory",
+      "handoff",
+      "rotation history cannot be silently dropped",
+      source.identity.identity_id,
+      source.identity.encrypted_private_key,
+      source.identityEncryptionKey,
+    );
+    const bundleDir = await exportBundle(source, ["agent-memory"]);
+    await addRotationHistoryAndResign(bundleDir, source);
+
+    const destination = await bootstrapFortress(
+      DESTINATION_PASSPHRASE,
+      "destination",
+    );
+    cleanup.push(destination.storagePath);
+    process.env.SANCTUARY_STORAGE_PATH = destination.storagePath;
+
+    const out = new StringWritable();
+    const err = new StringWritable();
+    const code = await runExitCommand({
+      argv: [
+        "import",
+        bundleDir,
+        "--activate",
+        "--import-state",
+        "--source-passphrase",
+        SOURCE_PASSPHRASE,
+        "--destination-identity-id",
+        destination.identity.identity_id,
+        "--force-rebind",
+        "--yes",
+      ],
+      out,
+      err,
+      env: { SANCTUARY_PASSPHRASE: DESTINATION_PASSPHRASE },
+    });
+
+    expect(code).toBe(1);
+    expect(out.text).not.toContain("verdict: PASS");
+    expect(err.text).toContain(
+      "this bundle is from a fortress that rotated its identity key; importing it would lose pre-rotation state",
+    );
+    expect(err.text).toContain("rotation-history replay");
+
+    const destinationState = new StateStore(
+      destination.storage,
+      destination.masterKey,
+    );
+    const imported = await destinationState.read("agent-memory", "handoff");
+    expect(imported).toBeNull();
   });
 
   it("rejects --import-state without source credentials, fail-closed", async () => {
