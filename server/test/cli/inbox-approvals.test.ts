@@ -6,6 +6,7 @@ import { join } from "node:path";
 
 import { runInboxCommand } from "../../src/cli/inbox.js";
 import { writeLockdownStatus } from "../../src/lockdown/status.js";
+import { writeTenantRuntime } from "../../src/cli/agents/runtime.js";
 
 class StringWritable extends Writable {
   chunks: string[] = [];
@@ -182,6 +183,38 @@ describe("sanctuary inbox approvals CLI", () => {
     expect(parsed.items.map((item: MockInboxItem) => item.item_id)).toEqual([
       "approval-1",
     ]);
+  });
+
+  it("routes --fortress=<path> through that fortress runtime", async () => {
+    const scopedFortress = await mkdtemp(join(tmpdir(), "sanctuary-inbox-scoped-"));
+    try {
+      await writeTenantRuntime(scopedFortress, {
+        version: "test",
+        pid: process.pid,
+        started_at: new Date().toISOString(),
+        dashboard_host: "127.0.0.1",
+        dashboard_port: 3910,
+        mode: "standalone",
+      });
+      const fetchSpy = vi.fn(async (url: string | URL) => {
+        expect(String(url)).toBe("http://127.0.0.1:3910/api/hub/inbox");
+        return okJson({ ok: true, data: { items } });
+      });
+      globalThis.fetch = fetchSpy as unknown as typeof globalThis.fetch;
+
+      const { code, err } = await run([
+        "approvals",
+        "list",
+        "--json",
+        `--fortress=${scopedFortress}`,
+      ]);
+
+      expect(code).toBe(0);
+      expect(err.text).toBe("");
+      expect(fetchSpy).toHaveBeenCalledOnce();
+    } finally {
+      await rm(scopedFortress, { recursive: true, force: true });
+    }
   });
 
   it("approvals approve <id> transitions the item out of pending approval", async () => {

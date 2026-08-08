@@ -1,7 +1,17 @@
 import { describe, expect, it } from "vitest";
 
-import { flagValue, flagValues, hasFlag } from "../../src/cli/argv.js";
+import {
+  consumeFlagValue,
+  flagValue,
+  flagValues,
+  hasFlag,
+  unknownFlagWithPrefix,
+} from "../../src/cli/argv.js";
 import { parseExportArgs } from "../../src/cli/audit-chain-export.js";
+import {
+  parseSecretsAuditFlags,
+  parseSecretsGrantFlags,
+} from "../../src/cli/secrets.js";
 
 describe("shared CLI argv flag parser", () => {
   it("reads split and equals value forms through one helper", () => {
@@ -42,6 +52,56 @@ describe("shared CLI argv flag parser", () => {
     );
   });
 
+  it("consumes split and equals value flags while preserving the rest", () => {
+    expect(consumeFlagValue(["list", "--fortress", "/tmp/a", "--json"], "--fortress")).toEqual({
+      argv: ["list", "--json"],
+      value: "/tmp/a",
+    });
+    expect(consumeFlagValue(["list", "--fortress=/tmp/a", "--json"], "--fortress")).toEqual({
+      argv: ["list", "--json"],
+      value: "/tmp/a",
+    });
+  });
+
+  it("returns loud errors for missing, empty, and duplicate values", () => {
+    expect(consumeFlagValue(["--fortress"], "--fortress")).toEqual({
+      argv: ["--fortress"],
+      error: "--fortress requires a value",
+    });
+    expect(consumeFlagValue(["--fortress="], "--fortress")).toEqual({
+      argv: ["--fortress="],
+      error: "--fortress requires a value",
+    });
+    expect(consumeFlagValue(["--fortress=/tmp/a", "--fortress", "/tmp/b"], "--fortress")).toEqual({
+      argv: ["--fortress=/tmp/a", "--fortress", "/tmp/b"],
+      error: "--fortress may only be provided once",
+    });
+  });
+
+  it("detects unknown or near-miss fortress flags while allowing known relatives", () => {
+    expect(unknownFlagWithPrefix(["--fortress-path=/tmp/a"], "--fortress")).toBe(
+      "--fortress-path",
+    );
+    expect(unknownFlagWithPrefix(["--fortressx=/tmp/a"], "--fortress")).toBe(
+      "--fortressx",
+    );
+    expect(unknownFlagWithPrefix(["--fortres=/tmp/a"], "--fortress")).toBe(
+      "--fortres",
+    );
+    expect(unknownFlagWithPrefix(["--fortrss=/tmp/a"], "--fortress")).toBe(
+      "--fortrss",
+    );
+    expect(unknownFlagWithPrefix(["--forterss=/tmp/a"], "--fortress")).toBe(
+      "--forterss",
+    );
+    expect(
+      unknownFlagWithPrefix(["--fortress-url=http://127.0.0.1:9"], "--fortress", [
+        "--fortress-url",
+      ]),
+    ).toBeUndefined();
+    expect(unknownFlagWithPrefix(["--format=json"], "--fortress")).toBeUndefined();
+  });
+
   it("keeps audit-chain export from silently dropping equals-form paths", () => {
     const parsed = parseExportArgs([
       "--output=/tmp/chain.jsonl",
@@ -54,5 +114,16 @@ describe("shared CLI argv flag parser", () => {
     expect(parsed.fortressPath).toBe("/tmp/fortress");
     expect(parsed.storagePath).toBe("/tmp/storage");
     expect(parsed.operatorOnly).toBe(true);
+  });
+
+  it("keeps secrets equals-form value flags on the keychain-free parser path", () => {
+    expect(parseSecretsGrantFlags(["skill", "secret", "--scope=rotate", "--ttl=600"])).toEqual({
+      scope: "rotate",
+      ttl: 600,
+    });
+    expect(parseSecretsAuditFlags(["--since=2026-08-08T00:00:00.000Z", "--limit=25"])).toEqual({
+      since: "2026-08-08T00:00:00.000Z",
+      limit: 25,
+    });
   });
 });

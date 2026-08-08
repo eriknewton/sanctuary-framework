@@ -1,6 +1,10 @@
 import { Writable } from "node:stream";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { runConciergeCommand } from "../../src/cli/concierge.js";
+import { writeTenantRuntime } from "../../src/cli/agents/runtime.js";
 
 class CaptureStream extends Writable {
   value = "";
@@ -76,5 +80,57 @@ describe("sanctuary concierge CLI", () => {
 
     expect(code).toBe(0);
     expect(JSON.parse(out.value).reachable).toBe(true);
+  });
+
+  it("routes --fortress=<path> through that fortress runtime", async () => {
+    const scopedFortress = await mkdtemp(join(tmpdir(), "sanctuary-concierge-scoped-"));
+    const originalStoragePath = process.env.SANCTUARY_STORAGE_PATH;
+    try {
+      await writeTenantRuntime(scopedFortress, {
+        version: "test",
+        pid: process.pid,
+        started_at: new Date().toISOString(),
+        dashboard_host: "127.0.0.1",
+        dashboard_port: 3503,
+        mode: "standalone",
+      });
+      const fetchSpy = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+        expect(String(url)).toBe("http://127.0.0.1:3503/api/hub/concierge/ask");
+        expect(JSON.parse(String(init!.body)).question).toBe("scoped?");
+        return new Response(JSON.stringify({
+          ok: true,
+          data: {
+            response: {
+              answer: "Scoped runtime answered.",
+              model: "venice-test",
+              provider: "venice",
+              read_surfaces: ["audit_log"],
+              context: {},
+            },
+          },
+        }), { status: 200 });
+      });
+      vi.stubGlobal("fetch", fetchSpy);
+      const out = new CaptureStream();
+      const err = new CaptureStream();
+
+      const code = await runConciergeCommand({
+        argv: ["ask", "scoped?", "--no-stream", `--fortress=${scopedFortress}`],
+        out,
+        err,
+      });
+
+      expect(code).toBe(0);
+      expect(out.value).toContain("Scoped runtime answered.");
+      expect(err.value).toBe("");
+      expect(fetchSpy).toHaveBeenCalledOnce();
+    } finally {
+      if (originalStoragePath === undefined) {
+        delete process.env.SANCTUARY_STORAGE_PATH;
+      } else {
+        process.env.SANCTUARY_STORAGE_PATH = originalStoragePath;
+      }
+      await rm(scopedFortress, { recursive: true, force: true });
+    }
   });
 });

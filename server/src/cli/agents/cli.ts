@@ -44,6 +44,7 @@ import { FilesystemStorage } from "../../storage/filesystem.js";
 import { resolveCliMasterKey } from "../../core/master-custody.js";
 import { readStoredPassphrase } from "../../wrap/passphrase.js";
 import { fortressIdFromStoragePath } from "../../dashboard/v1_1/wiring.js";
+import { consumeFlagValue, unknownFlagWithPrefix } from "../argv.js";
 
 export interface AgentsCommandArgs {
   argv: string[];
@@ -99,14 +100,18 @@ function resolveCtx(args: AgentsCommandArgs): ResolvedCtx {
 export async function runAgentsCommand(
   args: AgentsCommandArgs
 ): Promise<number> {
-  // Parse --fortress from argv and plumb into discoverOpts.root.
-  const fortressIdx = args.argv.indexOf("--fortress");
-  if (fortressIdx !== -1 && args.argv[fortressIdx + 1]) {
-    args = { ...args, root: args.argv[fortressIdx + 1] };
-    // Strip --fortress <path> from argv so subcommands don't see it.
-    const filtered = [...args.argv];
-    filtered.splice(fortressIdx, 2);
-    args = { ...args, argv: filtered };
+  const unknownFortressFlag = unknownFlagWithPrefix(args.argv, "--fortress");
+  if (unknownFortressFlag) {
+    (args.err ?? process.stderr).write(`agents unknown fortress flag ${unknownFortressFlag}\n`);
+    return 2;
+  }
+  const fortress = consumeFlagValue(args.argv, "--fortress");
+  if (fortress.error) {
+    (args.err ?? process.stderr).write(`agents ${fortress.error}\n`);
+    return 2;
+  }
+  if (fortress.value !== undefined) {
+    args = { ...args, root: fortress.value, argv: fortress.argv };
   }
   const ctx = resolveCtx(args);
   const [sub, ...rest] = args.argv;
@@ -652,6 +657,7 @@ function renderApprovalRedirectBlock(state: ApprovalRedirectState): string {
  */
 function upsertApprovalRedirectBlock(content: string, block: string): string {
   const lines = content.split("\n");
+  // cli-argv-indexof-allowed: scans policy-file lines, not CLI argv tokens.
   const startIdx = lines.findIndex((l) => l.startsWith("approval_redirect:"));
   if (startIdx === -1) {
     const trimmed = content.endsWith("\n") ? content : content + "\n";

@@ -19,6 +19,7 @@ import {
   type ConciergeAskResponse,
   type ConciergeStatus,
 } from "../concierge/index.js";
+import { consumeFlagValue, unknownFlagWithPrefix } from "./argv.js";
 
 export interface ConciergeCliArgs {
   argv: string[];
@@ -252,19 +253,22 @@ async function resolveContext(
   argv: string[],
   err: Writable,
 ): Promise<ConciergeCliContext | null> {
-  const fortressIdx = argv.indexOf("--fortress");
-  if (fortressIdx < 0) return { argv };
-  const fortress = argv[fortressIdx + 1];
-  if (!fortress) {
-    err.write("concierge --fortress requires a path\n");
+  const unknownFortressFlag = unknownFlagWithPrefix(argv, "--fortress");
+  if (unknownFortressFlag) {
+    err.write(`concierge unknown fortress flag ${unknownFortressFlag}\n`);
     return null;
   }
-  const filtered = [...argv];
-  filtered.splice(fortressIdx, 2);
+  const parsed = consumeFlagValue(argv, "--fortress");
+  if (parsed.error) {
+    err.write(`concierge ${parsed.error}\n`);
+    return null;
+  }
+  if (parsed.value === undefined) return { argv: parsed.argv };
+  const fortress = parsed.value;
   process.env.SANCTUARY_STORAGE_PATH = fortress;
   const runtime = await readTenantRuntime(fortress);
   return {
-    argv: filtered,
+    argv: parsed.argv,
     ...(runtime
       ? { dashboardUrl: `http://${runtime.dashboard_host}:${runtime.dashboard_port}` }
       : {}),
