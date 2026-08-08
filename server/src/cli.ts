@@ -753,6 +753,8 @@ async function runStandaloneDashboard(args: string[]): Promise<void> {
     const { startMultiDashboardServer } = await import(
       "./dashboard/multi-server.js"
     );
+    const { loadConfig } = await import("./config.js");
+    const config = await loadConfig();
     const envPort = process.env.SANCTUARY_MULTI_DASHBOARD_PORT;
     const resolvedPort =
       port ?? (envPort ? parseInt(envPort, 10) : undefined);
@@ -765,6 +767,8 @@ async function runStandaloneDashboard(args: string[]): Promise<void> {
       ...(resolvedPort !== undefined ? { port: resolvedPort } : {}),
       ...(host !== undefined ? { host } : {}),
       ...(authToken !== undefined ? { authToken } : {}),
+      allowPlaintextRemote:
+        allowPlaintextRemote || config.dashboard.allow_plaintext_remote,
     });
     // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error(

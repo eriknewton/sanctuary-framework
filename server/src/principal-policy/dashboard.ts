@@ -72,6 +72,7 @@ import {
   type V11Bindings,
 } from "../dashboard/v1_1/wiring.js";
 import { getProcessInstance, getProcessSince } from "../dashboard/process-identity.js";
+import { isRemoteDashboardBinding } from "../dashboard/remote-binding.js";
 // Dashboard-fold PR-3 (ratified decision 7): the mobile companion PWA moves
 // onto the ONE surviving surface. The shell/manifest/service-worker are
 // tokenless static assets with client-side auth; see dashboard/mobile.ts for
@@ -5343,8 +5344,9 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * C1: is this dashboard binding to a non-loopback interface?
    */
   private isRemoteBinding(): boolean {
-    const h = this.config.host;
-    return h !== "127.0.0.1" && h !== "::1" && h !== "localhost";
+    // Must match isRemoteDashboardBinding in ../dashboard/remote-binding.ts;
+    // the single-tenant and multi-tenant bind guards share that helper.
+    return isRemoteDashboardBinding(this.config.host);
   }
 
   /**
