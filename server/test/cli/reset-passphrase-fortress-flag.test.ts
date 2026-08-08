@@ -76,6 +76,59 @@ describe("reset-passphrase --fortress flag", () => {
     expect(err.text).toContain(tmpDir);
   });
 
+  it("--fortress= overrides the resolved storage path", async () => {
+    const out = new StringWritable();
+    const err = new StringWritable();
+    writeFileSync(join(tmpDir, "runtime.json"), "{}");
+
+    const code = await runResetPassphraseCommand({
+      argv: [`--fortress=${tmpDir}`, "--mode", "nuke"],
+      out,
+      err,
+      stdin: stdinFromLines([]),
+      storagePath: "/should/not/be/used",
+    });
+
+    expect(code).toBe(1);
+    expect(err.text).toContain("runtime.json");
+    expect(err.text).toContain(tmpDir);
+  });
+
+  it("--storage= remains a fortress alias", async () => {
+    const out = new StringWritable();
+    const err = new StringWritable();
+    writeFileSync(join(tmpDir, "runtime.json"), "{}");
+
+    const code = await runResetPassphraseCommand({
+      argv: [`--storage=${tmpDir}`, "--mode", "nuke"],
+      out,
+      err,
+      stdin: stdinFromLines([]),
+      storagePath: "/should/not/be/used",
+    });
+
+    expect(code).toBe(1);
+    expect(err.text).toContain("runtime.json");
+    expect(err.text).toContain(tmpDir);
+  });
+
+  it("refuses missing fortress and storage values before resolving the default fortress", async () => {
+    for (const flag of ["--fortress", "--storage"]) {
+      const out = new StringWritable();
+      const err = new StringWritable();
+      const code = await runResetPassphraseCommand({
+        argv: [flag],
+        out,
+        err,
+        stdin: stdinFromLines([]),
+        storagePath: tmpDir,
+      });
+
+      expect(code).toBe(1);
+      expect(err.text).toContain(`${flag} requires a value`);
+    }
+  });
+
   it("help text documents --fortress", async () => {
     const out = new StringWritable();
     const err = new StringWritable();

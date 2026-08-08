@@ -59,11 +59,12 @@ async function writeCommittedReachabilityConfig(
 async function runReachabilityProbe(
   fortressPath: string,
   execFileFn: (file: string, args: string[]) => Promise<{ stdout: string; stderr: string }>,
+  argv: string[] = ["--fortress", fortressPath],
 ): Promise<{ code: number; out: string; err: string }> {
   const out = new CaptureStream();
   const err = new CaptureStream();
   const args = {
-    argv: ["--fortress", fortressPath],
+    argv,
     out,
     err,
     env: {},
@@ -144,6 +145,22 @@ describe("sanctuary liveness-probe CLI", () => {
 
     expect(code).toBe(2);
     expect(err.text()).toContain("Unknown liveness-probe option: --unknown");
+    expect(out.text()).toBe("");
+  });
+
+  it("refuses a trailing fortress flag before reading the default fortress", async () => {
+    const out = new CaptureStream();
+    const err = new CaptureStream();
+
+    const code = await runLivenessProbeCommand({
+      argv: ["--fortress"],
+      out,
+      err,
+      env: {},
+    });
+
+    expect(code).toBe(2);
+    expect(err.text()).toContain("--fortress requires a value");
     expect(out.text()).toBe("");
   });
 
@@ -250,7 +267,7 @@ describe("sanctuary liveness-probe CLI", () => {
         const url = args[args.length - 1]!;
         if (hostOf(url) === "example.com") throw new Error("blocked control");
         return { stdout: "", stderr: "" };
-      });
+      }, [`--fortress=${dir}`]);
 
       expect(result.code).toBe(0);
       expect(result.out).toContain(

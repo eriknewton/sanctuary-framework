@@ -92,6 +92,7 @@ import {
   bootServiceInstalled,
   bootServiceReady,
 } from "./castle-wall-boot.js";
+import { consumeFlagValue } from "./argv.js";
 import { fortressIdFromStoragePath } from "../dashboard/v1_1/wiring.js";
 import {
   EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE,
@@ -284,6 +285,7 @@ export interface CastleWallCommandContext {
 export interface CastleWallParsedArgs {
   fortress?: string;
   since?: string;
+  parseError?: string;
   scope?: "once" | "session" | "always";
   requestId?: string;
   force?: boolean;
@@ -333,6 +335,15 @@ export interface CastleWallParsedArgs {
    * fortress publish path. Never accepted from an untrusted source.
    */
   producerPubKey?: string;
+}
+
+function writeCastleWallParseError(
+  parsed: CastleWallParsedArgs,
+  err: Writable,
+): boolean {
+  if (parsed.parseError === undefined) return false;
+  write(err, `Error: ${parsed.parseError}\n`);
+  return true;
 }
 
 /** Runs the host-app binary in headless mode; mirrors execFile semantics. */
@@ -772,6 +783,7 @@ export async function runAuditFindings(
   const err = ctx.err ?? process.stderr;
   const env = ctx.env ?? process.env;
   const parsed = parseCastleWallArgs(argv);
+  if (writeCastleWallParseError(parsed, err)) return 2;
   const fortressPath = resolveFortressArg(parsed.fortress, env);
 
   try {
@@ -872,6 +884,7 @@ export async function runAuditStoreStatus(
   const err = ctx.err ?? process.stderr;
   const env = ctx.env ?? process.env;
   const parsed = parseCastleWallArgs(argv);
+  if (writeCastleWallParseError(parsed, err)) return 2;
   const fortressPath = resolveFortressArg(parsed.fortress, env);
 
   try {
@@ -904,8 +917,9 @@ export async function runProvisionPin(
   // version" while federation/identity verbs against the SAME --fortress path
   // worked (2026-06-24 stock-CLI drill). resolveFortressArg falls back to
   // resolveStoragePath(env) when no flag is given, preserving prior behavior.
-  const { fortress } = parseCastleWallArgs(argv);
-  const storagePath = resolveFortressArg(fortress, env);
+  const parsed = parseCastleWallArgs(argv);
+  if (writeCastleWallParseError(parsed, err)) return 2;
+  const storagePath = resolveFortressArg(parsed.fortress, env);
   const pubPath = join(storagePath, CASTLE_PINNED_PUBKEY);
   const privPath = join(storagePath, CASTLE_PINNED_PRIVKEY);
   // Reuse the existing globalPinnedPublicKeyPath test seam (already threaded
@@ -1177,7 +1191,9 @@ export async function runRePin(
   const err = ctx.err ?? process.stderr;
   const env = ctx.env ?? process.env;
   const platform = ctx.platform ?? process.platform;
-  const acceptBrokenChain = parseCastleWallArgs(argv).acceptBrokenChain ?? false;
+  const parsed = parseCastleWallArgs(argv);
+  if (writeCastleWallParseError(parsed, err)) return 2;
+  const acceptBrokenChain = parsed.acceptBrokenChain ?? false;
 
   if (platform !== "darwin") {
     write(err, "castle-wall re-pin is macOS-only.\n");
@@ -1647,7 +1663,9 @@ export async function runDaemon(
   const err = ctx.err ?? process.stderr;
   const env = ctx.env ?? process.env;
   const platform = ctx.platform ?? process.platform;
-  const acceptBrokenChain = parseCastleWallArgs(argv).acceptBrokenChain ?? false;
+  const parsed = parseCastleWallArgs(argv);
+  if (writeCastleWallParseError(parsed, err)) return 2;
+  const acceptBrokenChain = parsed.acceptBrokenChain ?? false;
 
   // FIX 3 (codex HIGH - wire the opt-in producer-signed close into production).
   // The daemon verb is macOS by default. On Linux it stays unsupported UNLESS the
@@ -1689,7 +1707,7 @@ export async function runDaemon(
   // back to resolveStoragePath(env) when no flag is given, preserving prior
   // env-var behavior (SANCTUARY_FORTRESS_PATH is promoted to
   // SANCTUARY_STORAGE_PATH upstream in cli.ts).
-  const storagePath = resolveFortressArg(parseCastleWallArgs(argv).fortress, env);
+  const storagePath = resolveFortressArg(parsed.fortress, env);
   const localSign = env.SANCTUARY_CASTLE_LOCAL_SIGN === "1";
   const launchdBoot = argv.includes("--launchd");
 
@@ -2151,6 +2169,8 @@ export async function runSafeModeDaemon(
   const err = ctx.err ?? process.stderr;
   const env = ctx.env ?? process.env;
   const platform = ctx.platform ?? process.platform;
+  const parsed = parseCastleWallArgs(argv);
+  if (writeCastleWallParseError(parsed, err)) return 2;
 
   if (platform !== "darwin") {
     write(err, "castle-wall daemon --safe-mode is macOS-only.\n");
@@ -2174,7 +2194,7 @@ export async function runSafeModeDaemon(
   // the same footgun runDaemon had. resolveFortressArg falls back to
   // resolveStoragePath(env) when no flag is given, so the launchd boot path
   // (SANCTUARY_STORAGE_PATH set in the plist, no flag) is unchanged.
-  const storagePath = resolveFortressArg(parseCastleWallArgs(argv).fortress, env);
+  const storagePath = resolveFortressArg(parsed.fortress, env);
   const fortressId = fortressIdFromStoragePath(storagePath);
 
   // 1. Boot token (the only secret safe mode holds). Fail-closed on absence or
@@ -2564,6 +2584,7 @@ export async function runReload(
   const err = ctx.err ?? process.stderr;
   const env = ctx.env ?? process.env;
   const parsed = parseCastleWallArgs(argv);
+  if (writeCastleWallParseError(parsed, err)) return 2;
   const fortressPath = resolveFortressArg(parsed.fortress, env);
 
   const result = await requestPolicyReload(fortressPath, ctx.platform ?? process.platform);
@@ -2590,6 +2611,7 @@ export async function runApprove(
   const err = ctx.err ?? process.stderr;
   const env = ctx.env ?? process.env;
   const parsed = parseCastleWallArgs(argv);
+  if (writeCastleWallParseError(parsed, err)) return 2;
   const requestId = parsed.requestId;
   if (!requestId) {
     write(err, "Error: castle-wall approve requires <request_id>\n");
@@ -2698,6 +2720,7 @@ export async function runAuditDump(
   const err = ctx.err ?? process.stderr;
   const env = ctx.env ?? process.env;
   const parsed = parseCastleWallArgs(argv);
+  if (writeCastleWallParseError(parsed, err)) return 2;
   if (parsed.ruleMissingValue) {
     write(err, "Error: --rule requires a rule id (e.g. --rule allow-anthropic, or --rule default-deny).\n");
     return 2;
@@ -2954,6 +2977,7 @@ export async function runAuditVerify(
   const err = ctx.err ?? process.stderr;
   const env = ctx.env ?? process.env;
   const parsed = parseCastleWallArgs(argv);
+  if (writeCastleWallParseError(parsed, err)) return 2;
   const fortressPath = resolveFortressArg(parsed.fortress, env);
   const sinceIso = parsed.since
     ? new Date(Date.now() - parseDurationMs(parsed.since)).toISOString()
@@ -3526,6 +3550,7 @@ export async function runConfigureOrigin(
   const err = ctx.err ?? process.stderr;
   const env = ctx.env ?? process.env;
   const parsed = parseCastleWallArgs(argv);
+  if (writeCastleWallParseError(parsed, err)) return 2;
   const fortressPath = resolveFortressArg(parsed.fortress, env);
 
   // Parse remaining positional args: configure-origin <mode> [options]
@@ -4432,6 +4457,7 @@ async function runArmDisarmInner(
   }
 
   const parsed = parseCastleWallArgs(argv);
+  if (writeCastleWallParseError(parsed, err)) return 2;
   const fortressPath = resolveFortressArg(parsed.fortress, env);
   const socketPath = resolveCastleWallSocketPath({
     platform,
@@ -5027,14 +5053,18 @@ export async function runDisable(
 
 export function parseCastleWallArgs(argv: string[]): CastleWallParsedArgs {
   const parsed: CastleWallParsedArgs = {};
-  for (let i = 0; i < argv.length; i++) {
-    const arg = argv[i]!;
-    if (arg === "--fortress") {
-      parsed.fortress = argv[++i];
-    } else if (arg === "--since") {
-      parsed.since = argv[++i];
-    } else if (arg === "--ttl") {
-      parsed.ttlSeconds = parseLeaseTtlSeconds(argv[++i]);
+  // Must match consumeFlagValue in ./argv.ts: a dropped --fortress/--since value must refuse, never silently resolve the default fortress; wrong-fortress custody/daemon operations are a constraint-5 violation.
+  const fortress = consumeFlagValue(argv, "--fortress");
+  if (fortress.error !== undefined) return { parseError: fortress.error };
+  if (fortress.value !== undefined) parsed.fortress = fortress.value;
+  const since = consumeFlagValue(fortress.argv, "--since");
+  if (since.error !== undefined) return { ...parsed, parseError: since.error };
+  if (since.value !== undefined) parsed.since = since.value;
+
+  for (let i = 0; i < since.argv.length; i++) {
+    const arg = since.argv[i]!;
+    if (arg === "--ttl") {
+      parsed.ttlSeconds = parseLeaseTtlSeconds(since.argv[++i]);
     } else if (arg.startsWith("--ttl=")) {
       parsed.ttlSeconds = parseLeaseTtlSeconds(arg.slice("--ttl=".length));
     } else if (arg === "--no-ttl") {
@@ -5042,7 +5072,7 @@ export function parseCastleWallArgs(argv: string[]): CastleWallParsedArgs {
     } else if (arg.startsWith("--scope=")) {
       parsed.scope = parseScope(arg.slice("--scope=".length));
     } else if (arg === "--scope") {
-      parsed.scope = parseScope(argv[++i]);
+      parsed.scope = parseScope(since.argv[++i]);
     } else if (arg === "--force") {
       parsed.force = true;
     } else if (arg === "--allow-no-egress") {
@@ -5060,14 +5090,14 @@ export function parseCastleWallArgs(argv: string[]): CastleWallParsedArgs {
     } else if (arg.startsWith("--producer-pub-key=")) {
       parsed.producerPubKey = arg.slice("--producer-pub-key=".length);
     } else if (arg === "--producer-pub-key") {
-      parsed.producerPubKey = argv[++i];
+      parsed.producerPubKey = since.argv[++i];
     } else if (arg.startsWith("--rule=")) {
       parsed.rule = arg.slice("--rule=".length);
     } else if (arg === "--rule") {
       // `--rule` requires a value. If the next token is missing or is itself a
       // flag, do NOT consume it - flag the omission so the caller emits a usage
       // error rather than silently falling back to the raw audit dump.
-      const next = argv[i + 1];
+      const next = since.argv[i + 1];
       if (next === undefined || next.startsWith("-")) {
         parsed.ruleMissingValue = true;
       } else {
