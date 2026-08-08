@@ -157,7 +157,7 @@ negotiator = Agent(
 )
 ```
 
-Each agent gets its own cryptographic identity, encrypted state store, and reputation history - fully isolated from other agents in the crew.
+Each agent gets its own cryptographic identity, encrypted state store, and reputation history. Same-host isolation between wrapped agents remains partial until **IC-16** closes.
 
 ### Context Gating for Inference Calls
 

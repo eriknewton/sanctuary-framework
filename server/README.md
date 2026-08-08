@@ -262,7 +262,7 @@ Sanctuary's security claims are structural, not cooperative-only.
 - Concordia receipts for cross-castle commitments
 - Verascore reputation aggregating across operators
 - Portable reputation bundles for cross-platform portability
-- Signed audit trails as compliance evidence
+- Hash-chained audit with current checkpoint-signing bounds as compliance evidence
 
 ## Development
 

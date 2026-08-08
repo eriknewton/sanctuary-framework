@@ -108,7 +108,7 @@ Five operator rights are foundational. The substrate guarantees all five at zero
 
 **Attestation.** Approved actions produce hash-chained audit entries the operator controls. Counterparty-verifiable evidence is strongest at checkpoint and receipt surfaces where a signer is actually wired; production audit checkpoints are unsigned until **IC-05** closes. Attestation is not gated by a vendor's signing authority.
 
-**Exit.** When the operator wants to leave a vendor, the operator's substrate walks out with them. The vendor does not own the operator's history.
+**Exit.** Keys, state, reputation, and commitments are yours to move, copy, or keep offline through the shipped paths, with the full exit guarantee partial until **IC-07, IC-08, IC-09** close.
 
 These are not slogans. They are concrete substrate guarantees with a reference implementation in Apache 2.0 source.
 

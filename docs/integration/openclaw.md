@@ -4,7 +4,7 @@
 > to your OpenClaw agent in under 60 seconds.
 
 Verified working on Mac Mini M4 running OpenClaw 2026.4.2 + Sanctuary v1.3.0-rc.1
-(80+ tools registered, sovereignty handshakes completed, Verascore publish proven).
+(68 tools registered, sovereignty handshakes completed, Verascore publish proven).
 The config below uses the explicit-binary npx form
 (`-p @sanctuary-framework/mcp-server sanctuary-mcp-server`), which resolves an
 executable on every published version, so it tracks the latest release instead

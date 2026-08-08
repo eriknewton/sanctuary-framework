@@ -41,7 +41,7 @@ Deploy the agent. Sanctuary tools load automatically via MCP.
 - **Encrypted Audit Trail**: Tamper-evident hash-chained logs with current signed-checkpoint bounds; selective disclosure via zero-knowledge attestations
 - **Principal Policy**: Tiered role-based access control (RBAC) with time-locked capabilities
 - **SIEM Export**: Push audit events to any SIEM (Datadog, Splunk, Chronicle)
-- **Sovereignty Health Reports**: Real-time dashboard of identity status, policy compliance, audit integrity
+- **Sovereignty Health Reports**: Current dashboard of identity status, policy compliance, audit integrity
 - **Reputation Publishing**: Cryptographic proof of track record via Verascore
 
 ## Before vs. After
@@ -49,7 +49,7 @@ Deploy the agent. Sanctuary tools load automatically via MCP.
 | Aspect | Without Sanctuary | With Sanctuary |
 |--------|------------------|----------------|
 | Identity | Implicit (cloud-managed) | Explicit (agent-owned Ed25519 keypair) |
-| Audit | Default logging | Encrypted, tamper-evident, SIEM-ready |
+| Audit | Default logging | Encrypted, tamper-evident hash-chained logs with current signed-checkpoint bounds, SIEM-ready |
 | Policy | Platform-level (static) | Principal-level (dynamic, time-locked) |
 | Disclosure | All-or-nothing | Selective (ZK attestations) |
 | Reputation | Opaque | Verifiable via Verascore |

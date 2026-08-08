@@ -20,7 +20,7 @@ Every runtime gets the same capabilities:
 
 - **Ed25519 Identity**: Cryptographic keypair + W3C DID per agent
 - **Encrypted Audit Trail**: Tamper-evident hash-chained logs with current signed-checkpoint bounds
-- **Sovereignty Health Report**: Real-time L1-L4 status
+- **Sovereignty Health Report**: Current status for Castle Wall, Sentinels, Charter, and Heralds
 - **Verascore Profile**: Portable, verifiable reputation
 - **Sovereignty Handshake**: Mutual trust verification between agents
 
