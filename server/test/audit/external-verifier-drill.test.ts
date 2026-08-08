@@ -73,6 +73,22 @@ function mutateByte(b64: string, index = Math.floor(b64.length / 2)): string {
   return b64.slice(0, index) + replacement + b64.slice(index + 1);
 }
 
+function tamperEntryPayload(
+  records: readonly VerifierExportRecord[],
+  seq: number
+): VerifierExportRecord[] {
+  return records.map((r) => {
+    if (r.type === "entry" && (r as EntryExportRecord).seq === seq) {
+      const e = r as EntryExportRecord;
+      return {
+        ...e,
+        encrypted_payload_bytes: mutateByte(e.encrypted_payload_bytes),
+      };
+    }
+    return r;
+  });
+}
+
 type SignedCheckpointRecord = VerifierCheckpointExportRecord & {
   signature: string;
   public_key: string;
@@ -190,6 +206,8 @@ describe("external-verifier-drill: happy path", () => {
     expect(report.findings).toHaveLength(0);
     expect(report.entries_verified).toBe(25);
     expect(report.checkpoints_verified).toBeGreaterThanOrEqual(1);
+    expect(report.signatures_verified).toBe(checkpoints.length);
+    expect(report.signatures_skipped).toBe(0);
   });
 
   it("verifies a valid chain content string as PASS with the expected entry count", async () => {
@@ -221,6 +239,7 @@ describe("external-verifier-drill: happy path", () => {
 
     const jsonl = await collectExport(storage);
     const records = parseJsonl(jsonl);
+    const checkpointCount = records.filter((r) => r.type === "checkpoint").length;
 
     expect(records.filter((r) => r.type === "entry")).toHaveLength(5);
     expect(records).toEqual(
@@ -234,6 +253,8 @@ describe("external-verifier-drill: happy path", () => {
     const report = verifyAuditChainRecords(records);
     expect(report.verdict).toBe("PASS");
     expect(report.findings).toHaveLength(0);
+    expect(report.signatures_verified).toBe(0);
+    expect(report.signatures_skipped).toBe(checkpointCount);
   });
 });
 
@@ -305,16 +326,7 @@ describe("external-verifier-drill: Scenario A - entry payload mutation", () => {
     const records = parseJsonl(jsonl);
 
     // Mutate encrypted_payload_bytes of seq=3
-    const tampered = records.map((r) => {
-      if (r.type === "entry" && (r as EntryExportRecord).seq === 3) {
-        const e = r as EntryExportRecord;
-        return {
-          ...e,
-          encrypted_payload_bytes: mutateByte(e.encrypted_payload_bytes),
-        };
-      }
-      return r;
-    });
+    const tampered = tamperEntryPayload(records, 3);
 
     const report = verifyAuditChainRecords(tampered, { publicKey });
     expect(report.verdict).toBe("FAIL");
@@ -330,6 +342,17 @@ describe("external-verifier-drill: Scenario A - entry payload mutation", () => {
       (f) => f.kind === "prev_hash_mismatch" && f.seq === 4
     );
     expect(chainFinding).toBeDefined();
+  });
+
+  it("reports FAIL with findings even when strict mode is disabled", async () => {
+    const { storage, publicKey } = await buildSignedAuditChain();
+    const tampered = tamperEntryPayload(parseJsonl(await collectExport(storage)), 3);
+
+    const report = verifyAuditChainRecords(tampered, { publicKey, strict: false });
+
+    expect(report.verdict).toBe("FAIL");
+    expect(report.findings.length).toBeGreaterThan(0);
+    expect(report.findings.some((f) => f.kind === "entry_hash_mismatch")).toBe(true);
   });
 });
 

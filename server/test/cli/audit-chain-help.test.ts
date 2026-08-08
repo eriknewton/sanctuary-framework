@@ -22,6 +22,8 @@ describe("sanctuary audit-chain --help (QQQQ)", () => {
     expect(code).toBe(0);
     expect(stderr).toContain("Usage: sanctuary audit-chain verify");
     expect(stderr).toContain("--input");
+    expect(stderr).toContain("--no-strict            Report FAIL findings but exit 0");
+    expect(stderr).not.toContain("Continue on verification failures");
     expect(stderr).not.toContain("Error");
   }, CLI_SUBPROCESS_TEST_TIMEOUT_MS);
 
