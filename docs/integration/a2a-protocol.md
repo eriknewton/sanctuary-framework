@@ -144,7 +144,7 @@ agent supports sovereignty handshakes, negotiation, and reputation verification.
 
 ## Step 3: Verify Sanctuary Is Active
 
-Call `manifest` from your agent logic. You should see 68 Sanctuary tools listed.
+Call `manifest` from your agent logic. You should see 80+ Sanctuary tools listed.
 
 ## Step 4: Bind an Identity
 

@@ -1,7 +1,36 @@
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 
-export type AssuranceStatus = "proven" | "partial" | "planned" | "unknown";
+/**
+ * The status tokens a matrix row may carry. Must match the "Status enum" line in
+ * `ASSURANCE_MATRIX.md` (currently line 5); `unknown` doubles as the parser's
+ * fallback for a token that is not in that enum at all.
+ *
+ * Every enum member is listed here on purpose. A member that is missing from
+ * this union does NOT fail the parse: `normalizeStatus` silently downgrades it
+ * to `unknown`, so an honest `not_implemented` row would read as an unparsed
+ * row, and the two are not the same claim. Adding a token to the matrix enum
+ * without adding it here is the failure mode this comment exists to prevent.
+ */
+export type AssuranceStatus =
+  | "proven"
+  | "partial"
+  | "manual"
+  | "not_implemented"
+  | "planned"
+  | "in_flight"
+  | "unknown";
+
+/** Recognized status tokens, mirroring the `ASSURANCE_MATRIX.md` status enum. */
+const KNOWN_STATUSES: readonly AssuranceStatus[] = [
+  "proven",
+  "partial",
+  "manual",
+  "not_implemented",
+  "planned",
+  "in_flight",
+  "unknown",
+];
 
 export interface AssuranceRow {
   id: string;
@@ -26,10 +55,13 @@ function findRepoRoot(start = process.cwd()): string {
 }
 
 function normalizeStatus(status: string): AssuranceStatus {
-  if (status === "proven" || status === "partial" || status === "planned") {
-    return status;
-  }
-  return "unknown";
+  // An unrecognized token becomes `unknown` rather than throwing, so a typo in
+  // the matrix degrades the report instead of breaking the whole pipeline. That
+  // leniency is why KNOWN_STATUSES must stay in lockstep with the matrix enum:
+  // a real status the parser has never heard of is indistinguishable from a typo.
+  return KNOWN_STATUSES.includes(status as AssuranceStatus)
+    ? (status as AssuranceStatus)
+    : "unknown";
 }
 
 function stripMarkdownLinks(value: string): string {

@@ -48,7 +48,7 @@
     {
       "assurance_row_id": "4",
       "label": "Tamper-evident audit chain",
-      "assurance_status": "proven",
+      "assurance_status": "partial",
       "fixtures_passed": 8,
       "coverage_state": "covered",
       "passing_fixture_names": [
@@ -119,16 +119,10 @@
     {
       "assurance_row_id": "9",
       "label": "Egress enforcement: Linux (Castle Wall Phase 1)",
-      "assurance_status": "proven",
-      "fixtures_passed": 5,
-      "coverage_state": "covered",
-      "passing_fixture_names": [
-        "boundary-admission: deny on expired token",
-        "boundary-admission: deny on missing token",
-        "boundary-admission: deny on revoked principal",
-        "boundary-admission: happy admit",
-        "boundary-admission: replay rejection"
-      ]
+      "assurance_status": "not_implemented",
+      "fixtures_passed": 0,
+      "coverage_state": "not_implemented",
+      "passing_fixture_names": []
     },
     {
       "assurance_row_id": "10",
@@ -154,7 +148,7 @@
     {
       "assurance_row_id": "12",
       "label": "Export / exit bundle",
-      "assurance_status": "proven",
+      "assurance_status": "partial",
       "fixtures_passed": 5,
       "coverage_state": "covered",
       "passing_fixture_names": [
@@ -285,7 +279,7 @@
     },
     {
       "assurance_row_id": "22",
-      "label": "Verifiable transparency checkpoints (signed enforcement evidence)",
+      "label": "Verifiable transparency checkpoint format and offline verifier",
       "assurance_status": "proven",
       "fixtures_passed": 6,
       "coverage_state": "covered",

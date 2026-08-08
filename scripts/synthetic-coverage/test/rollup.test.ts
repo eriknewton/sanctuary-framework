@@ -43,7 +43,10 @@ function report(platform: CoverageReport["platform"], rows: CoverageRow[]): Cove
     summary: {
       total_rows: rows.length,
       rows_with_fixtures: rows.filter((coverageRow) => coverageRow.fixtures_run > 0).length,
-      rows_no_fixture: rows.filter((coverageRow) => coverageRow.fixtures_run === 0).length,
+      rows_no_fixture: rows.filter((coverageRow) => coverageRow.coverage_state === "no_fixture").length,
+      rows_not_implemented: rows.filter(
+        (coverageRow) => coverageRow.coverage_state === "not_implemented",
+      ).length,
       rows_failing: rows.filter((coverageRow) => coverageRow.fixtures_failed > 0).length,
     },
   };
@@ -152,6 +155,51 @@ describe("synthetic coverage gate rollup", () => {
         row_id: "1",
         label: "Row 1",
         reason: "planned_not_yet_covered",
+        blocking_for_gate: false,
+      },
+    ]);
+  });
+
+  it("keeps not_implemented rows out of passing assurance totals", () => {
+    const linux = report("linux", [
+      row({
+        id: "9",
+        status: "not_implemented",
+        fixturesRun: 0,
+        fixturesPassed: 0,
+        coverageState: "not_implemented",
+      }),
+    ]);
+    const macos = report("macos", [
+      row({
+        id: "9",
+        status: "not_implemented",
+        fixturesRun: 0,
+        fixturesPassed: 0,
+        coverageState: "not_implemented",
+      }),
+    ]);
+
+    const artifact = produceGateArtifact(linux, macos, cleanParity());
+
+    expect(artifact.gate_state).toBe("gate_a_green");
+    expect(artifact.claim_to_row[0]).toMatchObject({
+      row_id: "9",
+      linux_fixtures: 0,
+      macos_fixtures: 0,
+      coverage_state_linux: "not_implemented",
+      coverage_state_macos: "not_implemented",
+    });
+    expect(artifact.version_matrix[0]).toMatchObject({
+      platform: "linux",
+      fixtures_run: 0,
+      fixtures_passed: 0,
+    });
+    expect(artifact.gap_inventory).toEqual([
+      {
+        row_id: "9",
+        label: "Row 9",
+        reason: "not_implemented",
         blocking_for_gate: false,
       },
     ]);

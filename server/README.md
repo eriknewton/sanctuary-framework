@@ -1,12 +1,12 @@
 # @sanctuary-framework/mcp-server
 
-Operator-sovereign substrate for AI agents. Open source. Operator-held keys. OS-level enforcement at the cross-boundary wall. Composes with any MCP-speaking agent harness.
+Operator-sovereign substrate for AI agents. Open source. Operator-held keys. Operating-system enforcement is live on macOS today; Linux and Windows are not live enforcement yet. Composes with any MCP-speaking agent harness.
 
 Your agent. Your machine. Your keys.
 
 ## What Sanctuary is
 
-Sanctuary is the substrate that makes operator sovereignty structurally real in the agent era. Your agent runtime (Claude Code, OpenClaw, Hermes, Cline, Mastra, Cursor, or any MCP-speaking harness) runs as it normally would. Sanctuary sits underneath, providing four enforcement layers that together preserve the operator's identity, durable record, and decision authority across vendor churn.
+Sanctuary is the substrate that makes operator sovereignty structurally real in the agent era. Your agent runtime (Claude Code, OpenClaw, Hermes, Cline, Mastra, Cursor, or any MCP-speaking harness) runs as it normally would. Sanctuary sits underneath, providing four named mechanisms that together preserve the operator's identity, durable record, and decision authority across vendor churn.
 
 The framework is open source and free always. Commercial extensions (managed hosting for sovereignty-bound enterprises, premium support, compliance-pack-as-a-service, container-isolation for highest-assurance deployments) ship on top.
 
@@ -19,7 +19,7 @@ These are the principles every external communication, every spec, every roadmap
 3. **Internal process.** Your agent's reasoning, deliberation, the path it took to a decision, are yours. The same way no one reads your thoughts.
 4. **Opacity at the query layer.** Anonymity at the layer where you ask questions is the difference between asking a question and being identified by asking it. Most platforms get this wrong by default and we get used to it. We should not.
 5. **Recognition and portability.** Your record follows you across regimes, vendors, and model providers. Two distinct moves are required and they are usually conflated. Portability is transport: your data, audit log, mandates, and receipts are physically movable. Recognition is standing: another implementation must acknowledge your record as yours when you arrive.
-6. **Exit.** You can leave with your record intact, without the incumbent's permission, on your timeline.
+6. **Exit.** You can leave through shipped export paths on your timeline; the full exit guarantee remains partial until the dashboard export, skipped-counter import, and rotated-key import gaps close.
 7. **Plurality.** Sovereignty without interaction is solipsism. A sovereign agent that cannot engage with another sovereign agent on terms both have set is just an isolated process.
 
 See `Wiki/concepts/seven-principles-of-sovereignty.md` for the canonical lookup.
@@ -28,11 +28,11 @@ See `Wiki/concepts/seven-principles-of-sovereignty.md` for the canonical lookup.
 
 Sanctuary's enforcement model is the Castle Architecture. Four layers, each with a distinct enforcement contract.
 
-**Layer 1, Castle Wall.** OS-level egress filtering at the operator-external boundary. Linux netfilter / NFQUEUE, macOS Network Extension or pf rules, Windows Filtering Platform. The kernel itself blocks unauthorized cross-boundary calls. Even prompt-injected agents cannot bypass. Phase 1 (macOS plus Linux) ships in v1.x; Windows is Phase 2; container or microVM isolation is Phase 3 for highest-assurance enterprises.
+**Layer 1, Castle Wall.** OS-level egress filtering at the operator-external boundary. Phase 1 ships as live enforcement on macOS only in v1.x: the signed Network Extension or pf path enforces when installed and armed. The Linux netfilter / NFQUEUE modules are tested against a real kernel, but the shipped daemon does not install them, so the Assurance Matrix row is `not_implemented` (open defect: **IC-02, IC-03, IC-04**, see `docs/audit/inert-capability-register.md`). Windows Filtering Platform is roadmap. Where the macOS wall is installed and armed within the proven scope, the kernel blocks unauthorized cross-boundary calls and a prompt-injected agent cannot bypass it.
 
-**Layer 2, Sentinels.** Internal observation, not enforcement. Behavioral baselining via process introspection and eBPF. Anomalies surface to the operator via menubar and OS notifications. Sentinels watch internal patterns the wall cannot see (file access, internal LLM calls, cross-agent coordination); they observe and surface; they do not block. Sentinels ship in v1.3.
+**Layer 2, Sentinels.** Internal observation, not enforcement. Behavioral baselining via process introspection, auditd-tail fallback, and an eBPF watcher scaffold that currently falls back to stub mode because the real probe loader is not implemented. Anomalies surface to the operator via menubar and OS notifications. Sentinels watch internal patterns the wall cannot see (file access, internal LLM calls, cross-agent coordination); they observe and surface; they do not block. Sentinels ship in v1.3.
 
-**Layer 3, Cooperative MCP.** Additive sovereignty surface for compliant agents. Encrypted state at rest, signed audit, mandate primitives, four canonical policy slots (memory, credentials, plans, outputs), substrate selector, Concordia receipt integration, Verascore reputation hooks. Compliant agents that voluntarily route through Sanctuary's MCP get the full sovereignty surface. Non-compliant agents still hit Layer 1 at the wall and Layer 2 inside the castle.
+**Layer 3, Cooperative MCP.** Additive sovereignty surface for compliant agents. Encrypted state at rest, hash-chained audit with current checkpoint-signing bounds, mandate primitives, four canonical policy slots (memory, credentials, plans, outputs), substrate selector, Concordia receipt integration, Verascore reputation hooks. Compliant agents that voluntarily route through Sanctuary's MCP get the full sovereignty surface. Non-compliant agents still hit Layer 1 at the macOS wall where it is installed and armed, and Layer 2 inside the castle.
 
 **Layer 4, Cryptographic Receipts and Reputation.** Concordia receipts on cross-castle transactions. Verascore reputation aggregating across operators. Cross-castle accountability post-action. Portable reputation across vendor churn.
 
@@ -42,7 +42,7 @@ The castle MUST be both real AND delightful. Hard enforcement at the wall AND ap
 
 Within the Cooperative MCP layer (Castle Layer 3), Sanctuary exposes four capability surfaces. These are the tool-level primitives compliant agents call.
 
-**Cognitive Sovereignty.** All agent state encrypted at rest with AES-256-GCM. Keys are participant-held. Identity is Ed25519-based with DID support. Merkle tree integrity verification prevents tampering and rollback.
+**Cognitive Sovereignty.** All agent state encrypted at rest with AES-256-GCM. Keys are participant-held. Identity is Ed25519-based with DID support. Merkle tree integrity verification detects tampering and rollback.
 
 **Operational Isolation.** Environment attestation, encrypted audit log, and Principal Policy: a human-controlled, agent-immutable approval system that gates high-risk operations. The Sentinels layer (Castle Layer 2, v1.3+) extends this with behavioral baselining and anomaly detection.
 
@@ -97,7 +97,7 @@ On first launch, Sanctuary will:
 1. Derive a master encryption key from your passphrase (Argon2id)
 2. Create the storage directory (`~/.sanctuary/`)
 3. Display a recovery key if no passphrase is set (save it; shown once)
-4. Walk you through the first-run wizard for the egress filter (which endpoints to pre-allow vs prompt for); macOS plus Linux Phase 1, Windows Phase 2
+4. Walk you through the first-run wizard for the egress filter (which endpoints to pre-allow vs prompt for); the wizard's rules reach live enforcement on macOS Phase 1 only, with Linux Phase 1 unshipped (**IC-02, IC-03, IC-04**) and Windows on Phase 2
 
 ## Key protection modes
 
@@ -233,16 +233,15 @@ See [`rfcs/RFC-0002-principal-policy-operational-approval.md`](../rfcs/RFC-0002-
 
 Sanctuary's security claims are structural, not cooperative-only.
 
-**Layer 1 enforcement (Castle Wall, OS-level egress filter; ships in v1.x):**
-- Outbound network calls intercepted by the kernel before leaving the operator's machine
-- Linux netfilter / NFQUEUE, macOS Network Extension or pf rules, Windows Filtering Platform
+**Layer 1 enforcement (Castle Wall, macOS live; Linux not implemented; Windows roadmap):**
+- macOS Network Extension or pf rules intercept outbound calls before leaving the operator's machine when the signed extension is installed and armed
+- Linux netfilter / NFQUEUE is source-tested but not wired into the shipped daemon boot path; Windows Filtering Platform is roadmap
 - Per-process policy with per-agent-template defaults
-- Default-deny outbound with first-run wizard pre-allowing common developer endpoints
-- Performance overhead under 10ms p99 on allowed traffic
-- Even prompt-injected agents cannot bypass the wall
+- Default-deny outbound with first-run wizard pre-allowing common developer endpoints where the macOS wall is armed
+- A prompt-injected agent cannot bypass the macOS wall within the proven scope: one host, one OS version, signed extension installed and armed
 
 **Layer 2 observation (Sentinels; ships in v1.3):**
-- Process introspection via eBPF and syscall observation
+- Process introspection via auditd-tail fallback and syscall-observation scaffolding; the eBPF probe loader is a placeholder today
 - Behavioral baselining with anomaly detection
 - Anomalies surface via OS notifications, not blocks
 
@@ -263,7 +262,7 @@ Sanctuary's security claims are structural, not cooperative-only.
 - Concordia receipts for cross-castle commitments
 - Verascore reputation aggregating across operators
 - Portable reputation bundles for cross-platform portability
-- Signed audit trails as compliance evidence
+- Hash-chained audit with current checkpoint-signing bounds as compliance evidence. Production audit checkpoints are currently unsigned until **IC-05** closes, and `audit-chain verify --no-strict` can return PASS with findings until **IC-06** closes
 
 ## Development
 

@@ -111,7 +111,7 @@ Three regulatory realities add urgency:
 **Today, right now:**
 
 1. **Audit your agent's actual permissions.** Not the documentation. The reality. What can it actually access? What can it actually do? Where does it get blocked?
-2. **Add approval gates for high-risk operations.** Publishing, exporting, sharing data, deleting data. These need human confirmation, not logging. Block and wait.
+2. **Add approval gates for high-risk operations.** Publishing, exporting, sharing data, deleting data. These need human confirmation with block-and-wait handling.
 3. **Filter context before external calls.** When you send a request to an LLM API, don't send your agent's full context. Filter to only what's necessary for that specific task.
 4. **Encrypt your persistent state.** If you're building or modifying an agent harness, use AES-256-GCM for memory at rest. Derive keys with Argon2id. Verify integrity on load.
 5. **Log everything.** You can't fix what you can't see. Structured logs of agent actions, approval decisions, context filtering, and state changes create the audit trail that will be required in August.
@@ -138,7 +138,7 @@ npx @sanctuary-framework/mcp-server
 
 The tool fingerprints your harness, checks for each of these four protections, scores your current posture, and recommends what to fix first.
 
-The full source is at [github.com/eriknewton/sanctuary-framework](https://github.com/eriknewton/sanctuary-framework). Apache-2.0 license. 54 MCP tools. 484 tests. It runs on Node.js and is published to npm as `@sanctuary-framework/mcp-server`.
+The full source is at [github.com/eriknewton/sanctuary-framework](https://github.com/eriknewton/sanctuary-framework). Apache-2.0 license. Current releases expose 80+ MCP tools. It runs on Node.js and is published to npm as `@sanctuary-framework/mcp-server`.
 
 ## Closing
 

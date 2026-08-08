@@ -1,6 +1,6 @@
 # Sanctuary Roadmap
 
-In the physical world, your body provides the perimeter, the custody, the memory, and the audit trail by default. In the agent world, action moves to substrates that do not carry those guarantees. Sanctuary installs the architecture that does: a wall the operator imposes, keys only the operator holds, and an audit trail nobody can silently edit. The same substrate serves any principal acting through agents: a person, a company, eventually an agent itself.
+In the physical world, your body provides the perimeter, the custody, the memory, and the audit trail by default. In the agent world, action moves to substrates that do not carry those guarantees. Sanctuary installs the architecture that does: a wall the operator imposes, keys only the operator holds, and a hash-chained audit trail with current signed-checkpoint bounds. The same substrate serves any principal acting through agents: a person, a company, eventually an agent itself.
 
 This roadmap covers what Sanctuary ships today and what's coming next, with rationale for why each piece matters. Detailed shipped history lives in [`CHANGELOG.md`](CHANGELOG.md). Trust claims trace to rows in the [Sanctuary Assurance Matrix](ASSURANCE_MATRIX.md), preserving the platform, gap, and next-proof limits named on each row.
 
@@ -12,9 +12,9 @@ Last updated: 2026-08-07. Freshness is enforced: a CI guard requires feature PRs
 
 Sanctuary's enforcement model is the Castle Architecture, codified at [`server/rfcs/RFC-0003-castle-architecture.md`](server/rfcs/RFC-0003-castle-architecture.md). Five named mechanisms, each with a distinct enforcement contract.
 
-- **Castle Wall (the perimeter).** OS-level egress enforcement at the operator-external boundary. The kernel itself blocks unauthorized cross-boundary calls. Even prompt-injected agents cannot bypass. Linux backend proven (shipped 2026-05-06). macOS proven: per-uid allow/deny plus reboot-survival (N=5) on a Dev-ID-signed and notarized binary, drills 2026-06-11 through 2026-06-22; the per-flow rule-attributed audit trail is the named remaining gap. Windows on the roadmap.
+- **Castle Wall (the perimeter).** OS-level egress enforcement at the operator-external boundary. macOS is proven: per-uid allow/deny plus attended reboot-survival (N=5) on a Dev-ID-signed and notarized binary, drills 2026-06-11 through 2026-06-22; the per-flow rule-attributed audit trail is the named remaining gap. Linux ships no egress enforcement at all: the source modules are integration-proven, and the shipped daemon does not install the nftables table, bind NFQUEUE, create cgroup scopes, or call the deny-by-default evaluator, so the matrix row is `not_implemented` rather than partial. Open defect: **IC-02, IC-03, IC-04** (`docs/audit/inert-capability-register.md`). Windows is on the roadmap.
 - **Sentinels (the nerves).** Internal observation via process introspection and behavioral baselining. Anomalies surface to the operator via menubar and notifications. Observation, not enforcement.
-- **Charter (the will).** Cooperative MCP surface for compliant agents. Encrypted state, signed audit, mandate primitives, four canonical policy slots, substrate selector, Concordia receipt integration, Verascore reputation hooks.
+- **Charter (the will).** Cooperative MCP surface for compliant agents. Encrypted state, hash-chained audit with current signed-checkpoint bounds, mandate primitives, four canonical policy slots, substrate selector, Concordia receipt integration, Verascore reputation hooks. Open defect: **IC-05, IC-06** (`docs/audit/inert-capability-register.md`).
 - **Heralds (the voice).** Concordia receipts for cross-castle commitments, Verascore reputation aggregating across operators. Cross-castle accountability post-action.
 - **Mantle (the unique-substrate-binding).** Install-time substrate-binding. The check that locks Sanctuary to the operator's machine at install time and rejects orphan agent identifiers not bound to a wrapped harness.
 
@@ -32,13 +32,13 @@ Castle-walking principle: real enforcement AND delightful operator experience. H
 
 ### Castle Wall on Linux: kernel-level enforcement
 
-OS-level egress filtering via netfilter / NFQUEUE with per-process cgroup routing. Outbound calls blocked at the kernel even when the agent is prompt-injected, jailbroken, or simply not bothering to cooperate. **Why it matters:** this is the load-bearing security claim. Without kernel-level enforcement, the substrate is a polite fiction; with it, the architecture holds under adversarial conditions.
+Target: OS-level egress filtering via netfilter / NFQUEUE with per-process cgroup routing, so outbound calls are blocked at the kernel even when the agent is prompt-injected, jailbroken, or simply not bothering to cooperate. Current bound: the Linux modules are proven in integration tests, but the shipped daemon does not assemble that enforcement loop. **Why it matters:** this is the security claim the Linux row must earn before it can be called shipped.
 
-*Status: shipped (Phase 1, 2026-05-06). ASSURANCE_MATRIX row "Egress enforcement: Linux (Castle Wall Phase 1)" is proven.*
+*Status: not shipped as enforcement. ASSURANCE_MATRIX row "Egress enforcement: Linux (Castle Wall Phase 1)" is `not_implemented`, so marketing and release copy may not trace a Linux enforcement claim to it. Open defect: **IC-02, IC-03, IC-04** (`docs/audit/inert-capability-register.md`).*
 
-### Castle Wall on macOS: signed system extension, enforced and reboot-surviving
+### Castle Wall on macOS: signed system extension, enforced and attended-reboot-surviving
 
-The signed system extension, host app, content-filter provider, and retail UX shipped through v1.3.3 and the Tahoe fix rounds. The proven claim, exactly: Castle Wall on macOS enforces a signed operator policy with a clean per-uid allow/deny demonstration (agent blocked off-allowlist, agent reaches its allowlisted destination, operator unaffected, in the same armed window) that survives reboot (N=5 real reboot cycles), on a Dev-ID-signed and notarized binary built from the mainline tree. One-command arming (`enable --agent-uid`, configure-then-arm in a single step) shipped 2026-07-06. **Why it matters:** Macs are where retail operators live; without macOS enforcement parity the security claim is asymmetric.
+The signed system extension, host app, content-filter provider, and retail UX shipped through v1.3.3 and the Tahoe fix rounds. The proven claim, exactly: Castle Wall on macOS enforces a signed operator policy with a clean per-uid allow/deny demonstration (agent blocked off-allowlist, agent reaches its allowlisted destination, operator unaffected, in the same armed window) that survives attended reboot cycles (N=5 real cycles), on a Dev-ID-signed and notarized binary built from the mainline tree. One-command arming (`enable --agent-uid`, configure-then-arm in a single step) shipped 2026-07-06. **Why it matters:** Macs are where retail operators live; without macOS enforcement parity the security claim is asymmetric.
 
 *Status: proven. ASSURANCE_MATRIX row "Egress enforcement: macOS" is proven; strongest evidence: [boot-survival re-drill 2026-06-22](docs/audit/castle-wall-macos-boot-survival-redrill-2026-06-22.md) plus the [full-scope re-drill 2026-06-20](docs/audit/castle-wall-macos-fullscope-redrill-2026-06-20.md). Honest bounds carried on the row: one host and one OS version so far, and NOT an audited per-rule-per-flow trail; that trail is the top "coming next" item below.*
 
@@ -68,11 +68,11 @@ The signed system extension, host app, content-filter provider, and retail UX sh
 
 *Confined-path liveness by as-uid reachability (built 2026-08-02, code + host-free tests only; NO hardware leg): the check that answers 'is my protected agent still able to work?' without needing a message channel at all. The Telegram round trip it replaces is impossible on that platform (bots cannot see other bots' messages), and it would not have proven more anyway: a stub-config agent with no memory still replies. What actually matters is whether the confined account can still reach the endpoints its operator declared, and whether it is still blocked from everything else -- both halves are required before the surface will say verified, so a torn down wall reads as unverified rather than green. The evidence already existed at install time; this surfaces it as a verdict and makes it re-runnable afterwards, which is when it matters, because the failure this catches is an agent that was fine at install and is strangled hours later. Verified evidence is sealed at the point it is validated, so a malformed or copied object cannot print a green line, and endpoint identity is compared as a set so a partial report cannot quietly define a smaller universe for itself. HONEST BOUND: it certifies the confined network path only -- NOT that the agent process is running, NOT that its memory or reasoning work, NOT that its model provider is healthy. Proven by host-free tests; the on-hardware leg is owed.*
 
-### Cryptographic identity, encrypted state, signed audit chain
+### Cryptographic identity, encrypted state, audit chain
 
-Ed25519 identity you hold (Argon2id passphrase unlock, per-purpose HKDF subkeys). AES-256-GCM state at rest. Hash-chained signed audit log with a standalone external verifier. Identity keys never leave Sanctuary in plaintext. Recovery is inspectable, with M-of-N guardian eviction shipped for the guardian-recovery path. Audit entries embed a scheme identifier, and hybrid post-quantum signing (Ed25519 + ML-DSA / FIPS 204) has landed on that crypto-agility path without breaking historical receipts. **Why it matters:** the cryptographic primitives are what makes "your keys" a structural claim rather than a marketing claim.
+Ed25519 identity you hold (Argon2id passphrase unlock, per-purpose HKDF subkeys). AES-256-GCM state at rest. Hash-chained audit log with a standalone external verifier. Production checkpoints are unsigned today, and `audit-chain verify --no-strict` can report PASS with findings. Open defect: **IC-05, IC-06** (`docs/audit/inert-capability-register.md`). Identity keys never leave Sanctuary in plaintext. Recovery is inspectable, with M-of-N guardian eviction shipped for the guardian-recovery path. Audit entries embed a scheme identifier, and hybrid post-quantum signing (Ed25519 + ML-DSA / FIPS 204) has landed on that crypto-agility path without breaking historical receipts. **Why it matters:** the cryptographic primitives are what makes "your keys" a structural claim rather than a marketing claim.
 
-*Status: shipped. ASSURANCE_MATRIX rows "State encryption," "State envelope integrity / default verify-on-read," "Tamper-evident audit chain," "Critical audit durability (appendCritical)," "did:key encoding," and "Identity signing authority" are all proven.*
+*Status: shipped for state encryption, state envelope integrity, critical audit durability, did:key encoding, and identity signing authority. ASSURANCE_MATRIX row "Tamper-evident audit chain" is partial until **IC-05, IC-06** are fixed (`docs/audit/inert-capability-register.md`).*
 
 ### Three-tier Principal Policy gates with human-in-the-loop approval
 
@@ -88,9 +88,9 @@ Outbound queries strip operator-identifying headers (client-IP, fingerprint, cor
 
 ### Portable identity, state export, recovery flows
 
-Operator can export their full identity bundle (keys, state, reputation, audit chain) and import on a fresh machine or fresh harness. Recovery key for lost-passphrase scenarios. Tier-1 approval required for export and import. **Why it matters:** the "exit" guarantee is structural, not contractual. Nothing the operator builds up in Sanctuary is locked to the platform; everything is portable, encrypted, and operator-controlled.
+Operator can export identity, state, reputation, and audit-chain material through shipped paths, but the full exit guarantee is partial: dashboard export omits the state re-key key, import hides skipped-entry counters, and rotated-key fortresses can silently lose pre-rotation state on import. Open defect: **IC-07, IC-08, IC-09** (`docs/audit/inert-capability-register.md`). Recovery key for lost-passphrase scenarios remains shipped. Tier-1 approval is required for export and import. **Why it matters:** the "exit" guarantee is structural only when the operator can verify that the whole bundle imports without silent loss.
 
-*Status: shipped. ASSURANCE_MATRIX row "Export / exit bundle" is proven. Adds `sanctuary exit inspect <dir>`: a read-only report of what a bundle carries and which credential it DECLARES it needs, so an operator can tell whether the key in their hand is the right KIND of key without running an import. It never opens a fortress, never asks for a passphrase, never writes, and deliberately makes no claim that any import will succeed; its `credential check:` line prints, on every path, exactly what was and was not checked.*
+*Status: partial. ASSURANCE_MATRIX row "Export / exit bundle" is partial until **IC-07, IC-08, IC-09** are fixed (`docs/audit/inert-capability-register.md`). `sanctuary exit inspect <dir>` is a read-only report of what a bundle carries and which credential it DECLARES it needs, so an operator can tell whether the key in their hand is the right KIND of key without running an import. It never opens a fortress, never asks for a passphrase, never writes, and deliberately makes no claim that any import will succeed; its `credential check:` line prints, on every path, exactly what was and was not checked.*
 
 ### Local multi-agent coordination and Sovereignty Dashboard
 
@@ -100,7 +100,7 @@ Wrap many agents on one machine. Coordinate workflows across them with handoff v
 
 ### Fleet licensing and node-count enforcement (the first commercial tier)
 
-Cross-machine federation is proven on real hardware (N=3) with signed policy distribution, and the fleet layer now issues and verifies licenses locally and enforces the licensed node count on the daemon roster, failing safe to the free Community tier. Durable-count reboot survival drilled (3/3). Single-operator and individual-developer use is always free; the commercial tier only ever prices team and fleet scale. **Why it matters:** the operator-substrate model (versus the vendor-substrate model) scales across the operator's hardware, not across a vendor's network, and the free line stays generous by design.
+Cross-machine federation has hardware drill evidence recorded on the roadmap with signed policy distribution, but it does not yet have a dedicated Assurance Matrix row. The fleet layer issues and verifies licenses locally and enforces the licensed node count on the daemon roster, failing safe to the free Community tier. Durable-count reboot survival drilled (3/3). Single-operator and individual-developer use is always free; the commercial tier only ever prices team and fleet scale. **Why it matters:** the operator-substrate model (versus the vendor-substrate model) scales across the operator's hardware, not across a vendor's network, and the free line stays generous by design.
 
 *Status: licensing and enforcement core shipped. Next slices: the enrollment "Add Machine" flow and signed compliance-attestation export.*
 
@@ -129,7 +129,7 @@ Cross-machine federation is proven on real hardware (N=3) with signed policy dis
 
 ### Concordia and Verascore composition (optional, default off)
 
-Concordia adds structured negotiation between agents with binding commitments and signed session transcripts. Verascore adds portable agent reputation. Both compose with Sanctuary's audit chain but neither is required. **Why it matters:** Sanctuary's non-dependency principle is structural: each component ships, runs, and wins on its own. Composition is power, not coupling.
+Concordia adds structured negotiation between agents with binding commitments and signed session transcripts. Verascore adds portable agent reputation. Both compose with Sanctuary's audit chain but neither is required. **Why it matters:** Sanctuary's non-dependency principle is structural: each component ships, runs, and wins on its own. Composition adds power without coupling.
 
 *Status: composition surfaces shipped; both compositions optional.*
 
@@ -143,7 +143,7 @@ Concrete, scoped, on the engineering path. Each item has named decision artifact
 
 #### Per-flow, rule-attributed, signed audit for the wall (the named gap)
 
-Today the macOS wall enforces and a per-rule read-out exists, but the unforgeable, producer-signed, per-flow audit trail is not wired. This build converts "the wall blocked it" into "this rule blocked this flow, provably, in a record nobody can edit," which is what a security operations console needs to consume enforcement as evidence. **Why it matters:** it is the honest gap named on the Assurance Matrix row, and closing it upgrades every enforcement claim from demonstration to per-decision evidence.
+Today the macOS wall enforces and a per-rule read-out exists, but the unforgeable, producer-signed, per-flow audit trail is not wired. This build converts "the wall blocked it" into "this rule blocked this flow, provably, in a tamper-evident record," which is what a security operations console needs to consume enforcement as evidence. **Why it matters:** it is the honest gap named on the Assurance Matrix row, and closing it upgrades every enforcement claim from demonstration to per-decision evidence.
 
 *Status: the three macOS pieces (producer-key mint+publish, full-mode daemon producer-signing, and the `castle-wall audit-verify` reader CLI verb with forged-entry rejection) are built and pass the full local gate (lint, typecheck, 10k+ tests) on a branch rebased onto current main; still HALTed pending Erik security-core review and a signed-host engage drill where producer signing actually fires on real flows (N>=3). Built is not yet drilled, and this does not widen the Assurance Matrix row.*
 
@@ -151,7 +151,7 @@ Today the macOS wall enforces and a per-rule read-out exists, but the unforgeabl
 
 #### Castle Wall on Windows
 
-Windows Filtering Platform backend. Same drill discipline as Linux Phase 1 and macOS. **Why it matters:** Windows operators get the same kernel-level enforcement everyone else has. Sequenced after the macOS discipline held end to end so the cross-platform bar stays consistent.
+Windows Filtering Platform backend. Same drill discipline as macOS. **Why it matters:** Windows operators get kernel-level enforcement held to the macOS bar, which is the only platform where the shipped artifact enforces today; Linux is `not_implemented` until **IC-02, IC-03, IC-04** are fixed (`docs/audit/inert-capability-register.md`). Sequenced after the macOS discipline held end to end so the cross-platform bar stays consistent.
 
 *Status: planning.*
 
@@ -189,7 +189,7 @@ Operator sees which security features actually fired today, with per-plugin attr
 
 Your agent's working data, query history, document corpus, and intermediate state live on your substrate, not in a vendor's silo. In the physical world, your body holds your memory; in the agent world, your substrate has to. **Why it matters:** the "your data" claim is structural only if the operator's working data actually lives where the operator controls it.
 
-*Status: core shipped (#420, #421, #422, #435, #436, #438, #440, #449): working-state, query-history, and document-corpus stores; enforced cannot-persist-secrets write gate; provenance-derived taint; blind query-history timestamps; approval-bound signed export/import. Remaining: the OSS memory-engine backend adapter (Letta first) and the PAM conformance profile.*
+*Status: core shipped (#420, #421, #422, #435, #436, #438, #440, #449): working-state, query-history, and document-corpus stores; enforced cannot-persist-secrets write gate; provenance-derived taint; blind query-history timestamps. The vault export/import claim is not shipped: no exposed `sdw_export` surface exists in the shipped bundle, violating the project MUST-NEVER rule that persisted agent output be inspectable, exportable, and deletable. Open defect: **IC-15** (`docs/audit/inert-capability-register.md`). Remaining: shipping vault export, the OSS memory-engine backend adapter (Letta first), and the PAM conformance profile.*
 
 #### Query-layer anonymity Tier 3
 
@@ -215,7 +215,7 @@ Scoped and acknowledged, but without a near-term timeline. Each item ships when 
 - **Recognition layer expansions (ERC-8004 + DIF KYA-OS).** Path C `did:web` builds 1-4 shipped; Paths A and B planning. Composable adapter surfaces for on-chain reputation registries and decentralized-identity verifiable credentials.
 - **PWA mobile companion.** Your phone as approval surface, alert surface, and emergency brake. The first slice ships now: an installable, mobile-first web app that lists your agents' pending approvals and lets you allow or deny each one from your phone, authenticated with your operator token over the same secured API the desktop dashboard uses (the app holds no data of its own, and the token never leaves your device). Still on the horizon: push notifications via Web Push, biometric unlock via WebAuthn and passkeys, QR pairing from the desktop dashboard, and a one-tap emergency brake.
 - **Post-quantum completion.** Hybrid Ed25519 + ML-DSA signing has landed (see the identity section above); ML-KEM (FIPS 203) key-establishment surfaces and the remaining migration steps follow on the same crypto-agility path.
-- **EU AI Act compliance pack and NIST AI RMF alignment.** Article 50 transparency primitives surfaced to the operator; operator-facing compliance generator; documentation aligning Sanctuary to NIST AI RMF controls. First-mile (signed audit, signed receipts, signed-event envelopes) AND the bundle generator with coverage matrix and CLI are shipped (`server/src/compliance/eu_ai_act/`); the full productized pack and NIST alignment docs ship when regulated-industry pilot demand materializes.
+- **EU AI Act compliance pack and NIST AI RMF alignment.** Article 50 transparency primitives surfaced to the operator; operator-facing compliance generator; documentation aligning Sanctuary to NIST AI RMF controls. First-mile hash-chained audit, signed receipts, signed-event envelopes, and the bundle generator with coverage matrix and CLI are shipped (`server/src/compliance/eu_ai_act/`); production audit checkpoints are currently unsigned until **IC-05** closes, and `audit-chain verify --no-strict` can return PASS with findings until **IC-06** closes. The full productized pack and NIST alignment docs ship when regulated-industry pilot demand materializes.
 - **Operator-cloud deployment mode.** Sanctuary running in the operator's own GCP / Azure / AWS account with operator-approved scoped node custody. The provider is inside the node runtime trust boundary until sovereign TEE mode is verified by hardware attestation. Prosumer / small-business deployment path.
 - **Sovereign-managed TEE.** Trusted Execution Environment with hardware-backed remote attestation (Intel TDX, AMD SEV-SNP, ARM CCA). Sanctuary operates the hardware; the hardware proves to the operator's console that even Sanctuary cannot see inside. Highest-assurance deployment.
 - **Fleet console expansions.** The licensing and node-count enforcement core is shipped (see the fleet section above); multi-operator-estate management for organizations ships as organizational-scale customers materialize.
@@ -246,7 +246,7 @@ Sanctuary engages standards bodies to land operator-controlled primitives as ope
 
 ## Non-dependency and composition posture
 
-Sanctuary never requires Concordia. Concordia never requires Sanctuary. Composition with external frameworks is always optional and default off. The framework alone, with no external dependency of any kind, is a fully operational local security harness with structural enforcement at the Castle Wall.
+Sanctuary never requires Concordia. Concordia never requires Sanctuary. Composition with external frameworks is always optional and default off. The framework alone, with no external dependency of any kind, is a local security harness with policy gates, local custody, and macOS Castle Wall enforcement when the signed wall is installed and armed. Linux is `not_implemented` and Windows is roadmap.
 
 Composition partners are named as partners: Coinbase x402, Google AP2, Anthropic MCP, Hermes A2A, Concordia Protocol, Verascore, ERC-8004 ecosystem, and peers in the agent-interop space.
 

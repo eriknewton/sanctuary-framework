@@ -27,6 +27,7 @@ function report(fixtures: Array<{ name: string; passed: boolean }>): CoverageRep
       total_rows: 1,
       rows_with_fixtures: fixtures.length > 0 ? 1 : 0,
       rows_no_fixture: fixtures.length > 0 ? 0 : 1,
+      rows_not_implemented: 0,
       rows_failing: fixturesFailed > 0 ? 1 : 0,
     },
   };

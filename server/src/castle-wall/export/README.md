@@ -6,8 +6,9 @@ consume, and delivers it either locally (default, no network) or, behind an
 explicit opt-in + a pinned destination + a Tier-1 approval, as an outbound push
 to an HTTP collector (for example a Palo Alto Cortex XSIAM content pack).
 
-The story it enables: **the wall enforces on the host; the console sees every
-denial.**
+The story it enables when the upstream audit emission path is healthy: **the wall enforces on the
+host; the console consumes exported denial metadata.** This exporter does not prove every denial is
+visible because the per-flow producer-signed audit trail still has a confirmed emission-stall gap.
 
 ## What LEAVES the host (metadata only, closed schema)
 
@@ -16,7 +17,8 @@ nothing else. The mapping in `map.ts` constructs every event field-by-field from
 an explicit allowlist and **never** spreads or serializes the raw audit
 `details` object. Three closed event classes:
 
-1. **`egress_decision`** - a rule-attributed allow/deny:
+1. **`egress_decision`** - an exported allow/deny record when the source audit row carries verified
+   rule attribution:
    `timestamp`, `decision` (coarse `allow`/`deny`), `destination_host`,
    `destination_ip`, `destination_port`, `destination_protocol`, `rule_id`,
    `agent_id` (the operator-facing agent id, e.g. `claude-code-1`),
@@ -101,7 +103,7 @@ retry (`reset()`) discards the partial pass.
   event identity).
   - **Tamper-authenticated (this was the one un-authenticated link).** A run used
     to trust any well-formed cursor, so a poisoned high cursor (`999999999`) made
-    it forward ZERO events, advance nothing, and emit NOTHING — the off-box console
+    it forward ZERO events, advance nothing, and emit NOTHING - the off-box console
     silently went blind. Now the record is **MAC'd with a purpose key derived from
     the fortress master key** (the SAME construction the audit rotation/head anchors
     use) and **bound to the chain identity** via the `entry_hash` at the cursor
@@ -111,7 +113,7 @@ retry (`reset()`) discards the partial pass.
     failure is **fail-LOUD**: an `_cursor_reset` audit record (`failure`) + a stderr
     warning, then a re-scan from the start (re-send, never a silent zero-forward,
     never a skip). A legacy (v1, un-MAC'd) or unreadable (non-ENOENT) cursor is
-    treated the same way — discarded loudly, never silently trusted or silently
+    treated the same way - discarded loudly, never silently trusted or silently
     reset.
 - **Bounded retry, still fail closed**: a transient sink failure is retried up to
   a bounded budget with backoff. The retried payload is the SAME already-mapped
@@ -143,6 +145,7 @@ retry (`reset()`) discards the partial pass.
 ## Provenance
 
 The events are read from the tamper-evident, hash-chained encrypted audit log,
-and Castle Wall events are producer-signed at source
-(`sanctuary.castle-wall.audit-producer.v1`). The exported stream is therefore
-tamper-evident at the source - a claim a generic log forwarder cannot make.
+and Castle Wall events are producer-signed at source only when the upstream
+producer-signing path fires. The exported stream is source-verifiable for rows
+that carry verified producer evidence; it does not close the per-flow emission
+stall or unsigned-production-checkpoint gaps.

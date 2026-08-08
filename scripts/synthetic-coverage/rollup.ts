@@ -19,7 +19,10 @@ export interface GateArtifact {
 export interface ClaimRowSummary {
   row_id: string;
   label: string;
-  assurance_status: "proven" | "partial" | "planned" | "unknown";
+  // Reuse the parser's union rather than re-listing the tokens: a hand-mirrored
+  // copy here silently narrowed the rollup when the matrix gained a status.
+  // Must match `AssuranceStatus` in assurance-matrix.ts.
+  assurance_status: CoverageRow["assurance_status"];
   linux_fixtures: number;
   macos_fixtures: number;
   coverage_state_linux: string;
@@ -33,6 +36,7 @@ export interface GapEntry {
     | "proven_without_fixture"
     | "partial_fixture_only"
     | "documented_intentional_gap"
+    | "not_implemented"
     | "planned_not_yet_covered";
   blocking_for_gate: boolean;
 }
@@ -131,6 +135,15 @@ function gapForRow(row: ClaimRowSummary): GapEntry | undefined {
       row_id: row.row_id,
       label: row.label,
       reason: "documented_intentional_gap",
+      blocking_for_gate: false,
+    };
+  }
+
+  if (row.assurance_status === "not_implemented") {
+    return {
+      row_id: row.row_id,
+      label: row.label,
+      reason: "not_implemented",
       blocking_for_gate: false,
     };
   }

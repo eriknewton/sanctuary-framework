@@ -14,7 +14,7 @@ claims_era_note: true
 
 # Sanctuary for Claude Managed Agents: Quickstart
 
-You've deployed a Managed Agent. Now secure it with cryptographic identity, audit trails, and policy enforcement. Sanctuary Framework v0.7.0 adds 68 tools for security, privacy, and control, published today as an MCP server.
+You've deployed a Managed Agent. Now secure it with cryptographic identity, audit trails, and policy enforcement. Sanctuary Framework v0.7.0 added a smaller tool surface when this post was published; current releases expose 80+ tools.
 
 ## Add Sanctuary in 30 Seconds
 
@@ -38,10 +38,10 @@ Deploy the agent. Sanctuary tools load automatically via MCP.
 ## What Sanctuary Gives You
 
 - **Sovereign Identity**: Ed25519 cryptographic keypair + W3C DID per agent instance
-- **Encrypted Audit Trail**: Tamper-proof CEF/OCSF logs; selective disclosure via zero-knowledge attestations
+- **Encrypted Audit Trail**: Tamper-evident hash-chained logs; production audit checkpoints are currently unsigned until **IC-05** closes, and `audit-chain verify --no-strict` can return PASS with findings until **IC-06** closes; selective disclosure via zero-knowledge attestations
 - **Principal Policy**: Tiered role-based access control (RBAC) with time-locked capabilities
 - **SIEM Export**: Push audit events to any SIEM (Datadog, Splunk, Chronicle)
-- **Sovereignty Health Reports**: Real-time dashboard of identity status, policy compliance, audit integrity
+- **Sovereignty Health Reports**: Current dashboard of identity status, policy compliance, audit integrity
 - **Reputation Publishing**: Cryptographic proof of track record via Verascore
 
 ## Before vs. After
@@ -49,14 +49,14 @@ Deploy the agent. Sanctuary tools load automatically via MCP.
 | Aspect | Without Sanctuary | With Sanctuary |
 |--------|------------------|----------------|
 | Identity | Implicit (cloud-managed) | Explicit (agent-owned Ed25519 keypair) |
-| Audit | Default logging | Encrypted, tamper-evident, SIEM-ready |
+| Audit | Default logging | Encrypted, tamper-evident hash-chained logs; production audit checkpoints are currently unsigned until **IC-05** closes, and `audit-chain verify --no-strict` can return PASS with findings until **IC-06** closes; SIEM-ready |
 | Policy | Platform-level (static) | Principal-level (dynamic, time-locked) |
 | Disclosure | All-or-nothing | Selective (ZK attestations) |
 | Reputation | Opaque | Verifiable via Verascore |
 
 ## Verify Sanctuary is Ready
 
-Call the `manifest` tool from your agent logic. If you see 68 tools listed, Sanctuary is active:
+Call the `manifest` tool from your agent logic. If you see the Sanctuary tool surface listed, Sanctuary is active. Current releases expose 80+ tools:
 
 ```python
 # Verify Sanctuary tools are available

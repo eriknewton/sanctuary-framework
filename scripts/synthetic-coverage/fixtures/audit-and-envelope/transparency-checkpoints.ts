@@ -23,7 +23,7 @@ import {
 
 const CLAIM_ID = "22";
 const CLAIM_LABEL =
-  "Verifiable transparency checkpoints (signed enforcement evidence)";
+  "Verifiable transparency checkpoint format and offline verifier";
 
 const IDENTITY_ENCRYPTION_KEY = derivePurposeKey(
   new Uint8Array(32).fill(7),

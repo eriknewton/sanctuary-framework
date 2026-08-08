@@ -65,7 +65,7 @@ npx @sanctuary-framework/mcp-server
 
 Run `sanctuary/sovereignty_audit` on your agent's environment. Run `sanctuary/context_gate_set_policy` to define what's allowed to leave your sovereignty boundary. The next incident won't wait for you to update your `.npmignore`.
 
-Source: [github.com/eriknewton/sanctuary-framework](https://github.com/eriknewton/sanctuary-framework). 51 MCP tools. 420 tests. Apache-2.0.
+Source: [github.com/eriknewton/sanctuary-framework](https://github.com/eriknewton/sanctuary-framework). Current releases expose 80+ MCP tools. Apache-2.0.
 
 ---
 

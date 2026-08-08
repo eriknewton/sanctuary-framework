@@ -24,28 +24,28 @@ description: Row-by-row mapping from Sanctuary primitives to Regulation (EU) 202
 | **Manual only** (Sanctuary has no visibility; enterprise authors in full) | 17 | 37% |
 | **Total** | 46 | 100% |
 
-### The 5 full rows (load-bearing spine)
+### The 5 full rows (core spine)
 
-Every "full" row was individually verified against source. The audit-log rows (Article 12(1) and Article 15(5) first subparagraph) were re-verified against the current tree (server package v1.6.1) on 2026-07-05 to reflect the tamper-evident audit-chain hardening (PR #274 and follow-ups #290, #320, #396, #461, #501); the remaining rows carry their original 2026-04-10 verification against v0.7.0 source. See per-row review_notes for verification findings and any corrections applied. If a claim of "full coverage" on any other row appears in a downstream document, the matrix has drifted and needs re-verification.
+Every "full" row was individually verified against source. The audit-log rows (Article 12(1) and Article 15(5) first subparagraph) were re-verified against the current tree (server package v1.6.1) on 2026-07-05 to reflect the tamper-evident audit-chain hardening (PR #274 and follow-ups #290, #320, #396, #461, #501); checkpoint-signing and false-PASS verifier bounds remain tracked in **IC-05, IC-06** (`docs/audit/inert-capability-register.md`). The remaining rows carry their original 2026-04-10 verification against v0.7.0 source. See per-row review_notes for verification findings and any corrections applied. If a claim of "full coverage" on any other row appears in a downstream document, the matrix has drifted and needs re-verification.
 
-1. **Annex IV §2(h)** — Cybersecurity measures
-2. **Article 12(1)** — Automatic logging of events over lifetime
-3. **Article 12(2)(a)** — Logs enable identification of Article 79(1) risks
-4. **Article 12(2)(b)** — Logs facilitate monitoring operation per Article 26(5)
-5. **Article 15(5) first subparagraph** — Resilience against unauthorised third-party alteration
+1. **Annex IV §2(h)** - Cybersecurity measures
+2. **Article 12(1)** - Automatic logging of events over lifetime
+3. **Article 12(2)(a)** - Logs enable identification of Article 79(1) risks
+4. **Article 12(2)(b)** - Logs facilitate monitoring operation per Article 26(5)
+5. **Article 15(5) first subparagraph** - Resilience against unauthorised third-party alteration
 
 ### Notes
 
 - Matrix v1 is aligned to the OJ-published text of Regulation (EU) 2024/1689. It does not yet reflect any implementing acts or delegated acts that the European Commission may publish before the 2026-08-02 enforcement date. Review the `next_review_due` field and bump regulation_version whenever the aligned text changes.
 - Verbatim regulation text uses [...] elisions for length; text is never paraphrased. Clause identifiers (clause_id) are separately queryable so templates can render citations without parsing the verbatim quotes.
-- Every 'full' row was individually verified against source. The audit-log rows (Article 12(1), Article 15(5) first subparagraph) were re-verified against the current tree (server package v1.6.1) on 2026-07-05 to reflect the tamper-evident audit-chain hardening (PR #274 and follow-ups #290, #320, #396, #461, #501). The remaining rows carry their original 2026-04-10 verification against v0.7.0 source. See per-row review_notes for verification findings and any corrections applied.
+- Every 'full' row was individually verified against source. The audit-log rows (Article 12(1), Article 15(5) first subparagraph) were re-verified against the current tree (server package v1.6.1) on 2026-07-05 to reflect the tamper-evident audit-chain hardening (PR #274 and follow-ups #290, #320, #396, #461, #501). Checkpoint-signing and false-PASS verifier bounds remain tracked in **IC-05, IC-06** (`docs/audit/inert-capability-register.md`). The remaining rows carry their original 2026-04-10 verification against v0.7.0 source. See per-row review_notes for verification findings and any corrections applied.
 - NOT LEGAL ADVICE. This matrix is a technical mapping from Sanctuary primitives to regulation clause identifiers; it is not a legal interpretation of the EU AI Act.
 
 ---
 
 ## Row-by-row mapping
 
-### Annex IV §1(a) — General description: intended purpose, provider, version
+### Annex IV §1(a) - General description: intended purpose, provider, version
 
 - **Row ID:** `annex_iv_1_a_general_description`
 - **Clause ID:** `annex-iv-1-a`
@@ -72,7 +72,7 @@ Partial is honest here: Sanctuary can emit a cryptographic provider identity and
 
 ---
 
-### Annex IV §1(b) — Interaction with external hardware or software
+### Annex IV §1(b) - Interaction with external hardware or software
 
 - **Row ID:** `annex_iv_1_b_hardware_software_interaction`
 - **Clause ID:** `annex-iv-1-b`
@@ -99,7 +99,7 @@ Sanctuary genuinely covers ~60% of this row when model_provenance is populated b
 
 ---
 
-### Annex IV §1(c) — Versions of relevant software and firmware
+### Annex IV §1(c) - Versions of relevant software and firmware
 
 - **Row ID:** `annex_iv_1_c_software_versions`
 - **Clause ID:** `annex-iv-1-c`
@@ -126,7 +126,7 @@ Downgraded from full during verification (2026-04-10). Sanctuary auto-emits its 
 
 ---
 
-### Annex IV §1(d) — Forms in which the system is placed on the market
+### Annex IV §1(d) - Forms in which the system is placed on the market
 
 - **Row ID:** `annex_iv_1_d_forms_on_market`
 - **Clause ID:** `annex-iv-1-d`
@@ -141,7 +141,7 @@ Downgraded from full during verification (2026-04-10). Sanctuary auto-emits its 
 
 [MANUAL INPUT REQUIRED: forms in which the AI system is placed on the market or put into service].
 
-**Evidence emitter tools:** _(none — this row is manual_only)_
+**Evidence emitter tools:** _(none - this row is manual_only)_
 
 **Enterprise input required:**
 
@@ -149,11 +149,11 @@ Sanctuary is a runtime sovereignty layer and has no visibility into the commerci
 
 **Review notes:**
 
-Structural manual row — commercial distribution is not a Sanctuary concern and will not become one.
+Structural manual row - commercial distribution is not a Sanctuary concern and will not become one.
 
 ---
 
-### Annex IV §1(e) — Description of the hardware on which the system runs
+### Annex IV §1(e) - Description of the hardware on which the system runs
 
 - **Row ID:** `annex_iv_1_e_hardware_description`
 - **Clause ID:** `annex-iv-1-e`
@@ -176,11 +176,11 @@ Production hardware specifications, TEE attestation evidence from the actual dep
 
 **Review notes:**
 
-In local-process mode Sanctuary emits tee_available=false, which is honest but incomplete — production may run on TEE-capable hardware that Sanctuary does not detect. SHR degradation NO_TEE is flagged automatically.
+In local-process mode Sanctuary emits tee_available=false, which is honest but incomplete - production may run on TEE-capable hardware that Sanctuary does not detect. SHR degradation NO_TEE is flagged automatically.
 
 ---
 
-### Annex IV §1(f) — Basic description of the user interface
+### Annex IV §1(f) - Basic description of the user interface
 
 - **Row ID:** `annex_iv_1_f_instructions_of_use`
 - **Clause ID:** `annex-iv-1-f`
@@ -195,7 +195,7 @@ In local-process mode Sanctuary emits tee_available=false, which is honest but i
 
 [MANUAL INPUT REQUIRED: description of the user interface provided to the deployer].
 
-**Evidence emitter tools:** _(none — this row is manual_only)_
+**Evidence emitter tools:** _(none - this row is manual_only)_
 
 **Enterprise input required:**
 
@@ -207,7 +207,7 @@ Structural manual row.
 
 ---
 
-### Annex IV §2(a) — Methods and steps performed for development
+### Annex IV §2(a) - Methods and steps performed for development
 
 - **Row ID:** `annex_iv_2_a_development_methods`
 - **Clause ID:** `annex-iv-2-a`
@@ -222,7 +222,7 @@ Structural manual row.
 
 [MANUAL INPUT REQUIRED: development methodology, design iterations, training procedures, validation steps].
 
-**Evidence emitter tools:** _(none — this row is manual_only)_
+**Evidence emitter tools:** _(none - this row is manual_only)_
 
 **Enterprise input required:**
 
@@ -230,11 +230,11 @@ Sanctuary is a runtime sovereignty layer and is not involved in model developmen
 
 **Review notes:**
 
-Structural manual row — model development is outside Sanctuary's architectural scope.
+Structural manual row - model development is outside Sanctuary's architectural scope.
 
 ---
 
-### Annex IV §2(b) — Design specifications and key design choices
+### Annex IV §2(b) - Design specifications and key design choices
 
 - **Row ID:** `annex_iv_2_b_design_specifications`
 - **Clause ID:** `annex-iv-2-b`
@@ -257,11 +257,11 @@ Agent-level business logic, decision algorithms, the rationale for key design ch
 
 **Review notes:**
 
-Borderline partial — Sanctuary emits the policy and gating specifications as structured data, but 'key design choices including rationale' is inherently a narrative field that requires enterprise authorship. Kept partial deliberately.
+Borderline partial - Sanctuary emits the policy and gating specifications as structured data, but 'key design choices including rationale' is inherently a narrative field that requires enterprise authorship. Kept partial deliberately.
 
 ---
 
-### Annex IV §2(c) — Description of system architecture
+### Annex IV §2(c) - Description of system architecture
 
 - **Row ID:** `annex_iv_2_c_system_architecture`
 - **Clause ID:** `annex-iv-2-c`
@@ -284,11 +284,11 @@ Agent-level architecture (LLM orchestration, prompt templates, tool-use loops), 
 
 **Review notes:**
 
-Borderline partial — Sanctuary emits a complete architectural description of its own layer but this row requires the architecture of the AI system as a whole. Enterprise wraps the Sanctuary layer in a broader architecture narrative.
+Borderline partial - Sanctuary emits a complete architectural description of its own layer but this row requires the architecture of the AI system as a whole. Enterprise wraps the Sanctuary layer in a broader architecture narrative.
 
 ---
 
-### Annex IV §2(d) — Data requirements: training data datasheets
+### Annex IV §2(d) - Data requirements: training data datasheets
 
 - **Row ID:** `annex_iv_2_d_data_requirements`
 - **Clause ID:** `annex-iv-2-d`
@@ -303,7 +303,7 @@ Borderline partial — Sanctuary emits a complete architectural description of i
 
 [MANUAL INPUT REQUIRED: training data description, provenance, scope, labelling, cleaning, and governance].
 
-**Evidence emitter tools:** _(none — this row is manual_only)_
+**Evidence emitter tools:** _(none - this row is manual_only)_
 
 **Enterprise input required:**
 
@@ -315,7 +315,7 @@ Classification is structurally stable across EU AI Act revisions.
 
 ---
 
-### Annex IV §2(e) — Assessment of human oversight measures per Article 14
+### Annex IV §2(e) - Assessment of human oversight measures per Article 14
 
 - **Row ID:** `annex_iv_2_e_human_oversight_assessment`
 - **Clause ID:** `annex-iv-2-e`
@@ -342,7 +342,7 @@ Borderline partial. Sanctuary provides the oversight mechanism inventory with ze
 
 ---
 
-### Annex IV §2(f) — Pre-determined changes to the system and performance
+### Annex IV §2(f) - Pre-determined changes to the system and performance
 
 - **Row ID:** `annex_iv_2_f_predetermined_changes`
 - **Clause ID:** `annex-iv-2-f`
@@ -357,7 +357,7 @@ Borderline partial. Sanctuary provides the oversight mechanism inventory with ze
 
 [MANUAL INPUT REQUIRED: pre-determined changes to the AI system and its performance, if any].
 
-**Evidence emitter tools:** _(none — this row is manual_only)_
+**Evidence emitter tools:** _(none - this row is manual_only)_
 
 **Enterprise input required:**
 
@@ -369,7 +369,7 @@ Structural manual row.
 
 ---
 
-### Annex IV §2(g) — Validation and testing procedures, metrics
+### Annex IV §2(g) - Validation and testing procedures, metrics
 
 - **Row ID:** `annex_iv_2_g_validation_and_testing`
 - **Clause ID:** `annex-iv-2-g`
@@ -396,7 +396,7 @@ Sanctuary emits runtime operational evidence but does not participate in pre-dep
 
 ---
 
-### Annex IV §2(h) — Cybersecurity measures
+### Annex IV §2(h) - Cybersecurity measures
 
 - **Row ID:** `annex_iv_2_h_cybersecurity`
 - **Clause ID:** `annex-iv-2-h`
@@ -409,21 +409,21 @@ Sanctuary emits runtime operational evidence but does not participate in pre-dep
 
 **Evidence emitted by Sanctuary:**
 
-Machine-verifiable inventory of Sanctuary's cybersecurity primitives, every item reproducible by running the listed tools against a live instance: (1) L1 Cognitive Sovereignty — AES-256-GCM namespace encryption with HKDF per-namespace key derivation, Argon2id master key derivation, Ed25519 self-custodied identity, Merkle integrity tracking; reported by sovereignty_audit and shr_generate under layers.l1. (2) L2 Operational Isolation — three-tier Principal Policy gate with out-of-band approval channel, tool-call audit logging, and denial-on-timeout semantics; reported by principal_policy_view and shr_generate under layers.l2. (3) L2 Outbound context gating — per-provider field policies classifying agent context as allow / redact / hash / summarize / deny before any outbound call; reported by context_gate_list_policies and context_gate_enforcer_status. (4) L3 Selective Disclosure — Pedersen commitments on Ristretto255, Schnorr proofs, and bit-decomposition range proofs; reported by sovereignty_audit and shr_generate under layers.l3. (5) L4 Verifiable Reputation — Ed25519-signed attestations in EAS-compatible format with sovereignty-gated trust tiers; reported by sovereignty_audit and shr_generate under layers.l4. (6) Execution attestation — cryptographic execution attestation via exec_attest. The full tool inventory of this Sanctuary instance is reproducible by running manifest.
+Machine-verifiable inventory of Sanctuary's cybersecurity primitives, every item reproducible by running the listed tools against a live instance: (1) L1 Cognitive Sovereignty - AES-256-GCM namespace encryption with HKDF per-namespace key derivation, Argon2id master key derivation, Ed25519 self-custodied identity, Merkle integrity tracking; reported by sovereignty_audit and shr_generate under layers.l1. (2) L2 Operational Isolation - three-tier Principal Policy gate with out-of-band approval channel, tool-call audit logging, and denial-on-timeout semantics; reported by principal_policy_view and shr_generate under layers.l2. (3) L2 Outbound context gating - per-provider field policies classifying agent context as allow / redact / hash / summarize / deny before any outbound call; reported by context_gate_list_policies and context_gate_enforcer_status. (4) L3 Selective Disclosure - Pedersen commitments on Ristretto255, Schnorr proofs, and bit-decomposition range proofs; reported by sovereignty_audit and shr_generate under layers.l3. (5) L4 Verifiable Reputation - Ed25519-signed attestations in EAS-compatible format with sovereignty-gated trust tiers; reported by sovereignty_audit and shr_generate under layers.l4. (6) Execution attestation - cryptographic execution attestation via exec_attest. The full tool inventory of this Sanctuary instance is reproducible by running manifest.
 
 **Evidence emitter tools:** `sovereignty_audit`, `shr_generate`, `manifest`, `principal_policy_view`, `context_gate_list_policies`, `context_gate_enforcer_status`, `exec_attest`
 
 **Enterprise input required:**
 
-_(none — this row is fully auto-emitted)_
+_(none - this row is fully auto-emitted)_
 
 **Review notes:**
 
-Verified against v0.7.0 source on 2026-04-10: every emitter in the array corresponds to a registered MCP tool in index.ts, and every primitive named in the prose is reported by at least one listed tool. DELIBERATELY EXCLUDED: prompt injection detection. The InjectionDetector subsystem (server/src/security/injection-detector.ts) is wired into the Principal Policy gate and is a real runtime control, but in v0.7.0 its configuration state is not exposed via any MCP tool — it is only indirectly evidenced through `injection_detected:*` entries in the audit log (visible via monitor_audit_log / audit_export_siem). Claiming injection detection as part of this row's full coverage would require source-code inspection, which violates the full-coverage bar. Injection detection runtime activity is evidenced via the Art. 12 risk management support row instead. If v0.8.0+ adds an `injection_detector_status` MCP tool, revisit and add to this row.
+Verified against v0.7.0 source on 2026-04-10: every emitter in the array corresponds to a registered MCP tool in index.ts, and every primitive named in the prose is reported by at least one listed tool. DELIBERATELY EXCLUDED: prompt injection detection. The InjectionDetector subsystem (server/src/security/injection-detector.ts) is wired into the Principal Policy gate and is a real runtime control, but in v0.7.0 its configuration state is not exposed via any MCP tool - it is only indirectly evidenced through `injection_detected:*` entries in the audit log (visible via monitor_audit_log / audit_export_siem). Claiming injection detection as part of this row's full coverage would require source-code inspection, which violates the full-coverage bar. Injection detection runtime activity is evidenced via the Art. 12 risk management support row instead. If v0.8.0+ adds an `injection_detector_status` MCP tool, revisit and add to this row.
 
 ---
 
-### Annex IV §3 — Monitoring, functioning and control of the system
+### Annex IV §3 - Monitoring, functioning and control of the system
 
 - **Row ID:** `annex_iv_3_monitoring_functioning_control`
 - **Clause ID:** `annex-iv-3`
@@ -450,7 +450,7 @@ Sanctuary provides the monitoring substrate; the enterprise wraps it in operatio
 
 ---
 
-### Annex IV §4 — Appropriateness of performance metrics
+### Annex IV §4 - Appropriateness of performance metrics
 
 - **Row ID:** `annex_iv_4_performance_metrics`
 - **Clause ID:** `annex-iv-4`
@@ -465,7 +465,7 @@ Sanctuary provides the monitoring substrate; the enterprise wraps it in operatio
 
 [MANUAL INPUT REQUIRED: performance metrics and their appropriateness for the specific agent deployment].
 
-**Evidence emitter tools:** _(none — this row is manual_only)_
+**Evidence emitter tools:** _(none - this row is manual_only)_
 
 **Enterprise input required:**
 
@@ -477,7 +477,7 @@ Structural manual row.
 
 ---
 
-### Annex IV §5 — Risk management system per Article 9
+### Annex IV §5 - Risk management system per Article 9
 
 - **Row ID:** `annex_iv_5_risk_management`
 - **Clause ID:** `annex-iv-5`
@@ -504,7 +504,7 @@ Sanctuary emits runtime controls; enterprise maps them to an Article 9 risk mana
 
 ---
 
-### Annex IV §6 — Description of relevant changes made through lifecycle
+### Annex IV §6 - Description of relevant changes made through lifecycle
 
 - **Row ID:** `annex_iv_6_lifecycle_changes`
 - **Clause ID:** `annex-iv-6`
@@ -531,7 +531,7 @@ Sanctuary captures its own layer's change timeline; enterprise provides the broa
 
 ---
 
-### Annex IV §7 — Harmonised standards applied
+### Annex IV §7 - Harmonised standards applied
 
 - **Row ID:** `annex_iv_7_standards_applied`
 - **Clause ID:** `annex-iv-7`
@@ -546,7 +546,7 @@ Sanctuary captures its own layer's change timeline; enterprise provides the broa
 
 [MANUAL INPUT REQUIRED: list of harmonised standards applied, or description of alternative solutions].
 
-**Evidence emitter tools:** _(none — this row is manual_only)_
+**Evidence emitter tools:** _(none - this row is manual_only)_
 
 **Enterprise input required:**
 
@@ -554,11 +554,11 @@ Standards conformance is a legal declaration made by the provider. Sanctuary doe
 
 **Review notes:**
 
-Structural manual row — standards conformance is a provider legal declaration, not a Sanctuary primitive.
+Structural manual row - standards conformance is a provider legal declaration, not a Sanctuary primitive.
 
 ---
 
-### Annex IV §8 — Copy of the EU declaration of conformity
+### Annex IV §8 - Copy of the EU declaration of conformity
 
 - **Row ID:** `annex_iv_8_eu_declaration_of_conformity`
 - **Clause ID:** `annex-iv-8`
@@ -573,7 +573,7 @@ Structural manual row — standards conformance is a provider legal declaration,
 
 [MANUAL INPUT REQUIRED: EU declaration of conformity per Article 47].
 
-**Evidence emitter tools:** _(none — this row is manual_only)_
+**Evidence emitter tools:** _(none - this row is manual_only)_
 
 **Enterprise input required:**
 
@@ -581,11 +581,11 @@ The EU declaration of conformity is a formal legal document signed by the provid
 
 **Review notes:**
 
-Structural manual row — legal document only.
+Structural manual row - legal document only.
 
 ---
 
-### Annex IV §9 — Post-market monitoring plan per Article 72
+### Annex IV §9 - Post-market monitoring plan per Article 72
 
 - **Row ID:** `annex_iv_9_post_market_monitoring_plan`
 - **Clause ID:** `annex-iv-9`
@@ -600,7 +600,7 @@ Structural manual row — legal document only.
 
 [MANUAL INPUT REQUIRED: post-market monitoring plan per Article 72(3)].
 
-**Evidence emitter tools:** _(none — this row is manual_only)_
+**Evidence emitter tools:** _(none - this row is manual_only)_
 
 **Enterprise input required:**
 
@@ -612,7 +612,7 @@ See the Art. 12 post-market monitoring support row for Sanctuary's concrete cont
 
 ---
 
-### Article 12(1) — Automatic logging of events over lifetime
+### Article 12(1) - Automatic logging of events over lifetime
 
 - **Row ID:** `art_12_automatic_logging`
 - **Clause ID:** `art-12-1`
@@ -631,7 +631,7 @@ Every tool call in the Sanctuary runtime automatically produces an audit entry v
 
 **Enterprise input required:**
 
-_(none — this row is fully auto-emitted)_
+_(none - this row is fully auto-emitted)_
 
 **Review notes:**
 
@@ -639,7 +639,7 @@ Re-verified against the current tree (server package v1.6.1) on 2026-07-05. rout
 
 ---
 
-### Article 12(2)(a) — Logs enable identification of Article 79(1) risks
+### Article 12(2)(a) - Logs enable identification of Article 79(1) risks
 
 - **Row ID:** `art_12_post_market_monitoring_support`
 - **Clause ID:** `art-12-2-a`
@@ -658,7 +658,7 @@ The audit_export_siem tool exports audit log entries in two SIEM-standard format
 
 **Enterprise input required:**
 
-_(none — this row is fully auto-emitted)_
+_(none - this row is fully auto-emitted)_
 
 **Review notes:**
 
@@ -666,7 +666,7 @@ Verified against v0.7.0 source on 2026-04-10: audit/siem-tools.ts:18-77 register
 
 ---
 
-### Article 12(2)(b) — Logs facilitate monitoring operation per Article 26(5)
+### Article 12(2)(b) - Logs facilitate monitoring operation per Article 26(5)
 
 - **Row ID:** `art_12_risk_management_support`
 - **Clause ID:** `art-12-2-b`
@@ -685,7 +685,7 @@ Gate decisions are logged with structured operation prefixes (gate_allow:, gate_
 
 **Enterprise input required:**
 
-_(none — this row is fully auto-emitted)_
+_(none - this row is fully auto-emitted)_
 
 **Review notes:**
 
@@ -693,7 +693,7 @@ Verified against v0.7.0 source on 2026-04-10. gate.ts writes structured operatio
 
 ---
 
-### Article 12(3) — Required log content for Annex III §1(a) systems
+### Article 12(3) - Required log content for Annex III §1(a) systems
 
 - **Row ID:** `art_12_log_content`
 - **Clause ID:** `art-12-3`
@@ -712,7 +712,7 @@ Auto-filled where the agent routes through Sanctuary: period of use (audit log t
 
 **Enterprise input required:**
 
-Reference database identifier (the external database the agent queries) — only captured if the agent explicitly logs it to Sanctuary state. Natural-person verifier identification beyond the Sanctuary principal identity (e.g., the human operator's HR record or employee ID). Input data captured only when the agent passes it through a Sanctuary tool call.
+Reference database identifier (the external database the agent queries) - only captured if the agent explicitly logs it to Sanctuary state. Natural-person verifier identification beyond the Sanctuary principal identity (e.g., the human operator's HR record or employee ID). Input data captured only when the agent passes it through a Sanctuary tool call.
 
 **Review notes:**
 
@@ -720,7 +720,7 @@ Row applies only to Annex III §1(a) (biometric remote identification) systems. 
 
 ---
 
-### Article 19(1) — Log retention for at least six months
+### Article 19(1) - Log retention for at least six months
 
 - **Row ID:** `art_12_retention`
 - **Clause ID:** `art-19-1`
@@ -747,7 +747,7 @@ Note: this row cites Article 19(1) rather than Article 12: retention is specific
 
 ---
 
-### Article 13(3)(a) — Identity and contact details of the provider
+### Article 13(3)(a) - Identity and contact details of the provider
 
 - **Row ID:** `art_13_3_a_provider_identity`
 - **Clause ID:** `art-13-3-a`
@@ -760,7 +760,7 @@ Note: this row cites Article 19(1) rather than Article 12: retention is specific
 
 **Evidence emitted by Sanctuary:**
 
-Auto-filled: cryptographic provider identity — primary Ed25519 public key, DID, instance_id, and key creation timestamp via identity_list and identity_set_primary. The signed SHR carries the same identity in its signed_by field, providing a verifiable link between the provider identity and the capability assertions of the system.
+Auto-filled: cryptographic provider identity - primary Ed25519 public key, DID, instance_id, and key creation timestamp via identity_list and identity_set_primary. The signed SHR carries the same identity in its signed_by field, providing a verifiable link between the provider identity and the capability assertions of the system.
 
 **Evidence emitter tools:** `identity_list`, `identity_set_primary`, `shr_generate`
 
@@ -774,7 +774,7 @@ Sanctuary emits the cryptographic identity; the enterprise supplies the legal id
 
 ---
 
-### Article 13(3)(b)(ii) — Performance characteristics, capabilities and limitations
+### Article 13(3)(b)(ii) - Performance characteristics, capabilities and limitations
 
 - **Row ID:** `art_13_3_b_ii_capabilities_and_limitations`
 - **Clause ID:** `art-13-3-b-ii`
@@ -797,11 +797,11 @@ Agent-level accuracy metrics and their measurement methodology, false-positive a
 
 **Review notes:**
 
-Sanctuary's SHR is structurally a transparency artefact — it is designed to honestly declare capabilities and degradations. This row is where SHR data feeds user-facing disclosures.
+Sanctuary's SHR is structurally a transparency artefact - it is designed to honestly declare capabilities and degradations. This row is where SHR data feeds user-facing disclosures.
 
 ---
 
-### Article 13(3)(b)(iv) — Technical capabilities to interpret system output
+### Article 13(3)(b)(iv) - Technical capabilities to interpret system output
 
 - **Row ID:** `art_13_3_b_iv_output_interpretation`
 - **Clause ID:** `art-13-3-b-iv`
@@ -814,7 +814,7 @@ Sanctuary's SHR is structurally a transparency artefact — it is designed to ho
 
 **Evidence emitted by Sanctuary:**
 
-Auto-filled: signed SHR + tamper-evident, checkpoint-signed audit chain + Concordia bridge attestations (where used) give machine-readable provenance for every tool call the agent made during the reporting period. This enables output interpretation of the form 'this agent action came from these inputs at this time, cryptographically signed and independently verifiable.'
+Auto-filled: signed SHR + tamper-evident, hash-chained audit with checkpoint signatures only where a signer is wired + Concordia bridge attestations (where used) give machine-readable provenance for every tool call the agent made during the reporting period. Production audit checkpoints are currently unsigned until **IC-05** closes, and `audit-chain verify --no-strict` can return PASS with findings until **IC-06** closes. This enables output interpretation of the form 'this agent action came from these inputs at this time, cryptographically signed where a signer is present and independently verifiable.'
 
 **Evidence emitter tools:** `shr_generate`, `monitor_audit_log`, `audit_export_siem`, `bridge_verify`
 
@@ -828,7 +828,7 @@ Sanctuary provides the cryptographic substrate for output provenance; enterprise
 
 ---
 
-### Article 14(4)(a)-(c) — Oversight enables understanding and interpretation
+### Article 14(4)(a)-(c) - Oversight enables understanding and interpretation
 
 - **Row ID:** `art_14_interpret_outputs`
 - **Clause ID:** `art-14-4-a-c`
@@ -855,7 +855,7 @@ Sanctuary emits artefacts designed to be interpretable; the enterprise builds th
 
 ---
 
-### Article 14(4)(e) — Intervention, interruption, and stop button
+### Article 14(4)(e) - Intervention, interruption, and stop button
 
 - **Row ID:** `art_14_intervene_interrupt`
 - **Clause ID:** `art-14-4-e`
@@ -868,7 +868,7 @@ Sanctuary emits artefacts designed to be interpretable; the enterprise builds th
 
 **Evidence emitted by Sanctuary:**
 
-Auto-filled: Principal Policy approval channel configuration (stderr / dashboard / webhook), Tier 1 require-approval rule count, denial-on-timeout behaviour, and gate decision semantics. These collectively document Sanctuary's pre-execution intervention capability — every Tier 1 tool call is halted pending human approval.
+Auto-filled: Principal Policy approval channel configuration (stderr / dashboard / webhook), Tier 1 require-approval rule count, denial-on-timeout behaviour, and gate decision semantics. These collectively document Sanctuary's pre-execution intervention capability - every Tier 1 tool call is halted pending human approval.
 
 **Evidence emitter tools:** `principal_policy_view`, `sovereignty_audit`
 
@@ -882,7 +882,7 @@ Downgraded from full during audit (2026-04-10). Sanctuary's approval gate is a p
 
 ---
 
-### Article 14(4)(d) — Decide not to use or to disregard the output
+### Article 14(4)(d) - Decide not to use or to disregard the output
 
 - **Row ID:** `art_14_decide_not_to_use`
 - **Clause ID:** `art-14-4-d`
@@ -895,7 +895,7 @@ Downgraded from full during audit (2026-04-10). Sanctuary's approval gate is a p
 
 **Evidence emitted by Sanctuary:**
 
-Auto-filled: Principal Policy denial semantics — every Tier 1 operation defaults to deny on approval timeout, providing a structural 'decide not to use' control at the policy layer. Tier 1 tools include export, import, key rotation, and secure delete.
+Auto-filled: Principal Policy denial semantics - every Tier 1 operation defaults to deny on approval timeout, providing a structural 'decide not to use' control at the policy layer. Tier 1 tools include export, import, key rotation, and secure delete.
 
 **Evidence emitter tools:** `principal_policy_view`
 
@@ -909,7 +909,7 @@ Downgraded from full during audit (2026-04-10). Sanctuary provides the capabilit
 
 ---
 
-### Article 14(4) chapeau — Operator competence, training, and authority
+### Article 14(4) chapeau - Operator competence, training, and authority
 
 - **Row ID:** `art_14_operator_training`
 - **Clause ID:** `art-14-4-chapeau`
@@ -924,7 +924,7 @@ Downgraded from full during audit (2026-04-10). Sanctuary provides the capabilit
 
 [MANUAL INPUT REQUIRED: operator identities, roles, competence, training program, and authority to override].
 
-**Evidence emitter tools:** _(none — this row is manual_only)_
+**Evidence emitter tools:** _(none - this row is manual_only)_
 
 **Enterprise input required:**
 
@@ -932,11 +932,11 @@ People-and-process facts that Sanctuary cannot observe or emit.
 
 **Review notes:**
 
-Structural manual row — operator governance is an HR function.
+Structural manual row - operator governance is an HR function.
 
 ---
 
-### Article 15(5) — Cybersecurity measures appropriate to the risks
+### Article 15(5) - Cybersecurity measures appropriate to the risks
 
 - **Row ID:** `art_15_cybersecurity_appropriate`
 - **Clause ID:** `art-15-5`
@@ -959,11 +959,11 @@ Appropriateness assertion: the enterprise must declare that the Sanctuary-report
 
 **Review notes:**
 
-Downgraded from full during audit (2026-04-10). Art. 15(5) requires measures 'appropriate to the risks' — the appropriateness claim is a risk-matched narrative the enterprise owns. The pure-description version survives as a full row at Annex IV §2(h); this row is the risk-adequacy half of the same content.
+Downgraded from full during audit (2026-04-10). Art. 15(5) requires measures 'appropriate to the risks' - the appropriateness claim is a risk-matched narrative the enterprise owns. The pure-description version survives as a full row at Annex IV §2(h); this row is the risk-adequacy half of the same content.
 
 ---
 
-### Article 15(5) first subparagraph — Resilience against unauthorised third-party alteration
+### Article 15(5) first subparagraph - Resilience against unauthorised third-party alteration
 
 - **Row ID:** `art_15_resilience_alteration`
 - **Clause ID:** `art-15-5-resilience`
@@ -976,13 +976,13 @@ Downgraded from full during audit (2026-04-10). Art. 15(5) requires measures 'ap
 
 **Evidence emitted by Sanctuary:**
 
-Resilience against unauthorised third-party alteration is enforced across multiple subsystems, each independently verifiable via an MCP tool call: (1) L1 state store — AES-256-GCM authenticated encryption with HKDF per-namespace keys, Merkle root per namespace, monotonic version counter per (namespace, key), and anti-rollback checks on every read; reported by monitor_health (state_integrity flag) and via version numbers returned by state_list. (2) L1 audit log — AES-256-GCM authenticated ciphertext persisted under an HKDF-derived audit-log key, linked into a tamper-evident hash chain (per-entry sequence plus prev_hash plus entry_hash), with periodic checkpoint records carrying a SHA-256 root over the covered entry hashes, Ed25519-signed when a signing identity is available; a rotation anchor authenticated by a master-derived MAC makes a truncation or prune of the tail detectable. Reported by monitor_health and the audit-chain verifier; integrity findings surface as a P1 anomaly. (See review_notes for the exact non-repudiation bound.) (3) L1 identity — Ed25519 self-custodied keypairs; signed identity operations (sign, rotate, verify) and signed SHR generation; reported by shr_generate signature block. (4) L2 execution gate — every tool call routed through router.ts -> ApprovalGate.evaluate() -> Principal Policy tier check before execution; no bypass path; reported by principal_policy_view and the audit log trail of gate_* entries. (5) L2 outbound context gating — per-provider field policies applied before any outbound call; reported by context_gate_enforcer_status.
+Resilience against unauthorised third-party alteration is enforced across multiple subsystems, each independently verifiable via an MCP tool call: (1) L1 state store - AES-256-GCM authenticated encryption with HKDF per-namespace keys, Merkle root per namespace, monotonic version counter per (namespace, key), and anti-rollback checks on every read; reported by monitor_health (state_integrity flag) and via version numbers returned by state_list. (2) L1 audit log - AES-256-GCM authenticated ciphertext persisted under an HKDF-derived audit-log key, linked into a tamper-evident hash chain (per-entry sequence plus prev_hash plus entry_hash), with periodic checkpoint records carrying a SHA-256 root over the covered entry hashes, Ed25519-signed when a signing identity is available; a rotation anchor authenticated by a master-derived MAC makes a truncation or prune of the tail detectable. Reported by monitor_health and the audit-chain verifier; integrity findings surface as a P1 anomaly. (See review_notes for the exact non-repudiation bound.) (3) L1 identity - Ed25519 self-custodied keypairs; signed identity operations (sign, rotate, verify) and signed SHR generation; reported by shr_generate signature block. (4) L2 execution gate - every tool call routed through router.ts -> ApprovalGate.evaluate() -> Principal Policy tier check before execution; no bypass path; reported by principal_policy_view and the audit log trail of gate_* entries. (5) L2 outbound context gating - per-provider field policies applied before any outbound call; reported by context_gate_enforcer_status.
 
 **Evidence emitter tools:** `sovereignty_audit`, `shr_generate`, `monitor_health`, `state_list`, `principal_policy_view`, `context_gate_enforcer_status`
 
 **Enterprise input required:**
 
-_(none — this row is fully auto-emitted)_
+_(none - this row is fully auto-emitted)_
 
 **Review notes:**
 
@@ -990,7 +990,7 @@ Re-verified against the current tree (server package v1.6.1) on 2026-07-05. UPDA
 
 ---
 
-### Article 15(5) second subparagraph — Resilience against data and model poisoning
+### Article 15(5) second subparagraph - Resilience against data and model poisoning
 
 - **Row ID:** `art_15_resilience_poisoning`
 - **Clause ID:** `art-15-5-poisoning`
@@ -1009,7 +1009,7 @@ Auto-filled: the Principal Policy gate runs a prompt injection detector pre-chec
 
 **Enterprise input required:**
 
-Training-time threats (data poisoning, model poisoning) are entirely outside Sanctuary's runtime scope — training data governance is the model provider's responsibility. The runtime adversarial-input detection is partial coverage of the 'adversarial examples' subset of Art. 15(5).
+Training-time threats (data poisoning, model poisoning) are entirely outside Sanctuary's runtime scope - training data governance is the model provider's responsibility. The runtime adversarial-input detection is partial coverage of the 'adversarial examples' subset of Art. 15(5).
 
 **Review notes:**
 
@@ -1017,7 +1017,7 @@ The injection detector exists (security/injection-detector.ts) and its activity 
 
 ---
 
-### Article 15(3) — Declared accuracy levels and metrics
+### Article 15(3) - Declared accuracy levels and metrics
 
 - **Row ID:** `art_15_accuracy_metrics`
 - **Clause ID:** `art-15-3`
@@ -1032,7 +1032,7 @@ The injection detector exists (security/injection-detector.ts) and its activity 
 
 [MANUAL INPUT REQUIRED: accuracy levels and metrics on the agent's business task].
 
-**Evidence emitter tools:** _(none — this row is manual_only)_
+**Evidence emitter tools:** _(none - this row is manual_only)_
 
 **Enterprise input required:**
 
@@ -1044,7 +1044,7 @@ Structural manual row.
 
 ---
 
-### Article 15(4) — Technical redundancy and fail-safe measures
+### Article 15(4) - Technical redundancy and fail-safe measures
 
 - **Row ID:** `art_15_redundancy_failsafe`
 - **Clause ID:** `art-15-4`
@@ -1059,7 +1059,7 @@ Structural manual row.
 
 [MANUAL INPUT REQUIRED: technical redundancy and fail-safe plans for the deployment].
 
-**Evidence emitter tools:** _(none — this row is manual_only)_
+**Evidence emitter tools:** _(none - this row is manual_only)_
 
 **Enterprise input required:**
 
@@ -1071,7 +1071,7 @@ Structural manual row.
 
 ---
 
-### Article 26(1) — Use in accordance with instructions for use
+### Article 26(1) - Use in accordance with instructions for use
 
 - **Row ID:** `art_26_per_instructions`
 - **Clause ID:** `art-26-1`
@@ -1086,7 +1086,7 @@ Structural manual row.
 
 [MANUAL INPUT REQUIRED: declaration of use in accordance with instructions].
 
-**Evidence emitter tools:** _(none — this row is manual_only)_
+**Evidence emitter tools:** _(none - this row is manual_only)_
 
 **Enterprise input required:**
 
@@ -1098,7 +1098,7 @@ Structural manual row.
 
 ---
 
-### Article 26(2) — Assign human oversight to competent natural persons
+### Article 26(2) - Assign human oversight to competent natural persons
 
 - **Row ID:** `art_26_human_oversight_assigned`
 - **Clause ID:** `art-26-2`
@@ -1125,7 +1125,7 @@ Sanctuary provides the technical oversight surface; enterprise assigns the peopl
 
 ---
 
-### Article 26(4) — Input data relevance and representativeness
+### Article 26(4) - Input data relevance and representativeness
 
 - **Row ID:** `art_26_input_data_relevance`
 - **Clause ID:** `art-26-4`
@@ -1140,7 +1140,7 @@ Sanctuary provides the technical oversight surface; enterprise assigns the peopl
 
 [MANUAL INPUT REQUIRED: declaration of input data relevance and representativeness].
 
-**Evidence emitter tools:** _(none — this row is manual_only)_
+**Evidence emitter tools:** _(none - this row is manual_only)_
 
 **Enterprise input required:**
 
@@ -1152,7 +1152,7 @@ Structural manual row.
 
 ---
 
-### Article 26(5) — Monitor operation and inform provider of incidents
+### Article 26(5) - Monitor operation and inform provider of incidents
 
 - **Row ID:** `art_26_monitor_and_inform`
 - **Clause ID:** `art-26-5`
@@ -1165,7 +1165,7 @@ Structural manual row.
 
 **Evidence emitted by Sanctuary:**
 
-Auto-filled: the runtime monitoring substrate — encrypted audit log queryable and exportable in SIEM-standard formats, health dashboard, and anomaly baseline tracker. Provides the technical means to monitor and detect risk situations.
+Auto-filled: the runtime monitoring substrate - encrypted audit log queryable and exportable in SIEM-standard formats, health dashboard, and anomaly baseline tracker. Provides the technical means to monitor and detect risk situations.
 
 **Evidence emitter tools:** `monitor_audit_log`, `audit_export_siem`, `monitor_health`, `principal_baseline_view`
 
@@ -1179,7 +1179,7 @@ Sanctuary provides the detect-and-export half; enterprise provides the report-an
 
 ---
 
-### Article 26(6) — Deployers keep logs for at least six months
+### Article 26(6) - Deployers keep logs for at least six months
 
 - **Row ID:** `art_26_retain_logs`
 - **Clause ID:** `art-26-6`
@@ -1206,7 +1206,7 @@ Downgraded from full during audit (2026-04-10). Sanctuary captures and exports; 
 
 ---
 
-### Article 26(7) — Inform workers and workers' representatives (employment)
+### Article 26(7) - Inform workers and workers' representatives (employment)
 
 - **Row ID:** `art_26_workers_representatives`
 - **Clause ID:** `art-26-7`
@@ -1221,7 +1221,7 @@ Downgraded from full during audit (2026-04-10). Sanctuary captures and exports; 
 
 [MANUAL INPUT REQUIRED: worker and workers' representative notification evidence].
 
-**Evidence emitter tools:** _(none — this row is manual_only)_
+**Evidence emitter tools:** _(none - this row is manual_only)_
 
 **Enterprise input required:**
 
@@ -1233,7 +1233,7 @@ Structural manual row. Applies only to employment-context deployments (Annex III
 
 ---
 
-### Article 26(9) — Data protection impact assessment per GDPR Art. 35
+### Article 26(9) - Data protection impact assessment per GDPR Art. 35
 
 - **Row ID:** `art_26_dpia`
 - **Clause ID:** `art-26-9`
@@ -1248,7 +1248,7 @@ Structural manual row. Applies only to employment-context deployments (Annex III
 
 [MANUAL INPUT REQUIRED: DPIA under GDPR Article 35, where applicable].
 
-**Evidence emitter tools:** _(none — this row is manual_only)_
+**Evidence emitter tools:** _(none - this row is manual_only)_
 
 **Enterprise input required:**
 
@@ -1260,7 +1260,7 @@ Structural manual row.
 
 ---
 
-### Article 26(8) — Registration in EU database for Annex III systems
+### Article 26(8) - Registration in EU database for Annex III systems
 
 - **Row ID:** `art_26_eu_database_registration`
 - **Clause ID:** `art-26-8`
@@ -1275,7 +1275,7 @@ Structural manual row.
 
 [MANUAL INPUT REQUIRED: EU database registration under Article 71, where applicable].
 
-**Evidence emitter tools:** _(none — this row is manual_only)_
+**Evidence emitter tools:** _(none - this row is manual_only)_
 
 **Enterprise input required:**
 

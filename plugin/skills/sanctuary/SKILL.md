@@ -35,7 +35,7 @@ If you're running OpenClaw (v2026.3.28+), Sanctuary adds four protections that O
 - **Cryptographic identity**: OpenClaw has no agent identity. Sanctuary gives your agent an Ed25519 keypair for signing, verification, and handshakes.
 - **Graduated approval**: OpenClaw's `requireApproval` is binary. Sanctuary's three-tier Principal Policy auto-allows routine ops (Tier 3), escalates anomalies (Tier 2), and requires human approval for irreversible ops (Tier 1).
 - **Selective disclosure**: Prove facts about your state without revealing it. SHA-256 + Pedersen commitments, Schnorr ZK proofs, range proofs.
-- **Portable reputation**: Signed EAS-compatible attestations that you own and can take anywhere.
+- **Portable reputation**: Signed EAS-compatible attestations that you own and can export through current paths, with full exit still partial until **IC-07, IC-08, IC-09** close.
 
 **Five-minute setup:**
 Add Sanctuary to your OpenClaw MCP config:
@@ -203,8 +203,8 @@ Sanctuary's cooperative MCP surface is organized in four named layers:
 - **Selective Disclosure:** Commitment-based proofs, zero-knowledge proofs (Pedersen/Ristretto255/Schnorr), disclosure policies
 - **Verifiable Reputation:** Signed attestations (posture-weighted), portable reputation, trust bootstrapping, handshakes, MCP-to-MCP federation
 
-Beneath the cooperative surface, the Castle Wall enforces egress policy at the operating-system level on Linux and macOS, so the perimeter holds even when an agent is prompt-injected or disobedient. See the repo README for the current per-platform enforcement status and its proven bounds.
+Beneath the cooperative surface, the Castle Wall enforces egress policy at the operating-system level on macOS, so the perimeter holds even when an agent is prompt-injected or disobedient. Linux ships no egress enforcement: the modules are tested against a real kernel and the shipped daemon does not install them (**IC-02, IC-03, IC-04**). See the repo README for the current per-platform enforcement status and its proven bounds.
 
-All state is encrypted with AES-256-GCM. Keys are derived via Argon2id. Integrity is verified via Merkle trees. Identity is Ed25519 with key rotation support. No plaintext ever touches persistent storage.
+User state under `~/.sanctuary/state/` is encrypted with AES-256-GCM. Keys are derived via Argon2id. Integrity is verified via Merkle trees. Identity is Ed25519 with key rotation support. Operator policy and harness backup configs can be plaintext, so plaintext claims must stay scoped to user state.
 
-90+ MCP tools. Three approval channels (stderr, dashboard, webhook). Concordia bridge. Protection-posture audit. Context gating. Apache 2.0. Published as `@sanctuary-framework/mcp-server` on npm (current stable v1.7.0).
+80+ MCP tools. Three approval channels (stderr, dashboard, webhook). Concordia bridge. Protection-posture audit. Context gating. Apache 2.0. Published as `@sanctuary-framework/mcp-server` on npm (current stable v1.7.2).

@@ -51,7 +51,7 @@ The third iteration got the framing right but the scope wrong. Scope crept, and 
 
 The current iteration is the Castle Architecture. Agents live in the castle. It protects them and you both. The castle is not an agent.
 
-Four enforcement layers. The Castle Wall blocks egress at the operating-system boundary, where prompt-injected agents cannot route around it. Sentinels watch from inside. Cooperative MCP gives compliant agents a sovereignty surface. Receipts and reputation hold every actor accountable across castles. The wall is in the kernel because hope is not a security model. Phase 1 just shipped to Linux and macOS.
+Four enforcement layers. On macOS within the proven scope, the Castle Wall blocks egress at the operating-system boundary, where prompt-injected agents cannot route around it. Sentinels watch from inside. Cooperative MCP gives compliant agents a sovereignty surface. Receipts and reputation hold every actor accountable across castles. The wall is in the kernel because hope is not a security model. Phase 1 just shipped to Linux and macOS. Current correction, 2026-08-07: Phase 1 shipped as live enforcement on macOS only. The Linux daemon installs no kernel enforcement, and its Assurance Matrix row is `not_implemented`. Open defect: **IC-02, IC-03, IC-04** (`docs/audit/inert-capability-register.md`).
 
 I am not pretending this is the last iteration. I am sure it has flaws I cannot see. But the architecture is right enough now to be worth discussing in public.
 

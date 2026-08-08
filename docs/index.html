@@ -7,13 +7,13 @@ layout: null
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Sanctuary. The open source standard for secure, private AI.</title>
-<meta name="description" content="Your agent will know you better than you know yourself. Make sure that stays between you. Sanctuary is the open source standard for secure, private AI: a wall the operating system enforces in both directions, and your data under your own keys, portable anywhere.">
+<meta name="description" content="Your agent will know you better than you know yourself. Make sure that stays between you. Sanctuary is the open source standard for secure, private AI: operating-system enforcement is live on macOS today; Linux and Windows are not live enforcement yet, and your data stays under your own keys with current portability bounds called out in the Assurance Matrix.">
 <meta name="author" content="Erik Newton">
 <meta name="theme-color" content="#0b1326">
 
 <!-- Open Graph -->
 <meta property="og:title" content="Sanctuary. The open source standard for secure, private AI.">
-<meta property="og:description" content="Your agent will know you better than you know yourself. Make sure that stays between you. A wall the operating system enforces in both directions, and your data under your own keys, portable anywhere. Any agent, local or cloud, solo or fleet. Apache-2.0. Install with npx.">
+<meta property="og:description" content="Your agent will know you better than you know yourself. Make sure that stays between you. Operating-system enforcement is live on macOS today; Linux and Windows are not live enforcement yet, and your data stays under your own keys with current portability bounds called out in the Assurance Matrix. Any agent, local or cloud, solo or fleet. Apache-2.0. Install with npx.">
 <meta property="og:type" content="website">
 <meta property="og:url" content="https://sanctuaryprotocol.ai/">
 <meta property="og:site_name" content="Sanctuary Protocol">
@@ -71,8 +71,9 @@ layout: null
     </h1>
 
     <p class="hero__sub">
-      Sanctuary is the open source standard for secure, private AI: a wall the operating system
-      enforces in both directions, and your data under your own keys, portable anywhere.
+      Sanctuary is the open source standard for secure, private AI: operating-system enforcement
+      is live on macOS today; Linux and Windows are not live enforcement yet, and your data stays
+      under your own keys with current portability bounds called out in the Assurance Matrix.
       Any agent, local or cloud, solo or fleet. One command to get started.
       One dashboard to secure them all.
     </p>
@@ -81,7 +82,7 @@ layout: null
     <div class="install surface-card">
       <div class="install__label">
         <span>Install</span>
-        <span>Node 22+ · macOS · Linux · Windows</span>
+        <span>Node 22+ · macOS live wall · Linux/Windows cooperative</span>
       </div>
       <div class="install__row">
         <code class="install__cmd mono"><span class="token--dim">$</span> npx @sanctuary-framework/mcp-server</code>
@@ -101,8 +102,8 @@ layout: null
 
     <div class="hero__stats" aria-label="Project stats">
       <div class="hero__stat"><strong>5</strong><span>Castle layers</span></div>
-      <div class="hero__stat"><strong>11,998</strong><span>Passing tests</span></div>
-      <div class="hero__stat"><strong>203</strong><span>Kernel-binding tests</span></div>
+      <div class="hero__stat"><strong>13k+</strong><span>Passing tests</span></div>
+      <div class="hero__stat"><strong>203</strong><span>Linux source-coverage tests</span></div>
       <div class="hero__stat"><strong>0</strong><span>Harness changes</span></div>
     </div>
   </section>
@@ -114,8 +115,9 @@ layout: null
         <span class="eyebrow">Local node</span>
         <h2 id="provisioning-title">One command. <span class="text-gradient">Full stack, running locally.</span></h2>
         <p>
-          Sanctuary runs on your hardware with your keys. Nothing leaves the machine unless you
-          approve it. Point any MCP-compatible agent at it and the whole substrate is live.
+          Sanctuary runs on your hardware with your keys. Policy-gated calls route through local
+          approval surfaces, and Castle Wall enforcement follows the platform bounds in the
+          Assurance Matrix. Point any MCP-compatible agent at it and the cooperative substrate is live.
         </p>
       </div>
 
@@ -152,11 +154,15 @@ layout: null
             <div>
               <h3 class="provisioning__heading">Kernel-level egress wall</h3>
               <p class="provisioning__body">
-                The Castle Wall blocks unauthorized outbound calls at the operating system. A
-                prompt-injected agent cannot route around it because the kernel itself enforces.
-                DNS, DoH, DoT, raw sockets, all covered. Live on Linux and macOS: the wall
-                enforces a signed operator policy, with a clean per-account allow/deny
-                demonstration and 5/5 reboot survival behind the claim.
+                On macOS today, the Castle Wall blocks unauthorized outbound calls at the
+                operating system. A prompt-injected agent cannot route around that path within
+                the proven scope because the kernel itself enforces.
+                Live on macOS: the wall enforces a signed operator policy, with a clean
+                per-account allow/deny demonstration and 5/5 attended reboot survival behind the claim.
+                On Linux the nftables, cgroup, and NFQUEUE modules are tested against a real
+                kernel, DNS, DoH, DoT and raw sockets included, and the shipped daemon does not
+                install that path yet, so Linux is source coverage today rather than live
+                enforcement.
               </p>
             </div>
           </li>
@@ -175,8 +181,8 @@ layout: null
             <div>
               <h3 class="provisioning__heading">Local approval dashboard</h3>
               <p class="provisioning__body">
-                Dark-theme web UI on <code class="mono">127.0.0.1:3501</code>. Real-time SSE,
-                approve and deny buttons, audit viewer. Optional TLS and webhook channels for
+                Dark-theme web UI on <code class="mono">127.0.0.1:3501</code>. Approve and deny
+                buttons, audit viewer. Optional TLS and webhook channels for
                 headless setups.
               </p>
             </div>
@@ -193,7 +199,8 @@ layout: null
         <span class="eyebrow">Architecture</span>
         <h2 id="layers-title">The Castle Architecture.</h2>
         <p>
-          Five layers, each with a distinct contract. Real enforcement at the perimeter,
+          Five layers, each with a distinct contract. Operating-system enforcement is live on
+          macOS today; Linux and Windows are not live enforcement yet,
           observation inside, an encrypted state surface for compliant agents, receipts and reputation
           across vendors, and an install-time substrate that binds it all to the operator.
           The layers compose. None of them substitute for another.
@@ -205,9 +212,10 @@ layout: null
           <span class="layer__id">Perimeter</span>
           <h3 class="layer__title">Castle Wall</h3>
           <p class="layer__body">
-            Operating-system-level egress filtering. nftables, cgroup v2, and NFQUEUE on Linux.
-            Network Extension on macOS. Plain DNS, DoH, DoT, and raw-socket bypass coverage all
-            verified end-to-end against real kernel bindings. Phase 1 shipped.
+            Operating-system-level egress filtering. Network Extension on macOS, where Phase 1
+            is proven on a signed and notarized build. On Linux the nftables, cgroup v2, and
+            NFQUEUE modules carry plain-DNS, DoH, DoT, and raw-socket bypass coverage against
+            real kernel bindings, and the shipped daemon does not install that path yet.
           </p>
           <div class="layer__tags">
             <span class="layer__tag">kernel-binding</span>
@@ -220,7 +228,9 @@ layout: null
           <span class="layer__id">Observation</span>
           <h3 class="layer__title">Sentinels</h3>
           <p class="layer__body">
-            Internal behavioral observation. eBPF on Linux. Cross-platform auditd-tail. Seven
+            Internal behavioral observation. Cross-platform auditd-tail, plus an eBPF watcher
+            scaffold on Linux that currently falls back to stub mode because the real probe loader
+            is not implemented. Seven
             sentinels watching for prompt-injection signatures, anomalous tool sequences, and
             policy drift. The sentinels surface; the operator decides.
           </p>
@@ -235,9 +245,11 @@ layout: null
           <span class="layer__id">Cooperative surface</span>
           <h3 class="layer__title">Charter (Cooperative MCP)</h3>
           <p class="layer__body">
-            Encrypted state, signed audit, mandate primitives, canonical policy slots,
-            and substrate selector. Compliant agents that voluntarily route through Sanctuary
-            get the full surface. Non-compliant agents still hit the Castle Wall and the Sentinels.
+            Encrypted state, hash-chained audit, mandate primitives, canonical policy slots, and
+            substrate selector. Production audit checkpoints are currently unsigned until IC-05
+            closes, and audit-chain verify --no-strict can return PASS with findings until IC-06
+            closes. Compliant agents that voluntarily route through Sanctuary get the full surface. On macOS with the wall
+            installed and armed, non-compliant agents still hit the wall and the Sentinels.
           </p>
           <div class="layer__tags">
             <span class="layer__tag">approval-gates</span>
@@ -267,7 +279,7 @@ layout: null
           <p class="layer__body">
             Install-time substrate-binding to the operator. The Mantle gives the rest of the
             castle a verifiable anchor on the operator's machine before the agent runs.
-            Phases 1 and 2 shipped.
+            Template init rejects orphan agent identifiers that are not bound to a wrapped harness.
           </p>
           <div class="layer__tags">
             <span class="layer__tag">install-time</span>
@@ -387,7 +399,7 @@ sanctuary = MCPTool.from_stdio(
         <article class="step surface-card">
           <span class="step__number">Step 03 · Approve</span>
           <h3 class="step__heading">Open the dashboard</h3>
-          <p class="step__body">Approve sensitive operations in real time at the local dashboard URL.</p>
+          <p class="step__body">Approve sensitive operations at the local dashboard URL.</p>
 <pre class="step__code"><code><span class="token--dim">$</span> open http://127.0.0.1:3501</code></pre>
         </article>
       </div>
@@ -442,11 +454,11 @@ sanctuary = MCPTool.from_stdio(
             <span>Architecture</span>
             <span>2026-05-08</span>
           </div>
-          <h3 class="journal__title">The Castle Wall, Live on Linux</h3>
+          <h3 class="journal__title">The Castle Wall, Linux Phase 1 Source Path</h3>
           <p class="journal__excerpt">
-            Cooperative gates do not stop a prompt-injected agent. Kernel-level enforcement does.
-            Castle Wall Phase 1 shipped on Linux: 203 Rust tests against a real kernel binding,
-            with plain-DNS, DoH, and DoT bypass coverage verified end-to-end.
+            Cooperative gates do not stop a prompt-injected agent. Kernel-level enforcement does on macOS within the proven scope.
+            Current correction: Linux Phase 1 source modules are tested against a real kernel
+            binding, and the shipped daemon does not assemble live enforcement.
           </p>
           <span class="btn btn--terminal">Read the post</span>
         </a>
@@ -463,8 +475,8 @@ sanctuary = MCPTool.from_stdio(
     <div class="container">
       <div class="cta surface-card">
         <span class="eyebrow">Ship agents you actually control</span>
-        <h2 id="cta-title">Give your agent a real firewall in one command.</h2>
-        <p>Open source. Runs locally. No platform dependency. No blockchain. No telemetry.</p>
+        <h2 id="cta-title">Put the Sanctuary wall around your agent.</h2>
+        <p>Open source and local-first. Castle Wall enforcement is proven on macOS; Linux is <code>not_implemented</code> in the Assurance Matrix. Telemetry-free and blockchain-free.</p>
         <div class="btn-row" style="justify-content: center;">
           <a class="btn btn--primary" href="https://github.com/eriknewton/sanctuary-framework">View on GitHub</a>
           <a class="btn btn--secondary" href="https://www.npmjs.com/package/@sanctuary-framework/mcp-server">Install from npm</a>
@@ -485,8 +497,9 @@ sanctuary = MCPTool.from_stdio(
           Sanctuary
         </a>
         <p>
-          A firewall and custody substrate for AI agents. Real egress enforcement,
-          portable reputation, no platform dependency.
+          A custody substrate for AI agents: operating-system enforcement is live on macOS today;
+          Linux and Windows are not live enforcement yet, with portable reputation and current
+          bounds in the Assurance Matrix.
         </p>
       </div>
 

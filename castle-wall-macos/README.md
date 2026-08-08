@@ -128,15 +128,16 @@ The macOS NEFilterProvider runs unprivileged in user space, but its
 content-filter callbacks are invoked synchronously by the kernel for
 every flow on the system. Apple gates loading via a user approval
 prompt + signed-with-entitlement check at install time; once loaded, a
-prompt-injected user-space agent CANNOT bypass the filter without the
-operator removing the system extension.
+prompt-injected user-space agent cannot bypass the filter within the proven
+scope: one host, one OS version, signed extension installed and armed, and
+attended reboot proof only.
 
 The Sanctuary-main IPC connection authenticates via Ed25519
 challenge-response: the macOS extension issues a 32-byte nonce, the
 Sanctuary-main side signs it with the fortress identity key, the
 extension verifies against a TOFU-pinned public key. SO_PEERCRED-style
 UID binding is unavailable on macOS BSD sockets, so the fortress
-identity binding is the load-bearing trust anchor.
+identity binding is the primary trust anchor.
 
 ## What ships in subsequent builds
 
@@ -194,7 +195,7 @@ operator-granted macOS content-filter consent while avoiding LaunchServices'
 `Unable to block on application` failure for already-running apps.
 The host app prints one JSON line and exits 0 (success), 1 (failure), 2
 (usage), 3 (needs the one-time consent), or 4 (NE preferences timeout).
-Running the host-app binary itself is load-bearing: the NE content-filter
+Running the host-app binary itself is required: the NE content-filter
 configuration is owned by the signed app identity that created it, so only
 that binary can toggle `NEFilterManager.isEnabled` without re-prompting. The
 headless path never initializes SwiftUI, so it needs no WindowServer and works

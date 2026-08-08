@@ -2,7 +2,7 @@
 
 ## Quick summary
 
-v0.4.0 is **backwards compatible**. All v0.3.x MCP tools continue to work with the same names and parameters. This release adds 10 new tools (46 → 56 total) and introduces optional Concordia Protocol composition.
+v0.4.0 is **backwards compatible**. All v0.3.x MCP tools continue to work with the same names and parameters. This release adds decommissioning, hardening, gateway export, and context-gating tools, and introduces optional Concordia Protocol composition.
 
 No breaking changes to:
 - Tool interface (names, parameters, return types)
@@ -22,7 +22,7 @@ No breaking changes to:
 
 The Concordia Bridge tools (`bridge_commit`, `bridge_verify`, `bridge_attest`) were added in v0.3.1 late commits and are also present.
 
-**Total tool surface:** 46 (v0.3.x) → 56 (v0.4.0)
+**Total tool surface:** expanded in v0.4.0; current releases expose 80+ MCP tools.
 
 ## Upgrade steps
 
@@ -66,17 +66,14 @@ Refer to the host's documentation for gateway restart. The key is that the MCP c
 
 ### 3. Verify the tool surface
 
-After restarting, verify that all 54 tools are available:
+After restarting, verify that the Sanctuary tools are available:
 
 ```bash
 # List all Sanctuary tools (requires MCP host running)
 claude --dangerously-skip-permissions -p "List all sanctuary tools available to you"
 ```
 
-You should see:
-- Core tools: 46 (from v0.3.x)
-- New tools: 10 (decommissioning, hardening, gateway export, context gating)
-- **Total: 56**
+You should see the v0.4.0-era core tools plus the new decommissioning, hardening, gateway export, and context-gating tools. Current releases expose 80+ MCP tools.
 
 If you only see 4 tools (the Concordia bridge tools), the Sanctuary MCP server didn't reconnect. See "Common issues" below.
 
@@ -155,16 +152,16 @@ If you also run Concordia Protocol alongside Sanctuary, you can enable the bridg
 
 ### Issue: "SHR generation fails: 'sanctuary/shr_generate' not found"
 
-**Root cause:** The Sanctuary MCP server isn't registered. This tool has **not been removed** — it's a gateway registration issue (same as "only 4 tools" above).
+**Root cause:** The Sanctuary MCP server isn't registered. This tool has **not been removed** - it's a gateway registration issue (same as "only 4 tools" above).
 
-**Solution:** Follow the steps in "I can only see 4 Sanctuary tools" above. Once the gateway sees all 54 tools, `shr_generate` will work.
+**Solution:** Follow the steps in "I can only see 4 Sanctuary tools" above. Once the gateway sees the Sanctuary tool surface, `shr_generate` will work.
 
 ### Issue: "Bridge authentication fails"
 
 **Root cause:** The Concordia bridge requires separate authentication from Sanctuary. You need:
 
-1. A Concordia agent registration (`concordia_register_agent`) — this gives you a Concordia auth token
-2. Identity mapping — connecting your Concordia agent ID to your Sanctuary identity ID and DID
+1. A Concordia agent registration (`concordia_register_agent`) - this gives you a Concordia auth token
+2. Identity mapping - connecting your Concordia agent ID to your Sanctuary identity ID and DID
 
 **Solution:**
 
@@ -224,11 +221,10 @@ sleep 2
 openclaw gateway start
 ```
 
-This is safe — v0.4.0 does not modify your state store or configuration. Downgrading will simply hide the 10 new tools temporarily.
+This is safe - v0.4.0 does not modify your state store or configuration. Downgrading will simply hide the 10 new tools temporarily.
 
 ## Questions or issues?
 
 - Check `KNOWN_ISSUES.md` for current limitations
 - File a GitHub issue: https://github.com/eriknewton/sanctuary-framework/issues
 - Read the `README.md` for general setup and troubleshooting
-

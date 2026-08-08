@@ -1,18 +1,20 @@
 # castle-wall-daemon
 
-The OS-level egress filter that enforces the operator's allow-list at the
-kernel boundary. Castle Architecture Layer 1: the kernel itself blocks
-unauthorized cross-boundary calls, so even a prompt-injected agent cannot
-exfiltrate. Cooperative MCP gates (Castle Layer 3) sit on top for compliant
-agents; this daemon is the deterministic enforcement layer underneath them.
+The Linux Castle Wall source crate. Its nftables, cgroup, and NFQUEUE modules
+are tested against a real kernel, but the shipped daemon boot path does not
+install those modules into live enforcement yet. Open defect: **IC-02, IC-03,
+IC-04** (`docs/audit/inert-capability-register.md`).
+Cooperative MCP gates sit on top for compliant agents; Linux kernel enforcement
+is not implemented until the shipped daemon assembles the tested loop.
 
 ## Status
 
-Phase 1 Linux: shipped through PR 2b checkpoints 1 to 5 on
-`wp-castle-wall-pr2b-kernel-impl`. The crate compiles on macOS, Linux, and
-Windows; the kernel-touching modules (`nftables`, `cgroup`, `nfqueue`) only
-bind real kernel resources on Linux and refuse to start with structured
-errors elsewhere.
+Phase 1 Linux: no shipped enforcement (Assurance Matrix `not_implemented`). PR 2b landed and tests
+the kernel-touching modules (`nftables`, `cgroup`, `nfqueue`), but
+`daemon::boot` does not install an nftables table, bind NFQUEUE, create cgroup
+scopes, or call the deny-by-default evaluator. The shipped systemd unit is also
+`Type=notify` while the daemon never sends readiness. Open defect: **IC-02,
+IC-03, IC-04** (`docs/audit/inert-capability-register.md`).
 
 Phase 2 macOS Network Extension: queued behind Apple Developer Program
 filing.
@@ -33,18 +35,17 @@ Three layers of source, named after the surface they own.
    handshake authenticator (`auth.rs`), and the UDS server
    (`server.rs`). The framing is byte-for-byte compatible with the
    TypeScript main-process side at `server/src/castle-wall/ipc/`.
-3. **Kernel binding.** `src/nftables.rs` installs the `sanctuary-castle`
-   table and per-agent rulesets via the `nft` CLI with atomic
-   `add table` plus `flush` plus `add rule` transactions; `src/cgroup.rs`
-   creates systemd transient scopes per wrapped agent and resolves their
-   numeric cgroup-id through the systemd journal listener;
-   `src/nfqueue.rs` binds the `nfq` crate with `NFQA_CFG_F_FAIL_OPEN`
-   explicitly disabled (Codex amendment 7).
+3. **Kernel binding.** `src/nftables.rs`, `src/cgroup.rs`, and
+   `src/nfqueue.rs` implement and test the intended `sanctuary-castle`
+   table, per-agent cgroup scopes, and NFQUEUE verdict loop. The shipped
+   daemon boot path does not call them yet. Open defect: **IC-02, IC-04**
+   (`docs/audit/inert-capability-register.md`).
 
-`src/daemon.rs` ties the three layers together and orchestrates the boot
-sequence; `src/failure.rs` maps every failure mode to a fail-closed,
-fail-degraded, or refuse-to-start disposition with operator-facing
-messages.
+`src/daemon.rs` owns the boot sequence but currently starts IPC and WAL
+handling without installing kernel enforcement. Open defect: **IC-02, IC-04**
+(`docs/audit/inert-capability-register.md`). `src/failure.rs`
+maps failure modes to fail-closed, fail-degraded, or refuse-to-start
+dispositions with operator-facing messages.
 
 ## Local setup
 
@@ -112,7 +113,8 @@ Both jobs must be green before this PR can be marked ready-for-review.
 - `Review/Sanctuary/Castle_Wall_Phase1_Scope_Lock_2026-05-03.md`
   (ratified post-Codex amendments).
 - `Review/Sanctuary/Castle_Architecture_ADR_2026-04-30.md` (parent ADR;
-  the architectural intent that this crate enforces).
+  the architectural intent this crate is meant to serve once the daemon boot
+  path is wired to live enforcement).
 - PR #117 (PR 1: TypeScript interfaces and types).
 - PR #119 (PR 2a: IPC contract path plus Rust scaffold).
 - PR #124 (PR 2b: kernel enforcement binding).

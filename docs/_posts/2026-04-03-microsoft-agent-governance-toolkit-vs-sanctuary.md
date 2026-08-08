@@ -6,6 +6,7 @@ author: Erik Newton
 description: "Microsoft released the Agent Governance Toolkit, open-source runtime security for AI agents. It validates the category we've been building. But their approach is about enterprise control. Ours is about portable sovereignty. Here's what's the same, what's different, and why it matters."
 image: /images/blog/microsoft-vs-sanctuary.jpg
 archive_note: "Predates Mantle vocabulary canonicalization on 2026-05-15. Terminology in this post may refer to install-time-binding concepts using earlier language; current canonical vocabulary lives at https://github.com/eriknewton/newton-wiki/blob/main/concepts/mantle.md."
+claims_era_note: true
 ---
 
 > **Archive note:** This post predates Mantle vocabulary canonicalization on 2026-05-15.
@@ -43,21 +44,21 @@ The toolkit is built for an enterprise deploying agents at scale and needing cen
 
 This is a good premise. It's also incomplete.
 
-**Sanctuary's premise: sovereignty is a property of the agent, not the infrastructure.**
+**Sanctuary's premise: sovereignty travels with the agent.**
 
-Sanctuary doesn't assume the agent's operator and the infrastructure provider are the same entity. It assumes the opposite, that agents need sovereignty *from* infrastructure, not just governance *by* infrastructure. An agent running on someone else's cloud, connecting to someone else's MCP servers, processing someone else's data, still needs its own encrypted state, its own identity, and its own ability to prove claims without revealing the underlying data.
+Sanctuary assumes the agent's operator and the infrastructure provider can be different entities. Agents need sovereignty *from* infrastructure as well as governance *by* infrastructure. An agent running on someone else's cloud, connecting to someone else's MCP servers, processing someone else's data, still needs its own encrypted state, its own identity, and its own ability to prove claims without revealing the underlying data.
 
 This isn't a philosophical distinction. It's an architectural one.
 
 ## The Concrete Differences
 
-**Portability.** Sanctuary's Sovereignty Health Report, attestations, and reputation bundles are portable across instances. You can export your agent's entire identity and reputation, move it to a different machine, a different cloud, a different harness, and it carries its cryptographic history with it. Microsoft's governance is Azure-native. Your agent's security posture exists within the Microsoft ecosystem.
+**Portability.** Sanctuary's Sovereignty Health Report, attestations, and reputation bundles are portable across instances. You can export current identity and reputation artifacts and move them to a different machine, cloud, or harness, with exit-bundle caveats for dashboard export, skipped import counters, and rotated-key imports. Open defect: **IC-07, IC-08, IC-09** (`docs/audit/inert-capability-register.md`). Microsoft's governance is Azure-native. Your agent's security posture exists within the Microsoft ecosystem.
 
 **Selective disclosure.** Sanctuary's Layer 3 provides Pedersen commitments, Schnorr proofs, and range proofs, genuine zero-knowledge cryptographic primitives that let an agent prove claims about its data without revealing the underlying values. No other framework in this space offers this. Microsoft's toolkit handles identity and access control but doesn't address the question: how does an agent prove something about itself to a counterparty it doesn't fully trust?
 
 **Dual sovereignty.** This is the structural insight that drives everything we build. Human sovereignty and agent sovereignty are not separate problems. They require identical architecture. A human acting through an agent needs the same protections as an autonomous agent acting on its own behalf, encrypted state, self-custodied identity, approval gates, verifiable reputation. Microsoft's toolkit governs agents on behalf of enterprises. Sanctuary protects both the human and the agent, using the same mechanisms.
 
-**No cloud dependency.** Sanctuary runs locally. One command: `npx @sanctuary-framework/mcp-server`. No Azure subscription. No cloud account. No platform dependency. This matters because the agents that need sovereignty most are the ones operating outside enterprise infrastructure, personal agents, research agents, agents running on local hardware.
+**No cloud dependency.** Sanctuary runs locally. One command: `npx @sanctuary-framework/mcp-server`. No Azure subscription. No cloud account. This matters because the agents that need sovereignty most are the ones operating outside enterprise infrastructure, personal agents, research agents, agents running on local hardware.
 
 **Agent-to-agent trust.** Sanctuary's sovereignty handshake lets two agents cryptographically verify each other's security posture before transacting. This is the foundation for an open trust network that isn't mediated by any platform. Microsoft's toolkit handles identity within an organization's boundary. It doesn't address how agents from different organizations (or agents with no organizational affiliation at all) establish mutual trust.
 
@@ -90,7 +91,7 @@ Sanctuary is open source (Apache-2.0), runs locally, and works with any MCP-comp
 npx @sanctuary-framework/mcp-server
 ```
 
-62 MCP tools. Four layers of sovereignty. No cloud required.
+Current releases expose 80+ MCP tools. Four layers of sovereignty. No cloud required.
 
 GitHub: [github.com/eriknewton/sanctuary-framework](https://github.com/eriknewton/sanctuary-framework)
 
