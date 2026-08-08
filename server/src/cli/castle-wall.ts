@@ -3641,6 +3641,7 @@ function makeHostAppInvoke(timeoutMs: number): HostAppInvoker {
  */
 function resolveAppBundlePath(binaryPath: string): string {
   const marker = ".app/";
+  // cli-argv-indexof-allowed: scans a filesystem path string, not CLI argv tokens.
   const idx = binaryPath.indexOf(marker);
   if (idx >= 0) return binaryPath.slice(0, idx + ".app".length);
   return binaryPath;

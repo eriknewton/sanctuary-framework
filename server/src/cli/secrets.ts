@@ -55,6 +55,17 @@ export interface SecretsArgs {
   stdin?: NodeJS.ReadableStream & { isTTY?: boolean };
 }
 
+export interface SecretsGrantFlags {
+  scope: SecretScope;
+  ttl?: number;
+  error?: string;
+}
+
+export interface SecretsAuditFlags {
+  since?: string;
+  limit: number;
+}
+
 export async function runSecretsCommand(args: SecretsArgs): Promise<number> {
   const out = args.out ?? process.stdout;
   const err = args.err ?? process.stderr;
@@ -246,18 +257,12 @@ async function cmdGrant(
 ): Promise<number> {
   const skill = requirePositional(argv, 0, "grant <skill> <secret>");
   const secret = requirePositional(argv, 1, "grant <skill> <secret>");
-  const scopeFlag = flagValue(argv, "--scope");
-  const ttlFlag = flagValue(argv, "--ttl");
-  const scope: SecretScope = (scopeFlag as SecretScope | undefined) ?? "read";
-  if (scope !== "read" && scope !== "rotate") {
-    ctx.err.write(`--scope must be "read" or "rotate" (got ${scopeFlag})\n`);
+  const flags = parseSecretsGrantFlags(argv);
+  if (flags.error) {
+    ctx.err.write(flags.error);
     return 2;
   }
-  const ttl = ttlFlag ? Number(ttlFlag) : undefined;
-  if (ttl !== undefined && (!Number.isFinite(ttl) || ttl <= 0)) {
-    ctx.err.write(`--ttl must be a positive integer (got ${ttlFlag})\n`);
-    return 2;
-  }
+  const { scope, ttl } = flags;
 
   // Update policy file + in-process broker (so running daemons pick up at next
   // reload; the CLI-local broker gets the grant for audit purposes).
@@ -335,8 +340,7 @@ async function cmdAudit(
   argv: string[],
   ctx: { out: NodeJS.WritableStream; err: NodeJS.WritableStream; args: SecretsArgs }
 ): Promise<number> {
-  const since = flagValue(argv, "--since");
-  const limit = Number(flagValue(argv, "--limit") ?? "200");
+  const { since, limit } = parseSecretsAuditFlags(argv);
   const { broker, close } = await openBroker({
     passphrase: ctx.args.passphrase,
     storagePath: ctx.args.storagePath,
@@ -365,6 +369,26 @@ async function cmdAudit(
 }
 
 // ── helpers ─────────────────────────────────────────────────────────
+
+export function parseSecretsGrantFlags(argv: string[]): SecretsGrantFlags {
+  const scopeFlag = flagValue(argv, "--scope");
+  const ttlFlag = flagValue(argv, "--ttl");
+  const scope: SecretScope = (scopeFlag as SecretScope | undefined) ?? "read";
+  if (scope !== "read" && scope !== "rotate") {
+    return { scope: "read", error: `--scope must be "read" or "rotate" (got ${scopeFlag})\n` };
+  }
+  const ttl = ttlFlag ? Number(ttlFlag) : undefined;
+  if (ttl !== undefined && (!Number.isFinite(ttl) || ttl <= 0)) {
+    return { scope, error: `--ttl must be a positive integer (got ${ttlFlag})\n` };
+  }
+  return ttl === undefined ? { scope } : { scope, ttl };
+}
+
+export function parseSecretsAuditFlags(argv: string[]): SecretsAuditFlags {
+  const since = flagValue(argv, "--since");
+  const limit = Number(flagValue(argv, "--limit") ?? "200");
+  return since === undefined ? { limit } : { since, limit };
+}
 
 /**
  * The flag this file refuses, plus the equals-spelling prefix derived from it

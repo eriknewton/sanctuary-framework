@@ -657,6 +657,7 @@ function renderApprovalRedirectBlock(state: ApprovalRedirectState): string {
  */
 function upsertApprovalRedirectBlock(content: string, block: string): string {
   const lines = content.split("\n");
+  // cli-argv-indexof-allowed: scans policy-file lines, not CLI argv tokens.
   const startIdx = lines.findIndex((l) => l.startsWith("approval_redirect:"));
   if (startIdx === -1) {
     const trimmed = content.endsWith("\n") ? content : content + "\n";
