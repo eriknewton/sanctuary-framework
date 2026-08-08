@@ -256,6 +256,13 @@ export interface CastleWallCommandContext {
     input: DenyAllQuarantineProbeInput,
   ) => Promise<DenyAllQuarantineProbeResult>;
   /**
+   * Override the pre-arm sudo credential probe used only for the explicit
+   * `enable --allow-no-egress` uid-quarantine path. Defaults to running
+   * `/usr/bin/sudo -n -u '#<uid>' /usr/bin/true` with the same timeout as the
+   * deny-all quarantine smoke.
+   */
+  sudoPreflightProbe?: (uid: number) => Promise<SudoPreflightProbeResult>;
+  /**
    * Inject the FULL operator-daemon start function (Slice M; tests pass a fake
    * that captures the resolved {@link MacOSCastleWallDaemonInput}, so the
    * key-resolution + producer-key threading can be exercised without a real
@@ -348,6 +355,14 @@ export interface DenyAllQuarantineProbeResult {
    * blocked. A sudo/spawn/timeout failure is not proof that quarantine works.
    */
   verified: boolean;
+  exitCode: number | null;
+  stderr?: string;
+  command?: readonly string[];
+}
+
+export interface SudoPreflightProbeResult {
+  /** True only when sudo ran the target command as the uid and exited 0. */
+  ok: boolean;
   exitCode: number | null;
   stderr?: string;
   command?: readonly string[];
@@ -3276,6 +3291,47 @@ async function readAgentOriginUidBestEffort(fortressPath: string): Promise<numbe
   return descriptor.agent_uid;
 }
 
+function asUidSudoPreflightArgv(uid: number): { file: string; args: string[] } {
+  if (!Number.isSafeInteger(uid) || uid <= 0) {
+    throw new Error(`sudo preflight requires a positive integer uid, got ${String(uid)}`);
+  }
+  return {
+    file: "/usr/bin/sudo",
+    args: ["-n", "-u", `#${uid}`, "/usr/bin/true"],
+  };
+}
+
+function defaultSudoPreflightProbe(uid: number): Promise<SudoPreflightProbeResult> {
+  const probe = asUidSudoPreflightArgv(uid);
+  return new Promise((resolvePromise) => {
+    nodeExecFile(
+      probe.file,
+      probe.args,
+      {
+        encoding: "utf8",
+        timeout: DENY_ALL_QUARANTINE_PROBE_TIMEOUT_MS,
+      },
+      (error, _stdout, stderr) => {
+        const exitCode = error
+          ? typeof error.code === "number"
+            ? error.code
+            : null
+          : 0;
+        const stderrText = stderr ?? "";
+        const errorText =
+          error && exitCode === null ? `${error.name}: ${error.message}` : "";
+        const combinedStderr = [stderrText, errorText].filter(Boolean).join("\n");
+        resolvePromise({
+          ok: exitCode === 0,
+          exitCode,
+          ...(combinedStderr ? { stderr: combinedStderr } : {}),
+          command: [probe.file, ...probe.args],
+        });
+      },
+    );
+  });
+}
+
 function defaultDenyAllQuarantineProbe(
   input: DenyAllQuarantineProbeInput,
 ): Promise<DenyAllQuarantineProbeResult> {
@@ -3319,6 +3375,22 @@ function formatProbeCommand(command: readonly string[] | undefined): string {
   return command
     .map((part) => (/^[A-Za-z0-9_./:=@%+#-]+$/.test(part) ? part : JSON.stringify(part)))
     .join(" ");
+}
+
+function renderSudoPreflightRefusal(
+  uid: number,
+  result: SudoPreflightProbeResult,
+): string {
+  const details = [
+    `probe: ${formatProbeCommand(result.command)}`,
+    `exit_code: ${result.exitCode === null ? "none" : result.exitCode}`,
+    ...(result.stderr?.trim() ? [`stderr: ${result.stderr.trim()}`] : []),
+  ].join("\n");
+  return (
+    `Refusing to arm: a non-interactive sudo credential for the arm probe is unavailable for uid ${uid}.\n` +
+    "Run 'sudo -v' to cache your credential (or configure a sudoers rule for the probe), then retry. The wall was not armed.\n" +
+    `${details}\n`
+  );
 }
 
 function renderDenyAllQuarantineProbeRefusal(
@@ -4641,6 +4713,60 @@ async function runArmDisarmInner(
     return 1;
   }
 
+  if (allowNoEgressOverrideUsed) {
+    if (allowNoEgressQuarantineUid === null) {
+      write(
+        err,
+        "Refusing to arm: --allow-no-egress was requested, but the uid-mode agent-origin descriptor could not be resolved.\n" +
+          `${GENERIC_UID_CONFINEMENT_REMEDY} Then retry. The wall was not armed.\n`,
+      );
+      await appendCastleWallCliAuditBestEffort(
+        EGRESS_PROVISION_REFUSED_AUDIT_OP,
+        {
+          source: "castle-wall-cli",
+          guard: "deny-all-quarantine-uid-resolution",
+          agent_origin_mode: "uid",
+          negative_control_host: AGENT_EGRESS_NEGATIVE_CONTROL_HOST,
+          negative_control_port: 443,
+          observed: "unverified",
+          disarm_outcome: "not-armed",
+        },
+        fortressPath,
+        env,
+        err,
+      );
+      return 1;
+    }
+    const preflightProbe = ctx.sudoPreflightProbe ?? defaultSudoPreflightProbe;
+    const preflightResult = await preflightProbe(allowNoEgressQuarantineUid);
+    // A missing sudo credential must refuse before the wall is armed, so an inconclusive probe is never mistaken
+    // for a wall failure and the operator is never left with an armed wall they were told to disarm.
+    if (!preflightResult.ok) {
+      write(
+        err,
+        renderSudoPreflightRefusal(allowNoEgressQuarantineUid, preflightResult),
+      );
+      await appendCastleWallCliAuditBestEffort(
+        EGRESS_PROVISION_REFUSED_AUDIT_OP,
+        {
+          source: "castle-wall-cli",
+          guard: "sudo-preflight",
+          agent_origin_mode: "uid",
+          agent_uid: allowNoEgressQuarantineUid,
+          exit_code: preflightResult.exitCode,
+          ...(preflightResult.stderr?.trim()
+            ? { stderr: preflightResult.stderr.trim() }
+            : {}),
+          disarm_outcome: "not-armed",
+        },
+        fortressPath,
+        env,
+        err,
+      );
+      return 1;
+    }
+  }
+
   const invoke = ctx.hostAppInvoke ?? defaultArmInvoke(ctx, action);
   const cliGitSha = resolveCliBuildSha(env, ctx);
   const headlessArgs = ["--headless", action];
@@ -4810,36 +4936,16 @@ async function runArmDisarmInner(
       return 1;
     }
     if (allowNoEgressOverrideUsed) {
-      if (allowNoEgressQuarantineUid === null) {
-        write(
-          err,
-          "Castle Wall arm saved by the host app, but the deny-all quarantine smoke could not resolve the uid-mode agent-origin descriptor.\n" +
-            "Treat the quarantine as unverified; run 'sanctuary castle-wall disable' before continuing.\n",
-        );
-        await appendCastleWallCliAuditBestEffort(
-          EGRESS_PROVISION_REFUSED_AUDIT_OP,
-          {
-            source: "castle-wall-cli",
-            guard: "deny-all-quarantine-smoke",
-            agent_origin_mode: "uid",
-            negative_control_host: AGENT_EGRESS_NEGATIVE_CONTROL_HOST,
-            negative_control_port: 443,
-            observed: "unverified",
-            disarm_outcome: "operator-action-needed",
-          },
-          fortressPath,
-          env,
-          err,
-        );
-        return 1;
-      }
       const smokeInput: DenyAllQuarantineProbeInput = {
-        agentUid: allowNoEgressQuarantineUid,
+        // The pre-arm block above returns unless `--allow-no-egress` has a resolved, sudo-preflighted uid.
+        agentUid: allowNoEgressQuarantineUid!,
         host: AGENT_EGRESS_NEGATIVE_CONTROL_HOST,
         port: 443,
       };
       const smokeProbe = ctx.denyAllQuarantineProbe ?? defaultDenyAllQuarantineProbe;
       const smokeResult = await smokeProbe(smokeInput);
+      // The sudo preflight above proves this probe could run as the uid before arming; an unverified smoke here is
+      // an enforcement uncertainty, not a cold sudo credential miss.
       if (!smokeResult.verified || smokeResult.reachable) {
         write(err, renderDenyAllQuarantineProbeRefusal(smokeInput, smokeResult));
         await appendCastleWallCliAuditBestEffort(

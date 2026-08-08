@@ -1803,6 +1803,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
         daemonProbe: async () => true,
         bootServiceReadyProbe: makeBootServiceReadyProbe(plistPath, fixture.fortressPath),
         sysextProbe: async () => "[activated enabled]" as const,
+        sudoPreflightProbe: async () => ({ ok: true, exitCode: 0 }),
         ...extras,
       };
     }
@@ -1859,6 +1860,115 @@ describe("castle-wall enable/disable CLI verbs", () => {
       });
     });
 
+    it("--allow-no-egress refuses before arming when sudo preflight cannot run as the target uid and audits the guard", async () => {
+      const fixture = await makeFixture();
+      const plistPath = join(fixture.fortressPath, "boot.plist");
+      await writeFile(plistPath, makeBootPlist(`${fixture.fortressPath}/`));
+      await writeUidDescriptor(fixture.fortressPath);
+      const err = new CaptureStream();
+      let preflightUid: number | undefined;
+      const { invoke, calls } = makeInvoker({});
+
+      const code = await runEnable(
+        ["--fortress", fixture.fortressPath, "--no-ttl", "--allow-no-egress"],
+        guardCtx(fixture, plistPath, err, invoke, {
+          sudoPreflightProbe: async (uid: number) => {
+            preflightUid = uid;
+            return {
+              ok: false,
+              exitCode: 1,
+              stderr: "sudo: a password is required",
+              command: ["/usr/bin/sudo", "-n", "-u", "#502", "/usr/bin/true"],
+            };
+          },
+        }),
+      );
+
+      expect(code).toBe(1);
+      expect(preflightUid).toBe(502);
+      expect(err.text()).toContain("non-interactive sudo credential");
+      expect(err.text()).toContain("sudo -v");
+      expect(err.text()).toContain("The wall was not armed");
+      expect(err.text()).toContain("sudo: a password is required");
+      expect(err.text()).not.toContain("disarm");
+      expect(calls).toHaveLength(0);
+
+      const storage = new FilesystemStorage(join(fixture.fortressPath, "state"));
+      const { establishMaster } = await import("../../src/core/master-custody.js");
+      const { masterKey } = await establishMaster({
+        storage,
+        recoveryKey: fixture.env.SANCTUARY_RECOVERY_KEY!,
+        firstRun: { installMode: "headless", mintRecoveryKey: false },
+        storagePathHint: fixture.fortressPath,
+      });
+      const auditLog = new AuditLog(storage, masterKey);
+      const { entries } = await auditLog.query({ layer: "l1", limit: 100 });
+      const refusal = entries.find(
+        (e) =>
+          e.operation === "egress_provision_refused" &&
+          (e.details as Record<string, unknown>).guard === "sudo-preflight",
+      );
+      expect(refusal?.details).toMatchObject({
+        guard: "sudo-preflight",
+        agent_uid: 502,
+        exit_code: 1,
+        disarm_outcome: "not-armed",
+      });
+    });
+
+    it("--allow-no-egress refuses before arming when the quarantine uid cannot be resolved", async () => {
+      const fixture = await makeFixture();
+      const plistPath = join(fixture.fortressPath, "boot.plist");
+      await writeFile(plistPath, makeBootPlist(`${fixture.fortressPath}/`));
+      await writeUidDescriptor(fixture.fortressPath);
+      const err = new CaptureStream();
+      const { invoke, calls } = makeInvoker({});
+
+      const code = await runEnable(
+        ["--fortress", fixture.fortressPath, "--no-ttl", "--allow-no-egress"],
+        guardCtx(fixture, plistPath, err, invoke, {
+          egressAllowRuleCountProbe: async () => {
+            await writeFile(
+              join(fixture.fortressPath, "policy", "egress", "agent-origin.json"),
+              JSON.stringify({ mode: "uid", system_uid_allow_ceiling: 500 }),
+            );
+            return 0;
+          },
+          sudoPreflightProbe: async () => {
+            throw new Error("preflight should not run without a resolved uid");
+          },
+        }),
+      );
+
+      expect(code).toBe(1);
+      expect(err.text()).toContain("uid-mode agent-origin descriptor could not be resolved");
+      expect(err.text()).toContain("The wall was not armed");
+      expect(err.text()).not.toContain("disarm");
+      expect(calls).toHaveLength(0);
+
+      const storage = new FilesystemStorage(join(fixture.fortressPath, "state"));
+      const { establishMaster } = await import("../../src/core/master-custody.js");
+      const { masterKey } = await establishMaster({
+        storage,
+        recoveryKey: fixture.env.SANCTUARY_RECOVERY_KEY!,
+        firstRun: { installMode: "headless", mintRecoveryKey: false },
+        storagePathHint: fixture.fortressPath,
+      });
+      const auditLog = new AuditLog(storage, masterKey);
+      const { entries } = await auditLog.query({ layer: "l1", limit: 100 });
+      const refusal = entries.find(
+        (e) =>
+          e.operation === "egress_provision_refused" &&
+          (e.details as Record<string, unknown>).guard ===
+            "deny-all-quarantine-uid-resolution",
+      );
+      expect(refusal?.details).toMatchObject({
+        guard: "deny-all-quarantine-uid-resolution",
+        observed: "unverified",
+        disarm_outcome: "not-armed",
+      });
+    });
+
     it("--allow-no-egress overrides the guard (deliberate quarantine), warns loudly, arms, and the override is audited on wall_armed", async () => {
       const fixture = await makeFixture();
       const plistPath = join(fixture.fortressPath, "boot.plist");
@@ -1867,17 +1977,30 @@ describe("castle-wall enable/disable CLI verbs", () => {
       const err = new CaptureStream();
       const out = new CaptureStream();
       let probeInput: { agentUid: number; host: string; port: number } | undefined;
+      let preflightUid: number | undefined;
+      const events: string[] = [];
       const { invoke } = makeInvoker({
         enable: { stdout: reportLine("enable", "enabled", true), exitCode: 0 },
         status: { stdout: reportLine("status", "enabled", true), exitCode: 0 },
       });
+      const trackingInvoke: HostAppInvoker = async (binaryPath, args) => {
+        events.push(`invoke:${args[1]}`);
+        return invoke(binaryPath, args);
+      };
 
       const code = await runEnable(
         ["--fortress", fixture.fortressPath, "--no-ttl", "--allow-no-egress"],
         guardCtx(fixture, plistPath, err, invoke, {
           out,
+          hostAppInvoke: trackingInvoke,
+          sudoPreflightProbe: async (uid: number) => {
+            preflightUid = uid;
+            events.push(`preflight:${uid}`);
+            return { ok: true, exitCode: 0 };
+          },
           denyAllQuarantineProbe: async (input: { agentUid: number; host: string; port: number }) => {
             probeInput = input;
+            events.push(`smoke:${input.agentUid}`);
             return {
               reachable: false,
               verified: true,
@@ -1893,7 +2016,9 @@ describe("castle-wall enable/disable CLI verbs", () => {
       expect(err.text()).toContain("--allow-no-egress");
       expect(err.text()).toContain("deliberate quarantine");
       expect(out.text()).toContain("Deny-all quarantine smoke passed");
+      expect(preflightUid).toBe(502);
       expect(probeInput).toMatchObject({ agentUid: 502, host: "example.com", port: 443 });
+      expect(events).toEqual(["preflight:502", "invoke:enable", "invoke:status", "smoke:502"]);
 
       const storage = new FilesystemStorage(join(fixture.fortressPath, "state"));
       const { establishMaster } = await import("../../src/core/master-custody.js");
