@@ -17,7 +17,7 @@ import {
 // evaluator. While the matrix row is `not_implemented`, report.ts suppresses
 // these fixtures from coverage totals so they cannot read as Linux enforcement
 // assurance.
-// Open defect: IC-02, IC-04 (docs/audit/inert-capability-register.md).
+// Open defect: IC-02, IC-04.
 const CLAIM_ID = "9";
 const CLAIM_LABEL = "Egress enforcement: Linux (Castle Wall Phase 1)";
 

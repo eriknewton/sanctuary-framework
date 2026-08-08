@@ -12,9 +12,9 @@ Last updated: 2026-08-07. Freshness is enforced: a CI guard requires feature PRs
 
 Sanctuary's enforcement model is the Castle Architecture, codified at [`server/rfcs/RFC-0003-castle-architecture.md`](server/rfcs/RFC-0003-castle-architecture.md). Five named mechanisms, each with a distinct enforcement contract.
 
-- **Castle Wall (the perimeter).** OS-level egress enforcement at the operator-external boundary. macOS is proven: per-uid allow/deny plus attended reboot-survival (N=5) on a Dev-ID-signed and notarized binary, drills 2026-06-11 through 2026-06-22; the per-flow rule-attributed audit trail is the named remaining gap. Linux ships no egress enforcement at all: the source modules are integration-proven, and the shipped daemon does not install the nftables table, bind NFQUEUE, create cgroup scopes, or call the deny-by-default evaluator, so the matrix row is `not_implemented` rather than partial. Open defect: **IC-02, IC-03, IC-04** (`docs/audit/inert-capability-register.md`). Windows is on the roadmap.
+- **Castle Wall (the perimeter).** OS-level egress enforcement at the operator-external boundary. macOS is proven: per-uid allow/deny plus attended reboot-survival (N=5) on a Dev-ID-signed and notarized binary, drills 2026-06-11 through 2026-06-22; the per-flow rule-attributed audit trail is the named remaining gap. Linux ships no egress enforcement at all: the source modules are integration-proven, and the shipped daemon does not install the nftables table, bind NFQUEUE, create cgroup scopes, or call the deny-by-default evaluator, so the matrix row is `not_implemented` rather than partial. Open defect: **IC-02, IC-03, IC-04**. Windows is on the roadmap.
 - **Sentinels (the nerves).** Internal observation via process introspection and behavioral baselining. Anomalies surface to the operator via menubar and notifications. Observation, not enforcement.
-- **Charter (the will).** Cooperative MCP surface for compliant agents. Encrypted state, hash-chained audit with current signed-checkpoint bounds, mandate primitives, four canonical policy slots, substrate selector, Concordia receipt integration, Verascore reputation hooks. Open defect: **IC-05, IC-06** (`docs/audit/inert-capability-register.md`).
+- **Charter (the will).** Cooperative MCP surface for compliant agents. Encrypted state, hash-chained audit with current signed-checkpoint bounds, mandate primitives, four canonical policy slots, substrate selector, Concordia receipt integration, Verascore reputation hooks. Open defect: **IC-05, IC-06**.
 - **Heralds (the voice).** Concordia receipts for cross-castle commitments, Verascore reputation aggregating across operators. Cross-castle accountability post-action.
 - **Mantle (the unique-substrate-binding).** Install-time substrate-binding. The check that locks Sanctuary to the operator's machine at install time and rejects orphan agent identifiers not bound to a wrapped harness.
 
@@ -34,7 +34,7 @@ Castle-walking principle: real enforcement AND delightful operator experience. H
 
 Target: OS-level egress filtering via netfilter / NFQUEUE with per-process cgroup routing, so outbound calls are blocked at the kernel even when the agent is prompt-injected, jailbroken, or simply not bothering to cooperate. Current bound: the Linux modules are proven in integration tests, but the shipped daemon does not assemble that enforcement loop. **Why it matters:** this is the security claim the Linux row must earn before it can be called shipped.
 
-*Status: not shipped as enforcement. ASSURANCE_MATRIX row "Egress enforcement: Linux (Castle Wall Phase 1)" is `not_implemented`, so marketing and release copy may not trace a Linux enforcement claim to it. Open defect: **IC-02, IC-03, IC-04** (`docs/audit/inert-capability-register.md`).*
+*Status: not shipped as enforcement. ASSURANCE_MATRIX row "Egress enforcement: Linux (Castle Wall Phase 1)" is `not_implemented`, so marketing and release copy may not trace a Linux enforcement claim to it. Open defect: **IC-02, IC-03, IC-04**.*
 
 ### Castle Wall on macOS: signed system extension, enforced and attended-reboot-surviving
 
@@ -70,9 +70,9 @@ The signed system extension, host app, content-filter provider, and retail UX sh
 
 ### Cryptographic identity, encrypted state, audit chain
 
-Ed25519 identity you hold (Argon2id passphrase unlock, per-purpose HKDF subkeys). AES-256-GCM state at rest. Hash-chained audit log with a standalone external verifier. Production checkpoints are unsigned today, and `audit-chain verify --no-strict` can report PASS with findings. Open defect: **IC-05, IC-06** (`docs/audit/inert-capability-register.md`). Identity keys never leave Sanctuary in plaintext. Recovery is inspectable, with M-of-N guardian eviction shipped for the guardian-recovery path. Audit entries embed a scheme identifier, and hybrid post-quantum signing (Ed25519 + ML-DSA / FIPS 204) has landed on that crypto-agility path without breaking historical receipts. **Why it matters:** the cryptographic primitives are what makes "your keys" a structural claim rather than a marketing claim.
+Ed25519 identity you hold (Argon2id passphrase unlock, per-purpose HKDF subkeys). AES-256-GCM state at rest. Hash-chained audit log with a standalone external verifier. Production checkpoints are unsigned today, and `audit-chain verify --no-strict` can report PASS with findings. Open defect: **IC-05, IC-06**. Identity keys never leave Sanctuary in plaintext. Recovery is inspectable, with M-of-N guardian eviction shipped for the guardian-recovery path. Audit entries embed a scheme identifier, and hybrid post-quantum signing (Ed25519 + ML-DSA / FIPS 204) has landed on that crypto-agility path without breaking historical receipts. **Why it matters:** the cryptographic primitives are what makes "your keys" a structural claim rather than a marketing claim.
 
-*Status: shipped for state encryption, state envelope integrity, critical audit durability, did:key encoding, and identity signing authority. ASSURANCE_MATRIX row "Tamper-evident audit chain" is partial until **IC-05, IC-06** are fixed (`docs/audit/inert-capability-register.md`).*
+*Status: shipped for state encryption, state envelope integrity, critical audit durability, did:key encoding, and identity signing authority. ASSURANCE_MATRIX row "Tamper-evident audit chain" is partial until **IC-05, IC-06** are fixed.*
 
 ### Three-tier Principal Policy gates with human-in-the-loop approval
 
@@ -88,9 +88,9 @@ Outbound queries strip operator-identifying headers (client-IP, fingerprint, cor
 
 ### Portable identity, state export, recovery flows
 
-Operator can export identity, state, reputation, and audit-chain material through shipped paths, but the full exit guarantee is partial: dashboard export omits the state re-key key, import hides skipped-entry counters, and rotated-key fortresses can silently lose pre-rotation state on import. Open defect: **IC-07, IC-08, IC-09** (`docs/audit/inert-capability-register.md`). Recovery key for lost-passphrase scenarios remains shipped. Tier-1 approval is required for export and import. **Why it matters:** the "exit" guarantee is structural only when the operator can verify that the whole bundle imports without silent loss.
+Operator can export identity, state, reputation, and audit-chain material through shipped paths, but the full exit guarantee is partial: dashboard export omits the state re-key key, import hides skipped-entry counters, and rotated-key fortresses can silently lose pre-rotation state on import. Open defect: **IC-07, IC-08, IC-09**. Recovery key for lost-passphrase scenarios remains shipped. Tier-1 approval is required for export and import. **Why it matters:** the "exit" guarantee is structural only when the operator can verify that the whole bundle imports without silent loss.
 
-*Status: partial. ASSURANCE_MATRIX row "Export / exit bundle" is partial until **IC-07, IC-08, IC-09** are fixed (`docs/audit/inert-capability-register.md`). `sanctuary exit inspect <dir>` is a read-only report of what a bundle carries and which credential it DECLARES it needs, so an operator can tell whether the key in their hand is the right KIND of key without running an import. It never opens a fortress, never asks for a passphrase, never writes, and deliberately makes no claim that any import will succeed; its `credential check:` line prints, on every path, exactly what was and was not checked.*
+*Status: partial. ASSURANCE_MATRIX row "Export / exit bundle" is partial until **IC-07, IC-08, IC-09** are fixed. `sanctuary exit inspect <dir>` is a read-only report of what a bundle carries and which credential it DECLARES it needs, so an operator can tell whether the key in their hand is the right KIND of key without running an import. It never opens a fortress, never asks for a passphrase, never writes, and deliberately makes no claim that any import will succeed; its `credential check:` line prints, on every path, exactly what was and was not checked.*
 
 ### Local multi-agent coordination and Sovereignty Dashboard
 
@@ -151,7 +151,7 @@ Today the macOS wall enforces and a per-rule read-out exists, but the unforgeabl
 
 #### Castle Wall on Windows
 
-Windows Filtering Platform backend. Same drill discipline as macOS. **Why it matters:** Windows operators get kernel-level enforcement held to the macOS bar, which is the only platform where the shipped artifact enforces today; Linux is `not_implemented` until **IC-02, IC-03, IC-04** are fixed (`docs/audit/inert-capability-register.md`). Sequenced after the macOS discipline held end to end so the cross-platform bar stays consistent.
+Windows Filtering Platform backend. Same drill discipline as macOS. **Why it matters:** Windows operators get kernel-level enforcement held to the macOS bar, which is the only platform where the shipped artifact enforces today; Linux is `not_implemented` until **IC-02, IC-03, IC-04** are fixed. Sequenced after the macOS discipline held end to end so the cross-platform bar stays consistent.
 
 *Status: planning.*
 
@@ -189,7 +189,7 @@ Operator sees which security features actually fired today, with per-plugin attr
 
 Your agent's working data, query history, document corpus, and intermediate state live on your substrate, not in a vendor's silo. In the physical world, your body holds your memory; in the agent world, your substrate has to. **Why it matters:** the "your data" claim is structural only if the operator's working data actually lives where the operator controls it.
 
-*Status: core shipped (#420, #421, #422, #435, #436, #438, #440, #449): working-state, query-history, and document-corpus stores; enforced cannot-persist-secrets write gate; provenance-derived taint; blind query-history timestamps. The vault export/import claim is not shipped: no exposed `sdw_export` surface exists in the shipped bundle, violating the project MUST-NEVER rule that persisted agent output be inspectable, exportable, and deletable. Open defect: **IC-15** (`docs/audit/inert-capability-register.md`). Remaining: shipping vault export, the OSS memory-engine backend adapter (Letta first), and the PAM conformance profile.*
+*Status: core shipped (#420, #421, #422, #435, #436, #438, #440, #449): working-state, query-history, and document-corpus stores; enforced cannot-persist-secrets write gate; provenance-derived taint; blind query-history timestamps. The vault export/import claim is not shipped: no exposed `sdw_export` surface exists in the shipped bundle, violating the project MUST-NEVER rule that persisted agent output be inspectable, exportable, and deletable. Open defect: **IC-15**. Remaining: shipping vault export, the OSS memory-engine backend adapter (Letta first), and the PAM conformance profile.*
 
 #### Query-layer anonymity Tier 3
 

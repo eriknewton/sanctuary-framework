@@ -55,14 +55,14 @@ On Linux: kernel-level egress enforcement, shipped in May, with the bypass paths
 > nftables table, bind NFQUEUE, create cgroup scopes, or call the deny-by-default
 > evaluator, so Linux is source coverage rather than enforcement an operator can
 > run. The macOS evidence in the next paragraph is unaffected. Open defect:
-> **IC-02, IC-03, IC-04** (`docs/audit/inert-capability-register.md`).
+> **IC-02, IC-03, IC-04**.
 >
 > Audit correction, 2026-08-07: earlier versions described the log as "signed
 > and chained," which was too broad. Sanctuary's production audit log is hash-chained, but production boot
 > paths do not supply a checkpoint signer, so production checkpoints are written
 > unsigned. Strict verification detects tampering, while `audit-chain verify
 > --no-strict` can return PASS with findings. Open defect: **IC-05, IC-06**
-> (`docs/audit/inert-capability-register.md`).
+>.
 
 On macOS: a signed and notarized system extension enforcing a signed operator policy. In June we drilled it on real hardware: the agent's account blocked from a non-allowlisted destination, reaching its allowlisted one, the operator's account untouched, in the same armed window. Then we rebooted the machine through five attended cycles. The wall came back up every time within the proven scope.
 

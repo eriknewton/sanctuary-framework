@@ -133,7 +133,7 @@ These are testable assertions. Each should be verifiable by inspection or automa
 
 6. "Private keys never appear in any MCP tool response." *(Tested: `test/security/key-never-in-response.test.ts`)*
 7. "Identity key rotation produces a signed chain proving authorization: the new key is signed by the old key."
-8. "A user can export current identity and reputation artifacts through shipped paths." Full exit remains partial: dashboard export omits the state re-key key, import hides skipped-entry counters, and rotated-key imports can lose pre-rotation state. Open defect: **IC-07, IC-08, IC-09** (`docs/audit/inert-capability-register.md`).
+8. "A user can export current identity and reputation artifacts through shipped paths." Full exit remains partial: dashboard export omits the state re-key key, import hides skipped-entry counters, and rotated-key imports can lose pre-rotation state. Open defect: **IC-07, IC-08, IC-09**.
 
 **Operational sovereignty:**
 

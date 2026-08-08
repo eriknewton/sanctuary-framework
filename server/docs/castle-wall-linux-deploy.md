@@ -7,13 +7,13 @@ cgroup v2, and NFQUEUE modules are integration-tested, but the shipped daemon
 does not install the table, bind NFQUEUE, create cgroup scopes, or call the
 deny-by-default evaluator. The shipped systemd unit is also `Type=notify`
 without daemon readiness signaling. Open defect: **IC-02, IC-03, IC-04**
-(`docs/audit/inert-capability-register.md`).
+.
 
 The Linux implementation source is intended to use nftables for packet-routing
 decisions, cgroup v2 for per-agent process scope, and NFQUEUE for inline
 verdicts from the privileged daemon. The shipped daemon does not assemble that
 loop yet. Open defect: **IC-02, IC-04**
-(`docs/audit/inert-capability-register.md`). It does not load a
+. It does not load a
 custom kernel module.
 It does not use eBPF for Phase 1 enforcement. eBPF remains an
 observability substrate for Sentinel work, not the Layer 1 allow or deny
@@ -25,7 +25,7 @@ What Phase 1 source currently implements and tests:
 
 - Linux kernel-binding modules for nftables, cgroup v2, and NFQUEUE. They are
   tested, but not called by the shipped daemon boot path. Open defect:
-  **IC-02, IC-04** (`docs/audit/inert-capability-register.md`).
+  **IC-02, IC-04**.
 - Per-agent egress scope helpers. The shipped daemon does not create the
   transient units from `daemon::boot` yet.
 - Dedicated firewall namespace helpers. The shipped daemon does not install
@@ -58,7 +58,7 @@ What is NOT in Phase 1:
 - **nftables.** The source module shells out to `nft` and installs the
   `inet sanctuary-castle` table when called by tests; the shipped daemon boot
   path does not call it. Open defect: **IC-02**
-  (`docs/audit/inert-capability-register.md`).
+ .
 - **NFQUEUE libraries.** Development builds need
   `libnetfilter-queue-dev` and `libnfnetlink-dev`.
 - **Rust 1.74 or newer** when building the daemon from source.
@@ -75,7 +75,7 @@ sudo apt-get install -y nftables libnetfilter-queue-dev libnfnetlink-dev
 ## Architecture at a glance
 
 This diagram is the intended Phase 1 composition once **IC-02, IC-03, IC-04**
-are fixed (`docs/audit/inert-capability-register.md`). Today the
+are fixed. Today the
 source modules and integration tests cover these pieces, but the shipped daemon
 boot path does not wire the kernel-enforcement loop.
 
@@ -266,7 +266,7 @@ sudo nft list table inet sanctuary-castle
 
 Expected in that source-validation path. This is not expected from the shipped
 daemon boot path until **IC-02, IC-04** are fixed
-(`docs/audit/inert-capability-register.md`):
+:
 
 - Table family is `inet`.
 - Table name is `sanctuary-castle`.
@@ -298,7 +298,7 @@ sudo tail -n 5 /var/lib/sanctuary/<fortress-id>/filter-events.wal
 Expected after the enforcement loop is wired. Today the shipped daemon writes
 `daemon_started`, but egress decisions are not produced by a live NFQUEUE loop.
 Open defect: **IC-02, IC-04**
-(`docs/audit/inert-capability-register.md`):
+:
 
 - Mode `600`.
 - Owner `root`.
@@ -409,9 +409,9 @@ baseline yet. The intended kernel-level decision path is nftables plus cgroup
 v2 plus NFQUEUE, backed by the privileged Rust daemon's policy evaluator and
 WAL, but the shipped daemon boot path does not install or enter that path.
 Open defect: **IC-02, IC-03, IC-04**
-(`docs/audit/inert-capability-register.md`).
+.
 
 Cooperative MCP is the sovereignty surface for compliant agents. It is not a
 substitute for the Linux enforcement path. The Linux kernel-routing claim
 becomes true only after **IC-02, IC-03, IC-04** are fixed
-(`docs/audit/inert-capability-register.md`).
+.
