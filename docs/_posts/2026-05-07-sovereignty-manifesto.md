@@ -78,7 +78,7 @@ These are not aspirational. They are buildable. We are building them. The v1.2 s
 > or call the deny-by-default evaluator, so Linux Castle Wall is not live
 > enforcement. macOS Phase 1 did later ship and is proven in the Assurance
 > Matrix. Open defect: **IC-02, IC-03, IC-04**
-> (`docs/audit/inert-capability-register.md`).
+>.
 
 ## The Castle Architecture
 
@@ -88,7 +88,7 @@ Sanctuary's enforcement model has four layers. They work together just like the 
 
 **Sentinels.** The watchtowers do not block; they see, and they call out. Internal observation, not enforcement. Behavioral baselining via process introspection. Anomalies surface to the operator via menubar and operating-system notifications. Sentinels see what the wall cannot: file-access patterns, internal model calls, cross-agent coordination, prompt-injection signatures in internal communications. The sentinels surface. The operator decides.
 
-**The Charter.** Inside the walls, those who choose to work under the castle's terms gain the full measure of sovereignty. Additive sovereignty surface for compliant agents. Encrypted state, hash-chained audit, mandate primitives, four canonical policy slots, substrate selector, receipt integration. Production audit checkpoints are currently unsigned until **IC-05** closes, and `audit-chain verify --no-strict` can return PASS with findings until **IC-06** closes. Open defect: **IC-05, IC-06** (`docs/audit/inert-capability-register.md`). Compliant agents that voluntarily route through the Sanctuary surface get the full sovereignty primitives. Non-compliant agents do not break the castle; they hit the wall at the boundary and the sentinels inside.
+**The Charter.** Inside the walls, those who choose to work under the castle's terms gain the full measure of sovereignty. Additive sovereignty surface for compliant agents. Encrypted state, hash-chained audit, mandate primitives, four canonical policy slots, substrate selector, receipt integration. Production audit checkpoints are currently unsigned until **IC-05** closes, and `audit-chain verify --no-strict` can return PASS with findings until **IC-06** closes. Open defect: **IC-05, IC-06**. Compliant agents that voluntarily route through the Sanctuary surface get the full sovereignty primitives. Non-compliant agents do not break the castle; they hit the wall at the boundary and the sentinels inside.
 
 **The Heralds.** The carriers of verified accounts between castles make commerce honest without prior trust. Receipts on cross-castle transactions. Reputation aggregating across operators. Cross-castle accountability after the action. Portable reputation that survives vendor churn. This is how operators hold each other honest when they have no prior relationship.
 
@@ -104,7 +104,7 @@ Five operator rights are foundational. The substrate guarantees all five at zero
 
 **Data.** The operator's working memory, audit log, and durable record are encrypted at rest with operator-held keys. No vendor reads the operator's bytes by default.
 
-**Portability.** The operator's identity and record can be exported as a sealed bundle and imported through current exit paths, but exit remains partial: dashboard export omits the state re-key key, import hides skipped-entry counters, and rotated-key imports can lose pre-rotation state. Open defect: **IC-07, IC-08, IC-09** (`docs/audit/inert-capability-register.md`).
+**Portability.** The operator's identity and record can be exported as a sealed bundle and imported through current exit paths, but exit remains partial: dashboard export omits the state re-key key, import hides skipped-entry counters, and rotated-key imports can lose pre-rotation state. Open defect: **IC-07, IC-08, IC-09**.
 
 **Attestation.** Approved actions produce hash-chained audit entries the operator controls. Counterparty-verifiable evidence is strongest at checkpoint and receipt surfaces where a signer is actually wired; production audit checkpoints are unsigned until **IC-05** closes. Attestation is not gated by a vendor's signing authority.
 
@@ -164,7 +164,7 @@ If you are an enterprise buyer evaluating sovereign deployment: pilot conversati
 > Live kernel enforcement is proven on macOS; the shipped Linux daemon installs
 > no kernel enforcement, so a Linux pilot demo cannot be offered on that basis.
 > Open defect: **IC-02, IC-03, IC-04**
-> (`docs/audit/inert-capability-register.md`).
+>.
 
 If you are a partner building a payment rail, mandate framework, identity registry, or reputation engine: compose with us. The substrate is open source and free always. We ship reference integrations against your primitives. We contribute upstream as the operator-side complement to your work. The operator-sovereign reference implementation is the most useful partner you can have if your goal is genuine portability rather than soft lock-in.
 

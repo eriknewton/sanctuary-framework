@@ -52,7 +52,7 @@ This isn't a philosophical distinction. It's an architectural one.
 
 ## The Concrete Differences
 
-**Portability.** Sanctuary's Sovereignty Health Report, attestations, and reputation bundles are portable across instances. You can export current identity and reputation artifacts and move them to a different machine, cloud, or harness, with exit-bundle caveats for dashboard export, skipped import counters, and rotated-key imports. Open defect: **IC-07, IC-08, IC-09** (`docs/audit/inert-capability-register.md`). Microsoft's governance is Azure-native. Your agent's security posture exists within the Microsoft ecosystem.
+**Portability.** Sanctuary's Sovereignty Health Report, attestations, and reputation bundles are portable across instances. You can export current identity and reputation artifacts and move them to a different machine, cloud, or harness, with exit-bundle caveats for dashboard export, skipped import counters, and rotated-key imports. Open defect: **IC-07, IC-08, IC-09**. Microsoft's governance is Azure-native. Your agent's security posture exists within the Microsoft ecosystem.
 
 **Selective disclosure.** Sanctuary's Layer 3 provides Pedersen commitments, Schnorr proofs, and range proofs, genuine zero-knowledge cryptographic primitives that let an agent prove claims about its data without revealing the underlying values. No other framework in this space offers this. Microsoft's toolkit handles identity and access control but doesn't address the question: how does an agent prove something about itself to a counterparty it doesn't fully trust?
 
