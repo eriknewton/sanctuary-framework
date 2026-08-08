@@ -76,7 +76,9 @@ for first ingest and 8052 ms for re-ingest. If another process still holds the
 lock beyond that budget, the caller sees a `CrossProcessLockError` whose message
 names the lock path and includes the manual recovery command. There is no
 automatic stale-break; a dead holder is recovered by manually removing that exact
-lock path after confirming no other Sanctuary process is running.
+lock path after confirming no other Sanctuary process is running. At the MCP
+tool surface, the agent caller receives the fixed denial shape; the lock-path
+recovery hint reaches the operator-readable denial audit record.
 
 ## Custody invariants preserved
 

@@ -176,7 +176,11 @@ export async function ingestClaudeCodeMemoryDirectory(
  * reporting) any individual file the SDW write gate refuses.
  *
  * Two properties this function must keep, both learned from real large memory
- * directories in which the secret classifier refused files:
+ * directories in which the secret classifier refused files. Concrete
+ * measurement, 2026-08-07: readClaudeCodeMemoryDirectory plus
+ * SdwMemoryBackendAdapter.screenPassage over a real Claude Code memory
+ * directory refused 147 of 414 markdown files (35.5%); MEMORY.md itself was
+ * among the refused files. The measurement collected counts only.
  *
  *  - A refused file is a REPORTED SKIP, never a whole-run abort. It is also
  *    never an exemption: the same gate still runs on everything written, and

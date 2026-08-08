@@ -184,14 +184,23 @@ describe("memory file CLI: fortress-backed round trip", () => {
     while (cleanupTasks.length > 0) await cleanupTasks.pop()!();
   });
 
-  async function auditOperations(): Promise<string[]> {
+  async function auditEntries(): Promise<
+    Array<{ operation: string; details: Record<string, unknown> }>
+  > {
     const storage = new FilesystemStorage(join(fortress, "state"));
     const masterKey = await resolveCliMasterKey(storage, {
       passphrase: PASSPHRASE,
       storagePathHint: fortress,
     });
     const result = await new AuditLog(storage, masterKey).query({ limit: 1000 });
-    return result.entries.map((entry) => entry.operation);
+    return result.entries.map((entry) => ({
+      operation: entry.operation,
+      details: (entry.details ?? {}) as Record<string, unknown>,
+    }));
+  }
+
+  async function auditOperations(): Promise<string[]> {
+    return (await auditEntries()).map((entry) => entry.operation);
   }
 
   it("ingests, emits, and records the intent BEFORE and the outcome AFTER each operation", async () => {
@@ -232,16 +241,20 @@ describe("memory file CLI: fortress-backed round trip", () => {
       );
     }
 
-    const operations = await auditOperations();
+    const entries = await auditEntries();
     // Order matters: the intent record precedes the work, and the record that
     // asserts the work happened comes after it.
-    const relevant = operations.filter((op) => op.startsWith("memory_"));
-    expect(relevant).toEqual([
+    const relevant = entries.filter((entry) => entry.operation.startsWith("memory_"));
+    expect(relevant.map((entry) => entry.operation)).toEqual([
       "memory_ingest_started",
       "memory_ingest",
       "memory_emit_started",
       "memory_emit",
     ]);
+    expect(relevant.find((entry) => entry.operation === "memory_emit")!.details).toMatchObject({
+      emitted_file_count: 3,
+      index_present: true,
+    });
   }, 60_000);
 
   it("accepts the passphrase on stdin instead of argv", async () => {
@@ -332,6 +345,11 @@ describe("memory file CLI: fortress-backed round trip", () => {
     expect(emitErr.text()).toContain("missing MEMORY.md");
     expect((await readdir(output)).filter((name) => name.endsWith(".md")).sort())
       .not.toContain("MEMORY.md");
+    expect((await auditEntries()).find((entry) => entry.operation === "memory_emit")!.details)
+      .toMatchObject({
+        emitted_file_count: 2,
+        index_present: false,
+      });
   }, 60_000);
 
   it("fails closed with a denial record when the source directory does not exist", async () => {

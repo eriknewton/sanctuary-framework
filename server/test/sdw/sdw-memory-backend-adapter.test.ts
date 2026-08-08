@@ -1,8 +1,8 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { StorageBackend, StorageEntryMeta } from "../../src/storage/interface.js";
 import {
   chunkText,
@@ -17,10 +17,12 @@ import {
   encryptedEnvelopeContains,
 } from "../../src/sdw/write-gate.js";
 import { SdwValidationError } from "../../src/sdw/errors.js";
+import { CrossProcessLockError } from "../../src/storage/cross-process-lock.js";
 
 const FORTRESS_ID = "fortress:test";
 const MASTER_KEY = new Uint8Array(32).fill(7);
 const NOW = "2026-06-11T00:00:00.000Z";
+const EXPECTED_BATCH_LOCK_TIMEOUT_MS = 30_000;
 
 class MemoryStorage implements StorageBackend {
   readonly data = new Map<string, Uint8Array>();
@@ -436,6 +438,44 @@ describe("SDW memory-backend adapter: write-gate enforcement", () => {
 
       expect(storage.lockNamespaces).toEqual(["sdw_memory_locks"]);
       await expect(adapter.getPassage("locked-batch")).resolves.toMatchObject({ text: "ok" });
+    } finally {
+      await rm(lockRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("uses the measured 30 s timeout for filesystem-style owner-scope batch locks", async () => {
+    const lockRoot = await mkdtemp(join(tmpdir(), "sdw-memory-lock-timeout-"));
+    try {
+      const storage = new LockTrackingStorage(lockRoot);
+      const adapter = makeAdapter(storage);
+      const lockDir = join(lockRoot, "sdw_memory_locks");
+      await mkdir(lockDir, { recursive: true, mode: 0o700 });
+      await writeFile(
+        join(lockDir, "mem.letta-archive-1.batch-replace.lock"),
+        JSON.stringify({ pid: process.pid, acquired_at: NOW }),
+      );
+
+      const nowSpy = vi.spyOn(Date, "now");
+      nowSpy.mockReturnValue(EXPECTED_BATCH_LOCK_TIMEOUT_MS);
+      nowSpy.mockReturnValueOnce(0);
+      try {
+        let caught: unknown;
+        try {
+          await adapter.putPassages(
+            [{ passage_id: "lock-timeout", text: "blocked" }],
+            "user_content",
+          );
+        } catch (error) {
+          caught = error;
+        }
+        expect(caught).toBeInstanceOf(CrossProcessLockError);
+        expect(caught).toMatchObject({
+          name: "CrossProcessLockError",
+          message: expect.stringContaining("held >30000ms"),
+        });
+      } finally {
+        nowSpy.mockRestore();
+      }
     } finally {
       await rm(lockRoot, { recursive: true, force: true });
     }
