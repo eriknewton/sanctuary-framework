@@ -220,6 +220,7 @@ describe("memory file CLI: fortress-backed round trip", () => {
     });
     expect(emitCode).toBe(0);
     expect(emitOut.text()).toContain("emitted 3 Claude Code memory files");
+    expect(emitOut.text()).toContain("index_present: yes");
 
     // Byte-faithful round trip through the encrypted vault.
     expect((await readdir(output)).filter((f) => f.endsWith(".md")).sort()).toEqual(
@@ -296,6 +297,41 @@ describe("memory file CLI: fortress-backed round trip", () => {
       "memory_ingest_started",
       "memory_ingest",
     ]);
+  }, 60_000);
+
+  it("warns when emit cannot produce a re-ingestable Claude Code memory tree", async () => {
+    const source = await copyFixtureSet("basic", "memfile-cli-index-skip-source");
+    await writeFile(
+      join(source, "MEMORY.md"),
+      "# Memory index\n\nThe principal policy file lives in the fortress root.\n",
+    );
+    const output = await tempDir("memfile-cli-index-output");
+
+    const ingestOut = makeSink();
+    const ingestErr = makeSink();
+    const ingestCode = await runMemoryIngestCommand({
+      argv: ["--harness", "claude-code", "--dir", source, "--fortress", fortress],
+      out: ingestOut.stream,
+      err: ingestErr.stream,
+      env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
+    });
+    expect(ingestCode).toBe(0);
+    expect(ingestErr.text()).toContain("MEMORY.md (classifier_reject)");
+
+    const emitOut = makeSink();
+    const emitErr = makeSink();
+    const emitCode = await runMemoryEmitCommand({
+      argv: ["--harness", "claude-code", "--dir", output, "--fortress", fortress],
+      out: emitOut.stream,
+      err: emitErr.stream,
+      env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
+    });
+
+    expect(emitCode).toBe(0);
+    expect(emitOut.text()).toContain("index_present: no");
+    expect(emitErr.text()).toContain("missing MEMORY.md");
+    expect((await readdir(output)).filter((name) => name.endsWith(".md")).sort())
+      .not.toContain("MEMORY.md");
   }, 60_000);
 
   it("fails closed with a denial record when the source directory does not exist", async () => {

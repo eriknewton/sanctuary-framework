@@ -93,9 +93,25 @@ function denialCategory(error: unknown, fallback: string): string {
 }
 
 function errorCauseDetail(error: unknown): Record<string, string> {
-  if (!(error instanceof SdwValidationError)) return {};
-  const cause = errorCauseMessage(error.cause);
-  return cause === undefined ? {} : { error_cause: cause };
+  const cause = errorCauseMessage(errorCause(error));
+  if (error instanceof SdwValidationError) {
+    return cause === undefined ? {} : { error_cause: cause };
+  }
+  return { error_message: errorMessage(error) };
+}
+
+function errorName(error: unknown): string {
+  return error instanceof Error ? error.name : "Error";
+}
+
+function errorMessage(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  const cause = errorCauseMessage(errorCause(error));
+  return cause === undefined ? message : `${message}; cause: ${cause}`;
+}
+
+function errorCause(error: unknown): unknown {
+  return error instanceof Error ? error.cause : undefined;
 }
 
 function errorCauseMessage(cause: unknown): string | undefined {
@@ -233,6 +249,7 @@ export function createSdwMemoryFileTools(options: SdwMemoryFileToolsOptions): To
       } catch (error) {
         await auditFailure("memory_ingest_denied", {
           denial_class: denialCategory(error, "ingest_failed"),
+          error_class: errorName(error),
           ...errorCauseDetail(error),
           harness,
           owner_ref: adapter.ownerRef,
@@ -249,7 +266,9 @@ export function createSdwMemoryFileTools(options: SdwMemoryFileToolsOptions): To
     description:
       "Manually emit Claude Code memory files from the SDW vault into an " +
       "operator-named output directory. Existing memory files are never " +
-      "overwritten. Emitted files are plaintext for the harness; " +
+      "overwritten. The result reports index_present; false means the emitted " +
+      "tree cannot be re-ingested as a Claude Code memory directory. Emitted " +
+      "files are plaintext for the harness; " +
       "this does not sync or write back to the source memory directory, and " +
       "memory later sent to a model vendor is exposed to that vendor at inference.",
     tool_class: "write",
@@ -292,16 +311,19 @@ export function createSdwMemoryFileTools(options: SdwMemoryFileToolsOptions): To
           output_dir: dir,
           owner_ref: adapter.ownerRef,
           emitted_file_count: result.emitted.length,
+          index_present: result.index_present,
         });
         return toolResult({
           emitted: true,
           harness,
           file_count: result.emitted.length,
+          index_present: result.index_present,
           files: result.emitted,
         });
       } catch (error) {
         await auditFailure("memory_emit_denied", {
           denial_class: denialCategory(error, "emit_failed"),
+          error_class: errorName(error),
           ...errorCauseDetail(error),
           harness,
           owner_ref: adapter.ownerRef,

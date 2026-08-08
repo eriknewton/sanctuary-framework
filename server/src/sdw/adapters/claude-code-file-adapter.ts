@@ -87,6 +87,8 @@ export interface EmitClaudeCodeMemoryResult {
     readonly passage_id: string;
     readonly source_path: string;
   }[];
+  /** True when the emitted tree includes the Claude Code index file. */
+  readonly index_present: boolean;
 }
 
 const DIGEST_HEX_CHARS = 16; // 16 hex chars = 64 bits of collision suffix.
@@ -173,8 +175,8 @@ export async function ingestClaudeCodeMemoryDirectory(
  * Mirror a snapshot into the vault as one verified unit, skipping (and
  * reporting) any individual file the SDW write gate refuses.
  *
- * Two properties this function must keep, both learned from a real 405-file
- * memory directory in which the secret classifier refused 35 files:
+ * Two properties this function must keep, both learned from real large memory
+ * directories in which the secret classifier refused files:
  *
  *  - A refused file is a REPORTED SKIP, never a whole-run abort. It is also
  *    never an exemption: the same gate still runs on everything written, and
@@ -298,11 +300,13 @@ export async function emitClaudeCodeMemoryDirectory(
     throw error;
   }
 
+  const emitted = targets.map((item) => ({
+    passage_id: item.passage.passage_id,
+    source_path: item.relativePath,
+  }));
   return {
-    emitted: targets.map((item) => ({
-      passage_id: item.passage.passage_id,
-      source_path: item.relativePath,
-    })),
+    emitted,
+    index_present: emitted.some((item) => item.source_path === CLAUDE_CODE_MEMORY_INDEX),
   };
 }
 

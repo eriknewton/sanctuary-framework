@@ -183,12 +183,19 @@ export async function runMemoryEmitCommand(
         output_dir: parsed.dir,
         owner_ref: parsed.ownerRef,
         emitted_file_count: result.emitted.length,
+        index_present: result.index_present,
       },
     });
     write(
       out,
-      `memory_emit: emitted ${String(result.emitted.length)} Claude Code memory files to ${parsed.dir}\n`,
+      `memory_emit: emitted ${String(result.emitted.length)} Claude Code memory files to ${parsed.dir} (index_present: ${result.index_present ? "yes" : "no"})\n`,
     );
+    if (!result.index_present) {
+      write(
+        err,
+        `memory_emit: WARNING - emitted tree is missing MEMORY.md and cannot be re-ingested as a Claude Code memory directory.\n`,
+      );
+    }
     return 0;
   } catch (error) {
     await appendFailure(boot.auditLog, "memory_emit", {

@@ -68,6 +68,7 @@ const MEMORY_PASSAGE_ID_MAC_DOMAIN = "sanctuary.sdw-memory-passage-id.v1";
 const MEMORY_PASSAGE_ID_HEX_CHARS = 32;
 const MEMORY_BATCH_LOCK_NAMESPACE = "sdw_memory_locks";
 const MEMORY_BATCH_LOCK_FILE = "batch-replace.lock";
+const MEMORY_BATCH_LOCK_TIMEOUT_MS = 30_000;
 
 const DEFAULT_MAX_CHUNK_CHARS = 8192;
 const MAX_CONFIGURABLE_CHUNK_CHARS = 100_000;
@@ -278,6 +279,13 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
             // so it must not fail the write.
             await this.pruneOrphanChunks(prepared, prior);
             return prepared.map((item) => this.toPassage(item.documentRecord, item.text));
+          },
+          {
+            // Measured 2026-08-07 against a real 413-file Claude Code memory
+            // directory: first ingest 7184 ms, re-ingest 8052 ms. The 30 s
+            // budget gives this batch write room beyond the lock helper's
+            // default for millisecond-duration state writes.
+            timeoutMs: MEMORY_BATCH_LOCK_TIMEOUT_MS,
           },
         );
       }

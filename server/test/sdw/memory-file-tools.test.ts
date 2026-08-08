@@ -13,6 +13,7 @@ import { SdwValidationError } from "../../src/sdw/errors.js";
 import { createSdwMemoryFileTools, memoryFileApprovalArgs } from "../../src/sdw/memory-file-tools.js";
 import { createMultiAgentIsolationGuard } from "../../src/sdw/memory-isolation.js";
 import { createSdwMemoryTools } from "../../src/sdw/memory-tools.js";
+import { CrossProcessLockError } from "../../src/storage/cross-process-lock.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
 
 const FIXTURE_ROOT = fileURLToPath(
@@ -204,7 +205,7 @@ describe("SDW memory file tools", () => {
     expect(ingestOutcome.details.skipped_file_count).toBe(0);
     expect(ingestOutcome.details.complete).toBe(true);
     expect(auditCalls.find((call) => call.operation === "memory_emit")!.details)
-      .toMatchObject({ emitted_file_count: 2 });
+      .toMatchObject({ emitted_file_count: 2, index_present: true });
   });
 
   it("reports skipped files in the result AND in the outcome audit record", async () => {
@@ -317,6 +318,110 @@ describe("SDW memory file tools", () => {
         error_cause: "injected rollback verifier failure",
       },
     });
+  });
+
+  it("preserves non-validation error identity and message in MCP denial audits", async () => {
+    const auditCalls: AuditCall[] = [];
+    const auditLog = {
+      async appendCritical(entry: {
+        readonly operation: string;
+        readonly result: "success" | "failure";
+        readonly details?: Record<string, unknown>;
+      }): Promise<void> {
+        auditCalls.push({
+          operation: entry.operation,
+          result: entry.result,
+          details: entry.details ?? {},
+        });
+      },
+    } as unknown as AuditLog;
+    const lockError = new CrossProcessLockError(
+      "cross-process lock /tmp/sdw.lock held >30000ms; clear it with: rm '/tmp/sdw.lock'",
+    );
+    const adapter: MemoryBackendAdapter = {
+      ownerRef: "fleet-self",
+      derivePassageId: (_domain, label) => label.replace(/[^A-Za-z0-9._:@+-]/g, "."),
+      screenPassage: () => ({ ok: true }),
+      putPassages: async () => {
+        throw lockError;
+      },
+      insertPassage: async () => {
+        throw new Error("not used");
+      },
+      getPassage: async () => null,
+      searchPassages: async () => [],
+      listPassages: async () => {
+        throw lockError;
+      },
+      deletePassage: async () => false,
+      countPassages: async () => 0,
+    };
+    const tools = new Map(
+      createSdwMemoryFileTools({ adapter, auditLog, now: () => NOW }).map((tool) => [
+        tool.name,
+        tool,
+      ]),
+    );
+
+    expect(
+      parse(
+        await tools.get("memory_ingest")!.handler({
+          harness: "claude-code",
+          dir: join(FIXTURE_ROOT, "basic"),
+        }),
+      ).denied,
+    ).toBe(true);
+    const emitDenied = parse(
+      await tools.get("memory_emit")!.handler({ harness: "claude-code", dir: "/tmp/out" }),
+    );
+    expect(emitDenied.denied).toBe(true);
+
+    expect(auditCalls.find((call) => call.operation === "memory_ingest_denied")).toMatchObject({
+      result: "failure",
+      details: {
+        denial_class: "ingest_failed",
+        error_class: "CrossProcessLockError",
+        error_message: expect.stringContaining("rm '/tmp/sdw.lock'"),
+      },
+    });
+    expect(auditCalls.find((call) => call.operation === "memory_emit_denied")).toMatchObject({
+      result: "failure",
+      details: {
+        denial_class: "emit_failed",
+        error_class: "CrossProcessLockError",
+        error_message: expect.stringContaining("rm '/tmp/sdw.lock'"),
+      },
+    });
+  });
+
+  it("reports missing Claude Code index files in MCP emit results and audit", async () => {
+    const { tools, auditCalls } = await makeTools();
+    const source = await copyFixtureSet("basic", "cc-memory-tool-index-skip");
+    await writeFile(
+      join(source, "MEMORY.md"),
+      "# Memory index\n\nThe principal policy file lives in the fortress root.\n",
+    );
+    const output = await tempDir("cc-memory-tool-index-output");
+
+    const ingested = parse(
+      await tools.get("memory_ingest")!.handler({ harness: "claude-code", dir: source }),
+    );
+    expect(ingested.complete).toBe(false);
+    expect(ingested.skipped).toEqual([
+      expect.objectContaining({ source_path: "MEMORY.md", reason: "classifier_reject" }),
+    ]);
+
+    const emitted = parse(
+      await tools.get("memory_emit")!.handler({ harness: "claude-code", dir: output }),
+    );
+    expect(emitted.emitted).toBe(true);
+    expect(emitted.index_present).toBe(false);
+    const emittedPaths = (emitted.files as Array<{ source_path: string }>).map(
+      (file) => file.source_path,
+    );
+    expect(emittedPaths).not.toContain("MEMORY.md");
+    expect(auditCalls.find((call) => call.operation === "memory_emit")!.details)
+      .toMatchObject({ index_present: false });
   });
 
   it("denies unsupported harness values without touching the adapter", async () => {
