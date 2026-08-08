@@ -644,10 +644,10 @@ export function parseVerifyArgs(argv: string[], env?: NodeJS.ProcessEnv): Verify
   return { input, strict, publicKey, storagePath };
 }
 
-export async function runVerify(args: VerifyArgs): Promise<void> {
+export async function runVerify(args: VerifyArgs): Promise<number> {
   if (!args.input) {
     process.stderr.write("Error: --input <path> is required\n");
-    process.exit(1);
+    return 1;
   }
 
   let content: string;
@@ -655,7 +655,7 @@ export async function runVerify(args: VerifyArgs): Promise<void> {
     content = readFileSync(args.input, "utf8");
   } catch (err) {
     process.stderr.write(`Error reading ${args.input}: ${String(err)}\n`);
-    process.exit(1);
+    return 1;
   }
 
   const report = verifyAuditChainContent(content, {
@@ -667,5 +667,5 @@ export async function runVerify(args: VerifyArgs): Promise<void> {
   if (banner) process.stderr.write(banner);
   process.stdout.write(JSON.stringify(report, null, 2) + "\n");
 
-  process.exit(auditChainVerifyExitCode(report, args.strict));
+  return auditChainVerifyExitCode(report, args.strict);
 }

@@ -523,8 +523,7 @@ Examples:
       }
       const { parseVerifyArgs, runVerify } = await import("./cli/audit-chain-verify.js");
       const opts = parseVerifyArgs(subArgs, process.env);
-      await runVerify(opts);
-      process.exit(0);
+      return drainAndExit(await runVerify(opts));
     } else {
       // SAFETY: stderr / stdout is the operator-facing CLI channel; no logger module in scope.
       console.error(`Usage: sanctuary audit-chain <export|verify> [options]
