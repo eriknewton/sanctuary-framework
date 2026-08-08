@@ -410,6 +410,8 @@ export interface ExportExitBundleOptions {
    * the default cap.
    */
   auditReceiptsExportCap?: number;
+  /** Optional deterministic export clock for tests. */
+  now?: () => Date;
 }
 
 export interface ExportExitBundleResult {
@@ -743,7 +745,8 @@ function assertExportOptionsShape(opts: ExportExitBundleOptions): void {
 }
 
 async function exportEncryptedState(
-  opts: ExportExitBundleOptions
+  opts: ExportExitBundleOptions,
+  exportedAt: string,
 ): Promise<{
   bundle: ExitEncryptedStateBundle;
   rekeyKey?: string;
@@ -880,7 +883,7 @@ async function exportEncryptedState(
   return {
     bundle: {
       format: "SANCTUARY_EXIT_ENCRYPTED_STATE_V1",
-      exported_at: new Date().toISOString(),
+      exported_at: exportedAt,
       key_source: opts.keySource ?? "unknown",
       ownership_partitioned: opts.memoryClassPartition !== undefined,
       ...(emptyReason !== undefined ? { empty_reason: emptyReason } : {}),
@@ -903,7 +906,8 @@ async function exportEncryptedState(
 
 function exportPublicIdentity(
   identity: StoredIdentity,
-  masterKey: Uint8Array
+  masterKey: Uint8Array,
+  exportedAt: string,
 ): ExitPublicIdentityArtifact {
   const body: ExitPublicIdentityArtifact["bundle"] = {
     format: "SANCTUARY_IDENTITY_BUNDLE_V1",
@@ -914,7 +918,7 @@ function exportPublicIdentity(
     key_type: identity.key_type,
     key_protection: identity.key_protection,
     rotation_history: identity.rotation_history ?? [],
-    exported_at: new Date().toISOString(),
+    exported_at: exportedAt,
   };
   const signature = identitySign(
     canonicalizeToBytes(body),
@@ -941,13 +945,14 @@ function redactedPolicy(policy: PrincipalPolicy): PrincipalPolicy {
 
 function exportPolicySet(
   policy: PrincipalPolicy,
-  config?: SanctuaryConfig
+  config: SanctuaryConfig | undefined,
+  exportedAt: string,
 ): ExitPolicySetArtifact {
   const cfg = config ?? defaultConfig();
 
   return {
     format: "SANCTUARY_EXIT_POLICY_SET_V1",
-    exported_at: new Date().toISOString(),
+    exported_at: exportedAt,
     principal_policy: redactedPolicy(policy),
     config_summary: {
       version: cfg.version,
@@ -962,7 +967,8 @@ function exportPolicySet(
 
 async function exportAuditReceipts(
   auditLog: AuditLog,
-  cap: number = EXIT_AUDIT_RECEIPTS_EXPORT_CAP
+  cap: number,
+  exportedAt: string,
 ): Promise<{ artifact: ExitAuditReceiptsArtifact; warning?: string }> {
   await auditLog.flush();
   const result = await auditLog.query({ limit: cap });
@@ -975,7 +981,7 @@ async function exportAuditReceipts(
   const truncated = omitted > 0;
   const artifact: ExitAuditReceiptsArtifact = {
     format: "SANCTUARY_AUDIT_RECEIPTS_V1",
-    exported_at: new Date().toISOString(),
+    exported_at: exportedAt,
     total: result.total,
     recovery_semantics: "archive_only",
     normal_audit_query_continuity: false,
@@ -992,7 +998,8 @@ async function exportAuditReceipts(
 
 async function exportCommitments(
   storage: StorageBackend,
-  masterKey: Uint8Array
+  masterKey: Uint8Array,
+  exportedAt: string,
 ): Promise<ExitCommitmentsArtifact> {
   const encryptionKey = derivePurposeKey(masterKey, "l3-commitments");
   const publicCommitments: ExitCommitmentsArtifact["public_commitments"] = [];
@@ -1022,7 +1029,7 @@ async function exportCommitments(
   }
   return {
     format: "SANCTUARY_EXIT_COMMITMENTS_V1",
-    exported_at: new Date().toISOString(),
+    exported_at: exportedAt,
     public_commitments: publicCommitments,
     unreadable_count: unreadable,
     redacted_fields: ["value", "blinding_factor"],
@@ -1031,7 +1038,8 @@ async function exportCommitments(
 
 async function exportPlaceholderVaultMetadata(
   storage: StorageBackend,
-  masterKey: Uint8Array
+  masterKey: Uint8Array,
+  exportedAt: string,
 ): Promise<ExitPlaceholderVaultMetadataArtifact> {
   const encryptionKey = derivePurposeKey(masterKey, "l2-privacy-placeholders");
   const entries: Array<Record<string, unknown>> = [];
@@ -1067,7 +1075,7 @@ async function exportPlaceholderVaultMetadata(
   }
   return {
     format: "SANCTUARY_PLACEHOLDER_VAULT_METADATA_V1",
-    exported_at: new Date().toISOString(),
+    exported_at: exportedAt,
     entries,
     unreadable_count: unreadable,
     redacted_fields: ["raw_value", "raw_path"],
@@ -1077,6 +1085,10 @@ async function exportPlaceholderVaultMetadata(
 export async function exportExitBundle(
   opts: ExportExitBundleOptions
 ): Promise<ExportExitBundleResult> {
+  // INVARIANT: manifest `exported_at` is the did:web assertion time, so
+  // deterministic callers pin it here instead of comparing historical keys
+  // against the real wall clock.
+  const exportedAt = (opts.now ?? (() => new Date()))().toISOString();
   // INVARIANT (A9): every option-shape refusal fires BEFORE the first side
   // effect (mkdir / audit append / artifact write). A throw after
   // public_identity.json lands leaves a partial, unsigned artifact directory a
@@ -1131,11 +1143,11 @@ export async function exportExitBundle(
     await writeJsonArtifact(
       bundleDir,
       `${ARTIFACT_DIR}/public_identity.json`,
-      exportPublicIdentity(identity, opts.masterKey),
+      exportPublicIdentity(identity, opts.masterKey, exportedAt),
       "public_identity"
     )
   );
-  const encryptedStateExport = await exportEncryptedState(opts);
+  const encryptedStateExport = await exportEncryptedState(opts, exportedAt);
   // A zero-entry export is a legitimate outcome for a fresh fortress, but it
   // must never READ as a successful state export: the bundle still carries a
   // valid signed manifest and an `encrypted_state.json`, so an operator running
@@ -1162,13 +1174,14 @@ export async function exportExitBundle(
     await writeJsonArtifact(
       bundleDir,
       `${ARTIFACT_DIR}/policy_set.json`,
-      exportPolicySet(opts.policy, opts.config),
+      exportPolicySet(opts.policy, opts.config, exportedAt),
       "policy_set"
     )
   );
   const auditReceiptsExport = await exportAuditReceipts(
     opts.auditLog,
-    opts.auditReceiptsExportCap ?? EXIT_AUDIT_RECEIPTS_EXPORT_CAP
+    opts.auditReceiptsExportCap ?? EXIT_AUDIT_RECEIPTS_EXPORT_CAP,
+    exportedAt,
   );
   if (auditReceiptsExport.warning !== undefined) {
     exportWarnings.push(auditReceiptsExport.warning);
@@ -1193,7 +1206,7 @@ export async function exportExitBundle(
     await writeJsonArtifact(
       bundleDir,
       `${ARTIFACT_DIR}/commitments.json`,
-      await exportCommitments(opts.storage, opts.masterKey),
+      await exportCommitments(opts.storage, opts.masterKey, exportedAt),
       "commitments"
     )
   );
@@ -1201,7 +1214,7 @@ export async function exportExitBundle(
     await writeJsonArtifact(
       bundleDir,
       `${ARTIFACT_DIR}/placeholder_vault_metadata.json`,
-      await exportPlaceholderVaultMetadata(opts.storage, opts.masterKey),
+      await exportPlaceholderVaultMetadata(opts.storage, opts.masterKey, exportedAt),
       "placeholder_vault_metadata"
     )
   );
@@ -1210,7 +1223,7 @@ export async function exportExitBundle(
   // first side effect (A9), and is embedded here unchanged.
   const body: ExitBundleManifestBody = {
     manifest_version: EXIT_BUNDLE_MANIFEST_VERSION,
-    exported_at: new Date().toISOString(),
+    exported_at: exportedAt,
     identity_binding: {
       identity_id: identity.identity_id,
       fortress_id: identity.did,
