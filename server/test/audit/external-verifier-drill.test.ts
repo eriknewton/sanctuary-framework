@@ -41,6 +41,10 @@ import {
   type CheckpointExportRecord,
 } from "../../src/cli/audit-chain-export.js";
 import {
+  AUDIT_CHAIN_VERIFY_EXIT_OK,
+  AUDIT_CHAIN_VERIFY_EXIT_RELAXED_FINDINGS,
+  AUDIT_CHAIN_VERIFY_EXIT_STRICT_FINDINGS,
+  auditChainVerifyExitCode,
   verifyAuditChainRecords,
   parseJsonl,
   verifyAuditChainContent,
@@ -353,6 +357,44 @@ describe("external-verifier-drill: Scenario A - entry payload mutation", () => {
     expect(report.verdict).toBe("FAIL");
     expect(report.findings.length).toBeGreaterThan(0);
     expect(report.findings.some((f) => f.kind === "entry_hash_mismatch")).toBe(true);
+  });
+});
+
+describe("external-verifier-drill: CLI exit policy", () => {
+  it("returns exit 0 for a clean report", async () => {
+    const { storage, publicKey } = await buildSignedAuditChain();
+    const report = verifyAuditChainRecords(parseJsonl(await collectExport(storage)), {
+      publicKey,
+    });
+
+    expect(report.verdict).toBe("PASS");
+    expect(AUDIT_CHAIN_VERIFY_EXIT_OK).toBe(0);
+    expect(auditChainVerifyExitCode(report, true)).toBe(AUDIT_CHAIN_VERIFY_EXIT_OK);
+    expect(auditChainVerifyExitCode(report, false)).toBe(AUDIT_CHAIN_VERIFY_EXIT_OK);
+  });
+
+  it("returns exit 1 for strict verification findings", async () => {
+    const { storage, publicKey } = await buildSignedAuditChain();
+    const tampered = tamperEntryPayload(parseJsonl(await collectExport(storage)), 3);
+    const report = verifyAuditChainRecords(tampered, { publicKey });
+
+    expect(report.verdict).toBe("FAIL");
+    expect(AUDIT_CHAIN_VERIFY_EXIT_STRICT_FINDINGS).toBe(1);
+    expect(auditChainVerifyExitCode(report, true)).toBe(
+      AUDIT_CHAIN_VERIFY_EXIT_STRICT_FINDINGS,
+    );
+  });
+
+  it("returns exit 10 for --no-strict verification findings", async () => {
+    const { storage, publicKey } = await buildSignedAuditChain();
+    const tampered = tamperEntryPayload(parseJsonl(await collectExport(storage)), 3);
+    const report = verifyAuditChainRecords(tampered, { publicKey });
+
+    expect(report.verdict).toBe("FAIL");
+    expect(AUDIT_CHAIN_VERIFY_EXIT_RELAXED_FINDINGS).toBe(10);
+    expect(auditChainVerifyExitCode(report, false)).toBe(
+      AUDIT_CHAIN_VERIFY_EXIT_RELAXED_FINDINGS,
+    );
   });
 });
 

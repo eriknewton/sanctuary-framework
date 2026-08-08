@@ -506,9 +506,14 @@ Usage: sanctuary audit-chain verify --input <path> [--public-key <key>] [--no-st
 Options:
   --input <path>         JSONL file to verify (required)
   --public-key <key>     Ed25519 public key for signature check (base64url)
-  --no-strict            Report FAIL findings but exit 0 after verification
+  --no-strict            Report FAIL findings and exit 10 after verification
   --storage-path <path>  Override state directory
   --help, -h             Show this help
+
+Exit codes:
+  0  verification passed
+  1  strict verification found one or more findings
+ 10  --no-strict verification completed with one or more findings
 
 Examples:
   sanctuary audit-chain verify --input chain.jsonl

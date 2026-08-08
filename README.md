@@ -72,7 +72,7 @@ Current capability summary:
 | Cooperative MCP gates: three-tier approval, four canonical policy slots, channel templates | Shipped |
 | Context gating, sensitive-field redaction, query-layer anonymity (header strip default-on; opt-in PII rewrite live, classifier surface pinned local-only) | Shipped |
 | Portable identity, state export/import, recovery flows, reputation bundles | Partial for exit bundles until **IC-07, IC-08, IC-09** are fixed |
-| Local multi-agent coordination, fortress-local hub APIs, audit chain | Shipped with audit-chain verifier caveats: production checkpoints are unsigned and `--no-strict` can report PASS with findings. Open defect: **IC-05, IC-06** |
+| Local multi-agent coordination, fortress-local hub APIs, audit chain | Shipped with audit-chain verifier caveat: production checkpoints are unsigned. Open defect: **IC-05** |
 | Federation Protocol v0.1 foundation | Shipped; cross-operator federation hardening underway per Wave 1 design (2026-05-26) |
 | Concordia composition (negotiation receipts), Verascore composition (reputation) | Optional, default off; both shipped |
 | Castle Wall (OS-level egress enforcement): Linux | Not implemented. Source modules are integration-proven; the shipped daemon installs no enforcement, so the Assurance Matrix row is `not_implemented` and no claim may trace to it. Open defect: **IC-02, IC-03, IC-04** |
@@ -306,7 +306,7 @@ Sanctuary installs the protections your body used to provide by default: a perim
 
 **Sentinels: the nerves.** What surfaces what's happening to your awareness. Internal observation via process introspection and behavioral baselining. Anomalies surface through the menubar or notifications. Observation, not enforcement.
 
-**Charter: the will.** What you train your agent to choose voluntarily. The additive cooperative MCP surface for compliant agents. Operator-rooted cryptographic identity (Ed25519 signing, Argon2id passphrase unlock, per-purpose HKDF subkeys). Per-agent encrypted state at rest (AES-256-GCM). Three-tier Principal Policy gates with channel-template binding. Hash-chained audit with rollback detection. Production audit checkpoints are currently unsigned until **IC-05** closes, and `audit-chain verify --no-strict` can return PASS with findings until **IC-06** closes. Open defect: **IC-05, IC-06**.
+**Charter: the will.** What you train your agent to choose voluntarily. The additive cooperative MCP surface for compliant agents. Operator-rooted cryptographic identity (Ed25519 signing, Argon2id passphrase unlock, per-purpose HKDF subkeys). Per-agent encrypted state at rest (AES-256-GCM). Three-tier Principal Policy gates with channel-template binding. Hash-chained audit with rollback detection. Production audit checkpoints are currently unsigned until **IC-05** closes. Open defect: **IC-05**.
 
 **Heralds: the voice.** How you speak to and are recognized by other sovereigns. Optional composition surface (Concordia for structured negotiation, Verascore for portable reputation). Receipts and reputation attestations can be exported through current paths; the full exit guarantee remains partial until **IC-07, IC-08, IC-09** close. Default off; both compositions are optional.
 

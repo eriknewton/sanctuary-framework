@@ -39,7 +39,7 @@
  * Usage:
  *   sanctuary audit-chain verify --input chain.jsonl [--public-key <base64url>]
  *   sanctuary audit-chain verify --input chain.jsonl --no-strict
- *     # still reports FAIL findings, but exits 0 after completing verification
+ *     # still reports FAIL findings, then exits 10 after completing verification
  */
 
 import { readFileSync } from "node:fs";
@@ -264,6 +264,9 @@ export interface RecordFinding {
 }
 
 export type VerifyVerdict = "PASS" | "FAIL";
+export const AUDIT_CHAIN_VERIFY_EXIT_OK = 0;
+export const AUDIT_CHAIN_VERIFY_EXIT_STRICT_FINDINGS = 1;
+export const AUDIT_CHAIN_VERIFY_EXIT_RELAXED_FINDINGS = 10;
 
 export interface VerifyReport {
   verdict: VerifyVerdict;
@@ -300,8 +303,8 @@ export const ROTATION_ANCHOR_SCOPE =
  * @param records - Parsed records from the export file (entries + checkpoints in any order)
  * @param opts.publicKey - Optional base64url-encoded public key override for checkpoint verification.
  *   If omitted, each checkpoint's embedded public_key field is used.
- * @param opts.strict - Kept for callers that pair report generation with CLI exit policy.
- *   Report truth is independent of strictness: any finding yields a FAIL verdict.
+ * @param opts.strict - Backwards-compatible no-op. Exit strictness is applied
+ *   by the CLI layer after report generation, never by this verifier.
  */
 export function verifyAuditChainRecords(
   records: ExportRecord[],
@@ -523,8 +526,6 @@ export function verifyAuditChainRecords(
     }
   }
 
-  // Strictness controls CLI exit policy only; the JSON verdict must always tell
-  // the truth about findings so relaxed callers cannot mistake them for PASS.
   const verdict: VerifyVerdict = findings.length > 0 ? "FAIL" : "PASS";
 
   return {
@@ -532,6 +533,8 @@ export function verifyAuditChainRecords(
     entries_verified: entries.length,
     checkpoints_verified: checkpoints.length,
     signatures_verified: signaturesVerified,
+    // These counters are positive evidence, not a partition: missing-key and
+    // marked-signed-without-signature checkpoints produce findings instead.
     signatures_skipped: signaturesSkipped,
     legacy_anchors_verified: legacyAnchors.length,
     rotation_anchor_scope: ROTATION_ANCHOR_SCOPE,
@@ -611,6 +614,16 @@ export function verifyAuditChainContent(
   return verifyAuditChainRecords(records, opts);
 }
 
+export function auditChainVerifyExitCode(
+  report: VerifyReport,
+  strict: boolean,
+): number {
+  if (report.verdict === "PASS") return AUDIT_CHAIN_VERIFY_EXIT_OK;
+  return strict
+    ? AUDIT_CHAIN_VERIFY_EXIT_STRICT_FINDINGS
+    : AUDIT_CHAIN_VERIFY_EXIT_RELAXED_FINDINGS;
+}
+
 // ---- CLI entry point --------------------------------------------------------
 
 export interface VerifyArgs {
@@ -654,7 +667,5 @@ export async function runVerify(args: VerifyArgs): Promise<void> {
   if (banner) process.stderr.write(banner);
   process.stdout.write(JSON.stringify(report, null, 2) + "\n");
 
-  if (args.strict && report.verdict === "FAIL") {
-    process.exit(1);
-  }
+  process.exit(auditChainVerifyExitCode(report, args.strict));
 }
