@@ -506,9 +506,14 @@ Usage: sanctuary audit-chain verify --input <path> [--public-key <key>] [--no-st
 Options:
   --input <path>         JSONL file to verify (required)
   --public-key <key>     Ed25519 public key for signature check (base64url)
-  --no-strict            Continue on verification failures
+  --no-strict            Report FAIL findings and exit 10 after verification
   --storage-path <path>  Override state directory
   --help, -h             Show this help
+
+Exit codes:
+  0  verification passed
+  1  strict verification found one or more findings
+ 10  --no-strict verification completed with one or more findings
 
 Examples:
   sanctuary audit-chain verify --input chain.jsonl
@@ -518,8 +523,7 @@ Examples:
       }
       const { parseVerifyArgs, runVerify } = await import("./cli/audit-chain-verify.js");
       const opts = parseVerifyArgs(subArgs, process.env);
-      await runVerify(opts);
-      process.exit(0);
+      return drainAndExit(await runVerify(opts));
     } else {
       // SAFETY: stderr / stdout is the operator-facing CLI channel; no logger module in scope.
       console.error(`Usage: sanctuary audit-chain <export|verify> [options]

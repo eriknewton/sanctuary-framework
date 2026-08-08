@@ -39,6 +39,7 @@
  * Usage:
  *   sanctuary audit-chain verify --input chain.jsonl [--public-key <base64url>]
  *   sanctuary audit-chain verify --input chain.jsonl --no-strict
+ *     # still reports FAIL findings, then exits 10 after completing verification
  */
 
 import { readFileSync } from "node:fs";
@@ -263,11 +264,16 @@ export interface RecordFinding {
 }
 
 export type VerifyVerdict = "PASS" | "FAIL";
+export const AUDIT_CHAIN_VERIFY_EXIT_OK = 0;
+export const AUDIT_CHAIN_VERIFY_EXIT_STRICT_FINDINGS = 1;
+export const AUDIT_CHAIN_VERIFY_EXIT_RELAXED_FINDINGS = 10;
 
 export interface VerifyReport {
   verdict: VerifyVerdict;
   entries_verified: number;
   checkpoints_verified: number;
+  signatures_verified: number;
+  signatures_skipped: number;
   legacy_anchors_verified: number;
   findings: RecordFinding[];
   /**
@@ -297,14 +303,16 @@ export const ROTATION_ANCHOR_SCOPE =
  * @param records - Parsed records from the export file (entries + checkpoints in any order)
  * @param opts.publicKey - Optional base64url-encoded public key override for checkpoint verification.
  *   If omitted, each checkpoint's embedded public_key field is used.
- * @param opts.strict - If true (default), any finding results in FAIL verdict.
+ * @param opts.strict - Backwards-compatible no-op. Exit strictness is applied
+ *   by the CLI layer after report generation, never by this verifier.
  */
 export function verifyAuditChainRecords(
   records: ExportRecord[],
   opts: { publicKey?: string; strict?: boolean } = {}
 ): VerifyReport {
-  const strict = opts.strict ?? true;
   const findings: RecordFinding[] = [];
+  let signaturesVerified = 0;
+  let signaturesSkipped = 0;
 
   // Partition records
   const entries = records
@@ -330,8 +338,10 @@ export function verifyAuditChainRecords(
       verdict: "FAIL",
       entries_verified: 0,
       checkpoints_verified: 0,
+      signatures_verified: 0,
+      signatures_skipped: 0,
       legacy_anchors_verified: 0,
-    rotation_anchor_scope: ROTATION_ANCHOR_SCOPE,
+      rotation_anchor_scope: ROTATION_ANCHOR_SCOPE,
       findings: [
         {
           kind: "empty_input",
@@ -461,7 +471,9 @@ export function verifyAuditChainRecords(
     }
 
     // Signature verification
-    if (!cp.unsigned) {
+    if (cp.unsigned) {
+      signaturesSkipped += 1;
+    } else {
       const pubKey = opts.publicKey ?? cp.public_key;
       if (!pubKey) {
         findings.push({
@@ -486,7 +498,9 @@ export function verifyAuditChainRecords(
         };
         const sigBytes = checkpointSigningBytes(payload);
         const valid = verifyEd25519(sigBytes, cp.signature, pubKey);
-        if (!valid) {
+        if (valid) {
+          signaturesVerified += 1;
+        } else {
           findings.push({
             kind: "checkpoint_signature_invalid",
             seq: cp.checkpoint_sequence,
@@ -512,13 +526,16 @@ export function verifyAuditChainRecords(
     }
   }
 
-  const verdict: VerifyVerdict =
-    strict && findings.length > 0 ? "FAIL" : findings.length === 0 ? "PASS" : "PASS";
+  const verdict: VerifyVerdict = findings.length > 0 ? "FAIL" : "PASS";
 
   return {
     verdict,
     entries_verified: entries.length,
     checkpoints_verified: checkpoints.length,
+    signatures_verified: signaturesVerified,
+    // These counters are positive evidence, not a partition: missing-key and
+    // marked-signed-without-signature checkpoints produce findings instead.
+    signatures_skipped: signaturesSkipped,
     legacy_anchors_verified: legacyAnchors.length,
     rotation_anchor_scope: ROTATION_ANCHOR_SCOPE,
     findings,
@@ -547,6 +564,8 @@ export function emptyInputReport(): VerifyReport {
     verdict: "FAIL",
     entries_verified: 0,
     checkpoints_verified: 0,
+    signatures_verified: 0,
+    signatures_skipped: 0,
     legacy_anchors_verified: 0,
     rotation_anchor_scope: ROTATION_ANCHOR_SCOPE,
     findings: [
@@ -564,6 +583,8 @@ export function malformedInputReport(err: unknown): VerifyReport {
     verdict: "FAIL",
     entries_verified: 0,
     checkpoints_verified: 0,
+    signatures_verified: 0,
+    signatures_skipped: 0,
     legacy_anchors_verified: 0,
     rotation_anchor_scope: ROTATION_ANCHOR_SCOPE,
     findings: [
@@ -593,6 +614,16 @@ export function verifyAuditChainContent(
   return verifyAuditChainRecords(records, opts);
 }
 
+export function auditChainVerifyExitCode(
+  report: VerifyReport,
+  strict: boolean,
+): number {
+  if (report.verdict === "PASS") return AUDIT_CHAIN_VERIFY_EXIT_OK;
+  return strict
+    ? AUDIT_CHAIN_VERIFY_EXIT_STRICT_FINDINGS
+    : AUDIT_CHAIN_VERIFY_EXIT_RELAXED_FINDINGS;
+}
+
 // ---- CLI entry point --------------------------------------------------------
 
 export interface VerifyArgs {
@@ -613,10 +644,10 @@ export function parseVerifyArgs(argv: string[], env?: NodeJS.ProcessEnv): Verify
   return { input, strict, publicKey, storagePath };
 }
 
-export async function runVerify(args: VerifyArgs): Promise<void> {
+export async function runVerify(args: VerifyArgs): Promise<number> {
   if (!args.input) {
     process.stderr.write("Error: --input <path> is required\n");
-    process.exit(1);
+    return 1;
   }
 
   let content: string;
@@ -624,7 +655,7 @@ export async function runVerify(args: VerifyArgs): Promise<void> {
     content = readFileSync(args.input, "utf8");
   } catch (err) {
     process.stderr.write(`Error reading ${args.input}: ${String(err)}\n`);
-    process.exit(1);
+    return 1;
   }
 
   const report = verifyAuditChainContent(content, {
@@ -636,7 +667,5 @@ export async function runVerify(args: VerifyArgs): Promise<void> {
   if (banner) process.stderr.write(banner);
   process.stdout.write(JSON.stringify(report, null, 2) + "\n");
 
-  if (args.strict && report.verdict === "FAIL") {
-    process.exit(1);
-  }
+  return auditChainVerifyExitCode(report, args.strict);
 }

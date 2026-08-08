@@ -406,6 +406,13 @@ async function checkAuditChain(
     .map((line) => JSON.parse(line) as ExportRecord);
   const report = verifyAuditChainRecords(records);
   if (report.verdict === "PASS") {
+    if (report.signatures_verified === 0 && report.signatures_skipped > 0) {
+      return warn(
+        "audit chain",
+        "no checkpoint signature was verified",
+        "wire a production checkpoint signer before treating checkpoint signatures as evidence",
+      );
+    }
     return ok("audit chain", `${report.entries_verified} entries verified`, "none");
   }
   return fail("audit chain", `${report.findings.length} integrity finding(s)`, "run sanctuary audit-chain export and verify for details");

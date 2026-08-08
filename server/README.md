@@ -262,7 +262,7 @@ Sanctuary's security claims are structural, not cooperative-only.
 - Concordia receipts for cross-castle commitments
 - Verascore reputation aggregating across operators
 - Portable reputation bundles for cross-platform portability
-- Hash-chained audit with current checkpoint-signing bounds as compliance evidence. Production audit checkpoints are currently unsigned until **IC-05** closes, and `audit-chain verify --no-strict` can return PASS with findings until **IC-06** closes
+- Hash-chained audit with current checkpoint-signing bounds as compliance evidence. Production audit checkpoints are currently unsigned until **IC-05** closes
 
 ## Development
 

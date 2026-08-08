@@ -32,7 +32,7 @@ Strip away the marketing and every "sovereign AI" offering answers three questio
 
 Residency answers none of these. A data center in Frankfurt with someone else's keys is a promise with better geography.
 
-Custody answers all three. Custody means the keys are generated on your hardware and never leave it. It means the deny is enforced below the agent, at the kernel, where a prompt-injected agent can't talk its way past it. It means the log is hash-chained so that tampering is detectable under strict verification. Production audit checkpoints are currently unsigned, and `audit-chain verify --no-strict` can return PASS with findings.
+Custody answers all three. Custody means the keys are generated on your hardware and never leave it. It means the deny is enforced below the agent, at the kernel, where a prompt-injected agent can't talk its way past it. It means the log is hash-chained so that tampering is detectable under strict verification. Production audit checkpoints are currently unsigned.
 
 Residency is a location. Custody is a power relationship. The industry keeps selling you the first and calling it the second.
 
@@ -60,8 +60,7 @@ On Linux: kernel-level egress enforcement, shipped in May, with the bypass paths
 > Audit correction, 2026-08-07: earlier versions described the log as "signed
 > and chained," which was too broad. Sanctuary's production audit log is hash-chained, but production boot
 > paths do not supply a checkpoint signer, so production checkpoints are written
-> unsigned. Strict verification detects tampering, while `audit-chain verify
-> --no-strict` can return PASS with findings. Open defect: **IC-05, IC-06**
+> unsigned. Open defect: **IC-05**
 >.
 
 On macOS: a signed and notarized system extension enforcing a signed operator policy. In June we drilled it on real hardware: the agent's account blocked from a non-allowlisted destination, reaching its allowlisted one, the operator's account untouched, in the same armed window. Then we rebooted the machine through five attended cycles. The wall came back up every time within the proven scope.

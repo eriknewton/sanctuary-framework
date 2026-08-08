@@ -41,7 +41,7 @@ describe("sanctuary doctor", () => {
     }
   });
 
-  async function makeFortress(opts: { identity?: boolean; policy?: "valid" | "invalid"; audit?: boolean } = {}): Promise<string> {
+  async function makeFortress(opts: { identity?: boolean; policy?: "valid" | "invalid"; audit?: boolean | "unsigned-checkpoint" } = {}): Promise<string> {
     const fortress = await mkdtemp(join(tmpdir(), "sanctuary-doctor-"));
     tempDirs.push(fortress);
     await chmod(fortress, 0o700);
@@ -72,7 +72,9 @@ approval_channel:
     }
 
     if (opts.audit) {
-      const auditLog = new AuditLog(storage, derived.key, { checkpointInterval: 0 });
+      const auditLog = new AuditLog(storage, derived.key, {
+        checkpointInterval: opts.audit === "unsigned-checkpoint" ? 1 : 0,
+      });
       await auditLog.appendCritical({
         layer: "l2",
         operation: "state_read",
@@ -86,7 +88,7 @@ approval_channel:
     return fortress;
   }
 
-  it("reports OK checks for a healthy fixture and does not print secrets", async () => {
+  it("reports expected checks for a healthy fixture and does not print secrets", async () => {
     const fortress = await makeFortress({ identity: true, policy: "valid", audit: true });
     const out = new Capture();
     const code = await runDoctorCommand({
@@ -99,10 +101,39 @@ approval_channel:
     expect(out.text()).toContain("OK   state dir");
     expect(out.text()).toContain("OK   identity");
     expect(out.text()).toContain("OK   principal policy");
-    expect(out.text()).toContain("OK   audit chain");
+    expect(out.text()).toContain("WARN audit chain");
+    expect(out.text()).toContain("no checkpoint signature was verified");
     expect(out.text()).toContain("n/a (not macOS)");
     expect(out.text()).not.toContain(passphrase);
     expect(out.text()).not.toContain("encrypted_private_key");
+  });
+
+  it("warns when the audit chain has checkpoints but no verified checkpoint signatures", async () => {
+    const fortress = await makeFortress({
+      identity: true,
+      policy: "valid",
+      audit: "unsigned-checkpoint",
+    });
+
+    const checks = await runDoctorChecks({
+      storagePath: fortress,
+      env: { SANCTUARY_PASSPHRASE: passphrase },
+      platform: "linux",
+    });
+    const chainCheck = checks.find((check) => check.name === "audit chain");
+    expect(chainCheck?.status).toBe("WARN");
+    expect(chainCheck?.message).toBe("no checkpoint signature was verified");
+
+    const out = new Capture();
+    const code = await runDoctorCommand({
+      argv: ["--fortress", fortress],
+      out,
+      env: { SANCTUARY_PASSPHRASE: passphrase },
+      platform: "linux",
+    });
+    expect(code).toBe(0);
+    expect(out.text()).toContain("WARN audit chain");
+    expect(out.text()).toContain("no checkpoint signature was verified");
   });
 
   it("emits JSON shape and exits non-zero when checks fail", async () => {

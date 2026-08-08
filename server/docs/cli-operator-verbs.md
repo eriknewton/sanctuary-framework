@@ -55,6 +55,8 @@ Checks:
 - `principal-policy.yaml` exists and parses. Raw policy rules are not printed.
 - Audit log exists and chain-verifies through the same export plus verifier
   logic used by `sanctuary audit-chain`.
+- On shipped installs, `WARN audit chain / no checkpoint signature was verified`
+  is expected until a production checkpoint signer is wired.
 - Package, Node.js, and npm versions are reported.
 - Castle Wall system-extension status is reported on macOS. Other platforms
   print `n/a (not macOS)`.
