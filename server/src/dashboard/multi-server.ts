@@ -11,9 +11,11 @@
  */
 
 import { createServer, type Server } from "node:http";
+import { randomBytes } from "node:crypto";
 import { getMultiTenantSnapshot } from "./multi-aggregator.js";
 import { renderMultiAgentHTML } from "./multi-html.js";
 import { getProcessInstance, getProcessSince } from "./process-identity.js";
+import { isRemoteDashboardBinding } from "./remote-binding.js";
 import { sendCaughtError } from "../http/error-envelope.js";
 import {
   attachPostListenHttpServerErrorLogger,
@@ -29,6 +31,11 @@ export interface MultiDashboardOptions {
   host?: string;
   /** Optional bearer token (checked on every route). */
   authToken?: string;
+  /**
+   * Permit non-loopback plaintext HTTP when the network layer already encrypts.
+   * Defaults to false.
+   */
+  allowPlaintextRemote?: boolean;
   /**
    * Override HOME for tenant discovery. Primarily for tests.
    */
@@ -77,7 +84,34 @@ export async function startMultiDashboardServer(
 ): Promise<MultiDashboardHandle> {
   const port = options.port ?? DEFAULT_PORT;
   const host = options.host ?? DEFAULT_HOST;
-  const authToken = options.authToken;
+  let authToken = options.authToken;
+
+  // A non-loopback plaintext multi-tenant bind exposes every tenant
+  // unauthenticated; refuse it, matching the single-tenant path in
+  // principal-policy/dashboard.ts.
+  if (isRemoteDashboardBinding(host) && !options.allowPlaintextRemote) {
+    throw new Error(
+      `Sanctuary Multi Dashboard: refusing to start on non-loopback interface ` +
+        `${host} over plaintext HTTP.\n\n` +
+        `  The multi-agent dashboard exposes every tenant's metadata.\n\n` +
+        `  Options:\n` +
+        `    1. Configure TLS or a TLS-terminating reverse proxy\n` +
+        `    2. Set dashboard.allow_plaintext_remote: true if the network\n` +
+        `       layer already encrypts (e.g. Tailscale, WireGuard)\n` +
+        `    3. Bind to 127.0.0.1 (localhost only)\n`,
+    );
+  }
+
+  // Must match DashboardApprovalChannel.isRemoteBinding in
+  // principal-policy/dashboard.ts: remote binds never start tokenless.
+  if (isRemoteDashboardBinding(host) && !authToken) {
+    authToken = randomBytes(32).toString("hex");
+    process.stderr.write(
+      `\n  C1: Non-loopback multi-dashboard binding requires authentication.\n` +
+        `  Auto-generated auth token (use this to connect from remote machines).\n` +
+        `  Operator token: ${authToken}\n\n`,
+    );
+  }
 
   const discovery: { home?: string; root?: string } = {};
   if (options.home !== undefined) discovery.home = options.home;

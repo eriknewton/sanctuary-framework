@@ -15,6 +15,7 @@ import { request as httpRequest } from "node:http";
 import { createConnection, type Socket } from "node:net";
 import { startMultiDashboardServer } from "../../src/dashboard/multi-server.js";
 import type { MultiDashboardHandle } from "../../src/dashboard/multi-server.js";
+import { randomTestPort } from "../util/port-collision-retry.js";
 
 function fetchText(
   url: URL,
@@ -82,6 +83,37 @@ function openRawConnection(handle: MultiDashboardHandle): Promise<Socket> {
   });
 }
 
+function captureStderr(): { chunks: string[]; restore: () => void } {
+  const chunks: string[] = [];
+  const original = process.stderr.write;
+  process.stderr.write = ((chunk: unknown) => {
+    chunks.push(String(chunk));
+    return true;
+  }) as typeof process.stderr.write;
+  return {
+    chunks,
+    restore: () => {
+      process.stderr.write = original;
+    },
+  };
+}
+
+function expectLoopbackPortClosed(port: number): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const socket = createConnection({ host: "127.0.0.1", port });
+    socket.setTimeout(250);
+    socket.once("connect", () => {
+      socket.destroy();
+      reject(new Error(`port ${port} unexpectedly accepted a connection`));
+    });
+    socket.once("timeout", () => {
+      socket.destroy();
+      resolve();
+    });
+    socket.once("error", () => resolve());
+  });
+}
+
 describe("multi-server", () => {
   let home: string;
   let root: string;
@@ -112,6 +144,70 @@ describe("multi-server", () => {
     handle = await startMultiDashboardServer(options);
     return handle;
   }
+
+  it("refuses non-loopback plaintext before listening", async () => {
+    const port = randomTestPort();
+
+    await expect(
+      startMultiDashboardServer({
+        port,
+        host: "0.0.0.0",
+        home,
+        shutdownGraceMs: 25,
+      }),
+    ).rejects.toThrow(/refusing to start on non-loopback interface/i);
+
+    await expectLoopbackPortClosed(port);
+  });
+
+  it("refuses a concrete non-loopback IP through the same guard", async () => {
+    await expect(
+      startMultiDashboardServer({
+        port: randomTestPort(),
+        host: "192.0.2.10",
+        home,
+        shutdownGraceMs: 25,
+      }),
+    ).rejects.toThrow(/refusing to start on non-loopback interface/i);
+  });
+
+  it("keeps loopback plaintext usable without a token", async () => {
+    const h = await start();
+    const res = await fetchText(new URL(h.url + "/api/agents"));
+    expect(res.status).toBe(200);
+  });
+
+  it("allows remote plaintext only with the flag and a minted bearer token", async () => {
+    await makeTenant(root, "remote", false);
+    const stderr = captureStderr();
+    try {
+      handle = await startMultiDashboardServer({
+        port: 0,
+        host: "0.0.0.0",
+        home,
+        allowPlaintextRemote: true,
+        shutdownGraceMs: 25,
+      });
+    } finally {
+      stderr.restore();
+    }
+
+    const output = stderr.chunks.join("");
+    const token = output.match(/Operator token: ([0-9a-f]{64})/)?.[1];
+    expect(token).toMatch(/^[0-9a-f]{64}$/);
+    if (!handle || !token) {
+      throw new Error("remote multi-dashboard did not start with a minted token");
+    }
+
+    const loopbackUrl = new URL(`http://127.0.0.1:${handle.port}/api/agents`);
+    const noToken = await fetchText(loopbackUrl);
+    expect(noToken.status).toBe(401);
+
+    const authed = await fetchText(loopbackUrl, token);
+    expect(authed.status).toBe(200);
+    const parsed = JSON.parse(authed.body);
+    expect(parsed.tenant_count).toBe(1);
+  });
 
   it("serves the /agents HTML page on GET /", async () => {
     await makeTenant(root, "nsa", false);
