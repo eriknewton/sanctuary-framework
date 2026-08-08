@@ -209,12 +209,13 @@ Use `--ttl 15m` instead of `--no-ttl` for a bounded drill window. TTL values use
 
 Failure modes:
 
+- `Refusing to arm: a non-interactive sudo credential for the arm probe is unavailable for uid <agent-uid>.` This is the usual outcome when your `sudo` timestamp is cold. The wall is **not** armed, so no `disable` is needed. Run `sudo -v` (or configure a NOPASSWD sudoers grant for the probe), then re-run `enable`. The arm now preflights sudo before arming, so a missing credential is caught here rather than after the wall is armed.
 - `Refusing to arm: no agent-origin descriptor is set for this fortress.` Re-run `enable` with `--agent-uid=<agent-uid> --ceiling=500`.
 - `Refusing to arm: this fortress has ZERO agent-matchable allow rules`. Use `--allow-no-egress` for the initial deny-all proof, or promote allow rules first.
 - `The one-time macOS content-filter consent has not been granted on this machine.` Launch `Sanctuary-CastleWall.app` at the console, click Allow, then retry.
 - `The Castle Wall system extension is installed but toggled OFF.` Open System Settings > General > Login Items & Extensions > Network Extensions and switch Castle Wall on.
 - `Castle Wall arm saved by the host app, but enforcement availability is not live.` Treat the wall as unarmed, run `sanctuary castle-wall status`, fix the named availability reason, then re-run `enable`.
-- If the as-uid smoke cannot prove it reached curl, the refusal is:
+- If the as-uid smoke cannot prove it reached curl (a rarer case now that the pre-arm sudo preflight catches a cold credential first, for example if the credential expires between the preflight and the smoke), the refusal is:
 
 ```text
 Castle Wall arm saved by the host app, but the deny-all quarantine smoke could not verify the direct as-uid path.
