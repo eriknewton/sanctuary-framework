@@ -21,6 +21,13 @@ Install the pinned CLI:
 npm install -g @sanctuary-framework/mcp-server@1.7.2
 ```
 
+Record the CLI's absolute path for the later commands that run through `sudo`:
+
+```bash
+SANCTUARY_CLI="$(command -v sanctuary)"
+test -n "$SANCTUARY_CLI" && test -x "$SANCTUARY_CLI" && echo "$SANCTUARY_CLI"
+```
+
 Wrap the harness you already use. For Claude Code:
 
 ```bash
@@ -79,18 +86,22 @@ Failure mode: the CLI searches `/Applications/Sanctuary-CastleWall.app` and `~/A
 Run the shared-directory preflight, then use the app at the console:
 
 ```bash
-sudo sanctuary castle-wall setup-shared-dir
+sudo "$SANCTUARY_CLI" castle-wall setup-shared-dir
 open "/Applications/Sanctuary-CastleWall.app"
 ```
 
-Approve every macOS prompt that appears:
+Approve the macOS prompts in this order:
 
 - If the app shows "Approve Sanctuary background helper", click "Open Settings", then enable `Sanctuary-CastleWall` under System Settings > General > Login Items & Extensions > Allow in the Background.
-- If macOS asks for system extension approval, open System Settings > Privacy & Security and approve the Castle Wall system extension.
+- Quit `Sanctuary-CastleWall.app`, relaunch it with `open "/Applications/Sanctuary-CastleWall.app"`, then expect the system-extension approval prompt.
+- If macOS asks for system extension approval, open System Settings > Privacy & Security and approve the Castle Wall system extension. If no prompt appears, click the app's Arm button; the manual Arm action re-submits activation.
 - On macOS Tahoe, open System Settings > General > Login Items & Extensions > Network Extensions and switch Castle Wall on.
 - If a later arm attempt says content-filter consent is missing, launch `Sanctuary-CastleWall.app` at the console, click Allow on the content-filter prompt, then retry the arm command.
 
-Failure mode: a remote shell cannot complete the first GUI approvals. Use the Mac console, Screen Sharing, or another interactive macOS login session for this step.
+Failure modes:
+
+- A remote shell cannot complete the first GUI approvals. Use the Mac console, Screen Sharing, or another interactive macOS login session for this step.
+- `sudo: sanctuary: command not found` means root's PATH cannot find the CLI even when your user PATH can. Use `sudo "$SANCTUARY_CLI" ...` after confirming `echo "$SANCTUARY_CLI"` prints the absolute path.
 
 ## 5. Re-pin to the signer helper
 
@@ -99,6 +110,14 @@ Migrate the enforcement trust anchor to the approved root signer helper:
 ```bash
 sanctuary castle-wall re-pin
 ```
+
+Expected stderr announcement starts with:
+
+```text
+Re-pinning trust anchor for fortress: <fortress-path>
+```
+
+This line is informational even though it goes to stderr. The command derives the master key after this announcement, so a normal passphrase or custody prompt can still appear before it completes.
 
 Check helper readiness:
 
@@ -118,7 +137,7 @@ Failure modes:
 - `launchd_job_visible` fails: approve the Background Item in System Settings > General > Login Items & Extensions, then reboot or rerun the check.
 - `xpc_reachable` fails: confirm the Background Item approval and the signer-client path.
 - `pin_match` fails: rerun `sanctuary castle-wall re-pin`.
-- `custody_directory` fails: rerun `sudo sanctuary castle-wall setup-shared-dir`.
+- `custody_directory` fails: rerun `sudo "$SANCTUARY_CLI" castle-wall setup-shared-dir`.
 
 ## 6. Install the root boot service
 
@@ -128,7 +147,7 @@ The boot service keeps the Castle Wall daemon alive after boot in safe mode. It 
 SANCTUARY_CLI="$(command -v sanctuary)"
 test -n "$SANCTUARY_CLI" && test -x "$SANCTUARY_CLI" && echo "$SANCTUARY_CLI"
 
-sudo sanctuary castle-wall install-boot \
+sudo "$SANCTUARY_CLI" castle-wall install-boot \
   --binary "$SANCTUARY_CLI" \
   --signer-client "/Applications/Sanctuary-CastleWall.app/Contents/MacOS/castle-wall-signer-client"
 ```
@@ -146,11 +165,13 @@ On first install it also prints:
 Boot token minted: /Library/Application Support/Sanctuary/castle-wall-boot-token.bin (root-owned 0600).
 ```
 
-Failure mode: if the command cannot resolve the CLI path, reinstall with `npm install -g @sanctuary-framework/mcp-server@1.7.2` and confirm `command -v sanctuary` prints an absolute path. If bootstrap is accepted and the service does not stay running, inspect the two paths the command prints: `sudo launchctl print system/ai.sanctuaryprotocol.castle-wall.daemon` and `/var/log/castle-wall-daemon.err.log`.
+Failure mode: if the command cannot resolve the CLI path, reinstall with `npm install -g @sanctuary-framework/mcp-server@1.7.2` and confirm `command -v sanctuary` prints an absolute path. `sudo: sanctuary: command not found` means root's PATH cannot find the CLI even when your user PATH can. If bootstrap is accepted and the service does not stay running, inspect the two paths the command prints: `sudo launchctl print system/ai.sanctuaryprotocol.castle-wall.daemon` and `/var/log/castle-wall-daemon.err.log`.
 
 ## 7. Choose the protected agent UID
 
-Pick a dedicated macOS account for the agent, then get its UID:
+Pick a dedicated macOS account for the agent. If the account does not exist yet, create it in System Settings > Users & Groups > Add Account and choose Standard rather than Administrator; a freshly created macOS account gets a UID at or above `501`, which satisfies the default ceiling.
+
+Get its UID:
 
 ```bash
 id -u <agent-account>
@@ -164,7 +185,11 @@ Failure mode: the UID is never auto-derived. If you choose the wrong UID, you pr
 
 This first arm proves the wall is actually enforcing for the protected UID. It deliberately starts with zero agent egress, so the agent is confined until you promote allow rules.
 
+Run this in the same terminal immediately before `enable`. The deny-all smoke shells out to `sudo -n -u '#<uid>' /usr/bin/curl ...`, so it needs either a warm sudo credential or an explicitly configured NOPASSWD grant:
+
 ```bash
+sudo -v
+
 sanctuary castle-wall enable \
   --agent-uid=<agent-uid> \
   --ceiling=500 \
@@ -189,6 +214,25 @@ Failure modes:
 - `The one-time macOS content-filter consent has not been granted on this machine.` Launch `Sanctuary-CastleWall.app` at the console, click Allow, then retry.
 - `The Castle Wall system extension is installed but toggled OFF.` Open System Settings > General > Login Items & Extensions > Network Extensions and switch Castle Wall on.
 - `Castle Wall arm saved by the host app, but enforcement availability is not live.` Treat the wall as unarmed, run `sanctuary castle-wall status`, fix the named availability reason, then re-run `enable`.
+- If the as-uid smoke cannot prove it reached curl, the refusal is:
+
+```text
+Castle Wall arm saved by the host app, but the deny-all quarantine smoke could not verify the direct as-uid path.
+Expected uid <agent-uid> to be unable to reach example.com:443 with --noproxy '*', but the probe itself was inconclusive.
+Treat the quarantine as unverified; run 'sanctuary castle-wall disable' before continuing.
+```
+
+This is expected recovery. Run `sanctuary castle-wall disable`, warm sudo with `sudo -v`, then re-run `enable`; the install does not need to be restarted.
+
+- If the smoke proves the protected UID could still reach the negative-control host, the refusal is:
+
+```text
+Castle Wall arm saved by the host app, but the deny-all quarantine smoke FAILED.
+uid <agent-uid> reached example.com:443 on the direct --noproxy path despite ZERO agent-matchable allow rules.
+Treat this as fail-open for the confined uid; run 'sanctuary castle-wall disable' before continuing.
+```
+
+This is also expected recovery. Run `sanctuary castle-wall disable` before making any allow-rule changes; the install does not need to be restarted.
 
 ## 9. Confirm the wall is armed
 
@@ -230,6 +274,8 @@ sanctuary castle-wall observe promote --destination <host:port>
 
 Promotion is Tier-1 approved. Approved rules are re-signed and published to the rule source the enforcement daemons read. Follow the command's final instruction: either run `sanctuary castle-wall reload` for a running direct wall, or re-arm if the command says the fortress uses exclusive routing.
 
+Failure mode: `Skipping EXFIL-RISK destination <host:port> (pass --include-risky to promote it deliberately).` means the destination stayed pending because it was classified as an exfil risk. Re-run with `--include-risky` only if you deliberately approve that destination.
+
 ## Teardown
 
 Disarm first:
@@ -247,7 +293,10 @@ Castle Wall disarmed: content filter disabled (verified via host-app status).
 Then remove the boot service:
 
 ```bash
-sudo sanctuary castle-wall uninstall-boot --yes --fortress "$HOME/.sanctuary"
+SANCTUARY_CLI="$(command -v sanctuary)"
+test -n "$SANCTUARY_CLI" && test -x "$SANCTUARY_CLI" && echo "$SANCTUARY_CLI"
+
+sudo "$SANCTUARY_CLI" castle-wall uninstall-boot --yes --fortress "$HOME/.sanctuary"
 ```
 
 Expected output begins with:
