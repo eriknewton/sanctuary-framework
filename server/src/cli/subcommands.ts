@@ -33,6 +33,8 @@ export const TOP_LEVEL_SUBCOMMANDS = [
   "intelligence",
   "license",
   "liveness-probe",
+  "memory_emit",
+  "memory_ingest",
   "nodes",
   "plugin",
   "policy",

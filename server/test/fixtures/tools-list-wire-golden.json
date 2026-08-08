@@ -1,5 +1,5 @@
 {
-  "tool_count": 97,
+  "tool_count": 99,
   "tools": [
     {
       "name": "identity_create",
@@ -1827,6 +1827,52 @@
         },
         "required": [
           "passage_id"
+        ]
+      }
+    },
+    {
+      "name": "memory_ingest",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "harness": {
+            "type": "string",
+            "enum": [
+              "claude-code"
+            ],
+            "description": "Harness memory-file format to ingest"
+          },
+          "dir": {
+            "type": "string",
+            "description": "Path to the harness memory directory to read"
+          }
+        },
+        "required": [
+          "harness",
+          "dir"
+        ]
+      }
+    },
+    {
+      "name": "memory_emit",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "harness": {
+            "type": "string",
+            "enum": [
+              "claude-code"
+            ],
+            "description": "Harness memory-file format to emit"
+          },
+          "dir": {
+            "type": "string",
+            "description": "Output directory; existing memory files are never overwritten"
+          }
+        },
+        "required": [
+          "harness",
+          "dir"
         ]
       }
     },

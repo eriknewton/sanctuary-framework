@@ -8,8 +8,8 @@ export type SdwReadFailureKind =
 export class SdwValidationError extends Error {
   readonly category: string;
 
-  constructor(category: string, message: string) {
-    super(message);
+  constructor(category: string, message: string, options?: ErrorOptions) {
+    super(message, options);
     this.name = "SdwValidationError";
     this.category = category;
   }

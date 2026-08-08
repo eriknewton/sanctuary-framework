@@ -78,6 +78,8 @@ const RAW_IDENTITY_SIGN_OPERATION = "identity_sign";
  *   So it must require operator approval. (CISO NEW-1.)
  * - memory_delete: irreversible SDW memory deletion must not be relaxable by a
  *   hand-authored policy once the inert memory tool factory is wired.
+ * - memory_ingest / memory_emit: manual transcode writes either vault records
+ *   or plaintext files and must start at Tier 1 in the generated policy.
  */
 /**
  * Operator Cloud Slice 2 (non-relaxable cloud-custody gate, MANDATORY): minting
@@ -538,6 +540,12 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     // external channel).
     "memory_insert",
     "memory_delete",
+    // Rung-1 manual memory-file transcode. Ingest writes a plaintext harness
+    // snapshot into the encrypted vault; emit materializes vault memory as
+    // plaintext files for a harness output directory. Both are manual
+    // portability commands, never sync/watch paths, and both require approval.
+    "memory_ingest",
+    "memory_emit",
     // Castle Wall Observe / Learn Allow-List v1 (2026-07-07): promoting an
     // observed destination into a live allow rule is a wall-widening policy
     // mutation, the same class as file_grant / operator_cloud_provision
