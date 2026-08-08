@@ -77,7 +77,7 @@ Visit `https://verascore.ai/agent/{did}` to see the live profile.
 | Before Sanctuary | After Sanctuary |
 |-----------------|-----------------|
 | No agent identity | Ed25519 keypair + W3C DID |
-| Default logging | Encrypted, tamper-evident hash-chained audit trail; production checkpoint signatures are partial until **IC-05, IC-06** close |
+| Default logging | Encrypted, tamper-evident hash-chained audit trail; production audit checkpoints are currently unsigned until **IC-05** closes, and `audit-chain verify --no-strict` can return PASS with findings until **IC-06** closes |
 | No reputation | Verifiable Verascore profile |
 | Platform-locked trust | Portable across any runtime |
 | No sovereignty proof | L1-L4 Sovereignty Health Report |

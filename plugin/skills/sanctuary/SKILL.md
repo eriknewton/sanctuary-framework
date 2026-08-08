@@ -207,4 +207,4 @@ Beneath the cooperative surface, the Castle Wall enforces egress policy at the o
 
 User state under `~/.sanctuary/state/` is encrypted with AES-256-GCM. Keys are derived via Argon2id. Integrity is verified via Merkle trees. Identity is Ed25519 with key rotation support. Operator policy and harness backup configs can be plaintext, so plaintext claims must stay scoped to user state.
 
-80+ MCP tools. Three approval channels (stderr, dashboard, webhook). Concordia bridge. Protection-posture audit. Context gating. Apache 2.0. Published as `@sanctuary-framework/mcp-server` on npm (current stable v1.7.0).
+80+ MCP tools. Three approval channels (stderr, dashboard, webhook). Concordia bridge. Protection-posture audit. Context gating. Apache 2.0. Published as `@sanctuary-framework/mcp-server` on npm (current stable v1.7.2).

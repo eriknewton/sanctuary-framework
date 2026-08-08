@@ -114,23 +114,33 @@ fi
 # reds with "server/src changed, but no changed server/test/*.test.ts files were
 # found" on a PR that touched zero behavior. Must match the negated `paths`
 # filter in .github/workflows/verify-fail-before.yml.
+CHANGED_SRC_RAW="$(mktemp "${TMPDIR:-/tmp}/verify-fail-before-src-list.XXXXXX")"
+if ! git diff --name-only "$BASE_REF"...HEAD -- server/src > "$CHANGED_SRC_RAW"; then
+  echo "FAIL: could not inspect server/src changes between $BASE_REF and HEAD." >&2
+  rm -f "$CHANGED_SRC_RAW"
+  exit 2
+fi
+
 CHANGED_SRC=()
 while IFS= read -r changed_src; do
   [[ -z "$changed_src" ]] && continue
   CHANGED_SRC+=("$changed_src")
-done < <(
-  git diff --name-only "$BASE_REF"...HEAD -- server/src \
-    | grep -vE '\.md$' || true
-)
+done < <(grep -vE '\.md$' "$CHANGED_SRC_RAW" || true)
+rm -f "$CHANGED_SRC_RAW"
+
+CHANGED_TESTS_RAW="$(mktemp "${TMPDIR:-/tmp}/verify-fail-before-test-list.XXXXXX")"
+if ! git diff --name-only --diff-filter=ACMR "$BASE_REF"...HEAD -- server/test > "$CHANGED_TESTS_RAW"; then
+  echo "FAIL: could not inspect server/test changes between $BASE_REF and HEAD." >&2
+  rm -f "$CHANGED_TESTS_RAW"
+  exit 2
+fi
 
 CHANGED_TESTS=()
 while IFS= read -r changed_test; do
   [[ -z "$changed_test" ]] && continue
   CHANGED_TESTS+=("$changed_test")
-done < <(
-  git diff --name-only --diff-filter=ACMR "$BASE_REF"...HEAD -- server/test \
-    | grep -E '\.test\.tsx?$' || true
-)
+done < <(grep -E '\.test\.tsx?$' "$CHANGED_TESTS_RAW" || true)
+rm -f "$CHANGED_TESTS_RAW"
 
 if [[ ${#CHANGED_SRC[@]} -eq 0 ]]; then
   echo "No server/src changes between $BASE_REF and HEAD; fail-before check not required."

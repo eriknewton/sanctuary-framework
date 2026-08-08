@@ -13,7 +13,7 @@ describe("loadAssuranceMatrix", () => {
         "Identity signing authority (PR #270, raw identity_sign Tier 1)",
         "State envelope integrity / default verify-on-read",
         "Hostile-guest containment: macOS box launcher jails uncooperative plugins (B2 inner-confinement, seccomp-deny-AF_VSOCK)",
-        "Verifiable transparency checkpoints (signed enforcement evidence)",
+        "Verifiable transparency checkpoint format and offline verifier",
       ]),
     );
     expect(rows.map((row) => row.id)).toEqual(

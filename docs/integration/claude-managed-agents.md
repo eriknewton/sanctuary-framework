@@ -63,7 +63,7 @@ Visit `https://verascore.ai/agent/{did}` to see the live profile.
 | Before Sanctuary | After Sanctuary |
 |-----------------|-----------------|
 | Implicit cloud identity | Explicit agent-owned Ed25519 keypair |
-| Default logging | Encrypted, tamper-evident hash-chained audit trail; production checkpoint signatures are partial until **IC-05, IC-06** close |
+| Default logging | Encrypted, tamper-evident hash-chained audit trail; production audit checkpoints are currently unsigned until **IC-05** closes, and `audit-chain verify --no-strict` can return PASS with findings until **IC-06** closes |
 | Platform-level policy (static) | Principal-level policy (dynamic, time-locked) |
 | All-or-nothing disclosure | Selective disclosure (ZK attestations) |
 | Opaque reputation | Verifiable Verascore profile |

@@ -62,7 +62,7 @@ Expect: Recent operations logged, including the identity_create
         and sovereignty_health_report calls from steps 2-3.
 ```
 
-All operations are logged to an encrypted, tamper-evident hash-chained audit trail. Production checkpoint signatures are partial until **IC-05, IC-06** close.
+All operations are logged to an encrypted, tamper-evident hash-chained audit trail. Production audit checkpoints are currently unsigned until **IC-05** closes, and `audit-chain verify --no-strict` can return PASS with findings until **IC-06** closes.
 
 ### 5. Verascore Publish (confirms L4 + external integration)
 

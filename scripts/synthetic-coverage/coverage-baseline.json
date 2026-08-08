@@ -279,7 +279,7 @@
     },
     {
       "assurance_row_id": "22",
-      "label": "Verifiable transparency checkpoints (signed enforcement evidence)",
+      "label": "Verifiable transparency checkpoint format and offline verifier",
       "assurance_status": "proven",
       "fixtures_passed": 6,
       "coverage_state": "covered",
