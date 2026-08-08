@@ -8,7 +8,7 @@
 
 Sanctuary is the open source standard for secure, private AI: operating-system enforcement is live on macOS today; Linux and Windows are not live enforcement yet. Your data stays under your own keys, with current portability bounds called out in the Assurance Matrix. Any agent, local or cloud, solo or fleet. One command to get started. One dashboard to secure them all.
 
-Sanctuary wraps any AI agent, on your machine or in your cloud, so actions flow through policy gates, platform-proven walls, operator-held keys, and an audit trail you can actually read. One dashboard manages the security and privacy of every agent you run, whether that is one agent on your laptop or a whole fleet across your machines. Your data, and the reputation your agents build, stay on hardware you control, with exit-bundle gaps still open for dashboard export, skipped import counters, and rotated-key import. Open defect: **IC-07, IC-08, IC-09**.
+Sanctuary wraps any AI agent, on your machine or in your cloud, so actions flow through policy gates, platform-proven walls, operator-held keys, and an audit trail you can actually read. One dashboard manages the security and privacy of every agent you run, whether that is one agent on your laptop or a whole fleet across your machines. Your data, and the reputation your agents build, stay on hardware you control, with exit-bundle gaps still open for dashboard export, skipped import counters, and rotated-key import.
 
 Already running Claude Code, Cursor, Hermes, OpenClaw, Cline, or Mastra?
 
@@ -16,9 +16,9 @@ Already running Claude Code, Cursor, Hermes, OpenClaw, Cline, or Mastra?
 npx @sanctuary-framework/mcp-server protect --claude-code
 ```
 
-That one command puts the keys, audit trail, policy gates, and dashboard around the agent you already use. The operating-system wall is a separate privileged arming step on macOS through the signed app and extension path. You keep your harness; Sanctuary adds the protection underneath.
+That one command puts the keys, audit trail, policy gates, and dashboard around the agent you already use. The operating-system wall is a separate privileged arming step on macOS through the signed app and extension path. See the [Castle Wall macOS install and arm guide](docs/castle-wall-macos-install.md) for the customer path from download to verified armed state. You keep your harness; Sanctuary adds the protection underneath.
 
-**Under the hood:** the macOS wall is drilled on real hardware, signed and notarized, and survives attended reboot cycles; the Linux enforcement modules are integration-proven but the shipped daemon does not yet assemble them into live kernel enforcement. Open defect: **IC-02, IC-03, IC-04**. Cryptographic identity and encrypted state remain operator-held, and exit-bundle portability is partial until the open exit defects above are fixed. It composes with Concordia (agent negotiation) and Verascore (portable reputation), each in its own repo and neither required.
+**Under the hood:** the macOS wall is drilled on real hardware, signed and notarized, and survives attended reboot cycles; the Linux enforcement modules are integration-proven but the shipped daemon does not yet assemble them into live kernel enforcement. Cryptographic identity and encrypted state remain operator-held, and exit-bundle portability is partial while the remaining exit-bundle gaps above are open. It composes with Concordia (agent negotiation) and Verascore (portable reputation), each in its own repo and neither required.
 
 **The claim underneath everything: custody.** Plenty of tools can sandbox an agent when the agent, or its harness, chooses to run inside one. Sanctuary is built for the harder promise: the wall is imposed by the operator and does not depend on the agent's cooperation, the keys never leave hardware you control, and no vendor, including us, sits in the path or can decrypt your state. Every public capability claim traces to a proven row in the [Assurance Matrix](ASSURANCE_MATRIX.md), with its limits stated on the row.
 
@@ -58,7 +58,7 @@ Prints the passphrase to stdout after a confirmation prompt. Store it in a passw
 
 ## Release status
 
-`main` is the development branch. The current stable release is **v1.7.0** on the npm `latest` channel (released 2026-07-26), the first release whose macOS app artifact is signed and notarized; it also lands the unified-protect exclusive-egress path end to end in code. A follow-up patch release, **v1.7.1**, is staged to complete that gate path: as of v1.7.0 an unmodified agent harness could not reach the exclusive gate, and a gate-daemon plist healed at boot took effect only on the next boot; v1.7.1 carries the reachability fix (#1024) and the boot fixes (#1027, #994). The macOS Castle Wall bounds are unchanged: per-uid allow/deny plus attended boot-survival are proven; there is no per-flow rule-attributed audit trail. See the [v1.7.0 release notes](docs/releases/v1.7.0.md), the [v1.7.1 release notes](docs/releases/v1.7.1.md), and [CHANGELOG.md](CHANGELOG.md) for the full history.
+`main` is the development branch. The current stable release is **v1.7.2** on the npm `latest` channel. The macOS Castle Wall app for this release is attached to the GitHub release as `Sanctuary-CastleWall.app.zip`, with SHA-256 `0c09842936ffb9d2d65badd6e00638675fbb91756d0efa1ac2eb6d2032ffb736`. The npm package installs the cooperative Sanctuary surface; the signed macOS app, system extension, signer helper, and root boot service are installed and armed through the separate [Castle Wall macOS install and arm guide](docs/castle-wall-macos-install.md). The macOS Castle Wall bounds remain per-uid allow/deny plus attended boot-survival; there is no per-flow rule-attributed audit trail. See the [v1.7.2 release notes](docs/releases/v1.7.2.md), the [v1.7.1 release notes](docs/releases/v1.7.1.md), and [CHANGELOG.md](CHANGELOG.md) for the full history.
 
 ```bash
 npm install -g @sanctuary-framework/mcp-server
@@ -68,14 +68,14 @@ Current capability summary:
 
 | Surface | Current status |
 |---|---|
-| Local `sanctuary protect` (alias `wrap`), dashboard, policy gates, encrypted state, audit trail, exit bundle | Shipped with exit-bundle gaps: dashboard export cannot re-key state, import hides skipped entries, and rotated-key imports can lose pre-rotation state. Open defect: **IC-07, IC-08, IC-09** |
+| Local `sanctuary protect` (alias `wrap`), dashboard, policy gates, encrypted state, audit trail, exit bundle | Shipped with exit-bundle gaps: dashboard export cannot re-key state, import hides skipped entries, and rotated-key imports can lose pre-rotation state |
 | Cooperative MCP gates: three-tier approval, four canonical policy slots, channel templates | Shipped |
 | Context gating, sensitive-field redaction, query-layer anonymity (header strip default-on; opt-in PII rewrite live, classifier surface pinned local-only) | Shipped |
 | Portable identity, state export/import, recovery flows, reputation bundles | Partial for exit bundles until **IC-07, IC-08, IC-09** are fixed |
 | Local multi-agent coordination, fortress-local hub APIs, audit chain | Shipped with audit-chain verifier caveat: production checkpoints are unsigned. Open defect: **IC-05** |
 | Federation Protocol v0.1 foundation | Shipped; cross-operator federation hardening underway per Wave 1 design (2026-05-26) |
 | Concordia composition (negotiation receipts), Verascore composition (reputation) | Optional, default off; both shipped |
-| Castle Wall (OS-level egress enforcement): Linux | Not implemented. Source modules are integration-proven; the shipped daemon installs no enforcement, so the Assurance Matrix row is `not_implemented` and no claim may trace to it. Open defect: **IC-02, IC-03, IC-04** |
+| Castle Wall (OS-level egress enforcement): Linux | Not implemented. Source modules are integration-proven; the shipped daemon installs no enforcement, so the Assurance Matrix row is `not_implemented` and no claim may trace to it |
 | Castle Wall macOS: signed sysext, host app, content-filter provider, retail UX | Shipped; enforces a signed operator policy with a clean per-uid allow/deny demonstration that survives attended reboot cycles (N=5, drill 2026-06-22, one host / one OS version, Dev-ID-signed and notarized). Not an audited per-rule-per-flow trail |
 | Castle Wall Windows | Roadmapped |
 | Mobile (PWA) operator companion | Roadmapped |
@@ -185,7 +185,7 @@ Substitute `<template-name>` with the archetype the operator picked (`research-a
 
 Tell them: "Sanctuary is installed and your first sub-agent is scaffolded. Open the Sovereignty Dashboard at http://localhost:3501 to review what your agents are doing, and reload the page when you want current data. Your passphrase is in your macOS Keychain; if you want a printable backup, run `sanctuary export-passphrase`."
 
-Current bound: this line previously said "in real time", and the dashboard has no live-update path. The `inbox` and `agent_status` SSE events are declared but never broadcast, and no periodic refetch runs, so five of the six inbox sources and every per-agent status change go stale until the operator reloads. Do not describe the dashboard as a real-time view. Open defect: **IC-12**.
+Current bound: this line previously said "in real time", and the dashboard has no live-update path. The `inbox` and `agent_status` SSE events are declared but never broadcast, and no periodic refetch runs, so five of the six inbox sources and every per-agent status change go stale until the operator reloads. Do not describe the dashboard as a real-time view.
 
 ### Raw MCP server path (Step 4 alternative)
 
@@ -272,7 +272,7 @@ Channel-shape archetypes that ship with Sanctuary:
 | **planner** | Generates plans without executing them | none | any |
 | **handoff-coordinator** | Coordinates work across multiple agents | inter-agent only | any |
 
-Sanctuary ships channel-shape governance templates (policy, egress, budgets, retention) rather than named-agent runtimes. Operators bring their own harnesses and protect them; `template init` binds a channel shape to an already-wrapped harness.
+Sanctuary ships channel-shape governance templates (policy, egress, budgets, retention) instead of named-agent runtimes. Operators bring their own harnesses and protect them; `template init` binds a channel shape to an already-wrapped harness.
 
 Operator authoring beyond this list: copy any template directory under `~/.sanctuary/templates/`, edit `template.json`, `defaults.json`, `policy.md`, `commitments.json`, and `onboarding.md`, then run `sanctuary template init <your-template>`.
 
@@ -302,13 +302,13 @@ The operator remains the custody root in every mode. Commodity operator-cloud mo
 
 Sanctuary installs the protections your body used to provide by default: a perimeter, custody, memory, and a record of what happened. Everything it protects for you together is **your Sanctuary**: each machine is a rampart the Castle Wall holds, each fortress is a keep inside those walls, and each agent is a resident of exactly one keep. The unit never blurs: one agent, one account, one fortress, one master key. Architecturally it ships as five named mechanisms.
 
-**Castle Wall: the perimeter.** What the world cannot cross without your consent. OS-level egress enforcement at the operator-external boundary. macOS enforces a signed operator policy with a proven per-uid allow/deny demonstration that survives attended reboot cycles, captured on a real host (drills 2026-06-11 through 2026-06-22, boot survival 5 of 5 on a Dev-ID-signed and notarized binary): agent egress to a non-allowlisted address blocked, allowlisted egress allowed, operator egress unaffected, and enforcement live again after every attended reboot. Linux ships no egress enforcement: the tested nftables, cgroup, and NFQUEUE modules are not wired into the shipped daemon boot path, and the Assurance Matrix row is `not_implemented`. Open defect: **IC-02, IC-03, IC-04**. The macOS proof is one host and one OS version, not an audited per-rule-per-flow trail. Windows on the roadmap.
+**Castle Wall: the perimeter.** What the world cannot cross without your consent. OS-level egress enforcement at the operator-external boundary. macOS enforces a signed operator policy with a proven per-uid allow/deny demonstration that survives attended reboot cycles, captured on a real host (drills 2026-06-11 through 2026-06-22, boot survival 5 of 5 on a Dev-ID-signed and notarized binary): agent egress to a non-allowlisted address blocked, allowlisted egress allowed, operator egress unaffected, and enforcement live again after every attended reboot. Linux ships no egress enforcement: the tested nftables, cgroup, and NFQUEUE modules are not wired into the shipped daemon boot path, and the Assurance Matrix row is `not_implemented`. The macOS proof is one host and one OS version, not an audited per-rule-per-flow trail. Windows on the roadmap.
 
 **Sentinels: the nerves.** What surfaces what's happening to your awareness. Internal observation via process introspection and behavioral baselining. Anomalies surface through the menubar or notifications. Observation, not enforcement.
 
 **Charter: the will.** What you train your agent to choose voluntarily. The additive cooperative MCP surface for compliant agents. Operator-rooted cryptographic identity (Ed25519 signing, Argon2id passphrase unlock, per-purpose HKDF subkeys). Per-agent encrypted state at rest (AES-256-GCM). Three-tier Principal Policy gates with channel-template binding. Hash-chained audit with rollback detection. Production audit checkpoints are currently unsigned until **IC-05** closes. Open defect: **IC-05**.
 
-**Heralds: the voice.** How you speak to and are recognized by other sovereigns. Optional composition surface (Concordia for structured negotiation, Verascore for portable reputation). Receipts and reputation attestations can be exported through current paths; the full exit guarantee remains partial until **IC-07, IC-08, IC-09** close. Default off; both compositions are optional.
+**Heralds: the voice.** How you speak to and are recognized by other sovereigns. Optional composition surface (Concordia for structured negotiation, Verascore for portable reputation). Receipts and reputation attestations can be exported through current paths; the full exit guarantee remains partial while the remaining exit-bundle gaps are open. Default off; both compositions are optional.
 
 **Mantle: the unique-substrate-binding.** What makes this install yours, not someone else's. Install-time check that locks Sanctuary to the operator's machine at install time and rejects orphan agent identifiers that are not bound to a wrapped harness.
 
@@ -325,8 +325,8 @@ The substrate enforces rights that normally only ship to enterprises with dedica
 - **Identity.** Your agent has a key you own. No provider can impersonate you or revoke your agent. You can prove the agent is yours without asking anyone's permission.
 - **Data.** Your agent's state is encrypted against the provider running it. The platform sees the calls going out; it does not see your life going in. Your conversations, your memory, and your plans stay yours.
 - **Portability.** Your agent's memory, reputation, and commitments travel through current export paths, with exit-bundle gaps still open for dashboard export, skipped import counters, and rotated-key imports.
-- **Attestation.** What your agent did is provable through hash-chained audit entries and signed receipt surfaces. Production audit checkpoints are currently unsigned until **IC-05** closes.
-- **Exit.** Keys, state, reputation, and commitments are yours to move, copy, or keep offline through the shipped paths, with the full exit guarantee partial until **IC-07, IC-08, IC-09** close.
+- **Attestation.** What your agent did is provable through hash-chained audit entries and signed receipt surfaces. Production audit checkpoints are currently unsigned.
+- **Exit.** Keys, state, reputation, and commitments are yours to move, copy, or keep offline through the shipped paths, with the full exit guarantee partial while the remaining exit-bundle gaps are open.
 
 Sanctuary ships the rights substrate. Access (compute, devices, bandwidth, literacy) belongs to civic-infrastructure partners (public libraries, legal-aid organizations, labor unions, public-interest tech groups, community colleges) who host agentic AI on behalf of users who do not self-host. The partner provides access; Sanctuary provides rights. The two compose; they do not substitute.
 
@@ -351,7 +351,7 @@ Sanctuary wraps MCP-compatible harnesses. The named harnesses below are exercise
 
 When your agent needs to negotiate or make deals, **Concordia Protocol** adds structured negotiation with binding commitments. Sanctuary also composes with **Verascore** for portable agent reputation.
 
-**Sanctuary never requires Concordia, and Concordia never requires Sanctuary.** They compose powerfully when both are deployed: Concordia commitment receipts flow through Sanctuary envelopes, and reputation attestations assemble into a single audit trail. Each ships, runs, and wins on its own. This is a structural commitment rather than a tagline. Neither repo imports the other.
+**Sanctuary never requires Concordia, and Concordia never requires Sanctuary.** They compose powerfully when both are deployed: Concordia commitment receipts flow through Sanctuary envelopes, and reputation attestations assemble into a single audit trail. Each ships, runs, and wins on its own. The structural commitment shows up in the repos themselves. Neither repo imports the other.
 
 Install both if you want the full stack:
 
