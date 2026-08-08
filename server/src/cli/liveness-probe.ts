@@ -26,6 +26,7 @@ import {
 } from "../castle-wall/provision/orchestrate.js";
 import { collectSystemResolvers } from "../castle-wall/runtime/system-resolvers.js";
 import { runAgentEgressProbesAsUid } from "../wrap/auto-provision.js";
+import { consumeFlagValue } from "./argv.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -101,27 +102,22 @@ function parsedNow(args: LivenessProbeCommandArgs): Date {
 
 function parseLivenessProbeArgs(argv: string[]): LivenessProbeOptions {
   const opts: LivenessProbeOptions = { json: false, help: false };
-  for (let i = 0; i < argv.length; i += 1) {
-    const arg = argv[i]!;
+  // Must match consumeFlagValue in ./argv.ts: a dropped --fortress value must refuse, never silently resolve the default fortress; wrong-fortress liveness checks are a constraint-5 violation.
+  const fortress = consumeFlagValue(argv, "--fortress");
+  if (fortress.error !== undefined) throw new Error(fortress.error);
+  if (fortress.value !== undefined) opts.fortress = fortress.value;
+
+  for (let i = 0; i < fortress.argv.length; i += 1) {
+    const arg = fortress.argv[i]!;
     if (arg === "--help" || arg === "-h") {
       opts.help = true;
     } else if (arg === "--json") {
       opts.json = true;
-    } else if (arg === "--fortress") {
-      opts.fortress = requireValue(argv, ++i, "--fortress");
     } else {
       throw new Error(`Unknown liveness-probe option: ${arg}`);
     }
   }
   return opts;
-}
-
-function requireValue(argv: string[], index: number, flag: string): string {
-  const value = argv[index];
-  if (value === undefined || value.startsWith("--")) {
-    throw new Error(`${flag} requires a value`);
-  }
-  return value;
 }
 
 async function assertFortressBaseReadable(fortressPath: string): Promise<void> {

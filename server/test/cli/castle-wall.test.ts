@@ -210,7 +210,7 @@ describe("castle-wall CLI verbs", () => {
 
     const out = new CaptureStream();
     const err = new CaptureStream();
-    const code = await runDaemon(["--fortress", fortressPath], {
+    const code = await runDaemon([`--fortress=${fortressPath}`], {
       out,
       err,
       platform: "darwin",
@@ -544,6 +544,38 @@ describe("castle-wall CLI verbs", () => {
       scope: "session",
       fortress: "/tmp/f",
     });
+  });
+
+  it("parses Castle Wall fortress and since flags through the shared equals-form parser", () => {
+    expect(
+      parseCastleWallArgs(["request-1", "--fortress=/scratch", "--since=5m"]),
+    ).toMatchObject({
+      requestId: "request-1",
+      fortress: "/scratch",
+      since: "5m",
+    });
+  });
+
+  it("refuses missing Castle Wall fortress and since flag values", () => {
+    expect(parseCastleWallArgs(["daemon", "--fortress"]).parseError).toBe(
+      "--fortress requires a value",
+    );
+    expect(parseCastleWallArgs(["audit-dump", "--since", "--json"]).parseError).toBe(
+      "--since requires a value",
+    );
+  });
+
+  it("daemon refuses a trailing fortress flag before resolving the default fortress", async () => {
+    const err = new CaptureStream();
+    const code = await runDaemon(["--fortress"], {
+      err,
+      platform: "linux",
+      env: { SANCTUARY_STORAGE_PATH: "/should/not/be/used" },
+    });
+
+    expect(code).toBe(2);
+    expect(err.text()).toContain("--fortress requires a value");
+    expect(err.text()).not.toContain("macOS-only");
   });
 
   it("reload is an idempotent no-op when no daemon is running", async () => {

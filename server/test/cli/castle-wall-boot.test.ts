@@ -566,6 +566,13 @@ describe("castle-wall boot service (F1 Option C)", () => {
         yes: true,
         rotate: true,
       });
+      expect(parseBootArgs(["--fortress=/scratch"]).fortress).toBe("/scratch");
+    });
+
+    it("refuses a missing fortress value", () => {
+      expect(parseBootArgs(["--fortress"]).error).toBe(
+        "--fortress requires a value",
+      );
     });
   });
 
@@ -692,6 +699,18 @@ describe("castle-wall boot service (F1 Option C)", () => {
   // ── install-boot ───────────────────────────────────────────────────
 
   describe("runInstallBoot", () => {
+    it("refuses a trailing fortress flag before resolving the default fortress", async () => {
+      const err = new CaptureStream();
+      const code = await runInstallBoot(["--fortress"], {
+        err,
+        platform: "darwin",
+        getuid: () => 0,
+      });
+
+      expect(code).toBe(1);
+      expect(err.text()).toContain("--fortress requires a value");
+    });
+
     async function makeInstallFixture() {
       const fortress = await makeTemp("f1-fortress-");
       const plistDir = await makeTemp("f1-plist-");

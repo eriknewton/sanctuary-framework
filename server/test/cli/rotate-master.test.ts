@@ -149,6 +149,69 @@ describe("rotate-master --recovery-out", () => {
     );
     expect(out.writes.join("")).not.toContain("Sanctuary rotate-master");
   });
+
+  it("honors --fortress= when resolving recovery-output bounds", async () => {
+    const fortressPath = join(tmp, "flag-fortress");
+    const err = captureStream();
+    const out = captureStream();
+    const code = await runRotateMasterCommand({
+      argv: [
+        `--fortress=${fortressPath}`,
+        "--recovery-out",
+        join(fortressPath, RECOVERY_KEY_FILENAME),
+      ],
+      home: tmp,
+      out: out.stream,
+      err: err.stream,
+      stdin: Readable.from([]) as NodeJS.ReadableStream & { isTTY?: boolean },
+      passphraseOverride: "unused",
+    });
+
+    expect(code).toBe(1);
+    expect(err.writes.join("")).toContain("outside the fortress");
+    expect(out.writes.join("")).not.toContain("Sanctuary rotate-master");
+  });
+
+  it("honors --storage= when resolving recovery-output bounds", async () => {
+    const fortressPath = join(tmp, "storage-fortress");
+    const err = captureStream();
+    const out = captureStream();
+    const code = await runRotateMasterCommand({
+      argv: [
+        `--storage=${fortressPath}`,
+        "--recovery-out",
+        join(fortressPath, RECOVERY_KEY_FILENAME),
+      ],
+      home: tmp,
+      out: out.stream,
+      err: err.stream,
+      stdin: Readable.from([]) as NodeJS.ReadableStream & { isTTY?: boolean },
+      passphraseOverride: "unused",
+    });
+
+    expect(code).toBe(1);
+    expect(err.writes.join("")).toContain("outside the fortress");
+    expect(out.writes.join("")).not.toContain("Sanctuary rotate-master");
+  });
+
+  it("rejects missing fortress and storage values before rotation prompts", async () => {
+    for (const flag of ["--fortress", "--storage"]) {
+      const err = captureStream();
+      const out = captureStream();
+      const code = await runRotateMasterCommand({
+        argv: [flag],
+        storagePath: join(tmp, "fallback-fortress"),
+        out: out.stream,
+        err: err.stream,
+        stdin: Readable.from([]) as NodeJS.ReadableStream & { isTTY?: boolean },
+        passphraseOverride: "unused",
+      });
+
+      expect(code).toBe(1);
+      expect(err.writes.join("")).toContain(`${flag} requires a value`);
+      expect(out.writes.join("")).not.toContain("Sanctuary rotate-master");
+    }
+  });
 });
 
 describe("rotate-master anti-strand: refuse without off-host capture (element 4)", () => {

@@ -89,6 +89,7 @@ import {
   type NormalizeFortressCustodyOutcome,
 } from "../castle-wall/provision/fortress-custody.js";
 import { resolveFortressCreateOwner } from "../castle-wall/runtime/fortress-create-owner.js";
+import { consumeFlagValue } from "./argv.js";
 
 export const CASTLE_WALL_BOOT_LABEL = "ai.sanctuaryprotocol.castle-wall.daemon";
 export const CASTLE_WALL_BOOT_PLIST_PATH = `/Library/LaunchDaemons/${CASTLE_WALL_BOOT_LABEL}.plist`;
@@ -154,6 +155,12 @@ export interface CastleWallBootContext {
 
 function write(stream: Writable, text: string): void {
   stream.write(text);
+}
+
+function writeBootParseError(parsed: ParsedBootArgs, err: Writable): boolean {
+  if (parsed.error === undefined) return false;
+  write(err, `${parsed.error}\n`);
+  return true;
 }
 
 function defaultExecFile(cmd: string, args: string[]): ExecFileResult {
@@ -695,19 +702,23 @@ interface ParsedBootArgs {
   signerClient?: string;
   yes: boolean;
   rotate: boolean;
+  error?: string;
 }
 
 export function parseBootArgs(argv: string[]): ParsedBootArgs {
   const parsed: ParsedBootArgs = { yes: false, rotate: false };
-  for (let i = 0; i < argv.length; i++) {
-    const arg = argv[i]!;
-    if (arg === "--fortress") parsed.fortress = argv[++i];
-    else if (arg.startsWith("--fortress=")) parsed.fortress = arg.slice("--fortress=".length);
-    else if (arg === "--user") parsed.user = argv[++i];
+  // Must match consumeFlagValue in ./argv.ts: a dropped --fortress value must refuse, never silently resolve the default fortress; wrong-fortress boot-service operations are a constraint-5 violation.
+  const fortress = consumeFlagValue(argv, "--fortress");
+  if (fortress.error !== undefined) return { ...parsed, error: fortress.error };
+  if (fortress.value !== undefined) parsed.fortress = fortress.value;
+
+  for (let i = 0; i < fortress.argv.length; i++) {
+    const arg = fortress.argv[i]!;
+    if (arg === "--user") parsed.user = fortress.argv[++i];
     else if (arg.startsWith("--user=")) parsed.user = arg.slice("--user=".length);
-    else if (arg === "--binary") parsed.binary = argv[++i];
+    else if (arg === "--binary") parsed.binary = fortress.argv[++i];
     else if (arg.startsWith("--binary=")) parsed.binary = arg.slice("--binary=".length);
-    else if (arg === "--signer-client") parsed.signerClient = argv[++i];
+    else if (arg === "--signer-client") parsed.signerClient = fortress.argv[++i];
     else if (arg.startsWith("--signer-client=")) {
       parsed.signerClient = arg.slice("--signer-client=".length);
     } else if (arg === "--yes" || arg === "-y") parsed.yes = true;
@@ -953,6 +964,7 @@ export async function runProvisionBootToken(
   const execFileFn = ctx.execFileFn ?? defaultExecFile;
   const bootTokenPath = ctx.bootTokenPath ?? CASTLE_BOOT_TOKEN_PATH;
   const parsed = parseBootArgs(argv);
+  if (writeBootParseError(parsed, err)) return 1;
 
   if (platform !== "darwin") {
     write(err, "castle-wall provision-boot-token is macOS-only.\n");
@@ -1126,6 +1138,7 @@ export async function runInstallBoot(
   const err = ctx.err ?? process.stderr;
   const getuid = ctx.getuid ?? process.getuid?.bind(process);
   const parsed = parseBootArgs(argv);
+  if (writeBootParseError(parsed, err)) return 1;
   if (
     (ctx.platform ?? process.platform) === "darwin" &&
     getuid?.() === 0 &&
@@ -1167,6 +1180,7 @@ function resolveInstallBootFortressPath(
   env: NodeJS.ProcessEnv,
 ): string | undefined {
   const parsed = parseBootArgs(argv);
+  if (parsed.error !== undefined) return undefined;
   let fortressPath = parsed.fortress ?? env.SANCTUARY_STORAGE_PATH;
   if (!fortressPath) {
     const user = parsed.user ?? env.SUDO_USER;
@@ -1195,6 +1209,7 @@ async function runInstallBootInner(
   const sleepFn =
     ctx.sleepFn ?? ((ms: number) => new Promise<void>((resolveSleep) => setTimeout(resolveSleep, ms)));
   const parsed = parseBootArgs(argv);
+  if (writeBootParseError(parsed, err)) return 1;
 
   if (platform !== "darwin") {
     write(err, "castle-wall install-boot is macOS-only (Linux uses the systemd unit; see castle-wall-daemon/systemd/).\n");
@@ -1458,6 +1473,7 @@ export async function runUninstallBoot(
   const plistPath = ctx.plistPath ?? CASTLE_WALL_BOOT_PLIST_PATH;
   const socketHasLiveListenerFn = ctx.socketHasLiveListenerFn ?? castleSocketHasLiveListener;
   const parsed = parseBootArgs(argv);
+  if (writeBootParseError(parsed, err)) return 1;
 
   if (platform !== "darwin") {
     write(err, "castle-wall uninstall-boot is macOS-only.\n");
