@@ -85,8 +85,10 @@ const d = argv
 });
 
 /**
- * Residual boundary: this guard does not try to catch computed-property calls
- * (`argv["indexOf"](...)`), aliased methods (`const f = argv.indexOf; f(...)`),
- * wrappers outside `server/src/cli.ts` and `server/src/cli/**`, or parsing
- * hidden behind a helper that does not itself call one of these Array methods.
+ * Residual boundary: the dominant live blind spot is inline index-based scanning
+ * that advances through `argv` manually, for example `argv[++i]`. This guard also
+ * does not try to catch computed-property calls (`argv["indexOf"](...)`), aliased
+ * methods (`const f = argv.indexOf; f(...)`), wrappers outside `server/src/cli.ts`
+ * and `server/src/cli/**`, or parsing hidden behind a helper that does not itself
+ * call one of these Array methods.
  */
