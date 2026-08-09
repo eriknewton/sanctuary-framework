@@ -15,12 +15,38 @@
  * signature independent of property insertion order on either side.
  */
 
+import { randomUUID } from "node:crypto";
 import { ed25519 } from "@noble/curves/ed25519";
 import { fromBase64url } from "../core/encoding.js";
 import { verify } from "../core/identity.js";
 
 /** Domain separator for operator-signed admin payloads (versioned). */
 export const V1_OPERATOR_SIGNED_DOMAIN = "sanctuary.v1.operator-signed";
+/** Default operator authorization lifetime: 5 minutes. */
+export const V1_OPERATOR_AUTHORIZATION_TTL_MS = 5 * 60_000;
+/** Bound accepted lifetimes so a signed payload cannot become a long-lived bearer. */
+export const V1_OPERATOR_AUTHORIZATION_MAX_TTL_MS =
+  V1_OPERATOR_AUTHORIZATION_TTL_MS;
+/** Small clock skew allowance for operator and daemon clocks. */
+export const V1_OPERATOR_AUTHORIZATION_CLOCK_SKEW_MS = 60_000;
+
+export type OperatorAuthorizationFreshness =
+  | {
+      ok: true;
+      authorizationNonce: string;
+      issuedAtMs: number;
+      expiresAtMs: number;
+      expiresAt: string;
+    }
+  | {
+      ok: false;
+      reason:
+        | "operator_authorization_missing_freshness"
+        | "operator_authorization_malformed_freshness"
+        | "operator_authorization_expired"
+        | "operator_authorization_not_yet_valid"
+        | "operator_authorization_lifetime_too_long";
+    };
 
 /**
  * Deterministic JSON encoding: object keys sorted lexicographically at
@@ -31,6 +57,77 @@ export const V1_OPERATOR_SIGNED_DOMAIN = "sanctuary.v1.operator-signed";
  */
 export function canonicalJson(value: unknown): string {
   return encodeCanonical(value, new Set());
+}
+
+/**
+ * Add the freshness fields that are covered by the operator signature. Callers
+ * sign the returned object and send that same object on the wire.
+ */
+export function addOperatorAuthorizationFields(
+  payload: Record<string, unknown>,
+  opts?: { nowMs?: number; nonce?: string; ttlMs?: number },
+): Record<string, unknown> {
+  const nowMs = opts?.nowMs ?? Date.now();
+  const ttlMs = opts?.ttlMs ?? V1_OPERATOR_AUTHORIZATION_TTL_MS;
+  return {
+    ...payload,
+    authorization_nonce: opts?.nonce ?? randomUUID(),
+    issued_at: new Date(nowMs).toISOString(),
+    expires_at: new Date(nowMs + ttlMs).toISOString(),
+  };
+}
+
+/**
+ * Validate signed freshness fields. This is not an anti-replay primitive by
+ * itself; the caller must still spend the nonce durably after signature verify.
+ */
+export function validateOperatorAuthorizationFreshness(
+  payload: unknown,
+  nowMs = Date.now(),
+): OperatorAuthorizationFreshness {
+  if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
+    return { ok: false, reason: "operator_authorization_malformed_freshness" };
+  }
+  const body = payload as Record<string, unknown>;
+  const nonce = body.authorization_nonce;
+  const issuedAt = body.issued_at;
+  const expiresAt = body.expires_at;
+  if (nonce === undefined || issuedAt === undefined || expiresAt === undefined) {
+    return { ok: false, reason: "operator_authorization_missing_freshness" };
+  }
+  if (
+    typeof nonce !== "string" ||
+    nonce.length === 0 ||
+    nonce.length > 128 ||
+    typeof issuedAt !== "string" ||
+    typeof expiresAt !== "string"
+  ) {
+    return { ok: false, reason: "operator_authorization_malformed_freshness" };
+  }
+  const issuedAtMs = Date.parse(issuedAt);
+  const expiresAtMs = Date.parse(expiresAt);
+  if (!Number.isFinite(issuedAtMs) || !Number.isFinite(expiresAtMs)) {
+    return { ok: false, reason: "operator_authorization_malformed_freshness" };
+  }
+  if (issuedAtMs > nowMs + V1_OPERATOR_AUTHORIZATION_CLOCK_SKEW_MS) {
+    return { ok: false, reason: "operator_authorization_not_yet_valid" };
+  }
+  if (expiresAtMs <= nowMs) {
+    return { ok: false, reason: "operator_authorization_expired" };
+  }
+  if (
+    expiresAtMs <= issuedAtMs ||
+    expiresAtMs - issuedAtMs > V1_OPERATOR_AUTHORIZATION_MAX_TTL_MS
+  ) {
+    return { ok: false, reason: "operator_authorization_lifetime_too_long" };
+  }
+  return {
+    ok: true,
+    authorizationNonce: nonce,
+    issuedAtMs,
+    expiresAtMs,
+    expiresAt,
+  };
 }
 
 function encodeCanonical(value: unknown, seen: Set<object>): string {

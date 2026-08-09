@@ -230,6 +230,13 @@ export interface FederationSyncStateSnapshot {
   acceptedHighWater: Map<string, number>;
   /** This daemon's own monotonic outbound (reciprocal) high-water. */
   outboundHighWater: number;
+  /**
+   * OPERATOR_SIGNED replay set: replayKey -> expires_at. A key is added only
+   * after signature and freshness verification, and before the authorized effect.
+   * The daemon also checks expiry before accepting, so expired entries may be
+   * pruned by consumers without weakening replay protection.
+   */
+  spentOperatorAuthorizations: Map<string, string>;
   /** Folded node-revocation projection: the grow-only revoked-node set. */
   revokedNodeIds: Set<string>;
   /** Highest accepted operator-authority eviction serial (replay floor). */
@@ -354,6 +361,13 @@ interface PersistedSyncState {
   accepted_high_water: Array<[string, number]>;
   /** This daemon's own outbound high-water. */
   outbound_high_water: number;
+  /**
+   * Spent OPERATOR_SIGNED authorizations as [replayKey, expires_at] pairs.
+   * Optional on read for back-compat within v1: a pre-fix record omits it and
+   * decodes to an empty set, which makes legacy unsigned-freshness payloads fail
+   * at the verifier rather than at decode time.
+   */
+  spent_operator_authorizations?: Array<[string, string]>;
   /** Folded revoked-node ids. */
   revoked_node_ids: string[];
   /** Highest accepted eviction serial. */
@@ -483,6 +497,7 @@ export function emptyFederationSyncState(): FederationSyncStateSnapshot {
     federationEnabledGeneration: 0,
     acceptedHighWater: new Map(),
     outboundHighWater: 0,
+    spentOperatorAuthorizations: new Map(),
     revokedNodeIds: new Set(),
     highestEvictionSerial: 0,
     revokedRootPubkeys: new Set(),
@@ -882,6 +897,9 @@ export class FederationSyncStateStore {
           federation_enabled_generation: merged.federationEnabledGeneration ?? 0,
           accepted_high_water: [...merged.acceptedHighWater],
           outbound_high_water: merged.outboundHighWater,
+          spent_operator_authorizations: [
+            ...merged.spentOperatorAuthorizations,
+          ],
           revoked_node_ids: [...merged.revokedNodeIds],
           highest_eviction_serial: merged.highestEvictionSerial,
           revoked_root_pubkeys: [...merged.revokedRootPubkeys],
@@ -941,6 +959,10 @@ function cloneSnapshot(
         .federationEnabledGeneration ?? 0,
     acceptedHighWater: new Map(snapshot.acceptedHighWater),
     outboundHighWater: snapshot.outboundHighWater,
+    spentOperatorAuthorizations: new Map(
+      (snapshot as Partial<FederationSyncStateSnapshot>)
+        .spentOperatorAuthorizations ?? new Map<string, string>(),
+    ),
     revokedNodeIds: new Set(snapshot.revokedNodeIds),
     highestEvictionSerial: snapshot.highestEvictionSerial,
     revokedRootPubkeys: new Set(snapshot.revokedRootPubkeys),
@@ -1063,6 +1085,10 @@ function mergeSyncStateMonotonic(
   }
   const revokedNodeIds = new Set(base.revokedNodeIds);
   for (const nodeId of next.revokedNodeIds) revokedNodeIds.add(nodeId);
+  const spentOperatorAuthorizations = new Map(base.spentOperatorAuthorizations);
+  for (const [replayKey, expiresAt] of next.spentOperatorAuthorizations) {
+    spentOperatorAuthorizations.set(replayKey, expiresAt);
+  }
   const revokedRootPubkeys = new Set(base.revokedRootPubkeys);
   for (const pubkey of next.revokedRootPubkeys) revokedRootPubkeys.add(pubkey);
   const appliedPolicyVersions = new Map(base.appliedPolicyVersions);
@@ -1095,6 +1121,7 @@ function mergeSyncStateMonotonic(
     ...selectFederationEnabledByGeneration(base, next),
     acceptedHighWater,
     outboundHighWater: Math.max(base.outboundHighWater, next.outboundHighWater),
+    spentOperatorAuthorizations,
     revokedNodeIds,
     highestEvictionSerial: Math.max(
       base.highestEvictionSerial,
@@ -1233,6 +1260,9 @@ function decodeSyncState(value: unknown): FederationSyncStateSnapshot {
     obj.outbound_high_water,
     "outbound_high_water",
   );
+  const spentOperatorAuthorizations = decodeSpentOperatorAuthorizations(
+    obj.spent_operator_authorizations,
+  );
   const revokedNodeIds = decodeRevokedNodeIds(obj.revoked_node_ids);
   const highestEvictionSerial = decodeNonNegativeInt(
     obj.highest_eviction_serial,
@@ -1304,6 +1334,7 @@ function decodeSyncState(value: unknown): FederationSyncStateSnapshot {
     federationEnabledGeneration,
     acceptedHighWater,
     outboundHighWater,
+    spentOperatorAuthorizations,
     revokedNodeIds,
     highestEvictionSerial,
     revokedRootPubkeys,
@@ -1324,6 +1355,34 @@ function decodeBoolean(value: unknown, label: string): boolean {
     throw new FederationSyncStateStoreError(`${label} is invalid`);
   }
   return value;
+}
+
+function decodeSpentOperatorAuthorizations(
+  value: unknown,
+): Map<string, string> {
+  if (value === undefined) return new Map();
+  if (!Array.isArray(value)) {
+    throw new FederationSyncStateStoreError(
+      "spent_operator_authorizations is not an array",
+    );
+  }
+  const out = new Map<string, string>();
+  for (const pair of value) {
+    if (
+      !Array.isArray(pair) ||
+      pair.length !== 2 ||
+      typeof pair[0] !== "string" ||
+      pair[0].length === 0 ||
+      typeof pair[1] !== "string" ||
+      !Number.isFinite(Date.parse(pair[1]))
+    ) {
+      throw new FederationSyncStateStoreError(
+        "spent operator authorization is invalid",
+      );
+    }
+    out.set(pair[0], pair[1]);
+  }
+  return out;
 }
 
 function encodeBreakGlassState(state: BreakGlassState): PersistedBreakGlassState {

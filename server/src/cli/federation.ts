@@ -112,6 +112,7 @@ import {
   FEDERATION_POLICY_BUNDLE_HASH_ALGORITHM,
   signFederationPolicyBundlePayload,
 } from "../v1/federation-policy-bundle.js";
+import { addOperatorAuthorizationFields } from "../v1/operator-signed.js";
 import {
   dashboardRequest,
   DashboardRequestError,
@@ -1734,8 +1735,9 @@ export async function runFederationEnableDisable(args: {
     if (flags.idempotencyKey !== undefined) {
       signedPayload.idempotency_key = flags.idempotencyKey;
     }
-    const operatorSignature = signer.signPayload(action, signedPayload);
-    const body = { ...signedPayload, operator_signature: operatorSignature };
+    const authorizedPayload = addOperatorAuthorizationFields(signedPayload);
+    const operatorSignature = signer.signPayload(action, authorizedPayload);
+    const body = { ...authorizedPayload, operator_signature: operatorSignature };
 
     const response = (await request(
       action,
@@ -1809,8 +1811,9 @@ export async function runFederationAuthorize(args: {
       intended_node_id: flags.nodeId,
       intended_node_mode: flags.nodeMode,
     };
-    const operatorSignature = signer.signPayload(action, signedPayload);
-    const body = { ...signedPayload, operator_signature: operatorSignature };
+    const authorizedPayload = addOperatorAuthorizationFields(signedPayload);
+    const operatorSignature = signer.signPayload(action, authorizedPayload);
+    const body = { ...authorizedPayload, operator_signature: operatorSignature };
 
     const response = (await request(
       action,
@@ -1879,8 +1882,9 @@ export async function runFederationRevoke(args: {
     if (flags.idempotencyKey !== undefined) {
       signedPayload.idempotency_key = flags.idempotencyKey;
     }
-    const operatorSignature = signer.signPayload(action, signedPayload);
-    const body = { ...signedPayload, operator_signature: operatorSignature };
+    const authorizedPayload = addOperatorAuthorizationFields(signedPayload);
+    const operatorSignature = signer.signPayload(action, authorizedPayload);
+    const body = { ...authorizedPayload, operator_signature: operatorSignature };
 
     const response = (await request(
       action,
@@ -2006,12 +2010,12 @@ export async function runFederationPolicyPush(args: {
     const originNodeId = federationOperatorAuthorityOrigin(
       record.pinned_master_pubkey.fortress_id,
     );
-    const baseSyncPayload = {
+    const baseSyncPayload = addOperatorAuthorizationFields({
       wire_version: FEDERATION_SYNC_WIRE_VERSION,
       node_id: record.node_id,
       events: [] as FederationEvent[],
       cursor: { node_id: originNodeId },
-    };
+    });
     const fetchResponse = (await request(
       action,
       {
@@ -2054,14 +2058,15 @@ export async function runFederationPolicyPush(args: {
       ...eventWithoutHash,
       event_hash: federationEventHash(eventWithoutHash),
     };
-    const pushPayload: Record<string, unknown> = {
+    const pushPayloadBase: Record<string, unknown> = {
       wire_version: FEDERATION_SYNC_WIRE_VERSION,
       node_id: record.node_id,
       events: [event],
     };
     if (flags.idempotencyKey !== undefined) {
-      pushPayload.idempotency_key = flags.idempotencyKey;
+      pushPayloadBase.idempotency_key = flags.idempotencyKey;
     }
+    const pushPayload = addOperatorAuthorizationFields(pushPayloadBase);
     const pushResponse = (await request(
       action,
       {
