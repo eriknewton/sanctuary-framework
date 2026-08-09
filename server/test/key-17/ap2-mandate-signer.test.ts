@@ -45,7 +45,13 @@ describe("ap2-mandate-signer", () => {
       expect(signed.signature).toBeDefined();
       expect(signed.algorithm).toBe("EdDSA");
       expect(signed.public_key).toBeDefined();
-      expect(verifyAp2Mandate(signed)).toBe(true);
+      expect(
+        verifyAp2Mandate(signed, { trustedPublicKey: signed.public_key })
+      ).toMatchObject({
+        valid: true,
+        signature_basis: "trusted",
+        freshness: "not_checked",
+      });
     });
 
     it("preserves all original mandate fields", () => {
@@ -68,14 +74,18 @@ describe("ap2-mandate-signer", () => {
       const mandate = makeMandate();
       const signed = signAp2Mandate(masterKey, operatorId, mandate);
       const tampered = { ...signed, mandate_type: "authorization" };
-      expect(verifyAp2Mandate(tampered)).toBe(false);
+      expect(
+        verifyAp2Mandate(tampered, { trustedPublicKey: signed.public_key }).valid
+      ).toBe(false);
     });
 
     it("rejects if target is modified", () => {
       const mandate = makeMandate();
       const signed = signAp2Mandate(masterKey, operatorId, mandate);
       const tampered = { ...signed, target: "evil-agent" };
-      expect(verifyAp2Mandate(tampered)).toBe(false);
+      expect(
+        verifyAp2Mandate(tampered, { trustedPublicKey: signed.public_key }).valid
+      ).toBe(false);
     });
 
     it("rejects if payload is modified", () => {
@@ -85,14 +95,63 @@ describe("ap2-mandate-signer", () => {
         ...signed,
         payload: { ...signed.payload, amount: "99999" },
       };
-      expect(verifyAp2Mandate(tampered)).toBe(false);
+      expect(
+        verifyAp2Mandate(tampered, { trustedPublicKey: signed.public_key }).valid
+      ).toBe(false);
     });
 
     it("rejects if expires_at is modified", () => {
       const mandate = makeMandate();
       const signed = signAp2Mandate(masterKey, operatorId, mandate);
       const tampered = { ...signed, expires_at: "2099-12-31T23:59:59Z" };
-      expect(verifyAp2Mandate(tampered)).toBe(false);
+      expect(
+        verifyAp2Mandate(tampered, { trustedPublicKey: signed.public_key }).valid
+      ).toBe(false);
+    });
+  });
+
+  describe("trusted-key verification boundary", () => {
+    it("refuses embedded-key verification unless explicitly opted in", () => {
+      const signed = signAp2Mandate(masterKey, operatorId, makeMandate());
+
+      expect(verifyAp2Mandate(signed)).toMatchObject({
+        valid: false,
+        signature_basis: "none",
+        reason: "trusted_public_key_required",
+      });
+    });
+
+    it("does not trust an attacker-signed mandate carrying the attacker key", () => {
+      const trusted = signAp2Mandate(masterKey, operatorId, makeMandate());
+      const attacker = signAp2Mandate(
+        randomBytes(32),
+        "operator-mallory",
+        makeMandate({ issuer: "operator-mallory" })
+      );
+
+      expect(
+        verifyAp2Mandate(attacker, { trustedPublicKey: trusted.public_key })
+      ).toMatchObject({
+        valid: false,
+        signature_basis: "trusted",
+        reason: "public_key_mismatch",
+      });
+    });
+
+    it("labels embedded-key opt-in as internal consistency only", () => {
+      const attacker = signAp2Mandate(
+        randomBytes(32),
+        "operator-mallory",
+        makeMandate({ issuer: "operator-mallory" })
+      );
+
+      expect(verifyAp2Mandate(attacker, { trustEmbedded: true })).toMatchObject(
+        {
+          valid: true,
+          signature_basis: "embedded",
+          freshness: "not_checked",
+        }
+      );
     });
   });
 

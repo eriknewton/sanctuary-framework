@@ -60,6 +60,8 @@ export class OperatorKeyService implements OperatorKeyInterface {
     operatorId: string,
     request: X402Request
   ): Promise<SignedX402Request> {
+    // The policy gate is the authority boundary: no protocol subkey is touched
+    // until the operator policy has allowed this counterparty/action pair.
     await this.policyGate.checkApproval({
       protocol: "x402",
       operatorId,
@@ -82,6 +84,8 @@ export class OperatorKeyService implements OperatorKeyInterface {
     operatorId: string,
     reg: Erc8004Registration
   ): Promise<SignedErc8004Registration> {
+    // The policy gate is the authority boundary: no protocol subkey is touched
+    // until the operator policy has allowed this registry/action pair.
     await this.policyGate.checkApproval({
       protocol: "erc8004",
       operatorId,
@@ -104,6 +108,8 @@ export class OperatorKeyService implements OperatorKeyInterface {
     operatorId: string,
     mandate: Ap2Mandate
   ): Promise<SignedAp2Mandate> {
+    // The policy gate is the authority boundary: no protocol subkey is touched
+    // until the operator policy has allowed this target/action pair.
     await this.policyGate.checkApproval({
       protocol: "ap2",
       operatorId,

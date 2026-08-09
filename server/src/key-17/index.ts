@@ -12,6 +12,8 @@ export {
   deriveX402Key,
   type X402Request,
   type SignedX402Request,
+  type VerifyX402RequestOptions,
+  type X402RequestVerificationResult,
 } from "./x402-signer.js";
 
 export {
@@ -52,6 +54,8 @@ export {
   deriveAp2Key,
   type Ap2Mandate,
   type SignedAp2Mandate,
+  type VerifyAp2MandateOptions,
+  type Ap2MandateVerificationResult,
 } from "./ap2-mandate-signer.js";
 
 export {

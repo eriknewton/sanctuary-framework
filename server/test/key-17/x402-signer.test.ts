@@ -38,7 +38,13 @@ describe("x402-signer", () => {
       expect(signed.signature).toBeDefined();
       expect(signed.algorithm).toBe("EdDSA");
       expect(signed.public_key).toBeDefined();
-      expect(verifyX402Request(signed)).toBe(true);
+      expect(
+        verifyX402Request(signed, { trustedPublicKey: signed.public_key })
+      ).toMatchObject({
+        valid: true,
+        signature_basis: "trusted",
+        freshness: "not_checked",
+      });
     });
 
     it("preserves all original request fields", () => {
@@ -131,7 +137,9 @@ describe("x402-signer", () => {
     it("handles whitespace-only differences (no whitespace in canonical form)", () => {
       const request = makeRequest({ description: "  spaced  " });
       const signed = signX402Request(masterKey, operatorId, request);
-      expect(verifyX402Request(signed)).toBe(true);
+      expect(
+        verifyX402Request(signed, { trustedPublicKey: signed.public_key }).valid
+      ).toBe(true);
     });
   });
 
@@ -140,14 +148,20 @@ describe("x402-signer", () => {
       const request = makeRequest();
       const signed = signX402Request(masterKey, operatorId, request);
       const tampered = { ...signed, amount: "9999" };
-      expect(verifyX402Request(tampered)).toBe(false);
+      expect(
+        verifyX402Request(tampered, { trustedPublicKey: signed.public_key })
+          .valid
+      ).toBe(false);
     });
 
     it("rejects if counterparty is modified after signing", () => {
       const request = makeRequest();
       const signed = signX402Request(masterKey, operatorId, request);
       const tampered = { ...signed, counterparty: "evil-agent" };
-      expect(verifyX402Request(tampered)).toBe(false);
+      expect(
+        verifyX402Request(tampered, { trustedPublicKey: signed.public_key })
+          .valid
+      ).toBe(false);
     });
 
     it("rejects if signature is replaced with a different valid signature", () => {
@@ -159,7 +173,55 @@ describe("x402-signer", () => {
         request
       );
       const swapped = { ...signed, signature: otherSigned.signature };
-      expect(verifyX402Request(swapped)).toBe(false);
+      expect(
+        verifyX402Request(swapped, { trustedPublicKey: signed.public_key })
+          .valid
+      ).toBe(false);
+    });
+  });
+
+  describe("trusted-key verification boundary", () => {
+    it("refuses embedded-key verification unless explicitly opted in", () => {
+      const signed = signX402Request(masterKey, operatorId, makeRequest());
+
+      expect(verifyX402Request(signed)).toMatchObject({
+        valid: false,
+        signature_basis: "none",
+        reason: "trusted_public_key_required",
+      });
+    });
+
+    it("does not trust an attacker-signed request carrying the attacker key", () => {
+      const trusted = signX402Request(masterKey, operatorId, makeRequest());
+      const attacker = signX402Request(
+        randomBytes(32),
+        "operator-mallory",
+        makeRequest({ counterparty: "mallory-agent" })
+      );
+
+      expect(
+        verifyX402Request(attacker, { trustedPublicKey: trusted.public_key })
+      ).toMatchObject({
+        valid: false,
+        signature_basis: "trusted",
+        reason: "public_key_mismatch",
+      });
+    });
+
+    it("labels embedded-key opt-in as internal consistency only", () => {
+      const attacker = signX402Request(
+        randomBytes(32),
+        "operator-mallory",
+        makeRequest({ counterparty: "mallory-agent" })
+      );
+
+      expect(verifyX402Request(attacker, { trustEmbedded: true })).toMatchObject(
+        {
+          valid: true,
+          signature_basis: "embedded",
+          freshness: "not_checked",
+        }
+      );
     });
   });
 });
