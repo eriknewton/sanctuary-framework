@@ -890,6 +890,7 @@ const GUARDIAN_AUDIT_COVERAGE_FINDING_KINDS: ReadonlySet<AuditIntegrityFindingKi
     "checkpoint_root_mismatch",
     "checkpoint_signature_mismatch",
     "checkpoint_signature_unverifiable",
+    "checkpoint_signature_embedded_key_untrusted",
   ]);
 
 function newerAppliedPolicy(

@@ -119,6 +119,7 @@ export type AuditIntegrityFindingKind =
   | "checkpoint_root_mismatch"
   | "checkpoint_signature_mismatch"
   | "checkpoint_signature_unverifiable"
+  | "checkpoint_signature_embedded_key_untrusted"
   // F2 Option A (writer-split) boundary findings. See the module doc comment
   // near AUDIT_SPLIT_BOUNDARY_DIRNAME.
   //  - split_boundary_invalid: a boundary record is PRESENT but fails MAC
@@ -200,6 +201,11 @@ export interface AuditLogConfig {
   ) => Promise<AuditCheckpointSignature | null>;
   /** Resolve a known checkpoint signing key by signer_kid. */
   checkpointPublicKeyResolver?: (signerKid: string) => string | Uint8Array | undefined;
+  /**
+   * Explicit self-check opt-in for checkpoint-embedded public keys.
+   * Embedded keys prove record self-consistency only, not signer identity.
+   */
+  trustEmbeddedCheckpointPublicKeys?: boolean;
   /** Optional in-process subscribers notified when audit-chain integrity fails. */
   integrityAnomalySubscribers?: AuditIntegrityAnomalySubscriber[];
   /**
@@ -1796,6 +1802,7 @@ export class AuditLog {
   private readonly checkpointPublicKeyResolver?: (
     signerKid: string
   ) => string | Uint8Array | undefined;
+  private readonly trustEmbeddedCheckpointPublicKeys: boolean;
   private readonly integrityAnomalySubscribers: AuditIntegrityAnomalySubscriber[];
   private readonly filesystemCapabilities?: FilesystemStorageCapabilities;
   private readonly auditWriteLockPath?: string;
@@ -1927,6 +1934,8 @@ export class AuditLog {
       config?.checkpointInterval ?? DEFAULT_CHECKPOINT_INTERVAL;
     this.checkpointSigner = config?.checkpointSigner;
     this.checkpointPublicKeyResolver = config?.checkpointPublicKeyResolver;
+    this.trustEmbeddedCheckpointPublicKeys =
+      config?.trustEmbeddedCheckpointPublicKeys ?? false;
     this.integrityAnomalySubscribers = config?.integrityAnomalySubscribers ?? [];
     this.eagerReverifyIntervalMs = resolveEagerReverifyIntervalMs(
       config?.eagerReverifyIntervalMs
@@ -2263,6 +2272,9 @@ export class AuditLog {
         this.assertAuditWriteLockActive(signal);
         const sequence = this.nextSequence;
         const prevHash = this.lastEntryHash;
+        // Hash-chain invariant: the entry hash covers the previous hash and the
+        // encrypted payload bytes, so changing either content or position in the
+        // append-only chain changes the digest checked on every reload.
         const entryHash = computeAuditEntryHash({
           sequence,
           prev_hash: prevHash,
@@ -5437,6 +5449,9 @@ export class AuditLog {
           hashes.push(entry.entry_hash);
         }
 
+        // Checkpoint root invariant: the persisted root is recomputed from the
+        // verified entry hashes on load, so a checkpoint cannot bless a changed
+        // span by carrying its own root_hash.
         const expectedRoot = computeAuditRoot(hashes);
         if (checkpoint.root_hash !== expectedRoot) {
           findings.push({
@@ -5469,10 +5484,26 @@ export class AuditLog {
       return;
     }
 
+    const resolvedPublicKey = this.checkpointPublicKeyResolver?.(
+      checkpoint.signer_kid
+    );
+    // Checkpoint trust-basis invariant: an embedded public key is part of the
+    // checkpoint being verified, so it is attacker-controlled unless the caller
+    // explicitly asks for an internal-consistency check instead of signer trust.
     const publicKey =
-      this.checkpointPublicKeyResolver?.(checkpoint.signer_kid) ??
-      checkpoint.public_key;
+      resolvedPublicKey ??
+      (this.trustEmbeddedCheckpointPublicKeys ? checkpoint.public_key : undefined);
     if (!publicKey) {
+      if (checkpoint.public_key) {
+        findings.push({
+          kind: "checkpoint_signature_embedded_key_untrusted",
+          sequence: checkpoint.checkpoint_sequence,
+          message:
+            `checkpoint signer ${checkpoint.signer_kid} has only an embedded public key; ` +
+            "configure checkpointPublicKeyResolver with an authenticated key, or explicitly opt in to embedded-key self-checks",
+        });
+        return;
+      }
       findings.push({
         kind: "checkpoint_signature_unverifiable",
         sequence: checkpoint.checkpoint_sequence,
@@ -5626,6 +5657,9 @@ export class AuditLog {
           checkpoint_kind: "audit-checkpoint",
           checkpoint_sequence: checkpointSequence,
           from_sequence: fromSequence,
+          // Checkpoint write invariant: the root is derived from persisted entry
+          // hashes collected while the write lock is held, not from mutable
+          // in-memory payloads or caller-provided checkpoint material.
           root_hash: computeAuditRoot(hashes),
           previous_checkpoint_sequence: previousCheckpointSequence,
           signed_at: new Date().toISOString(),
@@ -5725,6 +5759,9 @@ export class AuditLog {
       signed = null;
     }
 
+    // Production checkpoints may be unsigned today when no signer is wired; that
+    // honest bound is serialized as `unsigned` instead of fabricating signer
+    // evidence or silently trusting a fallback key.
     const record: AuditCheckpointRecord = {
       schema_version: AUDIT_CHECKPOINT_SCHEMA_VERSION,
       ...payload,
