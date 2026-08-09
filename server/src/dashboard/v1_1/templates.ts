@@ -1,5 +1,5 @@
 /**
- * Sanctuary v1.1 Dashboard — Display Template Registry
+ * Sanctuary v1.1 Dashboard - Display Template Registry
  *
  * Backends emit (display_template_id, display_template_args). The dashboard
  * owns the human-readable strings. This module is the single source of
@@ -93,7 +93,7 @@ const TEMPLATES: Record<string, TemplateRenderer> = {
   "approval_pending.tier1.lockdown": (a) =>
     `Lock down agent ${arg(a, "agent_id")}. This stops all egress and freezes gates.`,
   "approval_pending.tier1.fortress_lockdown": () =>
-    "Lockdown approval pending. Approving locks the entire fortress: writes are blocked, reads continue with LOCKED posture signals, active operations may fail, and agent workflows stop until the operator recovers or restarts them.",
+    "Lockdown approval pending. Approving asks every wrapped-agent controller to enter lockdown and records fortress lockdown status. The status flag is informational; it does not by itself block writes.",
   "approval_pending.tier1.fortress_exit_bundle_export": () =>
     "Export the entire fortress as a portable exit bundle.",
   "approval_pending.tier1.unwrap": (a) =>

@@ -1,13 +1,13 @@
 /**
- * Sanctuary MCP Server — Ed25519 Identity Management
+ * Sanctuary MCP Server - Ed25519 Identity Management
  *
  * Sovereign identity based on Ed25519 keypairs.
- * Private keys are always encrypted at rest — never stored in plaintext.
+ * Private keys are always encrypted at rest - never stored in plaintext.
  *
  * Security invariants:
  * - Private keys never appear in any MCP tool response
  * - Private keys are encrypted with identity-specific keys derived from the master key
- * - Key rotation produces a signed rotation event (verifiable chain)
+ * - Key rotation records a signed rotation event under the old key
  */
 
 import { ed25519 } from "@noble/curves/ed25519";
@@ -151,7 +151,7 @@ function base58btcEncode(bytes: Uint8Array): string {
  */
 export function generateIdentityId(publicKey: Uint8Array): string {
   const keyHash = hash(publicKey);
-  // First 16 bytes of SHA-256(pubkey) as hex — short, unique, deterministic
+  // First 16 bytes of SHA-256(pubkey) as hex - short, unique, deterministic
   return Array.from(keyHash.slice(0, 16))
     .map((b) => b.toString(16).padStart(2, "0"))
     .join("");

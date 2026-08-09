@@ -115,8 +115,8 @@ describe("v1.1 dashboard template registry", () => {
   it("renders the fortress lockdown approval template with consequences", () => {
     const out = renderTemplate("approval_pending.tier1.fortress_lockdown", []);
     expect(out).toContain("Lockdown approval pending");
-    expect(out).toContain("writes are blocked");
-    expect(out).toContain("reads continue");
+    expect(out).toContain("records fortress lockdown status");
+    expect(out).toContain("does not by itself block writes");
     expect(out).not.toContain("[unrecognized template");
   });
 });

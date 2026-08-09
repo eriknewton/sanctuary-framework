@@ -22,7 +22,7 @@ This doc originally staged large parts of the flow as unbuilt "Phase 2 /
 Alpha-3 / Alpha-4" scope. Those have since shipped. What is live today (traced to
 ASSURANCE_MATRIX row 18 "Egress enforcement: macOS"):
 
-- **The system extension enforces per-uid allow/deny that survives reboot** on a
+- **The system extension enforces per-uid allow/deny that survives attended reboot cycles** on a
   Developer-ID-signed + notarized + stapled binary, proven by the drills linked
   in ASSURANCE_MATRIX row 18. Do not claim beyond that row (in particular this is
   NOT tamper-evident per-flow audit).

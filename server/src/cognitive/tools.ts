@@ -1068,7 +1068,7 @@ export function createCognitiveTools(
       name: "identity_rotate",
       description:
         "Rotate keys for an identity. Generates a new keypair and " +
-        "signs a rotation event with the old key for verifiable chain.",
+        "signs a rotation event with the old key.",
       inputSchema: {
         type: "object",
         properties: {
