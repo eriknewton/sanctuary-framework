@@ -874,10 +874,10 @@ test/v1/federation-guardian-revocation-restart.test.ts(76,13): error TS2339: Pro
 test/v1/federation-guardian-revocation-restart.test.ts(91,13): error TS2339: Property 'setFederationContext' does not exist on type 'never'.
 test/v1/federation-guardian-revocation-restart.test.ts(92,13): error TS2339: Property '_federationEnabled' does not exist on type 'never'.
 test/v1/federation-guardian-revocation-restart.test.ts(93,19): error TS2339: Property 'setFederationSyncStateStore' does not exist on type 'never'.
-test/v1/federation-http.test.ts(25,15): error TS2305: Module '"../../src/mesh/types.js"' has no exported member 'BootstrapToken'.
-test/v1/federation-http.test.ts(715,7): error TS2322: Type 'Uint8Array<ArrayBufferLike> | undefined' is not assignable to type 'Uint8Array<ArrayBufferLike>'.
-test/v1/federation-http.test.ts(748,7): error TS2322: Type 'Uint8Array<ArrayBufferLike> | undefined' is not assignable to type 'Uint8Array<ArrayBufferLike>'.
-test/v1/federation-http.test.ts(787,7): error TS2322: Type 'Uint8Array<ArrayBufferLike> | undefined' is not assignable to type 'Uint8Array<ArrayBufferLike>'.
+test/v1/federation-http.test.ts(29,15): error TS2305: Module '"../../src/mesh/types.js"' has no exported member 'BootstrapToken'.
+test/v1/federation-http.test.ts(723,7): error TS2322: Type 'Uint8Array<ArrayBufferLike> | undefined' is not assignable to type 'Uint8Array<ArrayBufferLike>'.
+test/v1/federation-http.test.ts(756,7): error TS2322: Type 'Uint8Array<ArrayBufferLike> | undefined' is not assignable to type 'Uint8Array<ArrayBufferLike>'.
+test/v1/federation-http.test.ts(795,7): error TS2322: Type 'Uint8Array<ArrayBufferLike> | undefined' is not assignable to type 'Uint8Array<ArrayBufferLike>'.
 test/v1/federation-joiner-trust-root-store.test.ts(377,7): error TS2322: Type '(event: FederationJoinerTrustRootAuditEvent) => number' is not assignable to type '(event: FederationJoinerTrustRootAuditEvent) => void | Promise<void>'.
 test/v1/federation-policy-bundle.test.ts(117,13): error TS2339: Property 'setDependencies' does not exist on type 'never'.
 test/v1/federation-policy-bundle.test.ts(132,13): error TS2339: Property 'setFederationContext' does not exist on type 'never'.

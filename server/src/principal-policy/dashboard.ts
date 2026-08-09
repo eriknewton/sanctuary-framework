@@ -238,6 +238,8 @@ import {
   FederationSyncStateStore,
   type FederationSyncStateSnapshot,
 } from "../v1/federation-sync-state-store.js";
+import type { OperatorAuthorizationConsumeParams } from "../v1/operator-signed.js";
+import { OperatorAuthorizationSpentStore } from "../v1/operator-authorization-spent-store.js";
 import { FederationReissueChallengeStore } from "../v1/federation-reissue-challenge-store.js";
 import { HubNotFoundError, HubCapabilityError } from "../hub/errors.js";
 import { fromBase64url } from "../core/encoding.js";
@@ -1303,7 +1305,8 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    */
   private readonly _federationAcceptedHighWater = new Map<string, number>();
   private _federationOutboundHighWater = 0;
-  private readonly _federationSpentOperatorAuthorizations = new Map<string, string>();
+  private _operatorAuthorizationSpentStore = new OperatorAuthorizationSpentStore();
+  private _operatorAuthorizationSpentStoreUnavailable = false;
   /**
    * Federation 3/3b P0: DURABLE peer-sync security state. The store persists +
    * rehydrates the per-sender accepted high-water, the outbound high-water, and
@@ -2703,6 +2706,8 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       nodeId,
       listAgents: () => this.v11Bindings?.hubService.listAgents() ?? [],
       resolveOperatorPublicKey: () => this.resolveOperatorPublicKey(),
+      consumeOperatorAuthorization: (params) =>
+        this.consumeV1OperatorAuthorization(params),
       enqueueUnprotect: async (agentId): Promise<UnprotectOutcome> => {
         const hub = this.v11Bindings?.hubService;
         if (!hub) return { ok: false, reason: "unavailable" };
@@ -2738,6 +2743,25 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         : {}),
       idempotency: this.v1Idempotency,
     };
+  }
+
+  private async consumeV1OperatorAuthorization({
+    replayKey,
+    expiresAt,
+    action,
+    authorizationNonce,
+    operatorPublicKey,
+  }: OperatorAuthorizationConsumeParams): Promise<"consumed" | "replayed"> {
+    if (this._operatorAuthorizationSpentStoreUnavailable) {
+      throw new Error("operator_authorization_spent_store_unavailable");
+    }
+    return await this._operatorAuthorizationSpentStore.consume({
+      replayKey,
+      expiresAt,
+      action,
+      authorizationNonce,
+      operatorPublicKey,
+    });
   }
 
   /**
@@ -3667,6 +3691,27 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   }
 
   /**
+   * Bind the durable replay store for OPERATOR_SIGNED v1 authorizations.
+   * This is deliberately not gated on federation provisioning: /v1/agents
+   * protect/unprotect exist in the default single-node install and must keep
+   * single-use semantics there. Load failure latches the write routes
+   * unavailable, preserving fail-closed behavior without requiring federation.
+   */
+  async setOperatorAuthorizationSpentStore(
+    store: OperatorAuthorizationSpentStore | null,
+  ): Promise<void> {
+    this._operatorAuthorizationSpentStore =
+      store ?? new OperatorAuthorizationSpentStore();
+    this._operatorAuthorizationSpentStoreUnavailable = false;
+    if (store === null) return;
+    try {
+      await store.init();
+    } catch {
+      this._operatorAuthorizationSpentStoreUnavailable = true;
+    }
+  }
+
+  /**
    * Load the durable sync-state snapshot into the live in-memory fields.
    * Internal to {@link setFederationSyncStateStore}; separated for testability.
    */
@@ -3827,10 +3872,6 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       this._federationOutboundHighWater,
       snapshot.outboundHighWater,
     );
-    this._federationSpentOperatorAuthorizations.clear();
-    for (const [replayKey, expiresAt] of snapshot.spentOperatorAuthorizations) {
-      this._federationSpentOperatorAuthorizations.set(replayKey, expiresAt);
-    }
     // The durable revocation projection is the SOLE post-restart guarantor of
     // who is revoked (CC-2). It supersedes the empty-log reprojection: union the
     // durable revoked-set over the live one and lift the eviction-serial floor.
@@ -4340,9 +4381,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       federationEnabledGeneration: this._federationEnabledGeneration,
       acceptedHighWater: new Map(this._federationAcceptedHighWater),
       outboundHighWater: this._federationOutboundHighWater,
-      spentOperatorAuthorizations: new Map(
-        this._federationSpentOperatorAuthorizations,
-      ),
+      spentOperatorAuthorizations: new Map(),
       revokedNodeIds: new Set(this._federationState.revoked),
       highestEvictionSerial: this._federationState.evictionMaxSerial,
       revokedRootPubkeys: new Set(this._federationRevokedRoots),
@@ -4422,14 +4461,6 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   private assertFederationSyncStateAvailable(): void {
     if (this._federationSyncStateUnavailable) {
       throw new Error("federation_sync_state_unavailable");
-    }
-  }
-
-  private pruneExpiredOperatorAuthorizations(nowMs: number): void {
-    for (const [replayKey, expiresAt] of this._federationSpentOperatorAuthorizations) {
-      if (Date.parse(expiresAt) <= nowMs) {
-        this._federationSpentOperatorAuthorizations.delete(replayKey);
-      }
     }
   }
 
@@ -4794,26 +4825,8 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       },
       acceptedHighWaterFor: (senderNodeId) =>
         this._federationAcceptedHighWater.get(senderNodeId) ?? null,
-      consumeOperatorAuthorization: async ({ replayKey, expiresAt }) => {
-        if (this._federationSyncStateStore === null) {
-          throw new Error("federation_sync_state_unavailable");
-        }
-        this.assertFederationSyncStateAvailable();
-        this.pruneExpiredOperatorAuthorizations(Date.now());
-        if (this._federationSpentOperatorAuthorizations.has(replayKey)) {
-          return "replayed";
-        }
-        this._federationSpentOperatorAuthorizations.set(replayKey, expiresAt);
-        try {
-          await this.persistFederationSyncState();
-        } catch (err) {
-          if (this._federationSpentOperatorAuthorizations.get(replayKey) === expiresAt) {
-            this._federationSpentOperatorAuthorizations.delete(replayKey);
-          }
-          throw err;
-        }
-        return "consumed";
-      },
+      consumeOperatorAuthorization: (params) =>
+        this.consumeV1OperatorAuthorization(params),
       recordAcceptedHighWater: async (senderNodeId, highWater, certificate) => {
         // Fail closed on an unavailable durable record (corrupt-on-boot).
         if (this._federationSyncStateUnavailable) return false;

@@ -20,7 +20,11 @@ import {
   signOperatorPayload,
 } from "../../src/v1/operator-signed.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
-import { FederationSyncStateStore } from "../../src/v1/federation-sync-state-store.js";
+import {
+  OPERATOR_AUTHORIZATION_SPENT_STORE_KEY,
+  OPERATOR_AUTHORIZATION_SPENT_STORE_NAMESPACE,
+  OperatorAuthorizationSpentStore,
+} from "../../src/v1/operator-authorization-spent-store.js";
 import { verifyCertChain } from "../../src/mesh/trust-root.js";
 import type { BootstrapToken, NodeIdentityCertificate, PrincipalCertificate } from "../../src/mesh/types.js";
 import { toBase64url } from "../../src/core/encoding.js";
@@ -39,7 +43,7 @@ import {
   GUARDIAN_SIGN_OFF_ACTION,
 } from "../../src/v1/federation-revocation-guardian-gate.js";
 
-class ArmedFailingSyncStateStorage extends MemoryStorage {
+class ArmedFailingOperatorSpentStorage extends MemoryStorage {
   armed = false;
 
   override async write(
@@ -47,8 +51,12 @@ class ArmedFailingSyncStateStorage extends MemoryStorage {
     key: string,
     data: Uint8Array,
   ): Promise<void> {
-    if (this.armed && namespace === "_federation" && key === "sync-state-v1") {
-      throw new Error("sync-state write failed");
+    if (
+      this.armed &&
+      namespace === OPERATOR_AUTHORIZATION_SPENT_STORE_NAMESPACE &&
+      key === OPERATOR_AUTHORIZATION_SPENT_STORE_KEY
+    ) {
+      throw new Error("operator spent-set write failed");
     }
     await super.write(namespace, key, data);
   }
@@ -159,9 +167,9 @@ describe("/v1/federation enable/disable — OPERATOR_SIGNED", { retry: 2 }, () =
   });
 
   it("refuses authorize/init when the spent-authorization set cannot persist", async () => {
-    const storage = new ArmedFailingSyncStateStorage();
-    await rig.dashboard.setFederationSyncStateStore(
-      new FederationSyncStateStore({ storage, masterKey: randomBytes(32) }),
+    const storage = new ArmedFailingOperatorSpentStorage();
+    await rig.dashboard.setOperatorAuthorizationSpentStore(
+      OperatorAuthorizationSpentStore.durableFromBoot(storage, randomBytes(32)),
     );
     const token = await openDurableSession(rig);
     const enableRes = await fetch(`${rig.baseUrl}/v1/federation/enable`, {
