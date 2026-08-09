@@ -27,7 +27,12 @@ export interface Tier2Config {
 
 /** Approval channel configuration */
 export interface ApprovalChannelConfig {
-  type: "stderr" | "webhook" | "callback";
+  /**
+   * Additive at-rest enum. Existing tokens stay byte-stable per
+   * server/reorg-surface-manifest.md; `dashboard` only lets the policy name the
+   * already-shipped DashboardApprovalChannel.
+   */
+  type: "stderr" | "webhook" | "callback" | "dashboard";
   timeout_seconds: number;
   /**
    * SEC-002: auto_deny is hardcoded to true and not configurable.

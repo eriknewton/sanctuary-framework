@@ -114,6 +114,34 @@ approval_channel:
       }
     });
 
+    it("accepts dashboard as an explicit approval channel type", () => {
+      const yaml = `
+version: 1
+tier1_always_approve:
+  - state_export
+approval_channel:
+  type: dashboard
+  timeout_seconds: 120
+`;
+      const policy = parsePolicy(yaml);
+      expect(policy.approval_channel.type).toBe("dashboard");
+      expect(policy.approval_channel.timeout_seconds).toBe(120);
+    });
+
+    it("rejects unknown approval channel types instead of silently defaulting", () => {
+      const yaml = `
+version: 1
+tier1_always_approve:
+  - state_export
+approval_channel:
+  type: sms
+  timeout_seconds: 120
+`;
+      expect(() => parsePolicy(yaml)).toThrow(
+        /approval_channel\.type must be "stderr", "webhook", "callback", or "dashboard"/,
+      );
+    });
+
     it("migrates context-gate mutation tools out of Tier 3 on upgrade", () => {
       const yaml = `
 version: 1
