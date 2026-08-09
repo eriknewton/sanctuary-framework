@@ -1,3 +1,4 @@
+// fail-before-exempt: inherited supporting file-grant coverage still passes against pre-fix source; key-resolution fail-before coverage lives in state-envelope-integrity.test.ts and master-rotation.test.ts
 /**
  * Governed File-Grant v1 -- real TTL scrub via reconcile (Fix 4).
  *
@@ -21,7 +22,7 @@ const APPLIED: FileGrantAclResult = { status: "applied", platform: process.platf
 
 describe("file-grant reconcile: expired grants are actually scrubbed", () => {
   it("scrubs the tree entry AND flips persisted status once a grant is past its TTL", async () => {
-    const { grantStore, auditLog } = makeFileGrantTestStore();
+    const { grantStore, auditLog } = await makeFileGrantTestStore();
     const fsOps = new FakeFsOps({ agentUid: 502, sourceOwnerUid: 501 });
 
     const { grant } = await mintFileGrant(
@@ -63,7 +64,7 @@ describe("file-grant reconcile: expired grants are actually scrubbed", () => {
   });
 
   it("removes a verified grant ACL when expiry scrub removes the tree entry", async () => {
-    const { grantStore, auditLog } = makeFileGrantTestStore();
+    const { grantStore, auditLog } = await makeFileGrantTestStore();
     const fsOps = new FakeFsOps({
       agentUid: 502,
       sourceOwnerUid: 501,
@@ -107,7 +108,7 @@ describe("file-grant reconcile: expired grants are actually scrubbed", () => {
   });
 
   it("retains verified grant ACL metadata when expiry scrub cannot confirm removal", async () => {
-    const { grantStore, auditLog } = makeFileGrantTestStore();
+    const { grantStore, auditLog } = await makeFileGrantTestStore();
     const fsOps = new FakeFsOps({
       agentUid: 502,
       sourceOwnerUid: 501,
@@ -143,7 +144,7 @@ describe("file-grant reconcile: expired grants are actually scrubbed", () => {
   });
 
   it("never scrubs or expires a standing (no-TTL) grant", async () => {
-    const { grantStore } = makeFileGrantTestStore();
+    const { grantStore } = await makeFileGrantTestStore();
     const fsOps = new FakeFsOps({ agentUid: 502, sourceOwnerUid: 501 });
 
     const { grant } = await mintFileGrant(
@@ -169,7 +170,7 @@ describe("file-grant reconcile: expired grants are actually scrubbed", () => {
   });
 
   it("scrubs the expired tree entry even when the status persist THROWS (R2-2 fail-open close)", async () => {
-    const { grantStore, auditLog } = makeFileGrantTestStore();
+    const { grantStore, auditLog } = await makeFileGrantTestStore();
     const fsOps = new FakeFsOps({ agentUid: 502, sourceOwnerUid: 501 });
 
     const { grant } = await mintFileGrant(
@@ -207,7 +208,7 @@ describe("file-grant reconcile: expired grants are actually scrubbed", () => {
   });
 
   it("a list-command touch reconciles (scrubs the expired entry) before projecting -- not merely 'expired' (R2-4)", async () => {
-    const { grantStore, auditLog } = makeFileGrantTestStore();
+    const { grantStore, auditLog } = await makeFileGrantTestStore();
     const fsOps = new FakeFsOps({ agentUid: 502, sourceOwnerUid: 501 });
 
     const { grant } = await mintFileGrant(
@@ -239,7 +240,7 @@ describe("file-grant reconcile: expired grants are actually scrubbed", () => {
   });
 
   it("scrubs a revoked grant's entry idempotently without re-flipping status", async () => {
-    const { grantStore } = makeFileGrantTestStore();
+    const { grantStore } = await makeFileGrantTestStore();
     const fsOps = new FakeFsOps({ agentUid: 502, sourceOwnerUid: 501 });
 
     const { grant } = await mintFileGrant(

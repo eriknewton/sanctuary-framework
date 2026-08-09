@@ -1,3 +1,4 @@
+// fail-before-exempt: authenticated StateStore fixture wiring only; key-resolution fail-before coverage lives in state-envelope-integrity.test.ts and master-rotation.test.ts
 import { describe, expect, it } from "vitest";
 
 import { derivePurposeKey } from "../../../src/core/key-derivation.js";
@@ -12,8 +13,9 @@ import {
   type TaskStatus,
 } from "../../../src/operational/task-coordination/index.js";
 import { MemoryStorage } from "../../../src/storage/memory.js";
+import { persistStoredIdentity } from "../../util/persist-stored-identity.js";
 
-function makeService(fortressId = "fortress-a") {
+async function makeService(fortressId = "fortress-a") {
   const storage = new MemoryStorage();
   const masterKey = generateRandomKey();
   const stateStore = new StateStore(storage, masterKey);
@@ -24,6 +26,7 @@ function makeService(fortressId = "fortress-a") {
     identityEncryptionKey,
     "recovery-key",
   );
+  await persistStoredIdentity(storage, masterKey, storedIdentity);
   const service = new TaskService({
     stateStore,
     auditLog,
@@ -39,7 +42,7 @@ function makeService(fortressId = "fortress-a") {
 
 describe("TaskService", () => {
   it("creates, lists, shows, assigns, updates, and cancels tasks", async () => {
-    const { service } = makeService();
+    const { service } = await makeService();
 
     const created = await service.create({
       title: "Review handoff",
@@ -92,7 +95,7 @@ describe("TaskService", () => {
     for (const from of TASK_STATUSES) {
       for (const to of TASK_STATUSES) {
         if (allowed[from].includes(to)) continue;
-        const { service } = makeService(`fortress-${from}-${to}`);
+        const { service } = await makeService(`fortress-${from}-${to}`);
         const task = await service.create({ title: `${from} to ${to}`, creator: "operator" });
         await driveTo(service, task.id, from);
         await expect(
@@ -103,7 +106,7 @@ describe("TaskService", () => {
   });
 
   it("emits critical audit entries for lifecycle transitions", async () => {
-    const { service, auditLog } = makeService();
+    const { service, auditLog } = await makeService();
     const task = await service.create({ title: "Audit me", creator: "operator" });
     await service.assign(task.id, { assignee: "agent-a", actor: "operator" });
     await service.updateStatus(task.id, {
@@ -126,7 +129,7 @@ describe("TaskService", () => {
   });
 
   it("chains ready_for_review into an inbox approval id and audits the chain", async () => {
-    const { service, auditLog } = makeService();
+    const { service, auditLog } = await makeService();
     const task = await service.create({ title: "Ready", creator: "operator" });
     await service.updateStatus(task.id, {
       status: "in_progress",
@@ -146,7 +149,7 @@ describe("TaskService", () => {
   });
 
   it("isolates task listings by fortress id", async () => {
-    const rig = makeService("fortress-a");
+    const rig = await makeService("fortress-a");
     const serviceB = new TaskService({
       stateStore: rig.stateStore,
       auditLog: rig.auditLog,

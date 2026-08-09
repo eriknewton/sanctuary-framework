@@ -1,3 +1,4 @@
+// fail-before-exempt: authenticated StateStore fixture wiring only; key-resolution fail-before coverage lives in state-envelope-integrity.test.ts and master-rotation.test.ts
 /**
  * Castle Wall Observe / Learn Allow-List v1 -- StateStore round-trip tests.
  *
@@ -18,6 +19,7 @@ import { createIdentity } from "../../../src/core/identity.js";
 import { derivePurposeKey } from "../../../src/core/key-derivation.js";
 import { ObserveStore } from "../../../src/castle-wall/observe/store.js";
 import { OBSERVE_NAMESPACE, candidateKey, type CandidateObservation } from "../../../src/castle-wall/observe/types.js";
+import { persistStoredIdentity } from "../../util/persist-stored-identity.js";
 
 function candidate(overrides: Partial<CandidateObservation> = {}): CandidateObservation {
   return {
@@ -37,12 +39,13 @@ function candidate(overrides: Partial<CandidateObservation> = {}): CandidateObse
   };
 }
 
-function makeStore(): { store: ObserveStore; stateStore: StateStore } {
+async function makeStore(): Promise<{ store: ObserveStore; stateStore: StateStore }> {
   const storage = new MemoryStorage();
   const masterKey = generateRandomKey();
   const stateStore = new StateStore(storage, masterKey);
   const identityEncKey = derivePurposeKey(masterKey, "identity-encryption");
   const { storedIdentity } = createIdentity("operator", identityEncKey, "passphrase");
+  await persistStoredIdentity(storage, masterKey, storedIdentity);
   const store = new ObserveStore(stateStore, {
     identityId: storedIdentity.identity_id,
     encryptedPrivateKey: storedIdentity.encrypted_private_key,
@@ -53,7 +56,7 @@ function makeStore(): { store: ObserveStore; stateStore: StateStore } {
 
 describe("ObserveStore: readable / exportable / deletable (DoD test 5)", () => {
   it("round-trips the observe-mode state", async () => {
-    const { store } = makeStore();
+    const { store } = await makeStore();
     const initial = await store.getState();
     expect(initial.enabled).toBe(false);
 
@@ -63,7 +66,7 @@ describe("ObserveStore: readable / exportable / deletable (DoD test 5)", () => {
   });
 
   it("round-trips a candidate through put/list", async () => {
-    const { store } = makeStore();
+    const { store } = await makeStore();
     const c = candidate();
     await store.putCandidate(c);
 
@@ -73,7 +76,7 @@ describe("ObserveStore: readable / exportable / deletable (DoD test 5)", () => {
   });
 
   it("is readable through the standard StateStore read/list/export path (Invariant #2)", async () => {
-    const { store, stateStore } = makeStore();
+    const { store, stateStore } = await makeStore();
     await store.putCandidate(candidate());
 
     const listing = await stateStore.list(OBSERVE_NAMESPACE);
@@ -84,7 +87,7 @@ describe("ObserveStore: readable / exportable / deletable (DoD test 5)", () => {
   });
 
   it("is deletable: removing a candidate leaves it absent from listCandidates", async () => {
-    const { store } = makeStore();
+    const { store } = await makeStore();
     const c = candidate();
     await store.putCandidate(c);
     expect((await store.listCandidates()).size).toBe(1);
@@ -94,7 +97,7 @@ describe("ObserveStore: readable / exportable / deletable (DoD test 5)", () => {
   });
 
   it("deleting one candidate leaves an unrelated candidate untouched", async () => {
-    const { store } = makeStore();
+    const { store } = await makeStore();
     const a = candidate({ host: "a.example.com" });
     const b = candidate({ host: "b.example.com" });
     await store.putCandidate(a);
@@ -108,7 +111,7 @@ describe("ObserveStore: readable / exportable / deletable (DoD test 5)", () => {
   });
 
   it("mergeObservations bumps an existing candidate rather than duplicating it", async () => {
-    const { store } = makeStore();
+    const { store } = await makeStore();
     await store.putCandidate(candidate({ times_seen: 1 }));
     await store.mergeObservations([candidate({ times_seen: 2 })]);
 
@@ -118,7 +121,7 @@ describe("ObserveStore: readable / exportable / deletable (DoD test 5)", () => {
   });
 
   it("lists candidates across more than one StateStore page (paging correctness)", async () => {
-    const { store } = makeStore();
+    const { store } = await makeStore();
     for (let i = 0; i < 150; i++) {
       await store.putCandidate(candidate({ host: `host-${i}.example.com`, port: 443 + i }));
     }
@@ -151,7 +154,7 @@ describe("ObserveStore: persisted last-refresh strict validation (definitive-emp
   }
 
   it("round-trips a fully valid two-source record", async () => {
-    const { store } = makeStore();
+    const { store } = await makeStore();
     await store.putLastRefreshOutcome(validOutcome());
     const read = await store.getLastRefreshOutcome();
     expect(read).not.toBeNull();
@@ -159,7 +162,7 @@ describe("ObserveStore: persisted last-refresh strict validation (definitive-emp
   });
 
   it("rejects a bare absent row lacking a reason (authority by omission)", async () => {
-    const { store, stateStore } = makeStore();
+    const { store, stateStore } = await makeStore();
     const malformed = validOutcome() as unknown as { source_reads: unknown[] };
     malformed.source_reads[1] = { source_id: "boot-audit", status: "absent" };
     await writeRaw(store, stateStore, malformed);
@@ -167,7 +170,7 @@ describe("ObserveStore: persisted last-refresh strict validation (definitive-emp
   });
 
   it("rejects an absent row smuggling a downgrade failure enum", async () => {
-    const { store, stateStore } = makeStore();
+    const { store, stateStore } = await makeStore();
     const malformed = validOutcome() as unknown as { source_reads: unknown[] };
     malformed.source_reads[1] = {
       source_id: "boot-audit",
@@ -180,7 +183,7 @@ describe("ObserveStore: persisted last-refresh strict validation (definitive-emp
   });
 
   it("rejects a single-source record (cannot carry full-registry authority)", async () => {
-    const { store, stateStore } = makeStore();
+    const { store, stateStore } = await makeStore();
     const partial = validOutcome() as unknown as { source_reads: unknown[] };
     partial.source_reads = [partial.source_reads[0]];
     await writeRaw(store, stateStore, partial);
@@ -188,7 +191,7 @@ describe("ObserveStore: persisted last-refresh strict validation (definitive-emp
   });
 
   it("rejects duplicate source ids", async () => {
-    const { store, stateStore } = makeStore();
+    const { store, stateStore } = await makeStore();
     const dup = validOutcome() as unknown as { source_reads: unknown[] };
     dup.source_reads = [dup.source_reads[0], dup.source_reads[0]];
     await writeRaw(store, stateStore, dup);
@@ -196,7 +199,7 @@ describe("ObserveStore: persisted last-refresh strict validation (definitive-emp
   });
 
   it("rejects an unknown source id", async () => {
-    const { store, stateStore } = makeStore();
+    const { store, stateStore } = await makeStore();
     const unknownSource = validOutcome() as unknown as { source_reads: unknown[] };
     unknownSource.source_reads[1] = { source_id: "rogue-audit", status: "absent", reason: "x" };
     await writeRaw(store, stateStore, unknownSource);

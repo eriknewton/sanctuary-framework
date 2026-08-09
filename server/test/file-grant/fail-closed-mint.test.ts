@@ -1,3 +1,4 @@
+// fail-before-exempt: inherited supporting file-grant coverage still passes against pre-fix source; key-resolution fail-before coverage lives in state-envelope-integrity.test.ts and master-rotation.test.ts
 /**
  * Governed File-Grant v1 -- fail-closed + honest mint (DoD gate 5, Invariant
  * #5, plus the two-family gate fixes 1/2/3/5).
@@ -48,7 +49,7 @@ function baseParams(overrides: Record<string, unknown> = {}) {
 
 describe("file-grant fail-closed mint: rollback leaves no object AND no tree entry", () => {
   it("place() throwing before recording rolls back the object and places nothing", async () => {
-    const { grantStore, auditLog } = makeFileGrantTestStore();
+    const { grantStore, auditLog } = await makeFileGrantTestStore();
     const fsOps = new FakeFsOps({ placeThrows: new Error("EPERM: cannot chown to agent uid") });
 
     await expect(
@@ -79,7 +80,7 @@ describe("file-grant fail-closed mint: rollback leaves no object AND no tree ent
   });
 
   it("place() recording a partial entry THEN throwing is scrubbed (no tree entry survives)", async () => {
-    const { grantStore, auditLog } = makeFileGrantTestStore();
+    const { grantStore, auditLog } = await makeFileGrantTestStore();
     const fsOps = new FakeFsOps({
       placeRecordsThenThrows: new Error("symlink ok then chown EPERM"),
     });
@@ -96,7 +97,7 @@ describe("file-grant fail-closed mint: rollback leaves no object AND no tree ent
   });
 
   it("store.remove throwing during rollback leaves NO active grant (terminal tombstone persisted)", async () => {
-    const { grantStore, auditLog } = makeFileGrantTestStore();
+    const { grantStore, auditLog } = await makeFileGrantTestStore();
     // A store whose delete fails, but whose write still works: mint must then
     // persist a terminal `revoked` record rather than leaving a dangling active.
     const removeFailingStore: FileGrantRecordStore = {
@@ -121,7 +122,7 @@ describe("file-grant fail-closed mint: rollback leaves no object AND no tree ent
 
 describe("file-grant mint: a throw AFTER place() succeeds never becomes a false failure (Fix 1 + R2-3b)", () => {
   it("a broken POST-PLACE confirmation audit does NOT roll back a live grant; mint reports success", async () => {
-    const { grantStore } = makeFileGrantTestStore();
+    const { grantStore } = await makeFileGrantTestStore();
     const fsOps = new FakeFsOps({ agentUid: 502, sourceOwnerUid: 501 });
     // Audit that throws ONLY on the post-placement CONFIRMATION append (phase
     // "placed"). The DURABLE pre-placement audit (phase "recorded") succeeds, so
@@ -154,7 +155,7 @@ describe("file-grant mint: a throw AFTER place() succeeds never becomes a false 
 
 describe("file-grant mint: a put() that commits then throws leaves no phantom (R2-1)", () => {
   it("a persists-then-throws put() rolls the committed record back; no active grant survives", async () => {
-    const { grantStore, auditLog } = makeFileGrantTestStore();
+    const { grantStore, auditLog } = await makeFileGrantTestStore();
     // A store whose put() DURABLY writes to the real grantStore and THEN throws,
     // modeling StateStore.write committing before a post-commit await
     // (rememberWriterPublicKey / observeVersion / rename->fsyncDir) throws. The
@@ -183,7 +184,7 @@ describe("file-grant mint: a put() that commits then throws leaves no phantom (R
 
 describe("file-grant mint: audit precedes access (R2-3a)", () => {
   it("a pre-placement audit failure fails closed: no live access, no active grant", async () => {
-    const { grantStore } = makeFileGrantTestStore();
+    const { grantStore } = await makeFileGrantTestStore();
     const fsOps = new FakeFsOps({ agentUid: 502, sourceOwnerUid: 501 });
     // Audit that throws on the DURABLE pre-placement append (phase "recorded").
     // Access must NEVER be conferred without a preceding audit entry, so mint
@@ -209,7 +210,7 @@ describe("file-grant mint: audit precedes access (R2-3a)", () => {
 
 describe("file-grant mint: file_grant_recorded -> file_grant audit sequence (R3-1, revised round 4)", () => {
   it("a successful mint writes a durable 'file_grant_recorded' audit, then a 'file_grant' success confirmation", async () => {
-    const { grantStore, auditLog } = makeFileGrantTestStore();
+    const { grantStore, auditLog } = await makeFileGrantTestStore();
     const fsOps = new FakeFsOps({ agentUid: 502, sourceOwnerUid: 501 });
 
     const { grant } = await mintFileGrant(baseParams(), {
@@ -254,7 +255,7 @@ describe("file-grant mint: file_grant_recorded -> file_grant audit sequence (R3-
 
 describe("file-grant mint: honest enforcement label (Fix 3, never overclaim)", () => {
   it("reports unmet when the agent uid equals the source-file owner (same-owner box)", async () => {
-    const { grantStore } = makeFileGrantTestStore();
+    const { grantStore } = await makeFileGrantTestStore();
     const fsOps = new FakeFsOps({ agentUid: 501, sourceOwnerUid: 501 });
 
     const { grant, enforcement } = await mintFileGrant(baseParams(), {
@@ -268,7 +269,7 @@ describe("file-grant mint: honest enforcement label (Fix 3, never overclaim)", (
   });
 
   it("reports unmet for the sudo/source-owner case (source owned BY the agent uid), never met", async () => {
-    const { grantStore } = makeFileGrantTestStore();
+    const { grantStore } = await makeFileGrantTestStore();
     // Under sudo, process.getuid() would be 0; a naive uid check would see
     // 0 != 502 and print "met". The source is owned by the agent uid (502),
     // so there is NO boundary: the honest verdict is "unmet".
@@ -285,7 +286,7 @@ describe("file-grant mint: honest enforcement label (Fix 3, never overclaim)", (
   });
 
   it("reports unmet when no dedicated agent uid is configured at all", async () => {
-    const { grantStore } = makeFileGrantTestStore();
+    const { grantStore } = await makeFileGrantTestStore();
     const fsOps = new FakeFsOps({ agentUid: null, sourceOwnerUid: 501 });
 
     const { enforcement } = await mintFileGrant(baseParams({ ttlSeconds: null }), {
@@ -298,7 +299,7 @@ describe("file-grant mint: honest enforcement label (Fix 3, never overclaim)", (
   });
 
   it("reports unverified (NOT met) for a real uid split with no on-hardware verification", async () => {
-    const { grantStore } = makeFileGrantTestStore();
+    const { grantStore } = await makeFileGrantTestStore();
     const fsOps = new FakeFsOps({ agentUid: 502, sourceOwnerUid: 501 });
 
     const { enforcement } = await mintFileGrant(baseParams(), {
@@ -315,7 +316,7 @@ describe("file-grant mint: honest enforcement label (Fix 3, never overclaim)", (
 
 describe("file-grant mint: agent-id containment (Fix 5)", () => {
   it("rejects a path-traversing subject agent id and persists/places nothing", async () => {
-    const { grantStore } = makeFileGrantTestStore();
+    const { grantStore } = await makeFileGrantTestStore();
     const fsOps = new FakeFsOps({ agentUid: 502, sourceOwnerUid: 501 });
 
     await expect(
@@ -331,7 +332,7 @@ describe("file-grant mint: agent-id containment (Fix 5)", () => {
   });
 
   it("rejects a slashed or leading-dot agent id before any side effect", async () => {
-    const { grantStore } = makeFileGrantTestStore();
+    const { grantStore } = await makeFileGrantTestStore();
     const fsOps = new FakeFsOps();
 
     for (const bad of ["a/b", ".hidden", "..", "", "x/../y"]) {

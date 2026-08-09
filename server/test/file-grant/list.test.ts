@@ -1,3 +1,4 @@
+// fail-before-exempt: inherited supporting file-grant coverage still passes against pre-fix source; key-resolution fail-before coverage lives in state-envelope-integrity.test.ts and master-rotation.test.ts
 /**
  * Governed File-Grant v1 -- list projection.
  *
@@ -13,7 +14,7 @@ import { FakeFsOps, makeFileGrantTestStore } from "./fixtures.js";
 
 describe("file-grant list projection", () => {
   it("projects a past-TTL grant as expired without mutating the persisted record", async () => {
-    const { grantStore } = makeFileGrantTestStore();
+    const { grantStore } = await makeFileGrantTestStore();
     const fsOps = new FakeFsOps({ agentUid: 502, sourceOwnerUid: 501 });
 
     const { grant } = await mintFileGrant(
@@ -39,7 +40,7 @@ describe("file-grant list projection", () => {
   });
 
   it("filters by subjectAgentId", async () => {
-    const { grantStore } = makeFileGrantTestStore();
+    const { grantStore } = await makeFileGrantTestStore();
     const fsOps = new FakeFsOps({ agentUid: 502, sourceOwnerUid: 501 });
 
     await mintFileGrant(
@@ -69,7 +70,7 @@ describe("file-grant list projection", () => {
   });
 
   it("returns an empty list when there are no grants", async () => {
-    const { grantStore } = makeFileGrantTestStore();
+    const { grantStore } = await makeFileGrantTestStore();
     expect(await listFileGrants(grantStore, new Date())).toEqual([]);
   });
 });

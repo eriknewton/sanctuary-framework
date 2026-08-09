@@ -39,7 +39,7 @@ import {
 } from "../core/encoding.js";
 import type { EncryptedPayload as EncPayload } from "../core/encryption.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
-import type { StoredIdentity } from "../core/identity.js";
+import type { RotationEvent, StoredIdentity } from "../core/identity.js";
 import {
   mintProvenanceStamp,
   serializeStamp,
@@ -61,10 +61,9 @@ const STATE_ENVELOPE_VERSION_ANCHORS_KEY = "state-envelope-version-anchors-v1";
 // makes such an edit detectable (verification fails -> the read is rejected). The
 // MAC binds the `_meta` key so the record cannot be replayed under another key.
 // Scope note: this authenticates the version anchor only. The writer-public-key
-// registry (`state-envelope-public-keys-v1`) is a separate plaintext `_meta`
-// record; authenticating it (to close kid->key injection when an identity is
-// resolved from the registry rather than `_identities`) is a related but
-// distinct hardening, tracked separately - it is NOT covered here.
+// registry (`state-envelope-public-keys-v1`) is a plaintext legacy/migration
+// hint. It is deliberately not a verification basis: read verification accepts
+// only keys authenticated by `_identities` and its signed rotation history.
 const STATE_META_MAC_DOMAIN = "sanctuary.meta-record-mac.v1\n";
 // Distinctive envelope marker so a MAC'd record is unambiguously distinguished
 // from a legacy bare record (legacy keys are versionKeys, never this).
@@ -321,6 +320,174 @@ export interface StateEntry {
     schema_version?: number;
     written_at: string;
   };
+}
+
+export type WriterPublicKeyTrustBasis = "authenticated" | "unauthenticated";
+
+export interface ResolvedWriterPublicKey {
+  publicKey: Uint8Array;
+  publicKeyBase64url: string;
+  trustBasis: WriterPublicKeyTrustBasis;
+  source:
+    | "identity-current"
+    | "identity-rotation-chain"
+    | "plaintext-registry";
+}
+
+// 64 bounds identity-chain verification work while still allowing decades of
+// realistic key rotations for one local identity.
+const MAX_IDENTITY_ROTATION_CHAIN_LENGTH = 64;
+
+function rotationEventSigningBytes(event: RotationEvent): Uint8Array {
+  // Must match rotateKeys() in core/identity.ts: the old key signs exactly
+  // these fields in this order before the signature field is attached.
+  return stringToBytes(
+    JSON.stringify({
+      old_public_key: event.old_public_key,
+      new_public_key: event.new_public_key,
+      identity_id: event.identity_id,
+      reason: event.reason,
+      rotated_at: event.rotated_at,
+    })
+  );
+}
+
+function parseStoredRotationEvent(encoded: string): RotationEvent | null {
+  try {
+    const parsed = JSON.parse(bytesToString(fromBase64url(encoded))) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return null;
+    }
+    const record = parsed as Record<string, unknown>;
+    if (
+      typeof record.old_public_key !== "string" ||
+      typeof record.new_public_key !== "string" ||
+      typeof record.identity_id !== "string" ||
+      typeof record.reason !== "string" ||
+      typeof record.rotated_at !== "string" ||
+      typeof record.signature !== "string"
+    ) {
+      return null;
+    }
+    return {
+      old_public_key: record.old_public_key,
+      new_public_key: record.new_public_key,
+      identity_id: record.identity_id,
+      reason: record.reason,
+      rotated_at: record.rotated_at,
+      signature: record.signature,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function appendResolvedWriterKey(
+  keys: ResolvedWriterPublicKey[],
+  seen: Set<string>,
+  publicKeyBase64url: string,
+  source: ResolvedWriterPublicKey["source"],
+  trustBasis: WriterPublicKeyTrustBasis
+): boolean {
+  if (seen.has(publicKeyBase64url)) return true;
+  try {
+    const publicKey = fromBase64url(publicKeyBase64url);
+    keys.push({ publicKey, publicKeyBase64url, trustBasis, source });
+    seen.add(publicKeyBase64url);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function resolveAuthenticatedIdentityWriterPublicKeys(
+  identity: StoredIdentity
+): ResolvedWriterPublicKey[] {
+  const keys: ResolvedWriterPublicKey[] = [];
+  const seen = new Set<string>();
+  const history = Array.isArray(identity.rotation_history)
+    ? identity.rotation_history
+    : [];
+
+  if (history.length > MAX_IDENTITY_ROTATION_CHAIN_LENGTH) {
+    return [];
+  }
+
+  if (history.length === 0) {
+    return appendResolvedWriterKey(
+      keys,
+      seen,
+      identity.public_key,
+      "identity-current",
+      "authenticated"
+    )
+      ? keys
+      : [];
+  }
+
+  let expectedOldPublicKey: string | null = null;
+  for (const item of history) {
+    if (
+      !item ||
+      typeof item.old_public_key !== "string" ||
+      typeof item.new_public_key !== "string" ||
+      typeof item.rotation_event !== "string" ||
+      typeof item.rotated_at !== "string"
+    ) {
+      return [];
+    }
+
+    const event = parseStoredRotationEvent(item.rotation_event);
+    if (
+      !event ||
+      event.identity_id !== identity.identity_id ||
+      event.old_public_key !== item.old_public_key ||
+      event.new_public_key !== item.new_public_key ||
+      event.rotated_at !== item.rotated_at ||
+      (expectedOldPublicKey !== null && event.old_public_key !== expectedOldPublicKey)
+    ) {
+      return [];
+    }
+
+    let oldPublicKey: Uint8Array;
+    let signature: Uint8Array;
+    try {
+      oldPublicKey = fromBase64url(event.old_public_key);
+      fromBase64url(event.new_public_key);
+      signature = fromBase64url(event.signature);
+    } catch {
+      return [];
+    }
+    if (!verify(rotationEventSigningBytes(event), signature, oldPublicKey)) {
+      return [];
+    }
+    if (
+      !appendResolvedWriterKey(
+        keys,
+        seen,
+        event.old_public_key,
+        "identity-rotation-chain",
+        "authenticated"
+      )
+    ) {
+      return [];
+    }
+    expectedOldPublicKey = event.new_public_key;
+  }
+
+  if (expectedOldPublicKey !== identity.public_key) {
+    return [];
+  }
+
+  return appendResolvedWriterKey(
+    keys,
+    seen,
+    identity.public_key,
+    "identity-current",
+    "authenticated"
+  )
+    ? keys
+    : [];
 }
 
 /** Result of a state write operation */
@@ -1123,21 +1290,33 @@ export class StateStore {
     return null;
   }
 
-  private async resolveWriterPublicKey(kid: string): Promise<Uint8Array | null> {
+  private async resolveWriterPublicKeys(
+    kid: string
+  ): Promise<ResolvedWriterPublicKey[]> {
+    const keys: ResolvedWriterPublicKey[] = [];
+    const seen = new Set<string>();
     const identity = await this.resolveStoredIdentity(kid);
     if (identity) {
-      return fromBase64url(identity.public_key);
+      for (const key of resolveAuthenticatedIdentityWriterPublicKeys(identity)) {
+        if (!seen.has(key.publicKeyBase64url)) {
+          keys.push(key);
+          seen.add(key.publicKeyBase64url);
+        }
+      }
     }
 
     const registry = await this.loadJsonRecord(STATE_ENVELOPE_PUBLIC_KEYS_KEY);
     const publicKey = registry[kid];
-    if (typeof publicKey !== "string") return null;
-
-    try {
-      return fromBase64url(publicKey);
-    } catch {
-      return null;
+    if (typeof publicKey === "string") {
+      appendResolvedWriterKey(
+        keys,
+        seen,
+        publicKey,
+        "plaintext-registry",
+        "unauthenticated"
+      );
     }
+    return keys;
   }
 
   private async getAnchoredVersion(
@@ -1456,18 +1635,24 @@ export class StateStore {
     key: string,
     signerPublicKey?: Uint8Array
   ): Promise<{ verified: boolean; warnings?: LegacyEnvelopeWarningInfo[] }> {
-    const publicKey = signerPublicKey ?? (await this.resolveWriterPublicKey(entry.kid));
+    const publicKeys = signerPublicKey
+      ? [signerPublicKey]
+      : (await this.resolveWriterPublicKeys(entry.kid))
+          .filter((resolved) => resolved.trustBasis === "authenticated")
+          .map((resolved) => resolved.publicKey);
 
     if (entry.v === 1) {
       const warnings = [legacyWarning()];
-      if (!publicKey) {
+      if (publicKeys.length === 0) {
         return { verified: false, warnings };
       }
 
-      const sigValid = verify(
-        fromBase64url(entry.payload.ct),
-        fromBase64url(entry.sig),
-        publicKey
+      const sigValid = publicKeys.some((publicKey) =>
+        verify(
+          fromBase64url(entry.payload.ct),
+          fromBase64url(entry.sig),
+          publicKey
+        )
       );
       if (!sigValid) {
         throw new StateVerificationError(
@@ -1488,7 +1673,7 @@ export class StateStore {
       );
     }
 
-    if (!publicKey) {
+    if (publicKeys.length === 0) {
       throw new StateVerificationError(
         "kid_unknown",
         `Writer key not found for ${entry.kid}`
@@ -1502,27 +1687,24 @@ export class StateStore {
         `State envelope signature is missing for ${namespace}/${key}`
       );
     }
-    const sigValid = verify(
-      stateEnvelopeSigningBytes(envelope),
-      fromBase64url(entry.envelope_sig),
-      publicKey
+    if (typeof entry.sig !== "string") {
+      throw new StateVerificationError(
+        "schema_mismatch",
+        `State envelope legacy ciphertext signature is missing for ${namespace}/${key}`
+      );
+    }
+    const envelopeSig = fromBase64url(entry.envelope_sig);
+    const legacySig = fromBase64url(entry.sig);
+    const signedEnvelope = stateEnvelopeSigningBytes(envelope);
+    const legacyCiphertext = fromBase64url(entry.payload.ct);
+    const sigValid = publicKeys.some((publicKey) =>
+      verify(signedEnvelope, envelopeSig, publicKey) &&
+      verify(legacyCiphertext, legacySig, publicKey)
     );
     if (!sigValid) {
       throw new StateVerificationError(
         "signature_mismatch",
         `Signature verification failed for state envelope ${namespace}/${key}`
-      );
-    }
-
-    const legacySigValid = verify(
-      fromBase64url(entry.payload.ct),
-      fromBase64url(entry.sig),
-      publicKey
-    );
-    if (!legacySigValid) {
-      throw new StateVerificationError(
-        "signature_mismatch",
-        `Signature verification failed for legacy ciphertext ${namespace}/${key}`
       );
     }
 
@@ -2217,8 +2399,13 @@ export interface RotationWriterMaterial {
   encryptedPrivateKey: EncPayload;
   /** The identity-encryption purpose key that decrypts it. */
   identityEncryptionKey: Uint8Array;
-  /** The writer's Ed25519 public key (for verifying the OLD signatures). */
+  /** The writer's current Ed25519 public key. */
   publicKey: Uint8Array;
+  /**
+   * Authenticated public keys for this kid: current plus valid historical
+   * rotation-chain keys. Plaintext-registry keys are never placed here.
+   */
+  verificationPublicKeys: ResolvedWriterPublicKey[];
 }
 
 export class RotationStateEntryError extends Error {
@@ -2242,8 +2429,8 @@ export type RotateStateEntryResult =
  *  - Otherwise decrypts under the OLD namespace key (failure throws - the
  *    rotation preflight aborts; nothing is mutated on an undecryptable
  *    fortress).
- *  - Verifies the OLD entry's signature(s) against the writer's public key
- *    before producing anything (no laundering).
+ *  - Verifies the OLD entry's signature(s) against one authenticated key in
+ *    the writer's key chain before producing anything (no laundering).
  *  - Re-encrypts the plaintext under the new key and re-signs with the
  *    writer's resident private key. Version, integrity_hash (plaintext
  *    hash), metadata, and kid are all preserved - only the ciphertext block
@@ -2302,11 +2489,26 @@ export async function rotateStateEntryBytes(args: {
       );
     }
 
+    const verificationPublicKeys = writer.verificationPublicKeys.map(
+      (candidate) => candidate.publicKey
+    );
+    if (verificationPublicKeys.length === 0) {
+      throw new RotationStateEntryError(
+        `state entry ${namespace}/${key} has no authenticated writer key chain for identity "${entry.kid}"; refusing to re-sign it`
+      );
+    }
+
     // Verify the OLD signatures before re-signing anything.
     if (entry.v === 1) {
       if (
         typeof entry.sig !== "string" ||
-        !verify(fromBase64url(entry.payload.ct), fromBase64url(entry.sig), writer.publicKey)
+        !verificationPublicKeys.some((publicKey) =>
+          verify(
+            fromBase64url(entry.payload.ct),
+            fromBase64url(entry.sig),
+            publicKey
+          )
+        )
       ) {
         throw new RotationStateEntryError(
           `state entry ${namespace}/${key} failed legacy signature verification; refusing to re-sign it`
@@ -2336,15 +2538,18 @@ export async function rotateStateEntryBytes(args: {
           `state entry ${namespace}/${key} envelope metadata mismatch; refusing to re-sign it`
         );
       }
-      if (
-        !verify(
-          stateEnvelopeSigningBytes(entry.envelope),
-          fromBase64url(entry.envelope_sig),
-          writer.publicKey
-        ) ||
-        typeof entry.sig !== "string" ||
-        !verify(fromBase64url(entry.payload.ct), fromBase64url(entry.sig), writer.publicKey)
-      ) {
+      const signedEnvelope = stateEnvelopeSigningBytes(entry.envelope);
+      const envelopeSig = fromBase64url(entry.envelope_sig);
+      const legacyCiphertext = fromBase64url(entry.payload.ct);
+      const legacySig =
+        typeof entry.sig === "string" ? fromBase64url(entry.sig) : null;
+      const sigValid =
+        legacySig !== null &&
+        verificationPublicKeys.some((publicKey) =>
+          verify(signedEnvelope, envelopeSig, publicKey) &&
+          verify(legacyCiphertext, legacySig, publicKey)
+        );
+      if (!sigValid) {
         throw new RotationStateEntryError(
           `state entry ${namespace}/${key} failed signature verification; refusing to re-sign it`
         );

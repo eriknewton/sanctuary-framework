@@ -1,3 +1,4 @@
+// fail-before-exempt: authenticated StateStore fixture wiring only; key-resolution fail-before coverage lives in state-envelope-integrity.test.ts and master-rotation.test.ts
 /**
  * Security Test: No Plaintext Leak
  *
@@ -12,6 +13,7 @@ import { createIdentity } from "../../src/core/identity.js";
 import { derivePurposeKey, deriveNamespaceKey } from "../../src/core/key-derivation.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import { bytesToString } from "../../src/core/encoding.js";
+import { persistStoredIdentity } from "../util/persist-stored-identity.js";
 
 describe("No Plaintext Leak", () => {
   let storage: MemoryStorage;
@@ -20,12 +22,13 @@ describe("No Plaintext Leak", () => {
   let identityEncKey: Uint8Array;
   let identity: ReturnType<typeof createIdentity>;
 
-  beforeEach(() => {
+  beforeEach(async () => {
     masterKey = generateRandomKey();
     storage = new MemoryStorage();
     stateStore = new StateStore(storage, masterKey);
     identityEncKey = derivePurposeKey(masterKey, "identity-encryption");
     identity = createIdentity("test", identityEncKey, "recovery-key");
+    await persistStoredIdentity(storage, masterKey, identity.storedIdentity);
   });
 
   it("should never store plaintext values in storage", async () => {

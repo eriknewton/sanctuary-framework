@@ -1343,7 +1343,7 @@ async function wireUnlockedDeps(args: {
       stateStore,
       auditLog,
       fortressId: fortressIdFromStoragePath(config.storage_path),
-      identityId: hubIdentityId,
+      identityId: signingIdentity.identity_id,
       signingIdentity,
       identityEncryptionKey: idEncKey,
       enqueueReviewApproval: (task, actor) =>
