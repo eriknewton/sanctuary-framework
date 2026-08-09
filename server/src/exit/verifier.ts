@@ -190,6 +190,22 @@ export interface LoadedExitArtifact<T = unknown> {
   bytes: Uint8Array;
 }
 
+type ExitBundleFailureClass =
+  NonNullable<ExitBundleVerifierResult["failure_class"]>;
+
+interface IdentityArtifactVerification {
+  signature_valid: boolean;
+  identity_id?: string;
+  did?: string;
+  public_key?: string;
+}
+
+interface IdentityBindingVerificationResult {
+  identityVerification?: IdentityArtifactVerification;
+  failure_class?: ExitBundleFailureClass;
+  warnings: string[];
+}
+
 const PRIVATE_MATERIAL_KEYS = new Set([
   "private_key",
   "privatekey",
@@ -421,12 +437,7 @@ export async function loadExitArtifact<T = unknown>(
 
 function verifyIdentityArtifact(
   identityArtifact: unknown
-): {
-  signature_valid: boolean;
-  identity_id?: string;
-  did?: string;
-  public_key?: string;
-} {
+): IdentityArtifactVerification {
   const wrapper = identityArtifact as {
     bundle?: Record<string, unknown>;
     signature?: string;
@@ -451,6 +462,127 @@ function verifyIdentityArtifact(
     did: typeof bundle.did === "string" ? bundle.did : undefined,
     public_key: publicKey,
   };
+}
+
+function identityResult(
+  verification: IdentityArtifactVerification
+): NonNullable<ExitBundleDetailedVerifierResult["identity"]> {
+  return {
+    signature_valid: verification.signature_valid,
+    identity_id: verification.identity_id,
+    did: verification.did,
+  };
+}
+
+function compareManifestIdentityBinding(
+  manifest: ExitBundleManifest,
+  identityVerification: IdentityArtifactVerification
+): IdentityBindingVerificationResult {
+  const warnings: string[] = [];
+  const binding = manifest.body.identity_binding;
+  if (!identityVerification.signature_valid) {
+    return {
+      identityVerification,
+      failure_class: "identity_signature_invalid",
+      warnings: ["public identity artifact signature is invalid"],
+    };
+  }
+  // INVARIANT: a manifest origin is accepted only when it names the same
+  // identity and public key as the self-signed public_identity artifact.
+  if (binding.identity_id !== identityVerification.identity_id) {
+    return {
+      identityVerification,
+      failure_class: "identity_binding_mismatch",
+      warnings: [
+        "identity_binding_mismatch: manifest identity_id does not match public_identity.bundle.identity_id",
+      ],
+    };
+  }
+  if (binding.fortress_master_pubkey !== identityVerification.public_key) {
+    return {
+      identityVerification,
+      failure_class: "identity_binding_mismatch",
+      warnings: [
+        "identity_binding_mismatch: manifest fortress_master_pubkey does not match public_identity.bundle.publicKey",
+      ],
+    };
+  }
+  if (binding.did === undefined) {
+    warnings.push(
+      "legacy_identity_binding_did_absent: manifest identity_binding.did is absent; accepted because identity_id and fortress_master_pubkey match the signed public_identity artifact"
+    );
+  } else if (binding.did !== identityVerification.did) {
+    return {
+      identityVerification,
+      failure_class: "identity_binding_mismatch",
+      warnings: [
+        "identity_binding_mismatch: manifest did does not match public_identity.bundle.did",
+      ],
+    };
+  }
+  return { identityVerification, warnings };
+}
+
+async function verifyIdentityBindingBeforeManifestKeyUse(
+  root: string,
+  manifest: ExitBundleManifest
+): Promise<IdentityBindingVerificationResult> {
+  const entry = manifest.body.artifacts.find(
+    (artifact) => artifact.kind === "public_identity"
+  );
+  if (!entry) {
+    return {
+      failure_class: "identity_binding_mismatch",
+      warnings: [
+        "identity_binding_mismatch: manifest identity_binding has no public_identity artifact to support it",
+      ],
+    };
+  }
+
+  const artifactPath = join(root, entry.path);
+  let bytes: Uint8Array;
+  let fileSize: number;
+  try {
+    const linkStat = await lstat(artifactPath);
+    if (linkStat.isSymbolicLink()) {
+      return { failure_class: "archive_contains_symlink", warnings: [] };
+    }
+    const descends = await assertDescendant(root, artifactPath);
+    if (!descends) {
+      return { failure_class: "artifact_path_escapes_root", warnings: [] };
+    }
+    const { data: raw, stats } = await readFileCustodyWithStats(
+      artifactPath,
+      { verifyPathIdentity: true },
+    );
+    bytes = new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength);
+    fileSize = stats.size;
+  } catch {
+    return { failure_class: "artifact_missing", warnings: [] };
+  }
+
+  const hashPassed = sha256Hex(bytes) === entry.hash;
+  if (!hashPassed) {
+    return { failure_class: "artifact_hash_mismatch", warnings: [] };
+  }
+  if (fileSize !== entry.size_bytes) {
+    return { failure_class: "artifact_size_mismatch", warnings: [] };
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(Buffer.from(bytes).toString("utf8"));
+  } catch {
+    return {
+      failure_class: "identity_signature_invalid",
+      warnings: ["public identity artifact is not parseable JSON"],
+    };
+  }
+
+  return compareManifestIdentityBinding(
+    manifest,
+    verifyIdentityArtifact(parsed)
+  );
 }
 
 function verifyReputationArtifact(
@@ -610,6 +742,28 @@ export async function verifyExitBundle(
     }
   }
 
+  const identityBindingVerification =
+    await verifyIdentityBindingBeforeManifestKeyUse(root, manifest);
+  warnings.push(...identityBindingVerification.warnings);
+  if (identityBindingVerification.failure_class) {
+    return {
+      ...fail(
+        root,
+        manifest,
+        identityBindingVerification.failure_class,
+        warnings,
+        unsupportedArtifacts
+      ),
+      ...(identityBindingVerification.identityVerification !== undefined
+        ? {
+            identity: identityResult(
+              identityBindingVerification.identityVerification
+            ),
+          }
+        : {}),
+    };
+  }
+
   const signatureOk = ed25519.verify(
     fromBase64url(manifest.signature),
     canonicalizeToBytes(body),
@@ -745,23 +899,21 @@ export async function verifyExitBundle(
   }
 
   const publicKeysByDid = new Map<string, Uint8Array>();
-  const identityArtifact = await loadExitArtifact(root, manifest, "public_identity");
   let identity: ExitBundleDetailedVerifierResult["identity"] | undefined;
-  if (identityArtifact) {
-    const identityVerification = verifyIdentityArtifact(identityArtifact.json);
+  const identityVerification = identityBindingVerification.identityVerification;
+  if (identityVerification) {
     identity = {
       signature_valid: identityVerification.signature_valid,
       identity_id: identityVerification.identity_id,
       did: identityVerification.did,
     };
+    // The pre-signature binding gate above proves this key is the manifest
+    // identity's key before any reputation verifier can trust it by DID.
     if (identityVerification.did && identityVerification.public_key) {
       publicKeysByDid.set(
         identityVerification.did,
         fromBase64url(identityVerification.public_key)
       );
-    }
-    if (!identityVerification.signature_valid) {
-      warnings.push("public identity artifact signature is invalid");
     }
   }
 
