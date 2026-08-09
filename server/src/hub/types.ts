@@ -10,6 +10,7 @@
 
 import type { AuditLog } from "../operational/audit-log.js";
 import type { AuditAttributionOptionsResolver } from "../castle-wall/audit-attribution.js";
+import type { HubAgentControlAction } from "./constants.js";
 import type {
   HubAgentStatus,
   HubInboxKind,
@@ -73,6 +74,16 @@ export interface HubTemplateBindingApprovalEnqueuedResult
   compiled_policy_id: string;
 }
 
+export interface HubAgentLockdownControllerResult {
+  outcome: "engaged" | "partial";
+  new_status?: HubAgentStatus;
+  agent_uid?: number;
+  revoked_rule_ids?: string[];
+  residual_allow_count?: number;
+  reload_confirmed?: boolean;
+  reason_code?: string;
+}
+
 /**
  * Result returned from a fortress-scope Tier-1 action that has been
  * deferred to operator approval. Distinguished from the per-agent shape by
@@ -109,6 +120,15 @@ export interface HubFortressExportResult {
  * those throws to HubCapabilityError or HubConflictError.
  */
 export interface HubAgentController {
+  /**
+   * Optional executor-side support probe. Record capability flags still gate
+   * the UI surface; this probe prevents queuing Tier-1 work whose handler is
+   * known not to exist.
+   */
+  supports?(
+    action: HubAgentControlAction,
+    agentId: string,
+  ): boolean | Promise<boolean>;
   pause(agentId: string): Promise<HubAgentStatus>;
   resume(agentId: string): Promise<HubAgentStatus>;
   restart(agentId: string): Promise<HubAgentStatus>;
@@ -120,10 +140,12 @@ export interface HubAgentController {
   unwrap(agentId: string): Promise<HubAgentStatus>;
   /**
    * Apply an operator-approved lockdown. Called only after a Tier 1
-   * approval lands. Implementations SHOULD treat lockdown as a hard-stop
-   * (deny all egress, freeze gates) until explicitly cleared.
+   * approval lands. Implementations SHOULD report observed network-stop
+   * effects, not intents.
    */
-  lockdown(agentId: string): Promise<HubAgentStatus>;
+  lockdown(
+    agentId: string,
+  ): Promise<HubAgentStatus | HubAgentLockdownControllerResult>;
   /**
    * Apply an operator-approved policy bind. Called only after a Tier 1
    * approval lands.

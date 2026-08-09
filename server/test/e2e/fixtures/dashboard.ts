@@ -21,6 +21,9 @@ import {
   type Server,
   type ServerResponse,
 } from "node:http";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { MemoryStorage } from "../../../src/storage/memory.js";
 import { AuditLog } from "../../../src/operational/audit-log.js";
@@ -76,6 +79,7 @@ async function startHarness(opts: DashboardHarnessOptions = {}): Promise<Dashboa
   const storage = new MemoryStorage();
   const masterKey = generateRandomKey();
   const auditLog = new AuditLog(storage, masterKey);
+  const storagePath = await mkdtemp(join(tmpdir(), "sanctuary-e2e-dashboard-"));
   const selector = new SubstrateSelector({
     storage,
     masterKey,
@@ -88,6 +92,7 @@ async function startHarness(opts: DashboardHarnessOptions = {}): Promise<Dashboa
     identityId: IDENTITY,
     fortressId: FORTRESS,
     auditLog,
+    storagePath,
     intelligenceSelector: selector,
     storage,
     masterKey,
@@ -139,11 +144,16 @@ async function startHarness(opts: DashboardHarnessOptions = {}): Promise<Dashboa
     // navigations; server.close alone waits indefinitely on that
     // socket and surfaces as a fixture-teardown timeout. Node 18.2
     // added closeAllConnections specifically for this teardown shape.
-    stop: () =>
-      new Promise<void>((resolve, reject) => {
-        server.closeAllConnections();
-        server.close((err) => (err ? reject(err) : resolve()));
-      }),
+    stop: async () => {
+      try {
+        await new Promise<void>((resolve, reject) => {
+          server.closeAllConnections();
+          server.close((err) => (err ? reject(err) : resolve()));
+        });
+      } finally {
+        await rm(storagePath, { recursive: true, force: true });
+      }
+    },
   };
 }
 

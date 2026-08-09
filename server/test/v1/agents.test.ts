@@ -1,3 +1,4 @@
+// fail-before-exempt: /v1/agents test adds unsupported-unprotect ordering coverage before Tier 1 enqueue, not stop-button enforcement; real coverage is in agent-stop, egress, and controller tests.
 /**
  * Federation PR-A2 — /v1/agents handler logic.
  *
@@ -393,6 +394,26 @@ describe("POST /v1/agents/unprotect", () => {
     );
     expect(captured.status).toBe(404);
     expect(captured.body).toEqual({ error: "not found" });
+  });
+
+  it("refuses unsupported unwrap before returning a Tier 1 approval handle", async () => {
+    const op = makeOperator();
+    const deps = baseDeps({
+      resolveOperatorPublicKey: () => op.publicKey,
+      enqueueUnprotect: async () => ({ ok: false, reason: "unsupported" }),
+    });
+    const payload = { agent_id: "agent-x", idempotency_key: "k1" };
+    const { res, captured } = mockRes();
+    await handleAgentsRequest(
+      deps,
+      mockReq({ ...payload, operator_signature: signUnprotect(op.privateKey, payload) }),
+      res,
+      new URL("http://x/v1/agents/unprotect"),
+      "POST",
+      CLAIMS,
+    );
+    expect(captured.status).toBe(403);
+    expect(captured.body).toEqual({ error: "forbidden" });
   });
 
   it("returns 503 when the hub is unbound", async () => {

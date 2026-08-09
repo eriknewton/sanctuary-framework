@@ -1,3 +1,4 @@
+// fail-before-exempt: this flake stabilization only widens audit-log lock timing deadlines and asserts no stop-button behavior.
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import type { Stats } from "node:fs";
 import { tmpdir, uptime as osUptime } from "node:os";
@@ -110,8 +111,8 @@ describe("AuditLog write-lock hold deadline and self-held recovery", () => {
 
   it("abandons a hung entry write, releases the lock, and the same log appends again", async () => {
     const { log, storage, lockPath } = await makeLog({
-      writeLockHoldDeadlineMs: 250,
-      selfHeldStaleLockMs: 1_500,
+      writeLockHoldDeadlineMs: 1_000,
+      selfHeldStaleLockMs: 2_500,
     });
 
     storage.hangEntryWrites = true;

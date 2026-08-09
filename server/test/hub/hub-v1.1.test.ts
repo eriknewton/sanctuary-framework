@@ -39,6 +39,7 @@ import {
   HUB_INBOX_TEMPLATE_NAMESPACES,
   HUB_TIER_1_AGENT_CONTROL_ACTIONS,
   HUB_VERSION,
+  type HubAgentControlAction,
 } from "../../src/hub/constants.js";
 import {
   HubService,
@@ -191,6 +192,12 @@ class StubAgentController implements HubAgentController {
   }
 }
 
+class UnsupportedUnwrapController extends StubAgentController {
+  supports(action: HubAgentControlAction): boolean {
+    return action !== "unwrap";
+  }
+}
+
 interface InboxSourceState {
   approvals: HubApprovalPendingItem[];
   blockedEgress: HubBlockedEgressItem[];
@@ -329,6 +336,7 @@ interface RigOptions {
   budgetSummaries?: HubBudgetSummary[];
   pinnedProducerKeyB64url?: string | null;
   subjectFortressId?: string | null;
+  controller?: StubAgentController;
 }
 
 async function startRig(options: RigOptions = {}): Promise<TestRig> {
@@ -337,7 +345,7 @@ async function startRig(options: RigOptions = {}): Promise<TestRig> {
   const auditLog = new AuditLog(storage, masterKey);
 
   const registry = new InMemoryLocalAgentRegistry([makeAgent()]);
-  const controller = new StubAgentController();
+  const controller = options.controller ?? new StubAgentController();
   const inboxState = makeEmptyInboxState();
   const policySummaries = options.policySummaries ?? [];
   const budgetSummaries = options.budgetSummaries ?? [];
@@ -500,7 +508,7 @@ describe("Hub agent listing persisted refresh (Finding BB)", () => {
       const service = makeRefreshService(storagePath);
       const first = makeAgent({
         agent_id: "agent-claude-code",
-        harness: "claude-code",
+        harness: "claude_code",
       });
       const second = makeAgent({
         agent_id: "agent-openclaw",
@@ -1226,6 +1234,44 @@ describe("Hub agent control endpoints (Test 4)", () => {
       data: { agent: LocalAgentRecord };
     };
     expect(agentBody.data.agent.channel_template_id).toBe("read-then-report");
+  });
+});
+
+describe("Hub Tier 1 enqueue executor support", () => {
+  let rig: TestRig;
+
+  beforeEach(async () => {
+    rig = await startRig({ controller: new UnsupportedUnwrapController() });
+  });
+  afterEach(async () => rig.stop());
+
+  it("refuses unsupported unwrap before creating an approval item", async () => {
+    const res = await fetch(
+      `${rig.url}${HUB_API_PREFIX}/agents/agent-alpha/unwrap`,
+      { method: "POST", headers: withAuth({}, rig.authToken) },
+    );
+    expect(res.status).toBe(422);
+    const body = (await res.json()) as { detail?: string };
+    expect(body.detail).toContain(
+      "agent_control_unwrap_unsupported_operator_decision_pending",
+    );
+    expect(body.detail).not.toContain("harness");
+    expect(rig.controller.calls).toEqual([]);
+
+    const inboxRes = await fetch(`${rig.url}${HUB_API_PREFIX}/inbox`, {
+      headers: withAuth({}, rig.authToken),
+    });
+    const inbox = (await inboxRes.json()) as {
+      ok: true;
+      data: { items: HubInboxItem[] };
+    };
+    expect(
+      inbox.data.items.filter(
+        (item) =>
+          item.kind === "approval_pending" &&
+          item.operation_category === "unwrap",
+      ),
+    ).toEqual([]);
   });
 });
 

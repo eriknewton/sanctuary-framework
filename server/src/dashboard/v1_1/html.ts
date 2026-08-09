@@ -131,6 +131,7 @@ body {
 .btn.btn-lockdown { background: transparent; color: var(--rust); border-color: var(--rust); }
 .btn.btn-lockdown:hover:not(:disabled) { background: var(--rust-bg); }
 .btn.tier1-pending { background: var(--ochre-bg); color: var(--ochre); border-color: var(--ochre); }
+.btn.tier1-partial { background: var(--ochre-bg); color: var(--ochre); border-color: var(--ochre); }
 .btn.tier1-engaged { background: var(--rust-bg); color: var(--rust); border-color: var(--rust); }
 .btn.btn-icon {
   padding: 4px 6px;

@@ -2,10 +2,10 @@ import { describe, expect, it } from "vitest";
 import { loadAssuranceMatrix } from "../assurance-matrix.js";
 
 describe("loadAssuranceMatrix", () => {
-  it("parses the canonical 22 row matrix", () => {
+  it("parses the canonical 23 row matrix", () => {
     const rows = loadAssuranceMatrix();
 
-    expect(rows).toHaveLength(22);
+    expect(rows).toHaveLength(23);
     expect(rows.map((row) => row.label)).toEqual(
       expect.arrayContaining([
         "Tamper-evident audit chain",
@@ -17,7 +17,7 @@ describe("loadAssuranceMatrix", () => {
       ]),
     );
     expect(rows.map((row) => row.id)).toEqual(
-      Array.from({ length: 22 }, (_, index) => String(index + 1)),
+      Array.from({ length: 23 }, (_, index) => String(index + 1)),
     );
   });
 });

@@ -5831,8 +5831,9 @@ export function harnessKindForPlatform(platform: AgentPlatform): LocalHarnessKin
  * stays "unknown" and `policy_id` stays "unbound" until the v1.2
  * data-plane work lands real detection / Phase 2 binding. The capability
  * flags reflect what the dashboard controller honestly supports today:
- * `can_unwrap` remains the only harness mutation exposed, and
- * `can_change_template` is registry-local through the Tier 1 binding flow.
+ * process controls stay false, `can_lockdown` is derived from a confined
+ * uid after auto-provision, and `can_change_template` is registry-local
+ * through the Tier 1 binding flow.
  */
 function buildLocalAgentRecord(input: {
   storagePath: string;
@@ -5876,7 +5877,14 @@ function withProtectionSubjectAlias(
 ): LocalAgentRecord {
   return protectionSubject === null
     ? record
-    : { ...record, protection_subject: protectionSubject };
+    : {
+        ...record,
+        protection_subject: protectionSubject,
+        capabilities: {
+          ...record.capabilities,
+          can_lockdown: true,
+        },
+      };
 }
 
 function bestEffortUpsertLocalAgentProtectionSubject(input: {

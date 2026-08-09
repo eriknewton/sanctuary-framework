@@ -9,13 +9,10 @@
  *
  * The wiring is deliberately minimal at v1.1.1:
  *
- *   - Local agent registry starts empty by default. v1.1.5 (Finding Z)
- *     adds an optional `storagePath` input that rehydrates the registry
- *     from `<storagePath>/state/_hub/local-agents.json`, written by
- *     `sanctuary wrap` for each successfully wrapped harness. Callers
- *     that pass `storagePath` get the wrap-populated set; callers that
- *     omit it (legacy) keep the empty-by-default behavior. Real
- *     harness-discovery via `discoverTenants()` remains v1.2 work.
+ *   - Local agent registry rehydrates from the required fortress
+ *     `storagePath` (`<storagePath>/state/_hub/local-agents.json`),
+ *     written by `sanctuary wrap` for each successfully wrapped harness.
+ *     Real harness-discovery via `discoverTenants()` remains v1.2 work.
  *   - Inbox sources return empty arrays. The privacy chokepoint already
  *     emits audit events through PR #69 / PR #71; the inbox aggregator is
  *     the v1.2 work to project those into operator cards.
@@ -46,19 +43,19 @@ import { IdentityManager } from "../../cognitive/tools.js";
 import {
   HubService,
   InMemoryLocalAgentRegistry,
-  type HubAgentController,
 } from "../../hub/index.js";
-import { HubCapabilityError } from "../../hub/errors.js";
 import {
   readPersistedLocalAgents,
   writePersistedLocalAgents,
 } from "../../hub/agent-registry-persistence.js";
 import {
+  CastleWallAgentController,
+  type CastleWallAgentControllerDeps,
+} from "./castle-wall-agent-controller.js";
+import {
   agentRecordAttributionIds,
   publicAgentIdForVerifiedAttribution,
 } from "../../hub/agent-attribution.js";
-import type { ChannelTemplateId } from "../../policy-engine/constants.js";
-import type { HubAgentStatus } from "../../contracts/v1.1/constants.js";
 import type { LocalAgentRecord } from "../../contracts/v1.1/local-agent-records.js";
 import type { SubstrateSelector } from "../../intelligence/selector.js";
 import type { ReputationStore } from "../../reputation/reputation-store.js";
@@ -108,13 +105,18 @@ export interface BuildV11BindingsInputs {
   /** Underlying audit log; powers the activity feed projection. */
   auditLog: AuditLog;
   /**
-   * Fortress storage root. When provided, the agent registry rehydrates
+   * Fortress storage root. The agent registry rehydrates
    * from `<storagePath>/state/_hub/local-agents.json` (best-effort; a
    * missing or unparseable file degrades to an empty registry rather
-   * than failing construction). Omit for callers that intentionally
-   * want an empty registry (e.g. unit tests, future ephemeral modes).
+   * than failing construction). Required because the live Castle Wall
+   * controller cannot safely mutate enforcement without a fortress path.
    */
-  storagePath?: string;
+  storagePath: string;
+  /**
+   * Test seam for the Castle Wall network stop. Production omits this and
+   * uses the real stop actuator constructed by `CastleWallAgentController`.
+   */
+  stopAgentEgress?: CastleWallAgentControllerDeps["stopAgentEgress"];
   /**
    * Optional Intelligence Substrate Selector. When present, the dashboard
    * dispatch layer mounts `/api/hub/intelligence/*` against this selector
@@ -243,7 +245,7 @@ export interface V11Bindings {
   hubService: HubService;
   identityId: string;
   fortressId: string;
-  storagePath?: string;
+  storagePath: string;
   masterKey?: Uint8Array;
   /**
    * Optional Intelligence Substrate Selector. Dispatch layer routes
@@ -333,38 +335,6 @@ async function pruneExpiredDidWebKeysOnUnlock(
   await inputs.auditLog.flush();
 }
 
-class CapabilityErrorAgentController implements HubAgentController {
-  private fail(action: string): never {
-    throw new HubCapabilityError(
-      `agent_control_${action}_not_wired_in_v1.1.1`,
-    );
-  }
-  async pause(_agentId: string): Promise<HubAgentStatus> {
-    this.fail("pause");
-  }
-  async resume(_agentId: string): Promise<HubAgentStatus> {
-    this.fail("resume");
-  }
-  async restart(_agentId: string): Promise<HubAgentStatus> {
-    this.fail("restart");
-  }
-  async unwrap(_agentId: string): Promise<HubAgentStatus> {
-    this.fail("unwrap");
-  }
-  async lockdown(_agentId: string): Promise<HubAgentStatus> {
-    this.fail("lockdown");
-  }
-  async bindPolicy(_agentId: string, _policyId: string): Promise<void> {
-    this.fail("bindPolicy");
-  }
-  async bindChannelTemplate(
-    _agentId: string,
-    _templateId: ChannelTemplateId,
-  ): Promise<void> {
-    return;
-  }
-}
-
 function buildAuditAttributionResolver(
   inputs: BuildV11BindingsInputs,
 ): AuditAttributionOptionsResolver {
@@ -379,13 +349,6 @@ function buildAuditAttributionResolver(
   }
 
   const storagePath = inputs.storagePath;
-  if (storagePath === undefined) {
-    return () => ({
-      pinnedProducerKeyB64url: null,
-      subjectFortressId,
-    });
-  }
-
   let cached: ProducerKeyLoad | undefined;
   let lastWarnedReason: string | null = null;
   const warn =
@@ -441,25 +404,16 @@ export function buildV11Bindings(
   inputs: BuildV11BindingsInputs,
 ): V11Bindings {
   // v1.1.5 (Finding Z): seed the registry from the persisted hub-layer
-  // file when a storage path is supplied. Reads are best-effort; the
+  // file from the fortress storage path. Reads are best-effort; the
   // persistence helper returns [] on missing-file or parse-error, so a
   // first-boot or corrupted-file fortress simply starts with an empty
   // registry instead of failing construction.
-  const seed =
-    inputs.storagePath !== undefined
-      ? readPersistedLocalAgents(inputs.storagePath)
-      : [];
+  const seed = readPersistedLocalAgents(inputs.storagePath);
   const registry = new InMemoryLocalAgentRegistry(seed);
   const storagePath = inputs.storagePath;
-  const readPersisted =
-    storagePath !== undefined
-      ? () => readPersistedLocalAgents(storagePath)
-      : undefined;
-  const writePersisted =
-    storagePath !== undefined
-      ? (records: ReturnType<typeof readPersistedLocalAgents>) =>
-          writePersistedLocalAgents(storagePath, records)
-      : undefined;
+  const readPersisted = () => readPersistedLocalAgents(storagePath);
+  const writePersisted = (records: ReturnType<typeof readPersistedLocalAgents>) =>
+    writePersistedLocalAgents(storagePath, records);
   void pruneExpiredDidWebKeysOnUnlock(inputs).catch(() => {
     // Best-effort unlock pruning must not block dashboard construction.
   });
@@ -555,7 +509,7 @@ export function buildV11Bindings(
             queryAnonymityFortressId: inputs.fortressId,
           }
         : {}),
-      ...(piiConfigStore && inputs.storage && inputs.masterKey && inputs.storagePath
+      ...(piiConfigStore && inputs.storage && inputs.masterKey
         ? {
             queryAnonymityReverseMappingStore: new ReverseMappingStore({
               fortressPath: inputs.storagePath,
@@ -654,9 +608,9 @@ export function buildV11Bindings(
     identityId: inputs.identityId,
     fortressId: inputs.fortressId,
     agentRegistry: registry,
-    ...(readPersisted ? { readPersistedLocalAgents: readPersisted } : {}),
-    ...(writePersisted ? { writePersistedLocalAgents: writePersisted } : {}),
-    ...(inputs.storagePath !== undefined ? { storagePath: inputs.storagePath } : {}),
+    readPersistedLocalAgents: readPersisted,
+    writePersistedLocalAgents: writePersisted,
+    storagePath: inputs.storagePath,
     inboxSources: {
       listPendingApprovals: () => [],
       listRecentBlockedEgress: () => [],
@@ -675,13 +629,23 @@ export function buildV11Bindings(
       listPolicySummaries: () => [],
       listBudgetSummaries: () => [],
     },
-    agentController: new CapabilityErrorAgentController(),
-    ...(inputs.storage && inputs.masterKey && inputs.storagePath
+    agentController: new CastleWallAgentController({
+      storagePath: inputs.storagePath,
+      fortressPath: inputs.storagePath,
+      fortressId: inputs.fortressId,
+      auditLog: inputs.auditLog,
+      now: () => new Date(),
+      getAgentRecord: (agentId) => registry.get(agentId),
+      ...(inputs.stopAgentEgress
+        ? { stopAgentEgress: inputs.stopAgentEgress }
+        : {}),
+    }),
+    ...(inputs.storage && inputs.masterKey
       ? {
           fortressExportBundle: async (approvalAuditId?: string) => {
             const storage = inputs.storage!;
             const masterKey = inputs.masterKey!;
-            const storagePath = inputs.storagePath!;
+            const storagePath = inputs.storagePath;
             const identityManager =
               inputs.identityManager ??
               new IdentityManager(storage, masterKey);
@@ -737,7 +701,7 @@ export function buildV11Bindings(
     hubService,
     identityId: inputs.identityId,
     fortressId: inputs.fortressId,
-    ...(inputs.storagePath !== undefined ? { storagePath: inputs.storagePath } : {}),
+    storagePath: inputs.storagePath,
     ...(inputs.masterKey !== undefined ? { masterKey: inputs.masterKey } : {}),
     ...(inputs.intelligenceSelector
       ? { intelligenceSelector: inputs.intelligenceSelector }

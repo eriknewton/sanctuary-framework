@@ -330,6 +330,17 @@ describe("Fortress lockdown happy path (Test 1)", () => {
       { method: "POST", headers: withAuth({}, rig.authToken) },
     );
     expect(approveRes.status).toBe(200);
+    const approveBody = (await approveRes.json()) as {
+      ok: true;
+      data: {
+        item: HubApprovalPendingItem;
+      };
+    };
+    expect(approveBody.data.item.resolution_payload).toMatchObject({
+      outcome: "engaged",
+      locked_count: 3,
+      failed_count: 0,
+    });
 
     // All three agents locked down.
     const lockdownCalls = rig.controller.calls.filter(
@@ -432,6 +443,17 @@ describe("Fortress lockdown partial failure (Test 3)", () => {
       { method: "POST", headers: withAuth({}, rig.authToken) },
     );
     expect(approveRes.status).toBe(200);
+    const approveBody = (await approveRes.json()) as {
+      ok: true;
+      data: {
+        item: HubApprovalPendingItem;
+      };
+    };
+    expect(approveBody.data.item.resolution_payload).toMatchObject({
+      outcome: "partial",
+      locked_count: 2,
+      failed_count: 1,
+    });
 
     expect(rig.registry.get("agent-alpha")!.status).toBe("locked_down");
     expect(rig.registry.get("agent-beta")!.status).toBe("active");
@@ -456,6 +478,132 @@ describe("Fortress lockdown partial failure (Test 3)", () => {
         i.kind === "agent_error" && i.agent_id === "agent-beta",
     );
     expect(errorItems.length).toBe(1);
+
+    await rig.auditLog.flush();
+    const activityRes = await fetch(
+      `${rig.url}${HUB_API_PREFIX}/activity?limit=20`,
+      { headers: withAuth({}, rig.authToken) },
+    );
+    const activity = (await activityRes.json()) as {
+      ok: true;
+      data: { entries: Array<{ display_template_id: string }> };
+    };
+    expect(
+      activity.data.entries.some((e) =>
+        e.display_template_id.includes("fortress_lockdown_partial"),
+      ),
+    ).toBe(true);
+    expect(
+      activity.data.entries.some((e) =>
+        e.display_template_id.includes("fortress_lockdown_engaged"),
+      ),
+    ).toBe(false);
+  });
+});
+
+describe("Fortress lockdown zero-effect outcomes", () => {
+  let rig: TestRig | undefined;
+  afterEach(async () => {
+    await rig?.stop();
+    rig = undefined;
+  });
+
+  it("all-fail emits fortress_lockdown_failed, writes no active status, and never emits engaged", async () => {
+    rig = await startRig({
+      agentIds: ["agent-alpha", "agent-beta"],
+    });
+    rig.controller.failingAgents.add("agent-alpha");
+    rig.controller.failingAgents.add("agent-beta");
+
+    const enqueueRes = await fetch(
+      `${rig.url}${HUB_API_PREFIX}/fortress/lockdown`,
+      { method: "POST", headers: withAuth({}, rig.authToken) },
+    );
+    const enqueueBody = (await enqueueRes.json()) as {
+      ok: true;
+      data: { inbox_item_id: string };
+    };
+    const approveRes = await fetch(
+      `${rig.url}${HUB_API_PREFIX}/inbox/${encodeURIComponent(enqueueBody.data.inbox_item_id)}/approve`,
+      { method: "POST", headers: withAuth({}, rig.authToken) },
+    );
+    expect(approveRes.status).toBe(200);
+    const approveBody = (await approveRes.json()) as {
+      ok: true;
+      data: { item: HubApprovalPendingItem };
+    };
+    expect(approveBody.data.item.resolution_payload).toMatchObject({
+      outcome: "failed",
+      locked_count: 0,
+      failed_count: 2,
+    });
+    await expect(readLockdownStatus(rig.storagePath)).resolves.toMatchObject({
+      active: false,
+    });
+
+    await rig.auditLog.flush();
+    const activityRes = await fetch(
+      `${rig.url}${HUB_API_PREFIX}/activity?limit=20`,
+      { headers: withAuth({}, rig.authToken) },
+    );
+    const activity = (await activityRes.json()) as {
+      ok: true;
+      data: { entries: Array<{ display_template_id: string }> };
+    };
+    expect(
+      activity.data.entries.some((e) =>
+        e.display_template_id.includes("fortress_lockdown_failed"),
+      ),
+    ).toBe(true);
+    expect(
+      activity.data.entries.some((e) =>
+        e.display_template_id.includes("fortress_lockdown_engaged"),
+      ),
+    ).toBe(false);
+  });
+
+  it("empty roster emits fortress_lockdown_no_agents and writes no active status", async () => {
+    rig = await startRig({ agentIds: [] });
+    const enqueueRes = await fetch(
+      `${rig.url}${HUB_API_PREFIX}/fortress/lockdown`,
+      { method: "POST", headers: withAuth({}, rig.authToken) },
+    );
+    const enqueueBody = (await enqueueRes.json()) as {
+      ok: true;
+      data: { inbox_item_id: string };
+    };
+    const approveRes = await fetch(
+      `${rig.url}${HUB_API_PREFIX}/inbox/${encodeURIComponent(enqueueBody.data.inbox_item_id)}/approve`,
+      { method: "POST", headers: withAuth({}, rig.authToken) },
+    );
+    expect(approveRes.status).toBe(200);
+    const approveBody = (await approveRes.json()) as {
+      ok: true;
+      data: { item: HubApprovalPendingItem };
+    };
+    expect(approveBody.data.item.resolution_payload).toMatchObject({
+      outcome: "no_agents",
+      locked_count: 0,
+      failed_count: 0,
+    });
+    await expect(readLockdownStatus(rig.storagePath)).resolves.toMatchObject({
+      active: false,
+    });
+
+    await rig.auditLog.flush();
+    const activityRes = await fetch(
+      `${rig.url}${HUB_API_PREFIX}/activity?limit=20`,
+      { headers: withAuth({}, rig.authToken) },
+    );
+    const activity = (await activityRes.json()) as {
+      ok: true;
+      data: { entries: Array<{ display_template_id: string }> };
+    };
+    expect(
+      activity.data.entries.some((e) =>
+        e.display_template_id.includes("fortress_lockdown_no_agents"),
+      ),
+    ).toBe(true);
   });
 });
 

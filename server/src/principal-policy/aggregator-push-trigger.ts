@@ -153,8 +153,7 @@ export class PushTriggerRegistry {
   }
 
   /**
-   * Drop all registered webhooks. Used by `sanctuary lockdown` and
-   * test setup.
+   * Drop all registered webhooks. Used by fortress-lockdown setup and tests.
    */
   unregisterAllWebhooks(): void {
     this.webhooks.length = 0;

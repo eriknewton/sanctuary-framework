@@ -1,3 +1,4 @@
+// fail-before-exempt: attribution test now uses a temp fortress storage path for signed Castle Wall context; stop-button enforcement is covered by agent-stop, egress, and castle-wall-agent-controller tests.
 import { describe, expect, it, vi } from "vitest";
 import { randomBytes } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -215,42 +216,45 @@ function signedMacOSEgressEntry(args: {
 
 describe("v1.1 dashboard wiring Castle Wall attribution", () => {
   it("does not attribute forged unsigned Castle Wall activity to a victim in concierge context", async () => {
-    const storage = new MemoryStorage();
-    const masterKey = randomBytes(32);
-    const auditLog = new AuditLog(storage, masterKey);
-    const identityId = "operator-dashboard-attribution";
-    await auditLog.append(
-      "l1",
-      "egress_blocked",
-      identityId,
-      {
-        agent_id: "victim-agent-b",
-        dest_host: "evil.example",
-        dest_ip: "203.0.113.91",
-        dest_port: 443,
-        dest_protocol: "tcp",
-      },
-      "success",
-    );
-    await auditLog.flush();
+    await withTmpFortress(async (storagePath) => {
+      const storage = new MemoryStorage();
+      const masterKey = randomBytes(32);
+      const auditLog = new AuditLog(storage, masterKey);
+      const identityId = "operator-dashboard-attribution";
+      await auditLog.append(
+        "l1",
+        "egress_blocked",
+        identityId,
+        {
+          agent_id: "victim-agent-b",
+          dest_host: "evil.example",
+          dest_ip: "203.0.113.91",
+          dest_port: 443,
+          dest_protocol: "tcp",
+        },
+        "success",
+      );
+      await auditLog.flush();
 
-    const { selector, captured } = makeCapturingSelector();
-    const bindings = buildV11Bindings({
-      identityId,
-      fortressId: "fortress-dashboard-attribution",
-      auditLog,
-      storage,
-      masterKey,
-      intelligenceSelector: selector,
+      const { selector, captured } = makeCapturingSelector();
+      const bindings = buildV11Bindings({
+        identityId,
+        fortressId: "fortress-dashboard-attribution",
+        storagePath,
+        auditLog,
+        storage,
+        masterKey,
+        intelligenceSelector: selector,
+      });
+
+      await bindings.operatorChatService!.sendConcierge(
+        "show recent activity for victim-agent-b",
+      );
+
+      expect(captured.context).toContain("agent=_fortress");
+      expect(captured.context).not.toContain("victim-agent-b");
+      expect(captured.context).not.toContain("verified");
     });
-
-    await bindings.operatorChatService!.sendConcierge(
-      "show recent activity for victim-agent-b",
-    );
-
-    expect(captured.context).toContain("agent=_fortress");
-    expect(captured.context).not.toContain("victim-agent-b");
-    expect(captured.context).not.toContain("verified");
   });
 
   it("threads the producer key so legitimate signed Castle Wall activity remains attributable", async () => {
