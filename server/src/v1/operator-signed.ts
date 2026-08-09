@@ -15,9 +15,9 @@
  * signature independent of property insertion order on either side.
  */
 
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { ed25519 } from "@noble/curves/ed25519";
-import { fromBase64url } from "../core/encoding.js";
+import { fromBase64url, toBase64url } from "../core/encoding.js";
 import { verify } from "../core/identity.js";
 
 /** Domain separator for operator-signed admin payloads (versioned). */
@@ -46,6 +46,36 @@ export type OperatorAuthorizationFreshness =
         | "operator_authorization_expired"
         | "operator_authorization_not_yet_valid"
         | "operator_authorization_lifetime_too_long";
+    };
+
+export type OperatorAuthorizationConsumeParams = {
+  replayKey: string;
+  action: string;
+  authorizationNonce: string;
+  expiresAt: string;
+  operatorPublicKey: Uint8Array;
+};
+
+export interface OperatorAuthorizationDeps {
+  resolveOperatorPublicKey(): Uint8Array | null;
+  consumeOperatorAuthorization(
+    params: OperatorAuthorizationConsumeParams,
+  ): Promise<"consumed" | "replayed">;
+}
+
+export type OperatorAuthorizationResult =
+  | { ok: true; operatorPublicKey: Uint8Array }
+  | {
+      ok: false;
+      reason:
+        | "operator_signature_invalid"
+        | "operator_authorization_missing_freshness"
+        | "operator_authorization_malformed_freshness"
+        | "operator_authorization_expired"
+        | "operator_authorization_not_yet_valid"
+        | "operator_authorization_lifetime_too_long"
+        | "operator_authorization_replayed"
+        | "operator_authorization_spent_store_unavailable";
     };
 
 /**
@@ -221,6 +251,82 @@ export function verifyOperatorSignature(input: {
     return verify(message, signature, input.operatorPublicKey);
   } catch {
     return false;
+  }
+}
+
+/**
+ * Verify and durably consume one OPERATOR_SIGNED authorization.
+ * Freshness fields are inside the signed payload; the spent replay key is
+ * recorded before the caller performs the authorized effect.
+ */
+export async function verifyAndConsumeOperatorAuthorization(
+  deps: OperatorAuthorizationDeps,
+  action: string,
+  payload: Record<string, unknown>,
+  signature: unknown,
+): Promise<OperatorAuthorizationResult> {
+  if (typeof signature !== "string" || signature.length === 0) {
+    return { ok: false, reason: "operator_signature_invalid" };
+  }
+  const operatorPublicKey = deps.resolveOperatorPublicKey();
+  if (!operatorPublicKey) {
+    return { ok: false, reason: "operator_signature_invalid" };
+  }
+  const freshness = validateOperatorAuthorizationFreshness(payload);
+  if (!freshness.ok) return freshness;
+  const ok = verifyOperatorSignature({
+    action,
+    payload,
+    signature,
+    operatorPublicKey,
+  });
+  if (!ok) return { ok: false, reason: "operator_signature_invalid" };
+  const replayKey = operatorAuthorizationReplayKey({
+    operatorPublicKey,
+    action,
+    authorizationNonce: freshness.authorizationNonce,
+  });
+  try {
+    const consumed = await deps.consumeOperatorAuthorization({
+      replayKey,
+      action,
+      authorizationNonce: freshness.authorizationNonce,
+      expiresAt: freshness.expiresAt,
+      operatorPublicKey,
+    });
+    if (consumed === "replayed") {
+      return { ok: false, reason: "operator_authorization_replayed" };
+    }
+  } catch {
+    return {
+      ok: false,
+      reason: "operator_authorization_spent_store_unavailable",
+    };
+  }
+  return { ok: true, operatorPublicKey };
+}
+
+export function operatorAuthorizationReplayKey(input: {
+  operatorPublicKey: Uint8Array;
+  action: string;
+  authorizationNonce: string;
+}): string {
+  const h = createHash("sha256");
+  h.update("sanctuary.v1.operator-authorization-spent\0");
+  h.update(input.operatorPublicKey);
+  h.update("\0");
+  h.update(input.action);
+  h.update("\0");
+  h.update(input.authorizationNonce);
+  return toBase64url(h.digest());
+}
+
+export function includeOperatorAuthorizationFields(
+  signedPayload: Record<string, unknown>,
+  body: Record<string, unknown>,
+): void {
+  for (const key of ["authorization_nonce", "issued_at", "expires_at"]) {
+    if (key in body) signedPayload[key] = body[key];
   }
 }
 

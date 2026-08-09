@@ -18,6 +18,7 @@ import { AuditLog } from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import type { StorageBackend } from "../../src/storage/interface.js";
 import { FederationSyncStateStore } from "../../src/v1/federation-sync-state-store.js";
+import { OperatorAuthorizationSpentStore } from "../../src/v1/operator-authorization-spent-store.js";
 import type { IdentityManager } from "../../src/cognitive/tools.js";
 import { buildChallengeMessage } from "../../src/v1/ceremony.js";
 import { signOperatorAttestation } from "../../src/v1/operator-attestation.js";
@@ -67,6 +68,8 @@ export async function startRig(opts?: {
   operatorPublicKey?: Uint8Array;
   syncStateStorage?: StorageBackend;
   syncStateMasterKey?: Uint8Array;
+  operatorAuthorizationStorage?: StorageBackend;
+  operatorAuthorizationMasterKey?: Uint8Array;
 }): Promise<TestRig> {
   const storage = new MemoryStorage();
   const masterKey = randomBytes(32);
@@ -107,6 +110,12 @@ export async function startRig(opts?: {
       storage: opts?.syncStateStorage ?? storage,
       masterKey: opts?.syncStateMasterKey ?? masterKey,
     }),
+  );
+  await dashboard.setOperatorAuthorizationSpentStore(
+    OperatorAuthorizationSpentStore.durableFromBoot(
+      opts?.operatorAuthorizationStorage ?? storage,
+      opts?.operatorAuthorizationMasterKey ?? masterKey,
+    ),
   );
 
   await dashboard.start();

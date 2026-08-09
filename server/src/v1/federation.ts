@@ -69,8 +69,8 @@ import type {
 import type { V1SessionClaims } from "./session-service.js";
 import {
   canonicalJson,
-  validateOperatorAuthorizationFreshness,
-  verifyOperatorSignature,
+  includeOperatorAuthorizationFields,
+  verifyAndConsumeOperatorAuthorization,
 } from "./operator-signed.js";
 import {
   writeJson,
@@ -920,97 +920,6 @@ function handleStatus(deps: V1FederationDeps, res: ServerResponse): void {
     tee_attested: posture.tee_attested,
     trust_boundary: posture,
   });
-}
-
-type OperatorAuthorizationResult =
-  | { ok: true }
-  | {
-      ok: false;
-      reason:
-        | "operator_signature_invalid"
-        | "operator_authorization_missing_freshness"
-        | "operator_authorization_malformed_freshness"
-        | "operator_authorization_expired"
-        | "operator_authorization_not_yet_valid"
-        | "operator_authorization_lifetime_too_long"
-        | "operator_authorization_replayed"
-        | "operator_authorization_spent_store_unavailable";
-    };
-
-/**
- * Verify and durably consume one OPERATOR_SIGNED federation authorization.
- * Freshness fields are inside the signed payload; the spent replay key is
- * recorded before the caller performs the authorized effect.
- */
-async function verifyAndConsumeOperatorAuthorization(
-  deps: V1FederationDeps,
-  action: string,
-  payload: Record<string, unknown>,
-  signature: unknown,
-): Promise<OperatorAuthorizationResult> {
-  if (typeof signature !== "string" || signature.length === 0) {
-    return { ok: false, reason: "operator_signature_invalid" };
-  }
-  const operatorPublicKey = deps.resolveOperatorPublicKey();
-  if (!operatorPublicKey) {
-    return { ok: false, reason: "operator_signature_invalid" };
-  }
-  const freshness = validateOperatorAuthorizationFreshness(payload);
-  if (!freshness.ok) return freshness;
-  const ok = verifyOperatorSignature({
-    action,
-    payload,
-    signature,
-    operatorPublicKey,
-  });
-  if (!ok) return { ok: false, reason: "operator_signature_invalid" };
-  const replayKey = operatorAuthorizationReplayKey({
-    operatorPublicKey,
-    action,
-    authorizationNonce: freshness.authorizationNonce,
-  });
-  try {
-    const consumed = await deps.consumeOperatorAuthorization({
-      replayKey,
-      action,
-      authorizationNonce: freshness.authorizationNonce,
-      expiresAt: freshness.expiresAt,
-      operatorPublicKey,
-    });
-    if (consumed === "replayed") {
-      return { ok: false, reason: "operator_authorization_replayed" };
-    }
-  } catch {
-    return {
-      ok: false,
-      reason: "operator_authorization_spent_store_unavailable",
-    };
-  }
-  return { ok: true };
-}
-
-function operatorAuthorizationReplayKey(input: {
-  operatorPublicKey: Uint8Array;
-  action: string;
-  authorizationNonce: string;
-}): string {
-  const h = createHash("sha256");
-  h.update("sanctuary.v1.operator-authorization-spent\0");
-  h.update(input.operatorPublicKey);
-  h.update("\0");
-  h.update(input.action);
-  h.update("\0");
-  h.update(input.authorizationNonce);
-  return toBase64url(h.digest());
-}
-
-function includeOperatorAuthorizationFields(
-  signedPayload: Record<string, unknown>,
-  body: Record<string, unknown>,
-): void {
-  for (const key of ["authorization_nonce", "issued_at", "expires_at"]) {
-    if (key in body) signedPayload[key] = body[key];
-  }
 }
 
 async function handleEnableDisable(

@@ -145,6 +145,7 @@ import {
   buildV11Bindings,
   fortressIdFromStoragePath,
 } from "./dashboard/v1_1/wiring.js";
+import { OperatorAuthorizationSpentStore } from "./v1/operator-authorization-spent-store.js";
 import { SubstrateSelector } from "./intelligence/selector.js";
 import { installConsentGatedRedactor } from "./intelligence/privacy-tier2-redactor.js";
 // Agent-facing audit redaction (property #11, no-policy-inference). Single-sourced
@@ -952,6 +953,9 @@ export async function createSanctuaryServer(options?: {
       // local attestation-store reputation evidence (counts, never a score).
       storage,
     });
+    await dashboard.setOperatorAuthorizationSpentStore(
+      OperatorAuthorizationSpentStore.durableFromBoot(storage, masterKey),
+    );
     // v1.1.1 hotfix: bind the v1.1 dashboard at /v1.1 + hub API at
     // /api/hub/* on the embedded dashboard path so operators see the
     // v1.1 surface whether they boot via `sanctuary --dashboard` or

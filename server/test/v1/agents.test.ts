@@ -26,7 +26,10 @@ import {
   type V1AgentsDeps,
   type UnprotectOutcome,
 } from "../../src/v1/agents.js";
-import { signOperatorPayload } from "../../src/v1/operator-signed.js";
+import {
+  addOperatorAuthorizationFields,
+  signOperatorPayload,
+} from "../../src/v1/operator-signed.js";
 import { toBase64url } from "../../src/core/encoding.js";
 import type { LocalAgentRecord } from "../../src/contracts/v1.1/local-agent-records.js";
 import type { V1SessionClaims } from "../../src/v1/session-service.js";
@@ -111,6 +114,7 @@ function baseDeps(over: Partial<V1AgentsDeps>): V1AgentsDeps {
     nodeId: "node-1",
     listAgents: () => [],
     resolveOperatorPublicKey: () => null,
+    consumeOperatorAuthorization: async () => "consumed",
     enqueueUnprotect: async () => ({ ok: false, reason: "unavailable" }),
     ...over,
   };
@@ -119,8 +123,23 @@ function baseDeps(over: Partial<V1AgentsDeps>): V1AgentsDeps {
 function signUnprotect(
   privateKey: Uint8Array,
   payload: Record<string, unknown>,
-): string {
-  return toBase64url(signOperatorPayload("/v1/agents/unprotect", payload, privateKey));
+): Record<string, unknown> {
+  const signedPayload = addOperatorAuthorizationFields(payload);
+  return {
+    ...signedPayload,
+    operator_signature: toBase64url(
+      signOperatorPayload("/v1/agents/unprotect", signedPayload, privateKey),
+    ),
+  };
+}
+
+function spentSetConsumer() {
+  const spent = new Set<string>();
+  return async ({ replayKey }: { replayKey: string }) => {
+    if (spent.has(replayKey)) return "replayed" as const;
+    spent.add(replayKey);
+    return "consumed" as const;
+  };
 }
 
 // ── GET /v1/agents ─────────────────────────────────────────────────────────
@@ -294,7 +313,7 @@ describe("POST /v1/agents/unprotect", () => {
     const { res, captured } = mockRes();
     await handleAgentsRequest(
       deps,
-      mockReq({ ...payload, operator_signature: signUnprotect(op.privateKey, payload) }),
+      mockReq(signUnprotect(op.privateKey, payload)),
       res,
       new URL("http://x/v1/agents/unprotect"),
       "POST",
@@ -347,7 +366,7 @@ describe("POST /v1/agents/unprotect", () => {
     const { res, captured } = mockRes();
     await handleAgentsRequest(
       deps,
-      mockReq({ ...payload, operator_signature: signUnprotect(attacker.privateKey, payload) }),
+      mockReq(signUnprotect(attacker.privateKey, payload)),
       res,
       new URL("http://x/v1/agents/unprotect"),
       "POST",
@@ -366,7 +385,7 @@ describe("POST /v1/agents/unprotect", () => {
     const { res, captured } = mockRes();
     await handleAgentsRequest(
       deps,
-      mockReq({ ...payload, operator_signature: signUnprotect(op.privateKey, payload) }),
+      mockReq(signUnprotect(op.privateKey, payload)),
       res,
       new URL("http://x/v1/agents/unprotect"),
       "POST",
@@ -386,7 +405,7 @@ describe("POST /v1/agents/unprotect", () => {
     const { res, captured } = mockRes();
     await handleAgentsRequest(
       deps,
-      mockReq({ ...payload, operator_signature: signUnprotect(op.privateKey, payload) }),
+      mockReq(signUnprotect(op.privateKey, payload)),
       res,
       new URL("http://x/v1/agents/unprotect"),
       "POST",
@@ -406,7 +425,7 @@ describe("POST /v1/agents/unprotect", () => {
     const { res, captured } = mockRes();
     await handleAgentsRequest(
       deps,
-      mockReq({ ...payload, operator_signature: signUnprotect(op.privateKey, payload) }),
+      mockReq(signUnprotect(op.privateKey, payload)),
       res,
       new URL("http://x/v1/agents/unprotect"),
       "POST",
@@ -426,7 +445,7 @@ describe("POST /v1/agents/unprotect", () => {
     const { res, captured } = mockRes();
     await handleAgentsRequest(
       deps,
-      mockReq({ ...payload, operator_signature: signUnprotect(op.privateKey, payload) }),
+      mockReq(signUnprotect(op.privateKey, payload)),
       res,
       new URL("http://x/v1/agents/unprotect"),
       "POST",
@@ -435,11 +454,12 @@ describe("POST /v1/agents/unprotect", () => {
     expect(captured.status).toBe(503);
   });
 
-  it("is idempotent: a replayed signed request enqueues exactly once", async () => {
+  it("refuses a replayed operator-signed unprotect and enqueues no second approval", async () => {
     const op = makeOperator();
     let enqueueCount = 0;
     const deps = baseDeps({
       resolveOperatorPublicKey: () => op.publicKey,
+      consumeOperatorAuthorization: spentSetConsumer(),
       idempotency: new V1IdempotencyStore(),
       enqueueUnprotect: async (agentId): Promise<UnprotectOutcome> => {
         enqueueCount += 1;
@@ -455,12 +475,12 @@ describe("POST /v1/agents/unprotect", () => {
       },
     });
     const payload = { agent_id: "agent-x", idempotency_key: "same-key" };
-    const sig = signUnprotect(op.privateKey, payload);
+    const signedBody = signUnprotect(op.privateKey, payload);
     const run = async () => {
       const { res, captured } = mockRes();
       await handleAgentsRequest(
         deps,
-        mockReq({ ...payload, operator_signature: sig }),
+        mockReq(signedBody),
         res,
         new URL("http://x/v1/agents/unprotect"),
         "POST",
@@ -471,18 +491,17 @@ describe("POST /v1/agents/unprotect", () => {
     const first = await run();
     const second = await run();
     expect(enqueueCount).toBe(1);
-    expect(second.body).toEqual(first.body);
+    expect(first.status).toBe(202);
+    expect(second.status).toBe(403);
+    expect(second.body).toEqual({ error: "forbidden" });
   });
 
-  it("dedups across DIFFERENT sessions (retry that re-opens a session)", async () => {
-    // Regression for the codex PR-A2 finding: a retry after token expiry
-    // opens a fresh /v1 session with a NEW ephemeral client key. Keyed on
-    // the session it would double-enqueue; keyed on the operator identity it
-    // must still replay.
+  it("refuses a replayed operator-signed unprotect across different sessions", async () => {
     const op = makeOperator();
     let enqueueCount = 0;
     const deps = baseDeps({
       resolveOperatorPublicKey: () => op.publicKey,
+      consumeOperatorAuthorization: spentSetConsumer(),
       idempotency: new V1IdempotencyStore(),
       enqueueUnprotect: async (agentId): Promise<UnprotectOutcome> => {
         enqueueCount += 1;
@@ -498,12 +517,12 @@ describe("POST /v1/agents/unprotect", () => {
       },
     });
     const payload = { agent_id: "agent-x", idempotency_key: "retry-key" };
-    const sig = signUnprotect(op.privateKey, payload);
+    const signedBody = signUnprotect(op.privateKey, payload);
     const runWith = async (clientPubkey: string) => {
       const { res, captured } = mockRes();
       await handleAgentsRequest(
         deps,
-        mockReq({ ...payload, operator_signature: sig }),
+        mockReq(signedBody),
         res,
         new URL("http://x/v1/agents/unprotect"),
         "POST",
@@ -514,17 +533,17 @@ describe("POST /v1/agents/unprotect", () => {
     const first = await runWith("ephemeral-session-1");
     const second = await runWith("ephemeral-session-2");
     expect(enqueueCount).toBe(1);
-    expect(second.body).toEqual(first.body);
+    expect(first.status).toBe(202);
+    expect(second.status).toBe(403);
+    expect(second.body).toEqual({ error: "forbidden" });
   });
 
-  it("coalesces CONCURRENT duplicate requests onto a single enqueue", async () => {
-    // Regression for codex finding 2: two identical signed requests racing
-    // both miss the durable cache; the in-flight reservation must collapse
-    // them to one Tier 1 enqueue.
+  it("refuses a concurrent duplicate operator authorization before a second enqueue", async () => {
     const op = makeOperator();
     let enqueueCount = 0;
     const deps = baseDeps({
       resolveOperatorPublicKey: () => op.publicKey,
+      consumeOperatorAuthorization: spentSetConsumer(),
       idempotency: new V1IdempotencyStore(),
       enqueueUnprotect: async (agentId): Promise<UnprotectOutcome> => {
         // Yield so both requests are in-flight before either resolves.
@@ -542,12 +561,12 @@ describe("POST /v1/agents/unprotect", () => {
       },
     });
     const payload = { agent_id: "agent-x", idempotency_key: "race-key" };
-    const sig = signUnprotect(op.privateKey, payload);
+    const signedBody = signUnprotect(op.privateKey, payload);
     const fire = async () => {
       const { res, captured } = mockRes();
       await handleAgentsRequest(
         deps,
-        mockReq({ ...payload, operator_signature: sig }),
+        mockReq(signedBody),
         res,
         new URL("http://x/v1/agents/unprotect"),
         "POST",
@@ -557,9 +576,65 @@ describe("POST /v1/agents/unprotect", () => {
     };
     const [a, b] = await Promise.all([fire(), fire()]);
     expect(enqueueCount).toBe(1);
-    expect(a.status).toBe(202);
-    expect(b.status).toBe(202);
-    expect(a.body).toEqual(b.body);
+    expect([a.status, b.status].sort()).toEqual([202, 403]);
+  });
+
+  it("fails closed when the durable spent-set write fails before unprotect", async () => {
+    const op = makeOperator();
+    let enqueued = false;
+    const deps = baseDeps({
+      resolveOperatorPublicKey: () => op.publicKey,
+      consumeOperatorAuthorization: async () => {
+        throw new Error("sync-state write failed");
+      },
+      enqueueUnprotect: async () => {
+        enqueued = true;
+        return { ok: false, reason: "unavailable" };
+      },
+    });
+    const payload = { agent_id: "agent-x", idempotency_key: "k1" };
+    const { res, captured } = mockRes();
+    await handleAgentsRequest(
+      deps,
+      mockReq(signUnprotect(op.privateKey, payload)),
+      res,
+      new URL("http://x/v1/agents/unprotect"),
+      "POST",
+      CLAIMS,
+    );
+    expect(captured.status).toBe(503);
+    expect(captured.body).toEqual({ error: "unavailable" });
+    expect(enqueued).toBe(false);
+  });
+
+  it("refuses a legacy no-freshness operator-signed unprotect before enqueue", async () => {
+    const op = makeOperator();
+    let enqueued = false;
+    const payload = { agent_id: "agent-x", idempotency_key: "legacy" };
+    const deps = baseDeps({
+      resolveOperatorPublicKey: () => op.publicKey,
+      enqueueUnprotect: async () => {
+        enqueued = true;
+        return { ok: false, reason: "unavailable" };
+      },
+    });
+    const { res, captured } = mockRes();
+    await handleAgentsRequest(
+      deps,
+      mockReq({
+        ...payload,
+        operator_signature: toBase64url(
+          signOperatorPayload("/v1/agents/unprotect", payload, op.privateKey),
+        ),
+      }),
+      res,
+      new URL("http://x/v1/agents/unprotect"),
+      "POST",
+      CLAIMS,
+    );
+    expect(captured.status).toBe(403);
+    expect(captured.body).toEqual({ error: "forbidden" });
+    expect(enqueued).toBe(false);
   });
 
   it("rejects a missing agent_id with 400 before any auth work", async () => {
@@ -589,8 +664,17 @@ describe("POST /v1/agents/protect", () => {
       ...over,
     };
   }
-  function signProtect(privateKey: Uint8Array, payload: Record<string, unknown>): string {
-    return toBase64url(signOperatorPayload("/v1/agents/protect", payload, privateKey));
+  function signProtect(
+    privateKey: Uint8Array,
+    payload: Record<string, unknown>,
+  ): Record<string, unknown> {
+    const signedPayload = addOperatorAuthorizationFields(payload);
+    return {
+      ...signedPayload,
+      operator_signature: toBase64url(
+        signOperatorPayload("/v1/agents/protect", signedPayload, privateKey),
+      ),
+    };
   }
 
   it("launches via the supervisor and returns 202 protecting for a signed request", async () => {
@@ -607,7 +691,7 @@ describe("POST /v1/agents/protect", () => {
     const { res, captured } = mockRes();
     await handleAgentsRequest(
       deps,
-      mockReq({ ...payload, operator_signature: signProtect(op.privateKey, payload) }),
+      mockReq(signProtect(op.privateKey, payload)),
       res,
       new URL("http://x/v1/agents/protect"),
       "POST",
@@ -629,7 +713,7 @@ describe("POST /v1/agents/protect", () => {
     const { res, captured } = mockRes();
     await handleAgentsRequest(
       deps,
-      mockReq({ ...payload, operator_signature: signProtect(op.privateKey, payload) }),
+      mockReq(signProtect(op.privateKey, payload)),
       res,
       new URL("http://x/v1/agents/protect"),
       "POST",
@@ -649,7 +733,7 @@ describe("POST /v1/agents/protect", () => {
     const { res, captured } = mockRes();
     await handleAgentsRequest(
       deps,
-      mockReq({ ...payload, operator_signature: signProtect(op.privateKey, payload) }),
+      mockReq(signProtect(op.privateKey, payload)),
       res,
       new URL("http://x/v1/agents/protect"),
       "POST",
@@ -669,7 +753,7 @@ describe("POST /v1/agents/protect", () => {
     const { res, captured } = mockRes();
     await handleAgentsRequest(
       deps,
-      mockReq({ ...payload, operator_signature: signProtect(op.privateKey, payload) }),
+      mockReq(signProtect(op.privateKey, payload)),
       res,
       new URL("http://x/v1/agents/protect"),
       "POST",
@@ -687,7 +771,7 @@ describe("POST /v1/agents/protect", () => {
     const { res, captured } = mockRes();
     await handleAgentsRequest(
       deps,
-      mockReq({ ...payload, operator_signature: signProtect(op.privateKey, payload) }),
+      mockReq(signProtect(op.privateKey, payload)),
       res,
       new URL("http://x/v1/agents/protect"),
       "POST",
@@ -745,7 +829,7 @@ describe("POST /v1/agents/protect", () => {
     const { res, captured } = mockRes();
     await handleAgentsRequest(
       deps,
-      mockReq({ ...payload, operator_signature: signProtect(op.privateKey, payload) }),
+      mockReq(signProtect(op.privateKey, payload)),
       res,
       new URL("http://x/v1/agents/protect"),
       "POST",
@@ -754,12 +838,13 @@ describe("POST /v1/agents/protect", () => {
     expect(captured.status).toBe(400);
   });
 
-  it("replays a retried protect from the idempotency cache — launches EXACTLY once (M2)", async () => {
+  it("refuses a replayed operator-signed protect and launches no second process", async () => {
     const op = makeOperator();
     let launchCount = 0;
     const store = new V1IdempotencyStore();
     const deps = baseDeps({
       resolveOperatorPublicKey: () => op.publicKey,
+      consumeOperatorAuthorization: spentSetConsumer(),
       idempotency: store,
       launchProtect: async (spec) => {
         launchCount++;
@@ -767,12 +852,12 @@ describe("POST /v1/agents/protect", () => {
       },
     });
     const payload = protectPayload();
-    const sig = signProtect(op.privateKey, payload);
+    const signedBody = signProtect(op.privateKey, payload);
     const run = async () => {
       const { res, captured } = mockRes();
       await handleAgentsRequest(
         deps,
-        mockReq({ ...payload, operator_signature: sig }),
+        mockReq(signedBody),
         res,
         new URL("http://x/v1/agents/protect"),
         "POST",
@@ -784,11 +869,11 @@ describe("POST /v1/agents/protect", () => {
     const second = await run();
     expect(launchCount).toBe(1); // double-click does NOT double-launch
     expect(first.status).toBe(202);
-    expect(second.status).toBe(202);
-    expect(second.body).toEqual(first.body); // same launch_id replayed
+    expect(second.status).toBe(403);
+    expect(second.body).toEqual({ error: "forbidden" });
   });
 
-  it("coalesces CONCURRENT duplicate protects onto one launch (M2 race)", async () => {
+  it("refuses a concurrent duplicate operator authorization before a second launch", async () => {
     const op = makeOperator();
     let launchCount = 0;
     let release!: () => void;
@@ -798,6 +883,7 @@ describe("POST /v1/agents/protect", () => {
     const store = new V1IdempotencyStore();
     const deps = baseDeps({
       resolveOperatorPublicKey: () => op.publicKey,
+      consumeOperatorAuthorization: spentSetConsumer(),
       idempotency: store,
       launchProtect: async (spec) => {
         launchCount++;
@@ -806,12 +892,12 @@ describe("POST /v1/agents/protect", () => {
       },
     });
     const payload = protectPayload();
-    const sig = signProtect(op.privateKey, payload);
+    const signedBody = signProtect(op.privateKey, payload);
     const fire = () => {
       const { res, captured } = mockRes();
       return handleAgentsRequest(
         deps,
-        mockReq({ ...payload, operator_signature: sig }),
+        mockReq(signedBody),
         res,
         new URL("http://x/v1/agents/protect"),
         "POST",
@@ -824,8 +910,35 @@ describe("POST /v1/agents/protect", () => {
     release();
     const [c1, c2] = await Promise.all([p1, p2]);
     expect(launchCount).toBe(1); // concurrent duplicates coalesce
-    expect(c1.status).toBe(202);
-    expect(c2.status).toBe(202);
+    expect([c1.status, c2.status].sort()).toEqual([202, 403]);
+  });
+
+  it("fails closed when the durable spent-set write fails before protect launch", async () => {
+    const op = makeOperator();
+    let launched = false;
+    const deps = baseDeps({
+      resolveOperatorPublicKey: () => op.publicKey,
+      consumeOperatorAuthorization: async () => {
+        throw new Error("sync-state write failed");
+      },
+      launchProtect: async () => {
+        launched = true;
+        return { ok: true, status: "protecting", agent_id: "agent-1", launch_id: "L1" };
+      },
+    });
+    const payload = protectPayload();
+    const { res, captured } = mockRes();
+    await handleAgentsRequest(
+      deps,
+      mockReq(signProtect(op.privateKey, payload)),
+      res,
+      new URL("http://x/v1/agents/protect"),
+      "POST",
+      CLAIMS,
+    );
+    expect(captured.status).toBe(503);
+    expect(captured.body).toEqual({ error: "unavailable" });
+    expect(launched).toBe(false);
   });
 
   it("does NOT cache a transient unavailable launch failure (retryable)", async () => {
@@ -842,12 +955,11 @@ describe("POST /v1/agents/protect", () => {
       },
     });
     const payload = protectPayload();
-    const sig = signProtect(op.privateKey, payload);
     const run = async () => {
       const { res, captured } = mockRes();
       await handleAgentsRequest(
         deps,
-        mockReq({ ...payload, operator_signature: sig }),
+        mockReq(signProtect(op.privateKey, payload)),
         res,
         new URL("http://x/v1/agents/protect"),
         "POST",

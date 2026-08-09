@@ -13,12 +13,12 @@
  * - The router has already validated the SESSION_TOKEN before delegating
  *   here; a missing/invalid session never reaches this module.
  * - Writes additionally require a valid inline OPERATOR_SIGNED Ed25519
- *   signature over the canonical request payload (PR-A1's
- *   `verifyOperatorSignature`), verified against the daemon's operator
- *   identity public key. If no operator identity can be resolved, OR the
- *   signature does not verify, the write is DENIED with the generic 403 —
- *   never executed, never fails open. The two outcomes are indistinguishable
- *   in the response (no oracle for "is an operator key configured").
+ *   signature over the canonical request payload, including freshness fields,
+ *   verified against the daemon's operator identity public key and consumed in
+ *   the durable operator-authorization spent set BEFORE any effect. If the
+ *   operator identity cannot be resolved, the signature/freshness check fails,
+ *   the authorization replays, or the spent-set write fails, the write is
+ *   DENIED — never executed, never fails open.
  * - Unprotect routes through the existing HubService Tier 1 approval queue
  *   (`controlAgent(..., "unwrap")`); it enqueues an approval-pending item
  *   and returns its id, it does NOT tear down synchronously.
@@ -27,9 +27,10 @@
  *   2026-06-13) wires execution through a SEPARATE supervisor process: the
  *   dashboard hands the supervisor a launch request over an authenticated
  *   local socket (`deps.launchProtect`); the supervisor owns spawning the
- *   wrapped agent and holds only a transient key. Protect is idempotent at
- *   both the request level (replay the 202) and the resource level (an
- *   already-up agent is a 200 no-op) so a double-click never double-launches.
+ *   wrapped agent and holds only a transient key. Protect is single-use at the
+ *   operator-authorization level (a replay is refused) and idempotent at the
+ *   resource level (an already-up agent is a 200 no-op), so a double-click never
+ *   double-launches.
  *   When no supervisor is wired, protect fails closed with 503 `unavailable`
  *   (never a silent success; never an auth oracle once a signature verified).
  *   Tier A+ (keychain-at-login) and Tier B (headless/unattended) are deferred
@@ -48,7 +49,12 @@ import { createHash } from "node:crypto";
 import type { LocalAgentRecord } from "../contracts/v1.1/local-agent-records.js";
 import type { HubTier1ApprovalEnqueuedResult } from "../hub/types.js";
 import type { V1SessionClaims } from "./session-service.js";
-import { verifyOperatorSignature, canonicalJson } from "./operator-signed.js";
+import {
+  canonicalJson,
+  includeOperatorAuthorizationFields,
+  verifyAndConsumeOperatorAuthorization,
+  type OperatorAuthorizationConsumeParams,
+} from "./operator-signed.js";
 import { fromBase64url, toBase64url } from "../core/encoding.js";
 import {
   writeJson,
@@ -161,6 +167,14 @@ export interface V1AgentsDeps {
    */
   resolveOperatorPublicKey(): Uint8Array | null;
   /**
+   * Consume one verified OPERATOR_SIGNED authorization before its effect runs.
+   * Implementations must durably persist the replay key and fail closed on a
+   * write failure; returning "replayed" refuses an already-spent nonce.
+   */
+  consumeOperatorAuthorization(
+    params: OperatorAuthorizationConsumeParams,
+  ): Promise<"consumed" | "replayed">;
+  /**
    * Enqueue a Tier 1 unwrap through HubService. Implementations translate
    * hub errors into {@link UnprotectOutcome} reasons; they never throw.
    */
@@ -208,9 +222,9 @@ interface IdempotencyRecord {
 }
 
 /**
- * Replay cache so a retried Tier 1 write returns its first result instead
- * of enqueuing a second approval. Bounded LRU with a TTL; insertion-order
- * Map eviction.
+ * Response cache for Tier 1 write producers. The durable operator-authorization
+ * spent set is the replay defense; this cache only preserves the older
+ * producer-deduplication boundary for callers/tests that reach it.
  *
  * The composite key is built by the caller and MUST be stable across
  * sessions: a retry that opens a FRESH /v1 session (after a token timeout,
@@ -313,10 +327,9 @@ export class V1IdempotencyStore {
 
 /**
  * Build the session-independent idempotency key for a Tier 1 write. Stable
- * across retries of the same logical operation: operator namespace + action
- * + client idempotency UUID + a hash binding the exact signed payload (so a
- * client that reuses a UUID for a DIFFERENT payload gets a fresh enqueue
- * rather than a wrong replay).
+ * across exact signed bodies: operator namespace + action + client idempotency
+ * UUID + a hash binding the exact signed payload (so a client that reuses a UUID
+ * for a DIFFERENT payload gets a fresh producer call rather than a wrong replay).
  */
 export function idempotencyKeyFor(
   operatorPublicKey: Uint8Array,
@@ -478,29 +491,19 @@ function handleListAgents(
 }
 
 /**
- * Verify the inline OPERATOR_SIGNED signature over the request payload.
- * `payload` MUST be the request body with `operator_signature` removed.
- * Returns the verified operator public key when an operator identity is
- * configured AND the signature verifies; otherwise null. The caller maps
- * null to the generic 403 (no distinguishable failure reason) and reuses
- * the returned key to namespace idempotency to a stable operator identity.
+ * Map every operator authorization failure to the generic 403 except a durable
+ * spent-set write failure, which is a retryable 503. The specific auth reason
+ * never leaves the handler on replay, legacy no-freshness, or signature errors.
  */
-function resolveAndVerifyOperator(
-  deps: V1AgentsDeps,
-  action: string,
-  payloadWithoutSignature: Record<string, unknown>,
-  signature: unknown,
-): Uint8Array | null {
-  if (typeof signature !== "string" || signature.length === 0) return null;
-  const operatorPublicKey = deps.resolveOperatorPublicKey();
-  if (!operatorPublicKey) return null; // fail closed: no operator identity
-  const ok = verifyOperatorSignature({
-    action,
-    payload: payloadWithoutSignature,
-    signature,
-    operatorPublicKey,
-  });
-  return ok ? operatorPublicKey : null;
+function writeOperatorAuthorizationFailure(
+  res: ServerResponse,
+  reason: string,
+): void {
+  if (reason === "operator_authorization_spent_store_unavailable") {
+    writeJson(res, 503, { error: "unavailable" });
+    return;
+  }
+  denyForbidden(res);
 }
 
 async function handleUnprotect(
@@ -542,16 +545,18 @@ async function handleUnprotect(
   const action = "/v1/agents/unprotect";
   const signedPayload: Record<string, unknown> = { agent_id, idempotency_key };
   if (node_id !== undefined) signedPayload.node_id = node_id;
-  const operatorPublicKey = resolveAndVerifyOperator(
+  includeOperatorAuthorizationFields(signedPayload, body as Record<string, unknown>);
+  const authorization = await verifyAndConsumeOperatorAuthorization(
     deps,
     action,
     signedPayload,
     operator_signature,
   );
-  if (!operatorPublicKey) {
-    denyForbidden(res);
+  if (!authorization.ok) {
+    writeOperatorAuthorizationFailure(res, authorization.reason);
     return;
   }
+  const operatorPublicKey = authorization.operatorPublicKey;
 
   // Single-node: a write addressed to a different node is rejected (no
   // federation transport in PR-A2). Reached only after a valid signature.
@@ -560,11 +565,9 @@ async function handleUnprotect(
     return;
   }
 
-  // Enqueue the Tier 1 unwrap, deduplicated by idempotency key. The key is
-  // the STABLE operator identity + action + idempotency key + payload hash,
-  // NOT the ephemeral session client key — so a retry that opens a fresh
-  // session still replays (codex finding 1). The store also coalesces
-  // CONCURRENT duplicates onto one enqueue (codex finding 2).
+  // The durable spent set above is the replay defense. This producer cache uses
+  // the stable operator identity + action + idempotency key + payload hash,
+  // never the ephemeral session client key.
   const nowMs = (deps.now ?? Date.now)();
   const store = deps.idempotency;
   const cacheKey = idempotencyKeyFor(operatorPublicKey, action, idempotency_key, signedPayload);
@@ -645,16 +648,18 @@ async function handleProtect(
   if (agent_id !== undefined) signedPayload.agent_id = agent_id;
   if (config_path !== undefined) signedPayload.config_path = config_path;
   if (node_id !== undefined) signedPayload.node_id = node_id;
-  const operatorPublicKey = resolveAndVerifyOperator(
+  includeOperatorAuthorizationFields(signedPayload, body as Record<string, unknown>);
+  const authorization = await verifyAndConsumeOperatorAuthorization(
     deps,
     "/v1/agents/protect",
     signedPayload,
     operator_signature,
   );
-  if (!operatorPublicKey) {
-    denyForbidden(res);
+  if (!authorization.ok) {
+    writeOperatorAuthorizationFailure(res, authorization.reason);
     return;
   }
+  const operatorPublicKey = authorization.operatorPublicKey;
 
   if (node_id !== undefined && node_id !== deps.nodeId) {
     writeJson(res, 400, { error: "unknown node" });
@@ -685,12 +690,9 @@ async function handleProtect(
   }
   const launchProtect = deps.launchProtect;
 
-  // Idempotency (review M2): protect is the path that LAUNCHES a process, so a
-  // retried/raced double-click must launch exactly once. Key on the stable
-  // operator identity + action + client idempotency key + payload hash — the
-  // same session-independent composite the unprotect path uses — so a retry
-  // that opens a fresh /v1 session still replays instead of double-launching.
-  // The store also coalesces CONCURRENT duplicates onto one launch.
+  // The durable spent set above is the replay defense for the process-launch
+  // path. This producer cache uses the same stable operator identity + action +
+  // client idempotency key + payload hash composite as unprotect.
   const nowMs = (deps.now ?? Date.now)();
   const store = deps.idempotency;
   const cacheKey = idempotencyKeyFor(

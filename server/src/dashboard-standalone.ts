@@ -90,6 +90,7 @@ import { provisionOrLoadOperatorCloudJoinedNode } from "./mesh/operator-cloud-jo
 import { federationRotateRootInProgress } from "./mesh/federation-rotate-root.js";
 import { FederationSyncStateStore } from "./v1/federation-sync-state-store.js";
 import { FederationReissueChallengeStore } from "./v1/federation-reissue-challenge-store.js";
+import { OperatorAuthorizationSpentStore } from "./v1/operator-authorization-spent-store.js";
 import {
   BootstrapNonceStore,
   createStandaloneJoinApprover,
@@ -1227,6 +1228,15 @@ async function wireUnlockedDeps(args: {
       }
     }
   }
+
+  // M-10: wire the DURABLE OPERATOR_SIGNED authorization spent-set for every
+  // unlocked dashboard, including the default non-federated single-node path.
+  // This store is separate from federation sync state so protect/unprotect do
+  // not require federation provisioning, while a durable write failure still
+  // denies before any authorized effect.
+  await dashboard.setOperatorAuthorizationSpentStore(
+    OperatorAuthorizationSpentStore.durableFromBoot(storage, masterKey),
+  );
 
   // Federation 3/3b P0: wire the DURABLE peer-sync security-state store and
   // rehydrate it whenever federation is provisioned (issuer OR joiner). This
