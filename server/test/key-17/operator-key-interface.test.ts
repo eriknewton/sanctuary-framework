@@ -63,7 +63,9 @@ describe("OperatorKeyService", () => {
     it("signX402 produces a valid x402 signature", async () => {
       const signed = await service.signX402(operatorId, makeX402());
       expect(signed.algorithm).toBe("EdDSA");
-      expect(verifyX402Request(signed)).toBe(true);
+      expect(
+        verifyX402Request(signed, { trustedPublicKey: signed.public_key }).valid
+      ).toBe(true);
     });
 
     it("signErc8004Identity produces a valid ERC-8004 signature", async () => {
@@ -78,7 +80,9 @@ describe("OperatorKeyService", () => {
     it("signAp2Mandate produces a valid AP2 signature", async () => {
       const signed = await service.signAp2Mandate(operatorId, makeAp2());
       expect(signed.algorithm).toBe("EdDSA");
-      expect(verifyAp2Mandate(signed)).toBe(true);
+      expect(
+        verifyAp2Mandate(signed, { trustedPublicKey: signed.public_key }).valid
+      ).toBe(true);
     });
   });
 
@@ -132,7 +136,9 @@ describe("OperatorKeyService", () => {
       const service = new OperatorKeyService({ masterKey, policyGate: gate });
 
       const signed = await service.signX402(operatorId, makeX402());
-      expect(verifyX402Request(signed)).toBe(true);
+      expect(
+        verifyX402Request(signed, { trustedPublicKey: signed.public_key }).valid
+      ).toBe(true);
       expect(approvalFn).toHaveBeenCalledTimes(1);
       expect(approvalFn).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -202,7 +208,9 @@ describe("OperatorKeyService", () => {
       const service = new OperatorKeyService({ masterKey, policyGate: gate });
 
       const signed = await service.signX402(operatorId, makeX402());
-      expect(verifyX402Request(signed)).toBe(true);
+      expect(
+        verifyX402Request(signed, { trustedPublicKey: signed.public_key }).valid
+      ).toBe(true);
     });
 
     it("denies non-approved counterparty despite allow default for other protocols", async () => {
@@ -233,7 +241,9 @@ describe("OperatorKeyService", () => {
       const service = new OperatorKeyService({ masterKey, policyGate: gate });
 
       const signed = await service.signAp2Mandate(operatorId, makeAp2());
-      expect(verifyAp2Mandate(signed)).toBe(true);
+      expect(
+        verifyAp2Mandate(signed, { trustedPublicKey: signed.public_key }).valid
+      ).toBe(true);
     });
   });
 });

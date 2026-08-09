@@ -74,7 +74,9 @@ registerFixture(
       spec_version: "1.0",
     });
     return {
-      passed: verifyAp2Mandate(signed),
+      passed: verifyAp2Mandate(signed, {
+        trustedPublicKey: signed.public_key,
+      }).valid,
       durationMs: performance.now() - start,
     };
   },

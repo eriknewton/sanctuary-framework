@@ -51,6 +51,8 @@ export function deriveErc8004Key(
   masterKey: Uint8Array,
   operatorId: string
 ): Uint8Array {
+  // ERC-8004 uses a protocol-scoped subkey so an identity-registry signature
+  // cannot be replayed as x402/AP2 authority.
   return hkdf(
     sha256,
     masterKey,
@@ -71,7 +73,8 @@ export function publicKeyToAddress(publicKey: Uint8Array): string {
     publicKey.length === 33
       ? secp256k1.ProjectivePoint.fromHex(publicKey).toRawBytes(false)
       : publicKey;
-  // Hash the 64 bytes after the 0x04 prefix
+  // Ethereum addresses are the low 20 bytes of keccak(pubkey[1..65]); the
+  // compressed key itself is never the identity claim.
   const hash = keccak_256(uncompressed.slice(1));
   const addressBytes = hash.slice(12);
   return checksumAddress(addressBytes);
@@ -124,6 +127,8 @@ export function signErc8004Registration(
   const publicKey = secp256k1.getPublicKey(privateKey, true); // compressed
   const address = publicKeyToAddress(publicKey);
 
+  // Canonical bytes bind every registry field, including nonce and timestamp,
+  // before the Ethereum personal_sign prefix is applied.
   const messageBytes = canonicalizeToBytes(registration);
   const msgHash = ethMessageHash(messageBytes);
 
@@ -153,10 +158,13 @@ export function verifyErc8004Registration(
 ): boolean {
   const { signature, signer_address, public_key: _public_key, ...unsigned } = signed;
 
+  // Verification recomputes the registry payload from unsigned fields; the
+  // carried public_key is ignored because recovery from the signature is the
+  // only key material that can settle this envelope.
   const messageBytes = canonicalizeToBytes(unsigned);
   const msgHash = ethMessageHash(messageBytes);
 
-  // Parse the 65-byte signature
+  // 130 = hex length of a 65-byte Ethereum signature (r[32] + s[32] + v[1]).
   const sigHex = signature.startsWith("0x") ? signature.slice(2) : signature;
   if (sigHex.length !== 130) return false;
 
@@ -171,6 +179,8 @@ export function verifyErc8004Registration(
     const recoveredAddress = publicKeyToAddress(
       recoveredPoint.toRawBytes(false)
     );
+    // The embedded signer_address is only checked against the recovered key;
+    // registry ownership is a separate trust upgrade in erc8004-resolve.
     return recoveredAddress.toLowerCase() === signer_address.toLowerCase();
   } catch {
     return false;

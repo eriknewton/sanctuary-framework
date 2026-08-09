@@ -103,6 +103,8 @@ export class DefaultPolicyGate implements PolicyGate {
   async checkApproval(request: SigningApprovalRequest): Promise<void> {
     const decision = this.evaluate(request);
 
+    // An explicit allow is the only silent path; unknown or unapproved
+    // counterparties must either deny or pass through the human approval hook.
     if (decision === "allow") return;
 
     if (decision === "deny") {
@@ -112,7 +114,8 @@ export class DefaultPolicyGate implements PolicyGate {
       );
     }
 
-    // operator_approval_required
+    // Missing approval plumbing is a hard deny so a Tier-2 signing request
+    // cannot degrade into local key use without a human channel.
     if (!this.config.requestOperatorApproval) {
       throw new SigningDeniedError(
         request.protocol,
@@ -139,6 +142,8 @@ export class DefaultPolicyGate implements PolicyGate {
     const protocolPolicy = this.config[request.protocol];
     if (!protocolPolicy) return this.config.global_default;
 
+    // Counterparty-specific rules are evaluated before protocol defaults so an
+    // operator's named allow/deny entry cannot be diluted by a broad fallback.
     const counterpartyRule = protocolPolicy.counterparty_rules.find(
       (r) =>
         r.counterparty === request.counterparty || r.counterparty === "*"

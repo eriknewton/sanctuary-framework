@@ -174,6 +174,8 @@ export async function resolveErc8004Identity(
   );
 
   // ── Trust-boundary shape check (fail closed) ──────────────────────
+  // Caller input is untrusted; malformed records must stop before signature
+  // recovery so they cannot be rendered as a weak-but-valid identity.
   const coerced = coercePresentedRecord(presented);
   if (!coerced.ok) {
     await deps.auditLog.append(
@@ -188,6 +190,8 @@ export async function resolveErc8004Identity(
   const signed = coerced.signed;
 
   // ── Offline signature verification (reuses the signer's verify path) ──
+  // Offline verification proves self-consistency only; registry ownership is
+  // the separate confirmation step below and is never inferred from the record.
   let offlineValid: boolean;
   try {
     offlineValid = verifyErc8004Registration(signed);
@@ -243,6 +247,8 @@ export async function resolveErc8004Identity(
   );
 
   if (registryConfirmation.status === "confirmed") {
+    // Assurance is upgraded only after the gated ownerOf read matches the
+    // recovered signer; offline self-consistency alone stays offline_verified.
     await deps.auditLog.append(
       "l2",
       ERC8004_RESOLVE_AUDIT_OPS.REGISTRY_CONFIRMED,
