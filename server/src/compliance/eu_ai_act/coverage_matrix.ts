@@ -1,5 +1,5 @@
 /**
- * Sanctuary MCP Server — EU AI Act Coverage Matrix v1
+ * Sanctuary MCP Server - EU AI Act Coverage Matrix v1
  *
  * Copyright 2026 Erik Newton
  * SPDX-License-Identifier: Apache-2.0
@@ -15,11 +15,11 @@
  * live instance.
  *
  * Coverage classification (strict):
- *   - "full"        — emittable from Sanctuary tool output alone,
+ *   - "full"        - emittable from Sanctuary tool output alone,
  *                     zero enterprise input, machine-verifiable
- *   - "partial"     — Sanctuary emits structured evidence; enterprise
+ *   - "partial"     - Sanctuary emits structured evidence; enterprise
  *                     supplies business context to complete the row
- *   - "manual_only" — Sanctuary has no visibility; row is entirely
+ *   - "manual_only" - Sanctuary has no visibility; row is entirely
  *                     enterprise-authored
  *
  * Regulation citations are verbatim from Regulation (EU) 2024/1689 as
@@ -98,7 +98,7 @@ export interface CoverageRow {
   last_reviewed_by: string;
   /**
    * Per-row rationale for the classification. Load-bearing for
-   * future maintainers — explains *why* a row is classified the way
+   * future maintainers - explains *why* a row is classified the way
    * it is, including any verification corrections applied.
    */
   review_notes: string;
@@ -106,7 +106,7 @@ export interface CoverageRow {
 
 export interface CoverageMatrix {
   matrix_version: "v1";
-  /** See REGULATION_VERSION — human-readable display anchor. */
+  /** See REGULATION_VERSION - human-readable display anchor. */
   regulation_version: string;
   /** Structured regulation metadata for programmatic diffing. */
   regulation: {
@@ -131,7 +131,7 @@ const REVIEWER = "Erik Newton";
 
 const ROWS: CoverageRow[] = [
   // ═══════════════════════════════════════════════════════════════════
-  // ANNEX IV — Technical Documentation Requirements (per Article 11)
+  // ANNEX IV - Technical Documentation Requirements (per Article 11)
   // ═══════════════════════════════════════════════════════════════════
 
   // ─── §1 General description ─────────────────────────────────────
@@ -268,7 +268,7 @@ const ROWS: CoverageRow[] = [
     last_reviewed_date: REVIEW_DATE,
     last_reviewed_by: REVIEWER,
     review_notes:
-      "Structural manual row — commercial distribution is not a " +
+      "Structural manual row - commercial distribution is not a " +
       "Sanctuary concern and will not become one.",
   },
 
@@ -300,7 +300,7 @@ const ROWS: CoverageRow[] = [
     last_reviewed_by: REVIEWER,
     review_notes:
       "In local-process mode Sanctuary emits tee_available=false, which " +
-      "is honest but incomplete — production may run on TEE-capable " +
+      "is honest but incomplete - production may run on TEE-capable " +
       "hardware that Sanctuary does not detect. SHR degradation " +
       "NO_TEE is flagged automatically.",
   },
@@ -354,7 +354,7 @@ const ROWS: CoverageRow[] = [
     last_reviewed_date: REVIEW_DATE,
     last_reviewed_by: REVIEWER,
     review_notes:
-      "Structural manual row — model development is outside Sanctuary's " +
+      "Structural manual row - model development is outside Sanctuary's " +
       "architectural scope.",
   },
 
@@ -391,7 +391,7 @@ const ROWS: CoverageRow[] = [
     last_reviewed_date: REVIEW_DATE,
     last_reviewed_by: REVIEWER,
     review_notes:
-      "Borderline partial — Sanctuary emits the policy and gating " +
+      "Borderline partial - Sanctuary emits the policy and gating " +
       "specifications as structured data, but 'key design choices " +
       "including rationale' is inherently a narrative field that " +
       "requires enterprise authorship. Kept partial deliberately.",
@@ -431,7 +431,7 @@ const ROWS: CoverageRow[] = [
     last_reviewed_date: REVIEW_DATE,
     last_reviewed_by: REVIEWER,
     review_notes:
-      "Borderline partial — Sanctuary emits a complete architectural " +
+      "Borderline partial - Sanctuary emits a complete architectural " +
       "description of its own layer but this row requires the " +
       "architecture of the AI system as a whole. Enterprise wraps the " +
       "Sanctuary layer in a broader architecture narrative.",
@@ -598,25 +598,26 @@ const ROWS: CoverageRow[] = [
       "Machine-verifiable inventory of Sanctuary's cybersecurity " +
       "primitives, every item reproducible by running the listed " +
       "tools against a live instance: (1) L1 Cognitive Sovereignty " +
-      "— AES-256-GCM namespace encryption with HKDF per-namespace " +
+      "- AES-256-GCM namespace encryption with HKDF per-namespace " +
       "key derivation, Argon2id master key derivation, Ed25519 " +
       "self-custodied identity, Merkle integrity tracking; reported " +
       "by sovereignty_audit and shr_generate under layers.l1. (2) L2 " +
-      "Operational Isolation — three-tier Principal Policy gate with " +
+      "Operational Isolation - three-tier Principal Policy gate with " +
       "out-of-band approval channel, tool-call audit logging, and " +
       "denial-on-timeout semantics; reported by principal_policy_view " +
       "and shr_generate under layers.l2. (3) L2 Outbound context " +
-      "gating — per-provider field policies classifying agent context " +
+      "gating - per-provider field policies classifying agent context " +
       "as allow / redact / hash / summarize / deny before any outbound " +
       "call; reported by context_gate_list_policies and " +
-      "context_gate_enforcer_status. (4) L3 Selective Disclosure — " +
+      "context_gate_enforcer_status. (4) L3 Selective Disclosure - " +
       "Pedersen commitments on Ristretto255, Schnorr proofs, and " +
       "bit-decomposition range proofs; reported by sovereignty_audit " +
       "and shr_generate under layers.l3. (5) L4 Verifiable Reputation " +
-      "— Ed25519-signed attestations in EAS-compatible format with " +
+      "- Ed25519-signed attestations in EAS-compatible format with " +
       "sovereignty-gated trust tiers; reported by sovereignty_audit " +
-      "and shr_generate under layers.l4. (6) Execution attestation — " +
-      "cryptographic execution attestation via exec_attest. The full " +
+      "and shr_generate under layers.l4. (6) Execution evidence - " +
+      "structured local evidence via exec_attest; TEE and remote-attestation " +
+      "proof remain separate. The full " +
       "tool inventory of this Sanctuary instance is reproducible by " +
       "running manifest.",
     manual_carveout: null,
@@ -630,7 +631,7 @@ const ROWS: CoverageRow[] = [
       "The InjectionDetector subsystem (server/src/security/" +
       "injection-detector.ts) is wired into the Principal Policy gate " +
       "and is a real runtime control, but in v0.7.0 its configuration " +
-      "state is not exposed via any MCP tool — it is only indirectly " +
+      "state is not exposed via any MCP tool - it is only indirectly " +
       "evidenced through `injection_detected:*` entries in the audit " +
       "log (visible via monitor_audit_log / audit_export_siem). " +
       "Claiming injection detection as part of this row's full " +
@@ -641,7 +642,7 @@ const ROWS: CoverageRow[] = [
       "revisit and add to this row.",
   },
 
-  // ─── §3–§9 ───────────────────────────────────────────────────────
+  // --- §3-§9 -------------------------------------------------------
 
   {
     id: "annex_iv_3_monitoring_functioning_control",
@@ -801,7 +802,7 @@ const ROWS: CoverageRow[] = [
     last_reviewed_date: REVIEW_DATE,
     last_reviewed_by: REVIEWER,
     review_notes:
-      "Structural manual row — standards conformance is a provider " +
+      "Structural manual row - standards conformance is a provider " +
       "legal declaration, not a Sanctuary primitive.",
   },
 
@@ -827,7 +828,7 @@ const ROWS: CoverageRow[] = [
     last_reviewed_date: REVIEW_DATE,
     last_reviewed_by: REVIEWER,
     review_notes:
-      "Structural manual row — legal document only.",
+      "Structural manual row - legal document only.",
   },
 
   {
@@ -860,7 +861,7 @@ const ROWS: CoverageRow[] = [
   },
 
   // ═══════════════════════════════════════════════════════════════════
-  // ARTICLE 12 — Automatic Record-Keeping (logs)
+  // ARTICLE 12 - Automatic Record-Keeping (logs)
   // ═══════════════════════════════════════════════════════════════════
 
   {
@@ -919,7 +920,8 @@ const ROWS: CoverageRow[] = [
       "un-awaited path, and those are still tracked and rethrown by " +
       "flush(). Art. 12(1) requires the system to technically *allow* " +
       "automatic recording, which remains satisfied and is now backed " +
-      "by a verifiable chain.",
+      "by a linked audit chain with the bounds carried in " +
+      "ASSURANCE_MATRIX.md.",
   },
 
   {
@@ -1037,7 +1039,7 @@ const ROWS: CoverageRow[] = [
       "identity that requested the operation.",
     manual_carveout:
       "Reference database identifier (the external database the agent " +
-      "queries) — only captured if the agent explicitly logs it to " +
+      "queries) - only captured if the agent explicitly logs it to " +
       "Sanctuary state. Natural-person verifier identification beyond " +
       "the Sanctuary principal identity (e.g., the human operator's " +
       "HR record or employee ID). Input data captured only when the " +
@@ -1097,7 +1099,7 @@ const ROWS: CoverageRow[] = [
   },
 
   // ═══════════════════════════════════════════════════════════════════
-  // ARTICLE 13 — Transparency and provision of information to deployers
+  // ARTICLE 13 - Transparency and provision of information to deployers
   // ═══════════════════════════════════════════════════════════════════
 
   {
@@ -1116,7 +1118,7 @@ const ROWS: CoverageRow[] = [
     coverage: "partial",
     evidence_emitter: ["identity_list", "identity_set_primary", "shr_generate"],
     evidence_emitted:
-      "Auto-filled: cryptographic provider identity — primary Ed25519 " +
+      "Auto-filled: cryptographic provider identity - primary Ed25519 " +
       "public key, DID, instance_id, and key creation timestamp via " +
       "identity_list and identity_set_primary. The signed SHR carries " +
       "the same identity in its signed_by field, providing a " +
@@ -1169,7 +1171,7 @@ const ROWS: CoverageRow[] = [
     last_reviewed_date: REVIEW_DATE,
     last_reviewed_by: REVIEWER,
     review_notes:
-      "Sanctuary's SHR is structurally a transparency artefact — it " +
+      "Sanctuary's SHR is structurally a transparency artefact - it " +
       "is designed to honestly declare capabilities and degradations. " +
       "This row is where SHR data feeds user-facing disclosures.",
   },
@@ -1219,7 +1221,7 @@ const ROWS: CoverageRow[] = [
   },
 
   // ═══════════════════════════════════════════════════════════════════
-  // ARTICLE 14 — Human Oversight
+  // ARTICLE 14 - Human Oversight
   // ═══════════════════════════════════════════════════════════════════
 
   {
@@ -1278,7 +1280,7 @@ const ROWS: CoverageRow[] = [
       "(stderr / dashboard / webhook), Tier 1 require-approval rule " +
       "count, denial-on-timeout behaviour, and gate decision semantics. " +
       "These collectively document Sanctuary's pre-execution " +
-      "intervention capability — every Tier 1 tool call is halted " +
+      "intervention capability - every Tier 1 tool call is halted " +
       "pending human approval.",
     manual_carveout:
       "The enterprise's declared mapping between Sanctuary's approval " +
@@ -1312,7 +1314,7 @@ const ROWS: CoverageRow[] = [
     coverage: "partial",
     evidence_emitter: ["principal_policy_view"],
     evidence_emitted:
-      "Auto-filled: Principal Policy denial semantics — every Tier 1 " +
+      "Auto-filled: Principal Policy denial semantics - every Tier 1 " +
       "operation defaults to deny on approval timeout, providing a " +
       "structural 'decide not to use' control at the policy layer. " +
       "Tier 1 tools include export, import, key rotation, and secure " +
@@ -1353,11 +1355,11 @@ const ROWS: CoverageRow[] = [
     last_reviewed_date: REVIEW_DATE,
     last_reviewed_by: REVIEWER,
     review_notes:
-      "Structural manual row — operator governance is an HR function.",
+      "Structural manual row - operator governance is an HR function.",
   },
 
   // ═══════════════════════════════════════════════════════════════════
-  // ARTICLE 15 — Accuracy, Robustness, Cybersecurity
+  // ARTICLE 15 - Accuracy, Robustness, Cybersecurity
   // ═══════════════════════════════════════════════════════════════════
 
   {
@@ -1395,7 +1397,7 @@ const ROWS: CoverageRow[] = [
     last_reviewed_by: REVIEWER,
     review_notes:
       "Downgraded from full during audit (2026-04-10). Art. 15(5) " +
-      "requires measures 'appropriate to the risks' — the " +
+      "requires measures 'appropriate to the risks' - the " +
       "appropriateness claim is a risk-matched narrative the " +
       "enterprise owns. The pure-description version survives as a " +
       "full row at Annex IV §2(h); this row is the risk-adequacy " +
@@ -1426,12 +1428,12 @@ const ROWS: CoverageRow[] = [
     evidence_emitted:
       "Resilience against unauthorised third-party alteration is " +
       "enforced across multiple subsystems, each independently " +
-      "verifiable via an MCP tool call: (1) L1 state store — " +
+      "verifiable via an MCP tool call: (1) L1 state store - " +
       "AES-256-GCM authenticated encryption with HKDF per-namespace " +
       "keys, Merkle root per namespace, monotonic version counter " +
       "per (namespace, key), and anti-rollback checks on every read; " +
       "reported by monitor_health (state_integrity flag) and via " +
-      "version numbers returned by state_list. (2) L1 audit log — " +
+      "version numbers returned by state_list. (2) L1 audit log - " +
       "AES-256-GCM authenticated ciphertext persisted under an " +
       "HKDF-derived audit-log key, linked into a tamper-evident hash " +
       "chain (per-entry sequence plus prev_hash plus entry_hash), with " +
@@ -1441,14 +1443,14 @@ const ROWS: CoverageRow[] = [
       "MAC makes a truncation or prune of the tail detectable. Reported " +
       "by monitor_health and the audit-chain verifier; integrity " +
       "findings surface as a P1 anomaly. (See review_notes for the " +
-      "exact non-repudiation bound.) (3) L1 identity — Ed25519 " +
+      "exact non-repudiation bound.) (3) L1 identity - Ed25519 " +
       "self-custodied keypairs; signed identity operations (sign, " +
       "rotate, verify) and signed SHR generation; reported by " +
-      "shr_generate signature block. (4) L2 execution gate — every " +
+      "shr_generate signature block. (4) L2 execution gate - every " +
       "tool call routed through router.ts -> ApprovalGate.evaluate() " +
       "-> Principal Policy tier check before execution; no bypass " +
       "path; reported by principal_policy_view and the audit log " +
-      "trail of gate_* entries. (5) L2 outbound context gating — " +
+      "trail of gate_* entries. (5) L2 outbound context gating - " +
       "per-provider field policies applied before any outbound call; " +
       "reported by context_gate_enforcer_status.",
     manual_carveout: null,
@@ -1509,7 +1511,7 @@ const ROWS: CoverageRow[] = [
       "stuffing signals at runtime.",
     manual_carveout:
       "Training-time threats (data poisoning, model poisoning) are " +
-      "entirely outside Sanctuary's runtime scope — training data " +
+      "entirely outside Sanctuary's runtime scope - training data " +
       "governance is the model provider's responsibility. The " +
       "runtime adversarial-input detection is partial coverage of " +
       "the 'adversarial examples' subset of Art. 15(5).",
@@ -1576,7 +1578,7 @@ const ROWS: CoverageRow[] = [
   },
 
   // ═══════════════════════════════════════════════════════════════════
-  // ARTICLE 26 — Deployer Obligations
+  // ARTICLE 26 - Deployer Obligations
   // ═══════════════════════════════════════════════════════════════════
 
   {
@@ -1685,7 +1687,7 @@ const ROWS: CoverageRow[] = [
       "principal_baseline_view",
     ],
     evidence_emitted:
-      "Auto-filled: the runtime monitoring substrate — encrypted " +
+      "Auto-filled: the runtime monitoring substrate - encrypted " +
       "audit log queryable and exportable in SIEM-standard formats, " +
       "health dashboard, and anomaly baseline tracker. Provides the " +
       "technical means to monitor and detect risk situations.",

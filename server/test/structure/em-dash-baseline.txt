@@ -89,7 +89,6 @@
 3	server/src/agent-contract/errors.ts
 1	server/src/agent-contract/lifecycle.ts
 3	server/src/agent-contract/schema.ts
-12	server/src/audit/analyzer.ts
 1	server/src/audit/tools.ts
 1	server/src/bridge/tools.ts
 1	server/src/broker-mcp/broker-server.ts
@@ -103,7 +102,6 @@
 3	server/src/cognitive/memory-attest.ts
 13	server/src/compliance/eu_ai_act/annex_iii.ts
 3	server/src/compliance/eu_ai_act/cli.ts
-28	server/src/compliance/eu_ai_act/coverage_matrix.ts
 9	server/src/compliance/eu_ai_act/generator.ts
 1	server/src/compliance/eu_ai_act/pdf.ts
 9	server/src/compliance/eu_ai_act/templates/01_annex_iv_technical_documentation.ts
@@ -154,7 +152,6 @@
 3	server/src/sanctuary-tools.ts
 1	server/src/shr/decommission-verifier.ts
 12	server/src/shr/gateway-adapter.ts
-1	server/src/shr/generator.ts
 3	server/src/shr/verifier.ts
 2	server/src/substrate/verdict.ts
 8	server/src/system-prompt-generator.ts

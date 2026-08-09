@@ -1,5 +1,5 @@
 /**
- * Sanctuary MCP Server — Sovereignty Gap Analyzer
+ * Sanctuary MCP Server - Sovereignty Gap Analyzer
  *
  * Analyzes an environment fingerprint against Sanctuary's four-layer sovereignty
  * model and produces a scored gap analysis with prioritized recommendations.
@@ -102,7 +102,7 @@ const INCIDENT_CONTEXT_LEAKAGE: IncidentClass = {
   name: "Context leakage: Full state exposure to inference providers",
   date: "2026-03",
   description:
-    "Agents send full context — conversation history, memory, secrets, internal reasoning — " +
+    "Agents send full context - conversation history, memory, secrets, internal reasoning - " +
     "to remote LLM providers on every inference call with no filtering mechanism.",
 };
 
@@ -131,7 +131,7 @@ const INCIDENT_CLAUDE_CODE_LEAK: IncidentClass = {
   date: "2026-03-31",
   description:
     "Anthropic accidentally shipped a 59.8 MB source map in npm package v2.1.88, exposing " +
-    "the full Claude Code TypeScript source — 1,900 files, internal model codenames, " +
+    "the full Claude Code TypeScript source - 1,900 files, internal model codenames, " +
     "unreleased features, OAuth flows, and multi-agent coordination logic.",
 };
 
@@ -179,7 +179,7 @@ export function analyzeSovereignty(
 
   // Honesty (audit seam #5, level layer): the top "full" level is reserved for a
   // posture where nothing optional is left off. The numeric score qualifying
-  // (>= 80) is necessary but NOT sufficient — the optional sovereignty layers
+  // (>= 80) is necessary but NOT sufficient - the optional sovereignty layers
   // that would otherwise be open gaps (context-gating, ZK proofs) must actually
   // be enabled. Otherwise a default install (context-gating + ZK default OFF)
   // scores 89 and would have read "full" at the one-word headline verdict,
@@ -377,8 +377,8 @@ function assessDisclosure(
     // ZK proofs were operating when the feature was disabled.
     zkProofs = runtime?.zkProofsEnabled === true;
     if (zkProofs) {
-      findings.push("Schnorr zero-knowledge proofs (Fiat-Shamir) ENABLED (live profile) — genuine ZK proofs");
-      findings.push("Range proofs (bit-decomposition + OR-proofs) enabled — genuine ZK proofs");
+      findings.push("Schnorr zero-knowledge proofs (Fiat-Shamir) ENABLED (live profile) - genuine ZK proofs");
+      findings.push("Range proofs (bit-decomposition + OR-proofs) enabled - genuine ZK proofs");
       findings.push("Non-interactive proofs with replay-resistant domain separation");
     } else {
       findings.push(
@@ -586,7 +586,7 @@ function generateGaps(
       description:
         "Your agent's memory (MEMORY.md, daily notes, SQLite index) is stored in plaintext " +
         "at ~/.openclaw/workspace/. Any process with file access can read your agent's full " +
-        "context — preferences, decisions, conversation history.",
+        "context - preferences, decisions, conversation history.",
       openclaw_relevance:
         "Stock OpenClaw stores all agent memory in plaintext files. " +
         "There is no built-in encryption for agent state.",
@@ -649,7 +649,7 @@ function generateGaps(
         ? "OpenClaw's requireApproval hook provides binary approve/deny gating. " +
           "Sanctuary's three-tier Principal Policy adds behavioral anomaly detection " +
           "(auto-escalation when agent behavior deviates from baseline), encrypted audit " +
-          "trails, and graduated approval tiers — so routine operations auto-proceed while " +
+          "trails, and graduated approval tiers - so routine operations auto-proceed while " +
           "sensitive operations require explicit consent."
         : null,
       sanctuary_solution:
@@ -682,17 +682,17 @@ function generateGaps(
       id: "GAP-L2-002",
       layer: "L2",
       severity: "medium",
-      title: "Basic tool sandboxing (no cryptographic attestation)",
+      title: "Basic tool sandboxing (no execution evidence)",
       description:
-        "Your tool sandbox enforces allow/deny lists but provides no cryptographic " +
-        "attestation of execution context.",
+        "Your tool sandbox enforces allow/deny lists but provides no structured " +
+        "evidence report for execution context.",
       openclaw_relevance: env.openclaw_detected
         ? "OpenClaw's sandbox tool policy (tools.sandbox.tools) enforces allow/deny lists. " +
-          "Sanctuary adds cryptographic attestation of execution context — a verifiable proof " +
-          "that an operation ran within policy, not just that a policy was configured."
+          "Sanctuary adds structured local execution evidence plus policy audit trails " +
+          "that show what ran within configured controls."
         : null,
       sanctuary_solution:
-        "Sanctuary provides cryptographic execution attestation via sanctuary/exec_attest " +
+        "Sanctuary provides structured local execution evidence via sanctuary/exec_attest " +
         "and policy-enforced sandboxing with encrypted audit trails.",
       incident_class: INCIDENT_OPENCLAW_SANDBOX,
     });
@@ -705,8 +705,8 @@ function generateGaps(
       severity: "high",
       title: "No context gating for outbound inference calls",
       description:
-        "Your agent sends its full context — conversation history, memory, preferences, " +
-        "internal reasoning — to remote LLM providers on every inference call. There is " +
+        "Your agent sends its full context - conversation history, memory, preferences, " +
+        "internal reasoning - to remote LLM providers on every inference call. There is " +
         "no mechanism to filter what leaves the sovereignty boundary. The provider sees " +
         "everything the agent knows.",
       openclaw_relevance: env.openclaw_detected
@@ -753,7 +753,7 @@ function generateGaps(
         "zero-knowledge proofs, no selective disclosure policies.",
       openclaw_relevance: env.openclaw_detected
         ? "OpenClaw has no selective disclosure mechanism. When your agent shares information, " +
-          "it shares everything or nothing — there is no way to prove a claim without " +
+          "it shares everything or nothing - there is no way to prove a claim without " +
           "revealing the underlying data."
         : null,
       sanctuary_solution:
@@ -817,7 +817,7 @@ function generateRecommendations(
   if (!cognitive.identity_cryptographic) {
     recs.push({
       priority: 1,
-      action: "Create a cryptographic identity — your agent's foundation for all sovereignty operations",
+      action: "Create a cryptographic identity - your agent's foundation for all sovereignty operations",
       tool: "identity_create",
       effort: "immediate",
       impact: "critical",

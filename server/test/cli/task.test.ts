@@ -246,7 +246,7 @@ describe("sanctuary task CLI", () => {
 
     expect(listed.code).toBe(0);
     expect(listed.out.text).toContain(
-      "Fortress is LOCKED (since 2026-05-19T12:00:00.000Z). Reads permitted; writes blocked.",
+      "Fortress lockdown status is ACTIVE (since 2026-05-19T12:00:00.000Z). CLI status only; writes are not blocked by this flag.",
     );
     expect(listed.out.text).toContain("task-1");
   });

@@ -7,8 +7,9 @@ references are inline.
 
 Trust bounds for this capability are row 18 ("Egress enforcement: macOS") of
 [../../ASSURANCE_MATRIX.md](../../ASSURANCE_MATRIX.md). Do not claim beyond that
-row. In particular this is per-uid allow/deny enforcement that survives reboot on
-a signed+notarized binary; it is NOT tamper-evident per-flow audit, and the
+row. In particular this is per-uid allow/deny enforcement that survives attended
+reboot cycles on a signed+notarized binary; it is NOT tamper-evident per-flow
+audit, and the
 headless CLI arm path has a known Tahoe wedge (W7-1) noted below.
 
 ---
