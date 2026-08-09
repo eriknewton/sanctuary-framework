@@ -1,5 +1,5 @@
 /**
- * Sanctuary MCP Server — SHR Generator
+ * Sanctuary MCP Server - SHR Generator
  *
  * Generates a Sovereignty Health Report from current server state,
  * signs it with a specified identity, and returns the complete signed SHR.
@@ -96,7 +96,7 @@ export interface SHRGeneratorOptions {
  *
  * Emitter rules:
  *   - Empty store → NO_REPUTATION_HISTORY (warning). Other per-attestation
- *     signals (staleness, disputes, tier dominance) are skipped — they have
+ *     signals (staleness, disputes, tier dominance) are skipped - they have
  *     no meaning when count == 0.
  *   - NO_VERASCORE_LINK fires independently of history: an agent with
  *     rich internal reputation but no external publish is still worth
@@ -125,7 +125,7 @@ export function deriveReputationDegradations(
         "Complete interactions that produce reputation_record calls, or import a portable reputation bundle",
     });
   } else {
-    // LOW_TIER_DOMINANCE — most evidence comes from weakly-verified signers
+    // LOW_TIER_DOMINANCE - most evidence comes from weakly-verified signers
     const lowTierCount =
       (evidence.tier_distribution["self-attested"] ?? 0) +
       (evidence.tier_distribution["unverified"] ?? 0);
@@ -142,7 +142,7 @@ export function deriveReputationDegradations(
       });
     }
 
-    // STALE_REPUTATION — no new attestation inside the freshness window
+    // STALE_REPUTATION - no new attestation inside the freshness window
     if (evidence.most_recent_attestation_at) {
       const mostRecentMs = new Date(evidence.most_recent_attestation_at).getTime();
       if (!isNaN(mostRecentMs)) {
@@ -162,7 +162,7 @@ export function deriveReputationDegradations(
       }
     }
 
-    // DISPUTE_ON_RECORD — at least one attestation flagged as disputed
+    // DISPUTE_ON_RECORD - at least one attestation flagged as disputed
     if (evidence.dispute_count > 0) {
       out.push({
         layer: "l4",
@@ -175,14 +175,14 @@ export function deriveReputationDegradations(
     }
   }
 
-  // NO_VERASCORE_LINK — independent of attestation history
+  // NO_VERASCORE_LINK - independent of attestation history
   if (!evidence.verascore_linked) {
     out.push({
       layer: "l4",
       code: "NO_VERASCORE_LINK",
       severity: "info",
       description:
-        "No successful reputation_publish call for this identity — reputation is not externally discoverable",
+        "No successful reputation_publish call for this identity - reputation is not externally discoverable",
       mitigation:
         "Run reputation_publish to link this identity to a Verascore profile",
     });
@@ -244,9 +244,9 @@ export function generateSHR(
 
   // Note: L3 is NOT degraded. Sanctuary's Schnorr proofs + Pedersen commitments +
   // range proofs are genuine zero-knowledge proofs. The "commitment-only" label was
-  // a categorization error — these ARE ZK proofs with selective disclosure capability.
+  // a categorization error - these ARE ZK proofs with selective disclosure capability.
 
-  // L4 degradations — emitted when reputation evidence is supplied.
+  // L4 degradations - emitted when reputation evidence is supplied.
   // Without evidence the generator leaves L4 at "active" (backward-compatible
   // with older call sites; fresh code paths always provide evidence).
   const l4Degradations = l4Evidence
@@ -305,11 +305,11 @@ export function generateSHR(
     degradations,
   };
 
-  // Carry the key-rotation chain so a rotated identity's SHR can still bind
-  // its current signing key back to the stable instance_id. The stored
-  // rotation_event blob is the canonical signed RotationEvent JSON; decode it
-  // into the structured proof the verifier walks. Only attach when the
-  // identity has actually rotated, so never-rotated SHRs are unchanged.
+  // Copy stored key-rotation events into the SHR so shr_verify can check the
+  // current signing key back to the stable instance_id. This generator decodes
+  // stored rotation_event blobs; it does not treat rotation_history as verified
+  // before signing the report. Only attach when the identity has actually
+  // rotated, so never-rotated SHRs are unchanged.
   if (identity.rotation_history.length > 0) {
     body.key_rotation_proof = identity.rotation_history.map(
       (h) =>
