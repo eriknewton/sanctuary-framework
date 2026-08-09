@@ -1,3 +1,4 @@
+// fail-before-exempt: supporting regression file changed by inherited fixture wiring; key-resolution fail-before coverage lives in state-envelope-integrity.test.ts and master-rotation.test.ts
 /**
  * Castle Wall Observe -- refresh chokepoint regression tests (sweep finding
  * R3-1, 2026-07-14: the pre-watermark engine re-folded the full retained

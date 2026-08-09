@@ -319,17 +319,17 @@ test/federation/subscriber-pre-handshake-gating.test.ts(115,7): error TS2322: Ty
 test/federation/subscriber-pre-handshake-gating.test.ts(91,7): error TS2322: Type 'string' is not assignable to type 'number'.
 test/file-grant/fixtures.ts(190,11): error TS2322: Type 'string | undefined' is not assignable to type 'string'.
 test/file-grant/fixtures.ts(191,11): error TS2322: Type 'string | undefined' is not assignable to type 'string'.
-test/file-grant/revoke-idempotent-audited.test.ts(248,12): error TS2532: Object is possibly 'undefined'.
 test/file-grant/revoke-idempotent-audited.test.ts(249,12): error TS2532: Object is possibly 'undefined'.
-test/file-grant/revoke-idempotent-audited.test.ts(429,12): error TS2532: Object is possibly 'undefined'.
+test/file-grant/revoke-idempotent-audited.test.ts(250,12): error TS2532: Object is possibly 'undefined'.
 test/file-grant/revoke-idempotent-audited.test.ts(430,12): error TS2532: Object is possibly 'undefined'.
-test/file-grant/revoke-idempotent-audited.test.ts(471,12): error TS2532: Object is possibly 'undefined'.
+test/file-grant/revoke-idempotent-audited.test.ts(431,12): error TS2532: Object is possibly 'undefined'.
 test/file-grant/revoke-idempotent-audited.test.ts(472,12): error TS2532: Object is possibly 'undefined'.
-test/file-grant/revoke-idempotent-audited.test.ts(513,14): error TS2532: Object is possibly 'undefined'.
+test/file-grant/revoke-idempotent-audited.test.ts(473,12): error TS2532: Object is possibly 'undefined'.
 test/file-grant/revoke-idempotent-audited.test.ts(514,14): error TS2532: Object is possibly 'undefined'.
 test/file-grant/revoke-idempotent-audited.test.ts(515,14): error TS2532: Object is possibly 'undefined'.
-test/file-grant/revoke-idempotent-audited.test.ts(573,14): error TS2532: Object is possibly 'undefined'.
+test/file-grant/revoke-idempotent-audited.test.ts(516,14): error TS2532: Object is possibly 'undefined'.
 test/file-grant/revoke-idempotent-audited.test.ts(574,14): error TS2532: Object is possibly 'undefined'.
+test/file-grant/revoke-idempotent-audited.test.ts(575,14): error TS2532: Object is possibly 'undefined'.
 test/handshake/verify-completion-protocol-version.test.ts(21,11): error TS2741: Property 'expires_at' is missing in type '{ session_id: string; role: "responder"; state: "responded"; our_nonce: string; initiated_at: string; our_shr: any; }' but required in type 'HandshakeSession'.
 test/harness/harness-compatibility.test.ts(427,22): error TS2352: Conversion of type '{ url: string; port: number; host: string; mode: string; stop: () => Promise<void>; createSessionUrl: () => string; }' to type 'DashboardHandle' may be a mistake because neither type sufficiently overlaps with the other. If this was intentional, convert the expression to 'unknown' first.
 test/honeypot/honeypot.test.ts(131,32): error TS2339: Property 'path_pattern' does not exist on type 'TrapTrigger'.

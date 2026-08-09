@@ -1,3 +1,4 @@
+// fail-before-exempt: authenticated StateStore fixture wiring only; key-resolution fail-before coverage lives in state-envelope-integrity.test.ts and master-rotation.test.ts
 import { describe, expect, it } from "vitest";
 
 import { derivePurposeKey } from "../../src/core/key-derivation.js";

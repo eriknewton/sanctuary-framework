@@ -1,3 +1,4 @@
+// fail-before-exempt: inherited supporting file-grant coverage still passes against pre-fix source; key-resolution fail-before coverage lives in state-envelope-integrity.test.ts and master-rotation.test.ts
 /**
  * Governed File-Grant v1 -- inspect / export / delete round-trip (DoD gate 3,
  * AGENTS.md Invariant #2).

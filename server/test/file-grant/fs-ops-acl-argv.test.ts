@@ -1,3 +1,4 @@
+// fail-before-exempt: inherited supporting file-grant coverage still passes against pre-fix source; key-resolution fail-before coverage lives in state-envelope-integrity.test.ts and master-rotation.test.ts
 /**
  * Command construction tests for the file-grant ACL primitive.
  *
