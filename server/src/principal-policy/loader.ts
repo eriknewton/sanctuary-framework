@@ -811,18 +811,35 @@ function validatePolicy(raw: Record<string, unknown>): PrincipalPolicy {
       ...((raw.tier2_anomaly as Record<string, unknown>) ?? {}),
     } as Tier2Config,
     tier3_always_allow: mergedTier3Pre,
-    approval_channel: (() => {
-      const merged = {
-        ...DEFAULT_CHANNEL,
-        ...((raw.approval_channel as Record<string, unknown>) ?? {}),
-      } as ApprovalChannelConfig;
-      // SEC-002: Strip auto_deny from user-supplied policy.
-      // Timeout always denies - this is not configurable.
-      delete merged.auto_deny;
-      return merged;
-    })(),
+    approval_channel: parseApprovalChannel(raw.approval_channel),
     approval_redirect: parseApprovalRedirect(raw.approval_redirect),
   });
+}
+
+/**
+ * Parse + validate the approval channel block. A malformed channel type is a
+ * startup-blocking policy error because silently substituting another channel
+ * would misstate the operator's human-oversight path.
+ */
+function parseApprovalChannel(raw: unknown): ApprovalChannelConfig {
+  const merged = {
+    ...DEFAULT_CHANNEL,
+    ...((raw as Record<string, unknown>) ?? {}),
+  } as ApprovalChannelConfig;
+  if (
+    merged.type !== "stderr" &&
+    merged.type !== "webhook" &&
+    merged.type !== "callback" &&
+    merged.type !== "dashboard"
+  ) {
+    throw new Error(
+      `approval_channel.type must be "stderr", "webhook", "callback", or "dashboard" (got ${JSON.stringify(merged.type)})`,
+    );
+  }
+  // SEC-002: Strip auto_deny from user-supplied policy.
+  // Timeout always denies - this is not configurable.
+  delete merged.auto_deny;
+  return merged;
 }
 
 /**

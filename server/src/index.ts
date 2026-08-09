@@ -21,11 +21,15 @@ import { createDisclosureTools } from "./disclosure/tools.js";
 import { createReputationTools } from "./reputation/tools.js";
 import { loadPrincipalPolicy, MalformedPrincipalPolicyError } from "./principal-policy/loader.js";
 import type { IdentityManager } from "./cognitive/tools.js";
-import type { PrincipalPolicy } from "./principal-policy/types.js";
+import type {
+  ApprovalRequest,
+  ApprovalResponse,
+  PrincipalPolicy,
+} from "./principal-policy/types.js";
 import { BaselineTracker } from "./principal-policy/baseline.js";
-import { StderrApprovalChannel } from "./principal-policy/approval-channel.js";
+import type { ApprovalChannel } from "./principal-policy/approval-channel.js";
 import { DashboardApprovalChannel } from "./principal-policy/dashboard.js";
-import { WebhookApprovalChannel } from "./principal-policy/webhook.js";
+import { selectApprovalChannelByPolicy } from "./principal-policy/channel-selection.js";
 import { ApprovalGate } from "./principal-policy/gate.js";
 import {
   ApprovalAggregator,
@@ -176,6 +180,12 @@ export async function createSanctuaryServer(options?: {
   configPath?: string;
   passphrase?: string;
   storage?: StorageBackend;
+  /**
+   * Embedding-only implementation for approval_channel.type: callback. The MCP
+   * stdio server has no native callback transport, so callback policy selection
+   * without this hook is a startup error.
+   */
+  approvalCallback?: (request: ApprovalRequest) => Promise<ApprovalResponse>;
 }): Promise<SanctuaryServer> {
   // 1. Load configuration
   const config = await loadConfig(options?.configPath);
@@ -900,8 +910,7 @@ export async function createSanctuaryServer(options?: {
   const baseline = new BaselineTracker(storage, masterKey);
   await baseline.load();
 
-  // Choose approval channel: dashboard (web UI), webhook (external), or stderr (auto-deny)
-  let approvalChannel: StderrApprovalChannel | DashboardApprovalChannel | WebhookApprovalChannel;
+  let approvalChannel: ApprovalChannel;
   let dashboard: DashboardApprovalChannel | undefined;
 
   // WP-V1.3-5 Pi-2: the Intelligence Substrate Selector is hoisted to
@@ -920,24 +929,16 @@ export async function createSanctuaryServer(options?: {
   // construct (the route then honestly reports inactive).
   let tierBPiiRedactorInstalled = false;
 
-  if (config.dashboard.enabled) {
-    // Resolve auth token: "auto" generates a random 32-byte hex token
-    let authToken = config.dashboard.auth_token;
-    if (authToken === "auto") {
-      const { randomBytes: rb } = await import("node:crypto");
-      authToken = rb(32).toString("hex");
-    }
-
-    dashboard = new DashboardApprovalChannel({
-      port: config.dashboard.port,
-      host: config.dashboard.host,
-      timeout_seconds: policy.approval_channel.timeout_seconds,
-      // SEC-002: auto_deny removed — timeout always denies
-      auth_token: authToken,
-      tls: config.dashboard.tls,
-      auto_open: config.dashboard.auto_open,
-      allow_plaintext_remote: config.dashboard.allow_plaintext_remote,
-    });
+  const selectedApprovalChannel = selectApprovalChannelByPolicy({
+    config,
+    policy,
+    ...(options?.approvalCallback
+      ? { approvalCallback: options.approvalCallback }
+      : {}),
+  });
+  switch (selectedApprovalChannel.type) {
+  case "dashboard": {
+    dashboard = selectedApprovalChannel.channel;
     dashboard.setDependencies({
       policy,
       baseline,
@@ -1037,21 +1038,20 @@ export async function createSanctuaryServer(options?: {
     if (dashboardHostIsLoopback && loadResult.loaded > 0) {
       dashboard.setAutoAuthLocalhost(true);
     }
-    await dashboard.start();
+    await selectedApprovalChannel.start();
     approvalChannel = dashboard;
-  } else if (config.webhook.enabled && config.webhook.url && config.webhook.secret) {
-    const webhook = new WebhookApprovalChannel({
-      webhook_url: config.webhook.url,
-      webhook_secret: config.webhook.secret,
-      callback_port: config.webhook.callback_port,
-      callback_host: config.webhook.callback_host,
-      timeout_seconds: policy.approval_channel.timeout_seconds,
-      // SEC-002: auto_deny removed — timeout always denies
-    });
-    await webhook.start();
-    approvalChannel = webhook;
-  } else {
-    approvalChannel = new StderrApprovalChannel(policy.approval_channel);
+    break;
+  }
+  case "webhook":
+    await selectedApprovalChannel.start();
+    approvalChannel = selectedApprovalChannel.channel;
+    break;
+  case "callback":
+    approvalChannel = selectedApprovalChannel.channel;
+    break;
+  case "stderr":
+    approvalChannel = selectedApprovalChannel.channel;
+    break;
   }
 
   // 15b. Create injection detector
