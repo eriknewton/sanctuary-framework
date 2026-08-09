@@ -166,6 +166,20 @@ export { resolvePolicyDaemonAction } from "./policy-daemon.js";
 export type { PolicyDaemonState, PolicyDaemonAction } from "./policy-daemon.js";
 
 export {
+  AGENT_STOP_REASON_CODES,
+  AgentEgressStopError,
+  stopAgentEgress,
+  liftAgentEgressStop,
+} from "./agent-stop.js";
+export type {
+  AgentStopReasonCode,
+  StopAgentEgressInput,
+  StopAgentEgressObservation,
+  LiftAgentEgressStopInput,
+  LiftAgentEgressStopObservation,
+} from "./agent-stop.js";
+
+export {
   HERMES_ENDPOINT_SET,
   EGRESS_PROVISIONED_AUDIT_OP,
   EGRESS_PROVISION_REFUSED_AUDIT_OP,
@@ -204,6 +218,7 @@ export type {
   ProvisionedEgressRuleFile,
   RestoreProvisionedEgressInput,
   RestoreProvisionedEgressResult,
+  EgressRuleFileSelector,
   AgentEgressProbeSpec,
   AgentEgressProbeRow,
   AgentEgressVerifyReport,

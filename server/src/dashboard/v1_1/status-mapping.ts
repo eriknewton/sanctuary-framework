@@ -97,13 +97,15 @@ export const STATUS_REASON_LABELS: Record<
 /**
  * Two-step Tier 1 control state. Mirrors the addendum section 3 lifecycle.
  * `idle` is the resting state, `pending` is post-202 awaiting inbox
- * approval, `engaged` is post-controller-call landed.
+ * approval, `partial` means persisted revocation landed but one live effect
+ * was unconfirmed, and `engaged` is post-controller-call landed.
  */
-export type Tier1ButtonState = "idle" | "pending" | "engaged";
+export type Tier1ButtonState = "idle" | "pending" | "partial" | "engaged";
 
 export interface Tier1ButtonCopy {
   idle: string;
   pending: string;
+  partial?: string;
   engaged: string;
   cancelled: string;
 }
@@ -116,6 +118,7 @@ export const TIER1_BUTTON_COPY: Record<string, Tier1ButtonCopy> = {
   lockdown: {
     idle: "Lockdown",
     pending: "Awaiting approval",
+    partial: "Lockdown partial",
     engaged: "Lockdown ON",
     cancelled: "Lockdown not engaged",
   },

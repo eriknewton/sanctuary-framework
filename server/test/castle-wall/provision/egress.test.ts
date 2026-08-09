@@ -307,6 +307,31 @@ describe("castle-wall/provision/egress: publish + scrub (hermetic tmp fortress)"
     expect(result.reloadOk).toBe(false);
   });
 
+  it("scrub fails when the verified read-back still sees a selected survivor", async () => {
+    const fortress = await makeFortress();
+    const dir = egressRulesDir(fortress);
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, "provisioned-hermes-aaaaaaaaaaaa.json"), "{}");
+    await writeFile(join(dir, "provisioned-hermes-bbbbbbbbbbbb.json"), "{}");
+    const seen = new Map<string, number>();
+    const select = (filename: string): boolean => {
+      const count = (seen.get(filename) ?? 0) + 1;
+      seen.set(filename, count);
+      if (filename === "provisioned-hermes-bbbbbbbbbbbb.json") {
+        return count > 1;
+      }
+      return filename.startsWith("provisioned-hermes-");
+    };
+
+    await expect(
+      scrubProvisionedEgressRules({
+        fortressPath: fortress,
+        harnessId: "hermes",
+        select,
+      }),
+    ).rejects.toThrow(/left 1 provisioned rule file/);
+  });
+
   /**
    * FIX F-REVOKE (HIGH, Mini1 confined-Hermes drill 2026-07-26). On hardware a
    * refused SECOND arm reported "the re-homed paths were restored" and "no

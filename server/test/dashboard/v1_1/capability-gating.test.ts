@@ -27,9 +27,11 @@ describe("v1.1 dashboard capability gating", () => {
     expect(src).toMatch(/mi\.enabled \? '' : ' disabled'/);
   });
 
-  it("disabled menu items emit tooltip explaining the harness limitation", () => {
+  it("disabled menu items emit tooltip explaining the process limitation", () => {
     const src = getClientScript();
-    expect(src).toContain("does not support");
+    expect(src).toContain("does not control this agent's process");
+    expect(src).toContain("not confined to a dedicated uid");
+    expect(src).not.toContain("This harness does not support");
   });
 
   it("Tier 1 menu items carry an inbox-approval tooltip", () => {
@@ -40,6 +42,6 @@ describe("v1.1 dashboard capability gating", () => {
   it("422 response on agent control surfaces operator-visible message", () => {
     const src = getClientScript();
     expect(src).toMatch(/status === 422/);
-    expect(src).toContain("This harness does not support");
+    expect(src).toContain("Sanctuary cannot apply");
   });
 });

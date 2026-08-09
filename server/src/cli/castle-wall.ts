@@ -62,8 +62,7 @@ import {
   safeModeAuditStoragePath,
 } from "../castle-wall/boot/boot-token.js";
 import { validateAgentOrigin } from "../castle-wall/allowlist/agent-origin.js";
-import { validateRule, type AllowlistRule } from "../castle-wall/allowlist/schema.js";
-import { HABEAS_RULE_ID_PREFIX } from "../castle-wall/allowlist/habeas-port.js";
+import { listAgentMatchableAllowRuleFiles } from "../castle-wall/allowlist/agent-matchable.js";
 import {
   AGENT_EGRESS_NEGATIVE_CONTROL_HOST,
   EGRESS_PROVISION_REFUSED_AUDIT_OP,
@@ -101,15 +100,19 @@ import {
 import {
   CASTLE_WALL_AUDIT_PROVENANCE_KEY,
   CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
-  CASTLE_WALL_RELOAD_CLIENT_TIMEOUT_MS,
 } from "../castle-wall/constants.js";
 import type {
   CastleWallMessage,
   DecisionResponse,
-  PolicyReloadResponse,
 } from "../castle-wall/ipc/messages.js";
+import {
+  requestPolicyReload,
+  type PolicyReloadResult,
+} from "../castle-wall/runtime/policy-reload-client.js";
 import { observing, type Observed } from "../claim-witness.js";
 import { ED25519_PUBLIC_KEY_BYTES } from "../core/crypto-suite-registry.js";
+
+export { requestPolicyReload, type PolicyReloadResult };
 
 const CASTLE_PINNED_PUBKEY = "castle-pinned-pubkey.bin";
 const CASTLE_PINNED_PRIVKEY = "castle-pinned-privkey.enc";
@@ -2519,63 +2522,6 @@ export async function runSetupSharedDir(
   return 0;
 }
 
-/** Result of {@link requestPolicyReload}. */
-export interface PolicyReloadResult {
-  ok: boolean;
-  loadedRuleCount?: number;
-  error?: string;
-  /** True when the failure was an unreachable daemon socket (no daemon running). */
-  socketUnavailable?: boolean;
-}
-
-/**
- * Ask the running Castle Wall policy daemon for this fortress to re-read,
- * re-compose, re-sign, and broadcast its manifest. FAIL-CLOSED result shape:
- * an unreachable socket is `ok: false` (with `socketUnavailable: true`),
- * never a silent success -- callers that REQUIRE a confirmed reload (the
- * confined-agent egress provisioning step) must treat anything but
- * `ok: true` as a refusal. The lenient "no daemon running" UX belongs to
- * `runReload`'s CLI rendering, not to this primitive.
- */
-export async function requestPolicyReload(
-  fortressPath: string,
-  platform: NodeJS.Platform = process.platform,
-): Promise<PolicyReloadResult> {
-  const socketPath = resolveCastleWallSocketPath({ platform, fortressPath }).path;
-  try {
-    // The daemon recomposes + re-signs from `policy/egress/rules/`, so no
-    // `manifest_path` is sent (it was a fabricated, non-existent path the daemon
-    // ignored). A reload re-signs through the root helper, which is far slower
-    // than a status query (especially the first cold reload on a freshly-booted
-    // box), so it gets a dedicated, longer client deadline that comfortably
-    // exceeds the daemon's own internal reload budget. Without it the generic 5s
-    // socket deadline fired BEFORE a healthy daemon finished signing and the
-    // reload was reported as a spurious timeout (Mini1 egress drill 2026-07-12).
-    const reply = await sendCastleWallMessage<PolicyReloadResponse>(
-      socketPath,
-      {
-        type: "policy_reload_request",
-        request_id: nodeRandomBytes(16).toString("hex"),
-      },
-      "policy_reload_response",
-      CASTLE_WALL_RELOAD_CLIENT_TIMEOUT_MS,
-    );
-    if (!reply.ok) {
-      return { ok: false, error: reply.error ?? "policy reload failed" };
-    }
-    return { ok: true, loadedRuleCount: reply.loaded_rule_count };
-  } catch (error) {
-    if (isSocketUnavailable(error)) {
-      return {
-        ok: false,
-        socketUnavailable: true,
-        error: `no Castle Wall daemon reachable at ${socketPath}`,
-      };
-    }
-    return { ok: false, error: error instanceof Error ? error.message : String(error) };
-  }
-}
-
 export async function runReload(
   argv: string[] = [],
   ctx: CastleWallCommandContext = {}
@@ -3466,19 +3412,7 @@ export async function countAgentMatchableAllowRules(fortressPath: string): Promi
   } catch {
     return 0;
   }
-  let count = 0;
-  for (const filename of filenames) {
-    try {
-      const parsed = JSON.parse(await readFile(join(rulesDir, filename), "utf8")) as AllowlistRule;
-      if (validateRule(parsed).length > 0) continue;
-      if (parsed.disposition !== "allow") continue;
-      if (parsed.id.startsWith(HABEAS_RULE_ID_PREFIX)) continue;
-      count += 1;
-    } catch {
-      continue;
-    }
-  }
-  return count;
+  return (await listAgentMatchableAllowRuleFiles(rulesDir, filenames)).length;
 }
 
 /**
@@ -5226,13 +5160,4 @@ async function sendCastleWallMessage<T extends CastleWallMessage>(
     });
     socket.on("error", finish);
   });
-}
-
-function isSocketUnavailable(error: unknown): boolean {
-  return (
-    error instanceof Error &&
-    "code" in error &&
-    ((error as NodeJS.ErrnoException).code === "ENOENT" ||
-      (error as NodeJS.ErrnoException).code === "ECONNREFUSED")
-  );
 }

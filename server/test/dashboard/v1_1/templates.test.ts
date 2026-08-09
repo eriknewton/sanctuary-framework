@@ -21,7 +21,7 @@ describe("v1.1 dashboard template registry", () => {
       [{ kind: "agent_id", value: "agent-alpha" }],
     );
     expect(out).toContain("agent-alpha");
-    expect(out.toLowerCase()).toContain("lock down");
+    expect(out.toLowerCase()).toContain("network access");
   });
 
   it("returns a diagnostic fallback for an unknown template id (no throw)", () => {
@@ -102,6 +102,26 @@ describe("v1.1 dashboard template registry", () => {
     for (const c of cats) expect(ids).toContain(`activity.${c}`);
   });
 
+  it("registers entries for every lockdown activity operation this build emits", () => {
+    const ops = [
+      "agent_lockdown_engaged",
+      "agent_lockdown_partial",
+      "agent_lockdown_refused",
+      "fortress_lockdown_engaged",
+      "fortress_lockdown_partial",
+      "fortress_lockdown_failed",
+      "fortress_lockdown_no_agents",
+    ];
+    for (const op of ops) {
+      const templateId = `activity.lifecycle.${op}`;
+      const out = renderTemplate(templateId, [
+        { kind: "agent_id", value: "agent-alpha" },
+        { kind: "iso8601", value: "2026-08-08T00:00:00.000Z" },
+      ]);
+      expect(out).not.toContain("[unrecognized template");
+    }
+  });
+
   it("does not interpolate unknown args into the fallback string", () => {
     // Args are NOT echoed into the fallback (defense-in-depth for any arg
     // shape that might carry sensitive content via a future broken
@@ -115,8 +135,8 @@ describe("v1.1 dashboard template registry", () => {
   it("renders the fortress lockdown approval template with consequences", () => {
     const out = renderTemplate("approval_pending.tier1.fortress_lockdown", []);
     expect(out).toContain("Lockdown approval pending");
-    expect(out).toContain("records fortress lockdown status");
-    expect(out).toContain("does not by itself block writes");
+    expect(out).toContain("revokes network access");
+    expect(out).not.toContain("writes are blocked");
     expect(out).not.toContain("[unrecognized template");
   });
 });

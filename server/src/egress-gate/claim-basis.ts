@@ -1965,6 +1965,7 @@ export const CLAIM_SITES: Record<ClaimSiteId, ClaimSiteDeclaration> = {
  */
 export const CLAIM_LITERAL_COUNTS: Readonly<Record<string, number>> = {
   [`${CW}/account.ts`]: 1,
+  [`${CW}/agent-stop.ts`]: 0,
   [`${CW}/detect.ts`]: 0,
   [`${CW}/egress.ts`]: 5,
   [`${CW}/exclusive-arm.ts`]: 3,

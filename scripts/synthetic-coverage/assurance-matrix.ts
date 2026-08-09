@@ -31,6 +31,7 @@ const KNOWN_STATUSES: readonly AssuranceStatus[] = [
   "in_flight",
   "unknown",
 ];
+const EXPECTED_ASSURANCE_ROW_COUNT = 23;
 
 export interface AssuranceRow {
   id: string;
@@ -94,8 +95,10 @@ export function loadAssuranceMatrix(repoRoot = findRepoRoot()): AssuranceRow[] {
     });
   }
 
-  if (rows.length !== 22) {
-    throw new Error(`Expected 22 assurance rows in ${matrixPath}, found ${rows.length}`);
+  if (rows.length !== EXPECTED_ASSURANCE_ROW_COUNT) {
+    throw new Error(
+      `Expected ${EXPECTED_ASSURANCE_ROW_COUNT} assurance rows in ${matrixPath}, found ${rows.length}`,
+    );
   }
 
   return rows;

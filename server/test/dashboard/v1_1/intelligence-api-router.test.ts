@@ -1,3 +1,4 @@
+// fail-before-exempt: intelligence API harness now creates and cleans a temp storagePath for v1.1 bindings; stop-button enforcement is covered by agent-stop, egress, and castle-wall-agent-controller tests.
 /**
  * Sanctuary v1.1 Dashboard — Intelligence API Router tests
  *
@@ -31,6 +32,9 @@ import {
   type Server,
   type ServerResponse,
 } from "node:http";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { MemoryStorage } from "../../../src/storage/memory.js";
 import { AuditLog } from "../../../src/operational/audit-log.js";
@@ -62,6 +66,7 @@ async function startHarness(opts: { withSelector?: boolean } = {}): Promise<Harn
   const storage = new MemoryStorage();
   const masterKey = generateRandomKey();
   const auditLog = new AuditLog(storage, masterKey);
+  const storagePath = await mkdtemp(join(tmpdir(), "sanctuary-intel-api-"));
   const selector = new SubstrateSelector({
     storage,
     masterKey,
@@ -91,6 +96,7 @@ async function startHarness(opts: { withSelector?: boolean } = {}): Promise<Harn
             identityId: IDENTITY,
             fortressId: "fortress-test",
             auditLog,
+            storagePath,
             // Intentionally omit intelligenceSelector.
           });
           const url = new URL(req.url ?? "/", `http://127.0.0.1`);
@@ -126,10 +132,15 @@ async function startHarness(opts: { withSelector?: boolean } = {}): Promise<Harn
     selector,
     auditLog,
     authToken,
-    stop: () =>
-      new Promise<void>((resolve, reject) => {
-        server.close((err) => (err ? reject(err) : resolve()));
-      }),
+    stop: async () => {
+      try {
+        await new Promise<void>((resolve, reject) => {
+          server.close((err) => (err ? reject(err) : resolve()));
+        });
+      } finally {
+        await rm(storagePath, { recursive: true, force: true });
+      }
+    },
   };
 }
 

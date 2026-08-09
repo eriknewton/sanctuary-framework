@@ -370,9 +370,9 @@ function arg(args, kind, fallback) {
 }
 
 const TEMPLATES = {
-  "approval_pending.tier1.lockdown": (a) => "Lock down agent " + arg(a,"agent_id") + ". This stops all egress and freezes gates.",
-  "approval_pending.tier1.fortress_lockdown": () => "Lockdown approval pending. Approving asks every wrapped-agent controller to enter lockdown and records fortress lockdown status. The status flag is informational; it does not by itself block writes.",
-  "approval_pending.tier1.unwrap": (a) => "Unwrap agent " + arg(a,"agent_id") + ". Protection and registry binding will be removed.",
+  "approval_pending.tier1.lockdown": (a) => "Cut agent " + arg(a,"agent_id") + "'s network access. The agent keeps running and keeps local access; it stops reaching anything off this machine.",
+  "approval_pending.tier1.fortress_lockdown": () => "Lockdown approval pending. Approving revokes network access for confined agents. Agents keep running and keep local access; off-machine reachability is cut when Castle Wall reloads.",
+  "approval_pending.tier1.unwrap": (a) => "Unwrap request for agent " + arg(a,"agent_id") + ". This build refuses unsupported unwraps before approval is queued.",
   "approval_pending.tier1.policy_change": (a) => "Bind agent " + arg(a,"agent_id") + " to policy " + arg(a,"policy_id") + ".",
   "approval_pending.tier1.policy_change_template": (a) => "Bind agent " + arg(a,"agent_id") + " to template " + arg(a,"policy_id") + ".",
   "approval_pending.tier1.exit_bundle_export": (a) => "Export the fortress as a portable bundle. Agent: " + arg(a,"agent_id","all agents") + ".",
@@ -418,6 +418,13 @@ const TEMPLATES = {
   "activity.privacy": (a) => "Privacy event recorded for agent " + arg(a,"agent_id") + ".",
   "activity.handoff": (a) => "Internal handoff event involving agent " + arg(a,"agent_id") + ".",
   "activity.lifecycle": (a) => "Lifecycle change on agent " + arg(a,"agent_id") + ".",
+  "activity.lifecycle.agent_lockdown_engaged": (a) => "Network access revoked for agent " + arg(a,"agent_id") + ".",
+  "activity.lifecycle.agent_lockdown_partial": (a) => "Network access was revoked on disk for agent " + arg(a,"agent_id") + ", but the live Castle Wall reload was not confirmed.",
+  "activity.lifecycle.agent_lockdown_refused": (a) => "Network stop refused for agent " + arg(a,"agent_id") + ".",
+  "activity.lifecycle.fortress_lockdown_engaged": () => "Fortress lockdown engaged for all confined agents.",
+  "activity.lifecycle.fortress_lockdown_partial": () => "Fortress lockdown partially engaged; at least one confined agent could not be locked.",
+  "activity.lifecycle.fortress_lockdown_failed": () => "Fortress lockdown failed; no confined agent was locked.",
+  "activity.lifecycle.fortress_lockdown_no_agents": () => "Fortress lockdown found no confined agents to lock.",
   "activity.agent_policy_change_engaged": (a) => "Template binding changed on agent " + arg(a,"agent_id") + ": " + arg(a,"channel_template_id","default none") + " to " + arg(a,"policy_id") + ".",
   "activity.agent_policy_change_denied": (a) => "Template binding denied on agent " + arg(a,"agent_id") + ": " + arg(a,"channel_template_id","default none") + " to " + arg(a,"policy_id") + ".",
   "activity.config": (a) => "Configuration change applied.",
@@ -619,16 +626,19 @@ function renderTopbar() {
     '<span class="pill" data-pill="mode">mode: ' + escHtml(state.topbarPills.mode) + '</span>',
     renderTopbarAttestationBadge(state.topbarPills.attestation)
   ].join("");
-  // Lockdown button three-state UX (binding addendum 3).
+  // Lockdown button reflects the approved handler's reported outcome.
   const btn = document.getElementById("btn-lockdown");
   if (!btn) return;
   const t1 = state.tier1.lockdown;
-  btn.classList.remove("tier1-pending", "tier1-engaged");
+  btn.classList.remove("tier1-pending", "tier1-partial", "tier1-engaged");
   btn.disabled = false;
   if (t1.state === "pending") {
     btn.textContent = "Awaiting approval";
     btn.classList.add("tier1-pending");
     btn.disabled = true;
+  } else if (t1.state === "partial") {
+    btn.textContent = "Lockdown partial";
+    btn.classList.add("tier1-partial");
   } else if (t1.state === "engaged") {
     btn.textContent = "Lockdown ON";
     btn.classList.add("tier1-engaged");
@@ -2518,10 +2528,17 @@ function renderFortressAgentsCard() {
           { action: "lockdown", label: "Lockdown", enabled: !!c.can_lockdown, tier1: true },
           { action: "unwrap", label: "Unwrap", enabled: !!c.can_unwrap, tier1: true }
         ];
+        const disabledTipByAction = {
+          pause: "Sanctuary does not control this agent's process, so pause is not available.",
+          resume: "Sanctuary does not control this agent's process, so resume is not available.",
+          restart: "Sanctuary does not control this agent's process, so restart is not available.",
+          lockdown: "This agent is not confined to a dedicated uid, so network lockdown is not available.",
+          unwrap: "Dashboard unwrap is not implemented yet; unsupported unwraps are refused before approval is queued."
+        };
         const buttons = menuItems.map(function (mi) {
           const tip = mi.enabled
             ? (mi.tier1 ? "Tier 1: requires inbox approval." : "")
-            : "This harness does not support " + mi.label.toLowerCase() + ".";
+            : disabledTipByAction[mi.action];
           return '<button class="btn" data-action="agent-' + mi.action + '" data-agent-id="' + escHtml(a.agent_id) + '"' + (mi.enabled ? '' : ' disabled') + ' title="' + escHtml(tip) + '">' + escHtml(mi.label) + '</button>';
         }).join("");
         // Click-to-inspect: the head sub-row is the click target. A click
@@ -3461,7 +3478,7 @@ async function onAgentControl(agentId, action) {
     rerender();
   } catch (e) {
     if (e.status === 422) {
-      toast("This harness does not support " + action + ".", "error");
+      toast("Sanctuary cannot apply " + action + " for this agent: " + e.message, "error");
     } else {
       toast(action + " failed: " + e.message, "error");
     }
@@ -3479,11 +3496,20 @@ async function onInboxAction(itemId, action) {
   const boundAgentId = (item0 && item0.agent_id) || null;
   try {
     const r = await api("/inbox/" + encodeURIComponent(itemId) + "/" + action, { method: "POST", body: {} });
-    // Tier 1 lockdown engagement: the approve handler triggers the controller
-    // call. Reflect engaged state once the activity feed confirms.
     const item = (r.data && r.data.item) || null;
     if (item && state.tier1.lockdown.inboxItemId === itemId) {
-      state.tier1.lockdown.state = action === "approve" ? "engaged" : "idle";
+      const payload = item.resolution_payload || {};
+      if (action === "approve" && payload.outcome === "engaged") {
+        state.tier1.lockdown.state = "engaged";
+      } else if (action === "approve" && payload.outcome === "partial") {
+        state.tier1.lockdown.state = "partial";
+        toast("Lockdown partially applied. At least one confined agent did not confirm a live stop.", "info");
+      } else {
+        state.tier1.lockdown.state = "idle";
+        if (action === "approve" && payload.outcome) {
+          toast("Lockdown outcome: " + payload.outcome + ".", "error");
+        }
+      }
       renderTopbar();
     }
     if (state.exitDrill.inboxItemId === itemId && action === "approve") {

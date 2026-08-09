@@ -582,6 +582,16 @@ export interface ScrubProvisionedEgressInput {
   fortressPath: string;
   harnessId: string;
   /**
+   * Optional file selector for callers that revoke a different subset of
+   * rule files. Defaults to `provisioned-<harness>-*.json`.
+   */
+  select?: EgressRuleFileSelector;
+  /**
+   * Internal seam for callers that already hold the fortress-wide writer lock
+   * across a snapshot/scrub/restore sequence.
+   */
+  lockAlreadyHeld?: boolean;
+  /**
    * Optional reload trigger. The scrub itself is authoritative on the
    * persisted source; the reload propagates it to a still-running daemon.
    * A reload failure is reported (never thrown) because the rules are
@@ -598,6 +608,37 @@ export interface ScrubProvisionedEgressResult {
   reloadOk: boolean;
 }
 
+export type EgressRuleFileSelector = (
+  filename: string,
+) => boolean | Promise<boolean>;
+
+function provisionedRuleFileSelector(harnessId: string): EgressRuleFileSelector {
+  const prefix = provisionedRuleIdPrefix(harnessId);
+  return (filename) => filename.startsWith(prefix) && filename.endsWith(".json");
+}
+
+async function selectedRuleFilenames(
+  filenames: readonly string[],
+  select: EgressRuleFileSelector,
+): Promise<string[]> {
+  const selected: string[] = [];
+  for (const filename of filenames) {
+    if (!filename.endsWith(".json")) continue;
+    if (await select(filename)) selected.push(filename);
+  }
+  return selected.sort();
+}
+
+function plainJsonRuleFilename(filename: string): boolean {
+  return (
+    filename.endsWith(".json") &&
+    !filename.includes("/") &&
+    !filename.includes("\\") &&
+    !filename.includes("\0") &&
+    filename !== ".json"
+  );
+}
+
 /**
  * Remove every `provisioned-<harness>-*` rule file from the fortress rules
  * directory and VERIFY none survive (design section 6: no orphan grants).
@@ -610,16 +651,18 @@ export async function scrubProvisionedEgressRules(
   input: ScrubProvisionedEgressInput,
 ): Promise<ScrubProvisionedEgressResult> {
   const dir = egressRulesDir(input.fortressPath);
-  const prefix = provisionedRuleIdPrefix(input.harnessId);
+  const select = input.select ?? provisionedRuleFileSelector(input.harnessId);
   // Round-4 C1: the scrub is a REVOCATION writer on the shared rule source;
   // it serializes on the same egress-policy writer lock as every other
   // mutator. Contended => throw (fail-loud, mirroring this function's
   // existing survivor-check posture); nothing removed.
   let holderDescription = "";
-  const lock = egressPolicyWriterLock(input.fortressPath, (holder) => {
-    holderDescription = holder;
-  });
-  const release = await lock.acquire();
+  const lock = input.lockAlreadyHeld
+    ? null
+    : egressPolicyWriterLock(input.fortressPath, (holder) => {
+        holderDescription = holder;
+      });
+  const release = input.lockAlreadyHeld ? async () => {} : await lock!.acquire();
   if (release === null) {
     throw new Error(
       `egress rule scrub refused: another egress-policy writer holds this fortress's writer lock` +
@@ -640,13 +683,14 @@ export async function scrubProvisionedEgressRules(
       throw err;
     }
     for (const filename of filenames) {
-      if (!filename.startsWith(prefix) || !filename.endsWith(".json")) continue;
+      if (!(await select(filename))) continue;
       await unlink(join(dir, filename));
       removedRuleIds.push(filename.slice(0, -".json".length));
     }
     // Verified read-back: the scrub is only a scrub if nothing survives.
-    const survivors = (await readdir(dir)).filter(
-      (name) => name.startsWith(prefix) && name.endsWith(".json"),
+    const survivors = await selectedRuleFilenames(
+      await readdir(dir),
+      select,
     );
     if (survivors.length > 0) {
       throw new Error(
@@ -699,9 +743,9 @@ export interface ProvisionedEgressRuleFile {
 export async function snapshotProvisionedEgressRules(
   fortressPath: string,
   harnessId: string,
+  select: EgressRuleFileSelector = provisionedRuleFileSelector(harnessId),
 ): Promise<ProvisionedEgressRuleFile[]> {
   const dir = egressRulesDir(fortressPath);
-  const prefix = provisionedRuleIdPrefix(harnessId);
   let filenames: string[];
   try {
     filenames = await readdir(dir);
@@ -710,7 +754,7 @@ export async function snapshotProvisionedEgressRules(
     throw err;
   }
   const snapshot: ProvisionedEgressRuleFile[] = [];
-  for (const filename of filenames.filter((n) => n.startsWith(prefix) && n.endsWith(".json")).sort()) {
+  for (const filename of await selectedRuleFilenames(filenames, select)) {
     snapshot.push({ filename, content: await readFile(join(dir, filename), "utf8") });
   }
   return snapshot;
@@ -722,6 +766,13 @@ export interface RestoreProvisionedEgressInput {
   harnessId: string;
   /** The pre-run capture from {@link snapshotProvisionedEgressRules}. An empty snapshot restores to "no provisioned rules". */
   snapshot: ReadonlyArray<ProvisionedEgressRuleFile>;
+  /**
+   * Optional file selector for callers that restore a non-provisioned subset.
+   * Defaults to `provisioned-<harness>-*.json`.
+   */
+  select?: EgressRuleFileSelector;
+  /** Internal seam for callers that already hold the writer lock. */
+  lockAlreadyHeld?: boolean;
   /**
    * Optional reload trigger. Rules on disk are the signing source, but the
    * RUNNING daemon keeps serving the previous composition until it reloads --
@@ -764,6 +815,8 @@ export async function restoreProvisionedEgressRules(
 ): Promise<RestoreProvisionedEgressResult> {
   const dir = egressRulesDir(input.fortressPath);
   const prefix = provisionedRuleIdPrefix(input.harnessId);
+  const select = input.select ?? provisionedRuleFileSelector(input.harnessId);
+  const usingDefaultSelector = input.select === undefined;
   const problems: string[] = [];
   const removedRuleIds: string[] = [];
   const ruleIdOf = (filename: string): string => filename.slice(0, -".json".length);
@@ -772,12 +825,14 @@ export async function restoreProvisionedEgressRules(
   // lock. This function's contract is NEVER-THROWS (it runs on abort paths),
   // so contention is a recorded problem with `restored: false`, not a throw.
   let holderDescription = "";
-  const lock = egressPolicyWriterLock(input.fortressPath, (holder) => {
-    holderDescription = holder;
-  });
+  const lock = input.lockAlreadyHeld
+    ? null
+    : egressPolicyWriterLock(input.fortressPath, (holder) => {
+        holderDescription = holder;
+      });
   let release: (() => Promise<void>) | null = null;
   try {
-    release = await lock.acquire();
+    release = input.lockAlreadyHeld ? async () => {} : await lock!.acquire();
   } catch (err) {
     problems.push(`could not acquire the egress-policy writer lock: ${(err as Error).message}`);
   }
@@ -804,16 +859,19 @@ export async function restoreProvisionedEgressRules(
   // recorded problem (so `restored` is false), never a silent skip.
   const wanted = new Map<string, string>();
   for (const file of input.snapshot) {
-    const wellFormed =
+    const provisionedWellFormed =
       file.filename.startsWith(prefix) &&
       file.filename.endsWith(".json") &&
       !file.filename.includes("/") &&
       !file.filename.includes("\\") &&
       !file.filename.includes("\0") &&
       file.filename !== `${prefix}.json`;
+    const wellFormed = usingDefaultSelector
+      ? provisionedWellFormed
+      : plainJsonRuleFilename(file.filename);
     if (!wellFormed) {
       problems.push(
-        `refusing to restore ${JSON.stringify(file.filename)}: not a plain provisioned-${input.harnessId}-*.json rule filename`,
+        `refusing to restore ${JSON.stringify(file.filename)}: not a plain selected rule filename`,
       );
       continue;
     }
@@ -826,7 +884,7 @@ export async function restoreProvisionedEgressRules(
     }
     let present: string[] = [];
     try {
-      present = (await readdir(dir)).filter((n) => n.startsWith(prefix) && n.endsWith(".json"));
+      present = await selectedRuleFilenames(await readdir(dir), select);
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
     }
@@ -846,7 +904,7 @@ export async function restoreProvisionedEgressRules(
   // observed AFTER the writes, and only when the bytes match.
   let observed: ProvisionedEgressRuleFile[];
   try {
-    observed = await snapshotProvisionedEgressRules(input.fortressPath, input.harnessId);
+    observed = await snapshotProvisionedEgressRules(input.fortressPath, input.harnessId, select);
   } catch (err) {
     return {
       restored: false,

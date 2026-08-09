@@ -1,3 +1,4 @@
+// fail-before-exempt: real-browser drill harness now creates and cleans a temp storagePath for v1.1 bindings; stop-button enforcement is covered by agent-stop, egress, and castle-wall-agent-controller tests.
 /**
  * Sanctuary v1.1 Dashboard — Intelligence Real-Browser Drill
  *
@@ -49,6 +50,9 @@ import {
   type Server,
   type ServerResponse,
 } from "node:http";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { MemoryStorage } from "../../../src/storage/memory.js";
 import { AuditLog } from "../../../src/operational/audit-log.js";
@@ -79,6 +83,7 @@ async function bootDrill(): Promise<Drill> {
   const storage = new MemoryStorage();
   const masterKey = generateRandomKey();
   const auditLog = new AuditLog(storage, masterKey);
+  const storagePath = await mkdtemp(join(tmpdir(), "sanctuary-intel-drill-"));
   const selector = new SubstrateSelector({
     storage,
     masterKey,
@@ -90,6 +95,7 @@ async function bootDrill(): Promise<Drill> {
     identityId: IDENTITY,
     fortressId: FORTRESS,
     auditLog,
+    storagePath,
     intelligenceSelector: selector,
   });
 
@@ -127,10 +133,15 @@ async function bootDrill(): Promise<Drill> {
     url: `http://127.0.0.1:${addr.port}`,
     selector,
     auditLog,
-    stop: () =>
-      new Promise<void>((resolve, reject) => {
-        server.close((err) => (err ? reject(err) : resolve()));
-      }),
+    stop: async () => {
+      try {
+        await new Promise<void>((resolve, reject) => {
+          server.close((err) => (err ? reject(err) : resolve()));
+        });
+      } finally {
+        await rm(storagePath, { recursive: true, force: true });
+      }
+    },
   };
 }
 
