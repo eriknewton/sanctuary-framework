@@ -490,7 +490,7 @@ export function applyAttestationEvent(event: AttestationEvent): BadgeState {
 export function getGlobalBadgeState(fortress_id: string): BadgeState {
   const stored = globalStore.get(fortress_id);
   if (!stored) {
-    // Default: offline (no events received yet)
+    // No event history is offline, not green; absence of attestation evidence never becomes a healthy badge.
     return makeBadge("offline", "global", fortress_id, [], "global.no_data");
   }
   return stored.badge;

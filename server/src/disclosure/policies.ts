@@ -87,7 +87,7 @@ export function evaluateDisclosure(
 
     const ruleName = `${matchedRule.context}`;
 
-    // Withhold takes priority
+    // Withhold is the first matched action so an explicit deny cannot be weakened by proof_required or disclose lists.
     if (matchedRule.withhold.includes(field)) {
       return {
         field,

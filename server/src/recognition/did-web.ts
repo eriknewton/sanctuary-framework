@@ -502,6 +502,7 @@ export async function resolveDidWeb(
   const url = didToUrl(parsed);
   const unsafeHost = unsafeAuthorityHostReason(parsed.authority_host);
   if (unsafeHost !== undefined) {
+    // Authority hosts are refused before fetch; a did:web string cannot steer resolution to local or private infrastructure.
     return {
       ok: false,
       failure: "host_not_allowed",
@@ -511,6 +512,7 @@ export async function resolveDidWeb(
   }
 
   if (!opts.allowed_hosts.includes(parsed.authority_host)) {
+    // The operator allowlist is the network boundary; a syntactically valid DID never grants outbound fetch authority by itself.
     return {
       ok: false,
       failure: "host_not_allowed",
@@ -522,6 +524,7 @@ export async function resolveDidWeb(
   if (opts.fetcher === undefined) {
     const resolvedHostFailure = await resolvedHostNotPublicReason(parsed.authority_host);
     if (resolvedHostFailure !== undefined) {
+      // DNS is rechecked for the production fetcher so an allowed hostname cannot resolve into loopback or private space.
       return {
         ok: false,
         failure: "host_not_allowed",
@@ -597,6 +600,7 @@ export async function resolveDidWeb(
   }
 
   if (!isDidDocument(body, did)) {
+    // DID document binding is checked against the requested DID; an authority cannot answer with a document for another id.
     return {
       ok: false,
       failure: "invalid_json",
@@ -607,6 +611,7 @@ export async function resolveDidWeb(
 
   if (opts.expected_public_key !== undefined) {
     const expectedX = toBase64url(opts.expected_public_key);
+    // DID key binding is caller-pinned: a fetched document is trusted only if it carries the expected assertion key for this time.
     const selected = selectVerificationMethod(
       body,
       expectedX,
@@ -760,6 +765,7 @@ function selectVerificationMethod(
   );
   if (matches.length === 0) return undefined;
   const activeIds = new Set([...doc.authentication, ...doc.assertionMethod]);
+  // Historical-key acceptance is bounded by assertion_time plus the caller-pinned key, never by a remote document's claim alone.
   return (
     matches.find((vm) => activeIds.has(vm.id)) ??
     matches.find((vm) => vm.status === "previous" || vm.status === "revoked") ??
@@ -791,6 +797,7 @@ function canonicalSerializeDidDocument(doc: DidDocument): string {
 function isDidDocument(value: unknown, expectedDid: string): value is DidDocument {
   if (!value || typeof value !== "object") return false;
   const v = value as Record<string, unknown>;
+  // The fetched document's `id` must equal the requested DID before any verification method is considered authoritative.
   if (v["id"] !== expectedDid) return false;
   if (!Array.isArray(v["@context"])) return false;
   const vm = v["verificationMethod"];
@@ -1075,6 +1082,7 @@ export async function tryLoadFortressDidWebRecord(
 function isFortressDidWebRecord(value: unknown): value is FortressDidWebRecord {
   if (!value || typeof value !== "object") return false;
   const v = value as Record<string, unknown>;
+  // Local registry records must prove the v1 shape before they can become the fortress DID source of truth.
   if (v["version"] !== 1) return false;
   const id = v["identifier"] as Record<string, unknown> | undefined;
   if (!id || typeof id !== "object") return false;

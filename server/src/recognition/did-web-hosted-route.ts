@@ -72,6 +72,7 @@ export async function handleHostedDidWebRoute(
 
   const entry = await registry.get(handle);
   if (!entry) {
+    // Registry miss, corruption, or wrong-fortress ciphertext all return 404, so the route never serves unverified fallback data.
     res.writeHead(404, {
       "Content-Type": "application/json",
       "Cache-Control": "no-store",
@@ -81,6 +82,7 @@ export async function handleHostedDidWebRoute(
   }
 
   if (opts.onAudit) {
+    // The audit event is emitted only after registry validation returns an entry, so resolution provenance names served content.
     opts.onAudit(HOSTED_DID_WEB_AUDIT_OPS.HOSTED_DID_RESOLVED, {
       operator_handle: handle,
       did: entry.did_document.id,

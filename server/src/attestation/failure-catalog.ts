@@ -287,6 +287,7 @@ export function verifyFailureCatalogInvariants(): {
 function assertCatalogInvariantsAtImport(): void {
   const result = verifyFailureCatalogInvariants();
   if (!result.valid) {
+    // Catalog drift fails at import so no consumer can render badge policy from a malformed failure table.
     throw new FailureCatalogInvariantError(
       `Failure-mode catalog invariant violation: ${result.violations.join("; ")}`
     );

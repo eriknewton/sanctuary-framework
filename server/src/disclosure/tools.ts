@@ -117,6 +117,7 @@ export function createDisclosureTools(
         const value = args.value as string;
         const blindingFactor = args.blinding_factor as string;
 
+        // The reveal result comes only from recomputing the commitment, not from caller-provided validity metadata.
         const valid = verifyCommitment(commitment, value, blindingFactor);
 
         void auditLog.append("l3", "proof_reveal", "system", {
@@ -335,6 +336,7 @@ export function createDisclosureTools(
         const value = args.value as number;
 
         if (!Number.isInteger(value)) {
+          // Numeric commitments require integer scalars; fractional input is refused before it can become proof material.
           return toolResult({ error: "Value must be an integer." });
         }
 
@@ -389,7 +391,7 @@ export function createDisclosureTools(
         const blindingFactor = args.blinding_factor as string;
         const commitment = args.commitment as string;
 
-        // Verify the commitment first
+        // Verify the commitment first; no proof is minted unless the value and blinding factor open this exact commitment.
         if (!verifyPedersenCommitment(commitment, value, blindingFactor)) {
           return toolResult({
             error: "The provided value and blinding factor do not match the commitment.",
@@ -428,6 +430,7 @@ export function createDisclosureTools(
       handler: async (args) => {
         const proof = args.proof as Parameters<typeof verifyProofOfKnowledge>[0];
 
+        // Verification recomputes the Fiat-Shamir transcript; a proof's embedded fields do not self-certify validity.
         const valid = verifyProofOfKnowledge(proof);
 
         void auditLog.append("l3", "zk_verify", "system", {
@@ -520,6 +523,7 @@ export function createDisclosureTools(
       handler: async (args) => {
         const proof = args.proof as Parameters<typeof verifyRangeProof>[0];
 
+        // Range verification requires both lower and upper decompositions; the claimed min/max alone never proves inclusion.
         const valid = verifyRangeProof(proof);
 
         void auditLog.append("l3", "zk_range_verify", "system", {

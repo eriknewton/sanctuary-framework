@@ -137,7 +137,7 @@ export function toSignedEventPayload(event: AttestationEvent): {
   event_type: string;
   payload: AttestationEvent;
 } {
-  // Verify the event_type has the attestation_ prefix
+  // The outer signed-event type must be attestation-scoped before the payload can ride the federation envelope.
   if (!event.event_type.startsWith(ATTESTATION_EVENT_TYPE_PREFIX)) {
     throw new Error(
       `Attestation event type must start with "${ATTESTATION_EVENT_TYPE_PREFIX}", got "${event.event_type}"`
@@ -167,10 +167,12 @@ export function fromSignedEvent(
     return null;
   }
   const payload = evt.payload;
+  // Payload shape is revalidated after envelope verification, so signed bytes cannot smuggle a non-attestation body.
   if (!isValidAttestationEvent(payload)) {
     return null;
   }
   if (payload.event_type !== evt.event_type) {
+    // The inner and outer event types must match, so routing cannot verify one type while applying another.
     return null;
   }
   return payload;
@@ -209,6 +211,7 @@ function isValidAttestationEvent(value: unknown): value is AttestationEvent {
     typeof value.resulting_state !== "string" ||
     !(BADGE_STATES as readonly string[]).includes(value.resulting_state)
   ) {
+    // Resulting state must be a closed badge enum before badge derivation can consume it.
     return false;
   }
   if (

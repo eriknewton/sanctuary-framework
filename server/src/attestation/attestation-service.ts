@@ -188,7 +188,7 @@ export function processAttestationEvent(event: AttestationEvent): BadgeState {
   if (result.ok) {
     return result.result;
   }
-  // Fallback: create a degraded badge
+  // Processing failures degrade into an explicit badge, never a throw or an implicit green.
   return {
     state: result.state,
     label: result.state === "red" ? "Walls breached" : "Walls watch",
@@ -351,8 +351,7 @@ export function resetScopeRetryState(
         prior_failure_reason: prior?.last_failure_reason,
       });
     } catch {
-      // Audit emission failures must not stop the reset itself: the
-      // operator-visible badge clearing is the load-bearing behavior.
+      // Audit emission failure cannot block the operator reset; the sink is optional and pure logic owns no durable AuditLog.
     }
   }
 

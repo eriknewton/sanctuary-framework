@@ -286,7 +286,7 @@ export function verifyProofOfKnowledge(proof: ZKProofOfKnowledge): boolean {
     const s_v = bytesToBigint(fromBase64url(proof.response_v));
     const s_b = bytesToBigint(fromBase64url(proof.response_b));
 
-    // Recompute challenge
+    // Recompute the Fiat-Shamir challenge from C and R, so a prover cannot choose its own challenge after seeing responses.
     const e = fiatShamirChallenge(
       "sanctuary-zk-pok-v1",
       fromBase64url(proof.commitment),
@@ -472,6 +472,7 @@ function verifyBitDecomposition(
   let reconstructed = RistrettoPoint.ZERO;
   for (let i = 0; i < numBits; i++) {
     const C_i = RistrettoPoint.fromHex(fromBase64url(bitCommitments[i]!));
+    // Every bit commitment must prove membership in {0,1}; the sum proof alone cannot rule out multi-bit values.
     if (!verifyBitProof(bitProofs[i]!, C_i)) return false;
     reconstructed = reconstructed.add(safeMultiply(C_i, mod(BigInt(1) << BigInt(i))));
   }
@@ -500,6 +501,7 @@ export function verifyRangeProof(proof: ZKRangeProof): boolean {
     if (numBits > MAX_RANGE_BITS) return false;
 
     if (!proof.upper_bit_commitments || !proof.upper_bit_proofs || !proof.upper_sum_proof) {
+      // Legacy one-sided range proofs fail closed because they cannot prove the value is at or below max.
       return false;
     }
 

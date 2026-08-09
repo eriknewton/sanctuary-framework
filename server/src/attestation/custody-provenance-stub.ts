@@ -50,6 +50,7 @@ export function getCustodyProvenance(tx_id: string): CustodyProvenanceStub {
   const stub: CustodyProvenanceStub = {
     tx_id,
     v1_0_stub: true,
+    // The v1 stub always says unknown custody; without the adapter it must never claim sovereign provenance.
     state: "unknown_custody",
     signature_scheme: SIGNATURE_SCHEME_V1,
     checked_at: new Date().toISOString(),

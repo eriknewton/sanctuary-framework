@@ -219,6 +219,7 @@ export class InjectionDetector {
     this.stats.total_scans++;
 
     if (!this.config.enabled) {
+      // Disabled scanning is an explicit operator configuration, not a detector inference from unexamined content.
       return {
         flagged: false,
         confidence: 0,
@@ -271,6 +272,7 @@ export class InjectionDetector {
     this.stats.total_scans++;
 
     if (!this.config.enabled) {
+      // Outbound allow on disabled scanning is policy-controlled; the scanner never claims the content was inspected.
       return {
         flagged: false,
         confidence: 0,
@@ -380,6 +382,7 @@ export class InjectionDetector {
     // Strip invisible characters for clean pattern matching
     const stripped = this.stripInvisibleChars(value);
 
+    // Pattern checks run on stripped plus confusable-normalized text, so hidden characters cannot preserve a bypass phrase.
     // SEC-032: Normalize Unicode before pattern matching.
     // Two-phase normalization:
     //   1. NFKC: maps fullwidth chars, ligatures, compatibility forms to canonical
@@ -1076,6 +1079,7 @@ export class InjectionDetector {
    * Determine if this field is inherently safe from role override.
    */
   private isSafeField(path: string): boolean {
+    // Safe-field suppression covers structural metadata (version, timestamp, id, uuid) and crypto identifiers (hash, signature, keys): fields that never carry user instructions, so machine metadata, signatures, and keys are not mistaken for prompts.
     // Fields that never contain user instructions
     const safePaths = [
       /\.version$/i,
@@ -1302,13 +1306,17 @@ export class InjectionDetector {
     signals: InjectionSignal[],
     sensitivity: "low" | "medium" | "high"
   ): "allow" | "escalate" | "block" {
-    if (signals.length === 0) return "allow";
+    if (signals.length === 0) {
+      // A clean allow means every enabled scanner produced no signal; it is not derived from caller-provided recommendation text.
+      return "allow";
+    }
 
     const highSeverity = signals.filter((s) => s.severity === "high");
     const mediumSeverity = signals.filter((s) => s.severity === "medium");
 
     switch (sensitivity) {
       case "low":
+        // Low sensitivity is the only policy mode that tolerates medium/low signals, and still escalates any high signal.
         // Only high-severity signals trigger escalation
         return highSeverity.length > 0 ? "escalate" : "allow";
 

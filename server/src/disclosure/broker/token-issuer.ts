@@ -172,6 +172,7 @@ export class TokenIssuer {
   async issueToken(req: IssueTokenRequest): Promise<TokenBinding> {
     const requestedScope: SecretScope = req.requestedScope ?? "read";
     if (req.skill !== req.caller.skill) {
+      // Skill identity is taken from verified caller claims; an MCP argument cannot mint a token for another skill.
       await this.auditLog.appendCritical({
         layer: "l3",
         operation: BROKER_OPS.TOKEN_DENIED,
@@ -195,6 +196,7 @@ export class TokenIssuer {
     const grant = this.grants.get(grantKey(req.caller.skill, req.secret));
 
     if (!grant) {
+      // No grant means deny with an audit reason; absence of policy never widens broker access.
       await this.auditLog.appendCritical({
         layer: "l3",
         operation: BROKER_OPS.TOKEN_DENIED,
@@ -215,6 +217,7 @@ export class TokenIssuer {
     }
     const claimMismatch = grantClaimMismatch(grant, req.caller);
     if (claimMismatch) {
+      // Tenant, fortress, audience, and agent constraints are rechecked against verified claims before token issuance.
       await this.auditLog.appendCritical({
         layer: "l3",
         operation: BROKER_OPS.TOKEN_DENIED,
@@ -235,6 +238,7 @@ export class TokenIssuer {
       throw new BrokerDeniedError();
     }
     if (!scopeSatisfies(requestedScope, grant.scope)) {
+      // Requested scope must be no stronger than the grant, so callers cannot self-upgrade read into rotate.
       await this.auditLog.appendCritical({
         layer: "l3",
         operation: BROKER_OPS.TOKEN_DENIED,
@@ -291,6 +295,7 @@ export class TokenIssuer {
         ttl_seconds: ttl,
       },
     });
+    // The success audit is durable before the token enters the live map, so issued tokens have provenance.
     this.tokens.set(token, binding);
     return binding;
   }
@@ -316,6 +321,7 @@ export class TokenIssuer {
     }
     const nowMs = this.now();
     if (nowMs >= Date.parse(binding.expires_at)) {
+      // Expiry is enforced again at read time, so pruning is only hygiene and never the security boundary.
       this.tokens.delete(token);
       await this.auditLog.appendCritical({
         layer: "l3",
@@ -336,7 +342,7 @@ export class TokenIssuer {
       throw new BrokerTokenExpiredError();
     }
 
-    // Re-check grant — it may have been revoked since issuance.
+    // Re-check the live grant on every read; a token cannot outlive a revoked or narrowed policy.
     const grant = this.grants.get(grantKey(binding.skill, binding.secret));
     if (!grant || !scopeSatisfies(binding.scope, grant.scope)) {
       this.tokens.delete(token);
@@ -359,7 +365,7 @@ export class TokenIssuer {
       throw new BrokerDeniedError();
     }
 
-    // Read from backend. Errors propagate; we audit but do not leak the value.
+    // Backend errors propagate after a redacted audit entry; the secret value is never logged or embedded in the error path.
     try {
       const value = await this.backend.readSecret(binding.secret);
       await this.auditLog.appendCritical({
