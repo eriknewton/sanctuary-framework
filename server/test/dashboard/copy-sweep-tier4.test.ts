@@ -60,16 +60,16 @@ describe("Dashboard copy sweep — Tier 4", () => {
     expect(script).toContain("CHANNEL_TEMPLATES.length");
   });
 
-  // YYYY: "Run full audit" button is not disabled
-  it("YYYY: run full audit button is enabled with data-action", () => {
-    expect(script).toContain('data-action="run-full-audit"');
+  // YYYY superseded by NF-01: no button may post to an absent audit route.
+  it("YYYY/NF-01: run full audit dead control is absent", () => {
+    expect(script).not.toContain('data-action="run-full-audit"');
     expect(script).not.toContain('disabled title="Manual audit landing in v1.2."');
   });
 
-  // YYYY: onRunFullAudit handler exists
-  it("YYYY: onRunFullAudit handler is defined", () => {
-    expect(script).toContain("async function onRunFullAudit()");
-    expect(script).toContain("/audit-chain/verify");
+  // YYYY superseded by NF-01: the missing route is not called from the client.
+  it("YYYY/NF-01: onRunFullAudit handler is not defined", () => {
+    expect(script).not.toContain("async function onRunFullAudit()");
+    expect(script).not.toContain('api("/audit-chain/verify"');
   });
 
   // VVVVV: CSS for inbox group heads exists in HTML shell

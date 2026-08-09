@@ -1545,6 +1545,9 @@ function renderHealthPage() {
   const lockedDown = state.agents.filter(function (a) { return a.status === "locked_down"; }).length;
   const errored = state.agents.filter(function (a) { return a.status === "error"; }).length;
   const recentDenials = state.activity.filter(function (e) { return e.category === "denial"; }).length;
+  // No hub verifier route exists; this renders an honest unavailable state,
+  // never a button that posts to a missing endpoint.
+  const auditVerifyState = '<p class="muted">Audit-chain verification is not available from this dashboard in this build.</p>';
   return '<h1>Health</h1>' +
     '<p class="muted">Projected from existing data.</p>' +
     '<div class="card"><h3>Fortress at a glance</h3>' +
@@ -1555,7 +1558,7 @@ function renderHealthPage() {
       '<dt>Denials in feed</dt><dd>' + escHtml(recentDenials) + '</dd>' +
       '</dl>' +
     '</div>' +
-    '<button class="btn" data-action="run-full-audit">Run full audit</button>';
+    auditVerifyState;
 }
 
 // ── Render: intelligence ───────────────────────────────────────────────
@@ -2197,16 +2200,19 @@ function renderPolicyCenter() {
           ? "$" + escHtml(a.budget_summary.daily.cap) + "/day"
           : "Not set";
         const open = state.templateBinding.agentId === a.agent_id;
+        // LocalAgentRecord carries real template and budget fields only; these
+        // cells use an honest empty state, never invented policy detail.
+        const policyDetailUnavailable = '<span class="muted">Not available yet</span>';
         return '<tr>' +
           '<td><button class="link-btn" data-action="open-agent" data-agent-id="' + escHtml(a.agent_id) + '">' + escHtml(a.agent_id) + '</button></td>' +
           '<td><button class="template-cell" data-action="template-picker-open" data-agent-id="' + escHtml(a.agent_id) + '">' + escHtml(binding) + '</button>' +
             (open ? renderTemplatePicker(a) : '') +
           '</td>' +
-          '<td><span class="allow-count">12</span> <span class="muted">.</span> <span class="block-count">3</span></td>' +
+          '<td>' + policyDetailUnavailable + '</td>' +
           '<td>' + budget + '</td>' +
-          '<td>30 d</td>' +
-          '<td><span class="toggle-on" aria-label="enabled"></span></td>' +
-          '<td>T1, T2</td>' +
+          '<td>' + policyDetailUnavailable + '</td>' +
+          '<td>' + policyDetailUnavailable + '</td>' +
+          '<td>' + policyDetailUnavailable + '</td>' +
         '</tr>';
       }).join("\n")
     : '<tr><td colspan="7" class="muted">No protected agents yet.</td></tr>';
@@ -3628,26 +3634,6 @@ async function onInboxBatchAction(action, until) {
   }
 }
 
-async function onRunFullAudit() {
-  try {
-    toast("Running audit-chain export + verify...");
-    const r = await api("/audit-chain/verify", { method: "POST", body: {} });
-    const verdict = r.data && r.data.verdict ? r.data.verdict : "unknown";
-    const entries = r.data && r.data.entries_checked ? r.data.entries_checked : "?";
-    if (verdict === "PASS") {
-      toast("Audit chain verified: " + entries + " entries, verdict PASS", "success");
-    } else {
-      toast("Audit chain verdict: " + verdict + " (" + entries + " entries checked)", "error");
-    }
-  } catch (e) {
-    if (e.status === 404) {
-      toast("Audit-chain verify endpoint not available. Run manually: sanctuary audit-chain export | sanctuary audit-chain verify --input -", "error");
-    } else {
-      toast("Audit failed: " + (e.message || "unknown error"), "error");
-    }
-  }
-}
-
 async function onExitExportStart() {
   try {
     const r = await api("/agents/all/exit-bundle/export", { method: "POST", body: {} });
@@ -3974,7 +3960,6 @@ document.addEventListener("click", function (ev) {
   }
   // WP-V1.2 reshape click-to-inspect handler ────────────────────────
   if (action === "agent-inspect-open" && agentId) return void onAgentInspectOpen(agentId);
-  if (action === "run-full-audit") return void onRunFullAudit();
   if (action === "exit-export-start") return void onExitExportStart();
   if (action === "did-web-rotate-compromised") return void onDidWebCompromisedRotation();
   if (action === "exit-mark-verified") { state.exitDrill.step = 5; return rerender(); }
