@@ -6,11 +6,12 @@ import {
   stringToBytes,
   toBase64url,
 } from "../../src/core/encoding.js";
-import { createIdentity, sign } from "../../src/core/identity.js";
+import { createIdentity, rotateKeys, sign } from "../../src/core/identity.js";
 import { hashToString } from "../../src/core/hashing.js";
 import { deriveNamespaceKey, derivePurposeKey } from "../../src/core/key-derivation.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import {
+  resolveAuthenticatedIdentityWriterPublicKeys,
   StateStore,
   StateVerificationError,
   type StateEntry,
@@ -119,6 +120,59 @@ async function writeLegacyEntry(args: {
 }
 
 describe("state envelope integrity", () => {
+  it("resolves current and historical identity keys as authenticated trust bases", () => {
+    const { identityEncKey, identity } = makeStateRig();
+    const { updatedIdentity } = rotateKeys(
+      identity.storedIdentity,
+      identityEncKey,
+      "test rotation"
+    );
+
+    const resolved = resolveAuthenticatedIdentityWriterPublicKeys(updatedIdentity);
+
+    expect(resolved.map((key) => key.publicKeyBase64url)).toEqual([
+      identity.storedIdentity.public_key,
+      updatedIdentity.public_key,
+    ]);
+    expect(resolved.map((key) => key.trustBasis)).toEqual([
+      "authenticated",
+      "authenticated",
+    ]);
+    expect(resolved.map((key) => key.source)).toEqual([
+      "identity-rotation-chain",
+      "identity-current",
+    ]);
+  });
+
+  it("refuses an identity rotation chain whose signed event was changed", () => {
+    const { identityEncKey, identity } = makeStateRig();
+    const { updatedIdentity } = rotateKeys(
+      identity.storedIdentity,
+      identityEncKey,
+      "test rotation"
+    );
+    const [firstRotation] = updatedIdentity.rotation_history;
+    if (!firstRotation) throw new Error("missing rotation history fixture");
+    const tamperedEvent = JSON.parse(
+      bytesToString(fromBase64url(firstRotation.rotation_event))
+    ) as Record<string, unknown>;
+    tamperedEvent.reason = "tampered reason";
+
+    const tamperedIdentity = {
+      ...updatedIdentity,
+      rotation_history: [
+        {
+          ...firstRotation,
+          rotation_event: toBase64url(
+            stringToBytes(JSON.stringify(tamperedEvent))
+          ),
+        },
+      ],
+    };
+
+    expect(resolveAuthenticatedIdentityWriterPublicKeys(tamperedIdentity)).toEqual([]);
+  });
+
   it("round trips with default envelope verification", async () => {
     const rig = makeStateRig();
     await persistRigIdentity(rig);
@@ -255,16 +309,18 @@ describe("state envelope integrity", () => {
 
   it("state_read refuses a matching signature when the writer key comes only from the plaintext registry", async () => {
     const { storage, masterKey, stateStore, identity, identityEncKey } = makeStateRig();
+    const rogueIdentity = createIdentity("rogue", identityEncKey, "recovery-key");
+    const victimKid = identity.storedIdentity.identity_id;
 
     await stateStore.write(
       "memory",
       "profile",
       "trusted value",
-      identity.storedIdentity.identity_id,
-      identity.storedIdentity.encrypted_private_key,
+      victimKid,
+      rogueIdentity.storedIdentity.encrypted_private_key,
       identityEncKey
     );
-    expect(await storage.read("_identities", identity.storedIdentity.identity_id)).toBeNull();
+    expect(await storage.read("_identities", victimKid)).toBeNull();
 
     const stateStoreForTool = new StateStore(storage, masterKey);
     const auditLog = new AuditLog(storage, masterKey);
@@ -284,7 +340,7 @@ describe("state envelope integrity", () => {
 
     expect(read.error).toBe("state_verification_failed");
     expect(read.classification).toBe("kid_unknown");
-    expect(read.signature_verified).not.toBe(true);
+    expect(read.signature_verified).toBe(false);
   });
 
   it("loads legacy schema-1 entries with a warning", async () => {

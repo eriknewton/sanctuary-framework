@@ -12,6 +12,7 @@ import { createIdentity } from "../../src/core/identity.js";
 import { derivePurposeKey } from "../../src/core/key-derivation.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import { bytesToString, stringToBytes } from "../../src/core/encoding.js";
+import { persistStoredIdentity } from "../util/persist-stored-identity.js";
 
 describe("Tamper Detection", () => {
   let storage: MemoryStorage;
@@ -26,6 +27,7 @@ describe("Tamper Detection", () => {
     stateStore = new StateStore(storage, masterKey);
     identityEncKey = derivePurposeKey(masterKey, "identity-encryption");
     identity = createIdentity("test", identityEncKey, "recovery-key");
+    await persistStoredIdentity(storage, masterKey, identity.storedIdentity);
 
     // Write a known value
     await stateStore.write(

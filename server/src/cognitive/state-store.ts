@@ -1687,6 +1687,12 @@ export class StateStore {
         `State envelope signature is missing for ${namespace}/${key}`
       );
     }
+    if (typeof entry.sig !== "string") {
+      throw new StateVerificationError(
+        "schema_mismatch",
+        `State envelope legacy ciphertext signature is missing for ${namespace}/${key}`
+      );
+    }
     const envelopeSig = fromBase64url(entry.envelope_sig);
     const legacySig = fromBase64url(entry.sig);
     const signedEnvelope = stateEnvelopeSigningBytes(envelope);

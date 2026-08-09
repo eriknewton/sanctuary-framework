@@ -13,6 +13,7 @@ import {
   type HubAgentController,
 } from "../../src/hub/index.js";
 import type { Task } from "../../src/operational/task-coordination/index.js";
+import { persistStoredIdentity } from "../util/persist-stored-identity.js";
 
 const controller: HubAgentController = {
   async pause() {
@@ -36,7 +37,7 @@ const controller: HubAgentController = {
 
 describe("task to inbox approval chain", () => {
   it("creates a pending approval when a task becomes ready_for_review", async () => {
-    const { auditLog, hub } = makeRig("fortress-a");
+    const { auditLog, hub } = await makeRig("fortress-a");
 
     const task = await hub.createTask({
       title: "Cross harness review",
@@ -71,7 +72,7 @@ describe("task to inbox approval chain", () => {
   });
 
   it("approves a task review inbox item and completes the task", async () => {
-    const { auditLog, hub } = makeRig("fortress-a");
+    const { auditLog, hub } = await makeRig("fortress-a");
     const ready = await createReadyForReviewTask(hub);
 
     await hub.resolveInboxItem(ready.approval_request_id!, "approve");
@@ -114,7 +115,7 @@ describe("task to inbox approval chain", () => {
   });
 
   it("denies a task review inbox item and returns the task to in_progress", async () => {
-    const { auditLog, hub } = makeRig("fortress-a");
+    const { auditLog, hub } = await makeRig("fortress-a");
     const ready = await createReadyForReviewTask(hub);
 
     await hub.resolveInboxItem(ready.approval_request_id!, "deny");
@@ -136,7 +137,7 @@ describe("task to inbox approval chain", () => {
   });
 
   it("leaves the inbox item unresolved when the task transition fails", async () => {
-    const { auditLog, hub } = makeRig("fortress-a");
+    const { auditLog, hub } = await makeRig("fortress-a");
     const ready = await createReadyForReviewTask(hub);
     await hub.updateTaskStatus(ready.id, {
       status: "completed",
@@ -164,8 +165,8 @@ describe("task to inbox approval chain", () => {
   it("does not let a fortress A approval resolve a fortress B task", async () => {
     const storage = new MemoryStorage();
     const masterKey = generateRandomKey();
-    const rigA = makeRig("fortress-a", storage, masterKey);
-    const rigB = makeRig("fortress-b", storage, masterKey);
+    const rigA = await makeRig("fortress-a", storage, masterKey);
+    const rigB = await makeRig("fortress-b", storage, masterKey);
     const readyB = await createReadyForReviewTask(rigB.hub, "agent-b");
     const inboxItemA = rigA.hub.enqueueTaskReviewApproval(readyB, "agent-b");
 
@@ -180,7 +181,7 @@ describe("task to inbox approval chain", () => {
   });
 });
 
-function makeRig(
+async function makeRig(
   fortressId: string,
   storage = new MemoryStorage(),
   masterKey = generateRandomKey(),
@@ -193,6 +194,7 @@ function makeRig(
     identityEncryptionKey,
     "recovery-key",
   );
+  await persistStoredIdentity(storage, masterKey, storedIdentity);
 
   const hub = new HubService({
     identityId: storedIdentity.identity_id,

@@ -41,6 +41,7 @@ import type {
   RetentionFacts,
 } from "../../src/evidence-pack/types.js";
 import { populated, type ReadOutcome } from "../../src/evidence-pack/read-outcome.js";
+import { persistStoredIdentity } from "../util/persist-stored-identity.js";
 
 function rowsOf<T>(o: ReadOutcome<T[]>): T[] {
   return o.status === "populated" ? o.value : [];
@@ -128,17 +129,18 @@ function reportText(pack: EvidencePack): string {
   return report.content;
 }
 
-function makeObservedStore(): {
+async function makeObservedStore(): Promise<{
   store: ObserveStore;
   stateStore: StateStore;
   signer: StoredIdentity;
   masterKey: Uint8Array;
-} {
+}> {
   const storage = new MemoryStorage();
   const masterKey = generateRandomKey();
   const stateStore = new StateStore(storage, masterKey);
   const identityEncryptionKey = derivePurposeKey(masterKey, "identity-encryption");
-  const { storedIdentity } = createIdentity("evidence-r1", identityEncryptionKey, "pw");
+  const { storedIdentity } = createIdentity("evidence-r1", identityEncryptionKey, "passphrase");
+  await persistStoredIdentity(storage, masterKey, storedIdentity);
   const store = new ObserveStore(stateStore, {
     identityId: storedIdentity.identity_id,
     encryptedPrivateKey: storedIdentity.encrypted_private_key,
@@ -221,7 +223,7 @@ describe("buildInventorySnapshot", () => {
     }
   });
 
-  it("rejects a zero-count observed destination before it can sign denied-flow prose", () => {
+  it("rejects a zero-count observed destination before it can sign denied-flow prose", async () => {
     const snap = buildInventorySnapshot({
       observedDestinations: {
         ok: true,
@@ -230,7 +232,7 @@ describe("buildInventorySnapshot", () => {
     });
 
     expect(snap.observed_destinations.status).toBe("read_failed");
-    const fixture = makeObservedStore();
+    const fixture = await makeObservedStore();
     const pack = buildEvidencePack(packInput(snap), deps(fixture.signer, fixture.masterKey));
     const text = reportText(pack);
     expect(text).toContain("malformed candidate evidence");
@@ -343,7 +345,7 @@ describe("buildInventorySnapshot", () => {
 
   describe("R1: strict persisted observe-candidate boundary", () => {
     it("real persisted garbage renders as read_failed with no raw row contents", async () => {
-      const fixture = makeObservedStore();
+      const fixture = await makeObservedStore();
       await fixture.store.putCandidate(
         candidate({
           host: "leaky-r1.example",
@@ -375,7 +377,7 @@ describe("buildInventorySnapshot", () => {
     });
 
     it("real persisted valid observe candidate still renders through the pack", async () => {
-      const fixture = makeObservedStore();
+      const fixture = await makeObservedStore();
       await fixture.store.putCandidate(
         candidate({
           host: "api.telegram.org",

@@ -1286,6 +1286,7 @@ export function createCognitiveTools(
             return toolResult({
               error: "state_verification_failed",
               classification: error.classification,
+              signature_verified: false,
               message: "State verification failed.",
               namespace: args.namespace,
               key: args.key,
