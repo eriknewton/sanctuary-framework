@@ -293,6 +293,7 @@ export interface ExitBundleVerifierResult {
     // pass (identity / reputation) used to collapse to "other"; surface
     // the specific cause so importers can branch on it without parsing
     // the warnings array.
+    | "identity_binding_mismatch"
     | "identity_signature_invalid"
     | "reputation_bundle_signature_invalid"
     | "reputation_completeness_mismatch"

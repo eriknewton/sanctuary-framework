@@ -1,9 +1,3 @@
-// fail-before-exempt: adapted to the exporter's new contract only. This PR makes
-// a supplied-but-empty stateNamespaces array throw, so these call sites now omit
-// the option instead of passing []. Behavior is unchanged (they pass no
-// stateStoragePath, so discovery finds nothing either way) and no assertion was
-// added here, so nothing in this file can fail against pre-fix source. The
-// binding test for the fix is test/exit/exit-export-namespace-discovery.test.ts.
 import { afterEach, describe, expect, it } from "vitest";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -500,6 +494,50 @@ describe("Exit bundle hardening (full-sweep #54 + #55)", () => {
     await writeFile(manifestPath, jsonBytes(manifest));
   }
 
+  async function rewriteManifest(
+    bundleDir: string,
+    signer: Awaited<ReturnType<typeof makeHarness>>,
+    mutate: (manifest: {
+      body: {
+        identity_binding: {
+          identity_id: string;
+          fortress_id: string;
+          fortress_master_pubkey: string;
+          did?: string;
+        };
+      };
+      signature: string;
+    } & Record<string, unknown>) => void
+  ): Promise<void> {
+    const manifestPath = join(bundleDir, "manifest.json");
+    const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+      body: {
+        identity_binding: {
+          identity_id: string;
+          fortress_id: string;
+          fortress_master_pubkey: string;
+          did?: string;
+        };
+      };
+      signature: string;
+    } & Record<string, unknown>;
+    mutate(manifest);
+    const identity = signer.identityManager.getDefault();
+    if (!identity) throw new Error("manifest signer identity missing");
+    const identityEncryptionKey = derivePurposeKey(
+      signer.masterKey,
+      "identity-encryption"
+    );
+    manifest.signature = toBase64url(
+      identitySign(
+        canonicalizeToBytes(manifest.body),
+        identity.encrypted_private_key,
+        identityEncryptionKey
+      )
+    );
+    await writeFile(manifestPath, jsonBytes(manifest));
+  }
+
   const ACTIVATION_NAMESPACES = [
     "_exit_public_identities",
     "_exit_policy_sets",
@@ -617,6 +655,131 @@ describe("Exit bundle hardening (full-sweep #54 + #55)", () => {
     expect(result.passed).toBe(false);
     expect(result.failure_class).toBe("identity_signature_invalid");
     expect(result.identity?.signature_valid).toBe(false);
+  });
+
+  it("M-02: verifier rejects a manifest re-bound to a different identity than public_identity", async () => {
+    const sourceA = await makeHarness();
+    await callTool(sourceA.tools, "identity_create", { label: "source-a" });
+    const sourceB = await makeHarness();
+    await callTool(sourceB.tools, "identity_create", { label: "source-b" });
+
+    const bundleDir = await mkdtemp(join(tmpdir(), "sanctuary-m02-rebound-"));
+    tempDirs.push(bundleDir);
+    await exportFromSource(sourceA, bundleDir);
+
+    const honest = await verifyExitBundle(bundleDir);
+    expect(honest.passed).toBe(true);
+
+    await rewriteManifest(bundleDir, sourceB, (manifest) => {
+      const identity = sourceB.identityManager.getDefault();
+      if (!identity) throw new Error("source-b identity missing");
+      manifest.body.identity_binding = {
+        identity_id: identity.identity_id,
+        fortress_id: identity.did,
+        fortress_master_pubkey: identity.public_key,
+        did: identity.did,
+      };
+    });
+
+    const result = await verifyExitBundle(bundleDir);
+    expect(result.passed).toBe(false);
+    expect(result.failure_class).toBe("identity_binding_mismatch");
+    expect(result.identity?.signature_valid).toBe(true);
+    expect(result.warnings.join("\n")).toContain("identity_binding_mismatch");
+  });
+
+  it("M-02: verifier rejects each manifest/public_identity binding mismatch independently", async () => {
+    const sourceA = await makeHarness();
+    await callTool(sourceA.tools, "identity_create", { label: "source-a-fields" });
+    const sourceB = await makeHarness();
+    await callTool(sourceB.tools, "identity_create", { label: "source-b-fields" });
+    const identityA = sourceA.identityManager.getDefault();
+    const identityB = sourceB.identityManager.getDefault();
+    if (!identityA || !identityB) throw new Error("test identities missing");
+
+    const scenarios = [
+      {
+        name: "identity_id",
+        signer: sourceA,
+        mutate: (binding: {
+          identity_id: string;
+          fortress_id: string;
+          fortress_master_pubkey: string;
+          did?: string;
+        }) => {
+          binding.identity_id = `${binding.identity_id}-other`;
+        },
+        warning: "manifest identity_id does not match",
+      },
+      {
+        name: "fortress_master_pubkey",
+        signer: sourceB,
+        mutate: (binding: {
+          identity_id: string;
+          fortress_id: string;
+          fortress_master_pubkey: string;
+          did?: string;
+        }) => {
+          binding.identity_id = identityA.identity_id;
+          binding.fortress_id = identityA.did;
+          binding.fortress_master_pubkey = identityB.public_key;
+          binding.did = identityA.did;
+        },
+        warning: "manifest fortress_master_pubkey does not match",
+      },
+      {
+        name: "did",
+        signer: sourceA,
+        mutate: (binding: {
+          identity_id: string;
+          fortress_id: string;
+          fortress_master_pubkey: string;
+          did?: string;
+        }) => {
+          binding.did = identityB.did;
+        },
+        warning: "manifest did does not match",
+      },
+    ];
+
+    for (const scenario of scenarios) {
+      const bundleDir = await mkdtemp(
+        join(tmpdir(), `sanctuary-m02-${scenario.name}-`)
+      );
+      tempDirs.push(bundleDir);
+      await exportFromSource(sourceA, bundleDir);
+      await rewriteManifest(bundleDir, scenario.signer, (manifest) => {
+        scenario.mutate(manifest.body.identity_binding);
+      });
+
+      const result = await verifyExitBundle(bundleDir);
+      expect(result.passed, scenario.name).toBe(false);
+      expect(result.failure_class, scenario.name).toBe(
+        "identity_binding_mismatch"
+      );
+      expect(result.warnings.join("\n"), scenario.name).toContain(
+        scenario.warning
+      );
+    }
+  });
+
+  it("M-02: verifier accepts the named legacy path where manifest identity_binding.did is absent", async () => {
+    const source = await makeHarness();
+    await callTool(source.tools, "identity_create", { label: "legacy-did-absent" });
+    const bundleDir = await mkdtemp(join(tmpdir(), "sanctuary-m02-legacy-did-"));
+    tempDirs.push(bundleDir);
+    await exportFromSource(source, bundleDir);
+
+    await rewriteManifest(bundleDir, source, (manifest) => {
+      delete manifest.body.identity_binding.did;
+    });
+
+    const result = await verifyExitBundle(bundleDir);
+    expect(result.passed).toBe(true);
+    expect(result.identity?.signature_valid).toBe(true);
+    expect(result.warnings.join("\n")).toContain(
+      "legacy_identity_binding_did_absent"
+    );
   });
 
   it("#77: verifier surfaces reputation_bundle_signature_invalid when reputation bundle signature is tampered", async () => {
