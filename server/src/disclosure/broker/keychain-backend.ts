@@ -180,6 +180,7 @@ export class KeychainBackend implements Backend {
 
   async addSecret(name: string, value: string): Promise<void> {
     this.assertUnlocked();
+    // Secret names are validated before any security(1) call, so names cannot inject args or poison dump parsing.
     validateSecretName(name);
     const account = brokerAccountForSecret(name, this.accountNamespace);
     // Check existence first to preserve explicit "rotate required" semantics.
@@ -212,6 +213,7 @@ export class KeychainBackend implements Backend {
 
   async readSecret(name: string): Promise<string> {
     this.assertUnlocked();
+    // The unlock flag and name grammar are checked before reading, so a token cannot address arbitrary keychain items.
     validateSecretName(name);
     const value = await this.findGeneric(name, { returnValue: true });
     if (value === null) {
@@ -296,6 +298,7 @@ export class KeychainBackend implements Backend {
 
   private assertUnlocked(): void {
     if (!this.unlocked) {
+      // A missing in-process unlock is a hard refusal; the backend never tries a silent login-keychain fallback.
       throw new BackendLockedError();
     }
   }
@@ -414,6 +417,7 @@ function validateSecretName(name: string): void {
     throw new Error("Secret name must be 1..256 characters");
   }
   if (!/^[A-Za-z0-9._\-:/]+$/.test(name)) {
+    // The allowlist is deliberately narrower than keychain account syntax to keep CLI args and dump parsing unambiguous.
     throw new Error(
       `Secret name contains invalid characters: ${JSON.stringify(name)} (allowed: letters, digits, .-_/:)`
     );

@@ -119,6 +119,7 @@ async function loadBrokerGrants(storagePath: string) {
     const raw = await readFile(policyPath, "utf8");
     return parseBrokerPolicy(JSON.parse(raw));
   } catch {
+    // Missing or malformed broker policy resolves to zero grants, so load failure denies access instead of allowing all.
     return [];
   }
 }

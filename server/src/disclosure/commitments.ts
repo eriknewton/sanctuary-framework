@@ -90,7 +90,8 @@ export function verifyCommitment(
   const combined = concatBytes(valueBytes, blindingBytes);
   const expectedHash = toBase64url(hash(combined));
 
-  // Constant-time comparison prevents timing attacks on commitment verification
+  // Reveal verification recomputes SHA-256(value || blinding); the commitment string alone is never trusted.
+  // Constant-time comparison prevents timing attacks on commitment verification.
   const commitmentBytes = fromBase64url(commitment);
   const expectedBytes = fromBase64url(expectedHash);
   return constantTimeEqual(commitmentBytes, expectedBytes);
@@ -145,6 +146,7 @@ export class CommitmentStore {
       const decrypted = decrypt(encrypted, this.encryptionKey);
       return JSON.parse(bytesToString(decrypted));
     } catch {
+      // Corrupt or wrong-key ciphertext is treated as missing; the store never falls back to plaintext commitment data.
       return null;
     }
   }
