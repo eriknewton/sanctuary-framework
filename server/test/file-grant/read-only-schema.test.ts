@@ -14,7 +14,7 @@ import { FakeFsOps, makeFileGrantTestStore } from "./fixtures.js";
 
 describe("file-grant read-only schema enforcement", () => {
   it("rejects mode: write with a typed error", async () => {
-    const { grantStore } = makeFileGrantTestStore();
+    const { grantStore } = await makeFileGrantTestStore();
     const fsOps = new FakeFsOps();
 
     await expect(
@@ -37,7 +37,7 @@ describe("file-grant read-only schema enforcement", () => {
   });
 
   it("rejects an arbitrary non-read mode string", async () => {
-    const { grantStore } = makeFileGrantTestStore();
+    const { grantStore } = await makeFileGrantTestStore();
     const fsOps = new FakeFsOps();
 
     await expect(

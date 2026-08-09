@@ -46,6 +46,23 @@ function makeStateRig() {
   return { storage, masterKey, identityEncKey, identity, stateStore };
 }
 
+type StateRig = ReturnType<typeof makeStateRig>;
+
+async function persistRigIdentity(rig: StateRig): Promise<void> {
+  await rig.storage.write(
+    "_identities",
+    rig.identity.storedIdentity.identity_id,
+    stringToBytes(
+      JSON.stringify(
+        encrypt(
+          stringToBytes(JSON.stringify(rig.identity.storedIdentity)),
+          rig.identityEncKey
+        )
+      )
+    )
+  );
+}
+
 async function readEntry(
   storage: MemoryStorage,
   namespace: string,
@@ -103,7 +120,9 @@ async function writeLegacyEntry(args: {
 
 describe("state envelope integrity", () => {
   it("round trips with default envelope verification", async () => {
-    const { stateStore, identity, identityEncKey } = makeStateRig();
+    const rig = makeStateRig();
+    await persistRigIdentity(rig);
+    const { stateStore, identity, identityEncKey } = rig;
 
     await stateStore.write(
       "memory",
@@ -147,7 +166,9 @@ describe("state envelope integrity", () => {
   });
 
   it("tampering with signed provenance fails verification before read", async () => {
-    const { storage, masterKey, stateStore, identity, identityEncKey } = makeStateRig();
+    const rig = makeStateRig();
+    await persistRigIdentity(rig);
+    const { storage, masterKey, stateStore, identity, identityEncKey } = rig;
 
     await stateStore.write(
       "memory",
@@ -175,7 +196,9 @@ describe("state envelope integrity", () => {
   });
 
   it("detects namespace metadata tampering after write", async () => {
-    const { storage, masterKey, stateStore, identity, identityEncKey } = makeStateRig();
+    const rig = makeStateRig();
+    await persistRigIdentity(rig);
+    const { storage, masterKey, stateStore, identity, identityEncKey } = rig;
 
     await stateStore.write(
       "memory",
@@ -198,7 +221,9 @@ describe("state envelope integrity", () => {
   });
 
   it("detects version rollback after restart", async () => {
-    const { storage, masterKey, stateStore, identity, identityEncKey } = makeStateRig();
+    const rig = makeStateRig();
+    await persistRigIdentity(rig);
+    const { storage, masterKey, stateStore, identity, identityEncKey } = rig;
 
     await stateStore.write(
       "memory",
@@ -228,9 +253,8 @@ describe("state envelope integrity", () => {
     } satisfies Partial<StateVerificationError>);
   });
 
-  it("detects a wrong public key for the writer kid", async () => {
+  it("state_read refuses a matching signature when the writer key comes only from the plaintext registry", async () => {
     const { storage, masterKey, stateStore, identity, identityEncKey } = makeStateRig();
-    const otherIdentity = createIdentity("other", identityEncKey, "recovery-key");
 
     await stateStore.write(
       "memory",
@@ -240,21 +264,27 @@ describe("state envelope integrity", () => {
       identity.storedIdentity.encrypted_private_key,
       identityEncKey
     );
-    await storage.write(
-      "_meta",
-      "state-envelope-public-keys-v1",
-      stringToBytes(
-        JSON.stringify({
-          [identity.storedIdentity.identity_id]: otherIdentity.publicIdentity.public_key,
-        })
-      )
-    );
+    expect(await storage.read("_identities", identity.storedIdentity.identity_id)).toBeNull();
 
-    const freshStore = new StateStore(storage, masterKey);
-    await expect(freshStore.read("memory", "profile")).rejects.toMatchObject({
-      name: "StateVerificationError",
-      classification: "signature_mismatch",
-    } satisfies Partial<StateVerificationError>);
+    const stateStoreForTool = new StateStore(storage, masterKey);
+    const auditLog = new AuditLog(storage, masterKey);
+    const { tools, identityManager } = createL1Tools(
+      stateStoreForTool,
+      storage,
+      masterKey,
+      "recovery-key",
+      auditLog
+    );
+    await identityManager.load();
+
+    const read = await callTool(tools, "state_read", {
+      namespace: "memory",
+      key: "profile",
+    });
+
+    expect(read.error).toBe("state_verification_failed");
+    expect(read.classification).toBe("kid_unknown");
+    expect(read.signature_verified).not.toBe(true);
   });
 
   it("loads legacy schema-1 entries with a warning", async () => {
@@ -329,7 +359,9 @@ describe("state envelope integrity", () => {
   });
 
   it("rejects a legacy (v1) entry that leapfrogs an established anchor (F1)", async () => {
-    const { storage, masterKey, stateStore, identity, identityEncKey } = makeStateRig();
+    const rig = makeStateRig();
+    await persistRigIdentity(rig);
+    const { storage, masterKey, stateStore, identity, identityEncKey } = rig;
 
     // Establish an anchor with a genuine v2 write.
     await stateStore.write(
@@ -386,7 +418,9 @@ describe("state envelope integrity", () => {
   });
 
   it("rejects an in-place LOWERING of the MAC-authenticated version anchor (F1)", async () => {
-    const { storage, masterKey, stateStore, identity, identityEncKey } = makeStateRig();
+    const rig = makeStateRig();
+    await persistRigIdentity(rig);
+    const { storage, masterKey, stateStore, identity, identityEncKey } = rig;
     // Two v2 writes -> balance at version 2, MAC'd anchor = 2.
     await stateStore.write(
       "memory",
@@ -508,7 +542,9 @@ describe("state envelope integrity", () => {
   });
 
   it("readUnverified works for explicit legacy migration paths", async () => {
-    const { storage, stateStore, identity, identityEncKey } = makeStateRig();
+    const rig = makeStateRig();
+    await persistRigIdentity(rig);
+    const { storage, stateStore, identity, identityEncKey } = rig;
 
     await stateStore.write(
       "memory",

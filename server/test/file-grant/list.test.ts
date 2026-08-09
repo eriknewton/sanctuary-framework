@@ -13,7 +13,7 @@ import { FakeFsOps, makeFileGrantTestStore } from "./fixtures.js";
 
 describe("file-grant list projection", () => {
   it("projects a past-TTL grant as expired without mutating the persisted record", async () => {
-    const { grantStore } = makeFileGrantTestStore();
+    const { grantStore } = await makeFileGrantTestStore();
     const fsOps = new FakeFsOps({ agentUid: 502, sourceOwnerUid: 501 });
 
     const { grant } = await mintFileGrant(
@@ -39,7 +39,7 @@ describe("file-grant list projection", () => {
   });
 
   it("filters by subjectAgentId", async () => {
-    const { grantStore } = makeFileGrantTestStore();
+    const { grantStore } = await makeFileGrantTestStore();
     const fsOps = new FakeFsOps({ agentUid: 502, sourceOwnerUid: 501 });
 
     await mintFileGrant(
@@ -69,7 +69,7 @@ describe("file-grant list projection", () => {
   });
 
   it("returns an empty list when there are no grants", async () => {
-    const { grantStore } = makeFileGrantTestStore();
+    const { grantStore } = await makeFileGrantTestStore();
     expect(await listFileGrants(grantStore, new Date())).toEqual([]);
   });
 });

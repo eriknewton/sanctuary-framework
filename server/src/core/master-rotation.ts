@@ -112,6 +112,7 @@ import {
 } from "../operational/audit-log.js";
 import { writeEpochWitness } from "./anti-rollback.js";
 import {
+  resolveAuthenticatedIdentityWriterPublicKeys,
   rotateStateEntryBytes,
   rotateStateMetaRecordBytes,
   STATE_META_PUBLIC_KEYS_KEY,
@@ -908,6 +909,8 @@ async function resolveWriter(
             encryptedPrivateKey: identity.encrypted_private_key,
             identityEncryptionKey: idKey,
             publicKey: fromBase64url(identity.public_key),
+            verificationPublicKeys:
+              resolveAuthenticatedIdentityWriterPublicKeys(identity),
           };
           break;
         } catch {

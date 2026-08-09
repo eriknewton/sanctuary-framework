@@ -317,7 +317,7 @@ describe("file-grant ACL command argv construction", () => {
   });
 
   it("macOS grant verifies a hard-link ACL target before chmod and can reach met", async () => {
-    const { grantStore } = makeFileGrantTestStore();
+    const { grantStore } = await makeFileGrantTestStore();
     const fortress = await mkdtemp(join(tmpdir(), "sanctuary-file-grant-mac-"));
     const exec = makeRecordingExecRunner();
     const macLinks = makeMacAclLinkOps({ identity: { source_dev: "11", source_ino: "22" } });
@@ -395,7 +395,7 @@ describe("file-grant ACL command argv construction", () => {
   });
 
   it("macOS grant fails closed when the hard-link inode differs from the pinned source", async () => {
-    const { grantStore } = makeFileGrantTestStore();
+    const { grantStore } = await makeFileGrantTestStore();
     const fortress = await mkdtemp(join(tmpdir(), "sanctuary-file-grant-mac-"));
     const exec = makeRecordingExecRunner();
     const macLinks = makeMacAclLinkOps({ identity: { source_dev: "11", source_ino: "23" } });
@@ -436,7 +436,7 @@ describe("file-grant ACL command argv construction", () => {
   });
 
   it("macOS grant fails closed on EXDEV without applying an ACE", async () => {
-    const { grantStore } = makeFileGrantTestStore();
+    const { grantStore } = await makeFileGrantTestStore();
     const fortress = await mkdtemp(join(tmpdir(), "sanctuary-file-grant-mac-"));
     const exec = makeRecordingExecRunner();
     const macLinks = makeMacAclLinkOps({
@@ -1079,7 +1079,7 @@ describe("file-grant ACL command argv construction", () => {
     let markProbeEntered: () => void = () => {};
     const probeEntered = new Promise<void>((r) => (markProbeEntered = r));
 
-    const { grantStore } = makeFileGrantTestStore();
+    const { grantStore } = await makeFileGrantTestStore();
     const fsOps = new PosixFileGrantFsOps(fortress, {
       platform: "linux",
       execRunner: {

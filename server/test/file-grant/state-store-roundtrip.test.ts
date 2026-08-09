@@ -28,6 +28,7 @@ import { MemoryStorage } from "../../src/storage/memory.js";
 import { createIdentity } from "../../src/core/identity.js";
 import { derivePurposeKey } from "../../src/core/key-derivation.js";
 import { generateRandomKey } from "../../src/core/random.js";
+import { persistStoredIdentity } from "../util/persist-stored-identity.js";
 import {
   FileGrantStore,
   FILE_GRANT_NAMESPACE,
@@ -36,12 +37,13 @@ import {
   type FileGrant,
 } from "../../src/file-grant/index.js";
 
-function makeStore() {
+async function makeStore() {
   const storage = new MemoryStorage();
   const masterKey = generateRandomKey();
   const stateStore = new StateStore(storage, masterKey);
   const identityEncKey = derivePurposeKey(masterKey, "identity-encryption");
   const { storedIdentity } = createIdentity("operator", identityEncKey, "passphrase");
+  await persistStoredIdentity(storage, masterKey, storedIdentity);
   const grantStore = new FileGrantStore(stateStore, {
     identityId: storedIdentity.identity_id,
     encryptedPrivateKey: storedIdentity.encrypted_private_key,
@@ -70,7 +72,7 @@ function makeGrant(overrides: Partial<FileGrant> = {}): FileGrant {
 
 describe("file-grant StateStore round-trip", () => {
   it("writes, reads, lists, and deletes a grant through real StateStore code", async () => {
-    const { stateStore, grantStore } = makeStore();
+    const { stateStore, grantStore } = await makeStore();
     const grant = makeGrant();
 
     await grantStore.put(grant);
@@ -97,7 +99,7 @@ describe("file-grant StateStore round-trip", () => {
   });
 
   it("the operator inspects a grant through the file-grant list path (not the agent state_* tools)", async () => {
-    const { grantStore } = makeStore();
+    const { grantStore } = await makeStore();
     const grant = makeGrant();
     await grantStore.put(grant);
 
@@ -110,12 +112,12 @@ describe("file-grant StateStore round-trip", () => {
   });
 
   it("get returns null for an absent grant id", async () => {
-    const { grantStore } = makeStore();
+    const { grantStore } = await makeStore();
     expect(await grantStore.get("fg_doesnotexist000")).toBeNull();
   });
 
   it("lists ALL grants past the 100-key default page (R2-6)", async () => {
-    const { grantStore } = makeStore();
+    const { grantStore } = await makeStore();
     // The underlying stateStore.list() caps each call at limit=100. A grant set
     // larger than one page must still be fully listed (and therefore fully
     // reconciled) -- grants 101+ must never be silently dropped.

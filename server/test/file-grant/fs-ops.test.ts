@@ -224,7 +224,7 @@ describe("PosixFileGrantFsOps (real filesystem, same-uid lane)", () => {
         },
       },
     });
-    const { grantStore } = makeFileGrantTestStore();
+    const { grantStore } = await makeFileGrantTestStore();
 
     await expect(
       mintFileGrant(

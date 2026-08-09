@@ -115,7 +115,7 @@ function makeMacRevokeFsOps(params: {
 
 describe("file-grant revoke: idempotent + audited", () => {
   it("revoking an active grant marks it revoked, scrubs the tree entry, and audits", async () => {
-    const { grantStore, auditLog } = makeFileGrantTestStore();
+    const { grantStore, auditLog } = await makeFileGrantTestStore();
     const fsOps = new FakeFsOps({ agentUid: 502, sourceOwnerUid: 501 });
 
     const { grant } = await mintFileGrant(
@@ -150,7 +150,7 @@ describe("file-grant revoke: idempotent + audited", () => {
   });
 
   it("revoking a verified grant removes the ACL before scrubbing the tree entry", async () => {
-    const { grantStore, auditLog } = makeFileGrantTestStore();
+    const { grantStore, auditLog } = await makeFileGrantTestStore();
     const fsOps = new FakeFsOps({
       agentUid: 502,
       sourceOwnerUid: 501,
@@ -195,7 +195,7 @@ describe("file-grant revoke: idempotent + audited", () => {
   });
 
   it("surfaces a durable ACE metadata-clear write failure after confirmed scrub", async () => {
-    const { grantStore, auditLog } = makeFileGrantTestStore();
+    const { grantStore, auditLog } = await makeFileGrantTestStore();
     const fsOps = new FakeFsOps({
       agentUid: 502,
       sourceOwnerUid: 501,
@@ -250,7 +250,7 @@ describe("file-grant revoke: idempotent + audited", () => {
   });
 
   it("double-revoke is a no-op success, not an error", async () => {
-    const { grantStore, auditLog } = makeFileGrantTestStore();
+    const { grantStore, auditLog } = await makeFileGrantTestStore();
     const fsOps = new FakeFsOps({ agentUid: 502, sourceOwnerUid: 501 });
 
     const { grant } = await mintFileGrant(
@@ -288,7 +288,7 @@ describe("file-grant revoke: idempotent + audited", () => {
   });
 
   it("revoking a nonexistent grant id returns found: false and audits a failure", async () => {
-    const { grantStore, auditLog } = makeFileGrantTestStore();
+    const { grantStore, auditLog } = await makeFileGrantTestStore();
     const fsOps = new FakeFsOps();
 
     const result = await revokeFileGrant("fg_doesnotexist000", "operator-1", {
@@ -307,7 +307,7 @@ describe("file-grant revoke: idempotent + audited", () => {
   });
 
   it("propagates a scrub failure but keeps the record revoked (never resurrected to active)", async () => {
-    const { grantStore, auditLog } = makeFileGrantTestStore();
+    const { grantStore, auditLog } = await makeFileGrantTestStore();
     const mintFsOps = new FakeFsOps({ agentUid: 502, sourceOwnerUid: 501 });
 
     const { grant } = await mintFileGrant(
@@ -339,7 +339,7 @@ describe("file-grant revoke: idempotent + audited", () => {
   });
 
   it("removes the ACE for the persisted uid even if the current descriptor drifts", async () => {
-    const { grantStore, auditLog } = makeFileGrantTestStore();
+    const { grantStore, auditLog } = await makeFileGrantTestStore();
     const mintFsOps = new FakeFsOps({
       agentUid: 502,
       sourceOwnerUid: 501,
@@ -382,7 +382,7 @@ describe("file-grant revoke: idempotent + audited", () => {
   });
 
   it("does not remove a persisted ACE when the source inode has changed", async () => {
-    const { grantStore, auditLog } = makeFileGrantTestStore();
+    const { grantStore, auditLog } = await makeFileGrantTestStore();
     const mintFsOps = new FakeFsOps({
       agentUid: 502,
       sourceOwnerUid: 501,
@@ -431,7 +431,7 @@ describe("file-grant revoke: idempotent + audited", () => {
   });
 
   it("Linux reports ACL removal failure honestly while still unlinking the grant-tree symlink", async () => {
-    const { grantStore, auditLog } = makeFileGrantTestStore();
+    const { grantStore, auditLog } = await makeFileGrantTestStore();
     const fsOps = new FakeFsOps({
       agentUid: 502,
       sourceOwnerUid: 501,
@@ -475,7 +475,7 @@ describe("file-grant revoke: idempotent + audited", () => {
   it("macOS chmod failure keeps the trusted hard link and ACE metadata until retry succeeds", async () => {
     const fortress = await mkdtemp(join(tmpdir(), "sanctuary-file-grant-revoke-mac-"));
     try {
-      const { grantStore, auditLog } = makeFileGrantTestStore();
+      const { grantStore, auditLog } = await makeFileGrantTestStore();
       const identity = { source_dev: "11", source_ino: "22" };
       const treeEntry = "agent-1/fg_mac_retry";
       const trustedPath = join(fortress, "grants", treeEntry);
@@ -539,7 +539,7 @@ describe("file-grant revoke: idempotent + audited", () => {
   it("macOS missing hard link at revoke keeps ACE metadata and reports failure, not removed", async () => {
     const fortress = await mkdtemp(join(tmpdir(), "sanctuary-file-grant-revoke-mac-"));
     try {
-      const { grantStore, auditLog } = makeFileGrantTestStore();
+      const { grantStore, auditLog } = await makeFileGrantTestStore();
       const identity = { source_dev: "11", source_ino: "22" };
       const treeEntry = "agent-1/fg_mac_missing";
       const trustedPath = join(fortress, "grants", treeEntry);

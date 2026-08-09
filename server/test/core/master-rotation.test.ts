@@ -62,6 +62,7 @@ import {
 import { generateRandomKey } from "../../src/core/random.js";
 import { encrypt, decrypt, type EncryptedPayload } from "../../src/core/encryption.js";
 import {
+  fromBase64url,
   toBase64url,
   stringToBytes,
   bytesToString,
@@ -106,7 +107,7 @@ import {
   FEDERATION_REISSUE_CHALLENGE_STORE_KEY,
   FEDERATION_REISSUE_CHALLENGE_STORE_HKDF_INFO,
 } from "../../src/v1/federation-reissue-challenge-store.js";
-import type { StoredIdentity } from "../../src/core/identity.js";
+import { rotateKeys, type StoredIdentity } from "../../src/core/identity.js";
 
 const PASSPHRASE = "rotation-test-passphrase";
 const KID = "agent-rotate-1";
@@ -245,6 +246,44 @@ function rotateOpts(
   };
 }
 
+async function readResidentIdentity(
+  fortress: Fortress,
+): Promise<{ identity: StoredIdentity; identityKey: Uint8Array }> {
+  const identityKey = derivePurposeKey(fortress.master, "identity-encryption");
+  const raw = await fortress.storage.read("_identities", KID);
+  if (!raw) throw new Error(`missing test identity ${KID}`);
+  const encrypted = JSON.parse(bytesToString(raw)) as EncryptedPayload;
+  const identity = JSON.parse(
+    bytesToString(decrypt(encrypted, identityKey))
+  ) as StoredIdentity;
+  return { identity, identityKey };
+}
+
+async function writeResidentIdentity(
+  fortress: Fortress,
+  identity: StoredIdentity,
+  identityKey: Uint8Array,
+): Promise<void> {
+  await fortress.storage.write(
+    "_identities",
+    KID,
+    stringToBytes(
+      JSON.stringify(encrypt(stringToBytes(JSON.stringify(identity)), identityKey))
+    )
+  );
+}
+
+async function rotateResidentIdentity(fortress: Fortress): Promise<StoredIdentity> {
+  const { identity, identityKey } = await readResidentIdentity(fortress);
+  const { updatedIdentity } = rotateKeys(
+    identity,
+    identityKey,
+    "test identity rotation"
+  );
+  await writeResidentIdentity(fortress, updatedIdentity, identityKey);
+  return updatedIdentity;
+}
+
 /** Full post-rotation verification battery. */
 async function verifyRotated(
   fortress: Fortress,
@@ -366,6 +405,36 @@ describe("master rotation — happy path", () => {
     expect(result.converted_entries).toBeGreaterThan(0);
     expect(result.old_wrap_ids.length).toBeGreaterThan(0);
     await verifyRotated(fortress, { newRecoveryKey: disclosedKey });
+  });
+
+  it("rotates the master after identity rotation, preserving entries signed by old and current identity keys", async () => {
+    const fortress = await buildFortress();
+    const updatedIdentity = await rotateResidentIdentity(fortress);
+    const { identityKey } = await readResidentIdentity(fortress);
+
+    const stateStore = new StateStore(fortress.storage, fortress.master);
+    await stateStore.write(
+      "notes",
+      "after-identity-rotate",
+      "written after identity rotation",
+      KID,
+      updatedIdentity.encrypted_private_key,
+      identityKey
+    );
+
+    await rotateMaster(rotateOpts(fortress));
+    const est = await establishMaster({
+      storage: fortress.storage,
+      passphrase: PASSPHRASE,
+    });
+    const rotatedStore = new StateStore(fortress.storage, est.masterKey);
+
+    const before = await rotatedStore.read("notes", "k1");
+    const after = await rotatedStore.read("notes", "after-identity-rotate");
+    expect(before?.value).toBe("hello sovereign world");
+    expect(before?.signature_verified).toBe(true);
+    expect(after?.value).toBe("written after identity rotation");
+    expect(after?.signature_verified).toBe(true);
   });
 
   it("re-encrypts the castle pin file in place", async () => {
@@ -1085,6 +1154,41 @@ describe("master rotation — fail-closed coverage", () => {
     await expect(rotateMaster(rotateOpts(fortress))).rejects.toThrow(
       RotationPreflightError
     );
+  });
+
+  it("aborts when a state entry verifies under no authenticated key in the writer chain", async () => {
+    const fortress = await buildFortress();
+    await rotateResidentIdentity(fortress);
+
+    const raw = await fortress.storage.read("notes", "k1");
+    const entry = JSON.parse(bytesToString(raw!)) as StateEntry;
+    const rogueSeed = generateRandomKey();
+    entry.sig = toBase64url(
+      ed25519.sign(fromBase64url(entry.payload.ct), rogueSeed)
+    );
+    await fortress.storage.write(
+      "notes",
+      "k1",
+      stringToBytes(JSON.stringify(entry))
+    );
+
+    let captureCalled = false;
+    await expect(
+      rotateMaster(
+        rotateOpts(fortress, {
+          captureRecoveryKey: async (rk, verify) => {
+            captureCalled = true;
+            return verify(rk);
+          },
+        })
+      )
+    ).rejects.toThrow(RotationPreflightError);
+    expect(captureCalled).toBe(false);
+    const est = await establishMaster({
+      storage: fortress.storage,
+      passphrase: PASSPHRASE,
+    });
+    expect(toBase64url(est.masterKey)).toBe(toBase64url(fortress.master));
   });
 });
 

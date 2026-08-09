@@ -53,6 +53,7 @@ import {
   type CandidateObservation,
   type FoldWatermark,
 } from "../../../src/castle-wall/observe/types.js";
+import { persistStoredIdentity } from "../../util/persist-stored-identity.js";
 
 interface Harness {
   auditLog: AuditLog;
@@ -112,12 +113,13 @@ function signedDetailsFor(input: {
   };
 }
 
-function makeHarness(): Harness {
+async function makeHarness(): Promise<Harness> {
   const stateStorage = new MemoryStorage();
   const masterKey = generateRandomKey();
   const stateStore = new StateStore(stateStorage, masterKey);
   const identityEncKey = derivePurposeKey(masterKey, "identity-encryption");
   const { storedIdentity } = createIdentity("operator", identityEncKey, "passphrase");
+  await persistStoredIdentity(stateStorage, masterKey, storedIdentity);
   const store = new ObserveStore(stateStore, {
     identityId: storedIdentity.identity_id,
     encryptedPrivateKey: storedIdentity.encrypted_private_key,
@@ -328,7 +330,7 @@ async function onlyCandidate(store: ObserveStore): Promise<CandidateObservation>
 
 describe("refresh idempotency (R3-1a: refresh-twice yields identical times_seen)", () => {
   it("the sweep's empirical probe: folding the same 2-event history through two refreshes keeps times_seen at 2, never 4", async () => {
-    const harness = makeHarness();
+    const harness = await makeHarness();
     await appendBlocked(harness.auditLog);
     await appendBlocked(harness.auditLog);
 
@@ -344,7 +346,7 @@ describe("refresh idempotency (R3-1a: refresh-twice yields identical times_seen)
   });
 
   it("N extra refreshes over unchanged history leave every count and field byte-identical", async () => {
-    const harness = makeHarness();
+    const harness = await makeHarness();
     await appendBlocked(harness.auditLog);
     await appendBlocked(harness.auditLog, { host: "other.example.net", ip: "198.51.100.7", port: 8443 });
 
@@ -356,7 +358,7 @@ describe("refresh idempotency (R3-1a: refresh-twice yields identical times_seen)
   });
 
   it("a genuinely NEW observation after a refresh is reflected by the next full recompute", async () => {
-    const harness = makeHarness();
+    const harness = await makeHarness();
     await appendBlocked(harness.auditLog);
     await appendBlocked(harness.auditLog);
     await refresh(harness);
@@ -371,7 +373,7 @@ describe("refresh idempotency (R3-1a: refresh-twice yields identical times_seen)
 
 describe("Option A source enumeration and read witnesses", () => {
   it("opens both master-audit and boot-audit, folds their retained histories, and re-refreshes idempotently", async () => {
-    const harness = makeHarness();
+    const harness = await makeHarness();
     await appendBlocked(harness.auditLog, { host: "master.example.com", ip: "203.0.113.10" });
     await appendBlocked(harness.bootAuditLog, { host: "boot.example.com", ip: "203.0.113.11" });
 
@@ -402,7 +404,7 @@ describe("Option A source enumeration and read witnesses", () => {
   });
 
   it("aggregates overlapping master and boot observations into one candidate count without multiplying on refresh", async () => {
-    const harness = makeHarness();
+    const harness = await makeHarness();
     await appendBlocked(harness.auditLog);
     await appendBlocked(harness.bootAuditLog);
 
@@ -414,7 +416,7 @@ describe("Option A source enumeration and read witnesses", () => {
   });
 
   it("allows absent only for a source that has never contributed to this store", async () => {
-    const harness = makeHarness();
+    const harness = await makeHarness();
     const absentBoot: RefreshAuditSourceDescriptor = {
       source_id: "boot-audit",
       status: "absent",
@@ -447,7 +449,7 @@ describe("Option A source enumeration and read witnesses", () => {
   });
 
   it("treats a changed boot segment after contribution as incomplete rather than withdrawing its prior aggregate", async () => {
-    const harness = makeHarness();
+    const harness = await makeHarness();
     await appendBlocked(harness.bootAuditLog);
     await refreshBoth(harness);
 
@@ -470,7 +472,7 @@ describe("Option A source enumeration and read witnesses", () => {
   });
 
   it("crash retry under snapshot replacement converges without double-counting", async () => {
-    const harness = makeHarness();
+    const harness = await makeHarness();
     await appendBlocked(harness.bootAuditLog);
     await appendBlocked(harness.bootAuditLog);
 
@@ -507,7 +509,7 @@ describe("Option A source enumeration and read witnesses", () => {
 
 describe("promote/discard non-resurrection (R3-1b)", () => {
   it("promote-then-refresh does NOT resurrect the promoted destination (watermark leg: history is already folded)", async () => {
-    const harness = makeHarness();
+    const harness = await makeHarness();
     await appendBlocked(harness.auditLog);
     await appendBlocked(harness.auditLog);
     await refresh(harness);
@@ -523,7 +525,7 @@ describe("promote/discard non-resurrection (R3-1b)", () => {
   });
 
   it("promoted destination stays out even through a recompute heal (allowlist leg: the belt when the watermark cannot protect)", async () => {
-    const harness = makeHarness();
+    const harness = await makeHarness();
     await appendBlocked(harness.auditLog);
     await appendBlocked(harness.auditLog);
     // NO prior refresh: no watermark, so this refresh replays FULL history
@@ -536,7 +538,7 @@ describe("promote/discard non-resurrection (R3-1b)", () => {
   });
 
   it("discard-then-refresh does not resurrect; a NEW observation re-mints with a RESTARTED count (the legend's semantics)", async () => {
-    const harness = makeHarness();
+    const harness = await makeHarness();
     await appendBlocked(harness.auditLog);
     await appendBlocked(harness.auditLog);
     await appendBlocked(harness.auditLog);
@@ -558,7 +560,7 @@ describe("promote/discard non-resurrection (R3-1b)", () => {
   });
 
   it("R1 Option A: coarse promote marker in master prevents boot-audit recompute from resurrecting the removed row", async () => {
-    const harness = makeHarness();
+    const harness = await makeHarness();
     await appendBlocked(harness.bootAuditLog);
     await refreshBoth(harness);
     const candidate = await onlyCandidate(harness.store);
@@ -574,7 +576,7 @@ describe("promote/discard non-resurrection (R3-1b)", () => {
   });
 
   it("R1 Option A: exclusive promote retains the row across boot-audit recomputes without reminting a duplicate", async () => {
-    const harness = makeHarness();
+    const harness = await makeHarness();
     await appendBlocked(harness.bootAuditLog);
     await refreshBoth(harness);
     expect((await onlyCandidate(harness.store)).times_seen).toBe(1);
@@ -590,7 +592,7 @@ describe("promote/discard non-resurrection (R3-1b)", () => {
   });
 
   it("R1 Option A: discard marker in master prevents boot-audit recompute from resurrecting a discarded row", async () => {
-    const harness = makeHarness();
+    const harness = await makeHarness();
     await appendBlocked(harness.bootAuditLog);
     await refreshBoth(harness);
     const candidate = await onlyCandidate(harness.store);
@@ -606,7 +608,7 @@ describe("promote/discard non-resurrection (R3-1b)", () => {
   });
 
   it("persists the review tombstone before row removal, so pruning the master review marker cannot re-mint a resolved boot-audit candidate", async () => {
-    const harness = makeHarness();
+    const harness = await makeHarness();
     await appendBlocked(harness.bootAuditLog, { timestamp: "2026-07-14T09:00:00.000Z" });
     await refreshBoth(harness);
     const candidate = await onlyCandidate(harness.store);
@@ -627,7 +629,7 @@ describe("promote/discard non-resurrection (R3-1b)", () => {
   });
 
   it("persists the review tombstone before row removal, so a master-chain reset cannot re-mint a resolved boot-audit candidate", async () => {
-    const harness = makeHarness();
+    const harness = await makeHarness();
     await appendBlocked(harness.bootAuditLog, { timestamp: "2026-07-14T09:00:00.000Z" });
     await refreshBoth(harness);
     const candidate = await onlyCandidate(harness.store);
@@ -645,7 +647,7 @@ describe("promote/discard non-resurrection (R3-1b)", () => {
   });
 
   it("allows a genuinely new post-resolution event to re-surface the tombstoned candidate with a restarted, stable count", async () => {
-    const harness = makeHarness();
+    const harness = await makeHarness();
     await appendBlocked(harness.bootAuditLog, { timestamp: "2026-07-14T09:00:00.000Z" });
     await appendBlocked(harness.bootAuditLog, { timestamp: "2026-07-14T09:05:00.000Z" });
     await refreshBoth(harness);
@@ -671,7 +673,7 @@ describe("promote/discard non-resurrection (R3-1b)", () => {
 
 describe("allowlist-aware fold + prune (R3-1b, chokepoint requirement 2)", () => {
   it("an already-allowed destination is never minted, while a not-allowed one still is", async () => {
-    const harness = makeHarness();
+    const harness = await makeHarness();
     await appendBlocked(harness.auditLog); // api.example.com -- allowed below
     await appendBlocked(harness.auditLog, { host: "blocked.example.net", ip: "198.51.100.9" });
 
@@ -682,7 +684,7 @@ describe("allowlist-aware fold + prune (R3-1b, chokepoint requirement 2)", () =>
   });
 
   it("a PERSISTED pending candidate whose destination the policy now permits is pruned on the next refresh", async () => {
-    const harness = makeHarness();
+    const harness = await makeHarness();
     await appendBlocked(harness.auditLog);
     await refresh(harness);
     expect((await harness.store.listCandidates()).size).toBe(1);
@@ -695,7 +697,7 @@ describe("allowlist-aware fold + prune (R3-1b, chokepoint requirement 2)", () =>
   });
 
   it("protocol-aware: a udp allow rule suppresses a udp candidate (the CONNECT-proxy tcp matcher alone would miss it)", async () => {
-    const harness = makeHarness();
+    const harness = await makeHarness();
     await appendBlocked(harness.auditLog, { protocol: "udp" });
     const outcome = await refresh(harness, [allowRule({ protocol: "udp" })]);
     expect(outcome.status === "refreshed" && outcome.suppressed_allowed).toBe(1);
@@ -703,7 +705,7 @@ describe("allowlist-aware fold + prune (R3-1b, chokepoint requirement 2)", () =>
   });
 
   it("a udp candidate is NOT suppressed by a tcp-only rule for the same destination", async () => {
-    const harness = makeHarness();
+    const harness = await makeHarness();
     await appendBlocked(harness.auditLog, { protocol: "udp" });
     await refresh(harness, [allowRule({ protocol: "tcp" })]);
     expect((await harness.store.listCandidates()).size).toBe(1);
@@ -738,7 +740,7 @@ describe("allowlist-aware fold + prune (R3-1b, chokepoint requirement 2)", () =>
   });
 
   it("round-3 HIGH: suppression is SCOPE-AWARE -- a rule promoted for template A neither suppresses nor prunes template B's identical destination", async () => {
-    const harness = makeHarness();
+    const harness = await makeHarness();
     // Template B (ops-runner) is denied reaching the same destination a
     // claude-code-scoped rule allows. The daemon still denies ops-runner
     // (RuleScope::applies_to), so its candidate must be minted and stay.
@@ -755,7 +757,7 @@ describe("allowlist-aware fold + prune (R3-1b, chokepoint requirement 2)", () =>
   });
 
   it("round-3 HIGH counterpart: an EMPTY scope (all wrapped agents) suppresses any template, matching the daemon's applies_to", async () => {
-    const harness = makeHarness();
+    const harness = await makeHarness();
     await appendBlocked(harness.auditLog, { template: "ops-runner" });
     const allAgentsRule = { ...allowRule(), scope: {} };
     const outcome = await refresh(harness, [allAgentsRule]);
@@ -764,7 +766,7 @@ describe("allowlist-aware fold + prune (R3-1b, chokepoint requirement 2)", () =>
   });
 
   it("round-3 HIGH counterpart: an agent_ids scope suppresses exactly that instance", async () => {
-    const harness = makeHarness();
+    const harness = await makeHarness();
     await appendBlocked(harness.auditLog); // agent-1 / claude-code
     const instanceRule = { ...allowRule(), scope: { agent_ids: [AGENT_1_SUBJECT] } };
     const outcome = await refresh(harness, [instanceRule]);
@@ -773,7 +775,7 @@ describe("allowlist-aware fold + prune (R3-1b, chokepoint requirement 2)", () =>
   });
 
   it("round-4 HIGH: a matching deny BEFORE an allow vetoes suppression (the daemon's first match denies; the flow keeps being recorded)", async () => {
-    const harness = makeHarness();
+    const harness = await makeHarness();
     await appendBlocked(harness.auditLog);
     const denyFirst = [
       { ...allowRule(), id: "deny-first", disposition: "deny" as const },
@@ -785,7 +787,7 @@ describe("allowlist-aware fold + prune (R3-1b, chokepoint requirement 2)", () =>
   });
 
   it("round-6 HIGH: a matching deny AFTER an allow ALSO vetoes suppression (macOS deny-anywhere-wins would drop and record this flow)", async () => {
-    const harness = makeHarness();
+    const harness = await makeHarness();
     await appendBlocked(harness.auditLog);
     const allowFirst = [
       allowRule(),
@@ -800,7 +802,7 @@ describe("allowlist-aware fold + prune (R3-1b, chokepoint requirement 2)", () =>
   });
 
   it("round-6 HIGH: an exact-host allow never suppresses an IP-ONLY observation (OS enforcers cannot match a host axis against a raw-IP flow)", async () => {
-    const harness = makeHarness();
+    const harness = await makeHarness();
     await appendBlocked(harness.auditLog, { host: null, ip: "203.0.113.10" });
     const hostRuleForIp = [allowRule({ host: ["203.0.113.10"] })];
     const outcome = await refresh(harness, hostRuleForIp);
@@ -815,7 +817,7 @@ describe("allowlist-aware fold + prune (R3-1b, chokepoint requirement 2)", () =>
   });
 
   it("round-4: a first-matching PROMPT disposition does not suppress (the flow is not unconditionally allowed)", async () => {
-    const harness = makeHarness();
+    const harness = await makeHarness();
     await appendBlocked(harness.auditLog);
     const promptFirst = [{ ...allowRule(), disposition: "prompt" as const }];
     await refresh(harness, promptFirst);
@@ -823,7 +825,7 @@ describe("allowlist-aware fold + prune (R3-1b, chokepoint requirement 2)", () =>
   });
 
   it("round-4: a time_window allow is CONDITIONAL and never suppresses", async () => {
-    const harness = makeHarness();
+    const harness = await makeHarness();
     await appendBlocked(harness.auditLog);
     const windowed = [{ ...allowRule(), time_window: { start: "09:00", end: "17:00" } }];
     await refresh(harness, windowed);
@@ -831,7 +833,7 @@ describe("allowlist-aware fold + prune (R3-1b, chokepoint requirement 2)", () =>
   });
 
   it("round-5 HIGH: a `*.suffix` host_pattern allow never suppresses (the Linux daemon treats that form as a defensive non-match and keeps denying)", async () => {
-    const harness = makeHarness();
+    const harness = await makeHarness();
     await appendBlocked(harness.auditLog); // api.example.com
     const wildcardPattern = [
       { ...allowRule({ host: undefined, host_pattern: "*.example.com" }) },
@@ -842,7 +844,7 @@ describe("allowlist-aware fold + prune (R3-1b, chokepoint requirement 2)", () =>
   });
 
   it("round-5 HIGH counterpart: a `.suffix` host_pattern allow also never suppresses (the CONNECT-proxy family would not allow that form; suppression requires the enforcer INTERSECTION)", async () => {
-    const harness = makeHarness();
+    const harness = await makeHarness();
     await appendBlocked(harness.auditLog); // api.example.com
     const dotPattern = [{ ...allowRule({ host: undefined, host_pattern: ".example.com" }) }];
     const outcome = await refresh(harness, dotPattern);
@@ -851,7 +853,7 @@ describe("allowlist-aware fold + prune (R3-1b, chokepoint requirement 2)", () =>
   });
 
   it("round-5: an exact-host allow still suppresses (both enforcer legs agree)", async () => {
-    const harness = makeHarness();
+    const harness = await makeHarness();
     await appendBlocked(harness.auditLog);
     const outcome = await refresh(harness, [allowRule()]);
     expect(outcome.status === "refreshed" && outcome.suppressed_allowed).toBe(1);
@@ -859,7 +861,7 @@ describe("allowlist-aware fold + prune (R3-1b, chokepoint requirement 2)", () =>
   });
 
   it("round-7 HIGH: the 'unknown' sentinel template (macOS default resolver -- may contain unattributed drops no allow can ever permit) is NEVER suppressed or pruned", async () => {
-    const harness = makeHarness();
+    const harness = await makeHarness();
     await appendBlocked(harness.auditLog, { template: "unknown" });
     const allAgentsRule = { ...allowRule(), scope: {} };
     const outcome = await refresh(harness, [allAgentsRule]);
@@ -869,7 +871,7 @@ describe("allowlist-aware fold + prune (R3-1b, chokepoint requirement 2)", () =>
   });
 
   it("#897 finding 2: a Linux-daemon FLAT 'unknown'-template row IS folded AND IS suppressed by a covering allow rule scoped to 'unknown' (the exemption is macOS-only)", async () => {
-    const harness = makeHarness();
+    const harness = await makeHarness();
     // A real NFQUEUE row: flat shape, agent_template "unknown", provenance linux_daemon.
     await appendBlockedFlat(harness.auditLog, { template: "unknown" });
     // Operator has allowed exactly this destination for template "unknown".
@@ -921,7 +923,7 @@ describe("allowlist-aware fold + prune (R3-1b, chokepoint requirement 2)", () =>
   });
 
   it("an unverifiable allowlist aborts the refresh with NOTHING folded, written, or pruned", async () => {
-    const harness = makeHarness();
+    const harness = await makeHarness();
     await appendBlocked(harness.auditLog);
     const outcome = await refreshCandidatesFromAudit({
       auditLog: harness.auditLog,
@@ -938,7 +940,7 @@ describe("allowlist-aware fold + prune (R3-1b, chokepoint requirement 2)", () =>
 
 describe("recompute heal (pre-watermark stores and reset chains)", () => {
   it("a store the old additive engine inflated is healed to the true retained-history count on the first watermarkless refresh", async () => {
-    const harness = makeHarness();
+    const harness = await makeHarness();
     await appendBlocked(harness.auditLog);
     await appendBlocked(harness.auditLog);
 
@@ -965,7 +967,7 @@ describe("recompute heal (pre-watermark stores and reset chains)", () => {
   });
 
   it("full snapshot recompute drops rows whose audit history is no longer retained", async () => {
-    const harness = makeHarness();
+    const harness = await makeHarness();
     // Store holds a candidate, but the audit chain has no matching entries
     // (fully pruned): the recompute folds nothing and must leave it alone.
     await harness.store.putCandidate({
@@ -989,7 +991,7 @@ describe("recompute heal (pre-watermark stores and reset chains)", () => {
   });
 
   it("a watermark AHEAD of the surviving chain head (audit store reset) triggers a recompute instead of silently folding nothing forever", async () => {
-    const harness = makeHarness();
+    const harness = await makeHarness();
     await appendBlocked(harness.auditLog);
     // A watermark from a previous audit-chain epoch, far past this chain.
     await harness.store.setFoldWatermark({
@@ -1009,7 +1011,7 @@ describe("recompute heal (pre-watermark stores and reset chains)", () => {
   });
 
   it("an empty chain refresh is a no-op that does not invent a watermark", async () => {
-    const harness = makeHarness();
+    const harness = await makeHarness();
     const outcome = await refresh(harness);
     expect(outcome.status === "refreshed" && outcome.folded_events).toBe(0);
     expect(await harness.store.getFoldWatermark()).toBeNull();
@@ -1018,7 +1020,7 @@ describe("recompute heal (pre-watermark stores and reset chains)", () => {
 
 describe("watermark round-trip (store surface)", () => {
   it("persists and re-reads the fold watermark; a malformed/hash-less record reads as absent (recompute, never inflate)", async () => {
-    const harness = makeHarness();
+    const harness = await makeHarness();
     expect(await harness.store.getFoldWatermark()).toBeNull();
     await harness.store.setFoldWatermark({
       folded_through_sequence: 7,
@@ -1044,7 +1046,7 @@ describe("watermark round-trip (store surface)", () => {
 
 describe("Codex-gate hardening (two-family gate fix round, 2026-07-14)", () => {
   it("BLOCKER: a concurrent refresh is refused by the lock -- the suffix is folded exactly once, never twice", async () => {
-    const harness = makeHarness();
+    const harness = await makeHarness();
     await appendBlocked(harness.auditLog);
     await appendBlocked(harness.auditLog);
 
@@ -1061,7 +1063,7 @@ describe("Codex-gate hardening (two-family gate fix round, 2026-07-14)", () => {
   });
 
   it("HIGH-1: a candidate discarded under the OLD engine (no watermark) is NOT resurrected by the migration recompute -- and a genuinely NEW denial re-mints it", async () => {
-    const harness = makeHarness();
+    const harness = await makeHarness();
     // Old-engine history: two denials were folded into a candidate...
     await appendBlocked(harness.auditLog);
     await appendBlocked(harness.auditLog);
@@ -1083,7 +1085,7 @@ describe("Codex-gate hardening (two-family gate fix round, 2026-07-14)", () => {
   });
 
   it("HIGH-1 counterpart: the migration recompute still HEALS a row that is present (not discarded), replacing its inflated count", async () => {
-    const harness = makeHarness();
+    const harness = await makeHarness();
     await appendBlocked(harness.auditLog);
     await appendBlocked(harness.auditLog);
     // A review action happened (say, a different destination was discarded),
@@ -1111,7 +1113,7 @@ describe("Codex-gate hardening (two-family gate fix round, 2026-07-14)", () => {
   });
 
   it("round-2 MED: a watermark whose sequence was pruned off the surviving chain is NOT blindly honored -- it recomputes (identity unverifiable)", async () => {
-    const harness = makeHarness();
+    const harness = await makeHarness();
     // Fake verified-chain source whose surviving suffix starts ABOVE the
     // persisted watermark's sequence (heavy FIFO pruning between refreshes,
     // or a reset chain that regrew and pruned past the old position -- the
@@ -1167,7 +1169,7 @@ describe("Codex-gate hardening (two-family gate fix round, 2026-07-14)", () => {
   });
 
   it("round-2 LOW: a throwing lock release never masks a completed refresh", async () => {
-    const harness = makeHarness();
+    const harness = await makeHarness();
     await appendBlocked(harness.auditLog);
     const outcome = await refreshCandidatesFromAudit({
       auditLog: harness.auditLog,
@@ -1189,7 +1191,7 @@ describe("Codex-gate hardening (two-family gate fix round, 2026-07-14)", () => {
   });
 
   it("a RESET audit chain is fully recomputed on the next refresh, never prefix-skipped by a stale watermark", async () => {
-    const harness = makeHarness();
+    const harness = await makeHarness();
     // Chain epoch 1: one denial, refreshed into the candidate snapshot.
     await appendBlocked(harness.auditLog);
     await refresh(harness);

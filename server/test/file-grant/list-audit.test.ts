@@ -14,7 +14,7 @@ import { makeFileGrantTestStore } from "./fixtures.js";
 
 describe("file-grant list audit (Fix 6)", () => {
   it("appends a file_grant_list audit event with filter + count", async () => {
-    const { auditLog } = makeFileGrantTestStore();
+    const { auditLog } = await makeFileGrantTestStore();
 
     await recordFileGrantListAudit(auditLog, "operator-1", { subjectAgentId: "agent-7" }, 3);
 
@@ -29,7 +29,7 @@ describe("file-grant list audit (Fix 6)", () => {
   });
 
   it("records 'all' when no agent filter is applied", async () => {
-    const { auditLog } = makeFileGrantTestStore();
+    const { auditLog } = await makeFileGrantTestStore();
 
     await recordFileGrantListAudit(auditLog, "operator-1", undefined, 0);
 
