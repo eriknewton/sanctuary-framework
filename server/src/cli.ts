@@ -168,6 +168,12 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (args[0] === "uninstall") {
+    const { runUninstallCommand } = await import("./cli/uninstall.js");
+    const code = await runUninstallCommand({ argv: args.slice(1) });
+    process.exit(code);
+  }
+
   if (args[0] === "init") {
     const { parseInitArgs, runInit, printInitHelp } = await import(
       "./wrap/init.js"
@@ -898,6 +904,7 @@ Usage:
   sanctuary deploy operator-cloud plan    # Emit operator-cloud deploy skeleton
   sanctuary protect [opts]                 # Protect an agent in one command
   sanctuary wrap [opts]                   # (alias for protect)
+  sanctuary uninstall [opts]              # Remove installed enforcement footprint; preserve operator data
   sanctuary export-passphrase             # Print stored passphrase
 
 Options:
@@ -920,6 +927,11 @@ Subcommands:
                        Use "sanctuary protect --help" for options.
 
   wrap                 (alias for protect)
+
+  uninstall            Remove Sanctuary's installed enforcement footprint
+                       while preserving fortress state and keys. Reports
+                       residue that needs sudo, host app action, or reboot.
+                       Use "sanctuary uninstall --help" for options.
 
   dashboard            Start the dashboard as a standalone HTTP server.
                        Reads from the same storage as the MCP server.
@@ -1175,6 +1187,11 @@ async function handleHelpEarly(args: string[]): Promise<boolean> {
     case "castle-wall":
       printCastleWallHelp();
       return true;
+    case "uninstall": {
+      const { runUninstallCommand } = await import("./cli/uninstall.js");
+      await runUninstallCommand({ argv: args.slice(1).concat("--help") });
+      return true;
+    }
     default:
       return false;
   }

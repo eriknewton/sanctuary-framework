@@ -30,6 +30,8 @@ Castle-walking principle: real enforcement AND delightful operator experience. H
 
 *Status: shipped through v1.7.0 (latest release tag, 2026-07-26).*
 
+*Clean uninstall verb (built 2026-08-09, CLI wiring + tests; release pending): `sanctuary uninstall` removes the reachable installed enforcement footprint by disarming the macOS wall when available, uninstalling the auto-provisioned harness daemon, scrubbing provisioned egress rules, and removing the boot LaunchDaemon when run with the needed root privilege. It preserves operator data by default: fortress state, keys, passphrase custody, recovery material, and the audit log stay in place and are named in the output. Honest bounds: a root-owned boot service requires sudo, the host-wide Castle Wall global pin is left for explicit operator removal, system-extension deactivation still belongs to the Castle Wall host app and may require reboot, and successful re-home replay is not claimed because the current shipped record does not persist a replay manifest for this CLI to consume.*
+
 ### Castle Wall on Linux: kernel-level enforcement
 
 Target: OS-level egress filtering via netfilter / NFQUEUE with per-process cgroup routing, so outbound calls are blocked at the kernel even when the agent is prompt-injected, jailbroken, or simply not bothering to cooperate. Current bound: the Linux modules are proven in integration tests, but the shipped daemon does not assemble that enforcement loop. **Why it matters:** this is the security claim the Linux row must earn before it can be called shipped.
