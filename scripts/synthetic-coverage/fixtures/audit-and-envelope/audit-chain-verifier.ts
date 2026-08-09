@@ -95,7 +95,9 @@ async function fixture(
   expectedFinding?: RecordFindingKind
 ): Promise<FixtureOutcome> {
   const started = performance.now();
-  const report = verifyAuditChainRecords(records);
+  const report = verifyAuditChainRecords(records, {
+    publicKey: CHECKPOINT_IDENTITY.public_key,
+  });
   const hasExpectedFinding =
     expectedFinding === undefined ||
     report.findings.some((finding) => finding.kind === expectedFinding);
