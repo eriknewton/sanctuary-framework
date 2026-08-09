@@ -38,6 +38,7 @@
  *
  * Usage:
  *   sanctuary audit-chain verify --input chain.jsonl [--public-key <base64url>]
+ *   sanctuary audit-chain verify --input chain.jsonl --trust-embedded
  *   sanctuary audit-chain verify --input chain.jsonl --no-strict
  *     # still reports FAIL findings, then exits 10 after completing verification
  */
@@ -264,6 +265,7 @@ export interface RecordFinding {
 }
 
 export type VerifyVerdict = "PASS" | "FAIL";
+export type SignatureBasis = "pinned" | "embedded" | "none";
 export const AUDIT_CHAIN_VERIFY_EXIT_OK = 0;
 export const AUDIT_CHAIN_VERIFY_EXIT_STRICT_FINDINGS = 1;
 export const AUDIT_CHAIN_VERIFY_EXIT_RELAXED_FINDINGS = 10;
@@ -272,6 +274,7 @@ export interface VerifyReport {
   verdict: VerifyVerdict;
   entries_verified: number;
   checkpoints_verified: number;
+  signature_basis: SignatureBasis;
   signatures_verified: number;
   signatures_skipped: number;
   legacy_anchors_verified: number;
@@ -302,17 +305,24 @@ export const ROTATION_ANCHOR_SCOPE =
  *
  * @param records - Parsed records from the export file (entries + checkpoints in any order)
  * @param opts.publicKey - Optional base64url-encoded public key override for checkpoint verification.
- *   If omitted, each checkpoint's embedded public_key field is used.
+ *   If omitted, signed checkpoints are not verified unless trustEmbedded is explicitly true.
+ * @param opts.trustEmbedded - Explicit opt-in to verify against checkpoint-embedded keys.
+ *   Embedded-key verification proves internal consistency, not signer identity.
  * @param opts.strict - Backwards-compatible no-op. Exit strictness is applied
  *   by the CLI layer after report generation, never by this verifier.
  */
 export function verifyAuditChainRecords(
   records: ExportRecord[],
-  opts: { publicKey?: string; strict?: boolean } = {}
+  opts: { publicKey?: string; strict?: boolean; trustEmbedded?: boolean } = {}
 ): VerifyReport {
   const findings: RecordFinding[] = [];
   let signaturesVerified = 0;
   let signaturesSkipped = 0;
+  const signatureBasis: SignatureBasis = opts.publicKey
+    ? "pinned"
+    : opts.trustEmbedded
+      ? "embedded"
+      : "none";
 
   // Partition records
   const entries = records
@@ -338,6 +348,7 @@ export function verifyAuditChainRecords(
       verdict: "FAIL",
       entries_verified: 0,
       checkpoints_verified: 0,
+      signature_basis: "none",
       signatures_verified: 0,
       signatures_skipped: 0,
       legacy_anchors_verified: 0,
@@ -474,12 +485,16 @@ export function verifyAuditChainRecords(
     if (cp.unsigned) {
       signaturesSkipped += 1;
     } else {
-      const pubKey = opts.publicKey ?? cp.public_key;
+      // Embedded checkpoint keys are attacker-controllable in an export; using
+      // them as verification evidence requires an explicit self-check opt-in.
+      const pubKey = opts.publicKey ?? (opts.trustEmbedded ? cp.public_key : undefined);
       if (!pubKey) {
         findings.push({
           kind: "checkpoint_signature_missing_key",
           seq: cp.checkpoint_sequence,
-          message: `Checkpoint at seq ${cp.checkpoint_sequence} has no public key for signature verification`,
+          message:
+            `Checkpoint at seq ${cp.checkpoint_sequence} was not verified against a trusted public key; ` +
+            "pass --public-key with an out-of-band signer key, or explicitly use --trust-embedded for an internal-consistency check only",
         });
       } else if (!cp.signature) {
         findings.push({
@@ -532,6 +547,7 @@ export function verifyAuditChainRecords(
     verdict,
     entries_verified: entries.length,
     checkpoints_verified: checkpoints.length,
+    signature_basis: signatureBasis,
     signatures_verified: signaturesVerified,
     // These counters are positive evidence, not a partition: missing-key and
     // marked-signed-without-signature checkpoints produce findings instead.
@@ -564,6 +580,7 @@ export function emptyInputReport(): VerifyReport {
     verdict: "FAIL",
     entries_verified: 0,
     checkpoints_verified: 0,
+    signature_basis: "none",
     signatures_verified: 0,
     signatures_skipped: 0,
     legacy_anchors_verified: 0,
@@ -583,6 +600,7 @@ export function malformedInputReport(err: unknown): VerifyReport {
     verdict: "FAIL",
     entries_verified: 0,
     checkpoints_verified: 0,
+    signature_basis: "none",
     signatures_verified: 0,
     signatures_skipped: 0,
     legacy_anchors_verified: 0,
@@ -598,7 +616,7 @@ export function malformedInputReport(err: unknown): VerifyReport {
 
 export function verifyAuditChainContent(
   content: string,
-  opts: { publicKey?: string; strict?: boolean } = {}
+  opts: { publicKey?: string; strict?: boolean; trustEmbedded?: boolean } = {}
 ): VerifyReport {
   if (content.length === 0) {
     return emptyInputReport();
@@ -630,6 +648,7 @@ export interface VerifyArgs {
   input: string;
   strict: boolean;
   publicKey?: string;
+  trustEmbedded: boolean;
   storagePath?: string;
 }
 
@@ -637,11 +656,12 @@ export function parseVerifyArgs(argv: string[], env?: NodeJS.ProcessEnv): Verify
   const input = flagValue(argv, "--input") ?? flagValue(argv, "-i") ?? "";
   const strict = !argv.includes("--no-strict");
   const publicKey = flagValue(argv, "--public-key");
+  const trustEmbedded = argv.includes("--trust-embedded");
   const storagePath =
     flagValue(argv, "--storage-path") ??
     env?.SANCTUARY_STORAGE_PATH ??
     env?.SANCTUARY_FORTRESS_PATH;
-  return { input, strict, publicKey, storagePath };
+  return { input, strict, publicKey, trustEmbedded, storagePath };
 }
 
 export async function runVerify(args: VerifyArgs): Promise<number> {
@@ -661,6 +681,7 @@ export async function runVerify(args: VerifyArgs): Promise<number> {
   const report = verifyAuditChainContent(content, {
     publicKey: args.publicKey,
     strict: args.strict,
+    trustEmbedded: args.trustEmbedded,
   });
 
   const banner = lockdownBanner(await readLockdownStatus(args.storagePath));

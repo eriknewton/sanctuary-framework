@@ -501,11 +501,13 @@ Examples:
         // SAFETY: stderr / stdout is the operator-facing CLI channel; no logger module in scope.
         console.error(`sanctuary audit-chain verify. Verify an exported Sanctuary audit chain.
 
-Usage: sanctuary audit-chain verify --input <path> [--public-key <key>] [--no-strict]
+Usage: sanctuary audit-chain verify --input <path> [--public-key <key>] [--trust-embedded] [--no-strict]
 
 Options:
   --input <path>         JSONL file to verify (required)
   --public-key <key>     Ed25519 public key for signature check (base64url)
+  --trust-embedded       Verify checkpoint signatures against embedded keys.
+                         Proves internal consistency only, not signer identity.
   --no-strict            Report FAIL findings and exit 10 after verification
   --storage-path <path>  Override state directory
   --help, -h             Show this help

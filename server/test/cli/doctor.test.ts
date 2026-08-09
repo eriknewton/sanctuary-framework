@@ -4,13 +4,26 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
 import { runDoctorChecks, runDoctorCommand } from "../../src/cli/doctor.js";
+import { exportAuditChain } from "../../src/cli/audit-chain-export.js";
+import type {
+  CheckpointExportRecord,
+  EntryExportRecord,
+  ExportRecord,
+} from "../../src/cli/audit-chain-verify.js";
 import { AuditLog } from "../../src/operational/audit-log.js";
 import { migrateFortressAuditStoreSplit } from "../../src/operational/audit-store-split.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import { deriveMasterKey, derivePurposeKey } from "../../src/core/key-derivation.js";
-import { stringToBytes } from "../../src/core/encoding.js";
+import { bytesToString, stringToBytes, toBase64url } from "../../src/core/encoding.js";
 import { IdentityManager } from "../../src/cognitive/tools.js";
-import { createIdentity } from "../../src/core/identity.js";
+import { createIdentity, sign as identitySign } from "../../src/core/identity.js";
+import {
+  AUDIT_CHAIN_GENESIS,
+  checkpointSigningBytes,
+  computeAuditEntryHash,
+  computeAuditRoot,
+  type AuditCheckpointSigningPayload,
+} from "../../src/audit/chain.js";
 import {
   hermesParityPythonCandidates,
   type SidecarExec,
@@ -41,7 +54,11 @@ describe("sanctuary doctor", () => {
     }
   });
 
-  async function makeFortress(opts: { identity?: boolean; policy?: "valid" | "invalid"; audit?: boolean | "unsigned-checkpoint" } = {}): Promise<string> {
+  async function makeFortress(opts: {
+    identity?: boolean;
+    policy?: "valid" | "invalid";
+    audit?: boolean | "unsigned-checkpoint" | "signed-checkpoint";
+  } = {}): Promise<string> {
     const fortress = await mkdtemp(join(tmpdir(), "sanctuary-doctor-"));
     tempDirs.push(fortress);
     await chmod(fortress, 0o700);
@@ -72,8 +89,33 @@ approval_channel:
     }
 
     if (opts.audit) {
+      const signerIdentityKey = derivePurposeKey(derived.key, "identity-encryption");
+      const { storedIdentity } = createIdentity(
+        "doctor-audit-signer",
+        signerIdentityKey,
+        "passphrase",
+      );
       const auditLog = new AuditLog(storage, derived.key, {
-        checkpointInterval: opts.audit === "unsigned-checkpoint" ? 1 : 0,
+        checkpointInterval:
+          opts.audit === "unsigned-checkpoint" || opts.audit === "signed-checkpoint"
+            ? 1
+            : 0,
+        ...(opts.audit === "signed-checkpoint"
+          ? {
+              checkpointSigner: async (payload: AuditCheckpointSigningPayload) => ({
+                signer_kid: storedIdentity.identity_id,
+                signature: toBase64url(
+                  identitySign(
+                    checkpointSigningBytes(payload),
+                    storedIdentity.encrypted_private_key,
+                    signerIdentityKey,
+                  ),
+                ),
+                public_key: storedIdentity.public_key,
+              }),
+              checkpointPublicKeyResolver: () => storedIdentity.public_key,
+            }
+          : {}),
       });
       await auditLog.appendCritical({
         layer: "l2",
@@ -82,10 +124,120 @@ approval_channel:
         result: "success",
       });
       await auditLog.flush();
+      signerIdentityKey.fill(0);
     }
 
     derived.key.fill(0);
     return fortress;
+  }
+
+  async function collectAuditExport(storage: FilesystemStorage): Promise<ExportRecord[]> {
+    const out = new Capture();
+    await exportAuditChain(storage, out);
+    return out
+      .text()
+      .split("\n")
+      .filter((line) => line.trim().length > 0)
+      .map((line) => JSON.parse(line) as ExportRecord);
+  }
+
+  function mutateByte(value: string): string {
+    const index = Math.floor(value.length / 2);
+    const original = value[index]!;
+    const replacement = original === "A" ? "B" : "A";
+    return value.slice(0, index) + replacement + value.slice(index + 1);
+  }
+
+  async function rewriteStorageAsForgedEmbeddedKeyChain(
+    storage: FilesystemStorage,
+  ): Promise<void> {
+    const records = await collectAuditExport(storage);
+    const forgedIdentityKey = derivePurposeKey(
+      new Uint8Array(32).fill(7),
+      "identity-encryption",
+    );
+    const { storedIdentity } = createIdentity(
+      "forged-doctor-signer",
+      forgedIdentityKey,
+      "passphrase",
+    );
+
+    const entries = records
+      .filter((record): record is EntryExportRecord => record.type === "entry")
+      .sort((a, b) => a.seq - b.seq);
+    const forgedEntries = new Map<number, EntryExportRecord>();
+    let prevHash = AUDIT_CHAIN_GENESIS;
+    for (const entry of entries) {
+      const encrypted_payload_bytes =
+        entry.seq === 1
+          ? mutateByte(entry.encrypted_payload_bytes)
+          : entry.encrypted_payload_bytes;
+      const forgedEntry: EntryExportRecord = {
+        ...entry,
+        prev_hash: prevHash,
+        encrypted_payload_bytes,
+        entry_hash: computeAuditEntryHash({
+          sequence: entry.seq,
+          prev_hash: prevHash,
+          timestamp: entry.timestamp,
+          encrypted_payload_bytes,
+          schema_version: entry.schema_version,
+        }),
+      };
+      forgedEntries.set(forgedEntry.seq, forgedEntry);
+      prevHash = forgedEntry.entry_hash;
+    }
+
+    for (const meta of await storage.list("_audit")) {
+      const raw = await storage.read("_audit", meta.key);
+      if (!raw) continue;
+      const envelope = JSON.parse(bytesToString(raw));
+      const forged = forgedEntries.get(envelope.sequence);
+      if (!forged) continue;
+      envelope.prev_hash = forged.prev_hash;
+      envelope.entry_hash = forged.entry_hash;
+      envelope.encrypted_payload_bytes = forged.encrypted_payload_bytes;
+      await storage.write("_audit", meta.key, stringToBytes(JSON.stringify(envelope)));
+    }
+
+    for (const meta of await storage.list("_audit_checkpoints", "audit-checkpoint-")) {
+      const raw = await storage.read("_audit_checkpoints", meta.key);
+      if (!raw) continue;
+      const checkpoint = JSON.parse(bytesToString(raw)) as CheckpointExportRecord;
+      const hashes: string[] = [];
+      for (
+        let seq = checkpoint.from_sequence;
+        seq <= checkpoint.checkpoint_sequence;
+        seq++
+      ) {
+        hashes.push(forgedEntries.get(seq)!.entry_hash);
+      }
+      const payload: AuditCheckpointSigningPayload = {
+        checkpoint_kind: checkpoint.checkpoint_kind,
+        checkpoint_sequence: checkpoint.checkpoint_sequence,
+        from_sequence: checkpoint.from_sequence,
+        root_hash: computeAuditRoot(hashes),
+        previous_checkpoint_sequence: checkpoint.previous_checkpoint_sequence,
+        signed_at: checkpoint.signed_at,
+      };
+      checkpoint.root_hash = payload.root_hash;
+      checkpoint.signer_kid = storedIdentity.identity_id;
+      checkpoint.signature = toBase64url(
+        identitySign(
+          checkpointSigningBytes(payload),
+          storedIdentity.encrypted_private_key,
+          forgedIdentityKey,
+        ),
+      );
+      checkpoint.public_key = storedIdentity.public_key;
+      checkpoint.unsigned = false;
+      await storage.write(
+        "_audit_checkpoints",
+        meta.key,
+        stringToBytes(JSON.stringify(checkpoint)),
+      );
+    }
+    forgedIdentityKey.fill(0);
   }
 
   it("reports expected checks for a healthy fixture and does not print secrets", async () => {
@@ -134,6 +286,38 @@ approval_channel:
     expect(code).toBe(0);
     expect(out.text()).toContain("WARN audit chain");
     expect(out.text()).toContain("no checkpoint signature was verified");
+  });
+
+  it("does not report OK for a tampered chain re-signed with embedded checkpoint keys", async () => {
+    const fortress = await makeFortress({
+      identity: true,
+      policy: "valid",
+      audit: "signed-checkpoint",
+    });
+    const storage = new FilesystemStorage(join(fortress, "state"));
+    await rewriteStorageAsForgedEmbeddedKeyChain(storage);
+
+    const checks = await runDoctorChecks({
+      storagePath: fortress,
+      env: { SANCTUARY_PASSPHRASE: passphrase },
+      platform: "linux",
+    });
+    const chainCheck = checks.find((check) => check.name === "audit chain");
+    expect(chainCheck?.status).toBe("WARN");
+    expect(chainCheck?.message).toBe(
+      "checkpoint signatures were not verified against a pinned public key",
+    );
+
+    const out = new Capture();
+    const code = await runDoctorCommand({
+      argv: ["--fortress", fortress],
+      out,
+      env: { SANCTUARY_PASSPHRASE: passphrase },
+      platform: "linux",
+    });
+    expect(code).toBe(0);
+    expect(out.text()).toContain("WARN audit chain");
+    expect(out.text()).not.toContain("OK   audit chain");
   });
 
   it("emits JSON shape and exits non-zero when checks fail", async () => {

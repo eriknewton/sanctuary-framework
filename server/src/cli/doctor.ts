@@ -415,6 +415,16 @@ async function checkAuditChain(
     }
     return ok("audit chain", `${report.entries_verified} entries verified`, "none");
   }
+  if (
+    report.findings.length > 0 &&
+    report.findings.every((finding) => finding.kind === "checkpoint_signature_missing_key")
+  ) {
+    return warn(
+      "audit chain",
+      "checkpoint signatures were not verified against a pinned public key",
+      "run 'sanctuary audit-chain verify --public-key <signer-public-key>' with the signer key obtained out-of-band",
+    );
+  }
   return fail("audit chain", `${report.findings.length} integrity finding(s)`, "run sanctuary audit-chain export and verify for details");
 }
 

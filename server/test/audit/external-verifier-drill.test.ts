@@ -26,6 +26,9 @@ import {
   sign as identitySign,
 } from "../../src/core/identity.js";
 import {
+  AUDIT_CHAIN_GENESIS,
+  computeAuditEntryHash,
+  computeAuditRoot,
   checkpointSigningBytes,
   verifyCheckpointSignature,
   type AuditCheckpointSigningPayload,
@@ -119,6 +122,92 @@ function checkpointPayload(record: VerifierCheckpointExportRecord): AuditCheckpo
     previous_checkpoint_sequence: record.previous_checkpoint_sequence,
     signed_at: record.signed_at,
   };
+}
+
+async function forgeSelfConsistentTamperedChain(
+  records: readonly VerifierExportRecord[],
+  tamperedSeq: number,
+): Promise<{
+  records: VerifierExportRecord[];
+  embeddedPublicKey: string;
+}> {
+  const forgedMasterKey = generateRandomKey();
+  const forgedIdentityKey = derivePurposeKey(forgedMasterKey, "identity-encryption");
+  const { storedIdentity } = createIdentity(
+    "forged-signer",
+    forgedIdentityKey,
+    "recovery-key",
+  );
+
+  const entries = records
+    .filter((r): r is EntryExportRecord => r.type === "entry")
+    .sort((a, b) => a.seq - b.seq);
+  const forgedEntries = new Map<number, EntryExportRecord>();
+  let prevHash = AUDIT_CHAIN_GENESIS;
+  for (const entry of entries) {
+    const encrypted_payload_bytes =
+      entry.seq === tamperedSeq
+        ? mutateByte(entry.encrypted_payload_bytes)
+        : entry.encrypted_payload_bytes;
+    const forgedEntry: EntryExportRecord = {
+      ...entry,
+      prev_hash: prevHash,
+      encrypted_payload_bytes,
+      entry_hash: computeAuditEntryHash({
+        sequence: entry.seq,
+        prev_hash: prevHash,
+        timestamp: entry.timestamp,
+        encrypted_payload_bytes,
+        schema_version: entry.schema_version,
+      }),
+    };
+    forgedEntries.set(forgedEntry.seq, forgedEntry);
+    prevHash = forgedEntry.entry_hash;
+  }
+
+  const forged = records.map((record): VerifierExportRecord => {
+    if (record.type === "entry") {
+      return forgedEntries.get((record as EntryExportRecord).seq)! as VerifierExportRecord;
+    }
+    if (record.type !== "checkpoint") {
+      return record;
+    }
+    const checkpoint = record as VerifierCheckpointExportRecord;
+    const hashes: string[] = [];
+    for (
+      let seq = checkpoint.from_sequence;
+      seq <= checkpoint.checkpoint_sequence;
+      seq++
+    ) {
+      hashes.push(forgedEntries.get(seq)!.entry_hash);
+    }
+    const payload: AuditCheckpointSigningPayload = {
+      checkpoint_kind: checkpoint.checkpoint_kind,
+      checkpoint_sequence: checkpoint.checkpoint_sequence,
+      from_sequence: checkpoint.from_sequence,
+      root_hash: computeAuditRoot(hashes),
+      previous_checkpoint_sequence: checkpoint.previous_checkpoint_sequence,
+      signed_at: checkpoint.signed_at,
+    };
+    return {
+      ...checkpoint,
+      root_hash: payload.root_hash,
+      signer_kid: storedIdentity.identity_id,
+      signature: toBase64url(
+        identitySign(
+          checkpointSigningBytes(payload),
+          storedIdentity.encrypted_private_key,
+          forgedIdentityKey,
+        ),
+      ),
+      public_key: storedIdentity.public_key,
+      unsigned: false,
+    };
+  });
+
+  forgedMasterKey.fill(0);
+  forgedIdentityKey.fill(0);
+  return { records: forged, embeddedPublicKey: storedIdentity.public_key };
 }
 
 // ---------------------------------------------------------------------------
@@ -222,6 +311,70 @@ describe("external-verifier-drill: happy path", () => {
     expect(report.verdict).toBe("PASS");
     expect(report.entries_verified).toBe(25);
     expect(report.findings).toHaveLength(0);
+  });
+
+  it("refuses an embedded-key-only checkpoint basis unless explicitly opted in", async () => {
+    const { storage, publicKey } = await buildSignedAuditChain();
+    const records = parseJsonl(await collectExport(storage));
+
+    const defaultReport = verifyAuditChainRecords(records);
+    expect(defaultReport.verdict).toBe("FAIL");
+    expect(defaultReport.signature_basis).toBe("none");
+    expect(defaultReport.signatures_verified).toBe(0);
+    expect(
+      defaultReport.findings.every(
+        (finding) => finding.kind === "checkpoint_signature_missing_key",
+      ),
+    ).toBe(true);
+
+    const pinnedReport = verifyAuditChainRecords(records, { publicKey });
+    expect(pinnedReport.verdict).toBe("PASS");
+    expect(pinnedReport.signature_basis).toBe("pinned");
+
+    const embeddedReport = verifyAuditChainRecords(records, { trustEmbedded: true });
+    expect(embeddedReport.verdict).toBe("PASS");
+    expect(embeddedReport.signature_basis).toBe("embedded");
+  });
+
+  it("does not PASS a tampered chain re-signed with a fresh embedded key by default", async () => {
+    const { storage, publicKey } = await buildSignedAuditChain();
+    const original = parseJsonl(await collectExport(storage));
+    const forged = await forgeSelfConsistentTamperedChain(original, 3);
+
+    const defaultReport = verifyAuditChainRecords(forged.records);
+    expect(defaultReport.verdict).toBe("FAIL");
+    expect(defaultReport.signature_basis).toBe("none");
+    expect(defaultReport.signatures_verified).toBe(0);
+    expect(
+      defaultReport.findings.some(
+        (finding) => finding.kind === "checkpoint_signature_missing_key",
+      ),
+    ).toBe(true);
+    expect(
+      defaultReport.findings.some(
+        (finding) =>
+          finding.kind === "entry_hash_mismatch" ||
+          finding.kind === "prev_hash_mismatch" ||
+          finding.kind === "checkpoint_root_mismatch",
+      ),
+    ).toBe(false);
+
+    const pinnedReport = verifyAuditChainRecords(forged.records, { publicKey });
+    expect(pinnedReport.verdict).toBe("FAIL");
+    expect(pinnedReport.signature_basis).toBe("pinned");
+    expect(
+      pinnedReport.findings.some(
+        (finding) => finding.kind === "checkpoint_signature_invalid",
+      ),
+    ).toBe(true);
+
+    const embeddedReport = verifyAuditChainRecords(forged.records, {
+      trustEmbedded: true,
+    });
+    expect(embeddedReport.verdict).toBe("PASS");
+    expect(embeddedReport.signature_basis).toBe("embedded");
+    expect(embeddedReport.signatures_verified).toBeGreaterThan(0);
+    expect(forged.embeddedPublicKey).not.toBe(publicKey);
   });
 
   it("exports a rotated chain with its rotation anchor and verifies it as PASS", async () => {
@@ -502,7 +655,9 @@ describe("external-verifier-drill: Scenario C - checkpoint signature invalidatio
         ? { ...checkpoint, signature: `${checkpoint.signature}!` }
         : record
     );
-    const signatureReport = verifyAuditChainRecords(nonCanonicalSignature);
+    const signatureReport = verifyAuditChainRecords(nonCanonicalSignature, {
+      trustEmbedded: true,
+    });
     expect(signatureReport.verdict).toBe("FAIL");
     expect(
       signatureReport.findings.some((f) => f.kind === "checkpoint_signature_invalid")
@@ -513,7 +668,9 @@ describe("external-verifier-drill: Scenario C - checkpoint signature invalidatio
         ? { ...checkpoint, public_key: `${checkpoint.public_key}!` }
         : record
     );
-    const keyReport = verifyAuditChainRecords(nonCanonicalKey);
+    const keyReport = verifyAuditChainRecords(nonCanonicalKey, {
+      trustEmbedded: true,
+    });
     expect(keyReport.verdict).toBe("FAIL");
     expect(keyReport.findings.some((f) => f.kind === "checkpoint_signature_invalid")).toBe(
       true
