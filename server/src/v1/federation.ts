@@ -67,7 +67,11 @@ import type {
   JoinRequest,
 } from "../mesh/lifecycle/types.js";
 import type { V1SessionClaims } from "./session-service.js";
-import { canonicalJson, verifyOperatorSignature } from "./operator-signed.js";
+import {
+  canonicalJson,
+  validateOperatorAuthorizationFreshness,
+  verifyOperatorSignature,
+} from "./operator-signed.js";
 import {
   writeJson,
   readJsonBody,
@@ -568,6 +572,18 @@ export interface V1FederationDeps {
   setEnabled(enabled: boolean): void | Promise<void>;
   /** Operator identity public key for OPERATOR_SIGNED gating (PR-A2 parity). */
   resolveOperatorPublicKey(): Uint8Array | null;
+  /**
+   * Consume one verified OPERATOR_SIGNED authorization before its effect runs.
+   * Implementations must durably persist the replay key and fail closed on a
+   * write failure; returning "replayed" refuses an already-spent nonce.
+   */
+  consumeOperatorAuthorization(params: {
+    replayKey: string;
+    action: string;
+    authorizationNonce: string;
+    expiresAt: string;
+    operatorPublicKey: Uint8Array;
+  }): Promise<"consumed" | "replayed">;
   audit: FederationAudit;
   /** Joined node ids, for the status roster summary. */
   rosterNodeIds(): string[];
@@ -906,27 +922,95 @@ function handleStatus(deps: V1FederationDeps, res: ServerResponse): void {
   });
 }
 
+type OperatorAuthorizationResult =
+  | { ok: true }
+  | {
+      ok: false;
+      reason:
+        | "operator_signature_invalid"
+        | "operator_authorization_missing_freshness"
+        | "operator_authorization_malformed_freshness"
+        | "operator_authorization_expired"
+        | "operator_authorization_not_yet_valid"
+        | "operator_authorization_lifetime_too_long"
+        | "operator_authorization_replayed"
+        | "operator_authorization_spent_store_unavailable";
+    };
+
 /**
- * Verify the inline OPERATOR_SIGNED signature over a federation admin payload.
- * Returns true only when an operator identity is configured AND the signature
- * verifies; otherwise false (the caller maps false to the generic 403, no
- * distinguishable reason - same contract as the agents write path).
+ * Verify and durably consume one OPERATOR_SIGNED federation authorization.
+ * Freshness fields are inside the signed payload; the spent replay key is
+ * recorded before the caller performs the authorized effect.
  */
-function verifyOperator(
+async function verifyAndConsumeOperatorAuthorization(
   deps: V1FederationDeps,
   action: string,
   payload: Record<string, unknown>,
   signature: unknown,
-): boolean {
-  if (typeof signature !== "string" || signature.length === 0) return false;
+): Promise<OperatorAuthorizationResult> {
+  if (typeof signature !== "string" || signature.length === 0) {
+    return { ok: false, reason: "operator_signature_invalid" };
+  }
   const operatorPublicKey = deps.resolveOperatorPublicKey();
-  if (!operatorPublicKey) return false; // fail closed: no operator identity
-  return verifyOperatorSignature({
+  if (!operatorPublicKey) {
+    return { ok: false, reason: "operator_signature_invalid" };
+  }
+  const freshness = validateOperatorAuthorizationFreshness(payload);
+  if (!freshness.ok) return freshness;
+  const ok = verifyOperatorSignature({
     action,
     payload,
     signature,
     operatorPublicKey,
   });
+  if (!ok) return { ok: false, reason: "operator_signature_invalid" };
+  const replayKey = operatorAuthorizationReplayKey({
+    operatorPublicKey,
+    action,
+    authorizationNonce: freshness.authorizationNonce,
+  });
+  try {
+    const consumed = await deps.consumeOperatorAuthorization({
+      replayKey,
+      action,
+      authorizationNonce: freshness.authorizationNonce,
+      expiresAt: freshness.expiresAt,
+      operatorPublicKey,
+    });
+    if (consumed === "replayed") {
+      return { ok: false, reason: "operator_authorization_replayed" };
+    }
+  } catch {
+    return {
+      ok: false,
+      reason: "operator_authorization_spent_store_unavailable",
+    };
+  }
+  return { ok: true };
+}
+
+function operatorAuthorizationReplayKey(input: {
+  operatorPublicKey: Uint8Array;
+  action: string;
+  authorizationNonce: string;
+}): string {
+  const h = createHash("sha256");
+  h.update("sanctuary.v1.operator-authorization-spent\0");
+  h.update(input.operatorPublicKey);
+  h.update("\0");
+  h.update(input.action);
+  h.update("\0");
+  h.update(input.authorizationNonce);
+  return toBase64url(h.digest());
+}
+
+function includeOperatorAuthorizationFields(
+  signedPayload: Record<string, unknown>,
+  body: Record<string, unknown>,
+): void {
+  for (const key of ["authorization_nonce", "issued_at", "expires_at"]) {
+    if (key in body) signedPayload[key] = body[key];
+  }
 }
 
 async function handleEnableDisable(
@@ -949,15 +1033,26 @@ async function handleEnableDisable(
   };
   const signedPayload: Record<string, unknown> = {};
   if (typeof idempotency_key === "string") signedPayload.idempotency_key = idempotency_key;
+  includeOperatorAuthorizationFields(signedPayload, body as Record<string, unknown>);
 
-  if (!verifyOperator(deps, action, signedPayload, operator_signature)) {
+  const authorization = await verifyAndConsumeOperatorAuthorization(
+    deps,
+    action,
+    signedPayload,
+    operator_signature,
+  );
+  if (!authorization.ok) {
     await deps.audit({
       operation,
       result: "failure",
       identityId: "operator",
-      details: { reason: "operator_signature_invalid" },
+      details: { reason: authorization.reason },
     });
-    denyForbidden(res);
+    if (authorization.reason === "operator_authorization_spent_store_unavailable") {
+      writeJson(res, 503, { error: "unavailable" });
+    } else {
+      denyForbidden(res);
+    }
     return;
   }
 
@@ -1030,14 +1125,25 @@ async function handleAuthorizeInit(
     intended_node_id,
     intended_node_mode,
   };
-  if (!verifyOperator(deps, action, signedPayload, operator_signature)) {
+  includeOperatorAuthorizationFields(signedPayload, body as Record<string, unknown>);
+  const authorization = await verifyAndConsumeOperatorAuthorization(
+    deps,
+    action,
+    signedPayload,
+    operator_signature,
+  );
+  if (!authorization.ok) {
     await deps.audit({
       operation,
       result: "failure",
       identityId: intended_node_id,
-      details: { reason: "operator_signature_invalid" },
+      details: { reason: authorization.reason },
     });
-    denyForbidden(res);
+    if (authorization.reason === "operator_authorization_spent_store_unavailable") {
+      writeJson(res, 503, { error: "unavailable" });
+    } else {
+      denyForbidden(res);
+    }
     return;
   }
 
@@ -1111,15 +1217,26 @@ async function handleRevoke(
     reason: revocationReason,
   };
   if (typeof idempotency_key === "string") signedPayload.idempotency_key = idempotency_key;
+  includeOperatorAuthorizationFields(signedPayload, body as Record<string, unknown>);
 
-  if (!verifyOperator(deps, action, signedPayload, operator_signature)) {
+  const authorization = await verifyAndConsumeOperatorAuthorization(
+    deps,
+    action,
+    signedPayload,
+    operator_signature,
+  );
+  if (!authorization.ok) {
     await deps.audit({
       operation,
       result: "failure",
       identityId: node_id,
-      details: { reason: "operator_signature_invalid" },
+      details: { reason: authorization.reason },
     });
-    denyForbidden(res);
+    if (authorization.reason === "operator_authorization_spent_store_unavailable") {
+      writeJson(res, 503, { error: "unavailable" });
+    } else {
+      denyForbidden(res);
+    }
     return;
   }
 
@@ -1332,15 +1449,26 @@ async function handleSync(
     signedPayload.cursor = parsedCursor;
   }
   if (typeof idempotency_key === "string") signedPayload.idempotency_key = idempotency_key;
+  includeOperatorAuthorizationFields(signedPayload, body as Record<string, unknown>);
 
-  if (!verifyOperator(deps, action, signedPayload, operator_signature)) {
+  const authorization = await verifyAndConsumeOperatorAuthorization(
+    deps,
+    action,
+    signedPayload,
+    operator_signature,
+  );
+  if (!authorization.ok) {
     await deps.audit({
       operation,
       result: "failure",
       identityId: node_id,
-      details: { reason: "operator_signature_invalid" },
+      details: { reason: authorization.reason },
     });
-    denyForbidden(res);
+    if (authorization.reason === "operator_authorization_spent_store_unavailable") {
+      writeJson(res, 503, { error: "unavailable" });
+    } else {
+      denyForbidden(res);
+    }
     return;
   }
 

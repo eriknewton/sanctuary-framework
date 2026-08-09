@@ -26,7 +26,10 @@ import {
   federationEventHash,
   type FederationEvent,
 } from "../../src/v1/federation.js";
-import { signOperatorPayload } from "../../src/v1/operator-signed.js";
+import {
+  addOperatorAuthorizationFields,
+  signOperatorPayload,
+} from "../../src/v1/operator-signed.js";
 import { toBase64url } from "../../src/core/encoding.js";
 import {
   FEDERATION_NODE_EVICTION_EVENT_KIND,
@@ -57,10 +60,11 @@ afterEach(async () => {
 });
 
 function operatorSigned(action: string, payload: Record<string, unknown>) {
+  const signedPayload = addOperatorAuthorizationFields(payload);
   return {
-    ...payload,
+    ...signedPayload,
     operator_signature: toBase64url(
-      signOperatorPayload(action, payload, OPERATOR.privateKey),
+      signOperatorPayload(action, signedPayload, OPERATOR.privateKey),
     ),
   };
 }

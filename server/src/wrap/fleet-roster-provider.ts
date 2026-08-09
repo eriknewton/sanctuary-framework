@@ -284,6 +284,7 @@ export function readOnlyFederationDeps(
     isRootRevoked: notReadOnly,
     setEnabled: notReadOnly,
     resolveOperatorPublicKey: notReadOnly,
+    consumeOperatorAuthorization: notReadOnly,
     audit: notReadOnly,
     rosterNodeIds: notReadOnly,
     recordJoin: notReadOnly,

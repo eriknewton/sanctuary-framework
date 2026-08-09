@@ -1,3 +1,8 @@
+// fail-before-exempt: adapted to the new federation-deps interface only (adds
+// consumeOperatorAuthorization to the mustNotCall mock). No assertion here
+// exercises the operator-signed freshness fix, so nothing in this file fails
+// against pre-fix source. Freshness fail-before tests: v1/operator-signed.test.ts
+// and v1/federation-http.test.ts.
 /**
  * Fleet Console Slice 1 - fleet-roster presenter unit tests.
  *
@@ -108,6 +113,7 @@ function deps(opts: {
     // touch. Wire them to throw so a regression that reaches for them fails loud.
     setEnabled: mustNotCall("setEnabled") as never,
     resolveOperatorPublicKey: mustNotCall("resolveOperatorPublicKey") as never,
+    consumeOperatorAuthorization: mustNotCall("consumeOperatorAuthorization") as never,
     audit: mustNotCall("audit") as never,
     rosterNodeIds: mustNotCall("rosterNodeIds") as never,
     recordJoin: mustNotCall("recordJoin") as never,

@@ -13,6 +13,9 @@ import { randomBytes } from "node:crypto";
 
 import {
   canonicalJson,
+  addOperatorAuthorizationFields,
+  validateOperatorAuthorizationFreshness,
+  V1_OPERATOR_AUTHORIZATION_TTL_MS,
   buildOperatorSignedMessage,
   verifyOperatorSignature,
   signOperatorPayload,
@@ -156,5 +159,72 @@ describe("verifyOperatorSignature", () => {
     const text = new TextDecoder().decode(message.slice(0, 40));
     expect(text).toContain("operator-signed");
     expect(text).not.toContain("session.challenge");
+  });
+});
+
+describe("operator authorization freshness", () => {
+  it("adds signed freshness fields with a bounded lifetime", () => {
+    const nowMs = Date.parse("2026-08-08T12:00:00.000Z");
+    const payload = addOperatorAuthorizationFields(
+      { node_id: "edge-1" },
+      { nowMs, nonce: "nonce-1" },
+    );
+
+    expect(payload).toEqual({
+      node_id: "edge-1",
+      authorization_nonce: "nonce-1",
+      issued_at: "2026-08-08T12:00:00.000Z",
+      expires_at: "2026-08-08T12:05:00.000Z",
+    });
+    expect(validateOperatorAuthorizationFreshness(payload, nowMs).ok).toBe(true);
+  });
+
+  it("rejects legacy payloads with no signed freshness fields", () => {
+    expect(
+      validateOperatorAuthorizationFreshness({ node_id: "edge-1" }),
+    ).toEqual({
+      ok: false,
+      reason: "operator_authorization_missing_freshness",
+    });
+  });
+
+  it("rejects expired, not-yet-valid, and overlong windows", () => {
+    const nowMs = Date.parse("2026-08-08T12:00:00.000Z");
+    expect(
+      validateOperatorAuthorizationFreshness(
+        addOperatorAuthorizationFields(
+          { node_id: "expired" },
+          { nowMs: nowMs - V1_OPERATOR_AUTHORIZATION_TTL_MS - 1, nonce: "n1" },
+        ),
+        nowMs,
+      ),
+    ).toEqual({ ok: false, reason: "operator_authorization_expired" });
+
+    expect(
+      validateOperatorAuthorizationFreshness(
+        addOperatorAuthorizationFields(
+          { node_id: "future" },
+          { nowMs: nowMs + 61_000, nonce: "n2" },
+        ),
+        nowMs,
+      ),
+    ).toEqual({ ok: false, reason: "operator_authorization_not_yet_valid" });
+
+    expect(
+      validateOperatorAuthorizationFreshness(
+        addOperatorAuthorizationFields(
+          { node_id: "long" },
+          {
+            nowMs,
+            nonce: "n3",
+            ttlMs: V1_OPERATOR_AUTHORIZATION_TTL_MS + 1,
+          },
+        ),
+        nowMs,
+      ),
+    ).toEqual({
+      ok: false,
+      reason: "operator_authorization_lifetime_too_long",
+    });
   });
 });

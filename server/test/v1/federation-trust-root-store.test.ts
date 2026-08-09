@@ -27,7 +27,11 @@ import {
 } from "../../src/mesh/federation-trust-root-store.js";
 import { CAP_STANDARD_FORTRESS_NODE } from "../../src/mesh/constants.js";
 import { issueNodeIdentityCertificate } from "../../src/mesh/trust-root.js";
-import { signOperatorPayload } from "../../src/v1/operator-signed.js";
+import {
+  addOperatorAuthorizationFields,
+  signOperatorPayload,
+} from "../../src/v1/operator-signed.js";
+import { FederationSyncStateStore } from "../../src/v1/federation-sync-state-store.js";
 import { buildChallengeMessage } from "../../src/v1/ceremony.js";
 import {
   pushSyncToPeer,
@@ -192,7 +196,9 @@ describe("FederationTrustRootStore", () => {
       }),
     );
 
-    const enablePayload = { idempotency_key: "slice1-enable" };
+    const enablePayload = addOperatorAuthorizationFields({
+      idempotency_key: "slice1-enable",
+    });
     const enable = await fetch(`${daemon.baseUrl}/v1/federation/enable`, {
       method: "POST",
       headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
@@ -276,7 +282,8 @@ async function startDaemon(
   opts?: { operatorIdentity?: boolean },
 ): Promise<TestDaemon> {
   const storage = new MemoryStorage();
-  const auditLog = new AuditLog(storage, randomBytes(32));
+  const masterKey = randomBytes(32);
+  const auditLog = new AuditLog(storage, masterKey);
   const port = 32000 + Math.floor(Math.random() * 20000);
   const dashboard = new DashboardApprovalChannel({
     port,
@@ -304,6 +311,9 @@ async function startDaemon(
       : {}),
   });
   dashboard.setFederationContext(context);
+  await dashboard.setFederationSyncStateStore(
+    new FederationSyncStateStore({ storage, masterKey }),
+  );
   await dashboard.start();
   const daemon = {
     dashboard,

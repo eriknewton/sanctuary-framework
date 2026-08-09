@@ -1,3 +1,7 @@
+// fail-before-exempt: adapted to the shared verifyCapturedOperatorSignature helper
+// only; these assertions check signature validity, not the anti-replay spent-set
+// behavior, so they pass with or without the fix. Freshness fail-before tests:
+// v1/operator-signed.test.ts and v1/federation-http.test.ts.
 /**
  * Federation Slice 3b -- operator-signed admin CLI verb tests.
  *
@@ -194,16 +198,7 @@ describe("federation enable/disable -- operator-signed, fail-closed", () => {
     expect(action).toBe("/v1/federation/enable");
     expect(typeof body.operator_signature).toBe("string");
 
-    // Reconstruct the SERVER-side signed payload (server includes
-    // idempotency_key only when it is a string; never the signature itself).
-    const signedPayload: Record<string, unknown> = { idempotency_key: body.idempotency_key };
-    const ok = verifyOperatorSignature({
-      action,
-      payload: signedPayload,
-      signature: body.operator_signature as string,
-      operatorPublicKey: issuer.operator.publicKey,
-    });
-    expect(ok).toBe(true);
+    expect(verifyCapturedOperatorSignature({ action, body })).toBe(true);
   });
 
   it("surfaces a 503 from the server as fail-closed not-provisioned (exit 3)", async () => {
@@ -290,16 +285,7 @@ describe("federation authorize -- operator-signed bootstrap token", () => {
     expect(code).toBe(0);
     const { action, body } = captured!;
     expect(action).toBe("/v1/federation/authorize/init");
-    const ok = verifyOperatorSignature({
-      action,
-      payload: {
-        intended_node_id: body.intended_node_id,
-        intended_node_mode: body.intended_node_mode,
-      },
-      signature: body.operator_signature as string,
-      operatorPublicKey: issuer.operator.publicKey,
-    });
-    expect(ok).toBe(true);
+    expect(verifyCapturedOperatorSignature({ action, body })).toBe(true);
     const printed = JSON.parse(out.get()) as { bootstrap_token: { intended_node_id: string } };
     expect(printed.bootstrap_token.intended_node_id).toBe("joiner-linux");
   });
@@ -385,17 +371,7 @@ describe("federation revoke -- operator-signed node eviction", () => {
     expect(code).toBe(0);
     const { action, body } = captured!;
     expect(action).toBe("/v1/federation/revoke");
-    const ok = verifyOperatorSignature({
-      action,
-      payload: {
-        node_id: body.node_id,
-        reason: body.reason,
-        idempotency_key: body.idempotency_key,
-      },
-      signature: body.operator_signature as string,
-      operatorPublicKey: issuer.operator.publicKey,
-    });
-    expect(ok).toBe(true);
+    expect(verifyCapturedOperatorSignature({ action, body })).toBe(true);
     expect(JSON.parse(out.get())).toEqual({
       revoked: true,
       node_id: "joiner-linux",
