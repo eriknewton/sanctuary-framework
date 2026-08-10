@@ -399,7 +399,12 @@ export class ToolCallTrapRuntime {
       }
       if (persisted) {
         this.retainActivation(spec.trap_id, invocation);
-        this.activeFindingWindows.set(windowKey, {
+        // BoundedMap.set() is async (core/bounded-map.ts, MUST-FIX 6): a
+        // trust-bearing map awaits a critical audit before an eviction
+        // delete. This map has no `onEvict` (not trust-bearing — see its
+        // construction doc), so the await here resolves with no real
+        // work; it is only awaited for API uniformity with `BoundedMap`.
+        await this.activeFindingWindows.set(windowKey, {
           finding_id: findingId,
           window_started_at: windowStartedAt,
           first_observed_at: firstObservedAt,

@@ -74,22 +74,85 @@ import type {
 export const MAX_HANDSHAKE_SESSIONS = 500;
 
 /**
- * Per-origin quota for `sessions` (AGENTS.md rule 8 RECHECK): the ORIGIN of
- * a session is the LOCAL identity that owns it (`our_shr.body.instance_id` —
- * a fortress can hold multiple local identities, and `handshake_initiate` /
- * `handshake_respond` both take an `identity_id` argument selecting which
- * one). Without this, a caller driving 500 `handshake_initiate` calls
- * through ONE local identity could fill the entire global cap and evict
- * every OTHER identity's in-flight session too (the eviction policy below
- * is unconditional oldest-evict). With this, that same flood exhausts only
- * its OWN identity's quota and is REFUSED — never evicts another identity's
- * session — leaving the other identities' headroom untouched. 50 = 1/10th
- * of MAX_HANDSHAKE_SESSIONS: generous for legitimate concurrent in-flight
- * handshakes on one identity, while guaranteeing at least 10 distinct local
- * identities can be mid-handshake at once before any single one could even
- * begin to threaten the global ceiling.
+ * Per-origin quota for `sessions` (AGENTS.md rule 8, MUST-FIX 1 RECHECK —
+ * SPINE FIX, fix-round-2). The ORIGIN of a session is the SERVER-SET
+ * AGENT-SESSION PRINCIPAL (`callerIdentity`, threaded down from
+ * router.ts — `agent:<currentAgentId>` or the shared `agent:unknown`
+ * bucket, see `AGENT_UNKNOWN_ORIGIN`'s doc), NEVER the caller-supplied
+ * `identity_id` / `our_shr.body.instance_id` the fix-round-1 cut used.
+ *
+ * WHY THE CHANGE (verified at source): `identity_create` and
+ * `identity_list` are both in `principal-policy/loader.ts`'s
+ * `tier3_always_allow` — an untrusted agent mints local Sanctuary
+ * identities freely, at will, with no approval gate. A per-origin quota
+ * keyed on `identity_id` is therefore trivially defeated: mint ~10
+ * identities, drive `MAX_HANDSHAKE_SESSIONS_PER_ORIGIN` sessions through
+ * EACH one, and the flood again fills the whole global cap across 10
+ * "distinct" origins that are really one attacker — reproducing the exact
+ * cross-origin eviction/lockout this quota exists to prevent (the
+ * fix-round-1 branch's own multi-identity test proved this at
+ * attacker-writable-collections-bounds.test.ts). `callerIdentity` is not
+ * mintable this way: it is set by the MCP router from
+ * `options.currentAgentId()`, never from tool arguments, so an agent
+ * cannot manufacture additional origins by minting identities — every
+ * identity IT mints still calls through the SAME session and therefore
+ * the SAME origin. 50 = 1/10th of MAX_HANDSHAKE_SESSIONS: generous for
+ * legitimate concurrent in-flight handshakes from one agent session,
+ * while guaranteeing at least 10 distinct agent sessions can be
+ * mid-handshake at once before any single one could even begin to
+ * threaten the global ceiling.
+ *
+ * HONEST POSTURE (rule 8, fix-round-2): this quota isolates DISTINCT agent
+ * sessions from one another — the fleet / multi-agent-per-fortress
+ * deployment shape this bound is really for. In a single-agent deployment
+ * there is only ONE session, so this quota degenerates to a SELF-limit
+ * (that one agent can fill its own 50-session share and get refused, same
+ * as before) rather than a fairness guarantee between principals — there is
+ * no second principal to be fair to. What does NOT degenerate: the
+ * refuse-only eviction policy (never "evict this origin's own oldest to
+ * make room") still holds in that single-session case, so even a
+ * self-flooding single agent can never evict its OWN earlier session, let
+ * alone another origin's — it just gets refused once its own quota fills.
  */
 export const MAX_HANDSHAKE_SESSIONS_PER_ORIGIN = 50;
+
+/**
+ * Shared bucket for the `agent:unknown` fallback (MUST-FIX 1, deliberate
+ * decision, fix-round-2). `router.ts` sets `callerIdentity` to
+ * `agent:unknown` whenever `options.currentAgentId()` returns undefined —
+ * e.g. a call that did not arrive through a wrapped-agent session (a
+ * loopback/dashboard-triggered call, or a harness that never configured
+ * `currentAgentId`). Every such call shares this ONE origin string and is
+ * therefore subject to the SAME per-origin quota as any single named agent
+ * session — deliberately NOT an unbounded escape hatch: an attacker cannot
+ * multiply their headroom by arranging to look "unknown," because looking
+ * unknown just means sharing one already-bounded bucket with every other
+ * unknown caller. This is a shared-bucket choice, not fail-closed, because
+ * unknown-identity calls are a legitimate operational path (embedded
+ * dashboard / loopback tooling), not exclusively an attacker signal; a
+ * fortress that runs entirely without a wrapped agent would otherwise have
+ * every one of its own legitimate calls refused once the shared bucket's
+ * modest quota is reached, which is the wrong failure mode for a
+ * non-adversarial deployment shape.
+ */
+export const AGENT_UNKNOWN_ORIGIN = "agent:unknown";
+
+/**
+ * Resolve the per-origin quota key for a handler call (MUST-FIX 1). Shared
+ * by `insertSession` (sessions) and `recordHandshakeResult`
+ * (handshakeResults) so the AGENT_UNKNOWN_ORIGIN fallback decision lives in
+ * exactly one place. `callerIdentity` is `router.ts`'s server-set session
+ * principal; it is `undefined` only when a caller bypasses the router
+ * entirely (a direct unit-test handler call, or a future non-MCP caller),
+ * which this treats identically to the router's own `agent:unknown` case —
+ * see AGENT_UNKNOWN_ORIGIN's doc for why a shared bucket, not fail-closed,
+ * is the right response.
+ */
+function resolveSessionOrigin(callerIdentity: string | undefined): string {
+  return callerIdentity && callerIdentity.length > 0
+    ? callerIdentity
+    : AGENT_UNKNOWN_ORIGIN;
+}
 
 /**
  * `handshakeResults` cap — shared with L4 tier resolution, federation
@@ -107,20 +170,25 @@ export const MAX_HANDSHAKE_SESSIONS_PER_ORIGIN = 50;
 export const MAX_HANDSHAKE_RESULTS = 1000;
 
 /**
- * Per-origin quota for `handshakeResults` (AGENTS.md rule 8 RECHECK): the
- * ORIGIN of a result is the LOCAL identity that recorded it (the
- * `auditIdentityId` already threaded into `recordHandshakeResult` below —
- * `session.our_shr.body.instance_id` for the 4-step protocol,
- * `ourSHR.body.instance_id` for `handshake_exchange`). Without this, feeding
- * one local identity a stream of attacker-controlled counterparty SHRs
- * could fill the entire global cap and — once every slot holds a verified
- * entry — permanently refuse recording for every OTHER identity too. With
- * this, that flood exhausts only the flooded identity's own quota and is
- * REFUSED there; a different identity's headroom is untouched. 100 = 1/10th
- * of MAX_HANDSHAKE_RESULTS, matching MAX_HANDSHAKE_SESSIONS_PER_ORIGIN's
- * ratio: generous per-identity headroom, guarantees at least 10 distinct
- * local identities' worth of results fit before any one identity could
- * threaten the shared ceiling.
+ * Per-origin quota for `handshakeResults` (AGENTS.md rule 8, MUST-FIX 1
+ * RECHECK — same spine fix as MAX_HANDSHAKE_SESSIONS_PER_ORIGIN above; see
+ * that constant's doc for the full mint-many-identities defeat this closes).
+ * The ORIGIN of a result is the SERVER-SET AGENT-SESSION PRINCIPAL
+ * (`callerIdentity`, threaded from router.ts into `recordHandshakeResult`
+ * below), NEVER the local identity that happened to sign the SHR
+ * (`session.our_shr.body.instance_id` / `ourSHR.body.instance_id`) — a
+ * value the calling agent can multiply at will via `identity_create`
+ * (Tier 3 always-allow). Without this, feeding one agent session a stream
+ * of attacker-controlled counterparty SHRs across many MINTED local
+ * identities could still fill the entire global cap and — once every slot
+ * holds a verified entry — permanently refuse recording for every OTHER
+ * agent session too. With this, that flood exhausts only the flooding
+ * SESSION's own quota and is REFUSED there, regardless of how many local
+ * identities it minted to spread the flood across; a different agent
+ * session's headroom is untouched. 100 = 1/10th of MAX_HANDSHAKE_RESULTS,
+ * matching MAX_HANDSHAKE_SESSIONS_PER_ORIGIN's ratio: generous per-session
+ * headroom, guarantees at least 10 distinct agent sessions' worth of
+ * results fit before any one session could threaten the shared ceiling.
  */
 export const MAX_HANDSHAKE_RESULTS_PER_ORIGIN = 100;
 
@@ -158,13 +226,18 @@ export function createHandshakeTools(
   // enforces this at every consumer call site; a consumer that needs to
   // mutate the map is a design error, not a cast to work around.
   handshakeResults: ReadonlyMap<string, HandshakeResult>;
-  // Per-origin accounting (AGENTS.md rule 8 RECHECK): counterparty_id ->
-  // the LOCAL identity id that recorded that entry. Federation registration
-  // reads this to attribute a peer to the local identity whose quota it
-  // should count against (see MAX_FEDERATION_PEERS_PER_ORIGIN in
+  // Per-origin accounting (AGENTS.md rule 8, MUST-FIX 1 RECHECK):
+  // counterparty_id -> the AGENT-SESSION PRINCIPAL (`callerIdentity`,
+  // resolved through `resolveSessionOrigin`) that recorded that entry —
+  // NEVER the local Sanctuary identity that signed our side (caller-
+  // mintable via `identity_create`; see MAX_HANDSHAKE_RESULTS_PER_ORIGIN's
+  // doc for why that would defeat the quota). Federation registration
+  // reads this to attribute a peer to the SAME session principal whose
+  // quota it should count against (see MAX_FEDERATION_PEERS_PER_ORIGIN in
   // federation/registry.ts) — `HandshakeResult` itself carries no field for
-  // "which local identity recorded me," so this is the one place that
-  // information exists.
+  // "which session recorded me," so this is the one place that information
+  // exists. REQUIRED at federation/tools.ts (not optional — MUST-FIX 2):
+  // an omitted map there must never mean "skip the quota."
   handshakeResultOrigins: ReadonlyMap<string, string>;
 } {
   const autoPublishHandshakes = options?.autoPublishHandshakes ?? false;
@@ -200,10 +273,18 @@ export function createHandshakeTools(
       if (oldest.done) return { refuse: true };
       return { evict: oldest.value };
     },
-    onEvict: (evictedSessionId) => {
-      void auditLog.append("l4", "handshake_session_evicted", "system", {
-        session_id: evictedSessionId,
-        reason: "capacity",
+    onEvict: async (evictedSessionId) => {
+      // AWAITED + CRITICAL (MUST-FIX 6, fix-round-2 RECHECK): eviction here
+      // drops a live in-flight handshake session; BoundedMap.set() awaits
+      // this and ABORTS the eviction (refuses the new insert) if the
+      // durable write fails, rather than deleting a session with no audit
+      // record of why. See bounded-map.ts's onEvict doc.
+      await auditLog.appendCritical({
+        layer: "l4",
+        operation: "handshake_session_evicted",
+        identity_id: "system",
+        result: "success",
+        details: { session_id: evictedSessionId, reason: "capacity" },
       });
     },
     // No onRefuse here: `handshake_initiate` / `handshake_respond` below
@@ -226,35 +307,48 @@ export function createHandshakeTools(
    * (register LD2-03 / rule 8 RECHECK — every `sessions.set(...)` in this
    * file funnels through here, mirroring recordHandshakeResult's role for
    * `handshakeResults`, so the origin-quota-vs-capacity distinction and its
-   * audit trail are written once, not duplicated per call site). `originId`
-   * is the LOCAL identity's own instance_id (`shr.body.instance_id`) — see
-   * MAX_HANDSHAKE_SESSIONS_PER_ORIGIN's doc for why that, not the remote
-   * caller, is the right accounting key for this store.
+   * audit trail are written once, not duplicated per call site).
+   *
+   * `localIdentityId` is the LOCAL identity's own instance_id
+   * (`shr.body.instance_id`) — kept ONLY as the audit log's `identity_id`
+   * field (forensic attribution: which Sanctuary identity this session
+   * belongs to) and as a component of `HandshakeFailureReason` context; it
+   * is NEVER the quota origin (see MAX_HANDSHAKE_SESSIONS_PER_ORIGIN's doc
+   * — a caller-mintable identity cannot be the quota key). `callerIdentity`
+   * is the SERVER-SET agent-session principal (router.ts, MUST-FIX 1
+   * spine) and IS the quota origin, resolved through
+   * `resolveSessionOrigin` so an absent value (a call that bypassed the
+   * router, or a legitimately unwrapped caller) lands in the shared
+   * `AGENT_UNKNOWN_ORIGIN` bucket rather than skipping accounting.
    */
   function insertSession(
     session: HandshakeSession,
-    originId: string
-  ): { ok: true } | { ok: false; error: string; reason: HandshakeFailureReason } {
-    const originQuotaExceeded =
-      sessions.originSize(originId) >= MAX_HANDSHAKE_SESSIONS_PER_ORIGIN;
-    const inserted = sessions.set(session.session_id, session, originId);
-    if (!inserted) {
-      const reason: HandshakeFailureReason = originQuotaExceeded
-        ? "handshake_session_origin_quota_exceeded"
-        : "handshake_session_store_saturated";
-      const error = originQuotaExceeded
-        ? SESSION_ORIGIN_QUOTA_ERROR
-        : SESSIONS_SATURATED_ERROR;
-      void auditLog.append(
-        "l4",
-        reason,
-        originId,
-        { session_id: session.session_id },
-        "failure"
-      );
-      return { ok: false, error, reason };
-    }
-    return { ok: true };
+    localIdentityId: string,
+    callerIdentity: string | undefined
+  ): Promise<{ ok: true } | { ok: false; error: string; reason: HandshakeFailureReason }> {
+    return (async () => {
+      const origin = resolveSessionOrigin(callerIdentity);
+      const originQuotaExceeded =
+        sessions.originSize(origin) >= MAX_HANDSHAKE_SESSIONS_PER_ORIGIN;
+      const inserted = await sessions.set(session.session_id, session, origin);
+      if (!inserted) {
+        const reason: HandshakeFailureReason = originQuotaExceeded
+          ? "handshake_session_origin_quota_exceeded"
+          : "handshake_session_store_saturated";
+        const error = originQuotaExceeded
+          ? SESSION_ORIGIN_QUOTA_ERROR
+          : SESSIONS_SATURATED_ERROR;
+        void auditLog.append(
+          "l4",
+          reason,
+          localIdentityId,
+          { session_id: session.session_id, caller_identity: origin },
+          "failure"
+        );
+        return { ok: false, error, reason };
+      }
+      return { ok: true };
+    })();
   }
 
   // Completed handshake results indexed by counterparty ID — shared with L4
@@ -318,13 +412,23 @@ export function createHandshakeTools(
       }
       return { refuse: true };
     },
-    onEvict: (evictedCounterpartyId, evictedResult) => {
-      void auditLog.append("l4", "handshake_result_evicted", "system", {
-        counterparty_id: evictedCounterpartyId,
-        verified: evictedResult.verified,
-        liveness_proven: evictedResult.liveness_proven,
-        expired: new Date(evictedResult.expires_at) <= new Date(),
-        reason: "capacity",
+    onEvict: async (evictedCounterpartyId, evictedResult) => {
+      // AWAITED + CRITICAL (MUST-FIX 6, fix-round-2 RECHECK): see
+      // `sessions`'s onEvict above — a verified peer's trust state
+      // disappearing must have a durable audit record BEFORE the delete,
+      // and the eviction ABORTS if the write fails.
+      await auditLog.appendCritical({
+        layer: "l4",
+        operation: "handshake_result_evicted",
+        identity_id: "system",
+        result: "success",
+        details: {
+          counterparty_id: evictedCounterpartyId,
+          verified: evictedResult.verified,
+          liveness_proven: evictedResult.liveness_proven,
+          expired: new Date(evictedResult.expires_at) <= new Date(),
+          reason: "capacity",
+        },
       });
     },
     // No onRefuse here: recordHandshakeResult below distinguishes
@@ -422,59 +526,69 @@ export function createHandshakeTools(
    * does — the caller gets an explicit refusal, never a silently-dropped
    * "success". `reason` on the failure branch lets callers audit the two
    * cases distinctly instead of collapsing them to one hardcoded label.
+   *
+   * `localIdentityId` is kept ONLY for audit attribution (which Sanctuary
+   * identity signed our side); `callerIdentity` (MUST-FIX 1 spine) is the
+   * quota origin, resolved via `resolveSessionOrigin` — see that function
+   * and MAX_HANDSHAKE_RESULTS_PER_ORIGIN's doc for why a caller-mintable
+   * identity must never be the accounting key.
    */
   function recordHandshakeResult(
     result: HandshakeResult,
-    auditIdentityId: string
-  ): { ok: true } | { ok: false; error: string; reason: HandshakeFailureReason } {
-    const counterpartyKey = tryDecodeSignerKey(result.counterparty_shr.signed_by);
-    if (isLocallyHeldSignerKey(counterpartyKey)) {
-      // counterparty_did here is derived ONLY for the audit trail's
-      // readability; the trust decision above already ran on decoded key
-      // bytes, never this string.
-      const counterpartyDid = tryDeriveDid(result.counterparty_shr.signed_by);
-      void auditLog.append(
-        "l4",
-        "handshake_self_vouch_blocked",
-        auditIdentityId,
-        {
-          counterparty_id: result.counterparty_id,
-          ...(counterpartyDid ? { counterparty_did: counterpartyDid } : {}),
-        },
-        "failure"
+    localIdentityId: string,
+    callerIdentity: string | undefined
+  ): Promise<{ ok: true } | { ok: false; error: string; reason: HandshakeFailureReason }> {
+    return (async () => {
+      const counterpartyKey = tryDecodeSignerKey(result.counterparty_shr.signed_by);
+      if (isLocallyHeldSignerKey(counterpartyKey)) {
+        // counterparty_did here is derived ONLY for the audit trail's
+        // readability; the trust decision above already ran on decoded key
+        // bytes, never this string.
+        const counterpartyDid = tryDeriveDid(result.counterparty_shr.signed_by);
+        void auditLog.append(
+          "l4",
+          "handshake_self_vouch_blocked",
+          localIdentityId,
+          {
+            counterparty_id: result.counterparty_id,
+            ...(counterpartyDid ? { counterparty_did: counterpartyDid } : {}),
+          },
+          "failure"
+        );
+        return { ok: false, error: SELF_VOUCH_ERROR, reason: "self_vouch_local_did" };
+      }
+      const origin = resolveSessionOrigin(callerIdentity);
+      // Pre-check which refusal reason applies BEFORE calling set() (the same
+      // condition BoundedMap checks internally) purely for audit/error-message
+      // richness — set() itself only returns a boolean, and the two refusal
+      // reasons need different operator-facing text (rule 8: a flooding
+      // origin's OWN quota is a very different situation from the whole store
+      // being genuinely saturated with live peers).
+      const originQuotaExceeded =
+        handshakeResults.originSize(origin) >= MAX_HANDSHAKE_RESULTS_PER_ORIGIN;
+      const inserted = await handshakeResults.set(
+        result.counterparty_id,
+        result,
+        origin
       );
-      return { ok: false, error: SELF_VOUCH_ERROR, reason: "self_vouch_local_did" };
-    }
-    // Pre-check which refusal reason applies BEFORE calling set() (the same
-    // condition BoundedMap checks internally) purely for audit/error-message
-    // richness — set() itself only returns a boolean, and the two refusal
-    // reasons need different operator-facing text (rule 8: a flooding
-    // origin's OWN quota is a very different situation from the whole store
-    // being genuinely saturated with live peers).
-    const originQuotaExceeded =
-      handshakeResults.originSize(auditIdentityId) >= MAX_HANDSHAKE_RESULTS_PER_ORIGIN;
-    const inserted = handshakeResults.set(
-      result.counterparty_id,
-      result,
-      auditIdentityId
-    );
-    if (!inserted) {
-      const reason: HandshakeFailureReason = originQuotaExceeded
-        ? "handshake_results_origin_quota_exceeded"
-        : "handshake_results_saturated";
-      const error = originQuotaExceeded
-        ? HANDSHAKE_RESULTS_ORIGIN_QUOTA_ERROR
-        : HANDSHAKE_RESULTS_SATURATED_ERROR;
-      void auditLog.append(
-        "l4",
-        reason,
-        auditIdentityId,
-        { counterparty_id: result.counterparty_id },
-        "failure"
-      );
-      return { ok: false, error, reason };
-    }
-    return { ok: true };
+      if (!inserted) {
+        const reason: HandshakeFailureReason = originQuotaExceeded
+          ? "handshake_results_origin_quota_exceeded"
+          : "handshake_results_saturated";
+        const error = originQuotaExceeded
+          ? HANDSHAKE_RESULTS_ORIGIN_QUOTA_ERROR
+          : HANDSHAKE_RESULTS_SATURATED_ERROR;
+        void auditLog.append(
+          "l4",
+          reason,
+          localIdentityId,
+          { counterparty_id: result.counterparty_id, caller_identity: origin },
+          "failure"
+        );
+        return { ok: false, error, reason };
+      }
+      return { ok: true };
+    })();
   }
 
   /**
@@ -514,7 +628,7 @@ export function createHandshakeTools(
           },
         },
       },
-      handler: async (args) => {
+      handler: async (args, callerIdentity) => {
         sweepExpiredSessions();
 
         // Generate our SHR
@@ -524,7 +638,7 @@ export function createHandshakeTools(
         }
 
         const { challenge, session } = initiateHandshake(shr);
-        const insertResult = insertSession(session, shr.body.instance_id);
+        const insertResult = await insertSession(session, shr.body.instance_id, callerIdentity);
         if (!insertResult.ok) {
           auditHandshakeFailed(auditLog, {
             session_id: session.session_id,
@@ -573,7 +687,7 @@ export function createHandshakeTools(
         },
         required: ["challenge"],
       },
-      handler: async (args) => {
+      handler: async (args, callerIdentity) => {
         sweepExpiredSessions();
 
         const challenge = args.challenge as unknown as HandshakeChallenge;
@@ -624,7 +738,7 @@ export function createHandshakeTools(
           return toolResult({ error: result.error });
         }
 
-        const insertResult = insertSession(result.session, shr.body.instance_id);
+        const insertResult = await insertSession(result.session, shr.body.instance_id, callerIdentity);
         if (!insertResult.ok) {
           void auditLog.append("l4", "handshake_respond", shr.body.instance_id, undefined, "failure");
           auditHandshakeFailed(auditLog, {
@@ -769,7 +883,7 @@ export function createHandshakeTools(
         },
         required: ["session_id", "response"],
       },
-      handler: async (args) => {
+      handler: async (args, callerIdentity) => {
         const sessionId = args.session_id as string;
         sweepExpiredSessions(sessionId);
         const response = args.response as unknown as HandshakeResponse;
@@ -839,9 +953,10 @@ export function createHandshakeTools(
         // above cannot catch (two distinct locally-held keys). Reject before
         // the session is marked completed so the caller gets an explicit
         // refusal instead of a silently-unrecorded "success".
-        const recorded = recordHandshakeResult(
+        const recorded = await recordHandshakeResult(
           result.result,
-          session.our_shr.body.instance_id
+          session.our_shr.body.instance_id,
+          callerIdentity
         );
         if (!recorded.ok) {
           session.state = "failed";
@@ -908,7 +1023,7 @@ export function createHandshakeTools(
         },
         required: ["session_id"],
       },
-      handler: async (args) => {
+      handler: async (args, callerIdentity) => {
         const sessionId = args.session_id as string;
         sweepExpiredSessions(sessionId);
         const completion = args.completion as unknown as HandshakeCompletion | undefined;
@@ -959,9 +1074,10 @@ export function createHandshakeTools(
           // invalid nonce signature would, rather than silently reporting
           // verified:true for an entry that was never written.
           if (result.verified) {
-            const recorded = recordHandshakeResult(
+            const recorded = await recordHandshakeResult(
               result,
-              session.our_shr.body.instance_id
+              session.our_shr.body.instance_id,
+              callerIdentity
             );
             if (!recorded.ok) {
               recordFailure = { error: recorded.error, reason: recorded.reason };
@@ -1046,7 +1162,7 @@ export function createHandshakeTools(
         },
         required: ["counterparty_shr"],
       },
-      handler: async (args) => {
+      handler: async (args, callerIdentity) => {
         const counterpartySHR = args.counterparty_shr as unknown as SignedSHR;
 
         // 1. Generate our SHR
@@ -1083,6 +1199,14 @@ export function createHandshakeTools(
           | { ok: true }
           | { ok: false; error: string; reason: HandshakeFailureReason }
           | undefined;
+        // MUST-FIX 7 (P2, fix-round-2 RECHECK): true only when THIS call's
+        // preview already had live coverage from a prior 4-step handshake
+        // (the MEDIUM#3 downgrade-DoS guard below, which deliberately skips
+        // writing in that case) — the counterparty IS represented in
+        // handshakeResults either way, just not because of this write. Used
+        // below so `verification.recorded` never defaults to `true` when no
+        // record exists and none was ever attempted (e.g. an invalid SHR).
+        let alreadyLivePeer = false;
         //
         // HS-1 / HS-2 fix: handshake_exchange is a STRUCTURAL PREVIEW ONLY.
         // It performs no nonce challenge-response, so it proves neither
@@ -1125,7 +1249,7 @@ export function createHandshakeTools(
             // (recording is a caching side effect for future tier
             // resolution, not the attestation's own correctness), so this is
             // additive honesty, not a new failure mode for the tool call.
-            recordResult = recordHandshakeResult(
+            recordResult = await recordHandshakeResult(
               {
                 counterparty_id: verificationResult.counterparty_id,
                 counterparty_shr: counterpartySHR,
@@ -1137,8 +1261,15 @@ export function createHandshakeTools(
                 errors: [],
                 liveness_proven: false,
               },
-              ourSHR.body.instance_id
+              ourSHR.body.instance_id,
+              callerIdentity
             );
+          } else {
+            // Existing entry is already verified/live: the write was
+            // deliberately skipped (MEDIUM#3), not refused — the
+            // counterparty IS covered in handshakeResults, just from a
+            // prior call. See `alreadyLivePeer`'s doc above.
+            alreadyLivePeer = true;
           }
         }
 
@@ -1155,13 +1286,18 @@ export function createHandshakeTools(
             trust_tier: "unverified",
             errors: verificationResult.errors,
             warnings: verificationResult.warnings,
-            // FAIL-LOUD: whether this preview was actually cached into
-            // handshakeResults for future tier resolution. `false` with
-            // `record_error` set means the preview is valid but was NOT
-            // recorded (self-vouch or a bounded-collection refusal) — the
-            // caller must not assume a future federation/tier lookup will
-            // see this counterparty.
-            recorded: recordResult?.ok ?? true,
+            // FAIL-LOUD (register §Z RECHECK) + TRUTHFUL (MUST-FIX 7, P2,
+            // fix-round-2 RECHECK): whether this counterparty is actually
+            // represented in handshakeResults for future tier resolution.
+            // Previously defaulted to `true` whenever no write was
+            // ATTEMPTED — including when `verificationResult.valid` was
+            // false, so an invalid SHR reported `recorded: true` despite
+            // recording nothing. Now `true` only when this call actually
+            // wrote a record (`recordResult.ok`) or the counterparty was
+            // already covered by a prior live record (`alreadyLivePeer`);
+            // `false` whenever verification failed, self-vouch fired, or
+            // the bounded-collection quota refused the write.
+            recorded: recordResult?.ok ?? alreadyLivePeer,
             ...(recordResult && !recordResult.ok
               ? { record_error: recordResult.error }
               : {}),

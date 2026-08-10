@@ -78,16 +78,28 @@ export interface BoundedMapOptions<K, V> {
     incomingKey: K,
     incomingValue: V,
   ) => EvictionDecision<K>;
-  /** Fired once a GLOBAL-capacity eviction has actually happened. Called
-   * BEFORE the entry is removed from the map (see `set()`): a crash between
-   * the audit call and the physical delete must never leave "the entry is
-   * gone with no audit trail" as the observable outcome, so the audit
-   * intent is recorded first. The callback itself is the same fire-and-
-   * forget `void auditLog.append(...)` shape used throughout this codebase
-   * (see AGENTS.md rule 6/7's audit conventions) — ordering the call before
-   * the delete is the fix this primitive owns; making the audit write
-   * itself durable end-to-end is the audit log's contract, not this one. */
-  onEvict?: (evictedKey: K, evictedValue: V) => void;
+  /**
+   * Fired once a GLOBAL-capacity eviction decision has been made, AWAITED
+   * and BEFORE the entry is removed from the map (see `set()`). RECHECK
+   * (MUST-FIX 6, fix-round-2): the three maps this primitive protects
+   * (handshake sessions, handshake results, federation peers) evict a
+   * TRUST-BEARING entry — a verified peer's trust state disappearing is a
+   * critical state change, not low-risk telemetry, so `onEvict` MUST call
+   * `auditLog.appendCritical(...)` (durable, round-trip-verified) and
+   * return the awaited promise, not `void auditLog.append(...)`
+   * fire-and-forget. If the returned promise REJECTS (e.g. an
+   * integrity-locked audit chain), `set()` ABORTS the whole eviction: the
+   * evicted entry is never deleted and the incoming insert is refused,
+   * exactly as if `selectEviction` had itself returned `{ refuse: true }`.
+   * "Audit before delete" alone (the fix-round-1 shape) only fixes
+   * ORDERING; it does not stop a crash or a rejected write from producing
+   * "the entry is gone, no durable record" — only awaiting AND aborting on
+   * failure closes that. A map whose evicted entries are not trust-bearing
+   * (e.g. the honeypot coalescing tracker) may omit `onEvict` entirely, or
+   * supply a fire-and-forget non-critical callback — this contract only
+   * binds a caller that DOES supply one.
+   */
+  onEvict?: (evictedKey: K, evictedValue: V) => void | Promise<void>;
   /** Fired when an insert is refused — either because the incoming origin
    * was already at `maxPerOrigin`, or because the map is at the global cap
    * and `selectEviction` refused. */
@@ -174,22 +186,43 @@ export class BoundedMap<K, V> {
   }
 
   /**
-   * Insert or update `key`. Returns `true` when the entry is present in the
-   * map afterward (a plain update, a plain insert under the cap, or an
+   * Insert or update `key`. Resolves `true` when the entry is present in
+   * the map afterward (a plain update, a plain insert under the cap, or an
    * insert admitted by evicting another entry), `false` when the insert was
-   * refused (every existing entry is left exactly as it was).
+   * refused (every existing entry is left exactly as it was, including the
+   * entry `selectEviction` had picked, if any — see the ABORT-ON-AUDIT-
+   * FAILURE note below).
+   *
+   * ASYNC (MUST-FIX 6 RECHECK): a GLOBAL-capacity eviction must durably
+   * audit the evicted entry BEFORE deleting it (see `onEvict`'s doc) — that
+   * requires awaiting the audit write, so `set()` itself is async. A `set()`
+   * call that never reaches the eviction branch (plain update, or insert
+   * under both caps) still returns a promise for API uniformity, but
+   * resolves on the same microtask with no real awaited work.
    *
    * `origin` is optional and only meaningful when the map was constructed
    * with `maxPerOrigin` — see the class doc and `BoundedMapOptions.maxPerOrigin`.
-   * Passing a DIFFERENT origin on a later `set()` for the same existing key
-   * re-attributes that key's origin going forward (an update never grows
-   * the map, so it is never subject to the per-origin refusal check either
-   * way).
+   *
+   * NO REATTRIBUTION ON UPDATE (MUST-FIX 3, fix-round-2 RECHECK): a `set()`
+   * for an EXISTING key never touches `origins` — the origin recorded at
+   * INSERT time is permanent for that key's lifetime (until `delete()`).
+   * The prior behavior (re-attributing the origin on every update) was a
+   * framing/evasion primitive: since an update never grows the map, it
+   * never re-enters the per-origin refusal check above, so an attacker who
+   * can trigger an "update" of an existing key (e.g. two different sessions
+   * both producing an unverified handshake preview for the same
+   * counterparty_id) could silently move that key's accounting from their
+   * own origin onto ANY other origin string of their choosing — inflating a
+   * victim origin's count toward its quota (framing) while freeing their
+   * own (evasion), all without ever creating a new key. Because origin is
+   * now fixed at insertion, an update can never change what it counts
+   * against, so there is nothing for a "quota re-check on update" to do —
+   * the accounting an update could possibly affect is exactly the
+   * accounting this rule keeps untouched.
    */
-  set(key: K, value: V, origin?: string): boolean {
+  async set(key: K, value: V, origin?: string): Promise<boolean> {
     if (this.map.has(key)) {
       this.map.set(key, value);
-      if (origin !== undefined) this.origins.set(key, origin);
       return true;
     }
 
@@ -216,10 +249,19 @@ export class BoundedMap<K, V> {
       }
       const evictedValue = this.map.get(decision.evict);
       if (evictedValue !== undefined) {
-        // Audit BEFORE delete (see onEvict's doc) — a crash between these
-        // two lines must never leave "vanished, no audit record" as the
-        // outcome a reviewer sees later.
-        this.opts.onEvict?.(decision.evict, evictedValue);
+        // Audit BEFORE delete, AWAITED (see onEvict's doc): a crash OR a
+        // rejected audit write between these two steps must never leave
+        // "vanished, no durable audit record" as the outcome a reviewer
+        // sees later. On rejection, ABORT the eviction entirely — the
+        // evicted entry is never deleted and this insert is refused, same
+        // as a capacity refusal, rather than proceeding to mutate state
+        // with no durable trail of why.
+        try {
+          await this.opts.onEvict?.(decision.evict, evictedValue);
+        } catch {
+          this.opts.onRefuse?.(key, value, "capacity");
+          return false;
+        }
       }
       this.map.delete(decision.evict);
       this.origins.delete(decision.evict);

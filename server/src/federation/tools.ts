@@ -12,6 +12,7 @@ import type { ToolDefinition } from "../router.js";
 import { toolResult } from "../router.js";
 import type { AuditLog } from "../operational/audit-log.js";
 import type { HandshakeResult } from "../handshake/types.js";
+import { AGENT_UNKNOWN_ORIGIN } from "../handshake/tools.js";
 import type { IdentityManager } from "../cognitive/tools.js";
 import { publicKeyToDid, isLocallyHeldPublicKey } from "../core/identity.js";
 import { fromBase64url } from "../core/encoding.js";
@@ -29,20 +30,22 @@ export function createFederationTools(
   // Production wiring (index.ts) always supplies it; every test construction
   // must too (a test that omits it is testing a bypass, not a real config).
   identityManager: IdentityManager,
-  // OPTIONAL — unlike identityManager above, this does not gate a trust
-  // decision (AGENTS.md rule 3 distinguishes the two): it only feeds the
-  // per-origin DoS quota (MAX_FEDERATION_PEERS_PER_ORIGIN, see
-  // federation/registry.ts). Omitting it means every registration is
-  // recorded with no origin attribution, so per-origin fairness simply does
-  // not apply to it — the global cap and the "never evict an active peer"
-  // guarantee hold regardless either way. Production wiring (index.ts)
-  // always supplies the real map (`createHandshakeTools`'s
-  // `handshakeResultOrigins`); tests that only exercise the pre-existing
-  // global-cap/self-vouch behavior are unaffected by omitting it.
-  handshakeResultOrigins?: ReadonlyMap<string, string>
+  // REQUIRED (AGENTS.md rule 3, MUST-FIX 2 RECHECK: an optional dependency
+  // that gates a per-origin quota — a security property under rule 8 — must
+  // be required, never silently-disabling). Fix-round-1 made this optional
+  // on the theory that it "only" fed a DoS quota, not a trust decision; the
+  // gate found that reasoning wrong for THIS quota specifically, because
+  // the quota origin is the un-mintable agent-session principal (MUST-FIX
+  // 1's spine) — omitting the map does not just lose fairness accounting,
+  // it silently reopens the exact cross-session lockout MUST-FIX 1 closes
+  // (an attacker whose registrations carry no origin attribution floods the
+  // shared registry unbounded by any per-session quota). Production wiring
+  // (index.ts) always supplies `createHandshakeTools`'s
+  // `handshakeResultOrigins`; every test construction must too — a test
+  // that omits it is testing a bypass, not a real config.
+  handshakeResultOrigins: ReadonlyMap<string, string>
 ): { tools: ToolDefinition[]; registry: FederationRegistry } {
   const registry = new FederationRegistry(auditLog);
-  const originsForPeers = handshakeResultOrigins ?? new Map<string, string>();
 
   const tools: ToolDefinition[] = [
     // ─── Peer Management ──────────────────────────────────────────────
@@ -206,18 +209,23 @@ export function createFederationTools(
               });
             }
 
-            // Per-origin quota (register LD2-04 RECHECK): attribute this
-            // registration to the LOCAL identity that recorded the
-            // underlying handshake result, so a flood of attacker-completed
-            // handshakes against ONE identity cannot exhaust the shared
-            // registry and lock out a DIFFERENT identity's registration —
-            // see MAX_FEDERATION_PEERS_PER_ORIGIN's doc.
-            const origin = originsForPeers.get(peerId);
+            // Per-origin quota (register LD2-04, MUST-FIX 1/2 RECHECK):
+            // attribute this registration to the AGENT-SESSION PRINCIPAL
+            // that recorded the underlying handshake result
+            // (`handshakeResultOrigins`, see that map's doc in
+            // handshake/tools.ts), so a flood of attacker-completed
+            // handshakes — even spread across many MINTED local identities —
+            // cannot exhaust the shared registry and lock out a DIFFERENT
+            // session's registration. `handshakeResultOrigins` is REQUIRED
+            // (MUST-FIX 2) precisely so this line can never silently fall
+            // back to "no origin, skip the quota"; a peerId genuinely absent
+            // from the map (should not happen — every `recordHandshakeResult`
+            // write supplies an origin) still falls into the shared
+            // `AGENT_UNKNOWN_ORIGIN` bucket rather than escaping accounting.
+            const origin = handshakeResultOrigins.get(peerId) ?? AGENT_UNKNOWN_ORIGIN;
             const originQuotaExceeded =
-              origin !== undefined &&
-              registry.peerOriginSize(origin) >=
-                registry.maxPeersPerOrigin();
-            const peer = registry.registerFromHandshake(
+              registry.peerOriginSize(origin) >= registry.maxPeersPerOrigin();
+            const peer = await registry.registerFromHandshake(
               hsResult,
               peerDid,
               undefined,

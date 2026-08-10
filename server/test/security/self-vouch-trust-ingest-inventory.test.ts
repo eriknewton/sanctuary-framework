@@ -356,7 +356,7 @@ describe("(b) federation_peers register(): local-custody refusal", () => {
     const fortress = makeFortress();
     const a = await addIdentity(fortress, "identity-a");
     const b = await addIdentity(fortress, "identity-b");
-    const { tools: hsTools, handshakeResults } = createHandshakeTools(
+    const { tools: hsTools, handshakeResults, handshakeResultOrigins } = createHandshakeTools(
       fortress.config,
       fortress.identityManager,
       fortress.masterKey,
@@ -389,7 +389,8 @@ describe("(b) federation_peers register(): local-custody refusal", () => {
     const { tools: fedTools } = createFederationTools(
       fortress.auditLog,
       handshakeResults,
-      fortress.identityManager
+      fortress.identityManager,
+      handshakeResultOrigins
     );
     const register = fedTools.find((t) => t.name === "federation_peers")!;
     const out = parse(
@@ -427,10 +428,15 @@ describe("(b) federation_peers register(): local-custody refusal", () => {
       liveness_proven: true,
     });
 
+    // REQUIRED (fix-round-2, MUST-FIX 2): an empty origins map is correct —
+    // this block hand-inserts into `handshakeResults` directly, bypassing
+    // the producer that would normally attribute an origin, so there is no
+    // real per-session origin to supply.
     const { tools: fedTools } = createFederationTools(
       fortress.auditLog,
       handshakeResults,
-      fortress.identityManager
+      fortress.identityManager,
+      new Map<string, string>()
     );
     const register = fedTools.find((t) => t.name === "federation_peers")!;
     const out = parse(
@@ -802,10 +808,15 @@ describe("(f) MUST-FIX 1: a legacy-DID-encoded local identity is still recognize
       liveness_proven: true,
     });
 
+    // REQUIRED (fix-round-2, MUST-FIX 2): an empty origins map is correct —
+    // this block hand-inserts into `handshakeResults` directly, bypassing
+    // the producer that would normally attribute an origin, so there is no
+    // real per-session origin to supply.
     const { tools: fedTools } = createFederationTools(
       fortress.auditLog,
       handshakeResults,
-      fortress.identityManager
+      fortress.identityManager,
+      new Map<string, string>()
     );
     const register = fedTools.find((t) => t.name === "federation_peers")!;
     const out = parse(

@@ -54,28 +54,30 @@ const DEFAULT_CAPABILITIES: FederationCapabilities = {
 export const MAX_FEDERATION_PEERS = 500;
 
 /**
- * Per-origin quota for `peers` (AGENTS.md rule 8 RECHECK — HIGH gate
- * finding on the first cut of this bound). The ORIGIN of a peer is the
- * LOCAL identity that recorded the underlying handshake result
- * (`handshake/tools.ts`'s `handshakeResultOrigins`, threaded through
- * `federation/tools.ts`'s register handler). Without this, an attacker who
- * completes MAX_FEDERATION_PEERS real 4-step handshakes against ONE local
- * identity fills the entire shared registry with active peers and
- * PERMANENTLY locks out registration for every OTHER local identity too
- * (the gate's own reproduction: the branch's first cut proved this
- * lockout). With this, that flood exhausts only the flooded identity's own
- * quota and is REFUSED there — never evicts an active peer, and never
- * touches a different identity's headroom, so a different identity can
- * still register. 50 = 1/10th of MAX_FEDERATION_PEERS, matching
+ * Per-origin quota for `peers` (AGENTS.md rule 8, MUST-FIX 1/2 RECHECK —
+ * HIGH gate finding, TWICE: the first cut had no per-origin quota at all;
+ * fix-round-1's quota keyed on the LOCAL identity that recorded the
+ * underlying handshake result, which a caller can multiply at will via
+ * `identity_create` (Tier 3 always-allow) — mint N identities, complete N
+ * real 4-step handshakes, register N peers, and the "per-origin" quota
+ * never engages). The ORIGIN of a peer is now the AGENT-SESSION PRINCIPAL
+ * (`handshake/tools.ts`'s `handshakeResultOrigins`, REQUIRED — not
+ * optional — through `federation/tools.ts`'s register handler; see that
+ * parameter's doc for why optional was itself the MUST-FIX 2 defect). An
+ * attacker who completes MAX_FEDERATION_PEERS real 4-step handshakes,
+ * however many local identities they spread the flood across, still
+ * exhausts only THEIR OWN session's quota and is REFUSED there — never
+ * evicts an active peer, and never touches a DIFFERENT session's headroom.
+ * 50 = 1/10th of MAX_FEDERATION_PEERS, matching
  * MAX_HANDSHAKE_SESSIONS_PER_ORIGIN / MAX_HANDSHAKE_RESULTS_PER_ORIGIN's
- * ratio: generous per-identity headroom while guaranteeing at least 10
- * distinct local identities' worth of peers fit before any one identity
- * could threaten the shared ceiling. `origin` is OPTIONAL on
- * `registerFromHandshake` (a caller that cannot supply it — e.g. a test
- * harness that builds `handshakeResults` by hand, never through
- * `createHandshakeTools` — simply does not get per-origin accounting for
- * that entry; the global cap + active-peer-eviction-never-happens guarantee
- * still applies unconditionally either way).
+ * ratio: generous per-session headroom while guaranteeing at least 10
+ * distinct agent sessions' worth of peers fit before any one session could
+ * threaten the shared ceiling. `origin` is REQUIRED on
+ * `registerFromHandshake` (MUST-FIX 2: an omitted origin must never mean
+ * "skip the quota") — every production and test call site must supply one;
+ * a caller with no real session context uses `AGENT_UNKNOWN_ORIGIN`
+ * (handshake/tools.ts), which is itself quota-bounded, never an escape
+ * hatch.
  */
 export const MAX_FEDERATION_PEERS_PER_ORIGIN = 50;
 
@@ -124,11 +126,23 @@ export class FederationRegistry {
         }
         return { evict: oldestInactiveKey };
       },
-      onEvict: (evictedPeerId, evictedPeer) => {
-        void this.auditLog.append("l4", "federation_peer_evicted", "system", {
-          peer_id: evictedPeerId,
-          peer_did: evictedPeer.peer_did,
-          reason: "capacity",
+      onEvict: async (evictedPeerId, evictedPeer) => {
+        // AWAITED + CRITICAL (MUST-FIX 6, fix-round-2 RECHECK): evicting a
+        // peer drops its trust state; BoundedMap.set() awaits this and
+        // ABORTS the eviction (refuses the new registration) if the durable
+        // write fails, rather than deleting a peer with no audit record of
+        // why. See bounded-map.ts's onEvict doc / handshake/tools.ts's
+        // sessions/handshakeResults onEvict for the same pattern.
+        await this.auditLog.appendCritical({
+          layer: "l4",
+          operation: "federation_peer_evicted",
+          identity_id: "system",
+          result: "success",
+          details: {
+            peer_id: evictedPeerId,
+            peer_did: evictedPeer.peer_did,
+            reason: "capacity",
+          },
         });
       },
       onRefuse: (incomingPeerId, _incomingPeer, reason) => {
@@ -156,18 +170,25 @@ export class FederationRegistry {
    * peer (see the eviction policy above), or `origin`'s own per-origin quota
    * (MAX_FEDERATION_PEERS_PER_ORIGIN) is already exhausted — the caller must
    * surface this as an explicit refusal, never treat it as a silent no-op
-   * success. `origin` is the LOCAL identity that recorded the underlying
-   * handshake result (see MAX_FEDERATION_PEERS_PER_ORIGIN's doc); omit it
-   * only when the caller genuinely cannot attribute one (per-origin
-   * accounting is then simply skipped for this entry, per BoundedMap's
-   * `maxPerOrigin` contract).
+   * success.
+   *
+   * `origin` is REQUIRED (MUST-FIX 2, fix-round-2 RECHECK — was optional;
+   * see MAX_FEDERATION_PEERS_PER_ORIGIN's doc for why "omit it and the quota
+   * is silently skipped" was itself the defect): the agent-session
+   * principal that recorded the underlying handshake result. A caller with
+   * no real session context passes `AGENT_UNKNOWN_ORIGIN`
+   * (handshake/tools.ts) explicitly — that bucket is itself quota-bounded,
+   * never an unaccounted escape hatch.
+   *
+   * ASYNC (MUST-FIX 6): `this.peers.set()` is async (see bounded-map.ts) so
+   * a global-capacity eviction can durably audit BEFORE the delete.
    */
-  registerFromHandshake(
+  async registerFromHandshake(
     result: HandshakeResult,
     peerDid: string,
-    capabilities?: Partial<FederationCapabilities>,
-    origin?: string
-  ): FederationPeer | null {
+    capabilities: Partial<FederationCapabilities> | undefined,
+    origin: string
+  ): Promise<FederationPeer | null> {
     const existing = this.peers.get(result.counterparty_id);
     const now = new Date().toISOString();
 
@@ -191,7 +212,7 @@ export class FederationRegistry {
       peer.trust_tier = "self-attested";
     }
 
-    const inserted = this.peers.set(result.counterparty_id, peer, origin);
+    const inserted = await this.peers.set(result.counterparty_id, peer, origin);
     return inserted ? peer : null;
   }
 

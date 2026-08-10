@@ -74,23 +74,114 @@ const MAX_FINDING_BYTES = 256 * 1024;
  * index from storage on first use — see that method.
  */
 const MAX_SCANNED_RECORDS = 5000;
-// CROSS-FILE PIN: must be >= sentinel/sentinels/anomaly-trigger.ts's
-// QUERY_LIMIT (currently 5000) — anomaly-trigger asks for `limit: 5000` to
-// cover its full 8-day baseline window, and MAX_SCANNED_RECORDS is the
-// absolute ceiling `listFindings` will ever decrypt for ANY caller's
-// `limit`, including that one. If either constant changes, check the other.
+// CROSS-FILE PIN (revised, fix-round-2 / MUST-FIX 5 RECHECK): this used to
+// be pinned to sentinel/sentinels/anomaly-trigger.ts's QUERY_LIMIT because
+// that 8-day rolling-baseline consumer asked `listFindings` for
+// `limit: 5000` — but a decrypt-bounded, sorted-then-sliced `limit` is
+// exactly the shape that let a flood in a RECENT window truncate an OLDER
+// baseline window out of the result before anomaly-trigger ever saw it (the
+// register Z-HNY-02 class this file's index exists to close, recurring one
+// layer up). anomaly-trigger.ts now calls `listFindingMetadata` instead
+// (see that method's doc) — an index-only scan with NO limit and NO
+// decrypt, so it cannot be truncated by a flood at all. MAX_SCANNED_RECORDS
+// remains the decrypt-work ceiling for `listFindings`'s CONTENT-bearing
+// callers (dashboard/CLI "show recent findings" style queries), where a
+// bounded top-N-newest truncation is the correct, disclosed behavior for a
+// display page, not a security-relevant baseline.
 
 /**
  * One entry of the in-memory finding index (see MAX_SCANNED_RECORDS above).
  * Deliberately narrow: only the fields `listFindings`'s filters need,
  * never the finding's `summary`/`details` — the index exists to avoid
  * decrypting records that WON'T match, not to cache plaintext content.
+ * `origin` (MUST-FIX 4, fix-round-2) is the ONE exception carrying derived
+ * (not raw) data: the resolved per-origin-quota key (see
+ * `resolveFindingOrigin`), computed once at write/backfill time so
+ * `originCount` never has to re-derive it on every quota check.
  */
 interface FindingIndexEntry {
   severity: SentinelSeverity;
   sentinel_id: string;
   agent_id?: string;
   observed_at: string;
+  origin: string;
+}
+
+/**
+ * Public shape of `listFindingMetadata`'s results — the index entry plus
+ * the finding_id (the index's own map key, not stored redundantly inside
+ * `FindingIndexEntry` itself). Exported so consumers like
+ * sentinel/sentinels/anomaly-trigger.ts can type their windowed-bucket
+ * helpers against it without importing the internal `FindingIndexEntry`.
+ */
+export type SentinelFindingMetadata = FindingIndexEntry & { finding_id: string };
+
+/**
+ * Shared bucket for a finding this store cannot attribute to any caller
+ * (MUST-FIX 4, fix-round-2 — mirrors handshake/tools.ts's
+ * `AGENT_UNKNOWN_ORIGIN` decision: a shared bucket, not an unbounded escape
+ * hatch, because every finding in it still counts against the SAME quota).
+ * Fortress-wide findings (e.g. a cross-agent-chatter spike with no single
+ * responsible agent) legitimately have no attributable origin; they are not
+ * an attacker signal by themselves, so refusing them entirely would be the
+ * wrong failure mode.
+ */
+export const UNATTRIBUTED_FINDING_ORIGIN = "unattributed";
+
+/**
+ * Resolve the per-origin-quota key for a finding (MUST-FIX 4). Prefers the
+ * finding's own `agent_id` (set directly by most sentinels — e.g.
+ * credential-usage-watcher.ts, anomaly detectors). Falls back to
+ * `details.caller_identity` — several honeypot producers
+ * (tool-call-trap-runtime.ts, filesystem-trap-monitor.ts,
+ * runtime-trap-handler.ts) record the triggering caller ONLY inside
+ * `details`, never as a top-level `agent_id`, because that field's product
+ * meaning is "which agent this finding is ABOUT" and a fortress-wide
+ * honeypot trigger is arguably about the trap, not a single agent — but the
+ * per-origin WRITE quota needs the ACTUAL caller regardless of that
+ * distinction, since the honeypot's tool-call trap is the highest-volume
+ * attacker-reachable producer this store has. A finding with neither field
+ * falls into the shared `UNATTRIBUTED_FINDING_ORIGIN` bucket.
+ */
+function resolveFindingOrigin(finding: SentinelFinding): string {
+  if (finding.agent_id) return finding.agent_id;
+  const callerIdentity = finding.details["caller_identity"];
+  if (typeof callerIdentity === "string" && callerIdentity.length > 0) {
+    return callerIdentity;
+  }
+  return UNATTRIBUTED_FINDING_ORIGIN;
+}
+
+/**
+ * Thrown by `saveFinding` when a write is refused rather than persisted
+ * (MUST-FIX 4, fix-round-2 — replaces the prior "always overshoot, never
+ * refuse" behavior). `reason` distinguishes "THIS finding's own origin is
+ * over its per-write quota" from "the whole store is genuinely saturated
+ * and nothing is reclaimable" — the same origin_quota/capacity split
+ * `BoundedMapRefuseReason` uses (core/bounded-map.ts), for the same reason:
+ * an operator needs to tell "one caller is flooding" apart from "the store
+ * is full of legitimately-live findings." Every current caller of
+ * `saveFinding` already wraps the call in a try/catch or lets an outer
+ * per-sentinel/per-detector catch handle a thrown error as a loud,
+ * audited-but-non-fatal failure (see sentinel-dispatcher.ts's `tick()` /
+ * anomaly-pipeline.ts's `tick()`, and the honeypot producers' existing
+ * `.catch(() => undefined)` best-effort-persist convention) — this is
+ * deliberately NOT a silent drop: the store itself audits the refusal
+ * (`finding_store_origin_quota_exceeded` / `finding_store_saturated`)
+ * before throwing, so the operator-visible trail exists even when a caller
+ * only catches-and-discards.
+ */
+export class SentinelFindingStoreRefusedError extends Error {
+  readonly reason: "origin_quota" | "capacity";
+  constructor(reason: "origin_quota" | "capacity") {
+    super(
+      reason === "origin_quota"
+        ? "Sentinel finding store: origin per-write quota exceeded"
+        : "Sentinel finding store: at capacity, nothing reclaimable"
+    );
+    this.name = "SentinelFindingStoreRefusedError";
+    this.reason = reason;
+  }
 }
 
 /**
@@ -98,11 +189,16 @@ interface FindingIndexEntry {
  * MAX_SCANNED_RECORDS above) — a cost paid at most once per store instance
  * lifetime (amortized across every subsequent `listFindings`/`saveFinding`
  * call, never repeated per-request), not a per-call bound. 20000 = 4x
- * MAX_TRACKED_FINDINGS's default (5000): generous headroom for that
- * constant's documented soft-ceiling overshoot (a live record is never
- * blind-evicted, so the store can temporarily exceed its own ceiling — see
- * MAX_TRACKED_FINDINGS below) while still bounding the backfill to a
- * constant instead of truly unbounded storage-namespace size.
+ * MAX_TRACKED_FINDINGS's default (5000): headroom for records written
+ * before this store's ceiling became a hard refuse (MUST-FIX 4, fix-round-2
+ * — a store that predates this change, or whose retention window still
+ * holds pre-fix overshoot records, can be modestly larger than
+ * MAX_TRACKED_FINDINGS) while still bounding the backfill to a constant
+ * instead of truly unbounded storage-namespace size. A cold start with MORE
+ * than this many retained records backfills an INCOMPLETE index for that
+ * one process lifetime (see `buildIndex`'s COMPLETE-REBUILD note) — bounded
+ * by the storage listing's own order, not by decrypt cost, so widening this
+ * constant is a cheap knob if a real deployment ever needs it.
  */
 const MAX_INDEX_BACKFILL_RECORDS = 20_000;
 
@@ -128,8 +224,39 @@ const PRUNE_SCAN_CAP = 2000;
  * 5000 = comfortably above what the honeypot write-site coalescing (see
  * tool-call-trap-runtime.ts) and normal sentinel activity produce for a real
  * fortress, while still reachable in an adversarial test.
+ *
+ * REAL CEILING, NOT SOFT (MUST-FIX 4, fix-round-2 RECHECK): the prior cut of
+ * this store still WROTE a new record past this ceiling whenever nothing
+ * was reclaimable (an audited but unbounded overshoot — the class this rule
+ * exists to close, one layer up from where it was first closed). A write
+ * that hits the ceiling with nothing reclaimable is now REFUSED
+ * (`SentinelFindingStoreRefusedError`, reason `"capacity"`), loudly audited
+ * exactly as before. This is safe for the rule-8(c) invariant ("a
+ * pre-existing critical finding must survive a flood") because eviction
+ * only ever reclaims an already-EXPIRED record regardless of severity —
+ * refusing a NEW write never touches an existing one, critical or not.
  */
 const MAX_TRACKED_FINDINGS = 5000;
+
+/**
+ * Per-origin quota for durable finding writes (AGENTS.md rule 8, MUST-FIX 4
+ * RECHECK — this store's own bound had no per-writer accounting at all: any
+ * single caller could grow it toward MAX_TRACKED_FINDINGS on its own,
+ * exhausting the shared ceiling for every other producer). Mirrors the
+ * MUST-FIX 1 spine's per-origin-quota shape (handshake sessions/results,
+ * federation peers): the origin is resolved via `resolveFindingOrigin`
+ * (agent_id, or the honeypot's `details.caller_identity` fallback), so a
+ * single flooding agent session exhausts only its own share and is REFUSED
+ * (`SentinelFindingStoreRefusedError`, reason `"origin_quota"`) before it
+ * can starve the ceiling for a different agent or a different sentinel's
+ * fortress-wide findings. 500 = 1/10th of MAX_TRACKED_FINDINGS, matching
+ * the same ratio MAX_HANDSHAKE_SESSIONS_PER_ORIGIN /
+ * MAX_HANDSHAKE_RESULTS_PER_ORIGIN / MAX_FEDERATION_PEERS_PER_ORIGIN use:
+ * generous per-origin headroom while guaranteeing at least 10 distinct
+ * origins' worth of findings fit before any one origin threatens the
+ * shared ceiling.
+ */
+export const MAX_FINDINGS_PER_ORIGIN = 500;
 
 /**
  * Bounds the decrypt work `evictOldestExpired` spends per saturated write:
@@ -168,8 +295,9 @@ export interface SentinelFindingStoreOptions {
   auditLog?: AuditLog;
   /**
    * Test-only overrides for the bounded-work constants (MAX_TRACKED_FINDINGS,
-   * MAX_SCANNED_RECORDS, PRUNE_SCAN_CAP). Production call sites never set
-   * these; they exist so the class-level bounded-collection inventory test
+   * MAX_SCANNED_RECORDS, PRUNE_SCAN_CAP, MAX_FINDINGS_PER_ORIGIN). Production
+   * call sites never set these; they exist so the class-level
+   * bounded-collection inventory test
    * (test/security/attacker-writable-collections-bounds.test.ts) can drive
    * the REAL production write/list/prune path to its cap in a handful of
    * iterations instead of thousands, without weakening the shipped defaults.
@@ -177,6 +305,7 @@ export interface SentinelFindingStoreOptions {
   maxTrackedFindings?: number;
   maxScannedRecords?: number;
   pruneScanCap?: number;
+  maxFindingsPerOrigin?: number;
 }
 
 export class SentinelFindingStore {
@@ -189,6 +318,7 @@ export class SentinelFindingStore {
   private readonly maxTrackedFindings: number;
   private readonly maxScannedRecords: number;
   private readonly pruneScanCap: number;
+  private readonly maxFindingsPerOrigin: number;
   // Filter-before-decrypt index (see MAX_SCANNED_RECORDS's doc). Populated
   // incrementally on every saveFinding, and lazily backfilled ONCE from
   // storage (`ensureIndex`) so records written by a PRIOR process instance
@@ -210,6 +340,8 @@ export class SentinelFindingStore {
     this.maxTrackedFindings = opts.maxTrackedFindings ?? MAX_TRACKED_FINDINGS;
     this.maxScannedRecords = opts.maxScannedRecords ?? MAX_SCANNED_RECORDS;
     this.pruneScanCap = opts.pruneScanCap ?? PRUNE_SCAN_CAP;
+    this.maxFindingsPerOrigin =
+      opts.maxFindingsPerOrigin ?? MAX_FINDINGS_PER_ORIGIN;
   }
 
   /**
@@ -227,6 +359,18 @@ export class SentinelFindingStore {
     await this.indexBuildPromise;
   }
 
+  /**
+   * COMPLETE-REBUILD NOTE (MUST-FIX 5, fix-round-2 RECHECK): this reads
+   * EVERY key the storage backend's `list()` returns for the namespace (not
+   * a truncated recency window), capped only by MAX_INDEX_BACKFILL_RECORDS —
+   * which is 4x MAX_TRACKED_FINDINGS's hard, going-forward ceiling (MUST-FIX
+   * 4), so any store built entirely under the current rules backfills
+   * completely; the only way to exceed the cap is retained pre-fix overshoot
+   * records still inside the retention window, which the doc on that
+   * constant covers. This is a genuine improvement over the fix-round-1
+   * shape, which read only the newest 20000 by LISTING ORDER with no
+   * relationship to the store's own bound.
+   */
   private async buildIndex(): Promise<void> {
     const metas = await this.storage.list(
       SENTINEL_FINDING_NAMESPACE,
@@ -245,9 +389,26 @@ export class SentinelFindingStore {
         sentinel_id: finding.sentinel_id,
         agent_id: finding.agent_id,
         observed_at: finding.observed_at,
+        origin: resolveFindingOrigin(finding),
       });
     }
     this.indexReady = true;
+  }
+
+  /**
+   * How many findings `origin` currently holds, per the in-memory index
+   * (MUST-FIX 4). Callers MUST `await ensureIndex()` first (both call
+   * sites — `enforceTrackedFindingsCeiling` and `listFindingMetadata` —
+   * already do), or a cold-start count reads as artificially low. O(index
+   * size), itself bounded by MAX_TRACKED_FINDINGS going forward (see that
+   * constant's doc) — cheap in-memory field compares, no decrypt, no I/O.
+   */
+  private originCount(origin: string): number {
+    let count = 0;
+    for (const entry of this.index.values()) {
+      if (entry.origin === origin) count += 1;
+    }
+    return count;
   }
 
   /**
@@ -267,6 +428,17 @@ export class SentinelFindingStore {
    * O(records) metadata listing on every follow-up within the same window.
    * A caller that sets this for a genuinely new key bypasses the ceiling
    * check for that one write; do not set it speculatively.
+   *
+   * THROWS `SentinelFindingStoreRefusedError` (MUST-FIX 4, fix-round-2
+   * RECHECK — was previously unconditional-success with a silent overshoot)
+   * when the write is refused: either the finding's own resolved origin
+   * (`resolveFindingOrigin`) is already at `MAX_FINDINGS_PER_ORIGIN`, or the
+   * store is at `MAX_TRACKED_FINDINGS` with nothing reclaimable. Both cases
+   * are audited (non-critical, matches this store's existing
+   * `finding_store_saturated` telemetry convention) BEFORE throwing, so the
+   * refusal is never silent even for a caller that only catches-and-drops
+   * the exception (the honeypot producers' existing best-effort-persist
+   * convention).
    */
   async saveFinding(
     finding: SentinelFinding,
@@ -285,8 +457,9 @@ export class SentinelFindingStore {
       retention_until: retentionUntil.toISOString(),
     };
     const key = findingKey(finding.finding_id);
+    const origin = resolveFindingOrigin(truncated);
     if (!opts?.knownExisting) {
-      await this.enforceTrackedFindingsCeiling(key);
+      await this.enforceTrackedFindingsCeiling(key, origin);
     }
     await this.writeFinding(key, finding.finding_id, persisted);
     // Keep the filter index current (see MAX_SCANNED_RECORDS's doc). Set
@@ -300,15 +473,39 @@ export class SentinelFindingStore {
       sentinel_id: truncated.sentinel_id,
       agent_id: truncated.agent_id,
       observed_at: truncated.observed_at,
+      origin,
     });
     return persisted.retention_until;
   }
 
   /**
    * The bounded-ceiling check factored out of `saveFinding` so the
-   * `knownExisting` fast path can skip it entirely. See MAX_TRACKED_FINDINGS.
+   * `knownExisting` fast path can skip it entirely. See MAX_TRACKED_FINDINGS
+   * and MAX_FINDINGS_PER_ORIGIN. Throws `SentinelFindingStoreRefusedError`
+   * on refusal (MUST-FIX 4) instead of returning and letting the caller
+   * silently overshoot.
    */
-  private async enforceTrackedFindingsCeiling(key: string): Promise<void> {
+  private async enforceTrackedFindingsCeiling(
+    key: string,
+    origin: string,
+  ): Promise<void> {
+    // Per-origin quota FIRST (mirrors BoundedMap.set()'s ordering, MUST-FIX
+    // 1's spine shape): a flooding origin hits its own wall before it can
+    // ever consume shared global headroom. Needs the index ready — a
+    // cold-start count before backfill would under-count and let an origin
+    // exceed its quota on the very first write after a restart.
+    await this.ensureIndex();
+    if (this.originCount(origin) >= this.maxFindingsPerOrigin) {
+      void this.auditLog?.append(
+        "l2",
+        "finding_store_origin_quota_exceeded",
+        this.fortressId,
+        { origin, max_findings_per_origin: this.maxFindingsPerOrigin },
+        "failure",
+      );
+      throw new SentinelFindingStoreRefusedError("origin_quota");
+    }
+
     const metas = await this.storage.list(
       SENTINEL_FINDING_NAMESPACE,
       SENTINEL_FINDING_KEY_PREFIX,
@@ -324,10 +521,11 @@ export class SentinelFindingStore {
         // of severity — this is the AGENTS.md rule 8 invariant ("a
         // pre-existing critical finding MUST survive a flood") satisfied at
         // its strongest: no live record of ANY severity is blind-FIFO'd.
-        // The write below still proceeds (a temporary ceiling overshoot),
-        // because refusing to record a NEW finding is itself a silent loss
-        // of security signal — the honest failure mode here is "grew past
-        // the ceiling, loudly," not "dropped an observation."
+        // REFUSE the write instead of the prior overshoot (MUST-FIX 4): a
+        // pre-existing finding is never touched either way (refusing a NEW
+        // write cannot drop an EXISTING one), and the refusal is loudly
+        // audited, so this is "refused a new write, loudly," never "dropped
+        // an observation silently."
         void this.auditLog?.append(
           "l2",
           "finding_store_saturated",
@@ -338,6 +536,7 @@ export class SentinelFindingStore {
           },
           "failure",
         );
+        throw new SentinelFindingStoreRefusedError("capacity");
       }
     }
   }
@@ -363,6 +562,21 @@ export class SentinelFindingStore {
    * one already past its own retention_until, and delete the first one
    * found. Returns whether a record was reclaimed. Bounded decrypt work —
    * see SATURATION_EVICT_SCAN_CAP's derivation.
+   *
+   * AWAITED CRITICAL AUDIT BEFORE DELETE (MUST-FIX 6, fix-round-2 RECHECK):
+   * when `auditLog` is configured, the reclamation audit is now
+   * `appendCritical` (durable, round-trip-verified) and AWAITED before the
+   * delete, not `void auditLog.append(...)` fire-and-forget after. If the
+   * awaited write REJECTS, this ABORTS the whole reclamation scan and
+   * returns `false` — the caller (`enforceTrackedFindingsCeiling`) then
+   * refuses the triggering write (capacity), rather than deleting a record
+   * with no durable trail of why. This mirrors bounded-map.ts's
+   * onEvict/set() contract for the same reason: a crash or a rejected audit
+   * write between "decided to delete" and "deleted" must never leave
+   * "vanished, no record" as the observable outcome. `auditLog` itself
+   * stays OPTIONAL (see `SentinelFindingStoreOptions.auditLog`'s doc — it
+   * only gates observability, not the eviction guarantee); when absent,
+   * reclamation proceeds exactly as before (no audit to await or fail).
    */
   private async evictOldestExpired(metas: StorageEntryMeta[]): Promise<boolean> {
     const cutoff = this.now().toISOString();
@@ -380,23 +594,26 @@ export class SentinelFindingStore {
         const plaintext = decrypt(envelope, this.encryptionKey, aad);
         const persisted = JSON.parse(bytesToString(plaintext)) as PersistedFinding;
         if (persisted.retention_until <= cutoff) {
+          if (this.auditLog) {
+            try {
+              await this.auditLog.appendCritical({
+                layer: "l2",
+                operation: "finding_store_expired_record_reclaimed",
+                identity_id: this.fortressId,
+                result: "success",
+                details: { finding_id: id, retention_until: persisted.retention_until },
+              });
+            } catch {
+              // ABORT the reclamation: never delete a record with no
+              // durable audit trail. The caller treats "not reclaimed" the
+              // same as "genuinely nothing reclaimable" and refuses the
+              // triggering write (capacity) — fail closed, not a silent
+              // delete.
+              return false;
+            }
+          }
           await this.storage.delete(SENTINEL_FINDING_NAMESPACE, meta.key);
           this.index.delete(id);
-          // NEVER-SILENT-EVICTION (AGENTS.md rule 6/"never silently
-          // degrade"): the saturation branch above already audits the
-          // FAILURE case (no reclaimable record found); this is the
-          // SUCCESS case, which previously left no trace at all — an
-          // operator reading the audit log could not tell "the store
-          // reclaimed a genuinely expired record to make room" apart from
-          // "a write just silently happened to fit." Audit the reclamation
-          // too, so eviction of a store record is never silent either way.
-          void this.auditLog?.append(
-            "l2",
-            "finding_store_expired_record_reclaimed",
-            this.fortressId,
-            { finding_id: id, retention_until: persisted.retention_until },
-            "success",
-          );
           return true;
         }
       } catch {
@@ -472,6 +689,53 @@ export class SentinelFindingStore {
     }
     findings.sort((a, b) => (a.observed_at < b.observed_at ? 1 : -1));
     return findings.slice(0, limit);
+  }
+
+  /**
+   * List finding METADATA ONLY — no decrypt, no storage read — matching the
+   * same since/severity/sentinel_id/agent_id filters as `listFindings`, but
+   * returning EVERY index match rather than a decrypt-bounded top-N slice.
+   *
+   * MUST-FIX 5 (fix-round-2 RECHECK — anomaly baseline flood-truncation).
+   * Built for sentinel/sentinels/anomaly-trigger.ts's 8-day rolling
+   * baseline, which needs an ACCURATE per-window finding count and
+   * sentinel/agent attribution and must NEVER have a flood in one window
+   * silently push an OLDER window's findings out of the result — exactly
+   * what `listFindings`'s `min(limit, MAX_SCANNED_RECORDS)` decrypt bound
+   * did when a caller like that one asked for the whole span in one call
+   * (see MAX_SCANNED_RECORDS's cross-file-pin comment above for the full
+   * story). Every field Trigger A/B/C need (finding_id, severity,
+   * sentinel_id, agent_id, observed_at) already lives in the index; none of
+   * them need `summary`/`details`, so skipping decrypt entirely is not a
+   * shortcut, it is the CORRECT bound for this consumer.
+   *
+   * NOT capped by MAX_SCANNED_RECORDS (AGENTS.md rule 8(d) note): unlike
+   * `listFindings`, this method's cost is cheap in-memory field compares
+   * only — the true bound is the store's OWN size, which MUST-FIX 4
+   * (MAX_TRACKED_FINDINGS as a hard refuse + MAX_FINDINGS_PER_ORIGIN) now
+   * makes a real ceiling rather than the prior soft/overshootable one. A
+   * decrypt-bounded slice would reintroduce the exact truncation bug this
+   * method exists to close; an unbounded-by-decrypt scan over a
+   * store that is itself bounded is the fix, not a gap.
+   */
+  async listFindingMetadata(opts?: {
+    since?: string;
+    severity?: SentinelSeverity;
+    sentinelId?: string;
+    agentId?: string;
+  }): Promise<SentinelFindingMetadata[]> {
+    await this.ensureIndex();
+
+    const matches: SentinelFindingMetadata[] = [];
+    for (const [id, meta] of this.index) {
+      if (opts?.since && meta.observed_at < opts.since) continue;
+      if (opts?.severity && meta.severity !== opts.severity) continue;
+      if (opts?.sentinelId && meta.sentinel_id !== opts.sentinelId) continue;
+      if (opts?.agentId && meta.agent_id !== opts.agentId) continue;
+      matches.push({ finding_id: id, ...meta });
+    }
+    matches.sort((a, b) => (a.observed_at < b.observed_at ? 1 : -1));
+    return matches;
   }
 
   /**

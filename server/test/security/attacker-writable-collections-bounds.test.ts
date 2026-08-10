@@ -19,6 +19,8 @@
  *   5. honeypot coalescing windows server/src/honeypot/tool-call-trap-runtime.ts
  *      (the correlation-buffer itself, #1190's original fix, is re-verified
  *      by its own dedicated suite: test/honeypot/tool-call-trap-bound.test.ts)
+ *   6. awaited critical audit before eviction/reclamation (cross-cutting;
+ *      MUST-FIX 6, fix-round-2)
  *
  * Every test below drives the REAL production tool/store path (the actual
  * MCP tool handlers from createHandshakeTools/createFederationTools, the
@@ -26,6 +28,19 @@
  * DISTINCT minted keypairs or args per invocation — never a mock of the
  * map or store under test — per AGENTS.md rule 8(d)'s adversarial-
  * complexity requirement.
+ *
+ * PER-ORIGIN QUOTAS ARE SESSION-SCOPED, NOT IDENTITY-SCOPED (fix-round-2,
+ * MUST-FIX 1 spine RECHECK): `identity_create`/`identity_list` are Tier-3
+ * always-allow (principal-policy/loader.ts), so an untrusted agent mints
+ * local Sanctuary identities freely. Every test below that exercises a
+ * per-origin quota therefore drives the REAL tool handler's SECOND
+ * argument — `callerIdentity`, the server-set agent-session principal
+ * router.ts threads in from `options.currentAgentId()` — as the origin,
+ * never `identity_id`. Several tests deliberately MINT MANY DISTINCT LOCAL
+ * IDENTITIES under ONE session string to prove that multiplicity doesn't
+ * multiply origins — this is the exact mint-many-identities bypass the
+ * fix-round-1 cut of this branch was vulnerable to (its own multi-identity
+ * test proved the lockout was still reachable).
  */
 
 import { describe, it, expect } from "vitest";
@@ -41,6 +56,7 @@ import {
   MAX_HANDSHAKE_SESSIONS_PER_ORIGIN,
   MAX_HANDSHAKE_RESULTS,
   MAX_HANDSHAKE_RESULTS_PER_ORIGIN,
+  AGENT_UNKNOWN_ORIGIN,
 } from "../../src/handshake/tools.js";
 import { createFederationTools } from "../../src/federation/tools.js";
 import {
@@ -58,13 +74,17 @@ import type { SignedSHR } from "../../src/shr/types.js";
 import { ToolCallTrapRuntime } from "../../src/honeypot/tool-call-trap-runtime.js";
 import { TrapRegistry } from "../../src/honeypot/trap-registry.js";
 import type { TrapSpec } from "../../src/honeypot/types.js";
-import { SentinelFindingStore } from "../../src/sentinel/sentinel-finding-store.js";
+import {
+  SentinelFindingStore,
+  SentinelFindingStoreRefusedError,
+} from "../../src/sentinel/sentinel-finding-store.js";
 import type { SentinelFinding } from "../../src/sentinel/types.js";
+import { AnomalyTriggerWatcher } from "../../src/sentinel/sentinels/anomaly-trigger.js";
+import type { SentinelContext } from "../../src/sentinel/types.js";
 
 // ── Shared harness (mirrors test/handshake/handshake-forgery-remediation.test.ts) ──
 
-function makeAgent() {
-  const storage = new MemoryStorage();
+function makeAgent(storage: MemoryStorage = new MemoryStorage()) {
   const masterKey = generateRandomKey();
   const stateStore = new StateStore(storage, masterKey);
   const auditLog = new AuditLog(storage, masterKey);
@@ -138,17 +158,29 @@ function mintCounterpartySHR(template: SignedSHR): SignedSHR {
   };
 }
 
+/** Storage wrapper that fails every `_audit` namespace write once
+ * `failAuditWrites` is flipped true — used by section 6's mutation-proof
+ * tests to prove a rejected critical audit write ABORTS an eviction /
+ * reclamation rather than proceeding to delete with no durable trail. */
+class ToggleableFaultingAuditStorage extends MemoryStorage {
+  failAuditWrites = false;
+  async write(namespace: string, key: string, data: Uint8Array): Promise<void> {
+    if (namespace === "_audit" && this.failAuditWrites) {
+      throw new Error("simulated audit disk unavailable");
+    }
+    return super.write(namespace, key, data);
+  }
+}
+
 // ──────────────────────────────────────────────────────────────────────────
 // 1. Handshake sessions (handshake/tools.ts)
 // ──────────────────────────────────────────────────────────────────────────
 
-describe("1. handshake sessions: capped + swept + bounded + per-origin fair", () => {
+describe("1. handshake sessions: capped + swept + bounded + per-session fair", () => {
   it(
-    "MUTATION-PROOF TARGET (per-origin): refuses the (quota+1)-th in-flight session for ONE identity WITHOUT evicting or blocking a DIFFERENT identity's session",
+    "MUTATION-PROOF TARGET (per-session, MUST-FIX 1 spine): minting MANY local identities within ONE agent session does not multiply origins — refuses at the session's own quota, and a DISTINCT session is unaffected",
     async () => {
       const agent = makeAgent();
-      const identityA = await createIdentityFor(agent, "origin-a");
-      const identityB = await createIdentityFor(agent, "origin-b");
       const { tools } = createHandshakeTools(
         agent.config,
         agent.identityManager,
@@ -158,23 +190,35 @@ describe("1. handshake sessions: capped + swept + bounded + per-origin fair", ()
       const initiate = tools.find((t) => t.name === "handshake_initiate")!;
       const status = tools.find((t) => t.name === "handshake_status")!;
 
-      // Fill identity A's OWN per-origin quota. Every one of these must
-      // succeed (well under both the per-origin and global caps).
+      const SESSION_A = "agent:session-a";
+      const SESSION_B = "agent:session-b";
+
+      // MINT a distinct local identity for EVERY call — the exact bypass
+      // fix-round-1 was vulnerable to: identity_create is Tier-3
+      // always-allow, so an attacker who could multiply origins by minting
+      // identities would defeat a per-identity quota. Every one of these
+      // calls carries the SAME agent session.
+      const identities = [];
+      for (let i = 0; i < MAX_HANDSHAKE_SESSIONS_PER_ORIGIN; i += 1) {
+        identities.push(await createIdentityFor(agent, `minted-${i}`));
+      }
       const firstForA = parse(
-        await initiate.handler({ identity_id: identityA.identity_id })
+        await initiate.handler({ identity_id: identities[0]!.identity_id }, SESSION_A)
       );
       const firstSessionIdForA = firstForA.session_id as string;
-      for (let i = 1; i < MAX_HANDSHAKE_SESSIONS_PER_ORIGIN; i += 1) {
+      for (let i = 1; i < identities.length; i += 1) {
         const out = parse(
-          await initiate.handler({ identity_id: identityA.identity_id })
+          await initiate.handler({ identity_id: identities[i]!.identity_id }, SESSION_A)
         );
         expect(out.error).toBeUndefined();
       }
 
-      // The (quota+1)-th session for A is REFUSED — a real, surfaced error,
-      // never a silently-dropped success.
+      // The (quota+1)-th session for session A is refused even against a
+      // BRAND NEW, never-before-used minted identity — proving the quota
+      // tracks the SESSION, not identity_id.
+      const overflowIdentity = await createIdentityFor(agent, "minted-overflow");
       const overflowForA = parse(
-        await initiate.handler({ identity_id: identityA.identity_id })
+        await initiate.handler({ identity_id: overflowIdentity.identity_id }, SESSION_A)
       );
       expect(overflowForA.session_id).toBeUndefined();
       expect(overflowForA.error).toContain("too many in-flight handshake sessions");
@@ -188,12 +232,11 @@ describe("1. handshake sessions: capped + swept + bounded + per-origin fair", ()
       expect(stillThereForA.error).toBeUndefined();
       expect(stillThereForA.session_id).toBe(firstSessionIdForA);
 
-      // B is a COMPLETELY DIFFERENT origin: A's flood must not have touched
-      // B's headroom at all — this is the property the fix exists for
-      // ("500 handshake_initiate calls from one principal cannot evict
-      // ANOTHER principal's in-flight session").
+      // A COMPLETELY DIFFERENT SESSION — reusing one of A's own minted
+      // identities, to prove it is the SESSION that is accounted, not the
+      // identity — is entirely unaffected by A's flood.
       const forB = parse(
-        await initiate.handler({ identity_id: identityB.identity_id })
+        await initiate.handler({ identity_id: identities[0]!.identity_id }, SESSION_B)
       );
       expect(forB.error).toBeUndefined();
       expect(forB.session_id).toBeDefined();
@@ -202,19 +245,17 @@ describe("1. handshake sessions: capped + swept + bounded + per-origin fair", ()
   );
 
   it(
-    "under GLOBAL-cap pressure spread across many distinct identities (each within its own quota), the store still evicts the oldest session to admit a new one",
+    "under GLOBAL-cap pressure spread across many distinct AGENT SESSIONS (each within its own quota), the store still evicts the oldest session to admit a new one",
     async () => {
       const agent = makeAgent();
+      const identity = await createIdentityFor(agent, "shared-identity");
       // At least ceil(MAX_HANDSHAKE_SESSIONS / MAX_HANDSHAKE_SESSIONS_PER_ORIGIN) + 1
-      // distinct identities are needed so the flood can reach the GLOBAL
-      // cap without any single identity ever exceeding its own quota
-      // (which would refuse before the global cap is ever reached).
-      const identityCount =
+      // distinct SESSIONS are needed so the flood can reach the GLOBAL cap
+      // without any single session ever exceeding its own quota (which
+      // would refuse before the global cap is ever reached). One shared
+      // local identity is enough — origin no longer depends on identity_id.
+      const sessionCount =
         Math.ceil(MAX_HANDSHAKE_SESSIONS / MAX_HANDSHAKE_SESSIONS_PER_ORIGIN) + 1;
-      const identities = [];
-      for (let i = 0; i < identityCount; i += 1) {
-        identities.push(await createIdentityFor(agent, `spread-${i}`));
-      }
       const { tools } = createHandshakeTools(
         agent.config,
         agent.identityManager,
@@ -225,21 +266,19 @@ describe("1. handshake sessions: capped + swept + bounded + per-origin fair", ()
       const status = tools.find((t) => t.name === "handshake_status")!;
 
       const first = parse(
-        await initiate.handler({ identity_id: identities[0]!.identity_id })
+        await initiate.handler({ identity_id: identity.identity_id }, "agent:spread-0")
       );
       const firstSessionId = first.session_id as string;
 
-      // Round-robin across identities so no single one exceeds its
-      // per-origin quota, while collectively exceeding the GLOBAL cap by a
-      // small margin — proves the ORIGINAL entry was evicted to make room
-      // under genuine multi-identity pressure (the disclosed residual:
-      // per-origin quota stops ONE flooding origin, not legitimate load
-      // spread thin across many).
+      // Round-robin across sessions so no single one exceeds its per-origin
+      // quota, while collectively exceeding the GLOBAL cap by a small
+      // margin — proves the ORIGINAL entry was evicted to make room under
+      // genuine multi-session pressure.
       const EXTRA = 20;
       for (let i = 1; i < MAX_HANDSHAKE_SESSIONS + EXTRA; i += 1) {
-        const identity = identities[i % identities.length]!;
+        const session = `agent:spread-${i % sessionCount}`;
         const out = parse(
-          await initiate.handler({ identity_id: identity.identity_id })
+          await initiate.handler({ identity_id: identity.identity_id }, session)
         );
         expect(out.error).toBeUndefined();
       }
@@ -251,19 +290,50 @@ describe("1. handshake sessions: capped + swept + bounded + per-origin fair", ()
     },
     60_000
   );
+
+  it("a call with no callerIdentity (bypassing the router) falls into the shared AGENT_UNKNOWN_ORIGIN bucket, which is itself quota-bounded — not an unbounded escape hatch", async () => {
+    const agent = makeAgent();
+    const identity = await createIdentityFor(agent, "unknown-origin-identity");
+    const { tools } = createHandshakeTools(
+      agent.config,
+      agent.identityManager,
+      agent.masterKey,
+      agent.auditLog
+    );
+    const initiate = tools.find((t) => t.name === "handshake_initiate")!;
+
+    // No second argument passed — mirrors a direct handler call that never
+    // goes through router.ts's callerIdentity computation.
+    const first = parse(await initiate.handler({ identity_id: identity.identity_id }));
+    expect(first.error).toBeUndefined();
+
+    for (let i = 1; i < MAX_HANDSHAKE_SESSIONS_PER_ORIGIN; i += 1) {
+      const out = parse(await initiate.handler({ identity_id: identity.identity_id }));
+      expect(out.error).toBeUndefined();
+    }
+    // The shared unknown-origin bucket hits the SAME per-origin quota as
+    // any named session — refused, not unbounded.
+    const overflow = parse(await initiate.handler({ identity_id: identity.identity_id }));
+    expect(overflow.error).toContain("too many in-flight handshake sessions");
+
+    // Explicitly passing the constant produces the identical refusal —
+    // confirms this IS the AGENT_UNKNOWN_ORIGIN bucket, not a separate one.
+    const explicit = parse(
+      await initiate.handler({ identity_id: identity.identity_id }, AGENT_UNKNOWN_ORIGIN)
+    );
+    expect(explicit.error).toContain("too many in-flight handshake sessions");
+  });
 });
 
 // ──────────────────────────────────────────────────────────────────────────
 // 2. Handshake results (handshake/tools.ts)
 // ──────────────────────────────────────────────────────────────────────────
 
-describe("2. handshake results: capped + per-origin fair + expires_at-aware eviction + bounded listing", () => {
+describe("2. handshake results: capped + per-session fair + expires_at-aware eviction + bounded listing", () => {
   it(
-    "MUTATION-PROOF TARGET (per-origin): refuses the (quota+1)-th preview for ONE identity WITHOUT evicting or blocking a DIFFERENT identity",
+    "MUTATION-PROOF TARGET (per-session, MUST-FIX 1 spine): minting MANY local identities within ONE agent session does not multiply origins for handshakeResults either",
     async () => {
       const agent = makeAgent();
-      const identityA = await createIdentityFor(agent, "origin-a");
-      const identityB = await createIdentityFor(agent, "origin-b");
       const { tools, handshakeResults } = createHandshakeTools(
         agent.config,
         agent.identityManager,
@@ -271,38 +341,53 @@ describe("2. handshake results: capped + per-origin fair + expires_at-aware evic
         agent.auditLog
       );
       const exchange = tools.find((t) => t.name === "handshake_exchange")!;
+
+      const SESSION_A = "agent:session-a";
+      const SESSION_B = "agent:session-b";
+
+      const identities = [];
+      for (let i = 0; i < MAX_HANDSHAKE_RESULTS_PER_ORIGIN; i += 1) {
+        identities.push(await createIdentityFor(agent, `minted-result-${i}`));
+      }
+      // shrFor() defaults to the primary identity, which must exist first.
       const template = shrFor(agent);
 
       const firstSHRForA = mintCounterpartySHR(template);
       const firstResultForA = parse(
-        await exchange.handler({
-          counterparty_shr: firstSHRForA,
-          identity_id: identityA.identity_id,
-        })
+        await exchange.handler(
+          { counterparty_shr: firstSHRForA, identity_id: identities[0]!.identity_id },
+          SESSION_A
+        )
       );
       expect(firstResultForA.verification.recorded).toBe(true);
       const firstIdForA = firstSHRForA.body.instance_id;
       expect(handshakeResults.get(firstIdForA)).toBeDefined();
 
-      for (let i = 1; i < MAX_HANDSHAKE_RESULTS_PER_ORIGIN; i += 1) {
+      for (let i = 1; i < identities.length; i += 1) {
         const out = parse(
-          await exchange.handler({
-            counterparty_shr: mintCounterpartySHR(template),
-            identity_id: identityA.identity_id,
-          })
+          await exchange.handler(
+            {
+              counterparty_shr: mintCounterpartySHR(template),
+              identity_id: identities[i]!.identity_id,
+            },
+            SESSION_A
+          )
         );
         expect(out.verification.recorded).toBe(true);
       }
 
-      // The (quota+1)-th preview for A is refused — surfaced via
-      // verification.recorded/record_error (FAIL-LOUD fix), never a
-      // silently-dropped "success". The attestation itself is still valid
-      // (a structural preview does not depend on being cached).
+      // The (quota+1)-th preview for session A — using a BRAND NEW minted
+      // identity — is refused. Surfaced via verification.recorded/
+      // record_error (FAIL-LOUD fix), never a silently-dropped "success".
+      const overflowIdentity = await createIdentityFor(agent, "minted-result-overflow");
       const overflowForA = parse(
-        await exchange.handler({
-          counterparty_shr: mintCounterpartySHR(template),
-          identity_id: identityA.identity_id,
-        })
+        await exchange.handler(
+          {
+            counterparty_shr: mintCounterpartySHR(template),
+            identity_id: overflowIdentity.identity_id,
+          },
+          SESSION_A
+        )
       );
       expect(overflowForA.verification.recorded).toBe(false);
       expect(overflowForA.verification.record_error).toContain(
@@ -313,13 +398,16 @@ describe("2. handshake results: capped + per-origin fair + expires_at-aware evic
       // A's FIRST entry is still present — refusing never evicted it.
       expect(handshakeResults.get(firstIdForA)).toBeDefined();
 
-      // B is a COMPLETELY DIFFERENT origin: A's flood must not have
-      // touched B's headroom.
+      // A COMPLETELY DIFFERENT SESSION (reusing one of A's own minted
+      // identities): A's flood must not have touched B's headroom.
       const forB = parse(
-        await exchange.handler({
-          counterparty_shr: mintCounterpartySHR(template),
-          identity_id: identityB.identity_id,
-        })
+        await exchange.handler(
+          {
+            counterparty_shr: mintCounterpartySHR(template),
+            identity_id: identities[0]!.identity_id,
+          },
+          SESSION_B
+        )
       );
       expect(forB.verification.recorded).toBe(true);
     },
@@ -327,15 +415,12 @@ describe("2. handshake results: capped + per-origin fair + expires_at-aware evic
   );
 
   it(
-    "under GLOBAL-cap pressure spread across many distinct identities (each within its own quota), the store still evicts the oldest unverified entry to admit a new one",
+    "under GLOBAL-cap pressure spread across many distinct AGENT SESSIONS (each within its own quota), the store still evicts the oldest unverified entry to admit a new one",
     async () => {
       const agent = makeAgent();
-      const identityCount =
+      const identity = await createIdentityFor(agent, "shared-identity");
+      const sessionCount =
         Math.ceil(MAX_HANDSHAKE_RESULTS / MAX_HANDSHAKE_RESULTS_PER_ORIGIN) + 1;
-      const identities = [];
-      for (let i = 0; i < identityCount; i += 1) {
-        identities.push(await createIdentityFor(agent, `spread-${i}`));
-      }
       const { tools, handshakeResults } = createHandshakeTools(
         agent.config,
         agent.identityManager,
@@ -346,20 +431,20 @@ describe("2. handshake results: capped + per-origin fair + expires_at-aware evic
       const template = shrFor(agent);
 
       const firstSHR = mintCounterpartySHR(template);
-      await exchange.handler({
-        counterparty_shr: firstSHR,
-        identity_id: identities[0]!.identity_id,
-      });
+      await exchange.handler(
+        { counterparty_shr: firstSHR, identity_id: identity.identity_id },
+        "agent:spread-0"
+      );
       const firstId = firstSHR.body.instance_id;
       expect(handshakeResults.get(firstId)).toBeDefined();
 
       const EXTRA = 20;
       for (let i = 1; i < MAX_HANDSHAKE_RESULTS + EXTRA; i += 1) {
-        const identity = identities[i % identities.length]!;
-        await exchange.handler({
-          counterparty_shr: mintCounterpartySHR(template),
-          identity_id: identity.identity_id,
-        });
+        const session = `agent:spread-${i % sessionCount}`;
+        await exchange.handler(
+          { counterparty_shr: mintCounterpartySHR(template), identity_id: identity.identity_id },
+          session
+        );
         expect(handshakeResults.size).toBeLessThanOrEqual(MAX_HANDSHAKE_RESULTS);
       }
 
@@ -375,12 +460,10 @@ describe("2. handshake results: capped + per-origin fair + expires_at-aware evic
       // Short SHR validity (test-only override) so 1000 real handshakes can
       // all complete WITHIN their validity window, and then all become
       // expired together after one short sleep — without waiting the real
-      // 1-hour default. 30s is generous headroom over the ~7-10s this fill
-      // takes in practice; too short and entries start expiring mid-fill,
-      // which the "while-live" probe below cannot distinguish from the
-      // eviction-on-expiry behavior it is NOT yet testing.
+      // 1-hour default.
       const SHR_VALIDITY_MS = 30_000;
       const registrar = makeAgent();
+      const registrarIdentity = await createIdentityFor(registrar, "registrar-identity");
       const { tools: registrarTools, handshakeResults } = createHandshakeTools(
         registrar.config,
         registrar.identityManager,
@@ -391,21 +474,20 @@ describe("2. handshake results: capped + per-origin fair + expires_at-aware evic
       const initiate = registrarTools.find((t) => t.name === "handshake_initiate")!;
       const complete = registrarTools.find((t) => t.name === "handshake_complete")!;
 
-      const fillerOriginCount = MAX_HANDSHAKE_RESULTS / MAX_HANDSHAKE_RESULTS_PER_ORIGIN;
-      const fillerIdentities = [];
-      for (let i = 0; i < fillerOriginCount; i += 1) {
-        fillerIdentities.push(await createIdentityFor(registrar, `filler-${i}`));
-      }
-      const probeIdentity = await createIdentityFor(registrar, "probe");
+      const fillerSessionCount = MAX_HANDSHAKE_RESULTS / MAX_HANDSHAKE_RESULTS_PER_ORIGIN;
+      const probeSession = "agent:probe-session";
 
       // Runs a REAL 3-step handshake (initiate/respond/complete) between the
-      // registrar (as `localIdentityId`) and a freshly-minted counterparty
-      // fortress, and returns the PARSED handshake_complete response —
-      // callers assert success or refusal as appropriate (a refused
-      // recordHandshakeResult is an EXPECTED outcome for the overflow
-      // probes below, so this helper must not assert success itself).
+      // registrar (as `callerIdentity`'s session) and a freshly-minted
+      // counterparty fortress, and returns the PARSED handshake_complete
+      // response — callers assert success or refusal as appropriate (a
+      // refused recordHandshakeResult is an EXPECTED outcome for the
+      // overflow probes below, so this helper must not assert success
+      // itself). The counterparty's OWN `respond` call gets a per-call
+      // UNIQUE callerIdentity so its (separate, single-use) session store
+      // never approaches its own quota.
       async function completeRealHandshake(
-        localIdentityId: string,
+        callerIdentity: string,
         counterpartyLabel: string
       ): Promise<{ result?: { verified: boolean }; error?: string }> {
         const counterpartyFortress = makeAgent();
@@ -422,30 +504,37 @@ describe("2. handshake results: capped + per-origin fair + expires_at-aware evic
         );
         const respond = counterpartyTools.find((t) => t.name === "handshake_respond")!;
         const initiated = parse(
-          await initiate.handler({ identity_id: localIdentityId })
+          await initiate.handler({ identity_id: registrarIdentity.identity_id }, callerIdentity)
         );
         const responded = parse(
-          await respond.handler({
-            challenge: initiated.challenge,
-            identity_id: counterpartyIdentity.identity_id,
-          })
+          await respond.handler(
+            {
+              challenge: initiated.challenge,
+              identity_id: counterpartyIdentity.identity_id,
+            },
+            `agent:counterparty-${counterpartyLabel}`
+          )
         );
         return parse(
-          await complete.handler({
-            session_id: initiated.session_id,
-            response: responded.response,
-          })
+          await complete.handler(
+            {
+              session_id: initiated.session_id,
+              response: responded.response,
+            },
+            callerIdentity
+          )
         );
       }
 
       // Fill handshakeResults to EXACTLY the global cap, spread across
-      // `fillerOriginCount` distinct local identities so no single one
-      // ever exceeds its own per-origin quota (which would refuse before
-      // the global cap is ever reached).
+      // `fillerSessionCount` distinct agent SESSIONS (one shared registrar
+      // identity throughout — origin no longer depends on identity_id) so
+      // no single one ever exceeds its own per-origin quota.
       let counter = 0;
-      for (const identity of fillerIdentities) {
+      for (let s = 0; s < fillerSessionCount; s += 1) {
+        const session = `agent:filler-session-${s}`;
         for (let i = 0; i < MAX_HANDSHAKE_RESULTS_PER_ORIGIN; i += 1) {
-          const completed = await completeRealHandshake(identity.identity_id, `peer-${counter}`);
+          const completed = await completeRealHandshake(session, `peer-${counter}`);
           expect(completed.result?.verified).toBe(true);
           counter += 1;
         }
@@ -457,17 +546,29 @@ describe("2. handshake results: capped + per-origin fair + expires_at-aware evic
       const originalAppend = registrar.auditLog.append.bind(registrar.auditLog);
       registrar.auditLog.append = ((...args: Parameters<AuditLog["append"]>) => {
         if (args[1] === "handshake_results_saturated") saturatedAudited += 1;
-        if (args[1] === "handshake_result_evicted") {
-          evictedAudited = args[3] as { expired?: boolean };
-        }
         return originalAppend(...args);
       }) as AuditLog["append"];
+      // Eviction now audits via appendCritical (MUST-FIX 6, fix-round-2 —
+      // awaited, durable, BEFORE the delete), not the low-risk `.append`
+      // fire-and-forget it used before, so the spy targets that method.
+      const originalAppendCritical = registrar.auditLog.appendCritical.bind(
+        registrar.auditLog
+      );
+      registrar.auditLog.appendCritical = ((
+        ...args: Parameters<AuditLog["appendCritical"]>
+      ) => {
+        const entry = args[0];
+        if (entry.operation === "handshake_result_evicted") {
+          evictedAudited = entry.details as { expired?: boolean };
+        }
+        return originalAppendCritical(...args);
+      }) as AuditLog["appendCritical"];
 
       // Every slot holds a verified, live, UNEXPIRED peer — the probe
-      // identity's own new handshake is REFUSED, not admitted by evicting
+      // session's own new handshake is REFUSED, not admitted by evicting
       // one of them (never blind-FIFO a live peer).
       const whileLive = await completeRealHandshake(
-        probeIdentity.identity_id,
+        probeSession,
         "overflow-while-live"
       );
       expect(whileLive.result).toBeUndefined();
@@ -476,14 +577,12 @@ describe("2. handshake results: capped + per-origin fair + expires_at-aware evic
       expect(saturatedAudited).toBeGreaterThan(0);
 
       // Wait past SHR_VALIDITY_MS: every filler entry's expires_at is now
-      // in the past. A fresh handshake for the SAME probe identity must
-      // now SUCCEED — the MEDIUM #1 fix: an expired verified entry rolls
-      // off to admit a new one, exactly like federation/registry.ts's
-      // isPeerCurrentlyActive-gated eviction, instead of wedging the store
-      // for the server's lifetime.
+      // in the past. A fresh handshake for the SAME probe session must now
+      // SUCCEED — an expired verified entry rolls off to admit a new one,
+      // instead of wedging the store for the server's lifetime.
       await sleep(SHR_VALIDITY_MS + 500);
       const afterExpiry = await completeRealHandshake(
-        probeIdentity.identity_id,
+        probeSession,
         "overflow-after-expiry"
       );
       expect(afterExpiry.result?.verified).toBe(true);
@@ -493,26 +592,110 @@ describe("2. handshake results: capped + per-origin fair + expires_at-aware evic
     },
     240_000
   );
+
+  it(
+    "MUTATION-PROOF TARGET (no reattribution on update, MUST-FIX 3): a SECOND session's unverified preview for the SAME counterparty does not reattribute that entry's origin away from the FIRST session that created it",
+    async () => {
+      const agent = makeAgent();
+      await createIdentityFor(agent, "template-identity");
+      const { tools, handshakeResults, handshakeResultOrigins } = createHandshakeTools(
+        agent.config,
+        agent.identityManager,
+        agent.masterKey,
+        agent.auditLog
+      );
+      const exchange = tools.find((t) => t.name === "handshake_exchange")!;
+      const template = shrFor(agent);
+      const counterpartySHR = mintCounterpartySHR(template);
+
+      const SESSION_A = "agent:session-a-reattribution";
+      const SESSION_B = "agent:session-b-reattribution";
+
+      // Session A creates the FIRST (unverified preview) entry for this
+      // counterparty.
+      const first = parse(
+        await exchange.handler({ counterparty_shr: counterpartySHR }, SESSION_A)
+      );
+      expect(first.verification.recorded).toBe(true);
+      expect(handshakeResultOrigins.get(counterpartySHR.body.instance_id)).toBe(SESSION_A);
+      expect(handshakeResults.get(counterpartySHR.body.instance_id)).toBeDefined();
+
+      // Session B "updates" the SAME entry — the MEDIUM#3 downgrade guard
+      // allows overwriting an entry that is still unverified/non-live.
+      // Pre-fix, BoundedMap.set()'s update path re-attributed the origin
+      // to whichever caller updated it LAST (a framing/evasion primitive
+      // — see bounded-map.ts's `set()` doc: an attacker could inflate a
+      // VICTIM origin's count by repeatedly "updating" a shared key onto
+      // it, or evade their OWN quota by moving entries off their origin).
+      // Post-fix, the origin stays fixed at SESSION_A regardless of who
+      // updates the value afterward.
+      const second = parse(
+        await exchange.handler({ counterparty_shr: counterpartySHR }, SESSION_B)
+      );
+      expect(second.verification.recorded).toBe(true);
+      expect(handshakeResultOrigins.get(counterpartySHR.body.instance_id)).toBe(SESSION_A);
+
+      // Confirm this is not a stale read of a map that was never touched:
+      // SESSION_B's own origin count is still zero (it never actually got
+      // attributed anything), while SESSION_A's count is exactly 1 (the
+      // one entry it created, never reassigned).
+      let sessionACounted = 0;
+      let sessionBCounted = 0;
+      for (const origin of handshakeResultOrigins.values()) {
+        if (origin === SESSION_A) sessionACounted += 1;
+        if (origin === SESSION_B) sessionBCounted += 1;
+      }
+      expect(sessionACounted).toBe(1);
+      expect(sessionBCounted).toBe(0);
+    }
+  );
+
+  it(
+    "MUTATION-PROOF TARGET (truthful `recorded`, MUST-FIX 7): handshake_exchange reports recorded:false when SHR verification fails — never defaults to true for an attempt that never wrote anything",
+    async () => {
+      const agent = makeAgent();
+      const { tools } = createHandshakeTools(
+        agent.config,
+        agent.identityManager,
+        agent.masterKey,
+        agent.auditLog
+      );
+      const exchange = tools.find((t) => t.name === "handshake_exchange")!;
+      await createIdentityFor(agent, "template-identity");
+      const template = shrFor(agent);
+
+      const badSHR = mintCounterpartySHR(template);
+      // Corrupt the signature so verifySHR's cryptographic check fails —
+      // verificationResult.valid becomes false, and (pre-fix) `recorded`
+      // still defaulted to `true` here despite no write ever being
+      // attempted.
+      badSHR.signature = toBase64url(new Uint8Array(64));
+
+      const out = parse(
+        await exchange.handler({ counterparty_shr: badSHR }, "agent:truthful-recorded-session")
+      );
+      expect(out.verification.counterparty_valid).toBe(false);
+      expect(out.verification.recorded).toBe(false);
+    }
+  );
 });
 
 // ──────────────────────────────────────────────────────────────────────────
 // 3. Federation peers (federation/registry.ts)
 // ──────────────────────────────────────────────────────────────────────────
 
-describe("3. federation peers: capped + per-origin fair + refuse-on-all-active + bounded listing", () => {
+describe("3. federation peers: capped + per-session fair + refuse-on-all-active + bounded listing", () => {
   it(
-    "MUTATION-PROOF TARGET (per-origin): 500 attacker-completed handshakes against ONE local identity cannot lock out a DIFFERENT identity's legitimate registration",
+    "MUTATION-PROOF TARGET (per-session, MUST-FIX 1 spine): completing handshakes under MANY minted local identities from ONE agent session cannot lock out a DIFFERENT session's legitimate registration",
     async () => {
-      // register LD2-04 RECHECK: the original cut of this fix let ONE
-      // registrar identity fill the ENTIRE shared registry, permanently
-      // locking out every other identity's registration (the gate's own
-      // reproduction). MAX_FEDERATION_PEERS_PER_ORIGIN closes that — an
-      // identity floods only its OWN quota and is refused there, never
-      // evicting an active peer to make room and never touching a
-      // different identity's headroom.
+      // register LD2-04 RECHECK: the fix-round-1 cut let one FLOODING
+      // IDENTITY exhaust its own quota, but an attacker session that mints
+      // enough distinct identities (Tier-3 always-allow) could still fill
+      // the whole registry across "different" identities that are really
+      // the same attacker. Binding the quota to the SESSION (MUST-FIX 1)
+      // closes that: minting identities never creates new origins.
       const registrar = makeAgent();
-      const identityA = await createIdentityFor(registrar, "origin-a");
-      const identityB = await createIdentityFor(registrar, "origin-b");
+      const registrarIdentity = await createIdentityFor(registrar, "registrar-identity");
       const counterpartyFortress = makeAgent();
 
       const { tools: registrarTools, handshakeResults, handshakeResultOrigins } =
@@ -522,12 +705,6 @@ describe("3. federation peers: capped + per-origin fair + refuse-on-all-active +
           registrar.masterKey,
           registrar.auditLog
         );
-      const { tools: counterpartyTools } = createHandshakeTools(
-        counterpartyFortress.config,
-        counterpartyFortress.identityManager,
-        counterpartyFortress.masterKey,
-        counterpartyFortress.auditLog
-      );
       const { tools: federationTools } = createFederationTools(
         registrar.auditLog,
         handshakeResults,
@@ -536,48 +713,66 @@ describe("3. federation peers: capped + per-origin fair + refuse-on-all-active +
       );
 
       const initiate = registrarTools.find((t) => t.name === "handshake_initiate")!;
-      const respond = counterpartyTools.find((t) => t.name === "handshake_respond")!;
       const complete = registrarTools.find((t) => t.name === "handshake_complete")!;
       const register = federationTools.find((t) => t.name === "federation_peers")!;
 
-      // Registers ONE new peer end-to-end AS `localIdentityId`: mints a
-      // fresh counterparty identity (cheap: no KDF), completes the real
-      // nonce-bearing 4-step handshake, then registers it as a federation
-      // peer. Returns the parsed register response (callers assert success
-      // or refusal as appropriate — refusal is an EXPECTED outcome for the
-      // overflow probes below).
+      // Registers ONE new peer end-to-end under `callerIdentity`'s session:
+      // mints a fresh counterparty identity (cheap: no KDF), completes the
+      // real nonce-bearing 4-step handshake, then registers it as a
+      // federation peer. The counterparty's OWN `respond` call gets a
+      // per-call unique session string so its (shared across this test)
+      // sessions map never approaches its own quota. Returns the parsed
+      // register response (callers assert success or refusal as
+      // appropriate — refusal is an EXPECTED outcome for the overflow
+      // probes below).
       async function mintAndRegisterPeer(
-        localIdentityId: string,
+        callerIdentity: string,
         label: string
       ): Promise<{ registered?: boolean; error?: string; peer_id?: string }> {
         const identity = await createIdentityFor(counterpartyFortress, label);
+        const { tools: counterpartyTools } = createHandshakeTools(
+          counterpartyFortress.config,
+          counterpartyFortress.identityManager,
+          counterpartyFortress.masterKey,
+          counterpartyFortress.auditLog
+        );
+        const respond = counterpartyTools.find((t) => t.name === "handshake_respond")!;
         const initiated = parse(
-          await initiate.handler({ identity_id: localIdentityId })
+          await initiate.handler({ identity_id: registrarIdentity.identity_id }, callerIdentity)
         );
         const responded = parse(
-          await respond.handler({
-            challenge: initiated.challenge,
-            identity_id: identity.identity_id,
-          })
+          await respond.handler(
+            {
+              challenge: initiated.challenge,
+              identity_id: identity.identity_id,
+            },
+            `agent:counterparty-${label}`
+          )
         );
-        await complete.handler({
-          session_id: initiated.session_id,
-          response: responded.response,
-        });
+        await complete.handler(
+          {
+            session_id: initiated.session_id,
+            response: responded.response,
+          },
+          callerIdentity
+        );
         return parse(
           await register.handler({ action: "register", peer_id: identity.identity_id })
         );
       }
 
-      const firstForA = await mintAndRegisterPeer(identityA.identity_id, "a-peer-000");
+      const SESSION_A = "agent:session-a";
+      const SESSION_B = "agent:session-b";
+
+      const firstForA = await mintAndRegisterPeer(SESSION_A, "a-peer-000");
       expect(firstForA.registered).toBe(true);
       for (let i = 1; i < MAX_FEDERATION_PEERS_PER_ORIGIN; i += 1) {
-        const out = await mintAndRegisterPeer(identityA.identity_id, `a-peer-${i}`);
+        const out = await mintAndRegisterPeer(SESSION_A, `a-peer-${i}`);
         expect(out.registered).toBe(true);
       }
 
-      // The (quota+1)-th registration for A is REFUSED.
-      const overflowForA = await mintAndRegisterPeer(identityA.identity_id, "a-overflow");
+      // The (quota+1)-th registration for session A is REFUSED.
+      const overflowForA = await mintAndRegisterPeer(SESSION_A, "a-overflow");
       expect(overflowForA.registered).toBeUndefined();
       expect(overflowForA.error).toContain("registration quota");
 
@@ -587,33 +782,26 @@ describe("3. federation peers: capped + per-origin fair + refuse-on-all-active +
         listedAfterA.peers.some((p: { peer_id: string }) => p.peer_id === firstForA.peer_id)
       ).toBe(true);
 
-      // B is a COMPLETELY DIFFERENT local identity: A's flood must not
-      // have touched B's headroom.
-      const forB = await mintAndRegisterPeer(identityB.identity_id, "b-peer-000");
+      // B is a COMPLETELY DIFFERENT session: A's flood must not have
+      // touched B's headroom.
+      const forB = await mintAndRegisterPeer(SESSION_B, "b-peer-000");
       expect(forB.registered).toBe(true);
     },
     60_000
   );
 
   it(
-    "under GLOBAL-cap pressure spread across many distinct identities (each within its own quota), the registry evicts the oldest INACTIVE peer to admit a new one — a legitimate registration still succeeds, and an ACTIVE peer survives",
+    "under GLOBAL-cap pressure spread across many distinct AGENT SESSIONS (each within its own quota), the registry evicts the oldest INACTIVE peer to admit a new one — a legitimate registration still succeeds, and an ACTIVE peer survives",
     async () => {
       const registrar = makeAgent();
-      // Dedicated identities for the two peers whose fate is asserted below
-      // (kept SEPARATE from the round-robin filler identities so their
-      // one pre-existing registration never collides with a round-robin
-      // remainder pushing them over their own per-origin quota).
-      const inactiveOrigin = await createIdentityFor(registrar, "origin-inactive");
-      const firstActiveOrigin = await createIdentityFor(registrar, "origin-first-active");
-      const probeIdentity = await createIdentityFor(registrar, "origin-probe");
-      // Round-robin fillers for the remaining 498 registrations. 11 origins
-      // keeps each one's share (ceil(498/11) = 46) comfortably under
-      // MAX_FEDERATION_PEERS_PER_ORIGIN (50), regardless of how the 498
-      // remainder distributes across them.
-      const fillerIdentities = [];
-      for (let i = 0; i < 11; i += 1) {
-        fillerIdentities.push(await createIdentityFor(registrar, `spread-${i}`));
-      }
+      const registrarIdentity = await createIdentityFor(registrar, "registrar-identity");
+      const inactiveSession = "agent:session-inactive";
+      const firstActiveSession = "agent:session-first-active";
+      const probeSession = "agent:session-probe";
+      // 11 filler sessions keeps each one's share (ceil(498/11) = 46)
+      // comfortably under MAX_FEDERATION_PEERS_PER_ORIGIN (50), regardless
+      // of how the 498 remainder distributes across them.
+      const fillerSessionCount = 11;
 
       const { tools: registrarTools, handshakeResults, handshakeResultOrigins } =
         createHandshakeTools(
@@ -632,18 +820,16 @@ describe("3. federation peers: capped + per-origin fair + refuse-on-all-active +
       const complete = registrarTools.find((t) => t.name === "handshake_complete")!;
       const register = federationTools.find((t) => t.name === "federation_peers")!;
 
-      // Registers ONE new peer end-to-end AS `localIdentityId`. The
-      // counterparty's OWN handshake tools take `counterpartyShrValidityMs`
-      // — deliberately short for exactly ONE peer below, so it (and ONLY
-      // it) becomes an INACTIVE peer shortly after registration, without
-      // any timing dependency on how long the rest of this test takes (the
-      // registrar's own SHR validity, and every OTHER counterparty's, stay
-      // at the real 1-hour default). `result.expires_at` on the registrar's
-      // side derives from the COUNTERPARTY's SHR (handshake/protocol.ts:
-      // `their_shr.body.expires_at`), which is exactly what
-      // FederationRegistry uses to compute `peer.active`.
+      // Registers ONE new peer end-to-end under `callerIdentity`'s session.
+      // The counterparty's OWN handshake tools take
+      // `counterpartyShrValidityMs` — deliberately short for exactly ONE
+      // peer below, so it (and ONLY it) becomes an INACTIVE peer shortly
+      // after registration, without any timing dependency on how long the
+      // rest of this test takes. A FRESH counterparty fortress+tools
+      // instance per call means the counterparty's own session accounting
+      // never accumulates across calls.
       async function mintAndRegisterPeer(
-        localIdentityId: string,
+        callerIdentity: string,
         label: string,
         counterpartyShrValidityMs?: number
       ): Promise<{ registered?: boolean; error?: string; peer_id?: string; active?: boolean }> {
@@ -660,7 +846,7 @@ describe("3. federation peers: capped + per-origin fair + refuse-on-all-active +
         );
         const respond = counterpartyTools.find((t) => t.name === "handshake_respond")!;
         const initiated = parse(
-          await initiate.handler({ identity_id: localIdentityId })
+          await initiate.handler({ identity_id: registrarIdentity.identity_id }, callerIdentity)
         );
         const responded = parse(
           await respond.handler({
@@ -668,10 +854,13 @@ describe("3. federation peers: capped + per-origin fair + refuse-on-all-active +
             identity_id: identity.identity_id,
           })
         );
-        await complete.handler({
-          session_id: initiated.session_id,
-          response: responded.response,
-        });
+        await complete.handler(
+          {
+            session_id: initiated.session_id,
+            response: responded.response,
+          },
+          callerIdentity
+        );
         return parse(
           await register.handler({ action: "register", peer_id: identity.identity_id })
         );
@@ -681,7 +870,7 @@ describe("3. federation peers: capped + per-origin fair + refuse-on-all-active +
       // counterparty SHR, registered first.
       const SHORT_VALIDITY_MS = 500;
       const inactivePeer = await mintAndRegisterPeer(
-        inactiveOrigin.identity_id,
+        inactiveSession,
         "inactive-peer",
         SHORT_VALIDITY_MS
       );
@@ -689,19 +878,19 @@ describe("3. federation peers: capped + per-origin fair + refuse-on-all-active +
 
       // The very first ACTIVE peer registered — this one must SURVIVE.
       const firstActivePeer = await mintAndRegisterPeer(
-        firstActiveOrigin.identity_id,
+        firstActiveSession,
         "first-active-peer"
       );
       expect(firstActivePeer.registered).toBe(true);
 
       // Fill the rest of the global cap (498 more), spread round-robin
-      // across the filler identities so no single one exceeds its own
+      // across the filler sessions so no single one exceeds its own
       // per-origin quota.
       let counter = 0;
       const totalToFill = MAX_FEDERATION_PEERS - 2;
       for (let i = 0; i < totalToFill; i += 1) {
-        const identity = fillerIdentities[i % fillerIdentities.length]!;
-        const out = await mintAndRegisterPeer(identity.identity_id, `filler-${counter}`);
+        const session = `agent:filler-session-${i % fillerSessionCount}`;
+        const out = await mintAndRegisterPeer(session, `filler-${counter}`);
         expect(out.registered).toBe(true);
         counter += 1;
       }
@@ -710,12 +899,12 @@ describe("3. federation peers: capped + per-origin fair + refuse-on-all-active +
       // peer actually expire before probing further.
       await sleep(SHORT_VALIDITY_MS + 500);
 
-      // The probe identity (fresh, well under its own quota) registers a
+      // The probe session (fresh, well under its own quota) registers a
       // NEW peer — the registry is at global capacity, but ONE existing
       // peer (the deliberately-short-lived one) is now INACTIVE, so this
       // is admitted by evicting THAT one, not refused, and not by evicting
       // an active peer.
-      const newPeer = await mintAndRegisterPeer(probeIdentity.identity_id, "legitimate-new-peer");
+      const newPeer = await mintAndRegisterPeer(probeSession, "legitimate-new-peer");
       expect(newPeer.registered).toBe(true);
 
       const finalList = parse(await register.handler({ action: "list" }));
@@ -731,13 +920,108 @@ describe("3. federation peers: capped + per-origin fair + refuse-on-all-active +
     },
     180_000
   );
+
+  it(
+    "MUTATION-PROOF TARGET (required origin, MUST-FIX 2): a peer_id missing from handshakeResultOrigins is NOT a quota-skip — it falls into the shared AGENT_UNKNOWN_ORIGIN bucket, which is itself quota-bounded",
+    async () => {
+      // Simulates the MUST-FIX 2 defect directly: a handshake result whose
+      // origin attribution is somehow absent (a future producer bug, or
+      // exactly what fix-round-1's OPTIONAL handshakeResultOrigins param
+      // produced when a caller omitted it entirely — an empty map means
+      // every peerId lookup misses). REQUIRED (not optional) means
+      // federation/tools.ts's register handler must never treat a miss as
+      // "skip the quota" — it falls back to the shared AGENT_UNKNOWN_ORIGIN
+      // bucket instead, which is itself bounded.
+      const registrar = makeAgent();
+      const registrarIdentity = await createIdentityFor(registrar, "registrar-identity");
+      const counterpartyFortress = makeAgent();
+
+      const { tools: registrarTools, handshakeResults, handshakeResultOrigins } =
+        createHandshakeTools(
+          registrar.config,
+          registrar.identityManager,
+          registrar.masterKey,
+          registrar.auditLog
+        );
+      const { tools: federationTools } = createFederationTools(
+        registrar.auditLog,
+        handshakeResults,
+        registrar.identityManager,
+        handshakeResultOrigins
+      );
+      const initiate = registrarTools.find((t) => t.name === "handshake_initiate")!;
+      const complete = registrarTools.find((t) => t.name === "handshake_complete")!;
+      const register = federationTools.find((t) => t.name === "federation_peers")!;
+
+      async function completeHandshakeForOrigin(
+        callerIdentity: string,
+        label: string
+      ): Promise<string> {
+        const identity = await createIdentityFor(counterpartyFortress, label);
+        const { tools: counterpartyTools } = createHandshakeTools(
+          counterpartyFortress.config,
+          counterpartyFortress.identityManager,
+          counterpartyFortress.masterKey,
+          counterpartyFortress.auditLog
+        );
+        const respond = counterpartyTools.find((t) => t.name === "handshake_respond")!;
+        const initiated = parse(
+          await initiate.handler({ identity_id: registrarIdentity.identity_id }, callerIdentity)
+        );
+        const responded = parse(
+          await respond.handler(
+            { challenge: initiated.challenge, identity_id: identity.identity_id },
+            `agent:counterparty-${label}`
+          )
+        );
+        await complete.handler(
+          { session_id: initiated.session_id, response: responded.response },
+          callerIdentity
+        );
+        return identity.identity_id;
+      }
+
+      // Fill the shared AGENT_UNKNOWN_ORIGIN bucket via "unattributed"
+      // registrations: complete a real handshake (each under a DIFFERENT
+      // session, proving this is about origin ATTRIBUTION, not session
+      // reuse), then delete its origin entry before registering — modeling
+      // the missing-attribution case.
+      for (let i = 0; i < MAX_FEDERATION_PEERS_PER_ORIGIN; i += 1) {
+        const peerId = await completeHandshakeForOrigin(`agent:owner-${i}`, `unattributed-${i}`);
+        // Deliberate test-only reach into the ReadonlyMap's underlying
+        // mutable store (BoundedMap's `origins` sibling map — see
+        // originsView()'s doc) to simulate a producer that completed a
+        // handshake but failed to attribute an origin for it. The public
+        // API surface exercised below (register.handler) is unchanged —
+        // only the origin INPUT this simulates is missing.
+        (handshakeResultOrigins as Map<string, string>).delete(peerId);
+        const out = parse(await register.handler({ action: "register", peer_id: peerId }));
+        expect(out.registered).toBe(true);
+      }
+
+      // The shared bucket is now at quota. One more "unattributed"
+      // registration is REFUSED — proving the fallback bucket is real
+      // accounting, not an unbounded escape hatch.
+      const overflowPeerId = await completeHandshakeForOrigin(
+        "agent:owner-overflow",
+        "unattributed-overflow"
+      );
+      (handshakeResultOrigins as Map<string, string>).delete(overflowPeerId);
+      const overflow = parse(
+        await register.handler({ action: "register", peer_id: overflowPeerId })
+      );
+      expect(overflow.registered).toBeUndefined();
+      expect(overflow.error).toContain("registration quota");
+    },
+    60_000
+  );
 });
 
 // ──────────────────────────────────────────────────────────────────────────
 // 4. Sentinel durable findings (sentinel/sentinel-finding-store.ts)
 // ──────────────────────────────────────────────────────────────────────────
 
-describe("4. sentinel durable findings: capped, never blind-FIFO, bounded list + prune", () => {
+describe("4. sentinel durable findings: capped, per-origin fair, never blind-FIFO, bounded list + prune", () => {
   function mkFinding(id: string, overrides: Partial<SentinelFinding> = {}): SentinelFinding {
     return {
       finding_id: id,
@@ -754,7 +1038,7 @@ describe("4. sentinel durable findings: capped, never blind-FIFO, bounded list +
   }
 
   it(
-    "MUTATION-PROOF TARGET (flood-survival): a pre-existing CRITICAL finding survives a flood past MAX_TRACKED_FINDINGS, no blind FIFO",
+    "MUTATION-PROOF TARGET (flood-survival, MUST-FIX 4): a pre-existing CRITICAL finding survives a flood past MAX_TRACKED_FINDINGS — the flood is REFUSED, not silently overshot",
     async () => {
       const storage = new MemoryStorage();
       const masterKey = generateRandomKey();
@@ -766,6 +1050,11 @@ describe("4. sentinel durable findings: capped, never blind-FIFO, bounded list +
         fortressId: "fortress-inventory-test",
         auditLog,
         maxTrackedFindings: CAP,
+        // Isolate the CAPACITY refusal from the per-origin one (tested
+        // separately below) — every finding here shares no agent_id, so
+        // without this override they would all land in the same
+        // "unattributed" bucket and hit ITS quota first.
+        maxFindingsPerOrigin: 1000,
       });
 
       // A pre-existing, non-expired, HIGHEST-SEVERITY finding — the one
@@ -788,18 +1077,72 @@ describe("4. sentinel durable findings: capped, never blind-FIFO, bounded list +
       }) as AuditLog["append"];
 
       // Flood PAST the cap with brand-new finding_ids. Nothing in the store
-      // is expired, so evictOldestExpired can reclaim nothing — the store
-      // must overshoot (loudly, via the saturation audit) rather than
-      // blind-FIFO evict the critical finding to make room.
+      // is expired, so evictOldestExpired can reclaim nothing — every one
+      // of these writes must be REFUSED (MUST-FIX 4), loudly (via the
+      // saturation audit), never a blind overshoot.
       const FLOOD = 10;
+      let refusedCount = 0;
       for (let i = 0; i < FLOOD; i += 1) {
-        await store.saveFinding(mkFinding(`flood-${i}`));
+        try {
+          await store.saveFinding(mkFinding(`flood-${i}`));
+        } catch (err) {
+          expect(err).toBeInstanceOf(SentinelFindingStoreRefusedError);
+          expect((err as SentinelFindingStoreRefusedError).reason).toBe("capacity");
+          refusedCount += 1;
+        }
       }
 
+      expect(refusedCount).toBe(FLOOD);
       expect(saturatedAudited).toBeGreaterThan(0);
       const survived = await store.loadFinding("critical-000");
       expect(survived).not.toBeNull();
       expect(survived!.severity).toBe("alert");
+
+      // The store's tracked count NEVER exceeds the cap — the class this
+      // rule closes, one layer up from the first place it was closed.
+      const allMeta = await store.listFindingMetadata({});
+      expect(allMeta.length).toBe(CAP);
+    },
+    30_000
+  );
+
+  it(
+    "MUTATION-PROOF TARGET (per-origin, MUST-FIX 4): a flood from ONE origin is refused at its own quota without touching a DIFFERENT origin's headroom",
+    async () => {
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const auditLog = new AuditLog(storage, masterKey);
+      const ORIGIN_QUOTA = 5;
+      const store = new SentinelFindingStore({
+        storage,
+        masterKey,
+        fortressId: "fortress-inventory-test",
+        auditLog,
+        maxFindingsPerOrigin: ORIGIN_QUOTA,
+        // Large enough that only the per-origin quota can fire in this test.
+        maxTrackedFindings: 1000,
+      });
+
+      for (let i = 0; i < ORIGIN_QUOTA; i += 1) {
+        await store.saveFinding(mkFinding(`origin-a-${i}`, { agent_id: "origin-a" }));
+      }
+
+      await expect(
+        store.saveFinding(mkFinding("origin-a-overflow", { agent_id: "origin-a" }))
+      ).rejects.toMatchObject({
+        reason: "origin_quota",
+      });
+
+      // A DIFFERENT origin is completely unaffected.
+      await expect(
+        store.saveFinding(mkFinding("origin-b-000", { agent_id: "origin-b" }))
+      ).resolves.toBeTypeOf("string");
+
+      // origin-a's existing findings are all still there — refusing never
+      // evicted them.
+      for (let i = 0; i < ORIGIN_QUOTA; i += 1) {
+        expect(await store.loadFinding(`origin-a-${i}`)).not.toBeNull();
+      }
     },
     30_000
   );
@@ -819,7 +1162,7 @@ describe("4. sentinel durable findings: capped, never blind-FIFO, bounded list +
 
     const TOTAL_EXPIRED = 10;
     for (let i = 0; i < TOTAL_EXPIRED; i += 1) {
-      await store.saveFinding(mkFinding(`expired-${i}`));
+      await store.saveFinding(mkFinding(`expired-${i}`, { agent_id: `agent-${i}` }));
     }
     // Advance well past the 1-day retention window so every record above is
     // now expired.
@@ -859,6 +1202,7 @@ describe("4. sentinel durable findings: capped, never blind-FIFO, bounded list +
       await store.saveFinding(
         mkFinding(`ordered-${i}`, {
           observed_at: new Date(Date.parse("2026-01-01T00:00:00.000Z") + i * 1000).toISOString(),
+          agent_id: `agent-${i}`,
         })
       );
       // MemoryStorage's modified_at is wall-clock at write time; a tiny
@@ -898,7 +1242,7 @@ describe("4. sentinel durable findings: capped, never blind-FIFO, bounded list +
 
       const OLD_TIME = new Date("2026-01-01T00:00:00.000Z").toISOString();
       await store.saveFinding(
-        mkFinding("old-critical", { severity: "alert", observed_at: OLD_TIME })
+        mkFinding("old-critical", { severity: "alert", observed_at: OLD_TIME, agent_id: "agent-old" })
       );
 
       // Flood with NEWER, low-severity findings — well past maxScannedRecords.
@@ -908,6 +1252,7 @@ describe("4. sentinel durable findings: capped, never blind-FIFO, bounded list +
           mkFinding(`recent-info-${i}`, {
             severity: "info",
             observed_at: new Date(Date.parse(OLD_TIME) + (i + 1) * 60_000).toISOString(),
+            agent_id: `agent-recent-${i}`,
           })
         );
         // Distinct modified_at per write (matches the ordering test above).
@@ -921,20 +1266,16 @@ describe("4. sentinel durable findings: capped, never blind-FIFO, bounded list +
   );
 
   it(
-    "an 8-day-baseline-style `since` query (anomaly-trigger's own call shape) is NOT truncated below its span by a flood past the old hardcoded scan window",
+    "MUTATION-PROOF TARGET (metadata scan, MUST-FIX 5): listFindingMetadata is NOT truncated by any decrypt-bound window — a flood far past the old hardcoded/decrypt-bound scan size still returns every matching record",
     async () => {
       const storage = new MemoryStorage();
       const masterKey = generateRandomKey();
-      // Deliberately no maxScannedRecords override — this exercises the
-      // REAL production ceiling (pinned to anomaly-trigger's QUERY_LIMIT,
-      // 5000), and the OLD hardcoded scan window this class re-introduced
-      // was 500 — so a flood between 500 and 5000, all within the query's
-      // `since` window, is exactly the case that used to silently starve
-      // anomaly-trigger's baseline.
       const store = new SentinelFindingStore({
         storage,
         masterKey,
         fortressId: "fortress-inventory-test",
+        maxTrackedFindings: 10_000,
+        maxFindingsPerOrigin: 10_000,
       });
 
       const sinceIso = new Date("2026-01-01T00:00:00.000Z").toISOString();
@@ -942,28 +1283,168 @@ describe("4. sentinel durable findings: capped, never blind-FIFO, bounded list +
         mkFinding("in-window-old", {
           severity: "info",
           observed_at: new Date(Date.parse(sinceIso) + 1_000).toISOString(),
+          agent_id: "agent-old",
         })
       );
 
       // 600 > the OLD hardcoded 500-record scan window this class
-      // re-introduced, all newer than `in-window-old` but still >= since.
+      // re-introduced, and also > listFindings's own MAX_SCANNED_RECORDS
+      // decrypt bound region this consumer used to be capped by. Spread
+      // across many distinct agent_ids so no single origin's quota
+      // interferes with this test's actual concern (decrypt/scan
+      // truncation, not per-origin fairness).
       const FLOOD = 600;
       for (let i = 0; i < FLOOD; i += 1) {
         await store.saveFinding(
           mkFinding(`in-window-flood-${i}`, {
             severity: "info",
             observed_at: new Date(Date.parse(sinceIso) + (i + 2) * 60_000).toISOString(),
+            agent_id: `agent-flood-${i % 20}`,
           })
         );
       }
 
-      // Mirrors sentinel/sentinels/anomaly-trigger.ts's own call: `since` +
-      // a limit large enough to cover the whole baseline span.
-      const found = await store.listFindings({ since: sinceIso, limit: 5_000 });
+      // Mirrors sentinel/sentinels/anomaly-trigger.ts's own call shape
+      // (MUST-FIX 5: it now calls listFindingMetadata, not listFindings).
+      const found = await store.listFindingMetadata({ since: sinceIso });
       expect(found.length).toBe(FLOOD + 1);
       expect(found.some((f) => f.finding_id === "in-window-old")).toBe(true);
     },
     60_000
+  );
+
+  it("cold restart: a fresh store instance backfills its index from storage and sees every record a PRIOR instance wrote", async () => {
+    const storage = new MemoryStorage();
+    const masterKey = generateRandomKey();
+    const fortressId = "fortress-restart-test";
+    const store1 = new SentinelFindingStore({ storage, masterKey, fortressId });
+    const N = 25;
+    for (let i = 0; i < N; i += 1) {
+      await store1.saveFinding(mkFinding(`restart-${i}`, { agent_id: `agent-${i % 5}` }));
+    }
+
+    // Fresh instance, same storage/fortress — simulates a process restart.
+    const store2 = new SentinelFindingStore({ storage, masterKey, fortressId });
+    const metadata = await store2.listFindingMetadata({});
+    expect(metadata.length).toBe(N);
+    const ids = metadata.map((m) => m.finding_id).sort();
+    expect(ids).toEqual(Array.from({ length: N }, (_, i) => `restart-${i}`).sort());
+  });
+
+  it(
+    "two INDEPENDENT store instances over the SAME storage do not see each other's writes once their own index has built — exactly why index.ts now shares ONE instance across production consumers (MUST-FIX 5)",
+    async () => {
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const fortressId = "fortress-dual-instance-test";
+      const store1 = new SentinelFindingStore({ storage, masterKey, fortressId });
+      const store2 = new SentinelFindingStore({ storage, masterKey, fortressId });
+
+      // Force store2's index to build BEFORE store1 writes anything.
+      await store2.listFindingMetadata({});
+
+      await store1.saveFinding(mkFinding("only-in-store1"));
+
+      // store2's OWN index has no knowledge of store1's write — this is
+      // the exact defect class MUST-FIX 5 closes at the wiring layer
+      // (index.ts / dashboard/v1_1/wiring.ts sharing ONE instance), not
+      // something a single store class can fix for itself.
+      const fromStore2 = await store2.listFindingMetadata({});
+      expect(fromStore2.some((m) => m.finding_id === "only-in-store1")).toBe(false);
+
+      // store1 sees its own write, of course.
+      const fromStore1 = await store1.listFindingMetadata({});
+      expect(fromStore1.some((m) => m.finding_id === "only-in-store1")).toBe(true);
+
+      // A FRESH instance (a genuine cold start, per the test above) sees
+      // it — confirms this is specifically about two LIVE instances
+      // diverging, not about durability.
+      const store3 = new SentinelFindingStore({ storage, masterKey, fortressId });
+      const fromStore3 = await store3.listFindingMetadata({});
+      expect(fromStore3.some((m) => m.finding_id === "only-in-store1")).toBe(true);
+    }
+  );
+
+  it(
+    "MUST-FIX 5b: anomaly-trigger's 8-day rolling baseline is NOT corrupted by a >5000 flood in the CURRENT window — every older baseline window keeps its true count",
+    async () => {
+      // Regression shape: the OLD listFindings({since, limit: 5000}) call
+      // sorted matches newest-first and decrypt-bounded to 5000 — so a
+      // >5000 flood entirely within window 0 (the most recent 24h) would
+      // consume the WHOLE decrypt budget, silently truncating away every
+      // OLDER baseline window's findings. Under that bug, Trigger B's
+      // "populated >= BASELINE_WINDOWS" warmup gate would see windows 1-7
+      // as EMPTY and never fire, despite a genuine, massive count spike.
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const fortressId = "fortress-baseline-flood-test";
+      const now = new Date("2026-06-01T12:00:00.000Z");
+      const store = new SentinelFindingStore({
+        storage,
+        masterKey,
+        fortressId,
+        maxTrackedFindings: 10_000,
+        maxFindingsPerOrigin: 10_000,
+      });
+
+      const DAY_MS = 24 * 60 * 60 * 1000;
+      const BASELINE_WINDOWS = 7;
+      const BASELINE_COUNT_PER_WINDOW = 10;
+      const FLOOD_COUNT = 5_500; // > the old 5000 decrypt-bound
+
+      let seq = 0;
+      async function writeAt(windowIndex: number, count: number): Promise<void> {
+        for (let i = 0; i < count; i += 1) {
+          const observedAt = new Date(
+            now.getTime() - windowIndex * DAY_MS - i * 1_000
+          ).toISOString();
+          await store.saveFinding(
+            mkFinding(`baseline-${seq}`, {
+              sentinel_id: "flood-sentinel",
+              severity: "info",
+              observed_at: observedAt,
+              agent_id: `agent-${seq % 40}`,
+            })
+          );
+          seq += 1;
+        }
+      }
+
+      // Baseline windows 1..7: a small, known, populated count each.
+      for (let w = 1; w <= BASELINE_WINDOWS; w += 1) {
+        await writeAt(w, BASELINE_COUNT_PER_WINDOW);
+      }
+      // Current window (0): the flood, far past the old decrypt bound.
+      await writeAt(0, FLOOD_COUNT);
+
+      const watcher = new AnomalyTriggerWatcher();
+      const context: SentinelContext = {
+        fortressId,
+        auditLog: { query: async () => ({ entries: [], total: 0 }) } as unknown as SentinelContext["auditLog"],
+        now: () => now,
+        findingStore: store,
+      };
+      await watcher.subscribe(context);
+      const findings = await watcher.evaluate();
+
+      const countSpike = findings.find(
+        (f) => (f.details as { trigger?: string }).trigger === "count_spike"
+      );
+      // Under the pre-fix truncation bug this finding is never emitted
+      // (the baseline windows read as unpopulated) — its presence here IS
+      // the regression proof.
+      expect(countSpike).toBeDefined();
+      expect(countSpike!.severity).toBe("alert");
+      expect((countSpike!.details as { current_count: number }).current_count).toBe(
+        FLOOD_COUNT
+      );
+      // The baseline mean reflects the TRUE per-window count (10), not
+      // zero/undercounted — proving windows 1-7 were not silently
+      // truncated away by window 0's flood.
+      const baselineMean = (countSpike!.details as { baseline_mean: number }).baseline_mean;
+      expect(baselineMean).toBeCloseTo(BASELINE_COUNT_PER_WINDOW, 0);
+    },
+    120_000
   );
 });
 
@@ -1210,4 +1691,126 @@ describe("5. honeypot coalescing windows: capped, evicts oldest, never durably g
     },
     60_000
   );
+});
+
+// ──────────────────────────────────────────────────────────────────────────
+// 6. Awaited critical audit before eviction/reclamation (cross-cutting,
+//    MUST-FIX 6, fix-round-2)
+// ──────────────────────────────────────────────────────────────────────────
+
+describe("6. awaited critical audit before eviction/reclamation aborts on audit failure", () => {
+  it(
+    "MUTATION-PROOF TARGET (BoundedMap eviction abort): a rejected critical audit write during GLOBAL-cap eviction aborts the eviction — the oldest session is NOT deleted, and the new insert is refused",
+    async () => {
+      const storage = new ToggleableFaultingAuditStorage();
+      const agent = makeAgent(storage);
+      const identity = await createIdentityFor(agent, "audit-fail-identity");
+      const { tools } = createHandshakeTools(
+        agent.config,
+        agent.identityManager,
+        agent.masterKey,
+        agent.auditLog
+      );
+      const initiate = tools.find((t) => t.name === "handshake_initiate")!;
+      const status = tools.find((t) => t.name === "handshake_status")!;
+
+      // Fill the GLOBAL cap spread across enough distinct sessions that no
+      // single session's own quota refuses first.
+      const sessionCount = Math.ceil(
+        MAX_HANDSHAKE_SESSIONS / MAX_HANDSHAKE_SESSIONS_PER_ORIGIN
+      );
+      const first = parse(
+        await initiate.handler(
+          { identity_id: identity.identity_id },
+          "agent:audit-fail-spread-0"
+        )
+      );
+      const firstSessionId = first.session_id as string;
+      for (let i = 1; i < MAX_HANDSHAKE_SESSIONS; i += 1) {
+        const session = `agent:audit-fail-spread-${i % sessionCount}`;
+        const out = parse(
+          await initiate.handler({ identity_id: identity.identity_id }, session)
+        );
+        expect(out.error).toBeUndefined();
+      }
+
+      // NOW the map is at the global cap. Flip audit writes to fail BEFORE
+      // triggering the eviction — this proves the ABORT path, not just
+      // "audit happened to fail during setup".
+      storage.failAuditWrites = true;
+
+      const overflow = parse(
+        await initiate.handler(
+          { identity_id: identity.identity_id },
+          "agent:audit-fail-new-session"
+        )
+      );
+      // The eviction's critical audit write rejected -> BoundedMap.set()
+      // ABORTS: the incoming insert is refused (same as a capacity
+      // refusal), and the entry `selectEviction` had picked (the oldest
+      // session) is NEVER deleted.
+      expect(overflow.session_id).toBeUndefined();
+      expect(overflow.error).toBeDefined();
+
+      storage.failAuditWrites = false;
+      const stillThere = parse(await status.handler({ session_id: firstSessionId }));
+      expect(stillThere.error).toBeUndefined();
+      expect(stillThere.session_id).toBe(firstSessionId);
+    },
+    60_000
+  );
+
+  it(
+    "MUTATION-PROOF TARGET (sentinel reclamation abort): a rejected critical audit write during expired-record reclamation aborts the reclamation — the expired record is NOT deleted, and the triggering write is refused",
+    async () => {
+      const storage = new ToggleableFaultingAuditStorage();
+      const masterKey = generateRandomKey();
+      let nowMs = Date.parse("2026-01-01T00:00:00.000Z");
+      const auditLog = new AuditLog(storage, masterKey);
+      const CAP = 3;
+      const store = new SentinelFindingStore({
+        storage,
+        masterKey,
+        fortressId: "fortress-audit-fail-test",
+        retentionDays: 1,
+        now: () => new Date(nowMs),
+        auditLog,
+        maxTrackedFindings: CAP,
+        maxFindingsPerOrigin: 1000,
+      });
+
+      // Fill the cap with findings that will all be EXPIRED shortly.
+      for (let i = 0; i < CAP; i += 1) {
+        await store.saveFinding(mkFinding(`expiring-${i}`, { agent_id: `agent-${i}` }));
+      }
+      // Advance past the 1-day retention window so every record above is
+      // now reclaimable.
+      nowMs += 2 * 24 * 60 * 60 * 1000;
+
+      storage.failAuditWrites = true;
+      await expect(store.saveFinding(mkFinding("overflow"))).rejects.toMatchObject({
+        reason: "capacity",
+      });
+      storage.failAuditWrites = false;
+
+      // The expired record was NEVER deleted — the audit failure aborted
+      // reclamation before the delete.
+      expect(await store.loadFinding("expiring-0")).not.toBeNull();
+    },
+    30_000
+  );
+
+  function mkFinding(id: string, overrides: Partial<SentinelFinding> = {}): SentinelFinding {
+    return {
+      finding_id: id,
+      sentinel_id: "inventory-test-sentinel",
+      severity: "alert",
+      summary: `finding ${id}`,
+      details: {},
+      observed_at: new Date().toISOString(),
+      evidence_audit_ids: [],
+      fortress_id: "fortress-inventory-test",
+      ...overrides,
+    };
+  }
 });

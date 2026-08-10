@@ -28,9 +28,27 @@ import {
 const require = createRequire(import.meta.url);
 const { version: PKG_VERSION } = require("../package.json");
 
-/** Tool handler function signature */
+/**
+ * Tool handler function signature.
+ *
+ * `callerIdentity` (MUST-FIX 1, fix-round-2 spine, register RECHECK): the
+ * SERVER-SET agent-session principal — `agent:<currentAgentId>` when the
+ * server is wrapping a known agent, `agent:unknown` otherwise (see
+ * `callerIdentity`'s computation below) — NEVER derived from request args.
+ * This is the only principal a calling agent cannot mint more of: Sanctuary
+ * identities are `identity_create`-mintable at Tier 3 (principal-policy
+ * `loader.ts`'s `tier3_always_allow`), so any per-origin quota keyed on a
+ * caller-supplied `identity_id` is defeated by minting enough identities.
+ * Handlers that enforce a per-origin quota on attacker-writable state
+ * (handshake sessions/results, federation peer registration) MUST use this
+ * value as the quota origin, never `args.identity_id` / `args.instance_id`.
+ * Optional so every handler that does not need it (the overwhelming
+ * majority) is unaffected — TypeScript allows a handler declared with fewer
+ * parameters to satisfy this type.
+ */
 export type ToolHandler = (
-  args: Record<string, unknown>
+  args: Record<string, unknown>,
+  callerIdentity?: string
 ) => Promise<{ content: Array<{ type: "text"; text: string }> }>;
 
 /** Tool definition for registration */
@@ -280,7 +298,11 @@ export function createServer(
             },
           });
         }
-        return tool.handler(handlerArgs);
+        // Thread the server-set session principal to every handler (see
+        // ToolHandler's doc) — this is what lets handshake/federation
+        // per-origin quotas bind to a value the calling agent cannot mint
+        // more of, instead of a caller-supplied identity_id.
+        return tool.handler(handlerArgs, callerIdentity);
       };
 
       const shouldBypassAuditIntegrity =
