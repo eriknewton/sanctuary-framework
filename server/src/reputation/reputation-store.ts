@@ -77,7 +77,6 @@ export interface Attestation {
 export interface StoredAttestation {
   attestation: Attestation;
   counterparty_attestation?: string;
-  counterparty_confirmed: boolean;
   recorded_at: string;
   /**
    * Provenance marker used by tier-weighted reads to decide whether a stored
@@ -596,10 +595,10 @@ export class ReputationStore {
 
     const stored: StoredAttestation = {
       attestation,
+      // A raw counterparty attachment is retained but never treated as a
+      // verified countersignature: there is no counterparty-signature verifier,
+      // so no confirmation flag is emitted (the presence-only flag was removed).
       counterparty_attestation: counterpartyAttestation,
-      // A raw attachment is not a verified countersignature over this
-      // interaction, so presence alone must not claim counterparty confirmation.
-      counterparty_confirmed: false,
       recorded_at: now,
       // Provably local provenance: this tier came from a handshake this
       // instance witnessed, so trustedSovereigntyTier leaves it unclamped.
@@ -946,7 +945,6 @@ export class ReputationStore {
       // trustworthy on this instance, which never witnessed that handshake.
       const stored: StoredAttestation = {
         attestation,
-        counterparty_confirmed: false,
         recorded_at: new Date().toISOString(),
         imported: true,
       };
