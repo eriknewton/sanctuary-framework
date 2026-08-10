@@ -424,6 +424,72 @@ export function summarizeEncryptedState(
   };
 }
 
+/**
+ * Structural read-health of the encrypted_state artifact, deliberately
+ * INDEPENDENT of {@link ExitBundleDeclaredRekeyMaterial} — see the
+ * CRITICAL SCOPING note on the class-level fix this type belongs to.
+ * `declared_rekey_material === "damaged"` also fires for a malformed
+ * `source_custody`/`legacy_kdf_params` block on a bundle whose entries ARE
+ * readable (`summarizeEncryptedState` above), and that bundle MUST stay
+ * verify-PASS: import rejects it for a typed, actionable credential reason
+ * (`SOURCE_CUSTODY_MALFORMED` / `SOURCE_KDF_PARAMS_MALFORMED`), never a
+ * crash, and `test/exit/exit-credential-path.test.ts` pins that PASS
+ * deliberately. `entry_count === null` is the one signal both verify and
+ * import agree names an artifact whose own contents cannot be read at all
+ * (LD2-01), so this type is keyed on that field alone.
+ */
+export type EncryptedStateStructuralHealth = "readable" | "entries_unreadable";
+
+function classifyEncryptedStateStructuralHealth(
+  state: ExitEncryptedStateSummary | undefined
+): EncryptedStateStructuralHealth | undefined {
+  if (state === undefined) return undefined;
+  return state.entry_count === null ? "entries_unreadable" : "readable";
+}
+
+/**
+ * CLASS INVARIANT (verify/import parity aggregator, LD2-01): fail CLOSED on
+ * any structural health value this function does not explicitly recognize
+ * as safe to pass. This is the mechanism, not a comment: three prior
+ * instances of "verify reports PASS while import fails closed" (rotation
+ * chain #1189, reputation-bundle signature #1194, and the damaged-entries
+ * case this function closes) were each patched one at a time by adding one
+ * more named boolean to a hand-written `&&` chain — a shape where a FOURTH
+ * instance is silently absent-by-omission unless someone remembers to
+ * extend the chain. A health value this switch does not recognize returns
+ * `failed: true`, never `false`: the default arm below is the fail-closed
+ * floor, held mechanically by a unit test that drives an out-of-union value
+ * through this function directly (server/test/exit/exit-verifier-aggregator
+ * .test.ts).
+ *
+ * Exported for that unit test only; it is an internal aggregator helper, not
+ * an MCP-facing or CLI-facing surface.
+ */
+export function encryptedStateSubVerdictFailed(
+  health: EncryptedStateStructuralHealth | undefined
+): boolean {
+  switch (health) {
+    case undefined:
+    case "readable":
+      return false;
+    case "entries_unreadable":
+      return true;
+    default: {
+      // Fail closed. Exhaustiveness over the DECLARED union is enforced at
+      // compile time by the `never` assignment below, but this arm is also
+      // LIVE at runtime for any value this switch was not updated to
+      // recognize — exactly the shape a future structural-health value
+      // would take if `classifyEncryptedStateStructuralHealth` grew a new
+      // case without a matching one here. Reverting this branch to
+      // `return false` is the fail-open mutation this function exists to
+      // rule out.
+      const unreachable: never = health;
+      void unreachable;
+      return true;
+    }
+  }
+}
+
 export async function readManifest(bundleDir: string): Promise<ExitBundleManifest> {
   const bytes = await readFileCustody(join(bundleDir, "manifest.json"), {
     verifyPathIdentity: true,
@@ -918,6 +984,25 @@ export async function verifyExitBundle(
         "passphrase re-key path cannot run. Re-export from the source fortress"
     );
   }
+  // Previously silent: legacy_kdf_params malformed warned (above) but the
+  // sibling source_custody malformed case (verifier.ts summarizeEncryptedState,
+  // sourceCustody === "malformed") pushed no warning at all, even though it is
+  // the SAME "signed, intact, but this re-key path is dead" fact about the
+  // artifact and import refuses it with SOURCE_CUSTODY_MALFORMED.
+  if (stateSummary?.source_custody === "malformed") {
+    warnings.push(
+      "encrypted state carries a malformed source_custody re-key block: the " +
+        "bundle is signed and intact, but its bundle re-key path cannot run. " +
+        "Re-export from the source fortress, or use the legacy passphrase path " +
+        "if valid source_key_derivation parameters are present"
+    );
+  }
+
+  // CLASS-LEVEL AGGREGATOR INPUT (LD2-01): the encrypted_state artifact's
+  // structural read-health, computed once here so the sub-verdict below and
+  // any future consumer share the same classification rather than each
+  // re-deriving `entry_count === null`.
+  const encryptedStateHealth = classifyEncryptedStateStructuralHealth(stateSummary);
 
   const publicKeysByDid = new Map<string, Uint8Array>();
   let identity: ExitBundleDetailedVerifierResult["identity"] | undefined;
@@ -1069,10 +1154,6 @@ export async function verifyExitBundle(
     reputation !== undefined && reputation.bundle_signature_valid !== true;
   const reputationAttestationFailed = (reputation?.invalid_attestations ?? 0) > 0;
   const reputationCompletenessFailed = reputation?.completeness === "mismatch";
-  const reputationFailed =
-    reputationBundleFailed ||
-    reputationAttestationFailed ||
-    reputationCompletenessFailed;
   const identityFailed = identity ? !identity.signature_valid : false;
   // EXIT-PASS-01: a present-but-invalid rotation chain is a verifier failure,
   // not descriptive metadata. `rotation` is undefined when the bundle carries
@@ -1098,37 +1179,71 @@ export async function verifyExitBundle(
     );
   }
 
-  // Full-sweep #77: route the specific failure cause so importers and
-  // operators see what went wrong without having to parse the warnings
-  // array. Priority ordering: identity (cryptographic-binding broken)
-  // beats reputation-bundle (provenance broken) beats completeness
-  // mismatch (signed manifest does not describe the body) beats
-  // individual attestation invalidity beats unverifiable signers
-  // (which is policy-relaxable via the explicit opt-in flag).
-  let detailedFailureClass:
-    | NonNullable<ExitBundleVerifierResult["failure_class"]>
-    | undefined;
-  if (identityFailed) {
-    detailedFailureClass = "identity_signature_invalid";
-  } else if (rotationFailed) {
-    detailedFailureClass = "rotation_chain_invalid";
-  } else if (reputationBundleFailed) {
-    detailedFailureClass = "reputation_bundle_signature_invalid";
-  } else if (reputationCompletenessFailed) {
-    detailedFailureClass = "reputation_completeness_mismatch";
-  } else if (reputationAttestationFailed) {
-    detailedFailureClass = "reputation_attestation_signature_invalid";
-  } else if (unverifiableFailed) {
-    detailedFailureClass = "reputation_unverifiable_attestations";
-  }
+  const entriesUnreadableFailed = encryptedStateSubVerdictFailed(
+    encryptedStateHealth
+  );
+
+  // CLASS-LEVEL AGGREGATOR (LD2-01 follow-up). `passed` is a reduction over
+  // this EXPLICIT, enumerated list of structural sub-verdicts, not a
+  // hand-written `&&` chain: every structural failure dimension this
+  // function can produce MUST appear below, and `passed` is defined so it
+  // can only see a failure that IS in the list. This absorbs the two prior
+  // one-instance fixes for the same class (#1189 rotation-chain-invalid,
+  // #1194 reputation-bundle-signature-unverifiable) by routing them through
+  // the same array rather than leaving them as separate ad-hoc terms.
+  //
+  // CONTRACT PIN (contracts/v1.1/exit-bundle-manifest.ts
+  // `ExitBundleVerifierResult["failure_class"]`): each `name` below is typed
+  // against that union via `ExitBundleFailureClass`, so a name here with no
+  // matching contract member is a compile error, not a silent drift.
+  //
+  // Priority order (full-sweep #77, preserved): identity
+  // (cryptographic-binding broken) beats rotation-chain beats
+  // reputation-bundle (provenance broken) beats completeness mismatch
+  // (signed manifest does not describe the body) beats individual
+  // attestation invalidity beats unverifiable signers (policy-relaxable via
+  // the explicit opt-in flag) beats the encrypted-state entries-unreadable
+  // class (LD2-01, least specific: the artifact's own contents cannot be
+  // read at all).
+  //
+  // The fail-closed property does NOT come from this array being complete —
+  // an entry simply missing from the array is exactly the omission this
+  // fix closes, and is caught by the verify/import differential test
+  // (server/test/exit/exit-verifier-aggregator.test.ts), not by anything
+  // here. It comes from each entry's OWN computation failing closed on
+  // whatever it does not positively recognize (see
+  // `encryptedStateSubVerdictFailed` above for the pattern).
+  const subVerdicts: { name: ExitBundleFailureClass; failed: boolean }[] = [
+    { name: "identity_signature_invalid", failed: identityFailed },
+    { name: "rotation_chain_invalid", failed: rotationFailed },
+    {
+      name: "reputation_bundle_signature_invalid",
+      failed: reputationBundleFailed,
+    },
+    {
+      name: "reputation_completeness_mismatch",
+      failed: reputationCompletenessFailed,
+    },
+    {
+      name: "reputation_attestation_signature_invalid",
+      failed: reputationAttestationFailed,
+    },
+    {
+      name: "reputation_unverifiable_attestations",
+      failed: unverifiableFailed,
+    },
+    {
+      name: "encrypted_state_entries_unreadable",
+      failed: entriesUnreadableFailed,
+    },
+  ];
+  const passed = subVerdicts.every((verdict) => !verdict.failed);
+  const detailedFailureClass = subVerdicts.find((verdict) => verdict.failed)
+    ?.name;
 
   return {
     version: "1.1",
-    passed:
-      !reputationFailed &&
-      !identityFailed &&
-      !unverifiableFailed &&
-      !rotationFailed,
+    passed,
     verified_at: new Date().toISOString(),
     manifest_path: join(root, "manifest.json"),
     manifest_hash: sha256Hex(manifestBytes),
