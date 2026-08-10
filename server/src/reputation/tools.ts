@@ -267,7 +267,18 @@ export function createReputationTools(
         const counterpartyDid = args.counterparty_did as string;
         // The weight reflects who makes the claim, not who it is about, so an
         // untrusted caller cannot borrow a verified counterparty's credibility.
-        const tierMeta = resolveTierByDid(identity.did, hsResults, true);
+        // REP-01: the signer (identity.did) is a LOCAL identity, so its
+        // credibility cannot come from this instance's own handshake map (a match
+        // there is a self-vouch). Cap it at self-attested. Passing exactly the
+        // signer DID is race-free vs a snapshot of identityManager.list() (no
+        // rotation window). The storage chokepoint (trustedSovereigntyTier)
+        // enforces the same cap at scoring for existing/other-caller records.
+        const tierMeta = resolveTierByDid(
+          identity.did,
+          hsResults,
+          true,
+          new Set([identity.did])
+        );
 
         let stored;
         try {
