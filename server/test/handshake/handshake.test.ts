@@ -9,7 +9,7 @@ import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import { derivePurposeKey } from "../../src/core/key-derivation.js";
 import { createIdentity } from "../../src/core/identity.js";
-import { toBase64url } from "../../src/core/encoding.js";
+import { toBase64url, fromBase64url } from "../../src/core/encoding.js";
 import { generateSHR } from "../../src/shr/generator.js";
 import {
   initiateHandshake,
@@ -452,6 +452,54 @@ describe("Sovereignty Handshake Protocol", () => {
         respondResult.session
       );
       expect(resultB.verified).toBe(true);
+    });
+
+    // Return a DIFFERENT base64url string that decodes to the SAME key bytes,
+    // by flipping the final char's unused low bits (fromBase64url is lenient).
+    // This is the encoding gap a string=== guard misses; sameSigningKey (DID of
+    // the decoded bytes) catches it.
+    function nonCanonicalReencode(b64url: string): string {
+      const bytes = fromBase64url(b64url);
+      const alphabet =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+      const head = b64url.slice(0, -1);
+      for (const c of alphabet) {
+        const candidate = head + c;
+        if (candidate === b64url) continue;
+        try {
+          const dec = fromBase64url(candidate);
+          if (dec.length === bytes.length && dec.every((v, i) => v === bytes[i])) {
+            return candidate;
+          }
+        } catch {
+          // not a valid encoding; keep looking
+        }
+      }
+      throw new Error("no non-canonical same-byte encoding found");
+    }
+
+    it("rejects a self-handshake whose signed_by is a NON-CANONICAL encoding of the same key", () => {
+      // Falsifiability guard for the byte-vs-string fix: reverting sameSigningKey
+      // to a plain signed_by === comparison lets this self-handshake through.
+      const agent = makeAgent();
+      const shr = agentSHR(agent);
+      const reencoded = nonCanonicalReencode(shr.signed_by);
+      expect(reencoded).not.toBe(shr.signed_by); // genuinely different string
+      const shrReenc: SignedSHR = { ...shr, signed_by: reencoded };
+
+      // Earliest boundary: the challenge carries the canonical SHR, the responder
+      // presents the non-canonically-encoded SHR of the SAME key.
+      const { challenge } = initiateHandshake(shr);
+      const result = respondToHandshake(
+        challenge,
+        shrReenc,
+        agent.identityManager as any,
+        agent.masterKey
+      );
+      expect("error" in result).toBe(true);
+      if ("error" in result) {
+        expect(result.error.toLowerCase()).toContain("self-handshake");
+      }
     });
   });
 });
