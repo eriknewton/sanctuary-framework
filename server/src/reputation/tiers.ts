@@ -154,8 +154,28 @@ export function resolveTier(
 export function resolveTierByDid(
   counterpartyDid: string,
   handshakeResults: Map<string, HandshakeResult>,
-  hasSanctuaryIdentity: boolean
+  hasSanctuaryIdentity: boolean,
+  localIdentityDids?: ReadonlySet<string>
 ): TierMetadata {
+  // REP-01 (register §Z RECHECK) — the self-vouch chokepoint. A handshake entry
+  // for a LOCALLY-HELD identity is a self-vouch, never independent verification:
+  // this map holds counterparties THIS instance verified, and a genuine remote
+  // peer's verification of one of our identities lives in the PEER's map, never
+  // ours. So a match against a local DID can only have been minted by handshaking
+  // ourselves — with an identical key, OR (the case the same-key protocol guard
+  // does NOT catch) two distinct keys the operator holds. Crediting it lets an
+  // agent launder its own attestations up to full signer tier. Never credit a
+  // local DID: a local signer resolves to self-attested regardless of any
+  // handshake entry, which is also the honest posture (its credibility is not
+  // established by our own map). This one check closes every self-vouch key
+  // variant; the protocol-level same-key rejection is defense-in-depth for the
+  // obviously-degenerate case. Callers pass the local DID set; when omitted (a
+  // genuine remote-counterparty lookup) the credit path is unchanged.
+  if (localIdentityDids?.has(counterpartyDid)) {
+    return hasSanctuaryIdentity
+      ? { sovereignty_tier: "self-attested" }
+      : { sovereignty_tier: "unverified" };
+  }
   for (const [instanceId, result] of handshakeResults) {
     try {
       const did = publicKeyToDid(fromBase64url(result.counterparty_shr.signed_by));

@@ -657,6 +657,67 @@ describe("Exit bundle hardening (full-sweep #54 + #55)", () => {
     expect(result.identity?.signature_valid).toBe(false);
   });
 
+  it("EXIT-PASS-01 class (loop-dry): verify FAILS on an UNVERIFIABLE reputation bundle signature", async () => {
+    // The bundle signature verdict is `boolean | "unverifiable"`. When the
+    // exporter's key cannot be resolved from the included identities the verdict
+    // is "unverifiable"; import rejects such a bundle, so the read-only verify
+    // must not report PASS on it (the EXIT-PASS-01 verify-lies shape). Pre-fix,
+    // `reputationBundleFailed` keyed on `=== false`, so "unverifiable" left
+    // `passed` true — this test fails on that code.
+    const source = await makeHarness();
+    await callTool(source.tools, "identity_create", { label: "rep-bundle-src" });
+    await callTool(source.tools, "reputation_record", {
+      interaction_id: "unverifiable-bundle-sig-001",
+      counterparty_did: "did:key:counterparty",
+      outcome: {
+        type: "transaction",
+        result: "completed",
+        metrics: { score: 100 },
+      },
+      context: "exit-hardening",
+    });
+
+    const bundleDir = await mkdtemp(join(tmpdir(), "sanctuary-exitpass-bundlesig-"));
+    tempDirs.push(bundleDir);
+    await exportFromSource(source, bundleDir);
+
+    // Sanity: an honest bundle PASSES with a positively-valid bundle signature.
+    const honest = await verifyExitBundle(bundleDir);
+    expect(honest.passed).toBe(true);
+    expect(honest.reputation?.bundle_signature_valid).toBe(true);
+
+    // Rewrite exporter_did to a DID whose key is NOT among the included
+    // identities: the verifier can no longer resolve the exporter key, so the
+    // bundle signature verdict is "unverifiable" (not merely false).
+    await tamperArtifactInternalField(
+      bundleDir,
+      "reputation_bundle",
+      (parsed) => ({
+        ...parsed,
+        exporter_did: "did:key:z6MkNotAnIncludedExporterKey0000000000000000",
+      }),
+      source
+    );
+
+    const result = await verifyExitBundle(bundleDir);
+    expect(result.reputation?.bundle_signature_valid).toBe("unverifiable");
+    expect(result.passed).toBe(false);
+    expect(result.failure_class).toBe("reputation_bundle_signature_invalid");
+  });
+
+  it("EXIT-PASS-01 class (loop-dry): a bundle with NO reputation still PASSES (no regression)", async () => {
+    // The unverifiable-bundle-sig failure only fires when a reputation bundle is
+    // present; a bundle with no reputation must not be dragged to FAIL.
+    const source = await makeHarness();
+    await callTool(source.tools, "identity_create", { label: "no-rep-src" });
+    const bundleDir = await mkdtemp(join(tmpdir(), "sanctuary-exitpass-norep-"));
+    tempDirs.push(bundleDir);
+    await exportFromSource(source, bundleDir);
+
+    const result = await verifyExitBundle(bundleDir);
+    expect(result.passed).toBe(true);
+  });
+
   it("M-02: verifier rejects a manifest re-bound to a different identity than public_identity", async () => {
     const sourceA = await makeHarness();
     await callTool(sourceA.tools, "identity_create", { label: "source-a" });

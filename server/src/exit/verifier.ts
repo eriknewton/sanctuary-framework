@@ -1055,7 +1055,18 @@ export async function verifyExitBundle(
     }
   }
 
-  const reputationBundleFailed = reputation?.bundle_signature_valid === false;
+  // EXIT-PASS-01 class (loop-dry follow-up): the bundle signature is
+  // `boolean | "unverifiable"`. An UNVERIFIABLE bundle signature (the exporter's
+  // key is not among the included identities) used to leave `passed` true while
+  // import rejected the same bundle (verifyReputationBundle throws) — the exact
+  // verify-lies shape EXIT-PASS-01 fixed for the rotation chain. Fail `passed`
+  // on anything that is not positively valid, but only when a reputation bundle
+  // is actually present (a bundle with no reputation must still PASS). There is
+  // no operator relaxation for a bad/unverifiable BUNDLE signature (unlike
+  // unverifiable per-attestation signers, which `acceptUnverifiableAttestations`
+  // relaxes separately below); import never admits one either.
+  const reputationBundleFailed =
+    reputation !== undefined && reputation.bundle_signature_valid !== true;
   const reputationAttestationFailed = (reputation?.invalid_attestations ?? 0) > 0;
   const reputationCompletenessFailed = reputation?.completeness === "mismatch";
   const reputationFailed =
