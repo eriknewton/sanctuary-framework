@@ -36,6 +36,11 @@ import {
   type ExitBundleVerifierResult,
 } from "../contracts/v1.1/exit-bundle-manifest.js";
 import { fromBase64url, stringToBytes } from "../core/encoding.js";
+import { publicKeyToDid } from "../core/identity.js";
+import {
+  verifyRotationChain,
+  type RotationChainInvalidReason,
+} from "../core/rotation-chain.js";
 import { parseKeyDerivationParams } from "../core/key-derivation.js";
 import { hash } from "../core/hashing.js";
 import { canonicalize, canonicalizeToBytes } from "../mesh/canonical-json.js";
@@ -165,6 +170,14 @@ export interface ExitBundleDetailedVerifierResult
     signature_valid: boolean;
     identity_id?: string;
     did?: string;
+    rotation?: {
+      hop_count: number;
+      chain_signature_verified: boolean;
+      terminates_at_current: boolean;
+      invalid_reason?: RotationChainInvalidReason;
+      invalid_detail?: string;
+      compromised_hops: number;
+    };
   };
   audit?: {
     receipt_count: number;
@@ -180,6 +193,7 @@ export interface ExitBundleDetailedVerifierResult
     verified_attestations: number;
     invalid_attestations: number;
     unverifiable_attestations: number;
+    first_unverifiable_signer_prefix?: string;
   };
 }
 
@@ -198,6 +212,7 @@ interface IdentityArtifactVerification {
   identity_id?: string;
   did?: string;
   public_key?: string;
+  rotation_history?: unknown;
 }
 
 interface IdentityBindingVerificationResult {
@@ -461,6 +476,7 @@ function verifyIdentityArtifact(
       typeof bundle.identity_id === "string" ? bundle.identity_id : undefined,
     did: typeof bundle.did === "string" ? bundle.did : undefined,
     public_key: publicKey,
+    rotation_history: bundle.rotation_history,
   };
 }
 
@@ -652,10 +668,12 @@ function verifyReputationArtifact(
   let verified = 0;
   let invalid = 0;
   let unverifiable = 0;
+  let firstUnverifiableSignerPrefix: string | undefined;
   for (const attestation of attestations) {
     const signerKey = publicKeysByDid.get(attestation.signer);
     if (!signerKey) {
       unverifiable++;
+      firstUnverifiableSignerPrefix ??= attestation.signer.slice(0, 24);
       continue;
     }
     const ok = ed25519.verify(
@@ -677,6 +695,9 @@ function verifyReputationArtifact(
     verified_attestations: verified,
     invalid_attestations: invalid,
     unverifiable_attestations: unverifiable,
+    ...(firstUnverifiableSignerPrefix !== undefined
+      ? { first_unverifiable_signer_prefix: firstUnverifiableSignerPrefix }
+      : {}),
   };
 }
 
@@ -902,18 +923,64 @@ export async function verifyExitBundle(
   let identity: ExitBundleDetailedVerifierResult["identity"] | undefined;
   const identityVerification = identityBindingVerification.identityVerification;
   if (identityVerification) {
+    let rotation: NonNullable<ExitBundleDetailedVerifierResult["identity"]>["rotation"];
+    if (
+      identityVerification.identity_id !== undefined &&
+      identityVerification.public_key !== undefined
+    ) {
+      const rotationResult = verifyRotationChain({
+        identityId: identityVerification.identity_id,
+        currentPublicKey: identityVerification.public_key,
+        rotationHistory: identityVerification.rotation_history,
+      });
+      rotation =
+        rotationResult.status === "verified"
+          ? {
+              hop_count: rotationResult.chain.hop_count,
+              chain_signature_verified: true,
+              terminates_at_current: true,
+              compromised_hops: rotationResult.chain.retired.filter(
+                (retired) => retired.compromised
+              ).length,
+            }
+          : {
+              hop_count: Array.isArray(identityVerification.rotation_history)
+                ? identityVerification.rotation_history.length
+                : 0,
+              chain_signature_verified: false,
+              terminates_at_current:
+                rotationResult.reason !== "rotation_chain_non_terminating",
+              invalid_reason: rotationResult.reason,
+              invalid_detail: rotationResult.detail,
+              compromised_hops: 0,
+            };
+    }
     identity = {
       signature_valid: identityVerification.signature_valid,
       identity_id: identityVerification.identity_id,
       did: identityVerification.did,
+      ...(rotation !== undefined ? { rotation } : {}),
     };
     // The pre-signature binding gate above proves this key is the manifest
     // identity's key before any reputation verifier can trust it by DID.
     if (identityVerification.did && identityVerification.public_key) {
-      publicKeysByDid.set(
-        identityVerification.did,
-        fromBase64url(identityVerification.public_key)
-      );
+      const currentPublicKey = fromBase64url(identityVerification.public_key);
+      publicKeysByDid.set(identityVerification.did, currentPublicKey);
+      if (
+        identityVerification.identity_id !== undefined &&
+        identityVerification.rotation_history !== undefined
+      ) {
+        const rotationResult = verifyRotationChain({
+          identityId: identityVerification.identity_id,
+          currentPublicKey: identityVerification.public_key,
+          rotationHistory: identityVerification.rotation_history,
+        });
+        if (rotationResult.status === "verified") {
+          for (const retired of rotationResult.chain.retired) {
+            publicKeysByDid.set(publicKeyToDid(retired.public_key), retired.public_key);
+          }
+        }
+      }
     }
   }
 
@@ -962,7 +1029,10 @@ export async function verifyExitBundle(
     }
     if (reputation.unverifiable_attestations > 0) {
       warnings.push(
-        `${reputation.unverifiable_attestations} reputation attestation(s) have unknown signer public keys`
+        `${reputation.unverifiable_attestations} reputation attestation(s) have unknown signer public keys` +
+          (reputation.first_unverifiable_signer_prefix !== undefined
+            ? `; first signer DID prefix: ${reputation.first_unverifiable_signer_prefix}`
+            : "")
       );
     }
     if (reputation.invalid_attestations > 0) {

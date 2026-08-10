@@ -105,7 +105,7 @@ export function legacyPublicKeyToDid(publicKey: Uint8Array): string {
   return `did:key:z${toBase64url(multicodec)}`;
 }
 
-function assertEd25519PublicKey(publicKey: Uint8Array): void {
+export function assertEd25519PublicKey(publicKey: Uint8Array): void {
   if (publicKey.length !== ED25519_PUBLIC_KEY_LENGTH) {
     throw new RangeError(
       `Ed25519 public key must be ${ED25519_PUBLIC_KEY_LENGTH} bytes`
@@ -268,6 +268,9 @@ export function rotateKeys(
   const now = new Date().toISOString();
 
   // Create rotation event
+  // CONTRACT PIN (server/src/core/rotation-chain.ts `rotationEventSigningBytes`):
+  // this object literal's field order is the signature preimage and must match
+  // the verifier exactly because `JSON.stringify` is order-sensitive.
   const eventData = JSON.stringify({
     old_public_key: storedIdentity.public_key,
     new_public_key: toBase64url(newPublicKey),

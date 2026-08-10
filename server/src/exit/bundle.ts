@@ -62,8 +62,14 @@ import { generateRandomKey } from "../core/random.js";
 import {
   sign as identitySign,
   verify as identityVerify,
+  publicKeyToDid,
   type StoredIdentity,
 } from "../core/identity.js";
+import {
+  verifyRotationChain,
+  type RotationChainInvalidReason,
+  type VerifiedRotationChain,
+} from "../core/rotation-chain.js";
 import {
   ReputationStore,
   ReputationBundleVerificationError,
@@ -513,6 +519,12 @@ export interface ImportExitBundleOptions {
    */
   skipDidWebVerify?: boolean;
   /**
+   * Operator opt-in for importing entries whose only valid source signature is
+   * a key retired by a compromised-reason rotation. CLI surface:
+   * `--accept-compromised-rotation-keys`.
+   */
+  acceptCompromisedRotationKeys?: boolean;
+  /**
    * Recognition-Layer Path C primary build 2: optional fetcher
    * override for tests. Defaults to globalThis.fetch via the did:web
    * foundation's resolver. Production callers leave undefined.
@@ -576,6 +588,15 @@ export interface ImportExitBundleResult {
     invalid_attestations: number;
     unverifiable_attestations: number;
   };
+  rotation?: {
+    identity_id: string;
+    hop_count: number;
+    chain_signature_verified: boolean;
+    compromised_hops: number;
+    entries_admitted_by_current_key: number;
+    entries_admitted_by_retired_key: number;
+    entries_admitted_by_compromised_retired_key: number;
+  };
   staged_artifacts: string[];
   warnings: string[];
   unsupported_artifacts: string[];
@@ -608,6 +629,21 @@ function stateImportIncompleteMessage(
     "Refusing activation and rolling back staged artifacts; inspect or " +
     "re-export the source bundle before retrying."
   );
+}
+
+function stateImportIncompleteMessageWithRotationKeys(
+  state: ImportExitBundleResult["state"],
+  publicKeysByIdentityId: Map<string, SourceIdentityPublicKeyCandidate[]>
+): string {
+  const base = stateImportIncompleteMessage(state);
+  const keyCounts = [...publicKeysByIdentityId.values()].map(
+    (candidates) => candidates.length
+  );
+  const maxKeysTried = keyCounts.length > 0 ? Math.max(...keyCounts) : 0;
+  return maxKeysTried > 1
+    ? base +
+        ` Verified rotation history was present; signature checks tried ${maxKeysTried} key candidates (current plus ${maxKeysTried - 1} retired) before refusing.`
+    : base;
 }
 
 export class ExitBundleStateImportIncompleteError extends ExitBundleImportError {
@@ -1448,17 +1484,121 @@ function validateExportDidWeb(
   };
 }
 
+interface SourceIdentityPublicKeyCandidate {
+  publicKey: Uint8Array;
+  source: "current" | "retired";
+  retiredIndex?: number;
+  compromised: boolean;
+}
+
+type IdentityPublicKeyResolution =
+  | {
+      status: "verified";
+      byIdentityId: Map<string, SourceIdentityPublicKeyCandidate[]>;
+      byDid: Map<string, Uint8Array>;
+      chain: VerifiedRotationChain;
+    }
+  | {
+      status: "invalid";
+      reason: RotationChainInvalidReason;
+      detail: string;
+      identityId: string;
+      hopCount: number;
+    };
+
 function publicKeysFromIdentityArtifact(
   identityArtifact: ExitPublicIdentityArtifact
-): {
-  byIdentityId: Map<string, Uint8Array>;
-  byDid: Map<string, Uint8Array>;
-} {
-  const pubkey = fromBase64url(identityArtifact.bundle.publicKey);
+): IdentityPublicKeyResolution {
+  const chainResult = verifyRotationChain({
+    identityId: identityArtifact.bundle.identity_id,
+    currentPublicKey: identityArtifact.bundle.publicKey,
+    rotationHistory: identityArtifact.bundle.rotation_history,
+  });
+  if (chainResult.status !== "verified") {
+    return {
+      status: "invalid",
+      reason: chainResult.reason,
+      detail: chainResult.detail,
+      identityId: identityArtifact.bundle.identity_id,
+      hopCount: Array.isArray(identityArtifact.bundle.rotation_history)
+        ? identityArtifact.bundle.rotation_history.length
+        : 0,
+    };
+  }
+
+  const candidates: SourceIdentityPublicKeyCandidate[] = [
+    {
+      publicKey: chainResult.chain.current_public_key,
+      source: "current",
+      compromised: false,
+    },
+    ...chainResult.chain.retired.map((retired, index) => ({
+      publicKey: retired.public_key,
+      source: "retired" as const,
+      retiredIndex: index + 1,
+      compromised: retired.compromised,
+    })),
+  ];
+  const byDid = new Map<string, Uint8Array>([
+    [identityArtifact.bundle.did, chainResult.chain.current_public_key],
+  ]);
+  for (const retired of chainResult.chain.retired) {
+    byDid.set(publicKeyToDid(retired.public_key), retired.public_key);
+  }
   return {
-    byIdentityId: new Map([[identityArtifact.bundle.identity_id, pubkey]]),
-    byDid: new Map([[identityArtifact.bundle.did, pubkey]]),
+    status: "verified",
+    byIdentityId: new Map([[identityArtifact.bundle.identity_id, candidates]]),
+    byDid,
+    chain: chainResult.chain,
   };
+}
+
+function rotationChainRefusalMessage(
+  result: Extract<IdentityPublicKeyResolution, { status: "invalid" }>
+): string {
+  return (
+    `rotation chain unverifiable for identity ${result.identityId}: ` +
+    `${result.reason} (${result.detail}; hop_count=${result.hopCount}). ` +
+    "Keep the source fortress intact and re-export after verifying its identity " +
+    "rotation history."
+  );
+}
+
+function compromisedRetiredSignatureUse(
+  encryptedState: ExitEncryptedStateBundle | null,
+  publicKeysByIdentityId: Map<string, SourceIdentityPublicKeyCandidate[]>
+): { count: number; firstRetiredIndex?: number } {
+  let count = 0;
+  let firstRetiredIndex: number | undefined;
+  for (const item of encryptedState?.entries ?? []) {
+    if (item.namespace.startsWith("_") || isReservedNamespace(item.namespace)) {
+      continue;
+    }
+    const candidates = publicKeysByIdentityId.get(item.entry.kid) ?? [];
+    if (candidates.length === 0) continue;
+    let payload: Uint8Array;
+    let signature: Uint8Array;
+    try {
+      payload = fromBase64url(item.entry.payload.ct);
+      signature = fromBase64url(item.entry.sig);
+    } catch {
+      continue;
+    }
+    const matching = candidates.filter((candidate) =>
+      identityVerify(payload, signature, candidate.publicKey)
+    );
+    if (matching.some((candidate) => candidate.compromised)) {
+      const acceptedByNonCompromised = matching.some(
+        (candidate) => !candidate.compromised
+      );
+      if (!acceptedByNonCompromised) {
+        count++;
+        firstRetiredIndex ??= matching.find((candidate) => candidate.compromised)
+          ?.retiredIndex;
+      }
+    }
+  }
+  return firstRetiredIndex === undefined ? { count } : { count, firstRetiredIndex };
 }
 
 async function conflictReport(
@@ -1952,7 +2092,12 @@ async function rekeyState(
   encryptedState: ExitEncryptedStateBundle,
   opts: ImportExitBundleOptions,
   sourceMasterKey: Uint8Array,
-  publicKeysByIdentityId: Map<string, Uint8Array>,
+  publicKeysByIdentityId: Map<string, SourceIdentityPublicKeyCandidate[]>,
+  rotationStats: {
+    entriesAdmittedByCurrentKey: number;
+    entriesAdmittedByRetiredKey: number;
+    entriesAdmittedByCompromisedRetiredKey: number;
+  },
   /**
    * Accumulator threaded by importExitBundle so the outer cleanup path
    * can remove every entry rekeyState successfully wrote prior to a
@@ -2000,21 +2145,37 @@ async function rekeyState(
       skipped++;
       continue;
     }
-    const signerPubkey = publicKeysByIdentityId.get(item.entry.kid);
-    if (!signerPubkey) {
+    const signerPubkeys = publicKeysByIdentityId.get(item.entry.kid);
+    if (!signerPubkeys || signerPubkeys.length === 0) {
       skippedUnknownKid++;
       skipped++;
       continue;
     }
-    const sourceSigValid = identityVerify(
-      fromBase64url(item.entry.payload.ct),
-      fromBase64url(item.entry.sig),
-      signerPubkey
+    const admittingKey = signerPubkeys.find((candidate) =>
+      identityVerify(
+        fromBase64url(item.entry.payload.ct),
+        fromBase64url(item.entry.sig),
+        candidate.publicKey
+      )
     );
-    if (!sourceSigValid) {
+    if (!admittingKey) {
       skippedInvalidSig++;
       skipped++;
       continue;
+    }
+    if (
+      admittingKey.source === "retired" &&
+      admittingKey.compromised &&
+      opts.acceptCompromisedRotationKeys !== true
+    ) {
+      throw new ExitBundleImportError(
+        "COMPROMISED_ROTATION_KEY_REFUSED",
+        `Refusing to import state entry ${item.namespace}/${item.key}: its ` +
+          `source signature verifies only under retired rotation key ` +
+          `retired-${admittingKey.retiredIndex ?? "unknown"}, whose rotation ` +
+          `reason declares compromise. Re-run only if the operator explicitly ` +
+          `accepts that risk with --accept-compromised-rotation-keys.`,
+      );
     }
 
     const exists = await opts.storage.exists(item.namespace, item.key);
@@ -2081,10 +2242,26 @@ async function rekeyState(
           ...(item.entry.metadata.tags ?? []),
           "exit-import",
           `source:${item.entry.kid}`,
+          ...(admittingKey.source === "retired"
+            ? [
+                `source-key:retired-${admittingKey.retiredIndex ?? "unknown"}`,
+                ...(admittingKey.compromised
+                  ? ["source-key:compromised-rotation"]
+                  : []),
+              ]
+            : []),
         ],
       }
     );
     imported++;
+    if (admittingKey.source === "current") {
+      rotationStats.entriesAdmittedByCurrentKey++;
+    } else {
+      rotationStats.entriesAdmittedByRetiredKey++;
+      if (admittingKey.compromised) {
+        rotationStats.entriesAdmittedByCompromisedRetiredKey++;
+      }
+    }
     importedRekeyEntries?.push({ namespace: item.namespace, key: item.key });
   }
 
@@ -2178,7 +2355,10 @@ export async function importExitBundle(
     unsupported_artifacts: verification.unsupported_artifacts,
   });
 
-  if (!verification.passed) {
+  if (
+    !verification.passed &&
+    verification.failure_class !== "reputation_unverifiable_attestations"
+  ) {
     return notVerifiedResult(
       0,
       verification.reputation?.unverifiable_attestations ?? 0
@@ -2193,13 +2373,6 @@ export async function importExitBundle(
     manifest,
     "public_identity"
   );
-  if ((identityArtifact?.json.bundle.rotation_history?.length ?? 0) > 0) {
-    // An unconsumed rotation history must be surfaced, never reported as a successful import.
-    throw new ExitBundleImportError(
-      "ROTATION_HISTORY_UNSUPPORTED",
-      "this bundle is from a fortress that rotated its identity key; importing it would lose pre-rotation state because this importer cannot consume rotation_history yet. Keep the source fortress intact and re-export after Sanctuary supports rotation-history replay; do not activate this bundle into a destination fortress."
-    );
-  }
   const encryptedState = await loadExitArtifact<ExitEncryptedStateBundle>(
     opts.bundleDir,
     manifest,
@@ -2234,7 +2407,50 @@ export async function importExitBundle(
 
   const publicKeys = identityArtifact
     ? publicKeysFromIdentityArtifact(identityArtifact.json)
-    : { byIdentityId: new Map<string, Uint8Array>(), byDid: new Map<string, Uint8Array>() };
+    : {
+        status: "verified" as const,
+        byIdentityId: new Map<string, SourceIdentityPublicKeyCandidate[]>(),
+        byDid: new Map<string, Uint8Array>(),
+        chain: {
+          identity_id: manifest.body.identity_binding.identity_id,
+          current_public_key: new Uint8Array(),
+          retired: [],
+          hop_count: 0,
+        },
+      };
+  if (publicKeys.status === "invalid") {
+    // INVARIANT: a bundle whose rotation history cannot be consumed must fail
+    // before import can fall back to current-key-only verification and report a
+    // partial PASS over silently dropped pre-rotation data.
+    throw new ExitBundleImportError(
+      "ROTATION_CHAIN_UNVERIFIABLE",
+      rotationChainRefusalMessage(publicKeys)
+    );
+  }
+  if (!verification.passed) {
+    return notVerifiedResult(
+      0,
+      verification.reputation?.unverifiable_attestations ?? 0
+    );
+  }
+
+  const compromisedUse = compromisedRetiredSignatureUse(
+    encryptedState?.json ?? null,
+    publicKeys.byIdentityId
+  );
+  if (
+    compromisedUse.count > 0 &&
+    opts.acceptCompromisedRotationKeys !== true
+  ) {
+    throw new ExitBundleImportError(
+      "COMPROMISED_ROTATION_KEY_REFUSED",
+      `${compromisedUse.count} state entr${compromisedUse.count === 1 ? "y" : "ies"} ` +
+        "verify only under a key retired by a compromised-reason rotation " +
+        `(first retired key: retired-${compromisedUse.firstRetiredIndex ?? "unknown"}). ` +
+        "Refusing by default. Re-run only if the operator explicitly accepts " +
+        "that risk with --accept-compromised-rotation-keys."
+    );
+  }
 
   const reputationStore = reputationArtifact
     ? opts.reputationStore ?? new ReputationStore(opts.storage, opts.masterKey)
@@ -2531,6 +2747,11 @@ export async function importExitBundle(
     invalid_attestations: 0,
     unverifiable_attestations: verification.reputation?.unverifiable_attestations ?? 0,
   };
+  const rotationStats = {
+    entriesAdmittedByCurrentKey: 0,
+    entriesAdmittedByRetiredKey: 0,
+    entriesAdmittedByCompromisedRetiredKey: 0,
+  };
   let stateResult: ImportExitBundleResult["state"];
   // Resolved INSIDE the try block: a fail-closed source-credential error
   // (SOURCE_CREDENTIAL_INVALID / SOURCE_KEY_UNAVAILABLE / malformed
@@ -2652,6 +2873,7 @@ export async function importExitBundle(
               opts,
               sourceMasterKey,
               publicKeys.byIdentityId,
+              rotationStats,
               importedRekeyEntries
             )
           : {
@@ -2684,7 +2906,13 @@ export async function importExitBundle(
     }
     if (stateHasNonConflictSkippedEntries(stateResult)) {
       // A dropped state entry must be surfaced, never reported as a successful import.
-      throw new ExitBundleStateImportIncompleteError(stateResult);
+      throw new ExitBundleStateImportIncompleteError(
+        stateResult,
+        stateImportIncompleteMessageWithRotationKeys(
+          stateResult,
+          publicKeys.byIdentityId
+        )
+      );
     }
     if (stateSkippedOnlyConflicts(stateResult)) {
       importWarnings.push(
@@ -2719,6 +2947,28 @@ export async function importExitBundle(
       state_imported_keys: stateResult.imported_keys,
       reputation_imported_attestations: reputationResult.imported_attestations,
     });
+    if (identityArtifact && publicKeys.chain.hop_count > 0) {
+      await opts.auditLog.appendCritical({
+        layer: "l1",
+        operation: "exit_bundle_rotation_chain_consumed",
+        identity_id: identityArtifact.json.bundle.identity_id,
+        result: "success",
+        details: {
+          hop_count: publicKeys.chain.hop_count,
+          entries_admitted_by_current_key:
+            rotationStats.entriesAdmittedByCurrentKey,
+          entries_admitted_by_retired_key:
+            rotationStats.entriesAdmittedByRetiredKey,
+          compromised_hops: publicKeys.chain.retired.filter(
+            (retired) => retired.compromised
+          ).length,
+          entries_admitted_by_compromised_retired_key:
+            rotationStats.entriesAdmittedByCompromisedRetiredKey,
+          accept_compromised_rotation_keys:
+            opts.acceptCompromisedRotationKeys === true,
+        },
+      });
+    }
     await opts.auditLog.flush();
   } catch (err) {
     const cleanup = await restoreStorageSnapshots(
@@ -2795,6 +3045,24 @@ export async function importExitBundle(
     conflicts,
     state: stateResult,
     reputation: reputationResult,
+    ...(identityArtifact && publicKeys.chain.hop_count > 0
+      ? {
+          rotation: {
+            identity_id: identityArtifact.json.bundle.identity_id,
+            hop_count: publicKeys.chain.hop_count,
+            chain_signature_verified: true,
+            compromised_hops: publicKeys.chain.retired.filter(
+              (retired) => retired.compromised
+            ).length,
+            entries_admitted_by_current_key:
+              rotationStats.entriesAdmittedByCurrentKey,
+            entries_admitted_by_retired_key:
+              rotationStats.entriesAdmittedByRetiredKey,
+            entries_admitted_by_compromised_retired_key:
+              rotationStats.entriesAdmittedByCompromisedRetiredKey,
+          },
+        }
+      : {}),
     staged_artifacts: stagedArtifacts,
     warnings: [...verification.warnings, ...importWarnings],
     unsupported_artifacts: verification.unsupported_artifacts,
