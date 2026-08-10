@@ -13,8 +13,9 @@
  * Each fix closed its own instance and left the SHAPE open: a fourth
  * dimension the verifier learns to classify, and nobody remembers to fold
  * into `passed`, reproduces the exact same bug. `server/src/exit/verifier.ts`
- * now derives `passed` from an explicit, enumerated `subVerdicts` array
- * instead (see the CLASS-LEVEL AGGREGATOR comment there); this file is the
+ * now derives `passed` from a `Record` keyed over the entire
+ * `ExitBundleFailureClass` union (see the CLASS-LEVEL AGGREGATOR comment
+ * there), so omitting a member is a compile error; this file is the
  * differential that HOLDS that structure, by driving every structural
  * damage/invalidity the verifier can classify through both a real
  * `verifyExitBundle` and a real `importExitBundle` and asserting the
