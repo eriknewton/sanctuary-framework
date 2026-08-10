@@ -228,17 +228,43 @@ export function createHandshakeTools(
   handshakeResults: ReadonlyMap<string, HandshakeResult>;
   // Per-origin accounting (AGENTS.md rule 8, MUST-FIX 1 RECHECK):
   // counterparty_id -> the AGENT-SESSION PRINCIPAL (`callerIdentity`,
-  // resolved through `resolveSessionOrigin`) that recorded that entry —
-  // NEVER the local Sanctuary identity that signed our side (caller-
-  // mintable via `identity_create`; see MAX_HANDSHAKE_RESULTS_PER_ORIGIN's
-  // doc for why that would defeat the quota). Federation registration
-  // reads this to attribute a peer to the SAME session principal whose
-  // quota it should count against (see MAX_FEDERATION_PEERS_PER_ORIGIN in
-  // federation/registry.ts) — `HandshakeResult` itself carries no field for
-  // "which session recorded me," so this is the one place that information
-  // exists. REQUIRED at federation/tools.ts (not optional — MUST-FIX 2):
-  // an omitted map there must never mean "skip the quota."
+  // resolved through `resolveSessionOrigin`) that FIRST created that
+  // entry. This is `handshakeResults`'s own BoundedMap `origins` (see
+  // `originsView()`, core/bounded-map.ts) — the IMMUTABLE ALLOCATION
+  // origin, fixed forever at first insert and deliberately NEVER
+  // reattributed on update (MUST-FIX 3, fix-round-2), so it feeds only
+  // `handshakeResults`'s OWN per-origin quota
+  // (`MAX_HANDSHAKE_RESULTS_PER_ORIGIN`, checked inside
+  // `recordHandshakeResult` below). NOT what federation reads for its
+  // registration charge — see `handshakeResultWriterOrigins` below for
+  // that, and for why the two questions need different answers.
   handshakeResultOrigins: ReadonlyMap<string, string>;
+  // FEDERATION-FACING WRITER accounting (MUST-FIX 2, fix-round-3). A
+  // SEPARATE map from `handshakeResultOrigins` above: updated on EVERY
+  // successful `recordHandshakeResult` write, insert OR update — "which
+  // session's WRITE produced the result CURRENTLY stored for this
+  // counterparty_id," not "which session's write claimed the slot
+  // first." federation/tools.ts's register handler reads THIS map (never
+  // `handshakeResultOrigins`) to decide whose per-origin registration
+  // quota (`MAX_FEDERATION_PEERS_PER_ORIGIN`, federation/registry.ts) a
+  // new peer counts against. The split exists because "first writer" and
+  // "verified writer" are the same session in the common case but can
+  // diverge under attack: `handshakeResultOrigins` staying fixed at first
+  // insert (by design, to stop the framing/evasion attack MUST-FIX 3
+  // closed) means an attacker who PREVIEWS a victim's counterparty FIRST
+  // (a cheap, unverified `handshake_exchange` write — no real handshake
+  // required) would otherwise permanently pin that counterparty_id's
+  // charged origin to themselves; when the VICTIM later completes a REAL
+  // 4-step verified handshake for that SAME counterparty (an UPDATE, per
+  // BoundedMap's update path), federation would charge the victim's
+  // genuine registration to the ATTACKER's quota — letting an attacker
+  // who has exhausted their own quota with unrelated pre-previews deny a
+  // victim's unrelated, legitimate registration. `handshakeResultWriterOrigins`
+  // tracks the CURRENT writer instead, so that charge always lands on
+  // whoever actually produced the verified result being registered.
+  // REQUIRED at federation/tools.ts (not optional — MUST-FIX 2, both
+  // rounds): an omitted map there must never mean "skip the quota."
+  handshakeResultWriterOrigins: ReadonlyMap<string, string>;
 } {
   const autoPublishHandshakes = options?.autoPublishHandshakes ?? false;
   const verascoreUrl = options?.verascoreUrl ?? "https://verascore.ai";
@@ -301,6 +327,10 @@ export function createHandshakeTools(
   const SESSIONS_SATURATED_ERROR =
     "Handshake session store is at capacity; cannot start a new session " +
     "until an existing one completes, expires, or is aborted.";
+  const SESSIONS_AUDIT_UNAVAILABLE_ERROR =
+    "Handshake session store could not durably audit an eviction needed " +
+    "to admit this session; the store is not full, its audit trail is " +
+    "unavailable. Retry once the audit log recovers.";
 
   /**
    * Shared insert path for BOTH `handshake_initiate` and `handshake_respond`
@@ -328,16 +358,26 @@ export function createHandshakeTools(
   ): Promise<{ ok: true } | { ok: false; error: string; reason: HandshakeFailureReason }> {
     return (async () => {
       const origin = resolveSessionOrigin(callerIdentity);
-      const originQuotaExceeded =
-        sessions.originSize(origin) >= MAX_HANDSHAKE_SESSIONS_PER_ORIGIN;
-      const inserted = await sessions.set(session.session_id, session, origin);
-      if (!inserted) {
-        const reason: HandshakeFailureReason = originQuotaExceeded
-          ? "handshake_session_origin_quota_exceeded"
-          : "handshake_session_store_saturated";
-        const error = originQuotaExceeded
-          ? SESSION_ORIGIN_QUOTA_ERROR
-          : SESSIONS_SATURATED_ERROR;
+      // MUST-FIX 3 (fix-round-3): read the REAL refusal reason off THIS
+      // call's own result rather than reconstructing it from a pre-check
+      // (the fix-round-2 shape) — `set()` can now refuse for a THIRD
+      // reason (`audit_unavailable`) that a boolean-only pre-check
+      // (origin-quota-or-else-capacity) cannot distinguish from genuine
+      // saturation.
+      const result = await sessions.set(session.session_id, session, origin);
+      if (!result.ok) {
+        const reason: HandshakeFailureReason =
+          result.reason === "origin_quota"
+            ? "handshake_session_origin_quota_exceeded"
+            : result.reason === "audit_unavailable"
+              ? "handshake_session_audit_unavailable"
+              : "handshake_session_store_saturated";
+        const error =
+          result.reason === "origin_quota"
+            ? SESSION_ORIGIN_QUOTA_ERROR
+            : result.reason === "audit_unavailable"
+              ? SESSIONS_AUDIT_UNAVAILABLE_ERROR
+              : SESSIONS_SATURATED_ERROR;
         void auditLog.append(
           "l4",
           reason,
@@ -400,6 +440,10 @@ export function createHandshakeTools(
     `(limit ${MAX_HANDSHAKE_RESULTS_PER_ORIGIN}). This bounds one identity's ` +
     "share of the shared handshake-results store so it cannot exhaust the " +
     "space every identity draws from.";
+  const HANDSHAKE_RESULTS_AUDIT_UNAVAILABLE_ERROR =
+    "Handshake result store could not durably audit an eviction needed to " +
+    "record this handshake; the store is not full, its audit trail is " +
+    "unavailable. Retry once the audit log recovers.";
   const handshakeResults = new BoundedMap<string, HandshakeResult>({
     maxSize: MAX_HANDSHAKE_RESULTS,
     maxPerOrigin: MAX_HANDSHAKE_RESULTS_PER_ORIGIN,
@@ -430,13 +474,48 @@ export function createHandshakeTools(
           reason: "capacity",
         },
       });
+      // Keep handshakeResultWriterOrigins's key set a subset of
+      // handshakeResults's own (MUST-FIX 2, fix-round-3): without this,
+      // the writer-origin map would grow forever independent of
+      // handshakeResults's own bound — an entry counted here and never
+      // removed, even after the underlying handshake result it describes
+      // is gone, is exactly the unbounded-attacker-writable-collection
+      // class this whole file exists to close (AGENTS.md rule 8).
+      //
+      // CONDITIONAL, mirroring bounded-map.ts's own post-await
+      // reference re-validation (MUST-FIX 1): `onEvict` runs BEFORE
+      // bounded-map.ts's own post-await check that decides whether the
+      // eviction actually proceeds, so at this point the delete on
+      // `handshakeResults` has NOT happened yet and might still be
+      // aborted (a concurrent update to this SAME counterparty_id — e.g.
+      // a real verified handshake completing while this eviction's audit
+      // was in flight — replaces the value, and bounded-map.ts then
+      // refuses to delete it). Only remove the writer-origin entry when
+      // `handshakeResults` STILL holds the EXACT value object just
+      // audited for eviction: if a concurrent write already replaced it,
+      // that write's OWN call to `recordHandshakeResult` already (or will
+      // shortly) set `handshakeResultWriterOrigins` to ITS origin, and an
+      // unconditional delete here could run AFTER that set() and erase a
+      // legitimate concurrent registration's attribution instead of the
+      // stale one this eviction is actually about.
+      if (handshakeResults.get(evictedCounterpartyId) === evictedResult) {
+        handshakeResultWriterOrigins.delete(evictedCounterpartyId);
+      }
     },
-    // No onRefuse here: recordHandshakeResult below distinguishes
-    // origin-quota from global-capacity refusal itself (it can cheaply
-    // pre-check `originSize` before calling `set()`) and audits with the
-    // richer domain context (counterparty_id, the identity refused) — see
-    // that function.
+    // No onRefuse here: recordHandshakeResult below reads the reason
+    // directly off `handshakeResults.set()`'s own return value (MUST-FIX
+    // 3, fix-round-3 — no longer a pre-check reconstruction) and audits
+    // with the richer domain context (counterparty_id, the identity
+    // refused) — see that function.
   });
+
+  // FEDERATION-FACING WRITER accounting (MUST-FIX 2, fix-round-3) — see
+  // this doc repeated in full on `createHandshakeTools`'s return type
+  // above. Maintained ONLY by `recordHandshakeResult` below, updated on
+  // every successful write (insert or update), which is what makes it
+  // answer "who wrote the CURRENTLY stored value" rather than
+  // `handshakeResults`'s own `origins` map's "who wrote it FIRST."
+  const handshakeResultWriterOrigins = new Map<string, string>();
 
   const shrOpts: SHRGeneratorOptions = {
     config,
@@ -558,26 +637,29 @@ export function createHandshakeTools(
         return { ok: false, error: SELF_VOUCH_ERROR, reason: "self_vouch_local_did" };
       }
       const origin = resolveSessionOrigin(callerIdentity);
-      // Pre-check which refusal reason applies BEFORE calling set() (the same
-      // condition BoundedMap checks internally) purely for audit/error-message
-      // richness — set() itself only returns a boolean, and the two refusal
-      // reasons need different operator-facing text (rule 8: a flooding
-      // origin's OWN quota is a very different situation from the whole store
-      // being genuinely saturated with live peers).
-      const originQuotaExceeded =
-        handshakeResults.originSize(origin) >= MAX_HANDSHAKE_RESULTS_PER_ORIGIN;
-      const inserted = await handshakeResults.set(
+      // MUST-FIX 3 (fix-round-3): read the REAL refusal reason off THIS
+      // call's own `set()` result rather than reconstructing it from a
+      // pre-check (the fix-round-2 shape) — `set()` can now refuse for a
+      // THIRD reason (`audit_unavailable`) a boolean-only pre-check
+      // cannot distinguish from genuine saturation.
+      const setResult = await handshakeResults.set(
         result.counterparty_id,
         result,
         origin
       );
-      if (!inserted) {
-        const reason: HandshakeFailureReason = originQuotaExceeded
-          ? "handshake_results_origin_quota_exceeded"
-          : "handshake_results_saturated";
-        const error = originQuotaExceeded
-          ? HANDSHAKE_RESULTS_ORIGIN_QUOTA_ERROR
-          : HANDSHAKE_RESULTS_SATURATED_ERROR;
+      if (!setResult.ok) {
+        const reason: HandshakeFailureReason =
+          setResult.reason === "origin_quota"
+            ? "handshake_results_origin_quota_exceeded"
+            : setResult.reason === "audit_unavailable"
+              ? "handshake_results_audit_unavailable"
+              : "handshake_results_saturated";
+        const error =
+          setResult.reason === "origin_quota"
+            ? HANDSHAKE_RESULTS_ORIGIN_QUOTA_ERROR
+            : setResult.reason === "audit_unavailable"
+              ? HANDSHAKE_RESULTS_AUDIT_UNAVAILABLE_ERROR
+              : HANDSHAKE_RESULTS_SATURATED_ERROR;
         void auditLog.append(
           "l4",
           reason,
@@ -587,6 +669,12 @@ export function createHandshakeTools(
         );
         return { ok: false, error, reason };
       }
+      // FEDERATION-FACING WRITER accounting (MUST-FIX 2, fix-round-3): set
+      // on EVERY successful write, insert or update — see
+      // `handshakeResultWriterOrigins`'s doc for why this must track the
+      // CURRENT writer rather than staying fixed at first insert the way
+      // `handshakeResults`'s own (BoundedMap-internal) origin does.
+      handshakeResultWriterOrigins.set(result.counterparty_id, origin);
       return { ok: true };
     })();
   }
@@ -1418,6 +1506,7 @@ export function createHandshakeTools(
     tools,
     handshakeResults: handshakeResults.asReadonlyMap(),
     handshakeResultOrigins: handshakeResults.originsView(),
+    handshakeResultWriterOrigins,
   };
 }
 

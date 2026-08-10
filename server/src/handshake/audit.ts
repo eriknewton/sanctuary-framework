@@ -78,6 +78,17 @@ export type HandshakeFailureReason =
   // reached MAX_HANDSHAKE_SESSIONS_PER_ORIGIN in-flight sessions of its
   // own; refused before it could evict a DIFFERENT identity's session.
   | "handshake_session_origin_quota_exceeded"
+  // DISTINCT from `handshake_results_saturated` (MUST-FIX 3, fix-round-3):
+  // the shared `handshakeResults` map WAS at its global cap and DID pick a
+  // victim to evict, but the eviction's critical audit write never
+  // durably confirmed (rejected, or timed out — see
+  // core/bounded-map.ts's `BoundedMapRefuseReason` doc) — the map is not
+  // genuinely full of unevictable entries, the AUDIT TRAIL is what is
+  // unavailable, and an operator diagnosing the refusal needs to be able
+  // to tell those two apart.
+  | "handshake_results_audit_unavailable"
+  // Same distinction as above, for `sessions`'s eviction audit.
+  | "handshake_session_audit_unavailable"
   | "other";
 
 /** Reasons a handshake may be aborted (operator or transport). */

@@ -185,22 +185,42 @@ export class SentinelFindingStoreRefusedError extends Error {
 }
 
 /**
- * Bound on the ONE-TIME lazy index backfill (`ensureIndex`, see
- * MAX_SCANNED_RECORDS above) — a cost paid at most once per store instance
- * lifetime (amortized across every subsequent `listFindings`/`saveFinding`
- * call, never repeated per-request), not a per-call bound. 20000 = 4x
- * MAX_TRACKED_FINDINGS's default (5000): headroom for records written
- * before this store's ceiling became a hard refuse (MUST-FIX 4, fix-round-2
- * — a store that predates this change, or whose retention window still
- * holds pre-fix overshoot records, can be modestly larger than
- * MAX_TRACKED_FINDINGS) while still bounding the backfill to a constant
- * instead of truly unbounded storage-namespace size. A cold start with MORE
- * than this many retained records backfills an INCOMPLETE index for that
- * one process lifetime (see `buildIndex`'s COMPLETE-REBUILD note) — bounded
- * by the storage listing's own order, not by decrypt cost, so widening this
- * constant is a cheap knob if a real deployment ever needs it.
+ * REMOVED (MUST-FIX 5, fix-round-3): a `MAX_INDEX_BACKFILL_RECORDS` constant
+ * used to slice the ONE-TIME lazy index backfill (`ensureIndex`) to the
+ * first N lexicographically-listed records, sized as a multiple of
+ * MAX_TRACKED_FINDINGS's DEFAULT (5000). Two problems, both closed by
+ * making `buildIndex` read every listed record instead of a slice:
+ *
+ * 1. `maxTrackedFindings` is a per-INSTANCE override
+ *    (`SentinelFindingStoreOptions.maxTrackedFindings`, used by tests to
+ *    drive the real ceiling in a handful of iterations instead of
+ *    thousands) — a FIXED module-level slice could not track an
+ *    instance's real ceiling. An instance constructed with a LARGER
+ *    override than the constant the old slice was derived from would
+ *    silently cold-start with an INCOMPLETE index: a retained record past
+ *    the slice, but still within THAT instance's own
+ *    `maxTrackedFindings`, was invisible to `listFindings`/
+ *    `listFindingMetadata`/`originCount` until the next write happened to
+ *    touch it — a filtered post-restart query could miss a record that
+ *    genuinely still exists and is still within the store's own bound,
+ *    which is exactly the "flood in a recent window hides an older
+ *    matching record" class this file's index exists to close one layer
+ *    up (see MAX_SCANNED_RECORDS's doc).
+ * 2. Even pinning the slice to `this.maxTrackedFindings` at call time
+ *    (rather than a module constant) would still be provably incomplete
+ *    for the ONE disclosed residual case: pre-fix overshoot records
+ *    written before MUST-FIX 4 made the ceiling a hard refuse. A slice
+ *    sized off the CURRENT ceiling cannot bound a count that predates the
+ *    ceiling existing.
+ *
+ * `buildIndex` below reads every record `storage.list()` returns for the
+ * namespace — this store's own MAX_TRACKED_FINDINGS + per-origin quota
+ * (MUST-FIX 4) already bound how large that listing can grow GOING
+ * FORWARD; the only residual cost is retained pre-fix overshoot still
+ * inside the retention window, which ages out on its own (30 days
+ * default) rather than needing a truncation that could hide a live
+ * record.
  */
-const MAX_INDEX_BACKFILL_RECORDS = 20_000;
 
 /**
  * CLASS-LEVEL guard: `pruneExpired()` fires once per fortress-unlock (see
@@ -346,10 +366,10 @@ export class SentinelFindingStore {
 
   /**
    * Lazily build the filter index from storage, exactly ONCE per store
-   * instance lifetime (see MAX_SCANNED_RECORDS's doc +
-   * MAX_INDEX_BACKFILL_RECORDS's derivation). Concurrent callers share the
-   * same in-flight build via `indexBuildPromise` rather than each kicking
-   * off a redundant full scan.
+   * instance lifetime (see MAX_SCANNED_RECORDS's doc and `buildIndex`'s
+   * COMPLETE-REBUILD note below). Concurrent callers share the same
+   * in-flight build via `indexBuildPromise` rather than each kicking off a
+   * redundant full scan.
    */
   private async ensureIndex(): Promise<void> {
     if (this.indexReady) return;
@@ -360,24 +380,27 @@ export class SentinelFindingStore {
   }
 
   /**
-   * COMPLETE-REBUILD NOTE (MUST-FIX 5, fix-round-2 RECHECK): this reads
-   * EVERY key the storage backend's `list()` returns for the namespace (not
-   * a truncated recency window), capped only by MAX_INDEX_BACKFILL_RECORDS —
-   * which is 4x MAX_TRACKED_FINDINGS's hard, going-forward ceiling (MUST-FIX
-   * 4), so any store built entirely under the current rules backfills
-   * completely; the only way to exceed the cap is retained pre-fix overshoot
-   * records still inside the retention window, which the doc on that
-   * constant covers. This is a genuine improvement over the fix-round-1
-   * shape, which read only the newest 20000 by LISTING ORDER with no
-   * relationship to the store's own bound.
+   * COMPLETE-REBUILD NOTE (MUST-FIX 5, fix-round-3): reads EVERY key the
+   * storage backend's `list()` returns for the namespace — no slice, no
+   * truncation. Completeness is by construction, not by a bound argued to
+   * be generous enough (see the REMOVED-constant doc above for why a
+   * fixed or even per-instance-derived slice could still be wrong): every
+   * record `list()` reports gets decoded and indexed, so a cold-started
+   * store's filter index always matches its actual retained record set,
+   * regardless of how a given instance configures `maxTrackedFindings` or
+   * how much pre-fix overshoot residue a long-lived store still carries.
+   * The one-time cost this pays is proportional to the namespace's actual
+   * size, not a constant — acceptable because it is paid ONCE per store
+   * instance lifetime (see `ensureIndex` above), not per request, and
+   * because MUST-FIX 4's hard ceiling + per-origin quota already bound how
+   * large that size can grow going forward.
    */
   private async buildIndex(): Promise<void> {
     const metas = await this.storage.list(
       SENTINEL_FINDING_NAMESPACE,
       SENTINEL_FINDING_KEY_PREFIX,
     );
-    const bounded = metas.slice(0, MAX_INDEX_BACKFILL_RECORDS);
-    for (const meta of bounded) {
+    for (const meta of metas) {
       const id = stripKeyPrefix(meta.key);
       if (id === null) continue;
       const raw = await this.storage.read(SENTINEL_FINDING_NAMESPACE, meta.key);
@@ -564,7 +587,7 @@ export class SentinelFindingStore {
    * see SATURATION_EVICT_SCAN_CAP's derivation.
    *
    * AWAITED CRITICAL AUDIT BEFORE DELETE (MUST-FIX 6, fix-round-2 RECHECK):
-   * when `auditLog` is configured, the reclamation audit is now
+   * when `auditLog` is configured, the reclamation INTENT is audited via
    * `appendCritical` (durable, round-trip-verified) and AWAITED before the
    * delete, not `void auditLog.append(...)` fire-and-forget after. If the
    * awaited write REJECTS, this ABORTS the whole reclamation scan and
@@ -577,6 +600,22 @@ export class SentinelFindingStore {
    * stays OPTIONAL (see `SentinelFindingStoreOptions.auditLog`'s doc — it
    * only gates observability, not the eviction guarantee); when absent,
    * reclamation proceeds exactly as before (no audit to await or fail).
+   *
+   * INTENT / COMPLETION SPLIT + RE-VERIFY-BEFORE-DELETE (MUST-FIX 4,
+   * fix-round-3): the pre-delete audit above records INTENT
+   * (`finding_store_expired_record_reclaim_started`), never
+   * `finding_store_expired_record_reclaimed` — that operation name is now
+   * reserved for the COMPLETION audit written AFTER `storage.delete()`
+   * resolves, tagged `success`/`failure` to match what actually happened.
+   * A delete failure after a successful intent write now produces an
+   * explicit `finding_store_expired_record_reclaim_failed` entry instead
+   * of a false success. Immediately before the delete, the record is
+   * RE-READ and re-checked against `cutoff`; if a concurrent `saveFinding`
+   * renewed it in the interim, the delete is skipped
+   * (`finding_store_expired_record_reclaim_abandoned`) and the scan moves
+   * to the next candidate, rather than deleting state a concurrent writer
+   * just legitimately extended. See the inline comment at the call site
+   * for the full reasoning on both defects this closes.
    */
   private async evictOldestExpired(metas: StorageEntryMeta[]): Promise<boolean> {
     const cutoff = this.now().toISOString();
@@ -594,27 +633,126 @@ export class SentinelFindingStore {
         const plaintext = decrypt(envelope, this.encryptionKey, aad);
         const persisted = JSON.parse(bytesToString(plaintext)) as PersistedFinding;
         if (persisted.retention_until <= cutoff) {
+          // INTENT -> RE-VERIFY -> DELETE -> COMPLETION (MUST-FIX 4,
+          // fix-round-3 — replaces a single pre-delete audit that recorded
+          // `result: "success"` for the RECLAMATION before the delete had
+          // even been attempted). Two distinct bugs that ordering hid:
+          //
+          // 1. FALSE SUCCESS ON DELETE FAILURE: the old audit entry
+          //    claimed `finding_store_expired_record_reclaimed` / success
+          //    BEFORE calling `storage.delete()`, which is itself
+          //    fallible and was never wrapped — a delete failure after
+          //    that point left a durable "success" record for a
+          //    reclamation that never actually happened, with no
+          //    corrective entry. Splitting into an INTENT audit (this
+          //    call, still `appendCritical`, still awaited and aborting
+          //    on rejection — the crash-safety property MUST-FIX 6
+          //    established is unchanged) and a separate COMPLETION audit
+          //    AFTER the delete resolves means a delete failure now
+          //    produces an intent record plus an explicit FAILURE record,
+          //    never an uncorrected false success.
+          // 2. CONCURRENT-REFRESH DELETION ON STALE STATE: `persisted` was
+          //    decoded from a `storage.read()` at the top of this loop
+          //    iteration; the awaited audit write below is a real async
+          //    gap during which a CONCURRENT `saveFinding` for this SAME
+          //    finding_id could legitimately renew it (extend
+          //    `retention_until`). Without a re-check, this call would
+          //    still delete the renewed record based on the STALE
+          //    "expired" decision made before the renewal. The storage
+          //    interface (storage/interface.ts) has no compare-and-delete
+          //    primitive, so the closest available atomicity is
+          //    re-reading immediately before the delete and refusing to
+          //    proceed if the record no longer qualifies — narrows the
+          //    race to the smallest window this interface allows, rather
+          //    than leaving the original (much wider) one open.
           if (this.auditLog) {
             try {
               await this.auditLog.appendCritical({
                 layer: "l2",
-                operation: "finding_store_expired_record_reclaimed",
+                operation: "finding_store_expired_record_reclaim_started",
                 identity_id: this.fortressId,
                 result: "success",
                 details: { finding_id: id, retention_until: persisted.retention_until },
               });
             } catch {
               // ABORT the reclamation: never delete a record with no
-              // durable audit trail. The caller treats "not reclaimed" the
-              // same as "genuinely nothing reclaimable" and refuses the
-              // triggering write (capacity) — fail closed, not a silent
-              // delete.
+              // durable audit trail even for the INTENT to do so. The
+              // caller treats "not reclaimed" the same as "genuinely
+              // nothing reclaimable" and refuses the triggering write
+              // (capacity) — fail closed, not a silent delete.
               return false;
             }
           }
-          await this.storage.delete(SENTINEL_FINDING_NAMESPACE, meta.key);
+
+          // Re-verify immediately before the destructive delete (concurrent-
+          // refresh guard, see point 2 above).
+          const freshRaw = await this.storage.read(SENTINEL_FINDING_NAMESPACE, meta.key);
+          if (!freshRaw) {
+            // Already gone — a concurrent reclamation or an operator
+            // delete beat this one to it. Nothing to reclaim here; keep
+            // scanning rather than treating this as a hard failure.
+            continue;
+          }
+          let stillExpired: boolean;
+          try {
+            const freshEnvelope: EncryptedPayload = JSON.parse(bytesToString(freshRaw));
+            const freshPlaintext = decrypt(freshEnvelope, this.encryptionKey, aad);
+            const freshPersisted = JSON.parse(bytesToString(freshPlaintext)) as PersistedFinding;
+            stillExpired = freshPersisted.retention_until <= cutoff;
+          } catch {
+            // Corrupted on re-read: treat the ORIGINAL decision (made from
+            // a successfully-decoded read moments ago) as still valid —
+            // matches this file's existing "leave corrupted records for
+            // rotation" convention rather than blocking reclamation on a
+            // decode failure of a record already decided reclaimable.
+            stillExpired = true;
+          }
+          if (!stillExpired) {
+            // A concurrent write renewed this record between the initial
+            // read and this re-check — leave it in place. Audit the
+            // abandoned intent explicitly so the `_started` entry above
+            // never reads as an unresolved, ambiguous record.
+            if (this.auditLog) {
+              void this.auditLog.append(
+                "l2",
+                "finding_store_expired_record_reclaim_abandoned",
+                this.fortressId,
+                { finding_id: id, reason: "renewed_concurrently" },
+                "success",
+              );
+            }
+            continue;
+          }
+
+          let deleted: boolean;
+          try {
+            deleted = await this.storage.delete(SENTINEL_FINDING_NAMESPACE, meta.key);
+          } catch (err) {
+            // The delete itself failed AFTER intent was durably recorded
+            // (point 1 above) — audit the mismatch explicitly rather than
+            // leaving the `_started` entry as the only, ambiguous trace.
+            if (this.auditLog) {
+              void this.auditLog.append(
+                "l2",
+                "finding_store_expired_record_reclaim_failed",
+                this.fortressId,
+                { finding_id: id, error: err instanceof Error ? err.message : String(err) },
+                "failure",
+              );
+            }
+            return false;
+          }
+          if (this.auditLog) {
+            void this.auditLog.append(
+              "l2",
+              "finding_store_expired_record_reclaimed",
+              this.fortressId,
+              { finding_id: id, retention_until: persisted.retention_until },
+              deleted ? "success" : "failure",
+            );
+          }
           this.index.delete(id);
-          return true;
+          return deleted;
         }
       } catch {
         // Corrupted record: leave in place; rotation handled by audit log.

@@ -356,7 +356,7 @@ describe("(b) federation_peers register(): local-custody refusal", () => {
     const fortress = makeFortress();
     const a = await addIdentity(fortress, "identity-a");
     const b = await addIdentity(fortress, "identity-b");
-    const { tools: hsTools, handshakeResults, handshakeResultOrigins } = createHandshakeTools(
+    const { tools: hsTools, handshakeResults, handshakeResultWriterOrigins } = createHandshakeTools(
       fortress.config,
       fortress.identityManager,
       fortress.masterKey,
@@ -390,7 +390,7 @@ describe("(b) federation_peers register(): local-custody refusal", () => {
       fortress.auditLog,
       handshakeResults,
       fortress.identityManager,
-      handshakeResultOrigins
+      handshakeResultWriterOrigins
     );
     const register = fedTools.find((t) => t.name === "federation_peers")!;
     const out = parse(

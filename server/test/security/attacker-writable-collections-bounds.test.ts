@@ -77,6 +77,7 @@ import type { TrapSpec } from "../../src/honeypot/types.js";
 import {
   SentinelFindingStore,
   SentinelFindingStoreRefusedError,
+  SENTINEL_FINDING_NAMESPACE,
 } from "../../src/sentinel/sentinel-finding-store.js";
 import type { SentinelFinding } from "../../src/sentinel/types.js";
 import { AnomalyTriggerWatcher } from "../../src/sentinel/sentinels/anomaly-trigger.js";
@@ -698,7 +699,7 @@ describe("3. federation peers: capped + per-session fair + refuse-on-all-active 
       const registrarIdentity = await createIdentityFor(registrar, "registrar-identity");
       const counterpartyFortress = makeAgent();
 
-      const { tools: registrarTools, handshakeResults, handshakeResultOrigins } =
+      const { tools: registrarTools, handshakeResults, handshakeResultWriterOrigins } =
         createHandshakeTools(
           registrar.config,
           registrar.identityManager,
@@ -709,7 +710,7 @@ describe("3. federation peers: capped + per-session fair + refuse-on-all-active 
         registrar.auditLog,
         handshakeResults,
         registrar.identityManager,
-        handshakeResultOrigins
+        handshakeResultWriterOrigins
       );
 
       const initiate = registrarTools.find((t) => t.name === "handshake_initiate")!;
@@ -803,7 +804,7 @@ describe("3. federation peers: capped + per-session fair + refuse-on-all-active 
       // of how the 498 remainder distributes across them.
       const fillerSessionCount = 11;
 
-      const { tools: registrarTools, handshakeResults, handshakeResultOrigins } =
+      const { tools: registrarTools, handshakeResults, handshakeResultWriterOrigins } =
         createHandshakeTools(
           registrar.config,
           registrar.identityManager,
@@ -814,7 +815,7 @@ describe("3. federation peers: capped + per-session fair + refuse-on-all-active 
         registrar.auditLog,
         handshakeResults,
         registrar.identityManager,
-        handshakeResultOrigins
+        handshakeResultWriterOrigins
       );
       const initiate = registrarTools.find((t) => t.name === "handshake_initiate")!;
       const complete = registrarTools.find((t) => t.name === "handshake_complete")!;
@@ -922,7 +923,7 @@ describe("3. federation peers: capped + per-session fair + refuse-on-all-active 
   );
 
   it(
-    "MUTATION-PROOF TARGET (required origin, MUST-FIX 2): a peer_id missing from handshakeResultOrigins is NOT a quota-skip — it falls into the shared AGENT_UNKNOWN_ORIGIN bucket, which is itself quota-bounded",
+    "MUTATION-PROOF TARGET (required origin, MUST-FIX 2): a peer_id missing from handshakeResultWriterOrigins is NOT a quota-skip — it falls into the shared AGENT_UNKNOWN_ORIGIN bucket, which is itself quota-bounded",
     async () => {
       // Simulates the MUST-FIX 2 defect directly: a handshake result whose
       // origin attribution is somehow absent (a future producer bug, or
@@ -931,12 +932,16 @@ describe("3. federation peers: capped + per-session fair + refuse-on-all-active 
       // every peerId lookup misses). REQUIRED (not optional) means
       // federation/tools.ts's register handler must never treat a miss as
       // "skip the quota" — it falls back to the shared AGENT_UNKNOWN_ORIGIN
-      // bucket instead, which is itself bounded.
+      // bucket instead, which is itself bounded. fix-round-3: federation now
+      // reads `handshakeResultWriterOrigins` (see that map's doc,
+      // handshake/tools.ts) rather than `handshakeResultOrigins`, so this
+      // test simulates the same "missing attribution" shape against THAT
+      // map.
       const registrar = makeAgent();
       const registrarIdentity = await createIdentityFor(registrar, "registrar-identity");
       const counterpartyFortress = makeAgent();
 
-      const { tools: registrarTools, handshakeResults, handshakeResultOrigins } =
+      const { tools: registrarTools, handshakeResults, handshakeResultWriterOrigins } =
         createHandshakeTools(
           registrar.config,
           registrar.identityManager,
@@ -947,7 +952,7 @@ describe("3. federation peers: capped + per-session fair + refuse-on-all-active 
         registrar.auditLog,
         handshakeResults,
         registrar.identityManager,
-        handshakeResultOrigins
+        handshakeResultWriterOrigins
       );
       const initiate = registrarTools.find((t) => t.name === "handshake_initiate")!;
       const complete = registrarTools.find((t) => t.name === "handshake_complete")!;
@@ -994,7 +999,7 @@ describe("3. federation peers: capped + per-session fair + refuse-on-all-active 
         // handshake but failed to attribute an origin for it. The public
         // API surface exercised below (register.handler) is unchanged —
         // only the origin INPUT this simulates is missing.
-        (handshakeResultOrigins as Map<string, string>).delete(peerId);
+        (handshakeResultWriterOrigins as Map<string, string>).delete(peerId);
         const out = parse(await register.handler({ action: "register", peer_id: peerId }));
         expect(out.registered).toBe(true);
       }
@@ -1006,7 +1011,7 @@ describe("3. federation peers: capped + per-session fair + refuse-on-all-active 
         "agent:owner-overflow",
         "unattributed-overflow"
       );
-      (handshakeResultOrigins as Map<string, string>).delete(overflowPeerId);
+      (handshakeResultWriterOrigins as Map<string, string>).delete(overflowPeerId);
       const overflow = parse(
         await register.handler({ action: "register", peer_id: overflowPeerId })
       );
@@ -1014,6 +1019,205 @@ describe("3. federation peers: capped + per-session fair + refuse-on-all-active 
       expect(overflow.error).toContain("registration quota");
     },
     60_000
+  );
+
+  it(
+    "MUTATION-PROOF TARGET (writer origin, not first-writer origin, MUST-FIX 2 fix-round-3): a victim's REAL verified registration is charged to the VICTIM's own quota, not an attacker's exhausted quota, even though the attacker previewed the SAME counterparty FIRST",
+    async () => {
+      // The fix-round-2 defect this closes: `handshakeResults`'s own
+      // BoundedMap `origins` (exposed as `handshakeResultOrigins`) is
+      // IMMUTABLE at first insert BY DESIGN (MUST-FIX 3, fix-round-2 — see
+      // the "no reattribution on update" test above), which is correct for
+      // THAT map's own quota, but is the WRONG answer for "whose
+      // registration is this" once a LATER session's real, verified write
+      // supersedes an EARLIER session's cheap unverified preview for the
+      // SAME counterparty_id. An attacker who previews a victim's
+      // counterparty first — no real handshake required, just a one-shot
+      // `handshake_exchange` — would otherwise permanently pin that
+      // counterparty_id's federation-charge origin to themselves; once the
+      // ATTACKER's own registration quota is separately exhausted (via
+      // unrelated registrations), the VICTIM's later real registration for
+      // that SAME counterparty would be refused too, even though the
+      // victim never touched their own quota. `handshakeResultWriterOrigins`
+      // (fix-round-3) tracks the CURRENT writer instead, so federation
+      // charges the victim correctly regardless of the attacker's quota
+      // state.
+      const registrar = makeAgent();
+      const registrarIdentity = await createIdentityFor(registrar, "registrar-identity");
+      const counterpartyFortress = makeAgent();
+      const sharedCounterparty = await createIdentityFor(
+        counterpartyFortress,
+        "shared-counterparty"
+      );
+
+      const {
+        tools: registrarTools,
+        handshakeResults,
+        handshakeResultOrigins,
+        handshakeResultWriterOrigins,
+      } = createHandshakeTools(
+        registrar.config,
+        registrar.identityManager,
+        registrar.masterKey,
+        registrar.auditLog
+      );
+      const { tools: federationTools, registry } = createFederationTools(
+        registrar.auditLog,
+        handshakeResults,
+        registrar.identityManager,
+        handshakeResultWriterOrigins
+      );
+      const exchange = registrarTools.find((t) => t.name === "handshake_exchange")!;
+      const initiate = registrarTools.find((t) => t.name === "handshake_initiate")!;
+      const complete = registrarTools.find((t) => t.name === "handshake_complete")!;
+      const register = federationTools.find((t) => t.name === "federation_peers")!;
+
+      const SESSION_ATTACKER = "agent:mustfix2-attacker";
+      const SESSION_VICTIM = "agent:mustfix2-victim";
+
+      // Registers ONE new, UNRELATED peer end-to-end under `callerIdentity`'s
+      // session — mirrors `mintAndRegisterPeer` in the MUST-FIX 1 spine test
+      // above, used here only to fill SESSION_ATTACKER's OWN registration
+      // quota with peers that have nothing to do with the shared
+      // counterparty this test is actually about.
+      async function mintAndRegisterUnrelatedPeer(
+        callerIdentity: string,
+        label: string
+      ): Promise<void> {
+        const identity = await createIdentityFor(counterpartyFortress, label);
+        // Respond happens on a SEPARATE handshake-tools instance bound to
+        // counterpartyFortress's own identity manager, matching the
+        // section-3 helper pattern.
+        const { tools: counterpartyTools } = createHandshakeTools(
+          counterpartyFortress.config,
+          counterpartyFortress.identityManager,
+          counterpartyFortress.masterKey,
+          counterpartyFortress.auditLog
+        );
+        const counterpartyRespond = counterpartyTools.find(
+          (t) => t.name === "handshake_respond"
+        )!;
+        const initiated = parse(
+          await initiate.handler({ identity_id: registrarIdentity.identity_id }, callerIdentity)
+        );
+        const responded = parse(
+          await counterpartyRespond.handler(
+            { challenge: initiated.challenge, identity_id: identity.identity_id },
+            `agent:counterparty-${label}`
+          )
+        );
+        await complete.handler(
+          { session_id: initiated.session_id, response: responded.response },
+          callerIdentity
+        );
+        const out = parse(
+          await register.handler({ action: "register", peer_id: identity.identity_id })
+        );
+        expect(out.registered).toBe(true);
+      }
+
+      // Exhaust SESSION_ATTACKER's OWN federation registration quota FIRST,
+      // entirely with unrelated peers — proves the fix below is not merely
+      // "the attacker's quota happened to have room."
+      for (let i = 0; i < MAX_FEDERATION_PEERS_PER_ORIGIN; i += 1) {
+        await mintAndRegisterUnrelatedPeer(SESSION_ATTACKER, `unrelated-${i}`);
+      }
+      expect(registry.peerOriginSize(SESSION_ATTACKER)).toBe(MAX_FEDERATION_PEERS_PER_ORIGIN);
+
+      // ATTACKER previews the SHARED counterparty FIRST — cheap, unverified,
+      // no real handshake. This is the write that claims the ALLOCATION
+      // origin (handshakeResultOrigins) forever, per MUST-FIX 3's
+      // no-reattribution rule. Generated for `sharedCounterparty`
+      // EXPLICITLY by identity_id (not the `shrFor` helper's default-
+      // identity shortcut) — `counterpartyFortress` now also holds every
+      // "unrelated" identity minted above, so relying on whichever
+      // identity happens to be the manager's default would be ambiguous.
+      const counterpartyShrResult = generateSHR(sharedCounterparty.identity_id, {
+        config: counterpartyFortress.config,
+        identityManager: counterpartyFortress.identityManager,
+        masterKey: counterpartyFortress.masterKey,
+      });
+      if (typeof counterpartyShrResult === "string") {
+        throw new Error(counterpartyShrResult);
+      }
+      const counterpartySHR = counterpartyShrResult;
+      const previewed = parse(
+        await exchange.handler(
+          { counterparty_shr: counterpartySHR },
+          SESSION_ATTACKER
+        )
+      );
+      expect(previewed.verification.recorded).toBe(true);
+      expect(handshakeResultOrigins.get(sharedCounterparty.identity_id)).toBe(
+        SESSION_ATTACKER
+      );
+      expect(handshakeResultWriterOrigins.get(sharedCounterparty.identity_id)).toBe(
+        SESSION_ATTACKER
+      );
+
+      // VICTIM completes a REAL 4-step verified handshake with the SAME
+      // counterparty — this is an UPDATE to the existing handshakeResults
+      // entry, so the ALLOCATION origin stays SESSION_ATTACKER (unchanged,
+      // by design — MUST-FIX 3), but the WRITER origin must move to
+      // SESSION_VICTIM.
+      const { tools: counterpartyTools } = createHandshakeTools(
+        counterpartyFortress.config,
+        counterpartyFortress.identityManager,
+        counterpartyFortress.masterKey,
+        counterpartyFortress.auditLog
+      );
+      const counterpartyRespond = counterpartyTools.find(
+        (t) => t.name === "handshake_respond"
+      )!;
+      const initiated = parse(
+        await initiate.handler(
+          { identity_id: registrarIdentity.identity_id },
+          SESSION_VICTIM
+        )
+      );
+      const responded = parse(
+        await counterpartyRespond.handler(
+          {
+            challenge: initiated.challenge,
+            identity_id: sharedCounterparty.identity_id,
+          },
+          "agent:counterparty-shared"
+        )
+      );
+      await complete.handler(
+        { session_id: initiated.session_id, response: responded.response },
+        SESSION_VICTIM
+      );
+
+      // The allocation origin (handshakeResultOrigins) is UNCHANGED —
+      // fix-round-2's guarantee still holds. The writer origin
+      // (handshakeResultWriterOrigins) HAS moved to the victim.
+      expect(handshakeResultOrigins.get(sharedCounterparty.identity_id)).toBe(
+        SESSION_ATTACKER
+      );
+      expect(handshakeResultWriterOrigins.get(sharedCounterparty.identity_id)).toBe(
+        SESSION_VICTIM
+      );
+
+      // THE FIX: registering this peer succeeds — charged to the VICTIM's
+      // own (fresh) quota — even though the ATTACKER's origin is fully
+      // exhausted. Pre-fix (charging to handshakeResultOrigins), this
+      // registration would have been refused with "registration quota"
+      // because the attacker's origin, not the victim's, was checked.
+      const registered = parse(
+        await register.handler({
+          action: "register",
+          peer_id: sharedCounterparty.identity_id,
+        })
+      );
+      expect(registered.registered).toBe(true);
+      expect(registry.peerOriginSize(SESSION_VICTIM)).toBe(1);
+      // The attacker's own count is untouched by the victim's registration.
+      expect(registry.peerOriginSize(SESSION_ATTACKER)).toBe(
+        MAX_FEDERATION_PEERS_PER_ORIGIN
+      );
+    },
+    120_000
   );
 });
 
@@ -1796,6 +2000,175 @@ describe("6. awaited critical audit before eviction/reclamation aborts on audit 
       // The expired record was NEVER deleted — the audit failure aborted
       // reclamation before the delete.
       expect(await store.loadFinding("expiring-0")).not.toBeNull();
+    },
+    30_000
+  );
+
+  it(
+    "MUTATION-PROOF TARGET (no false success, MUST-FIX 4 fix-round-3): a storage.delete() failure AFTER a successful reclamation-intent audit produces an explicit failure record, never a durable 'success' claim for a reclamation that never happened",
+    async () => {
+      class FailingDeleteStorage extends MemoryStorage {
+        failFindingDeletes = false;
+        async delete(
+          namespace: string,
+          key: string,
+          secureOverwrite?: boolean
+        ): Promise<boolean> {
+          if (namespace === SENTINEL_FINDING_NAMESPACE && this.failFindingDeletes) {
+            throw new Error("simulated finding delete failure");
+          }
+          return super.delete(namespace, key, secureOverwrite);
+        }
+      }
+      const storage = new FailingDeleteStorage();
+      const masterKey = generateRandomKey();
+      let nowMs = Date.parse("2026-01-01T00:00:00.000Z");
+      const auditLog = new AuditLog(storage, masterKey);
+      const CAP = 1;
+      const store = new SentinelFindingStore({
+        storage,
+        masterKey,
+        fortressId: "fortress-false-success-test",
+        retentionDays: 1,
+        now: () => new Date(nowMs),
+        auditLog,
+        maxTrackedFindings: CAP,
+        maxFindingsPerOrigin: 1000,
+      });
+
+      // Capture every audited op so we can assert on the EXACT sequence,
+      // not just the thrown error.
+      const auditedOps: { operation: string; result: string }[] = [];
+      const originalAppend = auditLog.append.bind(auditLog);
+      auditLog.append = ((...args: Parameters<AuditLog["append"]>) => {
+        const [, operation, , , result] = args;
+        auditedOps.push({ operation, result: result ?? "success" });
+        return originalAppend(...args);
+      }) as AuditLog["append"];
+      const originalAppendCritical = auditLog.appendCritical.bind(auditLog);
+      auditLog.appendCritical = ((...args: Parameters<AuditLog["appendCritical"]>) => {
+        const entry = args[0];
+        auditedOps.push({ operation: entry.operation, result: entry.result });
+        return originalAppendCritical(...args);
+      }) as AuditLog["appendCritical"];
+
+      await store.saveFinding(mkFinding("expiring-0"));
+      nowMs += 2 * 24 * 60 * 60 * 1000;
+
+      // The intent audit (appendCritical, to a storage namespace that is
+      // NOT gated by `failFindingDeletes`) succeeds normally; only the
+      // FINDING delete itself fails.
+      storage.failFindingDeletes = true;
+      await expect(store.saveFinding(mkFinding("overflow"))).rejects.toMatchObject({
+        reason: "capacity",
+      });
+      storage.failFindingDeletes = false;
+
+      // The record was never actually deleted (the failed delete never
+      // completed) — same observable state as the audit-rejection test
+      // above, reached via a DIFFERENT failure point.
+      expect(await store.loadFinding("expiring-0")).not.toBeNull();
+
+      // THE FIX: the audit trail contains the INTENT (success) followed by
+      // an explicit FAILURE record — never a lone
+      // `finding_store_expired_record_reclaimed` / success claim with no
+      // corresponding delete. Pre-fix, the single pre-delete audit entry
+      // WAS `finding_store_expired_record_reclaimed` / success, written
+      // before the (here, failing) delete was even attempted — exactly the
+      // false-success shape this closes.
+      const reclaimOps = auditedOps.filter((o) => o.operation.startsWith("finding_store_expired_record"));
+      expect(reclaimOps).toContainEqual({
+        operation: "finding_store_expired_record_reclaim_started",
+        result: "success",
+      });
+      expect(reclaimOps).toContainEqual({
+        operation: "finding_store_expired_record_reclaim_failed",
+        result: "failure",
+      });
+      // Never a success claim for the RECLAIM COMPLETION when the delete
+      // itself never ran.
+      expect(reclaimOps).not.toContainEqual({
+        operation: "finding_store_expired_record_reclaimed",
+        result: "success",
+      });
+    },
+    30_000
+  );
+
+  it(
+    "MUTATION-PROOF TARGET (no concurrent-refresh deletion, MUST-FIX 4 fix-round-3): a record RENEWED by a concurrent write during the reclamation-intent audit await survives, and the scan reclaims a DIFFERENT genuinely-expired record instead",
+    async () => {
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      let nowMs = Date.parse("2026-01-01T00:00:00.000Z");
+      const auditLog = new AuditLog(storage, masterKey);
+      const CAP = 2;
+      const store = new SentinelFindingStore({
+        storage,
+        masterKey,
+        fortressId: "fortress-concurrent-refresh-test",
+        retentionDays: 1,
+        now: () => new Date(nowMs),
+        auditLog,
+        maxTrackedFindings: CAP,
+        maxFindingsPerOrigin: 1000,
+      });
+
+      await store.saveFinding(mkFinding("expiring-a"));
+      await store.saveFinding(mkFinding("expiring-b"));
+      // Both now past their 1-day retention window.
+      nowMs += 2 * 24 * 60 * 60 * 1000;
+
+      // Intercept the FIRST reclamation-intent audit (whichever of the two
+      // candidates the oldest-first scan reaches first) and, DURING that
+      // awaited critical write, perform a CONCURRENT renewal of that SAME
+      // finding_id — modeling a legitimate `saveFinding` update racing the
+      // reclamation scan's audit await (the real async gap this closes).
+      let renewedFindingId: string | undefined;
+      const originalAppendCritical = auditLog.appendCritical.bind(auditLog);
+      auditLog.appendCritical = (async (
+        ...args: Parameters<AuditLog["appendCritical"]>
+      ) => {
+        const entry = args[0];
+        if (
+          renewedFindingId === undefined &&
+          entry.operation === "finding_store_expired_record_reclaim_started"
+        ) {
+          renewedFindingId = (entry.details as { finding_id?: string }).finding_id;
+          // Renew: a fresh write for the SAME finding_id, computed at the
+          // CURRENT (still-advanced) `nowMs`, so its retention_until lands
+          // safely in the future relative to the reclamation's `cutoff`
+          // (also computed from the same `nowMs`).
+          await store.saveFinding(
+            mkFinding(renewedFindingId!, { summary: "renewed concurrently" }),
+            { knownExisting: true }
+          );
+        }
+        return originalAppendCritical(...args);
+      }) as AuditLog["appendCritical"];
+
+      // Triggers reclamation: the FIRST candidate gets renewed mid-audit
+      // (abandoned, not deleted); the scan continues to the SECOND
+      // candidate, which is genuinely still expired and gets reclaimed
+      // normally, making room for this write.
+      const retentionUntil = await store.saveFinding(mkFinding("overflow"));
+      expect(retentionUntil).toBeDefined();
+      expect(renewedFindingId).toBeDefined();
+
+      // The renewed record survived, WITH its renewal content intact —
+      // never deleted despite having been the reclamation scan's first
+      // candidate.
+      const survivor = await store.loadFinding(renewedFindingId!);
+      expect(survivor).not.toBeNull();
+      expect(survivor!.summary).toBe("renewed concurrently");
+
+      // The OTHER candidate (not renewed) was genuinely reclaimed.
+      const otherId = renewedFindingId === "expiring-a" ? "expiring-b" : "expiring-a";
+      expect(await store.loadFinding(otherId)).toBeNull();
+
+      // The overflow write itself succeeded (room was made by reclaiming
+      // the OTHER record, not the renewed one).
+      expect(await store.loadFinding("overflow")).not.toBeNull();
     },
     30_000
   );

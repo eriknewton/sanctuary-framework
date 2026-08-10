@@ -61,9 +61,12 @@ export const MAX_FEDERATION_PEERS = 500;
  * `identity_create` (Tier 3 always-allow) — mint N identities, complete N
  * real 4-step handshakes, register N peers, and the "per-origin" quota
  * never engages). The ORIGIN of a peer is now the AGENT-SESSION PRINCIPAL
- * (`handshake/tools.ts`'s `handshakeResultOrigins`, REQUIRED — not
- * optional — through `federation/tools.ts`'s register handler; see that
- * parameter's doc for why optional was itself the MUST-FIX 2 defect). An
+ * that recorded the VERIFIED handshake result CURRENTLY on file for this
+ * counterparty (`handshake/tools.ts`'s `handshakeResultWriterOrigins`,
+ * REQUIRED — not optional — through `federation/tools.ts`'s register
+ * handler; see that parameter's doc for why optional was itself the
+ * MUST-FIX 2 defect, and for why fix-round-3 reads the WRITER map rather
+ * than `handshakeResults`'s own first-writer allocation origin). An
  * attacker who completes MAX_FEDERATION_PEERS real 4-step handshakes,
  * however many local identities they spread the flood across, still
  * exhausts only THEIR OWN session's quota and is REFUSED there — never
@@ -146,11 +149,20 @@ export class FederationRegistry {
         });
       },
       onRefuse: (incomingPeerId, _incomingPeer, reason) => {
-        void this.auditLog.append(
-          "l4",
+        // Three DISTINCT reasons (MUST-FIX 3, fix-round-3 — `capacity` and
+        // `audit_unavailable` used to collapse to the same "saturated"
+        // audit op, hiding "the audit trail is down" behind "the registry
+        // is genuinely full of active peers" from an operator diagnosing
+        // the refusal).
+        const op =
           reason === "origin_quota"
             ? "federation_registry_origin_quota_exceeded"
-            : "federation_registry_saturated",
+            : reason === "audit_unavailable"
+              ? "federation_registry_audit_unavailable"
+              : "federation_registry_saturated";
+        void this.auditLog.append(
+          "l4",
+          op,
           "system",
           { peer_id: incomingPeerId },
           "failure"
@@ -212,8 +224,8 @@ export class FederationRegistry {
       peer.trust_tier = "self-attested";
     }
 
-    const inserted = await this.peers.set(result.counterparty_id, peer, origin);
-    return inserted ? peer : null;
+    const setResult = await this.peers.set(result.counterparty_id, peer, origin);
+    return setResult.ok ? peer : null;
   }
 
   /**

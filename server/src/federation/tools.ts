@@ -39,11 +39,24 @@ export function createFederationTools(
   // 1's spine) — omitting the map does not just lose fairness accounting,
   // it silently reopens the exact cross-session lockout MUST-FIX 1 closes
   // (an attacker whose registrations carry no origin attribution floods the
-  // shared registry unbounded by any per-session quota). Production wiring
-  // (index.ts) always supplies `createHandshakeTools`'s
-  // `handshakeResultOrigins`; every test construction must too — a test
-  // that omits it is testing a bypass, not a real config.
-  handshakeResultOrigins: ReadonlyMap<string, string>
+  // shared registry unbounded by any per-session quota).
+  //
+  // THE WRITER map, not the allocation map (MUST-FIX 2, fix-round-3):
+  // production wiring (index.ts) supplies `createHandshakeTools`'s
+  // `handshakeResultWriterOrigins` here — NOT its `handshakeResultOrigins`
+  // (that one is `handshakeResults`'s own BoundedMap-internal, immutable,
+  // first-writer accounting; see both fields' docs in handshake/tools.ts).
+  // Charging registration to the FIRST previewer of a counterparty rather
+  // than the session whose REAL verified handshake produced the result
+  // being registered lets an attacker who has exhausted their own quota
+  // with cheap unverified pre-previews deny an unrelated victim's later,
+  // legitimate registration for the SAME counterparty (their pre-preview
+  // permanently "claims" that counterparty_id's allocation origin; the
+  // victim's real handshake is an UPDATE, which never reattributes it).
+  // Every test construction must supply a real (or intentionally empty,
+  // for tests that don't exercise per-origin fairness) map here too — a
+  // test that omits it is testing a bypass, not a real config.
+  handshakeResultWriterOrigins: ReadonlyMap<string, string>
 ): { tools: ToolDefinition[]; registry: FederationRegistry } {
   const registry = new FederationRegistry(auditLog);
 
@@ -209,20 +222,26 @@ export function createFederationTools(
               });
             }
 
-            // Per-origin quota (register LD2-04, MUST-FIX 1/2 RECHECK):
-            // attribute this registration to the AGENT-SESSION PRINCIPAL
-            // that recorded the underlying handshake result
-            // (`handshakeResultOrigins`, see that map's doc in
-            // handshake/tools.ts), so a flood of attacker-completed
-            // handshakes — even spread across many MINTED local identities —
-            // cannot exhaust the shared registry and lock out a DIFFERENT
-            // session's registration. `handshakeResultOrigins` is REQUIRED
+            // Per-origin quota (register LD2-04, MUST-FIX 1/2 RECHECK, split
+            // fix-round-3): attribute this registration to the AGENT-SESSION
+            // PRINCIPAL that recorded the VERIFIED handshake result CURRENTLY
+            // stored for this peer (`handshakeResultWriterOrigins`, see that
+            // map's doc in handshake/tools.ts — deliberately NOT
+            // `handshakeResults`'s own first-writer allocation origin; using
+            // that one here was itself the MUST-FIX 2 fix-round-3 defect: an
+            // attacker's cheap unverified pre-preview of a victim's
+            // counterparty permanently claims the allocation origin, and the
+            // victim's later real handshake (an update) never displaces it),
+            // so a flood of attacker-completed handshakes — even spread
+            // across many MINTED local identities — cannot exhaust the
+            // shared registry and lock out a DIFFERENT session's
+            // registration. `handshakeResultWriterOrigins` is REQUIRED
             // (MUST-FIX 2) precisely so this line can never silently fall
             // back to "no origin, skip the quota"; a peerId genuinely absent
             // from the map (should not happen — every `recordHandshakeResult`
             // write supplies an origin) still falls into the shared
             // `AGENT_UNKNOWN_ORIGIN` bucket rather than escaping accounting.
-            const origin = handshakeResultOrigins.get(peerId) ?? AGENT_UNKNOWN_ORIGIN;
+            const origin = handshakeResultWriterOrigins.get(peerId) ?? AGENT_UNKNOWN_ORIGIN;
             const originQuotaExceeded =
               registry.peerOriginSize(origin) >= registry.maxPeersPerOrigin();
             const peer = await registry.registerFromHandshake(
