@@ -272,6 +272,8 @@ describe("reputation weighting by signer", () => {
       })
     );
 
-    expect(record.counterparty_confirmed).toBe(false);
+    // The presence-only confirmation flag was removed: no confirmation is
+    // emitted for an unverified counterparty attachment (the field is absent).
+    expect(record.counterparty_confirmed).toBeUndefined();
   });
 });

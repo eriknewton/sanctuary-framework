@@ -1,3 +1,4 @@
+// fail-before-exempt: adaptation-only in this PR — removes references to the deleted counterparty_confirmed field from StoredAttestation fixtures; the behavior change (the flag is now absent from the reputation_record response) is proven by test/reputation/weight-by-signer.test.ts, which does fail against pre-fix source.
 /**
  * L4 Reputation Store Tests
  *
@@ -293,7 +294,6 @@ async function writeBridgeAttestationRecord(
   };
   const stored: StoredAttestation = {
     attestation,
-    counterparty_confirmed: false,
     recorded_at: now,
   };
   const reputationKey = derivePurposeKey(masterKey, "l4-reputation");
@@ -2156,7 +2156,6 @@ describe("L4 Reputation Store", () => {
       };
       const stored: StoredAttestation = {
         attestation,
-        counterparty_confirmed: false,
         recorded_at: now,
         // Only set the marker when the test asks for it; a legacy record has
         // NO imported key at all.

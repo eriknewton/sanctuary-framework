@@ -306,7 +306,6 @@ export function createReputationTools(
           attestation_id: stored.attestation.attestation_id,
           interaction_id: stored.attestation.data.interaction_id,
           self_attestation: stored.attestation.signature,
-          counterparty_confirmed: stored.counterparty_confirmed,
           sovereignty_tier: tierMeta.sovereignty_tier,
           context,
           recorded_at: stored.recorded_at,
