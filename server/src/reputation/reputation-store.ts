@@ -79,24 +79,32 @@ export interface StoredAttestation {
   counterparty_attestation?: string;
   recorded_at: string;
   /**
-   * Provenance marker used by tier-weighted reads to decide whether a stored
-   * attestation's self-asserted sovereignty_tier may be trusted.
+   * Provenance marker distinguishing a record this instance witnessed
+   * directly (false) from one accepted via importBundle (true) or of unknown
+   * origin (absent).
    *
-   *   - false  => recorded locally from a handshake THIS instance witnessed;
-   *               the tier is trustworthy and is NOT clamped.
-   *   - true   => accepted via importBundle; the tier is a foreign signer's
-   *               uncorroborated claim and is clamped to
-   *               MAX_IMPORTED_SOVEREIGNTY_TIER at every weighted read.
-   *   - absent => unknown provenance. FAIL CLOSED: a record whose imported
-   *               field is undefined is treated as untrusted and clamped like
-   *               an import. Legacy attestations written before this marker
-   *               existed land here, so a pre-patch imported "verified-sovereign"
-   *               claim cannot keep a privileged weight just because it predates
-   *               the marker. Only an explicit imported:false escapes the clamp.
+   * A11 (ratified; register §Z RECHECK residual, now closed): this marker no
+   * longer controls whether trustedSovereigntyTier clamps the declared tier.
+   * Clamping is UNCONDITIONAL regardless of `imported` — see
+   * trustedSovereigntyTier — because a local record's declared tier can never
+   * legitimately exceed self-attested either: every record() write is signed
+   * with a LOCALLY-HELD key by construction, so "trust cannot originate from a
+   * locally-held key" is the SAME self-vouch class as the handshake chokepoint
+   * (recordHandshakeResult in handshake/tools.ts), expressed here at the
+   * storage/scoring boundary instead of the handshake boundary.
    *
-   * The signed attestation.data is left byte-intact so re-export signatures still
-   * verify; this marker drives the trust clamp at the consumption boundary
-   * instead of mutating the signed payload.
+   *   - false  => recorded locally via ReputationStore.record().
+   *   - true   => accepted via importBundle; a foreign signer's
+   *               uncorroborated claim.
+   *   - absent => unknown provenance (a legacy record written before this
+   *               marker existed).
+   *
+   * The marker is retained for its genuine remaining purpose: distinguishing
+   * directly-witnessed history from imported history for audit, export, and
+   * dedup logic elsewhere in this file. The signed attestation.data is left
+   * byte-intact regardless, so re-export signatures still verify; the clamp
+   * is applied at the consumption boundary, never by mutating the signed
+   * payload.
    */
   imported?: boolean;
 }
@@ -234,41 +242,36 @@ export interface Guarantee {
  * The sovereignty tier that may be TRUSTED for weighting from a stored
  * attestation, as opposed to the raw self-asserted tier in the signed data.
  *
- * The recorded tier passes through verbatim ONLY when provenance is provably
- * local (imported === false): it was set from a handshake this instance
- * witnessed. In EVERY other case the tier is clamped to
- * MAX_IMPORTED_SOVEREIGNTY_TIER:
+ * A11 (ratified; closes the REP-01 RESIDUAL / register §Z RECHECK): the clamp
+ * to MAX_IMPORTED_SOVEREIGNTY_TIER is now UNCONDITIONAL, regardless of the
+ * `imported` provenance marker. Every record() write is signed with a
+ * LOCALLY-HELD key by construction (see ReputationStore.record), so a local
+ * record's declared tier can never legitimately exceed self-attested either —
+ * "trust cannot originate from a locally-held key" is the SAME self-vouch
+ * class the handshake producer chokepoint closes (recordHandshakeResult in
+ * handshake/tools.ts), expressed here at the storage/scoring boundary instead
+ * of the handshake boundary. This closes the residual the REP-01 RECHECK
+ * deliberately left open: a pre-fix laundered local record, or a hypothetical
+ * direct ReputationStore.record() caller that stores a privileged local tier,
+ * can no longer keep privileged weight.
  *
- *   - imported === true  => a foreign signer's uncorroborated tier claim.
- *   - imported undefined => unknown provenance. Fail CLOSED. Legacy records
- *                           written before the marker existed have no imported
- *                           field; a pre-patch imported "verified-sovereign"
- *                           claim must NOT keep a privileged weight merely
- *                           because it predates the marker.
+ * DESIGN CONSEQUENCE (inside the A11 ratification): verified-sovereign /
+ * verified-degraded are now unreachable in reputation scoring product-wide —
+ * an imported record was already clamped by provenance, and a local record's
+ * declared tier is already forced to self-attested at every standard
+ * record-time caller (reputation_record / bridge_attest, via
+ * resolveTierByDid capping the signer's own DID). This clamp makes that
+ * structural rather than convention-dependent.
  *
  * This is the single chokepoint every tier-weighted read must go through so a
- * forged or provenance-unknown attestation cannot inflate its scoring weight.
- * It never RAISES a tier.
- *
- * REP-01 RESIDUAL (register §Z RECHECK, OWNER DECISION — deliberately NOT
- * changed here): the imported:false pass-through trusts a local record's stored
- * tier. REP-01 closes the AGENT-FACING exploit at the record-time callers
- * (reputation_record / bridge_attest cap the local signer at self-attested), so
- * an agent using the tools can no longer launder. What this pass-through still
- * trusts is (a) a pre-fix laundered local record written before that cap, and
- * (b) a hypothetical direct ReputationStore.record consumer that stores a
- * privileged local tier. Clamping imported:false here would close both, but it
- * flips a deliberately-designed, tested trust surface (see reputation.test.ts
- * "import-trust hardening") and changes the scoring meaning of every local
- * record — a trust-model decision drafted for the owner, not taken unilaterally.
+ * forged, provenance-unknown, OR provably-local attestation cannot inflate
+ * its scoring weight. It never RAISES a tier.
  */
 export function trustedSovereigntyTier(
   stored: StoredAttestation
 ): SovereigntyTier | undefined {
   const declared = stored.attestation.data.sovereignty_tier;
-  return stored.imported === false
-    ? declared
-    : clampImportedSovereigntyTier(declared);
+  return clampImportedSovereigntyTier(declared);
 }
 
 function computeMedian(values: number[]): number {
@@ -612,9 +615,12 @@ export class ReputationStore {
       // so no confirmation flag is emitted (the presence-only flag was removed).
       counterparty_attestation: counterpartyAttestation,
       recorded_at: now,
-      // Provably local provenance: this tier came from a handshake this
-      // instance witnessed, so trustedSovereigntyTier leaves it unclamped.
-      // Stamped explicitly (not left absent) because absent now fails closed.
+      // Provably local provenance (this tier came from a handshake this
+      // instance witnessed, or from the self-attested cap resolveTierByDid
+      // applies to a local signer). Stamped explicitly, not left absent,
+      // because absent fails closed. Retained for audit/export/dedup
+      // provenance; it no longer exempts this record from the
+      // trustedSovereigntyTier clamp (A11 — the clamp is unconditional).
       imported: false,
     };
 
@@ -1572,8 +1578,9 @@ export class ReputationStore {
     let disputeCount = 0;
 
     for (const a of filtered) {
-      // Trust-clamped tier: an imported attestation cannot claim a privileged
-      // tier this instance never witnessed (see trustedSovereigntyTier).
+      // Trust-clamped tier (unconditional — see trustedSovereigntyTier): no
+      // stored attestation, imported or local, may claim a privileged tier
+      // above self-attested.
       const tier = trustedSovereigntyTier(a);
       if (tier) tierDist[tier]++;
 
@@ -1607,10 +1614,11 @@ export class ReputationStore {
    * scoring-visible `attestation.data.sovereignty_tier` through
    * trustedSovereigntyTier, so this is the single trust chokepoint for scoring:
    * a caller cannot feed a raw privileged tier into computeWeightedScore or a
-   * tier distribution by forgetting to clamp. An imported or unknown-provenance
-   * attestation that self-asserts a privileged ("verified-*") tier is returned
-   * clamped to the non-privileged import ceiling (self-attested); a provably
-   * local record (imported === false) is returned unchanged.
+   * tier distribution by forgetting to clamp. ANY attestation that self-
+   * asserts a privileged ("verified-*") tier is returned clamped to the
+   * non-privileged ceiling (self-attested) — imported, unknown-provenance, and
+   * provably-local (imported === false) records alike (A11: the clamp is
+   * unconditional; see trustedSovereigntyTier).
    *
    * The clamp is applied to a SCORING VIEW built on a fresh object spine, not to
    * the persisted record: the signed `attestation.data` on disk is left

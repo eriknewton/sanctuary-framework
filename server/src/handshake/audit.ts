@@ -45,6 +45,12 @@ export type HandshakeFailureReason =
   | "session_unknown"
   | "session_state_mismatch"
   | "session_expired"
+  // Class-level self-vouch guard (register §Z RECHECK / LD2-02): the
+  // counterparty's signing DID is one this fortress currently holds
+  // (identityManager.list()), so the "verification" would be self-referential
+  // rather than independent. Distinct from sameSigningKey's identical-key
+  // rejection in protocol.ts — this catches two DISTINCT locally-held keys.
+  | "self_vouch_local_did"
   | "other";
 
 /** Reasons a handshake may be aborted (operator or transport). */

@@ -18,6 +18,7 @@ import {
   rotateKeys,
   sign as identitySign,
   verify as identityVerify,
+  assertEd25519PublicKey,
   type StoredIdentity,
   type PublicIdentity,
   type RotationEvent,
@@ -215,6 +216,51 @@ function optionalNonEmptyString(
   return requireNonEmptyString(value, key, name);
 }
 
+/**
+ * Ingest chokepoint for a stored identity's `public_key` (register §Z
+ * RECHECK MUST-FIX-1, CRITICAL). This is the ROOT fix: every local-identity
+ * trust guard — `isLocallyHeldPublicKey` (handshake producer, federation
+ * register-time check) and `resolveTierByDid`'s local-DID cap (via
+ * `requireLocalDidEncodings`) — builds its "identities this fortress holds"
+ * set from each held identity's STORED `public_key`. Before this check, a
+ * decode failure on that field silently dropped the identity from every
+ * such set (`localDidEncodings`/`isLocallyHeldPublicKey`'s per-identity
+ * catch returned nothing for it), so an identity imported with a
+ * garbage/undecodable `public_key` was invisible to every local-identity
+ * guard even though it could still SIGN with its real (decryptable) private
+ * key — a self-vouch from that identity would then be misjudged as a
+ * genuine remote counterparty. Rejecting a non-decodable `public_key` here,
+ * at the only two places a `StoredIdentity` enters memory
+ * (`normalizeImportedIdentity` below and `IdentityManager.load()`),
+ * guarantees every HELD identity's key decodes, so the local sets can never
+ * silently miss one. Fails closed: an unparseable or wrong-length key
+ * refuses the identity outright rather than persisting it in a
+ * partially-trusted state.
+ */
+function requireEd25519PublicKeyBase64url(
+  value: Record<string, unknown>,
+  key: string,
+  name: string
+): string {
+  const field = requireNonEmptyString(value, key, name);
+  let decoded: Uint8Array;
+  try {
+    decoded = fromBase64url(field);
+  } catch {
+    throw new Error(
+      `${name}.${key} must be a valid base64url-encoded Ed25519 public key.`
+    );
+  }
+  try {
+    assertEd25519PublicKey(decoded);
+  } catch {
+    throw new Error(
+      `${name}.${key} must be a valid base64url-encoded Ed25519 public key.`
+    );
+  }
+  return field;
+}
+
 function requireSha256Digest(
   value: Record<string, unknown>,
   key: string,
@@ -329,7 +375,11 @@ function normalizeImportedIdentity(payload: unknown): StoredIdentity {
   return {
     identity_id: requireNonEmptyString(record, "identity_id", "identity_import.identity"),
     label: requireNonEmptyString(record, "label", "identity_import.identity"),
-    public_key: requireNonEmptyString(record, "public_key", "identity_import.identity"),
+    public_key: requireEd25519PublicKeyBase64url(
+      record,
+      "public_key",
+      "identity_import.identity"
+    ),
     did: requireNonEmptyString(record, "did", "identity_import.identity"),
     created_at: requireNonEmptyString(record, "created_at", "identity_import.identity"),
     key_type: requireOneOf(
@@ -452,6 +502,47 @@ export class IdentityManager {
     return derivePurposeKey(this.masterKey, "identity-encryption");
   }
 
+  /**
+   * Structural boundary assert (register §Z RECHECK MUST-FIX-1, round 3):
+   * the SINGLE point through which every `StoredIdentity` passes on its way
+   * into the guarded in-memory `identities` map. `load()` and `save()` (and
+   * therefore `saveNew()`, and every direct `save()` caller across
+   * sanctuary-tools, dashboard-standalone, cli/identity, wrap/init,
+   * wrap/cli) both call this before `identities.set(...)`, so no
+   * StoredIdentity can enter the guarded set without a well-formed Ed25519
+   * public_key BY CONSTRUCTION, not by each caller remembering to validate.
+   * Every local-identity trust guard (isLocallyHeldPublicKey,
+   * requireLocalDidEncodings) builds its "identities this fortress holds"
+   * set from these keys, so an undecodable key here would make an identity
+   * invisible to those guards. `normalizeImportedIdentity`'s
+   * `requireEd25519PublicKeyBase64url` (above) already validates the import
+   * path with a friendlier per-field error message; this assert is the
+   * backstop that holds even for a *future* caller that seats an identity
+   * some other way. It decodes the same base64url bytes those paths already
+   * paid for, so on an already-validated identity it is a cheap idempotent
+   * recheck, not a second expensive re-parse.
+   */
+  private assertValidStoredIdentity(identity: StoredIdentity): void {
+    let decoded: Uint8Array;
+    try {
+      decoded = fromBase64url(identity.public_key);
+    } catch {
+      throw new Error(
+        `identity ${identity.identity_id} has a non-base64url public_key; ` +
+          "refusing to admit it into the identity set."
+      );
+    }
+    try {
+      assertEd25519PublicKey(decoded);
+    } catch {
+      throw new Error(
+        `identity ${identity.identity_id} has a public_key that does not ` +
+          "decode to a well-formed Ed25519 key; refusing to admit it into " +
+          "the identity set."
+      );
+    }
+  }
+
   /** Load identities from storage on startup.
    *  Returns { total: number of encrypted files found, loaded: number successfully decrypted }.
    *  A mismatch (total > 0, loaded === 0) indicates a wrong master key / missing passphrase.
@@ -466,6 +557,21 @@ export class IdentityManager {
         const encrypted = JSON.parse(bytesToString(raw));
         const decrypted = decrypt(encrypted, this.encryptionKey);
         const identity: StoredIdentity = JSON.parse(bytesToString(decrypted));
+        // Ingest chokepoint, load-path half (register §Z RECHECK
+        // MUST-FIX-1): a record already on disk with an undecodable
+        // public_key predates this check or reached storage some other
+        // way. Refusing to LOAD it (rather than loading it and letting
+        // every local-identity guard silently miss it) keeps the same
+        // guarantee `requireEd25519PublicKeyBase64url` gives the import
+        // path — every identity this fortress holds in memory has a
+        // decodable key, so `isLocallyHeldPublicKey` /
+        // `requireLocalDidEncodings` can never fail to see it. Folds into
+        // the existing `failed` counter: a corrupt-key record reads the
+        // same as any other corrupt/undecryptable identity file. Routed
+        // through the same structural `assertValidStoredIdentity` boundary
+        // `save()` uses (round 3), so load and save share one check rather
+        // than two hand-mirrored ones that could drift.
+        this.assertValidStoredIdentity(identity);
         this.identities.set(identity.identity_id, identity);
       } catch {
         failed++;
@@ -500,6 +606,15 @@ export class IdentityManager {
 
   /** Save an identity to storage */
   async save(identity: StoredIdentity): Promise<void> {
+    // Structural chokepoint (register §Z RECHECK MUST-FIX-1, round 3):
+    // every direct save() caller (sanctuary-tools, dashboard-standalone,
+    // cli/identity, wrap/init, wrap/cli) and every saveNew()/rotation
+    // caller funnels through here before identities.set(...) below, so
+    // this is the ONE assert that has to hold for the whole class to be
+    // closed at the map-insertion boundary rather than by caller
+    // convention. Runs before any disk write, so a rejected identity is
+    // never persisted either.
+    this.assertValidStoredIdentity(identity);
     // Two-factor custody floor (I4/F6) for NEW identities, enforced here
     // (not only in saveNew) because several callers - sanctuary_bootstrap,
     // wrap-auto identity creation - persist through save() directly

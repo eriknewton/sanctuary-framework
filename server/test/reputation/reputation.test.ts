@@ -1865,6 +1865,11 @@ describe("L4 Reputation Store", () => {
     });
 
     it("counts attestations by tier and context, tracks the most recent", async () => {
+      // A11 (register §Z RECHECK, ratified): trustedSovereigntyTier clamps
+      // UNCONDITIONALLY, so the "a1" record's declared verified-sovereign
+      // tier reads back as self-attested here even though it is a local
+      // (imported: false) record — a local record's signer is always locally
+      // held, so it can never legitimately outrank self-attested.
       const storage = new MemoryStorage();
       const masterKey = generateRandomKey();
       const store = new ReputationStore(storage, masterKey);
@@ -1891,8 +1896,8 @@ describe("L4 Reputation Store", () => {
 
       const summary = await store.summarizeForSHR();
       expect(summary.attestation_count).toBe(3);
-      expect(summary.tier_distribution["verified-sovereign"]).toBe(1);
-      expect(summary.tier_distribution["self-attested"]).toBe(1);
+      expect(summary.tier_distribution["verified-sovereign"]).toBe(0);
+      expect(summary.tier_distribution["self-attested"]).toBe(2);
       expect(summary.tier_distribution["unverified"]).toBe(1);
       expect(summary.context_breakdown["commerce"]).toBe(2);
       expect(summary.context_breakdown["negotiation"]).toBe(1);
@@ -2091,9 +2096,13 @@ describe("L4 Reputation Store", () => {
       expect(weighted.tier_distribution["self-attested"]).toBe(1);
     });
 
-    it("does NOT clamp a locally recorded verified-sovereign tier", async () => {
-      // Regression guard: the clamp must apply ONLY to imported attestations.
-      // A locally recorded tier came from a handshake this instance witnessed.
+    it("clamps a locally recorded verified-sovereign tier too (A11, unconditional)", async () => {
+      // A11 (register §Z RECHECK, ratified): FLIPPED from the pre-A11
+      // "does NOT clamp" regression guard. A locally recorded tier is signed
+      // with a LOCALLY-HELD key by construction, so it can never legitimately
+      // exceed self-attested either — trust cannot originate from a key this
+      // fortress holds. The clamp is now unconditional (see
+      // trustedSovereigntyTier); imported:false no longer bypasses it.
       const storage = new MemoryStorage();
       const masterKey = generateRandomKey();
       const store = new ReputationStore(storage, masterKey);
@@ -2108,9 +2117,10 @@ describe("L4 Reputation Store", () => {
       );
 
       const summary = await store.summarizeForSHR();
-      expect(summary.tier_distribution["verified-sovereign"]).toBe(1);
+      expect(summary.tier_distribution["verified-sovereign"]).toBe(0);
+      expect(summary.tier_distribution["self-attested"]).toBe(1);
       const stored = await store.loadAllForTierScoring({});
-      expect(trustedSovereigntyTier(stored[0]!)).toBe("verified-sovereign");
+      expect(trustedSovereigntyTier(stored[0]!)).toBe("self-attested");
     });
 
     // Write a StoredAttestation straight into the encrypted _reputation
@@ -2221,9 +2231,10 @@ describe("L4 Reputation Store", () => {
       expect(weighted.tier_distribution["self-attested"]).toBe(1);
     });
 
-    it("does NOT clamp a record explicitly marked imported:false", async () => {
-      // The other half of the fail-closed pair: only a provably-local record
-      // (imported === false) escapes the clamp. This is what record() now stamps.
+    it("clamps a record explicitly marked imported:false too (A11, unconditional)", async () => {
+      // A11 (register §Z RECHECK, ratified): FLIPPED from the pre-A11
+      // "does NOT clamp" fail-closed-pair guard. imported:false no longer
+      // exempts a record from the clamp — see trustedSovereigntyTier.
       const storage = new MemoryStorage();
       const masterKey = generateRandomKey();
       const store = new ReputationStore(storage, masterKey);
@@ -2245,18 +2256,19 @@ describe("L4 Reputation Store", () => {
       const stored = await store.loadAllForTierScoring({});
       expect(stored).toHaveLength(1);
       expect(stored[0]!.imported).toBe(false);
-      expect(trustedSovereigntyTier(stored[0]!)).toBe("verified-sovereign");
-      // Boundary chokepoint regression: a provably-local record is NOT clamped,
-      // so the raw tier field of the scoring view is left at verified-sovereign.
+      expect(trustedSovereigntyTier(stored[0]!)).toBe("self-attested");
+      // Boundary chokepoint: imported:false no longer exempts a record, so the
+      // raw tier field of the scoring view is clamped too.
       expect(stored[0]!.attestation.data.sovereignty_tier).toBe(
-        "verified-sovereign"
+        "self-attested"
       );
     });
 
     it("record() stamps genuinely-local attestations with imported:false", async () => {
       // Guard the write side: a locally recorded attestation must carry the
-      // explicit local marker so it is correctly NOT clamped, and so it is
-      // distinguishable from an unknown-provenance legacy record.
+      // explicit local marker for audit/export/dedup provenance, distinguishing
+      // it from an unknown-provenance legacy record. It no longer exempts the
+      // record from the trustedSovereigntyTier clamp (A11: unconditional).
       const storage = new MemoryStorage();
       const masterKey = generateRandomKey();
       const store = new ReputationStore(storage, masterKey);

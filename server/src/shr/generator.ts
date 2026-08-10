@@ -137,8 +137,17 @@ export function deriveReputationDegradations(
         code: "LOW_TIER_DOMINANCE",
         severity: "info",
         description: `${pct}% of attestations are self-attested or unverified`,
+        // A11 honest-bound correction (register §Z RECHECK): a sovereignty
+        // handshake does NOT raise the tier of attestations THIS instance
+        // records. reputation_record and bridge_attest cap the signer's own
+        // tier at self-attested (REP-01), and the storage-level clamp
+        // (trustedSovereigntyTier) enforces the same cap for every stored
+        // attestation regardless of caller — verified-sovereign and
+        // verified-degraded are not reachable through those two tools. The
+        // old mitigation text promised the opposite; keep this one accurate
+        // rather than softened.
         mitigation:
-          "Complete sovereignty handshakes with counterparties to upgrade future attestations to verified tiers",
+          "Self-attested and unverified are the tiers reachable through reputation_record and bridge_attest",
       });
     }
 

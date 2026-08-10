@@ -20,7 +20,7 @@ import { derivePurposeKey } from "../core/key-derivation.js";
 import { fromBase64url, stringToBytes } from "../core/encoding.js";
 import { encrypt, decrypt, type EncryptedPayload } from "../core/encryption.js";
 import { bytesToString } from "../core/encoding.js";
-import { publicKeyToDid, type StoredIdentity } from "../core/identity.js";
+import { publicKeyToDid, requireLocalDidEncodings, type StoredIdentity } from "../core/identity.js";
 import {
   BRIDGE_METRIC_POLICY,
   BridgeAttestationMetricValidationError,
@@ -89,7 +89,7 @@ export function createBridgeTools(
   masterKey: Uint8Array,
   identityManager: IdentityManager,
   auditLog: AuditLog,
-  handshakeResults?: Map<string, HandshakeResult>
+  handshakeResults?: ReadonlyMap<string, HandshakeResult>
 ): { tools: ToolDefinition[] } {
   const bridgeStore = new BridgeStore(storage, masterKey);
   const reputationStore = new ReputationStore(storage, masterKey);
@@ -569,12 +569,21 @@ export function createBridgeTools(
         // REP-01: the signer (identity.did) is a LOCAL identity; cap it at
         // self-attested (a handshake-map match for a local signer is a
         // self-vouch). Passing exactly the signer DID is race-free. The storage
-        // chokepoint (trustedSovereigntyTier) enforces the same cap at scoring.
+        // chokepoint (trustedSovereigntyTier, A11 — now an UNCONDITIONAL
+        // clamp) enforces the same cap at scoring for every record, including
+        // a pre-fix laundered record or a direct ReputationStore.record()
+        // caller that bypasses this tool. requireLocalDidEncodings (not bare
+        // identity.did) so BOTH DID encodings this identity's key could be
+        // persisted under are capped — see resolveTierByDid's doc. The
+        // "require" (hard-fail) form, not the soft localDidEncodings, because
+        // `identity` is a HELD identity: a decode failure on our own key
+        // material is an integrity error and must refuse the record, never
+        // silently produce an empty cap set (register §Z RECHECK MUST-FIX-1).
         const tierMeta: TierMetadata = resolveTierByDid(
           identity.did,
           hsResults,
           true,
-          new Set([identity.did])
+          new Set(requireLocalDidEncodings(identity.public_key))
         );
         const tier = tierMeta.sovereignty_tier;
 

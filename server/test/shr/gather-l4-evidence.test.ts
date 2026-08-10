@@ -35,7 +35,12 @@ describe("gatherReputationEvidence", () => {
     expect(ev.dispute_count).toBe(0);
   });
 
-  it("picks up recorded attestations for the identity", async () => {
+  it("picks up recorded attestations for the identity, clamped to self-attested (A11)", async () => {
+    // A11 (register §Z RECHECK, ratified): trustedSovereigntyTier clamps
+    // UNCONDITIONALLY now, so a stored attestation's declared tier can never
+    // read back as verified-sovereign through this evidence path, even for a
+    // local (imported: false) record — a local record's signer is always
+    // locally held, so it can never legitimately be more than self-attested.
     const { store, auditLog, identity, encryptionKey } = setup();
     await store.record(
       "txn-1",
@@ -49,7 +54,8 @@ describe("gatherReputationEvidence", () => {
     );
     const ev = await gatherReputationEvidence(store, auditLog, identity);
     expect(ev.attestation_count).toBe(1);
-    expect(ev.tier_distribution["verified-sovereign"]).toBe(1);
+    expect(ev.tier_distribution["verified-sovereign"]).toBe(0);
+    expect(ev.tier_distribution["self-attested"]).toBe(1);
     expect(ev.most_recent_attestation_at).toBeTruthy();
   });
 

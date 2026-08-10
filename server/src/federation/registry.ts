@@ -10,7 +10,12 @@
  * - Peer capabilities (what operations they support)
  *
  * Security invariants:
- * - Peers are ONLY added through completed handshakes (not self-registration)
+ * - Peers are ONLY added through a completed handshake with a counterparty
+ *   this fortress does not hold keys for (never self-registration; see
+ *   register §Z RECHECK / LD2-02 — the shared handshakeResults map this
+ *   registry reads from is kept free of self-vouched entries at the
+ *   producer, handshake/tools.ts recordHandshakeResult, and the caller in
+ *   federation/tools.ts re-checks identityManager.list() independently)
  * - Trust tiers degrade automatically when handshakes expire
  * - Peer data is stored encrypted under L1 sovereignty
  */
@@ -36,7 +41,9 @@ export class FederationRegistry {
 
   /**
    * Register or update a peer from a completed handshake.
-   * This is the ONLY way peers enter the registry.
+   * This is the ONLY way peers enter the registry, and the caller
+   * (federation/tools.ts) refuses a peer_did this fortress holds keys for
+   * before this method is ever reached.
    */
   registerFromHandshake(
     result: HandshakeResult,

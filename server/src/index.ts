@@ -842,7 +842,8 @@ export async function createSanctuaryServer(options?: {
   // 14b. Create Federation tools (MCP-to-MCP)
   const { tools: federationTools } = createFederationTools(
     auditLog,
-    handshakeResults
+    handshakeResults,
+    identityManager
   );
 
   // 14c. Create Bridge tools (Concordia integration)

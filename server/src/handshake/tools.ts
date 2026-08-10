@@ -15,9 +15,13 @@ import type { SanctuaryConfig } from "../config.js";
 import type { IdentityManager } from "../cognitive/tools.js";
 import type { AuditLog } from "../operational/audit-log.js";
 import { generateSHR, type SHRGeneratorOptions } from "../shr/generator.js";
-import { sign as identitySign } from "../core/identity.js";
+import {
+  sign as identitySign,
+  publicKeyToDid,
+  isLocallyHeldPublicKey,
+} from "../core/identity.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
-import { toBase64url } from "../core/encoding.js";
+import { toBase64url, fromBase64url } from "../core/encoding.js";
 import {
   initiateHandshake,
   respondToHandshake,
@@ -63,13 +67,25 @@ export function createHandshakeTools(
   masterKey: Uint8Array,
   auditLog: AuditLog,
   options?: HandshakeToolsOptions
-): { tools: ToolDefinition[]; handshakeResults: Map<string, HandshakeResult> } {
+): {
+  tools: ToolDefinition[];
+  // Exposed to every consumer (federation, dashboard, reputation, bridge) as
+  // a ReadonlyMap: recordHandshakeResult below is the ONLY writer, and MUST
+  // stay the only writer, since it is the producer chokepoint the whole
+  // self-vouch class is closed at (register §Z RECHECK). The type system
+  // enforces this at every consumer call site; a consumer that needs to
+  // mutate the map is a design error, not a cast to work around.
+  handshakeResults: ReadonlyMap<string, HandshakeResult>;
+} {
   const autoPublishHandshakes = options?.autoPublishHandshakes ?? false;
   const verascoreUrl = options?.verascoreUrl ?? "https://verascore.ai";
   const identityEncKey = derivePurposeKey(masterKey, "identity-encryption");
   // In-memory session store (per server instance lifetime)
   const sessions = new Map<string, HandshakeSession>();
-  // Completed handshake results indexed by counterparty ID — shared with L4 tier resolution
+  // Completed handshake results indexed by counterparty ID — shared with L4
+  // tier resolution. Kept as a mutable Map INTERNALLY (recordHandshakeResult
+  // is the only function in this closure that calls .set on it); the return
+  // type above widens it to ReadonlyMap for every external consumer.
   const handshakeResults = new Map<string, HandshakeResult>();
 
   const shrOpts: SHRGeneratorOptions = {
@@ -77,6 +93,107 @@ export function createHandshakeTools(
     identityManager,
     masterKey,
   };
+
+  const SELF_VOUCH_ERROR =
+    "Self-handshake rejected: an identity cannot verify another identity held by the same fortress";
+
+  /**
+   * Decode a base64url-encoded Ed25519 public key to raw bytes, or undefined
+   * if it cannot be decoded. Every caller below uses the result ONLY to
+   * REFUSE (never to grant trust), so a decode failure just skips the
+   * refusal; a genuinely malformed key is already rejected elsewhere by SHR/
+   * signature verification.
+   */
+  function tryDecodeSignerKey(signedByBase64url: string | undefined): Uint8Array | undefined {
+    if (!signedByBase64url) return undefined;
+    try {
+      return fromBase64url(signedByBase64url);
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * Derive the DID for a base64url-encoded Ed25519 public key, or undefined
+   * if it cannot be decoded. INFORMATIONAL ONLY (audit-log readability) —
+   * never use this for the local-identity TRUST decision; see
+   * isLocallyHeldSignerKey / isLocallyHeldPublicKey below for why a DID
+   * string is not safe to compare against a persisted identity's `.did`.
+   */
+  function tryDeriveDid(signedByBase64url: string | undefined): string | undefined {
+    if (!signedByBase64url) return undefined;
+    try {
+      return publicKeyToDid(fromBase64url(signedByBase64url));
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * Is `signerPublicKey` the raw signing key of an identity THIS fortress
+   * currently holds? Computed FRESH via identityManager.list() on every call
+   * (never cached at module-load or server-boot time), so an identity
+   * created after startup is covered. Delegates to the shared
+   * isLocallyHeldPublicKey predicate (core/identity.ts) — comparing DECODED
+   * KEY BYTES, never a DID string, because a persisted identity's `.did` can
+   * be in the legacy base64url encoding (see legacyPublicKeyToDid) while a
+   * freshly-derived DID uses the canonical base58btc encoding; DID-string
+   * equality silently fails to recognize a legacy-encoded local identity as
+   * local (the #1194-class defect this guard exists to close).
+   */
+  function isLocallyHeldSignerKey(signerPublicKey: Uint8Array | undefined): boolean {
+    return isLocallyHeldPublicKey(signerPublicKey, identityManager.list());
+  }
+
+  /**
+   * CLASS-LEVEL SELF-VOUCH CHOKEPOINT (register §Z RECHECK / LD2-02, LD2-02b).
+   *
+   * `handshakeResults` is a SHARED SUBSTRATE: federation (peer registration),
+   * the operator dashboard (handshake panel), and reputation/bridge tier
+   * resolution all read from this ONE map. A poisoned entry that slips in
+   * here is inherited as "verified" by every one of those consumers,
+   * regardless of whether that consumer holds its own local-custody check
+   * (neither federation nor the dashboard did — that was LD2-02 / LD2-02b).
+   * Refusing the WRITE at the producer, rather than gating each consumer
+   * separately, closes the whole class at once: no future consumer of this
+   * map can be tricked by an entry that never exists.
+   *
+   * Every `handshakeResults.set(...)` in this file funnels through this one
+   * function. A counterparty is "locally held" when its signing KEY BYTES
+   * equal the key bytes of an identity THIS fortress currently holds
+   * (isLocallyHeldSignerKey — compares decoded key material, never a DID
+   * string; see that function's doc for the legacy-DID-encoding defect this
+   * closes). The protocol-level `sameSigningKey()` guard (protocol.ts) only
+   * rejects the degenerate case of an IDENTICAL key signing both sides of a
+   * handshake; two DISTINCT locally-held keys (identity A handshaking
+   * identity B, both created by the same operator) pass every
+   * sameSigningKey check and are exactly the case this chokepoint closes.
+   */
+  function recordHandshakeResult(
+    result: HandshakeResult,
+    auditIdentityId: string
+  ): { ok: true } | { ok: false; error: string } {
+    const counterpartyKey = tryDecodeSignerKey(result.counterparty_shr.signed_by);
+    if (isLocallyHeldSignerKey(counterpartyKey)) {
+      // counterparty_did here is derived ONLY for the audit trail's
+      // readability; the trust decision above already ran on decoded key
+      // bytes, never this string.
+      const counterpartyDid = tryDeriveDid(result.counterparty_shr.signed_by);
+      void auditLog.append(
+        "l4",
+        "handshake_self_vouch_blocked",
+        auditIdentityId,
+        {
+          counterparty_id: result.counterparty_id,
+          ...(counterpartyDid ? { counterparty_did: counterpartyDid } : {}),
+        },
+        "failure"
+      );
+      return { ok: false, error: SELF_VOUCH_ERROR };
+    }
+    handshakeResults.set(result.counterparty_id, result);
+    return { ok: true };
+  }
 
   const tools: ToolDefinition[] = [
     {
@@ -149,6 +266,26 @@ export function createHandshakeTools(
         const shr = generateSHR(args.identity_id as string | undefined, shrOpts);
         if (typeof shr === "string") {
           return toolResult({ error: shr });
+        }
+
+        // Class-level self-vouch chokepoint (see recordHandshakeResult):
+        // refuse a challenge from a counterparty this fortress already holds
+        // keys for, before ever generating a response or advancing any
+        // session state. sameSigningKey() inside respondToHandshake only
+        // rejects an IDENTICAL key on both sides; this is the earliest point
+        // that can catch the case it cannot — two DISTINCT locally-held keys.
+        // Compares decoded key bytes (isLocallyHeldSignerKey), never a DID
+        // string — see that function's doc.
+        if (isLocallyHeldSignerKey(tryDecodeSignerKey(challenge.shr?.signed_by))) {
+          void auditLog.append("l4", "handshake_respond", shr.body.instance_id, undefined, "failure");
+          auditHandshakeFailed(auditLog, {
+            session_id: "unknown",
+            role: "responder",
+            identity_id: shr.body.instance_id,
+            reason: "self_vouch_local_did",
+            error: SELF_VOUCH_ERROR,
+          });
+          return toolResult({ error: SELF_VOUCH_ERROR });
         }
 
         const result = respondToHandshake(
@@ -367,13 +504,40 @@ export function createHandshakeTools(
           return toolResult({ error: result.error });
         }
 
+        // Class-level self-vouch chokepoint: refuse to RECORD (and therefore
+        // to complete) when the responder's signing key belongs to an
+        // identity this fortress already holds — the case sameSigningKey()
+        // above cannot catch (two distinct locally-held keys). Reject before
+        // the session is marked completed so the caller gets an explicit
+        // refusal instead of a silently-unrecorded "success".
+        const recorded = recordHandshakeResult(
+          result.result,
+          session.our_shr.body.instance_id
+        );
+        if (!recorded.ok) {
+          session.state = "failed";
+          void auditLog.append(
+            "l4",
+            "handshake_complete",
+            session.our_shr.body.instance_id,
+            undefined,
+            "failure"
+          );
+          auditHandshakeFailed(auditLog, {
+            session_id: sessionId,
+            role: "initiator",
+            identity_id: session.our_shr.body.instance_id,
+            counterparty_id: result.result.counterparty_id,
+            reason: "self_vouch_local_did",
+            error: recorded.error,
+          });
+          return toolResult({ error: recorded.error });
+        }
+
         session.state = "completed";
         session.their_shr = response.shr;
         session.their_nonce = response.responder_nonce;
         session.result = result.result;
-
-        // Store completed result for tier resolution
-        handshakeResults.set(result.result.counterparty_id, result.result);
 
         void auditLog.append("l4", "handshake_complete", session.our_shr.body.instance_id);
         auditHandshakeCompleted(auditLog, {
@@ -451,14 +615,36 @@ export function createHandshakeTools(
         // completion is verified the session advances to completed/failed and
         // can never be re-verified (replay of the completion message).
         if (completion && session.role === "responder" && session.state === "responded") {
-          const result = verifyCompletion(completion, session);
+          let result = verifyCompletion(completion, session);
+          let selfVouchError: string | undefined;
+
+          // Class-level self-vouch chokepoint: a verified completion still
+          // must not be RECORDED when the initiator's signing key belongs to
+          // an identity this fortress already holds. Reached only when
+          // sameSigningKey() (protocol.ts) already passed — i.e. the two
+          // distinct-local-keys case. On refusal, downgrade the returned
+          // result to unverified exactly as an invalid nonce signature would,
+          // rather than silently reporting verified:true for an entry that
+          // was never written.
+          if (result.verified) {
+            const recorded = recordHandshakeResult(
+              result,
+              session.our_shr.body.instance_id
+            );
+            if (!recorded.ok) {
+              selfVouchError = recorded.error;
+              result = {
+                ...result,
+                verified: false,
+                trust_tier: "unverified",
+                liveness_proven: false,
+                errors: [...result.errors, recorded.error],
+              };
+            }
+          }
+
           session.state = result.verified ? "completed" : "failed";
           session.result = result;
-
-          // Store completed result for tier resolution
-          if (result.verified) {
-            handshakeResults.set(result.counterparty_id, result);
-          }
 
           void auditLog.append(
             "l4",
@@ -481,8 +667,10 @@ export function createHandshakeTools(
               role: "responder",
               identity_id: session.our_shr.body.instance_id,
               counterparty_id: result.counterparty_id,
-              reason: classifyCompleteFailure(result.errors.join("; ")),
-              error: result.errors.join("; "),
+              reason: selfVouchError
+                ? "self_vouch_local_did"
+                : classifyCompleteFailure(result.errors.join("; ")),
+              error: selfVouchError ?? result.errors.join("; "),
             });
           }
 
@@ -581,17 +769,26 @@ export function createHandshakeTools(
             verificationResult.counterparty_id
           );
           if (!existing || (!existing.verified && !existing.liveness_proven)) {
-            handshakeResults.set(verificationResult.counterparty_id, {
-              counterparty_id: verificationResult.counterparty_id,
-              counterparty_shr: counterpartySHR,
-              verified: false,
-              sovereignty_level: sovereigntyLevel,
-              trust_tier: "unverified",
-              completed_at: new Date().toISOString(),
-              expires_at: verificationResult.expires_at,
-              errors: [],
-              liveness_proven: false,
-            });
+            // Class-level self-vouch chokepoint: even an unverified preview
+            // entry is refused when it describes a counterparty this fortress
+            // already holds keys for — funneled through the SAME shared
+            // recordHandshakeResult() every other write site uses, so a
+            // future consumer of this map never has to special-case
+            // "preview" entries differently from "completed" ones.
+            recordHandshakeResult(
+              {
+                counterparty_id: verificationResult.counterparty_id,
+                counterparty_shr: counterpartySHR,
+                verified: false,
+                sovereignty_level: sovereigntyLevel,
+                trust_tier: "unverified",
+                completed_at: new Date().toISOString(),
+                expires_at: verificationResult.expires_at,
+                errors: [],
+                liveness_proven: false,
+              },
+              ourSHR.body.instance_id
+            );
           }
         }
 
