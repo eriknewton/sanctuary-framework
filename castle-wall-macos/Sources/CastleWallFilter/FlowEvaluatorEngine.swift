@@ -147,10 +147,40 @@ public final class FlowEvaluatorEngine {
         }
 
         if armLease.failOpenReason() != nil {
-            // Intentional operator-armed degrade: an expired/stopped dead-man
-            // lease fails OPEN so an SSH-only operator can always recover from
-            // a wedged Tahoe NE preference subsystem. The marker is surfaced as
-            // the matched rule id so every bypassed flow is loud in audit.
+            // AR-1: an expired/stopped dead-man lease used to fail OPEN for EVERY
+            // origin, which left an AGENT unconfined for the entire daemon-down
+            // window (measured multi-hour unconfined windows on a production host
+            // on 2026-07-29 / 08-01). The fail-open exists as an anti-lockout
+            // recovery path, but only the OPERATOR needs it: an SSH-only operator
+            // must still reach a box whose daemon is wedged. So keep the fail-open
+            // for the operator origin, and fail CLOSED for agents — evaluate the
+            // agent flow against the last-known manifest and drop, exactly like
+            // the missing-lease degrade above. The rule id stays loud in audit so
+            // every dead-man decision (operator bypass or agent denial) is
+            // attributable.
+            let origin = OriginClassifier.originClass(
+                descriptor: descriptor,
+                agentOrigin: agentOrigin
+            )
+            if origin != .operator {
+                if let snapshot = manifestStore.currentSnapshot() {
+                    let outcome = AllowlistEvaluator.evaluate(
+                        flow: descriptor,
+                        rules: snapshot.rules,
+                        agentOrigin: agentOrigin,
+                        operatorBaseline: snapshot.operatorBaseline
+                    )
+                    if case .drop = outcome {
+                        return outcome
+                    }
+                }
+                // No manifest to consult, or the manifest would have allowed it:
+                // fail CLOSED anyway. During a dead-man window an agent flow must
+                // never pass on a degraded, unverifiable posture.
+                return .drop(matchedRuleId: ArmLease.failClosedDeadManRuleId)
+            }
+            // Operator origin: preserve the recovery fail-open so a daemon-down
+            // box is never self-inflicted-locked-out of operator SSH/console.
             return .allow(matchedRuleId: ArmLease.failOpenRuleId)
         }
 
