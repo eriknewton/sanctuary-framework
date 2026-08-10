@@ -502,6 +502,47 @@ export class IdentityManager {
     return derivePurposeKey(this.masterKey, "identity-encryption");
   }
 
+  /**
+   * Structural boundary assert (register §Z RECHECK MUST-FIX-1, round 3):
+   * the SINGLE point through which every `StoredIdentity` passes on its way
+   * into the guarded in-memory `identities` map. `load()` and `save()` (and
+   * therefore `saveNew()`, and every direct `save()` caller across
+   * sanctuary-tools, dashboard-standalone, cli/identity, wrap/init,
+   * wrap/cli) both call this before `identities.set(...)`, so no
+   * StoredIdentity can enter the guarded set without a well-formed Ed25519
+   * public_key BY CONSTRUCTION, not by each caller remembering to validate.
+   * Every local-identity trust guard (isLocallyHeldPublicKey,
+   * requireLocalDidEncodings) builds its "identities this fortress holds"
+   * set from these keys, so an undecodable key here would make an identity
+   * invisible to those guards. `normalizeImportedIdentity`'s
+   * `requireEd25519PublicKeyBase64url` (above) already validates the import
+   * path with a friendlier per-field error message; this assert is the
+   * backstop that holds even for a *future* caller that seats an identity
+   * some other way. It decodes the same base64url bytes those paths already
+   * paid for, so on an already-validated identity it is a cheap idempotent
+   * recheck, not a second expensive re-parse.
+   */
+  private assertValidStoredIdentity(identity: StoredIdentity): void {
+    let decoded: Uint8Array;
+    try {
+      decoded = fromBase64url(identity.public_key);
+    } catch {
+      throw new Error(
+        `identity ${identity.identity_id} has a non-base64url public_key; ` +
+          "refusing to admit it into the identity set."
+      );
+    }
+    try {
+      assertEd25519PublicKey(decoded);
+    } catch {
+      throw new Error(
+        `identity ${identity.identity_id} has a public_key that does not ` +
+          "decode to a well-formed Ed25519 key; refusing to admit it into " +
+          "the identity set."
+      );
+    }
+  }
+
   /** Load identities from storage on startup.
    *  Returns { total: number of encrypted files found, loaded: number successfully decrypted }.
    *  A mismatch (total > 0, loaded === 0) indicates a wrong master key / missing passphrase.
@@ -526,8 +567,11 @@ export class IdentityManager {
         // decodable key, so `isLocallyHeldPublicKey` /
         // `requireLocalDidEncodings` can never fail to see it. Folds into
         // the existing `failed` counter: a corrupt-key record reads the
-        // same as any other corrupt/undecryptable identity file.
-        assertEd25519PublicKey(fromBase64url(identity.public_key));
+        // same as any other corrupt/undecryptable identity file. Routed
+        // through the same structural `assertValidStoredIdentity` boundary
+        // `save()` uses (round 3), so load and save share one check rather
+        // than two hand-mirrored ones that could drift.
+        this.assertValidStoredIdentity(identity);
         this.identities.set(identity.identity_id, identity);
       } catch {
         failed++;
@@ -562,6 +606,15 @@ export class IdentityManager {
 
   /** Save an identity to storage */
   async save(identity: StoredIdentity): Promise<void> {
+    // Structural chokepoint (register §Z RECHECK MUST-FIX-1, round 3):
+    // every direct save() caller (sanctuary-tools, dashboard-standalone,
+    // cli/identity, wrap/init, wrap/cli) and every saveNew()/rotation
+    // caller funnels through here before identities.set(...) below, so
+    // this is the ONE assert that has to hold for the whole class to be
+    // closed at the map-insertion boundary rather than by caller
+    // convention. Runs before any disk write, so a rejected identity is
+    // never persisted either.
+    this.assertValidStoredIdentity(identity);
     // Two-factor custody floor (I4/F6) for NEW identities, enforced here
     // (not only in saveNew) because several callers - sanctuary_bootstrap,
     // wrap-auto identity creation - persist through save() directly

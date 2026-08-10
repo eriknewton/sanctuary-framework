@@ -335,7 +335,7 @@ Verifies a received SHR.
 
 ## 7. Sovereignty-Gated Reputation Tiers
 
-SHRs integrate with the reputation system through sovereignty-gated tiers. Attestations from agents with higher sovereignty levels carry more weight:
+SHRs integrate with the reputation system through sovereignty-gated tiers: the model below defines a per-tier attestation weight, used by the SHR handshake and federation trust protocol (sections 5 and 6). See the implementation bound immediately after the table for how this maps onto reputation scoring of stored attestations.
 
 | Tier | Requirement | Attestation Weight |
 |------|-------------|-------------------|

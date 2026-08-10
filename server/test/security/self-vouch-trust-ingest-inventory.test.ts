@@ -884,8 +884,8 @@ describe("(f) MUST-FIX 1: a legacy-DID-encoded local identity is still recognize
 
     // OLD (pre-fix) shape: a set built from only the LEGACY-encoded `.did` a
     // local identity might be persisted under MISSES a CANONICAL lookup —
-    // falls through to the handshake-map loop, which matches by signing key
-    // and over-credits the poisoned entry's declared verified-sovereign tier.
+    // falls through to the general handshake-map path instead of being
+    // capped as local.
     const legacyOnlySet = new Set([legacyDid]);
     expect(
       resolveTierByDid(canonicalDid, map, true, legacyOnlySet).sovereignty_tier
@@ -908,35 +908,17 @@ describe("(f) MUST-FIX 1: a legacy-DID-encoded local identity is still recognize
 //    undecodable/garbage stored public_key must never silently vanish from
 //    a local-identity trust set ─────────────────────────────────────────
 //
-// REACHABILITY FINDING (recorded here, and restated in BUILD_RESULT.md):
-// the literal end-to-end shape the finding describes — an identity self-
-// vouches by producing a verifiable SHR while its OWN stored `public_key`
-// is garbage — is NOT reachable through the handshake/federation guards,
-// because `shr/generator.ts` sets `signed_by: identity.public_key` VERBATIM
-// (the stored field, not a re-derivation from the private key), and
-// `shr/verifier.ts` verifies the signature against THAT SAME field. A
-// garbage `public_key` therefore makes that identity's OWN SHR
-// unverifiable — the handshake never reaches `verified: true` in the first
-// place, independent of this fix. The gap IS real and reachable one layer
-// down: `resolveTierByDid`'s local-DID check (bridge/tools.ts,
-// reputation/tools.ts) is DID-STRING based, and `identity.did` is an
-// independently-supplied import field with NO binding check against
-// `public_key` — so a decode failure on the local signer's OWN
-// `public_key` collapsing the local set to `[]` (pre-fix) could let a
-// colliding local `did` fall through to the handshake-map loop and borrow
-// a genuinely-verified remote counterparty's declared tier in THAT tool
-// call's OWN response. `trustedSovereigntyTier` (A11, already shipped)
-// unconditionally re-clamps every STORED attestation at read/scoring time
-// regardless of what was written, so this could never become a durable,
-// SCORED trust gain — the exposure this fix closes is a misleading tier
-// value in a single write call's own response, not a scored self-vouch.
-// The fix (validate at ingest; hard-fail the "held identity" set-builder on
-// a decode failure) is still the correct, unconditional posture per
-// AGENTS.md rule 3 ("cannot determine locality" must never mean "not
-// local") — it should not depend on the SHR-binding and A11 coincidences
-// holding forever. Severity is downgraded from "live self-vouch bypass" to
-// "fail-open write-time gap, neutralized for scoring by an independent
-// control, closed here as the correct posture regardless."
+// THE INVARIANT: every local-identity guard's "identities this fortress
+// holds" set must be built from the fortress's FULL held-identity list, with
+// no member silently dropped just because its stored public_key fails to
+// decode. A decode failure has to be treated as an integrity error the
+// caller must handle (per AGENTS.md rule 3, "cannot determine locality" must
+// never mean "not local"), never as a quiet omission from the set. This fix
+// makes that failure loud at ingest (identity_import, IdentityManager.load())
+// instead of letting the set-builder omit the identity and continue.
+// Full reachability tracing and the honest severity bound for the
+// pre-fix window live in the private register (§Z RECHECK fix-round-2), not
+// in this public test source, per AGENTS.md MUST-NEVER #9.
 
 describe("(g) MUST-FIX 1: an undecodable stored public_key never defeats a local-identity guard", () => {
   it("identity_import refuses an identity whose public_key does not decode to a well-formed 32-byte Ed25519 key (ingest chokepoint, root fix)", async () => {
@@ -981,11 +963,29 @@ describe("(g) MUST-FIX 1: an undecodable stored public_key never defeats a local
       ...storedIdentity,
       public_key: "AAAA",
     };
-    // `IdentityManager.save()` itself does not run the identity_import
-    // ingest check (only the MCP tool layer does) — this reproduces a
-    // record already on disk from before this fix existed, or written by
-    // any other path that bypasses the tool.
-    await fortress.identityManager.save(garbageIdentity);
+    // `IdentityManager.save()` now refuses this (round 3: the structural
+    // `assertValidStoredIdentity` boundary), so this reproduces a record
+    // that reached storage some other way instead: a file written before
+    // this fix existed, or a write that bypassed `IdentityManager`
+    // entirely. Writes the same encrypted shape `save()` writes, directly
+    // through the storage backend, so `load()`'s OWN independent check is
+    // what is under test here, not `save()`'s.
+    const encKeyForWrite = derivePurposeKey(
+      fortress.masterKey,
+      "identity-encryption"
+    );
+    await fortress.storage.write(
+      "_identities",
+      garbageIdentity.identity_id,
+      stringToBytes(
+        JSON.stringify(
+          encrypt(
+            stringToBytes(JSON.stringify(garbageIdentity)),
+            encKeyForWrite
+          )
+        )
+      )
+    );
 
     const reloaded = new IdentityManager(fortress.storage, fortress.masterKey);
     const loadResult = await reloaded.load();
@@ -994,6 +994,39 @@ describe("(g) MUST-FIX 1: an undecodable stored public_key never defeats a local
     expect(loadResult.loaded).toBe(0);
     expect(loadResult.failed).toBe(1);
     expect(reloaded.list()).toHaveLength(0);
+  });
+
+  it("IdentityManager.save() itself refuses to admit an identity with a non-decodable public_key into the guarded identities map (round 3: structural boundary, not caller convention)", async () => {
+    // Drives the fix as close to the real persistence boundary as
+    // possible: a direct IdentityManager.save() call, which is what every
+    // current in-repo caller (sanctuary-tools, dashboard-standalone,
+    // cli/identity, wrap/init, wrap/cli, saveNew/rotation) funnels through
+    // before an identity reaches `identities.set(...)`. Before round 3,
+    // this call succeeded (save() trusted every caller to have already
+    // validated); the mutation proof in BUILD_RESULT.md removes the
+    // `assertValidStoredIdentity` call from save() and shows this same
+    // call SUCCEED instead of throwing.
+    const fortress = makeFortress();
+    const encKey = derivePurposeKey(fortress.masterKey, "identity-encryption");
+    const { storedIdentity } = createIdentity(
+      "boundary-garbage-key-identity",
+      encKey,
+      "recovery-key"
+    );
+    const garbageIdentity: StoredIdentity = {
+      ...storedIdentity,
+      public_key: "AAAA",
+    };
+
+    await expect(
+      fortress.identityManager.save(garbageIdentity)
+    ).rejects.toThrow(/refusing to admit it into the identity set/i);
+
+    // Refused before entering the in-memory set AND before any disk write.
+    expect(fortress.identityManager.list()).toHaveLength(0);
+    expect(
+      await fortress.storage.list("_identities")
+    ).toHaveLength(0);
   });
 
   it("isLocallyHeldPublicKey throws (integrity error) rather than silently skipping a held identity whose public_key cannot be decoded (defense-in-depth)", () => {
@@ -1030,7 +1063,7 @@ describe("(g) MUST-FIX 1: an undecodable stored public_key never defeats a local
     expect(localDidEncodings("AAAA")).toEqual([]);
   });
 
-  it("resolveTierByDid: an empty local set produced by a decode failure lets a colliding local DID borrow a genuinely-verified remote counterparty's tier; requireLocalDidEncodings closes it by refusing instead of building the set", () => {
+  it("resolveTierByDid: requireLocalDidEncodings refuses on a decode failure instead of returning an empty local-membership set for a colliding local DID", () => {
     const encKey = derivePurposeKey(generateRandomKey(), "identity-encryption");
     const local = createIdentity("local-signer", encKey, "recovery-key");
     const localDid = local.publicIdentity.did;
@@ -1076,11 +1109,9 @@ describe("(g) MUST-FIX 1: an undecodable stored public_key never defeats a local
     });
 
     // OLD (pre-fix) shape: `localDidEncodings` on a held identity's own
-    // undecodable public_key silently returns [] — the empty set can never
-    // refuse ANYTHING, so the local DID lookup falls through to the
-    // handshake-map loop, which matches by signing key and over-credits the
-    // poisoned entry's declared verified-sovereign tier in the caller's own
-    // (bridge_attest / reputation_record) response.
+    // undecodable public_key silently returns [] — an empty set can never
+    // match, so the lookup falls through to the general handshake-map path
+    // instead of being capped as local.
     const gapFromDecodeFailure = new Set(localDidEncodings("AAAA"));
     expect(gapFromDecodeFailure.size).toBe(0);
     expect(
