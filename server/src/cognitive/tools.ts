@@ -18,6 +18,7 @@ import {
   rotateKeys,
   sign as identitySign,
   verify as identityVerify,
+  assertEd25519PublicKey,
   type StoredIdentity,
   type PublicIdentity,
   type RotationEvent,
@@ -215,6 +216,51 @@ function optionalNonEmptyString(
   return requireNonEmptyString(value, key, name);
 }
 
+/**
+ * Ingest chokepoint for a stored identity's `public_key` (register §Z
+ * RECHECK MUST-FIX-1, CRITICAL). This is the ROOT fix: every local-identity
+ * trust guard — `isLocallyHeldPublicKey` (handshake producer, federation
+ * register-time check) and `resolveTierByDid`'s local-DID cap (via
+ * `requireLocalDidEncodings`) — builds its "identities this fortress holds"
+ * set from each held identity's STORED `public_key`. Before this check, a
+ * decode failure on that field silently dropped the identity from every
+ * such set (`localDidEncodings`/`isLocallyHeldPublicKey`'s per-identity
+ * catch returned nothing for it), so an identity imported with a
+ * garbage/undecodable `public_key` was invisible to every local-identity
+ * guard even though it could still SIGN with its real (decryptable) private
+ * key — a self-vouch from that identity would then be misjudged as a
+ * genuine remote counterparty. Rejecting a non-decodable `public_key` here,
+ * at the only two places a `StoredIdentity` enters memory
+ * (`normalizeImportedIdentity` below and `IdentityManager.load()`),
+ * guarantees every HELD identity's key decodes, so the local sets can never
+ * silently miss one. Fails closed: an unparseable or wrong-length key
+ * refuses the identity outright rather than persisting it in a
+ * partially-trusted state.
+ */
+function requireEd25519PublicKeyBase64url(
+  value: Record<string, unknown>,
+  key: string,
+  name: string
+): string {
+  const field = requireNonEmptyString(value, key, name);
+  let decoded: Uint8Array;
+  try {
+    decoded = fromBase64url(field);
+  } catch {
+    throw new Error(
+      `${name}.${key} must be a valid base64url-encoded Ed25519 public key.`
+    );
+  }
+  try {
+    assertEd25519PublicKey(decoded);
+  } catch {
+    throw new Error(
+      `${name}.${key} must be a valid base64url-encoded Ed25519 public key.`
+    );
+  }
+  return field;
+}
+
 function requireSha256Digest(
   value: Record<string, unknown>,
   key: string,
@@ -329,7 +375,11 @@ function normalizeImportedIdentity(payload: unknown): StoredIdentity {
   return {
     identity_id: requireNonEmptyString(record, "identity_id", "identity_import.identity"),
     label: requireNonEmptyString(record, "label", "identity_import.identity"),
-    public_key: requireNonEmptyString(record, "public_key", "identity_import.identity"),
+    public_key: requireEd25519PublicKeyBase64url(
+      record,
+      "public_key",
+      "identity_import.identity"
+    ),
     did: requireNonEmptyString(record, "did", "identity_import.identity"),
     created_at: requireNonEmptyString(record, "created_at", "identity_import.identity"),
     key_type: requireOneOf(
@@ -466,6 +516,18 @@ export class IdentityManager {
         const encrypted = JSON.parse(bytesToString(raw));
         const decrypted = decrypt(encrypted, this.encryptionKey);
         const identity: StoredIdentity = JSON.parse(bytesToString(decrypted));
+        // Ingest chokepoint, load-path half (register §Z RECHECK
+        // MUST-FIX-1): a record already on disk with an undecodable
+        // public_key predates this check or reached storage some other
+        // way. Refusing to LOAD it (rather than loading it and letting
+        // every local-identity guard silently miss it) keeps the same
+        // guarantee `requireEd25519PublicKeyBase64url` gives the import
+        // path — every identity this fortress holds in memory has a
+        // decodable key, so `isLocallyHeldPublicKey` /
+        // `requireLocalDidEncodings` can never fail to see it. Folds into
+        // the existing `failed` counter: a corrupt-key record reads the
+        // same as any other corrupt/undecryptable identity file.
+        assertEd25519PublicKey(fromBase64url(identity.public_key));
         this.identities.set(identity.identity_id, identity);
       } catch {
         failed++;

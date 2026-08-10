@@ -134,6 +134,30 @@ export function localDidEncodings(publicKeyBase64url: string): string[] {
 }
 
 /**
+ * Hard-fail sibling of `localDidEncodings` for the one case its catch-
+ * returns-[] contract is unsafe for: enumerating a HELD identity's own key
+ * material to build a local-identity trust set (bridge/tools.ts,
+ * reputation/tools.ts pass `identity.public_key` for the currently-signing,
+ * locally-held identity). A decode failure here means this fortress's OWN
+ * stored public_key is corrupt or undecodable — "cannot determine locality"
+ * must never resolve to "not local -> grant trust" (register §Z RECHECK
+ * MUST-FIX-1 defense-in-depth: a garbage stored public_key would otherwise
+ * silently drop the identity from the local set, letting its self-vouch
+ * read as a genuine remote counterparty). Ingest validation
+ * (identity_import, IdentityManager.load — cognitive/tools.ts) rejects an
+ * undecodable public_key before an identity is ever held, so this throw is
+ * expected to be unreachable in production; it exists as the backstop for
+ * state that predates or bypasses that validation. `localDidEncodings`
+ * keeps its soft catch-[] contract for a genuinely untrusted CANDIDATE key,
+ * where a decode failure just means "this candidate can never match,"
+ * which is safe to skip.
+ */
+export function requireLocalDidEncodings(publicKeyBase64url: string): string[] {
+  const bytes = fromBase64url(publicKeyBase64url);
+  return [publicKeyToDid(bytes), legacyPublicKeyToDid(bytes)];
+}
+
+/**
  * Byte-exact equality for two public keys. Public keys are not secret, so
  * this does not need to be constant-time; it exists so every "is this the
  * same signing key" decision compares raw key material instead of a
@@ -167,6 +191,18 @@ export function publicKeyBytesEqual(a: Uint8Array, b: Uint8Array): boolean {
  * "locally held" — every caller uses the result ONLY to REFUSE trust, so a
  * decode failure just skips the refusal; the signer's key is already
  * validated elsewhere (SHR/signature verification) before this runs.
+ *
+ * `identities` is different: it enumerates THIS fortress's OWN held
+ * identities, not untrusted candidate material. A held identity's
+ * public_key that fails to decode is an integrity error, not "not local" —
+ * skipping it would silently drop that identity from the local set, so a
+ * self-vouch signed with the key it actually controls would be misjudged as
+ * a genuine remote counterparty (register §Z RECHECK MUST-FIX-1). Ingest
+ * validation (identity_import / IdentityManager.load, cognitive/tools.ts)
+ * rejects an undecodable public_key before an identity is ever held, so
+ * this throw is expected to be unreachable in production; it exists as the
+ * defense-in-depth backstop for state that predates or bypasses that
+ * validation.
  */
 export function isLocallyHeldPublicKey(
   candidatePublicKey: Uint8Array | undefined,
@@ -174,12 +210,16 @@ export function isLocallyHeldPublicKey(
 ): boolean {
   if (!candidatePublicKey) return false;
   for (const identity of identities) {
-    let identityKeyBytes: Uint8Array;
-    try {
-      identityKeyBytes = fromBase64url(identity.public_key);
-    } catch {
-      continue;
-    }
+    // `fromBase64url` is deliberately LENIENT (see its doc comment) — it
+    // silently skips out-of-alphabet characters rather than throwing, so a
+    // genuinely garbage stored key can decode "successfully" to the wrong
+    // BYTE LENGTH without ever raising. `assertEd25519PublicKey` is the
+    // explicit length gate that turns that into the hard failure this
+    // function's contract requires for a held identity's own key material;
+    // relying on `publicKeyBytesEqual`'s length check alone would silently
+    // return "no match" for a short/garbage key instead of throwing.
+    const identityKeyBytes = fromBase64url(identity.public_key);
+    assertEd25519PublicKey(identityKeyBytes);
     if (publicKeyBytesEqual(candidatePublicKey, identityKeyBytes)) {
       return true;
     }

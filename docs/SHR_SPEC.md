@@ -346,7 +346,7 @@ SHRs integrate with the reputation system through sovereignty-gated tiers. Attes
 
 These weights are configurable. The default values reflect the principle that verifiable sovereignty claims should be worth more than unverifiable ones.
 
-**Current implementation bound:** an attestation recorded through `reputation_record` or `bridge_attest` is scored at `self-attested` or `unverified` weight. `verified-sovereign` and `verified-degraded` are not currently reachable through those recording paths; the full tier table applies to the SHR handshake and federation trust model described in sections 5 and 6.
+**Current implementation bound:** every stored or imported attestation's self-declared sovereignty tier is clamped, unconditionally, at the point it is read back for scoring, regardless of which tool recorded it or how it arrived. `verified-sovereign` and `verified-degraded` weight is reachable only through live handshake resolution against a genuine remote counterparty, never from a stored claim of either tier; the full tier table applies to the SHR handshake and federation trust model described in sections 5 and 6.
 
 ---
 
