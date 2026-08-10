@@ -1,3 +1,4 @@
+// fail-before-exempt: adaptation-only in this PR — the only change here is passing the now-required identityManager arg to createFederationTools in setup() (AGENTS.md rule 3: an optional security dependency that gates a trust property must be required). None of this file's fixed SHRs correspond to a saved local identity, so the local-custody self-vouch refusal never fires here; that behavior IS bound (fails against pre-fix source) by test/security/self-vouch-trust-ingest-inventory.test.ts groups (b)/(f) and test/handshake/handshake-forgery-remediation.test.ts's M3 self-vouch test.
 /**
  * Federation Tools tests
  *
