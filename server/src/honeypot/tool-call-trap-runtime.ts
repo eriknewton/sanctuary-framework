@@ -35,8 +35,13 @@ export interface ToolCallInvocation {
   trap_id: string;
   fake_tool_name: string;
   caller_identity: string;
+  // HNY-01: a byte-capped preview of the invocation args, never the raw
+  // attacker object. `arg_bytes` is the true serialized size; `arg_truncated`
+  // marks that the preview omits content beyond MAX_RETAINED_ARG_BYTES.
   invocation_args: Record<string, unknown>;
   arg_hash: string;
+  arg_bytes: number;
+  arg_truncated: boolean;
   invoked_at: string;
   finding_id: string;
   fake_response: string | Record<string, unknown>;
@@ -47,8 +52,11 @@ export interface ToolCallInvocation {
 export interface ToolCallFollowUp {
   tool_name: string;
   caller_identity: string;
+  // HNY-01: byte-capped preview, matching ToolCallInvocation.invocation_args.
   args: Record<string, unknown>;
   args_hash: string;
+  args_bytes: number;
+  args_truncated: boolean;
   called_at: string;
 }
 
@@ -123,14 +131,17 @@ export class ToolCallTrapRuntime {
       return { handled: false };
     }
 
-    const argHash = hashJson(args);
+    const boundedArgs = hashAndBoundArgs(args);
+    const argHash = boundedArgs.hash;
     const findingId = randomUUID();
     const invocation: ToolCallInvocation = {
       trap_id: spec.trap_id,
       fake_tool_name: trigger.fake_tool_name,
       caller_identity: callerIdentity,
-      invocation_args: args,
+      invocation_args: boundedArgs.preview,
       arg_hash: argHash,
+      arg_bytes: boundedArgs.bytes,
+      arg_truncated: boundedArgs.truncated,
       invoked_at: now.toISOString(),
       finding_id: findingId,
       fake_response: trigger.fake_response,
@@ -148,8 +159,10 @@ export class ToolCallTrapRuntime {
         trap_class: spec.trap_class,
         fake_tool_name: trigger.fake_tool_name,
         caller_identity: callerIdentity,
-        invocation_args: args,
+        invocation_args: boundedArgs.preview,
         arg_hash: argHash,
+        arg_bytes: boundedArgs.bytes,
+        arg_truncated: boundedArgs.truncated,
         response_plausibility: invocation.response_plausibility,
         follow_up_window_ms: FOLLOW_UP_WINDOW_MS,
         follow_up_tool_calls: invocation.follow_up_tool_calls,
@@ -174,8 +187,10 @@ export class ToolCallTrapRuntime {
         trap_class: spec.trap_class,
         fake_tool_name: trigger.fake_tool_name,
         caller_identity: callerIdentity,
-        invocation_args: args,
+        invocation_args: boundedArgs.preview,
         arg_hash: argHash,
+        arg_bytes: boundedArgs.bytes,
+        arg_truncated: boundedArgs.truncated,
         finding_id: findingId,
         severity: spec.finding_severity,
         response_plausibility: invocation.response_plausibility,
@@ -201,6 +216,15 @@ export class ToolCallTrapRuntime {
     const now = this.now();
     this.pruneExpiredActivations(now);
 
+    // Bound the args ONCE, before the loops. A caller can hold up to
+    // MAX_ACTIVATIONS_PER_CALLER_PER_TRAP activations across traps, and a
+    // follow-up correlates against every one still in the window; serializing
+    // the args per matching activation would re-introduce the N-way
+    // amplification this fix closes. The capped preview is immutable and never
+    // mutated after retention, so sharing one reference across the matching
+    // activations is safe and strictly cheaper than a per-activation copy.
+    const boundedFollowUp = hashAndBoundArgs(args);
+
     for (const [trapId, invocations] of this.activations.entries()) {
       for (const activation of invocations) {
         if (activation.caller_identity !== callerIdentity) continue;
@@ -215,8 +239,10 @@ export class ToolCallTrapRuntime {
         const followUp: ToolCallFollowUp = {
           tool_name: toolName,
           caller_identity: callerIdentity,
-          args,
-          args_hash: hashJson(args),
+          args: boundedFollowUp.preview,
+          args_hash: boundedFollowUp.hash,
+          args_bytes: boundedFollowUp.bytes,
+          args_truncated: boundedFollowUp.truncated,
           called_at: now.toISOString(),
         };
         activation.follow_up_tool_calls.push(followUp);
@@ -341,4 +367,74 @@ function hashJson(value: unknown): string {
     .update(JSON.stringify(value) ?? "null", "utf8")
     .digest("hex")
     .slice(0, 32);
+}
+
+// HNY-01 (register §Z RECHECK): a tool-call trap intercepts PRE-GATE
+// (router.ts, before schema validation), so `args` is fully attacker-
+// controlled and unvalidated on the invoke path. The correlation buffer
+// retains one entry per activation plus up to 16 follow-ups each, and
+// stats()/the management route serialize every retained entry. Retaining the
+// raw args object graph let a visible agent drive unbounded memory growth and
+// response amplification (AGENTS.md rule 8) even though the entry COUNT was
+// already capped. We retain only a byte-capped preview plus the full-fidelity
+// hash — identity is preserved for correlation — and the true serialized size.
+// 512 bytes: enough for an operator to recognize a probe's shape; full fidelity
+// is preserved by arg_hash (correlation) and arg_bytes (true size). The security
+// property is that the retained/serialized size is set by PRODUCT caps, never by
+// the attacker's chosen argument size.
+//
+// Honest per-trap ceiling (accounting for the two amplifiers a naive estimate
+// misses): the retained preview is a STRING, so when stats() re-serializes it
+// the JSON escaping of any backslashes/quotes inside it can roughly DOUBLE its
+// on-the-wire size (~2x), and a byte-boundary truncation that splits a multibyte
+// sequence appends one U+FFFD (<= +3 bytes). So a preview caps at ~512 raw bytes
+// but serializes to <= ~1 KB worst case. Across the per-TRAP retention cap
+// (MAX_RETAINED_ACTIVATIONS_PER_TRAP = 128, four fully-capped callers) x
+// (1 invocation + 16 follow-ups): ~= 128 x 17 x ~1 KB ~= ~2.2 MB of previews,
+// plus per-activation metadata (ids, hashes, timestamps) that pushes a
+// fully-capped trap to ~2.9 MB total on the wire (measured). stats()/the
+// management route sum this over the deployed tool-call traps, whose COUNT is
+// operator-bounded (deploy needs the operator bearer). Bounded and operator-
+// scaled; within a trap the attacker is bounded to 128 activations. (Lower this
+// constant or the activation caps to tighten the ceiling further.)
+export const MAX_RETAINED_ARG_BYTES = 512;
+
+interface HashedBoundedArgs {
+  hash: string;
+  // A byte-capped stand-in for the raw args. Small args pass through verbatim;
+  // oversized args become a preview marker, so nothing retained references the
+  // attacker's object graph.
+  preview: Record<string, unknown>;
+  bytes: number;
+  truncated: boolean;
+}
+
+// Serialize ONCE and derive both the hash and the bound. The invoke path
+// previously called hashJson(args) (a full JSON.stringify) anyway, so this is
+// no extra asymptotic cost on the single incoming object — it just stops that
+// object from being RETAINED.
+function hashAndBoundArgs(args: Record<string, unknown>): HashedBoundedArgs {
+  const json = JSON.stringify(args) ?? "null";
+  const hash = createHash("sha256").update(json, "utf8").digest("hex").slice(0, 32);
+  const bytes = Buffer.byteLength(json, "utf8");
+  if (bytes <= MAX_RETAINED_ARG_BYTES) {
+    return { hash, preview: args, bytes, truncated: false };
+  }
+  // Truncate on a BYTE boundary, not a character boundary: json.slice() counts
+  // UTF-16 code units, so a multibyte-heavy string could retain up to ~4x
+  // MAX_RETAINED_ARG_BYTES and quietly break the ceiling above. Slicing the
+  // UTF-8 buffer and decoding back caps the true retained bytes at the constant;
+  // toString replaces a split trailing multibyte sequence with U+FFFD (safe, no
+  // throw, and the value is only ever re-serialized, never JSON.parsed).
+  const previewBytes = Buffer.from(json, "utf8").subarray(0, MAX_RETAINED_ARG_BYTES);
+  return {
+    hash,
+    preview: {
+      _sanctuary_arg_preview: previewBytes.toString("utf8"),
+      _sanctuary_arg_bytes: bytes,
+      _sanctuary_arg_truncated: true,
+    },
+    bytes,
+    truncated: true,
+  };
 }
