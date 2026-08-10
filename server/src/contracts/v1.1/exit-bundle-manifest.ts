@@ -295,6 +295,10 @@ export interface ExitBundleVerifierResult {
     // the warnings array.
     | "identity_binding_mismatch"
     | "identity_signature_invalid"
+    // EXIT-PASS-01: a present rotation chain that does not verify. Distinct
+    // from identity_signature_invalid (the artifact's own signature) — this is
+    // the chain from a retired key to the current one failing verification.
+    | "rotation_chain_invalid"
     | "reputation_bundle_signature_invalid"
     | "reputation_completeness_mismatch"
     | "reputation_attestation_signature_invalid"
