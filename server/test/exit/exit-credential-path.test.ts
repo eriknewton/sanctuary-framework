@@ -645,7 +645,14 @@ describe("exit cluster A3/A4: which credential opens this bundle", () => {
     const { chunks, out, err } = captureCli();
     const code = await runExitCommand({ argv: ["verify", bundleDir], out, err });
     const printed = chunks.join("");
-    expect(code).toBe(0);
+    // LD2-01 (verify/import parity aggregator): entry_count === null is now
+    // an enumerated sub-verdict in verifyExitBundle's aggregator, so `passed`
+    // is false and the CLI exits 1 - it no longer reports a machine-readable
+    // PASS for a bundle whose import structurally rejects with
+    // ENCRYPTED_STATE_ENTRIES_UNREADABLE (see exit-verifier-aggregator.test.ts
+    // for the differential that holds this).
+    expect(code).toBe(1);
+    expect(printed).toContain("verdict: FAIL");
     expect(printed).toContain("state_entries: unreadable");
     expect(printed).not.toContain("state_entries: 0");
     expect(printed).toContain("no readable entries list");

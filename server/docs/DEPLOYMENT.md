@@ -164,81 +164,22 @@ fortress, and the other path fails with `CustodyUnlockError` while every configu
 machine looks correct. If you keep both surfaces, treat one of them as the source and re-derive the
 other from it, and tighten the permissions on the harness config to match the env file.
 
-## systemd Service Unit
+## Running under a service manager
 
-Create `/etc/systemd/user/sanctuary-mcp.service`:
+**The stdio MCP server is not a service-manager workload.** `transport: "stdio"` is the default
+and the HTTP branch is unimplemented (it prints `HTTP transport not yet implemented. Use stdio.`
+and exits 1). A service manager gives the process no client on stdin. Verified behavior on a
+provisioned fortress: the process boots, prints `Sanctuary MCP Server v<version> running (stdio)`,
+reaches end-of-input immediately, and exits **0** in well under a second. `Restart=on-failure`
+treats 0 as success, so such a unit settles into `inactive (dead)` with no restart, and the last
+journal line is the word "running". From the outside that reads like a healthy service that
+quietly stopped.
 
-### Using local install (recommended)
-
-```ini
-[Unit]
-Description=Sanctuary MCP Server
-After=network.target
-
-[Service]
-Type=simple
-EnvironmentFile=%h/.config/sanctuary/sanctuary.env
-ExecStart=/usr/bin/node %h/sanctuary/node_modules/.bin/sanctuary-mcp-server
-Restart=on-failure
-RestartSec=5s
-WorkingDirectory=%h
-
-[Install]
-WantedBy=default.target
-```
-
-### Using npx
-
-```ini
-[Unit]
-Description=Sanctuary MCP Server
-After=network.target
-
-[Service]
-Type=simple
-EnvironmentFile=%h/.config/sanctuary/sanctuary.env
-ExecStart=/usr/bin/npx -y @sanctuary-framework/mcp-server
-Restart=on-failure
-RestartSec=5s
-WorkingDirectory=%h
-
-[Install]
-WantedBy=default.target
-```
-
-Enable and start:
-
-```bash
-systemctl --user daemon-reload
-systemctl --user enable sanctuary-mcp
-systemctl --user start sanctuary-mcp
-```
-
-### What this unit does and does not do
-
-Read this before you trust `systemctl status` on it.
-
-**The MCP server speaks stdio, and only stdio.** `transport: "stdio"` is the default and the HTTP
-branch is unimplemented (it prints `HTTP transport not yet implemented. Use stdio.` and exits 1).
-A service manager gives the process no client on stdin. Verified behavior on a provisioned
-fortress: the process boots, prints `Sanctuary MCP Server v<version> running (stdio)`, reaches
-end-of-input immediately, and exits **0** in well under a second. `Restart=on-failure` treats 0 as
-success, so the unit settles into `inactive (dead)` with no restart, and the last journal line is
-the word "running". From the outside that reads like a healthy service that quietly stopped.
-
-This unit is therefore a supervision and environment shell, not the process your agent talks to.
 The harness in the section above spawns its own Sanctuary child and talks to that one. If your
-goal is a persistent Sanctuary presence with a UI, run `sanctuary dashboard` under the service
-manager instead: it is an HTTP process built to stay alive.
-
-Failure modes in the unit itself, and what each looks like from the outside:
-
-| Mistake | Symptom | What to do |
-|---|---|---|
-| `EnvironmentFile=` path missing or unreadable by the unit's user | The unit refuses to start and never executes `ExecStart`, so there is no Sanctuary output at all to explain it. The journal reports a failure to load the environment file | check the path and its owner; a file written under `sudo` is root-owned and a `--user` unit cannot read it |
-| `EnvironmentFile=-` written with the leading dash | A missing file is silently ignored, the process starts with no credential, and you get the "passphrase absent" boot failure above instead of a clear message about the file | leave the dash off so the missing file is reported as itself |
-| Unit installed into `/etc/systemd/system/` instead of the user path | `systemctl --user status sanctuary-mcp` reports the unit is not found while `systemctl status sanctuary-mcp` finds it. When it does run as a system unit, `%h` resolves to `/root`, so it reads `/root/.config/sanctuary/sanctuary.env` and provisions `/root/.sanctuary`. Nothing errors; the agent simply sees an empty fortress owned by another user | keep it in the user path (`/etc/systemd/user/` or `~/.config/systemd/user/`) and always pass `--user` to `systemctl` |
-| Lingering not enabled for the user | It works while you are logged in and stops shortly after your last session ends, which over SSH means it dies after you disconnect and looks fine every time you log back in to check | `loginctl enable-linger $USER` |
+goal is a persistent Sanctuary presence with a UI, supervise `sanctuary dashboard` instead: it is
+an HTTP process built to stay alive. Do not hand-write a unit file; on Linux, generate one with
+`sanctuary generate systemd`, which emits this host's resolved paths and supervises the dashboard.
+See [cli-operator-verbs.md](cli-operator-verbs.md) for that command's options and failure modes.
 
 ## Bootstrap and First Run
 
