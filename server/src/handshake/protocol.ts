@@ -17,7 +17,7 @@ import type {
 } from "./types.js";
 import type { SignedSHR } from "../shr/types.js";
 import { verifySHR } from "../shr/verifier.js";
-import { sign, verify } from "../core/identity.js";
+import { sign, verify, publicKeyToDid } from "../core/identity.js";
 import { toBase64url, fromBase64url, stringToBytes } from "../core/encoding.js";
 import { randomBytes } from "../core/random.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
@@ -34,6 +34,24 @@ import type { IdentityManager } from "../cognitive/tools.js";
  * interactive / relayed exchange, not human-paced, so 120 s is generous.
  */
 export const HANDSHAKE_SESSION_TTL_MS = 120_000;
+
+/**
+ * REP-01 (loop-dry hardening): two SHRs are from the SAME signer when their
+ * signing keys are the same KEY, not the same base64url STRING. A raw `===` on
+ * `signed_by` would miss a non-canonical base64url encoding of the same key
+ * bytes and let a self-handshake slip the same-identity guards. Compare the
+ * canonical DID derived from the decoded key — the exact identity the
+ * reputation weighting keys on — so the protocol guard and the scoring cap agree
+ * on "same signer". A malformed encoding can never be a valid same-key
+ * self-handshake (verifySHR runs first), so a decode failure returns false.
+ */
+function sameSigningKey(a: string, b: string): boolean {
+  try {
+    return publicKeyToDid(fromBase64url(a)) === publicKeyToDid(fromBase64url(b));
+  } catch {
+    return false;
+  }
+}
 
 /** Terminal session states — a session in any of these is single-use-spent. */
 export const TERMINAL_SESSION_STATES: ReadonlySet<HandshakeSession["state"]> =
@@ -140,7 +158,7 @@ export function respondToHandshake(
   // reputation weighting credit its own attestations at full signer tier
   // (credibility laundering — see reputation/tiers.ts). Rejecting here means a
   // self-initiated challenge never advances to a response.
-  if (ourSHR.signed_by === challenge.shr.signed_by) {
+  if (sameSigningKey(ourSHR.signed_by, challenge.shr.signed_by)) {
     return { error: "Self-handshake rejected: an identity cannot verify itself" };
   }
 
@@ -218,7 +236,7 @@ export function completeHandshake(
   // the "verification" is self-referential and would launder the agent's own
   // attestations up to full signer tier. See respondToHandshake for the full
   // rationale.
-  if (session.our_shr.signed_by === response.shr.signed_by) {
+  if (sameSigningKey(session.our_shr.signed_by, response.shr.signed_by)) {
     return { error: "Self-handshake rejected: an identity cannot verify itself" };
   }
 
@@ -331,7 +349,7 @@ export function verifyCompletion(
   // same principal; a self-referential "verification" would launder the agent's
   // own attestations up to full signer tier (see respondToHandshake). Fail
   // closed to an unverified result, exactly as an invalid nonce signature does.
-  if (session.our_shr.signed_by === session.their_shr.signed_by) {
+  if (sameSigningKey(session.our_shr.signed_by, session.their_shr.signed_by)) {
     return {
       counterparty_id: session.their_shr.body.instance_id,
       counterparty_shr: session.their_shr,
