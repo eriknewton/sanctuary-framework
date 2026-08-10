@@ -266,15 +266,22 @@ describe("Z-HNY-01 tool-call trap correlation bounds", () => {
   });
 
   // This asserts a CORRECTNESS property: evicting an entry from the bounded
-  // in-memory correlation buffer must not lose its durable finding/audit record
-  // (retained-implies-persisted, and durability survives eviction). It is NOT an
-  // endorsement of unbounded durable growth: the durable sentinel-finding store
-  // has no per-caller/size quota, a separate PRE-EXISTING concern on a shared
-  // subsystem (all sentinels) that this PR does not change — a naive quota there
-  // could silently drop real security findings, so it is tracked as its own
-  // register item (Z-HNY-02) for a dedicated fix. This PR closes Z-HNY-01: the
-  // in-memory buffer bytes + the N-way audit amplification.
-  it("keeps durable findings and trigger audits after retained activations are evicted", async () => {
+  // in-memory correlation buffer must not lose its durable finding/audit
+  // trail (retained-implies-persisted, and durability survives eviction).
+  //
+  // Register Z-HNY-02 (closed by the class-level bounded-collection fix, not
+  // this file): a repeated invocation of the SAME trap by the SAME caller
+  // within one FOLLOW_UP_WINDOW_MS window now COALESCES into a single
+  // durable finding (tool-call-trap-runtime.ts's activeFindingWindows /
+  // MAX_DISTINCT_ARG_HASHES_PER_COALESCED_FINDING), rather than minting one
+  // durable row per invocation — that was the O(invocations) durable-store
+  // growth this register item closed. The audit trail is UNCHANGED: every
+  // invocation still appends its own HONEYPOT_AUDIT_OPS.TRIGGERED entry
+  // (the audit log's own append-only bound is a separate, already-solved
+  // concern), so `triggerAuditCount` still tracks invocation count 1:1 while
+  // `findings.length` now reflects distinct (trap, caller) pairs, not raw
+  // invocation count.
+  it("coalesces durable findings for one (trap, caller) window while keeping a trigger audit per invocation", async () => {
     let nowMs = START_MS;
     const rig = await makeRig({ now: () => new Date(nowMs) });
     let triggerAuditCount = 0;
@@ -296,7 +303,10 @@ describe("Z-HNY-01 tool-call trap correlation bounds", () => {
     expect(rig.runtime.stats()[0]!.activations).toEqual([]);
 
     const findings = await rig.findingStore.listFindings({ limit: QUERY_LIMIT });
-    expect(findings.length).toBe(invocationCount);
+    // All `invocationCount` calls share one trap + one caller inside one
+    // window, so they coalesce onto exactly one durable row.
+    expect(findings.length).toBe(1);
+    expect(findings[0]!.details.repeat_count).toBe(invocationCount);
     expect(triggerAuditCount).toBe(invocationCount);
   });
 

@@ -9,6 +9,9 @@ import { describe, it, expect, beforeEach } from "vitest";
 import { FederationRegistry } from "../../src/federation/registry.js";
 import type { HandshakeResult } from "../../src/handshake/types.js";
 import type { SignedSHR } from "../../src/shr/types.js";
+import { MemoryStorage } from "../../src/storage/memory.js";
+import { generateRandomKey } from "../../src/core/random.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
@@ -58,13 +61,16 @@ describe("Federation Registry", () => {
   let registry: FederationRegistry;
 
   beforeEach(() => {
-    registry = new FederationRegistry();
+    const auditLog = new AuditLog(new MemoryStorage(), generateRandomKey());
+    registry = new FederationRegistry(auditLog);
   });
 
   describe("Peer Registration", () => {
     it("registers a peer from a completed handshake", () => {
       const hsResult = makeHandshakeResult();
-      const peer = registry.registerFromHandshake(hsResult, "did:sanctuary:peer-1");
+      // Non-null: the registry is fresh (well under MAX_FEDERATION_PEERS),
+      // so registration cannot be refused for capacity here.
+      const peer = registry.registerFromHandshake(hsResult, "did:sanctuary:peer-1")!;
 
       expect(peer.peer_id).toBe("peer-1");
       expect(peer.peer_did).toBe("did:sanctuary:peer-1");
@@ -77,7 +83,7 @@ describe("Federation Registry", () => {
         counterparty_id: "sovereign-peer",
         trust_tier: "verified-sovereign",
       });
-      const peer = registry.registerFromHandshake(hsResult, "did:sanctuary:sovereign");
+      const peer = registry.registerFromHandshake(hsResult, "did:sanctuary:sovereign")!;
 
       expect(peer.trust_tier).toBe("verified-sovereign");
     });
@@ -87,7 +93,7 @@ describe("Federation Registry", () => {
       registry.registerFromHandshake(hsResult1, "did:sanctuary:peer-1");
 
       const hsResult2 = makeHandshakeResult({ trust_tier: "verified-sovereign" });
-      const peer = registry.registerFromHandshake(hsResult2, "did:sanctuary:peer-1");
+      const peer = registry.registerFromHandshake(hsResult2, "did:sanctuary:peer-1")!;
 
       expect(peer.trust_tier).toBe("verified-sovereign");
       // First seen should be preserved
@@ -96,12 +102,12 @@ describe("Federation Registry", () => {
 
     it("preserves first_seen on re-registration", () => {
       const hsResult1 = makeHandshakeResult();
-      const peer1 = registry.registerFromHandshake(hsResult1, "did:sanctuary:peer-1");
+      const peer1 = registry.registerFromHandshake(hsResult1, "did:sanctuary:peer-1")!;
       const firstSeen = peer1.first_seen;
 
       // Wait a tiny bit and re-register
       const hsResult2 = makeHandshakeResult();
-      const peer2 = registry.registerFromHandshake(hsResult2, "did:sanctuary:peer-1");
+      const peer2 = registry.registerFromHandshake(hsResult2, "did:sanctuary:peer-1")!;
 
       expect(peer2.first_seen).toBe(firstSeen);
     });

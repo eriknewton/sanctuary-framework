@@ -20,8 +20,10 @@
  * - Peer data is stored encrypted under L1 sovereignty
  */
 
+import type { AuditLog } from "../operational/audit-log.js";
 import type { HandshakeResult } from "../handshake/types.js";
 import { trustTierToSovereigntyTier } from "../reputation/tiers.js";
+import { BoundedMap } from "../core/bounded-map.js";
 import type {
   FederationPeer,
   FederationCapabilities,
@@ -36,20 +38,100 @@ const DEFAULT_CAPABILITIES: FederationCapabilities = {
   attestation_formats: ["sanctuary-interaction-v1"],
 };
 
+/**
+ * Hard cap on registered peers (register LD2-04): `federation_peers` register
+ * is Tier-3 auto-allowed, and the only gate before a completed handshake
+ * becomes a durable registry entry is the self-vouch check — an agent that
+ * mints many keypairs and completes a real (attacker-reachable, if costlier
+ * than a preview) 4-step handshake with each one can otherwise register
+ * without limit; `getPeer`/`listPeers` only ever MUTATE an expired peer to
+ * `active:false`, they never delete, so nothing ages entries out on its own.
+ * 500 mirrors handshake/tools.ts's MAX_HANDSHAKE_RESULTS order of magnitude:
+ * generous for a real federation topology, small enough to bound worst-case
+ * memory and keep the saturation-refusal path reachable in an adversarial
+ * test without an impractically long loop.
+ */
+export const MAX_FEDERATION_PEERS = 500;
+
+/**
+ * Is `peer` active RIGHT NOW, accounting for handshake expiry the lazy
+ * getPeer/listPeers mutation hasn't caught up to yet? Shared by getPeer,
+ * listPeers, and the eviction selector below so all three agree on what
+ * "active" means at the instant they're called, rather than three
+ * independently-maintained copies of the same expiry check drifting apart.
+ */
+function isPeerCurrentlyActive(peer: FederationPeer, now: Date): boolean {
+  return peer.active && new Date(peer.handshake_result.expires_at) > now;
+}
+
 export class FederationRegistry {
-  private peers = new Map<string, FederationPeer>();
+  private readonly peers: BoundedMap<string, FederationPeer>;
+  private readonly auditLog: AuditLog;
+
+  constructor(auditLog: AuditLog) {
+    this.auditLog = auditLog;
+    this.peers = new BoundedMap<string, FederationPeer>({
+      maxSize: MAX_FEDERATION_PEERS,
+      selectEviction: (entries) => {
+        const now = new Date();
+        let oldestInactiveKey: string | undefined;
+        let oldestInactiveFirstSeen = "";
+        for (const [key, peer] of entries) {
+          if (isPeerCurrentlyActive(peer, now)) continue;
+          if (
+            oldestInactiveKey === undefined ||
+            peer.first_seen < oldestInactiveFirstSeen
+          ) {
+            oldestInactiveKey = key;
+            oldestInactiveFirstSeen = peer.first_seen;
+          }
+        }
+        if (oldestInactiveKey === undefined) {
+          // Every slot holds a currently-ACTIVE peer: refuse rather than
+          // evict one to admit a new registration. An active peer is never
+          // evicted to admit a new one, or registration becomes a
+          // peer-flush primitive — an attacker who can complete handshakes
+          // could otherwise evict a real, trusted peer just by registering
+          // enough new ones.
+          return { refuse: true };
+        }
+        return { evict: oldestInactiveKey };
+      },
+      onEvict: (evictedPeerId, evictedPeer) => {
+        void this.auditLog.append("l4", "federation_peer_evicted", "system", {
+          peer_id: evictedPeerId,
+          peer_did: evictedPeer.peer_did,
+          reason: "capacity",
+        });
+      },
+      onRefuse: (incomingPeerId) => {
+        void this.auditLog.append(
+          "l4",
+          "federation_registry_saturated",
+          "system",
+          { peer_id: incomingPeerId },
+          "failure"
+        );
+      },
+    });
+  }
 
   /**
    * Register or update a peer from a completed handshake.
    * This is the ONLY way peers enter the registry, and the caller
    * (federation/tools.ts) refuses a peer_did this fortress holds keys for
    * before this method is ever reached.
+   *
+   * Returns `null` when the registry is at capacity and every existing slot
+   * holds a currently-active peer (see the eviction policy above) — the
+   * caller must surface this as an explicit refusal, never treat it as a
+   * silent no-op success.
    */
   registerFromHandshake(
     result: HandshakeResult,
     peerDid: string,
     capabilities?: Partial<FederationCapabilities>
-  ): FederationPeer {
+  ): FederationPeer | null {
     const existing = this.peers.get(result.counterparty_id);
     const now = new Date().toISOString();
 
@@ -73,8 +155,8 @@ export class FederationRegistry {
       peer.trust_tier = "self-attested";
     }
 
-    this.peers.set(result.counterparty_id, peer);
-    return peer;
+    const inserted = this.peers.set(result.counterparty_id, peer);
+    return inserted ? peer : null;
   }
 
   /**
@@ -86,7 +168,7 @@ export class FederationRegistry {
     if (!peer) return null;
 
     // Check if handshake has expired
-    if (peer.active && new Date(peer.handshake_result.expires_at) <= new Date()) {
+    if (!isPeerCurrentlyActive(peer, new Date())) {
       peer.active = false;
       peer.trust_tier = "self-attested"; // Degrade to self-attested when expired
     }
@@ -99,10 +181,11 @@ export class FederationRegistry {
    */
   listPeers(filter?: { active_only?: boolean }): FederationPeer[] {
     const peers = Array.from(this.peers.values());
+    const now = new Date();
 
     // Update active status before filtering
     for (const peer of peers) {
-      if (peer.active && new Date(peer.handshake_result.expires_at) <= new Date()) {
+      if (!isPeerCurrentlyActive(peer, now)) {
         peer.active = false;
         peer.trust_tier = "self-attested";
       }
@@ -231,7 +314,7 @@ export class FederationRegistry {
    */
   getHandshakeResults(): Map<string, HandshakeResult> {
     const results = new Map<string, HandshakeResult>();
-    for (const [id, peer] of this.peers) {
+    for (const [id, peer] of this.peers.entries()) {
       if (peer.active) {
         results.set(id, peer.handshake_result);
       }

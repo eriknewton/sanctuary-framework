@@ -30,7 +30,7 @@ export function createFederationTools(
   // must too (a test that omits it is testing a bypass, not a real config).
   identityManager: IdentityManager
 ): { tools: ToolDefinition[]; registry: FederationRegistry } {
-  const registry = new FederationRegistry();
+  const registry = new FederationRegistry(auditLog);
 
   const tools: ToolDefinition[] = [
     // ─── Peer Management ──────────────────────────────────────────────
@@ -195,6 +195,20 @@ export function createFederationTools(
             }
 
             const peer = registry.registerFromHandshake(hsResult, peerDid);
+
+            // Bounded-collection guard (register LD2-04): the registry
+            // refuses a new peer when it is at capacity and every existing
+            // slot holds a currently-active peer, rather than evicting a
+            // real trusted peer to make room. Surface this as an explicit
+            // error, never a silently-dropped "registered: true".
+            if (!peer) {
+              return toolResult({
+                error:
+                  "Federation peer registry is at capacity and every slot " +
+                  "holds an active peer; cannot register a new peer until " +
+                  "one expires, is removed, or one becomes inactive.",
+              });
+            }
 
             void auditLog.append("l4", "federation_peer_register", "system", {
               peer_id: peerId,

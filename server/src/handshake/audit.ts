@@ -51,6 +51,13 @@ export type HandshakeFailureReason =
   // rather than independent. Distinct from sameSigningKey's identical-key
   // rejection in protocol.ts — this catches two DISTINCT locally-held keys.
   | "self_vouch_local_did"
+  // CLASS-LEVEL bounded-collection guard (register LD2-03): the shared
+  // `handshakeResults` map is capped (MAX_HANDSHAKE_RESULTS); an insert for
+  // a NEW counterparty is refused, never allowed to evict a verified &&
+  // liveness_proven entry, when every existing slot already holds one. This
+  // fails closed to "cannot record this handshake" rather than silently
+  // flushing an established peer's trust state.
+  | "handshake_results_saturated"
   | "other";
 
 /** Reasons a handshake may be aborted (operator or transport). */

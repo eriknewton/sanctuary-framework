@@ -1237,6 +1237,15 @@ export async function createSanctuaryServer(options?: {
     storage,
     masterKey,
     fortressId: fortressIdForAggregator,
+    auditLog,
+  });
+  // Register Z-HNY-02: fire-and-forget at construction, mirroring the
+  // conciergeMemory.pruneExpired() pattern in dashboard/v1_1/wiring.ts, so
+  // the fortress-unlock cycle drops expired findings before any honeypot or
+  // sentinel activity accumulates on top of them.
+  void sentinelFindingStore.pruneExpired().catch(() => {
+    // Best-effort: a transient storage hiccup should not block boot. The
+    // next unlock re-runs the prune.
   });
   const sentinelRegistry = new SentinelRegistry();
   for (const entry of PHI1_BASELINE_CATALOG) {

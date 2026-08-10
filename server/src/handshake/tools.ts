@@ -14,6 +14,7 @@ import { toolResult } from "../router.js";
 import type { SanctuaryConfig } from "../config.js";
 import type { IdentityManager } from "../cognitive/tools.js";
 import type { AuditLog } from "../operational/audit-log.js";
+import { BoundedMap } from "../core/bounded-map.js";
 import { generateSHR, type SHRGeneratorOptions } from "../shr/generator.js";
 import {
   sign as identitySign,
@@ -54,6 +55,39 @@ import type {
   HandshakeSession,
 } from "./types.js";
 
+/**
+ * In-memory session store cap. BOUNDED (register LD2-03): `handshake_initiate`
+ * mints a session per call with zero counterparty input, and a session is
+ * otherwise deleted only by `handshake_abort` — an agent that never aborts
+ * grows the store without limit. Every 4-step handler sweeps expired/terminal
+ * sessions off the top (mirrors #1190's pruneExpiredActivations placement,
+ * see the sweep calls in createHandshakeTools) so the map is bounded to LIVE
+ * sessions on the request path; this cap is the backstop for a burst that
+ * outpaces the 120s TTL between sweeps.
+ *
+ * 500 = generous headroom over any realistic single-fortress concurrent
+ * in-flight handshake count (a human-triggered, interactive protocol, not a
+ * hot loop) while still bounding worst-case memory to ~500 session records.
+ * Exported so the class-level bounded-collection inventory test can drive
+ * the real production path to this exact cap without hardcoding it twice.
+ */
+export const MAX_HANDSHAKE_SESSIONS = 500;
+
+/**
+ * `handshakeResults` cap — shared with L4 tier resolution, federation
+ * registration, and the dashboard. BOUNDED (register LD2-03): every
+ * `handshake_exchange` call from an externally minted keypair adds a
+ * permanent preview entry (verified:false), and src never deletes an entry,
+ * so an unbounded stream of minted keys grows this map without limit.
+ *
+ * 1000 = headroom for a real fortress's peer + preview count (an order of
+ * magnitude above a realistic federation peer list) while keeping the
+ * capacity-refusal path reachable in an adversarial test without an
+ * impractically long loop. Exported for the same reason as
+ * MAX_HANDSHAKE_SESSIONS above.
+ */
+export const MAX_HANDSHAKE_RESULTS = 1000;
+
 export interface HandshakeToolsOptions {
   /** If true, auto-publishes handshake attestations to Verascore after handshake_respond. */
   autoPublishHandshakes?: boolean;
@@ -80,13 +114,77 @@ export function createHandshakeTools(
   const autoPublishHandshakes = options?.autoPublishHandshakes ?? false;
   const verascoreUrl = options?.verascoreUrl ?? "https://verascore.ai";
   const identityEncKey = derivePurposeKey(masterKey, "identity-encryption");
-  // In-memory session store (per server instance lifetime)
-  const sessions = new Map<string, HandshakeSession>();
+
+  // In-memory session store (per server instance lifetime). Eviction policy:
+  // drop the OLDEST session (first in Map insertion order — sessions are
+  // only ever newly inserted, never re-inserted under the same key, so
+  // insertion order tracks creation order) to admit a new one. This is safe
+  // to do unconditionally: an evicted in-flight session simply fails its
+  // next step with "No handshake session found," identical to what already
+  // happens once its TTL expires — no trust state is lost, because a session
+  // carries no trust until `recordHandshakeResult` writes it into
+  // `handshakeResults`. See MAX_HANDSHAKE_SESSIONS above for the cap.
+  const sessions = new BoundedMap<string, HandshakeSession>({
+    maxSize: MAX_HANDSHAKE_SESSIONS,
+    selectEviction: (entries) => {
+      const oldest = entries.keys().next();
+      // entries is non-empty whenever selectEviction runs (set() only
+      // calls it when size >= maxSize > 0), so oldest.done is unreachable;
+      // refuse defensively rather than evict a key that doesn't exist.
+      if (oldest.done) return { refuse: true };
+      return { evict: oldest.value };
+    },
+    onEvict: (evictedSessionId) => {
+      void auditLog.append("l4", "handshake_session_evicted", "system", {
+        session_id: evictedSessionId,
+        reason: "capacity",
+      });
+    },
+  });
+
   // Completed handshake results indexed by counterparty ID — shared with L4
-  // tier resolution. Kept as a mutable Map INTERNALLY (recordHandshakeResult
-  // is the only function in this closure that calls .set on it); the return
-  // type above widens it to ReadonlyMap for every external consumer.
-  const handshakeResults = new Map<string, HandshakeResult>();
+  // tier resolution, federation registration, and the dashboard. Kept as a
+  // mutable BoundedMap INTERNALLY (recordHandshakeResult is the only
+  // function in this closure that calls .set on it); the return type above
+  // widens it to ReadonlyMap for every external consumer. See
+  // MAX_HANDSHAKE_RESULTS above for the cap.
+  //
+  // Eviction policy: evict the oldest entry that is NOT both verified AND
+  // liveness_proven (a preview, or a failed/expired-tier entry) to admit a
+  // new one; a genuinely verified && liveness_proven entry is NEVER evicted
+  // — see recordHandshakeResult, which refuses the insert instead when no
+  // unverified entry exists to make room. A full 4-step handshake IS
+  // attacker-reachable too (the counterparty side is whatever process holds
+  // the minted key, which the attacker controls end-to-end), so "only evict
+  // previews" is not a loophole an attacker can route around by completing
+  // the liveness proof; it just costs them a real round trip, and once the
+  // map is saturated with verified entries the fortress fails closed
+  // (refuses new entries) rather than flushing an established peer's trust
+  // state — the same fail-closed trade-off federation/registry.ts makes for
+  // active peers.
+  const HANDSHAKE_RESULTS_SATURATED_ERROR =
+    "Handshake result store is at capacity and every entry is a verified, " +
+    "live peer; cannot record a new handshake result until one expires or " +
+    "is superseded.";
+  const handshakeResults = new BoundedMap<string, HandshakeResult>({
+    maxSize: MAX_HANDSHAKE_RESULTS,
+    selectEviction: (entries) => {
+      for (const [key, value] of entries) {
+        if (!value.verified || !value.liveness_proven) {
+          return { evict: key };
+        }
+      }
+      return { refuse: true };
+    },
+    onEvict: (evictedCounterpartyId, evictedResult) => {
+      void auditLog.append("l4", "handshake_result_evicted", "system", {
+        counterparty_id: evictedCounterpartyId,
+        verified: evictedResult.verified,
+        liveness_proven: evictedResult.liveness_proven,
+        reason: "capacity",
+      });
+    },
+  });
 
   const shrOpts: SHRGeneratorOptions = {
     config,
@@ -168,11 +266,18 @@ export function createHandshakeTools(
    * handshake; two DISTINCT locally-held keys (identity A handshaking
    * identity B, both created by the same operator) pass every
    * sameSigningKey check and are exactly the case this chokepoint closes.
+   *
+   * Also the SOLE writer for the bounded-collection guard (register
+   * LD2-03): a refused insert (map at capacity, every existing entry
+   * verified && liveness_proven) fails closed the same way a self-vouch
+   * does — the caller gets an explicit refusal, never a silently-dropped
+   * "success". `reason` on the failure branch lets callers audit the two
+   * cases distinctly instead of collapsing them to one hardcoded label.
    */
   function recordHandshakeResult(
     result: HandshakeResult,
     auditIdentityId: string
-  ): { ok: true } | { ok: false; error: string } {
+  ): { ok: true } | { ok: false; error: string; reason: HandshakeFailureReason } {
     const counterpartyKey = tryDecodeSignerKey(result.counterparty_shr.signed_by);
     if (isLocallyHeldSignerKey(counterpartyKey)) {
       // counterparty_did here is derived ONLY for the audit trail's
@@ -189,10 +294,44 @@ export function createHandshakeTools(
         },
         "failure"
       );
-      return { ok: false, error: SELF_VOUCH_ERROR };
+      return { ok: false, error: SELF_VOUCH_ERROR, reason: "self_vouch_local_did" };
     }
-    handshakeResults.set(result.counterparty_id, result);
+    const inserted = handshakeResults.set(result.counterparty_id, result);
+    if (!inserted) {
+      void auditLog.append(
+        "l4",
+        "handshake_results_saturated",
+        auditIdentityId,
+        { counterparty_id: result.counterparty_id },
+        "failure"
+      );
+      return {
+        ok: false,
+        error: HANDSHAKE_RESULTS_SATURATED_ERROR,
+        reason: "handshake_results_saturated",
+      };
+    }
     return { ok: true };
+  }
+
+  /**
+   * CLASS-LEVEL bounded-collection sweep (register LD2-03): run at the top
+   * of every handler that touches `sessions`, mirroring #1190's
+   * pruneExpiredActivations placement, so the map is bounded to LIVE
+   * sessions on the request path, not only by the capacity cap.
+   * `excludeSessionId` protects THIS call's own target session from being
+   * swept before its expired/terminal state is classified and audited
+   * below — sweeping it away here first would collapse a precise
+   * "Handshake session expired" error into a generic "No handshake session
+   * found," losing forensic signal for no bounding benefit (the session is
+   * about to be read, and likely deleted, by this call either way).
+   */
+  function sweepExpiredSessions(excludeSessionId?: string): void {
+    sessions.sweep(
+      (session, sessionId) =>
+        sessionId !== excludeSessionId &&
+        (TERMINAL_SESSION_STATES.has(session.state) || isSessionExpired(session))
+    );
   }
 
   const tools: ToolDefinition[] = [
@@ -213,6 +352,8 @@ export function createHandshakeTools(
         },
       },
       handler: async (args) => {
+        sweepExpiredSessions();
+
         // Generate our SHR
         const shr = generateSHR(args.identity_id as string | undefined, shrOpts);
         if (typeof shr === "string") {
@@ -260,6 +401,8 @@ export function createHandshakeTools(
         required: ["challenge"],
       },
       handler: async (args) => {
+        sweepExpiredSessions();
+
         const challenge = args.challenge as unknown as HandshakeChallenge;
 
         // Generate our SHR
@@ -443,6 +586,7 @@ export function createHandshakeTools(
       },
       handler: async (args) => {
         const sessionId = args.session_id as string;
+        sweepExpiredSessions(sessionId);
         const response = args.response as unknown as HandshakeResponse;
 
         const session = sessions.get(sessionId);
@@ -528,7 +672,7 @@ export function createHandshakeTools(
             role: "initiator",
             identity_id: session.our_shr.body.instance_id,
             counterparty_id: result.result.counterparty_id,
-            reason: "self_vouch_local_did",
+            reason: recorded.reason,
             error: recorded.error,
           });
           return toolResult({ error: recorded.error });
@@ -581,6 +725,7 @@ export function createHandshakeTools(
       },
       handler: async (args) => {
         const sessionId = args.session_id as string;
+        sweepExpiredSessions(sessionId);
         const completion = args.completion as unknown as HandshakeCompletion | undefined;
 
         const session = sessions.get(sessionId);
@@ -616,23 +761,25 @@ export function createHandshakeTools(
         // can never be re-verified (replay of the completion message).
         if (completion && session.role === "responder" && session.state === "responded") {
           let result = verifyCompletion(completion, session);
-          let selfVouchError: string | undefined;
+          let recordFailure: { error: string; reason: HandshakeFailureReason } | undefined;
 
-          // Class-level self-vouch chokepoint: a verified completion still
-          // must not be RECORDED when the initiator's signing key belongs to
-          // an identity this fortress already holds. Reached only when
-          // sameSigningKey() (protocol.ts) already passed — i.e. the two
-          // distinct-local-keys case. On refusal, downgrade the returned
-          // result to unverified exactly as an invalid nonce signature would,
-          // rather than silently reporting verified:true for an entry that
-          // was never written.
+          // Class-level self-vouch / bounded-collection chokepoint: a
+          // verified completion still must not be RECORDED when the
+          // initiator's signing key belongs to an identity this fortress
+          // already holds (reached only when sameSigningKey() in
+          // protocol.ts already passed — the two distinct-local-keys case),
+          // or when the shared results map is at capacity and every slot
+          // already holds a verified peer (register LD2-03). Either way,
+          // downgrade the returned result to unverified exactly as an
+          // invalid nonce signature would, rather than silently reporting
+          // verified:true for an entry that was never written.
           if (result.verified) {
             const recorded = recordHandshakeResult(
               result,
               session.our_shr.body.instance_id
             );
             if (!recorded.ok) {
-              selfVouchError = recorded.error;
+              recordFailure = { error: recorded.error, reason: recorded.reason };
               result = {
                 ...result,
                 verified: false,
@@ -667,10 +814,10 @@ export function createHandshakeTools(
               role: "responder",
               identity_id: session.our_shr.body.instance_id,
               counterparty_id: result.counterparty_id,
-              reason: selfVouchError
-                ? "self_vouch_local_did"
-                : classifyCompleteFailure(result.errors.join("; ")),
-              error: selfVouchError ?? result.errors.join("; "),
+              reason:
+                recordFailure?.reason ??
+                classifyCompleteFailure(result.errors.join("; ")),
+              error: recordFailure?.error ?? result.errors.join("; "),
             });
           }
 
@@ -887,6 +1034,7 @@ export function createHandshakeTools(
       },
       handler: async (args) => {
         const sessionId = args.session_id as string;
+        sweepExpiredSessions(sessionId);
         const reason = (args.reason as HandshakeAbortReason | undefined) ??
           "operator_cancelled";
         const session = sessions.get(sessionId);
@@ -917,7 +1065,7 @@ export function createHandshakeTools(
     },
   ];
 
-  return { tools, handshakeResults };
+  return { tools, handshakeResults: handshakeResults.asReadonlyMap() };
 }
 
 /**

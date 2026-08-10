@@ -546,6 +546,14 @@ export function buildV11Bindings(
       storage: inputs.storage,
       masterKey: inputs.masterKey,
       fortressId: inputs.fortressId,
+      auditLog: inputs.auditLog,
+    });
+    // Register Z-HNY-02: fire-and-forget at construction, same pattern as
+    // conciergeMemory.pruneExpired() above — the fortress-unlock cycle
+    // drops expired findings before any dashboard read of this store.
+    void findingStore.pruneExpired().catch(() => {
+      // Best-effort; a transient storage hiccup should not block hub
+      // construction. The next unlock re-runs the prune.
     });
     const dispatcher = new AnomalyPipelineDispatcher({
       findingStore,

@@ -12,3 +12,4 @@ export * from "./key-derivation.js";
 export * from "./random.js";
 export * from "./encoding.js";
 export * from "./crypto-suite-registry.js";
+export * from "./bounded-map.js";
