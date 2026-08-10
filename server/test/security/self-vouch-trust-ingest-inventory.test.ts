@@ -71,8 +71,14 @@ import {
 } from "../../src/reputation/reputation-store.js";
 import { resolveTierByDid } from "../../src/reputation/tiers.js";
 import { encrypt } from "../../src/core/encryption.js";
-import { sign, type StoredIdentity } from "../../src/core/identity.js";
-import { stringToBytes, toBase64url } from "../../src/core/encoding.js";
+import {
+  sign,
+  legacyPublicKeyToDid,
+  publicKeyToDid,
+  localDidEncodings,
+  type StoredIdentity,
+} from "../../src/core/identity.js";
+import { stringToBytes, toBase64url, fromBase64url } from "../../src/core/encoding.js";
 import { getFreePort } from "../helpers/free-port.js";
 import type { HandshakeResult } from "../../src/handshake/types.js";
 import type { SignedSHR } from "../../src/shr/types.js";
@@ -104,6 +110,34 @@ async function addIdentity(
   const { storedIdentity } = createIdentity(label, encKey, "recovery-key");
   await fortress.identityManager.save(storedIdentity);
   return storedIdentity;
+}
+
+/**
+ * MUST-FIX 1 (register §Z RECHECK / two-family gate CRITICAL) fixture: a
+ * local identity persisted under the LEGACY base64url `did:key` encoding
+ * (legacyPublicKeyToDid) instead of the canonical base58btc form
+ * (publicKeyToDid). `legacyPublicKeyToDid` exists precisely because
+ * persisted/imported identities can carry this old encoding — this
+ * reproduces that shape by overriding `.did` after creation (the public key
+ * and identity_id, which SHR generation actually signs with / keys off of,
+ * are untouched). Any local-identity guard that compares `.did` STRINGS
+ * against a freshly-derived CANONICAL DID (as isLocallyHeldDid /
+ * peerDid-string-compare did pre-fix) fails to recognize this identity as
+ * local; a guard that compares decoded PUBLIC-KEY BYTES recognizes it
+ * regardless of which DID encoding it happens to be stored under.
+ */
+async function addLegacyDidIdentity(
+  fortress: ReturnType<typeof makeFortress>,
+  label: string
+): Promise<StoredIdentity> {
+  const encKey = derivePurposeKey(fortress.masterKey, "identity-encryption");
+  const { storedIdentity } = createIdentity(label, encKey, "recovery-key");
+  const legacyIdentity: StoredIdentity = {
+    ...storedIdentity,
+    did: legacyPublicKeyToDid(fromBase64url(storedIdentity.public_key)),
+  };
+  await fortress.identityManager.save(legacyIdentity);
+  return legacyIdentity;
 }
 
 function shrFor(
@@ -632,6 +666,231 @@ describe("(e) resolveTierByDid local-DID caps still hold (REP-01 regression guar
         new Set([local.publicIdentity.did])
       ).sovereignty_tier
     ).toBe("verified-sovereign");
+  });
+});
+
+// ── (f) MUST-FIX 1: legacy DID encoding does not evade the guard ───────────
+//
+// register §Z RECHECK / two-family gate CRITICAL: isLocallyHeldDid /
+// peerDid-string-compare pre-fix derived the counterparty's DID CANONICALLY
+// (publicKeyToDid) and compared it against each held identity's STORED
+// `.did` string. legacyPublicKeyToDid exists precisely because a persisted
+// or imported identity can carry the OLD base64url DID encoding — a
+// legacy-encoded local identity's `.did` therefore never matched the
+// canonical derivation, so the guard failed to recognize it as local and
+// its self-vouch was NOT blocked. The fix compares DECODED PUBLIC-KEY BYTES
+// instead (core/identity.ts isLocallyHeldPublicKey), which is invariant to
+// which DID encoding the identity happens to be stored under.
+
+describe("(f) MUST-FIX 1: a legacy-DID-encoded local identity is still recognized as local", () => {
+  it("handshake_respond refuses a challenge from a legacy-DID-encoded locally-held identity", async () => {
+    const fortress = makeFortress();
+    const a = await addIdentity(fortress, "identity-a");
+    const b = await addLegacyDidIdentity(fortress, "identity-b-legacy-did");
+    // Sanity: b really is stored under the legacy (non-canonical) encoding —
+    // different from what the canonical derivation would produce for the
+    // SAME key.
+    expect(b.did).not.toEqual(publicKeyToDid(fromBase64url(b.public_key)));
+
+    const { tools } = createHandshakeTools(
+      fortress.config,
+      fortress.identityManager,
+      fortress.masterKey,
+      fortress.auditLog
+    );
+    const initiate = tools.find((t) => t.name === "handshake_initiate")!;
+    const respond = tools.find((t) => t.name === "handshake_respond")!;
+
+    const initiated = parse(
+      await initiate.handler({ identity_id: a.identity_id })
+    );
+    // A challenges B (the legacy-DID identity) — B is locally held either way.
+    const respondedToLegacy = parse(
+      await respond.handler({
+        challenge: initiated.challenge,
+        identity_id: b.identity_id,
+      })
+    );
+    expect(respondedToLegacy.error).toContain("same fortress");
+
+    // And the reverse direction: B (legacy-DID) initiates, A responds and
+    // must recognize B's signing key as locally held despite B's `.did`
+    // being the legacy string.
+    const initiatedByLegacy = parse(
+      await initiate.handler({ identity_id: b.identity_id })
+    );
+    const respondedByA = parse(
+      await respond.handler({
+        challenge: initiatedByLegacy.challenge,
+        identity_id: a.identity_id,
+      })
+    );
+    expect(respondedByA.error).toContain("same fortress");
+  });
+
+  it("handshake_complete refuses to RECORD a self-vouched pair for a legacy-DID identity (recordHandshakeResult chokepoint)", async () => {
+    const fortress = makeFortress();
+    const a = await addIdentity(fortress, "identity-a");
+    const b = await addLegacyDidIdentity(fortress, "identity-b-legacy-did");
+    const { tools, handshakeResults } = createHandshakeTools(
+      fortress.config,
+      fortress.identityManager,
+      fortress.masterKey,
+      fortress.auditLog
+    );
+    const initiate = tools.find((t) => t.name === "handshake_initiate")!;
+    const complete = tools.find((t) => t.name === "handshake_complete")!;
+
+    const initiated = parse(
+      await initiate.handler({ identity_id: a.identity_id })
+    );
+
+    // Bypass handshake_respond's own earliest-rejection tool-level gate via
+    // the pure protocol function, isolating the RECORDING chokepoint itself
+    // (mirrors the (a) group's equivalent test).
+    const { respondToHandshake } = await import(
+      "../../src/handshake/protocol.js"
+    );
+    const shrB = shrFor(fortress, b.identity_id);
+    const respondResult = respondToHandshake(
+      initiated.challenge,
+      shrB,
+      fortress.identityManager,
+      fortress.masterKey,
+      b.identity_id
+    );
+    if ("error" in respondResult) throw new Error(respondResult.error);
+
+    const completed = parse(
+      await complete.handler({
+        session_id: initiated.session_id,
+        response: respondResult.response,
+      })
+    );
+    expect(completed.error).toContain("same fortress");
+    expect(handshakeResults.get(b.identity_id)).toBeUndefined();
+  });
+
+  it("federation_peers register() independently refuses a legacy-DID-encoded locally-held peer_did reaching the map by some other path", async () => {
+    const fortress = makeFortress();
+    const b = await addLegacyDidIdentity(fortress, "identity-b-legacy-did");
+    const shrB = shrFor(fortress, b.identity_id);
+
+    // Bypass the producer entirely (as the (b) group's equivalent test
+    // does): hand-insert a verified, liveness-proven HandshakeResult so
+    // federation's OWN register-time check is what is under test.
+    const handshakeResults = new Map<string, HandshakeResult>();
+    handshakeResults.set(shrB.body.instance_id, {
+      counterparty_id: shrB.body.instance_id,
+      counterparty_shr: shrB,
+      verified: true,
+      sovereignty_level: "full",
+      trust_tier: "verified-sovereign",
+      completed_at: new Date().toISOString(),
+      expires_at: new Date(Date.now() + 3600_000).toISOString(),
+      errors: [],
+      liveness_proven: true,
+    });
+
+    const { tools: fedTools } = createFederationTools(
+      fortress.auditLog,
+      handshakeResults,
+      fortress.identityManager
+    );
+    const register = fedTools.find((t) => t.name === "federation_peers")!;
+    const out = parse(
+      await register.handler({
+        action: "register",
+        peer_id: shrB.body.instance_id,
+      })
+    );
+
+    expect(out.registered).toBeUndefined();
+    expect(out.error).toContain("Cannot register a federation peer this fortress holds keys for");
+  });
+
+  it("resolveTierByDid: a local-set built from only one DID encoding misses a canonically-looked-up local key; localDidEncodings closes it", () => {
+    // resolveTierByDid's own contract is "is this DID one of ours" — general
+    // purpose, not specific to today's two callers. This demonstrates the
+    // latent gap directly: the internal handshake-map loop ALWAYS derives a
+    // DID CANONICALLY from a stored signing key (publicKeyToDid), so the one
+    // direction that can actually be fooled is a canonically-looked-up DID
+    // matched against a local-identity set built from only that identity's
+    // (possibly legacy-encoded) `.did` field — exactly what
+    // `new Set([identity.did])` produces if that identity was persisted
+    // under the legacy encoding. Today's two production callers (bridge/
+    // tools.ts, reputation/tools.ts) happen to pass identity.did as BOTH the
+    // lookup DID and the set's sole member, so they were never exploitable
+    // by this specific path — but hardening the function's general contract
+    // (rather than relying on that coincidence) is the fix MUST-FIX 1 asks
+    // for, and this proves it holds.
+    const encKey = derivePurposeKey(generateRandomKey(), "identity-encryption");
+    const local = createIdentity("local-signer", encKey, "recovery-key");
+    const localKeyBytes = fromBase64url(local.storedIdentity.public_key);
+    const canonicalDid = publicKeyToDid(localKeyBytes);
+    const legacyDid = legacyPublicKeyToDid(localKeyBytes);
+    expect(legacyDid).not.toEqual(canonicalDid);
+    expect(canonicalDid).toEqual(local.publicIdentity.did);
+
+    // A handshake-map entry for the SAME local key — as if a poisoned entry
+    // had reached the map by some path other than the producer chokepoint
+    // (recordHandshakeResult already prevents this at the producer; this
+    // isolates resolveTierByDid's OWN defense-in-depth cap).
+    const map = new Map<string, HandshakeResult>();
+    map.set("poisoned-instance", {
+      counterparty_id: "poisoned-instance",
+      counterparty_shr: {
+        body: {
+          shr_version: "1.0",
+          implementation: {
+            sanctuary_version: "0.4.0",
+            node_version: "20.0.0",
+            generated_by: "sanctuary-mcp-server",
+          },
+          instance_id: "poisoned-instance",
+          generated_at: new Date().toISOString(),
+          expires_at: new Date(Date.now() + 3600_000).toISOString(),
+          layers: {
+            l1: { status: "active", encryption: "aes-256-gcm", key_custody: "self", integrity: "merkle-sha256", identity_type: "ed25519", state_portable: true },
+            l2: { status: "active", isolation_type: "local-process", attestation_available: true },
+            l3: { status: "active", proof_system: "schnorr-pedersen", selective_disclosure: true },
+            l4: { status: "active", reputation_mode: "self-custodied", attestation_format: "eas-compatible", reputation_portable: true },
+          },
+          capabilities: { handshake: true, shr_exchange: true, reputation_verify: true, encrypted_channel: false },
+          degradations: [],
+        } as unknown as SignedSHR["body"],
+        signed_by: local.storedIdentity.public_key,
+        signature_scheme: "ed25519-v1",
+        signature: toBase64url(new Uint8Array(64)),
+      },
+      verified: true,
+      sovereignty_level: "full",
+      trust_tier: "verified-sovereign",
+      completed_at: new Date().toISOString(),
+      expires_at: new Date(Date.now() + 3600_000).toISOString(),
+      errors: [],
+      liveness_proven: true,
+    });
+
+    // OLD (pre-fix) shape: a set built from only the LEGACY-encoded `.did` a
+    // local identity might be persisted under MISSES a CANONICAL lookup —
+    // falls through to the handshake-map loop, which matches by signing key
+    // and over-credits the poisoned entry's declared verified-sovereign tier.
+    const legacyOnlySet = new Set([legacyDid]);
+    expect(
+      resolveTierByDid(canonicalDid, map, true, legacyOnlySet).sovereignty_tier
+    ).toBe("verified-sovereign"); // FAIL-BEFORE: demonstrates the gap
+
+    // NEW (fixed) shape: localDidEncodings derives BOTH forms from the raw
+    // key bytes, so the canonical lookup is recognized as local and capped —
+    // regardless of which single encoding the identity happens to be stored
+    // under.
+    const bothFormsSet = new Set(
+      localDidEncodings(local.storedIdentity.public_key)
+    );
+    expect(
+      resolveTierByDid(canonicalDid, map, true, bothFormsSet).sovereignty_tier
+    ).toBe("self-attested"); // PASS-AFTER
   });
 });
 

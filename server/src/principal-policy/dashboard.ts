@@ -967,7 +967,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   private baseline: BaselineTracker | null = null;
   private auditLog: AuditLog | null = null;
   private identityManager: IdentityManager | null = null;
-  private handshakeResults: Map<string, HandshakeResult> | null = null;
+  private handshakeResults: ReadonlyMap<string, HandshakeResult> | null = null;
   private shrOpts: SHRGeneratorOptions | null = null;
   /**
    * Storage backend, injected for the Recognition panel (P5) so the dashboard
@@ -1468,7 +1468,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     baseline: BaselineTracker;
     auditLog: AuditLog;
     identityManager?: IdentityManager;
-    handshakeResults?: Map<string, HandshakeResult>;
+    handshakeResults?: ReadonlyMap<string, HandshakeResult>;
     shrOpts?: SHRGeneratorOptions;
     sanctuaryConfig?: SanctuaryConfig;
     profileStore?: SovereigntyProfileStore;

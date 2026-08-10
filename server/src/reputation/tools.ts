@@ -27,6 +27,7 @@ import type { SanctuaryConfig } from "../config.js";
 import type { RuntimeStatus } from "../health/evidence.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
 import { toBase64url, fromBase64url } from "../core/encoding.js";
+import { localDidEncodings } from "../core/identity.js";
 import {
   resolveTierByDid,
   computeWeightedScore,
@@ -177,7 +178,7 @@ export function createReputationTools(
   masterKey: Uint8Array,
   identityManager: IdentityManager,
   auditLog: AuditLog,
-  handshakeResults?: Map<string, HandshakeResult>,
+  handshakeResults?: ReadonlyMap<string, HandshakeResult>,
   verascoreUrl?: string,
   config?: SanctuaryConfig
 ): { tools: ToolDefinition[]; reputationStore: ReputationStore } {
@@ -276,11 +277,14 @@ export function createReputationTools(
         // for every record regardless of caller, closing the residual this
         // record-time cap alone could not: a pre-fix laundered record, or a
         // direct ReputationStore.record() caller that bypasses this tool.
+        // localDidEncodings (not bare identity.did) so BOTH DID encodings
+        // this identity's key could be persisted under are capped — see
+        // resolveTierByDid's doc.
         const tierMeta = resolveTierByDid(
           identity.did,
           hsResults,
           true,
-          new Set([identity.did])
+          new Set(localDidEncodings(identity.public_key))
         );
 
         let stored;
@@ -606,8 +610,10 @@ export function createReputationTools(
       name: "reputation_query_weighted",
       description:
         "Query reputation with sovereignty-weighted scoring. " +
-        "Attestations from verified-sovereign agents carry full weight (1.0); " +
-        "unverified attestations carry reduced weight (0.2). " +
+        "Every attestation this instance stores or imports is scored at " +
+        "self-attested (0.5) or unverified (0.2) weight; verified-sovereign " +
+        "(1.0) and verified-degraded (0.8) are not currently reachable " +
+        "through recorded or imported attestations. " +
         "Returns both the weighted score and tier distribution.",
       inputSchema: {
         type: "object",

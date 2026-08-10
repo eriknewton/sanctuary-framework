@@ -169,6 +169,11 @@ compounding errors across an agent mesh.
 - No semantic cross-checking of claims between agents.
 - No content-truthfulness scoring — Sanctuary scores **provenance**,
   not **truth**.
+- An attestation recorded through `reputation_record` or `bridge_attest` is
+  scored at self-attested or unverified weight; verified-sovereign and
+  verified-degraded are not currently reachable through those recording
+  paths. Handshake-verified peer trust is tracked separately, in the
+  federation layer.
 
 ---
 

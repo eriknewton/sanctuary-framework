@@ -11,7 +11,7 @@
  */
 
 import { ed25519 } from "@noble/curves/ed25519";
-import { toBase64url } from "./encoding.js";
+import { toBase64url, fromBase64url } from "./encoding.js";
 import { encrypt, decrypt, type EncryptedPayload } from "./encryption.js";
 import { hash } from "./hashing.js";
 import { randomBytes } from "./random.js";
@@ -111,6 +111,80 @@ export function assertEd25519PublicKey(publicKey: Uint8Array): void {
       `Ed25519 public key must be ${ED25519_PUBLIC_KEY_LENGTH} bytes`
     );
   }
+}
+
+/**
+ * Every did:key STRING encoding a given base64url public key could be stored
+ * under, canonical (publicKeyToDid) and legacy (legacyPublicKeyToDid). A
+ * caller that must build a DID-STRING allowlist of "identities this fortress
+ * holds" (rather than compare raw bytes directly, e.g. because the consuming
+ * function's contract is DID-string-shaped) needs BOTH forms — a set built
+ * from only `identity.did` covers whichever ONE form that identity happens
+ * to be persisted under, silently missing the other (the #1194-class
+ * defect). Prefer isLocallyHeldPublicKey when the candidate is available as
+ * raw bytes; this exists for the DID-string-shaped case.
+ */
+export function localDidEncodings(publicKeyBase64url: string): string[] {
+  try {
+    const bytes = fromBase64url(publicKeyBase64url);
+    return [publicKeyToDid(bytes), legacyPublicKeyToDid(bytes)];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Byte-exact equality for two public keys. Public keys are not secret, so
+ * this does not need to be constant-time; it exists so every "is this the
+ * same signing key" decision compares raw key material instead of a
+ * canonicalized string form. `legacyPublicKeyToDid` above exists precisely
+ * because the SAME key can be persisted under two different `did:key`
+ * strings (canonical base58btc vs. the retired base64url form) — a DID-
+ * STRING comparison silently fails to recognize a legacy-encoded identity
+ * as the same key (the #1194-class defect). Comparing decoded bytes cannot
+ * be fooled by encoding drift.
+ */
+export function publicKeyBytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
+
+/**
+ * THE shared "does this fortress hold this signing key" predicate (register
+ * §Z RECHECK / class-level self-vouch guard). Every local-identity trust
+ * check that decides whether a counterparty's signing key belongs to an
+ * identity THIS fortress holds — the handshake producer chokepoint
+ * (`recordHandshakeResult` in handshake/tools.ts), the federation
+ * register-time defense-in-depth check (federation/tools.ts), and the
+ * reputation tier cap (`resolveTierByDid` in reputation/tiers.ts) — MUST
+ * route through this function rather than comparing DID strings, because
+ * `identities[].did` can be stored in either DID encoding (see
+ * `publicKeyBytesEqual`) and only the raw key bytes are encoding-invariant.
+ * `candidatePublicKey` undefined (an undecodable signer key) is never
+ * "locally held" — every caller uses the result ONLY to REFUSE trust, so a
+ * decode failure just skips the refusal; the signer's key is already
+ * validated elsewhere (SHR/signature verification) before this runs.
+ */
+export function isLocallyHeldPublicKey(
+  candidatePublicKey: Uint8Array | undefined,
+  identities: readonly { public_key: string }[]
+): boolean {
+  if (!candidatePublicKey) return false;
+  for (const identity of identities) {
+    let identityKeyBytes: Uint8Array;
+    try {
+      identityKeyBytes = fromBase64url(identity.public_key);
+    } catch {
+      continue;
+    }
+    if (publicKeyBytesEqual(candidatePublicKey, identityKeyBytes)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function base58btcEncode(bytes: Uint8Array): string {

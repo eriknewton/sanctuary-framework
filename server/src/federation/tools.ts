@@ -13,20 +13,22 @@ import { toolResult } from "../router.js";
 import type { AuditLog } from "../operational/audit-log.js";
 import type { HandshakeResult } from "../handshake/types.js";
 import type { IdentityManager } from "../cognitive/tools.js";
-import { publicKeyToDid } from "../core/identity.js";
+import { publicKeyToDid, isLocallyHeldPublicKey } from "../core/identity.js";
 import { fromBase64url } from "../core/encoding.js";
 import { FederationRegistry } from "./registry.js";
 
 export function createFederationTools(
   auditLog: AuditLog,
-  handshakeResults: Map<string, HandshakeResult>,
-  // Optional (defense-in-depth): when supplied, register-time refuses a peer
-  // this fortress holds keys for, independent of the shared producer
-  // chokepoint (recordHandshakeResult in handshake/tools.ts) that already
-  // keeps `handshakeResults` free of such entries. Production wiring
-  // (index.ts) always supplies it; tests that construct handshakeResults
-  // directly (not through the real handshake tools) may omit it.
-  identityManager?: IdentityManager
+  handshakeResults: ReadonlyMap<string, HandshakeResult>,
+  // REQUIRED (AGENTS.md rule 3: an optional security dependency that gates a
+  // trust property must be required, never silently-disabling). Register-time
+  // refuses a peer this fortress holds keys for, independent of the shared
+  // producer chokepoint (recordHandshakeResult in handshake/tools.ts) that
+  // already keeps `handshakeResults` free of such entries — this is
+  // defense-in-depth, not the only layer, but it must never be inert.
+  // Production wiring (index.ts) always supplies it; every test construction
+  // must too (a test that omits it is testing a bypass, not a real config).
+  identityManager: IdentityManager
 ): { tools: ToolDefinition[]; registry: FederationRegistry } {
   const registry = new FederationRegistry();
 
@@ -139,9 +141,10 @@ export function createFederationTools(
             // arbitrary/impersonating label from being attached to a verified
             // peer.
             let derivedDid: string;
+            let signerPublicKey: Uint8Array;
             try {
-              const pubKey = fromBase64url(hsResult.counterparty_shr.signed_by);
-              derivedDid = publicKeyToDid(pubKey);
+              signerPublicKey = fromBase64url(hsResult.counterparty_shr.signed_by);
+              derivedDid = publicKeyToDid(signerPublicKey);
             } catch (e) {
               return toolResult({
                 error:
@@ -169,8 +172,15 @@ export function createFederationTools(
             // rather than trusting that every past or future write into
             // `handshakeResults` routed through that chokepoint. Federation
             // must never trust a peer this fortress holds the private key
-            // for, regardless of how its handshake entry arrived.
-            if (identityManager?.list().some((id) => id.did === peerDid)) {
+            // for, regardless of how its handshake entry arrived. Compares
+            // DECODED KEY BYTES (isLocallyHeldPublicKey, core/identity.ts),
+            // never the DID string — a persisted identity's `.did` can be in
+            // the legacy base64url encoding while `derivedDid` above is
+            // always canonical, so a DID-string comparison here would miss a
+            // legacy-encoded local identity (the #1194-class defect).
+            // `signerPublicKey` is already decoded above; reuse it rather
+            // than re-deriving from `peerDid`.
+            if (isLocallyHeldPublicKey(signerPublicKey, identityManager.list())) {
               void auditLog.append(
                 "l4",
                 "federation_peer_register_self_vouch_blocked",

@@ -346,6 +346,8 @@ SHRs integrate with the reputation system through sovereignty-gated tiers. Attes
 
 These weights are configurable. The default values reflect the principle that verifiable sovereignty claims should be worth more than unverifiable ones.
 
+**Current implementation bound:** an attestation recorded through `reputation_record` or `bridge_attest` is scored at `self-attested` or `unverified` weight. `verified-sovereign` and `verified-degraded` are not currently reachable through those recording paths; the full tier table applies to the SHR handshake and federation trust model described in sections 5 and 6.
+
 ---
 
 ## 8. EU AI Act Compliance Mapping

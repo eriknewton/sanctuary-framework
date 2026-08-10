@@ -20,7 +20,7 @@ import { derivePurposeKey } from "../core/key-derivation.js";
 import { fromBase64url, stringToBytes } from "../core/encoding.js";
 import { encrypt, decrypt, type EncryptedPayload } from "../core/encryption.js";
 import { bytesToString } from "../core/encoding.js";
-import { publicKeyToDid, type StoredIdentity } from "../core/identity.js";
+import { publicKeyToDid, localDidEncodings, type StoredIdentity } from "../core/identity.js";
 import {
   BRIDGE_METRIC_POLICY,
   BridgeAttestationMetricValidationError,
@@ -89,7 +89,7 @@ export function createBridgeTools(
   masterKey: Uint8Array,
   identityManager: IdentityManager,
   auditLog: AuditLog,
-  handshakeResults?: Map<string, HandshakeResult>
+  handshakeResults?: ReadonlyMap<string, HandshakeResult>
 ): { tools: ToolDefinition[] } {
   const bridgeStore = new BridgeStore(storage, masterKey);
   const reputationStore = new ReputationStore(storage, masterKey);
@@ -572,12 +572,14 @@ export function createBridgeTools(
         // chokepoint (trustedSovereigntyTier, A11 — now an UNCONDITIONAL
         // clamp) enforces the same cap at scoring for every record, including
         // a pre-fix laundered record or a direct ReputationStore.record()
-        // caller that bypasses this tool.
+        // caller that bypasses this tool. localDidEncodings (not bare
+        // identity.did) so BOTH DID encodings this identity's key could be
+        // persisted under are capped — see resolveTierByDid's doc.
         const tierMeta: TierMetadata = resolveTierByDid(
           identity.did,
           hsResults,
           true,
-          new Set([identity.did])
+          new Set(localDidEncodings(identity.public_key))
         );
         const tier = tierMeta.sovereignty_tier;
 

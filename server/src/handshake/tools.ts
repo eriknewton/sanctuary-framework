@@ -15,7 +15,11 @@ import type { SanctuaryConfig } from "../config.js";
 import type { IdentityManager } from "../cognitive/tools.js";
 import type { AuditLog } from "../operational/audit-log.js";
 import { generateSHR, type SHRGeneratorOptions } from "../shr/generator.js";
-import { sign as identitySign, publicKeyToDid } from "../core/identity.js";
+import {
+  sign as identitySign,
+  publicKeyToDid,
+  isLocallyHeldPublicKey,
+} from "../core/identity.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
 import { toBase64url, fromBase64url } from "../core/encoding.js";
 import {
@@ -63,13 +67,25 @@ export function createHandshakeTools(
   masterKey: Uint8Array,
   auditLog: AuditLog,
   options?: HandshakeToolsOptions
-): { tools: ToolDefinition[]; handshakeResults: Map<string, HandshakeResult> } {
+): {
+  tools: ToolDefinition[];
+  // Exposed to every consumer (federation, dashboard, reputation, bridge) as
+  // a ReadonlyMap: recordHandshakeResult below is the ONLY writer, and MUST
+  // stay the only writer, since it is the producer chokepoint the whole
+  // self-vouch class is closed at (register §Z RECHECK). The type system
+  // enforces this at every consumer call site; a consumer that needs to
+  // mutate the map is a design error, not a cast to work around.
+  handshakeResults: ReadonlyMap<string, HandshakeResult>;
+} {
   const autoPublishHandshakes = options?.autoPublishHandshakes ?? false;
   const verascoreUrl = options?.verascoreUrl ?? "https://verascore.ai";
   const identityEncKey = derivePurposeKey(masterKey, "identity-encryption");
   // In-memory session store (per server instance lifetime)
   const sessions = new Map<string, HandshakeSession>();
-  // Completed handshake results indexed by counterparty ID — shared with L4 tier resolution
+  // Completed handshake results indexed by counterparty ID — shared with L4
+  // tier resolution. Kept as a mutable Map INTERNALLY (recordHandshakeResult
+  // is the only function in this closure that calls .set on it); the return
+  // type above widens it to ReadonlyMap for every external consumer.
   const handshakeResults = new Map<string, HandshakeResult>();
 
   const shrOpts: SHRGeneratorOptions = {
@@ -82,11 +98,27 @@ export function createHandshakeTools(
     "Self-handshake rejected: an identity cannot verify another identity held by the same fortress";
 
   /**
-   * Derive the DID for a base64url-encoded Ed25519 public key, or undefined
+   * Decode a base64url-encoded Ed25519 public key to raw bytes, or undefined
    * if it cannot be decoded. Every caller below uses the result ONLY to
    * REFUSE (never to grant trust), so a decode failure just skips the
    * refusal; a genuinely malformed key is already rejected elsewhere by SHR/
    * signature verification.
+   */
+  function tryDecodeSignerKey(signedByBase64url: string | undefined): Uint8Array | undefined {
+    if (!signedByBase64url) return undefined;
+    try {
+      return fromBase64url(signedByBase64url);
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * Derive the DID for a base64url-encoded Ed25519 public key, or undefined
+   * if it cannot be decoded. INFORMATIONAL ONLY (audit-log readability) —
+   * never use this for the local-identity TRUST decision; see
+   * isLocallyHeldSignerKey / isLocallyHeldPublicKey below for why a DID
+   * string is not safe to compare against a persisted identity's `.did`.
    */
   function tryDeriveDid(signedByBase64url: string | undefined): string | undefined {
     if (!signedByBase64url) return undefined;
@@ -98,13 +130,19 @@ export function createHandshakeTools(
   }
 
   /**
-   * Is `did` an identity THIS fortress currently holds? Computed FRESH via
-   * identityManager.list() on every call (never cached at module-load or
-   * server-boot time), so an identity created after startup is covered.
+   * Is `signerPublicKey` the raw signing key of an identity THIS fortress
+   * currently holds? Computed FRESH via identityManager.list() on every call
+   * (never cached at module-load or server-boot time), so an identity
+   * created after startup is covered. Delegates to the shared
+   * isLocallyHeldPublicKey predicate (core/identity.ts) — comparing DECODED
+   * KEY BYTES, never a DID string, because a persisted identity's `.did` can
+   * be in the legacy base64url encoding (see legacyPublicKeyToDid) while a
+   * freshly-derived DID uses the canonical base58btc encoding; DID-string
+   * equality silently fails to recognize a legacy-encoded local identity as
+   * local (the #1194-class defect this guard exists to close).
    */
-  function isLocallyHeldDid(did: string | undefined): boolean {
-    if (!did) return false;
-    return identityManager.list().some((id) => id.did === did);
+  function isLocallyHeldSignerKey(signerPublicKey: Uint8Array | undefined): boolean {
+    return isLocallyHeldPublicKey(signerPublicKey, identityManager.list());
   }
 
   /**
@@ -121,10 +159,12 @@ export function createHandshakeTools(
    * map can be tricked by an entry that never exists.
    *
    * Every `handshakeResults.set(...)` in this file funnels through this one
-   * function. A counterparty is "locally held" when its signing DID equals
-   * the DID of an identity THIS fortress currently holds (isLocallyHeldDid).
-   * The protocol-level `sameSigningKey()` guard (protocol.ts) only rejects
-   * the degenerate case of an IDENTICAL key signing both sides of a
+   * function. A counterparty is "locally held" when its signing KEY BYTES
+   * equal the key bytes of an identity THIS fortress currently holds
+   * (isLocallyHeldSignerKey — compares decoded key material, never a DID
+   * string; see that function's doc for the legacy-DID-encoding defect this
+   * closes). The protocol-level `sameSigningKey()` guard (protocol.ts) only
+   * rejects the degenerate case of an IDENTICAL key signing both sides of a
    * handshake; two DISTINCT locally-held keys (identity A handshaking
    * identity B, both created by the same operator) pass every
    * sameSigningKey check and are exactly the case this chokepoint closes.
@@ -133,8 +173,12 @@ export function createHandshakeTools(
     result: HandshakeResult,
     auditIdentityId: string
   ): { ok: true } | { ok: false; error: string } {
-    const counterpartyDid = tryDeriveDid(result.counterparty_shr.signed_by);
-    if (isLocallyHeldDid(counterpartyDid)) {
+    const counterpartyKey = tryDecodeSignerKey(result.counterparty_shr.signed_by);
+    if (isLocallyHeldSignerKey(counterpartyKey)) {
+      // counterparty_did here is derived ONLY for the audit trail's
+      // readability; the trust decision above already ran on decoded key
+      // bytes, never this string.
+      const counterpartyDid = tryDeriveDid(result.counterparty_shr.signed_by);
       void auditLog.append(
         "l4",
         "handshake_self_vouch_blocked",
@@ -230,7 +274,9 @@ export function createHandshakeTools(
         // session state. sameSigningKey() inside respondToHandshake only
         // rejects an IDENTICAL key on both sides; this is the earliest point
         // that can catch the case it cannot — two DISTINCT locally-held keys.
-        if (isLocallyHeldDid(tryDeriveDid(challenge.shr?.signed_by))) {
+        // Compares decoded key bytes (isLocallyHeldSignerKey), never a DID
+        // string — see that function's doc.
+        if (isLocallyHeldSignerKey(tryDecodeSignerKey(challenge.shr?.signed_by))) {
           void auditLog.append("l4", "handshake_respond", shr.body.instance_id, undefined, "failure");
           auditHandshakeFailed(auditLog, {
             session_id: "unknown",

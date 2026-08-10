@@ -113,7 +113,7 @@ export interface TierMetadata {
  */
 export function resolveTier(
   counterpartyId: string,
-  handshakeResults: Map<string, HandshakeResult>,
+  handshakeResults: ReadonlyMap<string, HandshakeResult>,
   hasSanctuaryIdentity: boolean
 ): TierMetadata {
   const handshake = handshakeResults.get(counterpartyId);
@@ -150,10 +150,18 @@ export function resolveTier(
  * handshake (never the wrong one — no over-crediting); a miss (including a
  * counterparty whose signing key has rotated away from the DID) falls through to
  * the original instance_id lookup, preserving today's behavior.
+ *
+ * `localIdentityDids` is a DID-STRING set (this function's contract is
+ * DID-shaped throughout), so a caller MUST include every DID encoding for
+ * each local identity it is capping — `core/identity.ts`'s
+ * `localDidEncodings(identity.public_key)` builds both the canonical and
+ * legacy forms from the identity's raw key material. A set built from only
+ * `identity.did` covers whichever ONE encoding that identity happens to be
+ * persisted under and silently misses the other (the #1194-class defect).
  */
 export function resolveTierByDid(
   counterpartyDid: string,
-  handshakeResults: Map<string, HandshakeResult>,
+  handshakeResults: ReadonlyMap<string, HandshakeResult>,
   hasSanctuaryIdentity: boolean,
   localIdentityDids?: ReadonlySet<string>
 ): TierMetadata {
