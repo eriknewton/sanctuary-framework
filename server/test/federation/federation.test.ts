@@ -15,6 +15,7 @@
 
 import { describe, it, expect, beforeEach } from "vitest";
 import { FederationRegistry } from "../../src/federation/registry.js";
+import type { FederationPeer } from "../../src/federation/types.js";
 import type { HandshakeResult } from "../../src/handshake/types.js";
 import type { SignedSHR } from "../../src/shr/types.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
@@ -22,6 +23,37 @@ import { generateRandomKey } from "../../src/core/random.js";
 import { AuditLog } from "../../src/operational/audit-log.js";
 
 const TEST_ORIGIN = "agent:test-origin";
+
+/**
+ * `registerFromHandshake` now returns a typed `{ ok, ... }` result rather
+ * than a bare `FederationPeer | null` (MUST-FIX 2, fix-round-4 — see
+ * registry.ts's `RegisterPeerResult` doc for why the agent-facing caller
+ * needs the typed refusal reason). Every test in this file registers a
+ * peer expecting SUCCESS (capacity/quota refusal paths are covered by
+ * test/security/attacker-writable-collections-bounds.test.ts instead), so
+ * this helper unwraps to the plain `FederationPeer` the tests below were
+ * already written against, throwing loudly on an unexpected refusal
+ * instead of silently returning `undefined` the way the old
+ * non-null-assertion (`!`) pattern would have masked one.
+ */
+async function register(
+  registry: FederationRegistry,
+  result: HandshakeResult,
+  peerDid: string,
+  capabilities: Parameters<FederationRegistry["registerFromHandshake"]>[2],
+  origin: string
+): Promise<FederationPeer> {
+  const registration = await registry.registerFromHandshake(
+    result,
+    peerDid,
+    capabilities,
+    origin
+  );
+  if (!registration.ok) {
+    throw new Error(`registerFromHandshake unexpectedly refused: ${registration.reason}`);
+  }
+  return registration.peer;
+}
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
@@ -80,7 +112,7 @@ describe("Federation Registry", () => {
       const hsResult = makeHandshakeResult();
       // Non-null: the registry is fresh (well under MAX_FEDERATION_PEERS),
       // so registration cannot be refused for capacity here.
-      const peer = (await registry.registerFromHandshake(hsResult, "did:sanctuary:peer-1", undefined, TEST_ORIGIN))!;
+      const peer = await register(registry, hsResult, "did:sanctuary:peer-1", undefined, TEST_ORIGIN);
 
       expect(peer.peer_id).toBe("peer-1");
       expect(peer.peer_did).toBe("did:sanctuary:peer-1");
@@ -93,17 +125,17 @@ describe("Federation Registry", () => {
         counterparty_id: "sovereign-peer",
         trust_tier: "verified-sovereign",
       });
-      const peer = (await registry.registerFromHandshake(hsResult, "did:sanctuary:sovereign", undefined, TEST_ORIGIN))!;
+      const peer = await register(registry, hsResult, "did:sanctuary:sovereign", undefined, TEST_ORIGIN);
 
       expect(peer.trust_tier).toBe("verified-sovereign");
     });
 
     it("updates existing peer on re-registration", async () => {
       const hsResult1 = makeHandshakeResult({ trust_tier: "verified-degraded" });
-      await registry.registerFromHandshake(hsResult1, "did:sanctuary:peer-1", undefined, TEST_ORIGIN);
+      await register(registry, hsResult1, "did:sanctuary:peer-1", undefined, TEST_ORIGIN);
 
       const hsResult2 = makeHandshakeResult({ trust_tier: "verified-sovereign" });
-      const peer = (await registry.registerFromHandshake(hsResult2, "did:sanctuary:peer-1", undefined, TEST_ORIGIN))!;
+      const peer = await register(registry, hsResult2, "did:sanctuary:peer-1", undefined, TEST_ORIGIN);
 
       expect(peer.trust_tier).toBe("verified-sovereign");
       // First seen should be preserved
@@ -112,12 +144,12 @@ describe("Federation Registry", () => {
 
     it("preserves first_seen on re-registration", async () => {
       const hsResult1 = makeHandshakeResult();
-      const peer1 = (await registry.registerFromHandshake(hsResult1, "did:sanctuary:peer-1", undefined, TEST_ORIGIN))!;
+      const peer1 = await register(registry, hsResult1, "did:sanctuary:peer-1", undefined, TEST_ORIGIN);
       const firstSeen = peer1.first_seen;
 
       // Wait a tiny bit and re-register
       const hsResult2 = makeHandshakeResult();
-      const peer2 = (await registry.registerFromHandshake(hsResult2, "did:sanctuary:peer-1", undefined, TEST_ORIGIN))!;
+      const peer2 = await register(registry, hsResult2, "did:sanctuary:peer-1", undefined, TEST_ORIGIN);
 
       expect(peer2.first_seen).toBe(firstSeen);
     });
@@ -129,7 +161,7 @@ describe("Federation Registry", () => {
     });
 
     it("returns the peer for known IDs", async () => {
-      await registry.registerFromHandshake(makeHandshakeResult(), "did:sanctuary:peer-1", undefined, TEST_ORIGIN);
+      await register(registry, makeHandshakeResult(), "did:sanctuary:peer-1", undefined, TEST_ORIGIN);
       const peer = registry.getPeer("peer-1");
 
       expect(peer).not.toBeNull();
@@ -141,7 +173,7 @@ describe("Federation Registry", () => {
         counterparty_id: "expired-peer",
         expires_at: new Date(Date.now() - 1000).toISOString(),
       });
-      await registry.registerFromHandshake(expired, "did:sanctuary:expired-peer", undefined, TEST_ORIGIN);
+      await register(registry, expired, "did:sanctuary:expired-peer", undefined, TEST_ORIGIN);
 
       const peer = registry.getPeer("expired-peer");
       expect(peer).not.toBeNull();
@@ -152,13 +184,13 @@ describe("Federation Registry", () => {
 
   describe("Listing", () => {
     it("lists all peers", async () => {
-      await registry.registerFromHandshake(
+      await register(registry,
         makeHandshakeResult({ counterparty_id: "p1" }),
         "did:p1",
         undefined,
         TEST_ORIGIN
       );
-      await registry.registerFromHandshake(
+      await register(registry,
         makeHandshakeResult({ counterparty_id: "p2" }),
         "did:p2",
         undefined,
@@ -169,13 +201,13 @@ describe("Federation Registry", () => {
     });
 
     it("filters to active-only peers", async () => {
-      await registry.registerFromHandshake(
+      await register(registry,
         makeHandshakeResult({ counterparty_id: "active-peer" }),
         "did:active",
         undefined,
         TEST_ORIGIN
       );
-      await registry.registerFromHandshake(
+      await register(registry,
         makeHandshakeResult({
           counterparty_id: "expired-peer",
           expires_at: new Date(Date.now() - 1000).toISOString(),
@@ -193,7 +225,7 @@ describe("Federation Registry", () => {
 
   describe("Peer Removal", () => {
     it("removes a peer", async () => {
-      await registry.registerFromHandshake(makeHandshakeResult(), "did:peer-1", undefined, TEST_ORIGIN);
+      await register(registry, makeHandshakeResult(), "did:peer-1", undefined, TEST_ORIGIN);
       expect(registry.removePeer("peer-1")).toBe(true);
       expect(registry.getPeer("peer-1")).toBeNull();
     });
@@ -211,7 +243,7 @@ describe("Federation Registry", () => {
     });
 
     it("returns medium trust for verified-degraded peer with active handshake", async () => {
-      await registry.registerFromHandshake(
+      await register(registry,
         makeHandshakeResult({ trust_tier: "verified-degraded" }),
         "did:peer",
         undefined,
@@ -225,7 +257,7 @@ describe("Federation Registry", () => {
     });
 
     it("returns high trust for verified-sovereign with attestation history", async () => {
-      await registry.registerFromHandshake(
+      await register(registry,
         makeHandshakeResult({ trust_tier: "verified-sovereign" }),
         "did:peer",
         undefined,
@@ -237,7 +269,7 @@ describe("Federation Registry", () => {
     });
 
     it("degrades trust when handshake expires", async () => {
-      await registry.registerFromHandshake(
+      await register(registry,
         makeHandshakeResult({
           trust_tier: "verified-sovereign",
           expires_at: new Date(Date.now() - 1000).toISOString(),
@@ -253,7 +285,7 @@ describe("Federation Registry", () => {
     });
 
     it("factors in reputation score", async () => {
-      await registry.registerFromHandshake(
+      await register(registry,
         makeHandshakeResult({ trust_tier: "verified-degraded" }),
         "did:peer",
         undefined,
@@ -269,7 +301,7 @@ describe("Federation Registry", () => {
     });
 
     it("includes all evaluation factors in output", async () => {
-      await registry.registerFromHandshake(
+      await register(registry,
         makeHandshakeResult(),
         "did:peer",
         undefined,
@@ -286,13 +318,13 @@ describe("Federation Registry", () => {
 
   describe("Handshake Results Integration", () => {
     it("exposes active handshake results for tier resolution", async () => {
-      await registry.registerFromHandshake(
+      await register(registry,
         makeHandshakeResult({ counterparty_id: "active" }),
         "did:active",
         undefined,
         TEST_ORIGIN
       );
-      await registry.registerFromHandshake(
+      await register(registry,
         makeHandshakeResult({
           counterparty_id: "expired",
           expires_at: new Date(Date.now() - 1000).toISOString(),

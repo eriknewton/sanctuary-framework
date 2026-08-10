@@ -38,6 +38,11 @@
  * from this insert.
  */
 
+import {
+  AUDIT_WRITE_LOCK_TIMEOUT_MS,
+  DEFAULT_AUDIT_WRITE_LOCK_HOLD_DEADLINE_MS,
+} from "../operational/audit-log.js";
+
 /**
  * The caller's answer to "a new key needs room; what do I do?" — either name
  * an existing key to evict (making room for the incoming entry), or refuse
@@ -91,15 +96,53 @@ export type BoundedMapSetResult =
  * inside the per-map admission lock (see `admissionQueue`), so a HANGING
  * audit write would otherwise stall every later `set()` call for this map
  * indefinitely, turning an audit-log availability problem into a total
- * admission stall for the whole collection. 10_000 = 2x
- * operational/audit-log.ts's own `AUDIT_WRITE_LOCK_TIMEOUT_MS` (5s): long
- * enough that a write merely blocked behind the audit log's OWN internal
- * lock still completes inside this window, short enough that a genuinely
- * hung write fails closed (refused, reason `audit_unavailable`) in
- * bounded time rather than never — see AGENTS.md rule 8(d), bounded work
- * per request.
+ * admission stall for the whole collection.
+ *
+ * CROSS-FILE PIN, CORRECTED (fix-round-4, F1 — the prior value derived
+ * from the WRONG audit-log bound): must match `AUDIT_WRITE_LOCK_TIMEOUT_MS`
+ * and `DEFAULT_AUDIT_WRITE_LOCK_HOLD_DEADLINE_MS` in
+ * operational/audit-log.ts. A caller's `onEvict` is, in every production
+ * call site, a single `auditLog.appendCritical(...)` call (plus
+ * negligible synchronous bookkeeping) — and `appendCritical`'s own
+ * worst-case settle time is bounded by audit-log.ts's TWO-PHASE timeout:
+ * lock ACQUISITION rejects at `AUDIT_WRITE_LOCK_TIMEOUT_MS` (5s,
+ * `AuditLockContentionError`) if it never acquires, and once acquired the
+ * write OPERATION itself is raced against
+ * `DEFAULT_AUDIT_WRITE_LOCK_HOLD_DEADLINE_MS` (30s,
+ * `AuditLockHoldDeadlineError`) — so `appendCritical` is GUARANTEED to
+ * settle, one way or the other, within the SUM of the two (audit-log.ts's
+ * own `Promise.race` against a deadline timer, not merely a convention).
+ *
+ * The PRIOR value here (10_000, "2x AUDIT_WRITE_LOCK_TIMEOUT_MS") mistook
+ * the 5s ACQUISITION-only bound for the whole write's bound. A
+ * slow-but-successful `appendCritical` — its OWN I/O taking 10-30s, not
+ * blocked behind lock contention — legitimately crosses that old 10s
+ * timeout while still succeeding: `withTimeout` below rejects at 10s
+ * (refusing the admission, `audit_unavailable`, correctly leaving the
+ * victim intact), but the underlying `onEvict` PROMISE keeps running
+ * detached — nothing cancels it — and when it later resolves, its
+ * post-audit continuation runs with no caller left listening. See each
+ * onEvict call site (handshake/tools.ts's `handshakeResults`,
+ * federation/registry.ts) for why a detached continuation acting on
+ * sibling state after the eviction it describes was actually REFUSED is
+ * the defect this constant's correctness prevents, and
+ * `BoundedMapOptions.onEvicted`'s doc for the second, structural half of
+ * the fix (sibling-state side effects no longer live in `onEvict` at all).
+ *
+ * Set STRICTLY ABOVE the sum, with margin, so this timeout can never
+ * legitimately race audit-log.ts's own settle guarantee — i.e., ANY
+ * `appendCritical` call that ever resolves under audit-log.ts's documented
+ * contract is provably observed by `withTimeout` below BEFORE this timer
+ * could fire, making the "resolves after the caller already gave up"
+ * window unreachable for a conforming audit-log implementation (not an
+ * absolute guarantee against a future change to that contract — see
+ * BUILD_RESULT.md's residual note).
  */
-const ON_EVICT_AUDIT_TIMEOUT_MS = 10_000;
+// EXPORTED for tests only (test/core/bounded-map.test.ts pins fake-timer
+// advances to this exact value rather than a hand-copied duplicate, so the
+// test cannot silently drift from the real derivation above).
+export const ON_EVICT_AUDIT_TIMEOUT_MS =
+  AUDIT_WRITE_LOCK_TIMEOUT_MS + DEFAULT_AUDIT_WRITE_LOCK_HOLD_DEADLINE_MS + 5_000;
 
 /**
  * Race `promise` against a timer that rejects after `ms`. Used ONLY to
@@ -171,6 +214,44 @@ export interface BoundedMapOptions<K, V> {
    * binds a caller that DOES supply one.
    */
   onEvict?: (evictedKey: K, evictedValue: V) => void | Promise<void>;
+  /**
+   * AUTHORITATIVE post-eviction hook (fix-round-4, MUST-FIX 1 / F1 — closes
+   * the detached-continuation defect `onEvict` alone cannot close). Fired
+   * SYNCHRONOUSLY, exactly once, IMMEDIATELY after this map has itself
+   * deleted `evictedKey` from `this.map` (and `this.origins`, if it held an
+   * origin) — never before, never speculatively, and never for an eviction
+   * that was refused (audit rejection, audit timeout, or a post-await
+   * reference mismatch — see `admitNewKey`'s doc). No `await` separates the
+   * delete from this call, so there is no window in which anything else can
+   * run in between: by the time this fires, the deletion is an already-done
+   * fact, not a decision still in flight.
+   *
+   * WHY THIS EXISTS, DISTINCT FROM `onEvict`: `onEvict` is awaited and
+   * TIMEOUT-BOUNDED (`ON_EVICT_AUDIT_TIMEOUT_MS`) for durability reasons —
+   * the audit write must happen BEFORE the delete, so a crash or a
+   * rejected write can abort the eviction instead of losing state
+   * silently. But bounding an await with a timeout cannot CANCEL the
+   * underlying promise: if `onEvict` is still running when
+   * `ON_EVICT_AUDIT_TIMEOUT_MS` elapses, `set()` refuses the admission
+   * (correctly leaving the victim intact) while `onEvict`'s own promise
+   * keeps executing DETACHED — nothing is listening to it anymore. A
+   * caller whose `onEvict` does anything beyond the audit write itself
+   * (e.g. cleaning up a SIBLING collection keyed by the same id — see
+   * handshake/tools.ts's `handshakeResultWriterOrigins`) would have that
+   * cleanup run from the detached continuation once the slow write finally
+   * settles, mutating sibling state for an eviction that, from this map's
+   * own authoritative perspective, never happened. `onEvicted` cannot be
+   * reached by a detached continuation because it is never awaited FROM
+   * inside `onEvict` at all — it is called by `admitNewKey` itself, after
+   * `admitNewKey`'s own (successfully awaited, non-timed-out) delete. A
+   * caller with a sibling collection to keep in sync MUST put that cleanup
+   * here, never inside `onEvict`. `onEvicted` must be cheap and
+   * synchronous (in-memory bookkeeping only, no I/O, no `await`) — it is
+   * not awaited or timeout-bounded, and a caller needing a durable side
+   * effect from an eviction should do that inside `onEvict` (before the
+   * delete) instead, accepting that shape's own await/timeout contract.
+   */
+  onEvicted?: (evictedKey: K, evictedValue: V) => void;
   /** Fired when an insert is refused — either because the incoming origin
    * was already at `maxPerOrigin`, or because the map is at the global cap
    * and `selectEviction` refused. */
@@ -452,6 +533,23 @@ export class BoundedMap<K, V> {
       }
       this.map.delete(decision.evict);
       this.origins.delete(decision.evict);
+      // AUTHORITATIVE post-delete hook (fix-round-4, MUST-FIX 1 / F1) — see
+      // `BoundedMapOptions.onEvicted`'s doc. Fired synchronously, right
+      // here, with no `await` between the delete above and this call, so a
+      // caller's sibling-state cleanup (e.g. handshake/tools.ts's
+      // `handshakeResultWriterOrigins`) only ever runs when this map has
+      // ITSELF just committed the eviction — never from `onEvict`'s own
+      // promise continuing to run after `set()` already gave up and
+      // refused (timeout) or aborted (rejection/reference mismatch) above.
+      // `evictedValue` may be `undefined` here only if `decision.evict`
+      // named a key already absent from the map (defensive — `onEvict`
+      // above already guards this with `if (evictedValue !== undefined)`);
+      // firing `onEvicted` with `undefined` in that case would hand a
+      // caller a value it never asked for, so skip it — there was nothing
+      // to authoritatively evict.
+      if (evictedValue !== undefined) {
+        this.opts.onEvicted?.(decision.evict, evictedValue);
+      }
     }
 
     this.map.set(key, value);

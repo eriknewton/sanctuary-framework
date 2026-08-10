@@ -27,8 +27,12 @@
  * races.
  */
 
-import { describe, it, expect } from "vitest";
-import { BoundedMap, type EvictionDecision } from "../../src/core/bounded-map.js";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import {
+  BoundedMap,
+  ON_EVICT_AUDIT_TIMEOUT_MS,
+  type EvictionDecision,
+} from "../../src/core/bounded-map.js";
 
 /** A promise this test can resolve/reject on demand, to pin exactly when a
  * caller-supplied `onEvict` callback settles relative to other code the
@@ -281,5 +285,168 @@ describe("BoundedMap refusal reasons (MUST-FIX 3, fix-round-3)", () => {
     expect(first.ok).toBe(true);
     const second = await map.set("k2", { n: 2 }, "origin-a");
     expect(second).toEqual({ ok: false, reason: "origin_quota" });
+  });
+});
+
+describe("BoundedMap onEvict timeout + onEvicted authority (fix-round-4, MUST-FIX 1 / F1)", () => {
+  // Real timers, driven synchronously via `vi.advanceTimersByTimeAsync`
+  // rather than a real multi-second wait — mirrors the established pattern
+  // in test/v1/federation-guardian-disable-gate.test.ts and
+  // test/transparency/scheduler.test.ts. `withTimeout` (bounded-map.ts)
+  // uses a real `setTimeout`, so fake timers let this test exercise
+  // `ON_EVICT_AUDIT_TIMEOUT_MS`'s ACTUAL value deterministically and fast,
+  // rather than accepting the "not tested at real-time scale" residual the
+  // fix-round-3 build disclosed (and which the gate finding this file
+  // closes flagged as the exact area the disclosed residual got wrong).
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it(
+    "a slow-but-successful onEvict that resolves BEFORE ON_EVICT_AUDIT_TIMEOUT_MS (e.g. 35s, which would have crossed the OLD 10s timeout) never spuriously refuses — the eviction succeeds normally, once, and onEvicted fires for the real delete",
+    async () => {
+      type Entry = { tag: string };
+      const onEvictedCalls: string[] = [];
+      let onEvictCalls = 0;
+      let resolveAudit!: () => void;
+
+      const map = new BoundedMap<string, Entry>({
+        maxSize: 1,
+        selectEviction: (entries) => {
+          const first = entries.keys().next();
+          if (first.done) return { refuse: true };
+          return { evict: first.value };
+        },
+        onEvict: async () => {
+          onEvictCalls += 1;
+          // Models a slow-but-successful `appendCritical`: its own I/O
+          // takes 35s (past the OLD, WRONG 10s derivation, but comfortably
+          // inside the CORRECTED derivation — AUDIT_WRITE_LOCK_TIMEOUT_MS +
+          // DEFAULT_AUDIT_WRITE_LOCK_HOLD_DEADLINE_MS + margin — since
+          // audit-log.ts itself guarantees `appendCritical` settles within
+          // that same bound).
+          await new Promise<void>((resolve) => {
+            resolveAudit = resolve;
+          });
+        },
+        onEvicted: (evictedKey) => {
+          onEvictedCalls.push(evictedKey);
+        },
+      });
+
+      await map.set("existing", { tag: "original" });
+
+      const setPromise = map.set("incoming", { tag: "new" });
+      await vi.advanceTimersByTimeAsync(35_000);
+      // Let the resolved audit's continuation (and admitNewKey's own
+      // post-await steps) actually run before releasing the promise below.
+      resolveAudit();
+      const result = await setPromise;
+
+      expect(onEvictCalls).toBe(1);
+      // THE MUTATION-PROOF ASSERTION (availability half of F1): a write
+      // that legitimately takes 35s — well past the OLD 10s timeout, well
+      // inside the CORRECTED one — must succeed, not spuriously refuse.
+      // Reverting `ON_EVICT_AUDIT_TIMEOUT_MS` to its old (wrong) 10s
+      // derivation makes this assertion fail: `result` would be
+      // `{ ok: false, reason: "audit_unavailable" }` instead.
+      expect(result).toEqual({ ok: true });
+      expect(map.has("existing")).toBe(false);
+      expect(map.has("incoming")).toBe(true);
+      // onEvicted fires exactly once, for the entry that was REALLY
+      // evicted — this eviction was genuine (not timed out), so the
+      // caller's sibling-state cleanup runs exactly when it should.
+      expect(onEvictedCalls).toEqual(["existing"]);
+    },
+  );
+
+  it(
+    "MUTATION-PROOF TARGET (F1): an onEvict promise that resolves AFTER set() has already timed out and refused never fires onEvicted — a detached, timed-out audit continuation can never trigger a caller's sibling-state side effect",
+    async () => {
+      type Entry = { tag: string };
+      const onEvictedCalls: string[] = [];
+      const refusals: { reason: string }[] = [];
+      let resolveAudit!: () => void;
+
+      const map = new BoundedMap<string, Entry>({
+        maxSize: 1,
+        selectEviction: (entries) => {
+          const first = entries.keys().next();
+          if (first.done) return { refuse: true };
+          return { evict: first.value };
+        },
+        onEvict: async () => {
+          // Never resolves within the test's own control — simulates a
+          // write that is still genuinely in flight when
+          // ON_EVICT_AUDIT_TIMEOUT_MS elapses (a true outage/hang, not the
+          // "merely slow" case the prior test covers), and resolves LATER,
+          // after `set()` has already given up.
+          await new Promise<void>((resolve) => {
+            resolveAudit = resolve;
+          });
+        },
+        onEvicted: (evictedKey) => {
+          onEvictedCalls.push(evictedKey);
+        },
+        onRefuse: (_key, _value, reason) => {
+          refusals.push({ reason });
+        },
+      });
+
+      await map.set("existing", { tag: "original" });
+
+      const setPromise = map.set("incoming", { tag: "new" });
+      await vi.advanceTimersByTimeAsync(ON_EVICT_AUDIT_TIMEOUT_MS);
+      const result = await setPromise;
+
+      // `set()` has already given up and refused — the victim is untouched.
+      expect(result).toEqual({ ok: false, reason: "audit_unavailable" });
+      expect(refusals).toEqual([{ reason: "audit_unavailable" }]);
+      expect(map.has("existing")).toBe(true);
+      expect(map.has("incoming")).toBe(false);
+      expect(onEvictedCalls).toEqual([]);
+
+      // NOW let the detached onEvict promise finally resolve — modeling the
+      // F1 repro exactly: a write that was merely slow, not truly hung,
+      // finally landing after the caller already stopped listening.
+      resolveAudit();
+      // Flush every microtask the late resolution's continuation could
+      // possibly run on, including inside bounded-map.ts's own internals.
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+
+      // THE MUTATION-PROOF ASSERTION: onEvicted NEVER fires for this late
+      // resolution. Reverting to the fix-round-3 shape (writerOrigins
+      // cleanup living inside `onEvict` itself, guarded only by a
+      // post-hoc "does the map still hold this value" re-check) would let
+      // a caller's sibling-state mutation run right here, from the
+      // detached continuation, for an eviction that never actually
+      // happened — exactly the F1 defect. With the fix, there is no code
+      // path left that could call `onEvicted` for this settled admission.
+      expect(onEvictedCalls).toEqual([]);
+      expect(map.has("existing")).toBe(true);
+      expect(map.has("incoming")).toBe(false);
+    },
+  );
+});
+
+describe("bounded-map.ts <-> operational/audit-log.ts cross-file pin (F1 derivation)", () => {
+  it("ON_EVICT_AUDIT_TIMEOUT_MS is derived STRICTLY ABOVE the audit log's own worst-case appendCritical settle time (acquisition timeout + write-lock hold deadline) — the exact bound the F1 finding proved was violated by the prior 10s value", async () => {
+    const { AUDIT_WRITE_LOCK_TIMEOUT_MS, DEFAULT_AUDIT_WRITE_LOCK_HOLD_DEADLINE_MS } =
+      await import("../../src/operational/audit-log.js");
+    const auditLogWorstCaseSettleMs =
+      AUDIT_WRITE_LOCK_TIMEOUT_MS + DEFAULT_AUDIT_WRITE_LOCK_HOLD_DEADLINE_MS;
+    expect(ON_EVICT_AUDIT_TIMEOUT_MS).toBeGreaterThan(auditLogWorstCaseSettleMs);
+    // The OLD (wrong) derivation was 2x AUDIT_WRITE_LOCK_TIMEOUT_MS = 10_000,
+    // which is LESS than the audit log's real worst case (35_000 with
+    // today's defaults) — pin that the corrected value is not a
+    // coincidental pass but is actually anchored to both source constants.
+    expect(ON_EVICT_AUDIT_TIMEOUT_MS).toBe(
+      AUDIT_WRITE_LOCK_TIMEOUT_MS + DEFAULT_AUDIT_WRITE_LOCK_HOLD_DEADLINE_MS + 5_000,
+    );
   });
 });

@@ -346,6 +346,42 @@ export class SentinelFindingStore {
   private readonly index = new Map<string, FindingIndexEntry>();
   private indexReady = false;
   private indexBuildPromise: Promise<void> | null = null;
+  /**
+   * Per-finding-id mutex (MUST-FIX 3, fix-round-4 — versioned/conditional
+   * compare-and-delete). Mirrors `ToolCallTrapRuntime.windowLocks`
+   * (honeypot/tool-call-trap-runtime.ts): a self-cleaning promise chain,
+   * one entry per finding_id CURRENTLY being mutated, deleted the instant
+   * the last queued caller for that id finishes — bounded by concurrent
+   * in-flight finding_ids, never by cumulative ids ever seen.
+   *
+   * WHY PER-FINDING-ID, NOT A WHOLE-STORE LOCK: the storage interface
+   * (storage/interface.ts) has no compare-and-delete primitive, so
+   * `evictOldestExpired`'s prior fix (re-reading immediately before the
+   * delete) only NARROWED the race, it did not close it — the re-read and
+   * the delete are still two separate awaited steps, and a concurrent
+   * `saveFinding` renewal for that SAME finding_id can still land between
+   * them. A single WHOLE-STORE lock would close that, but
+   * `evictOldestExpired` awaits a durable INTENT audit (`appendCritical`)
+   * BEFORE reaching that section, and one of THIS file's own existing
+   * tests (the fix-round-3 concurrent-refresh test) legitimately performs
+   * a NESTED `saveFinding` call for the SAME finding_id from inside that
+   * very audit await, modeling a real renewal racing the reclamation scan
+   * — a whole-store lock held across that audit await would make the
+   * renewal wait on its own reclaimer's lock, deadlocking (the reclaimer
+   * cannot release the lock until the renewal, which needs the same lock,
+   * completes). Scoping the lock to (a) only the destructive
+   * read-decide-delete section (never the audit await) and (b) only the
+   * SINGLE finding_id under mutation avoids that: the reclaimer does not
+   * hold this lock while awaiting the audit, so a renewal for that same id
+   * can acquire it, write, and release BEFORE the reclaimer ever asks for
+   * it — and when the reclaimer then acquires the (now-free) lock and
+   * re-reads, it correctly observes the renewal. `saveFinding`'s own write
+   * path takes the SAME per-id lock, so the two are mutually exclusive for
+   * any id both a writer and a reclaimer touch concurrently, closing the
+   * race for genuinely concurrent (non-nested) calls too, not only the
+   * nested-test shape.
+   */
+  private readonly findingLocks = new Map<string, Promise<void>>();
 
   constructor(opts: SentinelFindingStoreOptions) {
     this.storage = opts.storage;
@@ -435,6 +471,37 @@ export class SentinelFindingStore {
   }
 
   /**
+   * Chains `fn` onto `findingId`'s own lock so at most one mutation of
+   * THAT finding_id (a write, or a reclamation's read-decide-delete) runs
+   * at a time — see `findingLocks`'s doc for why per-finding-id rather
+   * than whole-store. Self-cleaning: mirrors
+   * `ToolCallTrapRuntime.runExclusive` (honeypot/tool-call-trap-runtime.ts)
+   * exactly — chain onto the prior call's SETTLED tail so one caller's
+   * failure can never wedge a later caller behind a permanently-rejected
+   * promise, and delete the map entry once the chain is idle so this never
+   * grows past the concurrent in-flight count.
+   */
+  private async runExclusiveForFinding<T>(
+    findingId: string,
+    fn: () => Promise<T>,
+  ): Promise<T> {
+    const prior = this.findingLocks.get(findingId) ?? Promise.resolve();
+    const run = prior.then(fn, fn);
+    const chained = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.findingLocks.set(findingId, chained);
+    try {
+      return await run;
+    } finally {
+      if (this.findingLocks.get(findingId) === chained) {
+        this.findingLocks.delete(findingId);
+      }
+    }
+  }
+
+  /**
    * Persist a finding. Truncates the operator-visible summary to
    * SENTINEL_SUMMARY_MAX_CHARS so the dashboard render stays bounded.
    * Returns the retention deadline so callers can audit it.
@@ -484,19 +551,28 @@ export class SentinelFindingStore {
     if (!opts?.knownExisting) {
       await this.enforceTrackedFindingsCeiling(key, origin);
     }
-    await this.writeFinding(key, finding.finding_id, persisted);
-    // Keep the filter index current (see MAX_SCANNED_RECORDS's doc). Set
-    // unconditionally, INCLUDING before `ensureIndex()` has ever run for
-    // this instance — when the lazy backfill does run later it will read
-    // this same record from storage and overwrite with an identical entry,
-    // so ordering between "index updated here" and "index backfilled from
-    // storage" never matters.
-    this.index.set(truncated.finding_id, {
-      severity: truncated.severity,
-      sentinel_id: truncated.sentinel_id,
-      agent_id: truncated.agent_id,
-      observed_at: truncated.observed_at,
-      origin,
+    // LOCKED (MUST-FIX 3, fix-round-4): the actual write + index update run
+    // under this finding_id's own lock (`findingLocks`, see that field's
+    // doc), the SAME lock a concurrent reclamation
+    // (`evictOldestExpired`/`pruneExpired`) takes for its own
+    // read-decide-delete section on this id. Whichever gets there first
+    // completes before the other's read runs, so a renewal can never be
+    // silently lost to a reclamation that read stale (pre-renewal) state.
+    await this.runExclusiveForFinding(finding.finding_id, async () => {
+      await this.writeFinding(key, finding.finding_id, persisted);
+      // Keep the filter index current (see MAX_SCANNED_RECORDS's doc). Set
+      // unconditionally, INCLUDING before `ensureIndex()` has ever run for
+      // this instance — when the lazy backfill does run later it will read
+      // this same record from storage and overwrite with an identical entry,
+      // so ordering between "index updated here" and "index backfilled from
+      // storage" never matters.
+      this.index.set(truncated.finding_id, {
+        severity: truncated.severity,
+        sentinel_id: truncated.sentinel_id,
+        agent_id: truncated.agent_id,
+        observed_at: truncated.observed_at,
+        origin,
+      });
     });
     return persisted.retention_until;
   }
@@ -685,80 +761,122 @@ export class SentinelFindingStore {
           }
 
           // Re-verify immediately before the destructive delete (concurrent-
-          // refresh guard, see point 2 above).
-          const freshRaw = await this.storage.read(SENTINEL_FINDING_NAMESPACE, meta.key);
-          if (!freshRaw) {
-            // Already gone — a concurrent reclamation or an operator
-            // delete beat this one to it. Nothing to reclaim here; keep
-            // scanning rather than treating this as a hard failure.
-            continue;
-          }
-          let stillExpired: boolean;
-          try {
-            const freshEnvelope: EncryptedPayload = JSON.parse(bytesToString(freshRaw));
-            const freshPlaintext = decrypt(freshEnvelope, this.encryptionKey, aad);
-            const freshPersisted = JSON.parse(bytesToString(freshPlaintext)) as PersistedFinding;
-            stillExpired = freshPersisted.retention_until <= cutoff;
-          } catch {
-            // Corrupted on re-read: treat the ORIGINAL decision (made from
-            // a successfully-decoded read moments ago) as still valid —
-            // matches this file's existing "leave corrupted records for
-            // rotation" convention rather than blocking reclamation on a
-            // decode failure of a record already decided reclaimable.
-            stillExpired = true;
-          }
-          if (!stillExpired) {
-            // A concurrent write renewed this record between the initial
-            // read and this re-check — leave it in place. Audit the
-            // abandoned intent explicitly so the `_started` entry above
-            // never reads as an unresolved, ambiguous record.
-            if (this.auditLog) {
-              void this.auditLog.append(
-                "l2",
-                "finding_store_expired_record_reclaim_abandoned",
-                this.fortressId,
-                { finding_id: id, reason: "renewed_concurrently" },
-                "success",
-              );
-            }
-            continue;
-          }
-
-          let deleted: boolean;
-          try {
-            deleted = await this.storage.delete(SENTINEL_FINDING_NAMESPACE, meta.key);
-          } catch (err) {
-            // The delete itself failed AFTER intent was durably recorded
-            // (point 1 above) — audit the mismatch explicitly rather than
-            // leaving the `_started` entry as the only, ambiguous trace.
-            if (this.auditLog) {
-              void this.auditLog.append(
-                "l2",
-                "finding_store_expired_record_reclaim_failed",
-                this.fortressId,
-                { finding_id: id, error: err instanceof Error ? err.message : String(err) },
-                "failure",
-              );
-            }
-            return false;
-          }
-          if (this.auditLog) {
-            void this.auditLog.append(
-              "l2",
-              "finding_store_expired_record_reclaimed",
-              this.fortressId,
-              { finding_id: id, retention_until: persisted.retention_until },
-              deleted ? "success" : "failure",
-            );
-          }
-          this.index.delete(id);
-          return deleted;
+          // refresh guard, see point 2 above) — INSIDE this finding_id's own
+          // lock (MUST-FIX 3, fix-round-4: `runExclusiveForFinding`, see
+          // `findingLocks`'s doc). A bare re-read with no lock only
+          // NARROWS the race, it does not close it: the read and the
+          // delete below are still two separate awaited steps, and a
+          // concurrent `saveFinding` renewal can land between them exactly
+          // as it could before this re-read existed. Locking this section
+          // against the SAME id's write path (`saveFinding`'s own
+          // `runExclusiveForFinding` call) makes the two mutually
+          // exclusive: whichever gets there first completes before the
+          // other's read runs, so the read below always observes a
+          // consistent, non-stale state — never a renewal that landed in a
+          // gap this call could not see.
+          const outcome = await this.runExclusiveForFinding(id, () =>
+            this.reclaimVerifiedExpired(meta, id, cutoff, aad, persisted.retention_until),
+          );
+          if (outcome.action === "continue") continue;
+          return outcome.deleted;
         }
       } catch {
         // Corrupted record: leave in place; rotation handled by audit log.
       }
     }
     return false;
+  }
+
+  /**
+   * The re-verify -> delete -> completion-audit section of
+   * `evictOldestExpired`, factored out so it can run under `id`'s own
+   * `runExclusiveForFinding` lock (MUST-FIX 3, fix-round-4). Called ONLY
+   * from inside that lock — see the call site's doc for why the lock, not
+   * this method, is what actually closes the concurrent-refresh race; this
+   * method's own re-read is necessary but not sufficient without it.
+   *
+   * Returns `{ action: "continue" }` when this candidate was not
+   * reclaimed (already gone, or renewed concurrently) so the caller's scan
+   * loop should move to the next one, or `{ action: "return", deleted }`
+   * when this call has a final answer for the whole
+   * `evictOldestExpired` call (a genuine reclaim, or a hard delete
+   * failure) and the caller should return immediately without scanning
+   * further.
+   */
+  private async reclaimVerifiedExpired(
+    meta: StorageEntryMeta,
+    id: string,
+    cutoff: string,
+    aad: Uint8Array,
+    retentionUntil: string,
+  ): Promise<{ action: "continue" } | { action: "return"; deleted: boolean }> {
+    const freshRaw = await this.storage.read(SENTINEL_FINDING_NAMESPACE, meta.key);
+    if (!freshRaw) {
+      // Already gone — a concurrent reclamation or an operator delete beat
+      // this one to it. Nothing to reclaim here; keep scanning rather than
+      // treating this as a hard failure.
+      return { action: "continue" };
+    }
+    let stillExpired: boolean;
+    try {
+      const freshEnvelope: EncryptedPayload = JSON.parse(bytesToString(freshRaw));
+      const freshPlaintext = decrypt(freshEnvelope, this.encryptionKey, aad);
+      const freshPersisted = JSON.parse(bytesToString(freshPlaintext)) as PersistedFinding;
+      stillExpired = freshPersisted.retention_until <= cutoff;
+    } catch {
+      // Corrupted on re-read: treat the ORIGINAL decision (made from a
+      // successfully-decoded read moments ago) as still valid — matches
+      // this file's existing "leave corrupted records for rotation"
+      // convention rather than blocking reclamation on a decode failure of
+      // a record already decided reclaimable.
+      stillExpired = true;
+    }
+    if (!stillExpired) {
+      // A concurrent write renewed this record between the initial read
+      // and this re-check — leave it in place. Audit the abandoned intent
+      // explicitly so the `_started` entry the caller already wrote never
+      // reads as an unresolved, ambiguous record.
+      if (this.auditLog) {
+        void this.auditLog.append(
+          "l2",
+          "finding_store_expired_record_reclaim_abandoned",
+          this.fortressId,
+          { finding_id: id, reason: "renewed_concurrently" },
+          "success",
+        );
+      }
+      return { action: "continue" };
+    }
+
+    let deleted: boolean;
+    try {
+      deleted = await this.storage.delete(SENTINEL_FINDING_NAMESPACE, meta.key);
+    } catch (err) {
+      // The delete itself failed AFTER intent was durably recorded — audit
+      // the mismatch explicitly rather than leaving the `_started` entry as
+      // the only, ambiguous trace.
+      if (this.auditLog) {
+        void this.auditLog.append(
+          "l2",
+          "finding_store_expired_record_reclaim_failed",
+          this.fortressId,
+          { finding_id: id, error: err instanceof Error ? err.message : String(err) },
+          "failure",
+        );
+      }
+      return { action: "return", deleted: false };
+    }
+    if (this.auditLog) {
+      void this.auditLog.append(
+        "l2",
+        "finding_store_expired_record_reclaimed",
+        this.fortressId,
+        { finding_id: id, retention_until: retentionUntil },
+        deleted ? "success" : "failure",
+      );
+    }
+    this.index.delete(id);
+    return { action: "return", deleted };
   }
 
   /** Load a single finding by id, or null when absent / corrupted. */
@@ -910,15 +1028,68 @@ export class SentinelFindingStore {
           bytesToString(plaintext),
         ) as PersistedFinding;
         if (persisted.retention_until <= cutoff) {
-          await this.storage.delete(SENTINEL_FINDING_NAMESPACE, meta.key);
-          this.index.delete(id);
-          pruned += 1;
+          // LOCKED + RE-VERIFIED (MUST-FIX 3, fix-round-4 — this loop used
+          // to delete straight off THIS read with no re-check at all, a
+          // wider version of the same race `evictOldestExpired` had before
+          // its own fix: a concurrent `saveFinding` renewal for this SAME
+          // finding_id, landing between this read and the delete, would be
+          // silently lost). `pruneRecordIfStillExpired` re-reads and
+          // re-decides under `id`'s own lock — the SAME lock
+          // `saveFinding`'s write path and `evictOldestExpired`'s own
+          // reclaim take — so a renewal racing this sweep is never deleted
+          // out from under itself.
+          const deletedHere = await this.runExclusiveForFinding(id, () =>
+            this.pruneRecordIfStillExpired(meta, id, cutoff, aad),
+          );
+          if (deletedHere) pruned += 1;
         }
       } catch {
         // Corrupted record: leave in place; rotation handled by audit log.
       }
     }
     return { pruned };
+  }
+
+  /**
+   * Re-verify (concurrent-refresh guard, mirrors `reclaimVerifiedExpired`'s
+   * shape for `evictOldestExpired`) and delete a single record, called ONLY
+   * from inside `id`'s `runExclusiveForFinding` lock (MUST-FIX 3,
+   * fix-round-4). `pruneExpired`'s own read of `persisted` (at the call
+   * site, before the lock) happened before the lock was acquired, so a
+   * concurrent `saveFinding` renewal could have extended this record's
+   * retention in the gap between that read and here — re-reading and
+   * re-deciding INSIDE the lock is what makes this authoritative rather
+   * than advisory. `pruneExpired` has no per-record audit trail today (see
+   * this method's silence on `this.auditLog` — matches the pre-existing
+   * behavior this fix does not change the observability shape of), so this
+   * stays a plain boolean return rather than the richer
+   * continue/return-with-audit shape `reclaimVerifiedExpired` needs.
+   */
+  private async pruneRecordIfStillExpired(
+    meta: StorageEntryMeta,
+    id: string,
+    cutoff: string,
+    aad: Uint8Array,
+  ): Promise<boolean> {
+    const freshRaw = await this.storage.read(SENTINEL_FINDING_NAMESPACE, meta.key);
+    if (!freshRaw) return false;
+    let stillExpired: boolean;
+    try {
+      const freshEnvelope: EncryptedPayload = JSON.parse(bytesToString(freshRaw));
+      const freshPlaintext = decrypt(freshEnvelope, this.encryptionKey, aad);
+      const freshPersisted = JSON.parse(bytesToString(freshPlaintext)) as PersistedFinding;
+      stillExpired = freshPersisted.retention_until <= cutoff;
+    } catch {
+      // Corrupted on re-read: matches this file's existing convention of
+      // treating the original successfully-decoded decision as still valid
+      // rather than blocking on a decode failure of an already-decided
+      // record.
+      stillExpired = true;
+    }
+    if (!stillExpired) return false;
+    const deleted = await this.storage.delete(SENTINEL_FINDING_NAMESPACE, meta.key);
+    if (deleted) this.index.delete(id);
+    return deleted;
   }
 
   private async decode(

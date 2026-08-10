@@ -242,9 +242,7 @@ export function createFederationTools(
             // write supplies an origin) still falls into the shared
             // `AGENT_UNKNOWN_ORIGIN` bucket rather than escaping accounting.
             const origin = handshakeResultWriterOrigins.get(peerId) ?? AGENT_UNKNOWN_ORIGIN;
-            const originQuotaExceeded =
-              registry.peerOriginSize(origin) >= registry.maxPeersPerOrigin();
-            const peer = await registry.registerFromHandshake(
+            const registration = await registry.registerFromHandshake(
               hsResult,
               peerDid,
               undefined,
@@ -252,24 +250,38 @@ export function createFederationTools(
             );
 
             // Bounded-collection guard (register LD2-04): the registry
-            // refuses a new peer either because THIS identity's own
-            // per-origin quota is exhausted, or because the shared registry
-            // is at capacity and every existing slot holds a currently-active
-            // peer — either way it never evicts a real trusted peer to make
-            // room. Surface this as an explicit error, never a
+            // refuses a new peer for one of THREE typed reasons (MUST-FIX 2,
+            // fix-round-4 — widened from a bare null/non-null result so the
+            // AGENT-facing tool response is as accurate as the operator audit
+            // trail already was via `onRefuse`, registry.ts): THIS identity's
+            // own per-origin quota is exhausted (`origin_quota`), the shared
+            // registry is at capacity and every existing slot holds a
+            // currently-active peer (`capacity`), or a capacity eviction was
+            // decided but its durable audit write did not complete
+            // (`audit_unavailable` — distinct from `capacity` because a
+            // retry once the audit trail recovers should not be told "full").
+            // Either way the registry never evicts a real trusted peer to
+            // make room. Surface this as an explicit error, never a
             // silently-dropped "registered: true".
-            if (!peer) {
-              return toolResult({
-                error: originQuotaExceeded
+            if (!registration.ok) {
+              const error =
+                registration.reason === "origin_quota"
                   ? "This identity has reached its federation peer " +
                     `registration quota (${registry.maxPeersPerOrigin()} peers). ` +
                     "Remove or let an inactive peer expire before " +
                     "registering more."
-                  : "Federation peer registry is at capacity and every slot " +
-                    "holds an active peer; cannot register a new peer until " +
-                    "one expires, is removed, or one becomes inactive.",
-              });
+                  : registration.reason === "audit_unavailable"
+                    ? "Federation peer registry could not durably audit an " +
+                      "eviction needed to register this peer; the registry " +
+                      "is not full, its audit trail is unavailable. Retry " +
+                      "once the audit log recovers."
+                    : "Federation peer registry is at capacity and every " +
+                      "slot holds an active peer; cannot register a new " +
+                      "peer until one expires, is removed, or one becomes " +
+                      "inactive.";
+              return toolResult({ error });
             }
+            const peer = registration.peer;
 
             void auditLog.append("l4", "federation_peer_register", "system", {
               peer_id: peerId,

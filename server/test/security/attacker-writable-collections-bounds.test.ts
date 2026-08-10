@@ -43,7 +43,7 @@
  * test proved the lockout was still reachable).
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { ed25519 } from "@noble/curves/ed25519";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey, randomBytes } from "../../src/core/random.js";
@@ -678,6 +678,107 @@ describe("2. handshake results: capped + per-session fair + expires_at-aware evi
       expect(out.verification.counterparty_valid).toBe(false);
       expect(out.verification.recorded).toBe(false);
     }
+  );
+
+  it(
+    "MUTATION-PROOF TARGET (F1, fix-round-4): a real handshakeResults eviction whose onEvict audit write is slow — crossing the OLD (wrong) 10s timeout but well inside the CORRECTED bound — succeeds normally, never spuriously refuses, and correctly moves handshakeResultWriterOrigins from the evicted entry to the new one via the authoritative onEvicted hook",
+    async () => {
+      const agent = makeAgent();
+      await createIdentityFor(agent, "template-identity");
+      const { tools, handshakeResults, handshakeResultWriterOrigins } = createHandshakeTools(
+        agent.config,
+        agent.identityManager,
+        agent.masterKey,
+        agent.auditLog
+      );
+      const exchange = tools.find((t) => t.name === "handshake_exchange")!;
+      const template = shrFor(agent);
+
+      // Fill handshakeResults to its GLOBAL cap with cheap unverified
+      // previews (handshake_exchange never needs a real round trip),
+      // spread across enough distinct agent sessions that no ONE session's
+      // own MAX_HANDSHAKE_RESULTS_PER_ORIGIN quota is ever hit — every
+      // entry stays evictable (never "currently live": unverified).
+      const sessionsNeeded = Math.ceil(
+        MAX_HANDSHAKE_RESULTS / MAX_HANDSHAKE_RESULTS_PER_ORIGIN
+      );
+      let filled = 0;
+      let survivorId: string | undefined;
+      let survivorSession: string | undefined;
+      outer: for (let s = 0; s < sessionsNeeded; s += 1) {
+        const session = `agent:filler-f1-${s}`;
+        for (let i = 0; i < MAX_HANDSHAKE_RESULTS_PER_ORIGIN; i += 1) {
+          if (filled >= MAX_HANDSHAKE_RESULTS) break outer;
+          const shr = mintCounterpartySHR(template);
+          const out = parse(await exchange.handler({ counterparty_shr: shr }, session));
+          expect(out.verification.recorded).toBe(true);
+          if (filled === 0) {
+            survivorId = shr.body.instance_id;
+            survivorSession = session;
+          }
+          filled += 1;
+        }
+      }
+      expect(handshakeResults.size).toBe(MAX_HANDSHAKE_RESULTS);
+      // The FIRST-inserted entry is what `selectEviction`'s oldest-first
+      // scan (Map insertion order) will pick once the map is at capacity.
+      expect(handshakeResultWriterOrigins.get(survivorId!)).toBe(survivorSession);
+
+      // Intercept appendCritical to hold the EVICTION's own audit write
+      // pending under manual control, then drive elapsed time with fake
+      // timers rather than a real multi-second wait (same pattern as
+      // test/core/bounded-map.test.ts).
+      vi.useFakeTimers();
+      try {
+        let resolveAudit!: () => void;
+        let evictionAuditCalls = 0;
+        const originalAppendCritical = agent.auditLog.appendCritical.bind(agent.auditLog);
+        agent.auditLog.appendCritical = ((
+          ...args: Parameters<typeof originalAppendCritical>
+        ) => {
+          const entry = args[0];
+          if (entry.operation === "handshake_result_evicted") {
+            evictionAuditCalls += 1;
+            return new Promise<void>((resolve) => {
+              resolveAudit = () => {
+                originalAppendCritical(...args).then(resolve, resolve);
+              };
+            });
+          }
+          return originalAppendCritical(...args);
+        }) as typeof originalAppendCritical;
+
+        const newSession = "agent:probe-f1";
+        const newSHR = mintCounterpartySHR(template);
+        const resultPromise = exchange.handler({ counterparty_shr: newSHR }, newSession);
+
+        // 25s: past the OLD (wrong) 10s derivation, comfortably inside the
+        // CORRECTED one (AUDIT_WRITE_LOCK_TIMEOUT_MS +
+        // DEFAULT_AUDIT_WRITE_LOCK_HOLD_DEADLINE_MS + margin = 40s) — a
+        // write genuinely this slow must still succeed, not refuse.
+        await vi.advanceTimersByTimeAsync(25_000);
+        resolveAudit();
+        const out = parse(await resultPromise);
+
+        expect(evictionAuditCalls).toBe(1);
+        // THE MUTATION-PROOF ASSERTION (F1): no spurious refusal for a
+        // legitimately slow write. Reverting ON_EVICT_AUDIT_TIMEOUT_MS to
+        // its old (wrong) 10s derivation makes this false — the probe's
+        // own recording would fail with `audit_unavailable`.
+        expect(out.verification.recorded).toBe(true);
+
+        // The evicted entry is truly gone, and its writer-origin
+        // attribution went with it — via the AUTHORITATIVE `onEvicted`
+        // hook (bounded-map.ts), driven by bounded-map's own post-delete
+        // call, never by `onEvict`'s (now audit-only) continuation.
+        expect(handshakeResults.get(survivorId!)).toBeUndefined();
+        expect(handshakeResultWriterOrigins.get(survivorId!)).toBeUndefined();
+        expect(handshakeResultWriterOrigins.get(newSHR.body.instance_id)).toBe(newSession);
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+    240_000
   );
 });
 
@@ -1388,6 +1489,102 @@ describe("4. sentinel durable findings: capped, per-origin fair, never blind-FIF
     }
     expect(totalPruned).toBe(TOTAL_EXPIRED);
   });
+
+  it(
+    "MUTATION-PROOF TARGET (MUST-FIX 3, fix-round-4): a record renewed by a concurrent saveFinding call DURING pruneExpired's scan is not deleted — the versioned per-finding-id lock closes the race the bare pre-fix pruneExpired had no guard against at all",
+    async () => {
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      let nowMs = Date.parse("2026-01-01T00:00:00.000Z");
+      const store = new SentinelFindingStore({
+        storage,
+        masterKey,
+        fortressId: "fortress-prune-race-test",
+        retentionDays: 1,
+        now: () => new Date(nowMs),
+      });
+
+      await store.saveFinding(mkFinding("racer"));
+      // Past the 1-day retention window — genuinely expired at this point.
+      nowMs += 2 * 24 * 60 * 60 * 1000;
+
+      // Model a real overlapping `saveFinding` renewal landing in the gap
+      // between `pruneExpired`'s coarse initial read (used only to decide
+      // "does this candidate look expired") and its lock-protected
+      // re-verify: intercept the storage read for this record's key and,
+      // AFTER capturing the (still-expired) bytes `pruneExpired`'s own
+      // read will see, perform the renewal before returning — so the
+      // underlying storage already reflects the renewal by the time
+      // `pruneExpired`'s initial read resolves, exactly the interleaving a
+      // concurrent legitimate caller could produce.
+      let renewed = false;
+      const originalRead = storage.read.bind(storage);
+      storage.read = (async (namespace: string, key: string) => {
+        const result = await originalRead(namespace, key);
+        if (!renewed && key === "finding.racer") {
+          renewed = true;
+          await store.saveFinding(
+            mkFinding("racer", { summary: "renewed mid-scan" }),
+            { knownExisting: true }
+          );
+        }
+        return result;
+      }) as typeof storage.read;
+
+      const result = await store.pruneExpired();
+
+      // THE MUTATION-PROOF ASSERTION: nothing was pruned — the renewed
+      // record survived. Reverting `pruneExpired` to its pre-fix shape
+      // (delete straight off the initial read, no lock, no re-verify)
+      // makes this assertion fail: `pruned` would be 1 and the renewal
+      // would be lost.
+      expect(result.pruned).toBe(0);
+
+      const survivor = await store.loadFinding("racer");
+      expect(survivor).not.toBeNull();
+      expect(survivor!.summary).toBe("renewed mid-scan");
+    }
+  );
+
+  it(
+    "MUTATION-PROOF TARGET (MUST-FIX 3, fix-round-4): two concurrent pruneExpired() sweeps racing to reclaim the SAME set of expired records never double-act — the per-finding-id lock serializes the second sweep's re-verify onto storage state the first sweep already deleted",
+    async () => {
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      let nowMs = Date.parse("2026-01-01T00:00:00.000Z");
+      const store = new SentinelFindingStore({
+        storage,
+        masterKey,
+        fortressId: "fortress-prune-double-race-test",
+        retentionDays: 1,
+        now: () => new Date(nowMs),
+      });
+
+      const COUNT = 5;
+      for (let i = 0; i < COUNT; i += 1) {
+        await store.saveFinding(mkFinding(`double-${i}`));
+      }
+      nowMs += 2 * 24 * 60 * 60 * 1000;
+
+      // Two overlapping sweeps over the SAME expired set. Without the
+      // per-finding-id lock, both could read the same record as expired
+      // and both call `storage.delete()` on it — harmless for MemoryStorage
+      // (idempotent delete) but the REAL risk this guards is a `pruned`
+      // double-count and a lost-renewal race on a record either sweep
+      // could concurrently be asked to spare; with the lock, the second
+      // sweep's lock-protected re-verify always observes whatever the
+      // first sweep already did.
+      const [first, second] = await Promise.all([
+        store.pruneExpired(),
+        store.pruneExpired(),
+      ]);
+
+      expect(first.pruned + second.pruned).toBe(COUNT);
+      for (let i = 0; i < COUNT; i += 1) {
+        expect(await store.loadFinding(`double-${i}`)).toBeNull();
+      }
+    }
+  );
 
   it("listFindings bounds its decrypt work to maxScannedRecords, newest-first", async () => {
     const storage = new MemoryStorage();

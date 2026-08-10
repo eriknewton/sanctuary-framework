@@ -23,12 +23,31 @@
 import type { AuditLog } from "../operational/audit-log.js";
 import type { HandshakeResult } from "../handshake/types.js";
 import { trustTierToSovereigntyTier } from "../reputation/tiers.js";
-import { BoundedMap } from "../core/bounded-map.js";
+import { BoundedMap, type BoundedMapRefuseReason } from "../core/bounded-map.js";
 import type {
   FederationPeer,
   FederationCapabilities,
   PeerTrustEvaluation,
 } from "./types.js";
+
+/**
+ * `registerFromHandshake`'s result (MUST-FIX 2, fix-round-4 — replaces a
+ * plain `FederationPeer | null`). An agent reads the federation tool
+ * response to decide how to behave (MCP tool responses are product copy
+ * for an agent audience, per AGENTS.md's forward-documentation rule), so
+ * collapsing all three `BoundedMap` refusal reasons into a bare `null`
+ * hid a real distinction the OPERATOR audit trail already had (via
+ * `onRefuse` below): "this identity is flooding" (`origin_quota`), "the
+ * registry is genuinely full of active peers" (`capacity`), and "the
+ * audit trail itself is unavailable right now, retry" (`audit_unavailable`)
+ * are three different things to tell an agent, and only the first two were
+ * ever distinguishable from the return value alone. `federation/tools.ts`
+ * reads `reason` directly off this result to render the accurate
+ * agent-facing message.
+ */
+export type RegisterPeerResult =
+  | { ok: true; peer: FederationPeer }
+  | { ok: false; reason: BoundedMapRefuseReason };
 
 /** Default capabilities assumed for new peers */
 const DEFAULT_CAPABILITIES: FederationCapabilities = {
@@ -177,12 +196,19 @@ export class FederationRegistry {
    * (federation/tools.ts) refuses a peer_did this fortress holds keys for
    * before this method is ever reached.
    *
-   * Returns `null` when the registration was refused — either the shared
-   * registry is at capacity and every existing slot holds a currently-active
-   * peer (see the eviction policy above), or `origin`'s own per-origin quota
-   * (MAX_FEDERATION_PEERS_PER_ORIGIN) is already exhausted — the caller must
-   * surface this as an explicit refusal, never treat it as a silent no-op
-   * success.
+   * Returns `{ ok: false, reason }` when the registration was refused
+   * (MUST-FIX 2, fix-round-4 — widened from a bare `FederationPeer | null`;
+   * see `RegisterPeerResult`'s doc for why the caller needs the typed
+   * reason, not just a refusal signal). `reason` is exactly
+   * `BoundedMap`'s own `BoundedMapRefuseReason`: `origin_quota` (this
+   * `origin`'s own quota is exhausted), `capacity` (the shared registry is
+   * at capacity and every existing slot holds a currently-active peer —
+   * see the eviction policy above), or `audit_unavailable` (a
+   * global-capacity eviction was decided but its durable audit write did
+   * not complete — rare, and distinct from a genuine capacity refusal: an
+   * operator retrying the SAME registration once the audit trail recovers
+   * should not be told "the registry is full"). The caller must surface
+   * this as an explicit refusal, never treat it as a silent no-op success.
    *
    * `origin` is REQUIRED (MUST-FIX 2, fix-round-2 RECHECK — was optional;
    * see MAX_FEDERATION_PEERS_PER_ORIGIN's doc for why "omit it and the quota
@@ -200,7 +226,7 @@ export class FederationRegistry {
     peerDid: string,
     capabilities: Partial<FederationCapabilities> | undefined,
     origin: string
-  ): Promise<FederationPeer | null> {
+  ): Promise<RegisterPeerResult> {
     const existing = this.peers.get(result.counterparty_id);
     const now = new Date().toISOString();
 
@@ -225,7 +251,7 @@ export class FederationRegistry {
     }
 
     const setResult = await this.peers.set(result.counterparty_id, peer, origin);
-    return setResult.ok ? peer : null;
+    return setResult.ok ? { ok: true, peer } : { ok: false, reason: setResult.reason };
   }
 
   /**

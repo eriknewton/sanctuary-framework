@@ -461,6 +461,24 @@ export function createHandshakeTools(
       // `sessions`'s onEvict above — a verified peer's trust state
       // disappearing must have a durable audit record BEFORE the delete,
       // and the eviction ABORTS if the write fails.
+      //
+      // AUDIT ONLY (fix-round-4, MUST-FIX 1 / F1): this callback used to
+      // ALSO clean up `handshakeResultWriterOrigins` here, guarded by a
+      // conditional re-check (`handshakeResults.get(id) === evictedResult`)
+      // that assumed "this promise resolved" and "bounded-map.ts decided to
+      // delete" were the same event. They are NOT under
+      // `ON_EVICT_AUDIT_TIMEOUT_MS`: bounded-map.ts can give up waiting on
+      // this call (timeout) and refuse the eviction while this async
+      // function keeps running DETACHED — no caller is listening to it
+      // anymore — and when the write above eventually resolves, the OLD
+      // conditional read as "still matches" (nothing else had touched the
+      // entry) even though bounded-map.ts never deleted it, so the cleanup
+      // ran for an eviction that, authoritatively, never happened. See the
+      // real repro in the F1 gate finding this fix closes. The writer-origin
+      // cleanup now lives in `onEvicted` below, which bounded-map.ts calls
+      // ONLY immediately after its OWN synchronous delete — see that hook's
+      // doc (core/bounded-map.ts) for why that makes it safe to do
+      // unconditionally, with no reference re-check needed here at all.
       await auditLog.appendCritical({
         layer: "l4",
         operation: "handshake_result_evicted",
@@ -474,33 +492,25 @@ export function createHandshakeTools(
           reason: "capacity",
         },
       });
-      // Keep handshakeResultWriterOrigins's key set a subset of
-      // handshakeResults's own (MUST-FIX 2, fix-round-3): without this,
+    },
+    onEvicted: (evictedCounterpartyId) => {
+      // AUTHORITATIVE (fix-round-4, MUST-FIX 1 / F1 — see
+      // core/bounded-map.ts's `BoundedMapOptions.onEvicted` doc). Keeps
+      // `handshakeResultWriterOrigins`'s key set a subset of
+      // `handshakeResults`'s own (MUST-FIX 2, fix-round-3): without this,
       // the writer-origin map would grow forever independent of
-      // handshakeResults's own bound — an entry counted here and never
+      // `handshakeResults`'s own bound — an entry counted here and never
       // removed, even after the underlying handshake result it describes
       // is gone, is exactly the unbounded-attacker-writable-collection
       // class this whole file exists to close (AGENTS.md rule 8).
-      //
-      // CONDITIONAL, mirroring bounded-map.ts's own post-await
-      // reference re-validation (MUST-FIX 1): `onEvict` runs BEFORE
-      // bounded-map.ts's own post-await check that decides whether the
-      // eviction actually proceeds, so at this point the delete on
-      // `handshakeResults` has NOT happened yet and might still be
-      // aborted (a concurrent update to this SAME counterparty_id — e.g.
-      // a real verified handshake completing while this eviction's audit
-      // was in flight — replaces the value, and bounded-map.ts then
-      // refuses to delete it). Only remove the writer-origin entry when
-      // `handshakeResults` STILL holds the EXACT value object just
-      // audited for eviction: if a concurrent write already replaced it,
-      // that write's OWN call to `recordHandshakeResult` already (or will
-      // shortly) set `handshakeResultWriterOrigins` to ITS origin, and an
-      // unconditional delete here could run AFTER that set() and erase a
-      // legitimate concurrent registration's attribution instead of the
-      // stale one this eviction is actually about.
-      if (handshakeResults.get(evictedCounterpartyId) === evictedResult) {
-        handshakeResultWriterOrigins.delete(evictedCounterpartyId);
-      }
+      // UNCONDITIONAL, not a re-check against the evicted value: bounded-map
+      // calls this synchronously, with no `await` between its own
+      // `this.map.delete(evictedCounterpartyId)` and this call, so by
+      // construction `handshakeResults` no longer holds ANY value for this
+      // id at this exact point — there is nothing left to compare against,
+      // and no concurrent write can have interleaved in the gap (there is
+      // no gap).
+      handshakeResultWriterOrigins.delete(evictedCounterpartyId);
     },
     // No onRefuse here: recordHandshakeResult below reads the reason
     // directly off `handshakeResults.set()`'s own return value (MUST-FIX
@@ -511,10 +521,15 @@ export function createHandshakeTools(
 
   // FEDERATION-FACING WRITER accounting (MUST-FIX 2, fix-round-3) — see
   // this doc repeated in full on `createHandshakeTools`'s return type
-  // above. Maintained ONLY by `recordHandshakeResult` below, updated on
-  // every successful write (insert or update), which is what makes it
-  // answer "who wrote the CURRENTLY stored value" rather than
-  // `handshakeResults`'s own `origins` map's "who wrote it FIRST."
+  // above. Written by TWO sites, never a third: `recordHandshakeResult`
+  // below sets an entry on every successful write (insert or update),
+  // which is what makes it answer "who wrote the CURRENTLY stored value"
+  // rather than `handshakeResults`'s own `origins` map's "who wrote it
+  // FIRST"; `handshakeResults`'s `onEvicted` hook above (fix-round-4,
+  // MUST-FIX 1) deletes an entry, authoritatively, exactly when
+  // `handshakeResults` itself deletes the corresponding key. Both keep this
+  // map's key set a subset of `handshakeResults`'s own — never a caller
+  // outside this closure.
   const handshakeResultWriterOrigins = new Map<string, string>();
 
   const shrOpts: SHRGeneratorOptions = {
