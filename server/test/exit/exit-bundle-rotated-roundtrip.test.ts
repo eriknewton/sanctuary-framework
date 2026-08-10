@@ -410,6 +410,13 @@ describe("rotated exit-bundle import", () => {
     const inspected = await inspectExitBundle(bundleDir);
     expect(inspected.rotation.chain_signature_verified).toBe(false);
     expect(inspected.rotation.invalid_reason).toBe("rotation_chain_repeated_key");
+    // EXIT-PASS-01: verify/inspect must FAIL on an invalid rotation chain, not
+    // report PASS while quietly carrying chain_signature_verified: false. Both
+    // commands derive their exit status from the verifier `passed` boolean.
+    expect(inspected.verdict).toBe("FAIL");
+    const verified = await verifyExitBundle(bundleDir);
+    expect(verified.passed).toBe(false);
+    expect(verified.failure_class).toBe("rotation_chain_invalid");
 
     const destination = await makeHarness();
     const destinationIdentityId = await createIdentity(destination);

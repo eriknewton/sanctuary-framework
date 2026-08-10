@@ -16,6 +16,7 @@ import type { HandshakeResult } from "../../src/handshake/types.js";
 import { AuditLog } from "../../src/operational/audit-log.js";
 import { createReputationTools } from "../../src/reputation/tools.js";
 import type { SovereigntyTier } from "../../src/reputation/tiers.js";
+import { resolveTierByDid } from "../../src/reputation/tiers.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import type { SignedSHR } from "../../src/shr/types.js";
 import type { ToolDefinition } from "../../src/router.js";
@@ -196,7 +197,19 @@ describe("reputation weighting by signer", () => {
     });
   });
 
-  it("weights records about the same counterparty differently by signer tier", async () => {
+  // REP-01 (register §Z RECHECK), the self-vouch chokepoint, end-to-end through
+  // the real reputation tools + real IdentityManager. `signerB` is a LOCAL
+  // identity (saved in setupHarness). We inject the exact verified handshake
+  // entry a self-vouch would mint for it — the shape reachable via a self-
+  // handshake with an identical key OR (the case the protocol same-key guard
+  // does NOT catch) two distinct keys the operator holds. The weighting must
+  // REFUSE to credit it: a handshake entry for a locally-held DID is a
+  // self-vouch, never independent verification, so signerB's record is capped at
+  // self-attested. Both records therefore weight self-attested — the agent
+  // cannot launder its own attestations up to verified-sovereign. Falsifiable:
+  // without the localIdentityDids guard in resolveTierByDid this asserts
+  // verified-sovereign 1.0 for signerB (the pre-fix laundering outcome).
+  it("refuses to credit a local signer's self-vouch handshake (caps at self-attested)", async () => {
     const { byName, signerB, counterparty } = await setupHarness(
       ({ signerB, counterparty }) => {
         const handshakes = new Map<string, HandshakeResult>();
@@ -208,6 +221,8 @@ describe("reputation weighting by signer", () => {
             "verified-sovereign"
           )
         );
+        // The self-vouch entry: a verified handshake whose counterparty is
+        // signerB, while signerB is also the local signer below.
         handshakes.set(
           "verified-signer-instance",
           verifiedHandshake(
@@ -230,7 +245,7 @@ describe("reputation weighting by signer", () => {
       },
     });
     await byName("reputation_record").handler({
-      interaction_id: "same-counterparty-verified-signer",
+      interaction_id: "same-counterparty-self-vouch-signer",
       counterparty_did: counterparty.publicIdentity.did,
       identity_id: signerB.storedIdentity.identity_id,
       outcome: {
@@ -247,11 +262,47 @@ describe("reputation weighting by signer", () => {
       })
     );
 
+    // The self-vouch confers NO verified weight: both records are self-attested.
     expect(weighted.tier_distribution).toMatchObject({
-      "verified-sovereign": 1,
-      "self-attested": 1,
+      "verified-sovereign": 0,
+      "self-attested": 2,
     });
-    expect(weighted.weighted_score).toBeCloseTo(1 / 1.5, 8);
+    // Both at weight 0.5 (quality 0 and 1): (0*0.5 + 1*0.5) / (0.5 + 0.5) = 0.5.
+    expect(weighted.weighted_score).toBeCloseTo(0.5, 8);
+  });
+
+  it("records signed by a locally-held signer with a self-vouch entry are stamped self-attested", async () => {
+    // The per-record stamp (not just the aggregate) must reflect the cap, so a
+    // downstream consumer of a single record never sees a laundered tier.
+    const { byName, signerB, counterparty } = await setupHarness(
+      ({ signerB, counterparty }) => {
+        const handshakes = new Map<string, HandshakeResult>();
+        handshakes.set(
+          "verified-signer-instance",
+          verifiedHandshake(
+            signerB,
+            "verified-signer-instance",
+            "verified-sovereign"
+          )
+        );
+        return handshakes;
+      }
+    );
+
+    const record = parseToolResult(
+      await byName("reputation_record").handler({
+        interaction_id: "self-vouch-single-record",
+        counterparty_did: counterparty.publicIdentity.did,
+        identity_id: signerB.storedIdentity.identity_id,
+        outcome: {
+          type: "transaction",
+          result: "completed",
+          metrics: { quality: 1 },
+        },
+      })
+    );
+
+    expect(record.sovereignty_tier).toBe("self-attested");
   });
 
   it("does not confirm arbitrary counterparty attestation text", async () => {
@@ -275,5 +326,65 @@ describe("reputation weighting by signer", () => {
     // The presence-only confirmation flag was removed: no confirmation is
     // emitted for an unverified counterparty attachment (the field is absent).
     expect(record.counterparty_confirmed).toBeUndefined();
+  });
+});
+
+describe("resolveTierByDid — self-vouch guard (REP-01)", () => {
+  function mkIdentity(label: string): CreatedIdentity {
+    const encKey = derivePurposeKey(generateRandomKey(), "identity-encryption");
+    return createIdentity(label, encKey, "recovery-key");
+  }
+
+  it("credits a verified handshake for a DID NOT locally held (no over-block)", () => {
+    const remote = mkIdentity("remote-peer");
+    const map = new Map<string, HandshakeResult>();
+    map.set(
+      "remote-instance",
+      verifiedHandshake(remote, "remote-instance", "verified-sovereign")
+    );
+
+    // Empty local set: a genuine remote counterparty is still credited.
+    expect(
+      resolveTierByDid(
+        remote.publicIdentity.did,
+        map,
+        true,
+        new Set<string>()
+      ).sovereignty_tier
+    ).toBe("verified-sovereign");
+
+    // Omitted local set: backward-compatible, credited (unchanged behavior).
+    expect(
+      resolveTierByDid(remote.publicIdentity.did, map, true).sovereignty_tier
+    ).toBe("verified-sovereign");
+  });
+
+  it("refuses to credit the SAME verified handshake when the DID is locally held", () => {
+    const local = mkIdentity("local-signer");
+    const map = new Map<string, HandshakeResult>();
+    map.set(
+      "local-instance",
+      verifiedHandshake(local, "local-instance", "verified-sovereign")
+    );
+
+    // Locally held: the self-vouch confers no verified tier.
+    expect(
+      resolveTierByDid(
+        local.publicIdentity.did,
+        map,
+        true,
+        new Set([local.publicIdentity.did])
+      ).sovereignty_tier
+    ).toBe("self-attested");
+
+    // ...and with no Sanctuary identity claim, unverified (never credited).
+    expect(
+      resolveTierByDid(
+        local.publicIdentity.did,
+        map,
+        false,
+        new Set([local.publicIdentity.did])
+      ).sovereignty_tier
+    ).toBe("unverified");
   });
 });

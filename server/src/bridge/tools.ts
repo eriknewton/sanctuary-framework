@@ -371,8 +371,9 @@ export function createBridgeTools(
         "linked to a bridge commitment. The commitment (L3) proves the revealed " +
         "outcome matches the committer's signed commitment and terms hash; it does " +
         "not independently prove Concordia agreement or counterparty assent. The " +
-        "attestation (L4) feeds the sovereignty-weighted reputation score. The attestation is automatically " +
-        "tagged with the counterparty's sovereignty tier from any completed handshake.",
+        "attestation (L4) feeds the sovereignty-weighted reputation score. Its " +
+        "weight reflects the SIGNER's sovereignty tier (who makes the claim), not " +
+        "the counterparty's; a locally-signed attestation is self-attested.",
       inputSchema: {
         type: "object",
         properties: {
@@ -565,7 +566,16 @@ export function createBridgeTools(
 
         // The weight reflects who makes the claim, not who it is about, so an
         // untrusted caller cannot borrow a verified counterparty's credibility.
-        const tierMeta: TierMetadata = resolveTierByDid(identity.did, hsResults, true);
+        // REP-01: the signer (identity.did) is a LOCAL identity; cap it at
+        // self-attested (a handshake-map match for a local signer is a
+        // self-vouch). Passing exactly the signer DID is race-free. The storage
+        // chokepoint (trustedSovereigntyTier) enforces the same cap at scoring.
+        const tierMeta: TierMetadata = resolveTierByDid(
+          identity.did,
+          hsResults,
+          true,
+          new Set([identity.did])
+        );
         const tier = tierMeta.sovereignty_tier;
 
         // Record the reputation attestation

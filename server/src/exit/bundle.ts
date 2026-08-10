@@ -2357,7 +2357,15 @@ export async function importExitBundle(
 
   if (
     !verification.passed &&
-    verification.failure_class !== "reputation_unverifiable_attestations"
+    verification.failure_class !== "reputation_unverifiable_attestations" &&
+    // EXIT-PASS-01: rotation_chain_invalid now fails the verifier `passed`
+    // boolean (so `exit verify`/`inspect` report FAIL). Do NOT let it short to
+    // the generic not-verified result here — falling through preserves the
+    // specific, more diagnosable ROTATION_CHAIN_UNVERIFIABLE throw below
+    // (line ~2421), which names the rotation chain as the cause instead of a
+    // bare "not verified". Import stays fail-closed either way: it never admits
+    // data on an unverifiable chain.
+    verification.failure_class !== "rotation_chain_invalid"
   ) {
     return notVerifiedResult(
       0,

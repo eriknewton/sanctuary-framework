@@ -249,6 +249,18 @@ export interface Guarantee {
  * This is the single chokepoint every tier-weighted read must go through so a
  * forged or provenance-unknown attestation cannot inflate its scoring weight.
  * It never RAISES a tier.
+ *
+ * REP-01 RESIDUAL (register §Z RECHECK, OWNER DECISION — deliberately NOT
+ * changed here): the imported:false pass-through trusts a local record's stored
+ * tier. REP-01 closes the AGENT-FACING exploit at the record-time callers
+ * (reputation_record / bridge_attest cap the local signer at self-attested), so
+ * an agent using the tools can no longer launder. What this pass-through still
+ * trusts is (a) a pre-fix laundered local record written before that cap, and
+ * (b) a hypothetical direct ReputationStore.record consumer that stores a
+ * privileged local tier. Clamping imported:false here would close both, but it
+ * flips a deliberately-designed, tested trust surface (see reputation.test.ts
+ * "import-trust hardening") and changes the scoring meaning of every local
+ * record — a trust-model decision drafted for the owner, not taken unilaterally.
  */
 export function trustedSovereigntyTier(
   stored: StoredAttestation
