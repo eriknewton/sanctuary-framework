@@ -563,12 +563,9 @@ export function createBridgeTools(
           });
         }
 
-        // Resolve sovereignty tier from handshake results
-        // Check if the counterparty has a known Sanctuary identity
-        const hasSanctuaryIdentity = identityManager.list().some(
-          (id) => identityManager.get(id.identity_id)?.did === counterpartyDid
-        );
-        const tierMeta: TierMetadata = resolveTierByDid(counterpartyDid, hsResults, hasSanctuaryIdentity);
+        // The weight reflects who makes the claim, not who it is about, so an
+        // untrusted caller cannot borrow a verified counterparty's credibility.
+        const tierMeta: TierMetadata = resolveTierByDid(identity.did, hsResults, true);
         const tier = tierMeta.sovereignty_tier;
 
         // Record the reputation attestation
@@ -623,7 +620,7 @@ export function createBridgeTools(
           attested_at: attestation.recorded_at,
           already_attested: false,
           note: `Negotiation recorded as reputation attestation. ` +
-            `Counterparty sovereignty tier: ${tier} (weight: ${weight}).`,
+            `Signer sovereignty tier: ${tier} (weight: ${weight}).`,
         });
       },
     },

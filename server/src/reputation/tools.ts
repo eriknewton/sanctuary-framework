@@ -231,7 +231,9 @@ export function createReputationTools(
           },
           counterparty_attestation: {
             type: "string",
-            description: "Counterparty's signed attestation of the same interaction",
+            description:
+              "Optional raw counterparty attestation attachment. " +
+              "Presence alone is not treated as verified confirmation.",
           },
           identity_id: {
             type: "string",
@@ -262,12 +264,10 @@ export function createReputationTools(
           });
         }
 
-        // Resolve sovereignty tier for the counterparty
         const counterpartyDid = args.counterparty_did as string;
-        const hasSanctuaryIdentity = identityManager.list().some(
-          (id) => identityManager.get(id.identity_id)?.did === counterpartyDid
-        );
-        const tierMeta = resolveTierByDid(counterpartyDid, hsResults, hasSanctuaryIdentity);
+        // The weight reflects who makes the claim, not who it is about, so an
+        // untrusted caller cannot borrow a verified counterparty's credibility.
+        const tierMeta = resolveTierByDid(identity.did, hsResults, true);
 
         let stored;
         try {
