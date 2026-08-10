@@ -597,7 +597,9 @@ export class ReputationStore {
     const stored: StoredAttestation = {
       attestation,
       counterparty_attestation: counterpartyAttestation,
-      counterparty_confirmed: !!counterpartyAttestation,
+      // A raw attachment is not a verified countersignature over this
+      // interaction, so presence alone must not claim counterparty confirmation.
+      counterparty_confirmed: false,
       recorded_at: now,
       // Provably local provenance: this tier came from a handshake this
       // instance witnessed, so trustedSovereigntyTier leaves it unclamped.

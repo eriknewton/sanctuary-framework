@@ -1520,7 +1520,7 @@
         },
         "counterparty_attestation": {
           "type": "string",
-          "description": "Counterparty's signed attestation of the same interaction"
+          "description": "Optional raw counterparty attestation attachment. Presence alone is not treated as verified confirmation."
         },
         "identity_id": {
           "type": "string",
