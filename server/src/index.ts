@@ -803,7 +803,7 @@ export async function createSanctuaryServer(options?: {
 
   // 12. Create Handshake tools (sovereignty handshake protocol)
   // Must be created before L4 so handshakeResults can feed tier resolution
-  const { tools: handshakeTools, handshakeResults } = createHandshakeTools(
+  const { tools: handshakeTools, handshakeResults, handshakeResultOrigins } = createHandshakeTools(
     config,
     identityManager,
     masterKey,
@@ -843,7 +843,8 @@ export async function createSanctuaryServer(options?: {
   const { tools: federationTools } = createFederationTools(
     auditLog,
     handshakeResults,
-    identityManager
+    identityManager,
+    handshakeResultOrigins
   );
 
   // 14c. Create Bridge tools (Concordia integration)

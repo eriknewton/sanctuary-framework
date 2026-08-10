@@ -83,7 +83,17 @@ const WARN_SIGMA = 3;
 const ALERT_SIGMA = 6;
 /** Days of history required before threshold checks run. */
 const BASELINE_WINDOWS = 7;
-/** Max findings to consider per evaluation. */
+/**
+ * Max findings to consider per evaluation.
+ *
+ * CROSS-FILE PIN: must be <= sentinel/sentinel-finding-store.ts's
+ * MAX_SCANNED_RECORDS (the absolute ceiling `listFindings` will decrypt for
+ * ANY caller's `limit`). This IS the caller whose 8-day baseline needs the
+ * whole window, not just a display page — a QUERY_LIMIT above the store's
+ * ceiling would silently get truncated below what the baseline calculation
+ * (BASELINE_WINDOWS below) needs. If either constant changes, check the
+ * other.
+ */
 const QUERY_LIMIT = 5_000;
 /** Window duration in ms. */
 const WINDOW_MS = 24 * 60 * 60 * 1000;

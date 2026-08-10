@@ -28,9 +28,21 @@ export function createFederationTools(
   // defense-in-depth, not the only layer, but it must never be inert.
   // Production wiring (index.ts) always supplies it; every test construction
   // must too (a test that omits it is testing a bypass, not a real config).
-  identityManager: IdentityManager
+  identityManager: IdentityManager,
+  // OPTIONAL — unlike identityManager above, this does not gate a trust
+  // decision (AGENTS.md rule 3 distinguishes the two): it only feeds the
+  // per-origin DoS quota (MAX_FEDERATION_PEERS_PER_ORIGIN, see
+  // federation/registry.ts). Omitting it means every registration is
+  // recorded with no origin attribution, so per-origin fairness simply does
+  // not apply to it — the global cap and the "never evict an active peer"
+  // guarantee hold regardless either way. Production wiring (index.ts)
+  // always supplies the real map (`createHandshakeTools`'s
+  // `handshakeResultOrigins`); tests that only exercise the pre-existing
+  // global-cap/self-vouch behavior are unaffected by omitting it.
+  handshakeResultOrigins?: ReadonlyMap<string, string>
 ): { tools: ToolDefinition[]; registry: FederationRegistry } {
   const registry = new FederationRegistry(auditLog);
+  const originsForPeers = handshakeResultOrigins ?? new Map<string, string>();
 
   const tools: ToolDefinition[] = [
     // ─── Peer Management ──────────────────────────────────────────────
@@ -194,19 +206,41 @@ export function createFederationTools(
               });
             }
 
-            const peer = registry.registerFromHandshake(hsResult, peerDid);
+            // Per-origin quota (register LD2-04 RECHECK): attribute this
+            // registration to the LOCAL identity that recorded the
+            // underlying handshake result, so a flood of attacker-completed
+            // handshakes against ONE identity cannot exhaust the shared
+            // registry and lock out a DIFFERENT identity's registration —
+            // see MAX_FEDERATION_PEERS_PER_ORIGIN's doc.
+            const origin = originsForPeers.get(peerId);
+            const originQuotaExceeded =
+              origin !== undefined &&
+              registry.peerOriginSize(origin) >=
+                registry.maxPeersPerOrigin();
+            const peer = registry.registerFromHandshake(
+              hsResult,
+              peerDid,
+              undefined,
+              origin
+            );
 
             // Bounded-collection guard (register LD2-04): the registry
-            // refuses a new peer when it is at capacity and every existing
-            // slot holds a currently-active peer, rather than evicting a
-            // real trusted peer to make room. Surface this as an explicit
-            // error, never a silently-dropped "registered: true".
+            // refuses a new peer either because THIS identity's own
+            // per-origin quota is exhausted, or because the shared registry
+            // is at capacity and every existing slot holds a currently-active
+            // peer — either way it never evicts a real trusted peer to make
+            // room. Surface this as an explicit error, never a
+            // silently-dropped "registered: true".
             if (!peer) {
               return toolResult({
-                error:
-                  "Federation peer registry is at capacity and every slot " +
-                  "holds an active peer; cannot register a new peer until " +
-                  "one expires, is removed, or one becomes inactive.",
+                error: originQuotaExceeded
+                  ? "This identity has reached its federation peer " +
+                    `registration quota (${registry.maxPeersPerOrigin()} peers). ` +
+                    "Remove or let an inactive peer expire before " +
+                    "registering more."
+                  : "Federation peer registry is at capacity and every slot " +
+                    "holds an active peer; cannot register a new peer until " +
+                    "one expires, is removed, or one becomes inactive.",
               });
             }
 

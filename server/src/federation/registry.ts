@@ -54,6 +54,32 @@ const DEFAULT_CAPABILITIES: FederationCapabilities = {
 export const MAX_FEDERATION_PEERS = 500;
 
 /**
+ * Per-origin quota for `peers` (AGENTS.md rule 8 RECHECK — HIGH gate
+ * finding on the first cut of this bound). The ORIGIN of a peer is the
+ * LOCAL identity that recorded the underlying handshake result
+ * (`handshake/tools.ts`'s `handshakeResultOrigins`, threaded through
+ * `federation/tools.ts`'s register handler). Without this, an attacker who
+ * completes MAX_FEDERATION_PEERS real 4-step handshakes against ONE local
+ * identity fills the entire shared registry with active peers and
+ * PERMANENTLY locks out registration for every OTHER local identity too
+ * (the gate's own reproduction: the branch's first cut proved this
+ * lockout). With this, that flood exhausts only the flooded identity's own
+ * quota and is REFUSED there — never evicts an active peer, and never
+ * touches a different identity's headroom, so a different identity can
+ * still register. 50 = 1/10th of MAX_FEDERATION_PEERS, matching
+ * MAX_HANDSHAKE_SESSIONS_PER_ORIGIN / MAX_HANDSHAKE_RESULTS_PER_ORIGIN's
+ * ratio: generous per-identity headroom while guaranteeing at least 10
+ * distinct local identities' worth of peers fit before any one identity
+ * could threaten the shared ceiling. `origin` is OPTIONAL on
+ * `registerFromHandshake` (a caller that cannot supply it — e.g. a test
+ * harness that builds `handshakeResults` by hand, never through
+ * `createHandshakeTools` — simply does not get per-origin accounting for
+ * that entry; the global cap + active-peer-eviction-never-happens guarantee
+ * still applies unconditionally either way).
+ */
+export const MAX_FEDERATION_PEERS_PER_ORIGIN = 50;
+
+/**
  * Is `peer` active RIGHT NOW, accounting for handshake expiry the lazy
  * getPeer/listPeers mutation hasn't caught up to yet? Shared by getPeer,
  * listPeers, and the eviction selector below so all three agree on what
@@ -72,6 +98,7 @@ export class FederationRegistry {
     this.auditLog = auditLog;
     this.peers = new BoundedMap<string, FederationPeer>({
       maxSize: MAX_FEDERATION_PEERS,
+      maxPerOrigin: MAX_FEDERATION_PEERS_PER_ORIGIN,
       selectEviction: (entries) => {
         const now = new Date();
         let oldestInactiveKey: string | undefined;
@@ -104,10 +131,12 @@ export class FederationRegistry {
           reason: "capacity",
         });
       },
-      onRefuse: (incomingPeerId) => {
+      onRefuse: (incomingPeerId, _incomingPeer, reason) => {
         void this.auditLog.append(
           "l4",
-          "federation_registry_saturated",
+          reason === "origin_quota"
+            ? "federation_registry_origin_quota_exceeded"
+            : "federation_registry_saturated",
           "system",
           { peer_id: incomingPeerId },
           "failure"
@@ -122,15 +151,22 @@ export class FederationRegistry {
    * (federation/tools.ts) refuses a peer_did this fortress holds keys for
    * before this method is ever reached.
    *
-   * Returns `null` when the registry is at capacity and every existing slot
-   * holds a currently-active peer (see the eviction policy above) — the
-   * caller must surface this as an explicit refusal, never treat it as a
-   * silent no-op success.
+   * Returns `null` when the registration was refused — either the shared
+   * registry is at capacity and every existing slot holds a currently-active
+   * peer (see the eviction policy above), or `origin`'s own per-origin quota
+   * (MAX_FEDERATION_PEERS_PER_ORIGIN) is already exhausted — the caller must
+   * surface this as an explicit refusal, never treat it as a silent no-op
+   * success. `origin` is the LOCAL identity that recorded the underlying
+   * handshake result (see MAX_FEDERATION_PEERS_PER_ORIGIN's doc); omit it
+   * only when the caller genuinely cannot attribute one (per-origin
+   * accounting is then simply skipped for this entry, per BoundedMap's
+   * `maxPerOrigin` contract).
    */
   registerFromHandshake(
     result: HandshakeResult,
     peerDid: string,
-    capabilities?: Partial<FederationCapabilities>
+    capabilities?: Partial<FederationCapabilities>,
+    origin?: string
   ): FederationPeer | null {
     const existing = this.peers.get(result.counterparty_id);
     const now = new Date().toISOString();
@@ -155,7 +191,7 @@ export class FederationRegistry {
       peer.trust_tier = "self-attested";
     }
 
-    const inserted = this.peers.set(result.counterparty_id, peer);
+    const inserted = this.peers.set(result.counterparty_id, peer, origin);
     return inserted ? peer : null;
   }
 
@@ -178,9 +214,17 @@ export class FederationRegistry {
 
   /**
    * List all known peers, optionally filtered by status.
+   *
+   * BOUNDED (register LD2-04, AGENTS.md rule 8(d)): `boundedList` reads at
+   * most MAX_FEDERATION_PEERS entries — the registry's own hard cap — so
+   * this can never do unbounded work regardless of how many peers a caller
+   * has registered; it's the same bound `Array.from(this.peers.values())`
+   * had implicitly (the underlying map is itself capped), made explicit via
+   * the primitive built for it rather than materializing through a bare
+   * Map method.
    */
   listPeers(filter?: { active_only?: boolean }): FederationPeer[] {
-    const peers = Array.from(this.peers.values());
+    const peers = this.peers.boundedList(MAX_FEDERATION_PEERS);
     const now = new Date();
 
     // Update active status before filtering
@@ -307,6 +351,19 @@ export class FederationRegistry {
    */
   removePeer(peerId: string): boolean {
     return this.peers.delete(peerId);
+  }
+
+  /** How many peers `origin` currently holds — used by federation/tools.ts
+   * to pick the right refusal message (origin-quota vs global-capacity)
+   * BEFORE calling registerFromHandshake, since that method only returns
+   * null on refusal without saying why. */
+  peerOriginSize(origin: string): number {
+    return this.peers.originSize(origin);
+  }
+
+  /** The per-origin quota this registry enforces (MAX_FEDERATION_PEERS_PER_ORIGIN). */
+  maxPeersPerOrigin(): number {
+    return MAX_FEDERATION_PEERS_PER_ORIGIN;
   }
 
   /**

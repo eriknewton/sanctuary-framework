@@ -53,11 +53,31 @@ export type HandshakeFailureReason =
   | "self_vouch_local_did"
   // CLASS-LEVEL bounded-collection guard (register LD2-03): the shared
   // `handshakeResults` map is capped (MAX_HANDSHAKE_RESULTS); an insert for
-  // a NEW counterparty is refused, never allowed to evict a verified &&
-  // liveness_proven entry, when every existing slot already holds one. This
-  // fails closed to "cannot record this handshake" rather than silently
-  // flushing an established peer's trust state.
+  // a NEW counterparty is refused, never allowed to evict a currently-live
+  // verified && liveness_proven && unexpired entry, when every existing
+  // slot already holds one. This fails closed to "cannot record this
+  // handshake" rather than silently flushing an established peer's trust
+  // state.
   | "handshake_results_saturated"
+  // CLASS-LEVEL per-origin quota guard (AGENTS.md rule 8 RECHECK): the
+  // LOCAL identity recording this result has already reached
+  // MAX_HANDSHAKE_RESULTS_PER_ORIGIN entries of its own. Distinct from
+  // `handshake_results_saturated` (the whole shared map is full) — this
+  // fires well before that, and refusing here is what guarantees one
+  // identity's flood can never touch another identity's share of the map.
+  | "handshake_results_origin_quota_exceeded"
+  // CLASS-LEVEL bounded-collection guard for `sessions` (AGENTS.md rule 8
+  // RECHECK): the shared session store is at MAX_HANDSHAKE_SESSIONS and
+  // every remaining slot's origin quota check declined to evict (should
+  // not occur in practice — the sessions eviction policy is unconditional
+  // oldest-evict once past the per-origin check — but the store fails
+  // closed here rather than silently dropping the new session if it ever
+  // does).
+  | "handshake_session_store_saturated"
+  // The LOCAL identity starting/responding to this handshake has already
+  // reached MAX_HANDSHAKE_SESSIONS_PER_ORIGIN in-flight sessions of its
+  // own; refused before it could evict a DIFFERENT identity's session.
+  | "handshake_session_origin_quota_exceeded"
   | "other";
 
 /** Reasons a handshake may be aborted (operator or transport). */

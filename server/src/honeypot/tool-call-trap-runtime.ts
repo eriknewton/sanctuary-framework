@@ -7,7 +7,7 @@
  * calls to those fake tool names before regular tool dispatch.
  */
 
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 
 import type { AuditLog } from "../operational/audit-log.js";
 import type { SentinelFindingStore } from "../sentinel/sentinel-finding-store.js";
@@ -131,6 +131,26 @@ function coalescedWindowKey(trapId: string, callerIdentity: string): string {
   return JSON.stringify([trapId, callerIdentity]);
 }
 
+/**
+ * Deterministic finding_id for a (trap, caller, time-bucket) triple
+ * (register Z-HNY-02 RECHECK / rule 8 atomicity fix — see the doc above
+ * `runExclusive`). Two invocations that fall in the SAME
+ * FOLLOW_UP_WINDOW_MS-wide bucket ALWAYS compute the identical id, with no
+ * dependency on which one observes the in-memory tracker first — that is
+ * what makes the durable write an idempotent upsert instead of a
+ * check-then-mint race. sha256 (not randomUUID) precisely because it must
+ * be a pure function of its inputs, not a fresh random value per call.
+ */
+function deterministicCoalescedFindingId(
+  trapId: string,
+  callerIdentity: string,
+  windowBucket: number,
+): string {
+  return createHash("sha256")
+    .update(JSON.stringify(["coalesced-finding-v1", trapId, callerIdentity, windowBucket]), "utf8")
+    .digest("hex");
+}
+
 export class ToolCallTrapRuntime {
   private readonly registry: TrapRegistry;
   private readonly findingStore: SentinelFindingStore;
@@ -139,6 +159,13 @@ export class ToolCallTrapRuntime {
   private readonly fortressId: string;
   private readonly now: () => Date;
   private readonly activations = new Map<string, ToolCallInvocation[]>();
+  // Per-(trap, caller) mutex chain (register Z-HNY-02 RECHECK, rule 8
+  // atomicity fix). Self-cleaning: an entry exists ONLY while a call for
+  // that key is in flight — `runExclusive` deletes it the moment the last
+  // queued call finishes — so this is never itself an unbounded
+  // attacker-writable collection; it is bounded by concurrent in-flight
+  // request count, not by cumulative (trap, caller) pairs ever seen.
+  private readonly windowLocks = new Map<string, Promise<void>>();
   // See MAX_COALESCED_FINDING_WINDOWS. Evict-oldest on capacity: losing a
   // tracker entry only means the next invocation for that (trap, caller)
   // mints a fresh finding_id (a new durable row) instead of updating the
@@ -203,125 +230,223 @@ export class ToolCallTrapRuntime {
     const boundedArgs = hashAndBoundArgs(args);
     const argHash = boundedArgs.hash;
 
-    // Coalescing (register Z-HNY-02): reuse the durable finding for this
-    // (trap, caller) if one was minted within the current window (the
-    // pruneExpiredCoalescedWindows call above already dropped anything
-    // stale, so `existingWindow` here is, by construction, still current —
-    // the explicit timestamp check is defense-in-depth, matching the same
-    // belt-and-braces pattern the handshake session sweep uses).
+    // Coalescing (register Z-HNY-02 RECHECK — atomicity fix). The ENTIRE
+    // read-decide-persist-update sequence below runs inside ONE
+    // `runExclusive` call, which fully serializes every `invokeIfTrap`
+    // sharing this windowKey end to end — see that method's doc for why the
+    // ORIGINAL code (read the tracker, decide, THEN `await saveFinding`,
+    // THEN write the tracker) let two overlapping calls both observe "no
+    // window" and each mint an independent finding_id for what should
+    // coalesce into ONE durable row: the gap wasn't the read, it was
+    // everything between the read and the final tracker write having an
+    // `await` in the middle with no lock around it.
     const windowKey = coalescedWindowKey(spec.trap_id, callerIdentity);
-    const existingWindow = this.activeFindingWindows.get(windowKey);
     const nowMs = now.getTime();
-    const withinWindow =
-      existingWindow !== undefined &&
-      nowMs - existingWindow.window_started_at <= FOLLOW_UP_WINDOW_MS;
+    const windowBucket = Math.floor(nowMs / FOLLOW_UP_WINDOW_MS);
+    // Deterministic, not random: two calls in the SAME bucket compute the
+    // IDENTICAL finding_id independently, with no dependency on tracker
+    // state — this is what makes the durable write an upsert rather than a
+    // race between two independently-minted ids (see
+    // deterministicCoalescedFindingId's doc).
+    const findingId = deterministicCoalescedFindingId(
+      spec.trap_id,
+      callerIdentity,
+      windowBucket,
+    );
+    const windowStartedAt = windowBucket * FOLLOW_UP_WINDOW_MS;
 
-    const findingId = withinWindow ? existingWindow.finding_id : randomUUID();
-    const repeatCount = withinWindow ? existingWindow.repeat_count + 1 : 1;
-    const firstObservedAt = withinWindow
-      ? existingWindow.first_observed_at
-      : now.toISOString();
-    const windowStartedAt = withinWindow ? existingWindow.window_started_at : nowMs;
-    const distinctArgHashes = withinWindow
-      ? mergeCappedArgHash(existingWindow.distinct_arg_hashes, argHash)
-      : [argHash];
+    return this.runExclusive(windowKey, async () => {
+      // Ground truth is the DURABLE store, never just the in-memory
+      // tracker: the tracker is a cache that can be capacity-evicted
+      // (MAX_COALESCED_FINDING_WINDOWS) mid-window without losing the
+      // underlying bucket's determinism — a subsequent call in the SAME
+      // bucket still computes the SAME findingId above, so if the tracker
+      // was evicted we recover repeat_count/first_observed_at/
+      // distinct_arg_hashes by reading the record back rather than
+      // treating the eviction as "this is a brand-new observation" (which
+      // would both undercount repeat_count and, if repeated, mint
+      // unbounded fresh durable rows on tracker churn alone — exactly the
+      // second bypass the gate found: "tracker eviction mints a fresh
+      // durable finding within the same window").
+      const existingWindow = this.activeFindingWindows.get(windowKey);
+      let groundTruth:
+        | { repeat_count: number; first_observed_at: string; distinct_arg_hashes: string[] }
+        | undefined;
+      if (existingWindow && existingWindow.finding_id === findingId) {
+        groundTruth = {
+          repeat_count: existingWindow.repeat_count,
+          first_observed_at: existingWindow.first_observed_at,
+          distinct_arg_hashes: existingWindow.distinct_arg_hashes,
+        };
+      } else {
+        // Fail-safe (same invariant as the saveFinding try/catch below):
+        // invokeIfTrap runs pre-gate and uncaught in the router, so a raw
+        // store-read error must never propagate here either. Treat a read
+        // failure exactly like "no existing record" — the call proceeds as
+        // a fresh observation rather than throwing.
+        let stored: SentinelFinding | null;
+        try {
+          stored = await this.findingStore.loadFinding(findingId);
+        } catch {
+          stored = null;
+        }
+        if (stored) {
+          const details = stored.details as {
+            first_observed_at?: string;
+            repeat_count?: number;
+            distinct_arg_hashes?: string[];
+          };
+          groundTruth = {
+            repeat_count: details.repeat_count ?? 1,
+            first_observed_at: details.first_observed_at ?? stored.observed_at,
+            distinct_arg_hashes: details.distinct_arg_hashes ?? [],
+          };
+        }
+      }
 
-    const invocation: ToolCallInvocation = {
-      trap_id: spec.trap_id,
-      fake_tool_name: trigger.fake_tool_name,
-      caller_identity: callerIdentity,
-      invocation_args: boundedArgs.preview,
-      arg_hash: argHash,
-      arg_bytes: boundedArgs.bytes,
-      arg_truncated: boundedArgs.truncated,
-      invoked_at: now.toISOString(),
-      finding_id: findingId,
-      fake_response: trigger.fake_response,
-      response_plausibility: "operator_configured_fake_response",
-      follow_up_tool_calls: [],
-    };
-    const finding: SentinelFinding = {
-      finding_id: findingId,
-      sentinel_id: honeypotSentinelId(spec.trap_id),
-      severity: spec.finding_severity,
-      summary:
-        `honeypot ${spec.trap_id} triggered: tool ${trigger.fake_tool_name} invoked by ${callerIdentity}` +
-        (repeatCount > 1 ? ` (${repeatCount}x in window)` : ""),
-      details: {
+      const withinWindow = groundTruth !== undefined;
+      const repeatCount = withinWindow ? groundTruth!.repeat_count + 1 : 1;
+      const firstObservedAt = withinWindow
+        ? groundTruth!.first_observed_at
+        : now.toISOString();
+      const distinctArgHashes = withinWindow
+        ? mergeCappedArgHash(groundTruth!.distinct_arg_hashes, argHash)
+        : [argHash];
+
+      const invocation: ToolCallInvocation = {
         trap_id: spec.trap_id,
-        trap_class: spec.trap_class,
         fake_tool_name: trigger.fake_tool_name,
         caller_identity: callerIdentity,
         invocation_args: boundedArgs.preview,
         arg_hash: argHash,
         arg_bytes: boundedArgs.bytes,
         arg_truncated: boundedArgs.truncated,
-        response_plausibility: invocation.response_plausibility,
-        follow_up_window_ms: FOLLOW_UP_WINDOW_MS,
-        follow_up_tool_calls: invocation.follow_up_tool_calls,
-        // Coalescing fields (register Z-HNY-02): this ONE durable row
-        // represents every invocation of this trap by this caller within
-        // the current window, not only the invocation that triggered this
-        // particular write.
-        first_observed_at: firstObservedAt,
-        repeat_count: repeatCount,
-        distinct_arg_hashes: distinctArgHashes,
-      },
-      observed_at: now.toISOString(),
-      evidence_audit_ids: [],
-      fortress_id: this.fortressId,
-    };
-    // Persist the finding and trigger audit BEFORE retaining the activation
-    // and updating the coalescing window, so a retained correlation-buffer
-    // entry (or an updated window pointing at findingId) always has a
-    // durable record behind it. invokeIfTrap runs pre-gate and uncaught in
-    // the router (router.ts CallTool handler has no try/catch around this
-    // call), so a raw persistence error must never propagate here: it would
-    // leak an internal error to the agent (no-leak invariant) and break the
-    // honeypot's stealth. On failure, skip retention (preserving "retained
-    // implies persisted") and still return the fake response.
-    let persisted = false;
-    try {
-      // `knownExisting: withinWindow` skips the finding store's per-write
-      // ceiling check for a coalesced UPDATE (same finding_id, cannot grow
-      // the tracked count) — see saveFinding's doc. A brand-new window
-      // (withinWindow false) still pays the full ceiling check.
-      await this.findingStore.saveFinding(finding, { knownExisting: withinWindow });
-      await this.auditLog.append("l2", HONEYPOT_AUDIT_OPS.TRIGGERED, this.operatorId, {
-        fortress_id: this.fortressId,
-        trap_id: spec.trap_id,
-        trap_class: spec.trap_class,
-        fake_tool_name: trigger.fake_tool_name,
-        caller_identity: callerIdentity,
-        invocation_args: boundedArgs.preview,
-        arg_hash: argHash,
-        arg_bytes: boundedArgs.bytes,
-        arg_truncated: boundedArgs.truncated,
+        invoked_at: now.toISOString(),
         finding_id: findingId,
-        severity: spec.finding_severity,
-        response_plausibility: invocation.response_plausibility,
-        fake_response_hash: hashJson(trigger.fake_response),
-        follow_up_window_ms: FOLLOW_UP_WINDOW_MS,
+        fake_response: trigger.fake_response,
+        response_plausibility: "operator_configured_fake_response",
         follow_up_tool_calls: [],
-        repeat_count: repeatCount,
-      });
-      persisted = true;
-    } catch {
-      // Persistence failed. Do not retain an unpersisted activation; stay stealthy
-      // and fail safe rather than surface the error on the pre-gate path.
-    }
-    if (persisted) {
-      this.retainActivation(spec.trap_id, invocation);
-      this.activeFindingWindows.set(windowKey, {
+      };
+      const finding: SentinelFinding = {
         finding_id: findingId,
-        window_started_at: windowStartedAt,
-        first_observed_at: firstObservedAt,
-        repeat_count: repeatCount,
-        distinct_arg_hashes: distinctArgHashes,
-      });
-    }
+        sentinel_id: honeypotSentinelId(spec.trap_id),
+        severity: spec.finding_severity,
+        summary:
+          `honeypot ${spec.trap_id} triggered: tool ${trigger.fake_tool_name} invoked by ${callerIdentity}` +
+          (repeatCount > 1 ? ` (${repeatCount}x in window)` : ""),
+        details: {
+          trap_id: spec.trap_id,
+          trap_class: spec.trap_class,
+          fake_tool_name: trigger.fake_tool_name,
+          caller_identity: callerIdentity,
+          invocation_args: boundedArgs.preview,
+          arg_hash: argHash,
+          arg_bytes: boundedArgs.bytes,
+          arg_truncated: boundedArgs.truncated,
+          response_plausibility: invocation.response_plausibility,
+          follow_up_window_ms: FOLLOW_UP_WINDOW_MS,
+          follow_up_tool_calls: invocation.follow_up_tool_calls,
+          // Coalescing fields (register Z-HNY-02): this ONE durable row
+          // represents every invocation of this trap by this caller within
+          // the current window, not only the invocation that triggered this
+          // particular write.
+          first_observed_at: firstObservedAt,
+          repeat_count: repeatCount,
+          distinct_arg_hashes: distinctArgHashes,
+        },
+        observed_at: now.toISOString(),
+        evidence_audit_ids: [],
+        fortress_id: this.fortressId,
+      };
+      // Persist the finding and trigger audit BEFORE retaining the activation
+      // and updating the coalescing window, so a retained correlation-buffer
+      // entry (or an updated window pointing at findingId) always has a
+      // durable record behind it. invokeIfTrap runs pre-gate and uncaught in
+      // the router (router.ts CallTool handler has no try/catch around this
+      // call), so a raw persistence error must never propagate here: it would
+      // leak an internal error to the agent (no-leak invariant) and break the
+      // honeypot's stealth. On failure, skip retention (preserving "retained
+      // implies persisted") and still return the fake response.
+      let persisted = false;
+      try {
+        // `knownExisting: withinWindow` skips the finding store's per-write
+        // ceiling check for a coalesced UPDATE (same finding_id, cannot grow
+        // the tracked count) — see saveFinding's doc. A brand-new window
+        // (withinWindow false) still pays the full ceiling check.
+        await this.findingStore.saveFinding(finding, { knownExisting: withinWindow });
+        await this.auditLog.append("l2", HONEYPOT_AUDIT_OPS.TRIGGERED, this.operatorId, {
+          fortress_id: this.fortressId,
+          trap_id: spec.trap_id,
+          trap_class: spec.trap_class,
+          fake_tool_name: trigger.fake_tool_name,
+          caller_identity: callerIdentity,
+          invocation_args: boundedArgs.preview,
+          arg_hash: argHash,
+          arg_bytes: boundedArgs.bytes,
+          arg_truncated: boundedArgs.truncated,
+          finding_id: findingId,
+          severity: spec.finding_severity,
+          response_plausibility: invocation.response_plausibility,
+          fake_response_hash: hashJson(trigger.fake_response),
+          follow_up_window_ms: FOLLOW_UP_WINDOW_MS,
+          follow_up_tool_calls: [],
+          repeat_count: repeatCount,
+        });
+        persisted = true;
+      } catch {
+        // Persistence failed. Do not retain an unpersisted activation; stay stealthy
+        // and fail safe rather than surface the error on the pre-gate path.
+      }
+      if (persisted) {
+        this.retainActivation(spec.trap_id, invocation);
+        this.activeFindingWindows.set(windowKey, {
+          finding_id: findingId,
+          window_started_at: windowStartedAt,
+          first_observed_at: firstObservedAt,
+          repeat_count: repeatCount,
+          distinct_arg_hashes: distinctArgHashes,
+        });
+      }
 
-    return { handled: true, response: trigger.fake_response };
+      return { handled: true as const, response: trigger.fake_response };
+    });
+  }
+
+  /**
+   * Serialize every call sharing `key` — the second and later concurrent
+   * callers each await the FULL completion (including any error) of every
+   * call queued before them, then run in strict order. This is what turns
+   * the coalescing read-decide-persist-update sequence in `invokeIfTrap`
+   * into a true critical section: without it, two calls racing on the same
+   * (trap, caller) window could both read "no existing record" before
+   * either had written one (register Z-HNY-02 RECHECK).
+   *
+   * Self-cleaning (see the `windowLocks` field doc): `key`'s entry in the
+   * map is a placeholder that exists only while at least one call for that
+   * key is queued or running, and is removed once the queue drains back to
+   * empty — the `finally` block deletes it, but ONLY if no newer call has
+   * already replaced it with its own placeholder (the `=== chained` guard),
+   * so a call that arrives while this one is still running is never
+   * dropped from the queue by an earlier call's cleanup.
+   */
+  private async runExclusive<T>(
+    key: string,
+    fn: () => Promise<T>,
+  ): Promise<T> {
+    const prior = this.windowLocks.get(key) ?? Promise.resolve();
+    const run = prior.then(fn, fn);
+    const chained = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.windowLocks.set(key, chained);
+    try {
+      return await run;
+    } finally {
+      if (this.windowLocks.get(key) === chained) {
+        this.windowLocks.delete(key);
+      }
+    }
   }
 
   recordToolCall(

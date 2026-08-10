@@ -45,29 +45,66 @@ export const DEFAULT_SENTINEL_FINDING_RETENTION_DAYS = 30;
 const MAX_FINDING_BYTES = 256 * 1024;
 
 /**
- * CLASS-LEVEL bounded-listing guard (register Z-HNY-02): `listFindings` used
- * to decrypt EVERY record in the namespace before applying any filter or the
- * `limit`, so an attacker who drives finding COUNT up (honeypot invocations,
- * pre-coalescing) turned every read into an O(all-records)-decrypt scan.
- * Storage metadata already carries `modified_at`, which for this store is
- * always the write-time of the record it describes (writes are append-once
- * per finding_id in the normal case; a re-saved finding_id only happens via
- * the honeypot coalescing update path, which still bumps modified_at to the
- * latest observation — so "newest write" tracks "most recently relevant"
- * closely enough to order the scan by). Sorting metas by `modified_at`
- * descending and decrypting only the newest MAX_SCANNED_RECORDS bounds
- * decrypt work to a constant regardless of how large the store has grown,
- * without touching the `finding.{finding_id}` at-rest key format (checked
- * against reorg-surface-manifest.md: that format is not listed as frozen,
- * but reusing storage metadata the backend already maintains is simpler and
- * lower-risk than minting a parallel index record).
+ * CLASS-LEVEL bounded-listing guard (register Z-HNY-02 RECHECK):
+ * `listFindings` used to sort metas by `modified_at`, SLICE to the newest
+ * MAX_SCANNED_RECORDS, and only THEN apply the caller's since/severity/
+ * sentinel/agent filters — so a flood of RECENT low-value findings could
+ * push an older matching finding out of the scan window before the filter
+ * ever ran, hiding it from a `severity: "alert"` or `since: <8 days ago>`
+ * query even though it still exists and is still in-window. That second
+ * consumer is not hypothetical: sentinels/anomaly-trigger.ts asks for
+ * `since: <8 days ago>, limit: 5000` to compute its rolling baseline, and a
+ * flood of same-day low-severity findings silently starved it down to
+ * whatever fit in the newest 500 — a real, broken security consumer, not
+ * just a display truncation.
  *
- * 500 = 5x the default result `limit` (100): generous slack so a caller
- * asking for the newest 100 findings still gets them even when up to 80% of
- * the freshest 500 records are filtered out by severity/sentinel/agent,
- * without decrypting the whole store to find out.
+ * The fix is the in-memory INDEX below (`this.index`): every write updates
+ * a small, PLAINTEXT-metadata-only record (severity/sentinel_id/agent_id/
+ * observed_at — never the finding's `summary`/`details`, so the index
+ * itself never becomes a plaintext oracle over encrypted content) keyed by
+ * finding_id, and `listFindings` filters against the index FIRST — an
+ * in-memory field compare, no decrypt — before touching storage at all.
+ * Only the (already-filtered, already-sorted) top of the match set is
+ * decrypted, bounded to the CALLER's own `limit` (capped at
+ * MAX_SCANNED_RECORDS so a caller cannot force unbounded decrypt work by
+ * passing an enormous limit — see that constant's derivation, pinned to
+ * anomaly-trigger's own QUERY_LIMIT so its 8-day baseline is never
+ * truncated). A record written by a PRIOR process (before this store
+ * instance existed) is covered too: `ensureIndex()` lazily backfills the
+ * index from storage on first use — see that method.
  */
-const MAX_SCANNED_RECORDS = 500;
+const MAX_SCANNED_RECORDS = 5000;
+// CROSS-FILE PIN: must be >= sentinel/sentinels/anomaly-trigger.ts's
+// QUERY_LIMIT (currently 5000) — anomaly-trigger asks for `limit: 5000` to
+// cover its full 8-day baseline window, and MAX_SCANNED_RECORDS is the
+// absolute ceiling `listFindings` will ever decrypt for ANY caller's
+// `limit`, including that one. If either constant changes, check the other.
+
+/**
+ * One entry of the in-memory finding index (see MAX_SCANNED_RECORDS above).
+ * Deliberately narrow: only the fields `listFindings`'s filters need,
+ * never the finding's `summary`/`details` — the index exists to avoid
+ * decrypting records that WON'T match, not to cache plaintext content.
+ */
+interface FindingIndexEntry {
+  severity: SentinelSeverity;
+  sentinel_id: string;
+  agent_id?: string;
+  observed_at: string;
+}
+
+/**
+ * Bound on the ONE-TIME lazy index backfill (`ensureIndex`, see
+ * MAX_SCANNED_RECORDS above) — a cost paid at most once per store instance
+ * lifetime (amortized across every subsequent `listFindings`/`saveFinding`
+ * call, never repeated per-request), not a per-call bound. 20000 = 4x
+ * MAX_TRACKED_FINDINGS's default (5000): generous headroom for that
+ * constant's documented soft-ceiling overshoot (a live record is never
+ * blind-evicted, so the store can temporarily exceed its own ceiling — see
+ * MAX_TRACKED_FINDINGS below) while still bounding the backfill to a
+ * constant instead of truly unbounded storage-namespace size.
+ */
+const MAX_INDEX_BACKFILL_RECORDS = 20_000;
 
 /**
  * CLASS-LEVEL guard: `pruneExpired()` fires once per fortress-unlock (see
@@ -152,6 +189,13 @@ export class SentinelFindingStore {
   private readonly maxTrackedFindings: number;
   private readonly maxScannedRecords: number;
   private readonly pruneScanCap: number;
+  // Filter-before-decrypt index (see MAX_SCANNED_RECORDS's doc). Populated
+  // incrementally on every saveFinding, and lazily backfilled ONCE from
+  // storage (`ensureIndex`) so records written by a PRIOR process instance
+  // are covered too.
+  private readonly index = new Map<string, FindingIndexEntry>();
+  private indexReady = false;
+  private indexBuildPromise: Promise<void> | null = null;
 
   constructor(opts: SentinelFindingStoreOptions) {
     this.storage = opts.storage;
@@ -166,6 +210,44 @@ export class SentinelFindingStore {
     this.maxTrackedFindings = opts.maxTrackedFindings ?? MAX_TRACKED_FINDINGS;
     this.maxScannedRecords = opts.maxScannedRecords ?? MAX_SCANNED_RECORDS;
     this.pruneScanCap = opts.pruneScanCap ?? PRUNE_SCAN_CAP;
+  }
+
+  /**
+   * Lazily build the filter index from storage, exactly ONCE per store
+   * instance lifetime (see MAX_SCANNED_RECORDS's doc +
+   * MAX_INDEX_BACKFILL_RECORDS's derivation). Concurrent callers share the
+   * same in-flight build via `indexBuildPromise` rather than each kicking
+   * off a redundant full scan.
+   */
+  private async ensureIndex(): Promise<void> {
+    if (this.indexReady) return;
+    if (!this.indexBuildPromise) {
+      this.indexBuildPromise = this.buildIndex();
+    }
+    await this.indexBuildPromise;
+  }
+
+  private async buildIndex(): Promise<void> {
+    const metas = await this.storage.list(
+      SENTINEL_FINDING_NAMESPACE,
+      SENTINEL_FINDING_KEY_PREFIX,
+    );
+    const bounded = metas.slice(0, MAX_INDEX_BACKFILL_RECORDS);
+    for (const meta of bounded) {
+      const id = stripKeyPrefix(meta.key);
+      if (id === null) continue;
+      const raw = await this.storage.read(SENTINEL_FINDING_NAMESPACE, meta.key);
+      if (!raw || raw.length > MAX_FINDING_BYTES) continue;
+      const finding = await this.decode(id, raw);
+      if (!finding) continue;
+      this.index.set(id, {
+        severity: finding.severity,
+        sentinel_id: finding.sentinel_id,
+        agent_id: finding.agent_id,
+        observed_at: finding.observed_at,
+      });
+    }
+    this.indexReady = true;
   }
 
   /**
@@ -207,6 +289,18 @@ export class SentinelFindingStore {
       await this.enforceTrackedFindingsCeiling(key);
     }
     await this.writeFinding(key, finding.finding_id, persisted);
+    // Keep the filter index current (see MAX_SCANNED_RECORDS's doc). Set
+    // unconditionally, INCLUDING before `ensureIndex()` has ever run for
+    // this instance — when the lazy backfill does run later it will read
+    // this same record from storage and overwrite with an identical entry,
+    // so ordering between "index updated here" and "index backfilled from
+    // storage" never matters.
+    this.index.set(truncated.finding_id, {
+      severity: truncated.severity,
+      sentinel_id: truncated.sentinel_id,
+      agent_id: truncated.agent_id,
+      observed_at: truncated.observed_at,
+    });
     return persisted.retention_until;
   }
 
@@ -287,6 +381,22 @@ export class SentinelFindingStore {
         const persisted = JSON.parse(bytesToString(plaintext)) as PersistedFinding;
         if (persisted.retention_until <= cutoff) {
           await this.storage.delete(SENTINEL_FINDING_NAMESPACE, meta.key);
+          this.index.delete(id);
+          // NEVER-SILENT-EVICTION (AGENTS.md rule 6/"never silently
+          // degrade"): the saturation branch above already audits the
+          // FAILURE case (no reclaimable record found); this is the
+          // SUCCESS case, which previously left no trace at all — an
+          // operator reading the audit log could not tell "the store
+          // reclaimed a genuinely expired record to make room" apart from
+          // "a write just silently happened to fit." Audit the reclamation
+          // too, so eviction of a store record is never silent either way.
+          void this.auditLog?.append(
+            "l2",
+            "finding_store_expired_record_reclaimed",
+            this.fortressId,
+            { finding_id: id, retention_until: persisted.retention_until },
+            "success",
+          );
           return true;
         }
       } catch {
@@ -316,11 +426,18 @@ export class SentinelFindingStore {
    * List findings, newest first. Optional filters: since (ISO 8601),
    * severity, sentinel_id, agent_id, limit. Default limit 100.
    *
-   * BOUNDED (register Z-HNY-02): decrypts at most MAX_SCANNED_RECORDS,
-   * newest-by-modified_at first — see that constant's derivation. The final
-   * sort/slice still runs over the (bounded) decoded set, so ordering
-   * within the scanned window is exactly `observed_at` descending, same as
-   * before this fix.
+   * FILTER-BEFORE-TRUNCATE (register Z-HNY-02 RECHECK — the class
+   * re-introduced by the first cut of this bound; see MAX_SCANNED_RECORDS's
+   * doc above for the full story). since/severity/sentinel_id/agent_id are
+   * matched against the in-memory INDEX first — a cheap field compare, no
+   * decrypt, no storage read — so a flood of recent NON-matching findings
+   * can never push an older MATCHING one out of view: the match set is
+   * computed over the WHOLE index, not a truncated recency window. Only
+   * the matched, newest-first set is then decrypted, and that decrypt work
+   * is bounded to `min(limit, MAX_SCANNED_RECORDS)` — the caller's own
+   * requested limit, capped so a caller cannot force unbounded decrypt work
+   * by requesting an enormous one (AGENTS.md rule 8(d), bounded work per
+   * request).
    */
   async listFindings(opts?: {
     since?: string;
@@ -329,33 +446,31 @@ export class SentinelFindingStore {
     agentId?: string;
     limit?: number;
   }): Promise<SentinelFinding[]> {
-    const metas = await this.storage.list(
-      SENTINEL_FINDING_NAMESPACE,
-      SENTINEL_FINDING_KEY_PREFIX,
-    );
-    const scanWindow = [...metas]
-      .sort((a, b) => (a.modified_at < b.modified_at ? 1 : -1))
-      .slice(0, this.maxScannedRecords);
+    await this.ensureIndex();
+
+    const matches: Array<[string, FindingIndexEntry]> = [];
+    for (const entry of this.index) {
+      const [, meta] = entry;
+      if (opts?.since && meta.observed_at < opts.since) continue;
+      if (opts?.severity && meta.severity !== opts.severity) continue;
+      if (opts?.sentinelId && meta.sentinel_id !== opts.sentinelId) continue;
+      if (opts?.agentId && meta.agent_id !== opts.agentId) continue;
+      matches.push(entry);
+    }
+    matches.sort((a, b) => (a[1].observed_at < b[1].observed_at ? 1 : -1));
+
+    const limit = opts?.limit ?? 100;
+    const decryptBound = Math.max(0, Math.min(limit, this.maxScannedRecords));
     const findings: SentinelFinding[] = [];
-    for (const meta of scanWindow) {
-      const id = stripKeyPrefix(meta.key);
-      if (id === null) continue;
-      const raw = await this.storage.read(
-        SENTINEL_FINDING_NAMESPACE,
-        meta.key,
-      );
+    for (const [id] of matches.slice(0, decryptBound)) {
+      const raw = await this.storage.read(SENTINEL_FINDING_NAMESPACE, findingKey(id));
       if (!raw) continue;
       if (raw.length > MAX_FINDING_BYTES) continue;
       const finding = await this.decode(id, raw);
       if (!finding) continue;
-      if (opts?.since && finding.observed_at < opts.since) continue;
-      if (opts?.severity && finding.severity !== opts.severity) continue;
-      if (opts?.sentinelId && finding.sentinel_id !== opts.sentinelId) continue;
-      if (opts?.agentId && finding.agent_id !== opts.agentId) continue;
       findings.push(finding);
     }
     findings.sort((a, b) => (a.observed_at < b.observed_at ? 1 : -1));
-    const limit = opts?.limit ?? 100;
     return findings.slice(0, limit);
   }
 
@@ -394,6 +509,7 @@ export class SentinelFindingStore {
         ) as PersistedFinding;
         if (persisted.retention_until <= cutoff) {
           await this.storage.delete(SENTINEL_FINDING_NAMESPACE, meta.key);
+          this.index.delete(id);
           pruned += 1;
         }
       } catch {

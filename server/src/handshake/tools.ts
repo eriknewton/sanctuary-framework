@@ -74,6 +74,24 @@ import type {
 export const MAX_HANDSHAKE_SESSIONS = 500;
 
 /**
+ * Per-origin quota for `sessions` (AGENTS.md rule 8 RECHECK): the ORIGIN of
+ * a session is the LOCAL identity that owns it (`our_shr.body.instance_id` —
+ * a fortress can hold multiple local identities, and `handshake_initiate` /
+ * `handshake_respond` both take an `identity_id` argument selecting which
+ * one). Without this, a caller driving 500 `handshake_initiate` calls
+ * through ONE local identity could fill the entire global cap and evict
+ * every OTHER identity's in-flight session too (the eviction policy below
+ * is unconditional oldest-evict). With this, that same flood exhausts only
+ * its OWN identity's quota and is REFUSED — never evicts another identity's
+ * session — leaving the other identities' headroom untouched. 50 = 1/10th
+ * of MAX_HANDSHAKE_SESSIONS: generous for legitimate concurrent in-flight
+ * handshakes on one identity, while guaranteeing at least 10 distinct local
+ * identities can be mid-handshake at once before any single one could even
+ * begin to threaten the global ceiling.
+ */
+export const MAX_HANDSHAKE_SESSIONS_PER_ORIGIN = 50;
+
+/**
  * `handshakeResults` cap — shared with L4 tier resolution, federation
  * registration, and the dashboard. BOUNDED (register LD2-03): every
  * `handshake_exchange` call from an externally minted keypair adds a
@@ -88,11 +106,41 @@ export const MAX_HANDSHAKE_SESSIONS = 500;
  */
 export const MAX_HANDSHAKE_RESULTS = 1000;
 
+/**
+ * Per-origin quota for `handshakeResults` (AGENTS.md rule 8 RECHECK): the
+ * ORIGIN of a result is the LOCAL identity that recorded it (the
+ * `auditIdentityId` already threaded into `recordHandshakeResult` below —
+ * `session.our_shr.body.instance_id` for the 4-step protocol,
+ * `ourSHR.body.instance_id` for `handshake_exchange`). Without this, feeding
+ * one local identity a stream of attacker-controlled counterparty SHRs
+ * could fill the entire global cap and — once every slot holds a verified
+ * entry — permanently refuse recording for every OTHER identity too. With
+ * this, that flood exhausts only the flooded identity's own quota and is
+ * REFUSED there; a different identity's headroom is untouched. 100 = 1/10th
+ * of MAX_HANDSHAKE_RESULTS, matching MAX_HANDSHAKE_SESSIONS_PER_ORIGIN's
+ * ratio: generous per-identity headroom, guarantees at least 10 distinct
+ * local identities' worth of results fit before any one identity could
+ * threaten the shared ceiling.
+ */
+export const MAX_HANDSHAKE_RESULTS_PER_ORIGIN = 100;
+
 export interface HandshakeToolsOptions {
   /** If true, auto-publishes handshake attestations to Verascore after handshake_respond. */
   autoPublishHandshakes?: boolean;
   /** Verascore base URL to publish to. */
   verascoreUrl?: string;
+  /**
+   * Test-only override: SHR validity duration in ms, threaded into every
+   * `generateSHR` call this closure makes (mirrors the
+   * `maxTrackedFindings`-style test override pattern in
+   * sentinel-finding-store.ts). Production call sites never set this
+   * (defaults to shr/generator.ts's `DEFAULT_VALIDITY_MS`, one hour); it
+   * exists so a test can produce a quickly-EXPIRING verified handshake
+   * result without waiting a real hour, to exercise the expires_at-aware
+   * `handshakeResults` eviction path end-to-end through the real tool
+   * handlers rather than only at the BoundedMap unit level.
+   */
+  shrValidityMs?: number;
 }
 
 export function createHandshakeTools(
@@ -110,22 +158,40 @@ export function createHandshakeTools(
   // enforces this at every consumer call site; a consumer that needs to
   // mutate the map is a design error, not a cast to work around.
   handshakeResults: ReadonlyMap<string, HandshakeResult>;
+  // Per-origin accounting (AGENTS.md rule 8 RECHECK): counterparty_id ->
+  // the LOCAL identity id that recorded that entry. Federation registration
+  // reads this to attribute a peer to the local identity whose quota it
+  // should count against (see MAX_FEDERATION_PEERS_PER_ORIGIN in
+  // federation/registry.ts) — `HandshakeResult` itself carries no field for
+  // "which local identity recorded me," so this is the one place that
+  // information exists.
+  handshakeResultOrigins: ReadonlyMap<string, string>;
 } {
   const autoPublishHandshakes = options?.autoPublishHandshakes ?? false;
   const verascoreUrl = options?.verascoreUrl ?? "https://verascore.ai";
   const identityEncKey = derivePurposeKey(masterKey, "identity-encryption");
 
-  // In-memory session store (per server instance lifetime). Eviction policy:
-  // drop the OLDEST session (first in Map insertion order — sessions are
-  // only ever newly inserted, never re-inserted under the same key, so
-  // insertion order tracks creation order) to admit a new one. This is safe
-  // to do unconditionally: an evicted in-flight session simply fails its
-  // next step with "No handshake session found," identical to what already
-  // happens once its TTL expires — no trust state is lost, because a session
-  // carries no trust until `recordHandshakeResult` writes it into
-  // `handshakeResults`. See MAX_HANDSHAKE_SESSIONS above for the cap.
+  // In-memory session store (per server instance lifetime). Eviction policy
+  // (reached only when the GLOBAL cap is hit and the incoming session's own
+  // identity is still within MAX_HANDSHAKE_SESSIONS_PER_ORIGIN — see the
+  // per-origin refusal path in BoundedMap.set(), which runs first): drop the
+  // OLDEST session (first in Map insertion order — sessions are only ever
+  // newly inserted, never re-inserted under the same key, so insertion
+  // order tracks creation order) to admit a new one. This is safe to do
+  // unconditionally: an evicted in-flight session simply fails its next
+  // step with "No handshake session found," identical to what already
+  // happens once its TTL expires — no trust state is lost, because a
+  // session carries no trust until `recordHandshakeResult` writes it into
+  // `handshakeResults`. This residual global-cap eviction can still cross
+  // identities when pressure is spread thin across MANY distinct
+  // identities each within their own quota — disclosed and accepted
+  // (SOUND-WITH-FIXES gate review, target 1): the property this guards is
+  // "one identity's OWN flood cannot evict another identity," not "the
+  // global cap can never be reached by legitimate multi-identity load."
+  // See MAX_HANDSHAKE_SESSIONS / MAX_HANDSHAKE_SESSIONS_PER_ORIGIN above.
   const sessions = new BoundedMap<string, HandshakeSession>({
     maxSize: MAX_HANDSHAKE_SESSIONS,
+    maxPerOrigin: MAX_HANDSHAKE_SESSIONS_PER_ORIGIN,
     selectEviction: (entries) => {
       const oldest = entries.keys().next();
       // entries is non-empty whenever selectEviction runs (set() only
@@ -140,7 +206,56 @@ export function createHandshakeTools(
         reason: "capacity",
       });
     },
+    // No onRefuse here: `handshake_initiate` / `handshake_respond` below
+    // already inspect `sessions.set()`'s return value and audit the
+    // domain-specific reason (origin-quota vs global-capacity) themselves
+    // with the identity that was refused — a second, BoundedMap-generic
+    // audit entry here would just duplicate that with less context.
   });
+
+  const SESSION_ORIGIN_QUOTA_ERROR =
+    "This identity has too many in-flight handshake sessions " +
+    `(limit ${MAX_HANDSHAKE_SESSIONS_PER_ORIGIN}). Complete or abort an ` +
+    "existing session before starting a new one.";
+  const SESSIONS_SATURATED_ERROR =
+    "Handshake session store is at capacity; cannot start a new session " +
+    "until an existing one completes, expires, or is aborted.";
+
+  /**
+   * Shared insert path for BOTH `handshake_initiate` and `handshake_respond`
+   * (register LD2-03 / rule 8 RECHECK — every `sessions.set(...)` in this
+   * file funnels through here, mirroring recordHandshakeResult's role for
+   * `handshakeResults`, so the origin-quota-vs-capacity distinction and its
+   * audit trail are written once, not duplicated per call site). `originId`
+   * is the LOCAL identity's own instance_id (`shr.body.instance_id`) — see
+   * MAX_HANDSHAKE_SESSIONS_PER_ORIGIN's doc for why that, not the remote
+   * caller, is the right accounting key for this store.
+   */
+  function insertSession(
+    session: HandshakeSession,
+    originId: string
+  ): { ok: true } | { ok: false; error: string; reason: HandshakeFailureReason } {
+    const originQuotaExceeded =
+      sessions.originSize(originId) >= MAX_HANDSHAKE_SESSIONS_PER_ORIGIN;
+    const inserted = sessions.set(session.session_id, session, originId);
+    if (!inserted) {
+      const reason: HandshakeFailureReason = originQuotaExceeded
+        ? "handshake_session_origin_quota_exceeded"
+        : "handshake_session_store_saturated";
+      const error = originQuotaExceeded
+        ? SESSION_ORIGIN_QUOTA_ERROR
+        : SESSIONS_SATURATED_ERROR;
+      void auditLog.append(
+        "l4",
+        reason,
+        originId,
+        { session_id: session.session_id },
+        "failure"
+      );
+      return { ok: false, error, reason };
+    }
+    return { ok: true };
+  }
 
   // Completed handshake results indexed by counterparty ID — shared with L4
   // tier resolution, federation registration, and the dashboard. Kept as a
@@ -149,28 +264,55 @@ export function createHandshakeTools(
   // widens it to ReadonlyMap for every external consumer. See
   // MAX_HANDSHAKE_RESULTS above for the cap.
   //
-  // Eviction policy: evict the oldest entry that is NOT both verified AND
-  // liveness_proven (a preview, or a failed/expired-tier entry) to admit a
-  // new one; a genuinely verified && liveness_proven entry is NEVER evicted
-  // — see recordHandshakeResult, which refuses the insert instead when no
-  // unverified entry exists to make room. A full 4-step handshake IS
-  // attacker-reachable too (the counterparty side is whatever process holds
-  // the minted key, which the attacker controls end-to-end), so "only evict
-  // previews" is not a loophole an attacker can route around by completing
-  // the liveness proof; it just costs them a real round trip, and once the
-  // map is saturated with verified entries the fortress fails closed
-  // (refuses new entries) rather than flushing an established peer's trust
-  // state — the same fail-closed trade-off federation/registry.ts makes for
-  // active peers.
+  // Eviction policy: evict the oldest entry that is NOT a currently-live
+  // verified peer to admit a new one — "currently-live verified" means
+  // verified && liveness_proven && NOT PAST ITS OWN expires_at. A genuinely
+  // live verified entry is NEVER evicted — see recordHandshakeResult, which
+  // refuses the insert instead when no evictable entry exists to make room.
+  // A full 4-step handshake IS attacker-reachable too (the counterparty
+  // side is whatever process holds the minted key, which the attacker
+  // controls end-to-end), so "prefer evicting previews/expired entries" is
+  // not a loophole an attacker can route around by completing the liveness
+  // proof; it just costs them a real round trip, and once the map is
+  // saturated with entries that are ALL still live-verified, the fortress
+  // fails closed (refuses new entries) rather than flushing an established
+  // peer's trust state — the same fail-closed trade-off federation/registry.ts
+  // makes for active peers.
+  //
+  // The `expires_at` check is load-bearing, not cosmetic (post-gate fix,
+  // MEDIUM #1): without it, a verified+live entry that has since EXPIRED
+  // was still treated as permanently unevictable, and nothing else ever
+  // prunes `handshakeResults` (unlike `sessions`, which is TTL-swept every
+  // handler call). An attacker who completes MAX_HANDSHAKE_RESULTS real
+  // handshakes therefore permanently wedged the map — refusing every future
+  // insert for the server's LIFETIME, long after every one of those entries
+  // had expired. This selector is symmetric with
+  // federation/registry.ts's `isPeerCurrentlyActive`-gated eviction now:
+  // both roll off an expired verified entry to admit a new one, and both
+  // refuse ONLY when every slot holds an entry that is verified, live, AND
+  // still unexpired.
+  const isHandshakeResultCurrentlyLive = (
+    value: HandshakeResult,
+    now: Date
+  ): boolean =>
+    value.verified && value.liveness_proven && new Date(value.expires_at) > now;
+
   const HANDSHAKE_RESULTS_SATURATED_ERROR =
     "Handshake result store is at capacity and every entry is a verified, " +
-    "live peer; cannot record a new handshake result until one expires or " +
-    "is superseded.";
+    "live, unexpired peer; cannot record a new handshake result until one " +
+    "expires or is superseded.";
+  const HANDSHAKE_RESULTS_ORIGIN_QUOTA_ERROR =
+    "This identity has recorded too many handshake results " +
+    `(limit ${MAX_HANDSHAKE_RESULTS_PER_ORIGIN}). This bounds one identity's ` +
+    "share of the shared handshake-results store so it cannot exhaust the " +
+    "space every identity draws from.";
   const handshakeResults = new BoundedMap<string, HandshakeResult>({
     maxSize: MAX_HANDSHAKE_RESULTS,
+    maxPerOrigin: MAX_HANDSHAKE_RESULTS_PER_ORIGIN,
     selectEviction: (entries) => {
+      const now = new Date();
       for (const [key, value] of entries) {
-        if (!value.verified || !value.liveness_proven) {
+        if (!isHandshakeResultCurrentlyLive(value, now)) {
           return { evict: key };
         }
       }
@@ -181,15 +323,22 @@ export function createHandshakeTools(
         counterparty_id: evictedCounterpartyId,
         verified: evictedResult.verified,
         liveness_proven: evictedResult.liveness_proven,
+        expired: new Date(evictedResult.expires_at) <= new Date(),
         reason: "capacity",
       });
     },
+    // No onRefuse here: recordHandshakeResult below distinguishes
+    // origin-quota from global-capacity refusal itself (it can cheaply
+    // pre-check `originSize` before calling `set()`) and audits with the
+    // richer domain context (counterparty_id, the identity refused) — see
+    // that function.
   });
 
   const shrOpts: SHRGeneratorOptions = {
     config,
     identityManager,
     masterKey,
+    validityMs: options?.shrValidityMs,
   };
 
   const SELF_VOUCH_ERROR =
@@ -296,20 +445,34 @@ export function createHandshakeTools(
       );
       return { ok: false, error: SELF_VOUCH_ERROR, reason: "self_vouch_local_did" };
     }
-    const inserted = handshakeResults.set(result.counterparty_id, result);
+    // Pre-check which refusal reason applies BEFORE calling set() (the same
+    // condition BoundedMap checks internally) purely for audit/error-message
+    // richness — set() itself only returns a boolean, and the two refusal
+    // reasons need different operator-facing text (rule 8: a flooding
+    // origin's OWN quota is a very different situation from the whole store
+    // being genuinely saturated with live peers).
+    const originQuotaExceeded =
+      handshakeResults.originSize(auditIdentityId) >= MAX_HANDSHAKE_RESULTS_PER_ORIGIN;
+    const inserted = handshakeResults.set(
+      result.counterparty_id,
+      result,
+      auditIdentityId
+    );
     if (!inserted) {
+      const reason: HandshakeFailureReason = originQuotaExceeded
+        ? "handshake_results_origin_quota_exceeded"
+        : "handshake_results_saturated";
+      const error = originQuotaExceeded
+        ? HANDSHAKE_RESULTS_ORIGIN_QUOTA_ERROR
+        : HANDSHAKE_RESULTS_SATURATED_ERROR;
       void auditLog.append(
         "l4",
-        "handshake_results_saturated",
+        reason,
         auditIdentityId,
         { counterparty_id: result.counterparty_id },
         "failure"
       );
-      return {
-        ok: false,
-        error: HANDSHAKE_RESULTS_SATURATED_ERROR,
-        reason: "handshake_results_saturated",
-      };
+      return { ok: false, error, reason };
     }
     return { ok: true };
   }
@@ -361,7 +524,17 @@ export function createHandshakeTools(
         }
 
         const { challenge, session } = initiateHandshake(shr);
-        sessions.set(session.session_id, session);
+        const insertResult = insertSession(session, shr.body.instance_id);
+        if (!insertResult.ok) {
+          auditHandshakeFailed(auditLog, {
+            session_id: session.session_id,
+            role: "initiator",
+            identity_id: shr.body.instance_id,
+            reason: insertResult.reason,
+            error: insertResult.error,
+          });
+          return toolResult({ error: insertResult.error });
+        }
 
         void auditLog.append("l4", "handshake_initiate", shr.body.instance_id);
         auditHandshakeInitiated(auditLog, {
@@ -451,7 +624,19 @@ export function createHandshakeTools(
           return toolResult({ error: result.error });
         }
 
-        sessions.set(result.session.session_id, result.session);
+        const insertResult = insertSession(result.session, shr.body.instance_id);
+        if (!insertResult.ok) {
+          void auditLog.append("l4", "handshake_respond", shr.body.instance_id, undefined, "failure");
+          auditHandshakeFailed(auditLog, {
+            session_id: result.session.session_id,
+            role: "responder",
+            identity_id: shr.body.instance_id,
+            counterparty_id: challenge.shr.body.instance_id,
+            reason: insertResult.reason,
+            error: insertResult.error,
+          });
+          return toolResult({ error: insertResult.error });
+        }
 
         void auditLog.append("l4", "handshake_respond", shr.body.instance_id);
         auditHandshakeInitiated(auditLog, {
@@ -889,7 +1074,15 @@ export function createHandshakeTools(
           return toolResult({ error: attestation.error });
         }
 
-        // 4. Store as a handshake result for tier resolution.
+        // 4. Store as a handshake result for tier resolution. Captures the
+        // FAIL-LOUD recording outcome (register §Z RECHECK) for the
+        // `verification.recorded` / `record_error` response fields below —
+        // see recordHandshakeResult's doc for why a refusal here must be
+        // surfaced, never silently dropped.
+        let recordResult:
+          | { ok: true }
+          | { ok: false; error: string; reason: HandshakeFailureReason }
+          | undefined;
         //
         // HS-1 / HS-2 fix: handshake_exchange is a STRUCTURAL PREVIEW ONLY.
         // It performs no nonce challenge-response, so it proves neither
@@ -922,7 +1115,17 @@ export function createHandshakeTools(
             // recordHandshakeResult() every other write site uses, so a
             // future consumer of this map never has to special-case
             // "preview" entries differently from "completed" ones.
-            recordHandshakeResult(
+            //
+            // FAIL-LOUD (register §Z RECHECK): earlier code discarded this
+            // call's return value, so a self-vouch or bounded-collection
+            // refusal here was invisible to the caller — the tool still
+            // reported an apparently-successful preview even though nothing
+            // was recorded. Capture it and surface it on the response below;
+            // the attestation itself is still valid and still returned
+            // (recording is a caching side effect for future tier
+            // resolution, not the attestation's own correctness), so this is
+            // additive honesty, not a new failure mode for the tool call.
+            recordResult = recordHandshakeResult(
               {
                 counterparty_id: verificationResult.counterparty_id,
                 counterparty_shr: counterpartySHR,
@@ -952,6 +1155,16 @@ export function createHandshakeTools(
             trust_tier: "unverified",
             errors: verificationResult.errors,
             warnings: verificationResult.warnings,
+            // FAIL-LOUD: whether this preview was actually cached into
+            // handshakeResults for future tier resolution. `false` with
+            // `record_error` set means the preview is valid but was NOT
+            // recorded (self-vouch or a bounded-collection refusal) — the
+            // caller must not assume a future federation/tier lookup will
+            // see this counterparty.
+            recorded: recordResult?.ok ?? true,
+            ...(recordResult && !recordResult.ok
+              ? { record_error: recordResult.error }
+              : {}),
           },
           instructions:
             "STRUCTURAL CHECK ONLY — counterparty liveness is NOT proven, so this " +
@@ -1065,7 +1278,11 @@ export function createHandshakeTools(
     },
   ];
 
-  return { tools, handshakeResults: handshakeResults.asReadonlyMap() };
+  return {
+    tools,
+    handshakeResults: handshakeResults.asReadonlyMap(),
+    handshakeResultOrigins: handshakeResults.originsView(),
+  };
 }
 
 /**
