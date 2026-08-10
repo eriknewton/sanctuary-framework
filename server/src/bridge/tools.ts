@@ -569,7 +569,10 @@ export function createBridgeTools(
         // REP-01: the signer (identity.did) is a LOCAL identity; cap it at
         // self-attested (a handshake-map match for a local signer is a
         // self-vouch). Passing exactly the signer DID is race-free. The storage
-        // chokepoint (trustedSovereigntyTier) enforces the same cap at scoring.
+        // chokepoint (trustedSovereigntyTier, A11 — now an UNCONDITIONAL
+        // clamp) enforces the same cap at scoring for every record, including
+        // a pre-fix laundered record or a direct ReputationStore.record()
+        // caller that bypasses this tool.
         const tierMeta: TierMetadata = resolveTierByDid(
           identity.did,
           hsResults,

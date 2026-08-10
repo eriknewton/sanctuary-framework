@@ -157,7 +157,11 @@ export function respondToHandshake(
   // agent mint a verified handshake entry for its OWN DID and then have the
   // reputation weighting credit its own attestations at full signer tier
   // (credibility laundering — see reputation/tiers.ts). Rejecting here means a
-  // self-initiated challenge never advances to a response.
+  // self-initiated challenge never advances to a response. Only the
+  // IDENTICAL-key case; two distinct locally-held keys are caught earlier
+  // still, at the tool boundary in handshake/tools.ts (the isLocallyHeldDid
+  // check ahead of this call), and again at the recordHandshakeResult
+  // chokepoint if that earlier check is ever bypassed.
   if (sameSigningKey(ourSHR.signed_by, challenge.shr.signed_by)) {
     return { error: "Self-handshake rejected: an identity cannot verify itself" };
   }
@@ -236,6 +240,13 @@ export function completeHandshake(
   // the "verification" is self-referential and would launder the agent's own
   // attestations up to full signer tier. See respondToHandshake for the full
   // rationale.
+  //
+  // This only catches the IDENTICAL-key case. Two DISTINCT locally-held keys
+  // (identity A handshaking identity B, both held by the same fortress) pass
+  // this check and are caught one layer up, at the RECORDING boundary: see
+  // recordHandshakeResult in handshake/tools.ts, which every
+  // handshakeResults.set() call funnels through (register §Z RECHECK /
+  // LD2-02).
   if (sameSigningKey(session.our_shr.signed_by, response.shr.signed_by)) {
     return { error: "Self-handshake rejected: an identity cannot verify itself" };
   }
@@ -349,6 +360,9 @@ export function verifyCompletion(
   // same principal; a self-referential "verification" would launder the agent's
   // own attestations up to full signer tier (see respondToHandshake). Fail
   // closed to an unverified result, exactly as an invalid nonce signature does.
+  // Only the IDENTICAL-key case; the distinct-locally-held-keys case is caught
+  // at the recordHandshakeResult chokepoint in handshake/tools.ts before this
+  // result is ever written into the shared handshake map.
   if (sameSigningKey(session.our_shr.signed_by, session.their_shr.signed_by)) {
     return {
       counterparty_id: session.their_shr.body.instance_id,

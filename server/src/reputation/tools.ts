@@ -271,8 +271,11 @@ export function createReputationTools(
         // credibility cannot come from this instance's own handshake map (a match
         // there is a self-vouch). Cap it at self-attested. Passing exactly the
         // signer DID is race-free vs a snapshot of identityManager.list() (no
-        // rotation window). The storage chokepoint (trustedSovereigntyTier)
-        // enforces the same cap at scoring for existing/other-caller records.
+        // rotation window). The storage chokepoint (trustedSovereigntyTier,
+        // A11 — now an UNCONDITIONAL clamp) enforces the same cap at scoring
+        // for every record regardless of caller, closing the residual this
+        // record-time cap alone could not: a pre-fix laundered record, or a
+        // direct ReputationStore.record() caller that bypasses this tool.
         const tierMeta = resolveTierByDid(
           identity.did,
           hsResults,

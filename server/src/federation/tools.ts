@@ -12,13 +12,21 @@ import type { ToolDefinition } from "../router.js";
 import { toolResult } from "../router.js";
 import type { AuditLog } from "../operational/audit-log.js";
 import type { HandshakeResult } from "../handshake/types.js";
+import type { IdentityManager } from "../cognitive/tools.js";
 import { publicKeyToDid } from "../core/identity.js";
 import { fromBase64url } from "../core/encoding.js";
 import { FederationRegistry } from "./registry.js";
 
 export function createFederationTools(
   auditLog: AuditLog,
-  handshakeResults: Map<string, HandshakeResult>
+  handshakeResults: Map<string, HandshakeResult>,
+  // Optional (defense-in-depth): when supplied, register-time refuses a peer
+  // this fortress holds keys for, independent of the shared producer
+  // chokepoint (recordHandshakeResult in handshake/tools.ts) that already
+  // keeps `handshakeResults` free of such entries. Production wiring
+  // (index.ts) always supplies it; tests that construct handshakeResults
+  // directly (not through the real handshake tools) may omit it.
+  identityManager?: IdentityManager
 ): { tools: ToolDefinition[]; registry: FederationRegistry } {
   const registry = new FederationRegistry();
 
@@ -29,8 +37,8 @@ export function createFederationTools(
       name: "federation_peers",
       description:
         "List known federation peers, register a peer from a completed handshake, " +
-        "or remove a peer. Every peer MUST enter through a verified handshake — " +
-        "no self-registration allowed.",
+        "or remove a peer. Every peer MUST enter through a verified handshake " +
+        "with a counterparty this fortress does not hold keys for.",
       inputSchema: {
         type: "object",
         properties: {
@@ -150,6 +158,31 @@ export function createFederationTools(
             }
 
             const peerDid = derivedDid;
+
+            // Class-level self-vouch guard, defense-in-depth (register §Z
+            // RECHECK / LD2-02): the shared producer chokepoint
+            // (recordHandshakeResult in handshake/tools.ts) already refuses
+            // to record a handshake result for a counterparty this fortress
+            // holds keys for, so hsResult should never exist for a
+            // self-vouched pair. This is a SECOND, independent check at the
+            // registration boundary, reading identityManager.list() directly
+            // rather than trusting that every past or future write into
+            // `handshakeResults` routed through that chokepoint. Federation
+            // must never trust a peer this fortress holds the private key
+            // for, regardless of how its handshake entry arrived.
+            if (identityManager?.list().some((id) => id.did === peerDid)) {
+              void auditLog.append(
+                "l4",
+                "federation_peer_register_self_vouch_blocked",
+                "system",
+                { peer_id: peerId, peer_did: peerDid },
+                "failure"
+              );
+              return toolResult({
+                error:
+                  "Cannot register a federation peer this fortress holds keys for.",
+              });
+            }
 
             const peer = registry.registerFromHandshake(hsResult, peerDid);
 

@@ -208,9 +208,17 @@ describe("M2: handshake_exchange can never produce a verified peer", () => {
       agent.auditLog
     );
 
-    // A genuinely valid, captured SHR (e.g. recorded from a real agent) is
-    // replayed. With no nonce/liveness, it must not confer trust.
-    const capturedValid = shrFor(agent);
+    // A genuinely valid, captured SHR from a DIFFERENT party (e.g. recorded
+    // from a real remote agent) is replayed. With no nonce/liveness, it must
+    // not confer trust. Uses a SEPARATE victim identity/fortress — not
+    // `agent`'s own SHR — because `agent` replaying its own SHR against
+    // itself is the self-vouch case the class-level chokepoint
+    // (recordHandshakeResult) now refuses outright (see the self-vouch
+    // describe block below); that is a different assertion than "captured
+    // remote SHR, no liveness".
+    const victim = makeAgent();
+    await createIdentityFor(victim);
+    const capturedValid = shrFor(victim);
     const exchange = tools.find((t) => t.name === "handshake_exchange")!;
     const out = parse(await exchange.handler({ counterparty_shr: capturedValid }));
 
