@@ -48,6 +48,7 @@ export const TOP_LEVEL_SUBCOMMANDS = [
   "task",
   "template",
   "transparency",
+  "uninstall",
   "verify-exit-bundle",
   "verify-transparency",
   "wrap",
