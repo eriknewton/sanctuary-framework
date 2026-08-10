@@ -63,7 +63,14 @@ export interface ToolCallTrapStats {
   activations: ToolCallInvocation[];
 }
 
-const FOLLOW_UP_WINDOW_MS = 5 * 60 * 1000;
+// 5 minutes is the product follow-up window already emitted in findings and audit.
+export const FOLLOW_UP_WINDOW_MS = 5 * 60 * 1000;
+// 128 retained activations allows four fully capped callers in one 5-minute window.
+export const MAX_RETAINED_ACTIVATIONS_PER_TRAP = 128;
+// 32 activations per caller preserves a burst of probes while bounding one caller.
+export const MAX_ACTIVATIONS_PER_CALLER_PER_TRAP = 32;
+// 16 follow-ups captures a realistic post-probe sequence without NxM audit growth.
+export const MAX_FOLLOW_UP_TOOL_CALLS_PER_ACTIVATION = 16;
 
 export class ToolCallTrapRuntime {
   private readonly registry: TrapRegistry;
@@ -103,6 +110,9 @@ export class ToolCallTrapRuntime {
     args: Record<string, unknown>,
     callerIdentity: string,
   ): Promise<{ handled: false } | { handled: true; response: unknown }> {
+    const now = this.now();
+    this.pruneExpiredActivations(now);
+
     const spec = this.toolCallSpecs().find(
       (candidate) => candidate.trigger.fake_tool_name === toolName,
     );
@@ -113,7 +123,6 @@ export class ToolCallTrapRuntime {
       return { handled: false };
     }
 
-    const now = this.now();
     const argHash = hashJson(args);
     const findingId = randomUUID();
     const invocation: ToolCallInvocation = {
@@ -128,10 +137,6 @@ export class ToolCallTrapRuntime {
       response_plausibility: "operator_configured_fake_response",
       follow_up_tool_calls: [],
     };
-    const list = this.activations.get(spec.trap_id) ?? [];
-    list.push(invocation);
-    this.activations.set(spec.trap_id, list);
-
     const finding: SentinelFinding = {
       finding_id: findingId,
       sentinel_id: honeypotSentinelId(spec.trap_id),
@@ -153,22 +158,37 @@ export class ToolCallTrapRuntime {
       evidence_audit_ids: [],
       fortress_id: this.fortressId,
     };
-    await this.findingStore.saveFinding(finding).catch(() => undefined);
-    void this.auditLog.append("l2", HONEYPOT_AUDIT_OPS.TRIGGERED, this.operatorId, {
-      fortress_id: this.fortressId,
-      trap_id: spec.trap_id,
-      trap_class: spec.trap_class,
-      fake_tool_name: trigger.fake_tool_name,
-      caller_identity: callerIdentity,
-      invocation_args: args,
-      arg_hash: argHash,
-      finding_id: findingId,
-      severity: spec.finding_severity,
-      response_plausibility: invocation.response_plausibility,
-      fake_response_hash: hashJson(trigger.fake_response),
-      follow_up_window_ms: FOLLOW_UP_WINDOW_MS,
-      follow_up_tool_calls: [],
-    });
+    // Persist the finding and trigger audit BEFORE retaining the activation, so a
+    // retained correlation-buffer entry always has a durable record behind it.
+    // invokeIfTrap runs pre-gate and uncaught in the router (router.ts CallTool
+    // handler has no try/catch around this call), so a raw persistence error must
+    // never propagate here: it would leak an internal error to the agent (no-leak
+    // invariant) and break the honeypot's stealth. On failure, skip retention
+    // (preserving "retained implies persisted") and still return the fake response.
+    let persisted = false;
+    try {
+      await this.findingStore.saveFinding(finding);
+      await this.auditLog.append("l2", HONEYPOT_AUDIT_OPS.TRIGGERED, this.operatorId, {
+        fortress_id: this.fortressId,
+        trap_id: spec.trap_id,
+        trap_class: spec.trap_class,
+        fake_tool_name: trigger.fake_tool_name,
+        caller_identity: callerIdentity,
+        invocation_args: args,
+        arg_hash: argHash,
+        finding_id: findingId,
+        severity: spec.finding_severity,
+        response_plausibility: invocation.response_plausibility,
+        fake_response_hash: hashJson(trigger.fake_response),
+        follow_up_window_ms: FOLLOW_UP_WINDOW_MS,
+        follow_up_tool_calls: [],
+      });
+      persisted = true;
+    } catch {
+      // Persistence failed. Do not retain an unpersisted activation; stay stealthy
+      // and fail safe rather than surface the error on the pre-gate path.
+    }
+    if (persisted) this.retainActivation(spec.trap_id, invocation);
 
     return { handled: true, response: trigger.fake_response };
   }
@@ -179,11 +199,19 @@ export class ToolCallTrapRuntime {
     callerIdentity: string,
   ): void {
     const now = this.now();
+    this.pruneExpiredActivations(now);
+
     for (const [trapId, invocations] of this.activations.entries()) {
       for (const activation of invocations) {
         if (activation.caller_identity !== callerIdentity) continue;
         const delta = now.getTime() - Date.parse(activation.invoked_at);
         if (delta < 0 || delta > FOLLOW_UP_WINDOW_MS) continue;
+        if (
+          activation.follow_up_tool_calls.length >=
+          MAX_FOLLOW_UP_TOOL_CALLS_PER_ACTIVATION
+        ) {
+          continue;
+        }
         const followUp: ToolCallFollowUp = {
           tool_name: toolName,
           caller_identity: callerIdentity,
@@ -205,6 +233,10 @@ export class ToolCallTrapRuntime {
             args_hash: followUp.args_hash,
             activation_at: activation.invoked_at,
             called_at: followUp.called_at,
+            follow_up_count: activation.follow_up_tool_calls.length,
+            follow_up_cap_reached:
+              activation.follow_up_tool_calls.length ===
+              MAX_FOLLOW_UP_TOOL_CALLS_PER_ACTIVATION,
           },
         );
       }
@@ -212,6 +244,8 @@ export class ToolCallTrapRuntime {
   }
 
   stats(): ToolCallTrapStats[] {
+    this.pruneExpiredActivations(this.now());
+
     return this.toolCallSpecs().map((spec) => {
       const trigger = spec.trigger;
       const activations = [...(this.activations.get(spec.trap_id) ?? [])];
@@ -242,6 +276,48 @@ export class ToolCallTrapRuntime {
         (spec): spec is TrapSpec & { trigger: ToolCallTrigger } =>
           spec.trigger.kind === "tool_call",
       );
+  }
+
+  private retainActivation(trapId: string, invocation: ToolCallInvocation): void {
+    const list = this.activations.get(trapId) ?? [];
+    list.push(invocation);
+    this.activations.set(trapId, this.capActivations(list));
+  }
+
+  private pruneExpiredActivations(now: Date): void {
+    for (const [trapId, invocations] of this.activations.entries()) {
+      const nowMs = now.getTime();
+      const active = invocations.filter((activation) => {
+        const invokedMs = Date.parse(activation.invoked_at);
+        if (!Number.isFinite(invokedMs)) return false;
+        return nowMs - invokedMs <= FOLLOW_UP_WINDOW_MS;
+      });
+      // The finding and trigger audit are persisted before retention, so evicting
+      // an expired correlation buffer entry loses no security signal.
+      const capped = this.capActivations(active);
+      if (capped.length === 0) {
+        this.activations.delete(trapId);
+      } else {
+        this.activations.set(trapId, capped);
+      }
+    }
+  }
+
+  private capActivations(invocations: ToolCallInvocation[]): ToolCallInvocation[] {
+    const perCallerCounts = new Map<string, number>();
+    const callerCapped: ToolCallInvocation[] = [];
+    for (let i = invocations.length - 1; i >= 0; i -= 1) {
+      const activation = invocations[i]!;
+      const count = perCallerCounts.get(activation.caller_identity) ?? 0;
+      if (count >= MAX_ACTIVATIONS_PER_CALLER_PER_TRAP) continue;
+      perCallerCounts.set(activation.caller_identity, count + 1);
+      callerCapped.push(activation);
+    }
+    callerCapped.reverse();
+    if (callerCapped.length <= MAX_RETAINED_ACTIVATIONS_PER_TRAP) {
+      return callerCapped;
+    }
+    return callerCapped.slice(-MAX_RETAINED_ACTIVATIONS_PER_TRAP);
   }
 }
 
