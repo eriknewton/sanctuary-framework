@@ -1183,20 +1183,70 @@ export async function verifyExitBundle(
     encryptedStateHealth
   );
 
-  // CLASS-LEVEL AGGREGATOR (LD2-01 follow-up). `passed` is a reduction over
-  // this EXPLICIT, enumerated list of structural sub-verdicts, not a
-  // hand-written `&&` chain: every structural failure dimension this
-  // function can produce MUST appear below, and `passed` is defined so it
-  // can only see a failure that IS in the list. This absorbs the two prior
-  // one-instance fixes for the same class (#1189 rotation-chain-invalid,
-  // #1194 reputation-bundle-signature-unverifiable) by routing them through
-  // the same array rather than leaving them as separate ad-hoc terms.
+  // CLASS-LEVEL AGGREGATOR (LD2-01 follow-up, type-forced 2026-08-10 fix
+  // round). `passed` is a reduction over `subVerdicts`, a
+  // `Record<ExitBundleFailureClass, boolean>` keyed over the ENTIRE contract
+  // union, not a hand-written `&&` chain and not an array a developer can
+  // extend incompletely. This absorbs the two prior one-instance fixes for
+  // the same class (#1189 rotation-chain-invalid, #1194
+  // reputation-bundle-signature-unverifiable) by routing them through the
+  // same structure rather than leaving them as separate ad-hoc terms.
   //
-  // CONTRACT PIN (contracts/v1.1/exit-bundle-manifest.ts
-  // `ExitBundleVerifierResult["failure_class"]`): each `name` below is typed
-  // against that union via `ExitBundleFailureClass`, so a name here with no
-  // matching contract member is a compile error, not a silent drift.
+  // COMPLETENESS IS NOW COMPILE-ENFORCED, not merely tested. `Record<K, V>`
+  // requires every member of `K` as a key: omitting any
+  // `ExitBundleFailureClass` member below is a `TS2741 property missing`
+  // compile error, so a new failure_class landing in the contract union
+  // (contracts/v1.1/exit-bundle-manifest.ts) forces a human to make a
+  // conscious `true`/`false` wiring decision for it here before the branch
+  // even typechecks — the omission-by-forgetting shape that produced three
+  // prior instances of this bug is no longer expressible. (Previously this
+  // was a plain array of `{ name, failed }` objects, whose `name` typing
+  // rejected an invalid name but never forced every union member to be
+  // present; adding a new contract member compiled clean with no entry for
+  // it. That gap is what this Record closes.)
   //
+  // Members below fall into two groups:
+  //   1. The seven GATING sub-verdicts this aggregator actually computes,
+  //      wired to their booleans above.
+  //   2. Every OTHER `ExitBundleFailureClass` member, pinned to `false` with
+  //      a one-line reason. Each of those classes is enforced by an EARLY
+  //      RETURN elsewhere in `verifyExitBundle` (see the `fail(...)` call
+  //      sites and `identityBindingVerification.failure_class` above) —
+  //      execution cannot reach this line while any of those conditions
+  //      holds, because the function already returned a failed result with
+  //      that exact `failure_class`. They are listed and pinned, never
+  //      omitted, purely so the Record stays total over the union; `"other"`
+  //      is the catch-all and is never assigned by this ladder either.
+  const subVerdicts: Record<ExitBundleFailureClass, boolean> = {
+    // --- Gating: computed by this aggregator. Changing any line below is a
+    // live behavior change and is covered by
+    // server/test/exit/exit-verifier-aggregator.test.ts.
+    identity_signature_invalid: identityFailed,
+    rotation_chain_invalid: rotationFailed,
+    reputation_bundle_signature_invalid: reputationBundleFailed,
+    reputation_completeness_mismatch: reputationCompletenessFailed,
+    reputation_attestation_signature_invalid: reputationAttestationFailed,
+    reputation_unverifiable_attestations: unverifiableFailed,
+    encrypted_state_entries_unreadable: entriesUnreadableFailed,
+
+    // --- Non-gating for THIS ladder: already handled by an early `return
+    // fail(...)` before this point in `verifyExitBundle` runs.
+    manifest_unknown_version: false, // early-returned at the manifest_version gate above
+    manifest_signature_scheme_invalid: false, // early-returned at the signature_scheme gate above
+    artifact_path_duplicate: false, // early-returned in the per-artifact path-validation loop above
+    artifact_path_unsafe: false, // early-returned in the per-artifact path-validation loop above
+    identity_binding_mismatch: false, // early-returned by verifyIdentityBindingBeforeManifestKeyUse above
+    manifest_signature_invalid: false, // early-returned at the manifest fortress-master signature gate above
+    aggregate_hash_mismatch: false, // early-returned at the artifacts_aggregate_hash gate above
+    archive_contains_symlink: false, // early-returned by the per-artifact symlink/hash/size loop above
+    artifact_path_escapes_root: false, // early-returned by the per-artifact symlink/hash/size loop above
+    artifact_missing: false, // early-returned by the per-artifact symlink/hash/size loop above
+    artifact_hash_mismatch: false, // early-returned by the per-artifact symlink/hash/size loop above
+    artifact_size_mismatch: false, // early-returned by the per-artifact symlink/hash/size loop above
+    private_material_present: false, // early-returned by the per-artifact symlink/hash/size loop above
+    other: false, // catch-all; the unknown-artifact-kind gate above returns "other" directly via an early return
+  };
+  const passed = Object.values(subVerdicts).every((failed) => !failed);
   // Priority order (full-sweep #77, preserved): identity
   // (cryptographic-binding broken) beats rotation-chain beats
   // reputation-bundle (provenance broken) beats completeness mismatch
@@ -1204,42 +1254,22 @@ export async function verifyExitBundle(
   // attestation invalidity beats unverifiable signers (policy-relaxable via
   // the explicit opt-in flag) beats the encrypted-state entries-unreadable
   // class (LD2-01, least specific: the artifact's own contents cannot be
-  // read at all).
-  //
-  // The fail-closed property does NOT come from this array being complete —
-  // an entry simply missing from the array is exactly the omission this
-  // fix closes, and is caught by the verify/import differential test
-  // (server/test/exit/exit-verifier-aggregator.test.ts), not by anything
-  // here. It comes from each entry's OWN computation failing closed on
-  // whatever it does not positively recognize (see
-  // `encryptedStateSubVerdictFailed` above for the pattern).
-  const subVerdicts: { name: ExitBundleFailureClass; failed: boolean }[] = [
-    { name: "identity_signature_invalid", failed: identityFailed },
-    { name: "rotation_chain_invalid", failed: rotationFailed },
-    {
-      name: "reputation_bundle_signature_invalid",
-      failed: reputationBundleFailed,
-    },
-    {
-      name: "reputation_completeness_mismatch",
-      failed: reputationCompletenessFailed,
-    },
-    {
-      name: "reputation_attestation_signature_invalid",
-      failed: reputationAttestationFailed,
-    },
-    {
-      name: "reputation_unverifiable_attestations",
-      failed: unverifiableFailed,
-    },
-    {
-      name: "encrypted_state_entries_unreadable",
-      failed: entriesUnreadableFailed,
-    },
+  // read at all). Kept as an explicit ordered list, read against
+  // `subVerdicts`, rather than relying on object key insertion order: an
+  // ordering an editor can see and reorder directly, not an incidental
+  // property of how the Record literal above happens to be written.
+  const FAILURE_PRIORITY: readonly ExitBundleFailureClass[] = [
+    "identity_signature_invalid",
+    "rotation_chain_invalid",
+    "reputation_bundle_signature_invalid",
+    "reputation_completeness_mismatch",
+    "reputation_attestation_signature_invalid",
+    "reputation_unverifiable_attestations",
+    "encrypted_state_entries_unreadable",
   ];
-  const passed = subVerdicts.every((verdict) => !verdict.failed);
-  const detailedFailureClass = subVerdicts.find((verdict) => verdict.failed)
-    ?.name;
+  const detailedFailureClass = FAILURE_PRIORITY.find(
+    (name) => subVerdicts[name]
+  );
 
   return {
     version: "1.1",

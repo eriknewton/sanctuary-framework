@@ -303,15 +303,13 @@ export interface ExitBundleVerifierResult {
     | "reputation_completeness_mismatch"
     | "reputation_attestation_signature_invalid"
     | "reputation_unverifiable_attestations"
-    // LD2-01 (verify/import parity aggregator, class-level follow-up to
-    // #1189 / #1194): the encrypted_state artifact is signed and
-    // hash-verified but its `entries` field is absent or not an array, so
-    // its own contents cannot be read at all. Distinct from `"damaged"` in
-    // `ExitBundleDeclaredRekeyMaterial` (server/src/exit/verifier.ts),
-    // which ALSO covers a malformed source_custody/legacy_kdf_params block
-    // on a bundle with readable entries — that case stays verify-PASS by
-    // design (see the CRITICAL SCOPING note on the aggregator in
-    // verifier.ts) and fails import for a typed credential reason instead.
+    // The encrypted_state artifact passed its own hash and manifest-
+    // signature checks, but its internal entries list could not be read in
+    // the expected shape. Distinct from `"damaged"` in
+    // `ExitBundleDeclaredRekeyMaterial` (server/src/exit/verifier.ts), which
+    // covers a bundle whose entries ARE readable but whose re-key material
+    // is malformed — that case stays verify-PASS by design and fails import
+    // for a typed credential reason instead.
     | "encrypted_state_entries_unreadable"
     | "other";
 }

@@ -2476,7 +2476,23 @@ export async function importExitBundle(
   // trace. CONTRACT PIN: the code string mirrors failure_class
   // "encrypted_state_entries_unreadable" in
   // contracts/v1.1/exit-bundle-manifest.ts.
-  if (encryptedState && !Array.isArray(encryptedState.json.entries)) {
+  //
+  // NULL-ROOT RECHECK: `encryptedState.json` is an unchecked cast of parsed,
+  // untrusted JSON (`loadExitArtifact<ExitEncryptedStateBundle>` above) — a
+  // signed, hash-verified artifact whose bytes happen to be the JSON literal
+  // `null` (or any other non-object root) satisfies no object shape at all.
+  // The original guard here dereferenced `encryptedState.json.entries`
+  // directly, which throws a raw TypeError on a null/non-object root BEFORE
+  // `Array.isArray` ever runs — the exact crash class this fix exists to
+  // close, one property access earlier than the case it was written for.
+  // Narrow the JSON ROOT itself first, through `unknown`, so a malformed
+  // root reaches the SAME named error instead.
+  const encryptedStateJsonRoot: unknown = encryptedState?.json;
+  const encryptedStateEntriesReadable =
+    encryptedStateJsonRoot !== null &&
+    typeof encryptedStateJsonRoot === "object" &&
+    Array.isArray((encryptedStateJsonRoot as { entries?: unknown }).entries);
+  if (encryptedState && !encryptedStateEntriesReadable) {
     throw new ExitBundleImportError(
       "ENCRYPTED_STATE_ENTRIES_UNREADABLE",
       "This bundle's encrypted_state artifact has no readable entries list " +
