@@ -12,6 +12,7 @@ import {
   MAX_ACTIVATIONS_PER_CALLER_PER_TRAP,
   MAX_FOLLOW_UP_TOOL_CALLS_PER_ACTIVATION,
   MAX_RETAINED_ACTIVATIONS_PER_TRAP,
+  MAX_RETAINED_ARG_BYTES,
 } from "../../src/honeypot/tool-call-trap-runtime.js";
 import { TrapRegistry } from "../../src/honeypot/trap-registry.js";
 import { HONEYPOT_AUDIT_OPS, type TrapSpec } from "../../src/honeypot/types.js";
@@ -92,7 +93,7 @@ function countFollowUpAuditEmissions(auditLog: AuditLog): () => number {
 
 describe("Z-HNY-01 tool-call trap correlation bounds", () => {
   it("bounds retained activations and follow-up audit work under adversarial growth", async () => {
-    let nowMs = START_MS;
+    const nowMs = START_MS;
     const rig = await makeRig({ now: () => new Date(nowMs) });
     const followUpAuditCount = countFollowUpAuditEmissions(rig.auditLog);
 
@@ -158,6 +159,121 @@ describe("Z-HNY-01 tool-call trap correlation bounds", () => {
     expect(followUpAuditCount()).toBe(0);
   });
 
+  it("bounds retained BYTES and stats serialization at the FULL per-trap cap under attacker-sized args (RECHECK-HNY-01)", async () => {
+    // The count caps alone do not stop a visible agent from making each retained
+    // entry attacker-sized. Fill the whole per-trap retention cap (128), which
+    // takes FOUR callers each at the per-caller cap (32) — a single caller only
+    // reaches 32 and would hide the true ceiling. A ~2 MB blob retained across
+    // 128 activations x (1 + 16 follow-ups) would serialize to ~4.5 GB pre-fix;
+    // the byte bound keeps it to ~128 x 17 x ~1 KB.
+    const rig = await makeRig({ now: () => new Date(START_MS) });
+    // ADVERSARIAL content: a backslash-heavy blob. JSON.stringify escapes each
+    // backslash, and the retained preview is a STRING that stats() re-serializes,
+    // so those escapes DOUBLE again — the amplifier a naive byte-count ceiling
+    // misses. Identical args every call make the true size deterministic so we
+    // can assert arg_bytes EXACTLY (not just "large").
+    const bigBlob = "\\".repeat(1_000_000);
+    const invocationArgs = { blob: bigBlob };
+    const followUpArgs = { blob: bigBlob };
+    const expectedArgBytes = Buffer.byteLength(
+      JSON.stringify(invocationArgs),
+      "utf8",
+    );
+    const expectedFollowUpBytes = Buffer.byteLength(
+      JSON.stringify(followUpArgs),
+      "utf8",
+    );
+    const callerCount = 4; // 4 x 32 = 128 = MAX_RETAINED_ACTIVATIONS_PER_TRAP
+    expect(callerCount * MAX_ACTIVATIONS_PER_CALLER_PER_TRAP).toBe(
+      MAX_RETAINED_ACTIVATIONS_PER_TRAP,
+    );
+    for (let c = 0; c < callerCount; c += 1) {
+      const caller = `agent:flood-${c}`;
+      for (let i = 0; i < MAX_ACTIVATIONS_PER_CALLER_PER_TRAP + EXTRA_INVOCATIONS; i += 1) {
+        await rig.runtime.invokeIfTrap(FAKE_TOOL, invocationArgs, caller);
+      }
+      // Follow-ups with attacker-sized args, correlated to this caller's
+      // activations, must be bounded too.
+      for (let i = 0; i < MAX_FOLLOW_UP_TOOL_CALLS_PER_ACTIVATION + EXTRA_INVOCATIONS; i += 1) {
+        rig.runtime.recordToolCall("file_read", followUpArgs, caller);
+      }
+    }
+
+    const stats = rig.runtime.stats();
+    const activations = stats[0]!.activations;
+    // The whole retained buffer is at the per-trap ceiling.
+    expect(activations.length).toBe(MAX_RETAINED_ACTIVATIONS_PER_TRAP);
+
+    // Whole serialized payload bounded by the honest formula (128 x 17 x ~1 KB
+    // re-escaped preview ~= ~2.2 MB of previews + per-activation metadata ~=
+    // ~2.9 MB total) even with adversarial escaping content, not by the
+    // ~gigabytes of raw input. Assert < 4 MB: above the real ceiling, far below
+    // anything the raw retention would produce (fails on pre-fix code).
+    const serializedBytes = Buffer.byteLength(JSON.stringify(stats), "utf8");
+    expect(serializedBytes).toBeLessThan(4_000_000);
+
+    for (const activation of activations) {
+      // Preview serialized size bounded even under re-escaping: <= ~2x the raw
+      // cap (escaping) + U+FFFD + JSON field overhead.
+      expect(
+        Buffer.byteLength(JSON.stringify(activation.invocation_args), "utf8"),
+      ).toBeLessThan(MAX_RETAINED_ARG_BYTES * 2 + 256);
+      expect(activation.arg_truncated).toBe(true);
+      // True size reported EXACTLY, not just "large".
+      expect(activation.arg_bytes).toBe(expectedArgBytes);
+      expect(activation.follow_up_tool_calls.length).toBe(
+        MAX_FOLLOW_UP_TOOL_CALLS_PER_ACTIVATION,
+      );
+      for (const followUp of activation.follow_up_tool_calls) {
+        expect(
+          Buffer.byteLength(JSON.stringify(followUp.args), "utf8"),
+        ).toBeLessThan(MAX_RETAINED_ARG_BYTES * 2 + 256);
+        expect(followUp.args_truncated).toBe(true);
+        expect(followUp.args_bytes).toBe(expectedFollowUpBytes);
+      }
+    }
+  });
+
+  it("caps the retained preview at MAX_RETAINED_ARG_BYTES on a BYTE boundary for multibyte args", async () => {
+    // A char-boundary slice would let a multibyte-heavy arg retain up to ~4x the
+    // byte cap. Drive an all-multibyte (4-byte UTF-8) blob and assert the
+    // retained preview's true byte length never exceeds the constant.
+    const rig = await makeRig({ now: () => new Date(START_MS) });
+    const emoji = "\u{1F600}".repeat(600_000); // each code point = 4 UTF-8 bytes
+    await rig.runtime.invokeIfTrap(FAKE_TOOL, { blob: emoji }, "agent:multibyte");
+    const activation = rig.runtime.stats()[0]!.activations[0]!;
+    expect(activation.arg_truncated).toBe(true);
+    const preview = (activation.invocation_args as { _sanctuary_arg_preview: string })
+      ._sanctuary_arg_preview;
+    // Byte-boundary truncation caps the RAW slice at MAX; if it splits a 4-byte
+    // sequence, decoding appends one U+FFFD (3 bytes), so the decoded preview is
+    // at most MAX + 3 — never the ~4x a char-boundary slice would retain.
+    expect(Buffer.byteLength(preview, "utf8")).toBeLessThanOrEqual(
+      MAX_RETAINED_ARG_BYTES + 3,
+    );
+  });
+
+  it("retains small args verbatim (byte bound does not damage normal fidelity)", async () => {
+    const rig = await makeRig({ now: () => new Date(START_MS) });
+    const smallArgs = { reason: "why do you want the admin password?" };
+    await rig.runtime.invokeIfTrap(FAKE_TOOL, smallArgs, "agent:curious");
+    const activation = rig.runtime.stats()[0]!.activations[0]!;
+    expect(activation.invocation_args).toEqual(smallArgs);
+    expect(activation.arg_truncated).toBe(false);
+    expect(activation.arg_bytes).toBe(
+      Buffer.byteLength(JSON.stringify(smallArgs), "utf8"),
+    );
+  });
+
+  // This asserts a CORRECTNESS property: evicting an entry from the bounded
+  // in-memory correlation buffer must not lose its durable finding/audit record
+  // (retained-implies-persisted, and durability survives eviction). It is NOT an
+  // endorsement of unbounded durable growth: the durable sentinel-finding store
+  // has no per-caller/size quota, a separate PRE-EXISTING concern on a shared
+  // subsystem (all sentinels) that this PR does not change — a naive quota there
+  // could silently drop real security findings, so it is tracked as its own
+  // register item (Z-HNY-02) for a dedicated fix. This PR closes Z-HNY-01: the
+  // in-memory buffer bytes + the N-way audit amplification.
   it("keeps durable findings and trigger audits after retained activations are evicted", async () => {
     let nowMs = START_MS;
     const rig = await makeRig({ now: () => new Date(nowMs) });
