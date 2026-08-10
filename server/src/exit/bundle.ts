@@ -1747,6 +1747,23 @@ async function resolveSourceMasterKey(
   encryptedState: ExitEncryptedStateBundle | null,
   opts: ImportExitBundleOptions
 ): Promise<Uint8Array | null> {
+  // LD2-01: `encryptedState` is an unchecked cast of parsed, untrusted JSON
+  // (`loadExitArtifact<ExitEncryptedStateBundle>` in the caller) — its
+  // `entries` field is declared non-optional but is not runtime-guaranteed
+  // to be an array. `importExitBundle` already refuses this shape with the
+  // same typed error before calling in (see the LD2-01 comment at its call
+  // site), so this check is defense in depth for any other caller reaching
+  // this function: fail closed with a named error, never a raw
+  // `.length`-on-undefined TypeError.
+  if (encryptedState && !Array.isArray(encryptedState.entries)) {
+    throw new ExitBundleImportError(
+      "ENCRYPTED_STATE_ENTRIES_UNREADABLE",
+      "This bundle's encrypted_state artifact has no readable entries list " +
+        "(the `entries` field is absent or is not an array). This is not an " +
+        "empty bundle: the entry list itself cannot be read. Re-export the " +
+        "bundle from the source fortress."
+    );
+  }
   if (!encryptedState || encryptedState.entries.length === 0) return null;
   // This return precedes `validateSourceCustody` deliberately: a caller who
   // already holds the source master needs no re-key material at all, so a
@@ -2365,7 +2382,14 @@ export async function importExitBundle(
     // (line ~2421), which names the rotation chain as the cause instead of a
     // bare "not verified". Import stays fail-closed either way: it never admits
     // data on an unverifiable chain.
-    verification.failure_class !== "rotation_chain_invalid"
+    verification.failure_class !== "rotation_chain_invalid" &&
+    // LD2-01 (same #1189 pattern): encrypted_state_entries_unreadable now
+    // fails `passed` too (verifier.ts aggregator). Do NOT let it short to the
+    // generic not-verified result here either — falling through preserves the
+    // specific ENCRYPTED_STATE_ENTRIES_UNREADABLE throw below, once
+    // `encryptedState` is loaded, instead of a bare "not verified" that gives
+    // the operator no named cause. Import stays fail-closed either way.
+    verification.failure_class !== "encrypted_state_entries_unreadable"
   ) {
     return notVerifiedResult(
       0,
@@ -2433,6 +2457,48 @@ export async function importExitBundle(
     throw new ExitBundleImportError(
       "ROTATION_CHAIN_UNVERIFIABLE",
       rotationChainRefusalMessage(publicKeys)
+    );
+  }
+  // LD2-01 (verify/import parity aggregator, class fix): an encrypted_state
+  // artifact whose `entries` field is missing or not an array is structural
+  // damage to the artifact itself — verifier.ts `summarizeEncryptedState`
+  // classifies it as `entry_count === null`, and the aggregator in
+  // `verifyExitBundle` now fails `passed` on it too
+  // (`encrypted_state_entries_unreadable`). Checked here unconditionally and
+  // BEFORE the generic not-verified gate below, mirroring the
+  // rotation-chain-invalid throw immediately above: without this, the raw
+  // `encryptedState.entries.length` dereference three lines into
+  // `resolveSourceMasterKey` throws an unhandled TypeError for the same
+  // input. Fail closed with a NAMED, typed error instead — never a crash —
+  // so an operator (or a programmatic caller passing `sourceMasterKey`, which
+  // bypasses the credential-resolution branches below entirely but still
+  // reaches this same dereference) gets a diagnosable code, not a stack
+  // trace. CONTRACT PIN: the code string mirrors failure_class
+  // "encrypted_state_entries_unreadable" in
+  // contracts/v1.1/exit-bundle-manifest.ts.
+  //
+  // NULL-ROOT RECHECK: `encryptedState.json` is an unchecked cast of parsed,
+  // untrusted JSON (`loadExitArtifact<ExitEncryptedStateBundle>` above) — a
+  // signed, hash-verified artifact whose bytes happen to be the JSON literal
+  // `null` (or any other non-object root) satisfies no object shape at all.
+  // The original guard here dereferenced `encryptedState.json.entries`
+  // directly, which throws a raw TypeError on a null/non-object root BEFORE
+  // `Array.isArray` ever runs — the exact crash class this fix exists to
+  // close, one property access earlier than the case it was written for.
+  // Narrow the JSON ROOT itself first, through `unknown`, so a malformed
+  // root reaches the SAME named error instead.
+  const encryptedStateJsonRoot: unknown = encryptedState?.json;
+  const encryptedStateEntriesReadable =
+    encryptedStateJsonRoot !== null &&
+    typeof encryptedStateJsonRoot === "object" &&
+    Array.isArray((encryptedStateJsonRoot as { entries?: unknown }).entries);
+  if (encryptedState && !encryptedStateEntriesReadable) {
+    throw new ExitBundleImportError(
+      "ENCRYPTED_STATE_ENTRIES_UNREADABLE",
+      "This bundle's encrypted_state artifact has no readable entries list " +
+        "(the `entries` field is absent or is not an array). This is not an " +
+        "empty bundle: the entry list itself cannot be read. Re-export the " +
+        "bundle from the source fortress."
     );
   }
   if (!verification.passed) {

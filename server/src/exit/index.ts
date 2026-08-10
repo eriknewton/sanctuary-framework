@@ -29,6 +29,14 @@ export {
   type LoadedExitArtifact,
   type VerifyExitBundleOptions,
 } from "./verifier.js";
+// `encryptedStateSubVerdictFailed` / `EncryptedStateStructuralHealth`
+// (aggregator mutation-test helper, server/test/exit/exit-verifier-aggregator
+// .test.ts) are deliberately NOT re-exported here: they are module-internal
+// to verifier.ts, not an MCP/CLI-facing surface, and the package's public
+// surface is frozen by test/structure/public-surface-snapshot.test.ts. The
+// test imports them directly from "../../src/exit/verifier.js" instead,
+// matching the existing pattern of several sibling exit tests that import
+// straight from bundle.ts for the same reason.
 
 export {
   inspectExitBundle,

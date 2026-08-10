@@ -383,11 +383,15 @@ describe("exit inspect: what the bundle declares, never what an import will do",
     expect(printed).toContain("This is not an empty bundle.");
     expect(printed).not.toContain("declares: no-state");
 
-    // And the import does not quietly agree that it is empty either.
+    // And the import does not quietly agree that it is empty either. A bare
+    // try/catch here (accepting ANY thrown value, including an unhandled
+    // TypeError) previously masked LD2-01: `resolveSourceMasterKey` read
+    // `entries.length` off the same unreadable field and crashed rather than
+    // refusing cleanly. Asserting the NAMED, typed error code is what proves
+    // import fails CLOSED here, not just that it fails somehow.
     const destination = await makeDestination();
-    let importSucceeded = false;
-    try {
-      const result = await importExitBundle({
+    await expect(
+      importExitBundle({
         bundleDir,
         storage: destination.storage,
         masterKey: destination.masterKey,
@@ -398,12 +402,8 @@ describe("exit inspect: what the bundle declares, never what an import will do",
         forceRebind: true,
         sourceMasterKey: source.masterKey,
         destinationSignerIdentityId: destination.identityId,
-      });
-      importSucceeded = result.state.status === "rekeyed";
-    } catch {
-      importSucceeded = false;
-    }
-    expect(importSucceeded).toBe(false);
+      })
+    ).rejects.toMatchObject({ code: "ENCRYPTED_STATE_ENTRIES_UNREADABLE" });
   });
 
   it("declares no-state for a genuinely empty bundle, and says the entry list was readable", async () => {
