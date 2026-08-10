@@ -1063,6 +1063,18 @@ export async function verifyExitBundle(
     reputationAttestationFailed ||
     reputationCompletenessFailed;
   const identityFailed = identity ? !identity.signature_valid : false;
+  // EXIT-PASS-01: a present-but-invalid rotation chain is a verifier failure,
+  // not descriptive metadata. `rotation` is undefined when the bundle carries
+  // no rotation history, so this only fires on a chain that exists and does
+  // not verify — non-rotated bundles never false-positive. Keys on
+  // chain_signature_verified, so the signed-but-compromised chain admitted via
+  // --accept-compromised-rotation-keys (chain_signature_verified === true)
+  // stays PASS and its policy gate is untouched. Import already fails closed on
+  // the same chain (ROTATION_CHAIN_UNVERIFIABLE); this closes the verify/inspect
+  // command that reported PASS on a chain it could not verify.
+  const rotationFailed =
+    identity?.rotation !== undefined &&
+    identity.rotation.chain_signature_verified === false;
   const unverifiableCount = reputation?.unverifiable_attestations ?? 0;
   const unverifiableFailed =
     unverifiableCount > 0 && !options.acceptUnverifiableAttestations;
@@ -1087,6 +1099,8 @@ export async function verifyExitBundle(
     | undefined;
   if (identityFailed) {
     detailedFailureClass = "identity_signature_invalid";
+  } else if (rotationFailed) {
+    detailedFailureClass = "rotation_chain_invalid";
   } else if (reputationBundleFailed) {
     detailedFailureClass = "reputation_bundle_signature_invalid";
   } else if (reputationCompletenessFailed) {
@@ -1099,7 +1113,11 @@ export async function verifyExitBundle(
 
   return {
     version: "1.1",
-    passed: !reputationFailed && !identityFailed && !unverifiableFailed,
+    passed:
+      !reputationFailed &&
+      !identityFailed &&
+      !unverifiableFailed &&
+      !rotationFailed,
     verified_at: new Date().toISOString(),
     manifest_path: join(root, "manifest.json"),
     manifest_hash: sha256Hex(manifestBytes),
