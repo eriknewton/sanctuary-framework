@@ -156,16 +156,17 @@ compounding errors across an agent mesh.
 
 **Mechanism.**
 - **Sovereignty-gated reputation tiers** define a per-tier attestation
-  weight model: verified-sovereign (tier 1.0) above self-attested (0.2)
-  and unverified (0.2) (`reputation/tiers.ts`).
+  weight model: verified-sovereign (1.0) and verified-degraded (0.8) above
+  self-attested (0.5) and unverified (0.2) (`reputation/tiers.ts`).
 - **A stored or imported attestation's declared tier is clamped to
   self-attested unconditionally at read time**, regardless of who signed
   it, how it arrived, or which tier it declares
-  (`reputation/reputation-store.ts` `trustedSovereigntyTier`). A
-  reputation query over stored history therefore cannot itself credit a
-  handshake-verified peer above an unverified one; the higher tiers are
-  reachable only during a live, in-progress sovereignty handshake, never
-  from a stored claim.
+  (`reputation/reputation-store.ts` `trustedSovereigntyTier`). The clamp
+  removes the privileged verified-tier weight (1.0/0.8) from any stored
+  claim, so a reputation query over stored history can never score a stored
+  attestation above self-attested; it does not lower it to unverified. The
+  privileged verified tiers are reachable only during a live, in-progress
+  sovereignty handshake, never from a stored claim.
 - **Sanctuary does NOT factually verify claims.** It only establishes
   whether the claim came from a cryptographically identified source
   with a known sovereignty posture.

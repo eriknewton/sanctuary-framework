@@ -224,14 +224,13 @@ async function runPoisonedFederationRegistration(
   );
   expect(completed.result.verified).toBe(true);
 
-  // FED separately gains local custody of a public key matching C's — NOT
+  // FED separately gains local custody of a public key matching C's, not
   // through the handshake producer, so the producer chokepoint
-  // (recordHandshakeResult) never even runs for this. `identity_import`'s
-  // own ingest validation (MUST-FIX 1) only requires the public_key to be a
-  // well-formed, decodable Ed25519 key; it does not (and cannot) verify the
-  // caller actually controls the matching private key, so a plausible
-  // placeholder encrypted-private-key payload is sufficient to reach the
-  // federation check under test.
+  // (recordHandshakeResult) is not exercised here. The test supplies a
+  // placeholder encrypted-private-key payload because this path exercises
+  // federation's OWN local-custody refusal, which is independent of
+  // private-key control; ingest validation (MUST-FIX 1) checks only that
+  // the public_key is a well-formed Ed25519 key.
   const poisonedImport = parse(
     await callServerTool(fedFortress.server, "identity_import", {
       identity: {

@@ -963,13 +963,11 @@ describe("(g) MUST-FIX 1: an undecodable stored public_key never defeats a local
       ...storedIdentity,
       public_key: "AAAA",
     };
-    // `IdentityManager.save()` now refuses this (round 3: the structural
-    // `assertValidStoredIdentity` boundary), so this reproduces a record
-    // that reached storage some other way instead: a file written before
-    // this fix existed, or a write that bypassed `IdentityManager`
-    // entirely. Writes the same encrypted shape `save()` writes, directly
-    // through the storage backend, so `load()`'s OWN independent check is
-    // what is under test here, not `save()`'s.
+    // `IdentityManager.save()` refuses an invalid key at the structural
+    // boundary, so this test seeds an on-disk record with an invalid key
+    // directly through the storage backend to exercise `load()`'s OWN
+    // independent check (not `save()`'s). It writes the same encrypted
+    // shape `save()` writes.
     const encKeyForWrite = derivePurposeKey(
       fortress.masterKey,
       "identity-encryption"
@@ -1038,11 +1036,11 @@ describe("(g) MUST-FIX 1: an undecodable stored public_key never defeats a local
     );
     const candidateKeyBytes = fromBase64url(storedIdentity.public_key);
 
-    // Pre-fix: a held identity's undecodable public_key was silently
-    // `continue`d past, so this returned `false` even for a candidate that
-    // genuinely belongs to a held identity — the exact fail-open shape.
-    // Post-fix: a held identity's own key material failing to decode is an
-    // integrity error the caller must not paper over as "not local."
+    // A held identity whose own key material fails to decode is an
+    // integrity error, not a "not local" result: enumerating our own held
+    // identities must hard-fail rather than silently skip an entry, so a
+    // candidate that genuinely belongs to a held identity can never be
+    // misjudged as not-local.
     expect(() =>
       isLocallyHeldPublicKey(candidateKeyBytes, [{ public_key: "AAAA" }])
     ).toThrow();
