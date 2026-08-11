@@ -361,12 +361,16 @@ export function createHandshakeTools(
   // some separate "not full" state. Mirrors the wording
   // federation/tools.ts already uses correctly for its own
   // `audit_unavailable` branch.
+  // "failed or did not complete in time" (fix-round-7): bounded-map.ts's
+  // catch around the awaited `onEvict` covers BOTH an immediate rejection
+  // (e.g. an integrity-locked audit chain) and a timeout — "did not
+  // complete in time" alone described only the second.
   const SESSIONS_AUDIT_UNAVAILABLE_ERROR =
     "Handshake session store is at capacity and needed to evict an " +
     "existing session to admit this one, but the durable audit write for " +
-    "that eviction did not complete in time; this is an audit-log " +
-    "availability issue, not genuine session-store saturation. Retry " +
-    "once the audit log recovers.";
+    "that eviction failed or did not complete in time; this is an " +
+    "audit-log availability issue, not genuine session-store saturation. " +
+    "Retry once the audit log recovers.";
   // ADMISSION-WAITER CAP (AGENTS.md rule 8, fix-round-6): distinct from all
   // three reasons above — this call never reached the origin-quota/
   // capacity/audit checks at all, because `sessions`'s own admission-lock
@@ -427,13 +431,33 @@ export function createHandshakeTools(
               : result.reason === "admission_busy"
                 ? SESSIONS_ADMISSION_BUSY_ERROR
                 : SESSIONS_SATURATED_ERROR;
-        void auditLog.append(
-          "l4",
-          reason,
-          localIdentityId,
-          { session_id: session.session_id, caller_identity: origin },
-          "failure"
-        );
+        // BUSY-AUDIT COALESCING (fix-round-7 — must match the episode
+        // contract of `AdmissionBusyAuditCoalescer` in core/bounded-map.ts):
+        // `admission_busy` is the at-cap fast path, DESIGNED to absorb a
+        // hammering flood, so a per-refusal append here would shift that
+        // flood's backlog into the audit log's uncapped append queue. Its
+        // audit therefore emits once per saturation episode, carrying the
+        // suppressed-refusal count; the agent-facing refusal result below
+        // is returned on every call, uncoalesced. The other three reasons
+        // are pre-existing per-refusal audits, deliberately untouched.
+        if (result.reason !== "admission_busy" || result.busyAudit.emit) {
+          void auditLog.append(
+            "l4",
+            reason,
+            localIdentityId,
+            {
+              session_id: session.session_id,
+              caller_identity: origin,
+              ...(result.reason === "admission_busy"
+                ? {
+                    suppressed_busy_refusals:
+                      result.busyAudit.suppressedSinceLastAudit,
+                  }
+                : {}),
+            },
+            "failure"
+          );
+        }
         return { ok: false, error, reason };
       }
       return { ok: true };
@@ -494,12 +518,15 @@ export function createHandshakeTools(
   // condition — see SESSIONS_AUDIT_UNAVAILABLE_ERROR's doc above for the
   // identical correction and why `audit_unavailable` is only ever reached
   // from inside bounded-map.ts's AT-CAPACITY branch.
+  // "failed or did not complete in time" (fix-round-7): see
+  // SESSIONS_AUDIT_UNAVAILABLE_ERROR's note — the catch this reports on
+  // covers rejection AND timeout.
   const HANDSHAKE_RESULTS_AUDIT_UNAVAILABLE_ERROR =
     "Handshake result store is at capacity and needed to evict an " +
     "existing result to record this one, but the durable audit write for " +
-    "that eviction did not complete in time; this is an audit-log " +
-    "availability issue, not genuine handshake-result-store saturation. " +
-    "Retry once the audit log recovers.";
+    "that eviction failed or did not complete in time; this is an " +
+    "audit-log availability issue, not genuine handshake-result-store " +
+    "saturation. Retry once the audit log recovers.";
   // ADMISSION-WAITER CAP (AGENTS.md rule 8, fix-round-6): see
   // SESSIONS_ADMISSION_BUSY_ERROR's doc above — same distinction, for
   // `handshakeResults`'s own admission-lock waiter queue.
@@ -776,13 +803,31 @@ export function createHandshakeTools(
               : setResult.reason === "admission_busy"
                 ? HANDSHAKE_RESULTS_ADMISSION_BUSY_ERROR
                 : HANDSHAKE_RESULTS_SATURATED_ERROR;
-        void auditLog.append(
-          "l4",
-          reason,
-          localIdentityId,
-          { counterparty_id: result.counterparty_id, caller_identity: origin },
-          "failure"
-        );
+        // BUSY-AUDIT COALESCING (fix-round-7): see insertSession's
+        // identical gate above — busy audits emit once per saturation
+        // episode of `handshakeResults`'s admission queue (per the
+        // `AdmissionBusyAuditCoalescer` contract, core/bounded-map.ts),
+        // with the suppressed count; the other three reasons keep their
+        // pre-existing per-refusal appends, and the agent-facing refusal
+        // below is never coalesced.
+        if (setResult.reason !== "admission_busy" || setResult.busyAudit.emit) {
+          void auditLog.append(
+            "l4",
+            reason,
+            localIdentityId,
+            {
+              counterparty_id: result.counterparty_id,
+              caller_identity: origin,
+              ...(setResult.reason === "admission_busy"
+                ? {
+                    suppressed_busy_refusals:
+                      setResult.busyAudit.suppressedSinceLastAudit,
+                  }
+                : {}),
+            },
+            "failure"
+          );
+        }
         return { ok: false, error, reason };
       }
       // FEDERATION-FACING WRITER accounting (MUST-FIX 2, fix-round-3): set

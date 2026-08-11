@@ -297,12 +297,19 @@ export function createFederationTools(
                     "remove an existing peer (federation_peers action: " +
                     "\"remove\") to free a slot before registering another."
                   : registration.reason === "audit_unavailable"
+                    // "failed or did not complete in time" (fix-round-7):
+                    // bounded-map.ts's catch around the awaited onEvict
+                    // covers BOTH an immediate rejection and a timeout —
+                    // "did not complete in time" alone described only the
+                    // second. Must match the handshake wording
+                    // (SESSIONS_AUDIT_UNAVAILABLE_ERROR, handshake/tools.ts).
                     ? "Federation peer registry is at capacity and needed " +
                       "to evict an inactive peer to register this one, but " +
-                      "the durable audit write for that eviction did not " +
-                      "complete in time; this is an audit-log availability " +
-                      "issue, not a genuine \"every peer is active\" " +
-                      "saturation. Retry once the audit log recovers."
+                      "the durable audit write for that eviction failed or " +
+                      "did not complete in time; this is an audit-log " +
+                      "availability issue, not a genuine \"every peer is " +
+                      "active\" saturation. Retry once the audit log " +
+                      "recovers."
                     : registration.reason === "admission_busy"
                       ? "Federation peer registry's admission queue is " +
                         "momentarily saturated with other concurrent peer " +

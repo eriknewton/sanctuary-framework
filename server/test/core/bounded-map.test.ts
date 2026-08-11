@@ -262,7 +262,10 @@ describe("BoundedMap admission-waiter cap (AGENTS.md rule 8 on the fix's OWN sta
       // `deferred` resolves, evicting "a" — this assertion catches exactly
       // that mutation.
       const r3 = await p3;
-      expect(r3).toEqual({ ok: false, reason: "admission_busy" });
+      // `busyAudit` (fix-round-7) rides along on every busy refusal; its
+      // coalescing semantics have their own describe block below — here it
+      // only matters that the refusal reason itself is unchanged.
+      expect(r3).toMatchObject({ ok: false, reason: "admission_busy" });
       expect(busyRefusals).toEqual(["c"]);
 
       // p1 and p2 are still genuinely pending (blocked on `deferred`) —
@@ -311,6 +314,158 @@ describe("BoundedMap admission-waiter cap (AGENTS.md rule 8 on the fix's OWN sta
         })
     ).toThrow(/maxPendingAdmissionWaiters must be a positive integer/);
   });
+});
+
+describe("BoundedMap busy-audit coalescing (fix-round-7 — once per saturation episode, never per refusal)", () => {
+  /** Harness shared by both tests below: maxSize 1 + a re-armable onEvict
+   * gate, so every post-seed admission blocks inside its eviction's audit
+   * await and the test controls exactly when the running admission settles
+   * (ending the saturation episode). Cap 1 means the single running
+   * admission IS the whole waiter queue — every concurrent call during it
+   * is a busy refusal. */
+  function makeGatedMap() {
+    let gate = createDeferred();
+    const onRefuseDecisions: {
+      key: string;
+      emit: boolean | undefined;
+      suppressed: number | undefined;
+    }[] = [];
+    const map = new BoundedMap<string, { n: number }>({
+      maxSize: 1,
+      maxPendingAdmissionWaiters: 1,
+      selectEviction: (entries) => {
+        for (const [key] of entries) return { evict: key };
+        return { refuse: true };
+      },
+      onEvict: async () => {
+        await gate.promise;
+      },
+      onRefuse: (key, _value, reason, busyAudit) => {
+        if (reason !== "admission_busy") return;
+        onRefuseDecisions.push({
+          key,
+          emit: busyAudit?.emit,
+          suppressed: busyAudit?.suppressedSinceLastAudit,
+        });
+      },
+    });
+    return {
+      map,
+      onRefuseDecisions,
+      openGate: () => gate.resolve(),
+      rearmGate: () => {
+        gate = createDeferred();
+      },
+    };
+  }
+
+  it(
+    "MUTATION-PROOF TARGET (busy-audit coalescing): a flood of busy refusals in ONE saturation episode gets emit:true on exactly the FIRST refusal — every later refusal in the episode is emit:false, while the refusal RESULT itself still comes back on every call",
+    async () => {
+      const { map, onRefuseDecisions, openGate } = makeGatedMap();
+      expect((await map.set("seed", { n: 0 })).ok).toBe(true);
+
+      // Occupies the single waiter slot and blocks inside onEvict — the
+      // saturation episode starts with the first refusal below.
+      const running = map.set("occupant", { n: 1 });
+
+      // Five-call busy flood while the queue is saturated.
+      const refusals = await Promise.all(
+        ["b1", "b2", "b3", "b4", "b5"].map((k) => map.set(k, { n: 9 }))
+      );
+
+      // AGENT-FACING behavior is per-call and uncoalesced: every one of
+      // the five calls got its own typed busy refusal.
+      for (const r of refusals) {
+        expect(r).toMatchObject({ ok: false, reason: "admission_busy" });
+      }
+
+      // THE MUTATION-PROOF ASSERTION (audit half): only the FIRST refusal
+      // of the episode carries emit:true; the other four are suppressed.
+      // Mutating AdmissionBusyAuditCoalescer.onBusyRefusal to always
+      // return emit:true (coalescing disabled) makes every consumer's
+      // audit append fire per refusal again — this assertion catches
+      // exactly that mutation.
+      expect(onRefuseDecisions.map((d) => d.emit)).toEqual([
+        true,
+        false,
+        false,
+        false,
+        false,
+      ]);
+      // The emitted (first) decision reports 0 suppressed since the last
+      // audit — nothing was suppressed before it.
+      expect(onRefuseDecisions[0]!.suppressed).toBe(0);
+
+      // The same decision object rides on the RESULT channel (the one
+      // handshake/tools.ts consumes), not only the onRefuse channel.
+      const first = refusals[0]!;
+      const second = refusals[1]!;
+      if (first.ok || first.reason !== "admission_busy") {
+        throw new Error("expected a busy refusal");
+      }
+      if (second.ok || second.reason !== "admission_busy") {
+        throw new Error("expected a busy refusal");
+      }
+      expect(first.busyAudit).toEqual({
+        emit: true,
+        suppressedSinceLastAudit: 0,
+      });
+      expect(second.busyAudit.emit).toBe(false);
+
+      openGate();
+      await expect(running).resolves.toEqual({ ok: true });
+    }
+  );
+
+  it(
+    "a NEW saturation episode after the queue drains re-audits (emit:true again), and the emitted decision carries the count of refusals suppressed since the LAST emitted audit",
+    async () => {
+      const { map, onRefuseDecisions, openGate, rearmGate } = makeGatedMap();
+      expect((await map.set("seed", { n: 0 })).ok).toBe(true);
+
+      // Episode 1: one running admission, four busy refusals (1 emitted,
+      // 3 suppressed).
+      const running1 = map.set("occupant-1", { n: 1 });
+      await Promise.all(
+        ["e1-a", "e1-b", "e1-c", "e1-d"].map((k) => map.set(k, { n: 9 }))
+      );
+      expect(onRefuseDecisions.map((d) => d.emit)).toEqual([
+        true,
+        false,
+        false,
+        false,
+      ]);
+
+      // Drain: the running admission settles, dropping the waiter count
+      // below the cap — the episode ends here (BoundedMap.set()'s
+      // settlement `finally`), NOT at any timer or explicit reset.
+      openGate();
+      await expect(running1).resolves.toEqual({ ok: true });
+
+      // Episode 2: saturate again.
+      rearmGate();
+      const running2 = map.set("occupant-2", { n: 2 });
+      const r = await map.set("e2-a", { n: 9 });
+
+      // THE MUTATION-PROOF ASSERTION (re-audit half): the first refusal of
+      // the NEW episode audits again — a coalescer that never re-arms
+      // (episodeActive stuck true, e.g. a dropped onBelowCap call in the
+      // settlement `finally`) would leave this emit:false and silence the
+      // busy audit for the instance's whole lifetime.
+      if (r.ok || r.reason !== "admission_busy") {
+        throw new Error("expected a busy refusal");
+      }
+      expect(r.busyAudit.emit).toBe(true);
+      // ...and it reports the 3 refusals suppressed since the last emitted
+      // audit (episode 1's b/c/d), so the coalesced trail still reflects
+      // the flood's volume honestly.
+      expect(r.busyAudit.suppressedSinceLastAudit).toBe(3);
+
+      openGate();
+      await expect(running2).resolves.toEqual({ ok: true });
+    }
+  );
 });
 
 describe("BoundedMap refusal reasons (MUST-FIX 3, fix-round-3)", () => {

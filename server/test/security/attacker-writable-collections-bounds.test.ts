@@ -2183,6 +2183,127 @@ describe("4. sentinel durable findings: capped, per-origin fair, never blind-FIF
     },
     30_000
   );
+
+  it(
+    "MUTATION-PROOF TARGET (busy-audit coalescing, fix-round-7): a flood of admission_busy refusals produces exactly ONE finding_store_admission_busy audit append per saturation episode — every refusal still throws to its caller, and a NEW episode after the queue drains re-audits with the suppressed-refusal count",
+    async () => {
+      // Re-armable gate on `storage.list()` — same shape as the
+      // waiter-cap test above, armed once per episode. Scoped to the
+      // sentinel-findings namespace: this test's REAL AuditLog also calls
+      // `storage.list()` (chain bootstrap/prune paths), including from
+      // fire-and-forget `void append` continuations that can land between
+      // episodes — an unscoped gate could be consumed by one of those
+      // instead of the ceiling check the test means to block.
+      class GatedStorage extends MemoryStorage {
+        private gate: Promise<void> | null = null;
+        armGate(gate: Promise<void>): void {
+          this.gate = gate;
+        }
+        async list(namespace: string, prefix?: string) {
+          if (this.gate && namespace === SENTINEL_FINDING_NAMESPACE) {
+            const g = this.gate;
+            this.gate = null; // gate only the NEXT call, never a later one
+            await g;
+          }
+          return super.list(namespace, prefix);
+        }
+      }
+
+      const storage = new GatedStorage();
+      const masterKey = generateRandomKey();
+      const auditLog = new AuditLog(storage, masterKey);
+      const WAITER_CAP = 2;
+      const store = new SentinelFindingStore({
+        storage,
+        masterKey,
+        fortressId: "fortress-busy-audit-coalescing-test",
+        auditLog,
+        maxTrackedFindings: 1000,
+        maxPendingAdmissionWaiters: WAITER_CAP,
+      });
+
+      // Warm-up: consumes ensureIndex's one-time list() and one ceiling
+      // list() BEFORE any gate is armed.
+      await store.saveFinding(mkFinding("seed"));
+
+      // Count REAL audit appends for the busy op (the telemetry this
+      // round bounds), not the coalescer's internal decisions.
+      const appendSpy = vi.spyOn(auditLog, "append");
+      const busyAppends = () =>
+        appendSpy.mock.calls.filter(
+          (c) => c[1] === "finding_store_admission_busy"
+        );
+
+      // EPISODE 1: p1 runs (blocked inside its gated ceiling list(),
+      // holding the admission lock), p2 queues — waiter count at the cap.
+      let releaseGate!: () => void;
+      storage.armGate(
+        new Promise<void>((resolve) => {
+          releaseGate = resolve;
+        })
+      );
+      const p1 = store.saveFinding(mkFinding("e1-run"));
+      const p2 = store.saveFinding(mkFinding("e1-queued"));
+
+      // Four-call busy flood. AGENT/CALLER-FACING behavior is per-call and
+      // uncoalesced: every one of the four throws the typed refusal.
+      for (const id of ["e1-b1", "e1-b2", "e1-b3", "e1-b4"]) {
+        await expect(store.saveFinding(mkFinding(id))).rejects.toMatchObject({
+          reason: "admission_busy",
+        });
+      }
+
+      // THE MUTATION-PROOF ASSERTION (audit half): exactly ONE busy append
+      // for the whole four-refusal episode, reporting 0 suppressed since
+      // the last audit (nothing preceded it). Mutating
+      // AdmissionBusyAuditCoalescer.onBusyRefusal (core/bounded-map.ts,
+      // the SHARED implementation this store instantiates) to always
+      // return emit:true — coalescing disabled — makes this count 4:
+      // one append per refusal, the exact attacker-driven
+      // audit-append-amplification this round closes.
+      expect(busyAppends().length).toBe(1);
+      expect(busyAppends()[0]![3]).toMatchObject({
+        suppressed_busy_refusals: 0,
+      });
+
+      // Drain episode 1: p1 completes; p2 then runs its own (ungated,
+      // since the gate is consumed exactly once) list() and completes.
+      // Each settlement drops the waiter count below the cap, ending the
+      // episode in saveFinding's settlement `finally`.
+      releaseGate();
+      await expect(p1).resolves.toBeTypeOf("string");
+      await expect(p2).resolves.toBeTypeOf("string");
+
+      // EPISODE 2: saturate again the same way.
+      storage.armGate(
+        new Promise<void>((resolve) => {
+          releaseGate = resolve;
+        })
+      );
+      const p3 = store.saveFinding(mkFinding("e2-run"));
+      const p4 = store.saveFinding(mkFinding("e2-queued"));
+      await expect(
+        store.saveFinding(mkFinding("e2-b1"))
+      ).rejects.toMatchObject({ reason: "admission_busy" });
+
+      // THE MUTATION-PROOF ASSERTION (re-audit half): the new episode's
+      // first refusal audits again — a coalescer that never re-arms (a
+      // dropped onBelowCap in the settlement `finally`) would silence the
+      // busy audit for the store's whole lifetime after episode 1 — and
+      // carries the 3 refusals suppressed since the LAST emitted audit
+      // (episode 1's b2..b4), so the coalesced trail still reflects the
+      // flood's volume honestly.
+      expect(busyAppends().length).toBe(2);
+      expect(busyAppends()[1]![3]).toMatchObject({
+        suppressed_busy_refusals: 3,
+      });
+
+      releaseGate();
+      await expect(p3).resolves.toBeTypeOf("string");
+      await expect(p4).resolves.toBeTypeOf("string");
+    },
+    30_000
+  );
 });
 
 // ──────────────────────────────────────────────────────────────────────────

@@ -92,10 +92,22 @@ export type BoundedMapRefuseReason =
  * inside the same admission) for callers that want a callback-shaped
  * side effect at the exact point of refusal; the two mechanisms are
  * independent and a caller may use either, both, or neither.
+ *
+ * An `admission_busy` refusal additionally carries `busyAudit`
+ * (fix-round-7): the per-episode coalescing decision for the AUDIT append
+ * only — see `AdmissionBusyAuditDecision`. It is REQUIRED on that arm (a
+ * discriminated union, not an optional field) so a consumer's audit gate
+ * cannot silently read `undefined` and pick a default; the refusal result
+ * itself is still returned on every busy call.
  */
 export type BoundedMapSetResult =
   | { ok: true }
-  | { ok: false; reason: BoundedMapRefuseReason };
+  | { ok: false; reason: Exclude<BoundedMapRefuseReason, "admission_busy"> }
+  | {
+      ok: false;
+      reason: "admission_busy";
+      busyAudit: AdmissionBusyAuditDecision;
+    };
 
 /**
  * Bounds the await on a caller-supplied `onEvict` critical-audit write
@@ -142,8 +154,8 @@ export type BoundedMapSetResult =
  * contract is provably observed by `withTimeout` below BEFORE this timer
  * could fire, making the "resolves after the caller already gave up"
  * window unreachable for a conforming audit-log implementation (not an
- * absolute guarantee against a future change to that contract — see
- * BUILD_RESULT.md's residual note).
+ * absolute guarantee against a future change to that contract — the
+ * accepted-residual paragraph below is the record of that bound).
  *
  * ACCEPTED RESIDUAL, RECORDED HONESTLY (fix-round-6): if a caller-supplied
  * `onEvict` DOES take longer than this timeout to settle (a non-conforming
@@ -155,8 +167,9 @@ export type BoundedMapSetResult =
  * no-cancellation trade-off `sentinel/sentinel-finding-store.ts`'s own
  * `STORE_ADMISSION_DEADLINE_MS` accepts for its raw storage calls (which
  * carry no settle-time contract at all, unlike `appendCritical` here) —
- * see that constant's doc for the fuller accepted-residual statement, and
- * BUILD_RESULT.md for the record. Adding cancellation or a
+ * see that constant's doc for the fuller accepted-residual statement.
+ * This paragraph IS the accepted-residual record: the trade-off is
+ * deliberate, not an oversight. Adding cancellation or a
  * compare-and-swap primitive to close this one write is disproportionate
  * to how narrow the residual is (AGENTS.md's minimalism principle).
  */
@@ -202,6 +215,84 @@ export const ON_EVICT_AUDIT_TIMEOUT_MS =
  * closed, reason `admission_busy`) rather than ever joining the queue.
  */
 export const MAX_PENDING_ADMISSION_WAITERS = 64;
+
+/**
+ * The coalesced busy-AUDIT decision attached to every `admission_busy`
+ * refusal (fix-round-7 — see {@link AdmissionBusyAuditCoalescer}). This
+ * governs ONLY how often the operator-facing audit append fires; the
+ * agent-facing refusal itself (the `set()` result, the `onRefuse`
+ * callback, a store's typed throw) still happens on every single call,
+ * uncoalesced.
+ */
+export interface AdmissionBusyAuditDecision {
+  /** True only for the FIRST busy refusal of a saturation episode — the
+   * one refusal whose audit append should actually be emitted. */
+  emit: boolean;
+  /** How many busy refusals had their audit append suppressed since the
+   * LAST emitted busy audit (i.e., the volume the previous emitted record
+   * did not individually log). Consumers include this in the emitted
+   * audit's details so the trail still reflects flood volume honestly,
+   * one record per episode instead of one per refusal. */
+  suppressedSinceLastAudit: number;
+}
+
+/**
+ * Coalesces the `admission_busy` AUDIT telemetry to at most one append per
+ * SATURATION EPISODE per map/store instance (fix-round-7). The busy
+ * refusal is the at-cap FAST path — it is designed to absorb a hammering
+ * flood (that is the point of refusing instead of queuing), so a
+ * per-refusal `auditLog.append` on it would let a refusal flood shift
+ * attacker-driven backlog from the (capped) admission-waiter queue into
+ * the audit log's own uncapped in-process append queue: the same
+ * rule-8 unbounded-state class, one layer down.
+ *
+ * EPISODE DEFINITION: an episode starts when the waiter count first
+ * reaches the cap and ends when it drops back below it. Because busy
+ * refusals only ever happen AT the cap, "first busy refusal observed
+ * while no episode is active" marks the start; and because the counter
+ * can never exceed the cap (the increment is guarded by the same
+ * synchronous check), EVERY admission settlement drops the count strictly
+ * below the cap, so `onBelowCap()` is called unconditionally from each
+ * settlement's `finally`. The first refusal of an episode audits (carrying
+ * the count suppressed since the previous emitted audit); later refusals
+ * in the same episode do not.
+ *
+ * ONE shared implementation for every busy-audit site — `BoundedMap`
+ * embeds one per instance below (surfaced to consumers through the
+ * `set()` result and the `onRefuse` callback), and
+ * `sentinel/sentinel-finding-store.ts` instantiates its own for its
+ * store-level admission queue — never four hand-mirrored copies.
+ */
+export class AdmissionBusyAuditCoalescer {
+  /** True from the first busy refusal of an episode until the waiter
+   * count next drops below the cap (`onBelowCap`). */
+  private episodeActive = false;
+  /** Busy refusals whose audit was suppressed since the last EMITTED
+   * busy audit — spans episodes, resets only when an audit is emitted. */
+  private suppressed = 0;
+
+  /** Record one busy refusal and decide whether ITS audit append emits.
+   * Synchronous and called only from the (synchronous, pre-first-await)
+   * at-cap refusal branch, so it needs no lock — same run-to-completion
+   * argument as the waiter counter itself. */
+  onBusyRefusal(): AdmissionBusyAuditDecision {
+    if (this.episodeActive) {
+      this.suppressed += 1;
+      return { emit: false, suppressedSinceLastAudit: this.suppressed };
+    }
+    this.episodeActive = true;
+    const suppressedSinceLastAudit = this.suppressed;
+    this.suppressed = 0;
+    return { emit: true, suppressedSinceLastAudit };
+  }
+
+  /** The waiter count just dropped below the cap (any admission
+   * settlement — see the class doc): the current episode, if one was
+   * active, ends here. Idempotent. */
+  onBelowCap(): void {
+    this.episodeActive = false;
+  }
+}
 
 /**
  * Race `promise` against a timer that rejects after `ms`. Used ONLY to
@@ -348,11 +439,17 @@ export interface BoundedMapOptions<K, V> {
    * already at `maxPerOrigin`, because the map is at the global cap and
    * `selectEviction` refused, because a decided eviction's audit write
    * did not durably complete, or (fix-round-6) because the admission
-   * WAITER queue itself was already at its own cap. */
+   * WAITER queue itself was already at its own cap. `busyAudit` is
+   * present EXACTLY when `reason` is `admission_busy` (fix-round-7): a
+   * consumer that audits busy refusals must gate its append on
+   * `busyAudit.emit` (once per saturation episode — see
+   * `AdmissionBusyAuditCoalescer`) rather than appending per refusal;
+   * the callback itself still fires on every refusal. */
   onRefuse?: (
     incomingKey: K,
     incomingValue: V,
     reason: BoundedMapRefuseReason,
+    busyAudit?: AdmissionBusyAuditDecision,
   ) => void;
   /**
    * Per-origin quota (AGENTS.md rule 8): the maximum number of entries a
@@ -415,6 +512,14 @@ export class BoundedMap<K, V> {
    * `admitNewKey`.
    */
   private pendingAdmissionWaiters = 0;
+  /**
+   * Per-instance busy-AUDIT coalescing state (fix-round-7) — see
+   * `AdmissionBusyAuditCoalescer`'s doc. Fed from exactly two sites: the
+   * at-cap refusal branch in `set()` (`onBusyRefusal`) and the settlement
+   * `finally` (`onBelowCap`), both synchronous alongside the waiter
+   * counter they mirror.
+   */
+  private readonly busyAuditCoalescer = new AdmissionBusyAuditCoalescer();
 
   constructor(opts: BoundedMapOptions<K, V>) {
     if (!Number.isInteger(opts.maxSize) || opts.maxSize <= 0) {
@@ -547,8 +652,15 @@ export class BoundedMap<K, V> {
     const maxWaiters =
       this.opts.maxPendingAdmissionWaiters ?? MAX_PENDING_ADMISSION_WAITERS;
     if (this.pendingAdmissionWaiters >= maxWaiters) {
-      this.opts.onRefuse?.(key, value, "admission_busy");
-      return { ok: false, reason: "admission_busy" };
+      // Busy-AUDIT coalescing only (fix-round-7): the refusal below is
+      // still returned (and onRefuse still fired) for EVERY at-cap call —
+      // `busyAudit` only tells the audit consumer whether THIS refusal is
+      // the one that audits its saturation episode. See
+      // AdmissionBusyAuditCoalescer's doc for why the at-cap fast path
+      // must not append per refusal.
+      const busyAudit = this.busyAuditCoalescer.onBusyRefusal();
+      this.opts.onRefuse?.(key, value, "admission_busy", busyAudit);
+      return { ok: false, reason: "admission_busy", busyAudit };
     }
     this.pendingAdmissionWaiters += 1;
     try {
@@ -557,6 +669,11 @@ export class BoundedMap<K, V> {
       );
     } finally {
       this.pendingAdmissionWaiters -= 1;
+      // The counter never exceeds the cap (the increment above is guarded
+      // by the same synchronous check), so after ANY decrement it sits
+      // strictly below the cap — the saturation episode, if one was
+      // active, ends exactly here (fix-round-7 busy-audit coalescing).
+      this.busyAuditCoalescer.onBelowCap();
     }
   }
 

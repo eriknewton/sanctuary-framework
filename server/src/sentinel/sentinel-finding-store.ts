@@ -32,6 +32,7 @@ import type { AuditLog } from "../operational/audit-log.js";
 import {
   ON_EVICT_AUDIT_TIMEOUT_MS,
   MAX_PENDING_ADMISSION_WAITERS,
+  AdmissionBusyAuditCoalescer,
 } from "../core/bounded-map.js";
 import {
   SENTINEL_SUMMARY_MAX_CHARS,
@@ -338,8 +339,9 @@ const SATURATION_EVICT_SCAN_CAP = 50;
  * the underlying I/O) — adding storage-level cancellation or
  * compare-and-swap machinery to close this one write would be
  * disproportionate to a residual this narrow (AGENTS.md's minimalism
- * principle: a remediation worse than the bug it fixes). See
- * BUILD_RESULT.md's accepted-residual note for the full record.
+ * principle: a remediation worse than the bug it fixes). This paragraph
+ * IS the accepted-residual record: the trade-off is deliberate, not an
+ * oversight.
  */
 const STORAGE_OP_MARGIN_MS = 10_000;
 const STORE_ADMISSION_DEADLINE_MS = ON_EVICT_AUDIT_TIMEOUT_MS + STORAGE_OP_MARGIN_MS;
@@ -446,6 +448,16 @@ export class SentinelFindingStore {
    * why the synchronous check-then-increment needs no separate lock.
    */
   private pendingAdmissionWaiters = 0;
+  /**
+   * Per-store busy-AUDIT coalescing state (fix-round-7) — the SHARED
+   * implementation from core/bounded-map.ts (`AdmissionBusyAuditCoalescer`,
+   * see its doc for the episode contract), instantiated here for this
+   * store's own admission queue exactly as `BoundedMap` embeds one per map
+   * instance. Fed from the two sites mirroring the waiter counter: the
+   * at-cap refusal branch in `saveFinding` (`onBusyRefusal`) and the
+   * settlement `finally` (`onBelowCap`).
+   */
+  private readonly busyAuditCoalescer = new AdmissionBusyAuditCoalescer();
   // Filter-before-decrypt index (see MAX_SCANNED_RECORDS's doc). Populated
   // incrementally on every saveFinding, and lazily backfilled ONCE from
   // storage (`ensureIndex`) so records written by a PRIOR process instance
@@ -823,16 +835,28 @@ export class SentinelFindingStore {
       // never chained onto `admissionQueue`, so a refused call leaves the
       // queue exactly as it was.
       if (this.pendingAdmissionWaiters >= this.maxPendingAdmissionWaiters) {
-        void this.auditLog?.append(
-          "l2",
-          "finding_store_admission_busy",
-          this.fortressId,
-          {
-            pending_admission_waiters: this.pendingAdmissionWaiters,
-            max_pending_admission_waiters: this.maxPendingAdmissionWaiters,
-          },
-          "failure",
-        );
+        // BUSY-AUDIT COALESCING (fix-round-7 — must match the episode
+        // contract of `AdmissionBusyAuditCoalescer`, core/bounded-map.ts):
+        // this at-cap branch is the fast path a refusal flood hammers, so
+        // a per-refusal append would shift the flood's backlog into the
+        // audit log's uncapped append queue. The busy audit emits once per
+        // saturation episode, carrying the suppressed-refusal count; the
+        // caller-facing typed throw below still fires on every call,
+        // uncoalesced.
+        const busyAudit = this.busyAuditCoalescer.onBusyRefusal();
+        if (busyAudit.emit) {
+          void this.auditLog?.append(
+            "l2",
+            "finding_store_admission_busy",
+            this.fortressId,
+            {
+              pending_admission_waiters: this.pendingAdmissionWaiters,
+              max_pending_admission_waiters: this.maxPendingAdmissionWaiters,
+              suppressed_busy_refusals: busyAudit.suppressedSinceLastAudit,
+            },
+            "failure",
+          );
+        }
         throw new SentinelFindingStoreRefusedError("admission_busy");
       }
       this.pendingAdmissionWaiters += 1;
@@ -851,6 +875,12 @@ export class SentinelFindingStore {
         });
       } finally {
         this.pendingAdmissionWaiters -= 1;
+        // The counter never exceeds the cap (the increment above is
+        // guarded by the same synchronous check), so after ANY decrement
+        // it sits strictly below the cap — the saturation episode, if one
+        // was active, ends exactly here (fix-round-7 busy-audit
+        // coalescing; mirrors `BoundedMap.set()`'s settlement `finally`).
+        this.busyAuditCoalescer.onBelowCap();
       }
     }
     return persisted.retention_until;

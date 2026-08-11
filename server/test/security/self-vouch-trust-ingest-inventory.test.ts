@@ -953,8 +953,8 @@ describe("(g) MUST-FIX 1: an undecodable stored public_key never defeats a local
     // requireNonEmptyString accepted any non-empty string) and MUST fail
     // after it (requireEd25519PublicKeyBase64url rejects a non-decodable
     // key) — both sides land on "refused," which is exactly the point:
-    // mutation-proof (a) in BUILD_RESULT.md reverts the ingest check and
-    // shows this same call SUCCEED instead.
+    // reverting the ingest check (the literal source mutation run as that
+    // fix round's proof) shows this same call SUCCEED instead.
     await expect(
       importTool.handler({ identity: garbageIdentity })
     ).rejects.toThrow(/Ed25519 public key/i);
@@ -1012,9 +1012,9 @@ describe("(g) MUST-FIX 1: an undecodable stored public_key never defeats a local
     // cli/identity, wrap/init, wrap/cli, saveNew/rotation) funnels through
     // before an identity reaches `identities.set(...)`. Before round 3,
     // this call succeeded (save() trusted every caller to have already
-    // validated); the mutation proof in BUILD_RESULT.md removes the
-    // `assertValidStoredIdentity` call from save() and shows this same
-    // call SUCCEED instead of throwing.
+    // validated); removing the `assertValidStoredIdentity` call from
+    // save() (the literal source mutation run as that fix round's proof)
+    // shows this same call SUCCEED instead of throwing.
     const fortress = makeFortress();
     const encKey = derivePurposeKey(fortress.masterKey, "identity-encryption");
     const { storedIdentity } = createIdentity(

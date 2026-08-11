@@ -35,15 +35,18 @@ import type {
  * plain `FederationPeer | null`). An agent reads the federation tool
  * response to decide how to behave (MCP tool responses are product copy
  * for an agent audience, per AGENTS.md's forward-documentation rule), so
- * collapsing all three `BoundedMap` refusal reasons into a bare `null`
- * hid a real distinction the OPERATOR audit trail already had (via
- * `onRefuse` below): "this identity is flooding" (`origin_quota`), "the
- * registry is genuinely full of active peers" (`capacity`), and "the
- * audit trail itself is unavailable right now, retry" (`audit_unavailable`)
- * are three different things to tell an agent, and only the first two were
- * ever distinguishable from the return value alone. `federation/tools.ts`
- * reads `reason` directly off this result to render the accurate
- * agent-facing message.
+ * collapsing every `BoundedMap` refusal reason into a bare `null` hid a
+ * real distinction the OPERATOR audit trail already had (via `onRefuse`
+ * below). The four reasons (`BoundedMapRefuseReason`, core/bounded-map.ts)
+ * — "this identity is flooding" (`origin_quota`), "the registry is
+ * genuinely full of active peers" (`capacity`), "the audit trail itself
+ * is unavailable right now, retry" (`audit_unavailable`), and "the
+ * registry's own admission queue is momentarily saturated, retry shortly"
+ * (`admission_busy`, added fix-round-6) — are four different things to
+ * tell an agent, and under the bare-null shape at most the first two were
+ * distinguishable, via a separate `peerOriginSize` pre-check, never from
+ * the return value itself. `federation/tools.ts` reads `reason` directly
+ * off this result to render the accurate agent-facing message.
  */
 export type RegisterPeerResult =
   | { ok: true; peer: FederationPeer }
@@ -197,7 +200,7 @@ export class FederationRegistry {
           "success"
         );
       },
-      onRefuse: (incomingPeerId, _incomingPeer, reason) => {
+      onRefuse: (incomingPeerId, _incomingPeer, reason, busyAudit) => {
         // FOUR DISTINCT reasons (MUST-FIX 3, fix-round-3 — `capacity` and
         // `audit_unavailable` used to collapse to the same "saturated"
         // audit op, hiding "the audit trail is down" behind "the registry
@@ -207,6 +210,22 @@ export class FederationRegistry {
         // fall into the `capacity` bucket either, or an operator would be
         // told "every peer is active" when the real condition is "this
         // map's admission-waiter queue was momentarily saturated").
+        //
+        // BUSY-AUDIT COALESCING (fix-round-7 — must match the episode
+        // contract of `AdmissionBusyAuditCoalescer`, core/bounded-map.ts):
+        // `admission_busy` is the at-cap fast path, designed to absorb a
+        // hammering flood, so its audit emits once per saturation episode
+        // (with the suppressed-refusal count) rather than per refusal —
+        // per-refusal appends would shift the flood's backlog into the
+        // audit log's uncapped append queue. `busyAudit` accompanies every
+        // busy refusal; if it were ever absent (it is not, by BoundedMap's
+        // construction), falling through to append errs toward MORE audit,
+        // never less. The other three reasons keep their pre-existing
+        // per-refusal appends, and the agent-facing refusal (the typed
+        // `RegisterPeerResult`) is never coalesced.
+        if (reason === "admission_busy" && busyAudit !== undefined && !busyAudit.emit) {
+          return;
+        }
         const op =
           reason === "origin_quota"
             ? "federation_registry_origin_quota_exceeded"
@@ -219,7 +238,12 @@ export class FederationRegistry {
           "l4",
           op,
           "system",
-          { peer_id: incomingPeerId },
+          {
+            peer_id: incomingPeerId,
+            ...(reason === "admission_busy" && busyAudit !== undefined
+              ? { suppressed_busy_refusals: busyAudit.suppressedSinceLastAudit }
+              : {}),
+          },
           "failure"
         );
       },
@@ -452,10 +476,13 @@ export class FederationRegistry {
     return this.peers.delete(peerId);
   }
 
-  /** How many peers `origin` currently holds — used by federation/tools.ts
-   * to pick the right refusal message (origin-quota vs global-capacity)
-   * BEFORE calling registerFromHandshake, since that method only returns
-   * null on refusal without saying why. */
+  /** How many peers `origin` currently holds. Historically how
+   * federation/tools.ts picked its refusal message, when
+   * `registerFromHandshake` returned a bare null on refusal; since the
+   * fix-round-4 typed `RegisterPeerResult`, production callers read
+   * `reason` off the result instead, and this accessor remains for the
+   * adversarial regression suite to assert per-origin accounting
+   * directly. */
   peerOriginSize(origin: string): number {
     return this.peers.originSize(origin);
   }
