@@ -153,6 +153,21 @@ function lockdownStatusFromResult(
   return result.new_status ?? null;
 }
 
+/**
+ * LD4 HUB-STATUS-REVERT-01: statuses set by an OPERATOR safety action
+ * (pause, lockdown) that the persisted local-agents.json snapshot can never
+ * reflect, because those actions call `agentRegistry.updateStatus` only
+ * (in-memory) and do not write back to disk; see the lockdown/unwrap call
+ * sites in `enqueueTier1ControlAction` and the pause/resume/restart cases in
+ * `controlAgent`, none of which call `writePersistedLocalAgents`. See the
+ * invariant comment at `refreshPersistedLocalAgents` for why this set gates
+ * the refresh.
+ */
+const OPERATOR_DURABLE_STATUSES: ReadonlySet<HubAgentStatus> = new Set([
+  "paused",
+  "locked_down",
+]);
+
 function checkChannelTemplateId(value: unknown): ChannelTemplateId {
   if (
     typeof value === "string" &&
@@ -214,6 +229,23 @@ export class HubService {
     const readPersistedLocalAgents = this.deps.readPersistedLocalAgents;
     if (!readPersistedLocalAgents) return;
     for (const record of readPersistedLocalAgents()) {
+      const current = this.deps.agentRegistry.get(record.agent_id);
+      // INVARIANT: an operator-set pause/lockdown must win over the
+      // persisted (wrap-time, or last policy-rebind) snapshot. That file is
+      // written at wrap and on channel-template rebind only; it never
+      // reflects a pause/lockdown/unwrap issued after that, so blindly
+      // `put`-ing it here would silently revert a just-locked-down/paused
+      // agent to whatever status it had at wrap time; the operator would
+      // see a dangerous agent rendered active/protected/verified on the
+      // very next fleet read. Skip the whole record while the live status
+      // is operator-durable; resume/unlock clears it via updateStatus, and
+      // the next refresh after that resumes applying persisted fields
+      // normally. If a refresh ever needs to clear a lockdown, that must be
+      // an explicit, operator-visible action, never a silent side effect of
+      // a read.
+      if (current && OPERATOR_DURABLE_STATUSES.has(current.status)) {
+        continue;
+      }
       this.deps.agentRegistry.put(record);
     }
   }

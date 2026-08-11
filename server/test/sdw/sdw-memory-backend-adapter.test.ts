@@ -156,7 +156,12 @@ class LockTrackingStorage extends MemoryStorage {
 
 function makeAdapter(
   storage: MemoryStorage,
-  overrides: { ownerRef?: string; maxChunkChars?: number } = {},
+  overrides: {
+    ownerRef?: string;
+    maxChunkChars?: number;
+    corpusScanCap?: number;
+    listMaxLimit?: number;
+  } = {},
 ): MemoryBackendAdapter {
   return new SdwMemoryBackendAdapter({
     storage,
@@ -164,6 +169,8 @@ function makeAdapter(
     fortressId: FORTRESS_ID,
     ownerRef: overrides.ownerRef ?? "letta-archive-1",
     maxChunkChars: overrides.maxChunkChars,
+    corpusScanCap: overrides.corpusScanCap,
+    listMaxLimit: overrides.listMaxLimit,
     now: () => NOW,
   });
 }
@@ -177,6 +184,18 @@ async function ownerScopeCorpusKeys(
     ...(await storage.list(SDW_DOCUMENT_CORPUS_NAMESPACE, `chunk.mem.${ownerRef}.`)),
   ];
   return [...new Set(entries.map((entry) => entry.key))].sort();
+}
+
+/**
+ * Counts every storage.read() call so a test can prove decrypt work stayed
+ * bounded (LD4 SDW-SEARCH-DOS-01) instead of scaling with corpus size.
+ */
+class ReadCountingStorage extends MemoryStorage {
+  readCount = 0;
+  override async read(namespace: string, key: string): Promise<Uint8Array | null> {
+    this.readCount++;
+    return super.read(namespace, key);
+  }
 }
 
 describe("SDW memory-backend adapter: insert + get", () => {
@@ -519,6 +538,104 @@ describe("SDW memory-backend adapter: search", () => {
     const results = await adapter.searchPassages({ text: "needle" });
     expect(results).toHaveLength(1);
     expect(results[0]!.passage.passage_id).toBe("span-1");
+  });
+});
+
+describe("SDW memory-backend adapter: per-call scan/decrypt bound (LD4 SDW-SEARCH-DOS-01)", () => {
+  it("fails closed with a typed bound instead of ranking a silently partial corpus scan", async () => {
+    const storage = new MemoryStorage();
+    // corpusScanCap=2 with 3 passages in the owner scope: a full-fidelity
+    // ranked search cannot honestly answer from a 2-of-3 scan, so it must
+    // refuse rather than return results from an arbitrary slice of the
+    // vault as if they were the true top matches.
+    const adapter = makeAdapter(storage, { corpusScanCap: 2, listMaxLimit: 2 });
+    for (const id of ["p1", "p2", "p3"]) {
+      await adapter.insertPassage({ passage_id: id, text: `needle appears in ${id}` }, "user_content");
+    }
+
+    await expect(adapter.searchPassages({ text: "needle" })).rejects.toMatchObject({
+      category: "search_scan_bound",
+    });
+  });
+
+  it("never decrypts a passage body when the corpus exceeds the scan cap, only bounded metadata", async () => {
+    const storage = new ReadCountingStorage();
+    // corpusScanCap=2 with 5 multi-chunk passages: a pre-fix implementation
+    // would decrypt every document's metadata AND its full chunked body
+    // (readPassageText) unconditionally, so read count would scale with the
+    // whole 5-passage corpus. The fix must refuse before any body decrypt,
+    // so read count stays pinned to (roughly) the metadata scan window,
+    // never reaching the chunk reads at all.
+    const adapter = makeAdapter(storage, { corpusScanCap: 2, listMaxLimit: 2, maxChunkChars: 4 });
+    for (const id of ["r1", "r2", "r3", "r4", "r5"]) {
+      await adapter.insertPassage(
+        { passage_id: id, text: `sovereign-memory-passage-${id}-with-several-chunks` },
+        "user_content",
+      );
+    }
+
+    storage.readCount = 0;
+    await expect(adapter.searchPassages({ text: "sovereign" })).rejects.toMatchObject({
+      category: "search_scan_bound",
+    });
+    // Each multi-chunk passage's body alone costs several chunk reads on top
+    // of its one document-metadata read; 5 passages worth of full bodies is
+    // comfortably double digits. A bounded implementation only reads
+    // document metadata for the capped scan window (corpusScanCap=2) before
+    // refusing, so the count stays in the single digits regardless of how
+    // large the real corpus is.
+    expect(storage.readCount).toBeLessThan(10);
+  });
+
+  it("clamps a caller-supplied limit to the configured ceiling instead of decrypting an unbounded result set", async () => {
+    const storage = new MemoryStorage();
+    const adapter = makeAdapter(storage, { corpusScanCap: 5, listMaxLimit: 2 });
+    for (const id of ["c1", "c2", "c3"]) {
+      await adapter.insertPassage({ passage_id: id, text: `text ${id}` }, "user_content");
+    }
+
+    // Number.MAX_SAFE_INTEGER mirrors the pre-fix listPassages default
+    // (options.limit ?? Number.MAX_SAFE_INTEGER); it must clamp to
+    // listMaxLimit=2, not decrypt and return all 3.
+    const listed = await adapter.listPassages({ limit: Number.MAX_SAFE_INTEGER });
+    expect(listed).toHaveLength(2);
+
+    const searched = await adapter.searchPassages({ text: "text", limit: Number.MAX_SAFE_INTEGER });
+    expect(searched.length).toBeLessThanOrEqual(2);
+  });
+
+  it("pages a corpus larger than the scan cap correctly via the after cursor, never claiming a short page is complete when it might not be", async () => {
+    const storage = new MemoryStorage();
+    // corpusScanCap === listMaxLimit === 2: every page is exactly at the cap,
+    // so this proves cursor pagination still reaches every passage even
+    // though no single call ever scans more than 2 documents.
+    const adapter = makeAdapter(storage, { corpusScanCap: 2, listMaxLimit: 2 });
+    for (const id of ["p1", "p2", "p3", "p4", "p5"]) {
+      await adapter.insertPassage({ passage_id: id, text: `text ${id}` }, "user_content");
+    }
+
+    const collected: string[] = [];
+    let after: string | undefined;
+    for (let page = 0; page < 10; page++) {
+      const batch = await adapter.listPassages({ after });
+      if (batch.length === 0) break;
+      collected.push(...batch.map((p) => p.passage_id));
+      after = batch[batch.length - 1]!.passage_id;
+    }
+
+    expect(collected).toEqual(["p1", "p2", "p3", "p4", "p5"]);
+  });
+
+  it("rejects corpusScanCap/listMaxLimit overrides that would raise the module ceiling", () => {
+    expect(() =>
+      makeAdapter(new MemoryStorage(), { corpusScanCap: 2001 }),
+    ).toThrow(SdwValidationError);
+    expect(() =>
+      makeAdapter(new MemoryStorage(), { listMaxLimit: 501 }),
+    ).toThrow(SdwValidationError);
+    expect(() =>
+      makeAdapter(new MemoryStorage(), { corpusScanCap: 1, listMaxLimit: 2 }),
+    ).toThrow(SdwValidationError);
   });
 });
 

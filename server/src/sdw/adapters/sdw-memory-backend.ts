@@ -74,6 +74,40 @@ const DEFAULT_MAX_CHUNK_CHARS = 8192;
 const MAX_CONFIGURABLE_CHUNK_CHARS = 100_000;
 const DEFAULT_SEARCH_LIMIT = 10;
 
+/**
+ * LD4 SDW-SEARCH-DOS-01 rule-8 bound: hard ceiling on the number of document
+ * records (metadata for listPassages, metadata + full chunk-body for
+ * searchPassages) a single searchPassages/listPassages call will decrypt.
+ * Without this, memory_search / memory_list (Tier-3 auto-allowed MCP tools)
+ * let an agent force a full-owner-corpus decrypt on every call by looping,
+ * and cost grows unbounded with vault size. Derivation: the only real-corpus
+ * timing on record for this adapter is the 413-file / 7184 ms first-ingest
+ * measurement above MEMORY_BATCH_LOCK_TIMEOUT_MS (encrypt is at least as
+ * expensive as decrypt); 2000 keeps one call's decrypt work within roughly
+ * that same low-seconds order of magnitude regardless of how large the vault
+ * grows, instead of scaling with it.
+ */
+const MEMORY_CORPUS_SCAN_CAP = 2000;
+
+/**
+ * Hard ceiling on the caller-supplied `limit` for search/list, and the
+ * default when the caller supplies none (searchPassages keeps its own
+ * smaller DEFAULT_SEARCH_LIMIT default; this is the max either can reach). A
+ * limit above this is clamped, never rejected: paging with `after`
+ * (listPassages) or a narrower query (searchPassages tag/text) is how a
+ * caller gets the rest. Deliberately well below MEMORY_CORPUS_SCAN_CAP (see
+ * assertion below) so a scan never stops before filling a full page.
+ */
+const MEMORY_LIST_MAX_LIMIT = 500;
+
+if (MEMORY_CORPUS_SCAN_CAP < MEMORY_LIST_MAX_LIMIT) {
+  // Invariant listPassages relies on to tell "short page" from "capped scan"
+  // apart without a separate truncation flag (see listPassages below). A
+  // constant edit that violates it must fail loudly at import time, not
+  // silently reintroduce a truncated-looking-complete page.
+  throw new Error("MEMORY_CORPUS_SCAN_CAP must be >= MEMORY_LIST_MAX_LIMIT");
+}
+
 /** Everything an insert-or-replace needs, computed before any write happens. */
 interface PreparedPassage {
   readonly documentId: string;
@@ -105,6 +139,16 @@ export interface SdwMemoryBackendAdapterOptions {
   readonly ownerRef: string;
   /** Maximum characters per encrypted chunk (default 8192). */
   readonly maxChunkChars?: number;
+  /**
+   * Override for MEMORY_CORPUS_SCAN_CAP (default; see that constant's
+   * derivation). Only a TIGHTER cap is accepted (1..default): this can
+   * never be raised past the module default, so a caller cannot use this
+   * option to defeat the rule-8 per-call decrypt bound. Test-only in
+   * practice, to exercise the bound without a multi-thousand-passage corpus.
+   */
+  readonly corpusScanCap?: number;
+  /** Same tightening-only contract as corpusScanCap, for MEMORY_LIST_MAX_LIMIT. */
+  readonly listMaxLimit?: number;
   /** Injectable clock for tests; defaults to the system clock. */
   readonly now?: () => string;
 }
@@ -115,6 +159,8 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
   readonly ownerRef: string;
   private readonly passageIdKey: Uint8Array;
   private readonly maxChunkChars: number;
+  private readonly corpusScanCap: number;
+  private readonly listMaxLimit: number;
   private readonly now: () => string;
   /**
    * Process-local duplicate-insert guard for non-transactional backends. This
@@ -143,6 +189,38 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
         "Invalid SDW memory adapter maxChunkChars",
       );
     }
+    const corpusScanCap = options.corpusScanCap ?? MEMORY_CORPUS_SCAN_CAP;
+    if (
+      !Number.isSafeInteger(corpusScanCap) ||
+      corpusScanCap < 1 ||
+      corpusScanCap > MEMORY_CORPUS_SCAN_CAP
+    ) {
+      throw new SdwValidationError(
+        "invalid_identifier",
+        `Invalid SDW memory adapter corpusScanCap (must be 1-${MEMORY_CORPUS_SCAN_CAP})`,
+      );
+    }
+    const listMaxLimit = options.listMaxLimit ?? MEMORY_LIST_MAX_LIMIT;
+    if (
+      !Number.isSafeInteger(listMaxLimit) ||
+      listMaxLimit < 1 ||
+      listMaxLimit > MEMORY_LIST_MAX_LIMIT
+    ) {
+      throw new SdwValidationError(
+        "invalid_identifier",
+        `Invalid SDW memory adapter listMaxLimit (must be 1-${MEMORY_LIST_MAX_LIMIT})`,
+      );
+    }
+    if (corpusScanCap < listMaxLimit) {
+      // Same invariant as the module-level default assertion, re-checked per
+      // instance: listPassages relies on scanning at least `limit` candidates
+      // whenever they exist, so a short page always means "no more" and
+      // never "we stopped scanning too early to tell".
+      throw new SdwValidationError(
+        "invalid_identifier",
+        "Invalid SDW memory adapter options: corpusScanCap must be >= listMaxLimit",
+      );
+    }
     this.storage = options.storage;
     this.corpus = new SdwDocumentCorpusStore({
       storage: options.storage,
@@ -152,6 +230,8 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
     this.ownerRef = options.ownerRef;
     this.passageIdKey = derivePurposeKey(options.masterKey, MEMORY_PASSAGE_ID_HKDF_INFO);
     this.maxChunkChars = maxChunkChars;
+    this.corpusScanCap = corpusScanCap;
+    this.listMaxLimit = listMaxLimit;
     this.now = options.now ?? (() => new Date().toISOString());
   }
 
@@ -313,13 +393,26 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
   }
 
   async searchPassages(query: MemorySearchQuery): Promise<readonly MemorySearchResult[]> {
-    const limit = query.limit ?? DEFAULT_SEARCH_LIMIT;
-    if (!Number.isSafeInteger(limit) || limit < 1) {
+    const rawLimit = query.limit ?? DEFAULT_SEARCH_LIMIT;
+    if (!Number.isSafeInteger(rawLimit) || rawLimit < 1) {
       throw new SdwValidationError("invalid_identifier", "Invalid SDW memory search limit");
     }
+    const limit = Math.min(rawLimit, this.listMaxLimit);
     const needle = query.text.toLowerCase();
+    // Ranking needs every passage's match_count, so unlike listPassages
+    // (which can cap-and-page via the `after` cursor) there is no partial
+    // scan that stays honest: a corpus over the cap fails closed with a
+    // typed bound instead of silently ranking only an arbitrary slice of it
+    // and returning that as if it were the best matches in the vault.
+    const { documents, truncated } = await this.listDocuments(this.corpusScanCap);
+    if (truncated) {
+      throw new SdwValidationError(
+        "search_scan_bound",
+        `SDW memory search corpus exceeds the ${this.corpusScanCap}-passage per-call scan bound; narrow with a tag filter or use memory_list to page instead`,
+      );
+    }
     const results: MemorySearchResult[] = [];
-    for (const document of await this.listDocuments()) {
+    for (const document of documents) {
       if (query.tag !== undefined && !(document.tags ?? []).includes(query.tag)) {
         continue;
       }
@@ -338,16 +431,25 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
   }
 
   async listPassages(options: MemoryListOptions = {}): Promise<readonly MemoryPassage[]> {
-    const limit = options.limit ?? Number.MAX_SAFE_INTEGER;
-    if (!Number.isSafeInteger(limit) || limit < 1) {
+    const rawLimit = options.limit ?? this.listMaxLimit;
+    if (!Number.isSafeInteger(rawLimit) || rawLimit < 1) {
       throw new SdwValidationError("invalid_identifier", "Invalid SDW memory list limit");
     }
+    const limit = Math.min(rawLimit, this.listMaxLimit);
+    // rule-8 bound: this.corpusScanCap >= this.listMaxLimit is asserted in
+    // the constructor (mirroring the module-default assertion above), so a
+    // scan capped at this.corpusScanCap always covers at least `limit`
+    // after-filtered candidates when that many exist. A short page (fewer
+    // than `limit` results) therefore always means "no more past the
+    // cursor", never "we stopped scanning too early to tell"; it is never
+    // presented as complete when it might not be. A FULL page (length ===
+    // limit) means there may be more: the caller pages again with
+    // after=<last returned passage_id>, the standard cursor idiom this
+    // contract already documents, rather than this method claiming
+    // completeness it cannot verify without a second scan.
+    const { documents } = await this.listDocuments(this.corpusScanCap, options.after);
     const passages: MemoryPassage[] = [];
-    for (const document of await this.listDocuments()) {
-      const passageId = this.passageIdOf(document.document_id);
-      if (options.after !== undefined && passageId.localeCompare(options.after) <= 0) {
-        continue;
-      }
+    for (const document of documents) {
       passages.push(this.toPassage(document, await this.readPassageText(document)));
       if (passages.length >= limit) break;
     }
@@ -696,13 +798,36 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
     }
   }
 
-  private async listDocuments(): Promise<readonly SdwDocumentRecord[]> {
+  /**
+   * Decrypt document metadata for up to `maxScan` documents in this owner
+   * scope, in stable key order, optionally starting strictly after
+   * `afterPassageId`. LD4 SDW-SEARCH-DOS-01 rule-8 bound: storage.list()
+   * returns keys already sorted by key with no decryption (both
+   * StorageBackend implementations this adapter ships against, filesystem.ts
+   * and memory.ts, sort their list() output by key; this method's cursor
+   * math depends on that and would silently misorder pages against a future
+   * backend that does not), so the `after` cursor is applied to the
+   * plaintext key BEFORE any document is decrypted, and metadata decrypt
+   * here never exceeds `maxScan` documents regardless of corpus size.
+   * `truncated: true` means more matching entries exist past what was
+   * scanned; a caller must not treat the returned set as "everything".
+   */
+  private async listDocuments(
+    maxScan: number,
+    afterPassageId?: string,
+  ): Promise<{ readonly documents: readonly SdwDocumentRecord[]; readonly truncated: boolean }> {
     const entries = await this.storage.list(
       SDW_DOCUMENT_CORPUS_NAMESPACE,
       this.documentKeyPrefix(),
     );
+    const afterKey =
+      afterPassageId === undefined ? undefined : this.documentKeyPrefix() + afterPassageId;
+    const candidates =
+      afterKey === undefined ? entries : entries.filter((entry) => entry.key > afterKey);
+    const truncated = candidates.length > maxScan;
+    const scanSet = truncated ? candidates.slice(0, maxScan) : candidates;
     const documents: SdwDocumentRecord[] = [];
-    for (const entry of entries) {
+    for (const entry of scanSet) {
       const documentId = entry.key.slice("doc.".length);
       const document = await this.corpus.getDocument(documentId);
       // A vanished entry between list and read is a benign race; anything
@@ -710,7 +835,7 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
       // propagates: fail closed, never skip silently.
       if (document !== null) documents.push(document);
     }
-    return documents;
+    return { documents, truncated };
   }
 
   private async readPassageText(document: SdwDocumentRecord): Promise<string> {

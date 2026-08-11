@@ -461,6 +461,35 @@ function makeRefreshService(storagePath: string): HubService {
   });
 }
 
+/**
+ * Like makeRefreshService, but also hands back the raw registry so a test
+ * can mutate status the way an operator control action does (in-memory
+ * only, no write-back to local-agents.json) without going through the full
+ * async Tier 1 approval flow.
+ */
+function makeRefreshServiceWithRegistry(storagePath: string): {
+  service: HubService;
+  registry: InMemoryLocalAgentRegistry;
+} {
+  const storage = new MemoryStorage();
+  const auditLog = new AuditLog(storage, randomBytes(32));
+  const registry = new InMemoryLocalAgentRegistry();
+  const service = new HubService({
+    identityId: IDENTITY_ID,
+    fortressId: FORTRESS_ID,
+    agentRegistry: registry,
+    readPersistedLocalAgents: () => readPersistedLocalAgents(storagePath),
+    inboxSources: makeInboxSources(makeEmptyInboxState()),
+    activitySources: { auditLog, identityId: IDENTITY_ID },
+    policyBudgetSources: {
+      listPolicySummaries: () => [],
+      listBudgetSummaries: () => [],
+    },
+    agentController: new StubAgentController(),
+  });
+  return { service, registry };
+}
+
 // ═════════════════════════════════════════════════════════════════════
 // Tests
 // ═════════════════════════════════════════════════════════════════════
@@ -539,6 +568,82 @@ describe("Hub agent listing persisted refresh (Finding BB)", () => {
 
       expect(second).toEqual(first);
       expect(second).toEqual(["agent-idempotent"]);
+    });
+  });
+
+  it("preserves an operator-set lockdown status across a later refresh (LD4 HUB-STATUS-REVERT-01)", async () => {
+    await withTmpFortress(async (storagePath) => {
+      const { service, registry } = makeRefreshServiceWithRegistry(storagePath);
+      const record = makeAgent({ agent_id: "agent-lockdown-revert", status: "active" });
+      writePersistedLocalAgents(storagePath, [record]);
+
+      // First read seeds the registry from the persisted (wrap-time) snapshot,
+      // exactly like the real dashboard boot path.
+      expect(
+        service.listAgents().find((a) => a.agent_id === record.agent_id)?.status,
+      ).toBe("active");
+
+      // Simulate what enqueueTier1ControlAction's lockdown handler does on a
+      // real operator lockdown: mutate the in-memory registry only. Nothing
+      // ever writes this back to local-agents.json (see the invariant
+      // comment on refreshPersistedLocalAgents), so the file on disk still
+      // says "active".
+      registry.updateStatus(record.agent_id, "locked_down", "operator_lockdown");
+      expect(
+        service.listAgents().find((a) => a.agent_id === record.agent_id)?.status,
+      ).toBe("locked_down");
+
+      // A SECOND read is the regression case: refreshPersistedLocalAgents runs
+      // again on every listAgents() call. Before the fix it re-`put` the
+      // stale "active" persisted record over the live "locked_down" one, so
+      // an operator polling the fleet view would see a locked-down agent
+      // rendered as active/protected/verified.
+      expect(
+        service.listAgents().find((a) => a.agent_id === record.agent_id)?.status,
+      ).toBe("locked_down");
+    });
+  });
+
+  it("preserves an operator-set pause status across a later refresh (LD4 HUB-STATUS-REVERT-01)", async () => {
+    await withTmpFortress(async (storagePath) => {
+      const { service, registry } = makeRefreshServiceWithRegistry(storagePath);
+      const record = makeAgent({ agent_id: "agent-pause-revert", status: "active" });
+      writePersistedLocalAgents(storagePath, [record]);
+
+      expect(
+        service.listAgents().find((a) => a.agent_id === record.agent_id)?.status,
+      ).toBe("active");
+
+      // Simulate controlAgent's synchronous pause case: registry.updateStatus
+      // with no status_reason_class, same as the real pause path.
+      registry.updateStatus(record.agent_id, "paused");
+      expect(
+        service.listAgents().find((a) => a.agent_id === record.agent_id)?.status,
+      ).toBe("paused");
+      expect(
+        service.listAgents().find((a) => a.agent_id === record.agent_id)?.status,
+      ).toBe("paused");
+    });
+  });
+
+  it("still applies the persisted snapshot for a non-durable status (no lockdown/pause held)", async () => {
+    await withTmpFortress(async (storagePath) => {
+      const { service, registry } = makeRefreshServiceWithRegistry(storagePath);
+      const record = makeAgent({ agent_id: "agent-normal-refresh", status: "active" });
+      writePersistedLocalAgents(storagePath, [record]);
+      expect(
+        service.listAgents().find((a) => a.agent_id === record.agent_id)?.status,
+      ).toBe("active");
+
+      // An ordinary status (e.g. a live "error") is NOT operator-durable and
+      // must keep tracking the persisted snapshot on refresh, so a rebind or
+      // a fresh wrap-time write for this agent_id still reaches the reader.
+      registry.updateStatus(record.agent_id, "error", "harness_error");
+      const rewritten = { ...record, status: "active" as const };
+      writePersistedLocalAgents(storagePath, [rewritten]);
+      expect(
+        service.listAgents().find((a) => a.agent_id === record.agent_id)?.status,
+      ).toBe("active");
     });
   });
 });
