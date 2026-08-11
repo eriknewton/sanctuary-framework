@@ -490,6 +490,42 @@ function makeRefreshServiceWithRegistry(storagePath: string): {
   return { service, registry };
 }
 
+/**
+ * Like makeRefreshServiceWithRegistry, but wires BOTH persistence callbacks
+ * (`readPersistedLocalAgents` AND `writePersistedLocalAgents`) to the same
+ * on-disk file, and routes status changes through the real production
+ * methods (`controlAgent`, `bindAgentChannelTemplate` + `resolveInboxItem`)
+ * instead of mutating the registry directly. This is required to exercise
+ * `persistLocalAgentStatusBestEffort` (LD4 HUB-STATUS-REVERT-01 fix-round-2),
+ * which only fires from those real call sites.
+ */
+function makeDurableStatusService(storagePath: string): {
+  service: HubService;
+  registry: InMemoryLocalAgentRegistry;
+  controller: StubAgentController;
+} {
+  const storage = new MemoryStorage();
+  const auditLog = new AuditLog(storage, randomBytes(32));
+  const registry = new InMemoryLocalAgentRegistry();
+  const controller = new StubAgentController();
+  const service = new HubService({
+    identityId: IDENTITY_ID,
+    fortressId: FORTRESS_ID,
+    agentRegistry: registry,
+    readPersistedLocalAgents: () => readPersistedLocalAgents(storagePath),
+    writePersistedLocalAgents: (records) =>
+      writePersistedLocalAgents(storagePath, records),
+    inboxSources: makeInboxSources(makeEmptyInboxState()),
+    activitySources: { auditLog, identityId: IDENTITY_ID },
+    policyBudgetSources: {
+      listPolicySummaries: () => [],
+      listBudgetSummaries: () => [],
+    },
+    agentController: controller,
+  });
+  return { service, registry, controller };
+}
+
 // ═════════════════════════════════════════════════════════════════════
 // Tests
 // ═════════════════════════════════════════════════════════════════════
@@ -644,6 +680,91 @@ describe("Hub agent listing persisted refresh (Finding BB)", () => {
       expect(
         service.listAgents().find((a) => a.agent_id === record.agent_id)?.status,
       ).toBe("active");
+    });
+  });
+
+  it("preserves a resume across a channel-template rebind that persisted the prior pause (LD4 HUB-STATUS-REVERT-01 fix-round-2)", async () => {
+    await withTmpFortress(async (storagePath) => {
+      const { service, controller } = makeDurableStatusService(storagePath);
+      const record = makeAgent({ agent_id: "agent-resume-durable", status: "active" });
+      writePersistedLocalAgents(storagePath, [record]);
+
+      // Seed the registry from the persisted (wrap-time) snapshot, exactly
+      // like the real dashboard boot path.
+      expect(
+        service.listAgents().find((a) => a.agent_id === record.agent_id)?.status,
+      ).toBe("active");
+
+      // 1. Operator pauses through the REAL controlAgent path (not a direct
+      // registry mutation). Before fix-round-2 this updated memory only;
+      // now it also persists, so disk already reads "paused" here.
+      await service.controlAgent(record.agent_id, "pause");
+      expect(
+        service.listAgents().find((a) => a.agent_id === record.agent_id)?.status,
+      ).toBe("paused");
+
+      // 2. A channel-template rebind fires (e.g. a policy update mid-pause).
+      // bindAgentChannelTemplate's approval handler persists the WHOLE live
+      // registry unconditionally, so it re-writes "paused" to disk — this
+      // call exists independently of the fix and is the source of the
+      // stale-file hazard the fix closes.
+      const rebind = service.bindAgentChannelTemplate(
+        record.agent_id,
+        "read-then-report",
+      );
+      await service.resolveInboxItem(rebind.inbox_item_id, "approve");
+      expect(
+        service.listAgents().find((a) => a.agent_id === record.agent_id)
+          ?.channel_template_id,
+      ).toBe("read-then-report");
+
+      // 3. Operator resumes through the REAL controlAgent path.
+      await service.controlAgent(record.agent_id, "resume");
+      expect(
+        service.listAgents().find((a) => a.agent_id === record.agent_id)?.status,
+      ).toBe("active");
+
+      // 4. THE REGRESSION CASE: a later refresh (another listAgents() call,
+      // or a fresh boot reading the same file) must see the resume, not the
+      // pause frozen onto disk by the rebind in step 2. Pre-fix, resume
+      // never persisted, so this read reverted the agent back to "paused"
+      // even though the operator's last action was a resume.
+      expect(
+        service.listAgents().find((a) => a.agent_id === record.agent_id)?.status,
+      ).toBe("active");
+      expect(controller.calls.map((c) => c.action)).toEqual([
+        "pause",
+        "bindChannelTemplate",
+        "resume",
+      ]);
+    });
+  });
+
+  it("still preserves an operator pause across a rebind when there is no later resume (LD4 HUB-STATUS-REVERT-01 fix-round-2)", async () => {
+    await withTmpFortress(async (storagePath) => {
+      const { service } = makeDurableStatusService(storagePath);
+      const record = makeAgent({ agent_id: "agent-pause-durable", status: "active" });
+      writePersistedLocalAgents(storagePath, [record]);
+
+      expect(
+        service.listAgents().find((a) => a.agent_id === record.agent_id)?.status,
+      ).toBe("active");
+
+      await service.controlAgent(record.agent_id, "pause");
+      const rebind = service.bindAgentChannelTemplate(
+        record.agent_id,
+        "read-then-report",
+      );
+      await service.resolveInboxItem(rebind.inbox_item_id, "approve");
+
+      // No resume in between: the OPERATOR_DURABLE_STATUSES gate at
+      // refreshPersistedLocalAgents keeps holding here regardless of the
+      // fix (defense in depth), and the new best-effort persist keeps disk
+      // in step with memory too. Either mechanism alone is enough to pass
+      // this case; the resume test above is the one that needs BOTH.
+      expect(
+        service.listAgents().find((a) => a.agent_id === record.agent_id)?.status,
+      ).toBe("paused");
     });
   });
 });

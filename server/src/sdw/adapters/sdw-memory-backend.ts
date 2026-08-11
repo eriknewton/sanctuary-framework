@@ -811,11 +811,27 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
    * here never exceeds `maxScan` documents regardless of corpus size.
    * `truncated: true` means more matching entries exist past what was
    * scanned; a caller must not treat the returned set as "everything".
+   *
+   * LD4 fix-round-2: the cursor comparison MUST use the same ordering as
+   * storage.list()'s sort, or the filter disagrees with the iteration order
+   * and silently drops or repeats entries across pages. Both shipping
+   * backends sort with `String.prototype.localeCompare` (filesystem.ts,
+   * memory.ts), which is a locale-collation order, NOT the code-unit order
+   * of `>`; they diverge across the passage_id charset
+   * (`[A-Za-z0-9._:@+-]`, and base64url `[A-Za-z0-9_-]`), e.g. `"_" > "Z"`
+   * in code-unit order but `"_".localeCompare("Z") < 0` under default
+   * collation. Comparing with `localeCompare` here matches the iteration
+   * order exactly, so the cursor never skips or repeats a record.
    */
   private async listDocuments(
     maxScan: number,
     afterPassageId?: string,
   ): Promise<{ readonly documents: readonly SdwDocumentRecord[]; readonly truncated: boolean }> {
+    // DEBT: storage.list() itself still enumerates the full owner-scope
+    // corpus (O(corpus) key listing, no decryption) before the maxScan cap
+    // below limits the decrypt work. Accepted as a residual, not fixed
+    // here; see the LD4 SDW-SEARCH-DOS-01 rule-8 bound above for what IS
+    // bounded.
     const entries = await this.storage.list(
       SDW_DOCUMENT_CORPUS_NAMESPACE,
       this.documentKeyPrefix(),
@@ -823,7 +839,9 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
     const afterKey =
       afterPassageId === undefined ? undefined : this.documentKeyPrefix() + afterPassageId;
     const candidates =
-      afterKey === undefined ? entries : entries.filter((entry) => entry.key > afterKey);
+      afterKey === undefined
+        ? entries
+        : entries.filter((entry) => entry.key.localeCompare(afterKey) > 0);
     const truncated = candidates.length > maxScan;
     const scanSet = truncated ? candidates.slice(0, maxScan) : candidates;
     const documents: SdwDocumentRecord[] = [];

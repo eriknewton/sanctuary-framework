@@ -626,6 +626,45 @@ describe("SDW memory-backend adapter: per-call scan/decrypt bound (LD4 SDW-SEARC
     expect(collected).toEqual(["p1", "p2", "p3", "p4", "p5"]);
   });
 
+  it("pages a mixed-charset corpus without dropping or duplicating any passage across pages (LD4 fix-round-2 cursor-order mismatch)", async () => {
+    // Regression for a fix-round-2 gate finding: the `after` cursor was
+    // compared with code-unit `>` while storage.list() (both shipping
+    // backends) sorts with `localeCompare`. Those orderings diverge across
+    // the passage_id charset (SDW_IDENTIFIER_PATTERN allows
+    // [A-Za-z0-9._:@+-]), e.g. under localeCompare "_" sorts before "A" and
+    // "Z", but under code-unit "_" (0x5f) sorts after every uppercase
+    // letter (0x41-0x5a). A code-unit cursor walking a localeCompare-sorted
+    // list re-admits already-seen keys and skips over ones it jumped past,
+    // which is exactly the drop/duplicate pattern asserted below.
+    const storage = new MemoryStorage();
+    const ids = [
+      "A", "Z", "Ab", "M9", "a", "z", "_", "_x", "9", "-", "-x", "1", "0", "ZZ",
+    ];
+    // corpusScanCap === listMaxLimit === 3: forces at least 5 pages over 14
+    // passages, so the cursor is exercised across every divergent boundary
+    // in the charset, not just a single split point.
+    const adapter = makeAdapter(storage, { corpusScanCap: 3, listMaxLimit: 3 });
+    for (const id of ids) {
+      await adapter.insertPassage({ passage_id: id, text: `text ${id}` }, "user_content");
+    }
+
+    const collected: string[] = [];
+    let after: string | undefined;
+    for (let page = 0; page < 20; page++) {
+      const batch = await adapter.listPassages({ after });
+      if (batch.length === 0) break;
+      collected.push(...batch.map((p) => p.passage_id));
+      after = batch[batch.length - 1]!.passage_id;
+    }
+
+    // Every passage appears EXACTLY once; storage.list()'s localeCompare
+    // order is the ground truth for "the" correct order, so compare against
+    // that rather than insertion order.
+    const expectedOrder = [...ids].sort((x, y) => x.localeCompare(y));
+    expect(collected).toEqual(expectedOrder);
+    expect(new Set(collected).size).toBe(ids.length);
+  });
+
   it("rejects corpusScanCap/listMaxLimit overrides that would raise the module ceiling", () => {
     expect(() =>
       makeAdapter(new MemoryStorage(), { corpusScanCap: 2001 }),
