@@ -335,6 +335,7 @@ export function createReputationTools(
             identity_id: identity.identity_id,
             result: "success",
             details: {
+              attestation_id: projection.attestation_id,
               interaction_id: projection.interaction_id,
               outcome_type: projection.outcome_type,
               outcome_result: projection.outcome_result,

@@ -416,6 +416,44 @@ describe("LD6 BP-DEADLINE-03: bridge_commit durable admission-completion oracle"
     expect(entries.length).toBe(1); // only the pre-seeded foreign record
   });
 
+  it("existence guard rejects a signed commitment whose stored outcome no longer opens it", async () => {
+    const rig = setup();
+    await seedIdentities(rig);
+    const outcome = makeOutcome({ session_id: "ld6-tampered-outcome" });
+    const commitment = createBridgeCommitment(
+      outcome,
+      rig.signer.storedIdentity,
+      derivePurposeKey(rig.masterKey, "identity-encryption")
+    );
+    const tamperedOutcome = { ...outcome, rounds: outcome.rounds + 1 };
+    const bridgeEncKey = derivePurposeKey(rig.masterKey, "bridge-commitments");
+    const record = {
+      commitment,
+      outcome: tamperedOutcome,
+      origin: "agent:preseed",
+    };
+    const encrypted: EncryptedPayload = encrypt(
+      stringToBytes(JSON.stringify(record)),
+      bridgeEncKey
+    );
+    await rig.storage.write(
+      "_bridge",
+      commitment.bridge_commitment_id,
+      stringToBytes(JSON.stringify(encrypted))
+    );
+
+    const result = await callToolSafe(rig.commit, {
+      ...outcome,
+      identity_id: rig.signer.storedIdentity.identity_id,
+    });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(String(result.value.error)).toMatch(/occupied.*intent verification/i);
+      expect(result.value.already_committed).toBeUndefined();
+    }
+    expect((await rig.storage.list("_bridge")).length).toBe(1);
+  });
+
   it("mutant 3 guard (caller-success-without-record): a deadline timeout on a stalled audit write NEVER surfaces a caller-visible success", async () => {
     vi.useFakeTimers();
     try {
@@ -676,13 +714,10 @@ describe("LD6 BP-DEADLINE-03: reputation_record durable admission-completion ora
       rig.storage,
       rig.masterKey,
       "reputation_record",
-      "interaction_id"
+      "attestation_id"
     );
     expect(commitIdsAtBoundary.has(attestationId)).toBe(true);
-    // Reconciled audit entries key on interaction_id (not the store key) --
-    // see ReputationRecordAuditProjection; assert this exact interaction_id
-    // has no success entry yet.
-    expect(auditIdsAtBoundary.has(args.interaction_id)).toBe(false);
+    expect(auditIdsAtBoundary.has(attestationId)).toBe(false);
 
     const second = await callToolSafe(rig.record, args, rig.signer.publicIdentity.did);
     expect(second.ok).toBe(true);
@@ -695,9 +730,9 @@ describe("LD6 BP-DEADLINE-03: reputation_record durable admission-completion ora
       rig.storage,
       rig.masterKey,
       "reputation_record",
-      "interaction_id"
+      "attestation_id"
     );
-    expect(auditIdsAfter.has(args.interaction_id)).toBe(true);
+    expect(auditIdsAfter.has(attestationId)).toBe(true);
     expect((await rig.storage.list("_reputation")).length).toBe(1);
   });
 

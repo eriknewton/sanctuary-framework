@@ -744,7 +744,7 @@ class BridgeStore {
       return false;
     }
     const verification = verifyBridgeCommitment(commitment, outcome, committerPublicKey);
-    return verification.checks.signature_valid;
+    return verification.valid;
   }
 
   /** Raw promise-chain primitive. Never call directly — see
