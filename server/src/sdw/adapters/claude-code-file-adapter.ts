@@ -231,12 +231,31 @@ export async function ingestClaudeCodeMemorySnapshot(
   };
 }
 
+/**
+ * Page through the whole owner scope via the `after` cursor. listPassages
+ * caps decrypt work to a bounded per-call scan (LD4 SDW-SEARCH-DOS-01); an
+ * export must see the WHOLE vault, so it pages explicitly instead of relying
+ * on one call to return everything, which would silently under-export a
+ * vault larger than the per-call cap.
+ */
+async function listAllPassages(adapter: MemoryBackendAdapter): Promise<readonly MemoryPassage[]> {
+  const all: MemoryPassage[] = [];
+  let after: string | undefined;
+  for (;;) {
+    const page = await adapter.listPassages({ after });
+    if (page.length === 0) break;
+    all.push(...page);
+    after = page[page.length - 1]?.passage_id;
+  }
+  return all;
+}
+
 export async function emitClaudeCodeMemoryDirectory(
   adapter: MemoryBackendAdapter,
   outputDir: string,
 ): Promise<EmitClaudeCodeMemoryResult> {
   const rootDir = resolve(outputDir);
-  const passages = (await adapter.listPassages())
+  const passages = (await listAllPassages(adapter))
     .filter(isClaudeCodeMemoryPassage)
     .sort(compareClaudeCodePassagesForEmit);
 
