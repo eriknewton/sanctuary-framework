@@ -1,0 +1,22 @@
+# Direct dependencies for pass-secret-service, the headless D-Bus Secret
+# Service backend this action installs so tests exercising the
+# libsecret/keychain code path have something to talk to on Linux CI runners.
+#
+# CSO-CICD-01: this pip install used to run unpinned, in the same job as
+# RELEASE_SIGNING_KEY (publish-on-tag.yml). Hash-pinning every package, direct
+# and transitive (via --generate-hashes in requirements.txt), means a
+# compromised or typosquatted release on PyPI cannot install silently even if
+# a maintainer bumps a version here without re-auditing it: the installed
+# bytes must match a hash captured at pin time. The signing key is also now
+# scoped out of this job entirely (see publish-on-tag.yml), so this pin is
+# defense in depth, not the only control.
+#
+# Regeneration command (matches the Concordia sidecar convention in
+# sidecars/concordia/requirements.in; needs the system build deps this
+# action's own "Install libsecret and pass-secret-service prerequisites" step
+# installs, since pygobject/pycairo build from source):
+#   python3.12 -m venv .venv && .venv/bin/pip install pip-tools
+#   .venv/bin/pip-compile --generate-hashes --output-file requirements.txt requirements.in
+pygobject<3.50
+cryptography
+pass-secret-service

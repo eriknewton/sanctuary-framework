@@ -29,7 +29,11 @@ jobs:
       # so a CI-built extension can never upgrade a locally-built install (the
       # v1.7.2 artifact shipped as 0.1.0/1 against an active 0.1.0/1235 for
       # exactly this reason — confirmed 2026-08-05 by reading the artifact plist).
-      - uses: actions/checkout@v7
+      # CSO-CICD-02 (supply-chain pin): release-triggered workflows call
+      # third-party actions by immutable commit SHA, not a mutable tag, so a
+      # hijacked upstream tag cannot inject code into this signing/notarizing
+      # job.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
@@ -372,7 +376,7 @@ jobs:
           fi
 
       - name: Upload signed artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: Sanctuary-CastleWall-${{ inputs.version_tag || github.event.release.tag_name }}
           path: |

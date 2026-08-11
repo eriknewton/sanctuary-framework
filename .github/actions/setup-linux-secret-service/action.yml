@@ -22,16 +22,23 @@ runs:
           pkg-config \
           gir1.2-glib-2.0
 
+    # CSO-CICD-01: pygobject, cryptography, and pass-secret-service (plus
+    # their full transitive tree) are hash-pinned in requirements.txt, next
+    # to this action.yml, and installed with --require-hashes so a
+    # compromised or typosquatted PyPI release cannot install silently.
+    # `pip` and `wheel` themselves stay unpinned here, matching the existing
+    # convention in this same release pipeline (publish-on-tag.yml's
+    # Concordia sidecar step also runs a bare `pip install --upgrade pip`);
+    # pip-tools treats pip/setuptools/wheel as bootstrap tooling it will not
+    # pin by default (`--allow-unsafe` opts in, and this repo does not).
     - name: Install pass-secret-service
       shell: bash
       run: |
         set -euo pipefail
         python3 -m venv "$HOME/pss-venv"
         "$HOME/pss-venv/bin/pip" install --quiet --upgrade pip wheel
-        "$HOME/pss-venv/bin/pip" install --quiet \
-          "pygobject<3.50" \
-          cryptography \
-          pass-secret-service
+        "$HOME/pss-venv/bin/pip" install --quiet --require-hashes \
+          -r "$GITHUB_ACTION_PATH/requirements.txt"
 
         SESSION_FILE="$(find "$HOME/pss-venv/lib" -path '*/pass_secret_service/interfaces/session.py' -print -quit)"
         if [ -z "$SESSION_FILE" ]; then
