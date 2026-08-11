@@ -41,6 +41,10 @@ import {
   bridgeCountBucket,
   isConcordiaBridgeReputationContext,
 } from "./bridge-metrics.js";
+import {
+  MAX_PENDING_ADMISSION_WAITERS,
+  ON_EVICT_AUDIT_TIMEOUT_MS,
+} from "../core/bounded-map.js";
 
 // ─── Types ────────────────────────────────────────────────────────────────
 
@@ -556,20 +560,33 @@ export function verifyReputationBundleCompleteness(
 
 // ─── Reputation Store: growth bounds (LD3 gate fix-round, DEFECT 1) ───────
 //
-// record() is the SINGLE chokepoint every `_reputation` writer goes through
-// (reputation_record's handler, bridge_attest, and every direct test/
-// internal caller). The pre-fix BRIDGE-BP-01 pass bounded only bridge_attest's
-// OWN per-origin-per-context share of `_reputation` (see
-// countAttestationsByOriginForContext); the generic, Tier-2
-// (anomaly-gated-auto-allow) `reputation_record` MCP tool called record()
-// directly with no origin and no cap, so an attacker could grow
-// `_reputation` without bound through THAT tool alone, defeating the
-// bridge-only quota and leaving every O(N) decrypt-scan over `_reputation`
-// (this file has several) with no real worst-case bound. Bounding the
-// chokepoint itself — rather than one more consumer — closes the class for
-// every present and future writer, mirroring the "bound at the shared
-// substrate, not one consumer" lesson BridgeStore/MAX_HANDSHAKE_* already
-// apply to their own namespaces.
+// record() and importBundle() are the TWO writers of `_reputation`, and (LD3
+// gate fix-round-2, MUST-FIX 1) both now route their writes through the SAME
+// low-level admission+quota primitive: assertRecordQuotaForCount() run inside
+// runAdmissionExclusiveBounded()'s single per-instance lock. The pre-fix
+// BRIDGE-BP-01 pass bounded only bridge_attest's OWN per-origin-per-context
+// share of `_reputation` (see countAttestationsByOriginForContext); the
+// generic, Tier-2 (anomaly-gated-auto-allow) `reputation_record` MCP tool
+// called record() directly with no origin and no cap, so an attacker could
+// grow `_reputation` without bound through THAT tool alone. The fix-round-1
+// pass closed that for record() but left importBundle() writing directly
+// (bypassing both the quota check and the admission lock) — a Tier-1
+// (human-approved) `reputation_import` call could still grow `_reputation`
+// past the cap indefinitely across repeated approved imports, and every O(N)
+// decrypt-scan over `_reputation` (this file has several) had no real
+// worst-case bound as long as EITHER writer could bypass it. Bounding the
+// SHARED PRIMITIVE both writers call — rather than one more consumer —
+// closes the class for every present and future writer, mirroring the
+// "bound at the shared substrate, not one consumer" lesson BridgeStore/
+// MAX_HANDSHAKE_* already apply to their own namespaces. A SECOND, INSTANCE-
+// level defect (LD3 gate fix-round-2, MUST-FIX 2) compounded this: production
+// constructed TWO ReputationStore instances over the SAME `_reputation`
+// backend (createReputationTools and createBridgeTools each built their own),
+// so even a correctly-bounded chokepoint had two independent in-memory
+// admission locks and quota views that could both observe headroom and both
+// write, overshooting the cap together. index.ts now constructs exactly ONE
+// ReputationStore and injects it into both tool factories — see index.ts's
+// composition-root comment at the `createBridgeTools` call site.
 
 /**
  * Global ceiling on total persisted `_reputation` records, checked by
@@ -611,16 +628,21 @@ export const REPUTATION_UNKNOWN_ORIGIN = "agent:unknown";
 export type ReputationStoreRefuseReason =
   | "origin_quota"
   | "capacity"
-  | "scan_unavailable";
+  | "scan_unavailable"
+  | "admission_busy";
 
 /**
- * Typed refusal thrown by ReputationStore's record()-chokepoint quota
- * check. `capacity` and `origin_quota` are ordinary fail-closed refusals;
- * `scan_unavailable` means the pre-write quota scan itself could not
- * complete (a storage.list error, or an entry that failed to read/decrypt)
- * — treated as a refusal rather than "assume headroom," mirroring
- * BridgeStoreQuotaError's identical contract on the sibling `_bridge`
- * namespace (bridge/tools.ts).
+ * Typed refusal thrown by ReputationStore's record()/importBundle()
+ * chokepoint quota check. `capacity` and `origin_quota` are ordinary
+ * fail-closed refusals; `scan_unavailable` means the pre-write quota scan
+ * itself could not complete (a storage.list error, or an entry that failed
+ * to read/decrypt) — treated as a refusal rather than "assume headroom,"
+ * mirroring BridgeStoreQuotaError's identical contract on the sibling
+ * `_bridge` namespace (bridge/tools.ts). `admission_busy` (LD3 gate
+ * fix-round-2, MUST-FIX 3) is a FOURTH, distinct reason: this call never
+ * even reached the quota scan, because MAX_PENDING_ADMISSION_WAITERS other
+ * callers were already queued for this store's admission lock — see
+ * `runAdmissionExclusiveBounded`'s doc.
  */
 export class ReputationStoreQuotaError extends Error {
   readonly reason: ReputationStoreRefuseReason;
@@ -630,8 +652,11 @@ export class ReputationStoreQuotaError extends Error {
         ? "Reputation store: origin per-write quota exceeded"
         : reason === "capacity"
           ? "Reputation store: capacity exceeded"
-          : "Reputation store: could not confirm quota headroom " +
-            "(storage scan failed); refusing to write"
+          : reason === "admission_busy"
+            ? "Reputation store: admission queue is saturated; refusing to " +
+              "write (retry shortly)"
+            : "Reputation store: could not confirm quota headroom " +
+              "(storage scan failed); refusing to write"
     );
     this.name = "ReputationStoreQuotaError";
     this.reason = reason;
@@ -639,15 +664,94 @@ export class ReputationStoreQuotaError extends Error {
 }
 
 /**
- * Test-only override for the record()-chokepoint growth bounds (LD3 gate
- * fix-round DEFECT 1). Production call sites never set this — it exists
- * solely so a capacity/quota-refusal test can drive a small cap instead of
- * performing thousands of real writes to reach the production ceiling
- * (mirrors BridgeToolsTestOverrides in bridge/tools.ts).
+ * Test-only override for the record()/importBundle()-chokepoint growth
+ * bounds (LD3 gate fix-round DEFECT 1 / fix-round-2). Production call sites
+ * never set this — it exists solely so a capacity/quota-refusal test can
+ * drive a small cap instead of performing thousands of real writes to reach
+ * the production ceiling (mirrors BridgeToolsTestOverrides in
+ * bridge/tools.ts).
  */
 export interface ReputationStoreTestOverrides {
   maxReputationRecords?: number;
   maxReputationRecordsPerOrigin?: number;
+  /**
+   * Cap on this store's admission-WAITER queue (LD3 gate fix-round-2,
+   * MUST-FIX 3). Defaults to MAX_PENDING_ADMISSION_WAITERS (core/
+   * bounded-map.ts — shared, not re-derived). Test-only override, same
+   * shape as the two above.
+   */
+  maxPendingAdmissionWaiters?: number;
+}
+
+/**
+ * Bounds the whole admission critical section `runAdmissionExclusiveBounded`
+ * guards (LD3 gate fix-round-2, MUST-FIX 3 — same class as
+ * core/bounded-map.ts's `onEvict` timeout and
+ * sentinel-finding-store.ts's `STORE_ADMISSION_DEADLINE_MS`, applied here to
+ * `_reputation`'s own admission lock): a hung `storage.list`/`read`/`write`
+ * call inside the locked section would otherwise retain the lock
+ * indefinitely and wedge every later record()/importBundle() admission
+ * behind it. ON_EVICT_AUDIT_TIMEOUT_MS is reused rather than re-derived (it
+ * is itself derived from audit-log.ts's two-phase lock-acquisition + write-
+ * hold deadline contract — see that constant's doc, core/bounded-map.ts);
+ * STORAGE_OP_MARGIN_MS is a defensive backstop for this store's OWN
+ * storage.list/read/write calls, which carry no settle-time contract at all
+ * (storage/interface.ts). Kept as a LOCAL constant, not imported from
+ * sentinel-finding-store.ts, for the same module-boundary reason
+ * REPUTATION_UNKNOWN_ORIGIN is this file's own constant rather than an
+ * import — the two derivations must stay numerically identical, which is
+ * why both are pinned to ON_EVICT_AUDIT_TIMEOUT_MS + the same margin
+ * (cross-file pin: must match STORAGE_OP_MARGIN_MS /
+ * STORE_ADMISSION_DEADLINE_MS in sentinel-finding-store.ts and
+ * bridge/tools.ts).
+ *
+ * ACCEPTED RESIDUAL (mirrors sentinel-finding-store.ts's identical
+ * paragraph, recorded honestly, not "fixed"): a storage call that hangs
+ * PAST this deadline and later completes can still land a single detached
+ * write after the triggering admission was already refused — the deadline
+ * stops this call from WAITING, it cannot CANCEL the underlying storage
+ * operation (no cancellation or compare-and-swap primitive exists). The
+ * overshoot this can cause is bounded to exactly one extra write, never
+ * unbounded growth, and requires storage to pathologically hang past a
+ * multi-second deadline and still succeed.
+ */
+const REPUTATION_STORAGE_OP_MARGIN_MS = 10_000;
+const REPUTATION_STORE_ADMISSION_DEADLINE_MS =
+  ON_EVICT_AUDIT_TIMEOUT_MS + REPUTATION_STORAGE_OP_MARGIN_MS;
+
+/**
+ * Race `promise` against a timer that rejects after `ms`. Mirrors
+ * core/bounded-map.ts's (unexported) `withTimeout` / sentinel-finding-
+ * store.ts's `withDeadline` — reproduced here rather than reaching across a
+ * module boundary for a five-line helper (same reasoning as
+ * REPUTATION_UNKNOWN_ORIGIN's doc). Used only to bound
+ * runAdmissionExclusiveBounded's critical section; a timeout here rejects
+ * the whole admission call, the same fail-closed outcome as any other
+ * admission failure.
+ */
+function withReputationAdmissionDeadline<T>(
+  promise: Promise<T>,
+  ms: number
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(
+        new Error(
+          `reputation-store: admission did not settle within ${ms}ms`
+        )
+      );
+    }, ms);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err instanceof Error ? err : new Error(String(err)));
+      }
+    );
+  });
 }
 
 // ─── Reputation Store ─────────────────────────────────────────────────────
@@ -659,20 +763,36 @@ export class ReputationStore {
   private masterKey: Uint8Array;
   private readonly maxRecords: number;
   private readonly maxRecordsPerOrigin: number;
+  private readonly maxPendingAdmissionWaiters: number;
   /**
-   * Serializes the check-then-write critical section in record() (LD3 gate
-   * fix-round DEFECT 2): a single promise chain per ReputationStore
-   * INSTANCE, not per origin, because assertRecordQuota reads both the
-   * per-origin count AND the global `_reputation` size — a lock scoped to
-   * one origin could not stop two DIFFERENT origins from racing past the
-   * global MAX_REPUTATION_RECORDS ceiling together. Mirrors BoundedMap's
+   * Live count of callers currently occupying this store's admission-waiter
+   * cap (LD3 gate fix-round-2, MUST-FIX 3 — mirrors BoundedMap's
+   * `pendingAdmissionWaiters`, core/bounded-map.ts, and
+   * sentinel-finding-store.ts's field of the same name). Incremented
+   * SYNCHRONOUSLY in `runAdmissionExclusiveBounded` before its first
+   * `await`, decremented in a `finally` once the admission settles either
+   * way — the synchronous check-then-increment needs no separate lock
+   * because both happen in the same tick, with no `await` between them.
+   */
+  private pendingAdmissionWaiters = 0;
+  /**
+   * Serializes the check-then-write critical section in record() and
+   * importBundle() (LD3 gate fix-round DEFECT 2 / fix-round-2 MUST-FIX 1): a
+   * single promise chain per ReputationStore INSTANCE, not per origin,
+   * because assertRecordQuotaForCount reads both the per-origin count AND
+   * the global `_reputation` size — a lock scoped to one origin could not
+   * stop two DIFFERENT origins from racing past the global
+   * MAX_REPUTATION_RECORDS ceiling together. Mirrors BoundedMap's
    * `admissionQueue` (core/bounded-map.ts): chain the next call onto the
    * settled tail of the previous one, so the WHOLE quota-check-then-persist
-   * section (including any caller-supplied `additionalQuotaCheck`) runs
-   * start to finish with no other record() interleaved — this is what
-   * closes the TOCTOU the pre-fix version left open (many concurrent
-   * callers all observing capacity BEFORE any of them wrote, then all
-   * writing and overshooting the cap).
+   * section (including any caller-supplied `additionalQuotaCheck`, and
+   * importBundle()'s whole write loop) runs start to finish with no other
+   * record()/importBundle() interleaved — this is what closes the TOCTOU
+   * the pre-fix version left open (many concurrent callers all observing
+   * capacity BEFORE any of them wrote, then all writing and overshooting
+   * the cap). ONLY reached via `runAdmissionExclusiveBounded` below, which
+   * adds the waiter cap and settlement deadline this raw chain does not
+   * enforce on its own.
    */
   private admissionQueue: Promise<void> = Promise.resolve();
 
@@ -687,8 +807,13 @@ export class ReputationStore {
     this.maxRecords = testOverrides?.maxReputationRecords ?? MAX_REPUTATION_RECORDS;
     this.maxRecordsPerOrigin =
       testOverrides?.maxReputationRecordsPerOrigin ?? MAX_REPUTATION_RECORDS_PER_ORIGIN;
+    this.maxPendingAdmissionWaiters =
+      testOverrides?.maxPendingAdmissionWaiters ?? MAX_PENDING_ADMISSION_WAITERS;
   }
 
+  /** Raw promise-chain primitive. Never call directly — see
+   * `runAdmissionExclusiveBounded`, the ONLY caller, for the waiter-cap +
+   * settlement-deadline wrapper every production admission goes through. */
   private async runAdmissionExclusive<T>(fn: () => Promise<T>): Promise<T> {
     const run = this.admissionQueue.then(fn, fn);
     this.admissionQueue = run.then(
@@ -699,18 +824,70 @@ export class ReputationStore {
   }
 
   /**
-   * Scan `_reputation` and enforce both the global MAX_REPUTATION_RECORDS
-   * ceiling and `origin`'s MAX_REPUTATION_RECORDS_PER_ORIGIN share (LD3
-   * gate fix-round DEFECT 1). Fails CLOSED: a storage.list error, or any
-   * entry that cannot be read/decrypted, throws `scan_unavailable` rather
-   * than silently treating an unscannable entry as "not this origin" —
-   * the same fail-closed posture findExistingAttestationForDedup and
-   * countAttestationsByOriginForContext already use scanning this exact
-   * namespace. MUST be called only from inside runAdmissionExclusive (see
-   * record()) so this check and the write it gates can never be split by a
-   * concurrent write.
+   * The ONLY entry point into `admissionQueue` (LD3 gate fix-round-2,
+   * MUST-FIX 3 — mirrors `SentinelFindingStore.runAdmissionExclusive` /
+   * `BoundedMap`'s waiter-cap pattern exactly, core/bounded-map.ts and
+   * sentinel/sentinel-finding-store.ts). Two properties `runAdmissionExclusive`
+   * alone does not provide:
+   *
+   * 1. WAITER CAP: the queue of callers WAITING to chain onto
+   *    `admissionQueue` is itself attacker-influenceable state (every
+   *    `record()`/`importBundle()` call from a Tier-2/Tier-1 tool can queue
+   *    one), so it needs its own bound (AGENTS.md rule 8, applied to the
+   *    serialization primitive's OWN state, not just the collection it
+   *    protects). Checked and incremented SYNCHRONOUSLY, before this
+   *    method's first `await` — TOCTOU-safe with no extra lock because both
+   *    happen in the same tick. A refusal here never calls
+   *    `runAdmissionExclusive`: the closure is never constructed, never
+   *    chained onto `admissionQueue`, so a refused call leaves the queue
+   *    exactly as it was and cannot itself contribute to a wedge.
+   * 2. SETTLEMENT DEADLINE: `fn` races against
+   *    REPUTATION_STORE_ADMISSION_DEADLINE_MS via
+   *    withReputationAdmissionDeadline — a hung `storage.list`/`read`/
+   *    `write` call inside `fn` cannot retain this lock past that deadline;
+   *    the queue still advances for the NEXT admission even though the hung
+   *    operation itself keeps running detached (see that constant's doc for
+   *    the accepted, bounded residual this trade-off leaves).
    */
-  private async assertRecordQuota(origin: string): Promise<void> {
+  private async runAdmissionExclusiveBounded<T>(fn: () => Promise<T>): Promise<T> {
+    if (this.pendingAdmissionWaiters >= this.maxPendingAdmissionWaiters) {
+      throw new ReputationStoreQuotaError("admission_busy");
+    }
+    this.pendingAdmissionWaiters += 1;
+    try {
+      return await this.runAdmissionExclusive(() =>
+        withReputationAdmissionDeadline(fn(), REPUTATION_STORE_ADMISSION_DEADLINE_MS)
+      );
+    } finally {
+      this.pendingAdmissionWaiters -= 1;
+    }
+  }
+
+  /**
+   * Scan `_reputation` and enforce both the global MAX_REPUTATION_RECORDS
+   * ceiling and `origin`'s MAX_REPUTATION_RECORDS_PER_ORIGIN share against
+   * an incoming batch of `additionalCount` new records (LD3 gate fix-round
+   * DEFECT 1 / fix-round-2 MUST-FIX 1 — generalized from a single-record
+   * check to a batch check so importBundle() can enforce the cap for its
+   * WHOLE bundle atomically, all-or-nothing, rather than admitting records
+   * up to the cap and silently dropping the rest). `additionalCount <= 0`
+   * is a no-op (an empty bundle needs no headroom and must not be refused
+   * merely because the store happens to be full). Fails CLOSED: a
+   * storage.list error, or any entry that cannot be read/decrypted, throws
+   * `scan_unavailable` rather than silently treating an unscannable entry as
+   * "not this origin" — the same fail-closed posture
+   * findExistingAttestationForDedup and countAttestationsByOriginForContext
+   * already use scanning this exact namespace. MUST be called only from
+   * inside runAdmissionExclusiveBounded (see record()/importBundle()) so
+   * this check and the write(s) it gates can never be split by a concurrent
+   * write.
+   */
+  private async assertRecordQuotaForCount(
+    origin: string,
+    additionalCount: number
+  ): Promise<void> {
+    if (additionalCount <= 0) return;
+
     let entries: Array<{ key: string }>;
     try {
       entries = await this.storage.list("_reputation");
@@ -718,7 +895,7 @@ export class ReputationStore {
       throw new ReputationStoreQuotaError("scan_unavailable");
     }
 
-    if (entries.length >= this.maxRecords) {
+    if (entries.length + additionalCount > this.maxRecords) {
       throw new ReputationStoreQuotaError("capacity");
     }
 
@@ -741,9 +918,30 @@ export class ReputationStore {
       }
     }
 
-    if (originCount >= this.maxRecordsPerOrigin) {
+    if (originCount + additionalCount > this.maxRecordsPerOrigin) {
       throw new ReputationStoreQuotaError("origin_quota");
     }
+  }
+
+  /**
+   * Single-record convenience wrapper around assertRecordQuotaForCount, used
+   * by record(). See that method's doc for the batch shape importBundle()
+   * uses instead.
+   */
+  private async assertRecordQuota(origin: string): Promise<void> {
+    return this.assertRecordQuotaForCount(origin, 1);
+  }
+
+  /**
+   * Resolve the record()/importBundle() quota-key origin (LD3 gate
+   * fix-round DEFECT 1 / fix-round-2 MUST-FIX 1): an absent or empty origin
+   * pools into REPUTATION_UNKNOWN_ORIGIN rather than exempting the write
+   * from quota entirely — see REPUTATION_UNKNOWN_ORIGIN's doc. ONE
+   * definition shared by both writers so their fallback behavior can never
+   * drift apart.
+   */
+  private static resolveOrigin(origin: string | undefined): string {
+    return origin !== undefined && origin.length > 0 ? origin : REPUTATION_UNKNOWN_ORIGIN;
   }
 
   /**
@@ -793,8 +991,7 @@ export class ReputationStore {
     origin?: string,
     additionalQuotaCheck?: () => Promise<void>
   ): Promise<StoredAttestation> {
-    const resolvedOrigin =
-      origin !== undefined && origin.length > 0 ? origin : REPUTATION_UNKNOWN_ORIGIN;
+    const resolvedOrigin = ReputationStore.resolveOrigin(origin);
     const attestationId = `att-${Date.now()}-${toBase64url(randomBytes(8))}`;
     const now = new Date().toISOString();
     const metrics = isConcordiaBridgeReputationContext(context)
@@ -866,8 +1063,12 @@ export class ReputationStore {
     // origin, another origin, or the global cap — can observe stale
     // headroom between the check and this write. `additionalQuotaCheck`
     // (if supplied) runs in the SAME section, immediately before the
-    // write, for the same reason — see record()'s doc.
-    return this.runAdmissionExclusive(async () => {
+    // write, for the same reason — see record()'s doc. Routed through
+    // runAdmissionExclusiveBounded (fix-round-2, MUST-FIX 3), not the raw
+    // runAdmissionExclusive, so a flood of concurrent record() calls
+    // refuses fail-closed at the waiter cap instead of growing the
+    // in-memory queue without bound.
+    return this.runAdmissionExclusiveBounded(async () => {
       await this.assertRecordQuota(resolvedOrigin);
       if (additionalQuotaCheck) {
         await additionalQuotaCheck();
@@ -1023,16 +1224,22 @@ export class ReputationStore {
    * maintained incrementally) would remove this, but is a larger
    * structural change than this narrow scan-shape goal —
    * BridgeStore.assertOriginWithinQuota in bridge/tools.ts records the
-   * matching DEBT note for `_bridge`. CORRECTED CLAIM: the original text
-   * here asserted this scan's worst case was bounded by "this fix" while
-   * `_reputation`'s total SIZE was in fact still unbounded (the
-   * `reputation_record` tool wrote to the same namespace with no cap at
-   * all — DEFECT 1) — so the claim was false at the time it was written.
-   * It is true now: record()'s own MAX_REPUTATION_RECORDS chokepoint cap
-   * (this file, above) bounds `_reputation`'s total size for every writer,
-   * which is what actually bounds this scan's worst case. The scan's
-   * algorithmic shape (a full O(N) decrypt pass) is unchanged and remains
-   * DEBT, now honestly bounded rather than falsely claimed bounded.
+   * matching DEBT note for `_bridge`. CORRECTED CLAIM (fix-round-2
+   * RECHECK): the fix-round-1 text here asserted this scan's worst case was
+   * bounded by "this fix" while `_reputation`'s total SIZE was in fact
+   * still unbounded through TWO other paths — the `reputation_record` tool
+   * wrote to the same namespace with no cap at all (DEFECT 1), and
+   * importBundle() wrote directly, bypassing the chokepoint entirely (LD3
+   * gate fix-round-2 MUST-FIX 1) — so the claim was false both times it was
+   * written. It is true now: record() AND importBundle() both route through
+   * the SAME MAX_REPUTATION_RECORDS chokepoint (assertRecordQuotaForCount,
+   * this file, above), and that chokepoint is enforced from a SINGLE
+   * ReputationStore instance in production (index.ts constructs one and
+   * injects it into both createReputationTools and createBridgeTools — LD3
+   * gate fix-round-2 MUST-FIX 2), so `_reputation`'s total size is bounded
+   * for every writer, which is what actually bounds this scan's worst case.
+   * The scan's algorithmic shape (a full O(N) decrypt pass) is unchanged and
+   * remains DEBT, now honestly bounded rather than falsely claimed bounded.
    */
   async countAttestationsByOriginForContext(
     origin: string,
@@ -1251,6 +1458,30 @@ export class ReputationStore {
    * use the read-only exit-bundle previewer (exit/verifier.ts), which never
    * admits an attestation into the store.
    *
+   * GROWTH BOUND (LD3 gate fix-round-2, MUST-FIX 1): before this fix,
+   * importBundle wrote every attestation directly to `_reputation`,
+   * bypassing BOTH record()'s MAX_REPUTATION_RECORDS(_PER_ORIGIN) quota and
+   * its admission lock — `reputation_import` is Tier-1 (human-approved), but
+   * an approved import still grows `_reputation` on every call, so repeated
+   * approved imports could grow the store past the cap indefinitely, and two
+   * concurrent imports (or an import racing a record()/bridge_attest write)
+   * could each observe pre-write headroom and both persist, overshooting the
+   * cap together. This bundle's writes now run inside the SAME
+   * runAdmissionExclusiveBounded section record() uses, checked against
+   * assertRecordQuotaForCount for the WHOLE bundle's size up front — so the
+   * cap decision is ALL-OR-NOTHING: a bundle that would push `_reputation`
+   * past MAX_REPUTATION_RECORDS or `origin`'s MAX_REPUTATION_RECORDS_PER_ORIGIN
+   * share is refused in full, with NOTHING written, rather than admitting
+   * attestations up to the cap and silently dropping the rest (that
+   * up-to-cap-then-drop shape would make a caller's own `imported` count the
+   * only signal of a partial, cap-truncated import, easy to miss — refusing
+   * whole is the same fail-closed shape signature verification above already
+   * uses for this same method: "the whole bundle invalid, NOTHING is
+   * written"). `origin` (new, optional, trailing — mirrors record()'s
+   * parameter) is the SERVER-SET agent-session principal that performed the
+   * `reputation_import` call, resolved via the SAME ReputationStore.resolveOrigin
+   * fallback record() uses, so quota is never bypassed by omitting it.
+   *
    * @param publicKeys - Map of DID → public key bytes for signature verification
    */
   async importBundle(
@@ -1259,7 +1490,8 @@ export class ReputationStore {
     publicKeys: Map<string, Uint8Array>,
     options: {
       allowUnverifiedLegacy?: boolean;
-    } = {}
+    } = {},
+    origin?: string
   ): Promise<{
     imported: number;
     invalid: number;
@@ -1278,32 +1510,55 @@ export class ReputationStore {
       options
     );
 
-    let imported = 0;
+    const resolvedOrigin = ReputationStore.resolveOrigin(origin);
     const contexts = new Set<string>();
 
-    for (const attestation of bundle.attestations) {
-      // Store the imported attestation only after all bundle-level and
-      // per-attestation validation succeeds. Mark it imported so tier-weighted
-      // reads clamp its self-asserted sovereignty_tier to the non-privileged
-      // import ceiling: a foreign signer's "verified-sovereign" claim is not
-      // trustworthy on this instance, which never witnessed that handshake.
-      const stored: StoredAttestation = {
-        attestation,
-        recorded_at: new Date().toISOString(),
-        imported: true,
-      };
-
-      const serialized = stringToBytes(JSON.stringify(stored));
-      const encrypted = encrypt(serialized, this.encryptionKey);
-      await this.storage.write(
-        "_reputation",
-        attestation.attestation_id,
-        stringToBytes(JSON.stringify(encrypted))
+    // MUST-FIX 1: quota check + every write for this bundle run inside ONE
+    // admission-locked, deadline-bounded section (runAdmissionExclusiveBounded
+    // — the same primitive record() uses), so a concurrent record(),
+    // bridge_attest, or another importBundle() call can never observe stale
+    // headroom between this check and these writes. All-or-nothing: if the
+    // batch quota check throws, the loop below never runs and NOTHING is
+    // written — see this method's doc for why up-to-cap-then-drop was
+    // rejected in favor of refuse-whole.
+    const imported = await this.runAdmissionExclusiveBounded(async () => {
+      await this.assertRecordQuotaForCount(
+        resolvedOrigin,
+        bundle.attestations.length
       );
 
-      imported++;
-      contexts.add(attestation.data.context);
-    }
+      let count = 0;
+      for (const attestation of bundle.attestations) {
+        // Store the imported attestation only after all bundle-level and
+        // per-attestation validation succeeds, AND the batch quota check
+        // above passed for the whole bundle. Mark it imported so
+        // tier-weighted reads clamp its self-asserted sovereignty_tier to
+        // the non-privileged import ceiling: a foreign signer's
+        // "verified-sovereign" claim is not trustworthy on this instance,
+        // which never witnessed that handshake. `origin` is stamped
+        // (mirrors record()'s `stored.origin`) so THIS import's records are
+        // quota-attributed on every later scan the same way a record()
+        // write already is.
+        const stored: StoredAttestation = {
+          attestation,
+          recorded_at: new Date().toISOString(),
+          imported: true,
+          origin: resolvedOrigin,
+        };
+
+        const serialized = stringToBytes(JSON.stringify(stored));
+        const encrypted = encrypt(serialized, this.encryptionKey);
+        await this.storage.write(
+          "_reputation",
+          attestation.attestation_id,
+          stringToBytes(JSON.stringify(encrypted))
+        );
+
+        count++;
+        contexts.add(attestation.data.context);
+      }
+      return count;
+    });
 
     return {
       imported,

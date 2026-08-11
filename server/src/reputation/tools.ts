@@ -332,13 +332,20 @@ export function createReputationTools(
             return toolResult({ error: err.message });
           }
           if (err instanceof ReputationStoreQuotaError) {
+            // `admission_busy` (LD3 gate fix-round-2, MUST-FIX 3) is
+            // distinct from `scan_unavailable`: this call never even
+            // reached the quota scan, refused instead at the store's
+            // admission-waiter cap — see runAdmissionExclusiveBounded's doc
+            // (reputation-store.ts).
             void auditLog.append(
               "l4",
               err.reason === "origin_quota"
                 ? "reputation_record_origin_quota_exceeded"
                 : err.reason === "capacity"
                   ? "reputation_record_store_saturated"
-                  : "reputation_record_quota_scan_unavailable",
+                  : err.reason === "admission_busy"
+                    ? "reputation_record_admission_busy"
+                    : "reputation_record_quota_scan_unavailable",
               identity.identity_id,
               {
                 interaction_id: args.interaction_id,
@@ -560,7 +567,7 @@ export function createReputationTools(
         },
         required: ["bundle"],
       },
-      handler: async (args) => {
+      handler: async (args, callerIdentity) => {
         const bundleBase64 = args.bundle as string;
         // Signature verification is always enforced; no caller override.
         // Allowing callers to skip verification was a prompt-injection footgun.
@@ -588,11 +595,24 @@ export function createReputationTools(
 
         let result;
         try {
+          // `callerIdentity` (LD3 gate fix-round-2, MUST-FIX 1): the
+          // SERVER-SET agent-session principal that performed THIS import
+          // call, threaded through as importBundle's quota-key origin — the
+          // same shape record() already uses (see ReputationStore.resolveOrigin's
+          // doc, reputation-store.ts). `reputation_import` is Tier-1
+          // (human-approved), but an approved import that omitted an origin
+          // would still pool into REPUTATION_UNKNOWN_ORIGIN correctly rather
+          // than bypassing the quota — this is not the security-critical
+          // half of the fix (importBundle enforces the cap regardless of
+          // what origin resolves to), it is attribution so repeated imports
+          // by the SAME session share one per-origin bucket rather than each
+          // falling into the shared unknown bucket.
           result = await reputationStore.importBundle(
             bundle,
             verifySignatures,
             publicKeys,
-            { allowUnverifiedLegacy: args.allow_unverified_legacy === true }
+            { allowUnverifiedLegacy: args.allow_unverified_legacy === true },
+            callerIdentity
           );
         } catch (err) {
           const invalid =
@@ -603,6 +623,15 @@ export function createReputationTools(
             err instanceof Error
               ? err.message
               : "Reputation bundle verification failed";
+          // ReputationStoreQuotaError (LD3 gate fix-round-2, MUST-FIX 1):
+          // importBundle now enforces MAX_REPUTATION_RECORDS(_PER_ORIGIN)
+          // for the WHOLE bundle atomically — a refusal here means NOTHING
+          // was imported (all-or-nothing; see importBundle's doc,
+          // reputation-store.ts). Recorded in the audit details so an
+          // operator can tell a quota refusal apart from a signature/
+          // completeness failure, both of which land in this same catch.
+          const quotaRefuseReason =
+            err instanceof ReputationStoreQuotaError ? err.reason : undefined;
 
           await auditLog.appendCritical({
             layer: "l4",
@@ -614,6 +643,9 @@ export function createReputationTools(
               invalid,
               contexts: [],
               completeness_verification: "failed",
+              ...(quotaRefuseReason !== undefined
+                ? { quota_refuse_reason: quotaRefuseReason }
+                : {}),
             },
           });
 

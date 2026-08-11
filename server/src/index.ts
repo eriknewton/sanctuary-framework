@@ -847,12 +847,26 @@ export async function createSanctuaryServer(options?: {
     handshakeResultWriterOrigins
   );
 
-  // 14c. Create Bridge tools (Concordia integration)
+  // 14c. Create Bridge tools (Concordia integration). `reputationStore` is
+  // the SAME instance createReputationTools (step 13) constructed and
+  // returned — NOT a second `new ReputationStore(...)` (LD3 gate
+  // fix-round-2, MUST-FIX 2). Before this fix, createBridgeTools built its
+  // own ReputationStore internally, so this live server ran TWO independent
+  // in-memory admission locks and quota views over the SAME `_reputation`
+  // storage backend: a concurrent reputation_record (through step 13's
+  // store) and bridge_attest (through this factory's OWN, separate store)
+  // could each observe pre-write headroom on their own store's view and
+  // both write, overshooting MAX_REPUTATION_RECORDS(_PER_ORIGIN) together —
+  // a per-instance admission lock only serializes callers that share the
+  // SAME instance. Injecting the one store built at step 13 makes this the
+  // only ReputationStore construction reachable in the live server's
+  // composition graph.
   const { tools: bridgeTools } = createBridgeTools(
     storage,
     masterKey,
     identityManager,
     auditLog,
+    reputationStore,
     handshakeResults
   );
 

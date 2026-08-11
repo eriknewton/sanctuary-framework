@@ -1276,6 +1276,284 @@ describe("L4 Reputation Store", () => {
     });
   });
 
+  describe("LD3 gate fix-round-2: importBundle routes through the record() chokepoint (MUST-FIX 1) + bounded admission waiters (MUST-FIX 3)", () => {
+    // MUST-FIX 1: the fix-round-1 pass bounded record() but left
+    // importBundle() writing directly to `_reputation`, bypassing BOTH the
+    // quota check and the admission lock — a valid, signature-verified
+    // bundle imported at 1-below-capacity could still push the store past
+    // its cap. FAILS on pre-fix source (importBundle admits every
+    // attestation with no cap at all); PASSES once importBundle's writes
+    // run inside the SAME runAdmissionExclusiveBounded section record()
+    // uses, checked against the WHOLE bundle's size up front.
+    it("refuses an importBundle write that would push _reputation past capacity, fail-closed and ALL-OR-NOTHING", async () => {
+      // Build a small, independently-signed 2-attestation bundle.
+      const exporterMasterKey = generateRandomKey();
+      const exporterStorage = new MemoryStorage();
+      const exporterStore = new ReputationStore(exporterStorage, exporterMasterKey);
+      const { identity: exporterIdentity, encryptionKey: exporterEncKey } =
+        setupIdentity(exporterMasterKey, "bundle-exporter");
+      await exporterStore.record(
+        "bundle-1",
+        "did:key:cp1",
+        { type: "transaction", result: "completed" },
+        "general",
+        exporterIdentity,
+        exporterEncKey
+      );
+      await exporterStore.record(
+        "bundle-2",
+        "did:key:cp2",
+        { type: "transaction", result: "completed" },
+        "general",
+        exporterIdentity,
+        exporterEncKey
+      );
+      const bundle = await exporterStore.exportBundle(exporterIdentity, exporterEncKey);
+      expect(bundle.attestations).toHaveLength(2);
+
+      // Target store: capacity 5, seeded to 4 (1 slot of headroom).
+      // Importing this 2-attestation bundle would land at 6 — past the cap.
+      const targetStorage = new MemoryStorage();
+      const targetMasterKey = generateRandomKey();
+      const targetStore = new ReputationStore(targetStorage, targetMasterKey, {
+        maxReputationRecords: 5,
+        maxReputationRecordsPerOrigin: 1000,
+      });
+      const { identity: seedIdentity, encryptionKey: seedEncKey } = setupIdentity(
+        targetMasterKey,
+        "target-seed"
+      );
+      for (let i = 0; i < 4; i++) {
+        await targetStore.record(
+          `seed-${i}`,
+          "did:key:cp",
+          { type: "transaction", result: "completed" },
+          "general",
+          seedIdentity,
+          seedEncKey
+        );
+      }
+      expect((await targetStorage.list("_reputation")).length).toBe(4);
+
+      const publicKeys = publicKeysFor(exporterIdentity);
+      await expect(
+        targetStore.importBundle(bundle, true, publicKeys)
+      ).rejects.toThrow(ReputationStoreQuotaError);
+      try {
+        await targetStore.importBundle(bundle, true, publicKeys);
+        expect.unreachable("expected ReputationStoreQuotaError");
+      } catch (err) {
+        expect(err).toBeInstanceOf(ReputationStoreQuotaError);
+        expect((err as InstanceType<typeof ReputationStoreQuotaError>).reason).toBe(
+          "capacity"
+        );
+      }
+
+      // ALL-OR-NOTHING: still exactly 4 records — neither of the bundle's 2
+      // attestations was admitted, not even one of the two.
+      const after = await targetStorage.list("_reputation");
+      expect(after.length).toBe(4);
+      for (const attestation of bundle.attestations) {
+        expect(
+          after.some((e) => e.key === attestation.attestation_id)
+        ).toBe(false);
+      }
+    });
+
+    it("a within-cap importBundle still enforces the per-origin quota and stamps the resolved origin on every imported record", async () => {
+      // Two INDEPENDENTLY-exported, 1-attestation bundles from the SAME
+      // signer identity (rather than slicing one 2-attestation bundle's
+      // `attestations` array after export, which would desync the signed
+      // completeness_manifest from its contents and fail verification for
+      // an unrelated reason). Each bundle's own manifest/signature is
+      // correct for exactly what it carries.
+      const exporterMasterKey = generateRandomKey();
+      const { identity: exporterIdentity, encryptionKey: exporterEncKey } =
+        setupIdentity(exporterMasterKey, "bundle-exporter-2");
+
+      const exporterStoreA = new ReputationStore(new MemoryStorage(), exporterMasterKey);
+      await exporterStoreA.record(
+        "bundle-a",
+        "did:key:cp1",
+        { type: "transaction", result: "completed" },
+        "general",
+        exporterIdentity,
+        exporterEncKey
+      );
+      const bundleA = await exporterStoreA.exportBundle(exporterIdentity, exporterEncKey);
+      expect(bundleA.attestations).toHaveLength(1);
+
+      const exporterStoreB = new ReputationStore(new MemoryStorage(), exporterMasterKey);
+      await exporterStoreB.record(
+        "bundle-b",
+        "did:key:cp2",
+        { type: "transaction", result: "completed" },
+        "general",
+        exporterIdentity,
+        exporterEncKey
+      );
+      const bundleB = await exporterStoreB.exportBundle(exporterIdentity, exporterEncKey);
+      expect(bundleB.attestations).toHaveLength(1);
+
+      const targetStorage = new MemoryStorage();
+      const targetMasterKey = generateRandomKey();
+      // Per-origin cap of 1: a SECOND 1-attestation import for the SAME
+      // origin must be refused, even though global capacity is generous.
+      const targetStore = new ReputationStore(targetStorage, targetMasterKey, {
+        maxReputationRecords: 1000,
+        maxReputationRecordsPerOrigin: 1,
+      });
+      const publicKeys = publicKeysFor(exporterIdentity);
+
+      // First import: within the per-origin cap, succeeds and stamps the
+      // resolved origin onto the imported record.
+      const result = await targetStore.importBundle(
+        bundleA,
+        true,
+        publicKeys,
+        {},
+        "agent:import-session"
+      );
+      expect(result.imported).toBe(1);
+      expect((await targetStorage.list("_reputation")).length).toBe(1);
+
+      // Second import, SAME origin: refused. This is the assertion that
+      // proves origin STAMPING (not just the write itself) works — the
+      // first import's record was stamped with `origin:
+      // "agent:import-session"`, so assertRecordQuotaForCount's per-origin
+      // scan on THIS call counts it and refuses (cap is 1). An unstamped
+      // record would not be counted, and this import would wrongly
+      // succeed.
+      try {
+        await targetStore.importBundle(
+          bundleB,
+          true,
+          publicKeys,
+          {},
+          "agent:import-session"
+        );
+        expect.unreachable("expected ReputationStoreQuotaError");
+      } catch (err) {
+        expect(err).toBeInstanceOf(ReputationStoreQuotaError);
+        expect((err as InstanceType<typeof ReputationStoreQuotaError>).reason).toBe(
+          "origin_quota"
+        );
+      }
+      expect((await targetStorage.list("_reputation")).length).toBe(1);
+
+      // A DIFFERENT origin is unaffected by the first origin's exhausted
+      // quota — the same "refuse, never bypass" contract record() already
+      // guarantees.
+      const otherOriginResult = await targetStore.importBundle(
+        bundleB,
+        true,
+        publicKeys,
+        {},
+        "agent:a-different-import-session"
+      );
+      expect(otherOriginResult.imported).toBe(1);
+      expect((await targetStorage.list("_reputation")).length).toBe(2);
+    });
+
+    // MUST-FIX 3: the admission queue's WAITER count (how many callers are
+    // currently between "entered runAdmissionExclusiveBounded" and
+    // "settled") was itself unbounded pre-fix, and a hung storage op inside
+    // the locked section could retain the lock forever, wedging every later
+    // admission behind it. FAILS on pre-fix source (no waiter cap exists at
+    // all — every concurrent caller queues without limit, and nothing times
+    // out a hung storage call); PASSES once runAdmissionExclusiveBounded's
+    // synchronous cap check + settlement deadline are in place.
+    it("MUTATION-PROOF TARGET: bounds the admission-waiter queue and refuses fail-closed at the cap without wedging later admissions", async () => {
+      const backing = new MemoryStorage();
+      let releaseHang: (() => void) | null = null;
+      let hangArmed = false;
+      const hanging: StorageBackend = {
+        write: (ns, key, data) => backing.write(ns, key, data),
+        read: (ns, key) => backing.read(ns, key),
+        delete: (ns, key, secure) => backing.delete(ns, key, secure),
+        list: async (ns, prefix) => {
+          if (hangArmed && ns === "_reputation") {
+            // Only the FIRST admission that reaches here hangs — later
+            // calls (once released) proceed normally.
+            hangArmed = false;
+            await new Promise<void>((resolve) => {
+              releaseHang = resolve;
+            });
+          }
+          return backing.list(ns, prefix);
+        },
+        exists: (ns, key) => backing.exists(ns, key),
+        totalSize: () => backing.totalSize(),
+        listNamespaces: () => backing.listNamespaces!(),
+      };
+
+      const masterKey = generateRandomKey();
+      const store = new ReputationStore(hanging, masterKey, {
+        maxReputationRecords: 1000,
+        maxReputationRecordsPerOrigin: 1000,
+        maxPendingAdmissionWaiters: 2,
+      });
+      const { identity, encryptionKey } = setupIdentity(masterKey);
+      const origin = "agent:hang-flood";
+
+      const recordOnce = (interactionId: string) =>
+        store.record(
+          interactionId,
+          "did:key:counterparty",
+          { type: "transaction", result: "completed" },
+          "general",
+          identity,
+          encryptionKey,
+          undefined,
+          undefined,
+          origin
+        );
+
+      hangArmed = true;
+      // Call 1 occupies the admission lock, stuck inside storage.list.
+      const call1 = recordOnce("hang-1");
+      // Call 2 queues BEHIND call 1 — 2 concurrent waiters, exactly at cap.
+      const call2 = recordOnce("hang-2");
+
+      // Let the microtask queue drain so both calls' SYNCHRONOUS
+      // waiter-count increments (which happen before either call's first
+      // real await inside the admission section) have actually run.
+      await new Promise((resolve) => setTimeout(resolve, 10));
+
+      // Call 3 arrives while 2 admissions already occupy the cap: refused
+      // SYNCHRONOUSLY with admission_busy — it never joins the queue and
+      // never touches storage at all (the hung call is still hanging).
+      let call3Reason: unknown;
+      try {
+        await recordOnce("hang-3");
+        expect.unreachable("expected admission_busy refusal");
+      } catch (err) {
+        call3Reason = (err as InstanceType<typeof ReputationStoreQuotaError>).reason;
+      }
+      expect(call3Reason).toBe("admission_busy");
+
+      // Release the hung storage.list — call 1 (then call 2, queued behind
+      // it) can now complete normally. This is the "does not wedge" half:
+      // a hung op inside the lock does not brick the store forever.
+      expect(releaseHang).not.toBeNull();
+      releaseHang!();
+
+      const [result1, result2] = await Promise.all([call1, call2]);
+      expect(result1.attestation.attestation_id).toBeDefined();
+      expect(result2.attestation.attestation_id).toBeDefined();
+
+      // THE STORE IS NOT WEDGED: a fresh admission, well after the busy
+      // episode ended, succeeds normally.
+      const result4 = await recordOnce("hang-4");
+      expect(result4.attestation.attestation_id).toBeDefined();
+
+      // hang-1, hang-2, hang-4 persisted; hang-3 was refused before it ever
+      // reached storage.
+      const entries = await backing.list("_reputation");
+      expect(entries.length).toBe(3);
+    });
+  });
+
   describe("attestation signatures", () => {
     it("produces valid Ed25519 signatures", async () => {
       const storage = new MemoryStorage();

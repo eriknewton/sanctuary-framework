@@ -15,7 +15,15 @@ import type { StorageBackend } from "../storage/interface.js";
 import type { AuditLog } from "../operational/audit-log.js";
 import type { HandshakeResult } from "../handshake/types.js";
 import { AGENT_UNKNOWN_ORIGIN } from "../handshake/tools.js";
-import { ReputationStore, ReputationStoreQuotaError } from "../reputation/reputation-store.js";
+import {
+  ReputationStore,
+  ReputationStoreQuotaError,
+  type StoredAttestation,
+} from "../reputation/reputation-store.js";
+import {
+  MAX_PENDING_ADMISSION_WAITERS,
+  ON_EVICT_AUDIT_TIMEOUT_MS,
+} from "../core/bounded-map.js";
 import { resolveTierByDid, TIER_WEIGHTS, type TierMetadata } from "../reputation/tiers.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
 import { fromBase64url, stringToBytes } from "../core/encoding.js";
@@ -93,7 +101,11 @@ export const MAX_BRIDGE_COMMITMENTS_PER_ORIGIN = 500;
 export const MAX_BRIDGE_ATTESTATIONS_PER_ORIGIN = 200;
 
 /** Reason a bridge-store write was refused (LD3 BRIDGE-BP-01). */
-export type BridgeStoreRefuseReason = "origin_quota" | "capacity" | "scan_unavailable";
+export type BridgeStoreRefuseReason =
+  | "origin_quota"
+  | "capacity"
+  | "scan_unavailable"
+  | "admission_busy";
 
 /**
  * Typed refusal thrown by BridgeStore.assertOriginWithinQuota. `capacity`
@@ -102,7 +114,11 @@ export type BridgeStoreRefuseReason = "origin_quota" | "capacity" | "scan_unavai
  * storage.list error, or an entry that failed to read/decrypt) — treated
  * as a refusal rather than "assume headroom," mirroring
  * ReputationStore.findExistingAttestationForDedup's fail-closed contract
- * on this same `_bridge` namespace.
+ * on this same `_bridge` namespace. `admission_busy` (LD3 gate fix-round-2,
+ * MUST-FIX 3) means this call never even reached the quota scan, because
+ * MAX_PENDING_ADMISSION_WAITERS other callers were already queued for this
+ * store's admission lock — see BridgeStore.runAdmissionExclusiveBounded's
+ * doc.
  */
 export class BridgeStoreQuotaError extends Error {
   readonly reason: BridgeStoreRefuseReason;
@@ -112,8 +128,11 @@ export class BridgeStoreQuotaError extends Error {
         ? "Bridge commitment store: origin per-write quota exceeded"
         : reason === "capacity"
           ? "Bridge commitment store: capacity exceeded"
-          : "Bridge commitment store: could not confirm quota headroom " +
-            "(storage scan failed); refusing to write"
+          : reason === "admission_busy"
+            ? "Bridge commitment store: admission queue is saturated; " +
+              "refusing to write (retry shortly)"
+            : "Bridge commitment store: could not confirm quota headroom " +
+              "(storage scan failed); refusing to write"
     );
     this.name = "BridgeStoreQuotaError";
     this.reason = reason;
@@ -121,7 +140,10 @@ export class BridgeStoreQuotaError extends Error {
 }
 
 /** Reason a bridge_attest reputation-context write was refused (LD3 gate fix-round DEFECT 2). */
-export type BridgeAttestOriginQuotaRefuseReason = "origin_quota" | "scan_unavailable";
+export type BridgeAttestOriginQuotaRefuseReason =
+  | "origin_quota"
+  | "scan_unavailable"
+  | "dedup_scan_unavailable";
 
 /**
  * Typed refusal thrown by bridge_attest's `additionalQuotaCheck` callback
@@ -133,7 +155,14 @@ export type BridgeAttestOriginQuotaRefuseReason = "origin_quota" | "scan_unavail
  * chokepoint bound, checked in the same admission-locked section — see
  * reputation-store.ts). No `capacity` reason here: this check only ever
  * enforces the per-origin share of ONE context, not a global ceiling on
- * that context.
+ * that context. `dedup_scan_unavailable` (LD3 gate fix-round-2, MUST-FIX 4)
+ * is distinct from `scan_unavailable`: the former is the ATOMIC in-lock
+ * dedup re-scan (checkAttestAdmission's first step) failing to enumerate
+ * `_reputation`, the latter is the origin-quota scan (its second step)
+ * failing — kept as separate reasons, not coalesced, so the audit trail and
+ * the error text tell an operator WHICH scan could not confirm its result,
+ * rather than a generic "quota headroom" message that would be wrong for a
+ * dedup-scan failure (that scan is about uniqueness, not headroom).
  */
 export class BridgeAttestOriginQuotaError extends Error {
   readonly reason: BridgeAttestOriginQuotaRefuseReason;
@@ -141,11 +170,49 @@ export class BridgeAttestOriginQuotaError extends Error {
     super(
       reason === "origin_quota"
         ? "Bridge attestation store: origin per-write quota exceeded"
-        : "Bridge attestation store: could not confirm quota headroom " +
-          "(storage scan failed); refusing to write"
+        : reason === "dedup_scan_unavailable"
+          ? "Bridge attestation store: could not confirm this negotiation " +
+            "was not already attested (storage scan failed); refusing to write"
+          : "Bridge attestation store: could not confirm quota headroom " +
+            "(storage scan failed); refusing to write"
     );
     this.name = "BridgeAttestOriginQuotaError";
     this.reason = reason;
+  }
+}
+
+/**
+ * Thrown from `bridge_attest`'s `additionalQuotaCheck` closure (LD3 gate
+ * fix-round-2, MUST-FIX 4) when the ATOMIC, in-lock dedup re-scan finds an
+ * existing attestation for this same negotiation. Carries `existing` so the
+ * catch site can return the SAME idempotent "already_attested" response the
+ * pre-fix outer pre-check returned, without a second storage scan.
+ *
+ * WHY THIS EXISTS (the race this closes): the pre-fix version ran
+ * `findExistingAttestationForDedup` ONCE, before calling
+ * `reputationStore.record()`, with an await gap between that scan and the
+ * eventual write — record()'s own admission lock did not exist yet at that
+ * point in the call. Two concurrent `bridge_attest` calls for the SAME
+ * commitment could both run the scan, both see no match (neither has
+ * written yet), and both then persist a fresh attestation, double-counting
+ * one negotiation. Re-running the SAME scan as part of record()'s
+ * `additionalQuotaCheck` — which executes INSIDE record()'s
+ * per-instance admission lock, immediately before the write, with no await
+ * gap between the recheck and the write — makes the second of two
+ * concurrent calls observe the FIRST call's already-completed write (the
+ * admission lock serializes them), so the second throws this error instead
+ * of persisting a duplicate. Single-process only: two SEPARATE server
+ * processes racing the same commitment are not covered (no shared
+ * admission lock across processes) — a documented, accepted DEBT, same
+ * class as the bridge self-inflation DEBT above and cross-process
+ * uniqueness generally (Erik: cross-process is the deferred follow-up).
+ */
+export class BridgeAttestDuplicateError extends Error {
+  readonly existing: StoredAttestation;
+  constructor(existing: StoredAttestation) {
+    super("Bridge attestation store: duplicate attestation for this negotiation");
+    this.name = "BridgeAttestDuplicateError";
+    this.existing = existing;
   }
 }
 
@@ -165,6 +232,47 @@ function resolveBridgeOrigin(callerIdentity: string | undefined): string {
     : AGENT_UNKNOWN_ORIGIN;
 }
 
+/**
+ * Bounds BridgeStore's whole admission critical section (LD3 gate
+ * fix-round-2, MUST-FIX 3 — same class and derivation as
+ * REPUTATION_STORE_ADMISSION_DEADLINE_MS in reputation-store.ts and
+ * STORE_ADMISSION_DEADLINE_MS in sentinel-finding-store.ts; see either
+ * doc for the full derivation). CROSS-FILE PIN: must stay numerically
+ * identical to reputation-store.ts's REPUTATION_STORE_ADMISSION_DEADLINE_MS
+ * and sentinel-finding-store.ts's STORE_ADMISSION_DEADLINE_MS — all three
+ * are ON_EVICT_AUDIT_TIMEOUT_MS + the same 10s storage-op margin, kept as
+ * separate local constants per module (not a shared import) for the same
+ * module-boundary reason `resolveBridgeOrigin` above is reimplemented
+ * rather than imported.
+ */
+const BRIDGE_STORAGE_OP_MARGIN_MS = 10_000;
+const BRIDGE_STORE_ADMISSION_DEADLINE_MS =
+  ON_EVICT_AUDIT_TIMEOUT_MS + BRIDGE_STORAGE_OP_MARGIN_MS;
+
+/**
+ * Race `promise` against a timer that rejects after `ms`. Mirrors
+ * reputation-store.ts's `withReputationAdmissionDeadline` / core/
+ * bounded-map.ts's (unexported) `withTimeout` — reproduced here rather than
+ * reaching across a module boundary for a five-line helper.
+ */
+function withBridgeAdmissionDeadline<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`bridge-store: admission did not settle within ${ms}ms`));
+    }, ms);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err instanceof Error ? err : new Error(String(err)));
+      }
+    );
+  });
+}
+
 // ─── Bridge Store ────────────────────────────────────────────────────────
 // Persists bridge commitments encrypted at rest for later verification
 // and attestation linking.
@@ -174,6 +282,17 @@ class BridgeStore {
   private encryptionKey: Uint8Array;
   private maxCommitments: number;
   private maxCommitmentsPerOrigin: number;
+  private readonly maxPendingAdmissionWaiters: number;
+  /**
+   * Live count of callers currently occupying this store's admission-waiter
+   * cap (LD3 gate fix-round-2, MUST-FIX 3 — mirrors ReputationStore's field
+   * of the same name, reputation-store.ts, and BoundedMap's
+   * `pendingAdmissionWaiters`, core/bounded-map.ts). Incremented
+   * SYNCHRONOUSLY in `runAdmissionExclusiveBounded` before its first
+   * `await`, decremented in a `finally` once the admission settles either
+   * way.
+   */
+  private pendingAdmissionWaiters = 0;
   /**
    * Serializes the check-then-write critical section in save() (LD3 gate
    * fix-round DEFECT 2): a single promise chain per BridgeStore INSTANCE,
@@ -184,7 +303,10 @@ class BridgeStore {
    * `admissionQueue` (core/bounded-map.ts) and ReputationStore's identical
    * field (reputation-store.ts): chain the next call onto the settled tail
    * of the previous one, so the whole quota-check-then-persist section
-   * runs start to finish with no other save() interleaved.
+   * runs start to finish with no other save() interleaved. ONLY reached via
+   * `runAdmissionExclusiveBounded` below (LD3 gate fix-round-2, MUST-FIX 3),
+   * which adds the waiter cap and settlement deadline this raw chain does
+   * not enforce on its own.
    */
   private admissionQueue: Promise<void> = Promise.resolve();
 
@@ -195,18 +317,23 @@ class BridgeStore {
    * quota-refusal test would otherwise have to perform for real
    * (mirrors sentinel-finding-store.ts's `maxTrackedFindings`/
    * `maxFindingsPerOrigin` test-only override options; production call
-   * sites never set these).
+   * sites never set these). `maxPendingAdmissionWaiters` (LD3 gate
+   * fix-round-2) defaults to MAX_PENDING_ADMISSION_WAITERS
+   * (core/bounded-map.ts — shared, not re-derived); same test-only-override
+   * shape.
    */
   constructor(
     storage: StorageBackend,
     masterKey: Uint8Array,
     maxCommitments: number = MAX_BRIDGE_COMMITMENTS,
-    maxCommitmentsPerOrigin: number = MAX_BRIDGE_COMMITMENTS_PER_ORIGIN
+    maxCommitmentsPerOrigin: number = MAX_BRIDGE_COMMITMENTS_PER_ORIGIN,
+    maxPendingAdmissionWaiters: number = MAX_PENDING_ADMISSION_WAITERS
   ) {
     this.storage = storage;
     this.encryptionKey = derivePurposeKey(masterKey, "bridge-commitments");
     this.maxCommitments = maxCommitments;
     this.maxCommitmentsPerOrigin = maxCommitmentsPerOrigin;
+    this.maxPendingAdmissionWaiters = maxPendingAdmissionWaiters;
   }
 
   /**
@@ -289,7 +416,7 @@ class BridgeStore {
     outcome: ConcordiaOutcome,
     origin: string
   ): Promise<void> {
-    await this.runAdmissionExclusive(async () => {
+    await this.runAdmissionExclusiveBounded(async () => {
       await this.assertOriginWithinQuota(origin);
 
       const record = { commitment, outcome, origin };
@@ -303,6 +430,9 @@ class BridgeStore {
     });
   }
 
+  /** Raw promise-chain primitive. Never call directly — see
+   * `runAdmissionExclusiveBounded`, the ONLY caller, for the waiter-cap +
+   * settlement-deadline wrapper every production admission goes through. */
   private async runAdmissionExclusive<T>(fn: () => Promise<T>): Promise<T> {
     const run = this.admissionQueue.then(fn, fn);
     this.admissionQueue = run.then(
@@ -310,6 +440,31 @@ class BridgeStore {
       () => undefined
     );
     return run;
+  }
+
+  /**
+   * The ONLY entry point into `admissionQueue` (LD3 gate fix-round-2,
+   * MUST-FIX 3 — mirrors ReputationStore.runAdmissionExclusiveBounded,
+   * reputation-store.ts, exactly; see that method's doc for the full
+   * rationale). Adds a bounded admission-WAITER cap (checked+incremented
+   * synchronously before joining `admissionQueue`, fail-closed
+   * `admission_busy` refusal at the cap) and a settlement deadline
+   * (BRIDGE_STORE_ADMISSION_DEADLINE_MS) so a hung `storage.list`/`read`/
+   * `write` call inside `fn` cannot retain this lock — and therefore wedge
+   * every later save() admission — indefinitely.
+   */
+  private async runAdmissionExclusiveBounded<T>(fn: () => Promise<T>): Promise<T> {
+    if (this.pendingAdmissionWaiters >= this.maxPendingAdmissionWaiters) {
+      throw new BridgeStoreQuotaError("admission_busy");
+    }
+    this.pendingAdmissionWaiters += 1;
+    try {
+      return await this.runAdmissionExclusive(() =>
+        withBridgeAdmissionDeadline(fn(), BRIDGE_STORE_ADMISSION_DEADLINE_MS)
+      );
+    } finally {
+      this.pendingAdmissionWaiters -= 1;
+    }
   }
 
   async get(
@@ -339,15 +494,43 @@ export interface BridgeToolsTestOverrides {
   maxBridgeCommitments?: number;
   maxBridgeCommitmentsPerOrigin?: number;
   maxBridgeAttestationsPerOrigin?: number;
+  /**
+   * Cap on BridgeStore's admission-WAITER queue (LD3 gate fix-round-2,
+   * MUST-FIX 3). Defaults to MAX_PENDING_ADMISSION_WAITERS (core/
+   * bounded-map.ts — shared, not re-derived). Test-only override, same
+   * shape as the three above.
+   */
+  maxPendingAdmissionWaiters?: number;
 }
 
 // ─── Tool Factory ────────────────────────────────────────────────────────
 
+/**
+ * `reputationStore` (LD3 gate fix-round-2, MUST-FIX 2 — REQUIRED, not
+ * optional/constructed-internally): production runs exactly ONE
+ * ReputationStore instance over the `_reputation` backend, shared between
+ * this factory and createReputationTools (reputation/tools.ts) — see
+ * index.ts's composition-root comment at this factory's call site. Before
+ * this fix, this factory constructed its OWN ReputationStore, so a live
+ * server had TWO independent in-memory admission locks and quota views over
+ * the SAME persisted backend: a concurrent reputation_record (through
+ * createReputationTools' store) and bridge_attest (through THIS factory's
+ * OWN store) could each observe pre-write headroom on their own store's
+ * view and both write, overshooting MAX_REPUTATION_RECORDS(_PER_ORIGIN)
+ * together — the quota check is only as good as the ONE store instance that
+ * enforces it. Making this a REQUIRED parameter (rather than optional with
+ * an internal-construction fallback) is deliberate: AGENTS.md rule 3 — an
+ * optional dependency that GATES a security property must be required, or
+ * the composition root must fail closed when it is missing, because an
+ * optional shape here would silently reintroduce the exact two-instance
+ * defect this fix closes the moment a future call site forgot to pass it.
+ */
 export function createBridgeTools(
   storage: StorageBackend,
   masterKey: Uint8Array,
   identityManager: IdentityManager,
   auditLog: AuditLog,
+  reputationStore: ReputationStore,
   handshakeResults?: ReadonlyMap<string, HandshakeResult>,
   testOverrides?: BridgeToolsTestOverrides
 ): { tools: ToolDefinition[] } {
@@ -355,9 +538,9 @@ export function createBridgeTools(
     storage,
     masterKey,
     testOverrides?.maxBridgeCommitments,
-    testOverrides?.maxBridgeCommitmentsPerOrigin
+    testOverrides?.maxBridgeCommitmentsPerOrigin,
+    testOverrides?.maxPendingAdmissionWaiters
   );
-  const reputationStore = new ReputationStore(storage, masterKey);
   const identityEncryptionKey = derivePurposeKey(masterKey, "identity-encryption");
   const hsResults = handshakeResults ?? new Map<string, HandshakeResult>();
   const maxBridgeAttestationsPerOrigin =
@@ -818,18 +1001,31 @@ export function createBridgeTools(
         // re-committed under many session_ids. That is a trust-boundary decision
         // for Erik (draft-then-approve), not resolved by this dedup.
         //
-        // Fail CLOSED on the dedup scan: if uniqueness cannot be confirmed
-        // (a storage.list error, or any entry that failed to load/decrypt during
-        // the scan), deny the attest rather than risk recording a duplicate
-        // under a transient error. The aggregate read paths intentionally skip
+        // FAST-PATH ONLY, NOT THE SECURITY BOUNDARY (LD3 gate fix-round-2,
+        // MUST-FIX 4 — narrowed from fix-round-1): this scan runs BEFORE
+        // record()'s admission lock, with an await gap before the eventual
+        // write, so it is a genuine check-then-write TOCTOU under real
+        // concurrency — two concurrent bridge_attest calls for the SAME
+        // commitment could both pass this scan (neither has written yet) and
+        // both persist. It exists only to skip the cost of metrics-building,
+        // tier resolution, and signing for the COMMON (non-concurrent) case
+        // of an obvious repeat call. The AUTHORITATIVE recheck is
+        // `checkAttestAdmission` below, composed into record()'s
+        // `additionalQuotaCheck` so it runs INSIDE record()'s admission lock,
+        // immediately before the write — see that closure's doc for how it
+        // closes the race this fast path cannot. Fail CLOSED on the dedup
+        // scan here too: if uniqueness cannot be confirmed (a storage.list
+        // error, or any entry that failed to load/decrypt during the scan),
+        // deny the attest rather than risk recording a duplicate under a
+        // transient error. The aggregate read paths intentionally skip
         // corrupted entries; this dedup path does not.
-        const dedup = await reputationStore.findExistingAttestationForDedup({
+        const dedupFastPath = await reputationStore.findExistingAttestationForDedup({
           interaction_id: outcome.session_id,
           participant_did: identity.did,
           counterparty_did: counterpartyDid,
           context: CONCORDIA_BRIDGE_REPUTATION_CONTEXT,
         });
-        if (!dedup.scanComplete) {
+        if (!dedupFastPath.scanComplete) {
           return toolResult({
             error:
               "Cannot confirm this negotiation was not already attested " +
@@ -837,8 +1033,8 @@ export function createBridgeTools(
               "not recorded. Retry once the store is readable.",
           });
         }
-        const existingAttestation = dedup.match;
-        if (existingAttestation) {
+        if (dedupFastPath.match) {
+          const existingAttestation = dedupFastPath.match;
           return toolResult({
             attestation_id: existingAttestation.attestation.attestation_id,
             bridge_commitment_id: commitmentId,
@@ -885,21 +1081,49 @@ export function createBridgeTools(
         // (resolveBridgeOrigin), never `identity.did` — that DID is Tier-3
         // `identity_create`-mintable, so a per-origin cap keyed on it would
         // be defeated by minting a fresh identity per call, the same defeat
-        // MAX_BRIDGE_COMMITMENTS_PER_ORIGIN's doc records. The scan itself
-        // (`checkAttestOriginQuota` below) is unchanged; what changed is
-        // WHERE it runs: passed to record() as `additionalQuotaCheck` so it
-        // executes INSIDE record()'s own admission lock, immediately before
-        // the write, rather than before calling record() with an await gap
-        // in between. The pre-fix ordering let N concurrent bridge_attest
-        // calls all observe headroom (e.g. all at count 199) before any of
-        // them wrote, overshooting maxBridgeAttestationsPerOrigin by up to
-        // N-1; composing the check into record()'s single-flight section
-        // closes that race the same way BridgeStore.save() was closed
-        // above. Fails CLOSED (denies) if the scan itself cannot confirm
-        // the count, mirroring the dedup scan's own fail-closed contract
-        // immediately above.
+        // MAX_BRIDGE_COMMITMENTS_PER_ORIGIN's doc records.
+        //
+        // `checkAttestAdmission` (LD3 gate fix-round-2, MUST-FIX 4 — renamed
+        // and widened from the fix-round-1 `checkAttestOriginQuota`) is
+        // passed to record() as `additionalQuotaCheck`, so it executes
+        // INSIDE record()'s own admission lock, immediately before the
+        // write, with no await gap between this check and the persist. It
+        // now does TWO things atomically, in order:
+        //
+        // 1. RE-RUN the dedup scan (the same criteria the fast-path check
+        //    above already ran) and throw BridgeAttestDuplicateError on a
+        //    match. This is the AUTHORITATIVE dedup check: the fast-path
+        //    scan above ran before this lock, with an await gap before the
+        //    eventual write, so two concurrent bridge_attest calls for the
+        //    SAME commitment could both pass IT and both reach here — but
+        //    record()'s admission lock serializes their entries into THIS
+        //    closure, so the second call's re-scan observes the first
+        //    call's already-completed write and throws, instead of both
+        //    persisting a duplicate. See BridgeAttestDuplicateError's doc
+        //    for the full race this closes and its single-process scope.
+        // 2. The origin-quota scan (unchanged from fix-round-1): the
+        //    pre-fix ordering let N concurrent bridge_attest calls all
+        //    observe headroom (e.g. all at count 199) before any of them
+        //    wrote, overshooting maxBridgeAttestationsPerOrigin by up to
+        //    N-1; composing the check into record()'s single-flight section
+        //    closes that race the same way BridgeStore.save() was closed
+        //    above. Fails CLOSED (denies) if either scan cannot confirm its
+        //    result.
         const origin = resolveBridgeOrigin(callerIdentity);
-        const checkAttestOriginQuota = async (): Promise<void> => {
+        const checkAttestAdmission = async (): Promise<void> => {
+          const dedupRecheck = await reputationStore.findExistingAttestationForDedup({
+            interaction_id: outcome.session_id,
+            participant_did: identity.did,
+            counterparty_did: counterpartyDid,
+            context: CONCORDIA_BRIDGE_REPUTATION_CONTEXT,
+          });
+          if (!dedupRecheck.scanComplete) {
+            throw new BridgeAttestOriginQuotaError("dedup_scan_unavailable");
+          }
+          if (dedupRecheck.match) {
+            throw new BridgeAttestDuplicateError(dedupRecheck.match);
+          }
+
           const originQuota = await reputationStore.countAttestationsByOriginForContext(
             origin,
             CONCORDIA_BRIDGE_REPUTATION_CONTEXT
@@ -930,18 +1154,43 @@ export function createBridgeTools(
             undefined, // counterparty_attestation
             tier,
             origin,
-            checkAttestOriginQuota
+            checkAttestAdmission
           );
         } catch (err) {
           if (err instanceof BridgeAttestationMetricValidationError) {
             return toolResult({ error: err.message });
+          }
+          if (err instanceof BridgeAttestDuplicateError) {
+            // The atomic in-lock recheck found a match a concurrent call
+            // already persisted between the fast-path scan and this write —
+            // return the SAME idempotent shape the fast-path branch above
+            // returns, never a second attestation. Not itself a quota
+            // refusal, so no quota audit entry; the request succeeded
+            // idempotently.
+            const existingAttestation = err.existing;
+            return toolResult({
+              attestation_id: existingAttestation.attestation.attestation_id,
+              bridge_commitment_id: commitmentId,
+              session_id: outcome.session_id,
+              counterparty_did: counterpartyDid,
+              outcome_result: existingAttestation.attestation.data.outcome_result,
+              sovereignty_tier: existingAttestation.attestation.data.sovereignty_tier,
+              metric_policy: existingAttestation.attestation.data.metric_policy,
+              attested_at: existingAttestation.recorded_at,
+              already_attested: true,
+              note:
+                "This negotiation was already attested by this identity; returning " +
+                "the existing attestation. Reputation was not recorded a second time.",
+            });
           }
           if (err instanceof BridgeAttestOriginQuotaError) {
             void auditLog.append(
               "l4",
               err.reason === "origin_quota"
                 ? "bridge_attest_origin_quota_exceeded"
-                : "bridge_attest_quota_scan_unavailable",
+                : err.reason === "dedup_scan_unavailable"
+                  ? "bridge_attest_dedup_scan_unavailable"
+                  : "bridge_attest_quota_scan_unavailable",
               identity.identity_id,
               { bridge_commitment_id: commitmentId, caller_identity: origin },
               "failure"
@@ -952,23 +1201,33 @@ export function createBridgeTools(
                   ? `This origin has reached its bridge-attestation quota ` +
                     `(${maxBridgeAttestationsPerOrigin}); the attestation was ` +
                     "not recorded."
-                  : "Cannot confirm this origin's attestation quota headroom " +
-                    "(reputation store could not be fully read); the attestation " +
-                    "was not recorded. Retry once the store is readable.",
+                  : err.reason === "dedup_scan_unavailable"
+                    ? "Cannot confirm this negotiation was not already attested " +
+                      "(reputation store could not be fully read); the attestation " +
+                      "was not recorded. Retry once the store is readable."
+                    : "Cannot confirm this origin's attestation quota headroom " +
+                      "(reputation store could not be fully read); the attestation " +
+                      "was not recorded. Retry once the store is readable.",
             });
           }
           if (err instanceof ReputationStoreQuotaError) {
             // `_reputation`'s OWN global/per-origin chokepoint bound (LD3
             // gate fix-round DEFECT 1, reputation-store.ts) — distinct from
             // the context-scoped check above, checked in the same
-            // admission-locked section inside record().
+            // admission-locked section inside record(). `admission_busy`
+            // (fix-round-2, MUST-FIX 3) is included here: it is refused
+            // before record() ever reaches assertRecordQuota, but is still
+            // surfaced through this same catch since record() throws it the
+            // same way.
             void auditLog.append(
               "l4",
               err.reason === "origin_quota"
                 ? "bridge_attest_reputation_origin_quota_exceeded"
                 : err.reason === "capacity"
                   ? "bridge_attest_reputation_store_saturated"
-                  : "bridge_attest_reputation_quota_scan_unavailable",
+                  : err.reason === "admission_busy"
+                    ? "bridge_attest_reputation_admission_busy"
+                    : "bridge_attest_reputation_quota_scan_unavailable",
               identity.identity_id,
               { bridge_commitment_id: commitmentId, caller_identity: origin },
               "failure"
