@@ -705,15 +705,28 @@ export interface ReputationStoreTestOverrides {
  * STORE_ADMISSION_DEADLINE_MS in sentinel-finding-store.ts and
  * bridge/tools.ts).
  *
- * ACCEPTED RESIDUAL (mirrors sentinel-finding-store.ts's identical
- * paragraph, recorded honestly, not "fixed"): a storage call that hangs
- * PAST this deadline and later completes can still land a single detached
- * write after the triggering admission was already refused — the deadline
- * stops this call from WAITING, it cannot CANCEL the underlying storage
- * operation (no cancellation or compare-and-swap primitive exists). The
- * overshoot this can cause is bounded to exactly one extra write, never
- * unbounded growth, and requires storage to pathologically hang past a
- * multi-second deadline and still succeed.
+ * ACCEPTED RESIDUAL (mirrors sentinel-finding-store.ts's paragraph,
+ * recorded honestly, not "fixed"): a storage call that hangs PAST this
+ * deadline and later completes can still land detached write(s) after the
+ * triggering admission was already refused — the deadline stops this call
+ * from WAITING, it cannot CANCEL the underlying storage operation (no
+ * cancellation or compare-and-swap primitive exists). For a single-record
+ * `record()` the overshoot is bounded to exactly one extra write. For a
+ * BATCH `importBundle()` the timed-out closure can continue its write loop,
+ * so the overshoot is bounded by that ONE bundle's size — and that size is
+ * itself bounded because `assertRecordQuotaForCount` refuses the whole
+ * bundle up front if it would exceed the cap, so a single import never
+ * writes more than the headroom the batch check permitted; a second
+ * admission may then also write once the deadline releases the queue. The
+ * overshoot is therefore bounded (never unbounded growth) and requires
+ * storage to pathologically hang past a multi-second deadline and still
+ * succeed. Reachability is further limited: both importBundle paths are
+ * OPERATOR-gated (`reputation_import` is tier1_always_approve; the exit CLI
+ * is a separate operator process), so this is not an in-server Tier-3
+ * agent-reachable cap bypass. Cross-process concurrency is the separate
+ * accepted DEBT (bridge/tools.ts). The per-refusal `admission_busy` audit
+ * append is 1:1 with a real MCP round-trip (not N×M); the uncapped audit
+ * queue it feeds is the separately-tracked systemic item (register AUD-BP-01).
  */
 const REPUTATION_STORAGE_OP_MARGIN_MS = 10_000;
 const REPUTATION_STORE_ADMISSION_DEADLINE_MS =
