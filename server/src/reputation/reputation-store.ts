@@ -684,16 +684,21 @@ export interface ReputationStoreTestOverrides {
 }
 
 /**
- * Bounds the whole admission critical section `runAdmissionExclusiveBounded`
- * guards (LD3 gate fix-round-2, MUST-FIX 3 — same class as
+ * Bounds how long a `runAdmissionExclusiveBounded` CALLER waits for its own
+ * admission to settle (LD3 gate fix-round-2, MUST-FIX 3 — same class as
  * core/bounded-map.ts's `onEvict` timeout and
  * sentinel-finding-store.ts's `STORE_ADMISSION_DEADLINE_MS`, applied here to
- * `_reputation`'s own admission lock): a hung `storage.list`/`read`/`write`
- * call inside the locked section would otherwise retain the lock
- * indefinitely and wedge every later record()/importBundle() admission
- * behind it. ON_EVICT_AUDIT_TIMEOUT_MS is reused rather than re-derived (it
- * is itself derived from audit-log.ts's two-phase lock-acquisition + write-
- * hold deadline contract — see that constant's doc, core/bounded-map.ts);
+ * `_reputation`'s own admission lock). NOT a bound on how long the
+ * underlying lock is held (LD5 BP-DEADLINE-01 — see
+ * `runAdmissionExclusiveBounded`'s doc): a hung `storage.list`/`read`/
+ * `write` call inside the locked section keeps the lock, by design, until
+ * it settles — a timeout only stops THIS caller from waiting on it, and
+ * frees `pendingAdmissionWaiters`' slot for it, without releasing
+ * `admissionQueue` to a later admission that could otherwise observe stale
+ * (pre-write) headroom. ON_EVICT_AUDIT_TIMEOUT_MS is reused rather than
+ * re-derived (it is itself derived from audit-log.ts's two-phase
+ * lock-acquisition + write-hold deadline contract — see that constant's
+ * doc, core/bounded-map.ts);
  * STORAGE_OP_MARGIN_MS is a defensive backstop for this store's OWN
  * storage.list/read/write calls, which carry no settle-time contract at all
  * (storage/interface.ts). Kept as a LOCAL constant, not imported from
@@ -705,28 +710,37 @@ export interface ReputationStoreTestOverrides {
  * STORE_ADMISSION_DEADLINE_MS in sentinel-finding-store.ts and
  * bridge/tools.ts).
  *
- * ACCEPTED RESIDUAL (mirrors sentinel-finding-store.ts's paragraph,
- * recorded honestly, not "fixed"): a storage call that hangs PAST this
- * deadline and later completes can still land detached write(s) after the
- * triggering admission was already refused — the deadline stops this call
- * from WAITING, it cannot CANCEL the underlying storage operation (no
- * cancellation or compare-and-swap primitive exists). For a single-record
- * `record()` the overshoot is bounded to exactly one extra write. For a
- * BATCH `importBundle()` the timed-out closure can continue its write loop,
- * so the overshoot is bounded by that ONE bundle's size — and that size is
- * itself bounded because `assertRecordQuotaForCount` refuses the whole
- * bundle up front if it would exceed the cap, so a single import never
- * writes more than the headroom the batch check permitted; a second
- * admission may then also write once the deadline releases the queue. The
- * overshoot is therefore bounded (never unbounded growth) and requires
- * storage to pathologically hang past a multi-second deadline and still
- * succeed. Reachability is further limited: both importBundle paths are
- * OPERATOR-gated (`reputation_import` is tier1_always_approve; the exit CLI
- * is a separate operator process), so this is not an in-server Tier-3
- * agent-reachable cap bypass. Cross-process concurrency is the separate
- * accepted DEBT (bridge/tools.ts). The per-refusal `admission_busy` audit
- * append is 1:1 with a real MCP round-trip (not N×M); the uncapped audit
- * queue it feeds is the separately-tracked systemic item (register AUD-BP-01).
+ * LD5 BP-DEADLINE-01 (closed — this paragraph previously read "ACCEPTED
+ * RESIDUAL" and claimed a bounded, "exactly one extra write" overshoot; that
+ * claim was WRONG under repeated scheduling, not merely narrow): the pre-fix
+ * `runAdmissionExclusiveBounded` wrapped `fn` in
+ * `withReputationAdmissionDeadline` BEFORE handing it to
+ * `runAdmissionExclusive`, so the raw promise chained onto `admissionQueue`
+ * WAS the deadline race — the lock released to the next admission the
+ * instant the timer fired, even though the underlying `fn()` (quota check
+ * plus `storage.write`, or importBundle's whole write loop) kept running
+ * detached. A caller that repeatedly scheduled "scan passes, write hangs
+ * past the deadline, enqueue another admission, release the delayed write
+ * later" could keep every successive admission's quota scan observing
+ * STALE (pre-write) headroom indefinitely — there was no cap on how many
+ * waves of this could run, so the overshoot was unbounded, not "exactly
+ * one." The fix: `fn` (raw, undecorated) is what gets chained onto
+ * `admissionQueue` via `runAdmissionExclusive`, so the lock is held until
+ * `fn()` truly settles; the deadline is applied ONLY to the promise
+ * `runAdmissionExclusiveBounded` awaits and returns, bounding what the
+ * CALLER is told without ever releasing the lock early. A `fn()` that never
+ * settles at all (genuinely hung, not merely slow) now blocks this store's
+ * queue for every later admission until it does — deliberate, since the
+ * alternative (releasing the lock early) is the exact bypass this fix
+ * closes; each caller still fails closed on its own deadline and
+ * `pendingAdmissionWaiters` cap, so a hung storage backend degrades to "no
+ * new admissions succeed," never to a quota overshoot. Reachability
+ * remains as before: both importBundle paths are OPERATOR-gated
+ * (`reputation_import` is tier1_always_approve; the exit CLI is a separate
+ * operator process). Cross-process concurrency is the separate accepted
+ * DEBT (bridge/tools.ts). The per-refusal `admission_busy` audit append is
+ * 1:1 with a real MCP round-trip (not N×M); the uncapped audit queue it
+ * feeds is the separately-tracked systemic item (register AUD-BP-01).
  */
 const REPUTATION_STORAGE_OP_MARGIN_MS = 10_000;
 const REPUTATION_STORE_ADMISSION_DEADLINE_MS =
@@ -854,13 +868,17 @@ export class ReputationStore {
    *    `runAdmissionExclusive`: the closure is never constructed, never
    *    chained onto `admissionQueue`, so a refused call leaves the queue
    *    exactly as it was and cannot itself contribute to a wedge.
-   * 2. SETTLEMENT DEADLINE: `fn` races against
-   *    REPUTATION_STORE_ADMISSION_DEADLINE_MS via
-   *    withReputationAdmissionDeadline — a hung `storage.list`/`read`/
-   *    `write` call inside `fn` cannot retain this lock past that deadline;
-   *    the queue still advances for the NEXT admission even though the hung
-   *    operation itself keeps running detached (see that constant's doc for
-   *    the accepted, bounded residual this trade-off leaves).
+   * 2. SETTLEMENT DEADLINE: the promise this method returns to ITS OWN
+   *    caller races against REPUTATION_STORE_ADMISSION_DEADLINE_MS via
+   *    withReputationAdmissionDeadline — bounding how long that CALLER
+   *    waits, never how long this store's lock is held (LD5 BP-DEADLINE-01
+   *    — see REPUTATION_STORE_ADMISSION_DEADLINE_MS's doc for the closed
+   *    defect this replaces). `fn` itself is chained onto `admissionQueue`
+   *    RAW, undecorated, so the lock only frees once `fn()` truly settles;
+   *    a hung `storage.list`/`read`/`write` call inside `fn` therefore
+   *    keeps holding this lock past the deadline, on purpose — releasing it
+   *    early is exactly what let a detached write land against
+   *    already-stale quota headroom.
    */
   private async runAdmissionExclusiveBounded<T>(fn: () => Promise<T>): Promise<T> {
     if (this.pendingAdmissionWaiters >= this.maxPendingAdmissionWaiters) {
@@ -868,8 +886,16 @@ export class ReputationStore {
     }
     this.pendingAdmissionWaiters += 1;
     try {
-      return await this.runAdmissionExclusive(() =>
-        withReputationAdmissionDeadline(fn(), REPUTATION_STORE_ADMISSION_DEADLINE_MS)
+      // Chain the RAW fn onto admissionQueue (never the deadline-wrapped
+      // closure) so runAdmissionExclusive only advances the queue once
+      // fn() itself settles. The deadline races the ALREADY-CHAINED
+      // promise below, so a timeout changes only what THIS call reports —
+      // never when the lock frees for the next admission (LD5
+      // BP-DEADLINE-01).
+      const chained = this.runAdmissionExclusive(fn);
+      return await withReputationAdmissionDeadline(
+        chained,
+        REPUTATION_STORE_ADMISSION_DEADLINE_MS
       );
     } finally {
       this.pendingAdmissionWaiters -= 1;

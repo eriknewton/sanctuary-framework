@@ -306,10 +306,13 @@ const SATURATION_EVICT_SCAN_CAP = 50;
 
 /**
  * SHARED CLASS WITH core/bounded-map.ts (AGENTS.md rule 8, MUST-FIX 1,
- * fix-round-5): bounds the whole store-level NEW-RECORD admission critical
- * section (see `admissionQueue`'s doc below) so a hung storage operation
- * cannot retain the store-wide admission lock indefinitely and stall every
- * later new-finding write. The critical section can include an awaited
+ * fix-round-5): bounds how long a `saveFinding` CALLER waits for its own
+ * new-record admission to settle (see `admissionQueue`'s doc below) — NOT
+ * how long the store-wide admission lock is held (LD5 BP-DEADLINE-01, see
+ * that paragraph below): a hung storage operation inside the critical
+ * section keeps the lock, by design, until it settles, so this deadline
+ * frees only the WAITING caller, never the queue on that caller's behalf.
+ * The critical section can include an awaited
  * `appendCritical` reclamation-intent write (`evictOldestExpired`), whose
  * own worst-case settle time is `ON_EVICT_AUDIT_TIMEOUT_MS` (imported from
  * core/bounded-map.ts rather than re-derived — that constant is itself
@@ -321,27 +324,33 @@ const SATURATION_EVICT_SCAN_CAP = 50;
  * contract for at all. STORAGE_OP_MARGIN_MS is a defensive backstop for
  * that unbounded portion, not a precise derivation.
  *
- * ACCEPTED RESIDUAL (fix-round-6, recorded honestly, not "fixed"): a
- * storage `write`/`list`/`read` call that hangs PAST this deadline and
- * then LATER completes can still allow a single bounded detached write to
- * land after `withDeadline` already gave up and refused the triggering
- * admission — the deadline stops this call from WAITING on the hung
- * operation, it cannot CANCEL the operation itself, because
- * `storage/interface.ts` exposes no cancellation and no compare-and-swap
- * primitive. The overshoot this can cause is bounded to exactly ONE extra
- * write (the one detached call), never unbounded growth, and requires
- * storage to pathologically hang past a multi-second deadline and then
- * still succeed — this is NOT claimed to be impossible, and the resulting
- * write is NOT claimed to be byte-identical to anything; it is a real,
- * bounded, single-write overshoot, accepted rather than engineered away.
- * This is the SAME trade-off `core/bounded-map.ts`'s `onEvict` timeout
- * already makes for the identical reason (no cancellation primitive on
- * the underlying I/O) — adding storage-level cancellation or
- * compare-and-swap machinery to close this one write would be
- * disproportionate to a residual this narrow (AGENTS.md's minimalism
- * principle: a remediation worse than the bug it fixes). This paragraph
- * IS the accepted-residual record: the trade-off is deliberate, not an
- * oversight.
+ * LD5 BP-DEADLINE-01 (closed — this paragraph previously read "ACCEPTED
+ * RESIDUAL" and claimed a bounded, "exactly one extra write" overshoot;
+ * that claim was WRONG under repeated scheduling): the pre-fix
+ * `runAdmissionExclusive` wrapped `fn` in `withDeadline` INSIDE the
+ * `.then()` callbacks chained onto `admissionQueue`, so the promise that
+ * advanced the queue WAS the deadline race — the lock released to the next
+ * admission the instant the timer fired, even though the underlying
+ * `fn()` (the ceiling check plus the durable write) kept running detached.
+ * A caller that repeatedly scheduled "scan passes, write hangs past the
+ * deadline, enqueue another admission, release the delayed write later"
+ * could keep every successive admission's ceiling check observing STALE
+ * (pre-write) headroom indefinitely — there was no cap on how many waves
+ * of this could run, so the overshoot was unbounded, not "exactly one."
+ * `storage/interface.ts` still exposes no cancellation or compare-and-swap
+ * primitive, so a hung write still cannot be CANCELLED — the fix instead
+ * stops the queue from advancing until the write settles: `fn` (raw,
+ * undecorated) is what gets chained onto `admissionQueue`, and
+ * `withDeadline` is applied only to the promise `runAdmissionExclusive`
+ * returns to ITS caller, bounding what that caller is told without ever
+ * releasing the lock early. A `fn()` that never settles at all (genuinely
+ * hung, not merely slow) now blocks this store's queue for every later
+ * new-record admission until it does — deliberate, since the alternative
+ * (releasing the lock early) is the exact bypass this fix closes; each
+ * caller still fails closed on its own deadline and
+ * `pendingAdmissionWaiters` cap (see that field's doc), so a hung storage
+ * backend degrades to "no new findings admitted," never to a
+ * `MAX_TRACKED_FINDINGS`/`MAX_FINDINGS_PER_ORIGIN` overshoot.
  */
 const STORAGE_OP_MARGIN_MS = 10_000;
 const STORE_ADMISSION_DEADLINE_MS = ON_EVICT_AUDIT_TIMEOUT_MS + STORAGE_OP_MARGIN_MS;
@@ -712,25 +721,35 @@ export class SentinelFindingStore {
    * `BoundedMap.runAdmissionExclusive` (core/bounded-map.ts) exactly: chain
    * onto the prior call's SETTLED tail so one admission's failure can never
    * wedge every later admission behind a permanently-rejected promise.
-   * BOUNDED (MUST-FIX 1, fix-round-5): `fn` races against
-   * `STORE_ADMISSION_DEADLINE_MS` via `withDeadline` — a hung storage
-   * operation inside `fn` cannot retain this lock (or the underlying
-   * per-id lock it may have acquired) past that deadline; the queue still
-   * advances for the NEXT admission even though the hung operation itself
-   * keeps running detached (mirrors bounded-map.ts's `onEvict` timeout
-   * trade-off — nothing can cancel an in-flight storage call, only stop
-   * waiting on it).
+   * BOUNDED (MUST-FIX 1, fix-round-5; corrected LD5 BP-DEADLINE-01): the
+   * promise returned to THIS method's caller races against
+   * `STORE_ADMISSION_DEADLINE_MS` via `withDeadline`, bounding how long
+   * that caller waits. `admissionQueue` itself is fed the RAW `fn`, never
+   * the deadline-wrapped version — so a hung storage operation inside `fn`
+   * (or the underlying per-id lock it may have acquired) KEEPS this lock
+   * past the deadline, by design, until `fn()` truly settles. Releasing the
+   * lock at the deadline instead of at settlement is the exact defect LD5
+   * BP-DEADLINE-01 closed: it let a later admission's ceiling check
+   * observe stale (pre-write) headroom while the earlier write was still
+   * silently in flight, and a caller that repeated the fault indefinitely
+   * could overshoot `MAX_TRACKED_FINDINGS`/`MAX_FINDINGS_PER_ORIGIN`
+   * without bound. `storage/interface.ts` still has no cancellation
+   * primitive — the fix stops the queue from moving on, it does not stop
+   * the hung I/O itself.
    */
   private async runAdmissionExclusive<T>(fn: () => Promise<T>): Promise<T> {
-    const run = this.admissionQueue.then(
-      () => withDeadline(fn(), STORE_ADMISSION_DEADLINE_MS),
-      () => withDeadline(fn(), STORE_ADMISSION_DEADLINE_MS),
-    );
+    // `run` is chained from the RAW fn (never withDeadline-wrapped): this is
+    // what `admissionQueue` advances on, so the lock is held until fn()
+    // itself settles, not until the deadline fires (LD5 BP-DEADLINE-01).
+    const run = this.admissionQueue.then(fn, fn);
     this.admissionQueue = run.then(
       () => undefined,
       () => undefined,
     );
-    return run;
+    // The deadline races the ALREADY-CHAINED `run`, so a timeout changes
+    // only what THIS caller is told — it can never advance `admissionQueue`
+    // on fn()'s behalf.
+    return withDeadline(run, STORE_ADMISSION_DEADLINE_MS);
   }
 
   /**

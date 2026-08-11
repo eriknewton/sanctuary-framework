@@ -449,9 +449,33 @@ class BridgeStore {
    * rationale). Adds a bounded admission-WAITER cap (checked+incremented
    * synchronously before joining `admissionQueue`, fail-closed
    * `admission_busy` refusal at the cap) and a settlement deadline
-   * (BRIDGE_STORE_ADMISSION_DEADLINE_MS) so a hung `storage.list`/`read`/
-   * `write` call inside `fn` cannot retain this lock — and therefore wedge
-   * every later save() admission — indefinitely.
+   * (BRIDGE_STORE_ADMISSION_DEADLINE_MS) that bounds ONLY how long the
+   * CALLER waits, never how long this store's lock is held.
+   *
+   * LD5 BP-DEADLINE-01 (closed): the pre-fix version wrapped `fn` in
+   * `withBridgeAdmissionDeadline` BEFORE handing it to
+   * `runAdmissionExclusive`, so the raw promise chained onto
+   * `admissionQueue` WAS the deadline race — the lock released to the next
+   * admission the instant the timer fired, even though the underlying
+   * `fn()` (the quota check plus `storage.write`) kept running detached. A
+   * scheduled fault ("scan passes, write hangs past the deadline, a new
+   * admission is enqueued, the write is released later, repeat") could
+   * therefore land arbitrarily many writes against quota headroom that had
+   * already gone stale by the time each write actually landed, defeating
+   * `MAX_BRIDGE_COMMITMENTS_PER_ORIGIN` outright — NOT the "exactly one
+   * extra write, never unbounded growth" bound this comment used to claim.
+   * The fix: `fn` (raw, undecorated) is what gets chained onto
+   * `admissionQueue` via `runAdmissionExclusive` below, so the lock is held
+   * until `fn()` truly settles; the deadline is applied ONLY to the promise
+   * this method awaits and returns, bounding what the CALLER is told
+   * without ever releasing the lock early. A `fn()` that never settles at
+   * all (genuinely hung, not merely slow) therefore blocks this store's
+   * queue for every later admission until it does — that trade is
+   * deliberate: the alternative (releasing the lock early) is the exact
+   * quota bypass this fix closes. Each individual caller still fails closed
+   * on its own deadline and this store's `pendingAdmissionWaiters` cap, so
+   * a hung storage backend degrades to "no new admissions succeed," never
+   * to a quota overshoot.
    */
   private async runAdmissionExclusiveBounded<T>(fn: () => Promise<T>): Promise<T> {
     if (this.pendingAdmissionWaiters >= this.maxPendingAdmissionWaiters) {
@@ -459,8 +483,16 @@ class BridgeStore {
     }
     this.pendingAdmissionWaiters += 1;
     try {
-      return await this.runAdmissionExclusive(() =>
-        withBridgeAdmissionDeadline(fn(), BRIDGE_STORE_ADMISSION_DEADLINE_MS)
+      // Chain the RAW fn onto admissionQueue (never the deadline-wrapped
+      // closure) so runAdmissionExclusive only advances the queue once
+      // fn() itself settles. The deadline races the ALREADY-CHAINED
+      // promise below, so a timeout changes only what THIS call reports —
+      // never when the lock frees for the next admission (LD5
+      // BP-DEADLINE-01).
+      const chained = this.runAdmissionExclusive(fn);
+      return await withBridgeAdmissionDeadline(
+        chained,
+        BRIDGE_STORE_ADMISSION_DEADLINE_MS
       );
     } finally {
       this.pendingAdmissionWaiters -= 1;
