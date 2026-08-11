@@ -29,6 +29,7 @@ import {
   MeshReservedEventTypeError,
   MeshReservedExtensionKeyError,
   MeshRollbackDetectedError,
+  MeshUnsolicitedSyncResponseError,
 } from "../errors.js";
 import { packSignedEvent } from "../envelope.js";
 import { verifySignedEvent } from "../envelope.js";
@@ -83,6 +84,7 @@ import {
   LocatorTableStore,
   NodeLifecycleEventLog,
   PolicyBundleStore,
+  type LocatorUpsertResult,
   type PolicyBundleAuditEvent,
   type PolicyBundleUpsertResult,
 } from "./local-state.js";
@@ -129,6 +131,16 @@ export interface FirstNodeBootstrap {
   node_private_key: Uint8Array;
 }
 
+/**
+ * Upper bound on `MeshNode.receivedLog` (AGENTS.md rule 8). This is a
+ * diagnostic tap on every accepted broadcast (`getReceivedLog()` is a
+ * test/operator observability surface, not a replicated table like
+ * NodeLifecycleEventLog) with no dedup of its own — a rostered peer that
+ * broadcasts a flood of distinct, validly-signed envelopes grows it once
+ * per accepted event. 4096 mirrors MAX_LIFECYCLE_LOG_ENTRIES's derivation.
+ */
+const MAX_RECEIVED_EVENT_LOG_ENTRIES = 4096;
+
 export class MeshNode {
   private config: MeshNodeConfig;
   private readonly transport: MeshTransport;
@@ -158,6 +170,17 @@ export class MeshNode {
   private state: MeshNodeState = "unbooted";
   private oldestPendingEntryAt: number | null = null;
   private receivedLog: ReceivedEventLog[] = [];
+  /**
+   * MESH-SYNC-DOS-01 (rule 8): outstanding sync_requests we ourselves
+   * issued, keyed by the VERIFIED peer_node_id we sent them to (never a
+   * payload-carried "responder" field — see handleIncomingUnicast's
+   * `sync_response` branch, which keys the lookup off the envelope's own
+   * verified `emitter_node`). Bounded by construction: entries are added
+   * only from `requestSyncFromPeer` (a call WE make, never attacker-
+   * triggered) and removed the moment a matching response lands, so this
+   * set's size is bounded by the roster's own size, not by peer traffic.
+   */
+  private readonly pendingSyncRequests = new Set<string>();
 
   /** Callback hooks - Follow-up #3 (failure-mode operator surfaces) wires these. */
   onLifecycleEvent: (
@@ -171,7 +194,7 @@ export class MeshNode {
   onPolicyBundleRejected: (event: PolicyBundleAuditEvent) => void = () => {};
   onLocatorUpdate: (
     evt: SignedEvent<LocatorUpdatePayload>,
-    result: "applied" | "older" | "conflict"
+    result: LocatorUpsertResult
   ) => void = () => {};
   onAuditBatchEmitted: (info: {
     batch_seq: number;
@@ -789,6 +812,15 @@ export class MeshNode {
     });
     const result = this.locatorTable.upsert(evt);
     this.onLocatorUpdate(evt, result);
+    if (result !== "applied") {
+      // Mirrors publishPolicyUpdate's guard just above: a rejection here
+      // means THIS node's own emitter_node/emitter_principal did not match
+      // the payload it was asked to publish (a caller bug, since packSignedEvent
+      // always signs as `this.config.node_id`/`params.emitter_principal` —
+      // see LocatorTableStore.upsert's authority-binding check). Never
+      // broadcast a locator claim this node's own store refused to accept.
+      throw new MeshError(`locator_update rejected before publish: ${result}`);
+    }
     await this.transport.broadcast(evt);
     return evt;
   }
@@ -903,6 +935,11 @@ export class MeshNode {
       monotonic_seq: this.counters.next("envelope_monotonic_seq"),
       node_private_key: this.nodePrivateKey!,
     });
+    // MESH-SYNC-DOS-01: record the outstanding request BEFORE the unicast
+    // so there is no window in which a response could race ahead of our
+    // own bookkeeping. handleIncomingUnicast's `sync_response` branch
+    // refuses to apply any response from a peer not present here.
+    this.pendingSyncRequests.add(params.peer_node_id);
     await this.transport.unicast(
       params.peer_node_id,
       JSON.stringify({ kind: "sync_request", evt })
@@ -943,6 +980,13 @@ export class MeshNode {
       } else {
         this.verifyOrThrow(evt);
       }
+      // MESH-SYNC-DOS-01: this append and the one inside applySyncResponse
+      // below (via `acceptedLifecycleEvents`) both run for every accepted
+      // event -- deliberately. NodeLifecycleEventLog.append() is idempotent
+      // by event_id (local-state.ts), so the second call is a documented
+      // no-op, not a double-apply; see that method's doc for why dedup
+      // lives at the log itself rather than requiring either call site to
+      // track what the other one already did.
       this.lifecycleLog.append(evt);
       if (evt.event_type === "node_revoke") {
         const rev = evt as SignedEvent<NodeRevokePayload>;
@@ -1342,6 +1386,14 @@ export class MeshNode {
       });
       return;
     }
+    if (this.receivedLog.length >= MAX_RECEIVED_EVENT_LOG_ENTRIES) {
+      // Bound (rule 8): FIFO-evict the oldest diagnostic entry. Not
+      // trust-bearing (see LocatorTableStore's identical eviction note) —
+      // this log is an observability tap, never consulted for a trust or
+      // replication decision, so dropping its oldest entry has no security
+      // consequence beyond a shorter diagnostic window.
+      this.receivedLog.shift();
+    }
     this.receivedLog.push({
       event_type: evt.event_type,
       emitter_node: evt.emitter_node,
@@ -1464,6 +1516,36 @@ export class MeshNode {
     this.auditBuffer.push(entry);
   }
 
+  /** MESH-SYNC-DOS-01: audits a validly-signed but unsolicited sync_response
+   * — mirrors auditNodeRevokeDenied's shape for the same "authenticated
+   * peer, protocol-violating action" audit class. */
+  private auditUnsolicitedSyncResponse(
+    evt: SignedEvent,
+    error: Error
+  ): void {
+    if (!this.nodePrivateKey) {
+      return;
+    }
+    const entry = sealAuditEntry({
+      emitter_node: this.config.node_id,
+      emitter_agent: "mesh",
+      emitter_principal: this.config.system_principal_id ?? "system",
+      policy_version: 0,
+      attestation_state: "peer_protocol_violation",
+      payload: {
+        operation: "sync_response_unsolicited",
+        event_type: evt.event_type,
+        peer_node: evt.emitter_node,
+        reason: error.message,
+      },
+      node_private_key: this.nodePrivateKey,
+    });
+    if (this.oldestPendingEntryAt === null) {
+      this.oldestPendingEntryAt = Date.now();
+    }
+    this.auditBuffer.push(entry);
+  }
+
   private auditPeerProtocolViolation(info: {
     error: Error;
     event_type: string;
@@ -1544,12 +1626,38 @@ export class MeshNode {
       return;
     }
     if (parsed.kind === "sync_response" && parsed.evt) {
+      let verified: SignedEvent;
       try {
-        const verified = this.verifyOrThrow(parsed.evt);
+        verified = this.verifyOrThrow(parsed.evt);
+      } catch {
+        // ignore - envelope verification already failed closed
+        return;
+      }
+      // MESH-SYNC-DOS-01: apply a sync_response ONLY when it answers a
+      // request WE issued. `verified.emitter_node` is the envelope's own
+      // cryptographically verified origin (never a payload-carried field a
+      // peer could forge) -- checked against `pendingSyncRequests`, which
+      // this node populates exclusively from its own `requestSyncFromPeer`
+      // calls. Without this gate, any rostered peer could unicast an
+      // unsolicited, validly-signed sync_response at any time and have its
+      // contents applied -- the exact shape that let a flood of distinct
+      // policy/locator/lifecycle events past every other check.
+      if (!this.pendingSyncRequests.has(verified.emitter_node)) {
+        const error = new MeshUnsolicitedSyncResponseError(verified.emitter_node);
+        this.auditUnsolicitedSyncResponse(verified, error);
+        this.onEnvelopeRejected({
+          error,
+          event_type: verified.event_type,
+          emitter_node: verified.emitter_node,
+        });
+        return;
+      }
+      this.pendingSyncRequests.delete(verified.emitter_node);
+      try {
         const respPayload = verified.payload as SyncResponsePayload;
         await this.applySync(respPayload);
       } catch {
-        // ignore
+        // ignore - applySync's own per-event verification already audits/rejects
       }
       return;
     }

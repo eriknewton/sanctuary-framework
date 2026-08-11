@@ -111,3 +111,14 @@ export class MeshConfigError extends MeshError {
     this.name = "MeshConfigError";
   }
 }
+
+// ── Sync-protocol errors ────────────────────────────────────────────────
+
+export class MeshUnsolicitedSyncResponseError extends MeshError {
+  constructor(emitterNode: string) {
+    super(
+      `sync_response from emitter_node=${emitterNode} has no matching outstanding sync_request; refused (MESH-SYNC-DOS-01)`
+    );
+    this.name = "MeshUnsolicitedSyncResponseError";
+  }
+}

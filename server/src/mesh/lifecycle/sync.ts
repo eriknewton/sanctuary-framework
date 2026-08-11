@@ -181,6 +181,11 @@ export interface ApplySyncResult {
   locator_applied: number;
   locator_older: number;
   locator_conflicts: number;
+  /** MESH-LOCATOR-01: a locator_update whose emitter did not match its
+   * claimed host (LocatorTableStore's authority-binding check). Distinct
+   * from `locator_older`/`locator_conflicts` — those are honest version
+   * races between legitimate updates; this is a refused hijack attempt. */
+  locator_rejected: number;
   lifecycle_events_received: number;
   audit_batches_received: number;
 }
@@ -201,6 +206,7 @@ export function applySyncResponse(
     locator_applied: 0,
     locator_older: 0,
     locator_conflicts: 0,
+    locator_rejected: 0,
     lifecycle_events_received: 0,
     audit_batches_received: 0,
   };
@@ -216,11 +222,21 @@ export function applySyncResponse(
     const r = state.locator_table.upsert(evt);
     if (r === "applied") result.locator_applied++;
     else if (r === "conflict") result.locator_conflicts++;
-    else result.locator_older++;
+    else if (r === "older") result.locator_older++;
+    else result.locator_rejected++;
   }
   for (const evt of response.node_lifecycle_events ?? []) {
-    state.lifecycle_log.append(evt);
-    result.lifecycle_events_received++;
+    // MESH-SYNC-DOS-01: `append()` is idempotent by event_id (see
+    // NodeLifecycleEventLog). The caller (mesh-node.ts's `applySync`) has
+    // already appended each accepted event once itself before reaching
+    // here — this is deliberately a SECOND call on the same events, not a
+    // bug: relying on append()'s own dedup at this shared chokepoint means
+    // neither call site has to reason about whether the other already ran.
+    // Only count it as "received" when it was genuinely new, so this
+    // result never double-counts an event this function is re-applying.
+    if (state.lifecycle_log.append(evt)) {
+      result.lifecycle_events_received++;
+    }
   }
   result.audit_batches_received = (response.audit_batches ?? []).length;
 

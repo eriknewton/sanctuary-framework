@@ -391,7 +391,7 @@ test/intelligence/selector.test.ts(966,43): error TS2304: Cannot find name 'Requ
 test/intelligence/selector.test.ts(992,41): error TS2304: Cannot find name 'RequestInfo'.
 test/intelligence/tier2-local-pin.test.ts(50,36): error TS2304: Cannot find name 'RequestInfo'.
 test/memory-checkpoint/memory-checkpoint.test.ts(229,16): error TS2352: Conversion of type '{ unref: () => undefined; }' to type 'Timeout' may be a mistake because neither type sufficiently overlaps with the other. If this was intentional, convert the expression to 'unknown' first.
-test/mesh/lifecycle.test.ts(1423,33): error TS2322: Type 'SignedEvent<{ certificate: NodeIdentityCertificate; }>' is not assignable to type 'SignedEvent<NodeLifecyclePayload>'.
+test/mesh/lifecycle.test.ts(1712,33): error TS2322: Type 'SignedEvent<{ certificate: NodeIdentityCertificate; }>' is not assignable to type 'SignedEvent<NodeLifecyclePayload>'.
 test/mesh/node-roster-defensive-capability-check.test.ts(25,5): error TS2322: Type '"full"' is not assignable to type 'NodeMode'.
 test/mesh/node-roster-defensive-capability-check.test.ts(31,7): error TS2353: Object literal may only specify known properties, and 'principal_signature' does not exist in type '{ fortress_master_pubkey: string; principal_id: string; principal_pubkey: string; }'.
 test/mesh/node-roster-defensive-capability-check.test.ts(40,37): error TS2353: Object literal may only specify known properties, and 'fortress_id' does not exist in type 'NodeRosterOptions'.

@@ -72,10 +72,13 @@ import {
 } from "../../src/mesh/lifecycle/index.js";
 import type {
   FortressMasterPublicKey,
+  LocatorUpdatePayload,
+  NodeLeavePayload,
   NodeRevokePayload,
   PrincipalCertificate,
   SignedEvent,
 } from "../../src/mesh/types.js";
+import type { SyncResponsePayload } from "../../src/mesh/lifecycle/types.js";
 import type { MasterRotationQuorumInput } from "../../src/mesh/guardian/types.js";
 import type { CompiledPolicy } from "../../src/policy-engine/types.js";
 
@@ -223,6 +226,36 @@ function signNodeRevokeWithoutPrincipal(params: {
   const body = {
     protocol_version: "0.1",
     event_type: "node_revoke",
+    event_id: toBase64url(randomBytes(16)),
+    emitter_node: params.emitter_node,
+    emitter_principal: params.emitter_principal,
+    fortress_id: params.fortress_id,
+    causal_parents: [] as string[],
+    payload: params.payload,
+    payload_hash: toBase64url(sha256(canonicalizeToBytes(params.payload))),
+    emitted_at: "2026-05-14T00:00:00.000Z",
+    monotonic_seq: params.monotonic_seq,
+    extension_envelope: {},
+  };
+  return {
+    ...body,
+    node_signature: toBase64url(
+      ed25519.sign(canonicalizeToBytes(body), params.node_private_key)
+    ),
+  };
+}
+
+function signHostileLocatorUpdate(params: {
+  emitter_node: string;
+  emitter_principal: string;
+  fortress_id: string;
+  monotonic_seq: number;
+  node_private_key: Uint8Array;
+  payload: LocatorUpdatePayload;
+}): SignedEvent<LocatorUpdatePayload> {
+  const body = {
+    protocol_version: "0.1",
+    event_type: "locator_update",
     event_id: toBase64url(randomBytes(16)),
     emitter_node: params.emitter_node,
     emitter_principal: params.emitter_principal,
@@ -1084,6 +1117,182 @@ describe("lifecycle/mesh-node - bootstrap → join → revoke", () => {
     expect(rejected[0]?.message).toContain("node_revoke denied");
   });
 
+  it("MESH-LOCATOR-01: refuses a locator_update whose emitter does not match its claimed host, but applies a legitimate self-hosted one", async () => {
+    const first = await bootstrapFirstNode({ transport: hub });
+    const attackerKeypair = generateKeypair();
+    const attackerCert = issueNodeIdentityCertificate({
+      node_id: "attacker-node",
+      node_pubkey: attackerKeypair.publicKey,
+      node_mode: "local",
+      fortress_id: first.bootstrap.master_public.fortress_id,
+      capabilities: CAP_STANDARD_FORTRESS_NODE,
+      parent_chain: {
+        fortress_master_pubkey: first.bootstrap.master_public.public_key,
+        principal_id: first.bootstrap.root_principal_certificate.principal_id,
+        principal_pubkey:
+          first.bootstrap.root_principal_certificate.principal_pubkey,
+      },
+      principal_private_key: first.bootstrap.root_principal_private_key,
+    });
+    // "attacker-node" is genuinely rostered (a real, validly-issued node
+    // cert) — this is the "rostered-but-untrusted federation peer" MESH-
+    // LOCATOR-01 describes, not an unauthenticated outsider. Its envelope
+    // signature is real; only the PAYLOAD's claim about who now hosts the
+    // agent is a lie.
+    first.node.getRoster().add(attackerCert);
+
+    const rootPrincipalId = first.bootstrap.root_principal_certificate.principal_id;
+    const agentId = "victim-agent";
+
+    const locatorUpdates: Array<{ result: string }> = [];
+    first.node.onLocatorUpdate = (_evt, result) => locatorUpdates.push({ result });
+
+    // ── Attack: "attacker-node" claims node-1 (the REAL canonical node,
+    // a different identity than its own truthful, signature-bound
+    // emitter_node) now hosts victim-agent. Before MESH-LOCATOR-01's fix,
+    // LocatorTableStore.upsert had no check binding emitter_node to the
+    // payload's canonical_node, so this would have redirected victim-agent's
+    // locator entry (and the state-transfer key derived from it) on the
+    // say-so of a peer with no relationship to node-1 at all.
+    await hub.attach("attacker-node").broadcast(
+      signHostileLocatorUpdate({
+        emitter_node: "attacker-node",
+        emitter_principal: rootPrincipalId,
+        fortress_id: first.bootstrap.master_public.fortress_id,
+        monotonic_seq: 1,
+        node_private_key: attackerKeypair.privateKey,
+        payload: {
+          agent_id: agentId,
+          canonical_node: first.node.snapshot().node_id,
+          locator_version: 1,
+          last_migration_at: "2026-05-14T00:00:00.000Z",
+          hosting_principal: rootPrincipalId,
+        },
+      })
+    );
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(first.node.getLocatorTable().get(agentId)).toBeUndefined();
+    expect(locatorUpdates).toHaveLength(1);
+    expect(locatorUpdates[0]?.result).toBe("locator_host_mismatch");
+    expect(
+      first.node.getLocatorTable().auditEvents().map((e) => e.reason)
+    ).toEqual(["locator_host_mismatch"]);
+
+    // ── Legitimate case: "attacker-node" (any rostered node) self-reports
+    // hosting a DIFFERENT agent it genuinely claims for itself — emitter_node
+    // equals canonical_node, emitter_principal equals hosting_principal.
+    // This is exactly the shape the three-mode-drill §12.6 migration test
+    // uses via publishLocatorUpdate; the fix must not break it.
+    const selfHostedAgentId = "self-hosted-agent";
+    await hub.attach("attacker-node").broadcast(
+      signHostileLocatorUpdate({
+        emitter_node: "attacker-node",
+        emitter_principal: rootPrincipalId,
+        fortress_id: first.bootstrap.master_public.fortress_id,
+        monotonic_seq: 2,
+        node_private_key: attackerKeypair.privateKey,
+        payload: {
+          agent_id: selfHostedAgentId,
+          canonical_node: "attacker-node",
+          locator_version: 1,
+          last_migration_at: "2026-05-14T00:00:00.000Z",
+          hosting_principal: rootPrincipalId,
+        },
+      })
+    );
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(
+      first.node.getLocatorTable().get(selfHostedAgentId)?.payload.canonical_node
+    ).toBe("attacker-node");
+    expect(locatorUpdates).toHaveLength(2);
+    expect(locatorUpdates[1]?.result).toBe("applied");
+  });
+
+  it("MESH-SYNC-DOS-01: refuses an unsolicited sync_response, but applies one matching an outstanding request", async () => {
+    const first = await bootstrapFirstNode({ transport: hub });
+    const peerKeypair = generateKeypair();
+    const peerCert = issueNodeIdentityCertificate({
+      node_id: "peer-node",
+      node_pubkey: peerKeypair.publicKey,
+      node_mode: "local",
+      fortress_id: first.bootstrap.master_public.fortress_id,
+      capabilities: CAP_STANDARD_FORTRESS_NODE,
+      parent_chain: {
+        fortress_master_pubkey: first.bootstrap.master_public.public_key,
+        principal_id: first.bootstrap.root_principal_certificate.principal_id,
+        principal_pubkey:
+          first.bootstrap.root_principal_certificate.principal_pubkey,
+      },
+      principal_private_key: first.bootstrap.root_principal_private_key,
+    });
+    first.node.getRoster().add(peerCert);
+    const peerTransport = hub.attach("peer-node");
+
+    const sendSyncResponse = async (seq: number) => {
+      // node_lifecycle_events entries are independently verified inside
+      // applySync (verifyOrThrow), so the inner event must itself be
+      // validly signed by peer-node, distinct from the sync_response
+      // envelope's own signature.
+      const innerEvt = packSignedEvent<NodeLeavePayload>({
+        event_type: "node_leave",
+        emitter_node: "peer-node",
+        emitter_principal: "system",
+        fortress_id: first.bootstrap.master_public.fortress_id,
+        payload: { node_id: "peer-node", reason: "graceful" },
+        monotonic_seq: seq,
+        node_private_key: peerKeypair.privateKey,
+      });
+      const payload: SyncResponsePayload = {
+        kind: "initial_sync",
+        node_lifecycle_events: [innerEvt],
+      };
+      const responseEvt = packSignedEvent<SyncResponsePayload>({
+        event_type: "sync_response",
+        emitter_node: "peer-node",
+        emitter_principal: "system",
+        fortress_id: first.bootstrap.master_public.fortress_id,
+        payload,
+        monotonic_seq: seq,
+        node_private_key: peerKeypair.privateKey,
+      });
+      await peerTransport.unicast(
+        first.node.snapshot().node_id,
+        JSON.stringify({ kind: "sync_response", evt: responseEvt })
+      );
+      await new Promise((r) => setTimeout(r, 0));
+    };
+
+    const rejected: Error[] = [];
+    first.node.onEnvelopeRejected = ({ error }) => rejected.push(error);
+    const lifecycleSizeBefore = first.node.getLifecycleLog().size();
+    const auditBefore = first.node.snapshot().pending_audit_entries;
+
+    // ── Unsolicited: node-1 never called requestSyncFromPeer for peer-node.
+    await sendSyncResponse(1);
+    expect(first.node.getLifecycleLog().size()).toBe(lifecycleSizeBefore);
+    expect(rejected).toHaveLength(1);
+    expect(rejected[0]?.message).toContain("no matching outstanding sync_request");
+    expect(first.node.snapshot().pending_audit_entries).toBe(auditBefore + 1);
+
+    // ── Matched: node-1 requests sync from peer-node first, THEN the
+    // response arrives -- must be applied, not refused a second time.
+    await first.node.requestSyncFromPeer({
+      peer_node_id: "peer-node",
+      kind: "initial_sync",
+    });
+    await sendSyncResponse(2);
+    expect(first.node.getLifecycleLog().size()).toBe(lifecycleSizeBefore + 1);
+    expect(rejected).toHaveLength(1); // no new rejection
+
+    // ── A second response from the SAME peer with no fresh request is
+    // unsolicited again -- matching is single-use, not a standing grant.
+    await sendSyncResponse(3);
+    expect(first.node.getLifecycleLog().size()).toBe(lifecycleSizeBefore + 1);
+    expect(rejected).toHaveLength(2);
+  });
+
   it("rejects guardian-quorum revokes before emitting when the threshold is not met", async () => {
     const first = await bootstrapFirstNode({ transport: hub });
     const victimKeypair = generateKeypair();
@@ -1365,6 +1574,86 @@ describe("lifecycle/sync - initial sync pulls policy + locator + audit", () => {
     );
     expect(result.policy_applied).toBe(1);
     expect(result.policy_older).toBe(1);
+  });
+
+  it("MESH-SYNC-DOS-01: applySyncResponse does not double-apply node_lifecycle_events replayed across two calls, and reports locator_rejected separately from locator_older", () => {
+    const recvPolicy = new PolicyBundleStore();
+    const recvLocator = new LocatorTableStore();
+    const recvLifecycle = new NodeLifecycleEventLog();
+    const lifecycleEvt: SignedEvent<NodeRevokePayload> = {
+      protocol_version: "0.1",
+      event_type: "node_leave",
+      event_id: "lc-1",
+      emitter_node: "n",
+      emitter_principal: "p",
+      fortress_id: "f",
+      causal_parents: [],
+      payload: { node_id: "node-a", reason: "graceful" } as unknown as NodeRevokePayload,
+      payload_hash: "h",
+      emitted_at: new Date().toISOString(),
+      monotonic_seq: 0,
+      extension_envelope: {},
+      node_signature: "s",
+    };
+    const response = {
+      kind: "initial_sync" as const,
+      node_lifecycle_events: [lifecycleEvt],
+    };
+    const first = applySyncResponse(response, {
+      policy_bundle: recvPolicy,
+      locator_table: recvLocator,
+      lifecycle_log: recvLifecycle,
+    });
+    expect(first.lifecycle_events_received).toBe(1);
+    expect(recvLifecycle.size()).toBe(1);
+
+    // The SAME response applied a second time (mirrors mesh-node.ts's
+    // applySync, which appends each accepted event directly AND then
+    // passes it through applySyncResponse again) must not grow the log or
+    // report it as newly received a second time.
+    const second = applySyncResponse(response, {
+      policy_bundle: recvPolicy,
+      locator_table: recvLocator,
+      lifecycle_log: recvLifecycle,
+    });
+    expect(second.lifecycle_events_received).toBe(0);
+    expect(recvLifecycle.size()).toBe(1);
+
+    // A hijack attempt (emitter != claimed host) counts as locator_rejected,
+    // distinct from an honest version race (locator_older/locator_conflicts).
+    const hijackLocator: SignedEvent<LocatorUpdatePayload> = {
+      protocol_version: "0.1",
+      event_type: "locator_update",
+      event_id: "loc-1",
+      emitter_node: "attacker",
+      emitter_principal: "attacker-principal",
+      fortress_id: "f",
+      causal_parents: [],
+      payload: {
+        agent_id: "agent-a",
+        canonical_node: "victim-node",
+        locator_version: 1,
+        last_migration_at: new Date().toISOString(),
+        hosting_principal: "victim-principal",
+      },
+      payload_hash: "h",
+      emitted_at: new Date().toISOString(),
+      monotonic_seq: 0,
+      extension_envelope: {},
+      node_signature: "s",
+    };
+    const third = applySyncResponse(
+      { kind: "initial_sync" as const, locator_updates: [hijackLocator] },
+      {
+        policy_bundle: recvPolicy,
+        locator_table: recvLocator,
+        lifecycle_log: recvLifecycle,
+      }
+    );
+    expect(third.locator_rejected).toBe(1);
+    expect(third.locator_older).toBe(0);
+    expect(third.locator_conflicts).toBe(0);
+    expect(recvLocator.get("agent-a")).toBeUndefined();
   });
 
   it("agent-state-transfer kind responses do not carry the policy/locator delta tables", () => {

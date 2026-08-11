@@ -228,14 +228,86 @@ function isSafeNonNegativeInteger(value: unknown): value is number {
   );
 }
 
+export const LOCATOR_REJECTION_AUDIT_OP =
+  "mesh_locator_update_rejected" as const;
+
+/**
+ * MESH-LOCATOR-01 (rule 7, semantic-provenance): the only reason a
+ * locator_update is ever refused before the version/conflict logic runs.
+ */
+export type LocatorRejectionReason = "locator_host_mismatch";
+
+export type LocatorUpsertResult =
+  | "applied"
+  | "older"
+  | "conflict"
+  | LocatorRejectionReason;
+
+export interface LocatorRejectionAuditEvent {
+  operation: typeof LOCATOR_REJECTION_AUDIT_OP;
+  emitted_at: string;
+  event_id: string;
+  agent_id: string;
+  reason: LocatorRejectionReason;
+  emitter_node: string;
+  emitter_principal: string;
+  claimed_canonical_node: string;
+  claimed_hosting_principal: string;
+}
+
+export interface LocatorTableStoreOptions {
+  now?: () => Date;
+  onAuditEvent?: (event: LocatorRejectionAuditEvent) => void;
+}
+
+/**
+ * Upper bound on distinct agent_ids a single fortress's locator table will
+ * hold (AGENTS.md rule 8: attacker-influenced state needs an explicit cap).
+ * 4096 is a generous multiple of any realistic per-fortress agent
+ * population while still bounding a self-hosting-but-malicious rostered
+ * peer (MESH-LOCATOR-01's host-mismatch check only stops it from claiming
+ * OTHER agents, not from fabricating an unbounded number of agent_ids it
+ * "self-hosts") to a fixed memory ceiling rather than unbounded growth.
+ */
+export const MAX_LOCATOR_TABLE_ENTRIES = 4096;
+
 /** Per-fortress agent-locator table (§6). */
 export class LocatorTableStore {
   private byAgent = new Map<string, SignedEvent<LocatorUpdatePayload>>();
   private highestVersion = 0;
+  private readonly now: () => Date;
+  private readonly onAuditEvent?: (event: LocatorRejectionAuditEvent) => void;
+  private readonly auditEventsList: LocatorRejectionAuditEvent[] = [];
 
-  upsert(
-    evt: SignedEvent<LocatorUpdatePayload>
-  ): "applied" | "older" | "conflict" {
+  constructor(options: LocatorTableStoreOptions = {}) {
+    this.now = options.now ?? (() => new Date());
+    this.onAuditEvent = options.onAuditEvent;
+  }
+
+  upsert(evt: SignedEvent<LocatorUpdatePayload>): LocatorUpsertResult {
+    // AUTHORITY BINDING (MESH-LOCATOR-01, rule 7): `canonical_node` and
+    // `hosting_principal` are ATTACKER-CONTROLLED PAYLOAD fields — the
+    // envelope signature verified upstream (mesh-node.ts's verifyOrThrow,
+    // called BEFORE this method is ever reached) proves only that
+    // `emitter_node`/`emitter_principal` genuinely signed this envelope, not
+    // that the payload's claimed new host is truthful. Without this check
+    // any rostered-but-untrusted peer could publish a validly-signed
+    // locator_update redirecting ANY OTHER agent's canonical node to
+    // itself (a state-transfer-key-bearing trust hijack). A locator entry
+    // is accepted ONLY as a first-person self-report: the node claiming to
+    // now host the agent must BE the node whose signature this envelope
+    // carries, and the principal named as host must BE the principal that
+    // (co-)signed it. This mirrors the sibling handlers that already get
+    // this right — heartbeat keys `roster.recordHeartbeat` off the
+    // envelope's own `emitter_node`, never a payload field (mesh-node.ts),
+    // and node_revoke has its own `assertNodeRevokeAuthorized` gate.
+    if (
+      evt.emitter_node !== evt.payload.canonical_node ||
+      evt.emitter_principal !== evt.payload.hosting_principal
+    ) {
+      return this.reject(evt, "locator_host_mismatch");
+    }
+
     const existing = this.byAgent.get(evt.payload.agent_id);
     if (existing) {
       if (
@@ -249,6 +321,19 @@ export class LocatorTableStore {
       ) {
         return "older";
       }
+    } else if (this.byAgent.size >= MAX_LOCATOR_TABLE_ENTRIES) {
+      // Bound (rule 8): a NEW agent_id would grow the map past its cap.
+      // Evict the oldest entry (Map iteration order is insertion order) —
+      // never an UPDATE to an existing agent_id, which never grows the
+      // map and so never needs to evict anything. Losing the oldest
+      // locator entry here is not a trust-bearing removal the way a
+      // federation peer's trust state disappearing is (BoundedMap's
+      // audited-eviction ceremony is for that class): a peer that still
+      // legitimately hosts the evicted agent simply re-publishes on its
+      // next heartbeat/sync cycle, so a plain FIFO drop (no audit write,
+      // no BoundedMap) is the correct, minimal bound here.
+      const oldestAgentId = this.byAgent.keys().next().value as string;
+      this.byAgent.delete(oldestAgentId);
     }
     this.byAgent.set(evt.payload.agent_id, evt);
     if (evt.payload.locator_version > this.highestVersion) {
@@ -280,7 +365,40 @@ export class LocatorTableStore {
   snapshot(): SignedEvent<LocatorUpdatePayload>[] {
     return [...this.byAgent.values()];
   }
+
+  auditEvents(): readonly LocatorRejectionAuditEvent[] {
+    return this.auditEventsList;
+  }
+
+  private reject(
+    evt: SignedEvent<LocatorUpdatePayload>,
+    reason: LocatorRejectionReason
+  ): LocatorRejectionReason {
+    const auditEvent: LocatorRejectionAuditEvent = {
+      operation: LOCATOR_REJECTION_AUDIT_OP,
+      emitted_at: this.now().toISOString(),
+      event_id: evt.event_id,
+      agent_id: evt.payload.agent_id,
+      reason,
+      emitter_node: evt.emitter_node,
+      emitter_principal: evt.emitter_principal,
+      claimed_canonical_node: evt.payload.canonical_node,
+      claimed_hosting_principal: evt.payload.hosting_principal,
+    };
+    this.auditEventsList.push(auditEvent);
+    this.onAuditEvent?.(auditEvent);
+    return reason;
+  }
 }
+
+/**
+ * Upper bound on retained lifecycle events (AGENTS.md rule 8). 4096 mirrors
+ * MAX_LOCATOR_TABLE_ENTRIES's derivation: a generous multiple of realistic
+ * per-fortress join/leave/revoke churn, while still bounding a rostered
+ * peer that broadcasts (or replies to sync with) an unbounded stream of
+ * distinct, validly-signed lifecycle events to a fixed memory ceiling.
+ */
+export const MAX_LIFECYCLE_LOG_ENTRIES = 4096;
 
 /**
  * Recent node-lifecycle events log. Used by sync to ship missed
@@ -288,9 +406,43 @@ export class LocatorTableStore {
  */
 export class NodeLifecycleEventLog {
   private events: SignedEvent<NodeLifecyclePayload>[] = [];
+  /** Dedup index mirroring `events` 1:1 (AGENTS.md rule 8 / MESH-SYNC-DOS-01):
+   * the SAME event can legitimately reach `append()` twice — once via the
+   * broadcast router, once via a sync response replaying it — and a
+   * malicious peer can replay the identical signed event repeatedly to
+   * inflate the log. Keying on `event_id` (a per-emitter-unique ULID, part
+   * of the verified envelope) makes `append()` itself idempotent, which is
+   * the single shared chokepoint every caller (mesh-node.ts's direct
+   * append AND sync.ts's applySyncResponse append of the SAME accepted
+   * events) inherits for free, rather than each call site having to
+   * remember to dedup on its own.
+   */
+  private readonly seenEventIds = new Set<string>();
 
-  append(evt: SignedEvent<NodeLifecyclePayload>): void {
+  /**
+   * Append `evt` unless its `event_id` was already recorded. Returns
+   * whether the event was newly added, so a caller that needs accurate
+   * "how many new events did this apply" telemetry (sync.ts's
+   * ApplySyncResult) can tell a genuine new event apart from a replay.
+   */
+  append(evt: SignedEvent<NodeLifecyclePayload>): boolean {
+    if (this.seenEventIds.has(evt.event_id)) {
+      return false;
+    }
+    if (this.events.length >= MAX_LIFECYCLE_LOG_ENTRIES) {
+      // Bound (rule 8): FIFO-evict the oldest retained event before
+      // admitting a new one. Not a trust-bearing removal (see
+      // LocatorTableStore's identical eviction note) — a rejoining node
+      // whose `since_event_id` baseline predates the evicted window falls
+      // back to `since()`'s "unknown baseline -> ship everything we still
+      // have" path below, which is always a safe (if larger) resync, never
+      // a correctness violation.
+      const evicted = this.events.shift();
+      if (evicted) this.seenEventIds.delete(evicted.event_id);
+    }
     this.events.push(evt);
+    this.seenEventIds.add(evt.event_id);
+    return true;
   }
 
   /**
