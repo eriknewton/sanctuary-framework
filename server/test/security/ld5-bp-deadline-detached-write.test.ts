@@ -38,9 +38,13 @@ import {
   type BridgeToolsTestOverrides,
 } from "../../src/bridge/tools.js";
 import type { ConcordiaOutcome } from "../../src/bridge/types.js";
-import { ReputationStore } from "../../src/reputation/reputation-store.js";
+import {
+  ReputationStore,
+  ReputationStoreQuotaError,
+} from "../../src/reputation/reputation-store.js";
 import {
   SentinelFindingStore,
+  SentinelFindingStoreRefusedError,
   SENTINEL_FINDING_NAMESPACE,
 } from "../../src/sentinel/sentinel-finding-store.js";
 import type { SentinelFinding } from "../../src/sentinel/types.js";
@@ -120,6 +124,35 @@ async function drain(pendingCount: () => number, releaseNext: () => void): Promi
     releaseNext();
   }
   throw new Error("drain() did not converge — a write stayed pending");
+}
+
+/**
+ * Wraps a MemoryStorage so every `write` to `namespace` awaits a promise
+ * that NEVER resolves — models a PERMANENTLY hung backend (not merely slow),
+ * the exact fault LD5 BP-DEADLINE-02 concerns: `fn` never settles, so if the
+ * waiter slot is freed on anything other than `fn` settlement, later
+ * admissions can pile chained closures onto `admissionQueue` forever behind
+ * this hung head (AGENTS.md rule 8 adversarial-complexity test).
+ */
+function makeForeverHungStorage(namespace: string): StorageBackend {
+  const backing = new MemoryStorage();
+  const foreverPending = new Promise<void>(() => {
+    // Deliberately never resolves or rejects.
+  });
+  return {
+    write: async (ns, key, data) => {
+      if (ns === namespace) {
+        await foreverPending;
+      }
+      return backing.write(ns, key, data);
+    },
+    read: (ns, key) => backing.read(ns, key),
+    delete: (ns, key, secure) => backing.delete(ns, key, secure),
+    list: (ns, prefix) => backing.list(ns, prefix),
+    exists: (ns, key) => backing.exists(ns, key),
+    totalSize: () => backing.totalSize(),
+    listNamespaces: () => backing.listNamespaces!(),
+  };
 }
 
 describe("LD5 BP-DEADLINE-01: admission deadline must hold the lock until the write settles, not release it early", () => {
@@ -346,6 +379,334 @@ describe("LD5 BP-DEADLINE-01: admission deadline must hold the lock until the wr
 
     const finalEntries = await storage.list(SENTINEL_FINDING_NAMESPACE);
     expect(finalEntries.length).toBe(CAP);
+  });
+});
+
+/**
+ * LD5 BP-DEADLINE-02 — adversarial-complexity test (AGENTS.md rule 8).
+ *
+ * BP-DEADLINE-01's fix held each store's admission lock until `fn()`
+ * settled, closing the quota-bypass. But `pendingAdmissionWaiters` was still
+ * released in a `finally` on the CALLER's own deadline-bounded await, not on
+ * `fn()` settlement. Under a PERMANENTLY hung backend (write never
+ * resolves, not merely slow), a timed-out caller freed its waiter slot while
+ * its `fn` stayed chained on `admissionQueue` forever — so later admissions
+ * kept passing the (concurrent-only) waiter cap and piling up unbounded
+ * chained closures behind the permanently-hung head, all reachable from
+ * `this.admissionQueue` and therefore never GC-eligible.
+ *
+ * Each test below drives the REAL production write path for an
+ * agent-reachable store (bridge_commit, ReputationStore.record()) against a
+ * write that never settles, fills the waiter cap, lets every original
+ * caller's deadline elapse, and then asserts that admission is STILL
+ * refused `admission_busy` afterward — proving the waiter slots were never
+ * freed by the callers' own timeouts and chained-closure accumulation stays
+ * capped at `maxPendingAdmissionWaiters`. Run against the pre-fix source
+ * (slot released in a `finally` on the caller's own await) this test fails:
+ * once the original callers' deadlines elapse, their slots free up and the
+ * post-timeout admission is ACCEPTED instead of refused, which is exactly
+ * the unbounded-accumulation defect this closes.
+ */
+describe("LD5 BP-DEADLINE-02: the admission waiter slot must be held for fn()'s lifetime, not released on the caller's own timeout", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  // ── Bridge (agent-reachable via bridge_commit) ──────────────────────────
+
+  it("bridge_commit: waiter slots stay held after every original caller times out against a PERMANENTLY hung write, so chained-closure accumulation never exceeds maxPendingAdmissionWaiters", async () => {
+    const storage = makeForeverHungStorage("_bridge");
+    const masterKey = generateRandomKey();
+    const identityEncKey = derivePurposeKey(masterKey, "identity-encryption");
+    const identityManager = new IdentityManager(storage, masterKey);
+    const signer = createIdentity("ld5-bp2-bridge-signer", identityEncKey, "recovery-key");
+    const counterparty = createIdentity(
+      "ld5-bp2-bridge-counterparty",
+      identityEncKey,
+      "recovery-key"
+    );
+    await identityManager.save(signer.storedIdentity);
+    await identityManager.save(counterparty.storedIdentity);
+    await identityManager.setPrimary(signer.storedIdentity.identity_id);
+
+    const reputationStore = new ReputationStore(storage, masterKey);
+    const stubAuditLog = {
+      append: () => {},
+      appendCritical: async () => {},
+    } as unknown as AuditLog;
+
+    // Quota headroom is generous — this test is about the WAITER cap, not
+    // the per-origin write quota (BP-DEADLINE-01's concern).
+    const WAITER_CAP = 3;
+    const overrides: BridgeToolsTestOverrides = {
+      maxBridgeCommitments: 1000,
+      maxBridgeCommitmentsPerOrigin: 1000,
+      maxPendingAdmissionWaiters: WAITER_CAP,
+    };
+    const { tools } = createBridgeTools(
+      storage,
+      masterKey,
+      identityManager,
+      stubAuditLog,
+      reputationStore,
+      undefined,
+      overrides
+    );
+    const commit = tools.find((t) => t.name === "bridge_commit") as ToolDefinition;
+    const origin = "agent:ld5-bp-deadline-02-bridge";
+
+    const terms = { price: 100, currency: "USD", delivery: "2026-04-15" };
+    const termsHash = toBase64url(hash(stringToBytes(stableStringify(terms))));
+    const makeOutcome = (sessionId: string): ConcordiaOutcome => ({
+      session_id: sessionId,
+      protocol_version: "concordia-v1",
+      proposer_did: signer.publicIdentity.did,
+      acceptor_did: counterparty.publicIdentity.did,
+      terms,
+      terms_hash: termsHash,
+      rounds: 3,
+      accepted_at: "2026-04-01T00:00:00.000Z",
+    });
+    // `commit.handler` only catches `BridgeStoreQuotaError` internally
+    // (admission_busy, origin_quota, etc); a deadline TIMEOUT is a plain
+    // `Error` thrown by `withBridgeAdmissionDeadline`, which the handler
+    // re-throws rather than converting to a toolResult — so every call here
+    // is `.catch`-wrapped and the result is EITHER a toolResult object
+    // (`content`) or a caught Error, never a rejection that would
+    // short-circuit `Promise.all`.
+    const fire = (sessionId: string) =>
+      commit
+        .handler(
+          { ...makeOutcome(sessionId), identity_id: signer.publicIdentity.identity_id },
+          origin
+        )
+        .catch((e) => e);
+
+    // (a) Fill the waiter cap: WAITER_CAP admissions all pass the
+    // synchronous waiter-cap check and chain fn() (the hung write) onto
+    // admissionQueue. Only the first fn ever actually starts (the queue is
+    // strictly serial), the rest sit chained behind it — but all WAITER_CAP
+    // slots are occupied.
+    const initialCalls = Array.from({ length: WAITER_CAP }, (_, i) => fire(`w-${i}`));
+    await flush();
+
+    // (b) The next admission, fired immediately, is refused synchronously —
+    // this much holds both pre- and post-fix (the immediate over-cap check
+    // was never broken; BP-DEADLINE-02 is about what happens AFTER a
+    // caller's own deadline elapses).
+    const immediateOverflow = await fire("immediate-overflow");
+    const immediateText =
+      immediateOverflow instanceof Error
+        ? immediateOverflow.message
+        : (immediateOverflow.content[0]?.text ?? "");
+    expect(immediateText).toContain("admission queue is saturated");
+
+    // Let every ORIGINAL caller's own deadline elapse. fn() is permanently
+    // hung (the write never resolves), so none of them ever settle via
+    // fn() — they settle only via the deadline timeout (a rejected promise,
+    // caught above into an Error).
+    await vi.advanceTimersByTimeAsync(ADMISSION_DEADLINE_MS);
+    await flush();
+    const initialResults = await Promise.all(initialCalls);
+    for (const result of initialResults) {
+      const text = result instanceof Error ? result.message : (result.content[0]?.text ?? "");
+      // Each original caller times out (not admission_busy — it never
+      // raced against the cap, it raced against the deadline).
+      expect(text).not.toContain("admission queue is saturated");
+    }
+
+    // (c) THE MUTATION-PROOF ASSERTION: even though every original caller
+    // has now timed out, admission is STILL refused `admission_busy`,
+    // SYNCHRONOUSLY (no macrotask/timer needed — the waiter-cap check is a
+    // synchronous throw, see runAdmissionExclusiveBounded), for several more
+    // attempts in a row — proving the waiter slots were never freed by the
+    // callers' own timeouts (fn is still chained on admissionQueue,
+    // permanently hung) and that accumulation stays capped at WAITER_CAP
+    // rather than growing with every post-timeout attempt. Checked via a
+    // microtask flush rather than a bare `await`: pre-fix (slot released on
+    // the caller's own timeout), the slots would be free and this call
+    // would be ACCEPTED — i.e. still PENDING after a flush, chained onto
+    // admissionQueue behind the permanently-hung write, not settled at all
+    // — which the assertion below catches without hanging the test on a
+    // promise that (pre-fix) would never otherwise resolve in this run.
+    for (let i = 0; i < 5; i++) {
+      let settledText: string | undefined;
+      void fire(`post-timeout-overflow-${i}`).then((r) => {
+        settledText = r instanceof Error ? r.message : (r.content[0]?.text ?? "");
+      });
+      await flush();
+      expect(settledText).toBeDefined();
+      expect(settledText).toContain("admission queue is saturated");
+    }
+  });
+
+  // ── Reputation (agent-reachable via reputation record/bridge_attest) ────
+
+  it("ReputationStore.record(): waiter slots stay held after every original caller times out against a PERMANENTLY hung write, so chained-closure accumulation never exceeds maxPendingAdmissionWaiters", async () => {
+    const storage = makeForeverHungStorage("_reputation");
+    const masterKey = generateRandomKey();
+    const identityEncKey = derivePurposeKey(masterKey, "identity-encryption");
+    const { storedIdentity: identity } = createIdentity(
+      "ld5-bp2-reputation-signer",
+      identityEncKey,
+      "recovery-key"
+    );
+
+    const WAITER_CAP = 3;
+    const store = new ReputationStore(storage, masterKey, {
+      maxReputationRecords: 1000,
+      maxReputationRecordsPerOrigin: 1000,
+      maxPendingAdmissionWaiters: WAITER_CAP,
+    });
+    const origin = "agent:ld5-bp-deadline-02-reputation";
+
+    const recordOnce = (id: string) =>
+      store.record(
+        id,
+        "did:key:counterparty",
+        { type: "transaction", result: "completed" },
+        "general",
+        identity,
+        identityEncKey,
+        undefined,
+        undefined,
+        origin
+      );
+
+    // (a) Fill the waiter cap.
+    const initialCalls = Array.from({ length: WAITER_CAP }, (_, i) =>
+      recordOnce(`w-${i}`).catch((e) => e)
+    );
+    await flush();
+
+    // (b) Immediate overflow refuses synchronously (holds pre- and post-fix).
+    const immediateOverflow = await recordOnce("immediate-overflow").catch((e) => e);
+    expect(immediateOverflow).toBeInstanceOf(ReputationStoreQuotaError);
+    expect((immediateOverflow as InstanceType<typeof ReputationStoreQuotaError>).reason).toBe(
+      "admission_busy"
+    );
+
+    // Let every ORIGINAL caller's deadline elapse; fn() never settles.
+    await vi.advanceTimersByTimeAsync(ADMISSION_DEADLINE_MS);
+    await flush();
+    const initialResults = await Promise.all(initialCalls);
+    for (const result of initialResults) {
+      // Each original caller times out, not admission_busy.
+      const isAdmissionBusy =
+        result instanceof ReputationStoreQuotaError && result.reason === "admission_busy";
+      expect(isAdmissionBusy).toBe(false);
+    }
+
+    // (c) THE MUTATION-PROOF ASSERTION: admission is STILL refused
+    // `admission_busy`, SYNCHRONOUSLY (the waiter-cap check is a synchronous
+    // throw — no timer needed), for several more attempts after every
+    // original caller has timed out — the waiter cap bounds CUMULATIVE
+    // chained closures, not just concurrent ones. Checked via a microtask
+    // flush rather than a bare `await`: pre-fix (slot released on the
+    // caller's own timeout), these calls would be ACCEPTED — i.e. still
+    // PENDING after a flush, chained onto admissionQueue behind the
+    // permanently-hung write — which the assertion below catches without
+    // hanging the test on a promise that (pre-fix) would never otherwise
+    // resolve in this run.
+    for (let i = 0; i < 5; i++) {
+      let settledResult: unknown;
+      let settled = false;
+      void recordOnce(`post-timeout-overflow-${i}`).then(
+        (r) => {
+          settledResult = r;
+          settled = true;
+        },
+        (e) => {
+          settledResult = e;
+          settled = true;
+        }
+      );
+      await flush();
+      expect(settled).toBe(true);
+      expect(settledResult).toBeInstanceOf(ReputationStoreQuotaError);
+      expect((settledResult as InstanceType<typeof ReputationStoreQuotaError>).reason).toBe(
+        "admission_busy"
+      );
+    }
+  });
+
+  it("SentinelFindingStore.saveFinding(): waiter slots stay held after every original caller times out against a PERMANENTLY hung write, so chained-closure accumulation never exceeds maxPendingAdmissionWaiters", async () => {
+    const storage = makeForeverHungStorage(SENTINEL_FINDING_NAMESPACE);
+    const masterKey = generateRandomKey();
+
+    const WAITER_CAP = 3;
+    const origin = "agent:ld5-bp-deadline-02-sentinel";
+    const store = new SentinelFindingStore({
+      storage,
+      masterKey,
+      fortressId: "fortress-ld5-bp-deadline-02",
+      maxTrackedFindings: 1000,
+      maxFindingsPerOrigin: 1000,
+      maxPendingAdmissionWaiters: WAITER_CAP,
+    });
+
+    const mkFinding = (id: string): SentinelFinding => ({
+      finding_id: id,
+      sentinel_id: "ld5-bp2-test-sentinel",
+      severity: "alert",
+      agent_id: origin,
+      summary: `finding ${id}`,
+      details: {},
+      observed_at: new Date().toISOString(),
+      evidence_audit_ids: [],
+      fortress_id: "fortress-ld5-bp-deadline-02",
+    });
+    const saveOnce = (id: string) => store.saveFinding(mkFinding(id));
+
+    // (a) Fill the waiter cap.
+    const initialCalls = Array.from({ length: WAITER_CAP }, (_, i) =>
+      saveOnce(`w-${i}`).catch((e) => e)
+    );
+    await flush();
+
+    // (b) Immediate overflow refuses synchronously (holds pre- and post-fix).
+    const immediateOverflow = await saveOnce("immediate-overflow").catch((e) => e);
+    expect(immediateOverflow).toBeInstanceOf(SentinelFindingStoreRefusedError);
+    expect((immediateOverflow as SentinelFindingStoreRefusedError).reason).toBe("admission_busy");
+
+    // Let every ORIGINAL caller's deadline elapse; fn() never settles.
+    await vi.advanceTimersByTimeAsync(ADMISSION_DEADLINE_MS);
+    await flush();
+    const initialResults = await Promise.all(initialCalls);
+    for (const result of initialResults) {
+      const isAdmissionBusy =
+        result instanceof SentinelFindingStoreRefusedError && result.reason === "admission_busy";
+      expect(isAdmissionBusy).toBe(false);
+    }
+
+    // (c) THE MUTATION-PROOF ASSERTION: admission is STILL refused
+    // `admission_busy`, SYNCHRONOUSLY, for several more attempts after every
+    // original caller has timed out — the waiter cap bounds CUMULATIVE chained
+    // closures, not just concurrent ones. Pre-fix (slot released on the
+    // caller's own timeout), these would be ACCEPTED and left PENDING behind
+    // the permanently-hung write; the flush + `settled` check catches that
+    // without hanging on a never-resolving promise.
+    for (let i = 0; i < 5; i++) {
+      let settledResult: unknown;
+      let settled = false;
+      void saveOnce(`post-timeout-overflow-${i}`).then(
+        (r) => {
+          settledResult = r;
+          settled = true;
+        },
+        (e) => {
+          settledResult = e;
+          settled = true;
+        }
+      );
+      await flush();
+      expect(settled).toBe(true);
+      expect(settledResult).toBeInstanceOf(SentinelFindingStoreRefusedError);
+      expect((settledResult as SentinelFindingStoreRefusedError).reason).toBe("admission_busy");
+    }
   });
 });
 

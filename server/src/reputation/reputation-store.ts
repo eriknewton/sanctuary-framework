@@ -692,10 +692,13 @@ export interface ReputationStoreTestOverrides {
  * underlying lock is held (LD5 BP-DEADLINE-01 — see
  * `runAdmissionExclusiveBounded`'s doc): a hung `storage.list`/`read`/
  * `write` call inside the locked section keeps the lock, by design, until
- * it settles — a timeout only stops THIS caller from waiting on it, and
- * frees `pendingAdmissionWaiters`' slot for it, without releasing
- * `admissionQueue` to a later admission that could otherwise observe stale
- * (pre-write) headroom. ON_EVICT_AUDIT_TIMEOUT_MS is reused rather than
+ * it settles — a timeout only stops THIS caller from waiting on it, WITHOUT
+ * releasing `admissionQueue` to a later admission that could otherwise
+ * observe stale (pre-write) headroom, and (LD5 BP-DEADLINE-02, closed)
+ * WITHOUT freeing `pendingAdmissionWaiters`' slot either — that slot is
+ * held until `fn()` itself settles, so a caller timeout alone cannot let
+ * later admissions pile chained closures behind a permanently-hung `fn`.
+ * ON_EVICT_AUDIT_TIMEOUT_MS is reused rather than
  * re-derived (it is itself derived from audit-log.ts's two-phase
  * lock-acquisition + write-hold deadline contract — see that constant's
  * doc, core/bounded-map.ts);
@@ -734,8 +737,14 @@ export interface ReputationStoreTestOverrides {
  * alternative (releasing the lock early) is the exact bypass this fix
  * closes; each caller still fails closed on its own deadline and
  * `pendingAdmissionWaiters` cap, so a hung storage backend degrades to "no
- * new admissions succeed," never to a quota overshoot. Reachability
- * remains as before: both importBundle paths are OPERATOR-gated
+ * new admissions succeed," never to a quota overshoot. That is NOT, by
+ * itself, clean degradation with no other cost: LD5 BP-DEADLINE-02 (closed,
+ * see `runAdmissionExclusiveBounded`'s doc below) closes the companion
+ * memory risk — chained closures behind a permanently-hung admission are
+ * bounded at `maxPendingAdmissionWaiters` because the waiter slot is now
+ * held for `fn`'s full lifetime, not released on the caller's deadline
+ * timeout. Reachability remains as before: both importBundle paths are
+ * OPERATOR-gated
  * (`reputation_import` is tier1_always_approve; the exit CLI is a separate
  * operator process). Cross-process concurrency is the separate accepted
  * DEBT (bridge/tools.ts). The per-refusal `admission_busy` audit append is
@@ -797,9 +806,13 @@ export class ReputationStore {
    * `pendingAdmissionWaiters`, core/bounded-map.ts, and
    * sentinel-finding-store.ts's field of the same name). Incremented
    * SYNCHRONOUSLY in `runAdmissionExclusiveBounded` before its first
-   * `await`, decremented in a `finally` once the admission settles either
-   * way — the synchronous check-then-increment needs no separate lock
-   * because both happen in the same tick, with no `await` between them.
+   * `await`, decremented when `fn()` itself SETTLES (via a `.then` attached
+   * to the chained promise), never on the caller's deadline-bounded await
+   * settling first — see LD5 BP-DEADLINE-02 on `runAdmissionExclusiveBounded`
+   * for why a caller-timeout-triggered release let chained closures pile up
+   * unbounded behind a permanently-hung `fn`. The synchronous
+   * check-then-increment needs no separate lock because both happen in the
+   * same tick, with no `await` between them.
    */
   private pendingAdmissionWaiters = 0;
   /**
@@ -879,27 +892,47 @@ export class ReputationStore {
    *    keeps holding this lock past the deadline, on purpose — releasing it
    *    early is exactly what let a detached write land against
    *    already-stale quota headroom.
+   *
+   * LD5 BP-DEADLINE-02 (closed): `pendingAdmissionWaiters` used to be
+   * released in a `finally` on THIS method's own await — i.e. on the
+   * CALLER's timeout, not on `fn()` settlement. Under a permanently-hung
+   * `fn()`, a timed-out caller freed its waiter slot while `fn` stayed
+   * chained on `admissionQueue`, so later admissions kept passing the
+   * waiter cap and piling up unbounded chained closures behind the hung
+   * head (all reachable from `this.admissionQueue`, never GC-eligible) —
+   * the cap bounded only CONCURRENT waiters, not CUMULATIVE chained
+   * closures. The fix: the slot is released when `chained` (i.e. `fn()`)
+   * itself settles, not when this call's deadline-bounded await returns —
+   * see the settlement `.then` below.
    */
   private async runAdmissionExclusiveBounded<T>(fn: () => Promise<T>): Promise<T> {
     if (this.pendingAdmissionWaiters >= this.maxPendingAdmissionWaiters) {
       throw new ReputationStoreQuotaError("admission_busy");
     }
     this.pendingAdmissionWaiters += 1;
-    try {
-      // Chain the RAW fn onto admissionQueue (never the deadline-wrapped
-      // closure) so runAdmissionExclusive only advances the queue once
-      // fn() itself settles. The deadline races the ALREADY-CHAINED
-      // promise below, so a timeout changes only what THIS call reports —
-      // never when the lock frees for the next admission (LD5
-      // BP-DEADLINE-01).
-      const chained = this.runAdmissionExclusive(fn);
-      return await withReputationAdmissionDeadline(
-        chained,
-        REPUTATION_STORE_ADMISSION_DEADLINE_MS
-      );
-    } finally {
+    // Chain the RAW fn onto admissionQueue (never the deadline-wrapped
+    // closure) so runAdmissionExclusive only advances the queue once
+    // fn() itself settles. The deadline races the ALREADY-CHAINED
+    // promise below, so a timeout changes only what THIS call reports —
+    // never when the lock frees for the next admission (LD5
+    // BP-DEADLINE-01).
+    const chained = this.runAdmissionExclusive(fn);
+    // Release the waiter slot when fn() SETTLES, never when THIS caller's
+    // await resolves: on a caller timeout the deadline rejects this call
+    // while fn() stays chained on admissionQueue, and freeing the slot then
+    // would let later admissions pile unbounded chained closures behind a
+    // permanently-hung fn (LD5 BP-DEADLINE-02, rule-8). Holding the slot for
+    // fn's lifetime caps accumulation at maxPendingAdmissionWaiters. chained
+    // is also awaited below, so its rejection is handled and cannot surface
+    // as unhandledRejection.
+    const releaseSlot = (): void => {
       this.pendingAdmissionWaiters -= 1;
-    }
+    };
+    chained.then(releaseSlot, releaseSlot);
+    return await withReputationAdmissionDeadline(
+      chained,
+      REPUTATION_STORE_ADMISSION_DEADLINE_MS
+    );
   }
 
   /**

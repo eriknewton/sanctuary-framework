@@ -350,7 +350,13 @@ const SATURATION_EVICT_SCAN_CAP = 50;
  * caller still fails closed on its own deadline and
  * `pendingAdmissionWaiters` cap (see that field's doc), so a hung storage
  * backend degrades to "no new findings admitted," never to a
- * `MAX_TRACKED_FINDINGS`/`MAX_FINDINGS_PER_ORIGIN` overshoot.
+ * `MAX_TRACKED_FINDINGS`/`MAX_FINDINGS_PER_ORIGIN` overshoot. This is NOT,
+ * by itself, "clean degradation" with no other cost: LD5 BP-DEADLINE-02
+ * (closed, see the waiter-release `finally` inside `saveFinding`'s
+ * admission fn) closes the companion memory risk — chained closures behind
+ * a permanently-hung admission are bounded at `maxPendingAdmissionWaiters`
+ * because the waiter slot is now held for the admission fn's full
+ * lifetime, not released on the caller's deadline timeout.
  */
 const STORAGE_OP_MARGIN_MS = 10_000;
 const STORE_ADMISSION_DEADLINE_MS = ON_EVICT_AUDIT_TIMEOUT_MS + STORAGE_OP_MARGIN_MS;
@@ -452,9 +458,13 @@ export class SentinelFindingStore {
    * cap (AGENTS.md rule 8, fix-round-6 — mirrors `BoundedMap`'s
    * `pendingAdmissionWaiters`, core/bounded-map.ts). Incremented
    * SYNCHRONOUSLY in `saveFinding`'s new-record branch before the first
-   * `await` in that branch, decremented in a `finally` once
-   * `runAdmissionExclusive` settles either way — see that field's doc for
-   * why the synchronous check-then-increment needs no separate lock.
+   * `await` in that branch — see that field's doc for why the synchronous
+   * check-then-increment needs no separate lock. Decremented from a
+   * `finally` INSIDE the admission fn's own body, so the release fires when
+   * the fn itself SETTLES, never when the caller's deadline-bounded
+   * `runAdmissionExclusive` await returns first (LD5 BP-DEADLINE-02,
+   * closed): releasing on caller timeout let chained closures pile up
+   * unbounded behind a permanently-hung fn.
    */
   private pendingAdmissionWaiters = 0;
   /**
@@ -879,28 +889,44 @@ export class SentinelFindingStore {
         throw new SentinelFindingStoreRefusedError("admission_busy");
       }
       this.pendingAdmissionWaiters += 1;
-      try {
-        // NEW-RECORD ADMISSION (MUST-FIX 1, fix-round-5): the ceiling check
-        // and the write+index update run as ONE critical section under the
-        // store-level admission lock, so a concurrent new-id admission can
-        // only ever observe this call's COMPLETE outcome, never a
-        // pre-write snapshot. LOCK ORDERING: `runAdmissionExclusive` is
-        // acquired first (outer); `enforceTrackedFindingsCeiling`'s own
-        // reclamation and `writeAndIndex` each acquire a `findingLocks`
-        // entry (inner) only from inside it — see `admissionQueue`'s doc.
-        await this.runAdmissionExclusive(async () => {
+      // LD5 BP-DEADLINE-02 (closed): the waiter slot + busy-audit episode
+      // used to be released in a `finally` on THIS call's deadline-wrapped
+      // await (inside `runAdmissionExclusive`, which itself applies
+      // `withDeadline`) — i.e. on the CALLER's timeout, not on the admission
+      // fn's own settlement. Under a permanently-hung `storage.write` inside
+      // the fn, a timed-out caller freed its waiter slot while the fn stayed
+      // chained on `admissionQueue`, so later admissions kept passing the
+      // waiter cap and piling up unbounded chained closures behind the hung
+      // head (rule-8). The fix: `releaseSlot` runs from the fn's OWN
+      // `finally`, below, so it fires exactly once per admission — when the
+      // fn body itself settles, whether it throws or succeeds — not once
+      // per caller await. Holding the slot for the fn's lifetime caps
+      // accumulation at maxPendingAdmissionWaiters. The counter never
+      // exceeds the cap (the increment above is guarded by the same
+      // synchronous check), so after this decrement it sits strictly below
+      // the cap — the saturation episode, if one was active, ends exactly
+      // here (fix-round-7 busy-audit coalescing; mirrors
+      // `BoundedMap.set()`'s settlement `finally`).
+      const releaseSlot = (): void => {
+        this.pendingAdmissionWaiters -= 1;
+        this.busyAuditCoalescer.onBelowCap();
+      };
+      // NEW-RECORD ADMISSION (MUST-FIX 1, fix-round-5): the ceiling check
+      // and the write+index update run as ONE critical section under the
+      // store-level admission lock, so a concurrent new-id admission can
+      // only ever observe this call's COMPLETE outcome, never a
+      // pre-write snapshot. LOCK ORDERING: `runAdmissionExclusive` is
+      // acquired first (outer); `enforceTrackedFindingsCeiling`'s own
+      // reclamation and `writeAndIndex` each acquire a `findingLocks`
+      // entry (inner) only from inside it — see `admissionQueue`'s doc.
+      await this.runAdmissionExclusive(async () => {
+        try {
           await this.enforceTrackedFindingsCeiling(key, origin);
           await writeAndIndex();
-        });
-      } finally {
-        this.pendingAdmissionWaiters -= 1;
-        // The counter never exceeds the cap (the increment above is
-        // guarded by the same synchronous check), so after ANY decrement
-        // it sits strictly below the cap — the saturation episode, if one
-        // was active, ends exactly here (fix-round-7 busy-audit
-        // coalescing; mirrors `BoundedMap.set()`'s settlement `finally`).
-        this.busyAuditCoalescer.onBelowCap();
-      }
+        } finally {
+          releaseSlot();
+        }
+      });
     }
     return persisted.retention_until;
   }

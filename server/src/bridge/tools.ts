@@ -289,8 +289,11 @@ class BridgeStore {
    * of the same name, reputation-store.ts, and BoundedMap's
    * `pendingAdmissionWaiters`, core/bounded-map.ts). Incremented
    * SYNCHRONOUSLY in `runAdmissionExclusiveBounded` before its first
-   * `await`, decremented in a `finally` once the admission settles either
-   * way.
+   * `await`, decremented when `fn()` itself SETTLES (via a `.then` attached
+   * to the chained promise), never on the caller's deadline-bounded await
+   * settling first — see LD5 BP-DEADLINE-02 on `runAdmissionExclusiveBounded`
+   * for why a caller-timeout-triggered release let chained closures pile up
+   * unbounded behind a permanently-hung `fn`.
    */
   private pendingAdmissionWaiters = 0;
   /**
@@ -473,30 +476,51 @@ class BridgeStore {
    * queue for every later admission until it does — that trade is
    * deliberate: the alternative (releasing the lock early) is the exact
    * quota bypass this fix closes. Each individual caller still fails closed
-   * on its own deadline and this store's `pendingAdmissionWaiters` cap, so
-   * a hung storage backend degrades to "no new admissions succeed," never
-   * to a quota overshoot.
+   * on its own deadline; a hung storage backend degrades to "no new
+   * admissions succeed," never to a quota overshoot. That is NOT, by
+   * itself, clean degradation with no other cost — see LD5 BP-DEADLINE-02
+   * immediately below for the companion memory risk this fix also closes.
+   *
+   * LD5 BP-DEADLINE-02 (closed): `pendingAdmissionWaiters` used to be
+   * released in a `finally` on THIS method's own await — i.e. on the
+   * CALLER's timeout, not on `fn()` settlement. Under a permanently-hung
+   * `fn()`, a timed-out caller freed its waiter slot while `fn` stayed
+   * chained on `admissionQueue`, so later admissions kept passing the
+   * waiter cap and piling up unbounded chained closures behind the hung
+   * head (all reachable from `this.admissionQueue`, never GC-eligible) —
+   * the cap bounded only CONCURRENT waiters, not CUMULATIVE chained
+   * closures. The fix: the slot is released when `chained` (i.e. `fn()`)
+   * itself settles, not when this call's deadline-bounded await returns —
+   * see the settlement `.then` below.
    */
   private async runAdmissionExclusiveBounded<T>(fn: () => Promise<T>): Promise<T> {
     if (this.pendingAdmissionWaiters >= this.maxPendingAdmissionWaiters) {
       throw new BridgeStoreQuotaError("admission_busy");
     }
     this.pendingAdmissionWaiters += 1;
-    try {
-      // Chain the RAW fn onto admissionQueue (never the deadline-wrapped
-      // closure) so runAdmissionExclusive only advances the queue once
-      // fn() itself settles. The deadline races the ALREADY-CHAINED
-      // promise below, so a timeout changes only what THIS call reports —
-      // never when the lock frees for the next admission (LD5
-      // BP-DEADLINE-01).
-      const chained = this.runAdmissionExclusive(fn);
-      return await withBridgeAdmissionDeadline(
-        chained,
-        BRIDGE_STORE_ADMISSION_DEADLINE_MS
-      );
-    } finally {
+    // Chain the RAW fn onto admissionQueue (never the deadline-wrapped
+    // closure) so runAdmissionExclusive only advances the queue once
+    // fn() itself settles. The deadline races the ALREADY-CHAINED
+    // promise below, so a timeout changes only what THIS call reports —
+    // never when the lock frees for the next admission (LD5
+    // BP-DEADLINE-01).
+    const chained = this.runAdmissionExclusive(fn);
+    // Release the waiter slot when fn() SETTLES, never when THIS caller's
+    // await resolves: on a caller timeout the deadline rejects this call
+    // while fn() stays chained on admissionQueue, and freeing the slot then
+    // would let later admissions pile unbounded chained closures behind a
+    // permanently-hung fn (LD5 BP-DEADLINE-02, rule-8). Holding the slot for
+    // fn's lifetime caps accumulation at maxPendingAdmissionWaiters. chained
+    // is also awaited below, so its rejection is handled and cannot surface
+    // as unhandledRejection.
+    const releaseSlot = (): void => {
       this.pendingAdmissionWaiters -= 1;
-    }
+    };
+    chained.then(releaseSlot, releaseSlot);
+    return await withBridgeAdmissionDeadline(
+      chained,
+      BRIDGE_STORE_ADMISSION_DEADLINE_MS
+    );
   }
 
   async get(
