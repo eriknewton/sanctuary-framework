@@ -13,6 +13,7 @@
  */
 
 import type { SignedSHR, SHRBody, SHRDegradation } from "./types.js";
+import { verifySHR } from "./verifier.js";
 
 // ── Gateway Authorization Context ───────────────────────────────────────
 
@@ -153,10 +154,45 @@ const DEGRADATION_IMPACT = {
 /**
  * Transform an SHR into a Ping Identity Gateway authorization context.
  *
- * @param shr - The signed SHR to transform
+ * Verifies the SHR (signature, expiry, identity binding) before trusting any
+ * of its self-reported fields — see the invariant comment at the top of the
+ * function body.
+ *
+ * @param shr - The signed SHR to transform (a counterparty's SHR, or a
+ *   freshly self-signed one — both paths verify identically)
  * @returns A PingAuthorizationContext ready for the Agent Gateway
+ * @throws {Error} if `shr` fails verification (invalid signature, expired,
+ *   unbound instance_id, malformed schema/layers) — no trust decision is
+ *   minted from an unverified SHR
  */
-export function transformSHRForGateway(shr: SignedSHR): PingAuthorizationContext {
+export function transformSHRForGateway(
+  shr: SignedSHR,
+  // `now` threads to verifySHR's temporal check so a caller verifying against
+  // a specific clock (a test with a fixed-time SHR fixture, or a deterministic
+  // replay) checks expiry against THAT clock; production callers omit it and
+  // get the real clock. Threading it does NOT weaken the gate — an expired SHR
+  // still fails; it only lets the caller name the reference time.
+  now?: Date,
+): PingAuthorizationContext {
+  // SHR-GW-01 (rule-7, semantic provenance): every field read below —
+  // layers, capabilities, degradations, instance_id — is SELF-REPORTED by
+  // whoever holds `shr.signed_by`'s private key. It carries no credibility
+  // until `verifySHR` (server/src/shr/verifier.ts) has confirmed the Ed25519
+  // signature over the canonical body, checked temporal validity, and bound
+  // `instance_id` to `signed_by` (directly or via a verified rotation
+  // chain). This function mints a trust decision (score up to 100, up to
+  // "full" trust) FROM those fields, so an unverified SHR must never reach
+  // the scoring logic below: a counterparty could otherwise self-report
+  // "all layers active" and be handed the Gateway's highest trust tier with
+  // no cryptographic backing. Fail closed — do not fall through to scoring
+  // on a verification failure.
+  const verification = verifySHR(shr, now);
+  if (!verification.valid) {
+    throw new Error(
+      `Cannot mint a gateway trust decision from an unverified SHR: ${verification.errors.join("; ")}`
+    );
+  }
+
   const { body, signed_by, signature } = shr;
 
   // Calculate per-layer scores
@@ -475,8 +511,13 @@ export interface GenericAuthorizationContext {
 /**
  * Transform an SHR into a generic authorization context.
  */
-export function transformSHRGeneric(shr: SignedSHR): GenericAuthorizationContext {
-  const context = transformSHRForGateway(shr);
+export function transformSHRGeneric(
+  shr: SignedSHR,
+  now?: Date,
+): GenericAuthorizationContext {
+  // `now` threads through to the verify gate in transformSHRForGateway — see
+  // that function's `now` doc.
+  const context = transformSHRForGateway(shr, now);
 
   return {
     agent_id: context.agent_identity,
