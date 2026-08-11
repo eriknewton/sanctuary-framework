@@ -447,6 +447,10 @@
           "identity_id": {
             "type": "string",
             "description": "Optional identity this policy is bound to"
+          },
+          "policy_id": {
+            "type": "string",
+            "description": "Optional: id of an existing policy created by THIS session to update in place (replaces its rules without minting a new id or consuming a new policy slot). Omit to create a new policy; an id belonging to a different session is refused."
           }
         },
         "required": [
