@@ -15,6 +15,11 @@ import { describe, it, expect } from "vitest";
 import {
   evaluateDisclosure,
   PolicyStore,
+  validatePolicyInput,
+  MAX_DISCLOSURE_POLICIES_PER_ORIGIN,
+  MAX_DISCLOSURE_POLICY_RULES,
+  MAX_DISCLOSURE_RULE_FIELD_ITEMS,
+  MAX_DISCLOSURE_RULE_STRING_LENGTH,
   type DisclosurePolicy,
   type DisclosureRule,
 } from "../../src/disclosure/policies.js";
@@ -196,7 +201,7 @@ describe("L3 Disclosure Policies", () => {
       const masterKey = generateRandomKey();
       const store = new PolicyStore(storage, masterKey);
 
-      const policy = await store.create(
+      const result = await store.create(
         "Commerce Policy",
         [
           {
@@ -209,6 +214,9 @@ describe("L3 Disclosure Policies", () => {
         "withhold"
       );
 
+      expect(result.ok).toBe(true);
+      if (!result.ok) throw new Error("unreachable");
+      const policy = result.policy;
       expect(policy.policy_id).toMatch(/^pol-/);
       expect(policy.policy_name).toBe("Commerce Policy");
 
@@ -245,6 +253,192 @@ describe("L3 Disclosure Policies", () => {
         const rawStr = new TextDecoder().decode(raw);
         expect(rawStr).not.toContain(uniqueName);
       }
+    });
+  });
+
+  // LD3 — DISCLOSURE-POLICY-CACHE-UNBOUNDED: `disclosure_set_policy` used to
+  // mint a fresh id and cache the caller-supplied rules on EVERY call with
+  // no cap of any kind. These tests fail on the pre-fix code (unbounded
+  // creation succeeds forever; any rule payload size is accepted) and pass
+  // once the per-origin/global caps and rule-size bounds are enforced.
+  describe("PolicyStore bounds (LD3)", () => {
+    it("refuses a new policy once a single session's per-origin quota is exhausted", async () => {
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const store = new PolicyStore(storage, masterKey);
+      const origin = "agent:flood-session";
+
+      for (let i = 0; i < MAX_DISCLOSURE_POLICIES_PER_ORIGIN; i++) {
+        const result = await store.create(
+          `Policy ${i}`,
+          [],
+          "withhold",
+          undefined,
+          origin
+        );
+        expect(result.ok).toBe(true);
+      }
+
+      // The (N+1)th create from the SAME session must be refused, not
+      // silently minted — this is the line that fails on unbounded code.
+      const overflow = await store.create(
+        "One too many",
+        [],
+        "withhold",
+        undefined,
+        origin
+      );
+      expect(overflow.ok).toBe(false);
+      if (overflow.ok) throw new Error("unreachable");
+      expect(overflow.reason).toBe("origin_quota");
+
+      // A DIFFERENT session's own quota must be untouched by the flood.
+      const otherSession = await store.create(
+        "Different session's policy",
+        [],
+        "withhold",
+        undefined,
+        "agent:other-session"
+      );
+      expect(otherSession.ok).toBe(true);
+    });
+
+    it("rejects a policy with more rules than MAX_DISCLOSURE_POLICY_RULES", () => {
+      const rules: DisclosureRule[] = Array.from(
+        { length: MAX_DISCLOSURE_POLICY_RULES + 1 },
+        (_, i) => ({
+          context: `context-${i}`,
+          disclose: [],
+          withhold: [],
+          proof_required: [],
+        })
+      );
+      const result = validatePolicyInput("Too Many Rules", rules);
+      expect(result.ok).toBe(false);
+    });
+
+    it("rejects a rule with more disclose entries than MAX_DISCLOSURE_RULE_FIELD_ITEMS", () => {
+      const rules: DisclosureRule[] = [
+        {
+          context: "commerce",
+          disclose: Array.from(
+            { length: MAX_DISCLOSURE_RULE_FIELD_ITEMS + 1 },
+            (_, i) => `field-${i}`
+          ),
+          withhold: [],
+          proof_required: [],
+        },
+      ];
+      const result = validatePolicyInput("Too Many Fields", rules);
+      expect(result.ok).toBe(false);
+    });
+
+    it("rejects a rule field string longer than MAX_DISCLOSURE_RULE_STRING_LENGTH", () => {
+      const rules: DisclosureRule[] = [
+        {
+          context: "commerce",
+          disclose: ["x".repeat(MAX_DISCLOSURE_RULE_STRING_LENGTH + 1)],
+          withhold: [],
+          proof_required: [],
+        },
+      ];
+      const result = validatePolicyInput("Oversized Field", rules);
+      expect(result.ok).toBe(false);
+    });
+
+    it("accepts a policy sitting exactly at the rule/field/string caps", () => {
+      const rules: DisclosureRule[] = Array.from(
+        { length: MAX_DISCLOSURE_POLICY_RULES },
+        (_, i) => ({
+          context: `context-${i}`,
+          disclose: ["x".repeat(MAX_DISCLOSURE_RULE_STRING_LENGTH)],
+          withhold: [],
+          proof_required: [],
+        })
+      );
+      const result = validatePolicyInput("At The Cap", rules);
+      expect(result.ok).toBe(true);
+    });
+
+    it("update-in-place replaces rules without minting a new id or consuming a new quota slot", async () => {
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const store = new PolicyStore(storage, masterKey);
+      const origin = "agent:owner-session";
+
+      const created = await store.create(
+        "Original",
+        [
+          {
+            context: "commerce",
+            disclose: ["name"],
+            withhold: [],
+            proof_required: [],
+          },
+        ],
+        "withhold",
+        undefined,
+        origin
+      );
+      expect(created.ok).toBe(true);
+      if (!created.ok) throw new Error("unreachable");
+
+      const updated = await store.update(
+        created.policy.policy_id,
+        "Updated",
+        [
+          {
+            context: "commerce",
+            disclose: [],
+            withhold: ["name"],
+            proof_required: [],
+          },
+        ],
+        "withhold",
+        undefined,
+        origin
+      );
+      expect(updated.ok).toBe(true);
+      if (!updated.ok) throw new Error("unreachable");
+      expect(updated.policy.policy_id).toBe(created.policy.policy_id);
+      expect(updated.policy.policy_name).toBe("Updated");
+
+      const list = await store.list();
+      expect(
+        list.filter((p) => p.policy_id === created.policy.policy_id)
+      ).toHaveLength(1);
+    });
+
+    it("refuses to update a policy owned by a different session", async () => {
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const store = new PolicyStore(storage, masterKey);
+
+      const created = await store.create(
+        "Victim's Policy",
+        [],
+        "withhold",
+        undefined,
+        "agent:victim-session"
+      );
+      expect(created.ok).toBe(true);
+      if (!created.ok) throw new Error("unreachable");
+
+      const attempt = await store.update(
+        created.policy.policy_id,
+        "Hijacked",
+        [],
+        "withhold",
+        undefined,
+        "agent:attacker-session"
+      );
+      expect(attempt.ok).toBe(false);
+      if (attempt.ok) throw new Error("unreachable");
+      expect(attempt.reason).toBe("forbidden");
+
+      // The original policy must be untouched by the refused attempt.
+      const retrieved = await store.get(created.policy.policy_id);
+      expect(retrieved!.policy_name).toBe("Victim's Policy");
     });
   });
 });
