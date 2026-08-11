@@ -1,3 +1,4 @@
+// fail-before-exempt: adaptation-only in this PR — the changes are (a) destructuring handshakeResultWriterOrigins and passing the now-required origins-map arg through the widened createHandshakeTools/createFederationTools signatures, and (b) rewording two comments to drop a dangling BUILD_RESULT.md pointer. No assertion changed. This is a Class B (self-vouch) binding suite whose behavior landed in merged main (#1198), so it passes against origin/main by construction; the Class C bounded-state behavior is bound by test/security/attacker-writable-collections-bounds.test.ts and test/core/bounded-map.test.ts (both fail against pre-fix source, gate-confirmed).
 /**
  * Self-Vouch Trust-Ingest Inventory — Class-Level Regression Suite
  * (register §Z RECHECK / LD2-02, LD2-02b, A11)
@@ -356,7 +357,7 @@ describe("(b) federation_peers register(): local-custody refusal", () => {
     const fortress = makeFortress();
     const a = await addIdentity(fortress, "identity-a");
     const b = await addIdentity(fortress, "identity-b");
-    const { tools: hsTools, handshakeResults } = createHandshakeTools(
+    const { tools: hsTools, handshakeResults, handshakeResultWriterOrigins } = createHandshakeTools(
       fortress.config,
       fortress.identityManager,
       fortress.masterKey,
@@ -389,7 +390,8 @@ describe("(b) federation_peers register(): local-custody refusal", () => {
     const { tools: fedTools } = createFederationTools(
       fortress.auditLog,
       handshakeResults,
-      fortress.identityManager
+      fortress.identityManager,
+      handshakeResultWriterOrigins
     );
     const register = fedTools.find((t) => t.name === "federation_peers")!;
     const out = parse(
@@ -427,10 +429,15 @@ describe("(b) federation_peers register(): local-custody refusal", () => {
       liveness_proven: true,
     });
 
+    // REQUIRED (fix-round-2, MUST-FIX 2): an empty origins map is correct —
+    // this block hand-inserts into `handshakeResults` directly, bypassing
+    // the producer that would normally attribute an origin, so there is no
+    // real per-session origin to supply.
     const { tools: fedTools } = createFederationTools(
       fortress.auditLog,
       handshakeResults,
-      fortress.identityManager
+      fortress.identityManager,
+      new Map<string, string>()
     );
     const register = fedTools.find((t) => t.name === "federation_peers")!;
     const out = parse(
@@ -802,10 +809,15 @@ describe("(f) MUST-FIX 1: a legacy-DID-encoded local identity is still recognize
       liveness_proven: true,
     });
 
+    // REQUIRED (fix-round-2, MUST-FIX 2): an empty origins map is correct —
+    // this block hand-inserts into `handshakeResults` directly, bypassing
+    // the producer that would normally attribute an origin, so there is no
+    // real per-session origin to supply.
     const { tools: fedTools } = createFederationTools(
       fortress.auditLog,
       handshakeResults,
-      fortress.identityManager
+      fortress.identityManager,
+      new Map<string, string>()
     );
     const register = fedTools.find((t) => t.name === "federation_peers")!;
     const out = parse(
@@ -942,8 +954,8 @@ describe("(g) MUST-FIX 1: an undecodable stored public_key never defeats a local
     // requireNonEmptyString accepted any non-empty string) and MUST fail
     // after it (requireEd25519PublicKeyBase64url rejects a non-decodable
     // key) — both sides land on "refused," which is exactly the point:
-    // mutation-proof (a) in BUILD_RESULT.md reverts the ingest check and
-    // shows this same call SUCCEED instead.
+    // reverting the ingest check (the literal source mutation run as that
+    // fix round's proof) shows this same call SUCCEED instead.
     await expect(
       importTool.handler({ identity: garbageIdentity })
     ).rejects.toThrow(/Ed25519 public key/i);
@@ -1001,9 +1013,9 @@ describe("(g) MUST-FIX 1: an undecodable stored public_key never defeats a local
     // cli/identity, wrap/init, wrap/cli, saveNew/rotation) funnels through
     // before an identity reaches `identities.set(...)`. Before round 3,
     // this call succeeded (save() trusted every caller to have already
-    // validated); the mutation proof in BUILD_RESULT.md removes the
-    // `assertValidStoredIdentity` call from save() and shows this same
-    // call SUCCEED instead of throwing.
+    // validated); removing the `assertValidStoredIdentity` call from
+    // save() (the literal source mutation run as that fix round's proof)
+    // shows this same call SUCCEED instead of throwing.
     const fortress = makeFortress();
     const encKey = derivePurposeKey(fortress.masterKey, "identity-encryption");
     const { storedIdentity } = createIdentity(

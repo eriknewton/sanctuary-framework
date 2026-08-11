@@ -205,6 +205,23 @@ export interface BuildV11BindingsInputs {
    * `console.error`; tests can inject a no-op when exercising unreadable keys.
    */
   warnProducerKeyUnavailable?: (reason: string) => void;
+  /**
+   * Optional PRE-CONSTRUCTED SentinelFindingStore for this fortress (MUST-FIX
+   * 5, fix-round-2 RECHECK). When supplied — as index.ts's embedded-server
+   * boot path does — the anomaly-detection binding below REUSES this
+   * instance instead of constructing its own. A caller that also runs an
+   * independent sentinel-dispatch boot path against the SAME fortress (only
+   * index.ts does; `dashboard-standalone.ts` does not) MUST supply this,
+   * because two independent `SentinelFindingStore` instances maintain two
+   * DISJOINT in-memory filter indexes over the same storage namespace — a
+   * write through one is invisible to a `listFindings`/`listFindingMetadata`
+   * call through the other until that record ages past retention, which
+   * silently hides findings from whichever surface did not receive the
+   * write. Omit when this wiring layer owns the only store for the fortress
+   * (dashboard-standalone.ts, and every other caller of `buildV11Bindings`);
+   * a fresh instance is then constructed exactly as before.
+   */
+  sentinelFindingStore?: SentinelFindingStore;
 }
 
 /** Anomaly-detection binding mounted behind the dashboard auth chokepoint. */
@@ -542,11 +559,32 @@ export function buildV11Bindings(
   // Mounted by the dispatch layer behind the shared auth chokepoint.
   let anomaly: V11AnomalyBinding | undefined;
   if (inputs.storage && inputs.masterKey) {
-    const findingStore = new SentinelFindingStore({
-      storage: inputs.storage,
-      masterKey: inputs.masterKey,
-      fortressId: inputs.fortressId,
-    });
+    // MUST-FIX 5 (fix-round-2 RECHECK): reuse the caller's SentinelFindingStore
+    // when supplied — see `sentinelFindingStore`'s doc on
+    // BuildV11BindingsInputs for why a second independent instance silently
+    // hides findings between this binding and the caller's own sentinel-
+    // dispatch boot path. `pruneExpired` is skipped for a REUSED instance:
+    // the owner that constructed it already schedules pruning (index.ts's
+    // boot path); running it again here would just be redundant work
+    // against the same store.
+    const reusingSharedStore = inputs.sentinelFindingStore !== undefined;
+    const findingStore =
+      inputs.sentinelFindingStore ??
+      new SentinelFindingStore({
+        storage: inputs.storage,
+        masterKey: inputs.masterKey,
+        fortressId: inputs.fortressId,
+        auditLog: inputs.auditLog,
+      });
+    if (!reusingSharedStore) {
+      // Register Z-HNY-02: fire-and-forget at construction, same pattern as
+      // conciergeMemory.pruneExpired() above — the fortress-unlock cycle
+      // drops expired findings before any dashboard read of this store.
+      void findingStore.pruneExpired().catch(() => {
+        // Best-effort; a transient storage hiccup should not block hub
+        // construction. The next unlock re-runs the prune.
+      });
+    }
     const dispatcher = new AnomalyPipelineDispatcher({
       findingStore,
       auditLog: inputs.auditLog,

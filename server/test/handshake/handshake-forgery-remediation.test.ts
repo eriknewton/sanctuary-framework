@@ -1,3 +1,4 @@
+// fail-before-exempt: adaptation-only in this PR — the sole change is passing the now-required 4th origins-map arg to createFederationTools (an empty Map, since this file hand-builds handshakeResults with no real per-session origin). No assertion changed. The Class C bounded-state behavior IS bound (fails against pre-fix source) by test/security/attacker-writable-collections-bounds.test.ts and test/core/bounded-map.test.ts; the self-vouch behavior this file exercises is bound in merged main (#1198) and by this file's own M3 self-vouch test against pre-Class-B source.
 /**
  * Handshake Forgery & Replay Remediation — Regression Suite (M1-M4)
  *
@@ -309,7 +310,18 @@ describe("M3: federation register binds peer_did to the signing key", () => {
     const handshakeResults = new Map<string, HandshakeResult>();
     handshakeResults.set(shr.body.instance_id, liveResultFor(shr));
 
-    const { tools } = createFederationTools(agent.auditLog, handshakeResults, agent.identityManager);
+    // REQUIRED (fix-round-2, MUST-FIX 2): an empty origins map is correct
+    // here — this file builds `handshakeResults` by hand (not through
+    // createHandshakeTools's recordHandshakeResult), so there is no real
+    // per-session origin; every registration falls into the shared
+    // AGENT_UNKNOWN_ORIGIN bucket, which none of these tests' assertions
+    // depend on.
+    const { tools } = createFederationTools(
+      agent.auditLog,
+      handshakeResults,
+      agent.identityManager,
+      new Map<string, string>()
+    );
     const peersTool = tools.find((t) => t.name === "federation_peers")!;
 
     const out = parse(
@@ -334,7 +346,18 @@ describe("M3: federation register binds peer_did to the signing key", () => {
     const handshakeResults = new Map<string, HandshakeResult>();
     handshakeResults.set(shr.body.instance_id, liveResultFor(shr));
 
-    const { tools } = createFederationTools(agent.auditLog, handshakeResults, agent.identityManager);
+    // REQUIRED (fix-round-2, MUST-FIX 2): an empty origins map is correct
+    // here — this file builds `handshakeResults` by hand (not through
+    // createHandshakeTools's recordHandshakeResult), so there is no real
+    // per-session origin; every registration falls into the shared
+    // AGENT_UNKNOWN_ORIGIN bucket, which none of these tests' assertions
+    // depend on.
+    const { tools } = createFederationTools(
+      agent.auditLog,
+      handshakeResults,
+      agent.identityManager,
+      new Map<string, string>()
+    );
     const peersTool = tools.find((t) => t.name === "federation_peers")!;
 
     const out = parse(
@@ -359,7 +382,18 @@ describe("M3: federation register binds peer_did to the signing key", () => {
     const handshakeResults = new Map<string, HandshakeResult>();
     handshakeResults.set(shr.body.instance_id, liveResultFor(shr));
 
-    const { tools } = createFederationTools(agent.auditLog, handshakeResults, agent.identityManager);
+    // REQUIRED (fix-round-2, MUST-FIX 2): an empty origins map is correct
+    // here — this file builds `handshakeResults` by hand (not through
+    // createHandshakeTools's recordHandshakeResult), so there is no real
+    // per-session origin; every registration falls into the shared
+    // AGENT_UNKNOWN_ORIGIN bucket, which none of these tests' assertions
+    // depend on.
+    const { tools } = createFederationTools(
+      agent.auditLog,
+      handshakeResults,
+      agent.identityManager,
+      new Map<string, string>()
+    );
     const peersTool = tools.find((t) => t.name === "federation_peers")!;
 
     const out = parse(
@@ -386,7 +420,18 @@ describe("M3: federation register binds peer_did to the signing key", () => {
     const handshakeResults = new Map<string, HandshakeResult>();
     handshakeResults.set(shr.body.instance_id, liveResultFor(shr));
 
-    const { tools } = createFederationTools(agent.auditLog, handshakeResults, agent.identityManager);
+    // REQUIRED (fix-round-2, MUST-FIX 2): an empty origins map is correct
+    // here — this file builds `handshakeResults` by hand (not through
+    // createHandshakeTools's recordHandshakeResult), so there is no real
+    // per-session origin; every registration falls into the shared
+    // AGENT_UNKNOWN_ORIGIN bucket, which none of these tests' assertions
+    // depend on.
+    const { tools } = createFederationTools(
+      agent.auditLog,
+      handshakeResults,
+      agent.identityManager,
+      new Map<string, string>()
+    );
     const peersTool = tools.find((t) => t.name === "federation_peers")!;
 
     const out = parse(
@@ -417,7 +462,18 @@ describe("M3: federation register binds peer_did to the signing key", () => {
     const handshakeResults = new Map<string, HandshakeResult>();
     handshakeResults.set(shr.body.instance_id, previewResult);
 
-    const { tools } = createFederationTools(agent.auditLog, handshakeResults, agent.identityManager);
+    // REQUIRED (fix-round-2, MUST-FIX 2): an empty origins map is correct
+    // here — this file builds `handshakeResults` by hand (not through
+    // createHandshakeTools's recordHandshakeResult), so there is no real
+    // per-session origin; every registration falls into the shared
+    // AGENT_UNKNOWN_ORIGIN bucket, which none of these tests' assertions
+    // depend on.
+    const { tools } = createFederationTools(
+      agent.auditLog,
+      handshakeResults,
+      agent.identityManager,
+      new Map<string, string>()
+    );
     const peersTool = tools.find((t) => t.name === "federation_peers")!;
 
     const out = parse(

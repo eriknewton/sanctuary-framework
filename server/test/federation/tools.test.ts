@@ -38,7 +38,22 @@ function setup() {
   // never fires here; that path is covered by handshake-forgery-remediation.
   // test.ts's M3 self-vouch test and the class-binding inventory suite.
   const identityManager = new IdentityManager(storage, generateRandomKey());
-  const { tools, registry } = createFederationTools(auditLog, handshakeResults, identityManager);
+  // REQUIRED (fix-round-2, MUST-FIX 2: an optional per-origin-quota
+  // dependency can silently skip the quota, which was itself the defect).
+  // This file's `handshakeResults` is populated directly via `.set()`
+  // rather than through `createHandshakeTools`'s recordHandshakeResult, so
+  // there is no real per-session origin to attribute — an empty origins map
+  // means every registration in this file falls into the shared
+  // AGENT_UNKNOWN_ORIGIN bucket, which is fine: none of these tests
+  // exercise per-origin fairness (see
+  // test/security/attacker-writable-collections-bounds.test.ts for that).
+  const handshakeResultOrigins = new Map<string, string>();
+  const { tools, registry } = createFederationTools(
+    auditLog,
+    handshakeResults,
+    identityManager,
+    handshakeResultOrigins
+  );
   const findTool = (name: string) => tools.find(t => t.name === name)!;
   return { tools, registry, handshakeResults, findTool };
 }

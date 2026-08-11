@@ -803,7 +803,7 @@ export async function createSanctuaryServer(options?: {
 
   // 12. Create Handshake tools (sovereignty handshake protocol)
   // Must be created before L4 so handshakeResults can feed tier resolution
-  const { tools: handshakeTools, handshakeResults } = createHandshakeTools(
+  const { tools: handshakeTools, handshakeResults, handshakeResultWriterOrigins } = createHandshakeTools(
     config,
     identityManager,
     masterKey,
@@ -843,7 +843,8 @@ export async function createSanctuaryServer(options?: {
   const { tools: federationTools } = createFederationTools(
     auditLog,
     handshakeResults,
-    identityManager
+    identityManager,
+    handshakeResultWriterOrigins
   );
 
   // 14c. Create Bridge tools (Concordia integration)
@@ -896,6 +897,39 @@ export async function createSanctuaryServer(options?: {
 
   // 14h. Create Sovereignty Profile tools
   const { tools: profileTools } = createSovereigntyProfileTools(profileStore, auditLog);
+
+  // 14i. Construct the per-fortress Sentinel/Anomaly finding store HERE,
+  // ahead of both the embedded-dashboard wiring below (which used to
+  // construct its OWN independent instance inside `buildV11Bindings`) and
+  // the sentinel-dispatch boot path further down (step "v1.3 WP-V1.3-1
+  // Phi-1"). MUST-FIX 5 (fix-round-2 RECHECK): those were previously TWO
+  // separate `SentinelFindingStore` objects reading/writing the SAME
+  // storage namespace for the SAME fortress, each with its own in-memory
+  // filter index (sentinel-finding-store.ts's `this.index`) — a write
+  // through one instance never updated the other's index, so a query
+  // against whichever instance did NOT receive the write (e.g. the
+  // dashboard's anomaly binding reading findings the boot-path sentinel
+  // dispatcher persisted, or vice versa) silently missed them. One shared
+  // instance closes this: every production consumer of this fortress's
+  // finding store now reads/writes the SAME index. `fortressIdFromStoragePath`
+  // is a pure function of `config.storage_path` (used identically at both
+  // this store's original construction site and in `buildV11Bindings`'s
+  // call below), so calling it here ahead of `fortressIdForAggregator`
+  // (declared later) is behavior-preserving — same value either way.
+  const sentinelFindingStore = new SentinelFindingStore({
+    storage,
+    masterKey,
+    fortressId: fortressIdFromStoragePath(config.storage_path),
+    auditLog,
+  });
+  // Register Z-HNY-02: fire-and-forget at construction, mirroring the
+  // conciergeMemory.pruneExpired() pattern in dashboard/v1_1/wiring.ts, so
+  // the fortress-unlock cycle drops expired findings before any honeypot or
+  // sentinel activity accumulates on top of them.
+  void sentinelFindingStore.pruneExpired().catch(() => {
+    // Best-effort: a transient storage hiccup should not block boot. The
+    // next unlock re-runs the prune.
+  });
 
   // 15. Load Principal Policy and create approval gate
   let policy: PrincipalPolicy;
@@ -1019,6 +1053,12 @@ export async function createSanctuaryServer(options?: {
         reputationStore,
         policy,
         config,
+        // MUST-FIX 5 (fix-round-2): share the ONE SentinelFindingStore
+        // instance constructed above (step 14i) rather than letting
+        // `buildV11Bindings` construct its own — see that construction
+        // site's comment for why a second independent instance silently
+        // hides findings from whichever one did not receive a given write.
+        sentinelFindingStore,
         // Rho-2.5: the consent-gated Tier B redactor is installed on the
         // selector above, so the /api/query-anonymity/pii route reports
         // the truthful `effective_tier_b_enabled`.
@@ -1227,17 +1267,15 @@ export async function createSanctuaryServer(options?: {
   }
 
   // v1.3 WP-V1.3-1 Phi-1: Sentinel Baseline Pack (Castle Layer 2 anchor).
-  // Construct the per-fortress dispatcher + finding store, register the
-  // Phi-1 catalog, and re-subscribe whatever the operator opted into on
-  // a prior boot. The dispatcher's auto-tick is enabled so subscribed
-  // sentinels run periodically; tick interval is fixed at the
-  // coordinator-CTO default until per-fortress override lands. No new
-  // outbound surface; sentinels read server-local audit data only.
-  const sentinelFindingStore = new SentinelFindingStore({
-    storage,
-    masterKey,
-    fortressId: fortressIdForAggregator,
-  });
+  // Construct the per-fortress dispatcher, register the Phi-1 catalog, and
+  // re-subscribe whatever the operator opted into on a prior boot. The
+  // dispatcher's auto-tick is enabled so subscribed sentinels run
+  // periodically; tick interval is fixed at the coordinator-CTO default
+  // until per-fortress override lands. No new outbound surface; sentinels
+  // read server-local audit data only. `sentinelFindingStore` itself is
+  // constructed earlier (step 14i, MUST-FIX 5 fix-round-2) and shared with
+  // the embedded dashboard's anomaly binding — do not construct a second
+  // instance here.
   const sentinelRegistry = new SentinelRegistry();
   for (const entry of PHI1_BASELINE_CATALOG) {
     sentinelRegistry.register(entry);

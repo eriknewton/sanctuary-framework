@@ -839,9 +839,18 @@ export function deriveAuditEpochKeys(masterKey: Uint8Array): {
 const AUDIT_INTEGRITY_ALERT_NAMESPACE = "_audit_integrity_alert";
 const AUDIT_INTEGRITY_ALERT_KEY = "audit-integrity-alert.log";
 const AUDIT_WRITE_LOCK_FILE = ".audit-write.lock";
-const AUDIT_WRITE_LOCK_TIMEOUT_MS = 5_000;
+// EXPORTED (fix-round-4, MUST-FIX 1 cross-file pin): core/bounded-map.ts's
+// `ON_EVICT_AUDIT_TIMEOUT_MS` derives from this and
+// `DEFAULT_AUDIT_WRITE_LOCK_HOLD_DEADLINE_MS` below — a caller-supplied
+// `onEvict` critical audit is (almost always, see that constant's own doc)
+// a `this.appendCritical(...)` call, and its worst-case settle time is
+// bounded by these same two numbers (lock ACQUISITION timeout, then the
+// held-write's own deadline). If either of these values changes, that
+// derivation must be re-checked — see bounded-map.ts's
+// `ON_EVICT_AUDIT_TIMEOUT_MS` doc for the full reasoning.
+export const AUDIT_WRITE_LOCK_TIMEOUT_MS = 5_000;
 const AUDIT_WRITE_LOCK_RETRY_MS = 100;
-const DEFAULT_AUDIT_WRITE_LOCK_HOLD_DEADLINE_MS = 30_000;
+export const DEFAULT_AUDIT_WRITE_LOCK_HOLD_DEADLINE_MS = 30_000;
 const DEFAULT_AUDIT_SELF_HELD_STALE_LOCK_MS = 60_000;
 // Drill-found (Leg 5, MBA, 2026-07-15): a 0-byte / unparseable audit lock that
 // carries neither `pid` nor `acquired_at` cannot be proven stale by the two

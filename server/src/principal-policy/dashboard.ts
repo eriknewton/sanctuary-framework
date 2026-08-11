@@ -8524,6 +8524,13 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       return;
     }
 
+    // BOUNDED (AGENTS.md rule 8(d)): `handshakeResults` is the shared,
+    // CAPPED map from handshake/tools.ts (MAX_HANDSHAKE_RESULTS, currently
+    // 1000, itself further bounded per-origin by
+    // MAX_HANDSHAKE_RESULTS_PER_ORIGIN) — this dashboard route only ever
+    // holds a `ReadonlyMap` view (not the BoundedMap wrapper), so
+    // `boundedList()` is not reachable here, but the map's own construction
+    // already bounds this materialization to O(1000) worst case.
     const handshakes = Array.from(this.handshakeResults.values()).map(h => ({
       counterparty_id: h.counterparty_id,
       verified: h.verified,

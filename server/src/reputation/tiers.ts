@@ -184,6 +184,16 @@ export function resolveTierByDid(
       ? { sovereignty_tier: "self-attested" }
       : { sovereignty_tier: "unverified" };
   }
+  // BOUNDED (AGENTS.md rule 8(d)): `handshakeResults` is the shared,
+  // CAPPED map from handshake/tools.ts (MAX_HANDSHAKE_RESULTS, currently
+  // 1000, itself further bounded per-origin by
+  // MAX_HANDSHAKE_RESULTS_PER_ORIGIN). This scan is O(map size), which is
+  // therefore O(1000) worst case — a full iteration decoding + comparing a
+  // base64url key per entry, no KDF, no I/O — a bounded, constant cost per
+  // request rather than unbounded growth, even though there is no index
+  // from DID to instance_id to avoid it (the map is keyed by instance_id,
+  // and building a parallel DID index for a 1000-entry map is not worth
+  // the added state for the marginal lookup-cost win).
   for (const [instanceId, result] of handshakeResults) {
     try {
       const did = publicKeyToDid(fromBase64url(result.counterparty_shr.signed_by));

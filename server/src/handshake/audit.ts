@@ -51,6 +51,56 @@ export type HandshakeFailureReason =
   // rather than independent. Distinct from sameSigningKey's identical-key
   // rejection in protocol.ts — this catches two DISTINCT locally-held keys.
   | "self_vouch_local_did"
+  // CLASS-LEVEL bounded-collection guard (register LD2-03): the shared
+  // `handshakeResults` map is capped (MAX_HANDSHAKE_RESULTS); an insert for
+  // a NEW counterparty is refused, never allowed to evict a currently-live
+  // verified && liveness_proven && unexpired entry, when every existing
+  // slot already holds one. This fails closed to "cannot record this
+  // handshake" rather than silently flushing an established peer's trust
+  // state.
+  | "handshake_results_saturated"
+  // CLASS-LEVEL per-origin quota guard (AGENTS.md rule 8 RECHECK): the
+  // LOCAL identity recording this result has already reached
+  // MAX_HANDSHAKE_RESULTS_PER_ORIGIN entries of its own. Distinct from
+  // `handshake_results_saturated` (the whole shared map is full) — this
+  // fires well before that, and refusing here is what guarantees one
+  // identity's flood can never touch another identity's share of the map.
+  | "handshake_results_origin_quota_exceeded"
+  // CLASS-LEVEL bounded-collection guard for `sessions` (AGENTS.md rule 8
+  // RECHECK): the shared session store is at MAX_HANDSHAKE_SESSIONS and
+  // every remaining slot's origin quota check declined to evict (should
+  // not occur in practice — the sessions eviction policy is unconditional
+  // oldest-evict once past the per-origin check — but the store fails
+  // closed here rather than silently dropping the new session if it ever
+  // does).
+  | "handshake_session_store_saturated"
+  // The LOCAL identity starting/responding to this handshake has already
+  // reached MAX_HANDSHAKE_SESSIONS_PER_ORIGIN in-flight sessions of its
+  // own; refused before it could evict a DIFFERENT identity's session.
+  | "handshake_session_origin_quota_exceeded"
+  // DISTINCT from `handshake_results_saturated` (MUST-FIX 3, fix-round-3):
+  // the shared `handshakeResults` map WAS at its global cap and DID pick a
+  // victim to evict, but the eviction's critical audit write never
+  // durably confirmed (rejected, or timed out — see
+  // core/bounded-map.ts's `BoundedMapRefuseReason` doc) — the map is not
+  // genuinely full of unevictable entries, the AUDIT TRAIL is what is
+  // unavailable, and an operator diagnosing the refusal needs to be able
+  // to tell those two apart.
+  | "handshake_results_audit_unavailable"
+  // Same distinction as above, for `sessions`'s eviction audit.
+  | "handshake_session_audit_unavailable"
+  // ADMISSION-WAITER CAP (AGENTS.md rule 8, fix-round-6 — see
+  // core/bounded-map.ts's `BoundedMapRefuseReason` doc): `handshakeResults`'s
+  // admission-lock WAITER queue was already at its own cap when this call
+  // arrived. Distinct from every reason above: this call never even reached
+  // the origin-quota/capacity/audit checks, because
+  // `MAX_PENDING_ADMISSION_WAITERS` other admissions were already queued —
+  // a "the map's serialization primitive is momentarily saturated, retry
+  // shortly" signal, not a statement about `handshakeResults`'s own
+  // contents.
+  | "handshake_results_admission_busy"
+  // Same distinction as above, for `sessions`'s own admission-waiter queue.
+  | "handshake_session_admission_busy"
   | "other";
 
 /** Reasons a handshake may be aborted (operator or transport). */

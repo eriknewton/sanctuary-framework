@@ -12,6 +12,7 @@ import type { ToolDefinition } from "../router.js";
 import { toolResult } from "../router.js";
 import type { AuditLog } from "../operational/audit-log.js";
 import type { HandshakeResult } from "../handshake/types.js";
+import { AGENT_UNKNOWN_ORIGIN } from "../handshake/tools.js";
 import type { IdentityManager } from "../cognitive/tools.js";
 import { publicKeyToDid, isLocallyHeldPublicKey } from "../core/identity.js";
 import { fromBase64url } from "../core/encoding.js";
@@ -28,9 +29,36 @@ export function createFederationTools(
   // defense-in-depth, not the only layer, but it must never be inert.
   // Production wiring (index.ts) always supplies it; every test construction
   // must too (a test that omits it is testing a bypass, not a real config).
-  identityManager: IdentityManager
+  identityManager: IdentityManager,
+  // REQUIRED (AGENTS.md rule 3, MUST-FIX 2 RECHECK: an optional dependency
+  // that gates a per-origin quota — a security property under rule 8 — must
+  // be required, never silently-disabling). Fix-round-1 made this optional
+  // on the theory that it "only" fed a DoS quota, not a trust decision; the
+  // gate found that reasoning wrong for THIS quota specifically, because
+  // the quota origin is the un-mintable agent-session principal (MUST-FIX
+  // 1's spine) — omitting the map does not just lose fairness accounting,
+  // it silently reopens the exact cross-session lockout MUST-FIX 1 closes
+  // (an attacker whose registrations carry no origin attribution floods the
+  // shared registry unbounded by any per-session quota).
+  //
+  // THE WRITER map, not the allocation map (MUST-FIX 2, fix-round-3):
+  // production wiring (index.ts) supplies `createHandshakeTools`'s
+  // `handshakeResultWriterOrigins` here — NOT its `handshakeResultOrigins`
+  // (that one is `handshakeResults`'s own BoundedMap-internal, immutable,
+  // first-writer accounting; see both fields' docs in handshake/tools.ts).
+  // Charging registration to the FIRST previewer of a counterparty rather
+  // than the session whose REAL verified handshake produced the result
+  // being registered lets an attacker who has exhausted their own quota
+  // with cheap unverified pre-previews deny an unrelated victim's later,
+  // legitimate registration for the SAME counterparty (their pre-preview
+  // permanently "claims" that counterparty_id's allocation origin; the
+  // victim's real handshake is an UPDATE, which never reattributes it).
+  // Every test construction must supply a real (or intentionally empty,
+  // for tests that don't exercise per-origin fairness) map here too — a
+  // test that omits it is testing a bypass, not a real config.
+  handshakeResultWriterOrigins: ReadonlyMap<string, string>
 ): { tools: ToolDefinition[]; registry: FederationRegistry } {
-  const registry = new FederationRegistry();
+  const registry = new FederationRegistry(auditLog);
 
   const tools: ToolDefinition[] = [
     // ─── Peer Management ──────────────────────────────────────────────
@@ -194,7 +222,105 @@ export function createFederationTools(
               });
             }
 
-            const peer = registry.registerFromHandshake(hsResult, peerDid);
+            // Per-origin quota (register LD2-04, MUST-FIX 1/2 RECHECK, split
+            // fix-round-3): attribute this registration to the AGENT-SESSION
+            // PRINCIPAL that recorded the VERIFIED handshake result CURRENTLY
+            // stored for this peer (`handshakeResultWriterOrigins`, see that
+            // map's doc in handshake/tools.ts — deliberately NOT
+            // `handshakeResults`'s own first-writer allocation origin; using
+            // that one here was itself the MUST-FIX 2 fix-round-3 defect: an
+            // attacker's cheap unverified pre-preview of a victim's
+            // counterparty permanently claims the allocation origin, and the
+            // victim's later real handshake (an update) never displaces it),
+            // so a flood of attacker-completed handshakes — even spread
+            // across many MINTED local identities — cannot exhaust the
+            // shared registry and lock out a DIFFERENT session's
+            // registration. `handshakeResultWriterOrigins` is REQUIRED
+            // (MUST-FIX 2) precisely so this line can never silently fall
+            // back to "no origin, skip the quota"; a peerId genuinely absent
+            // from the map (should not happen — every `recordHandshakeResult`
+            // write supplies an origin) still falls into the shared
+            // `AGENT_UNKNOWN_ORIGIN` bucket rather than escaping accounting.
+            const origin = handshakeResultWriterOrigins.get(peerId) ?? AGENT_UNKNOWN_ORIGIN;
+            const registration = await registry.registerFromHandshake(
+              hsResult,
+              peerDid,
+              undefined,
+              origin
+            );
+
+            // Bounded-collection guard (register LD2-04): the registry
+            // refuses a new peer for one of FOUR typed reasons (MUST-FIX 2,
+            // fix-round-4 — widened from a bare null/non-null result so the
+            // AGENT-facing tool response is as accurate as the operator audit
+            // trail already was via `onRefuse`, registry.ts): THIS identity's
+            // own per-origin quota is exhausted (`origin_quota`), the shared
+            // registry is at capacity and every existing slot holds a
+            // currently-active peer (`capacity`), a capacity eviction was
+            // decided but its durable audit write did not complete
+            // (`audit_unavailable` — distinct from `capacity` because a
+            // retry once the audit trail recovers should not be told "full"),
+            // or the registry's own admission-lock waiter queue was already
+            // at its cap (`admission_busy`, fix-round-6 — see
+            // core/bounded-map.ts's `BoundedMapRefuseReason` doc). Either way
+            // the registry never evicts a real trusted peer to make room.
+            // Surface this as an explicit error, never a silently-dropped
+            // "registered: true".
+            if (!registration.ok) {
+              // MUST-FIX 3, fix-round-5 (Codex): both messages below were
+              // inaccurate about the underlying condition. (1) `origin_quota`
+              // counts entries currently attributed to this origin, checked
+              // BEFORE the capacity/eviction path ever runs (see
+              // bounded-map.ts's `admitNewKey`) — an expired peer entry is
+              // NOT deleted by expiry alone (only `getPeer`/`listPeers`
+              // lazily flip `active`/`trust_tier` in place; `removePeer` or
+              // a global-capacity eviction of THAT entry are the only things
+              // that ever delete it), so "let an inactive peer expire"
+              // never actually frees this quota — only an explicit
+              // `action: "remove"` does. (2) `audit_unavailable` can only be
+              // reached from INSIDE the capacity branch (`this.map.size >=
+              // this.opts.maxSize`, bounded-map.ts) — the registry WAS at
+              // capacity and an eviction WAS decided; it is a distinct
+              // reason for the SAME "at capacity" condition, not a separate
+              // "not full" one, so the two are never mutually exclusive.
+              // (3) `admission_busy` (fix-round-6) is checked BEFORE
+              // `origin_quota`/`capacity` ever run at all (bounded-map.ts's
+              // `set()`) — it must not collapse into the `capacity` message
+              // below, which would wrongly tell the agent "every peer is
+              // active" for what is really "retry shortly."
+              const error =
+                registration.reason === "origin_quota"
+                  ? "This identity has reached its federation peer " +
+                    `registration quota (${registry.maxPeersPerOrigin()} peers). ` +
+                    "A peer's registration continues to count against this " +
+                    "quota even after its handshake expires; explicitly " +
+                    "remove an existing peer (federation_peers action: " +
+                    "\"remove\") to free a slot before registering another."
+                  : registration.reason === "audit_unavailable"
+                    // "failed or did not complete in time" (fix-round-7):
+                    // bounded-map.ts's catch around the awaited onEvict
+                    // covers BOTH an immediate rejection and a timeout —
+                    // "did not complete in time" alone described only the
+                    // second. Must match the handshake wording
+                    // (SESSIONS_AUDIT_UNAVAILABLE_ERROR, handshake/tools.ts).
+                    ? "Federation peer registry is at capacity and needed " +
+                      "to evict an inactive peer to register this one, but " +
+                      "the durable audit write for that eviction failed or " +
+                      "did not complete in time; this is an audit-log " +
+                      "availability issue, not a genuine \"every peer is " +
+                      "active\" saturation. Retry once the audit log " +
+                      "recovers."
+                    : registration.reason === "admission_busy"
+                      ? "Federation peer registry's admission queue is " +
+                        "momentarily saturated with other concurrent peer " +
+                        "registrations; retry shortly."
+                      : "Federation peer registry is at capacity and every " +
+                        "slot holds an active peer; cannot register a new " +
+                        "peer until one expires, is removed, or one becomes " +
+                        "inactive.";
+              return toolResult({ error });
+            }
+            const peer = registration.peer;
 
             void auditLog.append("l4", "federation_peer_register", "system", {
               peer_id: peerId,
