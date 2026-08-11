@@ -142,6 +142,19 @@ export interface ExitEncryptedStateSummary {
    * missing empty-marker for it would name the wrong defect.
    */
   empty_reason_missing: boolean;
+  /**
+   * EXIT-STRUCT-02, one level deeper than `entry_count === null`: true IFF
+   * `entries` is a READABLE array (`entry_count !== null`) but contains at
+   * least one element that fails {@link isWellFormedExitStateEntryElement} -
+   * e.g. `null`, or missing/wrong-typed `namespace`/`entry`/`entry.kid`/
+   * `entry.payload.ct`/`entry.sig`. Always `false` when `entry_count` is
+   * `null`: that is the separate, already-covered LD2-01 case. A correctly
+   * hashed and signed artifact can pass the container check this field's
+   * sibling watches and still crash import at its first per-element
+   * dereference; this field is what lets the aggregator catch that before
+   * import ever runs.
+   */
+  entries_malformed: boolean;
   legacy_kdf_params: "absent" | "valid" | "malformed";
   /**
    * The same three-state read of `source_custody` the import gate performs.
@@ -346,6 +359,45 @@ function findPrivateMaterial(value: unknown, path = "$"): string[] {
 }
 
 /**
+ * True IFF `item` has the exact minimal shape import's state-rekey path
+ * dereferences BEFORE any other validation runs: an object with string
+ * `namespace` and `key`, and an `entry` object carrying string `kid` and
+ * `sig`, plus a `payload` object carrying string `ct`
+ * (server/src/exit/bundle.ts `compromisedRetiredSignatureUse`,
+ * `conflictReport`, `activationSnapshotLocations`, `rekeyState`, all of
+ * which read `item.namespace`/`item.key`/`item.entry.kid`/
+ * `item.entry.payload.ct`/`item.entry.sig` unconditionally at the top of
+ * their loop body). Deliberately NOT the full `StateEntry` shape
+ * (server/src/cognitive/state-store.ts) - a value that passes this check can
+ * still fail AEAD decryption or signature verification later; those are
+ * import's OWN job. This predicate exists only to close the gap between
+ * "the container is a readable array" (LD2-01) and "every element in it is
+ * safe to dereference the way import's first pass does" (EXIT-STRUCT-02),
+ * one level deeper.
+ *
+ * CONTRACT PIN (server/src/exit/bundle.ts): the encrypted-state entries
+ * guards in `resolveSourceMasterKey` and `importExitBundle` both call this
+ * SAME function on every element, so "malformed" here means exactly what
+ * makes import throw - a hand-mirrored second check was the whack-a-mole
+ * shape AGENTS.md rule 5 rules out.
+ */
+export function isWellFormedExitStateEntryElement(item: unknown): boolean {
+  if (item === null || typeof item !== "object") return false;
+  const record = item as Record<string, unknown>;
+  if (typeof record.namespace !== "string") return false;
+  if (typeof record.key !== "string") return false;
+  const entry = record.entry;
+  if (entry === null || typeof entry !== "object") return false;
+  const entryRecord = entry as Record<string, unknown>;
+  if (typeof entryRecord.kid !== "string") return false;
+  if (typeof entryRecord.sig !== "string") return false;
+  const payload = entryRecord.payload;
+  if (payload === null || typeof payload !== "object") return false;
+  if (typeof (payload as Record<string, unknown>).ct !== "string") return false;
+  return true;
+}
+
+/**
  * Summarize a parsed `artifacts/encrypted_state.json`. Pure, total, and
  * defensive: every field is narrowed from `unknown`, so a hand-crafted or
  * truncated artifact yields a conservative summary rather than throwing.
@@ -369,6 +421,19 @@ export function summarizeEncryptedState(
   const entries: unknown[] | null = Array.isArray(record.entries)
     ? record.entries
     : null;
+  // INVARIANT (EXIT-STRUCT-02, one level deeper than the LD2-01 check above):
+  // `entries` being a non-null array only proves the CONTAINER is readable.
+  // A `null` element, or one missing/wrong-typed `namespace`/`entry`/
+  // `entry.kid`/`entry.payload.ct`/`entry.sig`, passes that container check
+  // and then throws a raw TypeError at import's first per-element
+  // dereference (`compromisedRetiredSignatureUse` in bundle.ts). Checked
+  // with the SAME predicate import's own container guards use
+  // (`isWellFormedExitStateEntryElement` above), so "malformed" here means
+  // exactly what makes import throw. `entries === null` short-circuits this
+  // to `false`: an unreadable container is the already-covered LD2-01 case,
+  // not this one.
+  const entriesMalformed =
+    entries !== null && entries.some((item) => !isWellFormedExitStateEntryElement(item));
   const namespaces = Array.isArray(record.namespaces)
     ? record.namespaces.filter((n): n is string => typeof n === "string")
     : [];
@@ -418,6 +483,7 @@ export function summarizeEncryptedState(
     ownership_partitioned: record.ownership_partitioned === true,
     ...(emptyReason !== undefined ? { empty_reason: emptyReason } : {}),
     empty_reason_missing: entries?.length === 0 && emptyReason === undefined,
+    entries_malformed: entriesMalformed,
     legacy_kdf_params: legacyKdfParams,
     source_custody: sourceCustody,
     declared_rekey_material: declared,
@@ -435,16 +501,30 @@ export function summarizeEncryptedState(
  * (`SOURCE_CUSTODY_MALFORMED` / `SOURCE_KDF_PARAMS_MALFORMED`), never a
  * crash, and `test/exit/exit-credential-path.test.ts` pins that PASS
  * deliberately. `entry_count === null` is the one signal both verify and
- * import agree names an artifact whose own contents cannot be read at all
- * (LD2-01), so this type is keyed on that field alone.
+ * import agree names an artifact whose own contents cannot be read AT ALL
+ * (LD2-01), so this type is keyed on that field first.
+ *
+ * `entries_malformed_elements` (EXIT-STRUCT-02) is the one-level-deeper
+ * sibling: the container IS readable (`entry_count !== null`) but at least
+ * one ELEMENT in it is not - `entries: [null]`, or an element missing
+ * `namespace`/`entry`/`entry.kid`/`entry.payload.ct`/`entry.sig`. This is
+ * NOT the credential-exempt case above: a malformed element is damage to
+ * the artifact itself, exactly like an unreadable container, and import
+ * throws a raw TypeError on it at the same dereference LD2-01 fixed for the
+ * container case, one property access deeper.
  */
-export type EncryptedStateStructuralHealth = "readable" | "entries_unreadable";
+export type EncryptedStateStructuralHealth =
+  | "readable"
+  | "entries_unreadable"
+  | "entries_malformed_elements";
 
 function classifyEncryptedStateStructuralHealth(
   state: ExitEncryptedStateSummary | undefined
 ): EncryptedStateStructuralHealth | undefined {
   if (state === undefined) return undefined;
-  return state.entry_count === null ? "entries_unreadable" : "readable";
+  if (state.entry_count === null) return "entries_unreadable";
+  if (state.entries_malformed) return "entries_malformed_elements";
+  return "readable";
 }
 
 /**
@@ -473,6 +553,7 @@ export function encryptedStateSubVerdictFailed(
     case "readable":
       return false;
     case "entries_unreadable":
+    case "entries_malformed_elements":
       return true;
     default: {
       // Fail closed. Exhaustiveness over the DECLARED union is enforced at
@@ -969,6 +1050,15 @@ export async function verifyExitBundle(
         "bundle - re-export from the source fortress"
     );
   }
+  if (stateSummary?.entries_malformed === true) {
+    warnings.push(
+      "encrypted state entries list is readable but contains a malformed " +
+        "entry (missing or wrong-typed namespace/key/entry fields): this " +
+        "artifact is signed and hash-verified but structurally damaged one " +
+        "level deeper than an unreadable list, and import would refuse it " +
+        "rather than skip it - re-export from the source fortress"
+    );
+  }
   if (stateSummary?.empty_reason_missing === true) {
     warnings.push(
       "encrypted state carries zero entries and no empty_reason marker: " +
@@ -998,10 +1088,12 @@ export async function verifyExitBundle(
     );
   }
 
-  // CLASS-LEVEL AGGREGATOR INPUT (LD2-01): the encrypted_state artifact's
-  // structural read-health, computed once here so the sub-verdict below and
-  // any future consumer share the same classification rather than each
-  // re-deriving `entry_count === null`.
+  // CLASS-LEVEL AGGREGATOR INPUT (LD2-01, extended by EXIT-STRUCT-02 for
+  // per-element damage): the encrypted_state artifact's structural
+  // read-health, computed once here so the sub-verdict below and any future
+  // consumer share the same classification rather than each re-deriving
+  // `entry_count === null` (container) or the per-element shape check
+  // (`entries_malformed`) separately.
   const encryptedStateHealth = classifyEncryptedStateStructuralHealth(stateSummary);
 
   const publicKeysByDid = new Map<string, Uint8Array>();
