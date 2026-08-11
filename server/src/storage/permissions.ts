@@ -100,6 +100,16 @@ async function tightenEntry(path: string): Promise<void> {
  * would abort an otherwise-healthy startup; WITH a bare swallow, an EPERM
  * (cannot tighten a real mispermissioned entry) would be masked. Only ENOENT
  * is benign — see isBenignMissing.
+ *
+ * ACCEPTED RESIDUAL (LD3 gate): if an entry is deleted after `stat` and then
+ * RE-CREATED permissive before the one-shot boot walk finishes, its ENOENT here
+ * reads as benign and the recreated entry is not tightened this boot (it is on
+ * the next). This is a narrow boot-time TOCTOU that requires an attacker who
+ * ALREADY has write access to ~/.sanctuary (who could simply create permissive
+ * files that this walk tightens on the next boot), and the at-rest data stays
+ * encrypted regardless — the mode is defense-in-depth, not the confidentiality
+ * boundary. Closing it fully needs fd-stable operations (openat + fchmod), a
+ * disproportionate rewrite for this exposure; tracked as a disclosed residual.
  */
 async function tightenMode(path: string, mode: number): Promise<void> {
   try {
