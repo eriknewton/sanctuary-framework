@@ -305,7 +305,13 @@ export interface ExitBundleVerifierResult {
     | "reputation_unverifiable_attestations"
     // The encrypted_state artifact passed its own hash and manifest-
     // signature checks, but its internal entries list could not be read in
-    // the expected shape. Distinct from `"damaged"` in
+    // the expected shape — either the CONTAINER (`entries` missing or not
+    // an array, LD2-01) or, one level deeper, an ELEMENT inside it
+    // (`entries: [null]`, or an element missing `namespace`/`entry`/
+    // `entry.kid`/`entry.payload.ct`/`entry.sig`, EXIT-STRUCT-02). Both
+    // share this one failure_class: from an operator's perspective both are
+    // "the entries list could not be read in the expected shape". Distinct
+    // from `"damaged"` in
     // `ExitBundleDeclaredRekeyMaterial` (server/src/exit/verifier.ts), which
     // covers a bundle whose entries ARE readable but whose re-key material
     // is malformed — that case stays verify-PASS by design and fails import

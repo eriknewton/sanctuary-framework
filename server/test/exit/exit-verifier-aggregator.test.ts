@@ -928,16 +928,205 @@ describe("exit verify/import parity aggregator (LD2-01 class fix)", () => {
     );
   });
 
+  // ---- EXIT-STRUCT-02: malformed ELEMENT, one level deeper than LD2-01's
+  // ---- unreadable CONTAINER. Same failure_class
+  // ---- (encrypted_state_entries_unreadable), same named import error
+  // ---- (ENCRYPTED_STATE_ENTRIES_UNREADABLE) - a correctly hashed and
+  // ---- source-signed artifact whose `entries` array itself is readable but
+  // ---- whose contents are not.
+
+  it("EXIT-STRUCT-02: a null entries element fails verify closed, and import refuses with a NAMED error, never a crash", async () => {
+    const source = await makeSource("aggregator-struct02-null-source");
+    const bundleDir = await newBundleDir();
+    await exportBundle(source, bundleDir, { mint: true });
+    await patchEncryptedStateAndResign(bundleDir, source, (artifact) => {
+      // The container stays a readable, non-empty array - only the
+      // ELEMENT is damaged. `entry_count` still reads 1, so this is NOT
+      // the LD2-01 (`entries` missing/non-array) case.
+      artifact.entries = [null];
+    });
+    const destination = await makeDestination();
+
+    await assertVerifyImportInvariant(
+      bundleDir,
+      false,
+      "encrypted_state_entries_unreadable",
+      () =>
+        importExitBundle({
+          bundleDir,
+          storage: destination.storage,
+          masterKey: destination.masterKey,
+          identityManager: destination.identityManager,
+          auditLog: destination.auditLog,
+          reputationStore: destination.reputationStore,
+          activate: true,
+          forceRebind: true,
+          sourceMasterKey: source.masterKey,
+          destinationSignerIdentityId: destination.identityId,
+        }),
+      { kind: "throws", code: "ENCRYPTED_STATE_ENTRIES_UNREADABLE", reason: "structural" }
+    );
+  });
+
+  it("EXIT-STRUCT-02: an entries element missing `namespace` fails verify closed, and import refuses with a NAMED error, never a crash", async () => {
+    const source = await makeSource("aggregator-struct02-namespace-source");
+    const bundleDir = await newBundleDir();
+    await exportBundle(source, bundleDir, { mint: true });
+    await patchEncryptedStateAndResign(bundleDir, source, (artifact) => {
+      const entries = artifact.entries as Array<Record<string, unknown>>;
+      // `compromisedRetiredSignatureUse` (bundle.ts) dereferences
+      // `item.namespace.startsWith(...)` on every entry before any other
+      // check runs - a missing `namespace` throws there first.
+      const { namespace: _namespace, ...withoutNamespace } = entries[0]!;
+      artifact.entries = [withoutNamespace];
+    });
+    const destination = await makeDestination();
+
+    await assertVerifyImportInvariant(
+      bundleDir,
+      false,
+      "encrypted_state_entries_unreadable",
+      () =>
+        importExitBundle({
+          bundleDir,
+          storage: destination.storage,
+          masterKey: destination.masterKey,
+          identityManager: destination.identityManager,
+          auditLog: destination.auditLog,
+          reputationStore: destination.reputationStore,
+          activate: true,
+          forceRebind: true,
+          sourceMasterKey: source.masterKey,
+          destinationSignerIdentityId: destination.identityId,
+        }),
+      { kind: "throws", code: "ENCRYPTED_STATE_ENTRIES_UNREADABLE", reason: "structural" }
+    );
+  });
+
+  it("EXIT-STRUCT-02: an entries element missing `entry.sig` fails verify closed, and import refuses with a NAMED error, never a crash", async () => {
+    const source = await makeSource("aggregator-struct02-entrysig-source");
+    const bundleDir = await newBundleDir();
+    await exportBundle(source, bundleDir, { mint: true });
+    await patchEncryptedStateAndResign(bundleDir, source, (artifact) => {
+      const entries = artifact.entries as Array<Record<string, unknown>>;
+      const original = entries[0]! as { entry: Record<string, unknown> };
+      const { sig: _sig, ...entryWithoutSig } = original.entry;
+      artifact.entries = [{ ...entries[0], entry: entryWithoutSig }];
+    });
+    const destination = await makeDestination();
+
+    await assertVerifyImportInvariant(
+      bundleDir,
+      false,
+      "encrypted_state_entries_unreadable",
+      () =>
+        importExitBundle({
+          bundleDir,
+          storage: destination.storage,
+          masterKey: destination.masterKey,
+          identityManager: destination.identityManager,
+          auditLog: destination.auditLog,
+          reputationStore: destination.reputationStore,
+          activate: true,
+          forceRebind: true,
+          sourceMasterKey: source.masterKey,
+          destinationSignerIdentityId: destination.identityId,
+        }),
+      { kind: "throws", code: "ENCRYPTED_STATE_ENTRIES_UNREADABLE", reason: "structural" }
+    );
+  });
+
+  it("EXIT-STRUCT-02 fix-round: an entries element missing `entry.metadata` fails verify closed, and import refuses with a NAMED error, never a crash", async () => {
+    const source = await makeSource("aggregator-struct02-metadata-source");
+    const bundleDir = await newBundleDir();
+    await exportBundle(source, bundleDir, { mint: true });
+    await patchEncryptedStateAndResign(bundleDir, source, (artifact) => {
+      const entries = artifact.entries as Array<Record<string, unknown>>;
+      // `rekeyState` (bundle.ts write site) reads `entry.metadata.content_type`
+      // AFTER decrypt + integrity-hash pass. `metadata` is covered by NEITHER
+      // the signature (over payload.ct) NOR the integrity_hash (over plaintext),
+      // so this element re-signs cleanly and decrypts, then throws on the
+      // metadata deref unless verify fails it closed first.
+      const entry = entries[0]!.entry as Record<string, unknown>;
+      const { metadata: _metadata, ...entryWithoutMetadata } = entry;
+      artifact.entries = [{ ...entries[0]!, entry: entryWithoutMetadata }];
+    });
+    const destination = await makeDestination();
+
+    await assertVerifyImportInvariant(
+      bundleDir,
+      false,
+      "encrypted_state_entries_unreadable",
+      () =>
+        importExitBundle({
+          bundleDir,
+          storage: destination.storage,
+          masterKey: destination.masterKey,
+          identityManager: destination.identityManager,
+          auditLog: destination.auditLog,
+          reputationStore: destination.reputationStore,
+          activate: true,
+          forceRebind: true,
+          sourceMasterKey: source.masterKey,
+          destinationSignerIdentityId: destination.identityId,
+        }),
+      { kind: "throws", code: "ENCRYPTED_STATE_ENTRIES_UNREADABLE", reason: "structural" }
+    );
+  });
+
+  it("EXIT-STRUCT-02 fix-round: an entries element whose `entry.metadata.tags` is a non-array fails verify closed (the `...tags` spread would otherwise throw)", async () => {
+    const source = await makeSource("aggregator-struct02-tags-source");
+    const bundleDir = await newBundleDir();
+    await exportBundle(source, bundleDir, { mint: true });
+    await patchEncryptedStateAndResign(bundleDir, source, (artifact) => {
+      const entries = artifact.entries as Array<Record<string, unknown>>;
+      const entry = entries[0]!.entry as Record<string, unknown>;
+      const metadata = { ...(entry.metadata as Record<string, unknown>), tags: "not-an-array" };
+      artifact.entries = [{ ...entries[0]!, entry: { ...entry, metadata } }];
+    });
+    const destination = await makeDestination();
+
+    await assertVerifyImportInvariant(
+      bundleDir,
+      false,
+      "encrypted_state_entries_unreadable",
+      () =>
+        importExitBundle({
+          bundleDir,
+          storage: destination.storage,
+          masterKey: destination.masterKey,
+          identityManager: destination.identityManager,
+          auditLog: destination.auditLog,
+          reputationStore: destination.reputationStore,
+          activate: true,
+          forceRebind: true,
+          sourceMasterKey: source.masterKey,
+          destinationSignerIdentityId: destination.identityId,
+        }),
+      { kind: "throws", code: "ENCRYPTED_STATE_ENTRIES_UNREADABLE", reason: "structural" }
+    );
+  });
+
   // ---- Artifact 1's OTHER mutation-provable half: the fail-closed default ---
+
+  it("EXIT-STRUCT-02: `entries_malformed_elements` fails closed directly at the aggregator function", () => {
+    // Unit-level pin, independent of the end-to-end rows above: drives the
+    // health value `classifyEncryptedStateStructuralHealth` now returns for a
+    // malformed-element artifact straight through `encryptedStateSubVerdictFailed`
+    // and asserts it fails closed, the same way the pre-existing
+    // "entries_unreadable" case is pinned.
+    expect(encryptedStateSubVerdictFailed("entries_malformed_elements")).toBe(true);
+  });
 
   it("fails closed on a structural-health value the switch does not recognize (mutation-provable guard)", () => {
     // No legitimate TS caller can construct this today - the
     // `EncryptedStateStructuralHealth` union is closed to "readable" |
-    // "entries_unreadable" - but this cast is exactly the shape a FUTURE
-    // third health value would take if `classifyEncryptedStateStructuralHealth`
-    // grew a new case without a matching one in `encryptedStateSubVerdictFailed`.
-    // Reverting that function's default arm from `return true` to
-    // `return false` (the fail-open mutation) makes this assertion fail.
+    // "entries_unreadable" | "entries_malformed_elements" - but this cast is
+    // exactly the shape a FUTURE fourth health value would take if
+    // `classifyEncryptedStateStructuralHealth` grew a new case without a
+    // matching one in `encryptedStateSubVerdictFailed`. Reverting that
+    // function's default arm from `return true` to `return false` (the
+    // fail-open mutation) makes this assertion fail.
     const outOfUnionHealth = "a-future-health-value-nobody-wired-up" as unknown as Parameters<
       typeof encryptedStateSubVerdictFailed
     >[0];
