@@ -390,6 +390,76 @@ describe("Federation P1 — pre-session node-cert-authenticated /sync/peer", { r
     );
   });
 
+  // ── LD3 FED-REISSUE-DOS-01: the node-cert-auth CLASS PREDICATE, not a
+  // literal path, drives the rate class + ceiling ─────────────────────
+  it("applies the SAME federation_peer concurrent-verify ceiling to /rotate/reissue-node-cert, not just /sync/peer", async () => {
+    // Before the fix, the rate-limit class match in dashboard.ts was the
+    // literal string "/v1/federation/sync/peer", so /rotate/reissue-node-cert
+    // (also in the isFederationNodeCertAuthPath pre-session class per the
+    // predicate test above) fell through to the loopback-exempt, uncapped
+    // "general" class: driving inFlightPeerVerify to the ceiling had NO effect
+    // on it, and it kept returning 200 challenges. This asserts the ceiling now
+    // applies to reissue too, deterministically (the ceiling check runs before
+    // any body parsing, so the request body/action content does not matter).
+    const internals = linux1.dashboard as unknown as { inFlightPeerVerify: number };
+    const saved = internals.inFlightPeerVerify;
+    internals.inFlightPeerVerify = 16; // MAX_CONCURRENT_PEER_VERIFY
+    let res: Response;
+    try {
+      res = await fetch(`${linux1.baseUrl}/v1/federation/rotate/reissue-node-cert`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "challenge", node_id: "linux-1" }),
+      });
+    } finally {
+      internals.inFlightPeerVerify = saved;
+    }
+    expect(res.status).toBe(403);
+    expect(res.headers.get("cache-control")).toBe("no-store");
+
+    // The reissue route's OWN handler attaches an opaque `request_id` to every
+    // denial it emits (F-FED-OPAQUEDENY, v1/http.ts denyForbiddenWithRequestId).
+    // A pre-handler ceiling rejection at the SAME 403 status that omitted the
+    // field would itself be a wire-distinguishable shape versus every other
+    // denial this route returns, so it must carry one too — unlike sync/peer's
+    // ceiling rejection (asserted plain two-key {error:"forbidden"} above),
+    // this route's shape is exactly {error, request_id}.
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(Object.keys(body).sort()).toEqual(["error", "request_id"]);
+    expect(body.error).toBe("forbidden");
+    expect(String(body.request_id)).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
+    );
+  });
+
+  it("throttles a loopback flood on /rotate/reissue-node-cert with the tighter federation_peer budget (60/min), not the 120/min general budget", async () => {
+    // Confirms the RATE-LIMIT CLASS (not just the concurrency ceiling) moved:
+    // before the fix this route shared the "general" bucket (120/min,
+    // loopback-exempt) with every other unclassified /v1 route, so it would
+    // never throttle within 61 requests. After the fix it shares
+    // "federation_peer" (60/min, no loopback exemption) with /sync/peer.
+    let sawThrottle = false;
+    let firstThrottleIndex = -1;
+    for (let i = 0; i < 80; i++) {
+      const res = await fetch(`${linux1.baseUrl}/v1/federation/rotate/reissue-node-cert`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "challenge", node_id: `flood-${i}` }),
+      });
+      if (res.status === 429) {
+        sawThrottle = true;
+        firstThrottleIndex = i;
+        await res.json();
+        break;
+      }
+      expect(res.status).toBe(200);
+      await res.json();
+    }
+    expect(sawThrottle).toBe(true);
+    expect(firstThrottleIndex).toBeGreaterThanOrEqual(60);
+    expect(firstThrottleIndex).toBeLessThan(120);
+  });
+
   // ── Merge-bar 3: no membership oracle ───────────────────────────────
   it("returns an indistinguishable response for disabled, unprovisioned, and bad-envelope", async () => {
     // (a) federation disabled (provisioned-but-off).
