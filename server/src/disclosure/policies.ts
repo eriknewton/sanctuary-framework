@@ -142,16 +142,41 @@ export type PolicyValidationResult =
  * unexpected own property can never survive into what `create`/`update`
  * persist, whatever validation upstream did or skipped. Called from
  * `create()` and `update()` — both are write paths that reach `persist()`.
+ *
+ * DEEPENED (LD3 gate fix-round-2 MUST-FIX 2): the reconstruction above was
+ * only SHALLOW — `context` was copied by reference and `[...rule.disclose]`
+ * etc. copy the ARRAY but not its elements, so a nested object inside an
+ * element (`disclose: [{ junk: "A".repeat(5_000_000) }]`) still reached
+ * `persist()` verbatim when a caller reached `PolicyStore` directly,
+ * bypassing `validatePolicyInput`'s own element-type check. The MCP-facing
+ * `disclosure_set_policy` handler always calls `validatePolicyInput` first
+ * (tools.ts), which DOES reject a non-string element — so this is
+ * defense-in-depth for the storage boundary itself (a future non-MCP
+ * caller, or a direct `PolicyStore` call as in this file's own tests),
+ * not the primary gate. `sanitizeStringArray` below drops (never
+ * stringifies) a non-string element so no attacker-controlled object
+ * shape is ever serialized into storage.
  */
 function sanitizeRules(rules: DisclosureRule[]): DisclosureRule[] {
   return rules.map((rule) => ({
-    context: rule.context,
-    disclose: Array.isArray(rule.disclose) ? [...rule.disclose] : [],
-    withhold: Array.isArray(rule.withhold) ? [...rule.withhold] : [],
-    proof_required: Array.isArray(rule.proof_required)
-      ? [...rule.proof_required]
-      : [],
+    context: typeof rule.context === "string" ? rule.context : "",
+    disclose: sanitizeStringArray(rule.disclose),
+    withhold: sanitizeStringArray(rule.withhold),
+    proof_required: sanitizeStringArray(rule.proof_required),
   }));
+}
+
+/**
+ * Reduce a value to an array of only its STRING elements (LD3 gate
+ * fix-round-2 MUST-FIX 2, `sanitizeRules`'s helper). A non-array input
+ * becomes `[]`; a non-string element is DROPPED rather than coerced —
+ * coercing (e.g. `String(item)`) would still serialize an attacker-chosen
+ * object's shape (via its `toString`) into storage, which is exactly the
+ * smuggling path this function exists to close.
+ */
+function sanitizeStringArray(list: unknown): string[] {
+  if (!Array.isArray(list)) return [];
+  return list.filter((item): item is string => typeof item === "string");
 }
 
 /**
@@ -253,7 +278,8 @@ export function resolvePolicyOrigin(
 export type PolicyWriteRefuseReason =
   | BoundedMapRefuseReason
   | "not_found"
-  | "forbidden";
+  | "forbidden"
+  | "quota_state_unavailable";
 
 /** Result of `PolicyStore.create` / `update` — a discriminated union so a
  * caller cannot read `.policy` on a refused write. */
@@ -412,7 +438,28 @@ export class PolicyStore {
     // process restarts, because the check below reads `this.policies`,
     // not disk. `loadAll` is idempotent (skips keys already cached) so
     // calling it on every write is correctness, not just a boot-time nicety.
-    await this.loadAll();
+    //
+    // FAIL CLOSED on a failed rehydrate (LD3 gate fix-round-2 MUST-FIX 1,
+    // MUST-NEVER #5): `loadAll` reports `ok: false` only when it could NOT
+    // durably confirm the persisted set (a `storage.list()`/`read()`
+    // exception), never for a genuinely empty store (which is `ok: true`
+    // with zero entries). Proceeding past a failed rehydrate would check
+    // the quota against a map that is an UNKNOWN UNDERCOUNT, not a
+    // verified count — a caller could ride a transient listing failure
+    // straight past MAX_DISCLOSURE_POLICIES_PER_ORIGIN / global cap. Refuse
+    // and let the caller retry once storage enumeration recovers.
+    const rehydrated = await this.loadAll();
+    if (!rehydrated.ok) {
+      return { ok: false, reason: "quota_state_unavailable" };
+    }
+    // DEBT (residual, LD3 gate fix-round-2, accepted not fixed): the
+    // rehydrate-then-admit sequence above is not atomic ACROSS PROCESSES —
+    // two `PolicyStore` instances backed by the same storage could both
+    // `loadAll()` a count of 19 and both admit, landing at 21. Accepted
+    // because the deployment target is single-process (same class as the
+    // deferred cross-process bridge-dedup item); a storage-level lock or
+    // compare-and-swap on the persisted set is the future fix if a
+    // multi-process deployment is ever needed.
 
     const resolvedOrigin = resolvePolicyOrigin(origin);
     const policyId = `pol-${Date.now()}-${toBase64url(randomBytes(8))}`;
@@ -482,7 +529,18 @@ export class PolicyStore {
     // update into a spurious "forbidden". Rehydrating here keeps ownership
     // resolution correct across a restart the same way it keeps the quota
     // check correct in `create()`.
-    await this.loadAll();
+    //
+    // FAIL CLOSED on a failed rehydrate (LD3 gate fix-round-2 MUST-FIX 1,
+    // MUST-NEVER #5): same rationale as `create()` above — `ownerOrigin`
+    // resolution just below depends on this map already reflecting the
+    // full persisted set. Proceeding past a failed rehydrate risks either
+    // a spurious "forbidden" (a legitimate owner's entry never got loaded)
+    // or, via `get()`'s own best-effort re-cache, an update decision made
+    // against an undercounted map. Refuse rather than guess.
+    const rehydrated = await this.loadAll();
+    if (!rehydrated.ok) {
+      return { ok: false, reason: "quota_state_unavailable" };
+    }
 
     const resolvedOrigin = resolvePolicyOrigin(origin);
     const existing = await this.get(policyId);
@@ -565,12 +623,31 @@ export class PolicyStore {
    * `list()`: the quota/ownership checks in the write paths need the
    * in-memory `BoundedMap` to already reflect what is durably stored, not
    * only what THIS process instance has created since it started — see
-   * `create()`'s call site comment. Cheap to call repeatedly: the
-   * `this.policies.has(meta.key)` guard below skips every entry already
-   * cached, so a call after the first successful rehydrate only re-lists
-   * storage metadata and does no redundant decrypt work.
+   * `create()`'s call site comment. Cheap to call repeatedly for entries
+   * that got cached: the `this.policies.has(meta.key)` guard below skips
+   * them, so a call after the first successful rehydrate only re-lists
+   * storage metadata and does no redundant decrypt work for those keys.
+   * DEBT (LD3 gate fix-round-2, accepted not fixed): a legacy, pre-fix
+   * over-cap policy that `this.policies.set()` REFUSES below is never
+   * cached, so `has()` never skips it — every future call to `loadAll()`
+   * (i.e. every `create()`/`update()`, since both call it) re-reads and
+   * re-decrypts that same over-cap record, an O(N)-per-write cost for a
+   * fortress carrying legacy over-cap data. An in-memory "known-refused"
+   * id set would bound this to one decrypt per process lifetime.
+   *
+   * Returns `{ ok: false }` when `storage.list()` or `storage.read()`
+   * THROWS — a signal that the persisted set could not be fully
+   * enumerated, distinct from a genuinely empty store (`ok: true`, zero
+   * entries; `storage.list()` resolving to `[]` is not an error). A
+   * single unreadable/corrupted policy record (JSON parse or decrypt
+   * failure) is skipped and does NOT flip this to `ok: false` — that
+   * failure mode is unchanged from before this fix and is tracked
+   * separately; only a `list()`/`read()` exception, which leaves the
+   * rest of the on-disk set unaccounted for, does. `create()`/`update()`
+   * (fix-round-2 MUST-FIX 1) fail closed on `ok: false` rather than
+   * proceed with a quota count that may be an undercount.
    */
-  private async loadAll(): Promise<void> {
+  private async loadAll(): Promise<{ ok: boolean }> {
     try {
       const entries = await this.storage.list("_policies");
       for (const meta of entries) {
@@ -590,8 +667,18 @@ export class PolicyStore {
           // Skip corrupted policies
         }
       }
+      return { ok: true };
     } catch {
-      // Storage not available
+      // FAIL CLOSED signal (LD3 gate fix-round-2 MUST-FIX 1, MUST-NEVER
+      // #5): `storage.list()`/`storage.read()` threw, so the in-memory
+      // map may be an undercount of what is actually on disk. Reporting
+      // `ok: true` here (as before this fix) let `create()`/`update()`
+      // check quota against that undercount and admit a policy past the
+      // cap on a transient storage failure — a fail-OPEN on the quota.
+      // `list()` (public API, read-only) still returns whatever is
+      // cached rather than throwing here; only the two write paths that
+      // gate an admission decision on this result are made to refuse.
+      return { ok: false };
     }
   }
 

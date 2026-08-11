@@ -24,7 +24,53 @@ import {
   type DisclosureRule,
 } from "../../src/disclosure/policies.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
+import type {
+  StorageBackend,
+  StorageEntryMeta,
+} from "../../src/storage/interface.js";
 import { generateRandomKey } from "../../src/core/random.js";
+
+/**
+ * Wraps `MemoryStorage` with a toggle to simulate `list()` throwing (LD3
+ * gate fix-round-2 MUST-FIX 1 test support) — a transient storage-layer
+ * failure distinct from a benign "not found"/empty result, which
+ * `MemoryStorage` alone cannot produce on demand.
+ */
+class FailableStorage implements StorageBackend {
+  private readonly inner = new MemoryStorage();
+  failList = false;
+
+  async write(namespace: string, key: string, data: Uint8Array): Promise<void> {
+    return this.inner.write(namespace, key, data);
+  }
+
+  async read(namespace: string, key: string): Promise<Uint8Array | null> {
+    return this.inner.read(namespace, key);
+  }
+
+  async delete(
+    namespace: string,
+    key: string,
+    secureOverwrite?: boolean
+  ): Promise<boolean> {
+    return this.inner.delete(namespace, key, secureOverwrite);
+  }
+
+  async list(namespace: string, prefix?: string): Promise<StorageEntryMeta[]> {
+    if (this.failList) {
+      throw new Error("simulated storage list() failure");
+    }
+    return this.inner.list(namespace, prefix);
+  }
+
+  async exists(namespace: string, key: string): Promise<boolean> {
+    return this.inner.exists(namespace, key);
+  }
+
+  async totalSize(): Promise<number> {
+    return this.inner.totalSize();
+  }
+}
 
 function makePolicy(
   rules: DisclosureRule[],
@@ -607,6 +653,195 @@ describe("L3 Disclosure Policies", () => {
         "agent:other-restart-session"
       );
       expect(otherSession.ok).toBe(true);
+    });
+  });
+
+  // LD3 gate fix-round-2 — a re-gate of the fix-round-1 commit found two
+  // more real defects. These tests fail on that commit's code (HEAD~1 of
+  // this test file's own history at the time this describe block was
+  // added) and pass once both are closed.
+  describe("PolicyStore bounds (LD3 gate fix-round-2)", () => {
+    it("MUST-FIX 1 — fails closed on create() when loadAll() cannot enumerate the persisted set", async () => {
+      const storage = new FailableStorage();
+      const masterKey = generateRandomKey();
+      const store = new PolicyStore(storage, masterKey);
+
+      storage.failList = true;
+
+      // Pre-fix code swallows the `storage.list()` throw inside `loadAll`'s
+      // outer try/catch and proceeds as if the store were empty, so this
+      // `create()` would silently succeed against an unknown (possibly
+      // undercounted) quota count — the fail-OPEN this fix closes.
+      const result = await store.create(
+        "Should Refuse",
+        [],
+        "withhold",
+        undefined,
+        "agent:listfail-session"
+      );
+      expect(result.ok).toBe(false);
+      if (result.ok) throw new Error("unreachable");
+      expect(result.reason).toBe("quota_state_unavailable");
+    });
+
+    it("MUST-FIX 1 — fails closed on update() when loadAll() cannot enumerate the persisted set", async () => {
+      const storage = new FailableStorage();
+      const masterKey = generateRandomKey();
+      const store = new PolicyStore(storage, masterKey);
+      const origin = "agent:update-listfail-session";
+
+      const created = await store.create(
+        "Original",
+        [],
+        "withhold",
+        undefined,
+        origin
+      );
+      expect(created.ok).toBe(true);
+      if (!created.ok) throw new Error("unreachable");
+
+      storage.failList = true;
+
+      const result = await store.update(
+        created.policy.policy_id,
+        "Updated",
+        [],
+        "withhold",
+        undefined,
+        origin
+      );
+      expect(result.ok).toBe(false);
+      if (result.ok) throw new Error("unreachable");
+      expect(result.reason).toBe("quota_state_unavailable");
+    });
+
+    it("MUST-FIX 1 — a transient list() failure does not permanently corrupt state: create() succeeds again once storage recovers", async () => {
+      const storage = new FailableStorage();
+      const masterKey = generateRandomKey();
+      const store = new PolicyStore(storage, masterKey);
+
+      storage.failList = true;
+      const failed = await store.create(
+        "Transient Failure",
+        [],
+        "withhold",
+        undefined,
+        "agent:recovery-session"
+      );
+      expect(failed.ok).toBe(false);
+
+      storage.failList = false;
+      const recovered = await store.create(
+        "Recovered",
+        [],
+        "withhold",
+        undefined,
+        "agent:recovery-session"
+      );
+      expect(recovered.ok).toBe(true);
+    });
+
+    it("MUST-FIX 1 — a genuinely empty store (no list()/read() error) is NOT treated as a quota-state failure", async () => {
+      // Distinguishes the fix from an over-broad version that would also
+      // refuse on a legitimately empty (never-written-to) store.
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const store = new PolicyStore(storage, masterKey);
+
+      const result = await store.create(
+        "First Ever Policy",
+        [],
+        "withhold",
+        undefined,
+        "agent:fresh-session"
+      );
+      expect(result.ok).toBe(true);
+    });
+
+    it("MUST-FIX 2 — strips a nested object from a disclose array element before it reaches storage", async () => {
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const store = new PolicyStore(storage, masterKey);
+      const origin = "agent:nested-junk-session";
+
+      // The confirmed exploit shape: `sanitizeRules`'s shallow array copy
+      // (`[...rule.disclose]`) preserves element REFERENCES, so a nested
+      // object survives even though the array itself is a fresh copy. A
+      // direct `PolicyStore` caller (this test, or a future non-MCP
+      // caller) bypasses `validatePolicyInput`'s own element-type check,
+      // which is why this is a storage-boundary test, not a validator test.
+      const nestedJunkRule = {
+        context: "commerce",
+        disclose: [{ junk: "A".repeat(5_000_000) }],
+        withhold: [],
+        proof_required: [],
+      } as unknown as DisclosureRule;
+
+      const result = await store.create(
+        "Nested Junk Policy",
+        [nestedJunkRule],
+        "withhold",
+        undefined,
+        origin
+      );
+      expect(result.ok).toBe(true);
+      if (!result.ok) throw new Error("unreachable");
+
+      // On pre-fix code, `result.policy.rules[0].disclose[0]` is still the
+      // 5MB-carrying object. Post-fix, the non-string element is dropped
+      // entirely rather than persisted.
+      expect(result.policy.rules[0]!.disclose).toEqual([]);
+
+      const entries = await storage.list("_policies");
+      let checked = 0;
+      for (const entry of entries) {
+        const raw = await storage.read("_policies", entry.key);
+        if (!raw) continue;
+        checked += 1;
+        expect(raw.length).toBeLessThan(10_000);
+      }
+      expect(checked).toBeGreaterThan(0);
+    });
+
+    it("MUST-FIX 2 — strips a nested object from context and withhold/proof_required elements on update() too", async () => {
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const store = new PolicyStore(storage, masterKey);
+      const origin = "agent:nested-junk-update-session";
+
+      const created = await store.create(
+        "Original",
+        [],
+        "withhold",
+        undefined,
+        origin
+      );
+      expect(created.ok).toBe(true);
+      if (!created.ok) throw new Error("unreachable");
+
+      const nestedJunkRule = {
+        context: { junk: "B".repeat(2_000_000) },
+        disclose: [],
+        withhold: [{ junk: "C".repeat(2_000_000) }, "legit_field"],
+        proof_required: [{ junk: "D".repeat(2_000_000) }],
+      } as unknown as DisclosureRule;
+
+      const updated = await store.update(
+        created.policy.policy_id,
+        "Updated",
+        [nestedJunkRule],
+        "withhold",
+        undefined,
+        origin
+      );
+      expect(updated.ok).toBe(true);
+      if (!updated.ok) throw new Error("unreachable");
+
+      expect(updated.policy.rules[0]!.context).toBe("");
+      // The non-string element is dropped; the legitimate string sibling
+      // survives — this isn't a blunt "clear the whole array" fix.
+      expect(updated.policy.rules[0]!.withhold).toEqual(["legit_field"]);
+      expect(updated.policy.rules[0]!.proof_required).toEqual([]);
     });
   });
 });

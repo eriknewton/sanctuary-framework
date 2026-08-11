@@ -63,6 +63,12 @@ function policyWriteErrorMessage(reason: PolicyWriteRefuseReason): string {
       return "No disclosure policy found with that policy_id.";
     case "forbidden":
       return "That policy_id belongs to a different session and cannot be updated from this one.";
+    case "quota_state_unavailable":
+      return (
+        "Disclosure policy quota state unavailable, retry: the store could " +
+        "not confirm the full set of persisted policies, so this write was " +
+        "refused rather than risk exceeding the policy cap."
+      );
   }
 }
 
