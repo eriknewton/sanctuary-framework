@@ -305,13 +305,38 @@ export function createHandshakeTools(
       // this and ABORTS the eviction (refuses the new insert) if the
       // durable write fails, rather than deleting a session with no audit
       // record of why. See bounded-map.ts's onEvict doc.
+      //
+      // INTENT ONLY, NOT COMPLETION (MUST-FIX 2, fix-round-5 — see
+      // bounded-map.ts's onEvict doc "INTENT, NEVER COMPLETION" note): this
+      // write can durably land AFTER set() has already timed out and
+      // refused the eviction (appendCritical serializes behind
+      // audit-log.ts's own append queue, so this write's total settle time
+      // is unbounded under audit-queue contention even though set()'s own
+      // wait is bounded). Naming it `_eviction_intent` rather than
+      // `_evicted` means it can never be read as claiming the session was
+      // actually removed — see `onEvicted` below for the completion record.
       await auditLog.appendCritical({
         layer: "l4",
-        operation: "handshake_session_evicted",
+        operation: "handshake_session_eviction_intent",
         identity_id: "system",
         result: "success",
         details: { session_id: evictedSessionId, reason: "capacity" },
       });
+    },
+    onEvicted: (evictedSessionId) => {
+      // COMPLETION audit (MUST-FIX 2, fix-round-5 — see bounded-map.ts's
+      // onEvicted doc). Fires synchronously, immediately after
+      // bounded-map.ts's OWN delete, so by construction the session is
+      // already gone by the time this runs — fire-and-forget is safe here
+      // because this write can only ever describe a TRUE fact, never a
+      // refused/timed-out eviction.
+      void auditLog.append(
+        "l4",
+        "handshake_session_evicted",
+        "system",
+        { session_id: evictedSessionId, reason: "capacity" },
+        "success"
+      );
     },
     // No onRefuse here: `handshake_initiate` / `handshake_respond` below
     // already inspect `sessions.set()`'s return value and audit the
@@ -479,9 +504,24 @@ export function createHandshakeTools(
       // ONLY immediately after its OWN synchronous delete — see that hook's
       // doc (core/bounded-map.ts) for why that makes it safe to do
       // unconditionally, with no reference re-check needed here at all.
+      //
+      // INTENT ONLY, NOT COMPLETION (MUST-FIX 2, fix-round-5 — a SECOND,
+      // distinct symptom of the SAME F1 defect this file's `onEvicted`
+      // split already closed for the sibling-state half: see
+      // bounded-map.ts's onEvict doc "INTENT, NEVER COMPLETION" note).
+      // `appendCritical` serializes behind audit-log.ts's own append
+      // queue, so this write's total settle time is unbounded under
+      // audit-queue contention even though `ON_EVICT_AUDIT_TIMEOUT_MS`
+      // bounds how long `set()` itself waits — a write that resolves AFTER
+      // `set()` already timed out and refused would, under the old
+      // `_evicted`/"success" name, durably describe an eviction that never
+      // happened (the entry is still in the map). Naming this the INTENT
+      // record and moving the `_evicted` COMPLETION record into `onEvicted`
+      // below (which only ever fires from this map's own authoritative
+      // post-delete path) closes it structurally.
       await auditLog.appendCritical({
         layer: "l4",
-        operation: "handshake_result_evicted",
+        operation: "handshake_result_eviction_intent",
         identity_id: "system",
         result: "success",
         details: {
@@ -493,7 +533,7 @@ export function createHandshakeTools(
         },
       });
     },
-    onEvicted: (evictedCounterpartyId) => {
+    onEvicted: (evictedCounterpartyId, evictedResult) => {
       // AUTHORITATIVE (fix-round-4, MUST-FIX 1 / F1 — see
       // core/bounded-map.ts's `BoundedMapOptions.onEvicted` doc). Keeps
       // `handshakeResultWriterOrigins`'s key set a subset of
@@ -511,6 +551,25 @@ export function createHandshakeTools(
       // and no concurrent write can have interleaved in the gap (there is
       // no gap).
       handshakeResultWriterOrigins.delete(evictedCounterpartyId);
+      // COMPLETION audit (MUST-FIX 2, fix-round-5 — see `onEvict`'s
+      // "INTENT ONLY" note above and bounded-map.ts's onEvicted doc).
+      // Fire-and-forget is safe here for the same reason it is safe in
+      // `sessions`'s onEvicted: this call only ever runs once the eviction
+      // is ALREADY an authoritative fact, so the write can never be wrong,
+      // only possibly delayed or lost.
+      void auditLog.append(
+        "l4",
+        "handshake_result_evicted",
+        "system",
+        {
+          counterparty_id: evictedCounterpartyId,
+          verified: evictedResult.verified,
+          liveness_proven: evictedResult.liveness_proven,
+          expired: new Date(evictedResult.expires_at) <= new Date(),
+          reason: "capacity",
+        },
+        "success"
+      );
     },
     // No onRefuse here: recordHandshakeResult below reads the reason
     // directly off `handshakeResults.set()`'s own return value (MUST-FIX

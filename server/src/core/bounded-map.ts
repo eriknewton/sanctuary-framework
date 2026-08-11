@@ -212,6 +212,27 @@ export interface BoundedMapOptions<K, V> {
    * (e.g. the honeypot coalescing tracker) may omit `onEvict` entirely, or
    * supply a fire-and-forget non-critical callback — this contract only
    * binds a caller that DOES supply one.
+   *
+   * INTENT, NEVER COMPLETION (MUST-FIX 2, fix-round-5 — F1's second
+   * residual, closed structurally): `appendCritical` serializes behind
+   * audit-log.ts's own in-process append queue, so this call's TOTAL
+   * settle time is (drain of every write already queued ahead of it) +
+   * its own bound — `ON_EVICT_AUDIT_TIMEOUT_MS` bounds how long `set()`
+   * WAITS for it, not how long the underlying write can actually take to
+   * land durably. Under audit-queue contention a write can resolve
+   * successfully AFTER `set()` has already timed out and refused the
+   * eviction (see `withTimeout`'s doc) — so if this callback's audit entry
+   * claims the domain event `"<thing>_evicted"` / `result: "success"`,
+   * that record can durably describe an eviction that never happened (the
+   * victim is still in the map). A caller's `onEvict` audit write MUST
+   * therefore record INTENT (e.g. `"<thing>_eviction_intent"`) — "an
+   * eviction was decided and this write happened before any delete", never
+   * a claim that the deletion itself completed. The COMPLETION record
+   * (the operation name any existing dashboard/consumer already queries
+   * for) belongs in `onEvicted` below, which fires only from this map's
+   * own authoritative post-delete path and therefore can never be wrong.
+   * See `handshake/tools.ts`'s `sessions`/`handshakeResults` and
+   * `federation/registry.ts`'s `peers` for the shape.
    */
   onEvict?: (evictedKey: K, evictedValue: V) => void | Promise<void>;
   /**
@@ -247,9 +268,21 @@ export interface BoundedMapOptions<K, V> {
    * caller with a sibling collection to keep in sync MUST put that cleanup
    * here, never inside `onEvict`. `onEvicted` must be cheap and
    * synchronous (in-memory bookkeeping only, no I/O, no `await`) — it is
-   * not awaited or timeout-bounded, and a caller needing a durable side
+   * not awaited or timeout-bounded, and a caller needing a DURABLE side
    * effect from an eviction should do that inside `onEvict` (before the
    * delete) instead, accepting that shape's own await/timeout contract.
+   *
+   * COMPLETION AUDIT LIVES HERE TOO (MUST-FIX 2, fix-round-5 — see
+   * `onEvict`'s "INTENT, NEVER COMPLETION" note above for the defect this
+   * closes): a caller whose `onEvict` durably records eviction INTENT
+   * should fire a best-effort, NON-critical, fire-and-forget
+   * `auditLog.append(...)` from here for the completion record (e.g.
+   * `"<thing>_evicted"`). This is safe to do un-awaited specifically
+   * because, by construction, the event it describes has ALREADY happened
+   * by the time `onEvicted` runs — losing or delaying this specific write
+   * (audit-queue contention, a crash before it flushes) only loses a
+   * telemetry record of a TRUE fact; it can never fabricate a false one
+   * the way the old single-write-inside-`onEvict` shape could.
    */
   onEvicted?: (evictedKey: K, evictedValue: V) => void;
   /** Fired when an insert is refused — either because the incoming origin

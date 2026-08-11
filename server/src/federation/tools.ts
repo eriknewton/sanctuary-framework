@@ -264,17 +264,37 @@ export function createFederationTools(
             // make room. Surface this as an explicit error, never a
             // silently-dropped "registered: true".
             if (!registration.ok) {
+              // MUST-FIX 3, fix-round-5 (Codex): both messages below were
+              // inaccurate about the underlying condition. (1) `origin_quota`
+              // counts entries currently attributed to this origin, checked
+              // BEFORE the capacity/eviction path ever runs (see
+              // bounded-map.ts's `admitNewKey`) — an expired peer entry is
+              // NOT deleted by expiry alone (only `getPeer`/`listPeers`
+              // lazily flip `active`/`trust_tier` in place; `removePeer` or
+              // a global-capacity eviction of THAT entry are the only things
+              // that ever delete it), so "let an inactive peer expire"
+              // never actually frees this quota — only an explicit
+              // `action: "remove"` does. (2) `audit_unavailable` can only be
+              // reached from INSIDE the capacity branch (`this.map.size >=
+              // this.opts.maxSize`, bounded-map.ts) — the registry WAS at
+              // capacity and an eviction WAS decided; it is a distinct
+              // reason for the SAME "at capacity" condition, not a separate
+              // "not full" one, so the two are never mutually exclusive.
               const error =
                 registration.reason === "origin_quota"
                   ? "This identity has reached its federation peer " +
                     `registration quota (${registry.maxPeersPerOrigin()} peers). ` +
-                    "Remove or let an inactive peer expire before " +
-                    "registering more."
+                    "A peer's registration continues to count against this " +
+                    "quota even after its handshake expires; explicitly " +
+                    "remove an existing peer (federation_peers action: " +
+                    "\"remove\") to free a slot before registering another."
                   : registration.reason === "audit_unavailable"
-                    ? "Federation peer registry could not durably audit an " +
-                      "eviction needed to register this peer; the registry " +
-                      "is not full, its audit trail is unavailable. Retry " +
-                      "once the audit log recovers."
+                    ? "Federation peer registry is at capacity and needed " +
+                      "to evict an inactive peer to register this one, but " +
+                      "the durable audit write for that eviction did not " +
+                      "complete in time; this is an audit-log availability " +
+                      "issue, not a genuine \"every peer is active\" " +
+                      "saturation. Retry once the audit log recovers."
                     : "Federation peer registry is at capacity and every " +
                       "slot holds an active peer; cannot register a new " +
                       "peer until one expires, is removed, or one becomes " +

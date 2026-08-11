@@ -63,6 +63,7 @@ import {
   MAX_FEDERATION_PEERS,
   MAX_FEDERATION_PEERS_PER_ORIGIN,
 } from "../../src/federation/registry.js";
+import { ON_EVICT_AUDIT_TIMEOUT_MS } from "../../src/core/bounded-map.js";
 import { generateSHR } from "../../src/shr/generator.js";
 import { createIdentity, generateIdentityId } from "../../src/core/identity.js";
 import { derivePurposeKey } from "../../src/core/key-derivation.js";
@@ -559,7 +560,12 @@ describe("2. handshake results: capped + per-session fair + expires_at-aware evi
         ...args: Parameters<AuditLog["appendCritical"]>
       ) => {
         const entry = args[0];
-        if (entry.operation === "handshake_result_evicted") {
+        // MUST-FIX 2, fix-round-5: the pre-delete critical write is now the
+        // INTENT record (`_eviction_intent`), not `_evicted` — the
+        // COMPLETION record moved to a fire-and-forget `append()` call in
+        // `onEvicted` (see handshake/tools.ts), which fires only after the
+        // authoritative delete and is therefore not intercepted here.
+        if (entry.operation === "handshake_result_eviction_intent") {
           evictedAudited = entry.details as { expired?: boolean };
         }
         return originalAppendCritical(...args);
@@ -737,7 +743,12 @@ describe("2. handshake results: capped + per-session fair + expires_at-aware evi
           ...args: Parameters<typeof originalAppendCritical>
         ) => {
           const entry = args[0];
-          if (entry.operation === "handshake_result_evicted") {
+          // MUST-FIX 2, fix-round-5: intercept the INTENT write
+          // (`_eviction_intent`) — the pre-delete critical audit this test
+          // is deliberately holding pending. See the sibling comment above
+          // (section 3) for why `_evicted` itself is no longer written via
+          // appendCritical.
+          if (entry.operation === "handshake_result_eviction_intent") {
             evictionAuditCalls += 1;
             return new Promise<void>((resolve) => {
               resolveAudit = () => {
@@ -774,6 +785,138 @@ describe("2. handshake results: capped + per-session fair + expires_at-aware evi
         expect(handshakeResults.get(survivorId!)).toBeUndefined();
         expect(handshakeResultWriterOrigins.get(survivorId!)).toBeUndefined();
         expect(handshakeResultWriterOrigins.get(newSHR.body.instance_id)).toBe(newSession);
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+    240_000
+  );
+
+  it(
+    "MUTATION-PROOF TARGET (no phantom eviction-success audit, MUST-FIX 2, fix-round-5): a REFUSED/timed-out eviction never produces a `handshake_result_evicted` completion record for the surviving entry, even after the pending intent write eventually resolves",
+    async () => {
+      const agent = makeAgent();
+      await createIdentityFor(agent, "template-identity");
+      const { tools, handshakeResults, handshakeResultWriterOrigins } = createHandshakeTools(
+        agent.config,
+        agent.identityManager,
+        agent.masterKey,
+        agent.auditLog
+      );
+      const exchange = tools.find((t) => t.name === "handshake_exchange")!;
+      const template = shrFor(agent);
+
+      // Fill to the global cap with cheap unverified previews, exactly as
+      // the F1 test above — every entry stays evictable.
+      const sessionsNeeded = Math.ceil(
+        MAX_HANDSHAKE_RESULTS / MAX_HANDSHAKE_RESULTS_PER_ORIGIN
+      );
+      let filled = 0;
+      let survivorId: string | undefined;
+      outer: for (let s = 0; s < sessionsNeeded; s += 1) {
+        const session = `agent:filler-f1phantom-${s}`;
+        for (let i = 0; i < MAX_HANDSHAKE_RESULTS_PER_ORIGIN; i += 1) {
+          if (filled >= MAX_HANDSHAKE_RESULTS) break outer;
+          const shr = mintCounterpartySHR(template);
+          const out = parse(await exchange.handler({ counterparty_shr: shr }, session));
+          expect(out.verification.recorded).toBe(true);
+          if (filled === 0) survivorId = shr.body.instance_id;
+          filled += 1;
+        }
+      }
+      expect(handshakeResults.size).toBe(MAX_HANDSHAKE_RESULTS);
+      const survivorWriter = handshakeResultWriterOrigins.get(survivorId!);
+      expect(survivorWriter).toBeDefined();
+
+      vi.useFakeTimers();
+      try {
+        // Hold the INTENT write pending under manual control — this time,
+        // NEVER resolve it before the admission timeout elapses (unlike the
+        // F1 test above, which resolves at 25s, inside the corrected
+        // bound). Spy on BOTH audit channels for the COMPLETION operation
+        // name (`handshake_result_evicted`, no `_intent` suffix) — the
+        // pre-fix-round-5 shape wrote that name via `appendCritical` (the
+        // phantom record itself); the fixed shape writes it, if at all,
+        // via the low-risk fire-and-forget `append()` from `onEvicted`.
+        // Checking both channels makes this proof independent of WHICH
+        // channel a regression happens to use.
+        let evictionIntentCalls = 0;
+        let resolveIntent!: () => void;
+        let completionAuditedWhileSurvivorExists = false;
+        const originalAppendCritical = agent.auditLog.appendCritical.bind(agent.auditLog);
+        agent.auditLog.appendCritical = ((
+          ...args: Parameters<typeof originalAppendCritical>
+        ) => {
+          const entry = args[0];
+          if (entry.operation === "handshake_result_eviction_intent") {
+            evictionIntentCalls += 1;
+            return new Promise<void>((resolve) => {
+              resolveIntent = () => {
+                originalAppendCritical(...args).then(resolve, resolve);
+              };
+            });
+          }
+          if (
+            entry.operation === "handshake_result_evicted" &&
+            (entry.details as { counterparty_id?: string } | undefined)?.counterparty_id ===
+              survivorId &&
+            handshakeResults.get(survivorId!) !== undefined
+          ) {
+            completionAuditedWhileSurvivorExists = true;
+          }
+          return originalAppendCritical(...args);
+        }) as typeof originalAppendCritical;
+
+        const originalAppend = agent.auditLog.append.bind(agent.auditLog);
+        agent.auditLog.append = ((...args: Parameters<typeof originalAppend>) => {
+          if (
+            args[1] === "handshake_result_evicted" &&
+            (args[3] as { counterparty_id?: string } | undefined)?.counterparty_id ===
+              survivorId &&
+            handshakeResults.get(survivorId!) !== undefined
+          ) {
+            completionAuditedWhileSurvivorExists = true;
+          }
+          return originalAppend(...args);
+        }) as typeof originalAppend;
+
+        const newSession = "agent:probe-f1-phantom";
+        const newSHR = mintCounterpartySHR(template);
+        const resultPromise = exchange.handler({ counterparty_shr: newSHR }, newSession);
+
+        // Advance PAST the corrected admission timeout (bounded-map.ts's
+        // ON_EVICT_AUDIT_TIMEOUT_MS) — set() must give up waiting and
+        // refuse this admission, leaving the victim (survivorId) intact.
+        await vi.advanceTimersByTimeAsync(ON_EVICT_AUDIT_TIMEOUT_MS + 1_000);
+        const out = parse(await resultPromise);
+
+        expect(evictionIntentCalls).toBe(1);
+        // The probe's own recording failed — the eviction was refused, not
+        // completed (audit_unavailable, matching bounded-map.ts's
+        // `withTimeout` contract).
+        expect(out.verification.recorded).toBe(false);
+        // The survivor is genuinely still present: NOT evicted.
+        expect(handshakeResults.get(survivorId!)).toBeDefined();
+        expect(handshakeResultWriterOrigins.get(survivorId!)).toBe(survivorWriter);
+
+        // THE MUTATION-PROOF ASSERTION: no completion record for the
+        // survivor yet, because `onEvicted` (the only place that writes
+        // one) never fired for a refused eviction.
+        expect(completionAuditedWhileSurvivorExists).toBe(false);
+
+        // Now let the detached intent write finally resolve (models the
+        // exact audit-queue-contention scenario MUST-FIX 2 describes: a
+        // write that eventually lands successfully, long after set() gave
+        // up). Reverting the fix-round-5 split (writing the completion
+        // audit directly inside `onEvict`, before the delete, as fix-round-4
+        // did) makes this assertion FALSE: the old shape would have already
+        // written a "success" `handshake_result_evicted` record for
+        // survivorId the moment the intent write above resolved, well
+        // before any real delete ever happened.
+        resolveIntent();
+        await vi.runAllTimersAsync();
+        expect(completionAuditedWhileSurvivorExists).toBe(false);
+        expect(handshakeResults.get(survivorId!)).toBeDefined();
       } finally {
         vi.useRealTimers();
       }
@@ -1846,6 +1989,79 @@ describe("4. sentinel durable findings: capped, per-origin fair, never blind-FIF
       expect(baselineMean).toBeCloseTo(BASELINE_COUNT_PER_WINDOW, 0);
     },
     120_000
+  );
+
+  it(
+    "MUTATION-PROOF TARGET (cross-ID admission TOCTOU, MUST-FIX 1 fix-round-5): concurrent saveFinding calls for DISTINCT new finding_ids at the cap never overshoot MAX_TRACKED_FINDINGS or MAX_FINDINGS_PER_ORIGIN — the store-level admission lock, not just the per-finding-id lock, serializes them",
+    async () => {
+      // Reproduces the class exactly: runtime-trap-handler.ts mints a fresh
+      // randomUUID() per invocation, so an attacker who trips a trap
+      // repeatedly, concurrently, produces many DISTINCT new finding_ids —
+      // each takes a DIFFERENT `findingLocks` entry, so the per-id lock
+      // alone cannot serialize them against each other. Only a store-level
+      // admission lock closes the race where two concurrent writes both
+      // read the same pre-write quota/capacity headroom.
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const auditLog = new AuditLog(storage, masterKey);
+      const CAP = 10;
+      const store = new SentinelFindingStore({
+        storage,
+        masterKey,
+        fortressId: "fortress-concurrent-admission-test",
+        auditLog,
+        maxTrackedFindings: CAP,
+        // Isolate the GLOBAL-capacity race from the per-origin one — every
+        // concurrent writer here shares no agent_id, so without this
+        // override they would all race the "unattributed" origin's OWN
+        // quota instead of (or in addition to) the global cap.
+        maxFindingsPerOrigin: 1000,
+      });
+
+      // Fill to exactly ONE below the cap with distinct, non-expired,
+      // sequential writes (uncontended — this just establishes the
+      // starting state, not part of the race being tested).
+      for (let i = 0; i < CAP - 1; i += 1) {
+        await store.saveFinding(mkFinding(`seed-${i}`));
+      }
+
+      // Now fire MANY concurrent writes for DISTINCT new finding_ids —
+      // enough that, pre-fix, every one of them could read "1 slot free"
+      // before any of them had actually written. Nothing in the store is
+      // expired, so nothing is reclaimable: AT MOST ONE of these should
+      // ever succeed; every other one must be genuinely REFUSED
+      // (`capacity`), never silently admitted past the cap.
+      const RACERS = 20;
+      const outcomes = await Promise.allSettled(
+        Array.from({ length: RACERS }, (_, i) => store.saveFinding(mkFinding(`racer-${i}`)))
+      );
+
+      const succeeded = outcomes.filter((o) => o.status === "fulfilled").length;
+      const refused = outcomes.filter(
+        (o) =>
+          o.status === "rejected" &&
+          o.reason instanceof SentinelFindingStoreRefusedError &&
+          o.reason.reason === "capacity"
+      ).length;
+
+      // THE MUTATION-PROOF ASSERTION: exactly one racer was admitted (the
+      // one slot of headroom), every other racer was genuinely refused, and
+      // — the property that actually matters — the store's real size NEVER
+      // exceeds the cap. Removing the store-level admission lock
+      // (`runAdmissionExclusive` in `saveFinding`, restoring the
+      // pre-fix-round-5 shape where `enforceTrackedFindingsCeiling` ran
+      // unlocked ahead of the per-id write) makes `succeeded` land above 1
+      // and `finalCount` exceed `CAP` under this concurrency, because
+      // multiple racers observe the same one-slot-free snapshot before any
+      // of them commits.
+      expect(succeeded).toBe(1);
+      expect(refused).toBe(RACERS - 1);
+      expect(outcomes.length).toBe(succeeded + refused);
+
+      const finalCount = (await store.listFindingMetadata()).length;
+      expect(finalCount).toBe(CAP);
+    },
+    30_000
   );
 });
 

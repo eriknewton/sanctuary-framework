@@ -29,6 +29,7 @@ import {
 import { derivePurposeKey } from "../core/key-derivation.js";
 import { stringToBytes, bytesToString } from "../core/encoding.js";
 import type { AuditLog } from "../operational/audit-log.js";
+import { ON_EVICT_AUDIT_TIMEOUT_MS } from "../core/bounded-map.js";
 import {
   SENTINEL_SUMMARY_MAX_CHARS,
   type SentinelFinding,
@@ -288,6 +289,59 @@ export const MAX_FINDINGS_PER_ORIGIN = 500;
  */
 const SATURATION_EVICT_SCAN_CAP = 50;
 
+/**
+ * SHARED CLASS WITH core/bounded-map.ts (AGENTS.md rule 8, MUST-FIX 1,
+ * fix-round-5): bounds the whole store-level NEW-RECORD admission critical
+ * section (see `admissionQueue`'s doc below) so a hung storage operation
+ * cannot retain the store-wide admission lock indefinitely and stall every
+ * later new-finding write. The critical section can include an awaited
+ * `appendCritical` reclamation-intent write (`evictOldestExpired`), whose
+ * own worst-case settle time is `ON_EVICT_AUDIT_TIMEOUT_MS` (imported from
+ * core/bounded-map.ts rather than re-derived — that constant is itself
+ * derived from audit-log.ts's two-phase lock-acquisition + write-hold
+ * deadline contract; see its doc there), PLUS this store's OWN
+ * storage.list/read/write calls (the ceiling's metadata listing, the
+ * reclaim scan's per-record reads, and the final encrypted write) — calls
+ * the storage interface (storage/interface.ts) gives no settle-time
+ * contract for at all. STORAGE_OP_MARGIN_MS is a defensive backstop for
+ * that unbounded portion, not a precise derivation.
+ */
+const STORAGE_OP_MARGIN_MS = 10_000;
+const STORE_ADMISSION_DEADLINE_MS = ON_EVICT_AUDIT_TIMEOUT_MS + STORAGE_OP_MARGIN_MS;
+
+/**
+ * Race `promise` against a timer that rejects after `ms`. Mirrors
+ * core/bounded-map.ts's `withTimeout` (not exported there, so reproduced
+ * here rather than reaching across a module boundary for a five-line
+ * helper) — used ONLY to bound the store-level admission critical section
+ * (see `STORE_ADMISSION_DEADLINE_MS`'s doc): a timeout is reported to the
+ * caller identically to any other admission failure (both reject the
+ * `runAdmissionExclusive` call), since from the caller's perspective "the
+ * admission never confirmed in time" is the same fail-closed condition
+ * either way.
+ */
+function withDeadline<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(
+        new Error(
+          `sentinel-finding-store: admission did not settle within ${ms}ms`,
+        ),
+      );
+    }, ms);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err instanceof Error ? err : new Error(String(err)));
+      },
+    );
+  });
+}
+
 interface PersistedFinding {
   /** Bump on schema change. */
   version: 1;
@@ -354,22 +408,23 @@ export class SentinelFindingStore {
    * the last queued caller for that id finishes — bounded by concurrent
    * in-flight finding_ids, never by cumulative ids ever seen.
    *
-   * WHY PER-FINDING-ID, NOT A WHOLE-STORE LOCK: the storage interface
-   * (storage/interface.ts) has no compare-and-delete primitive, so
-   * `evictOldestExpired`'s prior fix (re-reading immediately before the
-   * delete) only NARROWED the race, it did not close it — the re-read and
-   * the delete are still two separate awaited steps, and a concurrent
-   * `saveFinding` renewal for that SAME finding_id can still land between
-   * them. A single WHOLE-STORE lock would close that, but
-   * `evictOldestExpired` awaits a durable INTENT audit (`appendCritical`)
-   * BEFORE reaching that section, and one of THIS file's own existing
-   * tests (the fix-round-3 concurrent-refresh test) legitimately performs
-   * a NESTED `saveFinding` call for the SAME finding_id from inside that
-   * very audit await, modeling a real renewal racing the reclamation scan
-   * — a whole-store lock held across that audit await would make the
-   * renewal wait on its own reclaimer's lock, deadlocking (the reclaimer
-   * cannot release the lock until the renewal, which needs the same lock,
-   * completes). Scoping the lock to (a) only the destructive
+   * WHY PER-FINDING-ID, NOT A WHOLE-STORE LOCK, FOR THIS SECTION
+   * SPECIFICALLY: the storage interface (storage/interface.ts) has no
+   * compare-and-delete primitive, so `evictOldestExpired`'s prior fix
+   * (re-reading immediately before the delete) only NARROWED the race, it
+   * did not close it — the re-read and the delete are still two separate
+   * awaited steps, and a concurrent `saveFinding` renewal for that SAME
+   * finding_id can still land between them. A single WHOLE-STORE lock held
+   * across THIS section would close that, but `evictOldestExpired` awaits
+   * a durable INTENT audit (`appendCritical`) BEFORE reaching it, and one
+   * of THIS file's own existing tests (the fix-round-3 concurrent-refresh
+   * test) legitimately performs a NESTED `saveFinding` call — with
+   * `knownExisting: true` — for the SAME finding_id from inside that very
+   * audit await, modeling a real renewal racing the reclamation scan. A
+   * whole-store lock held across that audit await would make the renewal
+   * wait on its own reclaimer's lock, deadlocking (the reclaimer cannot
+   * release the lock until the renewal, which needs the same lock,
+   * completes). Scoping THIS lock to (a) only the destructive
    * read-decide-delete section (never the audit await) and (b) only the
    * SINGLE finding_id under mutation avoids that: the reclaimer does not
    * hold this lock while awaiting the audit, so a renewal for that same id
@@ -380,8 +435,78 @@ export class SentinelFindingStore {
    * any id both a writer and a reclaimer touch concurrently, closing the
    * race for genuinely concurrent (non-nested) calls too, not only the
    * nested-test shape.
+   *
+   * WHAT THIS LOCK DOES NOT CLOSE (MUST-FIX 1, fix-round-5): two DISTINCT
+   * new finding_ids each take a DIFFERENT entry in this map, so this lock
+   * alone never serializes two concurrent NEW-record admissions against
+   * each other — see `admissionQueue` below, which is the primitive that
+   * closes that separate race. The two locks compose: `admissionQueue`
+   * serializes the whole store's new-record admission (quota/capacity
+   * decision through durable write), and WITHIN that critical section, the
+   * write itself still takes the target id's own `findingLocks` entry
+   * (LOCK ORDERING: store-level lock always acquired first, per-id lock
+   * always acquired second/nested — never the reverse), so a same-id
+   * refresh racing an admission still gets the SAME-ID protection this
+   * lock exists for. A `knownExisting: true` renewal (the fast path)
+   * deliberately BYPASSES `admissionQueue` entirely and only ever takes
+   * this per-id lock directly — see `saveFinding`'s doc for why that
+   * bypass is what keeps the nested-test scenario above deadlock-free.
    */
   private readonly findingLocks = new Map<string, Promise<void>>();
+
+  /**
+   * STORE-LEVEL admission lock (MUST-FIX 1, fix-round-5 — closes the
+   * cross-ID quota/capacity TOCTOU the per-finding-id lock above cannot
+   * reach). SHARED CLASS WITH core/bounded-map.ts's `admissionQueue`
+   * (AGENTS.md rule 8): before this fix, `enforceTrackedFindingsCeiling`'s
+   * quota/capacity CHECK ran UNLOCKED, ahead of `saveFinding`'s per-id
+   * write. Two concurrent `saveFinding` calls for two DISTINCT new
+   * finding_ids (the honeypot's runtime-trap-handler.ts mints a fresh
+   * `randomUUID()` per invocation — attacker-reachable, always a distinct
+   * id) each acquire DIFFERENT `findingLocks` entries, so the per-id lock
+   * never serializes them against each other: both could observe the SAME
+   * pre-write quota/capacity headroom, both decide "there is room," and
+   * both durably write — overshooting `MAX_TRACKED_FINDINGS` /
+   * `MAX_FINDINGS_PER_ORIGIN` by however many concurrent new-id writes
+   * raced the check. A single promise chain per STORE INSTANCE (not per
+   * id, not per origin) closes this: the origin-quota check, the capacity
+   * check, any reclamation it triggers, the durable write, and the index
+   * update for a NEW finding_id all run inside ONE critical section, so a
+   * second admission can only ever observe state that already reflects
+   * the first admission's complete outcome. Reuses the exact self-cleaning
+   * promise-chain SHAPE `BoundedMap.admissionQueue` / `runAdmissionExclusive`
+   * (core/bounded-map.ts) already established for the identical class of
+   * bug (LD2-03/LD2-04's async-set TOCTOU) — chain onto the prior call's
+   * SETTLED tail so one admission's failure can never wedge every later
+   * admission behind a permanently-rejected promise.
+   *
+   * BYPASSED BY THE `knownExisting: true` FAST PATH, DELIBERATELY (mirrors
+   * BoundedMap.set()'s update-path bypass — see that method's doc): an
+   * update to an already-existing finding_id can never grow the tracked
+   * count, so serializing it behind other stores' NEW-record admissions
+   * would only add latency for no safety benefit. This bypass is also
+   * what keeps the fix-round-3 concurrent-refresh test deadlock-free (see
+   * `findingLocks`'s doc above) — that test's nested renewal call always
+   * passes `knownExisting: true`, so it never tries to re-enter
+   * `admissionQueue` while the outer admission that triggered the
+   * reclamation still holds it.
+   *
+   * LOCK ORDERING (deadlock avoidance, MUST-FIX 1 fix-round-5): this lock
+   * is ALWAYS the outer lock and `findingLocks` entries are ALWAYS
+   * acquired only from inside it (never the reverse) for the new-record
+   * admission path — `enforceTrackedFindingsCeiling`'s own reclamation
+   * (`evictOldestExpired`) takes a per-id lock for the RECLAIMED (victim)
+   * id, and the subsequent write takes a per-id lock for the INCOMING
+   * (new) id; both are necessarily DIFFERENT ids from each other (a
+   * genuinely new finding_id cannot already be the reclamation's victim),
+   * so no self-deadlock there either. The ONLY path that acquires a
+   * `findingLocks` entry WITHOUT first holding this lock is the
+   * `knownExisting: true` bypass above, which is why that path must never
+   * be routed through `admissionQueue` — doing so would let a nested
+   * renewal (itself now requiring `admissionQueue`) block on the very
+   * admission it was invoked from inside of.
+   */
+  private admissionQueue: Promise<void> = Promise.resolve();
 
   constructor(opts: SentinelFindingStoreOptions) {
     this.storage = opts.storage;
@@ -502,6 +627,38 @@ export class SentinelFindingStore {
   }
 
   /**
+   * Chains `fn` onto this store's SINGLE admission queue so at most one
+   * new-record admission for THIS store runs at a time, start to finish
+   * (including every `await` inside `fn`) — see `admissionQueue`'s doc for
+   * why this has to be scoped to the whole store rather than to a
+   * finding_id or an origin, and for the lock-ordering invariant (this is
+   * always the OUTER lock; `findingLocks` entries are only ever acquired
+   * from inside it on this path). Mirrors `runExclusiveForFinding` and
+   * `BoundedMap.runAdmissionExclusive` (core/bounded-map.ts) exactly: chain
+   * onto the prior call's SETTLED tail so one admission's failure can never
+   * wedge every later admission behind a permanently-rejected promise.
+   * BOUNDED (MUST-FIX 1, fix-round-5): `fn` races against
+   * `STORE_ADMISSION_DEADLINE_MS` via `withDeadline` — a hung storage
+   * operation inside `fn` cannot retain this lock (or the underlying
+   * per-id lock it may have acquired) past that deadline; the queue still
+   * advances for the NEXT admission even though the hung operation itself
+   * keeps running detached (mirrors bounded-map.ts's `onEvict` timeout
+   * trade-off — nothing can cancel an in-flight storage call, only stop
+   * waiting on it).
+   */
+  private async runAdmissionExclusive<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.admissionQueue.then(
+      () => withDeadline(fn(), STORE_ADMISSION_DEADLINE_MS),
+      () => withDeadline(fn(), STORE_ADMISSION_DEADLINE_MS),
+    );
+    this.admissionQueue = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  /**
    * Persist a finding. Truncates the operator-visible summary to
    * SENTINEL_SUMMARY_MAX_CHARS so the dashboard render stays bounded.
    * Returns the retention deadline so callers can audit it.
@@ -529,6 +686,17 @@ export class SentinelFindingStore {
    * refusal is never silent even for a caller that only catches-and-drops
    * the exception (the honeypot producers' existing best-effort-persist
    * convention).
+   *
+   * ADMISSION-LOCKED FOR NEW RECORDS (MUST-FIX 1, fix-round-5 — closes the
+   * cross-ID quota/capacity TOCTOU): a call for a NEW finding_id
+   * (`!opts?.knownExisting`) runs its ENTIRE admission — the ceiling check,
+   * any reclamation it triggers, the durable write, and the index update —
+   * inside `runAdmissionExclusive` (`admissionQueue`, see that field's
+   * doc), so two concurrent new-id writes can never both observe the same
+   * pre-write headroom. A `knownExisting: true` call BYPASSES
+   * `admissionQueue` entirely (mirrors `BoundedMap.set()`'s update-path
+   * bypass) — see `admissionQueue`'s doc for why this is required, not
+   * optional, to keep the fix-round-3 nested-renewal test deadlock-free.
    */
   async saveFinding(
     finding: SentinelFinding,
@@ -548,32 +716,52 @@ export class SentinelFindingStore {
     };
     const key = findingKey(finding.finding_id);
     const origin = resolveFindingOrigin(truncated);
-    if (!opts?.knownExisting) {
-      await this.enforceTrackedFindingsCeiling(key, origin);
-    }
-    // LOCKED (MUST-FIX 3, fix-round-4): the actual write + index update run
-    // under this finding_id's own lock (`findingLocks`, see that field's
-    // doc), the SAME lock a concurrent reclamation
-    // (`evictOldestExpired`/`pruneExpired`) takes for its own
+
+    // The write + index update, run under this finding_id's own lock
+    // (`findingLocks`, see that field's doc), the SAME lock a concurrent
+    // reclamation (`evictOldestExpired`/`pruneExpired`) takes for its own
     // read-decide-delete section on this id. Whichever gets there first
     // completes before the other's read runs, so a renewal can never be
     // silently lost to a reclamation that read stale (pre-renewal) state.
-    await this.runExclusiveForFinding(finding.finding_id, async () => {
-      await this.writeFinding(key, finding.finding_id, persisted);
-      // Keep the filter index current (see MAX_SCANNED_RECORDS's doc). Set
-      // unconditionally, INCLUDING before `ensureIndex()` has ever run for
-      // this instance — when the lazy backfill does run later it will read
-      // this same record from storage and overwrite with an identical entry,
-      // so ordering between "index updated here" and "index backfilled from
-      // storage" never matters.
-      this.index.set(truncated.finding_id, {
-        severity: truncated.severity,
-        sentinel_id: truncated.sentinel_id,
-        agent_id: truncated.agent_id,
-        observed_at: truncated.observed_at,
-        origin,
+    const writeAndIndex = async (): Promise<void> => {
+      await this.runExclusiveForFinding(finding.finding_id, async () => {
+        await this.writeFinding(key, finding.finding_id, persisted);
+        // Keep the filter index current (see MAX_SCANNED_RECORDS's doc). Set
+        // unconditionally, INCLUDING before `ensureIndex()` has ever run for
+        // this instance — when the lazy backfill does run later it will read
+        // this same record from storage and overwrite with an identical
+        // entry, so ordering between "index updated here" and "index
+        // backfilled from storage" never matters.
+        this.index.set(truncated.finding_id, {
+          severity: truncated.severity,
+          sentinel_id: truncated.sentinel_id,
+          agent_id: truncated.agent_id,
+          observed_at: truncated.observed_at,
+          origin,
+        });
       });
-    });
+    };
+
+    if (opts?.knownExisting) {
+      // Fast path (MUST-FIX 1, fix-round-5): bypasses `admissionQueue`
+      // entirely — see that field's doc for why this is required to keep
+      // the nested-renewal test deadlock-free, and `writeAndIndex`'s own
+      // per-id lock for the (unchanged) same-id refresh protection.
+      await writeAndIndex();
+    } else {
+      // NEW-RECORD ADMISSION (MUST-FIX 1, fix-round-5): the ceiling check
+      // and the write+index update run as ONE critical section under the
+      // store-level admission lock, so a concurrent new-id admission can
+      // only ever observe this call's COMPLETE outcome, never a
+      // pre-write snapshot. LOCK ORDERING: `runAdmissionExclusive` is
+      // acquired first (outer); `enforceTrackedFindingsCeiling`'s own
+      // reclamation and `writeAndIndex` each acquire a `findingLocks`
+      // entry (inner) only from inside it — see `admissionQueue`'s doc.
+      await this.runAdmissionExclusive(async () => {
+        await this.enforceTrackedFindingsCeiling(key, origin);
+        await writeAndIndex();
+      });
+    }
     return persisted.retention_until;
   }
 
@@ -583,6 +771,14 @@ export class SentinelFindingStore {
    * and MAX_FINDINGS_PER_ORIGIN. Throws `SentinelFindingStoreRefusedError`
    * on refusal (MUST-FIX 4) instead of returning and letting the caller
    * silently overshoot.
+   *
+   * CALLED ONLY FROM INSIDE `admissionQueue` (MUST-FIX 1, fix-round-5): the
+   * only caller, `saveFinding`'s new-record branch, always wraps this call
+   * (and the subsequent write) in `runAdmissionExclusive` — this method
+   * itself takes no lock, and must not, since its own reclamation
+   * (`evictOldestExpired`) acquires a `findingLocks` entry that has to nest
+   * INSIDE the already-held store-level lock (see `admissionQueue`'s doc
+   * for the lock-ordering invariant this depends on).
    */
   private async enforceTrackedFindingsCeiling(
     key: string,

@@ -155,9 +155,21 @@ export class FederationRegistry {
         // write fails, rather than deleting a peer with no audit record of
         // why. See bounded-map.ts's onEvict doc / handshake/tools.ts's
         // sessions/handshakeResults onEvict for the same pattern.
+        //
+        // INTENT ONLY, NOT COMPLETION (MUST-FIX 2, fix-round-5 — see
+        // bounded-map.ts's onEvict doc "INTENT, NEVER COMPLETION" note, and
+        // handshake/tools.ts's identical fix on `handshakeResults`, the
+        // sibling map this was first found on). `appendCritical` serializes
+        // behind audit-log.ts's own append queue, so this write's total
+        // settle time is unbounded under audit-queue contention even though
+        // `ON_EVICT_AUDIT_TIMEOUT_MS` bounds how long `set()` itself waits —
+        // naming this the INTENT record (never `_evicted`) means it can
+        // never be read as claiming the peer was actually removed even if
+        // it lands after `set()` already refused. See `onEvicted` below for
+        // the completion record.
         await this.auditLog.appendCritical({
           layer: "l4",
-          operation: "federation_peer_evicted",
+          operation: "federation_peer_eviction_intent",
           identity_id: "system",
           result: "success",
           details: {
@@ -166,6 +178,24 @@ export class FederationRegistry {
             reason: "capacity",
           },
         });
+      },
+      onEvicted: (evictedPeerId, evictedPeer) => {
+        // COMPLETION audit (MUST-FIX 2, fix-round-5 — see `onEvict`'s
+        // "INTENT ONLY" note above and bounded-map.ts's onEvicted doc).
+        // Fires synchronously, immediately after bounded-map.ts's OWN
+        // delete, so this write can only ever describe a TRUE fact —
+        // fire-and-forget is safe because there is nothing left to abort.
+        void this.auditLog.append(
+          "l4",
+          "federation_peer_evicted",
+          "system",
+          {
+            peer_id: evictedPeerId,
+            peer_did: evictedPeer.peer_did,
+            reason: "capacity",
+          },
+          "success"
+        );
       },
       onRefuse: (incomingPeerId, _incomingPeer, reason) => {
         // Three DISTINCT reasons (MUST-FIX 3, fix-round-3 — `capacity` and
