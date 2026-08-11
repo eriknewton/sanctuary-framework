@@ -12,6 +12,7 @@ import { createIdentity } from "../../src/core/identity.js";
 import { generateSHR } from "../../src/shr/generator.js";
 import {
   transformSHRForGateway,
+  transformSHRForGatewayAt,
   transformSHRGeneric,
   type PingAuthorizationContext,
   type GenericAuthorizationContext,
@@ -396,6 +397,75 @@ describe("Ping Identity Gateway Adapter", () => {
     });
   });
 
+  // ─── SHR-GW-01: verify-before-trust (rule-7 semantic provenance) ──
+  // transformSHRForGateway mints a trust decision (score up to 100, up to
+  // "full" trust) from SHR fields that are self-reported by whoever holds
+  // the signing key. Before the fix, it never called verifySHR, so a
+  // tampered or forged SHR could be laundered straight into a
+  // full-sovereignty gateway authorization context. These tests reproduce
+  // that at the source (a body mutated after signing, and a corrupted
+  // signature) and assert the adapter now fails closed instead.
+  describe("verify-before-trust (SHR-GW-01)", () => {
+    it("refuses to mint a trust decision from a body tampered with after signing", () => {
+      const shr = generateSHR(undefined, {
+        config,
+        identityManager: identityManager as any,
+        masterKey,
+      }) as SignedSHR;
+
+      // Forge a "full sovereignty" claim by rewriting the signed body's
+      // layer statuses in place without re-signing. Prior to the fix this
+      // reached calculateLayerScores/determineTrustLevel unverified and
+      // could mint a "full" trust decision from claims the signature no
+      // longer covers.
+      const forged: SignedSHR = {
+        ...shr,
+        body: {
+          ...shr.body,
+          layers: {
+            ...shr.body.layers,
+            l1: { ...shr.body.layers.l1, status: "active" },
+            l2: { ...shr.body.layers.l2, status: "active" },
+            l3: { ...shr.body.layers.l3, status: "active" },
+            l4: { ...shr.body.layers.l4, status: "active" },
+          },
+        },
+      };
+
+      expect(() => transformSHRForGateway(forged)).toThrow(
+        /unverified SHR/i
+      );
+    });
+
+    it("refuses to mint a trust decision when the signature itself is invalid", () => {
+      const shr = generateSHR(undefined, {
+        config,
+        identityManager: identityManager as any,
+        masterKey,
+      }) as SignedSHR;
+
+      const forged: SignedSHR = {
+        ...shr,
+        signature: shr.signature.slice(0, -4) + "AAAA",
+      };
+
+      expect(() => transformSHRForGateway(forged)).toThrow(
+        /unverified SHR/i
+      );
+      expect(() => transformSHRGeneric(forged)).toThrow(/unverified SHR/i);
+    });
+
+    it("still mints a trust decision for a genuinely valid, unmodified SHR", () => {
+      const shr = generateSHR(undefined, {
+        config,
+        identityManager: identityManager as any,
+        masterKey,
+      }) as SignedSHR;
+
+      expect(() => transformSHRForGateway(shr)).not.toThrow();
+    });
+  });
+
   // ─── v0.9.1: new L4 degradation codes surface correctly ──────────
   describe("L4 degradation codes (v0.9.1)", () => {
     function zeroTiers() {
@@ -456,7 +526,11 @@ describe("Ping Identity Gateway Adapter", () => {
         },
       }) as SignedSHR;
 
-      const context = transformSHRForGateway(shr);
+      // Fixed-time fixture: use the TEST-ONLY clock seam so verifySHR checks
+      // expiry against this SHR's generation clock, not the real wall clock
+      // (the public transformSHRForGateway is real-clock-only by design —
+      // SHR-GW-01, so a trust decision cannot be handed a caller-chosen time).
+      const context = transformSHRForGatewayAt(shr, now);
       const l4Entries = context.degradations.filter((d) => d.layer === "l4");
 
       const codes = l4Entries.map((e) => e.code).sort();
