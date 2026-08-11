@@ -1,3 +1,4 @@
+// fail-before-exempt: adaptation-only in this PR — the sole change is passing the now-required 4th origins-map arg to createFederationTools (an empty Map, since this file hand-builds handshakeResults with no real per-session origin). No assertion changed. The Class C bounded-state behavior IS bound (fails against pre-fix source) by test/security/attacker-writable-collections-bounds.test.ts and test/core/bounded-map.test.ts; the self-vouch behavior this file exercises is bound in merged main (#1198) and by this file's own M3 self-vouch test against pre-Class-B source.
 /**
  * Handshake Forgery & Replay Remediation — Regression Suite (M1-M4)
  *

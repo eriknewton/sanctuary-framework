@@ -1,3 +1,4 @@
+// fail-before-exempt: adaptation-only in this PR — the changes are (a) destructuring handshakeResultWriterOrigins and passing the now-required origins-map arg through the widened createHandshakeTools/createFederationTools signatures, and (b) rewording two comments to drop a dangling BUILD_RESULT.md pointer. No assertion changed. This is a Class B (self-vouch) binding suite whose behavior landed in merged main (#1198), so it passes against origin/main by construction; the Class C bounded-state behavior is bound by test/security/attacker-writable-collections-bounds.test.ts and test/core/bounded-map.test.ts (both fail against pre-fix source, gate-confirmed).
 /**
  * Self-Vouch Trust-Ingest Inventory — Class-Level Regression Suite
  * (register §Z RECHECK / LD2-02, LD2-02b, A11)

@@ -1,3 +1,4 @@
+// fail-before-exempt: adaptation-only in this PR — the changes are pure test-double plumbing (add listFindingMetadata to the stub store so the suite runs against source that now calls the decrypt-bounded metadata listing instead of listFindings, extract a shared filtered() helper). No assertion changed (zero expect/it/describe edits in the diff), so it cannot fail against pre-fix source. The new Z-HNY-02 behavior (anomaly-trigger's self-inflicted decrypt path is metadata-bounded, not full-record) IS bound (fails against pre-fix source, gate-confirmed) by test/security/attacker-writable-collections-bounds.test.ts, which imports AnomalyTriggerWatcher, exercises listFindingMetadata, and carries an explicit mutation-proof target for the unbounded-metadata-scan property.
 /**
  * Sanctuary v1.3 WP-V1.3-1 Phi-5 Anomaly Trigger meta-sentinel regression suite.
  *
