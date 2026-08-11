@@ -25,6 +25,27 @@ import { BROKER_OPS } from "../../operational/audit-log.js";
 export const DEFAULT_TOKEN_TTL_SECONDS = 15 * 60;
 export const MAX_TOKEN_TTL_SECONDS = 60 * 60; // 1 hour cap
 
+/**
+ * Global ceiling on live (unexpired) tokens across every skill and caller.
+ * Derivation: a generous fleet-scale headroom of ~40 concurrently-granted
+ * skills times ~50 live tokens each (a skill re-requesting well inside its
+ * own default TTL window) rounds up to 2000. This bounds the issuer's
+ * memory to a small, fixed footprint regardless of how many tokens have
+ * ever been requested (BROKER-TOKEN-STORE-UNBOUNDED) — issuance fails
+ * closed once the live map hits this size, it never grows past it.
+ */
+export const MAX_LIVE_TOKENS_GLOBAL = 2000;
+
+/**
+ * Per-caller (skill+agent) ceiling on live tokens. Derivation: a legitimate
+ * caller holds at most a handful of concurrent scoped tokens (read/rotate,
+ * a few distinct secrets, occasional retries) — realistic use stays in the
+ * single digits. 100 is far above that while still turning a runaway or
+ * malicious request_token loop from one caller into a small, fixed
+ * per-caller footprint instead of unbounded growth.
+ */
+export const MAX_LIVE_TOKENS_PER_CALLER = 100;
+
 export interface SkillSecretGrant {
   /** Name of the skill this grant applies to. */
   skill: string;
@@ -119,6 +140,10 @@ export interface TokenIssuerOptions {
   auditLog: AuditLog;
   /** Clock, injectable for testing. Defaults to Date.now. */
   now?: () => number;
+  /** Global live-token cap override. See MAX_LIVE_TOKENS_GLOBAL for the default and its derivation. */
+  maxLiveTokensGlobal?: number;
+  /** Per-caller live-token cap override. See MAX_LIVE_TOKENS_PER_CALLER for the default and its derivation. */
+  maxLiveTokensPerCaller?: number;
 }
 
 const SCOPE_RANK: Record<SecretScope, number> = { read: 1, rotate: 2 };
@@ -134,6 +159,8 @@ export class TokenIssuer {
   private readonly auditLog: AuditLog;
   private readonly defaultTtlSeconds: number;
   private readonly maxTtlSeconds: number;
+  private readonly maxLiveTokensGlobal: number;
+  private readonly maxLiveTokensPerCaller: number;
   private readonly now: () => number;
 
   constructor(opts: TokenIssuerOptions) {
@@ -141,6 +168,8 @@ export class TokenIssuer {
     this.auditLog = opts.auditLog;
     this.defaultTtlSeconds = opts.defaultTtlSeconds ?? DEFAULT_TOKEN_TTL_SECONDS;
     this.maxTtlSeconds = opts.maxTtlSeconds ?? MAX_TOKEN_TTL_SECONDS;
+    this.maxLiveTokensGlobal = opts.maxLiveTokensGlobal ?? MAX_LIVE_TOKENS_GLOBAL;
+    this.maxLiveTokensPerCaller = opts.maxLiveTokensPerCaller ?? MAX_LIVE_TOKENS_PER_CALLER;
     this.now = opts.now ?? (() => Date.now());
     for (const g of opts.grants ?? []) this.setGrant(g);
   }
@@ -160,8 +189,31 @@ export class TokenIssuer {
     this.grants.delete(grantKey(skill, secret));
   }
 
+  /**
+   * OPERATOR-ONLY full inventory. Every grant regardless of principal — this
+   * is what the operator CLI (`sanctuary secrets list`) shows. An
+   * agent-facing surface MUST use {@link getGrantsForCaller} instead
+   * (BROKER-GRANT-INVENTORY-CROSS-CALLER): this method does not filter by
+   * caller identity at all.
+   */
   getGrants(): SkillSecretGrant[] {
     return Array.from(this.grants.values());
+  }
+
+  /**
+   * Grants visible to one verified caller: exactly the grants whose skill
+   * matches the caller's verified skill and whose optional
+   * agent/tenant/fortress/audience constraints (when present on the grant)
+   * match the caller's verified claims. Reuses `grantClaimMismatch`, the
+   * same check `issueToken` enforces, so "visible in list_grants" and
+   * "issuable via request_token" never diverge. `caller` must be the
+   * server-verified claims for this request, never anything sourced from
+   * MCP call arguments.
+   */
+  getGrantsForCaller(caller: VerifiedBrokerCallerClaims): SkillSecretGrant[] {
+    return this.getGrants().filter(
+      (g) => g.skill === caller.skill && grantClaimMismatch(g, caller) === null
+    );
   }
 
   /**
@@ -170,6 +222,12 @@ export class TokenIssuer {
    * denial is recorded in the audit log but not returned to the caller.
    */
   async issueToken(req: IssueTokenRequest): Promise<TokenBinding> {
+    // Prune BEFORE every issuance attempt (not just once at broker open, see
+    // openBroker) — a caller that requests tokens in a loop must not be able
+    // to outrun opportunistic pruning and accumulate unbounded expired
+    // entries in the live map (BROKER-TOKEN-STORE-UNBOUNDED).
+    this.pruneExpired();
+
     const requestedScope: SecretScope = req.requestedScope ?? "read";
     if (req.skill !== req.caller.skill) {
       // Skill identity is taken from verified caller claims; an MCP argument cannot mint a token for another skill.
@@ -250,6 +308,55 @@ export class TokenIssuer {
           requested_scope: requestedScope,
           granted_scope: grant.scope,
           reason: "scope_exceeds_grant",
+          agent: req.caller.agent,
+          tenant_id: req.caller.tenant_id,
+          fortress_id: req.caller.fortress_id,
+          audience: req.caller.audience,
+        },
+      });
+      throw new BrokerDeniedError();
+    }
+
+    // Fail-closed caps, checked only once the request is otherwise
+    // authorized so an unauthorized probe cannot use capacity denials as a
+    // side channel. Both caps are rechecked on every issuance (post-prune
+    // above), so an attacker cannot get ahead of them by issuing faster
+    // than any background sweep.
+    if (this.tokens.size >= this.maxLiveTokensGlobal) {
+      await this.auditLog.appendCritical({
+        layer: "l3",
+        operation: BROKER_OPS.TOKEN_DENIED,
+        identity_id: req.caller.identity_id,
+        result: "failure",
+        details: {
+          skill: req.caller.skill,
+          secret: req.secret,
+          requested_scope: requestedScope,
+          reason: "token_store_at_capacity",
+          live_tokens: this.tokens.size,
+          cap: this.maxLiveTokensGlobal,
+          agent: req.caller.agent,
+          tenant_id: req.caller.tenant_id,
+          fortress_id: req.caller.fortress_id,
+          audience: req.caller.audience,
+        },
+      });
+      throw new BrokerDeniedError();
+    }
+    const callerLiveCount = this.countLiveTokensForCaller(req.caller.skill, req.caller.agent);
+    if (callerLiveCount >= this.maxLiveTokensPerCaller) {
+      await this.auditLog.appendCritical({
+        layer: "l3",
+        operation: BROKER_OPS.TOKEN_DENIED,
+        identity_id: req.caller.identity_id,
+        result: "failure",
+        details: {
+          skill: req.caller.skill,
+          secret: req.secret,
+          requested_scope: requestedScope,
+          reason: "caller_token_quota_exceeded",
+          live_tokens_for_caller: callerLiveCount,
+          cap: this.maxLiveTokensPerCaller,
           agent: req.caller.agent,
           tenant_id: req.caller.tenant_id,
           fortress_id: req.caller.fortress_id,
@@ -399,7 +506,15 @@ export class TokenIssuer {
           fortress_id: binding.fortress_id,
           audience: binding.audience,
           reason: "backend_error",
+          // Full name AND message land ONLY in the operator-only audit
+          // trail (OperatorAuditSummary / queryAuditOperator); the agent-facing
+          // `broker/audit_query` tool redacts `details` away entirely
+          // (redactAuditEntryForAgent), and the MCP surface in
+          // broker-server.ts must never echo `err.message` into its response
+          // — it can carry the secret NAME, an absolute keychain path, or raw
+          // `security(1)` diagnostics (BROKER-BACKEND-DIAGNOSTIC-LEAK).
           error: errorName(err),
+          error_message: errorMessage(err),
         },
       });
       throw err;
@@ -417,8 +532,22 @@ export class TokenIssuer {
   }
 
   /**
-   * Drop expired tokens from the in-memory map. Called opportunistically;
-   * not required for correctness (readViaToken also validates expiry).
+   * Count of currently-live tokens issued to one (skill, agent) caller.
+   * Used to enforce {@link MAX_LIVE_TOKENS_PER_CALLER} at issuance time.
+   */
+  private countLiveTokensForCaller(skill: string, agent: string): number {
+    let count = 0;
+    for (const binding of this.tokens.values()) {
+      if (binding.skill === skill && binding.agent === agent) count++;
+    }
+    return count;
+  }
+
+  /**
+   * Drop expired tokens from the in-memory map. Called opportunistically —
+   * at broker open (see openBroker) and now at the top of every issueToken
+   * call — plus it is not required for correctness (readViaToken also
+   * validates expiry on every use).
    */
   pruneExpired(): number {
     const nowMs = this.now();
@@ -458,4 +587,13 @@ function clampTtl(requested: number, max: number): number {
 function errorName(err: unknown): string {
   if (err instanceof Error) return err.name;
   return "UnknownError";
+}
+
+/**
+ * Operator-audit-only. Never route this into an agent-facing response —
+ * see the invariant comment at the `backend_error` audit call site.
+ */
+function errorMessage(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  return String(err);
 }

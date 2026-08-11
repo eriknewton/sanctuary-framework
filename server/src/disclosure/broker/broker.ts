@@ -23,6 +23,7 @@ import {
   type SkillSecretGrant,
   type IssueTokenRequest,
   type TokenBinding,
+  type VerifiedBrokerCallerClaims,
 } from "./token-issuer.js";
 
 export interface BrokerOptions {
@@ -214,8 +215,25 @@ export class Broker {
     );
   }
 
+  /**
+   * OPERATOR-ONLY full grant inventory (every principal's grants). Used by
+   * the `sanctuary secrets` CLI. An agent-facing surface must use
+   * {@link getGrantsForCaller} instead — see BROKER-GRANT-INVENTORY-CROSS-CALLER.
+   */
   getGrants(): SkillSecretGrant[] {
     return this.issuer.getGrants();
+  }
+
+  /**
+   * Grant inventory scoped to one verified caller — the ONLY grant listing
+   * an agent-facing surface (`broker/list_grants`) may return. `caller`
+   * must be the server-verified claims for the request (skill/agent/
+   * tenant/fortress/audience), never anything read from MCP call
+   * arguments, matching the same verified-claims contract `issueToken`
+   * enforces.
+   */
+  getGrantsForCaller(caller: VerifiedBrokerCallerClaims): SkillSecretGrant[] {
+    return this.issuer.getGrantsForCaller(caller);
   }
 
   async issueToken(req: IssueTokenRequest): Promise<TokenBinding> {

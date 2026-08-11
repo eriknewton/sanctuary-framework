@@ -73,6 +73,8 @@ async function makeIssuer(overrides: {
   backend?: Backend;
   now?: () => number;
   grants?: Parameters<TokenIssuer["setGrant"]>[0][];
+  maxLiveTokensGlobal?: number;
+  maxLiveTokensPerCaller?: number;
 } = {}) {
   const storage = new MemoryStorage();
   const masterKey = generateRandomKey();
@@ -83,6 +85,8 @@ async function makeIssuer(overrides: {
     auditLog,
     grants: overrides.grants,
     now: overrides.now,
+    maxLiveTokensGlobal: overrides.maxLiveTokensGlobal,
+    maxLiveTokensPerCaller: overrides.maxLiveTokensPerCaller,
   });
   return { issuer, auditLog, backend };
 }
@@ -428,6 +432,10 @@ describe("TokenIssuer", () => {
     });
 
     it("pruneExpired drops only expired tokens", async () => {
+      // Both tokens are issued before either has expired, so the
+      // pre-issuance auto-prune (see the next test) finds nothing to do at
+      // issuance time; this isolates pruneExpired()'s own logic once time
+      // has moved on with no further issuance in between.
       let now = 1_700_000_000_000;
       const { issuer } = await makeIssuer({
         now: () => now,
@@ -438,15 +446,41 @@ describe("TokenIssuer", () => {
         secret: "gmail_oauth",
         caller: caller("s", { agent: "a", identity_id: "i" }),
       });
-      now += 15_000;
+      now += 5_000; // token 1 not yet expired (expires at +10s)
       await issuer.issueToken({
         skill: "s",
         secret: "gmail_oauth",
         caller: caller("s", { agent: "a", identity_id: "i" }),
       });
       expect(issuer.liveTokenCount()).toBe(2);
+      now += 7_000; // absolute +12s: token 1 (expires +10s) is expired, token 2 (issued +5s, expires +15s) is not
       const removed = issuer.pruneExpired();
       expect(removed).toBe(1);
+      expect(issuer.liveTokenCount()).toBe(1);
+    });
+
+    it("issueToken prunes expired tokens before creating a new one (BROKER-TOKEN-STORE-UNBOUNDED)", async () => {
+      // Reproduces the finding on unfixed code: without a prune-before-issuance
+      // step, a caller that never calls pruneExpired() itself (and never hits
+      // a fortress-unlock cycle, the only other prune trigger) accumulates one
+      // stale entry per request forever. On the fixed issuer, liveTokenCount()
+      // immediately after the second issuance already reflects the prune.
+      let now = 1_700_000_000_000;
+      const { issuer } = await makeIssuer({
+        now: () => now,
+        grants: [{ skill: "s", secret: "gmail_oauth", scope: "read", ttlSeconds: 10 }],
+      });
+      await issuer.issueToken({
+        skill: "s",
+        secret: "gmail_oauth",
+        caller: caller("s", { agent: "a", identity_id: "i" }),
+      });
+      now += 15_000; // token 1 (ttl 10s) is now expired
+      await issuer.issueToken({
+        skill: "s",
+        secret: "gmail_oauth",
+        caller: caller("s", { agent: "a", identity_id: "i" }),
+      });
       expect(issuer.liveTokenCount()).toBe(1);
     });
 
@@ -458,6 +492,111 @@ describe("TokenIssuer", () => {
       const grants = issuer.getGrants();
       expect(grants).toHaveLength(1);
       expect(grants[0]!.scope).toBe("rotate");
+    });
+
+    describe("live-token caps (BROKER-TOKEN-STORE-UNBOUNDED)", () => {
+      it("denies fail-closed once the global live-token cap is reached, with a typed reason", async () => {
+        const { issuer, auditLog } = await makeIssuer({
+          maxLiveTokensGlobal: 2,
+          grants: [
+            { skill: "s", secret: "secret-a", scope: "read" },
+            { skill: "s", secret: "secret-b", scope: "read" },
+            { skill: "s", secret: "secret-c", scope: "read" },
+          ],
+        });
+        await issuer.issueToken({
+          skill: "s",
+          secret: "secret-a",
+          caller: caller("s", { agent: "a", identity_id: "i" }),
+        });
+        await issuer.issueToken({
+          skill: "s",
+          secret: "secret-b",
+          caller: caller("s", { agent: "a", identity_id: "i" }),
+        });
+        expect(issuer.liveTokenCount()).toBe(2);
+
+        await expect(
+          issuer.issueToken({
+            skill: "s",
+            secret: "secret-c",
+            caller: caller("s", { agent: "a", identity_id: "i" }),
+          })
+        ).rejects.toBeInstanceOf(BrokerDeniedError);
+
+        // Fails CLOSED: no third token entered the live map.
+        expect(issuer.liveTokenCount()).toBe(2);
+
+        const audit = await auditLog.query({ operation_type: BROKER_OPS.TOKEN_DENIED, layer: "l3" });
+        const last = audit.entries[audit.entries.length - 1]!;
+        expect(last.details?.reason).toBe("token_store_at_capacity");
+      });
+
+      it("denies fail-closed once the per-caller live-token cap is reached, without blocking a different caller", async () => {
+        const { issuer, auditLog } = await makeIssuer({
+          maxLiveTokensGlobal: 1000,
+          maxLiveTokensPerCaller: 2,
+          grants: [
+            { skill: "s", secret: "secret-a", scope: "read" },
+            { skill: "s", secret: "secret-b", scope: "read" },
+            { skill: "s", secret: "secret-c", scope: "read" },
+          ],
+        });
+        await issuer.issueToken({
+          skill: "s",
+          secret: "secret-a",
+          caller: caller("s", { agent: "caller-1", identity_id: "i" }),
+        });
+        await issuer.issueToken({
+          skill: "s",
+          secret: "secret-b",
+          caller: caller("s", { agent: "caller-1", identity_id: "i" }),
+        });
+
+        // caller-1's 3rd request is denied: at its per-caller cap.
+        await expect(
+          issuer.issueToken({
+            skill: "s",
+            secret: "secret-c",
+            caller: caller("s", { agent: "caller-1", identity_id: "i" }),
+          })
+        ).rejects.toBeInstanceOf(BrokerDeniedError);
+        const audit = await auditLog.query({ operation_type: BROKER_OPS.TOKEN_DENIED, layer: "l3" });
+        const last = audit.entries[audit.entries.length - 1]!;
+        expect(last.details?.reason).toBe("caller_token_quota_exceeded");
+
+        // A DIFFERENT caller (different verified agent) is unaffected — the
+        // cap is per-caller, not a side effect that blocks everyone once one
+        // caller misbehaves.
+        const other = await issuer.issueToken({
+          skill: "s",
+          secret: "secret-a",
+          caller: caller("s", { agent: "caller-2", identity_id: "i2" }),
+        });
+        expect(other.token).toBeTruthy();
+        expect(issuer.liveTokenCount()).toBe(3);
+      });
+    });
+  });
+
+  describe("getGrantsForCaller (BROKER-GRANT-INVENTORY-CROSS-CALLER)", () => {
+    it("returns only the grants matching the caller's verified skill and constraints", async () => {
+      const { issuer } = await makeIssuer({
+        grants: [
+          { skill: "gmail-triage", secret: "gmail_oauth", scope: "read" },
+          { skill: "other-skill", secret: "other_secret", scope: "read" },
+          {
+            skill: "gmail-triage",
+            secret: "tenant_scoped_secret",
+            scope: "read",
+            tenant_id: "tenant-beta",
+          },
+        ],
+      });
+      const visible = issuer.getGrantsForCaller(caller("gmail-triage", { tenant_id: "tenant-alpha" }));
+      expect(visible.map((g) => g.secret).sort()).toEqual(["gmail_oauth"]);
+      // The full inventory still contains all three — only the filtered view is scoped.
+      expect(issuer.getGrants()).toHaveLength(3);
     });
   });
 });
