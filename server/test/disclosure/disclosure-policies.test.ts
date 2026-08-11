@@ -441,4 +441,172 @@ describe("L3 Disclosure Policies", () => {
       expect(retrieved!.policy_name).toBe("Victim's Policy");
     });
   });
+
+  // LD3 gate fix-round — a two-family adversarial re-review of the LD3 fix
+  // above found two real defects in it. These tests fail on the
+  // fix-round's pre-fix code (the commit this test file's HEAD~1 shipped)
+  // and pass once both are closed.
+  describe("PolicyStore bounds (LD3 gate fix-round)", () => {
+    it("DEFECT 1 — strips an unknown/oversized property from a rule before it reaches storage", async () => {
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const store = new PolicyStore(storage, masterKey);
+      const origin = "agent:junk-session";
+
+      // The confirmed exploit shape: a rule object carrying all four known
+      // fields PLUS an unbounded extra property.
+      const junkyRule = {
+        context: "commerce",
+        disclose: [],
+        withhold: [],
+        proof_required: [],
+        junk: "A".repeat(5_000_000),
+      } as unknown as DisclosureRule;
+
+      // Confirms the upstream validator alone does not catch this — it
+      // bounds only the four known fields' lengths and never rejects an
+      // extra own property on the rule object.
+      const validation = validatePolicyInput("Junk Policy", [junkyRule]);
+      expect(validation.ok).toBe(true);
+
+      const result = await store.create(
+        "Junk Policy",
+        [junkyRule],
+        "withhold",
+        undefined,
+        origin
+      );
+      expect(result.ok).toBe(true);
+      if (!result.ok) throw new Error("unreachable");
+
+      // The stored/returned rule must carry ONLY the four known fields —
+      // on pre-fix code this assertion fails because `junk` survives.
+      const storedRule = result.policy.rules[0] as unknown as Record<
+        string,
+        unknown
+      >;
+      expect(Object.keys(storedRule).sort()).toEqual(
+        ["context", "disclose", "proof_required", "withhold"].sort()
+      );
+      expect(storedRule.junk).toBeUndefined();
+
+      // The junk payload must never have reached durable storage either —
+      // on pre-fix code the raw encrypted record would be multiple
+      // megabytes; post-fix it stays small regardless of what the caller
+      // tried to smuggle in.
+      const entries = await storage.list("_policies");
+      let checked = 0;
+      for (const entry of entries) {
+        const raw = await storage.read("_policies", entry.key);
+        if (!raw) continue;
+        checked += 1;
+        expect(raw.length).toBeLessThan(10_000);
+      }
+      expect(checked).toBeGreaterThan(0);
+    });
+
+    it("DEFECT 1 — strips an unknown property on update() too, not only create()", async () => {
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const store = new PolicyStore(storage, masterKey);
+      const origin = "agent:junk-update-session";
+
+      const created = await store.create(
+        "Original",
+        [
+          {
+            context: "commerce",
+            disclose: ["name"],
+            withhold: [],
+            proof_required: [],
+          },
+        ],
+        "withhold",
+        undefined,
+        origin
+      );
+      expect(created.ok).toBe(true);
+      if (!created.ok) throw new Error("unreachable");
+
+      const junkyRule = {
+        context: "commerce",
+        disclose: [],
+        withhold: [],
+        proof_required: [],
+        junk: "B".repeat(2_000_000),
+      } as unknown as DisclosureRule;
+
+      const updated = await store.update(
+        created.policy.policy_id,
+        "Updated",
+        [junkyRule],
+        "withhold",
+        undefined,
+        origin
+      );
+      expect(updated.ok).toBe(true);
+      if (!updated.ok) throw new Error("unreachable");
+
+      const storedRule = updated.policy.rules[0] as unknown as Record<
+        string,
+        unknown
+      >;
+      expect(Object.keys(storedRule).sort()).toEqual(
+        ["context", "disclose", "proof_required", "withhold"].sort()
+      );
+      expect(storedRule.junk).toBeUndefined();
+    });
+
+    it("DEFECT 2 — rehydrates BoundedMap quota counters from persisted policies after a restart", async () => {
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const origin = "agent:restart-session";
+
+      // Pre-restart process: fill this origin's entire quota.
+      const store1 = new PolicyStore(storage, masterKey);
+      for (let i = 0; i < MAX_DISCLOSURE_POLICIES_PER_ORIGIN; i++) {
+        const result = await store1.create(
+          `Policy ${i}`,
+          [],
+          "withhold",
+          undefined,
+          origin
+        );
+        expect(result.ok).toBe(true);
+      }
+
+      // Simulate a process restart: a BRAND NEW PolicyStore instance
+      // backed by the SAME durable storage. Its BoundedMap starts empty —
+      // the policies above are on disk but this instance has never loaded
+      // them into memory.
+      const store2 = new PolicyStore(storage, masterKey);
+
+      // On pre-fix code, store2's in-memory counters start at zero (never
+      // rehydrated), so this create silently succeeds — a caller could
+      // refill an already-exhausted quota on every restart. Post-fix,
+      // create() loads persisted policies before checking the quota, so
+      // this is refused exactly as it would have been pre-restart.
+      const overflow = await store2.create(
+        "One too many after restart",
+        [],
+        "withhold",
+        undefined,
+        origin
+      );
+      expect(overflow.ok).toBe(false);
+      if (overflow.ok) throw new Error("unreachable");
+      expect(overflow.reason).toBe("origin_quota");
+
+      // A different origin is unaffected — the rehydrate must not turn
+      // into a false global refusal.
+      const otherSession = await store2.create(
+        "Different session after restart",
+        [],
+        "withhold",
+        undefined,
+        "agent:other-restart-session"
+      );
+      expect(otherSession.ok).toBe(true);
+    });
+  });
 });

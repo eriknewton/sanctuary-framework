@@ -124,6 +124,37 @@ export type PolicyValidationResult =
   | { ok: false; error: string };
 
 /**
+ * Reconstruct every rule from ONLY its four known fields (LD3 gate DEFECT
+ * 1 — a two-family adversarial re-review of the LD3 fix above). Confirmed
+ * exploit: `validatePolicyInput` bounds the four known fields' lengths but
+ * never rejects an EXTRA own property on a rule object, and
+ * `tool-args.ts`'s `validateArgs` byte-caps only TOP-LEVEL string args —
+ * it never recurses into `rules[]` items — so a rule shaped
+ * `{context, disclose:[], withhold:[], proof_required:[], junk:
+ * "A".repeat(5_000_000)}` passed both upstream checks and `create()`/
+ * `update()` would otherwise persist it verbatim, smuggling an unbounded
+ * per-rule payload into permanent storage (up to
+ * MAX_DISCLOSURE_POLICY_RULES rules x MAX_DISCLOSURE_POLICIES_PER_ORIGIN
+ * policies per caller). This is the STORAGE-BOUNDARY fix (the write path
+ * itself, not just the pre-write validator that a direct `PolicyStore`
+ * caller — such as a future non-MCP caller, or these tests — could bypass
+ * entirely): building a BRAND-NEW object from named fields means an
+ * unexpected own property can never survive into what `create`/`update`
+ * persist, whatever validation upstream did or skipped. Called from
+ * `create()` and `update()` — both are write paths that reach `persist()`.
+ */
+function sanitizeRules(rules: DisclosureRule[]): DisclosureRule[] {
+  return rules.map((rule) => ({
+    context: rule.context,
+    disclose: Array.isArray(rule.disclose) ? [...rule.disclose] : [],
+    withhold: Array.isArray(rule.withhold) ? [...rule.withhold] : [],
+    proof_required: Array.isArray(rule.proof_required)
+      ? [...rule.proof_required]
+      : [],
+  }));
+}
+
+/**
  * Bound the caller-supplied `policy_name` and `rules` payload BEFORE it
  * ever reaches `PolicyStore.create` / `update` (rule 8: bounded rule
  * COUNT and bounded per-rule STRING sizes, not just a count on the
@@ -371,6 +402,18 @@ export class PolicyStore {
     identityId?: string,
     origin?: string
   ): Promise<PolicyWriteResult> {
+    // REHYDRATE BEFORE QUOTA CHECK (LD3 gate DEFECT 2): the BoundedMap's
+    // size/per-origin counters start at zero for a freshly constructed
+    // `PolicyStore` — a process restart, not just a fresh test instance.
+    // Persisted policies from BEFORE the restart stay on disk but the
+    // in-memory counters have no memory of them until something loads
+    // them back in. Without this call, a caller could re-fill an
+    // already-full origin's quota (and the global cap) every time the
+    // process restarts, because the check below reads `this.policies`,
+    // not disk. `loadAll` is idempotent (skips keys already cached) so
+    // calling it on every write is correctness, not just a boot-time nicety.
+    await this.loadAll();
+
     const resolvedOrigin = resolvePolicyOrigin(origin);
     const policyId = `pol-${Date.now()}-${toBase64url(randomBytes(8))}`;
     const now = new Date().toISOString();
@@ -378,7 +421,10 @@ export class PolicyStore {
     const policy: DisclosurePolicy = {
       policy_id: policyId,
       policy_name: policyName,
-      rules,
+      // Sanitized (LD3 gate DEFECT 1): never persist the caller-supplied
+      // `rules` array verbatim — see `sanitizeRules`'s doc for the
+      // unbounded-nested-field exploit this closes.
+      rules: sanitizeRules(rules),
       default_action: defaultAction,
       identity_id: identityId,
       owner_session: resolvedOrigin,
@@ -428,6 +474,16 @@ export class PolicyStore {
     identityId: string | undefined,
     origin: string | undefined
   ): Promise<PolicyWriteResult> {
+    // See `create()`'s matching comment (LD3 gate DEFECT 2): `update` also
+    // reads `this.policies.originOf` below, and a not-yet-rehydrated map
+    // after a restart would report `undefined` for a legitimately owned
+    // pre-restart policy (`get()` only caches the ONE record it happens to
+    // look up, not the full inventory), turning a legitimate owner's
+    // update into a spurious "forbidden". Rehydrating here keeps ownership
+    // resolution correct across a restart the same way it keeps the quota
+    // check correct in `create()`.
+    await this.loadAll();
+
     const resolvedOrigin = resolvePolicyOrigin(origin);
     const existing = await this.get(policyId);
     if (!existing) {
@@ -441,7 +497,9 @@ export class PolicyStore {
     const policy: DisclosurePolicy = {
       ...existing,
       policy_name: policyName,
-      rules,
+      // Sanitized (LD3 gate DEFECT 1) — same reconstruction as `create()`;
+      // `update` is the other write path that reaches `persist()`.
+      rules: sanitizeRules(rules),
       default_action: defaultAction,
       identity_id: identityId,
       updated_at: new Date().toISOString(),
@@ -502,6 +560,15 @@ export class PolicyStore {
    * simply refuses once a cap is hit and the loop continues past it. This
    * bounds in-memory working set from EVERY source, not only from calls
    * made after this fix shipped.
+   *
+   * Called from `create()`/`update()` (LD3 gate DEFECT 2) as well as
+   * `list()`: the quota/ownership checks in the write paths need the
+   * in-memory `BoundedMap` to already reflect what is durably stored, not
+   * only what THIS process instance has created since it started — see
+   * `create()`'s call site comment. Cheap to call repeatedly: the
+   * `this.policies.has(meta.key)` guard below skips every entry already
+   * cached, so a call after the first successful rehydrate only re-lists
+   * storage metadata and does no redundant decrypt work.
    */
   private async loadAll(): Promise<void> {
     try {
