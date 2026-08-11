@@ -54,6 +54,9 @@ import {
 } from "../../src/reputation/reputation-store.js";
 import { createReputationTools } from "../../src/reputation/tools.js";
 import {
+  buildBridgeAttestationMetrics,
+} from "../../src/reputation/bridge-metrics.js";
+import {
   SentinelFindingStore,
   SENTINEL_FINDING_NAMESPACE,
   SENTINEL_FINDING_KEY_PREFIX,
@@ -471,6 +474,7 @@ describe("LD6 BP-DEADLINE-03: bridge_attest durable admission-completion oracle"
       identityManager,
       signer,
       counterparty,
+      reputationStore,
       commit: findTool(bridgeTools, "bridge_commit"),
       attest: findTool(bridgeTools, "bridge_attest"),
       queueRejections,
@@ -559,6 +563,63 @@ describe("LD6 BP-DEADLINE-03: bridge_attest durable admission-completion oracle"
       expect(result.ok).toBe(true);
     }
 
+    expect((await rig.storage.list("_reputation")).length).toBe(1);
+  });
+
+  it("reconcile audit describes the STORED sovereignty tier, not the retry's freshly resolved tier", async () => {
+    const rig = setup();
+    const { commitmentId, outcome } = await seedAndCommit(rig);
+    const identityEncryptionKey = derivePurposeKey(
+      rig.masterKey,
+      "identity-encryption"
+    );
+
+    // Pre-seed the logical record with a tier different from bridge_attest's
+    // current local-signer resolution (self-attested). This models a record
+    // written under an older tier decision or by an earlier internal caller.
+    // bridge_attest must reconcile that durable record, not rewrite it.
+    const builtMetrics = buildBridgeAttestationMetrics(outcome, undefined);
+    const stored = await rig.reputationStore.record(
+      outcome.session_id,
+      rig.counterparty.publicIdentity.did,
+      {
+        type: "negotiation",
+        result: "completed",
+        metrics: builtMetrics.metrics,
+        metric_policy: builtMetrics.policy,
+      },
+      "concordia-bridge",
+      rig.signer.storedIdentity,
+      identityEncryptionKey,
+      undefined,
+      "unverified"
+    );
+
+    const result = await callToolSafe(rig.attest, {
+      bridge_commitment_id: commitmentId,
+      outcome_result: "completed",
+      identity_id: rig.signer.storedIdentity.identity_id,
+    });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value.already_attested).toBe(true);
+      expect(result.value.attestation_id).toBe(
+        stored.attestation.attestation_id
+      );
+    }
+
+    const freshAuditLog = new AuditLog(rig.storage, rig.masterKey);
+    const { entries } = await freshAuditLog.query({
+      operation_type: "bridge_attest",
+      limit: 100,
+    });
+    const success = entries.find(
+      (entry) =>
+        entry.result === "success" &&
+        entry.details?.["attestation_id"] ===
+          stored.attestation.attestation_id
+    );
+    expect(success?.details?.["sovereignty_tier"]).toBe("unverified");
     expect((await rig.storage.list("_reputation")).length).toBe(1);
   });
 });

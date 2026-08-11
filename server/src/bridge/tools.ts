@@ -20,6 +20,7 @@ import {
   ReputationStoreQuotaError,
   ReputationAlreadyRecordedError,
   ReputationIdOccupiedUnverifiedError,
+  type ReputationRecordAuditProjection,
 } from "../reputation/reputation-store.js";
 import {
   MAX_PENDING_ADMISSION_WAITERS,
@@ -1479,18 +1480,15 @@ export function createBridgeTools(
         // as an `InLockAuditEmit` closure and runs INSIDE record()'s
         // admission lock (either right after the write, or as the
         // reconcile step on an already-committed retry). Captures ONLY
-        // `auditLog` + primitive locals (`commitmentId`, `tier`) -- never
+        // `auditLog` + primitive locals (`commitmentId`) -- never
         // `reputationStore` -- so re-entry into any store's admission lock
         // from inside it does not happen HERE, by CONVENTION, not by a
         // type-system guarantee -- see `ReputationInLockAuditEmit`'s doc
         // (reputation-store.ts) for why the callback type cannot enforce
         // this on its own (V2-5 gap-5).
-        const emitReputationAudit = async (projection: {
-          attestation_id: string;
-          interaction_id: string;
-          counterparty_did: string;
-          context: string;
-        }): Promise<void> => {
+        const emitReputationAudit = async (
+          projection: ReputationRecordAuditProjection
+        ): Promise<void> => {
           await auditLog.appendCritical({
             layer: "l4",
             operation: "bridge_attest",
@@ -1501,7 +1499,11 @@ export function createBridgeTools(
               session_id: projection.interaction_id,
               attestation_id: projection.attestation_id,
               counterparty_did: projection.counterparty_did,
-              sovereignty_tier: tier,
+              // Reconcile-audit fidelity: on an idempotent retry this is
+              // the STORED record's tier, not the current call's freshly
+              // resolved `tier`. A legacy/pre-existing record can carry a
+              // different tier; its audit must describe what is durable.
+              sovereignty_tier: projection.sovereignty_tier,
             },
           });
         };
