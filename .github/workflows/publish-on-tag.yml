@@ -48,20 +48,17 @@ jobs:
       contents: write
       id-token: write
 
-    # Job-level env so the "Require release signing key" probe step below can
-    # test the SAME value the sign step's key is mapped from. Probing this env
-    # var is probing the secret's delivery into this job, not a proxy for it.
-    env:
-      RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
-
     steps:
+      # CSO-CICD-02 (supply-chain pin): release-triggered workflows call
+      # third-party actions by immutable commit SHA, not a mutable tag, so a
+      # hijacked upstream tag cannot inject code into this privileged job.
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.ref != '' && inputs.ref || github.ref }}
 
       - name: Use Node.js 24
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
           registry-url: "https://registry.npmjs.org"
@@ -119,19 +116,32 @@ jobs:
       # This runs BEFORE the install/test/build/publish steps so that a
       # missing key aborts the run in seconds — before the irreversible
       # `npm publish` — rather than discovering the gap after the package is
-      # already live. The predicate probed here (job env RELEASE_SIGNING_KEY,
-      # mapped from the repository secret of the same name) is the same value
-      # the sign step's SANCTUARY_RELEASE_SIGNING_KEY_B64URL is mapped from,
-      # so a pass here means the key genuinely reaches the signing step; there
-      # is no separate proxy that can drift. Only presence is probed; the
-      # value is never printed (GitHub masks it regardless).
+      # already live. The predicate probed here (step-level env
+      # RELEASE_SIGNING_KEY, mapped from the repository secret of the same
+      # name) reads the identical secrets expression the sign step's
+      # SANCTUARY_RELEASE_SIGNING_KEY_B64URL is mapped from, so a pass here
+      # means the key genuinely reaches the signing step; there is no
+      # separate proxy that can drift. Only presence is probed; the value is
+      # never printed (GitHub masks it regardless).
+      #
+      # CSO-CICD-01 (supply-chain pin): the secret is scoped with a
+      # step-level `env:` here, not a job-level one, so it is present ONLY
+      # for the duration of this probe step's process. It is out of scope
+      # again for every later step until the dedicated "Sign + attach
+      # release manifest" step re-declares it at step level. In particular
+      # it is never in scope during "Install libsecret + Secret Service
+      # backend" below, which runs unpinned-by-default third-party pip
+      # installs; a compromised dependency executing there has no path to
+      # this secret's value.
       - name: Require release signing key (fail closed)
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
         run: |
           if [[ -z "${RELEASE_SIGNING_KEY}" ]]; then
-            echo "::error::The RELEASE_SIGNING_KEY repository secret is empty or is not reaching this job (checked the job-level env mapped from secrets.RELEASE_SIGNING_KEY). The release-signing key was activated 2026-07-01 and the shipped product pins its public half, so publishing WITHOUT a signed manifest would break the signed self-update path. Refusing to publish. Fix: restore the RELEASE_SIGNING_KEY secret (see .github/RELEASING.md) and re-run."
+            echo "::error::The RELEASE_SIGNING_KEY repository secret is empty or is not reaching this step (checked the step-level env mapped from secrets.RELEASE_SIGNING_KEY). The release-signing key was activated 2026-07-01 and the shipped product pins its public half, so publishing WITHOUT a signed manifest would break the signed self-update path. Refusing to publish. Fix: restore the RELEASE_SIGNING_KEY secret (see .github/RELEASING.md) and re-run."
             exit 1
           fi
-          echo "RELEASE_SIGNING_KEY is present in the job environment; the sign step will receive it."
+          echo "RELEASE_SIGNING_KEY is present in the repository secrets; the sign step will receive it."
 
       - name: Install dependencies
         working-directory: server
@@ -141,7 +151,7 @@ jobs:
         run: npm run check:release-dependency-pins
 
       - name: Set up Python 3.12 for Concordia sidecar
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
 
