@@ -18,6 +18,7 @@ import {
   REPUTATION_UNKNOWN_ORIGIN,
   ReputationStore,
   ReputationStoreQuotaError,
+  ReputationImportDuplicateTupleError,
   buildReputationCompletenessManifest,
   reputationBundleSigningBytes,
   trustedSovereigntyTier,
@@ -1551,6 +1552,142 @@ describe("L4 Reputation Store", () => {
       // reached storage.
       const entries = await backing.list("_reputation");
       expect(entries.length).toBe(3);
+    });
+  });
+
+  describe("LD6 gate re-fix: importBundle fails closed on a re-derived-id collision", () => {
+    // The id-derivation fix (LD6 BP-DEADLINE-03 fix-round) closed the
+    // pre-seed vector by re-deriving each imported attestation's id from
+    // its own signed tuple, but left a NEW gap: two entries that share an
+    // identical (interaction_id, participant_did, counterparty_did,
+    // context) tuple derive the SAME content-id key, and the pre-fix write
+    // loop persisted the SECOND one over the FIRST at that shared key
+    // while still incrementing `imported` for both -- a verified 2-record
+    // bundle would durably persist only 1 record while reporting 2.
+    // MUTATION-PROOF: reverting the pre-write duplicate-tuple guard (the
+    // `derivedIdsSeen` pass in importBundle, reputation-store.ts) makes
+    // this test fail -- the import would resolve instead of throwing, and
+    // it would leave exactly 1 (not 0) record in `_reputation`.
+    it("refuses the WHOLE bundle, ALL-OR-NOTHING, when two attestations derive the same id from an identical tuple", async () => {
+      const exporterMasterKey = generateRandomKey();
+      const exporterStorage = new MemoryStorage();
+      const exporterStore = new ReputationStore(exporterStorage, exporterMasterKey);
+      const { identity: exporterIdentity, encryptionKey: exporterEncKey } =
+        setupIdentity(exporterMasterKey, "dup-tuple-exporter");
+
+      // Two genuinely distinct, independently-recorded attestations --
+      // record()'s own existence guard would collapse a literal duplicate
+      // tuple at RECORD time, so the collision has to be introduced on the
+      // exported bundle itself, exactly as a replayed or hand-crafted
+      // bundle would present it to an importer.
+      await exporterStore.record(
+        "dup-1",
+        "did:key:cp1",
+        { type: "transaction", result: "completed" },
+        "general",
+        exporterIdentity,
+        exporterEncKey
+      );
+      await exporterStore.record(
+        "dup-2",
+        "did:key:cp2",
+        { type: "transaction", result: "completed" },
+        "general",
+        exporterIdentity,
+        exporterEncKey
+      );
+      const bundle = await exporterStore.exportBundle(
+        exporterIdentity,
+        exporterEncKey
+      );
+      expect(bundle.attestations).toHaveLength(2);
+
+      // Force the SECOND attestation's identifying tuple to collide with
+      // the first's, then re-sign every attestation and the bundle itself
+      // (resignAttestationAndBundle) so the bundle is a validly-signed,
+      // completeness-verified artifact -- the collision is the ONLY thing
+      // wrong with it.
+      const collidingBundle = cloneBundle(bundle);
+      collidingBundle.attestations[1]!.data = {
+        ...collidingBundle.attestations[1]!.data,
+        interaction_id: collidingBundle.attestations[0]!.data.interaction_id,
+        participant_did: collidingBundle.attestations[0]!.data.participant_did,
+        counterparty_did: collidingBundle.attestations[0]!.data.counterparty_did,
+        context: collidingBundle.attestations[0]!.data.context,
+      };
+      resignAttestationAndBundle(
+        collidingBundle,
+        exporterIdentity,
+        exporterEncKey
+      );
+
+      const targetStorage = new MemoryStorage();
+      const targetStore = new ReputationStore(
+        targetStorage,
+        generateRandomKey()
+      );
+      const publicKeys = publicKeysFor(exporterIdentity);
+
+      await expect(
+        targetStore.importBundle(collidingBundle, true, publicKeys)
+      ).rejects.toThrow(ReputationImportDuplicateTupleError);
+
+      // ALL-OR-NOTHING: nothing was written, not even one of the two
+      // colliding entries -- the fail-closed refusal happens BEFORE any
+      // write, never a silent one-survives-the-other collapse.
+      expect((await targetStorage.list("_reputation")).length).toBe(0);
+    });
+
+    // The fix must not break a genuinely idempotent re-import: importing
+    // the SAME already-verified bundle a second time hits the
+    // "already-stored, same content" branch (not the within-bundle
+    // duplicate guard) and must no-op each record rather than throwing or
+    // duplicating storage, while still reporting a truthful count.
+    it("re-importing the identical bundle a second time is idempotent: no throw, no duplicate storage, truthful count", async () => {
+      const exporterMasterKey = generateRandomKey();
+      const exporterStore = new ReputationStore(
+        new MemoryStorage(),
+        exporterMasterKey
+      );
+      const { identity: exporterIdentity, encryptionKey: exporterEncKey } =
+        setupIdentity(exporterMasterKey, "reimport-exporter");
+      await exporterStore.record(
+        "reimport-1",
+        "did:key:cp1",
+        { type: "transaction", result: "completed" },
+        "general",
+        exporterIdentity,
+        exporterEncKey
+      );
+      await exporterStore.record(
+        "reimport-2",
+        "did:key:cp2",
+        { type: "transaction", result: "completed" },
+        "general",
+        exporterIdentity,
+        exporterEncKey
+      );
+      const bundle = await exporterStore.exportBundle(
+        exporterIdentity,
+        exporterEncKey
+      );
+      expect(bundle.attestations).toHaveLength(2);
+
+      const targetStorage = new MemoryStorage();
+      const targetStore = new ReputationStore(
+        targetStorage,
+        generateRandomKey()
+      );
+      const publicKeys = publicKeysFor(exporterIdentity);
+
+      const first = await targetStore.importBundle(bundle, true, publicKeys);
+      expect(first.imported).toBe(2);
+      expect((await targetStorage.list("_reputation")).length).toBe(2);
+
+      const second = await targetStore.importBundle(bundle, true, publicKeys);
+      expect(second.imported).toBe(2);
+      // No-op, not a duplicate write: still exactly 2 records.
+      expect((await targetStorage.list("_reputation")).length).toBe(2);
     });
   });
 

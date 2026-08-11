@@ -751,6 +751,37 @@ export class ReputationIdOccupiedUnverifiedError extends Error {
 }
 
 /**
+ * Thrown by `importBundle()`'s pre-write duplicate-tuple guard (LD6 gate
+ * re-fix, closing the re-derived-id-collision residual the id-derivation
+ * fix left open) when TWO entries in the SAME bundle derive the same
+ * content id -- i.e. they share an identical (interaction_id,
+ * participant_did, counterparty_did, context) tuple. Before this guard,
+ * the second entry's write silently overwrote the first at their shared
+ * derived key while the loop still incremented `imported` for both, so a
+ * verified N-record bundle could durably persist FEWER than N records
+ * while the returned count claimed N. This error refuses the WHOLE bundle,
+ * before any write, the moment a collision is found -- the same
+ * "whole bundle invalid, NOTHING written" shape signature verification and
+ * the quota check already use on this method, never a silent partial
+ * import with a lying count.
+ */
+export class ReputationImportDuplicateTupleError extends Error {
+  readonly interactionId: string;
+  readonly context: string;
+  constructor(interactionId: string, context: string) {
+    super(
+      "Reputation bundle import refused: two attestations derive the same " +
+      "content id from an identical (interaction_id, participant_did, " +
+      "counterparty_did, context) tuple; a bundle must not contain " +
+      "duplicate-tuple attestations."
+    );
+    this.name = "ReputationImportDuplicateTupleError";
+    this.interactionId = interactionId;
+    this.context = context;
+  }
+}
+
+/**
  * The plain projection an in-lock audit callback needs -- nothing more.
  * Carries only already-computed primitive fields, never a store handle.
  */
@@ -1969,6 +2000,76 @@ export class ReputationStore {
     const resolvedOrigin = ReputationStore.resolveOrigin(origin);
     const contexts = new Set<string>();
 
+    // FIX 3 (LD6 BP-DEADLINE-03 fix-round, predictable-import-id close):
+    // the bundle's own `attestation_id` field is NOT part of the signed
+    // bytes (`dataBytes` in record() is `JSON.stringify(attestationData)`,
+    // which never includes `attestation_id`), so a validly-self-signed
+    // attestation can claim ANY `attestation_id` string -- including one
+    // precomputed via the PUBLIC `deriveReputationAttestationId` formula
+    // to collide with a tuple this instance has not recorded yet. Writing
+    // at the caller-claimed id directly would let an approved-but-
+    // malicious bundle pre-seed that predictable key; a future legitimate
+    // record() call for the real tuple would then find the key occupied
+    // by content that fails intent verification (`verifyStoredAttestationIntent`)
+    // and fail closed (`occupied_unverified`) -- never hijacked, but
+    // permanently blocked for that one tuple. Re-deriving the id from
+    // the attestation's OWN `data` fields (never trusting the bundle's
+    // `attestation_id`) closes the "arbitrary caller-chosen id
+    // disconnected from the signed content" vector: the storage key an
+    // imported record lands at is now always exactly what its own
+    // (interaction_id, participant_did, counterparty_did, context)
+    // tuple derives to, matching record()'s own id-derivation contract
+    // instead of trusting bundle metadata.
+    //
+    // DEBT (honest residual, not closed by this fix): `data.participant_did`
+    // itself is still bundle-supplied and is NOT required to equal
+    // `attestation.signer` here, so a sufficiently informed attacker who
+    // already knows a victim's exact future (interaction_id,
+    // participant_did, counterparty_did, context) tuple can still craft
+    // a self-signed attestation with THOSE exact `data` fields and land
+    // at the SAME derived key -- the future legitimate write then still
+    // hits `occupied_unverified` (the stored signature will not verify
+    // against the real participant's public key) and fails closed. This
+    // residual is bounded (one specific, pre-known tuple; the outcome is
+    // a fail-closed refusal, never a hijacked or corrupted record) and
+    // operator-gated (`reputation_import` is Tier-1, human-approved) --
+    // register it rather than claim full closure.
+    //
+    // LD6 gate re-fix (this fix): re-deriving the id closed the pre-seed
+    // vector but opened a NEW one -- two bundle entries can legitimately
+    // derive the SAME id (an identical tuple appearing twice, whether by a
+    // duplicate export, a replay, or a crafted bundle), and the write loop
+    // used to persist them at that one shared key with plain last-wins
+    // overwrite while still counting both. This pre-pass computes every
+    // entry's derived id BEFORE any write (and before the admission lock,
+    // since it only inspects the caller-supplied bundle, never store
+    // state) and refuses the WHOLE bundle the instant two entries collide
+    // -- the same "whole bundle invalid, NOTHING written" shape signature
+    // verification and the quota check below already use, so a refusal
+    // here can never be confused with a partial, silently-collapsed
+    // import. See `ReputationImportDuplicateTupleError`'s doc.
+    const derivedIdsSeen = new Map<string, string>();
+    const attestationsWithIds: Array<{
+      attestation: Attestation;
+      derivedAttestationId: string;
+    }> = [];
+    for (const attestation of bundle.attestations) {
+      const derivedAttestationId = deriveReputationAttestationId(
+        attestation.data.interaction_id,
+        attestation.data.participant_did,
+        attestation.data.counterparty_did,
+        attestation.data.context
+      );
+      if (derivedIdsSeen.has(derivedAttestationId)) {
+        throw new ReputationImportDuplicateTupleError(
+          attestation.data.interaction_id,
+          attestation.data.context
+        );
+      }
+      derivedIdsSeen.set(derivedAttestationId, attestation.data.context);
+      attestationsWithIds.push({ attestation, derivedAttestationId });
+    }
+
     // MUST-FIX 1: quota check + every write for this bundle run inside ONE
     // admission-locked, deadline-bounded section (runAdmissionExclusiveBounded
     // — the same primitive record() uses), so a concurrent record(),
@@ -1984,47 +2085,80 @@ export class ReputationStore {
       );
 
       let count = 0;
-      for (const attestation of bundle.attestations) {
-        // FIX 3 (LD6 BP-DEADLINE-03 fix-round, predictable-import-id close):
-        // the bundle's own `attestation_id` field is NOT part of the signed
-        // bytes (`dataBytes` in record() is `JSON.stringify(attestationData)`,
-        // which never includes `attestation_id`), so a validly-self-signed
-        // attestation can claim ANY `attestation_id` string -- including one
-        // precomputed via the PUBLIC `deriveReputationAttestationId` formula
-        // to collide with a tuple this instance has not recorded yet. Writing
-        // at the caller-claimed id directly would let an approved-but-
-        // malicious bundle pre-seed that predictable key; a future legitimate
-        // record() call for the real tuple would then find the key occupied
-        // by content that fails intent verification (`verifyStoredAttestationIntent`)
-        // and fail closed (`occupied_unverified`) -- never hijacked, but
-        // permanently blocked for that one tuple. Re-deriving the id from
-        // the attestation's OWN `data` fields (never trusting the bundle's
-        // `attestation_id`) closes the "arbitrary caller-chosen id
-        // disconnected from the signed content" vector: the storage key an
-        // imported record lands at is now always exactly what its own
-        // (interaction_id, participant_did, counterparty_did, context)
-        // tuple derives to, matching record()'s own id-derivation contract
-        // instead of trusting bundle metadata.
-        //
-        // DEBT (honest residual, not closed by this fix): `data.participant_did`
-        // itself is still bundle-supplied and is NOT required to equal
-        // `attestation.signer` here, so a sufficiently informed attacker who
-        // already knows a victim's exact future (interaction_id,
-        // participant_did, counterparty_did, context) tuple can still craft
-        // a self-signed attestation with THOSE exact `data` fields and land
-        // at the SAME derived key -- the future legitimate write then still
-        // hits `occupied_unverified` (the stored signature will not verify
-        // against the real participant's public key) and fails closed. This
-        // residual is bounded (one specific, pre-known tuple; the outcome is
-        // a fail-closed refusal, never a hijacked or corrupted record) and
-        // operator-gated (`reputation_import` is Tier-1, human-approved) --
-        // register it rather than claim full closure.
-        const derivedAttestationId = deriveReputationAttestationId(
-          attestation.data.interaction_id,
-          attestation.data.participant_did,
-          attestation.data.counterparty_did,
-          attestation.data.context
-        );
+      for (const { attestation, derivedAttestationId } of attestationsWithIds) {
+        const tuple = {
+          interaction_id: attestation.data.interaction_id,
+          participant_did: attestation.data.participant_did,
+          counterparty_did: attestation.data.counterparty_did,
+          context: attestation.data.context,
+        };
+
+        // The derived key can also already be occupied by a record from a
+        // PRIOR import or record() call -- not from THIS bundle, so the
+        // duplicate-tuple pre-pass above cannot see it. Recompute-then-
+        // verify with the SAME intent check record()'s existence guard
+        // uses (`verifyStoredAttestationIntent`: recompute the id from the
+        // stored record's own fields, verify its signature against the
+        // signer's OWN public key, and require exact tuple equality)
+        // before ever writing here. `signerKey` is guaranteed present:
+        // verifyBundleForImport above already refused the whole bundle if
+        // any signer's key were unknown (inspectAttestationSignatures
+        // counts a missing key as invalid). The lookup is defensive, not
+        // load-bearing, but still fails closed rather than trusting an
+        // unreachable branch.
+        const signerKey = publicKeys.get(attestation.signer);
+        if (!signerKey) {
+          throw new ReputationIdOccupiedUnverifiedError();
+        }
+
+        let existingRaw: Uint8Array | null;
+        try {
+          existingRaw = await this.storage.read("_reputation", derivedAttestationId);
+        } catch {
+          // Mirrors findVerifiedExistingRecord's "scan_unavailable": the
+          // read itself failed, so this cannot confirm the key is free.
+          // Refuse rather than assume absence and overwrite blind.
+          throw new ReputationStoreQuotaError("scan_unavailable");
+        }
+
+        if (existingRaw !== null) {
+          let existingCandidate: StoredAttestation;
+          try {
+            const encryptedExisting: EncryptedPayload = JSON.parse(
+              bytesToString(existingRaw)
+            );
+            const decryptedExisting = decrypt(encryptedExisting, this.encryptionKey);
+            existingCandidate = JSON.parse(bytesToString(decryptedExisting));
+          } catch {
+            // Undecryptable/corrupted content at the derived key cannot be
+            // a legitimate prior commit (a genuine write always round-
+            // trips) -- occupied-but-unverified, never treated as free.
+            throw new ReputationIdOccupiedUnverifiedError();
+          }
+
+          const isIdempotentMatch = this.verifyStoredAttestationIntent(
+            existingCandidate,
+            tuple,
+            signerKey,
+            derivedAttestationId
+          );
+          if (!isIdempotentMatch) {
+            // Occupied by content that does not verify as the SAME
+            // logical record: never overwrite a foreign or mismatched
+            // record just because its key matches.
+            throw new ReputationIdOccupiedUnverifiedError();
+          }
+
+          // Idempotent: the exact same content is already durably stored
+          // under this id (e.g. a re-import of a bundle already imported
+          // once). No-op the write, but still count it -- the caller's
+          // N-record bundle correctly ends up N records represented, and
+          // the returned count stays truthful.
+          count++;
+          contexts.add(attestation.data.context);
+          continue;
+        }
+
         const importedAttestation: Attestation = {
           ...attestation,
           attestation_id: derivedAttestationId,
