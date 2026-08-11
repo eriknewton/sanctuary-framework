@@ -18,7 +18,8 @@ import { AGENT_UNKNOWN_ORIGIN } from "../handshake/tools.js";
 import {
   ReputationStore,
   ReputationStoreQuotaError,
-  type StoredAttestation,
+  ReputationAlreadyRecordedError,
+  ReputationIdOccupiedUnverifiedError,
 } from "../reputation/reputation-store.js";
 import {
   MAX_PENDING_ADMISSION_WAITERS,
@@ -40,6 +41,7 @@ import {
 import {
   createBridgeCommitment,
   verifyBridgeCommitment,
+  deriveBridgeCommitmentId,
 } from "./bridge.js";
 import type {
   ConcordiaOutcome,
@@ -139,11 +141,76 @@ export class BridgeStoreQuotaError extends Error {
   }
 }
 
+// ─── Content-derived commitment ids + existence guard (LD6 BP-DEADLINE-03) ─
+//
+// Admission_Completion_Design_Brief_2026-08-11.md V2-3/V2-4: bridge_commit
+// used to mint `bridge-${Date.now()}-${rand}`, so a caller that timed out
+// waiting for admission had no safe key to retry -- re-issuing the SAME
+// negotiation minted a SECOND commitment and doubled quota. `bridge.ts` now
+// derives the id from `(session_id, terms_hash, committer_did)` (see
+// `deriveBridgeCommitmentId`); `BridgeStore.save` below adds the in-lock
+// existence guard that makes a retry resolve to the SAME record.
+
+/**
+ * Thrown by `BridgeStore.save`'s existence guard when the content-derived
+ * key is OCCUPIED by a record that FAILS intent verification (recompute-
+ * from-stored-fields, signature, or tuple equality -- see
+ * `verifyStoredCommitmentIntent`'s doc). Never overwritten, never silently
+ * treated as success. Distinct from `BridgeStoreQuotaError`
+ * ("scan_unavailable"): that reason means the guard's own scan could not
+ * complete; this one means the scan completed and found something that does
+ * not check out.
+ */
+export class BridgeIdOccupiedUnverifiedError extends Error {
+  constructor() {
+    super(
+      "Bridge commitment store: the derived commitment id is occupied by a " +
+      "record that failed intent verification; refusing to write."
+    );
+    this.name = "BridgeIdOccupiedUnverifiedError";
+  }
+}
+
+/**
+ * The plain projection an in-lock audit callback needs -- nothing more.
+ * Carries only already-computed primitive fields, never a store handle.
+ */
+export interface BridgeCommitmentAuditProjection {
+  bridge_commitment_id: string;
+  session_id: string;
+  counterparty_did: string;
+}
+
+/**
+ * Callback invoked INSIDE `BridgeStore.save`'s admission lock (V2-2/V2-5),
+ * either immediately after a NEW commitment is durably written, or as the
+ * reconcile step when the existence guard finds an already-committed match
+ * whose audit may have been lost to a prior crash. The parameter type
+ * exposes ONLY the plain projection above -- no `BridgeStore` reference, no
+ * storage handle, no admission-queue accessor -- so re-entry into ANY
+ * store's admission lock from inside this callback is not expressible in
+ * the type system (V2-5 gap-5 re-entry prohibition). Construct the closure
+ * passed here by capturing `auditLog` + plain data ONLY, never
+ * `bridgeStore` / `storage`.
+ */
+export type BridgeInLockAuditEmit = (
+  projection: BridgeCommitmentAuditProjection
+) => Promise<void>;
+
+/** `BridgeStore.save`'s result: which commitment/outcome the CALLER should
+ * use downstream. On a reconciled retry (`alreadyCommitted: true`) this is
+ * the STORED record, never the freshly re-signed one the caller built for
+ * this call (bridge signs `committed_at = now`, so a naive overwrite would
+ * leave two byte-distinct-but-valid records racing for one key -- the
+ * existence guard is what closes that, by never writing the new one). */
+export interface BridgeSaveResult {
+  commitment: BridgeCommitment;
+  outcome: ConcordiaOutcome;
+  alreadyCommitted: boolean;
+}
+
 /** Reason a bridge_attest reputation-context write was refused (LD3 gate fix-round DEFECT 2). */
-export type BridgeAttestOriginQuotaRefuseReason =
-  | "origin_quota"
-  | "scan_unavailable"
-  | "dedup_scan_unavailable";
+export type BridgeAttestOriginQuotaRefuseReason = "origin_quota" | "scan_unavailable";
 
 /**
  * Typed refusal thrown by bridge_attest's `additionalQuotaCheck` callback
@@ -155,14 +222,16 @@ export type BridgeAttestOriginQuotaRefuseReason =
  * chokepoint bound, checked in the same admission-locked section — see
  * reputation-store.ts). No `capacity` reason here: this check only ever
  * enforces the per-origin share of ONE context, not a global ceiling on
- * that context. `dedup_scan_unavailable` (LD3 gate fix-round-2, MUST-FIX 4)
- * is distinct from `scan_unavailable`: the former is the ATOMIC in-lock
- * dedup re-scan (checkAttestAdmission's first step) failing to enumerate
- * `_reputation`, the latter is the origin-quota scan (its second step)
- * failing — kept as separate reasons, not coalesced, so the audit trail and
- * the error text tell an operator WHICH scan could not confirm its result,
- * rather than a generic "quota headroom" message that would be wrong for a
- * dedup-scan failure (that scan is about uniqueness, not headroom).
+ * that context.
+ *
+ * LD6 BP-DEADLINE-03: this error's reason set used to include
+ * `dedup_scan_unavailable` for a same-negotiation dedup re-scan this
+ * closure ran itself. That dedup is now STRUCTURAL -- `record()`'s own
+ * existence guard (reputation-store.ts, `findVerifiedExistingRecord`)
+ * performs it INSIDE the same lock, before this closure even runs, and
+ * signals a scan failure via `ReputationStoreQuotaError("scan_unavailable")`
+ * instead (see the tool handler's catch block). This closure now enforces
+ * ONLY the origin-quota share described above.
  */
 export class BridgeAttestOriginQuotaError extends Error {
   readonly reason: BridgeAttestOriginQuotaRefuseReason;
@@ -170,49 +239,11 @@ export class BridgeAttestOriginQuotaError extends Error {
     super(
       reason === "origin_quota"
         ? "Bridge attestation store: origin per-write quota exceeded"
-        : reason === "dedup_scan_unavailable"
-          ? "Bridge attestation store: could not confirm this negotiation " +
-            "was not already attested (storage scan failed); refusing to write"
-          : "Bridge attestation store: could not confirm quota headroom " +
-            "(storage scan failed); refusing to write"
+        : "Bridge attestation store: could not confirm quota headroom " +
+          "(storage scan failed); refusing to write"
     );
     this.name = "BridgeAttestOriginQuotaError";
     this.reason = reason;
-  }
-}
-
-/**
- * Thrown from `bridge_attest`'s `additionalQuotaCheck` closure (LD3 gate
- * fix-round-2, MUST-FIX 4) when the ATOMIC, in-lock dedup re-scan finds an
- * existing attestation for this same negotiation. Carries `existing` so the
- * catch site can return the SAME idempotent "already_attested" response the
- * pre-fix outer pre-check returned, without a second storage scan.
- *
- * WHY THIS EXISTS (the race this closes): the pre-fix version ran
- * `findExistingAttestationForDedup` ONCE, before calling
- * `reputationStore.record()`, with an await gap between that scan and the
- * eventual write — record()'s own admission lock did not exist yet at that
- * point in the call. Two concurrent `bridge_attest` calls for the SAME
- * commitment could both run the scan, both see no match (neither has
- * written yet), and both then persist a fresh attestation, double-counting
- * one negotiation. Re-running the SAME scan as part of record()'s
- * `additionalQuotaCheck` — which executes INSIDE record()'s
- * per-instance admission lock, immediately before the write, with no await
- * gap between the recheck and the write — makes the second of two
- * concurrent calls observe the FIRST call's already-completed write (the
- * admission lock serializes them), so the second throws this error instead
- * of persisting a duplicate. Single-process only: two SEPARATE server
- * processes racing the same commitment are not covered (no shared
- * admission lock across processes) — a documented, accepted DEBT, same
- * class as the bridge self-inflation DEBT above and cross-process
- * uniqueness generally (Erik: cross-process is the deferred follow-up).
- */
-export class BridgeAttestDuplicateError extends Error {
-  readonly existing: StoredAttestation;
-  constructor(existing: StoredAttestation) {
-    super("Bridge attestation store: duplicate attestation for this negotiation");
-    this.name = "BridgeAttestDuplicateError";
-    this.existing = existing;
   }
 }
 
@@ -230,6 +261,19 @@ function resolveBridgeOrigin(callerIdentity: string | undefined): string {
   return callerIdentity && callerIdentity.length > 0
     ? callerIdentity
     : AGENT_UNKNOWN_ORIGIN;
+}
+
+/**
+ * The counterparty relative to `commitment.committer_did`: whichever of
+ * `proposer_did`/`acceptor_did` is NOT the committer. Used to build the
+ * `BridgeCommitmentAuditProjection` for both a fresh write and a
+ * reconciled existence-guard hit, so the audit detail is identical either
+ * way.
+ */
+function counterpartyDidOf(commitment: BridgeCommitment, outcome: ConcordiaOutcome): string {
+  return outcome.proposer_did === commitment.committer_did
+    ? outcome.acceptor_did
+    : outcome.proposer_did;
 }
 
 /**
@@ -325,18 +369,35 @@ class BridgeStore {
    * (core/bounded-map.ts — shared, not re-derived); same test-only-override
    * shape.
    */
+  /**
+   * V2-4 sunset flag: gates the legacy tuple-scan fallback (see
+   * `findExistingCommitmentForTuple`) that lets a caller retry with an OLD
+   * random-format id still resolve to its existing record. Defaults to
+   * `true` (production always scans) -- an operator would flip this off
+   * only after running an out-of-band migration that re-keys every legacy
+   * record to its content id, at which point the guard collapses to a
+   * single content-id read. DEBT (owed, not built here -- out of scope per
+   * the design brief V2-4 "optional operator-run maintenance verb"): no
+   * `migrate-bridge-ids` CLI verb exists yet, so this flag has no way to
+   * be safely turned off today; it stays `true` in practice until that
+   * verb ships.
+   */
+  private readonly legacyIdScanEnabled: boolean;
+
   constructor(
     storage: StorageBackend,
     masterKey: Uint8Array,
     maxCommitments: number = MAX_BRIDGE_COMMITMENTS,
     maxCommitmentsPerOrigin: number = MAX_BRIDGE_COMMITMENTS_PER_ORIGIN,
-    maxPendingAdmissionWaiters: number = MAX_PENDING_ADMISSION_WAITERS
+    maxPendingAdmissionWaiters: number = MAX_PENDING_ADMISSION_WAITERS,
+    legacyIdScanEnabled: boolean = true
   ) {
     this.storage = storage;
     this.encryptionKey = derivePurposeKey(masterKey, "bridge-commitments");
     this.maxCommitments = maxCommitments;
     this.maxCommitmentsPerOrigin = maxCommitmentsPerOrigin;
     this.maxPendingAdmissionWaiters = maxPendingAdmissionWaiters;
+    this.legacyIdScanEnabled = legacyIdScanEnabled;
   }
 
   /**
@@ -414,12 +475,58 @@ class BridgeStore {
    * BoundedMap's `admissionQueue`), so no other save() can observe state
    * between this call's check and its write.
    */
+  /**
+   * `committerPublicKey` (LD6 BP-DEADLINE-03): the CURRENT identity's own
+   * public key, used by the existence guard to verify a matched record's
+   * signature -- see `verifyStoredCommitmentIntent`'s doc for why the
+   * current caller's key (not a general DID resolver) is sound here.
+   * `emitAudit` (V2-2/V2-5): runs INSIDE this method's admission lock,
+   * either right after a NEW commitment durably writes, or as the
+   * reconcile step when the existence guard finds an already-committed
+   * match -- see `BridgeInLockAuditEmit`'s doc.
+   */
   async save(
     commitment: BridgeCommitment,
     outcome: ConcordiaOutcome,
-    origin: string
-  ): Promise<void> {
-    await this.runAdmissionExclusiveBounded(async () => {
+    origin: string,
+    committerPublicKey: Uint8Array,
+    emitAudit: BridgeInLockAuditEmit
+  ): Promise<BridgeSaveResult> {
+    return this.runAdmissionExclusiveBounded(async () => {
+      // LD6 BP-DEADLINE-03 (V2-2/V2-3/V2-4): the existence guard runs
+      // FIRST, inside the lock, before quota or write -- a retry of this
+      // exact (session_id, terms_hash, committer_did) tuple (content-id
+      // hit) or a pre-upgrade retry carrying an old random id (legacy-scan
+      // hit) always observes a prior admission's completed write instead
+      // of racing it. An id match ALONE never authorizes
+      // `already_committed`; see findVerifiedExistingCommitment's doc.
+      const tuple = {
+        session_id: commitment.session_id,
+        terms_hash: outcome.terms_hash,
+        committer_did: commitment.committer_did,
+      };
+      const existing = await this.findVerifiedExistingCommitment(
+        commitment.bridge_commitment_id,
+        tuple,
+        committerPublicKey
+      );
+      if (existing === "scan_unavailable") {
+        throw new BridgeStoreQuotaError("scan_unavailable");
+      }
+      if (existing === "occupied_unverified") {
+        throw new BridgeIdOccupiedUnverifiedError();
+      }
+      if (existing !== null) {
+        // Reconcile: a record that committed but lost its audit to a prior
+        // crash (the V2-2 named residual) gets its audit re-emitted here.
+        await emitAudit({
+          bridge_commitment_id: existing.commitment.bridge_commitment_id,
+          session_id: existing.commitment.session_id,
+          counterparty_did: counterpartyDidOf(existing.commitment, existing.outcome),
+        });
+        return { commitment: existing.commitment, outcome: existing.outcome, alreadyCommitted: true };
+      }
+
       await this.assertOriginWithinQuota(origin);
 
       const record = { commitment, outcome, origin };
@@ -430,7 +537,202 @@ class BridgeStore {
         commitment.bridge_commitment_id,
         stringToBytes(JSON.stringify(encrypted))
       );
+
+      // V2-2: the success audit is emitted INSIDE this same locked
+      // section, immediately after the durable write settles -- write-first,
+      // then an AWAITED appendCritical, never the reverse. This gives
+      // "eventual, self-healing commit<->audit agreement", NOT atomicity: a
+      // crash between the write above becoming durable and this append
+      // becoming durable leaves a committed-but-unaudited record, which is
+      // transient and self-healing (the reconcile branch above re-emits it
+      // on the next retry or guard-read) but not reducible to zero within
+      // one process (no cross-log transaction primitive exists on
+      // StorageBackend -- see the design brief V2-2). If `emitAudit` THROWS
+      // here (audit backend down -- a failure, not a crash), this call
+      // REJECTS: the write already landed, but the caller is NEVER told
+      // success without a durable audit. The record stays in place for an
+      // idempotent retry, which re-enters the guard above and re-emits the
+      // audit.
+      await emitAudit({
+        bridge_commitment_id: commitment.bridge_commitment_id,
+        session_id: commitment.session_id,
+        counterparty_did: counterpartyDidOf(commitment, outcome),
+      });
+
+      return { commitment, outcome, alreadyCommitted: false };
     });
+  }
+
+  /**
+   * V2-3/V2-4 existence guard used by `save()`. Looks for a commitment
+   * already committed for `tuple`, either at the content-derived
+   * `contentId` (primary) or via the legacy tuple-scan
+   * (`findExistingCommitmentForTuple` -- a pre-upgrade random-id record).
+   * Returns:
+   *   - the STORED `{commitment, outcome}`, when a match passes intent
+   *     verification;
+   *   - `"occupied_unverified"`, when the content-id key is occupied by a
+   *     record that FAILS intent verification (a pre-seed or corrupted
+   *     entry) -- the caller must fail closed, NEVER overwrite;
+   *   - `"scan_unavailable"`, when the guard's own read/scan could not
+   *     complete (a storage error) -- distinct from occupied-unverified:
+   *     nothing was found to be wrong, the guard simply could not confirm
+   *     either way;
+   *   - `null`, when neither the primary key nor the legacy scan has a
+   *     match -- the caller should proceed to quota-check-then-write.
+   *
+   * `committerPublicKey` is the CURRENT identity's own public key, not a
+   * general DID resolver. This is sound, not a shortcut: any match this
+   * guard can honor requires the stored record's `committer_did` to equal
+   * the identity making THIS call -- either by construction (the content-id
+   * hit's hash preimage includes `committer_did`) or by the explicit
+   * tuple-equality filter (`findExistingCommitmentForTuple` matches on
+   * `committer_did` exactly). If the key is occupied by a record genuinely
+   * signed by someone else, that signature will not verify against
+   * `committerPublicKey` -- the correct fail-closed outcome, not a false
+   * negative.
+   */
+  private async findVerifiedExistingCommitment(
+    contentId: string,
+    tuple: { session_id: string; terms_hash: string; committer_did: string },
+    committerPublicKey: Uint8Array
+  ): Promise<
+    | { commitment: BridgeCommitment; outcome: ConcordiaOutcome }
+    | "occupied_unverified"
+    | "scan_unavailable"
+    | null
+  > {
+    let raw: Uint8Array | null;
+    try {
+      raw = await this.storage.read("_bridge", contentId);
+    } catch {
+      return "scan_unavailable";
+    }
+
+    if (raw !== null) {
+      let candidate: { commitment: BridgeCommitment; outcome: ConcordiaOutcome; origin?: string };
+      try {
+        const encrypted: EncryptedPayload = JSON.parse(bytesToString(raw));
+        const decrypted = decrypt(encrypted, this.encryptionKey);
+        candidate = JSON.parse(bytesToString(decrypted));
+      } catch {
+        // Undecryptable/corrupted content at the derived key: cannot be a
+        // legitimate prior commit under this scheme (a genuine write always
+        // round-trips), so this is occupied-but-unverified, not absence.
+        return "occupied_unverified";
+      }
+      return this.verifyStoredCommitmentIntent(candidate, tuple, committerPublicKey, contentId)
+        ? { commitment: candidate.commitment, outcome: candidate.outcome }
+        : "occupied_unverified";
+    }
+
+    if (!this.legacyIdScanEnabled) {
+      return null;
+    }
+
+    const legacy = await this.findExistingCommitmentForTuple(tuple);
+    if (legacy === "scan_unavailable") return "scan_unavailable";
+    if (legacy === null) return null;
+    // No `expectedContentId` here: a legacy match was found by an EXACT
+    // field-by-field scan, so tuple equality already holds by
+    // construction -- recomputing a content id and comparing it to the
+    // record's OLD random id would always fail and is not the check this
+    // path needs. The signature check below is still required
+    // (defense-in-depth: a legacy match is genuine only if it was actually
+    // signed by this caller's key).
+    return this.verifyStoredCommitmentIntent(legacy, tuple, committerPublicKey)
+      ? { commitment: legacy.commitment, outcome: legacy.outcome }
+      : "occupied_unverified";
+  }
+
+  /**
+   * V2-4 legacy dual-read: scan `_bridge` for a pre-upgrade record (still
+   * keyed by its old random id) matching `tuple` exactly. Bounded by this
+   * store's own size cap (MAX_BRIDGE_COMMITMENTS), the SAME O(N)
+   * decrypt-scan shape `assertOriginWithinQuota` already pays on every
+   * write -- not a new unbounded surface. Runs at most once per admission,
+   * only on a content-id miss, inside the lock. Fails CLOSED (mirrors
+   * `assertOriginWithinQuota`'s contract on this exact namespace): a
+   * storage.list error, or any entry that cannot be read/decrypted, is
+   * treated as "cannot confirm," never as "not a match."
+   */
+  private async findExistingCommitmentForTuple(
+    tuple: { session_id: string; terms_hash: string; committer_did: string }
+  ): Promise<
+    { commitment: BridgeCommitment; outcome: ConcordiaOutcome } | "scan_unavailable" | null
+  > {
+    let entries: Array<{ key: string }>;
+    try {
+      entries = await this.storage.list("_bridge");
+    } catch {
+      return "scan_unavailable";
+    }
+
+    for (const meta of entries) {
+      let raw: Uint8Array | null;
+      try {
+        raw = await this.storage.read("_bridge", meta.key);
+      } catch {
+        return "scan_unavailable";
+      }
+      if (!raw) continue;
+      try {
+        const encrypted: EncryptedPayload = JSON.parse(bytesToString(raw));
+        const decrypted = decrypt(encrypted, this.encryptionKey);
+        const record = JSON.parse(bytesToString(decrypted)) as {
+          commitment: BridgeCommitment;
+          outcome: ConcordiaOutcome;
+        };
+        if (
+          record.commitment.session_id === tuple.session_id &&
+          record.outcome.terms_hash === tuple.terms_hash &&
+          record.commitment.committer_did === tuple.committer_did
+        ) {
+          return record;
+        }
+      } catch {
+        return "scan_unavailable";
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * V2-3 intent verification: an id (or tuple) match ALONE must never
+   * authorize `already_committed`. Recomputes the content id from the
+   * STORED record's own fields and asserts it equals `expectedContentId`
+   * (skipped for a legacy-scan match -- see the call site's doc), verifies
+   * the stored record's OWN signature via `verifyBridgeCommitment` against
+   * `committerPublicKey`, and asserts EXACT field equality between the
+   * stored tuple and the incoming operation's tuple -- not just id
+   * equality, the "verify exact canonical intent" the design brief
+   * requires. All checks must pass.
+   */
+  private verifyStoredCommitmentIntent(
+    candidate: { commitment: BridgeCommitment; outcome: ConcordiaOutcome },
+    tuple: { session_id: string; terms_hash: string; committer_did: string },
+    committerPublicKey: Uint8Array,
+    expectedContentId?: string
+  ): boolean {
+    const { commitment, outcome } = candidate;
+    if (expectedContentId !== undefined) {
+      const recomputed = deriveBridgeCommitmentId(
+        commitment.session_id,
+        outcome.terms_hash,
+        commitment.committer_did
+      );
+      if (recomputed !== expectedContentId) return false;
+    }
+    if (
+      commitment.session_id !== tuple.session_id ||
+      outcome.terms_hash !== tuple.terms_hash ||
+      commitment.committer_did !== tuple.committer_did
+    ) {
+      return false;
+    }
+    const verification = verifyBridgeCommitment(commitment, outcome, committerPublicKey);
+    return verification.checks.signature_valid;
   }
 
   /** Raw promise-chain primitive. Never call directly — see
@@ -557,6 +859,13 @@ export interface BridgeToolsTestOverrides {
    * shape as the three above.
    */
   maxPendingAdmissionWaiters?: number;
+  /**
+   * V2-4 sunset flag override (LD6 BP-DEADLINE-03). Production defaults to
+   * `true`; a legacy-dual-read test can set this `false` to isolate the
+   * content-id-only path, or leave it `true` (the default) to exercise the
+   * legacy tuple-scan fallback.
+   */
+  legacyIdScanEnabled?: boolean;
 }
 
 // ─── Tool Factory ────────────────────────────────────────────────────────
@@ -595,7 +904,8 @@ export function createBridgeTools(
     masterKey,
     testOverrides?.maxBridgeCommitments,
     testOverrides?.maxBridgeCommitmentsPerOrigin,
-    testOverrides?.maxPendingAdmissionWaiters
+    testOverrides?.maxPendingAdmissionWaiters,
+    testOverrides?.legacyIdScanEnabled
   );
   const identityEncryptionKey = derivePurposeKey(masterKey, "identity-encryption");
   const hsResults = handshakeResults ?? new Map<string, HandshakeResult>();
@@ -740,9 +1050,48 @@ export function createBridgeTools(
         // LD3 BRIDGE-BP-01: bound to the SERVER-SET session origin, never a
         // caller-supplied identity_id (see resolveBridgeOrigin's doc).
         const origin = resolveBridgeOrigin(callerIdentity);
+        // LD6 BP-DEADLINE-03 (V2-2/V2-5): the success audit is threaded in as
+        // an `InLockAuditEmit` closure and runs INSIDE BridgeStore.save's
+        // admission lock (either right after the write, or as the reconcile
+        // step on an already-committed retry). The closure captures ONLY
+        // `auditLog` + the primitive `identity.identity_id` -- never
+        // `bridgeStore` / `storage` -- so re-entry into any store's
+        // admission lock from inside it is not expressible (V2-5 re-entry
+        // prohibition).
+        const emitAudit: BridgeInLockAuditEmit = async (projection) => {
+          await auditLog.appendCritical({
+            layer: "l3",
+            operation: "bridge_commit",
+            identity_id: identity.identity_id,
+            result: "success",
+            details: {
+              bridge_commitment_id: projection.bridge_commitment_id,
+              session_id: projection.session_id,
+              counterparty: projection.counterparty_did,
+            },
+          });
+        };
+
+        let saveResult;
         try {
-          await bridgeStore.save(bridgeCommitment, outcome, origin);
+          saveResult = await bridgeStore.save(
+            bridgeCommitment,
+            outcome,
+            origin,
+            fromBase64url(identity.public_key),
+            emitAudit
+          );
         } catch (err) {
+          if (err instanceof BridgeIdOccupiedUnverifiedError) {
+            void auditLog.append(
+              "l3",
+              "bridge_commit_id_occupied_unverified",
+              identity.identity_id,
+              { session_id: outcome.session_id, caller_identity: origin },
+              "failure"
+            );
+            return toolResult({ error: err.message });
+          }
           if (err instanceof BridgeStoreQuotaError) {
             void auditLog.append(
               "l3",
@@ -763,31 +1112,24 @@ export function createBridgeTools(
           throw err;
         }
 
-        await auditLog.appendCritical({
-          layer: "l3",
-          operation: "bridge_commit",
-          identity_id: identity.identity_id,
-          result: "success",
-          details: {
-            bridge_commitment_id: bridgeCommitment.bridge_commitment_id,
-            session_id: outcome.session_id,
-            counterparty: outcome.proposer_did === identity.did
-              ? outcome.acceptor_did
-              : outcome.proposer_did,
-          },
-        });
-
+        const committed = saveResult.commitment;
         return toolResult({
-          bridge_commitment_id: bridgeCommitment.bridge_commitment_id,
-          session_id: bridgeCommitment.session_id,
-          sha256_commitment: bridgeCommitment.sha256_commitment,
-          committer_did: bridgeCommitment.committer_did,
-          signature: bridgeCommitment.signature,
-          pedersen_commitment: bridgeCommitment.pedersen_commitment
-            ? { commitment: bridgeCommitment.pedersen_commitment.commitment }
+          bridge_commitment_id: committed.bridge_commitment_id,
+          session_id: committed.session_id,
+          sha256_commitment: committed.sha256_commitment,
+          committer_did: committed.committer_did,
+          signature: committed.signature,
+          pedersen_commitment: committed.pedersen_commitment
+            ? { commitment: committed.pedersen_commitment.commitment }
             : undefined,
-          committed_at: bridgeCommitment.committed_at,
-          bridge_version: bridgeCommitment.bridge_version,
+          committed_at: committed.committed_at,
+          bridge_version: committed.bridge_version,
+          // LD6 BP-DEADLINE-03 (Erik decision 3): a caller that retries the
+          // identical negotiation (same session_id/terms_hash/committer_did)
+          // is told this was already committed, rather than getting a
+          // second, byte-different commitment -- this is the retry-safe
+          // result shape a timed-out caller relies on.
+          already_committed: saveResult.alreadyCommitted,
           note: "Bridge commitment created. The blinding factor is stored encrypted. " +
             "Use bridge_verify to verify the commitment against the revealed outcome. " +
             "Use bridge_attest to link this negotiation to your reputation.",
@@ -1032,80 +1374,32 @@ export function createBridgeTools(
             ? outcome.acceptor_did
             : outcome.proposer_did;
 
-        // Idempotency for the SAME-NEGOTIATION replay: a party can call
-        // bridge_attest repeatedly on the same valid commitment. Each call would
-        // otherwise mint a fresh attestation reusing interaction_id =
-        // session_id, and the reputation aggregator counts attestations with no
-        // de-dup, so re-attesting one session would inflate the tallies N-fold.
-        // Detect an attestation this same party has ALREADY recorded for this
-        // session in the bridge context and return it idempotently rather than
-        // recording a second. The counterparty attesting the same session, a
-        // different context, or a different session still records normally.
+        // Idempotency for the SAME-NEGOTIATION replay (LD6 BP-DEADLINE-03):
+        // a party can call bridge_attest repeatedly on the same valid
+        // commitment. This used to be a two-layer dedup (a fast-path scan
+        // here, plus an authoritative in-lock recheck) because the
+        // attestation id was random, so only an explicit scan could tell a
+        // repeat apart from a new attestation. The id is now content-derived
+        // from (interaction_id = session_id, participant_did = identity.did,
+        // counterparty_did, context) -- see reputation-store.ts's
+        // `deriveReputationAttestationId` -- so `record()`'s OWN in-lock
+        // existence guard (`findVerifiedExistingRecord`) IS the authoritative
+        // dedup, structurally, with no separate scan needed here: a repeat
+        // call resolves to the SAME key and record() rejects with
+        // `ReputationAlreadyRecordedError`, caught below.
         //
-        // SCOPE (do not overclaim): this closes RE-ATTESTATION of the SAME
-        // negotiation (same session_id tuple) only. It does NOT prevent a party
-        // from minting MULTIPLE DISTINCT commitments for one real negotiation:
-        // the session_id is caller-supplied and the session_receipt is not
-        // verified here, so a fresh session_id per call still self-inflates the
-        // tally. That broader self-inflation is NOT closed by this fix and is a
-        // known scoring-engine / collusion concern (the bridge cannot verify a
-        // Concordia session is unique or real without a verified session_receipt
-        // anchor).
+        // SCOPE (do not overclaim, unchanged by this fix): this closes
+        // RE-ATTESTATION of the SAME negotiation (same session_id tuple)
+        // only. It does NOT prevent a party from minting MULTIPLE DISTINCT
+        // commitments for one real negotiation: the session_id is
+        // caller-supplied and the session_receipt is not verified here, so a
+        // fresh session_id per call still self-inflates the tally.
         //
-        // DEBT (bridge self-inflation): verify the Concordia session_receipt (or
-        // another negotiation-unique anchor) so one real negotiation cannot be
-        // re-committed under many session_ids. That is a trust-boundary decision
-        // for Erik (draft-then-approve), not resolved by this dedup.
-        //
-        // FAST-PATH ONLY, NOT THE SECURITY BOUNDARY (LD3 gate fix-round-2,
-        // MUST-FIX 4 — narrowed from fix-round-1): this scan runs BEFORE
-        // record()'s admission lock, with an await gap before the eventual
-        // write, so it is a genuine check-then-write TOCTOU under real
-        // concurrency — two concurrent bridge_attest calls for the SAME
-        // commitment could both pass this scan (neither has written yet) and
-        // both persist. It exists only to skip the cost of metrics-building,
-        // tier resolution, and signing for the COMMON (non-concurrent) case
-        // of an obvious repeat call. The AUTHORITATIVE recheck is
-        // `checkAttestAdmission` below, composed into record()'s
-        // `additionalQuotaCheck` so it runs INSIDE record()'s admission lock,
-        // immediately before the write — see that closure's doc for how it
-        // closes the race this fast path cannot. Fail CLOSED on the dedup
-        // scan here too: if uniqueness cannot be confirmed (a storage.list
-        // error, or any entry that failed to load/decrypt during the scan),
-        // deny the attest rather than risk recording a duplicate under a
-        // transient error. The aggregate read paths intentionally skip
-        // corrupted entries; this dedup path does not.
-        const dedupFastPath = await reputationStore.findExistingAttestationForDedup({
-          interaction_id: outcome.session_id,
-          participant_did: identity.did,
-          counterparty_did: counterpartyDid,
-          context: CONCORDIA_BRIDGE_REPUTATION_CONTEXT,
-        });
-        if (!dedupFastPath.scanComplete) {
-          return toolResult({
-            error:
-              "Cannot confirm this negotiation was not already attested " +
-              "(reputation store could not be fully read); the attestation was " +
-              "not recorded. Retry once the store is readable.",
-          });
-        }
-        if (dedupFastPath.match) {
-          const existingAttestation = dedupFastPath.match;
-          return toolResult({
-            attestation_id: existingAttestation.attestation.attestation_id,
-            bridge_commitment_id: commitmentId,
-            session_id: outcome.session_id,
-            counterparty_did: counterpartyDid,
-            outcome_result: existingAttestation.attestation.data.outcome_result,
-            sovereignty_tier: existingAttestation.attestation.data.sovereignty_tier,
-            metric_policy: existingAttestation.attestation.data.metric_policy,
-            attested_at: existingAttestation.recorded_at,
-            already_attested: true,
-            note:
-              "This negotiation was already attested by this identity; returning " +
-              "the existing attestation. Reputation was not recorded a second time.",
-          });
-        }
+        // DEBT (bridge self-inflation, unchanged by this fix): verify the
+        // Concordia session_receipt (or another negotiation-unique anchor)
+        // so one real negotiation cannot be re-committed under many
+        // session_ids. That is a trust-boundary decision for Erik
+        // (draft-then-approve), not resolved by this dedup.
 
         // The weight reflects who makes the claim, not who it is about, so an
         // untrusted caller cannot borrow a verified counterparty's credibility.
@@ -1139,47 +1433,23 @@ export function createBridgeTools(
         // be defeated by minting a fresh identity per call, the same defeat
         // MAX_BRIDGE_COMMITMENTS_PER_ORIGIN's doc records.
         //
-        // `checkAttestAdmission` (LD3 gate fix-round-2, MUST-FIX 4 — renamed
-        // and widened from the fix-round-1 `checkAttestOriginQuota`) is
-        // passed to record() as `additionalQuotaCheck`, so it executes
-        // INSIDE record()'s own admission lock, immediately before the
-        // write, with no await gap between this check and the persist. It
-        // now does TWO things atomically, in order:
-        //
-        // 1. RE-RUN the dedup scan (the same criteria the fast-path check
-        //    above already ran) and throw BridgeAttestDuplicateError on a
-        //    match. This is the AUTHORITATIVE dedup check: the fast-path
-        //    scan above ran before this lock, with an await gap before the
-        //    eventual write, so two concurrent bridge_attest calls for the
-        //    SAME commitment could both pass IT and both reach here — but
-        //    record()'s admission lock serializes their entries into THIS
-        //    closure, so the second call's re-scan observes the first
-        //    call's already-completed write and throws, instead of both
-        //    persisting a duplicate. See BridgeAttestDuplicateError's doc
-        //    for the full race this closes and its single-process scope.
-        // 2. The origin-quota scan (unchanged from fix-round-1): the
-        //    pre-fix ordering let N concurrent bridge_attest calls all
-        //    observe headroom (e.g. all at count 199) before any of them
-        //    wrote, overshooting maxBridgeAttestationsPerOrigin by up to
-        //    N-1; composing the check into record()'s single-flight section
-        //    closes that race the same way BridgeStore.save() was closed
-        //    above. Fails CLOSED (denies) if either scan cannot confirm its
-        //    result.
+        // `checkAttestAdmission` is passed to record() as
+        // `additionalQuotaCheck`, so it executes INSIDE record()'s own
+        // admission lock, immediately before the write, with no await gap
+        // between this check and the persist. LD6 BP-DEADLINE-03: this
+        // closure used to ALSO re-run the dedup scan and throw
+        // `BridgeAttestDuplicateError` on a match -- that dedup is now
+        // STRUCTURAL, performed by record()'s OWN existence guard before
+        // `additionalQuotaCheck` ever runs (see the comment above), so this
+        // closure enforces ONLY the origin-quota share described above: the
+        // pre-fix ordering let N concurrent bridge_attest calls all observe
+        // headroom (e.g. all at count 199) before any of them wrote,
+        // overshooting maxBridgeAttestationsPerOrigin by up to N-1;
+        // composing the check into record()'s single-flight section closes
+        // that race the same way BridgeStore.save() was closed above. Fails
+        // CLOSED (denies) if the scan cannot confirm its result.
         const origin = resolveBridgeOrigin(callerIdentity);
         const checkAttestAdmission = async (): Promise<void> => {
-          const dedupRecheck = await reputationStore.findExistingAttestationForDedup({
-            interaction_id: outcome.session_id,
-            participant_did: identity.did,
-            counterparty_did: counterpartyDid,
-            context: CONCORDIA_BRIDGE_REPUTATION_CONTEXT,
-          });
-          if (!dedupRecheck.scanComplete) {
-            throw new BridgeAttestOriginQuotaError("dedup_scan_unavailable");
-          }
-          if (dedupRecheck.match) {
-            throw new BridgeAttestDuplicateError(dedupRecheck.match);
-          }
-
           const originQuota = await reputationStore.countAttestationsByOriginForContext(
             origin,
             CONCORDIA_BRIDGE_REPUTATION_CONTEXT
@@ -1190,6 +1460,34 @@ export function createBridgeTools(
           if (originQuota.count >= maxBridgeAttestationsPerOrigin) {
             throw new BridgeAttestOriginQuotaError("origin_quota");
           }
+        };
+
+        // LD6 BP-DEADLINE-03 (V2-2/V2-5): the success audit is threaded in
+        // as an `InLockAuditEmit` closure and runs INSIDE record()'s
+        // admission lock (either right after the write, or as the
+        // reconcile step on an already-committed retry). Captures ONLY
+        // `auditLog` + primitive locals (`commitmentId`, `tier`) -- never
+        // `reputationStore` -- so re-entry into any store's admission lock
+        // from inside it is not expressible (V2-5 re-entry prohibition).
+        const emitReputationAudit = async (projection: {
+          attestation_id: string;
+          interaction_id: string;
+          counterparty_did: string;
+          context: string;
+        }): Promise<void> => {
+          await auditLog.appendCritical({
+            layer: "l4",
+            operation: "bridge_attest",
+            identity_id: identity.identity_id,
+            result: "success",
+            details: {
+              bridge_commitment_id: commitmentId,
+              session_id: projection.interaction_id,
+              attestation_id: projection.attestation_id,
+              counterparty_did: projection.counterparty_did,
+              sovereignty_tier: tier,
+            },
+          });
         };
 
         // Record the reputation attestation
@@ -1210,19 +1508,30 @@ export function createBridgeTools(
             undefined, // counterparty_attestation
             tier,
             origin,
-            checkAttestAdmission
+            checkAttestAdmission,
+            emitReputationAudit
           );
         } catch (err) {
           if (err instanceof BridgeAttestationMetricValidationError) {
             return toolResult({ error: err.message });
           }
-          if (err instanceof BridgeAttestDuplicateError) {
-            // The atomic in-lock recheck found a match a concurrent call
-            // already persisted between the fast-path scan and this write —
-            // return the SAME idempotent shape the fast-path branch above
-            // returns, never a second attestation. Not itself a quota
-            // refusal, so no quota audit entry; the request succeeded
-            // idempotently.
+          if (err instanceof ReputationIdOccupiedUnverifiedError) {
+            void auditLog.append(
+              "l4",
+              "bridge_attest_id_occupied_unverified",
+              identity.identity_id,
+              { bridge_commitment_id: commitmentId, caller_identity: origin },
+              "failure"
+            );
+            return toolResult({ error: err.message });
+          }
+          if (err instanceof ReputationAlreadyRecordedError) {
+            // The structural existence guard found a match -- either THIS
+            // caller's own prior attest (same idempotent shape the old
+            // fast-path branch used to return), or a concurrent call that
+            // already persisted between admission and this recheck. Not a
+            // hard failure, so no failure-audit entry; the request
+            // succeeded idempotently.
             const existingAttestation = err.existing;
             return toolResult({
               attestation_id: existingAttestation.attestation.attestation_id,
@@ -1244,9 +1553,7 @@ export function createBridgeTools(
               "l4",
               err.reason === "origin_quota"
                 ? "bridge_attest_origin_quota_exceeded"
-                : err.reason === "dedup_scan_unavailable"
-                  ? "bridge_attest_dedup_scan_unavailable"
-                  : "bridge_attest_quota_scan_unavailable",
+                : "bridge_attest_quota_scan_unavailable",
               identity.identity_id,
               { bridge_commitment_id: commitmentId, caller_identity: origin },
               "failure"
@@ -1257,13 +1564,9 @@ export function createBridgeTools(
                   ? `This origin has reached its bridge-attestation quota ` +
                     `(${maxBridgeAttestationsPerOrigin}); the attestation was ` +
                     "not recorded."
-                  : err.reason === "dedup_scan_unavailable"
-                    ? "Cannot confirm this negotiation was not already attested " +
-                      "(reputation store could not be fully read); the attestation " +
-                      "was not recorded. Retry once the store is readable."
-                    : "Cannot confirm this origin's attestation quota headroom " +
-                      "(reputation store could not be fully read); the attestation " +
-                      "was not recorded. Retry once the store is readable.",
+                  : "Cannot confirm this origin's attestation quota headroom " +
+                    "(reputation store could not be fully read); the attestation " +
+                    "was not recorded. Retry once the store is readable.",
             });
           }
           if (err instanceof ReputationStoreQuotaError) {
@@ -1293,20 +1596,10 @@ export function createBridgeTools(
           throw err;
         }
 
-        await auditLog.appendCritical({
-          layer: "l4",
-          operation: "bridge_attest",
-          identity_id: identity.identity_id,
-          result: "success",
-          details: {
-            bridge_commitment_id: commitmentId,
-            session_id: outcome.session_id,
-            attestation_id: attestation.attestation.attestation_id,
-            counterparty_did: counterpartyDid,
-            sovereignty_tier: tier,
-          },
-        });
-
+        // LD6 BP-DEADLINE-03: the success audit for a NEW attestation is
+        // already emitted INSIDE record()'s admission lock via
+        // `emitReputationAudit` above (V2-2) -- no second, out-of-lock
+        // append here.
         const weight = TIER_WEIGHTS[tier];
 
         return toolResult({

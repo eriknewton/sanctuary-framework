@@ -258,11 +258,28 @@ export class SentinelDispatcher {
       observed_at: raw.observed_at || this.now().toISOString(),
     };
     await this.findingStore.saveFinding(stamped);
-    void this.auditLog.append(
-      "l2",
-      SENTINEL_AUDIT_OPS.FINDING_EMITTED,
-      this.identityId,
-      {
+    // LD6 BP-DEADLINE-03 (V2-5 sentinel exception): AWAITED appendCritical
+    // immediately AFTER the locked saveFinding, NOT folded into
+    // saveFinding's own admission section -- a saturated saveFinding can
+    // already emit an evict-INTENT appendCritical (up to 40s) inside its
+    // lock; adding a second audit write there would need up to 80s against
+    // the shared 50s admission-deadline budget (see
+    // sentinel-finding-store.ts's STORE_ADMISSION_DEADLINE_MS derivation).
+    // `finding_id` already gives this store I2/I3 (overwrite-in-place on a
+    // retry), so awaited-just-after accepts only I1-eventual: a crash
+    // between saveFinding settling and this append settling leaves a
+    // committed-but-unaudited finding, self-healing on the next retry or
+    // read of the same finding_id -- NOT atomicity (same named residual as
+    // the in-lock bridge/reputation audits, V2-2). Was previously a
+    // fire-and-forget `void append`, so a failed audit write was silently
+    // lost; awaiting `appendCritical` surfaces that failure to `tick()`'s
+    // own per-sentinel try/catch instead.
+    await this.auditLog.appendCritical({
+      layer: "l2",
+      operation: SENTINEL_AUDIT_OPS.FINDING_EMITTED,
+      identity_id: this.identityId,
+      result: "success",
+      details: {
         sentinel_id: sentinelId,
         finding_id: stamped.finding_id,
         severity: stamped.severity,
@@ -270,7 +287,7 @@ export class SentinelDispatcher {
         evidence_audit_ids: stamped.evidence_audit_ids,
         fortress_id: this.fortressId,
       },
-    );
+    });
     this.emit({ type: "finding", finding: stamped });
     return stamped;
   }
