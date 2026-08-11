@@ -532,6 +532,53 @@ describe("TokenIssuer", () => {
         expect(last.details?.reason).toBe("token_store_at_capacity");
       });
 
+      it("does not overshoot the global cap under concurrent issuance (async-TOCTOU across the success audit)", async () => {
+        // Regression for the check-then-await-then-set race: two issuances that
+        // both pass the capacity check while the first is parked on its success
+        // audit would each set a token and exceed the cap. The in-flight
+        // reservation makes the second refuse. Promise.all runs each call's
+        // synchronous cap-check-and-reserve to its first await in order, so the
+        // second observes the first's reservation deterministically.
+        const { issuer } = await makeIssuer({
+          maxLiveTokensGlobal: 2,
+          grants: [
+            { skill: "s", secret: "secret-a", scope: "read" },
+            { skill: "s", secret: "secret-b", scope: "read" },
+            { skill: "s", secret: "secret-c", scope: "read" },
+          ],
+        });
+        await issuer.issueToken({
+          skill: "s",
+          secret: "secret-a",
+          caller: caller("s", { agent: "a", identity_id: "i" }),
+        });
+        expect(issuer.liveTokenCount()).toBe(1);
+
+        // One slot left; fire two issuances concurrently.
+        const results = await Promise.allSettled([
+          issuer.issueToken({
+            skill: "s",
+            secret: "secret-b",
+            caller: caller("s", { agent: "a", identity_id: "i" }),
+          }),
+          issuer.issueToken({
+            skill: "s",
+            secret: "secret-c",
+            caller: caller("s", { agent: "a", identity_id: "i" }),
+          }),
+        ]);
+
+        const fulfilled = results.filter((r) => r.status === "fulfilled");
+        const rejected = results.filter((r) => r.status === "rejected");
+        expect(fulfilled).toHaveLength(1);
+        expect(rejected).toHaveLength(1);
+        expect((rejected[0] as PromiseRejectedResult).reason).toBeInstanceOf(
+          BrokerDeniedError
+        );
+        // Fails CLOSED at the cap: exactly 2 live tokens, never 3.
+        expect(issuer.liveTokenCount()).toBe(2);
+      });
+
       it("denies fail-closed once the per-caller live-token cap is reached, without blocking a different caller", async () => {
         const { issuer, auditLog } = await makeIssuer({
           maxLiveTokensGlobal: 1000,

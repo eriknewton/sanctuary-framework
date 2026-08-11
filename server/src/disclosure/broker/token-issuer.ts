@@ -162,6 +162,15 @@ export class TokenIssuer {
   private readonly maxLiveTokensGlobal: number;
   private readonly maxLiveTokensPerCaller: number;
   private readonly now: () => number;
+  // Reservations held from a PASSED capacity check until the durable success
+  // audit completes and the token enters `tokens`. The set at issueToken's end
+  // is deliberately AFTER the success audit (provenance: no live token without
+  // a durable issuance record), so `tokens.size` alone lags an in-flight issue
+  // that is parked on its audit await. Without counting these, two concurrent
+  // issuances at cap-1 both pass the check and overshoot the cap (an async
+  // TOCTOU across the success-audit await). The caps below count size + these.
+  private inFlightIssuances = 0;
+  private readonly inFlightByCaller = new Map<string, number>();
 
   constructor(opts: TokenIssuerOptions) {
     this.backend = opts.backend;
@@ -322,7 +331,11 @@ export class TokenIssuer {
     // side channel. Both caps are rechecked on every issuance (post-prune
     // above), so an attacker cannot get ahead of them by issuing faster
     // than any background sweep.
-    if (this.tokens.size >= this.maxLiveTokensGlobal) {
+    // Count in-flight reservations (issuances past their capacity check but
+    // not yet in `tokens`) so concurrent issuances cannot overshoot the cap
+    // across the success-audit await — see inFlightIssuances' doc.
+    const callerCountKey = `${req.caller.skill} ${req.caller.agent}`;
+    if (this.tokens.size + this.inFlightIssuances >= this.maxLiveTokensGlobal) {
       await this.auditLog.appendCritical({
         layer: "l3",
         operation: BROKER_OPS.TOKEN_DENIED,
@@ -333,7 +346,7 @@ export class TokenIssuer {
           secret: req.secret,
           requested_scope: requestedScope,
           reason: "token_store_at_capacity",
-          live_tokens: this.tokens.size,
+          live_tokens: this.tokens.size + this.inFlightIssuances,
           cap: this.maxLiveTokensGlobal,
           agent: req.caller.agent,
           tenant_id: req.caller.tenant_id,
@@ -343,7 +356,9 @@ export class TokenIssuer {
       });
       throw new BrokerDeniedError();
     }
-    const callerLiveCount = this.countLiveTokensForCaller(req.caller.skill, req.caller.agent);
+    const callerLiveCount =
+      this.countLiveTokensForCaller(req.caller.skill, req.caller.agent) +
+      (this.inFlightByCaller.get(callerCountKey) ?? 0);
     if (callerLiveCount >= this.maxLiveTokensPerCaller) {
       await this.auditLog.appendCritical({
         layer: "l3",
@@ -366,45 +381,66 @@ export class TokenIssuer {
       throw new BrokerDeniedError();
     }
 
-    const ttl = clampTtl(
-      req.ttlSeconds ?? grant.ttlSeconds ?? this.defaultTtlSeconds,
-      this.maxTtlSeconds
+    // RESERVE synchronously now that both caps passed, BEFORE the success-audit
+    // await below yields the event loop. This is what makes the capacity checks
+    // above race-safe: a concurrent issuance that arrives while this one is
+    // parked on its audit await counts this reservation and refuses at the cap,
+    // instead of both passing at cap-1 and overshooting (see inFlightIssuances'
+    // doc). Released in the `finally` on EVERY exit — success, audit failure,
+    // or throw — so a failed issuance never leaks a permanent reservation.
+    this.inFlightIssuances += 1;
+    this.inFlightByCaller.set(
+      callerCountKey,
+      (this.inFlightByCaller.get(callerCountKey) ?? 0) + 1
     );
-    const nowMs = this.now();
-    const token = randomBytes(32).toString("base64url");
-    const binding: TokenBinding = {
-      token,
-      skill: req.caller.skill,
-      secret: req.secret,
-      scope: requestedScope,
-      agent: req.caller.agent,
-      identity_id: req.caller.identity_id,
-      tenant_id: req.caller.tenant_id,
-      fortress_id: req.caller.fortress_id,
-      audience: req.caller.audience,
-      issued_at: new Date(nowMs).toISOString(),
-      expires_at: new Date(nowMs + ttl * 1000).toISOString(),
-    };
-    await this.auditLog.appendCritical({
-      layer: "l3",
-      operation: BROKER_OPS.TOKEN_ISSUED,
-      identity_id: req.caller.identity_id,
-      result: "success",
-      details: {
+    try {
+      const ttl = clampTtl(
+        req.ttlSeconds ?? grant.ttlSeconds ?? this.defaultTtlSeconds,
+        this.maxTtlSeconds
+      );
+      const nowMs = this.now();
+      const token = randomBytes(32).toString("base64url");
+      const binding: TokenBinding = {
+        token,
         skill: req.caller.skill,
         secret: req.secret,
         scope: requestedScope,
         agent: req.caller.agent,
+        identity_id: req.caller.identity_id,
         tenant_id: req.caller.tenant_id,
         fortress_id: req.caller.fortress_id,
         audience: req.caller.audience,
-        expires_at: binding.expires_at,
-        ttl_seconds: ttl,
-      },
-    });
-    // The success audit is durable before the token enters the live map, so issued tokens have provenance.
-    this.tokens.set(token, binding);
-    return binding;
+        issued_at: new Date(nowMs).toISOString(),
+        expires_at: new Date(nowMs + ttl * 1000).toISOString(),
+      };
+      await this.auditLog.appendCritical({
+        layer: "l3",
+        operation: BROKER_OPS.TOKEN_ISSUED,
+        identity_id: req.caller.identity_id,
+        result: "success",
+        details: {
+          skill: req.caller.skill,
+          secret: req.secret,
+          scope: requestedScope,
+          agent: req.caller.agent,
+          tenant_id: req.caller.tenant_id,
+          fortress_id: req.caller.fortress_id,
+          audience: req.caller.audience,
+          expires_at: binding.expires_at,
+          ttl_seconds: ttl,
+        },
+      });
+      // The success audit is durable before the token enters the live map, so
+      // issued tokens have provenance. The reservation above covers the cap for
+      // the window between the check and this set, so the ordering is safe.
+      this.tokens.set(token, binding);
+      return binding;
+    } finally {
+      this.inFlightIssuances -= 1;
+      const remaining = (this.inFlightByCaller.get(callerCountKey) ?? 1) - 1;
+      if (remaining <= 0) this.inFlightByCaller.delete(callerCountKey);
+      else this.inFlightByCaller.set(callerCountKey, remaining);
+    }
   }
 
   /**
