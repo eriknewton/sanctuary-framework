@@ -19,7 +19,21 @@ export * from "./types.js";
 export * from "./generator.js";
 export * from "./verifier.js";
 export * from "./tools.js";
-export * from "./gateway-adapter.js";
+// Explicit (not `export *`) so the test-only clock seam `transformSHRForGatewayAt`
+// is NOT re-exported onto the public SHR surface: it lets its caller choose the
+// verification clock, which on a trust-minting path is a footgun (a backdated
+// clock would accept an expired SHR). Tests import it directly from the file.
+// Public consumers get only the real-clock entry points. (SHR-GW-01.)
+export {
+  transformSHRForGateway,
+  transformSHRGeneric,
+} from "./gateway-adapter.js";
+export type {
+  PingAuthorizationContext,
+  GatewayDegradation,
+  AuthorizationConstraint,
+  GenericAuthorizationContext,
+} from "./gateway-adapter.js";
 export * from "./decommission-types.js";
 export * from "./decommission-generator.js";
 export * from "./decommission-verifier.js";
