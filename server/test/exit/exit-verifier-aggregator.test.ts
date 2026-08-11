@@ -1036,6 +1036,77 @@ describe("exit verify/import parity aggregator (LD2-01 class fix)", () => {
     );
   });
 
+  it("EXIT-STRUCT-02 fix-round: an entries element missing `entry.metadata` fails verify closed, and import refuses with a NAMED error, never a crash", async () => {
+    const source = await makeSource("aggregator-struct02-metadata-source");
+    const bundleDir = await newBundleDir();
+    await exportBundle(source, bundleDir, { mint: true });
+    await patchEncryptedStateAndResign(bundleDir, source, (artifact) => {
+      const entries = artifact.entries as Array<Record<string, unknown>>;
+      // `rekeyState` (bundle.ts write site) reads `entry.metadata.content_type`
+      // AFTER decrypt + integrity-hash pass. `metadata` is covered by NEITHER
+      // the signature (over payload.ct) NOR the integrity_hash (over plaintext),
+      // so this element re-signs cleanly and decrypts, then throws on the
+      // metadata deref unless verify fails it closed first.
+      const entry = entries[0]!.entry as Record<string, unknown>;
+      const { metadata: _metadata, ...entryWithoutMetadata } = entry;
+      artifact.entries = [{ ...entries[0]!, entry: entryWithoutMetadata }];
+    });
+    const destination = await makeDestination();
+
+    await assertVerifyImportInvariant(
+      bundleDir,
+      false,
+      "encrypted_state_entries_unreadable",
+      () =>
+        importExitBundle({
+          bundleDir,
+          storage: destination.storage,
+          masterKey: destination.masterKey,
+          identityManager: destination.identityManager,
+          auditLog: destination.auditLog,
+          reputationStore: destination.reputationStore,
+          activate: true,
+          forceRebind: true,
+          sourceMasterKey: source.masterKey,
+          destinationSignerIdentityId: destination.identityId,
+        }),
+      { kind: "throws", code: "ENCRYPTED_STATE_ENTRIES_UNREADABLE", reason: "structural" }
+    );
+  });
+
+  it("EXIT-STRUCT-02 fix-round: an entries element whose `entry.metadata.tags` is a non-array fails verify closed (the `...tags` spread would otherwise throw)", async () => {
+    const source = await makeSource("aggregator-struct02-tags-source");
+    const bundleDir = await newBundleDir();
+    await exportBundle(source, bundleDir, { mint: true });
+    await patchEncryptedStateAndResign(bundleDir, source, (artifact) => {
+      const entries = artifact.entries as Array<Record<string, unknown>>;
+      const entry = entries[0]!.entry as Record<string, unknown>;
+      const metadata = { ...(entry.metadata as Record<string, unknown>), tags: "not-an-array" };
+      artifact.entries = [{ ...entries[0]!, entry: { ...entry, metadata } }];
+    });
+    const destination = await makeDestination();
+
+    await assertVerifyImportInvariant(
+      bundleDir,
+      false,
+      "encrypted_state_entries_unreadable",
+      () =>
+        importExitBundle({
+          bundleDir,
+          storage: destination.storage,
+          masterKey: destination.masterKey,
+          identityManager: destination.identityManager,
+          auditLog: destination.auditLog,
+          reputationStore: destination.reputationStore,
+          activate: true,
+          forceRebind: true,
+          sourceMasterKey: source.masterKey,
+          destinationSignerIdentityId: destination.identityId,
+        }),
+      { kind: "throws", code: "ENCRYPTED_STATE_ENTRIES_UNREADABLE", reason: "structural" }
+    );
+  });
+
   // ---- Artifact 1's OTHER mutation-provable half: the fail-closed default ---
 
   it("EXIT-STRUCT-02: `entries_malformed_elements` fails closed directly at the aggregator function", () => {

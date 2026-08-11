@@ -394,6 +394,22 @@ export function isWellFormedExitStateEntryElement(item: unknown): boolean {
   const payload = entryRecord.payload;
   if (payload === null || typeof payload !== "object") return false;
   if (typeof (payload as Record<string, unknown>).ct !== "string") return false;
+  // EXIT-STRUCT-02 fix-round (Codex family, confirmed by probe: predicate:true
+  // then TypeError): `rekeyState` (server/src/exit/bundle.ts write site) reads
+  // `entry.metadata.content_type`/`.ttl_seconds` and SPREADS `entry.metadata.tags`
+  // AFTER decrypt + integrity-hash pass — but `metadata` is covered by NEITHER
+  // the entry signature (over `payload.ct`) NOR the integrity_hash (over the
+  // decrypted plaintext), so a source-signed, decryptable bundle with `metadata`
+  // stripped reaches that write and throws. `metadata` is therefore mandatory
+  // for a well-formed element; a legitimate export always populates it.
+  const metadata = entryRecord.metadata;
+  if (metadata === null || typeof metadata !== "object") return false;
+  // `tags` is optional, but when present it is spread (`...tags`); a non-array
+  // value (`...5`) throws "is not iterable". Require array-when-present; absent
+  // is fine (the write site defaults it with `?? []`). content_type/ttl_seconds
+  // are read but never dereferenced further, so absent subfields cannot throw.
+  const tags = (metadata as Record<string, unknown>).tags;
+  if (tags !== undefined && !Array.isArray(tags)) return false;
   return true;
 }
 
