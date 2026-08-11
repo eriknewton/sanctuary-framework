@@ -153,25 +153,6 @@ function lockdownStatusFromResult(
   return result.new_status ?? null;
 }
 
-/**
- * LD4 HUB-STATUS-REVERT-01, fix-round-2: statuses set by an OPERATOR safety
- * action (pause, lockdown). The pause/resume/restart cases in `controlAgent`
- * and the lockdown/unwrap cases in `enqueueTier1ControlAction` now call
- * `persistLocalAgentStatusBestEffort` right after `agentRegistry.updateStatus`
- * succeeds, so the on-disk snapshot is kept in step with the operator's
- * intent on the primary path. This set remains as defense in depth for the
- * refresh gate below: a persist can still fail (disk full, permission) or
- * this dep can be unset in a given wiring, and in either case a durable
- * live status must still win over whatever is on disk rather than silently
- * reverting. See the invariant comment at `refreshPersistedLocalAgents` for
- * why this set gates the refresh, and at `persistLocalAgentStatusBestEffort`
- * for the write-through ordering and failure contract.
- */
-const OPERATOR_DURABLE_STATUSES: ReadonlySet<HubAgentStatus> = new Set([
-  "paused",
-  "locked_down",
-]);
-
 function checkChannelTemplateId(value: unknown): ChannelTemplateId {
   if (
     typeof value === "string" &&
@@ -233,63 +214,7 @@ export class HubService {
     const readPersistedLocalAgents = this.deps.readPersistedLocalAgents;
     if (!readPersistedLocalAgents) return;
     for (const record of readPersistedLocalAgents()) {
-      const current = this.deps.agentRegistry.get(record.agent_id);
-      // INVARIANT: an operator-set pause/lockdown must win over the
-      // persisted (wrap-time, or last policy-rebind) snapshot. That file is
-      // written at wrap and on channel-template rebind only; it never
-      // reflects a pause/lockdown/unwrap issued after that, so blindly
-      // `put`-ing it here would silently revert a just-locked-down/paused
-      // agent to whatever status it had at wrap time; the operator would
-      // see a dangerous agent rendered active/protected/verified on the
-      // very next fleet read. Skip the whole record while the live status
-      // is operator-durable; resume/unlock clears it via updateStatus, and
-      // the next refresh after that resumes applying persisted fields
-      // normally. If a refresh ever needs to clear a lockdown, that must be
-      // an explicit, operator-visible action, never a silent side effect of
-      // a read.
-      if (current && OPERATOR_DURABLE_STATUSES.has(current.status)) {
-        continue;
-      }
       this.deps.agentRegistry.put(record);
-    }
-  }
-
-  /**
-   * LD4 fix-round-2 (HUB-STATUS-REVERT-01 follow-up): the OPERATOR_DURABLE_STATUSES
-   * gate above only protects a refresh from reverting a *currently* durable
-   * (paused/locked_down) live status; it does nothing once the operator has
-   * since resumed/unlocked, because at that point the live status is
-   * `active` (not durable) and the gate lets the stale on-disk record win.
-   * `bindAgentChannelTemplate` persists the WHOLE live registry
-   * (`writePersistedLocalAgents(agentRegistry.list())`) on every rebind, so a
-   * rebind that races a pause can freeze `paused` into the file; a later
-   * resume updates memory but not disk, and the next refresh (or process
-   * restart) reads the stale `paused` back and reverts the resume. Ordering
-   * guarantee: call this immediately after `agentRegistry.updateStatus`
-   * succeeds, so the on-disk snapshot is never more than one write behind
-   * the in-memory status the operator just set. Failure mode: a persist
-   * failure here (disk full, permission) is caught and audited, never
-   * thrown or retried inline; the control action already succeeded in
-   * memory and the live status remains authoritative for this process, and
-   * only a refresh/restart after an unresolved persist failure could still
-   * observe a stale file, which is the narrower residual this leaves.
-   */
-  private persistLocalAgentStatusBestEffort(context: string): void {
-    const writePersistedLocalAgents = this.deps.writePersistedLocalAgents;
-    if (!writePersistedLocalAgents) return;
-    try {
-      writePersistedLocalAgents(this.deps.agentRegistry.list());
-    } catch (err) {
-      void this.deps.activitySources.auditLog.append(
-        "l2",
-        "agent_status_persist_failed",
-        this.deps.identityId,
-        {
-          context,
-          reason: err instanceof Error ? err.message : String(err),
-        },
-        "failure",
-      );
     }
   }
 
@@ -504,19 +429,16 @@ export class HubService {
       case "pause": {
         const status = await this.deps.agentController.pause(agentId);
         next = this.deps.agentRegistry.updateStatus(agentId, status);
-        this.persistLocalAgentStatusBestEffort("control_pause");
         break;
       }
       case "resume": {
         const status = await this.deps.agentController.resume(agentId);
         next = this.deps.agentRegistry.updateStatus(agentId, status);
-        this.persistLocalAgentStatusBestEffort("control_resume");
         break;
       }
       case "restart": {
         const status = await this.deps.agentController.restart(agentId);
         next = this.deps.agentRegistry.updateStatus(agentId, status);
-        this.persistLocalAgentStatusBestEffort("control_restart");
         break;
       }
       default:
@@ -603,7 +525,6 @@ export class HubService {
             status,
             "operator_lockdown",
           );
-          this.persistLocalAgentStatusBestEffort("tier1_unwrap");
           void this.deps.activitySources.auditLog.append(
             "l2",
             "agent_unwrap_engaged",
@@ -645,7 +566,6 @@ export class HubService {
               status,
               "operator_lockdown",
             );
-            this.persistLocalAgentStatusBestEffort("tier1_lockdown");
           }
           const payload = lockdownPayloadFromResult(result);
           void this.deps.activitySources.auditLog.append(
