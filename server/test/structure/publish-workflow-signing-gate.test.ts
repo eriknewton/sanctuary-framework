@@ -14,8 +14,12 @@
  *
  * THE POSTURE THIS TEST FREEZES (probe-the-predicate, fail-closed):
  *   1. A fail-closed probe step ("Require release signing key") runs BEFORE
- *      the irreversible `npm publish`, probing the same job-level env the sign
- *      step's key is mapped from, and exits non-zero when it is empty.
+ *      the irreversible `npm publish`, probing the same secrets expression the
+ *      sign step's key is mapped from (CSO-CICD-01, 2026-08-11: scoped with a
+ *      step-level `env:` rather than a job-level one, so the secret is out of
+ *      scope for every other step, including the untrusted third-party pip
+ *      install in "Install libsecret + Secret Service backend"), and exits
+ *      non-zero when it is empty.
  *   2. The sign step is UNCONDITIONAL (no `if:` on the secret) — a missing
  *      key fails the run (the sign script also dies on a missing env var);
  *      there is no skip path in either direction.
@@ -64,8 +68,10 @@ describe("publish workflow: signed-manifest gate is fail-closed and honestly nam
     expect(names).toContain("Sign + attach release manifest");
   });
 
-  it("maps the RELEASE_SIGNING_KEY secret into the job env and the sign step", () => {
-    // Job-level mapping (what the probe step reads)...
+  it("maps the RELEASE_SIGNING_KEY secret into the probe step and the sign step", () => {
+    // Step-level mapping on the probe step (CSO-CICD-01: not job-level, so
+    // the secret is absent from every step's process env except this one and
+    // the sign step below)...
     expect(workflow).toContain(
       "RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}",
     );
@@ -90,6 +96,44 @@ describe("publish workflow: signed-manifest gate is fail-closed and honestly nam
     expect(workflow).toMatch(
       /if \[\[ -z "\$\{RELEASE_SIGNING_KEY\}" \]\]; then[\s\S]{0,800}?exit 1/,
     );
+  });
+
+  it("CSO-CICD-01: the secret is never mapped at job level (only per-step)", () => {
+    // A job-level `env:` block would put RELEASE_SIGNING_KEY in the process
+    // environment of every step in this job, including the untrusted
+    // third-party `pip install` in "Install libsecret + Secret Service
+    // backend". Both legitimate mappings of the secret (the probe step's
+    // RELEASE_SIGNING_KEY and the sign step's
+    // SANCTUARY_RELEASE_SIGNING_KEY_B64URL) must therefore sit AFTER the
+    // `steps:` key (i.e. nested under an individual step's own `env:`),
+    // never before it, and there must be exactly one of each so a
+    // reintroduced job-level duplicate cannot hide behind these.
+    const stepsIndex = workflow.indexOf("\n    steps:\n");
+    expect(stepsIndex).toBeGreaterThan(0);
+
+    function allIndexesOf(needle: string): number[] {
+      const idxs: number[] = [];
+      let from = 0;
+      while (true) {
+        const idx = workflow.indexOf(needle, from);
+        if (idx === -1) break;
+        idxs.push(idx);
+        from = idx + 1;
+      }
+      return idxs;
+    }
+
+    const probeMappings = allIndexesOf(
+      "RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}",
+    );
+    const signMappings = allIndexesOf(
+      "SANCTUARY_RELEASE_SIGNING_KEY_B64URL: ${{ secrets.RELEASE_SIGNING_KEY }}",
+    );
+    expect(probeMappings.length).toBe(1);
+    expect(signMappings.length).toBe(1);
+    for (const idx of [...probeMappings, ...signMappings]) {
+      expect(idx).toBeGreaterThan(stepsIndex);
+    }
   });
 
   it("has NO skip path conditioned on the secret (both directions)", () => {
