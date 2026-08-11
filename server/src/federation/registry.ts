@@ -198,17 +198,23 @@ export class FederationRegistry {
         );
       },
       onRefuse: (incomingPeerId, _incomingPeer, reason) => {
-        // Three DISTINCT reasons (MUST-FIX 3, fix-round-3 — `capacity` and
+        // FOUR DISTINCT reasons (MUST-FIX 3, fix-round-3 — `capacity` and
         // `audit_unavailable` used to collapse to the same "saturated"
         // audit op, hiding "the audit trail is down" behind "the registry
         // is genuinely full of active peers" from an operator diagnosing
-        // the refusal).
+        // the refusal; `admission_busy` added fix-round-6, see
+        // core/bounded-map.ts's `BoundedMapRefuseReason` doc — it must NOT
+        // fall into the `capacity` bucket either, or an operator would be
+        // told "every peer is active" when the real condition is "this
+        // map's admission-waiter queue was momentarily saturated").
         const op =
           reason === "origin_quota"
             ? "federation_registry_origin_quota_exceeded"
             : reason === "audit_unavailable"
               ? "federation_registry_audit_unavailable"
-              : "federation_registry_saturated";
+              : reason === "admission_busy"
+                ? "federation_registry_admission_busy"
+                : "federation_registry_saturated";
         void this.auditLog.append(
           "l4",
           op,
@@ -233,12 +239,16 @@ export class FederationRegistry {
    * `BoundedMap`'s own `BoundedMapRefuseReason`: `origin_quota` (this
    * `origin`'s own quota is exhausted), `capacity` (the shared registry is
    * at capacity and every existing slot holds a currently-active peer —
-   * see the eviction policy above), or `audit_unavailable` (a
+   * see the eviction policy above), `audit_unavailable` (a
    * global-capacity eviction was decided but its durable audit write did
    * not complete — rare, and distinct from a genuine capacity refusal: an
    * operator retrying the SAME registration once the audit trail recovers
-   * should not be told "the registry is full"). The caller must surface
-   * this as an explicit refusal, never treat it as a silent no-op success.
+   * should not be told "the registry is full"), or `admission_busy`
+   * (fix-round-6 — the registry's OWN admission-lock waiter queue was
+   * already at its cap; a momentary serialization-primitive saturation,
+   * not a statement about how many peers are registered). The caller must
+   * surface this as an explicit refusal, never treat it as a silent no-op
+   * success.
    *
    * `origin` is REQUIRED (MUST-FIX 2, fix-round-2 RECHECK — was optional;
    * see MAX_FEDERATION_PEERS_PER_ORIGIN's doc for why "omit it and the quota

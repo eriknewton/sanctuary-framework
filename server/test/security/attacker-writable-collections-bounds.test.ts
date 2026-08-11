@@ -2063,6 +2063,126 @@ describe("4. sentinel durable findings: capped, per-origin fair, never blind-FIF
     },
     30_000
   );
+
+  it(
+    "MUTATION-PROOF TARGET (admission-waiter cap, AGENTS.md rule 8 on the fix's OWN state, fix-round-6): concurrent saveFinding calls past maxPendingAdmissionWaiters are refused immediately with reason 'admission_busy', never queued behind the store's own admission lock",
+    async () => {
+      // A storage backend whose `list()` call can be gated open on demand,
+      // used to hold the FIRST new-record admission's critical section open
+      // (inside `enforceTrackedFindingsCeiling`'s own `storage.list()` call)
+      // long enough to prove later concurrent admissions queue up BEHIND
+      // it — mirrors bounded-map.test.ts's admission-waiter test, which
+      // uses a deferred `onEvict` for the identical purpose on `BoundedMap`.
+      class GatedStorage extends MemoryStorage {
+        private gate: Promise<void> | null = null;
+        armGate(gate: Promise<void>): void {
+          this.gate = gate;
+        }
+        async list(namespace: string, prefix?: string) {
+          if (this.gate) {
+            const g = this.gate;
+            this.gate = null; // gate only the NEXT call, never a later one
+            await g;
+          }
+          return super.list(namespace, prefix);
+        }
+      }
+
+      const storage = new GatedStorage();
+      const masterKey = generateRandomKey();
+      const auditLog = new AuditLog(storage, masterKey);
+      const WAITER_CAP = 2;
+      const store = new SentinelFindingStore({
+        storage,
+        masterKey,
+        fortressId: "fortress-admission-waiter-cap-test",
+        auditLog,
+        maxTrackedFindings: 1000,
+        maxPendingAdmissionWaiters: WAITER_CAP,
+      });
+
+      // Warm-up write: exercises `ensureIndex`'s own one-time
+      // `storage.list()` call and the ceiling's `storage.list()` call once,
+      // BEFORE the gate is armed, so neither happens while gated.
+      await store.saveFinding(mkFinding("seed"));
+
+      // Arm the gate: the NEXT `storage.list()` call (the first
+      // admission's own ceiling check) blocks until this test releases it.
+      let releaseGate!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        releaseGate = resolve;
+      });
+      storage.armGate(gate);
+
+      // Fire THREE concurrent new-record admissions, none awaited yet.
+      const p1 = store.saveFinding(mkFinding("f1")); // occupies waiter slot
+      // 1, becomes the RUNNING admission (blocks inside
+      // enforceTrackedFindingsCeiling's storage.list() call, holding the
+      // store-level admissionQueue lock).
+      const p2 = store.saveFinding(mkFinding("f2")); // occupies waiter slot
+      // 2, queues behind p1 — never reaches its own storage.list() call yet.
+      const p3 = store.saveFinding(mkFinding("f3")); // waiter count is
+      // already AT the cap (2) by the time this synchronous call runs —
+      // refused immediately, never touching runAdmissionExclusive at all.
+
+      // THE MUTATION-PROOF ASSERTION: p3 rejects with `admission_busy`
+      // WITHOUT waiting on the gate — proving it never joined the queue
+      // behind p1/p2. Removing the cap (or widening it past 2) would
+      // instead let p3 queue and eventually succeed once the gate
+      // releases — this assertion catches exactly that mutation.
+      await expect(p3).rejects.toBeInstanceOf(SentinelFindingStoreRefusedError);
+      await expect(p3).rejects.toMatchObject({ reason: "admission_busy" });
+
+      // p1 and p2 are still genuinely pending (blocked on the gate) — the
+      // cap refused p3 WITHOUT touching the two admissions already queued
+      // ahead of it.
+      let p1Settled = false;
+      let p2Settled = false;
+      p1.then(
+        () => {
+          p1Settled = true;
+        },
+        () => {
+          p1Settled = true;
+        }
+      );
+      p2.then(
+        () => {
+          p2Settled = true;
+        },
+        () => {
+          p2Settled = true;
+        }
+      );
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(p1Settled).toBe(false);
+      expect(p2Settled).toBe(false);
+
+      // Release the gate: p1 completes; p2 then runs its own (ungated,
+      // since the gate is consumed exactly once) storage.list() call and
+      // completes too.
+      releaseGate();
+      await expect(p1).resolves.toBeTypeOf("string");
+      await expect(p2).resolves.toBeTypeOf("string");
+
+      const findings = await store.listFindingMetadata();
+      expect(findings.map((f) => f.finding_id).sort()).toEqual(
+        ["f1", "f2", "seed"].sort()
+      );
+
+      // The waiter counter correctly returned to 0 once every admission
+      // settled — a fresh admission is neither spuriously refused nor able
+      // to exceed the cap on its own (a leaked counter, e.g. a missing
+      // `finally` decrement, would make this call incorrectly read as busy
+      // even with no concurrent admission in flight).
+      await expect(store.saveFinding(mkFinding("f4"))).resolves.toBeTypeOf(
+        "string"
+      );
+    },
+    30_000
+  );
 });
 
 // ──────────────────────────────────────────────────────────────────────────

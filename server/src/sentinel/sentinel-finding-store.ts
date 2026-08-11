@@ -29,7 +29,10 @@ import {
 import { derivePurposeKey } from "../core/key-derivation.js";
 import { stringToBytes, bytesToString } from "../core/encoding.js";
 import type { AuditLog } from "../operational/audit-log.js";
-import { ON_EVICT_AUDIT_TIMEOUT_MS } from "../core/bounded-map.js";
+import {
+  ON_EVICT_AUDIT_TIMEOUT_MS,
+  MAX_PENDING_ADMISSION_WAITERS,
+} from "../core/bounded-map.js";
 import {
   SENTINEL_SUMMARY_MAX_CHARS,
   type SentinelFinding,
@@ -171,14 +174,25 @@ function resolveFindingOrigin(finding: SentinelFinding): string {
  * (`finding_store_origin_quota_exceeded` / `finding_store_saturated`)
  * before throwing, so the operator-visible trail exists even when a caller
  * only catches-and-discards.
+ *
+ * A THIRD reason, `admission_busy` (AGENTS.md rule 8, fix-round-6 — see
+ * `admissionQueue`'s doc below), means this call never even reached the
+ * origin-quota/capacity checks above: `MAX_PENDING_ADMISSION_WAITERS`
+ * other new-record admissions were already queued for this store's own
+ * admission lock. Distinct from `capacity` the same way `admission_busy`
+ * is distinct from `capacity` on `BoundedMap` (core/bounded-map.ts) — this
+ * is "the store's serialization primitive is momentarily saturated, retry
+ * shortly," not a statement about how many findings are currently tracked.
  */
 export class SentinelFindingStoreRefusedError extends Error {
-  readonly reason: "origin_quota" | "capacity";
-  constructor(reason: "origin_quota" | "capacity") {
+  readonly reason: "origin_quota" | "capacity" | "admission_busy";
+  constructor(reason: "origin_quota" | "capacity" | "admission_busy") {
     super(
       reason === "origin_quota"
         ? "Sentinel finding store: origin per-write quota exceeded"
-        : "Sentinel finding store: at capacity, nothing reclaimable"
+        : reason === "capacity"
+          ? "Sentinel finding store: at capacity, nothing reclaimable"
+          : "Sentinel finding store: admission queue is momentarily saturated, retry shortly"
     );
     this.name = "SentinelFindingStoreRefusedError";
     this.reason = reason;
@@ -305,6 +319,27 @@ const SATURATION_EVICT_SCAN_CAP = 50;
  * the storage interface (storage/interface.ts) gives no settle-time
  * contract for at all. STORAGE_OP_MARGIN_MS is a defensive backstop for
  * that unbounded portion, not a precise derivation.
+ *
+ * ACCEPTED RESIDUAL (fix-round-6, recorded honestly, not "fixed"): a
+ * storage `write`/`list`/`read` call that hangs PAST this deadline and
+ * then LATER completes can still allow a single bounded detached write to
+ * land after `withDeadline` already gave up and refused the triggering
+ * admission — the deadline stops this call from WAITING on the hung
+ * operation, it cannot CANCEL the operation itself, because
+ * `storage/interface.ts` exposes no cancellation and no compare-and-swap
+ * primitive. The overshoot this can cause is bounded to exactly ONE extra
+ * write (the one detached call), never unbounded growth, and requires
+ * storage to pathologically hang past a multi-second deadline and then
+ * still succeed — this is NOT claimed to be impossible, and the resulting
+ * write is NOT claimed to be byte-identical to anything; it is a real,
+ * bounded, single-write overshoot, accepted rather than engineered away.
+ * This is the SAME trade-off `core/bounded-map.ts`'s `onEvict` timeout
+ * already makes for the identical reason (no cancellation primitive on
+ * the underlying I/O) — adding storage-level cancellation or
+ * compare-and-swap machinery to close this one write would be
+ * disproportionate to a residual this narrow (AGENTS.md's minimalism
+ * principle: a remediation worse than the bug it fixes). See
+ * BUILD_RESULT.md's accepted-residual note for the full record.
  */
 const STORAGE_OP_MARGIN_MS = 10_000;
 const STORE_ADMISSION_DEADLINE_MS = ON_EVICT_AUDIT_TIMEOUT_MS + STORAGE_OP_MARGIN_MS;
@@ -369,9 +404,9 @@ export interface SentinelFindingStoreOptions {
   auditLog?: AuditLog;
   /**
    * Test-only overrides for the bounded-work constants (MAX_TRACKED_FINDINGS,
-   * MAX_SCANNED_RECORDS, PRUNE_SCAN_CAP, MAX_FINDINGS_PER_ORIGIN). Production
-   * call sites never set these; they exist so the class-level
-   * bounded-collection inventory test
+   * MAX_SCANNED_RECORDS, PRUNE_SCAN_CAP, MAX_FINDINGS_PER_ORIGIN,
+   * MAX_PENDING_ADMISSION_WAITERS). Production call sites never set these;
+   * they exist so the class-level bounded-collection inventory test
    * (test/security/attacker-writable-collections-bounds.test.ts) can drive
    * the REAL production write/list/prune path to its cap in a handful of
    * iterations instead of thousands, without weakening the shipped defaults.
@@ -380,6 +415,13 @@ export interface SentinelFindingStoreOptions {
   maxScannedRecords?: number;
   pruneScanCap?: number;
   maxFindingsPerOrigin?: number;
+  /**
+   * Cap on this store's admission-WAITER queue (AGENTS.md rule 8,
+   * fix-round-6). Defaults to `MAX_PENDING_ADMISSION_WAITERS`
+   * (core/bounded-map.ts — shared, not re-derived; see that constant's
+   * doc). Test-only override, same shape as the four above.
+   */
+  maxPendingAdmissionWaiters?: number;
 }
 
 export class SentinelFindingStore {
@@ -393,6 +435,17 @@ export class SentinelFindingStore {
   private readonly maxScannedRecords: number;
   private readonly pruneScanCap: number;
   private readonly maxFindingsPerOrigin: number;
+  private readonly maxPendingAdmissionWaiters: number;
+  /**
+   * Live count of callers currently occupying this store's admission-waiter
+   * cap (AGENTS.md rule 8, fix-round-6 — mirrors `BoundedMap`'s
+   * `pendingAdmissionWaiters`, core/bounded-map.ts). Incremented
+   * SYNCHRONOUSLY in `saveFinding`'s new-record branch before the first
+   * `await` in that branch, decremented in a `finally` once
+   * `runAdmissionExclusive` settles either way — see that field's doc for
+   * why the synchronous check-then-increment needs no separate lock.
+   */
+  private pendingAdmissionWaiters = 0;
   // Filter-before-decrypt index (see MAX_SCANNED_RECORDS's doc). Populated
   // incrementally on every saveFinding, and lazily backfilled ONCE from
   // storage (`ensureIndex`) so records written by a PRIOR process instance
@@ -505,6 +558,14 @@ export class SentinelFindingStore {
    * be routed through `admissionQueue` — doing so would let a nested
    * renewal (itself now requiring `admissionQueue`) block on the very
    * admission it was invoked from inside of.
+   *
+   * WAITER CAP (AGENTS.md rule 8, fix-round-6): the queue of callers
+   * WAITING to chain onto this promise had no bound of its own — see
+   * `pendingAdmissionWaiters` and `MAX_PENDING_ADMISSION_WAITERS`
+   * (core/bounded-map.ts, shared) for the fix. `saveFinding`'s new-record
+   * branch checks and increments that counter BEFORE ever calling
+   * `runAdmissionExclusive`, so a caller refused for `admission_busy`
+   * never reaches this queue at all.
    */
   private admissionQueue: Promise<void> = Promise.resolve();
 
@@ -523,6 +584,8 @@ export class SentinelFindingStore {
     this.pruneScanCap = opts.pruneScanCap ?? PRUNE_SCAN_CAP;
     this.maxFindingsPerOrigin =
       opts.maxFindingsPerOrigin ?? MAX_FINDINGS_PER_ORIGIN;
+    this.maxPendingAdmissionWaiters =
+      opts.maxPendingAdmissionWaiters ?? MAX_PENDING_ADMISSION_WAITERS;
   }
 
   /**
@@ -749,18 +812,46 @@ export class SentinelFindingStore {
       // per-id lock for the (unchanged) same-id refresh protection.
       await writeAndIndex();
     } else {
-      // NEW-RECORD ADMISSION (MUST-FIX 1, fix-round-5): the ceiling check
-      // and the write+index update run as ONE critical section under the
-      // store-level admission lock, so a concurrent new-id admission can
-      // only ever observe this call's COMPLETE outcome, never a
-      // pre-write snapshot. LOCK ORDERING: `runAdmissionExclusive` is
-      // acquired first (outer); `enforceTrackedFindingsCeiling`'s own
-      // reclamation and `writeAndIndex` each acquire a `findingLocks`
-      // entry (inner) only from inside it — see `admissionQueue`'s doc.
-      await this.runAdmissionExclusive(async () => {
-        await this.enforceTrackedFindingsCeiling(key, origin);
-        await writeAndIndex();
-      });
+      // ADMISSION-WAITER CAP (AGENTS.md rule 8 on the fix's OWN state,
+      // fix-round-6): the admission WAITER queue is attacker-influenced
+      // state and is itself bounded (rule 8); at the cap, admission fails
+      // closed with a busy reason rather than growing the queue. Checked
+      // and incremented SYNCHRONOUSLY, before this branch's first `await`
+      // — see `pendingAdmissionWaiters`'s doc for why that makes the check
+      // itself TOCTOU-safe with no extra lock. A refusal here never calls
+      // `runAdmissionExclusive`: this call's closure is never constructed,
+      // never chained onto `admissionQueue`, so a refused call leaves the
+      // queue exactly as it was.
+      if (this.pendingAdmissionWaiters >= this.maxPendingAdmissionWaiters) {
+        void this.auditLog?.append(
+          "l2",
+          "finding_store_admission_busy",
+          this.fortressId,
+          {
+            pending_admission_waiters: this.pendingAdmissionWaiters,
+            max_pending_admission_waiters: this.maxPendingAdmissionWaiters,
+          },
+          "failure",
+        );
+        throw new SentinelFindingStoreRefusedError("admission_busy");
+      }
+      this.pendingAdmissionWaiters += 1;
+      try {
+        // NEW-RECORD ADMISSION (MUST-FIX 1, fix-round-5): the ceiling check
+        // and the write+index update run as ONE critical section under the
+        // store-level admission lock, so a concurrent new-id admission can
+        // only ever observe this call's COMPLETE outcome, never a
+        // pre-write snapshot. LOCK ORDERING: `runAdmissionExclusive` is
+        // acquired first (outer); `enforceTrackedFindingsCeiling`'s own
+        // reclamation and `writeAndIndex` each acquire a `findingLocks`
+        // entry (inner) only from inside it — see `admissionQueue`'s doc.
+        await this.runAdmissionExclusive(async () => {
+          await this.enforceTrackedFindingsCeiling(key, origin);
+          await writeAndIndex();
+        });
+      } finally {
+        this.pendingAdmissionWaiters -= 1;
+      }
     }
     return persisted.retention_until;
   }

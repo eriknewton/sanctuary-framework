@@ -250,19 +250,22 @@ export function createFederationTools(
             );
 
             // Bounded-collection guard (register LD2-04): the registry
-            // refuses a new peer for one of THREE typed reasons (MUST-FIX 2,
+            // refuses a new peer for one of FOUR typed reasons (MUST-FIX 2,
             // fix-round-4 — widened from a bare null/non-null result so the
             // AGENT-facing tool response is as accurate as the operator audit
             // trail already was via `onRefuse`, registry.ts): THIS identity's
             // own per-origin quota is exhausted (`origin_quota`), the shared
             // registry is at capacity and every existing slot holds a
-            // currently-active peer (`capacity`), or a capacity eviction was
+            // currently-active peer (`capacity`), a capacity eviction was
             // decided but its durable audit write did not complete
             // (`audit_unavailable` — distinct from `capacity` because a
-            // retry once the audit trail recovers should not be told "full").
-            // Either way the registry never evicts a real trusted peer to
-            // make room. Surface this as an explicit error, never a
-            // silently-dropped "registered: true".
+            // retry once the audit trail recovers should not be told "full"),
+            // or the registry's own admission-lock waiter queue was already
+            // at its cap (`admission_busy`, fix-round-6 — see
+            // core/bounded-map.ts's `BoundedMapRefuseReason` doc). Either way
+            // the registry never evicts a real trusted peer to make room.
+            // Surface this as an explicit error, never a silently-dropped
+            // "registered: true".
             if (!registration.ok) {
               // MUST-FIX 3, fix-round-5 (Codex): both messages below were
               // inaccurate about the underlying condition. (1) `origin_quota`
@@ -280,6 +283,11 @@ export function createFederationTools(
               // capacity and an eviction WAS decided; it is a distinct
               // reason for the SAME "at capacity" condition, not a separate
               // "not full" one, so the two are never mutually exclusive.
+              // (3) `admission_busy` (fix-round-6) is checked BEFORE
+              // `origin_quota`/`capacity` ever run at all (bounded-map.ts's
+              // `set()`) — it must not collapse into the `capacity` message
+              // below, which would wrongly tell the agent "every peer is
+              // active" for what is really "retry shortly."
               const error =
                 registration.reason === "origin_quota"
                   ? "This identity has reached its federation peer " +
@@ -295,10 +303,14 @@ export function createFederationTools(
                       "complete in time; this is an audit-log availability " +
                       "issue, not a genuine \"every peer is active\" " +
                       "saturation. Retry once the audit log recovers."
-                    : "Federation peer registry is at capacity and every " +
-                      "slot holds an active peer; cannot register a new " +
-                      "peer until one expires, is removed, or one becomes " +
-                      "inactive.";
+                    : registration.reason === "admission_busy"
+                      ? "Federation peer registry's admission queue is " +
+                        "momentarily saturated with other concurrent peer " +
+                        "registrations; retry shortly."
+                      : "Federation peer registry is at capacity and every " +
+                        "slot holds an active peer; cannot register a new " +
+                        "peer until one expires, is removed, or one becomes " +
+                        "inactive.";
               return toolResult({ error });
             }
             const peer = registration.peer;

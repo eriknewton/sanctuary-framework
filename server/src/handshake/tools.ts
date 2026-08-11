@@ -352,10 +352,30 @@ export function createHandshakeTools(
   const SESSIONS_SATURATED_ERROR =
     "Handshake session store is at capacity; cannot start a new session " +
     "until an existing one completes, expires, or is aborted.";
+  // CORRECTED (MUST-FIX 2, fix-round-6): the prior wording ("the store is
+  // not full, its audit trail is unavailable") described the WRONG
+  // condition. `audit_unavailable` is reachable ONLY from inside
+  // bounded-map.ts's `map.size >= this.opts.maxSize` branch (see
+  // `admitNewKey`) — the store WAS at capacity and an eviction WAS decided
+  // to make room; what failed is that eviction's durable audit write, not
+  // some separate "not full" state. Mirrors the wording
+  // federation/tools.ts already uses correctly for its own
+  // `audit_unavailable` branch.
   const SESSIONS_AUDIT_UNAVAILABLE_ERROR =
-    "Handshake session store could not durably audit an eviction needed " +
-    "to admit this session; the store is not full, its audit trail is " +
-    "unavailable. Retry once the audit log recovers.";
+    "Handshake session store is at capacity and needed to evict an " +
+    "existing session to admit this one, but the durable audit write for " +
+    "that eviction did not complete in time; this is an audit-log " +
+    "availability issue, not genuine session-store saturation. Retry " +
+    "once the audit log recovers.";
+  // ADMISSION-WAITER CAP (AGENTS.md rule 8, fix-round-6): distinct from all
+  // three reasons above — this call never reached the origin-quota/
+  // capacity/audit checks at all, because `sessions`'s own admission-lock
+  // WAITER queue was already at its cap (core/bounded-map.ts's
+  // `MAX_PENDING_ADMISSION_WAITERS`). A momentary serialization-primitive
+  // saturation, not a statement about how many sessions are tracked.
+  const SESSIONS_ADMISSION_BUSY_ERROR =
+    "Handshake session store's admission queue is momentarily saturated " +
+    "with other concurrent session insertions; retry shortly.";
 
   /**
    * Shared insert path for BOTH `handshake_initiate` and `handshake_respond`
@@ -385,10 +405,10 @@ export function createHandshakeTools(
       const origin = resolveSessionOrigin(callerIdentity);
       // MUST-FIX 3 (fix-round-3): read the REAL refusal reason off THIS
       // call's own result rather than reconstructing it from a pre-check
-      // (the fix-round-2 shape) — `set()` can now refuse for a THIRD
-      // reason (`audit_unavailable`) that a boolean-only pre-check
-      // (origin-quota-or-else-capacity) cannot distinguish from genuine
-      // saturation.
+      // (the fix-round-2 shape) — `set()` can now refuse for a FOURTH
+      // reason (`admission_busy`, fix-round-6, alongside `audit_unavailable`)
+      // that a boolean-only pre-check (origin-quota-or-else-capacity)
+      // cannot distinguish from genuine saturation.
       const result = await sessions.set(session.session_id, session, origin);
       if (!result.ok) {
         const reason: HandshakeFailureReason =
@@ -396,13 +416,17 @@ export function createHandshakeTools(
             ? "handshake_session_origin_quota_exceeded"
             : result.reason === "audit_unavailable"
               ? "handshake_session_audit_unavailable"
-              : "handshake_session_store_saturated";
+              : result.reason === "admission_busy"
+                ? "handshake_session_admission_busy"
+                : "handshake_session_store_saturated";
         const error =
           result.reason === "origin_quota"
             ? SESSION_ORIGIN_QUOTA_ERROR
             : result.reason === "audit_unavailable"
               ? SESSIONS_AUDIT_UNAVAILABLE_ERROR
-              : SESSIONS_SATURATED_ERROR;
+              : result.reason === "admission_busy"
+                ? SESSIONS_ADMISSION_BUSY_ERROR
+                : SESSIONS_SATURATED_ERROR;
         void auditLog.append(
           "l4",
           reason,
@@ -465,10 +489,23 @@ export function createHandshakeTools(
     `(limit ${MAX_HANDSHAKE_RESULTS_PER_ORIGIN}). This bounds one identity's ` +
     "share of the shared handshake-results store so it cannot exhaust the " +
     "space every identity draws from.";
+  // CORRECTED (MUST-FIX 2, fix-round-6): the prior wording ("the store is
+  // not full, its audit trail is unavailable") described the WRONG
+  // condition — see SESSIONS_AUDIT_UNAVAILABLE_ERROR's doc above for the
+  // identical correction and why `audit_unavailable` is only ever reached
+  // from inside bounded-map.ts's AT-CAPACITY branch.
   const HANDSHAKE_RESULTS_AUDIT_UNAVAILABLE_ERROR =
-    "Handshake result store could not durably audit an eviction needed to " +
-    "record this handshake; the store is not full, its audit trail is " +
-    "unavailable. Retry once the audit log recovers.";
+    "Handshake result store is at capacity and needed to evict an " +
+    "existing result to record this one, but the durable audit write for " +
+    "that eviction did not complete in time; this is an audit-log " +
+    "availability issue, not genuine handshake-result-store saturation. " +
+    "Retry once the audit log recovers.";
+  // ADMISSION-WAITER CAP (AGENTS.md rule 8, fix-round-6): see
+  // SESSIONS_ADMISSION_BUSY_ERROR's doc above — same distinction, for
+  // `handshakeResults`'s own admission-lock waiter queue.
+  const HANDSHAKE_RESULTS_ADMISSION_BUSY_ERROR =
+    "Handshake result store's admission queue is momentarily saturated " +
+    "with other concurrent handshake completions; retry shortly.";
   const handshakeResults = new BoundedMap<string, HandshakeResult>({
     maxSize: MAX_HANDSHAKE_RESULTS,
     maxPerOrigin: MAX_HANDSHAKE_RESULTS_PER_ORIGIN,
@@ -714,8 +751,9 @@ export function createHandshakeTools(
       // MUST-FIX 3 (fix-round-3): read the REAL refusal reason off THIS
       // call's own `set()` result rather than reconstructing it from a
       // pre-check (the fix-round-2 shape) — `set()` can now refuse for a
-      // THIRD reason (`audit_unavailable`) a boolean-only pre-check
-      // cannot distinguish from genuine saturation.
+      // FOURTH reason (`admission_busy`, fix-round-6, alongside
+      // `audit_unavailable`) a boolean-only pre-check cannot distinguish
+      // from genuine saturation.
       const setResult = await handshakeResults.set(
         result.counterparty_id,
         result,
@@ -727,13 +765,17 @@ export function createHandshakeTools(
             ? "handshake_results_origin_quota_exceeded"
             : setResult.reason === "audit_unavailable"
               ? "handshake_results_audit_unavailable"
-              : "handshake_results_saturated";
+              : setResult.reason === "admission_busy"
+                ? "handshake_results_admission_busy"
+                : "handshake_results_saturated";
         const error =
           setResult.reason === "origin_quota"
             ? HANDSHAKE_RESULTS_ORIGIN_QUOTA_ERROR
             : setResult.reason === "audit_unavailable"
               ? HANDSHAKE_RESULTS_AUDIT_UNAVAILABLE_ERROR
-              : HANDSHAKE_RESULTS_SATURATED_ERROR;
+              : setResult.reason === "admission_busy"
+                ? HANDSHAKE_RESULTS_ADMISSION_BUSY_ERROR
+                : HANDSHAKE_RESULTS_SATURATED_ERROR;
         void auditLog.append(
           "l4",
           reason,

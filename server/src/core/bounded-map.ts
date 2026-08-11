@@ -67,11 +67,18 @@ export type EvictionDecision<K> = { evict: K } | { refuse: true };
  * itself is unavailable right now" (MUST-FIX 3, fix-round-3) — the third
  * case is an availability problem with the AUDIT LOG, not with the
  * collection's capacity, and conflating it with "capacity" hides that
- * distinction from an operator trying to diagnose which one is true. */
+ * distinction from an operator trying to diagnose which one is true.
+ * `admission_busy` (fix-round-6, MUST-FIX 1) is a FOURTH, distinct
+ * reason: this call never even reached the origin-quota/capacity/audit
+ * checks above, because `MAX_PENDING_ADMISSION_WAITERS` other callers were
+ * already queued for this map's admission lock — a "the collection's
+ * SERIALIZATION PRIMITIVE is momentarily saturated, retry shortly" signal,
+ * not a statement about the collection's own contents at all. */
 export type BoundedMapRefuseReason =
   | "origin_quota"
   | "capacity"
-  | "audit_unavailable";
+  | "audit_unavailable"
+  | "admission_busy";
 
 /**
  * `set()`'s result (MUST-FIX 3, fix-round-3 — replaces a plain boolean).
@@ -137,12 +144,64 @@ export type BoundedMapSetResult =
  * window unreachable for a conforming audit-log implementation (not an
  * absolute guarantee against a future change to that contract — see
  * BUILD_RESULT.md's residual note).
+ *
+ * ACCEPTED RESIDUAL, RECORDED HONESTLY (fix-round-6): if a caller-supplied
+ * `onEvict` DOES take longer than this timeout to settle (a non-conforming
+ * or future audit-log implementation, or a caller who supplies something
+ * other than `appendCritical`), the detached continuation described above
+ * can still land after `set()` already refused — a real, bounded, SINGLE
+ * detached write, never unbounded growth, and never claimed to be
+ * impossible or byte-identical to a normal completion. This is the SAME
+ * no-cancellation trade-off `sentinel/sentinel-finding-store.ts`'s own
+ * `STORE_ADMISSION_DEADLINE_MS` accepts for its raw storage calls (which
+ * carry no settle-time contract at all, unlike `appendCritical` here) —
+ * see that constant's doc for the fuller accepted-residual statement, and
+ * BUILD_RESULT.md for the record. Adding cancellation or a
+ * compare-and-swap primitive to close this one write is disproportionate
+ * to how narrow the residual is (AGENTS.md's minimalism principle).
  */
 // EXPORTED for tests only (test/core/bounded-map.test.ts pins fake-timer
 // advances to this exact value rather than a hand-copied duplicate, so the
 // test cannot silently drift from the real derivation above).
 export const ON_EVICT_AUDIT_TIMEOUT_MS =
   AUDIT_WRITE_LOCK_TIMEOUT_MS + DEFAULT_AUDIT_WRITE_LOCK_HOLD_DEADLINE_MS + 5_000;
+
+/**
+ * Cap on the ADMISSION-WAITER QUEUE itself (AGENTS.md rule 8, fix-round-6 —
+ * applying the "state that grows from untrusted input needs a cap" rule to
+ * the serialization primitive's OWN state, not just the collection it
+ * protects). `admissionQueue` (below) serializes every new-key admission for
+ * a map instance into a single promise chain; before this fix, the number of
+ * callers simultaneously QUEUED behind that chain had no bound at all — a
+ * burst of concurrent Tier-3 tool calls (each minting a new attacker-facing
+ * key: a fresh handshake preview, a fresh federation registration) could
+ * pile an unbounded number of pending continuations onto the chain while the
+ * head of the queue was slow (a legitimate multi-second `onEvict` audit
+ * write). Each queued continuation is a live closure holding its own `key`/
+ * `value`/`origin`, so the queue is itself attacker-influenceable memory,
+ * exactly the class rule 8 exists to bound.
+ *
+ * CROSS-FILE PIN: `sentinel/sentinel-finding-store.ts` imports this SAME
+ * constant for its own store-level admission queue rather than re-deriving
+ * a second number for the identical class of state (a queued
+ * `saveFinding` continuation waiting on that store's own
+ * `runAdmissionExclusive`) — see that file's `admissionQueue` doc.
+ *
+ * DERIVATION: 64 = a generous multiple of the highest concurrency this
+ * codebase's own adversarial regression suite drives against a single
+ * map/store instance today (20 simultaneous new-record admissions, in
+ * sentinel-finding-store.ts's cross-ID admission TOCTOU test) — production
+ * concurrency for ONE instance is expected to stay near that order even
+ * under a scripted flood, since concurrent NEW-key admissions arise only
+ * from genuinely distinct concurrent Tier-3 tool invocations across agent
+ * sessions (a single session's own router-dispatched calls run
+ * sequentially, never in parallel against the same map). 64 sits well
+ * above the highest concurrency this suite exercises today while staying
+ * small enough that the waiter queue itself can never become a meaningful
+ * memory concern — a caller past the cap is refused immediately (fail
+ * closed, reason `admission_busy`) rather than ever joining the queue.
+ */
+export const MAX_PENDING_ADMISSION_WAITERS = 64;
 
 /**
  * Race `promise` against a timer that rejects after `ms`. Used ONLY to
@@ -285,9 +344,11 @@ export interface BoundedMapOptions<K, V> {
    * the way the old single-write-inside-`onEvict` shape could.
    */
   onEvicted?: (evictedKey: K, evictedValue: V) => void;
-  /** Fired when an insert is refused — either because the incoming origin
-   * was already at `maxPerOrigin`, or because the map is at the global cap
-   * and `selectEviction` refused. */
+  /** Fired when an insert is refused — because the incoming origin was
+   * already at `maxPerOrigin`, because the map is at the global cap and
+   * `selectEviction` refused, because a decided eviction's audit write
+   * did not durably complete, or (fix-round-6) because the admission
+   * WAITER queue itself was already at its own cap. */
   onRefuse?: (
     incomingKey: K,
     incomingValue: V,
@@ -305,6 +366,15 @@ export interface BoundedMapOptions<K, V> {
    * ever be evicted or refused "because of" it).
    */
   maxPerOrigin?: number;
+  /**
+   * Cap on the admission-WAITER queue (AGENTS.md rule 8, fix-round-6 — see
+   * {@link MAX_PENDING_ADMISSION_WAITERS}'s doc for the derivation and why
+   * this state needs its own bound). Defaults to
+   * {@link MAX_PENDING_ADMISSION_WAITERS}; overridable so a test can drive
+   * the cap in a handful of concurrent calls instead of dozens (mirrors
+   * `SentinelFindingStoreOptions`'s test-only bounded-work overrides).
+   */
+  maxPendingAdmissionWaiters?: number;
 }
 
 export class BoundedMap<K, V> {
@@ -333,6 +403,18 @@ export class BoundedMap<K, V> {
    * map would.
    */
   private admissionQueue: Promise<void> = Promise.resolve();
+  /**
+   * Live count of callers currently occupying the admission-waiter cap
+   * (AGENTS.md rule 8, fix-round-6) — incremented SYNCHRONOUSLY in `set()`
+   * before `runAdmissionExclusive` is ever called, decremented in a
+   * `finally` once that call settles either way. Because the increment and
+   * the cap check both run before this call's first `await`, a burst of
+   * concurrent `set()` calls can only ever observe this counter one at a
+   * time (ordinary JS run-to-completion between `await` points), so this
+   * needs no lock of its own the way `this.map`/`this.origins` do inside
+   * `admitNewKey`.
+   */
+  private pendingAdmissionWaiters = 0;
 
   constructor(opts: BoundedMapOptions<K, V>) {
     if (!Number.isInteger(opts.maxSize) || opts.maxSize <= 0) {
@@ -343,6 +425,15 @@ export class BoundedMap<K, V> {
       (!Number.isInteger(opts.maxPerOrigin) || opts.maxPerOrigin <= 0)
     ) {
       throw new Error("BoundedMap: maxPerOrigin must be a positive integer");
+    }
+    if (
+      opts.maxPendingAdmissionWaiters !== undefined &&
+      (!Number.isInteger(opts.maxPendingAdmissionWaiters) ||
+        opts.maxPendingAdmissionWaiters <= 0)
+    ) {
+      throw new Error(
+        "BoundedMap: maxPendingAdmissionWaiters must be a positive integer",
+      );
     }
     this.opts = opts;
   }
@@ -443,7 +534,30 @@ export class BoundedMap<K, V> {
       this.map.set(key, value);
       return { ok: true };
     }
-    return this.runAdmissionExclusive(() => this.admitNewKey(key, value, origin));
+    // ADMISSION-WAITER CAP (AGENTS.md rule 8 on the fix's OWN state,
+    // fix-round-6): the admission WAITER queue is attacker-influenced
+    // state and is itself bounded (rule 8); at the cap, admission fails
+    // closed with a busy reason rather than growing the queue. Checked
+    // and incremented SYNCHRONOUSLY, before the first `await` in this
+    // method — see `pendingAdmissionWaiters`'s doc for why that makes the
+    // check itself TOCTOU-safe with no extra lock. A refusal here never
+    // calls `runAdmissionExclusive` at all: the caller's closure is never
+    // constructed, never chained onto `admissionQueue`, so a refused call
+    // leaves the queue exactly as it was.
+    const maxWaiters =
+      this.opts.maxPendingAdmissionWaiters ?? MAX_PENDING_ADMISSION_WAITERS;
+    if (this.pendingAdmissionWaiters >= maxWaiters) {
+      this.opts.onRefuse?.(key, value, "admission_busy");
+      return { ok: false, reason: "admission_busy" };
+    }
+    this.pendingAdmissionWaiters += 1;
+    try {
+      return await this.runAdmissionExclusive(() =>
+        this.admitNewKey(key, value, origin),
+      );
+    } finally {
+      this.pendingAdmissionWaiters -= 1;
+    }
   }
 
   /**

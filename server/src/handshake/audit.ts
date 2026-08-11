@@ -89,6 +89,18 @@ export type HandshakeFailureReason =
   | "handshake_results_audit_unavailable"
   // Same distinction as above, for `sessions`'s eviction audit.
   | "handshake_session_audit_unavailable"
+  // ADMISSION-WAITER CAP (AGENTS.md rule 8, fix-round-6 — see
+  // core/bounded-map.ts's `BoundedMapRefuseReason` doc): `handshakeResults`'s
+  // admission-lock WAITER queue was already at its own cap when this call
+  // arrived. Distinct from every reason above: this call never even reached
+  // the origin-quota/capacity/audit checks, because
+  // `MAX_PENDING_ADMISSION_WAITERS` other admissions were already queued —
+  // a "the map's serialization primitive is momentarily saturated, retry
+  // shortly" signal, not a statement about `handshakeResults`'s own
+  // contents.
+  | "handshake_results_admission_busy"
+  // Same distinction as above, for `sessions`'s own admission-waiter queue.
+  | "handshake_session_admission_busy"
   | "other";
 
 /** Reasons a handshake may be aborted (operator or transport). */

@@ -212,6 +212,107 @@ describe("BoundedMap admission concurrency (MUST-FIX 1, fix-round-3)", () => {
   );
 });
 
+describe("BoundedMap admission-waiter cap (AGENTS.md rule 8 on the fix's OWN state, fix-round-6)", () => {
+  it(
+    "MUTATION-PROOF TARGET (waiter cap): concurrent admissions past maxPendingAdmissionWaiters are refused immediately with reason 'admission_busy', never queued — the waiter count never exceeds the configured cap",
+    async () => {
+      // maxSize: 1 so every NEW-key admission after the seed requires an
+      // eviction (and therefore actually reaches `runAdmissionExclusive`
+      // and blocks on `onEvict`, rather than resolving on the same
+      // microtask the way an under-cap plain insert would) — this is what
+      // lets the test hold the admission lock open long enough to prove
+      // callers queue up BEHIND it, not just that a single call succeeds.
+      const deferred = createDeferred();
+      const WAITER_CAP = 2;
+      const busyRefusals: string[] = [];
+      const map = new BoundedMap<string, { n: number }>({
+        maxSize: 1,
+        maxPendingAdmissionWaiters: WAITER_CAP,
+        selectEviction: (entries) => {
+          for (const [key] of entries) return { evict: key };
+          return { refuse: true };
+        },
+        onEvict: async () => {
+          await deferred.promise;
+        },
+        onRefuse: (key, _value, reason) => {
+          if (reason === "admission_busy") busyRefusals.push(key);
+        },
+      });
+
+      // Fill to maxSize=1 uncontended — no eviction needed yet.
+      expect((await map.set("seed", { n: 0 })).ok).toBe(true);
+
+      // Fire THREE concurrent new-key admissions, none awaited yet. Each
+      // requires evicting "seed" (map is at maxSize=1), so each must pass
+      // through the admission-waiter check in `set()` BEFORE it can even
+      // attempt to join `admissionQueue`.
+      const p1 = map.set("a", { n: 1 }); // occupies waiter slot 1, becomes
+      // the running admission (blocks on `deferred` inside onEvict).
+      const p2 = map.set("b", { n: 2 }); // occupies waiter slot 2, queues
+      // behind p1's still-in-flight admission.
+      const p3 = map.set("c", { n: 3 }); // waiter count is already AT the
+      // cap (2) by the time this synchronous call runs — refused
+      // immediately, never touching `admissionQueue` at all.
+
+      // THE MUTATION-PROOF ASSERTION: p3 resolves to a busy refusal WITHOUT
+      // waiting on `deferred` — proving it never joined the queue behind
+      // p1/p2. Removing the cap (or defaulting it to something larger than
+      // 2) would instead let p3 queue and eventually succeed once
+      // `deferred` resolves, evicting "a" — this assertion catches exactly
+      // that mutation.
+      const r3 = await p3;
+      expect(r3).toEqual({ ok: false, reason: "admission_busy" });
+      expect(busyRefusals).toEqual(["c"]);
+
+      // p1 and p2 are still genuinely pending (blocked on `deferred`) —
+      // the cap refused p3 WITHOUT touching the two admissions already
+      // queued ahead of it.
+      let p1Settled = false;
+      let p2Settled = false;
+      void p1.then(() => {
+        p1Settled = true;
+      });
+      void p2.then(() => {
+        p2Settled = true;
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(p1Settled).toBe(false);
+      expect(p2Settled).toBe(false);
+
+      // Release the gate: p1 evicts "seed" and inserts "a"; p2 then runs,
+      // evicts "a", and inserts "b".
+      deferred.resolve();
+      const [r1, r2] = await Promise.all([p1, p2]);
+      expect(r1.ok).toBe(true);
+      expect(r2.ok).toBe(true);
+      expect(map.size).toBe(1);
+      expect(map.has("b")).toBe(true);
+
+      // The waiter counter correctly returned to 0 once every admission
+      // settled — a fresh admission is neither spuriously refused nor
+      // able to exceed the cap on its own. (If the counter had leaked —
+      // e.g. a missing `finally` decrement — this call would incorrectly
+      // read as busy even with no concurrent admission in flight.)
+      const p4 = map.set("d", { n: 4 });
+      const r4 = await p4;
+      expect(r4.ok).toBe(true);
+    }
+  );
+
+  it("maxPendingAdmissionWaiters must be a positive integer", () => {
+    expect(
+      () =>
+        new BoundedMap<string, number>({
+          maxSize: 10,
+          maxPendingAdmissionWaiters: 0,
+          selectEviction: () => ({ refuse: true }),
+        })
+    ).toThrow(/maxPendingAdmissionWaiters must be a positive integer/);
+  });
+});
+
 describe("BoundedMap refusal reasons (MUST-FIX 3, fix-round-3)", () => {
   it("a rejected onEvict audit refuses with reason 'audit_unavailable', DISTINCT from a genuine capacity refusal, and never deletes the would-be-evicted entry", async () => {
     type Entry = { tag: string };
