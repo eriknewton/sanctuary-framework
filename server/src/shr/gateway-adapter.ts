@@ -165,14 +165,27 @@ const DEGRADATION_IMPACT = {
  *   unbound instance_id, malformed schema/layers) — no trust decision is
  *   minted from an unverified SHR
  */
-export function transformSHRForGateway(
+export function transformSHRForGateway(shr: SignedSHR): PingAuthorizationContext {
+  // PUBLIC trust-minting entry point: ALWAYS the real clock. `now` is
+  // deliberately NOT a parameter here. A trust decision must not let its
+  // caller choose the temporal reference — a request-wired `now` in the past
+  // would make a genuinely-signed-but-EXPIRED SHR verify, re-opening exactly
+  // the expiry bypass verifySHR closes. Clock injection for deterministic
+  // tests lives in transformSHRForGatewayAt below, which no production/MCP
+  // path reaches.
+  return transformSHRForGatewayAt(shr, new Date());
+}
+
+/**
+ * TEST-ONLY clock seam for transformSHRForGateway. NOT part of the public SHR
+ * surface and NOT re-exported from any barrel; the only callers are
+ * transformSHRForGateway (real clock) and the gateway-adapter tests (fixed-time
+ * fixtures). Never wire `now` to a request-supplied value — see
+ * transformSHRForGateway's doc for why that would re-open the expiry bypass.
+ */
+export function transformSHRForGatewayAt(
   shr: SignedSHR,
-  // `now` threads to verifySHR's temporal check so a caller verifying against
-  // a specific clock (a test with a fixed-time SHR fixture, or a deterministic
-  // replay) checks expiry against THAT clock; production callers omit it and
-  // get the real clock. Threading it does NOT weaken the gate — an expired SHR
-  // still fails; it only lets the caller name the reference time.
-  now?: Date,
+  now: Date,
 ): PingAuthorizationContext {
   // SHR-GW-01 (rule-7, semantic provenance): every field read below —
   // layers, capabilities, degradations, instance_id — is SELF-REPORTED by
@@ -511,13 +524,10 @@ export interface GenericAuthorizationContext {
 /**
  * Transform an SHR into a generic authorization context.
  */
-export function transformSHRGeneric(
-  shr: SignedSHR,
-  now?: Date,
-): GenericAuthorizationContext {
-  // `now` threads through to the verify gate in transformSHRForGateway — see
-  // that function's `now` doc.
-  const context = transformSHRForGateway(shr, now);
+export function transformSHRGeneric(shr: SignedSHR): GenericAuthorizationContext {
+  // Real clock only — see transformSHRForGateway's doc for why a trust-minting
+  // entry point does not accept a caller-chosen clock.
+  const context = transformSHRForGateway(shr);
 
   return {
     agent_id: context.agent_identity,

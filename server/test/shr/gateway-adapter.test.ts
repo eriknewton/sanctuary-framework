@@ -12,6 +12,7 @@ import { createIdentity } from "../../src/core/identity.js";
 import { generateSHR } from "../../src/shr/generator.js";
 import {
   transformSHRForGateway,
+  transformSHRForGatewayAt,
   transformSHRGeneric,
   type PingAuthorizationContext,
   type GenericAuthorizationContext,
@@ -525,10 +526,11 @@ describe("Ping Identity Gateway Adapter", () => {
         },
       }) as SignedSHR;
 
-      // Verify against the same fixed clock this SHR was generated at (SHR-GW-01
-      // threads `now` to verifySHR's temporal check; without it the fixed-time
-      // fixture reads as expired against the real clock).
-      const context = transformSHRForGateway(shr, now);
+      // Fixed-time fixture: use the TEST-ONLY clock seam so verifySHR checks
+      // expiry against this SHR's generation clock, not the real wall clock
+      // (the public transformSHRForGateway is real-clock-only by design —
+      // SHR-GW-01, so a trust decision cannot be handed a caller-chosen time).
+      const context = transformSHRForGatewayAt(shr, now);
       const l4Entries = context.degradations.filter((d) => d.layer === "l4");
 
       const codes = l4Entries.map((e) => e.code).sort();
