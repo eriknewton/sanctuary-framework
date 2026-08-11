@@ -75,7 +75,12 @@ import {
   ReputationBundleVerificationError,
   type ReputationBundle,
 } from "../reputation/reputation-store.js";
-import { verifyExitBundle, readManifest, loadExitArtifact } from "./verifier.js";
+import {
+  verifyExitBundle,
+  readManifest,
+  loadExitArtifact,
+  isWellFormedExitStateEntryElement,
+} from "./verifier.js";
 import {
   isValidSourceCustody,
   SOURCE_CUSTODY_FORMAT,
@@ -1747,21 +1752,34 @@ async function resolveSourceMasterKey(
   encryptedState: ExitEncryptedStateBundle | null,
   opts: ImportExitBundleOptions
 ): Promise<Uint8Array | null> {
-  // LD2-01: `encryptedState` is an unchecked cast of parsed, untrusted JSON
+  // LD2-01 (extended by EXIT-STRUCT-02, one level deeper): `encryptedState`
+  // is an unchecked cast of parsed, untrusted JSON
   // (`loadExitArtifact<ExitEncryptedStateBundle>` in the caller) — its
-  // `entries` field is declared non-optional but is not runtime-guaranteed
-  // to be an array. `importExitBundle` already refuses this shape with the
-  // same typed error before calling in (see the LD2-01 comment at its call
-  // site), so this check is defense in depth for any other caller reaching
-  // this function: fail closed with a named error, never a raw
-  // `.length`-on-undefined TypeError.
-  if (encryptedState && !Array.isArray(encryptedState.entries)) {
+  // `entries` field is declared non-optional and its element shape
+  // (`namespace`/`key`/`entry.kid`/`entry.payload.ct`/`entry.sig`) is
+  // declared non-optional too, but NEITHER is runtime-guaranteed: `entries`
+  // may not be an array at all (LD2-01), or it may be an array containing a
+  // `null` or otherwise malformed element (EXIT-STRUCT-02).
+  // `importExitBundle` already refuses both shapes with the same typed
+  // error before calling in (see the LD2-01/EXIT-STRUCT-02 comment at its
+  // call site), so this check is defense in depth for any other caller
+  // reaching this function: fail closed with a named error, never a raw
+  // TypeError. `isWellFormedExitStateEntryElement` is the SAME predicate
+  // that call site and `verifier.ts` `summarizeEncryptedState` use, so
+  // "malformed" means the same thing in all three places.
+  if (
+    encryptedState &&
+    (!Array.isArray(encryptedState.entries) ||
+      encryptedState.entries.some((item) => !isWellFormedExitStateEntryElement(item)))
+  ) {
     throw new ExitBundleImportError(
       "ENCRYPTED_STATE_ENTRIES_UNREADABLE",
       "This bundle's encrypted_state artifact has no readable entries list " +
-        "(the `entries` field is absent or is not an array). This is not an " +
-        "empty bundle: the entry list itself cannot be read. Re-export the " +
-        "bundle from the source fortress."
+        "(the `entries` field is absent or is not an array), or its entries " +
+        "list contains a malformed element (missing or wrong-typed " +
+        "namespace/key/entry fields). This is not an empty bundle: the " +
+        "entry list itself cannot be read. Re-export the bundle from the " +
+        "source fortress."
     );
   }
   if (!encryptedState || encryptedState.entries.length === 0) return null;
@@ -2383,9 +2401,11 @@ export async function importExitBundle(
     // bare "not verified". Import stays fail-closed either way: it never admits
     // data on an unverifiable chain.
     verification.failure_class !== "rotation_chain_invalid" &&
-    // LD2-01 (same #1189 pattern): encrypted_state_entries_unreadable now
-    // fails `passed` too (verifier.ts aggregator). Do NOT let it short to the
-    // generic not-verified result here either — falling through preserves the
+    // LD2-01 (same #1189 pattern), extended by EXIT-STRUCT-02 for a
+    // malformed ELEMENT rather than an unreadable container:
+    // encrypted_state_entries_unreadable now fails `passed` for both shapes
+    // (verifier.ts aggregator). Do NOT let it short to the generic
+    // not-verified result here either — falling through preserves the
     // specific ENCRYPTED_STATE_ENTRIES_UNREADABLE throw below, once
     // `encryptedState` is loaded, instead of a bare "not verified" that gives
     // the operator no named cause. Import stays fail-closed either way.
@@ -2459,18 +2479,26 @@ export async function importExitBundle(
       rotationChainRefusalMessage(publicKeys)
     );
   }
-  // LD2-01 (verify/import parity aggregator, class fix): an encrypted_state
-  // artifact whose `entries` field is missing or not an array is structural
-  // damage to the artifact itself — verifier.ts `summarizeEncryptedState`
-  // classifies it as `entry_count === null`, and the aggregator in
-  // `verifyExitBundle` now fails `passed` on it too
-  // (`encrypted_state_entries_unreadable`). Checked here unconditionally and
-  // BEFORE the generic not-verified gate below, mirroring the
-  // rotation-chain-invalid throw immediately above: without this, the raw
-  // `encryptedState.entries.length` dereference three lines into
-  // `resolveSourceMasterKey` throws an unhandled TypeError for the same
-  // input. Fail closed with a NAMED, typed error instead — never a crash —
-  // so an operator (or a programmatic caller passing `sourceMasterKey`, which
+  // LD2-01 (verify/import parity aggregator, class fix), extended by
+  // EXIT-STRUCT-02 one level deeper: an encrypted_state artifact whose
+  // `entries` field is missing or not an array is structural damage to the
+  // artifact itself — verifier.ts `summarizeEncryptedState` classifies it as
+  // `entry_count === null`, and the aggregator in `verifyExitBundle` now
+  // fails `passed` on it too (`encrypted_state_entries_unreadable`). The
+  // SAME is true one level deeper when `entries` IS an array but an
+  // ELEMENT in it is malformed (`entries: [null]`, or an element missing
+  // `namespace`/`entry`/`entry.kid`/`entry.payload.ct`/`entry.sig`):
+  // `summarizeEncryptedState` reports `entries_malformed`, and the
+  // aggregator fails `passed` on that too, through the SAME
+  // `encrypted_state_entries_unreadable` failure_class (both are "the
+  // entries list could not be read in the expected shape" from an
+  // operator's perspective). Checked here unconditionally and BEFORE the
+  // generic not-verified gate below, mirroring the rotation-chain-invalid
+  // throw immediately above: without this, the raw `item.namespace`/
+  // `item.entry.kid` dereferences in `compromisedRetiredSignatureUse`
+  // (three calls below) throw an unhandled TypeError for the same input.
+  // Fail closed with a NAMED, typed error instead — never a crash — so an
+  // operator (or a programmatic caller passing `sourceMasterKey`, which
   // bypasses the credential-resolution branches below entirely but still
   // reaches this same dereference) gets a diagnosable code, not a stack
   // trace. CONTRACT PIN: the code string mirrors failure_class
@@ -2487,18 +2515,30 @@ export async function importExitBundle(
   // close, one property access earlier than the case it was written for.
   // Narrow the JSON ROOT itself first, through `unknown`, so a malformed
   // root reaches the SAME named error instead.
+  //
+  // INVARIANT (EXIT-STRUCT-02): verify fails closed on a malformed ELEMENT
+  // exactly where import dereferences it; container+count checks are not
+  // enough. `isWellFormedExitStateEntryElement` is the SAME predicate
+  // `verifier.ts` `summarizeEncryptedState` and `resolveSourceMasterKey`
+  // (below) use, so this check and verify's `passed` boolean can never
+  // disagree about which element is damaged.
   const encryptedStateJsonRoot: unknown = encryptedState?.json;
   const encryptedStateEntriesReadable =
     encryptedStateJsonRoot !== null &&
     typeof encryptedStateJsonRoot === "object" &&
-    Array.isArray((encryptedStateJsonRoot as { entries?: unknown }).entries);
+    Array.isArray((encryptedStateJsonRoot as { entries?: unknown }).entries) &&
+    (encryptedStateJsonRoot as { entries: unknown[] }).entries.every((item) =>
+      isWellFormedExitStateEntryElement(item)
+    );
   if (encryptedState && !encryptedStateEntriesReadable) {
     throw new ExitBundleImportError(
       "ENCRYPTED_STATE_ENTRIES_UNREADABLE",
       "This bundle's encrypted_state artifact has no readable entries list " +
-        "(the `entries` field is absent or is not an array). This is not an " +
-        "empty bundle: the entry list itself cannot be read. Re-export the " +
-        "bundle from the source fortress."
+        "(the `entries` field is absent or is not an array), or its entries " +
+        "list contains a malformed element (missing or wrong-typed " +
+        "namespace/key/entry fields). This is not an empty bundle: the " +
+        "entry list itself cannot be read. Re-export the bundle from the " +
+        "source fortress."
     );
   }
   if (!verification.passed) {

@@ -22,6 +22,47 @@ import { SIGNATURE_SCHEME_V1 } from "../mesh/constants.js";
 const MAX_ROTATION_CHAIN = 64;
 
 /**
+ * SHR-FRESH-01 (rule-7, semantic freshness): a valid signature proves who
+ * signed the report, not that the posture it describes is still current.
+ * `shr_generate`'s `validity_minutes` and a hand-crafted counterparty SHR's
+ * `expires_at`/`generated_at` are both signer-controlled, and the ONLY prior
+ * temporal check was "has expires_at passed yet" — a signer (honest or
+ * hostile) could mint a report that reads verifier-valid for years. These
+ * three bounds are the relying-party floor: independent of what the signer
+ * declared, a report this old, this long-lived, or this far in the future
+ * is rejected here even though its signature checks out. The generator
+ * (server/src/shr/generator.ts SHR_MAX_LIFETIME_MS) clamps its own output to
+ * the same ceiling; this is the second, independent enforcement that also
+ * covers a counterparty SHR this instance never generated.
+ */
+
+/**
+ * Maximum age (now - generated_at) a relying party accepts. 24h mirrors
+ * SHR_MAX_LIFETIME_MS in generator.ts: a report older than the longest
+ * lifetime this instance itself would ever sign is stale by the same
+ * standard, whether or not its own expires_at has technically passed.
+ */
+export const SHR_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Maximum total declared lifetime (expires_at - generated_at) a relying
+ * party accepts, independent of the current time. Must match
+ * SHR_MAX_LIFETIME_MS in generator.ts — this is the verify-side pin of the
+ * same ceiling, catching an SHR from an unbounded/hostile signer whose
+ * generator has no clamp of its own.
+ */
+export const SHR_MAX_DECLARED_LIFETIME_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Bounded tolerance for benign clock drift on `generated_at` in the future.
+ * 5 minutes covers ordinary unsynchronized-clock skew between two hosts;
+ * beyond it, a future generated_at is no longer "my clock is a little off"
+ * but a signal the report is being back-dated or otherwise malformed, so it
+ * becomes a hard failure instead of a warning.
+ */
+export const SHR_MAX_CLOCK_SKEW_MS = 5 * 60 * 1000;
+
+/**
  * Verify that a key-rotation chain links the identity origin (whose key
  * derives `instanceId`) to `signedBy`. Returns an error string on any failure,
  * or null when the chain is valid.
@@ -145,8 +186,38 @@ export function verifySHR(
   const generatedAt = new Date(shr.body.generated_at);
   if (isNaN(generatedAt.getTime())) {
     errors.push("Invalid generated_at timestamp");
-  } else if (generatedAt > currentTime) {
-    warnings.push("SHR generated_at is in the future — clock skew detected");
+  } else {
+    const skewMs = generatedAt.getTime() - currentTime.getTime();
+    if (skewMs > SHR_MAX_CLOCK_SKEW_MS) {
+      // Fail closed (AGENTS.md #5): beyond the bounded skew tolerance, a
+      // future generated_at is not benign clock drift — treat it as a
+      // hard failure, not a warning, so a back-dated report cannot pass.
+      errors.push(
+        `SHR generated_at is ${Math.round(skewMs / 1000)}s in the future, exceeding the ${SHR_MAX_CLOCK_SKEW_MS / 1000}s clock-skew tolerance`
+      );
+    } else if (skewMs > 0) {
+      warnings.push("SHR generated_at is in the future — clock skew detected");
+    }
+
+    // Relying-party freshness floor: reject an authentic-but-stale report
+    // even though its own signature and expiry are technically fine. See
+    // the SHR-FRESH-01 comment above MAX_ROTATION_CHAIN for why this check
+    // exists independent of the expires_at check above.
+    const ageMs = currentTime.getTime() - generatedAt.getTime();
+    if (ageMs > SHR_MAX_AGE_MS) {
+      errors.push(
+        `SHR is ${Math.round(ageMs / (60 * 60 * 1000))}h old, exceeding the maximum relying-party age of ${SHR_MAX_AGE_MS / (60 * 60 * 1000)}h`
+      );
+    }
+
+    if (!isNaN(expiresAt.getTime())) {
+      const declaredLifetimeMs = expiresAt.getTime() - generatedAt.getTime();
+      if (declaredLifetimeMs > SHR_MAX_DECLARED_LIFETIME_MS) {
+        errors.push(
+          `SHR declares a ${Math.round(declaredLifetimeMs / (60 * 60 * 1000))}h lifetime, exceeding the maximum of ${SHR_MAX_DECLARED_LIFETIME_MS / (60 * 60 * 1000)}h`
+        );
+      }
+    }
   }
 
   // 3. Signature verification
