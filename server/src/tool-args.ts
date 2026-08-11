@@ -9,6 +9,24 @@ const MAX_BUNDLE_BYTES = 5_242_880;
 /** Fields known to carry base64 bundles — get the larger size cap */
 const BUNDLE_FIELDS = new Set(["bundle"]);
 
+/**
+ * Maximum serialized byte length for a nested object/array argument (LD3
+ * BRIDGE-BP-01). The string-byte check below only ever covered top-level
+ * STRING fields; a `type: "object"` or `type: "array"` schema property
+ * (e.g. bridge_commit's `terms`) carried no size bound at all, so a caller
+ * could smuggle an arbitrarily large payload through any tool's
+ * object-typed argument, bypassing MAX_STRING_BYTES entirely. Reuses that
+ * same 1 MB ceiling rather than a second derived number: it is already
+ * generous for every legitimate structured argument in this tool surface
+ * (none of which is a bulk-data transfer — those use string `bundle`
+ * fields, capped separately above at the larger MAX_BUNDLE_BYTES). Checked
+ * once here, at the shared validateArgs chokepoint, so every tool's
+ * object/array arguments get the bound instead of each call site having to
+ * remember to add its own (AGENTS.md rule 5: a shared parser is fixed once,
+ * not per caller).
+ */
+const MAX_NESTED_VALUE_BYTES = MAX_STRING_BYTES;
+
 export interface SchemaProperty {
   type?: string;
   properties?: Record<string, SchemaProperty>;
@@ -80,6 +98,22 @@ export function validateArgs(
         errors.push({
           field,
           message: `Field "${field}" exceeds maximum size (${byteLength} bytes > ${maxBytes} bytes)`,
+        });
+      }
+    }
+
+    // LD3 BRIDGE-BP-01: nested object/array arguments bypassed the string
+    // check above entirely. `typeof value === "object"` also matches arrays
+    // (checkType already validated shape against the schema's declared
+    // type), so one check here bounds both.
+    if (typeof value === "object" && value !== null) {
+      const byteLength = new TextEncoder().encode(JSON.stringify(value)).length;
+      if (byteLength > MAX_NESTED_VALUE_BYTES) {
+        errors.push({
+          field,
+          message:
+            `Field "${field}" exceeds maximum size ` +
+            `(${byteLength} bytes > ${MAX_NESTED_VALUE_BYTES} bytes)`,
         });
       }
     }
