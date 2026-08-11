@@ -14,6 +14,7 @@ import type { IdentityManager } from "../cognitive/tools.js";
 import type { StorageBackend } from "../storage/interface.js";
 import type { AuditLog } from "../operational/audit-log.js";
 import type { HandshakeResult } from "../handshake/types.js";
+import { AGENT_UNKNOWN_ORIGIN } from "../handshake/tools.js";
 import { ReputationStore } from "../reputation/reputation-store.js";
 import { resolveTierByDid, TIER_WEIGHTS, type TierMetadata } from "../reputation/tiers.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
@@ -42,6 +43,99 @@ export {
   BRIDGE_POLICY_METRIC_ALLOWLIST,
 } from "../reputation/bridge-metrics.js";
 
+// ─── Bridge Store: growth bounds (LD3 BRIDGE-BP-01) ───────────────────────
+//
+// bridge_commit is a Tier-3 (auto-allowed) tool: BridgeStore.save() wrote
+// one permanent encrypted record per call, keyed by a fresh
+// commitment.bridge_commitment_id, with NO cap, NO dedup, and NO eviction —
+// an agent could grow `_bridge` without bound. Every later bridge_attest and
+// ReputationStore.hasLocalBridgeCommitmentForAttestation decrypt-scans the
+// WHOLE `_bridge` namespace, so unbounded growth also amplifies every later
+// call's cost. This is the same "attacker-writable collection with no cap"
+// class #1190/#1199 already closed for in-memory maps (core/bounded-map.ts),
+// here applied to PERSISTED storage instead.
+
+/**
+ * Bound on total persisted bridge commitments. 5000 mirrors the
+ * global/per-origin ratio sentinel-finding-store.ts uses
+ * (MAX_TRACKED_FINDINGS=5000 / MAX_FINDINGS_PER_ORIGIN=500 = 10): generous
+ * headroom for a real fortress's negotiation history while guaranteeing at
+ * least 10 distinct origins can each use their full per-origin share before
+ * the global ceiling bites.
+ */
+export const MAX_BRIDGE_COMMITMENTS = 5000;
+
+/**
+ * Per-origin quota for `_bridge` writes. Bound to the SERVER-SET
+ * agent-session principal (`callerIdentity`, threaded from router.ts —
+ * see `resolveBridgeOrigin` below), NEVER a caller-supplied field:
+ * `identity_id` is Tier-3 `identity_create`-mintable and `session_id` is
+ * free-form caller input, so keying this quota on either would be
+ * defeated by minting a fresh value per call — the exact mistake
+ * MAX_HANDSHAKE_SESSIONS_PER_ORIGIN's doc (handshake/tools.ts) records and
+ * this mirrors. 500 = 1/10th of MAX_BRIDGE_COMMITMENTS, the same ratio
+ * used above.
+ */
+export const MAX_BRIDGE_COMMITMENTS_PER_ORIGIN = 500;
+
+/**
+ * Per-origin quota for CONCORDIA_BRIDGE_REPUTATION_CONTEXT attestations
+ * written via bridge_attest into the sibling `_reputation` store (same
+ * shape/finding as MAX_BRIDGE_COMMITMENTS_PER_ORIGIN — see
+ * ReputationStore.countAttestationsByOriginForContext). Kept as its own,
+ * smaller constant rather than reusing MAX_BRIDGE_COMMITMENTS_PER_ORIGIN:
+ * one commitment can legitimately be attested by only its two parties
+ * (proposer/acceptor), so a real fortress needs far fewer distinct
+ * bridge attestations per origin than commitments. 200 stays a generous
+ * multiple of any realistic single-session attestation volume while
+ * keeping the ceiling meaningfully tighter than the commitment quota.
+ */
+export const MAX_BRIDGE_ATTESTATIONS_PER_ORIGIN = 200;
+
+/** Reason a bridge-store write was refused (LD3 BRIDGE-BP-01). */
+export type BridgeStoreRefuseReason = "origin_quota" | "capacity" | "scan_unavailable";
+
+/**
+ * Typed refusal thrown by BridgeStore.assertOriginWithinQuota. `capacity`
+ * and `origin_quota` are ordinary fail-closed refusals; `scan_unavailable`
+ * means the pre-write quota scan itself could not complete (a
+ * storage.list error, or an entry that failed to read/decrypt) — treated
+ * as a refusal rather than "assume headroom," mirroring
+ * ReputationStore.findExistingAttestationForDedup's fail-closed contract
+ * on this same `_bridge` namespace.
+ */
+export class BridgeStoreQuotaError extends Error {
+  readonly reason: BridgeStoreRefuseReason;
+  constructor(reason: BridgeStoreRefuseReason) {
+    super(
+      reason === "origin_quota"
+        ? "Bridge commitment store: origin per-write quota exceeded"
+        : reason === "capacity"
+          ? "Bridge commitment store: capacity exceeded"
+          : "Bridge commitment store: could not confirm quota headroom " +
+            "(storage scan failed); refusing to write"
+    );
+    this.name = "BridgeStoreQuotaError";
+    this.reason = reason;
+  }
+}
+
+/**
+ * Resolve the per-origin quota key for a bridge-store write (LD3
+ * BRIDGE-BP-01). Mirrors `resolveSessionOrigin` in handshake/tools.ts —
+ * see that function's doc for why the SERVER-SET `callerIdentity` (never
+ * a caller-supplied field) is the only safe quota key. Reimplemented as a
+ * one-line function here, rather than imported, because
+ * `resolveSessionOrigin` itself is not exported (only its
+ * `AGENT_UNKNOWN_ORIGIN` shared-bucket constant is, so there remains
+ * exactly one definition of THAT decision).
+ */
+function resolveBridgeOrigin(callerIdentity: string | undefined): string {
+  return callerIdentity && callerIdentity.length > 0
+    ? callerIdentity
+    : AGENT_UNKNOWN_ORIGIN;
+}
+
 // ─── Bridge Store ────────────────────────────────────────────────────────
 // Persists bridge commitments encrypted at rest for later verification
 // and attestation linking.
@@ -49,14 +143,110 @@ export {
 class BridgeStore {
   private storage: StorageBackend;
   private encryptionKey: Uint8Array;
+  private maxCommitments: number;
+  private maxCommitmentsPerOrigin: number;
 
-  constructor(storage: StorageBackend, masterKey: Uint8Array) {
+  /**
+   * `maxCommitments`/`maxCommitmentsPerOrigin` (LD3 BRIDGE-BP-01) default
+   * to the production constants but are overridable for tests only — the
+   * real caps require thousands of writes to reach, which a capacity/
+   * quota-refusal test would otherwise have to perform for real
+   * (mirrors sentinel-finding-store.ts's `maxTrackedFindings`/
+   * `maxFindingsPerOrigin` test-only override options; production call
+   * sites never set these).
+   */
+  constructor(
+    storage: StorageBackend,
+    masterKey: Uint8Array,
+    maxCommitments: number = MAX_BRIDGE_COMMITMENTS,
+    maxCommitmentsPerOrigin: number = MAX_BRIDGE_COMMITMENTS_PER_ORIGIN
+  ) {
     this.storage = storage;
     this.encryptionKey = derivePurposeKey(masterKey, "bridge-commitments");
+    this.maxCommitments = maxCommitments;
+    this.maxCommitmentsPerOrigin = maxCommitmentsPerOrigin;
   }
 
-  async save(commitment: BridgeCommitment, outcome: ConcordiaOutcome): Promise<void> {
-    const record = { commitment, outcome };
+  /**
+   * Scan `_bridge` and enforce both the global MAX_BRIDGE_COMMITMENTS
+   * ceiling and `origin`'s MAX_BRIDGE_COMMITMENTS_PER_ORIGIN share (LD3
+   * BRIDGE-BP-01). Fails CLOSED: a storage.list error, or any entry that
+   * cannot be read/decrypted, throws `scan_unavailable` rather than
+   * silently treating an unscannable entry as "not this origin" — the
+   * same fail-closed posture ReputationStore.findExistingAttestationForDedup
+   * already uses scanning this exact namespace.
+   *
+   * DEBT (LD3 BRIDGE-BP-01, scope): this is an O(N) decrypt-scan on every
+   * write, same shape as the pre-existing bridge_attest/
+   * hasLocalBridgeCommitmentForAttestation scans. Indexing `_bridge` by
+   * origin (an in-memory count cache built once and maintained
+   * incrementally) would remove the rescan; that is a larger structural
+   * change left as follow-up. This fix bounds the STORE'S SIZE — which
+   * bounds every scan's own worst case, including this one — rather than
+   * changing the scan's algorithmic shape.
+   */
+  private async assertOriginWithinQuota(origin: string): Promise<void> {
+    let entries: Array<{ key: string }>;
+    try {
+      entries = await this.storage.list("_bridge");
+    } catch {
+      throw new BridgeStoreQuotaError("scan_unavailable");
+    }
+
+    if (entries.length >= this.maxCommitments) {
+      throw new BridgeStoreQuotaError("capacity");
+    }
+
+    let originCount = 0;
+    for (const meta of entries) {
+      let raw: Uint8Array | null;
+      try {
+        raw = await this.storage.read("_bridge", meta.key);
+      } catch {
+        throw new BridgeStoreQuotaError("scan_unavailable");
+      }
+      if (!raw) continue;
+      try {
+        const encrypted: EncryptedPayload = JSON.parse(bytesToString(raw));
+        const decrypted = decrypt(encrypted, this.encryptionKey);
+        const record = JSON.parse(bytesToString(decrypted)) as { origin?: string };
+        if (record.origin === origin) originCount++;
+      } catch {
+        throw new BridgeStoreQuotaError("scan_unavailable");
+      }
+    }
+
+    if (originCount >= this.maxCommitmentsPerOrigin) {
+      throw new BridgeStoreQuotaError("origin_quota");
+    }
+  }
+
+  /**
+   * `origin` (LD3 BRIDGE-BP-01) is the resolved quota key — see
+   * `resolveBridgeOrigin`. Required, not optional: this is the ONLY
+   * production call site (bridge_commit's handler), so there is no
+   * back-compat surface an optional parameter would need to protect, and
+   * an optional origin here would silently disable the quota exactly the
+   * way AGENTS.md rule 3 warns against.
+   *
+   * Check-then-write ordering has an accepted, narrow TOCTOU residual
+   * under CONCURRENT calls from the SAME origin (two calls can both pass
+   * the pre-write check before either's write lands) — bounded to "a
+   * small constant over quota under a genuine race," never unbounded, the
+   * same accepted-residual shape core/bounded-map.ts documents for its
+   * own onEvict race. A stronger fix would serialize all `_bridge` writes
+   * behind a single admission lock (mirroring BoundedMap's
+   * admissionQueue); left as DEBT, disproportionate to this MED finding's
+   * growth-bound goal since the residual stays bounded, not open-ended.
+   */
+  async save(
+    commitment: BridgeCommitment,
+    outcome: ConcordiaOutcome,
+    origin: string
+  ): Promise<void> {
+    await this.assertOriginWithinQuota(origin);
+
+    const record = { commitment, outcome, origin };
     const serialized = stringToBytes(JSON.stringify(record));
     const encrypted = encrypt(serialized, this.encryptionKey);
     await this.storage.write(
@@ -82,6 +272,19 @@ class BridgeStore {
   }
 }
 
+/**
+ * Test-only override for the LD3 BRIDGE-BP-01 growth bounds. Production
+ * call sites never set this (mirrors sentinel-finding-store.ts's
+ * `maxTrackedFindings`/`maxFindingsPerOrigin` options) — it exists solely
+ * so a capacity/quota-refusal test can drive a small cap instead of
+ * performing thousands of real writes to reach the production ceiling.
+ */
+export interface BridgeToolsTestOverrides {
+  maxBridgeCommitments?: number;
+  maxBridgeCommitmentsPerOrigin?: number;
+  maxBridgeAttestationsPerOrigin?: number;
+}
+
 // ─── Tool Factory ────────────────────────────────────────────────────────
 
 export function createBridgeTools(
@@ -89,12 +292,20 @@ export function createBridgeTools(
   masterKey: Uint8Array,
   identityManager: IdentityManager,
   auditLog: AuditLog,
-  handshakeResults?: ReadonlyMap<string, HandshakeResult>
+  handshakeResults?: ReadonlyMap<string, HandshakeResult>,
+  testOverrides?: BridgeToolsTestOverrides
 ): { tools: ToolDefinition[] } {
-  const bridgeStore = new BridgeStore(storage, masterKey);
+  const bridgeStore = new BridgeStore(
+    storage,
+    masterKey,
+    testOverrides?.maxBridgeCommitments,
+    testOverrides?.maxBridgeCommitmentsPerOrigin
+  );
   const reputationStore = new ReputationStore(storage, masterKey);
   const identityEncryptionKey = derivePurposeKey(masterKey, "identity-encryption");
   const hsResults = handshakeResults ?? new Map<string, HandshakeResult>();
+  const maxBridgeAttestationsPerOrigin =
+    testOverrides?.maxBridgeAttestationsPerOrigin ?? MAX_BRIDGE_ATTESTATIONS_PER_ORIGIN;
 
   // Helper to resolve identity
   function resolveIdentity(identityId?: string): StoredIdentity {
@@ -207,7 +418,7 @@ export function createBridgeTools(
           "accepted_at",
         ],
       },
-      handler: async (args) => {
+      handler: async (args, callerIdentity) => {
         const outcome: ConcordiaOutcome = {
           session_id: args.session_id as string,
           protocol_version: args.protocol_version as string,
@@ -230,8 +441,32 @@ export function createBridgeTools(
           includePedersen
         );
 
-        // Persist the commitment and outcome for later verification/attestation
-        await bridgeStore.save(bridgeCommitment, outcome);
+        // Persist the commitment and outcome for later verification/attestation.
+        // LD3 BRIDGE-BP-01: bound to the SERVER-SET session origin, never a
+        // caller-supplied identity_id (see resolveBridgeOrigin's doc).
+        const origin = resolveBridgeOrigin(callerIdentity);
+        try {
+          await bridgeStore.save(bridgeCommitment, outcome, origin);
+        } catch (err) {
+          if (err instanceof BridgeStoreQuotaError) {
+            void auditLog.append(
+              "l3",
+              err.reason === "origin_quota"
+                ? "bridge_commit_origin_quota_exceeded"
+                : err.reason === "capacity"
+                  ? "bridge_commit_store_saturated"
+                  : "bridge_commit_quota_scan_unavailable",
+              identity.identity_id,
+              {
+                session_id: outcome.session_id,
+                caller_identity: origin,
+              },
+              "failure"
+            );
+            return toolResult({ error: err.message });
+          }
+          throw err;
+        }
 
         await auditLog.appendCritical({
           layer: "l3",
@@ -436,7 +671,7 @@ export function createBridgeTools(
         },
         required: ["bridge_commitment_id", "outcome_result"],
       },
-      handler: async (args) => {
+      handler: async (args, callerIdentity) => {
         const commitmentId = args.bridge_commitment_id as string;
         const outcomeResult = args.outcome_result as
           | "completed"
@@ -587,6 +822,53 @@ export function createBridgeTools(
         );
         const tier = tierMeta.sovereignty_tier;
 
+        // LD3 BRIDGE-BP-01: bound per-origin growth of Concordia-bridge
+        // attestations in the sibling `_reputation` store, the same class
+        // as BridgeStore's `_bridge` quota above. `origin` is the
+        // SERVER-SET session principal (resolveBridgeOrigin), never
+        // `identity.did` — that DID is Tier-3 `identity_create`-mintable,
+        // so a per-origin cap keyed on it would be defeated by minting a
+        // fresh identity per call, the same defeat MAX_BRIDGE_
+        // COMMITMENTS_PER_ORIGIN's doc records. Checked BEFORE record()
+        // so a refused call never writes; fails CLOSED (denies) if the
+        // scan itself cannot confirm the count, mirroring the dedup scan's
+        // own fail-closed contract immediately above.
+        const origin = resolveBridgeOrigin(callerIdentity);
+        const originQuota = await reputationStore.countAttestationsByOriginForContext(
+          origin,
+          CONCORDIA_BRIDGE_REPUTATION_CONTEXT
+        );
+        if (!originQuota.scanComplete) {
+          void auditLog.append(
+            "l4",
+            "bridge_attest_quota_scan_unavailable",
+            identity.identity_id,
+            { bridge_commitment_id: commitmentId, caller_identity: origin },
+            "failure"
+          );
+          return toolResult({
+            error:
+              "Cannot confirm this origin's attestation quota headroom " +
+              "(reputation store could not be fully read); the attestation " +
+              "was not recorded. Retry once the store is readable.",
+          });
+        }
+        if (originQuota.count >= maxBridgeAttestationsPerOrigin) {
+          void auditLog.append(
+            "l4",
+            "bridge_attest_origin_quota_exceeded",
+            identity.identity_id,
+            { bridge_commitment_id: commitmentId, caller_identity: origin },
+            "failure"
+          );
+          return toolResult({
+            error:
+              `This origin has reached its bridge-attestation quota ` +
+              `(${maxBridgeAttestationsPerOrigin}); the attestation was ` +
+              "not recorded.",
+          });
+        }
+
         // Record the reputation attestation
         let attestation;
         try {
@@ -603,7 +885,8 @@ export function createBridgeTools(
             identity,
             identityEncryptionKey,
             undefined, // counterparty_attestation
-            tier
+            tier,
+            origin
           );
         } catch (err) {
           if (err instanceof BridgeAttestationMetricValidationError) {

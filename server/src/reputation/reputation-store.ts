@@ -107,6 +107,23 @@ export interface StoredAttestation {
    * payload.
    */
   imported?: boolean;
+
+  /**
+   * SERVER-SET agent-session principal (`callerIdentity`, LD3 BRIDGE-BP-01)
+   * that WROTE this record, when the caller supplied one. Distinct from
+   * `attestation.data.participant_did`: the participant DID is a Sanctuary
+   * identity, which `identity_create` lets an agent mint freely (Tier 3),
+   * so it cannot serve as a per-origin write-growth quota key — this field
+   * can, because only the router sets it, never a tool argument. Optional
+   * and NOT part of the signed `attestation.data`: it is bookkeeping for
+   * `countAttestationsByOriginForContext`'s quota scan, not a claim the
+   * signature covers, and its absence on a record just means that record's
+   * writer predates this field or bypassed the quota-checked call site
+   * (record() accepts it as an optional trailing parameter precisely so
+   * the many pre-existing direct-record() callers are unaffected — see
+   * `record()`'s doc for which call sites are expected to supply it).
+   */
+  origin?: string;
 }
 
 /** Aggregated metric statistics */
@@ -553,6 +570,22 @@ export class ReputationStore {
 
   /**
    * Record an interaction outcome as a signed attestation.
+   *
+   * `origin` (LD3 BRIDGE-BP-01, optional, trailing): the SERVER-SET
+   * agent-session principal that quota-gates this write, stamped onto the
+   * stored record's `origin` provenance field (see StoredAttestation's doc)
+   * for `countAttestationsByOriginForContext` to count on a later write.
+   * Left OPTIONAL rather than required so this fix does not force every
+   * existing direct-record() call site (tests, and the general-purpose
+   * `reputation_record` tool) to thread one through — record() has no
+   * per-caller way to enforce a quota against an origin it was never given,
+   * so an absent origin here means "this call site's growth is not
+   * quota-bound by this fix," an explicit, honest scope limit (see
+   * bridge_attest in bridge/tools.ts, the one call site that DOES resolve
+   * and pass origin, and that call site's own pre-write quota check —
+   * record() itself does not enforce the cap; the caller must check before
+   * calling, same division of labor as BridgeStore.save/
+   * assertOriginWithinQuota).
    */
   async record(
     interactionId: string,
@@ -562,7 +595,8 @@ export class ReputationStore {
     identity: StoredIdentity,
     identityEncryptionKey: Uint8Array,
     counterpartyAttestation?: string,
-    sovereigntyTier?: SovereigntyTier
+    sovereigntyTier?: SovereigntyTier,
+    origin?: string
   ): Promise<StoredAttestation> {
     const attestationId = `att-${Date.now()}-${toBase64url(randomBytes(8))}`;
     const now = new Date().toISOString();
@@ -622,6 +656,7 @@ export class ReputationStore {
       // provenance; it no longer exempts this record from the
       // trustedSovereigntyTier clamp (A11 — the clamp is unconditional).
       imported: false,
+      ...(origin !== undefined ? { origin } : {}),
     };
 
     // Persist encrypted
@@ -746,6 +781,71 @@ export class ReputationStore {
     }
 
     return { match, scanComplete };
+  }
+
+  /**
+   * Count existing `_reputation` records in `context` whose stored
+   * `origin` provenance marker (LD3 BRIDGE-BP-01, see StoredAttestation's
+   * doc) matches `origin`. Used by bridge_attest (bridge/tools.ts) to
+   * bound per-origin growth of Concordia-bridge attestations before
+   * calling record() — see that call site for why `origin` must be the
+   * SERVER-SET agent-session principal, never a caller-supplied field.
+   *
+   * Fails CLOSED on the same terms as findExistingAttestationForDedup:
+   * `scanComplete: false` on a storage.list error, or any entry that
+   * cannot be read/decrypted, because a skipped entry might be the one
+   * that would put `origin` over quota, and undercounting would let the
+   * caller record past its cap.
+   *
+   * DEBT (LD3 BRIDGE-BP-01, scope): a second full-namespace decrypt scan
+   * of `_reputation`, alongside the dedup scan bridge_attest already runs
+   * via findExistingAttestationForDedup. Both exist because `_reputation`
+   * has no origin index; adding one (an in-memory count cache, built once
+   * and maintained incrementally) would remove this, but is a larger
+   * structural change than this MED finding's growth-bound goal —
+   * BridgeStore.assertOriginWithinQuota in bridge/tools.ts records the
+   * matching DEBT note for `_bridge`. This fix bounds the STORE'S SIZE
+   * (which bounds this scan's own worst case) rather than the scan's
+   * algorithmic shape.
+   */
+  async countAttestationsByOriginForContext(
+    origin: string,
+    context: string
+  ): Promise<{ count: number; scanComplete: boolean }> {
+    let entries: Array<{ key: string }>;
+    try {
+      entries = await this.storage.list("_reputation");
+    } catch {
+      return { count: 0, scanComplete: false };
+    }
+
+    let count = 0;
+    let scanComplete = true;
+
+    for (const meta of entries) {
+      let raw: Uint8Array | null;
+      try {
+        raw = await this.storage.read("_reputation", meta.key);
+      } catch {
+        scanComplete = false;
+        continue;
+      }
+      if (!raw) continue;
+
+      try {
+        const encrypted: EncryptedPayload = JSON.parse(bytesToString(raw));
+        const decrypted = decrypt(encrypted, this.encryptionKey);
+        const stored: StoredAttestation = JSON.parse(bytesToString(decrypted));
+        if (stored.origin === origin && stored.attestation.data.context === context) {
+          count++;
+        }
+      } catch {
+        scanComplete = false;
+        continue;
+      }
+    }
+
+    return { count, scanComplete };
   }
 
   async classifyBridgeMetricEvidence(

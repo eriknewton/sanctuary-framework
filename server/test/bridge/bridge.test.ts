@@ -20,8 +20,17 @@ import {
 import { hash } from "../../src/core/hashing.js";
 import { encrypt, decrypt, type EncryptedPayload } from "../../src/core/encryption.js";
 import { IdentityManager } from "../../src/cognitive/tools.js";
-import { createBridgeTools } from "../../src/bridge/tools.js";
+import {
+  createBridgeTools,
+  MAX_BRIDGE_COMMITMENTS_PER_ORIGIN,
+  MAX_BRIDGE_ATTESTATIONS_PER_ORIGIN,
+  type BridgeToolsTestOverrides,
+} from "../../src/bridge/tools.js";
 import { ReputationStore } from "../../src/reputation/reputation-store.js";
+import {
+  normalizeToolArgsForValidation,
+  ToolArgumentValidationError,
+} from "../../src/tool-args.js";
 import {
   BRIDGE_ATTESTATION_BEHAVIORAL_METRIC_ALLOWLIST,
   BRIDGE_METRIC_POLICY,
@@ -67,7 +76,10 @@ function stubAuditLog(): AuditLog {
   } as unknown as AuditLog;
 }
 
-async function makeBridgeHarness() {
+async function makeBridgeHarness(
+  testOverrides?: BridgeToolsTestOverrides,
+  auditLog?: AuditLog
+) {
   const storage = new MemoryStorage();
   const masterKey = generateRandomKey();
   const identityEncKey = derivePurposeKey(masterKey, "identity-encryption");
@@ -85,7 +97,9 @@ async function makeBridgeHarness() {
     storage,
     masterKey,
     identityManager,
-    stubAuditLog()
+    auditLog ?? stubAuditLog(),
+    undefined,
+    testOverrides
   );
 
   const byName = (name: string): ToolDefinition => {
@@ -1313,6 +1327,223 @@ describe("Concordia Bridge", () => {
       expect(new Date(commitment.committed_at).toISOString()).toBe(
         commitment.committed_at
       );
+    });
+  });
+
+  // ── LD3 BRIDGE-BP-01: store growth bounds ──────────────────────────────
+
+  describe("LD3 BRIDGE-BP-01: bridge/reputation store growth bounds", () => {
+    it("rejects an oversized nested terms object before it ever reaches the handler", async () => {
+      // Reproduces the finding at source: the shared tool-args.ts validator
+      // only capped top-level STRING arguments, so bridge_commit's
+      // object-typed `terms` field had no size bound at all. This drives
+      // the REAL bridge_commit inputSchema through the REAL shared
+      // validator (not a hand-rolled duplicate), so it fails on pre-fix
+      // tool-args.ts and passes after.
+      const { byName, signer, counterparty } = await makeBridgeHarness();
+      const commit = byName("bridge_commit");
+
+      const oversizedTerms = { blob: "x".repeat(2_000_000) }; // ~2MB > 1MB cap
+      const outcome = makeOutcome({
+        proposer_did: signer.publicIdentity.did,
+        acceptor_did: counterparty.publicIdentity.did,
+        terms: oversizedTerms,
+      });
+
+      expect(() =>
+        normalizeToolArgsForValidation({
+          args: { ...outcome, identity_id: signer.publicIdentity.identity_id },
+          schema: commit.inputSchema,
+          toolClass: commit.tool_class,
+        })
+      ).toThrow(ToolArgumentValidationError);
+
+      // A modestly sized terms object (well under the cap) is unaffected.
+      const normalTerms = { price: 100, currency: "USD" };
+      expect(() =>
+        normalizeToolArgsForValidation({
+          args: {
+            ...makeOutcome({
+              proposer_did: signer.publicIdentity.did,
+              acceptor_did: counterparty.publicIdentity.did,
+              terms: normalTerms,
+            }),
+            identity_id: signer.publicIdentity.identity_id,
+          },
+          schema: commit.inputSchema,
+          toolClass: commit.tool_class,
+        })
+      ).not.toThrow();
+    });
+
+    it("bounds bridge_commit growth per origin, bound to callerIdentity not identity_id", async () => {
+      // Reproduces the finding: BridgeCommitmentStore.save() wrote one
+      // permanent record per call with no cap. Two DIFFERENT Sanctuary
+      // identities (identity_id is Tier-3 identity_create-mintable) calling
+      // under the SAME callerIdentity must share ONE quota — proving the
+      // quota is bound to the un-mintable session principal, not the
+      // caller-supplied identity_id.
+      const overrides: BridgeToolsTestOverrides = {
+        maxBridgeCommitments: 1000,
+        maxBridgeCommitmentsPerOrigin: 2,
+      };
+      const { storage, byName, signer, counterparty } = await makeBridgeHarness(overrides);
+      const commit = byName("bridge_commit");
+      const sameOrigin = "agent:flooding-origin";
+
+      const commitOnce = (sessionId: string, identityId: string) =>
+        commit.handler(
+          {
+            ...makeOutcome({
+              session_id: sessionId,
+              proposer_did: signer.publicIdentity.did,
+              acceptor_did: counterparty.publicIdentity.did,
+            }),
+            identity_id: identityId,
+          },
+          sameOrigin
+        );
+
+      const first = parseToolResult(
+        await commitOnce("session-a", signer.publicIdentity.identity_id)
+      );
+      expect(first.bridge_commitment_id).toBeDefined();
+
+      const second = parseToolResult(
+        await commitOnce("session-b", signer.publicIdentity.identity_id)
+      );
+      expect(second.bridge_commitment_id).toBeDefined();
+
+      // Third call is under the SAME origin, using a DIFFERENT (freshly
+      // mintable) identity_id — the quota must still refuse it.
+      const third = parseToolResult(
+        await commitOnce("session-c", counterparty.publicIdentity.identity_id)
+      );
+      expect(third.bridge_commitment_id).toBeUndefined();
+      expect(String(third.error)).toMatch(/quota/i);
+
+      // A DIFFERENT origin is unaffected by this origin's exhausted quota.
+      const otherOrigin = parseToolResult(
+        await commit.handler(
+          {
+            ...makeOutcome({
+              session_id: "session-d",
+              proposer_did: signer.publicIdentity.did,
+              acceptor_did: counterparty.publicIdentity.did,
+            }),
+            identity_id: signer.publicIdentity.identity_id,
+          },
+          "agent:a-different-origin"
+        )
+      );
+      expect(otherOrigin.bridge_commitment_id).toBeDefined();
+
+      // Exactly 3 records exist: the refused call never wrote.
+      const entries = await storage.list("_bridge");
+      expect(entries.length).toBe(3);
+    });
+
+    it("fails closed on global bridge-commitment capacity", async () => {
+      const overrides: BridgeToolsTestOverrides = {
+        maxBridgeCommitments: 2,
+        maxBridgeCommitmentsPerOrigin: 1000,
+      };
+      const { storage, byName, signer, counterparty } = await makeBridgeHarness(overrides);
+      const commit = byName("bridge_commit");
+
+      const commitAs = (sessionId: string, origin: string) =>
+        commit.handler(
+          {
+            ...makeOutcome({
+              session_id: sessionId,
+              proposer_did: signer.publicIdentity.did,
+              acceptor_did: counterparty.publicIdentity.did,
+            }),
+            identity_id: signer.publicIdentity.identity_id,
+          },
+          origin
+        );
+
+      // Two DIFFERENT origins fill the GLOBAL cap (per-origin quota is
+      // generous here, so this isolates the capacity path).
+      expect(
+        (parseToolResult(await commitAs("s1", "agent:origin-1"))).bridge_commitment_id
+      ).toBeDefined();
+      expect(
+        (parseToolResult(await commitAs("s2", "agent:origin-2"))).bridge_commitment_id
+      ).toBeDefined();
+
+      const refused = parseToolResult(await commitAs("s3", "agent:origin-3"));
+      expect(refused.bridge_commitment_id).toBeUndefined();
+      expect(String(refused.error)).toMatch(/capacity/i);
+
+      const entries = await storage.list("_bridge");
+      expect(entries.length).toBe(2);
+    });
+
+    it("bounds bridge_attest growth per origin in the sibling _reputation store", async () => {
+      // Reproduces the sibling shape the finding names: reputation-store.ts's
+      // record() path is keyed only by a fresh attestationId, with no
+      // origin-bound cap. Each attestation here links a DISTINCT bridge
+      // commitment (so the existing same-session dedup never fires) but is
+      // attested under the SAME callerIdentity, which must still be capped.
+      const overrides: BridgeToolsTestOverrides = {
+        maxBridgeCommitments: 1000,
+        maxBridgeCommitmentsPerOrigin: 1000,
+        maxBridgeAttestationsPerOrigin: 2,
+      };
+      const { storage, byName, signer, counterparty } = await makeBridgeHarness(overrides);
+      const commit = byName("bridge_commit");
+      const attest = byName("bridge_attest");
+      const sameOrigin = "agent:attest-flooder";
+
+      const commitAndAttest = async (sessionId: string) => {
+        const committed = parseToolResult(
+          await commit.handler(
+            {
+              ...makeOutcome({
+                session_id: sessionId,
+                proposer_did: signer.publicIdentity.did,
+                acceptor_did: counterparty.publicIdentity.did,
+              }),
+              identity_id: signer.publicIdentity.identity_id,
+            },
+            sameOrigin
+          )
+        );
+        return attest.handler(
+          {
+            bridge_commitment_id: committed.bridge_commitment_id,
+            outcome_result: "completed",
+            identity_id: signer.publicIdentity.identity_id,
+          },
+          sameOrigin
+        );
+      };
+
+      const first = parseToolResult(await commitAndAttest("att-session-1"));
+      expect(first.attestation_id).toBeDefined();
+      expect(first.already_attested).toBe(false);
+
+      const second = parseToolResult(await commitAndAttest("att-session-2"));
+      expect(second.attestation_id).toBeDefined();
+      expect(second.already_attested).toBe(false);
+
+      const third = parseToolResult(await commitAndAttest("att-session-3"));
+      expect(third.attestation_id).toBeUndefined();
+      expect(String(third.error)).toMatch(/quota/i);
+
+      // Exactly 2 attestations were persisted; the refused call never wrote.
+      const entries = await storage.list("_reputation");
+      expect(entries.length).toBe(2);
+    });
+
+    it("uses the real production defaults when no test override is supplied", () => {
+      // Pins the exported constants so a source edit that quietly changes
+      // the production cap (rather than the enforcement logic the tests
+      // above exercise) is still visible in a diff.
+      expect(MAX_BRIDGE_COMMITMENTS_PER_ORIGIN).toBe(500);
+      expect(MAX_BRIDGE_ATTESTATIONS_PER_ORIGIN).toBe(200);
     });
   });
 });
