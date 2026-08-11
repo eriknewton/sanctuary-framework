@@ -15,7 +15,9 @@
 import { describe, it, expect } from "vitest";
 import {
   REPUTATION_LEGACY_REJECT_MESSAGE,
+  REPUTATION_UNKNOWN_ORIGIN,
   ReputationStore,
+  ReputationStoreQuotaError,
   buildReputationCompletenessManifest,
   reputationBundleSigningBytes,
   trustedSovereigntyTier,
@@ -423,6 +425,71 @@ describe("L4 Reputation Store", () => {
       expect(result.error).toMatch(/bridge_attest/);
       expect(result.attestation_id).toBeUndefined();
       await expect(storage.list("_reputation")).resolves.toHaveLength(0);
+    });
+
+    it("reputation_record MCP tool refuses fail-closed once its callerIdentity's quota is exhausted (LD3 gate fix-round DEFECT 1)", async () => {
+      // Reproduces the finding directly: pre-fix, reputation_record's
+      // handler called reputationStore.record() with NO origin argument at
+      // all, so this Tier-2 (anomaly-gated auto-allow) tool's writes were
+      // exempt from every quota bridge_attest enforced on itself. This
+      // test FAILS on pre-fix source (the third call succeeds instead of
+      // being refused) and PASSES once record()'s own chokepoint bound
+      // covers this tool's calls too.
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const { identity } = setupIdentity(masterKey);
+
+      const identityManager = new IdentityManager(storage, masterKey);
+      await identityManager.save(identity);
+      await identityManager.setPrimary(identity.identity_id);
+      const { tools } = createReputationTools(
+        storage,
+        masterKey,
+        identityManager,
+        new AuditLog(storage, masterKey),
+        undefined,
+        undefined,
+        undefined,
+        { maxReputationRecords: 1000, maxReputationRecordsPerOrigin: 2 }
+      );
+      const recordTool = tools.find((tool) => tool.name === "reputation_record");
+      expect(recordTool).toBeDefined();
+
+      const callerIdentity = "agent:reputation-record-flooder";
+      const recordOnce = (interactionId: string) =>
+        recordTool!.handler(
+          {
+            interaction_id: interactionId,
+            counterparty_did: "did:key:counterparty",
+            outcome: { type: "transaction", result: "completed" },
+          },
+          callerIdentity
+        );
+
+      const first = parseToolResult(await recordOnce("tool-quota-1"));
+      expect(first.attestation_id).toBeDefined();
+      const second = parseToolResult(await recordOnce("tool-quota-2"));
+      expect(second.attestation_id).toBeDefined();
+
+      const third = parseToolResult(await recordOnce("tool-quota-3"));
+      expect(third.attestation_id).toBeUndefined();
+      expect(String(third.error)).toMatch(/quota/i);
+
+      // A DIFFERENT callerIdentity is unaffected by this one's exhausted quota.
+      const otherOrigin = parseToolResult(
+        await recordTool!.handler(
+          {
+            interaction_id: "tool-quota-other",
+            counterparty_did: "did:key:counterparty",
+            outcome: { type: "transaction", result: "completed" },
+          },
+          "agent:a-different-caller"
+        )
+      );
+      expect(otherOrigin.attestation_id).toBeDefined();
+
+      // Exactly 3 records exist: the refused call never wrote.
+      await expect(storage.list("_reputation")).resolves.toHaveLength(3);
     });
 
     it("rejects out-of-domain Concordia-bridge metrics at the record boundary and writes nothing", async () => {
@@ -999,6 +1066,213 @@ describe("L4 Reputation Store", () => {
       expect(score.min).toBe(10);
       expect(score.max).toBe(30);
       expect(score.count).toBe(3);
+    });
+  });
+
+  describe("record() growth chokepoint (LD3 gate fix-round DEFECT 1 + DEFECT 2)", () => {
+    // DEFECT 1: reputation_record (Tier-2, freely agent-callable absent an
+    // anomaly trip) called record() with no origin and no cap, so it could
+    // grow `_reputation` without bound even though bridge_attest's OWN
+    // narrower per-context quota was already closed. These tests reproduce
+    // the finding directly against ReputationStore.record() — the
+    // chokepoint every writer (reputation_record, bridge_attest, and any
+    // other direct caller) now goes through — and FAIL on pre-fix source
+    // (record() accepted unlimited writes with no quota check at all).
+
+    it("refuses a record() write past the per-origin quota, fail-closed", async () => {
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const store = new ReputationStore(storage, masterKey, {
+        maxReputationRecords: 1000,
+        maxReputationRecordsPerOrigin: 2,
+      });
+      const { identity, encryptionKey } = setupIdentity(masterKey);
+      const origin = "agent:reputation-flooder";
+
+      const recordOnce = (interactionId: string) =>
+        store.record(
+          interactionId,
+          "did:key:counterparty",
+          { type: "transaction", result: "completed" },
+          "general",
+          identity,
+          encryptionKey,
+          undefined,
+          undefined,
+          origin
+        );
+
+      const first = await recordOnce("i1");
+      expect(first.attestation.attestation_id).toBeDefined();
+      const second = await recordOnce("i2");
+      expect(second.attestation.attestation_id).toBeDefined();
+
+      // Third write under the SAME origin must be refused fail-closed.
+      await expect(recordOnce("i3")).rejects.toThrow(ReputationStoreQuotaError);
+      try {
+        await recordOnce("i3b");
+        expect.unreachable("expected ReputationStoreQuotaError");
+      } catch (err) {
+        expect(err).toBeInstanceOf(ReputationStoreQuotaError);
+        expect((err as InstanceType<typeof ReputationStoreQuotaError>).reason).toBe(
+          "origin_quota"
+        );
+      }
+
+      // A DIFFERENT origin is unaffected by this origin's exhausted quota.
+      const other = await store.record(
+        "i-other",
+        "did:key:counterparty",
+        { type: "transaction", result: "completed" },
+        "general",
+        identity,
+        encryptionKey,
+        undefined,
+        undefined,
+        "agent:a-different-origin"
+      );
+      expect(other.attestation.attestation_id).toBeDefined();
+
+      // Exactly 3 records exist: the two refused calls never wrote.
+      const entries = await storage.list("_reputation");
+      expect(entries.length).toBe(3);
+    });
+
+    it("refuses a record() write past the global capacity, fail-closed", async () => {
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const store = new ReputationStore(storage, masterKey, {
+        maxReputationRecords: 2,
+        maxReputationRecordsPerOrigin: 1000,
+      });
+      const { identity, encryptionKey } = setupIdentity(masterKey);
+
+      const recordAs = (interactionId: string, origin: string) =>
+        store.record(
+          interactionId,
+          "did:key:counterparty",
+          { type: "transaction", result: "completed" },
+          "general",
+          identity,
+          encryptionKey,
+          undefined,
+          undefined,
+          origin
+        );
+
+      // Two DIFFERENT origins fill the GLOBAL cap (per-origin quota is
+      // generous here, so this isolates the capacity path).
+      await recordAs("i1", "agent:origin-1");
+      await recordAs("i2", "agent:origin-2");
+
+      try {
+        await recordAs("i3", "agent:origin-3");
+        expect.unreachable("expected ReputationStoreQuotaError");
+      } catch (err) {
+        expect(err).toBeInstanceOf(ReputationStoreQuotaError);
+        expect((err as InstanceType<typeof ReputationStoreQuotaError>).reason).toBe(
+          "capacity"
+        );
+      }
+
+      const entries = await storage.list("_reputation");
+      expect(entries.length).toBe(2);
+    });
+
+    it("pools an unattributed record() call into the shared REPUTATION_UNKNOWN_ORIGIN bucket rather than exempting it from the quota", async () => {
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const store = new ReputationStore(storage, masterKey, {
+        maxReputationRecords: 1000,
+        maxReputationRecordsPerOrigin: 1,
+      });
+      const { identity, encryptionKey } = setupIdentity(masterKey);
+
+      const recordNoOrigin = (interactionId: string) =>
+        store.record(
+          interactionId,
+          "did:key:counterparty",
+          { type: "transaction", result: "completed" },
+          "general",
+          identity,
+          encryptionKey
+          // No sovereigntyTier, no origin: mirrors every pre-fix direct
+          // caller (tests, and the OLD reputation_record call shape).
+        );
+
+      const first = await recordNoOrigin("i1");
+      expect(first.origin).toBe(REPUTATION_UNKNOWN_ORIGIN);
+
+      // A second unattributed write shares the SAME bucket, so it is
+      // quota-bound too — this is the exact class DEFECT 1 closes: an
+      // absent origin used to mean "not quota-bound," not "bound to a
+      // shared bucket."
+      await expect(recordNoOrigin("i2")).rejects.toThrow(ReputationStoreQuotaError);
+
+      const entries = await storage.list("_reputation");
+      expect(entries.length).toBe(1);
+    });
+
+    // DEFECT 2: the pre-fix record() ran its quota check, then a separate
+    // `storage.write` several awaits later, with no lock between them. N
+    // concurrent record() calls at cap-1 could all observe headroom before
+    // any of them wrote, overshooting the cap. This test fires concurrent
+    // writes at exactly that boundary and asserts the store never exceeds
+    // its configured per-origin cap — it FAILS on pre-fix source (which
+    // overshoots) and PASSES once the check-then-write section is
+    // serialized behind record()'s admission lock.
+    it("MUTATION-PROOF TARGET: concurrent record() calls at cap-1 never overshoot the per-origin quota", async () => {
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const cap = 5;
+      const store = new ReputationStore(storage, masterKey, {
+        maxReputationRecords: 1000,
+        maxReputationRecordsPerOrigin: cap,
+      });
+      const { identity, encryptionKey } = setupIdentity(masterKey);
+      const origin = "agent:concurrent-flooder";
+
+      const recordOnce = (interactionId: string) =>
+        store.record(
+          interactionId,
+          "did:key:counterparty",
+          { type: "transaction", result: "completed" },
+          "general",
+          identity,
+          encryptionKey,
+          undefined,
+          undefined,
+          origin
+        );
+
+      // Fill to cap-1 sequentially (uncontended, establishes the boundary).
+      for (let i = 0; i < cap - 1; i++) {
+        await recordOnce(`seed-${i}`);
+      }
+      const seeded = await storage.list("_reputation");
+      expect(seeded.length).toBe(cap - 1);
+
+      // Fire MANY concurrent writers all racing the LAST slot. Exactly one
+      // may win; the rest must be refused, never silently overshoot.
+      const CONCURRENT = 8;
+      const results = await Promise.allSettled(
+        Array.from({ length: CONCURRENT }, (_, i) => recordOnce(`race-${i}`))
+      );
+
+      const succeeded = results.filter((r) => r.status === "fulfilled");
+      const refused = results.filter(
+        (r) =>
+          r.status === "rejected" &&
+          r.reason instanceof ReputationStoreQuotaError &&
+          r.reason.reason === "origin_quota"
+      );
+      expect(succeeded.length).toBe(1);
+      expect(refused.length).toBe(CONCURRENT - 1);
+
+      // The store's actual persisted size is the ground truth: it must
+      // land exactly at the cap, never over it.
+      const finalEntries = await storage.list("_reputation");
+      expect(finalEntries.length).toBe(cap);
     });
   });
 

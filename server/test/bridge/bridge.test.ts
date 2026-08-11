@@ -1538,6 +1538,146 @@ describe("Concordia Bridge", () => {
       expect(entries.length).toBe(2);
     });
 
+    it("MUTATION-PROOF TARGET: concurrent bridge_commit calls at cap-1 never overshoot the per-origin quota (LD3 gate fix-round DEFECT 2)", async () => {
+      // Pre-fix, BridgeStore.save() ran assertOriginWithinQuota(origin) and
+      // the actual storage.write() several awaits apart with no lock
+      // between them. N concurrent bridge_commit calls at cap-1 could all
+      // observe headroom before any of them wrote, overshooting the cap by
+      // up to N-1. This test FAILS on that source (more than 1 of the
+      // concurrent calls succeeds, and the store ends up over `cap`) and
+      // PASSES once the check-then-write section is serialized behind
+      // BridgeStore's admission lock.
+      const cap = 5;
+      const overrides: BridgeToolsTestOverrides = {
+        maxBridgeCommitments: 1000,
+        maxBridgeCommitmentsPerOrigin: cap,
+      };
+      const { storage, byName, signer, counterparty } = await makeBridgeHarness(overrides);
+      const commit = byName("bridge_commit");
+      const origin = "agent:concurrent-commit-flooder";
+
+      const commitOnce = (sessionId: string) =>
+        commit.handler(
+          {
+            ...makeOutcome({
+              session_id: sessionId,
+              proposer_did: signer.publicIdentity.did,
+              acceptor_did: counterparty.publicIdentity.did,
+            }),
+            identity_id: signer.publicIdentity.identity_id,
+          },
+          origin
+        );
+
+      // Fill to cap-1 sequentially (uncontended, establishes the boundary).
+      for (let i = 0; i < cap - 1; i++) {
+        const seeded = parseToolResult(await commitOnce(`seed-${i}`));
+        expect(seeded.bridge_commitment_id).toBeDefined();
+      }
+      expect((await storage.list("_bridge")).length).toBe(cap - 1);
+
+      // Fire MANY concurrent writers all racing the LAST slot. Exactly one
+      // may win; the rest must be refused, never silently overshoot.
+      const CONCURRENT = 8;
+      const results = await Promise.all(
+        Array.from({ length: CONCURRENT }, (_, i) => commitOnce(`race-${i}`))
+      );
+      const parsed = results.map(parseToolResult);
+      const succeeded = parsed.filter((r) => r.bridge_commitment_id !== undefined);
+      const refused = parsed.filter((r) => r.bridge_commitment_id === undefined);
+      expect(succeeded.length).toBe(1);
+      expect(refused.length).toBe(CONCURRENT - 1);
+      for (const r of refused) {
+        expect(String(r.error)).toMatch(/quota/i);
+      }
+
+      // The store's actual persisted size is the ground truth: it must
+      // land exactly at the cap, never over it.
+      const finalEntries = await storage.list("_bridge");
+      expect(finalEntries.length).toBe(cap);
+    });
+
+    it("MUTATION-PROOF TARGET: concurrent bridge_attest calls at cap-1 never overshoot the per-origin attestation quota (LD3 gate fix-round DEFECT 2)", async () => {
+      // Same shape as the bridge_commit race above, reproduced on the
+      // SIBLING check-then-write pair: bridge_attest's countAttestations
+      // ByOriginForContext scan, then reputationStore.record()'s write,
+      // several awaits apart pre-fix. FAILS on pre-fix source (more than
+      // one concurrent attest succeeds, overshooting cap); PASSES once
+      // that check runs INSIDE record()'s own admission lock via
+      // `additionalQuotaCheck`.
+      const cap = 5;
+      const overrides: BridgeToolsTestOverrides = {
+        maxBridgeCommitments: 1000,
+        maxBridgeCommitmentsPerOrigin: 1000,
+        maxBridgeAttestationsPerOrigin: cap,
+      };
+      const { storage, byName, signer, counterparty } = await makeBridgeHarness(overrides);
+      const commit = byName("bridge_commit");
+      const attest = byName("bridge_attest");
+      const origin = "agent:concurrent-attest-flooder";
+
+      const commitSession = async (sessionId: string): Promise<string> => {
+        const committed = parseToolResult(
+          await commit.handler(
+            {
+              ...makeOutcome({
+                session_id: sessionId,
+                proposer_did: signer.publicIdentity.did,
+                acceptor_did: counterparty.publicIdentity.did,
+              }),
+              identity_id: signer.publicIdentity.identity_id,
+            },
+            origin
+          )
+        );
+        return committed.bridge_commitment_id as string;
+      };
+      const attestCommitment = (bridgeCommitmentId: string) =>
+        attest.handler(
+          {
+            bridge_commitment_id: bridgeCommitmentId,
+            outcome_result: "completed",
+            identity_id: signer.publicIdentity.identity_id,
+          },
+          origin
+        );
+
+      // Pre-commit and attest cap-1 DISTINCT sessions sequentially
+      // (uncontended, establishes the boundary). Each attest uses a
+      // distinct session so the pre-existing same-negotiation dedup never
+      // fires and masks the quota race under test.
+      for (let i = 0; i < cap - 1; i++) {
+        const commitmentId = await commitSession(`seed-session-${i}`);
+        const seeded = parseToolResult(await attestCommitment(commitmentId));
+        expect(seeded.attestation_id).toBeDefined();
+      }
+      expect((await storage.list("_reputation")).length).toBe(cap - 1);
+
+      // Pre-commit the racing commitments sequentially (bridge_commit's own
+      // admission lock is exercised by the test above; committing here
+      // sequentially isolates the ATTEST-side race this test targets).
+      const CONCURRENT = 8;
+      const racingCommitmentIds: string[] = [];
+      for (let i = 0; i < CONCURRENT; i++) {
+        racingCommitmentIds.push(await commitSession(`race-session-${i}`));
+      }
+
+      const results = await Promise.all(
+        racingCommitmentIds.map((id) => attestCommitment(id))
+      );
+      const parsed = results.map(parseToolResult);
+      const succeeded = parsed.filter((r) => r.attestation_id !== undefined);
+      const refused = parsed.filter((r) => r.attestation_id === undefined);
+      expect(succeeded.length).toBe(1);
+      expect(refused.length).toBe(CONCURRENT - 1);
+      for (const r of refused) {
+        expect(String(r.error)).toMatch(/quota/i);
+      }
+
+      const finalEntries = await storage.list("_reputation");
+      expect(finalEntries.length).toBe(cap);
+    });
+
     it("uses the real production defaults when no test override is supplied", () => {
       // Pins the exported constants so a source edit that quietly changes
       // the production cap (rather than the enforcement logic the tests

@@ -10,8 +10,10 @@ import { toolResult } from "../router.js";
 import {
   ReputationBundleVerificationError,
   ReputationStore,
+  ReputationStoreQuotaError,
   trustedSovereigntyTier,
   type InteractionOutcome,
+  type ReputationStoreTestOverrides,
   type StoredAttestation,
 } from "./reputation-store.js";
 import {
@@ -180,9 +182,19 @@ export function createReputationTools(
   auditLog: AuditLog,
   handshakeResults?: ReadonlyMap<string, HandshakeResult>,
   verascoreUrl?: string,
-  config?: SanctuaryConfig
+  config?: SanctuaryConfig,
+  /**
+   * Test-only override for ReputationStore's record()-chokepoint growth
+   * bounds (LD3 gate fix-round DEFECT 1). Production call sites never set
+   * this — see ReputationStoreTestOverrides's doc (reputation-store.ts).
+   */
+  reputationStoreTestOverrides?: ReputationStoreTestOverrides
 ): { tools: ToolDefinition[]; reputationStore: ReputationStore } {
-  const reputationStore = new ReputationStore(storage, masterKey);
+  const reputationStore = new ReputationStore(
+    storage,
+    masterKey,
+    reputationStoreTestOverrides
+  );
   const identityEncryptionKey = derivePurposeKey(masterKey, "identity-encryption");
   // Default to empty map if no handshake results provided
   const hsResults = handshakeResults ?? new Map<string, HandshakeResult>();
@@ -243,7 +255,7 @@ export function createReputationTools(
         },
         required: ["interaction_id", "counterparty_did", "outcome"],
       },
-      handler: async (args) => {
+      handler: async (args, callerIdentity) => {
         const identityId = args.identity_id as string | undefined;
         const identity = identityId
           ? identityManager.get(identityId)
@@ -301,10 +313,40 @@ export function createReputationTools(
             identity,
             identityEncryptionKey,
             args.counterparty_attestation as string | undefined,
-            tierMeta.sovereignty_tier
+            tierMeta.sovereignty_tier,
+            // LD3 gate fix-round DEFECT 1: `reputation_record` is Tier-2
+            // (anomaly-gated auto-allow), so it is the general-purpose,
+            // freely-callable path into `_reputation` — the pre-fix version
+            // called record() with no origin at all, so this tool's writes
+            // were exempt from every quota bridge_attest enforced on
+            // itself. Threading the SERVER-SET `callerIdentity` here is
+            // what puts this tool's growth under record()'s own
+            // MAX_REPUTATION_RECORDS / MAX_REPUTATION_RECORDS_PER_ORIGIN
+            // chokepoint bound (reputation-store.ts) — never `identity_id`,
+            // which is Tier-3 `identity_create`-mintable and would let a
+            // caller reset its quota by minting a fresh identity per call.
+            callerIdentity
           );
         } catch (err) {
           if (err instanceof BridgeAttestationMetricValidationError) {
+            return toolResult({ error: err.message });
+          }
+          if (err instanceof ReputationStoreQuotaError) {
+            void auditLog.append(
+              "l4",
+              err.reason === "origin_quota"
+                ? "reputation_record_origin_quota_exceeded"
+                : err.reason === "capacity"
+                  ? "reputation_record_store_saturated"
+                  : "reputation_record_quota_scan_unavailable",
+              identity.identity_id,
+              {
+                interaction_id: args.interaction_id,
+                context,
+                caller_identity: callerIdentity,
+              },
+              "failure"
+            );
             return toolResult({ error: err.message });
           }
           throw err;
