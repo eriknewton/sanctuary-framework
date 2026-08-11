@@ -312,8 +312,22 @@ export function createReputationTools(
         // reconcile step on an already-committed retry -- see
         // ReputationInLockAuditEmit's doc). Captures ONLY `auditLog` +
         // primitive locals -- never `reputationStore` -- so re-entry into any
-        // store's admission lock from inside it is not expressible (V2-5
-        // re-entry prohibition).
+        // store's admission lock from inside it does not happen HERE, by
+        // CONVENTION, not by a type-system guarantee -- see
+        // ReputationInLockAuditEmit's doc for why the callback type cannot
+        // enforce this on its own (V2-5 gap-5).
+        //
+        // Reconcile-audit fidelity (fix-round, closes a three-way
+        // divergence): every field below reads from `projection`, NEVER
+        // from the outer `outcome`/`tierMeta` closure captures. On the
+        // reconcile branch (an already-committed retry), `projection`
+        // carries the EXISTING stored attestation's own outcome/tier --
+        // the same values the caller-visible `already_committed` result
+        // returns and the durable record holds. A same-tuple retry with a
+        // DIFFERENT incoming outcome must still audit the STORED truth, or
+        // caller-result / durable-write / audit-entry disagree, which is
+        // the exact divergence class this admission-completion fix exists
+        // to close.
         const emitAudit: ReputationInLockAuditEmit = async (projection) => {
           await auditLog.appendCritical({
             layer: "l4",
@@ -322,10 +336,10 @@ export function createReputationTools(
             result: "success",
             details: {
               interaction_id: projection.interaction_id,
-              outcome_type: outcome.type,
-              outcome_result: outcome.result,
+              outcome_type: projection.outcome_type,
+              outcome_result: projection.outcome_result,
               context: projection.context,
-              sovereignty_tier: tierMeta.sovereignty_tier,
+              sovereignty_tier: projection.sovereignty_tier,
             },
           });
         };

@@ -56,6 +56,7 @@ import { createReputationTools } from "../../src/reputation/tools.js";
 import {
   SentinelFindingStore,
   SENTINEL_FINDING_NAMESPACE,
+  SENTINEL_FINDING_KEY_PREFIX,
 } from "../../src/sentinel/sentinel-finding-store.js";
 import { Sentinel } from "../../src/sentinel/sentinel.js";
 import { SentinelRegistry } from "../../src/sentinel/sentinel-registry.js";
@@ -657,9 +658,66 @@ describe("LD6 BP-DEADLINE-03: reputation_record durable admission-completion ora
 
     expect((await rig.storage.list("_reputation")).length).toBe(1);
   });
+
+  it("fix-round FIX 2: reconcile audit pins the STORED outcome, never a divergent retry's incoming outcome", async () => {
+    const rig = setup();
+    await seedIdentity(rig);
+    const baseArgs = {
+      interaction_id: "ld6-reconcile-divergent",
+      counterparty_did: "did:sanctuary:counterparty-divergent",
+      context: "general",
+      identity_id: rig.signer.storedIdentity.identity_id,
+    };
+    const first = await callToolSafe(
+      rig.record,
+      { ...baseArgs, outcome: { type: "transaction", result: "completed" } },
+      rig.signer.publicIdentity.did
+    );
+    expect(first.ok).toBe(true);
+
+    // Retry the SAME (interaction_id, participant_did, counterparty_did,
+    // context) tuple with a DIFFERENT incoming outcome -- the existence
+    // guard collapses this to the already-committed record (I2/I3). Before
+    // the fix, the reconcile audit closure read the OUTER closure's
+    // `outcome`/`tierMeta` (this call's own "disputed" input) instead of
+    // the projection's stored values, so caller-result (stored, via
+    // `already_committed`), durable record (stored), and audit entry
+    // (incoming) disagreed. The fix pins the audit to `projection`, sourced
+    // from `existing.attestation.data` in reputation-store.ts.
+    const second = await callToolSafe(
+      rig.record,
+      { ...baseArgs, outcome: { type: "transaction", result: "disputed" } },
+      rig.signer.publicIdentity.did
+    );
+    expect(second.ok).toBe(true);
+    if (second.ok) {
+      expect(second.value.already_committed).toBe(true);
+    }
+
+    const freshAuditLog = new AuditLog(rig.storage, rig.masterKey);
+    const { entries } = await freshAuditLog.query({
+      operation_type: "reputation_record",
+      limit: 100,
+    });
+    const successEntries = entries.filter(
+      (e) => e.result === "success" && e.details?.["interaction_id"] === baseArgs.interaction_id
+    );
+    // At least the original write's audit, possibly plus the reconcile
+    // audit -- either way every success entry for this interaction_id must
+    // describe the STORED ("completed") outcome, never "disputed".
+    expect(successEntries.length).toBeGreaterThan(0);
+    for (const entry of successEntries) {
+      expect(entry.details?.["outcome_result"]).toBe("completed");
+    }
+
+    // Still exactly one durable record -- the divergent retry never mints
+    // a second attestation, it only reconciles the audit for the first.
+    expect((await rig.storage.list("_reputation")).length).toBe(1);
+  });
 });
 
-// ─── Sentinel (finding_id already idempotent; V2-5 awaited-just-after) ──
+// ─── Sentinel (fix-round: NO stable id in production, no crash-window ──
+// ─── self-heal -- honest accepted residual, V2-5 awaited-just-after) ────
 
 describe("LD6 BP-DEADLINE-03: sentinel FINDING_EMITTED durable admission-completion oracle", () => {
   class StubSentinel extends Sentinel {
@@ -701,15 +759,24 @@ describe("LD6 BP-DEADLINE-03: sentinel FINDING_EMITTED durable admission-complet
     return { storage, masterKey, findingStore, dispatcher, stub, auditLog, queueRejections };
   }
 
-  it("I1 (V2-5 sentinel exception, awaited-just-after): an audit-append failure surfaces to tick()'s per-sentinel error path, but the finding is ALREADY durably persisted (self-heals: unconditional overwrite-in-place re-emits the audit on the next tick)", async () => {
+  it("I1 (V2-5 sentinel exception, HONEST bound): an audit-append failure surfaces to tick()'s per-sentinel error path, the finding is ALREADY durably persisted, but -- unlike bridge/reputation -- the crash-window orphan is NEVER self-healed: production sentinels emit finding_id: \"\", so a later tick mints a DIFFERENT random id and never reconciles the first", async () => {
     const rig = setup();
     await rig.dispatcher.subscribeSentinel(rig.stub.sentinelId);
     // Drain the SUBSCRIBED audit append (fire-and-forget `append()`, not
     // `appendCritical`) before arming the fault queue below, so the fault
     // targets FINDING_EMITTED's write, not an unrelated pending write.
     await rig.auditLog.flush();
-    const finding: SentinelFinding = {
-      finding_id: "ld6-finding-001",
+
+    // Matches the REAL production shape: every shipped sentinel (see
+    // src/sentinel/sentinels/*.ts -- egress-volume-watcher.ts,
+    // credential-usage-watcher.ts, cross-agent-chatter-watcher.ts, etc.)
+    // emits `finding_id: ""` and lets sentinel-dispatcher.ts's routeFinding
+    // mint a fresh `randomUUID()` per finding. A hardcoded caller-supplied
+    // id here would test a fiction no production sentinel produces -- the
+    // prior cut of this oracle did exactly that and masked the gap Codex
+    // found (finding_id: "" never gives overwrite-in-place self-heal).
+    const makeFinding = (): SentinelFinding => ({
+      finding_id: "",
       sentinel_id: rig.stub.sentinelId,
       severity: "alert",
       summary: "LD6 oracle finding",
@@ -717,8 +784,8 @@ describe("LD6 BP-DEADLINE-03: sentinel FINDING_EMITTED durable admission-complet
       observed_at: "2026-08-11T00:00:00.000Z",
       evidence_audit_ids: [],
       fortress_id: "",
-    };
-    rig.stub.next = [finding];
+    });
+    rig.stub.next = [makeFinding()];
 
     // The audit write is awaited-just-after saveFinding (NOT folded into
     // its lock, V2-5) -- a rejection propagates out of routeFinding into
@@ -731,35 +798,57 @@ describe("LD6 BP-DEADLINE-03: sentinel FINDING_EMITTED durable admission-complet
     expect(firstTick.length).toBe(0);
 
     // I4: the finding is nonetheless durably persisted -- saveFinding
-    // settled BEFORE the audit append was even attempted.
-    const stored = await rig.findingStore.loadFinding(finding.finding_id);
+    // settled BEFORE the audit append was even attempted. The fixture
+    // cannot supply the id (production doesn't either), so capture the
+    // RANDOM id the dispatcher minted for it from durable storage.
+    const afterFirst = await rig.storage.list(SENTINEL_FINDING_NAMESPACE);
+    expect(afterFirst.length).toBe(1);
+    const firstId = afterFirst[0]!.key.slice(SENTINEL_FINDING_KEY_PREFIX.length);
+    const stored = await rig.findingStore.loadFinding(firstId);
     expect(stored).not.toBeNull();
+
     const auditIdsAtBoundary = await auditSuccessIds(
       rig.storage,
       rig.masterKey,
       SENTINEL_AUDIT_OPS.FINDING_EMITTED,
       "finding_id"
     );
-    expect(auditIdsAtBoundary.has(finding.finding_id)).toBe(false);
+    expect(auditIdsAtBoundary.has(firstId)).toBe(false);
 
-    // A later tick with the SAME finding_id (finding_id already gives I2/I3
-    // via overwrite-in-place, per sentinel-finding-store.ts) re-attempts
-    // the audit unconditionally -- self-heal, no explicit reconcile branch
-    // needed for sentinel's simpler awaited-just-after shape.
-    rig.stub.next = [finding];
+    // HONEST BOUND: a later tick re-evaluates from scratch (the real
+    // production shape -- a sentinel does not resupply the failed attempt's
+    // id, it has none to resupply) and gets its OWN fresh finding_id: "" ->
+    // a NEW random id, distinct from firstId. No caller-supplied identifying
+    // tuple exists for sentinel findings to retry against, unlike
+    // bridge_commit/bridge_attest/reputation_record's content-derived ids
+    // (V2-3), so this does NOT collapse onto the first tick's key.
+    rig.stub.next = [makeFinding()];
     const secondTick = await rig.dispatcher.tick();
     expect(secondTick.length).toBe(1);
+    const secondId = secondTick[0]!.finding_id;
+    expect(secondId).not.toBe(firstId);
+
     const auditIdsAfter = await auditSuccessIds(
       rig.storage,
       rig.masterKey,
       SENTINEL_AUDIT_OPS.FINDING_EMITTED,
       "finding_id"
     );
-    expect(auditIdsAfter.has(finding.finding_id)).toBe(true);
+    // The second tick's OWN finding gets its OWN successful audit...
+    expect(auditIdsAfter.has(secondId)).toBe(true);
+    // ...but the first tick's orphan is STILL unaudited. No self-heal
+    // occurred for it, and none ever will -- this is the accepted,
+    // disclosed residual (weaker than bridge/reputation's exactly-one-
+    // record self-heal), not a fabricated stronger guarantee.
+    expect(auditIdsAfter.has(firstId)).toBe(false);
 
-    // I2/I3: still exactly one durable finding record for this id (no
-    // duplicate growth from the retry).
-    const entries = await rig.storage.list(SENTINEL_FINDING_NAMESPACE);
-    expect(entries.length).toBe(1);
+    // Two DISTINCT durable records now exist: the crash-window orphan from
+    // tick 1 (retained, not silently dropped -- an operator can still find
+    // it via finding-store inspection) plus tick 2's own finding. If a
+    // future change made sentinel ids stable/content-derived (closing this
+    // residual for real), this assertion is exactly what would need to
+    // flip alongside it -- it is not an incidental count.
+    const finalEntries = await rig.storage.list(SENTINEL_FINDING_NAMESPACE);
+    expect(finalEntries.length).toBe(2);
   });
 });

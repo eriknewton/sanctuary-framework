@@ -265,15 +265,35 @@ export class SentinelDispatcher {
     // lock; adding a second audit write there would need up to 80s against
     // the shared 50s admission-deadline budget (see
     // sentinel-finding-store.ts's STORE_ADMISSION_DEADLINE_MS derivation).
-    // `finding_id` already gives this store I2/I3 (overwrite-in-place on a
-    // retry), so awaited-just-after accepts only I1-eventual: a crash
-    // between saveFinding settling and this append settling leaves a
-    // committed-but-unaudited finding, self-healing on the next retry or
-    // read of the same finding_id -- NOT atomicity (same named residual as
-    // the in-lock bridge/reputation audits, V2-2). Was previously a
-    // fire-and-forget `void append`, so a failed audit write was silently
-    // lost; awaiting `appendCritical` surfaces that failure to `tick()`'s
-    // own per-sentinel try/catch instead.
+    //
+    // HONEST BOUND (fix-round correction -- the prior comment here claimed
+    // "finding_id already gives this store I2/I3 (overwrite-in-place on a
+    // retry)"; that was FALSE for every shipped sentinel): every sentinel in
+    // src/sentinel/sentinels/*.ts emits `finding_id: ""`, so the stamp above
+    // (`raw.finding_id || randomUUID()`) mints a FRESH random id on every
+    // single finding, every tick -- there is no caller-supplied or
+    // content-derived key for a later tick to land back on. A crash between
+    // saveFinding settling and this append settling leaves a
+    // durably-persisted-but-PERMANENTLY-unaudited orphan record: the NEXT
+    // tick's finding (even one describing the same underlying condition,
+    // e.g. egress-volume-watcher re-detecting the same server's ongoing
+    // anomaly) gets its OWN new random id and its OWN new audit attempt --
+    // it does not overwrite or reconcile the orphan the way a bridge_commit/
+    // bridge_attest/reputation_record retry does (V2-2's self-healing
+    // in-lock audits, which DO have a caller-supplied identifying tuple to
+    // derive a stable id from).
+    //
+    // This is an ACCEPTED, weaker residual, not a bug to silently paper
+    // over: sentinels are timer-driven autonomous detectors, not
+    // caller-retried operations, and most sentinels' rolling-window findings
+    // (current_count, evidence_audit_ids, observed_at) genuinely differ tick
+    // to tick even when the underlying condition persists -- there is no
+    // sentinel-agnostic "condition key" this dispatcher could derive a
+    // stable id from without sentinel-specific semantics it does not have,
+    // and collapsing distinct ticks' evidence onto one overwritten key would
+    // silently lose that evidence. Still AWAITED (not fire-and-forget)
+    // because the failure must surface loudly to `tick()`'s own
+    // per-sentinel try/catch even though it cannot self-heal.
     await this.auditLog.appendCritical({
       layer: "l2",
       operation: SENTINEL_AUDIT_OPS.FINDING_EMITTED,

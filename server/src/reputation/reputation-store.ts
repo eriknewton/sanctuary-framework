@@ -759,6 +759,18 @@ export interface ReputationRecordAuditProjection {
   interaction_id: string;
   counterparty_did: string;
   context: string;
+  // LD6 BP-DEADLINE-03 fix-round (three-way divergence close): outcome_type
+  // / outcome_result / sovereignty_tier are carried in the projection so the
+  // in-lock audit callback can log the STORED record's own values, never a
+  // caller-closure-captured incoming value. On the reconcile branch below,
+  // `record()` passes `existing.attestation.data.*` here (the tuple already
+  // committed) rather than the retry call's own `outcome`/`sovereigntyTier`
+  // arguments -- a same-tuple retry with a DIFFERENT outcome must not make
+  // the audit disagree with the durable record and the caller-visible
+  // result, which both reflect the stored attestation, not the retry input.
+  outcome_type: string;
+  outcome_result: string;
+  sovereignty_tier?: SovereigntyTier;
 }
 
 /**
@@ -767,11 +779,24 @@ export interface ReputationRecordAuditProjection {
  * step when the existence guard finds an already-committed match whose
  * audit may have been lost to a prior crash. The parameter type exposes
  * ONLY the plain projection above -- no `ReputationStore` reference, no
- * storage handle, no admission-queue accessor -- so re-entry into ANY
- * store's admission lock from inside this callback is not expressible in
- * the type system (V2-5 gap-5 re-entry prohibition). Construct the closure
- * passed here by capturing `auditLog` + plain data ONLY, never
- * `reputationStore` / `storage`.
+ * storage handle, no admission-queue accessor -- so the callback has
+ * nothing PASSED IN that it could re-enter a store's admission lock with.
+ *
+ * HONEST BOUND (fix-round correction, mirrors bridge/tools.ts's
+ * `BridgeInLockAuditEmit`): this restricts only the PARAMETER a caller
+ * receives, not what a closure built against this type can LEXICALLY
+ * CAPTURE from its own creation scope -- a TS function type constrains
+ * arguments, not closures, so it cannot stop a call site from writing
+ * `async (projection) => { await reputationStore.record(...); ... }` and
+ * capturing `reputationStore` from the outer scope regardless of
+ * `projection`'s shape. Re-entry avoidance here is a CONVENTION every
+ * current call site follows (the closure captures only `auditLog` +
+ * primitive locals, never `reputationStore` / `storage`), not a structural
+ * guarantee this type enforces (V2-5 gap-5). A real structural guard (e.g.
+ * a re-entrancy flag on the admission lock itself) would close this
+ * properly; it is not built here. Construct the closure passed here by
+ * capturing `auditLog` + plain data ONLY, never `reputationStore` /
+ * `storage`.
  */
 export type ReputationInLockAuditEmit = (
   projection: ReputationRecordAuditProjection
@@ -1317,6 +1342,12 @@ export class ReputationStore {
             interaction_id: existing.attestation.data.interaction_id,
             counterparty_did: existing.attestation.data.counterparty_did,
             context: existing.attestation.data.context,
+            // Reconcile-audit fidelity (fix-round): STORED values, never
+            // this call's own `outcome`/`sovereigntyTier` arguments -- see
+            // ReputationRecordAuditProjection's doc.
+            outcome_type: existing.attestation.data.outcome_type,
+            outcome_result: existing.attestation.data.outcome_result,
+            sovereignty_tier: existing.attestation.data.sovereignty_tier,
           });
         }
         throw new ReputationAlreadyRecordedError(existing);
@@ -1357,6 +1388,14 @@ export class ReputationStore {
           interaction_id: stored.attestation.data.interaction_id,
           counterparty_did: stored.attestation.data.counterparty_did,
           context: stored.attestation.data.context,
+          // Same STORED-value sourcing as the reconcile branch above; on
+          // this fresh-write path `stored` is what just landed, so this is
+          // identical to the incoming outcome/tier today, but reading it
+          // from `stored` (not the outer closure) keeps one source of truth
+          // and matches the reconcile branch's shape exactly.
+          outcome_type: stored.attestation.data.outcome_type,
+          outcome_result: stored.attestation.data.outcome_result,
+          sovereignty_tier: stored.attestation.data.sovereignty_tier,
         });
       }
 
@@ -1946,6 +1985,51 @@ export class ReputationStore {
 
       let count = 0;
       for (const attestation of bundle.attestations) {
+        // FIX 3 (LD6 BP-DEADLINE-03 fix-round, predictable-import-id close):
+        // the bundle's own `attestation_id` field is NOT part of the signed
+        // bytes (`dataBytes` in record() is `JSON.stringify(attestationData)`,
+        // which never includes `attestation_id`), so a validly-self-signed
+        // attestation can claim ANY `attestation_id` string -- including one
+        // precomputed via the PUBLIC `deriveReputationAttestationId` formula
+        // to collide with a tuple this instance has not recorded yet. Writing
+        // at the caller-claimed id directly would let an approved-but-
+        // malicious bundle pre-seed that predictable key; a future legitimate
+        // record() call for the real tuple would then find the key occupied
+        // by content that fails intent verification (`verifyStoredAttestationIntent`)
+        // and fail closed (`occupied_unverified`) -- never hijacked, but
+        // permanently blocked for that one tuple. Re-deriving the id from
+        // the attestation's OWN `data` fields (never trusting the bundle's
+        // `attestation_id`) closes the "arbitrary caller-chosen id
+        // disconnected from the signed content" vector: the storage key an
+        // imported record lands at is now always exactly what its own
+        // (interaction_id, participant_did, counterparty_did, context)
+        // tuple derives to, matching record()'s own id-derivation contract
+        // instead of trusting bundle metadata.
+        //
+        // DEBT (honest residual, not closed by this fix): `data.participant_did`
+        // itself is still bundle-supplied and is NOT required to equal
+        // `attestation.signer` here, so a sufficiently informed attacker who
+        // already knows a victim's exact future (interaction_id,
+        // participant_did, counterparty_did, context) tuple can still craft
+        // a self-signed attestation with THOSE exact `data` fields and land
+        // at the SAME derived key -- the future legitimate write then still
+        // hits `occupied_unverified` (the stored signature will not verify
+        // against the real participant's public key) and fails closed. This
+        // residual is bounded (one specific, pre-known tuple; the outcome is
+        // a fail-closed refusal, never a hijacked or corrupted record) and
+        // operator-gated (`reputation_import` is Tier-1, human-approved) --
+        // register it rather than claim full closure.
+        const derivedAttestationId = deriveReputationAttestationId(
+          attestation.data.interaction_id,
+          attestation.data.participant_did,
+          attestation.data.counterparty_did,
+          attestation.data.context
+        );
+        const importedAttestation: Attestation = {
+          ...attestation,
+          attestation_id: derivedAttestationId,
+        };
+
         // Store the imported attestation only after all bundle-level and
         // per-attestation validation succeeds, AND the batch quota check
         // above passed for the whole bundle. Mark it imported so
@@ -1957,7 +2041,7 @@ export class ReputationStore {
         // quota-attributed on every later scan the same way a record()
         // write already is.
         const stored: StoredAttestation = {
-          attestation,
+          attestation: importedAttestation,
           recorded_at: new Date().toISOString(),
           imported: true,
           origin: resolvedOrigin,
@@ -1967,7 +2051,7 @@ export class ReputationStore {
         const encrypted = encrypt(serialized, this.encryptionKey);
         await this.storage.write(
           "_reputation",
-          attestation.attestation_id,
+          derivedAttestationId,
           stringToBytes(JSON.stringify(encrypted))
         );
 

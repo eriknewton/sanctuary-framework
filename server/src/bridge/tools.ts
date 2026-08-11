@@ -187,11 +187,22 @@ export interface BridgeCommitmentAuditProjection {
  * reconcile step when the existence guard finds an already-committed match
  * whose audit may have been lost to a prior crash. The parameter type
  * exposes ONLY the plain projection above -- no `BridgeStore` reference, no
- * storage handle, no admission-queue accessor -- so re-entry into ANY
- * store's admission lock from inside this callback is not expressible in
- * the type system (V2-5 gap-5 re-entry prohibition). Construct the closure
- * passed here by capturing `auditLog` + plain data ONLY, never
- * `bridgeStore` / `storage`.
+ * storage handle, no admission-queue accessor -- so the callback has
+ * nothing PASSED IN that it could re-enter a store's admission lock with.
+ *
+ * HONEST BOUND (fix-round correction): this restricts only the PARAMETER a
+ * caller receives, not what a closure built against this type can
+ * LEXICALLY CAPTURE from its own creation scope -- a TS function type
+ * constrains arguments, not closures, so it cannot stop a call site from
+ * writing `async (projection) => { await bridgeStore.save(...); ... }` and
+ * capturing `bridgeStore` from the outer scope regardless of `projection`'s
+ * shape. Re-entry avoidance here is a CONVENTION every current call site
+ * follows (the closure captures only `auditLog` + primitive locals, never
+ * `bridgeStore` / `storage`), not a structural guarantee this type enforces
+ * (V2-5 gap-5). A real structural guard (e.g. a re-entrancy flag on the
+ * admission lock itself) would close this properly; it is not built here.
+ * Construct the closure passed here by capturing `auditLog` + plain data
+ * ONLY, never `bridgeStore` / `storage`.
  */
 export type BridgeInLockAuditEmit = (
   projection: BridgeCommitmentAuditProjection
@@ -1056,8 +1067,10 @@ export function createBridgeTools(
         // step on an already-committed retry). The closure captures ONLY
         // `auditLog` + the primitive `identity.identity_id` -- never
         // `bridgeStore` / `storage` -- so re-entry into any store's
-        // admission lock from inside it is not expressible (V2-5 re-entry
-        // prohibition).
+        // admission lock from inside it does not happen HERE, by
+        // CONVENTION, not by a type-system guarantee -- see
+        // `BridgeInLockAuditEmit`'s doc for why the callback type cannot
+        // enforce this on its own (V2-5 gap-5).
         const emitAudit: BridgeInLockAuditEmit = async (projection) => {
           await auditLog.appendCritical({
             layer: "l3",
@@ -1468,7 +1481,10 @@ export function createBridgeTools(
         // reconcile step on an already-committed retry). Captures ONLY
         // `auditLog` + primitive locals (`commitmentId`, `tier`) -- never
         // `reputationStore` -- so re-entry into any store's admission lock
-        // from inside it is not expressible (V2-5 re-entry prohibition).
+        // from inside it does not happen HERE, by CONVENTION, not by a
+        // type-system guarantee -- see `ReputationInLockAuditEmit`'s doc
+        // (reputation-store.ts) for why the callback type cannot enforce
+        // this on its own (V2-5 gap-5).
         const emitReputationAudit = async (projection: {
           attestation_id: string;
           interaction_id: string;
