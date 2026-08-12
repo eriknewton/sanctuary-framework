@@ -305,7 +305,6 @@ function counterpartyDidOf(commitment: BridgeCommitment, outcome: ConcordiaOutco
     : outcome.proposer_did;
 }
 
-
 /**
  * Bounds how long a CALLER waits on BridgeStore's whole admission critical
  * section (LD3 gate fix-round-2, MUST-FIX 3). Caller-facing ONLY: the lock
@@ -596,8 +595,11 @@ class BridgeStore {
       if (existing !== null) {
         // Reconcile: a record that committed but lost its audit to a prior
         // crash (the V2-2 named residual) gets its audit re-emitted here.
-        // `reconcile: true` (LD6 gate fix-round F4) tells the callback to
-        // emit ONLY when the durable audit is actually missing -- see
+        // ALWAYS emitted on a guard hit -- never conditioned on an in-lock
+        // audit-log read (that read is the HIGH fix-round-2 removed: a
+        // non-eager query re-verifies the whole chain inside the lock) --
+        // and `reconcile: true` (LD6 gate fix-round-2 F4) makes the
+        // callback TAG the entry so counting consumers skip it; see
         // BridgeCommitmentAuditProjection's `reconcile` doc.
         await emitAudit({
           bridge_commitment_id: existing.commitment.bridge_commitment_id,

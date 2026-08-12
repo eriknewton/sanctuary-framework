@@ -1909,7 +1909,9 @@ export async function buildRecognitionPanel(
     // identical-args retry (LD6 gate fix-round-2 F4 -- see the `reconcile`
     // field docs in bridge/tools.ts and reputation-store.ts). Skipping them
     // keeps this tally per-RECORD, so an agent looping identical Tier-3
-    // retries cannot inflate it. The counts below stay an honest LOWER
+    // retries cannot inflate it. Filter must match the dashboard vc_count
+    // filter (`details.reconcile !== true`, dashboard/aggregator.ts
+    // buildDisclosure). The counts below stay an honest LOWER
     // bound, and skipping tags only strengthens that direction: a
     // crash-window orphan whose audit was healed by a retry has ONLY a
     // tagged entry, so it is undercounted here -- never double-counted.
