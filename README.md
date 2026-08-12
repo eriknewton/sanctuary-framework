@@ -85,7 +85,7 @@ Trust and security claims are tracked in the [Sanctuary Assurance Matrix](ASSURA
 
 Roadmap shape: with the Mac Castle Wall per-uid allow/deny plus attended reboot-survival demonstration proven, the current focus is the per-flow rule-attributed audit trail (still the real gap), the Castle Wall Windows backend, and the fleet / operator-cloud surfaces. See [ROADMAP.md](ROADMAP.md).
 
-Supply-chain posture: release binaries for the macOS enforcement path are Dev-ID-signed and notarized, the CLI update path verifies a signed release manifest before applying an update, and every commit to main passes a structural typecheck-plus-test-baseline gate locally and again in CI. Mechanisms and their history: [CHANGELOG.md](CHANGELOG.md) and [docs/audit/](docs/audit/).
+Supply-chain posture: release binaries for the macOS enforcement path are Dev-ID-signed and notarized, the CLI authenticates update availability with a signed release manifest before showing signed-channel advice, and every commit to main passes a structural typecheck-plus-test-baseline gate locally and again in CI. Sanctuary does not currently download or apply updates for the operator. Mechanisms and their history: [CHANGELOG.md](CHANGELOG.md) and [docs/audit/](docs/audit/).
 
 ---
 
