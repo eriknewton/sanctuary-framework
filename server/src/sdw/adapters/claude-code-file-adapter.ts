@@ -177,10 +177,12 @@ export async function ingestClaudeCodeMemoryDirectory(
  *
  * Two properties this function must keep, both learned from real large memory
  * directories in which the secret classifier refused files. Concrete
- * measurement, 2026-08-07: readClaudeCodeMemoryDirectory plus
+ * measurement, 2026-08-12: readClaudeCodeMemoryDirectory plus
  * SdwMemoryBackendAdapter.screenPassage over a real Claude Code memory
- * directory refused 147 of 414 markdown files (35.5%); MEMORY.md itself was
- * among the refused files. The measurement collected counts only.
+ * directory refused 36 of 438 markdown files (8.2%) on the pre-fix gate. Of
+ * those, 26 contained only protected-concept names; the shape-based gate
+ * refuses 10 of 438 (2.3%), all through token/entropy checks, and accepts
+ * MEMORY.md. The measurement collected counts and detector classes only.
  *
  *  - A refused file is a REPORTED SKIP, never a whole-run abort. It is also
  *    never an exemption: the same gate still runs on everything written, and

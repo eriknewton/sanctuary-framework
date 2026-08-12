@@ -219,6 +219,24 @@ describe("Claude Code memory-file adapter", () => {
     }
   });
 
+  it("roundtrips prose that names protected concepts without secret material", async () => {
+    const source = await copyFixtureSet("basic");
+    const prose = "# Security notes\n\nThe principal policy and recovery key are stored offline.\n";
+    await writeFile(join(source, "security-notes.md"), prose);
+    const storagePath = await tempDir("cc-memory-security-prose-vault");
+    const output = await tempDir("cc-memory-security-prose-output");
+    const adapter = makeAdapter(storagePath, "cc-security-prose");
+
+    const ingest = await ingestClaudeCodeMemoryDirectory(adapter, source, {
+      ingestedAt: INGESTED_AT,
+    });
+    expect(ingest.complete).toBe(true);
+    expect(ingest.skipped).toEqual([]);
+
+    await emitClaudeCodeMemoryDirectory(adapter, output);
+    expect(await readFile(join(output, "security-notes.md"), "utf8")).toBe(prose);
+  });
+
   it("re-ingesting a CHANGED directory into the SAME vault and owner_ref replaces the passages in place", async () => {
     // Regression pin for the "mirror works exactly once" defect. Memory files
     // change daily, so the second run is the normal case, not an edge case. The
@@ -266,12 +284,12 @@ describe("Claude Code memory-file adapter", () => {
 
   it("skips and REPORTS a file the secret classifier refuses, mirrors the rest, and stays re-runnable", async () => {
     const source = await copyFixtureSet("basic");
-    // The classifier refuses this on the "principal policy" probe. Sorted after
+    // The classifier refuses this labeled, material-shaped recovery key. Sorted after
     // MEMORY.md and concise-updates.md, so a whole-run abort here would leave a
     // committed prefix behind: exactly the failure this test pins.
     await writeFile(
       join(source, "note-with-secret.md"),
-      "# Ops note\n\nThe principal policy file lives in the fortress root.\n",
+      "# Ops note\n\nSANCTUARY_RECOVERY_KEY=AbCdEfGhIjKlMnOpQrStUvWxYz0123456789_-AbCdE\n",
     );
     const storagePath = await tempDir("cc-memory-skip-vault");
     const adapter = makeAdapter(storagePath, "cc-skip");
@@ -298,7 +316,7 @@ describe("Claude Code memory-file adapter", () => {
       ),
     ).toBeNull();
     for (const raw of await readRawCorpusFiles(storagePath)) {
-      expect(encryptedEnvelopeContains(raw, "principal policy")).toBe(false);
+      expect(encryptedEnvelopeContains(raw, "SANCTUARY_RECOVERY_KEY")).toBe(false);
     }
 
     // The run is repeatable: the previously committed files replace cleanly

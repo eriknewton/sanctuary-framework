@@ -313,6 +313,34 @@ describe("SDW memory-backend adapter: write-gate enforcement", () => {
     expect(storage.data.size).toBe(0);
   });
 
+  it("does not combine a prose keyword with a generated record identifier", () => {
+    const adapter = makeAdapter(new MemoryStorage());
+    const screen = adapter.screenPassage(
+      {
+        passage_id: "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789_-AbCdE",
+        text: "Never paste a secret into an operator memory file.",
+      },
+      "user_content",
+    );
+    expect(screen).toEqual({ ok: true });
+  });
+
+  it("keeps metadata key/value pairs in one entropy-classifier context", () => {
+    const adapter = makeAdapter(new MemoryStorage());
+    const screen = adapter.screenPassage(
+      {
+        passage_id: "metadata-secret",
+        text: "ordinary note",
+        metadata: [{
+          key: "credential",
+          value: "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789_-AbCdE",
+        }],
+      },
+      "user_content",
+    );
+    expect(screen).toMatchObject({ ok: false, category: "classifier_reject" });
+  });
+
   it("rejects unpaired surrogates before writing", async () => {
     const storage = new MemoryStorage();
     const adapter = makeAdapter(storage);

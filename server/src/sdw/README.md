@@ -33,7 +33,8 @@ reach the store."
 The classifier in `write-gate.ts` is a heuristic backstop, **not** the guarantee.
 It canonicalizes the whole record (fields + nested values + metadata) before
 scanning and *flags* several common high-signal shapes — PEM/private-key markers
-(including split across non-adjacent fields), encoded Ed25519 PKCS8 prefixes,
+(including split across non-adjacent fields), encoded or explicitly labeled
+Ed25519 key material, explicitly labeled Sanctuary recovery-key material,
 checksum-valid GitHub tokens, common provider token prefixes, JWTs, URL-embedded
 credentials, and keyword-gated high-entropy blobs. A classifier hit fails closed;
 a classifier **pass is never a guarantee** that arbitrary free text contains no
@@ -47,6 +48,17 @@ secret. Known, deliberate false negatives (documented, not bugs):
   a hash length may pass even when a secret-ish keyword is nearby.
 - The split-marker reassembly covers PEM private-key markers; it does not attempt
   to reassemble arbitrary secrets fragmented across fields.
+- Keyword-gated entropy is evaluated within each string field (and within each
+  metadata key/value pair), not across the canonical record. This prevents a
+  prose word such as `secret` from turning an unrelated generated record ID
+  into a false positive. Generic secret material split across unrelated fields
+  may pass unless provenance or another high-signal detector rejects it.
+- Names such as `principal_policy`, `recovery key`, `SANCTUARY_RECOVERY_KEY`,
+  and `Ed25519 private key` are allowed in ordinary prose. Policy and key
+  provenance remains fail-closed, while the classifier rejects labeled key
+  values only when they have a concrete 32-byte base64url or hex shape.
+  Arbitrary copied policy text or malformed/legacy key encodings may therefore
+  pass when a caller bypasses the provenance minters.
 
 Free text that never passes through a source minter is covered **only** by this
 heuristic backstop. Closing these gaps fully is the consumer-integration
