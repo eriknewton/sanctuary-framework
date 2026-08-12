@@ -330,6 +330,7 @@ const DEFAULT_CHECKPOINT_INTERVAL = 100;
 const MIN_IN_MEMORY_ENTRY_FLOOR = 256;
 const AUDIT_NAMESPACE = "_audit";
 const AUDIT_CHECKPOINT_NAMESPACE = "_audit_checkpoints";
+const AUDIT_META_NAMESPACE = "_meta";
 // F3: reserved storage key for the single MAC-authenticated rotation checkpoint.
 // Stored alongside the (optionally-signed) checkpoint records but addressed by a
 // fixed key that does NOT match the `audit-checkpoint-`/`legacy-anchor-` prefixes
@@ -675,7 +676,7 @@ export async function probeAuditHeadAnchor(
   // glaring, separately-detectable full-wipe residual, not a quiet splice.
   let established = false;
   try {
-    if ((await storage.read("_meta", AUDIT_HEAD_ANCHOR_ESTABLISHED_KEY)) !== null) {
+    if ((await storage.read(AUDIT_META_NAMESPACE, AUDIT_HEAD_ANCHOR_ESTABLISHED_KEY)) !== null) {
       established = true;
     }
   } catch {
@@ -1407,7 +1408,7 @@ export async function writeAuditStoreSplitEstablishedMarker(
     mac: toBase64url(auditStoreSplitEstablishedMacBytes(macKey)),
   };
   await storage.write(
-    "_meta",
+    AUDIT_META_NAMESPACE,
     AUDIT_STORE_SPLIT_ESTABLISHED_META_KEY,
     stringToBytes(JSON.stringify(envelope))
   );
@@ -1435,7 +1436,7 @@ export async function readAuditStoreSplitEstablishedMarker(
 ): Promise<"present" | "absent" | "invalid_or_unreadable"> {
   let raw: Uint8Array | null;
   try {
-    raw = await storage.read("_meta", AUDIT_STORE_SPLIT_ESTABLISHED_META_KEY);
+    raw = await storage.read(AUDIT_META_NAMESPACE, AUDIT_STORE_SPLIT_ESTABLISHED_META_KEY);
   } catch {
     // A read error cannot prove absence; a present-but-unreadable marker is
     // exactly the tamper case. Fail closed.
@@ -2341,7 +2342,7 @@ export class AuditLog {
             try {
               this.assertAuditWriteLockActive(signal);
               await this.storage.write(
-                "_meta",
+                AUDIT_META_NAMESPACE,
                 AUDIT_POST_SPLIT_SUFFIX_ESTABLISHED_KEY,
                 stringToBytes("1")
               );
@@ -2961,7 +2962,7 @@ export class AuditLog {
       );
     }
     await this.storage.write(
-      "_meta",
+      AUDIT_META_NAMESPACE,
       AUDIT_HEAD_ANCHOR_ESTABLISHED_KEY,
       stringToBytes("1")
     );
@@ -3209,7 +3210,7 @@ export class AuditLog {
   private async postSplitSuffixWasEstablished(): Promise<boolean> {
     try {
       const raw = await this.storage.read(
-        "_meta",
+        AUDIT_META_NAMESPACE,
         AUDIT_POST_SPLIT_SUFFIX_ESTABLISHED_KEY
       );
       return raw !== null;
@@ -3224,7 +3225,7 @@ export class AuditLog {
     if (hasAuditEntries) return true;
     if (
       await this.storage
-        .exists("_meta", AUDIT_HEAD_ANCHOR_ESTABLISHED_KEY)
+        .exists(AUDIT_META_NAMESPACE, AUDIT_HEAD_ANCHOR_ESTABLISHED_KEY)
         .catch(() => false)
     ) {
       return true;
@@ -4158,31 +4159,44 @@ export class AuditLog {
     const signal: AuditWriteLockAbortSignal = { aborted: false };
     if (!this.auditWriteLockPath) return operation(signal);
 
-    const auditNamespaceDir =
-      this.filesystemCapabilities!.namespacePath(AUDIT_NAMESPACE);
-    const firstCreated = await mkdir(auditNamespaceDir, {
-      recursive: true,
-      mode: 0o700,
-    });
-    if (this.createOwner !== undefined) {
-      if (firstCreated !== undefined) {
-        /**
-         * Fortress-ownership spec 2026-07-30: recursive mkdir as root creates
-         * the missing namespace chain root-owned 0700; files inside are
-         * operator-owned but the operator cannot traverse the directories.
-         */
-        await this.createOwnerChownDirChain(
-          firstCreated,
-          auditNamespaceDir,
-          this.createOwner,
-        );
-      } else {
-        // PR #1084 gate F2: retry must not launder a failed handback. See
-        // {@link verifyOrRepairNamespaceDirOwnership}.
-        await this.verifyOrRepairNamespaceDirOwnership(
-          auditNamespaceDir,
-          this.createOwner,
-        );
+    // A single append writes one chained entry, its durable head anchor, and
+    // the durable "anchor established" marker. Owner-mode FilesystemStorage
+    // deliberately refuses to create a missing parent as root, so ALL three
+    // namespace directories must exist (and be handed back to the fortress
+    // owner) before the append starts. Initializing only `_audit` made the
+    // first safe-mode boot append fail successively on `_audit_checkpoints`
+    // and `_meta` in a genuinely fresh fortress.
+    for (const namespace of [
+      AUDIT_NAMESPACE,
+      AUDIT_CHECKPOINT_NAMESPACE,
+      AUDIT_META_NAMESPACE,
+    ]) {
+      const namespaceDir =
+        this.filesystemCapabilities!.namespacePath(namespace);
+      const firstCreated = await mkdir(namespaceDir, {
+        recursive: true,
+        mode: 0o700,
+      });
+      if (this.createOwner !== undefined) {
+        if (firstCreated !== undefined) {
+          /**
+           * Fortress-ownership spec 2026-07-30: recursive mkdir as root creates
+           * the missing namespace chain root-owned 0700; files inside are
+           * operator-owned but the operator cannot traverse the directories.
+           */
+          await this.createOwnerChownDirChain(
+            firstCreated,
+            namespaceDir,
+            this.createOwner,
+          );
+        } else {
+          // PR #1084 gate F2: retry must not launder a failed handback. See
+          // {@link verifyOrRepairNamespaceDirOwnership}.
+          await this.verifyOrRepairNamespaceDirOwnership(
+            namespaceDir,
+            this.createOwner,
+          );
+        }
       }
     }
     // Once-per-process: GC any `.acquire.*.tmp` a prior process's crash/kill-9

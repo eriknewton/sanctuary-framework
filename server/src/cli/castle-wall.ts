@@ -4729,6 +4729,37 @@ async function runArmDisarmInner(
 
   const invoke = ctx.hostAppInvoke ?? defaultArmInvoke(ctx, action);
   const cliGitSha = resolveCliBuildSha(env, ctx);
+  if (action === "enable") {
+    // Identity is a PRECONDITION to mutation, not a postcondition. The old
+    // ordering invoked `--headless enable` first and only then rejected a
+    // stale deployed app, which could leave the NE preference enabled while
+    // returning failure before the authenticated arm lease was sent. Read the
+    // deployed app's identity through the non-mutating status action first;
+    // any missing/mismatched identity refuses without calling enable.
+    const identityProbe = await invoke(resolved.path, ["--headless", "status"]);
+    if (identityProbe.stderr.trim()) {
+      write(err, identityProbe.stderr.trimEnd() + "\n");
+    }
+    const identityReport = parseHeadlessReport(identityProbe.stdout);
+    if (!identityReport) {
+      const detail =
+        identityProbe.stderr.trim() ||
+        `host app status exited with code ${identityProbe.exitCode}`;
+      write(
+        err,
+        `castle-wall enable failed before arming: deployed app identity could not be verified (${detail}).\n`,
+      );
+      return 1;
+    }
+    const buildMismatch = validateHeadlessBuildIdentity(
+      identityReport,
+      cliGitSha,
+    );
+    if (buildMismatch) {
+      write(err, `castle-wall enable failed before arming: ${buildMismatch}\n`);
+      return 1;
+    }
+  }
   const headlessArgs = ["--headless", action];
   if (action === "enable") {
     if (parsed.noTtl) headlessArgs.push("--no-ttl");

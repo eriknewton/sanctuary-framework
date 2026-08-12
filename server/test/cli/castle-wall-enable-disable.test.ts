@@ -1174,6 +1174,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
     expect(code).toBe(0);
     expect(out.text()).toContain("Castle Wall armed");
     expect(calls).toEqual([
+      [hostAppPath, "--headless", "status"],
       [hostAppPath, "--headless", "enable", "--no-ttl"],
       [hostAppPath, "--headless", "status"],
     ]);
@@ -1249,6 +1250,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
     const { hostAppPath, env } = await makeFixture();
     const err = new CaptureStream();
     const { invoke } = makeInvoker({
+      status: { stdout: reportLine("status", "disabled", true), exitCode: 0 },
       enable: {
         stdout: reportLine("enable", "needs_user_approval", false, "consent missing"),
         exitCode: 3,
@@ -1435,8 +1437,8 @@ describe("castle-wall enable/disable CLI verbs", () => {
   it("fails loud when the deployed app omits the headless build identity", async () => {
     const { hostAppPath, env } = await makeFixture();
     const err = new CaptureStream();
-    const { invoke } = makeInvoker({
-      enable: { stdout: legacyReportLine("enable", "enabled", true), exitCode: 0 },
+    const { invoke, calls } = makeInvoker({
+      status: { stdout: legacyReportLine("status", "disabled", true), exitCode: 0 },
     });
 
     const code = await runEnable(["--force", "--no-ttl"], {
@@ -1453,14 +1455,15 @@ describe("castle-wall enable/disable CLI verbs", () => {
     expect(code).toBe(1);
     expect(err.text()).toContain("did not report a headless build identity");
     expect(err.text()).toContain("rebuild + redeploy");
+    expect(calls.map((call) => call[2])).toEqual(["status"]);
   });
 
   it("fails loud when the deployed app build does not match the CLI build", async () => {
     const { hostAppPath, env } = await makeFixture();
     const err = new CaptureStream();
-    const { invoke } = makeInvoker({
-      enable: {
-        stdout: reportLine("enable", "enabled", true, undefined, {
+    const { invoke, calls } = makeInvoker({
+      status: {
+        stdout: reportLine("status", "disabled", true, undefined, {
           git_sha: "stale-app-sha",
           headless_contract_version: CASTLE_WALL_HEADLESS_CONTRACT_VERSION,
         }),
@@ -1482,6 +1485,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
     expect(code).toBe(1);
     expect(err.text()).toContain("deployed app stale-app-sha != CLI test-build-sha");
     expect(err.text()).toContain("rebuild + redeploy");
+    expect(calls.map((call) => call[2])).toEqual(["status"]);
   });
 
   it("disarm treats an inconclusive post-change verification as success (dead-man lever)", async () => {
@@ -1759,8 +1763,9 @@ describe("castle-wall enable/disable CLI verbs", () => {
 
     expect(code).toBe(0);
     expect(out.text()).toContain("Castle Wall armed");
-    // Both the mutation and the post-change verification routed through `open`.
-    expect(openArgs).toHaveLength(2);
+    // The read-only identity preflight, mutation, and post-change verification
+    // all route through `open`.
+    expect(openArgs).toHaveLength(3);
     expect(openArgs[0]).toEqual([
       "open",
       "-n",
@@ -1768,11 +1773,15 @@ describe("castle-wall enable/disable CLI verbs", () => {
       hostAppPath, // no `.app` in the temp fixture path → bundle resolves to the binary
       "--args",
       "--headless",
+      "status",
+      `--report-file=${reportPath}`,
+    ]);
+    expect(openArgs[1]!.slice(-3)).toEqual([
       "enable",
       "--no-ttl",
       `--report-file=${reportPath}`,
     ]);
-    expect(openArgs[1]!.slice(-2)).toEqual(["status", `--report-file=${reportPath}`]);
+    expect(openArgs[2]!.slice(-2)).toEqual(["status", `--report-file=${reportPath}`]);
   });
 
   // ── Confined-agent egress (design 2026-07-10, section 5 layer 2): the
@@ -2018,7 +2027,13 @@ describe("castle-wall enable/disable CLI verbs", () => {
       expect(out.text()).toContain("Deny-all quarantine smoke passed");
       expect(preflightUid).toBe(502);
       expect(probeInput).toMatchObject({ agentUid: 502, host: "example.com", port: 443 });
-      expect(events).toEqual(["preflight:502", "invoke:enable", "invoke:status", "smoke:502"]);
+      expect(events).toEqual([
+        "preflight:502",
+        "invoke:status",
+        "invoke:enable",
+        "invoke:status",
+        "smoke:502",
+      ]);
 
       const storage = new FilesystemStorage(join(fixture.fortressPath, "state"));
       const { establishMaster } = await import("../../src/core/master-custody.js");
