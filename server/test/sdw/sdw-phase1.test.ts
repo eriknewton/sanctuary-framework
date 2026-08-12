@@ -70,11 +70,13 @@ describe("SDW Phase 1 write gate", () => {
     }
   });
 
-  it("rejects policy and key-like text without echoing matched material", () => {
+  it("rejects key material without echoing matched material", () => {
     const fixtures = [
-      "principal_policy:\n  deny: everything",
       "-----BEGIN ED25519 PRIVATE KEY-----\nabc\n-----END ED25519 PRIVATE KEY-----",
-      "SANCTUARY_RECOVERY_KEY=abcd",
+      "SANCTUARY_RECOVERY_KEY=AbCdEfGhIjKlMnOpQrStUvWxYz0123456789_-AbCdE",
+      "recovery key 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "ed25519 private key AbCdEfGhIjKlMnOpQrStUvWxYz0123456789_-AbCdE",
+      "ed25519 private key: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
     ];
     for (const fixture of fixtures) {
       const record = workingStateRecord("state1", fixture);
@@ -124,7 +126,10 @@ describe("SDW Phase 1 write gate", () => {
     );
     const forgedSecret = {
       ...persistable,
-      record: workingStateRecord("state2", "SANCTUARY_RECOVERY_KEY=abcd"),
+      record: workingStateRecord(
+        "state2",
+        "SANCTUARY_RECOVERY_KEY=AbCdEfGhIjKlMnOpQrStUvWxYz0123456789_-AbCdE",
+      ),
       storageKey: stateKey("task", "state2"),
     } as any;
     await expect(

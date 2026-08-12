@@ -213,7 +213,7 @@ describe("SDW memory file tools", () => {
     const source = await copyFixtureSet("basic", "cc-memory-tool-skip");
     await writeFile(
       join(source, "note-with-secret.md"),
-      "# Ops note\n\nThe principal policy file lives in the fortress root.\n",
+      "# Ops note\n\nSANCTUARY_RECOVERY_KEY=AbCdEfGhIjKlMnOpQrStUvWxYz0123456789_-AbCdE\n",
     );
 
     const ingested = parse(
@@ -394,7 +394,7 @@ describe("SDW memory file tools", () => {
     });
   });
 
-  it("reports missing Claude Code index files in MCP emit results and audit", async () => {
+  it("preserves a Claude Code index that mentions principal policy in prose", async () => {
     const { tools, auditCalls } = await makeTools();
     const source = await copyFixtureSet("basic", "cc-memory-tool-index-skip");
     await writeFile(
@@ -406,22 +406,20 @@ describe("SDW memory file tools", () => {
     const ingested = parse(
       await tools.get("memory_ingest")!.handler({ harness: "claude-code", dir: source }),
     );
-    expect(ingested.complete).toBe(false);
-    expect(ingested.skipped).toEqual([
-      expect.objectContaining({ source_path: "MEMORY.md", reason: "classifier_reject" }),
-    ]);
+    expect(ingested.complete).toBe(true);
+    expect(ingested.skipped).toEqual([]);
 
     const emitted = parse(
       await tools.get("memory_emit")!.handler({ harness: "claude-code", dir: output }),
     );
     expect(emitted.emitted).toBe(true);
-    expect(emitted.index_present).toBe(false);
+    expect(emitted.index_present).toBe(true);
     const emittedPaths = (emitted.files as Array<{ source_path: string }>).map(
       (file) => file.source_path,
     );
-    expect(emittedPaths).not.toContain("MEMORY.md");
+    expect(emittedPaths).toContain("MEMORY.md");
     expect(auditCalls.find((call) => call.operation === "memory_emit")!.details)
-      .toMatchObject({ index_present: false });
+      .toMatchObject({ index_present: true });
   });
 
   it("denies unsupported harness values without touching the adapter", async () => {

@@ -286,7 +286,7 @@ describe("memory file CLI: fortress-backed round trip", () => {
     const source = await copyFixtureSet("basic", "memfile-cli-skip-source");
     await writeFile(
       join(source, "note-with-secret.md"),
-      "# Ops note\n\nThe principal policy file lives in the fortress root.\n",
+      "# Ops note\n\nSANCTUARY_RECOVERY_KEY=AbCdEfGhIjKlMnOpQrStUvWxYz0123456789_-AbCdE\n",
     );
 
     const out = makeSink();
@@ -316,7 +316,7 @@ describe("memory file CLI: fortress-backed round trip", () => {
     const source = await copyFixtureSet("basic", "memfile-cli-index-skip-source");
     await writeFile(
       join(source, "MEMORY.md"),
-      "# Memory index\n\nThe principal policy file lives in the fortress root.\n",
+      "# Memory index\n\nSANCTUARY_RECOVERY_KEY=AbCdEfGhIjKlMnOpQrStUvWxYz0123456789_-AbCdE\n",
     );
     const output = await tempDir("memfile-cli-index-output");
 

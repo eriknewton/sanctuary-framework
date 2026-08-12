@@ -629,8 +629,8 @@ test/sdw/memory-tools-wiring.test.ts(23,8): error TS2459: Module '"../../src/pri
 test/sdw/sdw-d2-export-import.test.ts(1240,7): error TS2322: Type 'Record<string, unknown> | Promise<Record<string, unknown>>' is not assignable to type 'Record<string, unknown>'.
 test/sdw/sdw-d2-export-import.test.ts(1263,7): error TS2322: Type 'Record<string, unknown> | Promise<Record<string, unknown>>' is not assignable to type 'Record<string, unknown>'.
 test/sdw/sdw-d2-export-import.test.ts(1277,7): error TS2322: Type 'Record<string, unknown> | Promise<Record<string, unknown>>' is not assignable to type 'Record<string, unknown>'.
-test/sdw/sdw-phase1.test.ts(312,47): error TS2345: Argument of type '"catalog.future"' is not assignable to parameter of type '"catalog.environment"'.
-test/sdw/sdw-phase1.test.ts(345,64): error TS2554: Expected 2 arguments, but got 3.
+test/sdw/sdw-phase1.test.ts(317,47): error TS2345: Argument of type '"catalog.future"' is not assignable to parameter of type '"catalog.environment"'.
+test/sdw/sdw-phase1.test.ts(350,64): error TS2554: Expected 2 arguments, but got 3.
 test/security/agent-audit-allowlist.test.ts(149,15): error TS2352: Conversion of type 'AgentAuditView' to type 'Record<string, unknown>' may be a mistake because neither type sufficiently overlaps with the other. If this was intentional, convert the expression to 'unknown' first.
 test/security/agent-audit-allowlist.test.ts(150,15): error TS2352: Conversion of type 'AgentAuditView' to type 'Record<string, unknown>' may be a mistake because neither type sufficiently overlaps with the other. If this was intentional, convert the expression to 'unknown' first.
 test/security/agent-audit-allowlist.test.ts(349,15): error TS2352: Conversion of type 'AgentAuditView' to type 'Record<string, unknown>' may be a mistake because neither type sufficiently overlaps with the other. If this was intentional, convert the expression to 'unknown' first.
