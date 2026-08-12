@@ -11,9 +11,12 @@ import {
   ReputationBundleVerificationError,
   ReputationStore,
   ReputationStoreQuotaError,
+  ReputationAlreadyRecordedError,
+  ReputationIdOccupiedUnverifiedError,
   trustedSovereigntyTier,
   type InteractionOutcome,
   type ReputationStoreTestOverrides,
+  type ReputationInLockAuditEmit,
   type StoredAttestation,
 } from "./reputation-store.js";
 import {
@@ -303,7 +306,51 @@ export function createReputationTools(
           new Set(requireLocalDidEncodings(identity.public_key))
         );
 
+        // LD6 BP-DEADLINE-03 (V2-2/V2-5): the success audit is threaded in
+        // as an `InLockAuditEmit` closure and runs INSIDE record()'s
+        // admission lock (either right after the write, or as the
+        // reconcile step on an already-committed retry -- see
+        // ReputationInLockAuditEmit's doc). Captures ONLY `auditLog` +
+        // primitive locals -- never `reputationStore` -- so re-entry into any
+        // store's admission lock from inside it does not happen HERE, by
+        // CONVENTION, not by a type-system guarantee -- see
+        // ReputationInLockAuditEmit's doc for why the callback type cannot
+        // enforce this on its own (V2-5 gap-5).
+        //
+        // Reconcile-audit fidelity (fix-round, closes a three-way
+        // divergence): every field below reads from `projection`, NEVER
+        // from the outer `outcome`/`tierMeta` closure captures. On the
+        // reconcile branch (an already-committed retry), `projection`
+        // carries the EXISTING stored attestation's own outcome/tier --
+        // the same values the caller-visible `already_committed` result
+        // returns and the durable record holds. A same-tuple retry with a
+        // DIFFERENT incoming outcome must still audit the STORED truth, or
+        // caller-result / durable-write / audit-entry disagree, which is
+        // the exact divergence class this admission-completion fix exists
+        // to close.
+        const emitAudit: ReputationInLockAuditEmit = async (projection) => {
+          // F4 (fix-round-2, tag-based dedupe): a reconcile re-emission is
+          // TAGGED rather than deduped by an in-lock audit-log read -- see
+          // ReputationRecordAuditProjection's `reconcile` doc.
+          await auditLog.appendCritical({
+            layer: "l4",
+            operation: "reputation_record",
+            identity_id: identity.identity_id,
+            result: "success",
+            details: {
+              attestation_id: projection.attestation_id,
+              interaction_id: projection.interaction_id,
+              outcome_type: projection.outcome_type,
+              outcome_result: projection.outcome_result,
+              context: projection.context,
+              sovereignty_tier: projection.sovereignty_tier,
+              ...(projection.reconcile ? { reconcile: true } : {}),
+            },
+          });
+        };
+
         let stored;
+        let alreadyCommitted = false;
         try {
           stored = await reputationStore.record(
             args.interaction_id as string,
@@ -325,13 +372,38 @@ export function createReputationTools(
             // chokepoint bound (reputation-store.ts) — never `identity_id`,
             // which is Tier-3 `identity_create`-mintable and would let a
             // caller reset its quota by minting a fresh identity per call.
-            callerIdentity
+            callerIdentity,
+            undefined, // additionalQuotaCheck: reputation_record has none of its own
+            emitAudit
           );
         } catch (err) {
           if (err instanceof BridgeAttestationMetricValidationError) {
             return toolResult({ error: err.message });
           }
-          if (err instanceof ReputationStoreQuotaError) {
+          // LD6 BP-DEADLINE-03 (Erik-ratified caller-semantic change): a
+          // repeated (interaction_id, participant_did, counterparty_did,
+          // context) tuple is now an idempotent retry -- mirrors
+          // bridge_attest's existing `already_attested` shape -- rather than
+          // minting a second attestation. The structural existence guard
+          // inside record() rejects with this error; return the EXISTING
+          // record instead of treating it as a failure.
+          if (err instanceof ReputationAlreadyRecordedError) {
+            stored = err.existing;
+            alreadyCommitted = true;
+          } else if (err instanceof ReputationIdOccupiedUnverifiedError) {
+            void auditLog.append(
+              "l4",
+              "reputation_record_id_occupied_unverified",
+              identity.identity_id,
+              {
+                interaction_id: args.interaction_id,
+                context,
+                caller_identity: callerIdentity,
+              },
+              "failure"
+            );
+            return toolResult({ error: err.message });
+          } else if (err instanceof ReputationStoreQuotaError) {
             // `admission_busy` (LD3 gate fix-round-2, MUST-FIX 3) is
             // distinct from `scan_unavailable`: this call never even
             // reached the quota scan, refused instead at the store's
@@ -355,31 +427,28 @@ export function createReputationTools(
               "failure"
             );
             return toolResult({ error: err.message });
+          } else {
+            throw err;
           }
-          throw err;
         }
 
-        await auditLog.appendCritical({
-          layer: "l4",
-          operation: "reputation_record",
-          identity_id: identity.identity_id,
-          result: "success",
-          details: {
-            interaction_id: args.interaction_id,
-            outcome_type: outcome.type,
-            outcome_result: outcome.result,
-            context,
-            sovereignty_tier: tierMeta.sovereignty_tier,
-          },
-        });
-
+        // LD6 BP-DEADLINE-03: the success audit for a NEW record (or the
+        // reconciled audit for an already-committed one) is already emitted
+        // INSIDE record()'s admission lock via `emitAudit` above -- no
+        // second, out-of-lock append here.
         return toolResult({
           attestation_id: stored.attestation.attestation_id,
           interaction_id: stored.attestation.data.interaction_id,
           self_attestation: stored.attestation.signature,
-          sovereignty_tier: tierMeta.sovereignty_tier,
+          sovereignty_tier: stored.attestation.data.sovereignty_tier,
           context,
           recorded_at: stored.recorded_at,
+          // LD6 BP-DEADLINE-03 (Erik decision 3): a caller that retries the
+          // identical (interaction_id, participant_did, counterparty_did,
+          // context) tuple is told this was already recorded, rather than
+          // getting a second record -- the retry-safe result shape a
+          // timed-out caller relies on.
+          already_committed: alreadyCommitted,
         });
       },
     },

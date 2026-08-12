@@ -541,10 +541,22 @@ describe("Concordia Bridge", () => {
       expect(commitment.pedersen_commitment!.blinding_factor).toBeTruthy();
     });
 
-    it("produces unique commitment IDs", () => {
+    it("commitment IDs are content-derived: identical (session_id, terms_hash, committer_did) always produce the SAME id (LD6 BP-DEADLINE-03)", () => {
+      // The id is deterministic from the tuple that identifies the
+      // negotiation, not random per call -- this is the property that lets
+      // a timed-out bridge_commit retry safely (see BridgeStore's
+      // existence guard, bridge/tools.ts). Two mints of the identical
+      // outcome/identity therefore collide on purpose.
       const outcome = makeOutcome();
       const c1 = createBridgeCommitment(outcome, identity, identityEncKey);
       const c2 = createBridgeCommitment(outcome, identity, identityEncKey);
+
+      expect(c1.bridge_commitment_id).toBe(c2.bridge_commitment_id);
+    });
+
+    it("commitment IDs differ when the identifying tuple differs", () => {
+      const c1 = createBridgeCommitment(makeOutcome({ session_id: "session-a" }), identity, identityEncKey);
+      const c2 = createBridgeCommitment(makeOutcome({ session_id: "session-b" }), identity, identityEncKey);
 
       expect(c1.bridge_commitment_id).not.toBe(c2.bridge_commitment_id);
     });
@@ -1236,7 +1248,12 @@ describe("Concordia Bridge", () => {
       ).toBe(1);
 
       // Now the dedup scan cannot read the store: the second attest must DENY,
-      // not record a second attestation.
+      // not record a second attestation. LD6 BP-DEADLINE-03: the dedup is
+      // now record()'s own in-lock existence guard, whose primary step is a
+      // content-id READ (not the old namespace LIST) -- a read fault there
+      // surfaces as ReputationStoreQuotaError("scan_unavailable")'s "could
+      // not confirm quota headroom" text rather than the old dedup-specific
+      // wording, so the regex covers both fail-closed phrasings.
       failReputationReads = true;
       const second = parseToolResult(
         await byName("bridge_attest").handler({
@@ -1245,7 +1262,7 @@ describe("Concordia Bridge", () => {
           identity_id: signer.publicIdentity.identity_id,
         })
       );
-      expect(second.error).toMatch(/could not be fully read|not recorded/i);
+      expect(second.error).toMatch(/could not be fully read|not recorded|could not confirm/i);
       expect(second.attestation_id).toBeUndefined();
 
       // No second attestation was written: still exactly one on record.

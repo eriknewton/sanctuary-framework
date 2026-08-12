@@ -21,14 +21,48 @@ import { createCommitment, verifyCommitment } from "../disclosure/commitments.js
 import { createPedersenCommitment, verifyPedersenCommitment } from "../disclosure/zk-proofs.js";
 import { sign, verify } from "../core/identity.js";
 import { toBase64url, fromBase64url, stringToBytes } from "../core/encoding.js";
-import { randomBytes } from "../core/random.js";
 import { hash } from "../core/hashing.js";
+import { deriveContentId } from "../core/content-id.js";
 import type { StoredIdentity } from "../core/identity.js";
 import type {
   ConcordiaOutcome,
   BridgeCommitment,
   BridgeVerificationResult,
 } from "./types.js";
+
+/**
+ * LD6 BP-DEADLINE-03 (Admission_Completion_Design_Brief_2026-08-11.md V2-3):
+ * bridge commitment ids are content-derived from `(session_id, terms_hash,
+ * committer_did)` rather than random, so a retried `bridge_commit` for the
+ * SAME negotiation resolves to the SAME key instead of minting a duplicate.
+ * `sanctuary.bridge.commitment` is the domain label; `.v1` is this
+ * derivation's version -- bump the suffix (never reuse `v1`) if the tuple or
+ * framing ever changes, so old and new ids can never collide in one
+ * namespace. CROSS-FILE PIN: the existence guard in bridge/tools.ts
+ * (`BridgeStore.save`) recomputes this SAME id from a stored record's own
+ * fields to verify intent before honoring `already_committed` -- the tag and
+ * tuple order here must stay in lockstep with that recomputation.
+ */
+export const BRIDGE_COMMITMENT_ID_DOMAIN_TAG = "sanctuary.bridge.commitment.v1";
+export const BRIDGE_COMMITMENT_ID_PREFIX = "bridge";
+
+/**
+ * The ONE place the bridge id tuple/order is assembled, so
+ * `createBridgeCommitment` (minting) and `BridgeStore`'s existence guard
+ * (bridge/tools.ts, recomputing from a STORED record's own fields to verify
+ * intent) can never drift apart on field order.
+ */
+export function deriveBridgeCommitmentId(
+  sessionId: string,
+  termsHash: string,
+  committerDid: string
+): string {
+  return deriveContentId(BRIDGE_COMMITMENT_ID_PREFIX, BRIDGE_COMMITMENT_ID_DOMAIN_TAG, [
+    sessionId,
+    termsHash,
+    committerDid,
+  ]);
+}
 
 // ─── Canonical Serialization ─────────────────────────────────────────────
 // Deterministic JSON serialization of the ConcordiaOutcome for commitment.
@@ -113,7 +147,6 @@ export function createBridgeCommitment(
   identityEncryptionKey: Uint8Array,
   includePedersen: boolean = false
 ): BridgeCommitment {
-  const commitmentId = `bridge-${Date.now()}-${toBase64url(randomBytes(8))}`;
   const now = new Date().toISOString();
 
   // 0. Recompute terms_hash and fail closed on mismatch.
@@ -127,6 +160,16 @@ export function createBridgeCommitment(
   if (computedTermsHash !== outcome.terms_hash) {
     throw new Error("terms_hash does not match the canonical terms serialization");
   }
+
+  // LD6 BP-DEADLINE-03: content-derived id, computed BEFORE signing (the
+  // signature below binds this id inside commitmentPayload) so a retry of
+  // this SAME (session_id, terms_hash, committer_did) tuple always produces
+  // the SAME id, never a fresh random one. `computedTermsHash` (not
+  // `outcome.terms_hash`) is used here even though the equality check above
+  // already proved them equal, so the id is derived from the value THIS
+  // function computed rather than trusting the caller-supplied field a
+  // second time.
+  const commitmentId = deriveBridgeCommitmentId(outcome.session_id, computedTermsHash, identity.did);
 
   // 1. Canonical serialization of the outcome
   const canonicalBytes = canonicalize(outcome);
