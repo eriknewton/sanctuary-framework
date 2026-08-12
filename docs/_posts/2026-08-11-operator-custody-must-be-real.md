@@ -3,6 +3,7 @@ title: "Operator Custody Must Be Real. Let the Agents Spend."
 date: 2026-08-11
 description: "Three tests separate real key custody from custody theater: unilateral export, a working exit, and no provider-side signing path. Run them yourself. Then let the agents spend."
 author: "Erik Newton"
+image: /images/blog/operator-custody-card.png
 ---
 
 The agent-wallet conversation landed on the right question this summer: who controls the keys. I've been barking up this tree long enough that people were starting to worry about me. It's nice to have company.
