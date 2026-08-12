@@ -112,6 +112,34 @@ function filterAttestationsByTimeRange(
   });
 }
 
+/**
+ * Reconcile-branch absence check (LD6 gate fix-round F4): true when the
+ * durable audit log already holds a SUCCESS entry for `operation` whose
+ * `details[idField]` equals `id`. Used by `reputation_record`'s in-lock
+ * audit callback so a guard-hit retry re-emits the success audit ONLY when
+ * it is actually missing (the ratified self-heal semantic), never on every
+ * hit -- an identical-args retry loop must not inflate the success-audit
+ * count N-fold. A query failure propagates (fail closed): the reconcile
+ * caller is refused rather than guessing; the refused caller can retry.
+ * Cross-file pin: must match `auditSuccessEntryExists` in bridge/tools.ts
+ * (local copy here for the usual module-boundary reason -- reputation must
+ * not import from bridge).
+ */
+async function auditSuccessEntryExists(
+  auditLog: AuditLog,
+  operation: string,
+  idField: string,
+  id: string
+): Promise<boolean> {
+  const { entries } = await auditLog.query({
+    operation_type: operation,
+    limit: auditLog.getRetentionConfig().maxEntries,
+  });
+  return entries.some(
+    (entry) => entry.result === "success" && entry.details?.[idField] === id
+  );
+}
+
 async function bridgeMetricPolicyDisclosure(options: {
   reputationStore: ReputationStore;
   attestations: StoredAttestation[];
@@ -329,6 +357,20 @@ export function createReputationTools(
         // the exact divergence class this admission-completion fix exists
         // to close.
         const emitAudit: ReputationInLockAuditEmit = async (projection) => {
+          // F4: on the reconcile branch, append ONLY when the durable
+          // success audit is missing -- see `auditSuccessEntryExists` and
+          // ReputationRecordAuditProjection's `reconcile` doc.
+          if (
+            projection.reconcile &&
+            (await auditSuccessEntryExists(
+              auditLog,
+              "reputation_record",
+              "attestation_id",
+              projection.attestation_id
+            ))
+          ) {
+            return;
+          }
           await auditLog.appendCritical({
             layer: "l4",
             operation: "reputation_record",

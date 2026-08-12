@@ -771,6 +771,19 @@ export interface ReputationRecordAuditProjection {
   outcome_type: string;
   outcome_result: string;
   sovereignty_tier?: SovereigntyTier;
+  /**
+   * True ONLY on the existence-guard reconcile branch (an already-committed
+   * retry), false on a fresh write (LD6 gate fix-round F4 -- must match the
+   * same field on `BridgeCommitmentAuditProjection` in bridge/tools.ts).
+   * The self-heal semantic is "re-emit the success audit when the durable
+   * audit is MISSING," not "append on every guard hit": the callback uses
+   * this flag to query the audit log first and append only on absence, so
+   * an identical-args retry loop cannot inflate the success-audit count
+   * N-fold (posture.ts tallies these entries as an honest lower bound) or
+   * push unbounded critical entries into the maxEntries-pruned log. The
+   * fresh-write path skips the query -- its entry cannot already exist.
+   */
+  reconcile: boolean;
 }
 
 /**
@@ -837,19 +850,51 @@ export interface ReputationStoreTestOverrides {
  * WITHOUT freeing `pendingAdmissionWaiters`' slot either — that slot is
  * held until `fn()` itself settles, so a caller timeout alone cannot let
  * later admissions pile chained closures behind a permanently-hung `fn`.
- * ON_EVICT_AUDIT_TIMEOUT_MS is reused rather than
- * re-derived (it is itself derived from audit-log.ts's two-phase
- * lock-acquisition + write-hold deadline contract — see that constant's
- * doc, core/bounded-map.ts);
- * STORAGE_OP_MARGIN_MS is a defensive backstop for this store's OWN
- * storage.list/read/write calls, which carry no settle-time contract at all
- * (storage/interface.ts). Kept as a LOCAL constant, not imported from
+ * DERIVATION against the section's true worst case (LD6 gate fix-round F2
+ * — the prior comment predated V2-2 and omitted the in-lock audit append
+ * this PR added). record()'s locked section is: existence-guard read + (on
+ * a content-id miss) one full O(N) legacy decrypt-scan +
+ * `assertRecordQuota`'s scan + any caller-supplied `additionalQuotaCheck`
+ * (bridge_attest's origin-context scan) + the record write + one AWAITED
+ * `appendCritical` via `emitAudit`; importBundle()'s locked section is the
+ * batch quota check + its whole write loop, with NO in-lock audit append.
+ * The audit append's own worst case is AUDIT_WRITE_LOCK_TIMEOUT_MS (5s
+ * lock acquisition) + DEFAULT_AUDIT_WRITE_LOCK_HOLD_DEADLINE_MS (30s
+ * write-hold), both operational/audit-log.ts — 35s.
+ * ON_EVICT_AUDIT_TIMEOUT_MS (core/bounded-map.ts) is that same 35s plus a
+ * 5s scheduling margin, i.e. 40s: the established named bound for "one
+ * awaited audit append performed inside a lock," which is exactly
+ * record()'s shape, so it is reused rather than re-derived.
+ * STORAGE_OP_MARGIN_MS (10s) is the defensive backstop for this store's
+ * OWN storage.list/read/write calls (N bounded by MAX_REPUTATION_RECORDS),
+ * which carry no settle-time contract at all (storage/interface.ts); a
+ * backstop, not a precise bound. On the reconcile (guard-hit) branch the
+ * append is replaced by the F4 absence QUERY (an audit-log read over the
+ * retained window, bounded by the log's maxEntries retention cap) plus an
+ * append only when the audit is genuinely missing, so the fresh-write path
+ * stays the section's worst case. Total: the deadline exceeds the audit
+ * append's 35s hard worst case by 15s of margin for everything else.
+ *
+ * ACCEPTED CONSEQUENCE (deliberate, fail-closed): because the audit append
+ * is INSIDE the lock, a slow or contended audit backend serializes
+ * admissions behind it, and callers whose wait crosses this deadline are
+ * REFUSED — an availability cost, never fail-open (auditing outside the
+ * lock reopens the V2-2 told-success-without-durable-audit divergence).
+ * WHY this store and BridgeStore accept the coupling and the sentinel path
+ * does not: `SentinelFindingStore.saveFinding` can ALREADY spend up to
+ * ON_EVICT_AUDIT_TIMEOUT_MS (40s) in-lock on an evict-INTENT append, so a
+ * second in-lock append would worst-case 75s against the same 50s budget —
+ * see the fuller asymmetry note on BRIDGE_STORE_ADMISSION_DEADLINE_MS
+ * (bridge/tools.ts) and sentinel-dispatcher.ts's routeFinding comment.
+ *
+ * Kept as a LOCAL constant, not imported from
  * sentinel-finding-store.ts, for the same module-boundary reason
  * REPUTATION_UNKNOWN_ORIGIN is this file's own constant rather than an
- * import — the two derivations must stay numerically identical, which is
- * why both are pinned to ON_EVICT_AUDIT_TIMEOUT_MS + the same margin
+ * import — the derivations must stay numerically identical, which is
+ * why all are pinned to ON_EVICT_AUDIT_TIMEOUT_MS + the same margin
  * (cross-file pin: must match STORAGE_OP_MARGIN_MS /
  * STORE_ADMISSION_DEADLINE_MS in sentinel-finding-store.ts and
+ * BRIDGE_STORAGE_OP_MARGIN_MS / BRIDGE_STORE_ADMISSION_DEADLINE_MS in
  * bridge/tools.ts).
  *
  * LD5 BP-DEADLINE-01 (closed — this paragraph previously read "ACCEPTED
@@ -1336,6 +1381,9 @@ export class ReputationStore {
         // Reconcile: a record that committed but lost its audit to a prior
         // crash (the V2-2 named residual) gets its audit re-emitted here,
         // on the first retry or existence-guard read that finds it.
+        // `reconcile: true` (LD6 gate fix-round F4) tells the callback to
+        // emit ONLY when the durable audit is actually missing -- see
+        // ReputationRecordAuditProjection's `reconcile` doc.
         if (emitAudit) {
           await emitAudit({
             attestation_id: existing.attestation.attestation_id,
@@ -1348,6 +1396,7 @@ export class ReputationStore {
             outcome_type: existing.attestation.data.outcome_type,
             outcome_result: existing.attestation.data.outcome_result,
             sovereignty_tier: existing.attestation.data.sovereignty_tier,
+            reconcile: true,
           });
         }
         throw new ReputationAlreadyRecordedError(existing);
@@ -1396,6 +1445,9 @@ export class ReputationStore {
           outcome_type: stored.attestation.data.outcome_type,
           outcome_result: stored.attestation.data.outcome_result,
           sovereignty_tier: stored.attestation.data.sovereignty_tier,
+          // Fresh write: this entry cannot already exist, so the callback
+          // appends without the reconcile-branch absence query (F4).
+          reconcile: false,
         });
       }
 
@@ -1461,6 +1513,23 @@ export class ReputationStore {
         // round-trips), so this is occupied-but-unverified, not absence.
         return "occupied_unverified";
       }
+      // DEBT (LD6 gate fix-round F1, import pre-seed vector): importBundle()
+      // deliberately writes at the CALLER-SUPPLIED `attestation.attestation_id`
+      // (the id is not part of the signed attestation bytes, and
+      // `deriveReputationAttestationId` is exported and publicly computable),
+      // so an imported bundle entry can land at exactly the content-derived
+      // key a victim tuple's future record() call will compute. That entry
+      // fails intent verification here (wrong tuple/signature), so this
+      // branch refuses it fail-closed -- correctly -- but the refusal is
+      // PERMANENT: `_reputation` is a reserved namespace with no operator
+      // recovery verb, so the victim tuple can never be recorded until the
+      // squatting entry is removed out-of-band. Bounded by the operator gate
+      // on `reputation_import` (Tier-1, tier1_always_approve: every import is
+      // human-approved), so this is not an unauthenticated-attacker path; the
+      // recovery path (and/or import-id hardening that re-keys or refuses
+      // derived-format ids on import) is OWED as the deferred
+      // import-id-hardening design item -- do not silently re-add id
+      // rewriting to importBundle, which intentionally preserves foreign ids.
       return this.verifyStoredAttestationIntent(candidate, tuple, callerPublicKey, contentId)
         ? candidate
         : "occupied_unverified";
@@ -1532,14 +1601,19 @@ export class ReputationStore {
     ) {
       return false;
     }
-    let sigBytes: Uint8Array;
+    // Fail-closed decode/verify (LD6 gate fix-round F6 -- must match the
+    // try/catch in verifyStoredCommitmentIntent, bridge/tools.ts): a stored
+    // record whose signature is malformed enough to make decode or verify
+    // THROW is exactly as unverified as one that verifies false; the guard
+    // classifies it `occupied_unverified` rather than letting the throw
+    // escape record()'s locked section as an unclassified rejection.
     try {
-      sigBytes = fromBase64urlStrict(stored.attestation.signature);
+      const sigBytes = fromBase64urlStrict(stored.attestation.signature);
+      const dataBytes = stringToBytes(JSON.stringify(d));
+      return verify(dataBytes, sigBytes, callerPublicKey);
     } catch {
       return false;
     }
-    const dataBytes = stringToBytes(JSON.stringify(d));
-    return verify(dataBytes, sigBytes, callerPublicKey);
   }
 
   /**

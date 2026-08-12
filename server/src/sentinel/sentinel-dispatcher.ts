@@ -291,24 +291,62 @@ export class SentinelDispatcher {
     // sentinel-agnostic "condition key" this dispatcher could derive a
     // stable id from without sentinel-specific semantics it does not have,
     // and collapsing distinct ticks' evidence onto one overwritten key would
-    // silently lose that evidence. Still AWAITED (not fire-and-forget)
-    // because the failure must surface loudly to `tick()`'s own
-    // per-sentinel try/catch even though it cannot self-heal.
-    await this.auditLog.appendCritical({
-      layer: "l2",
-      operation: SENTINEL_AUDIT_OPS.FINDING_EMITTED,
-      identity_id: this.identityId,
-      result: "success",
-      details: {
-        sentinel_id: sentinelId,
-        finding_id: stamped.finding_id,
-        severity: stamped.severity,
-        ...(stamped.agent_id !== undefined ? { agent_id: stamped.agent_id } : {}),
-        evidence_audit_ids: stamped.evidence_audit_ids,
-        fortress_id: this.fortressId,
-      },
-    });
+    // silently lose that evidence.
+    //
+    // HONEST BOUND, part 2 (LD6 gate fix-round F3 -- batch isolation): the
+    // append is still AWAITED (never fire-and-forget: the outcome must be
+    // KNOWN before this method reports), but its failure no longer
+    // propagates out of routeFinding. The finding was already durably
+    // persisted by saveFinding above, so suppressing the ANOMALY over an
+    // audit-backend failure inverts the priority: pre-fix, the rejection
+    // escaped into tick()'s per-sentinel catch, which (a) never emitted the
+    // finding to subscribers (the dashboard saw `evaluation_failed` carrying
+    // the audit error INSTEAD of the anomaly) and (b) aborted every
+    // remaining finding in that sentinel's batch -- none persisted, none
+    // audited, none emitted. Now the finding is emitted to subscribers
+    // regardless of audit-append outcome, and an audit failure surfaces as
+    // its OWN `evaluation_failed` diagnostic event alongside the finding
+    // (no `void append` back into the sink that just failed -- that
+    // "surfacing" would be a write into the very backend whose failure it
+    // reports). The durable-write-then-awaited-audit ORDERING is unchanged;
+    // the crash-window no-self-heal residual above is unchanged.
+    let auditAppendError: unknown = null;
+    try {
+      await this.auditLog.appendCritical({
+        layer: "l2",
+        operation: SENTINEL_AUDIT_OPS.FINDING_EMITTED,
+        identity_id: this.identityId,
+        result: "success",
+        details: {
+          sentinel_id: sentinelId,
+          finding_id: stamped.finding_id,
+          severity: stamped.severity,
+          ...(stamped.agent_id !== undefined ? { agent_id: stamped.agent_id } : {}),
+          evidence_audit_ids: stamped.evidence_audit_ids,
+          fortress_id: this.fortressId,
+        },
+      });
+    } catch (err) {
+      auditAppendError = err;
+    }
+    // The finding is durable (saveFinding settled above); subscribers get it
+    // whether or not its audit landed -- the anomaly outranks its paper trail.
     this.emit({ type: "finding", finding: stamped });
+    if (auditAppendError !== null) {
+      const errorMessage =
+        auditAppendError instanceof Error
+          ? auditAppendError.message
+          : String(auditAppendError);
+      this.emit({
+        type: "evaluation_failed",
+        sentinel_id: sentinelId,
+        error_message:
+          `finding audit append failed (finding ${stamped.finding_id} is ` +
+          `durably persisted but its FINDING_EMITTED audit entry is not): ` +
+          errorMessage,
+        observed_at: this.now().toISOString(),
+      });
+    }
     return stamped;
   }
 

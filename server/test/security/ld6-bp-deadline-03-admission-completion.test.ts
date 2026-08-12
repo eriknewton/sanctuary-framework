@@ -216,9 +216,12 @@ async function durableRecordIds(storage: StorageBackend, ns: string): Promise<Se
  * the production instance's in-memory state) and calls `query()`, which
  * reloads persisted entries from `storage` itself -- this is the "reload
  * the on-disk audit chain" oracle V2-6 requires, not an in-memory spy.
- * Audit semantics are at-least-once (a reconcile retry may re-append an
- * already-present success entry, V2-2), so this dedupes by the id field --
- * a `Set` collapses duplicates for free.
+ * Audit semantics are at-least-once across crashes (a reconcile retry
+ * re-appends a success entry when the durable one is MISSING, V2-2; since
+ * the F4 fix it appends ONLY then, never on every guard hit), so this
+ * dedupes by the id field -- a `Set` collapses duplicates for free. Use
+ * `countAuditSuccessEntries` below when the assertion is about the entry
+ * COUNT itself (the F4 no-inflation property), not set membership.
  */
 async function auditSuccessIds(
   storage: StorageBackend,
@@ -235,6 +238,29 @@ async function auditSuccessIds(
     if (typeof value === "string") ids.add(value);
   }
   return ids;
+}
+
+/**
+ * Count of durable SUCCESS audit entries for one record id (same fresh-
+ * instance reload-from-storage oracle as `auditSuccessIds`, without the
+ * Set dedupe). This is the F4 oracle: a guard-hit retry must re-emit the
+ * success audit ONLY when the durable entry is missing, so identical
+ * retries settle at exactly ONE entry -- the mutant (unconditional
+ * reconcile emit) inflates this count N-fold and bloats the maxEntries-
+ * pruned critical log.
+ */
+async function countAuditSuccessEntries(
+  storage: StorageBackend,
+  masterKey: Uint8Array,
+  operation: string,
+  idField: string,
+  id: string
+): Promise<number> {
+  const freshAuditLog = new AuditLog(storage, masterKey);
+  const { entries } = await freshAuditLog.query({ operation_type: operation, limit: 100_000 });
+  return entries.filter(
+    (entry) => entry.result === "success" && entry.details?.[idField] === id
+  ).length;
 }
 
 // ─── Bridge (bridge_commit) ─────────────────────────────────────────────
@@ -483,6 +509,113 @@ describe("LD6 BP-DEADLINE-03: bridge_commit durable admission-completion oracle"
       vi.useRealTimers();
     }
   });
+
+  it("F4 (audit-emit dedupe): two identical successful calls settle at exactly ONE success audit entry -- the reconcile branch emits only when the durable audit is MISSING, never per guard hit", async () => {
+    const rig = setup();
+    await seedIdentities(rig);
+    const outcome = makeOutcome({ session_id: "ld6-f4-dedupe-session" });
+    const args = { ...outcome, identity_id: rig.signer.storedIdentity.identity_id };
+    const commitId = deriveBridgeCommitmentId(
+      outcome.session_id,
+      outcome.terms_hash,
+      rig.signer.publicIdentity.did
+    );
+
+    const first = await callToolSafe(rig.commit, args);
+    expect(first.ok).toBe(true);
+    const second = await callToolSafe(rig.commit, args);
+    expect(second.ok).toBe(true);
+    if (second.ok) expect(second.value.already_committed).toBe(true);
+
+    // Pre-F4 mutant: the removed fast path appended ZERO entries on a
+    // repeat, but the reconcile branch appended one per guard hit -- an
+    // identical-args loop inflated posture.ts's tally N-fold. Exactly one.
+    expect(
+      await countAuditSuccessEntries(
+        rig.storage,
+        rig.masterKey,
+        "bridge_commit",
+        "bridge_commitment_id",
+        commitId
+      )
+    ).toBe(1);
+    expect((await rig.storage.list("_bridge")).length).toBe(1);
+  });
+
+  it("F5 (rule 12, repeated admission waves): a timeout-then-release wave followed by two retry waves of the same tuple commits exactly ONE durable record and ONE success audit, with every caller's visible result in {success, refusal, timeout} and no success without the durable pair", async () => {
+    vi.useFakeTimers();
+    try {
+      // Fault the STORE namespace (`_bridge`), not the audit namespace:
+      // wave 1's record write itself is what detaches past the caller's
+      // deadline -- the exact LD5 BP-DEADLINE-01 schedule, now driven
+      // through to DURABLE-state assertions rather than an in-memory spy.
+      const rig = setup("_bridge");
+      await seedIdentities(rig);
+      const outcome = makeOutcome({ session_id: "ld6-f5-wave-session" });
+      const args = { ...outcome, identity_id: rig.signer.storedIdentity.identity_id };
+      const commitId = deriveBridgeCommitmentId(
+        outcome.session_id,
+        outcome.terms_hash,
+        rig.signer.publicIdentity.did
+      );
+
+      // Wave 1: existence guard + quota scans pass (reads are not faulted),
+      // then the record write parks. The caller's admission deadline fires
+      // while the write is still held: its visible result is a TIMEOUT
+      // rejection, never success.
+      rig.setHolding(true);
+      const wave1 = callToolSafe(rig.commit, args);
+      await flush();
+      expect(rig.pendingCount()).toBe(1); // parked on the _bridge write
+      await vi.advanceTimersByTimeAsync(ADMISSION_DEADLINE_MS);
+      const w1 = await wave1;
+      expect(w1.ok).toBe(false);
+
+      // Release the detached write: the lock was never released early (LD5
+      // BP-DEADLINE-01), so the held fn() now settles -- the write lands
+      // durably and its in-lock success audit lands after it.
+      rig.setHolding(false);
+      rig.releaseNext();
+      await flush();
+
+      // Waves 2 and 3: identical tuple. Each collapses onto wave 1's
+      // committed record via the existence guard (content-derived id) and
+      // reports already_committed -- their quota scans observe the REAL
+      // post-wave-1 state, never stale headroom.
+      const w2 = await callToolSafe(rig.commit, args);
+      const w3 = await callToolSafe(rig.commit, args);
+      expect(w2.ok).toBe(true);
+      if (w2.ok) {
+        expect(w2.value.error).toBeUndefined();
+        expect(w2.value.already_committed).toBe(true);
+        expect(w2.value.bridge_commitment_id).toBe(commitId);
+      }
+      expect(w3.ok).toBe(true);
+      if (w3.ok) {
+        expect(w3.value.error).toBeUndefined();
+        expect(w3.value.already_committed).toBe(true);
+      }
+
+      // DURABLE cap held across the whole fault schedule: exactly one
+      // committed record (quota headroom consumed exactly once) and
+      // exactly one success audit entry (waves 2/3's reconcile found the
+      // durable audit present and did not re-append, F4). Every caller
+      // told success (waves 2/3) has the durable record+audit pair behind
+      // it; wave 1 (no confirmed pair at response time) was refused.
+      expect(await durableRecordIds(rig.storage, "_bridge")).toEqual(new Set([commitId]));
+      expect(
+        await countAuditSuccessEntries(
+          rig.storage,
+          rig.masterKey,
+          "bridge_commit",
+          "bridge_commitment_id",
+          commitId
+        )
+      ).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 // ─── Reputation (bridge_attest) ─────────────────────────────────────────
@@ -660,13 +793,45 @@ describe("LD6 BP-DEADLINE-03: bridge_attest durable admission-completion oracle"
     expect(success?.details?.["sovereignty_tier"]).toBe("unverified");
     expect((await rig.storage.list("_reputation")).length).toBe(1);
   });
+
+  it("F4 (audit-emit dedupe): two identical bridge_attest calls settle at exactly ONE success audit entry -- pre-F4 the removed already_attested fast path's zero-append behavior had regressed into one critical append per identical Tier-3 retry", async () => {
+    const rig = setup();
+    const { commitmentId, outcome } = await seedAndCommit(rig);
+    const attestationId = deriveReputationAttestationId(
+      outcome.session_id,
+      rig.signer.publicIdentity.did,
+      rig.counterparty.publicIdentity.did,
+      "concordia-bridge"
+    );
+
+    for (let i = 0; i < 2; i++) {
+      const result = await callToolSafe(rig.attest, {
+        bridge_commitment_id: commitmentId,
+        outcome_result: "completed",
+        identity_id: rig.signer.storedIdentity.identity_id,
+      });
+      expect(result.ok).toBe(true);
+    }
+
+    expect(
+      await countAuditSuccessEntries(
+        rig.storage,
+        rig.masterKey,
+        "bridge_attest",
+        "attestation_id",
+        attestationId
+      )
+    ).toBe(1);
+    expect((await rig.storage.list("_reputation")).length).toBe(1);
+  });
 });
 
 // ─── Reputation (reputation_record, the general tool) ──────────────────
 
 describe("LD6 BP-DEADLINE-03: reputation_record durable admission-completion oracle", () => {
   function setup(faultNamespace = "_audit") {
-    const { storage, queueRejections } = makeFaultableStorage(faultNamespace);
+    const { storage, queueRejections, setHolding, pendingCount, releaseNext } =
+      makeFaultableStorage(faultNamespace);
     const masterKey = generateRandomKey();
     const identityEncKey = derivePurposeKey(masterKey, "identity-encryption");
     const identityManager = new IdentityManager(storage, masterKey);
@@ -680,6 +845,9 @@ describe("LD6 BP-DEADLINE-03: reputation_record durable admission-completion ora
       signer,
       record: findTool(tools, "reputation_record"),
       queueRejections,
+      setHolding,
+      pendingCount,
+      releaseNext,
     };
   }
 
@@ -810,6 +978,106 @@ describe("LD6 BP-DEADLINE-03: reputation_record durable admission-completion ora
     // a second attestation, it only reconciles the audit for the first.
     expect((await rig.storage.list("_reputation")).length).toBe(1);
   });
+
+  it("F4 (audit-emit dedupe): two identical reputation_record calls settle at exactly ONE success audit entry", async () => {
+    const rig = setup();
+    await seedIdentity(rig);
+    const args = {
+      interaction_id: "ld6-f4-record-dedupe",
+      counterparty_did: "did:sanctuary:counterparty-f4",
+      outcome: { type: "transaction", result: "completed" },
+      context: "general",
+      identity_id: rig.signer.storedIdentity.identity_id,
+    };
+    const attestationId = deriveReputationAttestationId(
+      args.interaction_id,
+      rig.signer.publicIdentity.did,
+      args.counterparty_did,
+      args.context
+    );
+
+    for (let i = 0; i < 2; i++) {
+      const result = await callToolSafe(rig.record, args, rig.signer.publicIdentity.did);
+      expect(result.ok).toBe(true);
+    }
+
+    expect(
+      await countAuditSuccessEntries(
+        rig.storage,
+        rig.masterKey,
+        "reputation_record",
+        "attestation_id",
+        attestationId
+      )
+    ).toBe(1);
+    expect((await rig.storage.list("_reputation")).length).toBe(1);
+  });
+
+  it("F5 (rule 12, repeated admission waves): timeout-then-release plus two retry waves of one tuple commit exactly ONE durable record and ONE success audit -- the shared bounding machinery holds at this site too, not only at the bridge", async () => {
+    vi.useFakeTimers();
+    try {
+      // Fault the STORE namespace (`_reputation`): wave 1's record write
+      // detaches past the caller's deadline, mirroring the bridge-side F5
+      // wave test -- rule 12 requires the fault schedule proven per site
+      // sharing the machinery, not once.
+      const rig = setup("_reputation");
+      await seedIdentity(rig);
+      const args = {
+        interaction_id: "ld6-f5-record-wave",
+        counterparty_did: "did:sanctuary:counterparty-f5",
+        outcome: { type: "transaction", result: "completed" },
+        context: "general",
+        identity_id: rig.signer.storedIdentity.identity_id,
+      };
+      const attestationId = deriveReputationAttestationId(
+        args.interaction_id,
+        rig.signer.publicIdentity.did,
+        args.counterparty_did,
+        args.context
+      );
+
+      rig.setHolding(true);
+      const wave1 = callToolSafe(rig.record, args, rig.signer.publicIdentity.did);
+      await flush();
+      expect(rig.pendingCount()).toBe(1); // parked on the _reputation write
+      await vi.advanceTimersByTimeAsync(ADMISSION_DEADLINE_MS);
+      const w1 = await wave1;
+      expect(w1.ok).toBe(false); // timed out; never told success
+
+      rig.setHolding(false);
+      rig.releaseNext();
+      await flush();
+
+      const w2 = await callToolSafe(rig.record, args, rig.signer.publicIdentity.did);
+      const w3 = await callToolSafe(rig.record, args, rig.signer.publicIdentity.did);
+      expect(w2.ok).toBe(true);
+      if (w2.ok) {
+        expect(w2.value.error).toBeUndefined();
+        expect(w2.value.already_committed).toBe(true);
+        expect(w2.value.attestation_id).toBe(attestationId);
+      }
+      expect(w3.ok).toBe(true);
+      if (w3.ok) {
+        expect(w3.value.error).toBeUndefined();
+        expect(w3.value.already_committed).toBe(true);
+      }
+
+      expect(await durableRecordIds(rig.storage, "_reputation")).toEqual(
+        new Set([attestationId])
+      );
+      expect(
+        await countAuditSuccessEntries(
+          rig.storage,
+          rig.masterKey,
+          "reputation_record",
+          "attestation_id",
+          attestationId
+        )
+      ).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 // ─── Sentinel (fix-round: NO stable id in production, no crash-window ──
@@ -884,14 +1152,15 @@ describe("LD6 BP-DEADLINE-03: sentinel FINDING_EMITTED durable admission-complet
     rig.stub.next = [makeFinding()];
 
     // The audit write is awaited-just-after saveFinding (NOT folded into
-    // its lock, V2-5) -- a rejection propagates out of routeFinding into
-    // tick()'s per-sentinel try/catch, which logs evaluation_failed rather
-    // than throwing out of tick() itself.
+    // its lock, V2-5). F3 (gate fix-round): its rejection is contained
+    // PER-FINDING inside routeFinding -- the durably-persisted finding is
+    // still returned/emitted, and the audit failure surfaces as its own
+    // evaluation_failed diagnostic event, instead of aborting the batch.
     rig.queueRejections(1);
     const firstTick = await rig.dispatcher.tick();
-    // The failed audit means this finding is not reported as emitted THIS
-    // tick (routeFinding never returned).
-    expect(firstTick.length).toBe(0);
+    // The finding IS reported this tick (it is durable); only its audit
+    // entry is missing.
+    expect(firstTick.length).toBe(1);
 
     // I4: the finding is nonetheless durably persisted -- saveFinding
     // settled BEFORE the audit append was even attempted. The fixture
@@ -946,5 +1215,82 @@ describe("LD6 BP-DEADLINE-03: sentinel FINDING_EMITTED durable admission-complet
     // flip alongside it -- it is not an incidental count.
     const finalEntries = await rig.storage.list(SENTINEL_FINDING_NAMESPACE);
     expect(finalEntries.length).toBe(2);
+  });
+
+  it("F3 (batch isolation): finding 1's audit-append failure still emits finding 1 to subscribers, surfaces an audit-failure diagnostic, and does NOT abort findings 2..N -- which persist, audit, and emit normally", async () => {
+    const rig = setup();
+    await rig.dispatcher.subscribeSentinel(rig.stub.sentinelId);
+    await rig.auditLog.flush(); // drain the SUBSCRIBED fire-and-forget append
+
+    const events: Array<{ type: string; payload: unknown }> = [];
+    rig.dispatcher.onEvent((event) => {
+      events.push({ type: event.type, payload: event });
+    });
+
+    const makeFinding = (summary: string): SentinelFinding => ({
+      finding_id: "",
+      sentinel_id: rig.stub.sentinelId,
+      severity: "alert",
+      summary,
+      details: {},
+      observed_at: "2026-08-11T00:00:00.000Z",
+      evidence_audit_ids: [],
+      fortress_id: "",
+    });
+    rig.stub.next = [
+      makeFinding("ld6-f3-finding-1"),
+      makeFinding("ld6-f3-finding-2"),
+      makeFinding("ld6-f3-finding-3"),
+    ];
+
+    // Fail exactly the FIRST finding's FINDING_EMITTED append. Pre-F3, the
+    // rejection escaped routeFinding into tick()'s per-sentinel catch,
+    // which aborted the remaining findings of the batch: findings 2 and 3
+    // were never persisted, never audited, never emitted, and subscribers
+    // got only evaluation_failed carrying the audit error INSTEAD of the
+    // anomaly.
+    rig.queueRejections(1);
+    const tickFindings = await rig.dispatcher.tick();
+    expect(tickFindings.length).toBe(3);
+
+    // All three findings are durably persisted...
+    const durable = await rig.storage.list(SENTINEL_FINDING_NAMESPACE);
+    expect(durable.length).toBe(3);
+
+    // ...all three reached subscribers (the anomaly outranks its paper
+    // trail: finding 1 is durable, so it is emitted despite its lost
+    // audit)...
+    const findingEvents = events.filter((e) => e.type === "finding");
+    expect(findingEvents.length).toBe(3);
+    const emittedSummaries = findingEvents.map(
+      (e) => (e.payload as { finding: SentinelFinding }).finding.summary
+    );
+    expect(emittedSummaries).toContain("ld6-f3-finding-1");
+    expect(emittedSummaries).toContain("ld6-f3-finding-2");
+    expect(emittedSummaries).toContain("ld6-f3-finding-3");
+
+    // ...the audit failure surfaced as its own diagnostic event naming the
+    // durably-persisted finding...
+    const failureEvents = events.filter((e) => e.type === "evaluation_failed");
+    expect(failureEvents.length).toBe(1);
+    expect(
+      (failureEvents[0]!.payload as { error_message: string }).error_message
+    ).toMatch(/audit append failed/);
+
+    // ...and findings 2 and 3 got their own successful audit entries while
+    // finding 1's is (honestly) missing -- the accepted no-self-heal
+    // residual, now scoped to ONE finding instead of the whole batch.
+    const byId = new Map(
+      tickFindings.map((f) => [f.summary, f.finding_id] as const)
+    );
+    const audited = await auditSuccessIds(
+      rig.storage,
+      rig.masterKey,
+      SENTINEL_AUDIT_OPS.FINDING_EMITTED,
+      "finding_id"
+    );
+    expect(audited.has(byId.get("ld6-f3-finding-1")!)).toBe(false);
+    expect(audited.has(byId.get("ld6-f3-finding-2")!)).toBe(true);
+    expect(audited.has(byId.get("ld6-f3-finding-3")!)).toBe(true);
   });
 });
