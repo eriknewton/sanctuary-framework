@@ -7,6 +7,8 @@
     "typecheck": "npm --prefix server run typecheck",
     "test": "npm --prefix server test",
     "check:release-dependency-pins": "node scripts/check-release-dependency-pins.mjs",
+    "check:release-action-pins": "node scripts/check-release-action-pins.mjs",
+    "check:release-key-parity": "node scripts/check-release-key-parity.mjs",
     "secrets:scan": "gitleaks detect --config .gitleaks.toml --no-banner",
     "synthetic-coverage": "server/node_modules/.bin/tsx scripts/synthetic-coverage/run.ts",
     "synthetic-coverage:parity": "server/node_modules/.bin/tsx scripts/synthetic-coverage/parity-cli.ts",
