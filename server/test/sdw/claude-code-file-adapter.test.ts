@@ -219,6 +219,24 @@ describe("Claude Code memory-file adapter", () => {
     }
   });
 
+  it("roundtrips prose that names protected concepts without secret material", async () => {
+    const source = await copyFixtureSet("basic");
+    const prose = "# Security notes\n\nThe principal policy and recovery key are stored offline.\n";
+    await writeFile(join(source, "security-notes.md"), prose);
+    const storagePath = await tempDir("cc-memory-security-prose-vault");
+    const output = await tempDir("cc-memory-security-prose-output");
+    const adapter = makeAdapter(storagePath, "cc-security-prose");
+
+    const ingest = await ingestClaudeCodeMemoryDirectory(adapter, source, {
+      ingestedAt: INGESTED_AT,
+    });
+    expect(ingest.complete).toBe(true);
+    expect(ingest.skipped).toEqual([]);
+
+    await emitClaudeCodeMemoryDirectory(adapter, output);
+    expect(await readFile(join(output, "security-notes.md"), "utf8")).toBe(prose);
+  });
+
   it("re-ingesting a CHANGED directory into the SAME vault and owner_ref replaces the passages in place", async () => {
     // Regression pin for the "mirror works exactly once" defect. Memory files
     // change daily, so the second run is the normal case, not an edge case. The

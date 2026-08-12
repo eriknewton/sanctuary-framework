@@ -95,6 +95,25 @@ describe("SDW Phase 1 write gate", () => {
     }
   });
 
+  it("allows policy and key names when no concrete secret material is present", () => {
+    const fixtures = [
+      "principal_policy:\n  deny: everything",
+      "Rotate SANCTUARY_RECOVERY_KEY during the next maintenance window.",
+      "The recovery key is stored offline.",
+    ];
+    for (const [index, fixture] of fixtures.entries()) {
+      const record = workingStateRecord(`prose-${index}`, fixture);
+      expect(() =>
+        mintPersistable(
+          { value: record, taint: "user_content" },
+          "_sdw_working_state",
+          stateKey("task", record.state_id),
+          FORTRESS_ID,
+        ),
+      ).not.toThrow();
+    }
+  });
+
   it("writes only encrypted envelope bytes through the gate", async () => {
     const storage = new MemoryStorage();
     const record = workingStateRecord("state1", "plain operator note");

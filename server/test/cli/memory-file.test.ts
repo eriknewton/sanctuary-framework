@@ -282,6 +282,27 @@ describe("memory file CLI: fortress-backed round trip", () => {
     expect(err.text()).not.toContain("--passphrase puts the fortress passphrase");
   }, 60_000);
 
+  it("ingests security prose without reporting a partial mirror", async () => {
+    const source = await copyFixtureSet("basic", "memfile-cli-security-prose-source");
+    await writeFile(
+      join(source, "security-notes.md"),
+      "# Security notes\n\nThe principal policy and recovery key are stored offline.\n",
+    );
+    const out = makeSink();
+    const err = makeSink();
+
+    const code = await runMemoryIngestCommand({
+      argv: ["--harness", "claude-code", "--dir", source, "--fortress", fortress],
+      out: out.stream,
+      err: err.stream,
+      env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
+    });
+
+    expect(code).toBe(0);
+    expect(out.text()).toContain("ingested 4 of 4 Claude Code memory files");
+    expect(err.text()).not.toContain("the mirror is INCOMPLETE");
+  }, 60_000);
+
   it("warns loudly and names every file when the classifier makes the mirror partial", async () => {
     const source = await copyFixtureSet("basic", "memfile-cli-skip-source");
     await writeFile(
