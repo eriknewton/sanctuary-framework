@@ -269,6 +269,33 @@ describe("Sovereignty Attestation Artifacts", () => {
 
       expect(attExpiry).toBe(Math.min(aExpiry, bExpiry));
     });
+
+    it("caps expiry at the verifier lifetime even when embedded SHR expiries are later", () => {
+      const agentA = makeAgent();
+      const agentB = makeAgent();
+      const shrA = agentSHR(agentA);
+      const shrB = agentSHR(agentB);
+      const verification = verifySHR(shrB);
+
+      shrA.body.expires_at = "2099-01-01T00:00:00.000Z";
+      shrB.body.expires_at = "2099-01-01T00:00:00.000Z";
+
+      const attestation = generateAttestation({
+        attesterSHR: shrA,
+        subjectSHR: shrB,
+        verificationResult: verification,
+        identityManager: agentA.identityManager as any,
+        masterKey: agentA.masterKey,
+      });
+
+      if ("error" in attestation) throw new Error(attestation.error);
+
+      const attestedAtMs = Date.parse(attestation.body.attested_at);
+      const expiresAtMs = Date.parse(attestation.body.expires_at);
+      expect(expiresAtMs - attestedAtMs).toBe(
+        ATTESTATION_MAX_DECLARED_LIFETIME_MS
+      );
+    });
   });
 
   describe("verifyAttestation", () => {
@@ -459,7 +486,9 @@ describe("Sovereignty Attestation Artifacts", () => {
 
       const result = verifyAttestation(attestation, now);
       expect(result.valid).toBe(false);
-      expect(result.errors.some(error => error.includes("declares a") && error.includes("lifetime"))).toBe(true);
+      expect(result.errors).toContain(
+        "Attestation declared lifetime exceeds the maximum of 24h"
+      );
     });
 
     it("rejects an authentic attestation older than the relying-party age ceiling", () => {
@@ -485,7 +514,12 @@ describe("Sovereignty Attestation Artifacts", () => {
 
       const result = verifyAttestation(attestation, now);
       expect(result.valid).toBe(false);
-      expect(result.errors.some(error => error.includes("old") && error.includes("relying-party age"))).toBe(true);
+      // With equal age and lifetime ceilings, any stale artifact that has not
+      // expired necessarily also declares an overlong lifetime. The
+      // age-specific assertion remains mutation-sensitive to the age check.
+      expect(result.errors).toContain(
+        "Attestation age exceeds the maximum relying-party age of 24h"
+      );
     });
 
     it("rejects attested_at beyond the bounded future clock skew", () => {
@@ -566,6 +600,34 @@ describe("Sovereignty Attestation Artifacts", () => {
       expect(result.valid).toBe(true);
       expect(result.errors).toHaveLength(0);
       expect(result.trust_tier).toBe("verified-degraded");
+    });
+
+    it("does not classify the exact maximum age as stale", () => {
+      const agentA = makeAgent();
+      const agentB = makeAgent();
+      const shrA = agentSHR(agentA);
+      const shrB = agentSHR(agentB);
+      const attestation = generateAttestation({
+        attesterSHR: shrA,
+        subjectSHR: shrB,
+        verificationResult: verifySHR(shrB),
+        livenessProven: true,
+        identityManager: agentA.identityManager as any,
+        masterKey: agentA.masterKey,
+      });
+      if ("error" in attestation) throw new Error(attestation.error);
+
+      const now = new Date("2026-08-12T12:00:00.000Z");
+      const boundaryAttestedAt = now.getTime() - ATTESTATION_MAX_AGE_MS;
+      attestation.body.attested_at = new Date(boundaryAttestedAt).toISOString();
+      attestation.body.expires_at = now.toISOString();
+      resignAttestation(attestation, agentA);
+
+      const result = verifyAttestation(attestation, now);
+      expect(result.valid).toBe(false);
+      expect(result.expired).toBe(true);
+      expect(result.errors).toContain("Attestation has expired");
+      expect(result.errors.some(error => error.includes("relying-party age"))).toBe(false);
     });
 
     it("rejects attestation signed by wrong key", () => {

@@ -158,7 +158,13 @@ export function generateAttestation(
   const now = new Date();
   const attesterExpiry = new Date(attesterSHR.body.expires_at);
   const subjectExpiry = new Date(subjectSHR.body.expires_at);
-  const earliestExpiry = attesterExpiry < subjectExpiry ? attesterExpiry : subjectExpiry;
+  const earliestShrExpiry = attesterExpiry < subjectExpiry ? attesterExpiry : subjectExpiry;
+  const policyExpiry = new Date(
+    now.getTime() + ATTESTATION_MAX_DECLARED_LIFETIME_MS
+  );
+  const earliestExpiry = earliestShrExpiry < policyExpiry
+    ? earliestShrExpiry
+    : policyExpiry;
 
   const sovereigntyLevel = verificationResult.valid
     ? (verificationResult.sovereignty_level as SovereigntyLevel)
@@ -343,7 +349,7 @@ export function verifyAttestation(
     const ageMs = currentTimeMs - attestedAtMs;
     if (ageMs > ATTESTATION_MAX_AGE_MS) {
       errors.push(
-        `Attestation is ${Math.round(ageMs / (60 * 60 * 1000))}h old, exceeding the maximum relying-party age of ${ATTESTATION_MAX_AGE_MS / (60 * 60 * 1000)}h`
+        `Attestation age exceeds the maximum relying-party age of ${ATTESTATION_MAX_AGE_MS / (60 * 60 * 1000)}h`
       );
     }
 
@@ -353,7 +359,7 @@ export function verifyAttestation(
         errors.push("Attestation expires_at precedes attested_at");
       } else if (declaredLifetimeMs > ATTESTATION_MAX_DECLARED_LIFETIME_MS) {
         errors.push(
-          `Attestation declares a ${Math.round(declaredLifetimeMs / (60 * 60 * 1000))}h lifetime, exceeding the maximum of ${ATTESTATION_MAX_DECLARED_LIFETIME_MS / (60 * 60 * 1000)}h`
+          `Attestation declared lifetime exceeds the maximum of ${ATTESTATION_MAX_DECLARED_LIFETIME_MS / (60 * 60 * 1000)}h`
         );
       }
     }
