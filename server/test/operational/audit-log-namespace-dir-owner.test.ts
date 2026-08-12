@@ -37,6 +37,12 @@ describe("AuditLog namespace directory create owner", () => {
     await log.flush();
   }
 
+  async function createAuditWriteNamespaces(storage: FilesystemStorage): Promise<void> {
+    for (const namespace of ["_audit", "_audit_checkpoints", "_meta"]) {
+      await mkdir(storage.namespacePath(namespace), { recursive: true, mode: 0o700 });
+    }
+  }
+
   async function pathExists(path: string): Promise<boolean> {
     try {
       await stat(path);
@@ -119,11 +125,15 @@ describe("AuditLog namespace directory create owner", () => {
   it("chowns the created namespace directory chain", async () => {
     const { root, storage, storagePath } = await makeStorage(["a", "b", "state"]);
     const leafDir = storage.namespacePath("_audit");
+    const checkpointDir = storage.namespacePath("_audit_checkpoints");
+    const metaDir = storage.namespacePath("_meta");
     const missingBefore = [
       join(root, "a"),
       join(root, "a", "b"),
       storagePath,
       leafDir,
+      checkpointDir,
+      metaDir,
     ];
     for (const path of missingBefore) {
       await expect(pathExists(path)).resolves.toBe(false);
@@ -134,21 +144,24 @@ describe("AuditLog namespace directory create owner", () => {
 
     await appendOne(log);
 
-    expect(calls).toHaveLength(1);
-    expect(calls[0]).toEqual({
-      firstCreated: expect.any(String),
+    expect(calls).toHaveLength(3);
+    expect(calls.map((call) => call.leafDir)).toEqual([
       leafDir,
-      owner: OWNER,
-    });
-    expect(isAncestorOrSelf(calls[0]!.firstCreated, leafDir)).toBe(true);
-    expect(missingBefore.map((path) => resolve(path))).toContain(
-      resolve(calls[0]!.firstCreated),
-    );
+      checkpointDir,
+      metaDir,
+    ]);
+    for (const call of calls) {
+      expect(call.owner).toEqual(OWNER);
+      expect(isAncestorOrSelf(call.firstCreated, call.leafDir)).toBe(true);
+      expect(missingBefore.map((path) => resolve(path))).toContain(
+        resolve(call.firstCreated),
+      );
+    }
   });
 
   it("does not chown when the namespace directory already exists and is healthy", async () => {
     const { storage } = await makeStorage();
-    await mkdir(storage.namespacePath("_audit"), { recursive: true, mode: 0o700 });
+    await createAuditWriteNamespaces(storage);
     const calls: DirChainChownCall[] = [];
     const log = new AuditLog(
       storage,
@@ -195,6 +208,49 @@ describe("AuditLog namespace directory create owner", () => {
     );
   });
 
+  it("recovers when namespace ownership handback fails partway through fresh initialization", async () => {
+    const { storagePath } = await makeStorage();
+    const uid = process.getuid!();
+    const gid = process.getgid!();
+    const owner = { uid, gid };
+    const storage = new FilesystemStorage(storagePath, { owner });
+    let handbacks = 0;
+    const interrupted = new AuditLog(storage, generateRandomKey(), {
+      integrityMode: "lenient",
+      createOwner: owner,
+      createOwnerChownDirChain: async () => {
+        handbacks++;
+        if (handbacks === 2) throw new Error("simulated handback interruption");
+      },
+    });
+
+    await expect(
+      interrupted.append("l1", "egress_allowed", "id-1", { n: 1 }),
+    ).rejects.toThrow("simulated handback interruption");
+    await expect(
+      stat(storage.namespacePath("_audit")).then((s) => s.isDirectory()),
+    ).resolves.toBe(true);
+    await expect(
+      stat(storage.namespacePath("_audit_checkpoints")).then((s) => s.isDirectory()),
+    ).resolves.toBe(true);
+    await expect(stat(storage.namespacePath("_meta"))).rejects.toThrow();
+
+    // A fresh process must treat the partial tree idempotently: verify the two
+    // existing owner-held directories, create the missing third one, and
+    // complete the append without manual repair.
+    const retry = new AuditLog(storage, generateRandomKey(), {
+      integrityMode: "lenient",
+      createOwner: owner,
+    });
+    await appendOne(retry);
+
+    for (const namespace of ["_audit", "_audit_checkpoints", "_meta"]) {
+      await expect(
+        stat(storage.namespacePath(namespace)).then((s) => s.isDirectory()),
+      ).resolves.toBe(true);
+    }
+  });
+
   it("repairs a pre-existing root-owned namespace chain instead of proceeding silently", async () => {
     // Gate F2 (PR #1084): a failed chain-chown (or a crash between mkdir and
     // chown) leaves the chain root-owned; the NEXT append's mkdir returns
@@ -202,7 +258,7 @@ describe("AuditLog namespace directory create owner", () => {
     // silently and the defect is permanently reinstated for the segment.
     const { storage } = await makeStorage();
     const leafDir = storage.namespacePath("_audit");
-    await mkdir(leafDir, { recursive: true, mode: 0o700 });
+    await createAuditWriteNamespaces(storage);
     const calls: DirChainChownCall[] = [];
     // Two-level chain (`<base>/_audit` under `<base>`): both root-owned until
     // the repair seam runs, healthy at the storage root above them.
@@ -237,7 +293,7 @@ describe("AuditLog namespace directory create owner", () => {
     // whole contiguous root-owned run to the first operator-owned ancestor.
     const { root, storage } = await makeStorage(["boot-audit", "fp"]);
     const leafDir = storage.namespacePath("_audit"); // <root>/boot-audit/fp/_audit
-    await mkdir(leafDir, { recursive: true, mode: 0o700 });
+    await createAuditWriteNamespaces(storage);
     const bootAudit = join(root, "boot-audit");
     const fp = join(root, "boot-audit", "fp");
     const calls: DirChainChownCall[] = [];
@@ -268,7 +324,7 @@ describe("AuditLog namespace directory create owner", () => {
     // job) and must REFUSE, never seize directories up toward `/`.
     const { storage } = await makeStorage();
     const leafDir = storage.namespacePath("_audit");
-    await mkdir(leafDir, { recursive: true, mode: 0o700 });
+    await createAuditWriteNamespaces(storage);
     const calls: DirChainChownCall[] = [];
     const log = new AuditLog(
       storage,
@@ -288,7 +344,7 @@ describe("AuditLog namespace directory create owner", () => {
   it("repairs only from the topmost drifted directory (leaf gid drift)", async () => {
     const { storage } = await makeStorage();
     const leafDir = storage.namespacePath("_audit");
-    await mkdir(leafDir, { recursive: true, mode: 0o700 });
+    await createAuditWriteNamespaces(storage);
     const calls: DirChainChownCall[] = [];
     let repaired = false;
     const log = new AuditLog(
@@ -371,11 +427,11 @@ describe("AuditLog namespace directory create owner", () => {
     expect(statted).not.toContain(dirname(leafDir));
   });
 
-  it("uses the default directory-chain chown wiring", async () => {
-    const { storage } = await makeStorage();
-    const leafDir = storage.namespacePath("_audit");
+  it("initializes every write namespace for a fresh owner-mode storage tree", async () => {
+    const { storagePath } = await makeStorage();
     const uid = process.getuid!();
     const gid = process.getgid!();
+    const storage = new FilesystemStorage(storagePath, { owner: { uid, gid } });
     const log = new AuditLog(storage, generateRandomKey(), {
       integrityMode: "lenient",
       createOwner: { uid, gid },
@@ -383,6 +439,10 @@ describe("AuditLog namespace directory create owner", () => {
 
     await appendOne(log);
 
-    await expect(stat(leafDir).then((s) => s.isDirectory())).resolves.toBe(true);
+    for (const namespace of ["_audit", "_audit_checkpoints", "_meta"]) {
+      await expect(
+        stat(storage.namespacePath(namespace)).then((s) => s.isDirectory()),
+      ).resolves.toBe(true);
+    }
   });
 });

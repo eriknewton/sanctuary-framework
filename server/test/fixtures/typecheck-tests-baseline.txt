@@ -953,7 +953,7 @@ test/wrap/castle-wall-banner-probe.test.ts(978,9): error TS2322: Type '{ kind: "
 test/wrap/custody-flow.test.ts(63,12): error TS18047: 'result.envelope' is possibly 'null'.
 test/wrap/hermes-yaml-injection.test.ts(484,35): error TS7006: Parameter 'c' implicitly has an 'any' type.
 test/wrap/hermes-yaml-parse-parity.test.ts(745,35): error TS7006: Parameter 'c' implicitly has an 'any' type.
-test/wrap/init.test.ts(546,12): error TS18047: 'unlocked.envelope' is possibly 'null'.
+test/wrap/init.test.ts(555,12): error TS18047: 'unlocked.envelope' is possibly 'null'.
 test/wrap/legacy-filename-compat.test.ts(38,26): error TS2322: Type 'Promise<{ url: string; port: number; host: string; stop: () => Promise<void>; publish: () => void; publishActivity: () => void; publishApproval: () => void; }>' is not assignable to type 'Promise<DashboardHandle>'.
 test/wrap/port-fallback.test.ts(33,9): error TS2322: Type '(opts: { port: number; host?: string | undefined; mode: "co-located" | "standalone"; authToken: string; serverVersion: string; }) => Promise<{ url: string; port: number; host: string; stop: () => Promise<void>; publish: () => void; publishActivity: () => void; publishApproval: () => void; }>' is not assignable to type 'DashboardStarter'.
 test/wrap/port-fallback.test.ts(83,11): error TS2322: Type '(opts: { port: number; host?: string | undefined; mode: "co-located" | "standalone"; authToken: string; serverVersion: string; }) => Promise<{ url: string; port: number; host: string; stop: () => Promise<void>; publish: () => void; publishActivity: () => void; publishApproval: () => void; }>' is not assignable to type 'DashboardStarter'.
