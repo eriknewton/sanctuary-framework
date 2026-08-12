@@ -462,6 +462,63 @@ describe("Sovereignty Attestation Artifacts", () => {
       expect(result.errors).toContain("Attestation has an invalid expires_at timestamp");
     });
 
+    it("rejects malformed attested_at without inventing dependent time errors", () => {
+      const agentA = makeAgent();
+      const agentB = makeAgent();
+      const shrA = agentSHR(agentA);
+      const shrB = agentSHR(agentB);
+      const attestation = generateAttestation({
+        attesterSHR: shrA,
+        subjectSHR: shrB,
+        verificationResult: verifySHR(shrB),
+        livenessProven: true,
+        identityManager: agentA.identityManager as any,
+        masterKey: agentA.masterKey,
+      });
+      if ("error" in attestation) throw new Error(attestation.error);
+
+      attestation.body.attested_at = "not-a-timestamp";
+      resignAttestation(attestation, agentA);
+
+      const result = verifyAttestation(attestation, new Date());
+      expect(result.valid).toBe(false);
+      expect(result.errors).toContain("Attestation has an invalid attested_at timestamp");
+      expect(result.errors.some(error => error.includes("clock-skew"))).toBe(false);
+      expect(result.errors.some(error => error.includes("relying-party age"))).toBe(false);
+      expect(result.errors.some(error => error.includes("declared lifetime"))).toBe(false);
+    });
+
+    it("still applies age policy when only expires_at is malformed", () => {
+      const agentA = makeAgent();
+      const agentB = makeAgent();
+      const shrA = agentSHR(agentA);
+      const shrB = agentSHR(agentB);
+      const attestation = generateAttestation({
+        attesterSHR: shrA,
+        subjectSHR: shrB,
+        verificationResult: verifySHR(shrB),
+        livenessProven: true,
+        identityManager: agentA.identityManager as any,
+        masterKey: agentA.masterKey,
+      });
+      if ("error" in attestation) throw new Error(attestation.error);
+
+      const now = new Date("2026-08-12T12:00:00.000Z");
+      attestation.body.attested_at = new Date(
+        now.getTime() - ATTESTATION_MAX_AGE_MS - 1
+      ).toISOString();
+      attestation.body.expires_at = "not-a-timestamp";
+      resignAttestation(attestation, agentA);
+
+      const result = verifyAttestation(attestation, now);
+      expect(result.valid).toBe(false);
+      expect(result.errors).toContain("Attestation has an invalid expires_at timestamp");
+      expect(result.errors).toContain(
+        "Attestation age exceeds the maximum relying-party age of 24h"
+      );
+      expect(result.errors.some(error => error.includes("declared lifetime"))).toBe(false);
+    });
+
     it("rejects a signer-chosen lifetime beyond the relying-party ceiling", () => {
       const agentA = makeAgent();
       const agentB = makeAgent();
