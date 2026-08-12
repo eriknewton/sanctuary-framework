@@ -8,10 +8,15 @@
 import { describe, it, expect } from "vitest";
 import { generateRandomKey } from "../../src/core/random.js";
 import { derivePurposeKey } from "../../src/core/key-derivation.js";
-import { createIdentity } from "../../src/core/identity.js";
+import { createIdentity, sign } from "../../src/core/identity.js";
+import { stringToBytes, toBase64url } from "../../src/core/encoding.js";
 import { generateSHR } from "../../src/shr/generator.js";
 import { verifySHR } from "../../src/shr/verifier.js";
+import { deepSortKeys } from "../../src/shr/types.js";
 import {
+  ATTESTATION_MAX_AGE_MS,
+  ATTESTATION_MAX_CLOCK_SKEW_MS,
+  ATTESTATION_MAX_DECLARED_LIFETIME_MS,
   generateAttestation,
   verifyAttestation,
   ATTESTATION_VERSION,
@@ -63,6 +68,19 @@ function agentSHR(agent: ReturnType<typeof makeAgent>): SignedSHR {
   });
   if (typeof result === "string") throw new Error(result);
   return result;
+}
+
+function resignAttestation(
+  attestation: SignedAttestation,
+  agent: ReturnType<typeof makeAgent>
+): void {
+  const identity = agent.identityManager.getDefault();
+  if (!identity) throw new Error("test identity missing");
+  const encryptionKey = derivePurposeKey(agent.masterKey, "identity-encryption");
+  const canonical = JSON.stringify(deepSortKeys(attestation.body));
+  attestation.signature = toBase64url(
+    sign(stringToBytes(canonical), identity.encrypted_private_key, encryptionKey)
+  );
 }
 
 describe("Sovereignty Attestation Artifacts", () => {
@@ -389,6 +407,165 @@ describe("Sovereignty Attestation Artifacts", () => {
       expect(result.valid).toBe(false);
       expect(result.expired).toBe(true);
       expect(result.errors.some(e => e.includes("expired"))).toBe(true);
+    });
+
+    it("rejects signed attestations with malformed temporal fields", () => {
+      const agentA = makeAgent();
+      const agentB = makeAgent();
+      const shrA = agentSHR(agentA);
+      const shrB = agentSHR(agentB);
+      const attestation = generateAttestation({
+        attesterSHR: shrA,
+        subjectSHR: shrB,
+        verificationResult: verifySHR(shrB),
+        livenessProven: true,
+        identityManager: agentA.identityManager as any,
+        masterKey: agentA.masterKey,
+      });
+      if ("error" in attestation) throw new Error(attestation.error);
+
+      attestation.body.attested_at = "not-a-timestamp";
+      attestation.body.expires_at = "also-not-a-timestamp";
+      resignAttestation(attestation, agentA);
+
+      const result = verifyAttestation(attestation, new Date("2026-08-12T12:00:00.000Z"));
+      expect(result.valid).toBe(false);
+      expect(result.expired).toBe(false);
+      expect(result.errors).toContain("Attestation has an invalid attested_at timestamp");
+      expect(result.errors).toContain("Attestation has an invalid expires_at timestamp");
+    });
+
+    it("rejects a signer-chosen lifetime beyond the relying-party ceiling", () => {
+      const agentA = makeAgent();
+      const agentB = makeAgent();
+      const shrA = agentSHR(agentA);
+      const shrB = agentSHR(agentB);
+      const attestation = generateAttestation({
+        attesterSHR: shrA,
+        subjectSHR: shrB,
+        verificationResult: verifySHR(shrB),
+        livenessProven: true,
+        identityManager: agentA.identityManager as any,
+        masterKey: agentA.masterKey,
+      });
+      if ("error" in attestation) throw new Error(attestation.error);
+
+      const now = new Date("2026-08-12T12:00:00.000Z");
+      attestation.body.attested_at = now.toISOString();
+      attestation.body.expires_at = new Date(
+        now.getTime() + ATTESTATION_MAX_DECLARED_LIFETIME_MS + 1
+      ).toISOString();
+      resignAttestation(attestation, agentA);
+
+      const result = verifyAttestation(attestation, now);
+      expect(result.valid).toBe(false);
+      expect(result.errors.some(error => error.includes("declares a") && error.includes("lifetime"))).toBe(true);
+    });
+
+    it("rejects an authentic attestation older than the relying-party age ceiling", () => {
+      const agentA = makeAgent();
+      const agentB = makeAgent();
+      const shrA = agentSHR(agentA);
+      const shrB = agentSHR(agentB);
+      const attestation = generateAttestation({
+        attesterSHR: shrA,
+        subjectSHR: shrB,
+        verificationResult: verifySHR(shrB),
+        livenessProven: true,
+        identityManager: agentA.identityManager as any,
+        masterKey: agentA.masterKey,
+      });
+      if ("error" in attestation) throw new Error(attestation.error);
+
+      const now = new Date("2026-08-12T12:00:00.000Z");
+      const staleAttestedAt = now.getTime() - ATTESTATION_MAX_AGE_MS - 1;
+      attestation.body.attested_at = new Date(staleAttestedAt).toISOString();
+      attestation.body.expires_at = new Date(now.getTime() + 60_000).toISOString();
+      resignAttestation(attestation, agentA);
+
+      const result = verifyAttestation(attestation, now);
+      expect(result.valid).toBe(false);
+      expect(result.errors.some(error => error.includes("old") && error.includes("relying-party age"))).toBe(true);
+    });
+
+    it("rejects attested_at beyond the bounded future clock skew", () => {
+      const agentA = makeAgent();
+      const agentB = makeAgent();
+      const shrA = agentSHR(agentA);
+      const shrB = agentSHR(agentB);
+      const attestation = generateAttestation({
+        attesterSHR: shrA,
+        subjectSHR: shrB,
+        verificationResult: verifySHR(shrB),
+        livenessProven: true,
+        identityManager: agentA.identityManager as any,
+        masterKey: agentA.masterKey,
+      });
+      if ("error" in attestation) throw new Error(attestation.error);
+
+      const now = new Date("2026-08-12T12:00:00.000Z");
+      const futureAttestedAt = now.getTime() + ATTESTATION_MAX_CLOCK_SKEW_MS + 1;
+      attestation.body.attested_at = new Date(futureAttestedAt).toISOString();
+      attestation.body.expires_at = new Date(futureAttestedAt + 60_000).toISOString();
+      resignAttestation(attestation, agentA);
+
+      const result = verifyAttestation(attestation, now);
+      expect(result.valid).toBe(false);
+      expect(result.errors.some(error => error.includes("future") && error.includes("clock-skew"))).toBe(true);
+    });
+
+    it("rejects an expiry that precedes the signed attestation time", () => {
+      const agentA = makeAgent();
+      const agentB = makeAgent();
+      const shrA = agentSHR(agentA);
+      const shrB = agentSHR(agentB);
+      const attestation = generateAttestation({
+        attesterSHR: shrA,
+        subjectSHR: shrB,
+        verificationResult: verifySHR(shrB),
+        livenessProven: true,
+        identityManager: agentA.identityManager as any,
+        masterKey: agentA.masterKey,
+      });
+      if ("error" in attestation) throw new Error(attestation.error);
+
+      const now = new Date("2026-08-12T12:00:00.000Z");
+      attestation.body.attested_at = new Date(now.getTime() + 60_000).toISOString();
+      attestation.body.expires_at = new Date(now.getTime() + 30_000).toISOString();
+      resignAttestation(attestation, agentA);
+
+      const result = verifyAttestation(attestation, now);
+      expect(result.valid).toBe(false);
+      expect(result.errors).toContain("Attestation expires_at precedes attested_at");
+    });
+
+    it("accepts exact freshness, lifetime, and clock-skew boundaries", () => {
+      const agentA = makeAgent();
+      const agentB = makeAgent();
+      const shrA = agentSHR(agentA);
+      const shrB = agentSHR(agentB);
+      const attestation = generateAttestation({
+        attesterSHR: shrA,
+        subjectSHR: shrB,
+        verificationResult: verifySHR(shrB),
+        livenessProven: true,
+        identityManager: agentA.identityManager as any,
+        masterKey: agentA.masterKey,
+      });
+      if ("error" in attestation) throw new Error(attestation.error);
+
+      const now = new Date("2026-08-12T12:00:00.000Z");
+      const boundaryAttestedAt = now.getTime() + ATTESTATION_MAX_CLOCK_SKEW_MS;
+      attestation.body.attested_at = new Date(boundaryAttestedAt).toISOString();
+      attestation.body.expires_at = new Date(
+        boundaryAttestedAt + ATTESTATION_MAX_DECLARED_LIFETIME_MS
+      ).toISOString();
+      resignAttestation(attestation, agentA);
+
+      const result = verifyAttestation(attestation, now);
+      expect(result.valid).toBe(true);
+      expect(result.errors).toHaveLength(0);
+      expect(result.trust_tier).toBe("verified-degraded");
     });
 
     it("rejects attestation signed by wrong key", () => {
