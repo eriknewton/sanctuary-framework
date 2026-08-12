@@ -339,6 +339,10 @@ export function verifyAttestation(
   if (!hasValidAttestedAt) {
     errors.push("Attestation has an invalid attested_at timestamp");
   } else {
+    // A timestamp accepted at the positive skew boundary can remain valid for
+    // declaredLifetime + clockSkew of verifier wall-clock time (24h05m under
+    // the current policy). That additive horizon is intentional: skew is a
+    // tolerance for clock disagreement, not extra signed lifetime.
     const futureSkewMs = attestedAtMs - currentTimeMs;
     if (futureSkewMs > ATTESTATION_MAX_CLOCK_SKEW_MS) {
       errors.push(

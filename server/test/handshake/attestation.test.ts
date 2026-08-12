@@ -577,6 +577,9 @@ describe("Sovereignty Attestation Artifacts", () => {
       expect(result.errors).toContain(
         "Attestation age exceeds the maximum relying-party age of 24h"
       );
+      expect(result.errors).toContain(
+        "Attestation declared lifetime exceeds the maximum of 24h"
+      );
     });
 
     it("rejects attested_at beyond the bounded future clock skew", () => {
@@ -621,13 +624,16 @@ describe("Sovereignty Attestation Artifacts", () => {
       if ("error" in attestation) throw new Error(attestation.error);
 
       const now = new Date("2026-08-12T12:00:00.000Z");
-      attestation.body.attested_at = new Date(now.getTime() + 60_000).toISOString();
-      attestation.body.expires_at = new Date(now.getTime() + 30_000).toISOString();
+      const futureAttestedAt = now.getTime() + ATTESTATION_MAX_CLOCK_SKEW_MS / 2;
+      attestation.body.attested_at = new Date(futureAttestedAt).toISOString();
+      attestation.body.expires_at = new Date(
+        now.getTime() + ATTESTATION_MAX_CLOCK_SKEW_MS / 4
+      ).toISOString();
       resignAttestation(attestation, agentA);
 
       const result = verifyAttestation(attestation, now);
       expect(result.valid).toBe(false);
-      expect(result.errors).toContain("Attestation expires_at precedes attested_at");
+      expect(result.errors).toEqual(["Attestation expires_at precedes attested_at"]);
     });
 
     it("accepts exact freshness, lifetime, and clock-skew boundaries", () => {
@@ -657,6 +663,45 @@ describe("Sovereignty Attestation Artifacts", () => {
       expect(result.valid).toBe(true);
       expect(result.errors).toHaveLength(0);
       expect(result.trust_tier).toBe("verified-degraded");
+
+      const atOuterWallClockBoundary = verifyAttestation(
+        attestation,
+        new Date(boundaryAttestedAt + ATTESTATION_MAX_DECLARED_LIFETIME_MS)
+      );
+      expect(atOuterWallClockBoundary.valid).toBe(false);
+      expect(atOuterWallClockBoundary.expired).toBe(true);
+      expect(atOuterWallClockBoundary.errors).toEqual(["Attestation has expired"]);
+    });
+
+    it("rejects beyond the combined lifetime and clock-skew wall-clock horizon", () => {
+      const agentA = makeAgent();
+      const agentB = makeAgent();
+      const shrA = agentSHR(agentA);
+      const shrB = agentSHR(agentB);
+      const attestation = generateAttestation({
+        attesterSHR: shrA,
+        subjectSHR: shrB,
+        verificationResult: verifySHR(shrB),
+        livenessProven: true,
+        identityManager: agentA.identityManager as any,
+        masterKey: agentA.masterKey,
+      });
+      if ("error" in attestation) throw new Error(attestation.error);
+
+      const issuedAt = new Date("2026-08-12T12:00:00.000Z").getTime();
+      const attestedAt = issuedAt + ATTESTATION_MAX_CLOCK_SKEW_MS;
+      const expiresAt = attestedAt + ATTESTATION_MAX_DECLARED_LIFETIME_MS;
+      attestation.body.attested_at = new Date(attestedAt).toISOString();
+      attestation.body.expires_at = new Date(expiresAt).toISOString();
+      resignAttestation(attestation, agentA);
+
+      const result = verifyAttestation(attestation, new Date(expiresAt + 1));
+      expect(result.valid).toBe(false);
+      expect(result.expired).toBe(true);
+      expect(result.errors).toEqual([
+        "Attestation has expired",
+        "Attestation age exceeds the maximum relying-party age of 24h",
+      ]);
     });
 
     it("does not classify the exact maximum age as stale", () => {
