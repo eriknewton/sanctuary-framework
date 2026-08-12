@@ -773,15 +773,19 @@ export interface ReputationRecordAuditProjection {
   sovereignty_tier?: SovereigntyTier;
   /**
    * True ONLY on the existence-guard reconcile branch (an already-committed
-   * retry), false on a fresh write (LD6 gate fix-round F4 -- must match the
-   * same field on `BridgeCommitmentAuditProjection` in bridge/tools.ts).
-   * The self-heal semantic is "re-emit the success audit when the durable
-   * audit is MISSING," not "append on every guard hit": the callback uses
-   * this flag to query the audit log first and append only on absence, so
-   * an identical-args retry loop cannot inflate the success-audit count
-   * N-fold (posture.ts tallies these entries as an honest lower bound) or
-   * push unbounded critical entries into the maxEntries-pruned log. The
-   * fresh-write path skips the query -- its entry cannot already exist.
+   * retry), false on a fresh write (LD6 gate fix-round F4, reworked
+   * fix-round-2 -- must match the same field on
+   * `BridgeCommitmentAuditProjection` in bridge/tools.ts). The reconcile
+   * branch ALWAYS re-emits its success audit -- O(1): one bounded
+   * appendCritical, never an in-lock audit-log READ, which on the
+   * non-eager path costs a full-chain decrypt + re-verify and would
+   * serialize every admission behind it -- but the callback TAGS the
+   * emitted entry (`reconcile: true` in `details`) so consumers that COUNT
+   * success entries (posture.ts's receipt tally) exclude re-emissions: an
+   * identical-args retry loop appends only tagged entries the tally
+   * ignores, so it cannot inflate the posture-visible count N-fold. The
+   * self-heal semantic survives: a crash-window-orphaned record still gets
+   * a durable, full-fidelity (tagged) success entry from any retry.
    */
   reconcile: boolean;
 }
@@ -868,12 +872,13 @@ export interface ReputationStoreTestOverrides {
  * STORAGE_OP_MARGIN_MS (10s) is the defensive backstop for this store's
  * OWN storage.list/read/write calls (N bounded by MAX_REPUTATION_RECORDS),
  * which carry no settle-time contract at all (storage/interface.ts); a
- * backstop, not a precise bound. On the reconcile (guard-hit) branch the
- * append is replaced by the F4 absence QUERY (an audit-log read over the
- * retained window, bounded by the log's maxEntries retention cap) plus an
- * append only when the audit is genuinely missing, so the fresh-write path
- * stays the section's worst case. Total: the deadline exceeds the audit
- * append's 35s hard worst case by 15s of margin for everything else.
+ * backstop, not a precise bound. The reconcile (guard-hit) branch's
+ * in-lock work is ONE bounded appendCritical (the F4 fix-round-2 tag-based
+ * re-emission -- same 35s worst case as the write path's append, with NO
+ * in-lock audit-log read), so the fresh-write path, which adds the scans
+ * and the record write on top of that same append, stays the section's
+ * worst case. Total: the deadline exceeds the audit append's 35s hard
+ * worst case by 15s of margin for everything else.
  *
  * ACCEPTED CONSEQUENCE (deliberate, fail-closed): because the audit append
  * is INSIDE the lock, a slow or contended audit backend serializes
@@ -883,9 +888,10 @@ export interface ReputationStoreTestOverrides {
  * WHY this store and BridgeStore accept the coupling and the sentinel path
  * does not: `SentinelFindingStore.saveFinding` can ALREADY spend up to
  * ON_EVICT_AUDIT_TIMEOUT_MS (40s) in-lock on an evict-INTENT append, so a
- * second in-lock append would worst-case 75s against the same 50s budget —
- * see the fuller asymmetry note on BRIDGE_STORE_ADMISSION_DEADLINE_MS
- * (bridge/tools.ts) and sentinel-dispatcher.ts's routeFinding comment.
+ * second in-lock append would worst-case 40s + 35s = 75s against the same
+ * 50s budget (the 75s figure must match BRIDGE_STORE_ADMISSION_DEADLINE_MS's
+ * note in bridge/tools.ts and sentinel-dispatcher.ts's routeFinding
+ * comment) — see the fuller asymmetry note at either of those sites.
  *
  * Kept as a LOCAL constant, not imported from
  * sentinel-finding-store.ts, for the same module-boundary reason
@@ -1583,31 +1589,36 @@ export class ReputationStore {
     callerPublicKey: Uint8Array,
     expectedContentId?: string
   ): boolean {
-    const d = stored.attestation.data;
-    if (expectedContentId !== undefined) {
-      const recomputed = deriveReputationAttestationId(
-        d.interaction_id,
-        d.participant_did,
-        d.counterparty_did,
-        d.context
-      );
-      if (recomputed !== expectedContentId) return false;
-    }
-    if (
-      d.interaction_id !== tuple.interaction_id ||
-      d.participant_did !== tuple.participant_did ||
-      d.counterparty_did !== tuple.counterparty_did ||
-      d.context !== tuple.context
-    ) {
-      return false;
-    }
-    // Fail-closed decode/verify (LD6 gate fix-round F6 -- must match the
-    // try/catch in verifyStoredCommitmentIntent, bridge/tools.ts): a stored
-    // record whose signature is malformed enough to make decode or verify
-    // THROW is exactly as unverified as one that verifies false; the guard
-    // classifies it `occupied_unverified` rather than letting the throw
-    // escape record()'s locked section as an unclassified rejection.
+    // Fail-closed verification body (LD6 gate fix-round F6; scope widened
+    // fix-round-2 M-3 -- must match the try/catch in
+    // verifyStoredCommitmentIntent, bridge/tools.ts): the try encloses the
+    // ENTIRE body from the stored-data access onward, because a
+    // decryptable-but-wrong-shape record (null, or missing
+    // attestation/data) throws a raw TypeError at the first property
+    // access -- before any signature work -- and is exactly as unverified
+    // as a bad signature (so is a malformed base64url signature or
+    // wrong-length key material). ANY throw classifies as the fail-closed
+    // `occupied_unverified` (return false), never an unclassified
+    // rejection escaping record()'s locked section.
     try {
+      const d = stored.attestation.data;
+      if (expectedContentId !== undefined) {
+        const recomputed = deriveReputationAttestationId(
+          d.interaction_id,
+          d.participant_did,
+          d.counterparty_did,
+          d.context
+        );
+        if (recomputed !== expectedContentId) return false;
+      }
+      if (
+        d.interaction_id !== tuple.interaction_id ||
+        d.participant_did !== tuple.participant_did ||
+        d.counterparty_did !== tuple.counterparty_did ||
+        d.context !== tuple.context
+      ) {
+        return false;
+      }
       const sigBytes = fromBase64urlStrict(stored.attestation.signature);
       const dataBytes = stringToBytes(JSON.stringify(d));
       return verify(dataBytes, sigBytes, callerPublicKey);

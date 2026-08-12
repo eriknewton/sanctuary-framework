@@ -896,17 +896,9 @@ describe("agent-audit-allowlist: STRUCTURE TRIPWIRE (comprehensive — agent-fac
   //   shr/tools.ts   — `shr_generate` (gatherReputationEvidence) derives a single
   //     boolean (verascore_linked) from a reputation_publish probe; no entries
   //     are returned.
-  //   bridge/tools.ts + reputation/tools.ts — `auditSuccessEntryExists` (LD6
-  //     gate fix-round F4): the in-lock reconcile branch of
-  //     bridge_commit/bridge_attest/reputation_record queries for the presence
-  //     of the record's own success audit entry and derives a single boolean
-  //     (append only when missing); no entry or `details` content reaches the
-  //     agent-visible tool result.
   const AGENT_FACING_NON_ENTRY_AUDIT_READS = [
     "audit/tools.ts",
     "shr/tools.ts",
-    "bridge/tools.ts",
-    "reputation/tools.ts",
   ] as const;
 
   // Operator / internal / principal audit reads that legitimately see FULL

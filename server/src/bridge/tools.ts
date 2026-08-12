@@ -182,15 +182,19 @@ export interface BridgeCommitmentAuditProjection {
   counterparty_did: string;
   /**
    * True ONLY on the existence-guard reconcile branch (an already-committed
-   * retry), false on a fresh write (LD6 gate fix-round F4 -- must match the
-   * same field on `ReputationRecordAuditProjection` in reputation-store.ts).
-   * The self-heal semantic is "re-emit the success audit when the durable
-   * audit is MISSING," not "append on every guard hit": the callback uses
-   * this flag to query the audit log first and append only on absence, so
-   * an identical-args retry loop cannot inflate the success-audit count
-   * N-fold (posture.ts tallies these entries as an honest lower bound) or
-   * push unbounded critical entries into the maxEntries-pruned log. The
-   * fresh-write path skips the query -- its entry cannot already exist.
+   * retry), false on a fresh write (LD6 gate fix-round F4, reworked
+   * fix-round-2 -- must match the same field on
+   * `ReputationRecordAuditProjection` in reputation-store.ts). The
+   * reconcile branch ALWAYS re-emits its success audit -- O(1): one
+   * bounded appendCritical, never an in-lock audit-log READ, which on the
+   * non-eager path costs a full-chain decrypt + re-verify and would
+   * serialize every admission behind it -- but the callback TAGS the
+   * emitted entry (`reconcile: true` in `details`) so consumers that COUNT
+   * success entries (posture.ts's receipt tally) exclude re-emissions: an
+   * identical-args retry loop appends only tagged entries the tally
+   * ignores, so it cannot inflate the posture-visible count N-fold. The
+   * self-heal semantic survives: a crash-window-orphaned record still gets
+   * a durable, full-fidelity (tagged) success entry from any retry.
    */
   reconcile: boolean;
 }
@@ -301,38 +305,6 @@ function counterpartyDidOf(commitment: BridgeCommitment, outcome: ConcordiaOutco
     : outcome.proposer_did;
 }
 
-/**
- * Reconcile-branch absence check (LD6 gate fix-round F4): true when the
- * durable audit log already holds a SUCCESS entry for `operation` whose
- * `details[idField]` equals `id`. Used by the in-lock audit callbacks so a
- * guard-hit retry re-emits the success audit ONLY when it is actually
- * missing (the ratified self-heal semantic), never on every hit. Queried
- * over the whole retained window (`getRetentionConfig().maxEntries`) so
- * "absent" means absent from the durable log, not merely from a recent
- * page; an entry already pruned by FIFO retention is genuinely missing from
- * the durable log, and re-appending it then is the self-heal semantic, not
- * a duplicate. A query failure propagates (fail closed): the reconcile
- * caller is refused rather than guessing between "already audited" (risking
- * a silently missing audit) and "not yet audited" (risking the N-fold
- * inflation this check exists to stop); the refused caller can retry.
- * Cross-file pin: must match the same helper in reputation/tools.ts (local
- * copy there for the usual module-boundary reason -- reputation must not
- * import from bridge).
- */
-async function auditSuccessEntryExists(
-  auditLog: AuditLog,
-  operation: string,
-  idField: string,
-  id: string
-): Promise<boolean> {
-  const { entries } = await auditLog.query({
-    operation_type: operation,
-    limit: auditLog.getRetentionConfig().maxEntries,
-  });
-  return entries.some(
-    (entry) => entry.result === "success" && entry.details?.[idField] === id
-  );
-}
 
 /**
  * Bounds how long a CALLER waits on BridgeStore's whole admission critical
@@ -357,14 +329,13 @@ async function auditSuccessEntryExists(
  * defensive backstop for the section's OWN storage ops (the guard read, the
  * two O(N) decrypt-scans — N bounded by MAX_BRIDGE_COMMITMENTS — and the
  * write), which the storage interface gives no settle-time contract for at
- * all; it is a backstop, not a precise bound. On the reconcile (guard-hit)
- * branch the append is replaced by the F4 absence QUERY (an audit-log read
- * over the retained window, bounded by the log's maxEntries retention cap)
- * plus an append only when the audit is missing — never both a full-cost
- * query and a 35s append on the same call unless the audit genuinely needs
- * re-emitting, so the write path above stays the section's worst case.
- * Total: the deadline exceeds the audit append's 35s hard worst case by
- * 15s of margin for everything else in the section.
+ * all; it is a backstop, not a precise bound. The reconcile (guard-hit)
+ * branch's in-lock work is ONE bounded appendCritical (the F4 fix-round-2
+ * tag-based re-emission -- same 35s worst case as the write path's append,
+ * with NO in-lock audit-log read), so the fresh-write path, which adds the
+ * scans and the record write on top of that same append, stays the
+ * section's worst case. Total: the deadline exceeds the audit append's 35s
+ * hard worst case by 15s of margin for everything else in the section.
  *
  * ACCEPTED CONSEQUENCE (deliberate, fail-closed): because the audit append
  * is INSIDE the lock, a slow or contended audit backend serializes
@@ -378,12 +349,15 @@ async function auditSuccessEntryExists(
  * sentinel path does NOT (the asymmetry sentinel-dispatcher.ts's comment
  * refuses to fold audit into saveFinding's lock over): a saturated
  * `SentinelFindingStore.saveFinding` can ALREADY spend up to
- * ON_EVICT_AUDIT_TIMEOUT_MS (40s) inside its lock on an evict-INTENT
- * `appendCritical`; folding a second audit append in would worst-case
- * 40s + 35s = 75s against the same 50s deadline, timing out every
- * capped-out caller. BridgeStore and ReputationStore perform NO in-lock
- * evict audit — their section contains exactly ONE awaited append — so the
- * single 35s worst case fits this budget with margin.
+ * ON_EVICT_AUDIT_TIMEOUT_MS (40s, the withTimeout-bounded evict-intent
+ * append) inside its lock; folding a second, bare (unbounded-by-timeout)
+ * audit append in would worst-case 40s + 35s = 75s against the same 50s
+ * deadline, timing out every capped-out caller. The 75s figure must match
+ * the routeFinding comment in sentinel-dispatcher.ts and the derivation
+ * note on REPUTATION_STORE_ADMISSION_DEADLINE_MS (reputation-store.ts).
+ * BridgeStore and ReputationStore perform NO in-lock evict audit — their
+ * section contains exactly ONE awaited append — so the single 35s worst
+ * case fits this budget with margin.
  *
  * CROSS-FILE PIN: must stay numerically identical to reputation-store.ts's
  * REPUTATION_STORE_ADMISSION_DEADLINE_MS and sentinel-finding-store.ts's
@@ -825,31 +799,35 @@ class BridgeStore {
     committerPublicKey: Uint8Array,
     expectedContentId?: string
   ): boolean {
-    const { commitment, outcome } = candidate;
-    if (expectedContentId !== undefined) {
-      const recomputed = deriveBridgeCommitmentId(
-        commitment.session_id,
-        outcome.terms_hash,
-        commitment.committer_did
-      );
-      if (recomputed !== expectedContentId) return false;
-    }
-    if (
-      commitment.session_id !== tuple.session_id ||
-      outcome.terms_hash !== tuple.terms_hash ||
-      commitment.committer_did !== tuple.committer_did
-    ) {
-      return false;
-    }
-    // Fail-closed decode/verify (LD6 gate fix-round F6 -- must match the
-    // try/catch in verifyStoredAttestationIntent, reputation-store.ts): a
-    // stored record whose signature or outcome is malformed enough to make
-    // decode/verify THROW (bad base64url, wrong-length key material, an
-    // uncanonicalizable outcome) is exactly as unverified as one that
-    // verifies false. Without this catch the throw escapes save()'s locked
-    // section as an unclassified rejection instead of the
-    // `occupied_unverified` classification the guard's contract promises.
+    // Fail-closed verification body (LD6 gate fix-round F6; scope widened
+    // fix-round-2 M-3 -- must match the try/catch in
+    // verifyStoredAttestationIntent, reputation-store.ts): the try encloses
+    // the ENTIRE body from the candidate destructure onward, because a
+    // decryptable-but-wrong-shape candidate (null, or missing
+    // commitment/outcome) throws a raw TypeError at the first property
+    // access -- before any signature work -- and is exactly as unverified
+    // as a bad signature (so are a malformed base64url signature,
+    // wrong-length key material, or an uncanonicalizable outcome inside
+    // verifyBridgeCommitment). ANY throw classifies as the fail-closed
+    // `occupied_unverified` (return false), never an unclassified
+    // rejection escaping save()'s locked section.
     try {
+      const { commitment, outcome } = candidate;
+      if (expectedContentId !== undefined) {
+        const recomputed = deriveBridgeCommitmentId(
+          commitment.session_id,
+          outcome.terms_hash,
+          commitment.committer_did
+        );
+        if (recomputed !== expectedContentId) return false;
+      }
+      if (
+        commitment.session_id !== tuple.session_id ||
+        outcome.terms_hash !== tuple.terms_hash ||
+        commitment.committer_did !== tuple.committer_did
+      ) {
+        return false;
+      }
       const verification = verifyBridgeCommitment(commitment, outcome, committerPublicKey);
       return verification.valid;
     } catch {
@@ -1183,20 +1161,10 @@ export function createBridgeTools(
         // `BridgeInLockAuditEmit`'s doc for why the callback type cannot
         // enforce this on its own (V2-5 gap-5).
         const emitAudit: BridgeInLockAuditEmit = async (projection) => {
-          // F4: on the reconcile branch, append ONLY when the durable
-          // success audit is missing -- see `auditSuccessEntryExists` and
-          // the projection's `reconcile` doc.
-          if (
-            projection.reconcile &&
-            (await auditSuccessEntryExists(
-              auditLog,
-              "bridge_commit",
-              "bridge_commitment_id",
-              projection.bridge_commitment_id
-            ))
-          ) {
-            return;
-          }
+          // F4 (fix-round-2, tag-based dedupe): a reconcile re-emission is
+          // TAGGED rather than deduped by an in-lock audit-log read -- see
+          // the projection's `reconcile` doc. posture.ts's receipt tally
+          // skips tagged entries.
           await auditLog.appendCritical({
             layer: "l3",
             operation: "bridge_commit",
@@ -1206,6 +1174,7 @@ export function createBridgeTools(
               bridge_commitment_id: projection.bridge_commitment_id,
               session_id: projection.session_id,
               counterparty: projection.counterparty_did,
+              ...(projection.reconcile ? { reconcile: true } : {}),
             },
           });
         };
@@ -1613,22 +1582,14 @@ export function createBridgeTools(
         const emitReputationAudit = async (
           projection: ReputationRecordAuditProjection
         ): Promise<void> => {
-          // F4: on the reconcile branch, append ONLY when the durable
-          // success audit is missing -- see `auditSuccessEntryExists` and
-          // the projection's `reconcile` doc. Without this, the removed
-          // `already_attested` fast path's zero-append behavior regressed
-          // into one critical append per identical Tier-3 retry.
-          if (
-            projection.reconcile &&
-            (await auditSuccessEntryExists(
-              auditLog,
-              "bridge_attest",
-              "attestation_id",
-              projection.attestation_id
-            ))
-          ) {
-            return;
-          }
+          // F4 (fix-round-2, tag-based dedupe): a reconcile re-emission is
+          // TAGGED rather than deduped by an in-lock audit-log read -- see
+          // ReputationRecordAuditProjection's `reconcile` doc. ACCEPTED
+          // (vs origin/main): the removed `already_attested` fast path
+          // appended ZERO entries per identical Tier-3 retry; this appends
+          // one TAGGED entry per guard hit -- per-call audit appends are
+          // the ambient norm on every other tool path, and the tally
+          // excludes tags.
           await auditLog.appendCritical({
             layer: "l4",
             operation: "bridge_attest",
@@ -1644,6 +1605,7 @@ export function createBridgeTools(
               // resolved `tier`. A legacy/pre-existing record can carry a
               // different tier; its audit must describe what is durable.
               sovereignty_tier: projection.sovereignty_tier,
+              ...(projection.reconcile ? { reconcile: true } : {}),
             },
           });
         };

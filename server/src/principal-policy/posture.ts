@@ -1903,14 +1903,23 @@ export async function buildRecognitionPanel(
     // Entries are already pre-filtered to bridge ops by the per-op queries; this
     // guard is defense-in-depth so a malformed audit row can never be tallied.
     if (!BRIDGE_RECEIPT_OPERATION_SET.has(entry.operation)) continue;
+    const details = isRecord(entry.details) ? entry.details : {};
+    // Reconcile-tagged re-emissions (`details.reconcile === true`) are the
+    // in-lock guard-hit re-audits bridge_commit/bridge_attest append on an
+    // identical-args retry (LD6 gate fix-round-2 F4 -- see the `reconcile`
+    // field docs in bridge/tools.ts and reputation-store.ts). Skipping them
+    // keeps this tally per-RECORD, so an agent looping identical Tier-3
+    // retries cannot inflate it. The counts below stay an honest LOWER
+    // bound, and skipping tags only strengthens that direction: a
+    // crash-window orphan whose audit was healed by a retry has ONLY a
+    // tagged entry, so it is undercounted here -- never double-counted.
     if (entry.operation === "bridge_commit") {
-      commitEvents += 1;
+      if (details.reconcile !== true) commitEvents += 1;
     } else if (entry.operation === "bridge_verify") {
-      const details = isRecord(entry.details) ? entry.details : {};
       if (details.valid === true) verifiedTrue += 1;
       else verifiedFalse += 1;
     } else if (entry.operation === "bridge_attest") {
-      attested += 1;
+      if (details.reconcile !== true) attested += 1;
     }
   }
 

@@ -74,17 +74,6 @@ function stubAuditLog(): AuditLog {
   return {
     append: () => {},
     appendCritical: async () => {},
-    // F4 reconcile-branch absence-query surface (the in-lock audit
-    // callbacks call query + getRetentionConfig -- see
-    // auditSuccessEntryExists in src/bridge/tools.ts). An empty stub log
-    // never holds the entry, so a reconcile in these tests always
-    // re-emits into the no-op appendCritical above; the F4 exactly-one-
-    // entry assertions live in the durable oracle suite
-    // (test/security/ld6-bp-deadline-03-admission-completion.test.ts).
-    query: async () => ({ entries: [], total: 0, integrity_findings: [] }),
-    // 1 is enough for a stub whose query always returns nothing; the value
-    // only feeds the query's `limit`.
-    getRetentionConfig: () => ({ maxEntries: 1, maxTotalSizeBytes: 0 }),
   } as unknown as AuditLog;
 }
 

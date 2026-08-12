@@ -261,10 +261,14 @@ export class SentinelDispatcher {
     // LD6 BP-DEADLINE-03 (V2-5 sentinel exception): AWAITED appendCritical
     // immediately AFTER the locked saveFinding, NOT folded into
     // saveFinding's own admission section -- a saturated saveFinding can
-    // already emit an evict-INTENT appendCritical (up to 40s) inside its
-    // lock; adding a second audit write there would need up to 80s against
-    // the shared 50s admission-deadline budget (see
-    // sentinel-finding-store.ts's STORE_ADMISSION_DEADLINE_MS derivation).
+    // already emit an evict-INTENT appendCritical (up to
+    // ON_EVICT_AUDIT_TIMEOUT_MS = 40s, its withTimeout bound) inside its
+    // lock; adding this bare 35s-worst-case audit write there would need
+    // up to 40s + 35s = 75s against the shared 50s admission-deadline
+    // budget (see sentinel-finding-store.ts's STORE_ADMISSION_DEADLINE_MS
+    // derivation; the 75s figure must match the asymmetry notes on
+    // BRIDGE_STORE_ADMISSION_DEADLINE_MS in bridge/tools.ts and
+    // REPUTATION_STORE_ADMISSION_DEADLINE_MS in reputation-store.ts).
     //
     // HONEST BOUND (fix-round correction -- the prior comment here claimed
     // "finding_id already gives this store I2/I3 (overwrite-in-place on a

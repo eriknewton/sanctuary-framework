@@ -216,12 +216,12 @@ async function durableRecordIds(storage: StorageBackend, ns: string): Promise<Se
  * the production instance's in-memory state) and calls `query()`, which
  * reloads persisted entries from `storage` itself -- this is the "reload
  * the on-disk audit chain" oracle V2-6 requires, not an in-memory spy.
- * Audit semantics are at-least-once across crashes (a reconcile retry
- * re-appends a success entry when the durable one is MISSING, V2-2; since
- * the F4 fix it appends ONLY then, never on every guard hit), so this
- * dedupes by the id field -- a `Set` collapses duplicates for free. Use
- * `countAuditSuccessEntries` below when the assertion is about the entry
- * COUNT itself (the F4 no-inflation property), not set membership.
+ * Audit semantics are at-least-once (a guard-hit retry ALWAYS re-appends a
+ * success entry, TAGGED `reconcile: true` since the F4 fix-round-2 rework,
+ * so posture's tally can exclude it), so this dedupes by the id field -- a
+ * `Set` collapses duplicates for free. Use `auditSuccessEntryCounts` below
+ * when the assertion is about entry COUNTS split by the tag (the F4
+ * no-tally-inflation property), not set membership.
  */
 async function auditSuccessIds(
   storage: StorageBackend,
@@ -241,26 +241,35 @@ async function auditSuccessIds(
 }
 
 /**
- * Count of durable SUCCESS audit entries for one record id (same fresh-
- * instance reload-from-storage oracle as `auditSuccessIds`, without the
- * Set dedupe). This is the F4 oracle: a guard-hit retry must re-emit the
- * success audit ONLY when the durable entry is missing, so identical
- * retries settle at exactly ONE entry -- the mutant (unconditional
- * reconcile emit) inflates this count N-fold and bloats the maxEntries-
- * pruned critical log.
+ * Durable SUCCESS audit-entry counts for one record id, split by the F4
+ * fix-round-2 `reconcile` tag (same fresh-instance reload-from-storage
+ * oracle as `auditSuccessIds`, without the Set dedupe). This is the F4
+ * oracle: a guard-hit retry always re-emits, but TAGGED, so the
+ * posture-visible count (`fresh` -- untagged entries, what posture.ts's
+ * receipt tally counts) settles at exactly ONE per record however many
+ * identical retries run; the mutant (untagged reconcile emit) inflates
+ * `fresh` N-fold and with it the posture receipt tally.
  */
-async function countAuditSuccessEntries(
+async function auditSuccessEntryCounts(
   storage: StorageBackend,
   masterKey: Uint8Array,
   operation: string,
   idField: string,
   id: string
-): Promise<number> {
+): Promise<{ fresh: number; reconcile: number }> {
   const freshAuditLog = new AuditLog(storage, masterKey);
   const { entries } = await freshAuditLog.query({ operation_type: operation, limit: 100_000 });
-  return entries.filter(
-    (entry) => entry.result === "success" && entry.details?.[idField] === id
-  ).length;
+  let fresh = 0;
+  let reconcile = 0;
+  for (const entry of entries) {
+    if (entry.result !== "success" || entry.details?.[idField] !== id) continue;
+    // Tag semantics must match posture.ts's tally filter (details.reconcile
+    // === true is skipped there) and the closure tagging in
+    // bridge/tools.ts / reputation/tools.ts.
+    if (entry.details?.["reconcile"] === true) reconcile += 1;
+    else fresh += 1;
+  }
+  return { fresh, reconcile };
 }
 
 // ─── Bridge (bridge_commit) ─────────────────────────────────────────────
@@ -442,6 +451,36 @@ describe("LD6 BP-DEADLINE-03: bridge_commit durable admission-completion oracle"
     expect(entries.length).toBe(1); // only the pre-seeded foreign record
   });
 
+  it("M-3 (fix-round-2): a decryptable-but-wrong-shape candidate at the derived key (JSON null) classifies as the fail-closed occupied_unverified, never a raw TypeError escaping the locked section", async () => {
+    const rig = setup();
+    await seedIdentities(rig);
+    const outcome = makeOutcome({ session_id: "ld6-m3-null-candidate" });
+    const legitId = deriveBridgeCommitmentId(
+      outcome.session_id,
+      outcome.terms_hash,
+      rig.signer.publicIdentity.did
+    );
+
+    // Pre-seed a VALIDLY ENCRYPTED payload whose plaintext is JSON `null`:
+    // it decrypts and parses fine, then the intent verifier's candidate
+    // destructure would throw a raw TypeError if the try scope started
+    // after it (the pre-M-3 shape).
+    const bridgeEncKey = derivePurposeKey(rig.masterKey, "bridge-commitments");
+    const encrypted: EncryptedPayload = encrypt(stringToBytes("null"), bridgeEncKey);
+    await rig.storage.write("_bridge", legitId, stringToBytes(JSON.stringify(encrypted)));
+
+    const result = await callToolSafe(rig.commit, {
+      ...outcome,
+      identity_id: rig.signer.storedIdentity.identity_id,
+    });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(String(result.value.error)).toMatch(/occupied.*intent verification/i);
+      expect(result.value.already_committed).toBeUndefined();
+    }
+    expect((await rig.storage.list("_bridge")).length).toBe(1);
+  });
+
   it("existence guard rejects a signed commitment whose stored outcome no longer opens it", async () => {
     const rig = setup();
     await seedIdentities(rig);
@@ -510,7 +549,7 @@ describe("LD6 BP-DEADLINE-03: bridge_commit durable admission-completion oracle"
     }
   });
 
-  it("F4 (audit-emit dedupe): two identical successful calls settle at exactly ONE success audit entry -- the reconcile branch emits only when the durable audit is MISSING, never per guard hit", async () => {
+  it("F4 (tag-based audit-emit dedupe): two identical successful calls settle at exactly ONE posture-visible (untagged) success entry; the retry's re-emission is tagged reconcile", async () => {
     const rig = setup();
     await seedIdentities(rig);
     const outcome = makeOutcome({ session_id: "ld6-f4-dedupe-session" });
@@ -527,18 +566,20 @@ describe("LD6 BP-DEADLINE-03: bridge_commit durable admission-completion oracle"
     expect(second.ok).toBe(true);
     if (second.ok) expect(second.value.already_committed).toBe(true);
 
-    // Pre-F4 mutant: the removed fast path appended ZERO entries on a
-    // repeat, but the reconcile branch appended one per guard hit -- an
-    // identical-args loop inflated posture.ts's tally N-fold. Exactly one.
-    expect(
-      await countAuditSuccessEntries(
-        rig.storage,
-        rig.masterKey,
-        "bridge_commit",
-        "bridge_commitment_id",
-        commitId
-      )
-    ).toBe(1);
+    // Pre-F4 mutant: the reconcile branch appended an UNTAGGED entry per
+    // guard hit, so an identical-args loop inflated posture.ts's receipt
+    // tally N-fold. Tag semantics: exactly one untagged (posture-visible)
+    // entry; the retry's re-emission exists but is tagged and excluded
+    // from the tally.
+    const counts = await auditSuccessEntryCounts(
+      rig.storage,
+      rig.masterKey,
+      "bridge_commit",
+      "bridge_commitment_id",
+      commitId
+    );
+    expect(counts.fresh).toBe(1);
+    expect(counts.reconcile).toBe(1);
     expect((await rig.storage.list("_bridge")).length).toBe(1);
   });
 
@@ -598,20 +639,21 @@ describe("LD6 BP-DEADLINE-03: bridge_commit durable admission-completion oracle"
 
       // DURABLE cap held across the whole fault schedule: exactly one
       // committed record (quota headroom consumed exactly once) and
-      // exactly one success audit entry (waves 2/3's reconcile found the
-      // durable audit present and did not re-append, F4). Every caller
-      // told success (waves 2/3) has the durable record+audit pair behind
-      // it; wave 1 (no confirmed pair at response time) was refused.
+      // exactly one posture-visible success entry -- waves 2/3's reconcile
+      // re-emissions are TAGGED (F4 fix-round-2), so they exist (proving
+      // the always-emit self-heal) but never inflate the tally. Every
+      // caller told success (waves 2/3) has the durable record+audit pair
+      // behind it; wave 1 (no confirmed pair at response time) was refused.
       expect(await durableRecordIds(rig.storage, "_bridge")).toEqual(new Set([commitId]));
-      expect(
-        await countAuditSuccessEntries(
-          rig.storage,
-          rig.masterKey,
-          "bridge_commit",
-          "bridge_commitment_id",
-          commitId
-        )
-      ).toBe(1);
+      const counts = await auditSuccessEntryCounts(
+        rig.storage,
+        rig.masterKey,
+        "bridge_commit",
+        "bridge_commitment_id",
+        commitId
+      );
+      expect(counts.fresh).toBe(1);
+      expect(counts.reconcile).toBe(2);
     } finally {
       vi.useRealTimers();
     }
@@ -794,7 +836,7 @@ describe("LD6 BP-DEADLINE-03: bridge_attest durable admission-completion oracle"
     expect((await rig.storage.list("_reputation")).length).toBe(1);
   });
 
-  it("F4 (audit-emit dedupe): two identical bridge_attest calls settle at exactly ONE success audit entry -- pre-F4 the removed already_attested fast path's zero-append behavior had regressed into one critical append per identical Tier-3 retry", async () => {
+  it("F4 (tag-based audit-emit dedupe): two identical bridge_attest calls settle at exactly ONE posture-visible (untagged) success entry -- the accepted per-guard-hit append is tagged reconcile, so it never inflates the receipt tally", async () => {
     const rig = setup();
     const { commitmentId, outcome } = await seedAndCommit(rig);
     const attestationId = deriveReputationAttestationId(
@@ -813,15 +855,15 @@ describe("LD6 BP-DEADLINE-03: bridge_attest durable admission-completion oracle"
       expect(result.ok).toBe(true);
     }
 
-    expect(
-      await countAuditSuccessEntries(
-        rig.storage,
-        rig.masterKey,
-        "bridge_attest",
-        "attestation_id",
-        attestationId
-      )
-    ).toBe(1);
+    const counts = await auditSuccessEntryCounts(
+      rig.storage,
+      rig.masterKey,
+      "bridge_attest",
+      "attestation_id",
+      attestationId
+    );
+    expect(counts.fresh).toBe(1);
+    expect(counts.reconcile).toBe(1);
     expect((await rig.storage.list("_reputation")).length).toBe(1);
   });
 });
@@ -979,7 +1021,7 @@ describe("LD6 BP-DEADLINE-03: reputation_record durable admission-completion ora
     expect((await rig.storage.list("_reputation")).length).toBe(1);
   });
 
-  it("F4 (audit-emit dedupe): two identical reputation_record calls settle at exactly ONE success audit entry", async () => {
+  it("F4 (tag-based audit-emit dedupe): two identical reputation_record calls settle at exactly ONE untagged success entry; the retry's re-emission is tagged reconcile", async () => {
     const rig = setup();
     await seedIdentity(rig);
     const args = {
@@ -1001,15 +1043,51 @@ describe("LD6 BP-DEADLINE-03: reputation_record durable admission-completion ora
       expect(result.ok).toBe(true);
     }
 
-    expect(
-      await countAuditSuccessEntries(
-        rig.storage,
-        rig.masterKey,
-        "reputation_record",
-        "attestation_id",
-        attestationId
-      )
-    ).toBe(1);
+    const counts = await auditSuccessEntryCounts(
+      rig.storage,
+      rig.masterKey,
+      "reputation_record",
+      "attestation_id",
+      attestationId
+    );
+    expect(counts.fresh).toBe(1);
+    expect(counts.reconcile).toBe(1);
+    expect((await rig.storage.list("_reputation")).length).toBe(1);
+  });
+
+  it("M-3 (fix-round-2, reputation twin): a decryptable-but-wrong-shape record at the derived key ({attestation: null}) classifies as the fail-closed occupied_unverified, never a raw TypeError escaping the locked section", async () => {
+    const rig = setup();
+    await seedIdentity(rig);
+    const args = {
+      interaction_id: "ld6-m3-record-null",
+      counterparty_did: "did:sanctuary:counterparty-m3",
+      outcome: { type: "transaction", result: "completed" },
+      context: "general",
+      identity_id: rig.signer.storedIdentity.identity_id,
+    };
+    const attestationId = deriveReputationAttestationId(
+      args.interaction_id,
+      rig.signer.publicIdentity.did,
+      args.counterparty_did,
+      args.context
+    );
+
+    // Validly encrypted, parses fine, but `stored.attestation` is null --
+    // the intent verifier's `.data` access would throw a raw TypeError if
+    // the try scope started after it (the pre-M-3 shape).
+    const repEncKey = derivePurposeKey(rig.masterKey, "l4-reputation");
+    const encrypted: EncryptedPayload = encrypt(
+      stringToBytes(JSON.stringify({ attestation: null })),
+      repEncKey
+    );
+    await rig.storage.write("_reputation", attestationId, stringToBytes(JSON.stringify(encrypted)));
+
+    const result = await callToolSafe(rig.record, args, rig.signer.publicIdentity.did);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(String(result.value.error)).toMatch(/occupied.*intent verification/i);
+      expect(result.value.already_committed).toBeUndefined();
+    }
     expect((await rig.storage.list("_reputation")).length).toBe(1);
   });
 
@@ -1065,15 +1143,18 @@ describe("LD6 BP-DEADLINE-03: reputation_record durable admission-completion ora
       expect(await durableRecordIds(rig.storage, "_reputation")).toEqual(
         new Set([attestationId])
       );
-      expect(
-        await countAuditSuccessEntries(
-          rig.storage,
-          rig.masterKey,
-          "reputation_record",
-          "attestation_id",
-          attestationId
-        )
-      ).toBe(1);
+      // One posture-visible entry (wave 1's fresh write); waves 2/3's
+      // re-emissions are tagged reconcile (F4 fix-round-2) -- present,
+      // never tally-visible.
+      const counts = await auditSuccessEntryCounts(
+        rig.storage,
+        rig.masterKey,
+        "reputation_record",
+        "attestation_id",
+        attestationId
+      );
+      expect(counts.fresh).toBe(1);
+      expect(counts.reconcile).toBe(2);
     } finally {
       vi.useRealTimers();
     }
@@ -1123,7 +1204,7 @@ describe("LD6 BP-DEADLINE-03: sentinel FINDING_EMITTED durable admission-complet
     return { storage, masterKey, findingStore, dispatcher, stub, auditLog, queueRejections };
   }
 
-  it("I1 (V2-5 sentinel exception, HONEST bound): an audit-append failure surfaces to tick()'s per-sentinel error path, the finding is ALREADY durably persisted, but -- unlike bridge/reputation -- the crash-window orphan is NEVER self-healed: production sentinels emit finding_id: \"\", so a later tick mints a DIFFERENT random id and never reconciles the first", async () => {
+  it("I1 (V2-5 sentinel exception, HONEST bound): an audit-append failure is contained per-finding (F3) -- the durably persisted finding is still returned and emitted, the failure surfaces as its own diagnostic event -- but, unlike bridge/reputation, the crash-window orphan is NEVER self-healed: production sentinels emit finding_id: \"\", so a later tick mints a DIFFERENT random id and never reconciles the first", async () => {
     const rig = setup();
     await rig.dispatcher.subscribeSentinel(rig.stub.sentinelId);
     // Drain the SUBSCRIBED audit append (fire-and-forget `append()`, not
