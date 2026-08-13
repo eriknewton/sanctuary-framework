@@ -102,6 +102,7 @@ SIGNER_HELPER_DST="${WRAPPED_APP_DIR}/Contents/MacOS/castle-wall-signer-helper"
 SIGNER_CLIENT_DST="${WRAPPED_APP_DIR}/Contents/MacOS/castle-wall-signer-client"
 SIGNER_HELPER_ENTITLEMENTS="${PKG_DIR}/Sources/CastleWallSignerHelper/CastleWallSignerHelper.entitlements"
 SIGNER_CLIENT_ENTITLEMENTS="${PKG_DIR}/Sources/CastleWallSignerClient/CastleWallSignerClient.entitlements"
+BOOT_RUNTIME_NODE_ENTITLEMENTS="${PKG_DIR}/signing/node-boot-runtime.entitlements"
 # Notarization: set NOTARYTOOL_PROFILE (a `notarytool store-credentials` keychain
 # profile) to notarize + staple automatically. Apps that bundle a LaunchDaemon
 # MUST be notarized or SMAppService stays stuck at .requiresApproval/.notFound.
@@ -393,6 +394,7 @@ if [ "${WRAPPED}" = true ]; then
             --timestamp \
             --identifier "ai.sanctuaryprotocol.macos.castle-wall.node" \
             --sign "${SIGNING_IDENTITY}" \
+            --entitlements "${BOOT_RUNTIME_NODE_ENTITLEMENTS}" \
             "${BOOT_RUNTIME_NODE}"
     elif [ "${SANCTUARY_REQUIRE_BOOT_RUNTIME:-0}" = "1" ]; then
         echo "[build-signed] ERROR: required app-bundled Castle Wall boot runtime is absent" >&2

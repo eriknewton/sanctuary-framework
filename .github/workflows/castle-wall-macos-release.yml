@@ -265,6 +265,10 @@ jobs:
           codesign --verify --strict \
             --requirement='anchor apple generic and certificate leaf[subject.OU] = "YFQSWQ9BJN" and identifier "ai.sanctuaryprotocol.macos.castle-wall.node"' \
             "$NODE"
+          NODE_ENTITLEMENTS="$RUNNER_TEMP/castle-wall-node-entitlements.plist"
+          codesign -d --entitlements - --xml "$NODE" > "$NODE_ENTITLEMENTS" 2>/dev/null
+          test "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.security.cs.allow-jit' "$NODE_ENTITLEMENTS")" = true
+          test "$(plutil -p "$NODE_ENTITLEMENTS" | grep -c ' => ')" = 1
           codesign --verify --strict \
             --requirement='anchor apple generic and certificate leaf[subject.OU] = "YFQSWQ9BJN" and identifier "ai.sanctuaryprotocol.macos.castle-wall.signer-client"' \
             "$SIGNER"
@@ -289,8 +293,16 @@ jobs:
             --safe-mode --launchd --fortress "$SMOKE_DIR/fortress" >"$SMOKE_DIR/output" 2>&1
           status=$?
           set -e
-          test "$status" -ne 0
-          grep -qi 'boot token' "$SMOKE_DIR/output"
+          if [ "$status" -eq 0 ]; then
+            echo "::error::standalone boot runtime unexpectedly started without a per-fortress boot token"
+            cat "$SMOKE_DIR/output"
+            exit 1
+          fi
+          if ! grep -qi 'boot token' "$SMOKE_DIR/output"; then
+            echo "::error::standalone boot runtime failed before reaching the expected boot-token custody gate"
+            cat "$SMOKE_DIR/output"
+            exit 1
+          fi
 
       # Fail-closed launchability assertions, BEFORE notarization spends time
       # and an Apple round-trip on a bundle that cannot launch.
@@ -355,8 +367,51 @@ jobs:
           xcrun stapler validate build/Sanctuary-CastleWall.app
           spctl --assess --type execute --verbose=4 build/Sanctuary-CastleWall.app
 
+          # `codesign --deep` does not reliably discover arbitrary Mach-O files
+          # under Contents/Resources. Re-verify the embedded Node executable
+          # after stapling so a valid outer app cannot conceal damaged runtime
+          # code that launchd will later snapshot into root custody.
+          codesign --verify --strict \
+            --requirement='anchor apple generic and certificate leaf[subject.OU] = "YFQSWQ9BJN" and identifier "ai.sanctuaryprotocol.macos.castle-wall.node"' \
+            build/Sanctuary-CastleWall.app/Contents/Resources/boot-runtime/node
+
           # Artifact zip is produced from the STAPLED bundle.
           ditto -c -k --keepParent build/Sanctuary-CastleWall.app build/Sanctuary-CastleWall.app.zip
+
+          # Validate the exact bytes consumers receive, not merely the build
+          # tree from which the archive was produced. Extraction must preserve
+          # the nested signature and the sealed pair must still reach the
+          # expected boot-token custody gate outside the repository.
+          ARTIFACT_CHECK_DIR=$(mktemp -d "$RUNNER_TEMP/castle-wall-artifact.XXXXXX")
+          trap 'rm -rf "$ARTIFACT_CHECK_DIR"' EXIT
+          ditto -x -k build/Sanctuary-CastleWall.app.zip "$ARTIFACT_CHECK_DIR"
+          ARTIFACT_APP="$ARTIFACT_CHECK_DIR/Sanctuary-CastleWall.app"
+          ARTIFACT_RUNTIME="$ARTIFACT_APP/Contents/Resources/boot-runtime"
+          codesign --verify --deep --strict "$ARTIFACT_APP"
+          codesign --verify --strict \
+            --requirement='anchor apple generic and certificate leaf[subject.OU] = "YFQSWQ9BJN" and identifier "ai.sanctuaryprotocol.macos.castle-wall.node"' \
+            "$ARTIFACT_RUNTIME/node"
+          ARTIFACT_NODE_ENTITLEMENTS="$ARTIFACT_CHECK_DIR/node-entitlements.plist"
+          codesign -d --entitlements - --xml "$ARTIFACT_RUNTIME/node" \
+            > "$ARTIFACT_NODE_ENTITLEMENTS" 2>/dev/null
+          test "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.security.cs.allow-jit' "$ARTIFACT_NODE_ENTITLEMENTS")" = true
+          test "$(plutil -p "$ARTIFACT_NODE_ENTITLEMENTS" | grep -c ' => ')" = 1
+          xcrun stapler validate "$ARTIFACT_APP"
+          spctl --assess --type execute --verbose=4 "$ARTIFACT_APP"
+
+          set +e
+          "$ARTIFACT_RUNTIME/node" "$ARTIFACT_RUNTIME/castle-wall-boot-daemon.js" \
+            castle-wall daemon --safe-mode --launchd \
+            --fortress "$ARTIFACT_CHECK_DIR/fortress" \
+            >"$ARTIFACT_CHECK_DIR/runtime-output" 2>&1
+          artifact_runtime_status=$?
+          set -e
+          if [ "$artifact_runtime_status" -eq 0 ] \
+            || ! grep -qi 'boot token' "$ARTIFACT_CHECK_DIR/runtime-output"; then
+            echo "::error::shipped boot runtime did not reach the expected boot-token custody gate"
+            cat "$ARTIFACT_CHECK_DIR/runtime-output"
+            exit 1
+          fi
 
       # Launch smoke test: prove the exact bundle we ship can be SPAWNED.
       #
