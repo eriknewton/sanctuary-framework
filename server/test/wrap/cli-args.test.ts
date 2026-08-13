@@ -85,6 +85,18 @@ describe("Wrap CLI", () => {
       expect(opts.devDist).toBe("/abs/path/to/dist/cli.js");
     });
 
+    it("parses --sealed-launcher with an absolute app path", () => {
+      const opts = parseWrapArgs(["--sealed-launcher", "/Applications/Sanctuary-CastleWall.app/Contents/MacOS/sanctuary"]);
+      expect(opts.sealedLauncher).toBe("/Applications/Sanctuary-CastleWall.app/Contents/MacOS/sanctuary");
+    });
+
+    it("rejects split runtime identity flags", () => {
+      expect(() => parseWrapArgs([
+        "--dev-dist", "/tmp/dist/cli.js",
+        "--sealed-launcher", "/Applications/Sanctuary-CastleWall.app/Contents/MacOS/sanctuary",
+      ])).toThrow(/cannot be combined/);
+    });
+
     it("parses protect preflight flags", () => {
       const opts = parseWrapArgs(["--preflight", "--json", "--strict"]);
       expect(opts.preflight).toBe(true);

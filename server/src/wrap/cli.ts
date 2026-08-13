@@ -544,6 +544,12 @@ export interface WrapOptions {
    */
   devDist?: string;
   /**
+   * App-sealed production entrypoint used by the full macOS installer.
+   * Unlike --dev-dist, this is the executable command written directly into
+   * the harness config; it carries no node/npm/npx or PATH dependency.
+   */
+  sealedLauncher?: string;
+  /**
    * Opt-in plaintext passphrase backup file path. When set, writes the
    * generated passphrase to this file at mode 0600. Default behavior
    * (unset): Keychain-only, no plaintext file on disk. v1.2.1 change:
@@ -743,10 +749,13 @@ function buildSanctuaryEnv(options: WrapOptions): Record<string, string> {
  * install prompt. Upgrades re-run `sanctuary protect`, which rewrites
  * the pin to the new version.
  */
-function resolveSanctuaryCommand(options: WrapOptions): {
+export function resolveSanctuaryCommand(options: WrapOptions): {
   command: string;
   args: string[];
 } {
+  if (options.sealedLauncher !== undefined) {
+    return { command: options.sealedLauncher, args: [] };
+  }
   const useDevDist = options.devDist !== undefined;
   return {
     command: useDevDist ? "node" : "npx",
@@ -759,6 +768,48 @@ function resolveSanctuaryCommand(options: WrapOptions): {
           "sanctuary",
         ],
   };
+}
+
+export class SealedLauncherInvalidError extends Error {
+  constructor(path: string, reason: string) {
+    super(`--sealed-launcher path is invalid: ${reason}\n  path: ${path}`);
+    this.name = "SealedLauncherInvalidError";
+  }
+}
+
+const CASTLE_WALL_SEALED_LAUNCHER =
+  "/Applications/Sanctuary-CastleWall.app/Contents/MacOS/sanctuary";
+
+export async function validateSealedLauncher(path: string): Promise<void> {
+  if (!path.startsWith("/")) {
+    throw new SealedLauncherInvalidError(path, "an absolute path is required");
+  }
+  const resolved = resolvePath(path);
+  if (resolved !== path) {
+    throw new SealedLauncherInvalidError(path, "the path must be normalized");
+  }
+  if (path !== CASTLE_WALL_SEALED_LAUNCHER) {
+    throw new SealedLauncherInvalidError(
+      path,
+      `expected the canonical signed-app path ${CASTLE_WALL_SEALED_LAUNCHER}`,
+    );
+  }
+  try {
+    const st = await lstat(path);
+    if (st.isSymbolicLink() || !st.isFile() || (st.mode & 0o111) === 0) {
+      throw new SealedLauncherInvalidError(path, "expected a non-symlink executable file");
+    }
+  } catch (error) {
+    if (error instanceof SealedLauncherInvalidError) throw error;
+    throw new SealedLauncherInvalidError(path, "no such executable file");
+  }
+  const { verifyCastleWallSealedRuntime } = await import("../cli/install.js");
+  if (!(await verifyCastleWallSealedRuntime())) {
+    throw new SealedLauncherInvalidError(
+      path,
+      "the app signature, exact source identity, or sealed runtime manifest did not verify",
+    );
+  }
 }
 
 function resolveAutoProvisionCliBinary(options: WrapOptions): string | undefined {
@@ -2920,6 +2971,18 @@ export async function runWrap(
     } catch (err) {
       if (err instanceof DevDistInvalidError) {
         // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+        console.error(`\n  Sanctuary wrap: ${err.message}\n`);
+        process.exit(2);
+      }
+      throw err;
+    }
+  }
+  if (options.sealedLauncher !== undefined) {
+    try {
+      await validateSealedLauncher(options.sealedLauncher);
+    } catch (err) {
+      if (err instanceof SealedLauncherInvalidError) {
+        // SAFETY: stderr is the operator-facing CLI channel; the error names only the code-controlled launcher path and validation reason.
         console.error(`\n  Sanctuary wrap: ${err.message}\n`);
         process.exit(2);
       }
@@ -6022,6 +6085,7 @@ const WRAP_VALUE_FLAGS = new Set([
   "--dashboard-port",
   "--fortress",
   "--dev-dist",
+  "--sealed-launcher",
   "--write-passphrase-backup",
 ]);
 
@@ -6193,6 +6257,9 @@ export function parseWrapArgs(argv: string[]): WrapOptions {
       case "--dev-dist":
         options.devDist = argv[++i];
         break;
+      case "--sealed-launcher":
+        options.sealedLauncher = argv[++i];
+        break;
       case "--write-passphrase-backup":
         options.writePassphraseBackup = argv[++i];
         break;
@@ -6217,6 +6284,9 @@ export function parseWrapArgs(argv: string[]): WrapOptions {
   }
   if (options.preflight === true && options.unwrap === true) {
     throw new Error("--preflight cannot be combined with --unwrap.");
+  }
+  if (options.devDist !== undefined && options.sealedLauncher !== undefined) {
+    throw new Error("--sealed-launcher cannot be combined with --dev-dist.");
   }
 
   return options;
@@ -6292,6 +6362,10 @@ function printWrapHelp(): void {
                        version doesn't have new subcommands yet, and
                        npx pulls from the registry, not your checkout.
                        Pass the absolute path to dist/cli.js.
+    --sealed-launcher <path>
+                       Signed-app production path. Write this absolute
+                       executable directly into the harness MCP config with
+                       no node/npm/npx or PATH dependency.
     --stand-down-agent
                        With --repair-egress-gate or --unprotect-egress-gate,
                        acknowledge and permit the required agent-harness stop.

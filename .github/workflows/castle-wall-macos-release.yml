@@ -50,12 +50,22 @@ jobs:
           cache: npm
           cache-dependency-path: server/package-lock.json
 
-      - name: Build self-contained Castle Wall boot daemon
+      - name: Build self-contained Castle Wall and CLI runtimes
         working-directory: server
+        env:
+          SANCTUARY_SOURCE_SHA: ${{ github.sha }}
         run: |
           npm ci --ignore-scripts
-          npm run build:boot-runtime
+          npm run build
           test -s dist/boot-runtime/castle-wall-boot-daemon.js
+          test -s dist/cli.js
+          test -d dist/templates
+          test -d dist/reference-plugin
+          # npm currently retains viem's optional TypeScript peer even with
+          # --omit=peer; keep the exact production closure and prove its size
+          # below rather than deleting dependency bytes by guesswork.
+          npm prune --omit=dev --omit=peer --ignore-scripts
+          test -d node_modules/@modelcontextprotocol/sdk
 
       # Preflight: name the missing credential instead of dying inside Keychain.
       #
@@ -238,6 +248,7 @@ jobs:
           SIGNING_IDENTITY: "Developer ID Application: Erik Newton (YFQSWQ9BJN)"
           SANCTUARY_REQUIRE_BOOT_RUNTIME: "1"
           SANCTUARY_BOOT_RUNTIME_DAEMON: ${{ github.workspace }}/server/dist/boot-runtime/castle-wall-boot-daemon.js
+          SANCTUARY_CLI_RUNTIME_DIR: ${{ github.workspace }}/server/dist
         run: |
           # setup-node places `node` on PATH. Resolve the exact executable here;
           # do not depend on an action-internal directory convention.
@@ -254,13 +265,27 @@ jobs:
           RUNTIME="$APP/Contents/Resources/boot-runtime"
           NODE="$RUNTIME/node"
           DAEMON="$RUNTIME/castle-wall-boot-daemon.js"
+          CLI_RUNTIME="$APP/Contents/Resources/cli-runtime"
+          CLI="$CLI_RUNTIME/dist/cli.js"
+          LAUNCHER="$APP/Contents/MacOS/sanctuary"
+          MANIFEST="$APP/Contents/Resources/cli-runtime-manifest.json"
           SIGNER="$APP/Contents/MacOS/castle-wall-signer-client"
+          EXPECTED_VERSION=$(node -p "require('../server/package.json').version")
 
           test -x "$NODE"
           test -s "$DAEMON"
           test -x "$SIGNER"
+          test -s "$CLI"
+          test -s "$CLI_RUNTIME/package.json"
+          test -x "$LAUNCHER"
+          test -s "$MANIFEST"
+          test -d "$CLI_RUNTIME/node_modules/@modelcontextprotocol/sdk"
+          test -d "$CLI_RUNTIME/templates"
+          test -d "$CLI_RUNTIME/reference-plugin"
           test "$(stat -f '%Lp' "$NODE")" = 555
           test "$(stat -f '%Lp' "$DAEMON")" = 444
+          test "$(stat -f '%Lp' "$CLI")" = 444
+          test -z "$(find "$CLI_RUNTIME" -type l -print -quit)"
 
           codesign --verify --strict \
             --requirement='anchor apple generic and certificate leaf[subject.OU] = "YFQSWQ9BJN" and identifier "ai.sanctuaryprotocol.macos.castle-wall.node"' \
@@ -272,6 +297,49 @@ jobs:
           codesign --verify --strict \
             --requirement='anchor apple generic and certificate leaf[subject.OU] = "YFQSWQ9BJN" and identifier "ai.sanctuaryprotocol.macos.castle-wall.signer-client"' \
             "$SIGNER"
+          codesign --verify --strict \
+            --requirement='anchor apple generic and certificate leaf[subject.OU] = "YFQSWQ9BJN" and identifier "ai.sanctuaryprotocol.macos.castle-wall.sanctuary-launcher"' \
+            "$LAUNCHER"
+          MACH_O_COUNT=0
+          while IFS= read -r -d '' addon; do
+            codesign --verify --strict \
+              --requirement='anchor apple generic and certificate leaf[subject.OU] = "YFQSWQ9BJN"' \
+              "$addon"
+            MACH_O_COUNT=$((MACH_O_COUNT + 1))
+          done < <(node scripts/list-cli-runtime-mach-o.mjs "$CLI_RUNTIME")
+          test "$MACH_O_COUNT" -ge 2
+
+          node -e '
+            const m = require(process.argv[1]);
+            const i = m.inventory;
+            const roots = m.files.filter(f => {
+              const s = f.path.split("/");
+              return f.path === "Resources/cli-runtime/package.json" ||
+                (s.at(-1) === "package.json" && (s.at(-3) === "node_modules" ||
+                  (s.at(-4) === "node_modules" && s.at(-3).startsWith("@"))));
+            });
+            const packageJsonCount = m.files.filter(f => f.path.endsWith("/package.json")).length;
+            const nestedPackageCount = roots.filter(f => f.path.split("/node_modules/").length > 2).length;
+            if (i.file_count > 30000 || i.total_bytes > 420 * 1024 * 1024) process.exit(1);
+            if (i.mach_o_count !== Number(process.argv[2]) || i.package_count !== roots.length) process.exit(1);
+            if (i.package_json_count !== packageJsonCount || i.package_internal_json_count !== packageJsonCount - roots.length) process.exit(1);
+            if (i.nested_package_count !== nestedPackageCount) process.exit(1);
+            if (!i.mach_o.some(p => p.includes("/@lmdb/") && p.endsWith(".node"))) process.exit(1);
+            if (!i.mach_o.some(p => p.includes("/@msgpackr-extract/") && p.endsWith(".node"))) process.exit(1);
+            console.log(JSON.stringify({
+              file_count: i.file_count, total_bytes: i.total_bytes,
+              installed_package_roots: i.package_count,
+              nested_installed_package_roots: i.nested_package_count,
+              package_internal_json_excluded: i.package_internal_json_count,
+              mach_o_count: i.mach_o_count,
+            }));
+          ' "$MANIFEST" "$MACH_O_COUNT"
+
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist")" = "$EXPECTED_VERSION"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :SanctuaryCliRuntimeVersion' "$APP/Contents/Info.plist")" = "$EXPECTED_VERSION"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :SanctuaryCastleWallSourceSHA' "$APP/Contents/Info.plist")" = "$GITHUB_SHA"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :SanctuaryCliRuntimeNodeVersion' "$APP/Contents/Info.plist")" = "$("$NODE" --version)"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :SanctuaryCliRuntimeManifestSHA256' "$APP/Contents/Info.plist")" = "$(shasum -a 256 "$MANIFEST" | awk '{print $1}')"
 
           for executable in "$NODE" "$SIGNER"; do
             unsafe=$(otool -L "$executable" | awk 'NR > 1 { print $1 }' \
@@ -303,6 +371,22 @@ jobs:
             cat "$SMOKE_DIR/output"
             exit 1
           fi
+          /usr/bin/env -i PATH=/usr/bin:/bin NODE_OPTIONS='--require=/definitely/missing' NODE_PATH=/definitely/missing \
+            "$LAUNCHER" --version \
+            | grep -Fx "@sanctuary-framework/mcp-server $EXPECTED_VERSION"
+          "$NODE" -e '
+            const load = require("node:module").createRequire(process.argv[1]);
+            load("lmdb");
+            load("msgpackr-extract");
+          ' "$CLI_RUNTIME/package.json"
+          FAKE_ROOT="$SMOKE_DIR/argv0-proof"
+          mkdir -p "$FAKE_ROOT/Contents/MacOS" "$FAKE_ROOT/Contents/Resources/boot-runtime" "$FAKE_ROOT/Contents/Resources/cli-runtime/dist"
+          printf '#!/bin/sh\necho ATTACKER-RUNTIME\n' > "$FAKE_ROOT/Contents/Resources/boot-runtime/node"
+          chmod +x "$FAKE_ROOT/Contents/Resources/boot-runtime/node"
+          printf 'throw new Error("attacker runtime")\n' > "$FAKE_ROOT/Contents/Resources/cli-runtime/dist/cli.js"
+          /usr/bin/env -i PATH=/usr/bin:/bin /bin/zsh -c \
+            'ARGV0="$1/Contents/MacOS/sanctuary" "$2" --version' _ "$FAKE_ROOT" "$LAUNCHER" \
+            | grep -Fx "@sanctuary-framework/mcp-server $EXPECTED_VERSION"
 
       # Fail-closed launchability assertions, BEFORE notarization spends time
       # and an Apple round-trip on a bundle that cannot launch.
@@ -383,10 +467,16 @@ jobs:
           # the nested signature and the sealed pair must still reach the
           # expected boot-token custody gate outside the repository.
           ARTIFACT_CHECK_DIR=$(mktemp -d "$RUNNER_TEMP/castle-wall-artifact.XXXXXX")
-          trap 'rm -rf "$ARTIFACT_CHECK_DIR"' EXIT
+          CANONICAL_APP="/Applications/Sanctuary-CastleWall.app"
+          CANONICAL_APP_INSTALLED=false
+          trap 'rm -rf "$ARTIFACT_CHECK_DIR"; if [ "$CANONICAL_APP_INSTALLED" = true ]; then rm -rf "$CANONICAL_APP"; fi' EXIT
           ditto -x -k build/Sanctuary-CastleWall.app.zip "$ARTIFACT_CHECK_DIR"
           ARTIFACT_APP="$ARTIFACT_CHECK_DIR/Sanctuary-CastleWall.app"
           ARTIFACT_RUNTIME="$ARTIFACT_APP/Contents/Resources/boot-runtime"
+          ARTIFACT_CLI_RUNTIME="$ARTIFACT_APP/Contents/Resources/cli-runtime"
+          ARTIFACT_LAUNCHER="$ARTIFACT_APP/Contents/MacOS/sanctuary"
+          ARTIFACT_MANIFEST="$ARTIFACT_APP/Contents/Resources/cli-runtime-manifest.json"
+          EXPECTED_VERSION=$(node -p "require('../server/package.json').version")
           codesign --verify --deep --strict "$ARTIFACT_APP"
           codesign --verify --strict \
             --requirement='anchor apple generic and certificate leaf[subject.OU] = "YFQSWQ9BJN" and identifier "ai.sanctuaryprotocol.macos.castle-wall.node"' \
@@ -396,8 +486,64 @@ jobs:
             > "$ARTIFACT_NODE_ENTITLEMENTS" 2>/dev/null
           test "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.security.cs.allow-jit' "$ARTIFACT_NODE_ENTITLEMENTS")" = true
           test "$(plutil -p "$ARTIFACT_NODE_ENTITLEMENTS" | grep -c ' => ')" = 1
+          test -s "$ARTIFACT_CLI_RUNTIME/dist/cli.js"
+          test -s "$ARTIFACT_CLI_RUNTIME/package.json"
+          test -d "$ARTIFACT_CLI_RUNTIME/templates"
+          test -d "$ARTIFACT_CLI_RUNTIME/reference-plugin"
+          test -d "$ARTIFACT_CLI_RUNTIME/node_modules/@modelcontextprotocol/sdk"
+          test -x "$ARTIFACT_LAUNCHER"
+          test -s "$ARTIFACT_MANIFEST"
+          test -z "$(find "$ARTIFACT_CLI_RUNTIME" -type l -print -quit)"
           xcrun stapler validate "$ARTIFACT_APP"
           spctl --assess --type execute --verbose=4 "$ARTIFACT_APP"
+
+          codesign --verify --strict \
+            --requirement='anchor apple generic and certificate leaf[subject.OU] = "YFQSWQ9BJN" and identifier "ai.sanctuaryprotocol.macos.castle-wall.sanctuary-launcher"' \
+            "$ARTIFACT_LAUNCHER"
+          ARTIFACT_MACH_O_COUNT=0
+          while IFS= read -r -d '' addon; do
+            codesign --verify --strict \
+              --requirement='anchor apple generic and certificate leaf[subject.OU] = "YFQSWQ9BJN"' \
+              "$addon"
+            ARTIFACT_MACH_O_COUNT=$((ARTIFACT_MACH_O_COUNT + 1))
+          done < <(node scripts/list-cli-runtime-mach-o.mjs "$ARTIFACT_CLI_RUNTIME")
+          test "$ARTIFACT_MACH_O_COUNT" -ge 2
+          test "$(/usr/libexec/PlistBuddy -c 'Print :SanctuaryCliRuntimeManifestSHA256' "$ARTIFACT_APP/Contents/Info.plist")" = "$(shasum -a 256 "$ARTIFACT_MANIFEST" | awk '{print $1}')"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$ARTIFACT_APP/Contents/Info.plist")" = "$EXPECTED_VERSION"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :SanctuaryCastleWallSourceSHA' "$ARTIFACT_APP/Contents/Info.plist")" = "$GITHUB_SHA"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :SanctuaryCliRuntimeNodeVersion' "$ARTIFACT_APP/Contents/Info.plist")" = "$("$ARTIFACT_RUNTIME/node" --version)"
+          /usr/bin/env -i PATH=/usr/bin:/bin NODE_OPTIONS='--require=/definitely/missing' NODE_PATH=/definitely/missing \
+            "$ARTIFACT_LAUNCHER" --version \
+            | grep -Fx "@sanctuary-framework/mcp-server $EXPECTED_VERSION"
+          "$ARTIFACT_RUNTIME/node" -e '
+            const load = require("node:module").createRequire(process.argv[1]);
+            load("lmdb");
+            load("msgpackr-extract");
+          ' "$ARTIFACT_CLI_RUNTIME/package.json"
+          FAKE_ARTIFACT_ROOT="$ARTIFACT_CHECK_DIR/argv0-proof"
+          mkdir -p "$FAKE_ARTIFACT_ROOT/Contents/MacOS" "$FAKE_ARTIFACT_ROOT/Contents/Resources/boot-runtime" "$FAKE_ARTIFACT_ROOT/Contents/Resources/cli-runtime/dist"
+          printf '#!/bin/sh\necho ATTACKER-RUNTIME\n' > "$FAKE_ARTIFACT_ROOT/Contents/Resources/boot-runtime/node"
+          chmod +x "$FAKE_ARTIFACT_ROOT/Contents/Resources/boot-runtime/node"
+          printf 'throw new Error("attacker runtime")\n' > "$FAKE_ARTIFACT_ROOT/Contents/Resources/cli-runtime/dist/cli.js"
+          /usr/bin/env -i PATH=/usr/bin:/bin /bin/zsh -c \
+            'ARGV0="$1/Contents/MacOS/sanctuary" "$2" --version' _ "$FAKE_ARTIFACT_ROOT" "$ARTIFACT_LAUNCHER" \
+            | grep -Fx "@sanctuary-framework/mcp-server $EXPECTED_VERSION"
+
+          test ! -e "$CANONICAL_APP"
+          CANONICAL_APP_INSTALLED=true
+          ditto "$ARTIFACT_APP" "$CANONICAL_APP"
+          mkdir -p "$ARTIFACT_CHECK_DIR/home" "$ARTIFACT_CHECK_DIR/fortress"
+          PLAN_JSON=$(/usr/bin/env -i HOME="$ARTIFACT_CHECK_DIR/home" PATH=/usr/bin:/bin \
+            SANCTUARY_STORAGE_PATH="$ARTIFACT_CHECK_DIR/fortress" \
+            "$CANONICAL_APP/Contents/MacOS/sanctuary" install --profile full --harness hermes --json)
+          printf '%s' "$PLAN_JSON" | node -e '
+            const plan = JSON.parse(require("node:fs").readFileSync(0, "utf8"));
+            const argv = plan.next_action?.argv ?? [];
+            if (plan.status !== "agent_action") process.exit(1);
+            if (argv[0] !== "/Applications/Sanctuary-CastleWall.app/Contents/MacOS/sanctuary") process.exit(1);
+            if (argv.some(arg => /(^|\/)(npm|npx|node)$/.test(arg))) process.exit(1);
+            if (!argv.includes("--sealed-launcher")) process.exit(1);
+          '
 
           set +e
           "$ARTIFACT_RUNTIME/node" "$ARTIFACT_RUNTIME/castle-wall-boot-daemon.js" \

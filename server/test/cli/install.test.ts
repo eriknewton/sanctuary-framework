@@ -1,4 +1,8 @@
 import { createRequire } from "node:module";
+import { createHash } from "node:crypto";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import { Writable } from "node:stream";
 import { describe, expect, it } from "vitest";
 
@@ -6,6 +10,7 @@ import {
   AGENT_INSTALL_CONTRACT,
   buildAgentInstallPlan,
   runInstallCommand,
+  verifyCastleWallRuntimeManifest,
   type AgentInstallOps,
   type InstallProbeResult,
 } from "../../src/cli/install.js";
@@ -35,6 +40,7 @@ function observed(overrides: Partial<InstallProbeResult> = {}): InstallProbeResu
     persistentCli: "present",
     persistentCliPath: "/usr/local/lib/node_modules/@sanctuary-framework/mcp-server/dist/cli.js",
     persistentCliVersion: packageJson.version,
+    packageManagerPath: "/opt/homebrew/bin/npm",
     nodePath: "/opt/homebrew/bin/node",
     castleWallApp: "not-applicable",
     castleWallBuildSha: "a61a7322ca80",
@@ -46,7 +52,112 @@ function observed(overrides: Partial<InstallProbeResult> = {}): InstallProbeResu
   };
 }
 
+function fullObserved(overrides: Partial<InstallProbeResult> = {}): InstallProbeResult {
+  return observed({
+    persistentCli: "present",
+    persistentCliPath: "/Applications/Sanctuary-CastleWall.app/Contents/MacOS/sanctuary",
+    persistentCliVersion: packageJson.version,
+    nodePath: "/Applications/Sanctuary-CastleWall.app/Contents/MacOS/sanctuary",
+    castleWallApp: "present",
+    ...overrides,
+  });
+}
+
 describe("sanctuary install agent contract", () => {
+  it("rejects a tampered sealed-runtime manifest payload", async () => {
+    const contents = await mkdtemp(join(tmpdir(), "sanctuary-runtime-manifest-"));
+    try {
+      const paths = [
+        "MacOS/sanctuary",
+        "Resources/boot-runtime/node",
+        "Resources/cli-runtime/dist/cli.js",
+        "Resources/cli-runtime/package.json",
+        "Resources/cli-runtime/node_modules/@lmdb/lmdb-darwin-arm64/node.napi.node",
+        "Resources/cli-runtime/node_modules/@msgpackr-extract/msgpackr-extract-darwin-arm64/node.napi.glibc.node",
+      ];
+      for (const path of paths) {
+        await mkdir(dirname(join(contents, path)), { recursive: true });
+        await writeFile(join(contents, path), path);
+      }
+      const files = await Promise.all(paths.map(async (path) => {
+        const bytes = await readFile(join(contents, path));
+        return {
+          path,
+          sha256: createHash("sha256").update(bytes).digest("hex"),
+          size: bytes.length,
+        };
+      }));
+      const manifest = {
+        schema: "sanctuary.castle-wall-cli-runtime.v1",
+        source_sha: "a".repeat(40),
+        cli_version: packageJson.version,
+        node_version: "v22.0.0",
+        inventory: {
+          file_count: files.length,
+          total_bytes: files.reduce((sum, entry) => sum + entry.size, 0),
+          package_count: 1,
+          package_json_count: 1,
+          package_internal_json_count: 0,
+          nested_package_count: 0,
+          packages: [{
+            path: "Resources/cli-runtime/package.json",
+            name: "@sanctuary-framework/mcp-server",
+            version: packageJson.version,
+          }],
+          mach_o_count: 2,
+          mach_o: paths.slice(-2),
+        },
+        files,
+      };
+      const bytes = Buffer.from(`${JSON.stringify(manifest)}\n`);
+      await expect(verifyCastleWallRuntimeManifest(bytes, contents, {
+        sourceSha: "a".repeat(40), nodeVersion: "v22.0.0",
+      })).resolves.toBe(true);
+      for (const invalid of [
+        {
+          ...manifest,
+          inventory: {
+            ...manifest.inventory,
+            file_count: manifest.inventory.file_count + 1,
+            total_bytes: manifest.inventory.total_bytes + files[0]!.size,
+          },
+          files: [...files, files[0]!],
+        },
+        {
+          ...manifest,
+          inventory: {
+            ...manifest.inventory,
+            mach_o_count: manifest.inventory.mach_o_count + 1,
+            mach_o: [...manifest.inventory.mach_o, manifest.inventory.mach_o[0]!],
+          },
+        },
+        {
+          ...manifest,
+          inventory: {
+            ...manifest.inventory,
+            package_count: 2,
+            packages: [
+              manifest.inventory.packages[0]!,
+              manifest.inventory.packages[0]!,
+            ],
+          },
+        },
+      ]) {
+        await expect(verifyCastleWallRuntimeManifest(
+          Buffer.from(`${JSON.stringify(invalid)}\n`),
+          contents,
+          { sourceSha: "a".repeat(40), nodeVersion: "v22.0.0" },
+        )).resolves.toBe(false);
+      }
+      await writeFile(join(contents, "Resources/cli-runtime/dist/cli.js"), "tampered");
+      await expect(verifyCastleWallRuntimeManifest(bytes, contents, {
+        sourceSha: "a".repeat(40), nodeVersion: "v22.0.0",
+      })).resolves.toBe(false);
+    } finally {
+      await rm(contents, { recursive: true, force: true });
+    }
+  });
+
   it("is exposed as a top-level completion subcommand", () => {
     expect(TOP_LEVEL_SUBCOMMANDS).toContain("install");
   });
@@ -91,11 +202,72 @@ describe("sanctuary install agent contract", () => {
     expect(plan.status).toBe("agent_action");
     expect(plan.next_action?.id).toBe("install_persistent_cli");
     expect(plan.next_action?.argv).toEqual([
-      "npm",
+      "/opt/homebrew/bin/npm",
       "install",
       "-g",
       `@sanctuary-framework/mcp-server@${packageJson.version}`,
     ]);
+  });
+
+  it("blocks cleanly when a pristine host has neither npm nor a trusted bundled CLI", () => {
+    const plan = buildAgentInstallPlan({
+      profile: "full",
+      harness: "hermes",
+      fortress: "/tmp/fortress",
+      platform: "darwin",
+      observed: observed({
+        persistentCli: "absent",
+        persistentCliPath: null,
+        persistentCliVersion: null,
+        packageManagerPath: null,
+        nodePath: "/Applications/Sanctuary-CastleWall.app/Contents/Resources/boot-runtime/node",
+        castleWallApp: "present",
+        systemExtension: "not loaded",
+      }),
+    });
+
+    expect(plan.status).toBe("blocked");
+    expect(plan.next_action).toBeNull();
+    expect(plan.notes.join(" ")).toContain("never falls back to npm");
+    expect(plan.notes.join(" ")).toContain("verified signed Castle Wall app");
+  });
+
+  it("resumes from the signed app runtime without npm after a clean-host handoff", () => {
+    const blocked = buildAgentInstallPlan({
+      profile: "full",
+      harness: "hermes",
+      fortress: "/tmp/fortress",
+      platform: "darwin",
+      observed: observed({
+        persistentCli: "absent",
+        persistentCliPath: null,
+        persistentCliVersion: null,
+        packageManagerPath: null,
+      }),
+    });
+    const resumed = buildAgentInstallPlan({
+      profile: "full",
+      harness: "hermes",
+      fortress: "/tmp/fortress",
+      platform: "darwin",
+      observed: fullObserved({
+        persistentCliPath: "/Applications/Sanctuary-CastleWall.app/Contents/MacOS/sanctuary",
+        packageManagerPath: null,
+        nodePath: "/Applications/Sanctuary-CastleWall.app/Contents/MacOS/sanctuary",
+        castleWallApp: "present",
+        systemExtension: "not loaded",
+      }),
+    });
+
+    expect(blocked.status).toBe("blocked");
+    expect(resumed.status).toBe("agent_action");
+    expect(resumed.next_action?.id).toBe("install_cooperative_surface");
+    expect(resumed.next_action?.argv?.[0]).toBe(
+      "/Applications/Sanctuary-CastleWall.app/Contents/MacOS/sanctuary",
+    );
+    expect(resumed.next_action?.argv).not.toContain("npm");
+    expect(resumed.next_action?.argv).not.toContain("npx");
+    expect(resumed.next_action?.argv).not.toContain("node");
   });
 
   it("marks memory mechanics complete but keeps recovery custody human-only", () => {
@@ -120,7 +292,7 @@ describe("sanctuary install agent contract", () => {
       harness: "hermes",
       fortress: "/tmp/fortress",
       platform: "darwin",
-      observed: observed({
+      observed: fullObserved({
         cooperativeWrap: "present",
         castleWallApp: "absent",
         castleWallBuildSha: null,
@@ -142,7 +314,7 @@ describe("sanctuary install agent contract", () => {
       harness: "hermes",
       fortress: "/tmp/fortress",
       platform: "darwin",
-      observed: observed({
+      observed: fullObserved({
         cooperativeWrap: "present",
         castleWallApp: "present",
         castleWallBuildSha: "a61a7322ca80",
@@ -165,7 +337,7 @@ describe("sanctuary install agent contract", () => {
       harness: "hermes",
       fortress: "/tmp/fortress",
       platform: "darwin",
-      observed: observed({
+      observed: fullObserved({
         cooperativeWrap: "present",
         castleWallApp: "present",
         systemExtension: "[activated enabled]",
@@ -182,8 +354,7 @@ describe("sanctuary install agent contract", () => {
       "/usr/bin/env",
       "SANCTUARY_CASTLE_BUILD_SHA=a61a7322ca80",
       "SANCTUARY_CASTLE_SIGNER_CLIENT=/Applications/Sanctuary-CastleWall.app/Contents/MacOS/castle-wall-signer-client",
-      "/opt/homebrew/bin/node",
-      "/usr/local/lib/node_modules/@sanctuary-framework/mcp-server/dist/cli.js",
+      "/Applications/Sanctuary-CastleWall.app/Contents/MacOS/sanctuary",
       "--fortress",
       "/tmp/fortress",
       "protect",
@@ -191,6 +362,8 @@ describe("sanctuary install agent contract", () => {
       "--no-open",
       "--provision-agent-account",
       "--agent-guided",
+      "--sealed-launcher",
+      "/Applications/Sanctuary-CastleWall.app/Contents/MacOS/sanctuary",
     ]);
   });
 
@@ -200,7 +373,7 @@ describe("sanctuary install agent contract", () => {
       harness: "hermes",
       fortress: "/tmp/fortress",
       platform: "darwin",
-      observed: observed({
+      observed: fullObserved({
         cooperativeWrap: "present",
         castleWallApp: "present",
         systemExtension: "[activated enabled]",
@@ -214,7 +387,7 @@ describe("sanctuary install agent contract", () => {
       harness: "hermes",
       fortress: "/tmp/fortress",
       platform: "darwin",
-      observed: observed({
+      observed: fullObserved({
         cooperativeWrap: "present",
         castleWallApp: "present",
         systemExtension: "[activated enabled]",
@@ -228,7 +401,7 @@ describe("sanctuary install agent contract", () => {
       harness: "hermes",
       fortress: "/tmp/fortress",
       platform: "darwin",
-      observed: observed({
+      observed: fullObserved({
         cooperativeWrap: "present",
         castleWallApp: "present",
         systemExtension: "unknown",
@@ -242,7 +415,7 @@ describe("sanctuary install agent contract", () => {
       harness: "hermes",
       fortress: "/tmp/fortress",
       platform: "darwin",
-      observed: observed({
+      observed: fullObserved({
         cooperativeWrap: "present",
         castleWallApp: "present",
         castleWallBuildSha: "bad value &&",
