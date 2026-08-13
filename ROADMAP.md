@@ -4,7 +4,7 @@ In the physical world, your body provides the perimeter, the custody, the memory
 
 This roadmap covers what Sanctuary ships today and what's coming next, with rationale for why each piece matters. Detailed shipped history lives in [`CHANGELOG.md`](CHANGELOG.md). Trust claims trace to rows in the [Sanctuary Assurance Matrix](ASSURANCE_MATRIX.md), preserving the platform, gap, and next-proof limits named on each row.
 
-Last updated: 2026-08-07. Freshness is enforced: a CI guard requires feature PRs to update this file (or carry an explicit `roadmap-exempt` label), and a weekly job files a drift issue listing any shipped features not yet reflected here. See `.github/workflows/roadmap-freshness.yml`.
+Last updated: 2026-08-12. Freshness is enforced: a CI guard requires feature PRs to update this file (or carry an explicit `roadmap-exempt` label), and a weekly job files a drift issue listing any shipped features not yet reflected here. See `.github/workflows/roadmap-freshness.yml`.
 
 ---
 
@@ -31,6 +31,8 @@ Castle-walking principle: real enforcement AND delightful operator experience. H
 *Status: shipped through v1.7.0 (latest release tag, 2026-07-26).*
 
 *Clean uninstall verb (built 2026-08-09, CLI wiring + tests; release pending): `sanctuary uninstall` removes the reachable installed enforcement footprint by disarming the macOS wall when available, uninstalling the auto-provisioned harness daemon, scrubbing provisioned egress rules, and removing the boot LaunchDaemon when run with the needed root privilege. It preserves operator data by default: fortress state, keys, passphrase custody, recovery material, and the audit log stay in place and are named in the output. Honest bounds: a root-owned boot service requires sudo, the host-wide Castle Wall global pin is left for explicit operator removal, system-extension deactivation still belongs to the Castle Wall host app and may require reboot, and successful re-home replay is not claimed because the current shipped record does not persist a replay manifest for this CLI to consume.*
+
+*Agent-guided cold install (built 2026-08-12, release and fresh-machine acceptance pending): `sanctuary install --profile <memory|full> --harness <name> --json` is a resumable, observed-state installation contract for a local shell-capable agent. The agent executes the returned mechanical action and replans; Sanctuary pauses at explicit human boundaries for Apple consent, exact-command privilege authorization, and private recovery custody. The planner never returns recovery material or reusable sudo authority. The `memory` profile supports every harness accepted by `sanctuary protect`; the `full` profile currently requires macOS, Hermes, a separately obtained signed Castle Wall release artifact, an enabled system extension, a root-custodied boot runtime, and observed live enforcement. Built is not yet release-proven: acceptance requires a fresh agent on a fresh Mac to reach `complete` with the operator performing only those human-boundary actions.*
 
 ### Castle Wall on Linux: kernel-level enforcement
 
