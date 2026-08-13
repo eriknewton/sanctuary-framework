@@ -22,13 +22,80 @@ const manifestBuilder = fileURLToPath(new URL(
   "../../scripts/build-castle-wall-runtime-manifest.mjs",
   import.meta.url,
 ));
+const releaseWorkflow = fileURLToPath(new URL(
+  "../../../.github/workflows/castle-wall-macos-release.yml",
+  import.meta.url,
+));
 const roots: string[] = [];
+
+function sealedRuntimeAssertion(): string {
+  const workflow = readFileSync(releaseWorkflow, "utf8");
+  const stepStart = workflow.indexOf("- name: Assert sealed boot runtime");
+  const stepEnd = workflow.indexOf("\n      - name:", stepStart + 1);
+  const step = workflow.slice(stepStart, stepEnd);
+  const assertion = step.match(/node -e '([\s\S]*?)' "\$MANIFEST" "\$MACH_O_COUNT"/);
+  if (!assertion) throw new Error("sealed-runtime inline assertion not found");
+  return assertion[1];
+}
 
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
 describe("Castle Wall CLI-runtime Mach-O scanner", () => {
+  it("executes the sealed-runtime workflow assertion with a relative manifest path", () => {
+    const root = mkdtempSync(join(tmpdir(), "sanctuary-release-manifest-assertion-"));
+    roots.push(root);
+    const manifestPath = "build/Sanctuary-CastleWall.app/Contents/Resources/cli-runtime-manifest.json";
+    mkdirSync(join(root, manifestPath, ".."), { recursive: true });
+    writeFileSync(join(root, manifestPath), JSON.stringify({
+      inventory: {
+        file_count: 3,
+        total_bytes: 1024,
+        mach_o_count: 2,
+        package_count: 1,
+        package_json_count: 1,
+        package_internal_json_count: 0,
+        nested_package_count: 0,
+        mach_o: [
+          "Resources/cli-runtime/node_modules/@lmdb/lmdb-darwin-arm64/lmdb.node",
+          "Resources/cli-runtime/node_modules/@msgpackr-extract/msgpackr-extract-darwin-arm64/extract.node",
+        ],
+      },
+      files: [{ path: "Resources/cli-runtime/package.json" }],
+    }));
+
+    const output = execFileSync(process.execPath, ["-e", sealedRuntimeAssertion(), manifestPath, "2"], {
+      cwd: root,
+      encoding: "utf8",
+    });
+    expect(JSON.parse(output)).toMatchObject({
+      file_count: 3,
+      installed_package_roots: 1,
+      mach_o_count: 2,
+    });
+  });
+
+  it("fails closed for missing, malformed, and structurally incomplete manifests", () => {
+    const root = mkdtempSync(join(tmpdir(), "sanctuary-release-manifest-rejection-"));
+    roots.push(root);
+    mkdirSync(join(root, "manifests"), { recursive: true });
+    writeFileSync(join(root, "manifests/malformed.json"), "{not-json");
+    writeFileSync(join(root, "manifests/incomplete.json"), JSON.stringify({ inventory: {} }));
+
+    for (const manifestPath of [
+      "manifests/missing.json",
+      "manifests/malformed.json",
+      "manifests/incomplete.json",
+    ]) {
+      expect(() => execFileSync(
+        process.execPath,
+        ["-e", sealedRuntimeAssertion(), manifestPath, "2"],
+        { cwd: root, stdio: "pipe" },
+      )).toThrow();
+    }
+  });
+
   it("recognizes every 32/64-bit thin and fat magic and rejects other files", () => {
     const root = mkdtempSync(join(tmpdir(), "sanctuary-mach-o-scanner-"));
     roots.push(root);

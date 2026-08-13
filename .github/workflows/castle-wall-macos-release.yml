@@ -310,7 +310,9 @@ jobs:
           test "$MACH_O_COUNT" -ge 2
 
           node -e '
-            const m = require(process.argv[1]);
+            const { readFileSync } = require("node:fs");
+            const { resolve } = require("node:path");
+            const m = JSON.parse(readFileSync(resolve(process.argv[1]), "utf8"));
             const i = m.inventory;
             const roots = m.files.filter(f => {
               const s = f.path.split("/");
