@@ -1202,6 +1202,17 @@ export async function hasExistingWrapMeta(
   }
 }
 
+/**
+ * Authoritative variant for safety-bearing observed-state planners. Unlike the
+ * advisory helper above, an unreadable pointer remains an error so callers can
+ * report `unknown` instead of silently deciding that the surface is absent.
+ */
+export async function hasExistingWrapMetaStrict(
+  originalPath: string,
+): Promise<boolean> {
+  return (await readExistingWrapMetaRawForSurface(originalPath)) !== null;
+}
+
 /** True when the path names an existing, accessible file. */
 async function fileExists(path: string): Promise<boolean> {
   try {

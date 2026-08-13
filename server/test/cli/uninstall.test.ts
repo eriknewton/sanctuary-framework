@@ -17,12 +17,14 @@ class Capture extends Writable {
 
 function ops(overrides: Partial<UninstallOps> = {}): UninstallOps {
   return {
-    disarm: async () => {},
+    disarm: async () => "corroborated_off",
     uninstallHarnessDaemon: async () => {},
     scrubProvisionedEgressRules: async () => ({ removedRuleIds: ["provisioned-hermes-a"], reloadOk: true }),
     bootServiceStatus: async () => "absent",
     uninstallBootService: async () => {},
     globalPinStatus: async () => "absent",
+    systemExtensionStatus: async () => "absent",
+    deactivateSystemExtension: async () => ({ kind: "request-completed" }),
     ...overrides,
   };
 }
@@ -44,6 +46,7 @@ describe("sanctuary uninstall", () => {
       ops: ops({
         disarm: async (fortressPath) => {
           calls.push(`disarm:${fortressPath}`);
+          return "corroborated_off";
         },
         uninstallHarnessDaemon: async () => {
           calls.push("uninstall-daemon");
@@ -75,6 +78,7 @@ describe("sanctuary uninstall", () => {
       ops: ops({
         bootServiceStatus: async () => "present",
         globalPinStatus: async () => "absent",
+        systemExtensionStatus: async () => "present",
       }),
     });
 
@@ -104,6 +108,105 @@ describe("sanctuary uninstall", () => {
     expect(out.text()).toContain("failed: scrub-egress-rules");
     expect(out.text()).toContain("egress rule scrub left 1 provisioned rule file behind");
     expect(out.text()).toContain("operator-data");
+  });
+
+  it("deactivates through the signed host and claims removal only after observed absence", async () => {
+    const out = new Capture();
+    const calls: string[] = [];
+    let statusReads = 0;
+    const code = await runUninstallCommand({
+      argv: ["--fortress", "/tmp/fortress"],
+      out,
+      err: new Capture(),
+      platform: "darwin",
+      getuid: () => 0,
+      ops: ops({
+        disarm: async () => {
+          calls.push("disarm");
+          return "corroborated_off";
+        },
+        uninstallHarnessDaemon: async () => {
+          calls.push("daemon");
+        },
+        scrubProvisionedEgressRules: async () => {
+          calls.push("rules");
+          return { removedRuleIds: [], reloadOk: true };
+        },
+        systemExtensionStatus: async () => {
+          calls.push("sysext-status");
+          statusReads++;
+          return statusReads === 1 ? "present" : "absent";
+        },
+        deactivateSystemExtension: async () => {
+          calls.push("deactivate");
+          return { kind: "request-completed" };
+        },
+      }),
+    });
+
+    expect(code).toBe(0);
+    expect(calls).toEqual([
+      "disarm",
+      "daemon",
+      "rules",
+      "sysext-status",
+      "deactivate",
+      "sysext-status",
+    ]);
+    expect(out.text()).toContain("removed: system-extension");
+    expect(out.text()).toContain("observed absent");
+  });
+
+  it("keeps reboot-deferred deactivation non-clean until absence is observed", async () => {
+    const out = new Capture();
+    const code = await runUninstallCommand({
+      argv: ["--fortress", "/tmp/fortress"],
+      out,
+      err: new Capture(),
+      platform: "darwin",
+      getuid: () => 0,
+      ops: ops({
+        systemExtensionStatus: async () => "present",
+        deactivateSystemExtension: async () => ({ kind: "reboot-required" }),
+      }),
+    });
+
+    expect(code).toBe(1);
+    expect(out.text()).toContain("cannot-remove: system-extension");
+    expect(out.text()).toContain("requires reboot");
+  });
+
+  it("does not remove supporting services when disarm is not positively observed", async () => {
+    const out = new Capture();
+    const calls: string[] = [];
+    const code = await runUninstallCommand({
+      argv: ["--fortress", "/tmp/fortress"],
+      out,
+      err: new Capture(),
+      platform: "darwin",
+      getuid: () => 0,
+      ops: ops({
+        disarm: async () => "save_accepted_inconclusive",
+        uninstallHarnessDaemon: async () => {
+          calls.push("daemon");
+        },
+        scrubProvisionedEgressRules: async () => {
+          calls.push("rules");
+          return { removedRuleIds: [], reloadOk: true };
+        },
+        systemExtensionStatus: async () => "present",
+        deactivateSystemExtension: async () => {
+          calls.push("deactivate");
+          return { kind: "request-completed" };
+        },
+      }),
+    });
+
+    expect(code).toBe(1);
+    expect(calls).toEqual([]);
+    expect(out.text()).toContain("failed: castle-wall");
+    expect(out.text()).toContain("kept because the content filter was not positively observed disabled");
+    expect(out.text()).toContain("deactivation not requested");
   });
 
   it("refuses operator data deletion through the software uninstall verb", async () => {

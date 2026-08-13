@@ -59,7 +59,7 @@ CASTLE_WALL_GIT_SHA="${CASTLE_WALL_GIT_SHA:-$(git -C "${REPO_DIR}" rev-parse --s
 # (Root-caused on the 2026-06-11b W5 drill: a W5-fixed app deployed but the
 # pre-W5 extension stayed active because the hardcoded version 10 never moved.)
 CASTLE_WALL_BUNDLE_VERSION="${CASTLE_WALL_BUNDLE_VERSION:-$(git -C "${REPO_DIR}" rev-list --count HEAD 2>/dev/null || echo 10)}"
-CASTLE_WALL_HEADLESS_CONTRACT_VERSION="${CASTLE_WALL_HEADLESS_CONTRACT_VERSION:-2}"
+CASTLE_WALL_HEADLESS_CONTRACT_VERSION="${CASTLE_WALL_HEADLESS_CONTRACT_VERSION:-3}"
 EXECUTABLE_NAME="CastleWallExtension"
 INFO_PLIST="${PKG_DIR}/Sources/CastleWallExtension/Info.plist"
 ENTITLEMENTS="${PKG_DIR}/Sources/CastleWallExtension/CastleWallExtension.entitlements"
@@ -381,6 +381,22 @@ if [ "${WRAPPED}" = true ]; then
             "${SIGNER_CLIENT_DST}"
     else
         echo "[build-signed]     WARN: signer helper/shim not present in bundle; skipping (pre-A2 layout)" >&2
+    fi
+
+    BOOT_RUNTIME_NODE="${WRAPPED_APP_DIR}/Contents/Resources/boot-runtime/node"
+    BOOT_RUNTIME_DAEMON="${WRAPPED_APP_DIR}/Contents/Resources/boot-runtime/castle-wall-boot-daemon.js"
+    if [ -x "${BOOT_RUNTIME_NODE}" ] && [ -f "${BOOT_RUNTIME_DAEMON}" ]; then
+        echo "[build-signed]     signing app-bundled Node boot runtime"
+        codesign \
+            --force \
+            --options runtime \
+            --timestamp \
+            --identifier "ai.sanctuaryprotocol.macos.castle-wall.node" \
+            --sign "${SIGNING_IDENTITY}" \
+            "${BOOT_RUNTIME_NODE}"
+    elif [ "${SANCTUARY_REQUIRE_BOOT_RUNTIME:-0}" = "1" ]; then
+        echo "[build-signed] ERROR: required app-bundled Castle Wall boot runtime is absent" >&2
+        exit 1
     fi
 
     echo "[build-signed]     signing outer .app with Developer ID + host entitlements"

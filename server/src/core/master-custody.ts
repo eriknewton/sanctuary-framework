@@ -1512,21 +1512,59 @@ export async function mintRecoveryWrap(
   envelope: CustodyEnvelope,
   masterKey: Uint8Array
 ): Promise<{ envelope: CustodyEnvelope; recoveryKey: string }> {
-  const recoveryKeyBytes = generateRandomKey();
-  const recoveryKey = toBase64url(recoveryKeyBytes);
-  const wrap = wrapMasterWithRecoveryKey(masterKey, recoveryKeyBytes, {
-    verified: false,
-  });
-  recoveryKeyBytes.fill(0);
+  const prepared = prepareRecoveryWrap(envelope, masterKey);
   const updated = await writeCustodyEnvelope(
     storage,
-    {
-      ...envelope,
-      wraps: [...envelope.wraps, wrap],
-    },
+    prepared.envelope,
     masterKey
   );
-  return { envelope: updated, recoveryKey };
+  return { envelope: updated, recoveryKey: prepared.recoveryKey };
+}
+
+/**
+ * Prepare a recovery wrap without persisting it. Agent-guided custody uses
+ * this to create the exclusive handoff file before committing the wrap, so a
+ * destination race cannot persist a recovery credential whose plaintext was
+ * never handed off.
+ */
+export function prepareRecoveryWrap(
+  envelope: CustodyEnvelope,
+  masterKey: Uint8Array
+): { envelope: CustodyEnvelope; recoveryKey: string } {
+  const recoveryKeyBytes = generateRandomKey();
+  const recoveryKey = toBase64url(recoveryKeyBytes);
+  try {
+    return prepareRecoveryWrapWithKey(envelope, masterKey, recoveryKey);
+  } finally {
+    recoveryKeyBytes.fill(0);
+  }
+}
+
+/**
+ * Prepare a recovery wrap from a previously staged key. The agent-guided
+ * crash-resume path calls this only after authenticating the staging receipt
+ * against the pre-wrap envelope and current master.
+ */
+export function prepareRecoveryWrapWithKey(
+  envelope: CustodyEnvelope,
+  masterKey: Uint8Array,
+  recoveryKey: string,
+): { envelope: CustodyEnvelope; recoveryKey: string } {
+  const recoveryKeyBytes = fromBase64url(recoveryKey);
+  try {
+    const wrap = wrapMasterWithRecoveryKey(masterKey, recoveryKeyBytes, {
+      verified: false,
+    });
+    return {
+      envelope: {
+        ...envelope,
+        wraps: [...envelope.wraps, wrap],
+      },
+      recoveryKey,
+    };
+  } finally {
+    recoveryKeyBytes.fill(0);
+  }
 }
 
 // ── Castle-pin custody diagnostic ───────────────────────────────────

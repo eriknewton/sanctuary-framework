@@ -20,7 +20,7 @@ CASTLE_WALL_GIT_SHA="${CASTLE_WALL_GIT_SHA:-$(git -C "${REPO_DIR}" rev-parse --s
 # when the version increases. A hardcoded version means rebuilt fixes never load
 # (root-caused on the 2026-06-11b W5 drill). git commit count is monotonic.
 CASTLE_WALL_BUNDLE_VERSION="${CASTLE_WALL_BUNDLE_VERSION:-$(git -C "${REPO_DIR}" rev-list --count HEAD 2>/dev/null || echo 10)}"
-CASTLE_WALL_HEADLESS_CONTRACT_VERSION="${CASTLE_WALL_HEADLESS_CONTRACT_VERSION:-2}"
+CASTLE_WALL_HEADLESS_CONTRACT_VERSION="${CASTLE_WALL_HEADLESS_CONTRACT_VERSION:-3}"
 
 HOST_TARGET="CastleWallHostApp"
 HOST_EXECUTABLE_NAME="CastleWallHostApp"
@@ -41,14 +41,20 @@ EXT_INFO_DST="${EXT_BUNDLE_DST}/Contents/Info.plist"
 
 # A2/B2 root signer helper + XPC shim + LaunchDaemon plist. The helper binary is
 # placed in Contents/MacOS with the on-disk name the plist BundleProgram expects.
-SIGNER_HELPER_TARGET="CastleWallSignerHelper"
 SIGNER_HELPER_EXE_NAME="CastleWallSignerHelper"
 SIGNER_HELPER_DST="${WRAPPED_APP_DIR}/Contents/MacOS/castle-wall-signer-helper"
-SIGNER_CLIENT_TARGET="CastleWallSignerClient"
 SIGNER_CLIENT_EXE_NAME="CastleWallSignerClient"
 SIGNER_CLIENT_DST="${WRAPPED_APP_DIR}/Contents/MacOS/castle-wall-signer-client"
 SIGNER_PLIST_SRC="${PKG_DIR}/Sources/CastleWallSignerHelper/ai.sanctuaryprotocol.macos.castle-wall.signer-helper.plist"
 SIGNER_PLIST_DST="${WRAPPED_APP_DIR}/Contents/Library/LaunchDaemons/ai.sanctuaryprotocol.macos.castle-wall.signer-helper.plist"
+
+# The root Castle Wall boot service snapshots these exact app-bundled assets
+# into root-owned custody. They must come from the same signed/notarized app as
+# the signer client, never from the operator's mutable Homebrew installation.
+BOOT_RUNTIME_DIR="${WRAPPED_APP_DIR}/Contents/Resources/boot-runtime"
+BOOT_RUNTIME_NODE_SRC="${SANCTUARY_BOOT_RUNTIME_NODE:-}"
+BOOT_RUNTIME_DAEMON_SRC="${SANCTUARY_BOOT_RUNTIME_DAEMON:-${REPO_DIR}/server/dist/boot-runtime/castle-wall-boot-daemon.js}"
+REQUIRE_BOOT_RUNTIME="${SANCTUARY_REQUIRE_BOOT_RUNTIME:-0}"
 
 log() {
     echo "[build-wrapped] $*"
@@ -158,6 +164,19 @@ if [ -x "${SIGNER_HELPER_SRC}" ] && [ -x "${SIGNER_CLIENT_SRC}" ]; then
     plutil -lint "${SIGNER_PLIST_DST}" >/dev/null || fail "signer LaunchDaemon plist failed lint"
 else
     log "signer helper/shim binaries not built; LaunchDaemon not bundled (pre-A2 layout)"
+fi
+
+if [ -n "${BOOT_RUNTIME_NODE_SRC}" ] && [ -x "${BOOT_RUNTIME_NODE_SRC}" ] && [ -f "${BOOT_RUNTIME_DAEMON_SRC}" ]; then
+    log "bundling sealed Castle Wall boot runtime"
+    mkdir -p "${BOOT_RUNTIME_DIR}"
+    cp "${BOOT_RUNTIME_NODE_SRC}" "${BOOT_RUNTIME_DIR}/node"
+    cp "${BOOT_RUNTIME_DAEMON_SRC}" "${BOOT_RUNTIME_DIR}/castle-wall-boot-daemon.js"
+    chmod 0555 "${BOOT_RUNTIME_DIR}/node"
+    chmod 0444 "${BOOT_RUNTIME_DIR}/castle-wall-boot-daemon.js"
+elif [ "${REQUIRE_BOOT_RUNTIME}" = "1" ]; then
+    fail "signed build requires SANCTUARY_BOOT_RUNTIME_NODE and built ${BOOT_RUNTIME_DAEMON_SRC}"
+else
+    log "boot runtime inputs absent; omitted from this non-release wrapped build"
 fi
 
 log "step 3/5 - install Info.plist files"

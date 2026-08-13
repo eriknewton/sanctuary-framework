@@ -631,7 +631,8 @@ struct ContentView: View {
             // and completes silently when unchanged; when activation completes,
             // the extension-state observer re-probes before enabling the filter.
             systemExtensionManager.activate()
-        case .activating, .deactivating, .activatedRequiresReboot, .needsUserApproval:
+        case .activating, .deactivating, .activatedRequiresReboot,
+             .deactivatedRequiresReboot, .needsUserApproval:
             // In-flight, reboot-gated, or parked on the System Settings sysext
             // approval: nothing sensible to re-submit now. The
             // onChange(extensionState) hook finishes arming when activation
@@ -786,7 +787,10 @@ struct ContentView: View {
             filterConfigurationManager.filterState == .needsUserApproval {
             return .yellow
         }
-        if systemExtensionManager.extensionState == .activatedRequiresReboot { return .yellow }
+        if systemExtensionManager.extensionState == .activatedRequiresReboot ||
+            systemExtensionManager.extensionState == .deactivatedRequiresReboot {
+            return .yellow
+        }
         if systemExtensionManager.extensionState == .activating ||
             filterConfigurationManager.filterState == .enabling {
             return .yellow
@@ -806,7 +810,8 @@ struct ContentView: View {
         if case let .error(msg) = signerHelperManager.helperState {
             return "Helper Error: \(msg)"
         }
-        if systemExtensionManager.extensionState == .activatedRequiresReboot {
+        if systemExtensionManager.extensionState == .activatedRequiresReboot ||
+            systemExtensionManager.extensionState == .deactivatedRequiresReboot {
             return "Reboot Required"
         }
         if systemExtensionManager.extensionState == .needsUserApproval {

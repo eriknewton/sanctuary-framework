@@ -43,6 +43,20 @@ jobs:
           xcodebuild -version
           swift --version
 
+      - name: Install pinned Node toolchain
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+
+      - name: Build self-contained Castle Wall boot daemon
+        working-directory: server
+        run: |
+          npm ci --ignore-scripts
+          npm run build:boot-runtime
+          test -s dist/boot-runtime/castle-wall-boot-daemon.js
+
       # Preflight: name the missing credential instead of dying inside Keychain.
       #
       # 2026-06-16 (run 27641268243) this job's only execution failed with
@@ -222,10 +236,61 @@ jobs:
         working-directory: castle-wall-macos
         env:
           SIGNING_IDENTITY: "Developer ID Application: Erik Newton (YFQSWQ9BJN)"
+          SANCTUARY_REQUIRE_BOOT_RUNTIME: "1"
+          SANCTUARY_BOOT_RUNTIME_DAEMON: ${{ github.workspace }}/server/dist/boot-runtime/castle-wall-boot-daemon.js
         run: |
+          # setup-node places `node` on PATH. Resolve the exact executable here;
+          # do not depend on an action-internal directory convention.
+          SANCTUARY_BOOT_RUNTIME_NODE="$(command -v node)"
+          export SANCTUARY_BOOT_RUNTIME_NODE
           swift build -c release
           bash scripts/build-wrapped.sh
           bash scripts/build-signed.sh --wrapped --allow-unnotarized
+
+      - name: Assert sealed boot runtime
+        working-directory: castle-wall-macos
+        run: |
+          APP="build/Sanctuary-CastleWall.app"
+          RUNTIME="$APP/Contents/Resources/boot-runtime"
+          NODE="$RUNTIME/node"
+          DAEMON="$RUNTIME/castle-wall-boot-daemon.js"
+          SIGNER="$APP/Contents/MacOS/castle-wall-signer-client"
+
+          test -x "$NODE"
+          test -s "$DAEMON"
+          test -x "$SIGNER"
+          test "$(stat -f '%Lp' "$NODE")" = 555
+          test "$(stat -f '%Lp' "$DAEMON")" = 444
+
+          codesign --verify --strict \
+            --requirement='anchor apple generic and certificate leaf[subject.OU] = "YFQSWQ9BJN" and identifier "ai.sanctuaryprotocol.macos.castle-wall.node"' \
+            "$NODE"
+          codesign --verify --strict \
+            --requirement='anchor apple generic and certificate leaf[subject.OU] = "YFQSWQ9BJN" and identifier "ai.sanctuaryprotocol.macos.castle-wall.signer-client"' \
+            "$SIGNER"
+
+          for executable in "$NODE" "$SIGNER"; do
+            unsafe=$(otool -L "$executable" | awk 'NR > 1 { print $1 }' \
+              | grep -Ev '^(/System/Library/|/usr/lib/)' || true)
+            if [ -n "$unsafe" ]; then
+              echo "::error::$executable has a non-system dynamic-library dependency: $unsafe"
+              exit 1
+            fi
+          done
+
+          # Exercise the copied pair without the repository or node_modules.
+          # The only expected failure is the absent per-fortress boot token.
+          SMOKE_DIR=$(mktemp -d "$RUNNER_TEMP/castle-wall-boot-runtime.XXXXXX")
+          trap 'rm -rf "$SMOKE_DIR"' EXIT
+          cp "$NODE" "$SMOKE_DIR/node"
+          cp "$DAEMON" "$SMOKE_DIR/daemon.js"
+          set +e
+          "$SMOKE_DIR/node" "$SMOKE_DIR/daemon.js" castle-wall daemon \
+            --safe-mode --launchd --fortress "$SMOKE_DIR/fortress" >"$SMOKE_DIR/output" 2>&1
+          status=$?
+          set -e
+          test "$status" -ne 0
+          grep -qi 'boot token' "$SMOKE_DIR/output"
 
       # Fail-closed launchability assertions, BEFORE notarization spends time
       # and an Apple round-trip on a bundle that cannot launch.

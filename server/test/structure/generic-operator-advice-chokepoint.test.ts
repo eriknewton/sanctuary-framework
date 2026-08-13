@@ -159,6 +159,14 @@ const HERMES_LITERAL_CLASSIFICATIONS: readonly HermesLiteralClassification[] = [
     reason: "top-level protect help names the real Hermes command; it is not generic recovery advice",
   },
   {
+    file: "server/src/cli/install.ts",
+    scope: "buildAgentInstallPlan",
+    snippet: "--hermes",
+    exact: true,
+    expectedCount: 1,
+    reason: "the full-profile planner emits the current Hermes-specific protected installation action",
+  },
+  {
     file: "server/src/egress-gate/parked-claim.ts",
     scope: "runStateAdvice",
     snippet: "Re-run 'sudo sanctuary protect --hermes' to bring it back up -- but NOT",

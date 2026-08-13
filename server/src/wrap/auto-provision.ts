@@ -907,6 +907,9 @@ export interface RunAutoProvisionForWrapOptions {
   isTty: boolean;
   /** `--provision-agent-account[=name]` pre-answer (fix L2: pre-answers the CHOICE only). Undefined = not passed. */
   preAnsweredProvision?: boolean;
+  /** Explicit operator delegation from `protect --agent-guided`; allows the
+   * printed plan to continue on a non-TTY while root/sudo remains required. */
+  agentGuided?: boolean;
   /** Absolute path to the running Sanctuary CLI binary for install-boot's LaunchDaemon argv. */
   cliBinary?: string;
   /** Print function for operator-facing output (defaults to console.error, matching the rest of wrap/cli.ts's stderr convention). */
@@ -1971,6 +1974,7 @@ export async function runAutoProvisionForWrap(
         detectResult,
         isTty: options.isTty,
         preAnsweredProvision: options.preAnsweredProvision,
+        agentGuided: options.agentGuided === true,
         fortressPath: wallFortressPath,
         // Confined-agent egress: the SAME endpoint set the provisioning +
         // probes consume, threaded for the Tier-1 confirm plan-print.

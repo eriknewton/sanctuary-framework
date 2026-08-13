@@ -34,6 +34,15 @@ final class SystemExtensionManagerTests: XCTestCase {
         XCTAssertEqual(manager.extensionState, .deactivated)
     }
 
+    func testDeactivationDeferredUntilRebootStaysDistinct() {
+        let manager = SystemExtensionManager()
+
+        manager.handleRequestStarted(isActivation: false)
+        manager.handleRequestFinished(result: .willCompleteAfterReboot)
+
+        XCTAssertEqual(manager.extensionState, .deactivatedRequiresReboot)
+    }
+
     func testActivatingToErrorState() {
         let manager = SystemExtensionManager()
 

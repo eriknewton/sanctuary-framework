@@ -16,6 +16,7 @@ import {
   formatEnforcementAvailabilityStatus,
   makeLaunchServicesHostAppInvoke,
   parseCastleWallArgs,
+  requestSystemExtensionDeactivation,
   runDisable,
   runEnable as runEnableRaw,
   type CastleWallCommandContext,
@@ -1485,6 +1486,74 @@ describe("castle-wall enable/disable CLI verbs", () => {
     expect(code).toBe(1);
     expect(err.text()).toContain("deployed app stale-app-sha != CLI test-build-sha");
     expect(err.text()).toContain("rebuild + redeploy");
+    expect(calls.map((call) => call[2])).toEqual(["status"]);
+  });
+
+  it("requests sysext deactivation only after disabled state and exact build identity", async () => {
+    const { hostAppPath, env } = await makeFixture();
+    const { invoke, calls } = makeInvoker({
+      status: { stdout: reportLine("status", "disabled", true), exitCode: 0 },
+      "deactivate-system-extension": {
+        stdout: reportLine("deactivate-system-extension", "deactivated", true),
+        exitCode: 0,
+      },
+    });
+
+    const outcome = await requestSystemExtensionDeactivation({
+      env,
+      platform: "darwin",
+      hostAppCandidates: [hostAppPath],
+      hostAppInvoke: invoke,
+    });
+
+    expect(outcome).toEqual({ kind: "request-completed" });
+    expect(calls.map((call) => call[2])).toEqual([
+      "status",
+      "deactivate-system-extension",
+    ]);
+  });
+
+  it("keeps reboot-deferred sysext deactivation distinct from removal", async () => {
+    const { hostAppPath, env } = await makeFixture();
+    const { invoke } = makeInvoker({
+      status: { stdout: reportLine("status", "disabled", true), exitCode: 0 },
+      "deactivate-system-extension": {
+        stdout: reportLine(
+          "deactivate-system-extension",
+          "will_complete_after_reboot",
+          true,
+        ),
+        exitCode: 0,
+      },
+    });
+
+    await expect(
+      requestSystemExtensionDeactivation({
+        env,
+        platform: "darwin",
+        hostAppCandidates: [hostAppPath],
+        hostAppInvoke: invoke,
+      }),
+    ).resolves.toEqual({ kind: "reboot-required" });
+  });
+
+  it("never submits sysext deactivation while the content filter is enabled", async () => {
+    const { hostAppPath, env } = await makeFixture();
+    const { invoke, calls } = makeInvoker({
+      status: { stdout: reportLine("status", "enabled", true), exitCode: 0 },
+    });
+
+    const outcome = await requestSystemExtensionDeactivation({
+      env,
+      platform: "darwin",
+      hostAppCandidates: [hostAppPath],
+      hostAppInvoke: invoke,
+    });
+
+    expect(outcome).toMatchObject({ kind: "failed" });
+    expect(outcome.kind === "failed" ? outcome.detail : "").toContain(
+      "not positively observed disabled",
+    );
     expect(calls.map((call) => call[2])).toEqual(["status"]);
   });
 

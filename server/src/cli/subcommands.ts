@@ -30,6 +30,7 @@ export const TOP_LEVEL_SUBCOMMANDS = [
   "import-exit-bundle",
   "inbox",
   "init",
+  "install",
   "intelligence",
   "license",
   "liveness-probe",

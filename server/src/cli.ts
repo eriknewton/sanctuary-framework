@@ -99,6 +99,12 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (args[0] === "install") {
+    const { runInstallCommand } = await import("./cli/install.js");
+    const code = await runInstallCommand({ argv: args.slice(1) });
+    return drainAndExit(code);
+  }
+
   if (args[0] === "protect" || args[0] === "wrap") {
     // Phase S1 supervisor handoff (codex R3-H1): when launched BY the
     // split-process supervisor, the transient master key arrives on an
@@ -902,6 +908,7 @@ Usage:
   sanctuary verify-transparency [opts]    # Verify a checkpoint chain offline
   sanctuary generate systemd [opts]       # Emit systemd service unit
   sanctuary deploy operator-cloud plan    # Emit operator-cloud deploy skeleton
+  sanctuary install [opts]                # Resumable agent-guided install plan
   sanctuary protect [opts]                 # Protect an agent in one command
   sanctuary wrap [opts]                   # (alias for protect)
   sanctuary uninstall [opts]              # Remove installed enforcement footprint; preserve operator data
@@ -921,6 +928,11 @@ Subcommands:
                        with --fortress to keep multiple fortresses
                        isolated on one host.
                        Use "sanctuary init --help" for options.
+
+  install              Emit one observed-state next action for a shell-capable
+                       installing agent. Supports memory and full profiles;
+                       never emits recovery secrets.
+                       Use "sanctuary install --help" for options.
 
   protect              Protect an agent and start the dashboard in one command.
                        Auto-generates a passphrase, auto-opens the browser.
@@ -1132,6 +1144,11 @@ async function handleHelpEarly(args: string[]): Promise<boolean> {
     case "dashboard":
       printDashboardHelp();
       return true;
+    case "install": {
+      const { runInstallCommand } = await import("./cli/install.js");
+      await runInstallCommand({ argv: ["--help"] });
+      return true;
+    }
     case "protect":
     case "wrap":
       printWrapHelpEarly();
@@ -1481,7 +1498,7 @@ function printCastleWallHelp(): void {
                      Mint the software-protected boot token (root-owned 0600; run with sudo). Anti-brick
                      credential only, NOT the fortress passphrase. install-boot auto-provisions it; --rotate replaces.
     install-boot     Install the daemon as a launchd safe-mode boot service (run with sudo, macOS).
-                     Options: --user <name> --fortress <path> --binary <path> --signer-client <path>
+                     Options: --user <name> --fortress <path> --signer-client <path>
     uninstall-boot   Remove the launchd boot service (run with sudo, macOS; requires --yes). Does NOT disarm the filter.
     repair-custody   Hand a root-owned fortress back to the operator (run with sudo, macOS).
                      Observe-first: writes a timestamped manifest of every entry's uid/gid/mode

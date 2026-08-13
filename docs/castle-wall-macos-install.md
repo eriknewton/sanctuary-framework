@@ -1,6 +1,10 @@
-# Castle Wall macOS Install And Arm Guide
+# Castle Wall macOS Install And Arm Reference
 
-This guide installs Sanctuary's macOS Castle Wall from a clean machine to a verified armed state. It targets Sanctuary `v1.7.2` and the `Sanctuary-CastleWall.app.zip` asset attached to that release.
+This is the command-level reference behind the supported agent-guided flow. A
+normal operator should give a shell-capable agent the task and have it loop on
+`sanctuary install --profile full --harness hermes --json`; the operator should
+not have to execute this recipe. This reference targets Sanctuary `v1.7.2` and
+the `Sanctuary-CastleWall.app.zip` asset attached to that release.
 
 The npm package installs the cooperative Sanctuary CLI, dashboard, keys, policy gates, and audit trail. The operating-system wall is a separate signed and notarized macOS app with a system extension, a signer helper, and a root boot service.
 
@@ -141,14 +145,18 @@ Failure modes:
 
 ## 6. Install the root boot service
 
-The boot service keeps the Castle Wall daemon alive after boot in safe mode. It requires a persistent CLI path and the signer-client shim path:
+The boot service keeps the Castle Wall daemon alive after boot in safe mode. It
+snapshots the signed app's embedded Node and safe-mode daemon into root-owned
+custody; the invoking npm CLI is never retained as a root executable. Use an
+absolute Node path to avoid launchd-style minimal-PATH failures while invoking
+the installer itself:
 
 ```bash
-SANCTUARY_CLI="$(command -v sanctuary)"
-test -n "$SANCTUARY_CLI" && test -x "$SANCTUARY_CLI" && echo "$SANCTUARY_CLI"
+SANCTUARY_CLI="$(realpath "$(command -v sanctuary)")"
+NODE_BIN="$(realpath "$(command -v node)")"
+test -f "$SANCTUARY_CLI" && test -x "$NODE_BIN"
 
-sudo "$SANCTUARY_CLI" castle-wall install-boot \
-  --binary "$SANCTUARY_CLI" \
+sudo "$NODE_BIN" "$SANCTUARY_CLI" castle-wall install-boot \
   --signer-client "/Applications/Sanctuary-CastleWall.app/Contents/MacOS/castle-wall-signer-client"
 ```
 
@@ -279,36 +287,25 @@ Failure mode: `Skipping EXFIL-RISK destination <host:port> (pass --include-risky
 
 ## Teardown
 
-Disarm first:
+Use the convergent uninstall command rather than manually reordering the safety
+steps:
 
 ```bash
-sanctuary castle-wall disable
+sanctuary uninstall --fortress "$HOME/.sanctuary"
+sudo sanctuary uninstall --fortress "$HOME/.sanctuary"
 ```
 
-Expected success output:
+The first run disarms through the logged-in app context. The elevated rerun can
+remove the root boot service, harness daemon, provisioned egress rules, and
+request system-extension deactivation. Both runs preserve the fortress, keys,
+recovery material, and audit log. The command refuses to report a clean uninstall
+while any authoritative probe is unknown or installed residue remains.
 
-```text
-Castle Wall disarmed: content filter disabled (verified via host-app status).
-```
-
-Then remove the boot service:
-
-```bash
-SANCTUARY_CLI="$(command -v sanctuary)"
-test -n "$SANCTUARY_CLI" && test -x "$SANCTUARY_CLI" && echo "$SANCTUARY_CLI"
-
-sudo "$SANCTUARY_CLI" castle-wall uninstall-boot --yes --fortress "$HOME/.sanctuary"
-```
-
-Expected output begins with:
-
-```text
-Castle Wall boot service removed (plist deleted; launchd job booted out or was not loaded).
-```
-
-The command also warns that removing the boot service does not disarm the content filter. Disarm with `sanctuary castle-wall disable` before rebooting, or reinstall with `install-boot`.
-
-The shipped CLI has `disable` and `uninstall-boot`. It has no shipped `uninstall` verb that deactivates or removes the system extension. Removing `/Applications/Sanctuary-CastleWall.app` is ordinary macOS app cleanup after disarm and boot-service removal; it is not a substitute for `disable`.
+macOS may report that system-extension deactivation will complete after reboot.
+In that case, reboot and rerun `sanctuary uninstall`; only an observed-absent
+system extension closes teardown. Removing the app bundle is optional ordinary
+app cleanup after the command reports the installed footprint removed, and is
+not a substitute for disarming or deactivating the extension.
 
 ## Restore and recovery
 
