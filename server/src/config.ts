@@ -8,11 +8,12 @@ import { readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { randomBytes } from "node:crypto";
-import packageJson from "../package.json";
+import { createRequire } from "node:module";
 import { ConfigLoadError } from "./errors/config-error.js";
 import { assertHermeticStoragePath } from "./paths.js";
 
-const PKG_VERSION = packageJson.version;
+const require = createRequire(import.meta.url);
+const { version: PKG_VERSION } = require("../package.json");
 
 /**
  * Strictly parse a whole-string integer from an env var.

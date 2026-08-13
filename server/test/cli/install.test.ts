@@ -1,6 +1,6 @@
+import { createRequire } from "node:module";
 import { Writable } from "node:stream";
 import { describe, expect, it } from "vitest";
-import packageJson from "../../package.json";
 
 import {
   AGENT_INSTALL_CONTRACT,
@@ -10,6 +10,9 @@ import {
   type InstallProbeResult,
 } from "../../src/cli/install.js";
 import { TOP_LEVEL_SUBCOMMANDS } from "../../src/cli/subcommands.js";
+
+const require = createRequire(import.meta.url);
+const packageJson = require("../../package.json") as { version: string };
 
 class Capture extends Writable {
   chunks: string[] = [];

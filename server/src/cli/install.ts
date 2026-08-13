@@ -3,9 +3,9 @@ import { lstat, realpath } from "node:fs/promises";
 import { Writable } from "node:stream";
 import { promisify } from "node:util";
 import { join, resolve } from "node:path";
-import packageJson from "../../package.json";
 
 import { resolveStoragePath } from "../paths.js";
+import { getSanctuaryVersion } from "../version.js";
 import { agentGuidedRecoveryOutputPath } from "../wrap/custody-flow.js";
 import {
   getPlatformPaths,
@@ -22,7 +22,7 @@ const execFileAsync = promisify(nodeExecFile);
 
 export const AGENT_INSTALL_CONTRACT = "sanctuary.agent-install.v1";
 export const DEFAULT_CASTLE_WALL_APP = "/Applications/Sanctuary-CastleWall.app";
-const INSTALLER_VERSION = packageJson.version;
+const INSTALLER_VERSION = getSanctuaryVersion();
 const CASTLE_WALL_TEAM_ID = "YFQSWQ9BJN";
 const CASTLE_WALL_APP_IDENTIFIER = "ai.sanctuaryprotocol.macos";
 const CASTLE_WALL_HEADLESS_CONTRACT = "3";
