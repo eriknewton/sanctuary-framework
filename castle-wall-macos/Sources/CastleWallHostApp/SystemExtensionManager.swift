@@ -10,6 +10,7 @@ final class SystemExtensionManager: NSObject, ObservableObject {
         case activatedRequiresReboot
         case deactivating
         case deactivated
+        case deactivatedRequiresReboot
         case needsUserApproval
         case error(String)
 
@@ -27,6 +28,8 @@ final class SystemExtensionManager: NSObject, ObservableObject {
                 return "Deactivating"
             case .deactivated:
                 return "Deactivated"
+            case .deactivatedRequiresReboot:
+                return "Deactivation accepted (reboot required)"
             case .needsUserApproval:
                 return "Needs user approval"
             case let .error(message):
@@ -89,7 +92,14 @@ final class SystemExtensionManager: NSObject, ObservableObject {
                 extensionState = .error("Unknown activation result")
             }
         case .deactivation:
-            extensionState = .deactivated
+            switch result {
+            case .completed:
+                extensionState = .deactivated
+            case .willCompleteAfterReboot:
+                extensionState = .deactivatedRequiresReboot
+            @unknown default:
+                extensionState = .error("Unknown deactivation result")
+            }
         case .none:
             extensionState = .unknown
         }

@@ -1512,21 +1512,38 @@ export async function mintRecoveryWrap(
   envelope: CustodyEnvelope,
   masterKey: Uint8Array
 ): Promise<{ envelope: CustodyEnvelope; recoveryKey: string }> {
+  const prepared = prepareRecoveryWrap(envelope, masterKey);
+  const updated = await writeCustodyEnvelope(
+    storage,
+    prepared.envelope,
+    masterKey
+  );
+  return { envelope: updated, recoveryKey: prepared.recoveryKey };
+}
+
+/**
+ * Prepare a recovery wrap without persisting it. Agent-guided custody uses
+ * this to create the exclusive handoff file before committing the wrap, so a
+ * destination race cannot persist a recovery credential whose plaintext was
+ * never handed off.
+ */
+export function prepareRecoveryWrap(
+  envelope: CustodyEnvelope,
+  masterKey: Uint8Array
+): { envelope: CustodyEnvelope; recoveryKey: string } {
   const recoveryKeyBytes = generateRandomKey();
   const recoveryKey = toBase64url(recoveryKeyBytes);
   const wrap = wrapMasterWithRecoveryKey(masterKey, recoveryKeyBytes, {
     verified: false,
   });
   recoveryKeyBytes.fill(0);
-  const updated = await writeCustodyEnvelope(
-    storage,
-    {
+  return {
+    envelope: {
       ...envelope,
       wraps: [...envelope.wraps, wrap],
     },
-    masterKey
-  );
-  return { envelope: updated, recoveryKey };
+    recoveryKey,
+  };
 }
 
 // ── Castle-pin custody diagnostic ───────────────────────────────────

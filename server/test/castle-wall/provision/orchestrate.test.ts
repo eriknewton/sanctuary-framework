@@ -1,4 +1,4 @@
-// fail-before-exempt: type-forced fixture updates only, from two separate contract changes — the rehome plan gained a required newAccountHome field (account-home custody), and ParkedInstallRevertOps gained setJobDisabled/ensureHoldDir plus snapshot holdFilePath/disabledBefore (park reversibility). This file's subject has a behavioral stake in neither; the real pins are in rehome.test.ts, auto-provision-realops.test.ts, and release-barrier.test.ts.
+// Historical file-level fail-before exemption retired: this file now contains an agent-guided provisioning behavior regression.
 /**
  * Tests for the one-flow orchestration (fold of the target flow's steps 1
  * through 11, folded fixes B2/H1/H3/H4/L2): every fail-closed branch is
@@ -2909,5 +2909,20 @@ describe("castle-wall/provision/orchestrate", () => {
       expect(printed.join("\n")).toMatch(/could NOT be fully restored/);
       expect(printed.join("\n")).toMatch(/The agent is PARKED \(not running\)/);
     });
+  });
+
+  it("agent-guided delegation preserves plan-print but permits the non-TTY flow without a prompt", async () => {
+    const ops = happyPathOps();
+    const result = await runProvisionFlow(
+      baseCtx({ isTty: false, preAnsweredProvision: true, agentGuided: true }),
+      ops,
+    );
+    expect(result.kind).toBe("armed");
+    expect(ops.confirm).not.toHaveBeenCalled();
+    expect(ops.print).toHaveBeenCalledWith(
+      expect.stringContaining("Agent-guided install explicitly delegated"),
+    );
+    expect(ops.createAccount).toHaveBeenCalledTimes(1);
+    expect(ops.arm).toHaveBeenCalledWith(AGENT_UID, CEILING);
   });
 });

@@ -428,7 +428,13 @@ type ObservedArmClaimObservationBasis =
 interface HeadlessReport {
   ok: boolean;
   action: string;
-  state: "enabled" | "disabled" | "needs_user_approval" | "unknown";
+  state:
+    | "enabled"
+    | "disabled"
+    | "deactivated"
+    | "will_complete_after_reboot"
+    | "needs_user_approval"
+    | "unknown";
   error?: string;
   build?: HeadlessBuildIdentity;
 }
@@ -537,7 +543,7 @@ async function readEnforcementAvailabilityForStatus(
 
 /** Exit-code contract with HeadlessFilterCLI.ExitCode (Swift side). */
 const HEADLESS_EXIT_NEEDS_APPROVAL = 3;
-export const CASTLE_WALL_HEADLESS_CONTRACT_VERSION = "2";
+export const CASTLE_WALL_HEADLESS_CONTRACT_VERSION = "3";
 
 interface HeadlessBuildIdentity {
   git_sha?: string;
@@ -3852,6 +3858,7 @@ function makeDefaultOpenRunner(timeoutMs: number): OpenRunner {
  */
 const ARM_INVOKE_TIMEOUT_MS = 90_000;
 const DISARM_INVOKE_TIMEOUT_MS = 7_000;
+const DEACTIVATE_SYSTEM_EXTENSION_TIMEOUT_MS = 90_000;
 function defaultArmInvoke(ctx: CastleWallCommandContext, action: "enable" | "disable"): HostAppInvoker {
   return makeLaunchServicesHostAppInvoke({
     timeoutMs: action === "disable" ? DISARM_INVOKE_TIMEOUT_MS : ARM_INVOKE_TIMEOUT_MS,
@@ -3861,6 +3868,113 @@ function defaultArmInvoke(ctx: CastleWallCommandContext, action: "enable" | "dis
       ? { runningAppController: ctx.runningAppController }
       : {}),
   });
+}
+
+export type SystemExtensionDeactivationRequestOutcome =
+  | { kind: "request-completed" }
+  | { kind: "reboot-required" }
+  | { kind: "needs-user-approval"; detail: string }
+  | { kind: "failed"; detail: string };
+
+/**
+ * Ask the deployed signed host app to deactivate its bundled system
+ * extension. This function deliberately proves only the REQUEST outcome;
+ * callers must independently observe system-extension absence before they
+ * claim removal, because macOS may defer completion until reboot.
+ */
+export async function requestSystemExtensionDeactivation(
+  ctx: CastleWallCommandContext = {},
+): Promise<SystemExtensionDeactivationRequestOutcome> {
+  const env = ctx.env ?? process.env;
+  const platform = ctx.platform ?? process.platform;
+  if (platform !== "darwin") {
+    return { kind: "failed", detail: "system-extension deactivation is macOS-only" };
+  }
+
+  const resolved = await resolveHostAppBinary(env, ctx);
+  if ("error" in resolved) {
+    return { kind: "failed", detail: resolved.error };
+  }
+
+  const invoke =
+    ctx.hostAppInvoke ??
+    makeLaunchServicesHostAppInvoke({
+      timeoutMs: DEACTIVATE_SYSTEM_EXTENSION_TIMEOUT_MS,
+      ...(ctx.openRunner ? { openRunner: ctx.openRunner } : {}),
+      ...(ctx.reportPathFactory ? { reportPathFactory: ctx.reportPathFactory } : {}),
+      ...(ctx.runningAppController
+        ? { runningAppController: ctx.runningAppController }
+        : {}),
+    });
+  const cliGitSha = resolveCliBuildSha(env, ctx);
+
+  // The signed host refuses deactivation while the filter is enabled too,
+  // but the CLI checks first so no destructive request is even submitted
+  // when the disarm postcondition is not positively observed.
+  const statusResult = await invoke(resolved.path, ["--headless", "status"]);
+  const statusReport = parseHeadlessReport(statusResult.stdout);
+  if (!statusReport) {
+    return {
+      kind: "failed",
+      detail:
+        statusResult.stderr.trim() ||
+        `host app status exited with code ${statusResult.exitCode}`,
+    };
+  }
+  const statusBuildMismatch = validateHeadlessBuildIdentity(statusReport, cliGitSha);
+  if (statusBuildMismatch) {
+    return { kind: "failed", detail: statusBuildMismatch };
+  }
+  if (statusReport.state !== "disabled") {
+    return {
+      kind: "failed",
+      detail: `content filter state is '${statusReport.state}', not positively observed disabled`,
+    };
+  }
+
+  const result = await invoke(resolved.path, [
+    "--headless",
+    "deactivate-system-extension",
+    "--timeout=60",
+  ]);
+  const report = parseHeadlessReport(result.stdout);
+  if (!report) {
+    return {
+      kind: "failed",
+      detail:
+        result.stderr.trim() ||
+        `host app deactivation exited with code ${result.exitCode}`,
+    };
+  }
+  const buildMismatch = validateHeadlessBuildIdentity(report, cliGitSha);
+  if (buildMismatch) {
+    return { kind: "failed", detail: buildMismatch };
+  }
+  if (report.state === "needs_user_approval") {
+    return {
+      kind: "needs-user-approval",
+      detail: report.error ?? "macOS requires operator approval",
+    };
+  }
+  if (!report.ok || result.exitCode !== 0) {
+    return {
+      kind: "failed",
+      detail:
+        report.error ??
+        (result.stderr.trim() ||
+          `host app deactivation exited with code ${result.exitCode}`),
+    };
+  }
+  if (report.state === "will_complete_after_reboot") {
+    return { kind: "reboot-required" };
+  }
+  if (report.state === "deactivated") {
+    return { kind: "request-completed" };
+  }
+  return {
+    kind: "failed",
+    detail: `host app returned unexpected deactivation state '${report.state}'`,
+  };
 }
 
 /**

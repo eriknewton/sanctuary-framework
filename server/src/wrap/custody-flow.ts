@@ -18,7 +18,7 @@
  * as a distinct path, never a silent relaxation (F6/F13).
  */
 
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { createInterface } from "node:readline/promises";
 
 import { FilesystemStorage } from "../storage/filesystem.js";
@@ -27,6 +27,7 @@ import { fortressIdFromStoragePath } from "../dashboard/v1_1/wiring.js";
 import {
   establishMaster,
   mintRecoveryWrap,
+  prepareRecoveryWrap,
   verifyRecoveryWrapByReentry,
   wrapMasterWithPassphrase,
   writeCustodyEnvelope,
@@ -37,7 +38,9 @@ import {
 } from "../core/master-custody.js";
 import {
   discloseRecoveryKey,
+  preflightRecoveryKeyOutputFile,
   verifyRecoveryKeyReentry,
+  writeRecoveryKeyFile,
   type DisclosureIo,
 } from "./recovery-key-disclosure.js";
 
@@ -49,6 +52,21 @@ export interface WrapCustodyOptions {
   interactive: boolean;
   /** Test seam: stdin/stderr streams for prompts. */
   io?: DisclosureIo;
+  /** Stage recovery outside the fortress without printing it to an agent transcript. */
+  agentGuided?: boolean;
+  /** Test seam: simulate a destination race after preflight, before O_EXCL. */
+  beforeAgentRecoveryFileCreate?: () => void | Promise<void>;
+}
+
+export function agentGuidedRecoveryOutputPath(
+  storagePath: string,
+  fortressId: string = fortressIdFromStoragePath(storagePath),
+): string {
+  return join(
+    dirname(storagePath),
+    "Sanctuary Recovery",
+    `${fortressId}-recovery-key.txt`,
+  );
 }
 
 export interface WrapCustodyResult {
@@ -200,17 +218,50 @@ export async function establishWrapCustody(
   // that makes a passphrase fortress actually recoverable.
   let mintedRecoveryKey = false;
   if (!envelope.wraps.some((w) => w.type === "recovery-key")) {
-    const minted = await mintRecoveryWrap(storage, envelope, masterKey);
-    envelope = minted.envelope;
+    const agentRecoveryPath = opts.agentGuided
+      ? agentGuidedRecoveryOutputPath(opts.storagePath, fortressId)
+      : undefined;
+    if (agentRecoveryPath !== undefined) {
+      // Fail before minting: a pre-existing destination must never leave the
+      // new recovery wrap with no safely handed-off key.
+      await preflightRecoveryKeyOutputFile(agentRecoveryPath);
+    }
+    let disclosure: { filePath: string; fileWritten: boolean };
+    if (agentRecoveryPath !== undefined) {
+      const prepared = prepareRecoveryWrap(envelope, masterKey);
+      // The custom writer is O_EXCL + O_NOFOLLOW. Commit the envelope only
+      // after that atomic handoff succeeds; if an attacker wins the path race,
+      // the fortress retains no orphaned recovery wrap.
+      await opts.beforeAgentRecoveryFileCreate?.();
+      const written = await writeRecoveryKeyFile({
+        storagePath: opts.storagePath,
+        recoveryKeyFilePath: agentRecoveryPath,
+        recoveryKey: prepared.recoveryKey,
+        fortressId,
+      });
+      envelope = await writeCustodyEnvelope(storage, prepared.envelope, masterKey);
+      disclosure = { filePath: written.filePath, fileWritten: written.written };
+    } else {
+      const minted = await mintRecoveryWrap(storage, envelope, masterKey);
+      envelope = minted.envelope;
+      const result = await discloseRecoveryKey({
+        recoveryKey: minted.recoveryKey,
+        storagePath: opts.storagePath,
+        fortressId,
+        mode: "no-confirm", // re-entry verification below replaces the Y/N prompt
+        ...(opts.io ? { io: opts.io } : {}),
+      });
+      disclosure = { filePath: result.filePath, fileWritten: result.fileWritten };
+    }
     mintedRecoveryKey = true;
-
-    const disclosure = await discloseRecoveryKey({
-      recoveryKey: minted.recoveryKey,
-      storagePath: opts.storagePath,
-      fortressId,
-      mode: "no-confirm", // re-entry verification below replaces the Y/N prompt
-      ...(opts.io ? { io: opts.io } : {}),
-    });
+    if (agentRecoveryPath !== undefined) {
+      (opts.io?.output ?? process.stderr).write(
+        `\n  Recovery material staged locally for the operator at:\n` +
+          `    ${disclosure.filePath}\n` +
+          `  The installing agent must not read this file. The operator should move it\n` +
+          `  into a password manager in a private local session, then delete the file.\n`,
+      );
+    }
     if (!disclosure.fileWritten) {
       // A recovery-key.txt already existed (a stale artifact from a legacy
       // path — the misleading-file trap from the 2026-06-12 incident).

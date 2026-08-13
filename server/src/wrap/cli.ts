@@ -463,6 +463,13 @@ export function registerProcessShutdownCleanup(
 export interface WrapOptions {
   /** True when the top-level CLI invoked this module through `sanctuary protect`. */
   protectCommand?: boolean;
+  /**
+   * Operator-delegated agent install. Stages recovery outside the fortress
+   * without printing it. On `protect --hermes --provision-agent-account`, it
+   * also permits the already plan-printed privileged flow to continue without
+   * stdin being a TTY. Root remains required for privileged mutations.
+   */
+  agentGuided?: boolean;
   /** Run the read-only install preflight and exit before any host mutation. */
   preflight?: boolean;
   /** Render the preflight table as machine-readable JSON. */
@@ -2335,6 +2342,7 @@ async function maybeRunAutoProvisionForWrap(
       summary = await runner({
         isTty: process.stdin.isTTY === true,
         preAnsweredProvision: options.provisionAgentAccount,
+        agentGuided: options.agentGuided === true,
         cliBinary: resolveAutoProvisionCliBinary(options),
         stopTransientCastleWallDaemon,
         ...(auditLog ? { auditLog } : {}),
@@ -2854,8 +2862,23 @@ export async function runWrap(
     process.exit(2);
   }
 
+  if (
+    options.agentGuided === true &&
+    (options.protectCommand !== true ||
+      options.repairEgressGate === true ||
+      options.unprotectEgressGate === true)
+  ) {
+    // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
+    console.error(
+      "\n  Sanctuary protect: --agent-guided is valid only on the protect install flow, not repair/unprotect verbs.\n",
+    );
+    process.exit(2);
+  }
+
   const protectInstallFlow =
     options.protectCommand === true &&
+    options.hermes === true &&
+    options.provisionAgentAccount !== false &&
     options.repairEgressGate !== true &&
     options.unprotectEgressGate !== true;
   if (options.protectCommand === true && (options.preflight === true || protectInstallFlow)) {
@@ -3500,6 +3523,7 @@ export async function runWrap(
         storagePath,
         passphrase: passphraseValue,
         interactive: !options.noOpen && process.stdin.isTTY === true,
+        agentGuided: options.agentGuided === true,
       });
     } catch (err) {
       if (err instanceof CustodyUnlockError) {
@@ -6011,6 +6035,7 @@ const WRAP_BOOLEAN_FLAGS = new Set([
   "--no-dashboard",
   "--allow-plaintext-remote",
   "--anchor-transparency",
+  "--agent-guided",
   "--provision-agent-account",
   "--no-provision-agent-account",
   "--exclusive-egress",
@@ -6121,6 +6146,9 @@ export function parseWrapArgs(argv: string[]): WrapOptions {
         break;
       case "--anchor-transparency":
         options.anchorTransparency = true;
+        break;
+      case "--agent-guided":
+        options.agentGuided = true;
         break;
       case "--provision-agent-account":
         options.provisionAgentAccount = true;
@@ -6249,6 +6277,10 @@ function printWrapHelp(): void {
                        counts, policy data, or fortress identifiers.
                        Equivalent to running
                        \`sanctuary transparency anchor enable\` later.
+    --agent-guided     Agent-install mode: stages recovery outside the fortress
+                       without printing it. With Hermes account provisioning,
+                       also permits the printed privileged plan to continue on
+                       a non-TTY; root/sudo remains required.
     --dev-dist <path>  Dogfood path. Point the harness MCP entries at a
                        local Sanctuary build (\`node <path>\` instead of the
                        version-pinned npx registry entry). Required

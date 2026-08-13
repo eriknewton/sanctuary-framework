@@ -188,7 +188,7 @@ sanctuary castle-wall disable      # disarm; unconditional dead-man lever
 ```
 
 Under the hood this launches the app through LaunchServices:
-`open -n -W Sanctuary-CastleWall.app --args --headless <enable|disable|status> --report-file=<tmp>`.
+`open -n -W Sanctuary-CastleWall.app --args --headless <enable|disable|status|deactivate-system-extension> --report-file=<tmp>`.
 If the GUI app is already running, the CLI first terminates that instance and
 then relaunches the same signed app bundle headlessly. This preserves the
 operator-granted macOS content-filter consent while avoiding LaunchServices'
@@ -204,7 +204,7 @@ over SSH.
 Every headless report includes a deployed-app build identity:
 
 ```json
-{"build":{"git_sha":"<sha>","headless_contract_version":"2"}}
+{"build":{"git_sha":"<sha>","headless_contract_version":"3"}}
 ```
 
 The TypeScript CLI carries its own git SHA and headless contract version and

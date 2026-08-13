@@ -8,12 +8,12 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtemp, rm, readFile } from "node:fs/promises";
+import { mkdtemp, rm, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Readable, Writable } from "node:stream";
 
-import { establishWrapCustody } from "../../src/wrap/custody-flow.js";
+import { agentGuidedRecoveryOutputPath, establishWrapCustody } from "../../src/wrap/custody-flow.js";
 import {
   establishMaster,
   readCustodyEnvelope,
@@ -81,6 +81,67 @@ describe("establishWrapCustody", () => {
     expect(ops).toContain("custody_envelope_created");
     expect(ops).toContain("custody_headless_install");
     expect(ops).toContain("custody_wrap_added");
+  });
+
+  it("agent-guided first run stages recovery outside the fortress without transcript disclosure", async () => {
+    const output: string[] = [];
+    const recoveryPath = agentGuidedRecoveryOutputPath(fortress);
+    try {
+      const result = await establishWrapCustody({
+        storagePath: fortress,
+        passphrase: "agent-guided-passphrase",
+        interactive: false,
+        agentGuided: true,
+        io: {
+          input: Readable.from([]),
+          output: new Writable({
+            write(chunk, _encoding, callback) {
+              output.push(String(chunk));
+              callback();
+            },
+          }),
+        },
+      });
+
+      const fileContent = await readFile(recoveryPath, "utf8");
+      const recoveryKey = extractRecoveryKey(fileContent);
+      expect(output.join("")).toContain(recoveryPath);
+      expect(output.join("")).not.toContain(recoveryKey);
+      await expect(readFile(join(fortress, RECOVERY_KEY_FILENAME), "utf8")).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+
+      const storage = new FilesystemStorage(join(fortress, "state"));
+      const unlocked = await establishMaster({ storage, recoveryKey });
+      expect(toBase64url(unlocked.masterKey)).toBe(toBase64url(result.masterKey));
+    } finally {
+      await rm(recoveryPath, { force: true });
+    }
+  });
+
+  it("does not persist an orphaned recovery wrap when the staging path loses the race", async () => {
+    const recoveryPath = agentGuidedRecoveryOutputPath(fortress);
+    try {
+      await expect(
+        establishWrapCustody({
+          storagePath: fortress,
+          passphrase: "agent-guided-race-passphrase",
+          interactive: false,
+          agentGuided: true,
+          beforeAgentRecoveryFileCreate: async () => {
+            await writeFile(recoveryPath, "planted after preflight", { mode: 0o600 });
+          },
+        }),
+      ).rejects.toThrow(/existing .*recovery-out file/i);
+
+      const envelope = await readCustodyEnvelope(
+        new FilesystemStorage(join(fortress, "state")),
+      );
+      expect(envelope?.wraps.some((wrap) => wrap.type === "recovery-key")).toBe(false);
+      expect(await readFile(recoveryPath, "utf8")).toBe("planted after preflight");
+    } finally {
+      await rm(recoveryPath, { force: true });
+    }
   });
 
   it("legacy passphrase fortress: migrates in place and mints a recovery key that unlocks the LEGACY master (incident cure)", async () => {

@@ -14,8 +14,8 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { createRequire } from "node:module";
 import { randomBytes } from "node:crypto";
+import packageJson from "../package.json";
 import type { ApprovalGate } from "./principal-policy/gate.js";
 import type { ToolCallTrapRuntime } from "./honeypot/tool-call-trap-runtime.js";
 import type { AuditLog } from "./operational/audit-log.js";
@@ -25,8 +25,7 @@ import {
   ToolArgumentValidationError,
 } from "./tool-args.js";
 
-const require = createRequire(import.meta.url);
-const { version: PKG_VERSION } = require("../package.json");
+const PKG_VERSION = packageJson.version;
 
 /**
  * Tool handler function signature.

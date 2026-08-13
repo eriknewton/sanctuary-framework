@@ -87,6 +87,11 @@ export interface ProvisionFlowContext {
   /** Pre-answers the CHOICE only (fix L2): still confirms on a TTY, still plan-and-prints. */
   preAnsweredProvision?: boolean;
   /**
+   * Explicit agent-delegated install authorization. The plan is still printed,
+   * root is still required, and this only replaces the stdin-TTY confirmation.
+   */
+  agentGuided?: boolean;
+  /**
    * Bug B (one-flow gap): absolute fortress path whose Castle Wall POLICY daemon
    * the flow must ensure is reachable BEFORE arming. Passed to
    * `ops.ensurePolicyDaemon`, and `ops.arm`/`ops.disarm` target the SAME fortress
@@ -1620,7 +1625,7 @@ async function runProvisionFlowSteps(
   // cooperative wrap itself still complete; this function just reports that
   // provisioning was skipped so the caller knows to print the
   // "cooperative-only, re-run interactively" message.
-  if (!ctx.isTty) {
+  if (!ctx.isTty && ctx.agentGuided !== true) {
     return {
       kind: "skipped-non-tty-cooperative-only",
       reason:
@@ -1680,7 +1685,15 @@ async function runProvisionFlowSteps(
     );
   }
 
-  const proceed = await ops.confirm("Proceed with account creation and arming? [y/N] ");
+  if (ctx.agentGuided === true) {
+    ops.print(
+      "Agent-guided install explicitly delegated: proceeding after plan-print without an stdin prompt; sudo/root authorization remains required.",
+    );
+  }
+  const proceed =
+    ctx.agentGuided === true
+      ? true
+      : await ops.confirm("Proceed with account creation and arming? [y/N] ");
   if (!proceed) {
     return { kind: "declined-by-operator" };
   }

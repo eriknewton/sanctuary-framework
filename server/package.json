@@ -28,7 +28,8 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "node scripts/sign-reference-plugin.mjs && tsup && node scripts/copy-templates.js",
+    "build": "node scripts/sign-reference-plugin.mjs && tsup && npm run build:boot-runtime && node scripts/copy-templates.js",
+    "build:boot-runtime": "tsup --config tsup.boot-runtime.config.ts",
     "sign-reference-plugin": "node scripts/sign-reference-plugin.mjs",
     "sign-release": "tsx scripts/sign-release-manifest.mjs",
     "dev": "tsup --watch",
