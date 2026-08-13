@@ -62,6 +62,8 @@ describe("sanctuary install agent contract", () => {
     expect(plan.next_action?.argv).toEqual([
       "/opt/homebrew/bin/node",
       "/usr/local/lib/node_modules/@sanctuary-framework/mcp-server/dist/cli.js",
+      "--fortress",
+      "/tmp/fortress",
       "protect",
       "--claude-code",
       "--no-open",

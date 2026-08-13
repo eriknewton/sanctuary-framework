@@ -453,6 +453,8 @@ export function buildAgentInstallPlan(input: {
   const protectArgs = [
     input.observed.nodePath,
     input.observed.persistentCliPath ?? "sanctuary",
+    "--fortress",
+    input.fortress,
     "protect",
     `--${input.harness}`,
     "--no-open",
