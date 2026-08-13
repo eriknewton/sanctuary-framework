@@ -588,6 +588,11 @@ export function buildAgentInstallPlan(input: {
     plan.notes.push("A safety-bearing local observation is unknown; repair access before any mutating retry.");
     return plan;
   }
+  const persistentCliPath = input.observed.persistentCliPath;
+  if (persistentCliPath === null) {
+    plan.notes.push("The persistent CLI path disappeared after it was observed; refusing to construct a privileged command.");
+    return plan;
+  }
   plan.status = "human_action";
   plan.next_action = {
     id: "install_full_surface",
@@ -600,7 +605,7 @@ export function buildAgentInstallPlan(input: {
       `SANCTUARY_CASTLE_BUILD_SHA=${input.observed.castleWallBuildSha}`,
       `SANCTUARY_CASTLE_SIGNER_CLIENT=${CASTLE_WALL_SIGNER_CLIENT}`,
       input.observed.nodePath,
-      input.observed.persistentCliPath,
+      persistentCliPath,
       "--fortress",
       input.fortress,
       "protect",

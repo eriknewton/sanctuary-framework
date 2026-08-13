@@ -1533,17 +1533,38 @@ export function prepareRecoveryWrap(
 ): { envelope: CustodyEnvelope; recoveryKey: string } {
   const recoveryKeyBytes = generateRandomKey();
   const recoveryKey = toBase64url(recoveryKeyBytes);
-  const wrap = wrapMasterWithRecoveryKey(masterKey, recoveryKeyBytes, {
-    verified: false,
-  });
-  recoveryKeyBytes.fill(0);
-  return {
-    envelope: {
-      ...envelope,
-      wraps: [...envelope.wraps, wrap],
-    },
-    recoveryKey,
-  };
+  try {
+    return prepareRecoveryWrapWithKey(envelope, masterKey, recoveryKey);
+  } finally {
+    recoveryKeyBytes.fill(0);
+  }
+}
+
+/**
+ * Prepare a recovery wrap from a previously staged key. The agent-guided
+ * crash-resume path calls this only after authenticating the staging receipt
+ * against the pre-wrap envelope and current master.
+ */
+export function prepareRecoveryWrapWithKey(
+  envelope: CustodyEnvelope,
+  masterKey: Uint8Array,
+  recoveryKey: string,
+): { envelope: CustodyEnvelope; recoveryKey: string } {
+  const recoveryKeyBytes = fromBase64url(recoveryKey);
+  try {
+    const wrap = wrapMasterWithRecoveryKey(masterKey, recoveryKeyBytes, {
+      verified: false,
+    });
+    return {
+      envelope: {
+        ...envelope,
+        wraps: [...envelope.wraps, wrap],
+      },
+      recoveryKey,
+    };
+  } finally {
+    recoveryKeyBytes.fill(0);
+  }
 }
 
 // ── Castle-pin custody diagnostic ───────────────────────────────────

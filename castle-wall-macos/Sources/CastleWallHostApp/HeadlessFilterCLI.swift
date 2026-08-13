@@ -454,6 +454,7 @@ private final class HeadlessSystemExtensionDeactivator: NSObject,
     private static let extensionIdentifier = "ai.sanctuaryprotocol.macos.castle-wall"
     private let lock = NSLock()
     private var result: HeadlessFilterCLI.SystemExtensionDeactivationResult?
+    private var approvalNeeded = false
 
     func run(timeoutSeconds: Double) -> HeadlessFilterCLI.SystemExtensionDeactivationResult {
         let request = OSSystemExtensionRequest.deactivationRequest(
@@ -470,7 +471,10 @@ private final class HeadlessSystemExtensionDeactivator: NSObject,
             }
             RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
         }
-        return loadResult() ?? .timedOut
+        if let completed = loadResult() {
+            return completed
+        }
+        return loadApprovalNeeded() ? .needsUserApproval : .timedOut
     }
 
     private func storeResult(_ value: HeadlessFilterCLI.SystemExtensionDeactivationResult) {
@@ -483,6 +487,18 @@ private final class HeadlessSystemExtensionDeactivator: NSObject,
         lock.lock()
         defer { lock.unlock() }
         return result
+    }
+
+    private func noteApprovalNeeded() {
+        lock.lock()
+        approvalNeeded = true
+        lock.unlock()
+    }
+
+    private func loadApprovalNeeded() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return approvalNeeded
     }
 
     func request(
@@ -507,7 +523,9 @@ private final class HeadlessSystemExtensionDeactivator: NSObject,
     }
 
     func requestNeedsUserApproval(_ request: OSSystemExtensionRequest) {
-        storeResult(.needsUserApproval)
+        // Informational, not terminal: macOS can still deliver didFinish after
+        // approval. Remember it for timeout reporting without racing completion.
+        noteApprovalNeeded()
     }
 
     func request(

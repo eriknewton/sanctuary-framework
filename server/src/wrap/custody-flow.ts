@@ -22,12 +22,22 @@ import { dirname, join } from "node:path";
 import { createInterface } from "node:readline/promises";
 
 import { FilesystemStorage } from "../storage/filesystem.js";
+import { readFileCustody } from "../storage/custody-fs.js";
 import { AuditLog } from "../operational/audit-log.js";
 import { fortressIdFromStoragePath } from "../dashboard/v1_1/wiring.js";
+import { derivePurposeKey } from "../core/key-derivation.js";
+import { hmacSha256 } from "../core/hashing.js";
+import {
+  constantTimeEqual,
+  fromBase64url,
+  stringToBytes,
+  toBase64url,
+} from "../core/encoding.js";
 import {
   establishMaster,
   mintRecoveryWrap,
   prepareRecoveryWrap,
+  prepareRecoveryWrapWithKey,
   verifyRecoveryWrapByReentry,
   wrapMasterWithPassphrase,
   writeCustodyEnvelope,
@@ -56,6 +66,8 @@ export interface WrapCustodyOptions {
   agentGuided?: boolean;
   /** Test seam: simulate a destination race after preflight, before O_EXCL. */
   beforeAgentRecoveryFileCreate?: () => void | Promise<void>;
+  /** Test seam: simulate a crash after staging succeeds, before envelope commit. */
+  afterAgentRecoveryFileCreate?: () => void | Promise<void>;
 }
 
 export function agentGuidedRecoveryOutputPath(
@@ -76,6 +88,89 @@ export interface WrapCustodyResult {
   /** Disclosed this run (newly minted recovery key), if any. */
   mintedRecoveryKey: boolean;
   origin: EstablishMasterResult["origin"] | "recovery-unlock-enroll";
+}
+
+const AGENT_RECOVERY_RECEIPT_PURPOSE = "agent-guided-recovery-staging-v1";
+const RECOVERY_KEY_VALUE = /^[A-Za-z0-9_-]{43}$/;
+
+function stagedRecoveryReceipt(
+  envelope: CustodyEnvelope,
+  masterKey: Uint8Array,
+  fortressId: string,
+  recoveryKey: string,
+): string {
+  const receiptKey = derivePurposeKey(masterKey, AGENT_RECOVERY_RECEIPT_PURPOSE);
+  try {
+    return toBase64url(hmacSha256(
+      receiptKey,
+      stringToBytes(`${fortressId}\0${envelope.mac}\0${recoveryKey}`),
+    ));
+  } finally {
+    receiptKey.fill(0);
+  }
+}
+
+function valueAfterLabel(content: string, label: string): string | null {
+  const lines = content.split(/\r?\n/);
+  const index = lines.indexOf(label);
+  return index >= 0 ? lines[index + 1]?.trim() ?? null : null;
+}
+
+async function resumeAuthenticatedAgentRecoveryFile(input: {
+  filePath: string;
+  envelope: CustodyEnvelope;
+  masterKey: Uint8Array;
+  fortressId: string;
+}): Promise<CustodyEnvelope | null> {
+  let content: string;
+  try {
+    const uid = process.getuid?.();
+    content = await readFileCustody(input.filePath, {
+      encoding: "utf8",
+      mode: { exact: 0o600 },
+      ...(uid === undefined ? {} : {
+        uid,
+        parent: { uid, mode: { rejectGroupOrOther: true } },
+      }),
+      verifyPathIdentity: true,
+    });
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+      return null;
+    }
+    throw error;
+  }
+
+  const recoveryKey = valueAfterLabel(content, "Recovery key:");
+  const receipt = valueAfterLabel(content, "Recovery staging receipt:");
+  if (!recoveryKey || !receipt || !RECOVERY_KEY_VALUE.test(recoveryKey)) {
+    throw new Error(
+      `Existing agent-guided recovery file is not an authenticated interrupted handoff: ${input.filePath}`,
+    );
+  }
+  const expected = stagedRecoveryReceipt(
+    input.envelope,
+    input.masterKey,
+    input.fortressId,
+    recoveryKey,
+  );
+  let receiptMatches = false;
+  try {
+    receiptMatches = constantTimeEqual(fromBase64url(receipt), fromBase64url(expected));
+  } catch {
+    receiptMatches = false;
+  }
+  if (!receiptMatches) {
+    throw new Error(
+      `Existing agent-guided recovery file is not an authenticated interrupted handoff: ${input.filePath}`,
+    );
+  }
+  const prepared = prepareRecoveryWrapWithKey(
+    input.envelope,
+    input.masterKey,
+    recoveryKey,
+  );
+  return prepared.envelope;
 }
 
 async function promptLine(
@@ -221,26 +316,43 @@ export async function establishWrapCustody(
     const agentRecoveryPath = opts.agentGuided
       ? agentGuidedRecoveryOutputPath(opts.storagePath, fortressId)
       : undefined;
-    if (agentRecoveryPath !== undefined) {
-      // Fail before minting: a pre-existing destination must never leave the
-      // new recovery wrap with no safely handed-off key.
-      await preflightRecoveryKeyOutputFile(agentRecoveryPath);
-    }
     let disclosure: { filePath: string; fileWritten: boolean };
     if (agentRecoveryPath !== undefined) {
-      const prepared = prepareRecoveryWrap(envelope, masterKey);
-      // The custom writer is O_EXCL + O_NOFOLLOW. Commit the envelope only
-      // after that atomic handoff succeeds; if an attacker wins the path race,
-      // the fortress retains no orphaned recovery wrap.
-      await opts.beforeAgentRecoveryFileCreate?.();
-      const written = await writeRecoveryKeyFile({
-        storagePath: opts.storagePath,
-        recoveryKeyFilePath: agentRecoveryPath,
-        recoveryKey: prepared.recoveryKey,
+      const resumedEnvelope = await resumeAuthenticatedAgentRecoveryFile({
+        filePath: agentRecoveryPath,
+        envelope,
+        masterKey,
         fortressId,
       });
-      envelope = await writeCustodyEnvelope(storage, prepared.envelope, masterKey);
-      disclosure = { filePath: written.filePath, fileWritten: written.written };
+      if (resumedEnvelope !== null) {
+        envelope = await writeCustodyEnvelope(storage, resumedEnvelope, masterKey);
+        disclosure = { filePath: agentRecoveryPath, fileWritten: true };
+      } else {
+        // Fail before minting: a pre-existing destination must never leave the
+        // new recovery wrap with no safely handed-off key.
+        await preflightRecoveryKeyOutputFile(agentRecoveryPath);
+        const prepared = prepareRecoveryWrap(envelope, masterKey);
+        const recoveryReceipt = stagedRecoveryReceipt(
+          envelope,
+          masterKey,
+          fortressId,
+          prepared.recoveryKey,
+        );
+        // The custom writer is O_EXCL + O_NOFOLLOW. Commit the envelope only
+        // after that atomic handoff succeeds; if an attacker wins the path race,
+        // the fortress retains no orphaned recovery wrap.
+        await opts.beforeAgentRecoveryFileCreate?.();
+        const written = await writeRecoveryKeyFile({
+          storagePath: opts.storagePath,
+          recoveryKeyFilePath: agentRecoveryPath,
+          recoveryKey: prepared.recoveryKey,
+          fortressId,
+          recoveryReceipt,
+        });
+        await opts.afterAgentRecoveryFileCreate?.();
+        envelope = await writeCustodyEnvelope(storage, prepared.envelope, masterKey);
+        disclosure = { filePath: written.filePath, fileWritten: written.written };
+      }
     } else {
       const minted = await mintRecoveryWrap(storage, envelope, masterKey);
       envelope = minted.envelope;

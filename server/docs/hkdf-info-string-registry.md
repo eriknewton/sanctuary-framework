@@ -43,6 +43,7 @@ Every entry in §B and §C below routes through one of these two helpers OR call
 |---|---|---|---|
 | `identity-encryption` | `server/src/cognitive/tools.ts:82`, `server/src/reputation/tools.ts:35`, `server/src/handshake/protocol.ts:96`, `server/src/exit/bundle.ts:524` | (literal) | Wraps Ed25519 identity private keys at rest. |
 | `audit-log` | `server/src/operational/audit-log.ts:68` | (literal) | Encrypts the Operational audit log. |
+| `agent-guided-recovery-staging-v1` | `server/src/wrap/custody-flow.ts` | `AGENT_RECOVERY_RECEIPT_PURPOSE` | Derives the MAC key for a recovery staging receipt bound to the fortress id, pre-wrap custody-envelope MAC, and staged recovery key. A retry accepts an existing file only when this receipt authenticates, so a crash can resume without trusting an attacker-planted file. This encrypts no durable store; changing it invalidates only an uncommitted staging handoff. **(scan-reconciled 2026-08-12; crypto-domain label.)** |
 | `principal-baseline` | `server/src/principal-policy/baseline.ts:40` | (literal) | Encrypts the Operational baseline-tracker store. |
 | `l2-privacy-policies-v1` | `server/src/operational/privacy-core.ts:157` | (literal) | Encrypts Operational privacy policy state. |
 | `sanctuary-v1.1-privacy-content-hmac` | `server/src/operational/privacy-core.ts:225` | (literal) | HMAC key for privacy-content fingerprints. |
