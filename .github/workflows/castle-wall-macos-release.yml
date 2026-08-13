@@ -377,7 +377,9 @@ jobs:
             "$LAUNCHER" --version \
             | grep -Fx "@sanctuary-framework/mcp-server $EXPECTED_VERSION"
           "$NODE" -e '
-            const load = require("node:module").createRequire(process.argv[1]);
+            const load = require("node:module").createRequire(
+              require("node:path").resolve(process.argv[1]),
+            );
             load("lmdb");
             load("msgpackr-extract");
           ' "$CLI_RUNTIME/package.json"
@@ -518,7 +520,9 @@ jobs:
             "$ARTIFACT_LAUNCHER" --version \
             | grep -Fx "@sanctuary-framework/mcp-server $EXPECTED_VERSION"
           "$ARTIFACT_RUNTIME/node" -e '
-            const load = require("node:module").createRequire(process.argv[1]);
+            const load = require("node:module").createRequire(
+              require("node:path").resolve(process.argv[1]),
+            );
             load("lmdb");
             load("msgpackr-extract");
           ' "$ARTIFACT_CLI_RUNTIME/package.json"

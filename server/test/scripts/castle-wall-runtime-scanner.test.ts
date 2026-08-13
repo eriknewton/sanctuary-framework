@@ -38,11 +38,99 @@ function sealedRuntimeAssertion(): string {
   return assertion[1];
 }
 
+function nativeLoadAssertions(): string[] {
+  const workflow = readFileSync(releaseWorkflow, "utf8");
+  return [...workflow.matchAll(
+    /(?:"\$NODE"|"\$ARTIFACT_RUNTIME\/node") -e '([\s\S]*?)' "\$(?:CLI_RUNTIME|ARTIFACT_CLI_RUNTIME)\/package\.json"/g,
+  )].map((match) => match[1]);
+}
+
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
 describe("Castle Wall CLI-runtime Mach-O scanner", () => {
+  it("accounts for every inline workflow consumer of a path argument", () => {
+    const workflow = readFileSync(releaseWorkflow, "utf8");
+    expect(workflow.match(/process\.argv\[1\]/g)).toHaveLength(3);
+    expect(nativeLoadAssertions()).toHaveLength(2);
+    for (const assertion of nativeLoadAssertions()) {
+      expect(assertion).toContain('load("lmdb")');
+      expect(assertion).toContain('load("msgpackr-extract")');
+    }
+    expect(sealedRuntimeAssertion()).toContain("resolve(process.argv[1])");
+  });
+
+  it("executes both native-load workflow assertions with relative package paths", () => {
+    const root = mkdtempSync(join(tmpdir(), "sanctuary-release-native-load-"));
+    roots.push(root);
+    const packagePath = "build/Sanctuary-CastleWall.app/Contents/Resources/cli-runtime/package.json";
+    const runtime = join(root, packagePath, "..");
+    for (const name of ["lmdb", "msgpackr-extract"]) {
+      const moduleRoot = join(runtime, "node_modules", name);
+      mkdirSync(moduleRoot, { recursive: true });
+      writeFileSync(join(moduleRoot, "package.json"), JSON.stringify({ main: "index.js" }));
+      writeFileSync(join(moduleRoot, "index.js"), [
+        'require("node:fs").appendFileSync(process.env.NATIVE_LOAD_MARKERS,',
+        `${JSON.stringify(`${name}\n`)});`,
+        "module.exports = true;",
+        "",
+      ].join("\n"));
+    }
+    writeFileSync(join(runtime, "package.json"), JSON.stringify({ name: "cli-runtime" }));
+
+    const assertions = nativeLoadAssertions();
+    expect(assertions).toHaveLength(2);
+    for (const [index, assertion] of assertions.entries()) {
+      const markers = join(root, `loaded-${index}.txt`);
+      execFileSync(process.execPath, ["-e", assertion, packagePath], {
+        cwd: root,
+        env: { ...process.env, NATIVE_LOAD_MARKERS: markers },
+      });
+      expect(readFileSync(markers, "utf8").trim().split("\n").sort()).toEqual([
+        "lmdb",
+        "msgpackr-extract",
+      ]);
+    }
+  });
+
+  it("fails both native-load workflow assertions closed for missing and invalid packages", () => {
+    const root = mkdtempSync(join(tmpdir(), "sanctuary-release-native-load-rejection-"));
+    roots.push(root);
+    const invalidRuntime = join(root, "invalid");
+    mkdirSync(join(invalidRuntime, "node_modules", "lmdb"), { recursive: true });
+    writeFileSync(join(invalidRuntime, "package.json"), JSON.stringify({ name: "cli-runtime" }));
+    writeFileSync(join(invalidRuntime, "node_modules", "lmdb", "package.json"), "{not-json");
+    for (const [runtimeName, moduleName] of [
+      ["lmdb-only", "lmdb"],
+      ["msgpackr-only", "msgpackr-extract"],
+    ]) {
+      const runtime = join(root, runtimeName);
+      const moduleRoot = join(runtime, "node_modules", moduleName);
+      mkdirSync(moduleRoot, { recursive: true });
+      writeFileSync(join(runtime, "package.json"), JSON.stringify({ name: "cli-runtime" }));
+      writeFileSync(join(moduleRoot, "package.json"), JSON.stringify({ main: "index.js" }));
+      writeFileSync(join(moduleRoot, "index.js"), "module.exports = true;\n");
+    }
+
+    const assertions = nativeLoadAssertions();
+    expect(assertions).toHaveLength(2);
+    for (const assertion of assertions) {
+      for (const packagePath of [
+        "missing/package.json",
+        "invalid/package.json",
+        "lmdb-only/package.json",
+        "msgpackr-only/package.json",
+      ]) {
+        expect(() => execFileSync(
+          process.execPath,
+          ["-e", assertion, packagePath],
+          { cwd: root, stdio: "pipe" },
+        )).toThrow();
+      }
+    }
+  });
+
   it("executes the sealed-runtime workflow assertion with a relative manifest path", () => {
     const root = mkdtempSync(join(tmpdir(), "sanctuary-release-manifest-assertion-"));
     roots.push(root);
