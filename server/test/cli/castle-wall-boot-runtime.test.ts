@@ -74,10 +74,10 @@ describe("Castle Wall root boot-runtime custody", () => {
       "--safe-mode",
       "--launchd",
     ]);
+    expect(await readFile(snapshot.cliPath, "utf8")).toBe("cli bytes");
     expect((await lstat(snapshot.nodePath)).mode & 0o777).toBe(0o555);
     expect((await lstat(snapshot.cliPath)).mode & 0o777).toBe(0o444);
     expect((await lstat(snapshot.signerClientPath)).mode & 0o777).toBe(0o555);
-    expect(await readFile(snapshot.cliPath, "utf8")).toBe("cli bytes");
     expect(f.calls.filter((call) => call.cmd === "/usr/bin/otool")).toHaveLength(2);
     expect(f.calls.find((call) => call.cmd === "/usr/bin/codesign")?.args.join(" ")).toContain(
       "YFQSWQ9BJN",
