@@ -2875,6 +2875,10 @@ export async function runWrap(
     process.exit(2);
   }
 
+  // This automatic preflight probes the signed macOS enforcement app, system
+  // extension consent, and dedicated-account services. It belongs only to the
+  // full Hermes provisioning flow; cooperative installs for other harnesses do
+  // not mutate those surfaces and retain their own path-specific validation.
   const protectInstallFlow =
     options.protectCommand === true &&
     options.hermes === true &&

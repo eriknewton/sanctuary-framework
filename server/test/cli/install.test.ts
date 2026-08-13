@@ -218,9 +218,24 @@ describe("sanctuary install agent contract", () => {
         enforcement: "undetermined",
       }),
     });
+    const unknownExtension = buildAgentInstallPlan({
+      profile: "full",
+      harness: "hermes",
+      fortress: "/tmp/fortress",
+      platform: "darwin",
+      observed: observed({
+        cooperativeWrap: "present",
+        castleWallApp: "present",
+        systemExtension: "unknown",
+        bootService: "present",
+        contentFilter: "enabled",
+        enforcement: "live",
+      }),
+    });
 
     expect(complete.status).toBe("complete");
     expect(notComplete.status).toBe("human_action");
+    expect(unknownExtension.status).toBe("blocked");
   });
 
   it("renders the machine-readable plan without running an action", async () => {

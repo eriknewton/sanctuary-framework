@@ -286,7 +286,7 @@ jobs:
           cp "$DAEMON" "$SMOKE_DIR/daemon.js"
           set +e
           "$SMOKE_DIR/node" "$SMOKE_DIR/daemon.js" castle-wall daemon \
-            --safe-mode --fortress "$SMOKE_DIR/fortress" >"$SMOKE_DIR/output" 2>&1
+            --safe-mode --launchd --fortress "$SMOKE_DIR/fortress" >"$SMOKE_DIR/output" 2>&1
           status=$?
           set -e
           test "$status" -ne 0

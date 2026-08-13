@@ -571,6 +571,7 @@ export function buildAgentInstallPlan(input: {
   }
   const fullMechanicsComplete =
     input.observed.cooperativeWrap === "present" &&
+    input.observed.systemExtension === "[activated enabled]" &&
     input.observed.bootService === "present" &&
     input.observed.contentFilter === "enabled" &&
     input.observed.enforcement === "live";
