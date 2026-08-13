@@ -702,7 +702,6 @@ export async function bootServiceReady(
 interface ParsedBootArgs {
   fortress?: string;
   user?: string;
-  binary?: string;
   signerClient?: string;
   yes: boolean;
   rotate: boolean;
@@ -720,8 +719,10 @@ export function parseBootArgs(argv: string[]): ParsedBootArgs {
     const arg = fortress.argv[i]!;
     if (arg === "--user") parsed.user = fortress.argv[++i];
     else if (arg.startsWith("--user=")) parsed.user = arg.slice("--user=".length);
-    else if (arg === "--binary") parsed.binary = fortress.argv[++i];
-    else if (arg.startsWith("--binary=")) parsed.binary = arg.slice("--binary=".length);
+    else if (arg === "--binary" || arg.startsWith("--binary=")) {
+      parsed.error = "--binary is no longer supported; install-boot uses the verified runtime embedded in Sanctuary-CastleWall.app";
+      break;
+    }
     else if (arg === "--signer-client") parsed.signerClient = fortress.argv[++i];
     else if (arg.startsWith("--signer-client=")) {
       parsed.signerClient = arg.slice("--signer-client=".length);

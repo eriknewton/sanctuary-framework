@@ -96,7 +96,8 @@ enum HeadlessFilterCLI {
         let ok: Bool
         let action: String
         /// Content-filter states plus the system-extension teardown states:
-        /// "deactivated" | "will_complete_after_reboot".
+        /// "enabled" | "disabled" | "needs_user_approval" | "unknown" |
+        /// "deactivated" | "will_complete_after_reboot" | "failed".
         let state: String
         let error: String?
         let build: Build

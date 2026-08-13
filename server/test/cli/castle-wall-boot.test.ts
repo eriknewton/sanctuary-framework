@@ -471,14 +471,12 @@ describe("castle-wall boot service (F1 Option C)", () => {
   });
 
   describe("parseBootArgs", () => {
-    it("parses both flag forms incl. --yes and --rotate", () => {
+    it("parses both flag forms incl. --yes and --rotate, and rejects retired --binary", () => {
       expect(
         parseBootArgs([
           "--fortress",
           "/f",
           "--user=op",
-          "--binary",
-          "/b",
           "--signer-client=/s",
           "--yes",
           "--rotate",
@@ -486,12 +484,14 @@ describe("castle-wall boot service (F1 Option C)", () => {
       ).toEqual({
         fortress: "/f",
         user: "op",
-        binary: "/b",
         signerClient: "/s",
         yes: true,
         rotate: true,
       });
       expect(parseBootArgs(["--fortress=/scratch"]).fortress).toBe("/scratch");
+      expect(parseBootArgs(["--binary", "/legacy/cli"]).error).toMatch(
+        /--binary is no longer supported/,
+      );
     });
 
     it("refuses a missing fortress value", () => {
@@ -675,7 +675,7 @@ describe("castle-wall boot service (F1 Option C)", () => {
         // multi-second window in production; tests must not actually wait.
         sleepFn: async () => {},
       };
-      const argv = ["--fortress", fortress, "--binary", binary, "--signer-client", signerClient];
+      const argv = ["--fortress", fortress, "--signer-client", signerClient];
       return { fortress, plistPath, binary, signerClient, globalPin, bootTokenPath, fake, out, err, ctx, argv };
     }
 

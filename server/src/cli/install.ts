@@ -543,7 +543,8 @@ export function buildAgentInstallPlan(input: {
   }
   if (
     input.observed.castleWallApp === "mismatch" ||
-    input.observed.castleWallBuildSha === null
+    input.observed.castleWallBuildSha === null ||
+    !/^[a-f0-9]{12}$/.test(input.observed.castleWallBuildSha)
   ) {
     plan.notes.push(
       `The Castle Wall app failed signature, Gatekeeper, bundle-identity, build-identity, or headless-contract validation. Replace it with a verified current candidate at ${DEFAULT_CASTLE_WALL_APP}.`,
