@@ -33,10 +33,18 @@ Each invocation observes the machine again and returns one of four states:
 - `complete`: the requested mechanical installation has been observed.
 - `blocked`: the requested profile is unsupported or a trusted artifact is absent.
 
+An `agent_action` is single-shot. Execute its `argv` once. If it exits zero,
+rerun the planner and trust the newly observed machine state. If it exits
+nonzero, do not retry it and do not rerun the planner autonomously: follow the
+action's declared `on_nonzero` human transition instead. After the human action
+completes, rerun the planner. This rule prevents an observed-state loop from
+turning a session-scoped custody refusal into unlimited autonomous retries.
+
 The response is advisory, not a mutable progress file. A caller must execute no
-command other than the returned argument vector, then rerun the planner. This
-makes interruption and handoff safe: a fresh agent resumes from observed state,
-not from a transcript or a claimed prior step.
+command other than the returned argument vector, then follow its exit contract:
+rerun the planner only after exit zero, or transition to `on_nonzero` after a
+failure. This makes interruption and handoff safe: a fresh agent resumes from
+observed state, not from a transcript or a claimed prior step.
 
 ## Secret boundary
 
@@ -48,6 +56,23 @@ is complete, the response gives that path to the operator. The operator moves it
 into a password manager in a private local session and deletes the staging file.
 The installing agent must not read the file, run `export-passphrase`, capture
 secret output, or ask the operator to paste recovery material into chat.
+
+On macOS, true first custody is deliberately a human action. The planner returns
+the exact `protect` argument vector with `--operator-custody`; the operator runs
+it once in a private local desktop Terminal and unlocks the login Keychain if
+macOS asks. The agent must not add that operator-only flag, run the command on
+the operator's behalf, request the login password, or capture command output.
+Passwordless SSH does not prove access to the login Keychain, and an absent-item
+lookup does not prove that a later Keychain write will succeed. Sanctuary
+therefore resolves and persists the passphrase before bootstrapping Hermes or
+writing fortress/recovery state. Any custody failure leaves those unrelated
+surfaces untouched.
+
+Wrapping a second harness is not a new first-custody ceremony. When the fortress
+already has custody material (including a user-supplied encrypted fallback), the
+planner may return the ordinary single-shot agent action. Its `on_nonzero`
+transition still names the exact private-local-Terminal action; a failed agent
+attempt is never retried automatically.
 
 ## Profiles
 

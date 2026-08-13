@@ -584,13 +584,21 @@ jobs:
           PLAN_JSON=$(/usr/bin/env -i HOME="$ARTIFACT_CHECK_DIR/home" PATH=/usr/bin:/bin \
             SANCTUARY_STORAGE_PATH="$ARTIFACT_CHECK_DIR/fortress" \
             "$CANONICAL_APP/Contents/MacOS/sanctuary" install --profile full --harness hermes --json)
-          printf '%s' "$PLAN_JSON" | node -e '
+          printf '%s' "$PLAN_JSON" | EXPECTED_FORTRESS="$ARTIFACT_CHECK_DIR/fortress" node -e '
             const plan = JSON.parse(require("node:fs").readFileSync(0, "utf8"));
             const argv = plan.next_action?.argv ?? [];
-            if (plan.status !== "agent_action") process.exit(1);
-            if (argv[0] !== "/Applications/Sanctuary-CastleWall.app/Contents/MacOS/sanctuary") process.exit(1);
+            const launcher = "/Applications/Sanctuary-CastleWall.app/Contents/MacOS/sanctuary";
+            const expected = [
+              launcher, "--fortress", process.env.EXPECTED_FORTRESS, "protect", "--hermes",
+              "--no-open", "--agent-guided", "--sealed-launcher", launcher,
+              "--operator-custody", "--no-provision-agent-account",
+            ];
+            if (plan.status !== "human_action") process.exit(1);
+            if (plan.next_action?.id !== "prepare_local_keychain_session") process.exit(1);
+            if (plan.next_action?.actor !== "human") process.exit(1);
+            if (JSON.stringify(argv) !== JSON.stringify(expected)) process.exit(1);
             if (argv.some(arg => /(^|\/)(npm|npx|node)$/.test(arg))) process.exit(1);
-            if (!argv.includes("--sealed-launcher")) process.exit(1);
+            if (!plan.next_action?.secret_boundary?.includes("Do not paste")) process.exit(1);
           '
 
           set +e
