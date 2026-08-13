@@ -24,6 +24,8 @@ const magicValues = new Set([
   0xcffaedfe,
   0xcafebabe,
   0xbebafeca,
+  0xcafebabf,
+  0xbfbafeca,
 ]);
 
 function walk(path) {

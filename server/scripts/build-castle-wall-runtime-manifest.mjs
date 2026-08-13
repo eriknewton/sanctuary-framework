@@ -28,6 +28,16 @@ const roots = [
 const files = [];
 const packages = [];
 
+function isInstalledPackageManifest(relativePath) {
+  if (relativePath === "Resources/cli-runtime/package.json") return true;
+  const segments = relativePath.split("/");
+  if (segments.at(-1) !== "package.json") return false;
+  return (
+    segments.at(-3) === "node_modules" ||
+    (segments.at(-4) === "node_modules" && segments.at(-3)?.startsWith("@"))
+  );
+}
+
 function readStableFile(path) {
   const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
   try {
@@ -60,10 +70,7 @@ function walk(path) {
     sha256: createHash("sha256").update(bytes).digest("hex"),
     size: bytes.length,
   });
-  if (
-    relativePath === "Resources/cli-runtime/package.json" ||
-    /^Resources\/cli-runtime\/node_modules\/(?:@[^/]+\/)?[^/]+\/package\.json$/.test(relativePath)
-  ) {
+  if (isInstalledPackageManifest(relativePath)) {
     const parsed = JSON.parse(bytes.toString("utf8"));
     if (typeof parsed.name === "string" && typeof parsed.version === "string") {
       packages.push({ path: relativePath, name: parsed.name, version: parsed.version });
@@ -74,6 +81,10 @@ function walk(path) {
 for (const root of roots) walk(root);
 files.sort((a, b) => a.path.localeCompare(b.path));
 packages.sort((a, b) => a.path.localeCompare(b.path));
+const packageJsonCount = files.filter((entry) => entry.path.endsWith("/package.json")).length;
+const nestedPackageCount = packages.filter(
+  (entry) => entry.path.split("/node_modules/").length > 2,
+).length;
 const machOInventoryPath = process.env.SANCTUARY_MACH_O_INVENTORY_FILE;
 if (!machOInventoryPath) throw new Error("SANCTUARY_MACH_O_INVENTORY_FILE is required");
 const filePaths = new Set(files.map((entry) => entry.path));
@@ -97,6 +108,9 @@ const manifest = {
     file_count: files.length,
     total_bytes: files.reduce((sum, entry) => sum + entry.size, 0),
     package_count: packages.length,
+    package_json_count: packageJsonCount,
+    package_internal_json_count: packageJsonCount - packages.length,
+    nested_package_count: nestedPackageCount,
     packages,
     mach_o_count: machO.length,
     mach_o: machO,

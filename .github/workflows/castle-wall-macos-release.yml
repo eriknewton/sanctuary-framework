@@ -312,11 +312,27 @@ jobs:
           node -e '
             const m = require(process.argv[1]);
             const i = m.inventory;
+            const roots = m.files.filter(f => {
+              const s = f.path.split("/");
+              return f.path === "Resources/cli-runtime/package.json" ||
+                (s.at(-1) === "package.json" && (s.at(-3) === "node_modules" ||
+                  (s.at(-4) === "node_modules" && s.at(-3).startsWith("@"))));
+            });
+            const packageJsonCount = m.files.filter(f => f.path.endsWith("/package.json")).length;
+            const nestedPackageCount = roots.filter(f => f.path.split("/node_modules/").length > 2).length;
             if (i.file_count > 30000 || i.total_bytes > 420 * 1024 * 1024) process.exit(1);
-            if (i.mach_o_count !== Number(process.argv[2]) || i.package_count !== i.packages.length) process.exit(1);
+            if (i.mach_o_count !== Number(process.argv[2]) || i.package_count !== roots.length) process.exit(1);
+            if (i.package_json_count !== packageJsonCount || i.package_internal_json_count !== packageJsonCount - roots.length) process.exit(1);
+            if (i.nested_package_count !== nestedPackageCount) process.exit(1);
             if (!i.mach_o.some(p => p.includes("/@lmdb/") && p.endsWith(".node"))) process.exit(1);
             if (!i.mach_o.some(p => p.includes("/@msgpackr-extract/") && p.endsWith(".node"))) process.exit(1);
-            console.log(JSON.stringify(i));
+            console.log(JSON.stringify({
+              file_count: i.file_count, total_bytes: i.total_bytes,
+              installed_package_roots: i.package_count,
+              nested_installed_package_roots: i.nested_package_count,
+              package_internal_json_excluded: i.package_internal_json_count,
+              mach_o_count: i.mach_o_count,
+            }));
           ' "$MANIFEST" "$MACH_O_COUNT"
 
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist")" = "$EXPECTED_VERSION"

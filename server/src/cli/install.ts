@@ -73,6 +73,9 @@ interface CastleWallRuntimeManifest {
     file_count: number;
     total_bytes: number;
     package_count: number;
+    package_json_count: number;
+    package_internal_json_count: number;
+    nested_package_count: number;
     packages: Array<{ path: string; name: string; version: string }>;
     mach_o_count: number;
     mach_o: string[];
@@ -84,6 +87,16 @@ const CASTLE_WALL_RUNTIME_MAX_FILES = 30_000;
 // Logical bytes (not APFS allocation). The current pruned closure is ~382 MiB
 // logical / ~219 MiB on disk; keep a narrow deterministic regression ceiling.
 const CASTLE_WALL_RUNTIME_MAX_BYTES = 420 * 1024 * 1024;
+
+function isInstalledPackageManifestPath(path: string): boolean {
+  if (path === "Resources/cli-runtime/package.json") return true;
+  const segments = path.split("/");
+  if (segments.at(-1) !== "package.json") return false;
+  return (
+    segments.at(-3) === "node_modules" ||
+    (segments.at(-4) === "node_modules" && (segments.at(-3)?.startsWith("@") ?? false))
+  );
+}
 
 export async function verifyCastleWallRuntimeManifest(
   bytes: Buffer,
@@ -111,6 +124,7 @@ export async function verifyCastleWallRuntimeManifest(
     "Resources/boot-runtime/node",
     "Resources/cli-runtime/dist/cli.js",
   ]);
+  const filePaths = new Set<string>();
   let totalBytes = 0;
   for (const entry of manifest.files) {
     if (
@@ -118,6 +132,8 @@ export async function verifyCastleWallRuntimeManifest(
       !/^[a-f0-9]{64}$/.test(entry.sha256) ||
       !Number.isSafeInteger(entry.size) || entry.size < 0
     ) return false;
+    if (filePaths.has(entry.path)) return false;
+    filePaths.add(entry.path);
     totalBytes += entry.size;
     const target = resolve(contents, entry.path);
     if (!target.startsWith(`${contents}/`)) return false;
@@ -142,6 +158,25 @@ export async function verifyCastleWallRuntimeManifest(
   }
   const inventory = manifest.inventory;
   const nativeSet = new Set(inventory.mach_o);
+  const expectedPackagePaths = new Set(
+    manifest.files.map((entry) => entry.path).filter(isInstalledPackageManifestPath),
+  );
+  const packageJsonCount = manifest.files.filter(
+    (entry) => entry.path.endsWith("/package.json"),
+  ).length;
+  const nestedPackageCount = [...expectedPackagePaths].filter(
+    (path) => path.split("/node_modules/").length > 2,
+  ).length;
+  const packagePaths = new Set<string>();
+  for (const entry of inventory.packages) {
+    if (
+      entry === null || typeof entry !== "object" ||
+      typeof entry.path !== "string" || typeof entry.name !== "string" ||
+      typeof entry.version !== "string" || !expectedPackagePaths.has(entry.path) ||
+      packagePaths.has(entry.path)
+    ) return false;
+    packagePaths.add(entry.path);
+  }
   return (
     required.size === 0 &&
     inventory.file_count === manifest.files.length &&
@@ -149,8 +184,13 @@ export async function verifyCastleWallRuntimeManifest(
     inventory.total_bytes === totalBytes &&
     inventory.total_bytes <= CASTLE_WALL_RUNTIME_MAX_BYTES &&
     inventory.package_count === inventory.packages.length &&
+    packagePaths.size === expectedPackagePaths.size &&
+    inventory.package_json_count === packageJsonCount &&
+    inventory.package_internal_json_count === packageJsonCount - packagePaths.size &&
+    inventory.nested_package_count === nestedPackageCount &&
     inventory.mach_o_count === inventory.mach_o.length &&
-    inventory.mach_o.every((path) => manifest.files.some((entry) => entry.path === path)) &&
+    nativeSet.size === inventory.mach_o.length &&
+    inventory.mach_o.every((path) => filePaths.has(path)) &&
     [...nativeSet].some((path) => path.includes("/@lmdb/") && path.endsWith(".node")) &&
     [...nativeSet].some((path) => path.includes("/@msgpackr-extract/") && path.endsWith(".node"))
   );

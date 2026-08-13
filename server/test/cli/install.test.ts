@@ -71,6 +71,7 @@ describe("sanctuary install agent contract", () => {
         "MacOS/sanctuary",
         "Resources/boot-runtime/node",
         "Resources/cli-runtime/dist/cli.js",
+        "Resources/cli-runtime/package.json",
         "Resources/cli-runtime/node_modules/@lmdb/lmdb-darwin-arm64/node.napi.node",
         "Resources/cli-runtime/node_modules/@msgpackr-extract/msgpackr-extract-darwin-arm64/node.napi.glibc.node",
       ];
@@ -86,7 +87,7 @@ describe("sanctuary install agent contract", () => {
           size: bytes.length,
         };
       }));
-      const bytes = Buffer.from(`${JSON.stringify({
+      const manifest = {
         schema: "sanctuary.castle-wall-cli-runtime.v1",
         source_sha: "a".repeat(40),
         cli_version: packageJson.version,
@@ -94,16 +95,60 @@ describe("sanctuary install agent contract", () => {
         inventory: {
           file_count: files.length,
           total_bytes: files.reduce((sum, entry) => sum + entry.size, 0),
-          package_count: 0,
-          packages: [],
+          package_count: 1,
+          package_json_count: 1,
+          package_internal_json_count: 0,
+          nested_package_count: 0,
+          packages: [{
+            path: "Resources/cli-runtime/package.json",
+            name: "@sanctuary-framework/mcp-server",
+            version: packageJson.version,
+          }],
           mach_o_count: 2,
           mach_o: paths.slice(-2),
         },
         files,
-      })}\n`);
+      };
+      const bytes = Buffer.from(`${JSON.stringify(manifest)}\n`);
       await expect(verifyCastleWallRuntimeManifest(bytes, contents, {
         sourceSha: "a".repeat(40), nodeVersion: "v22.0.0",
       })).resolves.toBe(true);
+      for (const invalid of [
+        {
+          ...manifest,
+          inventory: {
+            ...manifest.inventory,
+            file_count: manifest.inventory.file_count + 1,
+            total_bytes: manifest.inventory.total_bytes + files[0]!.size,
+          },
+          files: [...files, files[0]!],
+        },
+        {
+          ...manifest,
+          inventory: {
+            ...manifest.inventory,
+            mach_o_count: manifest.inventory.mach_o_count + 1,
+            mach_o: [...manifest.inventory.mach_o, manifest.inventory.mach_o[0]!],
+          },
+        },
+        {
+          ...manifest,
+          inventory: {
+            ...manifest.inventory,
+            package_count: 2,
+            packages: [
+              manifest.inventory.packages[0]!,
+              manifest.inventory.packages[0]!,
+            ],
+          },
+        },
+      ]) {
+        await expect(verifyCastleWallRuntimeManifest(
+          Buffer.from(`${JSON.stringify(invalid)}\n`),
+          contents,
+          { sourceSha: "a".repeat(40), nodeVersion: "v22.0.0" },
+        )).resolves.toBe(false);
+      }
       await writeFile(join(contents, "Resources/cli-runtime/dist/cli.js"), "tampered");
       await expect(verifyCastleWallRuntimeManifest(bytes, contents, {
         sourceSha: "a".repeat(40), nodeVersion: "v22.0.0",
