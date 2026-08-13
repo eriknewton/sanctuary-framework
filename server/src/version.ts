@@ -8,6 +8,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join, parse } from "node:path";
+import packageJson from "../package.json" with { type: "json" };
 
 const require = createRequire(import.meta.url);
 
@@ -17,7 +18,10 @@ interface PackageJson {
 }
 
 export function getSanctuaryVersion(): string {
-  return packageVersion(require("../package.json"), "../package.json");
+  // Static JSON import is load-bearing for the sealed Castle Wall daemon:
+  // tsup embeds it, so the content-addressed standalone bundle never reaches
+  // outside its root-custodied runtime for mutable package metadata.
+  return packageVersion(packageJson, "Sanctuary package metadata");
 }
 
 export function getMcpSdkVersion(): string {
