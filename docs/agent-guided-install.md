@@ -10,6 +10,21 @@ The agent drives installation by repeatedly running:
 sanctuary install --profile <memory|full> --harness <name> --json
 ```
 
+On a factory Mac, Node and npm are not preinstalled. After the verified signed
+Castle Wall app is placed at `/Applications/Sanctuary-CastleWall.app`, start the
+full-profile planner from the CLI runtime sealed inside that app:
+
+```bash
+/Applications/Sanctuary-CastleWall.app/Contents/MacOS/sanctuary install --profile full --harness hermes --json
+```
+
+The planner and the Hermes MCP configuration both continue to use that absolute
+signed launcher. It clears Node preload/search overrides before entering the
+app-sealed runtime and does not require a separate Node/npm installation. For
+profiles without a verified signed app, an absent package manager is reported
+as `blocked`; the agent must not invent a download or installer outside the
+returned action contract.
+
 Each invocation observes the machine again and returns one of four states:
 
 - `agent_action`: the response contains one argument vector the agent may run.

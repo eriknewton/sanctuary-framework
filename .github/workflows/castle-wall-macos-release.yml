@@ -50,12 +50,19 @@ jobs:
           cache: npm
           cache-dependency-path: server/package-lock.json
 
-      - name: Build self-contained Castle Wall boot daemon
+      - name: Build self-contained Castle Wall and CLI runtimes
         working-directory: server
+        env:
+          SANCTUARY_SOURCE_SHA: ${{ github.sha }}
         run: |
           npm ci --ignore-scripts
-          npm run build:boot-runtime
+          npm run build
           test -s dist/boot-runtime/castle-wall-boot-daemon.js
+          test -s dist/cli.js
+          test -d dist/templates
+          test -d dist/reference-plugin
+          npm prune --omit=dev --ignore-scripts
+          test -d node_modules/@modelcontextprotocol/sdk
 
       # Preflight: name the missing credential instead of dying inside Keychain.
       #
@@ -238,6 +245,7 @@ jobs:
           SIGNING_IDENTITY: "Developer ID Application: Erik Newton (YFQSWQ9BJN)"
           SANCTUARY_REQUIRE_BOOT_RUNTIME: "1"
           SANCTUARY_BOOT_RUNTIME_DAEMON: ${{ github.workspace }}/server/dist/boot-runtime/castle-wall-boot-daemon.js
+          SANCTUARY_CLI_RUNTIME_DIR: ${{ github.workspace }}/server/dist
         run: |
           # setup-node places `node` on PATH. Resolve the exact executable here;
           # do not depend on an action-internal directory convention.
@@ -254,13 +262,27 @@ jobs:
           RUNTIME="$APP/Contents/Resources/boot-runtime"
           NODE="$RUNTIME/node"
           DAEMON="$RUNTIME/castle-wall-boot-daemon.js"
+          CLI_RUNTIME="$APP/Contents/Resources/cli-runtime"
+          CLI="$CLI_RUNTIME/dist/cli.js"
+          LAUNCHER="$APP/Contents/MacOS/sanctuary"
+          MANIFEST="$APP/Contents/Resources/cli-runtime-manifest.json"
           SIGNER="$APP/Contents/MacOS/castle-wall-signer-client"
+          EXPECTED_VERSION=$(node -p "require('../server/package.json').version")
 
           test -x "$NODE"
           test -s "$DAEMON"
           test -x "$SIGNER"
+          test -s "$CLI"
+          test -s "$CLI_RUNTIME/package.json"
+          test -x "$LAUNCHER"
+          test -s "$MANIFEST"
+          test -d "$CLI_RUNTIME/node_modules/@modelcontextprotocol/sdk"
+          test -d "$CLI_RUNTIME/templates"
+          test -d "$CLI_RUNTIME/reference-plugin"
           test "$(stat -f '%Lp' "$NODE")" = 555
           test "$(stat -f '%Lp' "$DAEMON")" = 444
+          test "$(stat -f '%Lp' "$CLI")" = 444
+          test -z "$(find "$CLI_RUNTIME" -type l -print -quit)"
 
           codesign --verify --strict \
             --requirement='anchor apple generic and certificate leaf[subject.OU] = "YFQSWQ9BJN" and identifier "ai.sanctuaryprotocol.macos.castle-wall.node"' \
@@ -272,6 +294,22 @@ jobs:
           codesign --verify --strict \
             --requirement='anchor apple generic and certificate leaf[subject.OU] = "YFQSWQ9BJN" and identifier "ai.sanctuaryprotocol.macos.castle-wall.signer-client"' \
             "$SIGNER"
+          codesign --verify --strict \
+            --requirement='anchor apple generic and certificate leaf[subject.OU] = "YFQSWQ9BJN" and identifier "ai.sanctuaryprotocol.macos.castle-wall.sanctuary-launcher"' \
+            "$LAUNCHER"
+          while IFS= read -r -d '' addon; do
+            if file "$addon" | grep -q 'Mach-O'; then
+              codesign --verify --strict \
+                --requirement='anchor apple generic and certificate leaf[subject.OU] = "YFQSWQ9BJN"' \
+                "$addon"
+            fi
+          done < <(find "$CLI_RUNTIME/node_modules" -type f -name '*.node' -print0)
+
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist")" = "$EXPECTED_VERSION"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :SanctuaryCliRuntimeVersion' "$APP/Contents/Info.plist")" = "$EXPECTED_VERSION"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :SanctuaryCastleWallSourceSHA' "$APP/Contents/Info.plist")" = "$GITHUB_SHA"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :SanctuaryCliRuntimeNodeVersion' "$APP/Contents/Info.plist")" = "$("$NODE" --version)"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :SanctuaryCliRuntimeManifestSHA256' "$APP/Contents/Info.plist")" = "$(shasum -a 256 "$MANIFEST" | awk '{print $1}')"
 
           for executable in "$NODE" "$SIGNER"; do
             unsafe=$(otool -L "$executable" | awk 'NR > 1 { print $1 }' \
@@ -303,6 +341,9 @@ jobs:
             cat "$SMOKE_DIR/output"
             exit 1
           fi
+          /usr/bin/env -i PATH=/usr/bin:/bin NODE_OPTIONS='--require=/definitely/missing' NODE_PATH=/definitely/missing \
+            "$LAUNCHER" --version \
+            | grep -Fx "@sanctuary-framework/mcp-server $EXPECTED_VERSION"
 
       # Fail-closed launchability assertions, BEFORE notarization spends time
       # and an Apple round-trip on a bundle that cannot launch.
@@ -387,6 +428,10 @@ jobs:
           ditto -x -k build/Sanctuary-CastleWall.app.zip "$ARTIFACT_CHECK_DIR"
           ARTIFACT_APP="$ARTIFACT_CHECK_DIR/Sanctuary-CastleWall.app"
           ARTIFACT_RUNTIME="$ARTIFACT_APP/Contents/Resources/boot-runtime"
+          ARTIFACT_CLI_RUNTIME="$ARTIFACT_APP/Contents/Resources/cli-runtime"
+          ARTIFACT_LAUNCHER="$ARTIFACT_APP/Contents/MacOS/sanctuary"
+          ARTIFACT_MANIFEST="$ARTIFACT_APP/Contents/Resources/cli-runtime-manifest.json"
+          EXPECTED_VERSION=$(node -p "require('../server/package.json').version")
           codesign --verify --deep --strict "$ARTIFACT_APP"
           codesign --verify --strict \
             --requirement='anchor apple generic and certificate leaf[subject.OU] = "YFQSWQ9BJN" and identifier "ai.sanctuaryprotocol.macos.castle-wall.node"' \
@@ -396,8 +441,34 @@ jobs:
             > "$ARTIFACT_NODE_ENTITLEMENTS" 2>/dev/null
           test "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.security.cs.allow-jit' "$ARTIFACT_NODE_ENTITLEMENTS")" = true
           test "$(plutil -p "$ARTIFACT_NODE_ENTITLEMENTS" | grep -c ' => ')" = 1
+          test -s "$ARTIFACT_CLI_RUNTIME/dist/cli.js"
+          test -s "$ARTIFACT_CLI_RUNTIME/package.json"
+          test -d "$ARTIFACT_CLI_RUNTIME/templates"
+          test -d "$ARTIFACT_CLI_RUNTIME/reference-plugin"
+          test -d "$ARTIFACT_CLI_RUNTIME/node_modules/@modelcontextprotocol/sdk"
+          test -x "$ARTIFACT_LAUNCHER"
+          test -s "$ARTIFACT_MANIFEST"
+          test -z "$(find "$ARTIFACT_CLI_RUNTIME" -type l -print -quit)"
           xcrun stapler validate "$ARTIFACT_APP"
           spctl --assess --type execute --verbose=4 "$ARTIFACT_APP"
+
+          codesign --verify --strict \
+            --requirement='anchor apple generic and certificate leaf[subject.OU] = "YFQSWQ9BJN" and identifier "ai.sanctuaryprotocol.macos.castle-wall.sanctuary-launcher"' \
+            "$ARTIFACT_LAUNCHER"
+          while IFS= read -r -d '' addon; do
+            if file "$addon" | grep -q 'Mach-O'; then
+              codesign --verify --strict \
+                --requirement='anchor apple generic and certificate leaf[subject.OU] = "YFQSWQ9BJN"' \
+                "$addon"
+            fi
+          done < <(find "$ARTIFACT_CLI_RUNTIME/node_modules" -type f -name '*.node' -print0)
+          test "$(/usr/libexec/PlistBuddy -c 'Print :SanctuaryCliRuntimeManifestSHA256' "$ARTIFACT_APP/Contents/Info.plist")" = "$(shasum -a 256 "$ARTIFACT_MANIFEST" | awk '{print $1}')"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$ARTIFACT_APP/Contents/Info.plist")" = "$EXPECTED_VERSION"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :SanctuaryCastleWallSourceSHA' "$ARTIFACT_APP/Contents/Info.plist")" = "$GITHUB_SHA"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :SanctuaryCliRuntimeNodeVersion' "$ARTIFACT_APP/Contents/Info.plist")" = "$("$ARTIFACT_RUNTIME/node" --version)"
+          /usr/bin/env -i PATH=/usr/bin:/bin NODE_OPTIONS='--require=/definitely/missing' NODE_PATH=/definitely/missing \
+            "$ARTIFACT_LAUNCHER" --version \
+            | grep -Fx "@sanctuary-framework/mcp-server $EXPECTED_VERSION"
 
           set +e
           "$ARTIFACT_RUNTIME/node" "$ARTIFACT_RUNTIME/castle-wall-boot-daemon.js" \

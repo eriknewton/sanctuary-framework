@@ -52,6 +52,8 @@ BUILD_DIR="${BUILD_DIR:-${PKG_DIR}/build/CastleWallExtension.app}"
 SWIFT_BUILD_CONFIG="${SWIFT_BUILD_CONFIG:-release}"
 SIGNING_IDENTITY="${SIGNING_IDENTITY:-Developer ID Application: Erik Newton (YFQSWQ9BJN)}"
 CASTLE_WALL_GIT_SHA="${CASTLE_WALL_GIT_SHA:-$(git -C "${REPO_DIR}" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)}"
+CASTLE_WALL_SOURCE_SHA="${CASTLE_WALL_SOURCE_SHA:-$(git -C "${REPO_DIR}" rev-parse HEAD 2>/dev/null || echo unknown)}"
+SANCTUARY_PACKAGE_VERSION="${SANCTUARY_PACKAGE_VERSION:-$(node -p "require('${REPO_DIR}/server/package.json').version")}"
 # CFBundleVersion MUST increase whenever the extension code changes, or macOS
 # treats a rebuilt sysext as the same version and KEEPS the already-activated
 # (stale) extension binary — silently shipping the old enforcement code. The
@@ -103,6 +105,9 @@ SIGNER_CLIENT_DST="${WRAPPED_APP_DIR}/Contents/MacOS/castle-wall-signer-client"
 SIGNER_HELPER_ENTITLEMENTS="${PKG_DIR}/Sources/CastleWallSignerHelper/CastleWallSignerHelper.entitlements"
 SIGNER_CLIENT_ENTITLEMENTS="${PKG_DIR}/Sources/CastleWallSignerClient/CastleWallSignerClient.entitlements"
 BOOT_RUNTIME_NODE_ENTITLEMENTS="${PKG_DIR}/signing/node-boot-runtime.entitlements"
+SANCTUARY_LAUNCHER_ID="ai.sanctuaryprotocol.macos.castle-wall.sanctuary-launcher"
+SANCTUARY_LAUNCHER_DST="${WRAPPED_APP_DIR}/Contents/MacOS/sanctuary"
+CLI_RUNTIME_MANIFEST="${WRAPPED_APP_DIR}/Contents/Resources/cli-runtime-manifest.json"
 # Notarization: set NOTARYTOOL_PROFILE (a `notarytool store-credentials` keychain
 # profile) to notarize + staple automatically. Apps that bundle a LaunchDaemon
 # MUST be notarized or SMAppService stays stuck at .requiresApproval/.notFound.
@@ -401,6 +406,39 @@ if [ "${WRAPPED}" = true ]; then
         exit 1
     fi
 
+    if [ ! -x "${SANCTUARY_LAUNCHER_DST}" ]; then
+        echo "[build-signed] ERROR: required signed-app Sanctuary launcher is absent" >&2
+        exit 1
+    fi
+    echo "[build-signed]     signing sealed Sanctuary launcher (${SANCTUARY_LAUNCHER_ID})"
+    codesign \
+        --force \
+        --options runtime \
+        --timestamp \
+        --identifier "${SANCTUARY_LAUNCHER_ID}" \
+        --sign "${SIGNING_IDENTITY}" \
+        "${SANCTUARY_LAUNCHER_DST}"
+
+    echo "[build-signed]     signing native CLI runtime addons"
+    while IFS= read -r -d '' addon; do
+        if file "${addon}" | grep -q "Mach-O"; then
+            codesign --force --options runtime --timestamp --sign "${SIGNING_IDENTITY}" "${addon}"
+        fi
+    done < <(find "${WRAPPED_APP_DIR}/Contents/Resources/cli-runtime/node_modules" -type f -name '*.node' -print0)
+
+    chmod -R a-w "${WRAPPED_APP_DIR}/Contents/Resources/cli-runtime"
+    find "${WRAPPED_APP_DIR}/Contents/Resources/cli-runtime" -type d -exec chmod 0555 {} +
+    find "${WRAPPED_APP_DIR}/Contents/Resources/cli-runtime" -type f -exec chmod 0444 {} +
+
+    node "${REPO_DIR}/server/scripts/build-castle-wall-runtime-manifest.mjs" \
+        "${WRAPPED_APP_DIR}" "${CASTLE_WALL_SOURCE_SHA}" "${SANCTUARY_PACKAGE_VERSION}"
+    CLI_RUNTIME_NODE_VERSION="$("${BOOT_RUNTIME_NODE}" --version)"
+    CLI_RUNTIME_MANIFEST_SHA256="$(shasum -a 256 "${CLI_RUNTIME_MANIFEST}" | awk '{print $1}')"
+    /usr/libexec/PlistBuddy -c "Set :SanctuaryCliRuntimeNodeVersion ${CLI_RUNTIME_NODE_VERSION}" "${WRAPPED_APP_DIR}/Contents/Info.plist" >/dev/null 2>&1 || \
+        /usr/libexec/PlistBuddy -c "Add :SanctuaryCliRuntimeNodeVersion string ${CLI_RUNTIME_NODE_VERSION}" "${WRAPPED_APP_DIR}/Contents/Info.plist" >/dev/null
+    /usr/libexec/PlistBuddy -c "Set :SanctuaryCliRuntimeManifestSHA256 ${CLI_RUNTIME_MANIFEST_SHA256}" "${WRAPPED_APP_DIR}/Contents/Info.plist" >/dev/null 2>&1 || \
+        /usr/libexec/PlistBuddy -c "Add :SanctuaryCliRuntimeManifestSHA256 string ${CLI_RUNTIME_MANIFEST_SHA256}" "${WRAPPED_APP_DIR}/Contents/Info.plist" >/dev/null
+
     echo "[build-signed]     signing outer .app with Developer ID + host entitlements"
     codesign \
         --force \
@@ -412,6 +450,16 @@ if [ "${WRAPPED}" = true ]; then
 
     echo "[build-signed]     verifying wrapped .app signature"
     codesign --verify --deep --strict "${WRAPPED_APP_DIR}"
+    codesign --verify --strict \
+        --requirement="anchor apple generic and certificate leaf[subject.OU] = \"YFQSWQ9BJN\" and identifier \"${SANCTUARY_LAUNCHER_ID}\"" \
+        "${SANCTUARY_LAUNCHER_DST}"
+    while IFS= read -r -d '' addon; do
+        if file "${addon}" | grep -q "Mach-O"; then
+            codesign --verify --strict \
+                --requirement='anchor apple generic and certificate leaf[subject.OU] = "YFQSWQ9BJN"' \
+                "${addon}"
+        fi
+    done < <(find "${WRAPPED_APP_DIR}/Contents/Resources/cli-runtime/node_modules" -type f -name '*.node' -print0)
 
     # Fail-closed launchability assertions (profile presence at both
     # placements, entitlement coverage, seal integrity). The release workflow
