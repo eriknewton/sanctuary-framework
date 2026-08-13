@@ -154,7 +154,7 @@ async function resumeAuthenticatedAgentRecoveryFile(input: {
     input.fortressId,
     recoveryKey,
   );
-  let receiptMatches = false;
+  let receiptMatches: boolean;
   try {
     receiptMatches = constantTimeEqual(fromBase64url(receipt), fromBase64url(expected));
   } catch {
