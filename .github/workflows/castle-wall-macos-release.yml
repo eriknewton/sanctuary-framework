@@ -473,7 +473,47 @@ jobs:
           ARTIFACT_CHECK_DIR=$(mktemp -d "$RUNNER_TEMP/castle-wall-artifact.XXXXXX")
           CANONICAL_APP="/Applications/Sanctuary-CastleWall.app"
           CANONICAL_APP_INSTALLED=false
-          trap 'rm -rf "$ARTIFACT_CHECK_DIR"; if [ "$CANONICAL_APP_INSTALLED" = true ]; then rm -rf "$CANONICAL_APP"; fi' EXIT
+          cleanup_artifact_validation() {
+            validation_status=$?
+            trap - EXIT
+            set +e
+            cleanup_failed=false
+
+            if [ -e "$ARTIFACT_CHECK_DIR" ]; then
+              chmod -R u+rwX "$ARTIFACT_CHECK_DIR" 2>/dev/null
+              if [ "$?" -ne 0 ]; then
+                echo "::error::could not restore owner permissions on artifact validation directory"
+                cleanup_failed=true
+              fi
+              rm -rf "$ARTIFACT_CHECK_DIR"
+              if [ "$?" -ne 0 ]; then
+                echo "::error::could not remove artifact validation directory: $ARTIFACT_CHECK_DIR"
+                cleanup_failed=true
+              fi
+            fi
+
+            if [ "$CANONICAL_APP_INSTALLED" = true ] && [ -e "$CANONICAL_APP" ]; then
+              chmod -R u+rwX "$CANONICAL_APP" 2>/dev/null
+              if [ "$?" -ne 0 ]; then
+                echo "::error::could not restore owner permissions on job-installed canonical app"
+                cleanup_failed=true
+              fi
+              rm -rf "$CANONICAL_APP"
+              if [ "$?" -ne 0 ]; then
+                echo "::error::could not remove job-installed canonical app: $CANONICAL_APP"
+                cleanup_failed=true
+              fi
+            fi
+
+            if [ "$cleanup_failed" = true ]; then
+              echo "::error::release validation cleanup was incomplete; validation exit status was $validation_status"
+              if [ "$validation_status" -eq 0 ]; then
+                exit 1
+              fi
+            fi
+            exit "$validation_status"
+          }
+          trap cleanup_artifact_validation EXIT
           ditto -x -k build/Sanctuary-CastleWall.app.zip "$ARTIFACT_CHECK_DIR"
           ARTIFACT_APP="$ARTIFACT_CHECK_DIR/Sanctuary-CastleWall.app"
           ARTIFACT_RUNTIME="$ARTIFACT_APP/Contents/Resources/boot-runtime"
@@ -536,6 +576,8 @@ jobs:
             | grep -Fx "@sanctuary-framework/mcp-server $EXPECTED_VERSION"
 
           test ! -e "$CANONICAL_APP"
+          # From this point onward any complete or partial destination tree was
+          # created by this job and is therefore safe for the EXIT trap to remove.
           CANONICAL_APP_INSTALLED=true
           ditto "$ARTIFACT_APP" "$CANONICAL_APP"
           mkdir -p "$ARTIFACT_CHECK_DIR/home" "$ARTIFACT_CHECK_DIR/fortress"

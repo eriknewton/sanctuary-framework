@@ -1,8 +1,9 @@
 // fail-before-exempt: validates Castle Wall release scanner/manifest tooling outside server/src; install and wrap changed tests separately fail against reverted server/src.
 
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import {
   chmodSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -45,11 +46,147 @@ function nativeLoadAssertions(): string[] {
   )].map((match) => match[1]);
 }
 
+function artifactValidationCleanup(): string {
+  const workflow = readFileSync(releaseWorkflow, "utf8");
+  const match = workflow.match(
+    /          (cleanup_artifact_validation\(\) \{[\s\S]*?^          \})\n          trap cleanup_artifact_validation EXIT/m,
+  );
+  if (!match) throw new Error("artifact-validation cleanup function not found");
+  return match[1].replace(/^          /gm, "");
+}
+
+function notarizeAndStapleStep(): string {
+  const workflow = readFileSync(releaseWorkflow, "utf8");
+  const stepStart = workflow.indexOf("- name: Notarize and staple");
+  const stepEnd = workflow.indexOf("\n      - name:", stepStart + 1);
+  if (stepStart < 0 || stepEnd < 0) throw new Error("notarize-and-staple step not found");
+  return workflow.slice(stepStart, stepEnd);
+}
+
+function runArtifactValidationCleanup(options: {
+  artifactCheckDir: string;
+  canonicalApp: string;
+  canonicalInstalled: boolean;
+  validationStatus: number;
+  failCleanup?: boolean;
+}) {
+  const failCleanup = options.failCleanup
+    ? "rm() { return 73; }; chmod() { return 74; };"
+    : "";
+  return spawnSync("/bin/bash", ["-c", [
+    "set -euo pipefail",
+    artifactValidationCleanup(),
+    `ARTIFACT_CHECK_DIR=${JSON.stringify(options.artifactCheckDir)}`,
+    `CANONICAL_APP=${JSON.stringify(options.canonicalApp)}`,
+    `CANONICAL_APP_INSTALLED=${options.canonicalInstalled ? "true" : "false"}`,
+    failCleanup,
+    "trap cleanup_artifact_validation EXIT",
+    `exit ${options.validationStatus}`,
+  ].join("\n")], { encoding: "utf8" });
+}
+
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
 describe("Castle Wall CLI-runtime Mach-O scanner", () => {
+  it("cleans read-only extracted and job-installed app trees without changing success", () => {
+    const root = mkdtempSync(join(tmpdir(), "sanctuary-release-cleanup-readonly-"));
+    roots.push(root);
+    const artifactCheckDir = join(root, "artifact-check");
+    const canonicalApp = join(root, "canonical.app");
+    for (const target of [artifactCheckDir, canonicalApp]) {
+      mkdirSync(join(target, "sealed"), { recursive: true });
+      writeFileSync(join(target, "sealed", "runtime"), "sealed");
+      chmodSync(join(target, "sealed", "runtime"), 0o444);
+      chmodSync(join(target, "sealed"), 0o555);
+    }
+
+    const result = runArtifactValidationCleanup({
+      artifactCheckDir,
+      canonicalApp,
+      canonicalInstalled: true,
+      validationStatus: 0,
+    });
+    expect(result.status).toBe(0);
+    expect(existsSync(artifactCheckDir)).toBe(false);
+    expect(existsSync(canonicalApp)).toBe(false);
+  });
+
+  it("preserves a validation failure after successful cleanup", () => {
+    const root = mkdtempSync(join(tmpdir(), "sanctuary-release-cleanup-status-"));
+    roots.push(root);
+    const artifactCheckDir = join(root, "artifact-check");
+    const canonicalApp = join(root, "canonical.app");
+    mkdirSync(artifactCheckDir);
+    mkdirSync(canonicalApp);
+
+    const result = runArtifactValidationCleanup({
+      artifactCheckDir,
+      canonicalApp,
+      canonicalInstalled: true,
+      validationStatus: 37,
+    });
+    expect(result.status).toBe(37);
+    expect(existsSync(artifactCheckDir)).toBe(false);
+    expect(existsSync(canonicalApp)).toBe(false);
+  });
+
+  it("reports cleanup failures, fails cleanup-only errors, and preserves validation failures", () => {
+    const root = mkdtempSync(join(tmpdir(), "sanctuary-release-cleanup-failure-"));
+    roots.push(root);
+    for (const validationStatus of [0, 41]) {
+      const artifactCheckDir = join(root, `artifact-check-${validationStatus}`);
+      mkdirSync(artifactCheckDir);
+      const result = runArtifactValidationCleanup({
+        artifactCheckDir,
+        canonicalApp: join(root, `canonical-${validationStatus}.app`),
+        canonicalInstalled: false,
+        validationStatus,
+        failCleanup: true,
+      });
+      expect(result.status).toBe(validationStatus === 0 ? 1 : validationStatus);
+      expect(result.stdout).toContain("::error::could not restore owner permissions");
+      expect(result.stdout).toContain("::error::could not remove artifact validation directory");
+      expect(result.stdout).toContain(`validation exit status was ${validationStatus}`);
+    }
+  });
+
+  it("never removes a pre-existing canonical app not installed by the job", () => {
+    const step = notarizeAndStapleStep();
+    const ownershipSequence = [
+      "CANONICAL_APP_INSTALLED=false",
+      "trap cleanup_artifact_validation EXIT",
+      'test ! -e "$CANONICAL_APP"',
+      "CANONICAL_APP_INSTALLED=true",
+      'ditto "$ARTIFACT_APP" "$CANONICAL_APP"',
+    ];
+    let previousIndex = -1;
+    for (const marker of ownershipSequence) {
+      expect(step.match(new RegExp(marker.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g"))).toHaveLength(1);
+      const markerIndex = step.indexOf(marker);
+      expect(markerIndex).toBeGreaterThan(previousIndex);
+      previousIndex = markerIndex;
+    }
+
+    const root = mkdtempSync(join(tmpdir(), "sanctuary-release-cleanup-preexisting-"));
+    roots.push(root);
+    const artifactCheckDir = join(root, "artifact-check");
+    const canonicalApp = join(root, "pre-existing.app");
+    mkdirSync(artifactCheckDir);
+    mkdirSync(canonicalApp);
+    writeFileSync(join(canonicalApp, "owner-data"), "preserve");
+
+    const result = runArtifactValidationCleanup({
+      artifactCheckDir,
+      canonicalApp,
+      canonicalInstalled: false,
+      validationStatus: 0,
+    });
+    expect(result.status).toBe(0);
+    expect(readFileSync(join(canonicalApp, "owner-data"), "utf8")).toBe("preserve");
+  });
+
   it("accounts for every inline workflow consumer of a path argument", () => {
     const workflow = readFileSync(releaseWorkflow, "utf8");
     expect(workflow.match(/process\.argv\[1\]/g)).toHaveLength(3);
