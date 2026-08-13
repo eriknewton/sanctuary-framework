@@ -108,6 +108,7 @@ BOOT_RUNTIME_NODE_ENTITLEMENTS="${PKG_DIR}/signing/node-boot-runtime.entitlement
 SANCTUARY_LAUNCHER_ID="ai.sanctuaryprotocol.macos.castle-wall.sanctuary-launcher"
 SANCTUARY_LAUNCHER_DST="${WRAPPED_APP_DIR}/Contents/MacOS/sanctuary"
 CLI_RUNTIME_MANIFEST="${WRAPPED_APP_DIR}/Contents/Resources/cli-runtime-manifest.json"
+CLI_RUNTIME_MACH_O_SCANNER="${PKG_DIR}/scripts/list-cli-runtime-mach-o.mjs"
 # Notarization: set NOTARYTOOL_PROFILE (a `notarytool store-credentials` keychain
 # profile) to notarize + staple automatically. Apps that bundle a LaunchDaemon
 # MUST be notarized or SMAppService stays stuck at .requiresApproval/.notFound.
@@ -419,19 +420,36 @@ if [ "${WRAPPED}" = true ]; then
         --sign "${SIGNING_IDENTITY}" \
         "${SANCTUARY_LAUNCHER_DST}"
 
-    echo "[build-signed]     signing native CLI runtime addons"
+    echo "[build-signed]     signing every CLI-runtime Mach-O"
+    MACH_O_INVENTORY_FILE="$(mktemp "${TMPDIR:-/tmp}/sanctuary-cli-mach-o.XXXXXX")"
+    CLI_RUNTIME_MACH_O_COUNT=0
     while IFS= read -r -d '' addon; do
-        if file "${addon}" | grep -q "Mach-O"; then
-            codesign --force --options runtime --timestamp --sign "${SIGNING_IDENTITY}" "${addon}"
-        fi
-    done < <(find "${WRAPPED_APP_DIR}/Contents/Resources/cli-runtime/node_modules" -type f -name '*.node' -print0)
+        codesign --force --options runtime --timestamp --sign "${SIGNING_IDENTITY}" "${addon}"
+        printf '%s\n' "${addon#${WRAPPED_APP_DIR}/Contents/}" >> "${MACH_O_INVENTORY_FILE}"
+        CLI_RUNTIME_MACH_O_COUNT=$((CLI_RUNTIME_MACH_O_COUNT + 1))
+    done < <(node "${CLI_RUNTIME_MACH_O_SCANNER}" "${WRAPPED_APP_DIR}/Contents/Resources/cli-runtime")
+    if [ "${CLI_RUNTIME_MACH_O_COUNT}" -lt 2 ]; then
+        echo "[build-signed] ERROR: expected at least two native Mach-O runtime files" >&2
+        exit 1
+    fi
+    LC_ALL=C sort -o "${MACH_O_INVENTORY_FILE}" "${MACH_O_INVENTORY_FILE}"
 
     chmod -R a-w "${WRAPPED_APP_DIR}/Contents/Resources/cli-runtime"
     find "${WRAPPED_APP_DIR}/Contents/Resources/cli-runtime" -type d -exec chmod 0555 {} +
     find "${WRAPPED_APP_DIR}/Contents/Resources/cli-runtime" -type f -exec chmod 0444 {} +
 
-    node "${REPO_DIR}/server/scripts/build-castle-wall-runtime-manifest.mjs" \
+    SANCTUARY_MACH_O_INVENTORY_FILE="${MACH_O_INVENTORY_FILE}" \
+      node "${REPO_DIR}/server/scripts/build-castle-wall-runtime-manifest.mjs" \
         "${WRAPPED_APP_DIR}" "${CASTLE_WALL_SOURCE_SHA}" "${SANCTUARY_PACKAGE_VERSION}"
+    node -e '
+      const m = require(process.argv[1]);
+      if (m.inventory.file_count > 30000 || m.inventory.total_bytes > 420 * 1024 * 1024) process.exit(1);
+      if (m.inventory.mach_o_count < 2 || m.inventory.package_count < 1) process.exit(1);
+    ' "${CLI_RUNTIME_MANIFEST}" || {
+        echo "[build-signed] ERROR: CLI runtime inventory exceeds its budget or is incomplete" >&2
+        exit 1
+    }
+    rm -f "${MACH_O_INVENTORY_FILE}"
     CLI_RUNTIME_NODE_VERSION="$("${BOOT_RUNTIME_NODE}" --version)"
     CLI_RUNTIME_MANIFEST_SHA256="$(shasum -a 256 "${CLI_RUNTIME_MANIFEST}" | awk '{print $1}')"
     /usr/libexec/PlistBuddy -c "Set :SanctuaryCliRuntimeNodeVersion ${CLI_RUNTIME_NODE_VERSION}" "${WRAPPED_APP_DIR}/Contents/Info.plist" >/dev/null 2>&1 || \
@@ -453,13 +471,17 @@ if [ "${WRAPPED}" = true ]; then
     codesign --verify --strict \
         --requirement="anchor apple generic and certificate leaf[subject.OU] = \"YFQSWQ9BJN\" and identifier \"${SANCTUARY_LAUNCHER_ID}\"" \
         "${SANCTUARY_LAUNCHER_DST}"
+    VERIFIED_CLI_RUNTIME_MACH_O_COUNT=0
     while IFS= read -r -d '' addon; do
-        if file "${addon}" | grep -q "Mach-O"; then
-            codesign --verify --strict \
-                --requirement='anchor apple generic and certificate leaf[subject.OU] = "YFQSWQ9BJN"' \
-                "${addon}"
-        fi
-    done < <(find "${WRAPPED_APP_DIR}/Contents/Resources/cli-runtime/node_modules" -type f -name '*.node' -print0)
+        codesign --verify --strict \
+            --requirement='anchor apple generic and certificate leaf[subject.OU] = "YFQSWQ9BJN"' \
+            "${addon}"
+        VERIFIED_CLI_RUNTIME_MACH_O_COUNT=$((VERIFIED_CLI_RUNTIME_MACH_O_COUNT + 1))
+    done < <(node "${CLI_RUNTIME_MACH_O_SCANNER}" "${WRAPPED_APP_DIR}/Contents/Resources/cli-runtime")
+    [ "${VERIFIED_CLI_RUNTIME_MACH_O_COUNT}" -eq "${CLI_RUNTIME_MACH_O_COUNT}" ] || {
+        echo "[build-signed] ERROR: CLI runtime Mach-O inventory changed after signing" >&2
+        exit 1
+    }
 
     # Fail-closed launchability assertions (profile presence at both
     # placements, entitlement coverage, seal integrity). The release workflow

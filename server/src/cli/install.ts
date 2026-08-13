@@ -1,6 +1,7 @@
 import { execFile as nodeExecFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { lstat, readFile, realpath } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
+import { lstat, open, readFile, realpath } from "node:fs/promises";
 import { Writable } from "node:stream";
 import { promisify } from "node:util";
 import { join, resolve } from "node:path";
@@ -68,8 +69,21 @@ interface CastleWallRuntimeManifest {
   source_sha: string;
   cli_version: string;
   node_version: string;
+  inventory: {
+    file_count: number;
+    total_bytes: number;
+    package_count: number;
+    packages: Array<{ path: string; name: string; version: string }>;
+    mach_o_count: number;
+    mach_o: string[];
+  };
   files: Array<{ path: string; sha256: string; size: number }>;
 }
+
+const CASTLE_WALL_RUNTIME_MAX_FILES = 30_000;
+// Logical bytes (not APFS allocation). The current pruned closure is ~382 MiB
+// logical / ~219 MiB on disk; keep a narrow deterministic regression ceiling.
+const CASTLE_WALL_RUNTIME_MAX_BYTES = 420 * 1024 * 1024;
 
 export async function verifyCastleWallRuntimeManifest(
   bytes: Buffer,
@@ -87,28 +101,59 @@ export async function verifyCastleWallRuntimeManifest(
     manifest.source_sha !== expected.sourceSha ||
     manifest.cli_version !== INSTALLER_VERSION ||
     manifest.node_version !== expected.nodeVersion ||
-    !Array.isArray(manifest.files)
+    !Array.isArray(manifest.files) ||
+    manifest.inventory === null || typeof manifest.inventory !== "object" ||
+    !Array.isArray(manifest.inventory.packages) ||
+    !Array.isArray(manifest.inventory.mach_o)
   ) return false;
   const required = new Set([
     "MacOS/sanctuary",
     "Resources/boot-runtime/node",
     "Resources/cli-runtime/dist/cli.js",
   ]);
+  let totalBytes = 0;
   for (const entry of manifest.files) {
     if (
       typeof entry.path !== "string" ||
       !/^[a-f0-9]{64}$/.test(entry.sha256) ||
       !Number.isSafeInteger(entry.size) || entry.size < 0
     ) return false;
+    totalBytes += entry.size;
     const target = resolve(contents, entry.path);
     if (!target.startsWith(`${contents}/`)) return false;
-    const stat = await lstat(target);
-    if (stat.isSymbolicLink() || !stat.isFile() || stat.size !== entry.size) return false;
-    const digest = createHash("sha256").update(await readFile(target)).digest("hex");
-    if (digest !== entry.sha256) return false;
+    let handle;
+    try {
+      handle = await open(target, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+      const before = await handle.stat({ bigint: true });
+      if (!before.isFile() || before.size !== BigInt(entry.size)) return false;
+      const digest = createHash("sha256").update(await handle.readFile()).digest("hex");
+      const after = await handle.stat({ bigint: true });
+      if (
+        before.dev !== after.dev || before.ino !== after.ino ||
+        before.size !== after.size || before.mtimeNs !== after.mtimeNs ||
+        before.ctimeNs !== after.ctimeNs || digest !== entry.sha256
+      ) return false;
+    } catch {
+      return false;
+    } finally {
+      await handle?.close();
+    }
     required.delete(entry.path);
   }
-  return required.size === 0;
+  const inventory = manifest.inventory;
+  const nativeSet = new Set(inventory.mach_o);
+  return (
+    required.size === 0 &&
+    inventory.file_count === manifest.files.length &&
+    inventory.file_count <= CASTLE_WALL_RUNTIME_MAX_FILES &&
+    inventory.total_bytes === totalBytes &&
+    inventory.total_bytes <= CASTLE_WALL_RUNTIME_MAX_BYTES &&
+    inventory.package_count === inventory.packages.length &&
+    inventory.mach_o_count === inventory.mach_o.length &&
+    inventory.mach_o.every((path) => manifest.files.some((entry) => entry.path === path)) &&
+    [...nativeSet].some((path) => path.includes("/@lmdb/") && path.endsWith(".node")) &&
+    [...nativeSet].some((path) => path.includes("/@msgpackr-extract/") && path.endsWith(".node"))
+  );
 }
 
 function hasExactCodesignField(text: string, field: string, value: string): boolean {
@@ -371,6 +416,10 @@ async function probeCastleWallApp(): Promise<{
   } catch {
     return { status: "mismatch", buildSha: null };
   }
+}
+
+export async function verifyCastleWallSealedRuntime(): Promise<boolean> {
+  return (await probeCastleWallApp()).status === "present";
 }
 
 async function probeBootService(fortress: string): Promise<InstallObservation> {

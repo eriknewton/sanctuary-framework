@@ -65,6 +65,7 @@ CLI_RUNTIME_DIR="${WRAPPED_APP_DIR}/Contents/Resources/cli-runtime"
 CLI_RUNTIME_SRC="${SANCTUARY_CLI_RUNTIME_DIR:-${REPO_DIR}/server/dist}"
 CLI_RUNTIME_NODE_MODULES="${SANCTUARY_CLI_NODE_MODULES:-${REPO_DIR}/server/node_modules}"
 CLI_RUNTIME_PACKAGE_JSON="${SANCTUARY_CLI_PACKAGE_JSON:-${REPO_DIR}/server/package.json}"
+CLI_RUNTIME_MACH_O_SCANNER="${PKG_DIR}/scripts/list-cli-runtime-mach-o.mjs"
 SANCTUARY_LAUNCHER_EXE_NAME="SanctuaryLauncher"
 SANCTUARY_LAUNCHER_DST="${WRAPPED_APP_DIR}/Contents/MacOS/sanctuary"
 
@@ -266,11 +267,12 @@ codesign --force --sign - --timestamp=none \
     --identifier ai.sanctuaryprotocol.macos.castle-wall.sanctuary-launcher \
     "${SANCTUARY_LAUNCHER_DST}"
 if [ -d "${CLI_RUNTIME_DIR}/node_modules" ]; then
+    CLI_RUNTIME_MACH_O_COUNT=0
     while IFS= read -r -d '' addon; do
-        if file "${addon}" | grep -q "Mach-O"; then
-            codesign --force --sign - --timestamp=none "${addon}"
-        fi
-    done < <(find "${CLI_RUNTIME_DIR}/node_modules" -type f -name '*.node' -print0)
+        codesign --force --sign - --timestamp=none "${addon}"
+        CLI_RUNTIME_MACH_O_COUNT=$((CLI_RUNTIME_MACH_O_COUNT + 1))
+    done < <(node "${CLI_RUNTIME_MACH_O_SCANNER}" "${CLI_RUNTIME_DIR}")
+    [ "${CLI_RUNTIME_MACH_O_COUNT}" -ge 2 ] || fail "expected at least two native Mach-O runtime files"
 fi
 codesign --force --sign - --timestamp=none "${WRAPPED_APP_DIR}"
 

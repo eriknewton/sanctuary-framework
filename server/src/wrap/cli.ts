@@ -803,6 +803,13 @@ export async function validateSealedLauncher(path: string): Promise<void> {
     if (error instanceof SealedLauncherInvalidError) throw error;
     throw new SealedLauncherInvalidError(path, "no such executable file");
   }
+  const { verifyCastleWallSealedRuntime } = await import("../cli/install.js");
+  if (!(await verifyCastleWallSealedRuntime())) {
+    throw new SealedLauncherInvalidError(
+      path,
+      "the app signature, exact source identity, or sealed runtime manifest did not verify",
+    );
+  }
 }
 
 function resolveAutoProvisionCliBinary(options: WrapOptions): string | undefined {

@@ -71,6 +71,8 @@ describe("sanctuary install agent contract", () => {
         "MacOS/sanctuary",
         "Resources/boot-runtime/node",
         "Resources/cli-runtime/dist/cli.js",
+        "Resources/cli-runtime/node_modules/@lmdb/lmdb-darwin-arm64/node.napi.node",
+        "Resources/cli-runtime/node_modules/@msgpackr-extract/msgpackr-extract-darwin-arm64/node.napi.glibc.node",
       ];
       for (const path of paths) {
         await mkdir(dirname(join(contents, path)), { recursive: true });
@@ -89,6 +91,14 @@ describe("sanctuary install agent contract", () => {
         source_sha: "a".repeat(40),
         cli_version: packageJson.version,
         node_version: "v22.0.0",
+        inventory: {
+          file_count: files.length,
+          total_bytes: files.reduce((sum, entry) => sum + entry.size, 0),
+          package_count: 0,
+          packages: [],
+          mach_o_count: 2,
+          mach_o: paths.slice(-2),
+        },
         files,
       })}\n`);
       await expect(verifyCastleWallRuntimeManifest(bytes, contents, {
