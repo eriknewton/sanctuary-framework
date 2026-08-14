@@ -78,6 +78,7 @@ import {
   isOsKeyringLocation,
   PassphraseUnreadableError,
   PassphraseKeyringUnreachableError,
+  probeExistingCustodyMaterial,
 } from "./passphrase.js";
 import { type DashboardHandle } from "../dashboard/index.js";
 import {
@@ -470,6 +471,8 @@ export interface WrapOptions {
    * stdin being a TTY. Root remains required for privileged mutations.
    */
   agentGuided?: boolean;
+  /** Explicit acknowledgement carried only by the planner's human custody action. */
+  operatorCustody?: boolean;
   /** Run the read-only install preflight and exit before any host mutation. */
   preflight?: boolean;
   /** Render the preflight table as machine-readable JSON. */
@@ -2881,6 +2884,55 @@ export async function runWrap(
 ): Promise<void> {
   installProcessShutdownListeners();
 
+  // This operator acknowledgement is valid for one exact planner-declared
+  // shape only. Validate it before unwrap or any other early dispatch so an
+  // incompatible flag can never reach a mutating verb.
+  const selectedHarnessCount = [
+    options.openclaw,
+    options.hermes,
+    options.claudeCode,
+    options.cursor,
+    options.cline,
+    options.mastra,
+  ].filter((selected) => selected === true).length;
+  const operatorCustodyShapeInvalid =
+    options.operatorCustody === true &&
+    ((deps.osPlatform ?? platform)() !== "darwin" ||
+      options.agentGuided !== true ||
+      options.protectCommand !== true ||
+      options.provisionAgentAccount !== false ||
+      selectedHarnessCount !== 1 ||
+      options.wrap !== undefined ||
+      options.passphrase !== undefined ||
+      options.writePassphraseBackup !== undefined ||
+      options.devDist !== undefined ||
+      (options.sealedLauncher !== undefined &&
+        options.sealedLauncher !==
+          "/Applications/Sanctuary-CastleWall.app/Contents/MacOS/sanctuary") ||
+      options.noOpen !== true ||
+      options.dryRun === true ||
+      options.preflight === true ||
+      options.preflightJson === true ||
+      options.preflightStrict === true ||
+      options.unwrap === true ||
+      options.noDashboard === true ||
+      options.port !== undefined ||
+      options.allowPlaintextRemote === true ||
+      options.anchorTransparency === true ||
+      options.exclusiveEgress === true ||
+      options.overwriteDestination === true ||
+      options.repairEgressGate === true ||
+      options.standDownAgent === true ||
+      options.overrideTransientPfRules === true ||
+      options.unprotectEgressGate === true);
+  if (operatorCustodyShapeInvalid) {
+    // SAFETY: fixed flag-validation text only.
+    console.error(
+      "\n  Sanctuary protect: --operator-custody is valid only on the planner-declared human protect --agent-guided action.\n",
+    );
+    process.exit(2);
+  }
+
   if (options.preflight === true && options.unwrap === true) {
     // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
     console.error("\n  Sanctuary protect: --preflight cannot be combined with --unwrap.\n");
@@ -2987,6 +3039,56 @@ export async function runWrap(
         process.exit(2);
       }
       throw err;
+    }
+  }
+
+  // Resolve/persist the passphrase before config detection/bootstrap and every
+  // fortress/recovery write on the agent-guided path. This is the real custody
+  // capability check: a read-only Keychain probe cannot prove writability (an
+  // SSH session may report item-not-found and then refuse the write). The
+  // resolved value is cached only in this process and consumed by the ordinary
+  // wrap flow below; it never reaches argv, config, or planner output.
+  let preResolvedAgentPassphrase:
+    | { value: string; location: string; source: string }
+    | undefined;
+  if (options.agentGuided === true && options.dryRun !== true) {
+    const earlyStoragePath = resolveStoragePath();
+    const existingCustody = await probeExistingCustodyMaterial(earlyStoragePath);
+    if (
+      (deps.osPlatform ?? platform)() === "darwin" &&
+      options.operatorCustody !== true &&
+      existingCustody !== "present"
+    ) {
+      // SAFETY: fixed operator-handoff text; no probe detail or secret is emitted.
+      console.error(
+        "\n  Sanctuary protect: first macOS custody is a human action. " +
+          "Run the exact planner-declared --operator-custody command in a private local desktop Terminal.\n" +
+          "  An agent must not add this flag, retry autonomously, or receive any login password, passphrase, or recovery key.\n",
+      );
+      process.exit(2);
+      return;
+    }
+    if (options.passphrase !== undefined) {
+      const persist =
+        deps.persistPassphrase ??
+        ((value: string) => persistUserProvidedPassphrase(value, { storagePath: earlyStoragePath }));
+      const persisted = await persist(options.passphrase);
+      preResolvedAgentPassphrase = {
+        value: options.passphrase,
+        location: persisted.location,
+        source: persisted.source,
+      };
+    } else if (process.env.SANCTUARY_PASSPHRASE !== undefined) {
+      preResolvedAgentPassphrase = {
+        value: process.env.SANCTUARY_PASSPHRASE,
+        location: "SANCTUARY_PASSPHRASE",
+        source: "env",
+      };
+    } else {
+      const resolve =
+        deps.resolvePassphrase ??
+        (() => getOrCreatePassphrase({ storagePath: earlyStoragePath }));
+      preResolvedAgentPassphrase = await resolve();
     }
   }
 
@@ -3482,7 +3584,26 @@ export async function runWrap(
   // only; never persisted to disk beyond the existing keychain write
   // and never injected into the rewritten harness env.
   let passphraseValue: string | undefined;
-  if (options.passphrase) {
+  if (preResolvedAgentPassphrase !== undefined) {
+    passphraseLocation = preResolvedAgentPassphrase.location;
+    passphraseSource = preResolvedAgentPassphrase.source;
+    passphraseValue = preResolvedAgentPassphrase.value;
+    if (options.passphrase !== undefined) {
+      // SAFETY: destination description only; never the supplied value.
+      console.error(
+        `\n  \u{1F510} Persisted user-supplied passphrase (${passphraseLocation}).`,
+      );
+      // SAFETY: fixed backup instruction only; never the supplied value.
+      console.error("  Back up with: sanctuary export-passphrase");
+    } else if (passphraseSource === "generated") {
+      // SAFETY: destination description only; never the generated value.
+      console.error(
+        `\n  \u{1F510} Generated and stored passphrase (${passphraseLocation}).`,
+      );
+      // SAFETY: fixed backup instruction only; never the generated value.
+      console.error("  Back up with: sanctuary export-passphrase");
+    }
+  } else if (options.passphrase) {
     try {
       const persist =
         deps.persistPassphrase ??
@@ -6104,6 +6225,7 @@ const WRAP_BOOLEAN_FLAGS = new Set([
   "--allow-plaintext-remote",
   "--anchor-transparency",
   "--agent-guided",
+  "--operator-custody",
   "--provision-agent-account",
   "--no-provision-agent-account",
   "--exclusive-egress",
@@ -6217,6 +6339,9 @@ export function parseWrapArgs(argv: string[]): WrapOptions {
         break;
       case "--agent-guided":
         options.agentGuided = true;
+        break;
+      case "--operator-custody":
+        options.operatorCustody = true;
         break;
       case "--provision-agent-account":
         options.provisionAgentAccount = true;

@@ -10,6 +10,10 @@ import { resolveStoragePath } from "../paths.js";
 import { getSanctuaryVersion } from "../version.js";
 import { agentGuidedRecoveryOutputPath } from "../wrap/custody-flow.js";
 import {
+  probeExistingCustodyMaterial,
+  type ExistingCustodyMaterialStatus,
+} from "../wrap/passphrase.js";
+import {
   getPlatformPaths,
   hasExistingWrapMetaStrict,
 } from "../wrap/config-reader.js";
@@ -222,6 +226,13 @@ export interface AgentInstallAction {
   argv?: string[];
   completion: string;
   secret_boundary?: string;
+  /**
+   * Declared transition when this agent action exits nonzero. The caller must
+   * execute an agent action once only: on zero it reruns the planner; on
+   * nonzero it stops autonomous execution and hands this exact action to the
+   * named actor. No transcript or failure receipt is trusted as machine state.
+   */
+  on_nonzero?: AgentInstallAction;
 }
 
 export interface AgentInstallPlan {
@@ -236,6 +247,7 @@ export interface AgentInstallPlan {
     persistent_cli_path: string | null;
     persistent_cli_version: string | null;
     package_manager_path: string | null;
+    existing_custody: ExistingCustodyMaterialStatus;
     castle_wall_app: InstallObservation;
     castle_wall_build_sha: string | null;
     system_extension: SysextState | "unknown" | "not-applicable";
@@ -262,6 +274,7 @@ export interface InstallProbeResult {
   persistentCliPath: string | null;
   persistentCliVersion: string | null;
   packageManagerPath: string | null;
+  existingCustody: ExistingCustodyMaterialStatus;
   nodePath: string;
   castleWallApp: InstallObservation;
   castleWallBuildSha: string | null;
@@ -627,9 +640,12 @@ function createInstallOps(ctx: InstallCommandContext): AgentInstallOps {
   return {
     probe: async ({ profile, harness, fortress }) => {
       const cooperativeWrap = await probeWrap(harness);
-      const [pathCli, packageManagerPath] = await Promise.all([
+      const [pathCli, packageManagerPath, existingCustody] = await Promise.all([
         probePersistentCli(),
         probeExecutableOnPath("npm"),
+        platform === "darwin"
+          ? probeExistingCustodyMaterial(fortress)
+          : Promise.resolve("absent" as const),
       ]);
       let persistentCli = pathCli;
       let nodePath = process.execPath;
@@ -655,6 +671,7 @@ function createInstallOps(ctx: InstallCommandContext): AgentInstallOps {
           persistentCliPath: persistentCli.path,
           persistentCliVersion: persistentCli.version,
           packageManagerPath,
+          existingCustody,
           nodePath,
           castleWallApp: "not-applicable",
           castleWallBuildSha: null,
@@ -676,6 +693,7 @@ function createInstallOps(ctx: InstallCommandContext): AgentInstallOps {
         persistentCliPath: persistentCli.path,
         persistentCliVersion: persistentCli.version,
         packageManagerPath,
+        existingCustody,
         nodePath,
         castleWallApp: castleWallApp.status,
         castleWallBuildSha: castleWallApp.buildSha,
@@ -719,6 +737,7 @@ function basePlan(
       persistent_cli_path: observed.persistentCliPath,
       persistent_cli_version: observed.persistentCliVersion,
       package_manager_path: observed.packageManagerPath,
+      existing_custody: observed.existingCustody,
       castle_wall_app: observed.castleWallApp,
       castle_wall_build_sha: observed.castleWallBuildSha,
       system_extension: observed.systemExtension,
@@ -759,6 +778,40 @@ export function buildAgentInstallPlan(input: {
     "--agent-guided",
     ...(sealedFullRuntime ? ["--sealed-launcher", DEFAULT_CASTLE_WALL_LAUNCHER] : []),
   ];
+  const protectFailureAction = (): AgentInstallAction => ({
+    id: "complete_cooperative_surface_locally",
+    actor: "human",
+    description:
+      input.platform === "darwin"
+        ? "The agent-run protect command failed. In a private local desktop Terminal, unlock the login Keychain if prompted, then run this exact signed protect command once."
+        : "The agent-run protect command failed. In a private local desktop Terminal with the user Secret Service available, run this exact protect command once.",
+    argv: [
+      ...protectArgs,
+      ...(input.platform === "darwin" ? ["--operator-custody"] : []),
+      "--no-provision-agent-account",
+    ],
+    completion: "A planner rerun observes cooperative_wrap=present.",
+    secret_boundary:
+      input.platform === "darwin"
+        ? "Do not paste a login password, passphrase, recovery key, Keychain contents, or command output into chat. Do not let the agent retry this action."
+        : "Do not paste a login password, passphrase, recovery key, Secret Service contents, or command output into chat. Do not let the agent retry this action.",
+  });
+  const firstMacCustodyAction = (): AgentInstallAction => ({
+    id: "prepare_local_keychain_session",
+    actor: "human",
+    description:
+      input.observed.existingCustody === "unknown"
+        ? "Existing custody could not be safely identified. In a private local desktop Terminal, unlock the login Keychain if prompted, then run this exact signed protect command once."
+        : "First custody is an operator ceremony on macOS. In a private local desktop Terminal, unlock the login Keychain if prompted, then run this exact signed protect command once.",
+    argv: [
+      ...protectArgs,
+      "--operator-custody",
+      "--no-provision-agent-account",
+    ],
+    completion: "A planner rerun observes cooperative_wrap=present.",
+    secret_boundary:
+      "Do not paste a login password, passphrase, recovery key, or Keychain contents into chat or an agent command.",
+  });
 
   if (input.observed.persistentCli !== "present" || input.observed.persistentCliPath === null) {
     if (input.observed.persistentCli === "unknown") {
@@ -806,6 +859,11 @@ export function buildAgentInstallPlan(input: {
       plan.status = "human_action";
       return plan;
     }
+    if (input.platform === "darwin" && input.observed.existingCustody !== "present") {
+      plan.status = "human_action";
+      plan.next_action = firstMacCustodyAction();
+      return plan;
+    }
     plan.status = "agent_action";
     plan.next_action = {
       id: "install_cooperative_surface",
@@ -814,6 +872,7 @@ export function buildAgentInstallPlan(input: {
       argv: [...protectArgs, "--no-provision-agent-account"],
       completion: "A rerun observes cooperative_wrap=present.",
       secret_boundary: "Do not add --passphrase or --write-passphrase-backup; default custody does not disclose the generated passphrase.",
+      on_nonzero: protectFailureAction(),
     };
     return plan;
   }
@@ -832,6 +891,14 @@ export function buildAgentInstallPlan(input: {
     plan.notes.push("The full one-flow dedicated-account installer currently supports Hermes only.");
     return plan;
   }
+  if (
+    input.observed.cooperativeWrap === "absent" &&
+    input.observed.existingCustody !== "present"
+  ) {
+    plan.status = "human_action";
+    plan.next_action = firstMacCustodyAction();
+    return plan;
+  }
   if (input.observed.cooperativeWrap === "absent") {
     plan.status = "agent_action";
     plan.next_action = {
@@ -843,6 +910,7 @@ export function buildAgentInstallPlan(input: {
       completion: "A rerun observes cooperative_wrap=present.",
       secret_boundary:
         "Recovery is staged outside the fortress without being printed. The agent must not read the staged file.",
+      on_nonzero: protectFailureAction(),
     };
     return plan;
   }
