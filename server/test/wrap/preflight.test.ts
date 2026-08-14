@@ -212,6 +212,72 @@ describe("protect preflight", () => {
     expect(renderProtectPreflightReport(report)).toContain("| PASS");
   });
 
+  it("accepts the canonical executable sealed launcher without a root PATH dependency", async () => {
+    const sealedLauncher =
+      "/Applications/Sanctuary-CastleWall.app/Contents/MacOS/sanctuary";
+    const report = await runProtectPreflight({
+      sealedLauncherPath: sealedLauncher,
+      ops: fixtureOps({
+        env: baseEnv({ PATH: "/missing" }),
+        executable: new Set([sealedLauncher]),
+      }),
+    });
+
+    expect(row(report, "root_path_sanctuary")).toMatchObject({
+      status: "PASS",
+      state: "canonical_sealed_launcher",
+      remedy: "none",
+    });
+    expect(row(report, "root_path_sanctuary").detail).toContain(sealedLauncher);
+  });
+
+  it("does not accept a caller-selected executable as the sealed launcher", async () => {
+    const report = await runProtectPreflight({
+      sealedLauncherPath: "/tmp/sanctuary",
+      ops: fixtureOps({
+        env: baseEnv({ PATH: "/missing" }),
+        executable: new Set(["/tmp/sanctuary"]),
+      }),
+    });
+
+    expect(row(report, "root_path_sanctuary")).toMatchObject({
+      status: "FAIL",
+      state: "sealed_launcher_noncanonical",
+    });
+
+    const missingCanonical = await runProtectPreflight({
+      sealedLauncherPath:
+        "/Applications/Sanctuary-CastleWall.app/Contents/MacOS/sanctuary",
+      ops: fixtureOps({
+        env: baseEnv({ PATH: "/missing" }),
+        executable: new Set(),
+      }),
+    });
+    expect(row(missingCanonical, "root_path_sanctuary")).toMatchObject({
+      status: "FAIL",
+      state: "sealed_launcher_not_executable",
+    });
+  });
+
+  it("validates and forwards the sealed launcher before the automatic preflight", async () => {
+    const source = await readFile(
+      fileURLToPath(new URL("../../src/wrap/cli.ts", import.meta.url)),
+      "utf8",
+    );
+    const validation = source.indexOf(
+      "await validateSealedLauncher(options.sealedLauncher)",
+    );
+    const preflight = source.indexOf(
+      "const preflight = await (deps.runProtectPreflight ?? runProtectPreflight)",
+    );
+
+    expect(validation).toBeGreaterThan(-1);
+    expect(preflight).toBeGreaterThan(validation);
+    expect(source.slice(preflight, preflight + 320)).toContain(
+      "sealedLauncherPath: options.sealedLauncher",
+    );
+  });
+
   it("escapes backslashes before pipes in rendered table cells", () => {
     const report = failingReportFixture();
     report.rows[0]!.detail = String.raw`path \| injected | next`;
@@ -281,7 +347,10 @@ describe("protect preflight", () => {
     });
     expect(row(report, "fortress_custody").detail).toContain("dead-man lever");
     expect(row(report, "root_path_sanctuary").remedy).toContain(
-      "node server/dist/cli.js",
+      "canonical signed-app launcher",
+    );
+    expect(row(report, "root_path_sanctuary").remedy).not.toMatch(
+      /\bnode\b|\bnpm\b|\bnpx\b/,
     );
     expect(row(report, "signer_client").state).toBe("env_missing");
     expect(row(report, "sysext_approval").state).toBe("[activated waiting for user]");

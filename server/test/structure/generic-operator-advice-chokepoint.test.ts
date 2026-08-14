@@ -351,13 +351,6 @@ const HERMES_LITERAL_CLASSIFICATIONS: readonly HermesLiteralClassification[] = [
     expectedCount: 1,
     reason: "wrap help names the real Hermes command; it is not recovery advice",
   },
-  {
-    file: "server/src/wrap/preflight.ts",
-    scope: "checkRootPathSanctuary",
-    snippet: "sudo node server/dist/cli.js protect --hermes",
-    expectedCount: 1,
-    reason: "install preflight root-PATH fallback is explicitly the Hermes protect arming command",
-  },
 ];
 
 interface LiteralHit {

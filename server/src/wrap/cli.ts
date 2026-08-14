@@ -780,6 +780,8 @@ export class SealedLauncherInvalidError extends Error {
   }
 }
 
+// Must match CASTLE_WALL_SEALED_LAUNCHER in wrap/preflight.ts. This validation
+// is the trust gate; preflight independently checks only path availability.
 const CASTLE_WALL_SEALED_LAUNCHER =
   "/Applications/Sanctuary-CastleWall.app/Contents/MacOS/sanctuary";
 
@@ -2978,6 +2980,22 @@ export async function runWrap(
     process.exit(2);
   }
 
+  // Validate the app-sealed entrypoint before preflight reports it as the
+  // persistent CLI. The canonical path is not enough: the signature, exact
+  // source identity, and sealed runtime manifest must all verify first.
+  if (options.sealedLauncher !== undefined) {
+    try {
+      await validateSealedLauncher(options.sealedLauncher);
+    } catch (err) {
+      if (err instanceof SealedLauncherInvalidError) {
+        // SAFETY: stderr is the operator-facing CLI channel; the error names only the code-controlled launcher path and validation reason.
+        console.error(`\n  Sanctuary wrap: ${err.message}\n`);
+        process.exit(2);
+      }
+      throw err;
+    }
+  }
+
   // This automatic preflight probes the signed macOS enforcement app, system
   // extension consent, and dedicated-account services. It belongs only to the
   // full Hermes provisioning flow; cooperative installs for other harnesses do
@@ -2991,6 +3009,7 @@ export async function runWrap(
   if (options.protectCommand === true && (options.preflight === true || protectInstallFlow)) {
     const preflight = await (deps.runProtectPreflight ?? runProtectPreflight)({
       strict: options.preflightStrict === true,
+      sealedLauncherPath: options.sealedLauncher,
     });
     const preflightCode = protectPreflightExitCode(
       preflight,
@@ -3023,18 +3042,6 @@ export async function runWrap(
     } catch (err) {
       if (err instanceof DevDistInvalidError) {
         // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
-        console.error(`\n  Sanctuary wrap: ${err.message}\n`);
-        process.exit(2);
-      }
-      throw err;
-    }
-  }
-  if (options.sealedLauncher !== undefined) {
-    try {
-      await validateSealedLauncher(options.sealedLauncher);
-    } catch (err) {
-      if (err instanceof SealedLauncherInvalidError) {
-        // SAFETY: stderr is the operator-facing CLI channel; the error names only the code-controlled launcher path and validation reason.
         console.error(`\n  Sanctuary wrap: ${err.message}\n`);
         process.exit(2);
       }
