@@ -1842,7 +1842,8 @@
           "harness": {
             "type": "string",
             "enum": [
-              "claude-code"
+              "claude-code",
+              "codex"
             ],
             "description": "Harness memory-file format to ingest"
           },
@@ -1865,7 +1866,8 @@
           "harness": {
             "type": "string",
             "enum": [
-              "claude-code"
+              "claude-code",
+              "codex"
             ],
             "description": "Harness memory-file format to emit"
           },

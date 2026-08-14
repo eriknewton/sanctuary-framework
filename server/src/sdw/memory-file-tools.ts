@@ -18,6 +18,12 @@ import {
   ingestClaudeCodeMemorySnapshot,
   readClaudeCodeMemoryDirectory,
 } from "./adapters/claude-code-file-adapter.js";
+import {
+  CODEX_MEMORY_HARNESS,
+  emitCodexMemoryDirectory,
+  ingestCodexMemorySnapshot,
+  readCodexMemoryDirectory,
+} from "./adapters/codex-memory-file-adapter.js";
 import { SdwValidationError } from "./errors.js";
 import {
   createMultiAgentIsolationGuard,
@@ -44,10 +50,13 @@ export interface SdwMemoryFileToolsOptions {
   readonly now?: () => string;
 }
 
-type SupportedMemoryHarness = typeof CLAUDE_CODE_MEMORY_HARNESS;
+type SupportedMemoryHarness =
+  | typeof CLAUDE_CODE_MEMORY_HARNESS
+  | typeof CODEX_MEMORY_HARNESS;
 
 const SUPPORTED_HARNESSES: readonly SupportedMemoryHarness[] = [
   CLAUDE_CODE_MEMORY_HARNESS,
+  CODEX_MEMORY_HARNESS,
 ];
 
 export interface MemoryFileApprovalContext {
@@ -164,7 +173,7 @@ export function createSdwMemoryFileTools(options: SdwMemoryFileToolsOptions): To
   const memoryIngest: ToolDefinition = {
     name: "memory_ingest",
     description:
-      "Manually mirror a Claude Code memory directory into the SDW vault. It " +
+      "Manually mirror a Claude Code or Codex memory directory into the SDW vault. It " +
       "reads plaintext source files and leaves them untouched; the encrypted " +
       "copy lives in the vault. Files the secret classifier refuses are " +
       "skipped and named in the result, so check skipped_file_count before " +
@@ -200,8 +209,16 @@ export function createSdwMemoryFileTools(options: SdwMemoryFileToolsOptions): To
       let fileCount = 0;
       const ingestedAt = now();
       try {
-        const snapshot = await readClaudeCodeMemoryDirectory(dir, { ingestedAt });
-        fileCount = snapshot.entries.length;
+        let ingestSnapshot: () => ReturnType<typeof ingestClaudeCodeMemorySnapshot>;
+        if (harness === CLAUDE_CODE_MEMORY_HARNESS) {
+          const snapshot = await readClaudeCodeMemoryDirectory(dir, { ingestedAt });
+          fileCount = snapshot.entries.length;
+          ingestSnapshot = () => ingestClaudeCodeMemorySnapshot(adapter, snapshot);
+        } else {
+          const snapshot = await readCodexMemoryDirectory(dir, { ingestedAt });
+          fileCount = snapshot.entries.length;
+          ingestSnapshot = () => ingestCodexMemorySnapshot(adapter, snapshot);
+        }
         // Write-ahead INTENT, not an outcome. The durable record precedes the
         // vault mutation so a crash mid-ingest still leaves evidence that an
         // ingest was attempted; it is labelled `_started` because at this point
@@ -213,7 +230,7 @@ export function createSdwMemoryFileTools(options: SdwMemoryFileToolsOptions): To
           owner_ref: adapter.ownerRef,
           source_file_count: fileCount,
         });
-        const result = await ingestClaudeCodeMemorySnapshot(adapter, snapshot);
+        const result = await ingestSnapshot();
         await auditSuccess("memory_ingest", {
           harness,
           source_dir: dir,
@@ -264,10 +281,10 @@ export function createSdwMemoryFileTools(options: SdwMemoryFileToolsOptions): To
   const memoryEmit: ToolDefinition = {
     name: "memory_emit",
     description:
-      "Manually emit Claude Code memory files from the SDW vault into an " +
+      "Manually emit Claude Code or Codex memory files from the SDW vault into an " +
       "operator-named output directory. Existing memory files are never " +
       "overwritten. The result reports index_present; false means the emitted " +
-      "tree cannot be re-ingested as a Claude Code memory directory. Emitted " +
+      "tree cannot be re-ingested as that harness's memory directory. Emitted " +
       "files are plaintext for the harness; " +
       "this does not sync or write back to the source memory directory, and " +
       "memory later sent to a model vendor is exposed to that vendor at inference.",
@@ -305,7 +322,9 @@ export function createSdwMemoryFileTools(options: SdwMemoryFileToolsOptions): To
           output_dir: dir,
           owner_ref: adapter.ownerRef,
         });
-        const result = await emitClaudeCodeMemoryDirectory(adapter, dir);
+        const result = harness === CLAUDE_CODE_MEMORY_HARNESS
+          ? await emitClaudeCodeMemoryDirectory(adapter, dir)
+          : await emitCodexMemoryDirectory(adapter, dir);
         await auditSuccess("memory_emit", {
           harness,
           output_dir: dir,

@@ -31,6 +31,9 @@ import { FilesystemStorage } from "../../src/storage/filesystem.js";
 const FIXTURE_ROOT = fileURLToPath(
   new URL("../../src/sdw/__fixtures__/claude-code-memory/", import.meta.url),
 );
+const CODEX_FIXTURE_ROOT = fileURLToPath(
+  new URL("../../src/sdw/__fixtures__/codex-memory/", import.meta.url),
+);
 const PASSPHRASE = "memory-file-cli-test-passphrase-v1";
 
 function makeSink(): { stream: Writable; text: () => string } {
@@ -72,22 +75,22 @@ describe("memory file CLI: argument parsing", () => {
       const err = makeSink();
       const code = await run({ argv: ["--help"], out: out.stream, err: err.stream, env: {} });
       expect(code).toBe(0);
-      expect(out.text()).toContain("--harness=claude-code");
+      expect(out.text()).toContain("claude-code|codex");
       expect(err.text()).toBe("");
     }
   });
 
-  it("refuses a non-claude-code harness with the usage exit code", async () => {
+  it("refuses an unsupported harness with the usage exit code", async () => {
     const out = makeSink();
     const err = makeSink();
     const code = await runMemoryIngestCommand({
-      argv: ["--harness", "codex", "--dir", "/tmp/whatever"],
+      argv: ["--harness", "hermes", "--dir", "/tmp/whatever"],
       out: out.stream,
       err: err.stream,
       env: {},
     });
     expect(code).toBe(2);
-    expect(err.text()).toContain('--harness must be "claude-code"');
+    expect(err.text()).toContain('--harness must be "claude-code" or "codex"');
     expect(out.text()).toBe("");
   });
 
@@ -255,6 +258,53 @@ describe("memory file CLI: fortress-backed round trip", () => {
       emitted_file_count: 3,
       index_present: true,
     });
+  }, 60_000);
+
+  it("accepts a Codex home and round-trips only its three curated memory files", async () => {
+    const codexHome = await tempDir("memory-file-cli-codex-home");
+    const memories = join(codexHome, "memories");
+    await mkdir(memories, { recursive: true });
+    for (const filename of ["MEMORY.md", "memory_summary.md", "raw_memories.md"]) {
+      await writeFile(
+        join(memories, filename),
+        await readFile(join(CODEX_FIXTURE_ROOT, "unicode", filename)),
+      );
+    }
+    await writeFile(join(codexHome, "state_5.sqlite"), Buffer.from([0, 255, 0, 255]));
+    await writeFile(join(codexHome, "history.jsonl"), "not curated memory\n");
+    const output = await tempDir("memory-file-cli-codex-output");
+
+    const ingestOut = makeSink();
+    const ingestErr = makeSink();
+    expect(await runMemoryIngestCommand({
+      argv: ["--harness", "codex", "--dir", codexHome, "--fortress", fortress],
+      out: ingestOut.stream,
+      err: ingestErr.stream,
+      env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
+    })).toBe(0);
+    expect(ingestOut.text()).toContain("ingested 3 of 3 Codex memory files");
+    expect(ingestErr.text()).toBe("");
+
+    const emitOut = makeSink();
+    const emitErr = makeSink();
+    expect(await runMemoryEmitCommand({
+      argv: ["--harness", "codex", "--dir", output, "--fortress", fortress],
+      out: emitOut.stream,
+      err: emitErr.stream,
+      env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
+    })).toBe(0);
+    expect(emitOut.text()).toContain("emitted 3 Codex memory files");
+    expect(emitErr.text()).toBe("");
+    expect((await readdir(output)).sort()).toEqual([
+      "MEMORY.md",
+      "memory_summary.md",
+      "raw_memories.md",
+    ]);
+    for (const filename of await readdir(output)) {
+      expect(await readFile(join(output, filename))).toEqual(
+        await readFile(join(memories, filename)),
+      );
+    }
   }, 60_000);
 
   it("accepts the passphrase on stdin instead of argv", async () => {

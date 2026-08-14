@@ -21,6 +21,12 @@ import {
   ingestClaudeCodeMemorySnapshot,
   readClaudeCodeMemoryDirectory,
 } from "../sdw/adapters/claude-code-file-adapter.js";
+import {
+  CODEX_MEMORY_HARNESS,
+  emitCodexMemoryDirectory,
+  ingestCodexMemorySnapshot,
+  readCodexMemoryDirectory,
+} from "../sdw/adapters/codex-memory-file-adapter.js";
 import { SdwValidationError } from "../sdw/errors.js";
 import { SdwMemoryBackendAdapter } from "../sdw/adapters/sdw-memory-backend.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
@@ -69,7 +75,17 @@ export async function runMemoryIngestCommand(
   if (!boot) return 1;
 
   try {
-    const snapshot = await readClaudeCodeMemoryDirectory(parsed.dir);
+    let sourceFileCount = 0;
+    let ingestSnapshot: () => ReturnType<typeof ingestClaudeCodeMemorySnapshot>;
+    if (parsed.harness === CLAUDE_CODE_MEMORY_HARNESS) {
+      const snapshot = await readClaudeCodeMemoryDirectory(parsed.dir);
+      sourceFileCount = snapshot.entries.length;
+      ingestSnapshot = () => ingestClaudeCodeMemorySnapshot(boot.adapter, snapshot);
+    } else {
+      const snapshot = await readCodexMemoryDirectory(parsed.dir);
+      sourceFileCount = snapshot.entries.length;
+      ingestSnapshot = () => ingestCodexMemorySnapshot(boot.adapter, snapshot);
+    }
     // Write-ahead INTENT, durable before any vault write. If appendCritical
     // throws, the command aborts with no ingested memory files. It is labelled
     // `_started` because nothing is committed yet and the count is only what
@@ -83,10 +99,10 @@ export async function runMemoryIngestCommand(
         harness: parsed.harness,
         source_dir: parsed.dir,
         owner_ref: parsed.ownerRef,
-        source_file_count: snapshot.entries.length,
+        source_file_count: sourceFileCount,
       },
     });
-    const result = await ingestClaudeCodeMemorySnapshot(boot.adapter, snapshot);
+    const result = await ingestSnapshot();
     await boot.auditLog.appendCritical({
       layer: "l1",
       operation: "memory_ingest",
@@ -108,7 +124,7 @@ export async function runMemoryIngestCommand(
     });
     write(
       out,
-      `memory_ingest: ingested ${String(result.ingested.length)} of ${String(result.source_file_count)} Claude Code memory files into owner_ref ${parsed.ownerRef}\n`,
+      `memory_ingest: ingested ${String(result.ingested.length)} of ${String(result.source_file_count)} ${harnessLabel(parsed.harness)} memory files into owner_ref ${parsed.ownerRef}\n`,
     );
     if (!result.complete) {
       // Loud, on stderr, and named per file: a partial mirror that reports only
@@ -172,7 +188,9 @@ export async function runMemoryEmitCommand(
         owner_ref: parsed.ownerRef,
       },
     });
-    const result = await emitClaudeCodeMemoryDirectory(boot.adapter, parsed.dir);
+    const result = parsed.harness === CLAUDE_CODE_MEMORY_HARNESS
+      ? await emitClaudeCodeMemoryDirectory(boot.adapter, parsed.dir)
+      : await emitCodexMemoryDirectory(boot.adapter, parsed.dir);
     await boot.auditLog.appendCritical({
       layer: "l1",
       operation: "memory_emit",
@@ -188,12 +206,12 @@ export async function runMemoryEmitCommand(
     });
     write(
       out,
-      `memory_emit: emitted ${String(result.emitted.length)} Claude Code memory files to ${parsed.dir} (index_present: ${result.index_present ? "yes" : "no"})\n`,
+      `memory_emit: emitted ${String(result.emitted.length)} ${harnessLabel(parsed.harness)} memory files to ${parsed.dir} (index_present: ${result.index_present ? "yes" : "no"})\n`,
     );
     if (!result.index_present) {
       write(
         err,
-        `memory_emit: WARNING - emitted tree is missing MEMORY.md and cannot be re-ingested as a Claude Code memory directory.\n`,
+        `memory_emit: WARNING - emitted tree is missing MEMORY.md and cannot be re-ingested as a ${harnessLabel(parsed.harness)} memory directory.\n`,
       );
     }
     return 0;
@@ -212,7 +230,9 @@ export async function runMemoryEmitCommand(
 }
 
 interface ParsedCommonArgs {
-  readonly harness: typeof CLAUDE_CODE_MEMORY_HARNESS;
+  readonly harness:
+    | typeof CLAUDE_CODE_MEMORY_HARNESS
+    | typeof CODEX_MEMORY_HARNESS;
   readonly dir: string;
   readonly ownerRef: string;
   readonly fortress?: string;
@@ -227,8 +247,8 @@ function parseCommonArgs(
 ): ParsedCommonArgs | null {
   const harness = flagValue([...argv], "--harness");
   const dir = flagValue([...argv], "--dir");
-  if (harness !== CLAUDE_CODE_MEMORY_HARNESS) {
-    write(err, `${command}: --harness must be "claude-code"\n`);
+  if (harness !== CLAUDE_CODE_MEMORY_HARNESS && harness !== CODEX_MEMORY_HARNESS) {
+    write(err, `${command}: --harness must be "claude-code" or "codex"\n`);
     return null;
   }
   if (dir === undefined || dir.trim().length === 0) {
@@ -358,17 +378,24 @@ async function appendFailure(
   }
 }
 
+function harnessLabel(
+  harness: typeof CLAUDE_CODE_MEMORY_HARNESS | typeof CODEX_MEMORY_HARNESS,
+): string {
+  return harness === CLAUDE_CODE_MEMORY_HARNESS ? "Claude Code" : "Codex";
+}
+
 function printIngestHelp(out: Writable): void {
   write(
     out,
-    `Usage: sanctuary memory_ingest --harness=claude-code --dir <path> [options]
+    `Usage: sanctuary memory_ingest --harness=<claude-code|codex> --dir <path> [options]
 
-Manually mirror Claude Code memory files into the encrypted SDW vault. Source
-files remain plaintext and untouched; this command does not sync or watch.
+Manually mirror Claude Code or Codex memory files into the encrypted SDW vault.
+Source files remain plaintext and untouched; this command does not sync or watch.
 
 Options:
-  --harness=claude-code  Required harness format.
-  --dir <path>           Claude Code memory directory to read.
+  --harness <name>       Required: claude-code or codex.
+  --dir <path>           Harness memory directory to read. Codex also accepts
+                         the parent Codex home containing memories/.
   --owner-ref <id>       SDW owner_ref scope (default: fleet-self).
   --fortress <path>      Override the fortress path.
   --passphrase-stdin     Read the fortress passphrase from stdin (preferred).
@@ -383,13 +410,13 @@ Options:
 function printEmitHelp(out: Writable): void {
   write(
     out,
-    `Usage: sanctuary memory_emit --harness=claude-code --dir <path> [options]
+    `Usage: sanctuary memory_emit --harness=<claude-code|codex> --dir <path> [options]
 
-Manually emit Claude Code memory files from the encrypted SDW vault into an
-operator-named output directory. Existing memory files are never overwritten.
+Manually emit Claude Code or Codex memory files from the encrypted SDW vault
+into an operator-named output directory. Existing files are never overwritten.
 
 Options:
-  --harness=claude-code  Required harness format.
+  --harness <name>       Required: claude-code or codex.
   --dir <path>           Output directory for emitted plaintext files.
   --owner-ref <id>       SDW owner_ref scope (default: fleet-self).
   --fortress <path>      Override the fortress path.
