@@ -1038,7 +1038,7 @@ export function buildAgentInstallPlan(input: {
       "--no-open",
       "--provision-agent-account",
       "--agent-guided",
-      "--preflight-strict",
+      "--strict",
       "--sealed-launcher",
       DEFAULT_CASTLE_WALL_LAUNCHER,
     ],

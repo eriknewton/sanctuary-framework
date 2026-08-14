@@ -17,7 +17,7 @@ import {
   type AgentInstallPlan,
   type InstallProbeResult,
 } from "../../src/cli/install.js";
-import { runWrap, type WrapOptions } from "../../src/wrap/cli.js";
+import { parseWrapArgs, runWrap, type WrapOptions } from "../../src/wrap/cli.js";
 import { TOP_LEVEL_SUBCOMMANDS } from "../../src/cli/subcommands.js";
 
 const require = createRequire(import.meta.url);
@@ -829,10 +829,15 @@ describe("sanctuary install agent contract", () => {
       "--no-open",
       "--provision-agent-account",
       "--agent-guided",
-      "--preflight-strict",
+      "--strict",
       "--sealed-launcher",
       "/Applications/Sanctuary-CastleWall.app/Contents/MacOS/sanctuary",
     ]);
+
+    const argv = plan.next_action?.argv ?? [];
+    const protectIndex = argv.indexOf("protect");
+    expect(protectIndex).toBeGreaterThan(-1);
+    expect(parseWrapArgs(argv.slice(protectIndex + 1)).preflightStrict).toBe(true);
   });
 
   it("requires every full-profile enforcement observation before completion", () => {
