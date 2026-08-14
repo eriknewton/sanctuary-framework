@@ -20,6 +20,7 @@ import {
   ingestCodexMemoryDirectory,
   passageIdForCodexMemoryFile,
   readCodexMemoryDirectory,
+  requireCodexNoFollowFlag,
   resolveCodexMemoryDirectory,
 } from "../../src/sdw/adapters/codex-memory-file-adapter.js";
 import {
@@ -89,6 +90,16 @@ async function expectAllowlistedFilesEqual(actual: string, expected: string): Pr
 }
 
 describe("Codex memory-file adapter", () => {
+  it("fails closed when the platform cannot enforce O_NOFOLLOW", () => {
+    expect(() => requireCodexNoFollowFlag(undefined)).toThrow(
+      "Codex memory ingest requires O_NOFOLLOW support",
+    );
+    expect(() => requireCodexNoFollowFlag(0)).toThrow(
+      "Codex memory ingest requires O_NOFOLLOW support",
+    );
+    expect(requireCodexNoFollowFlag(0x20000)).toBe(0x20000);
+  });
+
   it("resolves a Codex home without enumerating or opening non-memory state", async () => {
     const codexHome = await tempDir("synthetic-codex-home");
     const memories = join(codexHome, "memories");

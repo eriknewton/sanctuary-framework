@@ -374,8 +374,23 @@ async function assertDirectoryNoSymlink(path: string, message: string): Promise<
   if (status !== "directory") throw new Error(message);
 }
 
+/** Internal testable boundary for the platform-level no-follow requirement. */
+export function requireCodexNoFollowFlag(value: unknown): number {
+  if (typeof value !== "number" || value === 0) {
+    throw new Error("Codex memory ingest requires O_NOFOLLOW support");
+  }
+  return value;
+}
+
 async function readRegularFileNoSymlink(path: string): Promise<Uint8Array> {
-  const noFollow = typeof fsConstants.O_NOFOLLOW === "number" ? fsConstants.O_NOFOLLOW : 0;
+  // Fail closed on a platform that cannot make the final-component symlink
+  // refusal atomic. Falling back to zero turns the preceding lstat into a
+  // check-then-open race: an attacker could replace an allowlisted memory file
+  // with a symlink between those calls and redirect the read outside memories/.
+  const noFollow = requireCodexNoFollowFlag(fsConstants.O_NOFOLLOW);
+  // Read only. No O_CREAT or write flag is present. The explicit O_NOFOLLOW is
+  // the security boundary for a final-component swap, including when a test
+  // fixture lives under the operating system's temporary directory.
   const handle = await open(path, fsConstants.O_RDONLY | noFollow);
   try {
     const fileStat = await handle.stat();

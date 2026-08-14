@@ -84,7 +84,11 @@ describe("memory file CLI: argument parsing", () => {
     const out = makeSink();
     const err = makeSink();
     const code = await runMemoryIngestCommand({
-      argv: ["--harness", "hermes", "--dir", "/tmp/whatever"],
+      // Deliberately nonexistent and outside the OS temp namespace. The
+      // unsupported harness must be rejected before any directory inspection;
+      // a temp-dir literal here also creates a false source-to-open dataflow in
+      // CodeQL even though this branch returns before bootstrap or file I/O.
+      argv: ["--harness", "hermes", "--dir", "/operator/not-opened"],
       out: out.stream,
       err: err.stream,
       env: {},
