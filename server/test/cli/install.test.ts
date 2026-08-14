@@ -10,6 +10,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   AGENT_INSTALL_CONTRACT,
   buildAgentInstallPlan,
+  parseInstallSystemExtensionState,
   runInstallCommand,
   verifyCastleWallRuntimeManifest,
   type AgentInstallOps,
@@ -88,6 +89,43 @@ function fullObserved(overrides: Partial<InstallProbeResult> = {}): InstallProbe
 }
 
 describe("sanctuary install agent contract", () => {
+  it("observes an active replacement beside a terminated prior system extension", () => {
+    const terminated =
+      "YFQSWQ9BJN ai.sanctuaryprotocol.macos.castle-wall (0.1.0/1407) CastleWallExtension [terminated waiting to uninstall on reboot]";
+    const active =
+      "* * YFQSWQ9BJN ai.sanctuaryprotocol.macos.castle-wall (0.1.0/1408) CastleWallExtension [activated enabled]";
+    const waiting =
+      "* - YFQSWQ9BJN ai.sanctuaryprotocol.macos.castle-wall (0.1.0/1408) CastleWallExtension [activated waiting for user]";
+    const lookalike =
+      "* * YFQSWQ9BJN ai.sanctuaryprotocol.macos.castle-wall-dev (0.1.0/9999) CastleWallDevExtension [activated enabled]";
+
+    expect(parseInstallSystemExtensionState(`${terminated}\n${active}`)).toBe(
+      "[activated enabled]",
+    );
+    expect(parseInstallSystemExtensionState(`${active}\n${terminated}`)).toBe(
+      "[activated enabled]",
+    );
+    expect(parseInstallSystemExtensionState(`${terminated}\n${waiting}`)).toBe(
+      "[activated waiting for user]",
+    );
+    expect(parseInstallSystemExtensionState(`${waiting}\n${terminated}`)).toBe(
+      "[activated waiting for user]",
+    );
+    expect(
+      parseInstallSystemExtensionState(`${terminated}\n${terminated}\n${active}`),
+    ).toBe("[activated enabled]");
+    expect(parseInstallSystemExtensionState(`${terminated}\n${lookalike}`)).toBe(
+      "not loaded",
+    );
+    expect(parseInstallSystemExtensionState(terminated)).toBe("not loaded");
+    expect(
+      parseInstallSystemExtensionState(
+        "YFQSWQ9BJN ai.sanctuaryprotocol.macos.castle-wall CastleWallExtension",
+      ),
+    ).toBe("not loaded");
+    expect(parseInstallSystemExtensionState("No extensions")).toBe("not loaded");
+  });
+
   it("rejects a tampered sealed-runtime manifest payload", async () => {
     const contents = await mkdtemp(join(tmpdir(), "sanctuary-runtime-manifest-"));
     try {
