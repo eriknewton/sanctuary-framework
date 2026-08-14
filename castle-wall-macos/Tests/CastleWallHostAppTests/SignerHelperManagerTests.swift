@@ -27,6 +27,21 @@ final class SignerHelperManagerTests: XCTestCase {
         XCTAssertFalse(SignerHelperManager.shouldAutoArm(helperEnabled: false, pinPresent: false))
     }
 
+    /// First install activates a dormant sysext before the privileged flow can
+    /// provision the global pin. Keep that activation gate distinct from the
+    /// stricter arm gate so approval can advance without enabling enforcement.
+    func testSystemExtensionActivationRequiresHelperButNotPinReadiness() {
+        XCTAssertTrue(
+            SignerHelperManager.canRequestSystemExtensionActivation(helperEnabled: true)
+        )
+        XCTAssertFalse(
+            SignerHelperManager.canRequestSystemExtensionActivation(helperEnabled: false)
+        )
+        XCTAssertFalse(
+            SignerHelperManager.shouldAutoArm(helperEnabled: true, pinPresent: false)
+        )
+    }
+
     func testPinPresentRequiresRootCustodyAndValidKey() {
         let path = "/protected/castle-pinned-pubkey.bin"
         let custody = FileCustody(probe: { probePath in
