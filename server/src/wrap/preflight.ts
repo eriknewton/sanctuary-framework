@@ -121,6 +121,13 @@ export interface ProtectPreflightOps {
 export interface RunProtectPreflightInput {
   strict?: boolean;
   /**
+   * Automatic full-install retries may continue past the exact launchd
+   * safe-mode daemon for this fortress. The provisioning flow immediately
+   * re-verifies the persistent service before any arm. Explicit preflight
+   * commands and unknown/transient holders keep the fail-closed refusal.
+   */
+  allowMatchingBootDaemon?: boolean;
+  /**
    * Canonical app-sealed launcher selected by the caller. The mutating protect
    * path validates its signature and sealed runtime before passing this path;
    * this read-only preflight independently checks only canonical location and
@@ -139,6 +146,7 @@ interface ProtectPreflightContext {
   operator: OperatorContext;
   fortressPath?: string;
   sealedLauncherPath?: string;
+  allowMatchingBootDaemon: boolean;
 }
 
 interface OperatorContext {
@@ -284,6 +292,7 @@ async function buildProtectPreflightContext(
     operator,
     fortressPath: resolvePreflightFortressPath(env, operator.home),
     sealedLauncherPath: input.sealedLauncherPath,
+    allowMatchingBootDaemon: input.allowMatchingBootDaemon === true,
   };
 }
 
@@ -672,6 +681,23 @@ async function checkCastleSockHolder(
 
   const safeMode = await classifySafeModeCastleDaemon(context, lsof.holders);
   if (safeMode.safe) {
+    if (
+      context.allowMatchingBootDaemon &&
+      safeMode.source === "launchd" &&
+      safeMode.fortressMatches
+    ) {
+      return row({
+        id: "castle_sock_holder",
+        check: "castle.sock holder",
+        status: "PASS",
+        state: "matching_launchd_safe_mode_boot_daemon",
+        detail:
+          `${holderList(lsof.holders)} holds ${socketPath}; launchd confirms the ` +
+          "Castle Wall safe-mode boot daemon targets this fortress. The provisioning flow will re-verify it before arming.",
+        remedy: NO_REMEDY,
+        findings: ["F-1"],
+      });
+    }
     return row({
       id: "castle_sock_holder",
       check: "castle.sock holder",
@@ -736,7 +762,11 @@ function parseLsofHolders(raw: string, socketPath: string): LsofHolder[] {
 async function classifySafeModeCastleDaemon(
   context: ProtectPreflightContext,
   holders: LsofHolder[],
-): Promise<{ safe: true } | { safe: false; reason: string }> {
+): Promise<
+  | { safe: true; source: "launchd"; fortressMatches: boolean }
+  | { safe: true; source: "active-config"; fortressMatches: false }
+  | { safe: false; reason: string }
+> {
   const holderPids = new Set(
     holders
       .map((holder) => holder.pid)
@@ -748,7 +778,16 @@ async function classifySafeModeCastleDaemon(
   ]);
   if (launchd.code === 0) {
     const pid = parseLaunchctlPid(launchd.stdout);
-    if (pid !== undefined && holderPids.has(pid)) return { safe: true };
+    if (pid !== undefined && holderPids.has(pid)) {
+      return {
+        safe: true,
+        source: "launchd",
+        fortressMatches:
+          context.fortressPath !== undefined &&
+          parseLaunchctlFortressPath(launchd.stdout) ===
+            resolvePath(context.fortressPath),
+      };
+    }
   }
 
   for (const path of [
@@ -759,7 +798,8 @@ async function classifySafeModeCastleDaemon(
     if (!config.ok) continue;
     const active = parseActiveCastleConfig(config.text);
     if (active?.mode === "safe" && active.pid !== undefined && holderPids.has(active.pid)) {
-      return { safe: true };
+      // Active-config holders never qualify for the automatic-retry allowance.
+      return { safe: true, source: "active-config", fortressMatches: false };
     }
   }
 
@@ -770,6 +810,14 @@ async function classifySafeModeCastleDaemon(
         ? `launchd job ${CASTLE_WALL_BOOT_LABEL} is loaded but did not match the holder pid`
         : `launchd job ${CASTLE_WALL_BOOT_LABEL} was not confirmed (${formatExecFailure(launchd)})`,
   };
+}
+
+function parseLaunchctlFortressPath(raw: string): string | undefined {
+  const match =
+    /"?SANCTUARY_STORAGE_PATH"?\s*=>\s*"?([^\n"]+)"?/.exec(raw) ??
+    /"?SANCTUARY_STORAGE_PATH"?\s*=\s*"?([^\n"]+)"?/.exec(raw);
+  const value = match?.[1]?.trim().replace(/[;,]+$/, "");
+  return value?.startsWith("/") ? resolvePath(value) : undefined;
 }
 
 function parseLaunchctlPid(raw: string): number | undefined {

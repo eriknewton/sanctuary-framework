@@ -3046,6 +3046,8 @@ export async function runWrap(
     const preflight = await (deps.runProtectPreflight ?? runProtectPreflight)({
       strict: options.preflightStrict === true,
       sealedLauncherPath: options.sealedLauncher,
+      allowMatchingBootDaemon:
+        protectInstallFlow && options.preflight !== true,
     });
     const preflightCode = protectPreflightExitCode(
       preflight,
