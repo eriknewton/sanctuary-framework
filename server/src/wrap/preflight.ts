@@ -120,6 +120,13 @@ export interface ProtectPreflightOps {
 
 export interface RunProtectPreflightInput {
   strict?: boolean;
+  /**
+   * Canonical app-sealed launcher selected by the caller. The mutating protect
+   * path validates its signature and sealed runtime before passing this path;
+   * this read-only preflight independently checks only canonical location and
+   * executability so it never substitutes PATH availability for app custody.
+   */
+  sealedLauncherPath?: string;
   ops?: Partial<ProtectPreflightOps>;
 }
 
@@ -131,6 +138,7 @@ interface ProtectPreflightContext {
   cwd: string;
   operator: OperatorContext;
   fortressPath?: string;
+  sealedLauncherPath?: string;
 }
 
 interface OperatorContext {
@@ -157,6 +165,10 @@ interface ConfiguredProvider {
 const execFileAsync = promisify(nodeExecFile);
 const PREFLIGHT_FETCH_TIMEOUT_MS = 5_000;
 const NO_REMEDY = "none";
+// Must match CASTLE_WALL_SEALED_LAUNCHER in wrap/cli.ts. The CLI performs the
+// signature/runtime verification; this preflight only reports availability.
+const CASTLE_WALL_SEALED_LAUNCHER =
+  "/Applications/Sanctuary-CastleWall.app/Contents/MacOS/sanctuary";
 const HERMES_GATEWAY_LABEL = "ai.hermes.gateway";
 const HERMES_GATEWAY_PROCESS_MARKER = "hermes_cli.main gateway";
 const FULL_DISK_ACCESS_PROBE_RELPATHS = [
@@ -273,6 +285,7 @@ export async function runProtectPreflight(
     cwd: ops.cwd(),
     operator,
     fortressPath,
+    sealedLauncherPath: input.sealedLauncherPath,
   };
 
   const rows = [
@@ -876,8 +889,58 @@ async function checkFortressCustody(
 async function checkRootPathSanctuary(
   context: ProtectPreflightContext,
 ): Promise<ProtectPreflightRow> {
+  if (context.sealedLauncherPath !== undefined) {
+    if (context.sealedLauncherPath !== CASTLE_WALL_SEALED_LAUNCHER) {
+      return row({
+        id: "root_path_sanctuary",
+        check: "sanctuary entrypoint",
+        status: "FAIL",
+        state: "sealed_launcher_noncanonical",
+        detail: `The requested sealed launcher is not the canonical app path (${CASTLE_WALL_SEALED_LAUNCHER}).`,
+        remedy:
+          "Rerun the agent-guided installer so it supplies the canonical signed-app launcher.",
+        findings: ["F-2"],
+      });
+    }
+    const executable = await context.ops.access(context.sealedLauncherPath, "execute");
+    if (executable.ok) {
+      return row({
+        id: "root_path_sanctuary",
+        check: "sanctuary entrypoint",
+        status: "PASS",
+        state: "canonical_sealed_launcher",
+        detail: `The canonical app launcher is executable at ${context.sealedLauncherPath}; this install has no root PATH dependency.`,
+        remedy: NO_REMEDY,
+        findings: ["F-2"],
+      });
+    }
+    if (isAbsentCode(executable.code)) {
+      return row({
+        id: "root_path_sanctuary",
+        check: "sanctuary entrypoint",
+        status: "FAIL",
+        state: "sealed_launcher_not_executable",
+        detail: `The canonical app launcher is not executable at ${context.sealedLauncherPath}.`,
+        remedy:
+          "Reinstall the verified Sanctuary Castle Wall app, then rerun the agent-guided installer.",
+        findings: ["F-2"],
+      });
+    }
+    return row({
+      id: "root_path_sanctuary",
+      check: "sanctuary entrypoint",
+      status: "UNDETERMINED",
+      state: "sealed_launcher_probe_unknown",
+      detail: `The canonical app launcher could not be inspected: ${executable.reason}.`,
+      remedy:
+        "Verify the signed app is installed and executable, then rerun the agent-guided installer.",
+      findings: ["F-2"],
+    });
+  }
+
   const pathValue = context.env.PATH;
-  const fallback = "sudo node server/dist/cli.js protect --hermes";
+  const legacyRemedy =
+    "Run the agent-guided installer with the canonical signed-app launcher, or install the sanctuary bin into root's PATH for a source install.";
   if (pathValue === undefined || pathValue.trim() === "") {
     return row({
       id: "root_path_sanctuary",
@@ -885,7 +948,7 @@ async function checkRootPathSanctuary(
       status: "FAIL",
       state: "path_empty",
       detail: "PATH is empty in the current privilege context, so root cannot resolve the sanctuary bin.",
-      remedy: `Install the sanctuary bin into root's PATH, or use the direct fallback: ${fallback}`,
+      remedy: legacyRemedy,
       findings: ["F-2"],
     });
   }
@@ -917,7 +980,7 @@ async function checkRootPathSanctuary(
       status: "UNDETERMINED",
       state: "path_probe_unknown",
       detail: `No sanctuary bin was found, and some PATH entries could not be inspected: ${unknowns.join("; ")}.`,
-      remedy: `Resolve the PATH permissions, or use the direct fallback: ${fallback}`,
+      remedy: `Resolve the PATH permissions. ${legacyRemedy}`,
       findings: ["F-2"],
     });
   }
@@ -928,7 +991,7 @@ async function checkRootPathSanctuary(
     status: "FAIL",
     state: "not_found",
     detail: "No executable named sanctuary was found in the current privilege context's PATH.",
-    remedy: `Install the sanctuary bin into root's PATH, or use the direct fallback: ${fallback}`,
+    remedy: legacyRemedy,
     findings: ["F-2"],
   });
 }
