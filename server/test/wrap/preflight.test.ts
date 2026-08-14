@@ -259,6 +259,21 @@ describe("protect preflight", () => {
     });
   });
 
+  it("reports an unknown sealed-launcher probe conservatively", async () => {
+    const unknownCanonical = await runProtectPreflight({
+      sealedLauncherPath:
+        "/Applications/Sanctuary-CastleWall.app/Contents/MacOS/sanctuary",
+      ops: fixtureOps({
+        env: baseEnv({ PATH: "/missing" }),
+        access: async () => ({ ok: false, reason: "EIO", code: "EIO" }),
+      }),
+    });
+    expect(row(unknownCanonical, "root_path_sanctuary")).toMatchObject({
+      status: "UNDETERMINED",
+      state: "sealed_launcher_probe_unknown",
+    });
+  });
+
   it("validates and forwards the sealed launcher before the automatic preflight", async () => {
     const source = await readFile(
       fileURLToPath(new URL("../../src/wrap/cli.ts", import.meta.url)),

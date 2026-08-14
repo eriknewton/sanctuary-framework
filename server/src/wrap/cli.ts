@@ -2909,8 +2909,7 @@ export async function runWrap(
       options.writePassphraseBackup !== undefined ||
       options.devDist !== undefined ||
       (options.sealedLauncher !== undefined &&
-        options.sealedLauncher !==
-          "/Applications/Sanctuary-CastleWall.app/Contents/MacOS/sanctuary") ||
+        options.sealedLauncher !== CASTLE_WALL_SEALED_LAUNCHER) ||
       options.noOpen !== true ||
       options.dryRun === true ||
       options.preflight === true ||
