@@ -73,6 +73,7 @@ function observed(overrides: Partial<InstallProbeResult> = {}): InstallProbeResu
     bootService: "not-applicable",
     contentFilter: "not-applicable",
     enforcement: "not-applicable",
+    operatorTwin: "not-applicable",
     ...overrides,
   };
 }
@@ -84,6 +85,7 @@ function fullObserved(overrides: Partial<InstallProbeResult> = {}): InstallProbe
     persistentCliVersion: packageJson.version,
     nodePath: "/Applications/Sanctuary-CastleWall.app/Contents/MacOS/sanctuary",
     castleWallApp: "present",
+    operatorTwin: "absent",
     ...overrides,
   });
 }
@@ -471,6 +473,29 @@ describe("sanctuary install agent contract", () => {
     expect(plan.next_action?.secret_boundary).toContain("Do not paste");
   });
 
+  it("never declares the full surface complete while an operator Hermes twin is present or unknown", () => {
+    for (const operatorTwin of ["present", "unknown"] as const) {
+      const plan = buildAgentInstallPlan({
+        profile: "full",
+        harness: "hermes",
+        fortress: "/tmp/fortress",
+        platform: "darwin",
+        observed: fullObserved({
+          cooperativeWrap: "present",
+          systemExtension: "[activated enabled]",
+          bootService: "present",
+          contentFilter: "enabled",
+          enforcement: "live",
+          operatorTwin,
+        }),
+      });
+
+      expect(plan.status).toBe("blocked");
+      expect(plan.next_action).toBeNull();
+      expect(plan.notes.join(" ")).toMatch(/operator.*twin/i);
+    }
+  });
+
   it("never infers first-custody writability from the ambient session", () => {
     const plan = buildAgentInstallPlan({
       profile: "full",
@@ -804,6 +829,7 @@ describe("sanctuary install agent contract", () => {
       "--no-open",
       "--provision-agent-account",
       "--agent-guided",
+      "--preflight-strict",
       "--sealed-launcher",
       "/Applications/Sanctuary-CastleWall.app/Contents/MacOS/sanctuary",
     ]);

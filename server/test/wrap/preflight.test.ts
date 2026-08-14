@@ -9,6 +9,7 @@ import {
   protectPreflightExitCode,
   renderProtectPreflightJson,
   renderProtectPreflightReport,
+  runOperatorTwinPreflight,
   runProtectPreflight,
   type AccessKind,
   type AccessResult,
@@ -210,6 +211,20 @@ describe("protect preflight", () => {
       summary: { pass: 8, fail: 0, undetermined: 0 },
     });
     expect(renderProtectPreflightReport(report)).toContain("| PASS");
+  });
+
+  it("exposes the authoritative operator-twin row without running provider probes", async () => {
+    const fetch = vi.fn(async () => ({ status: 200 }));
+    const twin = await runOperatorTwinPreflight({
+      ops: fixtureOps({ fetch }),
+    });
+
+    expect(twin).toMatchObject({
+      id: "operator_twin_services",
+      status: "PASS",
+      state: "no_operator_gateway",
+    });
+    expect(fetch).not.toHaveBeenCalled();
   });
 
   it("accepts the canonical executable sealed launcher without a root PATH dependency", async () => {

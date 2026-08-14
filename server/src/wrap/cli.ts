@@ -2610,6 +2610,43 @@ export function renderAutoProvisionOutcomeLines(summary: AutoProvisionSummary): 
   }
 }
 
+/**
+ * Agent-guided full-profile actions are transactional from the planner's
+ * perspective: only a terminal armed outcome may exit successfully. The
+ * ordinary cooperative wrap keeps its historical exit semantics, while the
+ * exact planner-generated human action gets a machine-readable nonzero result
+ * for every skipped, aborted, rolled-back, or indeterminate provision.
+ */
+export function agentGuidedAutoProvisionExitCode(
+  summary: AutoProvisionSummary,
+  agentGuided: boolean,
+  fullProfileProvisioning: boolean,
+): 2 | undefined {
+  if (!agentGuided || !fullProfileProvisioning) return undefined;
+  if (
+    summary.ran &&
+    (summary.outcome?.kind === "armed" || summary.outcome?.kind === "armed-exclusive")
+  ) {
+    return undefined;
+  }
+  return 2;
+}
+
+function markAgentGuidedAutoProvisionExit(
+  summary: AutoProvisionSummary,
+  agentGuided: boolean,
+  fullProfileProvisioning: boolean,
+): void {
+  const code = agentGuidedAutoProvisionExitCode(
+    summary,
+    agentGuided,
+    fullProfileProvisioning,
+  );
+  if (code !== undefined && (process.exitCode === undefined || process.exitCode === 0)) {
+    process.exitCode = code;
+  }
+}
+
 function renderCosLivenessOutcome(liveness: CosLivenessOutcome | undefined): string[] {
   if (liveness === undefined) return [];
   if (liveness.kind === "cos_liveness_verified") {
@@ -4573,6 +4610,11 @@ export async function runWrap(
     );
     const autoProvisionSummary = autoProvisionRun.summary;
     renderAutoProvisionOutcome(autoProvisionSummary);
+    markAgentGuidedAutoProvisionExit(
+      autoProvisionSummary,
+      options.agentGuided === true,
+      protectInstallFlow,
+    );
     await exitAfterDeferredAutoProvisionSignal(autoProvisionRun.deferredSignal);
     bestEffortUpsertLocalAgentProtectionSubject({
       storagePath,
@@ -4831,6 +4873,11 @@ export async function runWrap(
   );
   const autoProvisionSummary = autoProvisionRun.summary;
   renderAutoProvisionOutcome(autoProvisionSummary);
+  markAgentGuidedAutoProvisionExit(
+    autoProvisionSummary,
+    options.agentGuided === true,
+    protectInstallFlow,
+  );
   await exitAfterDeferredAutoProvisionSignal(autoProvisionRun.deferredSignal);
   bestEffortUpsertLocalAgentProtectionSubject({
     storagePath,
