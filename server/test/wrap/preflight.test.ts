@@ -9,6 +9,7 @@ import {
   protectPreflightExitCode,
   renderProtectPreflightJson,
   renderProtectPreflightReport,
+  runOperatorTwinPreflight,
   runProtectPreflight,
   type AccessKind,
   type AccessResult,
@@ -212,6 +213,20 @@ describe("protect preflight", () => {
     expect(renderProtectPreflightReport(report)).toContain("| PASS");
   });
 
+  it("exposes the authoritative operator-twin row without running provider probes", async () => {
+    const fetch = vi.fn(async () => ({ status: 200 }));
+    const twin = await runOperatorTwinPreflight({
+      ops: fixtureOps({ fetch }),
+    });
+
+    expect(twin).toMatchObject({
+      id: "operator_twin_services",
+      status: "PASS",
+      state: "no_operator_gateway",
+    });
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
   it("accepts the canonical executable sealed launcher without a root PATH dependency", async () => {
     const sealedLauncher =
       "/Applications/Sanctuary-CastleWall.app/Contents/MacOS/sanctuary";
@@ -384,6 +399,74 @@ describe("protect preflight", () => {
     expect(row(report, "operator_twin_services").remedy).toContain(
       "launchctl disable gui/501/ai.hermes.gateway",
     );
+  });
+
+  it("lets only the automatic retry accept the exact launchd boot daemon for this fortress", async () => {
+    const ops = fixtureOps({
+      env: baseEnv(),
+      entries: new Map([[CASTLE_SOCKET, present("file")]]),
+      execFile: async (cmd, args) => {
+        if (cmd.endsWith("lsof")) {
+          return execResult(
+            0,
+            `COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\nnode 42 root 5u unix 0x0 0t0 ${CASTLE_SOCKET}\n`,
+          );
+        }
+        if (cmd === "launchctl" && args.join(" ").includes("system/ai.sanctuaryprotocol.castle-wall.daemon")) {
+          return execResult(
+            0,
+            `{\n  pid = 42;\n  environment = {\n    SANCTUARY_STORAGE_PATH => ${FORTRESS}\n  }\n}\n`,
+          );
+        }
+        return execResult(1, "", "not configured");
+      },
+    });
+
+    const explicit = await runProtectPreflight({ ops });
+    expect(row(explicit, "castle_sock_holder")).toMatchObject({
+      status: "FAIL",
+      state: "launchd_safe_mode_boot_daemon",
+    });
+
+    const retry = await runProtectPreflight({
+      ops,
+      allowMatchingBootDaemon: true,
+    });
+    expect(row(retry, "castle_sock_holder")).toMatchObject({
+      status: "PASS",
+      state: "matching_launchd_safe_mode_boot_daemon",
+      remedy: "none",
+    });
+  });
+
+  it("still refuses a launchd daemon whose loaded fortress does not match", async () => {
+    const report = await runProtectPreflight({
+      allowMatchingBootDaemon: true,
+      ops: fixtureOps({
+        env: baseEnv(),
+        entries: new Map([[CASTLE_SOCKET, present("file")]]),
+        execFile: async (cmd, args) => {
+          if (cmd.endsWith("lsof")) {
+            return execResult(
+              0,
+              `COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\nnode 42 root 5u unix 0x0 0t0 ${CASTLE_SOCKET}\n`,
+            );
+          }
+          if (cmd === "launchctl" && args.join(" ").includes("system/ai.sanctuaryprotocol.castle-wall.daemon")) {
+            return execResult(
+              0,
+              "{\n  pid = 42;\n  environment = {\n    SANCTUARY_STORAGE_PATH => /Users/other/.sanctuary\n  }\n}\n",
+            );
+          }
+          return execResult(1, "", "not configured");
+        },
+      }),
+    });
+
+    expect(row(report, "castle_sock_holder")).toMatchObject({
+      status: "FAIL",
+      state: "launchd_safe_mode_boot_daemon",
+    });
   });
 
   it("sends Gemini preflight credentials in the x-goog-api-key header, not the URL", async () => {
