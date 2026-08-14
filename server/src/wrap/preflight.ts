@@ -268,25 +268,41 @@ export function createProtectPreflightOps(): ProtectPreflightOps {
   };
 }
 
-export async function runProtectPreflight(
-  input: RunProtectPreflightInput = {},
-): Promise<ProtectPreflightReport> {
+async function buildProtectPreflightContext(
+  input: RunProtectPreflightInput,
+): Promise<ProtectPreflightContext> {
   const baseOps = createProtectPreflightOps();
   const ops: ProtectPreflightOps = { ...baseOps, ...input.ops };
   const env = ops.env();
-  const platform = ops.platform();
   const operator = await resolveOperatorContext(ops, env);
-  const fortressPath = resolvePreflightFortressPath(env, operator.home);
-  const context: ProtectPreflightContext = {
+  return {
     strict: input.strict === true,
     ops,
     env,
-    platform,
+    platform: ops.platform(),
     cwd: ops.cwd(),
     operator,
-    fortressPath,
+    fortressPath: resolvePreflightFortressPath(env, operator.home),
     sealedLauncherPath: input.sealedLauncherPath,
   };
+}
+
+/**
+ * Run the authoritative operator-twin check without triggering unrelated
+ * provider/network probes. The install planner uses this same check so a
+ * later observed-state rerun cannot declare completion over an unconfined
+ * operator gateway.
+ */
+export async function runOperatorTwinPreflight(
+  input: RunProtectPreflightInput = {},
+): Promise<ProtectPreflightRow> {
+  return checkOperatorTwinServices(await buildProtectPreflightContext(input));
+}
+
+export async function runProtectPreflight(
+  input: RunProtectPreflightInput = {},
+): Promise<ProtectPreflightReport> {
+  const context = await buildProtectPreflightContext(input);
 
   const rows = [
     await checkCastleSockHolder(context),
@@ -302,7 +318,7 @@ export async function runProtectPreflight(
 
   return {
     command: "sanctuary protect preflight",
-    generated_at: ops.now().toISOString(),
+    generated_at: context.ops.now().toISOString(),
     strict: context.strict,
     summary,
     rows,

@@ -2336,15 +2336,32 @@ async function runProvisionFlowSteps(
   // create a false "functional through the wall" result.
   const operatorTwin = await ops.standDownOperatorTwin();
   if (!operatorTwin.ok) {
+    const baseReason =
+      `the operator-side agent LaunchAgent could not be stopped and disabled after the wall armed ` +
+      `(${operatorTwin.error}). Liveness was NOT checked, because the unconfined twin may still be able to answer.`;
+    let nePreferenceOutcome: DisarmNePreferenceOutcome;
+    let disarmObservedOff: Observed<true> | undefined;
+    try {
+      const disarmResult = await observeDisarmObservedOff(ops);
+      nePreferenceOutcome = disarmResult.nePreferenceOutcome;
+      disarmObservedOff = disarmResult.disarmObservedOff;
+    } catch (disarmErr) {
+      return {
+        kind: "armed-rollback-failed",
+        uid,
+        reason: baseReason,
+        disarmError: (disarmErr as Error).message,
+      };
+    }
+    const restoreNote = await restoreEgressBestEffort(ops, egressProvisionedThisRun);
     return {
-      kind: "aborted",
-      stage: "operator-twin-stand-down",
+      kind: "armed-then-rolled-back",
+      uid,
       reason:
-        `the operator-side agent LaunchAgent could not be stopped and disabled after the wall armed ` +
-        `(${operatorTwin.error}). Liveness was NOT checked, because the unconfined twin may still be able to answer.`,
-      rolledBack: false,
-      rehomeAttempted: true,
-      accountCreated,
+        `${baseReason} Fast-disarmed rather than leave enforcement active while the twin state is unresolved.` +
+        egressRestoreReasonSuffix(restoreNote),
+      disarmOutcome: nePreferenceOutcome,
+      disarmObservedOff,
     };
   }
   operatorTwinStandDown.snapshot = operatorTwin.snapshot;

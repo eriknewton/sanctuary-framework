@@ -9,7 +9,7 @@
  */
 
 import { describe, it, expect, vi } from "vitest";
-import {
+import { agentGuidedAutoProvisionExitCode,
   autoProvisionCeilingFromSummary,
   renderAutoProvisionOutcome,
   renderAutoProvisionOutcomeLines,
@@ -740,5 +740,29 @@ describe("describeNoAccountResidueTeardown (the --unprotect-egress-gate exit whe
     expect(out.line).toMatch(/FAILED part way/);
     expect(out.line).toMatch(/This run DID remove the exclusive-routing marker/);
     expect(out.line).toMatch(/mixed state/);
+  });
+});
+
+describe("agent-guided auto-provision exit code", () => {
+  function exitCode(
+    summary: unknown,
+    agentGuided = true,
+    fullProfileProvisioning = true,
+  ): 2 | undefined {
+    return agentGuidedAutoProvisionExitCode(
+      summary as AutoProvisionSummary,
+      agentGuided,
+      fullProfileProvisioning,
+    );
+  }
+
+  it("returns nonzero for every non-terminal-success agent-guided provision outcome", () => {
+    expect(exitCode({ ran: true, outcome: { kind: "armed", uid: 502, liveness: UNVERIFIED_NO_CHANNEL } })).toBeUndefined();
+    expect(exitCode({ ran: true, outcome: { kind: "armed-exclusive", uid: 502, generationId: "generation-1", liveness: UNVERIFIED_NO_CHANNEL } })).toBeUndefined();
+    expect(exitCode({ ran: true, outcome: { kind: "armed-rollback-failed", uid: 502, reason: "post-arm failure", disarmError: "disable exited 1" } })).toBe(2);
+    expect(exitCode({ ran: true, outcome: { kind: "aborted", stage: "operator-twin-stand-down", reason: "twin remained live", rolledBack: false } })).toBe(2);
+    expect(exitCode({ ran: true, outcome: { kind: "armed-then-rolled-back", uid: 502, reason: "fast-disarmed", disarmOutcome: "corroborated_off", disarmObservedOff: true } })).toBe(2);
+    expect(exitCode({ ran: true, outcome: { kind: "armed-rollback-failed", uid: 502, reason: "post-arm failure", disarmError: "disable exited 1" } }, false)).toBeUndefined();
+    expect(exitCode({ ran: false }, true, false)).toBeUndefined();
   });
 });
