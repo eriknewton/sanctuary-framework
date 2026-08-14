@@ -596,16 +596,24 @@ async function probeWrap(harness: InstallHarness): Promise<InstallObservation> {
   }
 }
 
+export function parseInstallSystemExtensionState(stdout: string): SysextState {
+  // macOS can retain an old terminated version beside its active replacement;
+  // every matching row must participate so list order never hides live enforcement.
+  const bundleId = "ai.sanctuaryprotocol.macos.castle-wall";
+  const matching = stdout
+    .split("\n")
+    .filter((line) => line.trim().split(/\s+/).includes(bundleId))
+    .join("\n");
+  return parseCastleWallState(matching);
+}
+
 async function probeSystemExtension(): Promise<SysextState | "unknown"> {
   try {
     const { stdout } = await execFileAsync("/usr/bin/systemextensionsctl", ["list"], {
       encoding: "utf8",
       timeout: 10_000,
     });
-    const matching = stdout
-      .split("\n")
-      .find((line) => line.includes("ai.sanctuaryprotocol.macos.castle-wall"));
-    return parseCastleWallState(matching ?? "");
+    return parseInstallSystemExtensionState(stdout);
   } catch {
     return "unknown";
   }
