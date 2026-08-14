@@ -401,6 +401,74 @@ describe("protect preflight", () => {
     );
   });
 
+  it("lets only the automatic retry accept the exact launchd boot daemon for this fortress", async () => {
+    const ops = fixtureOps({
+      env: baseEnv(),
+      entries: new Map([[CASTLE_SOCKET, present("file")]]),
+      execFile: async (cmd, args) => {
+        if (cmd.endsWith("lsof")) {
+          return execResult(
+            0,
+            `COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\nnode 42 root 5u unix 0x0 0t0 ${CASTLE_SOCKET}\n`,
+          );
+        }
+        if (cmd === "launchctl" && args.join(" ").includes("system/ai.sanctuaryprotocol.castle-wall.daemon")) {
+          return execResult(
+            0,
+            `{\n  pid = 42;\n  environment = {\n    SANCTUARY_STORAGE_PATH => ${FORTRESS}\n  }\n}\n`,
+          );
+        }
+        return execResult(1, "", "not configured");
+      },
+    });
+
+    const explicit = await runProtectPreflight({ ops });
+    expect(row(explicit, "castle_sock_holder")).toMatchObject({
+      status: "FAIL",
+      state: "launchd_safe_mode_boot_daemon",
+    });
+
+    const retry = await runProtectPreflight({
+      ops,
+      allowMatchingBootDaemon: true,
+    });
+    expect(row(retry, "castle_sock_holder")).toMatchObject({
+      status: "PASS",
+      state: "matching_launchd_safe_mode_boot_daemon",
+      remedy: "none",
+    });
+  });
+
+  it("still refuses a launchd daemon whose loaded fortress does not match", async () => {
+    const report = await runProtectPreflight({
+      allowMatchingBootDaemon: true,
+      ops: fixtureOps({
+        env: baseEnv(),
+        entries: new Map([[CASTLE_SOCKET, present("file")]]),
+        execFile: async (cmd, args) => {
+          if (cmd.endsWith("lsof")) {
+            return execResult(
+              0,
+              `COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\nnode 42 root 5u unix 0x0 0t0 ${CASTLE_SOCKET}\n`,
+            );
+          }
+          if (cmd === "launchctl" && args.join(" ").includes("system/ai.sanctuaryprotocol.castle-wall.daemon")) {
+            return execResult(
+              0,
+              "{\n  pid = 42;\n  environment = {\n    SANCTUARY_STORAGE_PATH => /Users/other/.sanctuary\n  }\n}\n",
+            );
+          }
+          return execResult(1, "", "not configured");
+        },
+      }),
+    });
+
+    expect(row(report, "castle_sock_holder")).toMatchObject({
+      status: "FAIL",
+      state: "launchd_safe_mode_boot_daemon",
+    });
+  });
+
   it("sends Gemini preflight credentials in the x-goog-api-key header, not the URL", async () => {
     const requests: Array<{ url: string; request: ProviderHttpRequest }> = [];
     const report = await runProtectPreflight({
