@@ -19,6 +19,9 @@ import { FilesystemStorage } from "../../src/storage/filesystem.js";
 const FIXTURE_ROOT = fileURLToPath(
   new URL("../../src/sdw/__fixtures__/claude-code-memory/", import.meta.url),
 );
+const CODEX_FIXTURE_ROOT = fileURLToPath(
+  new URL("../../src/sdw/__fixtures__/codex-memory/", import.meta.url),
+);
 const MASTER_KEY = new Uint8Array(32).fill(13);
 const NOW = "2026-08-07T18:00:00.000Z";
 
@@ -109,7 +112,7 @@ function parse(result: { content: Array<{ type: "text"; text: string }> }): Reco
 }
 
 describe("SDW memory file tools", () => {
-  it("registers manual Claude Code transcode tools as write tools with honest non-sync descriptions", async () => {
+  it("registers manual harness transcode tools as write tools with honest non-sync descriptions", async () => {
     const { tools } = await makeTools();
     expect([...tools.keys()].sort()).toEqual(["memory_emit", "memory_ingest"]);
     for (const tool of tools.values()) {
@@ -121,6 +124,13 @@ describe("SDW memory file tools", () => {
     expect(tools.get("memory_ingest")!.description).toContain("skipped_file_count");
     expect(tools.get("memory_emit")!.description).toContain("Existing memory files are never overwritten");
     expect(tools.get("memory_emit")!.description).not.toContain("empty operator-named directory");
+    for (const tool of tools.values()) {
+      const schema = tool.inputSchema as {
+        properties: { harness: { enum?: string[] } };
+      };
+      const harness = schema.properties.harness;
+      expect(harness.enum).toEqual(["claude-code", "codex"]);
+    }
   });
 
   it("approval projection carries command metadata AND whose memory moves, never memory file bytes", () => {
@@ -422,11 +432,48 @@ describe("SDW memory file tools", () => {
       .toMatchObject({ index_present: true });
   });
 
+  it("routes Codex ingest and emit through the exact three-file adapter", async () => {
+    const { tools, auditCalls } = await makeTools();
+    const output = await tempDir("codex-memory-tool-output");
+
+    const ingested = parse(
+      await tools.get("memory_ingest")!.handler({
+        harness: "codex",
+        dir: join(CODEX_FIXTURE_ROOT, "unicode"),
+      }),
+    );
+    expect(ingested).toMatchObject({
+      ingested: true,
+      harness: "codex",
+      complete: true,
+      source_file_count: 3,
+      file_count: 3,
+      skipped_file_count: 0,
+    });
+
+    const emitted = parse(
+      await tools.get("memory_emit")!.handler({ harness: "codex", dir: output }),
+    );
+    expect(emitted).toMatchObject({
+      emitted: true,
+      harness: "codex",
+      file_count: 3,
+      index_present: true,
+    });
+    expect((await (await import("node:fs/promises")).readdir(output)).sort()).toEqual([
+      "MEMORY.md",
+      "memory_summary.md",
+      "raw_memories.md",
+    ]);
+    expect(auditCalls.find((call) => call.operation === "memory_ingest")!.details)
+      .toMatchObject({ harness: "codex", committed_file_count: 3, complete: true });
+  });
+
   it("denies unsupported harness values without touching the adapter", async () => {
     const { tools, auditCalls } = await makeTools();
     const denied = parse(
       await tools.get("memory_ingest")!.handler({
-        harness: "codex",
+        harness: "hermes",
         dir: join(FIXTURE_ROOT, "basic"),
       }),
     );
