@@ -114,7 +114,12 @@ function parse(result: { content: Array<{ type: "text"; text: string }> }): Reco
 describe("SDW memory file tools", () => {
   it("registers manual harness transcode tools as write tools with honest non-sync descriptions", async () => {
     const { tools } = await makeTools();
-    expect([...tools.keys()].sort()).toEqual(["memory_emit", "memory_ingest"]);
+    expect([...tools.keys()].sort()).toEqual([
+      "memory_emit",
+      "memory_ingest",
+      "memory_transcode",
+      "memory_transcode_restore",
+    ]);
     for (const tool of tools.values()) {
       expect(tool.tool_class).toBe("write");
       expect(tool.description.toLowerCase()).toContain("does not sync");
@@ -124,7 +129,8 @@ describe("SDW memory file tools", () => {
     expect(tools.get("memory_ingest")!.description).toContain("skipped_file_count");
     expect(tools.get("memory_emit")!.description).toContain("Existing memory files are never overwritten");
     expect(tools.get("memory_emit")!.description).not.toContain("empty operator-named directory");
-    for (const tool of tools.values()) {
+    for (const name of ["memory_ingest", "memory_emit"]) {
+      const tool = tools.get(name)!;
       const schema = tool.inputSchema as {
         properties: { harness: { enum?: string[] } };
       };
@@ -146,11 +152,21 @@ describe("SDW memory file tools", () => {
     // owner scope and which calling agent it is for.
     expect(
       memoryFileApprovalArgs(
-        { harness: "claude-code", dir: "/tmp/out", text: "body" },
+        {
+          from_harness: "claude-code",
+          to_harness: "codex",
+          mode: "reversible",
+          archive_id: "opaque-id",
+          dir: "/tmp/out",
+          text: "body",
+        },
         { ownerRef: "fleet-self", agentId: "agent-beta" },
       ),
     ).toEqual({
-      harness: "claude-code",
+      from_harness: "claude-code",
+      to_harness: "codex",
+      mode: "reversible",
+      archive_id: "opaque-id",
       dir: "/tmp/out",
       owner_ref: "fleet-self",
       agent_id: "agent-beta",
@@ -174,6 +190,80 @@ describe("SDW memory file tools", () => {
         agent_id: "agent-alpha",
       });
     }
+    expect(tools.get("memory_transcode")!.approvalTargetArgs!({
+      from_harness: "claude-code",
+      to_harness: "codex",
+      mode: "reversible",
+      dir: "/tmp/out",
+      text: "must not escape",
+    })).toEqual({
+      from_harness: "claude-code",
+      to_harness: "codex",
+      mode: "reversible",
+      dir: "/tmp/out",
+      owner_ref: "fleet-self",
+      agent_id: "agent-alpha",
+    });
+    expect(tools.get("memory_transcode_restore")!.approvalTargetArgs!({
+      archive_id: "opaque-id",
+      dir: "/tmp/restore",
+      text: "must not escape",
+    })).toEqual({
+      archive_id: "opaque-id",
+      dir: "/tmp/restore",
+      owner_ref: "fleet-self",
+      agent_id: "agent-alpha",
+    });
+  });
+
+  it("transcodes and exactly restores through Tier-1 handlers without returning memory bodies", async () => {
+    const { tools, auditCalls } = await makeTools();
+    const projection = join(await tempDir("memory-transcode-tool-projection-parent"), "codex");
+    const restored = join(await tempDir("memory-transcode-tool-restore-parent"), "claude");
+    expect(
+      parse(await tools.get("memory_ingest")!.handler({
+        harness: "claude-code",
+        dir: join(FIXTURE_ROOT, "unicode"),
+      })).complete,
+    ).toBe(true);
+
+    const transcoded = parse(await tools.get("memory_transcode")!.handler({
+      from_harness: "claude-code",
+      to_harness: "codex",
+      mode: "reversible",
+      dir: projection,
+    }));
+    expect(transcoded).toMatchObject({
+      transcoded: true,
+      from_harness: "claude-code",
+      to_harness: "codex",
+      mode: "reversible",
+      source_file_count: 2,
+      projection_file_count: 3,
+    });
+    expect(JSON.stringify(transcoded)).not.toContain("café");
+
+    const restoredResult = parse(await tools.get("memory_transcode_restore")!.handler({
+      archive_id: transcoded.archive_id,
+      dir: restored,
+    }));
+    expect(restoredResult).toMatchObject({
+      restored: true,
+      source_harness: "claude-code",
+      source_file_count: 2,
+    });
+    expect(await readFile(join(restored, "MEMORY.md"))).toEqual(
+      await readFile(join(FIXTURE_ROOT, "unicode", "MEMORY.md")),
+    );
+    expect(auditCalls.map((call) => call.operation)).toEqual([
+      "memory_ingest_started",
+      "memory_ingest",
+      "memory_transcode_started",
+      "memory_transcode",
+      "memory_transcode_restore_started",
+      "memory_transcode_restore",
+    ]);
+    expect(JSON.stringify(auditCalls)).not.toContain("café");
   });
 
   it("ingests and emits Claude Code files through the MCP handlers without returning bodies in ingest output", async () => {
@@ -488,7 +578,7 @@ describe("SDW memory file tools", () => {
     ]);
   });
 
-  it("refuses a second distinct wrapped-agent identity on both transcode handlers", async () => {
+  it("refuses a second distinct wrapped-agent identity on every memory-file handler", async () => {
     let current: string | undefined = "agent-alpha";
     const { tools, auditCalls } = await makeTools({ ownerIdentity: () => current });
     const output = await tempDir("cc-memory-isolation-output");
@@ -513,9 +603,21 @@ describe("SDW memory file tools", () => {
       }),
     );
     expect(refusedIngest.denied).toBe(true);
+    const refusedTranscode = parse(await tools.get("memory_transcode")!.handler({
+      from_harness: "claude-code",
+      to_harness: "codex",
+      mode: "reversible",
+      dir: output,
+    }));
+    expect(refusedTranscode.denied).toBe(true);
+    const refusedRestore = parse(await tools.get("memory_transcode_restore")!.handler({
+      archive_id: "a".repeat(32),
+      dir: output,
+    }));
+    expect(refusedRestore.denied).toBe(true);
     expect(
       auditCalls.filter((call) => call.details.denial_class === "owner_scope_conflict"),
-    ).toHaveLength(2);
+    ).toHaveLength(4);
 
     // Fail closed means nothing was materialized for the second agent.
     const { readdir } = await import("node:fs/promises");

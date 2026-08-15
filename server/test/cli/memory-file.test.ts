@@ -23,6 +23,8 @@ import {
   PASSPHRASE_ARGV_WARNING,
   runMemoryEmitCommand,
   runMemoryIngestCommand,
+  runMemoryTranscodeCommand,
+  runMemoryTranscodeRestoreCommand,
 } from "../../src/cli/memory-file.js";
 import { resolveCliMasterKey } from "../../src/core/master-custody.js";
 import { AuditLog } from "../../src/operational/audit-log.js";
@@ -70,12 +72,17 @@ describe("memory file CLI: argument parsing", () => {
   });
 
   it("--help prints usage and exits 0 without touching a fortress", async () => {
-    for (const run of [runMemoryIngestCommand, runMemoryEmitCommand]) {
+    for (const run of [
+      runMemoryIngestCommand,
+      runMemoryEmitCommand,
+      runMemoryTranscodeCommand,
+      runMemoryTranscodeRestoreCommand,
+    ]) {
       const out = makeSink();
       const err = makeSink();
       const code = await run({ argv: ["--help"], out: out.stream, err: err.stream, env: {} });
       expect(code).toBe(0);
-      expect(out.text()).toContain("claude-code|codex");
+      expect(out.text()).toContain("Usage: sanctuary memory_");
       expect(err.text()).toBe("");
     }
   });
@@ -109,6 +116,23 @@ describe("memory file CLI: argument parsing", () => {
     });
     expect(code).toBe(2);
     expect(err.text()).toContain("--dir is required");
+  });
+
+  it("requires distinct harnesses and the exact reversible mode", async () => {
+    const out = makeSink();
+    const err = makeSink();
+    expect(await runMemoryTranscodeCommand({
+      argv: [
+        "--from-harness", "codex",
+        "--to-harness", "codex",
+        "--mode", "lossy",
+        "--dir", "/operator/not-opened",
+      ],
+      out: out.stream,
+      err: err.stream,
+      env: {},
+    })).toBe(2);
+    expect(err.text()).toContain("must name different values");
   });
 });
 
@@ -309,6 +333,68 @@ describe("memory file CLI: fortress-backed round trip", () => {
         await readFile(join(memories, filename)),
       );
     }
+  }, 60_000);
+
+  it("manually transcodes and restores exact source files with ordered audit receipts", async () => {
+    const source = await copyFixtureSet("unicode", "memfile-cli-transcode-source");
+    const projection = await tempDir("memfile-cli-transcode-projection");
+    const restored = await tempDir("memfile-cli-transcode-restored");
+    expect(await runMemoryIngestCommand({
+      argv: ["--harness", "claude-code", "--dir", source, "--fortress", fortress],
+      out: makeSink().stream,
+      err: makeSink().stream,
+      env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
+    })).toBe(0);
+
+    const transcodeOut = makeSink();
+    const transcodeErr = makeSink();
+    expect(await runMemoryTranscodeCommand({
+      argv: [
+        "--from-harness", "claude-code",
+        "--to-harness", "codex",
+        "--mode", "reversible",
+        "--dir", projection,
+        "--fortress", fortress,
+      ],
+      out: transcodeOut.stream,
+      err: transcodeErr.stream,
+      env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
+    })).toBe(0);
+    expect(transcodeErr.text()).toBe("");
+    const archiveId = /archive_id ([a-f0-9]+)/.exec(transcodeOut.text())?.[1];
+    expect(archiveId).toMatch(/^[a-f0-9]+$/);
+    expect((await readdir(projection)).sort()).toEqual([
+      "MEMORY.md",
+      "memory_summary.md",
+      "raw_memories.md",
+    ]);
+
+    const restoreOut = makeSink();
+    const restoreErr = makeSink();
+    expect(await runMemoryTranscodeRestoreCommand({
+      argv: [
+        "--archive-id", archiveId!,
+        "--dir", restored,
+        "--fortress", fortress,
+      ],
+      out: restoreOut.stream,
+      err: restoreErr.stream,
+      env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
+    })).toBe(0);
+    expect(restoreErr.text()).toBe("");
+    expect(restoreOut.text()).toContain("restored 2 exact Claude Code source files");
+    for (const filename of await readdir(source)) {
+      expect(await readFile(join(restored, filename))).toEqual(await readFile(join(source, filename)));
+    }
+
+    expect((await auditOperations()).filter((operation) =>
+      operation.startsWith("memory_transcode")
+    )).toEqual([
+      "memory_transcode_started",
+      "memory_transcode",
+      "memory_transcode_restore_started",
+      "memory_transcode_restore",
+    ]);
   }, 60_000);
 
   it("accepts the passphrase on stdin instead of argv", async () => {

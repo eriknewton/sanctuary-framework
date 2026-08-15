@@ -36,6 +36,8 @@ export const TOP_LEVEL_SUBCOMMANDS = [
   "liveness-probe",
   "memory_emit",
   "memory_ingest",
+  "memory_transcode",
+  "memory_transcode_restore",
   "nodes",
   "plugin",
   "policy",
