@@ -72,7 +72,10 @@ import { toBase64url, stringToBytes } from "../../src/core/encoding.js";
 import { SIGNATURE_SCHEME_V1 } from "../../src/mesh/constants.js";
 import { defaultConfig } from "../../src/config.js";
 import type { SignedSHR } from "../../src/shr/types.js";
-import { ToolCallTrapRuntime } from "../../src/honeypot/tool-call-trap-runtime.js";
+import {
+  FOLLOW_UP_WINDOW_MS,
+  ToolCallTrapRuntime,
+} from "../../src/honeypot/tool-call-trap-runtime.js";
 import { TrapRegistry } from "../../src/honeypot/trap-registry.js";
 import type { TrapSpec } from "../../src/honeypot/types.js";
 import {
@@ -2334,6 +2337,77 @@ describe("5. honeypot coalescing windows: capped, evicts oldest, never durably g
       compiled_at: new Date().toISOString(),
     };
   }
+
+  it("keeps one durable finding across a wall-clock bucket boundary while the rolling window remains live", async () => {
+    const storage = new MemoryStorage();
+    const masterKey = generateRandomKey();
+    const auditLog = new AuditLog(storage, masterKey);
+    const findingStore = new SentinelFindingStore({
+      storage,
+      masterKey,
+      fortressId: FORTRESS,
+    });
+    const registry = new TrapRegistry();
+    registry.deploy(mkToolSpec());
+
+    let nowMs = FOLLOW_UP_WINDOW_MS - 2;
+    const makeRuntime = () =>
+      new ToolCallTrapRuntime({
+        registry,
+        findingStore,
+        auditLog,
+        operatorId: OPERATOR,
+        fortressId: FORTRESS,
+        now: () => new Date(nowMs),
+      });
+
+    const firstRuntime = makeRuntime();
+    await firstRuntime.invokeIfTrap(FAKE_TOOL, { probe: "before" }, "agent:boundary");
+    const firstId = firstRuntime
+      .stats()
+      .find((s) => s.trap_id === TRAP_ID)!
+      .activations.at(-1)!.finding_id;
+
+    // Model process-local cache loss, then cross the epoch-aligned bucket
+    // only three milliseconds later. The product contract is a rolling
+    // five-minute window, so the durable row must still be recovered.
+    nowMs = FOLLOW_UP_WINDOW_MS + 1;
+    const restartedRuntime = makeRuntime();
+    await restartedRuntime.invokeIfTrap(
+      FAKE_TOOL,
+      { probe: "after" },
+      "agent:boundary",
+    );
+    const secondId = restartedRuntime
+      .stats()
+      .find((s) => s.trap_id === TRAP_ID)!
+      .activations.at(-1)!.finding_id;
+
+    expect(secondId).toBe(firstId);
+    const findings = (await findingStore.listFindings({ limit: 10 })).filter(
+      (finding) => finding.details.caller_identity === "agent:boundary",
+    );
+    expect(findings).toHaveLength(1);
+    expect(findings[0]!.details.repeat_count).toBe(2);
+
+    nowMs = 2 * FOLLOW_UP_WINDOW_MS;
+    const expiredRuntime = makeRuntime();
+    await expiredRuntime.invokeIfTrap(
+      FAKE_TOOL,
+      { probe: "expired" },
+      "agent:boundary",
+    );
+    const expiredId = expiredRuntime
+      .stats()
+      .find((s) => s.trap_id === TRAP_ID)!
+      .activations.at(-1)!.finding_id;
+    expect(expiredId).not.toBe(firstId);
+    expect(
+      (await findingStore.listFindings({ limit: 10 })).filter(
+        (finding) => finding.details.caller_identity === "agent:boundary",
+      ),
+    ).toHaveLength(2);
+  });
 
   it(
     "coalesces repeat invocations by the SAME caller into one durable finding, and caps the (trap, caller) tracker itself",
