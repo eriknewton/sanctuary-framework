@@ -386,6 +386,9 @@ describe("SDW memory file tools", () => {
           cause: new Error("injected rollback verifier failure"),
         });
       },
+      putPassagesIfAbsent: async () => {
+        throw new Error("not used");
+      },
       insertPassage: async () => {
         throw new Error("not used");
       },
@@ -444,6 +447,9 @@ describe("SDW memory file tools", () => {
       screenPassage: () => ({ ok: true }),
       putPassages: async () => {
         throw lockError;
+      },
+      putPassagesIfAbsent: async () => {
+        throw new Error("not used");
       },
       insertPassage: async () => {
         throw new Error("not used");

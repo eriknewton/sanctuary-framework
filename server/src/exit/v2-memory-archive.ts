@@ -249,7 +249,7 @@ export async function importExitV2SdwMemoryArchive(
   );
   const lineagePassageId = options.adapter.derivePassageId(
     DESTINATION_LINEAGE_ID_DOMAIN,
-    validated.artifactSha256,
+    validated.payload.source_archive_lineage_ref,
   );
   const existingLineage = await options.adapter.getPassage(lineagePassageId);
   if (existingLineage !== null) {
@@ -340,7 +340,26 @@ export async function importExitV2SdwMemoryArchive(
 
   // Files, completed manifest, and signed lineage share this one atomic batch;
   // no committed archive can exist without its destination lineage record.
-  await options.adapter.putPassages([...archiveInputs, lineageInput], "user_content");
+  const inserted = await options.adapter.putPassagesIfAbsent(
+    [...archiveInputs, lineageInput],
+    "user_content",
+  );
+  if (inserted === null) {
+    // Another importer won after our fail-before prechecks. Only the exact,
+    // trusted-signer-bound lineage is an idempotent replay; any partial or
+    // different occupancy fails closed and is never overwritten.
+    const racedLineage = await options.adapter.getPassage(lineagePassageId);
+    if (racedLineage === null) {
+      throw new Error("Exit V2 SDW memory destination-local archive id is already occupied");
+    }
+    return replayReceipt(
+      racedLineage,
+      validated,
+      options.adapter.ownerRef,
+      destinationArchiveId,
+      options.signer,
+    );
+  }
   return {
     replayed: false,
     source_lineage_ref: lineageBody.source_archive_lineage_ref,
@@ -747,13 +766,22 @@ function replayReceipt(
 ): ImportExitV2SdwMemoryArchiveResult {
   const lineage = parseStoredLineage(passage);
   if (
+    lineage.body.source_archive_lineage_ref === validated.payload.source_archive_lineage_ref &&
+    lineage.body.source_artifact_sha256 !== validated.artifactSha256
+  ) {
+    throw new Error(
+      "Exit V2 SDW memory source lineage already maps to a different artifact digest",
+    );
+  }
+  if (
     lineage.body.source_archive_lineage_ref !== validated.payload.source_archive_lineage_ref ||
     lineage.body.source_artifact_sha256 !== validated.artifactSha256 ||
     lineage.body.destination_owner_ref !== destinationOwnerRef ||
     lineage.body.destination_archive_id !== destinationArchiveId ||
     lineage.body.destination_fortress_id !== signer.fortress_id ||
     lineage.body.destination_signer_identity_id !== signer.identity_id ||
-    lineage.body.destination_signer_public_key !== signer.public_key
+    lineage.body.destination_signer_public_key !== signer.public_key ||
+    lineage.body.destination_signer_did !== signer.did
   ) {
     throw new Error("Exit V2 SDW memory replay lineage does not match the imported artifact");
   }

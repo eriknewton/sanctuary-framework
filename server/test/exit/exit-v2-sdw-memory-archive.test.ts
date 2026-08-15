@@ -19,8 +19,12 @@ import {
   type ExitV2SdwMemoryManifest,
 } from "../../src/contracts/v1.2/exit-bundle-manifest.js";
 import { decrypt, encrypt } from "../../src/core/encryption.js";
-import { toBase64url } from "../../src/core/encoding.js";
-import { generateKeypair, publicKeyToDid } from "../../src/core/identity.js";
+import { fromBase64url, toBase64url } from "../../src/core/encoding.js";
+import {
+  generateKeypair,
+  legacyPublicKeyToDid,
+  publicKeyToDid,
+} from "../../src/core/identity.js";
 import {
   exportExitV2SdwMemoryArchive,
   importExitV2SdwMemoryArchive,
@@ -127,6 +131,33 @@ function sha256Hex(bytes: Uint8Array): string {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
+function synchronizeInitialPassageReads(
+  destination: SdwMemoryBackendAdapter,
+): MemoryBackendAdapter {
+  let initialReads = 0;
+  let releaseInitialReads: () => void = () => {};
+  const bothInitialReads = new Promise<void>((resolve) => {
+    releaseInitialReads = resolve;
+  });
+  return new Proxy(destination, {
+    get(target, property, receiver): unknown {
+      if (property === "getPassage") {
+        return async (passageId: string) => {
+          const observed = await target.getPassage(passageId);
+          if (initialReads < 2) {
+            initialReads++;
+            if (initialReads === 2) releaseInitialReads();
+            await bothInitialReads;
+          }
+          return observed;
+        };
+      }
+      const value = Reflect.get(target, property, receiver) as unknown;
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
+
 describe("Exit V2 SDW memory archive", () => {
   it("adds a distinct V2 contract while leaving the closed V1 contract byte-stable", async () => {
     expect(EXIT_BUNDLE_MANIFEST_VERSION).toBe("SANCTUARY_EXIT_BUNDLE_V1");
@@ -199,11 +230,11 @@ describe("Exit V2 SDW memory archive", () => {
     let putCalls = 0;
     const observingAdapter: MemoryBackendAdapter = new Proxy(destination, {
       get(target, property, receiver): unknown {
-        if (property === "putPassages") {
+        if (property === "putPassagesIfAbsent") {
           return async (inputs: readonly MemoryPassageInput[], taint: "user_content") => {
             putCalls++;
             capturedInputs = inputs;
-            return target.putPassages(inputs, taint);
+            return target.putPassagesIfAbsent(inputs, taint);
           };
         }
         const value = Reflect.get(target, property, receiver) as unknown;
@@ -301,7 +332,7 @@ describe("Exit V2 SDW memory archive", () => {
     let putCalls = 0;
     const failingAdapter: MemoryBackendAdapter = new Proxy(destination, {
       get(target, property, receiver): unknown {
-        if (property === "putPassages") {
+        if (property === "putPassagesIfAbsent") {
           return async (inputs: readonly MemoryPassageInput[]) => {
             putCalls++;
             expect(inputs).toHaveLength(5);
@@ -439,6 +470,187 @@ describe("Exit V2 SDW memory archive", () => {
       signer,
     })).rejects.toThrow("source lineage already maps to a different artifact digest");
     expect(await destination.countPassages()).toBe(afterFirst);
+  });
+
+  it("binds exact replay lineage to the supplied destination signer identity", async () => {
+    const source = await makeSourceArchive();
+    const exported = await exportArchive(source);
+    const alternateDestination = await makeAdapter({
+      prefix: "exit-v2-alternate-signer-replay",
+      ownerRef: "owner-a",
+      masterByte: 81,
+      fortressId: "fortress-destination",
+    });
+    const alternateSigner = makeSigner("fortress-destination");
+    await importExitV2SdwMemoryArchive({
+      adapter: alternateDestination,
+      manifest: exported.manifest,
+      artifactBytes: exported.artifact_bytes,
+      transferKey: exported.transfer_key.slice(),
+      signer: alternateSigner,
+      now: () => NOW,
+    });
+    const afterAlternateImport = await alternateDestination.countPassages();
+    await expect(importExitV2SdwMemoryArchive({
+      adapter: alternateDestination,
+      manifest: exported.manifest,
+      artifactBytes: exported.artifact_bytes,
+      transferKey: exported.transfer_key.slice(),
+      signer: makeSigner("fortress-destination"),
+    })).rejects.toThrow("replay lineage does not match the imported artifact");
+    expect(await alternateDestination.countPassages()).toBe(afterAlternateImport);
+
+    const didDestination = await makeAdapter({
+      prefix: "exit-v2-did-binding-replay",
+      ownerRef: "owner-a",
+      masterByte: 82,
+      fortressId: "fortress-destination",
+    });
+    const canonicalDidSigner = makeSigner("fortress-destination");
+    const legacyDidSigner: ExitV2MemorySigner = {
+      ...canonicalDidSigner,
+      did: legacyPublicKeyToDid(fromBase64url(canonicalDidSigner.public_key)),
+    };
+    await importExitV2SdwMemoryArchive({
+      adapter: didDestination,
+      manifest: exported.manifest,
+      artifactBytes: exported.artifact_bytes,
+      transferKey: exported.transfer_key.slice(),
+      signer: legacyDidSigner,
+      now: () => NOW,
+    });
+    const afterLegacyDidImport = await didDestination.countPassages();
+    await expect(importExitV2SdwMemoryArchive({
+      adapter: didDestination,
+      manifest: exported.manifest,
+      artifactBytes: exported.artifact_bytes,
+      transferKey: exported.transfer_key.slice(),
+      signer: canonicalDidSigner,
+    })).rejects.toThrow("replay lineage does not match the imported artifact");
+    expect(await didDestination.countPassages()).toBe(afterLegacyDidImport);
+  });
+
+  it("linearizes concurrent exact-digest imports instead of replacing lineage", async () => {
+    const source = await makeSourceArchive();
+    const exported = await exportArchive(source);
+    const destination = await makeAdapter({
+      prefix: "exit-v2-concurrent-replay",
+      ownerRef: "owner-a",
+      masterByte: 83,
+      fortressId: "fortress-destination",
+    });
+    const signer = makeSigner("fortress-destination");
+    const racingAdapter = synchronizeInitialPassageReads(destination);
+
+    const receipts = await Promise.all([
+      importExitV2SdwMemoryArchive({
+        adapter: racingAdapter,
+        manifest: exported.manifest,
+        artifactBytes: exported.artifact_bytes,
+        transferKey: exported.transfer_key.slice(),
+        signer,
+        now: () => "2026-08-15T06:31:00.000Z",
+      }),
+      importExitV2SdwMemoryArchive({
+        adapter: racingAdapter,
+        manifest: exported.manifest,
+        artifactBytes: exported.artifact_bytes,
+        transferKey: exported.transfer_key.slice(),
+        signer,
+        now: () => "2026-08-15T06:32:00.000Z",
+      }),
+    ]);
+    expect(receipts.map((receipt) => receipt.replayed).sort()).toEqual([false, true]);
+    expect(receipts[0]?.destination_archive_id).toBe(receipts[1]?.destination_archive_id);
+    expect(await destination.countPassages()).toBe(5);
+  });
+
+  it("rejects a concurrent alternate signer instead of replacing the winning lineage", async () => {
+    const source = await makeSourceArchive();
+    const exported = await exportArchive(source);
+    const destination = await makeAdapter({
+      prefix: "exit-v2-concurrent-alternate-signer",
+      ownerRef: "owner-a",
+      masterByte: 84,
+      fortressId: "fortress-destination",
+    });
+    const racingAdapter = synchronizeInitialPassageReads(destination);
+    const results = await Promise.allSettled([
+      importExitV2SdwMemoryArchive({
+        adapter: racingAdapter,
+        manifest: exported.manifest,
+        artifactBytes: exported.artifact_bytes,
+        transferKey: exported.transfer_key.slice(),
+        signer: makeSigner("fortress-destination"),
+        now: () => "2026-08-15T06:33:00.000Z",
+      }),
+      importExitV2SdwMemoryArchive({
+        adapter: racingAdapter,
+        manifest: exported.manifest,
+        artifactBytes: exported.artifact_bytes,
+        transferKey: exported.transfer_key.slice(),
+        signer: makeSigner("fortress-destination"),
+        now: () => "2026-08-15T06:34:00.000Z",
+      }),
+    ]);
+    const fulfilled = results.filter((result) => result.status === "fulfilled");
+    const rejected = results.filter((result) => result.status === "rejected");
+    expect(fulfilled).toHaveLength(1);
+    expect(fulfilled[0]).toMatchObject({ value: { replayed: false } });
+    expect(rejected).toHaveLength(1);
+    expect(rejected[0]).toMatchObject({
+      reason: expect.objectContaining({
+        message: "Exit V2 SDW memory replay lineage does not match the imported artifact",
+      }),
+    });
+    expect(await destination.countPassages()).toBe(5);
+  });
+
+  it("linearizes concurrent conflicting artifacts through one source-lineage slot", async () => {
+    const source = await makeSourceArchive();
+    const firstExport = await exportArchive(source);
+    const conflictingExport = await exportArchive(source);
+    expect(conflictingExport.source_lineage_ref).toBe(firstExport.source_lineage_ref);
+    expect(conflictingExport.artifact_sha256).not.toBe(firstExport.artifact_sha256);
+    const destination = await makeAdapter({
+      prefix: "exit-v2-concurrent-conflicting-artifact",
+      ownerRef: "owner-a",
+      masterByte: 85,
+      fortressId: "fortress-destination",
+    });
+    const racingAdapter = synchronizeInitialPassageReads(destination);
+    const signer = makeSigner("fortress-destination");
+    const results = await Promise.allSettled([
+      importExitV2SdwMemoryArchive({
+        adapter: racingAdapter,
+        manifest: firstExport.manifest,
+        artifactBytes: firstExport.artifact_bytes,
+        transferKey: firstExport.transfer_key.slice(),
+        signer,
+        now: () => "2026-08-15T06:35:00.000Z",
+      }),
+      importExitV2SdwMemoryArchive({
+        adapter: racingAdapter,
+        manifest: conflictingExport.manifest,
+        artifactBytes: conflictingExport.artifact_bytes,
+        transferKey: conflictingExport.transfer_key.slice(),
+        signer,
+        now: () => "2026-08-15T06:36:00.000Z",
+      }),
+    ]);
+    const fulfilled = results.filter((result) => result.status === "fulfilled");
+    const rejected = results.filter((result) => result.status === "rejected");
+    expect(fulfilled).toHaveLength(1);
+    expect(fulfilled[0]).toMatchObject({ value: { replayed: false } });
+    expect(rejected).toHaveLength(1);
+    expect(rejected[0]).toMatchObject({
+      reason: expect.objectContaining({
+        message:
+          "Exit V2 SDW memory source lineage already maps to a different artifact digest",
+      }),
+    });
+    // Only the winning artifact's three files, manifest, and shared lineage land.
+    expect(await destination.countPassages()).toBe(5);
   });
 
   it("keeps source and destination owner scopes isolated", async () => {
