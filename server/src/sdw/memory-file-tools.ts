@@ -59,6 +59,32 @@ const SUPPORTED_HARNESSES: readonly SupportedMemoryHarness[] = [
   CODEX_MEMORY_HARNESS,
 ];
 
+/**
+ * Sole source for the two Rung-1 memory-file claim surfaces.
+ *
+ * The structure guard imports these exact production strings. Keep the bounds
+ * explicit: only the vault copy is encrypted, harness files are plaintext,
+ * and a configured model vendor can read memory supplied at inference.
+ */
+export const RUNG1_MEMORY_TOOL_DESCRIPTIONS = {
+  memory_ingest:
+    "Manually mirror a Claude Code or Codex memory directory into the SDW vault. It " +
+    "reads plaintext source files and leaves them untouched; the encrypted " +
+    "copy lives in the vault. Files the secret classifier refuses are " +
+    "skipped and named in the result, so check skipped_file_count before " +
+    "treating the mirror as complete. This does not sync, watch, or replace " +
+    "the harness write path, and memory later sent to a model vendor is " +
+    "exposed to that vendor at inference.",
+  memory_emit:
+    "Manually emit Claude Code or Codex memory files from the SDW vault into an " +
+    "operator-named output directory. Existing memory files are never " +
+    "overwritten. The result reports index_present; false means the emitted " +
+    "tree cannot be re-ingested as that harness's memory directory. Emitted " +
+    "files are plaintext for the harness; " +
+    "this does not sync or write back to the source memory directory, and " +
+    "memory later sent to a model vendor is exposed to that vendor at inference.",
+} as const;
+
 export interface MemoryFileApprovalContext {
   /** The SDW owner scope whose memory this call reads or writes. */
   readonly ownerRef: string;
@@ -172,14 +198,7 @@ export function createSdwMemoryFileTools(options: SdwMemoryFileToolsOptions): To
 
   const memoryIngest: ToolDefinition = {
     name: "memory_ingest",
-    description:
-      "Manually mirror a Claude Code or Codex memory directory into the SDW vault. It " +
-      "reads plaintext source files and leaves them untouched; the encrypted " +
-      "copy lives in the vault. Files the secret classifier refuses are " +
-      "skipped and named in the result, so check skipped_file_count before " +
-      "treating the mirror as complete. This does not sync, watch, or replace " +
-      "the harness write path, and memory later sent to a model vendor is " +
-      "exposed to that vendor at inference.",
+    description: RUNG1_MEMORY_TOOL_DESCRIPTIONS.memory_ingest,
     tool_class: "write",
     approvalTargetArgs: approvalArgs,
     inputSchema: {
@@ -280,14 +299,7 @@ export function createSdwMemoryFileTools(options: SdwMemoryFileToolsOptions): To
 
   const memoryEmit: ToolDefinition = {
     name: "memory_emit",
-    description:
-      "Manually emit Claude Code or Codex memory files from the SDW vault into an " +
-      "operator-named output directory. Existing memory files are never " +
-      "overwritten. The result reports index_present; false means the emitted " +
-      "tree cannot be re-ingested as that harness's memory directory. Emitted " +
-      "files are plaintext for the harness; " +
-      "this does not sync or write back to the source memory directory, and " +
-      "memory later sent to a model vendor is exposed to that vendor at inference.",
+    description: RUNG1_MEMORY_TOOL_DESCRIPTIONS.memory_emit,
     tool_class: "write",
     approvalTargetArgs: approvalArgs,
     inputSchema: {
