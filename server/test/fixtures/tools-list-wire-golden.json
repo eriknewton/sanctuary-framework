@@ -1,5 +1,5 @@
 {
-  "tool_count": 99,
+  "tool_count": 101,
   "tools": [
     {
       "name": "identity_create",
@@ -1878,6 +1878,68 @@
         },
         "required": [
           "harness",
+          "dir"
+        ]
+      }
+    },
+    {
+      "name": "memory_transcode",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "from_harness": {
+            "type": "string",
+            "enum": [
+              "claude-code",
+              "codex"
+            ],
+            "description": "Harness format already mirrored into this owner-scoped vault"
+          },
+          "to_harness": {
+            "type": "string",
+            "enum": [
+              "claude-code",
+              "codex"
+            ],
+            "description": "Different harness format to project as plaintext"
+          },
+          "dir": {
+            "type": "string",
+            "description": "Empty output directory; existing files are never overwritten"
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "reversible"
+            ],
+            "description": "Frozen reversible archive plus native plaintext projection"
+          }
+        },
+        "required": [
+          "from_harness",
+          "to_harness",
+          "dir",
+          "mode"
+        ]
+      }
+    },
+    {
+      "name": "memory_transcode_restore",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "archive_id": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{32}$",
+            "description": "Opaque archive_id returned by memory_transcode"
+          },
+          "dir": {
+            "type": "string",
+            "description": "Empty output directory; existing files are never overwritten"
+          }
+        },
+        "required": [
+          "archive_id",
           "dir"
         ]
       }

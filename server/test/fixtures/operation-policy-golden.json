@@ -22,6 +22,8 @@
     "memory_emit",
     "memory_ingest",
     "memory_insert",
+    "memory_transcode",
+    "memory_transcode_restore",
     "operator_cloud_provision",
     "policy_change",
     "principal_baseline_view",

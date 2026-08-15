@@ -29,6 +29,11 @@ import {
   createMultiAgentIsolationGuard,
   type MultiAgentIsolationGuard,
 } from "./memory-isolation.js";
+import {
+  MEMORY_TRANSCODE_MODE,
+  restoreMemoryTranscodeArchive,
+  transcodeMemoryDirectory,
+} from "./memory-transcode.js";
 
 export interface SdwMemoryFileToolsOptions {
   /** The shipped sovereign passage backend, already scoped to one owner_ref. */
@@ -60,7 +65,7 @@ const SUPPORTED_HARNESSES: readonly SupportedMemoryHarness[] = [
 ];
 
 /**
- * Sole source for the two Rung-1 memory-file claim surfaces.
+ * Sole source for the Rung-1 memory-file claim surfaces.
  *
  * The structure guard imports these exact production strings. Keep the bounds
  * explicit: only the vault copy is encrypted, harness files are plaintext,
@@ -83,6 +88,20 @@ export const RUNG1_MEMORY_TOOL_DESCRIPTIONS = {
     "files are plaintext for the harness; " +
     "this does not sync or write back to the source memory directory, and " +
     "memory later sent to a model vendor is exposed to that vendor at inference.",
+  memory_transcode:
+    "Manually project one already-mirrored Claude Code or Codex memory snapshot " +
+    "from the encrypted SDW vault into the other harness format. The output is " +
+    "plaintext and may be structurally lossy; exact source recovery uses the " +
+    "versioned encrypted archive returned as archive_id, not the projection. " +
+    "Existing output files are never overwritten. This does not sync, watch, or " +
+    "replace either harness write path, and memory later sent to a model vendor " +
+    "is exposed to that vendor at inference.",
+  memory_transcode_restore:
+    "Manually restore the exact source files from a completed encrypted Sanctuary " +
+    "memory transcode archive into an empty operator-named directory. Restored " +
+    "files are plaintext and existing files are never overwritten. This does not " +
+    "sync, watch, or write back to a live harness directory, and memory later sent " +
+    "to a model vendor is exposed to that vendor at inference.",
 } as const;
 
 export interface MemoryFileApprovalContext {
@@ -104,6 +123,10 @@ export function memoryFileApprovalArgs(
 ): Record<string, unknown> {
   const projected: Record<string, unknown> = {};
   if (typeof args.harness === "string") projected.harness = args.harness;
+  if (typeof args.from_harness === "string") projected.from_harness = args.from_harness;
+  if (typeof args.to_harness === "string") projected.to_harness = args.to_harness;
+  if (typeof args.mode === "string") projected.mode = args.mode;
+  if (typeof args.archive_id === "string") projected.archive_id = args.archive_id;
   if (typeof args.dir === "string") projected.dir = args.dir;
   if (context !== undefined) {
     projected.owner_ref = context.ownerRef;
@@ -121,6 +144,10 @@ function asSupportedHarness(value: unknown): SupportedMemoryHarness | null {
 
 function asDirectory(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
+}
+
+function asArchiveId(value: unknown): string | null {
+  return typeof value === "string" && /^[a-f0-9]{32}$/.test(value) ? value : null;
 }
 
 function denialCategory(error: unknown, fallback: string): string {
@@ -365,5 +392,173 @@ export function createSdwMemoryFileTools(options: SdwMemoryFileToolsOptions): To
     },
   };
 
-  return [memoryIngest, memoryEmit];
+  const memoryTranscode: ToolDefinition = {
+    name: "memory_transcode",
+    description: RUNG1_MEMORY_TOOL_DESCRIPTIONS.memory_transcode,
+    tool_class: "write",
+    approvalTargetArgs: approvalArgs,
+    inputSchema: {
+      type: "object",
+      properties: {
+        from_harness: {
+          type: "string",
+          enum: [...SUPPORTED_HARNESSES],
+          description: "Harness format already mirrored into this owner-scoped vault",
+        },
+        to_harness: {
+          type: "string",
+          enum: [...SUPPORTED_HARNESSES],
+          description: "Different harness format to project as plaintext",
+        },
+        dir: {
+          type: "string",
+          description: "Empty output directory; existing files are never overwritten",
+        },
+        mode: {
+          type: "string",
+          enum: [MEMORY_TRANSCODE_MODE],
+          description: "Frozen reversible archive plus native plaintext projection",
+        },
+      },
+      required: ["from_harness", "to_harness", "dir", "mode"],
+    },
+    handler: async (args) => {
+      const fromHarness = asSupportedHarness(args.from_harness);
+      const toHarness = asSupportedHarness(args.to_harness);
+      const dir = asDirectory(args.dir);
+      if (
+        fromHarness === null ||
+        toHarness === null ||
+        fromHarness === toHarness ||
+        dir === null ||
+        args.mode !== MEMORY_TRANSCODE_MODE
+      ) {
+        await auditFailure("memory_transcode_denied", { denial_class: "invalid_args" });
+        return deny("memory_transcode");
+      }
+      if (await refuseSecondIdentity("memory_transcode")) return deny("memory_transcode");
+
+      try {
+        await auditSuccess("memory_transcode_started", {
+          from_harness: fromHarness,
+          to_harness: toHarness,
+          mode: MEMORY_TRANSCODE_MODE,
+          output_dir: dir,
+          owner_ref: adapter.ownerRef,
+        });
+        const result = await transcodeMemoryDirectory(adapter, fromHarness, toHarness, dir, {
+          now,
+        });
+        try {
+          await auditSuccess("memory_transcode", {
+            archive_id: result.archive_id,
+            from_harness: result.from_harness,
+            to_harness: result.to_harness,
+            mode: result.mode,
+            output_dir: dir,
+            owner_ref: adapter.ownerRef,
+            source_file_count: result.source_file_count,
+            projection_file_count: result.projection_file_count,
+            source_set_sha256: result.source_set_sha256,
+            projection_set_sha256: result.projection_set_sha256,
+          });
+        } catch (auditError) {
+          return toolResult({
+            transcoded: true,
+            ...result,
+            audit_outcome_recorded: false,
+            operator_review_required: true,
+            audit_error_class: errorName(auditError),
+          });
+        }
+        return toolResult({ transcoded: true, ...result, audit_outcome_recorded: true });
+      } catch (error) {
+        await auditFailure("memory_transcode_denied", {
+          denial_class: denialCategory(error, "transcode_failed"),
+          error_class: errorName(error),
+          ...errorCauseDetail(error),
+          from_harness: fromHarness,
+          to_harness: toHarness,
+          mode: MEMORY_TRANSCODE_MODE,
+          output_dir: dir,
+          owner_ref: adapter.ownerRef,
+        });
+        return deny("memory_transcode");
+      }
+    },
+  };
+
+  const memoryTranscodeRestore: ToolDefinition = {
+    name: "memory_transcode_restore",
+    description: RUNG1_MEMORY_TOOL_DESCRIPTIONS.memory_transcode_restore,
+    tool_class: "write",
+    approvalTargetArgs: approvalArgs,
+    inputSchema: {
+      type: "object",
+      properties: {
+        archive_id: {
+          type: "string",
+          pattern: "^[a-f0-9]{32}$",
+          description: "Opaque archive_id returned by memory_transcode",
+        },
+        dir: {
+          type: "string",
+          description: "Empty output directory; existing files are never overwritten",
+        },
+      },
+      required: ["archive_id", "dir"],
+    },
+    handler: async (args) => {
+      const archiveId = asArchiveId(args.archive_id);
+      const dir = asDirectory(args.dir);
+      if (archiveId === null || dir === null) {
+        await auditFailure("memory_transcode_restore_denied", {
+          denial_class: "invalid_args",
+        });
+        return deny("memory_transcode_restore");
+      }
+      if (await refuseSecondIdentity("memory_transcode_restore")) {
+        return deny("memory_transcode_restore");
+      }
+
+      try {
+        await auditSuccess("memory_transcode_restore_started", {
+          archive_id: archiveId,
+          output_dir: dir,
+          owner_ref: adapter.ownerRef,
+        });
+        const result = await restoreMemoryTranscodeArchive(adapter, archiveId, dir);
+        try {
+          await auditSuccess("memory_transcode_restore", {
+            archive_id: archiveId,
+            source_harness: result.source_harness,
+            output_dir: dir,
+            owner_ref: adapter.ownerRef,
+            restored_file_count: result.source_file_count,
+            source_set_sha256: result.source_set_sha256,
+          });
+        } catch (auditError) {
+          return toolResult({
+            ...result,
+            audit_outcome_recorded: false,
+            operator_review_required: true,
+            audit_error_class: errorName(auditError),
+          });
+        }
+        return toolResult({ ...result, audit_outcome_recorded: true });
+      } catch (error) {
+        await auditFailure("memory_transcode_restore_denied", {
+          denial_class: denialCategory(error, "restore_failed"),
+          error_class: errorName(error),
+          ...errorCauseDetail(error),
+          archive_id: archiveId,
+          output_dir: dir,
+          owner_ref: adapter.ownerRef,
+        });
+        return deny("memory_transcode_restore");
+      }
+    },
+  };
+
+  return [memoryIngest, memoryEmit, memoryTranscode, memoryTranscodeRestore];
 }

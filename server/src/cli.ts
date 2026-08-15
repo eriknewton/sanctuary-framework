@@ -337,6 +337,18 @@ async function main(): Promise<void> {
     return drainAndExit(code);
   }
 
+  if (args[0] === "memory_transcode") {
+    const { runMemoryTranscodeCommand } = await import("./cli/memory-file.js");
+    const code = await runMemoryTranscodeCommand({ argv: args.slice(1) });
+    return drainAndExit(code);
+  }
+
+  if (args[0] === "memory_transcode_restore") {
+    const { runMemoryTranscodeRestoreCommand } = await import("./cli/memory-file.js");
+    const code = await runMemoryTranscodeRestoreCommand({ argv: args.slice(1) });
+    return drainAndExit(code);
+  }
+
   if (args[0] === "license") {
     const { runLicenseCommand } = await import("./cli/license.js");
     const code = await runLicenseCommand({ argv: args.slice(1) });
@@ -904,6 +916,8 @@ Usage:
   sanctuary checkpoint <cmd> [opts]       # Local encrypted memory checkpoints
   sanctuary memory_ingest [opts]          # Mirror harness memory into SDW
   sanctuary memory_emit [opts]            # Emit harness memory from SDW
+  sanctuary memory_transcode [opts]       # Project memory into another harness format
+  sanctuary memory_transcode_restore [opts] # Restore an exact transcode source archive
   sanctuary transparency <cmd> [opts]     # Signed enforcement checkpoints
   sanctuary verify-transparency [opts]    # Verify a checkpoint chain offline
   sanctuary generate systemd [opts]       # Emit systemd service unit
@@ -979,6 +993,15 @@ Subcommands:
   memory_emit          Manually emit Claude Code or Codex memory files from the SDW
                        vault into an output dir. Existing files are refused.
                        Use "sanctuary memory_emit --help" for options.
+
+  memory_transcode     Manually create a plaintext cross-harness projection plus
+                       an encrypted exact-source recovery archive. This is not sync.
+                       Use "sanctuary memory_transcode --help" for options.
+
+  memory_transcode_restore
+                       Restore exact source files from a completed encrypted
+                       transcode archive. This is not sync.
+                       Use "sanctuary memory_transcode_restore --help" for options.
 
   distress             Emit a distress signal through the reserved habeas
                        lane (operator test verb; same path the agent uses).

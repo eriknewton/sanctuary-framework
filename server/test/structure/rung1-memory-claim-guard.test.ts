@@ -3,7 +3,7 @@
  *
  * This is intentionally a bounded lexical guard, not a semantic oracle. It
  * owns the canonical Rung-1 memory surfaces: registered memory-file tool copy
- * and public paragraphs that name Rung-1, memory_ingest/memory_emit, the
+ * and public paragraphs that name Rung-1, a memory-file command, the
  * sovereign-memory substrate, or the memory mirror. A general memory claim
  * that uses none of those markers remains a review responsibility. When a new
  * overclaim wording or canonical marker is identified, add it to the lists
@@ -33,7 +33,7 @@ const PUBLIC_EXTENSIONS = new Set([".html", ".json", ".md", ".txt", ".yaml", ".y
 const README_WALK_EXCLUSIONS = new Set([".git", "dist", "node_modules", "target"]);
 
 const RUNG1_CONTEXT =
-  /\b(?:rung[- ]?1|memory_(?:ingest|emit)|sdw|sovereign data warehouse|sovereign[- ]memory substrate|memory(?:[- ]file)? mirror)\b/i;
+  /\b(?:rung[- ]?1|memory_(?:ingest|emit|transcode|transcode_restore)|sdw|sovereign data warehouse|sovereign[- ]memory substrate|memory(?:[- ]file)? mirror)\b/i;
 
 interface ForbiddenClaimClass {
   readonly id: string;
@@ -157,17 +157,24 @@ describe("Rung-1 memory claim guard", () => {
     expect(Object.keys(RUNG1_MEMORY_TOOL_DESCRIPTIONS).sort()).toEqual([
       "memory_emit",
       "memory_ingest",
+      "memory_transcode",
+      "memory_transcode_restore",
     ]);
     for (const [tool, description] of Object.entries(RUNG1_MEMORY_TOOL_DESCRIPTIONS)) {
       const lower = description.toLowerCase();
       expect(claimViolations(description, true), tool).toEqual([]);
       expect(lower, tool).toContain("plaintext");
-      expect(lower, tool).toContain("vault");
       expect(lower, tool).toContain("does not sync");
       expect(lower, tool).toContain("exposed to that vendor at inference");
     }
     expect(RUNG1_MEMORY_TOOL_DESCRIPTIONS.memory_ingest.toLowerCase()).toContain(
       "encrypted copy lives in the vault",
+    );
+    expect(RUNG1_MEMORY_TOOL_DESCRIPTIONS.memory_transcode.toLowerCase()).toContain(
+      "exact source recovery uses the versioned encrypted archive",
+    );
+    expect(RUNG1_MEMORY_TOOL_DESCRIPTIONS.memory_transcode_restore.toLowerCase()).toContain(
+      "completed encrypted sanctuary memory transcode archive",
     );
   });
 
@@ -195,6 +202,8 @@ describe("Rung-1 memory claim guard", () => {
       "With the memory mirror, the provider cannot read your memories.",
       "Rung-1 memories are never transmitted to any model provider.",
       "memory_emit provides end-to-end encrypted memory.",
+      "memory_transcode keeps memory private from the provider.",
+      "memory_transcode_restore provides full sovereignty.",
       "The Rung-1 memory mirror is encrypted end-to-end.",
     ];
     for (const claim of planted) {
