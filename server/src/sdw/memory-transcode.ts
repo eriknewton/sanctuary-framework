@@ -81,6 +81,32 @@ interface SourceFile {
   readonly text: string;
 }
 
+/**
+ * A validated, write-free view of one completed transcode archive.
+ *
+ * This is the shared parse boundary for local restore and Exit V2 export, so
+ * the two consumers cannot disagree about file, count, path, or digest rules.
+ */
+export interface MemoryTranscodeLogicalArchive {
+  readonly archive_id: string;
+  readonly owner_ref: string;
+  readonly version: typeof MEMORY_TRANSCODE_VERSION;
+  readonly state: "complete";
+  readonly from_harness: MemoryTranscodeHarness;
+  readonly to_harness: MemoryTranscodeHarness;
+  readonly source_file_count: number;
+  readonly source_set_sha256: string;
+  readonly projection_file_count: number;
+  readonly projection_set_sha256: string;
+  readonly files: readonly {
+    readonly path: string;
+    readonly source_class: string;
+    readonly text: string;
+    readonly size: number;
+    readonly sha256: string;
+  }[];
+}
+
 interface OutputFile {
   readonly path: string;
   readonly bytes: Uint8Array;
@@ -224,6 +250,28 @@ export async function restoreMemoryTranscodeArchive(
   archiveId: string,
   outputDir: string,
 ): Promise<MemoryTranscodeRestoreResult> {
+  const archive = await readMemoryTranscodeArchive(adapter, archiveId);
+  const files = archive.files.map((file) => ({
+    path: file.path,
+    bytes: Buffer.from(file.text, "utf8"),
+  }));
+  await writeOutputSet(outputDir, files);
+  return {
+    restored: true,
+    archive_id: archiveId,
+    version: MEMORY_TRANSCODE_VERSION,
+    source_harness: archive.from_harness,
+    source_file_count: files.length,
+    source_set_sha256: archive.source_set_sha256,
+    files: describeFiles(files),
+  };
+}
+
+/** Validate and read a completed archive without creating a plaintext projection. */
+export async function readMemoryTranscodeArchive(
+  adapter: MemoryBackendAdapter,
+  archiveId: string,
+): Promise<MemoryTranscodeLogicalArchive> {
   const manifest = await adapter.getPassage(archiveId);
   if (manifest === null || metadataValue(manifest, ARCHIVE_KIND_KEY) !== ARCHIVE_KIND_MANIFEST) {
     throw new Error("memory transcode archive manifest was not found");
@@ -285,16 +333,97 @@ export async function restoreMemoryTranscodeArchive(
   ) {
     throw new Error("memory transcode archive projection binding does not match its source");
   }
-  await writeOutputSet(outputDir, files);
   return {
-    restored: true,
     archive_id: archiveId,
+    owner_ref: adapter.ownerRef,
     version: MEMORY_TRANSCODE_VERSION,
-    source_harness: fromHarness,
+    state: ARCHIVE_STATE_COMPLETE,
+    from_harness: fromHarness,
+    to_harness: toHarness,
     source_file_count: files.length,
     source_set_sha256: expectedSetSha,
-    files: describeFiles(files),
+    projection_file_count: expectedProjectionCount,
+    projection_set_sha256: expectedProjectionSetSha,
+    files: source.map((file) => {
+      const bytes = Buffer.from(file.text, "utf8");
+      return {
+        path: file.path,
+        source_class: file.sourceClass,
+        text: file.text,
+        size: bytes.length,
+        sha256: sha256(bytes),
+      };
+    }),
   };
+}
+
+/**
+ * Build a destination-local completed archive as one atomic passage set.
+ *
+ * The caller adds any companion records (Exit V2 adds signed lineage) and
+ * submits the combined array through one `putPassages` call. Passage ids and
+ * the projection binding are re-derived under the destination adapter and
+ * archive id; source-fortress opaque ids are never copied.
+ */
+export function buildMemoryTranscodeArchivePassages(
+  adapter: MemoryBackendAdapter,
+  destinationArchiveId: string,
+  archive: Pick<
+    MemoryTranscodeLogicalArchive,
+    "version" | "state" | "from_harness" | "to_harness" | "source_set_sha256" | "files"
+  >,
+  createdAt: string,
+): readonly MemoryPassageInput[] {
+  assertArchiveId(destinationArchiveId);
+  if (archive.version !== MEMORY_TRANSCODE_VERSION || archive.state !== ARCHIVE_STATE_COMPLETE) {
+    throw new Error("memory transcode logical archive is not a supported completed archive");
+  }
+  if (archive.from_harness === archive.to_harness) {
+    throw new Error("memory transcode logical archive harness binding is invalid");
+  }
+  const source: SourceFile[] = archive.files.map((file) => ({
+    path: file.path,
+    sourceClass: file.source_class,
+    text: file.text,
+  }));
+  assertUniqueSourcePaths(source);
+  assertSourceBounds(source);
+  const files = source.map((file) => ({ path: file.path, bytes: Buffer.from(file.text, "utf8") }));
+  if (hashFileSet(files) !== archive.source_set_sha256) {
+    throw new Error("memory transcode logical archive source-set digest is invalid");
+  }
+  for (const file of archive.files) {
+    const bytes = Buffer.from(file.text, "utf8");
+    if (bytes.length !== file.size || sha256(bytes) !== file.sha256) {
+      throw new Error(`memory transcode logical archive file binding is invalid: ${file.path}`);
+    }
+  }
+  const projection = buildProjection(
+    source,
+    archive.from_harness,
+    archive.to_harness,
+    destinationArchiveId,
+  );
+  const fileInputs = source.map((file) => archiveFileInput(
+    adapter,
+    destinationArchiveId,
+    file,
+    archive.from_harness,
+    archive.to_harness,
+    createdAt,
+  ));
+  const manifest = archiveManifestInput({
+    archiveId: destinationArchiveId,
+    fromHarness: archive.from_harness,
+    toHarness: archive.to_harness,
+    state: ARCHIVE_STATE_COMPLETE,
+    sourceSetSha: archive.source_set_sha256,
+    sourceFileCount: source.length,
+    projectionSetSha: hashFileSet(projection),
+    projectionFileCount: projection.length,
+    createdAt,
+  });
+  return [...fileInputs, manifest];
 }
 
 async function sourceFilesFromVault(
