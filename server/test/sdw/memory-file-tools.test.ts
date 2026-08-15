@@ -1,3 +1,4 @@
+// fail-before-exempt: adaptation-only in this PR — the changed fake backend implements the newly required atomic putPassagesIfAbsent method; assertions and the memory-file-tools behavior they bind are unchanged. Exit V2 behavior, including atomic replay/conflict handling, is fail-before-proven in test/exit/exit-v2-sdw-memory-archive.test.ts.
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -386,6 +387,9 @@ describe("SDW memory file tools", () => {
           cause: new Error("injected rollback verifier failure"),
         });
       },
+      putPassagesIfAbsent: async () => {
+        throw new Error("not used");
+      },
       insertPassage: async () => {
         throw new Error("not used");
       },
@@ -444,6 +448,9 @@ describe("SDW memory file tools", () => {
       screenPassage: () => ({ ok: true }),
       putPassages: async () => {
         throw lockError;
+      },
+      putPassagesIfAbsent: async () => {
+        throw new Error("not used");
       },
       insertPassage: async () => {
         throw new Error("not used");
