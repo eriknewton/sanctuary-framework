@@ -24,8 +24,10 @@
  * (`mesh/audit-batch.ts`) is a STATELESS pure crypto primitive shared by every
  * audit path, and a per-node denial ceiling needs per-node mutable window
  * state; threading that state through every seal call site would be a larger,
- * riskier change than a scoped governor owned by MeshNode. The governor is
- * still a single shared object so other denial paths can adopt it.
+ * riskier change than a scoped governor owned by MeshNode. The governor is a
+ * shared CLASS other guaranteed-refusal audit paths adopt as sibling instances
+ * (the uncorrelated-sync_response refusal path already does), keeping each
+ * path's budget and saturation summary separate.
  */
 
 /** A sealed-summary payload the caller writes once per saturated interval. */
@@ -82,10 +84,12 @@ export class DenialAuditGovernor {
 
   /**
    * Emit any pending saturation summary for the CURRENT interval's suppressions
-   * without waiting for the window to roll (production wires this to the same
-   * periodic timer as the audit-buffer flush). Returns undefined when there is
-   * nothing to summarize. Clears the suppression accumulators so a summary is
-   * emitted at most once per pending set.
+   * without waiting for the window to roll. Production wiring:
+   * `FailureModeDetector.tick()` — the mesh's periodic tick — calls
+   * `MeshNode.flushRevokeDenialSaturation()`, which drains every governor
+   * through this method. Returns undefined when there is nothing to summarize.
+   * Clears the suppression accumulators so a summary is emitted at most once
+   * per pending set.
    */
   flushSaturationSummary(): DenialSaturationSummary | undefined {
     if (this.suppressed === 0) return undefined;

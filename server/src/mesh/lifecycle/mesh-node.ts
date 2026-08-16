@@ -191,11 +191,32 @@ export class MeshNode {
     REVOKE_DENIAL_AUDIT_GLOBAL_MAX,
     REVOKE_DENIAL_AUDIT_WINDOW_MS
   );
+  /**
+   * Sibling governor for the uncorrelated-`sync_response` refusal audit path.
+   * That refusal is GUARANTEED for any unsolicited response, so without a cap
+   * it is a zero-cost audit-write amplifier for any in-roster peer (the same
+   * rule-8 incentive shape as the revoke-denial path). Separate instance so
+   * the two paths' budgets and saturation summaries never conflate.
+   */
+  private readonly uncorrelatedSyncAuditGovernor = new DenialAuditGovernor(
+    REVOKE_DENIAL_AUDIT_PER_EMITTER_MAX,
+    REVOKE_DENIAL_AUDIT_GLOBAL_MAX,
+    REVOKE_DENIAL_AUDIT_WINDOW_MS
+  );
 
-  /** Callback hooks - Follow-up #3 (failure-mode operator surfaces) wires these. */
+  /**
+   * Callback hooks - Follow-up #3 (failure-mode operator surfaces) wires these.
+   *
+   * The third `kind`, `"sync_admitted_out_of_window"`, is the S2 detectability
+   * marker (design §3.2): a revoke admitted through the sync channel AFTER its
+   * collection window lapsed on this node's clock. It is the operator-visible
+   * half of the S2 residual — such an admission is legitimate for a late
+   * joiner but is also the only laundering channel left to an attacker, so it
+   * is never silent.
+   */
   onLifecycleEvent: (
     evt: SignedEvent<NodeLifecyclePayload>,
-    kind: "received" | "emitted"
+    kind: "received" | "emitted" | "sync_admitted_out_of_window"
   ) => void = () => {};
   onPolicyUpdate: (
     evt: SignedEvent<PolicyUpdatePayload>,
@@ -998,8 +1019,14 @@ export class MeshNode {
     now: Date = new Date()
   ): Promise<void> {
     // Verify policy/locator events up front (they are applied by
-    // applySyncResponse). A throw here is a whole-response failure for those
-    // tables only; the per-event isolation below governs lifecycle events.
+    // applySyncResponse). TRUTHFUL SCOPE: a throw here aborts the WHOLE
+    // response — the lifecycle loop below is never reached, so one poison
+    // policy_update or locator_update costs this response's lifecycle events
+    // too (and the correlation id was already consumed, so the initiator must
+    // retry with a fresh sync_request). The per-event isolation below governs
+    // only the lifecycle loop. Pre-existing shape; tracked as register row
+    // C12-SYNC-ORDER-01 (fix shape: per-table isolation or verify-after-
+    // lifecycle).
     for (const evt of payload.policy_updates ?? []) {
       this.verifyOrThrow(evt);
     }
@@ -1020,11 +1047,22 @@ export class MeshNode {
           // a committed revoke must outlive its collection window for a late
           // joiner, so freshness anchors to the emitter-stamped effective_at.
           const rev = evt as SignedEvent<NodeRevokePayload>;
-          this.admitRevoke(rev, {
+          const outcome = this.admitRevoke(rev, {
             mode: "sync_anchored",
             now,
             effective_at: rev.payload.effective_at,
           });
+          // S2 detectability (design §3.2/§5-F9): an admission the strict
+          // clock would have refused (now past expires_at) is the sync-only
+          // laundering channel the S2 residual concedes, so it is NEVER
+          // silent — distinct sealed audit entry + distinct operator-visible
+          // lifecycle marker, at this admission site. Fires only on a REAL
+          // admission (state change), not on an idempotent same-authorization
+          // drop, so a replay flood of an already-admitted event cannot use
+          // this entry as an ungoverned write amplifier.
+          if (outcome === "admitted") {
+            this.recordSyncOutOfWindowAdmission(rev, now);
+          }
         } else if (evt.event_type === "node_leave") {
           this.verifyOrThrow(evt);
           this.lifecycleLog.append(evt);
@@ -1089,18 +1127,21 @@ export class MeshNode {
    *     late joiners would diverge and fail open.
    *
    * Throws on any auth/freshness/re-admission failure; the caller audits.
+   * Returns whether state changed ("admitted") or the event was an idempotent
+   * same-authorization drop, so the sync site can scope its S2 detectability
+   * entry to real admissions.
    */
   private admitRevoke(
     rev: SignedEvent<NodeRevokePayload>,
     freshness: FreshnessMode
-  ): void {
+  ): "admitted" | "idempotent_drop" {
     this.assertNodeRevokeAuthorized(rev, freshness);
     const target = rev.payload.node_id;
     const authKey = this.revokeAuthorizationKey(rev);
     if (this.lifecycleLog.hasRetainedRevokeAuthorization(authKey)) {
       if (this.roster.presenceOf(target) === "revoked") {
         // Idempotent true replay — roster already revoked, drop from the log.
-        return;
+        return "idempotent_drop";
       }
       throw new MeshError(
         "node_revoke denied: authorization does not survive re-admission of its target"
@@ -1111,6 +1152,58 @@ export class MeshNode {
       authorization_key: authKey,
     });
     this.roster.markRevoked(target);
+    return "admitted";
+  }
+
+  /**
+   * S2 detectability (design §3.2/§5-F9): when a quorum revoke is admitted via
+   * the sync_anchored channel at a moment the strict clock would have refused
+   * (this node's `now` is past the context's `expires_at`), seal the DISTINCT
+   * audit entry `node_revoke_admitted_via_sync_out_of_window` and fire the
+   * distinct `onLifecycleEvent` marker. This is the operator-visible half of
+   * the S2 residual: the out-of-window sync admission is legitimate for a late
+   * joiner AND is the one laundering channel the design concedes, so it must
+   * never be silent. In-window sync admissions and every live-path admission
+   * emit nothing here. Principal-signed revokes carry no context and are out
+   * of S2's scope.
+   */
+  private recordSyncOutOfWindowAdmission(
+    rev: SignedEvent<NodeRevokePayload>,
+    now: Date
+  ): void {
+    const wireContext = rev.payload.quorum_context;
+    if (!wireContext) return;
+    const parsed = parseGuardianRevokeQuorumContext(wireContext);
+    // The admission already re-parsed and verified this context; a parse
+    // failure here is unreachable, and detectability must not invent one.
+    if (!parsed.ok) return;
+    if (now.getTime() <= parsed.context.expires_at_ms) return;
+    if (this.nodePrivateKey) {
+      const entry = sealAuditEntry({
+        emitter_node: this.config.node_id,
+        emitter_agent: "mesh",
+        emitter_principal: this.config.system_principal_id ?? "system",
+        policy_version: 0,
+        attestation_state: "present",
+        payload: {
+          operation: "node_revoke_admitted_via_sync_out_of_window",
+          peer_node: rev.emitter_node,
+          target_node: rev.payload.node_id,
+          ceremony_id: parsed.context.ceremony_id,
+          effective_at: rev.payload.effective_at,
+          expires_at: wireContext.expires_at,
+        },
+        node_private_key: this.nodePrivateKey,
+      });
+      if (this.oldestPendingEntryAt === null) {
+        this.oldestPendingEntryAt = Date.now();
+      }
+      this.auditBuffer.push(entry);
+    }
+    this.onLifecycleEvent(
+      rev as SignedEvent<NodeLifecyclePayload>,
+      "sync_admitted_out_of_window"
+    );
   }
 
   /**
@@ -1332,6 +1425,17 @@ export class MeshNode {
 
   getLocatorTable(): LocatorTableStore {
     return this.locatorTable;
+  }
+
+  /**
+   * Read-only view of the audit entries buffered but not yet flushed to the
+   * canonical audit node. Diagnostic/test surface: lets an operator console or
+   * a wired-consumer test assert WHICH entries are pending (e.g. the S2
+   * out-of-window admission entry or a governor saturation summary), not just
+   * how many. Never mutates the buffer.
+   */
+  peekPendingAuditEntries(): readonly AuditEntry[] {
+    return this.auditBuffer.peekPending();
   }
 
   getLifecycleLog(): NodeLifecycleEventLog {
@@ -1674,12 +1778,20 @@ export class MeshNode {
   }
 
   /**
-   * Flush any pending revoke-denial saturation summary without waiting for the
-   * window to roll (production wires this to the audit-buffer flush timer).
+   * Flush any pending audit-governor saturation summaries (revoke denials AND
+   * uncorrelated sync_response refusals) without waiting for their windows to
+   * roll. Production wiring: `FailureModeDetector.tick()` calls this on every
+   * periodic tick (MeshNode owns no timer of its own; the detector's interval
+   * is the mesh's periodic tick). Tests may also call it directly.
    */
   flushRevokeDenialSaturation(): void {
     const summary = this.denialAuditGovernor.flushSaturationSummary();
     if (summary) this.pushDenialSaturationSummary(summary);
+    const syncSummary =
+      this.uncorrelatedSyncAuditGovernor.flushSaturationSummary();
+    if (syncSummary) {
+      this.pushUncorrelatedSyncSaturationSummary(syncSummary);
+    }
   }
 
   private pushDenialSaturationSummary(summary: {
@@ -1706,14 +1818,51 @@ export class MeshNode {
     this.auditBuffer.push(entry);
   }
 
+  private pushUncorrelatedSyncSaturationSummary(summary: {
+    suppressed_count: number;
+    distinct_emitter_count: number;
+  }): void {
+    if (!this.nodePrivateKey) return;
+    const entry = sealAuditEntry({
+      emitter_node: this.config.node_id,
+      emitter_agent: "mesh",
+      emitter_principal: this.config.system_principal_id ?? "system",
+      policy_version: 0,
+      attestation_state: "peer_protocol_violation",
+      payload: {
+        operation: "sync_response_uncorrelated_saturation_summary",
+        suppressed_count: summary.suppressed_count,
+        distinct_emitter_count: summary.distinct_emitter_count,
+      },
+      node_private_key: this.nodePrivateKey,
+    });
+    if (this.oldestPendingEntryAt === null) {
+      this.oldestPendingEntryAt = Date.now();
+    }
+    this.auditBuffer.push(entry);
+  }
+
   /**
    * Record an uncorrelated / expired / replayed sync_response refusal with a
    * DISTINCT internal audit reason (never an MCP/public string) so a skewed or
    * slow-link fleet is diagnosable: repeated entries on a joiner are the tell of
    * a too-small SYNC_REQUEST_ID_EXPIRY_MS against real transfer time.
+   *
+   * Write-governed (rule 8): the refusal is GUARANTEED for any unsolicited
+   * response, so an ungoverned entry per refusal would let any in-roster peer
+   * spam zero-cost audit writes. The refusal DECISION is unaffected by
+   * suppression — this governs only whether the individual entry is written.
    */
   private auditUncorrelatedSyncResponse(peerNode: string): void {
     if (!this.nodePrivateKey) return;
+    const decision = this.uncorrelatedSyncAuditGovernor.consider(
+      peerNode,
+      Date.now()
+    );
+    if (decision.saturationSummary) {
+      this.pushUncorrelatedSyncSaturationSummary(decision.saturationSummary);
+    }
+    if (!decision.writeIndividual) return;
     const entry = sealAuditEntry({
       emitter_node: this.config.node_id,
       emitter_agent: "mesh",
@@ -1864,11 +2013,15 @@ export class MeshNode {
         const verified = this.verifyOrThrow(parsed.evt);
         const respPayload = verified.payload as SyncResponsePayload;
         // C12-REPLAY (§3.3 point 7): apply ONLY when the response correlates to
-        // an outstanding request this node issued. An uncorrelated (or expired,
-        // or replayed) response is refused BEFORE applySync — no parse, no
-        // verification side effects, no log or roster mutation — so the weaker
-        // sync_anchored freshness channel is never an always-on unsolicited
-        // surface (it runs only during a sync this node itself initiated).
+        // an outstanding request this node issued. Envelope verification
+        // (verifyOrThrow above) deliberately runs FIRST, so the refusal's
+        // audit entry attributes to an AUTHENTIC in-roster peer — an
+        // unverified emitter string would let anyone pollute the audit trail
+        // with forged attribution. After that, an uncorrelated (or expired, or
+        // replayed) response is refused BEFORE applySync — no payload parse,
+        // no log or roster mutation — so the weaker sync_anchored freshness
+        // channel is never an always-on unsolicited surface (it runs only
+        // during a sync this node itself initiated).
         if (!this.consumeOutstandingSyncRequest(respPayload.request_id)) {
           this.auditUncorrelatedSyncResponse(verified.emitter_node);
           this.onEnvelopeRejected({

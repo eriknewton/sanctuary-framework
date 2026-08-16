@@ -19,12 +19,17 @@ import { issueNodeIdentityCertificate } from "../../src/mesh/trust-root.js";
 import {
   MeshNode,
   NodeLifecycleEventLog,
+  InMemoryCounterStore,
   InMemoryNodeKeyStore,
   createAutoApproveJoinApprover,
 } from "../../src/mesh/lifecycle/index.js";
 import { InMemoryTransport } from "../../src/mesh/in-memory-transport.js";
 import { DenialAuditGovernor } from "../../src/mesh/lifecycle/denial-audit-governor.js";
+import { FailureModeDetector } from "../../src/mesh/failure-modes/index.js";
+import { NodeRevokeCeremony } from "../../src/mesh/recovery-flows/index.js";
 import {
+  MAX_RETAINED_NON_REVOKE_EVENTS_PER_EMITTER,
+  NODE_LIFECYCLE_LOG_MAX_EVENTS,
   REVOKE_DENIAL_AUDIT_GLOBAL_MAX,
   REVOKE_DENIAL_AUDIT_PER_EMITTER_MAX,
   REVOKE_DENIAL_AUDIT_WINDOW_MS,
@@ -43,6 +48,7 @@ import {
   QuorumFreshnessError,
   GUARDIAN_REVOKE_QUORUM_SCHEMA_V2,
   type GuardianRevokeQuorumContext,
+  type GuardianRoster,
 } from "../../src/mesh/guardian/index.js";
 import type {
   FortressMasterPublicKey,
@@ -63,8 +69,10 @@ interface Fortress {
   masterSecret: Uint8Array;
   rootCert: PrincipalCertificate;
   rootKey: Uint8Array;
+  nodeKey: Uint8Array;
   fortressId: string;
   guardians: Array<{ id: string; pub: string; sk: Uint8Array }>;
+  guardianRoster: GuardianRoster;
   m: number;
 }
 
@@ -120,14 +128,23 @@ async function bootFortress(m = 2, n = 3): Promise<Fortress> {
     masterSecret: bootstrap.master_private_key,
     rootCert: bootstrap.root_principal_certificate,
     rootKey: bootstrap.root_principal_private_key,
+    nodeKey: bootstrap.node_private_key,
     fortressId: bootstrap.master_public.fortress_id,
     guardians: guardianIdentities.map((g, i) => ({
       id: g.guardian_id,
       pub: g.public_key,
       sk: guardianKeys[i].privateKey,
     })),
+    guardianRoster: roster,
     m,
   };
+}
+
+/** Operations of the node's pending (unflushed) sealed audit entries. */
+function pendingAuditOps(node: MeshNode): string[] {
+  return node
+    .peekPendingAuditEntries()
+    .map((e) => (e.payload as { operation?: string }).operation ?? "");
 }
 
 /** Issue a node cert under the fortress root and add it to the node roster (active). */
@@ -768,6 +785,198 @@ describe("C12-REPLAY receive + sync paths", () => {
     expect(rejected.some((m) => /orphan context/.test(m))).toBe(true);
     expect(f.node.getRoster().presenceOf("victim-l")).not.toBe("revoked");
   });
+
+  it("T6(i)/(ii) S2 detectability: an out-of-window sync admission seals the distinct audit entry AND fires the distinct lifecycle marker", async () => {
+    const f = await bootFortress();
+    addRosterNode(f, "victim-s2");
+    const emitter = addRosterNode(f, "emitter-s2");
+    const base = new Date("2026-08-16T00:00:00.000Z");
+    const ctx = mintRevokeCollectionContext({ now: base });
+    // T6(i): a legitimate committed revoke whose window long lapsed reaches a
+    // late joiner via sync. T6(ii) is the SAME admission shape driven by a
+    // forged in-window effective_at — the laundering channel S2 concedes —
+    // which is exactly why the admission must never be silent.
+    const evt = buildV2Revoke({
+      f,
+      target: "victim-s2",
+      reason: "r",
+      context: ctx,
+      emitterNode: "emitter-s2",
+      emitterKey: emitter.kp.privateKey,
+      effectiveAt: new Date(base.getTime() + HOUR).toISOString(),
+    });
+    const markers: string[] = [];
+    f.node.onLifecycleEvent = (_evt, kind) => markers.push(kind);
+    await f.node.applySync(
+      { kind: "initial_sync", node_lifecycle_events: [evt] },
+      new Date(base.getTime() + 100 * HOUR) // strict clock would refuse here
+    );
+    expect(f.node.getRoster().presenceOf("victim-s2")).toBe("revoked"); // admitted
+    expect(pendingAuditOps(f.node)).toContain(
+      "node_revoke_admitted_via_sync_out_of_window"
+    );
+    expect(markers).toContain("sync_admitted_out_of_window");
+    // An idempotent same-authorization replay of the admitted event must NOT
+    // add a second detectability entry (no ungoverned write amplifier).
+    await f.node.applySync(
+      { kind: "initial_sync", node_lifecycle_events: [evt] },
+      new Date(base.getTime() + 100 * HOUR)
+    );
+    expect(
+      pendingAuditOps(f.node).filter(
+        (o) => o === "node_revoke_admitted_via_sync_out_of_window"
+      ).length
+    ).toBe(1);
+    // Mutation probe: delete the recordSyncOutOfWindowAdmission call in
+    // applySync -> the entry and marker assertions fail.
+  });
+
+  it("T6(i)/(ii) S2 detectability: the out-of-window entry is ABSENT on a live-path admission and on an in-window sync admission", async () => {
+    const f = await bootFortress();
+    addRosterNode(f, "victim-s3");
+    const emitter = addRosterNode(f, "emitter-s3");
+    const markers: string[] = [];
+    f.node.onLifecycleEvent = (_evt, kind) => markers.push(kind);
+
+    // Live-path admission: fresh in-window quorum broadcast to the receiver.
+    const liveCtx = mintRevokeCollectionContext();
+    const live = buildV2Revoke({
+      f,
+      target: "victim-s3",
+      reason: "r",
+      context: liveCtx,
+      emitterNode: "emitter-s3",
+      emitterKey: emitter.kp.privateKey,
+    });
+    const emitterTransport = f.hub.attach("emitter-s3");
+    await emitterTransport.broadcast(live);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(f.node.getRoster().presenceOf("victim-s3")).toBe("revoked");
+
+    // In-window sync admission: now is still inside the collection window.
+    addRosterNode(f, "victim-s4");
+    const syncCtx = mintRevokeCollectionContext();
+    const syncEvt = buildV2Revoke({
+      f,
+      target: "victim-s4",
+      reason: "r",
+      context: syncCtx,
+      emitterNode: "emitter-s3",
+      emitterKey: emitter.kp.privateKey,
+    });
+    await f.node.applySync(
+      { kind: "initial_sync", node_lifecycle_events: [syncEvt] },
+      new Date()
+    );
+    expect(f.node.getRoster().presenceOf("victim-s4")).toBe("revoked");
+
+    expect(pendingAuditOps(f.node)).not.toContain(
+      "node_revoke_admitted_via_sync_out_of_window"
+    );
+    expect(markers).not.toContain("sync_admitted_out_of_window");
+  });
+
+  it("T7(c) adversarial log cap: flood waves across the receive AND sync sites hold the NODE_LIFECYCLE_LOG_MAX_EVENTS bound and revoke entries survive", async () => {
+    const f = await bootFortress();
+    addRosterNode(f, "victim-t7c");
+    const emitter = addRosterNode(f, "emitter-t7c");
+
+    // 1. A real admitted revoke — the retention that must survive eviction.
+    const ctx = mintRevokeCollectionContext();
+    const revoke = buildV2Revoke({
+      f,
+      target: "victim-t7c",
+      reason: "r",
+      context: ctx,
+      emitterNode: "emitter-t7c",
+      emitterKey: emitter.kp.privateKey,
+    });
+    await f.node.applySync({
+      kind: "initial_sync",
+      node_lifecycle_events: [revoke],
+    });
+    expect(f.node.getRoster().presenceOf("victim-t7c")).toBe("revoked");
+
+    // 2. Drive the log to its global cap (fast, no crypto). The per-emitter
+    //    quota means one emitter tops out at its bucket, so 17 filler emitters
+    //    are needed to cross the 10k global cap and engage enforceCap.
+    const log = f.node.getLifecycleLog();
+    const filler = (em: string, id: string) =>
+      ({
+        protocol_version: "0.1",
+        event_type: "node_leave",
+        event_id: id,
+        emitter_node: em,
+        emitter_principal: "p",
+        fortress_id: f.fortressId,
+        causal_parents: [],
+        payload: { node_id: "x", reason: "graceful" },
+        payload_hash: "h",
+        emitted_at: "2026-08-16T00:00:00.000Z",
+        monotonic_seq: 1,
+        extension_envelope: {},
+        node_signature: "s",
+      }) as SignedEvent<NodeLifecyclePayload>;
+    for (let e = 0; e < 17; e++) {
+      for (let i = 0; i < MAX_RETAINED_NON_REVOKE_EVENTS_PER_EMITTER; i++) {
+        log.append(filler(`filler-${e}`, `evt-${e}-${i}`));
+      }
+    }
+    expect(log.size()).toBeLessThanOrEqual(NODE_LIFECYCLE_LOG_MAX_EVENTS);
+
+    // 3. Replay/flood wave through the REAL receive site (live broadcasts).
+    const emitterTransport = f.hub.attach("emitter-t7c");
+    for (let i = 0; i < 10; i++) {
+      const evt = packSignedEvent({
+        event_type: "node_attestation_refresh",
+        emitter_node: "emitter-t7c",
+        emitter_principal: f.rootCert.principal_id,
+        fortress_id: f.fortressId,
+        payload: { node_id: "emitter-t7c", attestation_state: "present" },
+        monotonic_seq: nextSeq(),
+        node_private_key: emitter.kp.privateKey,
+      });
+      await emitterTransport.broadcast(evt);
+    }
+    await new Promise((r) => setTimeout(r, 0));
+    expect(log.size()).toBeLessThanOrEqual(NODE_LIFECYCLE_LOG_MAX_EVENTS);
+
+    // 4. Flood wave through the REAL sync site (same machinery, second site —
+    //    rule 12: every site that shares the machinery).
+    const syncWave: SignedEvent<NodeLifecyclePayload>[] = [];
+    for (let i = 0; i < 10; i++) {
+      syncWave.push(
+        packSignedEvent({
+          event_type: "node_attestation_refresh",
+          emitter_node: "emitter-t7c",
+          emitter_principal: f.rootCert.principal_id,
+          fortress_id: f.fortressId,
+          payload: { node_id: "emitter-t7c", attestation_state: "present" },
+          monotonic_seq: nextSeq(),
+          node_private_key: emitter.kp.privateKey,
+        }) as unknown as SignedEvent<NodeLifecyclePayload>
+      );
+    }
+    await f.node.applySync({
+      kind: "initial_sync",
+      node_lifecycle_events: syncWave,
+    });
+
+    // The bound holds product-wide, and the revoke entry survived the flood's
+    // eviction pressure (revoke-preserving eviction).
+    expect(log.size()).toBeLessThanOrEqual(NODE_LIFECYCLE_LOG_MAX_EVENTS);
+    const revokes = log
+      .snapshot()
+      .filter(
+        (e) =>
+          e.event_type === "node_revoke" &&
+          (e.payload as NodeRevokePayload).node_id === "victim-t7c"
+      );
+    expect(revokes.length).toBe(1);
+    expect(f.node.getRoster().presenceOf("victim-t7c")).toBe("revoked");
+    // Mutation probe (run + reverted): disable enforceCap's eviction loop ->
+    // the size bound assertions fail (log grows past the cap).
+  });
 });
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -882,6 +1091,128 @@ describe("C12-REPLAY sync-response correlation + denial cap", () => {
       expect(f.node.getRoster().presenceOf(`t-${i}`)).not.toBe("revoked");
     }
   });
+
+  it("uncorrelated sync_response refusals are write-governed: individual entries capped, saturation summary sealed on flush", async () => {
+    const f = await bootFortress();
+    const emitter = addRosterNode(f, "emitter-o");
+    const peer = f.hub.attach("emitter-o");
+    const SUPPRESSED = 20;
+    const N = REVOKE_DENIAL_AUDIT_PER_EMITTER_MAX + SUPPRESSED;
+    // The refusal is GUARANTEED for an unsolicited response, so an ungoverned
+    // entry per refusal would be a zero-cost audit-write amplifier for any
+    // in-roster peer — the same rule-8 incentive shape as the denial path.
+    for (let i = 0; i < N; i++) {
+      const respEvt = packSignedEvent<SyncResponsePayload>({
+        event_type: "sync_response",
+        emitter_node: "emitter-o",
+        emitter_principal: f.rootCert.principal_id,
+        fortress_id: f.fortressId,
+        payload: {
+          kind: "initial_sync",
+          request_id: `never-issued-${i}`,
+          node_lifecycle_events: [],
+        },
+        monotonic_seq: nextSeq(),
+        node_private_key: emitter.kp.privateKey,
+      });
+      await peer.unicast(
+        "canon-1",
+        JSON.stringify({ kind: "sync_response", evt: respEvt })
+      );
+    }
+    await new Promise((r) => setTimeout(r, 0));
+    const ops = pendingAuditOps(f.node);
+    expect(
+      ops.filter((o) => o === "sync_response_uncorrelated").length
+    ).toBe(REVOKE_DENIAL_AUDIT_PER_EMITTER_MAX); // NOT N
+    expect(ops).not.toContain("sync_response_uncorrelated_saturation_summary");
+    // The flush (production: the detector tick) seals the summary — counts are
+    // degraded in granularity under flood, never lost.
+    f.node.flushRevokeDenialSaturation();
+    const summary = f.node
+      .peekPendingAuditEntries()
+      .map((e) => e.payload as {
+        operation?: string;
+        suppressed_count?: number;
+        distinct_emitter_count?: number;
+      })
+      .find(
+        (p) => p.operation === "sync_response_uncorrelated_saturation_summary"
+      );
+    expect(summary).toBeDefined();
+    expect(summary?.suppressed_count).toBe(SUPPRESSED);
+    expect(summary?.distinct_emitter_count).toBe(1);
+  });
+
+  it("wired consumer (rule 4): FailureModeDetector.tick — the production periodic tick — flushes a saturated-then-quiet denial schedule into the sealed summary", async () => {
+    const f = await bootFortress();
+    const emitter = addRosterNode(f, "emitter-p");
+    // The production object graph: the real detector wired to the real node,
+    // exactly as the composition root builds it. tick() is the function the
+    // production setInterval invokes; calling it directly is the same code
+    // path minus the wall-clock wait.
+    const detector = new FailureModeDetector(
+      f.node,
+      {
+        emit_context: {
+          emitter_node: "canon-1",
+          emitter_principal: f.rootCert.principal_id,
+          fortress_id: f.fortressId,
+          node_private_key: f.nodeKey,
+          principal_private_key: f.rootKey,
+          counters: new InMemoryCounterStore(),
+        },
+      },
+      { canonical_audit_node_id: "canon-1", tick_interval_ms: 60_000 }
+    );
+    try {
+      // Saturated wave: ONE emitter's out-of-window replays exceed its
+      // per-emitter audit budget, so some denials are suppressed.
+      const SUPPRESSED = 18;
+      const base = new Date("2026-08-16T00:00:00.000Z");
+      const ctx = mintRevokeCollectionContext({ now: base });
+      const events: SignedEvent<NodeLifecyclePayload>[] = [];
+      for (let i = 0; i < REVOKE_DENIAL_AUDIT_PER_EMITTER_MAX + SUPPRESSED; i++) {
+        addRosterNode(f, `p-${i}`);
+        events.push(
+          buildV2Revoke({
+            f,
+            target: `p-${i}`,
+            reason: "r",
+            context: ctx,
+            emitterNode: "emitter-p",
+            emitterKey: emitter.kp.privateKey,
+            effectiveAt: new Date(base.getTime() + 10_000 * HOUR).toISOString(),
+          }) as SignedEvent<NodeLifecyclePayload>
+        );
+      }
+      await f.node.applySync(
+        { kind: "initial_sync", node_lifecycle_events: events },
+        new Date(base.getTime() + 100 * HOUR)
+      );
+      // Quiet: no further denials arrive, so nothing rolls the window — the
+      // summary is pending but unwritten.
+      expect(pendingAuditOps(f.node)).not.toContain(
+        "node_revoke_denied_saturation_summary"
+      );
+      detector.tick(Date.now());
+      const summary = f.node
+        .peekPendingAuditEntries()
+        .map((e) => e.payload as {
+          operation?: string;
+          suppressed_count?: number;
+          distinct_emitter_count?: number;
+        })
+        .find((p) => p.operation === "node_revoke_denied_saturation_summary");
+      expect(summary).toBeDefined();
+      expect(summary?.suppressed_count).toBe(SUPPRESSED);
+      expect(summary?.distinct_emitter_count).toBe(1);
+      // Mutation probe: remove the flushRevokeDenialSaturation call from
+      // FailureModeDetector.tick -> the summary never appears.
+    } finally {
+      detector.stop();
+    }
+  });
 });
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -945,5 +1276,121 @@ describe("C12-REPLAY NodeLifecycleEventLog", () => {
     // The NEWEST authorization survives (evict-oldest, never block-newest).
     expect(log.hasRetainedRevokeAuthorization("q:target:19")).toBe(true);
     expect(log.hasRetainedRevokeAuthorization("q:target:0")).toBe(false);
+  });
+
+  it("per-emitter quota (rule 8 per-origin): a flooding emitter evicts within its OWN bucket; other emitters' join events survive", () => {
+    const log = new NodeLifecycleEventLog();
+    const mkJoin = (emitter: string, id: string) =>
+      ({
+        ...fakeNonRevoke(emitter, id),
+        event_type: "node_join",
+      }) as SignedEvent<NodeLifecyclePayload>;
+    // Three neighbors' join events, retained BEFORE the flood begins — under
+    // global-only oldest-first eviction these would be the first casualties.
+    log.append(mkJoin("n1", "j1"));
+    log.append(mkJoin("n2", "j2"));
+    log.append(mkJoin("n3", "j3"));
+    const QUOTA = MAX_RETAINED_NON_REVOKE_EVENTS_PER_EMITTER;
+    for (let i = 0; i < QUOTA + 50; i++) {
+      log.append(fakeNonRevoke("flood", `f-${i}`));
+    }
+    const ids = log.snapshot().map((e) => e.event_id);
+    // The neighbors' events survive the flood untouched.
+    expect(ids).toContain("j1");
+    expect(ids).toContain("j2");
+    expect(ids).toContain("j3");
+    // The flooder is capped at its quota, evicting its OWN oldest first.
+    const floodRetained = log
+      .snapshot()
+      .filter((e) => e.emitter_node === "flood");
+    expect(floodRetained.length).toBe(QUOTA);
+    expect(ids).not.toContain("f-0");
+    expect(ids).toContain(`f-${QUOTA + 49}`);
+    expect(log.size()).toBe(3 + QUOTA);
+    // Mutation probe: key the bucket eviction off the GLOBAL oldest instead of
+    // the flooder's own bucket -> j1..j3 disappear and this test fails.
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// Ceremony expiry boundaries (T5, design §8 Q4 adopted: confirm refuses too)
+// ═══════════════════════════════════════════════════════════════════════
+
+describe("C12-REPLAY ceremony expiry boundaries (T5)", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  async function proposeAtExpiryMinusDelta(target: string): Promise<{
+    f: Fortress;
+    ceremony: NodeRevokeCeremony;
+    expiresMs: number;
+  }> {
+    const f = await bootFortress();
+    addRosterNode(f, target);
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-16T00:00:00.000Z"));
+    const ctx = mintRevokeCollectionContext();
+    const input = buildGuardianRevokeQuorumInput({
+      context: ctx,
+      target_node_id: target,
+      reason: "boundary",
+      fortress_id: f.fortressId,
+    });
+    const sigs = f.guardians.slice(0, f.m).map((g) =>
+      signMasterRotationAsGuardian({
+        input,
+        guardian_id: g.id,
+        guardian_private_key: g.sk,
+      })
+    );
+    const expiresMs = Date.parse(ctx.expires_at);
+    // Propose at expiry - δ: still in-window, succeeds.
+    vi.setSystemTime(new Date(expiresMs - 60_000));
+    const ceremony = NodeRevokeCeremony.propose({
+      proposal: {
+        target_node_id: target,
+        reason: "boundary",
+        guardian_signatures: sigs,
+        quorum_context: ctx,
+      },
+      ctx: {
+        node: f.node,
+        pinned_master: f.master,
+        pinned_roster: f.guardianRoster,
+        // Never reached in these schedules: confirm/execute refuse before any
+        // alert emission.
+        emit_ctx: null as unknown as never,
+      },
+    });
+    return { f, ceremony, expiresMs };
+  }
+
+  it("T5(a) confirm at expiry+δ is refused (an operator confirmation is not a freshness extension); state stays proposed", async () => {
+    const { ceremony, expiresMs } = await proposeAtExpiryMinusDelta("victim-t5a");
+    vi.setSystemTime(new Date(expiresMs + 60_000));
+    expect(() => ceremony.confirm({ note: "late confirm" })).toThrow(
+      QuorumFreshnessError
+    );
+    expect(ceremony.state).toBe("proposed");
+  });
+
+  it("T5(b) confirm at expiry-δ then execute at expiry+δ: refused at the pre-broadcast gate, state failed, ZERO wire traffic", async () => {
+    const { f, ceremony, expiresMs } =
+      await proposeAtExpiryMinusDelta("victim-t5b");
+    // Confirm just inside the window: allowed.
+    ceremony.confirm({ note: "confirmed in-window" });
+    expect(ceremony.state).toBe("confirmed");
+    // Execute past expiry: revokePeer's strict pre-broadcast gate refuses
+    // BEFORE anything is emitted or broadcast.
+    vi.setSystemTime(new Date(expiresMs + 60_000));
+    const emitted: string[] = [];
+    f.node.onLifecycleEvent = (evt, kind) => {
+      if (kind === "emitted") emitted.push(evt.event_type);
+    };
+    await expect(ceremony.execute()).rejects.toThrow(/expired/i);
+    expect(ceremony.state).toBe("failed");
+    expect(emitted).not.toContain("node_revoke"); // zero wire traffic
+    expect(f.node.getRoster().presenceOf("victim-t5b")).toBe("active");
   });
 });

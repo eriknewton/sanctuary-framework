@@ -183,6 +183,24 @@ export class NodeRevokeCeremony {
         "operator confirmation requires a non-empty note"
       );
     }
+    // C12-REPLAY (design §8 Q4, adopted): an operator confirmation is not a
+    // freshness extension — a ceremony whose collection window has lapsed
+    // refuses HERE, giving the operator feedback at confirm time instead of
+    // one step later when execute's pre-broadcast gate (F5) would refuse
+    // anyway. Same shared assertion as every other relying site (T9: no
+    // second freshness implementation), this device's own clock.
+    const parsed = parseGuardianRevokeQuorumContext(
+      toWireQuorumContext(this.proposal.quorum_context)
+    );
+    if (!parsed.ok) {
+      throw new CeremonyError(
+        `node_revoke confirm: malformed quorum context (${parsed.reason})`
+      );
+    }
+    assertQuorumContextFresh(parsed.context, {
+      mode: "strict",
+      now: new Date(),
+    });
     this.state = "confirmed";
     this.confirmed_at = confirmation.at ?? new Date().toISOString();
     if (this.chainedRotation) {

@@ -67,6 +67,20 @@ export const NODE_LIFECYCLE_LOG_MAX_EVENTS = 10_000;
  */
 export const MAX_RETAINED_REVOKE_AUTHORIZATIONS_PER_TARGET = 8;
 
+/**
+ * Per-EMITTER cap on retained NON-revoke lifecycle events (rule 8's per-origin
+ * quota). The global cap alone lets one in-roster emitter flood non-revoke
+ * events and evict every OTHER emitter's history through oldest-first eviction;
+ * this bounds any single emitter to 1/16 of the global log, so at least 16
+ * emitters' histories can coexist — generous for a v0.1 fortress fleet
+ * (single-digit nodes). A full bucket evicts the FLOODING emitter's own oldest
+ * event first, never another emitter's. Derivation:
+ * floor(NODE_LIFECYCLE_LOG_MAX_EVENTS / 16) = 625.
+ */
+export const MAX_RETAINED_NON_REVOKE_EVENTS_PER_EMITTER = Math.floor(
+  NODE_LIFECYCLE_LOG_MAX_EVENTS / 16
+);
+
 // ═══════════════════════════════════════════════════════════════════════
 // C12-REPLAY — denial-write ceiling (rule 8, §2.5 + review F-8a/NH-4)
 // ═══════════════════════════════════════════════════════════════════════

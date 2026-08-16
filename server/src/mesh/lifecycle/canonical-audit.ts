@@ -54,6 +54,11 @@ export class AuditBuffer {
     return this.pending.length;
   }
 
+  /** Read-only view of the pending (unflushed) entries. Never mutates. */
+  peekPending(): readonly AuditEntry[] {
+    return this.pending;
+  }
+
   /**
    * Decide whether the buffer should be flushed now based on size or age.
    * Time-based flush is driven by the orchestrator's tick — pass the time of

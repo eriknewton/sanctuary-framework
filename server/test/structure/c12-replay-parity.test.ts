@@ -14,6 +14,10 @@ import { describe, expect, it } from "vitest";
 
 const REPO_ROOT = join(fileURLToPath(import.meta.url), "..", "..", "..", "..");
 const MESH_SRC = join(REPO_ROOT, "server/src/mesh");
+// The scans walk ALL of server/src, not a hand-picked file list: a single-file
+// substring pin cannot see a new caller added elsewhere (the J5 lesson — no
+// single-file substring pins).
+const SERVER_SRC = join(REPO_ROOT, "server/src");
 
 function read(rel: string): string {
   return readFileSync(join(REPO_ROOT, rel), "utf8");
@@ -47,7 +51,7 @@ describe("C12-REPLAY parity structure (T9)", () => {
   it("the shared module is the ONLY constructor of the v2 revoke input shape", () => {
     // The schema literal is defined once (in the shared module) and otherwise
     // only referenced (type positions / wire echoes), never re-built by hand.
-    const files = walk(MESH_SRC);
+    const files = walk(SERVER_SRC);
     const sharedModule = join(MESH_SRC, "guardian", "revoke-quorum-input.ts");
     // A hand-built input assigns the `schema` key (NOT the `input_schema` wire
     // echo, which legitimately rides NodeRevokePayload) to the v2 value.
@@ -62,12 +66,27 @@ describe("C12-REPLAY parity structure (T9)", () => {
     }
   });
 
-  it("only applySync passes mode: \"sync_anchored\"; every other site is strict", () => {
-    const meshNode = read("server/src/mesh/lifecycle/mesh-node.ts");
-    const anchoredMatches = meshNode.match(/mode:\s*"sync_anchored"/g) ?? [];
-    // Exactly one sync_anchored call site in production code.
-    expect(anchoredMatches.length).toBe(1);
+  it("only applySync passes mode: \"sync_anchored\" — sole-caller scan over ALL of server/src", () => {
+    // A VALUE-position use is `mode: "sync_anchored"` followed by `,` or `}`
+    // (an object literal being passed); the shared module's FreshnessMode TYPE
+    // member is followed by `;` and is the one legitimate non-call occurrence.
+    const callSite = /mode:\s*"sync_anchored"\s*[,}]/g;
+    const meshNodePath = join(MESH_SRC, "lifecycle", "mesh-node.ts");
+    let totalCallSites = 0;
+    for (const file of walk(SERVER_SRC)) {
+      const matches = readFileSync(file, "utf8").match(callSite) ?? [];
+      if (matches.length > 0) {
+        expect(
+          file,
+          `sync_anchored passed outside mesh-node.ts: ${file}`
+        ).toBe(meshNodePath);
+        totalCallSites += matches.length;
+      }
+    }
+    // Exactly one sync_anchored call site in ALL production code.
+    expect(totalCallSites).toBe(1);
     // And it is inside applySync (the anchored call references effective_at).
+    const meshNode = read("server/src/mesh/lifecycle/mesh-node.ts");
     const applySyncStart = meshNode.indexOf("async applySync(");
     const applySyncEnd = meshNode.indexOf("private admitRevoke(");
     expect(applySyncStart).toBeGreaterThan(0);
@@ -76,8 +95,8 @@ describe("C12-REPLAY parity structure (T9)", () => {
     expect(applySyncBody).toMatch(/mode:\s*"sync_anchored"/);
   });
 
-  it("no second freshness-assertion or ceremony-id generator exists under mesh/", () => {
-    const files = walk(MESH_SRC);
+  it("no second freshness-assertion or ceremony-id generator exists under server/src", () => {
+    const files = walk(SERVER_SRC);
     const sharedModule = join(MESH_SRC, "guardian", "revoke-quorum-input.ts");
     for (const file of files) {
       if (file === sharedModule) continue;

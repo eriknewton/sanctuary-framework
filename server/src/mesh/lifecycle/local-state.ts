@@ -18,6 +18,7 @@ import type {
 } from "../types.js";
 import { decodePolicyBlob } from "../../policy-engine/canonical-policy.js";
 import {
+  MAX_RETAINED_NON_REVOKE_EVENTS_PER_EMITTER,
   MAX_RETAINED_REVOKE_AUTHORIZATIONS_PER_TARGET,
   NODE_LIFECYCLE_LOG_MAX_EVENTS,
 } from "./constants.js";
@@ -291,8 +292,11 @@ export class LocatorTableStore {
  * join/leave/revoke events to a rejoining node.
  *
  * SYNC-APPEND-01 (C12-REPLAY §3.3): this log is fed from untrusted sync input,
- * so it is NOT an unbounded array. Three invariants hold here:
+ * so it is NOT an unbounded array. Four invariants hold here:
  *   - a cap with revoke-preserving eviction (rule 8);
+ *   - a per-EMITTER quota on retained non-revoke events (rule 8's per-origin
+ *     quota): one flooding in-roster emitter evicts within its OWN bucket
+ *     first and can never push another emitter's events out of the log;
  *   - non-revoke events dedupe on `(emitter_node_id, event_id)` — emitter-scoped
  *     so no cross-emitter suppression, and (per the caller contract) only
  *     VERIFIED events reach `append`, so an unverified colliding id can never
@@ -319,6 +323,16 @@ export class NodeLifecycleEventLog {
   >();
   /** target_node_id -> retained authorization keys in insertion order. */
   private readonly revokeAuthsByTarget = new Map<string, string[]>();
+  /**
+   * emitter_node -> that emitter's retained NON-revoke events in insertion
+   * order. Backs the per-emitter quota (rule 8's per-origin quota): eviction
+   * under quota pressure comes from the flooding emitter's own bucket, never
+   * a neighbor's.
+   */
+  private readonly nonRevokeByEmitter = new Map<
+    string,
+    SignedEvent<NodeLifecyclePayload>[]
+  >();
 
   /**
    * Append a VERIFIED non-revoke lifecycle event. Idempotent on
@@ -333,7 +347,20 @@ export class NodeLifecycleEventLog {
     }
     const key = this.nonRevokeKey(evt);
     if (this.nonRevokeKeys.has(key)) return;
+    // Per-emitter quota (rule 8's per-origin quota): a full bucket evicts the
+    // FLOODING emitter's own oldest event, never another emitter's — one
+    // in-roster emitter must not be able to erase its neighbors' history
+    // through global oldest-first eviction pressure.
+    const bucket = this.nonRevokeByEmitter.get(evt.emitter_node) ?? [];
+    while (bucket.length >= MAX_RETAINED_NON_REVOKE_EVENTS_PER_EMITTER) {
+      const oldest = bucket[0];
+      const idx = this.events.indexOf(oldest);
+      if (idx !== -1) this.events.splice(idx, 1);
+      this.forgetIndexed(oldest); // also shifts it out of this bucket
+    }
     this.nonRevokeKeys.add(key);
+    bucket.push(evt);
+    this.nonRevokeByEmitter.set(evt.emitter_node, bucket);
     this.events.push(evt);
     this.enforceCap();
   }
@@ -438,6 +465,12 @@ export class NodeLifecycleEventLog {
   ): void {
     if (evt.event_type !== "node_revoke") {
       this.nonRevokeKeys.delete(this.nonRevokeKey(evt));
+      const bucket = this.nonRevokeByEmitter.get(evt.emitter_node);
+      if (bucket) {
+        const i = bucket.indexOf(evt);
+        if (i !== -1) bucket.splice(i, 1);
+        if (bucket.length === 0) this.nonRevokeByEmitter.delete(evt.emitter_node);
+      }
       return;
     }
     let authKey = knownAuthKey;
