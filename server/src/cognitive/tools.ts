@@ -491,6 +491,9 @@ export class IdentityManager {
   private masterKey: Uint8Array;
   private identities = new Map<string, StoredIdentity>();
   private primaryIdentityId: string | null = null;
+  // Must match PRIMARY_IDENTITY_META_KEY in audit/checkpoint-identity.ts:
+  // the audit checkpoint signer resolves the fortress signing identity
+  // through this same `_meta` pointer.
   private metadataKey = "primary_identity_id";
 
   constructor(storage: StorageBackend, masterKey: Uint8Array) {
@@ -628,6 +631,11 @@ export class IdentityManager {
     }
     const serialized = stringToBytes(JSON.stringify(identity));
     const encrypted = encrypt(serialized, this.encryptionKey);
+    // Namespace + key layout must match the readers in
+    // cognitive/state-store.ts (resolveStoredIdentity) and
+    // audit/checkpoint-identity.ts (readStoredIdentity): both resolve
+    // signing keys by reading `_identities/<identity_id>` under the same
+    // identity-encryption purpose key this write uses.
     await this.storage.write(
       "_identities",
       identity.identity_id,
