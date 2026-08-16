@@ -40,7 +40,12 @@ describe("Castle Wall standalone boot-runtime bundle", () => {
         "--fortress",
         join(isolatedDir, "fortress"),
       ],
-      { encoding: "utf8" },
+      {
+        encoding: "utf8",
+        // Bundle smoke tests must fail before root-custodied credential access;
+        // operator-owned boot-token state is never a test fixture.
+        env: { ...process.env, SANCTUARY_CASTLE_LOCAL_SIGN: "1" },
+      },
     );
 
     expect(result.status).toBe(1);
@@ -48,7 +53,7 @@ describe("Castle Wall standalone boot-runtime bundle", () => {
     expect(result.stderr).not.toContain("MODULE_NOT_FOUND");
     expect(result.stderr).not.toContain("Cannot find module");
     expect(result.stderr).toContain(
-      process.platform === "darwin" ? "boot token" : "macOS-only",
+      process.platform === "darwin" ? "fortress master key" : "macOS-only",
     );
   });
 });

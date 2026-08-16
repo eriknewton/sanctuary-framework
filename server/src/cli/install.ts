@@ -17,6 +17,7 @@ import {
   getPlatformPaths,
   hasExistingWrapMetaStrict,
 } from "../wrap/config-reader.js";
+import { runOperatorTwinPreflight } from "../wrap/preflight.js";
 import {
   CASTLE_WALL_BOOT_PLIST_PATH,
   bootServicePlistPresent,
@@ -254,6 +255,7 @@ export interface AgentInstallPlan {
     boot_service: InstallObservation;
     content_filter: "enabled" | "disabled" | "unknown" | "not-applicable";
     enforcement: "live" | "unavailable" | "undetermined" | "not-applicable";
+    operator_twin: InstallObservation;
   };
   next_action: AgentInstallAction | null;
   operator_actions: AgentInstallAction[];
@@ -282,6 +284,7 @@ export interface InstallProbeResult {
   bootService: InstallObservation;
   contentFilter: "enabled" | "disabled" | "unknown" | "not-applicable";
   enforcement: "live" | "unavailable" | "undetermined" | "not-applicable";
+  operatorTwin: InstallObservation;
 }
 
 export interface AgentInstallOps {
@@ -596,16 +599,24 @@ async function probeWrap(harness: InstallHarness): Promise<InstallObservation> {
   }
 }
 
+export function parseInstallSystemExtensionState(stdout: string): SysextState {
+  // macOS can retain an old terminated version beside its active replacement;
+  // every matching row must participate so list order never hides live enforcement.
+  const bundleId = "ai.sanctuaryprotocol.macos.castle-wall";
+  const matching = stdout
+    .split("\n")
+    .filter((line) => line.trim().split(/\s+/).includes(bundleId))
+    .join("\n");
+  return parseCastleWallState(matching);
+}
+
 async function probeSystemExtension(): Promise<SysextState | "unknown"> {
   try {
     const { stdout } = await execFileAsync("/usr/bin/systemextensionsctl", ["list"], {
       encoding: "utf8",
       timeout: 10_000,
     });
-    const matching = stdout
-      .split("\n")
-      .find((line) => line.includes("ai.sanctuaryprotocol.macos.castle-wall"));
-    return parseCastleWallState(matching ?? "");
+    return parseInstallSystemExtensionState(stdout);
   } catch {
     return "unknown";
   }
@@ -632,6 +643,21 @@ async function probeWallStatus(
       ? "unavailable"
       : "undetermined";
   return { contentFilter, enforcement };
+}
+
+async function probeOperatorTwin(
+  env: NodeJS.ProcessEnv,
+  platform: NodeJS.Platform,
+): Promise<InstallObservation> {
+  const row = await runOperatorTwinPreflight({
+    ops: {
+      env: () => env,
+      platform: () => platform,
+    },
+  });
+  if (row.status === "PASS") return "absent";
+  if (row.status === "FAIL") return "present";
+  return "unknown";
 }
 
 function createInstallOps(ctx: InstallCommandContext): AgentInstallOps {
@@ -679,13 +705,17 @@ function createInstallOps(ctx: InstallCommandContext): AgentInstallOps {
           bootService: "not-applicable",
           contentFilter: "not-applicable",
           enforcement: "not-applicable",
+          operatorTwin: "not-applicable",
         };
       }
-      const [castleWallApp, systemExtension, bootService, wall] = await Promise.all([
+      const [castleWallApp, systemExtension, bootService, wall, operatorTwin] = await Promise.all([
         verifiedCastleWallApp === null ? probeCastleWallApp() : verifiedCastleWallApp,
         probeSystemExtension(),
         probeBootService(fortress),
         probeWallStatus(env),
+        harness === "hermes"
+          ? probeOperatorTwin(env, platform)
+          : Promise.resolve("not-applicable" as const),
       ]);
       return {
         cooperativeWrap,
@@ -700,6 +730,7 @@ function createInstallOps(ctx: InstallCommandContext): AgentInstallOps {
         systemExtension,
         bootService,
         ...wall,
+        operatorTwin,
       };
     },
   };
@@ -744,6 +775,7 @@ function basePlan(
       boot_service: observed.bootService,
       content_filter: observed.contentFilter,
       enforcement: observed.enforcement,
+      operator_twin: observed.operatorTwin,
     },
     next_action: null,
     operator_actions: [],
@@ -953,6 +985,14 @@ export function buildAgentInstallPlan(input: {
     plan.notes.push("The authoritative system-extension probe failed; unknown is never treated as approval.");
     return plan;
   }
+  if (input.observed.operatorTwin !== "absent") {
+    plan.notes.push(
+      input.observed.operatorTwin === "present"
+        ? "An operator-side Hermes twin is present; stand it down and rerun the planner before declaring or installing the full surface."
+        : "The operator-side Hermes twin probe is unknown; repair that observation before declaring or installing the full surface.",
+    );
+    return plan;
+  }
   const fullMechanicsComplete =
     input.observed.cooperativeWrap === "present" &&
     input.observed.systemExtension === "[activated enabled]" &&
@@ -998,6 +1038,7 @@ export function buildAgentInstallPlan(input: {
       "--no-open",
       "--provision-agent-account",
       "--agent-guided",
+      "--strict",
       "--sealed-launcher",
       DEFAULT_CASTLE_WALL_LAUNCHER,
     ],

@@ -70,4 +70,45 @@ final class SystemExtensionManagerTests: XCTestCase {
 
         XCTAssertEqual(manager.replacementAction(), .replace)
     }
+
+    func testLaunchActivationRefreshAdvancesAfterHelperApprovalWithoutPinInput() {
+        XCTAssertTrue(
+            SystemExtensionManager.shouldSubmitLaunchActivationRefresh(
+                didSubmit: false,
+                helperApproved: true,
+                extensionState: .unknown
+            )
+        )
+        XCTAssertTrue(
+            SystemExtensionManager.shouldSubmitLaunchActivationRefresh(
+                didSubmit: false,
+                helperApproved: true,
+                extensionState: .activated
+            )
+        )
+    }
+
+    func testLaunchActivationRefreshRemainsOneShotAndApprovalGated() {
+        XCTAssertFalse(
+            SystemExtensionManager.shouldSubmitLaunchActivationRefresh(
+                didSubmit: false,
+                helperApproved: false,
+                extensionState: .unknown
+            )
+        )
+        XCTAssertFalse(
+            SystemExtensionManager.shouldSubmitLaunchActivationRefresh(
+                didSubmit: true,
+                helperApproved: true,
+                extensionState: .unknown
+            )
+        )
+        XCTAssertFalse(
+            SystemExtensionManager.shouldSubmitLaunchActivationRefresh(
+                didSubmit: false,
+                helperApproved: true,
+                extensionState: .needsUserApproval
+            )
+        )
+    }
 }

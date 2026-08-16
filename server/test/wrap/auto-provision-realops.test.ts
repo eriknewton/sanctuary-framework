@@ -77,6 +77,7 @@ import {
   type RehomeOps,
 } from "../../src/castle-wall/provision/rehome.js";
 import { verifyReachabilityBeforeArm } from "../../src/castle-wall/provision/verify.js";
+import { parseBootArgs } from "../../src/cli/castle-wall-boot.js";
 
 describe("wrap/auto-provision real-ops chokepoint: dscl read classifiers (fix round-3 B1)", () => {
   it("distinguishes an absent attribute from an absent record when No such key is on stderr with exit 0", () => {
@@ -1475,13 +1476,20 @@ describe("wrap/auto-provision real-ops chokepoint: resolveHarnessDaemonLogDir", 
 });
 
 describe("wrap/auto-provision real-ops chokepoint: policy daemon install-boot binary resolution", () => {
-  it("passes the running CLI binary explicitly to install-boot so bundled installs do not rely on import.meta.url layout", () => {
-    expect(policyDaemonInstallBootArgs("/Users/erik/.sanctuary", "/opt/sanctuary/dist/cli.js")).toEqual([
+  it("never passes the retired --binary flag because install-boot uses the signed app runtime", () => {
+    const args = policyDaemonInstallBootArgs(
+      "/Users/erik/.sanctuary",
+      "/opt/sanctuary/dist/cli.js",
+    );
+    expect(args).toEqual([
       "--fortress",
       "/Users/erik/.sanctuary",
-      "--binary",
-      "/opt/sanctuary/dist/cli.js",
     ]);
+    expect(parseBootArgs(args)).toEqual({
+      fortress: "/Users/erik/.sanctuary",
+      yes: false,
+      rotate: false,
+    });
   });
 });
 

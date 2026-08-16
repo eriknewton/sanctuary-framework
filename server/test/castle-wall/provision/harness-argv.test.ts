@@ -22,6 +22,7 @@ import {
   mkdirSync,
   symlinkSync,
   realpathSync,
+  readlinkSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -59,10 +60,12 @@ const AGENT_UID = 503;
 function mockOps(
   existing: Set<string>,
   runnableAsAgent: Record<string, InterpreterVersion> = {},
+  symlinks: Record<string, string> = {},
 ): HarnessArgvOps {
   return {
     pathExists: async (path) => existing.has(path),
     realpath: async () => undefined,
+    readlink: async (path) => symlinks[path],
     probeInterpreterAsUid: async (path, uid) =>
       uid === AGENT_UID ? runnableAsAgent[path] : undefined,
     probeHermesCliImportAsUid: async (path, uid, pythonPathEntries) => {
@@ -107,6 +110,13 @@ function tempFixtureOps(): HarnessArgvOps {
     realpath: async (path) => {
       try {
         return realpathSync(path);
+      } catch {
+        return undefined;
+      }
+    },
+    readlink: async (path) => {
+      try {
+        return readlinkSync(path);
       } catch {
         return undefined;
       }
@@ -224,11 +234,52 @@ describe("castle-wall/provision/harness-argv", () => {
       expect(resolved.launch.programArguments[0]).toBe(systemPython);
     });
 
+    it("REGRESSION (Mini1): relocates an absolute uv-managed Python symlink into the dedicated home", async () => {
+      const operatorTarget = "/Users/mini1/.hermes/python/cpython-3.11.14-macos-aarch64-none/bin/python3.11";
+      const relocatedTarget = `${agentHome}/.hermes/python/cpython-3.11.14-macos-aarch64-none/bin/python3.11`;
+      const ops = mockOps(
+        new Set([mainModule, sitePackages, venvPython, relocatedTarget]),
+        { [relocatedTarget]: { major: 3, minor: 11 } },
+        { [venvPython]: operatorTarget },
+      );
+
+      const resolved = await resolveHermesGatewayArgv(ops, {
+        agentHome,
+        agentUid: AGENT_UID,
+        operatorHome: "/Users/mini1",
+      });
+
+      expect(resolved.launch.programArguments[0]).toBe(relocatedTarget);
+      expect(resolved.launch.environment).toEqual({
+        HERMES_ACCEPT_HOOKS: "1",
+        HOME: agentHome,
+        PYTHONPATH: `${hermesAgentDir}:${sitePackages}`,
+      });
+    });
+
+    it("fail-closed: an absolute uv-managed Python symlink cannot escape the re-homed managed-Python tree", async () => {
+      const escapedTarget = `${agentHome}/escape/python3.11`;
+      const ops = mockOps(
+        new Set([mainModule, sitePackages, venvPython, escapedTarget]),
+        { [escapedTarget]: { major: 3, minor: 11 } },
+        { [venvPython]: "/Users/mini1/.hermes/python/../../escape/python3.11" },
+      );
+
+      await expect(
+        resolveHermesGatewayArgv(ops, {
+          agentHome,
+          agentUid: AGENT_UID,
+          operatorHome: "/Users/mini1",
+        }),
+      ).rejects.toThrow(/No Hermes gateway runtime usable/);
+    });
+
     it("probes as the AGENT uid, never as the caller (root)", async () => {
       const seen: Array<{ path: string; uid: number }> = [];
       const ops: HarnessArgvOps = {
         pathExists: async (path) => new Set([mainModule, sitePackages, venvPython]).has(path),
         realpath: async () => undefined,
+        readlink: async () => undefined,
         probeInterpreterAsUid: async (path, uid) => {
           seen.push({ path, uid });
           return path === venvPython ? { major: 3, minor: 11 } : undefined;

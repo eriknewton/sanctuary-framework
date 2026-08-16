@@ -372,6 +372,88 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
     });
   }
 
+  async putPassagesIfAbsent(
+    inputs: readonly MemoryPassageInput[],
+    taint: PersistableTaint,
+  ): Promise<readonly MemoryPassage[] | null> {
+    if (inputs.length === 0) return [];
+    for (const input of inputs) {
+      if (input.passage_id === undefined) {
+        throw new SdwValidationError(
+          "invalid_identifier",
+          "SDW memory conditional batch write requires an explicit passage_id per passage",
+        );
+      }
+    }
+    // As with putPassages, validate and classify the complete set before
+    // entering the decision/write critical section.
+    const prepared = inputs.map((input) => this.preparePassage(input));
+    const seen = new Set<string>();
+    for (const item of prepared) {
+      if (seen.has(item.documentId)) {
+        throw new SdwValidationError(
+          "duplicate_passage",
+          "SDW memory conditional batch write contains the same passage_id twice",
+        );
+      }
+      seen.add(item.documentId);
+    }
+
+    const documentIds = prepared.map((item) => item.documentId);
+    return this.withDocumentLocks(documentIds, async () => {
+      const transactional = asSdwTransactional(this.storage);
+      if (transactional !== null) {
+        return transactional.sdwTransaction(async (txn) => {
+          for (const item of prepared) {
+            if (await this.corpus.getDocument(item.documentId, txn) !== null) {
+              return null;
+            }
+          }
+          for (const item of prepared) {
+            for (const chunkRecord of item.chunkRecords) {
+              await this.corpus.putChunk(chunkRecord, taint, txn);
+            }
+            await this.corpus.putDocument(item.documentRecord, taint, txn);
+          }
+          return prepared.map((item) => this.toPassage(item.documentRecord, item.text));
+        });
+      }
+
+      return withCrossProcessLock(
+        this.storage,
+        MEMORY_BATCH_LOCK_NAMESPACE,
+        this.ownerScopeBatchLockFile(),
+        async () => {
+          for (const item of prepared) {
+            if (await this.corpus.getDocument(item.documentId) !== null) {
+              return null;
+            }
+          }
+          const prior = await this.capturePriorPassages(prepared);
+          const beforeOwnerScope = await this.captureOwnerScopeSnapshot();
+          try {
+            for (const item of prepared) {
+              for (const chunkRecord of item.chunkRecords) {
+                await this.corpus.putChunk(chunkRecord, taint);
+              }
+              await this.corpus.putDocument(item.documentRecord, taint);
+            }
+          } catch (error) {
+            await this.restoreAndVerifyPriorPassages(
+              prepared,
+              prior,
+              taint,
+              beforeOwnerScope,
+            );
+            throw error;
+          }
+          return prepared.map((item) => this.toPassage(item.documentRecord, item.text));
+        },
+        { timeoutMs: MEMORY_BATCH_LOCK_TIMEOUT_MS },
+      );
+    });
+  }
+
   derivePassageId(domain: string, label: string): string {
     assertSdwIdentifier(domain, "passage_id_domain");
     const mac = hmacSha256(

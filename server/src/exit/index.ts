@@ -45,6 +45,21 @@ export {
 } from "./inspect.js";
 
 export {
+  exportExitV2SdwMemoryArchive,
+  importExitV2SdwMemoryArchive,
+  participantExitSdwMemoryRetention,
+  verifyExitV2SdwMemoryArchive,
+  type ExitV2MemorySigner,
+  type ExportExitV2SdwMemoryArchiveOptions,
+  type ExportExitV2SdwMemoryArchiveResult,
+  type VerifyExitV2SdwMemoryArchiveOptions,
+  type VerifyExitV2SdwMemoryArchiveResult,
+  type ImportExitV2SdwMemoryArchiveOptions,
+  type ImportExitV2SdwMemoryArchiveResult,
+  type ParticipantExitSdwMemoryRetentionReceipt,
+} from "./v2-memory-archive.js";
+
+export {
   runExitCommand,
   printExitHelp,
   printExitExportHelp,

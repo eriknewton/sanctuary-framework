@@ -537,19 +537,18 @@ struct ContentView: View {
     /// Re-submit activation once on launch / helper approval so a newer bundled
     /// sysext replaces an older running one. This must not depend on the filter
     /// being disabled: a fresh launch can start at `.unknown` while the filter is
-    /// already enabled from a previous app session.
+    /// already enabled from a previous app session. Activation itself is also
+    /// allowed before the global pin exists: the later privileged install
+    /// provisions that pin, while every path that can arm or enable the filter
+    /// remains fail-closed behind full helper + pin + daemon readiness.
     private func refreshActivatedSystemExtensionIfNeeded() {
-        guard !didSubmitLaunchActivationRefresh,
-              signerHelperManager.isReady else {
-            return
-        }
-        switch systemExtensionManager.extensionState {
-        case .unknown, .activated:
-            didSubmitLaunchActivationRefresh = true
-            systemExtensionManager.activate()
-        default:
-            break
-        }
+        guard SystemExtensionManager.shouldSubmitLaunchActivationRefresh(
+            didSubmit: didSubmitLaunchActivationRefresh,
+            helperApproved: signerHelperManager.canRequestSystemExtensionActivation,
+            extensionState: systemExtensionManager.extensionState
+        ) else { return }
+        didSubmitLaunchActivationRefresh = true
+        systemExtensionManager.activate()
     }
 
     private func refreshDaemonArmingReadiness(reevaluateAutoArm: Bool = false) {

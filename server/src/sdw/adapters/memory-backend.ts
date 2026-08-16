@@ -125,6 +125,21 @@ export interface MemoryBackendAdapter {
   ): Promise<readonly MemoryPassage[]>;
 
   /**
+   * Atomically create a whole SET only when every explicit passage id is
+   * absent. Returns null without writing when any target already exists.
+   *
+   * Security-sensitive callers use this instead of a separate absence check
+   * followed by putPassages: that check/write split permits two concurrent
+   * writers to both observe absence and then replace one another's signed
+   * records. Implementations MUST linearize the absence decision with the
+   * batch commit under the same transaction or owner-scope lock.
+   */
+  putPassagesIfAbsent(
+    inputs: readonly MemoryPassageInput[],
+    taint: PersistableTaint,
+  ): Promise<readonly MemoryPassage[] | null>;
+
+  /**
    * Dry-run the write gate for one passage: the SAME validation, grammar, and
    * secret classification the real write performs, with nothing persisted.
    *

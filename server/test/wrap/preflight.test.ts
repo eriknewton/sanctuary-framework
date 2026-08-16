@@ -9,6 +9,7 @@ import {
   protectPreflightExitCode,
   renderProtectPreflightJson,
   renderProtectPreflightReport,
+  runOperatorTwinPreflight,
   runProtectPreflight,
   type AccessKind,
   type AccessResult,
@@ -212,6 +213,101 @@ describe("protect preflight", () => {
     expect(renderProtectPreflightReport(report)).toContain("| PASS");
   });
 
+  it("exposes the authoritative operator-twin row without running provider probes", async () => {
+    const fetch = vi.fn(async () => ({ status: 200 }));
+    const twin = await runOperatorTwinPreflight({
+      ops: fixtureOps({ fetch }),
+    });
+
+    expect(twin).toMatchObject({
+      id: "operator_twin_services",
+      status: "PASS",
+      state: "no_operator_gateway",
+    });
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("accepts the canonical executable sealed launcher without a root PATH dependency", async () => {
+    const sealedLauncher =
+      "/Applications/Sanctuary-CastleWall.app/Contents/MacOS/sanctuary";
+    const report = await runProtectPreflight({
+      sealedLauncherPath: sealedLauncher,
+      ops: fixtureOps({
+        env: baseEnv({ PATH: "/missing" }),
+        executable: new Set([sealedLauncher]),
+      }),
+    });
+
+    expect(row(report, "root_path_sanctuary")).toMatchObject({
+      status: "PASS",
+      state: "canonical_sealed_launcher",
+      remedy: "none",
+    });
+    expect(row(report, "root_path_sanctuary").detail).toContain(sealedLauncher);
+  });
+
+  it("does not accept a caller-selected executable as the sealed launcher", async () => {
+    const report = await runProtectPreflight({
+      sealedLauncherPath: "/tmp/sanctuary",
+      ops: fixtureOps({
+        env: baseEnv({ PATH: "/missing" }),
+        executable: new Set(["/tmp/sanctuary"]),
+      }),
+    });
+
+    expect(row(report, "root_path_sanctuary")).toMatchObject({
+      status: "FAIL",
+      state: "sealed_launcher_noncanonical",
+    });
+
+    const missingCanonical = await runProtectPreflight({
+      sealedLauncherPath:
+        "/Applications/Sanctuary-CastleWall.app/Contents/MacOS/sanctuary",
+      ops: fixtureOps({
+        env: baseEnv({ PATH: "/missing" }),
+        executable: new Set(),
+      }),
+    });
+    expect(row(missingCanonical, "root_path_sanctuary")).toMatchObject({
+      status: "FAIL",
+      state: "sealed_launcher_not_executable",
+    });
+  });
+
+  it("reports an unknown sealed-launcher probe conservatively", async () => {
+    const unknownCanonical = await runProtectPreflight({
+      sealedLauncherPath:
+        "/Applications/Sanctuary-CastleWall.app/Contents/MacOS/sanctuary",
+      ops: fixtureOps({
+        env: baseEnv({ PATH: "/missing" }),
+        access: async () => ({ ok: false, reason: "EIO", code: "EIO" }),
+      }),
+    });
+    expect(row(unknownCanonical, "root_path_sanctuary")).toMatchObject({
+      status: "UNDETERMINED",
+      state: "sealed_launcher_probe_unknown",
+    });
+  });
+
+  it("validates and forwards the sealed launcher before the automatic preflight", async () => {
+    const source = await readFile(
+      fileURLToPath(new URL("../../src/wrap/cli.ts", import.meta.url)),
+      "utf8",
+    );
+    const validation = source.indexOf(
+      "await validateSealedLauncher(options.sealedLauncher)",
+    );
+    const preflight = source.indexOf(
+      "const preflight = await (deps.runProtectPreflight ?? runProtectPreflight)",
+    );
+
+    expect(validation).toBeGreaterThan(-1);
+    expect(preflight).toBeGreaterThan(validation);
+    expect(source.slice(preflight, preflight + 320)).toContain(
+      "sealedLauncherPath: options.sealedLauncher",
+    );
+  });
+
   it("escapes backslashes before pipes in rendered table cells", () => {
     const report = failingReportFixture();
     report.rows[0]!.detail = String.raw`path \| injected | next`;
@@ -281,7 +377,10 @@ describe("protect preflight", () => {
     });
     expect(row(report, "fortress_custody").detail).toContain("dead-man lever");
     expect(row(report, "root_path_sanctuary").remedy).toContain(
-      "node server/dist/cli.js",
+      "canonical signed-app launcher",
+    );
+    expect(row(report, "root_path_sanctuary").remedy).not.toMatch(
+      /\bnode\b|\bnpm\b|\bnpx\b/,
     );
     expect(row(report, "signer_client").state).toBe("env_missing");
     expect(row(report, "sysext_approval").state).toBe("[activated waiting for user]");
@@ -300,6 +399,74 @@ describe("protect preflight", () => {
     expect(row(report, "operator_twin_services").remedy).toContain(
       "launchctl disable gui/501/ai.hermes.gateway",
     );
+  });
+
+  it("lets only the automatic retry accept the exact launchd boot daemon for this fortress", async () => {
+    const ops = fixtureOps({
+      env: baseEnv(),
+      entries: new Map([[CASTLE_SOCKET, present("file")]]),
+      execFile: async (cmd, args) => {
+        if (cmd.endsWith("lsof")) {
+          return execResult(
+            0,
+            `COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\nnode 42 root 5u unix 0x0 0t0 ${CASTLE_SOCKET}\n`,
+          );
+        }
+        if (cmd === "launchctl" && args.join(" ").includes("system/ai.sanctuaryprotocol.castle-wall.daemon")) {
+          return execResult(
+            0,
+            `{\n  pid = 42;\n  environment = {\n    SANCTUARY_STORAGE_PATH => ${FORTRESS}\n  }\n}\n`,
+          );
+        }
+        return execResult(1, "", "not configured");
+      },
+    });
+
+    const explicit = await runProtectPreflight({ ops });
+    expect(row(explicit, "castle_sock_holder")).toMatchObject({
+      status: "FAIL",
+      state: "launchd_safe_mode_boot_daemon",
+    });
+
+    const retry = await runProtectPreflight({
+      ops,
+      allowMatchingBootDaemon: true,
+    });
+    expect(row(retry, "castle_sock_holder")).toMatchObject({
+      status: "PASS",
+      state: "matching_launchd_safe_mode_boot_daemon",
+      remedy: "none",
+    });
+  });
+
+  it("still refuses a launchd daemon whose loaded fortress does not match", async () => {
+    const report = await runProtectPreflight({
+      allowMatchingBootDaemon: true,
+      ops: fixtureOps({
+        env: baseEnv(),
+        entries: new Map([[CASTLE_SOCKET, present("file")]]),
+        execFile: async (cmd, args) => {
+          if (cmd.endsWith("lsof")) {
+            return execResult(
+              0,
+              `COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\nnode 42 root 5u unix 0x0 0t0 ${CASTLE_SOCKET}\n`,
+            );
+          }
+          if (cmd === "launchctl" && args.join(" ").includes("system/ai.sanctuaryprotocol.castle-wall.daemon")) {
+            return execResult(
+              0,
+              "{\n  pid = 42;\n  environment = {\n    SANCTUARY_STORAGE_PATH => /Users/other/.sanctuary\n  }\n}\n",
+            );
+          }
+          return execResult(1, "", "not configured");
+        },
+      }),
+    });
+
+    expect(row(report, "castle_sock_holder")).toMatchObject({
+      status: "FAIL",
+      state: "launchd_safe_mode_boot_daemon",
+    });
   });
 
   it("sends Gemini preflight credentials in the x-goog-api-key header, not the URL", async () => {

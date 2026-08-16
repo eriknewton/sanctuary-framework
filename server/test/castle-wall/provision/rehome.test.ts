@@ -150,13 +150,15 @@ describe("castle-wall/provision/rehome", () => {
       expect(sourcePaths).toContain(`${OPERATOR_HOME}/.hermes/cli-config.json`);
       expect(sourcePaths).toContain(`${OPERATOR_HOME}/.hermes/config.yaml`);
       expect(sourcePaths).toContain(`${OPERATOR_HOME}/.hermes/hermes-agent`);
+      expect(sourcePaths).toContain(`${OPERATOR_HOME}/.hermes/python`);
       expect(sourcePaths).toContain(`${OPERATOR_HOME}/.google_workspace_mcp/credentials`);
       expect(sourcePaths).toContain(`${OPERATOR_HOME}/.workspace-mcp/cli-tokens`);
       expect(sourcePaths).toContain(`${OPERATOR_HOME}/.hermes/google-mcp-creds`);
       expect(entries.find((e) => e.destRelativePath === ".hermes/hermes-agent")?.isSecret).toBe(false);
+      expect(entries.find((e) => e.destRelativePath === ".hermes/python")?.isSecret).toBe(false);
       expect(
         entries
-          .filter((e) => e.destRelativePath !== ".hermes/hermes-agent")
+          .filter((e) => ![".hermes/hermes-agent", ".hermes/python"].includes(e.destRelativePath))
           .every((e) => e.isSecret),
       ).toBe(true);
     });
