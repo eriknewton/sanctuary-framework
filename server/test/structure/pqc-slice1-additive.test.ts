@@ -26,7 +26,7 @@ describe("PQC additive guard", () => {
     // pinned exact version in `dependencies` — never hidden in
     // optionalDependencies (npm would silently ship a partial install that
     // crashes at boot) or in devDependencies.
-    expect(pkg.dependencies?.["@noble/post-quantum"]).toBe("0.6.1");
+    expect(pkg.dependencies?.["@noble/post-quantum"]).toBe("0.7.0");
     expect(pkg.devDependencies?.["@noble/post-quantum"]).toBeUndefined();
     expect(pkg.optionalDependencies?.["@noble/post-quantum"]).toBeUndefined();
   });
