@@ -286,9 +286,14 @@ export class NodeRevokeCeremony {
  *
  * This is explicitly an orchestration-layer convention; the receiver (inside
  * this ceremony, for verifyGuardianQuorum) uses the exact same builder.
+ *
+ * Must match `nodeRevokeQuorumInput` in `../lifecycle/mesh-node.ts`
+ * byte-for-byte: MeshNode.revokePeer's pre-broadcast gate and every
+ * receiving node recompute these bytes to verify the quorum signatures
+ * produced against this builder.
  */
 export function revokeQuorumInput(
-  proposal: NodeRevokeProposal,
+  proposal: Pick<NodeRevokeProposal, "target_node_id" | "reason">,
   fortressId: string
 ): MasterRotationQuorumInput {
   const initiatedAt = "revoke:" + proposal.target_node_id;

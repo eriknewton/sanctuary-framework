@@ -1159,7 +1159,7 @@ describe("lifecycle/mesh-node - bootstrap → join → revoke", () => {
     );
   });
 
-  it("rejects ceremony-verified revokes without any quorum signatures", async () => {
+  it("rejects revokes without a principal signature or any quorum signatures", async () => {
     const first = await bootstrapFirstNode({ transport: hub });
     const emitted: string[] = [];
     first.node.onLifecycleEvent = (evt, kind) => {
@@ -1174,7 +1174,6 @@ describe("lifecycle/mesh-node - bootstrap → join → revoke", () => {
       first.node.revokePeer({
         target_node_id: "empty-ceremony-victim",
         reason: "empty ceremony proof",
-        guardian_quorum_verified_by_ceremony: true,
         quorum_signatures: [],
       })
     ).rejects.toThrow(
@@ -1183,6 +1182,79 @@ describe("lifecycle/mesh-node - bootstrap → join → revoke", () => {
 
     expect(emitted).not.toContain("node_revoke");
     expect(broadcasted).not.toContain("node_revoke");
+  });
+
+  it("rejects quorum signatures that covered a ceremony input instead of this revoke payload (C12: no trusted-caller bypass)", async () => {
+    const first = await bootstrapFirstNode({ transport: hub });
+
+    const guardianKeys = [generateKeypair(), generateKeypair(), generateKeypair()];
+    const guardians = guardianKeys.map((kp, i) => ({
+      guardian_id: `guardian-${i + 1}`,
+      public_key: toBase64url(kp.publicKey),
+      kind: "human",
+      invited_at: "2026-05-14T00:00:00.000Z",
+    }));
+    const roster = issueGuardianRoster({
+      m: 2,
+      n: 3,
+      guardians,
+      fortress_id: first.bootstrap.master_public.fortress_id,
+      version: 1,
+      master_private_key: first.bootstrap.master_private_key,
+    });
+    first.node.registerGuardianRoster(roster);
+
+    // A full 2-of-3 quorum, genuinely signed by roster guardians, but over a
+    // DIFFERENT input than this revoke payload's quorum input (standing in
+    // for a recovery ceremony's quorum over its own ceremony payload). Before
+    // the C12 fix a caller could attach these and skip verification with a
+    // trusted flag; now the pre-broadcast gate recomputes the revoke input
+    // and must refuse them.
+    const ceremonyShapedInput = {
+      old_master_pubkey: "node:ceremony-victim",
+      new_master_pubkey: {
+        public_key: toBase64url(
+          stringToBytes("device_recovery:ceremony-victim->replacement")
+        ),
+        fortress_id: first.bootstrap.master_public.fortress_id,
+        created_at: "device_recovery:ceremony-victim->replacement",
+      },
+      rotated_at: "device_recovery:ceremony-victim->replacement",
+      fortress_id: first.bootstrap.master_public.fortress_id,
+    };
+    const ceremonySigs = guardianKeys.slice(0, 2).map((kp, i) =>
+      signMasterRotationAsGuardian({
+        input: ceremonyShapedInput,
+        guardian_id: guardians[i].guardian_id,
+        guardian_private_key: kp.privateKey,
+      })
+    );
+
+    const emitted: string[] = [];
+    first.node.onLifecycleEvent = (evt, kind) => {
+      if (kind === "emitted") emitted.push(evt.event_type);
+    };
+    const broadcasted: string[] = [];
+    hub.attach("ceremony-bypass-observer").subscribe((evt) => {
+      broadcasted.push(evt.event_type);
+    });
+
+    await expect(
+      first.node.revokePeer({
+        target_node_id: "ceremony-victim",
+        reason: "device_loss_recovery",
+        quorum_signatures: ceremonySigs.map((s, i) => ({
+          guardian_pubkey: guardians[i].public_key,
+          signature: s.signature,
+        })),
+      })
+    ).rejects.toThrow(/signature does not verify/);
+
+    expect(emitted).not.toContain("node_revoke");
+    expect(broadcasted).not.toContain("node_revoke");
+    expect(first.node.getRoster().presenceOf("ceremony-victim")).not.toBe(
+      "revoked"
+    );
   });
 
   it("accepts guardian-quorum node revocation when the pinned roster verifies", async () => {
