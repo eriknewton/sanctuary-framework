@@ -426,6 +426,187 @@ describe("IC-05: bare production constructor signs and verifies checkpoints", ()
   });
 });
 
+describe("IC-05 second-gate fixes: corruption, latch floor recovery, latch-referenced record", () => {
+  /** Fault injection for the latch-write path: MemoryStorage whose first N
+   * writes to the signing-latch key fail, everything else untouched. */
+  class FailingLatchWriteStorage extends MemoryStorage {
+    latchWriteFailuresRemaining: number;
+    constructor(failures: number) {
+      super();
+      this.latchWriteFailuresRemaining = failures;
+    }
+    override async write(
+      namespace: string,
+      key: string,
+      data: Uint8Array
+    ): Promise<void> {
+      if (key === "__signing_latch" && this.latchWriteFailuresRemaining > 0) {
+        this.latchWriteFailuresRemaining -= 1;
+        throw new Error("injected latch write failure");
+      }
+      return super.write(namespace, key, data);
+    }
+  }
+
+  it("a corrupted identity record is a loud signing error, never an honest unsigned checkpoint", async () => {
+    // Second-gate probe 1: valid primary pointer + corrupted identity record
+    // previously produced `unsigned: true` with the identity-absence reason,
+    // no latch, and ZERO findings on a strict reader.
+    const storage = new MemoryStorage();
+    const masterKey = generateRandomKey();
+    const { storedIdentity } = await seedStoredIdentity(storage, masterKey, "fortress");
+    await storage.write(
+      "_identities",
+      storedIdentity.identity_id,
+      stringToBytes("not-an-encrypted-identity-record")
+    );
+
+    const writer = new AuditLog(storage, masterKey, { checkpointInterval: 1 });
+    await appendCriticalEntries(writer, 1, storedIdentity.identity_id);
+
+    const [checkpoint] = await readCheckpoints(storage);
+    expect(checkpoint!.unsigned).toBe(true);
+    // The persisted reason must be the DISTINCT signer-error reason, not the
+    // identity-absence reason a pre-bootstrap fortress writes.
+    expect(checkpoint!.unsigned_reason).toBe(
+      "checkpoint signer failed: identity material unreadable or signing error"
+    );
+
+    const reader = new AuditLog(storage, masterKey);
+    await expect(reader.query({ limit: 100 })).rejects.toMatchObject({
+      name: "AuditIntegrityError",
+      findings: expect.arrayContaining([
+        expect.objectContaining({ kind: "checkpoint_signing_error" }),
+      ]),
+    } satisfies Partial<AuditIntegrityError>);
+  });
+
+  it("proven identity absence still writes the honest reason and stays finding-free", async () => {
+    // The discriminated counterpart of the corruption probe: the states must
+    // not merge in EITHER direction.
+    const storage = new MemoryStorage();
+    const masterKey = generateRandomKey();
+    const writer = new AuditLog(storage, masterKey, { checkpointInterval: 1 });
+    await appendCriticalEntries(writer, 1, "pre-bootstrap");
+
+    const [checkpoint] = await readCheckpoints(storage);
+    expect(checkpoint!.unsigned).toBe(true);
+    expect(checkpoint!.unsigned_reason).toBe(
+      "no signing identity available at checkpoint time"
+    );
+    const reader = new AuditLog(storage, masterKey);
+    const result = await reader.query({ limit: 100 });
+    expect(result.integrity_findings).toEqual([]);
+  });
+
+  it("a failed first latch write recovers the EARLIEST signed sequence on retry", async () => {
+    // Second-gate probe 2: latch write 1 fails silently, checkpoint 1 stays
+    // signed, and the retry stamped first_signed_sequence: 2, so stripping
+    // checkpoint 1 produced zero findings.
+    const storage = new FailingLatchWriteStorage(1);
+    const masterKey = generateRandomKey();
+    const { storedIdentity } = await seedStoredIdentity(storage, masterKey, "fortress");
+
+    const writer = new AuditLog(storage, masterKey, { checkpointInterval: 1 });
+    await appendCriticalEntries(writer, 1, storedIdentity.identity_id);
+    expect(await storage.read(CHECKPOINT_NAMESPACE, "__signing_latch")).toBeNull();
+
+    await appendCriticalEntries(writer, 1, storedIdentity.identity_id);
+    const latchRaw = await storage.read(CHECKPOINT_NAMESPACE, "__signing_latch");
+    expect(latchRaw).not.toBeNull();
+    const latch = JSON.parse(bytesToString(latchRaw!)) as {
+      data: { first_signed_sequence: number };
+    };
+    const checkpoints = await readCheckpoints(storage);
+    const earliestSigned = Math.min(
+      ...checkpoints
+        .filter((checkpoint) => checkpoint.unsigned === false)
+        .map((checkpoint) => checkpoint.checkpoint_sequence)
+    );
+    // The recovered floor is the EARLIEST signed checkpoint in the store,
+    // not the in-memory current sequence at retry time.
+    expect(latch.data.first_signed_sequence).toBe(earliestSigned);
+
+    // And the matrix claim holds: stripping that earliest checkpoint is a
+    // finding, not silence.
+    const metas = await storage.list(CHECKPOINT_NAMESPACE, CHECKPOINT_PREFIX);
+    const firstKey = metas[0]!.key;
+    const raw = await storage.read(CHECKPOINT_NAMESPACE, firstKey);
+    const record = JSON.parse(bytesToString(raw!)) as AuditCheckpointRecord;
+    expect(record.checkpoint_sequence).toBe(earliestSigned);
+    await storage.write(
+      CHECKPOINT_NAMESPACE,
+      firstKey,
+      stringToBytes(
+        JSON.stringify({
+          ...record,
+          signer_kid: null,
+          signature: null,
+          signature_algorithm: null,
+          unsigned: true,
+          unsigned_reason: "no signing identity available at checkpoint time",
+        })
+      )
+    );
+    const reader = new AuditLog(storage, masterKey, { integrityMode: "lenient" });
+    const result = await reader.query({ limit: 100 });
+    expect(result.integrity_findings).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ kind: "checkpoint_signing_downgrade" }),
+      ])
+    );
+  });
+
+  it("a load that finds signed checkpoints without a latch re-establishes it", async () => {
+    // The load-path half of the same fix: an attacker-deleted (or
+    // never-persisted) latch self-heals from the earliest VERIFIED signed
+    // record on the next load, closing the window until the next signed
+    // checkpoint write.
+    const storage = new MemoryStorage();
+    const masterKey = generateRandomKey();
+    const { storedIdentity } = await seedStoredIdentity(storage, masterKey, "fortress");
+    const writer = new AuditLog(storage, masterKey, { checkpointInterval: 1 });
+    await appendCriticalEntries(writer, 1, storedIdentity.identity_id);
+    await storage.delete(CHECKPOINT_NAMESPACE, "__signing_latch");
+
+    const reader = new AuditLog(storage, masterKey);
+    const result = await reader.query({ limit: 100 });
+    expect(result.integrity_findings).toEqual([]);
+    const latchRaw = await storage.read(CHECKPOINT_NAMESPACE, "__signing_latch");
+    expect(latchRaw).not.toBeNull();
+    const latch = JSON.parse(bytesToString(latchRaw!)) as {
+      data: { first_signed_sequence: number };
+    };
+    expect(latch.data.first_signed_sequence).toBe(1);
+  });
+
+  it("a valid latch whose referenced signed checkpoint is gone raises a finding", async () => {
+    // Second-gate probe 3: deleting the sole signed checkpoint while leaving
+    // the valid latch produced zero findings. Checkpoints have no pruning
+    // path, so the referenced record's absence is provable loss or deletion.
+    const storage = new MemoryStorage();
+    const masterKey = generateRandomKey();
+    const { storedIdentity } = await seedStoredIdentity(storage, masterKey, "fortress");
+    const writer = new AuditLog(storage, masterKey, { checkpointInterval: 1 });
+    await appendCriticalEntries(writer, 1, storedIdentity.identity_id);
+
+    const metas = await storage.list(CHECKPOINT_NAMESPACE, CHECKPOINT_PREFIX);
+    expect(metas).toHaveLength(1);
+    await storage.delete(CHECKPOINT_NAMESPACE, metas[0]!.key);
+
+    const reader = new AuditLog(storage, masterKey, { integrityMode: "lenient" });
+    const result = await reader.query({ limit: 100 });
+    expect(result.integrity_findings).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          kind: "checkpoint_signing_downgrade",
+          sequence: 1,
+        }),
+      ])
+    );
+  });
+});
+
 describe("IC-05: real composition root (createSanctuaryServer)", () => {
   let fortressHome: Awaited<ReturnType<typeof createTempHome>>;
 

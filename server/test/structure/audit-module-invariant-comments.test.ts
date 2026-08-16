@@ -78,10 +78,16 @@ describe("Audit module invariant comments", () => {
       "hashes collected while the write lock is held",
       "while the write lock is held",
     ]);
-    expectNear(source, "signed = (await this.checkpointSigner(payload)) ?? null;", [
+    expectNear(source, "signerFailure = failureMessage(err);", [
+      "not an identity-less fortress",
+      "made corruption produce a byte-identical",
+      "checkpoint_signing_error",
+    ]);
+    expectNear(source, "const record: AuditCheckpointRecord = {", [
       "Production checkpoints are signed by the constructor-derived fortress",
       "is serialized as `unsigned`",
-      "silently trusting a fallback key",
+      "fabricating signer evidence",
+      "identity-absence",
     ]);
   });
 

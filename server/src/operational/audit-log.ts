@@ -128,8 +128,18 @@ export type AuditIntegrityFindingKind =
   // `unsigned`/`unsigned_reason` fields are attacker-writable plaintext, so
   // without this memory a stripped signature is indistinguishable from an
   // honest pre-bootstrap store (MUST-NEVER #5, silent degrade). Also raised
-  // when the latch record itself is present but fails authentication.
+  // when the latch record itself is present but fails authentication, and
+  // when the signed checkpoint the latch references no longer survives in
+  // the store (checkpoints have no supported pruning path, so its absence is
+  // provable loss or deletion, never housekeeping).
   | "checkpoint_signing_downgrade"
+  // checkpoint_signing_error: a checkpoint was written unsigned because the
+  // SIGNER FAILED (identity material exists but is unreadable or corrupt, or
+  // the signing operation itself failed), which is a different state from
+  // the honest "this fortress holds no identity yet". Collapsing the two was
+  // an empirical silent fail-open (second-gate HIGH): a corrupted identity
+  // record demoted checkpoints to unsigned with zero findings.
+  | "checkpoint_signing_error"
   // F2 Option A (writer-split) boundary findings. See the module doc comment
   // near AUDIT_SPLIT_BOUNDARY_DIRNAME.
   //  - split_boundary_invalid: a boundary record is PRESENT but fails MAC
@@ -430,6 +440,16 @@ const AUDIT_HEAD_ANCHOR_MAC_DOMAIN = "sanctuary.audit-head-anchor.v1\n";
 // `audit/checkpoint-shape.ts`.
 const AUDIT_SIGNING_LATCH_MARKER = "__sanctuary_audit_signing_latch_v1";
 const AUDIT_SIGNING_LATCH_MAC_DOMAIN = "sanctuary.audit-signing-latch.v1\n";
+// The two honest reasons a persisted checkpoint may carry for being unsigned.
+// They are DIFFERENT states with different load-time consequences: proven
+// identity absence is clean (pre-bootstrap fortresses are real), while a
+// signer FAILURE (unreadable/corrupt identity material, failed signing op)
+// raises a `checkpoint_signing_error` finding on every later load. Both
+// literals are at-rest values on existing records; never edit them.
+const AUDIT_UNSIGNED_REASON_NO_IDENTITY =
+  "no signing identity available at checkpoint time";
+const AUDIT_UNSIGNED_REASON_SIGNER_ERROR =
+  "checkpoint signer failed: identity material unreadable or signing error";
 
 // ── F2 Option A: fortress audit store split by writer ──────────────────────
 //
@@ -3069,34 +3089,141 @@ export class AuditLog {
   }
 
   /**
-   * One-way write of the checkpoint-signing latch: called after the first
-   * SIGNED `audit-checkpoint` record is persisted. Records the sequence at
-   * which signing was first observed, MAC'd under master-derived material so
-   * it cannot be forged or edited by a storage-only attacker (deleting it is
-   * the residual, partially covered by the in-store signed-checkpoint signal
-   * in `verifyCheckpoints`). Never overwrites an existing record, whatever
-   * its content: a valid latch must keep its ORIGINAL first-signed floor, and
-   * an invalid one is tamper evidence the verify path must keep seeing, so
-   * re-stamping it here would erase exactly what the finding reports.
-   * Best-effort by design: a latch write failure must not fail the checkpoint
-   * append it rides on (availability), and only ever costs detection of a
-   * LATER downgrade, never a false finding.
+   * Resolve the verification-key candidates for one checkpoint signer_kid
+   * through the configured (or constructor-derived) resolver. A resolver
+   * failure yields the empty set, never a throw: the callers convert "no
+   * keys" into loud findings or into refusing to trust a record, so failing
+   * toward emptiness can only ADD findings, never suppress them.
    */
-  private async ensureSigningLatchEstablished(
-    firstSignedSequence: number,
-    signerKid: string,
-    signedAt: string
-  ): Promise<void> {
+  private async resolveCheckpointVerificationKeys(
+    signerKid: string
+  ): Promise<Array<string | Uint8Array>> {
+    let resolution: AuditCheckpointKeyResolution;
+    try {
+      resolution = await this.checkpointPublicKeyResolver(signerKid);
+    } catch {
+      resolution = undefined;
+    }
+    return (Array.isArray(resolution) ? resolution : [resolution]).filter(
+      (key): key is string | Uint8Array => key !== undefined
+    );
+  }
+
+  /** True iff this record carries a signature that verifies against the
+   * signer's RESOLVED (authenticated) keys; embedded keys are never used. */
+  private async checkpointSignatureVerifies(
+    checkpoint: AuditCheckpointRecord
+  ): Promise<boolean> {
+    if (checkpoint.unsigned || !checkpoint.signer_kid || !checkpoint.signature) {
+      return false;
+    }
+    const keys = await this.resolveCheckpointVerificationKeys(checkpoint.signer_kid);
+    return keys.some((publicKey) =>
+      verifyCheckpointSignature(
+        checkpointPayload(checkpoint),
+        checkpoint.signature!,
+        publicKey
+      )
+    );
+  }
+
+  /**
+   * The earliest audit-checkpoint sequence among RECORDS WHOSE SIGNATURE
+   * VERIFIES against the authenticated resolver, or null when none does.
+   * Verification (not mere `unsigned: false` shape) is load-bearing here in
+   * one direction only: it stops a WRONG-KEY instance (a transitional
+   * rotation reader, an nd-store key) from establishing a latch MAC'd under
+   * key material the real fortress master would later reject as tampered.
+   * An attacker-planted fake "signed" record can never RAISE the floor
+   * (minimum), so skipping unverifiable records is safe in the conservative
+   * direction.
+   */
+  private async earliestVerifiedSignedSequence(
+    checkpoints: readonly AuditCheckpointRecord[]
+  ): Promise<{ sequence: number; signerKid: string; signedAt: string } | null> {
+    let earliest: { sequence: number; signerKid: string; signedAt: string } | null =
+      null;
+    for (const checkpoint of checkpoints) {
+      if (checkpoint.checkpoint_kind !== "audit-checkpoint") continue;
+      if (checkpoint.unsigned) continue;
+      if (earliest && checkpoint.checkpoint_sequence >= earliest.sequence) continue;
+      if (await this.checkpointSignatureVerifies(checkpoint)) {
+        earliest = {
+          sequence: checkpoint.checkpoint_sequence,
+          signerKid: checkpoint.signer_kid!,
+          signedAt: checkpoint.signed_at,
+        };
+      }
+    }
+    return earliest;
+  }
+
+  /**
+   * One-way (re)establishment of the checkpoint-signing latch. Called after
+   * a signed `audit-checkpoint` write, and from the load path when signed
+   * checkpoints exist but the latch is absent (a swallowed first write, or a
+   * deleted latch).
+   *
+   * Floor recovery invariant (second-gate HIGH): the recorded
+   * `first_signed_sequence` is the MINIMUM of the caller's candidate (the
+   * record this process just signed, trusted by construction) and the
+   * earliest VERIFIED signed checkpoint already in the store. Stamping the
+   * in-memory current sequence alone was exploitable: if the first latch
+   * write failed, the retry stamped a LATER floor and the earlier signed
+   * checkpoint could be stripped without a finding.
+   *
+   * Never overwrites an existing record, whatever its content: a valid latch
+   * must keep its ORIGINAL floor, and an invalid one is tamper evidence the
+   * verify path must keep seeing, so re-stamping would erase exactly what
+   * the finding reports. A persistence failure is LOUD (stderr) but does not
+   * fail the append or load it rides on: until a later write or load
+   * succeeds, the in-store verified-signed floor in `verifyCheckpoints`
+   * remains the active detector, so the failure costs redundancy, not
+   * detection.
+   */
+  private async establishSigningLatchIfAbsent(candidate?: {
+    candidateSequence: number;
+    signerKid: string;
+    signedAt: string;
+  }): Promise<void> {
     try {
       const existing = await this.storage.read(
         AUDIT_CHECKPOINT_NAMESPACE,
         AUDIT_SIGNING_LATCH_KEY
       );
       if (existing !== null) return;
+
+      let floor = candidate
+        ? {
+            sequence: candidate.candidateSequence,
+            signerKid: candidate.signerKid,
+            signedAt: candidate.signedAt,
+          }
+        : null;
+      try {
+        const throwaway: AuditIntegrityFinding[] = [];
+        const stored = await this.readCheckpoints("audit-checkpoint", throwaway);
+        const earliest = await this.earliestVerifiedSignedSequence(stored);
+        if (earliest && (!floor || earliest.sequence < floor.sequence)) {
+          floor = {
+            sequence: earliest.sequence,
+            signerKid: earliest.signerKid,
+            signedAt: earliest.signedAt,
+          };
+        }
+      } catch (err) {
+        // Enumeration failure: fall back to the candidate floor (still
+        // correct for a first-ever signed checkpoint), but say so.
+        console.error(
+          `[audit-log] signing-latch floor recovery could not enumerate stored checkpoints: ${failureMessage(err)}`
+        );
+      }
+      if (!floor) return;
+
       const data = {
-        first_signed_sequence: firstSignedSequence,
-        signer_kid: signerKid,
-        signed_at: signedAt,
+        first_signed_sequence: floor.sequence,
+        signer_kid: floor.signerKid,
+        signed_at: floor.signedAt,
       };
       const envelope = {
         [AUDIT_SIGNING_LATCH_MARKER]: true,
@@ -3121,8 +3248,14 @@ export class AuditLog {
           bytes
         );
       }
-    } catch {
-      // See doc comment: best-effort; never fail the checkpoint append.
+    } catch (err) {
+      // Loud, never silent (second-gate HIGH): a swallowed latch failure is
+      // an invisible hole in downgrade detection. Retried on the next signed
+      // checkpoint write AND on every load that sees signed checkpoints
+      // without a latch.
+      console.error(
+        `[audit-log] checkpoint-signing latch could not be established: ${failureMessage(err)}`
+      );
     }
   }
 
@@ -5728,13 +5861,51 @@ export class AuditLog {
     // finding-free; that bound is part of the external-verifier drill's
     // downgrade-probe acceptance criteria. A latch that is present but does
     // not authenticate is itself a finding, never a silent skip.
-    const latch = await this.readSigningLatch();
+    let latch = await this.readSigningLatch();
     if (latch.status === "invalid") {
       findings.push({
         kind: "checkpoint_signing_downgrade",
         message:
           "the checkpoint-signing latch is present but does not authenticate under this master (tampered or wrong-key edit)",
       });
+    }
+    if (latch.status === "absent") {
+      // Latch self-healing (second-gate HIGH): signed checkpoints without a
+      // latch mean either the first latch write failed or the latch was
+      // deleted; both leave a detection hole until the next SIGNED write.
+      // Re-establish here from the earliest VERIFIED signed record (a
+      // wrong-key instance cannot verify any record, so it can never stamp a
+      // latch the true master would reject), and use the recovered floor for
+      // THIS pass even if the persist fails again.
+      const earliest = await this.earliestVerifiedSignedSequence(checkpoints);
+      if (earliest) {
+        await this.establishSigningLatchIfAbsent();
+        latch = { status: "valid", first_signed_sequence: earliest.sequence };
+      }
+    }
+    if (latch.status === "valid" && latch.first_signed_sequence > sealedTipSequence) {
+      // The latch's referenced signed checkpoint must still exist:
+      // checkpoints have no supported pruning path, so a valid latch whose
+      // first-signed record is gone is provable loss or deletion (the
+      // second-gate probe deleted the sole signed checkpoint and left the
+      // latch untouched: zero findings). A record at/below the sealed split
+      // tip is exempt only because it may be legitimately unreadable at this
+      // privilege (root-owned sealed-region file), the same skip the
+      // checkpoint read path itself applies. A record that survives but was
+      // STRIPPED to unsigned is handled by the floor loop below instead.
+      const latchFloor = latch.first_signed_sequence;
+      const referenced = checkpoints.some(
+        (checkpoint) => checkpoint.checkpoint_sequence === latchFloor
+      );
+      if (!referenced) {
+        findings.push({
+          kind: "checkpoint_signing_downgrade",
+          sequence: latchFloor,
+          message:
+            `the signing latch records a first signed checkpoint at sequence ${latchFloor}, ` +
+            "but no checkpoint record survives there; checkpoints are never pruned, so this is deletion or loss",
+        });
+      }
     }
     let signedFloor =
       latch.status === "valid" ? latch.first_signed_sequence : Number.POSITIVE_INFINITY;
@@ -5763,7 +5934,24 @@ export class AuditLog {
     checkpoint: AuditCheckpointRecord,
     findings: AuditIntegrityFinding[]
   ): Promise<void> {
-    if (checkpoint.unsigned) return;
+    if (checkpoint.unsigned) {
+      // Absence vs failure invariant (second-gate HIGH): a checkpoint whose
+      // recorded reason says the SIGNER FAILED is never a clean state, on
+      // any fortress, latch or no latch. The reason string is
+      // attacker-writable, but an attacker REMOVING it only moves the record
+      // onto the latch/floor downgrade detector; PLANTING it creates
+      // findings. Either direction fails toward loudness.
+      if (checkpoint.unsigned_reason === AUDIT_UNSIGNED_REASON_SIGNER_ERROR) {
+        findings.push({
+          kind: "checkpoint_signing_error",
+          sequence: checkpoint.checkpoint_sequence,
+          message:
+            `checkpoint ${checkpoint.checkpoint_sequence} was written unsigned because the ` +
+            "signer FAILED (identity material unreadable or signing error), not because the fortress holds no identity",
+        });
+      }
+      return;
+    }
     if (!checkpoint.signer_kid || !checkpoint.signature) {
       findings.push({
         kind: "checkpoint_signature_mismatch",
@@ -5773,18 +5961,12 @@ export class AuditLog {
       return;
     }
 
-    let resolution: AuditCheckpointKeyResolution;
-    try {
-      resolution = await this.checkpointPublicKeyResolver(checkpoint.signer_kid);
-    } catch {
-      // A resolver failure reads as "signer unknown" and surfaces as a
-      // finding below; it must never read as verified, and must never crash
-      // the load pass that the rest of the chain verification rides on.
-      resolution = undefined;
-    }
-    const resolvedPublicKeys = (
-      Array.isArray(resolution) ? resolution : [resolution]
-    ).filter((key): key is string | Uint8Array => key !== undefined);
+    // A resolver failure reads as "signer unknown" and surfaces as a finding
+    // below; it must never read as verified, and must never crash the load
+    // pass that the rest of the chain verification rides on.
+    const resolvedPublicKeys = await this.resolveCheckpointVerificationKeys(
+      checkpoint.signer_kid
+    );
     // Checkpoint trust-basis invariant: an embedded public key is part of the
     // checkpoint being verified, so it is attacker-controlled unless the caller
     // explicitly asks for an internal-consistency check instead of signer trust.
@@ -6058,19 +6240,37 @@ export class AuditLog {
   private async writeCheckpointRecord(
     payload: AuditCheckpointSigningPayload
   ): Promise<void> {
-    let signed: AuditCheckpointSignature | null;
+    let signed: AuditCheckpointSignature | null = null;
+    let signerFailure: string | null = null;
     try {
       signed = (await this.checkpointSigner(payload)) ?? null;
-    } catch {
-      signed = null;
+    } catch (err) {
+      // Absence vs failure invariant (second-gate HIGH): a signer that
+      // THROWS reports failed identity material (unreadable/corrupt record,
+      // failed signing op), not an identity-less fortress. Collapsing the
+      // throw into `signed = null` made corruption produce a byte-identical
+      // "honest" unsigned checkpoint with zero findings. The append itself
+      // still completes: an audit trail that stops recording because its
+      // signing dependency rotted destroys the evidence needed to diagnose
+      // that rot, and the MUST-NEVER #5 fail-closed duty is discharged at
+      // LOAD instead, where the distinct reason below raises a
+      // `checkpoint_signing_error` finding (strict instances then fail
+      // closed on their next load).
+      signerFailure = failureMessage(err);
+      // SAFETY: stderr diagnostic (operator-facing channel); never stdout.
+      console.error(
+        `[audit-log] checkpoint ${payload.checkpoint_sequence} written UNSIGNED because the signer FAILED (not identity absence): ${signerFailure}`
+      );
     }
 
     // Production checkpoints are signed by the constructor-derived fortress
     // identity binding (IC-05); a checkpoint may still be unsigned when the
-    // store holds no signable identity (fresh fortress before bootstrap, a
-    // store whose adapter cannot reach identity records). That honest bound
-    // is serialized as `unsigned` instead of fabricating signer evidence or
-    // silently trusting a fallback key.
+    // store provably holds no signable identity (fresh fortress before
+    // bootstrap, a store whose adapter cannot reach identity records). That
+    // honest bound is serialized as `unsigned` with the identity-absence
+    // reason, instead of fabricating signer evidence or silently trusting a
+    // fallback key; a signer FAILURE carries the distinct signer-error
+    // reason so the load path can tell the two apart.
     const record: AuditCheckpointRecord = {
       schema_version: AUDIT_CHECKPOINT_SCHEMA_VERSION,
       ...payload,
@@ -6081,7 +6281,11 @@ export class AuditLog {
       unsigned: !signed,
       ...(signed?.public_key ? { public_key: signed.public_key } : {}),
       ...(!signed
-        ? { unsigned_reason: "no signing identity available at checkpoint time" }
+        ? {
+            unsigned_reason: signerFailure
+              ? AUDIT_UNSIGNED_REASON_SIGNER_ERROR
+              : AUDIT_UNSIGNED_REASON_NO_IDENTITY,
+          }
         : {}),
     };
     const key = `${payload.checkpoint_kind}-${String(payload.checkpoint_sequence).padStart(20, "0")}`;
@@ -6096,11 +6300,11 @@ export class AuditLog {
       // finding, not a pre-bootstrap read. Scoped to the "audit-checkpoint"
       // kind because the legacy anchor's `checkpoint_sequence` counts the
       // LEGACY entry space and would poison the chained-sequence floor.
-      await this.ensureSigningLatchEstablished(
-        payload.checkpoint_sequence,
-        signed.signer_kid,
-        payload.signed_at
-      );
+      await this.establishSigningLatchIfAbsent({
+        candidateSequence: payload.checkpoint_sequence,
+        signerKid: signed.signer_kid,
+        signedAt: payload.signed_at,
+      });
     }
   }
 

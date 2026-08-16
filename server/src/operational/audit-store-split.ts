@@ -106,10 +106,19 @@ function remapNamespace(namespace: string): string {
     // `AuditLog` change that touches a fourth namespace must fail LOUD here
     // rather than silently writing operator-chain data into the daemon-owned
     // store, or vice versa.
-    throw new Error(
+    const err = new Error(
       `DaemonAuditStorageAdapter: refusing to touch unexpected namespace "${namespace}" ` +
         `(only "_audit", "_audit_checkpoints", and "_meta" are remapped for the daemon audit chain)`
     );
+    // Machine-readable marker so consumers can tell this STRUCTURAL
+    // refusal ("this store can never hold that namespace") apart from a
+    // real IO/corruption failure. The checkpoint signer treats it as proven
+    // identity absence (honest unsigned checkpoints on the daemon chain)
+    // rather than a loud signer error. Must match the code checked by
+    // `isStructuralNamespaceRefusal` in `audit/checkpoint-identity.ts`.
+    (err as Error & { code?: string }).code =
+      "SANCTUARY_AUDIT_NAMESPACE_UNSUPPORTED";
+    throw err;
   }
   return mapped;
 }
