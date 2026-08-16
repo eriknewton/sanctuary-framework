@@ -173,4 +173,110 @@ describe("AuditLog write-lock hold window on first load (C9)", () => {
     },
     30_000,
   );
+
+  // The test above proves the C9 bound holds for ONE stuck first-load wave.
+  // AGENTS.md rule 12 requires proving a bounded critical section holds under
+  // a genuine fault SCHEDULE -- repeated and overlapping admission waves, and
+  // a wave completing late relative to the ones after it -- not just a single
+  // instantaneous instance, because a per-wave-correct guard can still be
+  // reachable only once a second or third stuck loader piles onto the same
+  // cross-process lock, or once one wave's retry resolves out of order.
+  it(
+    "does not accumulate lock contention across repeated, overlapping first-load waves, and each independent write stays far under the lock timeout (AGENTS.md rule 12)",
+    async () => {
+      const root = await mkdtemp(join(tmpdir(), "sanctuary-audit-lock-firstload-waves-"));
+      dirs.push(root);
+      const storagePath = join(root, "state");
+      const lockPath = join(storagePath, AUDIT_NAMESPACE, LOCK_FILE);
+      const masterKey = generateRandomKey();
+
+      const seedCount = 5;
+      const seeder = new AuditLog(new FilesystemStorage(storagePath), masterKey, {
+        checkpointInterval: 10_000,
+      });
+      for (let i = 0; i < seedCount; i++) {
+        await seeder.appendCritical(entry("seed", i));
+      }
+      await seeder.flush();
+
+      // Three independent "processes" (A, B, C), each with its OWN
+      // GatedTornListingStorage instance, so each gates on its OWN first
+      // `_audit` listing -- mirroring three separate appenders each hitting
+      // their first-ever load -- started on an OVERLAPPING, staggered
+      // schedule rather than one at a time.
+      const waveA = new GatedTornListingStorage(storagePath);
+      const waveB = new GatedTornListingStorage(storagePath);
+      const waveC = new GatedTornListingStorage(storagePath);
+      const sutA = new AuditLog(waveA, masterKey, { checkpointInterval: 10_000 });
+      const sutB = new AuditLog(waveB, masterKey, { checkpointInterval: 10_000 });
+      const sutC = new AuditLog(waveC, masterKey, { checkpointInterval: 10_000 });
+
+      async function timedIndependentWrite(label: string): Promise<number> {
+        const writer = new AuditLog(new FilesystemStorage(storagePath), masterKey, {
+          checkpointInterval: 10_000,
+        });
+        const started = Date.now();
+        await writer.appendCritical(entry(label, 0));
+        await writer.flush();
+        return Date.now() - started;
+      }
+
+      // Wave A begins and gets stuck on its torn first read.
+      const appendA = sutA.appendCritical(entry("wave-a", 0));
+      await waveA.firstCallSeen;
+      expect(await lockFileExists(lockPath)).toBe(false);
+
+      // Wave B begins WHILE wave A is still stuck: two independent
+      // first-loads stuck on the same underlying lock at once.
+      const appendB = sutB.appendCritical(entry("wave-b", 0));
+      await waveB.firstCallSeen;
+      expect(await lockFileExists(lockPath)).toBe(false);
+
+      // An unrelated writer must still be free to use the lock while BOTH A
+      // and B are stuck, and must complete far under the 5s contention
+      // timeout (AUDIT_WRITE_LOCK_TIMEOUT_MS) -- proving the timeout budget
+      // is never even approached, not merely that the append eventually
+      // succeeds before it expires.
+      const elapsed1 = await timedIndependentWrite("writer-1");
+      expect(elapsed1).toBeLessThan(1_000);
+
+      // Wave A's gate is released now but NOT awaited yet: its retry pass
+      // (a second, non-gated listing plus decrypt/verify) keeps running
+      // concurrently with wave C starting below, so wave A completes LATE
+      // relative to wave C's admission rather than strictly before it.
+      waveA.release();
+
+      // Wave C begins while A is still finishing late and B is still stuck:
+      // a THIRD overlapping first-load wave, proving the bound holds under a
+      // three-deep pile-up, not just a pairwise one.
+      const appendC = sutC.appendCritical(entry("wave-c", 0));
+      await waveC.firstCallSeen;
+      expect(await lockFileExists(lockPath)).toBe(false);
+
+      const elapsed2 = await timedIndependentWrite("writer-2");
+      expect(elapsed2).toBeLessThan(1_000);
+
+      // Release the remaining waves and let all three settle in whatever
+      // order their retries actually finish.
+      waveB.release();
+      waveC.release();
+      await Promise.all([appendA, appendB, appendC]);
+      await Promise.all([sutA.flush(), sutB.flush(), sutC.flush()]);
+
+      // No wave admitted a torn read, no sequence collided across the
+      // three-deep overlap, and the chain is contiguous across seed + 3
+      // waves + 2 independent writers.
+      const reader = new AuditLog(new FilesystemStorage(storagePath), masterKey, {
+        checkpointInterval: 10_000,
+      });
+      const result = await reader.query({ limit: 100 });
+      expect(result.integrity_findings).toEqual([]);
+      expect(result.total).toBe(seedCount + 5);
+      const ops = result.entries.map((e) => e.operation);
+      for (const op of ["wave-a", "wave-b", "wave-c", "writer-1", "writer-2"]) {
+        expect(ops).toContain(op);
+      }
+    },
+    30_000,
+  );
 });
