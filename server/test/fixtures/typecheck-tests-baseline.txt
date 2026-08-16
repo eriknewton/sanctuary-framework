@@ -68,8 +68,8 @@ test/cli/auto-trigger-audit.test.ts(47,75): error TS2345: Argument of type '() =
 test/cli/castle-wall-audit-verify.test.ts(115,7): error TS2739: Type '{ host: string; ip: string; port: number; protocol: "tcp"; }' is missing the following properties from type 'IpcDestination': hostname_source, opaque
 test/cli/castle-wall-repair-custody.test.ts(140,5): error TS2322: Type 'Writable' is not assignable to type 'Writable & CaptureStream'.
 test/cli/castle-wall-repair-custody.test.ts(141,5): error TS2322: Type 'Writable' is not assignable to type 'Writable & CaptureStream'.
-test/cli/castle-wall.test.ts(1309,26): error TS2339: Property 'sequence' does not exist on type 'AuditEntry'.
-test/cli/castle-wall.test.ts(1309,52): error TS2339: Property 'sequence' does not exist on type 'AuditEntry'.
+test/cli/castle-wall.test.ts(1312,26): error TS2339: Property 'sequence' does not exist on type 'AuditEntry'.
+test/cli/castle-wall.test.ts(1312,52): error TS2339: Property 'sequence' does not exist on type 'AuditEntry'.
 test/cli/singleton-audit-writes.test.ts(179,75): error TS2345: Argument of type '() => void' is not assignable to parameter of type '(layer: "l1" | "l2" | "l3" | "l4", operation: string, identityId: string, details?: Record<string, unknown> | undefined, result?: "success" | "failure" | undefined) => Promise<...>'.
 test/cli/singleton-audit-writes.test.ts(217,75): error TS2345: Argument of type '() => void' is not assignable to parameter of type '(layer: "l1" | "l2" | "l3" | "l4", operation: string, identityId: string, details?: Record<string, unknown> | undefined, result?: "success" | "failure" | undefined) => Promise<...>'.
 test/cli/singleton-audit-writes.test.ts(239,8): error TS7006: Parameter 'c' implicitly has an 'any' type.
