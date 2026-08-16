@@ -5897,6 +5897,9 @@ export class AuditLog {
       // rewrite into the honest-absence shape would be a false assurance.
       // Authenticated downgrade/failure EVIDENCE is deliberately deferred to
       // a design-first follow-up (register id IC-05-DG).
+      // SAFETY: raw stderr is the contract here: this diagnostic must reach
+      // the operator console even when the audit log itself is the failing
+      // component, so it cannot route through any audit-backed logger.
       console.error(
         `[audit-log] checkpoint ${payload.checkpoint_sequence} written UNSIGNED because the signer FAILED (not identity absence): ${failureMessage(err)}`
       );
