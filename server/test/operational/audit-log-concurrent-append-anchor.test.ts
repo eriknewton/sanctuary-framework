@@ -252,6 +252,15 @@ describe("AuditLog read-vs-append ordering (register C6)", () => {
       const tornBytes = await readFile(torn);
       await unlink(torn);
 
+      // `victim` is fresh (never loaded), so this append drives its FIRST-EVER
+      // load-and-verify pass. Before the C9 fix, `persistChainedEntry` called
+      // `ensureLoaded()` INSIDE `withAuditWriteLock`, so this doomed first
+      // load ran (and failed) while holding the cross-process write lock —
+      // this assertion used to read `toContain(true)`. C9 moved that call to
+      // run BEFORE the lock is requested, so a first load that fails closed
+      // (as this one does, over a genuine gap) never touches the lock at
+      // all: see `audit-log-write-lock-first-load.test.ts` for the dedicated
+      // C9 coverage of the lock-hold-window shrink itself.
       const victim = new AuditLog(storage, masterKey, { checkpointInterval: 0 });
       await expect(appendCritical(victim, "fails-over-gap")).rejects.toMatchObject({
         name: "AuditIntegrityError",
@@ -259,7 +268,7 @@ describe("AuditLog read-vs-append ordering (register C6)", () => {
           expect.objectContaining({ kind: "sequence_gap_or_reorder" }),
         ]),
       });
-      expect(storage.fullPassLockHeld).toContain(true);
+      expect(storage.fullPassLockHeld).not.toContain(true);
 
       await writeFile(torn, tornBytes, { mode: 0o600 });
       const quiet = new AuditLog(storage, masterKey, { checkpointInterval: 0 });

@@ -43,6 +43,7 @@ import {
   sha256Hex,
   verifyCheckpointSignature,
 } from "../audit/chain.js";
+import { createFortressCheckpointIdentityBinding } from "../audit/checkpoint-identity.js";
 import type { PluginContribution } from "../substrate/attribution.js";
 
 export interface AuditEntry {
@@ -155,6 +156,19 @@ export interface AuditCreateOwner {
 
 type AuditLockFileHandle = Awaited<ReturnType<typeof open>>;
 
+/**
+ * What a checkpoint public-key resolver may hand back for one `signer_kid`:
+ * a single key, the signer's full authenticated key set (current key plus
+ * verified rotation-chain predecessors, so pre-rotation checkpoints keep
+ * verifying after a rotation), or `undefined`/an empty set for "this signer
+ * is unknown", which the verify path reports as an integrity finding.
+ */
+export type AuditCheckpointKeyResolution =
+  | string
+  | Uint8Array
+  | ReadonlyArray<string | Uint8Array>
+  | undefined;
+
 export interface AuditLogConfig {
   /** Maximum total size of stored audit entries in bytes. Default: 100 MB. */
   maxTotalSizeBytes?: number;
@@ -195,12 +209,28 @@ export interface AuditLogConfig {
   consultSplitBoundary?: boolean;
   /** Write a checkpoint after this many critical appends. Default: 100. */
   checkpointInterval?: number;
-  /** Optional typed identity signing bridge for checkpoint records. */
+  /**
+   * Typed identity signing bridge for checkpoint records. Optional in the
+   * CONFIG only as an injection seam (tests, embedders with their own key
+   * custody): when omitted, the constructor derives the production fortress
+   * signer from its own required arguments (IC-05), so no call site can
+   * silently opt out of checkpoint signing by forgetting a config field.
+   */
   checkpointSigner?: (
     payload: AuditCheckpointSigningPayload
   ) => Promise<AuditCheckpointSignature | null>;
-  /** Resolve a known checkpoint signing key by signer_kid. */
-  checkpointPublicKeyResolver?: (signerKid: string) => string | Uint8Array | undefined;
+  /**
+   * Resolve known checkpoint signing keys by signer_kid. May return a single
+   * key or the signer's full authenticated key set (current key plus
+   * rotation-chain predecessors), synchronously or as a promise. Same
+   * injection-seam contract as `checkpointSigner`: omitted means the
+   * constructor-derived fortress resolver, not "no resolution".
+   */
+  checkpointPublicKeyResolver?: (
+    signerKid: string
+  ) =>
+    | AuditCheckpointKeyResolution
+    | Promise<AuditCheckpointKeyResolution>;
   /**
    * Explicit self-check opt-in for checkpoint-embedded public keys.
    * Embedded keys prove record self-consistency only, not signer identity.
@@ -1806,12 +1836,14 @@ export class AuditLog {
   private readonly maxInMemoryEntries: number;
   private readonly integrityMode: "strict" | "lenient";
   private readonly checkpointInterval: number;
-  private readonly checkpointSigner?: (
+  private readonly checkpointSigner: (
     payload: AuditCheckpointSigningPayload
   ) => Promise<AuditCheckpointSignature | null>;
-  private readonly checkpointPublicKeyResolver?: (
+  private readonly checkpointPublicKeyResolver: (
     signerKid: string
-  ) => string | Uint8Array | undefined;
+  ) =>
+    | AuditCheckpointKeyResolution
+    | Promise<AuditCheckpointKeyResolution>;
   private readonly trustEmbeddedCheckpointPublicKeys: boolean;
   private readonly integrityAnomalySubscribers: AuditIntegrityAnomalySubscriber[];
   private readonly filesystemCapabilities?: FilesystemStorageCapabilities;
@@ -1942,8 +1974,28 @@ export class AuditLog {
     this.integrityMode = config?.integrityMode ?? "strict";
     this.checkpointInterval =
       config?.checkpointInterval ?? DEFAULT_CHECKPOINT_INTERVAL;
-    this.checkpointSigner = config?.checkpointSigner;
-    this.checkpointPublicKeyResolver = config?.checkpointPublicKeyResolver;
+    // IC-05 enforcement site (AGENTS.md assurance rule 3): the checkpoint
+    // signer/resolver pair used to be an optional dependency that every test
+    // supplied and every production call site omitted, so shipped fortresses
+    // wrote unsigned checkpoints and distrusted signed ones. Rule 3 offers
+    // "make it required" or "fail closed on absence"; this site takes the
+    // stronger third form: the production pair is DERIVED from the
+    // constructor's own required arguments (storage + master key), so no call
+    // site can omit it. Explicit config remains the injection seam and wins
+    // per field. Fail-closed-on-absence was rejected one level down instead
+    // of here: a fortress legitimately has zero identities until bootstrap,
+    // and refusing audit appends then would make audit availability depend on
+    // identity existence; that case degrades to the honest `unsigned`
+    // checkpoint record, never to a silently trusted fallback key.
+    const fortressCheckpointIdentity = createFortressCheckpointIdentityBinding(
+      storage,
+      derivePurposeKey(masterKey, "identity-encryption")
+    );
+    this.checkpointSigner =
+      config?.checkpointSigner ?? fortressCheckpointIdentity.checkpointSigner;
+    this.checkpointPublicKeyResolver =
+      config?.checkpointPublicKeyResolver ??
+      fortressCheckpointIdentity.checkpointPublicKeyResolver;
     this.trustEmbeddedCheckpointPublicKeys =
       config?.trustEmbeddedCheckpointPublicKeys ?? false;
     this.integrityAnomalySubscribers = config?.integrityAnomalySubscribers ?? [];
@@ -2265,19 +2317,48 @@ export class AuditLog {
     try {
       const normalized = this.normalizeEntry(entry);
       await this.reverifyCachedIntegrityFindingsBeforeAppend();
+      // C9 (availability, register): resolve the mandatory first-load
+      // read-consistency pass BEFORE requesting the cross-process write lock,
+      // not inside it. `ensureLoaded()` is a no-op once `this.loaded` is true
+      // (every append after this process's first), so this call is where the
+      // multi-pass decrypt+retry cost — up to 2x a full chain verify, see
+      // `loadPersistedEntriesWithReadConsistency` — actually lands: on the
+      // FIRST append only, and now with no write lock held while it runs,
+      // exactly mirroring how `reverifyCachedIntegrityFindingsBeforeAppend`
+      // above already takes its own fresh look lock-free. If it throws
+      // (strict mode, a store that never settled), the append never requests
+      // the lock at all, so a torn read on this process's first load can no
+      // longer hold other appenders in lock-contention for the retry's
+      // duration. The retry loop itself — deadline, store-stability
+      // discrimination — is UNCHANGED; only WHEN it runs relative to lock
+      // acquisition has moved. See the (retired) KNOWN LATENCY EXPOSURE note
+      // in `loadPersistedEntriesWithReadConsistency`. Not re-called inside
+      // the lock below: appends are strictly serialized per-process through
+      // `enqueueAppend`'s `appendQueue` chain (this is the only call site of
+      // `persistChainedEntry`), so by the time the lock callback below runs,
+      // `this.loaded` is already true (this call either set it or threw
+      // before the lock was ever requested) and a repeat call would be a
+      // guaranteed no-op purchased with real microtask-tick cost, not free
+      // defense in depth.
+      await this.ensureLoaded();
       const serialized = stringToBytes(JSON.stringify(normalized));
       const encrypted = encrypt(serialized, this.encryptionKey);
       const encryptedBytes = stringToBytes(JSON.stringify(encrypted));
       const encryptedPayloadBytes = toBase64url(encryptedBytes);
       await this.withAuditWriteLock(async (signal) => {
         this.assertAuditWriteLockActive(signal);
-        // LOCK-HOLD COST: on this process's FIRST append this is a full
-        // load-and-verify pass held inside the cross-process write lock, and the
-        // read-consistency retry can make it two. See the KNOWN LATENCY EXPOSURE
-        // note in `loadPersistedEntriesWithReadConsistency` for the measured
-        // bound and why it is accepted rather than mitigated here.
-        await this.ensureLoaded();
-        this.assertAuditWriteLockActive(signal);
+        // Incremental re-check of only the unstable tail (O(1) backward walk;
+        // see the Mini1-drill note on `readLatestPersistedChainState`), not a
+        // full re-verify. This is what protects correctness against a write
+        // that lands in the gap between the outside-lock `ensureLoaded()`
+        // above and this process actually acquiring the lock: it refreshes
+        // `nextSequence` / `lastEntryHash` to the true on-disk tip before they
+        // are used below, so a concurrent legitimate append is never lost or
+        // double-chained. It does not re-run the full decrypt+hash-chain
+        // verify, and does not need to: every append after the first already
+        // relies on this same freshen step today, never a per-append full
+        // reload, so this is the existing steady-state guarantee, not a
+        // weaker one.
         await this.freshenChainStateFromDisk();
         this.assertAuditWriteLockActive(signal);
         const sequence = this.nextSequence;
@@ -3953,40 +4034,52 @@ export class AuditLog {
       // the budget is 2s. Every transient tear on a large log therefore became
       // a hard tamper verdict on the first look, with no second look at all.
       //
-      // KNOWN LATENCY EXPOSURE (availability, not tamper weakening; accepted
-      // 2026-08-05, unmitigated on purpose). In the case this change is about —
-      // one pass outliving the 2s budget — making the retry mandatory costs
-      // exactly ONE extra full pass: the second pass establishes the baseline
-      // with the deadline already blown, so this check ends the loop. (Further
-      // passes remain possible in general, but only while the store is
-      // demonstrably mutating AND the whole loop is still inside the budget,
-      // i.e. only when passes are cheap.) But `persistChainedEntry`
-      // calls `ensureLoaded()` INSIDE `withAuditWriteLock`, so on an appending
-      // process's FIRST load that extra pass is paid while the cross-process
-      // write lock is held.
+      // LATENCY NOTE (availability, not tamper weakening). In the case this
+      // change is about — one pass outliving the 2s budget — making the retry
+      // mandatory costs exactly ONE extra full pass: the second pass
+      // establishes the baseline with the deadline already blown, so this
+      // check ends the loop. (Further passes remain possible in general, but
+      // only while the store is demonstrably mutating AND the whole loop is
+      // still inside the budget, i.e. only when passes are cheap.)
       //
-      // The size of that extra pass, measured rather than assumed. A cold full
-      // pass is LINEAR in entry count, not quadratic: timed on this branch
-      // (macOS, ~250-byte entries) at 250/500/1000/2000 entries the pass took
-      // 28/50/95/193ms, a flat ~0.1ms per entry. The per-entry constant, though,
-      // tracks PAYLOAD size, so it is not one number: the #714 profile (10k
-      // entries at ~40MB, so ~4KB each) measured 11-30s per pass, i.e. ~1.1-3ms
-      // per entry, ~10-30x the small-entry constant above. At the ~166k entries
+      // FORMERLY a KNOWN LATENCY EXPOSURE (accepted 2026-08-05, unmitigated
+      // on purpose): `persistChainedEntry` used to call `ensureLoaded()`
+      // INSIDE `withAuditWriteLock`, so on an appending process's FIRST load
+      // that extra pass was paid while the cross-process write lock was
+      // held. RESOLVED for C9 (register): `persistChainedEntry` now calls
+      // `ensureLoaded()` BEFORE requesting the write lock, so this retry loop
+      // (unchanged below) runs lock-free on the first load; the call inside
+      // the lock is a cheap already-loaded no-op, and the lock instead gets a
+      // narrow incremental re-check of just the tail (`freshenChainStateFromDisk`,
+      // O(1) backward walk) for the write that may have landed in the gap
+      // between the outside-lock load and the actual lock acquisition. This
+      // narrows the LOCK-HOLD window; it does not shrink or skip a single
+      // pass of the retry loop itself, so the read-consistency guarantee
+      // (store-stability discrimination, the same 2s deadline, the same
+      // fail-closed-on-a-static-store-with-findings behavior) is unchanged.
+      //
+      // The size of the extra pass this retry can still cost, measured rather
+      // than assumed. A cold full pass is LINEAR in entry count, not
+      // quadratic: timed on this branch (macOS, ~250-byte entries) at
+      // 250/500/1000/2000 entries the pass took 28/50/95/193ms, a flat
+      // ~0.1ms per entry. The per-entry constant, though, tracks PAYLOAD
+      // size, so it is not one number: the #714 profile (10k entries at
+      // ~40MB, so ~4KB each) measured 11-30s per pass, i.e. ~1.1-3ms per
+      // entry, ~10-30x the small-entry constant above. At the ~166k entries
       // the register-C6 production host carries, the extra pass is therefore
-      // ~16s of decrypt+verify with small entries and ~180-500s with #714-sized
-      // ones. The upper half of that range blows
-      // `DEFAULT_AUDIT_WRITE_LOCK_HOLD_DEADLINE_MS` (30s), which aborts the hold
-      // via the `signal` and runs lock recovery, while concurrent appenders
-      // waiting to acquire give up after `AUDIT_WRITE_LOCK_TIMEOUT_MS` (5s) with
-      // `AuditLockContentionError`. The
-      // trigger is narrow (a first load that both finds a transient tear and
-      // outruns the budget), and every cheap mitigation is worse than the
-      // exposure: skipping the retry when the caller holds the write lock
-      // reinstates exactly the first-look-is-final tamper verdict this change
-      // exists to remove, and scaling the budget by chain size only permits MORE
-      // passes. A real fix is an incremental/cheap re-verify so a second look is
-      // not a second full pass; that is its own design, tracked as follow-up, and
-      // deliberately NOT attempted here.
+      // ~16s of decrypt+verify with small entries and ~180-500s with
+      // #714-sized ones. Before the C9 fix, the upper half of that range blew
+      // `DEFAULT_AUDIT_WRITE_LOCK_HOLD_DEADLINE_MS` (30s) while the lock was
+      // held, aborting the hold via `signal` and running lock recovery, while
+      // concurrent appenders waiting to acquire gave up after
+      // `AUDIT_WRITE_LOCK_TIMEOUT_MS` (5s) with `AuditLockContentionError`.
+      // With the retry now running before lock acquisition, that same pass
+      // still costs the appending process the same wall-clock time, but no
+      // longer holds the lock (or blocks other appenders behind it) while it
+      // runs; a caller that never reaches a stable store still fails the
+      // append (strict-mode `AuditIntegrityError`, thrown before the lock is
+      // ever requested), which is the correct outcome for a store that is
+      // genuinely never becoming readable.
       if (hadBaseline && Date.now() >= deadline) {
         return; // bounded backstop; surfaced in strict mode by the caller
       }
@@ -5329,7 +5422,7 @@ export class AuditLog {
     }
 
     const anchor = existing.at(-1)!;
-    this.verifyCheckpointRecordSignature(anchor, findings);
+    await this.verifyCheckpointRecordSignature(anchor, findings);
     if (
       anchor.checkpoint_sequence !== legacyCount ||
       anchor.root_hash !== legacyAnchorHash
@@ -5487,16 +5580,16 @@ export class AuditLog {
         }
       }
 
-      this.verifyCheckpointRecordSignature(checkpoint, findings);
+      await this.verifyCheckpointRecordSignature(checkpoint, findings);
     }
 
     this.lastCheckpointSequence = highestCheckpoint;
   }
 
-  private verifyCheckpointRecordSignature(
+  private async verifyCheckpointRecordSignature(
     checkpoint: AuditCheckpointRecord,
     findings: AuditIntegrityFinding[]
-  ): void {
+  ): Promise<void> {
     if (checkpoint.unsigned) return;
     if (!checkpoint.signer_kid || !checkpoint.signature) {
       findings.push({
@@ -5507,38 +5600,55 @@ export class AuditLog {
       return;
     }
 
-    const resolvedPublicKey = this.checkpointPublicKeyResolver?.(
-      checkpoint.signer_kid
-    );
+    let resolution: AuditCheckpointKeyResolution;
+    try {
+      resolution = await this.checkpointPublicKeyResolver(checkpoint.signer_kid);
+    } catch {
+      // A resolver failure reads as "signer unknown" and surfaces as a
+      // finding below; it must never read as verified, and must never crash
+      // the load pass that the rest of the chain verification rides on.
+      resolution = undefined;
+    }
+    const resolvedPublicKeys = (
+      Array.isArray(resolution) ? resolution : [resolution]
+    ).filter((key): key is string | Uint8Array => key !== undefined);
     // Checkpoint trust-basis invariant: an embedded public key is part of the
     // checkpoint being verified, so it is attacker-controlled unless the caller
     // explicitly asks for an internal-consistency check instead of signer trust.
-    const publicKey =
-      resolvedPublicKey ??
-      (this.trustEmbeddedCheckpointPublicKeys ? checkpoint.public_key : undefined);
-    if (!publicKey) {
-      if (checkpoint.public_key) {
+    // When the resolver DID return authenticated keys, they are authoritative
+    // for this signer_kid: a signature that fails against them is a mismatch,
+    // never a reason to retry against the embedded copy.
+    if (resolvedPublicKeys.length === 0) {
+      const embeddedPublicKey = this.trustEmbeddedCheckpointPublicKeys
+        ? checkpoint.public_key
+        : undefined;
+      if (!embeddedPublicKey) {
+        if (checkpoint.public_key) {
+          findings.push({
+            kind: "checkpoint_signature_embedded_key_untrusted",
+            sequence: checkpoint.checkpoint_sequence,
+            message:
+              `checkpoint signer ${checkpoint.signer_kid} has only an embedded public key; ` +
+              "configure checkpointPublicKeyResolver with an authenticated key, or explicitly opt in to embedded-key self-checks",
+          });
+          return;
+        }
         findings.push({
-          kind: "checkpoint_signature_embedded_key_untrusted",
+          kind: "checkpoint_signature_unverifiable",
           sequence: checkpoint.checkpoint_sequence,
-          message:
-            `checkpoint signer ${checkpoint.signer_kid} has only an embedded public key; ` +
-            "configure checkpointPublicKeyResolver with an authenticated key, or explicitly opt in to embedded-key self-checks",
+          message: `checkpoint signer ${checkpoint.signer_kid} has no known public key`,
         });
         return;
       }
-      findings.push({
-        kind: "checkpoint_signature_unverifiable",
-        sequence: checkpoint.checkpoint_sequence,
-        message: `checkpoint signer ${checkpoint.signer_kid} has no known public key`,
-      });
-      return;
+      resolvedPublicKeys.push(embeddedPublicKey);
     }
 
-    const valid = verifyCheckpointSignature(
-      checkpointPayload(checkpoint),
-      checkpoint.signature,
-      publicKey
+    const valid = resolvedPublicKeys.some((publicKey) =>
+      verifyCheckpointSignature(
+        checkpointPayload(checkpoint),
+        checkpoint.signature!,
+        publicKey
+      )
     );
     if (!valid) {
       findings.push({
@@ -5777,14 +5887,31 @@ export class AuditLog {
   ): Promise<void> {
     let signed: AuditCheckpointSignature | null;
     try {
-      signed = (await this.checkpointSigner?.(payload)) ?? null;
-    } catch {
+      signed = (await this.checkpointSigner(payload)) ?? null;
+    } catch (err) {
+      // A signer that THROWS is a failure (unreadable identity material, a
+      // failed signing op), not an identity-less fortress; say so on stderr
+      // so an operator can tell the two apart. This is a diagnostic only:
+      // the persisted record carries no failure claim, because any at-rest
+      // field here is attacker-writable and a "finding" an attacker can
+      // rewrite into the honest-absence shape would be a false assurance.
+      // Authenticated downgrade/failure EVIDENCE is deliberately deferred to
+      // a design-first follow-up (register id IC-05-DG).
+      // SAFETY: raw stderr is the contract here: this diagnostic must reach
+      // the operator console even when the audit log itself is the failing
+      // component, so it cannot route through any audit-backed logger.
+      console.error(
+        `[audit-log] checkpoint ${payload.checkpoint_sequence} written UNSIGNED because the signer FAILED (not identity absence): ${failureMessage(err)}`
+      );
       signed = null;
     }
 
-    // Production checkpoints may be unsigned today when no signer is wired; that
-    // honest bound is serialized as `unsigned` instead of fabricating signer
-    // evidence or silently trusting a fallback key.
+    // Production checkpoints are signed by the constructor-derived fortress
+    // identity binding (IC-05); a checkpoint may still be unsigned when the
+    // store holds no signable identity (fresh fortress before bootstrap, a
+    // store whose adapter cannot reach identity records). That honest bound
+    // is serialized as `unsigned` instead of fabricating signer evidence or
+    // silently trusting a fallback key.
     const record: AuditCheckpointRecord = {
       schema_version: AUDIT_CHECKPOINT_SCHEMA_VERSION,
       ...payload,

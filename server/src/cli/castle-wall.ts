@@ -1502,9 +1502,11 @@ async function reportGlobalPinAndVerdict(
 }
 
 export async function runStatus(
+  argv: string[] = [],
   ctx: CastleWallCommandContext = {}
 ): Promise<number> {
   const out = ctx.out ?? process.stdout;
+  const err = ctx.err ?? process.stderr;
   const env = ctx.env ?? process.env;
   const platform = ctx.platform ?? process.platform;
   const execSyncFn =
@@ -1514,7 +1516,20 @@ export async function runStatus(
         encoding: "utf8",
         stdio: ["ignore", "pipe", "ignore"],
       }).trim());
-  const storagePath = resolveStoragePath(env);
+  // O-07 (register): honor the subcommand-level `--fortress <path>` flag,
+  // exactly like every other castle-wall custody verb (re-pin, daemon,
+  // audit-store-status; see runProvisionPin's doc for the identical prior
+  // bug). Before this fix `runStatus` took no argv at all and always read
+  // `resolveStoragePath(env)` (SANCTUARY_STORAGE_PATH or the default
+  // ~/.sanctuary fortress), so `castle-wall status --fortress <path>`
+  // silently reported the local pinned key AND probed the enforcement-
+  // availability socket for the DEFAULT fortress, never the one named --
+  // whatever order the flag was passed in, since it was never parsed.
+  // resolveFortressArg falls back to resolveStoragePath(env) when no flag is
+  // given, preserving prior (env-or-default) behavior exactly.
+  const parsed = parseCastleWallArgs(argv);
+  if (writeCastleWallParseError(parsed, err)) return 2;
+  const storagePath = resolveFortressArg(parsed.fortress, env);
   const pubPath = join(storagePath, CASTLE_PINNED_PUBKEY);
 
   let localFingerprint: string | null = null;
