@@ -125,6 +125,9 @@ describe("castle-wall CLI verbs", () => {
     });
     await new Promise<void>((resolvePromise, reject) => {
       server.once("error", reject);
+      // Unix-domain socket path under a per-test mkdtemp fortress dir, not a
+      // shared TCP port; no other test or run can collide on it, so there is
+      // no EADDRINUSE class for bindWithRetry to retry. port-discipline: ignore
       server.listen(socketPath, () => resolvePromise());
     });
     return {

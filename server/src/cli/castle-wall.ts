@@ -341,7 +341,7 @@ export interface CastleWallParsedArgs {
   /**
    * reload (NF-08, additive): opt a scripted caller into a non-zero exit when
    * no daemon was reachable to reload. The bare exit-0 "nothing to reload"
-   * default is unchanged and test-pinned — this flag only widens what a
+   * default is unchanged and test-pinned: this flag only widens what a
    * caller can ask for, it never narrows the default.
    */
   requireDaemon?: boolean;
@@ -2571,7 +2571,7 @@ export async function runReload(
       out,
       `No Castle Wall daemon running for fortress ${fortressIdLabel(fortressPath)}. Run 'sanctuary wrap' to start one.\n`,
     );
-    // NF-08: "nothing to reload" is not a failure by default — a fresh
+    // NF-08: "nothing to reload" is not a failure by default: a fresh
     // fortress with no daemon yet is a normal state, and this exit code is
     // test-pinned. A scripted caller that needs to tell "reloaded" apart from
     // "nothing was there" opts in with --require-daemon rather than the
