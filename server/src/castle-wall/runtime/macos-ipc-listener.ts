@@ -658,15 +658,21 @@ export class MacOSFlowIpcListener {
       // SAFETY: a clamped value is a producer defect; surface it on daemon
       // stderr rather than silently normalizing (the emission still proceeds
       // with the safe value so a config error cannot starve the lease).
-      // The RAW wire values never reach the log line: they arrive from the
-      // operator socket and may not be numbers at runtime, and a crafted
-      // value must not be able to forge daemon log lines. The runtime type
-      // tag plus the clamped results carry the whole diagnostic (which field
-      // was out of range and what it became).
+      // NO operator-socket value reaches this log line: only the CLAMPED
+      // numeric results and which field(s) tripped the clamp are logged, so a
+      // crafted wire value cannot forge daemon log lines (CodeQL log-injection
+      // sink stays free of the tainted `body.*` fields entirely).
+      const clampedFields = [
+        clampedInterval !== body.heartbeat_interval_seconds
+          ? "heartbeat_interval_seconds"
+          : null,
+        clampedTtl !== body.ttl_seconds ? "ttl_seconds" : null,
+      ].filter((f): f is string => f !== null);
       console.error(
-        `[castle-wall] arm_lease numeric field out of range; clamped before signing ` +
-          `(heartbeat_interval_seconds<${typeof body.heartbeat_interval_seconds}> -> ${clampedInterval}, ` +
-          `ttl_seconds<${body.ttl_seconds === null ? "null" : typeof body.ttl_seconds}> -> ${clampedTtl ?? "null"})`,
+        `[castle-wall] arm_lease numeric field(s) out of range; clamped before ` +
+          `signing (fields=${clampedFields.join(",")}; ` +
+          `heartbeat_interval_seconds=${clampedInterval}, ` +
+          `ttl_seconds=${clampedTtl ?? "null"})`,
       );
     }
     const stamped: ArmLeaseNotification = {
