@@ -1,0 +1,431 @@
+import { execFile as nodeExecFile } from "node:child_process";
+import { lstat } from "node:fs/promises";
+import { isAbsolute, resolve } from "node:path";
+import { Writable } from "node:stream";
+import { promisify } from "node:util";
+
+import { scrubProvisionedEgressRules, type ScrubProvisionedEgressResult } from "../castle-wall/provision/egress.js";
+import { resolveStoragePath } from "../paths.js";
+import { consumeFlagValue } from "./argv.js";
+import { CASTLE_WALL_BOOT_PLIST_PATH, runUninstallBoot } from "./castle-wall-boot.js";
+import type { DisableNePreferenceOutcome, SystemExtensionDeactivationRequestOutcome } from "./castle-wall.js";
+
+// Must match CASTLE_GLOBAL_PINNED_PUBKEY_PATH in server/src/cli/castle-wall.ts.
+export const CASTLE_GLOBAL_PINNED_PUBKEY_PATH = "/Library/Application Support/Sanctuary/castle-pinned-pubkey.bin";
+
+type FootprintStatus = "absent" | "present" | "unknown" | "not-applicable";
+const CASTLE_WALL_SYSTEM_EXTENSION_ID = "ai.sanctuaryprotocol.macos.castle-wall";
+const execFileAsync = promisify(nodeExecFile);
+
+export interface UninstallCommandContext {
+  argv?: string[];
+  out?: Writable;
+  err?: Writable;
+  env?: NodeJS.ProcessEnv;
+  platform?: NodeJS.Platform;
+  getuid?: () => number;
+  ops?: Partial<UninstallOps>;
+}
+
+export interface UninstallOps {
+  disarm(fortressPath: string): Promise<DisableNePreferenceOutcome>;
+  uninstallHarnessDaemon(): Promise<void>;
+  scrubProvisionedEgressRules(fortressPath: string, harnessId: string): Promise<ScrubProvisionedEgressResult>;
+  bootServiceStatus(): Promise<FootprintStatus>;
+  uninstallBootService(fortressPath: string): Promise<void>;
+  globalPinStatus(): Promise<FootprintStatus>;
+  systemExtensionStatus(): Promise<FootprintStatus>;
+  deactivateSystemExtension(): Promise<SystemExtensionDeactivationRequestOutcome>;
+}
+
+interface ParsedUninstallArgs {
+  help: boolean;
+  fortress?: string;
+  harnessId: string;
+  removeOperatorData: boolean;
+  error?: string;
+}
+
+interface ReportRow {
+  label: string;
+  status: "removed" | "skipped" | "preserved" | "cannot-remove" | "failed";
+  detail: string;
+}
+
+function write(stream: Writable, text: string): void {
+  stream.write(text);
+}
+
+function printUninstallHelp(out: Writable): void {
+  write(
+    out,
+    `sanctuary uninstall. Remove Sanctuary's installed enforcement footprint without deleting operator data.
+
+Usage:
+  sanctuary uninstall [--fortress <path>] [--harness <id>]
+
+Options:
+  --fortress <path>       Fortress directory for policy cleanup. Defaults to the normal Sanctuary fortress.
+  --harness <id>          Provisioned harness id whose egress rules are scrubbed. Default: hermes.
+  --remove-operator-data  Refused by this verb; operator data deletion must use a separate recovery/data command.
+  --help, -h              Show this help
+
+Default behavior preserves the fortress state, keys, passphrase custody, recovery material, and audit log.
+It reports any installed residue that needs sudo, the Castle Wall host app, or a reboot; it never reports a clean uninstall while that residue remains.
+`,
+  );
+}
+
+function parseUninstallArgs(argv: string[]): ParsedUninstallArgs {
+  let remaining = [...argv];
+  const fortress = consumeFlagValue(remaining, "--fortress");
+  if (fortress.error !== undefined) {
+    return { help: false, harnessId: "hermes", removeOperatorData: false, error: fortress.error };
+  }
+  remaining = fortress.argv;
+  const harness = consumeFlagValue(remaining, "--harness");
+  if (harness.error !== undefined) {
+    return { help: false, harnessId: "hermes", removeOperatorData: false, error: harness.error };
+  }
+  remaining = harness.argv;
+
+  const parsed: ParsedUninstallArgs = {
+    help: false,
+    ...(fortress.value !== undefined ? { fortress: fortress.value } : {}),
+    harnessId: harness.value ?? "hermes",
+    removeOperatorData: false,
+  };
+
+  for (const arg of remaining) {
+    if (arg === "--help" || arg === "-h") parsed.help = true;
+    else if (arg === "--remove-operator-data") parsed.removeOperatorData = true;
+    else if (arg.startsWith("-")) parsed.error = `Unknown uninstall option: ${arg}`;
+    else parsed.error = `Unexpected uninstall argument: ${arg}`;
+    if (parsed.error !== undefined) break;
+  }
+  if (parsed.harnessId.trim() === "") parsed.error = "--harness must not be empty";
+  return parsed;
+}
+
+function resolveFortressArg(fortress: string | undefined, env: NodeJS.ProcessEnv): string {
+  const value = fortress ?? env.SANCTUARY_STORAGE_PATH ?? env.SANCTUARY_FORTRESS_PATH;
+  if (value === undefined) return resolveStoragePath(env);
+  return isAbsolute(value) ? resolve(value) : resolve(process.cwd(), value);
+}
+
+function nullWritable(): Writable {
+  return new Writable({
+    write(_chunk, _encoding, callback) {
+      callback();
+    },
+  });
+}
+
+async function statFootprint(path: string): Promise<FootprintStatus> {
+  try {
+    await lstat(path);
+    return "present";
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return "absent";
+    return "unknown";
+  }
+}
+
+function realUninstallOps(ctx: UninstallCommandContext): UninstallOps {
+  const platform = ctx.platform ?? process.platform;
+  const getuid = ctx.getuid ?? process.getuid?.bind(process);
+  const env = ctx.env ?? process.env;
+  return {
+    disarm: async (fortressPath) => {
+      if (platform !== "darwin") return "corroborated_off";
+      const { runDisable } = await import("./castle-wall.js");
+      let observed: DisableNePreferenceOutcome | undefined;
+      const code = await runDisable(["--fortress", fortressPath], {
+        out: nullWritable(),
+        err: nullWritable(),
+        env,
+        platform,
+        onDisableNePreferenceOutcome: (outcome) => {
+          observed = outcome;
+        },
+      });
+      if (code !== 0) throw new Error(`castle-wall disable exited ${code}`);
+      if (observed !== "corroborated_off") {
+        throw new Error(
+          `castle-wall disable did not positively observe the filter off (${observed ?? "no outcome"})`,
+        );
+      }
+      return observed;
+    },
+    uninstallHarnessDaemon: async () => {
+      const { uninstallAutoProvisionedHarnessDaemon } = await import("../wrap/auto-provision.js");
+      await uninstallAutoProvisionedHarnessDaemon();
+    },
+    scrubProvisionedEgressRules: async (fortressPath, harnessId) =>
+      scrubProvisionedEgressRules({ fortressPath, harnessId }),
+    bootServiceStatus: async () => {
+      if (platform !== "darwin") return "not-applicable";
+      return statFootprint(CASTLE_WALL_BOOT_PLIST_PATH);
+    },
+    uninstallBootService: async (fortressPath) => {
+      const code = await runUninstallBoot(["--yes", "--fortress", fortressPath], {
+        out: nullWritable(),
+        err: nullWritable(),
+        env,
+        platform,
+        getuid,
+      });
+      if (code !== 0) throw new Error(`castle-wall uninstall-boot exited ${code}`);
+    },
+    globalPinStatus: async () => {
+      if (platform !== "darwin") return "not-applicable";
+      return statFootprint(CASTLE_GLOBAL_PINNED_PUBKEY_PATH);
+    },
+    systemExtensionStatus: async () => {
+      if (platform !== "darwin") return "not-applicable";
+      try {
+        const { stdout } = await execFileAsync("/usr/bin/systemextensionsctl", ["list"], {
+          encoding: "utf8",
+          timeout: 10_000,
+        });
+        return stdout.includes(CASTLE_WALL_SYSTEM_EXTENSION_ID) ? "present" : "absent";
+      } catch {
+        // Unknown is intentionally distinct from absent: teardown may never
+        // claim removal when the authoritative OS probe could not run.
+        return "unknown";
+      }
+    },
+    deactivateSystemExtension: async () => {
+      const { requestSystemExtensionDeactivation } = await import("./castle-wall.js");
+      return requestSystemExtensionDeactivation({ env, platform, getuid });
+    },
+  };
+}
+
+function printReport(out: Writable, rows: ReportRow[], clean: boolean): void {
+  write(out, clean ? "Sanctuary uninstall: installed footprint removed.\n" : "Sanctuary uninstall: completed with residue or failed steps.\n");
+  for (const row of rows) {
+    write(out, `- ${row.status}: ${row.label} - ${row.detail}\n`);
+  }
+}
+
+export async function runUninstallCommand(ctx: UninstallCommandContext = {}): Promise<number> {
+  const argv = ctx.argv ?? [];
+  const out = ctx.out ?? process.stdout;
+  const err = ctx.err ?? process.stderr;
+  const env = ctx.env ?? process.env;
+  const platform = ctx.platform ?? process.platform;
+  const getuid = ctx.getuid ?? process.getuid?.bind(process);
+  const parsed = parseUninstallArgs(argv);
+
+  if (parsed.help) {
+    printUninstallHelp(out);
+    return 0;
+  }
+  if (parsed.error !== undefined) {
+    write(err, `${parsed.error}\n`);
+    return 2;
+  }
+  if (parsed.removeOperatorData) {
+    write(
+      err,
+      "Refusing --remove-operator-data here. Uninstall preserves the fortress, keys, passphrase custody, recovery material, and audit log; use an explicit data-recovery or reset command for destructive state removal.\n",
+    );
+    return 2;
+  }
+
+  const fortressPath = resolveFortressArg(parsed.fortress, env);
+  const ops = { ...realUninstallOps(ctx), ...(ctx.ops ?? {}) };
+  const rows: ReportRow[] = [];
+  let safeToRemoveSupportingServices = false;
+
+  try {
+    const disarmOutcome = await ops.disarm(fortressPath);
+    if (platform === "darwin" && disarmOutcome !== "corroborated_off") {
+      throw new Error(
+        `content filter was not positively observed disabled (${disarmOutcome})`,
+      );
+    }
+    rows.push(
+      platform === "darwin"
+        ? {
+            label: "castle-wall",
+            status: "removed",
+            detail: "content filter is positively observed disabled",
+          }
+        : {
+            label: "castle-wall",
+            status: "skipped",
+            detail: "no macOS Castle Wall content filter exists on this platform",
+          },
+    );
+    safeToRemoveSupportingServices = true;
+  } catch (error) {
+    rows.push({
+      label: "castle-wall",
+      status: "failed",
+      detail: (error as Error).message,
+    });
+  }
+
+  let daemonRemoved = false;
+  let egressRulesRemoved = false;
+  if (safeToRemoveSupportingServices) {
+    try {
+      await ops.uninstallHarnessDaemon();
+      daemonRemoved = true;
+      rows.push({
+        label: "harness-daemon",
+        status: "removed",
+        detail: "auto-provisioned harness daemon uninstall completed",
+      });
+    } catch (error) {
+      rows.push({ label: "harness-daemon", status: "failed", detail: (error as Error).message });
+    }
+
+    try {
+      const scrubResult = await ops.scrubProvisionedEgressRules(fortressPath, parsed.harnessId);
+      egressRulesRemoved = true;
+      const reload = scrubResult.reloadOk === false ? "; policy reload was not confirmed" : "";
+      rows.push({
+        label: "scrub-egress-rules",
+        status: "removed",
+        detail: `${scrubResult.removedRuleIds.length} provisioned rule file(s) removed${reload}`,
+      });
+    } catch (error) {
+      rows.push({ label: "scrub-egress-rules", status: "failed", detail: (error as Error).message });
+    }
+  } else {
+    rows.push({
+      label: "harness-daemon",
+      status: "skipped",
+      detail: "kept because the content filter was not positively observed disabled",
+    });
+    rows.push({
+      label: "scrub-egress-rules",
+      status: "skipped",
+      detail: "kept because the content filter was not positively observed disabled",
+    });
+  }
+  rows.push({
+    label: "re-home restore",
+    status: "skipped",
+    detail:
+      "no persisted successful-provision re-home result manifest exists for this CLI to replay; operator files and fortress data were not deleted",
+  });
+
+  const bootStatus = await ops.bootServiceStatus();
+  let bootCleared = bootStatus === "absent" || bootStatus === "not-applicable";
+  if (bootStatus === "present") {
+    if (!safeToRemoveSupportingServices || !daemonRemoved || !egressRulesRemoved) {
+      rows.push({
+        label: "boot-service",
+        status: "cannot-remove",
+        detail:
+          "kept because disarm and supporting-service teardown did not all complete; removing boot recovery would be unsafe",
+      });
+    } else if (platform === "darwin" && getuid?.() === 0) {
+      try {
+        await ops.uninstallBootService(fortressPath);
+        bootCleared = true;
+        rows.push({ label: "boot-service", status: "removed", detail: `${CASTLE_WALL_BOOT_PLIST_PATH} removed through uninstall-boot` });
+      } catch (error) {
+        rows.push({ label: "boot-service", status: "failed", detail: (error as Error).message });
+      }
+    } else {
+      rows.push({
+        label: "boot-service",
+        status: "cannot-remove",
+        detail: `${CASTLE_WALL_BOOT_PLIST_PATH} exists and requires sudo: sudo sanctuary --fortress ${fortressPath} castle-wall uninstall-boot --yes`,
+      });
+    }
+  } else if (bootStatus === "absent") {
+    rows.push({ label: "boot-service", status: "skipped", detail: "no Castle Wall boot LaunchDaemon plist found" });
+  } else if (bootStatus === "unknown") {
+    rows.push({ label: "boot-service", status: "cannot-remove", detail: `could not inspect ${CASTLE_WALL_BOOT_PLIST_PATH}; run with sudo and re-run uninstall-boot if present` });
+  }
+
+  const globalPinStatus = await ops.globalPinStatus();
+  if (globalPinStatus === "present") {
+    rows.push({
+      label: "global-pin",
+      status: "cannot-remove",
+      detail: `${CASTLE_GLOBAL_PINNED_PUBKEY_PATH} exists; it is a host-wide trust anchor and this fortress-scoped uninstall leaves it for explicit operator removal`,
+    });
+  } else if (globalPinStatus === "absent") {
+    rows.push({ label: "global-pin", status: "skipped", detail: "no host-wide Castle Wall global pin found" });
+  } else if (globalPinStatus === "unknown") {
+    rows.push({ label: "global-pin", status: "cannot-remove", detail: `could not inspect ${CASTLE_GLOBAL_PINNED_PUBKEY_PATH}; it may need sudo for manual removal` });
+  }
+
+  if (platform === "darwin") {
+    const extensionStatus = await ops.systemExtensionStatus();
+    if (extensionStatus === "absent") {
+      rows.push({
+        label: "system-extension",
+        status: "skipped",
+        detail: "Castle Wall system extension is observed absent",
+      });
+    } else if (extensionStatus === "unknown") {
+      rows.push({
+        label: "system-extension",
+        status: "cannot-remove",
+        detail: "could not inspect system-extension state; absence is not assumed",
+      });
+    } else if (!safeToRemoveSupportingServices || !daemonRemoved || !egressRulesRemoved || !bootCleared) {
+      rows.push({
+        label: "system-extension",
+        status: "cannot-remove",
+        detail:
+          "deactivation not requested because filter, daemon, egress-rule, and boot-service teardown did not all complete safely",
+      });
+    } else {
+      const deactivation = await ops.deactivateSystemExtension();
+      if (deactivation.kind === "reboot-required") {
+        rows.push({
+          label: "system-extension",
+          status: "cannot-remove",
+          detail:
+            "deactivation accepted by macOS but requires reboot; reboot, then rerun uninstall to observe absence",
+        });
+      } else if (deactivation.kind === "needs-user-approval") {
+        rows.push({
+          label: "system-extension",
+          status: "cannot-remove",
+          detail: `${deactivation.detail}; approve at the console, then rerun uninstall`,
+        });
+      } else if (deactivation.kind === "failed") {
+        rows.push({ label: "system-extension", status: "failed", detail: deactivation.detail });
+      } else {
+        const observedAfter = await ops.systemExtensionStatus();
+        if (observedAfter === "absent") {
+          rows.push({
+            label: "system-extension",
+            status: "removed",
+            detail: "deactivation completed and the Castle Wall system extension is observed absent",
+          });
+        } else {
+          rows.push({
+            label: "system-extension",
+            status: "cannot-remove",
+            detail:
+              observedAfter === "present"
+                ? "deactivation request completed but the system extension is still present; reboot and rerun uninstall"
+                : "deactivation request completed but absence could not be observed; rerun after reboot",
+          });
+        }
+      }
+    }
+  }
+  rows.push({
+    label: "operator-data",
+    status: "preserved",
+    detail: `fortress state, keys, passphrase custody, recovery material, and audit log remain at ${fortressPath}`,
+  });
+
+  const hardResidue = rows.some((row) => row.status === "failed" || row.status === "cannot-remove");
+  const clean = safeToRemoveSupportingServices && daemonRemoved && egressRulesRemoved && !hardResidue;
+  printReport(out, rows, clean);
+  return clean ? 0 : 1;
+}

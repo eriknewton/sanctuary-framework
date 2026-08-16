@@ -84,6 +84,17 @@ public final class ExtensionDispatcher {
     private var lastVerdictDropLogAt = Date.distantPast
     private var manifestReceived = false
     private var armLeaseReceived = false
+    /// Monotonic floor for arm-lease `updated_at` (O-02): a frame whose stamp
+    /// is not strictly newer than this is a replay and is rejected. Reset
+    /// wherever `armLeaseReceived` resets, so each connection starts a fresh
+    /// connection-scoped replay window. CROSS-connection replay is bounded by
+    /// the verifier's 300s max-age window plus the daemon socket's 0o600
+    /// owner-only mode — NOT by the handshake: the handshake nonce is
+    /// daemon-self-signed (the extension issues no challenge), so reaching a
+    /// new connection does not itself prove fortress-key possession. The
+    /// daemon-impersonation replay residual inside that window is tracked in
+    /// the private defect register.
+    private var lastAcceptedLeaseUpdatedAt: Date?
     private var providerUnboundAuditSent = false
     private var connectedFortressId: String?
     private var unboundTimer: DispatchSourceTimer?
@@ -226,6 +237,7 @@ public final class ExtensionDispatcher {
             retryDelaySeconds = Self.initialRetryDelaySeconds
             manifestReceived = false
             armLeaseReceived = false
+            lastAcceptedLeaseUpdatedAt = nil
             connectedFortressId = nil
         }
         ipcClient.setTransportClosedListener(nil)
@@ -400,6 +412,31 @@ public final class ExtensionDispatcher {
     public func handleInbound(_ message: IpcMessage) {
         switch message {
         case .armLease(let body):
+            // O-02: the lease is verified against the pinned fortress key and
+            // its `updated_at` is CONSUMED (strict monotonic + bounded age)
+            // BEFORE the engine sees it. This must reject, not warn: an
+            // unsigned or replayed stale lease would otherwise re-anchor the
+            // dead-man deadline to local now() on every delivery, so a
+            // captured old "armed" frame could extend the wall's lease
+            // forever and a forged "revoked"/"disarmed" frame could flip its
+            // posture — with no key possession at all. A rejected lease
+            // leaves the lease state, `armLeaseReceived`, and the flow cache
+            // untouched (mirroring the rejected-manifest path: a push that
+            // never applied must not mark the provider bound).
+            let lastAccepted = stateQueue.sync { lastAcceptedLeaseUpdatedAt }
+            let acceptedUpdatedAt: Date
+            do {
+                acceptedUpdatedAt = try SignedArmLeaseVerifier.verify(
+                    body,
+                    pinnedPublicKey: ipcClient.pinnedPublicKeyBytes,
+                    lastAcceptedUpdatedAt: lastAccepted
+                )
+            } catch {
+                CastleWallLog.ipc.error(
+                    "arm_lease rejected: \(SignedArmLeaseVerifier.rejectLabel(error)); lease state unchanged (fail closed)"
+                )
+                return
+            }
             engine.armLease.update(
                 ArmLeaseUpdate(
                     armed: body.armed,
@@ -409,6 +446,7 @@ public final class ExtensionDispatcher {
                 )
             )
             stateQueue.sync {
+                lastAcceptedLeaseUpdatedAt = acceptedUpdatedAt
                 armLeaseReceived = true
                 cancelUnboundTimerIfBoundLocked()
             }
@@ -499,6 +537,7 @@ public final class ExtensionDispatcher {
                 connectionStateValue = .connected
                 manifestReceived = false
                 armLeaseReceived = false
+                lastAcceptedLeaseUpdatedAt = nil
                 providerUnboundAuditSent = false
                 connectedFortressId = identity.fortressId
             }

@@ -24,13 +24,19 @@ const MAX_RECORD_BYTES = 1024 * 1024;
 const SDW_REPLAY_MAC_DOMAIN = "sanctuary.sdw-replay-anchor-mac.v1\n";
 const SDW_REPLAY_MAC_MARKER = "__sanctuary_sdw_replay_anchor_mac_v1";
 const SDW_REPLAY_MAC_INFO = "sdw-replay-anchor-mac";
-const SECRET_CLASSIFIER_PROBES: readonly RegExp[] = [
+// ceil(32 bytes * 8 bits / 6 base64 bits) without the trailing `=` padding.
+const BASE64URL_32_BYTE_KEY_CHARS = 43;
+// Two hex characters encode each of 32 bytes.
+const HEX_32_BYTE_KEY_CHARS = 64;
+const BASE64URL_32_BYTE_KEY_SHAPE = new RegExp(
+  `^[A-Za-z0-9_-]{${BASE64URL_32_BYTE_KEY_CHARS}}$`,
+);
+const HEX_32_BYTE_KEY_SHAPE = new RegExp(`^[A-Fa-f0-9]{${HEX_32_BYTE_KEY_CHARS}}$`);
+const RECOVERY_KEY_LABEL_PATTERN = String.raw`SANCTUARY_RECOVERY_KEY|recovery[_ -]?key`;
+const ED25519_PRIVATE_KEY_LABEL_PATTERN = String.raw`ed25519[_ -]?(?:private|secret)(?:[_ -]?key)?|(?:private|secret)(?:[_ -]?key)?[_ -]?ed25519`;
+const PRIVATE_KEY_MARKER_PROBES: readonly RegExp[] = [
   /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/i,
   /\bBEGIN [A-Z0-9 ]*PRIVATE KEY\b/i,
-  /principal[_ -]?policy/i,
-  /\brecovery[_ -]?key\b/i,
-  /\bed25519\b.{0,80}\b(private|secret)\b/i,
-  /\bSANCTUARY_RECOVERY_KEY\b/i,
 ];
 
 export type Taint =
@@ -156,7 +162,7 @@ export function prepareSdwBackendWrite<T extends SdwRecord>(
 
 export function assertSdwClassifierCleanText(text: string): void {
   if (text.length === 0) return;
-  classifyText(text, text.replace(/[^A-Za-z0-9]+/g, ""));
+  classifyText(text, text.replace(/[^A-Za-z0-9]+/g, ""), undefined, [text]);
 }
 
 export async function writeReplayAnchor(
@@ -503,22 +509,58 @@ function classifyRecord(record: SdwRecord): void {
   // interleaves key-path tokens between values, which would wedge between a "PRIVATE"
   // in one field and a "KEY" in another and defeat the compact PRIVATEKEY match. The
   // values-only compact reassembles a marker fragmented across non-adjacent fields.
-  const compact = collectClassifierValues(record).replace(/[^A-Za-z0-9]+/g, "");
-  classifyText(text, compact, normalized);
+  const views = collectClassifierTextViews(record);
+  classifyText(text, views.compactValues, normalized, views.entropyContexts);
 }
 
-function classifyText(text: string, compact: string, normalized = normalizeClassifierText(text)): void {
+function classifyText(
+  text: string,
+  compact: string,
+  normalized = normalizeClassifierText(text),
+  entropyContexts: readonly string[] = [text],
+): void {
   if (
-    SECRET_CLASSIFIER_PROBES.some((probe) => probe.test(text) || probe.test(normalized)) ||
+    PRIVATE_KEY_MARKER_PROBES.some((probe) => probe.test(text) || probe.test(normalized)) ||
     containsSplitPrivateKeyMarker(compact) ||
     containsEncodedEd25519Pkcs8PrivateKey(text) ||
+    containsLabeledEd25519PrivateKeyMaterial(text) ||
+    containsLabeledRecoveryKeyMaterial(text) ||
     containsKnownSecretToken(text) ||
     containsJwt(text) ||
     containsUrlCredential(text) ||
-    containsKeywordGatedHighEntropySecret(text)
+    entropyContexts.some((context) => containsKeywordGatedHighEntropySecret(context))
   ) {
     throw new SdwValidationError("classifier_reject", "SDW classifier rejected sensitive material");
   }
+}
+
+function containsLabeledRecoveryKeyMaterial(text: string): boolean {
+  return containsLabeled32ByteKeyMaterial(text, RECOVERY_KEY_LABEL_PATTERN);
+}
+
+function containsLabeledEd25519PrivateKeyMaterial(text: string): boolean {
+  return containsLabeled32ByteKeyMaterial(text, ED25519_PRIVATE_KEY_LABEL_PATTERN);
+}
+
+function containsLabeled32ByteKeyMaterial(text: string, labelPattern: string): boolean {
+  const pattern = new RegExp(
+    String.raw`\b(?:${labelPattern})(?:\s*(?:=|:)\s*|\s+is\s+|\s+)["']?([A-Za-z0-9_-]+)(?![A-Za-z0-9_-])`,
+    "gi",
+  );
+  for (const match of text.matchAll(pattern)) {
+    const candidate = match[1] ?? "";
+    if (
+      isPlausible32ByteBase64urlKey(candidate) ||
+      HEX_32_BYTE_KEY_SHAPE.test(candidate)
+    ) return true;
+  }
+  return false;
+}
+
+function isPlausible32ByteBase64urlKey(value: string): boolean {
+  // A Sanctuary recovery key (and a raw 32-byte Ed25519 key) is 32 random
+  // bytes rendered as unpadded base64url.
+  return BASE64URL_32_BYTE_KEY_SHAPE.test(value) && !isAllowedPlaceholder(value);
 }
 
 function containsSplitPrivateKeyMarker(compactText: string): boolean {
@@ -565,13 +607,18 @@ function normalizeClassifierText(text: string): string {
   return text.replace(/[^A-Za-z0-9_-]+/g, " ");
 }
 
-// Field string values only (no key-path tokens), in canonical sorted order. Used
-// by the split-marker reassembly so fragments in non-adjacent fields sit adjacent.
-function collectClassifierValues(value: SdwRecord): string {
-  const out: string[] = [];
+interface ClassifierTextViews {
+  readonly compactValues: string;
+  readonly entropyContexts: readonly string[];
+}
+
+function collectClassifierTextViews(value: SdwRecord): ClassifierTextViews {
+  const stringValues: string[] = [];
+  const entropyContexts: string[] = [];
   const visit = (item: unknown): void => {
     if (typeof item === "string") {
-      out.push(item);
+      stringValues.push(item);
+      entropyContexts.push(item);
       return;
     }
     if (Array.isArray(item)) {
@@ -580,11 +627,23 @@ function collectClassifierValues(value: SdwRecord): string {
     }
     if (item !== null && typeof item === "object") {
       const object = item as { readonly [key: string]: unknown };
+      // Metadata key/value pairs are one semantic field. The whitespace
+      // boundary intentionally lets a label such as `credential` gate the
+      // candidate stored in its paired value. Individual strings are also
+      // retained below so their self-contained signals remain detectable.
+      if (typeof object.key === "string" && typeof object.value === "string") {
+        entropyContexts.push(`${object.key}\n${object.value}`);
+      }
       for (const key of Object.keys(object).sort()) visit(object[key]);
     }
   };
   visit(value);
-  return out.join("");
+  return {
+    // Field values only (no key paths), in canonical sorted order. Joining
+    // reassembles private-key markers fragmented across record fields.
+    compactValues: stringValues.join("").replace(/[^A-Za-z0-9]+/g, ""),
+    entropyContexts,
+  };
 }
 
 function containsKnownSecretToken(text: string): boolean {

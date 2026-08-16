@@ -198,7 +198,14 @@ export class FailureModeDetector {
     this.node.getRoster().checkDropouts(nowMs);
     // 2. Canonical-audit-loss check.
     this.checkCanonicalAuditLoss(nowMs);
-    // 3. Push fresh snapshot.
+    // 3. C12-REPLAY: flush any pending audit-governor saturation summaries
+    //    (revoke denials + uncorrelated sync_response refusals). This tick IS
+    //    the mesh's periodic timer — MeshNode owns none of its own — so a
+    //    saturated-then-quiet attack schedule still gets its sealed
+    //    {suppressed_count, distinct_emitter_count} summary here instead of
+    //    waiting for the next denial to roll the window.
+    this.node.flushRevokeDenialSaturation();
+    // 4. Push fresh snapshot.
     this.opts.on_health_snapshot(this.snapshot(nowMs));
   }
 

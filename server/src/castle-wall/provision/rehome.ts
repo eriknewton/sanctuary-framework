@@ -747,6 +747,9 @@ export async function restoreRehomeSteps(
  *     (LLM / Telegram / persona config -- secrets)
  *   - `~/.hermes/hermes-agent/` (runtime code; not a secret, but the confined
  *     LaunchDaemon needs it under the dedicated account to import `hermes_cli`)
+ *   - `~/.hermes/python/` (Hermes/uv managed CPython; not a secret. Current
+ *     Hermes venvs may point at it with an absolute symlink, so leaving it in
+ *     the operator's private home makes the dedicated uid unable to start.)
  *   - `~/.google_workspace_mcp/credentials` (file-based Google OAuth -- secret)
  *   - `~/.workspace-mcp/cli-tokens/mcp-oauth-token*` (secret)
  *   - `~/.hermes/google-mcp-creds/` (secret)
@@ -767,6 +770,11 @@ export const hermesRehomeAdapter: AgentRehomeAdapter = {
       {
         sourcePath: join(".hermes", "hermes-agent"),
         destRelativePath: ".hermes/hermes-agent",
+        isSecret: false,
+      },
+      {
+        sourcePath: join(".hermes", "python"),
+        destRelativePath: ".hermes/python",
         isSecret: false,
       },
       {

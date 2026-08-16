@@ -338,6 +338,13 @@ export interface CastleWallParsedArgs {
    * fortress publish path. Never accepted from an untrusted source.
    */
   producerPubKey?: string;
+  /**
+   * reload (NF-08, additive): opt a scripted caller into a non-zero exit when
+   * no daemon was reachable to reload. The bare exit-0 "nothing to reload"
+   * default is unchanged and test-pinned: this flag only widens what a
+   * caller can ask for, it never narrows the default.
+   */
+  requireDaemon?: boolean;
 }
 
 function writeCastleWallParseError(
@@ -428,7 +435,13 @@ type ObservedArmClaimObservationBasis =
 interface HeadlessReport {
   ok: boolean;
   action: string;
-  state: "enabled" | "disabled" | "needs_user_approval" | "unknown";
+  state:
+    | "enabled"
+    | "disabled"
+    | "deactivated"
+    | "will_complete_after_reboot"
+    | "needs_user_approval"
+    | "unknown";
   error?: string;
   build?: HeadlessBuildIdentity;
 }
@@ -537,7 +550,7 @@ async function readEnforcementAvailabilityForStatus(
 
 /** Exit-code contract with HeadlessFilterCLI.ExitCode (Swift side). */
 const HEADLESS_EXIT_NEEDS_APPROVAL = 3;
-export const CASTLE_WALL_HEADLESS_CONTRACT_VERSION = "2";
+export const CASTLE_WALL_HEADLESS_CONTRACT_VERSION = "3";
 
 interface HeadlessBuildIdentity {
   git_sha?: string;
@@ -1496,9 +1509,11 @@ async function reportGlobalPinAndVerdict(
 }
 
 export async function runStatus(
+  argv: string[] = [],
   ctx: CastleWallCommandContext = {}
 ): Promise<number> {
   const out = ctx.out ?? process.stdout;
+  const err = ctx.err ?? process.stderr;
   const env = ctx.env ?? process.env;
   const platform = ctx.platform ?? process.platform;
   const execSyncFn =
@@ -1508,7 +1523,20 @@ export async function runStatus(
         encoding: "utf8",
         stdio: ["ignore", "pipe", "ignore"],
       }).trim());
-  const storagePath = resolveStoragePath(env);
+  // O-07 (register): honor the subcommand-level `--fortress <path>` flag,
+  // exactly like every other castle-wall custody verb (re-pin, daemon,
+  // audit-store-status; see runProvisionPin's doc for the identical prior
+  // bug). Before this fix `runStatus` took no argv at all and always read
+  // `resolveStoragePath(env)` (SANCTUARY_STORAGE_PATH or the default
+  // ~/.sanctuary fortress), so `castle-wall status --fortress <path>`
+  // silently reported the local pinned key AND probed the enforcement-
+  // availability socket for the DEFAULT fortress, never the one named --
+  // whatever order the flag was passed in, since it was never parsed.
+  // resolveFortressArg falls back to resolveStoragePath(env) when no flag is
+  // given, preserving prior (env-or-default) behavior exactly.
+  const parsed = parseCastleWallArgs(argv);
+  if (writeCastleWallParseError(parsed, err)) return 2;
+  const storagePath = resolveFortressArg(parsed.fortress, env);
   const pubPath = join(storagePath, CASTLE_PINNED_PUBKEY);
 
   let localFingerprint: string | null = null;
@@ -2543,6 +2571,18 @@ export async function runReload(
       out,
       `No Castle Wall daemon running for fortress ${fortressIdLabel(fortressPath)}. Run 'sanctuary wrap' to start one.\n`,
     );
+    // NF-08: "nothing to reload" is not a failure by default: a fresh
+    // fortress with no daemon yet is a normal state, and this exit code is
+    // test-pinned. A scripted caller that needs to tell "reloaded" apart from
+    // "nothing was there" opts in with --require-daemon rather than the
+    // default silently becoming unscriptable for everyone else.
+    if (parsed.requireDaemon) {
+      write(
+        err,
+        `Error: --require-daemon set and no Castle Wall daemon is reachable for fortress ${fortressIdLabel(fortressPath)}.\n`,
+      );
+      return 1;
+    }
     return 0;
   }
   write(err, `Error: ${result.error ?? "policy reload failed"}\n`);
@@ -3852,6 +3892,7 @@ function makeDefaultOpenRunner(timeoutMs: number): OpenRunner {
  */
 const ARM_INVOKE_TIMEOUT_MS = 90_000;
 const DISARM_INVOKE_TIMEOUT_MS = 7_000;
+const DEACTIVATE_SYSTEM_EXTENSION_TIMEOUT_MS = 90_000;
 function defaultArmInvoke(ctx: CastleWallCommandContext, action: "enable" | "disable"): HostAppInvoker {
   return makeLaunchServicesHostAppInvoke({
     timeoutMs: action === "disable" ? DISARM_INVOKE_TIMEOUT_MS : ARM_INVOKE_TIMEOUT_MS,
@@ -3861,6 +3902,113 @@ function defaultArmInvoke(ctx: CastleWallCommandContext, action: "enable" | "dis
       ? { runningAppController: ctx.runningAppController }
       : {}),
   });
+}
+
+export type SystemExtensionDeactivationRequestOutcome =
+  | { kind: "request-completed" }
+  | { kind: "reboot-required" }
+  | { kind: "needs-user-approval"; detail: string }
+  | { kind: "failed"; detail: string };
+
+/**
+ * Ask the deployed signed host app to deactivate its bundled system
+ * extension. This function deliberately proves only the REQUEST outcome;
+ * callers must independently observe system-extension absence before they
+ * claim removal, because macOS may defer completion until reboot.
+ */
+export async function requestSystemExtensionDeactivation(
+  ctx: CastleWallCommandContext = {},
+): Promise<SystemExtensionDeactivationRequestOutcome> {
+  const env = ctx.env ?? process.env;
+  const platform = ctx.platform ?? process.platform;
+  if (platform !== "darwin") {
+    return { kind: "failed", detail: "system-extension deactivation is macOS-only" };
+  }
+
+  const resolved = await resolveHostAppBinary(env, ctx);
+  if ("error" in resolved) {
+    return { kind: "failed", detail: resolved.error };
+  }
+
+  const invoke =
+    ctx.hostAppInvoke ??
+    makeLaunchServicesHostAppInvoke({
+      timeoutMs: DEACTIVATE_SYSTEM_EXTENSION_TIMEOUT_MS,
+      ...(ctx.openRunner ? { openRunner: ctx.openRunner } : {}),
+      ...(ctx.reportPathFactory ? { reportPathFactory: ctx.reportPathFactory } : {}),
+      ...(ctx.runningAppController
+        ? { runningAppController: ctx.runningAppController }
+        : {}),
+    });
+  const cliGitSha = resolveCliBuildSha(env, ctx);
+
+  // The signed host refuses deactivation while the filter is enabled too,
+  // but the CLI checks first so no destructive request is even submitted
+  // when the disarm postcondition is not positively observed.
+  const statusResult = await invoke(resolved.path, ["--headless", "status"]);
+  const statusReport = parseHeadlessReport(statusResult.stdout);
+  if (!statusReport) {
+    return {
+      kind: "failed",
+      detail:
+        statusResult.stderr.trim() ||
+        `host app status exited with code ${statusResult.exitCode}`,
+    };
+  }
+  const statusBuildMismatch = validateHeadlessBuildIdentity(statusReport, cliGitSha);
+  if (statusBuildMismatch) {
+    return { kind: "failed", detail: statusBuildMismatch };
+  }
+  if (statusReport.state !== "disabled") {
+    return {
+      kind: "failed",
+      detail: `content filter state is '${statusReport.state}', not positively observed disabled`,
+    };
+  }
+
+  const result = await invoke(resolved.path, [
+    "--headless",
+    "deactivate-system-extension",
+    "--timeout=60",
+  ]);
+  const report = parseHeadlessReport(result.stdout);
+  if (!report) {
+    return {
+      kind: "failed",
+      detail:
+        result.stderr.trim() ||
+        `host app deactivation exited with code ${result.exitCode}`,
+    };
+  }
+  const buildMismatch = validateHeadlessBuildIdentity(report, cliGitSha);
+  if (buildMismatch) {
+    return { kind: "failed", detail: buildMismatch };
+  }
+  if (report.state === "needs_user_approval") {
+    return {
+      kind: "needs-user-approval",
+      detail: report.error ?? "macOS requires operator approval",
+    };
+  }
+  if (!report.ok || result.exitCode !== 0) {
+    return {
+      kind: "failed",
+      detail:
+        report.error ??
+        (result.stderr.trim() ||
+          `host app deactivation exited with code ${result.exitCode}`),
+    };
+  }
+  if (report.state === "will_complete_after_reboot") {
+    return { kind: "reboot-required" };
+  }
+  if (report.state === "deactivated") {
+    return { kind: "request-completed" };
+  }
+  return {
+    kind: "failed",
+    detail: `host app returned unexpected deactivation state '${report.state}'`,
+  };
 }
 
 /**
@@ -4729,6 +4877,37 @@ async function runArmDisarmInner(
 
   const invoke = ctx.hostAppInvoke ?? defaultArmInvoke(ctx, action);
   const cliGitSha = resolveCliBuildSha(env, ctx);
+  if (action === "enable") {
+    // Identity is a PRECONDITION to mutation, not a postcondition. The old
+    // ordering invoked `--headless enable` first and only then rejected a
+    // stale deployed app, which could leave the NE preference enabled while
+    // returning failure before the authenticated arm lease was sent. Read the
+    // deployed app's identity through the non-mutating status action first;
+    // any missing/mismatched identity refuses without calling enable.
+    const identityProbe = await invoke(resolved.path, ["--headless", "status"]);
+    if (identityProbe.stderr.trim()) {
+      write(err, identityProbe.stderr.trimEnd() + "\n");
+    }
+    const identityReport = parseHeadlessReport(identityProbe.stdout);
+    if (!identityReport) {
+      const detail =
+        identityProbe.stderr.trim() ||
+        `host app status exited with code ${identityProbe.exitCode}`;
+      write(
+        err,
+        `castle-wall enable failed before arming: deployed app identity could not be verified (${detail}).\n`,
+      );
+      return 1;
+    }
+    const buildMismatch = validateHeadlessBuildIdentity(
+      identityReport,
+      cliGitSha,
+    );
+    if (buildMismatch) {
+      write(err, `castle-wall enable failed before arming: ${buildMismatch}\n`);
+      return 1;
+    }
+  }
   const headlessArgs = ["--headless", action];
   if (action === "enable") {
     if (parsed.noTtl) headlessArgs.push("--no-ttl");
@@ -4998,17 +5177,33 @@ export function parseCastleWallArgs(argv: string[]): CastleWallParsedArgs {
   for (let i = 0; i < since.argv.length; i++) {
     const arg = since.argv[i]!;
     if (arg === "--ttl") {
-      parsed.ttlSeconds = parseLeaseTtlSeconds(since.argv[++i]);
+      // Route through parseError rather than letting the parser throw: this loop
+      // runs inside parseCastleWallArgs, the single chokepoint every castle-wall
+      // verb calls before its own try block starts, so an uncaught throw here
+      // would skip writeCastleWallParseError and land in the top-level
+      // `main().catch` handler instead (wrong exit code, "failed to start"
+      // instead of a usage error).
+      const ttl = parseLeaseTtlSeconds(since.argv[++i]);
+      if ("error" in ttl) return { ...parsed, parseError: ttl.error };
+      parsed.ttlSeconds = ttl.value;
     } else if (arg.startsWith("--ttl=")) {
-      parsed.ttlSeconds = parseLeaseTtlSeconds(arg.slice("--ttl=".length));
+      const ttl = parseLeaseTtlSeconds(arg.slice("--ttl=".length));
+      if ("error" in ttl) return { ...parsed, parseError: ttl.error };
+      parsed.ttlSeconds = ttl.value;
     } else if (arg === "--no-ttl") {
       parsed.noTtl = true;
     } else if (arg.startsWith("--scope=")) {
-      parsed.scope = parseScope(arg.slice("--scope=".length));
+      const scope = parseScope(arg.slice("--scope=".length));
+      if ("error" in scope) return { ...parsed, parseError: scope.error };
+      parsed.scope = scope.value;
     } else if (arg === "--scope") {
-      parsed.scope = parseScope(since.argv[++i]);
+      const scope = parseScope(since.argv[++i]);
+      if ("error" in scope) return { ...parsed, parseError: scope.error };
+      parsed.scope = scope.value;
     } else if (arg === "--force") {
       parsed.force = true;
+    } else if (arg === "--require-daemon") {
+      parsed.requireDaemon = true;
     } else if (arg === "--allow-no-egress") {
       parsed.allowNoEgress = true;
     } else if (arg.startsWith("--agent-uid=")) {
@@ -5045,9 +5240,17 @@ export function parseCastleWallArgs(argv: string[]): CastleWallParsedArgs {
   return parsed;
 }
 
-function parseScope(value: string | undefined): "once" | "session" | "always" {
-  if (value === "session" || value === "always" || value === "once") return value;
-  throw new Error("--scope must be once, session, or always");
+// Returns a result object instead of throwing (must match the equivalent
+// choice in parseLeaseTtlSeconds below): both are called from inside
+// parseCastleWallArgs's arg loop, before any verb's own try block, so a thrown
+// Error would bypass writeCastleWallParseError and surface as an unhandled
+// top-level failure rather than the structured parse-error path every other
+// flag uses.
+function parseScope(
+  value: string | undefined,
+): { value: "once" | "session" | "always" } | { error: string } {
+  if (value === "session" || value === "always" || value === "once") return { value };
+  return { error: "--scope must be once, session, or always" };
 }
 
 function resolveFortressArg(
@@ -5071,14 +5274,17 @@ function parseDurationMs(value: string): number {
   return amount * multiplier;
 }
 
-function parseLeaseTtlSeconds(value: string | undefined): number {
-  if (!value) throw new Error("--ttl requires a duration like 30s, 5m, or 1h");
+// See parseScope's comment above: same reasoning applies here.
+function parseLeaseTtlSeconds(
+  value: string | undefined,
+): { value: number } | { error: string } {
+  if (!value) return { error: "--ttl requires a duration like 30s, 5m, or 1h" };
   const match = /^(\d+)([smh])$/.exec(value);
-  if (!match) throw new Error("--ttl must use forms like 30s, 5m, or 1h");
+  if (!match) return { error: "--ttl must use forms like 30s, 5m, or 1h" };
   const amount = Number(match[1]);
   const unit = match[2];
   const multiplier = unit === "s" ? 1 : unit === "m" ? 60 : 3600;
-  return amount * multiplier;
+  return { value: amount * multiplier };
 }
 
 function isCastleWallAuditEntry(entry: AuditEntry): boolean {

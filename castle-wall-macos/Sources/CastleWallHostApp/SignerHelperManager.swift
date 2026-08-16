@@ -89,6 +89,19 @@ final class SignerHelperManager: ObservableObject {
         helperEnabled && pinPresent
     }
 
+    /// Activating the dormant system extension needs the approved helper, but
+    /// not the global pin. The privileged full-surface install provisions that
+    /// pin only after macOS has activated the extension, so using `isReady`
+    /// here would create a first-install dependency cycle. Arming and filter
+    /// enablement remain gated on `isReady` below.
+    static func canRequestSystemExtensionActivation(helperEnabled: Bool) -> Bool {
+        helperEnabled
+    }
+
+    var canRequestSystemExtensionActivation: Bool {
+        Self.canRequestSystemExtensionActivation(helperEnabled: helperState == .enabled)
+    }
+
     var isReady: Bool {
         SignerHelperManager.shouldAutoArm(
             helperEnabled: helperState == .enabled,

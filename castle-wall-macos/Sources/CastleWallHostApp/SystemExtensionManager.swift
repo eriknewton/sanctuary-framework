@@ -10,6 +10,7 @@ final class SystemExtensionManager: NSObject, ObservableObject {
         case activatedRequiresReboot
         case deactivating
         case deactivated
+        case deactivatedRequiresReboot
         case needsUserApproval
         case error(String)
 
@@ -27,6 +28,8 @@ final class SystemExtensionManager: NSObject, ObservableObject {
                 return "Deactivating"
             case .deactivated:
                 return "Deactivated"
+            case .deactivatedRequiresReboot:
+                return "Deactivation accepted (reboot required)"
             case .needsUserApproval:
                 return "Needs user approval"
             case let .error(message):
@@ -44,6 +47,24 @@ final class SystemExtensionManager: NSObject, ObservableObject {
     private var pendingOperation: PendingOperation?
 
     @Published var extensionState: ExtensionState = .unknown
+
+    /// Decide whether the host should submit its one launch-time activation
+    /// request. Helper approval is required because it is the operator's
+    /// background-item consent boundary; global-pin readiness is deliberately
+    /// absent because that pin is provisioned by the later privileged install.
+    static func shouldSubmitLaunchActivationRefresh(
+        didSubmit: Bool,
+        helperApproved: Bool,
+        extensionState: ExtensionState
+    ) -> Bool {
+        guard !didSubmit, helperApproved else { return false }
+        switch extensionState {
+        case .unknown, .activated:
+            return true
+        default:
+            return false
+        }
+    }
 
     func activate() {
         handleRequestStarted(isActivation: true)
@@ -89,7 +110,14 @@ final class SystemExtensionManager: NSObject, ObservableObject {
                 extensionState = .error("Unknown activation result")
             }
         case .deactivation:
-            extensionState = .deactivated
+            switch result {
+            case .completed:
+                extensionState = .deactivated
+            case .willCompleteAfterReboot:
+                extensionState = .deactivatedRequiresReboot
+            @unknown default:
+                extensionState = .error("Unknown deactivation result")
+            }
         case .none:
             extensionState = .unknown
         }

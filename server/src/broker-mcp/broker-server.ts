@@ -122,8 +122,9 @@ export function createBrokerMcpServer(
       {
         name: "broker/list_grants",
         description:
-          "List active grant metadata visible to this broker: skill, secret name, scope, optional " +
-          "agent/tenant/fortress/audience, and TTL. Secret values are never returned.",
+          "List grant metadata for YOUR verified caller only: skill, secret name, scope, optional " +
+          "agent/tenant/fortress/audience, and TTL. Grants belonging to other skills, agents, tenants, " +
+          "or fortresses are never returned. Secret values are never returned.",
         inputSchema: {
           type: "object",
           properties: {},
@@ -184,7 +185,12 @@ export function createBrokerMcpServer(
         }
 
         case "broker/list_grants": {
-          const grants = broker.getGrants().map((g) => ({
+          // Filtered against the SERVER-SET verified caller claims (never a
+          // request-supplied identity) so one skill/agent cannot enumerate
+          // every other principal's secret names, scopes, and TTLs
+          // (BROKER-GRANT-INVENTORY-CROSS-CALLER). The unfiltered inventory
+          // stays reachable only via broker.getGrants() on the operator CLI.
+          const grants = broker.getGrantsForCaller(verifiedCallerClaims(opts)).map((g) => ({
             skill: g.skill,
             secret: g.secret,
             scope: g.scope,
@@ -224,9 +230,16 @@ export function createBrokerMcpServer(
         // Generic denial message; specific reason is in the audit trail.
         return genericError("Broker denied");
       }
-      // Unexpected errors surface their name but NEVER the secret value.
-      const errMsg = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
-      return genericError(`Broker error: ${errMsg}`);
+      // Any other error (backend/keychain failure, malformed diagnostic
+      // output, etc.) is NEVER echoed to the agent: `e.message` can carry
+      // the secret NAME, an absolute keychain path, or raw `security(1)`
+      // stderr (BROKER-BACKEND-DIAGNOSTIC-LEAK). One fixed, content-free
+      // reason crosses this boundary; the real error already landed in the
+      // operator-only audit trail at its origin (see the `backend_error`
+      // audit entry in token-issuer.ts's readViaToken, queryable via
+      // queryAuditOperator / `sanctuary-secrets audit`, never via the
+      // agent-facing broker/audit_query tool).
+      return genericError("Broker backend unavailable");
     }
   });
 

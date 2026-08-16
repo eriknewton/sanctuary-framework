@@ -1,3 +1,4 @@
+// fail-before-exempt: adaptation-only in this PR — the only change here is passing the now-required identityManager arg to createFederationTools in setup() (AGENTS.md rule 3: an optional security dependency that gates a trust property must be required). None of this file's fixed SHRs correspond to a saved local identity, so the local-custody self-vouch refusal never fires here; that behavior IS bound (fails against pre-fix source) by test/security/self-vouch-trust-ingest-inventory.test.ts groups (b)/(f) and test/handshake/handshake-forgery-remediation.test.ts's M3 self-vouch test.
 /**
  * Federation Tools tests
  *
@@ -9,6 +10,7 @@
 import { describe, it, expect } from "vitest";
 import { ed25519 } from "@noble/curves/ed25519";
 import { createFederationTools } from "../../src/federation/tools.js";
+import { IdentityManager } from "../../src/cognitive/tools.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey, randomBytes } from "../../src/core/random.js";
 import { AuditLog } from "../../src/operational/audit-log.js";
@@ -29,7 +31,29 @@ function setup() {
   const storage = new MemoryStorage();
   const auditLog = new AuditLog(storage, generateRandomKey());
   const handshakeResults = new Map<string, HandshakeResult>();
-  const { tools, registry } = createFederationTools(auditLog, handshakeResults);
+  // Empty (no identities saved) but REAL — identityManager is a required
+  // constructor param now (AGENTS.md rule 3: an optional security dependency
+  // that gates a trust property must be required). None of this file's fixed
+  // SHRs correspond to a saved local identity, so the local-custody check
+  // never fires here; that path is covered by handshake-forgery-remediation.
+  // test.ts's M3 self-vouch test and the class-binding inventory suite.
+  const identityManager = new IdentityManager(storage, generateRandomKey());
+  // REQUIRED (fix-round-2, MUST-FIX 2: an optional per-origin-quota
+  // dependency can silently skip the quota, which was itself the defect).
+  // This file's `handshakeResults` is populated directly via `.set()`
+  // rather than through `createHandshakeTools`'s recordHandshakeResult, so
+  // there is no real per-session origin to attribute — an empty origins map
+  // means every registration in this file falls into the shared
+  // AGENT_UNKNOWN_ORIGIN bucket, which is fine: none of these tests
+  // exercise per-origin fairness (see
+  // test/security/attacker-writable-collections-bounds.test.ts for that).
+  const handshakeResultOrigins = new Map<string, string>();
+  const { tools, registry } = createFederationTools(
+    auditLog,
+    handshakeResults,
+    identityManager,
+    handshakeResultOrigins
+  );
   const findTool = (name: string) => tools.find(t => t.name === name)!;
   return { tools, registry, handshakeResults, findTool };
 }

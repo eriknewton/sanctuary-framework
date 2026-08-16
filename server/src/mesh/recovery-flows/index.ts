@@ -57,13 +57,14 @@ export {
 
 // Ceremonies
 export {
+  DEVICE_RECOVERY_REVOKE_REASON,
   DeviceRecoveryCeremony,
   deviceRecoveryQuorumInput,
+  deviceRecoveryRevokeQuorumInput,
   type DeviceRecoveryContext,
 } from "./device-recovery.js";
 export {
   NodeRevokeCeremony,
-  revokeQuorumInput,
   type NodeRevokeContext,
 } from "./node-revoke.js";
 export {

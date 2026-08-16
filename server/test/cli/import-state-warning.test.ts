@@ -335,7 +335,7 @@ describe("exit import state warning", () => {
     // state as the custody-splice signature and raised a FALSE
     // CustodyRollbackFrozenError, failing the import (exit 1). A fresh fortress
     // establishing itself for the first time has no prior lineage to roll back
-    // to — it is not a splice. This asserts the freeze did NOT fire, distinctly
+    // to - it is not a splice. This asserts the freeze did NOT fire, distinctly
     // from the success-path assertions above (which only check exit code +
     // imported-key count), so a regression that re-introduces the race is caught
     // by its rollback-specific symptom rather than only by a flaky exit code.
@@ -496,10 +496,9 @@ describe("exit import state warning", () => {
 
     expect(code).toBe(1);
     expect(out.text).not.toContain("verdict: PASS");
-    expect(err.text).toContain(
-      "this bundle is from a fortress that rotated its identity key; importing it would lose pre-rotation state",
-    );
-    expect(err.text).toContain("rotation-history replay");
+    expect(err.text).toContain("ROTATION_CHAIN_UNVERIFIABLE");
+    expect(err.text).toContain("rotation chain unverifiable");
+    expect(err.text).toContain(source.identity.identity_id);
 
     const destinationState = new StateStore(
       destination.storage,

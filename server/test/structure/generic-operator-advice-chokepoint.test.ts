@@ -159,6 +159,14 @@ const HERMES_LITERAL_CLASSIFICATIONS: readonly HermesLiteralClassification[] = [
     reason: "top-level protect help names the real Hermes command; it is not generic recovery advice",
   },
   {
+    file: "server/src/cli/install.ts",
+    scope: "buildAgentInstallPlan",
+    snippet: "--hermes",
+    exact: true,
+    expectedCount: 1,
+    reason: "the full-profile planner emits the current Hermes-specific protected installation action",
+  },
+  {
     file: "server/src/egress-gate/parked-claim.ts",
     scope: "runStateAdvice",
     snippet: "Re-run 'sudo sanctuary protect --hermes' to bring it back up -- but NOT",
@@ -342,13 +350,6 @@ const HERMES_LITERAL_CLASSIFICATIONS: readonly HermesLiteralClassification[] = [
     snippet: "sanctuary wrap --hermes            Wrap Hermes Agent",
     expectedCount: 1,
     reason: "wrap help names the real Hermes command; it is not recovery advice",
-  },
-  {
-    file: "server/src/wrap/preflight.ts",
-    scope: "checkRootPathSanctuary",
-    snippet: "sudo node server/dist/cli.js protect --hermes",
-    expectedCount: 1,
-    reason: "install preflight root-PATH fallback is explicitly the Hermes protect arming command",
   },
 ];
 

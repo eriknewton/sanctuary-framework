@@ -75,6 +75,12 @@ const FROZEN_SURFACES: ReadonlyArray<string> = [
   // federation rotate-root rotation-certificate kind tag (Slice 3a; the joiner
   // adopt side in 3b verifies this exact wire value):
   "federation-root-rotation",
+  // C12-REPLAY v2 quorum-input domain separators (design §8 Q5): these ride
+  // inside signed bytes AND on NodeRevokePayload.quorum_context.input_schema;
+  // every verifier matches them as an EXACT literal, so a byte change silently
+  // breaks verification of every existing v2 revoke / device-recovery quorum.
+  "sanctuary.guardian-revoke-quorum.v2",
+  "sanctuary.guardian-device-recovery-quorum.v2",
 
   // --- public TS export symbols (root index.ts surface) ---
   "L1Status",

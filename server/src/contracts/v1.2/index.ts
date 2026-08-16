@@ -22,3 +22,4 @@
 
 export * from "./intelligence-events.js";
 export * from "./operator-chat-events.js";
+export * from "./exit-bundle-manifest.js";

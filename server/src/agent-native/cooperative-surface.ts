@@ -21,6 +21,12 @@ import {
   sha256,
   type SessionBinding,
 } from "./safety-base.js";
+import {
+  COOPERATIVE_TOOL_NAMES,
+  isCompoundExecutableToolName,
+  type CompoundExecutableToolName,
+  type CooperativeToolName,
+} from "./tool-names.js";
 
 const FACADE_HIDDEN_MARKER_NAMESPACE = "_facade/hidden";
 
@@ -357,7 +363,7 @@ export function createAgentNativeCooperativeTools(
 
   function classifyIntent(intent: string): {
     safety_class: "ordinary" | "sensitive" | "gated";
-    tool: string | null;
+    tool: CooperativeToolName | null;
     example: Record<string, unknown> | null;
     why_sanctuary: string;
     remediation_class?: "request_review" | "try_lower_scope" | "wait";
@@ -444,7 +450,7 @@ export function createAgentNativeCooperativeTools(
             safety_class: "gated",
             tool: ["forget", "delete", "erase", "wipe", "purge", "remove", "remove permanently", "removepermanently"].some((needle) =>
               clause.includes(needle) || clause.replace(/[^a-z0-9:/._-]/g, "").includes(needle)
-            ) ? "sanctuary_forget" : null,
+            ) ? COOPERATIVE_TOOL_NAMES.forget : null,
             example: { args: "<operator-approved placeholders only>" },
             why_sanctuary: "This request may need operator review before execution.",
             remediation_class: "request_review",
@@ -469,7 +475,7 @@ export function createAgentNativeCooperativeTools(
         safety_class: "gated",
         tool: ["forget", "delete", "erase", "wipe", "purge", "remove", "remove permanently", "removepermanently"].some((needle) =>
           haystack.includes(needle) || compactHaystack.includes(needle)
-        ) ? "sanctuary_forget" : null,
+        ) ? COOPERATIVE_TOOL_NAMES.forget : null,
         example: { args: "<operator-approved placeholders only>" },
         why_sanctuary: "This request may need operator review before execution.",
         remediation_class: "request_review",
@@ -479,7 +485,7 @@ export function createAgentNativeCooperativeTools(
     if (/\b(remember|store|save)\b/.test(haystack)) {
       return {
         safety_class: "ordinary",
-        tool: "sanctuary_remember",
+        tool: COOPERATIVE_TOOL_NAMES.remember,
         example: { key: "user_tz", value: "America/Los_Angeles" },
         why_sanctuary: "State is encrypted, identity-bound, and audited.",
       };
@@ -487,7 +493,7 @@ export function createAgentNativeCooperativeTools(
     if (/\b(recall|read|lookup|get)\b/.test(haystack)) {
       return {
         safety_class: "ordinary",
-        tool: "sanctuary_recall",
+        tool: COOPERATIVE_TOOL_NAMES.recall,
         example: { key: "user_tz" },
         why_sanctuary: "Recall preserves verification status in the response.",
       };
@@ -500,6 +506,75 @@ export function createAgentNativeCooperativeTools(
       remediation_class: "try_lower_scope",
       probe_key: "ambiguous",
     };
+  }
+
+  function compoundStepPrimitive(tool: CompoundExecutableToolName, stepArgs: Record<string, unknown>): {
+    primitiveTool: "state_delete" | "state_write" | "state_read";
+    primitive: Record<string, unknown>;
+    riskTier: 1 | 3;
+  } {
+    switch (tool) {
+      case COOPERATIVE_TOOL_NAMES.forget:
+        return {
+          primitiveTool: "state_delete",
+          primitive: deletePrimitiveArgs(stepArgs),
+          riskTier: 1,
+        };
+      case COOPERATIVE_TOOL_NAMES.remember:
+        return {
+          primitiveTool: "state_write",
+          primitive: rememberPrimitiveArgs(stepArgs),
+          riskTier: 3,
+        };
+      case COOPERATIVE_TOOL_NAMES.hide:
+      case COOPERATIVE_TOOL_NAMES.recall:
+        return {
+          primitiveTool: "state_read",
+          primitive: recallPrimitiveArgs(stepArgs),
+          riskTier: 3,
+        };
+    }
+    const exhaustive: never = tool;
+    return exhaustive;
+  }
+
+  async function callCompoundStepPrimitive(step: {
+    tool: CompoundExecutableToolName;
+    primitive: Record<string, unknown>;
+  }): Promise<Record<string, unknown>> {
+    switch (step.tool) {
+      case COOPERATIVE_TOOL_NAMES.remember:
+        return await callPrimitive("state_write", step.primitive);
+      case COOPERATIVE_TOOL_NAMES.recall:
+      case COOPERATIVE_TOOL_NAMES.hide:
+        return await callPrimitive("state_read", step.primitive);
+      case COOPERATIVE_TOOL_NAMES.forget:
+        return await callPrimitive("state_delete", step.primitive);
+    }
+    const exhaustive: never = step.tool;
+    return exhaustive;
+  }
+
+  async function applyCompoundStepSideEffects(
+    step: {
+      tool: CompoundExecutableToolName;
+      args: Record<string, unknown>;
+      primitive: Record<string, unknown>;
+    },
+    result: Record<string, unknown>
+  ): Promise<boolean> {
+    switch (step.tool) {
+      case COOPERATIVE_TOOL_NAMES.hide:
+        return (await applyHideSideEffects(step.args, step.primitive, result)) !== null;
+      case COOPERATIVE_TOOL_NAMES.forget:
+        await applyForgetSideEffects(step.args, step.primitive);
+        return true;
+      case COOPERATIVE_TOOL_NAMES.remember:
+      case COOPERATIVE_TOOL_NAMES.recall:
+        return true;
+    }
+    const exhaustive: never = step.tool;
+    return exhaustive;
   }
 
   async function recordHelpProbe(intent: string, probeKey: string | undefined, safetyClass: string) {
@@ -538,7 +613,7 @@ export function createAgentNativeCooperativeTools(
 
   const tools: ToolDefinition[] = [
     {
-      name: "sanctuary_remember",
+      name: COOPERATIVE_TOOL_NAMES.remember,
       description: "Store a key/value into encrypted sovereign memory for this session. Wraps state_write with an approval-binding and audit record. Use this (not raw state_write) for agent working memory you want auditable. Returns { key, namespace_handle, audit_ref }; the namespace is an opaque handle, never the raw path.",
       tool_class: "write",
       approvalTargetToolName: "state_write",
@@ -580,7 +655,7 @@ export function createAgentNativeCooperativeTools(
       },
     },
     {
-      name: "sanctuary_recall",
+      name: COOPERATIVE_TOOL_NAMES.recall,
       description: "Read a key from encrypted sovereign memory, verifying integrity before returning. Returns { value, verified: true, audit_ref } (pass opts.full for the full record). Denied if integrity fails or the key was hidden via sanctuary_hide. Use as the read counterpart to sanctuary_remember.",
       tool_class: "read",
       approvalTargetToolName: "state_read",
@@ -633,7 +708,7 @@ export function createAgentNativeCooperativeTools(
       },
     },
     {
-      name: "sanctuary_hide",
+      name: COOPERATIVE_TOOL_NAMES.hide,
       description: "Mark a stored key as hidden so sanctuary_recall will not return it, without deleting the data. Use to suppress a memory from default reads while keeping it recoverable. Returns an audit_ref; the value still exists in the store and can be deleted with sanctuary_forget.",
       tool_class: "write",
       approvalTargetToolName: "state_read",
@@ -675,7 +750,7 @@ export function createAgentNativeCooperativeTools(
       },
     },
     {
-      name: "sanctuary_forget",
+      name: COOPERATIVE_TOOL_NAMES.forget,
       description: "Permanently delete a memory key via state_delete: the entry is removed and its file gets a best-effort random-byte overwrite before unlinking. On copy-on-write/SSD media (APFS, ext4, flash) the original bytes may persist, so at-rest confidentiality rests on encryption (data is stored as ciphertext), not on the overwrite. Tier 1: requires operator approval; pass the approval proof. Returns an audit_ref for the deletion event.",
       tool_class: "write",
       approvalTargetToolName: "state_delete",
@@ -708,7 +783,7 @@ export function createAgentNativeCooperativeTools(
       },
     },
     {
-      name: "sanctuary_help",
+      name: COOPERATIVE_TOOL_NAMES.help,
       description: "Given a free-text intent (e.g. \"save my timezone\", \"delete a stored secret\"), return which Sanctuary tool to use and how, including a runnable example for ordinary requests. This is the fastest way to find the sanctioned tool before acting; for the full tool catalog instead, call sanctuary_capabilities. Read-only; returns the guidance plus an audit_ref. Guidance is deliberately coarse for sensitive requests and never reveals policy internals.",
       tool_class: "read",
       inputSchema: {
@@ -731,7 +806,7 @@ export function createAgentNativeCooperativeTools(
       },
     },
     {
-      name: "sanctuary_capabilities",
+      name: COOPERATIVE_TOOL_NAMES.capabilities,
       description: "Return the start-here catalog of Sanctuary's cooperative tools: for each tool, what it does and when to reach for it. Read-only, takes no arguments. Call this to discover what cooperative memory/identity/audit tools are available and route your work through them instead of ad-hoc state. The same catalog is also delivered in the MCP server instructions at connect time; this tool re-serves it on demand. Returns { capabilities: [{ tool, does, when }], audit_ref }.",
       tool_class: "read",
       inputSchema: { type: "object", properties: {} },
@@ -754,7 +829,7 @@ export function createAgentNativeCooperativeTools(
       },
     },
     {
-      name: "sanctuary_who_am_i",
+      name: COOPERATIVE_TOOL_NAMES.whoAmI,
       description: "Return the disclosable identity facts for the current session: label, did, active-identity fingerprint, and memory namespace handle. Use to confirm which sovereign identity you are operating as. Read-only; private keys are never included.",
       tool_class: "read",
       inputSchema: { type: "object", properties: {} },
@@ -777,7 +852,7 @@ export function createAgentNativeCooperativeTools(
       },
     },
     {
-      name: "sanctuary_active_protections",
+      name: COOPERATIVE_TOOL_NAMES.activeProtections,
       description: "List the security guarantees currently in force for this session (e.g. state-encrypted-at-rest, approval-gate-mediated, append-only audit for critical ops, opaque memory handles). Use to tell a counterparty or yourself what protections apply. Read-only; returns guarantee flags plus an audit_ref. Reports only what IS active: absence of a flag is not a claim.",
       tool_class: "read",
       inputSchema: { type: "object", properties: {} },
@@ -800,7 +875,7 @@ export function createAgentNativeCooperativeTools(
       },
     },
     {
-      name: "sanctuary_events_open_cursor",
+      name: COOPERATIVE_TOOL_NAMES.eventsOpenCursor,
       description: "Open a paginated cursor over your own redacted local audit events, optionally filtered by operation. Use before sanctuary_events_read to page through recent activity. Returns { cursor, audit_ref }. Bound to your identity; cross-agent and callback/URL filters are refused.",
       tool_class: "read",
       inputSchema: {
@@ -835,7 +910,7 @@ export function createAgentNativeCooperativeTools(
       },
     },
     {
-      name: "sanctuary_events_read",
+      name: COOPERATIVE_TOOL_NAMES.eventsRead,
       description: "Read the next page of redacted events from a cursor opened with sanctuary_events_open_cursor (default 10, max 25 per call). Returns { events, next_cursor, audit_ref }. Only your own identity's events are visible; capped at 10 reads per cursor, then rate-limited.",
       tool_class: "read",
       inputSchema: {
@@ -889,7 +964,7 @@ export function createAgentNativeCooperativeTools(
       },
     },
     {
-      name: "sanctuary_events_close",
+      name: COOPERATIVE_TOOL_NAMES.eventsClose,
       description: "Release an event cursor opened with sanctuary_events_open_cursor. Call when done paging to free the cursor. Returns { closed: true, audit_ref }.",
       tool_class: "write",
       inputSchema: { type: "object", properties: { cursor: { type: "string" } }, required: ["cursor"] },
@@ -908,7 +983,7 @@ export function createAgentNativeCooperativeTools(
       },
     },
     {
-      name: "sanctuary_audit_search",
+      name: COOPERATIVE_TOOL_NAMES.auditSearch,
       description: "Full-text search your own audit history (scope is always own_signed), verifying entries against the audit chain first. Use to find when a past operation ran and its result. Returns matching entries with timestamp, operation, and verified_against_audit_chain status; refuses if the chain fails integrity.",
       tool_class: "read",
       inputSchema: {
@@ -993,7 +1068,7 @@ export function createAgentNativeCooperativeTools(
       },
     },
     {
-      name: "sanctuary_compound_execute",
+      name: COOPERATIVE_TOOL_NAMES.compoundExecute,
       description: "Execute a short plan of facade steps (sanctuary_remember/recall/hide/forget) in one call, reserving operator approvals up front for any Tier 1 step (e.g. a forget/delete). Use to batch a memory workflow atomically with respect to approval. Pass approvals keyed by step_id; the plan is hash-bound, and a missing approval aborts the whole plan.",
       tool_class: "write",
       inputSchema: {
@@ -1012,20 +1087,13 @@ export function createAgentNativeCooperativeTools(
             const stepArgs = (step.args && typeof step.args === "object" && !Array.isArray(step.args))
               ? step.args as Record<string, unknown>
               : {};
-            if (tool === "sanctuary_forget" && !forgetModeIsSecure(stepArgs)) {
+            if (!isCompoundExecutableToolName(tool)) {
               throw new Error(FIXED_DENIAL_MESSAGE);
             }
-            const primitive =
-              tool === "sanctuary_forget" ? deletePrimitiveArgs(stepArgs) :
-              tool === "sanctuary_remember" ? rememberPrimitiveArgs(stepArgs) :
-              tool === "sanctuary_hide" || tool === "sanctuary_recall" ? recallPrimitiveArgs(stepArgs) :
-              null;
-            const primitiveTool =
-              tool === "sanctuary_forget" ? "state_delete" :
-              tool === "sanctuary_remember" ? "state_write" :
-              tool === "sanctuary_hide" || tool === "sanctuary_recall" ? "state_read" :
-              null;
-            if (!primitive || !primitiveTool) throw new Error(FIXED_DENIAL_MESSAGE);
+            if (tool === COOPERATIVE_TOOL_NAMES.forget && !forgetModeIsSecure(stepArgs)) {
+              throw new Error(FIXED_DENIAL_MESSAGE);
+            }
+            const { primitiveTool, primitive, riskTier } = compoundStepPrimitive(tool, stepArgs);
             return {
               step_id: `step-${index + 1}`,
               tool,
@@ -1033,7 +1101,7 @@ export function createAgentNativeCooperativeTools(
               primitive_tool: primitiveTool,
               normalized_args_hash: normalizedArgsHash(primitive),
               primitive,
-              risk_tier: (primitiveTool === "state_delete" ? 1 : 3) as 1 | 3,
+              risk_tier: riskTier,
             };
           });
           const planHash = sha256(canonicalJson(planSteps.map((step) => ({
@@ -1096,10 +1164,7 @@ export function createAgentNativeCooperativeTools(
               }, "failure");
               return toolResult({ status: "partial_failed", completed_steps: completed, failed_step: step.step_id, audit_ref: auditRef });
             }
-            const result =
-              step.tool === "sanctuary_remember" ? await callPrimitive("state_write", step.primitive) :
-              step.tool === "sanctuary_recall" || step.tool === "sanctuary_hide" ? await callPrimitive("state_read", step.primitive) :
-              await callPrimitive("state_delete", step.primitive);
+            const result = await callCompoundStepPrimitive(step);
             if (result.denied || result.error) {
               releaseReservedApprovals(reservedApprovals.filter((approval) => approval.step_id !== step.step_id));
               const auditRef = await audit("sanctuary_compound_execute", {
@@ -1112,11 +1177,7 @@ export function createAgentNativeCooperativeTools(
             }
             let sideEffectsApplied = true;
             try {
-              if (step.tool === "sanctuary_hide") {
-                sideEffectsApplied = (await applyHideSideEffects(step.args, step.primitive, result)) !== null;
-              } else if (step.tool === "sanctuary_forget") {
-                await applyForgetSideEffects(step.args, step.primitive);
-              }
+              sideEffectsApplied = await applyCompoundStepSideEffects(step, result);
             } catch {
               sideEffectsApplied = false;
             }

@@ -295,9 +295,27 @@ export interface ExitBundleVerifierResult {
     // the warnings array.
     | "identity_binding_mismatch"
     | "identity_signature_invalid"
+    // EXIT-PASS-01: a present rotation chain that does not verify. Distinct
+    // from identity_signature_invalid (the artifact's own signature) — this is
+    // the chain from a retired key to the current one failing verification.
+    | "rotation_chain_invalid"
     | "reputation_bundle_signature_invalid"
     | "reputation_completeness_mismatch"
     | "reputation_attestation_signature_invalid"
     | "reputation_unverifiable_attestations"
+    // The encrypted_state artifact passed its own hash and manifest-
+    // signature checks, but its internal entries list could not be read in
+    // the expected shape — either the CONTAINER (`entries` missing or not
+    // an array, LD2-01) or, one level deeper, an ELEMENT inside it
+    // (`entries: [null]`, or an element missing `namespace`/`entry`/
+    // `entry.kid`/`entry.payload.ct`/`entry.sig`, EXIT-STRUCT-02). Both
+    // share this one failure_class: from an operator's perspective both are
+    // "the entries list could not be read in the expected shape". Distinct
+    // from `"damaged"` in
+    // `ExitBundleDeclaredRekeyMaterial` (server/src/exit/verifier.ts), which
+    // covers a bundle whose entries ARE readable but whose re-key material
+    // is malformed — that case stays verify-PASS by design and fails import
+    // for a typed credential reason instead.
+    | "encrypted_state_entries_unreadable"
     | "other";
 }

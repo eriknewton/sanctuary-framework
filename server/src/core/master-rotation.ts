@@ -1245,6 +1245,29 @@ async function convertAuditAnchors(ctx: Ctx, verifyOnly: boolean): Promise<numbe
       purpose: "audit-head-anchor",
       domain: "sanctuary.audit-head-anchor.v1\n",
     },
+    // IC-05-DG signing control records. Marker/purpose/domain must match
+    // AUDIT_SIGNING_LATCH_V2_MARKER / AUDIT_SIGNING_LATCH_V2_MAC_PURPOSE /
+    // AUDIT_SIGNING_LATCH_V2_MAC_DOMAIN and AUDIT_SIGNING_HEAD_MARKER /
+    // AUDIT_SIGNING_HEAD_MAC_PURPOSE / AUDIT_SIGNING_HEAD_MAC_DOMAIN in
+    // operational/audit-log.ts; the key literals are
+    // AUDIT_SIGNING_LATCH_V2_KEY / AUDIT_SIGNING_HEAD_KEY in
+    // audit/checkpoint-shape.ts. Omitting either entry would make rotation
+    // ABORT on every fortress that ever signed a checkpoint (closed-set
+    // classifier below). `restampMacRecord` gives these the required
+    // dual-master transitional verification: already-new is tolerated on
+    // resume, a marker-bearing record failing BOTH masters aborts loudly
+    // (tamper is never restamped into validity), and a marker-stripped
+    // record is left for the audit log's own fail-closed reader.
+    __signing_latch_v2: {
+      marker: "__sanctuary_audit_signing_latch_v2",
+      purpose: "audit-signing-latch-v2",
+      domain: "sanctuary.audit-signing-latch.v2\n",
+    },
+    __signing_head: {
+      marker: "__sanctuary_audit_signing_head_v1",
+      purpose: "audit-signing-head",
+      domain: "sanctuary.audit-signing-head.v1\n",
+    },
   };
   for (const key of await listKeys(ctx.storage, "_audit_checkpoints")) {
     const anchor = MAC_ANCHORS[key];
@@ -1591,7 +1614,14 @@ async function finalize(ctx: Ctx, journal: RotationJournalData): Promise<void> {
   // Audit the rotation under the NEW master (old entries decrypt via the
   // epoch record; the chain verifies across the boundary). Envelope ids
   // only — never key material (CLAUDE.md #6).
-  const auditLog = new AuditLog(ctx.storage, ctx.newMaster);
+  // IC-05-DG: transitional rotation reader (the #1249 fail-soft roster) —
+  // mid-rotation the signing control records may authenticate under either
+  // epoch, so downgrade detection is declared off AT CONSTRUCTION rather
+  // than minting false TAMPERED verdicts; the next steady-state fortress
+  // load runs it. Never derived from storage (DELTA-4).
+  const auditLog = new AuditLog(ctx.storage, ctx.newMaster, {
+    signingDetectionMode: "non-fortress",
+  });
   await auditLog.appendCritical({
     layer: "l1",
     operation: "custody_master_rotated",
@@ -1698,7 +1728,11 @@ export async function rotateMaster(
     // tamper aborts here with nothing mutated, not after a recovery key has
     // already been shown to the operator.
     try {
-      const auditPreflight = new AuditLog(storage, oldMaster);
+      // IC-05-DG: transitional rotation reader; see the rotation-audit
+      // instance's note. Never derived from storage (DELTA-4).
+      const auditPreflight = new AuditLog(storage, oldMaster, {
+        signingDetectionMode: "non-fortress",
+      });
       await auditPreflight.query({ limit: 1 });
     } catch (err) {
       throw new RotationPreflightError(
@@ -1814,7 +1848,11 @@ export async function rotateMaster(
 
     // Audit the start under the OLD master (this entry stays readable after
     // rotation via the audit epoch record).
-    const oldAudit = new AuditLog(storage, oldMaster);
+    // IC-05-DG: transitional rotation reader; see the rotation-audit
+    // instance's note. Never derived from storage (DELTA-4).
+    const oldAudit = new AuditLog(storage, oldMaster, {
+      signingDetectionMode: "non-fortress",
+    });
     await oldAudit.appendCritical({
       layer: "l1",
       operation: "custody_rotation_started",

@@ -16,7 +16,8 @@ import { runProvisionPin } from "../../../src/cli/castle-wall.js";
 import {
   formatCastleWallAlreadyRunningMessage,
   safeModeHandoffMessage,
-  startMacOSCastleWallDaemon,
+  startMacOSCastleWallDaemon as startProductionMacOSCastleWallDaemon,
+  type MacOSCastleWallDaemonInput,
   type MacOSCastleWallListenerOptions,
 } from "../../../src/castle-wall/runtime/index.js";
 import {
@@ -31,6 +32,25 @@ const silent = new Writable({
     callback();
   },
 });
+
+function hermeticGlobalPinPath(fortressPath: string): string {
+  return join(fortressPath, "test-system", "castle-pinned-pubkey.bin");
+}
+
+function startMacOSCastleWallDaemon(input: MacOSCastleWallDaemonInput) {
+  // Integration tests exercise only temp custody; installed machine-wide
+  // trust anchors and producer state are never test fixtures.
+  return startProductionMacOSCastleWallDaemon({
+    globalPinnedPublicKeyPath: hermeticGlobalPinPath(input.fortressPath),
+    auditProducerPublicKeyPath: join(
+      input.fortressPath,
+      "test-system",
+      "castle-audit-producer.pub",
+    ),
+    auditProducerStatePath: null,
+    ...input,
+  });
+}
 
 describe("Castle Wall macOS daemon integration", () => {
   const tempDirs: string[] = [];
@@ -79,6 +99,7 @@ describe("Castle Wall macOS daemon integration", () => {
     const pinResult = await runProvisionPin([], {
       out: silent,
       err: silent,
+      globalPinnedPublicKeyPath: hermeticGlobalPinPath(fortressPath),
       env: {
         SANCTUARY_STORAGE_PATH: fortressPath,
         SANCTUARY_RECOVERY_KEY: recoveryKey,

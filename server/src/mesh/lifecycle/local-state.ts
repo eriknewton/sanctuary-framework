@@ -17,6 +17,11 @@ import type {
   SignedEvent,
 } from "../types.js";
 import { decodePolicyBlob } from "../../policy-engine/canonical-policy.js";
+import {
+  MAX_RETAINED_NON_REVOKE_EVENTS_PER_EMITTER,
+  MAX_RETAINED_REVOKE_AUTHORIZATIONS_PER_TARGET,
+  NODE_LIFECYCLE_LOG_MAX_EVENTS,
+} from "./constants.js";
 
 export const POLICY_BUNDLE_REJECTION_AUDIT_OP =
   "mesh_policy_bundle_rejected" as const;
@@ -285,12 +290,122 @@ export class LocatorTableStore {
 /**
  * Recent node-lifecycle events log. Used by sync to ship missed
  * join/leave/revoke events to a rejoining node.
+ *
+ * SYNC-APPEND-01 (C12-REPLAY §3.3): this log is fed from untrusted sync input,
+ * so it is NOT an unbounded array. Four invariants hold here:
+ *   - a cap with revoke-preserving eviction (rule 8);
+ *   - a per-EMITTER quota on retained non-revoke events (rule 8's per-origin
+ *     quota): one flooding in-roster emitter evicts within its OWN bucket
+ *     first and can never push another emitter's events out of the log;
+ *   - non-revoke events dedupe on `(emitter_node_id, event_id)` — emitter-scoped
+ *     so no cross-emitter suppression, and (per the caller contract) only
+ *     VERIFIED events reach `append`, so an unverified colliding id can never
+ *     occupy a slot;
+ *   - accepted revokes retain on the AUTHORIZATION key (never `event_id`, which
+ *     is attacker-chosen inside the signed body): one authorization yields at
+ *     most one retained revoke entry per target, bounding the revoke-retained
+ *     set by (#targets * per-target quota) so a single harvested quorum cannot
+ *     apply eviction pressure against other targets' legitimate revokes.
+ *
+ * The roster-state binding (drop a same-authorization replay only when the
+ * target is currently revoked, refuse it when re-admitted) lives in the CALLER
+ * (`MeshNode.admitRevoke`), which knows roster state; this class provides the
+ * authorization-presence query and the append that registers it.
  */
 export class NodeLifecycleEventLog {
   private events: SignedEvent<NodeLifecyclePayload>[] = [];
+  /** `${emitter_node}\u0000${event_id}` for every retained NON-revoke event. */
+  private readonly nonRevokeKeys = new Set<string>();
+  /** authorization key -> the retained revoke event (identity for eviction). */
+  private readonly revokeByAuth = new Map<
+    string,
+    SignedEvent<NodeLifecyclePayload>
+  >();
+  /** target_node_id -> retained authorization keys in insertion order. */
+  private readonly revokeAuthsByTarget = new Map<string, string[]>();
+  /**
+   * emitter_node -> that emitter's retained NON-revoke events in insertion
+   * order. Backs the per-emitter quota (rule 8's per-origin quota): eviction
+   * under quota pressure comes from the flooding emitter's own bucket, never
+   * a neighbor's.
+   */
+  private readonly nonRevokeByEmitter = new Map<
+    string,
+    SignedEvent<NodeLifecyclePayload>[]
+  >();
 
+  /**
+   * Append a VERIFIED non-revoke lifecycle event. Idempotent on
+   * `(emitter_node, event_id)`: a re-served duplicate is a no-op, never a
+   * second row. Revokes MUST go through `appendRevoke` instead.
+   */
   append(evt: SignedEvent<NodeLifecyclePayload>): void {
+    if (evt.event_type === "node_revoke") {
+      throw new Error(
+        "NodeLifecycleEventLog.append: node_revoke events must use appendRevoke (authorization-keyed retention)"
+      );
+    }
+    const key = this.nonRevokeKey(evt);
+    if (this.nonRevokeKeys.has(key)) return;
+    // Per-emitter quota (rule 8's per-origin quota): a full bucket evicts the
+    // FLOODING emitter's own oldest event, never another emitter's — one
+    // in-roster emitter must not be able to erase its neighbors' history
+    // through global oldest-first eviction pressure.
+    const bucket = this.nonRevokeByEmitter.get(evt.emitter_node) ?? [];
+    while (bucket.length >= MAX_RETAINED_NON_REVOKE_EVENTS_PER_EMITTER) {
+      const oldest = bucket[0];
+      const idx = this.events.indexOf(oldest);
+      if (idx !== -1) this.events.splice(idx, 1);
+      this.forgetIndexed(oldest); // also shifts it out of this bucket
+    }
+    this.nonRevokeKeys.add(key);
+    bucket.push(evt);
+    this.nonRevokeByEmitter.set(evt.emitter_node, bucket);
     this.events.push(evt);
+    this.enforceCap();
+  }
+
+  /**
+   * True iff an accepted revoke carrying this authorization key is already
+   * retained. The caller uses this to distinguish a first admission (append)
+   * from a same-authorization replay (drop-if-still-revoked / refuse-if-live).
+   */
+  hasRetainedRevokeAuthorization(authKey: string): boolean {
+    return this.revokeByAuth.has(authKey);
+  }
+
+  /**
+   * Append a VERIFIED, AUTHORIZED, first-seen revoke. Caller guarantees
+   * `hasRetainedRevokeAuthorization(authKey)` was false (a duplicate is dropped
+   * or refused by the caller, never re-appended here). Enforces the per-target
+   * authorization quota by EVICTING THE OLDEST authorization for that target,
+   * never blocking the newest.
+   */
+  appendRevoke(
+    evt: SignedEvent<NodeLifecyclePayload>,
+    params: { target_node_id: string; authorization_key: string }
+  ): void {
+    const { target_node_id: target, authorization_key: authKey } = params;
+    if (this.revokeByAuth.has(authKey)) {
+      // Defense in depth: the caller already checked, but never silently
+      // append a second row for the same authorization.
+      return;
+    }
+    const auths = this.revokeAuthsByTarget.get(target) ?? [];
+    // Evict-oldest to honor the per-target quota. The newest authorization's
+    // entry is the ordering witness a late joiner needs; blocking it would
+    // leave a legitimate post-rejoin revoke unretained while older entries sit
+    // before the rejoin in log order (the RG3-1 divergence through the quota).
+    while (auths.length >= MAX_RETAINED_REVOKE_AUTHORIZATIONS_PER_TARGET) {
+      const oldest = auths.shift();
+      if (oldest === undefined) break;
+      this.dropRetainedRevoke(oldest);
+    }
+    this.revokeByAuth.set(authKey, evt);
+    auths.push(authKey);
+    this.revokeAuthsByTarget.set(target, auths);
+    this.events.push(evt);
+    this.enforceCap();
   }
 
   /**
@@ -312,5 +427,72 @@ export class NodeLifecycleEventLog {
 
   snapshot(): SignedEvent<NodeLifecyclePayload>[] {
     return [...this.events];
+  }
+
+  private nonRevokeKey(evt: SignedEvent<NodeLifecyclePayload>): string {
+    return `${evt.emitter_node}\u0000${evt.event_id}`;
+  }
+
+  /**
+   * Enforce the global cap. Evict OLDEST NON-REVOKE first; a revoke is evicted
+   * only when the log holds nothing but revokes (degrades to "learn via a peer
+   * with a longer log", never to un-revoking — the roster is authoritative).
+   */
+  private enforceCap(): void {
+    while (this.events.length > NODE_LIFECYCLE_LOG_MAX_EVENTS) {
+      let evictIdx = this.events.findIndex(
+        (e) => e.event_type !== "node_revoke"
+      );
+      if (evictIdx === -1) evictIdx = 0; // only revokes remain
+      const [removed] = this.events.splice(evictIdx, 1);
+      if (removed) this.forgetIndexed(removed);
+    }
+  }
+
+  /** Remove a retained revoke from the events array and every index. */
+  private dropRetainedRevoke(authKey: string): void {
+    const evt = this.revokeByAuth.get(authKey);
+    if (!evt) return;
+    const idx = this.events.indexOf(evt);
+    if (idx !== -1) this.events.splice(idx, 1);
+    this.forgetIndexed(evt, authKey);
+  }
+
+  /** Drop index entries for an evicted event (revoke or non-revoke). */
+  private forgetIndexed(
+    evt: SignedEvent<NodeLifecyclePayload>,
+    knownAuthKey?: string
+  ): void {
+    if (evt.event_type !== "node_revoke") {
+      this.nonRevokeKeys.delete(this.nonRevokeKey(evt));
+      const bucket = this.nonRevokeByEmitter.get(evt.emitter_node);
+      if (bucket) {
+        const i = bucket.indexOf(evt);
+        if (i !== -1) bucket.splice(i, 1);
+        if (bucket.length === 0) this.nonRevokeByEmitter.delete(evt.emitter_node);
+      }
+      return;
+    }
+    let authKey = knownAuthKey;
+    if (authKey === undefined) {
+      for (const [k, v] of this.revokeByAuth) {
+        if (v === evt) {
+          authKey = k;
+          break;
+        }
+      }
+    }
+    if (authKey === undefined) return;
+    this.revokeByAuth.delete(authKey);
+    const payload = evt.payload as { node_id?: string };
+    const target = payload.node_id;
+    if (target !== undefined) {
+      const auths = this.revokeAuthsByTarget.get(target);
+      if (auths) {
+        const i = auths.indexOf(authKey);
+        if (i !== -1) auths.splice(i, 1);
+        if (auths.length === 0) this.revokeAuthsByTarget.delete(target);
+      }
+    }
   }
 }

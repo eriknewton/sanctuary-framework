@@ -1,3 +1,4 @@
+// fail-before-exempt: adaptation-only in this PR — the changed fake backend implements the newly required atomic putPassagesIfAbsent method; assertions and the memory-file-tools behavior they bind are unchanged. Exit V2 behavior, including atomic replay/conflict handling, is fail-before-proven in test/exit/exit-v2-sdw-memory-archive.test.ts.
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -18,6 +19,9 @@ import { FilesystemStorage } from "../../src/storage/filesystem.js";
 
 const FIXTURE_ROOT = fileURLToPath(
   new URL("../../src/sdw/__fixtures__/claude-code-memory/", import.meta.url),
+);
+const CODEX_FIXTURE_ROOT = fileURLToPath(
+  new URL("../../src/sdw/__fixtures__/codex-memory/", import.meta.url),
 );
 const MASTER_KEY = new Uint8Array(32).fill(13);
 const NOW = "2026-08-07T18:00:00.000Z";
@@ -109,9 +113,14 @@ function parse(result: { content: Array<{ type: "text"; text: string }> }): Reco
 }
 
 describe("SDW memory file tools", () => {
-  it("registers manual Claude Code transcode tools as write tools with honest non-sync descriptions", async () => {
+  it("registers manual harness transcode tools as write tools with honest non-sync descriptions", async () => {
     const { tools } = await makeTools();
-    expect([...tools.keys()].sort()).toEqual(["memory_emit", "memory_ingest"]);
+    expect([...tools.keys()].sort()).toEqual([
+      "memory_emit",
+      "memory_ingest",
+      "memory_transcode",
+      "memory_transcode_restore",
+    ]);
     for (const tool of tools.values()) {
       expect(tool.tool_class).toBe("write");
       expect(tool.description.toLowerCase()).toContain("does not sync");
@@ -121,6 +130,14 @@ describe("SDW memory file tools", () => {
     expect(tools.get("memory_ingest")!.description).toContain("skipped_file_count");
     expect(tools.get("memory_emit")!.description).toContain("Existing memory files are never overwritten");
     expect(tools.get("memory_emit")!.description).not.toContain("empty operator-named directory");
+    for (const name of ["memory_ingest", "memory_emit"]) {
+      const tool = tools.get(name)!;
+      const schema = tool.inputSchema as {
+        properties: { harness: { enum?: string[] } };
+      };
+      const harness = schema.properties.harness;
+      expect(harness.enum).toEqual(["claude-code", "codex"]);
+    }
   });
 
   it("approval projection carries command metadata AND whose memory moves, never memory file bytes", () => {
@@ -136,11 +153,21 @@ describe("SDW memory file tools", () => {
     // owner scope and which calling agent it is for.
     expect(
       memoryFileApprovalArgs(
-        { harness: "claude-code", dir: "/tmp/out", text: "body" },
+        {
+          from_harness: "claude-code",
+          to_harness: "codex",
+          mode: "reversible",
+          archive_id: "opaque-id",
+          dir: "/tmp/out",
+          text: "body",
+        },
         { ownerRef: "fleet-self", agentId: "agent-beta" },
       ),
     ).toEqual({
-      harness: "claude-code",
+      from_harness: "claude-code",
+      to_harness: "codex",
+      mode: "reversible",
+      archive_id: "opaque-id",
       dir: "/tmp/out",
       owner_ref: "fleet-self",
       agent_id: "agent-beta",
@@ -164,6 +191,80 @@ describe("SDW memory file tools", () => {
         agent_id: "agent-alpha",
       });
     }
+    expect(tools.get("memory_transcode")!.approvalTargetArgs!({
+      from_harness: "claude-code",
+      to_harness: "codex",
+      mode: "reversible",
+      dir: "/tmp/out",
+      text: "must not escape",
+    })).toEqual({
+      from_harness: "claude-code",
+      to_harness: "codex",
+      mode: "reversible",
+      dir: "/tmp/out",
+      owner_ref: "fleet-self",
+      agent_id: "agent-alpha",
+    });
+    expect(tools.get("memory_transcode_restore")!.approvalTargetArgs!({
+      archive_id: "opaque-id",
+      dir: "/tmp/restore",
+      text: "must not escape",
+    })).toEqual({
+      archive_id: "opaque-id",
+      dir: "/tmp/restore",
+      owner_ref: "fleet-self",
+      agent_id: "agent-alpha",
+    });
+  });
+
+  it("transcodes and exactly restores through Tier-1 handlers without returning memory bodies", async () => {
+    const { tools, auditCalls } = await makeTools();
+    const projection = join(await tempDir("memory-transcode-tool-projection-parent"), "codex");
+    const restored = join(await tempDir("memory-transcode-tool-restore-parent"), "claude");
+    expect(
+      parse(await tools.get("memory_ingest")!.handler({
+        harness: "claude-code",
+        dir: join(FIXTURE_ROOT, "unicode"),
+      })).complete,
+    ).toBe(true);
+
+    const transcoded = parse(await tools.get("memory_transcode")!.handler({
+      from_harness: "claude-code",
+      to_harness: "codex",
+      mode: "reversible",
+      dir: projection,
+    }));
+    expect(transcoded).toMatchObject({
+      transcoded: true,
+      from_harness: "claude-code",
+      to_harness: "codex",
+      mode: "reversible",
+      source_file_count: 2,
+      projection_file_count: 3,
+    });
+    expect(JSON.stringify(transcoded)).not.toContain("café");
+
+    const restoredResult = parse(await tools.get("memory_transcode_restore")!.handler({
+      archive_id: transcoded.archive_id,
+      dir: restored,
+    }));
+    expect(restoredResult).toMatchObject({
+      restored: true,
+      source_harness: "claude-code",
+      source_file_count: 2,
+    });
+    expect(await readFile(join(restored, "MEMORY.md"))).toEqual(
+      await readFile(join(FIXTURE_ROOT, "unicode", "MEMORY.md")),
+    );
+    expect(auditCalls.map((call) => call.operation)).toEqual([
+      "memory_ingest_started",
+      "memory_ingest",
+      "memory_transcode_started",
+      "memory_transcode",
+      "memory_transcode_restore_started",
+      "memory_transcode_restore",
+    ]);
+    expect(JSON.stringify(auditCalls)).not.toContain("café");
   });
 
   it("ingests and emits Claude Code files through the MCP handlers without returning bodies in ingest output", async () => {
@@ -213,7 +314,7 @@ describe("SDW memory file tools", () => {
     const source = await copyFixtureSet("basic", "cc-memory-tool-skip");
     await writeFile(
       join(source, "note-with-secret.md"),
-      "# Ops note\n\nThe principal policy file lives in the fortress root.\n",
+      "# Ops note\n\nSANCTUARY_RECOVERY_KEY=AbCdEfGhIjKlMnOpQrStUvWxYz0123456789_-AbCdE\n",
     );
 
     const ingested = parse(
@@ -286,6 +387,9 @@ describe("SDW memory file tools", () => {
           cause: new Error("injected rollback verifier failure"),
         });
       },
+      putPassagesIfAbsent: async () => {
+        throw new Error("not used");
+      },
       insertPassage: async () => {
         throw new Error("not used");
       },
@@ -345,6 +449,9 @@ describe("SDW memory file tools", () => {
       putPassages: async () => {
         throw lockError;
       },
+      putPassagesIfAbsent: async () => {
+        throw new Error("not used");
+      },
       insertPassage: async () => {
         throw new Error("not used");
       },
@@ -394,7 +501,7 @@ describe("SDW memory file tools", () => {
     });
   });
 
-  it("reports missing Claude Code index files in MCP emit results and audit", async () => {
+  it("preserves a Claude Code index that mentions principal policy in prose", async () => {
     const { tools, auditCalls } = await makeTools();
     const source = await copyFixtureSet("basic", "cc-memory-tool-index-skip");
     await writeFile(
@@ -406,29 +513,64 @@ describe("SDW memory file tools", () => {
     const ingested = parse(
       await tools.get("memory_ingest")!.handler({ harness: "claude-code", dir: source }),
     );
-    expect(ingested.complete).toBe(false);
-    expect(ingested.skipped).toEqual([
-      expect.objectContaining({ source_path: "MEMORY.md", reason: "classifier_reject" }),
-    ]);
+    expect(ingested.complete).toBe(true);
+    expect(ingested.skipped).toEqual([]);
 
     const emitted = parse(
       await tools.get("memory_emit")!.handler({ harness: "claude-code", dir: output }),
     );
     expect(emitted.emitted).toBe(true);
-    expect(emitted.index_present).toBe(false);
+    expect(emitted.index_present).toBe(true);
     const emittedPaths = (emitted.files as Array<{ source_path: string }>).map(
       (file) => file.source_path,
     );
-    expect(emittedPaths).not.toContain("MEMORY.md");
+    expect(emittedPaths).toContain("MEMORY.md");
     expect(auditCalls.find((call) => call.operation === "memory_emit")!.details)
-      .toMatchObject({ index_present: false });
+      .toMatchObject({ index_present: true });
+  });
+
+  it("routes Codex ingest and emit through the exact three-file adapter", async () => {
+    const { tools, auditCalls } = await makeTools();
+    const output = await tempDir("codex-memory-tool-output");
+
+    const ingested = parse(
+      await tools.get("memory_ingest")!.handler({
+        harness: "codex",
+        dir: join(CODEX_FIXTURE_ROOT, "unicode"),
+      }),
+    );
+    expect(ingested).toMatchObject({
+      ingested: true,
+      harness: "codex",
+      complete: true,
+      source_file_count: 3,
+      file_count: 3,
+      skipped_file_count: 0,
+    });
+
+    const emitted = parse(
+      await tools.get("memory_emit")!.handler({ harness: "codex", dir: output }),
+    );
+    expect(emitted).toMatchObject({
+      emitted: true,
+      harness: "codex",
+      file_count: 3,
+      index_present: true,
+    });
+    expect((await (await import("node:fs/promises")).readdir(output)).sort()).toEqual([
+      "MEMORY.md",
+      "memory_summary.md",
+      "raw_memories.md",
+    ]);
+    expect(auditCalls.find((call) => call.operation === "memory_ingest")!.details)
+      .toMatchObject({ harness: "codex", committed_file_count: 3, complete: true });
   });
 
   it("denies unsupported harness values without touching the adapter", async () => {
     const { tools, auditCalls } = await makeTools();
     const denied = parse(
       await tools.get("memory_ingest")!.handler({
-        harness: "codex",
+        harness: "hermes",
         dir: join(FIXTURE_ROOT, "basic"),
       }),
     );
@@ -443,7 +585,7 @@ describe("SDW memory file tools", () => {
     ]);
   });
 
-  it("refuses a second distinct wrapped-agent identity on both transcode handlers", async () => {
+  it("refuses a second distinct wrapped-agent identity on every memory-file handler", async () => {
     let current: string | undefined = "agent-alpha";
     const { tools, auditCalls } = await makeTools({ ownerIdentity: () => current });
     const output = await tempDir("cc-memory-isolation-output");
@@ -468,9 +610,21 @@ describe("SDW memory file tools", () => {
       }),
     );
     expect(refusedIngest.denied).toBe(true);
+    const refusedTranscode = parse(await tools.get("memory_transcode")!.handler({
+      from_harness: "claude-code",
+      to_harness: "codex",
+      mode: "reversible",
+      dir: output,
+    }));
+    expect(refusedTranscode.denied).toBe(true);
+    const refusedRestore = parse(await tools.get("memory_transcode_restore")!.handler({
+      archive_id: "a".repeat(32),
+      dir: output,
+    }));
+    expect(refusedRestore.denied).toBe(true);
     expect(
       auditCalls.filter((call) => call.details.denial_class === "owner_scope_conflict"),
-    ).toHaveLength(2);
+    ).toHaveLength(4);
 
     // Fail closed means nothing was materialized for the second agent.
     const { readdir } = await import("node:fs/promises");

@@ -39,7 +39,8 @@ import {
 } from "../core/encoding.js";
 import type { EncryptedPayload as EncPayload } from "../core/encryption.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
-import type { RotationEvent, StoredIdentity } from "../core/identity.js";
+import type { StoredIdentity } from "../core/identity.js";
+import { verifyRotationChain } from "../core/rotation-chain.js";
 import {
   mintProvenanceStamp,
   serializeStamp,
@@ -334,54 +335,6 @@ export interface ResolvedWriterPublicKey {
     | "plaintext-registry";
 }
 
-// 64 bounds identity-chain verification work while still allowing decades of
-// realistic key rotations for one local identity.
-const MAX_IDENTITY_ROTATION_CHAIN_LENGTH = 64;
-
-function rotationEventSigningBytes(event: RotationEvent): Uint8Array {
-  // Must match rotateKeys() in core/identity.ts: the old key signs exactly
-  // these fields in this order before the signature field is attached.
-  return stringToBytes(
-    JSON.stringify({
-      old_public_key: event.old_public_key,
-      new_public_key: event.new_public_key,
-      identity_id: event.identity_id,
-      reason: event.reason,
-      rotated_at: event.rotated_at,
-    })
-  );
-}
-
-function parseStoredRotationEvent(encoded: string): RotationEvent | null {
-  try {
-    const parsed = JSON.parse(bytesToString(fromBase64url(encoded))) as unknown;
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-      return null;
-    }
-    const record = parsed as Record<string, unknown>;
-    if (
-      typeof record.old_public_key !== "string" ||
-      typeof record.new_public_key !== "string" ||
-      typeof record.identity_id !== "string" ||
-      typeof record.reason !== "string" ||
-      typeof record.rotated_at !== "string" ||
-      typeof record.signature !== "string"
-    ) {
-      return null;
-    }
-    return {
-      old_public_key: record.old_public_key,
-      new_public_key: record.new_public_key,
-      identity_id: record.identity_id,
-      reason: record.reason,
-      rotated_at: record.rotated_at,
-      signature: record.signature,
-    };
-  } catch {
-    return null;
-  }
-}
-
 function appendResolvedWriterKey(
   keys: ResolvedWriterPublicKey[],
   seen: Set<string>,
@@ -405,80 +358,26 @@ export function resolveAuthenticatedIdentityWriterPublicKeys(
 ): ResolvedWriterPublicKey[] {
   const keys: ResolvedWriterPublicKey[] = [];
   const seen = new Set<string>();
-  const history = Array.isArray(identity.rotation_history)
-    ? identity.rotation_history
-    : [];
+  const result = verifyRotationChain({
+    identityId: identity.identity_id,
+    currentPublicKey: identity.public_key,
+    rotationHistory: identity.rotation_history,
+  });
+  if (result.status !== "verified") return [];
 
-  if (history.length > MAX_IDENTITY_ROTATION_CHAIN_LENGTH) {
-    return [];
-  }
-
-  if (history.length === 0) {
-    return appendResolvedWriterKey(
-      keys,
-      seen,
-      identity.public_key,
-      "identity-current",
-      "authenticated"
-    )
-      ? keys
-      : [];
-  }
-
-  let expectedOldPublicKey: string | null = null;
-  for (const item of history) {
-    if (
-      !item ||
-      typeof item.old_public_key !== "string" ||
-      typeof item.new_public_key !== "string" ||
-      typeof item.rotation_event !== "string" ||
-      typeof item.rotated_at !== "string"
-    ) {
-      return [];
-    }
-
-    const event = parseStoredRotationEvent(item.rotation_event);
-    if (
-      !event ||
-      event.identity_id !== identity.identity_id ||
-      event.old_public_key !== item.old_public_key ||
-      event.new_public_key !== item.new_public_key ||
-      event.rotated_at !== item.rotated_at ||
-      (expectedOldPublicKey !== null && event.old_public_key !== expectedOldPublicKey)
-    ) {
-      return [];
-    }
-
-    let oldPublicKey: Uint8Array;
-    let signature: Uint8Array;
-    try {
-      oldPublicKey = fromBase64url(event.old_public_key);
-      fromBase64url(event.new_public_key);
-      signature = fromBase64url(event.signature);
-    } catch {
-      return [];
-    }
-    if (!verify(rotationEventSigningBytes(event), signature, oldPublicKey)) {
-      return [];
-    }
+  for (const retired of [...result.chain.retired].reverse()) {
     if (
       !appendResolvedWriterKey(
         keys,
         seen,
-        event.old_public_key,
+        retired.public_key_base64url,
         "identity-rotation-chain",
         "authenticated"
       )
     ) {
       return [];
     }
-    expectedOldPublicKey = event.new_public_key;
   }
-
-  if (expectedOldPublicKey !== identity.public_key) {
-    return [];
-  }
-
   return appendResolvedWriterKey(
     keys,
     seen,

@@ -1099,6 +1099,28 @@ describe("buildRecognitionPanel — local-evidence-only", () => {
     expect(panel.composition_enabled).toBe(true);
   });
 
+  it("skips reconcile-tagged re-emissions in the receipt tally (LD6 fix-round-2 F4 / R2-3): retried commits/attests stay per-record", async () => {
+    const { log } = newAuditLog();
+    // One real commit, retried twice: the in-lock guard-hit re-audits are
+    // TAGGED `reconcile: true` (see the `reconcile` field docs in
+    // bridge/tools.ts / reputation-store.ts). This drives the REAL
+    // buildRecognitionPanel over tagged fixtures -- the failing check for
+    // posture.ts's `details.reconcile !== true` guards, which the ld6
+    // durable oracle (its own local filter) cannot provide.
+    await appendBridge(log, "bridge_commit", { bridge_commitment_id: "bc-1" });
+    await appendBridge(log, "bridge_commit", { bridge_commitment_id: "bc-1", reconcile: true });
+    await appendBridge(log, "bridge_commit", { bridge_commitment_id: "bc-1", reconcile: true });
+    // One real attest, retried once.
+    await appendBridge(log, "bridge_attest", { bridge_commitment_id: "bc-1", attestation_id: "att-1" });
+    await appendBridge(log, "bridge_attest", { bridge_commitment_id: "bc-1", attestation_id: "att-1", reconcile: true });
+
+    // No injected committedReceiptCount: `committed` falls back to the
+    // audit-event tally, which is exactly the filter under test.
+    const panel = await buildRecognitionPanel({ auditLog: log, originMachine: FORTRESS });
+    expect(panel.receipts.committed).toBe(1);
+    expect(panel.receipts.attested).toBe(1);
+  });
+
   it("prefers the injected storage-list committed count over the audit-event lower bound", async () => {
     const { log } = newAuditLog();
     await appendBridge(log, "bridge_commit", { bridge_commitment_id: "bc-1" });

@@ -99,6 +99,12 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (args[0] === "install") {
+    const { runInstallCommand } = await import("./cli/install.js");
+    const code = await runInstallCommand({ argv: args.slice(1) });
+    return drainAndExit(code);
+  }
+
   if (args[0] === "protect" || args[0] === "wrap") {
     // Phase S1 supervisor handoff (codex R3-H1): when launched BY the
     // split-process supervisor, the transient master key arrives on an
@@ -166,6 +172,12 @@ async function main(): Promise<void> {
       },
     });
     return;
+  }
+
+  if (args[0] === "uninstall") {
+    const { runUninstallCommand } = await import("./cli/uninstall.js");
+    const code = await runUninstallCommand({ argv: args.slice(1) });
+    process.exit(code);
   }
 
   if (args[0] === "init") {
@@ -322,6 +334,30 @@ async function main(): Promise<void> {
   if (args[0] === "memory_emit") {
     const { runMemoryEmitCommand } = await import("./cli/memory-file.js");
     const code = await runMemoryEmitCommand({ argv: args.slice(1) });
+    return drainAndExit(code);
+  }
+
+  if (args[0] === "memory_transcode") {
+    const { runMemoryTranscodeCommand } = await import("./cli/memory-file.js");
+    const code = await runMemoryTranscodeCommand({ argv: args.slice(1) });
+    return drainAndExit(code);
+  }
+
+  if (args[0] === "memory_transcode_restore") {
+    const { runMemoryTranscodeRestoreCommand } = await import("./cli/memory-file.js");
+    const code = await runMemoryTranscodeRestoreCommand({ argv: args.slice(1) });
+    return drainAndExit(code);
+  }
+
+  if (args[0] === "memory_archive_export") {
+    const { runMemoryArchiveExportCommand } = await import("./cli/memory-archive.js");
+    const code = await runMemoryArchiveExportCommand({ argv: args.slice(1) });
+    return drainAndExit(code);
+  }
+
+  if (args[0] === "memory_archive_import") {
+    const { runMemoryArchiveImportCommand } = await import("./cli/memory-archive.js");
+    const code = await runMemoryArchiveImportCommand({ argv: args.slice(1) });
     return drainAndExit(code);
   }
 
@@ -890,14 +926,20 @@ Usage:
   sanctuary completion <bash|zsh|fish>    # Emit shell completion
   sanctuary audit search [opts]           # Search local audit log
   sanctuary checkpoint <cmd> [opts]       # Local encrypted memory checkpoints
-  sanctuary memory_ingest [opts]          # Mirror Claude Code memory into SDW
-  sanctuary memory_emit [opts]            # Emit Claude Code memory from SDW
+  sanctuary memory_ingest [opts]          # Mirror harness memory into SDW
+  sanctuary memory_emit [opts]            # Emit harness memory from SDW
+  sanctuary memory_archive_export [opts]  # Export one SDW archive through Exit V2
+  sanctuary memory_archive_import [opts]  # Import one SDW archive through Exit V2
+  sanctuary memory_transcode [opts]       # Project memory into another harness format
+  sanctuary memory_transcode_restore [opts] # Restore an exact transcode source archive
   sanctuary transparency <cmd> [opts]     # Signed enforcement checkpoints
   sanctuary verify-transparency [opts]    # Verify a checkpoint chain offline
   sanctuary generate systemd [opts]       # Emit systemd service unit
   sanctuary deploy operator-cloud plan    # Emit operator-cloud deploy skeleton
+  sanctuary install [opts]                # Resumable agent-guided install plan
   sanctuary protect [opts]                 # Protect an agent in one command
   sanctuary wrap [opts]                   # (alias for protect)
+  sanctuary uninstall [opts]              # Remove installed enforcement footprint; preserve operator data
   sanctuary export-passphrase             # Print stored passphrase
 
 Options:
@@ -915,11 +957,21 @@ Subcommands:
                        isolated on one host.
                        Use "sanctuary init --help" for options.
 
+  install              Emit one observed-state next action for a shell-capable
+                       installing agent. Supports memory and full profiles;
+                       never emits recovery secrets.
+                       Use "sanctuary install --help" for options.
+
   protect              Protect an agent and start the dashboard in one command.
                        Auto-generates a passphrase, auto-opens the browser.
                        Use "sanctuary protect --help" for options.
 
   wrap                 (alias for protect)
+
+  uninstall            Remove Sanctuary's installed enforcement footprint
+                       while preserving fortress state and keys. Reports
+                       residue that needs sudo, host app action, or reboot.
+                       Use "sanctuary uninstall --help" for options.
 
   dashboard            Start the dashboard as a standalone HTTP server.
                        Reads from the same storage as the MCP server.
@@ -948,13 +1000,32 @@ Subcommands:
                        memory checkpoints. Use "sanctuary checkpoint --help"
                        for options.
 
-  memory_ingest        Manually mirror Claude Code memory files into the
+  memory_ingest        Manually mirror Claude Code or Codex memory files into the
                        encrypted SDW vault without touching the source dir.
                        Use "sanctuary memory_ingest --help" for options.
 
-  memory_emit          Manually emit Claude Code memory files from the SDW
+  memory_archive_export
+                       Export one completed SDW archive through Exit V2 after
+                       Tier-1 approval; a local OS dialog confirms key custody.
+                       Use "sanctuary memory_archive_export --help" for options.
+
+  memory_archive_import
+                       Import one Exit V2 SDW archive after Tier-1 approval;
+                       a local OS dialog reads hidden recovery material.
+                       Use "sanctuary memory_archive_import --help" for options.
+
+  memory_emit          Manually emit Claude Code or Codex memory files from the SDW
                        vault into an output dir. Existing files are refused.
                        Use "sanctuary memory_emit --help" for options.
+
+  memory_transcode     Manually create a plaintext cross-harness projection plus
+                       an encrypted exact-source recovery archive. This is not sync.
+                       Use "sanctuary memory_transcode --help" for options.
+
+  memory_transcode_restore
+                       Restore exact source files from a completed encrypted
+                       transcode archive. This is not sync.
+                       Use "sanctuary memory_transcode_restore --help" for options.
 
   distress             Emit a distress signal through the reserved habeas
                        lane (operator test verb; same path the agent uses).
@@ -1120,6 +1191,11 @@ async function handleHelpEarly(args: string[]): Promise<boolean> {
     case "dashboard":
       printDashboardHelp();
       return true;
+    case "install": {
+      const { runInstallCommand } = await import("./cli/install.js");
+      await runInstallCommand({ argv: ["--help"] });
+      return true;
+    }
     case "protect":
     case "wrap":
       printWrapHelpEarly();
@@ -1175,6 +1251,11 @@ async function handleHelpEarly(args: string[]): Promise<boolean> {
     case "castle-wall":
       printCastleWallHelp();
       return true;
+    case "uninstall": {
+      const { runUninstallCommand } = await import("./cli/uninstall.js");
+      await runUninstallCommand({ argv: args.slice(1).concat("--help") });
+      return true;
+    }
     default:
       return false;
   }
@@ -1194,7 +1275,12 @@ async function runCastleWallCommand(args: string[]): Promise<number> {
 
   if (command === "status") {
     const { runStatus } = await import("./cli/castle-wall.js");
-    return runStatus();
+    // O-07 (register): the trailing args (e.g. `--fortress <path>`) were
+    // dropped here entirely -- unlike every other castle-wall verb below,
+    // which forwards `args.slice(1)` -- so `castle-wall status --fortress
+    // <path>` silently reported the DEFAULT fortress instead of the one
+    // named. See runStatus's own doc for the fix.
+    return runStatus(args.slice(1));
   }
 
   if (command === "enable") {
@@ -1435,6 +1521,11 @@ function printCastleWallHelp(): void {
     disable          Disarm the content filter headlessly (macOS; unconditional dead-man lever).
     setup-shared-dir Create the privileged shared dir for the pinned key (run with sudo, macOS).
     reload           Reload policy in the running fortress daemon.
+                     Exits 0 even when no daemon was reachable to reload (a
+                     fresh fortress has nothing to reload; this is intentional).
+                     --require-daemon  Exit non-zero instead when no daemon
+                                       was reachable, so a script can tell
+                                       "reloaded" apart from "nothing there".
     audit-dump       Emit Castle Wall audit events as JSONL. Read-only.
                      --by-rule        Roll recorded flows up per deciding rule:
                                       per-rule total + allow/deny/prompt split + sample flows.
@@ -1464,7 +1555,7 @@ function printCastleWallHelp(): void {
                      Mint the software-protected boot token (root-owned 0600; run with sudo). Anti-brick
                      credential only, NOT the fortress passphrase. install-boot auto-provisions it; --rotate replaces.
     install-boot     Install the daemon as a launchd safe-mode boot service (run with sudo, macOS).
-                     Options: --user <name> --fortress <path> --binary <path> --signer-client <path>
+                     Options: --user <name> --fortress <path> --signer-client <path>
     uninstall-boot   Remove the launchd boot service (run with sudo, macOS; requires --yes). Does NOT disarm the filter.
     repair-custody   Hand a root-owned fortress back to the operator (run with sudo, macOS).
                      Observe-first: writes a timestamped manifest of every entry's uid/gid/mode

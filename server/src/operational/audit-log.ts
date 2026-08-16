@@ -31,6 +31,8 @@ import {
   AUDIT_CHECKPOINT_SCHEMA_VERSION,
   AUDIT_EPOCH_KEYS_KEY,
   AUDIT_HEAD_ANCHOR_KEY,
+  AUDIT_SIGNING_LATCH_V2_KEY,
+  AUDIT_SIGNING_HEAD_KEY,
   AUDIT_ROTATION_ANCHOR_MARKER,
   isAuditRotationAnchorEnvelope,
   type AuditCheckpointRecord,
@@ -43,6 +45,12 @@ import {
   sha256Hex,
   verifyCheckpointSignature,
 } from "../audit/chain.js";
+import {
+  createFortressCheckpointIdentityBinding,
+  CheckpointSignerUnavailableError,
+  isStructuralNamespaceRefusal,
+  type CheckpointSignerFailureReasonClass,
+} from "../audit/checkpoint-identity.js";
 import type { PluginContribution } from "../substrate/attribution.js";
 
 export interface AuditEntry {
@@ -137,7 +145,40 @@ export type AuditIntegrityFindingKind =
   //    contents are unreadable at operator privilege (the F2 cross-uid case).
   | "split_boundary_invalid"
   | "split_boundary_missing"
-  | "sealed_prefix_incomplete";
+  | "sealed_prefix_incomplete"
+  // ── IC-05-DG: silent-downgrade detection for checkpoint signing ──
+  // checkpoint_signing_downgrade: this fortress provably committed to signing
+  // its audit checkpoints (the MAC'd v2 latch's forward commitment, the
+  // signing head's committed tip/floor witnesses, or a verified signed
+  // checkpoint still in the store), yet the store contradicts that
+  // commitment. `unsigned`/`unsigned_reason` are attacker-writable plaintext,
+  // so without these master-key-authenticated memories a stripped signature
+  // or a deleted signed checkpoint is indistinguishable from an honest
+  // pre-bootstrap store (MUST-NEVER #5, silent degrade). `variant` carries
+  // the concrete shape: latch-tamper / head-tamper / strip /
+  // deleted-predecessor / deleted-tail / rolled-floor / latched.
+  | "checkpoint_signing_downgrade"
+  // checkpoint_signing_error: a checkpoint was written unsigned because the
+  // SIGNER FAILED (identity material exists but is unreadable or corrupt, or
+  // the signing operation itself failed), which is a different state from
+  // the honest "this fortress holds no identity yet". The finding fires from
+  // the signing head's MAC'd incident ring (ring MEMBERSHIP, never the
+  // plaintext reason string, which carries zero trust weight).
+  | "checkpoint_signing_error"
+  // checkpoint_signing_state_indeterminate: downgrade detection could not
+  // run this pass (unreadable control record, or a partial checkpoint
+  // enumeration). "Read nothing" and "nothing exists" are different verdicts
+  // and only the second is evidence, so this surfaces loudly and strict mode
+  // fails closed on it rather than passing on the visible subset.
+  | "checkpoint_signing_state_indeterminate"
+  // checkpoint_signing_head_recovered / checkpoint_signing_floor_recovered:
+  // a control record was absent over surviving signing evidence and was
+  // re-established. Recovery-class findings: hard (fail strict-closed) on
+  // the pass where the recovery occurs, re-emitted at warn grade (strict-
+  // visible, non-fatal) on every later load from the latched marker — the
+  // functional state may heal; the record of recovery never heals to silence.
+  | "checkpoint_signing_head_recovered"
+  | "checkpoint_signing_floor_recovered";
 
 export interface AuditIntegrityFinding {
   kind: AuditIntegrityFindingKind;
@@ -146,6 +187,31 @@ export interface AuditIntegrityFinding {
   sequence?: number;
   expected?: string | number;
   actual?: string | number;
+  /**
+   * IC-05-DG severity grade. Absent means "hard": strict-mode loads fail
+   * closed on the finding, exactly as every pre-existing finding kind always
+   * has. "warn" exists for exactly one class — the re-emission of a LATCHED
+   * recovery-only marker on loads AFTER the pass where the recovery occurred
+   * — and means strict-VISIBLE but non-fatal: an honest fortress that lost a
+   * control record to a disk fault carries a permanent warn and an
+   * investigation, never a permanent brick. No mode drops, demotes, or ages
+   * out a finding (the §h Q6 pinned semantics); latched DOWNGRADE evidence
+   * re-emits hard forever.
+   */
+  severity?: "warn";
+  /** IC-05-DG downgrade/malformed variant detail (e.g. "rolled-floor",
+   * "deleted-tail", "bound-identity"). Diagnostic; never consumed by any
+   * detection decision. */
+  variant?: string;
+}
+
+/** True iff strict mode must fail closed on this finding: everything except
+ * the IC-05-DG warn-grade latched-recovery re-emission. The filter exists at
+ * the strict gates (not at finding creation) so a warn finding stays VISIBLE
+ * in every surface — query results, doctor, subscribers — and only the
+ * throw-vs-surface decision changes. */
+export function isHardIntegrityFinding(finding: AuditIntegrityFinding): boolean {
+  return finding.severity !== "warn";
 }
 
 export interface AuditCreateOwner {
@@ -154,6 +220,19 @@ export interface AuditCreateOwner {
 }
 
 type AuditLockFileHandle = Awaited<ReturnType<typeof open>>;
+
+/**
+ * What a checkpoint public-key resolver may hand back for one `signer_kid`:
+ * a single key, the signer's full authenticated key set (current key plus
+ * verified rotation-chain predecessors, so pre-rotation checkpoints keep
+ * verifying after a rotation), or `undefined`/an empty set for "this signer
+ * is unknown", which the verify path reports as an integrity finding.
+ */
+export type AuditCheckpointKeyResolution =
+  | string
+  | Uint8Array
+  | ReadonlyArray<string | Uint8Array>
+  | undefined;
 
 export interface AuditLogConfig {
   /** Maximum total size of stored audit entries in bytes. Default: 100 MB. */
@@ -195,17 +274,54 @@ export interface AuditLogConfig {
   consultSplitBoundary?: boolean;
   /** Write a checkpoint after this many critical appends. Default: 100. */
   checkpointInterval?: number;
-  /** Optional typed identity signing bridge for checkpoint records. */
+  /**
+   * Typed identity signing bridge for checkpoint records. Optional in the
+   * CONFIG only as an injection seam (tests, embedders with their own key
+   * custody): when omitted, the constructor derives the production fortress
+   * signer from its own required arguments (IC-05), so no call site can
+   * silently opt out of checkpoint signing by forgetting a config field.
+   */
   checkpointSigner?: (
     payload: AuditCheckpointSigningPayload
   ) => Promise<AuditCheckpointSignature | null>;
-  /** Resolve a known checkpoint signing key by signer_kid. */
-  checkpointPublicKeyResolver?: (signerKid: string) => string | Uint8Array | undefined;
+  /**
+   * Resolve known checkpoint signing keys by signer_kid. May return a single
+   * key or the signer's full authenticated key set (current key plus
+   * rotation-chain predecessors), synchronously or as a promise. Same
+   * injection-seam contract as `checkpointSigner`: omitted means the
+   * constructor-derived fortress resolver, not "no resolution".
+   */
+  checkpointPublicKeyResolver?: (
+    signerKid: string
+  ) =>
+    | AuditCheckpointKeyResolution
+    | Promise<AuditCheckpointKeyResolution>;
   /**
    * Explicit self-check opt-in for checkpoint-embedded public keys.
    * Embedded keys prove record self-consistency only, not signer identity.
    */
   trustEmbeddedCheckpointPublicKeys?: boolean;
+  /**
+   * IC-05-DG construction-mode discriminant for the silent-downgrade
+   * detector. OMITTED means "fortress" — the LOUD mode — so no call site can
+   * silently opt out by forgetting a field (rule 3: absence yields the
+   * secure behavior). "non-fortress" is declared ONLY by composition roots
+   * whose instance is structurally not a fortress load (the Castle Wall
+   * safe-mode boot store and the transitional master-rotation readers — the
+   * #1249 fail-soft roster): on those, latch/head records legitimately fail
+   * or mismatch this instance's keys mid-operation, so downgrade detection
+   * is skipped rather than minting false TAMPERED verdicts.
+   *
+   * PROVENANCE INVARIANT (DELTA-4): this value is a construction-time fact
+   * fixed by the composition root's static wiring. It must NEVER be derived
+   * from any `storage.read`/`storage.list` result — an attacker with storage
+   * write access could otherwise push a real fortress into the soft mode.
+   * Enforced by `test/structure/signing-detection-mode-provenance.test.ts`
+   * (every occurrence is a literal at a construction site) and by the §f-8
+   * counter-probe (a real fortress with corrupted storage still raises the
+   * full loud set).
+   */
+  signingDetectionMode?: "fortress" | "non-fortress";
   /** Optional in-process subscribers notified when audit-chain integrity fails. */
   integrityAnomalySubscribers?: AuditIntegrityAnomalySubscriber[];
   /**
@@ -330,6 +446,7 @@ const DEFAULT_CHECKPOINT_INTERVAL = 100;
 const MIN_IN_MEMORY_ENTRY_FLOOR = 256;
 const AUDIT_NAMESPACE = "_audit";
 const AUDIT_CHECKPOINT_NAMESPACE = "_audit_checkpoints";
+const AUDIT_META_NAMESPACE = "_meta";
 // F3: reserved storage key for the single MAC-authenticated rotation checkpoint.
 // Stored alongside the (optionally-signed) checkpoint records but addressed by a
 // fixed key that does NOT match the `audit-checkpoint-`/`legacy-anchor-` prefixes
@@ -378,6 +495,155 @@ const AUDIT_HEAD_ANCHOR_MARKER = "__sanctuary_audit_head_anchor_v1";
 // optional Ed25519 checkpoint signer, which may be null.
 const AUDIT_ROTATION_ANCHOR_MAC_DOMAIN = "sanctuary.audit-rotation-anchor.v1\n";
 const AUDIT_HEAD_ANCHOR_MAC_DOMAIN = "sanctuary.audit-head-anchor.v1\n";
+
+// ── IC-05-DG: silent-downgrade detection control records ───────────────────
+//
+// Two master-key-MAC'd control records — exactly two, so master-rotation
+// restamp work stays O(1) over a fixed count and the deletion surface does
+// not grow:
+//  - the SIGNING LATCH (v2): write-once forward commitment "every
+//    audit-checkpoint at or above `armed_at_sequence` is signed";
+//  - the SIGNING HEAD: mutable-monotone envelope carrying the signer-failure
+//    incident ring, the monotone-MAX committed tip, the monotone-MIN floor
+//    witness, and the append-only latched recovery/downgrade markers.
+//
+// The v2 strings are FRESH on purpose: the unmerged #1243 branch stamped
+// `__signing_latch` records (purpose "audit-signing-latch", domain
+// "sanctuary.audit-signing-latch.v1\n") with HISTORICAL semantics on drill
+// fortresses, and no artifact written under those semantics may satisfy or
+// confuse this reader, so the key, marker, purpose, and domain all differ.
+//
+// Marker, MAC purpose, and domain must match the `__signing_latch_v2` /
+// `__signing_head` entries in `MAC_ANCHORS` in `core/master-rotation.ts`
+// (`convertAuditAnchors`), which restamp these records across a master
+// rotation; the storage keys are `AUDIT_SIGNING_LATCH_V2_KEY` /
+// `AUDIT_SIGNING_HEAD_KEY` from `audit/checkpoint-shape.ts` (also mirrored
+// into `AUDIT_CHECKPOINT_NAMESPACE_CONTROL_KEYS`, the exporter skip list);
+// both purpose labels are registered in
+// `server/docs/hkdf-info-string-registry.md` and the at-rest classification
+// fixture. Full-set parity across all six sites is asserted by
+// `test/structure/signing-control-record-parity.test.ts`.
+const AUDIT_SIGNING_LATCH_V2_MARKER = "__sanctuary_audit_signing_latch_v2";
+const AUDIT_SIGNING_LATCH_V2_MAC_DOMAIN = "sanctuary.audit-signing-latch.v2\n";
+const AUDIT_SIGNING_LATCH_V2_MAC_PURPOSE = "audit-signing-latch-v2";
+const AUDIT_SIGNING_HEAD_MARKER = "__sanctuary_audit_signing_head_v1";
+const AUDIT_SIGNING_HEAD_MAC_DOMAIN = "sanctuary.audit-signing-head.v1\n";
+const AUDIT_SIGNING_HEAD_MAC_PURPOSE = "audit-signing-head";
+
+// The two honest reasons a persisted checkpoint may carry for being unsigned.
+// COSMETIC ONLY (IC-05-DG binding constraint 1): these strings are
+// operator-facing prose with ZERO trust weight — no load-time decision
+// consumes `unsigned_reason`, because the field is attacker-writable
+// plaintext and the #1243 round-3 gate demonstrated the rewrite (a
+// `checkpoint_signing_error` driven off this field was suppressed by editing
+// it into the honest-absence string). The authenticated failure evidence
+// lives in the signing head's incident ring instead. Both literals are
+// at-rest values on existing records; never edit them.
+const AUDIT_UNSIGNED_REASON_NO_IDENTITY =
+  "no signing identity available at checkpoint time";
+const AUDIT_UNSIGNED_REASON_SIGNER_ERROR =
+  "checkpoint signer failed: identity material unreadable or signing error";
+
+// Closed enum of persisted incident reason classes. Must match
+// `CheckpointSignerFailureReasonClass` in `audit/checkpoint-identity.ts`
+// (contract pin, both sides): the ring persists exactly the discriminants of
+// `CheckpointSignerUnavailableError`.
+const SIGNING_INCIDENT_REASON_CLASSES = [
+  "identity_unreadable",
+  "identity_undecryptable",
+  "signing_failed",
+] as const satisfies readonly CheckpointSignerFailureReasonClass[];
+
+// Ring capacities (rule 8: signer failures and recovery events are
+// attacker-inducible, so per-event records would be unbounded attacker-driven
+// state growth plus O(events) master-rotation restamp work; a fixed-size head
+// caps both). Eviction is loudness-safe in both rings: an unsigned checkpoint
+// at/above the floor whose incident evidence was evicted reads as the MORE
+// severe `checkpoint_signing_downgrade` instead of `checkpoint_signing_error`,
+// and an evicted latched marker collapses into the monotonic
+// `latched_evicted_count` summary (plus the sticky
+// `hard_downgrade_ever_latched` flag, which keeps the hard grade independent
+// of eviction — DELTA-1), so misclassification only ever escalates.
+//
+// 32 = 2^5, chosen so the head's serialized envelope stays under
+// SIGNING_HEAD_MAX_SERIALIZED_BYTES: a `recent` element serializes to at most
+// ~60 bytes ({"sequence":<=16-digit safe integer,"reason_class":<=22 chars}),
+// a `latched` element to at most ~320 bytes (marker_kind <= 18 chars + a
+// detail string clamped to SIGNING_HEAD_MARKER_DETAIL_MAX_CHARS), so
+// 32*60 + 32*320 = 12160 bytes of ring payload plus <=512 bytes of envelope
+// scalars and MAC stays below the 16 KiB ceiling.
+const SIGNING_HEAD_RECENT_RING_MAX = 32;
+const SIGNING_HEAD_LATCHED_RING_MAX = 32;
+// 256 chars: enough for a marker kind, a variant, and a sequence range;
+// clamping is what makes the byte-ceiling derivation above sound against
+// attacker-lengthened inputs (rule 8: nothing untrusted may grow the head).
+const SIGNING_HEAD_MARKER_DETAIL_MAX_CHARS = 256;
+// 16 KiB = 2^14: one filesystem block-write class on every supported backend,
+// and the adversarial-complexity test's asserted ceiling. Derived from the
+// ring bounds above, not tuned independently.
+const SIGNING_HEAD_MAX_SERIALIZED_BYTES = 16384;
+
+/** One persisted signer-failure incident (ring element). */
+interface SigningHeadIncident {
+  sequence: number;
+  reason_class: CheckpointSignerFailureReasonClass;
+}
+
+/** One latched recovery/downgrade marker (ring element). Append-only:
+ * union-merged by the LD6 chokepoint, never removed by any writer; eviction
+ * beyond the K2 cap only collapses detail into the monotonic summary count. */
+interface SigningHeadLatchedMarker {
+  marker_kind: "latch_recovered" | "head_recreated" | "downgrade_latched";
+  detail: string;
+}
+
+/**
+ * The signing head's authenticated payload (the `data` half of the MAC'd
+ * envelope). Monotone by construction: every writer path can only move
+ * `incident_count` and `highest_signed_checkpoint_sequence` UP,
+ * `lowest_signed_checkpoint_sequence` DOWN (null = not-yet-committed
+ * sentinel; never 0, which would poison a MIN), and the `latched` ring can
+ * only gain markers (or collapse them into `latched_evicted_count` +
+ * `hard_downgrade_ever_latched`).
+ */
+interface SigningHeadData {
+  incident_count: number;
+  first_incident_sequence: number | null;
+  last_incident_sequence: number | null;
+  recent: SigningHeadIncident[];
+  highest_signed_checkpoint_sequence: number;
+  lowest_signed_checkpoint_sequence: number | null;
+  latched: SigningHeadLatchedMarker[];
+  latched_evicted_count: number;
+  hard_downgrade_ever_latched: boolean;
+}
+
+/** Read result of one MAC'd signing control record. The four states are
+ * deliberately distinct end to end (IC-05-DG absence rule, review finding 3):
+ *  - "absent": a SUCCESSFUL read returned no record. The only state that may
+ *    ever feed an "unarmed"/recovery decision.
+ *  - "valid": authenticates under this master.
+ *  - "invalid": bytes were READ and failed marker/shape/MAC authentication —
+ *    tamper evidence.
+ *  - "unreadable": the read THREW (EACCES, IO). Proves nothing about the
+ *    bytes: never absent, never clean, and never TAMPERED either; the caller
+ *    surfaces `checkpoint_signing_state_indeterminate` and strict fails
+ *    closed. Treat-error-as-absent was the exploitable wrong reading (chmod
+ *    000 on the latch of a stripped store would have driven state_UNARMED).
+ *  - "unsupported": the read threw the STRUCTURAL namespace-refusal code
+ *    (`SANCTUARY_AUDIT_NAMESPACE_UNSUPPORTED`) — this store can never hold
+ *    the record by construction, which no runtime storage state can
+ *    manufacture (only the daemon adapter's closed allowlist throws it; the
+ *    real `FilesystemStorage` cannot). The one softness that is safe,
+ *    because it is constructional, not a reachability symptom (review
+ *    finding 2).
+ */
+type SigningControlRead<T> =
+  | { status: "absent" }
+  | { status: "valid"; data: T }
+  | { status: "invalid" }
+  | { status: "unreadable"; detail: string }
+  | { status: "unsupported" };
 
 // ── F2 Option A: fortress audit store split by writer ──────────────────────
 //
@@ -675,7 +941,7 @@ export async function probeAuditHeadAnchor(
   // glaring, separately-detectable full-wipe residual, not a quiet splice.
   let established = false;
   try {
-    if ((await storage.read("_meta", AUDIT_HEAD_ANCHOR_ESTABLISHED_KEY)) !== null) {
+    if ((await storage.read(AUDIT_META_NAMESPACE, AUDIT_HEAD_ANCHOR_ESTABLISHED_KEY)) !== null) {
       established = true;
     }
   } catch {
@@ -839,9 +1105,18 @@ export function deriveAuditEpochKeys(masterKey: Uint8Array): {
 const AUDIT_INTEGRITY_ALERT_NAMESPACE = "_audit_integrity_alert";
 const AUDIT_INTEGRITY_ALERT_KEY = "audit-integrity-alert.log";
 const AUDIT_WRITE_LOCK_FILE = ".audit-write.lock";
-const AUDIT_WRITE_LOCK_TIMEOUT_MS = 5_000;
+// EXPORTED (fix-round-4, MUST-FIX 1 cross-file pin): core/bounded-map.ts's
+// `ON_EVICT_AUDIT_TIMEOUT_MS` derives from this and
+// `DEFAULT_AUDIT_WRITE_LOCK_HOLD_DEADLINE_MS` below — a caller-supplied
+// `onEvict` critical audit is (almost always, see that constant's own doc)
+// a `this.appendCritical(...)` call, and its worst-case settle time is
+// bounded by these same two numbers (lock ACQUISITION timeout, then the
+// held-write's own deadline). If either of these values changes, that
+// derivation must be re-checked — see bounded-map.ts's
+// `ON_EVICT_AUDIT_TIMEOUT_MS` doc for the full reasoning.
+export const AUDIT_WRITE_LOCK_TIMEOUT_MS = 5_000;
 const AUDIT_WRITE_LOCK_RETRY_MS = 100;
-const DEFAULT_AUDIT_WRITE_LOCK_HOLD_DEADLINE_MS = 30_000;
+export const DEFAULT_AUDIT_WRITE_LOCK_HOLD_DEADLINE_MS = 30_000;
 const DEFAULT_AUDIT_SELF_HELD_STALE_LOCK_MS = 60_000;
 // Drill-found (Leg 5, MBA, 2026-07-15): a 0-byte / unparseable audit lock that
 // carries neither `pid` nor `acquired_at` cannot be proven stale by the two
@@ -1398,7 +1673,7 @@ export async function writeAuditStoreSplitEstablishedMarker(
     mac: toBase64url(auditStoreSplitEstablishedMacBytes(macKey)),
   };
   await storage.write(
-    "_meta",
+    AUDIT_META_NAMESPACE,
     AUDIT_STORE_SPLIT_ESTABLISHED_META_KEY,
     stringToBytes(JSON.stringify(envelope))
   );
@@ -1426,7 +1701,7 @@ export async function readAuditStoreSplitEstablishedMarker(
 ): Promise<"present" | "absent" | "invalid_or_unreadable"> {
   let raw: Uint8Array | null;
   try {
-    raw = await storage.read("_meta", AUDIT_STORE_SPLIT_ESTABLISHED_META_KEY);
+    raw = await storage.read(AUDIT_META_NAMESPACE, AUDIT_STORE_SPLIT_ESTABLISHED_META_KEY);
   } catch {
     // A read error cannot prove absence; a present-but-unreadable marker is
     // exactly the tamper case. Fail closed.
@@ -1752,6 +2027,36 @@ export class AuditLog {
   private encryptionKey: Uint8Array;
   private rotationAnchorMacKey: Uint8Array;
   private headAnchorMacKey: Uint8Array;
+  /** IC-05-DG: MAC keys for the two signing control records; derived up front
+   * so the raw master is never retained (same posture as every other purpose
+   * key here). */
+  private signingLatchMacKey: Uint8Array;
+  private signingHeadMacKey: Uint8Array;
+  /** IC-05-DG construction-mode discriminant; see AuditLogConfig. Fixed at
+   * construction, never derived from storage (DELTA-4). */
+  private readonly signingDetectionMode: "fortress" | "non-fortress";
+  /**
+   * IC-05-DG in-process memory that this instance has OBSERVED signing
+   * evidence (a latch/head record in any non-absent state, or a
+   * resolver-verified signed checkpoint) during a load, an arm, or an
+   * incident write. Closes the TOCTOU between a load and the next signed
+   * write: the write path arms (or creates the signing head) only on a store
+   * with NO observed evidence, so an attacker who erases both control
+   * records after the load cannot get them silently re-minted at a rolled
+   * floor by the very next checkpoint — the erasure instead reaches the next
+   * LOAD's recovery pass, which fails strict-closed and latches markers.
+   */
+  private signingEvidenceSeen = false;
+  /**
+   * IC-05-DG: true while the CURRENT top-level load call has performed a
+   * live recovery over signing evidence. The recovery-class findings are
+   * hard on the pass where the recovery occurs (§h Q6); without this flag
+   * the read-consistency retry loop would re-enumerate the just-recovered
+   * store, see only the warn-grade latched re-emission, and return clean —
+   * absorbing the pinned strict-closure. Reset at the top of each top-level
+   * load, NOT between retry passes.
+   */
+  private signingRecoveryThisLoad = false;
   private epochWrapKey: Uint8Array;
   private epochMacKey: Uint8Array;
   /** Lazily-loaded prior-epoch audit keys (master rotations); null = not yet loaded. */
@@ -1796,12 +2101,14 @@ export class AuditLog {
   private readonly maxInMemoryEntries: number;
   private readonly integrityMode: "strict" | "lenient";
   private readonly checkpointInterval: number;
-  private readonly checkpointSigner?: (
+  private readonly checkpointSigner: (
     payload: AuditCheckpointSigningPayload
   ) => Promise<AuditCheckpointSignature | null>;
-  private readonly checkpointPublicKeyResolver?: (
+  private readonly checkpointPublicKeyResolver: (
     signerKid: string
-  ) => string | Uint8Array | undefined;
+  ) =>
+    | AuditCheckpointKeyResolution
+    | Promise<AuditCheckpointKeyResolution>;
   private readonly trustEmbeddedCheckpointPublicKeys: boolean;
   private readonly integrityAnomalySubscribers: AuditIntegrityAnomalySubscriber[];
   private readonly filesystemCapabilities?: FilesystemStorageCapabilities;
@@ -1912,6 +2219,19 @@ export class AuditLog {
     // master key (mirrors how encryptionKey is derived here, per F1's pattern).
     this.rotationAnchorMacKey = derivePurposeKey(masterKey, "audit-rotation-anchor");
     this.headAnchorMacKey = derivePurposeKey(masterKey, "audit-head-anchor");
+    // IC-05-DG: purpose labels must match the `__signing_latch_v2` /
+    // `__signing_head` restamp entries in core/master-rotation.ts
+    // (convertAuditAnchors) and their rows in the HKDF registry + at-rest
+    // classification fixture.
+    this.signingLatchMacKey = derivePurposeKey(
+      masterKey,
+      AUDIT_SIGNING_LATCH_V2_MAC_PURPOSE
+    );
+    this.signingHeadMacKey = derivePurposeKey(
+      masterKey,
+      AUDIT_SIGNING_HEAD_MAC_PURPOSE
+    );
+    this.signingDetectionMode = config?.signingDetectionMode ?? "fortress";
     // F7: keys for the custody-epoch record (pre-rotation entry decryption).
     // Derived up front so the raw master is never retained on the instance.
     const epochKeys = deriveAuditEpochKeys(masterKey);
@@ -1932,8 +2252,28 @@ export class AuditLog {
     this.integrityMode = config?.integrityMode ?? "strict";
     this.checkpointInterval =
       config?.checkpointInterval ?? DEFAULT_CHECKPOINT_INTERVAL;
-    this.checkpointSigner = config?.checkpointSigner;
-    this.checkpointPublicKeyResolver = config?.checkpointPublicKeyResolver;
+    // IC-05 enforcement site (AGENTS.md assurance rule 3): the checkpoint
+    // signer/resolver pair used to be an optional dependency that every test
+    // supplied and every production call site omitted, so shipped fortresses
+    // wrote unsigned checkpoints and distrusted signed ones. Rule 3 offers
+    // "make it required" or "fail closed on absence"; this site takes the
+    // stronger third form: the production pair is DERIVED from the
+    // constructor's own required arguments (storage + master key), so no call
+    // site can omit it. Explicit config remains the injection seam and wins
+    // per field. Fail-closed-on-absence was rejected one level down instead
+    // of here: a fortress legitimately has zero identities until bootstrap,
+    // and refusing audit appends then would make audit availability depend on
+    // identity existence; that case degrades to the honest `unsigned`
+    // checkpoint record, never to a silently trusted fallback key.
+    const fortressCheckpointIdentity = createFortressCheckpointIdentityBinding(
+      storage,
+      derivePurposeKey(masterKey, "identity-encryption")
+    );
+    this.checkpointSigner =
+      config?.checkpointSigner ?? fortressCheckpointIdentity.checkpointSigner;
+    this.checkpointPublicKeyResolver =
+      config?.checkpointPublicKeyResolver ??
+      fortressCheckpointIdentity.checkpointPublicKeyResolver;
     this.trustEmbeddedCheckpointPublicKeys =
       config?.trustEmbeddedCheckpointPublicKeys ?? false;
     this.integrityAnomalySubscribers = config?.integrityAnomalySubscribers ?? [];
@@ -2255,19 +2595,48 @@ export class AuditLog {
     try {
       const normalized = this.normalizeEntry(entry);
       await this.reverifyCachedIntegrityFindingsBeforeAppend();
+      // C9 (availability, register): resolve the mandatory first-load
+      // read-consistency pass BEFORE requesting the cross-process write lock,
+      // not inside it. `ensureLoaded()` is a no-op once `this.loaded` is true
+      // (every append after this process's first), so this call is where the
+      // multi-pass decrypt+retry cost — up to 2x a full chain verify, see
+      // `loadPersistedEntriesWithReadConsistency` — actually lands: on the
+      // FIRST append only, and now with no write lock held while it runs,
+      // exactly mirroring how `reverifyCachedIntegrityFindingsBeforeAppend`
+      // above already takes its own fresh look lock-free. If it throws
+      // (strict mode, a store that never settled), the append never requests
+      // the lock at all, so a torn read on this process's first load can no
+      // longer hold other appenders in lock-contention for the retry's
+      // duration. The retry loop itself — deadline, store-stability
+      // discrimination — is UNCHANGED; only WHEN it runs relative to lock
+      // acquisition has moved. See the (retired) KNOWN LATENCY EXPOSURE note
+      // in `loadPersistedEntriesWithReadConsistency`. Not re-called inside
+      // the lock below: appends are strictly serialized per-process through
+      // `enqueueAppend`'s `appendQueue` chain (this is the only call site of
+      // `persistChainedEntry`), so by the time the lock callback below runs,
+      // `this.loaded` is already true (this call either set it or threw
+      // before the lock was ever requested) and a repeat call would be a
+      // guaranteed no-op purchased with real microtask-tick cost, not free
+      // defense in depth.
+      await this.ensureLoaded();
       const serialized = stringToBytes(JSON.stringify(normalized));
       const encrypted = encrypt(serialized, this.encryptionKey);
       const encryptedBytes = stringToBytes(JSON.stringify(encrypted));
       const encryptedPayloadBytes = toBase64url(encryptedBytes);
       await this.withAuditWriteLock(async (signal) => {
         this.assertAuditWriteLockActive(signal);
-        // LOCK-HOLD COST: on this process's FIRST append this is a full
-        // load-and-verify pass held inside the cross-process write lock, and the
-        // read-consistency retry can make it two. See the KNOWN LATENCY EXPOSURE
-        // note in `loadPersistedEntriesWithReadConsistency` for the measured
-        // bound and why it is accepted rather than mitigated here.
-        await this.ensureLoaded();
-        this.assertAuditWriteLockActive(signal);
+        // Incremental re-check of only the unstable tail (O(1) backward walk;
+        // see the Mini1-drill note on `readLatestPersistedChainState`), not a
+        // full re-verify. This is what protects correctness against a write
+        // that lands in the gap between the outside-lock `ensureLoaded()`
+        // above and this process actually acquiring the lock: it refreshes
+        // `nextSequence` / `lastEntryHash` to the true on-disk tip before they
+        // are used below, so a concurrent legitimate append is never lost or
+        // double-chained. It does not re-run the full decrypt+hash-chain
+        // verify, and does not need to: every append after the first already
+        // relies on this same freshen step today, never a per-append full
+        // reload, so this is the existing steady-state guarantee, not a
+        // weaker one.
         await this.freshenChainStateFromDisk();
         this.assertAuditWriteLockActive(signal);
         const sequence = this.nextSequence;
@@ -2332,7 +2701,7 @@ export class AuditLog {
             try {
               this.assertAuditWriteLockActive(signal);
               await this.storage.write(
-                "_meta",
+                AUDIT_META_NAMESPACE,
                 AUDIT_POST_SPLIT_SUFFIX_ESTABLISHED_KEY,
                 stringToBytes("1")
               );
@@ -2952,7 +3321,7 @@ export class AuditLog {
       );
     }
     await this.storage.write(
-      "_meta",
+      AUDIT_META_NAMESPACE,
       AUDIT_HEAD_ANCHOR_ESTABLISHED_KEY,
       stringToBytes("1")
     );
@@ -3200,7 +3569,7 @@ export class AuditLog {
   private async postSplitSuffixWasEstablished(): Promise<boolean> {
     try {
       const raw = await this.storage.read(
-        "_meta",
+        AUDIT_META_NAMESPACE,
         AUDIT_POST_SPLIT_SUFFIX_ESTABLISHED_KEY
       );
       return raw !== null;
@@ -3215,7 +3584,7 @@ export class AuditLog {
     if (hasAuditEntries) return true;
     if (
       await this.storage
-        .exists("_meta", AUDIT_HEAD_ANCHOR_ESTABLISHED_KEY)
+        .exists(AUDIT_META_NAMESPACE, AUDIT_HEAD_ANCHOR_ESTABLISHED_KEY)
         .catch(() => false)
     ) {
       return true;
@@ -3760,7 +4129,9 @@ export class AuditLog {
       auditIntegrityContext.getStore()?.allowIntegrityFindings === true;
     if (
       this.integrityMode === "strict" &&
-      this.integrityFindings.length > 0 &&
+      // IC-05-DG: warn-grade latched-recovery re-emissions are strict-visible
+      // but non-fatal; every other finding fails closed exactly as before.
+      this.integrityFindings.some(isHardIntegrityFinding) &&
       !contextAllowsIntegrityFindings
     ) {
       throw new AuditIntegrityError(this.integrityFindings);
@@ -3846,7 +4217,10 @@ export class AuditLog {
     if (
       this.integrityMode !== "strict" ||
       !this.loaded ||
-      this.integrityFindings.length === 0
+      // IC-05-DG: warn-grade findings never block appends, so a store whose
+      // only cached findings are warn-grade needs no fresh look; forcing one
+      // would turn a permanent latched warn into a full reload per append.
+      !this.integrityFindings.some(isHardIntegrityFinding)
     ) {
       return;
     }
@@ -3867,7 +4241,8 @@ export class AuditLog {
       auditIntegrityContext.getStore()?.allowIntegrityFindings === true;
     if (
       this.integrityMode === "strict" &&
-      this.integrityFindings.length > 0 &&
+      // IC-05-DG: hard findings only; see isHardIntegrityFinding.
+      this.integrityFindings.some(isHardIntegrityFinding) &&
       options?.allowIntegrityFindings !== true &&
       !contextAllowsIntegrityFindings
     ) {
@@ -3885,7 +4260,8 @@ export class AuditLog {
       auditIntegrityContext.getStore()?.allowIntegrityFindings === true;
     if (
       this.integrityMode === "strict" &&
-      this.integrityFindings.length > 0 &&
+      // IC-05-DG: hard findings only; see isHardIntegrityFinding.
+      this.integrityFindings.some(isHardIntegrityFinding) &&
       !contextAllowsIntegrityFindings
     ) {
       throw new AuditIntegrityError(this.integrityFindings);
@@ -3898,6 +4274,9 @@ export class AuditLog {
     const deadline = Date.now() + AUDIT_READ_CONSISTENCY_MAX_MS;
     let lastSignature: string | null = null;
     let streamedThisLoop = false;
+    // IC-05-DG: a fresh top-level load starts with no live recovery; the flag
+    // survives retry passes within this call (see its field doc).
+    this.signingRecoveryThisLoad = false;
     for (;;) {
       // A retry means the prior pass observed a transient mid-mutation state and
       // is being discarded. Tell the streaming consumer to drop everything it
@@ -3907,8 +4286,12 @@ export class AuditLog {
       if (consumer && streamedThisLoop) consumer.reset?.();
       await this.loadPersistedEntries(consumer);
       streamedThisLoop = consumer !== undefined;
-      if (this.integrityFindings.length === 0) {
-        return; // clean read
+      // IC-05-DG: a warn-grade latched-recovery re-emission is a PERMANENT
+      // property of the store, not a torn-read symptom, so it must not spend
+      // the retry budget (it would cost one extra full pass on every load
+      // forever). Hard findings keep the retry semantics unchanged.
+      if (!this.integrityFindings.some(isHardIntegrityFinding)) {
+        return; // clean read (warn-grade re-emissions are not torn-read signals)
       }
       // Give-up discriminator (attacker safety) is STORE STABILITY, not the
       // finding kind. Retry only while the store is DEMONSTRABLY mid-mutation:
@@ -3943,40 +4326,52 @@ export class AuditLog {
       // the budget is 2s. Every transient tear on a large log therefore became
       // a hard tamper verdict on the first look, with no second look at all.
       //
-      // KNOWN LATENCY EXPOSURE (availability, not tamper weakening; accepted
-      // 2026-08-05, unmitigated on purpose). In the case this change is about —
-      // one pass outliving the 2s budget — making the retry mandatory costs
-      // exactly ONE extra full pass: the second pass establishes the baseline
-      // with the deadline already blown, so this check ends the loop. (Further
-      // passes remain possible in general, but only while the store is
-      // demonstrably mutating AND the whole loop is still inside the budget,
-      // i.e. only when passes are cheap.) But `persistChainedEntry`
-      // calls `ensureLoaded()` INSIDE `withAuditWriteLock`, so on an appending
-      // process's FIRST load that extra pass is paid while the cross-process
-      // write lock is held.
+      // LATENCY NOTE (availability, not tamper weakening). In the case this
+      // change is about — one pass outliving the 2s budget — making the retry
+      // mandatory costs exactly ONE extra full pass: the second pass
+      // establishes the baseline with the deadline already blown, so this
+      // check ends the loop. (Further passes remain possible in general, but
+      // only while the store is demonstrably mutating AND the whole loop is
+      // still inside the budget, i.e. only when passes are cheap.)
       //
-      // The size of that extra pass, measured rather than assumed. A cold full
-      // pass is LINEAR in entry count, not quadratic: timed on this branch
-      // (macOS, ~250-byte entries) at 250/500/1000/2000 entries the pass took
-      // 28/50/95/193ms, a flat ~0.1ms per entry. The per-entry constant, though,
-      // tracks PAYLOAD size, so it is not one number: the #714 profile (10k
-      // entries at ~40MB, so ~4KB each) measured 11-30s per pass, i.e. ~1.1-3ms
-      // per entry, ~10-30x the small-entry constant above. At the ~166k entries
+      // FORMERLY a KNOWN LATENCY EXPOSURE (accepted 2026-08-05, unmitigated
+      // on purpose): `persistChainedEntry` used to call `ensureLoaded()`
+      // INSIDE `withAuditWriteLock`, so on an appending process's FIRST load
+      // that extra pass was paid while the cross-process write lock was
+      // held. RESOLVED for C9 (register): `persistChainedEntry` now calls
+      // `ensureLoaded()` BEFORE requesting the write lock, so this retry loop
+      // (unchanged below) runs lock-free on the first load; the call inside
+      // the lock is a cheap already-loaded no-op, and the lock instead gets a
+      // narrow incremental re-check of just the tail (`freshenChainStateFromDisk`,
+      // O(1) backward walk) for the write that may have landed in the gap
+      // between the outside-lock load and the actual lock acquisition. This
+      // narrows the LOCK-HOLD window; it does not shrink or skip a single
+      // pass of the retry loop itself, so the read-consistency guarantee
+      // (store-stability discrimination, the same 2s deadline, the same
+      // fail-closed-on-a-static-store-with-findings behavior) is unchanged.
+      //
+      // The size of the extra pass this retry can still cost, measured rather
+      // than assumed. A cold full pass is LINEAR in entry count, not
+      // quadratic: timed on this branch (macOS, ~250-byte entries) at
+      // 250/500/1000/2000 entries the pass took 28/50/95/193ms, a flat
+      // ~0.1ms per entry. The per-entry constant, though, tracks PAYLOAD
+      // size, so it is not one number: the #714 profile (10k entries at
+      // ~40MB, so ~4KB each) measured 11-30s per pass, i.e. ~1.1-3ms per
+      // entry, ~10-30x the small-entry constant above. At the ~166k entries
       // the register-C6 production host carries, the extra pass is therefore
-      // ~16s of decrypt+verify with small entries and ~180-500s with #714-sized
-      // ones. The upper half of that range blows
-      // `DEFAULT_AUDIT_WRITE_LOCK_HOLD_DEADLINE_MS` (30s), which aborts the hold
-      // via the `signal` and runs lock recovery, while concurrent appenders
-      // waiting to acquire give up after `AUDIT_WRITE_LOCK_TIMEOUT_MS` (5s) with
-      // `AuditLockContentionError`. The
-      // trigger is narrow (a first load that both finds a transient tear and
-      // outruns the budget), and every cheap mitigation is worse than the
-      // exposure: skipping the retry when the caller holds the write lock
-      // reinstates exactly the first-look-is-final tamper verdict this change
-      // exists to remove, and scaling the budget by chain size only permits MORE
-      // passes. A real fix is an incremental/cheap re-verify so a second look is
-      // not a second full pass; that is its own design, tracked as follow-up, and
-      // deliberately NOT attempted here.
+      // ~16s of decrypt+verify with small entries and ~180-500s with
+      // #714-sized ones. Before the C9 fix, the upper half of that range blew
+      // `DEFAULT_AUDIT_WRITE_LOCK_HOLD_DEADLINE_MS` (30s) while the lock was
+      // held, aborting the hold via `signal` and running lock recovery, while
+      // concurrent appenders waiting to acquire gave up after
+      // `AUDIT_WRITE_LOCK_TIMEOUT_MS` (5s) with `AuditLockContentionError`.
+      // With the retry now running before lock acquisition, that same pass
+      // still costs the appending process the same wall-clock time, but no
+      // longer holds the lock (or blocks other appenders behind it) while it
+      // runs; a caller that never reaches a stable store still fails the
+      // append (strict-mode `AuditIntegrityError`, thrown before the lock is
+      // ever requested), which is the correct outcome for a store that is
+      // genuinely never becoming readable.
       if (hadBaseline && Date.now() >= deadline) {
         return; // bounded backstop; surfaced in strict mode by the caller
       }
@@ -4149,31 +4544,44 @@ export class AuditLog {
     const signal: AuditWriteLockAbortSignal = { aborted: false };
     if (!this.auditWriteLockPath) return operation(signal);
 
-    const auditNamespaceDir =
-      this.filesystemCapabilities!.namespacePath(AUDIT_NAMESPACE);
-    const firstCreated = await mkdir(auditNamespaceDir, {
-      recursive: true,
-      mode: 0o700,
-    });
-    if (this.createOwner !== undefined) {
-      if (firstCreated !== undefined) {
-        /**
-         * Fortress-ownership spec 2026-07-30: recursive mkdir as root creates
-         * the missing namespace chain root-owned 0700; files inside are
-         * operator-owned but the operator cannot traverse the directories.
-         */
-        await this.createOwnerChownDirChain(
-          firstCreated,
-          auditNamespaceDir,
-          this.createOwner,
-        );
-      } else {
-        // PR #1084 gate F2: retry must not launder a failed handback. See
-        // {@link verifyOrRepairNamespaceDirOwnership}.
-        await this.verifyOrRepairNamespaceDirOwnership(
-          auditNamespaceDir,
-          this.createOwner,
-        );
+    // A single append writes one chained entry, its durable head anchor, and
+    // the durable "anchor established" marker. Owner-mode FilesystemStorage
+    // deliberately refuses to create a missing parent as root, so ALL three
+    // namespace directories must exist (and be handed back to the fortress
+    // owner) before the append starts. Initializing only `_audit` made the
+    // first safe-mode boot append fail successively on `_audit_checkpoints`
+    // and `_meta` in a genuinely fresh fortress.
+    for (const namespace of [
+      AUDIT_NAMESPACE,
+      AUDIT_CHECKPOINT_NAMESPACE,
+      AUDIT_META_NAMESPACE,
+    ]) {
+      const namespaceDir =
+        this.filesystemCapabilities!.namespacePath(namespace);
+      const firstCreated = await mkdir(namespaceDir, {
+        recursive: true,
+        mode: 0o700,
+      });
+      if (this.createOwner !== undefined) {
+        if (firstCreated !== undefined) {
+          /**
+           * Fortress-ownership spec 2026-07-30: recursive mkdir as root creates
+           * the missing namespace chain root-owned 0700; files inside are
+           * operator-owned but the operator cannot traverse the directories.
+           */
+          await this.createOwnerChownDirChain(
+            firstCreated,
+            namespaceDir,
+            this.createOwner,
+          );
+        } else {
+          // PR #1084 gate F2: retry must not launder a failed handback. See
+          // {@link verifyOrRepairNamespaceDirOwnership}.
+          await this.verifyOrRepairNamespaceDirOwnership(
+            namespaceDir,
+            this.createOwner,
+          );
+        }
       }
     }
     // Once-per-process: GC any `.acquire.*.tmp` a prior process's crash/kill-9
@@ -5306,7 +5714,7 @@ export class AuditLog {
     }
 
     const anchor = existing.at(-1)!;
-    this.verifyCheckpointRecordSignature(anchor, findings);
+    await this.verifyCheckpointRecordSignature(anchor, findings);
     if (
       anchor.checkpoint_sequence !== legacyCount ||
       anchor.root_hash !== legacyAnchorHash
@@ -5361,6 +5769,921 @@ export class AuditLog {
     }
   }
 
+  // ── IC-05-DG: signing control records (latch v2 + signing head) ──────────
+
+  private signingLatchMacBytes(data: {
+    armed_at_sequence: number;
+    signer_kid: string;
+    armed_at: string;
+  }): Uint8Array {
+    return hmacSha256(
+      this.signingLatchMacKey,
+      stringToBytes(AUDIT_SIGNING_LATCH_V2_MAC_DOMAIN + canonicalJson(data))
+    );
+  }
+
+  private signingHeadMacBytes(data: SigningHeadData): Uint8Array {
+    return hmacSha256(
+      this.signingHeadMacKey,
+      stringToBytes(
+        AUDIT_SIGNING_HEAD_MAC_DOMAIN +
+          canonicalJson(data as unknown as Record<string, unknown>)
+      )
+    );
+  }
+
+  /**
+   * Read + authenticate the v2 signing latch. See {@link SigningControlRead}
+   * for the four-state absence rule: only a successful null read is "absent",
+   * a thrown read is "unreadable" (never absent, never TAMPERED), and READ
+   * bytes that fail marker/shape/MAC authentication are "invalid".
+   */
+  private async readSigningLatchV2(): Promise<
+    SigningControlRead<{ armed_at_sequence: number }>
+  > {
+    let raw: Uint8Array | null;
+    try {
+      raw = await this.storage.read(
+        AUDIT_CHECKPOINT_NAMESPACE,
+        AUDIT_SIGNING_LATCH_V2_KEY
+      );
+    } catch (err) {
+      if (isStructuralNamespaceRefusal(err)) return { status: "unsupported" };
+      // Absence rule (review finding 3): a read that THROWS proves nothing
+      // about the bytes. Treat-error-as-absent would let an attacker chmod
+      // the latch on a stripped store and drive state_UNARMED; calling it
+      // TAMPERED would call an EACCES "proof of edit". It is indeterminate.
+      return { status: "unreadable", detail: failureMessage(err) };
+    }
+    if (raw === null) return { status: "absent" };
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(bytesToString(raw));
+    } catch {
+      return { status: "invalid" };
+    }
+    const record = parsed as Record<string, unknown>;
+    if (
+      !record ||
+      typeof record !== "object" ||
+      record[AUDIT_SIGNING_LATCH_V2_MARKER] !== true
+    ) {
+      return { status: "invalid" };
+    }
+    const data = record.data as
+      | { armed_at_sequence?: unknown; signer_kid?: unknown; armed_at?: unknown }
+      | undefined;
+    if (
+      !data ||
+      typeof data !== "object" ||
+      typeof data.armed_at_sequence !== "number" ||
+      !Number.isSafeInteger(data.armed_at_sequence) ||
+      data.armed_at_sequence <= 0 ||
+      typeof data.signer_kid !== "string" ||
+      typeof data.armed_at !== "string" ||
+      typeof record.mac !== "string"
+    ) {
+      return { status: "invalid" };
+    }
+    let providedMac: Uint8Array;
+    try {
+      providedMac = fromBase64url(record.mac);
+    } catch {
+      return { status: "invalid" };
+    }
+    if (
+      !constantTimeEqual(
+        providedMac,
+        this.signingLatchMacBytes({
+          armed_at_sequence: data.armed_at_sequence,
+          signer_kid: data.signer_kid,
+          armed_at: data.armed_at,
+        })
+      )
+    ) {
+      return { status: "invalid" };
+    }
+    // `signer_kid` / `armed_at` are diagnostic only: no detection decision
+    // consumes them (the signer may rotate or be deleted, and no verdict
+    // consumes a timestamp), so only the armed floor is returned.
+    return { status: "valid", data: { armed_at_sequence: data.armed_at_sequence } };
+  }
+
+  /** Read + authenticate the signing head. Same four-state absence rule as
+   * the latch. */
+  private async readSigningHead(): Promise<SigningControlRead<SigningHeadData>> {
+    let raw: Uint8Array | null;
+    try {
+      raw = await this.storage.read(
+        AUDIT_CHECKPOINT_NAMESPACE,
+        AUDIT_SIGNING_HEAD_KEY
+      );
+    } catch (err) {
+      if (isStructuralNamespaceRefusal(err)) return { status: "unsupported" };
+      return { status: "unreadable", detail: failureMessage(err) };
+    }
+    if (raw === null) return { status: "absent" };
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(bytesToString(raw));
+    } catch {
+      return { status: "invalid" };
+    }
+    const record = parsed as Record<string, unknown>;
+    if (
+      !record ||
+      typeof record !== "object" ||
+      record[AUDIT_SIGNING_HEAD_MARKER] !== true ||
+      typeof record.mac !== "string"
+    ) {
+      return { status: "invalid" };
+    }
+    const data = parseSigningHeadData(record.data);
+    if (data === null) return { status: "invalid" };
+    let providedMac: Uint8Array;
+    try {
+      providedMac = fromBase64url(record.mac);
+    } catch {
+      return { status: "invalid" };
+    }
+    if (!constantTimeEqual(providedMac, this.signingHeadMacBytes(data))) {
+      return { status: "invalid" };
+    }
+    if (
+      data.highest_signed_checkpoint_sequence > 0 &&
+      data.lowest_signed_checkpoint_sequence === null
+    ) {
+      // DELTA-3 build invariant: a valid head with a non-zero committed tip
+      // and a null (uncommitted) floor is impossible by construction — the
+      // tip and floor commit together in one chokepoint write (the arm's
+      // step-4 head commit, and the merge rule that back-fills the floor
+      // from the tip candidate). If a future refactor ever split them into
+      // two writes, the null-floor-quiet branch of the floor predicate would
+      // silently reopen exactly re-gate NEW-1, so a head observed in this
+      // shape reads as TAMPERED, never quiet.
+      return { status: "invalid" };
+    }
+    return { status: "valid", data };
+  }
+
+  /**
+   * THE chokepoint for every latch / signing-head write (the LD6
+   * never-overwrite/never-regress primitive, review finding 4). Callable only
+   * inside {@link withAuditWriteLock}: it (1) asserts the hold is live,
+   * (2) RE-READS the current record from storage, never from memory,
+   * (3) applies the per-record merge rule — latch: write-once, abort on any
+   * existing record; head: monotone merge — and (4) re-asserts the hold
+   * synchronously immediately before dispatching the durable write, so a
+   * deadline-expired continuation THROWS here instead of writing (this stops
+   * the rule-12 detached-late-completion schedule at the point of dispatch).
+   * A write that was legitimately dispatched pre-expiry and completes late
+   * can only land a payload that was itself computed by re-read-plus-
+   * monotone-merge under a real hold, so even a stale landing can only move
+   * every memory in its safe direction (§d's bounded transient).
+   */
+  private async writeSigningControlRecord(
+    signal: AuditWriteLockAbortSignal,
+    intent:
+      | {
+          record: "latch";
+          armed_at_sequence: number;
+          signer_kid: string;
+          armed_at: string;
+        }
+      | {
+          record: "head";
+          /** Create a zeroed head when absent (arm step 1 / never-armed first
+           * incident ONLY — steady-state writers never re-create a deleted
+           * head; load-path recovery owns that, with markers). */
+          ensure?: boolean;
+          addIncidents?: SigningHeadIncident[];
+          tipCandidate?: number;
+          floorCandidate?: number | null;
+          addMarkers?: SigningHeadLatchedMarker[];
+        }
+  ): Promise<"written" | "skipped"> {
+    this.assertAuditWriteLockActive(signal);
+    if (intent.record === "latch") {
+      const existing = await this.readSigningLatchV2();
+      if (existing.status === "valid") {
+        // Write-once: a valid latch keeps its ORIGINAL floor forever.
+        return "skipped";
+      }
+      if (existing.status === "unsupported") return "skipped";
+      if (existing.status === "invalid" || existing.status === "unreadable") {
+        // Never overwrite tamper evidence (an invalid latch is exactly what
+        // the downgrade finding reports; re-stamping would erase it), and
+        // never write over a record we could not read.
+        // SAFETY: stderr diagnostic for a refused control-record write; must
+        // reach the operator console even when the audit log is the failing
+        // component, so it cannot route through any audit-backed logger.
+        console.error(
+          `[audit-log] refusing to (re)write the signing latch over a ${existing.status} record`
+        );
+        return "skipped";
+      }
+      const data = {
+        armed_at_sequence: intent.armed_at_sequence,
+        signer_kid: intent.signer_kid,
+        armed_at: intent.armed_at,
+      };
+      const envelope = {
+        [AUDIT_SIGNING_LATCH_V2_MARKER]: true,
+        data,
+        mac: toBase64url(this.signingLatchMacBytes(data)),
+      };
+      // Deadline re-check synchronously before dispatch (LD6 rule): an
+      // expired hold must throw HERE, not land a write after a
+      // break-and-republish.
+      this.assertAuditWriteLockActive(signal);
+      await this.writeSigningControlBytes(
+        AUDIT_SIGNING_LATCH_V2_KEY,
+        stringToBytes(JSON.stringify(envelope))
+      );
+      return "written";
+    }
+
+    const existing = await this.readSigningHead();
+    if (existing.status === "unsupported") return "skipped";
+    if (existing.status === "invalid" || existing.status === "unreadable") {
+      // Restamping an invalid head would launder tamper evidence into
+      // validity; an unreadable one cannot be proven absent. Both are loud
+      // findings on the next load; this writer stays out of the way.
+      // SAFETY: stderr diagnostic for a refused control-record write; never
+      // stdout, never an audit-backed logger.
+      console.error(
+        `[audit-log] refusing to update the signing head over a ${existing.status} record`
+      );
+      return "skipped";
+    }
+    if (existing.status === "absent" && !intent.ensure) {
+      // Post-arm head absence is deletion evidence (or a loudly-diagnosed
+      // ensure failure), never an honest interleaving — the head is ensured
+      // FIRST in the arm sequence precisely so this is true. Recreating it
+      // here would silently absorb the deletion; the load path's recovery
+      // recreates it WITH a latched head_recreated marker instead.
+      // SAFETY: stderr diagnostic (operator-facing); the programmatic channel
+      // is the next load's recovery finding, not this line.
+      console.error(
+        "[audit-log] signing head is absent on a store with signing evidence; leaving recovery to the next load pass"
+      );
+      return "skipped";
+    }
+    const base: SigningHeadData =
+      existing.status === "valid"
+        ? existing.data
+        : {
+            incident_count: 0,
+            first_incident_sequence: null,
+            last_incident_sequence: null,
+            recent: [],
+            highest_signed_checkpoint_sequence: 0,
+            lowest_signed_checkpoint_sequence: null,
+            latched: [],
+            latched_evicted_count: 0,
+            hard_downgrade_ever_latched: false,
+          };
+    const merged = mergeSigningHead(base, intent);
+    const bytes = stringToBytes(
+      JSON.stringify({
+        [AUDIT_SIGNING_HEAD_MARKER]: true,
+        data: merged,
+        mac: toBase64url(this.signingHeadMacBytes(merged)),
+      })
+    );
+    if (bytes.length > SIGNING_HEAD_MAX_SERIALIZED_BYTES) {
+      // Rule-8 tripwire: the ring caps + detail clamp make this unreachable
+      // by derivation; reaching it means the fixed-size argument broke, and
+      // writing an unbounded head would hand an attacker a growth lever, so
+      // fail the bookkeeping write loudly instead.
+      throw new Error(
+        `signing head serialized to ${bytes.length} bytes, over the ${SIGNING_HEAD_MAX_SERIALIZED_BYTES}-byte ceiling`
+      );
+    }
+    this.assertAuditWriteLockActive(signal);
+    await this.writeSigningControlBytes(AUDIT_SIGNING_HEAD_KEY, bytes);
+    return "written";
+  }
+
+  /** Durable write where the backend supports it (same as the head anchor):
+   * a torn control record reads as "invalid" — a LOUD tamper-shaped finding —
+   * so a crash mid-write must not be able to plant permanent false tamper
+   * evidence. On backends without the capability that residual is accepted
+   * and stated: a torn record fails LOUD (an operator investigation), never
+   * silent (an attacker bypass) — a crash can cost an operator an
+   * investigation; it can never grant an attacker silence. */
+  private async writeSigningControlBytes(
+    key: string,
+    bytes: Uint8Array
+  ): Promise<void> {
+    if (this.filesystemCapabilities) {
+      await this.filesystemCapabilities.writeDurable(
+        AUDIT_CHECKPOINT_NAMESPACE,
+        key,
+        bytes
+      );
+    } else {
+      await this.storage.write(AUDIT_CHECKPOINT_NAMESPACE, key, bytes);
+    }
+  }
+
+  /**
+   * Loud non-finding diagnostic for control-record write failures: stderr
+   * plus an integrity-anomaly subscriber event (subscribers are the
+   * programmatic channel doctor/dashboard consume; stderr alone is not
+   * loud enough for the arming-write-failure path, §d). Not appended to
+   * `integrityFindings`: a write-path bookkeeping failure costs redundancy,
+   * not detection — the in-store verified-signed memory stays the active
+   * detector until re-arming succeeds — so it must not fail strict loads.
+   */
+  private notifySigningControlWriteFailure(context: string, err: unknown): void {
+    const message = `[audit-log] ${context}: ${failureMessage(err)}`;
+    // SAFETY: stderr diagnostic (operator-facing channel); never stdout.
+    console.error(message);
+    const event: AuditIntegrityAnomalyEvent = {
+      type: "audit_integrity_finding",
+      severity: "P1",
+      finding_count: 1,
+      findings: [
+        {
+          kind: "checkpoint_signing_state_indeterminate",
+          variant: "control-record-write-failed",
+          message,
+        },
+      ],
+      observed_at: new Date().toISOString(),
+    };
+    for (const subscriber of this.integrityAnomalySubscribers) {
+      try {
+        void subscriber(event);
+      } catch {
+        // Subscribers must not mask the failure being reported.
+      }
+    }
+  }
+
+  /**
+   * IC-05-DG: the silent-downgrade detection pass (design §c's state
+   * machine). Runs on every load, after per-record signature verification.
+   * The organizing rule, learned across three #1243 gate rounds: every datum
+   * consumed here answers "who can write it, and what key authenticates it",
+   * and any datum an attacker CAN write may only ever ADD findings, never
+   * remove or reclassify them (the monotone-loudness invariant).
+   *
+   * The named states appear as labeled branches below:
+   * state_UNARMED / state_ARMED / state_ARMED_PARTIAL / state_RECOVERABLE /
+   * state_TAMPERED / state_INDETERMINATE.
+   */
+  private async detectCheckpointSigningState(
+    checkpoints: readonly AuditCheckpointRecord[],
+    enumerationComplete: boolean,
+    resolverVerifiedSequences: ReadonlySet<number>,
+    sealedTipSequence: number,
+    findings: AuditIntegrityFinding[]
+  ): Promise<void> {
+    if (this.signingDetectionMode === "non-fortress") {
+      // Constructional carve-out, leg 2 (review finding 2): this instance
+      // declared itself non-fortress AT CONSTRUCTION (safe-mode boot store,
+      // transitional rotation reader) — a fact fixed by the composition
+      // root's static wiring, which no storage state can manufacture. On
+      // such instances latch/head records legitimately mismatch this
+      // instance's keys mid-operation, so running detection would mint
+      // false TAMPERED verdicts. On every OTHER instance (a real fortress
+      // load), every runtime failure below is a FINDING, never a softening.
+      return;
+    }
+    const latch = await this.readSigningLatchV2();
+    const head = await this.readSigningHead();
+    if (latch.status === "unsupported" || head.status === "unsupported") {
+      // Constructional carve-out, leg 1: the STRUCTURAL namespace-refusal
+      // code, set only by the daemon adapter's closed allowlist. Not
+      // manufacturable by an operator-uid attacker (FilesystemStorage has no
+      // code path that throws it), so — unlike any runtime read failure —
+      // it may soften without opening the review's manufactured-composition
+      // bypass.
+      return;
+    }
+
+    // Scope guard (carried from #1243 round 3): the floor logic consumes
+    // ONLY `audit-checkpoint` records; the legacy anchor's
+    // `checkpoint_sequence` counts the LEGACY entry space and would poison
+    // the floor.
+    const auditCheckpoints = checkpoints.filter(
+      (checkpoint) => checkpoint.checkpoint_kind === "audit-checkpoint"
+    );
+
+    if (
+      latch.status !== "absent" ||
+      head.status !== "absent" ||
+      resolverVerifiedSequences.size > 0
+    ) {
+      this.signingEvidenceSeen = true;
+    }
+
+    // Duplicate-sequence tripwire (re-gate NEW-2, rule-5 full-set posture):
+    // key uniqueness plus the bound-identity assert makes a bound duplicate
+    // structurally impossible; this check is the tripwire that keeps that
+    // argument true. A duplicate is loud, neither copy satisfies any
+    // reference or moves any monotone memory, and durable stamping is
+    // vetoed.
+    const sequenceCounts = new Map<number, number>();
+    for (const checkpoint of auditCheckpoints) {
+      sequenceCounts.set(
+        checkpoint.checkpoint_sequence,
+        (sequenceCounts.get(checkpoint.checkpoint_sequence) ?? 0) + 1
+      );
+    }
+    const duplicateSequences = [...sequenceCounts.entries()]
+      .filter(([, count]) => count > 1)
+      .map(([sequence]) => sequence);
+    const verified = new Set(resolverVerifiedSequences);
+    for (const sequence of duplicateSequences) {
+      verified.delete(sequence);
+      findings.push({
+        kind: "checkpoint_malformed",
+        variant: "duplicate-sequence",
+        sequence,
+        message:
+          `two checkpoint records claim sequence ${sequence}; a writer-produced store ` +
+          "cannot contain this (keys encode the sequence), so it is planted or corrupt; " +
+          "neither copy witnesses anything and no durable state is stamped this pass",
+      });
+    }
+    const duplicatesFound = duplicateSequences.length > 0;
+
+    // Identity-bound enumerated sequences: under a complete enumeration
+    // every record in this set was read, parsed, and key==record bound, so
+    // the predicates below consume only bound identities (a junk or
+    // mismatched substitution never reaches them — it already flipped the
+    // pass to partial with its own loud finding).
+    const boundSequences = new Set<number>();
+    for (const checkpoint of auditCheckpoints) {
+      if (!duplicateSequences.includes(checkpoint.checkpoint_sequence)) {
+        boundSequences.add(checkpoint.checkpoint_sequence);
+      }
+    }
+
+    const verifiedList = [...verified];
+    const earliestVerified =
+      verifiedList.length > 0 ? Math.min(...verifiedList) : null;
+    const highestVerified =
+      verifiedList.length > 0 ? Math.max(...verifiedList) : 0;
+
+    // ── Control-record disposition (state_TAMPERED / state_INDETERMINATE) ──
+    let indeterminate = false;
+    if (latch.status === "unreadable") {
+      // state_INDETERMINATE: detection cannot run, so it must surface
+      // (MUST-NEVER #5). The finding carries the failing key and error class
+      // so an operator can tell attacker starvation from a genuine disk
+      // fault (fail-closed-must-be-diagnosable).
+      indeterminate = true;
+      findings.push({
+        kind: "checkpoint_signing_state_indeterminate",
+        key: AUDIT_SIGNING_LATCH_V2_KEY,
+        message:
+          `the signing latch could not be read (${latch.detail}); downgrade detection ` +
+          "cannot run this pass; an unreadable control record is never absent and never clean",
+      });
+    }
+    if (head.status === "unreadable") {
+      indeterminate = true;
+      findings.push({
+        kind: "checkpoint_signing_state_indeterminate",
+        key: AUDIT_SIGNING_HEAD_KEY,
+        message:
+          `the signing head could not be read (${head.detail}); downgrade detection ` +
+          "cannot run this pass; an unreadable control record is never absent and never clean",
+      });
+    }
+    if (latch.status === "invalid") {
+      // state_TAMPERED: the latch was READ and failed authentication. The
+      // invalid record is itself the tamper evidence the finding reports;
+      // it is never re-stamped, and the floor falls back to the other two
+      // memories for the rest of the pass — an invalid latch never silently
+      // disables them.
+      findings.push({
+        kind: "checkpoint_signing_downgrade",
+        variant: "latch-tamper",
+        key: AUDIT_SIGNING_LATCH_V2_KEY,
+        message:
+          "the checkpoint-signing latch is present but does not authenticate under this " +
+          "master (tampered or wrong-key edit)",
+      });
+    }
+    if (head.status === "invalid") {
+      findings.push({
+        kind: "checkpoint_signing_downgrade",
+        variant: "head-tamper",
+        key: AUDIT_SIGNING_HEAD_KEY,
+        message:
+          "the checkpoint-signing head is present but does not authenticate under this " +
+          "master (tampered, wrong-key edit, or an impossible-by-construction shape)",
+      });
+    }
+    if (!enumerationComplete && !indeterminate) {
+      // state_ARMED_PARTIAL (latch valid) or state_INDETERMINATE (latch
+      // absent): either way, the coverage invariant is NOT evaluated (the
+      // subset-consumer rule: a partial view may not assert a gap) and NO
+      // durable state is written. The scoped finding makes strict mode fail
+      // closed on the BLINDNESS rather than pass on the visible subset:
+      // "read nothing" and "nothing exists" are different verdicts.
+      indeterminate = true;
+      findings.push({
+        kind: "checkpoint_signing_state_indeterminate",
+        message:
+          "the checkpoint enumeration is partial (an unreadable, malformed, or " +
+          "identity-mismatched record); deletion detection could not run this pass and " +
+          "no durable signing state was stamped",
+      });
+    }
+
+    // ── Latched-marker re-emission (NEW-3: the record of recovery never
+    // heals to silence) ──
+    if (head.status === "valid") {
+      const latchedDowngrades = head.data.latched.filter(
+        (marker) => marker.marker_kind === "downgrade_latched"
+      );
+      if (latchedDowngrades.length > 0 || head.data.hard_downgrade_ever_latched) {
+        // Latched downgrade evidence is proven tamper: hard, every load,
+        // never heals. The sticky flag keeps the grade even if the detail
+        // markers were evicted (DELTA-1).
+        findings.push({
+          kind: "checkpoint_signing_downgrade",
+          variant: "latched",
+          message:
+            "latched downgrade evidence in the signing head: " +
+            (latchedDowngrades.map((marker) => marker.detail).join("; ") ||
+              "detail evicted; the monotonic summary count witnesses the evidence"),
+        });
+      }
+      const recoveryMarkers = head.data.latched.filter(
+        (marker) => marker.marker_kind !== "downgrade_latched"
+      );
+      const evictedOnly =
+        head.data.latched_evicted_count > 0 &&
+        head.data.latched.length === 0 &&
+        !head.data.hard_downgrade_ever_latched;
+      if (recoveryMarkers.length > 0 || evictedOnly) {
+        // Warn on later loads, hard on the load that performed a live
+        // recovery (the signingRecoveryThisLoad flag keeps the pinned
+        // strict-closure from being absorbed by the read-consistency retry).
+        const severity = this.signingRecoveryThisLoad ? undefined : ("warn" as const);
+        for (const marker of recoveryMarkers) {
+          findings.push({
+            kind:
+              marker.marker_kind === "head_recreated"
+                ? "checkpoint_signing_head_recovered"
+                : "checkpoint_signing_floor_recovered",
+            variant: "latched",
+            ...(severity ? { severity } : {}),
+            message:
+              `a signing control record was recovered on an earlier load (${marker.detail}); ` +
+              "recovery restores forward protection but cannot prove what the lost record " +
+              "witnessed: an honest write failure and a deletion are locally " +
+              "indistinguishable here, so this finding is permanent (re-bootstrap is the " +
+              "only remedy; deleting control records mimics the attack and re-latches)",
+          });
+        }
+        if (evictedOnly) {
+          findings.push({
+            kind: "checkpoint_signing_head_recovered",
+            variant: "latched-evicted",
+            ...(severity ? { severity } : {}),
+            message:
+              `${head.data.latched_evicted_count} latched recovery marker(s) were evicted ` +
+              "from the detail ring; the monotonic count keeps this permanent finding firing",
+          });
+        }
+      }
+    }
+
+    // ── Coverage invariant (complete enumeration only; closes D7) ──
+    // Tracks whether any coverage finding fired: rolled-floor evidence and
+    // its siblings VETO durable stamping exactly like the review's
+    // re-arm-above-the-deleted-prefix kill shot requires.
+    let coverageVeto = duplicatesFound;
+    if (enumerationComplete && !indeterminate) {
+      if (head.status === "valid") {
+        // Tip predicate (deleted-tail variant): the committed tip is a
+        // monotone lower bound on how far the signed history extends; a
+        // planted record can never satisfy it dishonestly because H counts
+        // only resolver-verified records.
+        if (highestVerified < head.data.highest_signed_checkpoint_sequence) {
+          coverageVeto = true;
+          findings.push({
+            kind: "checkpoint_signing_downgrade",
+            variant: "deleted-tail",
+            sequence: head.data.highest_signed_checkpoint_sequence,
+            expected: head.data.highest_signed_checkpoint_sequence,
+            actual: highestVerified,
+            message:
+              `the signing head committed a verified signed checkpoint at sequence ` +
+              `${head.data.highest_signed_checkpoint_sequence}, but the highest surviving ` +
+              `verified checkpoint is ${highestVerified}; a committed signed checkpoint is ` +
+              "gone or no longer verifies (deleted tail)",
+          });
+        }
+        // Floor predicate (rolled-floor variant, re-gate NEW-1): the
+        // committed beginning of the signed history must survive as a
+        // verified record at EXACTLY the witnessed sequence, and nothing
+        // verified may begin later. E < lowest_signed is the benign
+        // arm-crash shape (more surviving history than committed) and is
+        // healed downward by the self-heal below.
+        const lowest = head.data.lowest_signed_checkpoint_sequence;
+        if (
+          lowest !== null &&
+          (!verified.has(lowest) ||
+            (earliestVerified !== null && earliestVerified > lowest))
+        ) {
+          coverageVeto = true;
+          findings.push({
+            kind: "checkpoint_signing_downgrade",
+            variant: "rolled-floor",
+            sequence: lowest,
+            expected: lowest,
+            actual: earliestVerified ?? "none",
+            message:
+              `the signing head witnesses this fortress's signed history beginning at ` +
+              `sequence ${lowest}, but ${
+                verified.has(lowest)
+                  ? `the earliest surviving verified checkpoint is ${String(earliestVerified)}`
+                  : "no verified signed checkpoint survives there"
+              }; the committed floor was erased, stripped, or rolled; recovery may never ` +
+              "re-arm above this witness",
+          });
+        }
+      }
+      // Predecessor-existence predicate (deleted-prefix/interior variant):
+      // set-based existence over signature-covered references, never a
+      // pointer walk — `previous_checkpoint_sequence` is INSIDE the signed
+      // payload, so on a verified checkpoint it is tamper-evident, while on
+      // an unsigned record it is attacker-writable (a walk would be
+      // steerable). Existence is satisfied ONLY by a BOUND record
+      // (key-sequence === record-sequence === referenced sequence, NEW-2);
+      // the predecessor may legitimately be UNSIGNED (the migration
+      // boundary) — the predicate demands bound existence, never
+      // signedness. A reference at/below the sealed tip is satisfied by the
+      // boundary MAC (the F2 exemption).
+      for (const checkpoint of auditCheckpoints) {
+        if (!verified.has(checkpoint.checkpoint_sequence)) continue;
+        const previous = checkpoint.previous_checkpoint_sequence;
+        if (previous <= 0 || previous <= sealedTipSequence) continue;
+        if (!boundSequences.has(previous)) {
+          coverageVeto = true;
+          findings.push({
+            kind: "checkpoint_signing_downgrade",
+            variant: "deleted-predecessor",
+            sequence: previous,
+            message:
+              `verified checkpoint ${checkpoint.checkpoint_sequence} references its ` +
+              `predecessor at sequence ${previous} inside its signed payload, but no ` +
+              "record survives there; checkpoints have no pruning path, so this is " +
+              "deletion or loss",
+          });
+        }
+      }
+    }
+
+    // ── Verdict floor: the three-memory MIN (latch, head floor witness,
+    // in-store earliest verified), so deleting any one memory alone never
+    // disarms detection. Clock independence (rule 10 discharge): floors and
+    // incidents are sequence-indexed; no verdict consumes a timestamp, so
+    // there is no signer-chosen freshness window for a relying party to
+    // constrain ──
+    const latchFloor =
+      latch.status === "valid"
+        ? latch.data.armed_at_sequence
+        : Number.POSITIVE_INFINITY;
+    const headFloor =
+      head.status === "valid" &&
+      head.data.lowest_signed_checkpoint_sequence !== null
+        ? head.data.lowest_signed_checkpoint_sequence
+        : Number.POSITIVE_INFINITY;
+    const storeFloor = earliestVerified ?? Number.POSITIVE_INFINITY;
+    const verdictFloor = Math.min(latchFloor, headFloor, storeFloor);
+
+    // ── Per-checkpoint verdicts ──
+    const incidentRing =
+      head.status === "valid"
+        ? new Set(head.data.recent.map((incident) => incident.sequence))
+        : new Set<number>();
+    for (const checkpoint of auditCheckpoints) {
+      if (!checkpoint.unsigned) continue;
+      if (incidentRing.has(checkpoint.checkpoint_sequence)) {
+        // UNSIGNED_INCIDENT: ring MEMBERSHIP is the predicate — never the
+        // first/last range, which would classify unattested sequences into
+        // the softer kind (review finding 9) — and it fires independent of
+        // the armed state: the day-one-corruption window (identity corrupt
+        // before the first interval ever signs) is visible ONLY through the
+        // incident ring.
+        findings.push({
+          kind: "checkpoint_signing_error",
+          sequence: checkpoint.checkpoint_sequence,
+          message:
+            `checkpoint ${checkpoint.checkpoint_sequence} was written unsigned because ` +
+            "the signer FAILED (the signing head's authenticated incident ring attests " +
+            "it), not because the fortress holds no identity",
+        });
+        continue;
+      }
+      if (checkpoint.checkpoint_sequence >= verdictFloor) {
+        // UNSIGNED_DOWNGRADE. Below the floor is UNSIGNED_PREBOOT: honest
+        // migration/pre-bootstrap, finding-free (the round-2 false-positive
+        // guard).
+        findings.push({
+          kind: "checkpoint_signing_downgrade",
+          variant: "strip",
+          sequence: checkpoint.checkpoint_sequence,
+          message:
+            `checkpoint ${checkpoint.checkpoint_sequence} is unsigned, but this fortress ` +
+            `provably signed checkpoints from sequence ${verdictFloor}; an unsigned ` +
+            "checkpoint after signing was established is a downgrade, not a " +
+            "pre-bootstrap state",
+        });
+      }
+    }
+
+    // ── Recovery (state_RECOVERABLE / head recovery) + self-heal stamps ──
+    // Binding rule, verbatim (R3-e): a durable floor (latch establishment or
+    // re-establishment) or head re-establishment/raise may be computed ONLY
+    // from a complete enumeration that is also coverage-finding-free; a
+    // partial enumeration may raise findings but may never stamp state.
+    if (enumerationComplete && !indeterminate) {
+      const hasSignedEvidence = verified.size > 0;
+      const latchRecoveryDue = latch.status === "absent" && hasSignedEvidence;
+      const headRecoveryDue =
+        head.status === "absent" && (latch.status === "valid" || hasSignedEvidence);
+
+      if (latchRecoveryDue) {
+        // state_RECOVERABLE: a missing latch on a signed store is itself
+        // evidence of a swallowed write or a deletion — say so, hard on
+        // THIS pass (strict-closed), warn thereafter via the latched marker.
+        this.signingRecoveryThisLoad = true;
+        findings.push({
+          kind: "checkpoint_signing_floor_recovered",
+          message:
+            "signed checkpoints exist but the signing latch is absent (a swallowed " +
+            "first write, or a deletion); this pass fails strict-closed, latches a " +
+            "permanent recovery marker, and " +
+            (coverageVeto
+              ? "does NOT re-arm (coverage findings veto stamping)"
+              : "re-arms at the observed floor"),
+        });
+      }
+      if (headRecoveryDue) {
+        this.signingRecoveryThisLoad = true;
+        findings.push({
+          kind: "checkpoint_signing_head_recovered",
+          message:
+            "the signing head is absent while signing evidence survives (deletion, or a " +
+            "loudly-diagnosed ensure failure); this pass fails strict-closed and " +
+            "re-creates the head with a permanent latched marker",
+        });
+      }
+
+      // Self-heal (change-guarded so a clean steady-state load writes
+      // nothing): raise the tip to the observed highest, lower the floor to
+      // the observed earliest, or commit a null floor — each only in its
+      // safe direction, and only on a coverage-finding-free complete pass.
+      const selfHealDue =
+        !coverageVeto &&
+        head.status === "valid" &&
+        verified.size > 0 &&
+        (highestVerified > head.data.highest_signed_checkpoint_sequence ||
+          head.data.lowest_signed_checkpoint_sequence === null ||
+          (earliestVerified !== null &&
+            earliestVerified < head.data.lowest_signed_checkpoint_sequence));
+      if (latchRecoveryDue || headRecoveryDue || selfHealDue) {
+        await this.performSigningRecoveryWrites({
+          latchRecoveryDue,
+          headRecoveryDue,
+          coverageVeto,
+          headValid: head.status === "valid" ? head.data : null,
+          headFloor: Number.isFinite(headFloor) ? headFloor : null,
+          earliestVerified,
+          highestVerified,
+          findings,
+        });
+      }
+    }
+  }
+
+  /**
+   * The recovery/self-heal write batch, all through the LD6 chokepoint under
+   * one {@link withAuditWriteLock} hold. Recovery LATCHES BEFORE it
+   * re-stamps (NEW-3): the first durable write appends the MAC'd marker(s),
+   * so even if the value stamps below fail, the record of the recovery
+   * survives; and downgrade evidence surfaced during a recovery pass latches
+   * too, so a later "repair" of the store cannot silence it.
+   */
+  private async performSigningRecoveryWrites(args: {
+    latchRecoveryDue: boolean;
+    headRecoveryDue: boolean;
+    coverageVeto: boolean;
+    headValid: SigningHeadData | null;
+    headFloor: number | null;
+    earliestVerified: number | null;
+    highestVerified: number;
+    findings: AuditIntegrityFinding[];
+  }): Promise<void> {
+    const {
+      latchRecoveryDue,
+      headRecoveryDue,
+      coverageVeto,
+      headValid,
+      headFloor,
+      earliestVerified,
+      highestVerified,
+      findings,
+    } = args;
+    try {
+      await this.withAuditWriteLock(async (signal) => {
+        const markers: SigningHeadLatchedMarker[] = [];
+        if (latchRecoveryDue) {
+          markers.push({
+            marker_kind: "latch_recovered",
+            detail: `latch absent over signing evidence; earliest verified ${
+              earliestVerified ?? "none"
+            }`,
+          });
+        }
+        if (headRecoveryDue) {
+          markers.push({
+            marker_kind: "head_recreated",
+            detail: `head absent over signing evidence; observed verified range ${
+              earliestVerified ?? "none"
+            }..${highestVerified}`,
+          });
+        }
+        if (coverageVeto) {
+          // One marker per downgrade variant raised this pass, so the
+          // latched record stays bounded while still naming what was seen.
+          const variants = new Map<string, { min: number; max: number }>();
+          for (const finding of findings) {
+            if (finding.kind !== "checkpoint_signing_downgrade") continue;
+            if (finding.variant === "latched") continue;
+            const variant = finding.variant ?? "unspecified";
+            const sequence =
+              typeof finding.sequence === "number" ? finding.sequence : 0;
+            const range = variants.get(variant);
+            if (!range) variants.set(variant, { min: sequence, max: sequence });
+            else {
+              range.min = Math.min(range.min, sequence);
+              range.max = Math.max(range.max, sequence);
+            }
+          }
+          for (const [variant, range] of variants) {
+            markers.push({
+              marker_kind: "downgrade_latched",
+              detail: `${variant}: sequences ${range.min}..${range.max}`,
+            });
+          }
+        }
+
+        const stampValues = !coverageVeto;
+        if (markers.length > 0 || stampValues) {
+          // Recovery may NEVER re-arm above `lowest_signed` (NEW-1); with a
+          // clean pass the floor predicate's own equality already forces the
+          // recovered floor to the committed one, and the MIN below is the
+          // structural guarantee.
+          const observedFloor =
+            earliestVerified !== null && headFloor !== null
+              ? Math.min(earliestVerified, headFloor)
+              : (earliestVerified ?? headFloor);
+          await this.writeSigningControlRecord(signal, {
+            record: "head",
+            ensure: headRecoveryDue || headValid === null,
+            addMarkers: markers,
+            ...(stampValues && observedFloor !== null && highestVerified > 0
+              ? {
+                  tipCandidate: highestVerified,
+                  floorCandidate: observedFloor,
+                }
+              : {}),
+          });
+          if (latchRecoveryDue && stampValues && observedFloor !== null) {
+            await this.writeSigningControlRecord(signal, {
+              record: "latch",
+              armed_at_sequence: observedFloor,
+              signer_kid: "recovered",
+              armed_at: new Date().toISOString(),
+            });
+          }
+        }
+      });
+    } catch (err) {
+      // Loud, never silent: a swallowed recovery-write failure is an
+      // invisible hole in downgrade detection. Retried on every later load
+      // that still sees the recovery condition; until then the in-store
+      // verified-signed memory remains the active detector (the failure
+      // costs redundancy, not detection).
+      this.notifySigningControlWriteFailure(
+        "signing-state recovery writes failed",
+        err
+      );
+    }
+  }
+
   private async verifyCheckpoints(
     legacyCount: number,
     legacyAnchorHash: string,
@@ -5380,13 +6703,21 @@ export class AuditLog {
     // armed box) instead of failing the whole load closed.
     const sealedTipSequence =
       splitBoundary.status === "valid" ? splitBoundary.boundary.sealed_tip_sequence : 0;
-    const checkpoints = await this.readCheckpoints(
-      "audit-checkpoint",
-      findings,
-      sealedTipSequence
-    );
+    const { records: checkpoints, complete: enumerationComplete } =
+      await this.readCheckpointsWithCompleteness(
+        "audit-checkpoint",
+        findings,
+        sealedTipSequence
+      );
     const entryBySequence = new Map(entries.map((entry) => [entry.sequence, entry]));
     let highestCheckpoint = 0;
+    // IC-05-DG: audit-checkpoint sequences whose Ed25519 signature verified
+    // against this instance's configured trust basis (the authenticated
+    // resolver; embedded keys only under the explicit self-check opt-in —
+    // see verifyCheckpointRecordSignature's doc comment). This is the set
+    // every coverage predicate consumes: on a fortress, a planted record
+    // cannot enter it and so cannot witness anything.
+    const resolverVerifiedSequences = new Set<number>();
 
     // F3: the lowest surviving chained sequence. Entries below this floor (but
     // above the legacy region) were legitimately pruned by rotation. A checkpoint
@@ -5464,58 +6795,122 @@ export class AuditLog {
         }
       }
 
-      this.verifyCheckpointRecordSignature(checkpoint, findings);
+      const resolverVerified = await this.verifyCheckpointRecordSignature(
+        checkpoint,
+        findings
+      );
+      if (resolverVerified && checkpoint.checkpoint_kind === "audit-checkpoint") {
+        resolverVerifiedSequences.add(checkpoint.checkpoint_sequence);
+      }
     }
+
+    await this.detectCheckpointSigningState(
+      checkpoints,
+      enumerationComplete,
+      resolverVerifiedSequences,
+      sealedTipSequence,
+      findings
+    );
 
     this.lastCheckpointSequence = highestCheckpoint;
   }
 
-  private verifyCheckpointRecordSignature(
+  /**
+   * Verify one checkpoint record's signature, pushing findings for every
+   * failure shape. Returns true iff the signature verified against this
+   * instance's CONFIGURED trust basis: the signer's RESOLVED (authenticated)
+   * keys, or — only under the explicit `trustEmbeddedCheckpointPublicKeys`
+   * opt-in, and only when the resolver yields nothing — the record's
+   * embedded key. The IC-05-DG coverage predicates consume exactly this
+   * set, so their unforgeability argument ("a planted record can never
+   * satisfy a witness dishonestly") is precisely as strong as the trust
+   * basis the instance was constructed with: production never opts in (the
+   * constructor derives the authenticated fortress resolver), so on a
+   * fortress the set contains only records chaining to fortress-held
+   * identity material; the opt-in seam (export tooling self-checks, tests)
+   * already accepts self-consistency as its trust basis, and inherits the
+   * same degradation here rather than a false TAMPERED verdict.
+   */
+  private async verifyCheckpointRecordSignature(
     checkpoint: AuditCheckpointRecord,
     findings: AuditIntegrityFinding[]
-  ): void {
-    if (checkpoint.unsigned) return;
+  ): Promise<boolean> {
+    if (checkpoint.unsigned) return false;
     if (!checkpoint.signer_kid || !checkpoint.signature) {
       findings.push({
         kind: "checkpoint_signature_mismatch",
         sequence: checkpoint.checkpoint_sequence,
         message: `checkpoint ${checkpoint.checkpoint_sequence} is marked signed but lacks signer data`,
       });
-      return;
+      return false;
     }
 
-    const resolvedPublicKey = this.checkpointPublicKeyResolver?.(
-      checkpoint.signer_kid
-    );
+    let resolution: AuditCheckpointKeyResolution;
+    try {
+      resolution = await this.checkpointPublicKeyResolver(checkpoint.signer_kid);
+    } catch {
+      // A resolver failure reads as "signer unknown" and surfaces as a
+      // finding below; it must never read as verified, and must never crash
+      // the load pass that the rest of the chain verification rides on.
+      resolution = undefined;
+    }
+    const resolvedPublicKeys = (
+      Array.isArray(resolution) ? resolution : [resolution]
+    ).filter((key): key is string | Uint8Array => key !== undefined);
     // Checkpoint trust-basis invariant: an embedded public key is part of the
     // checkpoint being verified, so it is attacker-controlled unless the caller
     // explicitly asks for an internal-consistency check instead of signer trust.
-    const publicKey =
-      resolvedPublicKey ??
-      (this.trustEmbeddedCheckpointPublicKeys ? checkpoint.public_key : undefined);
-    if (!publicKey) {
-      if (checkpoint.public_key) {
+    // When the resolver DID return authenticated keys, they are authoritative
+    // for this signer_kid: a signature that fails against them is a mismatch,
+    // never a reason to retry against the embedded copy.
+    if (resolvedPublicKeys.length === 0) {
+      const embeddedPublicKey = this.trustEmbeddedCheckpointPublicKeys
+        ? checkpoint.public_key
+        : undefined;
+      if (!embeddedPublicKey) {
+        if (checkpoint.public_key) {
+          findings.push({
+            kind: "checkpoint_signature_embedded_key_untrusted",
+            sequence: checkpoint.checkpoint_sequence,
+            message:
+              `checkpoint signer ${checkpoint.signer_kid} has only an embedded public key; ` +
+              "configure checkpointPublicKeyResolver with an authenticated key, or explicitly opt in to embedded-key self-checks",
+          });
+          return false;
+        }
         findings.push({
-          kind: "checkpoint_signature_embedded_key_untrusted",
+          kind: "checkpoint_signature_unverifiable",
           sequence: checkpoint.checkpoint_sequence,
-          message:
-            `checkpoint signer ${checkpoint.signer_kid} has only an embedded public key; ` +
-            "configure checkpointPublicKeyResolver with an authenticated key, or explicitly opt in to embedded-key self-checks",
+          message: `checkpoint signer ${checkpoint.signer_kid} has no known public key`,
         });
-        return;
+        return false;
       }
-      findings.push({
-        kind: "checkpoint_signature_unverifiable",
-        sequence: checkpoint.checkpoint_sequence,
-        message: `checkpoint signer ${checkpoint.signer_kid} has no known public key`,
-      });
-      return;
+      // Embedded-key self-check path (explicit opt-in only; see the doc
+      // comment for what "verified" means to the coverage predicates here).
+      resolvedPublicKeys.push(embeddedPublicKey);
+      const selfConsistent = resolvedPublicKeys.some((publicKey) =>
+        verifyCheckpointSignature(
+          checkpointPayload(checkpoint),
+          checkpoint.signature!,
+          publicKey
+        )
+      );
+      if (!selfConsistent) {
+        findings.push({
+          kind: "checkpoint_signature_mismatch",
+          sequence: checkpoint.checkpoint_sequence,
+          message: `checkpoint signature mismatch at sequence ${checkpoint.checkpoint_sequence}`,
+        });
+      }
+      return selfConsistent;
     }
 
-    const valid = verifyCheckpointSignature(
-      checkpointPayload(checkpoint),
-      checkpoint.signature,
-      publicKey
+    const valid = resolvedPublicKeys.some((publicKey) =>
+      verifyCheckpointSignature(
+        checkpointPayload(checkpoint),
+        checkpoint.signature!,
+        publicKey
+      )
     );
     if (!valid) {
       findings.push({
@@ -5523,7 +6918,9 @@ export class AuditLog {
         sequence: checkpoint.checkpoint_sequence,
         message: `checkpoint signature mismatch at sequence ${checkpoint.checkpoint_sequence}`,
       });
+      return false;
     }
+    return true;
   }
 
   private async readCheckpoints(
@@ -5542,7 +6939,47 @@ export class AuditLog {
     // `verifyCheckpoints` already applies to the root RE-DERIVATION.
     sealedTipSequence = 0
   ): Promise<AuditCheckpointRecord[]> {
+    const { records } = await this.readCheckpointsWithCompleteness(
+      kind,
+      findings,
+      sealedTipSequence
+    );
+    return records;
+  }
+
+  /**
+   * IC-05-DG: checkpoint enumeration with COMPLETENESS as a first-class
+   * result. This wrapper is the single place the verdict is computed, so
+   * consumers cannot re-derive it inconsistently (§h Q5).
+   *
+   * `complete` is true iff `storage.list` succeeded AND every listed record
+   * was read, parsed, shape-checked, and IDENTITY-BOUND, or was skipped
+   * under the one sanctioned exemption (a sealed-split-region record
+   * unreadable with a PERMISSION error, whose integrity the boundary MAC
+   * already carries). Anything else — the list itself, any read above the
+   * sealed tip, any parse/shape/bound failure — makes the enumeration
+   * PARTIAL. The binding rule, enforced at the detection pass: a durable
+   * floor (latch establishment or re-establishment) or head
+   * re-establishment/raise may be computed ONLY from a complete enumeration
+   * that is also coverage-finding-free; a partial enumeration may raise
+   * findings but may never stamp state. "Read nothing" and "nothing exists"
+   * are different verdicts, and only the second is evidence (the R3-e
+   * lesson: a self-heal stamped a floor from a partial read and permanently
+   * legalized a stripped prefix).
+   *
+   * Honesty bound (review finding 1): completeness keys on read/parse
+   * FAILURE and is structurally blind to DELETION — a deleted record lists
+   * as nothing and errors as nothing. Completeness is only the PRECONDITION
+   * for deletion detection (so "absent from the listed set" is meaningful);
+   * the coverage invariant is what sees deletion.
+   */
+  private async readCheckpointsWithCompleteness(
+    kind: "audit-checkpoint" | "legacy-anchor",
+    findings: AuditIntegrityFinding[],
+    sealedTipSequence = 0
+  ): Promise<{ records: AuditCheckpointRecord[]; complete: boolean }> {
     const records: AuditCheckpointRecord[] = [];
+    let complete = true;
     let metas;
     try {
       metas = await this.storage.list(AUDIT_CHECKPOINT_NAMESPACE, `${kind}-`);
@@ -5551,7 +6988,7 @@ export class AuditLog {
         kind: "storage_unavailable",
         message: `audit checkpoints could not be listed: ${failureMessage(err)}`,
       });
-      return records;
+      return { records, complete: false };
     }
 
     for (const meta of metas) {
@@ -5564,20 +7001,25 @@ export class AuditLog {
       } catch (err) {
         // F2: a sealed-region checkpoint the operator uid cannot open on an
         // armed box (root-owned legacy file). The boundary MAC covers the
-        // sealed region, so skip it silently: the same soundness argument that
-        // lets the routine load skip unreadable sealed entries. Anything else
-        // (a non-permission error, or an unreadable checkpoint ABOVE the sealed
-        // tip) is a real problem and fails closed.
+        // sealed region — that MAC is the exemption's soundness argument —
+        // so skip it silently WITHOUT flipping completeness: the same
+        // argument that lets the routine load skip unreadable sealed
+        // entries. Anything else (a non-permission error, or an unreadable
+        // checkpoint ABOVE the sealed tip) is a real problem and fails
+        // closed, and makes this enumeration PARTIAL.
         if (inSealedRegion && isPermissionError(err)) {
           continue;
         }
+        complete = false;
         findings.push({
           kind: "storage_unavailable",
+          key: meta.key,
           message: `audit checkpoint ${meta.key} could not be read: ${failureMessage(err)}`,
         });
         continue;
       }
       if (!raw) {
+        complete = false;
         findings.push({
           kind: "checkpoint_malformed",
           key: meta.key,
@@ -5585,24 +7027,58 @@ export class AuditLog {
         });
         continue;
       }
+      let parsed: unknown;
       try {
-        const parsed = JSON.parse(bytesToString(raw));
+        parsed = JSON.parse(bytesToString(raw));
         if (!isAuditCheckpointRecord(parsed) || parsed.checkpoint_kind !== kind) {
           throw new Error("invalid checkpoint shape");
         }
-        records.push(parsed);
       } catch {
+        complete = false;
         findings.push({
           kind: "checkpoint_malformed",
           key: meta.key,
           message: `audit checkpoint ${meta.key} is malformed`,
         });
+        continue;
       }
+      const record = parsed as AuditCheckpointRecord;
+      // Bound checkpoint identity (re-gate NEW-2): the record's internal
+      // sequence MUST equal the sequence its storage key encodes. Nothing
+      // bound them before, so a byte-copy of a validly signed record planted
+      // at a deleted record's key parsed, verified, and satisfied a bare
+      // key-set existence check as a second copy, masking the deletion. With
+      // the binding, the plant is loud AND sterile: the mismatch is
+      // malformed (bound-identity variant, carrying BOTH sequences per
+      // DELTA-2 so an operator can tell a deliberate plant from generic
+      // corruption), the enumeration flips PARTIAL (no stamping, scoped
+      // indeterminate finding, strict fails closed), and no reference is
+      // satisfied.
+      if (keySeq === null || keySeq !== record.checkpoint_sequence) {
+        complete = false;
+        findings.push({
+          kind: "checkpoint_malformed",
+          variant: "bound-identity",
+          key: meta.key,
+          sequence: record.checkpoint_sequence,
+          expected: keySeq ?? "unparseable-key",
+          actual: record.checkpoint_sequence,
+          message:
+            `audit checkpoint ${meta.key} fails bound identity: its storage key encodes ` +
+            `sequence ${keySeq ?? "(unparseable)"} but the record claims ` +
+            `${record.checkpoint_sequence} (a planted or misfiled record, never a writer-produced state)`,
+        });
+        continue;
+      }
+      records.push(record);
     }
 
-    return records.sort(
-      (a, b) => a.checkpoint_sequence - b.checkpoint_sequence
-    );
+    return {
+      records: records.sort(
+        (a, b) => a.checkpoint_sequence - b.checkpoint_sequence
+      ),
+      complete,
+    };
   }
 
   private collectHashesSinceLastCheckpoint(): string[] {
@@ -5663,7 +7139,7 @@ export class AuditLog {
           root_hash: computeAuditRoot(hashes),
           previous_checkpoint_sequence: previousCheckpointSequence,
           signed_at: new Date().toISOString(),
-        });
+        }, signal);
         this.assertAuditWriteLockActive(signal);
         this.lastCheckpointSequence = checkpointSequence;
         this.hashesSinceCheckpoint = [];
@@ -5750,18 +7226,146 @@ export class AuditLog {
   }
 
   private async writeCheckpointRecord(
-    payload: AuditCheckpointSigningPayload
+    payload: AuditCheckpointSigningPayload,
+    // IC-05-DG: the held audit-write-lock signal, required for every signing
+    // control-record write (the LD6 chokepoint refuses to run without one).
+    // The legacy-anchor writer passes none and touches no control record —
+    // the floor logic is scoped to the "audit-checkpoint" kind because the
+    // legacy anchor's `checkpoint_sequence` counts the LEGACY entry space
+    // and would poison the chained-sequence floor.
+    signal?: AuditWriteLockAbortSignal
   ): Promise<void> {
-    let signed: AuditCheckpointSignature | null;
+    let signed: AuditCheckpointSignature | null = null;
+    let signerFailure: {
+      reasonClass: CheckpointSignerFailureReasonClass;
+      message: string;
+    } | null = null;
     try {
-      signed = (await this.checkpointSigner?.(payload)) ?? null;
-    } catch {
-      signed = null;
+      signed = (await this.checkpointSigner(payload)) ?? null;
+    } catch (err) {
+      // A signer that THROWS is a failure (unreadable identity material, a
+      // failed signing op), not an identity-less fortress. The plaintext
+      // `unsigned_reason` written below stays a diagnostic only — an at-rest
+      // failure CLAIM an attacker can rewrite into the honest-absence shape
+      // would be false assurance (the #1243 round-3 reason-spoof) — so the
+      // authenticated failure EVIDENCE goes into the signing head's incident
+      // ring instead (IC-05-DG binding constraint 1), and the load path
+      // raises `checkpoint_signing_error` from ring membership.
+      // SAFETY: raw stderr is the contract here: this diagnostic must reach
+      // the operator console even when the audit log itself is the failing
+      // component, so it cannot route through any audit-backed logger.
+      signerFailure =
+        err instanceof CheckpointSignerUnavailableError
+          ? { reasonClass: err.reasonClass, message: err.message }
+          : { reasonClass: "signing_failed", message: failureMessage(err) };
+      // SAFETY: raw stderr is the contract here (see the comment above): the
+      // diagnostic must reach the operator console even when the audit log
+      // itself is the failing component.
+      console.error(
+        `[audit-log] checkpoint ${payload.checkpoint_sequence} written UNSIGNED because the signer FAILED (not identity absence): ${signerFailure.message}`
+      );
     }
 
-    // Production checkpoints may be unsigned today when no signer is wired; that
-    // honest bound is serialized as `unsigned` instead of fabricating signer
-    // evidence or silently trusting a fallback key.
+    const controlWritesEnabled =
+      payload.checkpoint_kind === "audit-checkpoint" &&
+      signal !== undefined &&
+      this.signingDetectionMode === "fortress";
+    let armedThisWrite = false;
+
+    if (controlWritesEnabled && signerFailure) {
+      // Incident ordering (§d): the head's authenticated incident update is
+      // attempted BEFORE the unsigned checkpoint record itself is persisted;
+      // if the head write fails, the unsigned checkpoint (at/above the
+      // floor) reads as `checkpoint_signing_downgrade` on the next load —
+      // louder than the accurate classification, the monotone direction.
+      try {
+        const latchRead = await this.readSigningLatchV2();
+        // Head creation roster: the arm sequence, or the first signer
+        // incident of a NEVER-ARMED store (the day-one-corruption window —
+        // without it, a fortress whose identity rots before the first
+        // interval never arms and every checkpoint is honest-unsigned-shaped
+        // forever). Post-arm head absence is deletion evidence and is never
+        // silently re-created here.
+        const neverArmed =
+          latchRead.status === "absent" && !this.signingEvidenceSeen;
+        const result = await this.writeSigningControlRecord(signal, {
+          record: "head",
+          ensure: neverArmed,
+          addIncidents: [
+            {
+              sequence: payload.checkpoint_sequence,
+              reason_class: signerFailure.reasonClass,
+            },
+          ],
+        });
+        if (result === "written") this.signingEvidenceSeen = true;
+      } catch (err) {
+        this.notifySigningControlWriteFailure(
+          `signing-incident record for checkpoint ${payload.checkpoint_sequence} failed`,
+          err
+        );
+      }
+    }
+
+    if (controlWritesEnabled && signed) {
+      // The arm sequence (§d), steps 1-2 of head-ensure → arm → sign →
+      // tip+floor-commit, all inside the caller's single write-lock hold.
+      // The head is ensured FIRST precisely so "armed with no head" cannot
+      // be produced by an honest crash: post-arm, head-absence is always
+      // evidence of deletion or a loudly-diagnosed ensure failure.
+      try {
+        const latchRead = await this.readSigningLatchV2();
+        if (latchRead.status === "absent") {
+          if (!this.signingEvidenceSeen) {
+            await this.writeSigningControlRecord(signal, {
+              record: "head",
+              ensure: true,
+            });
+            const result = await this.writeSigningControlRecord(signal, {
+              record: "latch",
+              // v2 FORWARD commitment: "every audit-checkpoint at or above
+              // this sequence is signed" — written exactly once, immediately
+              // before the first signed checkpoint persists. Not the
+              // round-2/3 historical claim, whose referent had to survive
+              // (R2-c) and whose crash shapes were indistinguishable from
+              // deletion.
+              armed_at_sequence: payload.checkpoint_sequence,
+              signer_kid: signed.signer_kid,
+              armed_at: payload.signed_at,
+            });
+            armedThisWrite = result === "written";
+            this.signingEvidenceSeen = true;
+          } else {
+            // TOCTOU guard: this process has OBSERVED signing evidence, so a
+            // now-absent latch is an erasure, not a fresh fortress. Arming
+            // here would silently re-mint the control records at a rolled
+            // floor; the next LOAD's recovery pass owns this, strict-closed
+            // and latched.
+            // SAFETY: stderr diagnostic (operator-facing); the programmatic
+            // channel is the next load's strict-closed recovery pass.
+            console.error(
+              "[audit-log] signing latch is absent on a store with observed signing evidence; leaving recovery to the next load pass"
+            );
+          }
+        }
+      } catch (err) {
+        this.notifySigningControlWriteFailure(
+          "signing-latch arm sequence failed (the signed checkpoint is still written; re-arming retries on later writes and loads)",
+          err
+        );
+      }
+    }
+
+    // Production checkpoints are signed by the constructor-derived fortress
+    // identity binding (IC-05); a checkpoint may still be unsigned when the
+    // store provably holds no signable identity (fresh fortress before
+    // bootstrap, a store whose adapter cannot reach identity records). That
+    // honest bound is serialized as `unsigned` with the identity-absence
+    // reason, instead of fabricating signer evidence or silently trusting a
+    // fallback key. Both `unsigned_reason` strings are COSMETIC
+    // operator-facing prose with zero trust weight: no load-time decision
+    // consumes them (IC-05-DG binding constraint 1 — the authenticated
+    // evidence is the signing head's incident ring).
     const record: AuditCheckpointRecord = {
       schema_version: AUDIT_CHECKPOINT_SCHEMA_VERSION,
       ...payload,
@@ -5772,7 +7376,11 @@ export class AuditLog {
       unsigned: !signed,
       ...(signed?.public_key ? { public_key: signed.public_key } : {}),
       ...(!signed
-        ? { unsigned_reason: "no signing identity available at checkpoint time" }
+        ? {
+            unsigned_reason: signerFailure
+              ? AUDIT_UNSIGNED_REASON_SIGNER_ERROR
+              : AUDIT_UNSIGNED_REASON_NO_IDENTITY,
+          }
         : {}),
     };
     const key = `${payload.checkpoint_kind}-${String(payload.checkpoint_sequence).padStart(20, "0")}`;
@@ -5781,6 +7389,37 @@ export class AuditLog {
       key,
       stringToBytes(JSON.stringify(record))
     );
+
+    if (controlWritesEnabled && signed) {
+      // Sign-then-commit ordering (§d): the tip advances AFTER the
+      // checkpoint's persist, in the same lock hold — the rejected
+      // commit-tip-then-persist ordering would mint a permanent hard
+      // MISSING_TAIL finding from an honest crash between the two writes
+      // (a self-brick for strict readers). The cost is the honestly-named
+      // §g residual: a checkpoint deleted in the window before its tip
+      // commit is unwitnessed (one lock-held write pair wide in the healthy
+      // path; wider only while this advance keeps failing, which is loud
+      // below every interval). At arm time this same write commits the tip
+      // AND the floor together in ONE head write (step 4; DELTA-3: no
+      // interleaving may ever persist a committed tip over an uncommitted
+      // floor). A tip-advance failure never aborts the checkpoint write
+      // itself — same audit-record-preservation principle as the
+      // arming-write-failure rule.
+      try {
+        await this.writeSigningControlRecord(signal, {
+          record: "head",
+          tipCandidate: payload.checkpoint_sequence,
+          ...(armedThisWrite
+            ? { floorCandidate: payload.checkpoint_sequence }
+            : {}),
+        });
+      } catch (err) {
+        this.notifySigningControlWriteFailure(
+          `signing-head tip advance for checkpoint ${payload.checkpoint_sequence} failed`,
+          err
+        );
+      }
+    }
   }
 
   private async reportIntegrityFindingsIfAny(): Promise<void> {
@@ -6073,5 +7712,206 @@ function checkpointPayload(
     root_hash: checkpoint.root_hash,
     previous_checkpoint_sequence: checkpoint.previous_checkpoint_sequence,
     signed_at: checkpoint.signed_at,
+  };
+}
+
+// ── IC-05-DG module-scope helpers (pure; unit of state is SigningHeadData) ──
+
+function isSigningIncidentReasonClass(
+  value: unknown
+): value is CheckpointSignerFailureReasonClass {
+  return (SIGNING_INCIDENT_REASON_CLASSES as readonly string[]).includes(
+    value as string
+  );
+}
+
+function isSigningHeadMarkerKind(
+  value: unknown
+): value is SigningHeadLatchedMarker["marker_kind"] {
+  return (
+    value === "latch_recovered" ||
+    value === "head_recreated" ||
+    value === "downgrade_latched"
+  );
+}
+
+/** Strict shape parse of the signing head's `data` half. Returns null on any
+ * deviation — the caller reports "invalid" (tamper-shaped), never a partial
+ * acceptance: a field an attacker can malform must not survive into a
+ * detection decision half-parsed. */
+function parseSigningHeadData(value: unknown): SigningHeadData | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const v = value as Record<string, unknown>;
+  const nonNegativeInt = (x: unknown): x is number =>
+    typeof x === "number" && Number.isSafeInteger(x) && x >= 0;
+  const seqOrNull = (x: unknown): x is number | null =>
+    x === null || (typeof x === "number" && Number.isSafeInteger(x) && x > 0);
+  if (!nonNegativeInt(v.incident_count)) return null;
+  if (!seqOrNull(v.first_incident_sequence)) return null;
+  if (!seqOrNull(v.last_incident_sequence)) return null;
+  if (!seqOrNull(v.lowest_signed_checkpoint_sequence)) return null;
+  if (!nonNegativeInt(v.highest_signed_checkpoint_sequence)) return null;
+  if (!nonNegativeInt(v.latched_evicted_count)) return null;
+  if (typeof v.hard_downgrade_ever_latched !== "boolean") return null;
+  if (!Array.isArray(v.recent) || v.recent.length > SIGNING_HEAD_RECENT_RING_MAX) {
+    return null;
+  }
+  const recent: SigningHeadIncident[] = [];
+  for (const item of v.recent) {
+    const incident = item as Record<string, unknown>;
+    if (
+      !incident ||
+      typeof incident !== "object" ||
+      !nonNegativeInt(incident.sequence) ||
+      !isSigningIncidentReasonClass(incident.reason_class)
+    ) {
+      return null;
+    }
+    recent.push({
+      sequence: incident.sequence,
+      reason_class: incident.reason_class,
+    });
+  }
+  if (
+    !Array.isArray(v.latched) ||
+    v.latched.length > SIGNING_HEAD_LATCHED_RING_MAX
+  ) {
+    return null;
+  }
+  const latched: SigningHeadLatchedMarker[] = [];
+  for (const item of v.latched) {
+    const marker = item as Record<string, unknown>;
+    if (
+      !marker ||
+      typeof marker !== "object" ||
+      !isSigningHeadMarkerKind(marker.marker_kind) ||
+      typeof marker.detail !== "string" ||
+      marker.detail.length > SIGNING_HEAD_MARKER_DETAIL_MAX_CHARS
+    ) {
+      return null;
+    }
+    latched.push({ marker_kind: marker.marker_kind, detail: marker.detail });
+  }
+  return {
+    incident_count: v.incident_count,
+    first_incident_sequence: v.first_incident_sequence,
+    last_incident_sequence: v.last_incident_sequence,
+    recent,
+    highest_signed_checkpoint_sequence: v.highest_signed_checkpoint_sequence,
+    lowest_signed_checkpoint_sequence: v.lowest_signed_checkpoint_sequence,
+    latched,
+    latched_evicted_count: v.latched_evicted_count,
+    hard_downgrade_ever_latched: v.hard_downgrade_ever_latched,
+  };
+}
+
+/**
+ * The signing head's monotone merge rule (LD6): given the RE-READ current
+ * record and a writer's intent, every memory moves only in its safe
+ * direction, so even a logically stale writer landing last cannot regress
+ * detection:
+ *  - `incident_count` only grows (monotonic; exactness is diagnostic);
+ *  - the incident ring is a union truncated to the K newest by sequence;
+ *  - `highest_signed_checkpoint_sequence` is a MAX;
+ *  - `lowest_signed_checkpoint_sequence` is a MIN over NON-NULL values —
+ *    null is the not-yet-committed sentinel and never participates in the
+ *    MIN (re-gate NEW-1: a null must never read as "floor 0", and no code
+ *    path may RAISE a committed floor: raising it IS the attack, it
+ *    legalizes an erased prefix — lowering only widens the defended range);
+ *  - the `latched` ring is a union (dedup by kind+detail) truncated to K2,
+ *    with evictions collapsing into the monotonic summary count and the
+ *    sticky `hard_downgrade_ever_latched` flag computed over the FULL union
+ *    before truncation (DELTA-1: the hard grade is independent of the ring's
+ *    eviction policy, so the detail ring can evict freely).
+ */
+function mergeSigningHead(
+  base: SigningHeadData,
+  intent: {
+    addIncidents?: SigningHeadIncident[];
+    tipCandidate?: number;
+    floorCandidate?: number | null;
+    addMarkers?: SigningHeadLatchedMarker[];
+  }
+): SigningHeadData {
+  const addIncidents = intent.addIncidents ?? [];
+  const incidentUnion = [...base.recent];
+  for (const incident of addIncidents) {
+    if (
+      !incidentUnion.some(
+        (existing) =>
+          existing.sequence === incident.sequence &&
+          existing.reason_class === incident.reason_class
+      )
+    ) {
+      incidentUnion.push(incident);
+    }
+  }
+  incidentUnion.sort((a, b) => a.sequence - b.sequence);
+  const recent = incidentUnion.slice(-SIGNING_HEAD_RECENT_RING_MAX);
+
+  const incidentSequences = [
+    base.first_incident_sequence,
+    base.last_incident_sequence,
+    ...addIncidents.map((incident) => incident.sequence),
+  ].filter((sequence): sequence is number => sequence !== null);
+
+  const addMarkers = (intent.addMarkers ?? []).map((marker) => ({
+    marker_kind: marker.marker_kind,
+    // Clamp BEFORE dedup/merge: the detail string is writer-composed but may
+    // embed attacker-influenced sequences/messages, and the byte-ceiling
+    // derivation (rule 8) is sound only if no element can exceed its bound.
+    detail: marker.detail.slice(0, SIGNING_HEAD_MARKER_DETAIL_MAX_CHARS),
+  }));
+  const markerUnion = [...base.latched];
+  for (const marker of addMarkers) {
+    if (
+      !markerUnion.some(
+        (existing) =>
+          existing.marker_kind === marker.marker_kind &&
+          existing.detail === marker.detail
+      )
+    ) {
+      markerUnion.push(marker);
+    }
+  }
+  const hardEver =
+    base.hard_downgrade_ever_latched ||
+    markerUnion.some((marker) => marker.marker_kind === "downgrade_latched");
+  const evicted = Math.max(0, markerUnion.length - SIGNING_HEAD_LATCHED_RING_MAX);
+  const latched = markerUnion.slice(evicted);
+
+  const nonNullFloors = [
+    base.lowest_signed_checkpoint_sequence,
+    intent.floorCandidate ?? null,
+  ].filter((sequence): sequence is number => sequence !== null);
+  let lowest = nonNullFloors.length > 0 ? Math.min(...nonNullFloors) : null;
+  const highest = Math.max(
+    base.highest_signed_checkpoint_sequence,
+    intent.tipCandidate ?? 0
+  );
+  if (highest > 0 && lowest === null && intent.tipCandidate !== undefined) {
+    // DELTA-3 enforcement site: the tip and floor commit TOGETHER — a head
+    // must never persist with a committed tip and an uncommitted floor
+    // (readSigningHead treats that shape as TAMPERED). A tip candidate is a
+    // sequence the writer itself just durably persisted as a signed
+    // checkpoint, so it is a legitimate floor witness; committing it high is
+    // the SAFE direction (E < lowest_signed is the benign arm-crash shape,
+    // healed downward by the next clean load — lowering only widens the
+    // defended range, and no path ever raises a committed floor).
+    lowest = intent.tipCandidate;
+  }
+
+  return {
+    incident_count: base.incident_count + addIncidents.length,
+    first_incident_sequence:
+      incidentSequences.length > 0 ? Math.min(...incidentSequences) : null,
+    last_incident_sequence:
+      incidentSequences.length > 0 ? Math.max(...incidentSequences) : null,
+    recent,
+    highest_signed_checkpoint_sequence: highest,
+    lowest_signed_checkpoint_sequence: lowest,
+    latched,
+    latched_evicted_count: base.latched_evicted_count + evicted,
+    hard_downgrade_ever_latched: hardEver,
   };
 }

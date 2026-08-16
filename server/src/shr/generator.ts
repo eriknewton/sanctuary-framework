@@ -26,6 +26,19 @@ import type { SovereigntyTier } from "../reputation/tiers.js";
 const DEFAULT_VALIDITY_MS = 60 * 60 * 1000;
 
 /**
+ * SHR-FRESH-01 (rule-7, semantic freshness): the signer chooses
+ * `validity_minutes` and it is baked directly into the signed `expires_at`.
+ * An unbounded value lets a hostile or careless signer mint a report that
+ * stays verifier-valid for years after the posture it describes has
+ * changed. This ceiling caps how long a freshly-generated SHR can ever
+ * advertise itself as good for, independent of what the caller asks for.
+ * 24h = long enough to cover a normal operating day/session without daily
+ * re-generation, short enough that a stale posture claim cannot ride on a
+ * signature indefinitely.
+ */
+export const SHR_MAX_LIFETIME_MS = 24 * 60 * 60 * 1000;
+
+/**
  * Default freshness window for the STALE_REPUTATION degradation.
  * If the most recent attestation is older than this, L4 is flagged stale.
  */
@@ -137,8 +150,17 @@ export function deriveReputationDegradations(
         code: "LOW_TIER_DOMINANCE",
         severity: "info",
         description: `${pct}% of attestations are self-attested or unverified`,
+        // A11 honest-bound correction (register §Z RECHECK): a sovereignty
+        // handshake does NOT raise the tier of attestations THIS instance
+        // records. reputation_record and bridge_attest cap the signer's own
+        // tier at self-attested (REP-01), and the storage-level clamp
+        // (trustedSovereigntyTier) enforces the same cap for every stored
+        // attestation regardless of caller — verified-sovereign and
+        // verified-degraded are not reachable through those two tools. The
+        // old mitigation text promised the opposite; keep this one accurate
+        // rather than softened.
         mitigation:
-          "Complete sovereignty handshakes with counterparties to upgrade future attestations to verified tiers",
+          "Self-attested and unverified are the tiers reachable through reputation_record and bridge_attest",
       });
     }
 
@@ -220,7 +242,15 @@ export function generateSHR(
   }
 
   const now = nowOverride ?? new Date();
-  const expiresAt = new Date(now.getTime() + (validityMs ?? DEFAULT_VALIDITY_MS));
+  // INVARIANT: clamp the requested lifetime to SHR_MAX_LIFETIME_MS before it
+  // is baked into the signed expires_at. Clamping (not erroring) lets a
+  // caller ask for "as long as possible" without a hard failure, while a
+  // signed SHR can never advertise a lifetime beyond the ceiling — the
+  // verify-side checks below are the second, independent enforcement of the
+  // same bound for reports this instance did NOT generate.
+  const requestedValidityMs = validityMs ?? DEFAULT_VALIDITY_MS;
+  const effectiveValidityMs = Math.min(requestedValidityMs, SHR_MAX_LIFETIME_MS);
+  const expiresAt = new Date(now.getTime() + effectiveValidityMs);
 
   // Assess degradations
   const degradations: SHRDegradation[] = [];

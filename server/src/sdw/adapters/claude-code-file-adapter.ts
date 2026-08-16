@@ -177,10 +177,12 @@ export async function ingestClaudeCodeMemoryDirectory(
  *
  * Two properties this function must keep, both learned from real large memory
  * directories in which the secret classifier refused files. Concrete
- * measurement, 2026-08-07: readClaudeCodeMemoryDirectory plus
+ * measurement, 2026-08-12: readClaudeCodeMemoryDirectory plus
  * SdwMemoryBackendAdapter.screenPassage over a real Claude Code memory
- * directory refused 147 of 414 markdown files (35.5%); MEMORY.md itself was
- * among the refused files. The measurement collected counts only.
+ * directory refused 36 of 438 markdown files (8.2%) on the pre-fix gate. Of
+ * those, 26 contained only protected-concept names; the shape-based gate
+ * refuses 10 of 438 (2.3%), all through token/entropy checks, and accepts
+ * MEMORY.md. The measurement collected counts and detector classes only.
  *
  *  - A refused file is a REPORTED SKIP, never a whole-run abort. It is also
  *    never an exemption: the same gate still runs on everything written, and
@@ -231,12 +233,31 @@ export async function ingestClaudeCodeMemorySnapshot(
   };
 }
 
+/**
+ * Page through the whole owner scope via the `after` cursor. listPassages
+ * caps decrypt work to a bounded per-call scan (LD4 SDW-SEARCH-DOS-01); an
+ * export must see the WHOLE vault, so it pages explicitly instead of relying
+ * on one call to return everything, which would silently under-export a
+ * vault larger than the per-call cap.
+ */
+async function listAllPassages(adapter: MemoryBackendAdapter): Promise<readonly MemoryPassage[]> {
+  const all: MemoryPassage[] = [];
+  let after: string | undefined;
+  for (;;) {
+    const page = await adapter.listPassages({ after });
+    if (page.length === 0) break;
+    all.push(...page);
+    after = page[page.length - 1]?.passage_id;
+  }
+  return all;
+}
+
 export async function emitClaudeCodeMemoryDirectory(
   adapter: MemoryBackendAdapter,
   outputDir: string,
 ): Promise<EmitClaudeCodeMemoryResult> {
   const rootDir = resolve(outputDir);
-  const passages = (await adapter.listPassages())
+  const passages = (await listAllPassages(adapter))
     .filter(isClaudeCodeMemoryPassage)
     .sort(compareClaudeCodePassagesForEmit);
 

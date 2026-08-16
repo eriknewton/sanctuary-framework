@@ -16,6 +16,9 @@ EXT_DIRNAME="${EXT_BUNDLE_ID}.systemextension"
 EXT_BUNDLE="${WRAPPED_APP_DIR}/Contents/Library/SystemExtensions/${EXT_DIRNAME}"
 EXT_EXEC="${EXT_BUNDLE}/Contents/MacOS/CastleWallExtension"
 EXT_INFO="${EXT_BUNDLE}/Contents/Info.plist"
+BOOT_RUNTIME_DIR="${WRAPPED_APP_DIR}/Contents/Resources/boot-runtime"
+BOOT_RUNTIME_NODE="${BOOT_RUNTIME_DIR}/node"
+BOOT_RUNTIME_DAEMON="${BOOT_RUNTIME_DIR}/castle-wall-boot-daemon.js"
 
 log() {
     echo "[test-wrap-structure] $*"
@@ -56,9 +59,22 @@ assert_exists "${EXT_BUNDLE}"
 assert_exists "${EXT_EXEC}"
 assert_exists "${EXT_INFO}"
 
+if [ "${SANCTUARY_REQUIRE_BOOT_RUNTIME:-0}" = "1" ]; then
+    log "checking sealed boot-runtime layout"
+    assert_exists "${BOOT_RUNTIME_NODE}"
+    assert_exists "${BOOT_RUNTIME_DAEMON}"
+    [ -x "${BOOT_RUNTIME_NODE}" ] || fail "boot-runtime node is not executable: ${BOOT_RUNTIME_NODE}"
+    [ -s "${BOOT_RUNTIME_DAEMON}" ] || fail "boot-runtime daemon is empty: ${BOOT_RUNTIME_DAEMON}"
+    [ "$(stat -f '%Lp' "${BOOT_RUNTIME_NODE}")" = "555" ] || fail "boot-runtime node mode is not 0555"
+    [ "$(stat -f '%Lp' "${BOOT_RUNTIME_DAEMON}")" = "444" ] || fail "boot-runtime daemon mode is not 0444"
+fi
+
 log "checking Mach-O binaries"
 assert_macho "${HOST_EXEC}"
 assert_macho "${EXT_EXEC}"
+if [ "${SANCTUARY_REQUIRE_BOOT_RUNTIME:-0}" = "1" ]; then
+    assert_macho "${BOOT_RUNTIME_NODE}"
+fi
 
 log "checking plist validity"
 assert_plist "${HOST_INFO}"

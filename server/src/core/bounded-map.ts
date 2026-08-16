@@ -1,0 +1,882 @@
+/**
+ * Sanctuary MCP Server — Bounded Map
+ *
+ * CLASS-LEVEL CHOKEPOINT (AGENTS.md rule 8 / register LD2-03, LD2-04):
+ * "an attacker-writable collection with no cap, no eviction, and O(all)
+ * listing work" recurred across three separate in-memory maps (handshake
+ * sessions, handshake results, federation peers) after the same class was
+ * already closed once in the honeypot activation buffer (#1190). This
+ * primitive makes cap + eviction + bounded listing STRUCTURAL for any new
+ * caller, rather than a convention each site has to remember to reinvent.
+ *
+ * Deliberately a thin wrapper, not a policy framework: it owns capacity
+ * ENFORCEMENT only. The eviction DECISION is always supplied by the caller,
+ * because the three sites this closes have genuinely different correct
+ * semantics (prefer-evict-unverified-then-expired for handshake results,
+ * refuse-on-all-active for federation peers, TTL/terminal-state sweep for
+ * sessions) — hard-coding one policy here would silently mismatch two of
+ * the three.
+ *
+ * PER-ORIGIN QUOTA (AGENTS.md rule 8, RECHECK — a GLOBAL-only cap let one
+ * flooding caller consume the whole cap and evict/lock out every other
+ * caller; a HIGH gate finding on the first cut of this primitive). When a
+ * caller supplies `origin` to `set()` and `maxPerOrigin` in the options, a
+ * NEW key whose origin already holds `maxPerOrigin` entries is REFUSED —
+ * never evicted, and never by evicting a DIFFERENT origin's entry to make
+ * room. This is deliberately a REFUSE-only rule, not "evict this origin's
+ * own oldest entry": the class this map protects (handshake sessions,
+ * handshake results, federation peers) treats "a live entry was evicted"
+ * as a trust event with its own audited meaning (a verified peer's trust
+ * state disappearing), and that meaning must not depend on WHOSE flood
+ * caused the pressure. Refusing keeps every existing entry — this origin's
+ * and every other origin's — untouched, so the eviction-safety guarantee
+ * `selectEviction` already provides (never evict a verified/active entry)
+ * is never bypassed by routing pressure through the per-origin path
+ * instead of the global one. `selectEviction` is consulted only when the
+ * map is at the GLOBAL cap and the incoming origin is still within its own
+ * quota — i.e., the pressure comes from OTHER origins collectively, not
+ * from this insert.
+ */
+
+import {
+  AUDIT_WRITE_LOCK_TIMEOUT_MS,
+  DEFAULT_AUDIT_WRITE_LOCK_HOLD_DEADLINE_MS,
+} from "../operational/audit-log.js";
+
+/**
+ * The caller's answer to "a new key needs room; what do I do?" — either name
+ * an existing key to evict (making room for the incoming entry), or refuse
+ * the incoming insert outright and leave every existing entry untouched.
+ * `selectEviction` is the ONLY place this decision is made, so the trust
+ * semantics for a given map live in one function a reviewer can read next to
+ * the map's construction, not scattered across every call site that
+ * happens to insert into it.
+ */
+export type EvictionDecision<K> = { evict: K } | { refuse: true };
+
+/** Why a `set()` call was refused — origin-quota refusals never touch a
+ * different origin's entries or the global eviction policy; capacity
+ * refusals ran the caller-supplied `selectEviction` and it declined to
+ * name a victim (including a victim that no longer qualifies once
+ * re-checked after an audit await — see the trust-property re-validation
+ * in `set()`); audit-unavailable refusals mean eviction was DECIDED but
+ * the durable audit write for it did not complete (rejected or timed
+ * out). Distinguishing all three lets an audit consumer tell "this one
+ * caller is flooding" apart from "the whole collection is genuinely
+ * saturated with entries nothing may evict" apart from "the audit trail
+ * itself is unavailable right now" (MUST-FIX 3, fix-round-3) — the third
+ * case is an availability problem with the AUDIT LOG, not with the
+ * collection's capacity, and conflating it with "capacity" hides that
+ * distinction from an operator trying to diagnose which one is true.
+ * `admission_busy` (fix-round-6, MUST-FIX 1) is a FOURTH, distinct
+ * reason: this call never even reached the origin-quota/capacity/audit
+ * checks above, because `MAX_PENDING_ADMISSION_WAITERS` other callers were
+ * already queued for this map's admission lock — a "the collection's
+ * SERIALIZATION PRIMITIVE is momentarily saturated, retry shortly" signal,
+ * not a statement about the collection's own contents at all. */
+export type BoundedMapRefuseReason =
+  | "origin_quota"
+  | "capacity"
+  | "audit_unavailable"
+  | "admission_busy";
+
+/**
+ * `set()`'s result (MUST-FIX 3, fix-round-3 — replaces a plain boolean).
+ * A caller that needs to distinguish "this identity is flooding" from
+ * "the store is genuinely saturated" from "the audit trail is
+ * unavailable" reads `reason` directly off its OWN call's result, rather
+ * than relying on a shared `onRefuse` callback and a variable read after
+ * the fact — the latter would race against a QUEUED next admission for
+ * the same map (`admissionQueue`) starting before this call's continuation
+ * gets to read a shared variable. `onRefuse` still fires (synchronously,
+ * inside the same admission) for callers that want a callback-shaped
+ * side effect at the exact point of refusal; the two mechanisms are
+ * independent and a caller may use either, both, or neither.
+ *
+ * An `admission_busy` refusal additionally carries `busyAudit`
+ * (fix-round-7): the per-episode coalescing decision for the AUDIT append
+ * only — see `AdmissionBusyAuditDecision`. It is REQUIRED on that arm (a
+ * discriminated union, not an optional field) so a consumer's audit gate
+ * cannot silently read `undefined` and pick a default; the refusal result
+ * itself is still returned on every busy call.
+ */
+export type BoundedMapSetResult =
+  | { ok: true }
+  | { ok: false; reason: Exclude<BoundedMapRefuseReason, "admission_busy"> }
+  | {
+      ok: false;
+      reason: "admission_busy";
+      busyAudit: AdmissionBusyAuditDecision;
+    };
+
+/**
+ * Bounds the await on a caller-supplied `onEvict` critical-audit write
+ * (MUST-FIX 3, fix-round-3 — Opus availability note): `onEvict` runs
+ * inside the per-map admission lock (see `admissionQueue`), so a HANGING
+ * audit write would otherwise stall every later `set()` call for this map
+ * indefinitely, turning an audit-log availability problem into a total
+ * admission stall for the whole collection.
+ *
+ * CROSS-FILE PIN, CORRECTED (fix-round-4, F1 — the prior value derived
+ * from the WRONG audit-log bound): must match `AUDIT_WRITE_LOCK_TIMEOUT_MS`
+ * and `DEFAULT_AUDIT_WRITE_LOCK_HOLD_DEADLINE_MS` in
+ * operational/audit-log.ts. A caller's `onEvict` is, in every production
+ * call site, a single `auditLog.appendCritical(...)` call (plus
+ * negligible synchronous bookkeeping) — and `appendCritical`'s own
+ * worst-case settle time is bounded by audit-log.ts's TWO-PHASE timeout:
+ * lock ACQUISITION rejects at `AUDIT_WRITE_LOCK_TIMEOUT_MS` (5s,
+ * `AuditLockContentionError`) if it never acquires, and once acquired the
+ * write OPERATION itself is raced against
+ * `DEFAULT_AUDIT_WRITE_LOCK_HOLD_DEADLINE_MS` (30s,
+ * `AuditLockHoldDeadlineError`) — so `appendCritical` is GUARANTEED to
+ * settle, one way or the other, within the SUM of the two (audit-log.ts's
+ * own `Promise.race` against a deadline timer, not merely a convention).
+ *
+ * The PRIOR value here (10_000, "2x AUDIT_WRITE_LOCK_TIMEOUT_MS") mistook
+ * the 5s ACQUISITION-only bound for the whole write's bound. A
+ * slow-but-successful `appendCritical` — its OWN I/O taking 10-30s, not
+ * blocked behind lock contention — legitimately crosses that old 10s
+ * timeout while still succeeding: `withTimeout` below rejects at 10s
+ * (refusing the admission, `audit_unavailable`, correctly leaving the
+ * victim intact), but the underlying `onEvict` PROMISE keeps running
+ * detached — nothing cancels it — and when it later resolves, its
+ * post-audit continuation runs with no caller left listening. See each
+ * onEvict call site (handshake/tools.ts's `handshakeResults`,
+ * federation/registry.ts) for why a detached continuation acting on
+ * sibling state after the eviction it describes was actually REFUSED is
+ * the defect this constant's correctness prevents, and
+ * `BoundedMapOptions.onEvicted`'s doc for the second, structural half of
+ * the fix (sibling-state side effects no longer live in `onEvict` at all).
+ *
+ * Set STRICTLY ABOVE the sum, with margin, so this timeout can never
+ * legitimately race audit-log.ts's own settle guarantee — i.e., ANY
+ * `appendCritical` call that ever resolves under audit-log.ts's documented
+ * contract is provably observed by `withTimeout` below BEFORE this timer
+ * could fire, making the "resolves after the caller already gave up"
+ * window unreachable for a conforming audit-log implementation (not an
+ * absolute guarantee against a future change to that contract — the
+ * accepted-residual paragraph below is the record of that bound).
+ *
+ * ACCEPTED RESIDUAL, RECORDED HONESTLY (fix-round-6): if a caller-supplied
+ * `onEvict` DOES take longer than this timeout to settle (a non-conforming
+ * or future audit-log implementation, or a caller who supplies something
+ * other than `appendCritical`), the detached continuation described above
+ * can still land after `set()` already refused — a real, bounded, SINGLE
+ * detached write, never unbounded growth, and never claimed to be
+ * impossible or byte-identical to a normal completion. This is the SAME
+ * no-cancellation trade-off `sentinel/sentinel-finding-store.ts`'s own
+ * `STORE_ADMISSION_DEADLINE_MS` accepts for its raw storage calls (which
+ * carry no settle-time contract at all, unlike `appendCritical` here) —
+ * see that constant's doc for the fuller accepted-residual statement.
+ * This paragraph IS the accepted-residual record: the trade-off is
+ * deliberate, not an oversight. Adding cancellation or a
+ * compare-and-swap primitive to close this one write is disproportionate
+ * to how narrow the residual is (AGENTS.md's minimalism principle).
+ */
+// EXPORTED for tests only (test/core/bounded-map.test.ts pins fake-timer
+// advances to this exact value rather than a hand-copied duplicate, so the
+// test cannot silently drift from the real derivation above).
+export const ON_EVICT_AUDIT_TIMEOUT_MS =
+  AUDIT_WRITE_LOCK_TIMEOUT_MS + DEFAULT_AUDIT_WRITE_LOCK_HOLD_DEADLINE_MS + 5_000;
+
+/**
+ * Cap on the ADMISSION-WAITER QUEUE itself (AGENTS.md rule 8, fix-round-6 —
+ * applying the "state that grows from untrusted input needs a cap" rule to
+ * the serialization primitive's OWN state, not just the collection it
+ * protects). `admissionQueue` (below) serializes every new-key admission for
+ * a map instance into a single promise chain; before this fix, the number of
+ * callers simultaneously QUEUED behind that chain had no bound at all — a
+ * burst of concurrent Tier-3 tool calls (each minting a new attacker-facing
+ * key: a fresh handshake preview, a fresh federation registration) could
+ * pile an unbounded number of pending continuations onto the chain while the
+ * head of the queue was slow (a legitimate multi-second `onEvict` audit
+ * write). Each queued continuation is a live closure holding its own `key`/
+ * `value`/`origin`, so the queue is itself attacker-influenceable memory,
+ * exactly the class rule 8 exists to bound.
+ *
+ * CROSS-FILE PIN: `sentinel/sentinel-finding-store.ts` imports this SAME
+ * constant for its own store-level admission queue rather than re-deriving
+ * a second number for the identical class of state (a queued
+ * `saveFinding` continuation waiting on that store's own
+ * `runAdmissionExclusive`) — see that file's `admissionQueue` doc.
+ *
+ * DERIVATION: 64 = a generous multiple of the highest concurrency this
+ * codebase's own adversarial regression suite drives against a single
+ * map/store instance today (20 simultaneous new-record admissions, in
+ * sentinel-finding-store.ts's cross-ID admission TOCTOU test) — production
+ * concurrency for ONE instance is expected to stay near that order even
+ * under a scripted flood, since concurrent NEW-key admissions arise only
+ * from genuinely distinct concurrent Tier-3 tool invocations across agent
+ * sessions (a single session's own router-dispatched calls run
+ * sequentially, never in parallel against the same map). 64 sits well
+ * above the highest concurrency this suite exercises today while staying
+ * small enough that the waiter queue itself can never become a meaningful
+ * memory concern — a caller past the cap is refused immediately (fail
+ * closed, reason `admission_busy`) rather than ever joining the queue.
+ */
+export const MAX_PENDING_ADMISSION_WAITERS = 64;
+
+/**
+ * The coalesced busy-AUDIT decision attached to every `admission_busy`
+ * refusal (fix-round-7 — see {@link AdmissionBusyAuditCoalescer}). This
+ * governs ONLY how often the operator-facing audit append fires; the
+ * agent-facing refusal itself (the `set()` result, the `onRefuse`
+ * callback, a store's typed throw) still happens on every single call,
+ * uncoalesced.
+ */
+export interface AdmissionBusyAuditDecision {
+  /** True only for the FIRST busy refusal of a saturation episode — the
+   * one refusal whose audit append should actually be emitted. */
+  emit: boolean;
+  /** How many busy refusals had their audit append suppressed since the
+   * LAST emitted busy audit (i.e., the volume the previous emitted record
+   * did not individually log). Consumers include this in the emitted
+   * audit's details so the trail still reflects flood volume honestly,
+   * one record per episode instead of one per refusal. */
+  suppressedSinceLastAudit: number;
+}
+
+/**
+ * Coalesces the `admission_busy` AUDIT telemetry to at most one append per
+ * SATURATION EPISODE per map/store instance (fix-round-7). The busy
+ * refusal is the at-cap FAST path — it is designed to absorb a hammering
+ * flood (that is the point of refusing instead of queuing), so a
+ * per-refusal `auditLog.append` on it would let a refusal flood shift
+ * attacker-driven backlog from the (capped) admission-waiter queue into
+ * the audit log's own uncapped in-process append queue: the same
+ * rule-8 unbounded-state class, one layer down.
+ *
+ * EPISODE DEFINITION: an episode starts when the waiter count first
+ * reaches the cap and ends when it drops back below it. Because busy
+ * refusals only ever happen AT the cap, "first busy refusal observed
+ * while no episode is active" marks the start; and because the counter
+ * can never exceed the cap (the increment is guarded by the same
+ * synchronous check), EVERY admission settlement drops the count strictly
+ * below the cap, so `onBelowCap()` is called unconditionally from each
+ * settlement's `finally`. The first refusal of an episode audits (carrying
+ * the count suppressed since the previous emitted audit); later refusals
+ * in the same episode do not.
+ *
+ * ONE shared implementation for every busy-audit site — `BoundedMap`
+ * embeds one per instance below (surfaced to consumers through the
+ * `set()` result and the `onRefuse` callback), and
+ * `sentinel/sentinel-finding-store.ts` instantiates its own for its
+ * store-level admission queue — never four hand-mirrored copies.
+ */
+export class AdmissionBusyAuditCoalescer {
+  /** True from the first busy refusal of an episode until the waiter
+   * count next drops below the cap (`onBelowCap`). */
+  private episodeActive = false;
+  /** Busy refusals whose audit was suppressed since the last EMITTED
+   * busy audit — spans episodes, resets only when an audit is emitted. */
+  private suppressed = 0;
+
+  /** Record one busy refusal and decide whether ITS audit append emits.
+   * Synchronous and called only from the (synchronous, pre-first-await)
+   * at-cap refusal branch, so it needs no lock — same run-to-completion
+   * argument as the waiter counter itself. */
+  onBusyRefusal(): AdmissionBusyAuditDecision {
+    if (this.episodeActive) {
+      this.suppressed += 1;
+      return { emit: false, suppressedSinceLastAudit: this.suppressed };
+    }
+    this.episodeActive = true;
+    const suppressedSinceLastAudit = this.suppressed;
+    this.suppressed = 0;
+    return { emit: true, suppressedSinceLastAudit };
+  }
+
+  /** The waiter count just dropped below the cap (any admission
+   * settlement — see the class doc): the current episode, if one was
+   * active, ends here. Idempotent. */
+  onBelowCap(): void {
+    this.episodeActive = false;
+  }
+}
+
+/**
+ * Race `promise` against a timer that rejects after `ms`. Used ONLY to
+ * bound the `onEvict` critical-audit await (see
+ * `ON_EVICT_AUDIT_TIMEOUT_MS`'s doc) — a timeout is reported to the
+ * caller identically to an explicit audit rejection (both land in the
+ * same `catch` in `admitNewKey` and refuse with reason
+ * `audit_unavailable`), since from the eviction's perspective "the audit
+ * never confirmed" is the same fail-closed condition either way.
+ */
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`bounded-map: onEvict audit did not settle within ${ms}ms`));
+    }, ms);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err instanceof Error ? err : new Error(String(err)));
+      }
+    );
+  });
+}
+
+export interface BoundedMapOptions<K, V> {
+  /**
+   * Hard cap on entry count. Each call site names and derives its own
+   * constant (the right number depends on what is being capped); this
+   * primitive only enforces whatever value it is given.
+   */
+  maxSize: number;
+  /**
+   * Called ONLY when a `set()` for a key NOT already present would exceed
+   * `maxSize` (an update to an existing key never grows the map, so it never
+   * reaches this callback — replacing a value in place cannot be a growth
+   * vector for an attacker-writable collection), AND the incoming entry's
+   * own origin (if any) is still within its per-origin quota (see the
+   * module doc above — an over-quota origin is refused before this ever
+   * runs, so `selectEviction` never has to reason about origin fairness).
+   */
+  selectEviction: (
+    entries: ReadonlyMap<K, V>,
+    incomingKey: K,
+    incomingValue: V,
+  ) => EvictionDecision<K>;
+  /**
+   * Fired once a GLOBAL-capacity eviction decision has been made, AWAITED
+   * and BEFORE the entry is removed from the map (see `set()`). RECHECK
+   * (MUST-FIX 6, fix-round-2): the three maps this primitive protects
+   * (handshake sessions, handshake results, federation peers) evict a
+   * TRUST-BEARING entry — a verified peer's trust state disappearing is a
+   * critical state change, not low-risk telemetry, so `onEvict` MUST call
+   * `auditLog.appendCritical(...)` (durable, round-trip-verified) and
+   * return the awaited promise, not `void auditLog.append(...)`
+   * fire-and-forget. If the returned promise REJECTS (e.g. an
+   * integrity-locked audit chain), `set()` ABORTS the whole eviction: the
+   * evicted entry is never deleted and the incoming insert is refused,
+   * exactly as if `selectEviction` had itself returned `{ refuse: true }`.
+   * "Audit before delete" alone (the fix-round-1 shape) only fixes
+   * ORDERING; it does not stop a crash or a rejected write from producing
+   * "the entry is gone, no durable record" — only awaiting AND aborting on
+   * failure closes that. A map whose evicted entries are not trust-bearing
+   * (e.g. the honeypot coalescing tracker) may omit `onEvict` entirely, or
+   * supply a fire-and-forget non-critical callback — this contract only
+   * binds a caller that DOES supply one.
+   *
+   * INTENT, NEVER COMPLETION (MUST-FIX 2, fix-round-5 — F1's second
+   * residual, closed structurally): `appendCritical` serializes behind
+   * audit-log.ts's own in-process append queue, so this call's TOTAL
+   * settle time is (drain of every write already queued ahead of it) +
+   * its own bound — `ON_EVICT_AUDIT_TIMEOUT_MS` bounds how long `set()`
+   * WAITS for it, not how long the underlying write can actually take to
+   * land durably. Under audit-queue contention a write can resolve
+   * successfully AFTER `set()` has already timed out and refused the
+   * eviction (see `withTimeout`'s doc) — so if this callback's audit entry
+   * claims the domain event `"<thing>_evicted"` / `result: "success"`,
+   * that record can durably describe an eviction that never happened (the
+   * victim is still in the map). A caller's `onEvict` audit write MUST
+   * therefore record INTENT (e.g. `"<thing>_eviction_intent"`) — "an
+   * eviction was decided and this write happened before any delete", never
+   * a claim that the deletion itself completed. The COMPLETION record
+   * (the operation name any existing dashboard/consumer already queries
+   * for) belongs in `onEvicted` below, which fires only from this map's
+   * own authoritative post-delete path and therefore can never be wrong.
+   * See `handshake/tools.ts`'s `sessions`/`handshakeResults` and
+   * `federation/registry.ts`'s `peers` for the shape.
+   */
+  onEvict?: (evictedKey: K, evictedValue: V) => void | Promise<void>;
+  /**
+   * AUTHORITATIVE post-eviction hook (fix-round-4, MUST-FIX 1 / F1 — closes
+   * the detached-continuation defect `onEvict` alone cannot close). Fired
+   * SYNCHRONOUSLY, exactly once, IMMEDIATELY after this map has itself
+   * deleted `evictedKey` from `this.map` (and `this.origins`, if it held an
+   * origin) — never before, never speculatively, and never for an eviction
+   * that was refused (audit rejection, audit timeout, or a post-await
+   * reference mismatch — see `admitNewKey`'s doc). No `await` separates the
+   * delete from this call, so there is no window in which anything else can
+   * run in between: by the time this fires, the deletion is an already-done
+   * fact, not a decision still in flight.
+   *
+   * WHY THIS EXISTS, DISTINCT FROM `onEvict`: `onEvict` is awaited and
+   * TIMEOUT-BOUNDED (`ON_EVICT_AUDIT_TIMEOUT_MS`) for durability reasons —
+   * the audit write must happen BEFORE the delete, so a crash or a
+   * rejected write can abort the eviction instead of losing state
+   * silently. But bounding an await with a timeout cannot CANCEL the
+   * underlying promise: if `onEvict` is still running when
+   * `ON_EVICT_AUDIT_TIMEOUT_MS` elapses, `set()` refuses the admission
+   * (correctly leaving the victim intact) while `onEvict`'s own promise
+   * keeps executing DETACHED — nothing is listening to it anymore. A
+   * caller whose `onEvict` does anything beyond the audit write itself
+   * (e.g. cleaning up a SIBLING collection keyed by the same id — see
+   * handshake/tools.ts's `handshakeResultWriterOrigins`) would have that
+   * cleanup run from the detached continuation once the slow write finally
+   * settles, mutating sibling state for an eviction that, from this map's
+   * own authoritative perspective, never happened. `onEvicted` cannot be
+   * reached by a detached continuation because it is never awaited FROM
+   * inside `onEvict` at all — it is called by `admitNewKey` itself, after
+   * `admitNewKey`'s own (successfully awaited, non-timed-out) delete. A
+   * caller with a sibling collection to keep in sync MUST put that cleanup
+   * here, never inside `onEvict`. `onEvicted` must be cheap and
+   * synchronous (in-memory bookkeeping only, no I/O, no `await`) — it is
+   * not awaited or timeout-bounded, and a caller needing a DURABLE side
+   * effect from an eviction should do that inside `onEvict` (before the
+   * delete) instead, accepting that shape's own await/timeout contract.
+   *
+   * COMPLETION AUDIT LIVES HERE TOO (MUST-FIX 2, fix-round-5 — see
+   * `onEvict`'s "INTENT, NEVER COMPLETION" note above for the defect this
+   * closes): a caller whose `onEvict` durably records eviction INTENT
+   * should fire a best-effort, NON-critical, fire-and-forget
+   * `auditLog.append(...)` from here for the completion record (e.g.
+   * `"<thing>_evicted"`). This is safe to do un-awaited specifically
+   * because, by construction, the event it describes has ALREADY happened
+   * by the time `onEvicted` runs — losing or delaying this specific write
+   * (audit-queue contention, a crash before it flushes) only loses a
+   * telemetry record of a TRUE fact; it can never fabricate a false one
+   * the way the old single-write-inside-`onEvict` shape could.
+   */
+  onEvicted?: (evictedKey: K, evictedValue: V) => void;
+  /** Fired when an insert is refused — because the incoming origin was
+   * already at `maxPerOrigin`, because the map is at the global cap and
+   * `selectEviction` refused, because a decided eviction's audit write
+   * did not durably complete, or (fix-round-6) because the admission
+   * WAITER queue itself was already at its own cap. `busyAudit` is
+   * present EXACTLY when `reason` is `admission_busy` (fix-round-7): a
+   * consumer that audits busy refusals must gate its append on
+   * `busyAudit.emit` (once per saturation episode — see
+   * `AdmissionBusyAuditCoalescer`) rather than appending per refusal;
+   * the callback itself still fires on every refusal. */
+  onRefuse?: (
+    incomingKey: K,
+    incomingValue: V,
+    reason: BoundedMapRefuseReason,
+    busyAudit?: AdmissionBusyAuditDecision,
+  ) => void;
+  /**
+   * Per-origin quota (AGENTS.md rule 8): the maximum number of entries a
+   * SINGLE origin (the string passed as `set()`'s third argument) may hold,
+   * independent of `maxSize`. Omit to disable per-origin accounting
+   * entirely (a `set()` call that never passes `origin` behaves exactly as
+   * before — global-cap-only). Required alongside `maxPerOrigin` for the
+   * quota to do anything; a `set()` call that omits `origin` on a map
+   * configured with `maxPerOrigin` simply skips the per-origin check for
+   * that one entry (it is accounted under no origin, so no future entry can
+   * ever be evicted or refused "because of" it).
+   */
+  maxPerOrigin?: number;
+  /**
+   * Cap on the admission-WAITER queue (AGENTS.md rule 8, fix-round-6 — see
+   * {@link MAX_PENDING_ADMISSION_WAITERS}'s doc for the derivation and why
+   * this state needs its own bound). Defaults to
+   * {@link MAX_PENDING_ADMISSION_WAITERS}; overridable so a test can drive
+   * the cap in a handful of concurrent calls instead of dozens (mirrors
+   * `SentinelFindingStoreOptions`'s test-only bounded-work overrides).
+   */
+  maxPendingAdmissionWaiters?: number;
+}
+
+export class BoundedMap<K, V> {
+  private readonly map = new Map<K, V>();
+  /** origin accounting (rule 8) — only ever populated for keys whose `set()`
+   * call supplied an `origin`; see `maxPerOrigin` above. Kept as a sibling
+   * map (rather than folding origin into V) so callers never have to widen
+   * their stored value's TYPE just to get per-origin fairness. */
+  private readonly origins = new Map<K, string>();
+  private readonly opts: BoundedMapOptions<K, V>;
+  /**
+   * Serializes the NEW-KEY admission critical section (MUST-FIX 1,
+   * fix-round-3 — see `admitNewKey`'s doc). A single promise chain per
+   * MAP INSTANCE, not per key or per origin: the origin-quota and
+   * capacity CHECKS both read state (`this.map.size`, `this.originSize`)
+   * that spans every key and every origin, so a lock scoped narrower than
+   * the whole map could not stop two concurrent evictors targeting
+   * different origins from both observing the same pre-eviction global
+   * size and both proceeding. Reuses the self-cleaning keyed-mutex SHAPE
+   * `ToolCallTrapRuntime.runExclusive` established
+   * (honeypot/tool-call-trap-runtime.ts) — chain the next call onto the
+   * settled tail of the previous one — but does not need that method's
+   * per-key cleanup: there is exactly one admission queue per BoundedMap
+   * instance for the instance's whole lifetime, never one per key, so
+   * there is nothing here that could grow unboundedly the way a per-key
+   * map would.
+   */
+  private admissionQueue: Promise<void> = Promise.resolve();
+  /**
+   * Live count of callers currently occupying the admission-waiter cap
+   * (AGENTS.md rule 8, fix-round-6) — incremented SYNCHRONOUSLY in `set()`
+   * before `runAdmissionExclusive` is ever called, decremented in a
+   * `finally` once that call settles either way. Because the increment and
+   * the cap check both run before this call's first `await`, a burst of
+   * concurrent `set()` calls can only ever observe this counter one at a
+   * time (ordinary JS run-to-completion between `await` points), so this
+   * needs no lock of its own the way `this.map`/`this.origins` do inside
+   * `admitNewKey`.
+   */
+  private pendingAdmissionWaiters = 0;
+  /**
+   * Per-instance busy-AUDIT coalescing state (fix-round-7) — see
+   * `AdmissionBusyAuditCoalescer`'s doc. Fed from exactly two sites: the
+   * at-cap refusal branch in `set()` (`onBusyRefusal`) and the settlement
+   * `finally` (`onBelowCap`), both synchronous alongside the waiter
+   * counter they mirror.
+   */
+  private readonly busyAuditCoalescer = new AdmissionBusyAuditCoalescer();
+
+  constructor(opts: BoundedMapOptions<K, V>) {
+    if (!Number.isInteger(opts.maxSize) || opts.maxSize <= 0) {
+      throw new Error("BoundedMap: maxSize must be a positive integer");
+    }
+    if (
+      opts.maxPerOrigin !== undefined &&
+      (!Number.isInteger(opts.maxPerOrigin) || opts.maxPerOrigin <= 0)
+    ) {
+      throw new Error("BoundedMap: maxPerOrigin must be a positive integer");
+    }
+    if (
+      opts.maxPendingAdmissionWaiters !== undefined &&
+      (!Number.isInteger(opts.maxPendingAdmissionWaiters) ||
+        opts.maxPendingAdmissionWaiters <= 0)
+    ) {
+      throw new Error(
+        "BoundedMap: maxPendingAdmissionWaiters must be a positive integer",
+      );
+    }
+    this.opts = opts;
+  }
+
+  get size(): number {
+    return this.map.size;
+  }
+
+  get(key: K): V | undefined {
+    return this.map.get(key);
+  }
+
+  has(key: K): boolean {
+    return this.map.has(key);
+  }
+
+  /** Origin recorded for `key`, or undefined if the key does not exist or
+   * was inserted without an origin. Exposed so a consumer that needs to
+   * attribute an entry to its origin (e.g. federation peer registration
+   * reading which local identity recorded the underlying handshake result)
+   * does not need a second parallel bookkeeping map of its own. */
+  originOf(key: K): string | undefined {
+    return this.origins.get(key);
+  }
+
+  /** Read-only view of the key -> origin accounting, for a consumer that
+   * needs to look up many origins (e.g. federation/tools.ts resolving the
+   * origin for a `peer_id` before delegating to the registry). */
+  originsView(): ReadonlyMap<K, string> {
+    return this.origins;
+  }
+
+  /** How many entries the given origin currently holds. O(map size), which
+   * is bounded by `maxSize` — cheap at the scale this primitive is used at
+   * (hundreds to low thousands of entries), and only ever called from
+   * `set()`'s own growth path (bounded work per request, AGENTS.md rule
+   * 8(d)), never from a hot read path. */
+  originSize(origin: string): number {
+    let count = 0;
+    for (const value of this.origins.values()) {
+      if (value === origin) count += 1;
+    }
+    return count;
+  }
+
+  /**
+   * Insert or update `key`. Resolves `{ ok: true }` when the entry is
+   * present in the map afterward (a plain update, a plain insert under the
+   * cap, or an insert admitted by evicting another entry), `{ ok: false,
+   * reason }` when the insert was refused (every existing entry is left
+   * exactly as it was, including the entry `selectEviction` had picked, if
+   * any — see the ABORT-ON-AUDIT-FAILURE note below).
+   *
+   * ASYNC (MUST-FIX 6 RECHECK): a GLOBAL-capacity eviction must durably
+   * audit the evicted entry BEFORE deleting it (see `onEvict`'s doc) — that
+   * requires awaiting the audit write, so `set()` itself is async. A `set()`
+   * call that never reaches the eviction branch (plain update, or insert
+   * under both caps) still returns a promise for API uniformity, but
+   * resolves on the same microtask with no real awaited work.
+   *
+   * `origin` is optional and only meaningful when the map was constructed
+   * with `maxPerOrigin` — see the class doc and `BoundedMapOptions.maxPerOrigin`.
+   *
+   * NO REATTRIBUTION ON UPDATE (MUST-FIX 3, fix-round-2 RECHECK): a `set()`
+   * for an EXISTING key never touches `origins` — the origin recorded at
+   * INSERT time is permanent for that key's lifetime (until `delete()`).
+   * The prior behavior (re-attributing the origin on every update) was a
+   * framing/evasion primitive: since an update never grows the map, it
+   * never re-enters the per-origin refusal check above, so an attacker who
+   * can trigger an "update" of an existing key (e.g. two different sessions
+   * both producing an unverified handshake preview for the same
+   * counterparty_id) could silently move that key's accounting from their
+   * own origin onto ANY other origin string of their choosing — inflating a
+   * victim origin's count toward its quota (framing) while freeing their
+   * own (evasion), all without ever creating a new key. Because origin is
+   * now fixed at insertion, an update can never change what it counts
+   * against, so there is nothing for a "quota re-check on update" to do —
+   * the accounting an update could possibly affect is exactly the
+   * accounting this rule keeps untouched.
+   *
+   * UPDATE PATH DELIBERATELY BYPASSES THE ADMISSION LOCK (MUST-FIX 1,
+   * fix-round-3): an existing-key update runs immediately, synchronously,
+   * never queued behind `admissionQueue`. This is not an oversight — it is
+   * what lets a genuine update WIN a race against a slower concurrent
+   * eviction of the SAME key that is still awaiting its critical audit
+   * write (see `admitNewKey`'s post-await re-validation). If updates were
+   * serialized behind the same lock as new-key admission, an update
+   * queued behind an in-flight eviction would always lose: by the time it
+   * ran, the eviction's delete would already have removed the very entry
+   * the update meant to refresh. Because the update path is unlocked, it
+   * can complete WHILE the eviction is still awaiting, and the eviction's
+   * post-await re-check then sees the change and refuses to delete —
+   * which is the behavior the "a live verified entry is never evicted"
+   * invariant requires.
+   */
+  async set(key: K, value: V, origin?: string): Promise<BoundedMapSetResult> {
+    if (this.map.has(key)) {
+      this.map.set(key, value);
+      return { ok: true };
+    }
+    // ADMISSION-WAITER CAP (AGENTS.md rule 8 on the fix's OWN state,
+    // fix-round-6): the admission WAITER queue is attacker-influenced
+    // state and is itself bounded (rule 8); at the cap, admission fails
+    // closed with a busy reason rather than growing the queue. Checked
+    // and incremented SYNCHRONOUSLY, before the first `await` in this
+    // method — see `pendingAdmissionWaiters`'s doc for why that makes the
+    // check itself TOCTOU-safe with no extra lock. A refusal here never
+    // calls `runAdmissionExclusive` at all: the caller's closure is never
+    // constructed, never chained onto `admissionQueue`, so a refused call
+    // leaves the queue exactly as it was.
+    const maxWaiters =
+      this.opts.maxPendingAdmissionWaiters ?? MAX_PENDING_ADMISSION_WAITERS;
+    if (this.pendingAdmissionWaiters >= maxWaiters) {
+      // Busy-AUDIT coalescing only (fix-round-7): the refusal below is
+      // still returned (and onRefuse still fired) for EVERY at-cap call —
+      // `busyAudit` only tells the audit consumer whether THIS refusal is
+      // the one that audits its saturation episode. See
+      // AdmissionBusyAuditCoalescer's doc for why the at-cap fast path
+      // must not append per refusal.
+      const busyAudit = this.busyAuditCoalescer.onBusyRefusal();
+      this.opts.onRefuse?.(key, value, "admission_busy", busyAudit);
+      return { ok: false, reason: "admission_busy", busyAudit };
+    }
+    this.pendingAdmissionWaiters += 1;
+    try {
+      return await this.runAdmissionExclusive(() =>
+        this.admitNewKey(key, value, origin),
+      );
+    } finally {
+      this.pendingAdmissionWaiters -= 1;
+      // The counter never exceeds the cap (the increment above is guarded
+      // by the same synchronous check), so after ANY decrement it sits
+      // strictly below the cap — the saturation episode, if one was
+      // active, ends exactly here (fix-round-7 busy-audit coalescing).
+      this.busyAuditCoalescer.onBelowCap();
+    }
+  }
+
+  /**
+   * Chains `fn` onto this map's single admission queue so at most one
+   * new-key admission for THIS map runs at a time, start to finish
+   * (including any `await` inside `fn`) — see `admissionQueue`'s doc for
+   * why the lock is scoped to the whole map rather than to a key or
+   * origin. Mirrors `ToolCallTrapRuntime.runExclusive`
+   * (honeypot/tool-call-trap-runtime.ts): chain onto the prior call's
+   * SETTLED tail (`.then(ok, ok)`, never left rejected) so one admission's
+   * failure can never wedge every later admission behind a permanently
+   * rejected promise.
+   */
+  private async runAdmissionExclusive<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.admissionQueue.then(fn, fn);
+    this.admissionQueue = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  /**
+   * The full new-key admission critical section (MUST-FIX 1, fix-round-3
+   * TOCTOU fix): origin-quota check -> capacity check -> victim selection
+   * -> awaited critical audit -> post-await re-validation -> delete ->
+   * insert, run end to end under `admissionQueue` for this map. Pre-fix,
+   * `set()` was async (to await `onEvict`, see that option's doc) with NO
+   * serialization at all: two concurrent evicting `set()` calls could both
+   * read the same pre-eviction map/origin state, both call
+   * `selectEviction` and land on the SAME victim, both durably audit it,
+   * and both proceed to delete-then-insert — collapsing one real delete
+   * into two inserts (size overshoots `maxSize` by one per extra racer)
+   * and firing `onEvict` twice for one logical eviction. Running the WHOLE
+   * section (not just the delete/insert tail) inside the lock closes that:
+   * the origin-quota and capacity CHECKS themselves read `this.map`/
+   * `this.origins`, and a second admission reading them before the first
+   * admission's decision has been fully applied is the same race as two
+   * admissions reaching the delete/insert tail together — so the lock has
+   * to start before the first read, not just before the first write.
+   */
+  private async admitNewKey(
+    key: K,
+    value: V,
+    origin?: string,
+  ): Promise<BoundedMapSetResult> {
+    // Re-check: a concurrent admission for this SAME new key could have
+    // been queued ahead of this one and already inserted it while this
+    // call was waiting for the lock.
+    if (this.map.has(key)) {
+      this.map.set(key, value);
+      return { ok: true };
+    }
+
+    // Per-origin quota FIRST (rule 8): a new key whose origin is already at
+    // its own quota is refused outright, before the global-capacity path
+    // (and therefore before `selectEviction`) ever runs. This is what
+    // guarantees a flooding origin can neither evict nor starve any OTHER
+    // origin — it hits its own wall first, every time, regardless of how
+    // much headroom the global cap still has.
+    if (
+      origin !== undefined &&
+      this.opts.maxPerOrigin !== undefined &&
+      this.originSize(origin) >= this.opts.maxPerOrigin
+    ) {
+      this.opts.onRefuse?.(key, value, "origin_quota");
+      return { ok: false, reason: "origin_quota" };
+    }
+
+    if (this.map.size >= this.opts.maxSize) {
+      const decision = this.opts.selectEviction(this.map, key, value);
+      if ("refuse" in decision) {
+        this.opts.onRefuse?.(key, value, "capacity");
+        return { ok: false, reason: "capacity" };
+      }
+      const evictedValue = this.map.get(decision.evict);
+      if (evictedValue !== undefined) {
+        // Audit BEFORE delete, AWAITED and TIMEOUT-BOUNDED (see onEvict's
+        // doc and ON_EVICT_AUDIT_TIMEOUT_MS's doc): a crash, a rejected
+        // audit write, OR a hung audit write between these two steps must
+        // never leave "vanished, no durable audit record" as the outcome a
+        // reviewer sees later. On rejection or timeout, ABORT the eviction
+        // entirely — the evicted entry is never deleted and this insert is
+        // refused (reason `audit_unavailable`, distinct from a genuine
+        // capacity refusal — MUST-FIX 3), rather than proceeding to mutate
+        // state with no durable trail of why.
+        try {
+          await withTimeout(
+            Promise.resolve(this.opts.onEvict?.(decision.evict, evictedValue)),
+            ON_EVICT_AUDIT_TIMEOUT_MS,
+          );
+        } catch {
+          this.opts.onRefuse?.(key, value, "audit_unavailable");
+          return { ok: false, reason: "audit_unavailable" };
+        }
+        // POST-AWAIT TRUST-PROPERTY RE-VALIDATION (MUST-FIX 1, fix-round-3):
+        // the update path above deliberately bypasses `admissionQueue`
+        // (see `set()`'s doc), so a concurrent `set()` call for
+        // `decision.evict` could have replaced its value WHILE this call
+        // awaited the audit write above — e.g. an unverified preview
+        // upgraded to a verified, liveness-proven, unexpired result mid-
+        // eviction. Re-comparing against the exact value object this call
+        // captured and audited (never re-fetching and re-checking a
+        // caller-specific "is this still evictable" predicate, which this
+        // generic primitive has no way to know) is a reliable "did
+        // anything change since I decided to evict this" signal: every
+        // production caller of `set()` replaces the WHOLE value on update
+        // (`recordHandshakeResult` and `registerFromHandshake` both
+        // construct a fresh object; neither mutates an existing one in
+        // place), so a reference mismatch here can only mean a concurrent
+        // `set()` won the race. A verified, live entry must NEVER be
+        // evicted (see the class doc's PER-ORIGIN QUOTA section and each
+        // call site's `selectEviction`) — refusing here is the fail-closed
+        // choice over deleting state this call no longer has an accurate,
+        // freshly-audited record of.
+        if (this.map.get(decision.evict) !== evictedValue) {
+          this.opts.onRefuse?.(key, value, "capacity");
+          return { ok: false, reason: "capacity" };
+        }
+      }
+      this.map.delete(decision.evict);
+      this.origins.delete(decision.evict);
+      // AUTHORITATIVE post-delete hook (fix-round-4, MUST-FIX 1 / F1) — see
+      // `BoundedMapOptions.onEvicted`'s doc. Fired synchronously, right
+      // here, with no `await` between the delete above and this call, so a
+      // caller's sibling-state cleanup (e.g. handshake/tools.ts's
+      // `handshakeResultWriterOrigins`) only ever runs when this map has
+      // ITSELF just committed the eviction — never from `onEvict`'s own
+      // promise continuing to run after `set()` already gave up and
+      // refused (timeout) or aborted (rejection/reference mismatch) above.
+      // `evictedValue` may be `undefined` here only if `decision.evict`
+      // named a key already absent from the map (defensive — `onEvict`
+      // above already guards this with `if (evictedValue !== undefined)`);
+      // firing `onEvicted` with `undefined` in that case would hand a
+      // caller a value it never asked for, so skip it — there was nothing
+      // to authoritatively evict.
+      if (evictedValue !== undefined) {
+        this.opts.onEvicted?.(decision.evict, evictedValue);
+      }
+    }
+
+    this.map.set(key, value);
+    if (origin !== undefined) this.origins.set(key, origin);
+    return { ok: true };
+  }
+
+  delete(key: K): boolean {
+    this.origins.delete(key);
+    return this.map.delete(key);
+  }
+
+  /**
+   * Remove every entry for which `predicate` returns true. This is the
+   * sweep primitive TTL/terminal-state call sites run at the top of every
+   * handler (mirroring #1190's `pruneExpiredActivations` placement), so a
+   * collection is bounded to LIVE entries on the request path, not only by
+   * the capacity cap. Returns the number of entries removed.
+   */
+  sweep(predicate: (value: V, key: K) => boolean): number {
+    let removed = 0;
+    for (const [key, value] of this.map) {
+      if (predicate(value, key)) {
+        this.map.delete(key);
+        this.origins.delete(key);
+        removed += 1;
+      }
+    }
+    return removed;
+  }
+
+  keys(): IterableIterator<K> {
+    return this.map.keys();
+  }
+
+  values(): IterableIterator<V> {
+    return this.map.values();
+  }
+
+  entries(): IterableIterator<[K, V]> {
+    return this.map.entries();
+  }
+
+  /**
+   * Bounded-iteration accessor: at most `limit` values, without a consumer
+   * having to materialize or scan the whole map first. Order is Map
+   * insertion order (oldest key first among entries never re-inserted).
+   */
+  boundedList(limit: number): V[] {
+    const out: V[] = [];
+    for (const value of this.map.values()) {
+      if (out.length >= limit) break;
+      out.push(value);
+    }
+    return out;
+  }
+
+  /**
+   * Read-only view for consumers that must never mutate — mirrors the
+   * `ReadonlyMap` contract `handshakeResults` already exposes externally
+   * (register §Z RECHECK: `recordHandshakeResult` is the only writer).
+   */
+  asReadonlyMap(): ReadonlyMap<K, V> {
+    return this.map;
+  }
+}

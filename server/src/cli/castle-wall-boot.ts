@@ -62,12 +62,11 @@
  */
 
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { lstat, rm, stat } from "node:fs/promises";
 import { createConnection } from "node:net";
-import { dirname, isAbsolute, join, resolve } from "node:path";
-import { execPath } from "node:process";
+import { basename, isAbsolute, join, resolve } from "node:path";
 import { Writable } from "node:stream";
-import { fileURLToPath } from "node:url";
 
 import { AuditLog } from "../operational/audit-log.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
@@ -90,6 +89,13 @@ import {
 } from "../castle-wall/provision/fortress-custody.js";
 import { resolveFortressCreateOwner } from "../castle-wall/runtime/fortress-create-owner.js";
 import { consumeFlagValue } from "./argv.js";
+import {
+  CASTLE_WALL_BOOT_RUNTIME_DIR,
+  installBootRuntimeSnapshot,
+  isContentAddressedBootRuntimePath,
+  removeBootRuntimeSnapshot,
+  type InstallBootRuntimeOptions,
+} from "./castle-wall-boot-runtime.js";
 
 export const CASTLE_WALL_BOOT_LABEL = "ai.sanctuaryprotocol.castle-wall.daemon";
 export const CASTLE_WALL_BOOT_PLIST_PATH = `/Library/LaunchDaemons/${CASTLE_WALL_BOOT_LABEL}.plist`;
@@ -97,6 +103,11 @@ export const LAUNCHCTL_TIMEOUT_MS = 15_000;
 export const LAUNCHCTL_KILL_SIGNAL = "SIGKILL";
 const CASTLE_GLOBAL_PINNED_PUBKEY_PATH =
   "/Library/Application Support/Sanctuary/castle-pinned-pubkey.bin";
+const CASTLE_WALL_APP_PATH = "/Applications/Sanctuary-CastleWall.app";
+const CASTLE_WALL_APP_BOOT_NODE =
+  "/Applications/Sanctuary-CastleWall.app/Contents/Resources/boot-runtime/node";
+const CASTLE_WALL_APP_BOOT_DAEMON =
+  "/Applications/Sanctuary-CastleWall.app/Contents/Resources/boot-runtime/castle-wall-boot-daemon.js";
 const CASTLE_WALL_BOOT_LOG_DIR = "/var/log";
 const SAFE_NAME_RE = /^[a-zA-Z0-9._-]+$/;
 /**
@@ -134,6 +145,20 @@ export interface CastleWallBootContext {
   globalPinPath?: string;
   /** Override the boot-token custody path (tests). */
   bootTokenPath?: string;
+  /** Override the root-owned boot-runtime directory (tests). */
+  bootRuntimeDir?: string;
+  /** Override the runtime snapshot installer (tests). */
+  installBootRuntimeFn?: typeof installBootRuntimeSnapshot;
+  /** Override the runtime snapshot remover (tests). */
+  removeBootRuntimeFn?: typeof removeBootRuntimeSnapshot;
+  /** Override the running Node source copied into the root boot runtime (tests). */
+  nodeExecPath?: string;
+  /** Override the self-contained boot-daemon source copied into custody (tests). */
+  bootDaemonSourcePath?: string;
+  /** Extra custody overrides used only with a test bootRuntimeDir. */
+  bootRuntimeProtectedDir?: string;
+  bootRuntimeTrustedAncestorDir?: string;
+  bootRuntimeExpectedOwnerUid?: number;
   /**
    * Sleep used by the post-bootstrap stability check (tests inject a no-op so
    * they don't actually wait). Defaults to a real timer.
@@ -310,57 +335,6 @@ export interface BootPlistOptions {
   signerClientPath: string;
   /** Log directory; defaults to <fortressPath>/logs. */
   logDir?: string;
-  /**
-   * Absolute directory of the Node interpreter that will run the daemon
-   * (typically `dirname(process.execPath)`). Prepended to the daemon's PATH so a
-   * `#!/usr/bin/env node` CLI shim can resolve `node` under launchd's minimal
-   * PATH. Without this, a Homebrew-installed node (`/opt/homebrew/bin/node`) is
-   * not on launchd's `/usr/bin:/bin:/usr/sbin:/sbin` default and the daemon
-   * crash-loops with `env: node: No such file or directory` — it never starts,
-   * so the box stays bricked at boot (the exact F1 failure). Omitted only in
-   * dev/test where the program path is already an absolute interpreter.
-   */
-  nodeBinDir?: string;
-  /**
-   * Absolute STABLE symlink bin dir to also prepend (e.g. `/opt/homebrew/bin`),
-   * after `nodeBinDir`. `nodeBinDir` typically resolves to a version-pinned
-   * Homebrew Cellar keg dir (`.../Cellar/node/<version>/bin`) which DISAPPEARS on
-   * `brew upgrade node` — silently re-bricking boot. The Homebrew prefix's `bin`
-   * is a stable symlink the package manager re-points at the new version, so
-   * including it is the durability belt to `nodeBinDir`'s suspenders. Derive it
-   * with {@link deriveHomebrewStableBinDir}. Omitted when there is no separate
-   * stable dir (system node / nvm / already-stable interpreter).
-   */
-  stableBinDir?: string;
-}
-
-/**
- * The only Homebrew prefixes whose `bin` we will put on the ROOT boot daemon's
- * PATH: the canonical Apple-Silicon and Intel locations, both root-owned by a
- * normal install. Any other `/Cellar/`-shaped prefix (e.g. one under an
- * operator-writable home) is NOT trusted — adding an operator-writable dir to a
- * root daemon's PATH is a privilege-escalation vector (codex 2026-06-14, MED).
- */
-const TRUSTED_HOMEBREW_PREFIXES = ["/opt/homebrew", "/usr/local"] as const;
-
-/**
- * Derive the STABLE Homebrew symlink bin dir from a node interpreter path that
- * lives inside a version-pinned Cellar keg under a TRUSTED Homebrew prefix:
- *   /opt/homebrew/Cellar/node/25.8.2/bin/node  ->  /opt/homebrew/bin
- *   /usr/local/Cellar/node/25.8.2/bin/node     ->  /usr/local/bin
- * The Cellar `bin` dir is version-pinned and vanishes on `brew upgrade node`;
- * the prefix's `bin` is a stable symlink Homebrew re-points at the new version.
- * Returns null when the interpreter is NOT under a TRUSTED Cellar keg (system
- * node, nvm, an already-stable symlink path, or a `/Cellar/` segment under any
- * untrusted/operator-writable prefix) — there is no safe stable dir to add.
- */
-export function deriveHomebrewStableBinDir(interpreterPath: string): string | null {
-  for (const prefix of TRUSTED_HOMEBREW_PREFIXES) {
-    if (interpreterPath.startsWith(`${prefix}/Cellar/`)) {
-      return `${prefix}/bin`;
-    }
-  }
-  return null;
 }
 
 /**
@@ -415,29 +389,10 @@ export function renderBootLaunchDaemonPlist(opts: BootPlistOptions): string {
   }
   assertNoControlChars(logDir, "log dir");
 
-  // launchd hands a minimal PATH to LaunchDaemons. If the daemon program is a
-  // `#!/usr/bin/env node` CLI shim and node lives outside the standard dirs
-  // (e.g. Homebrew's /opt/homebrew/bin), `env` cannot find it and the daemon
-  // crash-loops, never starting — the box stays bricked at boot. Prepend the
-  // interpreter's directory so the shim resolves its node. Fail-closed at render
-  // time if a bad value is passed.
+  // The root service executes a content-addressed Node snapshot by absolute
+  // path. Keep PATH system-only so no operator-writable package-manager
+  // directory can become an indirect root executable input.
   const pathDirs = ["/usr/bin", "/bin", "/usr/sbin", "/sbin"];
-  // Prepend interpreter dirs (validated, deduped). Apply stableBinDir first then
-  // nodeBinDir so the final order is [nodeBinDir, stableBinDir, ...base]: the
-  // exact running interpreter wins while present, with the stable symlink dir as
-  // the `brew upgrade node` survival fallback right behind it.
-  const prependPathDir = (dir: string | undefined, what: string): void => {
-    if (dir === undefined) return;
-    if (!isAbsolute(dir)) {
-      throw new Error(`${what} must be absolute (got: ${dir}).`);
-    }
-    assertNoControlChars(dir, what);
-    if (!pathDirs.includes(dir)) {
-      pathDirs.unshift(dir);
-    }
-  };
-  prependPathDir(opts.stableBinDir, "stable interpreter dir");
-  prependPathDir(opts.nodeBinDir, "node interpreter dir");
   const envEntries: Array<[string, string]> = [
     ["PATH", pathDirs.join(":")],
     ["SANCTUARY_STORAGE_PATH", opts.fortressPath],
@@ -515,16 +470,20 @@ function plistStringArrayValue(
     : null;
 }
 
-function supportedCastleWallCliPath(path: string): boolean {
+function supportedLegacyCastleWallCliPath(path: string): boolean {
   const name = path.split("/").pop();
-  return name === "sanctuary" || name === "sanctuary-framework" || name === "cli.js" || name === "cli.cjs";
+  return name === "sanctuary" || name === "sanctuary-framework" ||
+    name === "cli.js" || name === "cli.cjs";
 }
 
-function programArgumentsRunCastleWallDaemon(programArguments: string[]): boolean {
+function programArgumentsRunCastleWallDaemon(
+  programArguments: string[],
+  allowLegacyTestPath = false,
+): boolean {
   const daemonArgs = ["castle-wall", "daemon", "--safe-mode", "--launchd"];
-  if (programArguments.length === 5) {
+  if (allowLegacyTestPath && programArguments.length === 5) {
     const [program, ...args] = programArguments;
-    return Boolean(program && isAbsolute(program) && supportedCastleWallCliPath(program)) &&
+    return Boolean(program && isAbsolute(program) && supportedLegacyCastleWallCliPath(program)) &&
       args.every((arg, index) => arg === daemonArgs[index]);
   }
   if (programArguments.length === 6) {
@@ -532,12 +491,38 @@ function programArgumentsRunCastleWallDaemon(programArguments: string[]): boolea
     return Boolean(
       interpreter &&
         script &&
-        isAbsolute(interpreter) &&
-        isAbsolute(script) &&
-        supportedCastleWallCliPath(script),
+        (allowLegacyTestPath
+          ? isAbsolute(interpreter) && isAbsolute(script) &&
+            (supportedLegacyCastleWallCliPath(script) ||
+              isContentAddressedBootRuntimePath(script, "cli"))
+          : isContentAddressedBootRuntimePath(interpreter, "node") &&
+            isContentAddressedBootRuntimePath(script, "cli")),
     ) && args.every((arg, index) => arg === daemonArgs[index]);
   }
   return false;
+}
+
+async function contentAddressedRuntimeFileValid(
+  path: string,
+  kind: "node" | "cli" | "signer-client",
+): Promise<boolean> {
+  if (!isContentAddressedBootRuntimePath(path, kind)) return false;
+  const name = basename(path);
+  const digest = name
+    .replace(/^(?:node|cli|signer-client)-/, "")
+    .replace(/\.js$/, "");
+  const expectedMode = kind === "cli" ? 0o444 : 0o555;
+  try {
+    const data = await readFileCustody(path, {
+      uid: 0,
+      mode: { exact: expectedMode },
+      parent: { uid: 0, mode: { rejectGroupOrOtherWrite: true } },
+      verifyPathIdentity: true,
+    });
+    return createHash("sha256").update(data).digest("hex") === digest;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -578,7 +563,18 @@ export async function bootServiceInstalled(
   if (plist.RunAtLoad !== true) return false;
   if (plist.KeepAlive !== true) return false;
   const programArguments = plistStringArrayValue(plist, "ProgramArguments");
-  if (!programArguments || !programArgumentsRunCastleWallDaemon(programArguments)) return false;
+  const nonProductionPlistOverride = plistPath !== CASTLE_WALL_BOOT_PLIST_PATH;
+  if (
+    !programArguments ||
+    !programArgumentsRunCastleWallDaemon(programArguments, nonProductionPlistOverride)
+  ) return false;
+  if (
+    plistPath === CASTLE_WALL_BOOT_PLIST_PATH &&
+    (
+      !(await contentAddressedRuntimeFileValid(programArguments[0]!, "node")) ||
+      !(await contentAddressedRuntimeFileValid(programArguments[1]!, "cli"))
+    )
+  ) return false;
   const environment = plistDictValue(plist, "EnvironmentVariables");
   if (!environment) return false;
   const installedFortressPathRaw = environment.SANCTUARY_STORAGE_PATH;
@@ -586,6 +582,14 @@ export async function bootServiceInstalled(
   if (!isAbsolute(installedFortressPathRaw)) return false;
   const signerClientPath = environment.SANCTUARY_CASTLE_SIGNER_CLIENT;
   if (typeof signerClientPath !== "string" || !isAbsolute(signerClientPath)) return false;
+  if (
+    !nonProductionPlistOverride &&
+    !isContentAddressedBootRuntimePath(signerClientPath, "signer-client")
+  ) return false;
+  if (
+    plistPath === CASTLE_WALL_BOOT_PLIST_PATH &&
+    !(await contentAddressedRuntimeFileValid(signerClientPath, "signer-client"))
+  ) return false;
   if (expectedFortressPath !== undefined) {
     const installedFortressPath = resolve(installedFortressPathRaw);
     const expectedFortressPathResolved = resolve(expectedFortressPath);
@@ -698,7 +702,6 @@ export async function bootServiceReady(
 interface ParsedBootArgs {
   fortress?: string;
   user?: string;
-  binary?: string;
   signerClient?: string;
   yes: boolean;
   rotate: boolean;
@@ -716,8 +719,10 @@ export function parseBootArgs(argv: string[]): ParsedBootArgs {
     const arg = fortress.argv[i]!;
     if (arg === "--user") parsed.user = fortress.argv[++i];
     else if (arg.startsWith("--user=")) parsed.user = arg.slice("--user=".length);
-    else if (arg === "--binary") parsed.binary = fortress.argv[++i];
-    else if (arg.startsWith("--binary=")) parsed.binary = arg.slice("--binary=".length);
+    else if (arg === "--binary" || arg.startsWith("--binary=")) {
+      parsed.error = "--binary is no longer supported; install-boot uses the verified runtime embedded in Sanctuary-CastleWall.app";
+      break;
+    }
     else if (arg === "--signer-client") parsed.signerClient = fortress.argv[++i];
     else if (arg.startsWith("--signer-client=")) {
       parsed.signerClient = arg.slice("--signer-client=".length);
@@ -862,19 +867,7 @@ function bootOutFailedCastleWallUnit(
 }
 
 /**
- * Resolve the daemon argv when --binary is not given. Only resolvable from a
- * built dist tree (the npm-installed CLI); in dev/test contexts callers must
- * pass --binary explicitly. The boot service always runs in safe mode.
  */
-function resolveDefaultProgramArguments(): string[] | null {
-  const selfPath = fileURLToPath(import.meta.url);
-  if (selfPath.endsWith(`${join("dist", "cli", "castle-wall-boot.js")}`)) {
-    const cliJs = resolve(selfPath, "../../cli.js");
-    return [execPath, cliJs, "castle-wall", "daemon", "--safe-mode", "--launchd"];
-  }
-  return null;
-}
-
 function deriveOperatorHome(
   user: string,
   execFileFn: (cmd: string, args: string[]) => ExecFileResult,
@@ -905,11 +898,16 @@ async function auditBootTokenEvent(
     safeModeAuditStoragePath(fortressPath, token),
     fortressCreateOwner !== undefined ? { owner: fortressCreateOwner } : {},
   );
-  const auditLog = new AuditLog(
-    storage,
-    auditKey,
-    fortressCreateOwner !== undefined ? { createOwner: fortressCreateOwner } : undefined,
-  );
+  const auditLog = new AuditLog(storage, auditKey, {
+    // IC-05-DG: the safe-mode boot store is structurally NOT a fortress load
+    // (its own isolated storage path, a token-derived key, no identities), so
+    // downgrade detection is declared off AT CONSTRUCTION (the #1249
+    // fail-soft roster). Never derived from storage (DELTA-4).
+    signingDetectionMode: "non-fortress",
+    ...(fortressCreateOwner !== undefined
+      ? { createOwner: fortressCreateOwner }
+      : {}),
+  });
   await auditLog.append(
     "l1",
     operation,
@@ -1282,22 +1280,40 @@ async function runInstallBootInner(
     return 1;
   }
 
-  // 3. Program argv (always safe mode).
-  let programArguments: string[];
-  if (parsed.binary) {
-    if (!isAbsolute(parsed.binary) || !(await fileExists(parsed.binary))) {
-      write(err, `--binary must be an absolute existing path (got: ${parsed.binary}).\n`);
-      return 1;
-    }
-    programArguments = [parsed.binary, "castle-wall", "daemon", "--safe-mode", "--launchd"];
-  } else {
-    const resolved = resolveDefaultProgramArguments();
-    if (!resolved) {
-      write(err, "Cannot resolve the installed sanctuary CLI path; pass --binary <abs path to sanctuary>.\n");
-      return 1;
-    }
-    programArguments = resolved;
+  // 3. Snapshot every executable input into root-owned, content-addressed
+  // custody before launchd can execute it. A root service must never retain a
+  // user-writable CLI, Node interpreter, signer client, or PATH entry.
+  const bootDaemonSourcePath = ctx.bootDaemonSourcePath ?? CASTLE_WALL_APP_BOOT_DAEMON;
+  const nodeSourcePath = ctx.nodeExecPath ?? CASTLE_WALL_APP_BOOT_NODE;
+  let bootRuntime;
+  try {
+    const installRuntime = ctx.installBootRuntimeFn ?? installBootRuntimeSnapshot;
+    const runtimeOptions: InstallBootRuntimeOptions = {
+      cliSourcePath: bootDaemonSourcePath,
+      nodeSourcePath,
+      signerClientSourcePath: signerClient,
+      execFileFn,
+      ...(ctx.installBootRuntimeFn === undefined
+        ? { signedAppPath: CASTLE_WALL_APP_PATH }
+        : {}),
+      ...(ctx.bootRuntimeDir ? { runtimeDir: ctx.bootRuntimeDir } : {}),
+      ...(ctx.bootRuntimeProtectedDir ? { protectedDir: ctx.bootRuntimeProtectedDir } : {}),
+      ...(ctx.bootRuntimeTrustedAncestorDir
+        ? { trustedAncestorDir: ctx.bootRuntimeTrustedAncestorDir }
+        : {}),
+      ...(ctx.bootRuntimeExpectedOwnerUid !== undefined
+        ? { expectedOwnerUid: ctx.bootRuntimeExpectedOwnerUid }
+        : {}),
+    };
+    bootRuntime = await installRuntime(runtimeOptions);
+  } catch (error) {
+    write(
+      err,
+      `Error installing the root-owned Castle Wall boot runtime: ${error instanceof Error ? error.message : String(error)}\n`,
+    );
+    return 1;
   }
+  const programArguments = bootRuntime.programArguments;
 
   // ── Render + install (idempotent).
   let plist: string;
@@ -1306,18 +1322,8 @@ async function runInstallBootInner(
     plist = renderBootLaunchDaemonPlist({
       programArguments,
       fortressPath,
-      signerClientPath: signerClient,
+      signerClientPath: bootRuntime.signerClientPath,
       logDir,
-      // Put the running interpreter's dir on the daemon PATH so a
-      // `#!/usr/bin/env node` shim resolves node under launchd's minimal PATH.
-      nodeBinDir: dirname(execPath),
-      // ...and the stable Homebrew symlink dir behind it, so a `brew upgrade
-      // node` (which retires the version-pinned Cellar keg dir) cannot silently
-      // re-brick boot. Null for non-Homebrew interpreters (nothing to add).
-      ...((): { stableBinDir?: string } => {
-        const stable = deriveHomebrewStableBinDir(execPath);
-        return stable ? { stableBinDir: stable } : {};
-      })(),
     });
   } catch (error) {
     write(err, `Error: ${error instanceof Error ? error.message : String(error)}\n`);
@@ -1375,6 +1381,35 @@ async function runInstallBootInner(
     return 0;
   }
 
+  const restorePreviousService = async (): Promise<string> => {
+    if (!hadPlist || existing === null) {
+      return "No previous boot-service plist existed to restore.";
+    }
+    try {
+      await writeFileCustody(plistPath, existing, {
+        mode: 0o644,
+        createParent: false,
+      });
+    } catch (error) {
+      return `CRITICAL: could not restore the previous boot-service plist: ${error instanceof Error ? error.message : String(error)}`;
+    }
+    if (!launchdState.loaded) {
+      return "Restored the previous boot-service plist; it was not loaded before this replacement attempt.";
+    }
+    const current = bootServiceLoadState(execFileFn);
+    if (current.loaded && current.fortressPath === fortressPath) {
+      return "Restored the previous boot-service plist; the prior same-fortress unit remains loaded.";
+    }
+    const restoreBootstrap = execFileFn("launchctl", ["bootstrap", "system", plistPath]);
+    if (restoreBootstrap.code !== 0) {
+      return (
+        "CRITICAL: restored the previous plist but could not reload its same-fortress unit " +
+        `(launchctl bootstrap exit ${restoreBootstrap.code}: ${restoreBootstrap.stderr.trim() || restoreBootstrap.stdout.trim()}).`
+      );
+    }
+    return "Restored the previous boot-service plist and reloaded its same-fortress unit.";
+  };
+
   try {
     await writeFileCustody(plistPath, plist, {
       mode: 0o644,
@@ -1387,10 +1422,11 @@ async function runInstallBootInner(
 
   const enable = execFileFn("launchctl", ["enable", `system/${CASTLE_WALL_BOOT_LABEL}`]);
   if (enable.code !== 0 || !bootServiceEnabled(execFileFn)) {
+    const rollback = await restorePreviousService();
     write(
       err,
       `launchctl enable failed (exit ${enable.code}): ${enable.stderr.trim() || enable.stdout.trim()}\n` +
-        `Leaving ${plistPath} installed but not certifying boot survival; fix launchd disabled state and re-run install-boot.\n`,
+        `${rollback}\nNot certifying boot survival; fix launchd disabled state and re-run install-boot.\n`,
     );
     return 1;
   }
@@ -1399,19 +1435,21 @@ async function runInstallBootInner(
   // previous instance (ignore "not loaded"), then bootstrap the new unit.
   const bootout = execFileFn("launchctl", ["bootout", `system/${CASTLE_WALL_BOOT_LABEL}`]);
   if (bootout.code !== 0 && !launchctlResultWasNotLoaded(bootout)) {
+    const rollback = await restorePreviousService();
     write(
       err,
       `launchctl bootout failed (exit ${bootout.code}): ${bootout.stderr.trim() || bootout.stdout.trim()}\n` +
-        `Leaving ${plistPath} installed but not re-bootstrapping; fix launchd state and re-run install-boot.\n`,
+        `${rollback}\nNot certifying the replacement; fix launchd state and re-run install-boot.\n`,
     );
     return 1;
   }
   const bootstrap = execFileFn("launchctl", ["bootstrap", "system", plistPath]);
   if (bootstrap.code !== 0) {
+    const rollback = await restorePreviousService();
     write(
       err,
       `launchctl bootstrap failed (exit ${bootstrap.code}): ${bootstrap.stderr.trim() || bootstrap.stdout.trim()}\n` +
-        `The plist is installed at ${plistPath}; fix the cause and re-run install-boot.\n`,
+        `${rollback}\nFix the replacement cause and re-run install-boot.\n`,
     );
     return 1;
   }
@@ -1424,23 +1462,27 @@ async function runInstallBootInner(
     // Stop the throttled crash loop we just bootstrapped so it does not churn
     // forever; the plist stays on disk for inspection and re-run.
     const bootedOut = bootOutFailedCastleWallUnit(execFileFn, err, plistPath);
+    const rollback = await restorePreviousService();
     write(
       err,
       `Bootstrap was accepted but system/${CASTLE_WALL_BOOT_LABEL} did not stay running.\n` +
         `The daemon failed to start or is crash-looping (likely node is not resolvable on the daemon PATH, the signer helper is unreachable, or the boot token is unreadable). Inspect:\n` +
         `  sudo launchctl print system/${CASTLE_WALL_BOOT_LABEL}\n` +
         `  tail -n 50 ${join(logDir, "castle-wall-daemon.err.log")}\n` +
-        `${bootedOut ? "Booted the failed unit out." : "Could not prove the failed unit was booted out."} Not certifying the boot service; the brick condition is NOT yet closed.\n`,
+        `${bootedOut ? "Booted the failed unit out." : "Could not prove the failed unit was booted out."} ${rollback}\n` +
+        "Not certifying the replacement; the new boot-runtime candidate is NOT approved and the brick condition is NOT yet closed by it.\n",
     );
     return 1;
   }
   const pid = serviceRunningPid(execFileFn);
   if (pid === null) {
     const bootedOut = bootOutFailedCastleWallUnit(execFileFn, err, plistPath);
+    const rollback = await restorePreviousService();
     write(
       err,
       `Bootstrap was accepted but system/${CASTLE_WALL_BOOT_LABEL} vanished before certification completed.\n` +
-        `${bootedOut ? "Booted the failed unit out." : "Could not prove the failed unit was booted out."} Not certifying the boot service; the brick condition is NOT yet closed.\n`,
+        `${bootedOut ? "Booted the failed unit out." : "Could not prove the failed unit was booted out."} ${rollback}\n` +
+        "Not certifying the replacement; the new boot-runtime candidate is NOT approved and the brick condition is NOT yet closed by it.\n",
     );
     return 1;
   }
@@ -1452,6 +1494,7 @@ async function runInstallBootInner(
   if (tokenResult.minted) {
     write(out, `Boot token minted: ${bootTokenPath} (root-owned 0600).\n`);
   }
+  write(out, `Root-owned boot runtime: ${ctx.bootRuntimeDir ?? CASTLE_WALL_BOOT_RUNTIME_DIR}\n`);
   write(out, `Daemon logs: ${join(logDir, "castle-wall-daemon.log")} (+ .err.log)\n`);
   write(
     out,
@@ -1557,6 +1600,31 @@ export async function runUninstallBoot(
       return 1;
     }
   }
+  let removedRuntime = false;
+  // A test-only plist override must never make a unit test touch the host's
+  // real /Library runtime. Production has no plist override and always cleans
+  // residual snapshots after the launchd job is gone.
+  if (ctx.plistPath === undefined || ctx.bootRuntimeDir !== undefined) {
+    try {
+      const removeRuntime = ctx.removeBootRuntimeFn ?? removeBootRuntimeSnapshot;
+      removedRuntime = await removeRuntime({
+        ...(ctx.bootRuntimeDir ? { runtimeDir: ctx.bootRuntimeDir } : {}),
+        ...(ctx.bootRuntimeProtectedDir ? { protectedDir: ctx.bootRuntimeProtectedDir } : {}),
+        ...(ctx.bootRuntimeTrustedAncestorDir
+          ? { trustedAncestorDir: ctx.bootRuntimeTrustedAncestorDir }
+          : {}),
+        ...(ctx.bootRuntimeExpectedOwnerUid !== undefined
+          ? { expectedOwnerUid: ctx.bootRuntimeExpectedOwnerUid }
+          : {}),
+      });
+    } catch (error) {
+      write(
+        err,
+        `Boot service removed, but root boot-runtime cleanup failed: ${error instanceof Error ? error.message : String(error)}\n`,
+      );
+      return 1;
+    }
+  }
   let removedSocket = false;
   if (fortressPath) {
     const socketPath = resolveCastleWallSocketPath({
@@ -1584,6 +1652,9 @@ export async function runUninstallBoot(
   }
 
   write(out, "Castle Wall boot service removed (plist deleted; launchd job booted out or was not loaded).\n");
+  if (removedRuntime) {
+    write(out, "Removed the root-owned Castle Wall boot runtime.\n");
+  }
   if (removedSocket) {
     write(out, `Removed stale Castle Wall socket for fortress ${fortressPath}.\n`);
   }

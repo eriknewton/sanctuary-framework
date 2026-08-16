@@ -537,19 +537,18 @@ struct ContentView: View {
     /// Re-submit activation once on launch / helper approval so a newer bundled
     /// sysext replaces an older running one. This must not depend on the filter
     /// being disabled: a fresh launch can start at `.unknown` while the filter is
-    /// already enabled from a previous app session.
+    /// already enabled from a previous app session. Activation itself is also
+    /// allowed before the global pin exists: the later privileged install
+    /// provisions that pin, while every path that can arm or enable the filter
+    /// remains fail-closed behind full helper + pin + daemon readiness.
     private func refreshActivatedSystemExtensionIfNeeded() {
-        guard !didSubmitLaunchActivationRefresh,
-              signerHelperManager.isReady else {
-            return
-        }
-        switch systemExtensionManager.extensionState {
-        case .unknown, .activated:
-            didSubmitLaunchActivationRefresh = true
-            systemExtensionManager.activate()
-        default:
-            break
-        }
+        guard SystemExtensionManager.shouldSubmitLaunchActivationRefresh(
+            didSubmit: didSubmitLaunchActivationRefresh,
+            helperApproved: signerHelperManager.canRequestSystemExtensionActivation,
+            extensionState: systemExtensionManager.extensionState
+        ) else { return }
+        didSubmitLaunchActivationRefresh = true
+        systemExtensionManager.activate()
     }
 
     private func refreshDaemonArmingReadiness(reevaluateAutoArm: Bool = false) {
@@ -631,7 +630,8 @@ struct ContentView: View {
             // and completes silently when unchanged; when activation completes,
             // the extension-state observer re-probes before enabling the filter.
             systemExtensionManager.activate()
-        case .activating, .deactivating, .activatedRequiresReboot, .needsUserApproval:
+        case .activating, .deactivating, .activatedRequiresReboot,
+             .deactivatedRequiresReboot, .needsUserApproval:
             // In-flight, reboot-gated, or parked on the System Settings sysext
             // approval: nothing sensible to re-submit now. The
             // onChange(extensionState) hook finishes arming when activation
@@ -786,7 +786,10 @@ struct ContentView: View {
             filterConfigurationManager.filterState == .needsUserApproval {
             return .yellow
         }
-        if systemExtensionManager.extensionState == .activatedRequiresReboot { return .yellow }
+        if systemExtensionManager.extensionState == .activatedRequiresReboot ||
+            systemExtensionManager.extensionState == .deactivatedRequiresReboot {
+            return .yellow
+        }
         if systemExtensionManager.extensionState == .activating ||
             filterConfigurationManager.filterState == .enabling {
             return .yellow
@@ -806,7 +809,8 @@ struct ContentView: View {
         if case let .error(msg) = signerHelperManager.helperState {
             return "Helper Error: \(msg)"
         }
-        if systemExtensionManager.extensionState == .activatedRequiresReboot {
+        if systemExtensionManager.extensionState == .activatedRequiresReboot ||
+            systemExtensionManager.extensionState == .deactivatedRequiresReboot {
             return "Reboot Required"
         }
         if systemExtensionManager.extensionState == .needsUserApproval {

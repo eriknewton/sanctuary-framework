@@ -23,6 +23,11 @@
  * differential in server/test/exit/exit-inspect-declares.test.ts holds it by
  * running both sides over the same crafted bundles.
  *
+ * Rotation-chain verification is similarly self-contained: it checks only the
+ * signed identity artifact's public bytes and never predicts whether a later
+ * import with credentials, conflicts, reputation data, or destination storage
+ * will succeed.
+ *
  * READ-ONLY BY CONSTRUCTION: this module never calls `openExitContext`, never
  * asks for a passphrase, never opens a StateStore or an AuditLog, and never
  * writes. It operates solely on the bundle directory, through
@@ -64,6 +69,13 @@ export interface ExitBundleInspectionReport {
   legacy_kdf_params: "absent" | "valid" | "malformed" | "unknown";
   /** Which re-key block is present, and whether it has a usable shape. */
   source_custody: SourceCustodyState | "unknown";
+  rotation: {
+    hop_count: number;
+    chain_signature_verified: boolean;
+    terminates_at_current: boolean;
+    invalid_reason?: string;
+    compromised_hops: number;
+  };
   warnings: string[];
 }
 
@@ -211,6 +223,13 @@ export async function inspectExitBundle(
         : "nothing checked: this bundle carries no encrypted_state artifact",
     legacy_kdf_params: state?.legacy_kdf_params ?? "unknown",
     source_custody: state?.source_custody ?? "unknown",
+    rotation: result.identity?.rotation ?? {
+      hop_count: 0,
+      chain_signature_verified: false,
+      terminates_at_current: false,
+      invalid_reason: "unknown",
+      compromised_hops: 0,
+    },
     warnings: result.warnings,
   };
 }

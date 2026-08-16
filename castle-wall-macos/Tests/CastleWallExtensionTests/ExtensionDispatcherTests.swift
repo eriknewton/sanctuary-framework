@@ -202,13 +202,15 @@ final class ExtensionDispatcherTests: XCTestCase {
         )
     }
 
-    func arm(_ dispatcher: ExtensionDispatcher) {
-        dispatcher.handleInbound(.armLease(ArmLeaseBody(
-            armed: true,
-            ttlSeconds: nil,
-            heartbeatIntervalSeconds: 5,
-            updatedAt: "2026-07-29T22:17:00.000Z"
-        )))
+    /// Arm the dispatcher with a lease signed by `key` (which must be the
+    /// private half of the dispatcher's pinned public key) and a fresh stamp —
+    /// O-02: an unsigned or stale lease is rejected at `handleInbound`.
+    func arm(_ dispatcher: ExtensionDispatcher, key: Curve25519.Signing.PrivateKey) {
+        let body = try! makeSignedArmLeaseBody(
+            updatedAt: isoLeaseStamp(Date()),
+            privateKey: key
+        )
+        dispatcher.handleInbound(.armLease(body))
     }
 
     // MARK: - Inbound: manifest_updated applies snapshot + clears cache
@@ -242,7 +244,7 @@ final class ExtensionDispatcherTests: XCTestCase {
             engine: engine,
             ipcClient: makeFloatingClient(pinnedPublicKey: signedAllow.publicKey)
         )
-        arm(dispatcher)
+        arm(dispatcher, key: key)
 
         // Seed snapshot A and evaluate to populate the cache.
         dispatcher.handleInbound(.manifestUpdated(signedAllow.body))
@@ -368,7 +370,8 @@ final class ExtensionDispatcherTests: XCTestCase {
 
     func test_bindingState_tracksManifestAndLeaseReceipt() throws {
         let engine = FlowEvaluatorEngine()
-        let signed = try makeSignedManifestUpdatedBody(rules: [])
+        let key = Curve25519.Signing.PrivateKey()
+        let signed = try makeSignedManifestUpdatedBody(rules: [], privateKey: key)
         let dispatcher = ExtensionDispatcher(
             engine: engine,
             ipcClient: makeFloatingClient(pinnedPublicKey: signed.publicKey)
@@ -381,14 +384,117 @@ final class ExtensionDispatcherTests: XCTestCase {
         XCTAssertTrue(dispatcher.bindingState.manifestReceived)
         XCTAssertFalse(dispatcher.bindingState.armLeaseReceived)
 
+        dispatcher.handleInbound(.armLease(try makeSignedArmLeaseBody(
+            updatedAt: isoLeaseStamp(Date()),
+            privateKey: key
+        )))
+        XCTAssertTrue(dispatcher.bindingState.manifestReceived)
+        XCTAssertTrue(dispatcher.bindingState.armLeaseReceived)
+    }
+
+    // MARK: - O-02: arm-lease trust boundary at the dispatcher
+
+    func test_unsignedArmLease_rejected_doesNotBindOrUpdateEngine() throws {
+        let engine = FlowEvaluatorEngine()
+        let key = Curve25519.Signing.PrivateKey()
+        let dispatcher = ExtensionDispatcher(
+            engine: engine,
+            ipcClient: makeFloatingClient(pinnedPublicKey: key.publicKey.rawRepresentation)
+        )
+
         dispatcher.handleInbound(.armLease(ArmLeaseBody(
             armed: true,
             ttlSeconds: nil,
             heartbeatIntervalSeconds: 5,
-            updatedAt: "2026-06-11T00:00:00.000Z"
+            updatedAt: isoLeaseStamp(Date())
         )))
-        XCTAssertTrue(dispatcher.bindingState.manifestReceived)
+
+        // MUST-NEVER #5: the unsigned frame is REJECTED — never accepted with
+        // a warning. Neither the binding flag nor the engine lease may move.
+        XCTAssertFalse(dispatcher.bindingState.armLeaseReceived)
+        XCTAssertNotNil(engine.armLease.missingLeaseReason())
+    }
+
+    func test_wrongKeyArmLease_rejected() throws {
+        let engine = FlowEvaluatorEngine()
+        let pinnedKey = Curve25519.Signing.PrivateKey()
+        let dispatcher = ExtensionDispatcher(
+            engine: engine,
+            ipcClient: makeFloatingClient(pinnedPublicKey: pinnedKey.publicKey.rawRepresentation)
+        )
+
+        dispatcher.handleInbound(.armLease(try makeSignedArmLeaseBody(
+            updatedAt: isoLeaseStamp(Date()),
+            privateKey: Curve25519.Signing.PrivateKey()
+        )))
+
+        XCTAssertFalse(dispatcher.bindingState.armLeaseReceived)
+        XCTAssertNotNil(engine.armLease.missingLeaseReason())
+    }
+
+    func test_replayedArmLease_rejected_doesNotExtendDeadManDeadline() throws {
+        // The O-02 replay scenario proper: the lease deadline anchors to the
+        // EXTENSION clock at acceptance, so replaying a captured frame would
+        // extend `heartbeatExpiresAt` forever if `updated_at` were not
+        // consumed. With the monotonic gate, the replay is rejected and the
+        // deadline stays anchored to the FIRST acceptance.
+        var engineNow = Date()
+        let lease = ArmLease(now: { engineNow })
+        let engine = FlowEvaluatorEngine(armLease: lease)
+        let key = Curve25519.Signing.PrivateKey()
+        let dispatcher = ExtensionDispatcher(
+            engine: engine,
+            ipcClient: makeFloatingClient(pinnedPublicKey: key.publicKey.rawRepresentation)
+        )
+
+        let frame = try makeSignedArmLeaseBody(
+            updatedAt: isoLeaseStamp(Date()),
+            privateKey: key
+        )
+        dispatcher.handleInbound(.armLease(frame))
         XCTAssertTrue(dispatcher.bindingState.armLeaseReceived)
+        let deadlineAfterFirst = engine.armLease.snapshot().heartbeatExpiresAt
+
+        // Time passes; the captured frame is replayed verbatim.
+        engineNow = engineNow.addingTimeInterval(6)
+        dispatcher.handleInbound(.armLease(frame))
+
+        XCTAssertEqual(
+            engine.armLease.snapshot().heartbeatExpiresAt,
+            deadlineAfterFirst,
+            "a replayed lease must not re-anchor the dead-man deadline"
+        )
+    }
+
+    func test_olderStampArmLease_rejected_cannotRollBackArmState() throws {
+        let engine = FlowEvaluatorEngine()
+        let key = Curve25519.Signing.PrivateKey()
+        let dispatcher = ExtensionDispatcher(
+            engine: engine,
+            ipcClient: makeFloatingClient(pinnedPublicKey: key.publicKey.rawRepresentation)
+        )
+
+        let armedNow = try makeSignedArmLeaseBody(
+            armed: true,
+            updatedAt: isoLeaseStamp(Date()),
+            privateKey: key
+        )
+        dispatcher.handleInbound(.armLease(armedNow))
+        XCTAssertTrue(engine.armLease.snapshot().armed)
+
+        // A validly-signed but OLDER disarm frame (e.g. captured from an
+        // earlier disarm) must not roll the wall back.
+        let staleDisarm = try makeSignedArmLeaseBody(
+            armed: false,
+            updatedAt: isoLeaseStamp(Date().addingTimeInterval(-30)),
+            privateKey: key
+        )
+        dispatcher.handleInbound(.armLease(staleDisarm))
+
+        XCTAssertTrue(
+            engine.armLease.snapshot().armed,
+            "an older-stamped lease must not overwrite newer arm state"
+        )
     }
 
     func test_rejectedManifest_doesNotMarkManifestReceived() throws {

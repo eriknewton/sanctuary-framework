@@ -21,6 +21,7 @@ import {
   exportExitBundle,
   importExitBundle,
   exitBundleManifestShape,
+  ExitBundleImportError,
   ExitBundleStateImportIncompleteError,
   type ImportExitBundleResult,
 } from "./bundle.js";
@@ -250,6 +251,10 @@ Options:
                                     resolution; repeatable. Empty means refuse to
                                     resolve (no-outbound-by-default).
   --skip-did-web-verify             On import: skip did:web resolution entirely.
+  --accept-compromised-rotation-keys
+                                    On import: explicitly admit state entries whose
+                                    only valid source signature is a key retired by
+                                    a compromised-reason rotation. Refused by default.
   --json
   --yes, -y                         Explicit non-interactive Tier 1 approval
   --help, -h
@@ -450,6 +455,19 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
         }
         write(out, `legacy_kdf_params: ${report.legacy_kdf_params}\n`);
         write(out, `source_custody: ${report.source_custody}\n`);
+        write(out, `rotation_hop_count: ${report.rotation.hop_count}\n`);
+        write(
+          out,
+          `rotation_chain_signature_verified: ${report.rotation.chain_signature_verified}\n`,
+        );
+        write(
+          out,
+          `rotation_terminates_at_current: ${report.rotation.terminates_at_current}\n`,
+        );
+        if (report.rotation.invalid_reason !== undefined) {
+          write(out, `rotation_invalid_reason: ${report.rotation.invalid_reason}\n`);
+        }
+        write(out, `rotation_compromised_hops: ${report.rotation.compromised_hops}\n`);
         write(out, `declares: ${report.declared_rekey_material}\n`);
         write(out, `to try: ${report.suggested_command}\n`);
         // Printed unconditionally, including on the happy path: the whole
@@ -754,7 +772,7 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
       // --source-recovery-key supply). Without this gate the request silently
       // ends in `staged_requires_source_key` (no resume path exists) or, for a
       // stateless bundle, the post-activate WARNING tells the operator to
-      // "re-run with --import-state" — which they already did. Fail closed
+      // "re-run with --import-state" - which they already did. Fail closed
       // with actionable guidance instead.
       if (importState && !sourcePassphrase && !sourceRecoveryKey) {
         write(
@@ -798,6 +816,10 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
         "--did-web-allowed-host",
       );
       const skipDidWebVerify = hasFlag(argv, "--skip-did-web-verify");
+      const acceptCompromisedRotationKeys = hasFlag(
+        argv,
+        "--accept-compromised-rotation-keys",
+      );
       let result;
       try {
         result = await importExitBundle({
@@ -824,6 +846,7 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
             ? { didWebAllowedHosts }
             : {}),
           skipDidWebVerify,
+          acceptCompromisedRotationKeys,
         });
       } catch (e) {
         if (e instanceof InvalidExitBundleError) {
@@ -835,7 +858,7 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
             write(
               out,
               JSON.stringify(
-                { verdict: "FAIL", error: e.message, state: e.state },
+                { verdict: "FAIL", code: e.code, error: e.message, state: e.state },
                 null,
                 2,
               ) + "\n",
@@ -846,13 +869,35 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
           write(err, `Error: ${e.message}\n`);
           return 1;
         }
+        if (e instanceof ExitBundleImportError) {
+          if (json) {
+            write(
+              out,
+              JSON.stringify(
+                { verdict: "FAIL", code: e.code, error: e.message },
+                null,
+                2,
+              ) + "\n",
+            );
+          } else {
+            write(err, `Error [${e.code}]: ${e.message}\n`);
+          }
+          return 1;
+        }
         throw e;
       }
       if (json) {
+        const verdict = result.verified ? "PASS" : "FAIL";
         write(
           out,
           JSON.stringify(
-            { verdict: result.verified ? "PASS" : "FAIL", ...result },
+            {
+              verdict,
+              ...(!result.verified
+                ? { code: "BUNDLE_VERIFICATION_FAILED" }
+                : {}),
+              ...result,
+            },
             null,
             2,
           ) + "\n",

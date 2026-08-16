@@ -123,7 +123,7 @@
 1	server/src/distress/local-secret.ts
 2	server/src/distress/tools.ts
 4	server/src/federation/registry.ts
-2	server/src/federation/tools.ts
+1	server/src/federation/tools.ts
 2	server/src/handshake/protocol.ts
 2	server/src/handshake/tools.ts
 5	server/src/index.ts

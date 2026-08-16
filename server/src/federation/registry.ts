@@ -10,18 +10,47 @@
  * - Peer capabilities (what operations they support)
  *
  * Security invariants:
- * - Peers are ONLY added through completed handshakes (not self-registration)
+ * - Peers are ONLY added through a completed handshake with a counterparty
+ *   this fortress does not hold keys for (never self-registration; see
+ *   register §Z RECHECK / LD2-02 — the shared handshakeResults map this
+ *   registry reads from is kept free of self-vouched entries at the
+ *   producer, handshake/tools.ts recordHandshakeResult, and the caller in
+ *   federation/tools.ts re-checks identityManager.list() independently)
  * - Trust tiers degrade automatically when handshakes expire
  * - Peer data is stored encrypted under L1 sovereignty
  */
 
+import type { AuditLog } from "../operational/audit-log.js";
 import type { HandshakeResult } from "../handshake/types.js";
 import { trustTierToSovereigntyTier } from "../reputation/tiers.js";
+import { BoundedMap, type BoundedMapRefuseReason } from "../core/bounded-map.js";
 import type {
   FederationPeer,
   FederationCapabilities,
   PeerTrustEvaluation,
 } from "./types.js";
+
+/**
+ * `registerFromHandshake`'s result (MUST-FIX 2, fix-round-4 — replaces a
+ * plain `FederationPeer | null`). An agent reads the federation tool
+ * response to decide how to behave (MCP tool responses are product copy
+ * for an agent audience, per AGENTS.md's forward-documentation rule), so
+ * collapsing every `BoundedMap` refusal reason into a bare `null` hid a
+ * real distinction the OPERATOR audit trail already had (via `onRefuse`
+ * below). The four reasons (`BoundedMapRefuseReason`, core/bounded-map.ts)
+ * — "this identity is flooding" (`origin_quota`), "the registry is
+ * genuinely full of active peers" (`capacity`), "the audit trail itself
+ * is unavailable right now, retry" (`audit_unavailable`), and "the
+ * registry's own admission queue is momentarily saturated, retry shortly"
+ * (`admission_busy`, added fix-round-6) — are four different things to
+ * tell an agent, and under the bare-null shape at most the first two were
+ * distinguishable, via a separate `peerOriginSize` pre-check, never from
+ * the return value itself. `federation/tools.ts` reads `reason` directly
+ * off this result to render the accurate agent-facing message.
+ */
+export type RegisterPeerResult =
+  | { ok: true; peer: FederationPeer }
+  | { ok: false; reason: BoundedMapRefuseReason };
 
 /** Default capabilities assumed for new peers */
 const DEFAULT_CAPABILITIES: FederationCapabilities = {
@@ -31,18 +60,237 @@ const DEFAULT_CAPABILITIES: FederationCapabilities = {
   attestation_formats: ["sanctuary-interaction-v1"],
 };
 
+/**
+ * Hard cap on registered peers (register LD2-04): `federation_peers` register
+ * is Tier-3 auto-allowed, and the only gate before a completed handshake
+ * becomes a durable registry entry is the self-vouch check — an agent that
+ * mints many keypairs and completes a real (attacker-reachable, if costlier
+ * than a preview) 4-step handshake with each one can otherwise register
+ * without limit; `getPeer`/`listPeers` only ever MUTATE an expired peer to
+ * `active:false`, they never delete, so nothing ages entries out on its own.
+ * 500 mirrors handshake/tools.ts's MAX_HANDSHAKE_RESULTS order of magnitude:
+ * generous for a real federation topology, small enough to bound worst-case
+ * memory and keep the saturation-refusal path reachable in an adversarial
+ * test without an impractically long loop.
+ */
+export const MAX_FEDERATION_PEERS = 500;
+
+/**
+ * Per-origin quota for `peers` (AGENTS.md rule 8, MUST-FIX 1/2 RECHECK —
+ * HIGH gate finding, TWICE: the first cut had no per-origin quota at all;
+ * fix-round-1's quota keyed on the LOCAL identity that recorded the
+ * underlying handshake result, which a caller can multiply at will via
+ * `identity_create` (Tier 3 always-allow) — mint N identities, complete N
+ * real 4-step handshakes, register N peers, and the "per-origin" quota
+ * never engages). The ORIGIN of a peer is now the AGENT-SESSION PRINCIPAL
+ * that recorded the VERIFIED handshake result CURRENTLY on file for this
+ * counterparty (`handshake/tools.ts`'s `handshakeResultWriterOrigins`,
+ * REQUIRED — not optional — through `federation/tools.ts`'s register
+ * handler; see that parameter's doc for why optional was itself the
+ * MUST-FIX 2 defect, and for why fix-round-3 reads the WRITER map rather
+ * than `handshakeResults`'s own first-writer allocation origin). An
+ * attacker who completes MAX_FEDERATION_PEERS real 4-step handshakes,
+ * however many local identities they spread the flood across, still
+ * exhausts only THEIR OWN session's quota and is REFUSED there — never
+ * evicts an active peer, and never touches a DIFFERENT session's headroom.
+ * 50 = 1/10th of MAX_FEDERATION_PEERS, matching
+ * MAX_HANDSHAKE_SESSIONS_PER_ORIGIN / MAX_HANDSHAKE_RESULTS_PER_ORIGIN's
+ * ratio: generous per-session headroom while guaranteeing at least 10
+ * distinct agent sessions' worth of peers fit before any one session could
+ * threaten the shared ceiling. `origin` is REQUIRED on
+ * `registerFromHandshake` (MUST-FIX 2: an omitted origin must never mean
+ * "skip the quota") — every production and test call site must supply one;
+ * a caller with no real session context uses `AGENT_UNKNOWN_ORIGIN`
+ * (handshake/tools.ts), which is itself quota-bounded, never an escape
+ * hatch.
+ */
+export const MAX_FEDERATION_PEERS_PER_ORIGIN = 50;
+
+/**
+ * Is `peer` active RIGHT NOW, accounting for handshake expiry the lazy
+ * getPeer/listPeers mutation hasn't caught up to yet? Shared by getPeer,
+ * listPeers, and the eviction selector below so all three agree on what
+ * "active" means at the instant they're called, rather than three
+ * independently-maintained copies of the same expiry check drifting apart.
+ */
+function isPeerCurrentlyActive(peer: FederationPeer, now: Date): boolean {
+  return peer.active && new Date(peer.handshake_result.expires_at) > now;
+}
+
 export class FederationRegistry {
-  private peers = new Map<string, FederationPeer>();
+  private readonly peers: BoundedMap<string, FederationPeer>;
+  private readonly auditLog: AuditLog;
+
+  constructor(auditLog: AuditLog) {
+    this.auditLog = auditLog;
+    this.peers = new BoundedMap<string, FederationPeer>({
+      maxSize: MAX_FEDERATION_PEERS,
+      maxPerOrigin: MAX_FEDERATION_PEERS_PER_ORIGIN,
+      selectEviction: (entries) => {
+        const now = new Date();
+        let oldestInactiveKey: string | undefined;
+        let oldestInactiveFirstSeen = "";
+        for (const [key, peer] of entries) {
+          if (isPeerCurrentlyActive(peer, now)) continue;
+          if (
+            oldestInactiveKey === undefined ||
+            peer.first_seen < oldestInactiveFirstSeen
+          ) {
+            oldestInactiveKey = key;
+            oldestInactiveFirstSeen = peer.first_seen;
+          }
+        }
+        if (oldestInactiveKey === undefined) {
+          // Every slot holds a currently-ACTIVE peer: refuse rather than
+          // evict one to admit a new registration. An active peer is never
+          // evicted to admit a new one, or registration becomes a
+          // peer-flush primitive — an attacker who can complete handshakes
+          // could otherwise evict a real, trusted peer just by registering
+          // enough new ones.
+          return { refuse: true };
+        }
+        return { evict: oldestInactiveKey };
+      },
+      onEvict: async (evictedPeerId, evictedPeer) => {
+        // AWAITED + CRITICAL (MUST-FIX 6, fix-round-2 RECHECK): evicting a
+        // peer drops its trust state; BoundedMap.set() awaits this and
+        // ABORTS the eviction (refuses the new registration) if the durable
+        // write fails, rather than deleting a peer with no audit record of
+        // why. See bounded-map.ts's onEvict doc / handshake/tools.ts's
+        // sessions/handshakeResults onEvict for the same pattern.
+        //
+        // INTENT ONLY, NOT COMPLETION (MUST-FIX 2, fix-round-5 — see
+        // bounded-map.ts's onEvict doc "INTENT, NEVER COMPLETION" note, and
+        // handshake/tools.ts's identical fix on `handshakeResults`, the
+        // sibling map this was first found on). `appendCritical` serializes
+        // behind audit-log.ts's own append queue, so this write's total
+        // settle time is unbounded under audit-queue contention even though
+        // `ON_EVICT_AUDIT_TIMEOUT_MS` bounds how long `set()` itself waits —
+        // naming this the INTENT record (never `_evicted`) means it can
+        // never be read as claiming the peer was actually removed even if
+        // it lands after `set()` already refused. See `onEvicted` below for
+        // the completion record.
+        await this.auditLog.appendCritical({
+          layer: "l4",
+          operation: "federation_peer_eviction_intent",
+          identity_id: "system",
+          result: "success",
+          details: {
+            peer_id: evictedPeerId,
+            peer_did: evictedPeer.peer_did,
+            reason: "capacity",
+          },
+        });
+      },
+      onEvicted: (evictedPeerId, evictedPeer) => {
+        // COMPLETION audit (MUST-FIX 2, fix-round-5 — see `onEvict`'s
+        // "INTENT ONLY" note above and bounded-map.ts's onEvicted doc).
+        // Fires synchronously, immediately after bounded-map.ts's OWN
+        // delete, so this write can only ever describe a TRUE fact —
+        // fire-and-forget is safe because there is nothing left to abort.
+        void this.auditLog.append(
+          "l4",
+          "federation_peer_evicted",
+          "system",
+          {
+            peer_id: evictedPeerId,
+            peer_did: evictedPeer.peer_did,
+            reason: "capacity",
+          },
+          "success"
+        );
+      },
+      onRefuse: (incomingPeerId, _incomingPeer, reason, busyAudit) => {
+        // FOUR DISTINCT reasons (MUST-FIX 3, fix-round-3 — `capacity` and
+        // `audit_unavailable` used to collapse to the same "saturated"
+        // audit op, hiding "the audit trail is down" behind "the registry
+        // is genuinely full of active peers" from an operator diagnosing
+        // the refusal; `admission_busy` added fix-round-6, see
+        // core/bounded-map.ts's `BoundedMapRefuseReason` doc — it must NOT
+        // fall into the `capacity` bucket either, or an operator would be
+        // told "every peer is active" when the real condition is "this
+        // map's admission-waiter queue was momentarily saturated").
+        //
+        // BUSY-AUDIT COALESCING (fix-round-7 — must match the episode
+        // contract of `AdmissionBusyAuditCoalescer`, core/bounded-map.ts):
+        // `admission_busy` is the at-cap fast path, designed to absorb a
+        // hammering flood, so its audit emits once per saturation episode
+        // (with the suppressed-refusal count) rather than per refusal —
+        // per-refusal appends would shift the flood's backlog into the
+        // audit log's uncapped append queue. `busyAudit` accompanies every
+        // busy refusal; if it were ever absent (it is not, by BoundedMap's
+        // construction), falling through to append errs toward MORE audit,
+        // never less. The other three reasons keep their pre-existing
+        // per-refusal appends, and the agent-facing refusal (the typed
+        // `RegisterPeerResult`) is never coalesced.
+        if (reason === "admission_busy" && busyAudit !== undefined && !busyAudit.emit) {
+          return;
+        }
+        const op =
+          reason === "origin_quota"
+            ? "federation_registry_origin_quota_exceeded"
+            : reason === "audit_unavailable"
+              ? "federation_registry_audit_unavailable"
+              : reason === "admission_busy"
+                ? "federation_registry_admission_busy"
+                : "federation_registry_saturated";
+        void this.auditLog.append(
+          "l4",
+          op,
+          "system",
+          {
+            peer_id: incomingPeerId,
+            ...(reason === "admission_busy" && busyAudit !== undefined
+              ? { suppressed_busy_refusals: busyAudit.suppressedSinceLastAudit }
+              : {}),
+          },
+          "failure"
+        );
+      },
+    });
+  }
 
   /**
    * Register or update a peer from a completed handshake.
-   * This is the ONLY way peers enter the registry.
+   * This is the ONLY way peers enter the registry, and the caller
+   * (federation/tools.ts) refuses a peer_did this fortress holds keys for
+   * before this method is ever reached.
+   *
+   * Returns `{ ok: false, reason }` when the registration was refused
+   * (MUST-FIX 2, fix-round-4 — widened from a bare `FederationPeer | null`;
+   * see `RegisterPeerResult`'s doc for why the caller needs the typed
+   * reason, not just a refusal signal). `reason` is exactly
+   * `BoundedMap`'s own `BoundedMapRefuseReason`: `origin_quota` (this
+   * `origin`'s own quota is exhausted), `capacity` (the shared registry is
+   * at capacity and every existing slot holds a currently-active peer —
+   * see the eviction policy above), `audit_unavailable` (a
+   * global-capacity eviction was decided but its durable audit write did
+   * not complete — rare, and distinct from a genuine capacity refusal: an
+   * operator retrying the SAME registration once the audit trail recovers
+   * should not be told "the registry is full"), or `admission_busy`
+   * (fix-round-6 — the registry's OWN admission-lock waiter queue was
+   * already at its cap; a momentary serialization-primitive saturation,
+   * not a statement about how many peers are registered). The caller must
+   * surface this as an explicit refusal, never treat it as a silent no-op
+   * success.
+   *
+   * `origin` is REQUIRED (MUST-FIX 2, fix-round-2 RECHECK — was optional;
+   * see MAX_FEDERATION_PEERS_PER_ORIGIN's doc for why "omit it and the quota
+   * is silently skipped" was itself the defect): the agent-session
+   * principal that recorded the underlying handshake result. A caller with
+   * no real session context passes `AGENT_UNKNOWN_ORIGIN`
+   * (handshake/tools.ts) explicitly — that bucket is itself quota-bounded,
+   * never an unaccounted escape hatch.
+   *
+   * ASYNC (MUST-FIX 6): `this.peers.set()` is async (see bounded-map.ts) so
+   * a global-capacity eviction can durably audit BEFORE the delete.
    */
-  registerFromHandshake(
+  async registerFromHandshake(
     result: HandshakeResult,
     peerDid: string,
-    capabilities?: Partial<FederationCapabilities>
-  ): FederationPeer {
+    capabilities: Partial<FederationCapabilities> | undefined,
+    origin: string
+  ): Promise<RegisterPeerResult> {
     const existing = this.peers.get(result.counterparty_id);
     const now = new Date().toISOString();
 
@@ -66,8 +314,8 @@ export class FederationRegistry {
       peer.trust_tier = "self-attested";
     }
 
-    this.peers.set(result.counterparty_id, peer);
-    return peer;
+    const setResult = await this.peers.set(result.counterparty_id, peer, origin);
+    return setResult.ok ? { ok: true, peer } : { ok: false, reason: setResult.reason };
   }
 
   /**
@@ -79,7 +327,7 @@ export class FederationRegistry {
     if (!peer) return null;
 
     // Check if handshake has expired
-    if (peer.active && new Date(peer.handshake_result.expires_at) <= new Date()) {
+    if (!isPeerCurrentlyActive(peer, new Date())) {
       peer.active = false;
       peer.trust_tier = "self-attested"; // Degrade to self-attested when expired
     }
@@ -89,13 +337,22 @@ export class FederationRegistry {
 
   /**
    * List all known peers, optionally filtered by status.
+   *
+   * BOUNDED (register LD2-04, AGENTS.md rule 8(d)): `boundedList` reads at
+   * most MAX_FEDERATION_PEERS entries — the registry's own hard cap — so
+   * this can never do unbounded work regardless of how many peers a caller
+   * has registered; it's the same bound `Array.from(this.peers.values())`
+   * had implicitly (the underlying map is itself capped), made explicit via
+   * the primitive built for it rather than materializing through a bare
+   * Map method.
    */
   listPeers(filter?: { active_only?: boolean }): FederationPeer[] {
-    const peers = Array.from(this.peers.values());
+    const peers = this.peers.boundedList(MAX_FEDERATION_PEERS);
+    const now = new Date();
 
     // Update active status before filtering
     for (const peer of peers) {
-      if (peer.active && new Date(peer.handshake_result.expires_at) <= new Date()) {
+      if (!isPeerCurrentlyActive(peer, now)) {
         peer.active = false;
         peer.trust_tier = "self-attested";
       }
@@ -219,12 +476,28 @@ export class FederationRegistry {
     return this.peers.delete(peerId);
   }
 
+  /** How many peers `origin` currently holds. Historically how
+   * federation/tools.ts picked its refusal message, when
+   * `registerFromHandshake` returned a bare null on refusal; since the
+   * fix-round-4 typed `RegisterPeerResult`, production callers read
+   * `reason` off the result instead, and this accessor remains for the
+   * adversarial regression suite to assert per-origin accounting
+   * directly. */
+  peerOriginSize(origin: string): number {
+    return this.peers.originSize(origin);
+  }
+
+  /** The per-origin quota this registry enforces (MAX_FEDERATION_PEERS_PER_ORIGIN). */
+  maxPeersPerOrigin(): number {
+    return MAX_FEDERATION_PEERS_PER_ORIGIN;
+  }
+
   /**
    * Get the handshake results map (for tier resolution integration).
    */
   getHandshakeResults(): Map<string, HandshakeResult> {
     const results = new Map<string, HandshakeResult>();
-    for (const [id, peer] of this.peers) {
+    for (const [id, peer] of this.peers.entries()) {
       if (peer.active) {
         results.set(id, peer.handshake_result);
       }

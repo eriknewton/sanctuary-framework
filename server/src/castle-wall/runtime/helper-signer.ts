@@ -48,7 +48,12 @@ export type ShimInvoker = (
 export interface HelperSignerClientOptions {
   /** Absolute path to the code-signed `castle-wall-signer-client` shim. */
   clientBinaryPath: string;
-  /** Per-invocation timeout. Default 10s (signing is low-frequency). */
+  /**
+   * Per-invocation timeout. Default 10s. This SIGKILL deadline is what
+   * guarantees every sign call settles; the arm-lease emission chain relies
+   * on it as its ONLY deadline bound (must match the liveness contract on
+   * `MacOSLeaseSigner` in `macos-ipc-listener.ts`).
+   */
   timeoutMs?: number;
   /** Override the process runner (tests). */
   invoke?: ShimInvoker;
@@ -107,8 +112,11 @@ function spawnInvoker(clientBinaryPath: string, timeoutMs: number): ShimInvoker 
 
 /**
  * Talks to the root signer helper through the shim. Stateless; one short-lived
- * shim process per call (signing is low-frequency — policy load/reload + each
- * sysext handshake, never per-flow).
+ * shim process per call. Cadence: policy load/reload, each sysext handshake,
+ * and — since O-02 — one arm-lease signature per heartbeat interval while the
+ * wall is armed (default 5s), so signing is steady-state periodic, though
+ * still never per-flow. The listener coalesces heartbeats queued behind a
+ * slow shim, so a stalled helper bounds the backlog rather than growing it.
  */
 export class HelperSignerClient {
   private readonly invoke: ShimInvoker;

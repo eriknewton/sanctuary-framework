@@ -50,7 +50,8 @@ final class FilterProviderTests: XCTestCase {
     func flow(
         agentId: String = "agent-7",
         host: String? = "api.anthropic.com",
-        port: Int = 443
+        port: Int = 443,
+        sourceRuid: uid_t = 0
     ) -> FilterFlowDescriptor {
         return FilterFlowDescriptor(
             sourceAppIdentifier: "ai.sanctuaryprotocol.test",
@@ -62,10 +63,18 @@ final class FilterProviderTests: XCTestCase {
             networkProtocol: .tcp,
             hostnameSource: host != nil ? "sni" : nil,
             opaqueDestination: host == nil,
+            sourceRuid: sourceRuid,
             // Attributed agent flow: these fixtures exercise the allowlist
             // allow-path, not the #905 unattributed fail-closed suppression.
             sourceUnattributed: false
         )
+    }
+
+    // AR-1: a uid-mode origin descriptor. agentUid 600 is the confined agent;
+    // any ruid >= systemUidAllowCeiling (500) that is not 600 classifies as the
+    // OPERATOR (the recovery carve-out target). ruid 600 classifies as the AGENT.
+    func uidOrigin() -> AgentOriginDescriptor {
+        return AgentOriginDescriptor(mode: .uid, agentUid: 600, systemUidAllowCeiling: 500)
     }
 
     func loadStore(_ store: ManifestStore, rules: [ManifestRule]) {
@@ -120,7 +129,11 @@ final class FilterProviderTests: XCTestCase {
         XCTAssertEqual(outcome, .drop(matchedRuleId: nil))
     }
 
-    func testExpiredArmLeaseFailsOpenWithAuditMarker() {
+    // AR-1: an expired dead-man lease fails CLOSED for an AGENT (the default,
+    // no agentOrigin => everything classifies .agent). A flow the manifest WOULD
+    // have allowed is denied with the dead-man audit id; the fail-open no longer
+    // hands an agent an unconfined window.
+    func testExpiredArmLeaseFailsClosedForAgent() {
         var now = Date(timeIntervalSince1970: 100)
         let lease = ArmLease(now: { now })
         lease.update(ArmLeaseUpdate(armed: true, ttlSeconds: 10, heartbeatIntervalSeconds: 5))
@@ -133,27 +146,75 @@ final class FilterProviderTests: XCTestCase {
             flowCache: cache,
             armLease: lease
         )
-        loadStore(store, rules: [rule(host: "other.example.com")])
+        // The manifest WOULD allow this host; the dead-man window overrides.
+        loadStore(store, rules: [rule(host: "api.anthropic.com", disposition: "allow")])
 
-        let outcome = engine.evaluate(flow(host: "novel.example.com"))
-        XCTAssertEqual(outcome, .allow(matchedRuleId: ArmLease.failOpenRuleId))
-        XCTAssertEqual(cache.count, 0, "fail-open verdicts must not outlive a renewed lease")
+        let outcome = engine.evaluate(flow(host: "api.anthropic.com"))
+        XCTAssertEqual(outcome, .drop(matchedRuleId: ArmLease.failClosedDeadManRuleId))
+        XCTAssertEqual(cache.count, 0, "degraded verdicts must not outlive a renewed lease")
     }
 
-    func testStoppedHeartbeatFailsOpenWithAuditMarker() {
+    // AR-1 carve-out: the SAME expired dead-man lease still fails OPEN for the
+    // OPERATOR, so an SSH-only operator can recover a daemon-down box. Same lease
+    // state, operator ruid (601 >= ceiling 500, != agentUid 600).
+    func testExpiredArmLeaseFailsOpenForOperatorRecovery() {
+        var now = Date(timeIntervalSince1970: 100)
+        let lease = ArmLease(now: { now })
+        lease.update(ArmLeaseUpdate(armed: true, ttlSeconds: 10, heartbeatIntervalSeconds: 5))
+        now = Date(timeIntervalSince1970: 111)
+
+        let store = ManifestStore()
+        let engine = FlowEvaluatorEngine(
+            manifestStore: store,
+            agentOrigin: uidOrigin(),
+            armLease: lease
+        )
+        loadStore(store, rules: [rule(host: "api.anthropic.com", disposition: "allow")])
+
+        XCTAssertEqual(
+            engine.evaluate(flow(host: "blocked.example.com", sourceRuid: 601)),
+            .allow(matchedRuleId: ArmLease.failOpenRuleId)
+        )
+    }
+
+    // AR-1: the agent side under an EXPLICIT uid origin (ruid 600 == agentUid)
+    // still fails closed on the same lease.
+    func testExpiredArmLeaseFailsClosedForConfinedAgentUid() {
+        var now = Date(timeIntervalSince1970: 100)
+        let lease = ArmLease(now: { now })
+        lease.update(ArmLeaseUpdate(armed: true, ttlSeconds: 10, heartbeatIntervalSeconds: 5))
+        now = Date(timeIntervalSince1970: 111)
+
+        let store = ManifestStore()
+        let engine = FlowEvaluatorEngine(
+            manifestStore: store,
+            agentOrigin: uidOrigin(),
+            armLease: lease
+        )
+        loadStore(store, rules: [rule(host: "api.anthropic.com", disposition: "allow")])
+
+        XCTAssertEqual(
+            engine.evaluate(flow(host: "api.anthropic.com", sourceRuid: 600)),
+            .drop(matchedRuleId: ArmLease.failClosedDeadManRuleId)
+        )
+    }
+
+    func testStoppedHeartbeatFailsClosedForAgentNoManifest() {
         var now = Date(timeIntervalSince1970: 200)
         let lease = ArmLease(now: { now })
         lease.update(ArmLeaseUpdate(armed: true, ttlSeconds: nil, heartbeatIntervalSeconds: 5))
         now = Date(timeIntervalSince1970: 211)
 
+        // No manifest to consult: an agent flow still fails CLOSED during the
+        // dead-man window (never passes on a degraded, unverifiable posture).
         let engine = FlowEvaluatorEngine(armLease: lease)
         XCTAssertEqual(
             engine.evaluate(flow(host: "blocked.example.com")),
-            .allow(matchedRuleId: ArmLease.failOpenRuleId)
+            .drop(matchedRuleId: ArmLease.failClosedDeadManRuleId)
         )
     }
 
-    func testRevokedArmLeaseFailsOpenWithLeaseRevokedReason() {
+    func testRevokedArmLeaseFailsClosedForAgent() {
         let lease = ArmLease()
         lease.update(ArmLeaseUpdate(armed: false, revoked: true, ttlSeconds: nil, heartbeatIntervalSeconds: 5))
 
@@ -162,7 +223,7 @@ final class FilterProviderTests: XCTestCase {
         let engine = FlowEvaluatorEngine(armLease: lease)
         XCTAssertEqual(
             engine.evaluate(flow(host: "blocked.example.com")),
-            .allow(matchedRuleId: ArmLease.failOpenRuleId)
+            .drop(matchedRuleId: ArmLease.failClosedDeadManRuleId)
         )
     }
 

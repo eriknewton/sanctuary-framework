@@ -1,10 +1,11 @@
 import Foundation
 import NetworkExtension
+import SystemExtensions
 
 /// Headless driver for the Castle Wall content-filter configuration.
 ///
 /// Invoked as `Sanctuary-CastleWall.app/Contents/MacOS/CastleWallHostApp
-/// --headless <enable|disable|status>` (typically by `sanctuary castle-wall
+/// --headless <enable|disable|status|deactivate-system-extension>` (typically by `sanctuary castle-wall
 /// enable|disable` over SSH). Running the HOST APP BINARY itself is the load-
 /// bearing design point: the NE content-filter configuration is owned by the
 /// signed app identity that created it, so only this binary can toggle
@@ -19,13 +20,14 @@ import NetworkExtension
 /// console click for that, once per install.
 enum HeadlessFilterCLI {
     static let headlessFlag = "--headless"
-    static let headlessContractVersion = "2"
+    static let headlessContractVersion = "3"
     private static let defaultTimeoutSeconds = 30.0
 
     enum Action: String {
         case enable
         case disable
         case status
+        case deactivateSystemExtension = "deactivate-system-extension"
     }
 
     struct Invocation: Equatable {
@@ -93,7 +95,9 @@ enum HeadlessFilterCLI {
 
         let ok: Bool
         let action: String
-        /// "enabled" | "disabled" | "needs_user_approval" | "unknown"
+        /// Content-filter states plus the system-extension teardown states:
+        /// "enabled" | "disabled" | "needs_user_approval" | "unknown" |
+        /// "deactivated" | "will_complete_after_reboot" | "failed".
         let state: String
         let error: String?
         let build: Build
@@ -152,7 +156,7 @@ enum HeadlessFilterCLI {
         }
         guard let action else {
             return .usageError(
-                "usage: \(headlessFlag) <enable|disable|status> "
+                "usage: \(headlessFlag) <enable|disable|status|deactivate-system-extension> "
                     + "[--timeout=seconds] [--report-file=path]"
             )
         }
@@ -206,6 +210,8 @@ enum HeadlessFilterCLI {
     static func run(
         _ invocation: Invocation,
         manager: NEFilterManager = .shared(),
+        deactivateSystemExtension: (Double) -> SystemExtensionDeactivationResult =
+            runSystemExtensionDeactivation,
         output: (String) -> Void = { print($0) }
     ) -> ExitCode {
         let action = invocation.action.rawValue
@@ -274,7 +280,93 @@ enum HeadlessFilterCLI {
             return save(manager, invocation: invocation, emit: emit) {
                 Report(ok: true, action: action, state: "disabled", error: nil)
             }
+
+        case .deactivateSystemExtension:
+            // Deactivation removes the enforcement code from the host. It is
+            // never allowed to substitute for disarm: an enabled filter must
+            // be turned off and corroborated before the sysext request starts.
+            guard !currentlyEnabled else {
+                return emit(
+                    Report(
+                        ok: false,
+                        action: action,
+                        state: "unknown",
+                        error: "content filter is still enabled; disable it before deactivating the system extension"
+                    ),
+                    .failure
+                )
+            }
+            let outcome = reportForSystemExtensionDeactivation(
+                deactivateSystemExtension(invocation.timeoutSeconds),
+                action: action
+            )
+            return emit(outcome.report, outcome.exitCode)
         }
+    }
+
+    static func reportForSystemExtensionDeactivation(
+        _ result: SystemExtensionDeactivationResult,
+        action: String = Action.deactivateSystemExtension.rawValue
+    ) -> (report: Report, exitCode: ExitCode) {
+        switch result {
+            case .deactivated:
+                return (
+                    Report(ok: true, action: action, state: "deactivated", error: nil),
+                    .success
+                )
+            case .willCompleteAfterReboot:
+                return (
+                    Report(
+                        ok: true,
+                        action: action,
+                        state: "will_complete_after_reboot",
+                        error: nil
+                    ),
+                    .success
+                )
+            case .needsUserApproval:
+                return (
+                    Report(
+                        ok: false,
+                        action: action,
+                        state: "needs_user_approval",
+                        error: "macOS requires operator approval to deactivate the system extension"
+                    ),
+                    .needsUserApproval
+                )
+            case let .failed(message):
+                return (
+                    Report(ok: false, action: action, state: "unknown", error: message),
+                    .failure
+                )
+            case .timedOut:
+                return (
+                    Report(
+                        ok: false,
+                        action: action,
+                        state: "unknown",
+                        error: "system-extension deactivation timed out"
+                    ),
+                    .timeout
+                )
+        }
+    }
+
+    enum SystemExtensionDeactivationResult: Equatable {
+        case deactivated
+        case willCompleteAfterReboot
+        case needsUserApproval
+        case failed(String)
+        case timedOut
+    }
+
+    private static func runSystemExtensionDeactivation(
+        timeoutSeconds: Double
+    ) -> SystemExtensionDeactivationResult {
+        // OSSystemExtensionRequest.delegate is weak, so keep the bridge alive
+        // for the entire bounded run-loop wait.
+        let deactivator = HeadlessSystemExtensionDeactivator()
+        return deactivator.run(timeoutSeconds: timeoutSeconds)
     }
 
     private static func save(
@@ -351,6 +443,98 @@ enum HeadlessFilterCLI {
             RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
         }
         return .completed(captured.load())
+    }
+}
+
+/// Bounded delegate bridge for the signed host app's deactivation request.
+/// Node cannot own this request: macOS binds it to the app identity that owns
+/// the bundled system extension.
+private final class HeadlessSystemExtensionDeactivator: NSObject,
+    OSSystemExtensionRequestDelegate
+{
+    private static let extensionIdentifier = "ai.sanctuaryprotocol.macos.castle-wall"
+    private let lock = NSLock()
+    private var result: HeadlessFilterCLI.SystemExtensionDeactivationResult?
+    private var approvalNeeded = false
+
+    func run(timeoutSeconds: Double) -> HeadlessFilterCLI.SystemExtensionDeactivationResult {
+        let request = OSSystemExtensionRequest.deactivationRequest(
+            forExtensionWithIdentifier: Self.extensionIdentifier,
+            queue: .main
+        )
+        request.delegate = self
+        OSSystemExtensionManager.shared.submitRequest(request)
+
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
+        while Date() < deadline {
+            if let completed = loadResult() {
+                return completed
+            }
+            RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
+        }
+        if let completed = loadResult() {
+            return completed
+        }
+        return loadApprovalNeeded() ? .needsUserApproval : .timedOut
+    }
+
+    private func storeResult(_ value: HeadlessFilterCLI.SystemExtensionDeactivationResult) {
+        lock.lock()
+        result = value
+        lock.unlock()
+    }
+
+    private func loadResult() -> HeadlessFilterCLI.SystemExtensionDeactivationResult? {
+        lock.lock()
+        defer { lock.unlock() }
+        return result
+    }
+
+    private func noteApprovalNeeded() {
+        lock.lock()
+        approvalNeeded = true
+        lock.unlock()
+    }
+
+    private func loadApprovalNeeded() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return approvalNeeded
+    }
+
+    func request(
+        _ request: OSSystemExtensionRequest,
+        didFinishWithResult result: OSSystemExtensionRequest.Result
+    ) {
+        switch result {
+        case .completed:
+            storeResult(.deactivated)
+        case .willCompleteAfterReboot:
+            storeResult(.willCompleteAfterReboot)
+        @unknown default:
+            storeResult(.failed("unknown system-extension deactivation result"))
+        }
+    }
+
+    func request(
+        _ request: OSSystemExtensionRequest,
+        didFailWithError error: Error
+    ) {
+        storeResult(.failed(error.localizedDescription))
+    }
+
+    func requestNeedsUserApproval(_ request: OSSystemExtensionRequest) {
+        // Informational, not terminal: macOS can still deliver didFinish after
+        // approval. Remember it for timeout reporting without racing completion.
+        noteApprovalNeeded()
+    }
+
+    func request(
+        _ request: OSSystemExtensionRequest,
+        actionForReplacingExtension existing: OSSystemExtensionProperties,
+        withExtension ext: OSSystemExtensionProperties
+    ) -> OSSystemExtensionRequest.ReplacementAction {
+        .replace
     }
 }
 

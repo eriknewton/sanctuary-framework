@@ -78,6 +78,7 @@ import {
   isOsKeyringLocation,
   PassphraseUnreadableError,
   PassphraseKeyringUnreachableError,
+  probeExistingCustodyMaterial,
 } from "./passphrase.js";
 import { type DashboardHandle } from "../dashboard/index.js";
 import {
@@ -463,6 +464,15 @@ export function registerProcessShutdownCleanup(
 export interface WrapOptions {
   /** True when the top-level CLI invoked this module through `sanctuary protect`. */
   protectCommand?: boolean;
+  /**
+   * Operator-delegated agent install. Stages recovery outside the fortress
+   * without printing it. On `protect --hermes --provision-agent-account`, it
+   * also permits the already plan-printed privileged flow to continue without
+   * stdin being a TTY. Root remains required for privileged mutations.
+   */
+  agentGuided?: boolean;
+  /** Explicit acknowledgement carried only by the planner's human custody action. */
+  operatorCustody?: boolean;
   /** Run the read-only install preflight and exit before any host mutation. */
   preflight?: boolean;
   /** Render the preflight table as machine-readable JSON. */
@@ -536,6 +546,12 @@ export interface WrapOptions {
    * wraps omit it and use the npx default unchanged.
    */
   devDist?: string;
+  /**
+   * App-sealed production entrypoint used by the full macOS installer.
+   * Unlike --dev-dist, this is the executable command written directly into
+   * the harness config; it carries no node/npm/npx or PATH dependency.
+   */
+  sealedLauncher?: string;
   /**
    * Opt-in plaintext passphrase backup file path. When set, writes the
    * generated passphrase to this file at mode 0600. Default behavior
@@ -736,10 +752,13 @@ function buildSanctuaryEnv(options: WrapOptions): Record<string, string> {
  * install prompt. Upgrades re-run `sanctuary protect`, which rewrites
  * the pin to the new version.
  */
-function resolveSanctuaryCommand(options: WrapOptions): {
+export function resolveSanctuaryCommand(options: WrapOptions): {
   command: string;
   args: string[];
 } {
+  if (options.sealedLauncher !== undefined) {
+    return { command: options.sealedLauncher, args: [] };
+  }
   const useDevDist = options.devDist !== undefined;
   return {
     command: useDevDist ? "node" : "npx",
@@ -752,6 +771,50 @@ function resolveSanctuaryCommand(options: WrapOptions): {
           "sanctuary",
         ],
   };
+}
+
+export class SealedLauncherInvalidError extends Error {
+  constructor(path: string, reason: string) {
+    super(`--sealed-launcher path is invalid: ${reason}\n  path: ${path}`);
+    this.name = "SealedLauncherInvalidError";
+  }
+}
+
+// Must match CASTLE_WALL_SEALED_LAUNCHER in wrap/preflight.ts. This validation
+// is the trust gate; preflight independently checks only path availability.
+const CASTLE_WALL_SEALED_LAUNCHER =
+  "/Applications/Sanctuary-CastleWall.app/Contents/MacOS/sanctuary";
+
+export async function validateSealedLauncher(path: string): Promise<void> {
+  if (!path.startsWith("/")) {
+    throw new SealedLauncherInvalidError(path, "an absolute path is required");
+  }
+  const resolved = resolvePath(path);
+  if (resolved !== path) {
+    throw new SealedLauncherInvalidError(path, "the path must be normalized");
+  }
+  if (path !== CASTLE_WALL_SEALED_LAUNCHER) {
+    throw new SealedLauncherInvalidError(
+      path,
+      `expected the canonical signed-app path ${CASTLE_WALL_SEALED_LAUNCHER}`,
+    );
+  }
+  try {
+    const st = await lstat(path);
+    if (st.isSymbolicLink() || !st.isFile() || (st.mode & 0o111) === 0) {
+      throw new SealedLauncherInvalidError(path, "expected a non-symlink executable file");
+    }
+  } catch (error) {
+    if (error instanceof SealedLauncherInvalidError) throw error;
+    throw new SealedLauncherInvalidError(path, "no such executable file");
+  }
+  const { verifyCastleWallSealedRuntime } = await import("../cli/install.js");
+  if (!(await verifyCastleWallSealedRuntime())) {
+    throw new SealedLauncherInvalidError(
+      path,
+      "the app signature, exact source identity, or sealed runtime manifest did not verify",
+    );
+  }
 }
 
 function resolveAutoProvisionCliBinary(options: WrapOptions): string | undefined {
@@ -2335,6 +2398,7 @@ async function maybeRunAutoProvisionForWrap(
       summary = await runner({
         isTty: process.stdin.isTTY === true,
         preAnsweredProvision: options.provisionAgentAccount,
+        agentGuided: options.agentGuided === true,
         cliBinary: resolveAutoProvisionCliBinary(options),
         stopTransientCastleWallDaemon,
         ...(auditLog ? { auditLog } : {}),
@@ -2543,6 +2607,43 @@ export function renderAutoProvisionOutcomeLines(summary: AutoProvisionSummary): 
       return abortedProvisionLines(outcome);
     default:
       return assertNeverProvisionFlowOutcome(outcome);
+  }
+}
+
+/**
+ * Agent-guided full-profile actions are transactional from the planner's
+ * perspective: only a terminal armed outcome may exit successfully. The
+ * ordinary cooperative wrap keeps its historical exit semantics, while the
+ * exact planner-generated human action gets a machine-readable nonzero result
+ * for every skipped, aborted, rolled-back, or indeterminate provision.
+ */
+export function agentGuidedAutoProvisionExitCode(
+  summary: AutoProvisionSummary,
+  agentGuided: boolean,
+  fullProfileProvisioning: boolean,
+): 2 | undefined {
+  if (!agentGuided || !fullProfileProvisioning) return undefined;
+  if (
+    summary.ran &&
+    (summary.outcome?.kind === "armed" || summary.outcome?.kind === "armed-exclusive")
+  ) {
+    return undefined;
+  }
+  return 2;
+}
+
+function markAgentGuidedAutoProvisionExit(
+  summary: AutoProvisionSummary,
+  agentGuided: boolean,
+  fullProfileProvisioning: boolean,
+): void {
+  const code = agentGuidedAutoProvisionExitCode(
+    summary,
+    agentGuided,
+    fullProfileProvisioning,
+  );
+  if (code !== undefined && (process.exitCode === undefined || process.exitCode === 0)) {
+    process.exitCode = code;
   }
 }
 
@@ -2822,6 +2923,54 @@ export async function runWrap(
 ): Promise<void> {
   installProcessShutdownListeners();
 
+  // This operator acknowledgement is valid for one exact planner-declared
+  // shape only. Validate it before unwrap or any other early dispatch so an
+  // incompatible flag can never reach a mutating verb.
+  const selectedHarnessCount = [
+    options.openclaw,
+    options.hermes,
+    options.claudeCode,
+    options.cursor,
+    options.cline,
+    options.mastra,
+  ].filter((selected) => selected === true).length;
+  const operatorCustodyShapeInvalid =
+    options.operatorCustody === true &&
+    ((deps.osPlatform ?? platform)() !== "darwin" ||
+      options.agentGuided !== true ||
+      options.protectCommand !== true ||
+      options.provisionAgentAccount !== false ||
+      selectedHarnessCount !== 1 ||
+      options.wrap !== undefined ||
+      options.passphrase !== undefined ||
+      options.writePassphraseBackup !== undefined ||
+      options.devDist !== undefined ||
+      (options.sealedLauncher !== undefined &&
+        options.sealedLauncher !== CASTLE_WALL_SEALED_LAUNCHER) ||
+      options.noOpen !== true ||
+      options.dryRun === true ||
+      options.preflight === true ||
+      options.preflightJson === true ||
+      options.preflightStrict === true ||
+      options.unwrap === true ||
+      options.noDashboard === true ||
+      options.port !== undefined ||
+      options.allowPlaintextRemote === true ||
+      options.anchorTransparency === true ||
+      options.exclusiveEgress === true ||
+      options.overwriteDestination === true ||
+      options.repairEgressGate === true ||
+      options.standDownAgent === true ||
+      options.overrideTransientPfRules === true ||
+      options.unprotectEgressGate === true);
+  if (operatorCustodyShapeInvalid) {
+    // SAFETY: fixed flag-validation text only.
+    console.error(
+      "\n  Sanctuary protect: --operator-custody is valid only on the planner-declared human protect --agent-guided action.\n",
+    );
+    process.exit(2);
+  }
+
   if (options.preflight === true && options.unwrap === true) {
     // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
     console.error("\n  Sanctuary protect: --preflight cannot be combined with --unwrap.\n");
@@ -2854,13 +3003,51 @@ export async function runWrap(
     process.exit(2);
   }
 
+  if (
+    options.agentGuided === true &&
+    (options.protectCommand !== true ||
+      options.repairEgressGate === true ||
+      options.unprotectEgressGate === true)
+  ) {
+    // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
+    console.error(
+      "\n  Sanctuary protect: --agent-guided is valid only on the protect install flow, not repair/unprotect verbs.\n",
+    );
+    process.exit(2);
+  }
+
+  // Validate the app-sealed entrypoint before preflight reports it as the
+  // persistent CLI. The canonical path is not enough: the signature, exact
+  // source identity, and sealed runtime manifest must all verify first.
+  if (options.sealedLauncher !== undefined) {
+    try {
+      await validateSealedLauncher(options.sealedLauncher);
+    } catch (err) {
+      if (err instanceof SealedLauncherInvalidError) {
+        // SAFETY: stderr is the operator-facing CLI channel; the error names only the code-controlled launcher path and validation reason.
+        console.error(`\n  Sanctuary wrap: ${err.message}\n`);
+        process.exit(2);
+      }
+      throw err;
+    }
+  }
+
+  // This automatic preflight probes the signed macOS enforcement app, system
+  // extension consent, and dedicated-account services. It belongs only to the
+  // full Hermes provisioning flow; cooperative installs for other harnesses do
+  // not mutate those surfaces and retain their own path-specific validation.
   const protectInstallFlow =
     options.protectCommand === true &&
+    options.hermes === true &&
+    options.provisionAgentAccount !== false &&
     options.repairEgressGate !== true &&
     options.unprotectEgressGate !== true;
   if (options.protectCommand === true && (options.preflight === true || protectInstallFlow)) {
     const preflight = await (deps.runProtectPreflight ?? runProtectPreflight)({
       strict: options.preflightStrict === true,
+      sealedLauncherPath: options.sealedLauncher,
+      allowMatchingBootDaemon:
+        protectInstallFlow && options.preflight !== true,
     });
     const preflightCode = protectPreflightExitCode(
       preflight,
@@ -2897,6 +3084,56 @@ export async function runWrap(
         process.exit(2);
       }
       throw err;
+    }
+  }
+
+  // Resolve/persist the passphrase before config detection/bootstrap and every
+  // fortress/recovery write on the agent-guided path. This is the real custody
+  // capability check: a read-only Keychain probe cannot prove writability (an
+  // SSH session may report item-not-found and then refuse the write). The
+  // resolved value is cached only in this process and consumed by the ordinary
+  // wrap flow below; it never reaches argv, config, or planner output.
+  let preResolvedAgentPassphrase:
+    | { value: string; location: string; source: string }
+    | undefined;
+  if (options.agentGuided === true && options.dryRun !== true) {
+    const earlyStoragePath = resolveStoragePath();
+    const existingCustody = await probeExistingCustodyMaterial(earlyStoragePath);
+    if (
+      (deps.osPlatform ?? platform)() === "darwin" &&
+      options.operatorCustody !== true &&
+      existingCustody !== "present"
+    ) {
+      // SAFETY: fixed operator-handoff text; no probe detail or secret is emitted.
+      console.error(
+        "\n  Sanctuary protect: first macOS custody is a human action. " +
+          "Run the exact planner-declared --operator-custody command in a private local desktop Terminal.\n" +
+          "  An agent must not add this flag, retry autonomously, or receive any login password, passphrase, or recovery key.\n",
+      );
+      process.exit(2);
+      return;
+    }
+    if (options.passphrase !== undefined) {
+      const persist =
+        deps.persistPassphrase ??
+        ((value: string) => persistUserProvidedPassphrase(value, { storagePath: earlyStoragePath }));
+      const persisted = await persist(options.passphrase);
+      preResolvedAgentPassphrase = {
+        value: options.passphrase,
+        location: persisted.location,
+        source: persisted.source,
+      };
+    } else if (process.env.SANCTUARY_PASSPHRASE !== undefined) {
+      preResolvedAgentPassphrase = {
+        value: process.env.SANCTUARY_PASSPHRASE,
+        location: "SANCTUARY_PASSPHRASE",
+        source: "env",
+      };
+    } else {
+      const resolve =
+        deps.resolvePassphrase ??
+        (() => getOrCreatePassphrase({ storagePath: earlyStoragePath }));
+      preResolvedAgentPassphrase = await resolve();
     }
   }
 
@@ -3392,7 +3629,26 @@ export async function runWrap(
   // only; never persisted to disk beyond the existing keychain write
   // and never injected into the rewritten harness env.
   let passphraseValue: string | undefined;
-  if (options.passphrase) {
+  if (preResolvedAgentPassphrase !== undefined) {
+    passphraseLocation = preResolvedAgentPassphrase.location;
+    passphraseSource = preResolvedAgentPassphrase.source;
+    passphraseValue = preResolvedAgentPassphrase.value;
+    if (options.passphrase !== undefined) {
+      // SAFETY: destination description only; never the supplied value.
+      console.error(
+        `\n  \u{1F510} Persisted user-supplied passphrase (${passphraseLocation}).`,
+      );
+      // SAFETY: fixed backup instruction only; never the supplied value.
+      console.error("  Back up with: sanctuary export-passphrase");
+    } else if (passphraseSource === "generated") {
+      // SAFETY: destination description only; never the generated value.
+      console.error(
+        `\n  \u{1F510} Generated and stored passphrase (${passphraseLocation}).`,
+      );
+      // SAFETY: fixed backup instruction only; never the generated value.
+      console.error("  Back up with: sanctuary export-passphrase");
+    }
+  } else if (options.passphrase) {
     try {
       const persist =
         deps.persistPassphrase ??
@@ -3500,6 +3756,7 @@ export async function runWrap(
         storagePath,
         passphrase: passphraseValue,
         interactive: !options.noOpen && process.stdin.isTTY === true,
+        agentGuided: options.agentGuided === true,
       });
     } catch (err) {
       if (err instanceof CustodyUnlockError) {
@@ -4355,6 +4612,11 @@ export async function runWrap(
     );
     const autoProvisionSummary = autoProvisionRun.summary;
     renderAutoProvisionOutcome(autoProvisionSummary);
+    markAgentGuidedAutoProvisionExit(
+      autoProvisionSummary,
+      options.agentGuided === true,
+      protectInstallFlow,
+    );
     await exitAfterDeferredAutoProvisionSignal(autoProvisionRun.deferredSignal);
     bestEffortUpsertLocalAgentProtectionSubject({
       storagePath,
@@ -4613,6 +4875,11 @@ export async function runWrap(
   );
   const autoProvisionSummary = autoProvisionRun.summary;
   renderAutoProvisionOutcome(autoProvisionSummary);
+  markAgentGuidedAutoProvisionExit(
+    autoProvisionSummary,
+    options.agentGuided === true,
+    protectInstallFlow,
+  );
   await exitAfterDeferredAutoProvisionSignal(autoProvisionRun.deferredSignal);
   bestEffortUpsertLocalAgentProtectionSubject({
     storagePath,
@@ -5994,6 +6261,7 @@ const WRAP_VALUE_FLAGS = new Set([
   "--dashboard-port",
   "--fortress",
   "--dev-dist",
+  "--sealed-launcher",
   "--write-passphrase-backup",
 ]);
 
@@ -6011,6 +6279,8 @@ const WRAP_BOOLEAN_FLAGS = new Set([
   "--no-dashboard",
   "--allow-plaintext-remote",
   "--anchor-transparency",
+  "--agent-guided",
+  "--operator-custody",
   "--provision-agent-account",
   "--no-provision-agent-account",
   "--exclusive-egress",
@@ -6122,6 +6392,12 @@ export function parseWrapArgs(argv: string[]): WrapOptions {
       case "--anchor-transparency":
         options.anchorTransparency = true;
         break;
+      case "--agent-guided":
+        options.agentGuided = true;
+        break;
+      case "--operator-custody":
+        options.operatorCustody = true;
+        break;
       case "--provision-agent-account":
         options.provisionAgentAccount = true;
         break;
@@ -6161,6 +6437,9 @@ export function parseWrapArgs(argv: string[]): WrapOptions {
       case "--dev-dist":
         options.devDist = argv[++i];
         break;
+      case "--sealed-launcher":
+        options.sealedLauncher = argv[++i];
+        break;
       case "--write-passphrase-backup":
         options.writePassphraseBackup = argv[++i];
         break;
@@ -6185,6 +6464,9 @@ export function parseWrapArgs(argv: string[]): WrapOptions {
   }
   if (options.preflight === true && options.unwrap === true) {
     throw new Error("--preflight cannot be combined with --unwrap.");
+  }
+  if (options.devDist !== undefined && options.sealedLauncher !== undefined) {
+    throw new Error("--sealed-launcher cannot be combined with --dev-dist.");
   }
 
   return options;
@@ -6249,6 +6531,10 @@ function printWrapHelp(): void {
                        counts, policy data, or fortress identifiers.
                        Equivalent to running
                        \`sanctuary transparency anchor enable\` later.
+    --agent-guided     Agent-install mode: stages recovery outside the fortress
+                       without printing it. With Hermes account provisioning,
+                       also permits the printed privileged plan to continue on
+                       a non-TTY; root/sudo remains required.
     --dev-dist <path>  Dogfood path. Point the harness MCP entries at a
                        local Sanctuary build (\`node <path>\` instead of the
                        version-pinned npx registry entry). Required
@@ -6256,6 +6542,10 @@ function printWrapHelp(): void {
                        version doesn't have new subcommands yet, and
                        npx pulls from the registry, not your checkout.
                        Pass the absolute path to dist/cli.js.
+    --sealed-launcher <path>
+                       Signed-app production path. Write this absolute
+                       executable directly into the harness MCP config with
+                       no node/npm/npx or PATH dependency.
     --stand-down-agent
                        With --repair-egress-gate or --unprotect-egress-gate,
                        acknowledge and permit the required agent-harness stop.

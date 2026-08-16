@@ -113,7 +113,7 @@ export interface TierMetadata {
  */
 export function resolveTier(
   counterpartyId: string,
-  handshakeResults: Map<string, HandshakeResult>,
+  handshakeResults: ReadonlyMap<string, HandshakeResult>,
   hasSanctuaryIdentity: boolean
 ): TierMetadata {
   const handshake = handshakeResults.get(counterpartyId);
@@ -150,12 +150,50 @@ export function resolveTier(
  * handshake (never the wrong one — no over-crediting); a miss (including a
  * counterparty whose signing key has rotated away from the DID) falls through to
  * the original instance_id lookup, preserving today's behavior.
+ *
+ * `localIdentityDids` is a DID-STRING set (this function's contract is
+ * DID-shaped throughout), so a caller MUST include every DID encoding for
+ * each local identity it is capping — `core/identity.ts`'s
+ * `localDidEncodings(identity.public_key)` builds both the canonical and
+ * legacy forms from the identity's raw key material. A set built from only
+ * `identity.did` covers whichever ONE encoding that identity happens to be
+ * persisted under and silently misses the other (the #1194-class defect).
  */
 export function resolveTierByDid(
   counterpartyDid: string,
-  handshakeResults: Map<string, HandshakeResult>,
-  hasSanctuaryIdentity: boolean
+  handshakeResults: ReadonlyMap<string, HandshakeResult>,
+  hasSanctuaryIdentity: boolean,
+  localIdentityDids?: ReadonlySet<string>
 ): TierMetadata {
+  // REP-01 (register §Z RECHECK) — the self-vouch chokepoint. A handshake entry
+  // for a LOCALLY-HELD identity is a self-vouch, never independent verification:
+  // this map holds counterparties THIS instance verified, and a genuine remote
+  // peer's verification of one of our identities lives in the PEER's map, never
+  // ours. So a match against a local DID can only have been minted by handshaking
+  // ourselves — with an identical key, OR (the case the same-key protocol guard
+  // does NOT catch) two distinct keys the operator holds. Crediting it lets an
+  // agent launder its own attestations up to full signer tier. Never credit a
+  // local DID: a local signer resolves to self-attested regardless of any
+  // handshake entry, which is also the honest posture (its credibility is not
+  // established by our own map). This one check closes every self-vouch key
+  // variant; the protocol-level same-key rejection is defense-in-depth for the
+  // obviously-degenerate case. Callers pass the local DID set; when omitted (a
+  // genuine remote-counterparty lookup) the credit path is unchanged.
+  if (localIdentityDids?.has(counterpartyDid)) {
+    return hasSanctuaryIdentity
+      ? { sovereignty_tier: "self-attested" }
+      : { sovereignty_tier: "unverified" };
+  }
+  // BOUNDED (AGENTS.md rule 8(d)): `handshakeResults` is the shared,
+  // CAPPED map from handshake/tools.ts (MAX_HANDSHAKE_RESULTS, currently
+  // 1000, itself further bounded per-origin by
+  // MAX_HANDSHAKE_RESULTS_PER_ORIGIN). This scan is O(map size), which is
+  // therefore O(1000) worst case — a full iteration decoding + comparing a
+  // base64url key per entry, no KDF, no I/O — a bounded, constant cost per
+  // request rather than unbounded growth, even though there is no index
+  // from DID to instance_id to avoid it (the map is keyed by instance_id,
+  // and building a parallel DID index for a 1000-entry map is not worth
+  // the added state for the marginal lookup-cost win).
   for (const [instanceId, result] of handshakeResults) {
     try {
       const did = publicKeyToDid(fromBase64url(result.counterparty_shr.signed_by));

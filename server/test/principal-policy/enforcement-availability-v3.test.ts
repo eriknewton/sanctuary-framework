@@ -321,7 +321,7 @@ describe("level-triggered enforcement availability surfaces", () => {
   it("I6/I7 CLI status prints undetermined/non-green availability reasons instead of protected wording", async () => {
     await withTempFortress(async (fortressPath) => {
       const out = new CaptureStream();
-      const code = await runStatus({
+      const code = await runStatus([], {
         out,
         env: { SANCTUARY_STORAGE_PATH: fortressPath },
         platform: "darwin",
@@ -347,7 +347,7 @@ describe("level-triggered enforcement availability surfaces", () => {
       expect(out.text()).not.toMatch(/protected|enforcing/);
 
       const failed = new CaptureStream();
-      const failedCode = await runStatus({
+      const failedCode = await runStatus([], {
         out: failed,
         env: { SANCTUARY_STORAGE_PATH: fortressPath },
         platform: "darwin",

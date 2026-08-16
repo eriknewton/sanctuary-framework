@@ -207,7 +207,7 @@ Environment variables:
 
 Sanctuary is designed to run as a parallel MCP server. It adds the substrate underneath your agent without replacing any of its existing tools. Both servers appear in the same session as independent tool providers. Castle Wall enforcement (Layer 1) operates at the OS level regardless of which MCP servers the agent uses; the wall sees egress, not MCP routing.
 
-For the full setup guide (installation options, passphrase management, systemd units, egress filter configuration), see [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
+For the full setup guide (installation options, passphrase management, bootstrap, rollback), see [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
 
 For a reference MCP config, see [`docs/examples/parallel-mcp-config.json`](docs/examples/parallel-mcp-config.json).
 

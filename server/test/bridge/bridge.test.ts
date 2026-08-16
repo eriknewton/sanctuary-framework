@@ -20,8 +20,18 @@ import {
 import { hash } from "../../src/core/hashing.js";
 import { encrypt, decrypt, type EncryptedPayload } from "../../src/core/encryption.js";
 import { IdentityManager } from "../../src/cognitive/tools.js";
-import { createBridgeTools } from "../../src/bridge/tools.js";
+import {
+  createBridgeTools,
+  MAX_BRIDGE_COMMITMENTS_PER_ORIGIN,
+  MAX_BRIDGE_ATTESTATIONS_PER_ORIGIN,
+  type BridgeToolsTestOverrides,
+} from "../../src/bridge/tools.js";
 import { ReputationStore } from "../../src/reputation/reputation-store.js";
+import { createReputationTools } from "../../src/reputation/tools.js";
+import {
+  normalizeToolArgsForValidation,
+  ToolArgumentValidationError,
+} from "../../src/tool-args.js";
 import {
   BRIDGE_ATTESTATION_BEHAVIORAL_METRIC_ALLOWLIST,
   BRIDGE_METRIC_POLICY,
@@ -67,7 +77,10 @@ function stubAuditLog(): AuditLog {
   } as unknown as AuditLog;
 }
 
-async function makeBridgeHarness() {
+async function makeBridgeHarness(
+  testOverrides?: BridgeToolsTestOverrides,
+  auditLog?: AuditLog
+) {
   const storage = new MemoryStorage();
   const masterKey = generateRandomKey();
   const identityEncKey = derivePurposeKey(masterKey, "identity-encryption");
@@ -81,11 +94,19 @@ async function makeBridgeHarness() {
   await identityManager.save(outsider.storedIdentity);
   await identityManager.setPrimary(signer.storedIdentity.identity_id);
 
+  // MUST-FIX 2 (LD3 gate fix-round-2): createBridgeTools now requires an
+  // injected ReputationStore rather than constructing its own — mirrors
+  // index.ts's production wiring, where the SAME instance is shared with
+  // createReputationTools.
+  const reputationStore = new ReputationStore(storage, masterKey);
   const { tools } = createBridgeTools(
     storage,
     masterKey,
     identityManager,
-    stubAuditLog()
+    auditLog ?? stubAuditLog(),
+    reputationStore,
+    undefined,
+    testOverrides
   );
 
   const byName = (name: string): ToolDefinition => {
@@ -520,10 +541,22 @@ describe("Concordia Bridge", () => {
       expect(commitment.pedersen_commitment!.blinding_factor).toBeTruthy();
     });
 
-    it("produces unique commitment IDs", () => {
+    it("commitment IDs are content-derived: identical (session_id, terms_hash, committer_did) always produce the SAME id (LD6 BP-DEADLINE-03)", () => {
+      // The id is deterministic from the tuple that identifies the
+      // negotiation, not random per call -- this is the property that lets
+      // a timed-out bridge_commit retry safely (see BridgeStore's
+      // existence guard, bridge/tools.ts). Two mints of the identical
+      // outcome/identity therefore collide on purpose.
       const outcome = makeOutcome();
       const c1 = createBridgeCommitment(outcome, identity, identityEncKey);
       const c2 = createBridgeCommitment(outcome, identity, identityEncKey);
+
+      expect(c1.bridge_commitment_id).toBe(c2.bridge_commitment_id);
+    });
+
+    it("commitment IDs differ when the identifying tuple differs", () => {
+      const c1 = createBridgeCommitment(makeOutcome({ session_id: "session-a" }), identity, identityEncKey);
+      const c2 = createBridgeCommitment(makeOutcome({ session_id: "session-b" }), identity, identityEncKey);
 
       expect(c1.bridge_commitment_id).not.toBe(c2.bridge_commitment_id);
     });
@@ -1168,11 +1201,17 @@ describe("Concordia Bridge", () => {
       await identityManager.save(counterparty.storedIdentity);
       await identityManager.setPrimary(signer.storedIdentity.identity_id);
 
+      // MUST-FIX 2 (LD3 gate fix-round-2): inject a ReputationStore built
+      // over the SAME faulting backend, so both bridge_attest's writes
+      // (through this injected store) and this test's own query() checks
+      // below observe the same simulated read fault.
+      const reputationStore = new ReputationStore(faulting, harnessMasterKey);
       const { tools } = createBridgeTools(
         faulting,
         harnessMasterKey,
         identityManager,
-        stubAuditLog()
+        stubAuditLog(),
+        reputationStore
       );
       const byName = (name: string): ToolDefinition => {
         const tool = tools.find((t) => t.name === name);
@@ -1203,14 +1242,18 @@ describe("Concordia Bridge", () => {
       expect(first.already_attested).toBe(false);
       expect(first.attestation_id).toBeDefined();
 
-      const reputationStore = new ReputationStore(faulting, harnessMasterKey);
       expect(
         (await reputationStore.query({ context: "concordia-bridge" }))
           .total_interactions
       ).toBe(1);
 
       // Now the dedup scan cannot read the store: the second attest must DENY,
-      // not record a second attestation.
+      // not record a second attestation. LD6 BP-DEADLINE-03: the dedup is
+      // now record()'s own in-lock existence guard, whose primary step is a
+      // content-id READ (not the old namespace LIST) -- a read fault there
+      // surfaces as ReputationStoreQuotaError("scan_unavailable")'s "could
+      // not confirm quota headroom" text rather than the old dedup-specific
+      // wording, so the regex covers both fail-closed phrasings.
       failReputationReads = true;
       const second = parseToolResult(
         await byName("bridge_attest").handler({
@@ -1219,7 +1262,7 @@ describe("Concordia Bridge", () => {
           identity_id: signer.publicIdentity.identity_id,
         })
       );
-      expect(second.error).toMatch(/could not be fully read|not recorded/i);
+      expect(second.error).toMatch(/could not be fully read|not recorded|could not confirm/i);
       expect(second.attestation_id).toBeUndefined();
 
       // No second attestation was written: still exactly one on record.
@@ -1313,6 +1356,570 @@ describe("Concordia Bridge", () => {
       expect(new Date(commitment.committed_at).toISOString()).toBe(
         commitment.committed_at
       );
+    });
+  });
+
+  // ── LD3 BRIDGE-BP-01: store growth bounds ──────────────────────────────
+
+  describe("LD3 BRIDGE-BP-01: bridge/reputation store growth bounds", () => {
+    it("rejects an oversized nested terms object before it ever reaches the handler", async () => {
+      // Reproduces the finding at source: the shared tool-args.ts validator
+      // only capped top-level STRING arguments, so bridge_commit's
+      // object-typed `terms` field had no size bound at all. This drives
+      // the REAL bridge_commit inputSchema through the REAL shared
+      // validator (not a hand-rolled duplicate), so it fails on pre-fix
+      // tool-args.ts and passes after.
+      const { byName, signer, counterparty } = await makeBridgeHarness();
+      const commit = byName("bridge_commit");
+
+      const oversizedTerms = { blob: "x".repeat(2_000_000) }; // ~2MB > 1MB cap
+      const outcome = makeOutcome({
+        proposer_did: signer.publicIdentity.did,
+        acceptor_did: counterparty.publicIdentity.did,
+        terms: oversizedTerms,
+      });
+
+      expect(() =>
+        normalizeToolArgsForValidation({
+          args: { ...outcome, identity_id: signer.publicIdentity.identity_id },
+          schema: commit.inputSchema,
+          toolClass: commit.tool_class,
+        })
+      ).toThrow(ToolArgumentValidationError);
+
+      // A modestly sized terms object (well under the cap) is unaffected.
+      const normalTerms = { price: 100, currency: "USD" };
+      expect(() =>
+        normalizeToolArgsForValidation({
+          args: {
+            ...makeOutcome({
+              proposer_did: signer.publicIdentity.did,
+              acceptor_did: counterparty.publicIdentity.did,
+              terms: normalTerms,
+            }),
+            identity_id: signer.publicIdentity.identity_id,
+          },
+          schema: commit.inputSchema,
+          toolClass: commit.tool_class,
+        })
+      ).not.toThrow();
+    });
+
+    it("bounds bridge_commit growth per origin, bound to callerIdentity not identity_id", async () => {
+      // Reproduces the finding: BridgeCommitmentStore.save() wrote one
+      // permanent record per call with no cap. Two DIFFERENT Sanctuary
+      // identities (identity_id is Tier-3 identity_create-mintable) calling
+      // under the SAME callerIdentity must share ONE quota — proving the
+      // quota is bound to the un-mintable session principal, not the
+      // caller-supplied identity_id.
+      const overrides: BridgeToolsTestOverrides = {
+        maxBridgeCommitments: 1000,
+        maxBridgeCommitmentsPerOrigin: 2,
+      };
+      const { storage, byName, signer, counterparty } = await makeBridgeHarness(overrides);
+      const commit = byName("bridge_commit");
+      const sameOrigin = "agent:flooding-origin";
+
+      const commitOnce = (sessionId: string, identityId: string) =>
+        commit.handler(
+          {
+            ...makeOutcome({
+              session_id: sessionId,
+              proposer_did: signer.publicIdentity.did,
+              acceptor_did: counterparty.publicIdentity.did,
+            }),
+            identity_id: identityId,
+          },
+          sameOrigin
+        );
+
+      const first = parseToolResult(
+        await commitOnce("session-a", signer.publicIdentity.identity_id)
+      );
+      expect(first.bridge_commitment_id).toBeDefined();
+
+      const second = parseToolResult(
+        await commitOnce("session-b", signer.publicIdentity.identity_id)
+      );
+      expect(second.bridge_commitment_id).toBeDefined();
+
+      // Third call is under the SAME origin, using a DIFFERENT (freshly
+      // mintable) identity_id — the quota must still refuse it.
+      const third = parseToolResult(
+        await commitOnce("session-c", counterparty.publicIdentity.identity_id)
+      );
+      expect(third.bridge_commitment_id).toBeUndefined();
+      expect(String(third.error)).toMatch(/quota/i);
+
+      // A DIFFERENT origin is unaffected by this origin's exhausted quota.
+      const otherOrigin = parseToolResult(
+        await commit.handler(
+          {
+            ...makeOutcome({
+              session_id: "session-d",
+              proposer_did: signer.publicIdentity.did,
+              acceptor_did: counterparty.publicIdentity.did,
+            }),
+            identity_id: signer.publicIdentity.identity_id,
+          },
+          "agent:a-different-origin"
+        )
+      );
+      expect(otherOrigin.bridge_commitment_id).toBeDefined();
+
+      // Exactly 3 records exist: the refused call never wrote.
+      const entries = await storage.list("_bridge");
+      expect(entries.length).toBe(3);
+    });
+
+    it("fails closed on global bridge-commitment capacity", async () => {
+      const overrides: BridgeToolsTestOverrides = {
+        maxBridgeCommitments: 2,
+        maxBridgeCommitmentsPerOrigin: 1000,
+      };
+      const { storage, byName, signer, counterparty } = await makeBridgeHarness(overrides);
+      const commit = byName("bridge_commit");
+
+      const commitAs = (sessionId: string, origin: string) =>
+        commit.handler(
+          {
+            ...makeOutcome({
+              session_id: sessionId,
+              proposer_did: signer.publicIdentity.did,
+              acceptor_did: counterparty.publicIdentity.did,
+            }),
+            identity_id: signer.publicIdentity.identity_id,
+          },
+          origin
+        );
+
+      // Two DIFFERENT origins fill the GLOBAL cap (per-origin quota is
+      // generous here, so this isolates the capacity path).
+      expect(
+        (parseToolResult(await commitAs("s1", "agent:origin-1"))).bridge_commitment_id
+      ).toBeDefined();
+      expect(
+        (parseToolResult(await commitAs("s2", "agent:origin-2"))).bridge_commitment_id
+      ).toBeDefined();
+
+      const refused = parseToolResult(await commitAs("s3", "agent:origin-3"));
+      expect(refused.bridge_commitment_id).toBeUndefined();
+      expect(String(refused.error)).toMatch(/capacity/i);
+
+      const entries = await storage.list("_bridge");
+      expect(entries.length).toBe(2);
+    });
+
+    it("bounds bridge_attest growth per origin in the sibling _reputation store", async () => {
+      // Reproduces the sibling shape the finding names: reputation-store.ts's
+      // record() path is keyed only by a fresh attestationId, with no
+      // origin-bound cap. Each attestation here links a DISTINCT bridge
+      // commitment (so the existing same-session dedup never fires) but is
+      // attested under the SAME callerIdentity, which must still be capped.
+      const overrides: BridgeToolsTestOverrides = {
+        maxBridgeCommitments: 1000,
+        maxBridgeCommitmentsPerOrigin: 1000,
+        maxBridgeAttestationsPerOrigin: 2,
+      };
+      const { storage, byName, signer, counterparty } = await makeBridgeHarness(overrides);
+      const commit = byName("bridge_commit");
+      const attest = byName("bridge_attest");
+      const sameOrigin = "agent:attest-flooder";
+
+      const commitAndAttest = async (sessionId: string) => {
+        const committed = parseToolResult(
+          await commit.handler(
+            {
+              ...makeOutcome({
+                session_id: sessionId,
+                proposer_did: signer.publicIdentity.did,
+                acceptor_did: counterparty.publicIdentity.did,
+              }),
+              identity_id: signer.publicIdentity.identity_id,
+            },
+            sameOrigin
+          )
+        );
+        return attest.handler(
+          {
+            bridge_commitment_id: committed.bridge_commitment_id,
+            outcome_result: "completed",
+            identity_id: signer.publicIdentity.identity_id,
+          },
+          sameOrigin
+        );
+      };
+
+      const first = parseToolResult(await commitAndAttest("att-session-1"));
+      expect(first.attestation_id).toBeDefined();
+      expect(first.already_attested).toBe(false);
+
+      const second = parseToolResult(await commitAndAttest("att-session-2"));
+      expect(second.attestation_id).toBeDefined();
+      expect(second.already_attested).toBe(false);
+
+      const third = parseToolResult(await commitAndAttest("att-session-3"));
+      expect(third.attestation_id).toBeUndefined();
+      expect(String(third.error)).toMatch(/quota/i);
+
+      // Exactly 2 attestations were persisted; the refused call never wrote.
+      const entries = await storage.list("_reputation");
+      expect(entries.length).toBe(2);
+    });
+
+    it("MUTATION-PROOF TARGET: concurrent bridge_commit calls at cap-1 never overshoot the per-origin quota (LD3 gate fix-round DEFECT 2)", async () => {
+      // Pre-fix, BridgeStore.save() ran assertOriginWithinQuota(origin) and
+      // the actual storage.write() several awaits apart with no lock
+      // between them. N concurrent bridge_commit calls at cap-1 could all
+      // observe headroom before any of them wrote, overshooting the cap by
+      // up to N-1. This test FAILS on that source (more than 1 of the
+      // concurrent calls succeeds, and the store ends up over `cap`) and
+      // PASSES once the check-then-write section is serialized behind
+      // BridgeStore's admission lock.
+      const cap = 5;
+      const overrides: BridgeToolsTestOverrides = {
+        maxBridgeCommitments: 1000,
+        maxBridgeCommitmentsPerOrigin: cap,
+      };
+      const { storage, byName, signer, counterparty } = await makeBridgeHarness(overrides);
+      const commit = byName("bridge_commit");
+      const origin = "agent:concurrent-commit-flooder";
+
+      const commitOnce = (sessionId: string) =>
+        commit.handler(
+          {
+            ...makeOutcome({
+              session_id: sessionId,
+              proposer_did: signer.publicIdentity.did,
+              acceptor_did: counterparty.publicIdentity.did,
+            }),
+            identity_id: signer.publicIdentity.identity_id,
+          },
+          origin
+        );
+
+      // Fill to cap-1 sequentially (uncontended, establishes the boundary).
+      for (let i = 0; i < cap - 1; i++) {
+        const seeded = parseToolResult(await commitOnce(`seed-${i}`));
+        expect(seeded.bridge_commitment_id).toBeDefined();
+      }
+      expect((await storage.list("_bridge")).length).toBe(cap - 1);
+
+      // Fire MANY concurrent writers all racing the LAST slot. Exactly one
+      // may win; the rest must be refused, never silently overshoot.
+      const CONCURRENT = 8;
+      const results = await Promise.all(
+        Array.from({ length: CONCURRENT }, (_, i) => commitOnce(`race-${i}`))
+      );
+      const parsed = results.map(parseToolResult);
+      const succeeded = parsed.filter((r) => r.bridge_commitment_id !== undefined);
+      const refused = parsed.filter((r) => r.bridge_commitment_id === undefined);
+      expect(succeeded.length).toBe(1);
+      expect(refused.length).toBe(CONCURRENT - 1);
+      for (const r of refused) {
+        expect(String(r.error)).toMatch(/quota/i);
+      }
+
+      // The store's actual persisted size is the ground truth: it must
+      // land exactly at the cap, never over it.
+      const finalEntries = await storage.list("_bridge");
+      expect(finalEntries.length).toBe(cap);
+    });
+
+    it("MUTATION-PROOF TARGET: concurrent bridge_attest calls at cap-1 never overshoot the per-origin attestation quota (LD3 gate fix-round DEFECT 2)", async () => {
+      // Same shape as the bridge_commit race above, reproduced on the
+      // SIBLING check-then-write pair: bridge_attest's countAttestations
+      // ByOriginForContext scan, then reputationStore.record()'s write,
+      // several awaits apart pre-fix. FAILS on pre-fix source (more than
+      // one concurrent attest succeeds, overshooting cap); PASSES once
+      // that check runs INSIDE record()'s own admission lock via
+      // `additionalQuotaCheck`.
+      const cap = 5;
+      const overrides: BridgeToolsTestOverrides = {
+        maxBridgeCommitments: 1000,
+        maxBridgeCommitmentsPerOrigin: 1000,
+        maxBridgeAttestationsPerOrigin: cap,
+      };
+      const { storage, byName, signer, counterparty } = await makeBridgeHarness(overrides);
+      const commit = byName("bridge_commit");
+      const attest = byName("bridge_attest");
+      const origin = "agent:concurrent-attest-flooder";
+
+      const commitSession = async (sessionId: string): Promise<string> => {
+        const committed = parseToolResult(
+          await commit.handler(
+            {
+              ...makeOutcome({
+                session_id: sessionId,
+                proposer_did: signer.publicIdentity.did,
+                acceptor_did: counterparty.publicIdentity.did,
+              }),
+              identity_id: signer.publicIdentity.identity_id,
+            },
+            origin
+          )
+        );
+        return committed.bridge_commitment_id as string;
+      };
+      const attestCommitment = (bridgeCommitmentId: string) =>
+        attest.handler(
+          {
+            bridge_commitment_id: bridgeCommitmentId,
+            outcome_result: "completed",
+            identity_id: signer.publicIdentity.identity_id,
+          },
+          origin
+        );
+
+      // Pre-commit and attest cap-1 DISTINCT sessions sequentially
+      // (uncontended, establishes the boundary). Each attest uses a
+      // distinct session so the pre-existing same-negotiation dedup never
+      // fires and masks the quota race under test.
+      for (let i = 0; i < cap - 1; i++) {
+        const commitmentId = await commitSession(`seed-session-${i}`);
+        const seeded = parseToolResult(await attestCommitment(commitmentId));
+        expect(seeded.attestation_id).toBeDefined();
+      }
+      expect((await storage.list("_reputation")).length).toBe(cap - 1);
+
+      // Pre-commit the racing commitments sequentially (bridge_commit's own
+      // admission lock is exercised by the test above; committing here
+      // sequentially isolates the ATTEST-side race this test targets).
+      const CONCURRENT = 8;
+      const racingCommitmentIds: string[] = [];
+      for (let i = 0; i < CONCURRENT; i++) {
+        racingCommitmentIds.push(await commitSession(`race-session-${i}`));
+      }
+
+      const results = await Promise.all(
+        racingCommitmentIds.map((id) => attestCommitment(id))
+      );
+      const parsed = results.map(parseToolResult);
+      const succeeded = parsed.filter((r) => r.attestation_id !== undefined);
+      const refused = parsed.filter((r) => r.attestation_id === undefined);
+      expect(succeeded.length).toBe(1);
+      expect(refused.length).toBe(CONCURRENT - 1);
+      for (const r of refused) {
+        expect(String(r.error)).toMatch(/quota/i);
+      }
+
+      const finalEntries = await storage.list("_reputation");
+      expect(finalEntries.length).toBe(cap);
+    });
+
+    // MUST-FIX 2 (LD3 gate fix-round-2, the spine finding): production built
+    // TWO separate ReputationStore instances over the SAME `_reputation`
+    // backend (createReputationTools's own + createBridgeTools's own), each
+    // with its OWN in-memory admission lock and quota view. A per-origin
+    // cap enforced correctly WITHIN one instance is not enforced ACROSS two
+    // instances: concurrent reputation_record (through one) and
+    // bridge_attest (through the other) could each observe pre-write
+    // headroom on their own view and both write, overshooting the shared
+    // cap together. This test wires the tools exactly as index.ts's
+    // composition root now does — ONE ReputationStore, injected into BOTH
+    // factories — and races reputation_record against bridge_attest under
+    // the SAME origin at the per-origin cap boundary. It is a
+    // WIRED-CONSUMER test (AGENTS.md rule 4): it constructs the real
+    // production object graph (both tool factories sharing one store), not
+    // ReputationStore in isolation, so it is the test that would have
+    // caught the two-instance topology.
+    it("MUTATION-PROOF TARGET: reputation_record and bridge_attest share ONE per-origin quota through ONE injected ReputationStore (LD3 gate fix-round-2, MUST-FIX 2)", async () => {
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const identityEncKey = derivePurposeKey(masterKey, "identity-encryption");
+      const identityManager = new IdentityManager(storage, masterKey);
+      const signer = createIdentity(
+        "shared-store-signer",
+        identityEncKey,
+        "recovery-key"
+      );
+      const counterparty = createIdentity(
+        "shared-store-counterparty",
+        identityEncKey,
+        "recovery-key"
+      );
+      await identityManager.save(signer.storedIdentity);
+      await identityManager.save(counterparty.storedIdentity);
+      await identityManager.setPrimary(signer.storedIdentity.identity_id);
+
+      const cap = 5;
+      const auditLog = stubAuditLog();
+
+      // Step 13 shape (index.ts): createReputationTools constructs the ONE
+      // ReputationStore and returns it.
+      const { tools: reputationTools, reputationStore } = createReputationTools(
+        storage,
+        masterKey,
+        identityManager,
+        auditLog,
+        undefined,
+        undefined,
+        undefined,
+        { maxReputationRecords: 1000, maxReputationRecordsPerOrigin: cap }
+      );
+      // Step 14c shape (index.ts): createBridgeTools is INJECTED that same
+      // instance, never constructs its own.
+      const { tools: bridgeToolsList } = createBridgeTools(
+        storage,
+        masterKey,
+        identityManager,
+        auditLog,
+        reputationStore
+      );
+
+      const reputationRecord = reputationTools.find(
+        (t) => t.name === "reputation_record"
+      )!;
+      const bridgeCommit = bridgeToolsList.find((t) => t.name === "bridge_commit")!;
+      const bridgeAttest = bridgeToolsList.find((t) => t.name === "bridge_attest")!;
+
+      const origin = "agent:shared-store-flood";
+
+      // Seed cap-1 via reputation_record, uncontended — establishes the
+      // boundary.
+      for (let i = 0; i < cap - 1; i++) {
+        const result = parseToolResult(
+          await reputationRecord.handler(
+            {
+              interaction_id: `seed-${i}`,
+              counterparty_did: counterparty.publicIdentity.did,
+              outcome: { type: "transaction", result: "completed" },
+              identity_id: signer.publicIdentity.identity_id,
+            },
+            origin
+          )
+        );
+        expect(result.attestation_id).toBeDefined();
+      }
+      expect((await storage.list("_reputation")).length).toBe(cap - 1);
+
+      // Pre-commit DISTINCT sessions for the racing bridge_attest calls
+      // (sequential — isolates the SHARED-QUOTA race under test from the
+      // same-negotiation dedup race MUST-FIX 4 covers separately).
+      const CONCURRENT = 4;
+      const commitmentIds: string[] = [];
+      for (let i = 0; i < CONCURRENT; i++) {
+        const committed = parseToolResult(
+          await bridgeCommit.handler(
+            {
+              ...makeOutcome({
+                session_id: `shared-store-race-${i}`,
+                proposer_did: signer.publicIdentity.did,
+                acceptor_did: counterparty.publicIdentity.did,
+              }),
+              identity_id: signer.publicIdentity.identity_id,
+            },
+            origin
+          )
+        );
+        commitmentIds.push(committed.bridge_commitment_id as string);
+      }
+
+      // Race the LAST slot: CONCURRENT reputation_record calls AND
+      // CONCURRENT bridge_attest calls, all under the SAME origin,
+      // simultaneously.
+      const recordCalls = Array.from({ length: CONCURRENT }, (_, i) =>
+        reputationRecord.handler(
+          {
+            interaction_id: `race-record-${i}`,
+            counterparty_did: counterparty.publicIdentity.did,
+            outcome: { type: "transaction", result: "completed" },
+            identity_id: signer.publicIdentity.identity_id,
+          },
+          origin
+        )
+      );
+      const attestCalls = commitmentIds.map((id) =>
+        bridgeAttest.handler(
+          {
+            bridge_commitment_id: id,
+            outcome_result: "completed",
+            identity_id: signer.publicIdentity.identity_id,
+          },
+          origin
+        )
+      );
+
+      const results = (await Promise.all([...recordCalls, ...attestCalls])).map(
+        parseToolResult
+      );
+      const succeeded = results.filter(
+        (r) => r.attestation_id !== undefined && r.error === undefined
+      );
+      expect(succeeded.length).toBe(1);
+
+      // GROUND TRUTH: the SHARED store's actual persisted size lands
+      // exactly at the cap, never over it — a second, independent
+      // admission lock could not guarantee this across both writers.
+      const finalEntries = await storage.list("_reputation");
+      expect(finalEntries.length).toBe(cap);
+    });
+
+    it("uses the real production defaults when no test override is supplied", () => {
+      // Pins the exported constants so a source edit that quietly changes
+      // the production cap (rather than the enforcement logic the tests
+      // above exercise) is still visible in a diff.
+      expect(MAX_BRIDGE_COMMITMENTS_PER_ORIGIN).toBe(500);
+      expect(MAX_BRIDGE_ATTESTATIONS_PER_ORIGIN).toBe(200);
+    });
+
+    // MUST-FIX 4 (LD3 gate fix-round-2): the pre-fix dedup scan ran ONCE,
+    // BEFORE calling reputationStore.record(), with an await gap before the
+    // eventual write — a genuine check-then-write TOCTOU. Two concurrent
+    // bridge_attest calls for the SAME commitment could both observe "no
+    // existing attestation" and both persist, double-counting one
+    // negotiation. FAILS on pre-fix source (more than one attestation
+    // recorded for the same commitment); PASSES once the recheck runs
+    // INSIDE record()'s admission lock via `additionalQuotaCheck`
+    // (checkAttestAdmission), atomically with the write.
+    it("MUTATION-PROOF TARGET: concurrent bridge_attest calls for the SAME commitment dedup to exactly one attestation (LD3 gate fix-round-2, MUST-FIX 4)", async () => {
+      const { storage, byName, signer, counterparty } = await makeBridgeHarness();
+      const commit = byName("bridge_commit");
+      const attest = byName("bridge_attest");
+
+      const outcome = makeOutcome({
+        session_id: "concurrent-dedup-session",
+        proposer_did: signer.publicIdentity.did,
+        acceptor_did: counterparty.publicIdentity.did,
+      });
+      const committed = parseToolResult(
+        await commit.handler({
+          ...outcome,
+          identity_id: signer.publicIdentity.identity_id,
+        })
+      );
+      const commitmentId = committed.bridge_commitment_id as string;
+
+      const attestConcurrently = () =>
+        attest.handler({
+          bridge_commitment_id: commitmentId,
+          outcome_result: "completed",
+          identity_id: signer.publicIdentity.identity_id,
+        });
+
+      // Fire many concurrent attests for the SAME commitment. Exactly one
+      // may actually record; every other one must observe the SAME
+      // attestation_id via the idempotent already_attested response, never
+      // mint a second attestation.
+      const CONCURRENT = 8;
+      const results = await Promise.all(
+        Array.from({ length: CONCURRENT }, () => attestConcurrently())
+      );
+      const parsed = results.map(parseToolResult);
+
+      const fresh = parsed.filter((r) => r.already_attested === false);
+      const idempotent = parsed.filter((r) => r.already_attested === true);
+      expect(fresh.length).toBe(1);
+      expect(idempotent.length).toBe(CONCURRENT - 1);
+
+      const attestationIds = new Set(parsed.map((r) => r.attestation_id));
+      expect(attestationIds.size).toBe(1);
+      expect(fresh[0]!.attestation_id).toBe(idempotent[0]!.attestation_id);
+
+      // The store's actual persisted size is the ground truth: exactly ONE
+      // attestation exists for this negotiation, never more.
+      const finalEntries = await storage.list("_reputation");
+      expect(finalEntries.length).toBe(1);
     });
   });
 });

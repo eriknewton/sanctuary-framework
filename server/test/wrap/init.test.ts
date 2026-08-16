@@ -226,6 +226,15 @@ describe("runInit", () => {
     });
     expect(result.fortressPath).toBe(fortressPath);
 
+    // Fresh init seeds the one true Castle Wall rule-source directory while
+    // still running as the fortress owner. The root boot daemon must never
+    // need to recursively mkdir through this operator-mutable tree.
+    const rulesDirStats = await stat(
+      join(fortressPath, "policy", "egress", "rules"),
+    );
+    expect(rulesDirStats.isDirectory()).toBe(true);
+    expect(rulesDirStats.mode & 0o777).toBe(0o700);
+
     // Recovery key file landed at the fortress path, not at HOME.
     expect(result.recoveryKeyDisclosurePath).toBe(
       join(fortressPath, RECOVERY_KEY_FILENAME),
@@ -593,6 +602,26 @@ describe("runInit", () => {
       "utf-8",
     );
     expect(recoveryFile).toContain("Recovery key:");
+  });
+
+  it("refuses a symlinked policy ancestor under --force without writing outside the fortress", async () => {
+    const fortressPath = join(tmp, "symlinked-policy-fortress");
+    const outside = join(tmp, "outside-policy-target");
+    await mkdir(fortressPath, { recursive: true, mode: 0o700 });
+    await mkdir(outside, { recursive: true, mode: 0o700 });
+    await symlink(outside, join(fortressPath, "policy"));
+
+    await expect(
+      runInit({
+        fortress: fortressPath,
+        force: true,
+        noConfirm: true,
+        noPin: true,
+      }),
+    ).rejects.toThrow(/symlink.*refusing to mkdir/i);
+
+    await expect(stat(join(outside, "egress"))).rejects.toThrow();
+    await expect(stat(join(fortressPath, "state"))).rejects.toThrow();
   });
 
   it("recovery-key.txt is single-issuance: re-init with --force does NOT overwrite", async () => {

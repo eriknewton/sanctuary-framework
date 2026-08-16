@@ -93,3 +93,43 @@ func makeSignedBodyWithRawRules(
     let body = try JSONDecoder().decode(ManifestUpdatedBody.self, from: wireData)
     return (body, privateKey.publicKey.rawRepresentation)
 }
+
+/// Build a validly-signed arm-lease frame (O-02) the way the TS listener does:
+/// sign the canonical six-field body with the fortress key, then attach the
+/// signature envelope fields to the wire frame.
+func makeSignedArmLeaseBody(
+    armed: Bool = true,
+    revoked: Bool = false,
+    ttlSeconds: UInt32? = nil,
+    heartbeatIntervalSeconds: UInt32 = 5,
+    updatedAt: String,
+    privateKey: Curve25519.Signing.PrivateKey,
+    signingKeyId: String = "test-key"
+) throws -> ArmLeaseBody {
+    let unsigned = ArmLeaseBody(
+        armed: armed,
+        revoked: revoked,
+        ttlSeconds: ttlSeconds,
+        heartbeatIntervalSeconds: heartbeatIntervalSeconds,
+        updatedAt: updatedAt
+    )
+    let canonicalBytes = try SignedArmLeaseVerifier.canonicalSignedBody(unsigned)
+    let signature = try privateKey.signature(for: canonicalBytes)
+    return ArmLeaseBody(
+        armed: armed,
+        revoked: revoked,
+        ttlSeconds: ttlSeconds,
+        heartbeatIntervalSeconds: heartbeatIntervalSeconds,
+        updatedAt: updatedAt,
+        signingKeyId: signingKeyId,
+        leaseSignatureB64url: Base64URL.encode(signature)
+    )
+}
+
+/// ISO-8601 stamp in the exact shape the TS daemon emits
+/// (`Date.toISOString()`: millisecond-fractional UTC).
+func isoLeaseStamp(_ date: Date) -> String {
+    let formatter = ISO8601DateFormatter()
+    formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    return formatter.string(from: date)
+}

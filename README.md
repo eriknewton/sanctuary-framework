@@ -85,129 +85,46 @@ Trust and security claims are tracked in the [Sanctuary Assurance Matrix](ASSURA
 
 Roadmap shape: with the Mac Castle Wall per-uid allow/deny plus attended reboot-survival demonstration proven, the current focus is the per-flow rule-attributed audit trail (still the real gap), the Castle Wall Windows backend, and the fleet / operator-cloud surfaces. See [ROADMAP.md](ROADMAP.md).
 
-Supply-chain posture: release binaries for the macOS enforcement path are Dev-ID-signed and notarized, the CLI update path verifies a signed release manifest before applying an update, and every commit to main passes a structural typecheck-plus-test-baseline gate locally and again in CI. Mechanisms and their history: [CHANGELOG.md](CHANGELOG.md) and [docs/audit/](docs/audit/).
+Supply-chain posture: release binaries for the macOS enforcement path are Dev-ID-signed and notarized, the CLI authenticates update availability with a signed release manifest before showing signed-channel advice, and every commit to main passes a structural typecheck-plus-test-baseline gate locally and again in CI. Sanctuary does not currently download or apply updates for the operator. Mechanisms and their history: [CHANGELOG.md](CHANGELOG.md) and [docs/audit/](docs/audit/).
 
 ---
 
 ## For AI coding agents installing Sanctuary on behalf of an operator
 
-If you are an LLM-powered coding agent (OpenClaw, Hermes Agent, Claude Code, Cursor, Cline, Mastra, Codex, or any other harness with shell access) and an operator has asked you to install Sanctuary, follow this section. Humans can skip to "Installation reference" below; you will arrive at the same commands.
-
-**Operator-facing summary first.** Before running anything, give the operator one paragraph:
-
-> "Sanctuary will wrap your existing AI agent so every action it takes is signed with keys you hold and logged to a hash-chained audit trail with current checkpoint-signing and exit bounds. Install takes about a minute. I will: (1) detect which agent harness you are running, (2) run one protect command, (3) confirm the dashboard is live, (4) optionally scaffold your first sub-agent template. Approve to proceed."
-
-### Step 1: Detect the operator's harness
-
-Run these checks in order. Pick the first match.
+Do not translate the manual Castle Wall reference into a pile of shell
+commands. Use the resumable observed-state contract:
 
 ```bash
-# OpenClaw
-command -v openclaw && echo "harness=openclaw"
-
-# Hermes Agent
-command -v hermes && echo "harness=hermes"
-
-# Claude Code
-command -v claude && echo "harness=claude-code"
-
-# Cursor (config presence)
-test -d "$HOME/Library/Application Support/Cursor" && echo "harness=cursor"
-
-# Cline (VS Code extension config)
-test -d "$HOME/Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev" && echo "harness=cline"
-
-# Mastra (config presence)
-{ test -f "$HOME/.mastra/mcp.json" || test -f "$HOME/mastra/mcp.json" || test -f "$HOME/.config/mastra/mcp.json"; } && echo "harness=mastra"
+sanctuary install --profile memory --harness claude-code --json
 ```
 
-If multiple match, ask the operator which one to wrap. If none match, the operator does not have a recognized harness installed; offer to install one or use the raw MCP server path (Step 4 below).
-
-### Step 2: Run the protect command
+For the full macOS sovereignty surface, use Hermes:
 
 ```bash
-npx @sanctuary-framework/mcp-server protect --<harness>
+sanctuary install --profile full --harness hermes --json
 ```
 
-Substitute `<harness>` with the value detected in Step 1: `openclaw`, `hermes`, `claude-code`, `cursor`, `cline`, or `mastra`. For any harness not in that list, see Step 4.
+Execute only an `agent_action` argument vector, then rerun the same planner.
+Stop on `human_action` and guide the operator through the named Apple consent,
+exact privileged command, or private custody step. Never execute a human action
+on the operator's behalf.
+Stop on `blocked` and report the missing trust input rather than improvising.
+Installation is mechanically finished only at `complete`.
 
-Wait for the command to complete (typically 20-40 seconds). Expected output ends with a line like:
+The operator, not the agent, performs three things: Apple consent, bounded
+privilege authorization, and private recovery custody. In particular, never read
+the staged recovery file, run `sanctuary export-passphrase`, capture secret
+output, or ask the operator to paste recovery material into chat. The passphrase
+stays in the platform credential store; `--agent-guided` stages the recovery key
+outside the fortress without printing it.
 
-```
-Sovereignty Dashboard ready: http://localhost:3501
-```
-
-Note the port (it may be 3501-3510 if 3501 is taken).
-
-### Step 3: Verify the install
-
-After Step 2 (protect succeeds), the dashboard is running. Verify the install:
-
-```bash
-# (a) Dashboard responds
-curl -fsS "http://localhost:3501/api/health" | grep -q '"status":"ok"' && echo "dashboard=ok"
-
-# (b) Passphrase backed up to keychain (macOS)
-security find-generic-password -s "sanctuary-passphrase" >/dev/null 2>&1 && echo "passphrase=ok"
-```
-
-The first time you open the Sovereignty Dashboard in your browser, Sanctuary derives your master key from the keychain-stored passphrase, creates your fortress's Ed25519 identity, and writes the audit log genesis. The protect command configures these on disk; the first dashboard unlock initializes them. Verify after first unlock:
-
-```bash
-# (c) Identities loaded (run after opening the dashboard once)
-curl -fsS "http://localhost:3501/api/identities" | grep -q '"identities":\[' && echo "identities=ok"
-
-# (d) Audit log initialized (run after opening the dashboard once)
-test -d ~/.sanctuary/state/_audit && echo "audit=ok"
-```
-
-If any check fails, see "Troubleshooting" near the bottom of this README.
-
-### Step 4: Scaffold the operator's first governed harness (recommended)
-
-After the protect succeeds, ask the operator: "Which channel shape do you want on this harness? I have one-click archetypes for research-assistant, coding-assistant, ops-runner, planner, and handoff-coordinator. Or I can skip this step."
-
-If they pick an archetype, run:
-
-```bash
-curl -X POST "http://localhost:3501/api/templates/<template-name>/init" \
-  -H "Authorization: Bearer <operator-dashboard-token>" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "agent_name": "<already-wrapped-agent-id>",
-    "model_provider": "<xai|anthropic|openai|mistral>"
-  }'
-```
-
-Substitute `<template-name>` with the archetype the operator picked (`research-assistant`, `coding-assistant`, etc.). Template init authors and signs a governance policy for the agent, so it is protected like an approval decision: the request requires the operator's dashboard bearer token (printed when the dashboard starts; a tokenless request is rejected), and the operator then confirms a one-click Tier-1 approval card on the dashboard before the policy is signed. If the operator prefers, they can skip the curl and run the same init from the dashboard. The `agent_name` must match an already-wrapped harness; `template init` rejects an orphan `agent_id` that is not bound to a wrapped harness (the install-time check that locks Sanctuary to the operator's machine) and points the operator at `sanctuary protect`. Confirm the response includes a `signed_event_id` and an `attestation_panel_url`. Open that URL in the operator's browser.
-
-### Step 5: Hand back to the operator
-
-Tell them: "Sanctuary is installed and your first sub-agent is scaffolded. Open the Sovereignty Dashboard at http://localhost:3501 to review what your agents are doing, and reload the page when you want current data. Your passphrase is in your macOS Keychain; if you want a printable backup, run `sanctuary export-passphrase`."
-
-Current bound: this line previously said "in real time", and the dashboard has no live-update path. The `inbox` and `agent_status` SSE events are declared but never broadcast, and no periodic refetch runs, so five of the six inbox sources and every per-agent status change go stale until the operator reloads. Do not describe the dashboard as a real-time view.
-
-### Raw MCP server path (Step 4 alternative)
-
-If the operator's harness is not in the recognized list, install the MCP server directly and have them point their harness at it:
-
-```bash
-npm install -g @sanctuary-framework/mcp-server
-```
-
-Then add Sanctuary to the harness MCP config. The exact form depends on the harness; for an MCP-compatible harness the entry is typically:
-
-```json
-{
-  "command": "npx",
-  "args": ["-y", "@sanctuary-framework/mcp-server"],
-  "env": {
-    "SANCTUARY_PASSPHRASE": "<generated-passphrase>"
-  }
-}
-```
-
-Generate the passphrase with `openssl rand -base64 32` and store it in the operator's keychain or password manager.
+The `memory` profile is the sovereign encrypted-memory/cooperative-policy rung.
+The `full` profile adds the signed macOS app, dedicated Hermes account, boot
+service, content filter, and observed live enforcement. The full planner does
+not download an enforcement binary or guess its provenance; a verified signed
+release artifact or explicitly supplied drill candidate must already be
+installed. See [Agent-guided installation](docs/agent-guided-install.md) for the
+contract and cold-install acceptance criterion.
 
 ---
 
@@ -396,6 +313,10 @@ For AI coding agents handling install failures, here are the common cases.
 
 **`sanctuary` CLI not found after `npm install -g`:**
 - Confirm `npm bin -g` is on the PATH. On macOS with nvm, this typically lives at `~/.nvm/versions/node/<version>/bin/`.
+
+**Trust-bearing writes are FROZEN, or a `custody_rollback_suspected` audit finding appears:**
+- Sanctuary noticed the fortress looks older than its surviving custody evidence says it should be, which is what a restore looks like from the inside. A Time Machine restore, backup restore, dotfile sync, or cloning to a new machine all trigger this, and you may not have done it knowingly (a migration assistant or sync tool counts). The server keeps running; only trust-bearing writes are held until you acknowledge the restore. Follow the [Restore and recovery section of the Castle Wall macOS install guide](docs/castle-wall-macos-install.md#restore-and-recovery): run `sanctuary restore-attest` with the fortress passphrase to record the restore and unfreeze writes.
+- If you did not restore anything, treat the freeze as suspicious and rotate the master before attesting.
 
 **Existing harness config overwritten:**
 - The original is at `~/.sanctuary/backup/config-backup-<timestamp>-<surface-tag><ext>` (the surface tag is a short hex hash of the config file's path, and the extension matches the source config: `.json` for most harnesses; Hermes wraps two surfaces and backs up both, `.json` for the primary `~/.hermes/cli-config.json` and `.yaml` for the auxiliary `~/.hermes/config.yaml`). Backups written by earlier releases use the older `config-backup-<timestamp>.json` name and remain restorable. Restore with `sanctuary protect --unwrap` from the same fortress/storage context.

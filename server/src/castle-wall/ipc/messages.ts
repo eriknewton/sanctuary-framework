@@ -289,14 +289,40 @@ export interface HandshakeResponse {
   nonce_signature_b64url: string;
 }
 
-/** Authenticated daemon-to-extension lease heartbeat for the armed wall. */
+/**
+ * Authenticated daemon-to-extension lease heartbeat for the armed wall.
+ *
+ * O-02: the lease can flip the extension into `fail_open_deadman`, so an
+ * emitted frame carries a fortress-key Ed25519 signature over the canonical
+ * signed body (see `armLeaseSignedBody` in
+ * `server/src/castle-wall/runtime/macos-ipc-listener.ts`). The signature
+ * fields are wire-ADDITIVE: an older extension ignores them; a current
+ * extension REJECTS a frame without a valid signature and a monotonically
+ * fresh `updated_at` (verification lives in
+ * `castle-wall-macos/Sources/CastleWallFilter/SignedArmLeaseVerification.swift`).
+ * Field names must match `ArmLeaseBody` CodingKeys in
+ * `castle-wall-macos/Sources/CastleWallIPC/Messages.swift`.
+ */
 export interface ArmLeaseNotification {
   type: "arm_lease";
   armed: boolean;
   revoked?: boolean;
   ttl_seconds?: number | null;
   heartbeat_interval_seconds: number;
+  /**
+   * Signer-side freshness stamp; the extension consumes it (monotonic +
+   * bounded-age), so a replayed stale frame cannot re-anchor the dead-man
+   * deadline to the receiver's clock.
+   */
   updated_at: string;
+  /** Key id of the fortress signing key that produced `lease_signature_b64url`. */
+  signing_key_id?: string;
+  /**
+   * base64url (no padding) Ed25519 signature over the canonical signed body
+   * (`armLeaseSignedBody`), verified by the extension against the pinned
+   * fortress public key.
+   */
+  lease_signature_b64url?: string;
 }
 
 /**

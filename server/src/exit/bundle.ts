@@ -62,14 +62,25 @@ import { generateRandomKey } from "../core/random.js";
 import {
   sign as identitySign,
   verify as identityVerify,
+  publicKeyToDid,
   type StoredIdentity,
 } from "../core/identity.js";
+import {
+  verifyRotationChain,
+  type RotationChainInvalidReason,
+  type VerifiedRotationChain,
+} from "../core/rotation-chain.js";
 import {
   ReputationStore,
   ReputationBundleVerificationError,
   type ReputationBundle,
 } from "../reputation/reputation-store.js";
-import { verifyExitBundle, readManifest, loadExitArtifact } from "./verifier.js";
+import {
+  verifyExitBundle,
+  readManifest,
+  loadExitArtifact,
+  isWellFormedExitStateEntryElement,
+} from "./verifier.js";
 import {
   isValidSourceCustody,
   SOURCE_CUSTODY_FORMAT,
@@ -357,7 +368,10 @@ export interface ExportExitBundleOptions {
    * must have a secure, non-persisted channel to the operator: the exit
    * CLI prints it to the operator's terminal; callers whose results are
    * persisted (e.g. the hub's `resolution_payload`) must NOT enable this
-   * (key material must never be persisted - CLAUDE.md #6).
+   * (key material must never be persisted - CLAUDE.md #6). Known intentional
+   * non-minting caller: `fortressExportBundle` in `dashboard/v1_1/wiring.ts`
+   * (the dashboard exit endpoint), whose omission is a custody boundary, not
+   * an oversight; must match the acknowledgement comment there.
    *
    * Without it, an envelope-custody bundle's state can only be re-keyed by
    * a programmatic `sourceMasterKey` (legacy fortresses keep the legacy
@@ -410,7 +424,16 @@ export interface ExportExitBundleOptions {
    * the default cap.
    */
   auditReceiptsExportCap?: number;
-  /** Optional deterministic export clock for tests. */
+  /**
+   * Optional deterministic export clock. Beyond making tests reproducible,
+   * this single read anchors `manifest.body.exported_at`, which the import
+   * path feeds into did:web resolution as `assertion_time` (see
+   * `resolveDidWeb` callers below) - the value that decides whether a
+   * historical, since-revoked verification method is still inside its valid
+   * window. An uninjected caller gets the real wall clock, as before; a
+   * caller that injects `now` gets both a reproducible manifest AND a
+   * reproducible revoked-key window evaluation from the same read.
+   */
   now?: () => Date;
 }
 
@@ -513,6 +536,12 @@ export interface ImportExitBundleOptions {
    */
   skipDidWebVerify?: boolean;
   /**
+   * Operator opt-in for importing entries whose only valid source signature is
+   * a key retired by a compromised-reason rotation. CLI surface:
+   * `--accept-compromised-rotation-keys`.
+   */
+  acceptCompromisedRotationKeys?: boolean;
+  /**
    * Recognition-Layer Path C primary build 2: optional fetcher
    * override for tests. Defaults to globalThis.fetch via the did:web
    * foundation's resolver. Production callers leave undefined.
@@ -576,6 +605,15 @@ export interface ImportExitBundleResult {
     invalid_attestations: number;
     unverifiable_attestations: number;
   };
+  rotation?: {
+    identity_id: string;
+    hop_count: number;
+    chain_signature_verified: boolean;
+    compromised_hops: number;
+    entries_admitted_by_current_key: number;
+    entries_admitted_by_retired_key: number;
+    entries_admitted_by_compromised_retired_key: number;
+  };
   staged_artifacts: string[];
   warnings: string[];
   unsupported_artifacts: string[];
@@ -608,6 +646,21 @@ function stateImportIncompleteMessage(
     "Refusing activation and rolling back staged artifacts; inspect or " +
     "re-export the source bundle before retrying."
   );
+}
+
+function stateImportIncompleteMessageWithRotationKeys(
+  state: ImportExitBundleResult["state"],
+  publicKeysByIdentityId: Map<string, SourceIdentityPublicKeyCandidate[]>
+): string {
+  const base = stateImportIncompleteMessage(state);
+  const keyCounts = [...publicKeysByIdentityId.values()].map(
+    (candidates) => candidates.length
+  );
+  const maxKeysTried = keyCounts.length > 0 ? Math.max(...keyCounts) : 0;
+  return maxKeysTried > 1
+    ? base +
+        ` Verified rotation history was present; signature checks tried ${maxKeysTried} key candidates (current plus ${maxKeysTried - 1} retired) before refusing.`
+    : base;
 }
 
 export class ExitBundleStateImportIncompleteError extends ExitBundleImportError {
@@ -1130,8 +1183,13 @@ export async function exportExitBundle(
 ): Promise<ExportExitBundleResult> {
   // INVARIANT: manifest `exported_at` is the did:web assertion time, so
   // deterministic callers pin it here instead of comparing historical keys
-  // against the real wall clock.
-  const exportedAt = (opts.now ?? (() => new Date()))().toISOString();
+  // against the real wall clock. The `Date` is read exactly once and reused
+  // (see `exportApprovalAuditId` below) - a second ambient `Date.now()` read
+  // anywhere else in this function would reintroduce non-determinism even
+  // when the caller injects `now`.
+  const exportClock = opts.now ?? (() => new Date());
+  const exportedAtDate = exportClock();
+  const exportedAt = exportedAtDate.toISOString();
   // INVARIANT (A9): every option-shape refusal fires BEFORE the first side
   // effect (mkdir / audit append / artifact write). A throw after
   // public_identity.json lands leaves a partial, unsigned artifact directory a
@@ -1169,8 +1227,15 @@ export async function exportExitBundle(
     throw new Error("Cannot export exit bundle: no default identity exists.");
   }
 
+  // INVARIANT: the fallback audit id's timestamp is derived from the SAME
+  // captured `exportedAtDate` (the injected `now` seam when the caller
+  // supplies one) rather than a fresh `Date.now()` read. This id lands
+  // unchanged in the SIGNED manifest body as `export_approval_audit_id`
+  // below; a second, uncaptured wall-clock read here would make the signed
+  // manifest non-reproducible across two runs even when the export clock is
+  // pinned for determinism.
   const exportApprovalAuditId =
-    opts.exportApprovalAuditId ?? `exit-export-${Date.now()}`;
+    opts.exportApprovalAuditId ?? `exit-export-${exportedAtDate.getTime()}`;
   void opts.auditLog.append("l1", "exit_bundle_export", identity.identity_id, {
     approval_id: exportApprovalAuditId,
     manifest_version: EXIT_BUNDLE_MANIFEST_VERSION,
@@ -1448,17 +1513,121 @@ function validateExportDidWeb(
   };
 }
 
+interface SourceIdentityPublicKeyCandidate {
+  publicKey: Uint8Array;
+  source: "current" | "retired";
+  retiredIndex?: number;
+  compromised: boolean;
+}
+
+type IdentityPublicKeyResolution =
+  | {
+      status: "verified";
+      byIdentityId: Map<string, SourceIdentityPublicKeyCandidate[]>;
+      byDid: Map<string, Uint8Array>;
+      chain: VerifiedRotationChain;
+    }
+  | {
+      status: "invalid";
+      reason: RotationChainInvalidReason;
+      detail: string;
+      identityId: string;
+      hopCount: number;
+    };
+
 function publicKeysFromIdentityArtifact(
   identityArtifact: ExitPublicIdentityArtifact
-): {
-  byIdentityId: Map<string, Uint8Array>;
-  byDid: Map<string, Uint8Array>;
-} {
-  const pubkey = fromBase64url(identityArtifact.bundle.publicKey);
+): IdentityPublicKeyResolution {
+  const chainResult = verifyRotationChain({
+    identityId: identityArtifact.bundle.identity_id,
+    currentPublicKey: identityArtifact.bundle.publicKey,
+    rotationHistory: identityArtifact.bundle.rotation_history,
+  });
+  if (chainResult.status !== "verified") {
+    return {
+      status: "invalid",
+      reason: chainResult.reason,
+      detail: chainResult.detail,
+      identityId: identityArtifact.bundle.identity_id,
+      hopCount: Array.isArray(identityArtifact.bundle.rotation_history)
+        ? identityArtifact.bundle.rotation_history.length
+        : 0,
+    };
+  }
+
+  const candidates: SourceIdentityPublicKeyCandidate[] = [
+    {
+      publicKey: chainResult.chain.current_public_key,
+      source: "current",
+      compromised: false,
+    },
+    ...chainResult.chain.retired.map((retired, index) => ({
+      publicKey: retired.public_key,
+      source: "retired" as const,
+      retiredIndex: index + 1,
+      compromised: retired.compromised,
+    })),
+  ];
+  const byDid = new Map<string, Uint8Array>([
+    [identityArtifact.bundle.did, chainResult.chain.current_public_key],
+  ]);
+  for (const retired of chainResult.chain.retired) {
+    byDid.set(publicKeyToDid(retired.public_key), retired.public_key);
+  }
   return {
-    byIdentityId: new Map([[identityArtifact.bundle.identity_id, pubkey]]),
-    byDid: new Map([[identityArtifact.bundle.did, pubkey]]),
+    status: "verified",
+    byIdentityId: new Map([[identityArtifact.bundle.identity_id, candidates]]),
+    byDid,
+    chain: chainResult.chain,
   };
+}
+
+function rotationChainRefusalMessage(
+  result: Extract<IdentityPublicKeyResolution, { status: "invalid" }>
+): string {
+  return (
+    `rotation chain unverifiable for identity ${result.identityId}: ` +
+    `${result.reason} (${result.detail}; hop_count=${result.hopCount}). ` +
+    "Keep the source fortress intact and re-export after verifying its identity " +
+    "rotation history."
+  );
+}
+
+function compromisedRetiredSignatureUse(
+  encryptedState: ExitEncryptedStateBundle | null,
+  publicKeysByIdentityId: Map<string, SourceIdentityPublicKeyCandidate[]>
+): { count: number; firstRetiredIndex?: number } {
+  let count = 0;
+  let firstRetiredIndex: number | undefined;
+  for (const item of encryptedState?.entries ?? []) {
+    if (item.namespace.startsWith("_") || isReservedNamespace(item.namespace)) {
+      continue;
+    }
+    const candidates = publicKeysByIdentityId.get(item.entry.kid) ?? [];
+    if (candidates.length === 0) continue;
+    let payload: Uint8Array;
+    let signature: Uint8Array;
+    try {
+      payload = fromBase64url(item.entry.payload.ct);
+      signature = fromBase64url(item.entry.sig);
+    } catch {
+      continue;
+    }
+    const matching = candidates.filter((candidate) =>
+      identityVerify(payload, signature, candidate.publicKey)
+    );
+    if (matching.some((candidate) => candidate.compromised)) {
+      const acceptedByNonCompromised = matching.some(
+        (candidate) => !candidate.compromised
+      );
+      if (!acceptedByNonCompromised) {
+        count++;
+        firstRetiredIndex ??= matching.find((candidate) => candidate.compromised)
+          ?.retiredIndex;
+      }
+    }
+  }
+  return firstRetiredIndex === undefined ? { count } : { count, firstRetiredIndex };
 }
 
 async function conflictReport(
@@ -1607,6 +1776,36 @@ async function resolveSourceMasterKey(
   encryptedState: ExitEncryptedStateBundle | null,
   opts: ImportExitBundleOptions
 ): Promise<Uint8Array | null> {
+  // LD2-01 (extended by EXIT-STRUCT-02, one level deeper): `encryptedState`
+  // is an unchecked cast of parsed, untrusted JSON
+  // (`loadExitArtifact<ExitEncryptedStateBundle>` in the caller) — its
+  // `entries` field is declared non-optional and its element shape
+  // (`namespace`/`key`/`entry.kid`/`entry.payload.ct`/`entry.sig`) is
+  // declared non-optional too, but NEITHER is runtime-guaranteed: `entries`
+  // may not be an array at all (LD2-01), or it may be an array containing a
+  // `null` or otherwise malformed element (EXIT-STRUCT-02).
+  // `importExitBundle` already refuses both shapes with the same typed
+  // error before calling in (see the LD2-01/EXIT-STRUCT-02 comment at its
+  // call site), so this check is defense in depth for any other caller
+  // reaching this function: fail closed with a named error, never a raw
+  // TypeError. `isWellFormedExitStateEntryElement` is the SAME predicate
+  // that call site and `verifier.ts` `summarizeEncryptedState` use, so
+  // "malformed" means the same thing in all three places.
+  if (
+    encryptedState &&
+    (!Array.isArray(encryptedState.entries) ||
+      encryptedState.entries.some((item) => !isWellFormedExitStateEntryElement(item)))
+  ) {
+    throw new ExitBundleImportError(
+      "ENCRYPTED_STATE_ENTRIES_UNREADABLE",
+      "This bundle's encrypted_state artifact has no readable entries list " +
+        "(the `entries` field is absent or is not an array), or its entries " +
+        "list contains a malformed element (missing or wrong-typed " +
+        "namespace/key/entry fields). This is not an empty bundle: the " +
+        "entry list itself cannot be read. Re-export the bundle from the " +
+        "source fortress."
+    );
+  }
   if (!encryptedState || encryptedState.entries.length === 0) return null;
   // This return precedes `validateSourceCustody` deliberately: a caller who
   // already holds the source master needs no re-key material at all, so a
@@ -1952,7 +2151,12 @@ async function rekeyState(
   encryptedState: ExitEncryptedStateBundle,
   opts: ImportExitBundleOptions,
   sourceMasterKey: Uint8Array,
-  publicKeysByIdentityId: Map<string, Uint8Array>,
+  publicKeysByIdentityId: Map<string, SourceIdentityPublicKeyCandidate[]>,
+  rotationStats: {
+    entriesAdmittedByCurrentKey: number;
+    entriesAdmittedByRetiredKey: number;
+    entriesAdmittedByCompromisedRetiredKey: number;
+  },
   /**
    * Accumulator threaded by importExitBundle so the outer cleanup path
    * can remove every entry rekeyState successfully wrote prior to a
@@ -2000,21 +2204,37 @@ async function rekeyState(
       skipped++;
       continue;
     }
-    const signerPubkey = publicKeysByIdentityId.get(item.entry.kid);
-    if (!signerPubkey) {
+    const signerPubkeys = publicKeysByIdentityId.get(item.entry.kid);
+    if (!signerPubkeys || signerPubkeys.length === 0) {
       skippedUnknownKid++;
       skipped++;
       continue;
     }
-    const sourceSigValid = identityVerify(
-      fromBase64url(item.entry.payload.ct),
-      fromBase64url(item.entry.sig),
-      signerPubkey
+    const admittingKey = signerPubkeys.find((candidate) =>
+      identityVerify(
+        fromBase64url(item.entry.payload.ct),
+        fromBase64url(item.entry.sig),
+        candidate.publicKey
+      )
     );
-    if (!sourceSigValid) {
+    if (!admittingKey) {
       skippedInvalidSig++;
       skipped++;
       continue;
+    }
+    if (
+      admittingKey.source === "retired" &&
+      admittingKey.compromised &&
+      opts.acceptCompromisedRotationKeys !== true
+    ) {
+      throw new ExitBundleImportError(
+        "COMPROMISED_ROTATION_KEY_REFUSED",
+        `Refusing to import state entry ${item.namespace}/${item.key}: its ` +
+          `source signature verifies only under retired rotation key ` +
+          `retired-${admittingKey.retiredIndex ?? "unknown"}, whose rotation ` +
+          `reason declares compromise. Re-run only if the operator explicitly ` +
+          `accepts that risk with --accept-compromised-rotation-keys.`,
+      );
     }
 
     const exists = await opts.storage.exists(item.namespace, item.key);
@@ -2081,10 +2301,26 @@ async function rekeyState(
           ...(item.entry.metadata.tags ?? []),
           "exit-import",
           `source:${item.entry.kid}`,
+          ...(admittingKey.source === "retired"
+            ? [
+                `source-key:retired-${admittingKey.retiredIndex ?? "unknown"}`,
+                ...(admittingKey.compromised
+                  ? ["source-key:compromised-rotation"]
+                  : []),
+              ]
+            : []),
         ],
       }
     );
     imported++;
+    if (admittingKey.source === "current") {
+      rotationStats.entriesAdmittedByCurrentKey++;
+    } else {
+      rotationStats.entriesAdmittedByRetiredKey++;
+      if (admittingKey.compromised) {
+        rotationStats.entriesAdmittedByCompromisedRetiredKey++;
+      }
+    }
     importedRekeyEntries?.push({ namespace: item.namespace, key: item.key });
   }
 
@@ -2178,7 +2414,27 @@ export async function importExitBundle(
     unsupported_artifacts: verification.unsupported_artifacts,
   });
 
-  if (!verification.passed) {
+  if (
+    !verification.passed &&
+    verification.failure_class !== "reputation_unverifiable_attestations" &&
+    // EXIT-PASS-01: rotation_chain_invalid now fails the verifier `passed`
+    // boolean (so `exit verify`/`inspect` report FAIL). Do NOT let it short to
+    // the generic not-verified result here — falling through preserves the
+    // specific, more diagnosable ROTATION_CHAIN_UNVERIFIABLE throw below
+    // (line ~2421), which names the rotation chain as the cause instead of a
+    // bare "not verified". Import stays fail-closed either way: it never admits
+    // data on an unverifiable chain.
+    verification.failure_class !== "rotation_chain_invalid" &&
+    // LD2-01 (same #1189 pattern), extended by EXIT-STRUCT-02 for a
+    // malformed ELEMENT rather than an unreadable container:
+    // encrypted_state_entries_unreadable now fails `passed` for both shapes
+    // (verifier.ts aggregator). Do NOT let it short to the generic
+    // not-verified result here either — falling through preserves the
+    // specific ENCRYPTED_STATE_ENTRIES_UNREADABLE throw below, once
+    // `encryptedState` is loaded, instead of a bare "not verified" that gives
+    // the operator no named cause. Import stays fail-closed either way.
+    verification.failure_class !== "encrypted_state_entries_unreadable"
+  ) {
     return notVerifiedResult(
       0,
       verification.reputation?.unverifiable_attestations ?? 0
@@ -2193,13 +2449,6 @@ export async function importExitBundle(
     manifest,
     "public_identity"
   );
-  if ((identityArtifact?.json.bundle.rotation_history?.length ?? 0) > 0) {
-    // An unconsumed rotation history must be surfaced, never reported as a successful import.
-    throw new ExitBundleImportError(
-      "ROTATION_HISTORY_UNSUPPORTED",
-      "this bundle is from a fortress that rotated its identity key; importing it would lose pre-rotation state because this importer cannot consume rotation_history yet. Keep the source fortress intact and re-export after Sanctuary supports rotation-history replay; do not activate this bundle into a destination fortress."
-    );
-  }
   const encryptedState = await loadExitArtifact<ExitEncryptedStateBundle>(
     opts.bundleDir,
     manifest,
@@ -2234,7 +2483,112 @@ export async function importExitBundle(
 
   const publicKeys = identityArtifact
     ? publicKeysFromIdentityArtifact(identityArtifact.json)
-    : { byIdentityId: new Map<string, Uint8Array>(), byDid: new Map<string, Uint8Array>() };
+    : {
+        status: "verified" as const,
+        byIdentityId: new Map<string, SourceIdentityPublicKeyCandidate[]>(),
+        byDid: new Map<string, Uint8Array>(),
+        chain: {
+          identity_id: manifest.body.identity_binding.identity_id,
+          current_public_key: new Uint8Array(),
+          retired: [],
+          hop_count: 0,
+        },
+      };
+  if (publicKeys.status === "invalid") {
+    // INVARIANT: a bundle whose rotation history cannot be consumed must fail
+    // before import can fall back to current-key-only verification and report a
+    // partial PASS over silently dropped pre-rotation data.
+    throw new ExitBundleImportError(
+      "ROTATION_CHAIN_UNVERIFIABLE",
+      rotationChainRefusalMessage(publicKeys)
+    );
+  }
+  // LD2-01 (verify/import parity aggregator, class fix), extended by
+  // EXIT-STRUCT-02 one level deeper: an encrypted_state artifact whose
+  // `entries` field is missing or not an array is structural damage to the
+  // artifact itself — verifier.ts `summarizeEncryptedState` classifies it as
+  // `entry_count === null`, and the aggregator in `verifyExitBundle` now
+  // fails `passed` on it too (`encrypted_state_entries_unreadable`). The
+  // SAME is true one level deeper when `entries` IS an array but an
+  // ELEMENT in it is malformed (`entries: [null]`, or an element missing
+  // `namespace`/`entry`/`entry.kid`/`entry.payload.ct`/`entry.sig`):
+  // `summarizeEncryptedState` reports `entries_malformed`, and the
+  // aggregator fails `passed` on that too, through the SAME
+  // `encrypted_state_entries_unreadable` failure_class (both are "the
+  // entries list could not be read in the expected shape" from an
+  // operator's perspective). Checked here unconditionally and BEFORE the
+  // generic not-verified gate below, mirroring the rotation-chain-invalid
+  // throw immediately above: without this, the raw `item.namespace`/
+  // `item.entry.kid` dereferences in `compromisedRetiredSignatureUse`
+  // (three calls below) throw an unhandled TypeError for the same input.
+  // Fail closed with a NAMED, typed error instead — never a crash — so an
+  // operator (or a programmatic caller passing `sourceMasterKey`, which
+  // bypasses the credential-resolution branches below entirely but still
+  // reaches this same dereference) gets a diagnosable code, not a stack
+  // trace. CONTRACT PIN: the code string mirrors failure_class
+  // "encrypted_state_entries_unreadable" in
+  // contracts/v1.1/exit-bundle-manifest.ts.
+  //
+  // NULL-ROOT RECHECK: `encryptedState.json` is an unchecked cast of parsed,
+  // untrusted JSON (`loadExitArtifact<ExitEncryptedStateBundle>` above) — a
+  // signed, hash-verified artifact whose bytes happen to be the JSON literal
+  // `null` (or any other non-object root) satisfies no object shape at all.
+  // The original guard here dereferenced `encryptedState.json.entries`
+  // directly, which throws a raw TypeError on a null/non-object root BEFORE
+  // `Array.isArray` ever runs — the exact crash class this fix exists to
+  // close, one property access earlier than the case it was written for.
+  // Narrow the JSON ROOT itself first, through `unknown`, so a malformed
+  // root reaches the SAME named error instead.
+  //
+  // INVARIANT (EXIT-STRUCT-02): verify fails closed on a malformed ELEMENT
+  // exactly where import dereferences it; container+count checks are not
+  // enough. `isWellFormedExitStateEntryElement` is the SAME predicate
+  // `verifier.ts` `summarizeEncryptedState` and `resolveSourceMasterKey`
+  // (below) use, so this check and verify's `passed` boolean can never
+  // disagree about which element is damaged.
+  const encryptedStateJsonRoot: unknown = encryptedState?.json;
+  const encryptedStateEntriesReadable =
+    encryptedStateJsonRoot !== null &&
+    typeof encryptedStateJsonRoot === "object" &&
+    Array.isArray((encryptedStateJsonRoot as { entries?: unknown }).entries) &&
+    (encryptedStateJsonRoot as { entries: unknown[] }).entries.every((item) =>
+      isWellFormedExitStateEntryElement(item)
+    );
+  if (encryptedState && !encryptedStateEntriesReadable) {
+    throw new ExitBundleImportError(
+      "ENCRYPTED_STATE_ENTRIES_UNREADABLE",
+      "This bundle's encrypted_state artifact has no readable entries list " +
+        "(the `entries` field is absent or is not an array), or its entries " +
+        "list contains a malformed element (missing or wrong-typed " +
+        "namespace/key/entry fields). This is not an empty bundle: the " +
+        "entry list itself cannot be read. Re-export the bundle from the " +
+        "source fortress."
+    );
+  }
+  if (!verification.passed) {
+    return notVerifiedResult(
+      0,
+      verification.reputation?.unverifiable_attestations ?? 0
+    );
+  }
+
+  const compromisedUse = compromisedRetiredSignatureUse(
+    encryptedState?.json ?? null,
+    publicKeys.byIdentityId
+  );
+  if (
+    compromisedUse.count > 0 &&
+    opts.acceptCompromisedRotationKeys !== true
+  ) {
+    throw new ExitBundleImportError(
+      "COMPROMISED_ROTATION_KEY_REFUSED",
+      `${compromisedUse.count} state entr${compromisedUse.count === 1 ? "y" : "ies"} ` +
+        "verify only under a key retired by a compromised-reason rotation " +
+        `(first retired key: retired-${compromisedUse.firstRetiredIndex ?? "unknown"}). ` +
+        "Refusing by default. Re-run only if the operator explicitly accepts " +
+        "that risk with --accept-compromised-rotation-keys."
+    );
+  }
 
   const reputationStore = reputationArtifact
     ? opts.reputationStore ?? new ReputationStore(opts.storage, opts.masterKey)
@@ -2531,6 +2885,11 @@ export async function importExitBundle(
     invalid_attestations: 0,
     unverifiable_attestations: verification.reputation?.unverifiable_attestations ?? 0,
   };
+  const rotationStats = {
+    entriesAdmittedByCurrentKey: 0,
+    entriesAdmittedByRetiredKey: 0,
+    entriesAdmittedByCompromisedRetiredKey: 0,
+  };
   let stateResult: ImportExitBundleResult["state"];
   // Resolved INSIDE the try block: a fail-closed source-credential error
   // (SOURCE_CREDENTIAL_INVALID / SOURCE_KEY_UNAVAILABLE / malformed
@@ -2652,6 +3011,7 @@ export async function importExitBundle(
               opts,
               sourceMasterKey,
               publicKeys.byIdentityId,
+              rotationStats,
               importedRekeyEntries
             )
           : {
@@ -2684,7 +3044,13 @@ export async function importExitBundle(
     }
     if (stateHasNonConflictSkippedEntries(stateResult)) {
       // A dropped state entry must be surfaced, never reported as a successful import.
-      throw new ExitBundleStateImportIncompleteError(stateResult);
+      throw new ExitBundleStateImportIncompleteError(
+        stateResult,
+        stateImportIncompleteMessageWithRotationKeys(
+          stateResult,
+          publicKeys.byIdentityId
+        )
+      );
     }
     if (stateSkippedOnlyConflicts(stateResult)) {
       importWarnings.push(
@@ -2719,6 +3085,28 @@ export async function importExitBundle(
       state_imported_keys: stateResult.imported_keys,
       reputation_imported_attestations: reputationResult.imported_attestations,
     });
+    if (identityArtifact && publicKeys.chain.hop_count > 0) {
+      await opts.auditLog.appendCritical({
+        layer: "l1",
+        operation: "exit_bundle_rotation_chain_consumed",
+        identity_id: identityArtifact.json.bundle.identity_id,
+        result: "success",
+        details: {
+          hop_count: publicKeys.chain.hop_count,
+          entries_admitted_by_current_key:
+            rotationStats.entriesAdmittedByCurrentKey,
+          entries_admitted_by_retired_key:
+            rotationStats.entriesAdmittedByRetiredKey,
+          compromised_hops: publicKeys.chain.retired.filter(
+            (retired) => retired.compromised
+          ).length,
+          entries_admitted_by_compromised_retired_key:
+            rotationStats.entriesAdmittedByCompromisedRetiredKey,
+          accept_compromised_rotation_keys:
+            opts.acceptCompromisedRotationKeys === true,
+        },
+      });
+    }
     await opts.auditLog.flush();
   } catch (err) {
     const cleanup = await restoreStorageSnapshots(
@@ -2795,6 +3183,24 @@ export async function importExitBundle(
     conflicts,
     state: stateResult,
     reputation: reputationResult,
+    ...(identityArtifact && publicKeys.chain.hop_count > 0
+      ? {
+          rotation: {
+            identity_id: identityArtifact.json.bundle.identity_id,
+            hop_count: publicKeys.chain.hop_count,
+            chain_signature_verified: true,
+            compromised_hops: publicKeys.chain.retired.filter(
+              (retired) => retired.compromised
+            ).length,
+            entries_admitted_by_current_key:
+              rotationStats.entriesAdmittedByCurrentKey,
+            entries_admitted_by_retired_key:
+              rotationStats.entriesAdmittedByRetiredKey,
+            entries_admitted_by_compromised_retired_key:
+              rotationStats.entriesAdmittedByCompromisedRetiredKey,
+          },
+        }
+      : {}),
     staged_artifacts: stagedArtifacts,
     warnings: [...verification.warnings, ...importWarnings],
     unsupported_artifacts: verification.unsupported_artifacts,

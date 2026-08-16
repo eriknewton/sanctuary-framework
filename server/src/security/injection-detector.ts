@@ -65,6 +65,16 @@ const TOOL_INVOCATION_PATTERNS = [
 const URL_PATTERN = /https?:\/\/[^\s"'<>]+/i;
 const EMAIL_PATTERN = /\b[a-zA-Z0-9._%+-]{1,64}@[a-zA-Z0-9-]{1,63}(?:\.[a-zA-Z0-9-]{1,63}){0,9}\.[a-zA-Z]{2,63}\b/;
 
+// A field named like a sha256 digest (e.g. `artifact_sha256`, `manifest.sha256`)
+// is exempt from injection scanning only when its VALUE is also hex-shaped.
+// 64 = length in hex characters of a sha256 digest (32 bytes * 2 hex chars/byte).
+// The name match alone is deliberately broad (any `..._sha256` suffix, matching
+// the many legitimate field names across the codebase); the value gate is what
+// keeps an attacker-chosen field like `evil_sha256` from smuggling injection
+// content past the scanner under a hash-shaped name (review #1239 LOW finding 3).
+const SHA256_FIELD_NAME_PATTERN = /(?:^|[._])sha256$/i;
+const SHA256_HEX_VALUE_PATTERN = /^[0-9a-f]{64}$/i;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // SEC-034: Invisible Unicode characters used in smuggling attacks
 // ─────────────────────────────────────────────────────────────────────────────
@@ -356,6 +366,12 @@ export class InjectionDetector {
   ): void {
     // Skip obviously safe fields
     if (this.isSafeField(path)) {
+      return;
+    }
+    // sha256-named fields are exempt only when the value is also hex-shaped;
+    // see SHA256_FIELD_NAME_PATTERN / SHA256_HEX_VALUE_PATTERN above for why
+    // the name match alone must not be sufficient.
+    if (SHA256_FIELD_NAME_PATTERN.test(path) && SHA256_HEX_VALUE_PATTERN.test(value)) {
       return;
     }
 

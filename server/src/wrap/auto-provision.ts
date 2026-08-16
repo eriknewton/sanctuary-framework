@@ -907,6 +907,9 @@ export interface RunAutoProvisionForWrapOptions {
   isTty: boolean;
   /** `--provision-agent-account[=name]` pre-answer (fix L2: pre-answers the CHOICE only). Undefined = not passed. */
   preAnsweredProvision?: boolean;
+  /** Explicit operator delegation from `protect --agent-guided`; allows the
+   * printed plan to continue on a non-TTY while root/sudo remains required. */
+  agentGuided?: boolean;
   /** Absolute path to the running Sanctuary CLI binary for install-boot's LaunchDaemon argv. */
   cliBinary?: string;
   /** Print function for operator-facing output (defaults to console.error, matching the rest of wrap/cli.ts's stderr convention). */
@@ -959,13 +962,12 @@ export interface AutoProvisionSummary {
 
 export function policyDaemonInstallBootArgs(
   fortressPath: string,
-  cliBinary: string | undefined,
+  _cliBinary?: string,
 ): string[] {
-  const args = ["--fortress", fortressPath];
-  if (cliBinary !== undefined && cliBinary.length > 0) {
-    args.push("--binary", cliBinary);
-  }
-  return args;
+  // install-boot snapshots the verified runtime embedded in the signed app.
+  // `--binary` is deliberately retired and parseBootArgs rejects it, so the
+  // auto-provision path must never forward the running CLI path here.
+  return ["--fortress", fortressPath];
 }
 
 // `resolveGateDaemonArgvPrefix` moved to `../egress-gate/gate-daemon.ts` so the
@@ -1579,7 +1581,7 @@ export async function runAutoProvisionForWrap(
         };
       }
       const code = await runInstallBoot(
-        policyDaemonInstallBootArgs(fortressPath, options.cliBinary),
+        policyDaemonInstallBootArgs(fortressPath),
         { env: process.env },
       );
       if (code !== 0) {
@@ -1971,6 +1973,7 @@ export async function runAutoProvisionForWrap(
         detectResult,
         isTty: options.isTty,
         preAnsweredProvision: options.preAnsweredProvision,
+        agentGuided: options.agentGuided === true,
         fortressPath: wallFortressPath,
         // Confined-agent egress: the SAME endpoint set the provisioning +
         // probes consume, threaded for the Tier-1 confirm plan-print.

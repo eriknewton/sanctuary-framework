@@ -7,6 +7,10 @@ on:
   pull_request:
     branches: [main]
 
+# CSO-CICD-02 (supply-chain pin): this workflow triggers on a `v*` tag push,
+# so every action used anywhere in it is pinned to an immutable commit SHA
+# rather than a mutable tag; a hijacked upstream tag cannot inject into a
+# release-tag run.
 permissions:
   contents: read
   issues: write
@@ -20,10 +24,10 @@ jobs:
         os: [ubuntu-latest, macos-latest]
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Use Node.js 22
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
           cache: npm
@@ -34,7 +38,7 @@ jobs:
         run: npm ci
 
       - name: Set up Python 3.12 for Concordia sidecar
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
 
@@ -49,7 +53,7 @@ jobs:
 
       - name: Upload synthetic coverage report
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: synthetic-coverage-${{ matrix.os }}
           path: |
@@ -77,10 +81,10 @@ jobs:
     if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Use Node.js 22
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
           cache: npm
@@ -91,13 +95,13 @@ jobs:
         run: npm ci
 
       - name: Download Linux synthetic coverage report
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: synthetic-coverage-ubuntu-latest
           path: artifacts/ubuntu
 
       - name: Download macOS synthetic coverage report
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: synthetic-coverage-macos-latest
           path: artifacts/macos
@@ -107,7 +111,7 @@ jobs:
 
       - name: Upload synthetic coverage parity report
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: synthetic-coverage-parity
           path: |
@@ -134,10 +138,10 @@ jobs:
     if: always() && (github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Use Node.js 22
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
           cache: npm
@@ -148,19 +152,19 @@ jobs:
         run: npm ci
 
       - name: Download Linux synthetic coverage report
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: synthetic-coverage-ubuntu-latest
           path: artifacts/ubuntu
 
       - name: Download macOS synthetic coverage report
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: synthetic-coverage-macos-latest
           path: artifacts/macos
 
       - name: Download synthetic coverage parity report
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: synthetic-coverage-parity
           path: artifacts/parity
@@ -183,7 +187,7 @@ jobs:
 
       - name: Upload synthetic coverage gate (a) artifact
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: synthetic-coverage-gate-a
           path: |

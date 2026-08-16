@@ -60,7 +60,9 @@ export function buildSyncResponse(
     // base sync response for this kind is structurally empty - the snapshot
     // attaches as `agent_state_wrapped` via a separate code path so this
     // pure function stays free of crypto state.
-    return { kind: "agent_state_transfer" };
+    // Echo request_id must match SyncRequestPayload.request_id in ./types.ts —
+    // the initiator correlates the response to its outstanding request (C12-REPLAY).
+    return { kind: "agent_state_transfer", request_id: request.request_id };
   }
 
   const policy_updates = state.policy_bundle.delta(
@@ -92,6 +94,8 @@ export function buildSyncResponse(
 
   return {
     kind: request.kind,
+    // Echo request_id — must match SyncRequestPayload.request_id in ./types.ts.
+    request_id: request.request_id,
     policy_updates,
     locator_updates,
     node_lifecycle_events,
@@ -218,10 +222,14 @@ export function applySyncResponse(
     else if (r === "conflict") result.locator_conflicts++;
     else result.locator_older++;
   }
-  for (const evt of response.node_lifecycle_events ?? []) {
-    state.lifecycle_log.append(evt);
-    result.lifecycle_events_received++;
-  }
+  // C12-REPLAY / SYNC-APPEND-01: lifecycle events are NO LONGER appended here.
+  // `MeshNode.applySync` is the SINGLE append site — it verifies, freshness-
+  // checks, and authorization-dedupes each event BEFORE appending, then passes
+  // an EMPTY lifecycle list to this function. Appending here as well was the
+  // double-append defect (design §3.3 point 3). We still count what arrived.
+  result.lifecycle_events_received = (
+    response.node_lifecycle_events ?? []
+  ).length;
   result.audit_batches_received = (response.audit_batches ?? []).length;
 
   return result;

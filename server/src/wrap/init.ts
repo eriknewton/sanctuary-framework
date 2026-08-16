@@ -65,6 +65,7 @@ import {
   preflightFortressPathWritable,
 } from "../paths.js";
 import { runProvisionPin } from "../cli/castle-wall.js";
+import { mkdirSafeUnderRoot } from "./config-reader.js";
 
 /**
  * Operator-facing display path of the machine-wide Castle Wall enforcement
@@ -292,6 +293,18 @@ export async function runInit(
 
   await mkdir(fortressPath, { recursive: true, mode: 0o700 });
   await tightenStoragePermissions(fortressPath);
+
+  // The root Castle Wall daemon intentionally refuses to recursively mkdir
+  // through an operator-mutable policy tree: Node has no mkdirat/openat API
+  // with which to make that operation race-safe as root. Seed the one true
+  // rule-source directory while init is still running as the fortress owner,
+  // walking each component without following symlinks. A fresh fortress is
+  // then boot-service-ready even before it contains any allow rules.
+  await mkdirSafeUnderRoot(
+    join(fortressPath, "policy", "egress", "rules"),
+    fortressPath,
+    0o700,
+  );
 
   const storage = new FilesystemStorage(`${fortressPath}/state`);
 
