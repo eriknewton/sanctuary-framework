@@ -61,7 +61,16 @@ export const CASTLE_BOOT_TOKEN_PATH = join(
   CASTLE_BOOT_TOKEN_FILENAME,
 );
 
-/** A boot token is exactly 32 random bytes. */
+/**
+ * Boot-token length in bytes: 32 = 256 bits of CSPRNG output. The token is a
+ * root-owned bearer secret whose only protections are file custody and
+ * unguessability, and it is the HKDF-SHA256 input keying material for the
+ * 256-bit safe-mode audit key ({@link deriveSafeModeAuditKey}) as well as the
+ * preimage of the SHA-256 segment fingerprint
+ * ({@link safeModeAuditStoragePath}). 256 bits matches the security level of
+ * both derivations, so the token itself is never the weakest link; the read
+ * path ({@link readBootToken}) rejects any other length as tampering.
+ */
 export const BOOT_TOKEN_LENGTH = 32;
 
 /**

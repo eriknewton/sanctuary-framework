@@ -10,7 +10,11 @@
  *   1. `propose` — operator names the lost node_id + the replacement's
  *      NodeIdentityCertificate (signed under the CURRENT fortress-master
  *      during a prior join step, or freshly issued by a surviving principal
- *      for the replacement). Guardian quorum signs a recovery intent.
+ *      for the replacement). Guardian quorum signs TWO inputs in the same
+ *      ceremony session: the recovery intent (lost -> replacement) AND the
+ *      node_revoke quorum input for the lost node, because the ceremony
+ *      performs a revocation and a quorum over the recovery intent alone
+ *      never examined that revocation. Both quorums verify at propose.
  *   2. DMswitch grace-window enforcement: if the DMswitch has NOT yet
  *      fired AND operator activity is within the configured grace window,
  *      `propose` throws `DMswitchGraceWindowActive`. Outside the window
@@ -61,6 +65,7 @@ import {
   CeremonyError,
   CeremonyNotConfirmedError,
 } from "./errors.js";
+import { revokeQuorumInput } from "./node-revoke.js";
 import {
   enforceDMswitchGraceWindow,
   type DMswitchGraceWindowInput,
@@ -130,7 +135,7 @@ export class DeviceRecoveryCeremony {
       params.ctx.pinned_master
     );
 
-    // 3. Verify the guardian quorum.
+    // 3. Verify the guardian quorum over the recovery intent.
     const input = deviceRecoveryQuorumInput(
       params.proposal,
       params.ctx.pinned_master.fortress_id
@@ -142,6 +147,24 @@ export class DeviceRecoveryCeremony {
     verifyGuardianQuorum({
       input,
       proof,
+      pinned_roster: params.ctx.pinned_roster,
+    });
+
+    // 4. Verify the guardian quorum over the REVOCATION the ceremony will
+    //    perform. The recovery quorum above signed the lost->replacement
+    //    intent, not the node_revoke payload; treating one as authorization
+    //    for the other is exactly the trusted-bypass defect this check
+    //    closes. The same bytes are recomputed and re-verified by
+    //    MeshNode.revokePeer before broadcast and by every receiver.
+    verifyGuardianQuorum({
+      input: deviceRecoveryRevokeQuorumInput(
+        params.proposal,
+        params.ctx.pinned_master.fortress_id
+      ),
+      proof: {
+        roster_version: params.ctx.pinned_roster.version,
+        signatures: params.proposal.revoke_guardian_signatures,
+      },
       pinned_roster: params.ctx.pinned_roster,
     });
 
@@ -182,9 +205,15 @@ export class DeviceRecoveryCeremony {
     this.state = "executing";
 
     try {
-      // 1. Revoke the lost node (guardian-quorum-signed revoke event).
-      const quorumSignaturesForRevoke = this.proposal.guardian_signatures.map(
-        (s) => {
+      // 1. Revoke the lost node (guardian-quorum-signed revoke event). The
+      //    signatures attached here are the REVOKE quorum (signed over the
+      //    node_revoke quorum input, verified at propose), never the recovery
+      //    quorum: revokePeer recomputes the revoke input from the payload it
+      //    broadcasts and re-verifies these signatures before anything is
+      //    emitted, so a quorum that did not cover this revocation is refused
+      //    at the enforcement site rather than trusted across this boundary.
+      const quorumSignaturesForRevoke =
+        this.proposal.revoke_guardian_signatures.map((s) => {
           const g = this.ctx.pinned_roster.guardians.find(
             (x) => x.guardian_id === s.guardian_id
           );
@@ -194,14 +223,15 @@ export class DeviceRecoveryCeremony {
             );
           }
           return { guardian_pubkey: g.public_key, signature: s.signature };
-        }
-      );
+        });
       this.ctx.node.registerGuardianRoster(this.ctx.pinned_roster);
       await this.ctx.node.revokePeer({
+        // Must match deviceRecoveryRevokeQuorumInput below: target + reason
+        // are the payload fields the quorum input binds, so any drift here
+        // makes the pre-broadcast verification fail closed.
         target_node_id: this.proposal.lost_node_id,
-        reason: "device_loss_recovery",
+        reason: DEVICE_RECOVERY_REVOKE_REASON,
         quorum_signatures: quorumSignaturesForRevoke,
-        guardian_quorum_verified_by_ceremony: true,
       });
 
       // 2. Admit the replacement cert so roster state knows about it.
@@ -276,7 +306,10 @@ export class DeviceRecoveryCeremony {
  *   - rotated_at = `device_recovery:${lost_node_id}->${replacement_node_id}`
  */
 export function deviceRecoveryQuorumInput(
-  proposal: DeviceRecoveryProposal,
+  proposal: Pick<
+    DeviceRecoveryProposal,
+    "lost_node_id" | "replacement_node_cert"
+  >,
   fortressId: string
 ): MasterRotationQuorumInput {
   const rotatedAt =
@@ -294,6 +327,39 @@ export function deviceRecoveryQuorumInput(
     rotated_at: rotatedAt,
     fortress_id: fortressId,
   };
+}
+
+/**
+ * The `reason` recorded on the node_revoke a device-recovery ceremony emits.
+ * The revoke quorum input binds the reason into the signed bytes, so the
+ * guardians' revoke signatures are only valid for a revocation carrying
+ * exactly this reason — producer (guardian signing device), this ceremony's
+ * execute step, and every verifier must agree on the string.
+ */
+export const DEVICE_RECOVERY_REVOKE_REASON = "device_loss_recovery";
+
+/**
+ * Canonical quorum input for the REVOCATION a device-recovery ceremony
+ * performs on the lost node. Delegates to `revokeQuorumInput` so the bytes
+ * are identical to a direct compromised-node revoke of the same target with
+ * `DEVICE_RECOVERY_REVOKE_REASON` — which is what `MeshNode.revokePeer`'s
+ * pre-broadcast gate and every receiving node recompute and verify.
+ *
+ * Guardians sign this input IN ADDITION to `deviceRecoveryQuorumInput`:
+ * the recovery input covers the lost->replacement intent, this input covers
+ * the revocation, and neither implies the other.
+ */
+export function deviceRecoveryRevokeQuorumInput(
+  proposal: Pick<DeviceRecoveryProposal, "lost_node_id">,
+  fortressId: string
+): MasterRotationQuorumInput {
+  return revokeQuorumInput(
+    {
+      target_node_id: proposal.lost_node_id,
+      reason: DEVICE_RECOVERY_REVOKE_REASON,
+    },
+    fortressId
+  );
 }
 
 function generateCeremonyId(): string {

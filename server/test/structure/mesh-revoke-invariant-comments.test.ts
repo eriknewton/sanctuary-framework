@@ -39,15 +39,53 @@ describe("Mesh node-revoke invariant comments", () => {
     ]);
   });
 
-  it("keeps quorum revokes gated before lifecycle emission", () => {
+  it("keeps quorum revokes gated before lifecycle emission with no trusted-caller bypass", () => {
     const source = read("server/src/mesh/lifecycle/mesh-node.ts");
 
     expectNear(source, "this.assertNodeRevokePayloadQuorumAuthorized(payload);", [
       "Pre-broadcast guardian invariant",
       "before emitLifecycleEvent",
-      "guardian_quorum_verified_by_ceremony",
-      "broader ceremony payload",
-      "receivers still re-check node_revoke authority",
+      "no trusted-caller bypass",
+      "never examined",
+      "this node_revoke payload",
+      "receivers independently",
+      "re-check node_revoke authority",
+    ]);
+  });
+
+  it("keeps the ceremony bypass flag removed everywhere (C12)", () => {
+    // The C12 defect was a bare trusted boolean crossing the module boundary:
+    // a recovery ceremony could skip both revoke-quorum checks by asserting it
+    // had verified a quorum over a DIFFERENT payload. The flag must not
+    // reappear in the producer, any ceremony, or the payload types.
+    for (const file of [
+      "server/src/mesh/lifecycle/mesh-node.ts",
+      "server/src/mesh/lifecycle/types.ts",
+      "server/src/mesh/recovery-flows/device-recovery.ts",
+      "server/src/mesh/recovery-flows/node-revoke.ts",
+      "server/src/mesh/types.ts",
+    ]) {
+      expect(
+        read(file).includes("guardian_quorum_verified_by_ceremony"),
+        `trusted bypass flag reintroduced in ${file}`
+      ).toBe(false);
+    }
+  });
+
+  it("keeps the device-recovery ceremony verifying a dedicated revoke quorum", () => {
+    const source = read(
+      "server/src/mesh/recovery-flows/device-recovery.ts"
+    );
+
+    expectNear(source, "deviceRecoveryRevokeQuorumInput(", [
+      "REVOCATION",
+      "not the node_revoke payload",
+      "trusted-bypass defect",
+    ]);
+    expectNear(source, "revoke_guardian_signatures.map", [
+      "REVOKE quorum",
+      "never the recovery",
+      "re-verifies these signatures before anything is",
     ]);
   });
 
