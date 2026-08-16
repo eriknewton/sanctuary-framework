@@ -338,6 +338,13 @@ export interface CastleWallParsedArgs {
    * fortress publish path. Never accepted from an untrusted source.
    */
   producerPubKey?: string;
+  /**
+   * reload (NF-08, additive): opt a scripted caller into a non-zero exit when
+   * no daemon was reachable to reload. The bare exit-0 "nothing to reload"
+   * default is unchanged and test-pinned: this flag only widens what a
+   * caller can ask for, it never narrows the default.
+   */
+  requireDaemon?: boolean;
 }
 
 function writeCastleWallParseError(
@@ -2564,6 +2571,18 @@ export async function runReload(
       out,
       `No Castle Wall daemon running for fortress ${fortressIdLabel(fortressPath)}. Run 'sanctuary wrap' to start one.\n`,
     );
+    // NF-08: "nothing to reload" is not a failure by default: a fresh
+    // fortress with no daemon yet is a normal state, and this exit code is
+    // test-pinned. A scripted caller that needs to tell "reloaded" apart from
+    // "nothing was there" opts in with --require-daemon rather than the
+    // default silently becoming unscriptable for everyone else.
+    if (parsed.requireDaemon) {
+      write(
+        err,
+        `Error: --require-daemon set and no Castle Wall daemon is reachable for fortress ${fortressIdLabel(fortressPath)}.\n`,
+      );
+      return 1;
+    }
     return 0;
   }
   write(err, `Error: ${result.error ?? "policy reload failed"}\n`);
@@ -5158,17 +5177,33 @@ export function parseCastleWallArgs(argv: string[]): CastleWallParsedArgs {
   for (let i = 0; i < since.argv.length; i++) {
     const arg = since.argv[i]!;
     if (arg === "--ttl") {
-      parsed.ttlSeconds = parseLeaseTtlSeconds(since.argv[++i]);
+      // Route through parseError rather than letting the parser throw: this loop
+      // runs inside parseCastleWallArgs, the single chokepoint every castle-wall
+      // verb calls before its own try block starts, so an uncaught throw here
+      // would skip writeCastleWallParseError and land in the top-level
+      // `main().catch` handler instead (wrong exit code, "failed to start"
+      // instead of a usage error).
+      const ttl = parseLeaseTtlSeconds(since.argv[++i]);
+      if ("error" in ttl) return { ...parsed, parseError: ttl.error };
+      parsed.ttlSeconds = ttl.value;
     } else if (arg.startsWith("--ttl=")) {
-      parsed.ttlSeconds = parseLeaseTtlSeconds(arg.slice("--ttl=".length));
+      const ttl = parseLeaseTtlSeconds(arg.slice("--ttl=".length));
+      if ("error" in ttl) return { ...parsed, parseError: ttl.error };
+      parsed.ttlSeconds = ttl.value;
     } else if (arg === "--no-ttl") {
       parsed.noTtl = true;
     } else if (arg.startsWith("--scope=")) {
-      parsed.scope = parseScope(arg.slice("--scope=".length));
+      const scope = parseScope(arg.slice("--scope=".length));
+      if ("error" in scope) return { ...parsed, parseError: scope.error };
+      parsed.scope = scope.value;
     } else if (arg === "--scope") {
-      parsed.scope = parseScope(since.argv[++i]);
+      const scope = parseScope(since.argv[++i]);
+      if ("error" in scope) return { ...parsed, parseError: scope.error };
+      parsed.scope = scope.value;
     } else if (arg === "--force") {
       parsed.force = true;
+    } else if (arg === "--require-daemon") {
+      parsed.requireDaemon = true;
     } else if (arg === "--allow-no-egress") {
       parsed.allowNoEgress = true;
     } else if (arg.startsWith("--agent-uid=")) {
@@ -5205,9 +5240,17 @@ export function parseCastleWallArgs(argv: string[]): CastleWallParsedArgs {
   return parsed;
 }
 
-function parseScope(value: string | undefined): "once" | "session" | "always" {
-  if (value === "session" || value === "always" || value === "once") return value;
-  throw new Error("--scope must be once, session, or always");
+// Returns a result object instead of throwing (must match the equivalent
+// choice in parseLeaseTtlSeconds below): both are called from inside
+// parseCastleWallArgs's arg loop, before any verb's own try block, so a thrown
+// Error would bypass writeCastleWallParseError and surface as an unhandled
+// top-level failure rather than the structured parse-error path every other
+// flag uses.
+function parseScope(
+  value: string | undefined,
+): { value: "once" | "session" | "always" } | { error: string } {
+  if (value === "session" || value === "always" || value === "once") return { value };
+  return { error: "--scope must be once, session, or always" };
 }
 
 function resolveFortressArg(
@@ -5231,14 +5274,17 @@ function parseDurationMs(value: string): number {
   return amount * multiplier;
 }
 
-function parseLeaseTtlSeconds(value: string | undefined): number {
-  if (!value) throw new Error("--ttl requires a duration like 30s, 5m, or 1h");
+// See parseScope's comment above: same reasoning applies here.
+function parseLeaseTtlSeconds(
+  value: string | undefined,
+): { value: number } | { error: string } {
+  if (!value) return { error: "--ttl requires a duration like 30s, 5m, or 1h" };
   const match = /^(\d+)([smh])$/.exec(value);
-  if (!match) throw new Error("--ttl must use forms like 30s, 5m, or 1h");
+  if (!match) return { error: "--ttl must use forms like 30s, 5m, or 1h" };
   const amount = Number(match[1]);
   const unit = match[2];
   const multiplier = unit === "s" ? 1 : unit === "m" ? 60 : 3600;
-  return amount * multiplier;
+  return { value: amount * multiplier };
 }
 
 function isCastleWallAuditEntry(entry: AuditEntry): boolean {

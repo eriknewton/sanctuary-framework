@@ -4,6 +4,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { Writable } from "node:stream";
+import { createServer, type Server, type Socket as NetSocket } from "node:net";
+
+import { frame, parseFrame } from "../../src/castle-wall/ipc/framing.js";
+import type {
+  CastleWallMessage,
+  PolicyReloadResponse,
+} from "../../src/castle-wall/ipc/messages.js";
 
 import { ed25519 } from "@noble/curves/ed25519";
 
@@ -70,6 +77,64 @@ describe("castle-wall CLI verbs", () => {
       stringToBytes(hashToString(masterKey)),
     );
     return { fortressPath, masterKey, recoveryKey };
+  }
+
+  /**
+   * NF-08: minimal fake Castle Wall daemon that speaks just enough of the LSP
+   * framing + JSON-RPC envelope (see ipc/framing.ts, policy-reload-client.ts)
+   * to answer a `policy_reload_request` with a successful
+   * `policy_reload_response`. Exists only to give `--require-daemon` a
+   * present-daemon branch to exercise; it does not model any other verb.
+   */
+  async function startFakeReloadDaemon(
+    socketPath: string,
+    loadedRuleCount: number,
+  ): Promise<{ server: Server; close: () => Promise<void> }> {
+    const server = createServer((socket: NetSocket) => {
+      let inbound = new Uint8Array(0);
+      socket.on("data", (chunk: Buffer) => {
+        const merged = new Uint8Array(inbound.length + chunk.length);
+        merged.set(inbound, 0);
+        merged.set(chunk, inbound.length);
+        inbound = merged;
+        while (inbound.length > 0) {
+          const parsed = parseFrame(inbound);
+          if (parsed.kind !== "complete") break;
+          inbound = inbound.slice(parsed.consumedBytes);
+          const envelope = JSON.parse(parsed.body) as { params?: CastleWallMessage };
+          if (envelope.params?.type === "policy_reload_request") {
+            const response: PolicyReloadResponse = {
+              type: "policy_reload_response",
+              request_id: envelope.params.request_id,
+              ok: true,
+              loaded_manifest_signature_b64url: null,
+              loaded_rule_count: loadedRuleCount,
+            };
+            socket.write(
+              frame(
+                JSON.stringify({
+                  jsonrpc: "2.0",
+                  method: "castle-wall.policy_reload_response",
+                  params: response,
+                }),
+              ),
+            );
+          }
+        }
+      });
+    });
+    await new Promise<void>((resolvePromise, reject) => {
+      server.once("error", reject);
+      // Unix-domain socket path under a per-test mkdtemp fortress dir, not a
+      // shared TCP port; no other test or run can collide on it, so there is
+      // no EADDRINUSE class for bindWithRetry to retry. port-discipline: ignore
+      server.listen(socketPath, () => resolvePromise());
+    });
+    return {
+      server,
+      close: () =>
+        new Promise<void>((resolvePromise) => server.close(() => resolvePromise())),
+    };
   }
 
   function fingerprint(pub: Uint8Array): string {
@@ -565,6 +630,44 @@ describe("castle-wall CLI verbs", () => {
     );
   });
 
+  // Closes: a malformed --ttl or --scope value used to throw straight out of
+  // parseCastleWallArgs instead of setting parseError, so it bypassed
+  // writeCastleWallParseError (every other flag's error path) and surfaced as
+  // an unhandled exception at the top-level `main().catch` handler in
+  // cli.ts -- wrong exit code, and "Sanctuary MCP Server failed to start"
+  // instead of a usage error. Because parseCastleWallArgs is the single
+  // chokepoint every castle-wall verb calls, this one fix and its tests cover
+  // all of them.
+  it("routes malformed --ttl and --scope values through parseError instead of throwing, in both flag forms", () => {
+    expect(parseCastleWallArgs(["request-1", "--ttl", "nope"]).parseError).toBe(
+      "--ttl must use forms like 30s, 5m, or 1h",
+    );
+    expect(parseCastleWallArgs(["request-1", "--ttl=nope"]).parseError).toBe(
+      "--ttl must use forms like 30s, 5m, or 1h",
+    );
+    expect(parseCastleWallArgs(["request-1", "--ttl"]).parseError).toBe(
+      "--ttl requires a duration like 30s, 5m, or 1h",
+    );
+    expect(parseCastleWallArgs(["request-1", "--scope", "forever"]).parseError).toBe(
+      "--scope must be once, session, or always",
+    );
+    expect(parseCastleWallArgs(["request-1", "--scope=forever"]).parseError).toBe(
+      "--scope must be once, session, or always",
+    );
+    // A --scope/--ttl parseError still preserves everything the loop already
+    // parsed before it hit the bad flag (fortress via the earlier
+    // consumeFlagValue chokepoint, and requestId from this same loop), rather
+    // than discarding it -- matching how --fortress/--since parseError already
+    // behaves above.
+    expect(
+      parseCastleWallArgs(["request-1", "--fortress", "/tmp/f", "--scope=forever"]),
+    ).toEqual({
+      fortress: "/tmp/f",
+      requestId: "request-1",
+      parseError: "--scope must be once, session, or always",
+    });
+  });
+
   it("daemon refuses a trailing fortress flag before resolving the default fortress", async () => {
     const err = new CaptureStream();
     const code = await runDaemon(["--fortress"], {
@@ -587,6 +690,44 @@ describe("castle-wall CLI verbs", () => {
     });
     expect(code).toBe(0);
     expect(out.text()).toContain("No Castle Wall daemon running");
+  });
+
+  it("NF-08: reload --require-daemon exits non-zero and diagnosable when no daemon is running", async () => {
+    const { fortressPath } = await makeFortress();
+    const out = new CaptureStream();
+    const err = new CaptureStream();
+    const code = await runReload(["--fortress", fortressPath, "--require-daemon"], {
+      out,
+      err,
+      platform: "darwin",
+    });
+    // Additive contract: the bare default above stays exit 0 (previous test);
+    // this flag is the only thing that turns "nothing to reload" into a
+    // scriptable failure, and the message names the fortress and the flag
+    // that produced the failure so an operator isn't left guessing why.
+    expect(code).not.toBe(0);
+    expect(err.text()).toContain("--require-daemon");
+    expect(err.text()).toContain("no Castle Wall daemon is reachable");
+  });
+
+  it("NF-08: reload --require-daemon exits 0 when a daemon answers the reload", async () => {
+    const { fortressPath } = await makeFortress();
+    const socketPath = join(fortressPath, "castle.sock");
+    const daemon = await startFakeReloadDaemon(socketPath, 3);
+    try {
+      const out = new CaptureStream();
+      const err = new CaptureStream();
+      const code = await runReload(["--fortress", fortressPath, "--require-daemon"], {
+        out,
+        err,
+        platform: "darwin",
+      });
+      expect(code).toBe(0);
+      expect(out.text()).toContain("Castle Wall policy reloaded (3 rules)");
+      expect(err.text()).toBe("");
+    } finally {
+      await daemon.close();
+    }
   });
 
   it("audit-dump emits only Castle Wall audit entries", async () => {

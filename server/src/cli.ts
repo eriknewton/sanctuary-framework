@@ -1521,6 +1521,11 @@ function printCastleWallHelp(): void {
     disable          Disarm the content filter headlessly (macOS; unconditional dead-man lever).
     setup-shared-dir Create the privileged shared dir for the pinned key (run with sudo, macOS).
     reload           Reload policy in the running fortress daemon.
+                     Exits 0 even when no daemon was reachable to reload (a
+                     fresh fortress has nothing to reload; this is intentional).
+                     --require-daemon  Exit non-zero instead when no daemon
+                                       was reachable, so a script can tell
+                                       "reloaded" apart from "nothing there".
     audit-dump       Emit Castle Wall audit events as JSONL. Read-only.
                      --by-rule        Roll recorded flows up per deciding rule:
                                       per-rule total + allow/deny/prompt split + sample flows.
