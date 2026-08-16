@@ -34,6 +34,8 @@ export const TOP_LEVEL_SUBCOMMANDS = [
   "intelligence",
   "license",
   "liveness-probe",
+  "memory_archive_export",
+  "memory_archive_import",
   "memory_emit",
   "memory_ingest",
   "memory_transcode",
