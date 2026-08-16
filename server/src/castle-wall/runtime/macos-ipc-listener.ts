@@ -668,6 +668,9 @@ export class MacOSFlowIpcListener {
           : null,
         clampedTtl !== body.ttl_seconds ? "ttl_seconds" : null,
       ].filter((f): f is string => f !== null);
+      // SAFETY: daemon signing diagnostics are operator-facing stderr output;
+      // only clamped numerics and fixed field names are interpolated (no
+      // operator-socket value reaches the sink).
       console.error(
         `[castle-wall] arm_lease numeric field(s) out of range; clamped before ` +
           `signing (fields=${clampedFields.join(",")}; ` +
