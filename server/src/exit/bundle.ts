@@ -368,7 +368,10 @@ export interface ExportExitBundleOptions {
    * must have a secure, non-persisted channel to the operator: the exit
    * CLI prints it to the operator's terminal; callers whose results are
    * persisted (e.g. the hub's `resolution_payload`) must NOT enable this
-   * (key material must never be persisted - CLAUDE.md #6).
+   * (key material must never be persisted - CLAUDE.md #6). Known intentional
+   * non-minting caller: `fortressExportBundle` in `dashboard/v1_1/wiring.ts`
+   * (the dashboard exit endpoint), whose omission is a custody boundary, not
+   * an oversight; must match the acknowledgement comment there.
    *
    * Without it, an envelope-custody bundle's state can only be re-keyed by
    * a programmatic `sourceMasterKey` (legacy fortresses keep the legacy
