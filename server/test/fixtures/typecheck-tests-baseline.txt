@@ -12,7 +12,7 @@ test/audit/tools.test.ts(109,57): error TS2345: Argument of type '{ query: Mock<
 test/audit/tools.test.ts(45,10): error TS2352: Conversion of type '{ version: string; state_dir: string; master_key_source: string; }' to type 'SanctuaryConfig' may be a mistake because neither type sufficiently overlaps with the other. If this was intentional, convert the expression to 'unknown' first.
 test/auto-trigger/auto-trigger.test.ts(910,22): error TS2304: Cannot find name 'HeadersInit'.
 test/auto-trigger/auto-trigger.test.ts(913,24): error TS2304: Cannot find name 'HeadersInit'.
-test/broker-mcp/audit-integrity-gate-classification.test.ts(44,17): error TS18046: 'result.content' is of type 'unknown'.
+test/broker-mcp/audit-integrity-gate-classification.test.ts(45,17): error TS18046: 'result.content' is of type 'unknown'.
 test/broker-mcp/broker-server.test.ts(84,3): error TS2578: Unused '@ts-expect-error' directive.
 test/castle-wall/export/exporter.test.ts(618,43): error TS2493: Tuple type '[]' of length '0' has no element at index '1'.
 test/castle-wall/ipc/macos-flow-events.test.ts(1136,13): error TS2322: Type '() => Promise<{ status: "verified"; }>' is not assignable to type '() => Promise<AuditChainVerdict>'.

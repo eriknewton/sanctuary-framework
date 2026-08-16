@@ -266,14 +266,20 @@ export function createServer(
       const hasIntegrityFindings = (findings?.length ?? 0) > 0;
 
       // CALLER-CONTROLLED-AUDIT-OVERRIDE (register row, HIGH; MUST-NEVER #5):
-      // a write tool is refused OUTRIGHT while the audit chain has integrity
-      // findings — there is no agent-facing override. An MCP caller cannot
-      // supply anything that lifts this (`accept_broken_chain` is no longer
-      // an accepted argument; see tool-args.ts). Recovery is operator-CLI-only
-      // (`sanctuary castle-wall ... --accept-broken-chain`, run on the
-      // operator's own machine), because the findings this gate is refusing
-      // on may themselves be evidence of tampering by the very agent asking
-      // to proceed past them.
+      // no argument an MCP caller supplies can lift this gate for a tool
+      // classified `write` — `accept_broken_chain` is no longer an accepted
+      // argument at all (see tool-args.ts), and no other agent-facing field
+      // substitutes for it. That guarantee is scoped to classification: it
+      // holds only for tools correctly classified `write`. The bypass below
+      // keys off `tool.tool_class`, so a tool misclassified `read` whose
+      // handler actually performs a write escapes this check structurally,
+      // independent of any argument — a classification-correctness question
+      // this argument-level change does not close. Findings persisting is a
+      // hard stop for `write` tools, not a request for consent to proceed
+      // past them: restoring MCP write capability once the audit chain has
+      // integrity findings is not currently implemented anywhere in this
+      // tree (the operator CLI's `--accept-broken-chain` does not clear
+      // findings or reach this gate; see castle-wall.ts).
       if (tool.tool_class === "write" && hasIntegrityFindings) {
         return {
           content: [

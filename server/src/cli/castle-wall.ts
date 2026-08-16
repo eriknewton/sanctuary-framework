@@ -706,16 +706,20 @@ async function resolveMasterKey(
 
 /**
  * Operation name for the CLI's audited "operator accepted a broken audit chain"
- * consent entry. This CLI path is now the ONLY way past a broken audit
- * chain — the MCP router's former `mcp_accept_broken_chain_override` agent
- * path (CALLER-CONTROLLED-AUDIT-OVERRIDE, register row, HIGH; MUST-NEVER #5)
- * was removed from router.ts/tool-args.ts because it let an MCP-calling
- * agent bypass the same gate whose findings might be evidence of that
- * agent's own tampering. A privileged CLI action (daemon bring-up, re-pin)
- * past audit integrity findings records the operator's consent BEFORE it
- * proceeds, so the override is itself auditable. The broken history is
- * NEVER repaired or deleted; it stays on disk, visible to
- * `sanctuary castle-wall audit-findings`.
+ * consent entry. This flag lets specific privileged CLI verbs (daemon
+ * bring-up on the legacy chain, re-pin) proceed with their OWN action past
+ * existing audit integrity findings; it does not repair or clear those
+ * findings, and it does not restore MCP write capability — a fortress that
+ * has accumulated an audit-integrity finding has no path back to MCP write
+ * access anywhere in this tree today. The MCP router's former
+ * `mcp_accept_broken_chain_override` agent path was removed from
+ * router.ts/tool-args.ts because it let an MCP-calling agent bypass the same
+ * gate whose findings might be evidence of that agent's own tampering; this
+ * CLI flag is separate, unrelated machinery, not a replacement for it. A
+ * privileged CLI action past audit integrity findings records the
+ * operator's consent BEFORE it proceeds, so the override is itself
+ * auditable. The broken history is NEVER repaired or deleted; it stays on
+ * disk, visible to `sanctuary castle-wall audit-findings`.
  */
 const CASTLE_WALL_ACCEPT_BROKEN_CHAIN_OP = "castle_wall_accept_broken_chain_override";
 

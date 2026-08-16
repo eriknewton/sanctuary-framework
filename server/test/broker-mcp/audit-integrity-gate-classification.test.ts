@@ -6,6 +6,7 @@ import { generateRandomKey } from "../../src/core/random.js";
 import { AuditLog, type PersistedAuditEnvelopeV2 } from "../../src/operational/audit-log.js";
 import { createServer, toolResult, type ToolDefinition } from "../../src/router.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
+import { extraAllowedFieldsForTool } from "../../src/tool-args.js";
 
 async function connectTools(tools: ToolDefinition[], auditLog: AuditLog): Promise<Client> {
   const server = createServer(tools, { auditLog });
@@ -55,8 +56,9 @@ describe("MCP audit-integrity gate classification", () => {
     // call) let the write through and recorded an
     // `mcp_accept_broken_chain_override` audit entry keyed on the CALLING
     // AGENT's identity — an agent-reachable bypass of the audit-integrity
-    // gate. Post-fix there is no argument that lifts the block; recovery is
-    // operator-CLI-only (server/src/cli/castle-wall.ts).
+    // gate. Post-fix there is no argument that lifts the block. (The
+    // operator CLI's `--accept-broken-chain` is a separate mechanism that
+    // does not clear findings or reach this gate; see castle-wall.ts.)
     const { auditLog } = await makeBrokenAuditLog();
     let writeCount = 0;
     const tools: ToolDefinition[] = [
@@ -129,6 +131,18 @@ describe("MCP audit-integrity gate classification", () => {
       .toBe(false);
 
     await client.close();
+  });
+
+  it("extraAllowedFieldsForTool returns exactly the current allowlist (full-set assertion)", () => {
+    // AGENTS.md rule 5: a check that asserts only "accept_broken_chain is
+    // gone" cannot detect a differently-named field re-adding an equivalent
+    // escape hatch — every accept_broken_chain-specific assertion above
+    // would stay green. Asserting the WHOLE shape closes that class: any
+    // future addition to this allowlist, under any name, fails this test
+    // until it is a deliberate, reviewed change.
+    expect(extraAllowedFieldsForTool()).toEqual({
+      approval_ref: { type: "string" },
+    });
   });
 
   it("fails registration when a tool lacks tool_class", () => {

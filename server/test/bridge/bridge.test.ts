@@ -1383,6 +1383,7 @@ describe("Concordia Bridge", () => {
         normalizeToolArgsForValidation({
           args: { ...outcome, identity_id: signer.publicIdentity.identity_id },
           schema: commit.inputSchema,
+          toolClass: commit.tool_class,
         })
       ).toThrow(ToolArgumentValidationError);
 
@@ -1399,6 +1400,7 @@ describe("Concordia Bridge", () => {
             identity_id: signer.publicIdentity.identity_id,
           },
           schema: commit.inputSchema,
+          toolClass: commit.tool_class,
         })
       ).not.toThrow();
     });
