@@ -1,3 +1,9 @@
+// fail-before-exempt: the repeated-wave test added here hardens C9, whose fix is
+// ALREADY MERGED on main (#1247) — reverting this PR's delta cannot reproduce the
+// pre-C9 source, so fail-before cannot fire. The divergence was proven manually
+// twice (builder and gate independently re-planted ensureLoaded inside
+// withAuditWriteLock; both the existing and the new test failed, then passed on
+// restore).
 // C9 (register, MEDIUM availability): `persistChainedEntry` used to run the
 // mandatory first-load read-consistency retry (`ensureLoaded()`) INSIDE the
 // cross-process audit write lock, so a torn read on an appending process's
