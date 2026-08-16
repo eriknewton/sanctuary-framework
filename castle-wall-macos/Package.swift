@@ -68,6 +68,10 @@ let package = Package(
             name: "CastleWallSignerClient",
             targets: ["CastleWallSignerClient"]
         ),
+        .executable(
+            name: "SanctuaryLauncher",
+            targets: ["SanctuaryLauncher"]
+        ),
     ],
     targets: [
         .target(
@@ -151,6 +155,10 @@ let package = Package(
             exclude: [
                 "CastleWallSignerClient.entitlements",
             ]
+        ),
+        .executableTarget(
+            name: "SanctuaryLauncher",
+            path: "Sources/SanctuaryLauncher"
         ),
         .testTarget(
             name: "CastleWallSignerTests",

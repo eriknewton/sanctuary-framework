@@ -337,6 +337,30 @@ async function main(): Promise<void> {
     return drainAndExit(code);
   }
 
+  if (args[0] === "memory_transcode") {
+    const { runMemoryTranscodeCommand } = await import("./cli/memory-file.js");
+    const code = await runMemoryTranscodeCommand({ argv: args.slice(1) });
+    return drainAndExit(code);
+  }
+
+  if (args[0] === "memory_transcode_restore") {
+    const { runMemoryTranscodeRestoreCommand } = await import("./cli/memory-file.js");
+    const code = await runMemoryTranscodeRestoreCommand({ argv: args.slice(1) });
+    return drainAndExit(code);
+  }
+
+  if (args[0] === "memory_archive_export") {
+    const { runMemoryArchiveExportCommand } = await import("./cli/memory-archive.js");
+    const code = await runMemoryArchiveExportCommand({ argv: args.slice(1) });
+    return drainAndExit(code);
+  }
+
+  if (args[0] === "memory_archive_import") {
+    const { runMemoryArchiveImportCommand } = await import("./cli/memory-archive.js");
+    const code = await runMemoryArchiveImportCommand({ argv: args.slice(1) });
+    return drainAndExit(code);
+  }
+
   if (args[0] === "license") {
     const { runLicenseCommand } = await import("./cli/license.js");
     const code = await runLicenseCommand({ argv: args.slice(1) });
@@ -902,8 +926,12 @@ Usage:
   sanctuary completion <bash|zsh|fish>    # Emit shell completion
   sanctuary audit search [opts]           # Search local audit log
   sanctuary checkpoint <cmd> [opts]       # Local encrypted memory checkpoints
-  sanctuary memory_ingest [opts]          # Mirror Claude Code memory into SDW
-  sanctuary memory_emit [opts]            # Emit Claude Code memory from SDW
+  sanctuary memory_ingest [opts]          # Mirror harness memory into SDW
+  sanctuary memory_emit [opts]            # Emit harness memory from SDW
+  sanctuary memory_archive_export [opts]  # Export one SDW archive through Exit V2
+  sanctuary memory_archive_import [opts]  # Import one SDW archive through Exit V2
+  sanctuary memory_transcode [opts]       # Project memory into another harness format
+  sanctuary memory_transcode_restore [opts] # Restore an exact transcode source archive
   sanctuary transparency <cmd> [opts]     # Signed enforcement checkpoints
   sanctuary verify-transparency [opts]    # Verify a checkpoint chain offline
   sanctuary generate systemd [opts]       # Emit systemd service unit
@@ -972,13 +1000,32 @@ Subcommands:
                        memory checkpoints. Use "sanctuary checkpoint --help"
                        for options.
 
-  memory_ingest        Manually mirror Claude Code memory files into the
+  memory_ingest        Manually mirror Claude Code or Codex memory files into the
                        encrypted SDW vault without touching the source dir.
                        Use "sanctuary memory_ingest --help" for options.
 
-  memory_emit          Manually emit Claude Code memory files from the SDW
+  memory_archive_export
+                       Export one completed SDW archive through Exit V2 after
+                       Tier-1 approval; a local OS dialog confirms key custody.
+                       Use "sanctuary memory_archive_export --help" for options.
+
+  memory_archive_import
+                       Import one Exit V2 SDW archive after Tier-1 approval;
+                       a local OS dialog reads hidden recovery material.
+                       Use "sanctuary memory_archive_import --help" for options.
+
+  memory_emit          Manually emit Claude Code or Codex memory files from the SDW
                        vault into an output dir. Existing files are refused.
                        Use "sanctuary memory_emit --help" for options.
+
+  memory_transcode     Manually create a plaintext cross-harness projection plus
+                       an encrypted exact-source recovery archive. This is not sync.
+                       Use "sanctuary memory_transcode --help" for options.
+
+  memory_transcode_restore
+                       Restore exact source files from a completed encrypted
+                       transcode archive. This is not sync.
+                       Use "sanctuary memory_transcode_restore --help" for options.
 
   distress             Emit a distress signal through the reserved habeas
                        lane (operator test verb; same path the agent uses).

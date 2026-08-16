@@ -2926,3 +2926,43 @@ describe("castle-wall/provision/orchestrate", () => {
     expect(ops.arm).toHaveBeenCalledWith(AGENT_UID, CEILING);
   });
 });
+
+describe("operator-twin post-arm rollback regression", () => {
+  it("fast-disarms when the operator twin cannot be stood down after arm", async () => {
+    const ops = happyPathOps({
+      standDownOperatorTwin: vi.fn(async () => ({
+        ok: false as const,
+        error: "launchctl still reports pid 4242",
+      })),
+    });
+
+    await expect(runProvisionFlow(baseCtx(), ops)).resolves.toMatchObject({
+      kind: "armed-then-rolled-back",
+      uid: AGENT_UID,
+      reason: expect.stringMatching(/operator-side agent LaunchAgent.*could not be stopped/i),
+      disarmOutcome: "corroborated_off",
+      disarmObservedOff: true,
+    });
+    expect(ops.disarm).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns the armed rollback failure outcome when operator-twin recovery cannot disarm", async () => {
+    const ops = happyPathOps({
+      standDownOperatorTwin: vi.fn(async () => ({
+        ok: false as const,
+        error: "launchctl status is untrustworthy",
+      })),
+      disarm: vi.fn(async () => {
+        throw new Error("disable exited 1");
+      }),
+    });
+
+    await expect(runProvisionFlow(baseCtx(), ops)).resolves.toMatchObject({
+      kind: "armed-rollback-failed",
+      uid: AGENT_UID,
+      reason: expect.stringMatching(/operator-side agent LaunchAgent.*could not be stopped/i),
+      disarmError: "disable exited 1",
+    });
+    expect(ops.disarm).toHaveBeenCalledTimes(1);
+  });
+});
