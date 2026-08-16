@@ -837,3 +837,70 @@ describe("envelope epoch MAC binding", () => {
     expect(await readEnvelopeEpoch(storage)).toBe(4);
   });
 });
+
+describe("freeze-path operator messages name the restore runbook (NF-05)", () => {
+  /**
+   * NF-05 residual: the Time Machine / anti-rollback restore runbook
+   * (docs/castle-wall-macos-install.md, "Restore and recovery") existed but
+   * no freeze-path message pointed at it, so the operator seeing the symptom
+   * had no path to the remedy. These tests pin the pointer into the three
+   * operator-facing messages an anti-rollback freeze can surface: the
+   * epoch-lowering refusal, the fresh-rollback warning banner, and the
+   * stale-freeze re-boot banner. If a future edit drops the reference, the
+   * runbook goes back to being undiscoverable from the symptom; that is a
+   * regression, not a wording choice.
+   */
+  const RUNBOOK = "docs/castle-wall-macos-install.md";
+
+  it("the epoch-lowering refusal names the runbook", async () => {
+    const storage = new MemoryStorage();
+    const master = generateRandomKey();
+    await writeEpochWitness(storage, master, {
+      epoch: 3,
+      epoch_id: "epoch-3:test",
+      witnessed_at: new Date().toISOString(),
+    });
+    await expect(
+      writeEpochWitness(storage, master, {
+        epoch: 1,
+        epoch_id: "epoch-1:test",
+        witnessed_at: new Date().toISOString(),
+      })
+    ).rejects.toThrow(RUNBOOK);
+  });
+
+  it("the fresh-rollback warning banner names the runbook", async () => {
+    const storage = new MemoryStorage();
+    const master = generateRandomKey();
+    const res = await evaluateAndEnforceRollback({
+      storage,
+      master,
+      envelopeEpoch: 0,
+      observation: okObservation(3),
+    });
+    expect(res.frozen).toBe(true);
+    expect(res.banner).toContain(RUNBOOK);
+  });
+
+  it("the stale-freeze re-boot banner names the runbook", async () => {
+    const storage = new MemoryStorage();
+    const master = generateRandomKey();
+    // First boot: rollback detected, freeze set.
+    await evaluateAndEnforceRollback({
+      storage,
+      master,
+      envelopeEpoch: 0,
+      observation: okObservation(3),
+    });
+    // OK re-boot without attesting: the persisting freeze banner is the
+    // message a confused operator sees on every boot until they attest.
+    const res = await evaluateAndEnforceRollback({
+      storage,
+      master,
+      envelopeEpoch: 3,
+      observation: okObservation(3),
+    });
+    expect(res.frozen).toBe(true);
+    expect(res.banner).toContain(RUNBOOK);
+  });
+});

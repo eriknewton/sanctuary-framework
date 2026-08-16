@@ -702,7 +702,6 @@ export class MeshNode {
     reason: string;
     principal_private_key?: Uint8Array;
     emitter_principal?: string;
-    guardian_quorum_verified_by_ceremony?: boolean;
     quorum_signatures?: NodeRevokePayload["quorum_signatures"];
   }): Promise<SignedEvent<NodeRevokePayload>> {
     this.requireKeyed();
@@ -717,25 +716,23 @@ export class MeshNode {
       effective_at: new Date().toISOString(),
       quorum_signatures: params.quorum_signatures,
     };
-    // Pre-broadcast guardian invariant: direct quorum revokes verify the
+    // Pre-broadcast guardian invariant: every quorum revoke verifies its
     // guardian signatures here, before emitLifecycleEvent can surface or
-    // broadcast the envelope. The ceremony flag is a trusted compatibility
-    // hook for recovery flows that already verified a guardian quorum over a
-    // broader ceremony payload; receivers still re-check node_revoke authority
-    // before any peer roster mutation.
-    if (
-      !params.principal_private_key &&
-      !params.guardian_quorum_verified_by_ceremony
-    ) {
+    // broadcast the envelope. There is no trusted-caller bypass: a ceremony
+    // that verified a quorum over a broader ceremony payload has NOT obtained
+    // authorization for this revocation, because that quorum never examined
+    // this node_revoke payload. Callers present quorum signatures over THIS
+    // payload's input (recovery flows collect them via
+    // deviceRecoveryRevokeQuorumInput); receivers independently
+    // re-check node_revoke authority before any peer roster mutation.
+    if (!params.principal_private_key) {
       this.assertNodeRevokePayloadQuorumAuthorized(payload);
     }
     const evt = await this.emitLifecycleEvent("node_revoke", payload, {
       emitter_principal: params.emitter_principal,
       principal_private_key: params.principal_private_key,
     });
-    if (!params.guardian_quorum_verified_by_ceremony) {
-      this.assertNodeRevokeAuthorized(evt as SignedEvent<NodeRevokePayload>);
-    }
+    this.assertNodeRevokeAuthorized(evt as SignedEvent<NodeRevokePayload>);
     this.lifecycleLog.append(evt as SignedEvent<NodeLifecyclePayload>);
     this.roster.markRevoked(params.target_node_id);
     return evt as SignedEvent<NodeRevokePayload>;
@@ -1418,6 +1415,10 @@ export class MeshNode {
     });
   }
 
+  // Canonical quorum-input bytes for a node_revoke. Must match
+  // `revokeQuorumInput` in `../recovery-flows/node-revoke.ts` byte-for-byte:
+  // ceremony producers sign that builder's output, and this verifier (both
+  // the pre-broadcast gate and every receiver) recomputes the same bytes here.
   private nodeRevokeQuorumInput(
     payload: NodeRevokePayload
   ): MasterRotationQuorumInput {

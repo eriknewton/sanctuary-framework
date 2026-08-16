@@ -65,6 +65,15 @@ export interface DeviceRecoveryProposal {
   replacement_node_cert: NodeIdentityCertificate;
   /** Assembled guardian quorum signatures over the recovery payload. */
   guardian_signatures: GuardianQuorumSignature[];
+  /**
+   * Guardian quorum signatures over the node_revoke quorum input for the
+   * lost node (built by `deviceRecoveryRevokeQuorumInput`). Required: the
+   * recovery quorum above covers the recovery intent (lost -> replacement),
+   * NOT the revocation the ceremony performs, so the guardians explicitly
+   * sign the revocation too. Collected on the same ceremony device in the
+   * same signing session as `guardian_signatures`.
+   */
+  revoke_guardian_signatures: GuardianQuorumSignature[];
   /** ISO8601 timestamp the ceremony was initiated at. */
   initiated_at?: string;
 }

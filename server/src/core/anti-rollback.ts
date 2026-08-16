@@ -379,7 +379,8 @@ export async function writeEpochWitness(
       throw new Error(
         "Sanctuary: refusing to lower the custody epoch witness " +
           `(${current.data.epoch} → ${data.epoch}) without an explicit restore ` +
-          "attestation. Use `sanctuary restore-attest`."
+          "attestation. Use `sanctuary restore-attest` (runbook: the " +
+          '"Restore and recovery" section of docs/castle-wall-macos-install.md).'
       );
     }
     // The `baseline_established` latch and the `baseline_schema` floor are
@@ -1175,7 +1176,9 @@ function rollbackBanner(
     "\n" +
     "That records an honest, permanent audit entry that this fortress was restored\n" +
     "from an earlier epoch, and unfreezes writes. If you did NOT restore anything,\n" +
-    "treat this as a possible attack: rotate the master before attesting.\n"
+    "treat this as a possible attack: rotate the master before attesting.\n" +
+    "\n" +
+    'Runbook: the "Restore and recovery" section of docs/castle-wall-macos-install.md.\n'
   );
 }
 
@@ -1185,7 +1188,8 @@ function staleFreezeBanner(data: FreezeData): string {
     `rollback (detected ${data.frozen_at}; epoch ${data.observed_epoch} vs witness ` +
     `${data.witnessed_epoch}).\n` +
     "Run `sanctuary restore-attest` (fortress passphrase required) to acknowledge\n" +
-    "and unfreeze.\n"
+    "and unfreeze. Runbook: the \"Restore and recovery\" section of\n" +
+    "docs/castle-wall-macos-install.md.\n"
   );
 }
 

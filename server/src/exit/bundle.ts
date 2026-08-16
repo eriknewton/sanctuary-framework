@@ -368,7 +368,10 @@ export interface ExportExitBundleOptions {
    * must have a secure, non-persisted channel to the operator: the exit
    * CLI prints it to the operator's terminal; callers whose results are
    * persisted (e.g. the hub's `resolution_payload`) must NOT enable this
-   * (key material must never be persisted - CLAUDE.md #6).
+   * (key material must never be persisted - CLAUDE.md #6). Known intentional
+   * non-minting caller: `fortressExportBundle` in `dashboard/v1_1/wiring.ts`
+   * (the dashboard exit endpoint), whose omission is a custody boundary, not
+   * an oversight; must match the acknowledgement comment there.
    *
    * Without it, an envelope-custody bundle's state can only be re-keyed by
    * a programmatic `sourceMasterKey` (legacy fortresses keep the legacy
@@ -421,7 +424,16 @@ export interface ExportExitBundleOptions {
    * the default cap.
    */
   auditReceiptsExportCap?: number;
-  /** Optional deterministic export clock for tests. */
+  /**
+   * Optional deterministic export clock. Beyond making tests reproducible,
+   * this single read anchors `manifest.body.exported_at`, which the import
+   * path feeds into did:web resolution as `assertion_time` (see
+   * `resolveDidWeb` callers below) - the value that decides whether a
+   * historical, since-revoked verification method is still inside its valid
+   * window. An uninjected caller gets the real wall clock, as before; a
+   * caller that injects `now` gets both a reproducible manifest AND a
+   * reproducible revoked-key window evaluation from the same read.
+   */
   now?: () => Date;
 }
 
@@ -1171,8 +1183,13 @@ export async function exportExitBundle(
 ): Promise<ExportExitBundleResult> {
   // INVARIANT: manifest `exported_at` is the did:web assertion time, so
   // deterministic callers pin it here instead of comparing historical keys
-  // against the real wall clock.
-  const exportedAt = (opts.now ?? (() => new Date()))().toISOString();
+  // against the real wall clock. The `Date` is read exactly once and reused
+  // (see `exportApprovalAuditId` below) - a second ambient `Date.now()` read
+  // anywhere else in this function would reintroduce non-determinism even
+  // when the caller injects `now`.
+  const exportClock = opts.now ?? (() => new Date());
+  const exportedAtDate = exportClock();
+  const exportedAt = exportedAtDate.toISOString();
   // INVARIANT (A9): every option-shape refusal fires BEFORE the first side
   // effect (mkdir / audit append / artifact write). A throw after
   // public_identity.json lands leaves a partial, unsigned artifact directory a
@@ -1210,8 +1227,15 @@ export async function exportExitBundle(
     throw new Error("Cannot export exit bundle: no default identity exists.");
   }
 
+  // INVARIANT: the fallback audit id's timestamp is derived from the SAME
+  // captured `exportedAtDate` (the injected `now` seam when the caller
+  // supplies one) rather than a fresh `Date.now()` read. This id lands
+  // unchanged in the SIGNED manifest body as `export_approval_audit_id`
+  // below; a second, uncaptured wall-clock read here would make the signed
+  // manifest non-reproducible across two runs even when the export clock is
+  // pinned for determinism.
   const exportApprovalAuditId =
-    opts.exportApprovalAuditId ?? `exit-export-${Date.now()}`;
+    opts.exportApprovalAuditId ?? `exit-export-${exportedAtDate.getTime()}`;
   void opts.auditLog.append("l1", "exit_bundle_export", identity.identity_id, {
     approval_id: exportApprovalAuditId,
     manifest_version: EXIT_BUNDLE_MANIFEST_VERSION,
