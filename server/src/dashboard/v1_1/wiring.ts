@@ -721,6 +721,14 @@ export function buildV11Bindings(
               // the exit-machinery Slice 1 ownership partition is deliberately
               // not applied. Named acknowledgement, not a silent skip.
               unpartitionedLegacyExport: true,
+              // `mintStateRekeyKey` is DELIBERATELY absent (A10): this path's
+              // results are persisted into the hub inbox `resolution_payload`,
+              // and key material must never be persisted (CLAUDE.md #6). A
+              // minted key here would either be persisted with the result
+              // (forbidden) or destroyed while the bundle advertises a re-key
+              // path the operator can never satisfy. Must match the
+              // non-minting-caller pin on `mintStateRekeyKey` in
+              // exit/bundle.ts.
               ...(approvalAuditId !== undefined
                 ? { exportApprovalAuditId: approvalAuditId }
                 : {}),
