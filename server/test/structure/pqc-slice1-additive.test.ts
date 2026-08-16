@@ -1,9 +1,12 @@
 import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
+import { transitivelyImports } from "../../scripts/check-import-cycles.lib.js";
+
 const REPO_ROOT = join(fileURLToPath(import.meta.url), "..", "..", "..", "..");
+const SERVER_SRC = resolve(REPO_ROOT, "server", "src");
 
 function readRepoFile(path: string): string {
   return readFileSync(join(REPO_ROOT, path), "utf-8");
@@ -29,6 +32,19 @@ describe("PQC additive guard", () => {
   });
 
   it("keeps the suite registry out of legacy frozen serializers", () => {
+    // This is an IMPORT-GRAPH check, not a text/substring scan, on purpose.
+    // A `.not.toContain("crypto-suite-registry")` over the whole file text
+    // (the original shape of this guard, per #1112 and the J5 register row)
+    // both false-positives on a barred file that merely COMMENTS on the
+    // registry's name (a pin comment or a derivation note referencing it by
+    // name trips the same substring, with no import present) and
+    // false-negatives on an aliased re-export or an indirect import chain
+    // that never spells the literal string "crypto-suite-registry" in the
+    // importing file at all. Following actual `import`/`export ... from`
+    // edges (via the shared parser in `check-import-cycles.lib.ts`, reused
+    // rather than re-implemented per AGENTS.md rule 5) tests what the guard
+    // is actually meant to enforce: these serializers never reach the suite
+    // registry module, directly or transitively.
     const legacyFrozenFiles = [
       "server/src/core/encryption.ts",
       "server/src/mesh/trust-root.ts",
@@ -37,10 +53,14 @@ describe("PQC additive guard", () => {
       "server/src/transparency/checkpoint.ts",
       "server/src/v1/operator-signed.ts",
     ];
+    const suiteRegistry = join(SERVER_SRC, "core", "crypto-suite-registry.ts");
 
     for (const file of legacyFrozenFiles) {
-      expect(readRepoFile(file), file).not.toContain("crypto-suite-registry");
-      expect(readRepoFile(file), file).not.toContain("CryptoSuiteRegistry");
+      const abs = join(REPO_ROOT, file);
+      expect(
+        transitivelyImports(abs, suiteRegistry, SERVER_SRC),
+        `${file} must not import the crypto-suite registry, directly or transitively`,
+      ).toBe(false);
     }
   });
 });
