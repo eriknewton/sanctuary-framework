@@ -338,6 +338,13 @@ export interface CastleWallParsedArgs {
    * fortress publish path. Never accepted from an untrusted source.
    */
   producerPubKey?: string;
+  /**
+   * reload (NF-08, additive): opt a scripted caller into a non-zero exit when
+   * no daemon was reachable to reload. The bare exit-0 "nothing to reload"
+   * default is unchanged and test-pinned: this flag only widens what a
+   * caller can ask for, it never narrows the default.
+   */
+  requireDaemon?: boolean;
 }
 
 function writeCastleWallParseError(
@@ -2564,6 +2571,18 @@ export async function runReload(
       out,
       `No Castle Wall daemon running for fortress ${fortressIdLabel(fortressPath)}. Run 'sanctuary wrap' to start one.\n`,
     );
+    // NF-08: "nothing to reload" is not a failure by default: a fresh
+    // fortress with no daemon yet is a normal state, and this exit code is
+    // test-pinned. A scripted caller that needs to tell "reloaded" apart from
+    // "nothing was there" opts in with --require-daemon rather than the
+    // default silently becoming unscriptable for everyone else.
+    if (parsed.requireDaemon) {
+      write(
+        err,
+        `Error: --require-daemon set and no Castle Wall daemon is reachable for fortress ${fortressIdLabel(fortressPath)}.\n`,
+      );
+      return 1;
+    }
     return 0;
   }
   write(err, `Error: ${result.error ?? "policy reload failed"}\n`);
@@ -5169,6 +5188,8 @@ export function parseCastleWallArgs(argv: string[]): CastleWallParsedArgs {
       parsed.scope = parseScope(since.argv[++i]);
     } else if (arg === "--force") {
       parsed.force = true;
+    } else if (arg === "--require-daemon") {
+      parsed.requireDaemon = true;
     } else if (arg === "--allow-no-egress") {
       parsed.allowNoEgress = true;
     } else if (arg.startsWith("--agent-uid=")) {
