@@ -297,7 +297,6 @@ export async function classifyApprovalRequest(params: {
     ({ handlerArgs } = normalizeToolArgsForValidation({
       args: params.args,
       schema: tool.inputSchema,
-      toolClass: tool.tool_class,
     }));
   } catch (error) {
     if (error instanceof ToolArgumentValidationError) {

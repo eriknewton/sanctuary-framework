@@ -706,18 +706,23 @@ async function resolveMasterKey(
 
 /**
  * Operation name for the CLI's audited "operator accepted a broken audit chain"
- * consent entry. Parallels the MCP router's `mcp_accept_broken_chain_override`
- * (router.ts) - a privileged CLI action (daemon bring-up, re-pin) past audit
- * integrity findings records the operator's consent BEFORE it proceeds, so the
- * override is itself auditable. The broken history is NEVER repaired or deleted;
- * it stays on disk, visible to `sanctuary castle-wall audit-findings`.
+ * consent entry. This CLI path is now the ONLY way past a broken audit
+ * chain — the MCP router's former `mcp_accept_broken_chain_override` agent
+ * path (CALLER-CONTROLLED-AUDIT-OVERRIDE, register row, HIGH; MUST-NEVER #5)
+ * was removed from router.ts/tool-args.ts because it let an MCP-calling
+ * agent bypass the same gate whose findings might be evidence of that
+ * agent's own tampering. A privileged CLI action (daemon bring-up, re-pin)
+ * past audit integrity findings records the operator's consent BEFORE it
+ * proceeds, so the override is itself auditable. The broken history is
+ * NEVER repaired or deleted; it stays on disk, visible to
+ * `sanctuary castle-wall audit-findings`.
  */
 const CASTLE_WALL_ACCEPT_BROKEN_CHAIN_OP = "castle_wall_accept_broken_chain_override";
 
 /**
  * Build the `AuditLog` a privileged CLI verb (daemon / re-pin) should use,
- * applying the operator-override semantics that mirror the MCP router's
- * `accept_broken_chain` path:
+ * applying this CLI's operator-override semantics (the MCP router has no
+ * equivalent agent-facing path anymore; this flag is operator-CLI-only):
  *
  *  - No `--accept-broken-chain`: return a default (strict) `AuditLog`. If the
  *    chain has integrity findings, the verb's first append throws

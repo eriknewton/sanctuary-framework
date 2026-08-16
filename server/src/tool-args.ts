@@ -166,11 +166,20 @@ function checkType(
   return null;
 }
 
-export function extraAllowedFieldsForTool(toolClass?: "read" | "write"): Record<string, SchemaProperty> {
+// CALLER-CONTROLLED-AUDIT-OVERRIDE (register row, HIGH; MUST-NEVER #5): this
+// allowlist previously admitted an agent-supplied `accept_broken_chain`
+// boolean on every write tool, which let the calling agent itself bypass the
+// audit-integrity gate (router.ts) whose findings might be evidence of that
+// same agent's tampering. Recovery past a broken audit chain is
+// operator-CLI-only now (`sanctuary castle-wall ... --accept-broken-chain`,
+// see server/src/cli/castle-wall.ts, which runs on the operator's machine,
+// not via an MCP call the agent can issue). Do not re-admit
+// `accept_broken_chain` (or any equivalent override field) here: an unknown
+// field is rejected by `validateArgs` below with a diagnosable
+// `ToolArgumentValidationError`, which is the intended behavior for an agent
+// that still sends it.
+export function extraAllowedFieldsForTool(): Record<string, SchemaProperty> {
   return {
-    ...(toolClass === "write"
-      ? { accept_broken_chain: { type: "boolean", default: false } }
-      : {}),
     approval_ref: { type: "string" },
   };
 }
@@ -178,12 +187,11 @@ export function extraAllowedFieldsForTool(toolClass?: "read" | "write"): Record<
 export function normalizeToolArgsForValidation(params: {
   args: Record<string, unknown>;
   schema: Record<string, unknown>;
-  toolClass?: "read" | "write";
 }): { handlerArgs: Record<string, unknown>; approvalRef?: string } {
   const validationErrors = validateArgs(
     params.args,
     params.schema,
-    extraAllowedFieldsForTool(params.toolClass)
+    extraAllowedFieldsForTool()
   );
   if (validationErrors.length > 0) {
     throw new ToolArgumentValidationError(validationErrors);

@@ -195,7 +195,6 @@ export function createServer(
       ({ approvalRef, handlerArgs } = normalizeToolArgsForValidation({
         args: typedArgs,
         schema: tool.inputSchema,
-        toolClass: tool.tool_class,
       }));
     } catch (error) {
       if (!(error instanceof ToolArgumentValidationError)) throw error;
@@ -265,9 +264,17 @@ export function createServer(
     try {
       const findings = await options?.auditLog?.getIntegrityFindings();
       const hasIntegrityFindings = (findings?.length ?? 0) > 0;
-      const acceptBrokenChain = handlerArgs.accept_broken_chain === true;
 
-      if (tool.tool_class === "write" && hasIntegrityFindings && !acceptBrokenChain) {
+      // CALLER-CONTROLLED-AUDIT-OVERRIDE (register row, HIGH; MUST-NEVER #5):
+      // a write tool is refused OUTRIGHT while the audit chain has integrity
+      // findings — there is no agent-facing override. An MCP caller cannot
+      // supply anything that lifts this (`accept_broken_chain` is no longer
+      // an accepted argument; see tool-args.ts). Recovery is operator-CLI-only
+      // (`sanctuary castle-wall ... --accept-broken-chain`, run on the
+      // operator's own machine), because the findings this gate is refusing
+      // on may themselves be evidence of tampering by the very agent asking
+      // to proceed past them.
+      if (tool.tool_class === "write" && hasIntegrityFindings) {
         return {
           content: [
             {
@@ -275,7 +282,7 @@ export function createServer(
               text: JSON.stringify({
                 error: `${findings!.length} audit integrity findings detected`,
                 audit_integrity_findings: findings,
-                accept_broken_chain_required: true,
+                remediation: "operator_recovery_required",
               }),
             },
           ],
@@ -284,19 +291,6 @@ export function createServer(
       }
 
       const runHandler = async () => {
-        if (tool.tool_class === "write" && hasIntegrityFindings && acceptBrokenChain) {
-          await options?.auditLog?.appendCritical({
-            layer: "l2",
-            operation: "mcp_accept_broken_chain_override",
-            identity_id: callerIdentity,
-            result: "success",
-            details: {
-              tool: name,
-              finding_count: findings!.length,
-              findings,
-            },
-          });
-        }
         // Thread the server-set session principal to every handler (see
         // ToolHandler's doc) — this is what lets handshake/federation
         // per-origin quotas bind to a value the calling agent cannot mint
@@ -304,9 +298,10 @@ export function createServer(
         return tool.handler(handlerArgs, callerIdentity);
       };
 
-      const shouldBypassAuditIntegrity =
-        tool.tool_class === "read" ||
-        (tool.tool_class === "write" && hasIntegrityFindings && acceptBrokenChain);
+      // Read tools bypass the audit-integrity gate unconditionally (an
+      // operator must always be able to introspect); write tools never do,
+      // since the override branch above is gone.
+      const shouldBypassAuditIntegrity = tool.tool_class === "read";
       const result =
         shouldBypassAuditIntegrity && options?.auditLog
           ? await options.auditLog.runAllowingIntegrityFindings(runHandler)
