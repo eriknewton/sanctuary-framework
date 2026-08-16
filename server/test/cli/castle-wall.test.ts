@@ -630,6 +630,44 @@ describe("castle-wall CLI verbs", () => {
     );
   });
 
+  // Closes: a malformed --ttl or --scope value used to throw straight out of
+  // parseCastleWallArgs instead of setting parseError, so it bypassed
+  // writeCastleWallParseError (every other flag's error path) and surfaced as
+  // an unhandled exception at the top-level `main().catch` handler in
+  // cli.ts -- wrong exit code, and "Sanctuary MCP Server failed to start"
+  // instead of a usage error. Because parseCastleWallArgs is the single
+  // chokepoint every castle-wall verb calls, this one fix and its tests cover
+  // all of them.
+  it("routes malformed --ttl and --scope values through parseError instead of throwing, in both flag forms", () => {
+    expect(parseCastleWallArgs(["request-1", "--ttl", "nope"]).parseError).toBe(
+      "--ttl must use forms like 30s, 5m, or 1h",
+    );
+    expect(parseCastleWallArgs(["request-1", "--ttl=nope"]).parseError).toBe(
+      "--ttl must use forms like 30s, 5m, or 1h",
+    );
+    expect(parseCastleWallArgs(["request-1", "--ttl"]).parseError).toBe(
+      "--ttl requires a duration like 30s, 5m, or 1h",
+    );
+    expect(parseCastleWallArgs(["request-1", "--scope", "forever"]).parseError).toBe(
+      "--scope must be once, session, or always",
+    );
+    expect(parseCastleWallArgs(["request-1", "--scope=forever"]).parseError).toBe(
+      "--scope must be once, session, or always",
+    );
+    // A --scope/--ttl parseError still preserves everything the loop already
+    // parsed before it hit the bad flag (fortress via the earlier
+    // consumeFlagValue chokepoint, and requestId from this same loop), rather
+    // than discarding it -- matching how --fortress/--since parseError already
+    // behaves above.
+    expect(
+      parseCastleWallArgs(["request-1", "--fortress", "/tmp/f", "--scope=forever"]),
+    ).toEqual({
+      fortress: "/tmp/f",
+      requestId: "request-1",
+      parseError: "--scope must be once, session, or always",
+    });
+  });
+
   it("daemon refuses a trailing fortress flag before resolving the default fortress", async () => {
     const err = new CaptureStream();
     const code = await runDaemon(["--fortress"], {
