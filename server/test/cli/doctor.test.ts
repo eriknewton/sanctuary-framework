@@ -253,14 +253,25 @@ approval_channel:
     expect(out.text()).toContain("OK   state dir");
     expect(out.text()).toContain("OK   identity");
     expect(out.text()).toContain("OK   principal policy");
+    // IC-05: a fortress with an identity now signs its checkpoints via the
+    // constructor-derived fortress binding, so doctor's standalone export
+    // verify (which deliberately trusts no embedded key) warns that the
+    // signatures need an out-of-band pinned key, not that none exist.
     expect(out.text()).toContain("WARN audit chain");
-    expect(out.text()).toContain("no checkpoint signature was verified");
+    expect(out.text()).toContain(
+      "checkpoint signatures were not verified against a pinned public key"
+    );
     expect(out.text()).toContain("n/a (not macOS)");
     expect(out.text()).not.toContain(passphrase);
     expect(out.text()).not.toContain("encrypted_private_key");
   });
 
-  it("warns when the audit chain has checkpoints but no verified checkpoint signatures", async () => {
+  it("warns that default-signed checkpoints still need an out-of-band pinned key", async () => {
+    // Pre-IC-05 this fixture produced UNSIGNED checkpoints (no signer was
+    // wired anywhere in production) and doctor warned that no signature was
+    // verified. The constructor-derived fortress binding now signs whenever
+    // an identity exists, so the honest doctor posture for a signed-but-
+    // unpinned chain is the missing-pinned-key warning instead.
     const fortress = await makeFortress({
       identity: true,
       policy: "valid",
@@ -274,7 +285,9 @@ approval_channel:
     });
     const chainCheck = checks.find((check) => check.name === "audit chain");
     expect(chainCheck?.status).toBe("WARN");
-    expect(chainCheck?.message).toBe("no checkpoint signature was verified");
+    expect(chainCheck?.message).toBe(
+      "checkpoint signatures were not verified against a pinned public key"
+    );
 
     const out = new Capture();
     const code = await runDoctorCommand({
@@ -285,7 +298,9 @@ approval_channel:
     });
     expect(code).toBe(0);
     expect(out.text()).toContain("WARN audit chain");
-    expect(out.text()).toContain("no checkpoint signature was verified");
+    expect(out.text()).toContain(
+      "checkpoint signatures were not verified against a pinned public key"
+    );
   });
 
   it("does not report OK for a tampered chain re-signed with embedded checkpoint keys", async () => {

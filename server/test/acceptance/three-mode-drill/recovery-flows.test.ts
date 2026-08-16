@@ -55,6 +55,7 @@ import {
   canonicalAuditPromoteQuorumInput,
   createMasterRotationAckSubscription,
   deviceRecoveryQuorumInput,
+  deviceRecoveryRevokeQuorumInput,
   firePostRecoveryPrompt,
   revokeQuorumInput,
   type MasterRotationAckMessage,
@@ -63,6 +64,7 @@ import type { AlertEmitContext } from "../../../src/mesh/failure-modes/index.js"
 
 import {
   bootThreeModeDrill,
+  GOSSIP_SETTLE_MS,
   type ThreeModeDrillHandle,
   waitFor,
 } from "./harness.js";
@@ -184,7 +186,6 @@ describe("WP-MVP-8 ceremony 1 — device-loss recovery", () => {
         {
           lost_node_id: drill.nodeIdB,
           replacement_node_cert: replacementCert,
-          guardian_signatures: [],
         },
         drill.master_public.fortress_id
       );
@@ -197,6 +198,25 @@ describe("WP-MVP-8 ceremony 1 — device-loss recovery", () => {
             guardian_private_key: g.sk,
           })
         );
+      // The guardians also sign the node_revoke quorum input for the lost
+      // node in the same ceremony session: the recovery quorum never covers
+      // the revocation, and revokePeer + every receiver verify against these.
+      const revokeInput = deviceRecoveryRevokeQuorumInput(
+        { lost_node_id: drill.nodeIdB },
+        drill.master_public.fortress_id
+      );
+      const revokeSigs = guardians
+        .slice(0, 3)
+        .map((g) =>
+          signMasterRotationAsGuardian({
+            input: revokeInput,
+            guardian_id: g.identity.guardian_id,
+            guardian_private_key: g.sk,
+          })
+        );
+      // Pin the roster on the receiving peer too, so its independent
+      // node_revoke authority re-check can verify the broadcast quorum.
+      drill.nodeC.registerGuardianRoster(roster);
 
       // Last activity long enough in the past that the grace window is not
       // blocking the ceremony (past 90d + 30d).
@@ -209,6 +229,7 @@ describe("WP-MVP-8 ceremony 1 — device-loss recovery", () => {
           lost_node_id: drill.nodeIdB,
           replacement_node_cert: replacementCert,
           guardian_signatures: quorumSigs,
+          revoke_guardian_signatures: revokeSigs,
         },
         ctx: {
           node: drill.nodeA,
@@ -236,6 +257,18 @@ describe("WP-MVP-8 ceremony 1 — device-loss recovery", () => {
       // B is marked revoked on A's roster.
       expect(drill.nodeA.getRoster().presenceOf(drill.nodeIdB)).toBe(
         "revoked"
+      );
+      // C12 regression gate: the broadcast revoke must ALSO verify on the
+      // receiving peer. Node C re-checks node_revoke authority against the
+      // quorum signatures carried in the event; with the pre-fix recovery-
+      // quorum signatures (which never covered the revoke payload) this
+      // propagation never happened, because every receiver refused the event.
+      await waitFor(
+        () =>
+          drill.nodeC.getRoster().presenceOf(drill.nodeIdB) === "revoked",
+        GOSSIP_SETTLE_MS,
+        50,
+        "node C marks lost node revoked from the broadcast quorum revoke"
       );
       // Replacement cert is admitted on A's roster.
       expect(
@@ -337,7 +370,6 @@ describe("WP-MVP-8 ceremony 1 — device-loss recovery", () => {
         {
           lost_node_id: drill.nodeIdB,
           replacement_node_cert: replacementCert,
-          guardian_signatures: [],
         },
         drill.master_public.fortress_id
       );
@@ -358,6 +390,7 @@ describe("WP-MVP-8 ceremony 1 — device-loss recovery", () => {
             lost_node_id: drill.nodeIdB,
             replacement_node_cert: replacementCert,
             guardian_signatures: sigs,
+            revoke_guardian_signatures: [],
           },
           ctx: {
             node: drill.nodeA,

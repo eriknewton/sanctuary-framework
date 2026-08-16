@@ -314,6 +314,10 @@ For AI coding agents handling install failures, here are the common cases.
 **`sanctuary` CLI not found after `npm install -g`:**
 - Confirm `npm bin -g` is on the PATH. On macOS with nvm, this typically lives at `~/.nvm/versions/node/<version>/bin/`.
 
+**Trust-bearing writes are FROZEN, or a `custody_rollback_suspected` audit finding appears:**
+- Sanctuary noticed the fortress looks older than its surviving custody evidence says it should be, which is what a restore looks like from the inside. A Time Machine restore, backup restore, dotfile sync, or cloning to a new machine all trigger this, and you may not have done it knowingly (a migration assistant or sync tool counts). The server keeps running; only trust-bearing writes are held until you acknowledge the restore. Follow the [Restore and recovery section of the Castle Wall macOS install guide](docs/castle-wall-macos-install.md#restore-and-recovery): run `sanctuary restore-attest` with the fortress passphrase to record the restore and unfreeze writes.
+- If you did not restore anything, treat the freeze as suspicious and rotate the master before attesting.
+
 **Existing harness config overwritten:**
 - The original is at `~/.sanctuary/backup/config-backup-<timestamp>-<surface-tag><ext>` (the surface tag is a short hex hash of the config file's path, and the extension matches the source config: `.json` for most harnesses; Hermes wraps two surfaces and backs up both, `.json` for the primary `~/.hermes/cli-config.json` and `.yaml` for the auxiliary `~/.hermes/config.yaml`). Backups written by earlier releases use the older `config-backup-<timestamp>.json` name and remain restorable. Restore with `sanctuary protect --unwrap` from the same fortress/storage context.
 

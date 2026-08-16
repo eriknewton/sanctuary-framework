@@ -65,11 +65,12 @@ describe("Audit module invariant comments", () => {
       "cannot bless a changed",
       "span by carrying its own root_hash",
     ]);
-    expectNear(source, "const publicKey =\n      resolvedPublicKey", [
+    expectNear(source, "if (resolvedPublicKeys.length === 0) {", [
       "Checkpoint trust-basis invariant",
       "embedded public key is part of the",
       "checkpoint being verified",
       "explicitly asks for an internal-consistency check",
+      "never a reason to retry against the embedded copy",
     ]);
     expectNear(source, "root_hash: computeAuditRoot(hashes),", [
       "Checkpoint write invariant",
@@ -77,10 +78,27 @@ describe("Audit module invariant comments", () => {
       "hashes collected while the write lock is held",
       "while the write lock is held",
     ]);
+    expectNear(source, "signed = (await this.checkpointSigner(payload)) ?? null;", [
+      "not an identity-less fortress",
+      "diagnostic only",
+      "IC-05-DG",
+    ]);
     expectNear(source, "unsigned_reason: \"no signing identity available", [
-      "Production checkpoints may be unsigned today",
-      "honest bound is serialized as `unsigned`",
+      "store whose adapter cannot reach identity records",
+      "is serialized as `unsigned`",
       "silently trusting a fallback key",
+    ]);
+  });
+
+  it("keeps the IC-05 checkpoint-identity wiring pinned at the constructor default", () => {
+    const source = read("server/src/operational/audit-log.ts");
+
+    expectNear(source, "const fortressCheckpointIdentity = createFortressCheckpointIdentityBinding(", [
+      "DERIVED from the",
+      "constructor's own required arguments",
+      "injection seam",
+      "Fail-closed-on-absence was rejected",
+      "honest `unsigned`",
     ]);
   });
 });
