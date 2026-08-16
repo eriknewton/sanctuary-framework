@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
@@ -54,6 +54,22 @@ describe("PQC additive guard", () => {
       "server/src/v1/operator-signed.ts",
     ];
     const suiteRegistry = join(SERVER_SRC, "core", "crypto-suite-registry.ts");
+
+    // Positive control: prove the machinery is live before trusting six
+    // negatives. If the registry target path were ever mistyped (or the graph
+    // went vacuously empty), transitivelyImports would return false for every
+    // root and the six checks below would pass silently; a known genuine
+    // importer (v1/federation.ts value-imports key-length constants from the
+    // registry) must be reported as reaching it.
+    expect(existsSync(suiteRegistry), "registry target must exist").toBe(true);
+    expect(
+      transitivelyImports(
+        join(SERVER_SRC, "v1", "federation.ts"),
+        suiteRegistry,
+        SERVER_SRC,
+      ),
+      "positive control: v1/federation.ts is a known registry importer",
+    ).toBe(true);
 
     for (const file of legacyFrozenFiles) {
       const abs = join(REPO_ROOT, file);
