@@ -183,6 +183,15 @@ export interface NodeKeyStore {
 
 export interface SyncRequestPayload {
   kind: SyncKind;
+  /**
+   * C12-REPLAY (§3.3 point 7): CSPRNG correlation id minted by the requesting
+   * node and retained in its bounded, expiring outstanding-request set. A
+   * `sync_response` is applied ONLY when it echoes an outstanding id, and the
+   * match CONSUMES the id — so the weaker `sync_anchored` freshness channel runs
+   * only during a sync the node itself initiated, never as an always-on
+   * unsolicited surface. Must match `request_id` on `SyncResponsePayload`.
+   */
+  request_id?: string;
   /** Requester's per-agent policy-version baseline — requester wants anything higher. */
   since_policy_versions?: Record<string, number>;
   /** Requester's locator-version baseline — requester wants anything higher. */
@@ -197,6 +206,13 @@ export interface SyncRequestPayload {
 
 export interface SyncResponsePayload {
   kind: SyncKind;
+  /**
+   * C12-REPLAY: echoes `SyncRequestPayload.request_id` so the initiator can
+   * correlate the response to an outstanding request. A response without a
+   * matching outstanding id is refused before `applySync` (no parse, no
+   * verification side effects, no log/roster mutation).
+   */
+  request_id?: string;
   /** Missed `node_join` / `node_leave` / `node_revoke` events during offline window. */
   node_lifecycle_events?: SignedEvent<NodeLifecyclePayload>[];
   /** Missed `policy_update` events since `since_policy_versions`. */

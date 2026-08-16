@@ -65,7 +65,6 @@ export {
 } from "./device-recovery.js";
 export {
   NodeRevokeCeremony,
-  revokeQuorumInput,
   type NodeRevokeContext,
 } from "./node-revoke.js";
 export {

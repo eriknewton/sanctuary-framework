@@ -35,7 +35,6 @@ import type {
   GuardianIdentity,
   GuardianQuorumProof,
   GuardianRoster,
-  MasterRotationQuorumInput,
 } from "./types.js";
 import { ED25519_PUBLIC_KEY_BYTES } from "../../core/crypto-suite-registry.js";
 
@@ -294,9 +293,17 @@ export function verifyGuardianRoster(
  *      over `canonicalize(input)`.
  *
  * Throws GuardianQuorumError on any failure.
+ *
+ * Generic over the input type `I` (C12-REPLAY, review F-7): this function only
+ * ever canonicalizes `input`, so it verifies a `MasterRotationQuorumInput`, a
+ * `GuardianRevokeQuorumInput` (v2), or a `GuardianDeviceRecoveryQuorumInput`
+ * without a union, an overload set, or a second verify function (any of which
+ * would grow or mirror per input type). The v1 and v2 shapes have DISJOINT
+ * field sets, and `canonicalizeToBytes` is field-name-bearing canonical JSON,
+ * so their bytes can never collide — the generic is safe.
  */
-export function verifyGuardianQuorum(params: {
-  input: MasterRotationQuorumInput;
+export function verifyGuardianQuorum<I>(params: {
+  input: I;
   proof: GuardianQuorumProof;
   pinned_roster: GuardianRoster;
 }): void {
@@ -387,8 +394,8 @@ export function verifyGuardianQuorum(params: {
  * ceremony; production callers running the ceremony on a separate signing
  * device produce these signatures out-of-band and assemble the proof.
  */
-export function signMasterRotationAsGuardian(params: {
-  input: MasterRotationQuorumInput;
+export function signMasterRotationAsGuardian<I>(params: {
+  input: I;
   guardian_id: string;
   guardian_private_key: Uint8Array;
 }): { guardian_id: string; signature: string } {

@@ -50,6 +50,9 @@ import {
 import {
   issueGuardianRoster,
   signMasterRotationAsGuardian,
+  buildGuardianRevokeQuorumInput,
+  mintRevokeCollectionContext,
+  type GuardianRevokeQuorumContext,
 } from "../../src/mesh/guardian/index.js";
 import { InMemoryTransport } from "../../src/mesh/in-memory-transport.js";
 import {
@@ -82,7 +85,6 @@ import type {
   PrincipalCertificate,
   SignedEvent,
 } from "../../src/mesh/types.js";
-import type { MasterRotationQuorumInput } from "../../src/mesh/guardian/types.js";
 import type { CompiledPolicy } from "../../src/policy-engine/types.js";
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -248,23 +250,19 @@ function signNodeRevokeWithoutPrincipal(params: {
   };
 }
 
+// C12-REPLAY v2: the local v1 revokeQuorumInput helper is replaced by the
+// shared builder over a fresh collection context (ceremony_id + window).
 function revokeQuorumInput(
   payload: Pick<NodeRevokePayload, "node_id" | "reason">,
-  fortressId: string
-): MasterRotationQuorumInput {
-  const initiatedAt = "revoke:" + payload.node_id;
-  return {
-    old_master_pubkey: "node:" + payload.node_id,
-    new_master_pubkey: {
-      public_key: toBase64url(
-        new TextEncoder().encode("revoke|" + payload.reason)
-      ),
-      fortress_id: fortressId,
-      created_at: initiatedAt,
-    },
-    rotated_at: initiatedAt,
+  fortressId: string,
+  context: GuardianRevokeQuorumContext
+) {
+  return buildGuardianRevokeQuorumInput({
+    context,
+    target_node_id: payload.node_id,
+    reason: payload.reason,
     fortress_id: fortressId,
-  };
+  });
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1127,9 +1125,11 @@ describe("lifecycle/mesh-node - bootstrap → join → revoke", () => {
     first.node.registerGuardianRoster(roster);
 
     const reason = "guardian quorum below threshold";
+    const context = mintRevokeCollectionContext();
     const input = revokeQuorumInput(
       { node_id: "prebroadcast-victim", reason },
-      first.bootstrap.master_public.fortress_id
+      first.bootstrap.master_public.fortress_id,
+      context
     );
     const oneSignature = signMasterRotationAsGuardian({
       input,
@@ -1149,6 +1149,7 @@ describe("lifecycle/mesh-node - bootstrap → join → revoke", () => {
       first.node.revokePeer({
         target_node_id: "prebroadcast-victim",
         reason,
+        quorum_context: context,
         quorum_signatures: [
           {
             guardian_pubkey: guardians[0].public_key,
@@ -1211,23 +1212,19 @@ describe("lifecycle/mesh-node - bootstrap → join → revoke", () => {
     first.node.registerGuardianRoster(roster);
 
     // A full 2-of-3 quorum, genuinely signed by roster guardians, but over a
-    // DIFFERENT input than this revoke payload's quorum input (standing in
-    // for a recovery ceremony's quorum over its own ceremony payload). Before
-    // the C12 fix a caller could attach these and skip verification with a
-    // trusted flag; now the pre-broadcast gate recomputes the revoke input
-    // and must refuse them.
-    const ceremonyShapedInput = {
-      old_master_pubkey: "node:ceremony-victim",
-      new_master_pubkey: {
-        public_key: toBase64url(
-          stringToBytes("device_recovery:ceremony-victim->replacement")
-        ),
-        fortress_id: first.bootstrap.master_public.fortress_id,
-        created_at: "device_recovery:ceremony-victim->replacement",
-      },
-      rotated_at: "device_recovery:ceremony-victim->replacement",
+    // DIFFERENT revoke input than this payload's (a quorum for some OTHER
+    // target under the same fresh v2 context). Before the C12 fix a caller
+    // could attach these and skip verification with a trusted flag; now the
+    // pre-broadcast gate recomputes the revoke input from THIS payload and must
+    // refuse them. The context is valid+fresh, so the refusal lands at the
+    // signature check, not the v1-shape/freshness gate.
+    const context = mintRevokeCollectionContext();
+    const ceremonyShapedInput = buildGuardianRevokeQuorumInput({
+      context,
+      target_node_id: "some-other-target",
+      reason: "device_loss_recovery",
       fortress_id: first.bootstrap.master_public.fortress_id,
-    };
+    });
     const ceremonySigs = guardianKeys.slice(0, 2).map((kp, i) =>
       signMasterRotationAsGuardian({
         input: ceremonyShapedInput,
@@ -1249,6 +1246,7 @@ describe("lifecycle/mesh-node - bootstrap → join → revoke", () => {
       first.node.revokePeer({
         target_node_id: "ceremony-victim",
         reason: "device_loss_recovery",
+        quorum_context: context,
         quorum_signatures: ceremonySigs.map((s, i) => ({
           guardian_pubkey: guardians[i].public_key,
           signature: s.signature,
@@ -1300,9 +1298,11 @@ describe("lifecycle/mesh-node - bootstrap → join → revoke", () => {
     first.node.registerGuardianRoster(roster);
 
     const reason = "guardian quorum revoke";
+    const context = mintRevokeCollectionContext();
     const input = revokeQuorumInput(
       { node_id: "guardian-victim", reason },
-      first.bootstrap.master_public.fortress_id
+      first.bootstrap.master_public.fortress_id,
+      context
     );
     const guardianProof = guardianKeys.slice(0, 2).map((kp, i) =>
       signMasterRotationAsGuardian({
@@ -1315,6 +1315,7 @@ describe("lifecycle/mesh-node - bootstrap → join → revoke", () => {
     const evt = await first.node.revokePeer({
       target_node_id: "guardian-victim",
       reason,
+      quorum_context: context,
       quorum_signatures: guardianProof.map((sig, i) => ({
         guardian_pubkey: guardians[i].public_key,
         signature: sig.signature,
@@ -1489,23 +1490,28 @@ describe("lifecycle/sync - initial sync pulls policy + locator + audit", () => {
       emitter_node: attackerCert.node_id,
       emitter_principal: "system",
       fortress_id: first.bootstrap.master_public.fortress_id,
-      payload: { certificate: attackerCert },
+      payload: { certificate: attackerCert, bootstrap_token_ref: "hostile" },
       monotonic_seq: 1,
       node_private_key: attackerNodeKeypair.privateKey,
     });
 
     const beforeRosterSize = first.node.snapshot().roster_size;
-    await expect(
-      first.node.applySync({
-        kind: "initial_sync",
-        node_lifecycle_events: [hostileJoin],
-      })
-    ).rejects.toThrow();
+    // C12-REPLAY §3.3 point 6: per-event isolation means a poison event is
+    // dropped-and-audited and the batch CONTINUES rather than throwing out of
+    // applySync. The invariant that matters is unchanged: the hostile cert that
+    // does not chain to the pinned master is NEVER admitted to the roster.
+    const rejected: Error[] = [];
+    first.node.onEnvelopeRejected = ({ error }) => rejected.push(error);
+    await first.node.applySync({
+      kind: "initial_sync",
+      node_lifecycle_events: [hostileJoin],
+    });
 
     expect(first.node.snapshot().roster_size).toBe(beforeRosterSize);
     expect(
       first.node.getRoster().presenceOf(attackerCert.node_id)
     ).toBeUndefined();
+    expect(rejected.length).toBeGreaterThanOrEqual(1);
   });
 });
 

@@ -17,7 +17,8 @@
  * Spec §3 (lifecycle), §5 (audit), §6 (locator), §7.2 (revoke), §9 (recovery).
  */
 
-import { toBase64url } from "../../core/encoding.js";
+import { fromBase64url, toBase64url } from "../../core/encoding.js";
+import { randomBytes } from "../../core/random.js";
 import {
   DEFAULTS,
   type NodeMode,
@@ -33,11 +34,16 @@ import {
 import { packSignedEvent } from "../envelope.js";
 import { verifySignedEvent } from "../envelope.js";
 import {
+  assertQuorumContextFresh,
+  buildGuardianRevokeQuorumInput,
+  computeRevokeAuthorizationKey,
+  parseGuardianRevokeQuorumContext,
   verifyGuardianQuorum,
   verifyGuardianRoster,
+  type FreshnessMode,
   type GuardianQuorumProof,
+  type GuardianRevokeQuorumContext,
   type GuardianRoster,
-  type MasterRotationQuorumInput,
 } from "../guardian/index.js";
 import { receiveAuditBatch, type MeshTransport } from "../in-memory-transport.js";
 import { MeshRouter } from "../router.js";
@@ -88,6 +94,15 @@ import {
 } from "./local-state.js";
 import { NodeRoster } from "./node-roster.js";
 import { InMemoryCounterStore } from "./counters.js";
+import {
+  MAX_OUTSTANDING_SYNC_REQUESTS,
+  REVOKE_DENIAL_AUDIT_GLOBAL_MAX,
+  REVOKE_DENIAL_AUDIT_PER_EMITTER_MAX,
+  REVOKE_DENIAL_AUDIT_WINDOW_MS,
+  SYNC_REQUEST_ID_BYTES,
+  SYNC_REQUEST_ID_EXPIRY_MS,
+} from "./constants.js";
+import { DenialAuditGovernor } from "./denial-audit-governor.js";
 import {
   applySyncResponse,
   buildSyncResponse,
@@ -158,11 +173,50 @@ export class MeshNode {
   private state: MeshNodeState = "unbooted";
   private oldestPendingEntryAt: number | null = null;
   private receivedLog: ReceivedEventLog[] = [];
+  /**
+   * C12-REPLAY (§3.3 point 7): correlation ids of sync_requests THIS node has
+   * issued and not yet consumed, keyed by id -> expiry ms. A sync_response is
+   * applied only when it echoes an outstanding, unexpired id, and the match
+   * CONSUMES the id. Ids are minted solely here, so an external peer can neither
+   * insert nor evict — the set is not externally gameable.
+   */
+  private readonly outstandingSyncRequests = new Map<string, number>();
+  /**
+   * C12-REPLAY (§2.5): bounds revoke-denial audit writes (per-emitter + global
+   * ceiling) so the guaranteed-denial incentive freshness creates cannot become
+   * an audit-write amplifier.
+   */
+  private readonly denialAuditGovernor = new DenialAuditGovernor(
+    REVOKE_DENIAL_AUDIT_PER_EMITTER_MAX,
+    REVOKE_DENIAL_AUDIT_GLOBAL_MAX,
+    REVOKE_DENIAL_AUDIT_WINDOW_MS
+  );
+  /**
+   * Sibling governor for the uncorrelated-`sync_response` refusal audit path.
+   * That refusal is GUARANTEED for any unsolicited response, so without a cap
+   * it is a zero-cost audit-write amplifier for any in-roster peer (the same
+   * rule-8 incentive shape as the revoke-denial path). Separate instance so
+   * the two paths' budgets and saturation summaries never conflate.
+   */
+  private readonly uncorrelatedSyncAuditGovernor = new DenialAuditGovernor(
+    REVOKE_DENIAL_AUDIT_PER_EMITTER_MAX,
+    REVOKE_DENIAL_AUDIT_GLOBAL_MAX,
+    REVOKE_DENIAL_AUDIT_WINDOW_MS
+  );
 
-  /** Callback hooks - Follow-up #3 (failure-mode operator surfaces) wires these. */
+  /**
+   * Callback hooks - Follow-up #3 (failure-mode operator surfaces) wires these.
+   *
+   * The third `kind`, `"sync_admitted_out_of_window"`, is the S2 detectability
+   * marker (design §3.2): a revoke admitted through the sync channel AFTER its
+   * collection window lapsed on this node's clock. It is the operator-visible
+   * half of the S2 residual — such an admission is legitimate for a late
+   * joiner but is also the only laundering channel left to an attacker, so it
+   * is never silent.
+   */
   onLifecycleEvent: (
     evt: SignedEvent<NodeLifecyclePayload>,
-    kind: "received" | "emitted"
+    kind: "received" | "emitted" | "sync_admitted_out_of_window"
   ) => void = () => {};
   onPolicyUpdate: (
     evt: SignedEvent<PolicyUpdatePayload>,
@@ -703,6 +757,8 @@ export class MeshNode {
     principal_private_key?: Uint8Array;
     emitter_principal?: string;
     quorum_signatures?: NodeRevokePayload["quorum_signatures"];
+    /** C12-REPLAY: the freshness context the guardians signed (quorum path). */
+    quorum_context?: GuardianRevokeQuorumContext;
   }): Promise<SignedEvent<NodeRevokePayload>> {
     this.requireKeyed();
     if (!params.principal_private_key && !params.quorum_signatures?.length) {
@@ -715,26 +771,45 @@ export class MeshNode {
       reason: params.reason,
       effective_at: new Date().toISOString(),
       quorum_signatures: params.quorum_signatures,
+      // Present iff quorum_signatures is (presence pairing). A quorum revoke
+      // without a context is the retired v1 shape and would be refused.
+      quorum_context:
+        params.quorum_signatures?.length && params.quorum_context
+          ? {
+              input_schema: "sanctuary.guardian-revoke-quorum.v2",
+              ceremony_id: params.quorum_context.ceremony_id,
+              initiated_at: params.quorum_context.initiated_at,
+              expires_at: params.quorum_context.expires_at,
+            }
+          : undefined,
     };
     // Pre-broadcast guardian invariant: every quorum revoke verifies its
-    // guardian signatures here, before emitLifecycleEvent can surface or
-    // broadcast the envelope. There is no trusted-caller bypass: a ceremony
-    // that verified a quorum over a broader ceremony payload has NOT obtained
-    // authorization for this revocation, because that quorum never examined
-    // this node_revoke payload. Callers present quorum signatures over THIS
-    // payload's input (recovery flows collect them via
-    // deviceRecoveryRevokeQuorumInput); receivers independently
+    // guardian signatures AND its freshness window here, with this node's own
+    // clock, before emitLifecycleEvent can surface or broadcast the envelope —
+    // so a compromised local ceremony whose window has lapsed cannot even emit.
+    // There is no trusted-caller bypass: a ceremony that verified a quorum over
+    // a broader ceremony payload has NOT obtained authorization for this
+    // revocation, because that quorum never examined this node_revoke payload.
+    // Callers present quorum signatures over THIS payload's input (recovery
+    // flows collect them via deviceRecoveryRevokeQuorumInput), and
+    // receivers independently
     // re-check node_revoke authority before any peer roster mutation.
     if (!params.principal_private_key) {
-      this.assertNodeRevokePayloadQuorumAuthorized(payload);
+      this.assertNodeRevokePayloadQuorumAuthorized(payload, {
+        mode: "strict",
+        now: new Date(),
+      });
     }
     const evt = await this.emitLifecycleEvent("node_revoke", payload, {
       emitter_principal: params.emitter_principal,
       principal_private_key: params.principal_private_key,
     });
-    this.assertNodeRevokeAuthorized(evt as SignedEvent<NodeRevokePayload>);
-    this.lifecycleLog.append(evt as SignedEvent<NodeLifecyclePayload>);
-    this.roster.markRevoked(params.target_node_id);
+    // Post-emit re-check + single admission (append + markRevoked) share the
+    // ONE chokepoint every receiver uses; strict clock on this live path.
+    this.admitRevoke(evt as SignedEvent<NodeRevokePayload>, {
+      mode: "strict",
+      now: new Date(),
+    });
     return evt as SignedEvent<NodeRevokePayload>;
   }
 
@@ -885,8 +960,14 @@ export class MeshNode {
     kind: "initial_sync" | "delta_sync" | "agent_state_transfer";
   }): Promise<void> {
     this.requireKeyed();
+    // Mint a fresh correlation id and record it as outstanding. Only a
+    // sync_response echoing this id (before it expires) will be applied, and the
+    // match consumes it — the initiator owns retry with a FRESH id (§3.3 pt 7).
+    const requestId = this.mintSyncRequestId();
+    this.registerOutstandingSyncRequest(requestId);
     const payload: SyncRequestPayload = {
       kind: params.kind,
+      request_id: requestId,
       since_policy_versions: this.policyBundle.versionVector(),
       since_locator_version: this.locatorTable.highest(),
       since_audit_seqs: {},
@@ -920,61 +1001,240 @@ export class MeshNode {
     });
   }
 
-  /** Apply a sync response received from a peer. */
-  async applySync(payload: SyncResponsePayload): Promise<void> {
-    // Verify every signed event in the response BEFORE applying. The pure
-    // applySyncResponse function trusts its inputs; verification is here.
+  /**
+   * Apply a sync response received from a peer.
+   *
+   * SYNC-APPEND-01 (design §3.3): the ordering invariant is that parse,
+   * freshness, verification, and authorization ALL complete BEFORE any
+   * `lifecycleLog.append` — a refused event must never be persisted, because
+   * anything appended here is re-served to every future sync consumer by
+   * handleSyncRequest, and appending garbage would turn the attacker's dead
+   * bytes into a self-propagating relay through honest nodes. And each event is
+   * isolated: one malformed or refused event is dropped-and-audited and the loop
+   * CONTINUES, so it never costs the legitimate revokes behind it in the same
+   * response batch.
+   */
+  async applySync(
+    payload: SyncResponsePayload,
+    now: Date = new Date()
+  ): Promise<void> {
+    // Verify policy/locator events up front (they are applied by
+    // applySyncResponse). TRUTHFUL SCOPE: a throw here aborts the WHOLE
+    // response — the lifecycle loop below is never reached, so one poison
+    // policy_update or locator_update costs this response's lifecycle events
+    // too (and the correlation id was already consumed, so the initiator must
+    // retry with a fresh sync_request). The per-event isolation below governs
+    // only the lifecycle loop. Pre-existing shape; tracked as register row
+    // C12-SYNC-ORDER-01 (fix shape: per-table isolation or verify-after-
+    // lifecycle).
     for (const evt of payload.policy_updates ?? []) {
       this.verifyOrThrow(evt);
     }
     for (const evt of payload.locator_updates ?? []) {
       this.verifyOrThrow(evt);
     }
-    const acceptedLifecycleEvents: SignedEvent<NodeLifecyclePayload>[] = [];
     for (const evt of payload.node_lifecycle_events ?? []) {
-      if (evt.event_type === "node_join") {
-        const join = this.verifyNodeJoinBeforeRosterMutation(
-          evt as SignedEvent<NodeJoinPayload>
-        );
-        this.roster.add(join.payload.certificate);
-      } else {
-        this.verifyOrThrow(evt);
-      }
-      this.lifecycleLog.append(evt);
-      if (evt.event_type === "node_revoke") {
-        const rev = evt as SignedEvent<NodeRevokePayload>;
-        try {
-          this.assertNodeRevokeAuthorized(rev);
-        } catch (e) {
-          const error = e instanceof Error ? e : new Error(String(e));
-          this.auditNodeRevokeDenied(rev, error);
-          this.onEnvelopeRejected({
-            error,
-            event_type: rev.event_type,
-            emitter_node: rev.emitter_node,
+      try {
+        if (evt.event_type === "node_join") {
+          const join = this.verifyNodeJoinBeforeRosterMutation(
+            evt as SignedEvent<NodeJoinPayload>
+          );
+          this.roster.add(join.payload.certificate);
+          this.lifecycleLog.append(evt);
+        } else if (evt.event_type === "node_revoke") {
+          this.verifyOrThrow(evt);
+          // sync_anchored is the ONLY place this mode is passed (T9 pins it):
+          // a committed revoke must outlive its collection window for a late
+          // joiner, so freshness anchors to the emitter-stamped effective_at.
+          const rev = evt as SignedEvent<NodeRevokePayload>;
+          const outcome = this.admitRevoke(rev, {
+            mode: "sync_anchored",
+            now,
+            effective_at: rev.payload.effective_at,
           });
-          continue;
+          // S2 detectability (design §3.2/§5-F9): an admission the strict
+          // clock would have refused (now past expires_at) is the sync-only
+          // laundering channel the S2 residual concedes, so it is NEVER
+          // silent — distinct sealed audit entry + distinct operator-visible
+          // lifecycle marker, at this admission site. Fires only on a REAL
+          // admission (state change), not on an idempotent same-authorization
+          // drop, so a replay flood of an already-admitted event cannot use
+          // this entry as an ungoverned write amplifier.
+          if (outcome === "admitted") {
+            this.recordSyncOutOfWindowAdmission(rev, now);
+          }
+        } else if (evt.event_type === "node_leave") {
+          this.verifyOrThrow(evt);
+          this.lifecycleLog.append(evt);
+          this.roster.markLeft(
+            (evt as SignedEvent<NodeLeavePayload>).payload.node_id
+          );
+        } else {
+          this.verifyOrThrow(evt);
+          this.lifecycleLog.append(evt);
         }
-        this.roster.markRevoked(rev.payload.node_id);
+      } catch (e) {
+        // Per-event isolation (§3.3 point 6): drop and audit, never abort the
+        // batch. A refused event is NOT appended, so it is never re-served.
+        const error = e instanceof Error ? e : new Error(String(e));
+        if (evt.event_type === "node_revoke") {
+          this.auditNodeRevokeDenied(
+            evt as SignedEvent<NodeRevokePayload>,
+            error,
+            now
+          );
+        }
+        this.onEnvelopeRejected({
+          error,
+          event_type: evt.event_type,
+          emitter_node: evt.emitter_node,
+        });
+        continue;
       }
-      if (evt.event_type === "node_leave") {
-        const lv = evt as SignedEvent<NodeLeavePayload>;
-        this.roster.markLeft(lv.payload.node_id);
-      }
-      acceptedLifecycleEvents.push(evt);
     }
-    const result = applySyncResponse({
-      ...payload,
-      node_lifecycle_events: acceptedLifecycleEvents,
-    }, {
-      policy_bundle: this.policyBundle,
-      locator_table: this.locatorTable,
-      lifecycle_log: this.lifecycleLog,
-      audit_log: this.canonicalAudit,
-      on_policy_update: (evt, updateResult) =>
-        this.onPolicyUpdate(evt, updateResult),
-    });
+    // Policy + locator tables only — lifecycle events already appended above by
+    // the SINGLE append site, so pass an empty lifecycle list (no double-append).
+    const result = applySyncResponse(
+      { ...payload, node_lifecycle_events: [] },
+      {
+        policy_bundle: this.policyBundle,
+        locator_table: this.locatorTable,
+        lifecycle_log: this.lifecycleLog,
+        audit_log: this.canonicalAudit,
+        on_policy_update: (evt, updateResult) =>
+          this.onPolicyUpdate(evt, updateResult),
+      }
+    );
     void result; // observability hooks left for Follow-up #3
+  }
+
+  /**
+   * The single admission point for a verified revoke (the receive router,
+   * applySync, and revokePeer's post-emit re-check all funnel here). Asserts
+   * authority + freshness, then applies the authorization-keyed dedupe bound to
+   * roster state (SYNC-APPEND-01 §3.3 point 4, re-gate RG3-1):
+   *
+   *   - a same-authorization revoke of a target that is CURRENTLY REVOKED is a
+   *     true replay of the standing state: idempotent at the roster, DROPPED at
+   *     the log (never replace-in-place — the retained entry keeps its original
+   *     order so late joiners replay what live nodes saw);
+   *   - a same-authorization revoke of a target that is NOT currently revoked
+   *     (it was re-admitted after the authorization's ceremony) is REFUSED
+   *     loudly (throws into the caller's denial path): a quorum context
+   *     authorizes at most one revocation epoch of its target, and the
+   *     authorization dies when the target is re-admitted. Accepting-and-
+   *     dropping it would mutate the roster with no retained log witness, so
+   *     late joiners would diverge and fail open.
+   *
+   * Throws on any auth/freshness/re-admission failure; the caller audits.
+   * Returns whether state changed ("admitted") or the event was an idempotent
+   * same-authorization drop, so the sync site can scope its S2 detectability
+   * entry to real admissions.
+   */
+  private admitRevoke(
+    rev: SignedEvent<NodeRevokePayload>,
+    freshness: FreshnessMode
+  ): "admitted" | "idempotent_drop" {
+    this.assertNodeRevokeAuthorized(rev, freshness);
+    const target = rev.payload.node_id;
+    const authKey = this.revokeAuthorizationKey(rev);
+    if (this.lifecycleLog.hasRetainedRevokeAuthorization(authKey)) {
+      if (this.roster.presenceOf(target) === "revoked") {
+        // Idempotent true replay — roster already revoked, drop from the log.
+        return "idempotent_drop";
+      }
+      throw new MeshError(
+        "node_revoke denied: authorization does not survive re-admission of its target"
+      );
+    }
+    this.lifecycleLog.appendRevoke(rev as SignedEvent<NodeLifecyclePayload>, {
+      target_node_id: target,
+      authorization_key: authKey,
+    });
+    this.roster.markRevoked(target);
+    return "admitted";
+  }
+
+  /**
+   * S2 detectability (design §3.2/§5-F9): when a quorum revoke is admitted via
+   * the sync_anchored channel at a moment the strict clock would have refused
+   * (this node's `now` is past the context's `expires_at`), seal the DISTINCT
+   * audit entry `node_revoke_admitted_via_sync_out_of_window` and fire the
+   * distinct `onLifecycleEvent` marker. This is the operator-visible half of
+   * the S2 residual: the out-of-window sync admission is legitimate for a late
+   * joiner AND is the one laundering channel the design concedes, so it must
+   * never be silent. In-window sync admissions and every live-path admission
+   * emit nothing here. Principal-signed revokes carry no context and are out
+   * of S2's scope.
+   */
+  private recordSyncOutOfWindowAdmission(
+    rev: SignedEvent<NodeRevokePayload>,
+    now: Date
+  ): void {
+    const wireContext = rev.payload.quorum_context;
+    if (!wireContext) return;
+    const parsed = parseGuardianRevokeQuorumContext(wireContext);
+    // The admission already re-parsed and verified this context; a parse
+    // failure here is unreachable, and detectability must not invent one.
+    if (!parsed.ok) return;
+    if (now.getTime() <= parsed.context.expires_at_ms) return;
+    if (this.nodePrivateKey) {
+      const entry = sealAuditEntry({
+        emitter_node: this.config.node_id,
+        emitter_agent: "mesh",
+        emitter_principal: this.config.system_principal_id ?? "system",
+        policy_version: 0,
+        attestation_state: "present",
+        payload: {
+          operation: "node_revoke_admitted_via_sync_out_of_window",
+          peer_node: rev.emitter_node,
+          target_node: rev.payload.node_id,
+          ceremony_id: parsed.context.ceremony_id,
+          effective_at: rev.payload.effective_at,
+          expires_at: wireContext.expires_at,
+        },
+        node_private_key: this.nodePrivateKey,
+      });
+      if (this.oldestPendingEntryAt === null) {
+        this.oldestPendingEntryAt = Date.now();
+      }
+      this.auditBuffer.push(entry);
+    }
+    this.onLifecycleEvent(
+      rev as SignedEvent<NodeLifecyclePayload>,
+      "sync_admitted_out_of_window"
+    );
+  }
+
+  /**
+   * Compute the authorization dedupe key for a verified revoke. NEVER keys on
+   * `event_id` (attacker-chosen inside the signed body): keys on the ceremony_id
+   * for quorum revokes and on sha256(DECODED principal-signature bytes) for
+   * principal revokes — the artifact the attacker cannot mint fresh.
+   */
+  private revokeAuthorizationKey(
+    rev: SignedEvent<NodeRevokePayload>
+  ): string {
+    if (rev.principal_signature) {
+      // Decode the base64url wire string to raw bytes BEFORE hashing, so an
+      // encoding-variant duplicate cannot re-enter through a lenient decoder.
+      return computeRevokeAuthorizationKey({
+        target_node_id: rev.payload.node_id,
+        principal_signature_bytes: fromBase64url(rev.principal_signature),
+      });
+    }
+    const ceremonyId = rev.payload.quorum_context?.ceremony_id;
+    if (ceremonyId === undefined) {
+      // Should be unreachable: assertNodeRevokeAuthorized has already required
+      // a context on the quorum path. Fail closed rather than key on nothing.
+      throw new MeshError(
+        "node_revoke authorization key: quorum revoke missing ceremony_id"
+      );
+    }
+    return computeRevokeAuthorizationKey({
+      target_node_id: rev.payload.node_id,
+      ceremony_id: ceremonyId,
+    });
   }
 
   // ═════════════════════════════════════════════════════════════════════
@@ -1167,6 +1427,17 @@ export class MeshNode {
     return this.locatorTable;
   }
 
+  /**
+   * Read-only view of the audit entries buffered but not yet flushed to the
+   * canonical audit node. Diagnostic/test surface: lets an operator console or
+   * a wired-consumer test assert WHICH entries are pending (e.g. the S2
+   * out-of-window admission entry or a governor saturation summary), not just
+   * how many. Never mutates the buffer.
+   */
+  peekPendingAuditEntries(): readonly AuditEntry[] {
+    return this.auditBuffer.peekPending();
+  }
+
   getLifecycleLog(): NodeLifecycleEventLog {
     return this.lifecycleLog;
   }
@@ -1276,7 +1547,10 @@ export class MeshNode {
     this.router.register("node_revoke", (evt) => {
       const rev = evt as SignedEvent<NodeRevokePayload>;
       try {
-        this.assertNodeRevokeAuthorized(rev);
+        // Live receive path — strict clock (this node's own). admitRevoke
+        // asserts authority + freshness, applies the authorization-keyed dedupe
+        // bound to roster state, then appends (once) + markRevoked.
+        this.admitRevoke(rev, { mode: "strict", now: new Date() });
       } catch (e) {
         const error = e instanceof Error ? e : new Error(String(e));
         this.auditNodeRevokeDenied(rev, error);
@@ -1287,8 +1561,6 @@ export class MeshNode {
         });
         return;
       }
-      this.roster.markRevoked(rev.payload.node_id);
-      this.lifecycleLog.append(rev as SignedEvent<NodeLifecyclePayload>);
       this.onLifecycleEvent(rev as SignedEvent<NodeLifecyclePayload>, "received");
     });
     this.router.register("canonical_audit_change", (evt) => {
@@ -1362,21 +1634,32 @@ export class MeshNode {
   }
 
   private assertNodeRevokeAuthorized(
-    evt: SignedEvent<NodeRevokePayload>
+    evt: SignedEvent<NodeRevokePayload>,
+    freshness: FreshnessMode
   ): void {
+    // Presence pairing (design §2.1 / review F-10), enforced at all sites: no
+    // dead attacker-controlled field may ride a verified event. An orphan
+    // context (context present, signatures absent) is rejected loudly rather
+    // than ignored, even on a principal-signed revoke.
+    if (evt.payload.quorum_context && !evt.payload.quorum_signatures?.length) {
+      throw new MeshError(
+        "node_revoke denied: quorum_context present without quorum_signatures (orphan context rejected)"
+      );
+    }
     // Receive-path invariant: verifyOrThrow already validated peer envelopes,
     // and local emit paths use packSignedEvent. A principal signature therefore
     // carries revoke authority; otherwise reduce to the same guardian quorum
-    // proof used by the pre-broadcast direct path.
+    // proof (and freshness window) used by the pre-broadcast direct path.
     if (evt.principal_signature) {
       return;
     }
 
-    this.assertNodeRevokePayloadQuorumAuthorized(evt.payload);
+    this.assertNodeRevokePayloadQuorumAuthorized(evt.payload, freshness);
   }
 
   private assertNodeRevokePayloadQuorumAuthorized(
-    payload: NodeRevokePayload
+    payload: NodeRevokePayload,
+    freshness: FreshnessMode
   ): void {
     const quorumSignatures = payload.quorum_signatures ?? [];
     if (quorumSignatures.length === 0) {
@@ -1384,11 +1667,33 @@ export class MeshNode {
         "node_revoke denied: missing operator principal signature or guardian quorum"
       );
     }
+    // M1 clean break (design §4): a quorum revoke with NO context is exactly the
+    // retired v1 unbounded-lifetime shape. Refuse it with a version-
+    // distinguishing internal reason so a skewed-fleet operator can tell version
+    // skew from clock skew. Never softened — accepting v1 bytes accepts the very
+    // bearer capability this design exists to kill.
+    if (!payload.quorum_context) {
+      throw new MeshError(
+        "node_revoke denied: v1-shape quorum revoke (no v2 freshness context) refused under M1 clean break"
+      );
+    }
     if (!this.guardianRoster) {
       throw new MeshError(
         "node_revoke denied: guardian quorum present but no pinned guardian roster is installed"
       );
     }
+
+    // Element-level parse (rules 5/11): a malformed context fails closed HERE
+    // with a typed reason, never as a downstream TypeError.
+    const parsed = parseGuardianRevokeQuorumContext(payload.quorum_context);
+    if (!parsed.ok) {
+      throw new MeshError(
+        `node_revoke denied: malformed quorum context (${parsed.reason})`
+      );
+    }
+    // Relying-side freshness (rule 10) with THIS site's own clock — hard fail,
+    // never a warning. strict on every live path; sync_anchored only in applySync.
+    assertQuorumContextFresh(parsed.context, freshness);
 
     const signatures = quorumSignatures.map((sig) => {
       const guardian = this.guardianRoster!.guardians.find(
@@ -1408,40 +1713,47 @@ export class MeshNode {
       roster_version: this.guardianRoster.version,
       signatures,
     };
+    // The ONE shared builder recomputes the canonical bytes from the payload's
+    // echoed context + target + reason + fortress_id. No hand-mirror to drift
+    // (the retired nodeRevokeQuorumInput copy was deleted with its pin comment).
     verifyGuardianQuorum({
-      input: this.nodeRevokeQuorumInput(payload),
+      input: buildGuardianRevokeQuorumInput({
+        context: {
+          ceremony_id: parsed.context.ceremony_id,
+          initiated_at: parsed.context.initiated_at,
+          expires_at: parsed.context.expires_at,
+        },
+        target_node_id: payload.node_id,
+        reason: payload.reason,
+        fortress_id: this.config.fortress_id,
+      }),
       proof,
       pinned_roster: this.guardianRoster,
     });
   }
 
-  // Canonical quorum-input bytes for a node_revoke. Must match
-  // `revokeQuorumInput` in `../recovery-flows/node-revoke.ts` byte-for-byte:
-  // ceremony producers sign that builder's output, and this verifier (both
-  // the pre-broadcast gate and every receiver) recomputes the same bytes here.
-  private nodeRevokeQuorumInput(
-    payload: NodeRevokePayload
-  ): MasterRotationQuorumInput {
-    const initiatedAt = "revoke:" + payload.node_id;
-    return {
-      old_master_pubkey: "node:" + payload.node_id,
-      new_master_pubkey: {
-        public_key: toBase64url(
-          new TextEncoder().encode("revoke|" + payload.reason)
-        ),
-        fortress_id: this.config.fortress_id,
-        created_at: initiatedAt,
-      },
-      rotated_at: initiatedAt,
-      fortress_id: this.config.fortress_id,
-    };
-  }
-
   private auditNodeRevokeDenied(
     evt: SignedEvent<NodeRevokePayload>,
-    error: Error
+    error: Error,
+    now: Date = new Date()
   ): void {
     if (!this.nodePrivateKey) {
+      return;
+    }
+    // Audit-write governance is FORENSIC-ONLY: the deny decision was already
+    // made and applied by the caller; this only decides whether to WRITE the
+    // individual denial entry, and never affects accept/deny (invariant, §2.5).
+    const decision = this.denialAuditGovernor.consider(
+      evt.emitter_node,
+      now.getTime()
+    );
+    if (decision.saturationSummary) {
+      // A prior interval's suppressions are summarized once here — a sealed
+      // summary that degrades attribution granularity under flood but never
+      // erases how many denials or how many distinct authentic emitters.
+      this.pushDenialSaturationSummary(decision.saturationSummary);
+    }
+    if (!decision.writeIndividual) {
       return;
     }
     const entry = sealAuditEntry({
@@ -1463,6 +1775,158 @@ export class MeshNode {
       this.oldestPendingEntryAt = Date.now();
     }
     this.auditBuffer.push(entry);
+  }
+
+  /**
+   * Flush any pending audit-governor saturation summaries (revoke denials AND
+   * uncorrelated sync_response refusals) without waiting for their windows to
+   * roll. Production wiring: `FailureModeDetector.tick()` calls this on every
+   * periodic tick (MeshNode owns no timer of its own; the detector's interval
+   * is the mesh's periodic tick). Tests may also call it directly.
+   */
+  flushRevokeDenialSaturation(): void {
+    const summary = this.denialAuditGovernor.flushSaturationSummary();
+    if (summary) this.pushDenialSaturationSummary(summary);
+    const syncSummary =
+      this.uncorrelatedSyncAuditGovernor.flushSaturationSummary();
+    if (syncSummary) {
+      this.pushUncorrelatedSyncSaturationSummary(syncSummary);
+    }
+  }
+
+  private pushDenialSaturationSummary(summary: {
+    suppressed_count: number;
+    distinct_emitter_count: number;
+  }): void {
+    if (!this.nodePrivateKey) return;
+    const entry = sealAuditEntry({
+      emitter_node: this.config.node_id,
+      emitter_agent: "mesh",
+      emitter_principal: this.config.system_principal_id ?? "system",
+      policy_version: 0,
+      attestation_state: "peer_protocol_violation",
+      payload: {
+        operation: "node_revoke_denied_saturation_summary",
+        suppressed_count: summary.suppressed_count,
+        distinct_emitter_count: summary.distinct_emitter_count,
+      },
+      node_private_key: this.nodePrivateKey,
+    });
+    if (this.oldestPendingEntryAt === null) {
+      this.oldestPendingEntryAt = Date.now();
+    }
+    this.auditBuffer.push(entry);
+  }
+
+  private pushUncorrelatedSyncSaturationSummary(summary: {
+    suppressed_count: number;
+    distinct_emitter_count: number;
+  }): void {
+    if (!this.nodePrivateKey) return;
+    const entry = sealAuditEntry({
+      emitter_node: this.config.node_id,
+      emitter_agent: "mesh",
+      emitter_principal: this.config.system_principal_id ?? "system",
+      policy_version: 0,
+      attestation_state: "peer_protocol_violation",
+      payload: {
+        operation: "sync_response_uncorrelated_saturation_summary",
+        suppressed_count: summary.suppressed_count,
+        distinct_emitter_count: summary.distinct_emitter_count,
+      },
+      node_private_key: this.nodePrivateKey,
+    });
+    if (this.oldestPendingEntryAt === null) {
+      this.oldestPendingEntryAt = Date.now();
+    }
+    this.auditBuffer.push(entry);
+  }
+
+  /**
+   * Record an uncorrelated / expired / replayed sync_response refusal with a
+   * DISTINCT internal audit reason (never an MCP/public string) so a skewed or
+   * slow-link fleet is diagnosable: repeated entries on a joiner are the tell of
+   * a too-small SYNC_REQUEST_ID_EXPIRY_MS against real transfer time.
+   *
+   * Write-governed (rule 8): the refusal is GUARANTEED for any unsolicited
+   * response, so an ungoverned entry per refusal would let any in-roster peer
+   * spam zero-cost audit writes. The refusal DECISION is unaffected by
+   * suppression — this governs only whether the individual entry is written.
+   */
+  private auditUncorrelatedSyncResponse(peerNode: string): void {
+    if (!this.nodePrivateKey) return;
+    const decision = this.uncorrelatedSyncAuditGovernor.consider(
+      peerNode,
+      Date.now()
+    );
+    if (decision.saturationSummary) {
+      this.pushUncorrelatedSyncSaturationSummary(decision.saturationSummary);
+    }
+    if (!decision.writeIndividual) return;
+    const entry = sealAuditEntry({
+      emitter_node: this.config.node_id,
+      emitter_agent: "mesh",
+      emitter_principal: this.config.system_principal_id ?? "system",
+      policy_version: 0,
+      attestation_state: "peer_protocol_violation",
+      payload: {
+        operation: "sync_response_uncorrelated",
+        peer_node: peerNode,
+      },
+      node_private_key: this.nodePrivateKey,
+    });
+    if (this.oldestPendingEntryAt === null) {
+      this.oldestPendingEntryAt = Date.now();
+    }
+    this.auditBuffer.push(entry);
+  }
+
+  // ── C12-REPLAY sync-request correlation (§3.3 point 7) ────────────────
+
+  private mintSyncRequestId(): string {
+    const bytes = randomBytes(SYNC_REQUEST_ID_BYTES);
+    let hex = "";
+    for (const b of bytes) hex += b.toString(16).padStart(2, "0");
+    return hex;
+  }
+
+  private registerOutstandingSyncRequest(
+    requestId: string,
+    now: number = Date.now()
+  ): void {
+    // Evict expired ids opportunistically, then bound the set (self-inflicted
+    // growth only — ids are minted solely here). Evict oldest if still full.
+    for (const [id, expiry] of this.outstandingSyncRequests) {
+      if (expiry <= now) this.outstandingSyncRequests.delete(id);
+    }
+    while (this.outstandingSyncRequests.size >= MAX_OUTSTANDING_SYNC_REQUESTS) {
+      const oldest = this.outstandingSyncRequests.keys().next().value;
+      if (oldest === undefined) break;
+      this.outstandingSyncRequests.delete(oldest);
+    }
+    this.outstandingSyncRequests.set(
+      requestId,
+      now + SYNC_REQUEST_ID_EXPIRY_MS
+    );
+  }
+
+  /**
+   * Consume an outstanding sync-request id iff it is present and unexpired. An
+   * expired id is deliberately INDISTINGUISHABLE from a never-issued id (no
+   * tombstone set) — a stated choice, not an accident. Returns true only when
+   * the response is correlated to a live outstanding request.
+   */
+  private consumeOutstandingSyncRequest(
+    requestId: string | undefined,
+    now: number = Date.now()
+  ): boolean {
+    if (requestId === undefined) return false;
+    const expiry = this.outstandingSyncRequests.get(requestId);
+    if (expiry === undefined) return false;
+    // Match consumes the id, so a second response reusing it is refused.
+    this.outstandingSyncRequests.delete(requestId);
+    if (expiry <= now) return false;
+    return true;
   }
 
   private auditPeerProtocolViolation(info: {
@@ -1548,6 +2012,27 @@ export class MeshNode {
       try {
         const verified = this.verifyOrThrow(parsed.evt);
         const respPayload = verified.payload as SyncResponsePayload;
+        // C12-REPLAY (§3.3 point 7): apply ONLY when the response correlates to
+        // an outstanding request this node issued. Envelope verification
+        // (verifyOrThrow above) deliberately runs FIRST, so the refusal's
+        // audit entry attributes to an AUTHENTIC in-roster peer — an
+        // unverified emitter string would let anyone pollute the audit trail
+        // with forged attribution. After that, an uncorrelated (or expired, or
+        // replayed) response is refused BEFORE applySync — no payload parse,
+        // no log or roster mutation — so the weaker sync_anchored freshness
+        // channel is never an always-on unsolicited surface (it runs only
+        // during a sync this node itself initiated).
+        if (!this.consumeOutstandingSyncRequest(respPayload.request_id)) {
+          this.auditUncorrelatedSyncResponse(verified.emitter_node);
+          this.onEnvelopeRejected({
+            error: new MeshError(
+              "sync_response refused: no matching outstanding sync_request (uncorrelated, expired, or replayed)"
+            ),
+            event_type: "sync_response",
+            emitter_node: verified.emitter_node,
+          });
+          return;
+        }
         await this.applySync(respPayload);
       } catch {
         // ignore

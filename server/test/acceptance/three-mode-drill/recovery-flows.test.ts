@@ -20,6 +20,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { generateKeypair } from "../../../src/core/identity.js";
 import { toBase64url } from "../../../src/core/encoding.js";
+import { packSignedEvent } from "../../../src/mesh/envelope.js";
 import {
   CAP_STANDARD_FORTRESS_NODE,
   SIGNATURE_SCHEME_V1,
@@ -57,9 +58,14 @@ import {
   deviceRecoveryQuorumInput,
   deviceRecoveryRevokeQuorumInput,
   firePostRecoveryPrompt,
-  revokeQuorumInput,
   type MasterRotationAckMessage,
 } from "../../../src/mesh/recovery-flows/index.js";
+import {
+  buildGuardianRevokeQuorumInput,
+  mintRevokeCollectionContext,
+  GUARDIAN_REVOKE_QUORUM_SCHEMA_V2,
+  REVOKE_QUORUM_MAX_LIFETIME_MS,
+} from "../../../src/mesh/guardian/index.js";
 import type { AlertEmitContext } from "../../../src/mesh/failure-modes/index.js";
 
 import {
@@ -182,10 +188,13 @@ describe("WP-MVP-8 ceremony 1 — device-loss recovery", () => {
       const { roster, guardians } = buildGuardianRoster(drill);
       const emitCtx = buildEmitCtx(drill, "A");
 
+      // C12-REPLAY v2: one fresh collection context signs BOTH inputs.
+      const quorumContext = mintRevokeCollectionContext();
       const quorumInput = deviceRecoveryQuorumInput(
         {
           lost_node_id: drill.nodeIdB,
           replacement_node_cert: replacementCert,
+          quorum_context: quorumContext,
         },
         drill.master_public.fortress_id
       );
@@ -202,7 +211,7 @@ describe("WP-MVP-8 ceremony 1 — device-loss recovery", () => {
       // node in the same ceremony session: the recovery quorum never covers
       // the revocation, and revokePeer + every receiver verify against these.
       const revokeInput = deviceRecoveryRevokeQuorumInput(
-        { lost_node_id: drill.nodeIdB },
+        { lost_node_id: drill.nodeIdB, quorum_context: quorumContext },
         drill.master_public.fortress_id
       );
       const revokeSigs = guardians
@@ -230,6 +239,7 @@ describe("WP-MVP-8 ceremony 1 — device-loss recovery", () => {
           replacement_node_cert: replacementCert,
           guardian_signatures: quorumSigs,
           revoke_guardian_signatures: revokeSigs,
+          quorum_context: quorumContext,
         },
         ctx: {
           node: drill.nodeA,
@@ -366,10 +376,12 @@ describe("WP-MVP-8 ceremony 1 — device-loss recovery", () => {
         principal_private_key: drill.root_principal_keypair.privateKey,
         master_private_key: drill.master_private_key,
       });
+      const quorumContext = mintRevokeCollectionContext();
       const input = deviceRecoveryQuorumInput(
         {
           lost_node_id: drill.nodeIdB,
           replacement_node_cert: replacementCert,
+          quorum_context: quorumContext,
         },
         drill.master_public.fortress_id
       );
@@ -391,6 +403,7 @@ describe("WP-MVP-8 ceremony 1 — device-loss recovery", () => {
             replacement_node_cert: replacementCert,
             guardian_signatures: sigs,
             revoke_guardian_signatures: [],
+            quorum_context: quorumContext,
           },
           ctx: {
             node: drill.nodeA,
@@ -427,15 +440,18 @@ describe("WP-MVP-8 ceremony 2 — compromised-node revoke", () => {
         drill.nodeA.getRoster().lookupActiveNodeCert(drill.nodeIdB)
       ).toBeDefined();
 
+      const quorumContext = mintRevokeCollectionContext();
       const proposal = {
         target_node_id: drill.nodeIdB,
         reason: "non-monotonic envelope sequence detected",
         guardian_signatures: [],
       } as const;
-      const input = revokeQuorumInput(
-        proposal,
-        drill.master_public.fortress_id
-      );
+      const input = buildGuardianRevokeQuorumInput({
+        context: quorumContext,
+        target_node_id: proposal.target_node_id,
+        reason: proposal.reason,
+        fortress_id: drill.master_public.fortress_id,
+      });
       const sigs = guardians
         .slice(0, 3)
         .map((g) =>
@@ -446,7 +462,11 @@ describe("WP-MVP-8 ceremony 2 — compromised-node revoke", () => {
           })
         );
       const ceremony = NodeRevokeCeremony.propose({
-        proposal: { ...proposal, guardian_signatures: sigs },
+        proposal: {
+          ...proposal,
+          guardian_signatures: sigs,
+          quorum_context: quorumContext,
+        },
         ctx: {
           node: drill.nodeA,
           pinned_master: drill.master_public,
@@ -482,6 +502,72 @@ describe("WP-MVP-8 ceremony 2 — compromised-node revoke", () => {
       // gate_denied event carries the operator's decision.
       expect(gate_event.event.event_class).toBe("gate_denied");
       expect(gate_event.event.signature_scheme).toBe(SIGNATURE_SCHEME_V1);
+    },
+    120_000
+  );
+
+  it(
+    "C12-REPLAY T1 drill: an EXPIRED harvested guardian quorum, broadcast over the real libp2p mesh, does NOT revoke a healthy node",
+    async () => {
+      active = await bootThreeModeDrill();
+      const drill = active;
+      const { roster, guardians } = buildGuardianRoster(drill);
+      // Receiver (node C) pins the guardian roster so it can verify the quorum.
+      drill.nodeC.registerGuardianRoster(roster);
+      expect(drill.nodeC.getRoster().presenceOf(drill.nodeIdB)).toBe("active");
+
+      // An abandoned ceremony whose collection window opened long ago and has
+      // lapsed. On CURRENT MAIN (v1, no freshness) these harvested signatures
+      // would authorize revoking node B forever; under v2 the receiver's own
+      // strict clock refuses them.
+      const expiredContext = mintRevokeCollectionContext({
+        now: new Date(Date.now() - (REVOKE_QUORUM_MAX_LIFETIME_MS + 60 * 60 * 1000)),
+      });
+      const input = buildGuardianRevokeQuorumInput({
+        context: expiredContext,
+        target_node_id: drill.nodeIdB,
+        reason: "harvested-abandoned-ceremony",
+        fortress_id: drill.master_public.fortress_id,
+      });
+      const sigs = guardians.slice(0, 3).map((g) => ({
+        guardian_pubkey: g.identity.public_key,
+        signature: signMasterRotationAsGuardian({
+          input,
+          guardian_id: g.identity.guardian_id,
+          guardian_private_key: g.sk,
+        }).signature,
+      }));
+
+      // Node A signs and broadcasts the harvested revoke over the real mesh.
+      const revokeEvt = packSignedEvent({
+        event_type: "node_revoke",
+        emitter_node: drill.nodeIdA,
+        emitter_principal: drill.root_principal_cert.principal_id,
+        fortress_id: drill.master_public.fortress_id,
+        payload: {
+          node_id: drill.nodeIdB,
+          reason: "harvested-abandoned-ceremony",
+          effective_at: expiredContext.initiated_at,
+          quorum_signatures: sigs,
+          quorum_context: {
+            input_schema: GUARDIAN_REVOKE_QUORUM_SCHEMA_V2,
+            ceremony_id: expiredContext.ceremony_id,
+            initiated_at: expiredContext.initiated_at,
+            expires_at: expiredContext.expires_at,
+          },
+        },
+        monotonic_seq: 5_000_000,
+        node_private_key: drill.nodeKpA.privateKey,
+      });
+      await drill.transportA.broadcast(revokeEvt);
+
+      // Give gossipsub a full settle budget, then assert node B is STILL active
+      // on the receiver — the expired quorum was refused at the live path.
+      await new Promise((r) => setTimeout(r, 2000));
+      expect(drill.nodeC.getRoster().presenceOf(drill.nodeIdB)).toBe("active");
+      expect(
+        drill.nodeC.getRoster().lookupActiveNodeCert(drill.nodeIdB)
+      ).toBeDefined();
     },
     120_000
   );

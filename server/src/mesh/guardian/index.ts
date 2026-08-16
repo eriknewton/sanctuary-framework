@@ -52,3 +52,27 @@ export {
   type PostRecoveryPromptState,
   type BrokerCredentialLister,
 } from "./recovery-prompt.js";
+// C12-REPLAY: v2 revoke quorum-input freshness (single source of truth).
+export {
+  GUARDIAN_REVOKE_QUORUM_SCHEMA_V2,
+  GUARDIAN_DEVICE_RECOVERY_QUORUM_SCHEMA_V2,
+  REVOKE_QUORUM_MAX_LIFETIME_MS,
+  REVOKE_QUORUM_DEFAULT_LIFETIME_MS,
+  REVOKE_QUORUM_CLOCK_SKEW_MS,
+  mintRevokeCollectionContext,
+  buildGuardianRevokeQuorumInput,
+  buildGuardianDeviceRecoveryQuorumInput,
+  toWireQuorumContext,
+  parseGuardianRevokeQuorumContext,
+  assertQuorumContextFresh,
+  computeRevokeAuthorizationKey,
+  QuorumFreshnessError,
+  type GuardianRevokeQuorumContext,
+  type GuardianRevokeQuorumInput,
+  type GuardianDeviceRecoveryQuorumInput,
+  type NodeRevokeQuorumContextWire,
+  type ParsedQuorumContext,
+  type QuorumContextParseResult,
+  type QuorumContextParseFailure,
+  type FreshnessMode,
+} from "./revoke-quorum-input.js";

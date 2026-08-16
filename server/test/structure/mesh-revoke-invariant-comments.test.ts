@@ -12,7 +12,7 @@ function read(relativeToRepoRoot: string): string {
 function around(source: string, anchor: string): string {
   const index = source.indexOf(anchor);
   expect(index, `missing source anchor: ${anchor}`).toBeGreaterThanOrEqual(0);
-  return source.slice(Math.max(0, index - 700), index + anchor.length + 700);
+  return source.slice(Math.max(0, index - 1100), index + anchor.length + 1100);
 }
 
 function expectNear(
@@ -42,7 +42,7 @@ describe("Mesh node-revoke invariant comments", () => {
   it("keeps quorum revokes gated before lifecycle emission with no trusted-caller bypass", () => {
     const source = read("server/src/mesh/lifecycle/mesh-node.ts");
 
-    expectNear(source, "this.assertNodeRevokePayloadQuorumAuthorized(payload);", [
+    expectNear(source, "this.assertNodeRevokePayloadQuorumAuthorized(payload, {", [
       "Pre-broadcast guardian invariant",
       "before emitLifecycleEvent",
       "no trusted-caller bypass",
