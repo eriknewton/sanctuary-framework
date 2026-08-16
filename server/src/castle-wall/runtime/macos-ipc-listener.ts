@@ -47,6 +47,7 @@ import { randomBytes } from "node:crypto";
 
 import { CASTLE_WALL_IPC_NAMESPACE } from "../constants.js";
 import { frame, parseFrame } from "../ipc/framing.js";
+import { canonicalize } from "../../mesh/canonical-json.js";
 import type {
   AuditEmitNotification,
   CastleWallMessage,
@@ -140,6 +141,14 @@ export interface MacOSFlowIpcListenerOptions {
   generateNonce?: () => Uint8Array;
   /** Signs the connection nonce so the extension can authenticate main. */
   handshakeSigner?: MacOSHandshakeSigner;
+  /**
+   * Signs every emitted `arm_lease` frame (O-02). When configured, an emitted
+   * lease ALWAYS carries a fortress-key signature and a fresh `updated_at`
+   * stamp; a signing failure DROPS the emission (never an unsigned fallback —
+   * MUST-NEVER #5). When absent (legacy/dev harnesses), frames go out unsigned
+   * and a current extension rejects them fail-closed on its side.
+   */
+  leaseSigner?: MacOSLeaseSigner;
   /** Optional local-admin command handler used by the CLI verbs. */
   adminHandler?: MacOSFlowIpcAdminHandler;
   /** Called before an inbound operator revoke is broadcast to subscribers. */
@@ -165,6 +174,46 @@ export interface MacOSHandshakeSigner {
    * inline (preserving prior timing for existing tests).
    */
   signNonce(nonce: Uint8Array): Uint8Array | Promise<Uint8Array>;
+}
+
+export interface MacOSLeaseSigner {
+  /** Recorded in the frame's `signing_key_id`; audit-facing, not authority. */
+  signingKeyId: string;
+  /**
+   * Sign the canonical arm-lease body bytes with the fortress Ed25519 key
+   * (the same key the extension pins for the handshake and the manifest).
+   * May be async (root-helper XPC path) or sync (local dev path).
+   */
+  signLeaseBody(canonicalBytes: Uint8Array): Uint8Array | Promise<Uint8Array>;
+}
+
+/**
+ * Canonical SIGNED BODY of an arm lease: exactly these six fields, always all
+ * present (`revoked` explicit even when false, `ttl_seconds` explicit null when
+ * absent), serialized via `canonicalize` (sorted keys, no whitespace). The
+ * normalization exists because the wire frame legitimately omits
+ * `revoked`/`ttl_seconds` and may carry extra diagnostic fields (the CLI's
+ * `source`); the signature must bind every field the extension CONSUMES and
+ * nothing whose presence varies by producer.
+ *
+ * Must match `canonicalSignedBody` in
+ * `castle-wall-macos/Sources/CastleWallFilter/SignedArmLeaseVerification.swift`
+ * byte-for-byte: a divergence surfaces as the extension rejecting every lease
+ * (fail closed, wall degrades to missing-lease posture), never as a silent
+ * acceptance.
+ */
+export function armLeaseSignedBody(lease: ArmLeaseNotification): Record<string, unknown> {
+  return {
+    // `type` doubles as a domain-separation tag: the fortress key also signs
+    // manifest bodies and handshake nonces, and no other signed payload can
+    // contain `"type":"arm_lease"` as a top-level canonical field.
+    type: "arm_lease",
+    armed: lease.armed,
+    revoked: lease.revoked === true,
+    ttl_seconds: lease.ttl_seconds ?? null,
+    heartbeat_interval_seconds: lease.heartbeat_interval_seconds,
+    updated_at: lease.updated_at,
+  };
 }
 
 export interface MacOSFlowIpcAdminHandler {
@@ -239,10 +288,27 @@ export class MacOSFlowIpcListener {
   private readonly maxConnections: number;
   private readonly generateNonce: () => Uint8Array;
   private readonly handshakeSigner: MacOSHandshakeSigner | null;
+  private readonly leaseSigner: MacOSLeaseSigner | null;
   private readonly adminHandler: MacOSFlowIpcAdminHandler | null;
   private readonly onArmLeaseRevoke: ((lease: ArmLeaseNotification) => void | Promise<void>) | null;
   private readonly onArmLease: ((lease: ArmLeaseNotification) => void | Promise<void>) | null;
   private currentArmLease: ArmLeaseNotification | null = null;
+  /**
+   * Last `updated_at` epoch-ms this listener stamped into a signed lease. The
+   * extension enforces STRICT monotonicity per connection, and
+   * `Date.now()` has only millisecond resolution, so two emissions inside the
+   * same millisecond (e.g. an operator arm relay immediately followed by a
+   * heartbeat) would otherwise produce an equal stamp the extension rejects
+   * as a replay. Bumping to last+1ms keeps every emitted stamp unique and
+   * ordered without waiting.
+   */
+  private lastLeaseStampMs = 0;
+  /**
+   * Tail of the serialized lease-emission chain (see `broadcastArmLease`).
+   * Always settles; rejections are absorbed so one failed emission cannot
+   * wedge every later one.
+   */
+  private leaseEmitChain: Promise<void> = Promise.resolve();
   private server: Server | null = null;
   private connections = new Map<string, ConnectionState>();
   private stats: MacOSFlowIpcListenerStats = {
@@ -262,6 +328,7 @@ export class MacOSFlowIpcListener {
     this.maxConnections = opts.maxConnections ?? 8;
     this.generateNonce = opts.generateNonce ?? defaultNonceBytes;
     this.handshakeSigner = opts.handshakeSigner ?? null;
+    this.leaseSigner = opts.leaseSigner ?? null;
     this.adminHandler = opts.adminHandler ?? null;
     this.onArmLeaseRevoke = opts.onArmLeaseRevoke ?? null;
     this.onArmLease = opts.onArmLease ?? null;
@@ -384,16 +451,98 @@ export class MacOSFlowIpcListener {
     return emitted;
   }
 
-  /** Fan the current arm lease heartbeat to active extension subscribers. */
+  /**
+   * Fan the current arm lease heartbeat to active extension subscribers.
+   *
+   * O-02: every emission funnels through `signArmLease` — the daemon heartbeat,
+   * the CLI-relayed operator arm/revoke, and the subscribe-time resend all use
+   * this one chokepoint, so no path can emit a lease the extension would have
+   * to trust unauthenticated. If signing fails while a signer is configured,
+   * NOTHING is emitted and `currentArmLease` keeps the last signed frame
+   * (never an unsigned fallback; the extension's dead-man handles the gap).
+   */
   async broadcastArmLease(lease: ArmLeaseNotification): Promise<number> {
-    this.currentArmLease = lease;
+    // Serialize emissions: signing is async (root-helper round trip), and two
+    // concurrent broadcasts completing out of call order would let an OLDER
+    // arm state overwrite `currentArmLease` and reach subscribers after a
+    // newer one (e.g. a heartbeat racing an operator revoke). The chain keeps
+    // call order = emit order; a failed emission never breaks the chain.
+    const run = this.leaseEmitChain.then(() => this.emitSignedArmLease(lease));
+    this.leaseEmitChain = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return await run;
+  }
+
+  private async emitSignedArmLease(lease: ArmLeaseNotification): Promise<number> {
+    const signed = await this.signArmLease(lease);
+    if (signed === null) {
+      return 0;
+    }
+    this.currentArmLease = signed;
     let emitted = 0;
     for (const conn of this.connections.values()) {
       if (!conn.registered) continue;
-      this.writeMessage(conn, lease);
+      this.writeMessage(conn, signed);
       emitted += 1;
     }
     return emitted;
+  }
+
+  /**
+   * Stamp and sign one arm-lease frame. Returns the frame to emit, or `null`
+   * when a configured signer failed (the caller must then emit nothing).
+   *
+   * The `updated_at` re-stamp is deliberate: the stamp is the daemon's LIVE
+   * attestation ("this arm state holds as of now"), which is what lets the
+   * extension bound lease age and reject a captured old frame. Signing an
+   * inbound producer's original stamp would re-attest stale state. Unsigned
+   * legacy path (no signer configured) is left byte-identical to the previous
+   * behavior so existing dev harnesses see no change.
+   */
+  private async signArmLease(
+    lease: ArmLeaseNotification,
+  ): Promise<ArmLeaseNotification | null> {
+    if (!this.leaseSigner) {
+      return lease;
+    }
+    // Strip any inbound signature fields before re-signing: the daemon signs
+    // what IT attests, never relays another producer's signature envelope.
+    const {
+      signing_key_id: _inboundKeyId,
+      lease_signature_b64url: _inboundSig,
+      ...body
+    } = lease;
+    const stampMs = Math.max(Date.now(), this.lastLeaseStampMs + 1);
+    this.lastLeaseStampMs = stampMs;
+    const stamped: ArmLeaseNotification = {
+      ...body,
+      type: "arm_lease",
+      updated_at: new Date(stampMs).toISOString(),
+    };
+    try {
+      const canonicalBytes = new TextEncoder().encode(
+        canonicalize(armLeaseSignedBody(stamped)),
+      );
+      const signature = await this.leaseSigner.signLeaseBody(canonicalBytes);
+      return {
+        ...stamped,
+        signing_key_id: this.leaseSigner.signingKeyId,
+        lease_signature_b64url: toBase64url(signature),
+      };
+    } catch (err) {
+      this.stats.framesRejected += 1;
+      const reason = sanitizeLogValue(
+        err instanceof Error ? err.message : String(err),
+      );
+      // SAFETY: a dropped lease emission must surface on daemon stderr — the
+      // visible symptom downstream is the extension's dead-man firing.
+      console.error(
+        `[castle-wall] arm_lease signing failed; emission dropped (fail closed, no unsigned fallback): ${reason}`,
+      );
+      return null;
+    }
   }
 
   /**
@@ -617,7 +766,26 @@ export class MacOSFlowIpcListener {
     this.ensureSubscriberRegistered(state);
     await this.consumer.handleManifestSubscribe(request, state.subscriberId);
     if (this.currentArmLease) {
-      this.writeMessage(state, this.currentArmLease);
+      // Re-stamp + re-sign rather than replaying the stored frame: the
+      // extension bounds lease age, so a late subscriber served the ORIGINAL
+      // stamp would reject it as stale. A fresh signature is the daemon's live
+      // re-attestation of the current arm state. On signing failure nothing is
+      // sent (the heartbeat delivers the next signed lease). Rides the same
+      // serialization chain as `broadcastArmLease` so the resend cannot
+      // interleave with a concurrent broadcast and emit out-of-order stamps.
+      const run = this.leaseEmitChain.then(async () => {
+        if (!this.currentArmLease) return;
+        const resigned = await this.signArmLease(this.currentArmLease);
+        if (resigned !== null) {
+          this.currentArmLease = resigned;
+          this.writeMessage(state, resigned);
+        }
+      });
+      this.leaseEmitChain = run.then(
+        () => undefined,
+        () => undefined,
+      );
+      await run;
     }
   }
 

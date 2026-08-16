@@ -49,7 +49,7 @@ test/castle-wall/runtime/macos-daemon-reload.test.ts(532,47): error TS2554: Expe
 test/castle-wall/runtime/macos-daemon-reload.test.ts(551,50): error TS2554: Expected 0 arguments, but got 1.
 test/castle-wall/runtime/macos-daemon-reload.test.ts(563,50): error TS2554: Expected 0 arguments, but got 1.
 test/castle-wall/runtime/macos-daemon-reload.test.ts(597,47): error TS2554: Expected 0 arguments, but got 1.
-test/castle-wall/runtime/macos-ipc-listener.test.ts(219,11): error TS2349: This expression is not callable.
+test/castle-wall/runtime/macos-ipc-listener.test.ts(223,11): error TS2349: This expression is not callable.
 test/castle-wall/runtime/producer-signature.test.ts(15,3): error TS2440: Import declaration conflicts with local declaration of 'toBase64url'.
 test/chat/agent-context-cache.test.ts(122,5): error TS2322: Type '"running"' is not assignable to type '"active" | "unknown" | "error" | "paused" | "restarting" | "locked_down" | "unwrapping"'.
 test/cli/agents-config-approval-redirect.test.ts(39,35): error TS2741: Property 'state' is missing in type '{ running: false; status: null; reason: string; }' but required in type 'HealthProbeResult'.

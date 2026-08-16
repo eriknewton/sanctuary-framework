@@ -1131,6 +1131,18 @@ export async function startMacOSCastleWallDaemon(
         return signer.signNonce(nonce);
       },
     },
+    // O-02: authenticate the arm-lease frames with the SAME fortress key the
+    // extension already pins for the handshake + manifest. `signManifest` is
+    // the helper's opaque-canonical-bytes signing mode; domain confusion with
+    // a real manifest is structurally excluded because the lease's canonical
+    // signed body carries `"type":"arm_lease"` and neither side's manifest
+    // shape can decode/reconstruct to it (see `armLeaseSignedBody`).
+    leaseSigner: {
+      signingKeyId: signer.signingKeyId,
+      signLeaseBody(canonicalBytes) {
+        return signer.signManifest(canonicalBytes);
+      },
+    },
     adminHandler: {
       async reloadPolicy(request) {
         return reloadPolicy(request);

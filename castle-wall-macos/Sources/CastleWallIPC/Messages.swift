@@ -545,6 +545,12 @@ public struct HandshakeResponseBody: Codable, Equatable {
     }
 }
 
+/// O-02: signature fields are wire-ADDITIVE (`nil` decodes when absent and the
+/// synthesized encoder omits them), but consumption is NOT optional — the
+/// dispatcher rejects any lease that fails
+/// `SignedArmLeaseVerifier.verify` (unsigned, tampered, replayed, or stale).
+/// Field names must match `ArmLeaseNotification` in
+/// `server/src/castle-wall/ipc/messages.ts`.
 public struct ArmLeaseBody: Codable, Equatable {
     public let type: String
     public let armed: Bool
@@ -552,13 +558,22 @@ public struct ArmLeaseBody: Codable, Equatable {
     public let ttlSeconds: UInt32?
     public let heartbeatIntervalSeconds: UInt32
     public let updatedAt: String
+    /// Key id of the fortress signing key that produced `leaseSignatureB64url`.
+    /// Recorded for audit; authority comes only from the pinned key.
+    public let signingKeyId: String?
+    /// base64url (no padding) Ed25519 signature over the canonical signed body
+    /// (`SignedArmLeaseVerifier.canonicalSignedBody`), verified against the
+    /// TOFU-pinned fortress public key.
+    public let leaseSignatureB64url: String?
 
     public init(
         armed: Bool,
         revoked: Bool = false,
         ttlSeconds: UInt32?,
         heartbeatIntervalSeconds: UInt32,
-        updatedAt: String
+        updatedAt: String,
+        signingKeyId: String? = nil,
+        leaseSignatureB64url: String? = nil
     ) {
         self.type = "arm_lease"
         self.armed = armed
@@ -566,6 +581,8 @@ public struct ArmLeaseBody: Codable, Equatable {
         self.ttlSeconds = ttlSeconds
         self.heartbeatIntervalSeconds = heartbeatIntervalSeconds
         self.updatedAt = updatedAt
+        self.signingKeyId = signingKeyId
+        self.leaseSignatureB64url = leaseSignatureB64url
     }
 
     public init(from decoder: Decoder) throws {
@@ -576,6 +593,8 @@ public struct ArmLeaseBody: Codable, Equatable {
         self.ttlSeconds = try container.decodeIfPresent(UInt32.self, forKey: .ttlSeconds)
         self.heartbeatIntervalSeconds = try container.decode(UInt32.self, forKey: .heartbeatIntervalSeconds)
         self.updatedAt = try container.decode(String.self, forKey: .updatedAt)
+        self.signingKeyId = try container.decodeIfPresent(String.self, forKey: .signingKeyId)
+        self.leaseSignatureB64url = try container.decodeIfPresent(String.self, forKey: .leaseSignatureB64url)
     }
 
     enum CodingKeys: String, CodingKey {
@@ -585,6 +604,8 @@ public struct ArmLeaseBody: Codable, Equatable {
         case ttlSeconds = "ttl_seconds"
         case heartbeatIntervalSeconds = "heartbeat_interval_seconds"
         case updatedAt = "updated_at"
+        case signingKeyId = "signing_key_id"
+        case leaseSignatureB64url = "lease_signature_b64url"
     }
 }
 
