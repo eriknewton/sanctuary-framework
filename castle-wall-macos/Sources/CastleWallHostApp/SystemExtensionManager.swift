@@ -48,6 +48,24 @@ final class SystemExtensionManager: NSObject, ObservableObject {
 
     @Published var extensionState: ExtensionState = .unknown
 
+    /// Decide whether the host should submit its one launch-time activation
+    /// request. Helper approval is required because it is the operator's
+    /// background-item consent boundary; global-pin readiness is deliberately
+    /// absent because that pin is provisioned by the later privileged install.
+    static func shouldSubmitLaunchActivationRefresh(
+        didSubmit: Bool,
+        helperApproved: Bool,
+        extensionState: ExtensionState
+    ) -> Bool {
+        guard !didSubmit, helperApproved else { return false }
+        switch extensionState {
+        case .unknown, .activated:
+            return true
+        default:
+            return false
+        }
+    }
+
     func activate() {
         handleRequestStarted(isActivation: true)
         let request = OSSystemExtensionRequest.activationRequest(

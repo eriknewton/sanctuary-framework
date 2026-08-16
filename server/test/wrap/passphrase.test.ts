@@ -8,7 +8,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtemp, rm, access, readFile } from "node:fs/promises";
+import { mkdtemp, rm, access, readFile, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -18,6 +18,7 @@ import {
   generatePassphrase,
   fallbackFilePath,
   PassphraseUnreadableError,
+  PassphraseKeyringUnreachableError,
   type ExecResult,
 } from "../../src/wrap/passphrase.js";
 import { SilentCustodyRefusedError } from "../../src/core/master-custody.js";
@@ -170,7 +171,7 @@ describe("passphrase", () => {
     expect(second.value).toBe("user-held-value");
   });
 
-  it("F3: refuses to silently generate when the Keychain write fails on darwin", async () => {
+  it("F3: preserves an actionable, non-secret classification when the Keychain write fails on darwin", async () => {
     const exec = async (
       cmd: string,
       args: string[]
@@ -182,13 +183,101 @@ describe("passphrase", () => {
       return { stdout: "", stderr: "keychain unreachable", code: 1 };
     };
 
-    await expect(
-      getOrCreatePassphrase({
+    let thrown: unknown;
+    try {
+      await getOrCreatePassphrase({
         home,
         platformOverride: "darwin",
         exec,
-      })
-    ).rejects.toThrow(SilentCustodyRefusedError);
+      });
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(PassphraseKeyringUnreachableError);
+    expect((thrown as Error).message).toContain("security exit 1");
+    expect((thrown as Error).message).not.toContain("add-generic-password");
+    expect((thrown as Error).message).not.toMatch(/[A-Za-z0-9+/]{40,}={0,2}/);
+  });
+
+  it("preserves exact safe write-failure classifications for rc36, rc44, and unknown codes", async () => {
+    for (const writeFailure of [
+      { code: 36, stderr: "User interaction is not allowed.", error: PassphraseKeyringUnreachableError },
+      { code: 44, stderr: "item not found", error: SilentCustodyRefusedError },
+      { code: 9, stderr: "opaque failure", error: PassphraseKeyringUnreachableError },
+    ]) {
+      let generatedValue = "";
+      const exec = async (
+        cmd: string,
+        args: string[],
+        input?: string,
+      ): Promise<ExecResult> => {
+        if (cmd === "security" && args[0] === "find-generic-password") {
+          return { stdout: "", stderr: "not found", code: 44 };
+        }
+        if (cmd === "security" && args[0] === "-i") {
+          generatedValue = input?.match(/-w "([^"]+)"/)?.[1] ?? "";
+          return { stdout: "", stderr: writeFailure.stderr, code: writeFailure.code };
+        }
+        return { stdout: "", stderr: "unexpected", code: 1 };
+      };
+      let thrown: unknown;
+      try {
+        await getOrCreatePassphrase({
+          home,
+          storagePath: home,
+          platformOverride: "darwin",
+          exec,
+        });
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toBeInstanceOf(writeFailure.error);
+      expect((thrown as Error).message).toContain(`security exit ${writeFailure.code}`);
+      expect((thrown as Error).message).not.toContain(writeFailure.stderr);
+      expect(generatedValue.length).toBeGreaterThan(0);
+      expect((thrown as Error).message).not.toContain(generatedValue);
+      expect(await readdir(home)).toEqual([]);
+    }
+  });
+
+  it("allows an existing valid user-held fallback to resolve under rc36 without a Keychain write", async () => {
+    const derive = makeDeterministicDeriver("existing-user-held-fallback");
+    const linuxExec = async (
+      _cmd: string,
+      args: string[],
+    ): Promise<ExecResult> => args[0] === "lookup"
+      ? { stdout: "", stderr: "", code: 1 }
+      : { stdout: "", stderr: "no secret service", code: 1 };
+    await persistUserProvidedPassphrase("user-held-existing-value", {
+      home,
+      storagePath: home,
+      platformOverride: "linux",
+      exec: linuxExec,
+      deriveMachineKey: derive,
+    });
+
+    const calls: string[] = [];
+    const darwinExec = async (
+      _cmd: string,
+      args: string[],
+    ): Promise<ExecResult> => {
+      calls.push(args[0]!);
+      return {
+        stdout: "",
+        stderr: "User interaction is not allowed.",
+        code: 36,
+      };
+    };
+    const resolved = await getOrCreatePassphrase({
+      home,
+      storagePath: home,
+      platformOverride: "darwin",
+      exec: darwinExec,
+      deriveMachineKey: derive,
+    });
+    expect(resolved.source).toBe("fallback-file");
+    expect(resolved.value).toBe("user-held-existing-value");
+    expect(calls).not.toContain("-i");
   });
 
   it("readStoredPassphrase returns null when nothing is stored", async () => {

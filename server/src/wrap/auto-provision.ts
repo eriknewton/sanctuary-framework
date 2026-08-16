@@ -962,13 +962,12 @@ export interface AutoProvisionSummary {
 
 export function policyDaemonInstallBootArgs(
   fortressPath: string,
-  cliBinary: string | undefined,
+  _cliBinary?: string,
 ): string[] {
-  const args = ["--fortress", fortressPath];
-  if (cliBinary !== undefined && cliBinary.length > 0) {
-    args.push("--binary", cliBinary);
-  }
-  return args;
+  // install-boot snapshots the verified runtime embedded in the signed app.
+  // `--binary` is deliberately retired and parseBootArgs rejects it, so the
+  // auto-provision path must never forward the running CLI path here.
+  return ["--fortress", fortressPath];
 }
 
 // `resolveGateDaemonArgvPrefix` moved to `../egress-gate/gate-daemon.ts` so the
@@ -1582,7 +1581,7 @@ export async function runAutoProvisionForWrap(
         };
       }
       const code = await runInstallBoot(
-        policyDaemonInstallBootArgs(fortressPath, options.cliBinary),
+        policyDaemonInstallBootArgs(fortressPath),
         { env: process.env },
       );
       if (code !== 0) {

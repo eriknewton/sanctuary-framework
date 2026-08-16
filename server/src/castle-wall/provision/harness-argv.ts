@@ -67,7 +67,7 @@
  * args -- validation is the daemon module's job, not duplicated here.
  */
 
-import { dirname } from "node:path";
+import { dirname, normalize as normalizePath } from "node:path";
 
 import { harnessLaunchSpec, type HarnessLaunchSpec } from "../../egress-gate/harness-daemon.js";
 
@@ -83,6 +83,8 @@ export interface HarnessArgvOps {
   pathExists(path: string): Promise<boolean>;
   /** Resolve symlinks for a path, or `undefined` when the path cannot be resolved. */
   realpath(path: string): Promise<string | undefined>;
+  /** Read one symlink without following it, or `undefined` when `path` is not a readable symlink. */
+  readlink(path: string): Promise<string | undefined>;
   /**
    * Execute `path` AS `uid` and return the CPython feature version it reports,
    * or `undefined` when that uid cannot execute it at all (missing, not
@@ -251,6 +253,27 @@ function stripTrailingSlashes(path: string): string {
 function isPathAtOrWithin(path: string, base: string): boolean {
   const normalizedBase = stripTrailingSlashes(base);
   return path === normalizedBase || path.startsWith(`${normalizedBase}/`);
+}
+
+/**
+ * Hermes installed by uv currently makes `venv/bin/python` an absolute
+ * symlink into the operator-owned `~/.hermes/python` tree. Re-home moves that
+ * managed-Python tree beside `hermes-agent`, but the symlink text necessarily
+ * still names the old operator home. Map only the suffix below the exact
+ * `.hermes/python/` marker into the dedicated account home. A normalized
+ * escape is rejected, so an agent-controlled symlink can never select an
+ * unrelated host interpreter through this compatibility path.
+ */
+function relocatedHermesManagedPython(linkTarget: string | undefined, agentHome: string): string | undefined {
+  if (linkTarget === undefined || !linkTarget.startsWith("/")) return undefined;
+  const marker = "/.hermes/python/";
+  const markerIndex = linkTarget.lastIndexOf(marker);
+  if (markerIndex <= 0) return undefined;
+  const suffix = linkTarget.slice(markerIndex + marker.length);
+  if (suffix.length === 0) return undefined;
+  const managedPythonBase = `${stripTrailingSlashes(agentHome)}/.hermes/python`;
+  const candidate = normalizePath(`${managedPythonBase}/${suffix}`);
+  return isPathAtOrWithin(candidate, managedPythonBase) ? candidate : undefined;
 }
 
 function expandHomePath(path: string, home: string): string | undefined {
@@ -468,6 +491,56 @@ export async function resolveHermesGatewayArgv(
             "refusing to pair it with a system interpreter",
         );
       } else {
+        // Mini1 hardware regression (2026-08-15): uv's venv interpreter was
+        // an absolute symlink into `~/.hermes/python`. The runtime re-home now
+        // moves that managed CPython tree too, but cannot preserve an absolute
+        // operator-home symlink as executable by the dedicated uid. Probe the
+        // relocated target itself, still pairing it only with the exact ABI's
+        // site-packages and proving the real hermes_cli import as the agent.
+        const originalVenvTarget = await ops.readlink(venvPython);
+        const relocatedManagedPython = relocatedHermesManagedPython(originalVenvTarget, agentHome);
+        if (relocatedManagedPython !== undefined) {
+          const relocatedVersion = await ops.probeInterpreterAsUid(relocatedManagedPython, agentUid);
+          if (relocatedVersion === undefined) {
+            rejections.push(`${relocatedManagedPython} could not be executed as uid ${agentUid}`);
+          } else if (!sameVersion(relocatedVersion, requiredVersion)) {
+            rejections.push(
+              `${relocatedManagedPython} is Python ${renderVersion(relocatedVersion)} but the re-homed site-packages at ` +
+                `${sitePackages} are Python ${renderVersion(requiredVersion)} (C-extension ABI mismatch)`,
+            );
+          } else {
+            const importOrigin = await ops.probeHermesCliImportAsUid(relocatedManagedPython, agentUid, [
+              hermesAgentDir,
+              sitePackages,
+            ]);
+            if (importOrigin !== undefined && isPathAtOrWithin(importOrigin, `${hermesAgentDir}/hermes_cli`)) {
+              return {
+                harnessId: "hermes",
+                launch: harnessLaunchSpec({
+                  programArguments: [
+                    relocatedManagedPython,
+                    "-m",
+                    "hermes_cli.main",
+                    "gateway",
+                    "run",
+                    "--accept-hooks",
+                  ],
+                  environment: {
+                    HERMES_ACCEPT_HOOKS: "1",
+                    HOME: agentHome,
+                    PYTHONPATH: `${hermesAgentDir}:${sitePackages}`,
+                  },
+                }),
+              };
+            }
+            rejections.push(
+              importOrigin === undefined
+                ? `${relocatedManagedPython} could not import hermes_cli from ${hermesAgentDir}:${sitePackages}`
+                : `${relocatedManagedPython} imported hermes_cli from ${importOrigin}, not from ${hermesAgentDir}/hermes_cli`,
+            );
+          }
+        }
+
         for (const candidate of SYSTEM_PYTHON3_CANDIDATES) {
           const version = await ops.probeInterpreterAsUid(candidate, agentUid);
           if (version === undefined) {
@@ -792,6 +865,14 @@ export function realHarnessArgvOps(): HarnessArgvOps {
       const { realpath } = await import("node:fs/promises");
       try {
         return await realpath(path);
+      } catch {
+        return undefined;
+      }
+    },
+    readlink: async (path) => {
+      const { readlink } = await import("node:fs/promises");
+      try {
+        return await readlink(path);
       } catch {
         return undefined;
       }

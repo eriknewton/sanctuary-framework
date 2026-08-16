@@ -120,6 +120,20 @@ export interface ProtectPreflightOps {
 
 export interface RunProtectPreflightInput {
   strict?: boolean;
+  /**
+   * Automatic full-install retries may continue past the exact launchd
+   * safe-mode daemon for this fortress. The provisioning flow immediately
+   * re-verifies the persistent service before any arm. Explicit preflight
+   * commands and unknown/transient holders keep the fail-closed refusal.
+   */
+  allowMatchingBootDaemon?: boolean;
+  /**
+   * Canonical app-sealed launcher selected by the caller. The mutating protect
+   * path validates its signature and sealed runtime before passing this path;
+   * this read-only preflight independently checks only canonical location and
+   * executability so it never substitutes PATH availability for app custody.
+   */
+  sealedLauncherPath?: string;
   ops?: Partial<ProtectPreflightOps>;
 }
 
@@ -131,6 +145,8 @@ interface ProtectPreflightContext {
   cwd: string;
   operator: OperatorContext;
   fortressPath?: string;
+  sealedLauncherPath?: string;
+  allowMatchingBootDaemon: boolean;
 }
 
 interface OperatorContext {
@@ -157,6 +173,10 @@ interface ConfiguredProvider {
 const execFileAsync = promisify(nodeExecFile);
 const PREFLIGHT_FETCH_TIMEOUT_MS = 5_000;
 const NO_REMEDY = "none";
+// Must match CASTLE_WALL_SEALED_LAUNCHER in wrap/cli.ts. The CLI performs the
+// signature/runtime verification; this preflight only reports availability.
+const CASTLE_WALL_SEALED_LAUNCHER =
+  "/Applications/Sanctuary-CastleWall.app/Contents/MacOS/sanctuary";
 const HERMES_GATEWAY_LABEL = "ai.hermes.gateway";
 const HERMES_GATEWAY_PROCESS_MARKER = "hermes_cli.main gateway";
 const FULL_DISK_ACCESS_PROBE_RELPATHS = [
@@ -256,24 +276,42 @@ export function createProtectPreflightOps(): ProtectPreflightOps {
   };
 }
 
-export async function runProtectPreflight(
-  input: RunProtectPreflightInput = {},
-): Promise<ProtectPreflightReport> {
+async function buildProtectPreflightContext(
+  input: RunProtectPreflightInput,
+): Promise<ProtectPreflightContext> {
   const baseOps = createProtectPreflightOps();
   const ops: ProtectPreflightOps = { ...baseOps, ...input.ops };
   const env = ops.env();
-  const platform = ops.platform();
   const operator = await resolveOperatorContext(ops, env);
-  const fortressPath = resolvePreflightFortressPath(env, operator.home);
-  const context: ProtectPreflightContext = {
+  return {
     strict: input.strict === true,
     ops,
     env,
-    platform,
+    platform: ops.platform(),
     cwd: ops.cwd(),
     operator,
-    fortressPath,
+    fortressPath: resolvePreflightFortressPath(env, operator.home),
+    sealedLauncherPath: input.sealedLauncherPath,
+    allowMatchingBootDaemon: input.allowMatchingBootDaemon === true,
   };
+}
+
+/**
+ * Run the authoritative operator-twin check without triggering unrelated
+ * provider/network probes. The install planner uses this same check so a
+ * later observed-state rerun cannot declare completion over an unconfined
+ * operator gateway.
+ */
+export async function runOperatorTwinPreflight(
+  input: RunProtectPreflightInput = {},
+): Promise<ProtectPreflightRow> {
+  return checkOperatorTwinServices(await buildProtectPreflightContext(input));
+}
+
+export async function runProtectPreflight(
+  input: RunProtectPreflightInput = {},
+): Promise<ProtectPreflightReport> {
+  const context = await buildProtectPreflightContext(input);
 
   const rows = [
     await checkCastleSockHolder(context),
@@ -289,7 +327,7 @@ export async function runProtectPreflight(
 
   return {
     command: "sanctuary protect preflight",
-    generated_at: ops.now().toISOString(),
+    generated_at: context.ops.now().toISOString(),
     strict: context.strict,
     summary,
     rows,
@@ -643,6 +681,23 @@ async function checkCastleSockHolder(
 
   const safeMode = await classifySafeModeCastleDaemon(context, lsof.holders);
   if (safeMode.safe) {
+    if (
+      context.allowMatchingBootDaemon &&
+      safeMode.source === "launchd" &&
+      safeMode.fortressMatches
+    ) {
+      return row({
+        id: "castle_sock_holder",
+        check: "castle.sock holder",
+        status: "PASS",
+        state: "matching_launchd_safe_mode_boot_daemon",
+        detail:
+          `${holderList(lsof.holders)} holds ${socketPath}; launchd confirms the ` +
+          "Castle Wall safe-mode boot daemon targets this fortress. The provisioning flow will re-verify it before arming.",
+        remedy: NO_REMEDY,
+        findings: ["F-1"],
+      });
+    }
     return row({
       id: "castle_sock_holder",
       check: "castle.sock holder",
@@ -707,7 +762,11 @@ function parseLsofHolders(raw: string, socketPath: string): LsofHolder[] {
 async function classifySafeModeCastleDaemon(
   context: ProtectPreflightContext,
   holders: LsofHolder[],
-): Promise<{ safe: true } | { safe: false; reason: string }> {
+): Promise<
+  | { safe: true; source: "launchd"; fortressMatches: boolean }
+  | { safe: true; source: "active-config"; fortressMatches: false }
+  | { safe: false; reason: string }
+> {
   const holderPids = new Set(
     holders
       .map((holder) => holder.pid)
@@ -719,7 +778,16 @@ async function classifySafeModeCastleDaemon(
   ]);
   if (launchd.code === 0) {
     const pid = parseLaunchctlPid(launchd.stdout);
-    if (pid !== undefined && holderPids.has(pid)) return { safe: true };
+    if (pid !== undefined && holderPids.has(pid)) {
+      return {
+        safe: true,
+        source: "launchd",
+        fortressMatches:
+          context.fortressPath !== undefined &&
+          parseLaunchctlFortressPath(launchd.stdout) ===
+            resolvePath(context.fortressPath),
+      };
+    }
   }
 
   for (const path of [
@@ -730,7 +798,8 @@ async function classifySafeModeCastleDaemon(
     if (!config.ok) continue;
     const active = parseActiveCastleConfig(config.text);
     if (active?.mode === "safe" && active.pid !== undefined && holderPids.has(active.pid)) {
-      return { safe: true };
+      // Active-config holders never qualify for the automatic-retry allowance.
+      return { safe: true, source: "active-config", fortressMatches: false };
     }
   }
 
@@ -741,6 +810,14 @@ async function classifySafeModeCastleDaemon(
         ? `launchd job ${CASTLE_WALL_BOOT_LABEL} is loaded but did not match the holder pid`
         : `launchd job ${CASTLE_WALL_BOOT_LABEL} was not confirmed (${formatExecFailure(launchd)})`,
   };
+}
+
+function parseLaunchctlFortressPath(raw: string): string | undefined {
+  const match =
+    /"?SANCTUARY_STORAGE_PATH"?\s*=>\s*"?([^\n"]+)"?/.exec(raw) ??
+    /"?SANCTUARY_STORAGE_PATH"?\s*=\s*"?([^\n"]+)"?/.exec(raw);
+  const value = match?.[1]?.trim().replace(/[;,]+$/, "");
+  return value?.startsWith("/") ? resolvePath(value) : undefined;
 }
 
 function parseLaunchctlPid(raw: string): number | undefined {
@@ -876,8 +953,58 @@ async function checkFortressCustody(
 async function checkRootPathSanctuary(
   context: ProtectPreflightContext,
 ): Promise<ProtectPreflightRow> {
+  if (context.sealedLauncherPath !== undefined) {
+    if (context.sealedLauncherPath !== CASTLE_WALL_SEALED_LAUNCHER) {
+      return row({
+        id: "root_path_sanctuary",
+        check: "sanctuary entrypoint",
+        status: "FAIL",
+        state: "sealed_launcher_noncanonical",
+        detail: `The requested sealed launcher is not the canonical app path (${CASTLE_WALL_SEALED_LAUNCHER}).`,
+        remedy:
+          "Rerun the agent-guided installer so it supplies the canonical signed-app launcher.",
+        findings: ["F-2"],
+      });
+    }
+    const executable = await context.ops.access(context.sealedLauncherPath, "execute");
+    if (executable.ok) {
+      return row({
+        id: "root_path_sanctuary",
+        check: "sanctuary entrypoint",
+        status: "PASS",
+        state: "canonical_sealed_launcher",
+        detail: `The canonical app launcher is executable at ${context.sealedLauncherPath}; this install has no root PATH dependency.`,
+        remedy: NO_REMEDY,
+        findings: ["F-2"],
+      });
+    }
+    if (isAbsentCode(executable.code)) {
+      return row({
+        id: "root_path_sanctuary",
+        check: "sanctuary entrypoint",
+        status: "FAIL",
+        state: "sealed_launcher_not_executable",
+        detail: `The canonical app launcher is not executable at ${context.sealedLauncherPath}.`,
+        remedy:
+          "Reinstall the verified Sanctuary Castle Wall app, then rerun the agent-guided installer.",
+        findings: ["F-2"],
+      });
+    }
+    return row({
+      id: "root_path_sanctuary",
+      check: "sanctuary entrypoint",
+      status: "UNDETERMINED",
+      state: "sealed_launcher_probe_unknown",
+      detail: `The canonical app launcher could not be inspected: ${executable.reason}.`,
+      remedy:
+        "Verify the signed app is installed and executable, then rerun the agent-guided installer.",
+      findings: ["F-2"],
+    });
+  }
+
   const pathValue = context.env.PATH;
-  const fallback = "sudo node server/dist/cli.js protect --hermes";
+  const legacyRemedy =
+    "Run the agent-guided installer with the canonical signed-app launcher, or install the sanctuary bin into root's PATH for a source install.";
   if (pathValue === undefined || pathValue.trim() === "") {
     return row({
       id: "root_path_sanctuary",
@@ -885,7 +1012,7 @@ async function checkRootPathSanctuary(
       status: "FAIL",
       state: "path_empty",
       detail: "PATH is empty in the current privilege context, so root cannot resolve the sanctuary bin.",
-      remedy: `Install the sanctuary bin into root's PATH, or use the direct fallback: ${fallback}`,
+      remedy: legacyRemedy,
       findings: ["F-2"],
     });
   }
@@ -917,7 +1044,7 @@ async function checkRootPathSanctuary(
       status: "UNDETERMINED",
       state: "path_probe_unknown",
       detail: `No sanctuary bin was found, and some PATH entries could not be inspected: ${unknowns.join("; ")}.`,
-      remedy: `Resolve the PATH permissions, or use the direct fallback: ${fallback}`,
+      remedy: `Resolve the PATH permissions. ${legacyRemedy}`,
       findings: ["F-2"],
     });
   }
@@ -928,7 +1055,7 @@ async function checkRootPathSanctuary(
     status: "FAIL",
     state: "not_found",
     detail: "No executable named sanctuary was found in the current privilege context's PATH.",
-    remedy: `Install the sanctuary bin into root's PATH, or use the direct fallback: ${fallback}`,
+    remedy: legacyRemedy,
     findings: ["F-2"],
   });
 }

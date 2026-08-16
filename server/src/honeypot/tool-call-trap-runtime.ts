@@ -134,12 +134,12 @@ function coalescedWindowKey(trapId: string, callerIdentity: string): string {
 /**
  * Deterministic finding_id for a (trap, caller, time-bucket) triple
  * (register Z-HNY-02 RECHECK / rule 8 atomicity fix — see the doc above
- * `runExclusive`). Two invocations that fall in the SAME
- * FOLLOW_UP_WINDOW_MS-wide bucket ALWAYS compute the identical id, with no
- * dependency on which one observes the in-memory tracker first — that is
- * what makes the durable write an idempotent upsert instead of a
- * check-then-mint race. sha256 (not randomUUID) precisely because it must
- * be a pure function of its inputs, not a fresh random value per call.
+ * `runExclusive`). The bucket is an ID-candidate domain, not the product's
+ * window boundary: `invokeIfTrap` also checks the preceding bucket and the
+ * stored `first_observed_at` so a rolling five-minute window survives an
+ * epoch-aligned boundary and process-local cache loss. sha256 (not
+ * randomUUID) precisely because concurrent callers must converge on the
+ * same id candidate instead of minting a fresh value per call.
  */
 function deterministicCoalescedFindingId(
   trapId: string,
@@ -167,11 +167,10 @@ export class ToolCallTrapRuntime {
   // request count, not by cumulative (trap, caller) pairs ever seen.
   private readonly windowLocks = new Map<string, Promise<void>>();
   // See MAX_COALESCED_FINDING_WINDOWS. Evict-oldest on capacity: losing a
-  // tracker entry only means the next invocation for that (trap, caller)
-  // mints a fresh finding_id (a new durable row) instead of updating the
-  // old one — a coalescing-quality degradation under adversarial churn,
-  // never a security hole, so a simple oldest-first policy is sufficient
-  // (unlike handshakeResults/federation peers, nothing here is trust-bearing).
+  // tracker entry is safe because the next invocation recovers the current
+  // or preceding deterministic candidate from the durable store and checks
+  // its actual first-observed time. The map is a cache, never the authority,
+  // so a simple oldest-first policy is sufficient.
   private readonly activeFindingWindows = new BoundedMap<
     string,
     CoalescedFindingWindow
@@ -243,36 +242,45 @@ export class ToolCallTrapRuntime {
     const windowKey = coalescedWindowKey(spec.trap_id, callerIdentity);
     const nowMs = now.getTime();
     const windowBucket = Math.floor(nowMs / FOLLOW_UP_WINDOW_MS);
-    // Deterministic, not random: two calls in the SAME bucket compute the
-    // IDENTICAL finding_id independently, with no dependency on tracker
-    // state — this is what makes the durable write an upsert rather than a
-    // race between two independently-minted ids (see
-    // deterministicCoalescedFindingId's doc).
-    const findingId = deterministicCoalescedFindingId(
+    // Deterministic, not random: concurrent calls compute the same current
+    // candidate. The previous candidate is also checked inside the lock so
+    // an existing rolling window survives crossing an aligned bucket edge.
+    const currentFindingId = deterministicCoalescedFindingId(
       spec.trap_id,
       callerIdentity,
       windowBucket,
     );
-    const windowStartedAt = windowBucket * FOLLOW_UP_WINDOW_MS;
+    const previousFindingId = deterministicCoalescedFindingId(
+      spec.trap_id,
+      callerIdentity,
+      windowBucket - 1,
+    );
 
     return this.runExclusive(windowKey, async () => {
       // Ground truth is the DURABLE store, never just the in-memory
       // tracker: the tracker is a cache that can be capacity-evicted
-      // (MAX_COALESCED_FINDING_WINDOWS) mid-window without losing the
-      // underlying bucket's determinism — a subsequent call in the SAME
-      // bucket still computes the SAME findingId above, so if the tracker
-      // was evicted we recover repeat_count/first_observed_at/
-      // distinct_arg_hashes by reading the record back rather than
-      // treating the eviction as "this is a brand-new observation" (which
-      // would both undercount repeat_count and, if repeated, mint
-      // unbounded fresh durable rows on tracker churn alone — exactly the
-      // second bypass the gate found: "tracker eviction mints a fresh
-      // durable finding within the same window").
+      // (MAX_COALESCED_FINDING_WINDOWS) or lost on restart. The current and
+      // preceding deterministic bucket candidates cover every possible
+      // live rolling window; `first_observed_at` decides whether a candidate
+      // is still live. Recover repeat_count/first_observed_at/
+      // distinct_arg_hashes from the store rather than treating cache loss
+      // or an aligned bucket edge as a brand-new observation.
       const existingWindow = this.activeFindingWindows.get(windowKey);
+      let findingId = currentFindingId;
+      let windowStartedAt = nowMs;
       let groundTruth:
         | { repeat_count: number; first_observed_at: string; distinct_arg_hashes: string[] }
         | undefined;
-      if (existingWindow && existingWindow.finding_id === findingId) {
+      const existingAge = existingWindow
+        ? nowMs - existingWindow.window_started_at
+        : Number.POSITIVE_INFINITY;
+      if (
+        existingWindow &&
+        existingAge >= 0 &&
+        existingAge <= FOLLOW_UP_WINDOW_MS
+      ) {
+        findingId = existingWindow.finding_id;
+        windowStartedAt = existingWindow.window_started_at;
         groundTruth = {
           repeat_count: existingWindow.repeat_count,
           first_observed_at: existingWindow.first_observed_at,
@@ -284,23 +292,37 @@ export class ToolCallTrapRuntime {
         // store-read error must never propagate here either. Treat a read
         // failure exactly like "no existing record" — the call proceeds as
         // a fresh observation rather than throwing.
-        let stored: SentinelFinding | null;
-        try {
-          stored = await this.findingStore.loadFinding(findingId);
-        } catch {
-          stored = null;
-        }
-        if (stored) {
+        // The current bucket is checked first: if a new rolling window was
+        // already minted after the previous one expired, it is authoritative.
+        // The previous bucket is the only other possible live candidate for
+        // a window whose maximum age is FOLLOW_UP_WINDOW_MS.
+        for (const candidateId of [currentFindingId, previousFindingId]) {
+          let stored: SentinelFinding | null;
+          try {
+            stored = await this.findingStore.loadFinding(candidateId);
+          } catch {
+            stored = null;
+          }
+          if (!stored) continue;
           const details = stored.details as {
             first_observed_at?: string;
             repeat_count?: number;
             distinct_arg_hashes?: string[];
           };
+          const firstObservedAt = details.first_observed_at ?? stored.observed_at;
+          const firstObservedMs = Date.parse(firstObservedAt);
+          const age = nowMs - firstObservedMs;
+          if (!Number.isFinite(firstObservedMs) || age < 0 || age > FOLLOW_UP_WINDOW_MS) {
+            continue;
+          }
+          findingId = candidateId;
+          windowStartedAt = firstObservedMs;
           groundTruth = {
             repeat_count: details.repeat_count ?? 1,
-            first_observed_at: details.first_observed_at ?? stored.observed_at,
+            first_observed_at: firstObservedAt,
             distinct_arg_hashes: details.distinct_arg_hashes ?? [],
           };
+          break;
         }
       }
 

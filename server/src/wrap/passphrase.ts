@@ -19,7 +19,7 @@
  * passphrases again unless they want to export / migrate.
  */
 
-import { mkdir } from "node:fs/promises";
+import { lstat, mkdir } from "node:fs/promises";
 import { homedir, hostname, platform, userInfo } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { randomBytes } from "node:crypto";
@@ -103,6 +103,35 @@ export interface PassphraseOptions {
    * host/user migration). Production callers leave this undefined.
    */
   deriveMachineKey?: (home: string) => Uint8Array;
+}
+
+export type ExistingCustodyMaterialStatus = "present" | "absent" | "unknown";
+
+/**
+ * Presence-only, read-only observation used to distinguish a true first
+ * custody ceremony from wrapping an additional harness around an existing
+ * fortress. No secret bytes are opened here. Validity is still decided by the
+ * ordinary authenticated read/unlock path before any unrelated wrap mutation.
+ */
+export async function probeExistingCustodyMaterial(
+  storagePath: string,
+  home: string = homedir(),
+): Promise<ExistingCustodyMaterialStatus> {
+  const candidates = [
+    fallbackFilePath(home, storagePath),
+    join(storagePath, "state", "_meta", "custody-envelope.enc"),
+  ];
+  let present = false;
+  for (const path of candidates) {
+    try {
+      const stats = await lstat(path);
+      if (!stats.isFile() || stats.isSymbolicLink()) return "unknown";
+      present = true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") return "unknown";
+    }
+  }
+  return present ? "present" : "absent";
 }
 
 /**
@@ -273,11 +302,19 @@ export async function getOrCreatePassphrase(
   //    the keyring was genuinely reachable-but-empty). Writes always go to the
   //    new 16-hex service name.
   const value = generatePassphrase();
+  let keyringWriteFailure: string | undefined;
   if (plat === "darwin") {
-    const ok = await writeToKeychain(value, exec, service);
-    if (ok) {
+    const write = await writeToKeychain(value, exec, service);
+    if (write.status === "written") {
       return { value, source: "generated", location: OS_KEYRING_LOCATION_MACOS };
     }
+    if (write.status === "unavailable") {
+      throw new PassphraseKeyringUnreachableError(
+        OS_KEYRING_LOCATION_MACOS,
+        write.detail,
+      );
+    }
+    keyringWriteFailure = write.detail;
   } else if (plat === "linux") {
     const ok = await writeToSecretService(value, exec, service);
     if (ok) {
@@ -296,7 +333,9 @@ export async function getOrCreatePassphrase(
   );
   throw new SilentCustodyRefusedError(
     plat === "darwin" || plat === "linux"
-      ? "OS keyring unavailable or refused the write"
+      ? keyringWriteFailure === undefined
+        ? "OS keyring unavailable or refused the write"
+        : `OS keyring refused the write (${keyringWriteFailure})`
       : `no OS keyring integration on platform '${plat}'`
   );
 }
@@ -453,8 +492,8 @@ export async function persistUserProvidedPassphrase(
   const derive = opts.deriveMachineKey ?? deriveMachineKey;
 
   if (plat === "darwin") {
-    const ok = await writeToKeychain(value, exec, service);
-    if (ok) {
+    const write = await writeToKeychain(value, exec, service);
+    if (write.status === "written") {
       return { location: OS_KEYRING_LOCATION_MACOS, source: "keychain" };
     }
     // Keychain failed — try fallback file before giving up.
@@ -547,11 +586,16 @@ function escapeForSecurity(s: string): string {
   return s.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
 }
 
+type DarwinKeychainWriteResult =
+  | { status: "written" }
+  | { status: "unavailable"; detail: string }
+  | { status: "failed"; detail: string };
+
 async function writeToKeychain(
   value: string,
   exec: (cmd: string, args: string[], input?: string) => Promise<ExecResult>,
   service: string = KEYCHAIN_SERVICE_DEFAULT
-): Promise<boolean> {
+): Promise<DarwinKeychainWriteResult> {
   // F5 (HIGH): never pass the secret as an argv element. Process argv is
   // world-readable on macOS (`ps -ww`), so `add-generic-password -w <value>`
   // would leak the master passphrase to any other local user. Deliver the
@@ -562,16 +606,34 @@ async function writeToKeychain(
   //
   // A batch script is line-delimited, so a value containing a newline cannot be
   // embedded; reject it rather than truncating or falling back to a leaky form.
-  if (/[\r\n]/.test(value)) return false;
+  if (/[\r\n]/.test(value)) {
+    return { status: "failed", detail: "generated value contained a forbidden line break" };
+  }
   try {
     // -U updates in place if the item already exists.
     const batch =
       `add-generic-password -U -a "${escapeForSecurity(KEYCHAIN_ACCOUNT)}" ` +
       `-s "${escapeForSecurity(service)}" -w "${escapeForSecurity(value)}"\n`;
     const result = await exec("security", ["-i"], batch);
-    return result.code === 0;
+    if (result.code === 0) return { status: "written" };
+    const classified = classifyDarwinFailure(result);
+    if (classified.status === "unreachable") {
+      const interactionBlocked =
+        result.code === 36 ||
+        /(?:interaction is not allowed|interactionnotallowed|-?25308)/i.test(result.stderr);
+      return {
+        status: "unavailable",
+        detail: interactionBlocked
+          ? `macOS Keychain refused the write (security exit ${result.code ?? "unknown"} / interaction not allowed)`
+          : `keychain write failed (security exit ${result.code ?? "unknown"})`,
+      };
+    }
+    return {
+      status: "failed",
+      detail: `keychain write failed (security exit ${result.code ?? "unknown"})`,
+    };
   } catch {
-    return false;
+    return { status: "failed", detail: "macOS security tool could not be started" };
   }
 }
 

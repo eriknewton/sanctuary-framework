@@ -1,5 +1,5 @@
 /**
- * `sanctuary memory_ingest` / `sanctuary memory_emit` CLI wrappers.
+ * Manual memory-file ingest, emit, transcode, and archive-restore CLI wrappers.
  *
  * These are manual transcode commands. They use the same SDW memory backend as
  * the MCP tools and deliberately do not watch, sync, or modify harness-owned
@@ -21,8 +21,19 @@ import {
   ingestClaudeCodeMemorySnapshot,
   readClaudeCodeMemoryDirectory,
 } from "../sdw/adapters/claude-code-file-adapter.js";
+import {
+  CODEX_MEMORY_HARNESS,
+  emitCodexMemoryDirectory,
+  ingestCodexMemorySnapshot,
+  readCodexMemoryDirectory,
+} from "../sdw/adapters/codex-memory-file-adapter.js";
 import { SdwValidationError } from "../sdw/errors.js";
 import { SdwMemoryBackendAdapter } from "../sdw/adapters/sdw-memory-backend.js";
+import {
+  MEMORY_TRANSCODE_MODE,
+  restoreMemoryTranscodeArchive,
+  transcodeMemoryDirectory,
+} from "../sdw/memory-transcode.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
 import { flagValue, hasFlag } from "./argv.js";
 
@@ -69,7 +80,17 @@ export async function runMemoryIngestCommand(
   if (!boot) return 1;
 
   try {
-    const snapshot = await readClaudeCodeMemoryDirectory(parsed.dir);
+    let sourceFileCount = 0;
+    let ingestSnapshot: () => ReturnType<typeof ingestClaudeCodeMemorySnapshot>;
+    if (parsed.harness === CLAUDE_CODE_MEMORY_HARNESS) {
+      const snapshot = await readClaudeCodeMemoryDirectory(parsed.dir);
+      sourceFileCount = snapshot.entries.length;
+      ingestSnapshot = () => ingestClaudeCodeMemorySnapshot(boot.adapter, snapshot);
+    } else {
+      const snapshot = await readCodexMemoryDirectory(parsed.dir);
+      sourceFileCount = snapshot.entries.length;
+      ingestSnapshot = () => ingestCodexMemorySnapshot(boot.adapter, snapshot);
+    }
     // Write-ahead INTENT, durable before any vault write. If appendCritical
     // throws, the command aborts with no ingested memory files. It is labelled
     // `_started` because nothing is committed yet and the count is only what
@@ -83,10 +104,10 @@ export async function runMemoryIngestCommand(
         harness: parsed.harness,
         source_dir: parsed.dir,
         owner_ref: parsed.ownerRef,
-        source_file_count: snapshot.entries.length,
+        source_file_count: sourceFileCount,
       },
     });
-    const result = await ingestClaudeCodeMemorySnapshot(boot.adapter, snapshot);
+    const result = await ingestSnapshot();
     await boot.auditLog.appendCritical({
       layer: "l1",
       operation: "memory_ingest",
@@ -108,7 +129,7 @@ export async function runMemoryIngestCommand(
     });
     write(
       out,
-      `memory_ingest: ingested ${String(result.ingested.length)} of ${String(result.source_file_count)} Claude Code memory files into owner_ref ${parsed.ownerRef}\n`,
+      `memory_ingest: ingested ${String(result.ingested.length)} of ${String(result.source_file_count)} ${harnessLabel(parsed.harness)} memory files into owner_ref ${parsed.ownerRef}\n`,
     );
     if (!result.complete) {
       // Loud, on stderr, and named per file: a partial mirror that reports only
@@ -172,7 +193,9 @@ export async function runMemoryEmitCommand(
         owner_ref: parsed.ownerRef,
       },
     });
-    const result = await emitClaudeCodeMemoryDirectory(boot.adapter, parsed.dir);
+    const result = parsed.harness === CLAUDE_CODE_MEMORY_HARNESS
+      ? await emitClaudeCodeMemoryDirectory(boot.adapter, parsed.dir)
+      : await emitCodexMemoryDirectory(boot.adapter, parsed.dir);
     await boot.auditLog.appendCritical({
       layer: "l1",
       operation: "memory_emit",
@@ -188,12 +211,12 @@ export async function runMemoryEmitCommand(
     });
     write(
       out,
-      `memory_emit: emitted ${String(result.emitted.length)} Claude Code memory files to ${parsed.dir} (index_present: ${result.index_present ? "yes" : "no"})\n`,
+      `memory_emit: emitted ${String(result.emitted.length)} ${harnessLabel(parsed.harness)} memory files to ${parsed.dir} (index_present: ${result.index_present ? "yes" : "no"})\n`,
     );
     if (!result.index_present) {
       write(
         err,
-        `memory_emit: WARNING - emitted tree is missing MEMORY.md and cannot be re-ingested as a Claude Code memory directory.\n`,
+        `memory_emit: WARNING - emitted tree is missing MEMORY.md and cannot be re-ingested as a ${harnessLabel(parsed.harness)} memory directory.\n`,
       );
     }
     return 0;
@@ -211,13 +234,183 @@ export async function runMemoryEmitCommand(
   }
 }
 
-interface ParsedCommonArgs {
-  readonly harness: typeof CLAUDE_CODE_MEMORY_HARNESS;
+export async function runMemoryTranscodeCommand(
+  args: MemoryFileCommandArgs,
+): Promise<number> {
+  const out = args.out ?? process.stdout;
+  const err = args.err ?? process.stderr;
+  const env = args.env ?? process.env;
+  if (hasFlag(args.argv, "--help") || hasFlag(args.argv, "-h")) {
+    printTranscodeHelp(out);
+    return 0;
+  }
+  const parsed = parseTranscodeArgs(args.argv, err);
+  if (!parsed) return 2;
+  const boot = await bootstrap(parsed, env, err, args.stdin ?? process.stdin);
+  if (!boot) return 1;
+
+  try {
+    await boot.auditLog.appendCritical({
+      layer: "l1",
+      operation: "memory_transcode_started",
+      identity_id: "principal",
+      result: "success",
+      details: {
+        from_harness: parsed.fromHarness,
+        to_harness: parsed.toHarness,
+        mode: MEMORY_TRANSCODE_MODE,
+        output_dir: parsed.dir,
+        owner_ref: parsed.ownerRef,
+      },
+    });
+    const result = await transcodeMemoryDirectory(
+      boot.adapter,
+      parsed.fromHarness,
+      parsed.toHarness,
+      parsed.dir,
+    );
+    try {
+      await boot.auditLog.appendCritical({
+        layer: "l1",
+        operation: "memory_transcode",
+        identity_id: "principal",
+        result: "success",
+        details: {
+          archive_id: result.archive_id,
+          from_harness: result.from_harness,
+          to_harness: result.to_harness,
+          mode: result.mode,
+          output_dir: parsed.dir,
+          owner_ref: parsed.ownerRef,
+          source_file_count: result.source_file_count,
+          projection_file_count: result.projection_file_count,
+          source_set_sha256: result.source_set_sha256,
+          projection_set_sha256: result.projection_set_sha256,
+        },
+      });
+    } catch (auditError) {
+      write(
+        err,
+        `memory_transcode completed, but its outcome audit record failed (${errorName(auditError)}). Preserve archive_id ${result.archive_id} and inspect the output before retrying.\n`,
+      );
+      return 1;
+    }
+    write(
+      out,
+      `memory_transcode: projected ${String(result.source_file_count)} ${harnessLabel(parsed.fromHarness)} source files into ${String(result.projection_file_count)} ${harnessLabel(parsed.toHarness)} plaintext files at ${parsed.dir}\n` +
+      `memory_transcode: exact source recovery archive_id ${result.archive_id}\n`,
+    );
+    return 0;
+  } catch (error) {
+    await appendFailure(boot.auditLog, "memory_transcode", {
+      from_harness: parsed.fromHarness,
+      to_harness: parsed.toHarness,
+      mode: MEMORY_TRANSCODE_MODE,
+      owner_ref: parsed.ownerRef,
+      error_class: errorName(error),
+      ...errorCategoryDetail(error),
+    });
+    write(err, `memory_transcode failed: ${errorMessage(error)}\n`);
+    return 1;
+  } finally {
+    await boot.auditLog.flush();
+  }
+}
+
+export async function runMemoryTranscodeRestoreCommand(
+  args: MemoryFileCommandArgs,
+): Promise<number> {
+  const out = args.out ?? process.stdout;
+  const err = args.err ?? process.stderr;
+  const env = args.env ?? process.env;
+  if (hasFlag(args.argv, "--help") || hasFlag(args.argv, "-h")) {
+    printTranscodeRestoreHelp(out);
+    return 0;
+  }
+  const parsed = parseRestoreArgs(args.argv, err);
+  if (!parsed) return 2;
+  const boot = await bootstrap(parsed, env, err, args.stdin ?? process.stdin);
+  if (!boot) return 1;
+
+  try {
+    await boot.auditLog.appendCritical({
+      layer: "l1",
+      operation: "memory_transcode_restore_started",
+      identity_id: "principal",
+      result: "success",
+      details: {
+        archive_id: parsed.archiveId,
+        output_dir: parsed.dir,
+        owner_ref: parsed.ownerRef,
+      },
+    });
+    const result = await restoreMemoryTranscodeArchive(
+      boot.adapter,
+      parsed.archiveId,
+      parsed.dir,
+    );
+    try {
+      await boot.auditLog.appendCritical({
+        layer: "l1",
+        operation: "memory_transcode_restore",
+        identity_id: "principal",
+        result: "success",
+        details: {
+          archive_id: parsed.archiveId,
+          source_harness: result.source_harness,
+          output_dir: parsed.dir,
+          owner_ref: parsed.ownerRef,
+          restored_file_count: result.source_file_count,
+          source_set_sha256: result.source_set_sha256,
+        },
+      });
+    } catch (auditError) {
+      write(
+        err,
+        `memory_transcode_restore completed, but its outcome audit record failed (${errorName(auditError)}). Inspect ${parsed.dir} before retrying.\n`,
+      );
+      return 1;
+    }
+    write(
+      out,
+      `memory_transcode_restore: restored ${String(result.source_file_count)} exact ${harnessLabel(result.source_harness)} source files to ${parsed.dir}\n`,
+    );
+    return 0;
+  } catch (error) {
+    await appendFailure(boot.auditLog, "memory_transcode_restore", {
+      archive_id: parsed.archiveId,
+      owner_ref: parsed.ownerRef,
+      error_class: errorName(error),
+      ...errorCategoryDetail(error),
+    });
+    write(err, `memory_transcode_restore failed: ${errorMessage(error)}\n`);
+    return 1;
+  } finally {
+    await boot.auditLog.flush();
+  }
+}
+
+interface ParsedVaultArgs {
   readonly dir: string;
   readonly ownerRef: string;
   readonly fortress?: string;
   readonly passphrase?: string;
   readonly passphraseFromStdin: boolean;
+}
+
+interface ParsedCommonArgs extends ParsedVaultArgs {
+  readonly harness:
+    | typeof CLAUDE_CODE_MEMORY_HARNESS
+    | typeof CODEX_MEMORY_HARNESS;
+}
+
+interface ParsedTranscodeArgs extends ParsedVaultArgs {
+  readonly fromHarness: ParsedCommonArgs["harness"];
+  readonly toHarness: ParsedCommonArgs["harness"];
+}
+
+interface ParsedRestoreArgs extends ParsedVaultArgs {
+  readonly archiveId: string;
 }
 
 function parseCommonArgs(
@@ -227,8 +420,8 @@ function parseCommonArgs(
 ): ParsedCommonArgs | null {
   const harness = flagValue([...argv], "--harness");
   const dir = flagValue([...argv], "--dir");
-  if (harness !== CLAUDE_CODE_MEMORY_HARNESS) {
-    write(err, `${command}: --harness must be "claude-code"\n`);
+  if (harness !== CLAUDE_CODE_MEMORY_HARNESS && harness !== CODEX_MEMORY_HARNESS) {
+    write(err, `${command}: --harness must be "claude-code" or "codex"\n`);
     return null;
   }
   if (dir === undefined || dir.trim().length === 0) {
@@ -243,6 +436,59 @@ function parseCommonArgs(
   }
   return {
     harness,
+    dir,
+    ownerRef: flagValue([...argv], "--owner-ref") ?? DEFAULT_OWNER_REF,
+    fortress: flagValue([...argv], "--fortress"),
+    passphrase,
+    passphraseFromStdin: hasFlag([...argv], "--passphrase-stdin"),
+  };
+}
+
+function parseTranscodeArgs(argv: readonly string[], err: Writable): ParsedTranscodeArgs | null {
+  const fromHarness = flagValue([...argv], "--from-harness");
+  const toHarness = flagValue([...argv], "--to-harness");
+  if (
+    (fromHarness !== CLAUDE_CODE_MEMORY_HARNESS && fromHarness !== CODEX_MEMORY_HARNESS) ||
+    (toHarness !== CLAUDE_CODE_MEMORY_HARNESS && toHarness !== CODEX_MEMORY_HARNESS) ||
+    fromHarness === toHarness
+  ) {
+    write(
+      err,
+      "memory_transcode: --from-harness and --to-harness must name different values from claude-code or codex\n",
+    );
+    return null;
+  }
+  if (flagValue([...argv], "--mode") !== MEMORY_TRANSCODE_MODE) {
+    write(err, `memory_transcode: --mode must be "${MEMORY_TRANSCODE_MODE}"\n`);
+    return null;
+  }
+  const common = parseVaultArgs(argv, "memory_transcode", err);
+  return common === null ? null : { ...common, fromHarness, toHarness };
+}
+
+function parseRestoreArgs(argv: readonly string[], err: Writable): ParsedRestoreArgs | null {
+  const archiveId = flagValue([...argv], "--archive-id");
+  if (archiveId === undefined || !/^[a-f0-9]{32}$/.test(archiveId)) {
+    write(err, "memory_transcode_restore: --archive-id must be the 32-hex id returned by memory_transcode\n");
+    return null;
+  }
+  const common = parseVaultArgs(argv, "memory_transcode_restore", err);
+  return common === null ? null : { ...common, archiveId };
+}
+
+function parseVaultArgs(
+  argv: readonly string[],
+  command: string,
+  err: Writable,
+): ParsedVaultArgs | null {
+  const dir = flagValue([...argv], "--dir");
+  if (dir === undefined || dir.trim().length === 0) {
+    write(err, `${command}: --dir is required\n`);
+    return null;
+  }
+  const passphrase = flagValue([...argv], "--passphrase");
+  if (passphrase !== undefined) write(err, PASSPHRASE_ARGV_WARNING);
+  return {
     dir,
     ownerRef: flagValue([...argv], "--owner-ref") ?? DEFAULT_OWNER_REF,
     fortress: flagValue([...argv], "--fortress"),
@@ -287,7 +533,7 @@ interface BootstrappedMemoryFileCommand {
 }
 
 async function bootstrap(
-  args: ParsedCommonArgs,
+  args: ParsedVaultArgs,
   env: NodeJS.ProcessEnv,
   err: Writable,
   stdin: NodeJS.ReadableStream,
@@ -341,7 +587,11 @@ async function bootstrap(
 
 async function appendFailure(
   auditLog: AuditLog,
-  operation: "memory_ingest" | "memory_emit",
+  operation:
+    | "memory_ingest"
+    | "memory_emit"
+    | "memory_transcode"
+    | "memory_transcode_restore",
   details: Record<string, unknown>,
 ): Promise<void> {
   try {
@@ -358,17 +608,24 @@ async function appendFailure(
   }
 }
 
+function harnessLabel(
+  harness: typeof CLAUDE_CODE_MEMORY_HARNESS | typeof CODEX_MEMORY_HARNESS,
+): string {
+  return harness === CLAUDE_CODE_MEMORY_HARNESS ? "Claude Code" : "Codex";
+}
+
 function printIngestHelp(out: Writable): void {
   write(
     out,
-    `Usage: sanctuary memory_ingest --harness=claude-code --dir <path> [options]
+    `Usage: sanctuary memory_ingest --harness=<claude-code|codex> --dir <path> [options]
 
-Manually mirror Claude Code memory files into the encrypted SDW vault. Source
-files remain plaintext and untouched; this command does not sync or watch.
+Manually mirror Claude Code or Codex memory files into the encrypted SDW vault.
+Source files remain plaintext and untouched; this command does not sync or watch.
 
 Options:
-  --harness=claude-code  Required harness format.
-  --dir <path>           Claude Code memory directory to read.
+  --harness <name>       Required: claude-code or codex.
+  --dir <path>           Harness memory directory to read. Codex also accepts
+                         the parent Codex home containing memories/.
   --owner-ref <id>       SDW owner_ref scope (default: fleet-self).
   --fortress <path>      Override the fortress path.
   --passphrase-stdin     Read the fortress passphrase from stdin (preferred).
@@ -383,13 +640,13 @@ Options:
 function printEmitHelp(out: Writable): void {
   write(
     out,
-    `Usage: sanctuary memory_emit --harness=claude-code --dir <path> [options]
+    `Usage: sanctuary memory_emit --harness=<claude-code|codex> --dir <path> [options]
 
-Manually emit Claude Code memory files from the encrypted SDW vault into an
-operator-named output directory. Existing memory files are never overwritten.
+Manually emit Claude Code or Codex memory files from the encrypted SDW vault
+into an operator-named output directory. Existing files are never overwritten.
 
 Options:
-  --harness=claude-code  Required harness format.
+  --harness <name>       Required: claude-code or codex.
   --dir <path>           Output directory for emitted plaintext files.
   --owner-ref <id>       SDW owner_ref scope (default: fleet-self).
   --fortress <path>      Override the fortress path.
@@ -397,6 +654,48 @@ Options:
   --passphrase <value>   Fortress passphrase. Visible in the process list to
                          any local user; prefer SANCTUARY_PASSPHRASE or
                          --passphrase-stdin.
+  --help, -h             Show this help.
+`,
+  );
+}
+
+function printTranscodeHelp(out: Writable): void {
+  write(
+    out,
+    `Usage: sanctuary memory_transcode --from-harness=<claude-code|codex> --to-harness=<claude-code|codex> --mode=reversible --dir <path> [options]
+
+Manually create a plaintext native projection in the other harness format and
+a versioned encrypted archive for exact source recovery. This is not sync.
+
+Options:
+  --from-harness <name> Source harness already mirrored into the SDW vault.
+  --to-harness <name>   Different destination harness format.
+  --mode reversible     Required frozen transcode contract.
+  --dir <path>           Empty output directory; existing files are refused.
+  --owner-ref <id>       SDW owner_ref scope (default: fleet-self).
+  --fortress <path>      Override the fortress path.
+  --passphrase-stdin     Read the fortress passphrase from stdin (preferred).
+  --passphrase <value>   Visible in the process list; prefer the environment or stdin.
+  --help, -h             Show this help.
+`,
+  );
+}
+
+function printTranscodeRestoreHelp(out: Writable): void {
+  write(
+    out,
+    `Usage: sanctuary memory_transcode_restore --archive-id <id> --dir <path> [options]
+
+Restore exact plaintext source files from a completed encrypted transcode
+archive into an empty output directory. This is not sync.
+
+Options:
+  --archive-id <id>      Opaque id returned by memory_transcode.
+  --dir <path>           Empty output directory; existing files are refused.
+  --owner-ref <id>       SDW owner_ref scope (default: fleet-self).
+  --fortress <path>      Override the fortress path.
+  --passphrase-stdin     Read the fortress passphrase from stdin (preferred).
+  --passphrase <value>   Visible in the process list; prefer the environment or stdin.
   --help, -h             Show this help.
 `,
   );
