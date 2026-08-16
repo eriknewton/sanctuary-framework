@@ -1,3 +1,6 @@
+// fail-before-exempt: this PR only rewords two comments/test names in this file
+// (the #1242 gate INFO nits); no behavior is changed or newly pinned, so there is
+// no pre-fix source these tests could fail against.
 /**
  * Sanctuary MCP Server — Prompt Injection Detection Layer Tests
  *
