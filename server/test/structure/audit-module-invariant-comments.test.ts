@@ -83,10 +83,84 @@ describe("Audit module invariant comments", () => {
       "diagnostic only",
       "IC-05-DG",
     ]);
-    expectNear(source, "unsigned_reason: \"no signing identity available", [
-      "store whose adapter cannot reach identity records",
+    expectNear(source, "const record: AuditCheckpointRecord = {", [
       "is serialized as `unsigned`",
-      "silently trusting a fallback key",
+      "COSMETIC",
+      "zero trust weight",
+      "identity-absence",
+    ]);
+  });
+
+  it("keeps the IC-05-DG downgrade-detection invariant comments pinned at their enforcement sites", () => {
+    const source = read("server/src/operational/audit-log.ts");
+
+    // The absence rule (review finding 3): a thrown control-record read is
+    // indeterminate, never absent and never TAMPERED.
+    expectNear(source, "return { status: \"unreadable\", detail: failureMessage(err) };", [
+      "Absence rule",
+      "Treat-error-as-absent",
+      "chmod",
+    ]);
+    // DELTA-3: committed tip + uncommitted floor is impossible by
+    // construction; observing it reads as tampered, never quiet.
+    expectNear(source, "data.lowest_signed_checkpoint_sequence === null", [
+      "DELTA-3",
+      "impossible by construction",
+      "TAMPERED, never quiet",
+    ]);
+    // The LD6 chokepoint: re-read + monotone merge + pre-dispatch assert.
+    expectNear(source, "private async writeSigningControlRecord(", [
+      "never from memory",
+      "immediately before dispatching the durable write",
+      "detached-late-completion",
+    ]);
+    // The monotone floor merge (NEW-1): null sentinel, never raised.
+    expectNear(source, "lowest_signed_checkpoint_sequence` is a MIN over NON-NULL values", [
+      "not-yet-committed sentinel",
+      "raising it IS the attack",
+    ]);
+    // Enumeration completeness (R3-e): stamps only from complete,
+    // coverage-finding-free passes.
+    expectNear(source, "private async readCheckpointsWithCompleteness(", [
+      "may never stamp state",
+      "blind to DELETION",
+    ]);
+    expectNear(source, "the checkpoint enumeration is partial", [
+      "different verdicts",
+      "fail\n      // closed on the BLINDNESS",
+    ]);
+    // Bound checkpoint identity (NEW-2).
+    expectNear(source, "if (keySeq === null || keySeq !== record.checkpoint_sequence) {", [
+      "sequence MUST equal",
+      "byte-copy",
+      "loud AND sterile",
+    ]);
+    // The coverage predicates consume signed references only (never a walk).
+    expectNear(source, "const previous = checkpoint.previous_checkpoint_sequence;", [
+      "INSIDE the signed",
+      "tamper-evident",
+      "bound existence, never",
+    ]);
+    // Ring membership, not range (review finding 9), and the clock-
+    // independence discharge of rule 10.
+    expectNear(source, "if (incidentRing.has(checkpoint.checkpoint_sequence)) {", [
+      "ring MEMBERSHIP is the predicate",
+      "day-one-corruption",
+    ]);
+    expectNear(source, "const verdictFloor = Math.min(latchFloor, headFloor, storeFloor);", [
+      "deleting any one memory",
+      "no verdict consumes a timestamp",
+    ]);
+    // The constructional-only carve-out (review finding 2), both halves.
+    expectNear(source, "if (this.signingDetectionMode === \"non-fortress\") {", [
+      "AT CONSTRUCTION",
+      "no storage state can manufacture",
+      "every runtime failure below is a FINDING",
+    ]);
+    // Recovery latches before it re-stamps (NEW-3).
+    expectNear(source, "private async performSigningRecoveryWrites(", [
+      "LATCHES BEFORE it",
+      "cannot silence it",
     ]);
   });
 

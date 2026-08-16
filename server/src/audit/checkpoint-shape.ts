@@ -70,6 +70,38 @@ export const AUDIT_HEAD_ANCHOR_KEY = "__head_anchor";
 export const AUDIT_EPOCH_KEYS_KEY = "__custody_epoch_keys";
 
 /**
+ * Fixed `_audit_checkpoints` storage key of the MAC-authenticated
+ * checkpoint-signing latch, v2 semantics (IC-05-DG): the one-way FORWARD
+ * COMMITMENT "every `audit-checkpoint` with `checkpoint_sequence >=
+ * armed_at_sequence` must carry a signature that verifies against the
+ * authenticated resolver". A control record, never exported as a checkpoint.
+ * The `_v2` suffix is deliberate: the unmerged #1243 branch shipped a
+ * `__signing_latch` record with HISTORICAL ("first signed was N") semantics
+ * on drill fortresses, and no artifact written under those semantics may
+ * satisfy or confuse the v2 reader, so the key, marker, MAC purpose, and MAC
+ * domain are all fresh strings. Marker/purpose/domain live in
+ * `operational/audit-log.ts` (`AUDIT_SIGNING_LATCH_V2_MARKER` et al.) and
+ * must match the `__signing_latch_v2` entry in `MAC_ANCHORS`
+ * (`core/master-rotation.ts` `convertAuditAnchors`).
+ */
+export const AUDIT_SIGNING_LATCH_V2_KEY = "__signing_latch_v2";
+
+/**
+ * Fixed `_audit_checkpoints` storage key of the MAC-authenticated
+ * checkpoint-signing HEAD (IC-05-DG): the single fixed-size record carrying
+ * (1) the signer-failure incident ring (authenticated failure evidence — the
+ * plaintext `unsigned_reason` field carries zero trust weight), (2) the
+ * monotone-MAX committed tip `highest_signed_checkpoint_sequence`, (3) the
+ * monotone-MIN floor witness `lowest_signed_checkpoint_sequence`, and (4) the
+ * append-only latched recovery/downgrade markers. A control record, never
+ * exported as a checkpoint. Marker/purpose/domain live in
+ * `operational/audit-log.ts` (`AUDIT_SIGNING_HEAD_MARKER` et al.) and must
+ * match the `__signing_head` entry in `MAC_ANCHORS`
+ * (`core/master-rotation.ts` `convertAuditAnchors`).
+ */
+export const AUDIT_SIGNING_HEAD_KEY = "__signing_head";
+
+/**
  * The CLOSED allowlist of legitimate NON-EXPORT control records that live in
  * the `_audit_checkpoints` namespace under fixed keys. A record under one of
  * these keys may be skipped by the chain exporter WITHOUT counting toward
@@ -85,6 +117,8 @@ export const AUDIT_EPOCH_KEYS_KEY = "__custody_epoch_keys";
 export const AUDIT_CHECKPOINT_NAMESPACE_CONTROL_KEYS: readonly string[] = [
   AUDIT_HEAD_ANCHOR_KEY,
   AUDIT_EPOCH_KEYS_KEY,
+  AUDIT_SIGNING_LATCH_V2_KEY,
+  AUDIT_SIGNING_HEAD_KEY,
 ];
 
 /** The fields a checkpoint signature ranges over. */
