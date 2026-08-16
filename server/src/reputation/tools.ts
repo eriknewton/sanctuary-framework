@@ -10,8 +10,13 @@ import { toolResult } from "../router.js";
 import {
   ReputationBundleVerificationError,
   ReputationStore,
+  ReputationStoreQuotaError,
+  ReputationAlreadyRecordedError,
+  ReputationIdOccupiedUnverifiedError,
   trustedSovereigntyTier,
   type InteractionOutcome,
+  type ReputationStoreTestOverrides,
+  type ReputationInLockAuditEmit,
   type StoredAttestation,
 } from "./reputation-store.js";
 import {
@@ -27,6 +32,7 @@ import type { SanctuaryConfig } from "../config.js";
 import type { RuntimeStatus } from "../health/evidence.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
 import { toBase64url, fromBase64url } from "../core/encoding.js";
+import { requireLocalDidEncodings } from "../core/identity.js";
 import {
   resolveTierByDid,
   computeWeightedScore,
@@ -177,11 +183,21 @@ export function createReputationTools(
   masterKey: Uint8Array,
   identityManager: IdentityManager,
   auditLog: AuditLog,
-  handshakeResults?: Map<string, HandshakeResult>,
+  handshakeResults?: ReadonlyMap<string, HandshakeResult>,
   verascoreUrl?: string,
-  config?: SanctuaryConfig
+  config?: SanctuaryConfig,
+  /**
+   * Test-only override for ReputationStore's record()-chokepoint growth
+   * bounds (LD3 gate fix-round DEFECT 1). Production call sites never set
+   * this — see ReputationStoreTestOverrides's doc (reputation-store.ts).
+   */
+  reputationStoreTestOverrides?: ReputationStoreTestOverrides
 ): { tools: ToolDefinition[]; reputationStore: ReputationStore } {
-  const reputationStore = new ReputationStore(storage, masterKey);
+  const reputationStore = new ReputationStore(
+    storage,
+    masterKey,
+    reputationStoreTestOverrides
+  );
   const identityEncryptionKey = derivePurposeKey(masterKey, "identity-encryption");
   // Default to empty map if no handshake results provided
   const hsResults = handshakeResults ?? new Map<string, HandshakeResult>();
@@ -231,7 +247,9 @@ export function createReputationTools(
           },
           counterparty_attestation: {
             type: "string",
-            description: "Counterparty's signed attestation of the same interaction",
+            description:
+              "Optional raw counterparty attestation attachment. " +
+              "Presence alone is not treated as verified confirmation.",
           },
           identity_id: {
             type: "string",
@@ -240,7 +258,7 @@ export function createReputationTools(
         },
         required: ["interaction_id", "counterparty_did", "outcome"],
       },
-      handler: async (args) => {
+      handler: async (args, callerIdentity) => {
         const identityId = args.identity_id as string | undefined;
         const identity = identityId
           ? identityManager.get(identityId)
@@ -262,14 +280,77 @@ export function createReputationTools(
           });
         }
 
-        // Resolve sovereignty tier for the counterparty
         const counterpartyDid = args.counterparty_did as string;
-        const hasSanctuaryIdentity = identityManager.list().some(
-          (id) => identityManager.get(id.identity_id)?.did === counterpartyDid
+        // The weight reflects who makes the claim, not who it is about, so an
+        // untrusted caller cannot borrow a verified counterparty's credibility.
+        // REP-01: the signer (identity.did) is a LOCAL identity, so its
+        // credibility cannot come from this instance's own handshake map (a match
+        // there is a self-vouch). Cap it at self-attested. Passing exactly the
+        // signer DID is race-free vs a snapshot of identityManager.list() (no
+        // rotation window). The storage chokepoint (trustedSovereigntyTier,
+        // A11 — now an UNCONDITIONAL clamp) enforces the same cap at scoring
+        // for every record regardless of caller, closing the residual this
+        // record-time cap alone could not: a pre-fix laundered record, or a
+        // direct ReputationStore.record() caller that bypasses this tool.
+        // requireLocalDidEncodings (not bare identity.did) so BOTH DID
+        // encodings this identity's key could be persisted under are capped
+        // — see resolveTierByDid's doc. The "require" (hard-fail) form, not
+        // the soft localDidEncodings, because `identity` is a HELD identity:
+        // a decode failure on our own key material is an integrity error and
+        // must refuse the record, never silently produce an empty cap set
+        // (register §Z RECHECK MUST-FIX-1).
+        const tierMeta = resolveTierByDid(
+          identity.did,
+          hsResults,
+          true,
+          new Set(requireLocalDidEncodings(identity.public_key))
         );
-        const tierMeta = resolveTierByDid(counterpartyDid, hsResults, hasSanctuaryIdentity);
+
+        // LD6 BP-DEADLINE-03 (V2-2/V2-5): the success audit is threaded in
+        // as an `InLockAuditEmit` closure and runs INSIDE record()'s
+        // admission lock (either right after the write, or as the
+        // reconcile step on an already-committed retry -- see
+        // ReputationInLockAuditEmit's doc). Captures ONLY `auditLog` +
+        // primitive locals -- never `reputationStore` -- so re-entry into any
+        // store's admission lock from inside it does not happen HERE, by
+        // CONVENTION, not by a type-system guarantee -- see
+        // ReputationInLockAuditEmit's doc for why the callback type cannot
+        // enforce this on its own (V2-5 gap-5).
+        //
+        // Reconcile-audit fidelity (fix-round, closes a three-way
+        // divergence): every field below reads from `projection`, NEVER
+        // from the outer `outcome`/`tierMeta` closure captures. On the
+        // reconcile branch (an already-committed retry), `projection`
+        // carries the EXISTING stored attestation's own outcome/tier --
+        // the same values the caller-visible `already_committed` result
+        // returns and the durable record holds. A same-tuple retry with a
+        // DIFFERENT incoming outcome must still audit the STORED truth, or
+        // caller-result / durable-write / audit-entry disagree, which is
+        // the exact divergence class this admission-completion fix exists
+        // to close.
+        const emitAudit: ReputationInLockAuditEmit = async (projection) => {
+          // F4 (fix-round-2, tag-based dedupe): a reconcile re-emission is
+          // TAGGED rather than deduped by an in-lock audit-log read -- see
+          // ReputationRecordAuditProjection's `reconcile` doc.
+          await auditLog.appendCritical({
+            layer: "l4",
+            operation: "reputation_record",
+            identity_id: identity.identity_id,
+            result: "success",
+            details: {
+              attestation_id: projection.attestation_id,
+              interaction_id: projection.interaction_id,
+              outcome_type: projection.outcome_type,
+              outcome_result: projection.outcome_result,
+              context: projection.context,
+              sovereignty_tier: projection.sovereignty_tier,
+              ...(projection.reconcile ? { reconcile: true } : {}),
+            },
+          });
+        };
 
         let stored;
+        let alreadyCommitted = false;
         try {
           stored = await reputationStore.record(
             args.interaction_id as string,
@@ -279,37 +360,95 @@ export function createReputationTools(
             identity,
             identityEncryptionKey,
             args.counterparty_attestation as string | undefined,
-            tierMeta.sovereignty_tier
+            tierMeta.sovereignty_tier,
+            // LD3 gate fix-round DEFECT 1: `reputation_record` is Tier-2
+            // (anomaly-gated auto-allow), so it is the general-purpose,
+            // freely-callable path into `_reputation` — the pre-fix version
+            // called record() with no origin at all, so this tool's writes
+            // were exempt from every quota bridge_attest enforced on
+            // itself. Threading the SERVER-SET `callerIdentity` here is
+            // what puts this tool's growth under record()'s own
+            // MAX_REPUTATION_RECORDS / MAX_REPUTATION_RECORDS_PER_ORIGIN
+            // chokepoint bound (reputation-store.ts) — never `identity_id`,
+            // which is Tier-3 `identity_create`-mintable and would let a
+            // caller reset its quota by minting a fresh identity per call.
+            callerIdentity,
+            undefined, // additionalQuotaCheck: reputation_record has none of its own
+            emitAudit
           );
         } catch (err) {
           if (err instanceof BridgeAttestationMetricValidationError) {
             return toolResult({ error: err.message });
           }
-          throw err;
+          // LD6 BP-DEADLINE-03 (Erik-ratified caller-semantic change): a
+          // repeated (interaction_id, participant_did, counterparty_did,
+          // context) tuple is now an idempotent retry -- mirrors
+          // bridge_attest's existing `already_attested` shape -- rather than
+          // minting a second attestation. The structural existence guard
+          // inside record() rejects with this error; return the EXISTING
+          // record instead of treating it as a failure.
+          if (err instanceof ReputationAlreadyRecordedError) {
+            stored = err.existing;
+            alreadyCommitted = true;
+          } else if (err instanceof ReputationIdOccupiedUnverifiedError) {
+            void auditLog.append(
+              "l4",
+              "reputation_record_id_occupied_unverified",
+              identity.identity_id,
+              {
+                interaction_id: args.interaction_id,
+                context,
+                caller_identity: callerIdentity,
+              },
+              "failure"
+            );
+            return toolResult({ error: err.message });
+          } else if (err instanceof ReputationStoreQuotaError) {
+            // `admission_busy` (LD3 gate fix-round-2, MUST-FIX 3) is
+            // distinct from `scan_unavailable`: this call never even
+            // reached the quota scan, refused instead at the store's
+            // admission-waiter cap — see runAdmissionExclusiveBounded's doc
+            // (reputation-store.ts).
+            void auditLog.append(
+              "l4",
+              err.reason === "origin_quota"
+                ? "reputation_record_origin_quota_exceeded"
+                : err.reason === "capacity"
+                  ? "reputation_record_store_saturated"
+                  : err.reason === "admission_busy"
+                    ? "reputation_record_admission_busy"
+                    : "reputation_record_quota_scan_unavailable",
+              identity.identity_id,
+              {
+                interaction_id: args.interaction_id,
+                context,
+                caller_identity: callerIdentity,
+              },
+              "failure"
+            );
+            return toolResult({ error: err.message });
+          } else {
+            throw err;
+          }
         }
 
-        await auditLog.appendCritical({
-          layer: "l4",
-          operation: "reputation_record",
-          identity_id: identity.identity_id,
-          result: "success",
-          details: {
-            interaction_id: args.interaction_id,
-            outcome_type: outcome.type,
-            outcome_result: outcome.result,
-            context,
-            sovereignty_tier: tierMeta.sovereignty_tier,
-          },
-        });
-
+        // LD6 BP-DEADLINE-03: the success audit for a NEW record (or the
+        // reconciled audit for an already-committed one) is already emitted
+        // INSIDE record()'s admission lock via `emitAudit` above -- no
+        // second, out-of-lock append here.
         return toolResult({
           attestation_id: stored.attestation.attestation_id,
           interaction_id: stored.attestation.data.interaction_id,
           self_attestation: stored.attestation.signature,
-          counterparty_confirmed: stored.counterparty_confirmed,
-          sovereignty_tier: tierMeta.sovereignty_tier,
+          sovereignty_tier: stored.attestation.data.sovereignty_tier,
           context,
           recorded_at: stored.recorded_at,
+          // LD6 BP-DEADLINE-03 (Erik decision 3): a caller that retries the
+          // identical (interaction_id, participant_did, counterparty_did,
+          // context) tuple is told this was already recorded, rather than
+          // getting a second record -- the retry-safe result shape a
+          // timed-out caller relies on.
+          already_committed: alreadyCommitted,
         });
       },
     },
@@ -497,7 +636,7 @@ export function createReputationTools(
         },
         required: ["bundle"],
       },
-      handler: async (args) => {
+      handler: async (args, callerIdentity) => {
         const bundleBase64 = args.bundle as string;
         // Signature verification is always enforced; no caller override.
         // Allowing callers to skip verification was a prompt-injection footgun.
@@ -525,11 +664,24 @@ export function createReputationTools(
 
         let result;
         try {
+          // `callerIdentity` (LD3 gate fix-round-2, MUST-FIX 1): the
+          // SERVER-SET agent-session principal that performed THIS import
+          // call, threaded through as importBundle's quota-key origin — the
+          // same shape record() already uses (see ReputationStore.resolveOrigin's
+          // doc, reputation-store.ts). `reputation_import` is Tier-1
+          // (human-approved), but an approved import that omitted an origin
+          // would still pool into REPUTATION_UNKNOWN_ORIGIN correctly rather
+          // than bypassing the quota — this is not the security-critical
+          // half of the fix (importBundle enforces the cap regardless of
+          // what origin resolves to), it is attribution so repeated imports
+          // by the SAME session share one per-origin bucket rather than each
+          // falling into the shared unknown bucket.
           result = await reputationStore.importBundle(
             bundle,
             verifySignatures,
             publicKeys,
-            { allowUnverifiedLegacy: args.allow_unverified_legacy === true }
+            { allowUnverifiedLegacy: args.allow_unverified_legacy === true },
+            callerIdentity
           );
         } catch (err) {
           const invalid =
@@ -540,6 +692,15 @@ export function createReputationTools(
             err instanceof Error
               ? err.message
               : "Reputation bundle verification failed";
+          // ReputationStoreQuotaError (LD3 gate fix-round-2, MUST-FIX 1):
+          // importBundle now enforces MAX_REPUTATION_RECORDS(_PER_ORIGIN)
+          // for the WHOLE bundle atomically — a refusal here means NOTHING
+          // was imported (all-or-nothing; see importBundle's doc,
+          // reputation-store.ts). Recorded in the audit details so an
+          // operator can tell a quota refusal apart from a signature/
+          // completeness failure, both of which land in this same catch.
+          const quotaRefuseReason =
+            err instanceof ReputationStoreQuotaError ? err.reason : undefined;
 
           await auditLog.appendCritical({
             layer: "l4",
@@ -551,6 +712,9 @@ export function createReputationTools(
               invalid,
               contexts: [],
               completeness_verification: "failed",
+              ...(quotaRefuseReason !== undefined
+                ? { quota_refuse_reason: quotaRefuseReason }
+                : {}),
             },
           });
 
@@ -593,8 +757,10 @@ export function createReputationTools(
       name: "reputation_query_weighted",
       description:
         "Query reputation with sovereignty-weighted scoring. " +
-        "Attestations from verified-sovereign agents carry full weight (1.0); " +
-        "unverified attestations carry reduced weight (0.2). " +
+        "Every attestation this instance stores or imports is scored at " +
+        "self-attested (0.5) or unverified (0.2) weight; verified-sovereign " +
+        "(1.0) and verified-degraded (0.8) are not currently reachable " +
+        "through recorded or imported attestations. " +
         "Returns both the weighted score and tier distribution.",
       inputSchema: {
         type: "object",

@@ -31,7 +31,10 @@ jobs:
         run: npm ci
 
       - name: Release dependency pin check
-        run: npm run check:release-dependency-pins
+        run: |
+          npm run check:release-dependency-pins
+          npm run check:release-action-pins
+          npm run check:release-key-parity
 
       - name: Set up Python 3.12 for Concordia sidecar
         uses: actions/setup-python@v7

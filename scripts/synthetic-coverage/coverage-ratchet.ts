@@ -41,10 +41,11 @@ import type { CoverageReport, CoverageRow } from "./report.js";
 
 /** Coverage states ordered worst -> best; a move to a LOWER rank is a regression. */
 const COVERAGE_RANK: Record<CoverageRow["coverage_state"], number> = {
-  no_fixture: 0,
-  documented_gap: 1,
-  partial: 2,
-  covered: 3,
+  not_implemented: 0,
+  no_fixture: 1,
+  documented_gap: 2,
+  partial: 3,
+  covered: 4,
 };
 
 export interface CoverageBaselineRow {
@@ -83,6 +84,9 @@ export interface RatchetViolation {
 
 /** Sorted names of the PASSING fixtures in a coverage row. */
 function passingFixtureNames(row: CoverageRow): string[] {
+  if (row.coverage_state === "not_implemented") {
+    return [];
+  }
   return row.fixtures
     .filter((fixture) => fixture.passed)
     .map((fixture) => fixture.name)

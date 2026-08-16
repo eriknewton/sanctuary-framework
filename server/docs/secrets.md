@@ -37,6 +37,28 @@ sanctuary secrets audit
 
 That's the entire administrative workflow. Your skills now request tokens through the broker MCP server instead of reading from `.env`.
 
+Failure mode: the "never appears in argv" guarantee belongs to the prompt form shown
+above, and `add` also accepts the value as a second positional argument. That form is the
+one people reach for when scripting the migration, and it puts the credential in `ps aux`
+for the life of the process and in shell history permanently. The command's own help says
+so; the workflow above is where the habit gets set. For anything scripted, pipe the value
+instead: `printf %s "$VALUE" | sanctuary secrets add gmail_oauth_token`. The same
+precedence applies to `sanctuary secrets rotate`.
+
+Failure mode: `--fortress` must precede the subcommand. `sanctuary secrets list
+--fortress <path>` is refused with exit 2; write it as `sanctuary --fortress <path>
+secrets list`, or export `SANCTUARY_STORAGE_PATH` for the whole shell.
+
+The refusal was added on 2026-08-05 because `secrets` does not parse `--fortress` at
+all. Before it, `sanctuary secrets add NAME VALUE --fortress <other>` stored the
+credential in `~/.sanctuary`, left `<other>` empty, and printed `Stored secret: NAME`.
+The read verbs had the same shape, listing the default fortress's secrets under the
+other fortress's name. Both spellings (`--fortress <path>` and `--fortress=<path>`) and
+the missing-value form are refused, and the refusal returns before the broker opens, so
+no keychain is touched and nothing is written. See
+[cli-operator-verbs.md](cli-operator-verbs.md), which also notes that this refusal
+covers `secrets` only.
+
 ---
 
 ## How skills request credentials
@@ -129,6 +151,16 @@ This listens on stdio by default, add it to your harness's MCP server config the
 ```
 
 The first invocation creates the keychain (`~/Library/Keychains/sanctuary.keychain-db`) and prompts for a passphrase. Subsequent invocations use the passphrase cached by the Sanctuary wrap flow (same passphrase that protects the master key).
+
+Failure mode: that filename is the **default fortress** only. Broker storage is scoped per
+fortress: a fortress at any path other than `~/.sanctuary` gets its own keychain file named
+`sanctuary-broker-<digest>.keychain-db`, its own service name, and its own account
+namespace, where the digest derives from the fortress path. Two consequences on a
+multi-fortress host. Secrets stored under one fortress are invisible from another, which
+looks like the broker lost them rather than like you are asking the wrong fortress. And an
+operator following the path above in Keychain Access will not find the file at all, because
+it is named after a digest they have no obvious way to compute. Confirm which fortress a
+broker command targeted before concluding a secret is missing.
 
 ---
 

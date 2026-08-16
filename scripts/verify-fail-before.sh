@@ -86,20 +86,61 @@ if ! git rev-parse --verify "$BASE_REF^{commit}" >/dev/null 2>&1; then
   exit 2
 fi
 
+# INVARIANT: the source filter is a DOCUMENTATION DENYLIST, never an extension
+# allowlist, because this guard must fail closed on any file type it does not
+# recognize. Behavior under server/src is not carried by TypeScript alone: the
+# reference-plugin executables (`substrate/reference-plugin/*/bin/*.mjs`), the
+# policy templates (`principal-policy/templates/*.yaml`,
+# `substrate/reference-plugin/*/governance.yaml`), the agent-template payloads
+# (`templates/*/defaults.json`, `template.json`, `commitments.json`), the plugin
+# trust anchors (`SIGNATURE.json`, `first-party-signer.json`), the eBPF probe
+# loader (`sentinel/sentinels/ebpf/probe-loader.rs`), and the blocklist rules
+# data (`rules/blocklist.txt`, `rules/hosts-blocklist.hosts`) all change shipped
+# behavior. An allowlist of `.tsx?` drops every one of them, so a PR touching
+# only those files prints "No server/src changes" and the guard is silently off,
+# which is the failure this denylist exists to prevent: a disabled guard emits
+# no signal at all, so nobody learns it stopped running.
+#
+# Only prose is exempt, and only `.md`. `.txt` is deliberately NOT exempt: the
+# sole `.txt` under server/src is
+# `substrate/reference-plugin/blocklist/rules/blocklist.txt`, which is rules
+# data. Exempting the extension would reopen the hole on the one file that has
+# it. A new prose extension gets added here explicitly, after confirming no
+# behavior-bearing file shares it.
+#
+# The exemption exists because a docs-only edit to server/src/README.md would
+# otherwise count as a source change and make the guard demand a failing test
+# that no source change could produce. Failure mode when that drifts: the check
+# reds with "server/src changed, but no changed server/test/*.test.ts files were
+# found" on a PR that touched zero behavior. Must match the negated `paths`
+# filter in .github/workflows/verify-fail-before.yml.
+CHANGED_SRC_RAW="$(mktemp "${TMPDIR:-/tmp}/verify-fail-before-src-list.XXXXXX")"
+if ! git diff --name-only "$BASE_REF"...HEAD -- server/src > "$CHANGED_SRC_RAW"; then
+  echo "FAIL: could not inspect server/src changes between $BASE_REF and HEAD." >&2
+  rm -f "$CHANGED_SRC_RAW"
+  exit 2
+fi
+
 CHANGED_SRC=()
 while IFS= read -r changed_src; do
   [[ -z "$changed_src" ]] && continue
   CHANGED_SRC+=("$changed_src")
-done < <(git diff --name-only "$BASE_REF"...HEAD -- server/src)
+done < <(grep -vE '\.md$' "$CHANGED_SRC_RAW" || true)
+rm -f "$CHANGED_SRC_RAW"
+
+CHANGED_TESTS_RAW="$(mktemp "${TMPDIR:-/tmp}/verify-fail-before-test-list.XXXXXX")"
+if ! git diff --name-only --diff-filter=ACMR "$BASE_REF"...HEAD -- server/test > "$CHANGED_TESTS_RAW"; then
+  echo "FAIL: could not inspect server/test changes between $BASE_REF and HEAD." >&2
+  rm -f "$CHANGED_TESTS_RAW"
+  exit 2
+fi
 
 CHANGED_TESTS=()
 while IFS= read -r changed_test; do
   [[ -z "$changed_test" ]] && continue
   CHANGED_TESTS+=("$changed_test")
-done < <(
-  git diff --name-only --diff-filter=ACMR "$BASE_REF"...HEAD -- server/test \
-    | grep -E '\.test\.tsx?$' || true
-)
+done < <(grep -E '\.test\.tsx?$' "$CHANGED_TESTS_RAW" || true)
+rm -f "$CHANGED_TESTS_RAW"
 
 if [[ ${#CHANGED_SRC[@]} -eq 0 ]]; then
   echo "No server/src changes between $BASE_REF and HEAD; fail-before check not required."

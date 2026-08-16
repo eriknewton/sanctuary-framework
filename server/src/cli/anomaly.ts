@@ -48,6 +48,7 @@ import {
 import { ClassifierStateStore } from "../anomaly-detection/classifier-state-store.js";
 import { ANOMALY_SENTINEL_ID_PREFIX } from "../anomaly-detection/types.js";
 import { AuditLog } from "../operational/audit-log.js";
+import { flagValue } from "./argv.js";
 
 export interface AnomalyArgs {
   argv: string[];
@@ -153,12 +154,6 @@ function printUsage(s: NodeJS.WritableStream): void {
   classifier-state <detector-id> --classifier <id>
                                           Per-agent training state.
 `);
-}
-
-function flagValue(argv: string[], name: string): string | undefined {
-  const i = argv.indexOf(name);
-  if (i === -1) return undefined;
-  return argv[i + 1];
 }
 
 function cmdDetectors(

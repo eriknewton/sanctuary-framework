@@ -155,12 +155,18 @@ compounding errors across an agent mesh.
 **Coverage:** partial
 
 **Mechanism.**
-- **Sovereignty-gated reputation tiers** weight attestations from
-  verified-sovereign agents (tier 1.0) above self-attested (0.2) and
-  unverified (0.2) sources (`reputation/tiers.ts`).
-- **Reputation queries use tier-weighted scoring** so a claim from a
-  low-tier agent does not carry the same authority as one from a
-  handshake-verified peer.
+- **Sovereignty-gated reputation tiers** define a per-tier attestation
+  weight model: verified-sovereign (1.0) and verified-degraded (0.8) above
+  self-attested (0.5) and unverified (0.2) (`reputation/tiers.ts`).
+- **A stored or imported attestation's declared tier is clamped to
+  self-attested unconditionally at read time**, regardless of who signed
+  it, how it arrived, or which tier it declares
+  (`reputation/reputation-store.ts` `trustedSovereigntyTier`). The clamp
+  removes the privileged verified-tier weight (1.0/0.8) from any stored
+  claim, so a reputation query over stored history can never score a stored
+  attestation above self-attested; it does not lower it to unverified. The
+  privileged verified tiers are reachable only during a live, in-progress
+  sovereignty handshake, never from a stored claim.
 - **Sanctuary does NOT factually verify claims.** It only establishes
   whether the claim came from a cryptographically identified source
   with a known sovereignty posture.
@@ -169,6 +175,13 @@ compounding errors across an agent mesh.
 - No semantic cross-checking of claims between agents.
 - No content-truthfulness scoring — Sanctuary scores **provenance**,
   not **truth**.
+- Every stored or imported attestation's self-declared sovereignty tier is
+  clamped at the storage layer, unconditionally, regardless of how it
+  arrived. A verified-sovereign or verified-degraded weight is reachable
+  only through live handshake resolution against a genuine remote
+  counterparty; a stored claim of either tier is never trusted on its own.
+  Handshake-verified peer trust is tracked separately, in the federation
+  layer.
 
 ---
 

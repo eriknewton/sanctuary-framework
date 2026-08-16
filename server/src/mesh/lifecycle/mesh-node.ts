@@ -691,13 +691,17 @@ export class MeshNode {
    * to issue this - gated through the principal-policy gate at the console.
    * v0.1 mesh enforces the cryptographic invariants; the policy-gating
    * decision is the console thread's concern.
+   *
+   * Node-revoke authority invariant: a node signature only proves which node
+   * emitted the envelope. The revoke authority itself MUST come from an
+   * operator principal signature or a verified guardian quorum before anything
+   * is broadcast to peers.
    */
   async revokePeer(params: {
     target_node_id: string;
     reason: string;
     principal_private_key?: Uint8Array;
     emitter_principal?: string;
-    guardian_quorum_verified_by_ceremony?: boolean;
     quorum_signatures?: NodeRevokePayload["quorum_signatures"];
   }): Promise<SignedEvent<NodeRevokePayload>> {
     this.requireKeyed();
@@ -712,13 +716,23 @@ export class MeshNode {
       effective_at: new Date().toISOString(),
       quorum_signatures: params.quorum_signatures,
     };
+    // Pre-broadcast guardian invariant: every quorum revoke verifies its
+    // guardian signatures here, before emitLifecycleEvent can surface or
+    // broadcast the envelope. There is no trusted-caller bypass: a ceremony
+    // that verified a quorum over a broader ceremony payload has NOT obtained
+    // authorization for this revocation, because that quorum never examined
+    // this node_revoke payload. Callers present quorum signatures over THIS
+    // payload's input (recovery flows collect them via
+    // deviceRecoveryRevokeQuorumInput); receivers independently
+    // re-check node_revoke authority before any peer roster mutation.
+    if (!params.principal_private_key) {
+      this.assertNodeRevokePayloadQuorumAuthorized(payload);
+    }
     const evt = await this.emitLifecycleEvent("node_revoke", payload, {
       emitter_principal: params.emitter_principal,
       principal_private_key: params.principal_private_key,
     });
-    if (!params.guardian_quorum_verified_by_ceremony) {
-      this.assertNodeRevokeAuthorized(evt as SignedEvent<NodeRevokePayload>);
-    }
+    this.assertNodeRevokeAuthorized(evt as SignedEvent<NodeRevokePayload>);
     this.lifecycleLog.append(evt as SignedEvent<NodeLifecyclePayload>);
     this.roster.markRevoked(params.target_node_id);
     return evt as SignedEvent<NodeRevokePayload>;
@@ -1350,11 +1364,21 @@ export class MeshNode {
   private assertNodeRevokeAuthorized(
     evt: SignedEvent<NodeRevokePayload>
   ): void {
+    // Receive-path invariant: verifyOrThrow already validated peer envelopes,
+    // and local emit paths use packSignedEvent. A principal signature therefore
+    // carries revoke authority; otherwise reduce to the same guardian quorum
+    // proof used by the pre-broadcast direct path.
     if (evt.principal_signature) {
       return;
     }
 
-    const quorumSignatures = evt.payload.quorum_signatures ?? [];
+    this.assertNodeRevokePayloadQuorumAuthorized(evt.payload);
+  }
+
+  private assertNodeRevokePayloadQuorumAuthorized(
+    payload: NodeRevokePayload
+  ): void {
+    const quorumSignatures = payload.quorum_signatures ?? [];
     if (quorumSignatures.length === 0) {
       throw new MeshError(
         "node_revoke denied: missing operator principal signature or guardian quorum"
@@ -1385,12 +1409,16 @@ export class MeshNode {
       signatures,
     };
     verifyGuardianQuorum({
-      input: this.nodeRevokeQuorumInput(evt.payload),
+      input: this.nodeRevokeQuorumInput(payload),
       proof,
       pinned_roster: this.guardianRoster,
     });
   }
 
+  // Canonical quorum-input bytes for a node_revoke. Must match
+  // `revokeQuorumInput` in `../recovery-flows/node-revoke.ts` byte-for-byte:
+  // ceremony producers sign that builder's output, and this verifier (both
+  // the pre-broadcast gate and every receiver) recomputes the same bytes here.
   private nodeRevokeQuorumInput(
     payload: NodeRevokePayload
   ): MasterRotationQuorumInput {

@@ -1,3 +1,4 @@
+// fail-before-exempt: storagePath was added to existing unmounted-route binding harnesses; stop-button enforcement is covered by agent-stop, egress, and castle-wall-agent-controller tests.
 /**
  * Wire-unmounted-routes (2026-06-29) — auth-gate regression suite.
  *
@@ -132,6 +133,7 @@ async function startRig(): Promise<TestRig> {
       identityId: IDENTITY_ID,
       fortressId,
       auditLog,
+      storagePath: FORTRESS_STORAGE_PATH,
       // storage + masterKey trigger the anomaly + english-policy bindings.
       storage,
       masterKey,
@@ -328,6 +330,7 @@ describe("wire-unmounted-routes — bindings absent: match-then-auth-then-503 (n
         identityId: IDENTITY_ID,
         fortressId: fortressIdFromStoragePath(FORTRESS_STORAGE_PATH),
         auditLog,
+        storagePath: FORTRESS_STORAGE_PATH,
       }),
     );
     await dashboard.start();

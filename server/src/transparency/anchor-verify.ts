@@ -66,9 +66,22 @@ import {
 
 export const TRANSPARENCY_ANCHORS_EXPORT_FORMAT =
   "SANCTUARY_TRANSPARENCY_ANCHORS_V1";
+// These two must match `TRANSPARENCY_ANCHOR_SCHEMA_VERSION` and
+// `TRANSPARENCY_ANCHOR_COMMITMENT_DOMAIN` in `transparency/anchor.ts`; so must
+// the commitment preimage this file rebuilds at the recompute site below.
+// Re-typed rather than imported for a concrete reason: `anchor.ts` imports
+// `core/key-derivation.ts` (it derives the anchoring signing key), which an
+// offline verifier holding no master key must never pull in.
+// Enforced by `server/test/structure/cross-file-contract-pins.test.ts`.
 const ANCHOR_SCHEMA_VERSION = 1;
 const ANCHOR_COMMITMENT_DOMAIN = "sanctuary.transparency.anchor-commitment.v1";
-/** SPKI DER prefix for an uncompressed P-256 public point (65 bytes). */
+/**
+ * SPKI DER prefix for an uncompressed P-256 public point (65 bytes).
+ * Must match the prefix `anchorPublicKeyPem` prepends in
+ * `transparency/anchor.ts`; that function is the producer of every PEM this
+ * one parses. 26 prefix bytes (id-ecPublicKey + prime256v1 + BIT STRING
+ * header) + 65 point bytes = the 91-byte DER length checked below.
+ */
 const SPKI_P256_PREFIX_HEX =
   "3059301306072a8648ce3d020106082a8648ce3d030107034200";
 /** Signed-note signature-line prefix (EM DASH, space) per the note format. */
@@ -389,6 +402,8 @@ export function parseSignedNote(note: string): ParsedSignedNote | null {
   } catch {
     return null;
   }
+  // 32 = a SHA-256 digest (256 bits / 8), the Merkle root width in the
+  // checkpoint note. NOT a key length despite being the same number.
   if (rootHash.length !== 32) return null;
   const signatureBlobs: Uint8Array[] = [];
   for (const line of note.slice(separator + 2).split("\n")) {
@@ -884,6 +899,9 @@ function checkAnchoredReceipt(input: {
       // 2b. UUID binding: the entry UUID's leaf-hash part must recompute
       // from the body bytes (RFC 6962 leaf hashing).
       leafHashHex = bytesToHex(rfc6962LeafHash(bodyBytes));
+      // 64 = the hex character count of a SHA-256 leaf hash (32 bytes * 2).
+      // Rekor UUIDs may carry a tree-id prefix, so the leaf part is the LAST 64
+      // hex characters; a shorter uuid is used whole and fails `HEX64` below.
       const uuidLeaf =
         material.uuid.length >= 64 ? material.uuid.slice(-64) : material.uuid;
       if (!HEX64.test(uuidLeaf) || uuidLeaf !== leafHashHex) {

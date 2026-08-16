@@ -353,6 +353,9 @@ export interface BuiltProvisionBundle {
 export function buildOperatorCloudProvisionBundle(
   params: BuildProvisionBundleParams,
 ): BuiltProvisionBundle {
+  // 32 = 256-bit symmetric secrets. `nodeJoinProofKey` keys the HMAC-SHA-256
+  // join proof; `deliveryKey` is the AES-256 key the scoped secret is encrypted
+  // under. Neither is asymmetric material, so `ED25519_*` does not apply.
   if (params.nodeJoinProofKey.length !== 32) {
     throw new Error("node_join_proof_key must be 32 bytes");
   }

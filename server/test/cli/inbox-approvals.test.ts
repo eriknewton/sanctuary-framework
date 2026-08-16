@@ -6,6 +6,7 @@ import { join } from "node:path";
 
 import { runInboxCommand } from "../../src/cli/inbox.js";
 import { writeLockdownStatus } from "../../src/lockdown/status.js";
+import { writeTenantRuntime } from "../../src/cli/agents/runtime.js";
 
 class StringWritable extends Writable {
   chunks: string[] = [];
@@ -184,6 +185,38 @@ describe("sanctuary inbox approvals CLI", () => {
     ]);
   });
 
+  it("routes --fortress=<path> through that fortress runtime", async () => {
+    const scopedFortress = await mkdtemp(join(tmpdir(), "sanctuary-inbox-scoped-"));
+    try {
+      await writeTenantRuntime(scopedFortress, {
+        version: "test",
+        pid: process.pid,
+        started_at: new Date().toISOString(),
+        dashboard_host: "127.0.0.1",
+        dashboard_port: 3910,
+        mode: "standalone",
+      });
+      const fetchSpy = vi.fn(async (url: string | URL) => {
+        expect(String(url)).toBe("http://127.0.0.1:3910/api/hub/inbox");
+        return okJson({ ok: true, data: { items } });
+      });
+      globalThis.fetch = fetchSpy as unknown as typeof globalThis.fetch;
+
+      const { code, err } = await run([
+        "approvals",
+        "list",
+        "--json",
+        `--fortress=${scopedFortress}`,
+      ]);
+
+      expect(code).toBe(0);
+      expect(err.text).toBe("");
+      expect(fetchSpy).toHaveBeenCalledOnce();
+    } finally {
+      await rm(scopedFortress, { recursive: true, force: true });
+    }
+  });
+
   it("approvals approve <id> transitions the item out of pending approval", async () => {
     installInboxFetch();
 
@@ -208,7 +241,7 @@ describe("sanctuary inbox approvals CLI", () => {
 
     expect(code).toBe(0);
     expect(out.text).toContain(
-      "Fortress is LOCKED (since 2026-05-19T12:00:00.000Z). Reads permitted; writes blocked.",
+      "Fortress lockdown active since 2026-05-19T12:00:00.000Z. Confined agents' network access was revoked; local reads and writes are not blocked by this marker.",
     );
     expect(out.text).toContain("approval-1");
   });

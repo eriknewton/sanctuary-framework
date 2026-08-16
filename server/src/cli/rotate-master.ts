@@ -42,6 +42,7 @@ import {
   writeRecoveryKeyFile,
   type DisclosureIo,
 } from "../wrap/recovery-key-disclosure.js";
+import { consumeFlagValue } from "./argv.js";
 
 export interface RotateMasterCliArgs {
   argv: string[];
@@ -63,14 +64,20 @@ interface ParsedArgs {
 
 function parseArgs(argv: string[]): ParsedArgs {
   const out: ParsedArgs = { resume: false, help: false };
-  for (let i = 0; i < argv.length; i++) {
-    const a = argv[i];
+  // Must match consumeFlagValue in ./argv.ts: a dropped --fortress/--storage value must refuse, never silently resolve the default fortress; wrong-fortress custody operations are a constraint-5 violation.
+  const fortress = consumeFlagValue(argv, "--fortress");
+  if (fortress.error !== undefined) throw new Error(fortress.error);
+  const storage = consumeFlagValue(fortress.argv, "--storage");
+  if (storage.error !== undefined) throw new Error(storage.error);
+  const storageValue = storage.value ?? fortress.value;
+  if (storageValue !== undefined) out.storage = storageValue;
+
+  for (let i = 0; i < storage.argv.length; i++) {
+    const a = storage.argv[i];
     if (a === "--help" || a === "-h") out.help = true;
     else if (a === "--resume") out.resume = true;
-    else if ((a === "--fortress" || a === "--storage") && argv[i + 1]) {
-      out.storage = argv[++i];
-    } else if (a === "--recovery-out") {
-      out.recoveryOut = readRequiredPathArg(argv, i, "--recovery-out");
+    else if (a === "--recovery-out") {
+      out.recoveryOut = readRequiredPathArg(storage.argv, i, "--recovery-out");
       i++;
     } else if (a && a.startsWith("--")) {
       throw new Error(`Unknown flag: ${a}`);

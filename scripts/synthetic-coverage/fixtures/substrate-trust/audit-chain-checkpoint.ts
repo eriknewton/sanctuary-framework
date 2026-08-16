@@ -27,6 +27,18 @@ import {
 // Existing mirrors: server/test/operational/audit-log-chain.test.ts and
 // server/test/audit/external-verifier-drill.test.ts.
 // ASSURANCE_MATRIX row: 4, Tamper-evident audit chain.
+//
+// HONEST BOUND, do not read these fixtures as evidence of a shipped path.
+// The signed-checkpoint fixtures below construct AuditLog with an explicit
+// `checkpointSigner` (see makeCheckpointSigner and its two call sites). No
+// production `new AuditLog(...)` site in server/src supplies that dependency,
+// so every checkpoint on a real install persists `signature: null,
+// unsigned: true` and both verifiers skip the signature leg. What these
+// fixtures exercise is the checkpoint FORMAT and the verifier's behavior when a
+// signer IS present; they do not exercise any code path an operator runs.
+// Open defect: IC-05.
+// Deleting the injected signer here would not fix that; the fix is to supply a
+// signer at the production construction sites.
 
 async function appendCritical(log: AuditLog, operation: string): Promise<void> {
   await log.appendCritical({

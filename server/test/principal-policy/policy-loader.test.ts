@@ -67,6 +67,8 @@ approval_channel:
         "castle_wall_observe_promote",
         "enforcement_export_enabled",
         "memory_checkpoint_restore",
+        "memory_archive_export",
+        "memory_archive_import",
       ]);
       expect(policy.tier2_anomaly.new_namespace_access).toBe("approve");
       expect(policy.tier2_anomaly.new_counterparty).toBe("log");
@@ -112,6 +114,34 @@ approval_channel:
         expect(policy.tier1_always_approve).toContain(op);
         expect(policy.tier3_always_allow).not.toContain(op);
       }
+    });
+
+    it("accepts dashboard as an explicit approval channel type", () => {
+      const yaml = `
+version: 1
+tier1_always_approve:
+  - state_export
+approval_channel:
+  type: dashboard
+  timeout_seconds: 120
+`;
+      const policy = parsePolicy(yaml);
+      expect(policy.approval_channel.type).toBe("dashboard");
+      expect(policy.approval_channel.timeout_seconds).toBe(120);
+    });
+
+    it("rejects unknown approval channel types instead of silently defaulting", () => {
+      const yaml = `
+version: 1
+tier1_always_approve:
+  - state_export
+approval_channel:
+  type: sms
+  timeout_seconds: 120
+`;
+      expect(() => parsePolicy(yaml)).toThrow(
+        /approval_channel\.type must be "stderr", "webhook", "callback", or "dashboard"/,
+      );
     });
 
     it("migrates context-gate mutation tools out of Tier 3 on upgrade", () => {
@@ -220,6 +250,8 @@ approval_channel:
         "castle_wall_observe_promote",
         "enforcement_export_enabled",
         "memory_checkpoint_restore",
+        "memory_archive_export",
+        "memory_archive_import",
       ]);
     });
 
@@ -251,6 +283,8 @@ approval_channel:
         "castle_wall_observe_promote",
         "enforcement_export_enabled",
         "memory_checkpoint_restore",
+        "memory_archive_export",
+        "memory_archive_import",
       ]);
       // Tier 2 should have defaults
       expect(policy.tier2_anomaly.frequency_spike_multiplier).toBe(5);
@@ -295,6 +329,8 @@ approval_channel:
         "castle_wall_observe_promote",
         "enforcement_export_enabled",
         "memory_checkpoint_restore",
+        "memory_archive_export",
+        "memory_archive_import",
       ]);
       expect(policy.tier2_anomaly.new_namespace_access).toBe("log");
       expect(policy.tier2_anomaly.frequency_spike_multiplier).toBe(8);

@@ -54,6 +54,16 @@ import { basename, isAbsolute, join } from "node:path";
 
 import type { AllowlistRule } from "../castle-wall/allowlist/schema.js";
 import { validateExclusiveEgressGatePolicy } from "../castle-wall/allowlist/gate-derivation.js";
+// The account-name contract is single-sourced: the safe charset and the
+// reserved privileged names this renderer refuses come from the zero-import
+// policy module every refusal site consumes, so this plist renderer stays
+// dependency-light (the module has zero dependency edges, test-enforced) while a stale local copy of
+// the list is impossible by construction. Enforced by
+// `server/test/structure/cross-file-contract-pins.test.ts`.
+import {
+  RESERVED_ACCOUNT_NAMES,
+  SAFE_SERVICE_ACCOUNT_RE,
+} from "../castle-wall/provision/account-name-policy.js";
 import {
   startExclusiveEgressGate,
   type ExclusiveEgressGateHandle,
@@ -170,7 +180,6 @@ export function parseEgressGateRuntimeState(text: string, path: string): EgressG
   };
 }
 
-const SAFE_ACCOUNT_RE = /^[a-z_][a-z0-9._-]{0,63}$/;
 const GATE_DAEMON_LOG_DIR_NAME = "logs";
 
 function xmlEscape(value: string): string {
@@ -216,7 +225,7 @@ export function gateDaemonLogDirForHome(input: {
   gateAccount: string;
   gateHomeDirectory: string;
 }): string {
-  if (!SAFE_ACCOUNT_RE.test(input.gateAccount)) {
+  if (!SAFE_SERVICE_ACCOUNT_RE.test(input.gateAccount)) {
     throw new Error(`gate account name is not a safe service-account name (got ${JSON.stringify(input.gateAccount)})`);
   }
   if (!isAbsolute(input.gateHomeDirectory)) {
@@ -261,11 +270,17 @@ export function egressGateDaemonLogPaths(input: {
  */
 export function renderEgressGateDaemonPlist(options: EgressGateDaemonPlistOptions): string {
   const label = egressGateDaemonLabel(options.agentUid);
-  if (!SAFE_ACCOUNT_RE.test(options.gateAccount)) {
+  if (!SAFE_SERVICE_ACCOUNT_RE.test(options.gateAccount)) {
     throw new Error(`gate account name is not a safe service-account name (got ${JSON.stringify(options.gateAccount)})`);
   }
-  if (["root", "_root", "daemon", "wheel"].includes(options.gateAccount)) {
-    throw new Error(`refusing to render an egress-gate daemon running as "${options.gateAccount}" (the gate is TCB but must never hold root)`);
+  // INVARIANT: the gate is inside the TCB but must hold no privilege of its
+  // own. A privileged UserName -- root, or an `admin` account, which on macOS
+  // conventionally carries sudo -- could rewrite the gate policy this daemon
+  // loads and enforces, so the confinement would be self-revocable. The wall
+  // also classifies flows by ruid, so a shared privileged uid erases the
+  // per-agent attribution the gate exists to produce.
+  if (RESERVED_ACCOUNT_NAMES.has(options.gateAccount)) {
+    throw new Error(`refusing to render an egress-gate daemon running as "${options.gateAccount}" (the gate is TCB but must never hold root or any other privileged account)`);
   }
   if (options.programArguments.length === 0 || !isAbsolute(options.programArguments[0]!)) {
     throw new Error("gate daemon programArguments must be non-empty with an absolute program path first");

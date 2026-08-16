@@ -188,10 +188,12 @@ describe("Intelligence panel — CCCC first-load render + substrate-missing word
     const client = getClientScript();
     // The client must NOT surface the raw "unauthorized" string from the
     // auth middleware as the loadError. Instead, it must provide an
-    // actionable message naming the auth issue and how to fix it.
+    // actionable message naming the auth issue and a fortress override form
+    // the top-level CLI dispatcher actually honors.
     expect(client).toContain("e.status === 401");
     expect(client).toContain("Dashboard authentication required");
-    expect(client).toContain("sanctuary dashboard --fortress");
+    expect(client).toContain("sanctuary --fortress <path> dashboard");
+    expect(client).not.toContain("sanctuary dashboard --fortress");
   });
 
   it("pre-fix code path (substrate-missing showing raw 'unauthorized') no longer fires", () => {

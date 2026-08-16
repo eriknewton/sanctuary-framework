@@ -6,7 +6,10 @@
 // heartbeat re-broadcasts the REMAINING seconds; on expiry it broadcasts
 // `ttl_seconds: 0`. The Swift extension MUST treat a received zero as
 // "expire now" so `failOpenReason() == "ttl_expired"` and the flow engine
-// fails OPEN (`fail_open_deadman`, brick-prevention). The TS half of that
+// fails OPEN for positively classified OPERATOR traffic only
+// (`fail_open_deadman`, brick-prevention/recovery); agent and unattributed
+// traffic fails CLOSED during a stale lease (`fail_closed_deadman_agent`,
+// AR-1). The TS half of that
 // contract has deterministic coverage; before this suite the Swift half was
 // verified only by inspection. These tests lock the wire decode (`ttl_seconds`
 // present-zero, not nil) and the ArmLease expiry semantics with an injected

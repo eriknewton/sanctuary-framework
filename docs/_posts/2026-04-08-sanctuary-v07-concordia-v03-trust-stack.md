@@ -3,7 +3,7 @@ layout: post
 title: "Sanctuary v0.7.0 + Concordia v0.3.0: The Trust Stack for Managed Agents"
 date: 2026-04-08
 author: Erik Newton
-description: "Anthropic launched Managed Agents today. Same day, Sanctuary v0.7.0 (67 MCP tools, 1071 tests, SIEM export) and Concordia v0.3.0 (56 tools, agent discovery) ship the trust layer that managed platforms don't."
+description: "Anthropic launched Managed Agents today. Same day, Sanctuary v0.7.0 (SIEM export, wildcard context gates) and Concordia v0.3.0 (agent discovery) ship the trust layer that managed platforms don't."
 image: /images/blog/trust-stack.jpg
 archive_note: "Predates Mantle vocabulary canonicalization on 2026-05-15. Terminology in this post may refer to install-time-binding concepts using earlier language; current canonical vocabulary lives at https://github.com/eriknewton/newton-wiki/blob/main/concepts/mantle.md."
 claims_era_note: true
@@ -26,7 +26,7 @@ Managed Agents has no agent identity standard. No encrypted audit trails. No sov
 
 ## What Shipped
 
-**Sanctuary v0.7.0** is live on npm. 67 MCP tools, 1,071 passing tests. This release removes the `sanctuary/` prefix from all tool names (fixing OpenClaw double-mangling), adds CEF/OCSF SIEM export for Splunk, Datadog, and Chronicle, and introduces wildcard context gates. The full stack: sovereign identity via Ed25519 + W3C DIDs, encrypted hash-chained audit trails, tiered principal policy with approval gates, model provenance tracking, injection detection, and Sovereignty Health Reports that map directly to NIST AI RMF and EU AI Act Article 19.
+**Sanctuary v0.7.0** is live on npm. This release removes the `sanctuary/` prefix from all tool names (fixing OpenClaw double-mangling), adds CEF/OCSF SIEM export for Splunk, Datadog, and Chronicle, and introduces wildcard context gates. Current Sanctuary releases expose 80+ MCP tools. The full stack: sovereign identity via Ed25519 + W3C DIDs, encrypted hash-chained audit trails, tiered principal policy with approval gates, model provenance tracking, injection detection, and Sovereignty Health Reports that map directly to NIST AI RMF and EU AI Act Article 19.
 
 ```bash
 npm install @sanctuary-framework/mcp-server

@@ -87,6 +87,11 @@ export interface ProvisionFlowContext {
   /** Pre-answers the CHOICE only (fix L2): still confirms on a TTY, still plan-and-prints. */
   preAnsweredProvision?: boolean;
   /**
+   * Explicit agent-delegated install authorization. The plan is still printed,
+   * root is still required, and this only replaces the stdin-TTY confirmation.
+   */
+  agentGuided?: boolean;
+  /**
    * Bug B (one-flow gap): absolute fortress path whose Castle Wall POLICY daemon
    * the flow must ensure is reachable BEFORE arming. Passed to
    * `ops.ensurePolicyDaemon`, and `ops.arm`/`ops.disarm` target the SAME fortress
@@ -1620,7 +1625,7 @@ async function runProvisionFlowSteps(
   // cooperative wrap itself still complete; this function just reports that
   // provisioning was skipped so the caller knows to print the
   // "cooperative-only, re-run interactively" message.
-  if (!ctx.isTty) {
+  if (!ctx.isTty && ctx.agentGuided !== true) {
     return {
       kind: "skipped-non-tty-cooperative-only",
       reason:
@@ -1680,7 +1685,15 @@ async function runProvisionFlowSteps(
     );
   }
 
-  const proceed = await ops.confirm("Proceed with account creation and arming? [y/N] ");
+  if (ctx.agentGuided === true) {
+    ops.print(
+      "Agent-guided install explicitly delegated: proceeding after plan-print without an stdin prompt; sudo/root authorization remains required.",
+    );
+  }
+  const proceed =
+    ctx.agentGuided === true
+      ? true
+      : await ops.confirm("Proceed with account creation and arming? [y/N] ");
   if (!proceed) {
     return { kind: "declined-by-operator" };
   }
@@ -2323,15 +2336,32 @@ async function runProvisionFlowSteps(
   // create a false "functional through the wall" result.
   const operatorTwin = await ops.standDownOperatorTwin();
   if (!operatorTwin.ok) {
+    const baseReason =
+      `the operator-side agent LaunchAgent could not be stopped and disabled after the wall armed ` +
+      `(${operatorTwin.error}). Liveness was NOT checked, because the unconfined twin may still be able to answer.`;
+    let nePreferenceOutcome: DisarmNePreferenceOutcome;
+    let disarmObservedOff: Observed<true> | undefined;
+    try {
+      const disarmResult = await observeDisarmObservedOff(ops);
+      nePreferenceOutcome = disarmResult.nePreferenceOutcome;
+      disarmObservedOff = disarmResult.disarmObservedOff;
+    } catch (disarmErr) {
+      return {
+        kind: "armed-rollback-failed",
+        uid,
+        reason: baseReason,
+        disarmError: (disarmErr as Error).message,
+      };
+    }
+    const restoreNote = await restoreEgressBestEffort(ops, egressProvisionedThisRun);
     return {
-      kind: "aborted",
-      stage: "operator-twin-stand-down",
+      kind: "armed-then-rolled-back",
+      uid,
       reason:
-        `the operator-side agent LaunchAgent could not be stopped and disabled after the wall armed ` +
-        `(${operatorTwin.error}). Liveness was NOT checked, because the unconfined twin may still be able to answer.`,
-      rolledBack: false,
-      rehomeAttempted: true,
-      accountCreated,
+        `${baseReason} Fast-disarmed rather than leave enforcement active while the twin state is unresolved.` +
+        egressRestoreReasonSuffix(restoreNote),
+      disarmOutcome: nePreferenceOutcome,
+      disarmObservedOff,
     };
   }
   operatorTwinStandDown.snapshot = operatorTwin.snapshot;

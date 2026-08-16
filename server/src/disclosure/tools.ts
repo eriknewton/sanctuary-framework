@@ -14,7 +14,11 @@ import {
 import {
   evaluateDisclosure,
   PolicyStore,
+  validatePolicyInput,
+  resolvePolicyOrigin,
+  MAX_DISCLOSURE_POLICIES_PER_ORIGIN,
   type DisclosureRule,
+  type PolicyWriteRefuseReason,
 } from "./policies.js";
 import type { StorageBackend } from "../storage/interface.js";
 import type { AuditLog } from "../operational/audit-log.js";
@@ -26,6 +30,47 @@ import {
   createRangeProof,
   verifyRangeProof,
 } from "./zk-proofs.js";
+
+/**
+ * Human-facing refusal message for a `PolicyStore.create` / `update`
+ * failure (LD3, rule 8). Kept next to the tool handler rather than in
+ * policies.ts because the message is agent-facing product copy, not
+ * storage logic — see AGENTS.md's forward-documentation rule on MCP tool
+ * `description`/response text.
+ */
+function policyWriteErrorMessage(reason: PolicyWriteRefuseReason): string {
+  switch (reason) {
+    case "origin_quota":
+      return (
+        `This session already has ${MAX_DISCLOSURE_POLICIES_PER_ORIGIN} disclosure ` +
+        "policies. Pass an existing policy_id to update it in place instead of " +
+        "creating a new one."
+      );
+    case "capacity":
+      return "Disclosure policy store is at capacity; cannot create a new policy right now.";
+    case "audit_unavailable":
+      return (
+        "Disclosure policy store needed to evict an entry to admit this one, " +
+        "but the durable audit write for that eviction failed or did not " +
+        "complete in time; retry once the audit log recovers."
+      );
+    case "admission_busy":
+      return (
+        "Disclosure policy store's admission queue is momentarily saturated " +
+        "with other concurrent policy writes; retry shortly."
+      );
+    case "not_found":
+      return "No disclosure policy found with that policy_id.";
+    case "forbidden":
+      return "That policy_id belongs to a different session and cannot be updated from this one.";
+    case "quota_state_unavailable":
+      return (
+        "Disclosure policy quota state unavailable, retry: the store could " +
+        "not confirm the full set of persisted policies, so this write was " +
+        "refused rather than risk exceeding the policy cap."
+      );
+  }
+}
 
 export function createDisclosureTools(
   storage: StorageBackend,
@@ -117,6 +162,7 @@ export function createDisclosureTools(
         const value = args.value as string;
         const blindingFactor = args.blinding_factor as string;
 
+        // The reveal result comes only from recomputing the commitment, not from caller-provided validity metadata.
         const valid = verifyCommitment(commitment, value, blindingFactor);
 
         void auditLog.append("l3", "proof_reveal", "system", {
@@ -187,23 +233,78 @@ export function createDisclosureTools(
             type: "string",
             description: "Optional identity this policy is bound to",
           },
+          policy_id: {
+            type: "string",
+            description:
+              "Optional: id of an existing policy created by THIS session to " +
+              "update in place (replaces its rules without minting a new id " +
+              "or consuming a new policy slot). Omit to create a new policy; " +
+              "an id belonging to a different session is refused.",
+          },
         },
         required: ["policy_name", "rules", "default_action"],
       },
-      handler: async (args) => {
+      // `callerIdentity` (router.ts, MUST-FIX 1 spine): the SERVER-SET
+      // agent-session principal, never a caller-supplied field — this is
+      // the quota origin for the per-session cap below (LD3, rule 8).
+      handler: async (args, callerIdentity) => {
         const policyName = args.policy_name as string;
         const rules = args.rules as DisclosureRule[];
         const defaultAction = args.default_action as
           | "withhold"
           | "ask-principal";
         const identityId = args.identity_id as string | undefined;
+        const existingPolicyId = args.policy_id as string | undefined;
 
-        const policy = await policyStore.create(
-          policyName,
-          rules,
-          defaultAction,
-          identityId
-        );
+        // Bound the caller-supplied payload BEFORE it can occupy a quota
+        // slot or reach storage (rule 8: bounded rule COUNT and bounded
+        // per-rule STRING sizes, not just a count on the policy store).
+        const validation = validatePolicyInput(policyName, rules);
+        if (!validation.ok) {
+          void auditLog.append(
+            "l3",
+            "disclosure_set_policy",
+            identityId ?? "system",
+            { error: validation.error },
+            "failure"
+          );
+          return toolResult({ error: validation.error });
+        }
+
+        const origin = resolvePolicyOrigin(callerIdentity);
+        const result = existingPolicyId
+          ? await policyStore.update(
+              existingPolicyId,
+              policyName,
+              rules,
+              defaultAction,
+              identityId,
+              origin
+            )
+          : await policyStore.create(
+              policyName,
+              rules,
+              defaultAction,
+              identityId,
+              origin
+            );
+
+        if (!result.ok) {
+          void auditLog.append(
+            "l3",
+            "disclosure_set_policy",
+            identityId ?? "system",
+            {
+              reason: result.reason,
+              caller_identity: origin,
+              policy_id: existingPolicyId,
+            },
+            "failure"
+          );
+          return toolResult({ error: policyWriteErrorMessage(result.reason) });
+        }
+
+        const policy = result.policy;
 
         await auditLog.appendCritical({
           layer: "l3",
@@ -214,6 +315,7 @@ export function createDisclosureTools(
             policy_id: policy.policy_id,
             policy_name: policyName,
             rules_count: rules.length,
+            mode: existingPolicyId ? "update" : "create",
           },
         });
 
@@ -335,6 +437,7 @@ export function createDisclosureTools(
         const value = args.value as number;
 
         if (!Number.isInteger(value)) {
+          // Numeric commitments require integer scalars; fractional input is refused before it can become proof material.
           return toolResult({ error: "Value must be an integer." });
         }
 
@@ -389,7 +492,7 @@ export function createDisclosureTools(
         const blindingFactor = args.blinding_factor as string;
         const commitment = args.commitment as string;
 
-        // Verify the commitment first
+        // Verify the commitment first; no proof is minted unless the value and blinding factor open this exact commitment.
         if (!verifyPedersenCommitment(commitment, value, blindingFactor)) {
           return toolResult({
             error: "The provided value and blinding factor do not match the commitment.",
@@ -428,6 +531,7 @@ export function createDisclosureTools(
       handler: async (args) => {
         const proof = args.proof as Parameters<typeof verifyProofOfKnowledge>[0];
 
+        // Verification recomputes the Fiat-Shamir transcript; a proof's embedded fields do not self-certify validity.
         const valid = verifyProofOfKnowledge(proof);
 
         void auditLog.append("l3", "zk_verify", "system", {
@@ -520,6 +624,7 @@ export function createDisclosureTools(
       handler: async (args) => {
         const proof = args.proof as Parameters<typeof verifyRangeProof>[0];
 
+        // Range verification requires both lower and upper decompositions; the claimed min/max alone never proves inclusion.
         const valid = verifyRangeProof(proof);
 
         void auditLog.append("l3", "zk_range_verify", "system", {

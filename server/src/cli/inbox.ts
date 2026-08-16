@@ -1,6 +1,7 @@
 import { readTenantRuntime } from "./agents/runtime.js";
 import { dashboardRequest } from "./dashboard-request.js";
 import { lockdownBanner, readLockdownStatus } from "../lockdown/status.js";
+import { consumeFlagValue, flagValue, unknownFlagWithPrefix } from "./argv.js";
 
 export interface InboxCliArgs {
   argv: string[];
@@ -323,27 +324,30 @@ async function resolveContext(
   argv: string[],
   err: NodeJS.WritableStream,
 ): Promise<InboxCliContext | null> {
-  const fortressIdx = argv.indexOf("--fortress");
-  if (fortressIdx < 0) {
+  const unknownFortressFlag = unknownFlagWithPrefix(argv, "--fortress");
+  if (unknownFortressFlag) {
+    err.write(`inbox unknown fortress flag ${unknownFortressFlag}\n`);
+    return null;
+  }
+  const parsed = consumeFlagValue(argv, "--fortress");
+  if (parsed.error) {
+    err.write(`inbox ${parsed.error}\n`);
+    return null;
+  }
+  if (parsed.value === undefined) {
     return {
-      argv,
+      argv: parsed.argv,
       fortressPath:
         process.env.SANCTUARY_STORAGE_PATH ?? process.env.SANCTUARY_FORTRESS_PATH,
     };
   }
-  const fortress = argv[fortressIdx + 1];
-  if (!fortress) {
-    err.write("inbox --fortress requires a path\n");
-    return null;
-  }
-  const filtered = [...argv];
-  filtered.splice(fortressIdx, 2);
+  const fortress = parsed.value;
   const runtime = await readTenantRuntime(fortress);
   if (!runtime) {
     throw new Error(`no readable runtime.json for fortress ${fortress}`);
   }
   return {
-    argv: filtered,
+    argv: parsed.argv,
     dashboardUrl: `http://${runtime.dashboard_host}:${runtime.dashboard_port}`,
     fortressPath: fortress,
   };
@@ -452,10 +456,4 @@ function setFlag(
 
 function hasFlag(argv: string[], flag: string): boolean {
   return argv.includes(flag);
-}
-
-function flagValue(argv: string[], flag: string): string | null {
-  const idx = argv.indexOf(flag);
-  if (idx < 0 || idx + 1 >= argv.length) return null;
-  return argv[idx + 1] ?? null;
 }

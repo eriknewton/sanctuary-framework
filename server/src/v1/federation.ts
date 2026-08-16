@@ -67,7 +67,11 @@ import type {
   JoinRequest,
 } from "../mesh/lifecycle/types.js";
 import type { V1SessionClaims } from "./session-service.js";
-import { canonicalJson, verifyOperatorSignature } from "./operator-signed.js";
+import {
+  canonicalJson,
+  includeOperatorAuthorizationFields,
+  verifyAndConsumeOperatorAuthorization,
+} from "./operator-signed.js";
 import {
   writeJson,
   readJsonBody,
@@ -92,6 +96,10 @@ import {
   evaluateGuardianRevocationSignOff,
   type GuardianRevocationRequirement,
 } from "./federation-revocation-guardian-gate.js";
+import {
+  ED25519_PUBLIC_KEY_BYTES,
+  ED25519_SIGNATURE_BYTES,
+} from "../core/crypto-suite-registry.js";
 
 const NODE_MODES: readonly NodeMode[] = [
   "local",
@@ -417,7 +425,7 @@ export class JoinCeremony {
     // 5. node_pubkey must be a well-formed Ed25519 key.
     try {
       const key = fromBase64url(request.node_pubkey);
-      if (key.length !== 32) {
+      if (key.length !== ED25519_PUBLIC_KEY_BYTES) {
         return { approved: false, denialReason: "node_pubkey is not a 32-byte key" };
       }
     } catch {
@@ -564,6 +572,18 @@ export interface V1FederationDeps {
   setEnabled(enabled: boolean): void | Promise<void>;
   /** Operator identity public key for OPERATOR_SIGNED gating (PR-A2 parity). */
   resolveOperatorPublicKey(): Uint8Array | null;
+  /**
+   * Consume one verified OPERATOR_SIGNED authorization before its effect runs.
+   * Implementations must durably persist the replay key and fail closed on a
+   * write failure; returning "replayed" refuses an already-spent nonce.
+   */
+  consumeOperatorAuthorization(params: {
+    replayKey: string;
+    action: string;
+    authorizationNonce: string;
+    expiresAt: string;
+    operatorPublicKey: Uint8Array;
+  }): Promise<"consumed" | "replayed">;
   audit: FederationAudit;
   /** Joined node ids, for the status roster summary. */
   rosterNodeIds(): string[];
@@ -902,29 +922,6 @@ function handleStatus(deps: V1FederationDeps, res: ServerResponse): void {
   });
 }
 
-/**
- * Verify the inline OPERATOR_SIGNED signature over a federation admin payload.
- * Returns true only when an operator identity is configured AND the signature
- * verifies; otherwise false (the caller maps false to the generic 403, no
- * distinguishable reason - same contract as the agents write path).
- */
-function verifyOperator(
-  deps: V1FederationDeps,
-  action: string,
-  payload: Record<string, unknown>,
-  signature: unknown,
-): boolean {
-  if (typeof signature !== "string" || signature.length === 0) return false;
-  const operatorPublicKey = deps.resolveOperatorPublicKey();
-  if (!operatorPublicKey) return false; // fail closed: no operator identity
-  return verifyOperatorSignature({
-    action,
-    payload,
-    signature,
-    operatorPublicKey,
-  });
-}
-
 async function handleEnableDisable(
   deps: V1FederationDeps,
   req: IncomingMessage,
@@ -945,15 +942,26 @@ async function handleEnableDisable(
   };
   const signedPayload: Record<string, unknown> = {};
   if (typeof idempotency_key === "string") signedPayload.idempotency_key = idempotency_key;
+  includeOperatorAuthorizationFields(signedPayload, body as Record<string, unknown>);
 
-  if (!verifyOperator(deps, action, signedPayload, operator_signature)) {
+  const authorization = await verifyAndConsumeOperatorAuthorization(
+    deps,
+    action,
+    signedPayload,
+    operator_signature,
+  );
+  if (!authorization.ok) {
     await deps.audit({
       operation,
       result: "failure",
       identityId: "operator",
-      details: { reason: "operator_signature_invalid" },
+      details: { reason: authorization.reason },
     });
-    denyForbidden(res);
+    if (authorization.reason === "operator_authorization_spent_store_unavailable") {
+      writeJson(res, 503, { error: "unavailable" });
+    } else {
+      denyForbidden(res);
+    }
     return;
   }
 
@@ -1026,14 +1034,25 @@ async function handleAuthorizeInit(
     intended_node_id,
     intended_node_mode,
   };
-  if (!verifyOperator(deps, action, signedPayload, operator_signature)) {
+  includeOperatorAuthorizationFields(signedPayload, body as Record<string, unknown>);
+  const authorization = await verifyAndConsumeOperatorAuthorization(
+    deps,
+    action,
+    signedPayload,
+    operator_signature,
+  );
+  if (!authorization.ok) {
     await deps.audit({
       operation,
       result: "failure",
       identityId: intended_node_id,
-      details: { reason: "operator_signature_invalid" },
+      details: { reason: authorization.reason },
     });
-    denyForbidden(res);
+    if (authorization.reason === "operator_authorization_spent_store_unavailable") {
+      writeJson(res, 503, { error: "unavailable" });
+    } else {
+      denyForbidden(res);
+    }
     return;
   }
 
@@ -1107,15 +1126,26 @@ async function handleRevoke(
     reason: revocationReason,
   };
   if (typeof idempotency_key === "string") signedPayload.idempotency_key = idempotency_key;
+  includeOperatorAuthorizationFields(signedPayload, body as Record<string, unknown>);
 
-  if (!verifyOperator(deps, action, signedPayload, operator_signature)) {
+  const authorization = await verifyAndConsumeOperatorAuthorization(
+    deps,
+    action,
+    signedPayload,
+    operator_signature,
+  );
+  if (!authorization.ok) {
     await deps.audit({
       operation,
       result: "failure",
       identityId: node_id,
-      details: { reason: "operator_signature_invalid" },
+      details: { reason: authorization.reason },
     });
-    denyForbidden(res);
+    if (authorization.reason === "operator_authorization_spent_store_unavailable") {
+      writeJson(res, 503, { error: "unavailable" });
+    } else {
+      denyForbidden(res);
+    }
     return;
   }
 
@@ -1328,15 +1358,26 @@ async function handleSync(
     signedPayload.cursor = parsedCursor;
   }
   if (typeof idempotency_key === "string") signedPayload.idempotency_key = idempotency_key;
+  includeOperatorAuthorizationFields(signedPayload, body as Record<string, unknown>);
 
-  if (!verifyOperator(deps, action, signedPayload, operator_signature)) {
+  const authorization = await verifyAndConsumeOperatorAuthorization(
+    deps,
+    action,
+    signedPayload,
+    operator_signature,
+  );
+  if (!authorization.ok) {
     await deps.audit({
       operation,
       result: "failure",
       identityId: node_id,
-      details: { reason: "operator_signature_invalid" },
+      details: { reason: authorization.reason },
     });
-    denyForbidden(res);
+    if (authorization.reason === "operator_authorization_spent_store_unavailable") {
+      writeJson(res, 503, { error: "unavailable" });
+    } else {
+      denyForbidden(res);
+    }
     return;
   }
 
@@ -1851,7 +1892,7 @@ function reissueNodeCertificate(
   } catch {
     throw new ReissueNodeCertFailure("proof_invalid");
   }
-  if (nodePubkey.length !== 32 || signature.length !== 64) {
+  if (nodePubkey.length !== ED25519_PUBLIC_KEY_BYTES || signature.length !== ED25519_SIGNATURE_BYTES) {
     throw new ReissueNodeCertFailure("proof_invalid");
   }
   const proofMessage = buildFederationReissueNodeCertProofMessage({

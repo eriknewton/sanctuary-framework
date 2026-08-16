@@ -1,28 +1,35 @@
 # Castle Wall Linux - operator deploy guide
 
-This guide covers installing and verifying the Castle Wall Linux Phase 1
-filter daemon. Castle Wall is the Castle Layer 1 enforcement piece: a
-kernel-level egress filter that blocks unauthorized network calls from
-wrapped agents on the operator's Linux host.
+This guide is currently a source-validation reference, not a production
+activation runbook. Castle Wall Linux Phase 1 ships no enforcement (Assurance Matrix
+`not_implemented`): the nftables,
+cgroup v2, and NFQUEUE modules are integration-tested, but the shipped daemon
+does not install the table, bind NFQUEUE, create cgroup scopes, or call the
+deny-by-default evaluator. The shipped systemd unit is also `Type=notify`
+without daemon readiness signaling. Open defect: **IC-02, IC-03, IC-04**
+.
 
-The Linux implementation uses nftables for packet-routing decisions,
-cgroup v2 for per-agent process scope, and NFQUEUE for inline verdicts
-from the privileged daemon. It does not load a custom kernel module.
+The Linux implementation source is intended to use nftables for packet-routing
+decisions, cgroup v2 for per-agent process scope, and NFQUEUE for inline
+verdicts from the privileged daemon. The shipped daemon does not assemble that
+loop yet. Open defect: **IC-02, IC-04**
+. It does not load a
+custom kernel module.
 It does not use eBPF for Phase 1 enforcement. eBPF remains an
 observability substrate for Sentinel work, not the Layer 1 allow or deny
 path.
 
 ## Phase 1 scope
 
-What Phase 1 ships:
+What Phase 1 source currently implements and tests:
 
-- Real Linux kernel binding through nftables, cgroup v2, and NFQUEUE.
-- Per-agent egress scope. Each wrapped agent receives a dedicated
-  systemd transient unit and cgroup v2 match, so one agent's policy does
-  not become a shared host policy.
-- Dedicated firewall namespace. Castle Wall installs rules in the
-  `inet sanctuary-castle` nftables table and leaves ufw, firewalld, and
-  operator nftables tables in place.
+- Linux kernel-binding modules for nftables, cgroup v2, and NFQUEUE. They are
+  tested, but not called by the shipped daemon boot path. Open defect:
+  **IC-02, IC-04**.
+- Per-agent egress scope helpers. The shipped daemon does not create the
+  transient units from `daemon::boot` yet.
+- Dedicated firewall namespace helpers. The shipped daemon does not install
+  `inet sanctuary-castle` from its boot path yet.
 - NFQUEUE fail-open disabled. Packets routed to queue `0` require an
   explicit daemon verdict. Prompt-required, deny, and evaluator errors
   map to drop.
@@ -48,8 +55,10 @@ What is NOT in Phase 1:
 - **Linux with systemd as PID 1.** The daemon creates systemd transient
   `.service` units to anchor per-agent cgroups.
 - **Unified cgroup v2 mounted at `/sys/fs/cgroup`.**
-- **nftables.** The daemon shells out to `nft` and installs the
-  `inet sanctuary-castle` table.
+- **nftables.** The source module shells out to `nft` and installs the
+  `inet sanctuary-castle` table when called by tests; the shipped daemon boot
+  path does not call it. Open defect: **IC-02**
+ .
 - **NFQUEUE libraries.** Development builds need
   `libnetfilter-queue-dev` and `libnfnetlink-dev`.
 - **Rust 1.74 or newer** when building the daemon from source.
@@ -64,6 +73,11 @@ sudo apt-get install -y nftables libnetfilter-queue-dev libnfnetlink-dev
 ```
 
 ## Architecture at a glance
+
+This diagram is the intended Phase 1 composition once **IC-02, IC-03, IC-04**
+are fixed. Today the
+source modules and integration tests cover these pieces, but the shipped daemon
+boot path does not wire the kernel-enforcement loop.
 
 ```
 Sanctuary main process                     Linux Castle Wall daemon
@@ -243,13 +257,16 @@ Expected mode and ownership:
 660 root sanctuary /run/sanctuary/<fortress-id>/filter.sock
 ```
 
-Verify the Castle Wall nftables namespace:
+For source-validation builds that explicitly call the kernel-binding modules,
+verify the Castle Wall nftables namespace:
 
 ```bash
 sudo nft list table inet sanctuary-castle
 ```
 
-Expected:
+Expected in that source-validation path. This is not expected from the shipped
+daemon boot path until **IC-02, IC-04** are fixed
+:
 
 - Table family is `inet`.
 - Table name is `sanctuary-castle`.
@@ -278,7 +295,10 @@ sudo stat -c '%a %U %G %n' /var/lib/sanctuary/<fortress-id>/filter-events.wal
 sudo tail -n 5 /var/lib/sanctuary/<fortress-id>/filter-events.wal
 ```
 
-Expected:
+Expected after the enforcement loop is wired. Today the shipped daemon writes
+`daemon_started`, but egress decisions are not produced by a live NFQUEUE loop.
+Open defect: **IC-02, IC-04**
+:
 
 - Mode `600`.
 - Owner `root`.
@@ -337,7 +357,7 @@ recovery window.
 | Service exits with `nftables and systemd` guidance | `nft` is missing, systemd is not PID 1, or cgroup v2 is unavailable | install nftables, boot with systemd, and confirm `/sys/fs/cgroup` is cgroup v2 |
 | Service exits with pinned key failure | `pinned.key` is missing, unreadable, or not the expected raw public key | install the fortress pinned key at `/var/lib/sanctuary/<fortress-id>/policy/egress/pinned.key` with `0640 root:sanctuary` |
 | Service exits with socket bind failure | stale non-socket path, wrong `/run/sanctuary` permissions, or another daemon is running | check `systemctl status`, remove only confirmed stale socket files, and fix `/run/sanctuary/<fortress-id>` ownership |
-| `nft list table inet sanctuary-castle` fails | daemon did not install the table or lacks `CAP_NET_ADMIN` | verify the systemd unit uses `CapabilityBoundingSet=CAP_NET_ADMIN` and `AmbientCapabilities=CAP_NET_ADMIN` |
+| `nft list table inet sanctuary-castle` fails | expected for the current shipped daemon boot path; otherwise the daemon did not install the table or lacks `CAP_NET_ADMIN` | track **IC-02** for the shipped path; in source-validation runs, verify the systemd unit uses `CapabilityBoundingSet=CAP_NET_ADMIN` and `AmbientCapabilities=CAP_NET_ADMIN` |
 | Agent traffic bypasses Castle Wall | agent process is not in the expected `sanctuary-agent-<id>.service` cgroup | verify `ControlGroup`, rewrap the agent, and reload the agent ruleset |
 | nft rejects a cgroup rule | cgroup level or relative path does not match the real systemd placement | compare `systemctl show ... ControlGroup` with the `socket cgroupv2 level <N> "<path>"` rule |
 | Existing ufw or firewalld is active | expected coexistence posture | keep Castle Wall in `inet sanctuary-castle`; do not merge it into ufw or firewalld tables |
@@ -384,13 +404,14 @@ sudo systemctl enable --now sanctuary-castle-wall.service
 
 ## Castle-walking acknowledgement
 
-Castle Wall Linux Phase 1 is the production Castle Layer 1 enforcement
-baseline. The kernel-level decision path is nftables plus cgroup v2 plus
-NFQUEUE, backed by the privileged Rust daemon's policy evaluator and
-tamper-evident WAL.
+Castle Wall Linux Phase 1 is not the production Castle Wall enforcement
+baseline yet. The intended kernel-level decision path is nftables plus cgroup
+v2 plus NFQUEUE, backed by the privileged Rust daemon's policy evaluator and
+WAL, but the shipped daemon boot path does not install or enter that path.
+Open defect: **IC-02, IC-03, IC-04**
+.
 
-Cooperative MCP is the Castle Layer 3 sovereignty surface for compliant
-agents. It is not a substitute for this Linux enforcement path. A
-prompt-injected or jailbroken wrapped agent does not get to decide
-whether unauthorized egress reaches the network. The Linux kernel routes
-the packet through the operator's Castle Wall policy first.
+Cooperative MCP is the sovereignty surface for compliant agents. It is not a
+substitute for the Linux enforcement path. The Linux kernel-routing claim
+becomes true only after **IC-02, IC-03, IC-04** are fixed
+.

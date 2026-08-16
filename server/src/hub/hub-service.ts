@@ -22,6 +22,7 @@ import type {
   HubInboxItem,
   HubActivityFeedEntry,
 } from "../contracts/v1.1/hub-events.js";
+import type { HubAgentStatus } from "../contracts/v1.1/constants.js";
 import type {
   LocalAgentRecord,
   LocalAgentRegistryFilter,
@@ -52,6 +53,7 @@ import { writeLockdownStatus } from "../lockdown/status.js";
 import { aggregateActivity } from "./activity-feed.js";
 import type {
   HubAgentControlResult,
+  HubAgentLockdownControllerResult,
   HubBudgetSummary,
   HubAgentInspectPanel,
   HubFortressExportResult,
@@ -90,6 +92,10 @@ import {
   type UpdateTaskStatusInput,
 } from "../operational/task-coordination/index.js";
 
+type LockdownOutcomePayload = NonNullable<
+  HubApprovalPendingItem["resolution_payload"]
+>;
+
 type HubServiceTaskDeps = HubServiceDeps & {
   taskService?: TaskService;
 };
@@ -100,6 +106,51 @@ function isTier1ControlAction(
   return (HUB_TIER_1_AGENT_CONTROL_ACTIONS as readonly string[]).includes(
     action,
   );
+}
+
+function isLockdownControllerResult(
+  value: unknown,
+): value is HubAgentLockdownControllerResult {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "outcome" in value &&
+    ((value as { outcome?: unknown }).outcome === "engaged" ||
+      (value as { outcome?: unknown }).outcome === "partial")
+  );
+}
+
+function lockdownPayloadFromResult(
+  result: HubAgentStatus | HubAgentLockdownControllerResult,
+): LockdownOutcomePayload {
+  if (!isLockdownControllerResult(result)) {
+    return {
+      outcome: "engaged",
+      reload_confirmed: true,
+      residual_allow_count: 0,
+    };
+  }
+  return {
+    outcome: result.outcome,
+    ...(result.agent_uid !== undefined ? { agent_uid: result.agent_uid } : {}),
+    ...(result.revoked_rule_ids !== undefined
+      ? { revoked_rule_ids: result.revoked_rule_ids }
+      : {}),
+    ...(result.residual_allow_count !== undefined
+      ? { residual_allow_count: result.residual_allow_count }
+      : {}),
+    ...(result.reload_confirmed !== undefined
+      ? { reload_confirmed: result.reload_confirmed }
+      : {}),
+    ...(result.reason_code !== undefined ? { reason_code: result.reason_code } : {}),
+  };
+}
+
+function lockdownStatusFromResult(
+  result: HubAgentStatus | HubAgentLockdownControllerResult,
+): HubAgentStatus | null {
+  if (!isLockdownControllerResult(result)) return result;
+  return result.new_status ?? null;
 }
 
 function checkChannelTemplateId(value: unknown): ChannelTemplateId {
@@ -366,7 +417,7 @@ export class HubService {
       throw new HubValidationError(`unknown control action: ${action}`);
     }
     const record = this.getAgent(agentId);
-    this.assertCapability(record, action);
+    await this.assertCapability(record, action);
 
     if (isTier1ControlAction(action)) {
       return this.enqueueTier1ControlAction(record, action);
@@ -405,10 +456,10 @@ export class HubService {
    * Capability gate. Returns silently when the action is supported by the
    * harness; throws HubCapabilityError when not.
    */
-  private assertCapability(
+  private async assertCapability(
     record: LocalAgentRecord,
     action: HubAgentControlAction,
-  ): void {
+  ): Promise<void> {
     const c = record.capabilities;
     const supports: Record<HubAgentControlAction, boolean> = {
       pause: c.can_pause,
@@ -418,6 +469,19 @@ export class HubService {
       lockdown: c.can_lockdown,
     };
     if (!supports[action]) throw new HubCapabilityError(action);
+    const executorSupports = this.deps.agentController.supports
+      ? await this.deps.agentController.supports(action, record.agent_id)
+      : true;
+    if (!executorSupports) {
+      const reasonByAction: Record<HubAgentControlAction, string> = {
+        pause: "agent_control_pause_unsupported_no_process_handle",
+        resume: "agent_control_resume_unsupported_no_process_handle",
+        restart: "agent_control_restart_unsupported_no_process_handle",
+        unwrap: "agent_control_unwrap_unsupported_operator_decision_pending",
+        lockdown: "agent_control_lockdown_unsupported_no_confinement",
+      };
+      throw new HubCapabilityError(reasonByAction[action]);
+    }
   }
 
   /**
@@ -474,25 +538,50 @@ export class HubService {
           return;
         }
         case "lockdown": {
-          const status = await this.deps.agentController.lockdown(
-            approvedItem.agent_id ?? record.agent_id,
-          );
-          this.deps.agentRegistry.updateStatus(
-            record.agent_id,
-            status,
-            "operator_lockdown",
-          );
+          let result: Awaited<ReturnType<typeof this.deps.agentController.lockdown>>;
+          try {
+            result = await this.deps.agentController.lockdown(
+              approvedItem.agent_id ?? record.agent_id,
+            );
+          } catch (err) {
+            if (err instanceof HubCapabilityError) {
+              void this.deps.activitySources.auditLog.append(
+                "l2",
+                "agent_lockdown_refused",
+                this.deps.identityId,
+                {
+                  agent_id: record.agent_id,
+                  identity_id: record.identity_id,
+                  operator_audit_id: itemId,
+                  reason_code: err.reasonCode,
+                },
+              );
+            }
+            throw err;
+          }
+          const status = lockdownStatusFromResult(result);
+          if (status !== null) {
+            this.deps.agentRegistry.updateStatus(
+              record.agent_id,
+              status,
+              "operator_lockdown",
+            );
+          }
+          const payload = lockdownPayloadFromResult(result);
           void this.deps.activitySources.auditLog.append(
             "l2",
-            "agent_lockdown_engaged",
+            payload.outcome === "partial"
+              ? "agent_lockdown_partial"
+              : "agent_lockdown_engaged",
             this.deps.identityId,
             {
               agent_id: record.agent_id,
               identity_id: record.identity_id,
               operator_audit_id: itemId,
+              ...payload,
             },
           );
-          return;
+          return { resolution_payload: payload };
         }
       }
     });
@@ -686,33 +775,60 @@ export class HubService {
       const failed: Array<{ agent_id: string; error: string }> = [];
       for (const record of records) {
         try {
-          const status = await this.deps.agentController.lockdown(
+          const result = await this.deps.agentController.lockdown(
             record.agent_id,
           );
-          this.deps.agentRegistry.updateStatus(
-            record.agent_id,
-            status,
-            "operator_lockdown",
-          );
+          const status = lockdownStatusFromResult(result);
+          if (status !== null) {
+            this.deps.agentRegistry.updateStatus(
+              record.agent_id,
+              status,
+              "operator_lockdown",
+            );
+          } else {
+            failed.push({
+              agent_id: record.agent_id,
+              error: "lockdown returned no applied status",
+            });
+          }
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           failed.push({ agent_id: record.agent_id, error: msg });
         }
       }
+      const attempted = records.length;
+      const locked = attempted - failed.length;
+      const outcome =
+        attempted === 0
+          ? "no_agents"
+          : locked === 0
+            ? "failed"
+            : locked < attempted
+              ? "partial"
+              : "engaged";
+      const operation =
+        outcome === "engaged"
+          ? "fortress_lockdown_engaged"
+          : outcome === "partial"
+            ? "fortress_lockdown_partial"
+            : outcome === "failed"
+              ? "fortress_lockdown_failed"
+              : "fortress_lockdown_no_agents";
       // One fortress-level activity entry, regardless of partial-failure
       // count. Per-agent failures surface as individual agent_error items
       // below.
       void this.deps.activitySources.auditLog.append(
         "l2",
-        "fortress_lockdown_engaged",
+        operation,
         this.deps.identityId,
         {
           fortress_id: this.deps.fortressId,
-          locked_count: records.length - failed.length,
+          locked_count: locked,
           failed_count: failed.length,
+          ...(outcome === "no_agents" ? { agent_count: 0 } : {}),
         },
       );
-      if (this.deps.storagePath) {
+      if (locked > 0 && this.deps.storagePath) {
         await writeLockdownStatus(this.deps.storagePath, {
           active: true,
           activated_at: this.nowIso(),
@@ -739,6 +855,13 @@ export class HubService {
           agent_still_active: true,
         });
       }
+      return {
+        resolution_payload: {
+          outcome,
+          locked_count: locked,
+          failed_count: failed.length,
+        },
+      };
     });
 
     return {

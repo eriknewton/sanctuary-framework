@@ -35,9 +35,16 @@
  *
  * Algorithm:
  *
- *   1. Read findings for the last 8 days from `ctx.findingStore`,
+ *   1. Read finding METADATA (no decrypt — `listFindingMetadata`, MUST-FIX
+ *      5 fix-round-2 RECHECK) for the last 8 days from `ctx.findingStore`,
  *      filtered to this fortress (the store is per-fortress, so the
- *      filter is implicit; the `since` filter trims the window).
+ *      filter is implicit; the `since` filter trims the window). Every
+ *      field this meta-sentinel needs (finding_id, sentinel_id, agent_id,
+ *      severity, observed_at) already lives in the store's plaintext
+ *      index; a decrypt-bounded `listFindings({limit})` call previously
+ *      let a flood in a RECENT window silently truncate an OLDER baseline
+ *      window out of the result before this sentinel ever saw it —
+ *      `listFindingMetadata` has no decrypt bound to truncate against.
  *   2. Bucket by 24h window: window 0 = current, windows 1..7 = prior.
  *      Same window math the first-order sentinels use.
  *   3. Trigger A: walk window-0 warn+alert findings; group by
@@ -75,6 +82,7 @@ import type {
   SentinelFinding,
   SentinelSeverity,
 } from "../types.js";
+import type { SentinelFindingMetadata } from "../sentinel-finding-store.js";
 
 export const ANOMALY_TRIGGER_SENTINEL_ID = "anomaly-trigger" as const;
 
@@ -83,8 +91,6 @@ const WARN_SIGMA = 3;
 const ALERT_SIGMA = 6;
 /** Days of history required before threshold checks run. */
 const BASELINE_WINDOWS = 7;
-/** Max findings to consider per evaluation. */
-const QUERY_LIMIT = 5_000;
 /** Window duration in ms. */
 const WINDOW_MS = 24 * 60 * 60 * 1000;
 /** Distinct sentinel-IDs required on one agent to fire Trigger A. */
@@ -126,12 +132,14 @@ export class AnomalyTriggerWatcher extends Sentinel {
     const windowSpanMs = (BASELINE_WINDOWS + 1) * WINDOW_MS;
     const sinceIso = new Date(nowMs - windowSpanMs).toISOString();
 
-    let findings: SentinelFinding[];
+    let findings: SentinelFindingMetadata[];
     try {
-      findings = await findingStore.listFindings({
-        since: sinceIso,
-        limit: QUERY_LIMIT,
-      });
+      // METADATA ONLY (MUST-FIX 5, fix-round-2 RECHECK): no decrypt, no
+      // caller-`limit` truncation — see the class doc's Algorithm step 1
+      // and `listFindingMetadata`'s own doc for why a decrypt-bounded
+      // `listFindings({limit})` call was the wrong shape for a rolling
+      // security baseline.
+      findings = await findingStore.listFindingMetadata({ since: sinceIso });
     } catch {
       // Fail-soft: a store read failure produces zero findings this
       // tick. The dispatcher's evaluation_failed audit path covers
@@ -171,10 +179,10 @@ export class AnomalyTriggerWatcher extends Sentinel {
 // ── Trigger A: compound finding on one agent ─────────────────────────────
 
 function computeCompoundFindings(
-  windowZero: SentinelFinding[],
+  windowZero: SentinelFindingMetadata[],
   now: Date,
 ): SentinelFinding[] {
-  const byAgent = new Map<string, SentinelFinding[]>();
+  const byAgent = new Map<string, SentinelFindingMetadata[]>();
   for (const f of windowZero) {
     if (!f.agent_id) continue;
     if (!isWarnOrAlert(f.severity)) continue;
@@ -219,7 +227,7 @@ function computeCompoundFindings(
 // ── Trigger B: fortress-level count spike ────────────────────────────────
 
 function computeCountSpikeFinding(
-  windowed: SentinelFinding[][],
+  windowed: SentinelFindingMetadata[][],
   now: Date,
 ): SentinelFinding | null {
   const currentCount = (windowed[0] ?? []).length;
@@ -272,7 +280,7 @@ function buildCountFinding(
   stddev: number,
   sigma: number,
   severity: "warn" | "alert",
-  windowZero: SentinelFinding[],
+  windowZero: SentinelFindingMetadata[],
   now: Date,
 ): SentinelFinding {
   const ratio = mean === 0 ? Number.POSITIVE_INFINITY : currentCount / mean;
@@ -306,7 +314,7 @@ function buildCountFinding(
 // ── Trigger C: novel sentinel-ID combination ─────────────────────────────
 
 function computeNovelComboFinding(
-  windowed: SentinelFinding[][],
+  windowed: SentinelFindingMetadata[][],
   now: Date,
 ): SentinelFinding | null {
   // Drop windows that contributed zero distinct sentinel-IDs from the
@@ -370,10 +378,10 @@ function isWarnOrAlert(s: SentinelSeverity): s is "warn" | "alert" {
 }
 
 function bucketByWindow(
-  findings: SentinelFinding[],
+  findings: SentinelFindingMetadata[],
   nowMs: number,
-): SentinelFinding[][] {
-  const buckets: SentinelFinding[][] = Array.from(
+): SentinelFindingMetadata[][] {
+  const buckets: SentinelFindingMetadata[][] = Array.from(
     { length: BASELINE_WINDOWS + 1 },
     () => [],
   );

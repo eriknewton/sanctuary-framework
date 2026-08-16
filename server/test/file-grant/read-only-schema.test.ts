@@ -1,3 +1,4 @@
+// fail-before-exempt: inherited supporting file-grant coverage still passes against pre-fix source; key-resolution fail-before coverage lives in state-envelope-integrity.test.ts and master-rotation.test.ts
 /**
  * Governed File-Grant v1 -- read-only schema enforcement (DoD gate 4).
  *
@@ -14,7 +15,7 @@ import { FakeFsOps, makeFileGrantTestStore } from "./fixtures.js";
 
 describe("file-grant read-only schema enforcement", () => {
   it("rejects mode: write with a typed error", async () => {
-    const { grantStore } = makeFileGrantTestStore();
+    const { grantStore } = await makeFileGrantTestStore();
     const fsOps = new FakeFsOps();
 
     await expect(
@@ -37,7 +38,7 @@ describe("file-grant read-only schema enforcement", () => {
   });
 
   it("rejects an arbitrary non-read mode string", async () => {
-    const { grantStore } = makeFileGrantTestStore();
+    const { grantStore } = await makeFileGrantTestStore();
     const fsOps = new FakeFsOps();
 
     await expect(

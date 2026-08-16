@@ -6,6 +6,7 @@ import {
   normalizeToolArgsForValidation,
   ToolArgumentValidationError,
 } from "../tool-args.js";
+import { COOPERATIVE_TOOL_NAMES } from "./tool-names.js";
 
 export type RiskTier = 1 | 2 | 3;
 export type RemediationClass =
@@ -47,7 +48,7 @@ export const FIXED_DENIAL_MESSAGE =
  * by intent, tool, or denial reason.
  */
 export const COOPERATIVE_DENIAL_DISCOVERY_HINT =
-  "To find the sanctioned Sanctuary tool for what you need, call sanctuary_help with your intent, or sanctuary_capabilities for the full catalog." as const;
+  `To find the sanctioned Sanctuary tool for what you need, call ${COOPERATIVE_TOOL_NAMES.help} with your intent, or ${COOPERATIVE_TOOL_NAMES.capabilities} for the full catalog.` as const;
 
 export function fixedDenial(
   auditRef: string,
@@ -313,7 +314,7 @@ export async function classifyApprovalRequest(params: {
     throw error;
   }
   try {
-    handlerArgs = tool.approvalTargetArgs?.(handlerArgs) ?? handlerArgs;
+    handlerArgs = (await tool.approvalTargetArgs?.(handlerArgs)) ?? handlerArgs;
   } catch {
     throw new Error(FIXED_DENIAL_MESSAGE);
   }

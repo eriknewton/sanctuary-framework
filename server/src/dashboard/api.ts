@@ -58,6 +58,7 @@ import {
 } from "../principal-policy/posture-routes.js";
 import { absentFleetRoster } from "../principal-policy/fleet-roster.js";
 import type { FleetRoster } from "../principal-policy/fleet-roster.js";
+import { ASCII_LABEL_RE } from "../core/token-grammar.js";
 
 export { constantTimeEquals };
 
@@ -759,7 +760,7 @@ export async function handleRequest(
       }
 
       // Validate agent_name format (alphanumeric, hyphens, underscores)
-      if (!/^[a-zA-Z0-9_-]+$/.test(body.agent_name)) {
+      if (!ASCII_LABEL_RE.test(body.agent_name)) {
         writeJSON(res, 400, {
           error: "validation_error",
           message: "agent_name must contain only alphanumeric characters, hyphens, and underscores",

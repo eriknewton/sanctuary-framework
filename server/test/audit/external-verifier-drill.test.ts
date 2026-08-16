@@ -26,7 +26,11 @@ import {
   sign as identitySign,
 } from "../../src/core/identity.js";
 import {
+  AUDIT_CHAIN_GENESIS,
+  computeAuditEntryHash,
+  computeAuditRoot,
   checkpointSigningBytes,
+  verifyCheckpointSignature,
   type AuditCheckpointSigningPayload,
 } from "../../src/audit/chain.js";
 import { derivePurposeKey } from "../../src/core/key-derivation.js";
@@ -36,14 +40,19 @@ import {
   exportAuditChain,
   parseExportArgs,
   runExport,
-  type ExportRecord,
   type EntryExportRecord,
   type CheckpointExportRecord,
 } from "../../src/cli/audit-chain-export.js";
 import {
+  AUDIT_CHAIN_VERIFY_EXIT_OK,
+  AUDIT_CHAIN_VERIFY_EXIT_RELAXED_FINDINGS,
+  AUDIT_CHAIN_VERIFY_EXIT_STRICT_FINDINGS,
+  auditChainVerifyExitCode,
   verifyAuditChainRecords,
   parseJsonl,
   verifyAuditChainContent,
+  type ExportRecord as VerifierExportRecord,
+  type CheckpointExportRecord as VerifierCheckpointExportRecord,
 } from "../../src/cli/audit-chain-verify.js";
 
 // ---------------------------------------------------------------------------
@@ -69,6 +78,136 @@ function mutateByte(b64: string, index = Math.floor(b64.length / 2)): string {
   const original = b64[index]!;
   const replacement = chars.find((c) => c !== original) ?? "A";
   return b64.slice(0, index) + replacement + b64.slice(index + 1);
+}
+
+function tamperEntryPayload(
+  records: readonly VerifierExportRecord[],
+  seq: number
+): VerifierExportRecord[] {
+  return records.map((r) => {
+    if (r.type === "entry" && (r as EntryExportRecord).seq === seq) {
+      const e = r as EntryExportRecord;
+      return {
+        ...e,
+        encrypted_payload_bytes: mutateByte(e.encrypted_payload_bytes),
+      };
+    }
+    return r;
+  });
+}
+
+type SignedCheckpointRecord = VerifierCheckpointExportRecord & {
+  signature: string;
+  public_key: string;
+};
+
+function firstSignedCheckpoint(
+  records: readonly VerifierExportRecord[]
+): SignedCheckpointRecord {
+  const checkpoint = records.find(
+    (r): r is VerifierCheckpointExportRecord => r.type === "checkpoint"
+  );
+  if (!checkpoint?.signature || !checkpoint.public_key) {
+    throw new Error("expected a signed checkpoint with an embedded public key");
+  }
+  return checkpoint as SignedCheckpointRecord;
+}
+
+function checkpointPayload(record: VerifierCheckpointExportRecord): AuditCheckpointSigningPayload {
+  return {
+    checkpoint_kind: record.checkpoint_kind,
+    checkpoint_sequence: record.checkpoint_sequence,
+    from_sequence: record.from_sequence,
+    root_hash: record.root_hash,
+    previous_checkpoint_sequence: record.previous_checkpoint_sequence,
+    signed_at: record.signed_at,
+  };
+}
+
+async function forgeSelfConsistentTamperedChain(
+  records: readonly VerifierExportRecord[],
+  tamperedSeq: number,
+): Promise<{
+  records: VerifierExportRecord[];
+  embeddedPublicKey: string;
+}> {
+  const forgedMasterKey = generateRandomKey();
+  const forgedIdentityKey = derivePurposeKey(forgedMasterKey, "identity-encryption");
+  const { storedIdentity } = createIdentity(
+    "forged-signer",
+    forgedIdentityKey,
+    "recovery-key",
+  );
+
+  const entries = records
+    .filter((r): r is EntryExportRecord => r.type === "entry")
+    .sort((a, b) => a.seq - b.seq);
+  const forgedEntries = new Map<number, EntryExportRecord>();
+  let prevHash = AUDIT_CHAIN_GENESIS;
+  for (const entry of entries) {
+    const encrypted_payload_bytes =
+      entry.seq === tamperedSeq
+        ? mutateByte(entry.encrypted_payload_bytes)
+        : entry.encrypted_payload_bytes;
+    const forgedEntry: EntryExportRecord = {
+      ...entry,
+      prev_hash: prevHash,
+      encrypted_payload_bytes,
+      entry_hash: computeAuditEntryHash({
+        sequence: entry.seq,
+        prev_hash: prevHash,
+        timestamp: entry.timestamp,
+        encrypted_payload_bytes,
+        schema_version: entry.schema_version,
+      }),
+    };
+    forgedEntries.set(forgedEntry.seq, forgedEntry);
+    prevHash = forgedEntry.entry_hash;
+  }
+
+  const forged = records.map((record): VerifierExportRecord => {
+    if (record.type === "entry") {
+      return forgedEntries.get((record as EntryExportRecord).seq)! as VerifierExportRecord;
+    }
+    if (record.type !== "checkpoint") {
+      return record;
+    }
+    const checkpoint = record as VerifierCheckpointExportRecord;
+    const hashes: string[] = [];
+    for (
+      let seq = checkpoint.from_sequence;
+      seq <= checkpoint.checkpoint_sequence;
+      seq++
+    ) {
+      hashes.push(forgedEntries.get(seq)!.entry_hash);
+    }
+    const payload: AuditCheckpointSigningPayload = {
+      checkpoint_kind: checkpoint.checkpoint_kind,
+      checkpoint_sequence: checkpoint.checkpoint_sequence,
+      from_sequence: checkpoint.from_sequence,
+      root_hash: computeAuditRoot(hashes),
+      previous_checkpoint_sequence: checkpoint.previous_checkpoint_sequence,
+      signed_at: checkpoint.signed_at,
+    };
+    return {
+      ...checkpoint,
+      root_hash: payload.root_hash,
+      signer_kid: storedIdentity.identity_id,
+      signature: toBase64url(
+        identitySign(
+          checkpointSigningBytes(payload),
+          storedIdentity.encrypted_private_key,
+          forgedIdentityKey,
+        ),
+      ),
+      public_key: storedIdentity.public_key,
+      unsigned: false,
+    };
+  });
+
+  forgedMasterKey.fill(0);
+  forgedIdentityKey.fill(0);
+  return { records: forged, embeddedPublicKey: storedIdentity.public_key };
 }
 
 // ---------------------------------------------------------------------------
@@ -160,6 +299,8 @@ describe("external-verifier-drill: happy path", () => {
     expect(report.findings).toHaveLength(0);
     expect(report.entries_verified).toBe(25);
     expect(report.checkpoints_verified).toBeGreaterThanOrEqual(1);
+    expect(report.signatures_verified).toBe(checkpoints.length);
+    expect(report.signatures_skipped).toBe(0);
   });
 
   it("verifies a valid chain content string as PASS with the expected entry count", async () => {
@@ -170,6 +311,70 @@ describe("external-verifier-drill: happy path", () => {
     expect(report.verdict).toBe("PASS");
     expect(report.entries_verified).toBe(25);
     expect(report.findings).toHaveLength(0);
+  });
+
+  it("refuses an embedded-key-only checkpoint basis unless explicitly opted in", async () => {
+    const { storage, publicKey } = await buildSignedAuditChain();
+    const records = parseJsonl(await collectExport(storage));
+
+    const defaultReport = verifyAuditChainRecords(records);
+    expect(defaultReport.verdict).toBe("FAIL");
+    expect(defaultReport.signature_basis).toBe("none");
+    expect(defaultReport.signatures_verified).toBe(0);
+    expect(
+      defaultReport.findings.every(
+        (finding) => finding.kind === "checkpoint_signature_missing_key",
+      ),
+    ).toBe(true);
+
+    const pinnedReport = verifyAuditChainRecords(records, { publicKey });
+    expect(pinnedReport.verdict).toBe("PASS");
+    expect(pinnedReport.signature_basis).toBe("pinned");
+
+    const embeddedReport = verifyAuditChainRecords(records, { trustEmbedded: true });
+    expect(embeddedReport.verdict).toBe("PASS");
+    expect(embeddedReport.signature_basis).toBe("embedded");
+  });
+
+  it("does not PASS a tampered chain re-signed with a fresh embedded key by default", async () => {
+    const { storage, publicKey } = await buildSignedAuditChain();
+    const original = parseJsonl(await collectExport(storage));
+    const forged = await forgeSelfConsistentTamperedChain(original, 3);
+
+    const defaultReport = verifyAuditChainRecords(forged.records);
+    expect(defaultReport.verdict).toBe("FAIL");
+    expect(defaultReport.signature_basis).toBe("none");
+    expect(defaultReport.signatures_verified).toBe(0);
+    expect(
+      defaultReport.findings.some(
+        (finding) => finding.kind === "checkpoint_signature_missing_key",
+      ),
+    ).toBe(true);
+    expect(
+      defaultReport.findings.some(
+        (finding) =>
+          finding.kind === "entry_hash_mismatch" ||
+          finding.kind === "prev_hash_mismatch" ||
+          finding.kind === "checkpoint_root_mismatch",
+      ),
+    ).toBe(false);
+
+    const pinnedReport = verifyAuditChainRecords(forged.records, { publicKey });
+    expect(pinnedReport.verdict).toBe("FAIL");
+    expect(pinnedReport.signature_basis).toBe("pinned");
+    expect(
+      pinnedReport.findings.some(
+        (finding) => finding.kind === "checkpoint_signature_invalid",
+      ),
+    ).toBe(true);
+
+    const embeddedReport = verifyAuditChainRecords(forged.records, {
+      trustEmbedded: true,
+    });
+    expect(embeddedReport.verdict).toBe("PASS");
+    expect(embeddedReport.signature_basis).toBe("embedded");
+    expect(embeddedReport.signatures_verified).toBeGreaterThan(0);
+    expect(forged.embeddedPublicKey).not.toBe(publicKey);
   });
 
   it("exports a rotated chain with its rotation anchor and verifies it as PASS", async () => {
@@ -191,6 +396,7 @@ describe("external-verifier-drill: happy path", () => {
 
     const jsonl = await collectExport(storage);
     const records = parseJsonl(jsonl);
+    const checkpointCount = records.filter((r) => r.type === "checkpoint").length;
 
     expect(records.filter((r) => r.type === "entry")).toHaveLength(5);
     expect(records).toEqual(
@@ -204,6 +410,8 @@ describe("external-verifier-drill: happy path", () => {
     const report = verifyAuditChainRecords(records);
     expect(report.verdict).toBe("PASS");
     expect(report.findings).toHaveLength(0);
+    expect(report.signatures_verified).toBe(0);
+    expect(report.signatures_skipped).toBe(checkpointCount);
   });
 });
 
@@ -275,16 +483,7 @@ describe("external-verifier-drill: Scenario A - entry payload mutation", () => {
     const records = parseJsonl(jsonl);
 
     // Mutate encrypted_payload_bytes of seq=3
-    const tampered = records.map((r) => {
-      if (r.type === "entry" && (r as EntryExportRecord).seq === 3) {
-        const e = r as EntryExportRecord;
-        return {
-          ...e,
-          encrypted_payload_bytes: mutateByte(e.encrypted_payload_bytes),
-        };
-      }
-      return r;
-    });
+    const tampered = tamperEntryPayload(records, 3);
 
     const report = verifyAuditChainRecords(tampered, { publicKey });
     expect(report.verdict).toBe("FAIL");
@@ -300,6 +499,55 @@ describe("external-verifier-drill: Scenario A - entry payload mutation", () => {
       (f) => f.kind === "prev_hash_mismatch" && f.seq === 4
     );
     expect(chainFinding).toBeDefined();
+  });
+
+  it("reports FAIL with findings even when strict mode is disabled", async () => {
+    const { storage, publicKey } = await buildSignedAuditChain();
+    const tampered = tamperEntryPayload(parseJsonl(await collectExport(storage)), 3);
+
+    const report = verifyAuditChainRecords(tampered, { publicKey, strict: false });
+
+    expect(report.verdict).toBe("FAIL");
+    expect(report.findings.length).toBeGreaterThan(0);
+    expect(report.findings.some((f) => f.kind === "entry_hash_mismatch")).toBe(true);
+  });
+});
+
+describe("external-verifier-drill: CLI exit policy", () => {
+  it("returns exit 0 for a clean report", async () => {
+    const { storage, publicKey } = await buildSignedAuditChain();
+    const report = verifyAuditChainRecords(parseJsonl(await collectExport(storage)), {
+      publicKey,
+    });
+
+    expect(report.verdict).toBe("PASS");
+    expect(AUDIT_CHAIN_VERIFY_EXIT_OK).toBe(0);
+    expect(auditChainVerifyExitCode(report, true)).toBe(AUDIT_CHAIN_VERIFY_EXIT_OK);
+    expect(auditChainVerifyExitCode(report, false)).toBe(AUDIT_CHAIN_VERIFY_EXIT_OK);
+  });
+
+  it("returns exit 1 for strict verification findings", async () => {
+    const { storage, publicKey } = await buildSignedAuditChain();
+    const tampered = tamperEntryPayload(parseJsonl(await collectExport(storage)), 3);
+    const report = verifyAuditChainRecords(tampered, { publicKey });
+
+    expect(report.verdict).toBe("FAIL");
+    expect(AUDIT_CHAIN_VERIFY_EXIT_STRICT_FINDINGS).toBe(1);
+    expect(auditChainVerifyExitCode(report, true)).toBe(
+      AUDIT_CHAIN_VERIFY_EXIT_STRICT_FINDINGS,
+    );
+  });
+
+  it("returns exit 10 for --no-strict verification findings", async () => {
+    const { storage, publicKey } = await buildSignedAuditChain();
+    const tampered = tamperEntryPayload(parseJsonl(await collectExport(storage)), 3);
+    const report = verifyAuditChainRecords(tampered, { publicKey });
+
+    expect(report.verdict).toBe("FAIL");
+    expect(AUDIT_CHAIN_VERIFY_EXIT_RELAXED_FINDINGS).toBe(10);
+    expect(auditChainVerifyExitCode(report, false)).toBe(
+      AUDIT_CHAIN_VERIFY_EXIT_RELAXED_FINDINGS,
+    );
   });
 });
 
@@ -379,5 +627,53 @@ describe("external-verifier-drill: Scenario C - checkpoint signature invalidatio
         f.kind === "sequence_gap"
     );
     expect(entryFindings).toHaveLength(0);
+  });
+
+  it("runtime checkpoint verification rejects non-canonical base64url signature material", async () => {
+    const { storage } = await buildSignedAuditChain();
+    const checkpoint = firstSignedCheckpoint(parseJsonl(await collectExport(storage)));
+    const payload = checkpointPayload(checkpoint);
+
+    expect(verifyCheckpointSignature(payload, checkpoint.signature, checkpoint.public_key)).toBe(
+      true
+    );
+    expect(
+      verifyCheckpointSignature(payload, `${checkpoint.signature}!`, checkpoint.public_key)
+    ).toBe(false);
+    expect(
+      verifyCheckpointSignature(payload, checkpoint.signature, `${checkpoint.public_key}!`)
+    ).toBe(false);
+  });
+
+  it("standalone verification rejects non-canonical base64url checkpoint strings", async () => {
+    const { storage } = await buildSignedAuditChain();
+    const records = parseJsonl(await collectExport(storage));
+    const checkpoint = firstSignedCheckpoint(records);
+
+    const nonCanonicalSignature = records.map((record) =>
+      record === checkpoint
+        ? { ...checkpoint, signature: `${checkpoint.signature}!` }
+        : record
+    );
+    const signatureReport = verifyAuditChainRecords(nonCanonicalSignature, {
+      trustEmbedded: true,
+    });
+    expect(signatureReport.verdict).toBe("FAIL");
+    expect(
+      signatureReport.findings.some((f) => f.kind === "checkpoint_signature_invalid")
+    ).toBe(true);
+
+    const nonCanonicalKey = records.map((record) =>
+      record === checkpoint
+        ? { ...checkpoint, public_key: `${checkpoint.public_key}!` }
+        : record
+    );
+    const keyReport = verifyAuditChainRecords(nonCanonicalKey, {
+      trustEmbedded: true,
+    });
+    expect(keyReport.verdict).toBe("FAIL");
+    expect(keyReport.findings.some((f) => f.kind === "checkpoint_signature_invalid")).toBe(
+      true
+    );
   });
 });

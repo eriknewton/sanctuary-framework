@@ -16,6 +16,7 @@ import {
   formatEnforcementAvailabilityStatus,
   makeLaunchServicesHostAppInvoke,
   parseCastleWallArgs,
+  requestSystemExtensionDeactivation,
   runDisable,
   runEnable as runEnableRaw,
   type CastleWallCommandContext,
@@ -1174,6 +1175,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
     expect(code).toBe(0);
     expect(out.text()).toContain("Castle Wall armed");
     expect(calls).toEqual([
+      [hostAppPath, "--headless", "status"],
       [hostAppPath, "--headless", "enable", "--no-ttl"],
       [hostAppPath, "--headless", "status"],
     ]);
@@ -1249,6 +1251,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
     const { hostAppPath, env } = await makeFixture();
     const err = new CaptureStream();
     const { invoke } = makeInvoker({
+      status: { stdout: reportLine("status", "disabled", true), exitCode: 0 },
       enable: {
         stdout: reportLine("enable", "needs_user_approval", false, "consent missing"),
         exitCode: 3,
@@ -1435,8 +1438,8 @@ describe("castle-wall enable/disable CLI verbs", () => {
   it("fails loud when the deployed app omits the headless build identity", async () => {
     const { hostAppPath, env } = await makeFixture();
     const err = new CaptureStream();
-    const { invoke } = makeInvoker({
-      enable: { stdout: legacyReportLine("enable", "enabled", true), exitCode: 0 },
+    const { invoke, calls } = makeInvoker({
+      status: { stdout: legacyReportLine("status", "disabled", true), exitCode: 0 },
     });
 
     const code = await runEnable(["--force", "--no-ttl"], {
@@ -1453,14 +1456,15 @@ describe("castle-wall enable/disable CLI verbs", () => {
     expect(code).toBe(1);
     expect(err.text()).toContain("did not report a headless build identity");
     expect(err.text()).toContain("rebuild + redeploy");
+    expect(calls.map((call) => call[2])).toEqual(["status"]);
   });
 
   it("fails loud when the deployed app build does not match the CLI build", async () => {
     const { hostAppPath, env } = await makeFixture();
     const err = new CaptureStream();
-    const { invoke } = makeInvoker({
-      enable: {
-        stdout: reportLine("enable", "enabled", true, undefined, {
+    const { invoke, calls } = makeInvoker({
+      status: {
+        stdout: reportLine("status", "disabled", true, undefined, {
           git_sha: "stale-app-sha",
           headless_contract_version: CASTLE_WALL_HEADLESS_CONTRACT_VERSION,
         }),
@@ -1482,6 +1486,75 @@ describe("castle-wall enable/disable CLI verbs", () => {
     expect(code).toBe(1);
     expect(err.text()).toContain("deployed app stale-app-sha != CLI test-build-sha");
     expect(err.text()).toContain("rebuild + redeploy");
+    expect(calls.map((call) => call[2])).toEqual(["status"]);
+  });
+
+  it("requests sysext deactivation only after disabled state and exact build identity", async () => {
+    const { hostAppPath, env } = await makeFixture();
+    const { invoke, calls } = makeInvoker({
+      status: { stdout: reportLine("status", "disabled", true), exitCode: 0 },
+      "deactivate-system-extension": {
+        stdout: reportLine("deactivate-system-extension", "deactivated", true),
+        exitCode: 0,
+      },
+    });
+
+    const outcome = await requestSystemExtensionDeactivation({
+      env,
+      platform: "darwin",
+      hostAppCandidates: [hostAppPath],
+      hostAppInvoke: invoke,
+    });
+
+    expect(outcome).toEqual({ kind: "request-completed" });
+    expect(calls.map((call) => call[2])).toEqual([
+      "status",
+      "deactivate-system-extension",
+    ]);
+  });
+
+  it("keeps reboot-deferred sysext deactivation distinct from removal", async () => {
+    const { hostAppPath, env } = await makeFixture();
+    const { invoke } = makeInvoker({
+      status: { stdout: reportLine("status", "disabled", true), exitCode: 0 },
+      "deactivate-system-extension": {
+        stdout: reportLine(
+          "deactivate-system-extension",
+          "will_complete_after_reboot",
+          true,
+        ),
+        exitCode: 0,
+      },
+    });
+
+    await expect(
+      requestSystemExtensionDeactivation({
+        env,
+        platform: "darwin",
+        hostAppCandidates: [hostAppPath],
+        hostAppInvoke: invoke,
+      }),
+    ).resolves.toEqual({ kind: "reboot-required" });
+  });
+
+  it("never submits sysext deactivation while the content filter is enabled", async () => {
+    const { hostAppPath, env } = await makeFixture();
+    const { invoke, calls } = makeInvoker({
+      status: { stdout: reportLine("status", "enabled", true), exitCode: 0 },
+    });
+
+    const outcome = await requestSystemExtensionDeactivation({
+      env,
+      platform: "darwin",
+      hostAppCandidates: [hostAppPath],
+      hostAppInvoke: invoke,
+    });
+
+    expect(outcome).toMatchObject({ kind: "failed" });
+    expect(outcome.kind === "failed" ? outcome.detail : "").toContain(
+      "not positively observed disabled",
+    );
+    expect(calls.map((call) => call[2])).toEqual(["status"]);
   });
 
   it("disarm treats an inconclusive post-change verification as success (dead-man lever)", async () => {
@@ -1759,8 +1832,9 @@ describe("castle-wall enable/disable CLI verbs", () => {
 
     expect(code).toBe(0);
     expect(out.text()).toContain("Castle Wall armed");
-    // Both the mutation and the post-change verification routed through `open`.
-    expect(openArgs).toHaveLength(2);
+    // The read-only identity preflight, mutation, and post-change verification
+    // all route through `open`.
+    expect(openArgs).toHaveLength(3);
     expect(openArgs[0]).toEqual([
       "open",
       "-n",
@@ -1768,11 +1842,15 @@ describe("castle-wall enable/disable CLI verbs", () => {
       hostAppPath, // no `.app` in the temp fixture path → bundle resolves to the binary
       "--args",
       "--headless",
+      "status",
+      `--report-file=${reportPath}`,
+    ]);
+    expect(openArgs[1]!.slice(-3)).toEqual([
       "enable",
       "--no-ttl",
       `--report-file=${reportPath}`,
     ]);
-    expect(openArgs[1]!.slice(-2)).toEqual(["status", `--report-file=${reportPath}`]);
+    expect(openArgs[2]!.slice(-2)).toEqual(["status", `--report-file=${reportPath}`]);
   });
 
   // ── Confined-agent egress (design 2026-07-10, section 5 layer 2): the
@@ -1803,6 +1881,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
         daemonProbe: async () => true,
         bootServiceReadyProbe: makeBootServiceReadyProbe(plistPath, fixture.fortressPath),
         sysextProbe: async () => "[activated enabled]" as const,
+        sudoPreflightProbe: async () => ({ ok: true, exitCode: 0 }),
         ...extras,
       };
     }
@@ -1859,25 +1938,171 @@ describe("castle-wall enable/disable CLI verbs", () => {
       });
     });
 
+    it("--allow-no-egress refuses before arming when sudo preflight cannot run as the target uid and audits the guard", async () => {
+      const fixture = await makeFixture();
+      const plistPath = join(fixture.fortressPath, "boot.plist");
+      await writeFile(plistPath, makeBootPlist(`${fixture.fortressPath}/`));
+      await writeUidDescriptor(fixture.fortressPath);
+      const err = new CaptureStream();
+      let preflightUid: number | undefined;
+      const { invoke, calls } = makeInvoker({});
+
+      const code = await runEnable(
+        ["--fortress", fixture.fortressPath, "--no-ttl", "--allow-no-egress"],
+        guardCtx(fixture, plistPath, err, invoke, {
+          sudoPreflightProbe: async (uid: number) => {
+            preflightUid = uid;
+            return {
+              ok: false,
+              exitCode: 1,
+              stderr: "sudo: a password is required",
+              command: ["/usr/bin/sudo", "-n", "-u", "#502", "/usr/bin/true"],
+            };
+          },
+        }),
+      );
+
+      expect(code).toBe(1);
+      expect(preflightUid).toBe(502);
+      expect(err.text()).toContain("non-interactive sudo credential");
+      expect(err.text()).toContain("sudo -v");
+      expect(err.text()).toContain("The wall was not armed");
+      expect(err.text()).toContain("sudo: a password is required");
+      expect(err.text()).not.toContain("disarm");
+      expect(calls).toHaveLength(0);
+
+      const storage = new FilesystemStorage(join(fixture.fortressPath, "state"));
+      const { establishMaster } = await import("../../src/core/master-custody.js");
+      const { masterKey } = await establishMaster({
+        storage,
+        recoveryKey: fixture.env.SANCTUARY_RECOVERY_KEY!,
+        firstRun: { installMode: "headless", mintRecoveryKey: false },
+        storagePathHint: fixture.fortressPath,
+      });
+      const auditLog = new AuditLog(storage, masterKey);
+      const { entries } = await auditLog.query({ layer: "l1", limit: 100 });
+      const refusal = entries.find(
+        (e) =>
+          e.operation === "egress_provision_refused" &&
+          (e.details as Record<string, unknown>).guard === "sudo-preflight",
+      );
+      expect(refusal?.details).toMatchObject({
+        guard: "sudo-preflight",
+        agent_uid: 502,
+        exit_code: 1,
+        disarm_outcome: "not-armed",
+      });
+    });
+
+    it("--allow-no-egress refuses before arming when the quarantine uid cannot be resolved", async () => {
+      const fixture = await makeFixture();
+      const plistPath = join(fixture.fortressPath, "boot.plist");
+      await writeFile(plistPath, makeBootPlist(`${fixture.fortressPath}/`));
+      await writeUidDescriptor(fixture.fortressPath);
+      const err = new CaptureStream();
+      const { invoke, calls } = makeInvoker({});
+
+      const code = await runEnable(
+        ["--fortress", fixture.fortressPath, "--no-ttl", "--allow-no-egress"],
+        guardCtx(fixture, plistPath, err, invoke, {
+          egressAllowRuleCountProbe: async () => {
+            await writeFile(
+              join(fixture.fortressPath, "policy", "egress", "agent-origin.json"),
+              JSON.stringify({ mode: "uid", system_uid_allow_ceiling: 500 }),
+            );
+            return 0;
+          },
+          sudoPreflightProbe: async () => {
+            throw new Error("preflight should not run without a resolved uid");
+          },
+        }),
+      );
+
+      expect(code).toBe(1);
+      expect(err.text()).toContain("uid-mode agent-origin descriptor could not be resolved");
+      expect(err.text()).toContain("The wall was not armed");
+      expect(err.text()).not.toContain("disarm");
+      expect(calls).toHaveLength(0);
+
+      const storage = new FilesystemStorage(join(fixture.fortressPath, "state"));
+      const { establishMaster } = await import("../../src/core/master-custody.js");
+      const { masterKey } = await establishMaster({
+        storage,
+        recoveryKey: fixture.env.SANCTUARY_RECOVERY_KEY!,
+        firstRun: { installMode: "headless", mintRecoveryKey: false },
+        storagePathHint: fixture.fortressPath,
+      });
+      const auditLog = new AuditLog(storage, masterKey);
+      const { entries } = await auditLog.query({ layer: "l1", limit: 100 });
+      const refusal = entries.find(
+        (e) =>
+          e.operation === "egress_provision_refused" &&
+          (e.details as Record<string, unknown>).guard ===
+            "deny-all-quarantine-uid-resolution",
+      );
+      expect(refusal?.details).toMatchObject({
+        guard: "deny-all-quarantine-uid-resolution",
+        observed: "unverified",
+        disarm_outcome: "not-armed",
+      });
+    });
+
     it("--allow-no-egress overrides the guard (deliberate quarantine), warns loudly, arms, and the override is audited on wall_armed", async () => {
       const fixture = await makeFixture();
       const plistPath = join(fixture.fortressPath, "boot.plist");
       await writeFile(plistPath, makeBootPlist(`${fixture.fortressPath}/`));
       await writeUidDescriptor(fixture.fortressPath);
       const err = new CaptureStream();
+      const out = new CaptureStream();
+      let probeInput: { agentUid: number; host: string; port: number } | undefined;
+      let preflightUid: number | undefined;
+      const events: string[] = [];
       const { invoke } = makeInvoker({
         enable: { stdout: reportLine("enable", "enabled", true), exitCode: 0 },
         status: { stdout: reportLine("status", "enabled", true), exitCode: 0 },
       });
+      const trackingInvoke: HostAppInvoker = async (binaryPath, args) => {
+        events.push(`invoke:${args[1]}`);
+        return invoke(binaryPath, args);
+      };
 
       const code = await runEnable(
         ["--fortress", fixture.fortressPath, "--no-ttl", "--allow-no-egress"],
-        guardCtx(fixture, plistPath, err, invoke),
+        guardCtx(fixture, plistPath, err, invoke, {
+          out,
+          hostAppInvoke: trackingInvoke,
+          sudoPreflightProbe: async (uid: number) => {
+            preflightUid = uid;
+            events.push(`preflight:${uid}`);
+            return { ok: true, exitCode: 0 };
+          },
+          denyAllQuarantineProbe: async (input: { agentUid: number; host: string; port: number }) => {
+            probeInput = input;
+            events.push(`smoke:${input.agentUid}`);
+            return {
+              reachable: false,
+              verified: true,
+              exitCode: 28,
+              stderr: "curl: (28) Operation timed out",
+              command: ["/usr/bin/sudo", "-n", "-u", "#502", "/usr/bin/curl", "--noproxy", "*"],
+            };
+          },
+        }),
       );
 
       expect(code).toBe(0);
       expect(err.text()).toContain("--allow-no-egress");
       expect(err.text()).toContain("deliberate quarantine");
+      expect(out.text()).toContain("Deny-all quarantine smoke passed");
+      expect(preflightUid).toBe(502);
+      expect(probeInput).toMatchObject({ agentUid: 502, host: "example.com", port: 443 });
+      expect(events).toEqual([
+        "preflight:502",
+        "invoke:status",
+        "invoke:enable",
+        "invoke:status",
+        "smoke:502",
+      ]);
 
       const storage = new FilesystemStorage(join(fixture.fortressPath, "state"));
       const { establishMaster } = await import("../../src/core/master-custody.js");
@@ -1892,6 +2117,100 @@ describe("castle-wall enable/disable CLI verbs", () => {
       const armed = entries.find((e) => e.operation === "wall_armed");
       expect(armed).toBeDefined();
       expect(armed?.details).toMatchObject({ allow_no_egress_override: true });
+    });
+
+    it("--allow-no-egress refuses the armed claim when the direct negative-control probe is reachable", async () => {
+      const fixture = await makeFixture();
+      const plistPath = join(fixture.fortressPath, "boot.plist");
+      await writeFile(plistPath, makeBootPlist(`${fixture.fortressPath}/`));
+      await writeUidDescriptor(fixture.fortressPath);
+      const out = new CaptureStream();
+      const err = new CaptureStream();
+      const { invoke } = makeInvoker({
+        enable: { stdout: reportLine("enable", "enabled", true), exitCode: 0 },
+        status: { stdout: reportLine("status", "enabled", true), exitCode: 0 },
+      });
+
+      const code = await runEnable(
+        ["--fortress", fixture.fortressPath, "--no-ttl", "--allow-no-egress"],
+        guardCtx(fixture, plistPath, err, invoke, {
+          out,
+          denyAllQuarantineProbe: async () => ({
+            reachable: true,
+            verified: true,
+            exitCode: 0,
+            command: [
+              "/usr/bin/sudo",
+              "-n",
+              "-u",
+              "#502",
+              "/usr/bin/curl",
+              "--noproxy",
+              "*",
+              "https://example.com:443/",
+            ],
+          }),
+        }),
+      );
+
+      expect(code).toBe(1);
+      expect(err.text()).toContain("deny-all quarantine smoke FAILED");
+      expect(err.text()).toContain("uid 502 reached example.com:443");
+      expect(err.text()).toContain("--noproxy");
+      expect(out.text()).not.toContain("Castle Wall armed");
+
+      const storage = new FilesystemStorage(join(fixture.fortressPath, "state"));
+      const { establishMaster } = await import("../../src/core/master-custody.js");
+      const { masterKey } = await establishMaster({
+        storage,
+        recoveryKey: fixture.env.SANCTUARY_RECOVERY_KEY!,
+        firstRun: { installMode: "headless", mintRecoveryKey: false },
+        storagePathHint: fixture.fortressPath,
+      });
+      const auditLog = new AuditLog(storage, masterKey);
+      const { entries } = await auditLog.query({ layer: "l1", limit: 100 });
+      const refusal = entries.find(
+        (e) =>
+          e.operation === "egress_provision_refused" &&
+          (e.details as Record<string, unknown>).guard === "deny-all-quarantine-smoke",
+      );
+      expect(refusal?.details).toMatchObject({
+        observed: "reachable",
+        agent_uid: 502,
+        negative_control_host: "example.com",
+      });
+    });
+
+    it("--allow-no-egress refuses the armed claim when the direct negative-control probe is inconclusive", async () => {
+      const fixture = await makeFixture();
+      const plistPath = join(fixture.fortressPath, "boot.plist");
+      await writeFile(plistPath, makeBootPlist(`${fixture.fortressPath}/`));
+      await writeUidDescriptor(fixture.fortressPath);
+      const out = new CaptureStream();
+      const err = new CaptureStream();
+      const { invoke } = makeInvoker({
+        enable: { stdout: reportLine("enable", "enabled", true), exitCode: 0 },
+        status: { stdout: reportLine("status", "enabled", true), exitCode: 0 },
+      });
+
+      const code = await runEnable(
+        ["--fortress", fixture.fortressPath, "--no-ttl", "--allow-no-egress"],
+        guardCtx(fixture, plistPath, err, invoke, {
+          out,
+          denyAllQuarantineProbe: async () => ({
+            reachable: false,
+            verified: false,
+            exitCode: 1,
+            stderr: "sudo: a password is required",
+            command: ["/usr/bin/sudo", "-n", "-u", "#502", "/usr/bin/curl"],
+          }),
+        }),
+      );
+
+      expect(code).toBe(1);
+      expect(err.text()).toContain("could not verify the direct as-uid path");
+      expect(err.text()).toContain("sudo: a password is required");
+      expect(out.text()).not.toContain("Castle Wall armed");
     });
 
     it("arms WITHOUT the override when an agent-matchable allow rule exists on disk (real countAgentMatchableAllowRules path)", async () => {

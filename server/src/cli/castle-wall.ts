@@ -62,9 +62,13 @@ import {
   safeModeAuditStoragePath,
 } from "../castle-wall/boot/boot-token.js";
 import { validateAgentOrigin } from "../castle-wall/allowlist/agent-origin.js";
-import { validateRule, type AllowlistRule } from "../castle-wall/allowlist/schema.js";
-import { HABEAS_RULE_ID_PREFIX } from "../castle-wall/allowlist/habeas-port.js";
-import { EGRESS_PROVISION_REFUSED_AUDIT_OP } from "../castle-wall/provision/egress.js";
+import { listAgentMatchableAllowRuleFiles } from "../castle-wall/allowlist/agent-matchable.js";
+import {
+  AGENT_EGRESS_NEGATIVE_CONTROL_HOST,
+  EGRESS_PROVISION_REFUSED_AUDIT_OP,
+  asUidProbeReachableDecision,
+  asUidTlsProbeArgv,
+} from "../castle-wall/provision/egress.js";
 import {
   normalizeFortressCustody,
   resolveSudoIdentityDecision,
@@ -87,6 +91,7 @@ import {
   bootServiceInstalled,
   bootServiceReady,
 } from "./castle-wall-boot.js";
+import { consumeFlagValue } from "./argv.js";
 import { fortressIdFromStoragePath } from "../dashboard/v1_1/wiring.js";
 import {
   EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE,
@@ -95,19 +100,25 @@ import {
 import {
   CASTLE_WALL_AUDIT_PROVENANCE_KEY,
   CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
-  CASTLE_WALL_RELOAD_CLIENT_TIMEOUT_MS,
 } from "../castle-wall/constants.js";
 import type {
   CastleWallMessage,
   DecisionResponse,
-  PolicyReloadResponse,
 } from "../castle-wall/ipc/messages.js";
+import {
+  requestPolicyReload,
+  type PolicyReloadResult,
+} from "../castle-wall/runtime/policy-reload-client.js";
 import { observing, type Observed } from "../claim-witness.js";
+import { ED25519_PUBLIC_KEY_BYTES } from "../core/crypto-suite-registry.js";
+
+export { requestPolicyReload, type PolicyReloadResult };
 
 const CASTLE_PINNED_PUBKEY = "castle-pinned-pubkey.bin";
 const CASTLE_PINNED_PRIVKEY = "castle-pinned-privkey.enc";
 const CASTLE_GLOBAL_PINNED_PUBKEY_DIR = "/Library/Application Support/Sanctuary";
 const CASTLE_GLOBAL_PINNED_PUBKEY_PATH = `${CASTLE_GLOBAL_PINNED_PUBKEY_DIR}/${CASTLE_PINNED_PUBKEY}`;
+const DENY_ALL_QUARANTINE_PROBE_TIMEOUT_MS = 12_000;
 
 export interface CastleWallCommandContext {
   out?: Writable;
@@ -241,6 +252,21 @@ export interface CastleWallCommandContext {
    */
   egressAllowRuleCountProbe?: (fortressPath: string) => Promise<number>;
   /**
+   * Override the final deny-all quarantine smoke used only after an explicit
+   * `enable --allow-no-egress`. Defaults to running the same direct as-uid
+   * curl probe shape as the provisioned-egress verifier.
+   */
+  denyAllQuarantineProbe?: (
+    input: DenyAllQuarantineProbeInput,
+  ) => Promise<DenyAllQuarantineProbeResult>;
+  /**
+   * Override the pre-arm sudo credential probe used only for the explicit
+   * `enable --allow-no-egress` uid-quarantine path. Defaults to running
+   * `/usr/bin/sudo -n -u '#<uid>' /usr/bin/true` with the same timeout as the
+   * deny-all quarantine smoke.
+   */
+  sudoPreflightProbe?: (uid: number) => Promise<SudoPreflightProbeResult>;
+  /**
    * Inject the FULL operator-daemon start function (Slice M; tests pass a fake
    * that captures the resolved {@link MacOSCastleWallDaemonInput}, so the
    * key-resolution + producer-key threading can be exercised without a real
@@ -262,6 +288,7 @@ export interface CastleWallCommandContext {
 export interface CastleWallParsedArgs {
   fortress?: string;
   since?: string;
+  parseError?: string;
   scope?: "once" | "session" | "always";
   requestId?: string;
   force?: boolean;
@@ -313,11 +340,47 @@ export interface CastleWallParsedArgs {
   producerPubKey?: string;
 }
 
+function writeCastleWallParseError(
+  parsed: CastleWallParsedArgs,
+  err: Writable,
+): boolean {
+  if (parsed.parseError === undefined) return false;
+  write(err, `Error: ${parsed.parseError}\n`);
+  return true;
+}
+
 /** Runs the host-app binary in headless mode; mirrors execFile semantics. */
 export type HostAppInvoker = (
   binaryPath: string,
   args: string[],
 ) => Promise<{ stdout: string; stderr: string; exitCode: number }>;
+
+export interface DenyAllQuarantineProbeInput {
+  agentUid: number;
+  host: string;
+  port: number;
+}
+
+export interface DenyAllQuarantineProbeResult {
+  /** True only when the direct as-uid probe positively reached the host. */
+  reachable: boolean;
+  /**
+   * True when the probe itself ran far enough to distinguish reachable from
+   * blocked. A sudo/spawn/timeout failure is not proof that quarantine works.
+   */
+  verified: boolean;
+  exitCode: number | null;
+  stderr?: string;
+  command?: readonly string[];
+}
+
+export interface SudoPreflightProbeResult {
+  /** True only when sudo ran the target command as the uid and exited 0. */
+  ok: boolean;
+  exitCode: number | null;
+  stderr?: string;
+  command?: readonly string[];
+}
 
 export type DisableNePreferenceOutcome =
   | "corroborated_off"
@@ -365,7 +428,13 @@ type ObservedArmClaimObservationBasis =
 interface HeadlessReport {
   ok: boolean;
   action: string;
-  state: "enabled" | "disabled" | "needs_user_approval" | "unknown";
+  state:
+    | "enabled"
+    | "disabled"
+    | "deactivated"
+    | "will_complete_after_reboot"
+    | "needs_user_approval"
+    | "unknown";
   error?: string;
   build?: HeadlessBuildIdentity;
 }
@@ -474,7 +543,7 @@ async function readEnforcementAvailabilityForStatus(
 
 /** Exit-code contract with HeadlessFilterCLI.ExitCode (Swift side). */
 const HEADLESS_EXIT_NEEDS_APPROVAL = 3;
-export const CASTLE_WALL_HEADLESS_CONTRACT_VERSION = "2";
+export const CASTLE_WALL_HEADLESS_CONTRACT_VERSION = "3";
 
 interface HeadlessBuildIdentity {
   git_sha?: string;
@@ -723,6 +792,7 @@ export async function runAuditFindings(
   const err = ctx.err ?? process.stderr;
   const env = ctx.env ?? process.env;
   const parsed = parseCastleWallArgs(argv);
+  if (writeCastleWallParseError(parsed, err)) return 2;
   const fortressPath = resolveFortressArg(parsed.fortress, env);
 
   try {
@@ -823,6 +893,7 @@ export async function runAuditStoreStatus(
   const err = ctx.err ?? process.stderr;
   const env = ctx.env ?? process.env;
   const parsed = parseCastleWallArgs(argv);
+  if (writeCastleWallParseError(parsed, err)) return 2;
   const fortressPath = resolveFortressArg(parsed.fortress, env);
 
   try {
@@ -855,8 +926,9 @@ export async function runProvisionPin(
   // version" while federation/identity verbs against the SAME --fortress path
   // worked (2026-06-24 stock-CLI drill). resolveFortressArg falls back to
   // resolveStoragePath(env) when no flag is given, preserving prior behavior.
-  const { fortress } = parseCastleWallArgs(argv);
-  const storagePath = resolveFortressArg(fortress, env);
+  const parsed = parseCastleWallArgs(argv);
+  if (writeCastleWallParseError(parsed, err)) return 2;
+  const storagePath = resolveFortressArg(parsed.fortress, env);
   const pubPath = join(storagePath, CASTLE_PINNED_PUBKEY);
   const privPath = join(storagePath, CASTLE_PINNED_PRIVKEY);
   // Reuse the existing globalPinnedPublicKeyPath test seam (already threaded
@@ -871,7 +943,7 @@ export async function runProvisionPin(
 
     try {
       const existingPub = await readFile(pubPath);
-      if (existingPub.length !== 32) {
+      if (existingPub.length !== ED25519_PUBLIC_KEY_BYTES) {
         throw new Error(
           `Pinned public key at ${pubPath} must be 32 bytes (found ${existingPub.length}).`
         );
@@ -1128,7 +1200,9 @@ export async function runRePin(
   const err = ctx.err ?? process.stderr;
   const env = ctx.env ?? process.env;
   const platform = ctx.platform ?? process.platform;
-  const acceptBrokenChain = parseCastleWallArgs(argv).acceptBrokenChain ?? false;
+  const parsed = parseCastleWallArgs(argv);
+  if (writeCastleWallParseError(parsed, err)) return 2;
+  const acceptBrokenChain = parsed.acceptBrokenChain ?? false;
 
   if (platform !== "darwin") {
     write(err, "castle-wall re-pin is macOS-only.\n");
@@ -1183,7 +1257,7 @@ export async function runRePin(
     write(err, `Error: ${error instanceof Error ? error.message : String(error)}\n`);
     return 1;
   }
-  if (helperPub.length !== 32) {
+  if (helperPub.length !== ED25519_PUBLIC_KEY_BYTES) {
     write(err, `Helper returned a ${helperPub.length}-byte key (expected 32).\n`);
     return 1;
   }
@@ -1232,7 +1306,7 @@ export async function runRePin(
       err,
     });
 
-    if (oldPub && oldPub.length === 32 && oldEnc) {
+    if (oldPub && oldPub.length === ED25519_PUBLIC_KEY_BYTES && oldEnc) {
       const oldFingerprint = fingerprintFromPublicKey(oldPub);
       if (oldFingerprint === helperFingerprint) {
         // Already migrated (K_old already equals K_helper would be unusual, but
@@ -1331,7 +1405,7 @@ async function readGlobalPinForStatus(
     ctx.globalPinReader ?? (() => readFile(CASTLE_GLOBAL_PINNED_PUBKEY_PATH));
   try {
     const key = await reader();
-    if (key.length !== 32) return "unreadable";
+    if (key.length !== ED25519_PUBLIC_KEY_BYTES) return "unreadable";
     return key;
   } catch (error) {
     const code =
@@ -1428,9 +1502,11 @@ async function reportGlobalPinAndVerdict(
 }
 
 export async function runStatus(
+  argv: string[] = [],
   ctx: CastleWallCommandContext = {}
 ): Promise<number> {
   const out = ctx.out ?? process.stdout;
+  const err = ctx.err ?? process.stderr;
   const env = ctx.env ?? process.env;
   const platform = ctx.platform ?? process.platform;
   const execSyncFn =
@@ -1440,13 +1516,26 @@ export async function runStatus(
         encoding: "utf8",
         stdio: ["ignore", "pipe", "ignore"],
       }).trim());
-  const storagePath = resolveStoragePath(env);
+  // O-07 (register): honor the subcommand-level `--fortress <path>` flag,
+  // exactly like every other castle-wall custody verb (re-pin, daemon,
+  // audit-store-status; see runProvisionPin's doc for the identical prior
+  // bug). Before this fix `runStatus` took no argv at all and always read
+  // `resolveStoragePath(env)` (SANCTUARY_STORAGE_PATH or the default
+  // ~/.sanctuary fortress), so `castle-wall status --fortress <path>`
+  // silently reported the local pinned key AND probed the enforcement-
+  // availability socket for the DEFAULT fortress, never the one named --
+  // whatever order the flag was passed in, since it was never parsed.
+  // resolveFortressArg falls back to resolveStoragePath(env) when no flag is
+  // given, preserving prior (env-or-default) behavior exactly.
+  const parsed = parseCastleWallArgs(argv);
+  if (writeCastleWallParseError(parsed, err)) return 2;
+  const storagePath = resolveFortressArg(parsed.fortress, env);
   const pubPath = join(storagePath, CASTLE_PINNED_PUBKEY);
 
   let localFingerprint: string | null = null;
   try {
     const publicKey = await readFile(pubPath);
-    if (publicKey.length !== 32) {
+    if (publicKey.length !== ED25519_PUBLIC_KEY_BYTES) {
       throw new Error(
         `Pinned public key at ${pubPath} must be 32 bytes (found ${publicKey.length}).`
       );
@@ -1598,7 +1687,9 @@ export async function runDaemon(
   const err = ctx.err ?? process.stderr;
   const env = ctx.env ?? process.env;
   const platform = ctx.platform ?? process.platform;
-  const acceptBrokenChain = parseCastleWallArgs(argv).acceptBrokenChain ?? false;
+  const parsed = parseCastleWallArgs(argv);
+  if (writeCastleWallParseError(parsed, err)) return 2;
+  const acceptBrokenChain = parsed.acceptBrokenChain ?? false;
 
   // FIX 3 (codex HIGH - wire the opt-in producer-signed close into production).
   // The daemon verb is macOS by default. On Linux it stays unsupported UNLESS the
@@ -1640,7 +1731,7 @@ export async function runDaemon(
   // back to resolveStoragePath(env) when no flag is given, preserving prior
   // env-var behavior (SANCTUARY_FORTRESS_PATH is promoted to
   // SANCTUARY_STORAGE_PATH upstream in cli.ts).
-  const storagePath = resolveFortressArg(parseCastleWallArgs(argv).fortress, env);
+  const storagePath = resolveFortressArg(parsed.fortress, env);
   const localSign = env.SANCTUARY_CASTLE_LOCAL_SIGN === "1";
   const launchdBoot = argv.includes("--launchd");
 
@@ -1659,7 +1750,7 @@ export async function runDaemon(
     } else {
       publicKey = await readFile(pubPath);
     }
-    if (publicKey.length !== 32) {
+    if (publicKey.length !== ED25519_PUBLIC_KEY_BYTES) {
       write(err, `Pinned public key must be 32 bytes (found ${publicKey.length}).\n`);
       return 1;
     }
@@ -2102,6 +2193,8 @@ export async function runSafeModeDaemon(
   const err = ctx.err ?? process.stderr;
   const env = ctx.env ?? process.env;
   const platform = ctx.platform ?? process.platform;
+  const parsed = parseCastleWallArgs(argv);
+  if (writeCastleWallParseError(parsed, err)) return 2;
 
   if (platform !== "darwin") {
     write(err, "castle-wall daemon --safe-mode is macOS-only.\n");
@@ -2125,7 +2218,7 @@ export async function runSafeModeDaemon(
   // the same footgun runDaemon had. resolveFortressArg falls back to
   // resolveStoragePath(env) when no flag is given, so the launchd boot path
   // (SANCTUARY_STORAGE_PATH set in the plist, no flag) is unchanged.
-  const storagePath = resolveFortressArg(parseCastleWallArgs(argv).fortress, env);
+  const storagePath = resolveFortressArg(parsed.fortress, env);
   const fortressId = fortressIdFromStoragePath(storagePath);
 
   // 1. Boot token (the only secret safe mode holds). Fail-closed on absence or
@@ -2450,63 +2543,6 @@ export async function runSetupSharedDir(
   return 0;
 }
 
-/** Result of {@link requestPolicyReload}. */
-export interface PolicyReloadResult {
-  ok: boolean;
-  loadedRuleCount?: number;
-  error?: string;
-  /** True when the failure was an unreachable daemon socket (no daemon running). */
-  socketUnavailable?: boolean;
-}
-
-/**
- * Ask the running Castle Wall policy daemon for this fortress to re-read,
- * re-compose, re-sign, and broadcast its manifest. FAIL-CLOSED result shape:
- * an unreachable socket is `ok: false` (with `socketUnavailable: true`),
- * never a silent success -- callers that REQUIRE a confirmed reload (the
- * confined-agent egress provisioning step) must treat anything but
- * `ok: true` as a refusal. The lenient "no daemon running" UX belongs to
- * `runReload`'s CLI rendering, not to this primitive.
- */
-export async function requestPolicyReload(
-  fortressPath: string,
-  platform: NodeJS.Platform = process.platform,
-): Promise<PolicyReloadResult> {
-  const socketPath = resolveCastleWallSocketPath({ platform, fortressPath }).path;
-  try {
-    // The daemon recomposes + re-signs from `policy/egress/rules/`, so no
-    // `manifest_path` is sent (it was a fabricated, non-existent path the daemon
-    // ignored). A reload re-signs through the root helper, which is far slower
-    // than a status query (especially the first cold reload on a freshly-booted
-    // box), so it gets a dedicated, longer client deadline that comfortably
-    // exceeds the daemon's own internal reload budget. Without it the generic 5s
-    // socket deadline fired BEFORE a healthy daemon finished signing and the
-    // reload was reported as a spurious timeout (Mini1 egress drill 2026-07-12).
-    const reply = await sendCastleWallMessage<PolicyReloadResponse>(
-      socketPath,
-      {
-        type: "policy_reload_request",
-        request_id: nodeRandomBytes(16).toString("hex"),
-      },
-      "policy_reload_response",
-      CASTLE_WALL_RELOAD_CLIENT_TIMEOUT_MS,
-    );
-    if (!reply.ok) {
-      return { ok: false, error: reply.error ?? "policy reload failed" };
-    }
-    return { ok: true, loadedRuleCount: reply.loaded_rule_count };
-  } catch (error) {
-    if (isSocketUnavailable(error)) {
-      return {
-        ok: false,
-        socketUnavailable: true,
-        error: `no Castle Wall daemon reachable at ${socketPath}`,
-      };
-    }
-    return { ok: false, error: error instanceof Error ? error.message : String(error) };
-  }
-}
-
 export async function runReload(
   argv: string[] = [],
   ctx: CastleWallCommandContext = {}
@@ -2515,6 +2551,7 @@ export async function runReload(
   const err = ctx.err ?? process.stderr;
   const env = ctx.env ?? process.env;
   const parsed = parseCastleWallArgs(argv);
+  if (writeCastleWallParseError(parsed, err)) return 2;
   const fortressPath = resolveFortressArg(parsed.fortress, env);
 
   const result = await requestPolicyReload(fortressPath, ctx.platform ?? process.platform);
@@ -2541,6 +2578,7 @@ export async function runApprove(
   const err = ctx.err ?? process.stderr;
   const env = ctx.env ?? process.env;
   const parsed = parseCastleWallArgs(argv);
+  if (writeCastleWallParseError(parsed, err)) return 2;
   const requestId = parsed.requestId;
   if (!requestId) {
     write(err, "Error: castle-wall approve requires <request_id>\n");
@@ -2649,6 +2687,7 @@ export async function runAuditDump(
   const err = ctx.err ?? process.stderr;
   const env = ctx.env ?? process.env;
   const parsed = parseCastleWallArgs(argv);
+  if (writeCastleWallParseError(parsed, err)) return 2;
   if (parsed.ruleMissingValue) {
     write(err, "Error: --rule requires a rule id (e.g. --rule allow-anthropic, or --rule default-deny).\n");
     return 2;
@@ -2905,6 +2944,7 @@ export async function runAuditVerify(
   const err = ctx.err ?? process.stderr;
   const env = ctx.env ?? process.env;
   const parsed = parseCastleWallArgs(argv);
+  if (writeCastleWallParseError(parsed, err)) return 2;
   const fortressPath = resolveFortressArg(parsed.fortress, env);
   const sinceIso = parsed.since
     ? new Date(Date.now() - parseDurationMs(parsed.since)).toISOString()
@@ -3217,13 +3257,156 @@ async function readAgentOriginModeBestEffort(
   fortressPath: string,
 ): Promise<"uid" | "nat" | null> {
   try {
-    const raw = await readFile(agentOriginDescriptorPath(fortressPath), "utf8");
-    const validated = validateAgentOrigin(JSON.parse(raw));
+    const validated = await readAgentOriginDescriptorBestEffort(fortressPath);
     if (validated === null) return null;
     return validated.mode === "uid" ? "uid" : "nat";
   } catch {
     return null;
   }
+}
+
+async function readAgentOriginDescriptorBestEffort(
+  fortressPath: string,
+): Promise<ReturnType<typeof validateAgentOrigin>> {
+  try {
+    const raw = await readFile(agentOriginDescriptorPath(fortressPath), "utf8");
+    return validateAgentOrigin(JSON.parse(raw));
+  } catch {
+    return null;
+  }
+}
+
+async function readAgentOriginUidBestEffort(fortressPath: string): Promise<number | null> {
+  const descriptor = await readAgentOriginDescriptorBestEffort(fortressPath);
+  if (descriptor?.mode !== "uid" || descriptor.agent_uid === undefined) return null;
+  return descriptor.agent_uid;
+}
+
+function asUidSudoPreflightArgv(uid: number): { file: string; args: string[] } {
+  if (!Number.isSafeInteger(uid) || uid <= 0) {
+    throw new Error(`sudo preflight requires a positive integer uid, got ${String(uid)}`);
+  }
+  return {
+    file: "/usr/bin/sudo",
+    args: ["-n", "-u", `#${uid}`, "/usr/bin/true"],
+  };
+}
+
+function defaultSudoPreflightProbe(uid: number): Promise<SudoPreflightProbeResult> {
+  const probe = asUidSudoPreflightArgv(uid);
+  return new Promise((resolvePromise) => {
+    nodeExecFile(
+      probe.file,
+      probe.args,
+      {
+        encoding: "utf8",
+        timeout: DENY_ALL_QUARANTINE_PROBE_TIMEOUT_MS,
+      },
+      (error, _stdout, stderr) => {
+        const exitCode = error
+          ? typeof error.code === "number"
+            ? error.code
+            : null
+          : 0;
+        const stderrText = stderr ?? "";
+        const errorText =
+          error && exitCode === null ? `${error.name}: ${error.message}` : "";
+        const combinedStderr = [stderrText, errorText].filter(Boolean).join("\n");
+        resolvePromise({
+          ok: exitCode === 0,
+          exitCode,
+          ...(combinedStderr ? { stderr: combinedStderr } : {}),
+          command: [probe.file, ...probe.args],
+        });
+      },
+    );
+  });
+}
+
+function defaultDenyAllQuarantineProbe(
+  input: DenyAllQuarantineProbeInput,
+): Promise<DenyAllQuarantineProbeResult> {
+  const probe = asUidTlsProbeArgv(input.agentUid, input.host, input.port);
+  return new Promise((resolvePromise) => {
+    nodeExecFile(
+      probe.file,
+      probe.args,
+      {
+        encoding: "utf8",
+        timeout: DENY_ALL_QUARANTINE_PROBE_TIMEOUT_MS,
+      },
+      (error, _stdout, stderr) => {
+        const exitCode = error
+          ? typeof error.code === "number"
+            ? error.code
+            : null
+          : 0;
+        const stderrText = stderr ?? "";
+        const errorText =
+          error && exitCode === null ? `${error.name}: ${error.message}` : "";
+        const combinedStderr = [stderrText, errorText].filter(Boolean).join("\n");
+        resolvePromise({
+          reachable: asUidProbeReachableDecision(exitCode),
+          // Exit 0 or a curl-originated nonzero exit proves sudo reached curl
+          // as the target uid. A sudo/spawn/timeout failure is unverified.
+          verified:
+            exitCode === 0 ||
+            (exitCode !== null && /\bcurl: \(\d+\)/.test(combinedStderr)),
+          exitCode,
+          ...(combinedStderr ? { stderr: combinedStderr } : {}),
+          command: [probe.file, ...probe.args],
+        });
+      },
+    );
+  });
+}
+
+function formatProbeCommand(command: readonly string[] | undefined): string {
+  if (command === undefined || command.length === 0) return "(probe command unavailable)";
+  return command
+    .map((part) => (/^[A-Za-z0-9_./:=@%+#-]+$/.test(part) ? part : JSON.stringify(part)))
+    .join(" ");
+}
+
+function renderSudoPreflightRefusal(
+  uid: number,
+  result: SudoPreflightProbeResult,
+): string {
+  const details = [
+    `probe: ${formatProbeCommand(result.command)}`,
+    `exit_code: ${result.exitCode === null ? "none" : result.exitCode}`,
+    ...(result.stderr?.trim() ? [`stderr: ${result.stderr.trim()}`] : []),
+  ].join("\n");
+  return (
+    `Refusing to arm: a non-interactive sudo credential for the arm probe is unavailable for uid ${uid}.\n` +
+    "Run 'sudo -v' to cache your credential (or configure a sudoers rule for the probe), then retry. The wall was not armed.\n" +
+    `${details}\n`
+  );
+}
+
+function renderDenyAllQuarantineProbeRefusal(
+  input: DenyAllQuarantineProbeInput,
+  result: DenyAllQuarantineProbeResult,
+): string {
+  const details = [
+    `probe: ${formatProbeCommand(result.command)}`,
+    `exit_code: ${result.exitCode === null ? "none" : result.exitCode}`,
+    ...(result.stderr?.trim() ? [`stderr: ${result.stderr.trim()}`] : []),
+  ].join("\n");
+  if (!result.verified) {
+    return (
+      "Castle Wall arm saved by the host app, but the deny-all quarantine smoke could not verify the direct as-uid path.\n" +
+      `Expected uid ${input.agentUid} to be unable to reach ${input.host}:${input.port} with --noproxy '*', but the probe itself was inconclusive.\n` +
+      `${details}\n` +
+      "Treat the quarantine as unverified; run 'sanctuary castle-wall disable' before continuing.\n"
+    );
+  }
+  return (
+    "Castle Wall arm saved by the host app, but the deny-all quarantine smoke FAILED.\n" +
+    `uid ${input.agentUid} reached ${input.host}:${input.port} on the direct --noproxy path despite ZERO agent-matchable allow rules.\n` +
+    `${details}\n` +
+    "Treat this as fail-open for the confined uid; run 'sanctuary castle-wall disable' before continuing.\n"
+  );
 }
 
 /**
@@ -3250,19 +3433,7 @@ export async function countAgentMatchableAllowRules(fortressPath: string): Promi
   } catch {
     return 0;
   }
-  let count = 0;
-  for (const filename of filenames) {
-    try {
-      const parsed = JSON.parse(await readFile(join(rulesDir, filename), "utf8")) as AllowlistRule;
-      if (validateRule(parsed).length > 0) continue;
-      if (parsed.disposition !== "allow") continue;
-      if (parsed.id.startsWith(HABEAS_RULE_ID_PREFIX)) continue;
-      count += 1;
-    } catch {
-      continue;
-    }
-  }
-  return count;
+  return (await listAgentMatchableAllowRuleFiles(rulesDir, filenames)).length;
 }
 
 /**
@@ -3334,6 +3505,7 @@ export async function runConfigureOrigin(
   const err = ctx.err ?? process.stderr;
   const env = ctx.env ?? process.env;
   const parsed = parseCastleWallArgs(argv);
+  if (writeCastleWallParseError(parsed, err)) return 2;
   const fortressPath = resolveFortressArg(parsed.fortress, env);
 
   // Parse remaining positional args: configure-origin <mode> [options]
@@ -3521,6 +3693,7 @@ function makeHostAppInvoke(timeoutMs: number): HostAppInvoker {
  */
 function resolveAppBundlePath(binaryPath: string): string {
   const marker = ".app/";
+  // cli-argv-indexof-allowed: scans a filesystem path string, not CLI argv tokens.
   const idx = binaryPath.indexOf(marker);
   if (idx >= 0) return binaryPath.slice(0, idx + ".app".length);
   return binaryPath;
@@ -3700,6 +3873,7 @@ function makeDefaultOpenRunner(timeoutMs: number): OpenRunner {
  */
 const ARM_INVOKE_TIMEOUT_MS = 90_000;
 const DISARM_INVOKE_TIMEOUT_MS = 7_000;
+const DEACTIVATE_SYSTEM_EXTENSION_TIMEOUT_MS = 90_000;
 function defaultArmInvoke(ctx: CastleWallCommandContext, action: "enable" | "disable"): HostAppInvoker {
   return makeLaunchServicesHostAppInvoke({
     timeoutMs: action === "disable" ? DISARM_INVOKE_TIMEOUT_MS : ARM_INVOKE_TIMEOUT_MS,
@@ -3709,6 +3883,113 @@ function defaultArmInvoke(ctx: CastleWallCommandContext, action: "enable" | "dis
       ? { runningAppController: ctx.runningAppController }
       : {}),
   });
+}
+
+export type SystemExtensionDeactivationRequestOutcome =
+  | { kind: "request-completed" }
+  | { kind: "reboot-required" }
+  | { kind: "needs-user-approval"; detail: string }
+  | { kind: "failed"; detail: string };
+
+/**
+ * Ask the deployed signed host app to deactivate its bundled system
+ * extension. This function deliberately proves only the REQUEST outcome;
+ * callers must independently observe system-extension absence before they
+ * claim removal, because macOS may defer completion until reboot.
+ */
+export async function requestSystemExtensionDeactivation(
+  ctx: CastleWallCommandContext = {},
+): Promise<SystemExtensionDeactivationRequestOutcome> {
+  const env = ctx.env ?? process.env;
+  const platform = ctx.platform ?? process.platform;
+  if (platform !== "darwin") {
+    return { kind: "failed", detail: "system-extension deactivation is macOS-only" };
+  }
+
+  const resolved = await resolveHostAppBinary(env, ctx);
+  if ("error" in resolved) {
+    return { kind: "failed", detail: resolved.error };
+  }
+
+  const invoke =
+    ctx.hostAppInvoke ??
+    makeLaunchServicesHostAppInvoke({
+      timeoutMs: DEACTIVATE_SYSTEM_EXTENSION_TIMEOUT_MS,
+      ...(ctx.openRunner ? { openRunner: ctx.openRunner } : {}),
+      ...(ctx.reportPathFactory ? { reportPathFactory: ctx.reportPathFactory } : {}),
+      ...(ctx.runningAppController
+        ? { runningAppController: ctx.runningAppController }
+        : {}),
+    });
+  const cliGitSha = resolveCliBuildSha(env, ctx);
+
+  // The signed host refuses deactivation while the filter is enabled too,
+  // but the CLI checks first so no destructive request is even submitted
+  // when the disarm postcondition is not positively observed.
+  const statusResult = await invoke(resolved.path, ["--headless", "status"]);
+  const statusReport = parseHeadlessReport(statusResult.stdout);
+  if (!statusReport) {
+    return {
+      kind: "failed",
+      detail:
+        statusResult.stderr.trim() ||
+        `host app status exited with code ${statusResult.exitCode}`,
+    };
+  }
+  const statusBuildMismatch = validateHeadlessBuildIdentity(statusReport, cliGitSha);
+  if (statusBuildMismatch) {
+    return { kind: "failed", detail: statusBuildMismatch };
+  }
+  if (statusReport.state !== "disabled") {
+    return {
+      kind: "failed",
+      detail: `content filter state is '${statusReport.state}', not positively observed disabled`,
+    };
+  }
+
+  const result = await invoke(resolved.path, [
+    "--headless",
+    "deactivate-system-extension",
+    "--timeout=60",
+  ]);
+  const report = parseHeadlessReport(result.stdout);
+  if (!report) {
+    return {
+      kind: "failed",
+      detail:
+        result.stderr.trim() ||
+        `host app deactivation exited with code ${result.exitCode}`,
+    };
+  }
+  const buildMismatch = validateHeadlessBuildIdentity(report, cliGitSha);
+  if (buildMismatch) {
+    return { kind: "failed", detail: buildMismatch };
+  }
+  if (report.state === "needs_user_approval") {
+    return {
+      kind: "needs-user-approval",
+      detail: report.error ?? "macOS requires operator approval",
+    };
+  }
+  if (!report.ok || result.exitCode !== 0) {
+    return {
+      kind: "failed",
+      detail:
+        report.error ??
+        (result.stderr.trim() ||
+          `host app deactivation exited with code ${result.exitCode}`),
+    };
+  }
+  if (report.state === "will_complete_after_reboot") {
+    return { kind: "reboot-required" };
+  }
+  if (report.state === "deactivated") {
+    return { kind: "request-completed" };
+  }
+  return {
+    kind: "failed",
+    detail: `host app returned unexpected deactivation state '${report.state}'`,
+  };
 }
 
 /**
@@ -4239,6 +4520,7 @@ async function runArmDisarmInner(
   }
 
   const parsed = parseCastleWallArgs(argv);
+  if (writeCastleWallParseError(parsed, err)) return 2;
   const fortressPath = resolveFortressArg(parsed.fortress, env);
   const socketPath = resolveCastleWallSocketPath({
     platform,
@@ -4470,6 +4752,7 @@ async function runArmDisarmInner(
   // (the CLI does not know harness endpoints); the endpoint-specific static +
   // as-uid verification lives in the auto-provision flow.
   let allowNoEgressOverrideUsed = false;
+  let allowNoEgressQuarantineUid: number | null = null;
   if (action === "enable") {
     const originMode = await readAgentOriginModeBestEffort(fortressPath);
     if (originMode === "uid") {
@@ -4502,6 +4785,7 @@ async function runArmDisarmInner(
           return 1;
         }
         allowNoEgressOverrideUsed = true;
+        allowNoEgressQuarantineUid = await readAgentOriginUidBestEffort(fortressPath);
         write(
           err,
           "WARNING: --allow-no-egress: arming a uid-mode wall with ZERO agent-matchable\n" +
@@ -4518,8 +4802,93 @@ async function runArmDisarmInner(
     return 1;
   }
 
+  if (allowNoEgressOverrideUsed) {
+    if (allowNoEgressQuarantineUid === null) {
+      write(
+        err,
+        "Refusing to arm: --allow-no-egress was requested, but the uid-mode agent-origin descriptor could not be resolved.\n" +
+          `${GENERIC_UID_CONFINEMENT_REMEDY} Then retry. The wall was not armed.\n`,
+      );
+      await appendCastleWallCliAuditBestEffort(
+        EGRESS_PROVISION_REFUSED_AUDIT_OP,
+        {
+          source: "castle-wall-cli",
+          guard: "deny-all-quarantine-uid-resolution",
+          agent_origin_mode: "uid",
+          negative_control_host: AGENT_EGRESS_NEGATIVE_CONTROL_HOST,
+          negative_control_port: 443,
+          observed: "unverified",
+          disarm_outcome: "not-armed",
+        },
+        fortressPath,
+        env,
+        err,
+      );
+      return 1;
+    }
+    const preflightProbe = ctx.sudoPreflightProbe ?? defaultSudoPreflightProbe;
+    const preflightResult = await preflightProbe(allowNoEgressQuarantineUid);
+    // A missing sudo credential must refuse before the wall is armed, so an inconclusive probe is never mistaken
+    // for a wall failure and the operator is never left with an armed wall they were told to disarm.
+    if (!preflightResult.ok) {
+      write(
+        err,
+        renderSudoPreflightRefusal(allowNoEgressQuarantineUid, preflightResult),
+      );
+      await appendCastleWallCliAuditBestEffort(
+        EGRESS_PROVISION_REFUSED_AUDIT_OP,
+        {
+          source: "castle-wall-cli",
+          guard: "sudo-preflight",
+          agent_origin_mode: "uid",
+          agent_uid: allowNoEgressQuarantineUid,
+          exit_code: preflightResult.exitCode,
+          ...(preflightResult.stderr?.trim()
+            ? { stderr: preflightResult.stderr.trim() }
+            : {}),
+          disarm_outcome: "not-armed",
+        },
+        fortressPath,
+        env,
+        err,
+      );
+      return 1;
+    }
+  }
+
   const invoke = ctx.hostAppInvoke ?? defaultArmInvoke(ctx, action);
   const cliGitSha = resolveCliBuildSha(env, ctx);
+  if (action === "enable") {
+    // Identity is a PRECONDITION to mutation, not a postcondition. The old
+    // ordering invoked `--headless enable` first and only then rejected a
+    // stale deployed app, which could leave the NE preference enabled while
+    // returning failure before the authenticated arm lease was sent. Read the
+    // deployed app's identity through the non-mutating status action first;
+    // any missing/mismatched identity refuses without calling enable.
+    const identityProbe = await invoke(resolved.path, ["--headless", "status"]);
+    if (identityProbe.stderr.trim()) {
+      write(err, identityProbe.stderr.trimEnd() + "\n");
+    }
+    const identityReport = parseHeadlessReport(identityProbe.stdout);
+    if (!identityReport) {
+      const detail =
+        identityProbe.stderr.trim() ||
+        `host app status exited with code ${identityProbe.exitCode}`;
+      write(
+        err,
+        `castle-wall enable failed before arming: deployed app identity could not be verified (${detail}).\n`,
+      );
+      return 1;
+    }
+    const buildMismatch = validateHeadlessBuildIdentity(
+      identityReport,
+      cliGitSha,
+    );
+    if (buildMismatch) {
+      write(err, `castle-wall enable failed before arming: ${buildMismatch}\n`);
+      return 1;
+    }
+  }
   const headlessArgs = ["--headless", action];
   if (action === "enable") {
     if (parsed.noTtl) headlessArgs.push("--no-ttl");
@@ -4686,6 +5055,47 @@ async function runArmDisarmInner(
       );
       return 1;
     }
+    if (allowNoEgressOverrideUsed) {
+      const smokeInput: DenyAllQuarantineProbeInput = {
+        // The pre-arm block above returns unless `--allow-no-egress` has a resolved, sudo-preflighted uid.
+        agentUid: allowNoEgressQuarantineUid!,
+        host: AGENT_EGRESS_NEGATIVE_CONTROL_HOST,
+        port: 443,
+      };
+      const smokeProbe = ctx.denyAllQuarantineProbe ?? defaultDenyAllQuarantineProbe;
+      const smokeResult = await smokeProbe(smokeInput);
+      // The sudo preflight above proves this probe could run as the uid before arming; an unverified smoke here is
+      // an enforcement uncertainty, not a cold sudo credential miss.
+      if (!smokeResult.verified || smokeResult.reachable) {
+        write(err, renderDenyAllQuarantineProbeRefusal(smokeInput, smokeResult));
+        await appendCastleWallCliAuditBestEffort(
+          EGRESS_PROVISION_REFUSED_AUDIT_OP,
+          {
+            source: "castle-wall-cli",
+            guard: "deny-all-quarantine-smoke",
+            agent_origin_mode: "uid",
+            agent_uid: smokeInput.agentUid,
+            negative_control_host: smokeInput.host,
+            negative_control_port: smokeInput.port,
+            observed: smokeResult.reachable
+              ? "reachable"
+              : smokeResult.verified
+                ? "blocked"
+                : "unverified",
+            exit_code: smokeResult.exitCode,
+            disarm_outcome: "operator-action-needed",
+          },
+          fortressPath,
+          env,
+          err,
+        );
+        return 1;
+      }
+      write(
+        out,
+        `Deny-all quarantine smoke passed: uid ${smokeInput.agentUid} could not reach ${smokeInput.host}:${smokeInput.port} on the direct --noproxy path.\n`,
+      );
+    }
     const verifiedArmClaim = renderVerifiedArmClaimLine(armClaimBasis);
     write(
       out,
@@ -4737,14 +5147,18 @@ export async function runDisable(
 
 export function parseCastleWallArgs(argv: string[]): CastleWallParsedArgs {
   const parsed: CastleWallParsedArgs = {};
-  for (let i = 0; i < argv.length; i++) {
-    const arg = argv[i]!;
-    if (arg === "--fortress") {
-      parsed.fortress = argv[++i];
-    } else if (arg === "--since") {
-      parsed.since = argv[++i];
-    } else if (arg === "--ttl") {
-      parsed.ttlSeconds = parseLeaseTtlSeconds(argv[++i]);
+  // Must match consumeFlagValue in ./argv.ts: a dropped --fortress/--since value must refuse, never silently resolve the default fortress; wrong-fortress custody/daemon operations are a constraint-5 violation.
+  const fortress = consumeFlagValue(argv, "--fortress");
+  if (fortress.error !== undefined) return { parseError: fortress.error };
+  if (fortress.value !== undefined) parsed.fortress = fortress.value;
+  const since = consumeFlagValue(fortress.argv, "--since");
+  if (since.error !== undefined) return { ...parsed, parseError: since.error };
+  if (since.value !== undefined) parsed.since = since.value;
+
+  for (let i = 0; i < since.argv.length; i++) {
+    const arg = since.argv[i]!;
+    if (arg === "--ttl") {
+      parsed.ttlSeconds = parseLeaseTtlSeconds(since.argv[++i]);
     } else if (arg.startsWith("--ttl=")) {
       parsed.ttlSeconds = parseLeaseTtlSeconds(arg.slice("--ttl=".length));
     } else if (arg === "--no-ttl") {
@@ -4752,7 +5166,7 @@ export function parseCastleWallArgs(argv: string[]): CastleWallParsedArgs {
     } else if (arg.startsWith("--scope=")) {
       parsed.scope = parseScope(arg.slice("--scope=".length));
     } else if (arg === "--scope") {
-      parsed.scope = parseScope(argv[++i]);
+      parsed.scope = parseScope(since.argv[++i]);
     } else if (arg === "--force") {
       parsed.force = true;
     } else if (arg === "--allow-no-egress") {
@@ -4770,14 +5184,14 @@ export function parseCastleWallArgs(argv: string[]): CastleWallParsedArgs {
     } else if (arg.startsWith("--producer-pub-key=")) {
       parsed.producerPubKey = arg.slice("--producer-pub-key=".length);
     } else if (arg === "--producer-pub-key") {
-      parsed.producerPubKey = argv[++i];
+      parsed.producerPubKey = since.argv[++i];
     } else if (arg.startsWith("--rule=")) {
       parsed.rule = arg.slice("--rule=".length);
     } else if (arg === "--rule") {
       // `--rule` requires a value. If the next token is missing or is itself a
       // flag, do NOT consume it - flag the omission so the caller emits a usage
       // error rather than silently falling back to the raw audit dump.
-      const next = argv[i + 1];
+      const next = since.argv[i + 1];
       if (next === undefined || next.startsWith("-")) {
         parsed.ruleMissingValue = true;
       } else {
@@ -4906,13 +5320,4 @@ async function sendCastleWallMessage<T extends CastleWallMessage>(
     });
     socket.on("error", finish);
   });
-}
-
-function isSocketUnavailable(error: unknown): boolean {
-  return (
-    error instanceof Error &&
-    "code" in error &&
-    ((error as NodeJS.ErrnoException).code === "ENOENT" ||
-      (error as NodeJS.ErrnoException).code === "ECONNREFUSED")
-  );
 }

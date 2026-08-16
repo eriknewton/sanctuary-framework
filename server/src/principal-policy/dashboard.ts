@@ -22,7 +22,7 @@
 import { createServer as createHttpServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { createServer as createHttpsServer } from "node:https";
 import { readFile } from "node:fs/promises";
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { exec } from "node:child_process";
 import { platform } from "node:os";
 import {
@@ -40,6 +40,7 @@ import {
   loadBrokerProducerKey,
   type BrokerProducerKeyLoad,
 } from "../broker-mcp/producer-signature.js";
+import { ASCII_LABEL_RE } from "../core/token-grammar.js";
 import { SANCTUARY_VERSION as PKG_VERSION } from "../config.js";
 import type { SanctuaryConfig } from "../config.js";
 import type { ApprovalChannel } from "./approval-channel.js";
@@ -71,6 +72,7 @@ import {
   type V11Bindings,
 } from "../dashboard/v1_1/wiring.js";
 import { getProcessInstance, getProcessSince } from "../dashboard/process-identity.js";
+import { isRemoteDashboardBinding } from "../dashboard/remote-binding.js";
 // Dashboard-fold PR-3 (ratified decision 7): the mobile companion PWA moves
 // onto the ONE surviving surface. The shell/manifest/service-worker are
 // tokenless static assets with client-side auth; see dashboard/mobile.ts for
@@ -104,7 +106,7 @@ import {
 } from "../http/server-lifecycle.js";
 import { V1SessionService } from "../v1/session-service.js";
 import { handleV1Request } from "../v1/router.js";
-import { denyForbidden } from "../v1/http.js";
+import { denyForbidden, denyForbiddenWithRequestId } from "../v1/http.js";
 import {
   handlePostureRoute,
   POSTURE_API_PREFIX,
@@ -178,6 +180,7 @@ import {
   federationContextHasIssuerAuthority,
   federationEventHash,
   validateFederationEventHash,
+  isFederationNodeCertAuthPath,
   JoinCeremony,
   type FederationAppendOptions,
   type FederationAppendResult,
@@ -236,6 +239,8 @@ import {
   FederationSyncStateStore,
   type FederationSyncStateSnapshot,
 } from "../v1/federation-sync-state-store.js";
+import type { OperatorAuthorizationConsumeParams } from "../v1/operator-signed.js";
+import { OperatorAuthorizationSpentStore } from "../v1/operator-authorization-spent-store.js";
 import { FederationReissueChallengeStore } from "../v1/federation-reissue-challenge-store.js";
 import { HubNotFoundError, HubCapabilityError } from "../hub/errors.js";
 import { fromBase64url } from "../core/encoding.js";
@@ -287,6 +292,7 @@ import {
   UnifiedInboxRetentionPolicy,
   type UnifiedInboxRetentionPolicyStore,
 } from "./unified-inbox-retention-policy.js";
+import { ED25519_PUBLIC_KEY_BYTES } from "../core/crypto-suite-registry.js";
 
 // ── Types ───────────────────────────────────────────────────────────────
 
@@ -887,6 +893,7 @@ const GUARDIAN_AUDIT_COVERAGE_FINDING_KINDS: ReadonlySet<AuditIntegrityFindingKi
     "checkpoint_root_mismatch",
     "checkpoint_signature_mismatch",
     "checkpoint_signature_unverifiable",
+    "checkpoint_signature_embedded_key_untrusted",
   ]);
 
 function newerAppliedPolicy(
@@ -961,7 +968,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   private baseline: BaselineTracker | null = null;
   private auditLog: AuditLog | null = null;
   private identityManager: IdentityManager | null = null;
-  private handshakeResults: Map<string, HandshakeResult> | null = null;
+  private handshakeResults: ReadonlyMap<string, HandshakeResult> | null = null;
   private shrOpts: SHRGeneratorOptions | null = null;
   /**
    * Storage backend, injected for the Recognition panel (P5) so the dashboard
@@ -1299,6 +1306,8 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    */
   private readonly _federationAcceptedHighWater = new Map<string, number>();
   private _federationOutboundHighWater = 0;
+  private _operatorAuthorizationSpentStore = new OperatorAuthorizationSpentStore();
+  private _operatorAuthorizationSpentStoreUnavailable = false;
   /**
    * Federation 3/3b P0: DURABLE peer-sync security state. The store persists +
    * rehydrates the per-sender accepted high-water, the outbound high-water, and
@@ -1460,7 +1469,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     baseline: BaselineTracker;
     auditLog: AuditLog;
     identityManager?: IdentityManager;
-    handshakeResults?: Map<string, HandshakeResult>;
+    handshakeResults?: ReadonlyMap<string, HandshakeResult>;
     shrOpts?: SHRGeneratorOptions;
     sanctuaryConfig?: SanctuaryConfig;
     profileStore?: SovereigntyProfileStore;
@@ -2698,6 +2707,8 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       nodeId,
       listAgents: () => this.v11Bindings?.hubService.listAgents() ?? [],
       resolveOperatorPublicKey: () => this.resolveOperatorPublicKey(),
+      consumeOperatorAuthorization: (params) =>
+        this.consumeV1OperatorAuthorization(params),
       enqueueUnprotect: async (agentId): Promise<UnprotectOutcome> => {
         const hub = this.v11Bindings?.hubService;
         if (!hub) return { ok: false, reason: "unavailable" };
@@ -2733,6 +2744,25 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         : {}),
       idempotency: this.v1Idempotency,
     };
+  }
+
+  private async consumeV1OperatorAuthorization({
+    replayKey,
+    expiresAt,
+    action,
+    authorizationNonce,
+    operatorPublicKey,
+  }: OperatorAuthorizationConsumeParams): Promise<"consumed" | "replayed"> {
+    if (this._operatorAuthorizationSpentStoreUnavailable) {
+      throw new Error("operator_authorization_spent_store_unavailable");
+    }
+    return await this._operatorAuthorizationSpentStore.consume({
+      replayKey,
+      expiresAt,
+      action,
+      authorizationNonce,
+      operatorPublicKey,
+    });
   }
 
   /**
@@ -2821,7 +2851,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     if (!identity?.public_key) return null;
     try {
       const key = fromBase64url(identity.public_key);
-      return key.length === 32 ? key : null;
+      return key.length === ED25519_PUBLIC_KEY_BYTES ? key : null;
     } catch {
       return null;
     }
@@ -3662,6 +3692,27 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   }
 
   /**
+   * Bind the durable replay store for OPERATOR_SIGNED v1 authorizations.
+   * This is deliberately not gated on federation provisioning: /v1/agents
+   * protect/unprotect exist in the default single-node install and must keep
+   * single-use semantics there. Load failure latches the write routes
+   * unavailable, preserving fail-closed behavior without requiring federation.
+   */
+  async setOperatorAuthorizationSpentStore(
+    store: OperatorAuthorizationSpentStore | null,
+  ): Promise<void> {
+    this._operatorAuthorizationSpentStore =
+      store ?? new OperatorAuthorizationSpentStore();
+    this._operatorAuthorizationSpentStoreUnavailable = false;
+    if (store === null) return;
+    try {
+      await store.init();
+    } catch {
+      this._operatorAuthorizationSpentStoreUnavailable = true;
+    }
+  }
+
+  /**
    * Load the durable sync-state snapshot into the live in-memory fields.
    * Internal to {@link setFederationSyncStateStore}; separated for testability.
    */
@@ -4331,6 +4382,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       federationEnabledGeneration: this._federationEnabledGeneration,
       acceptedHighWater: new Map(this._federationAcceptedHighWater),
       outboundHighWater: this._federationOutboundHighWater,
+      spentOperatorAuthorizations: new Map(),
       revokedNodeIds: new Set(this._federationState.revoked),
       highestEvictionSerial: this._federationState.evictionMaxSerial,
       revokedRootPubkeys: new Set(this._federationRevokedRoots),
@@ -4677,8 +4729,19 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * channel's audit log (design note 5: every ceremony step writes success
    * AND denial); when no audit log is bound the write is a no-op rather than a
    * throw, so a minimal rig still serves.
+   *
+   * `originKey` (LD3 FED-REISSUE-DOS-01 corroboration): the caller's rate-limit
+   * map key (see `rateLimitKey`), captured ONLY by the live HTTP dispatch in
+   * `continueHandleRequest` for the node-cert-auth class. It is optional and
+   * unused by every other caller of this builder (fleet-roster reads have no
+   * request to key on) — passing it through `issueReissueChallenge` gives the
+   * pending-reissue-challenge store a per-origin bound alongside its existing
+   * global one, without widening the `V1FederationDeps`/federation.ts contract
+   * (that interface's `issueReissueChallenge` still takes only
+   * `{fortressId, nodeId}`; the origin is folded in here, in the closure, where
+   * the request is actually in scope).
    */
-  private buildV1FederationDeps(): V1FederationDeps {
+  private buildV1FederationDeps(originKey?: string): V1FederationDeps {
     return {
       getContext: () => this._federationContext,
       isEnabled: () => this._federationEnabled,
@@ -4774,6 +4837,8 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       },
       acceptedHighWaterFor: (senderNodeId) =>
         this._federationAcceptedHighWater.get(senderNodeId) ?? null,
+      consumeOperatorAuthorization: (params) =>
+        this.consumeV1OperatorAuthorization(params),
       recordAcceptedHighWater: async (senderNodeId, highWater, certificate) => {
         // Fail closed on an unavailable durable record (corrupt-on-boot).
         if (this._federationSyncStateUnavailable) return false;
@@ -4830,7 +4895,14 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         if (this._federationReissueChallengeStoreUnavailable) {
           throw new Error("federation_reissue_challenge_store_unavailable");
         }
-        return this._federationReissueChallengeStore.issue(params);
+        // LD3 FED-REISSUE-DOS-01 corroboration: fold in the per-request origin
+        // key (undefined for non-HTTP callers) so the store can bound pending
+        // challenges per origin, not just globally. See the class doc comment
+        // above this method.
+        return this._federationReissueChallengeStore.issue({
+          ...params,
+          originKey: originKey ?? "unknown-origin",
+        });
       },
       consumeReissueChallenge: async (params) => {
         if (this._federationReissueChallengeStoreUnavailable) return false;
@@ -5341,8 +5413,9 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * C1: is this dashboard binding to a non-loopback interface?
    */
   private isRemoteBinding(): boolean {
-    const h = this.config.host;
-    return h !== "127.0.0.1" && h !== "::1" && h !== "localhost";
+    // Must match isRemoteDashboardBinding in ../dashboard/remote-binding.ts;
+    // the single-tenant and multi-tenant bind guards share that helper.
+    return isRemoteDashboardBinding(this.config.host);
   }
 
   /**
@@ -6072,26 +6145,37 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     // `/v1.1` (legacy dashboard HTML) do not match this prefix.
     if (url.pathname === "/v1" || url.pathname.startsWith("/v1/")) {
       // Ceremony endpoints get the stricter decision-class rate limit
-      // (auth brute-force guard); reads get the general limit. The federation
-      // join-submission ceremony is an auth surface too (bootstrap-token
-      // brute-force guard), so it shares the decisions budget. Federation P1: the
-      // pre-session, node-cert-authenticated peer-sync route gets its OWN
-      // dedicated bucket (no loopback exemption, IPv6 /64 aggregation, tighter
-      // budget, global concurrent-verify ceiling) because it is reachable with no
-      // session and each request triggers a crypto verification.
-      const limitClass: RateLimitClass =
-        url.pathname === "/v1/federation/sync/peer"
-          ? "federation_peer"
-          : url.pathname.startsWith("/v1/session/") ||
-              url.pathname.startsWith("/v1/federation/authorize/")
-            ? "decisions"
-            : "general";
+      // (auth brute-force guard); reads get the general limit. LD3
+      // FED-REISSUE-DOS-01: the rate class is keyed off the PRE-SESSION
+      // node-cert-authenticated CLASS PREDICATE (isFederationNodeCertAuthPath),
+      // not a literal path string. That predicate is the single source of truth
+      // for "reachable before the session gate, no Authorization header, trust
+      // decided only by a crypto verify the handler performs itself" (see its
+      // doc comment in v1/federation.ts) — router.ts already dispatches every
+      // member of the class this way, so a route added to the class later (or
+      // matched here by a stale literal) would otherwise get the loopback-exempt,
+      // uncapped "general" budget for free unauthenticated crypto work. Today the
+      // class holds `/v1/federation/sync/peer` (envelope verify) and
+      // `/v1/federation/rotate/reissue-node-cert` (challenge issue + cert-signing
+      // completion) — both get the SAME dedicated bucket (no loopback exemption,
+      // IPv6 /64 aggregation, tighter budget, global concurrent-verify ceiling)
+      // because both are reachable with no session and each request triggers
+      // real cryptographic work.
+      const limitClass: RateLimitClass = isFederationNodeCertAuthPath(
+        url.pathname,
+      )
+        ? "federation_peer"
+        : url.pathname.startsWith("/v1/session/") ||
+            url.pathname.startsWith("/v1/federation/authorize/")
+          ? "decisions"
+          : "general";
       if (!this.checkRateLimit(req, res, limitClass)) return;
-      // Federation P1 DoS hardening: bound concurrent in-flight crypto-verify on
-      // the unauthenticated peer-sync route. Over the ceiling, reject with the
-      // SAME generic 403 a verify failure returns (no distinguishable error → no
-      // membership/enabled-state oracle). The counter is released in a finally
-      // after the handler resolves.
+      // Federation P1 DoS hardening (LD3: now covers both class members via the
+      // predicate above): bound concurrent in-flight crypto-verify on the
+      // unauthenticated peer-sync/reissue routes. Over the ceiling, reject with
+      // the SAME generic 403 a verify failure on THAT route returns (no
+      // distinguishable error → no membership/enabled-state oracle). The counter
+      // is released in a finally after the handler resolves.
       //
       // DEBT (Federation P1): the per-/64 rate limit + this concurrent-verify
       // ceiling bound CPU spent on crypto verification, but do NOT bound a
@@ -6102,13 +6186,25 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       // they touch shared server-listener config (not just this route).
       if (limitClass === "federation_peer") {
         if (this.inFlightPeerVerify >= MAX_CONCURRENT_PEER_VERIFY) {
-          // Byte-identical to every other 403 on this route (incl.
-          // Cache-Control: no-store) so the over-ceiling rejection is not a
-          // wire-distinguishable oracle.
-          denyForbidden(res);
+          // The reissue route's handler (F-FED-OPAQUEDENY, v1/http.ts) attaches an
+          // opaque per-request `request_id` to EVERY denial it emits, so a
+          // pre-handler rejection at the SAME 403 status that omitted the field
+          // would itself be a wire-distinguishable shape (a caller could tell
+          // "ceiling" from "handler denial" by key count alone). Mint one here too
+          // so the two are byte-shape-identical; sync/peer's handler never attaches
+          // an id, so its ceiling rejection must NOT invent one either.
+          if (url.pathname === "/v1/federation/rotate/reissue-node-cert") {
+            denyForbiddenWithRequestId(res, randomUUID());
+          } else {
+            // Byte-identical to every other 403 on /sync/peer (incl.
+            // Cache-Control: no-store) so the over-ceiling rejection is not a
+            // wire-distinguishable oracle.
+            denyForbidden(res);
+          }
           return;
         }
         this.inFlightPeerVerify++;
+        const originKey = this.rateLimitKey(this.getRemoteAddr(req), true);
         handleV1Request(
           {
             sessions: this.v1Sessions,
@@ -6116,7 +6212,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
             buildFullStatus: () => this.buildV1FullStatus(),
             version: PKG_VERSION,
             agents: this.buildV1AgentsDeps(),
-            federation: this.buildV1FederationDeps(),
+            federation: this.buildV1FederationDeps(originKey),
           },
           req,
           res,
@@ -8208,7 +8304,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       }
 
       // Validate agent_name format (alphanumeric, hyphens, underscores)
-      if (!/^[a-zA-Z0-9_-]+$/.test(body.agent_name)) {
+      if (!ASCII_LABEL_RE.test(body.agent_name)) {
         this.writeFoldedJSON(res, 400, {
           error: "validation_error",
           message:
@@ -8470,6 +8566,13 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       return;
     }
 
+    // BOUNDED (AGENTS.md rule 8(d)): `handshakeResults` is the shared,
+    // CAPPED map from handshake/tools.ts (MAX_HANDSHAKE_RESULTS, currently
+    // 1000, itself further bounded per-origin by
+    // MAX_HANDSHAKE_RESULTS_PER_ORIGIN) — this dashboard route only ever
+    // holds a `ReadonlyMap` view (not the BoundedMap wrapper), so
+    // `boundedList()` is not reachable here, but the map's own construction
+    // already bounds this materialization to O(1000) worst case.
     const handshakes = Array.from(this.handshakeResults.values()).map(h => ({
       counterparty_id: h.counterparty_id,
       verified: h.verified,

@@ -55,6 +55,7 @@ import {
   type FortressCustodyFsOps,
   type FortressWalkResult,
 } from "../castle-wall/provision/fortress-custody.js";
+import { consumeFlagValue } from "./argv.js";
 import { appendCastleWallCliAuditBestEffort } from "./castle-wall.js";
 
 const execFileAsync = promisify(nodeExecFile);
@@ -156,16 +157,20 @@ interface ParsedRepairCustodyArgs {
   fortress?: string;
   rollback?: string;
   unknown?: string;
+  error?: string;
 }
 
 export function parseRepairCustodyArgs(argv: string[]): ParsedRepairCustodyArgs {
   const parsed: ParsedRepairCustodyArgs = {};
-  for (let i = 0; i < argv.length; i++) {
-    const arg = argv[i]!;
-    if (arg === "--fortress") {
-      parsed.fortress = argv[++i];
-    } else if (arg === "--rollback") {
-      parsed.rollback = argv[++i];
+  // Must match consumeFlagValue in ./argv.ts: a dropped --fortress value must refuse, never silently resolve the default fortress; wrong-fortress custody operations are a constraint-5 violation.
+  const fortress = consumeFlagValue(argv, "--fortress");
+  if (fortress.error !== undefined) return { error: fortress.error };
+  if (fortress.value !== undefined) parsed.fortress = fortress.value;
+
+  for (let i = 0; i < fortress.argv.length; i++) {
+    const arg = fortress.argv[i]!;
+    if (arg === "--rollback") {
+      parsed.rollback = fortress.argv[++i];
     } else {
       parsed.unknown = arg;
       return parsed;
@@ -210,6 +215,10 @@ export async function runRepairCustody(
   }
 
   const parsed = parseRepairCustodyArgs(argv);
+  if (parsed.error !== undefined) {
+    write(err, `${parsed.error}\n`);
+    return REPAIR_CUSTODY_EXIT_REFUSED;
+  }
   if (parsed.unknown !== undefined) {
     write(
       err,

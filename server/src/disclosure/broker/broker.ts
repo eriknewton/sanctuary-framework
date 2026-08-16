@@ -23,6 +23,7 @@ import {
   type SkillSecretGrant,
   type IssueTokenRequest,
   type TokenBinding,
+  type VerifiedBrokerCallerClaims,
 } from "./token-issuer.js";
 
 export interface BrokerOptions {
@@ -140,6 +141,7 @@ export class Broker {
   /** Ensure backend is initialized and unlocked. Audits the unlock. */
   async ensureUnlocked(passphrase: string): Promise<void> {
     await this.backend.ensureInitialized(passphrase);
+    // Unlock provenance is recorded through the broker audit log; callers do not infer readiness from backend state alone.
     await this.auditLog.appendCritical({
       layer: "l3",
       operation: BROKER_OPS.BACKEND_UNLOCKED,
@@ -152,6 +154,7 @@ export class Broker {
   async addSecret(name: string, value: string): Promise<void> {
     await this.withNameLock(name, async () => {
       await this.backend.addSecret(name, value);
+      // Audit after backend success only; a failed write cannot leave a false secret_added provenance row.
       await this.auditLog.appendCritical({
         layer: "l3",
         operation: BROKER_OPS.SECRET_ADDED,
@@ -212,8 +215,25 @@ export class Broker {
     );
   }
 
+  /**
+   * OPERATOR-ONLY full grant inventory (every principal's grants). Used by
+   * the `sanctuary secrets` CLI. An agent-facing surface must use
+   * {@link getGrantsForCaller} instead — see BROKER-GRANT-INVENTORY-CROSS-CALLER.
+   */
   getGrants(): SkillSecretGrant[] {
     return this.issuer.getGrants();
+  }
+
+  /**
+   * Grant inventory scoped to one verified caller — the ONLY grant listing
+   * an agent-facing surface (`broker/list_grants`) may return. `caller`
+   * must be the server-verified claims for the request (skill/agent/
+   * tenant/fortress/audience), never anything read from MCP call
+   * arguments, matching the same verified-claims contract `issueToken`
+   * enforces.
+   */
+  getGrantsForCaller(caller: VerifiedBrokerCallerClaims): SkillSecretGrant[] {
+    return this.issuer.getGrantsForCaller(caller);
   }
 
   async issueToken(req: IssueTokenRequest): Promise<TokenBinding> {
@@ -272,7 +292,7 @@ export class Broker {
   }): Promise<AuditSummary> {
     const { entries, total } = await this.mergeBrokerAuditEntries(opts);
     const limit = opts?.limit ?? 1000;
-    // Allowlist redaction at the boundary — no raw details ever leave here.
+    // Allowlist redaction at the boundary means token scopes, secret names, and denial reasons never reach agent audit reads.
     const redacted = entries.map((e) => redactAuditEntryForAgent(e));
     return { entries: redacted.slice(-limit), total };
   }

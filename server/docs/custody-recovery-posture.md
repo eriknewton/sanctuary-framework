@@ -41,6 +41,24 @@ options are exactly the `sanctuary reset-passphrase` menu:
    anything worth keeping (the running system can still export while the keychain
    unlocks).
 
+Two of those three are not reachable on a stock fortress today, and the menu says so at
+the moment you need it least. `shares` requires `recovery-shares.json` to have been
+persisted in advance; `guardian` reports itself unavailable unconditionally, because the
+transport ships with the v1.1 full mesh. On a fortress that configured neither, the menu
+that appears in this state offers exactly one usable path: `nuke`. Plan for that before
+you are in it.
+
+Two failure modes worth knowing before you run `sanctuary reset-passphrase`:
+
+- **It refuses while anything is still running.** The command aborts if `runtime.json`
+  exists under the storage path, which it does whenever a dashboard or a wrapped agent
+  is live. From the outside this reads as a broken recovery tool at the worst possible
+  moment. Close the dashboard and stop every wrapped agent first, then re-run.
+- **The export has to come first.** `nuke` destroys state and re-initializes; once it
+  completes there is nothing left to export, and the keychain unlock that made the export
+  possible is gone with the fortress it unlocked. Run the Tier-1-gated `state_export` and
+  confirm the artifact is readable off-host **before** selecting option 3.
+
 An operator who discovers they are in this state should treat the fortress as on
 borrowed time: export state through the gated flow, re-initialize, and re-establish
 full custody.

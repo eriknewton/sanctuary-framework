@@ -1,3 +1,4 @@
+// fail-before-exempt: inherited supporting file-grant coverage still passes against pre-fix source; key-resolution fail-before coverage lives in state-envelope-integrity.test.ts and master-rotation.test.ts
 /**
  * Governed File-Grant v1 -- real POSIX FsOps smoke test.
  *
@@ -224,7 +225,7 @@ describe("PosixFileGrantFsOps (real filesystem, same-uid lane)", () => {
         },
       },
     });
-    const { grantStore } = makeFileGrantTestStore();
+    const { grantStore } = await makeFileGrantTestStore();
 
     await expect(
       mintFileGrant(

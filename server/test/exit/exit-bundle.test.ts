@@ -334,4 +334,66 @@ describe("SANCTUARY_EXIT_BUNDLE_V1", () => {
     ).resolves.toMatchObject({ activated: true });
     expect((await destination.storage.list("_exit_policy_sets")).length).toBe(1);
   });
+
+  it("derives the fallback export_approval_audit_id from the injected clock, so the signed manifest is reproducible across runs", async () => {
+    const fixedNow = () => new Date("2026-01-01T00:00:00.000Z");
+    const expectedAuditId = `exit-export-${fixedNow().getTime()}`;
+
+    async function exportWithFixedClock(): Promise<{
+      export_approval_audit_id: string;
+      exported_at: string;
+    }> {
+      const source = await makeHarness();
+      const sourceIdentity = await callTool(source.tools, "identity_create", {
+        label: "source-agent",
+      });
+      const sourceIdentityId = sourceIdentity.identity_id as string;
+      await callTool(source.tools, "state_write", {
+        namespace: "agent-memory",
+        key: "handoff",
+        value: "durable state survives exit",
+        identity_id: sourceIdentityId,
+      });
+
+      const bundleDir = await mkdtemp(
+        join(tmpdir(), "sanctuary-exit-clock-determinism-")
+      );
+      tempDirs.push(bundleDir);
+      const exported = await exportExitBundle({
+        unpartitionedLegacyExport: true,
+        bundleDir,
+        storage: source.storage,
+        masterKey: source.masterKey,
+        identityManager: source.identityManager,
+        auditLog: source.auditLog,
+        reputationStore: source.reputationStore,
+        policy: DEFAULT_POLICY,
+        config: defaultConfig(),
+        stateNamespaces: ["agent-memory"],
+        keySource: "recovery-key",
+        now: fixedNow,
+        // exportApprovalAuditId intentionally omitted: this exercises the
+        // internally-generated fallback id, which must derive from the
+        // injected clock rather than a fresh ambient wall-clock read.
+      });
+      return {
+        export_approval_audit_id: exported.manifest.body.export_approval_audit_id,
+        exported_at: exported.manifest.body.exported_at,
+      };
+    }
+
+    const runOne = await exportWithFixedClock();
+    const runTwo = await exportWithFixedClock();
+
+    // Fail-before: prior to the fix, the fallback export_approval_audit_id
+    // came from a bare `Date.now()` call, so two runs (even with the same
+    // injected `now`) produced different ids and the SIGNED manifest body
+    // was not reproducible despite the caller pinning the export clock.
+    expect(runOne.export_approval_audit_id).toBe(expectedAuditId);
+    expect(runTwo.export_approval_audit_id).toBe(expectedAuditId);
+    expect(runOne.export_approval_audit_id).toBe(
+      runTwo.export_approval_audit_id
+    );
+    expect(runOne.exported_at).toBe(runTwo.exported_at);
+  });
 });

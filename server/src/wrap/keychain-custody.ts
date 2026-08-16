@@ -23,7 +23,6 @@
  * "fix" it without superseding the posture doc.
  */
 
-import { spawn } from "node:child_process";
 import { homedir, platform } from "node:os";
 import { join, resolve } from "node:path";
 import { sha256 } from "@noble/hashes/sha256";
@@ -32,6 +31,7 @@ import { generateRandomKey } from "../core/random.js";
 import { toBase64url, fromBase64url } from "../core/encoding.js";
 import { DEFAULT_STORAGE_DIR } from "../paths.js";
 import type { ExecResult } from "./exec-result.js";
+import { execKeychain } from "./keychain-exec.js";
 
 const CUSTODY_ACCOUNT = "sanctuary";
 const CUSTODY_SERVICE_PREFIX = "sanctuary-custody";
@@ -263,6 +263,11 @@ async function readKeyClassified(
       // unreachable (the operator should investigate) rather than "not-found".
       return { status: "unreachable", detail: "keychain item is malformed" };
     }
+    // 32 = the 256-bit width of every key this reader classifies. It is
+    // generic over the two keyring items (the custody key read by
+    // `readKeychainCustodyKey` and the recovery key probed by
+    // `probeKeychainRecoveryKey`), so it names neither; both are consumed at
+    // that width in `core/master-custody.ts`.
     if (bytes.length !== 32) {
       return { status: "unreachable", detail: "keychain item has wrong length" };
     }
@@ -448,6 +453,9 @@ export async function storeRecoveryKeyInKeychain(
   }
 
   try {
+    // 32 = the 256-bit recovery key. Same minted value the operator is shown
+    // once (see this function's doc comment), so the width must match
+    // `decodeRecoveryKey` in `core/master-custody.ts`, which accepts it.
     if (recoveryKeyBytes.length !== 32) {
       throw new RecoveryKeyKeychainStoreError(service);
     }
@@ -482,21 +490,7 @@ async function defaultExec(
   args: string[],
   input?: string
 ): Promise<ExecResult> {
-  return new Promise((resolvePromise, reject) => {
-    const child = spawn(cmd, args, { stdio: ["pipe", "pipe", "pipe"] });
-    let stdout = "";
-    let stderr = "";
-    child.stdout.on("data", (d) => {
-      stdout += d.toString();
-    });
-    child.stderr.on("data", (d) => {
-      stderr += d.toString();
-    });
-    child.on("error", reject);
-    child.on("close", (code) => resolvePromise({ stdout, stderr, code }));
-    if (input !== undefined) {
-      child.stdin.write(input);
-    }
-    child.stdin.end();
-  });
+  // Routed through the single credential-CLI chokepoint so tests can never
+  // reach the operator's real login keychain. See src/wrap/keychain-exec.ts.
+  return execKeychain(cmd, args, input);
 }

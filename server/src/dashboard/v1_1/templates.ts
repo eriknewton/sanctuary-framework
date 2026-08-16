@@ -1,5 +1,5 @@
 /**
- * Sanctuary v1.1 Dashboard — Display Template Registry
+ * Sanctuary v1.1 Dashboard - Display Template Registry
  *
  * Backends emit (display_template_id, display_template_args). The dashboard
  * owns the human-readable strings. This module is the single source of
@@ -91,13 +91,13 @@ function shortTime(iso: string | null): string {
 const TEMPLATES: Record<string, TemplateRenderer> = {
   // ── approval_pending.tier1.* ─────────────────────────────────────────
   "approval_pending.tier1.lockdown": (a) =>
-    `Lock down agent ${arg(a, "agent_id")}. This stops all egress and freezes gates.`,
+    `Cut agent ${arg(a, "agent_id")}'s network access. The agent keeps running and keeps local access; it stops reaching anything off this machine.`,
   "approval_pending.tier1.fortress_lockdown": () =>
-    "Lockdown approval pending. Approving locks the entire fortress: writes are blocked, reads continue with LOCKED posture signals, active operations may fail, and agent workflows stop until the operator recovers or restarts them.",
+    "Lockdown approval pending. Approving revokes network access for confined agents. Agents keep running and keep local access; off-machine reachability is cut when Castle Wall reloads.",
   "approval_pending.tier1.fortress_exit_bundle_export": () =>
     "Export the entire fortress as a portable exit bundle.",
   "approval_pending.tier1.unwrap": (a) =>
-    `Unwrap agent ${arg(a, "agent_id")}. Protection and registry binding will be removed.`,
+    `Unwrap request for agent ${arg(a, "agent_id")}. This build refuses unsupported unwraps before approval is queued.`,
   "approval_pending.tier1.policy_change": (a) =>
     `Bind agent ${arg(a, "agent_id")} to policy ${arg(a, "policy_id")}.`,
   "approval_pending.tier1.policy_change_template": (a) =>
@@ -206,6 +206,20 @@ const TEMPLATES: Record<string, TemplateRenderer> = {
     `Internal handoff event involving agent ${arg(a, "agent_id")}.`,
   "activity.lifecycle": (a) =>
     `Lifecycle change on agent ${arg(a, "agent_id")} at ${shortTime(arg(a, "iso8601", ""))}.`,
+  "activity.lifecycle.agent_lockdown_engaged": (a) =>
+    `Network access revoked for agent ${arg(a, "agent_id")}.`,
+  "activity.lifecycle.agent_lockdown_partial": (a) =>
+    `Network access was revoked on disk for agent ${arg(a, "agent_id")}, but the live Castle Wall reload was not confirmed.`,
+  "activity.lifecycle.agent_lockdown_refused": (a) =>
+    `Network stop refused for agent ${arg(a, "agent_id")}.`,
+  "activity.lifecycle.fortress_lockdown_engaged": () =>
+    "Fortress lockdown engaged for all confined agents.",
+  "activity.lifecycle.fortress_lockdown_partial": () =>
+    "Fortress lockdown partially engaged; at least one confined agent could not be locked.",
+  "activity.lifecycle.fortress_lockdown_failed": () =>
+    "Fortress lockdown failed; no confined agent was locked.",
+  "activity.lifecycle.fortress_lockdown_no_agents": () =>
+    "Fortress lockdown found no confined agents to lock.",
   "activity.agent_policy_change_engaged": (a) =>
     `Template binding changed on agent ${arg(a, "agent_id")}: ${arg(a, "channel_template_id", "default none")} to ${arg(a, "policy_id")}.`,
   "activity.agent_policy_change_denied": (a) =>

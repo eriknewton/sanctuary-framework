@@ -32,7 +32,7 @@ Strip away the marketing and every "sovereign AI" offering answers three questio
 
 Residency answers none of these. A data center in Frankfurt with someone else's keys is a promise with better geography.
 
-Custody answers all three. Custody means the keys are generated on your hardware and never leave it. It means the deny is enforced below the agent, at the kernel, where a prompt-injected agent can't talk its way past it. It means the log is signed and chained so that silence and tampering are both detectable.
+Custody answers all three. Custody means the keys are generated on your hardware and never leave it. It means the deny is enforced below the agent, at the kernel, where a prompt-injected agent can't talk its way past it. It means the log is hash-chained so that tampering is detectable under strict verification. Production audit checkpoints are currently unsigned.
 
 Residency is a location. Custody is a power relationship. The industry keeps selling you the first and calling it the second.
 
@@ -50,7 +50,20 @@ Sanctuary is operator custody at the agent runtime. Not a promise. A mechanism, 
 
 On Linux: kernel-level egress enforcement, shipped in May, with the bypass paths you'd actually try (plain DNS, DoH, DoT) covered by integration tests against a real kernel binding.
 
-On macOS: a signed and notarized system extension enforcing a signed operator policy. In June we drilled it on real hardware: the agent's account blocked from a non-allowlisted destination, reaching its allowlisted one, the operator's account untouched, in the same armed window. Then we rebooted the machine five times. The wall came back up every time, enforcing, without a human touching it.
+> **Current correction, 2026-08-07:** the integration-test coverage is real; the
+> word "shipped" was wrong. The shipped Linux daemon does not install the
+> nftables table, bind NFQUEUE, create cgroup scopes, or call the deny-by-default
+> evaluator, so Linux is source coverage rather than enforcement an operator can
+> run. The macOS evidence in the next paragraph is unaffected. Open defect:
+> **IC-02, IC-03, IC-04**.
+>
+> Audit correction, 2026-08-07: earlier versions described the log as "signed
+> and chained," which was too broad. Sanctuary's production audit log is hash-chained, but production boot
+> paths do not supply a checkpoint signer, so production checkpoints are written
+> unsigned. Open defect: **IC-05**
+>.
+
+On macOS: a signed and notarized system extension enforcing a signed operator policy. In June we drilled it on real hardware: the agent's account blocked from a non-allowlisted destination, reaching its allowlisted one, the operator's account untouched, in the same armed window. Then we rebooted the machine through five attended cycles. The wall came back up every time within the proven scope.
 
 And here's what we have not proven yet, because claims without limits are how this industry got here: that evidence covers one host and one OS version so far, and the per-flow, rule-attributed audit trail is still being built. It's the top item on our public roadmap. When it lands, "the wall blocked it" becomes "this rule blocked this flow, provably." You'll see the drill logs when it does.
 

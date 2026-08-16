@@ -52,6 +52,9 @@ function sampleSnapshot(): FederationSyncStateSnapshot {
       ["mini-1", 42],
     ]),
     outboundHighWater: 5,
+    spentOperatorAuthorizations: new Map([
+      ["spent-key-1", "2026-08-08T12:05:00.000Z"],
+    ]),
     revokedNodeIds: new Set(["evil-node", "stale-node"]),
     highestEvictionSerial: 3,
     revokedRootPubkeys: new Set(["revoked-root-k1"]),
@@ -106,6 +109,9 @@ describe("FederationSyncStateStore - durable peer-sync security state", () => {
       [...snapshot.acceptedHighWater].sort(),
     );
     expect(loaded.outboundHighWater).toBe(snapshot.outboundHighWater);
+    expect([...loaded.spentOperatorAuthorizations]).toEqual([
+      ["spent-key-1", "2026-08-08T12:05:00.000Z"],
+    ]);
     expect([...loaded.revokedNodeIds].sort()).toEqual(
       [...snapshot.revokedNodeIds].sort(),
     );
@@ -127,6 +133,9 @@ describe("FederationSyncStateStore - durable peer-sync security state", () => {
 
     expect(afterRestart.acceptedHighWater.get("linux-1")).toBe(7);
     expect(afterRestart.outboundHighWater).toBe(5);
+    expect(afterRestart.spentOperatorAuthorizations.get("spent-key-1")).toBe(
+      "2026-08-08T12:05:00.000Z",
+    );
     expect(afterRestart.revokedNodeIds.has("evil-node")).toBe(true);
     expect(afterRestart.highestEvictionSerial).toBe(3);
   });
@@ -139,6 +148,7 @@ describe("FederationSyncStateStore - durable peer-sync security state", () => {
 
     expect(loaded.acceptedHighWater.size).toBe(0);
     expect(loaded.outboundHighWater).toBe(0);
+    expect(loaded.spentOperatorAuthorizations.size).toBe(0);
     expect(loaded.revokedNodeIds.size).toBe(0);
     expect(loaded.highestEvictionSerial).toBe(0);
     expect(loaded).toEqual(emptyFederationSyncState());

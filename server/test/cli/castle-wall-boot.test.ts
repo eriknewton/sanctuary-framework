@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { access, lstat, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { access, lstat, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
@@ -11,7 +11,6 @@ import {
   bootServiceLoaded,
   bootServicePlistPresent,
   bootServiceReady,
-  deriveHomebrewStableBinDir,
   parseBootArgs,
   renderBootLaunchDaemonPlist,
   runInstallBoot,
@@ -20,6 +19,7 @@ import {
   type CastleWallBootContext,
   type ExecFileResult,
 } from "../../src/cli/castle-wall-boot.js";
+import { CASTLE_WALL_BOOT_RUNTIME_DIR } from "../../src/cli/castle-wall-boot-runtime.js";
 import {
   deriveSafeModeAuditKey,
   readBootToken,
@@ -30,6 +30,17 @@ import { FilesystemStorage } from "../../src/storage/filesystem.js";
 
 const TEST_OPERATOR_UID = String(process.getuid?.() ?? 501);
 const TEST_OPERATOR_GID = String(process.getgid?.() ?? 20);
+const BOOT_NODE = `${CASTLE_WALL_BOOT_RUNTIME_DIR}/node-${"a".repeat(64)}`;
+const BOOT_CLI = `${CASTLE_WALL_BOOT_RUNTIME_DIR}/cli-${"b".repeat(64)}.js`;
+const BOOT_SIGNER = `${CASTLE_WALL_BOOT_RUNTIME_DIR}/signer-client-${"c".repeat(64)}`;
+const BOOT_PROGRAM_ARGUMENTS = [
+  BOOT_NODE,
+  BOOT_CLI,
+  "castle-wall",
+  "daemon",
+  "--safe-mode",
+  "--launchd",
+];
 
 class CaptureStream extends Writable {
   chunks: string[] = [];
@@ -145,17 +156,9 @@ describe("castle-wall boot service (F1 Option C)", () => {
 
   describe("renderBootLaunchDaemonPlist", () => {
     const base = {
-      programArguments: [
-        "/usr/local/bin/node",
-        "/opt/sanctuary/dist/cli.js",
-        "castle-wall",
-        "daemon",
-        "--safe-mode",
-        "--launchd",
-      ],
+      programArguments: BOOT_PROGRAM_ARGUMENTS,
       fortressPath: "/Users/operator/.sanctuary",
-      signerClientPath:
-        "/Applications/Castle Wall.app/Contents/MacOS/castle-wall-signer-client",
+      signerClientPath: BOOT_SIGNER,
     };
 
     it("renders a root safe-mode plist with the expected keys and no secrets", () => {
@@ -176,52 +179,13 @@ describe("castle-wall boot service (F1 Option C)", () => {
       expect(plist).not.toContain("SANCTUARY_CASTLE_LOCAL_SIGN");
     });
 
-    it("prepends the node interpreter dir to the daemon PATH (env-shebang shim resolves node)", () => {
-      // The 2026-06-14 drill brick: launchd's minimal PATH excludes Homebrew's
-      // /opt/homebrew/bin, so a `#!/usr/bin/env node` shim crash-loops with
-      // `env: node: No such file or directory`. The fix puts node's dir on PATH.
-      const plist = renderBootLaunchDaemonPlist({ ...base, nodeBinDir: "/opt/homebrew/bin" });
+    it("keeps the root daemon PATH system-only", () => {
+      const plist = renderBootLaunchDaemonPlist(base);
       expect(plist).toContain("<key>PATH</key>");
       expect(plist).toContain(
-        "<string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>",
+        "<string>/usr/bin:/bin:/usr/sbin:/sbin</string>",
       );
-    });
-
-    it("does not duplicate a standard dir already on PATH, and rejects a relative node dir", () => {
-      const plist = renderBootLaunchDaemonPlist({ ...base, nodeBinDir: "/usr/bin" });
-      expect(plist).toContain("<string>/usr/bin:/bin:/usr/sbin:/sbin</string>");
-      expect(() =>
-        renderBootLaunchDaemonPlist({ ...base, nodeBinDir: "opt/homebrew/bin" }),
-      ).toThrow(/absolute/);
-    });
-
-    it("also prepends the stable symlink dir behind the interpreter dir (#450 item 2: brew-upgrade durability)", () => {
-      // nodeBinDir is the version-pinned Cellar keg (vanishes on `brew upgrade
-      // node`); stableBinDir is the prefix symlink dir that survives the upgrade.
-      // Both must be on PATH, with the exact interpreter first.
-      const plist = renderBootLaunchDaemonPlist({
-        ...base,
-        nodeBinDir: "/opt/homebrew/Cellar/node/25.8.2/bin",
-        stableBinDir: "/opt/homebrew/bin",
-      });
-      expect(plist).toContain(
-        "<string>/opt/homebrew/Cellar/node/25.8.2/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>",
-      );
-    });
-
-    it("dedupes the stable dir against the interpreter dir and rejects a relative stable dir", () => {
-      // If both resolve to the same dir, it appears once.
-      const plist = renderBootLaunchDaemonPlist({
-        ...base,
-        nodeBinDir: "/opt/homebrew/bin",
-        stableBinDir: "/opt/homebrew/bin",
-      });
-      expect(plist).toContain(
-        "<string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>",
-      );
-      expect(() =>
-        renderBootLaunchDaemonPlist({ ...base, stableBinDir: "opt/homebrew/bin" }),
-      ).toThrow(/absolute/);
+      expect(plist).not.toContain("/opt/homebrew");
     });
 
     it("XML-escapes paths with special characters", () => {
@@ -303,50 +267,11 @@ describe("castle-wall boot service (F1 Option C)", () => {
     });
   });
 
-  describe("deriveHomebrewStableBinDir (#450 item 2)", () => {
-    it("maps a Cellar keg interpreter to the prefix's stable bin dir", () => {
-      expect(
-        deriveHomebrewStableBinDir("/opt/homebrew/Cellar/node/25.8.2/bin/node"),
-      ).toBe("/opt/homebrew/bin");
-      expect(
-        deriveHomebrewStableBinDir("/usr/local/Cellar/node/24.0.0/bin/node"),
-      ).toBe("/usr/local/bin");
-    });
-
-    it("returns null for non-Cellar interpreters (system node, nvm, already-stable)", () => {
-      expect(deriveHomebrewStableBinDir("/usr/bin/node")).toBeNull();
-      expect(deriveHomebrewStableBinDir("/opt/homebrew/bin/node")).toBeNull();
-      expect(
-        deriveHomebrewStableBinDir("/Users/op/.nvm/versions/node/v22.0.0/bin/node"),
-      ).toBeNull();
-      // A leading /Cellar/ with no prefix is not a real keg path.
-      expect(deriveHomebrewStableBinDir("/Cellar/node/bin/node")).toBeNull();
-    });
-
-    it("refuses to derive from an UNTRUSTED Cellar prefix (codex MED: root-PATH escalation)", () => {
-      // An operator-writable `/Cellar/`-shaped prefix must never put a fallback
-      // dir on the ROOT boot daemon PATH.
-      expect(
-        deriveHomebrewStableBinDir("/Users/op/Cellar/node/25.8.2/bin/node"),
-      ).toBeNull();
-      expect(
-        deriveHomebrewStableBinDir("/tmp/evil/Cellar/node/1/bin/node"),
-      ).toBeNull();
-    });
-  });
-
   describe("bootServiceInstalled (#450 item 5 / codex: validate, not just file-exists)", () => {
     const validPlist = renderBootLaunchDaemonPlist({
-      programArguments: [
-        "/usr/local/bin/node",
-        "/opt/sanctuary/dist/cli.js",
-        "castle-wall",
-        "daemon",
-        "--safe-mode",
-        "--launchd",
-      ],
+      programArguments: BOOT_PROGRAM_ARGUMENTS,
       fortressPath: "/Users/operator/.sanctuary",
-      signerClientPath: "/Applications/Castle Wall.app/Contents/MacOS/castle-wall-signer-client",
+      signerClientPath: BOOT_SIGNER,
     });
 
     it("returns true for a well-formed boot-survival plist", async () => {
@@ -546,14 +471,12 @@ describe("castle-wall boot service (F1 Option C)", () => {
   });
 
   describe("parseBootArgs", () => {
-    it("parses both flag forms incl. --yes and --rotate", () => {
+    it("parses both flag forms incl. --yes and --rotate, and rejects retired --binary", () => {
       expect(
         parseBootArgs([
           "--fortress",
           "/f",
           "--user=op",
-          "--binary",
-          "/b",
           "--signer-client=/s",
           "--yes",
           "--rotate",
@@ -561,11 +484,20 @@ describe("castle-wall boot service (F1 Option C)", () => {
       ).toEqual({
         fortress: "/f",
         user: "op",
-        binary: "/b",
         signerClient: "/s",
         yes: true,
         rotate: true,
       });
+      expect(parseBootArgs(["--fortress=/scratch"]).fortress).toBe("/scratch");
+      expect(parseBootArgs(["--binary", "/legacy/cli"]).error).toMatch(
+        /--binary is no longer supported/,
+      );
+    });
+
+    it("refuses a missing fortress value", () => {
+      expect(parseBootArgs(["--fortress"]).error).toBe(
+        "--fortress requires a value",
+      );
     });
   });
 
@@ -692,6 +624,18 @@ describe("castle-wall boot service (F1 Option C)", () => {
   // ── install-boot ───────────────────────────────────────────────────
 
   describe("runInstallBoot", () => {
+    it("refuses a trailing fortress flag before resolving the default fortress", async () => {
+      const err = new CaptureStream();
+      const code = await runInstallBoot(["--fortress"], {
+        err,
+        platform: "darwin",
+        getuid: () => 0,
+      });
+
+      expect(code).toBe(1);
+      expect(err.text()).toContain("--fortress requires a value");
+    });
+
     async function makeInstallFixture() {
       const fortress = await makeTemp("f1-fortress-");
       const plistDir = await makeTemp("f1-plist-");
@@ -699,10 +643,13 @@ describe("castle-wall boot service (F1 Option C)", () => {
       const tokDir = await makeTemp("f1-tok-");
       const plistPath = join(plistDir, `${CASTLE_WALL_BOOT_LABEL}.plist`);
       const binary = join(binDir, "sanctuary");
+      const bootDaemon = join(binDir, "boot-runtime", "castle-wall-boot-daemon.js");
       const signerClient = join(binDir, "castle-wall-signer-client");
       const globalPin = join(binDir, "castle-pinned-pubkey.bin");
       const bootTokenPath = join(tokDir, "boot-token.bin");
       await writeFile(binary, "#!/bin/sh\n", { mode: 0o755 });
+      await mkdir(join(binDir, "boot-runtime"));
+      await writeFile(bootDaemon, "boot daemon", { mode: 0o644 });
       await writeFile(signerClient, "#!/bin/sh\n", { mode: 0o755 });
       await writeFile(globalPin, Buffer.alloc(32, 7));
       const fake = makeFakeExec({ fortress });
@@ -718,11 +665,17 @@ describe("castle-wall boot service (F1 Option C)", () => {
         plistPath,
         globalPinPath: globalPin,
         bootTokenPath,
+        installBootRuntimeFn: async () => ({
+          nodePath: BOOT_NODE,
+          cliPath: BOOT_CLI,
+          signerClientPath: BOOT_SIGNER,
+          programArguments: BOOT_PROGRAM_ARGUMENTS,
+        }),
         // No-op sleep: the post-bootstrap stability check samples the pid over a
         // multi-second window in production; tests must not actually wait.
         sleepFn: async () => {},
       };
-      const argv = ["--fortress", fortress, "--binary", binary, "--signer-client", signerClient];
+      const argv = ["--fortress", fortress, "--signer-client", signerClient];
       return { fortress, plistPath, binary, signerClient, globalPin, bootTokenPath, fake, out, err, ctx, argv };
     }
 
@@ -769,14 +722,14 @@ describe("castle-wall boot service (F1 Option C)", () => {
       expect(f.err.text()).toContain("Signer-client shim not found");
     });
 
-    it("requires --binary outside a dist install", async () => {
+    it("does not persist or require the invoking CLI path", async () => {
       const f = await makeInstallFixture();
       const code = await runInstallBoot(
         ["--fortress", f.fortress, "--signer-client", f.signerClient],
         f.ctx,
       );
-      expect(code).toBe(1);
-      expect(f.err.text()).toContain("--binary");
+      expect(code).toBe(0);
+      expect(await readFile(f.plistPath, "utf8")).not.toContain(f.binary);
     });
 
     it("auto-provisions the token, installs the safe-mode plist, verifies a live PID, and states the drill caveat", async () => {
@@ -1009,8 +962,8 @@ describe("castle-wall boot service (F1 Option C)", () => {
       const repairCalls = f.fake.calls
         .map((call, index) => ({ ...call, index }))
         .filter((call) => call.cmd === "launchctl" && (call.args[0] === "enable" || call.args[0] === "bootout"));
-      const lastEnable = repairCalls.findLast((call) => call.args[0] === "enable");
-      const lastBootout = repairCalls.findLast((call) => call.args[0] === "bootout");
+      const lastEnable = repairCalls.slice().reverse().find((call) => call.args[0] === "enable");
+      const lastBootout = repairCalls.slice().reverse().find((call) => call.args[0] === "bootout");
       expect(lastEnable?.index).toBeLessThan(lastBootout?.index ?? Number.POSITIVE_INFINITY);
     });
 
@@ -1160,6 +1113,47 @@ describe("castle-wall boot service (F1 Option C)", () => {
       const code = await runInstallBoot(f.argv, { ...f.ctx, execFileFn: failingExec });
       expect(code).toBe(1);
       expect(f.err.text()).toContain("bootstrap failed");
+    });
+
+    it("restores and reloads the prior same-fortress service when replacement bootstrap fails", async () => {
+      const f = await makeInstallFixture();
+      expect(await runInstallBoot(f.argv, f.ctx)).toBe(0);
+      const previousPlist = await readFile(f.plistPath, "utf8");
+      let bootstrapAttempts = 0;
+      const replacementExec = (cmd: string, args: string[]): ExecFileResult => {
+        if (cmd === "launchctl" && args[0] === "bootstrap") {
+          bootstrapAttempts += 1;
+          if (bootstrapAttempts === 1) {
+            return { code: 5, stdout: "", stderr: "replacement rejected" };
+          }
+        }
+        return f.fake.execFileFn(cmd, args);
+      };
+      const replacementRuntime = async () => ({
+        nodePath: BOOT_NODE,
+        cliPath: BOOT_CLI.replace(/\.js$/, "-replacement.js"),
+        signerClientPath: BOOT_SIGNER,
+        programArguments: [
+          BOOT_NODE,
+          BOOT_CLI.replace(/\.js$/, "-replacement.js"),
+          "castle-wall",
+          "daemon",
+          "--safe-mode",
+          "--launchd",
+        ],
+      });
+
+      const code = await runInstallBoot(f.argv, {
+        ...f.ctx,
+        execFileFn: replacementExec,
+        installBootRuntimeFn: replacementRuntime,
+      });
+
+      expect(code).toBe(1);
+      expect(bootstrapAttempts).toBe(2);
+      expect(await readFile(f.plistPath, "utf8")).toBe(previousPlist);
+      expect(f.fake.running).toBe(true);
+      expect(f.err.text()).toContain("reloaded its same-fortress unit");
     });
   });
 

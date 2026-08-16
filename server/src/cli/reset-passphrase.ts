@@ -47,7 +47,6 @@
  */
 
 import { createInterface, Interface as ReadlineInterface } from "node:readline";
-import { spawn } from "node:child_process";
 import {
   readdir,
   rm,
@@ -60,7 +59,9 @@ import { homedir } from "node:os";
 import { basename, join } from "node:path";
 
 import { resolveStoragePath } from "../paths.js";
+import { execKeychain } from "../wrap/keychain-exec.js";
 import { keychainServiceFor } from "../wrap/passphrase.js";
+import { consumeFlagValue } from "./argv.js";
 
 // ── Types ───────────────────────────────────────────────────────────
 
@@ -126,6 +127,16 @@ interface ParsedArgs {
   help: boolean;
 }
 
+function isStorageTargetFlagParseError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return (
+    message.startsWith("--fortress requires ") ||
+    message.startsWith("--fortress may ") ||
+    message.startsWith("--storage requires ") ||
+    message.startsWith("--storage may ")
+  );
+}
+
 // ── Public entry ────────────────────────────────────────────────────
 
 export async function runResetPassphraseCommand(
@@ -137,7 +148,16 @@ export async function runResetPassphraseCommand(
   const home = args.home ?? homedir();
   const plat = args.platformOverride ?? process.platform;
 
-  const parsed = parseArgs(args.argv);
+  let parsed: ParsedArgs;
+  try {
+    parsed = parseArgs(args.argv);
+  } catch (error) {
+    if (isStorageTargetFlagParseError(error)) {
+      err.write(`${error instanceof Error ? error.message : String(error)}\n`);
+      return 1;
+    }
+    throw error;
+  }
   if (parsed.help) {
     printUsage(out);
     return 0;
@@ -222,22 +242,26 @@ export async function runResetPassphraseCommand(
 
 function parseArgs(argv: string[]): ParsedArgs {
   const out: ParsedArgs = { exitOnCompletion: false, help: false };
-  for (let i = 0; i < argv.length; i++) {
-    const a = argv[i];
+  // Must match consumeFlagValue in ./argv.ts: a dropped --fortress/--storage value must refuse, never silently resolve the default fortress; wrong-fortress custody operations are a constraint-5 violation.
+  const fortress = consumeFlagValue(argv, "--fortress");
+  if (fortress.error !== undefined) throw new Error(fortress.error);
+  const storage = consumeFlagValue(fortress.argv, "--storage");
+  if (storage.error !== undefined) throw new Error(storage.error);
+  if (fortress.value !== undefined) out.fortress = fortress.value;
+  if (storage.value !== undefined) out.storage = storage.value;
+
+  for (let i = 0; i < storage.argv.length; i++) {
+    const a = storage.argv[i];
     if (a === "--help" || a === "-h") {
       out.help = true;
-    } else if (a === "--mode" && argv[i + 1]) {
-      const v = argv[++i] as RecoveryMode;
+    } else if (a === "--mode" && storage.argv[i + 1]) {
+      const v = storage.argv[++i] as RecoveryMode;
       if (v !== "shares" && v !== "guardian" && v !== "nuke") {
         throw new Error(
           `--mode must be one of: shares, guardian, nuke (got ${v})`
         );
       }
       out.mode = v;
-    } else if (a === "--storage" && argv[i + 1]) {
-      out.storage = argv[++i];
-    } else if (a === "--fortress" && argv[i + 1]) {
-      out.fortress = argv[++i];
     } else if (a === "--exit-on-completion") {
       out.exitOnCompletion = true;
     } else if (a && a.startsWith("--")) {
@@ -792,21 +816,17 @@ export function zeroizeBuffers(
   }
 }
 
+/**
+ * Default credential-CLI runner. Routed through the single chokepoint
+ * (`wrap/keychain-exec`) rather than spawning `security` here: this module is
+ * the FOURTH call site, and the chokepoint exists precisely because per-site
+ * spawns are whack-a-mole. Under test the chokepoint refuses the real binary,
+ * so a reset path can never delete from the operator's real login keychain.
+ */
 async function defaultExec(
   cmd: string,
   args: string[]
 ): Promise<{ stdout: string; stderr: string; code: number | null }> {
-  return await new Promise((resolve, reject) => {
-    const child = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
-    let stdout = "";
-    let stderr = "";
-    child.stdout.on("data", (d) => {
-      stdout += d.toString();
-    });
-    child.stderr.on("data", (d) => {
-      stderr += d.toString();
-    });
-    child.on("error", reject);
-    child.on("close", (code) => resolve({ stdout, stderr, code }));
-  });
+  const result = await execKeychain(cmd, args);
+  return { stdout: result.stdout, stderr: result.stderr, code: result.code };
 }

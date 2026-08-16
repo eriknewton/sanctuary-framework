@@ -142,6 +142,8 @@ async function requireEgressAllowed(params: {
   identity: string;
 }): Promise<void> {
   if (!params.gate) {
+    // Registry confirmation is an external read; without an egress decision it
+    // must remain unconfirmed rather than silently opening the network.
     throw new Erc8004EgressDeniedError("egress_gate_unavailable");
   }
 
@@ -154,6 +156,8 @@ async function requireEgressAllowed(params: {
   });
 
   if (decision.decision !== "allow") {
+    // A denied RPC read cannot upgrade assurance; the caller maps this to an
+    // unconfirmed result so offline validity never becomes registry proof.
     throw new Erc8004EgressDeniedError(
       decision.reason_code ?? "egress_denied",
     );
@@ -178,6 +182,8 @@ function makeGatedFetch(params: {
     if (!destination) {
       throw new Erc8004EgressDeniedError("invalid_rpc_url");
     }
+    // Every RPC request is re-checked at fetch time because viem owns request
+    // construction and this wrapper is the last boundary before the network.
     await requireEgressAllowed({
       gate: params.gate,
       destination,
@@ -276,6 +282,8 @@ export async function confirmErc8004RegistryOwner(
     return unconfirmed(input, "invalid_signer_address");
   }
 
+  // Only numeric ERC-8004 identities can be passed to ownerOf(uint256); any
+  // other identity remains offline-only rather than being coerced.
   const agentId = parseAgentId(input.identity);
   if (agentId === null) {
     return unconfirmed(input, "identity_not_numeric");
@@ -304,6 +312,8 @@ export async function confirmErc8004RegistryOwner(
     });
 
     const ownerAddress = String(owner);
+    // The on-chain owner must match the recovered offline signer exactly; any
+    // mismatch preserves offline validity but refuses registry_confirmed.
     if (ownerAddress.toLowerCase() !== input.signer_address.toLowerCase()) {
       return unconfirmed(input, "owner_mismatch", ownerAddress);
     }

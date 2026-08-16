@@ -214,6 +214,21 @@ sudo launchctl print system/ai.sanctuaryprotocol.castle-wall.daemon   # expect a
 `--fortress`) so the root daemon reads the right `SANCTUARY_STORAGE_PATH` and
 the logs are chowned operator-readable.
 
+### Install-boot gotchas
+
+Most of these refuse loudly, and the last one does not, which is why it is the one
+to watch. Every refusal below is a specific message, so read the text rather than
+assuming a generic failure.
+
+| Gotcha | Symptom | What to do |
+|---|---|---|
+| **Not root** | `install-boot must run as root` (exit 1) | re-run under `sudo` |
+| **No operator account resolvable** | `Cannot determine the operator account` (exit 1). Happens in a root shell that dropped `SUDO_USER`, for example a login shell started with `su -` | pass `--user <name>` explicitly |
+| **No global pin yet** | Refuses with a pointer to `setup-shared-dir` plus the helper approval and `re-pin`. Helper mode is the only boot signer, so this is a real precondition and not a warning | run the three steps it names, then re-run |
+| **Signer-client shim missing or relative** | `Signer-client shim not found at: <path> (must be an absolute existing path)` (exit 1) | pass the absolute path inside the installed app bundle |
+| **`--binary` relative or absent on an unusual install** | `--binary must be an absolute existing path`, or `Cannot resolve the installed sanctuary CLI path` | pass the absolute path to the `sanctuary` entrypoint |
+| **Fortress silently resolved to the default** | Nothing errors. `install-boot` reads `SANCTUARY_STORAGE_PATH` from **its own** environment, and `sudo` resets the environment by default, so a value you exported in your shell does not survive into the command. It falls back to `<operator home>/.sanctuary`. On a multi-tenant host the service installs, starts, reports success, and supervises the wrong tenant's fortress | pass `--fortress <absolute path>` explicitly on any host with more than one fortress, and confirm the path in the rendered plist before trusting the install |
+
 ## Uninstall / disarm paths
 
 - `sudo sanctuary castle-wall uninstall-boot --yes` removes the boot service.

@@ -11,6 +11,7 @@ import { derivePurposeKey } from "../../src/core/key-derivation.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import { AuditLog } from "../../src/operational/audit-log.js";
 import { FileGrantStore } from "../../src/file-grant/store.js";
+import { persistStoredIdentity } from "../util/persist-stored-identity.js";
 import type {
   FileGrantAclResult,
   FileGrantGrantedReadAce,
@@ -22,12 +23,13 @@ import type {
 } from "../../src/file-grant/types.js";
 
 /** A real `FileGrantStore` backed by an in-memory StateStore, for tests that want real store code without touching disk. */
-export function makeFileGrantTestStore() {
+export async function makeFileGrantTestStore() {
   const storage = new MemoryStorage();
   const masterKey = generateRandomKey();
   const stateStore = new StateStore(storage, masterKey);
   const identityEncKey = derivePurposeKey(masterKey, "identity-encryption");
   const { storedIdentity } = createIdentity("operator", identityEncKey, "passphrase");
+  await persistStoredIdentity(storage, masterKey, storedIdentity);
   const grantStore = new FileGrantStore(stateStore, {
     identityId: storedIdentity.identity_id,
     encryptedPrivateKey: storedIdentity.encrypted_private_key,

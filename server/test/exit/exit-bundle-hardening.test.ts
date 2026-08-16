@@ -93,7 +93,10 @@ async function exportFromSource(
     reputationStore: source.reputationStore,
     policy: DEFAULT_POLICY,
     config: defaultConfig(),
-    stateNamespaces,
+    // Omit rather than forward an empty list: the exporter rejects a
+    // supplied-but-empty selection, because that shape is what a flag parser
+    // emits when the operator named nothing and it must mean "export all."
+    ...(stateNamespaces.length > 0 ? { stateNamespaces } : {}),
     keySource: "recovery-key",
   });
 }
@@ -355,7 +358,8 @@ describe("Exit bundle hardening (full-sweep #54 + #55)", () => {
       reputationStore: source.reputationStore,
       policy: DEFAULT_POLICY,
       config: defaultConfig(),
-      stateNamespaces: [],
+      // No stateStoragePath is supplied, so discovery finds nothing; the
+      // exporter rejects an explicit empty list, so omit it.
       keySource: "recovery-key",
       didWeb: { identifier: DID_URI, authority_host: AUTHORITY_HOST },
     });
@@ -490,6 +494,50 @@ describe("Exit bundle hardening (full-sweep #54 + #55)", () => {
     await writeFile(manifestPath, jsonBytes(manifest));
   }
 
+  async function rewriteManifest(
+    bundleDir: string,
+    signer: Awaited<ReturnType<typeof makeHarness>>,
+    mutate: (manifest: {
+      body: {
+        identity_binding: {
+          identity_id: string;
+          fortress_id: string;
+          fortress_master_pubkey: string;
+          did?: string;
+        };
+      };
+      signature: string;
+    } & Record<string, unknown>) => void
+  ): Promise<void> {
+    const manifestPath = join(bundleDir, "manifest.json");
+    const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+      body: {
+        identity_binding: {
+          identity_id: string;
+          fortress_id: string;
+          fortress_master_pubkey: string;
+          did?: string;
+        };
+      };
+      signature: string;
+    } & Record<string, unknown>;
+    mutate(manifest);
+    const identity = signer.identityManager.getDefault();
+    if (!identity) throw new Error("manifest signer identity missing");
+    const identityEncryptionKey = derivePurposeKey(
+      signer.masterKey,
+      "identity-encryption"
+    );
+    manifest.signature = toBase64url(
+      identitySign(
+        canonicalizeToBytes(manifest.body),
+        identity.encrypted_private_key,
+        identityEncryptionKey
+      )
+    );
+    await writeFile(manifestPath, jsonBytes(manifest));
+  }
+
   const ACTIVATION_NAMESPACES = [
     "_exit_public_identities",
     "_exit_policy_sets",
@@ -607,6 +655,192 @@ describe("Exit bundle hardening (full-sweep #54 + #55)", () => {
     expect(result.passed).toBe(false);
     expect(result.failure_class).toBe("identity_signature_invalid");
     expect(result.identity?.signature_valid).toBe(false);
+  });
+
+  it("EXIT-PASS-01 class (loop-dry): verify FAILS on an UNVERIFIABLE reputation bundle signature", async () => {
+    // The bundle signature verdict is `boolean | "unverifiable"`. When the
+    // exporter's key cannot be resolved from the included identities the verdict
+    // is "unverifiable"; import rejects such a bundle, so the read-only verify
+    // must not report PASS on it (the EXIT-PASS-01 verify-lies shape). Pre-fix,
+    // `reputationBundleFailed` keyed on `=== false`, so "unverifiable" left
+    // `passed` true — this test fails on that code.
+    const source = await makeHarness();
+    await callTool(source.tools, "identity_create", { label: "rep-bundle-src" });
+    await callTool(source.tools, "reputation_record", {
+      interaction_id: "unverifiable-bundle-sig-001",
+      counterparty_did: "did:key:counterparty",
+      outcome: {
+        type: "transaction",
+        result: "completed",
+        metrics: { score: 100 },
+      },
+      context: "exit-hardening",
+    });
+
+    const bundleDir = await mkdtemp(join(tmpdir(), "sanctuary-exitpass-bundlesig-"));
+    tempDirs.push(bundleDir);
+    await exportFromSource(source, bundleDir);
+
+    // Sanity: an honest bundle PASSES with a positively-valid bundle signature.
+    const honest = await verifyExitBundle(bundleDir);
+    expect(honest.passed).toBe(true);
+    expect(honest.reputation?.bundle_signature_valid).toBe(true);
+
+    // Rewrite exporter_did to a DID whose key is NOT among the included
+    // identities: the verifier can no longer resolve the exporter key, so the
+    // bundle signature verdict is "unverifiable" (not merely false).
+    await tamperArtifactInternalField(
+      bundleDir,
+      "reputation_bundle",
+      (parsed) => ({
+        ...parsed,
+        exporter_did: "did:key:z6MkNotAnIncludedExporterKey0000000000000000",
+      }),
+      source
+    );
+
+    const result = await verifyExitBundle(bundleDir);
+    expect(result.reputation?.bundle_signature_valid).toBe("unverifiable");
+    expect(result.passed).toBe(false);
+    expect(result.failure_class).toBe("reputation_bundle_signature_invalid");
+  });
+
+  it("EXIT-PASS-01 class (loop-dry): a bundle with NO reputation still PASSES (no regression)", async () => {
+    // The unverifiable-bundle-sig failure only fires when a reputation bundle is
+    // present; a bundle with no reputation must not be dragged to FAIL.
+    const source = await makeHarness();
+    await callTool(source.tools, "identity_create", { label: "no-rep-src" });
+    const bundleDir = await mkdtemp(join(tmpdir(), "sanctuary-exitpass-norep-"));
+    tempDirs.push(bundleDir);
+    await exportFromSource(source, bundleDir);
+
+    const result = await verifyExitBundle(bundleDir);
+    expect(result.passed).toBe(true);
+  });
+
+  it("M-02: verifier rejects a manifest re-bound to a different identity than public_identity", async () => {
+    const sourceA = await makeHarness();
+    await callTool(sourceA.tools, "identity_create", { label: "source-a" });
+    const sourceB = await makeHarness();
+    await callTool(sourceB.tools, "identity_create", { label: "source-b" });
+
+    const bundleDir = await mkdtemp(join(tmpdir(), "sanctuary-m02-rebound-"));
+    tempDirs.push(bundleDir);
+    await exportFromSource(sourceA, bundleDir);
+
+    const honest = await verifyExitBundle(bundleDir);
+    expect(honest.passed).toBe(true);
+
+    await rewriteManifest(bundleDir, sourceB, (manifest) => {
+      const identity = sourceB.identityManager.getDefault();
+      if (!identity) throw new Error("source-b identity missing");
+      manifest.body.identity_binding = {
+        identity_id: identity.identity_id,
+        fortress_id: identity.did,
+        fortress_master_pubkey: identity.public_key,
+        did: identity.did,
+      };
+    });
+
+    const result = await verifyExitBundle(bundleDir);
+    expect(result.passed).toBe(false);
+    expect(result.failure_class).toBe("identity_binding_mismatch");
+    expect(result.identity?.signature_valid).toBe(true);
+    expect(result.warnings.join("\n")).toContain("identity_binding_mismatch");
+  });
+
+  it("M-02: verifier rejects each manifest/public_identity binding mismatch independently", async () => {
+    const sourceA = await makeHarness();
+    await callTool(sourceA.tools, "identity_create", { label: "source-a-fields" });
+    const sourceB = await makeHarness();
+    await callTool(sourceB.tools, "identity_create", { label: "source-b-fields" });
+    const identityA = sourceA.identityManager.getDefault();
+    const identityB = sourceB.identityManager.getDefault();
+    if (!identityA || !identityB) throw new Error("test identities missing");
+
+    const scenarios = [
+      {
+        name: "identity_id",
+        signer: sourceA,
+        mutate: (binding: {
+          identity_id: string;
+          fortress_id: string;
+          fortress_master_pubkey: string;
+          did?: string;
+        }) => {
+          binding.identity_id = `${binding.identity_id}-other`;
+        },
+        warning: "manifest identity_id does not match",
+      },
+      {
+        name: "fortress_master_pubkey",
+        signer: sourceB,
+        mutate: (binding: {
+          identity_id: string;
+          fortress_id: string;
+          fortress_master_pubkey: string;
+          did?: string;
+        }) => {
+          binding.identity_id = identityA.identity_id;
+          binding.fortress_id = identityA.did;
+          binding.fortress_master_pubkey = identityB.public_key;
+          binding.did = identityA.did;
+        },
+        warning: "manifest fortress_master_pubkey does not match",
+      },
+      {
+        name: "did",
+        signer: sourceA,
+        mutate: (binding: {
+          identity_id: string;
+          fortress_id: string;
+          fortress_master_pubkey: string;
+          did?: string;
+        }) => {
+          binding.did = identityB.did;
+        },
+        warning: "manifest did does not match",
+      },
+    ];
+
+    for (const scenario of scenarios) {
+      const bundleDir = await mkdtemp(
+        join(tmpdir(), `sanctuary-m02-${scenario.name}-`)
+      );
+      tempDirs.push(bundleDir);
+      await exportFromSource(sourceA, bundleDir);
+      await rewriteManifest(bundleDir, scenario.signer, (manifest) => {
+        scenario.mutate(manifest.body.identity_binding);
+      });
+
+      const result = await verifyExitBundle(bundleDir);
+      expect(result.passed, scenario.name).toBe(false);
+      expect(result.failure_class, scenario.name).toBe(
+        "identity_binding_mismatch"
+      );
+      expect(result.warnings.join("\n"), scenario.name).toContain(
+        scenario.warning
+      );
+    }
+  });
+
+  it("M-02: verifier accepts the named legacy path where manifest identity_binding.did is absent", async () => {
+    const source = await makeHarness();
+    await callTool(source.tools, "identity_create", { label: "legacy-did-absent" });
+    const bundleDir = await mkdtemp(join(tmpdir(), "sanctuary-m02-legacy-did-"));
+    tempDirs.push(bundleDir);
+    await exportFromSource(source, bundleDir);
+
+    await rewriteManifest(bundleDir, source, (manifest) => {
+      delete manifest.body.identity_binding.did;
+    });
+
+    const result = await verifyExitBundle(bundleDir);
+    expect(result.passed).toBe(true);
+    expect(result.identity?.signature_valid).toBe(true);
+    expect(result.warnings.join("\n")).toContain(
+      "legacy_identity_binding_did_absent"
+    );
   });
 
   it("#77: verifier surfaces reputation_bundle_signature_invalid when reputation bundle signature is tampered", async () => {

@@ -112,6 +112,7 @@ import {
 } from "../operational/audit-log.js";
 import { writeEpochWitness } from "./anti-rollback.js";
 import {
+  resolveAuthenticatedIdentityWriterPublicKeys,
   rotateStateEntryBytes,
   rotateStateMetaRecordBytes,
   STATE_META_PUBLIC_KEYS_KEY,
@@ -908,6 +909,8 @@ async function resolveWriter(
             encryptedPrivateKey: identity.encrypted_private_key,
             identityEncryptionKey: idKey,
             publicKey: fromBase64url(identity.public_key),
+            verificationPublicKeys:
+              resolveAuthenticatedIdentityWriterPublicKeys(identity),
           };
           break;
         } catch {
@@ -1666,6 +1669,9 @@ export async function rotateMaster(
   verifyEnvelopeMac(oldEnvelope, oldMaster);
 
   const newMaster = generateRandomKey();
+  // 12 = 96 random bits taken from the 32-byte CSPRNG draw, chosen because 12
+  // bytes is exactly 16 base64url characters with no padding. A rotation id is
+  // an opaque log/journal label, not key material.
   const rotationId = toBase64url(generateRandomKey().subarray(0, 12));
   const ctx: Ctx = {
     storage,

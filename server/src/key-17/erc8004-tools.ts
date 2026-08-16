@@ -137,7 +137,8 @@ export async function handleErc8004Request(
     },
   };
 
-  // Tier evaluation: call checkApproval BEFORE any signing
+  // Approval is the last boundary before key use; no branch below may call the
+  // signer unless this check allowed it or a pending request was approved later.
   try {
     await deps.policyGate.checkApproval(approvalRequest);
   } catch (e) {
@@ -164,7 +165,8 @@ export async function handleErc8004Request(
         inboxId = entry?.inbox_id;
       }
 
-      // Store pending request for later resolution
+      // The pending request keeps key material process-local only so a later
+      // approval can sign the same payload without persisting the master key.
       deps.pendingStore.set({
         request_id: requestId,
         registration,
@@ -214,7 +216,8 @@ export async function handleErc8004Request(
     }
   }
 
-  // Tier 1 auto-approved (or --auto-approve override): sign
+  // Tier 1 auto-approved (or CLI pre-confirmed): sign only after the policy
+  // decision path above has settled in favor of this exact registration.
   const signed = signErc8004Registration(
     deps.masterKey,
     deps.operatorId,
@@ -282,7 +285,8 @@ export async function resolvePendingRequest(
     };
   }
 
-  // Approved: sign
+  // The inbox approval is the delayed authority boundary; only an approved,
+  // still-pending request may reach the signer.
   const signed = signErc8004Registration(
     pending.master_key,
     pending.operator_id,
@@ -436,6 +440,8 @@ export function createErc8004Tools(
           });
         }
 
+        // The registry nonce is signed into the registration, so malformed
+        // nonces are refused before they can become durable signature input.
         if (
           !Number.isFinite(nonce) ||
           nonce < 0 ||

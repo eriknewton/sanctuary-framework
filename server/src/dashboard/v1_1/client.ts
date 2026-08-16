@@ -370,9 +370,9 @@ function arg(args, kind, fallback) {
 }
 
 const TEMPLATES = {
-  "approval_pending.tier1.lockdown": (a) => "Lock down agent " + arg(a,"agent_id") + ". This stops all egress and freezes gates.",
-  "approval_pending.tier1.fortress_lockdown": () => "Lockdown approval pending. Approving locks the entire fortress: writes are blocked, reads continue with LOCKED posture signals, active operations may fail, and agent workflows stop until the operator recovers or restarts them.",
-  "approval_pending.tier1.unwrap": (a) => "Unwrap agent " + arg(a,"agent_id") + ". Protection and registry binding will be removed.",
+  "approval_pending.tier1.lockdown": (a) => "Cut agent " + arg(a,"agent_id") + "'s network access. The agent keeps running and keeps local access; it stops reaching anything off this machine.",
+  "approval_pending.tier1.fortress_lockdown": () => "Lockdown approval pending. Approving revokes network access for confined agents. Agents keep running and keep local access; off-machine reachability is cut when Castle Wall reloads.",
+  "approval_pending.tier1.unwrap": (a) => "Unwrap request for agent " + arg(a,"agent_id") + ". This build refuses unsupported unwraps before approval is queued.",
   "approval_pending.tier1.policy_change": (a) => "Bind agent " + arg(a,"agent_id") + " to policy " + arg(a,"policy_id") + ".",
   "approval_pending.tier1.policy_change_template": (a) => "Bind agent " + arg(a,"agent_id") + " to template " + arg(a,"policy_id") + ".",
   "approval_pending.tier1.exit_bundle_export": (a) => "Export the fortress as a portable bundle. Agent: " + arg(a,"agent_id","all agents") + ".",
@@ -418,6 +418,13 @@ const TEMPLATES = {
   "activity.privacy": (a) => "Privacy event recorded for agent " + arg(a,"agent_id") + ".",
   "activity.handoff": (a) => "Internal handoff event involving agent " + arg(a,"agent_id") + ".",
   "activity.lifecycle": (a) => "Lifecycle change on agent " + arg(a,"agent_id") + ".",
+  "activity.lifecycle.agent_lockdown_engaged": (a) => "Network access revoked for agent " + arg(a,"agent_id") + ".",
+  "activity.lifecycle.agent_lockdown_partial": (a) => "Network access was revoked on disk for agent " + arg(a,"agent_id") + ", but the live Castle Wall reload was not confirmed.",
+  "activity.lifecycle.agent_lockdown_refused": (a) => "Network stop refused for agent " + arg(a,"agent_id") + ".",
+  "activity.lifecycle.fortress_lockdown_engaged": () => "Fortress lockdown engaged for all confined agents.",
+  "activity.lifecycle.fortress_lockdown_partial": () => "Fortress lockdown partially engaged; at least one confined agent could not be locked.",
+  "activity.lifecycle.fortress_lockdown_failed": () => "Fortress lockdown failed; no confined agent was locked.",
+  "activity.lifecycle.fortress_lockdown_no_agents": () => "Fortress lockdown found no confined agents to lock.",
   "activity.agent_policy_change_engaged": (a) => "Template binding changed on agent " + arg(a,"agent_id") + ": " + arg(a,"channel_template_id","default none") + " to " + arg(a,"policy_id") + ".",
   "activity.agent_policy_change_denied": (a) => "Template binding denied on agent " + arg(a,"agent_id") + ": " + arg(a,"channel_template_id","default none") + " to " + arg(a,"policy_id") + ".",
   "activity.config": (a) => "Configuration change applied.",
@@ -619,16 +626,19 @@ function renderTopbar() {
     '<span class="pill" data-pill="mode">mode: ' + escHtml(state.topbarPills.mode) + '</span>',
     renderTopbarAttestationBadge(state.topbarPills.attestation)
   ].join("");
-  // Lockdown button three-state UX (binding addendum 3).
+  // Lockdown button reflects the approved handler's reported outcome.
   const btn = document.getElementById("btn-lockdown");
   if (!btn) return;
   const t1 = state.tier1.lockdown;
-  btn.classList.remove("tier1-pending", "tier1-engaged");
+  btn.classList.remove("tier1-pending", "tier1-partial", "tier1-engaged");
   btn.disabled = false;
   if (t1.state === "pending") {
     btn.textContent = "Awaiting approval";
     btn.classList.add("tier1-pending");
     btn.disabled = true;
+  } else if (t1.state === "partial") {
+    btn.textContent = "Lockdown partial";
+    btn.classList.add("tier1-partial");
   } else if (t1.state === "engaged") {
     btn.textContent = "Lockdown ON";
     btn.classList.add("tier1-engaged");
@@ -1545,6 +1555,9 @@ function renderHealthPage() {
   const lockedDown = state.agents.filter(function (a) { return a.status === "locked_down"; }).length;
   const errored = state.agents.filter(function (a) { return a.status === "error"; }).length;
   const recentDenials = state.activity.filter(function (e) { return e.category === "denial"; }).length;
+  // No hub verifier route exists; this renders an honest unavailable state,
+  // never a button that posts to a missing endpoint.
+  const auditVerifyState = '<p class="muted">Audit-chain verification is not available from this dashboard in this build.</p>';
   return '<h1>Health</h1>' +
     '<p class="muted">Projected from existing data.</p>' +
     '<div class="card"><h3>Fortress at a glance</h3>' +
@@ -1555,7 +1568,7 @@ function renderHealthPage() {
       '<dt>Denials in feed</dt><dd>' + escHtml(recentDenials) + '</dd>' +
       '</dl>' +
     '</div>' +
-    '<button class="btn" data-action="run-full-audit">Run full audit</button>';
+    auditVerifyState;
 }
 
 // ── Render: intelligence ───────────────────────────────────────────────
@@ -1916,7 +1929,7 @@ async function fetchIntelligenceState() {
       return;
     }
     if (e.status === 401) {
-      state.intelligence.loadError = "Dashboard authentication required. Reload the page or re-launch the dashboard with: sanctuary dashboard --fortress <path>";
+      state.intelligence.loadError = "Dashboard authentication required. Reload the page or re-launch the dashboard with: sanctuary --fortress <path> dashboard";
       return;
     }
     state.intelligence.loadError = e.message;
@@ -1931,7 +1944,7 @@ async function fetchIntelligenceState() {
       return;
     }
     if (e.status === 401) {
-      state.intelligence.loadError = "Dashboard authentication required. Reload the page or re-launch the dashboard with: sanctuary dashboard --fortress <path>";
+      state.intelligence.loadError = "Dashboard authentication required. Reload the page or re-launch the dashboard with: sanctuary --fortress <path> dashboard";
       return;
     }
     state.intelligence.loadError = e.message;
@@ -2197,16 +2210,19 @@ function renderPolicyCenter() {
           ? "$" + escHtml(a.budget_summary.daily.cap) + "/day"
           : "Not set";
         const open = state.templateBinding.agentId === a.agent_id;
+        // LocalAgentRecord carries real template and budget fields only; these
+        // cells use an honest empty state, never invented policy detail.
+        const policyDetailUnavailable = '<span class="muted">Not available yet</span>';
         return '<tr>' +
           '<td><button class="link-btn" data-action="open-agent" data-agent-id="' + escHtml(a.agent_id) + '">' + escHtml(a.agent_id) + '</button></td>' +
           '<td><button class="template-cell" data-action="template-picker-open" data-agent-id="' + escHtml(a.agent_id) + '">' + escHtml(binding) + '</button>' +
             (open ? renderTemplatePicker(a) : '') +
           '</td>' +
-          '<td><span class="allow-count">12</span> <span class="muted">.</span> <span class="block-count">3</span></td>' +
+          '<td>' + policyDetailUnavailable + '</td>' +
           '<td>' + budget + '</td>' +
-          '<td>30 d</td>' +
-          '<td><span class="toggle-on" aria-label="enabled"></span></td>' +
-          '<td>T1, T2</td>' +
+          '<td>' + policyDetailUnavailable + '</td>' +
+          '<td>' + policyDetailUnavailable + '</td>' +
+          '<td>' + policyDetailUnavailable + '</td>' +
         '</tr>';
       }).join("\n")
     : '<tr><td colspan="7" class="muted">No protected agents yet.</td></tr>';
@@ -2512,10 +2528,17 @@ function renderFortressAgentsCard() {
           { action: "lockdown", label: "Lockdown", enabled: !!c.can_lockdown, tier1: true },
           { action: "unwrap", label: "Unwrap", enabled: !!c.can_unwrap, tier1: true }
         ];
+        const disabledTipByAction = {
+          pause: "Sanctuary does not control this agent's process, so pause is not available.",
+          resume: "Sanctuary does not control this agent's process, so resume is not available.",
+          restart: "Sanctuary does not control this agent's process, so restart is not available.",
+          lockdown: "This agent is not confined to a dedicated uid, so network lockdown is not available.",
+          unwrap: "Dashboard unwrap is not implemented yet; unsupported unwraps are refused before approval is queued."
+        };
         const buttons = menuItems.map(function (mi) {
           const tip = mi.enabled
             ? (mi.tier1 ? "Tier 1: requires inbox approval." : "")
-            : "This harness does not support " + mi.label.toLowerCase() + ".";
+            : disabledTipByAction[mi.action];
           return '<button class="btn" data-action="agent-' + mi.action + '" data-agent-id="' + escHtml(a.agent_id) + '"' + (mi.enabled ? '' : ' disabled') + ' title="' + escHtml(tip) + '">' + escHtml(mi.label) + '</button>';
         }).join("");
         // Click-to-inspect: the head sub-row is the click target. A click
@@ -3455,7 +3478,7 @@ async function onAgentControl(agentId, action) {
     rerender();
   } catch (e) {
     if (e.status === 422) {
-      toast("This harness does not support " + action + ".", "error");
+      toast("Sanctuary cannot apply " + action + " for this agent: " + e.message, "error");
     } else {
       toast(action + " failed: " + e.message, "error");
     }
@@ -3473,11 +3496,20 @@ async function onInboxAction(itemId, action) {
   const boundAgentId = (item0 && item0.agent_id) || null;
   try {
     const r = await api("/inbox/" + encodeURIComponent(itemId) + "/" + action, { method: "POST", body: {} });
-    // Tier 1 lockdown engagement: the approve handler triggers the controller
-    // call. Reflect engaged state once the activity feed confirms.
     const item = (r.data && r.data.item) || null;
     if (item && state.tier1.lockdown.inboxItemId === itemId) {
-      state.tier1.lockdown.state = action === "approve" ? "engaged" : "idle";
+      const payload = item.resolution_payload || {};
+      if (action === "approve" && payload.outcome === "engaged") {
+        state.tier1.lockdown.state = "engaged";
+      } else if (action === "approve" && payload.outcome === "partial") {
+        state.tier1.lockdown.state = "partial";
+        toast("Lockdown partially applied. At least one confined agent did not confirm a live stop.", "info");
+      } else {
+        state.tier1.lockdown.state = "idle";
+        if (action === "approve" && payload.outcome) {
+          toast("Lockdown outcome: " + payload.outcome + ".", "error");
+        }
+      }
       renderTopbar();
     }
     if (state.exitDrill.inboxItemId === itemId && action === "approve") {
@@ -3625,26 +3657,6 @@ async function onInboxBatchAction(action, until) {
     rerender();
   } catch (e) {
     toast("Inbox batch action failed.", "error");
-  }
-}
-
-async function onRunFullAudit() {
-  try {
-    toast("Running audit-chain export + verify...");
-    const r = await api("/audit-chain/verify", { method: "POST", body: {} });
-    const verdict = r.data && r.data.verdict ? r.data.verdict : "unknown";
-    const entries = r.data && r.data.entries_checked ? r.data.entries_checked : "?";
-    if (verdict === "PASS") {
-      toast("Audit chain verified: " + entries + " entries, verdict PASS", "success");
-    } else {
-      toast("Audit chain verdict: " + verdict + " (" + entries + " entries checked)", "error");
-    }
-  } catch (e) {
-    if (e.status === 404) {
-      toast("Audit-chain verify endpoint not available. Run manually: sanctuary audit-chain export | sanctuary audit-chain verify --input -", "error");
-    } else {
-      toast("Audit failed: " + (e.message || "unknown error"), "error");
-    }
   }
 }
 
@@ -3974,7 +3986,6 @@ document.addEventListener("click", function (ev) {
   }
   // WP-V1.2 reshape click-to-inspect handler ────────────────────────
   if (action === "agent-inspect-open" && agentId) return void onAgentInspectOpen(agentId);
-  if (action === "run-full-audit") return void onRunFullAudit();
   if (action === "exit-export-start") return void onExitExportStart();
   if (action === "did-web-rotate-compromised") return void onDidWebCompromisedRotation();
   if (action === "exit-mark-verified") { state.exitDrill.step = 5; return rerender(); }

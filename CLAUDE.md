@@ -4,6 +4,10 @@
 
 The canonical, model-neutral agent instructions live in [`AGENTS.md`](AGENTS.md) and are imported above (Claude Code expands the `@AGENTS.md` import at session start). This section holds only the bits that are specific to Claude Code.
 
+### Prose hygiene propagation
+
+The prose-hygiene conventions in AGENTS.md (invariant comments at enforcement sites, cross-file contract pins, failure-mode notes in runbooks, derived constants, named protocol states) bind subagents too: any build-thread or Agent dispatch prompt that touches `server/src` or operational docs must restate them, because a spawned agent does not inherit this file's context automatically.
+
 ### Skill routing
 
 When the user's request matches an available skill, ALWAYS invoke it using the Skill

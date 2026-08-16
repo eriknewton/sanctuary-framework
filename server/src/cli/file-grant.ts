@@ -38,6 +38,7 @@ import type { ApprovalRequest, ApprovalResponse } from "../principal-policy/type
 import { resolveCliMasterKey } from "../core/master-custody.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
 import { loadConfig, type SanctuaryConfig } from "../config.js";
+import { flagValue } from "./argv.js";
 import {
   FILE_GRANT_DEFAULTS,
   FileGrantStore,
@@ -59,12 +60,6 @@ export interface FileGrantCommandArgs {
 
 function write(stream: Writable, text: string): void {
   stream.write(text);
-}
-
-function flagValue(argv: string[], name: string): string | undefined {
-  const index = argv.indexOf(name);
-  if (index === -1) return undefined;
-  return argv[index + 1];
 }
 
 function hasFlag(argv: string[], name: string): boolean {

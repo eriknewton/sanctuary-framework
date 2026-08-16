@@ -54,6 +54,30 @@ describe("sanctuary nodes list", () => {
     expect(JSON.parse(out.get()).nodes[0].node_id).toBe("linux-1");
   });
 
+  it("accepts equals-form value flags", async () => {
+    const out = capture();
+    const code = await runNodesCommand({
+      argv: [
+        "list",
+        "--session-token=session",
+        "--output=json",
+        "--dashboard-url=http://127.0.0.1:4500",
+      ],
+      env: {},
+      out: out.stream,
+      err: capture().stream,
+      request: async (path, _init, ctx) => {
+        expect(path).toBe("/v1/nodes");
+        expect(ctx?.authToken).toBe("session");
+        expect(ctx?.dashboardUrl).toBe("http://127.0.0.1:4500");
+        return { nodes: [], total: 0 };
+      },
+    });
+
+    expect(code).toBe(0);
+    expect(JSON.parse(out.get()).total).toBe(0);
+  });
+
   it("prints node mode and trust-boundary label in table output", async () => {
     const out = capture();
     const code = await runNodesCommand({

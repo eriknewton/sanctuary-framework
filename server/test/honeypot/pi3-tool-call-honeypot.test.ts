@@ -314,7 +314,7 @@ describe("WP-V1.3-5 Pi-3 follow-up correlation", () => {
     await rig.runtime.invokeIfTrap("admin_password_reader", {}, "agent:cline");
     nowMs += 6 * 60 * 1000;
     rig.runtime.recordToolCall("file_read", { path: "/etc/passwd" }, "agent:cline");
-    expect(rig.runtime.stats()[0]!.activations[0]!.follow_up_tool_calls).toEqual([]);
+    expect(rig.runtime.stats()[0]!.activations).toEqual([]);
   });
 });
 

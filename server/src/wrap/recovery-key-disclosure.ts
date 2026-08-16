@@ -594,6 +594,7 @@ async function writeSecretFile(opts: {
   fortressId?: string;
   now?: () => Date;
   failIfExists?: boolean;
+  metadataLines?: readonly string[];
 }): Promise<{ filePath: string; written: boolean }> {
   const filePath =
     opts.filePath !== undefined
@@ -612,6 +613,9 @@ async function writeSecretFile(opts: {
     "\n" +
     `${opts.copy.fileSecretLabel}\n` +
     `${opts.secret}\n` +
+    (opts.metadataLines && opts.metadataLines.length > 0
+      ? `\n${opts.metadataLines.join("\n")}\n`
+      : "") +
     "\n" +
     opts.copy.fileBody;
 
@@ -673,6 +677,8 @@ export async function writeRecoveryKeyFile(opts: {
   recoveryKeyFilePath?: string;
   recoveryKey: string;
   fortressId?: string;
+  /** Authenticated crash-resume receipt; not secret, but bound to this envelope. */
+  recoveryReceipt?: string;
   now?: () => Date;
 }): Promise<{ filePath: string; written: boolean }> {
   if (opts.recoveryKeyFilePath !== undefined) {
@@ -688,6 +694,12 @@ export async function writeRecoveryKeyFile(opts: {
     writeOpts.failIfExists = true;
   }
   if (opts.fortressId !== undefined) writeOpts.fortressId = opts.fortressId;
+  if (opts.recoveryReceipt !== undefined) {
+    writeOpts.metadataLines = [
+      "Recovery staging receipt:",
+      opts.recoveryReceipt,
+    ];
+  }
   if (opts.now !== undefined) writeOpts.now = opts.now;
   return writeSecretFile(writeOpts);
 }

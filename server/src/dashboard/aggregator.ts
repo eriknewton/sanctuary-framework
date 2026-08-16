@@ -620,8 +620,17 @@ function buildDisclosure(
     "reputation_publish",
   ]);
   const didActive = !!sources.identityManager?.getDefault()?.did;
+  // Reconcile-tagged re-emissions (`details.reconcile === true`) are the
+  // in-lock guard-hit re-audits reputation_record appends on an
+  // identical-args retry (LD6 gate fix-round-2 F4) -- one durable record,
+  // many tagged entries. Skipping them keeps vc_count per-CREDENTIAL, so a
+  // retry loop cannot inflate it. Filter must match posture.ts's receipt
+  // tally (`details.reconcile !== true`, buildRecognitionPanel).
   const vcCount = audit.filter(
-    (e) => e.layer === "l4" && VC_ISSUING_OPS.has(e.operation)
+    (e) =>
+      e.layer === "l4" &&
+      VC_ISSUING_OPS.has(e.operation) &&
+      e.details?.["reconcile"] !== true
   ).length;
   return {
     label: "L3 Disclosure",

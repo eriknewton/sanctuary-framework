@@ -7,21 +7,28 @@ Publish intent is separate from tag intent. Tag pushes do not publish; manual wo
 1. Land the release commit on `main`. `server/package.json` must be at the exact version string being published (example `1.0.0-rc.3` or `1.0.1`).
 2. Tag the SHA locally and push the tag, for example `git tag v1.0.1 && git push origin v1.0.1`. The tag is for git history; it does not trigger publish.
 3. Open the repo on GitHub, go to Actions, select the "Publish (manual)" workflow, click "Run workflow".
-4. Type the version string from `server/package.json` into the `version` input (do not prefix with `v`). Optionally set `ref` to the tag you just pushed; leave blank to publish from the selected branch.
-5. Click "Run workflow". The job verifies the input matches `server/package.json` at the checked-out ref, runs typecheck and tests, builds, and publishes. Pre-release versions (containing a hyphen) publish under the `next` dist-tag; plain versions publish under `latest`.
+4. Type the version string from `server/package.json` into the `version` input (do not prefix with `v`). The workflow always checks out the immutable matching tag (`v<version>`); publishing an arbitrary branch or SHA is intentionally unsupported.
+5. Click "Run workflow". The pipeline verifies the input, runs the release gates, packs one tarball, signs those exact bytes in an isolated job, stages a draft GitHub Release, publishes that tarball through npm Trusted Publishing, and only then makes the GitHub Release visible. Pre-release versions publish under `next`; plain versions publish under `latest`.
 
 ## Required repo secrets
 
-- `NPM_TOKEN` (automation token with publish access to the `@sanctuary-framework` scope). Add at Settings, Secrets and variables, Actions.
-- `RELEASE_SIGNING_KEY` (base64url of the 32-byte Ed25519 release-signing seed; activated 2026-07-01). The publish job signs `release-manifest.json` with it and attaches the manifest to the GitHub Release; the shipped product pins the corresponding public key (`PINNED_RELEASE_SIGNING_PUBLIC_KEY_B64URL` in `server/src/release-manifest.ts`) and refuses updates that do not verify. The job FAILS CLOSED, before publishing, if this secret is empty or missing: a green publish run guarantees a signed manifest was attached. The seed also has an off-host operator escrow; if the secret is lost from the repo, restore it from escrow rather than minting a new key (a new key would require a product-side pinned-key rotation to be believed by shipped clients).
+- `RELEASE_SIGNING_KEY` (canonical unpadded base64url of the 32-byte Ed25519 release-signing seed; activated 2026-07-01). Only the isolated `sign-release` job receives it. The signer derives its public key and requires an exact match with the public key pinned by shipped clients before signing. The seed also has an off-host operator escrow; restore from escrow if lost. A newly minted seed is not a substitute because shipped clients would not trust it.
+
+npm authentication uses Trusted Publishing (GitHub Actions OIDC). There is no static `NPM_TOKEN` repository secret. The OIDC-authorized job receives neither the release-signing secret nor repository-write permission, checks out no source, and publishes the prebuilt tarball with lifecycle scripts disabled.
+
+The workflow checks the release tag against the exact built commit before and after draft staging and immediately before making the release public. Git and the GitHub Releases API do not offer a cross-service transaction, so repository tag-protection rules remain the final control against a maintainer force-moving a release tag between adjacent API calls.
 
 ## Failure modes and what to do
 
 - Input version empty or does not match `server/package.json` at ref: job fails at the verify step. Fix the input or the ref, rerun.
-- "Require release signing key (fail closed)" fails: the `RELEASE_SIGNING_KEY` secret is empty or not reaching the job. Nothing was published. Restore the secret (from the operator escrow) and rerun.
-- `NPM_TOKEN` missing or expired: `npm publish` step fails. Rotate the token and rerun.
+- Signing fails because `RELEASE_SIGNING_KEY` is empty, malformed, or derives the wrong public key: nothing was published. Restore the correct escrowed seed and rerun; do not change the expected public key to make an unknown seed pass.
+- Draft staging fails: nothing was published to npm. Correct the GitHub Release/tag problem and rerun.
+- npm Trusted Publishing fails: the signed tarball may remain on a draft GitHub Release, but no public GitHub Release is announced. Correct the npm trusted-publisher configuration and rerun. npm versions are immutable, so if npm reports that the exact version already exists, verify its integrity before deciding how to finalize; never overwrite or silently substitute bytes.
+- Finalization fails after npm publication: the workflow remains red and the GitHub Release remains a draft. Verify the npm package matches the manifest, then rerun or publish the existing draft. Do not create a different tarball for the same version.
 - Tests or typecheck fail: treat as a real failure, do not bypass. Fix on a branch, merge, rerun dispatch.
 - Release dependency pin check fails: a direct release-critical dependency uses a range or its lockfile root does not match the manifest. Pin the direct dependency to the exact version being released, regenerate the relevant lockfile, and rerun `npm run check:release-dependency-pins`.
+- Release action pin check fails: a release-sensitive or manually privileged workflow invokes an external action through a mutable ref. Replace it with the reviewed 40-character commit SHA and rerun `npm run check:release-action-pins`.
+- Release key parity check fails: the workflow's signer/verifier public key differs from the key pinned by shipped clients, or either declaration is malformed/duplicated. Complete the key rotation on both surfaces and rerun `npm run check:release-key-parity`; never change only the workflow to make an unknown seed pass.
 
 ## Dependency refresh procedure
 
@@ -31,7 +38,7 @@ Release-critical dependency updates are intentional release inputs, not incident
 2. For the server package, update `server/package.json` direct `dependencies` and `devDependencies` to exact versions, then run `npm install --package-lock-only` from `server/`.
 3. For the menubar approval surface, update `menubar/package.json` direct Tauri/Vite/TypeScript dependencies to exact versions, then run `npm install --package-lock-only` from `menubar/`.
 4. For Rust-side menubar dependencies, update `menubar/src-tauri/Cargo.toml` direct release-critical crates with exact `=` requirements and refresh `menubar/src-tauri/Cargo.lock` only when the resolved version changes.
-5. Run `npm run check:release-dependency-pins`, `cd server && npm test`, and the menubar build checks available without release signing before opening the release PR.
+5. Run `npm run check:release-dependency-pins`, `npm run check:release-action-pins`, `npm run check:release-key-parity`, `cd server && npm test`, and the menubar build checks available without release signing before opening the release PR.
 
 ## Rollback
 

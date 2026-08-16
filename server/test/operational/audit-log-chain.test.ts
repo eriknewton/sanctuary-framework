@@ -67,6 +67,38 @@ async function expectStrictFinding(
   } satisfies Partial<AuditIntegrityError>);
 }
 
+function checkpointSignerFixture(masterKey: Uint8Array): {
+  publicKey: string;
+  signerKid: string;
+  signer: (payload: AuditCheckpointSigningPayload) => Promise<{
+    signer_kid: string;
+    signature: string;
+    public_key: string;
+  }>;
+} {
+  const identityKey = derivePurposeKey(masterKey, "identity-encryption");
+  const { storedIdentity } = createIdentity(
+    "checkpoint-signer",
+    identityKey,
+    "recovery-key"
+  );
+  return {
+    publicKey: storedIdentity.public_key,
+    signerKid: storedIdentity.identity_id,
+    signer: async (payload: AuditCheckpointSigningPayload) => ({
+      signer_kid: storedIdentity.identity_id,
+      signature: toBase64url(
+        identitySign(
+          checkpointSigningBytes(payload),
+          storedIdentity.encrypted_private_key,
+          identityKey
+        )
+      ),
+      public_key: storedIdentity.public_key,
+    }),
+  };
+}
+
 describe("AuditLog tamper-evident chain", () => {
   it("verifies a normal append/load chain cleanly", async () => {
     const storage = new MemoryStorage();
@@ -250,27 +282,11 @@ describe("AuditLog tamper-evident chain", () => {
   it("detects a checkpoint signature mismatch", async () => {
     const storage = new MemoryStorage();
     const masterKey = MASTER_KEY();
-    const identityKey = derivePurposeKey(masterKey, "identity-encryption");
-    const { storedIdentity } = createIdentity(
-      "checkpoint-signer",
-      identityKey,
-      "recovery-key"
-    );
-    const signer = async (payload: AuditCheckpointSigningPayload) => ({
-      signer_kid: storedIdentity.identity_id,
-      signature: toBase64url(
-        identitySign(
-          checkpointSigningBytes(payload),
-          storedIdentity.encrypted_private_key,
-          identityKey
-        )
-      ),
-      public_key: storedIdentity.public_key,
-    });
+    const { publicKey, signer } = checkpointSignerFixture(masterKey);
     const writer = new AuditLog(storage, masterKey, {
       checkpointInterval: 1,
       checkpointSigner: signer,
-      checkpointPublicKeyResolver: () => storedIdentity.public_key,
+      checkpointPublicKeyResolver: () => publicKey,
     });
     await appendCritical(writer, "signed_checkpoint");
 
@@ -286,13 +302,73 @@ describe("AuditLog tamper-evident chain", () => {
     );
 
     const reader = new AuditLog(storage, masterKey, {
-      checkpointPublicKeyResolver: () => storedIdentity.public_key,
+      checkpointPublicKeyResolver: () => publicKey,
     });
     await expect(reader.query({ limit: 100 })).rejects.toMatchObject({
       findings: expect.arrayContaining([
         expect.objectContaining({ kind: "checkpoint_signature_mismatch" }),
       ]),
     });
+  });
+
+  it("does not trust a signed checkpoint solely because it embeds its own public key", async () => {
+    const storage = new MemoryStorage();
+    const masterKey = MASTER_KEY();
+    const { signer } = checkpointSignerFixture(masterKey);
+    const writer = new AuditLog(storage, masterKey, {
+      checkpointInterval: 1,
+      checkpointSigner: signer,
+    });
+    await appendCritical(writer, "embedded_key_only_checkpoint");
+
+    const reader = new AuditLog(storage, masterKey, { integrityMode: "lenient" });
+    const result = await reader.query({ limit: 100 });
+
+    expect(result.integrity_findings).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          kind: "checkpoint_signature_embedded_key_untrusted",
+        }),
+      ])
+    );
+  });
+
+  it("accepts a signed checkpoint verified through an authenticated key resolver", async () => {
+    const storage = new MemoryStorage();
+    const masterKey = MASTER_KEY();
+    const { publicKey, signer, signerKid } = checkpointSignerFixture(masterKey);
+    const writer = new AuditLog(storage, masterKey, {
+      checkpointInterval: 1,
+      checkpointSigner: signer,
+      checkpointPublicKeyResolver: (kid) => (kid === signerKid ? publicKey : undefined),
+    });
+    await appendCritical(writer, "resolver_authenticated_checkpoint");
+
+    const reader = new AuditLog(storage, masterKey, {
+      checkpointPublicKeyResolver: (kid) => (kid === signerKid ? publicKey : undefined),
+    });
+    const result = await reader.query({ limit: 100 });
+
+    expect(result.integrity_findings).toEqual([]);
+  });
+
+  it("allows an explicit embedded-key checkpoint self-check opt-in", async () => {
+    const storage = new MemoryStorage();
+    const masterKey = MASTER_KEY();
+    const { signer } = checkpointSignerFixture(masterKey);
+    const writer = new AuditLog(storage, masterKey, {
+      checkpointInterval: 1,
+      checkpointSigner: signer,
+      trustEmbeddedCheckpointPublicKeys: true,
+    });
+    await appendCritical(writer, "embedded_key_self_check");
+
+    const reader = new AuditLog(storage, masterKey, {
+      trustEmbeddedCheckpointPublicKeys: true,
+    });
+    const result = await reader.query({ limit: 100 });
+
+    expect(result.integrity_findings).toEqual([]);
   });
 
   it("throws in strict mode and returns findings in lenient mode", async () => {

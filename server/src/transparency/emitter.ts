@@ -49,6 +49,7 @@ import {
   type EnforcementCheckpointPayload,
   type EnforcementCheckpointRecord,
 } from "./checkpoint.js";
+import { ED25519_SIGNATURE_BYTES } from "../core/crypto-suite-registry.js";
 
 export const TRANSPARENCY_CHECKPOINT_NAMESPACE = "_transparency_checkpoints";
 export const TRANSPARENCY_CHECKPOINT_KEY_PREFIX = "enforcement-checkpoint-";
@@ -266,7 +267,7 @@ export async function emitEnforcementCheckpoint(
           `transparency checkpoint signing failed (nothing was emitted): ${errorMessage(err)}`
         );
       }
-      if (signature.length !== 64) {
+      if (signature.length !== ED25519_SIGNATURE_BYTES) {
         throw new TransparencyEmitError(
           `transparency signer returned a ${signature.length}-byte signature (expected 64); nothing was emitted`
         );

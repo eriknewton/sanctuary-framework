@@ -43,6 +43,7 @@ import {
   NotifyOperatorAction,
 } from "../auto-trigger/action-dispatcher.js";
 import { CalibrationSuggester } from "../auto-trigger/calibration-suggester.js";
+import { flagValue } from "./argv.js";
 import {
   AutoTriggerError,
   type AutoTriggerRuleType,
@@ -489,12 +490,6 @@ async function cmdCancel(
   }
   ctx.err.write(`cancel: HTTP ${res.status}\n`);
   return 1;
-}
-
-function flagValue(argv: string[], name: string): string | undefined {
-  const i = argv.indexOf(name);
-  if (i === -1) return undefined;
-  return argv[i + 1];
 }
 
 function parseNumberFlag(argv: string[], name: string): number | undefined {

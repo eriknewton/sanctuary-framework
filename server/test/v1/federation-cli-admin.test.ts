@@ -1,3 +1,7 @@
+// fail-before-exempt: adapted to the shared verifyCapturedOperatorSignature helper
+// only; these assertions check signature validity, not the anti-replay spent-set
+// behavior, so they pass with or without the fix. Freshness fail-before tests:
+// v1/operator-signed.test.ts and v1/federation-http.test.ts.
 /**
  * Federation Slice 3b -- operator-signed admin CLI verb tests.
  *
@@ -194,16 +198,7 @@ describe("federation enable/disable -- operator-signed, fail-closed", () => {
     expect(action).toBe("/v1/federation/enable");
     expect(typeof body.operator_signature).toBe("string");
 
-    // Reconstruct the SERVER-side signed payload (server includes
-    // idempotency_key only when it is a string; never the signature itself).
-    const signedPayload: Record<string, unknown> = { idempotency_key: body.idempotency_key };
-    const ok = verifyOperatorSignature({
-      action,
-      payload: signedPayload,
-      signature: body.operator_signature as string,
-      operatorPublicKey: issuer.operator.publicKey,
-    });
-    expect(ok).toBe(true);
+    expect(verifyCapturedOperatorSignature({ action, body })).toBe(true);
   });
 
   it("surfaces a 503 from the server as fail-closed not-provisioned (exit 3)", async () => {
@@ -290,16 +285,7 @@ describe("federation authorize -- operator-signed bootstrap token", () => {
     expect(code).toBe(0);
     const { action, body } = captured!;
     expect(action).toBe("/v1/federation/authorize/init");
-    const ok = verifyOperatorSignature({
-      action,
-      payload: {
-        intended_node_id: body.intended_node_id,
-        intended_node_mode: body.intended_node_mode,
-      },
-      signature: body.operator_signature as string,
-      operatorPublicKey: issuer.operator.publicKey,
-    });
-    expect(ok).toBe(true);
+    expect(verifyCapturedOperatorSignature({ action, body })).toBe(true);
     const printed = JSON.parse(out.get()) as { bootstrap_token: { intended_node_id: string } };
     expect(printed.bootstrap_token.intended_node_id).toBe("joiner-linux");
   });
@@ -385,17 +371,7 @@ describe("federation revoke -- operator-signed node eviction", () => {
     expect(code).toBe(0);
     const { action, body } = captured!;
     expect(action).toBe("/v1/federation/revoke");
-    const ok = verifyOperatorSignature({
-      action,
-      payload: {
-        node_id: body.node_id,
-        reason: body.reason,
-        idempotency_key: body.idempotency_key,
-      },
-      signature: body.operator_signature as string,
-      operatorPublicKey: issuer.operator.publicKey,
-    });
-    expect(ok).toBe(true);
+    expect(verifyCapturedOperatorSignature({ action, body })).toBe(true);
     expect(JSON.parse(out.get())).toEqual({
       revoked: true,
       node_id: "joiner-linux",
@@ -548,6 +524,46 @@ describe("federation join --persist -- out-of-band pinned master", () => {
     });
     expect(code).toBe(1);
     expect(err.get()).toMatch(/unlocked operator identity|SANCTUARY_PASSPHRASE/);
+  });
+
+  it("passes --fortress=<path> to the joiner persistence layer", async () => {
+    const bootstrapToken = new JoinCeremony(issuerContextWithApprover(issuer)).authorizeInit({
+      intendedNodeId: "joiner-linux",
+      intendedNodeMode: "local",
+    });
+    const joinerPath = await mkdtemp(join(tmpdir(), "slice3b-joiner-equals-"));
+    let capturedFortressPath: string | undefined;
+    try {
+      const code = await runFederationJoin({
+        argv: [
+          "--fortress-url",
+          "http://127.0.0.1:9",
+          "--bootstrap-token",
+          JSON.stringify(bootstrapToken),
+          "--master-secret",
+          toBase64url(issuer.masterSecret),
+          "--persist",
+          "--pinned-master",
+          JSON.stringify(issuer.pinnedMaster),
+          `--fortress=${joinerPath}`,
+        ],
+        env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
+        out: capture().stream,
+        err: capture().stream,
+        request: async () => ({
+          certificate: { node_id: "joiner-linux" },
+          issuing_principal_cert: { principal_id: "issuer" },
+        }),
+        persistJoinerTrustRoot: async (params) => {
+          capturedFortressPath = params.fortressPath;
+        },
+      });
+
+      expect(code).toBe(0);
+      expect(capturedFortressPath).toBe(joinerPath);
+    } finally {
+      await rm(joinerPath, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+    }
   });
 
   it("persists a joiner trust root from a REAL join and refuses a non-chaining cert", async () => {

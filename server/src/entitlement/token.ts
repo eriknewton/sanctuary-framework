@@ -25,6 +25,7 @@ import {
   isEntitlementTier,
   type EntitlementTier,
 } from "./tier.js";
+import { ED25519_SIGNATURE_BYTES } from "../core/crypto-suite-registry.js";
 
 /** Domain separator for entitlement tokens (versioned). */
 export const ENTITLEMENT_TOKEN_DOMAIN = "sanctuary.fleet.entitlement.v1";
@@ -502,7 +503,7 @@ function decodeSignature(
   } catch {
     return { reason: "bad_signature" };
   }
-  if (signature.length !== 64) return { reason: "bad_signature" };
+  if (signature.length !== ED25519_SIGNATURE_BYTES) return { reason: "bad_signature" };
   return { signature };
 }
 

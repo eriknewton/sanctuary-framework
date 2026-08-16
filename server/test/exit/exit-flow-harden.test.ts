@@ -1,3 +1,16 @@
+// fail-before-exempt: adapted to the exporter's new contract only. This PR makes
+// a supplied-but-empty stateNamespaces array throw, so these call sites now omit
+// the option instead of passing []. Behavior is unchanged (they pass no
+// stateStoragePath, so discovery finds nothing either way) and no assertion was
+// added here, so nothing in this file can fail against pre-fix source. The
+// binding test for the fix is test/exit/exit-export-namespace-discovery.test.ts.
+// Extended 2026-08-05 for the exit cluster (A4): the H1(b) case now passes
+// `legacyRecoveryKeyIsMaster: true` because the raw-master reading of a
+// recovery key is an explicit opt-in rather than a silent guess. Against
+// pre-fix source the unknown option is simply ignored and the test passes
+// identically, so nothing here can fail-before either. The binding tests for
+// this PR are test/exit/exit-credential-path.test.ts and
+// test/exit/exit-empty-reason-and-ordering.test.ts.
 /**
  * Exit-flow harden findings (2026-06-25).
  *
@@ -140,7 +153,12 @@ async function exportFromSource(
     reputationStore: source.reputationStore,
     policy: DEFAULT_POLICY,
     config: defaultConfig(),
-    stateNamespaces: namespaces,
+    // Omit rather than forward an empty list: the exporter rejects a
+    // supplied-but-empty selection, because that shape is what a flag parser
+    // emits when the operator named nothing and it must mean "export all."
+    // This harness passes no stateStoragePath, so omitting still discovers
+    // nothing and the zero-state cases below keep their meaning.
+    ...(namespaces.length > 0 ? { stateNamespaces: namespaces } : {}),
     keySource: "recovery-key",
     ...extra,
   });
@@ -331,6 +349,12 @@ describe("Exit-flow harden H1: caller-supplied sourceMasterKey is never zeroed",
       activate: true,
       forceRebind: true,
       sourceRecoveryKey: recoveryKey,
+      // A4 (2026-08-05): this bundle has no source_custody block, so the raw-
+      // master interpretation of a recovery key is now an explicit opt-in
+      // rather than a silent guess. The H1 property under test (the import
+      // zeroes the buffer it derived) is unchanged; only the way the caller
+      // asks for that path is.
+      legacyRecoveryKeyIsMaster: true,
       destinationSignerIdentityId: destIdentity.identity_id as string,
     });
 

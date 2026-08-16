@@ -36,6 +36,7 @@ import {
 } from "./constants.js";
 import { IdentityBindingError } from "./errors.js";
 import type { AgentIdentityBinding } from "./types.js";
+import { ED25519_PRIVATE_KEY_BYTES } from "../core/crypto-suite-registry.js";
 
 /**
  * Derive the per-agent at-rest wrapping key from the fortress-master secret.
@@ -102,7 +103,7 @@ export function wrapAgentPrivateKey(params: {
   fortress_master_secret: Uint8Array;
   agent_id: string;
 }): EncryptedPayload {
-  if (params.agent_private_key.length !== 32) {
+  if (params.agent_private_key.length !== ED25519_PRIVATE_KEY_BYTES) {
     throw new IdentityBindingError(
       `wrapAgentPrivateKey: expected 32-byte Ed25519 seed; got ${params.agent_private_key.length}`
     );

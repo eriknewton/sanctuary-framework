@@ -19,6 +19,21 @@ import { sign } from "../core/identity.js";
 import { toBase64url, stringToBytes } from "../core/encoding.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
 import type { IdentityManager } from "../cognitive/tools.js";
+import {
+  SHR_MAX_AGE_MS as ATTESTATION_MAX_AGE_MS,
+  SHR_MAX_CLOCK_SKEW_MS as ATTESTATION_MAX_CLOCK_SKEW_MS,
+  SHR_MAX_DECLARED_LIFETIME_MS as ATTESTATION_MAX_DECLARED_LIFETIME_MS,
+} from "../shr/verifier.js";
+
+// A portable attestation is a relying-party freshness claim one level above
+// its embedded SHRs. Reuse the SHR policy so neither signed artifact can pick
+// a longer trust window than the verifier accepts. These aliases are exported
+// for boundary tests and must remain compile-linked to shr/verifier.ts.
+export {
+  ATTESTATION_MAX_AGE_MS,
+  ATTESTATION_MAX_CLOCK_SKEW_MS,
+  ATTESTATION_MAX_DECLARED_LIFETIME_MS,
+};
 
 // ── Attestation Types ───────────────────────────────────────────────
 
@@ -143,7 +158,13 @@ export function generateAttestation(
   const now = new Date();
   const attesterExpiry = new Date(attesterSHR.body.expires_at);
   const subjectExpiry = new Date(subjectSHR.body.expires_at);
-  const earliestExpiry = attesterExpiry < subjectExpiry ? attesterExpiry : subjectExpiry;
+  const earliestShrExpiry = attesterExpiry < subjectExpiry ? attesterExpiry : subjectExpiry;
+  const policyExpiry = new Date(
+    now.getTime() + ATTESTATION_MAX_DECLARED_LIFETIME_MS
+  );
+  const earliestExpiry = earliestShrExpiry < policyExpiry
+    ? earliestShrExpiry
+    : policyExpiry;
 
   const sovereigntyLevel = verificationResult.valid
     ? (verificationResult.sovereignty_level as SovereigntyLevel)
@@ -300,10 +321,52 @@ export function verifyAttestation(
     errors.push("Missing attester or subject SHR");
   }
 
-  // 3. Temporal validity
-  const expired = new Date(attestation.body.expires_at) <= currentTime;
-  if (expired) {
+  // 3. Temporal validity. The signature authenticates the signer's chosen
+  // timestamps; the relying party still bounds how long it will trust them.
+  const currentTimeMs = currentTime.getTime();
+  const expiresAtMs = Date.parse(attestation.body.expires_at);
+  const attestedAtMs = Date.parse(attestation.body.attested_at);
+  const hasValidExpiry = Number.isFinite(expiresAtMs);
+  const hasValidAttestedAt = Number.isFinite(attestedAtMs);
+  const expired = hasValidExpiry && expiresAtMs <= currentTimeMs;
+
+  if (!hasValidExpiry) {
+    errors.push("Attestation has an invalid expires_at timestamp");
+  } else if (expired) {
     errors.push("Attestation has expired");
+  }
+
+  if (!hasValidAttestedAt) {
+    errors.push("Attestation has an invalid attested_at timestamp");
+  } else {
+    // A timestamp accepted at the positive skew boundary can remain valid for
+    // declaredLifetime + clockSkew of verifier wall-clock time (24h05m under
+    // the current policy). That additive horizon is intentional: skew is a
+    // tolerance for clock disagreement, not extra signed lifetime.
+    const futureSkewMs = attestedAtMs - currentTimeMs;
+    if (futureSkewMs > ATTESTATION_MAX_CLOCK_SKEW_MS) {
+      errors.push(
+        `Attestation attested_at is ${Math.round(futureSkewMs / 1000)}s in the future, exceeding the ${ATTESTATION_MAX_CLOCK_SKEW_MS / 1000}s clock-skew tolerance`
+      );
+    }
+
+    const ageMs = currentTimeMs - attestedAtMs;
+    if (ageMs > ATTESTATION_MAX_AGE_MS) {
+      errors.push(
+        `Attestation age exceeds the maximum relying-party age of ${ATTESTATION_MAX_AGE_MS / (60 * 60 * 1000)}h`
+      );
+    }
+
+    if (hasValidExpiry) {
+      const declaredLifetimeMs = expiresAtMs - attestedAtMs;
+      if (declaredLifetimeMs < 0) {
+        errors.push("Attestation expires_at precedes attested_at");
+      } else if (declaredLifetimeMs > ATTESTATION_MAX_DECLARED_LIFETIME_MS) {
+        errors.push(
+          `Attestation declared lifetime exceeds the maximum of ${ATTESTATION_MAX_DECLARED_LIFETIME_MS / (60 * 60 * 1000)}h`
+        );
+      }
+    }
   }
 
   // 4. Signature verification

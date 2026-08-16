@@ -43,11 +43,16 @@ export function encrypt(
   key: Uint8Array,
   aad?: Uint8Array
 ): EncryptedPayload {
+  // 32 = the AES-256 key size (256 bits / 8). NOT an Ed25519 key length, which
+  // is also 32 bytes: `ED25519_PUBLIC_KEY_BYTES` must never be substituted here.
   if (key.length !== 32) {
     throw new Error("Key must be exactly 32 bytes (256 bits)");
   }
 
   const iv = generateIV();
+  // AAD binds caller-owned context without storing it in the envelope. Custody
+  // wraps and store codecs rely on this so a ciphertext moved to a different
+  // type, id, or domain fails authentication instead of decrypting as valid.
   const cipher = gcm(key, iv, aad);
   // @noble/ciphers gcm.encrypt appends the 16-byte auth tag to the ciphertext
   const ciphertext = cipher.encrypt(plaintext);
@@ -75,6 +80,8 @@ export function decrypt(
   key: Uint8Array,
   aad?: Uint8Array
 ): Uint8Array {
+  // 32 = the AES-256 key size (256 bits / 8); must match the check in `encrypt`
+  // above. Not an asymmetric key length.
   if (key.length !== 32) {
     throw new Error("Key must be exactly 32 bytes (256 bits)");
   }
@@ -87,6 +94,8 @@ export function decrypt(
 
   const iv = fromBase64url(payload.iv);
   const ciphertext = fromBase64url(payload.ct);
+  // The same AAD must be supplied on decrypt. The GCM tag is the swap detector,
+  // so callers do not need a parallel "expected type" field inside ciphertext.
   const cipher = gcm(key, iv, aad);
 
   // gcm.decrypt verifies the auth tag and throws if tampered

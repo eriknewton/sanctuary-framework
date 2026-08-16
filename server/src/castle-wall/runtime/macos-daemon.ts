@@ -64,6 +64,8 @@ import {
   writeFileCustody,
 } from "../../storage/custody-fs.js";
 import { MacOSFlowEventConsumer } from "./macos-flow-events.js";
+import { buildChainAnchorSourceFromAuditLog } from "./audit-consumer.js";
+import { seedMacOSAuditProducerStateFromLocalAnchor } from "./macos-audit-producer-state.js";
 import { MacOSFlowIpcListener } from "./macos-ipc-listener.js";
 import { protectionSubjectFromAgentOrigin } from "../subject-binding.js";
 import {
@@ -84,6 +86,11 @@ import {
   EGRESS_PROBE_FAILED_AUDIT_OP,
   asUidTlsProbeArgv,
 } from "../provision/egress.js";
+import {
+  ED25519_LEGACY_SEED_AND_PUBKEY_BYTES,
+  ED25519_PRIVATE_KEY_BYTES,
+  ED25519_PUBLIC_KEY_BYTES,
+} from "../../core/crypto-suite-registry.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -327,6 +334,12 @@ export interface MacOSCastleWallDaemonInput {
    * channel-authenticated floor remains in effect.
    */
   auditProducerPublicKeyPath?: string;
+  /**
+   * Root application-support cursor used by the macOS system extension's
+   * audit producer. Undefined means the production root path is used only for a
+   * real root-on-darwin daemon; null disables seeding; tests pass a temp path.
+   */
+  auditProducerStatePath?: string | null;
   /**
    * Provider-side dead-man lease. Undefined/null means durable arming
    * (--no-ttl); a positive number means the extension fails open after that
@@ -668,12 +681,26 @@ export async function startMacOSCastleWallDaemon(
   const auditProducerKey = await loadMacOSAuditProducerPublicKey(
     input.auditProducerPublicKeyPath ?? CASTLE_GLOBAL_AUDIT_PRODUCER_PUBKEY_PATH,
   );
+  const chainAnchorSource = buildChainAnchorSourceFromAuditLog(input.auditLog);
   if (auditProducerKey !== null) {
     await publishFortressAuditProducerPublicKey(
       input.fortressPath,
       auditProducerKey.bytes,
       fortressCreateOwner,
     );
+    const cursorSeed = await seedMacOSAuditProducerStateFromLocalAnchor({
+      chainAnchorSource,
+      pinnedProducerKeyB64url: auditProducerKey.keyB64url,
+      ...(input.auditProducerStatePath !== undefined
+        ? { statePath: input.auditProducerStatePath }
+        : {}),
+    });
+    if (cursorSeed.kind === "seeded") {
+      // SAFETY: Castle Wall launchd diagnostics are operator-facing stderr.
+      console.error(
+        `[castle-wall] audit producer cursor seeded from verified local anchor state_path=${cursorSeed.statePath} previous_next_seq=${cursorSeed.previousNextSeq ?? "none"} next_seq=${cursorSeed.nextSeq} replaced_invalid_state=${cursorSeed.replacedInvalidState}`,
+      );
+    }
   }
   const pinnedPublicKeySha256 = sha256Hex(signer.publicKey);
   const agentOrigin = await resolveAgentOrigin(input.fortressPath, input.agentOrigin);
@@ -751,6 +778,11 @@ export async function startMacOSCastleWallDaemon(
     input.auditHeartbeatIntervalSeconds ??
     CASTLE_WALL_DEFAULT_AUDIT_HEARTBEAT_INTERVAL_SECONDS;
   let auditHeartbeat: NodeJS.Timeout | undefined;
+  let auditHeartbeatInFlight: Promise<void> | undefined;
+  const waitForAuditHeartbeatIdle = async (): Promise<void> => {
+    const inFlight = auditHeartbeatInFlight;
+    if (inFlight) await inFlight;
+  };
   const stopAuditHeartbeat = (): void => {
     if (!auditHeartbeat) return;
     clearInterval(auditHeartbeat);
@@ -1068,6 +1100,11 @@ export async function startMacOSCastleWallDaemon(
       },
     },
     auditSink: input.auditLog,
+    // Restore the producer-signed flow chain's anchor from the fortress's OWN
+    // persisted audit log at startup (one-time old-basis migration included).
+    // Same log instance the sink appends to — the anchor is recomputed from
+    // entries this consumer persisted, never from the wire.
+    chainAnchorSource,
     defaultApprovalTimeoutSeconds: 30,
     pinnedProducerKeyB64url: auditProducerKey?.keyB64url ?? null,
     fortressId: input.fortressId,
@@ -1373,9 +1410,19 @@ export async function startMacOSCastleWallDaemon(
         degradedCarry.restore(degradedCountThisBeat);
       }
     };
+    const runAuditHeartbeat = (): Promise<void> => {
+      if (auditHeartbeatInFlight) return auditHeartbeatInFlight;
+      const heartbeat = emitAuditHeartbeat().finally(() => {
+        if (auditHeartbeatInFlight === heartbeat) {
+          auditHeartbeatInFlight = undefined;
+        }
+      });
+      auditHeartbeatInFlight = heartbeat;
+      return heartbeat;
+    };
     const startAuditHeartbeatInterval = (): void => {
       auditHeartbeat = setInterval(() => {
-        void emitAuditHeartbeat();
+        void runAuditHeartbeat();
       }, auditHeartbeatIntervalSeconds * 1000);
       auditHeartbeat.unref();
     };
@@ -1386,16 +1433,15 @@ export async function startMacOSCastleWallDaemon(
       // audit-cadence interval, mirroring the awaited first beat of the
       // initial start below. emitAuditHeartbeat handles its own write
       // failures, so nothing here can throw into the arm path.
-      void emitAuditHeartbeat();
+      void runAuditHeartbeat();
       startAuditHeartbeatInterval();
     };
-    await emitAuditHeartbeat();
-    startAuditHeartbeatInterval();
-
     // Slice M emission-liveness tick (definition next to
     // stopEmissionLivenessTimer above; restarted by a fresh operator arm
     // after a revoke stopped it).
     startEmissionLivenessTimer();
+    await runAuditHeartbeat();
+    startAuditHeartbeatInterval();
 
     // Confined-agent egress MED-3 (secondary signal): periodic AS-AGENT-UID
     // egress liveness probe over the provisioned-* allow rules in the loaded
@@ -1486,6 +1532,7 @@ export async function startMacOSCastleWallDaemon(
   } catch (err) {
     stopLeaseHeartbeat();
     stopAuditHeartbeat();
+    await waitForAuditHeartbeatIdle();
     stopAgentEgressProbeTimer();
     stopEmissionLivenessTimer();
     if (activeConfigWritten) {
@@ -1647,6 +1694,7 @@ export async function startMacOSCastleWallDaemon(
         // Stop the audit liveness heartbeat in the SAME teardown that stops the
         // IPC lease heartbeat, so a stopped daemon stops claiming liveness.
         stopAuditHeartbeat();
+        await waitForAuditHeartbeatIdle();
         stopAgentEgressProbeTimer();
         stopEmissionLivenessTimer();
         await listener.broadcastArmLease(buildArmLease({
@@ -1974,7 +2022,7 @@ async function loadSigningKey(input: MacOSCastleWallDaemonInput): Promise<Daemon
     ...(input.signerClientInvoke ? { invoke: input.signerClientInvoke } : {}),
   });
   const publicKey = await client.getPublicKey();
-  if (publicKey.length !== 32) {
+  if (publicKey.length !== ED25519_PUBLIC_KEY_BYTES) {
     throw new Error(`Helper public key must be 32 bytes (found ${publicKey.length}).`);
   }
   return {
@@ -1994,7 +2042,7 @@ async function loadLocalSigningKey(
   const publicKey = await readFileCustody(join(fortressPath, CASTLE_PINNED_PUBKEY), {
     verifyPathIdentity: true,
   });
-  if (publicKey.length !== 32) {
+  if (publicKey.length !== ED25519_PUBLIC_KEY_BYTES) {
     throw new Error(`Pinned public key must be 32 bytes (found ${publicKey.length}).`);
   }
   let encryptedPrivateKey = JSON.parse(
@@ -2005,9 +2053,9 @@ async function loadLocalSigningKey(
   ) as EncryptedPayload;
   const privateKey = decrypt(encryptedPrivateKey, masterKey);
   try {
-    if (privateKey.length === 64) {
-      encryptedPrivateKey = encrypt(privateKey.slice(0, 32), masterKey);
-    } else if (privateKey.length !== 32) {
+    if (privateKey.length === ED25519_LEGACY_SEED_AND_PUBKEY_BYTES) {
+      encryptedPrivateKey = encrypt(privateKey.slice(0, ED25519_PRIVATE_KEY_BYTES), masterKey);
+    } else if (privateKey.length !== ED25519_PRIVATE_KEY_BYTES) {
       throw new Error(`Pinned private key must decrypt to 32 bytes (found ${privateKey.length}).`);
     }
   } finally {
@@ -2102,7 +2150,7 @@ async function loadMacOSAuditProducerPublicKey(
       { cause: error },
     );
   }
-  if (bytes.length !== 32) {
+  if (bytes.length !== ED25519_PUBLIC_KEY_BYTES) {
     throw new Error(
       `Castle Wall macOS audit-producer key at ${path} is ${bytes.length} bytes (expected 32).`,
     );

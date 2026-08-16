@@ -4,9 +4,9 @@ Use Sanctuary's sovereignty infrastructure with LangChain agents.
 
 ## Overview
 
-This integration uses the official `langchain-mcp-adapters` package to connect LangChain agents to Sanctuary's MCP server. Sanctuary's 46 tools become LangChain tools — no custom adapter required.
+This integration uses the official `langchain-mcp-adapters` package to connect LangChain agents to Sanctuary's MCP server. Sanctuary's 80+ tools become LangChain tools - no custom adapter required.
 
-What you get: encrypted state, cryptographic identity, selective disclosure, and verifiable reputation for any LangChain agent — without changing your agent code.
+What you get: encrypted state, cryptographic identity, selective disclosure, and verifiable reputation for any LangChain agent - without changing your agent code.
 
 ## Quick Start
 
@@ -53,7 +53,7 @@ async with MultiServerMCPClient(
 
 Sanctuary's Principal Policy requires human approval for high-risk operations (state export, key rotation, identity deletion). In a LangChain agent workflow, these operations will block until approved.
 
-**Recommended pattern:** Run Sanctuary with the dashboard enabled so a human can approve requests in real time:
+**Recommended pattern:** Run Sanctuary with the dashboard enabled, then reload to inspect new pending approvals; for live delivery use webhook or stderr until **IC-12** closes:
 
 ```bash
 npx @sanctuary-framework/mcp-server --dashboard
@@ -129,17 +129,17 @@ Sanctuary and Concordia compose but neither depends on the other. Use either alo
 
 ## Available Sanctuary Tools
 
-All 46 Sanctuary tools are exposed as LangChain tools. Key categories:
+All 80+ Sanctuary tools are exposed as LangChain tools. Key categories:
 
-**L1 — Cognitive Sovereignty:** `state_read`, `state_write`, `state_list`, `state_export`, `state_import`, `state_delete`
+**L1 - Cognitive Sovereignty:** `state_read`, `state_write`, `state_list`, `state_export`, `state_import`, `state_delete`
 
-**L1 — Identity:** `identity_create`, `identity_list`, `identity_sign`, `identity_verify`, `identity_rotate`
+**L1 - Identity:** `identity_create`, `identity_list`, `identity_sign`, `identity_verify`, `identity_rotate`
 
-**L2 — Operational Isolation:** `exec_attest`, `principal_policy_view`, `principal_baseline_view`, `monitor_health`, `monitor_audit_log`
+**L2 - Operational Isolation:** `exec_attest`, `principal_policy_view`, `principal_baseline_view`, `monitor_health`, `monitor_audit_log`
 
-**L3 — Selective Disclosure:** `proof_commitment`, `proof_reveal`, `disclosure_set_policy`, `disclosure_evaluate`, `zk_commit`, `zk_prove`, `zk_verify`, `zk_range_prove`, `zk_range_verify`
+**L3 - Selective Disclosure:** `proof_commitment`, `proof_reveal`, `disclosure_set_policy`, `disclosure_evaluate`, `zk_commit`, `zk_prove`, `zk_verify`, `zk_range_prove`, `zk_range_verify`
 
-**L4 — Verifiable Reputation:** `reputation_record`, `reputation_query`, `reputation_query_weighted`, `reputation_export`, `reputation_import`, `bootstrap_create_escrow`, `bootstrap_provide_guarantee`
+**L4 - Verifiable Reputation:** `reputation_record`, `reputation_query`, `reputation_query_weighted`, `reputation_export`, `reputation_import`, `bootstrap_create_escrow`, `bootstrap_provide_guarantee`
 
 **Cross-Cutting:** `shr_generate`, `shr_verify`, `handshake_initiate`, `handshake_respond`, `handshake_complete`, `handshake_status`, `federation_peers`, `federation_trust_evaluate`, `federation_status`, `manifest`
 

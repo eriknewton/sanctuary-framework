@@ -1,6 +1,8 @@
 import { isAbsolute, normalize as normalizePath } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 
+import { RESERVED_ACCOUNT_NAMES, SAFE_SERVICE_ACCOUNT_RE } from "./account-name-policy.js";
+
 /**
  * Auto-provision Step 2 (Build 1): dedicated agent service-account plumbing.
  *
@@ -28,16 +30,15 @@ import { setTimeout as sleep } from "node:timers/promises";
  */
 
 /**
- * POSIX-ish service-account name, deliberately the SAME conservative charset
- * as harness-daemon.ts's SAFE_ACCOUNT_RE (kept in lockstep by a structural
- * test): lowercase start, then a conservative charset. This rejects anything
- * that could smuggle shell metacharacters or spaces into a `dscl`/
- * `sysadminctl` argv.
+ * The account-name contract (safe charset + reserved privileged names) is
+ * single-sourced in `./account-name-policy.ts` (zero-import module) and
+ * consumed by all three refusal sites: this file, `egress-gate/gate-daemon.ts`
+ * and `egress-gate/harness-daemon.ts`. Re-exported here so existing consumers
+ * (`egress-gate/gate-account.ts`, the provision barrel, the structural guard)
+ * keep their import paths. The WIDEN rationale (Erik-ratified 2026-08-05) and
+ * the full doc comments live with the declarations in that module.
  */
-export const SAFE_SERVICE_ACCOUNT_RE = /^[a-z_][a-z0-9._-]{0,63}$/;
-
-/** Privileged account names an agent service account must never collide with. */
-const RESERVED_ACCOUNT_NAMES = new Set(["root", "_root", "daemon", "wheel", "admin"]);
+export { RESERVED_ACCOUNT_NAMES, SAFE_SERVICE_ACCOUNT_RE } from "./account-name-policy.js";
 
 /** Derive the canonical dedicated account name for an agent id, e.g. "hermes" -> "sanctuary-hermes". */
 export function deriveAgentAccountName(agentId: string): string {
@@ -457,6 +458,11 @@ export function planAccountCreate(
   if (!SAFE_SERVICE_ACCOUNT_RE.test(accountName)) {
     throw new Error(`Account name is not a safe service-account name (got: ${JSON.stringify(accountName)}).`);
   }
+  // INVARIANT: the whole point of a dedicated agent account is that the wall
+  // can attribute and confine it by its own uid. Provisioning onto a
+  // privileged existing name would instead hand the agent that name's
+  // authority (root, or an `admin` account's sudo) and collapse the
+  // attribution onto a uid shared with the operator.
   if (RESERVED_ACCOUNT_NAMES.has(accountName)) {
     throw new Error(`Refusing to plan a dedicated agent account named "${accountName}" (privileged/reserved name).`);
   }

@@ -2,7 +2,8 @@
 
 Version: 1.0
 Produced by: `sanctuary audit-chain export`
-Verified by: `sanctuary audit-chain verify`
+Verified by: `sanctuary audit-chain verify`, with current bounds below.
+Production checkpoints are unsigned today. Open defect: **IC-05**.
 
 ## Overview
 
@@ -137,10 +138,10 @@ A verifier reading a JSONL export MUST:
 4. **prev_hash walk:** Assert that each entry's `prev_hash` equals the `entry_hash` of the previous entry (or `"GENESIS"` for the first, or the legacy anchor `root_hash` after migration).
 5. **Hash recomputation:** For each entry, recompute `entry_hash` from the envelope fields and compare to the stored value.
 6. **Checkpoint root:** For each checkpoint, collect the `entry_hash` values for `[from_sequence, checkpoint_sequence]` and recompute the root hash; compare to `root_hash`.
-7. **Checkpoint signature:** For each non-unsigned checkpoint, verify the Ed25519 signature over the domain-separated signing payload using the `public_key` field (or a supplied trusted key).
+7. **Checkpoint signature:** For each non-unsigned checkpoint, verify the Ed25519 signature over the domain-separated signing payload using the `public_key` field (or a supplied trusted key). Current bound: production checkpoints are unsigned because no production boot path supplies the checkpoint signer, so this leg is skipped on shipped installs. Open defect: **IC-05**.
 8. **Legacy anchor:** Assert that `root_hash` is a valid 64-character hex string.
 
-In strict mode (default), any single failure causes the verdict to be `FAIL`. In non-strict mode (`--no-strict`), findings are reported but the verifier exits 0.
+In strict mode (default), any single failure causes the verdict to be `FAIL` and the process exits 1. With `--no-strict`, verification still reports `FAIL` with findings and exits 10 after completing the full scan. A clean verification exits 0.
 
 ## Verification Report Schema
 
@@ -149,7 +150,10 @@ In strict mode (default), any single failure causes the verdict to be `FAIL`. In
   "verdict": "PASS | FAIL",
   "entries_verified": 100,
   "checkpoints_verified": 1,
+  "signatures_verified": 1,
+  "signatures_skipped": 0,
   "legacy_anchors_verified": 0,
+  "rotation_anchor_scope": "Human-readable bound on what standalone rotation-anchor verification proves",
   "findings": [
     {
       "kind": "entry_hash_mismatch | prev_hash_mismatch | sequence_gap | checkpoint_root_mismatch | checkpoint_signature_invalid | checkpoint_signature_missing_key | legacy_anchor_mismatch | schema_error",
@@ -174,7 +178,7 @@ sanctuary audit-chain verify --input chain.jsonl
 # Verify with an explicit trusted public key
 sanctuary audit-chain verify --input chain.jsonl --public-key <base64url>
 
-# Non-strict mode (report findings but exit 0)
+# Non-strict mode is diagnostic: findings still report FAIL and exit 10.
 sanctuary audit-chain verify --input chain.jsonl --no-strict
 ```
 
@@ -185,4 +189,4 @@ The verifier (`server/src/cli/audit-chain-verify.ts`) imports only:
 - `@noble/hashes/sha256` -- SHA-256 hashing
 - `node:fs` -- reading the JSONL file
 
-It does not import from the Sanctuary server runtime (no storage backend, no encryption key, no audit log class). A security reviewer can copy `audit-chain-verify.ts`, install `@noble/curves` and `@noble/hashes`, and run it against an exported chain file without a Sanctuary installation.
+It does not import from the Sanctuary server runtime (no storage backend, no encryption key, no audit log class). A security reviewer can copy `audit-chain-verify.ts`, install `@noble/curves` and `@noble/hashes`, and run it against an exported chain file without a Sanctuary installation. Current bound: production checkpoints are unsigned until **IC-05** closes.

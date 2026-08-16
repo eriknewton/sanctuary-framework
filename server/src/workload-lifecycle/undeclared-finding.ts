@@ -53,6 +53,10 @@ import type {
   UndeclaredDetection,
   UndeclaredWorkload,
 } from "./undeclared-detection.js";
+import {
+  ED25519_PUBLIC_KEY_BYTES,
+  ED25519_SIGNATURE_BYTES,
+} from "../core/crypto-suite-registry.js";
 
 /** Domain-string version for the undeclared-finding payload. */
 export const WORKLOAD_UNDECLARED_FINDING_SCHEMA =
@@ -99,7 +103,15 @@ export const WORKLOAD_UNDECLARED_FINDING_SCOPE_TEXT =
 /** The only accepted signature algorithm for a v1 finding. */
 export const WORKLOAD_UNDECLARED_FINDING_SIGNATURE_ALGORITHM =
   "Ed25519" as const;
-/** The only accepted payload encoding for a v1 finding. */
+/**
+ * The only accepted payload encoding for a v1 finding.
+ *
+ * The string is SHARED VOCABULARY across several independently-versioned
+ * signed surfaces, not a mirror of one canonical constant; the surfaces are
+ * enumerated on `AuditCheckpointRecord.payload_encoding` in
+ * `audit/checkpoint-shape.ts`. Read that note before changing the spelling
+ * here.
+ */
 export const WORKLOAD_UNDECLARED_FINDING_PAYLOAD_ENCODING =
   "domain-separated-canonical-json-v1" as const;
 
@@ -192,7 +204,7 @@ export async function buildUndeclaredFinding(
   params: BuildUndeclaredFindingParams,
 ): Promise<SignedUndeclaredFinding> {
   // Signer public key must be well-formed before we bind its kid into the body.
-  if (params.signer.publicKey.length !== 32) {
+  if (params.signer.publicKey.length !== ED25519_PUBLIC_KEY_BYTES) {
     throw new UndeclaredFindingError(
       `finding signer public key must be 32 bytes, got ${params.signer.publicKey.length}`,
     );
@@ -226,7 +238,7 @@ export async function buildUndeclaredFinding(
       }`,
     );
   }
-  if (signature.length !== 64) {
+  if (signature.length !== ED25519_SIGNATURE_BYTES) {
     throw new UndeclaredFindingError(
       `finding signer returned a ${signature.length}-byte signature ` +
         `(expected 64); nothing was produced`,
@@ -363,7 +375,7 @@ export function verifyUndeclaredFinding(
       typeof effectiveKey === "string"
         ? fromBase64url(effectiveKey)
         : effectiveKey;
-    if (keyBytes.length !== 32) return false;
+    if (keyBytes.length !== ED25519_PUBLIC_KEY_BYTES) return false;
     return verifyEd25519(
       undeclaredFindingSigningBytes(body),
       fromBase64url(finding.signature),

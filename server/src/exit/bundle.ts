@@ -49,6 +49,7 @@ import {
   deriveMasterKey,
   deriveNamespaceKey,
   derivePurposeKey,
+  parseKeyDerivationParams,
   type KeyDerivationParams,
 } from "../core/key-derivation.js";
 import { decrypt, type EncryptedPayload } from "../core/encryption.js";
@@ -61,14 +62,29 @@ import { generateRandomKey } from "../core/random.js";
 import {
   sign as identitySign,
   verify as identityVerify,
+  publicKeyToDid,
   type StoredIdentity,
 } from "../core/identity.js";
+import {
+  verifyRotationChain,
+  type RotationChainInvalidReason,
+  type VerifiedRotationChain,
+} from "../core/rotation-chain.js";
 import {
   ReputationStore,
   ReputationBundleVerificationError,
   type ReputationBundle,
 } from "../reputation/reputation-store.js";
-import { verifyExitBundle, readManifest, loadExitArtifact } from "./verifier.js";
+import {
+  verifyExitBundle,
+  readManifest,
+  loadExitArtifact,
+  isWellFormedExitStateEntryElement,
+} from "./verifier.js";
+import {
+  isValidSourceCustody,
+  SOURCE_CUSTODY_FORMAT,
+} from "./source-custody.js";
 import {
   partitionByMemoryClass,
   type PartitionConsentRelease,
@@ -149,10 +165,41 @@ export interface ExitSourceCustody {
   wraps: CustodyWrap[];
 }
 
+/**
+ * Why a zero-entry `encrypted_state.json` is empty.
+ *
+ * `fortress_state_empty`   - the source fortress had no exportable state.
+ * `partition_excluded_all` - state existed but the ownership partition
+ *                            withheld every entry (they stay with the operator).
+ *
+ * CONTRACT PIN (server/src/exit/verifier.ts `summarizeEncryptedState`): the
+ * verifier reports these tokens verbatim and treats a zero-entry artifact
+ * WITHOUT one as pre-marker evidence. Adding a member here means adding it
+ * there in the same commit.
+ */
+export const EXIT_EMPTY_REASONS = {
+  FORTRESS_STATE_EMPTY: "fortress_state_empty",
+  PARTITION_EXCLUDED_ALL: "partition_excluded_all",
+} as const;
+
+export type ExitEmptyReason =
+  (typeof EXIT_EMPTY_REASONS)[keyof typeof EXIT_EMPTY_REASONS];
+
 export interface ExitEncryptedStateBundle {
   format: "SANCTUARY_EXIT_ENCRYPTED_STATE_V1";
   exported_at: string;
   key_source: "passphrase" | "recovery-key" | "unknown";
+  /**
+   * Present IFF `entries` is empty: names why. Absent on every non-empty
+   * bundle and on every bundle written before this marker existed, so an
+   * absent marker on a zero-entry artifact means "pre-marker or buggy
+   * exporter", never "the fortress was empty".
+   *
+   * It lives in the ARTIFACT, not the manifest, so it is covered by the
+   * Ed25519-signed manifest transitively through the artifact's sha256 +
+   * size pins - no `manifest_version` bump, no `contracts/v1.1` edit.
+   */
+  empty_reason?: ExitEmptyReason;
   /**
    * Additive Slice-2 signal: true when this artifact was filtered through the
    * verified ownership partition, false/absent for legacy full-fortress exports.
@@ -274,6 +321,19 @@ export interface ExportExitBundleOptions {
   config?: SanctuaryConfig;
   reputationStore?: ReputationStore;
   stateStoragePath?: string;
+  /**
+   * Restrict the encrypted-state export to these namespaces. OMIT the option
+   * to export every namespace discovered under `stateStoragePath`; that is the
+   * behavior an operator-driven full-fortress export wants.
+   *
+   * Supplying an EMPTY array throws. It is never "export zero state": an empty
+   * array is what a repeated-flag parser produces when the operator passed no
+   * flag at all, and treating it as a real selection is what made
+   * `sanctuary exit export` emit signed, empty bundles. Callers that build this
+   * from CLI flags must spread it conditionally
+   * (`...(names.length > 0 ? { stateNamespaces: names } : {})`), the same shape
+   * the import path uses for `didWebAllowedHosts`.
+   */
   stateNamespaces?: string[];
   keySource?: "passphrase" | "recovery-key" | "unknown";
   /**
@@ -308,7 +368,10 @@ export interface ExportExitBundleOptions {
    * must have a secure, non-persisted channel to the operator: the exit
    * CLI prints it to the operator's terminal; callers whose results are
    * persisted (e.g. the hub's `resolution_payload`) must NOT enable this
-   * (key material must never be persisted - CLAUDE.md #6).
+   * (key material must never be persisted - CLAUDE.md #6). Known intentional
+   * non-minting caller: `fortressExportBundle` in `dashboard/v1_1/wiring.ts`
+   * (the dashboard exit endpoint), whose omission is a custody boundary, not
+   * an oversight; must match the acknowledgement comment there.
    *
    * Without it, an envelope-custody bundle's state can only be re-keyed by
    * a programmatic `sourceMasterKey` (legacy fortresses keep the legacy
@@ -361,6 +424,17 @@ export interface ExportExitBundleOptions {
    * the default cap.
    */
   auditReceiptsExportCap?: number;
+  /**
+   * Optional deterministic export clock. Beyond making tests reproducible,
+   * this single read anchors `manifest.body.exported_at`, which the import
+   * path feeds into did:web resolution as `assertion_time` (see
+   * `resolveDidWeb` callers below) - the value that decides whether a
+   * historical, since-revoked verification method is still inside its valid
+   * window. An uninjected caller gets the real wall clock, as before; a
+   * caller that injects `now` gets both a reproducible manifest AND a
+   * reproducible revoked-key window evaluation from the same read.
+   */
+  now?: () => Date;
 }
 
 export interface ExportExitBundleResult {
@@ -369,6 +443,13 @@ export interface ExportExitBundleResult {
   manifest_hash: string;
   artifact_count: number;
   unsupported_artifacts: string[];
+  /**
+   * Number of state entries carried in `encrypted_state.json`. Always present,
+   * including when it is 0, so a caller can gate on "did this export actually
+   * carry state" without parsing an artifact or a warning string. Mirrors the
+   * import path's `state.imported_keys`.
+   */
+  state_entry_count: number;
   /**
    * The minted bundle re-key key (base64url, 32 bytes), present only when
    * `mintStateRekeyKey` was set and the bundle carries state entries. It is
@@ -410,6 +491,16 @@ export interface ImportExitBundleOptions {
   conflictResolution?: "skip" | "overwrite" | "version";
   sourcePassphrase?: string;
   sourceRecoveryKey?: string;
+  /**
+   * Confirm the LEGACY interpretation of `sourceRecoveryKey`: on a bundle that
+   * carries no `source_custody` block, treat the supplied key as the source
+   * fortress's raw master rather than as a bundle re-key key. Required because
+   * those two meanings are indistinguishable from the bundle alone, and
+   * guessing produced a downstream SOURCE_KEY_MISMATCH that named the symptom
+   * instead of the cause. CLI surface: `--legacy-source-master` (only
+   * meaningful together with `--source-recovery-key`).
+   */
+  legacyRecoveryKeyIsMaster?: boolean;
   sourceMasterKey?: Uint8Array;
   destinationSignerIdentityId?: string;
   /**
@@ -444,6 +535,12 @@ export interface ImportExitBundleOptions {
    * origin matches the published DID Document.
    */
   skipDidWebVerify?: boolean;
+  /**
+   * Operator opt-in for importing entries whose only valid source signature is
+   * a key retired by a compromised-reason rotation. CLI surface:
+   * `--accept-compromised-rotation-keys`.
+   */
+  acceptCompromisedRotationKeys?: boolean;
   /**
    * Recognition-Layer Path C primary build 2: optional fetcher
    * override for tests. Defaults to globalThis.fetch via the did:web
@@ -485,8 +582,15 @@ export interface ImportExitBundleResult {
   activated: boolean;
   conflicts: ExitBundleConflictReport;
   state: {
+    /**
+     * `empty_bundle` (additive) is the honest answer to "I asked for state and
+     * supplied credentials, and the bundle carried none": it used to report
+     * `not_requested`, which is false and also suppresses nothing, so the CLI's
+     * "re-run with --import-state" advice fired at an operator who already had.
+     */
     status:
       | "not_requested"
+      | "empty_bundle"
       | "rekeyed"
       | "staged_requires_source_key"
       | "skipped_no_destination_signer";
@@ -501,9 +605,76 @@ export interface ImportExitBundleResult {
     invalid_attestations: number;
     unverifiable_attestations: number;
   };
+  rotation?: {
+    identity_id: string;
+    hop_count: number;
+    chain_signature_verified: boolean;
+    compromised_hops: number;
+    entries_admitted_by_current_key: number;
+    entries_admitted_by_retired_key: number;
+    entries_admitted_by_compromised_retired_key: number;
+  };
   staged_artifacts: string[];
   warnings: string[];
   unsupported_artifacts: string[];
+}
+
+function stateHasNonConflictSkippedEntries(
+  state: ImportExitBundleResult["state"]
+): boolean {
+  return (
+    state.skipped_invalid_sig > 0 ||
+    state.skipped_unknown_kid > 0 ||
+    state.skipped_keys > state.conflicts
+  );
+}
+
+function stateSkippedOnlyConflicts(
+  state: ImportExitBundleResult["state"]
+): boolean {
+  return state.skipped_keys > 0 && !stateHasNonConflictSkippedEntries(state);
+}
+
+function stateImportIncompleteMessage(
+  state: ImportExitBundleResult["state"]
+): string {
+  return (
+    "state import incomplete: " +
+    `state_skipped_keys=${state.skipped_keys}, ` +
+    `state_skipped_invalid_sig=${state.skipped_invalid_sig}, ` +
+    `state_skipped_unknown_kid=${state.skipped_unknown_kid}. ` +
+    "Refusing activation and rolling back staged artifacts; inspect or " +
+    "re-export the source bundle before retrying."
+  );
+}
+
+function stateImportIncompleteMessageWithRotationKeys(
+  state: ImportExitBundleResult["state"],
+  publicKeysByIdentityId: Map<string, SourceIdentityPublicKeyCandidate[]>
+): string {
+  const base = stateImportIncompleteMessage(state);
+  const keyCounts = [...publicKeysByIdentityId.values()].map(
+    (candidates) => candidates.length
+  );
+  const maxKeysTried = keyCounts.length > 0 ? Math.max(...keyCounts) : 0;
+  return maxKeysTried > 1
+    ? base +
+        ` Verified rotation history was present; signature checks tried ${maxKeysTried} key candidates (current plus ${maxKeysTried - 1} retired) before refusing.`
+    : base;
+}
+
+export class ExitBundleStateImportIncompleteError extends ExitBundleImportError {
+  readonly state: ImportExitBundleResult["state"];
+
+  constructor(
+    state: ImportExitBundleResult["state"],
+    message = stateImportIncompleteMessage(state),
+    options?: { cause?: unknown },
+  ) {
+    super("STATE_IMPORT_INCOMPLETE", message, options);
+    this.name = "ExitBundleStateImportIncompleteError";
+    this.state = state;
+  }
 }
 
 function sha256Hex(bytes: Uint8Array): string {
@@ -535,19 +706,48 @@ async function writeJsonArtifact(
   };
 }
 
+/**
+ * Three-state read of the legacy `_meta/key-params` marker.
+ *
+ * `absent`    - no marker on disk (envelope-era or never-migrated fortress).
+ * `ok`        - marker parsed AND passed `parseKeyDerivationParams`.
+ * `malformed` - marker exists but is unparseable or out of accepted bounds;
+ *               `reason` names the failing field for the operator.
+ */
+type SourceKeyParamsRead =
+  | { state: "absent" }
+  | { state: "ok"; params: KeyDerivationParams }
+  | { state: "malformed"; reason: string };
+
 async function readSourceKeyParams(
   storage: StorageBackend
-): Promise<KeyDerivationParams | undefined> {
+): Promise<SourceKeyParamsRead> {
   const raw = await storage.read("_meta", "key-params");
-  if (!raw) return undefined;
-  return JSON.parse(bytesToString(raw)) as KeyDerivationParams;
+  if (!raw) return { state: "absent" };
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(bytesToString(raw));
+  } catch (err) {
+    return {
+      state: "malformed",
+      reason: `not parseable JSON (${err instanceof Error ? err.message : String(err)})`,
+    };
+  }
+  // CONTRACT PIN (server/src/core/key-derivation.ts parseKeyDerivationParams):
+  // the export embed-gate, the import derive-gate below, and the verifier's
+  // `legacy_kdf_params` report all classify through that one validator.
+  const checked = parseKeyDerivationParams(parsed);
+  return checked.ok
+    ? { state: "ok", params: checked.params }
+    : { state: "malformed", reason: checked.reason };
 }
 
 /**
- * Maximum wraps accepted in a bundle's source_custody block. Export emits
- * exactly one; the cap bounds work on crafted bundles (codex round-1 LOW).
+ * Audit op emitted when an export refuses to sign a bundle because the
+ * fortress's legacy `_meta/key-params` marker is malformed.
  */
-const SOURCE_CUSTODY_MAX_WRAPS = 4;
+const EXIT_EXPORT_REFUSED_MALFORMED_KDF_MARKER_OP =
+  "exit_bundle_export_refused_malformed_kdf_marker";
 
 /**
  * Mint the bundle re-key key and the source_custody block that carries the
@@ -570,7 +770,10 @@ function mintSourceCustody(masterKey: Uint8Array): {
   const rekeyKey = toBase64url(rekeyKeyBytes);
   rekeyKeyBytes.fill(0);
   return {
-    custody: { format: "SANCTUARY_EXIT_SOURCE_CUSTODY_V1", wraps: [wrap] },
+    // CONTRACT PIN (server/src/exit/source-custody.ts `SOURCE_CUSTODY_FORMAT`):
+    // the mint and the validator read the token from one declaration, so a
+    // freshly minted block can never fail its own shape-check.
+    custody: { format: SOURCE_CUSTODY_FORMAT, wraps: [wrap] },
     rekeyKey,
   };
 }
@@ -595,13 +798,57 @@ async function discoverFilesystemStateNamespaces(
   }
 }
 
+/**
+ * Every option-SHAPE refusal for an export, in one place, so it can run before
+ * the first side effect (see the A9 invariant at the `exportExitBundle` call
+ * site) and again inside `exportEncryptedState` as defense in depth for any
+ * future direct caller. Pure: reads only `opts`, touches no storage.
+ */
+function assertExportOptionsShape(opts: ExportExitBundleOptions): void {
+  // "The caller named no namespaces" MUST resolve to discover-and-export
+  // everything, never to an empty selection. A supplied-but-empty array is
+  // exactly what a repeated-flag parser returns when the operator omitted the
+  // flag, so honoring it as "export zero namespaces" is how `sanctuary exit
+  // export` produced signed, well-formed, TOTALLY EMPTY bundles. Reject the
+  // ambiguous shape at the boundary instead of interpreting it: a caller that
+  // wants everything omits the option, and no caller has a legitimate reason to
+  // ask for precisely zero namespaces (a fortress with no state already yields
+  // an empty discovery). This is the same fail-closed posture as the
+  // partition/legacy-opt-out check below.
+  if (opts.stateNamespaces !== undefined && opts.stateNamespaces.length === 0) {
+    throw new Error(
+      "exit-bundle: stateNamespaces was supplied but empty. Omit the option to " +
+        "export every discoverable namespace; an empty list is never a request " +
+        "to export zero state.",
+    );
+  }
+
+  // Exit machinery Slice 1: apply the conservative ownership partition. The
+  // caller MUST make an explicit choice (codex HIGH): supply
+  // `memoryClassPartition` (partition on) OR `unpartitionedLegacyExport: true`
+  // (loud, named full-export opt-out). Supplying neither - or both - throws, so
+  // an agent-exit caller cannot silently fall through to "export everything."
+  const hasPartition = opts.memoryClassPartition !== undefined;
+  const hasLegacyOptOut = opts.unpartitionedLegacyExport === true;
+  if (hasPartition === hasLegacyOptOut) {
+    throw new Error(
+      "exit-bundle: exactly one of memoryClassPartition or " +
+        "unpartitionedLegacyExport must be supplied. The ownership partition is " +
+        "not silently skippable; pass memoryClassPartition for an ownership-classed " +
+        "exit, or unpartitionedLegacyExport: true to deliberately export all state.",
+    );
+  }
+}
+
 async function exportEncryptedState(
-  opts: ExportExitBundleOptions
+  opts: ExportExitBundleOptions,
+  exportedAt: string,
 ): Promise<{
   bundle: ExitEncryptedStateBundle;
   rekeyKey?: string;
   partition?: PartitionResult;
 }> {
+  assertExportOptionsShape(opts);
   const namespaceSet = new Set(
     opts.stateNamespaces ??
       (await discoverFilesystemStateNamespaces(opts.stateStoragePath))
@@ -626,22 +873,6 @@ async function exportEncryptedState(
         // Corrupt state is omitted rather than trusted into the exit bundle.
       }
     }
-  }
-
-  // Exit machinery Slice 1: apply the conservative ownership partition. The
-  // caller MUST make an explicit choice (codex HIGH): supply
-  // `memoryClassPartition` (partition on) OR `unpartitionedLegacyExport: true`
-  // (loud, named full-export opt-out). Supplying neither - or both - throws, so
-  // an agent-exit caller cannot silently fall through to "export everything."
-  const hasPartition = opts.memoryClassPartition !== undefined;
-  const hasLegacyOptOut = opts.unpartitionedLegacyExport === true;
-  if (hasPartition === hasLegacyOptOut) {
-    throw new Error(
-      "exit-bundle: exactly one of memoryClassPartition or " +
-        "unpartitionedLegacyExport must be supplied. The ownership partition is " +
-        "not silently skippable; pass memoryClassPartition for an ownership-classed " +
-        "exit, or unpartitionedLegacyExport: true to deliberately export all state.",
-    );
   }
 
   // An entry travels in the outbound bundle ONLY when it carries a live sealed
@@ -698,19 +929,65 @@ async function exportEncryptedState(
       ? mintSourceCustody(opts.masterKey)
       : undefined;
 
+  // DETECTION is unconditional; EMBEDDING is entries-gated. Reading the marker
+  // for every export is what makes the A3 refusal below fire on an empty
+  // fortress too: an entries-gated READ let a zero-entry export (empty
+  // fortress, or a partition that withheld everything) sail past a CORRUPT
+  // marker and sign an artifact asserting the legacy params are ABSENT, which
+  // is source-metadata corruption hidden at the worst possible moment. The
+  // embed stays gated because an empty bundle has nothing to re-key, so
+  // shipping the fortress's Argon2id salt + cost profile with it is gratuitous
+  // (symmetric with `source_custody`, entries-gated above via `minted`).
+  const keyParams: SourceKeyParamsRead = await readSourceKeyParams(opts.storage);
+  // INVARIANT (A3): _meta/key-params is untrusted bytes until shape-checked.
+  // Whatever passes this gate is embedded VERBATIM in encrypted_state.json and
+  // pinned by the Ed25519-signed manifest, so a malformed marker here becomes a
+  // signed re-key path that NO import can use. Malformed => structured throw at
+  // export; never embed unvalidated, never silently omit (hard constraint 5).
+  if (keyParams.state === "malformed") {
+    await opts.auditLog.appendCritical({
+      layer: "l1",
+      operation: EXIT_EXPORT_REFUSED_MALFORMED_KDF_MARKER_OP,
+      identity_id: opts.identityManager.getDefault()?.identity_id ?? "unknown",
+      result: "failure",
+      details: { reason: keyParams.reason },
+    });
+    throw new Error(
+      "exit-bundle: refusing to export. The fortress's legacy re-key marker at " +
+        `_meta/key-params is malformed (${keyParams.reason}). Embedding it would ` +
+        "produce a cryptographically valid, signed bundle whose legacy re-key " +
+        "path no import can ever use, and the failure would only surface after " +
+        "the source fortress is gone. Repair the marker, or - if this is an " +
+        "envelope-custody fortress where the marker is vestigial - remove " +
+        "_meta/key-params and re-export; the authoritative re-key path is the " +
+        "bundle re-key key printed at export.",
+    );
+  }
+
+  // INVARIANT (A8): a zero-entry artifact MUST name why it is empty. The signed
+  // manifest covers an empty artifact exactly as a full one, so without this
+  // marker verify/import cannot distinguish "fortress was empty" from "an export
+  // bug dropped everything". Enum, not free text; a zero-entry artifact WITHOUT
+  // this marker is downstream evidence of a pre-marker or buggy exporter.
+  const emptyReason: ExitEmptyReason | undefined =
+    entries.length > 0
+      ? undefined
+      : collected.length > 0
+        ? EXIT_EMPTY_REASONS.PARTITION_EXCLUDED_ALL
+        : EXIT_EMPTY_REASONS.FORTRESS_STATE_EMPTY;
+
   return {
     bundle: {
       format: "SANCTUARY_EXIT_ENCRYPTED_STATE_V1",
-      exported_at: new Date().toISOString(),
+      exported_at: exportedAt,
       key_source: opts.keySource ?? "unknown",
       ownership_partitioned: opts.memoryClassPartition !== undefined,
-      // Only emit the source KDF profile (Argon2id salt + cost) when there is
-      // re-keyable state. An empty/zero-state bundle has nothing to re-key, so
-      // leaking the fortress salt + cost profile for it is gratuitous - gate it
-      // symmetrically with `source_custody` (which is already entries-gated via
-      // `minted`).
-      ...(entries.length > 0
-        ? { source_key_derivation: await readSourceKeyParams(opts.storage) }
+      ...(emptyReason !== undefined ? { empty_reason: emptyReason } : {}),
+      // The entries-gate that used to sit on the READ (see the A3 detection
+      // note above) lives here instead: an empty bundle has nothing to re-key,
+      // so it must not carry the fortress's Argon2id salt + cost profile.
+      ...(entries.length > 0 && keyParams.state === "ok"
+        ? { source_key_derivation: keyParams.params }
         : {}),
       ...(minted !== undefined ? { source_custody: minted.custody } : {}),
       namespaces: [...new Set(entries.map((entry) => entry.namespace))].sort(),
@@ -725,7 +1002,8 @@ async function exportEncryptedState(
 
 function exportPublicIdentity(
   identity: StoredIdentity,
-  masterKey: Uint8Array
+  masterKey: Uint8Array,
+  exportedAt: string,
 ): ExitPublicIdentityArtifact {
   const body: ExitPublicIdentityArtifact["bundle"] = {
     format: "SANCTUARY_IDENTITY_BUNDLE_V1",
@@ -736,7 +1014,7 @@ function exportPublicIdentity(
     key_type: identity.key_type,
     key_protection: identity.key_protection,
     rotation_history: identity.rotation_history ?? [],
-    exported_at: new Date().toISOString(),
+    exported_at: exportedAt,
   };
   const signature = identitySign(
     canonicalizeToBytes(body),
@@ -763,13 +1041,14 @@ function redactedPolicy(policy: PrincipalPolicy): PrincipalPolicy {
 
 function exportPolicySet(
   policy: PrincipalPolicy,
-  config?: SanctuaryConfig
+  config: SanctuaryConfig | undefined,
+  exportedAt: string,
 ): ExitPolicySetArtifact {
   const cfg = config ?? defaultConfig();
 
   return {
     format: "SANCTUARY_EXIT_POLICY_SET_V1",
-    exported_at: new Date().toISOString(),
+    exported_at: exportedAt,
     principal_policy: redactedPolicy(policy),
     config_summary: {
       version: cfg.version,
@@ -784,7 +1063,8 @@ function exportPolicySet(
 
 async function exportAuditReceipts(
   auditLog: AuditLog,
-  cap: number = EXIT_AUDIT_RECEIPTS_EXPORT_CAP
+  cap: number,
+  exportedAt: string,
 ): Promise<{ artifact: ExitAuditReceiptsArtifact; warning?: string }> {
   await auditLog.flush();
   const result = await auditLog.query({ limit: cap });
@@ -797,7 +1077,7 @@ async function exportAuditReceipts(
   const truncated = omitted > 0;
   const artifact: ExitAuditReceiptsArtifact = {
     format: "SANCTUARY_AUDIT_RECEIPTS_V1",
-    exported_at: new Date().toISOString(),
+    exported_at: exportedAt,
     total: result.total,
     recovery_semantics: "archive_only",
     normal_audit_query_continuity: false,
@@ -814,7 +1094,8 @@ async function exportAuditReceipts(
 
 async function exportCommitments(
   storage: StorageBackend,
-  masterKey: Uint8Array
+  masterKey: Uint8Array,
+  exportedAt: string,
 ): Promise<ExitCommitmentsArtifact> {
   const encryptionKey = derivePurposeKey(masterKey, "l3-commitments");
   const publicCommitments: ExitCommitmentsArtifact["public_commitments"] = [];
@@ -844,7 +1125,7 @@ async function exportCommitments(
   }
   return {
     format: "SANCTUARY_EXIT_COMMITMENTS_V1",
-    exported_at: new Date().toISOString(),
+    exported_at: exportedAt,
     public_commitments: publicCommitments,
     unreadable_count: unreadable,
     redacted_fields: ["value", "blinding_factor"],
@@ -853,7 +1134,8 @@ async function exportCommitments(
 
 async function exportPlaceholderVaultMetadata(
   storage: StorageBackend,
-  masterKey: Uint8Array
+  masterKey: Uint8Array,
+  exportedAt: string,
 ): Promise<ExitPlaceholderVaultMetadataArtifact> {
   const encryptionKey = derivePurposeKey(masterKey, "l2-privacy-placeholders");
   const entries: Array<Record<string, unknown>> = [];
@@ -889,7 +1171,7 @@ async function exportPlaceholderVaultMetadata(
   }
   return {
     format: "SANCTUARY_PLACEHOLDER_VAULT_METADATA_V1",
-    exported_at: new Date().toISOString(),
+    exported_at: exportedAt,
     entries,
     unreadable_count: unreadable,
     redacted_fields: ["raw_value", "raw_path"],
@@ -899,6 +1181,43 @@ async function exportPlaceholderVaultMetadata(
 export async function exportExitBundle(
   opts: ExportExitBundleOptions
 ): Promise<ExportExitBundleResult> {
+  // INVARIANT: manifest `exported_at` is the did:web assertion time, so
+  // deterministic callers pin it here instead of comparing historical keys
+  // against the real wall clock. The `Date` is read exactly once and reused
+  // (see `exportApprovalAuditId` below) - a second ambient `Date.now()` read
+  // anywhere else in this function would reintroduce non-determinism even
+  // when the caller injects `now`.
+  const exportClock = opts.now ?? (() => new Date());
+  const exportedAtDate = exportClock();
+  const exportedAt = exportedAtDate.toISOString();
+  // INVARIANT (A9): every option-shape refusal fires BEFORE the first side
+  // effect (mkdir / audit append / artifact write). A throw after
+  // public_identity.json lands leaves a partial, unsigned artifact directory a
+  // later run may mistake for a bundle. There are exactly three such refusals
+  // and both statements below run before the first `mkdir`:
+  // `assertExportOptionsShape` (the empty-stateNamespaces and the
+  // partition/legacy-opt-out XOR) and `validateExportDidWeb` (the did:web
+  // shape + host-agreement checks). Both are pure functions of `opts`. The
+  // identical checks deeper in exportEncryptedState are retained as defense in
+  // depth for any future direct caller of that function.
+  assertExportOptionsShape(opts);
+  // Recognition-Layer Path C primary build 2: validate + embed the
+  // did:web pointer when the caller supplied one. Two structural
+  // checks before embedding so a malformed binding fails loudly at
+  // export rather than at the receiving regime's resolver:
+  //
+  //   1. `identifier` parses as a did:web URI under the supplied
+  //      `authority_host` (`parseDidWeb` throws on shape mismatch).
+  //   2. The parsed `authority_host` matches `binding.authority_host`
+  //      (defends against an operator typo where the URI's host and
+  //      the published host diverge).
+  //
+  // Pubkey match is the import-side verifier's job: the receiving
+  // regime is the one that benefits from confirming the operator's
+  // claimed pubkey matches the resolved DID Document. The export
+  // side does not re-fetch the published document; it embeds the
+  // pointer the operator declared.
+  const didWebBinding = validateExportDidWeb(opts.didWeb);
   const bundleDir = resolve(opts.bundleDir);
   await mkdir(bundleDir, { recursive: true, mode: 0o700 });
   await mkdir(join(bundleDir, ARTIFACT_DIR), { recursive: true, mode: 0o700 });
@@ -908,8 +1227,15 @@ export async function exportExitBundle(
     throw new Error("Cannot export exit bundle: no default identity exists.");
   }
 
+  // INVARIANT: the fallback audit id's timestamp is derived from the SAME
+  // captured `exportedAtDate` (the injected `now` seam when the caller
+  // supplies one) rather than a fresh `Date.now()` read. This id lands
+  // unchanged in the SIGNED manifest body as `export_approval_audit_id`
+  // below; a second, uncaptured wall-clock read here would make the signed
+  // manifest non-reproducible across two runs even when the export clock is
+  // pinned for determinism.
   const exportApprovalAuditId =
-    opts.exportApprovalAuditId ?? `exit-export-${Date.now()}`;
+    opts.exportApprovalAuditId ?? `exit-export-${exportedAtDate.getTime()}`;
   void opts.auditLog.append("l1", "exit_bundle_export", identity.identity_id, {
     approval_id: exportApprovalAuditId,
     manifest_version: EXIT_BUNDLE_MANIFEST_VERSION,
@@ -925,11 +1251,25 @@ export async function exportExitBundle(
     await writeJsonArtifact(
       bundleDir,
       `${ARTIFACT_DIR}/public_identity.json`,
-      exportPublicIdentity(identity, opts.masterKey),
+      exportPublicIdentity(identity, opts.masterKey, exportedAt),
       "public_identity"
     )
   );
-  const encryptedStateExport = await exportEncryptedState(opts);
+  const encryptedStateExport = await exportEncryptedState(opts, exportedAt);
+  // A zero-entry export is a legitimate outcome for a fresh fortress, but it
+  // must never READ as a successful state export: the bundle still carries a
+  // valid signed manifest and an `encrypted_state.json`, so an operator running
+  // an exit drill cannot tell an empty fortress from a broken selection by
+  // looking at the bundle. Say it out loud on every surface (result warning,
+  // audit trail, CLI) rather than letting the silence imply success.
+  if (encryptedStateExport.bundle.total_keys === 0) {
+    exportWarnings.push(
+      "NO STATE EXPORTED: this bundle carries zero state entries. It can " +
+        "restore identity, policy, and audit receipts, but no memory or " +
+        "namespace data. Confirm the source fortress is genuinely empty " +
+        "before treating this bundle as a complete exit.",
+    );
+  }
   artifacts.push(
     await writeJsonArtifact(
       bundleDir,
@@ -942,13 +1282,14 @@ export async function exportExitBundle(
     await writeJsonArtifact(
       bundleDir,
       `${ARTIFACT_DIR}/policy_set.json`,
-      exportPolicySet(opts.policy, opts.config),
+      exportPolicySet(opts.policy, opts.config, exportedAt),
       "policy_set"
     )
   );
   const auditReceiptsExport = await exportAuditReceipts(
     opts.auditLog,
-    opts.auditReceiptsExportCap ?? EXIT_AUDIT_RECEIPTS_EXPORT_CAP
+    opts.auditReceiptsExportCap ?? EXIT_AUDIT_RECEIPTS_EXPORT_CAP,
+    exportedAt,
   );
   if (auditReceiptsExport.warning !== undefined) {
     exportWarnings.push(auditReceiptsExport.warning);
@@ -973,7 +1314,7 @@ export async function exportExitBundle(
     await writeJsonArtifact(
       bundleDir,
       `${ARTIFACT_DIR}/commitments.json`,
-      await exportCommitments(opts.storage, opts.masterKey),
+      await exportCommitments(opts.storage, opts.masterKey, exportedAt),
       "commitments"
     )
   );
@@ -981,32 +1322,16 @@ export async function exportExitBundle(
     await writeJsonArtifact(
       bundleDir,
       `${ARTIFACT_DIR}/placeholder_vault_metadata.json`,
-      await exportPlaceholderVaultMetadata(opts.storage, opts.masterKey),
+      await exportPlaceholderVaultMetadata(opts.storage, opts.masterKey, exportedAt),
       "placeholder_vault_metadata"
     )
   );
 
-  // Recognition-Layer Path C primary build 2: validate + embed the
-  // did:web pointer when the caller supplied one. Two structural
-  // checks before embedding so a malformed binding fails loudly at
-  // export rather than at the receiving regime's resolver:
-  //
-  //   1. `identifier` parses as a did:web URI under the supplied
-  //      `authority_host` (`parseDidWeb` throws on shape mismatch).
-  //   2. The parsed `authority_host` matches `binding.authority_host`
-  //      (defends against an operator typo where the URI's host and
-  //      the published host diverge).
-  //
-  // Pubkey match is the import-side verifier's job: the receiving
-  // regime is the one that benefits from confirming the operator's
-  // claimed pubkey matches the resolved DID Document. The export
-  // side does not re-fetch the published document; it embeds the
-  // pointer the operator declared.
-  const didWebBinding = validateExportDidWeb(opts.didWeb);
-
+  // `didWebBinding` was validated at the top of this function, before the
+  // first side effect (A9), and is embedded here unchanged.
   const body: ExitBundleManifestBody = {
     manifest_version: EXIT_BUNDLE_MANIFEST_VERSION,
-    exported_at: new Date().toISOString(),
+    exported_at: exportedAt,
     identity_binding: {
       identity_id: identity.identity_id,
       fortress_id: identity.did,
@@ -1079,6 +1404,35 @@ export async function exportExitBundle(
       },
     );
   }
+  // Same honesty posture for a zero-state export: record it where an exit-drill
+  // operator queries after the fact, so "the bundle was empty" is provable from
+  // the source fortress rather than only inferable from the bundle.
+  //
+  // `appendCritical` and AWAITED, not `void append(...)`: `append`'s own
+  // contract reserves itself for low-risk telemetry and states that export/exit
+  // operations MUST use `appendCritical()`. The await is part of that contract,
+  // not style. Even though critical writes are also tracked for shutdown
+  // flushes, this export must fail at the local durability boundary if the
+  // zero-state evidence cannot be persisted (never silently degrade,
+  // AGENTS.md #5).
+  if (encryptedStateExport.bundle.total_keys === 0) {
+    await opts.auditLog.appendCritical({
+      layer: "l1",
+      operation: "exit_bundle_export_no_state",
+      identity_id: identity.identity_id,
+      result: "success",
+      details: {
+        approval_id: exportApprovalAuditId,
+        namespaces_requested: opts.stateNamespaces ?? null,
+        state_storage_path_supplied: opts.stateStoragePath !== undefined,
+      },
+    });
+  }
+  // Still required and still correct after the change above: the zero-state
+  // entry is already durably verified by the time control reaches here, so this
+  // flush is draining the sibling `void append(...)` calls (partition summary,
+  // receipts truncation) and the append queue. Same order as
+  // exit/consent.ts: appendCritical, then flush.
   await opts.auditLog.flush();
 
   const statePartitionSummary =
@@ -1094,6 +1448,7 @@ export async function exportExitBundle(
     unsupported_artifacts: [
       "audit_receipts: legacy L2 audit entries are manifest-pinned but not individually signed",
     ],
+    state_entry_count: encryptedStateExport.bundle.total_keys,
     ...(encryptedStateExport.rekeyKey !== undefined
       ? { state_rekey_key: encryptedStateExport.rekeyKey }
       : {}),
@@ -1158,17 +1513,121 @@ function validateExportDidWeb(
   };
 }
 
+interface SourceIdentityPublicKeyCandidate {
+  publicKey: Uint8Array;
+  source: "current" | "retired";
+  retiredIndex?: number;
+  compromised: boolean;
+}
+
+type IdentityPublicKeyResolution =
+  | {
+      status: "verified";
+      byIdentityId: Map<string, SourceIdentityPublicKeyCandidate[]>;
+      byDid: Map<string, Uint8Array>;
+      chain: VerifiedRotationChain;
+    }
+  | {
+      status: "invalid";
+      reason: RotationChainInvalidReason;
+      detail: string;
+      identityId: string;
+      hopCount: number;
+    };
+
 function publicKeysFromIdentityArtifact(
   identityArtifact: ExitPublicIdentityArtifact
-): {
-  byIdentityId: Map<string, Uint8Array>;
-  byDid: Map<string, Uint8Array>;
-} {
-  const pubkey = fromBase64url(identityArtifact.bundle.publicKey);
+): IdentityPublicKeyResolution {
+  const chainResult = verifyRotationChain({
+    identityId: identityArtifact.bundle.identity_id,
+    currentPublicKey: identityArtifact.bundle.publicKey,
+    rotationHistory: identityArtifact.bundle.rotation_history,
+  });
+  if (chainResult.status !== "verified") {
+    return {
+      status: "invalid",
+      reason: chainResult.reason,
+      detail: chainResult.detail,
+      identityId: identityArtifact.bundle.identity_id,
+      hopCount: Array.isArray(identityArtifact.bundle.rotation_history)
+        ? identityArtifact.bundle.rotation_history.length
+        : 0,
+    };
+  }
+
+  const candidates: SourceIdentityPublicKeyCandidate[] = [
+    {
+      publicKey: chainResult.chain.current_public_key,
+      source: "current",
+      compromised: false,
+    },
+    ...chainResult.chain.retired.map((retired, index) => ({
+      publicKey: retired.public_key,
+      source: "retired" as const,
+      retiredIndex: index + 1,
+      compromised: retired.compromised,
+    })),
+  ];
+  const byDid = new Map<string, Uint8Array>([
+    [identityArtifact.bundle.did, chainResult.chain.current_public_key],
+  ]);
+  for (const retired of chainResult.chain.retired) {
+    byDid.set(publicKeyToDid(retired.public_key), retired.public_key);
+  }
   return {
-    byIdentityId: new Map([[identityArtifact.bundle.identity_id, pubkey]]),
-    byDid: new Map([[identityArtifact.bundle.did, pubkey]]),
+    status: "verified",
+    byIdentityId: new Map([[identityArtifact.bundle.identity_id, candidates]]),
+    byDid,
+    chain: chainResult.chain,
   };
+}
+
+function rotationChainRefusalMessage(
+  result: Extract<IdentityPublicKeyResolution, { status: "invalid" }>
+): string {
+  return (
+    `rotation chain unverifiable for identity ${result.identityId}: ` +
+    `${result.reason} (${result.detail}; hop_count=${result.hopCount}). ` +
+    "Keep the source fortress intact and re-export after verifying its identity " +
+    "rotation history."
+  );
+}
+
+function compromisedRetiredSignatureUse(
+  encryptedState: ExitEncryptedStateBundle | null,
+  publicKeysByIdentityId: Map<string, SourceIdentityPublicKeyCandidate[]>
+): { count: number; firstRetiredIndex?: number } {
+  let count = 0;
+  let firstRetiredIndex: number | undefined;
+  for (const item of encryptedState?.entries ?? []) {
+    if (item.namespace.startsWith("_") || isReservedNamespace(item.namespace)) {
+      continue;
+    }
+    const candidates = publicKeysByIdentityId.get(item.entry.kid) ?? [];
+    if (candidates.length === 0) continue;
+    let payload: Uint8Array;
+    let signature: Uint8Array;
+    try {
+      payload = fromBase64url(item.entry.payload.ct);
+      signature = fromBase64url(item.entry.sig);
+    } catch {
+      continue;
+    }
+    const matching = candidates.filter((candidate) =>
+      identityVerify(payload, signature, candidate.publicKey)
+    );
+    if (matching.some((candidate) => candidate.compromised)) {
+      const acceptedByNonCompromised = matching.some(
+        (candidate) => !candidate.compromised
+      );
+      if (!acceptedByNonCompromised) {
+        count++;
+        firstRetiredIndex ??= matching.find((candidate) => candidate.compromised)
+          ?.retiredIndex;
+      }
+    }
+  }
+  return firstRetiredIndex === undefined ? { count } : { count, firstRetiredIndex };
 }
 
 async function conflictReport(
@@ -1236,29 +1695,32 @@ function importIdForManifest(manifest: ExitBundleManifest): string {
  * A crafted or corrupted block fails closed with a structured error rather
  * than being silently ignored (which would demote the import to the legacy
  * derivation path - a downgrade, #5).
+ *
+ * INVARIANT: the block-level rules and the per-wrap payload rule are quantified
+ * DIFFERENTLY, and the asymmetry is load-bearing rather than an oversight.
+ * `unwrapMatchingWrap` (server/src/core/master-custody.ts) walks the wraps in
+ * order, catches each wrap's failure individually, and returns on the FIRST
+ * that authenticates, so a block carrying one intact wrap beside one damaged
+ * wrap IS importable. `isValidSourceCustody` therefore requires the structural
+ * and security rules of EVERY wrap but an openable payload from only SOME wrap.
+ *
+ * FAILURE MODE if this drifts: promoting the payload rule to EVERY reads as
+ * harmless hardening in review, passes every test written against a
+ * single-wrap bundle, and silently converts "imports fine" into
+ * SOURCE_CUSTODY_MALFORMED for a mixed block - on the exit path, where the
+ * source fortress may already be gone and a refusal is unrecoverable. It was
+ * shipped once and reverted. The regression tests that hold it are the mixed
+ * intact/damaged wrap rows of the custody differential in
+ * server/test/exit/exit-inspect-declares.test.ts and the import-tolerance case
+ * in server/test/exit/exit-credential-path.test.ts.
+ *
+ * CONTRACT PIN (server/src/exit/source-custody.ts `isValidSourceCustody`): the
+ * rules live in that one predicate, which the verifier's
+ * `summarizeEncryptedState` also classifies through, so `exit inspect` can
+ * never describe a block this gate would refuse.
  */
 function validateSourceCustody(custody: ExitSourceCustody): void {
-  const malformed =
-    custody === null ||
-    typeof custody !== "object" ||
-    custody.format !== "SANCTUARY_EXIT_SOURCE_CUSTODY_V1" ||
-    !Array.isArray(custody.wraps) ||
-    custody.wraps.length === 0 ||
-    // Bounded, and recovery-key wraps ONLY: a passphrase-type wrap here
-    // would both reintroduce the offline passphrase oracle and feed
-    // bundle-controlled Argon2id parameters into the unwrap path
-    // (codex round-1 findings 1 and 2). The HKDF unwrap for recovery-key
-    // wraps carries no attacker-tunable cost parameters.
-    custody.wraps.length > SOURCE_CUSTODY_MAX_WRAPS ||
-    custody.wraps.some(
-      (wrap) =>
-        wrap === null ||
-        typeof wrap !== "object" ||
-        typeof wrap.id !== "string" ||
-        wrap.type !== "recovery-key" ||
-        typeof wrap.payload !== "object"
-    );
-  if (malformed) {
+  if (!isValidSourceCustody(custody)) {
     throw new ExitBundleImportError(
       "SOURCE_CUSTODY_MALFORMED",
       "This bundle's source_custody block is malformed or carries a wrap type " +
@@ -1270,6 +1732,9 @@ function validateSourceCustody(custody: ExitSourceCustody): void {
 
 function decodeSourceRecoveryKey(sourceRecoveryKey: string): Uint8Array {
   const key = fromBase64url(sourceRecoveryKey);
+  // 32 = the 256-bit recovery key minted by `generateRandomKey()`. The SOURCE
+  // fortress's recovery key, so the width must match `decodeRecoveryKey` in
+  // `core/master-custody.ts`. Symmetric material, not an Ed25519 key.
   if (key.length !== 32) {
     throw new Error("Source recovery key must decode to 32 bytes.");
   }
@@ -1284,8 +1749,9 @@ function decodeSourceRecoveryKey(sourceRecoveryKey: string): Uint8Array {
  *  2. Passphrase + legacy `source_key_derivation`: the explicit legacy path
  *     (`master = Argon2id(passphrase, params)`, pre-envelope semantics).
  *     Kept for migrated fortresses, whose bundles carry the legacy params
- *     by design; a wrong passphrase is caught by the all-entries-failed
- *     check in `rekeyState` (SOURCE_KEY_MISMATCH).
+ *     by design; the params are shape/cost-checked first
+ *     (SOURCE_KDF_PARAMS_MALFORMED), and a wrong passphrase is caught by the
+ *     all-entries-failed check in `rekeyState` (SOURCE_KEY_MISMATCH).
  *  3. Passphrase WITHOUT legacy params: fails closed. Envelope-era bundles
  *     deliberately carry no passphrase-checkable material (no offline
  *     oracle), so a passphrase cannot re-key them - the error points the
@@ -1295,8 +1761,11 @@ function decodeSourceRecoveryKey(sourceRecoveryKey: string): Uint8Array {
  *     unwraps nothing FAILS CLOSED with `SOURCE_CREDENTIAL_INVALID` -
  *     never falls through to the legacy raw-key path (that would silently
  *     treat an arbitrary 32 bytes as the master and drop every entry).
- *  5. Recovery key on a legacy bundle: pre-envelope semantics (the
- *     recovery key IS the master), mismatch-checked in `rekeyState`.
+ *  5. Recovery key on a bundle with NO `source_custody`: AMBIGUOUS, and
+ *     refused by default (`SOURCE_RECOVERY_KEY_AMBIGUOUS`). The pre-envelope
+ *     semantics (the recovery key IS the master) run only under the explicit
+ *     `legacyRecoveryKeyIsMaster` opt-in, and a wrong key there is still
+ *     mismatch-checked in `rekeyState`.
  *
  * The recovered master is transient: it only decrypts bundle entries, which
  * are immediately re-encrypted and re-signed under the DESTINATION
@@ -1307,7 +1776,42 @@ async function resolveSourceMasterKey(
   encryptedState: ExitEncryptedStateBundle | null,
   opts: ImportExitBundleOptions
 ): Promise<Uint8Array | null> {
+  // LD2-01 (extended by EXIT-STRUCT-02, one level deeper): `encryptedState`
+  // is an unchecked cast of parsed, untrusted JSON
+  // (`loadExitArtifact<ExitEncryptedStateBundle>` in the caller) — its
+  // `entries` field is declared non-optional and its element shape
+  // (`namespace`/`key`/`entry.kid`/`entry.payload.ct`/`entry.sig`) is
+  // declared non-optional too, but NEITHER is runtime-guaranteed: `entries`
+  // may not be an array at all (LD2-01), or it may be an array containing a
+  // `null` or otherwise malformed element (EXIT-STRUCT-02).
+  // `importExitBundle` already refuses both shapes with the same typed
+  // error before calling in (see the LD2-01/EXIT-STRUCT-02 comment at its
+  // call site), so this check is defense in depth for any other caller
+  // reaching this function: fail closed with a named error, never a raw
+  // TypeError. `isWellFormedExitStateEntryElement` is the SAME predicate
+  // that call site and `verifier.ts` `summarizeEncryptedState` use, so
+  // "malformed" means the same thing in all three places.
+  if (
+    encryptedState &&
+    (!Array.isArray(encryptedState.entries) ||
+      encryptedState.entries.some((item) => !isWellFormedExitStateEntryElement(item)))
+  ) {
+    throw new ExitBundleImportError(
+      "ENCRYPTED_STATE_ENTRIES_UNREADABLE",
+      "This bundle's encrypted_state artifact has no readable entries list " +
+        "(the `entries` field is absent or is not an array), or its entries " +
+        "list contains a malformed element (missing or wrong-typed " +
+        "namespace/key/entry fields). This is not an empty bundle: the " +
+        "entry list itself cannot be read. Re-export the bundle from the " +
+        "source fortress."
+    );
+  }
   if (!encryptedState || encryptedState.entries.length === 0) return null;
+  // This return precedes `validateSourceCustody` deliberately: a caller who
+  // already holds the source master needs no re-key material at all, so a
+  // damaged `source_custody` block is irrelevant to them. There is no CLI flag
+  // for it (see the import branch of `cli.ts`), so only a programmatic caller
+  // reaches it.
   if (opts.sourceMasterKey) return opts.sourceMasterKey;
 
   const sourceCustody = encryptedState.source_custody;
@@ -1315,10 +1819,27 @@ async function resolveSourceMasterKey(
 
   if (opts.sourcePassphrase) {
     if (encryptedState.source_key_derivation) {
-      return (await deriveMasterKey(
-        opts.sourcePassphrase,
+      // INVARIANT (A3): bundle-carried KDF params are attacker-influenceable
+      // input to Argon2id. Shape + cost bounds are enforced here, at the single
+      // site that feeds them to deriveMasterKey; out-of-bounds params fail
+      // closed with SOURCE_KDF_PARAMS_MALFORMED rather than burning unbounded
+      // memory or deriving a garbage master that dies later as
+      // SOURCE_KEY_MISMATCH. CONTRACT PIN (server/src/core/key-derivation.ts
+      // parseKeyDerivationParams): same validator as the export embed-gate.
+      const checked = parseKeyDerivationParams(
         encryptedState.source_key_derivation
-      )).key;
+      );
+      if (!checked.ok) {
+        throw new ExitBundleImportError(
+          "SOURCE_KDF_PARAMS_MALFORMED",
+          "This bundle's legacy re-key parameters (source_key_derivation) are " +
+            `unusable: ${checked.reason}. A passphrase cannot recover the source ` +
+            "master from them, and Sanctuary will not run a key derivation on " +
+            "parameters it cannot validate. Re-export the bundle from the source " +
+            "fortress, or supply the source master key programmatically.",
+        );
+      }
+      return (await deriveMasterKey(opts.sourcePassphrase, checked.params)).key;
     }
     if (sourceCustody !== undefined) {
       throw new ExitBundleImportError(
@@ -1356,11 +1877,83 @@ async function resolveSourceMasterKey(
       }
       return master;
     }
-    // Legacy semantics: the recovery key IS the master.
+    // INVARIANT (A4): a recovery key with NO source_custody block is AMBIGUOUS -
+    // either a bundle re-key key aimed at a bundle that cannot use it, or a
+    // legacy (pre-envelope) source recovery key that IS the master. Guessing
+    // "raw master" silently was how the operator's first signal became a
+    // downstream SOURCE_KEY_MISMATCH naming the symptom, never the cause.
+    // Refuse by default (symmetric with SOURCE_PASSPHRASE_UNSUPPORTED above);
+    // the legacy interpretation requires the explicit
+    // legacyRecoveryKeyIsMaster opt-in.
+    if (opts.legacyRecoveryKeyIsMaster !== true) {
+      throw new ExitBundleImportError(
+        "SOURCE_RECOVERY_KEY_AMBIGUOUS",
+        "This bundle carries no source_custody block, so the supplied " +
+          "--source-recovery-key has two possible meanings and Sanctuary will " +
+          "not guess between them. Either (a) it is a BUNDLE RE-KEY KEY from a " +
+          "different export and this is the wrong bundle (or a pre-envelope " +
+          "one) - in which case re-export from the source fortress and use the " +
+          "re-key key that export prints; or (b) this is a LEGACY bundle whose " +
+          "fortress used recovery-key custody, where the recovery key IS the " +
+          "source master - in which case confirm that interpretation by " +
+          "re-running with --legacy-source-master: " +
+          "sanctuary exit import <dir> --activate --import-state " +
+          "--source-recovery-key <key> --legacy-source-master",
+      );
+    }
+    // Legacy semantics, explicitly confirmed by the operator: the recovery key
+    // IS the master. A wrong key is still caught downstream by rekeyState's
+    // all-entries-failed SOURCE_KEY_MISMATCH.
     return decodeSourceRecoveryKey(opts.sourceRecoveryKey);
   }
 
   return null;
+}
+
+/**
+ * True when the caller supplied ANY source credential, i.e. explicitly asked
+ * for the bundle's encrypted state. Mirrors the credentials
+ * `resolveSourceMasterKey` accepts; keep the two in step.
+ */
+function importRequestedSourceCredential(
+  opts: ImportExitBundleOptions
+): boolean {
+  return (
+    opts.sourcePassphrase !== undefined ||
+    opts.sourceRecoveryKey !== undefined ||
+    opts.sourceMasterKey !== undefined
+  );
+}
+
+/**
+ * Operator-facing warning for a zero-entry encrypted_state artifact, keyed on
+ * the A8 marker. An ABSENT marker is the louder case: it means a pre-marker or
+ * buggy exporter wrote this bundle, so nothing in it distinguishes an empty
+ * fortress from an export that dropped everything.
+ */
+function emptyStateWarning(encryptedState: ExitEncryptedStateBundle): string {
+  switch (encryptedState.empty_reason) {
+    case EXIT_EMPTY_REASONS.FORTRESS_STATE_EMPTY:
+      return (
+        "this bundle carries zero state entries and its exporter recorded " +
+        `empty_reason=${EXIT_EMPTY_REASONS.FORTRESS_STATE_EMPTY}: the source ` +
+        "fortress had no exportable state."
+      );
+    case EXIT_EMPTY_REASONS.PARTITION_EXCLUDED_ALL:
+      return (
+        "this bundle carries zero state entries and its exporter recorded " +
+        `empty_reason=${EXIT_EMPTY_REASONS.PARTITION_EXCLUDED_ALL}: the source ` +
+        "fortress had state, but the ownership partition withheld every entry."
+      );
+    default:
+      return (
+        "this bundle carries zero state entries and NO empty_reason marker: it " +
+        "was written by a pre-marker (or buggy) exporter, so an empty source " +
+        "fortress cannot be distinguished from an export that dropped " +
+        "everything. Verify the source fortress before treating this as a " +
+        "complete exit."
+      );
+  }
 }
 
 /**
@@ -1533,11 +2126,37 @@ function activationSnapshotLocations(
   return locations;
 }
 
+/**
+ * One phrase naming which credential semantics `resolveSourceMasterKey`
+ * applied, for the SOURCE_KEY_MISMATCH message. Mirrors that function's
+ * precedence; if the precedence changes, change this in the same commit.
+ */
+function describeSourceCredentialInterpretation(
+  encryptedState: ExitEncryptedStateBundle,
+  opts: ImportExitBundleOptions
+): string {
+  if (opts.sourceMasterKey) return "the caller supplied the source master key directly";
+  if (opts.sourcePassphrase) {
+    return "the passphrase was run through the bundle's legacy source_key_derivation parameters";
+  }
+  if (opts.sourceRecoveryKey) {
+    return encryptedState.source_custody !== undefined
+      ? "the key was unwrapped from the bundle's source_custody block"
+      : "the key was applied under legacy raw-master semantics (--legacy-source-master)";
+  }
+  return "no source credential was supplied";
+}
+
 async function rekeyState(
   encryptedState: ExitEncryptedStateBundle,
   opts: ImportExitBundleOptions,
   sourceMasterKey: Uint8Array,
-  publicKeysByIdentityId: Map<string, Uint8Array>,
+  publicKeysByIdentityId: Map<string, SourceIdentityPublicKeyCandidate[]>,
+  rotationStats: {
+    entriesAdmittedByCurrentKey: number;
+    entriesAdmittedByRetiredKey: number;
+    entriesAdmittedByCompromisedRetiredKey: number;
+  },
   /**
    * Accumulator threaded by importExitBundle so the outer cleanup path
    * can remove every entry rekeyState successfully wrote prior to a
@@ -1585,21 +2204,37 @@ async function rekeyState(
       skipped++;
       continue;
     }
-    const signerPubkey = publicKeysByIdentityId.get(item.entry.kid);
-    if (!signerPubkey) {
+    const signerPubkeys = publicKeysByIdentityId.get(item.entry.kid);
+    if (!signerPubkeys || signerPubkeys.length === 0) {
       skippedUnknownKid++;
       skipped++;
       continue;
     }
-    const sourceSigValid = identityVerify(
-      fromBase64url(item.entry.payload.ct),
-      fromBase64url(item.entry.sig),
-      signerPubkey
+    const admittingKey = signerPubkeys.find((candidate) =>
+      identityVerify(
+        fromBase64url(item.entry.payload.ct),
+        fromBase64url(item.entry.sig),
+        candidate.publicKey
+      )
     );
-    if (!sourceSigValid) {
+    if (!admittingKey) {
       skippedInvalidSig++;
       skipped++;
       continue;
+    }
+    if (
+      admittingKey.source === "retired" &&
+      admittingKey.compromised &&
+      opts.acceptCompromisedRotationKeys !== true
+    ) {
+      throw new ExitBundleImportError(
+        "COMPROMISED_ROTATION_KEY_REFUSED",
+        `Refusing to import state entry ${item.namespace}/${item.key}: its ` +
+          `source signature verifies only under retired rotation key ` +
+          `retired-${admittingKey.retiredIndex ?? "unknown"}, whose rotation ` +
+          `reason declares compromise. Re-run only if the operator explicitly ` +
+          `accepts that risk with --accept-compromised-rotation-keys.`,
+      );
     }
 
     const exists = await opts.storage.exists(item.namespace, item.key);
@@ -1666,10 +2301,26 @@ async function rekeyState(
           ...(item.entry.metadata.tags ?? []),
           "exit-import",
           `source:${item.entry.kid}`,
+          ...(admittingKey.source === "retired"
+            ? [
+                `source-key:retired-${admittingKey.retiredIndex ?? "unknown"}`,
+                ...(admittingKey.compromised
+                  ? ["source-key:compromised-rotation"]
+                  : []),
+              ]
+            : []),
         ],
       }
     );
     imported++;
+    if (admittingKey.source === "current") {
+      rotationStats.entriesAdmittedByCurrentKey++;
+    } else {
+      rotationStats.entriesAdmittedByRetiredKey++;
+      if (admittingKey.compromised) {
+        rotationStats.entriesAdmittedByCompromisedRetiredKey++;
+      }
+    }
     importedRekeyEntries?.push({ namespace: item.namespace, key: item.key });
   }
 
@@ -1687,7 +2338,11 @@ async function rekeyState(
         "The source credential does not match the key this state was actually " +
         "encrypted under (on legacy bundles this can indicate a fortress whose " +
         "passphrase-derived key diverged from its true master). Re-run with the " +
-        "correct source credential, or re-export the bundle from the source fortress."
+        "correct source credential, or re-export the bundle from the source fortress. " +
+        // A4 follow-through: name the INTERPRETATION that was in effect, so even
+        // the residual mismatch says which credential semantics were applied
+        // rather than leaving the operator to infer it from the flags they typed.
+        `Interpretation in effect: ${describeSourceCredentialInterpretation(encryptedState, opts)}.`
     );
   }
 
@@ -1759,7 +2414,27 @@ export async function importExitBundle(
     unsupported_artifacts: verification.unsupported_artifacts,
   });
 
-  if (!verification.passed) {
+  if (
+    !verification.passed &&
+    verification.failure_class !== "reputation_unverifiable_attestations" &&
+    // EXIT-PASS-01: rotation_chain_invalid now fails the verifier `passed`
+    // boolean (so `exit verify`/`inspect` report FAIL). Do NOT let it short to
+    // the generic not-verified result here — falling through preserves the
+    // specific, more diagnosable ROTATION_CHAIN_UNVERIFIABLE throw below
+    // (line ~2421), which names the rotation chain as the cause instead of a
+    // bare "not verified". Import stays fail-closed either way: it never admits
+    // data on an unverifiable chain.
+    verification.failure_class !== "rotation_chain_invalid" &&
+    // LD2-01 (same #1189 pattern), extended by EXIT-STRUCT-02 for a
+    // malformed ELEMENT rather than an unreadable container:
+    // encrypted_state_entries_unreadable now fails `passed` for both shapes
+    // (verifier.ts aggregator). Do NOT let it short to the generic
+    // not-verified result here either — falling through preserves the
+    // specific ENCRYPTED_STATE_ENTRIES_UNREADABLE throw below, once
+    // `encryptedState` is loaded, instead of a bare "not verified" that gives
+    // the operator no named cause. Import stays fail-closed either way.
+    verification.failure_class !== "encrypted_state_entries_unreadable"
+  ) {
     return notVerifiedResult(
       0,
       verification.reputation?.unverifiable_attestations ?? 0
@@ -1808,7 +2483,112 @@ export async function importExitBundle(
 
   const publicKeys = identityArtifact
     ? publicKeysFromIdentityArtifact(identityArtifact.json)
-    : { byIdentityId: new Map<string, Uint8Array>(), byDid: new Map<string, Uint8Array>() };
+    : {
+        status: "verified" as const,
+        byIdentityId: new Map<string, SourceIdentityPublicKeyCandidate[]>(),
+        byDid: new Map<string, Uint8Array>(),
+        chain: {
+          identity_id: manifest.body.identity_binding.identity_id,
+          current_public_key: new Uint8Array(),
+          retired: [],
+          hop_count: 0,
+        },
+      };
+  if (publicKeys.status === "invalid") {
+    // INVARIANT: a bundle whose rotation history cannot be consumed must fail
+    // before import can fall back to current-key-only verification and report a
+    // partial PASS over silently dropped pre-rotation data.
+    throw new ExitBundleImportError(
+      "ROTATION_CHAIN_UNVERIFIABLE",
+      rotationChainRefusalMessage(publicKeys)
+    );
+  }
+  // LD2-01 (verify/import parity aggregator, class fix), extended by
+  // EXIT-STRUCT-02 one level deeper: an encrypted_state artifact whose
+  // `entries` field is missing or not an array is structural damage to the
+  // artifact itself — verifier.ts `summarizeEncryptedState` classifies it as
+  // `entry_count === null`, and the aggregator in `verifyExitBundle` now
+  // fails `passed` on it too (`encrypted_state_entries_unreadable`). The
+  // SAME is true one level deeper when `entries` IS an array but an
+  // ELEMENT in it is malformed (`entries: [null]`, or an element missing
+  // `namespace`/`entry`/`entry.kid`/`entry.payload.ct`/`entry.sig`):
+  // `summarizeEncryptedState` reports `entries_malformed`, and the
+  // aggregator fails `passed` on that too, through the SAME
+  // `encrypted_state_entries_unreadable` failure_class (both are "the
+  // entries list could not be read in the expected shape" from an
+  // operator's perspective). Checked here unconditionally and BEFORE the
+  // generic not-verified gate below, mirroring the rotation-chain-invalid
+  // throw immediately above: without this, the raw `item.namespace`/
+  // `item.entry.kid` dereferences in `compromisedRetiredSignatureUse`
+  // (three calls below) throw an unhandled TypeError for the same input.
+  // Fail closed with a NAMED, typed error instead — never a crash — so an
+  // operator (or a programmatic caller passing `sourceMasterKey`, which
+  // bypasses the credential-resolution branches below entirely but still
+  // reaches this same dereference) gets a diagnosable code, not a stack
+  // trace. CONTRACT PIN: the code string mirrors failure_class
+  // "encrypted_state_entries_unreadable" in
+  // contracts/v1.1/exit-bundle-manifest.ts.
+  //
+  // NULL-ROOT RECHECK: `encryptedState.json` is an unchecked cast of parsed,
+  // untrusted JSON (`loadExitArtifact<ExitEncryptedStateBundle>` above) — a
+  // signed, hash-verified artifact whose bytes happen to be the JSON literal
+  // `null` (or any other non-object root) satisfies no object shape at all.
+  // The original guard here dereferenced `encryptedState.json.entries`
+  // directly, which throws a raw TypeError on a null/non-object root BEFORE
+  // `Array.isArray` ever runs — the exact crash class this fix exists to
+  // close, one property access earlier than the case it was written for.
+  // Narrow the JSON ROOT itself first, through `unknown`, so a malformed
+  // root reaches the SAME named error instead.
+  //
+  // INVARIANT (EXIT-STRUCT-02): verify fails closed on a malformed ELEMENT
+  // exactly where import dereferences it; container+count checks are not
+  // enough. `isWellFormedExitStateEntryElement` is the SAME predicate
+  // `verifier.ts` `summarizeEncryptedState` and `resolveSourceMasterKey`
+  // (below) use, so this check and verify's `passed` boolean can never
+  // disagree about which element is damaged.
+  const encryptedStateJsonRoot: unknown = encryptedState?.json;
+  const encryptedStateEntriesReadable =
+    encryptedStateJsonRoot !== null &&
+    typeof encryptedStateJsonRoot === "object" &&
+    Array.isArray((encryptedStateJsonRoot as { entries?: unknown }).entries) &&
+    (encryptedStateJsonRoot as { entries: unknown[] }).entries.every((item) =>
+      isWellFormedExitStateEntryElement(item)
+    );
+  if (encryptedState && !encryptedStateEntriesReadable) {
+    throw new ExitBundleImportError(
+      "ENCRYPTED_STATE_ENTRIES_UNREADABLE",
+      "This bundle's encrypted_state artifact has no readable entries list " +
+        "(the `entries` field is absent or is not an array), or its entries " +
+        "list contains a malformed element (missing or wrong-typed " +
+        "namespace/key/entry fields). This is not an empty bundle: the " +
+        "entry list itself cannot be read. Re-export the bundle from the " +
+        "source fortress."
+    );
+  }
+  if (!verification.passed) {
+    return notVerifiedResult(
+      0,
+      verification.reputation?.unverifiable_attestations ?? 0
+    );
+  }
+
+  const compromisedUse = compromisedRetiredSignatureUse(
+    encryptedState?.json ?? null,
+    publicKeys.byIdentityId
+  );
+  if (
+    compromisedUse.count > 0 &&
+    opts.acceptCompromisedRotationKeys !== true
+  ) {
+    throw new ExitBundleImportError(
+      "COMPROMISED_ROTATION_KEY_REFUSED",
+      `${compromisedUse.count} state entr${compromisedUse.count === 1 ? "y" : "ies"} ` +
+        "verify only under a key retired by a compromised-reason rotation " +
+        `(first retired key: retired-${compromisedUse.firstRetiredIndex ?? "unknown"}). ` +
+        "Refusing by default. Re-run only if the operator explicitly accepts " +
+        "that risk with --accept-compromised-rotation-keys."
+    );
+  }
 
   const reputationStore = reputationArtifact
     ? opts.reputationStore ?? new ReputationStore(opts.storage, opts.masterKey)
@@ -2105,6 +2885,11 @@ export async function importExitBundle(
     invalid_attestations: 0,
     unverifiable_attestations: verification.reputation?.unverifiable_attestations ?? 0,
   };
+  const rotationStats = {
+    entriesAdmittedByCurrentKey: 0,
+    entriesAdmittedByRetiredKey: 0,
+    entriesAdmittedByCompromisedRetiredKey: 0,
+  };
   let stateResult: ImportExitBundleResult["state"];
   // Resolved INSIDE the try block: a fail-closed source-credential error
   // (SOURCE_CREDENTIAL_INVALID / SOURCE_KEY_UNAVAILABLE / malformed
@@ -2226,6 +3011,7 @@ export async function importExitBundle(
               opts,
               sourceMasterKey,
               publicKeys.byIdentityId,
+              rotationStats,
               importedRekeyEntries
             )
           : {
@@ -2237,13 +3023,46 @@ export async function importExitBundle(
               conflicts: conflicts.state_conflicts.length,
             }
         : {
-            status: "not_requested" as const,
+            // INVARIANT (A8): "the bundle carried zero entries" is NOT
+            // "no state import was requested". When the operator supplied a
+            // source credential they explicitly asked for state, so reporting
+            // `not_requested` here was a false negative that also mis-fired the
+            // CLI's "re-run with --import-state" advice. Credentials supplied
+            // => `empty_bundle`; no credentials => `not_requested` stays, plus
+            // a warning naming the empty_reason marker (or its absence).
+            status: importRequestedSourceCredential(opts)
+              ? ("empty_bundle" as const)
+              : ("not_requested" as const),
             imported_keys: 0,
             skipped_keys: 0,
             skipped_invalid_sig: 0,
             skipped_unknown_kid: 0,
             conflicts: 0,
           };
+    if (encryptedState && encryptedState.json.entries.length === 0) {
+      importWarnings.push(emptyStateWarning(encryptedState.json));
+    }
+    if (stateHasNonConflictSkippedEntries(stateResult)) {
+      // A dropped state entry must be surfaced, never reported as a successful import.
+      throw new ExitBundleStateImportIncompleteError(
+        stateResult,
+        stateImportIncompleteMessageWithRotationKeys(
+          stateResult,
+          publicKeys.byIdentityId
+        )
+      );
+    }
+    if (stateSkippedOnlyConflicts(stateResult)) {
+      importWarnings.push(
+        `state import skipped ${stateResult.skipped_keys} existing destination ` +
+          `entr${stateResult.skipped_keys === 1 ? "y" : "ies"} due to ` +
+          `conflict policy; state_skipped_keys=${stateResult.skipped_keys}, ` +
+          `state_skipped_invalid_sig=${stateResult.skipped_invalid_sig}, ` +
+          `state_skipped_unknown_kid=${stateResult.skipped_unknown_kid}. ` +
+          `Re-run with --conflict overwrite or --conflict version if these ` +
+          `source entries should replace destination state.`
+      );
+    }
     // M2-slice (warn): the destination `stateStore.write` mints a fresh
     // `written_at` and a fresh monotonic `ver` - both are bound into the
     // signed envelope, so they cannot be back-stamped to the source values
@@ -2266,6 +3085,28 @@ export async function importExitBundle(
       state_imported_keys: stateResult.imported_keys,
       reputation_imported_attestations: reputationResult.imported_attestations,
     });
+    if (identityArtifact && publicKeys.chain.hop_count > 0) {
+      await opts.auditLog.appendCritical({
+        layer: "l1",
+        operation: "exit_bundle_rotation_chain_consumed",
+        identity_id: identityArtifact.json.bundle.identity_id,
+        result: "success",
+        details: {
+          hop_count: publicKeys.chain.hop_count,
+          entries_admitted_by_current_key:
+            rotationStats.entriesAdmittedByCurrentKey,
+          entries_admitted_by_retired_key:
+            rotationStats.entriesAdmittedByRetiredKey,
+          compromised_hops: publicKeys.chain.retired.filter(
+            (retired) => retired.compromised
+          ).length,
+          entries_admitted_by_compromised_retired_key:
+            rotationStats.entriesAdmittedByCompromisedRetiredKey,
+          accept_compromised_rotation_keys:
+            opts.acceptCompromisedRotationKeys === true,
+        },
+      });
+    }
     await opts.auditLog.flush();
   } catch (err) {
     const cleanup = await restoreStorageSnapshots(
@@ -2305,17 +3146,24 @@ export async function importExitBundle(
       : stateRekeyStarted
         ? "REKEY_FAILED_AND_CLEANED"
         : "ACTIVATION_FAILED_AND_CLEANED";
-    throw new ExitBundleImportError(
+    const cleanupMessage =
       // Preserve structured fail-closed codes (SOURCE_CREDENTIAL_INVALID,
       // SOURCE_KEY_MISMATCH, ...) so callers can branch on the cause; the
       // generic code covers non-structured failures (disk full, etc.).
-      err instanceof ExitBundleImportError ? err.code : fallbackCode,
       `Exit-bundle ${failureKind} failed: ${originalMessage}. ` +
         `Cleanup removed ${cleanup.removed} and restored ${cleanup.restored} of ` +
         `${activationSnapshots.length} snapshotted paths ` +
         `plus ${activationNamespaceSnapshots.length} snapshotted namespaces ` +
         `(${importedRekeyEntries.length} re-keyed entries plus ${stagedLocations.length} staged artifacts; ` +
-        `${cleanup.failed.length} cleanup writes/deletes failed).`,
+        `${cleanup.failed.length} cleanup writes/deletes failed).`;
+    if (err instanceof ExitBundleStateImportIncompleteError) {
+      throw new ExitBundleStateImportIncompleteError(err.state, cleanupMessage, {
+        cause: err,
+      });
+    }
+    throw new ExitBundleImportError(
+      err instanceof ExitBundleImportError ? err.code : fallbackCode,
+      cleanupMessage,
       { cause: err }
     );
   } finally {
@@ -2335,6 +3183,24 @@ export async function importExitBundle(
     conflicts,
     state: stateResult,
     reputation: reputationResult,
+    ...(identityArtifact && publicKeys.chain.hop_count > 0
+      ? {
+          rotation: {
+            identity_id: identityArtifact.json.bundle.identity_id,
+            hop_count: publicKeys.chain.hop_count,
+            chain_signature_verified: true,
+            compromised_hops: publicKeys.chain.retired.filter(
+              (retired) => retired.compromised
+            ).length,
+            entries_admitted_by_current_key:
+              rotationStats.entriesAdmittedByCurrentKey,
+            entries_admitted_by_retired_key:
+              rotationStats.entriesAdmittedByRetiredKey,
+            entries_admitted_by_compromised_retired_key:
+              rotationStats.entriesAdmittedByCompromisedRetiredKey,
+          },
+        }
+      : {}),
     staged_artifacts: stagedArtifacts,
     warnings: [...verification.warnings, ...importWarnings],
     unsupported_artifacts: verification.unsupported_artifacts,

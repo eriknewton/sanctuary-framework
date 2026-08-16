@@ -19,8 +19,8 @@ code, no vendor lock-in.
 Every runtime gets the same capabilities:
 
 - **Ed25519 Identity**: Cryptographic keypair + W3C DID per agent
-- **Encrypted Audit Trail**: Tamper-proof CEF/OCSF logs
-- **Sovereignty Health Report**: Real-time L1-L4 status
+- **Encrypted Audit Trail**: Tamper-evident hash-chained logs; production audit checkpoints are currently unsigned until **IC-05** closes
+- **Sovereignty Health Report**: Current status for Castle Wall, Sentinels, Charter, and Heralds
 - **Verascore Profile**: Portable, verifiable reputation
 - **Sovereignty Handshake**: Mutual trust verification between agents
 
@@ -28,7 +28,7 @@ Every runtime gets the same capabilities:
 
 ```
 1. Add Sanctuary as an MCP server (see runtime-specific guide)
-2. Call `manifest` to verify 68 tools are loaded
+2. Call `manifest` to verify 80+ tools are loaded
 3. Call `identity_create` to get a DID
 4. Call `identity_set_primary` to designate the active identity
 5. Call `sovereignty_health_report` to check your status

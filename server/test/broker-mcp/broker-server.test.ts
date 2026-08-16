@@ -216,6 +216,60 @@ describe("Broker MCP Server", () => {
       const result = await callTool(server, "broker/read_secret", { token });
       expect(result.isError).toBe(true);
     });
+
+    it("never echoes a backend error's name/message to the agent (BROKER-BACKEND-DIAGNOSTIC-LEAK)", async () => {
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const auditLog = new AuditLog(storage, masterKey);
+      const backend = makeFakeBackend({ gmail_oauth: "SECRET-VALUE-XYZ" });
+      // Simulate a real keychain-style diagnostic: carries the secret NAME
+      // and an absolute path, exactly the shape BROKER-BACKEND-DIAGNOSTIC-LEAK
+      // is about (keychain-backend.ts's `find-generic-password failed: ...`
+      // and `Broker keychain not found at <path>` messages).
+      backend.readSecret = async () => {
+        throw new Error(
+          "find-generic-password failed: SecKeychainFindGenericPassword: gmail_oauth not found in /Users/erik/Library/Keychains/sanctuary-broker-abc123.keychain-db"
+        );
+      };
+      const broker = new Broker({
+        backend,
+        auditLog,
+        grants: [{ skill: "gmail-triage", secret: "gmail_oauth", scope: "read" }],
+        principalIdentityId: "did:sanctuary:1",
+      });
+      const server = createBrokerMcpServer(broker, {
+        skill: "gmail-triage",
+        agentId: "nsa",
+        identityId: "did:sanctuary:1",
+        tenantId: "tenant-alpha",
+        fortressId: "fortress-alpha",
+        audience: "sanctuary-broker",
+      });
+
+      const issue = await callTool(server, "broker/request_token", {
+        skill: "gmail-triage",
+        secret: "gmail_oauth",
+      });
+      const { token } = parseContent(issue);
+      const result = await callTool(server, "broker/read_secret", { token });
+
+      expect(result.isError).toBe(true);
+      const body = parseContent(result);
+      expect(body.error).toBe("Broker backend unavailable");
+      const serialized = JSON.stringify(result);
+      expect(serialized).not.toContain("gmail_oauth");
+      expect(serialized).not.toContain("/Users/erik");
+      expect(serialized).not.toContain("keychain-db");
+      expect(serialized).not.toContain("SecKeychainFindGenericPassword");
+
+      // The specific error is still preserved for the operator, in the
+      // operator-only audit view (never the agent-facing queryAudit()).
+      const operatorAudit = await broker.queryAuditOperator({});
+      const backendFailure = operatorAudit.entries.find(
+        (e) => e.details?.reason === "backend_error"
+      );
+      expect(backendFailure?.details?.error_message).toContain("gmail_oauth");
+    });
   });
 
   describe("broker/list_grants", () => {
@@ -228,6 +282,40 @@ describe("Broker MCP Server", () => {
       expect(body.grants[0].secret).toBe("gmail_oauth");
       const serialized = JSON.stringify(body);
       expect(serialized).not.toContain("SECRET-VALUE-XYZ");
+    });
+
+    it("never returns another principal's grants (BROKER-GRANT-INVENTORY-CROSS-CALLER)", async () => {
+      // Two skills' grants live on the same broker instance (one process
+      // serves every skill/session). The server for "gmail-triage" must see
+      // ONLY its own grant, never "slack-bot"'s secret name/scope/ttl.
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const auditLog = new AuditLog(storage, masterKey);
+      const broker = new Broker({
+        backend: makeFakeBackend({ gmail_oauth: "SECRET-VALUE-XYZ", slack_token: "SLACK-SECRET-XYZ" }),
+        auditLog,
+        grants: [
+          { skill: "gmail-triage", secret: "gmail_oauth", scope: "read" },
+          { skill: "slack-bot", secret: "slack_token", scope: "rotate", ttlSeconds: 900 },
+        ],
+        principalIdentityId: "did:sanctuary:1",
+      });
+      const server = createBrokerMcpServer(broker, {
+        skill: "gmail-triage",
+        agentId: "nsa",
+        identityId: "did:sanctuary:1",
+        tenantId: "tenant-alpha",
+        fortressId: "fortress-alpha",
+        audience: "sanctuary-broker",
+      });
+
+      const result = await callTool(server, "broker/list_grants", {});
+      const body = parseContent(result);
+      expect(body.grants).toHaveLength(1);
+      expect(body.grants[0].skill).toBe("gmail-triage");
+      const serialized = JSON.stringify(body);
+      expect(serialized).not.toContain("slack-bot");
+      expect(serialized).not.toContain("slack_token");
     });
   });
 

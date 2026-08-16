@@ -78,6 +78,9 @@ const RAW_IDENTITY_SIGN_OPERATION = "identity_sign";
  *   So it must require operator approval. (CISO NEW-1.)
  * - memory_delete: irreversible SDW memory deletion must not be relaxable by a
  *   hand-authored policy once the inert memory tool factory is wired.
+ * - memory_ingest / memory_emit / memory_transcode / memory_transcode_restore:
+ *   manual memory movement writes either vault records or plaintext files and
+ *   must start at Tier 1 in the generated policy.
  */
 /**
  * Operator Cloud Slice 2 (non-relaxable cloud-custody gate, MANDATORY): minting
@@ -165,6 +168,17 @@ export const NON_RELAXABLE_MEMORY_INTEGRITY_TIER1_OPERATIONS = [
   "memory_checkpoint_restore",
 ] as const;
 
+/**
+ * Exit V2 SDW memory carriage is an explicit custody-boundary operation.
+ * Both verbs are force-pinned because exporting recovery material and
+ * importing operator-carried state must never become silently allowable via
+ * a hand-authored policy.
+ */
+export const NON_RELAXABLE_EXIT_V2_MEMORY_TIER1_OPERATIONS = [
+  "memory_archive_export",
+  "memory_archive_import",
+] as const;
+
 const FORCED_TIER1_OPERATIONS = [
   RAW_IDENTITY_SIGN_OPERATION,
   "principal_policy_view",
@@ -180,6 +194,7 @@ const FORCED_TIER1_OPERATIONS = [
   ...NON_RELAXABLE_CASTLE_WALL_OBSERVE_TIER1_OPERATIONS,
   ...NON_RELAXABLE_ENFORCEMENT_EXPORT_TIER1_OPERATIONS,
   ...NON_RELAXABLE_MEMORY_INTEGRITY_TIER1_OPERATIONS,
+  ...NON_RELAXABLE_EXIT_V2_MEMORY_TIER1_OPERATIONS,
 ] as const;
 
 /**
@@ -538,6 +553,16 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     // external channel).
     "memory_insert",
     "memory_delete",
+    // Rung-1 manual memory-file movement. Ingest writes a plaintext harness
+    // snapshot into the encrypted vault; emit/transcode/restore materialize
+    // plaintext files in an operator-named output directory. These are manual
+    // portability commands, never sync/watch paths, and require approval.
+    "memory_ingest",
+    "memory_emit",
+    "memory_transcode",
+    "memory_transcode_restore",
+    "memory_archive_export",
+    "memory_archive_import",
     // Castle Wall Observe / Learn Allow-List v1 (2026-07-07): promoting an
     // observed destination into a live allow rule is a wall-widening policy
     // mutation, the same class as file_grant / operator_cloud_provision
@@ -803,18 +828,35 @@ function validatePolicy(raw: Record<string, unknown>): PrincipalPolicy {
       ...((raw.tier2_anomaly as Record<string, unknown>) ?? {}),
     } as Tier2Config,
     tier3_always_allow: mergedTier3Pre,
-    approval_channel: (() => {
-      const merged = {
-        ...DEFAULT_CHANNEL,
-        ...((raw.approval_channel as Record<string, unknown>) ?? {}),
-      } as ApprovalChannelConfig;
-      // SEC-002: Strip auto_deny from user-supplied policy.
-      // Timeout always denies - this is not configurable.
-      delete merged.auto_deny;
-      return merged;
-    })(),
+    approval_channel: parseApprovalChannel(raw.approval_channel),
     approval_redirect: parseApprovalRedirect(raw.approval_redirect),
   });
+}
+
+/**
+ * Parse + validate the approval channel block. A malformed channel type is a
+ * startup-blocking policy error because silently substituting another channel
+ * would misstate the operator's human-oversight path.
+ */
+function parseApprovalChannel(raw: unknown): ApprovalChannelConfig {
+  const merged = {
+    ...DEFAULT_CHANNEL,
+    ...((raw as Record<string, unknown>) ?? {}),
+  } as ApprovalChannelConfig;
+  if (
+    merged.type !== "stderr" &&
+    merged.type !== "webhook" &&
+    merged.type !== "callback" &&
+    merged.type !== "dashboard"
+  ) {
+    throw new Error(
+      `approval_channel.type must be "stderr", "webhook", "callback", or "dashboard" (got ${JSON.stringify(merged.type)})`,
+    );
+  }
+  // SEC-002: Strip auto_deny from user-supplied policy.
+  // Timeout always denies - this is not configurable.
+  delete merged.auto_deny;
+  return merged;
 }
 
 /**

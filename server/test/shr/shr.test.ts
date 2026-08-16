@@ -16,8 +16,13 @@ import {
 } from "../../src/core/identity.js";
 import type { StoredIdentity } from "../../src/core/identity.js";
 import type { SHRRotationEvent } from "../../src/shr/types.js";
-import { generateSHR } from "../../src/shr/generator.js";
-import { verifySHR } from "../../src/shr/verifier.js";
+import { generateSHR, SHR_MAX_LIFETIME_MS } from "../../src/shr/generator.js";
+import {
+  verifySHR,
+  SHR_MAX_AGE_MS,
+  SHR_MAX_DECLARED_LIFETIME_MS,
+  SHR_MAX_CLOCK_SKEW_MS,
+} from "../../src/shr/verifier.js";
 import { canonicalizeForSigning } from "../../src/shr/types.js";
 import { SIGNATURE_SCHEME_V1 } from "../../src/mesh/constants.js";
 import {
@@ -685,6 +690,134 @@ describe("Sovereignty Health Report (SHR)", () => {
         .map((d) => d.code);
       expect(l4Codes).toEqual([]);
       expect(shr.body.layers.l4.status).toBe("active");
+    });
+  });
+
+  // ─── SHR-FRESH-01: signed-lifetime clamp + relying-party freshness ────
+  describe("Freshness bounds (SHR-FRESH-01)", () => {
+    it("clamps a signed SHR's lifetime to SHR_MAX_LIFETIME_MS even when a far-larger validity is requested", () => {
+      const shr = generateSHR(undefined, {
+        config,
+        identityManager: identityManager as any,
+        masterKey,
+        // Ask for ~10 years — far beyond the ceiling.
+        validityMs: 10 * 365 * 24 * 60 * 60 * 1000,
+      }) as SignedSHR;
+
+      const generated = new Date(shr.body.generated_at).getTime();
+      const expires = new Date(shr.body.expires_at).getTime();
+      expect(expires - generated).toBe(SHR_MAX_LIFETIME_MS);
+    });
+
+    it("verifySHR rejects an otherwise-valid SHR whose age exceeds SHR_MAX_AGE_MS", () => {
+      const genTime = new Date("2026-01-01T00:00:00.000Z");
+      const shr = generateSHR(undefined, {
+        config,
+        identityManager: identityManager as any,
+        masterKey,
+        now: genTime,
+        validityMs: SHR_MAX_LIFETIME_MS, // long-lived so expiry itself isn't the trigger
+      }) as SignedSHR;
+
+      const staleCheckTime = new Date(genTime.getTime() + SHR_MAX_AGE_MS + 60_000);
+      const result = verifySHR(shr, staleCheckTime);
+
+      expect(result.valid).toBe(false);
+      expect(
+        result.errors.some((e) => e.includes("exceeding the maximum relying-party age"))
+      ).toBe(true);
+    });
+
+    it("verifySHR rejects an SHR whose declared lifetime exceeds SHR_MAX_DECLARED_LIFETIME_MS", () => {
+      // Hand-craft a body with a declared lifetime beyond the ceiling — a
+      // hostile signer's generator has no clamp of its own, so this proves
+      // the verify-side check is independent enforcement.
+      const priv = randomBytes(32);
+      const pub = ed25519.getPublicKey(priv);
+      const generatedAt = new Date("2026-01-01T00:00:00.000Z");
+      const expiresAt = new Date(
+        generatedAt.getTime() + SHR_MAX_DECLARED_LIFETIME_MS + 60_000
+      );
+
+      const body: any = {
+        shr_version: "1.0",
+        implementation: {
+          sanctuary_version: "test",
+          node_version: "test",
+          generated_by: "sanctuary-mcp-server",
+        },
+        instance_id: generateIdentityId(pub),
+        generated_at: generatedAt.toISOString(),
+        expires_at: expiresAt.toISOString(),
+        layers: {
+          l1: {
+            status: "active",
+            encryption: "aes-256-gcm",
+            key_custody: "self",
+            integrity: "hmac",
+            identity_type: "ed25519",
+            state_portable: true,
+          },
+          l2: { status: "active", isolation_type: "local-process", attestation_available: false },
+          l3: { status: "active", proof_system: "schnorr-pedersen", selective_disclosure: true },
+          l4: { status: "active", reputation_mode: "local", attestation_format: "v1", reputation_portable: true },
+        },
+        capabilities: {
+          handshake: true,
+          shr_exchange: true,
+          reputation_verify: true,
+          encrypted_channel: false,
+        },
+        degradations: [],
+      };
+      const sig = ed25519.sign(stringToBytes(canonicalizeForSigning(body)), priv);
+      const shr: SignedSHR = {
+        body,
+        signed_by: toBase64url(pub),
+        signature: toBase64url(sig),
+        signature_scheme: SIGNATURE_SCHEME_V1,
+      };
+
+      // Check well within the declared window so the age/expiry checks
+      // above don't also fire — isolates the declared-lifetime check.
+      const checkTime = new Date(generatedAt.getTime() + 60_000);
+      const result = verifySHR(shr, checkTime);
+
+      expect(result.valid).toBe(false);
+      expect(
+        result.errors.some((e) => e.includes("exceeding the maximum of"))
+      ).toBe(true);
+    });
+
+    it("verifySHR rejects a future generated_at beyond SHR_MAX_CLOCK_SKEW_MS (was only a warning before)", () => {
+      const now = new Date("2026-01-01T00:00:00.000Z");
+      const futureGenerated = new Date(now.getTime() + SHR_MAX_CLOCK_SKEW_MS + 60_000);
+      const shr = generateSHR(undefined, {
+        config,
+        identityManager: identityManager as any,
+        masterKey,
+        now: futureGenerated,
+      }) as SignedSHR;
+
+      const result = verifySHR(shr, now);
+
+      expect(result.valid).toBe(false);
+      expect(
+        result.errors.some((e) => e.includes("clock-skew tolerance"))
+      ).toBe(true);
+    });
+
+    it("a normal fresh 60-minute SHR still verifies valid", () => {
+      const shr = generateSHR(undefined, {
+        config,
+        identityManager: identityManager as any,
+        masterKey,
+        validityMs: 60 * 60 * 1000,
+      }) as SignedSHR;
+
+      const result = verifySHR(shr);
+      expect(result.valid).toBe(true);
+      expect(result.errors).toEqual([]);
     });
   });
 });

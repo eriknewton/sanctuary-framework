@@ -93,6 +93,22 @@ describe("SDW M-1 provenance-derived taint", () => {
     "forbidden_taint");
   });
 
+  it("permits prose that names protected concepts without containing their material", () => {
+    const record = workingStateRecord(
+      "m1-security-prose",
+      "The principal policy and recovery key remain protected. Never paste an Ed25519 private key here. The SANCTUARY_RECOVERY_KEY variable is operator-only.",
+    );
+
+    expect(() =>
+      mintPersistable(
+        { value: record, taint: "user_content" },
+        SDW_WORKING_STATE_NAMESPACE,
+        stateKey("task", "m1-security-prose"),
+        FORTRESS_ID,
+      ),
+    ).not.toThrow();
+  });
+
   it("mints and writes clean provenance", async () => {
     const storage = new MemoryStorage();
     const record = workingStateRecord("m1-clean", "benign operator note");

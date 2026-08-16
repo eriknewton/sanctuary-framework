@@ -1,3 +1,4 @@
+// fail-before-exempt: storagePath was threaded into existing v1.1 routing harness wiring; stop-button enforcement is covered by agent-stop, egress, and castle-wall-agent-controller tests.
 /**
  * v1.1.1 hotfix — DashboardApprovalChannel v1.1 routing wiring
  *
@@ -116,6 +117,7 @@ async function startRig(options: { host?: string; allowPlaintextRemote?: boolean
       identityId: IDENTITY_ID,
       fortressId: fortressIdFromStoragePath(FORTRESS_STORAGE_PATH),
       auditLog,
+      storagePath: FORTRESS_STORAGE_PATH,
     }),
   );
 

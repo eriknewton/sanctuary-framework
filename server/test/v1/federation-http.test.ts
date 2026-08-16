@@ -13,8 +13,18 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { randomBytes } from "node:crypto";
 
-import { signOperatorPayload } from "../../src/v1/operator-signed.js";
+import {
+  addOperatorAuthorizationFields,
+  signOperatorPayload,
+} from "../../src/v1/operator-signed.js";
+import { MemoryStorage } from "../../src/storage/memory.js";
+import {
+  OPERATOR_AUTHORIZATION_SPENT_STORE_KEY,
+  OPERATOR_AUTHORIZATION_SPENT_STORE_NAMESPACE,
+  OperatorAuthorizationSpentStore,
+} from "../../src/v1/operator-authorization-spent-store.js";
 import { verifyCertChain } from "../../src/mesh/trust-root.js";
 import type { BootstrapToken, NodeIdentityCertificate, PrincipalCertificate } from "../../src/mesh/types.js";
 import { toBase64url } from "../../src/core/encoding.js";
@@ -33,6 +43,25 @@ import {
   GUARDIAN_SIGN_OFF_ACTION,
 } from "../../src/v1/federation-revocation-guardian-gate.js";
 
+class ArmedFailingOperatorSpentStorage extends MemoryStorage {
+  armed = false;
+
+  override async write(
+    namespace: string,
+    key: string,
+    data: Uint8Array,
+  ): Promise<void> {
+    if (
+      this.armed &&
+      namespace === OPERATOR_AUTHORIZATION_SPENT_STORE_NAMESPACE &&
+      key === OPERATOR_AUTHORIZATION_SPENT_STORE_KEY
+    ) {
+      throw new Error("operator spent-set write failed");
+    }
+    await super.write(namespace, key, data);
+  }
+}
+
 let rig: TestRig;
 let materials: FedMaterials;
 
@@ -46,9 +75,12 @@ afterEach(async () => {
 });
 
 function operatorSigned(action: string, payload: Record<string, unknown>) {
+  const signedPayload = addOperatorAuthorizationFields(payload);
   return {
-    ...payload,
-    operator_signature: toBase64url(signOperatorPayload(action, payload, OPERATOR.privateKey)),
+    ...signedPayload,
+    operator_signature: toBase64url(
+      signOperatorPayload(action, signedPayload, OPERATOR.privateKey),
+    ),
   };
 }
 
@@ -134,6 +166,39 @@ describe("/v1/federation enable/disable — OPERATOR_SIGNED", { retry: 2 }, () =
     expect(await auditOps()).toContainEqual({ operation: "v1_federation_enable", result: "success" });
   });
 
+  it("refuses authorize/init when the spent-authorization set cannot persist", async () => {
+    const storage = new ArmedFailingOperatorSpentStorage();
+    await rig.dashboard.setOperatorAuthorizationSpentStore(
+      OperatorAuthorizationSpentStore.durableFromBoot(storage, randomBytes(32)),
+    );
+    const token = await openDurableSession(rig);
+    const enableRes = await fetch(`${rig.baseUrl}/v1/federation/enable`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify(
+        operatorSigned("/v1/federation/enable", { idempotency_key: "enable-before-arm" }),
+      ),
+    });
+    expect(enableRes.status).toBe(200);
+    storage.armed = true;
+    const res = await fetch(`${rig.baseUrl}/v1/federation/authorize/init`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify(
+        operatorSigned("/v1/federation/authorize/init", {
+          intended_node_id: "edge-node-unwritable-spent-set",
+          intended_node_mode: "local",
+        }),
+      ),
+    });
+    expect(res.status).toBe(503);
+    expect(await res.json()).toEqual({ error: "unavailable" });
+    expect(await auditOps()).toContainEqual({
+      operation: "v1_federation_authorize_init",
+      result: "failure",
+    });
+  });
+
   it("disable is honored and audited", async () => {
     const token = await openDurableSession(rig);
     const res = await fetch(`${rig.baseUrl}/v1/federation/disable`, {
@@ -205,6 +270,54 @@ describe("/v1/federation join ceremony end-to-end over HTTP", { retry: 2 }, () =
     const ops = await auditOps();
     expect(ops).toContainEqual({ operation: "v1_federation_authorize_init", result: "success" });
     expect(ops).toContainEqual({ operation: "v1_federation_authorize_complete", result: "success" });
+  });
+
+  it("refuses a replayed operator-signed authorize/init and mints no second token", async () => {
+    const token = await openDurableSession(rig);
+    await enableFederation(token);
+    const initBody = operatorSigned("/v1/federation/authorize/init", {
+      intended_node_id: "edge-node-replay",
+      intended_node_mode: "local",
+    });
+
+    const first = await fetch(`${rig.baseUrl}/v1/federation/authorize/init`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify(initBody),
+    });
+    expect(first.status).toBe(200);
+    const firstBody = (await first.json()) as { bootstrap_token?: BootstrapToken };
+    expect(firstBody.bootstrap_token?.intended_node_id).toBe("edge-node-replay");
+
+    const replay = await fetch(`${rig.baseUrl}/v1/federation/authorize/init`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify(initBody),
+    });
+    expect(replay.status).toBe(403);
+    expect(await replay.json()).toEqual({ error: "forbidden" });
+  });
+
+  it("refuses legacy operator-signed payloads without signed freshness fields", async () => {
+    const token = await openDurableSession(rig);
+    await enableFederation(token);
+    const action = "/v1/federation/authorize/init";
+    const legacyPayload = {
+      intended_node_id: "edge-node-legacy",
+      intended_node_mode: "local",
+    };
+    const res = await fetch(`${rig.baseUrl}${action}`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        ...legacyPayload,
+        operator_signature: toBase64url(
+          signOperatorPayload(action, legacyPayload, OPERATOR.privateKey),
+        ),
+      }),
+    });
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({ error: "forbidden" });
   });
 
   it("surfaces operator-cloud node mode and trust-boundary disclosure additively", async () => {

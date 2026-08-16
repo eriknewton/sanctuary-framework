@@ -200,7 +200,7 @@ A February 2026 arxiv survey of agent interoperability protocols mapped MCP, A2A
 
 Proprietary procurement agents (Keelvar, Zycus, GEP) are building closed negotiation systems for specific verticals. When those systems need to interoperate (when Walmart's procurement agent needs to negotiate with a supplier's sales agent running a different framework) they'll need an open protocol.
 
-The question isn't whether a negotiation layer will emerge. The question is whether it will be open, composable, and designed for sovereignty, or proprietary, siloed, and designed for platform lock-in.
+A negotiation layer will emerge. The open decision is whether it will be open, composable, and designed for sovereignty, or proprietary, siloed, and designed for platform lock-in.
 
 Concordia is the open answer. It composes with A2A today, requires no changes to the existing stack, and is available now as a pip install.
 
@@ -210,4 +210,4 @@ Concordia is the open answer. It composes with A2A today, requires no changes to
 - Concordia Protocol: `pip install concordia-protocol` (v0.1.0, 587 tests, 48 MCP tools)
 - GitHub: [github.com/eriknewton/concordia-protocol](https://github.com/eriknewton/concordia-protocol)
 - Full spec: [SPEC.md](https://github.com/eriknewton/concordia-protocol/blob/main/SPEC.md)
-- Sanctuary Framework (optional trust layer): `npx @sanctuary-framework/mcp-server` (v0.3.1, 46 MCP tools)
+- Sanctuary Framework (optional trust layer): `npx @sanctuary-framework/mcp-server` (current releases expose 80+ MCP tools)

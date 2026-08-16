@@ -47,6 +47,10 @@ import type {
 } from "./adapters/memory-backend.js";
 import { SdwValidationError } from "./errors.js";
 import { isSdwIdentifier } from "./grammar.js";
+import {
+  createMultiAgentIsolationGuard,
+  type MultiAgentIsolationGuard,
+} from "./memory-isolation.js";
 
 const MAX_TEXT_BYTES = 1024 * 1024;
 const PERSISTABLE_TAINTS: readonly PersistableTaint[] = [
@@ -73,8 +77,18 @@ export interface SdwMemoryToolsOptions {
    *
    * Fail-closed posture: this only ever ADDS a refusal. It never widens,
    * relaxes, or changes existing single-agent behavior.
+   *
+   * Ignored when `isolationGuard` is supplied.
    */
   readonly ownerIdentity?: () => string | undefined;
+  /**
+   * A guard shared with the OTHER tool families over the same owner scope
+   * (index.ts builds one and hands it to every family). Prefer this over
+   * `ownerIdentity` whenever more than one family reaches the same adapter:
+   * separate guards each pin their own first caller, so a second agent refused
+   * here would still be the first caller of the other family.
+   */
+  readonly isolationGuard?: MultiAgentIsolationGuard;
 }
 
 /** Full body view, reserved for explicit single-passage retrieval. */
@@ -174,53 +188,18 @@ export const SDW_MEMORY_MULTI_AGENT_DENIAL_CLASS =
   "sdw_memory_multi_agent_isolation_required" as const;
 
 /**
- * Build the fail-closed multi-agent isolation guard.
+ * Build the fail-closed multi-agent isolation guard for this tool family.
  *
  * The single `adapter` is bound to ONE shared `fleet-self` owner scope reused
  * for every caller (index.ts), so SDW memory has no per-agent custody
- * isolation yet. This guard pins the FIRST observed wrapped-agent identity that
- * the shared scope serves and REFUSES any later call from a DIFFERENT identity,
- * so a second agent can never read or write the first agent's passages over the
- * shared scope.
- *
- * Strictly additive + fail-closed:
- * - No `ownerIdentity` resolver -> no second identity can ever be observed ->
- *   the guard is a strict NO-OP (existing single-agent behavior unchanged).
- * - A single coordinator resolves a stable value (or a stable `undefined`);
- *   the bound identity is pinned once and every call matches it -> NO-OP.
- * - Any call whose resolved identity differs from the pinned one is REFUSED.
- *   The pin is NOT advanced to the new identity, so the guard cannot be walked
- *   forward by alternating callers; the shared scope stays bound to whoever
- *   touched it first.
- *
- * `undefined` is treated as a concrete identity value (the "no wrapped-agent
- * id configured" caller). Mixing a concrete id with `undefined` is therefore
- * two distinct identities and is refused - a configured agent must not share
- * the unconfigured coordinator's scope.
+ * isolation yet. Callers that also expose the same scope through another tool
+ * family MUST pass a shared `isolationGuard` instead of a second resolver, or
+ * each family pins its own first caller and the refusal is only per-family.
  */
-function createMultiAgentIsolationGuard(
-  ownerIdentity: (() => string | undefined) | undefined,
-): (operation: string) => { allowed: true } | { allowed: false } {
-  // Sentinel so we can distinguish "never observed an identity" from "observed
-  // `undefined`" without conflating the two.
-  let bound: { value: string | undefined } | null = null;
-  return (_operation: string) => {
-    if (ownerIdentity === undefined) {
-      // No resolver wired: a second identity can never be observed. NO-OP.
-      return { allowed: true };
-    }
-    const observed = ownerIdentity();
-    if (bound === null) {
-      bound = { value: observed };
-      return { allowed: true };
-    }
-    return bound.value === observed ? { allowed: true } : { allowed: false };
-  };
-}
-
 export function createSdwMemoryTools(options: SdwMemoryToolsOptions): ToolDefinition[] {
   const { adapter, auditLog } = options;
-  const isolationGuard = createMultiAgentIsolationGuard(options.ownerIdentity);
+  const isolationGuard =
+    options.isolationGuard ?? createMultiAgentIsolationGuard(options.ownerIdentity);
 
   const auditFailure = (operation: string, details: Record<string, unknown>): Promise<void> =>
     auditLog.appendCritical({

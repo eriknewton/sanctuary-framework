@@ -22,6 +22,12 @@ import type { Writable } from "node:stream";
 import { ed25519 } from "@noble/curves/ed25519";
 import { loadConfig } from "../config.js";
 import {
+  consumeFlagValue,
+  flagValue,
+  flagValues,
+  unknownFlagWithPrefix,
+} from "./argv.js";
+import {
   toBase64url,
   fromBase64url,
   fromBase64urlStrict,
@@ -106,6 +112,7 @@ import {
   FEDERATION_POLICY_BUNDLE_HASH_ALGORITHM,
   signFederationPolicyBundlePayload,
 } from "../v1/federation-policy-bundle.js";
+import { addOperatorAuthorizationFields } from "../v1/operator-signed.js";
 import {
   dashboardRequest,
   DashboardRequestError,
@@ -118,6 +125,7 @@ import {
   type OperatorSigner,
 } from "./federation-operator-signing.js";
 import { openV1Session } from "./v1-session.js";
+import { ED25519_PUBLIC_KEY_BYTES } from "../core/crypto-suite-registry.js";
 
 export interface AssembledJoin {
   joinRequest: JoinRequest;
@@ -215,6 +223,7 @@ export function assembleOperatorCloudJoinRequest(params: {
 }
 
 interface JoinFlags {
+  parseError?: string;
   fortressUrl?: string;
   bootstrapTokenJson?: string;
   masterSecretB64?: string;
@@ -241,23 +250,40 @@ interface JoinFlags {
   fortressPath?: string;
 }
 
+function parsedFederationFortressPath(argv: string[]): {
+  parseError?: string;
+  fortressPath?: string;
+} {
+  const unknown = unknownFlagWithPrefix(argv, "--fortress", ["--fortress-url"]);
+  if (unknown) return { parseError: `unknown fortress flag ${unknown}` };
+  const parsed = consumeFlagValue(argv, "--fortress");
+  if (parsed.error) return { parseError: parsed.error };
+  return parsed.value === undefined ? {} : { fortressPath: parsed.value };
+}
+
+function writeFederationFlagParseError(
+  verb: string,
+  flags: { parseError?: string },
+  err: Writable,
+): boolean {
+  if (!flags.parseError) return false;
+  err.write(`sanctuary federation ${verb}: ${flags.parseError}\n`);
+  return true;
+}
+
 function parseJoinFlags(argv: string[], env: NodeJS.ProcessEnv): JoinFlags {
-  const flag = (name: string): string | undefined => {
-    const i = argv.indexOf(name);
-    return i >= 0 && i + 1 < argv.length ? argv[i + 1] : undefined;
-  };
   return {
-    fortressUrl: flag("--fortress-url") ?? env.SANCTUARY_FORTRESS_URL,
-    bootstrapTokenJson: flag("--bootstrap-token"),
-    masterSecretB64: flag("--master-secret") ?? env.SANCTUARY_FORTRESS_MASTER_SECRET,
-    provisionBundleJson: flag("--provision-bundle"),
-    deliveryKeyB64: flag("--delivery-key") ?? env.SANCTUARY_OC_DELIVERY_KEY,
-    deliveryTarget: flag("--delivery-target"),
+    fortressUrl: flagValue(argv, "--fortress-url") ?? env.SANCTUARY_FORTRESS_URL,
+    bootstrapTokenJson: flagValue(argv, "--bootstrap-token"),
+    masterSecretB64: flagValue(argv, "--master-secret") ?? env.SANCTUARY_FORTRESS_MASTER_SECRET,
+    provisionBundleJson: flagValue(argv, "--provision-bundle"),
+    deliveryKeyB64: flagValue(argv, "--delivery-key") ?? env.SANCTUARY_OC_DELIVERY_KEY,
+    deliveryTarget: flagValue(argv, "--delivery-target"),
     persist: argv.includes("--persist"),
-    pinnedMasterArg: flag("--pinned-master"),
-    passphrase: flag("--passphrase") ?? env.SANCTUARY_PASSPHRASE,
+    pinnedMasterArg: flagValue(argv, "--pinned-master"),
+    passphrase: flagValue(argv, "--passphrase") ?? env.SANCTUARY_PASSPHRASE,
     recoveryKey: env.SANCTUARY_RECOVERY_KEY,
-    fortressPath: flag("--fortress"),
+    ...parsedFederationFortressPath(argv),
   };
 }
 
@@ -286,6 +312,7 @@ export async function runFederationJoin(args: {
   const request = args.request ?? dashboardRequest;
   const persistJoiner = args.persistJoinerTrustRoot ?? persistJoinerTrustRootFromJoin;
   const flags = parseJoinFlags(args.argv, env);
+  if (writeFederationFlagParseError("join", flags, err)) return 1;
 
   if (!flags.fortressUrl) {
     err.write("sanctuary federation join: --fortress-url (or SANCTUARY_FORTRESS_URL) is required\n");
@@ -385,6 +412,10 @@ export async function runFederationJoin(args: {
       err.write("sanctuary federation join: --delivery-key is not valid base64url\n");
       return 1;
     }
+    // 32 = the 256-bit symmetric delivery key. The bundle builder
+    // (`buildOperatorCloudProvisionBundle` in mesh/operator-cloud-provision.ts)
+    // checks the same width and uses it as the AES-256 key for the scoped
+    // secret, so a mismatch here would surface only as a decrypt failure.
     if (deliveryKey.length !== 32) {
       err.write("sanctuary federation join: delivery key must be 32 bytes\n");
       return 1;
@@ -441,6 +472,9 @@ export async function runFederationJoin(args: {
       err.write("sanctuary federation join: --master-secret is not valid base64url\n");
       return 1;
     }
+    // 32 = the 256-bit symmetric federation master secret; the store's own
+    // `assertKeyLength` (mesh/federation-trust-root-store.ts) applies the same
+    // width. Not an Ed25519 key despite the shared byte count.
     if (masterSecret.length !== 32) {
       err.write("sanctuary federation join: master secret must be 32 bytes\n");
       return 1;
@@ -617,6 +651,7 @@ const FEDERATION_REISSUE_NODE_CERT_PATH =
   "/v1/federation/rotate/reissue-node-cert";
 
 interface AdoptFlags {
+  parseError?: string;
   renew: boolean;
   fortressUrl?: string;
   rotationCertArg?: string;
@@ -627,18 +662,14 @@ interface AdoptFlags {
 }
 
 function parseAdoptFlags(argv: string[], env: NodeJS.ProcessEnv): AdoptFlags {
-  const flag = (name: string): string | undefined => {
-    const i = argv.indexOf(name);
-    return i >= 0 && i + 1 < argv.length ? argv[i + 1] : undefined;
-  };
   return {
     renew: argv.includes("--renew"),
-    fortressUrl: flag("--fortress-url") ?? env.SANCTUARY_FORTRESS_URL,
-    rotationCertArg: flag("--rotation-cert"),
-    pinnedMasterArg: flag("--pinned-master"),
-    passphrase: flag("--passphrase") ?? env.SANCTUARY_PASSPHRASE,
+    fortressUrl: flagValue(argv, "--fortress-url") ?? env.SANCTUARY_FORTRESS_URL,
+    rotationCertArg: flagValue(argv, "--rotation-cert"),
+    pinnedMasterArg: flagValue(argv, "--pinned-master"),
+    passphrase: flagValue(argv, "--passphrase") ?? env.SANCTUARY_PASSPHRASE,
     recoveryKey: env.SANCTUARY_RECOVERY_KEY,
-    fortressPath: flag("--fortress"),
+    ...parsedFederationFortressPath(argv),
   };
 }
 
@@ -670,6 +701,7 @@ export async function runFederationAdopt(args: {
   const request = args.request ?? dashboardRequest;
   const perform = args.performPlannedAdopt ?? performPlannedAdoptFromCli;
   const flags = parseAdoptFlags(args.argv, env);
+  if (writeFederationFlagParseError("adopt", flags, err)) return 1;
 
   if (!flags.renew) {
     err.write(
@@ -1101,6 +1133,7 @@ const REJOIN_FORBIDDEN_FLAGS: readonly string[] = [
 ];
 
 interface RejoinFlags {
+  parseError?: string;
   fortressUrl?: string;
   bootstrapTokenJson?: string;
   masterSecretB64?: string;
@@ -1115,20 +1148,16 @@ interface RejoinFlags {
 }
 
 function parseRejoinFlags(argv: string[], env: NodeJS.ProcessEnv): RejoinFlags {
-  const flag = (name: string): string | undefined => {
-    const i = argv.indexOf(name);
-    return i >= 0 && i + 1 < argv.length ? argv[i + 1] : undefined;
-  };
   return {
-    fortressUrl: flag("--fortress-url") ?? env.SANCTUARY_FORTRESS_URL,
-    bootstrapTokenJson: flag("--bootstrap-token"),
-    masterSecretB64: flag("--master-secret") ?? env.SANCTUARY_FORTRESS_MASTER_SECRET,
-    pinnedMasterArg: flag("--pinned-master"),
-    revokedOldMaster: flag("--revoked-old-master"),
-    revocationSerialRaw: flag("--revocation-serial"),
-    passphrase: flag("--passphrase") ?? env.SANCTUARY_PASSPHRASE,
+    fortressUrl: flagValue(argv, "--fortress-url") ?? env.SANCTUARY_FORTRESS_URL,
+    bootstrapTokenJson: flagValue(argv, "--bootstrap-token"),
+    masterSecretB64: flagValue(argv, "--master-secret") ?? env.SANCTUARY_FORTRESS_MASTER_SECRET,
+    pinnedMasterArg: flagValue(argv, "--pinned-master"),
+    revokedOldMaster: flagValue(argv, "--revoked-old-master"),
+    revocationSerialRaw: flagValue(argv, "--revocation-serial"),
+    passphrase: flagValue(argv, "--passphrase") ?? env.SANCTUARY_PASSPHRASE,
     recoveryKey: env.SANCTUARY_RECOVERY_KEY,
-    fortressPath: flag("--fortress"),
+    ...parsedFederationFortressPath(argv),
     forbiddenPresent: REJOIN_FORBIDDEN_FLAGS.filter((name) => argv.includes(name)),
   };
 }
@@ -1163,6 +1192,7 @@ export async function runFederationRejoin(args: {
   const persistRejoin =
     args.persistRejoinedJoinerTrustRoot ?? persistRejoinedJoinerTrustRootFromJoin;
   const flags = parseRejoinFlags(args.argv, env);
+  if (writeFederationFlagParseError("rejoin", flags, err)) return 1;
 
   if (flags.forbiddenPresent.length > 0) {
     err.write(
@@ -1376,7 +1406,7 @@ function parsePositiveInt(raw: string | undefined): number | null {
 function isBase64urlEd25519Pubkey(raw: string): boolean {
   try {
     const decoded = fromBase64urlStrict(raw);
-    const ok = decoded.length === 32;
+    const ok = decoded.length === ED25519_PUBLIC_KEY_BYTES;
     decoded.fill(0);
     return ok;
   } catch {
@@ -1385,6 +1415,7 @@ function isBase64urlEd25519Pubkey(raw: string): boolean {
 }
 
 interface AdminFlags {
+  parseError?: string;
   fortressUrl?: string;
   authToken?: string;
   /**
@@ -1405,17 +1436,13 @@ interface AdminFlags {
 }
 
 function parseAdminFlags(argv: string[], env: NodeJS.ProcessEnv): AdminFlags {
-  const flag = (name: string): string | undefined => {
-    const i = argv.indexOf(name);
-    return i >= 0 && i + 1 < argv.length ? argv[i + 1] : undefined;
-  };
-  const rawMode = flag("--node-mode") ?? "local";
+  const rawMode = flagValue(argv, "--node-mode") ?? "local";
   const nodeModeValid = (["local", "operator_cloud", "sovereign_tee"] as const).includes(
     rawMode as NodeMode,
   );
-  const explicitAuthToken = flag("--auth-token");
+  const explicitAuthToken = flagValue(argv, "--auth-token");
   return {
-    fortressUrl: flag("--fortress-url") ?? env.SANCTUARY_FORTRESS_URL,
+    fortressUrl: flagValue(argv, "--fortress-url") ?? env.SANCTUARY_FORTRESS_URL,
     // F-FED-AUTHENVTRAP (drilled 2026-07-30 AND 2026-07-31): this used to fall
     // back to `env.SANCTUARY_DASHBOARD_AUTH_TOKEN`. That env var holds the
     // LEGACY `/api/*` operator token, and every federation admin verb targets
@@ -1433,15 +1460,15 @@ function parseAdminFlags(argv: string[], env: NodeJS.ProcessEnv): AdminFlags {
       explicitAuthToken === undefined &&
       typeof env.SANCTUARY_DASHBOARD_AUTH_TOKEN === "string" &&
       env.SANCTUARY_DASHBOARD_AUTH_TOKEN.length > 0,
-    idempotencyKey: flag("--idempotency-key"),
-    nodeId: flag("--node-id"),
+    idempotencyKey: flagValue(argv, "--idempotency-key"),
+    nodeId: flagValue(argv, "--node-id"),
     nodeMode: rawMode as NodeMode,
     nodeModeValid,
-    reason: flag("--reason"),
-    passphrase: flag("--passphrase") ?? env.SANCTUARY_PASSPHRASE,
+    reason: flagValue(argv, "--reason"),
+    passphrase: flagValue(argv, "--passphrase") ?? env.SANCTUARY_PASSPHRASE,
     recoveryKey: env.SANCTUARY_RECOVERY_KEY,
-    fortressPath: flag("--fortress"),
-    policyPath: flag("--policy-path"),
+    ...parsedFederationFortressPath(argv),
+    policyPath: flagValue(argv, "--policy-path"),
   };
 }
 
@@ -1688,6 +1715,7 @@ export async function runFederationEnableDisable(args: {
   const verb = args.enable ? "enable" : "disable";
   const action = args.enable ? "/v1/federation/enable" : "/v1/federation/disable";
   const flags = parseAdminFlags(args.argv, env);
+  if (writeFederationFlagParseError(verb, flags, err)) return 1;
 
   if (!flags.fortressUrl) {
     err.write(
@@ -1707,8 +1735,9 @@ export async function runFederationEnableDisable(args: {
     if (flags.idempotencyKey !== undefined) {
       signedPayload.idempotency_key = flags.idempotencyKey;
     }
-    const operatorSignature = signer.signPayload(action, signedPayload);
-    const body = { ...signedPayload, operator_signature: operatorSignature };
+    const authorizedPayload = addOperatorAuthorizationFields(signedPayload);
+    const operatorSignature = signer.signPayload(action, authorizedPayload);
+    const body = { ...authorizedPayload, operator_signature: operatorSignature };
 
     const response = (await request(
       action,
@@ -1754,6 +1783,7 @@ export async function runFederationAuthorize(args: {
   // Accept both `authorize` and `authorize init`; strip a leading `init`.
   const argv = args.argv[0] === "init" ? args.argv.slice(1) : args.argv;
   const flags = parseAdminFlags(argv, env);
+  if (writeFederationFlagParseError("authorize", flags, err)) return 1;
 
   if (!flags.fortressUrl) {
     err.write(
@@ -1781,8 +1811,9 @@ export async function runFederationAuthorize(args: {
       intended_node_id: flags.nodeId,
       intended_node_mode: flags.nodeMode,
     };
-    const operatorSignature = signer.signPayload(action, signedPayload);
-    const body = { ...signedPayload, operator_signature: operatorSignature };
+    const authorizedPayload = addOperatorAuthorizationFields(signedPayload);
+    const operatorSignature = signer.signPayload(action, authorizedPayload);
+    const body = { ...authorizedPayload, operator_signature: operatorSignature };
 
     const response = (await request(
       action,
@@ -1826,6 +1857,7 @@ export async function runFederationRevoke(args: {
   const openSession = args.openSession ?? openV1Session;
   const action = "/v1/federation/revoke";
   const flags = parseAdminFlags(args.argv, env);
+  if (writeFederationFlagParseError("revoke", flags, err)) return 1;
 
   if (!flags.fortressUrl) {
     err.write(
@@ -1850,8 +1882,9 @@ export async function runFederationRevoke(args: {
     if (flags.idempotencyKey !== undefined) {
       signedPayload.idempotency_key = flags.idempotencyKey;
     }
-    const operatorSignature = signer.signPayload(action, signedPayload);
-    const body = { ...signedPayload, operator_signature: operatorSignature };
+    const authorizedPayload = addOperatorAuthorizationFields(signedPayload);
+    const operatorSignature = signer.signPayload(action, authorizedPayload);
+    const body = { ...authorizedPayload, operator_signature: operatorSignature };
 
     const response = (await request(
       action,
@@ -1922,6 +1955,7 @@ export async function runFederationPolicyPush(args: {
   const openSession = args.openSession ?? openV1Session;
   const action = "/v1/federation/sync";
   const flags = parseAdminFlags(args.argv, env);
+  if (writeFederationFlagParseError("policy-push", flags, err)) return 1;
 
   if (!flags.fortressUrl) {
     err.write(
@@ -1976,12 +2010,12 @@ export async function runFederationPolicyPush(args: {
     const originNodeId = federationOperatorAuthorityOrigin(
       record.pinned_master_pubkey.fortress_id,
     );
-    const baseSyncPayload = {
+    const baseSyncPayload = addOperatorAuthorizationFields({
       wire_version: FEDERATION_SYNC_WIRE_VERSION,
       node_id: record.node_id,
       events: [] as FederationEvent[],
       cursor: { node_id: originNodeId },
-    };
+    });
     const fetchResponse = (await request(
       action,
       {
@@ -2024,14 +2058,15 @@ export async function runFederationPolicyPush(args: {
       ...eventWithoutHash,
       event_hash: federationEventHash(eventWithoutHash),
     };
-    const pushPayload: Record<string, unknown> = {
+    const pushPayloadBase: Record<string, unknown> = {
       wire_version: FEDERATION_SYNC_WIRE_VERSION,
       node_id: record.node_id,
       events: [event],
     };
     if (flags.idempotencyKey !== undefined) {
-      pushPayload.idempotency_key = flags.idempotencyKey;
+      pushPayloadBase.idempotency_key = flags.idempotencyKey;
     }
+    const pushPayload = addOperatorAuthorizationFields(pushPayloadBase);
     const pushResponse = (await request(
       action,
       {
@@ -2110,19 +2145,11 @@ export async function runFederationRevokePush(args: {
   const out = args.out ?? process.stdout;
   const err = args.err ?? process.stderr;
   const flags = parseAdminFlags(args.argv, env);
+  if (writeFederationFlagParseError("revoke-push", flags, err)) return 1;
 
   // Collect ALL --license-id occurrences (the absolute revoked set).
-  const licenseIds: string[] = [];
-  for (let i = 0; i < args.argv.length; i += 1) {
-    if (args.argv[i] === "--license-id" && i + 1 < args.argv.length) {
-      const id = args.argv[i + 1];
-      if (typeof id === "string" && id.length > 0) licenseIds.push(id);
-    }
-  }
-  const versionRaw = ((): string | undefined => {
-    const i = args.argv.indexOf("--version");
-    return i >= 0 && i + 1 < args.argv.length ? args.argv[i + 1] : undefined;
-  })();
+  const licenseIds = flagValues(args.argv, "--license-id").filter((id) => id.length > 0);
+  const versionRaw = flagValue(args.argv, "--version");
   if (versionRaw === undefined) {
     err.write(
       "sanctuary federation revoke-push: --version <n> is required (the monotonic " +
@@ -2251,6 +2278,7 @@ export async function runFederationDowngradeLog(args: {
   const out = args.out ?? process.stdout;
   const err = args.err ?? process.stderr;
   const flags = parseAdminFlags(args.argv, env);
+  if (writeFederationFlagParseError("downgrade-log", flags, err)) return 1;
 
   const openSigner = args.openSigner ?? openOperatorSigner;
   let signer: OperatorSigner;
@@ -2290,6 +2318,7 @@ export async function runFederationDowngradeLog(args: {
 }
 
 interface ProvisionFlags {
+  parseError?: string;
   nodeId?: string;
   passphrase?: string;
   recoveryKey?: string;
@@ -2313,17 +2342,13 @@ function parseProvisionFlags(
   argv: string[],
   env: NodeJS.ProcessEnv,
 ): ProvisionFlags {
-  const flag = (name: string): string | undefined => {
-    const i = argv.indexOf(name);
-    return i >= 0 && i + 1 < argv.length ? argv[i + 1] : undefined;
-  };
   // PQC default-on: hybrid (Ed25519+ML-DSA-65) is the DEFAULT for a fresh
   // federation trust root. Two equivalent OPT-OUTS select the legacy classical
   // root: the boolean --classical, or the explicit --crypto-suite ed25519-v1.
   // Two equivalent (now no-op-but-accepted) OPT-INS name the default explicitly:
   // the boolean --pqc-hybrid, or --crypto-suite ed25519+ml-dsa-v1. Absence of any
   // flag = the hybrid default.
-  const cryptoSuite = flag("--crypto-suite");
+  const cryptoSuite = flagValue(argv, "--crypto-suite");
   const suiteSelectsHybrid = cryptoSuite === FEDERATION_ISSUANCE_SUITE_HYBRID;
   const suiteSelectsClassical = cryptoSuite === FEDERATION_ISSUANCE_SUITE_CLASSICAL;
   const cryptoSuiteInvalid =
@@ -2336,10 +2361,10 @@ function parseProvisionFlags(
   // not a silent default: refuse rather than guess which the operator meant.
   const cryptoSuiteConflict = optOutClassical && optInHybrid;
   return {
-    nodeId: flag("--node-id"),
-    passphrase: flag("--passphrase") ?? env.SANCTUARY_PASSPHRASE,
+    nodeId: flagValue(argv, "--node-id"),
+    passphrase: flagValue(argv, "--passphrase") ?? env.SANCTUARY_PASSPHRASE,
     recoveryKey: env.SANCTUARY_RECOVERY_KEY,
-    fortressPath: flag("--fortress"),
+    ...parsedFederationFortressPath(argv),
     // Default ON: hybrid unless the operator explicitly opts out with --classical
     // (or --crypto-suite ed25519-v1).
     pqcHybrid: !optOutClassical,
@@ -2400,6 +2425,7 @@ export async function runFederationProvision(args: {
   const err = args.err ?? process.stderr;
   const openSigner = args.openSigner ?? openOperatorSigner;
   const flags = parseProvisionFlags(args.argv, env);
+  if (writeFederationFlagParseError("provision", flags, err)) return 1;
 
   if (!flags.nodeId) {
     err.write("sanctuary federation provision: --node-id <id> is required\n");
@@ -2639,6 +2665,7 @@ export async function runFederationProvision(args: {
 }
 
 interface RotateRootFlags {
+  parseError?: string;
   renew: boolean;
   compromise: boolean;
   resume: boolean;
@@ -2651,17 +2678,13 @@ function parseRotateRootFlags(
   argv: string[],
   env: NodeJS.ProcessEnv,
 ): RotateRootFlags {
-  const flag = (name: string): string | undefined => {
-    const i = argv.indexOf(name);
-    return i >= 0 && i + 1 < argv.length ? argv[i + 1] : undefined;
-  };
   return {
     renew: argv.includes("--renew"),
     compromise: argv.includes("--compromise") || argv.includes("--compromised"),
     resume: argv.includes("--resume"),
-    passphrase: flag("--passphrase") ?? env.SANCTUARY_PASSPHRASE,
+    passphrase: flagValue(argv, "--passphrase") ?? env.SANCTUARY_PASSPHRASE,
     recoveryKey: env.SANCTUARY_RECOVERY_KEY,
-    fortressPath: flag("--fortress"),
+    ...parsedFederationFortressPath(argv),
   };
 }
 
@@ -2726,6 +2749,7 @@ export async function runFederationRotateRoot(args: {
   const err = args.err ?? process.stderr;
   const openSigner = args.openSigner ?? openOperatorSigner;
   const flags = parseRotateRootFlags(args.argv, env);
+  if (writeFederationFlagParseError("rotate-root", flags, err)) return 1;
 
   // --renew and --compromised are mutually exclusive intents.
   if (flags.compromise && flags.renew) {
@@ -2908,6 +2932,7 @@ export async function runFederationRotateRoot(args: {
 }
 
 interface RevealMasterSecretFlags {
+  parseError?: string;
   /** Explicit, mandatory disclosure confirmation (matches the repo --yes idiom). */
   confirmed: boolean;
   passphrase?: string;
@@ -2919,10 +2944,6 @@ function parseRevealMasterSecretFlags(
   argv: string[],
   env: NodeJS.ProcessEnv,
 ): RevealMasterSecretFlags {
-  const flag = (name: string): string | undefined => {
-    const i = argv.indexOf(name);
-    return i >= 0 && i + 1 < argv.length ? argv[i + 1] : undefined;
-  };
   return {
     // --yes is the repo's confirm idiom (transparency enable, castle-wall boot
     // remove). The long-form alias spells out the consequence so a reviewer
@@ -2931,9 +2952,9 @@ function parseRevealMasterSecretFlags(
       argv.includes("--yes") ||
       argv.includes("-y") ||
       argv.includes("--i-understand-this-reveals-the-master-secret"),
-    passphrase: flag("--passphrase") ?? env.SANCTUARY_PASSPHRASE,
+    passphrase: flagValue(argv, "--passphrase") ?? env.SANCTUARY_PASSPHRASE,
     recoveryKey: env.SANCTUARY_RECOVERY_KEY,
-    fortressPath: flag("--fortress"),
+    ...parsedFederationFortressPath(argv),
   };
 }
 
@@ -3009,6 +3030,7 @@ export async function runFederationRevealMasterSecret(args: {
   const makeAuditLog =
     args.makeAuditLog ?? ((storage, masterKey) => new AuditLog(storage, masterKey));
   const flags = parseRevealMasterSecretFlags(args.argv, env);
+  if (writeFederationFlagParseError("reveal-master-secret", flags, err)) return 1;
 
   // Confirm gate FIRST: refuse a sensitive disclosure that was not explicitly
   // requested BEFORE we even unlock custody. Nothing is read or revealed.

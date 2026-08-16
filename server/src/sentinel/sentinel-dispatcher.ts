@@ -258,20 +258,99 @@ export class SentinelDispatcher {
       observed_at: raw.observed_at || this.now().toISOString(),
     };
     await this.findingStore.saveFinding(stamped);
-    void this.auditLog.append(
-      "l2",
-      SENTINEL_AUDIT_OPS.FINDING_EMITTED,
-      this.identityId,
-      {
-        sentinel_id: sentinelId,
-        finding_id: stamped.finding_id,
-        severity: stamped.severity,
-        ...(stamped.agent_id !== undefined ? { agent_id: stamped.agent_id } : {}),
-        evidence_audit_ids: stamped.evidence_audit_ids,
-        fortress_id: this.fortressId,
-      },
-    );
+    // LD6 BP-DEADLINE-03 (V2-5 sentinel exception): AWAITED appendCritical
+    // immediately AFTER the locked saveFinding, NOT folded into
+    // saveFinding's own admission section -- a saturated saveFinding can
+    // already emit an evict-INTENT appendCritical (up to
+    // ON_EVICT_AUDIT_TIMEOUT_MS = 40s, its withTimeout bound) inside its
+    // lock; adding this bare 35s-worst-case audit write there would need
+    // up to 40s + 35s = 75s against the shared 50s admission-deadline
+    // budget (see sentinel-finding-store.ts's STORE_ADMISSION_DEADLINE_MS
+    // derivation; the 75s figure must match the asymmetry notes on
+    // BRIDGE_STORE_ADMISSION_DEADLINE_MS in bridge/tools.ts and
+    // REPUTATION_STORE_ADMISSION_DEADLINE_MS in reputation-store.ts).
+    //
+    // HONEST BOUND (fix-round correction -- the prior comment here claimed
+    // "finding_id already gives this store I2/I3 (overwrite-in-place on a
+    // retry)"; that was FALSE for every shipped sentinel): every sentinel in
+    // src/sentinel/sentinels/*.ts emits `finding_id: ""`, so the stamp above
+    // (`raw.finding_id || randomUUID()`) mints a FRESH random id on every
+    // single finding, every tick -- there is no caller-supplied or
+    // content-derived key for a later tick to land back on. A crash between
+    // saveFinding settling and this append settling leaves a
+    // durably-persisted-but-PERMANENTLY-unaudited orphan record: the NEXT
+    // tick's finding (even one describing the same underlying condition,
+    // e.g. egress-volume-watcher re-detecting the same server's ongoing
+    // anomaly) gets its OWN new random id and its OWN new audit attempt --
+    // it does not overwrite or reconcile the orphan the way a bridge_commit/
+    // bridge_attest/reputation_record retry does (V2-2's self-healing
+    // in-lock audits, which DO have a caller-supplied identifying tuple to
+    // derive a stable id from).
+    //
+    // This is an ACCEPTED, weaker residual, not a bug to silently paper
+    // over: sentinels are timer-driven autonomous detectors, not
+    // caller-retried operations, and most sentinels' rolling-window findings
+    // (current_count, evidence_audit_ids, observed_at) genuinely differ tick
+    // to tick even when the underlying condition persists -- there is no
+    // sentinel-agnostic "condition key" this dispatcher could derive a
+    // stable id from without sentinel-specific semantics it does not have,
+    // and collapsing distinct ticks' evidence onto one overwritten key would
+    // silently lose that evidence.
+    //
+    // HONEST BOUND, part 2 (LD6 gate fix-round F3 -- batch isolation): the
+    // append is still AWAITED (never fire-and-forget: the outcome must be
+    // KNOWN before this method reports), but its failure no longer
+    // propagates out of routeFinding. The finding was already durably
+    // persisted by saveFinding above, so suppressing the ANOMALY over an
+    // audit-backend failure inverts the priority: pre-fix, the rejection
+    // escaped into tick()'s per-sentinel catch, which (a) never emitted the
+    // finding to subscribers (the dashboard saw `evaluation_failed` carrying
+    // the audit error INSTEAD of the anomaly) and (b) aborted every
+    // remaining finding in that sentinel's batch -- none persisted, none
+    // audited, none emitted. Now the finding is emitted to subscribers
+    // regardless of audit-append outcome, and an audit failure surfaces as
+    // its OWN `evaluation_failed` diagnostic event alongside the finding
+    // (no `void append` back into the sink that just failed -- that
+    // "surfacing" would be a write into the very backend whose failure it
+    // reports). The durable-write-then-awaited-audit ORDERING is unchanged;
+    // the crash-window no-self-heal residual above is unchanged.
+    let auditAppendError: unknown = null;
+    try {
+      await this.auditLog.appendCritical({
+        layer: "l2",
+        operation: SENTINEL_AUDIT_OPS.FINDING_EMITTED,
+        identity_id: this.identityId,
+        result: "success",
+        details: {
+          sentinel_id: sentinelId,
+          finding_id: stamped.finding_id,
+          severity: stamped.severity,
+          ...(stamped.agent_id !== undefined ? { agent_id: stamped.agent_id } : {}),
+          evidence_audit_ids: stamped.evidence_audit_ids,
+          fortress_id: this.fortressId,
+        },
+      });
+    } catch (err) {
+      auditAppendError = err;
+    }
+    // The finding is durable (saveFinding settled above); subscribers get it
+    // whether or not its audit landed -- the anomaly outranks its paper trail.
     this.emit({ type: "finding", finding: stamped });
+    if (auditAppendError !== null) {
+      const errorMessage =
+        auditAppendError instanceof Error
+          ? auditAppendError.message
+          : String(auditAppendError);
+      this.emit({
+        type: "evaluation_failed",
+        sentinel_id: sentinelId,
+        error_message:
+          `finding audit append failed (finding ${stamped.finding_id} is ` +
+          `durably persisted but its FINDING_EMITTED audit entry is not): ` +
+          errorMessage,
+        observed_at: this.now().toISOString(),
+      });
+    }
     return stamped;
   }
 

@@ -240,7 +240,8 @@ export class Supervisor {
     // uninterrupted synchronous turn, before any await yields control — so a
     // concurrent protect() for the same agent_id cannot interleave until BOTH
     // are set, and (per the ordered checks above) it coalesces onto the inflight
-    // promise. The concurrent-duplicate-fails test pins the concrete invariant.
+    // promise. `server/test/supervisor/supervisor.test.ts` pins the duplicate
+    // failure case so the second caller cannot report a false success.
     const promise = (async () => this.runProtect(spec))();
     this.inflightProtect.set(spec.agent_id, promise);
     try {

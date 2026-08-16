@@ -186,6 +186,38 @@ describe("AuditLog flush() — rc.2 audit-visibility regression", () => {
     expect(entries).toHaveLength(1);
   });
 
+  it("flush() rejects un-awaited appendCritical persistence failures", async () => {
+    const storage = new FaultingWriteStorage();
+    const log = new AuditLog(storage, generateRandomKey());
+
+    // Intentionally fire-and-forget: critical writes now share append()'s
+    // flush-time failure surfacing, so a voided durable write cannot disappear.
+    void log.appendCritical({
+      layer: "l1",
+      operation: "state_write",
+      identity_id: "id",
+      result: "success",
+    });
+
+    await expect(log.flush()).rejects.toThrow(AuditLogPersistenceError);
+    await expect(log.flush()).resolves.toBeUndefined();
+  });
+
+  it("awaited appendCritical failures are not rethrown again by flush", async () => {
+    const storage = new FaultingWriteStorage();
+    const log = new AuditLog(storage, generateRandomKey());
+
+    await expect(
+      log.appendCritical({
+        layer: "l1",
+        operation: "state_write",
+        identity_id: "id",
+        result: "success",
+      })
+    ).rejects.toThrow(AuditPersistenceError);
+    await expect(log.flush()).resolves.toBeUndefined();
+  });
+
   it("appendCritical classifies storage-full failures", async () => {
     const log = new AuditLog(new ClassifiedFailureStorage("ENOSPC"), generateRandomKey());
 

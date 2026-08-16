@@ -39,7 +39,7 @@ Legend: **SHIPPED** = merged and, where relevant, drilled. **PARTIAL** = shipped
 ### 1. Tamper-evident / non-repudiation logging
 _(OWASP logging; ISO A.6.2.8; GSAR tamper-evident logging + forensic retention; AI Act Art 12; CRA evidence)_
 
-- **SHIPPED:** hash-chained, tamper-evident audit log. Every persisted state change produces a queryable audit entry; entries carry a per-entry `prev_hash` + `entry_hash` sequence and are periodically sealed by an Ed25519-signed checkpoint over a Merkle root (PR #274, hardened by #396/#461/#501). Any reordering, truncation, or entry edit breaks the chain or the signed checkpoint. This is *tamper-evidence*; non-repudiation is at checkpoint granularity, not a signature on every individual entry (individual entries are AES-256-GCM authenticated ciphertext linked by `prev_hash`).
+- **PARTIAL:** hash-chained, tamper-evident audit log. Every persisted state change produces a queryable audit entry; entries carry a per-entry `prev_hash` + `entry_hash` sequence and support checkpoint signatures when a checkpoint signer is supplied. Production boot paths currently do not supply that signer, so production checkpoints are written unsigned. `audit-chain verify --no-strict` reports findings with exit code 10. Any reordering, truncation, or entry edit is detectable by strict verification. This is *tamper-evidence*; non-repudiation is at checkpoint granularity only after the production signer is wired. Open defect: **IC-05**.
 - **SHIPPED:** Enforcement Receipts, external anchoring (opt-in). Sigstore Rekor transparency-log anchoring + an auditor pack + fork detection + log-attested freshness (PR #468/#487/#489). This is the strongest single evidence artifact: a third-party-verifiable proof the audit trail was not altered. Anchoring is opt-in and salted-hash-only. Cross-host verify was drilled (a checkpoint emitted on host A verifies on host B; a tampered checkpoint fails on both).
 - **SHIPPED:** anti-rollback anchoring. Custody-MAC-anchored monotonic anchors (config-downgrade gate #805; fleet ledger anti-rollback #871) prevent a silent rewind of the record.
 - **GAP (named):** per-flow, rule-attributed audit trail. Today the audit is per-uid / per-operation, not per-*flow* with the specific policy rule that fired attributed to each action. Do not claim "audited per-rule per-flow."
@@ -47,8 +47,8 @@ _(OWASP logging; ISO A.6.2.8; GSAR tamper-evident logging + forensic retention; 
 ### 2. Human oversight / approval gates
 _(OWASP human-agent-trust; ISO A.9; SOC 2 accountable-human; AI Act Art 14; CA AB 316)_
 
-- **SHIPPED:** Tier-1 approval gates on the highest-consequence operations. The default policy classifies as Tier-1 (human approval required before execution): state export, state import, raw identity signing, key rotation, governor reset, secure delete, and reputation import. This is the "privileged action attributable to an accountable human" that SOC 2 auditors ask for and that AB 316 makes legally load-bearing.
-- **SHIPPED:** plain-English policy view + promote-approval-to-standing-rule (PR #839). The operator can see, in plain English, what the policy allows and turn a one-off approval into a standing rule (downgrade-gated). Maps to Art 14 "understand, interpret, override."
+- **SHIPPED:** Tier-1 approval gates on the highest-consequence operations. The default policy classifies as Tier-1 (human approval required before execution): state export, state import, raw identity signing, key rotation, governor reset, secure delete, and reputation import. This is the "privileged action attributable to an accountable human" that SOC 2 auditors ask for and that AB 316 makes legally consequential.
+- **GAP (named), 2026-08-07 correction:** plain-English policy view + promote-approval-to-standing-rule (PR #839) was listed here as SHIPPED. Withdraw that. `EnglishPolicyActivator` is never constructed in any boot path and its required `PolicyActivationStore` has no construction site in `server/src` at all, so both production binding sites omit the field and every English-policy route returns 503. The plain-English panel never renders a policy and the "Always allow" control always fails. Do not cite this as an Art 14 "understand, interpret, override" control. Open defect: **IC-13**.
 - **PARTIAL:** per-action attribution. Approvals are attributable to the operator credential; full per-*action* human-vs-agent attribution across a long autonomous run is bounded (ties to the per-flow gap above).
 
 ### 3. Provable data control / eyes-off / custody
@@ -67,14 +67,15 @@ _(GSAR secure-deletion-with-written-certification; AI Act data-lifecycle)_
 ### 5. Data portability / no lock-in
 _(GSAR open-standards/no-lock-in; EU sovereignty procurement)_
 
-- **SHIPPED:** Exit MVP. User-state export + a completeness manifest + atomic activation + an offline `verify-exit-bundle` + reputation import/export parity. Maps to GSAR "open standards/APIs to prevent lock-in."
+- **PARTIAL:** Exit MVP. CLI user-state export, a completeness manifest, atomic activation, offline `verify-exit-bundle`, and reputation import/export parity exist, but the whole exit guarantee is partial: dashboard export omits the state re-key key, import hides skipped-entry counters, and imported bundles from a fortress that rotated identity keys can silently lose pre-rotation state. Open defect: **IC-07, IC-08, IC-09**.
 - **GAP (named):** provable clean-erasure exit. Full crypto-shred exit is blocked by deterministic HKDF; today's exit is honestly "narrow / user-state." Do not claim provable-clean-erasure.
 
 ### 6. Enforcement (the wall)
 _(OWASP tool-misuse / rogue-agent containment)_
 
-- **SHIPPED:** Castle Wall enforces a signed operator policy with a clean per-uid allow/deny demo + reboot-survival, drilled and coordinator-verified on macOS and on Linux (Linux evidence is CI-authoritative). A signed policy-distribution rail (PR #789) was drilled loopback and cross-machine. Standing honest caveat: this is enforcement of a signed operator policy with a per-uid allow/deny demo, NOT "audited per-rule per-flow."
-- **PARTIAL:** fine-grained per-action egress. The coarse network-destination wall is proven; the fine-grained "exclusive-egress" build (Unified Protect) is drilled on both OS families (N=3) but is not yet a one-command GA install, and the full external "unbypassable" claim still owes LaunchDaemon self-confinement plus a kernel wall on a second OS family. State this bound wherever the wall is described.
+- **SHIPPED (macOS only):** Castle Wall enforces a signed operator policy with a clean per-uid allow/deny demo plus attended reboot-survival, drilled and coordinator-verified on macOS. A signed policy-distribution rail (PR #789) was drilled loopback and cross-machine. Standing honest caveat: this is enforcement of a signed operator policy with a per-uid allow/deny demo, NOT "audited per-rule per-flow."
+- **GAP (named), 2026-08-07 correction:** this row previously read "on macOS and on Linux (Linux evidence is CI-authoritative)". Linux is withdrawn from the SHIPPED claim. The Linux kernel modules pass integration tests against a real kernel, and the shipped `castle-wall-daemon` binary installs no nftables table, binds no NFQUEUE, creates no cgroup scope, and never calls the deny-by-default evaluator; the shipped systemd unit is `Type=notify` while the daemon never signals readiness, so the documented activation path cannot reach `active`. Do not cite Linux Castle Wall as an enforcement control. Open defect: **IC-02, IC-03, IC-04**; `ASSURANCE_MATRIX.md` carries this row as `not_implemented`.
+- **PARTIAL:** fine-grained per-action egress. The coarse network-destination wall is proven; the fine-grained "exclusive-egress" build (Unified Protect) is drilled on both macOS families (Tahoe 26.5.1 arm64 and Sonoma 14.6.1 x86_64, N=3 each) but is not yet a one-command GA install, and the full external "unbypassable" claim still owes LaunchDaemon self-confinement plus a kernel wall on a second OS family. Those two drill legs are two macOS releases, one operating system; see `docs/audit/unified-protect-enforcement-status.md`. State this bound wherever the wall is described.
 
 ### 7. Identity / privilege
 _(OWASP identity-abuse; NIST Agent Standards identity/auth)_
@@ -88,21 +89,21 @@ _(OWASP identity-abuse; NIST Agent Standards identity/auth)_
 
 > Sanctuary provides operator-controlled, cryptographically verifiable controls that map to the agent-security controls your framework requires:
 >
-> - **Tamper-evident audit trail** (hash-chained + Ed25519-signed checkpoints) with optional external transparency-log anchoring that is third-party verifiable. Maps to OWASP logging, ISO 42001 A.6.2.8, GSAR tamper-evident logging + forensic retention, EU CRA evidence, AI Act Art 12 (preparedness).
+> - **Tamper-evident audit trail** (hash-chained, with checkpoint signatures only when a signer is wired) with optional external transparency-log anchoring that is third-party verifiable. Production checkpoints are currently unsigned. Open defect: **IC-05**. Maps to OWASP logging, ISO 42001 A.6.2.8, GSAR tamper-evident logging + forensic retention, EU CRA evidence, AI Act Art 12 (preparedness).
 > - **Human-approval gates** on the operations the policy classifies Tier-1 (export, import, key rotation, secure delete, reputation import), attributable to the operator credential. Maps to SOC 2 accountable-human, ISO A.9, AI Act Art 14, CA AB 316.
 > - **Operator-held custody**, vendor not in the data path, encrypted at rest, zero unrequested outbound. Maps to GSAR data ownership + eyes-off, EU sovereignty procurement.
 > - **Tier-1-gated secure delete** (phase 2: signed deletion certificate). Maps to GSAR secure-deletion-with-certification.
-> - **Data-portability / exit bundle** with offline verification. Maps to GSAR open-standards/no-lock-in.
-> - **Signed-operator-policy enforcement** (per-uid allow/deny, reboot-surviving, macOS and Linux). Maps to OWASP tool-misuse / rogue-agent containment.
+> - **Data-portability / exit bundle** with offline verification, partial until dashboard export carries the state re-key key, import surfaces skipped-entry counters, and rotated-key imports preserve pre-rotation state. Open defect: **IC-07, IC-08, IC-09**. Maps to GSAR open-standards/no-lock-in.
+> - **Signed-operator-policy enforcement** (per-uid allow/deny, reboot-surviving, macOS only). Maps to OWASP tool-misuse / rogue-agent containment. Linux is withdrawn from this claim: the shipped daemon installs no kernel enforcement, and the Assurance Matrix row is `not_implemented`. Open defect: **IC-02, IC-03, IC-04**.
 >
-> Honest boundaries (we never overclaim): per-flow rule-attributed audit and provable-clean-erasure exit are on the roadmap, not shipped; secure delete is best-effort overwrite with at-rest confidentiality resting on encryption; the fine-grained exclusive-egress wall is drilled but not yet a one-command GA install and still owes a second-OS-family kernel wall before any bare "unbypassable" claim.
+> Honest boundaries (we never overclaim): production audit checkpoints are currently unsigned; full exit remains partial across dashboard export, skipped import counters, and rotated-key imports; per-flow rule-attributed audit and provable-clean-erasure exit remain roadmap work; secure delete is best-effort overwrite with at-rest confidentiality resting on encryption; the fine-grained exclusive-egress wall is drilled and still owes a one-command GA install plus a second-OS-family kernel wall before any bare "unbypassable" claim.
 
 ---
 
 ## Next steps (ranked)
 
 1. Build the signed deletion certificate (phase-2, small, high-value; rides the existing Enforcement-Receipts channel; closes the single most literal GSAR gap).
-2. Re-verify the [EU AI Act Coverage Matrix](eu_ai_act_coverage_matrix_v1.md) against the current tree in the same review pass. Its `next_review_due` (2026-06-01) is overdue, and its audit-log review notes predate PR #274, which added the hash chain + signed checkpoints. The two documents must agree before either is used externally.
+2. Re-verify the [EU AI Act Coverage Matrix](eu_ai_act_coverage_matrix_v1.md) against the current tree in the same review pass. Its `next_review_due` (2026-06-01) is overdue, and its audit-log review notes must match PR #274's hash chain plus conditional checkpoint-signature bounds. The two documents must agree before either is used externally.
 3. Verify GSAR final-rule status and pull the exact OWASP Agentic Top-10 control text before any of this is used in a customer deck.
 4. Map to the NIST Agent Interoperability Profile when it lands, to keep the crosswalk current with the US government's reference standard.
 
@@ -110,7 +111,7 @@ _(OWASP identity-abuse; NIST Agent Standards identity/auth)_
 
 ## Sources
 
-Load-bearing anchors: OWASP Top 10 for Agentic Applications 2026; ISO/IEC 42001; GSAR 552.239-7001 (PROPOSED status); EU CRA reporting (Sep 2026) plus the Digital Omnibus high-risk deferral to Dec 2027; NIST AI Agent Standards Initiative; CA AB 316. Sanctuary capability rows trace to merged pull requests: #274 (tamper-evident audit chain + signed checkpoints), #468/#487/#489 (Enforcement Receipts / Rekor anchoring), #789 (signed policy-distribution rail), #805/#871 (anti-rollback anchoring), #839 (plain-English policy + promote-to-standing-rule), #869/#870 (zero unrequested outbound).
+Evidence anchors: OWASP Top 10 for Agentic Applications 2026; ISO/IEC 42001; GSAR 552.239-7001 (PROPOSED status); EU CRA reporting (Sep 2026) plus the Digital Omnibus high-risk deferral to Dec 2027; NIST AI Agent Standards Initiative; CA AB 316. Sanctuary capability rows trace to merged pull requests: #274 (tamper-evident audit chain plus conditional checkpoint signatures), #468/#487/#489 (Enforcement Receipts / Rekor anchoring), #789 (signed policy-distribution rail), #805/#871 (anti-rollback anchoring), #839 (plain-English policy + promote-to-standing-rule), #869/#870 (zero unrequested outbound).
 
 ---
 

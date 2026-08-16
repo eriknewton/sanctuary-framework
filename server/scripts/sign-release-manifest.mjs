@@ -5,7 +5,12 @@
  * Copyright 2026 Erik Newton
  * SPDX-License-Identifier: Apache-2.0
  *
- * What this does (Seam 2 of the signed self-update wiring):
+ * LOCAL DEVELOPMENT HELPER (not used by the privileged publish workflow).
+ * The workflow packs exactly once in its unprivileged build job, then uses
+ * root-level, Node-stdlib-only sign/verify scripts in isolated trust zones.
+ * This helper remains useful for local compatibility tests and manual signing.
+ *
+ * What this does:
  *   1. Runs `npm pack` on the current build to produce the EXACT publishable
  *      tarball (the same bytes `npm publish` would upload).
  *   2. Computes the tarball's SHA-256.
@@ -25,12 +30,9 @@
  *   <version>  must match server/package.json version (guard below).
  *   --out      output path for release-manifest.json (default: cwd).
  *
- * This script is invoked from the Publish workflow AFTER npm publish, with the
- * private key sourced from the GitHub Actions secret RELEASE_SIGNING_KEY. The
- * key was ACTIVATED 2026-07-01; the workflow fails closed BEFORE publishing if
- * the secret is empty or absent (step "Require release signing key"), and this
- * script's own missing-env failure is the second, unconditional layer of that
- * gate. There is no skip path: a publish without a signed manifest is a defect.
+ * This script is not invoked by the Publish workflow. The release pipeline's
+ * signer validates that the secret seed derives the public key pinned by
+ * shipped clients before it signs the exact prebuilt tarball.
  *
  * Crypto is NOT hand-rolled: canonicalization + the signed-message construction
  * come from release-manifest.ts; the Ed25519 sign primitive comes from

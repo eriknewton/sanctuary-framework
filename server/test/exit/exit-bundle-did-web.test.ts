@@ -781,6 +781,7 @@ describe("Recognition-Layer Path C primary build 2: exit-bundle did:web integrat
     const dir = await makeTempDir();
     const identity = source.identityManager.getDefault()!;
     const didUri = manifestDidUri(source);
+    const exportedAt = "2026-05-09T12:30:00.000Z";
     const issued = await issueDidWeb({
       fortress_id: TEST_FORTRESS_LABEL,
       authority_host: TEST_AUTHORITY_HOST,
@@ -788,7 +789,7 @@ describe("Recognition-Layer Path C primary build 2: exit-bundle did:web integrat
       public_key: fromBase64url(identity.public_key),
       now: () => new Date("2026-05-09T12:00:00.000Z"),
     });
-    await exportExitBundle({
+    const exported = await exportExitBundle({
       unpartitionedLegacyExport: true,
       bundleDir: dir,
       storage: source.storage,
@@ -798,7 +799,9 @@ describe("Recognition-Layer Path C primary build 2: exit-bundle did:web integrat
       reputationStore: source.reputationStore,
       policy: DEFAULT_POLICY,
       didWeb: { identifier: didUri, authority_host: TEST_AUTHORITY_HOST },
+      now: () => new Date(exportedAt),
     });
+    expect(exported.manifest.body.exported_at).toBe(exportedAt);
     const rotated = await rotateDidWebKey(issued, {
       reason: "manual",
       now: () => new Date("2026-05-10T00:00:00.000Z"),
@@ -821,11 +824,11 @@ describe("Recognition-Layer Path C primary build 2: exit-bundle did:web integrat
     });
     expect(result.verified).toBe(true);
     const audit = await receiver.auditLog.query({ layer: "l1", limit: 200 });
-    expect(
-      audit.entries.some(
-        (e) => e.operation === "did_web_historical_verification_used",
-      ),
-    ).toBe(true);
+    const historical = lastAuditEntry(
+      audit.entries,
+      "did_web_historical_verification_used",
+    );
+    expect(historical?.details?.assertion_time).toBe(exportedAt);
   });
 
   it("Castle-walking: empty allowed_hosts blocks outbound at the application layer (no fetcher invocation)", async () => {

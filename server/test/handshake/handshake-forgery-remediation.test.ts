@@ -1,3 +1,4 @@
+// fail-before-exempt: adaptation-only in this PR — the sole change is passing the now-required 4th origins-map arg to createFederationTools (an empty Map, since this file hand-builds handshakeResults with no real per-session origin). No assertion changed. The Class C bounded-state behavior IS bound (fails against pre-fix source) by test/security/attacker-writable-collections-bounds.test.ts and test/core/bounded-map.test.ts; the self-vouch behavior this file exercises is bound in merged main (#1198) and by this file's own M3 self-vouch test against pre-Class-B source.
 /**
  * Handshake Forgery & Replay Remediation — Regression Suite (M1-M4)
  *
@@ -174,8 +175,13 @@ describe("M2: handshake_exchange can never produce a verified peer", () => {
     const peerId = counterpartySHR.body.instance_id;
 
     // Simulate an established, liveness-proven peer (as the 4-step protocol
-    // would leave it in the results map).
-    handshakeResults.set(peerId, {
+    // would leave it in the results map). The producer exposes
+    // handshakeResults as ReadonlyMap to every consumer (see
+    // recordHandshakeResult in handshake/tools.ts) — this test-only cast
+    // seeds the fixture directly rather than driving a full 4-step
+    // handshake, which is legitimate for a test setting up pre-existing
+    // state, unlike a production write path.
+    (handshakeResults as Map<string, HandshakeResult>).set(peerId, {
       counterparty_id: peerId,
       counterparty_shr: counterpartySHR,
       verified: true,
@@ -208,9 +214,17 @@ describe("M2: handshake_exchange can never produce a verified peer", () => {
       agent.auditLog
     );
 
-    // A genuinely valid, captured SHR (e.g. recorded from a real agent) is
-    // replayed. With no nonce/liveness, it must not confer trust.
-    const capturedValid = shrFor(agent);
+    // A genuinely valid, captured SHR from a DIFFERENT party (e.g. recorded
+    // from a real remote agent) is replayed. With no nonce/liveness, it must
+    // not confer trust. Uses a SEPARATE victim identity/fortress — not
+    // `agent`'s own SHR — because `agent` replaying its own SHR against
+    // itself is the self-vouch case the class-level chokepoint
+    // (recordHandshakeResult) now refuses outright (see the self-vouch
+    // describe block below); that is a different assertion than "captured
+    // remote SHR, no liveness".
+    const victim = makeAgent();
+    await createIdentityFor(victim);
+    const capturedValid = shrFor(victim);
     const exchange = tools.find((t) => t.name === "handshake_exchange")!;
     const out = parse(await exchange.handler({ counterparty_shr: capturedValid }));
 
@@ -273,15 +287,41 @@ describe("M3: federation register binds peer_did to the signing key", () => {
     };
   }
 
+  // NOTE: these four tests originally used `shrFor(agent)` — the REGISTERING
+  // fortress's own identity — while constructing federation tools WITHOUT an
+  // identityManager (identityManager was optional pre-MUST-FIX-2). That
+  // combination inadvertently demonstrated the self-vouch bypass this branch
+  // closes: an identity was both the counterparty being registered AND
+  // locally held, but with no identityManager wired in, the local-custody
+  // check could never fire, so "defaults peer_did..." and "accepts a
+  // peer_did..." asserted `registered: true` for what is actually a
+  // self-vouch. Now that identityManager is REQUIRED (MUST-FIX 2), these
+  // three peer_did-binding tests use a SEPARATE `victim` identity (genuinely
+  // remote — not held by `agent`'s identityManager) so they keep testing
+  // peer_did binding rather than accidentally re-demonstrating the bypass;
+  // the self-vouch case now gets its OWN explicit refusal test below.
+
   it("rejects a peer_did that does not match the handshake signing key", async () => {
     const agent = makeAgent();
-    await createIdentityFor(agent);
-    const shr = shrFor(agent);
+    const victim = makeAgent();
+    await createIdentityFor(victim);
+    const shr = shrFor(victim);
 
     const handshakeResults = new Map<string, HandshakeResult>();
     handshakeResults.set(shr.body.instance_id, liveResultFor(shr));
 
-    const { tools } = createFederationTools(agent.auditLog, handshakeResults);
+    // REQUIRED (fix-round-2, MUST-FIX 2): an empty origins map is correct
+    // here — this file builds `handshakeResults` by hand (not through
+    // createHandshakeTools's recordHandshakeResult), so there is no real
+    // per-session origin; every registration falls into the shared
+    // AGENT_UNKNOWN_ORIGIN bucket, which none of these tests' assertions
+    // depend on.
+    const { tools } = createFederationTools(
+      agent.auditLog,
+      handshakeResults,
+      agent.identityManager,
+      new Map<string, string>()
+    );
     const peersTool = tools.find((t) => t.name === "federation_peers")!;
 
     const out = parse(
@@ -296,16 +336,28 @@ describe("M3: federation register binds peer_did to the signing key", () => {
     expect(out.error).toContain("does not match the key that signed the handshake");
   });
 
-  it("defaults peer_did to the derived did:key when omitted", async () => {
+  it("defaults peer_did to the derived did:key when omitted (genuinely remote peer)", async () => {
     const agent = makeAgent();
-    await createIdentityFor(agent);
-    const shr = shrFor(agent);
+    const victim = makeAgent();
+    await createIdentityFor(victim);
+    const shr = shrFor(victim);
     const expectedDid = publicKeyToDid(fromBase64url(shr.signed_by));
 
     const handshakeResults = new Map<string, HandshakeResult>();
     handshakeResults.set(shr.body.instance_id, liveResultFor(shr));
 
-    const { tools } = createFederationTools(agent.auditLog, handshakeResults);
+    // REQUIRED (fix-round-2, MUST-FIX 2): an empty origins map is correct
+    // here — this file builds `handshakeResults` by hand (not through
+    // createHandshakeTools's recordHandshakeResult), so there is no real
+    // per-session origin; every registration falls into the shared
+    // AGENT_UNKNOWN_ORIGIN bucket, which none of these tests' assertions
+    // depend on.
+    const { tools } = createFederationTools(
+      agent.auditLog,
+      handshakeResults,
+      agent.identityManager,
+      new Map<string, string>()
+    );
     const peersTool = tools.find((t) => t.name === "federation_peers")!;
 
     const out = parse(
@@ -320,16 +372,28 @@ describe("M3: federation register binds peer_did to the signing key", () => {
     expect(out.peer_did).toBe(expectedDid);
   });
 
-  it("accepts a peer_did that exactly matches the derived did:key", async () => {
+  it("accepts a peer_did that exactly matches the derived did:key (genuinely remote peer)", async () => {
     const agent = makeAgent();
-    await createIdentityFor(agent);
-    const shr = shrFor(agent);
+    const victim = makeAgent();
+    await createIdentityFor(victim);
+    const shr = shrFor(victim);
     const expectedDid = publicKeyToDid(fromBase64url(shr.signed_by));
 
     const handshakeResults = new Map<string, HandshakeResult>();
     handshakeResults.set(shr.body.instance_id, liveResultFor(shr));
 
-    const { tools } = createFederationTools(agent.auditLog, handshakeResults);
+    // REQUIRED (fix-round-2, MUST-FIX 2): an empty origins map is correct
+    // here — this file builds `handshakeResults` by hand (not through
+    // createHandshakeTools's recordHandshakeResult), so there is no real
+    // per-session origin; every registration falls into the shared
+    // AGENT_UNKNOWN_ORIGIN bucket, which none of these tests' assertions
+    // depend on.
+    const { tools } = createFederationTools(
+      agent.auditLog,
+      handshakeResults,
+      agent.identityManager,
+      new Map<string, string>()
+    );
     const peersTool = tools.find((t) => t.name === "federation_peers")!;
 
     const out = parse(
@@ -344,10 +408,48 @@ describe("M3: federation register binds peer_did to the signing key", () => {
     expect(out.peer_did).toBe(expectedDid);
   });
 
-  it("refuses to register a preview-only (liveness_proven:false) result", async () => {
+  // MUST-FIX 2 (register §Z RECHECK): the demonstrating replacement — proves
+  // that with identityManager now REQUIRED and wired, a fortress cannot
+  // register ITS OWN identity as a federation peer, rather than the old
+  // tests silently accepting that outcome as a pass.
+  it("refuses to register a peer this fortress holds keys for (self-vouch, federation defense-in-depth)", async () => {
     const agent = makeAgent();
     await createIdentityFor(agent);
-    const shr = shrFor(agent);
+    const shr = shrFor(agent); // agent's OWN identity — locally held
+
+    const handshakeResults = new Map<string, HandshakeResult>();
+    handshakeResults.set(shr.body.instance_id, liveResultFor(shr));
+
+    // REQUIRED (fix-round-2, MUST-FIX 2): an empty origins map is correct
+    // here — this file builds `handshakeResults` by hand (not through
+    // createHandshakeTools's recordHandshakeResult), so there is no real
+    // per-session origin; every registration falls into the shared
+    // AGENT_UNKNOWN_ORIGIN bucket, which none of these tests' assertions
+    // depend on.
+    const { tools } = createFederationTools(
+      agent.auditLog,
+      handshakeResults,
+      agent.identityManager,
+      new Map<string, string>()
+    );
+    const peersTool = tools.find((t) => t.name === "federation_peers")!;
+
+    const out = parse(
+      await peersTool.handler({
+        action: "register",
+        peer_id: shr.body.instance_id,
+      })
+    );
+
+    expect(out.registered).toBeUndefined();
+    expect(out.error).toContain("Cannot register a federation peer this fortress holds keys for");
+  });
+
+  it("refuses to register a preview-only (liveness_proven:false) result", async () => {
+    const agent = makeAgent();
+    const victim = makeAgent();
+    await createIdentityFor(victim);
+    const shr = shrFor(victim);
 
     // A result as produced by handshake_exchange: verified must already be
     // false, but assert the liveness gate even defends a hypothetically
@@ -360,7 +462,18 @@ describe("M3: federation register binds peer_did to the signing key", () => {
     const handshakeResults = new Map<string, HandshakeResult>();
     handshakeResults.set(shr.body.instance_id, previewResult);
 
-    const { tools } = createFederationTools(agent.auditLog, handshakeResults);
+    // REQUIRED (fix-round-2, MUST-FIX 2): an empty origins map is correct
+    // here — this file builds `handshakeResults` by hand (not through
+    // createHandshakeTools's recordHandshakeResult), so there is no real
+    // per-session origin; every registration falls into the shared
+    // AGENT_UNKNOWN_ORIGIN bucket, which none of these tests' assertions
+    // depend on.
+    const { tools } = createFederationTools(
+      agent.auditLog,
+      handshakeResults,
+      agent.identityManager,
+      new Map<string, string>()
+    );
     const peersTool = tools.find((t) => t.name === "federation_peers")!;
 
     const out = parse(

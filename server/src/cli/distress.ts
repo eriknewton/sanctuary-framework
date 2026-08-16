@@ -39,6 +39,7 @@ import {
   type DistressReason,
   type DistressSeverity,
 } from "../distress/tools.js";
+import { flagValue } from "./argv.js";
 
 export interface DistressCommandArgs {
   argv: string[];
@@ -49,15 +50,6 @@ export interface DistressCommandArgs {
 
 function write(stream: Writable, text: string): void {
   stream.write(text);
-}
-
-function flagValue(argv: string[], name: string): string | undefined {
-  // Support both `--flag value` and `--flag=value`.
-  const eq = argv.find((a) => a.startsWith(`${name}=`));
-  if (eq) return eq.slice(name.length + 1);
-  const index = argv.indexOf(name);
-  if (index === -1) return undefined;
-  return argv[index + 1];
 }
 
 function hasFlag(argv: string[], name: string): boolean {

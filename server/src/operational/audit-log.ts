@@ -43,6 +43,7 @@ import {
   sha256Hex,
   verifyCheckpointSignature,
 } from "../audit/chain.js";
+import { createFortressCheckpointIdentityBinding } from "../audit/checkpoint-identity.js";
 import type { PluginContribution } from "../substrate/attribution.js";
 
 export interface AuditEntry {
@@ -119,6 +120,7 @@ export type AuditIntegrityFindingKind =
   | "checkpoint_root_mismatch"
   | "checkpoint_signature_mismatch"
   | "checkpoint_signature_unverifiable"
+  | "checkpoint_signature_embedded_key_untrusted"
   // F2 Option A (writer-split) boundary findings. See the module doc comment
   // near AUDIT_SPLIT_BOUNDARY_DIRNAME.
   //  - split_boundary_invalid: a boundary record is PRESENT but fails MAC
@@ -153,6 +155,19 @@ export interface AuditCreateOwner {
 }
 
 type AuditLockFileHandle = Awaited<ReturnType<typeof open>>;
+
+/**
+ * What a checkpoint public-key resolver may hand back for one `signer_kid`:
+ * a single key, the signer's full authenticated key set (current key plus
+ * verified rotation-chain predecessors, so pre-rotation checkpoints keep
+ * verifying after a rotation), or `undefined`/an empty set for "this signer
+ * is unknown", which the verify path reports as an integrity finding.
+ */
+export type AuditCheckpointKeyResolution =
+  | string
+  | Uint8Array
+  | ReadonlyArray<string | Uint8Array>
+  | undefined;
 
 export interface AuditLogConfig {
   /** Maximum total size of stored audit entries in bytes. Default: 100 MB. */
@@ -194,12 +209,33 @@ export interface AuditLogConfig {
   consultSplitBoundary?: boolean;
   /** Write a checkpoint after this many critical appends. Default: 100. */
   checkpointInterval?: number;
-  /** Optional typed identity signing bridge for checkpoint records. */
+  /**
+   * Typed identity signing bridge for checkpoint records. Optional in the
+   * CONFIG only as an injection seam (tests, embedders with their own key
+   * custody): when omitted, the constructor derives the production fortress
+   * signer from its own required arguments (IC-05), so no call site can
+   * silently opt out of checkpoint signing by forgetting a config field.
+   */
   checkpointSigner?: (
     payload: AuditCheckpointSigningPayload
   ) => Promise<AuditCheckpointSignature | null>;
-  /** Resolve a known checkpoint signing key by signer_kid. */
-  checkpointPublicKeyResolver?: (signerKid: string) => string | Uint8Array | undefined;
+  /**
+   * Resolve known checkpoint signing keys by signer_kid. May return a single
+   * key or the signer's full authenticated key set (current key plus
+   * rotation-chain predecessors), synchronously or as a promise. Same
+   * injection-seam contract as `checkpointSigner`: omitted means the
+   * constructor-derived fortress resolver, not "no resolution".
+   */
+  checkpointPublicKeyResolver?: (
+    signerKid: string
+  ) =>
+    | AuditCheckpointKeyResolution
+    | Promise<AuditCheckpointKeyResolution>;
+  /**
+   * Explicit self-check opt-in for checkpoint-embedded public keys.
+   * Embedded keys prove record self-consistency only, not signer identity.
+   */
+  trustEmbeddedCheckpointPublicKeys?: boolean;
   /** Optional in-process subscribers notified when audit-chain integrity fails. */
   integrityAnomalySubscribers?: AuditIntegrityAnomalySubscriber[];
   /**
@@ -324,6 +360,7 @@ const DEFAULT_CHECKPOINT_INTERVAL = 100;
 const MIN_IN_MEMORY_ENTRY_FLOOR = 256;
 const AUDIT_NAMESPACE = "_audit";
 const AUDIT_CHECKPOINT_NAMESPACE = "_audit_checkpoints";
+const AUDIT_META_NAMESPACE = "_meta";
 // F3: reserved storage key for the single MAC-authenticated rotation checkpoint.
 // Stored alongside the (optionally-signed) checkpoint records but addressed by a
 // fixed key that does NOT match the `audit-checkpoint-`/`legacy-anchor-` prefixes
@@ -669,7 +706,7 @@ export async function probeAuditHeadAnchor(
   // glaring, separately-detectable full-wipe residual, not a quiet splice.
   let established = false;
   try {
-    if ((await storage.read("_meta", AUDIT_HEAD_ANCHOR_ESTABLISHED_KEY)) !== null) {
+    if ((await storage.read(AUDIT_META_NAMESPACE, AUDIT_HEAD_ANCHOR_ESTABLISHED_KEY)) !== null) {
       established = true;
     }
   } catch {
@@ -833,9 +870,18 @@ export function deriveAuditEpochKeys(masterKey: Uint8Array): {
 const AUDIT_INTEGRITY_ALERT_NAMESPACE = "_audit_integrity_alert";
 const AUDIT_INTEGRITY_ALERT_KEY = "audit-integrity-alert.log";
 const AUDIT_WRITE_LOCK_FILE = ".audit-write.lock";
-const AUDIT_WRITE_LOCK_TIMEOUT_MS = 5_000;
+// EXPORTED (fix-round-4, MUST-FIX 1 cross-file pin): core/bounded-map.ts's
+// `ON_EVICT_AUDIT_TIMEOUT_MS` derives from this and
+// `DEFAULT_AUDIT_WRITE_LOCK_HOLD_DEADLINE_MS` below — a caller-supplied
+// `onEvict` critical audit is (almost always, see that constant's own doc)
+// a `this.appendCritical(...)` call, and its worst-case settle time is
+// bounded by these same two numbers (lock ACQUISITION timeout, then the
+// held-write's own deadline). If either of these values changes, that
+// derivation must be re-checked — see bounded-map.ts's
+// `ON_EVICT_AUDIT_TIMEOUT_MS` doc for the full reasoning.
+export const AUDIT_WRITE_LOCK_TIMEOUT_MS = 5_000;
 const AUDIT_WRITE_LOCK_RETRY_MS = 100;
-const DEFAULT_AUDIT_WRITE_LOCK_HOLD_DEADLINE_MS = 30_000;
+export const DEFAULT_AUDIT_WRITE_LOCK_HOLD_DEADLINE_MS = 30_000;
 const DEFAULT_AUDIT_SELF_HELD_STALE_LOCK_MS = 60_000;
 // Drill-found (Leg 5, MBA, 2026-07-15): a 0-byte / unparseable audit lock that
 // carries neither `pid` nor `acquired_at` cannot be proven stale by the two
@@ -926,8 +972,24 @@ function resolveSelfHeldStaleLockMs(
 // rotation on a loaded CI host can outrun any small fixed ceiling (the original
 // false-fail), while an attacker who keeps the store permanently mid-update still
 // fails closed once the deadline passes.
+// `AUDIT_READ_CONSISTENCY_MAX_MS` must stay below the stall in
+// `ONE_PASS_OUTLIVES_THE_BUDGET_MS` in
+// `test/operational/audit-log-concurrent-append-anchor.test.ts`, which pins the
+// mandatory-retry behavior by making one pass spend the entire budget.
 const AUDIT_READ_CONSISTENCY_MAX_MS = 2_000;
 const AUDIT_READ_CONSISTENCY_RETRY_MS = 10;
+
+/**
+ * Outcome of reading the MAC'd head anchor. `unreadable_sealed` is the
+ * operator-uid-cannot-read-the-root-owned-legacy-anchor case (F2 Option A), NOT
+ * a tamper verdict; see {@link AuditLog.verifyHeadAnchor} for how each status is
+ * adjudicated.
+ */
+type HeadAnchorReadResult =
+  | { status: "valid"; highest_sequence: number; head_hash: string }
+  | { status: "absent" }
+  | { status: "invalid" }
+  | { status: "unreadable_sealed" };
 // Eager-read backstop throttle. The posture dashboard composes several full-chain
 // reads per board paint and pushes the same payload on an SSE cadence; re-reading
 // + re-decrypting + re-verifying a 10k-entry / 40MB chain from disk on EVERY such
@@ -1376,7 +1438,7 @@ export async function writeAuditStoreSplitEstablishedMarker(
     mac: toBase64url(auditStoreSplitEstablishedMacBytes(macKey)),
   };
   await storage.write(
-    "_meta",
+    AUDIT_META_NAMESPACE,
     AUDIT_STORE_SPLIT_ESTABLISHED_META_KEY,
     stringToBytes(JSON.stringify(envelope))
   );
@@ -1404,7 +1466,7 @@ export async function readAuditStoreSplitEstablishedMarker(
 ): Promise<"present" | "absent" | "invalid_or_unreadable"> {
   let raw: Uint8Array | null;
   try {
-    raw = await storage.read("_meta", AUDIT_STORE_SPLIT_ESTABLISHED_META_KEY);
+    raw = await storage.read(AUDIT_META_NAMESPACE, AUDIT_STORE_SPLIT_ESTABLISHED_META_KEY);
   } catch {
     // A read error cannot prove absence; a present-but-unreadable marker is
     // exactly the tamper case. Fail closed.
@@ -1774,12 +1836,15 @@ export class AuditLog {
   private readonly maxInMemoryEntries: number;
   private readonly integrityMode: "strict" | "lenient";
   private readonly checkpointInterval: number;
-  private readonly checkpointSigner?: (
+  private readonly checkpointSigner: (
     payload: AuditCheckpointSigningPayload
   ) => Promise<AuditCheckpointSignature | null>;
-  private readonly checkpointPublicKeyResolver?: (
+  private readonly checkpointPublicKeyResolver: (
     signerKid: string
-  ) => string | Uint8Array | undefined;
+  ) =>
+    | AuditCheckpointKeyResolution
+    | Promise<AuditCheckpointKeyResolution>;
+  private readonly trustEmbeddedCheckpointPublicKeys: boolean;
   private readonly integrityAnomalySubscribers: AuditIntegrityAnomalySubscriber[];
   private readonly filesystemCapabilities?: FilesystemStorageCapabilities;
   private readonly auditWriteLockPath?: string;
@@ -1909,8 +1974,30 @@ export class AuditLog {
     this.integrityMode = config?.integrityMode ?? "strict";
     this.checkpointInterval =
       config?.checkpointInterval ?? DEFAULT_CHECKPOINT_INTERVAL;
-    this.checkpointSigner = config?.checkpointSigner;
-    this.checkpointPublicKeyResolver = config?.checkpointPublicKeyResolver;
+    // IC-05 enforcement site (AGENTS.md assurance rule 3): the checkpoint
+    // signer/resolver pair used to be an optional dependency that every test
+    // supplied and every production call site omitted, so shipped fortresses
+    // wrote unsigned checkpoints and distrusted signed ones. Rule 3 offers
+    // "make it required" or "fail closed on absence"; this site takes the
+    // stronger third form: the production pair is DERIVED from the
+    // constructor's own required arguments (storage + master key), so no call
+    // site can omit it. Explicit config remains the injection seam and wins
+    // per field. Fail-closed-on-absence was rejected one level down instead
+    // of here: a fortress legitimately has zero identities until bootstrap,
+    // and refusing audit appends then would make audit availability depend on
+    // identity existence; that case degrades to the honest `unsigned`
+    // checkpoint record, never to a silently trusted fallback key.
+    const fortressCheckpointIdentity = createFortressCheckpointIdentityBinding(
+      storage,
+      derivePurposeKey(masterKey, "identity-encryption")
+    );
+    this.checkpointSigner =
+      config?.checkpointSigner ?? fortressCheckpointIdentity.checkpointSigner;
+    this.checkpointPublicKeyResolver =
+      config?.checkpointPublicKeyResolver ??
+      fortressCheckpointIdentity.checkpointPublicKeyResolver;
+    this.trustEmbeddedCheckpointPublicKeys =
+      config?.trustEmbeddedCheckpointPublicKeys ?? false;
     this.integrityAnomalySubscribers = config?.integrityAnomalySubscribers ?? [];
     this.eagerReverifyIntervalMs = resolveEagerReverifyIntervalMs(
       config?.eagerReverifyIntervalMs
@@ -2018,11 +2105,7 @@ export class AuditLog {
       result,
       details,
     }, { verifyDurability: false, critical: false });
-    this.pendingWrites.add(writePromise);
-    void writePromise.then(
-      () => this.pendingWrites.delete(writePromise),
-      () => this.pendingWrites.delete(writePromise)
-    );
+    this.trackPendingWrite(writePromise);
     return writePromise;
   }
 
@@ -2035,10 +2118,18 @@ export class AuditLog {
    * so this method treats a completed write plus exact read-after-write
    * verification as the backend-equivalent durability barrier. Storage
    * failures, disk-full conditions, permission failures, and partial/torn
-   * writes throw `AuditPersistenceError` with a classification.
+   * writes throw `AuditPersistenceError` with a classification. Like
+   * `append()`, the returned promise is tracked until it settles: an awaited
+   * caller gets the rejection at the call site, and a fire-and-forget caller's
+   * failure is rethrown by `flush()`.
    */
-  async appendCritical(entry: AuditEntryInput): Promise<void> {
-    await this.enqueueAppend(entry, { verifyDurability: true, critical: true });
+  appendCritical(entry: AuditEntryInput): Promise<void> {
+    const writePromise = this.enqueueAppend(entry, {
+      verifyDurability: true,
+      critical: true,
+    });
+    this.trackPendingWrite(writePromise);
+    return writePromise;
   }
 
   async runAllowingIntegrityFindings<T>(fn: () => Promise<T>): Promise<T> {
@@ -2049,6 +2140,14 @@ export class AuditLog {
     await this.appendQueue;
     await this.ensureLoaded({ allowIntegrityFindings: true });
     return [...this.integrityFindings];
+  }
+
+  private trackPendingWrite(writePromise: Promise<void>): void {
+    this.pendingWrites.add(writePromise);
+    void writePromise.then(
+      () => this.pendingWrites.delete(writePromise),
+      () => this.pendingWrites.delete(writePromise)
+    );
   }
 
   /**
@@ -2217,18 +2316,56 @@ export class AuditLog {
   ): Promise<void> {
     try {
       const normalized = this.normalizeEntry(entry);
+      await this.reverifyCachedIntegrityFindingsBeforeAppend();
+      // C9 (availability, register): resolve the mandatory first-load
+      // read-consistency pass BEFORE requesting the cross-process write lock,
+      // not inside it. `ensureLoaded()` is a no-op once `this.loaded` is true
+      // (every append after this process's first), so this call is where the
+      // multi-pass decrypt+retry cost — up to 2x a full chain verify, see
+      // `loadPersistedEntriesWithReadConsistency` — actually lands: on the
+      // FIRST append only, and now with no write lock held while it runs,
+      // exactly mirroring how `reverifyCachedIntegrityFindingsBeforeAppend`
+      // above already takes its own fresh look lock-free. If it throws
+      // (strict mode, a store that never settled), the append never requests
+      // the lock at all, so a torn read on this process's first load can no
+      // longer hold other appenders in lock-contention for the retry's
+      // duration. The retry loop itself — deadline, store-stability
+      // discrimination — is UNCHANGED; only WHEN it runs relative to lock
+      // acquisition has moved. See the (retired) KNOWN LATENCY EXPOSURE note
+      // in `loadPersistedEntriesWithReadConsistency`. Not re-called inside
+      // the lock below: appends are strictly serialized per-process through
+      // `enqueueAppend`'s `appendQueue` chain (this is the only call site of
+      // `persistChainedEntry`), so by the time the lock callback below runs,
+      // `this.loaded` is already true (this call either set it or threw
+      // before the lock was ever requested) and a repeat call would be a
+      // guaranteed no-op purchased with real microtask-tick cost, not free
+      // defense in depth.
+      await this.ensureLoaded();
       const serialized = stringToBytes(JSON.stringify(normalized));
       const encrypted = encrypt(serialized, this.encryptionKey);
       const encryptedBytes = stringToBytes(JSON.stringify(encrypted));
       const encryptedPayloadBytes = toBase64url(encryptedBytes);
       await this.withAuditWriteLock(async (signal) => {
         this.assertAuditWriteLockActive(signal);
-        await this.ensureLoaded();
-        this.assertAuditWriteLockActive(signal);
+        // Incremental re-check of only the unstable tail (O(1) backward walk;
+        // see the Mini1-drill note on `readLatestPersistedChainState`), not a
+        // full re-verify. This is what protects correctness against a write
+        // that lands in the gap between the outside-lock `ensureLoaded()`
+        // above and this process actually acquiring the lock: it refreshes
+        // `nextSequence` / `lastEntryHash` to the true on-disk tip before they
+        // are used below, so a concurrent legitimate append is never lost or
+        // double-chained. It does not re-run the full decrypt+hash-chain
+        // verify, and does not need to: every append after the first already
+        // relies on this same freshen step today, never a per-append full
+        // reload, so this is the existing steady-state guarantee, not a
+        // weaker one.
         await this.freshenChainStateFromDisk();
         this.assertAuditWriteLockActive(signal);
         const sequence = this.nextSequence;
         const prevHash = this.lastEntryHash;
+        // Hash-chain invariant: the entry hash covers the previous hash and the
+        // encrypted payload bytes, so changing either content or position in the
+        // append-only chain changes the digest checked on every reload.
         const entryHash = computeAuditEntryHash({
           sequence,
           prev_hash: prevHash,
@@ -2257,6 +2394,15 @@ export class AuditLog {
             this.assertAuditWriteLockActive(signal);
           }
           this.assertAuditWriteLockActive(signal);
+          // ORDERING INVARIANT (must match the anchor-before-listing read order
+          // in `loadPersistedEntries`): the entry file is durably on disk BEFORE
+          // the anchor claims its sequence, so a floor of N is only ever
+          // published after entry N was written. A reader that samples the
+          // anchor AFTER listing the entries loses that ordering (an append can
+          // land in between) and reports a live append as tail truncation.
+          // The converse is deliberately NOT claimed: a floor of N does not
+          // prove entry N still exists at read time, and an N that has since
+          // been deleted is precisely the truncation `verifyHeadAnchor` catches.
           await this.writeHeadAnchor(sequence, entryHash);
           this.assertAuditWriteLockActive(signal);
           // F2 Finding 1: the FIRST time this operator instance persists a
@@ -2277,7 +2423,7 @@ export class AuditLog {
             try {
               this.assertAuditWriteLockActive(signal);
               await this.storage.write(
-                "_meta",
+                AUDIT_META_NAMESPACE,
                 AUDIT_POST_SPLIT_SUFFIX_ESTABLISHED_KEY,
                 stringToBytes("1")
               );
@@ -2897,7 +3043,7 @@ export class AuditLog {
       );
     }
     await this.storage.write(
-      "_meta",
+      AUDIT_META_NAMESPACE,
       AUDIT_HEAD_ANCHOR_ESTABLISHED_KEY,
       stringToBytes("1")
     );
@@ -2913,6 +3059,12 @@ export class AuditLog {
     );
   }
 
+  /**
+   * Outcome of one head-anchor read. Named so the load path can sample the
+   * anchor early (before the entry listing) and hand the SAME result to
+   * {@link verifyHeadAnchor} later in the pass; see the ordering invariant in
+   * {@link loadPersistedEntries}.
+   */
   private async loadHeadAnchor(
     findings: AuditIntegrityFinding[],
     // F2 Option A: whether a VALID split boundary seals a legacy region. On an
@@ -2924,12 +3076,7 @@ export class AuditLog {
     // treat it as "no usable anchor for the post-split suffix" and re-establish
     // the operator's OWN anchor, instead of failing the whole load closed.
     boundaryIsValid = false
-  ): Promise<
-    | { status: "valid"; highest_sequence: number; head_hash: string }
-    | { status: "absent" }
-    | { status: "invalid" }
-    | { status: "unreadable_sealed" }
-  > {
+  ): Promise<HeadAnchorReadResult> {
     let raw: Uint8Array | null;
     try {
       raw = await this.storage.read(
@@ -2998,16 +3145,35 @@ export class AuditLog {
     };
   }
 
+  /**
+   * Adjudicate the head anchor against the surviving chain.
+   *
+   * `anchor` is read by the CALLER, before it lists the entries, and handed in
+   * here (it is never re-read at this point in the pass). State the property
+   * that ordering buys exactly, because it is narrower than "the listing also
+   * sees it": on the LEGITIMATE append path the entry file is written before the
+   * anchor that names it (see `persistChainedEntry`), so an anchor sampled
+   * before the listing can only name an entry that was already on disk. It does
+   * NOT guarantee the later listing still contains that entry — an adversarial
+   * delete or rollback between the two reads removes it — and that case must
+   * fail, not be excused: an entry the anchor names but the listing lacks leaves
+   * `highestChainedSeq < anchor.highest_sequence`, which is reported as
+   * `tail_anchor_invalid` below and fails the load closed.
+   *
+   * So the early sample removes only the FALSE verdict. Sampling AFTER the
+   * listing instead admits an append that landed mid-pass, raising a floor the
+   * already-taken listing could not have reached, and turns a live, healthy
+   * writer into that same tamper verdict.
+   */
   private async verifyHeadAnchor(
+    anchor: HeadAnchorReadResult,
     highestChainedSeq: number,
     highestChainedHash: string,
     hasLegacyEntries: boolean,
     hasChainedEntries: boolean,
     findings: AuditIntegrityFinding[],
-    boundaryIsValid = false,
     sealedTipSequence = 0
   ): Promise<void> {
-    const anchor = await this.loadHeadAnchor(findings, boundaryIsValid);
     if (anchor.status === "valid") {
       if (highestChainedSeq < anchor.highest_sequence) {
         findings.push({
@@ -3125,7 +3291,7 @@ export class AuditLog {
   private async postSplitSuffixWasEstablished(): Promise<boolean> {
     try {
       const raw = await this.storage.read(
-        "_meta",
+        AUDIT_META_NAMESPACE,
         AUDIT_POST_SPLIT_SUFFIX_ESTABLISHED_KEY
       );
       return raw !== null;
@@ -3140,7 +3306,7 @@ export class AuditLog {
     if (hasAuditEntries) return true;
     if (
       await this.storage
-        .exists("_meta", AUDIT_HEAD_ANCHOR_ESTABLISHED_KEY)
+        .exists(AUDIT_META_NAMESPACE, AUDIT_HEAD_ANCHOR_ESTABLISHED_KEY)
         .catch(() => false)
     ) {
       return true;
@@ -3767,6 +3933,21 @@ export class AuditLog {
     }
   }
 
+  private async reverifyCachedIntegrityFindingsBeforeAppend(): Promise<void> {
+    if (
+      this.integrityMode !== "strict" ||
+      !this.loaded ||
+      this.integrityFindings.length === 0
+    ) {
+      return;
+    }
+    // C7: this instance already failed closed once. Before refusing the next
+    // append with that cached verdict, take one fresh look WITHOUT holding the
+    // append write lock. If the store is still dirty, strict reload throws here;
+    // if a transient healed, the normal locked append path can proceed.
+    await this.reloadPersistedEntries();
+  }
+
   private async ensureLoaded(options?: { allowIntegrityFindings?: boolean }): Promise<void> {
     if (!this.loaded) {
       await this.loadPersistedEntriesWithReadConsistency();
@@ -3820,9 +4001,6 @@ export class AuditLog {
       if (this.integrityFindings.length === 0) {
         return; // clean read
       }
-      if (Date.now() >= deadline) {
-        return; // bounded backstop; surfaced in strict mode by the caller
-      }
       // Give-up discriminator (attacker safety) is STORE STABILITY, not the
       // finding kind. Retry only while the store is DEMONSTRABLY mid-mutation:
       // a writer marker is currently held, OR the entry listing changed since the
@@ -3836,7 +4014,7 @@ export class AuditLog {
       // pruned listing, entries pruned out from under a scan, a half-updated
       // checkpoint root) are tolerated WITHOUT ever classifying a genuine tamper
       // signal as "transient". The first attempt with findings always retries once
-      // to establish the listing baseline. The wall-clock deadline above bounds an
+      // to establish the listing baseline. The wall-clock deadline below bounds an
       // attacker who keeps the store permanently churning.
       const signature = await this.auditEntryListingSignature();
       const hadBaseline = lastSignature !== null;
@@ -3846,6 +4024,64 @@ export class AuditLog {
         listingChanged || (await this.isAuditWriterInProgress());
       if (hadBaseline && !storeIsMutating) {
         return; // static store with findings → fail closed (no masking)
+      }
+      // The deadline is checked only AFTER a baseline exists, so the one
+      // mandatory retry above is real work rather than a claim. Checking it
+      // first (the pre-2026-08-05 order) silently deleted that retry on any
+      // store where a SINGLE pass outlives the whole budget, which is the
+      // normal case at scale: one full decrypt+verify pass costs 11-30s
+      // on a 10k-entry chain (see the #714 note on the eager-read backstop) and
+      // the budget is 2s. Every transient tear on a large log therefore became
+      // a hard tamper verdict on the first look, with no second look at all.
+      //
+      // LATENCY NOTE (availability, not tamper weakening). In the case this
+      // change is about — one pass outliving the 2s budget — making the retry
+      // mandatory costs exactly ONE extra full pass: the second pass
+      // establishes the baseline with the deadline already blown, so this
+      // check ends the loop. (Further passes remain possible in general, but
+      // only while the store is demonstrably mutating AND the whole loop is
+      // still inside the budget, i.e. only when passes are cheap.)
+      //
+      // FORMERLY a KNOWN LATENCY EXPOSURE (accepted 2026-08-05, unmitigated
+      // on purpose): `persistChainedEntry` used to call `ensureLoaded()`
+      // INSIDE `withAuditWriteLock`, so on an appending process's FIRST load
+      // that extra pass was paid while the cross-process write lock was
+      // held. RESOLVED for C9 (register): `persistChainedEntry` now calls
+      // `ensureLoaded()` BEFORE requesting the write lock, so this retry loop
+      // (unchanged below) runs lock-free on the first load; the call inside
+      // the lock is a cheap already-loaded no-op, and the lock instead gets a
+      // narrow incremental re-check of just the tail (`freshenChainStateFromDisk`,
+      // O(1) backward walk) for the write that may have landed in the gap
+      // between the outside-lock load and the actual lock acquisition. This
+      // narrows the LOCK-HOLD window; it does not shrink or skip a single
+      // pass of the retry loop itself, so the read-consistency guarantee
+      // (store-stability discrimination, the same 2s deadline, the same
+      // fail-closed-on-a-static-store-with-findings behavior) is unchanged.
+      //
+      // The size of the extra pass this retry can still cost, measured rather
+      // than assumed. A cold full pass is LINEAR in entry count, not
+      // quadratic: timed on this branch (macOS, ~250-byte entries) at
+      // 250/500/1000/2000 entries the pass took 28/50/95/193ms, a flat
+      // ~0.1ms per entry. The per-entry constant, though, tracks PAYLOAD
+      // size, so it is not one number: the #714 profile (10k entries at
+      // ~40MB, so ~4KB each) measured 11-30s per pass, i.e. ~1.1-3ms per
+      // entry, ~10-30x the small-entry constant above. At the ~166k entries
+      // the register-C6 production host carries, the extra pass is therefore
+      // ~16s of decrypt+verify with small entries and ~180-500s with
+      // #714-sized ones. Before the C9 fix, the upper half of that range blew
+      // `DEFAULT_AUDIT_WRITE_LOCK_HOLD_DEADLINE_MS` (30s) while the lock was
+      // held, aborting the hold via `signal` and running lock recovery, while
+      // concurrent appenders waiting to acquire gave up after
+      // `AUDIT_WRITE_LOCK_TIMEOUT_MS` (5s) with `AuditLockContentionError`.
+      // With the retry now running before lock acquisition, that same pass
+      // still costs the appending process the same wall-clock time, but no
+      // longer holds the lock (or blocks other appenders behind it) while it
+      // runs; a caller that never reaches a stable store still fails the
+      // append (strict-mode `AuditIntegrityError`, thrown before the lock is
+      // ever requested), which is the correct outcome for a store that is
+      // genuinely never becoming readable.
+      if (hadBaseline && Date.now() >= deadline) {
+        return; // bounded backstop; surfaced in strict mode by the caller
       }
       await sleep(AUDIT_READ_CONSISTENCY_RETRY_MS);
     }
@@ -4016,31 +4252,44 @@ export class AuditLog {
     const signal: AuditWriteLockAbortSignal = { aborted: false };
     if (!this.auditWriteLockPath) return operation(signal);
 
-    const auditNamespaceDir =
-      this.filesystemCapabilities!.namespacePath(AUDIT_NAMESPACE);
-    const firstCreated = await mkdir(auditNamespaceDir, {
-      recursive: true,
-      mode: 0o700,
-    });
-    if (this.createOwner !== undefined) {
-      if (firstCreated !== undefined) {
-        /**
-         * Fortress-ownership spec 2026-07-30: recursive mkdir as root creates
-         * the missing namespace chain root-owned 0700; files inside are
-         * operator-owned but the operator cannot traverse the directories.
-         */
-        await this.createOwnerChownDirChain(
-          firstCreated,
-          auditNamespaceDir,
-          this.createOwner,
-        );
-      } else {
-        // PR #1084 gate F2: retry must not launder a failed handback. See
-        // {@link verifyOrRepairNamespaceDirOwnership}.
-        await this.verifyOrRepairNamespaceDirOwnership(
-          auditNamespaceDir,
-          this.createOwner,
-        );
+    // A single append writes one chained entry, its durable head anchor, and
+    // the durable "anchor established" marker. Owner-mode FilesystemStorage
+    // deliberately refuses to create a missing parent as root, so ALL three
+    // namespace directories must exist (and be handed back to the fortress
+    // owner) before the append starts. Initializing only `_audit` made the
+    // first safe-mode boot append fail successively on `_audit_checkpoints`
+    // and `_meta` in a genuinely fresh fortress.
+    for (const namespace of [
+      AUDIT_NAMESPACE,
+      AUDIT_CHECKPOINT_NAMESPACE,
+      AUDIT_META_NAMESPACE,
+    ]) {
+      const namespaceDir =
+        this.filesystemCapabilities!.namespacePath(namespace);
+      const firstCreated = await mkdir(namespaceDir, {
+        recursive: true,
+        mode: 0o700,
+      });
+      if (this.createOwner !== undefined) {
+        if (firstCreated !== undefined) {
+          /**
+           * Fortress-ownership spec 2026-07-30: recursive mkdir as root creates
+           * the missing namespace chain root-owned 0700; files inside are
+           * operator-owned but the operator cannot traverse the directories.
+           */
+          await this.createOwnerChownDirChain(
+            firstCreated,
+            namespaceDir,
+            this.createOwner,
+          );
+        } else {
+          // PR #1084 gate F2: retry must not launder a failed handback. See
+          // {@link verifyOrRepairNamespaceDirOwnership}.
+          await this.verifyOrRepairNamespaceDirOwnership(
+            namespaceDir,
+            this.createOwner,
+          );
+        }
       }
     }
     // Once-per-process: GC any `.acquire.*.tmp` a prior process's crash/kill-9
@@ -4842,6 +5091,26 @@ export class AuditLog {
       // F2 Finding 1: remember the trusted sealed tip so the append path can
       // classify a post-split suffix entry without re-reading the boundary.
       this.cachedSealedTip = effectiveSealedTip;
+      // ORDERING INVARIANT (must match the entry-then-anchor write order in
+      // `persistChainedEntry`): sample the MAC'd head anchor BEFORE listing the
+      // entries. The property this buys is narrow, so claim it precisely: a
+      // LEGITIMATE append writes its entry file first and its anchor second, so
+      // an anchor read here can only name an entry that was already on disk. It
+      // does NOT promise the listing taken below still contains that entry — a
+      // delete or rollback landing between the two reads removes it — and that
+      // must fail closed, which it does: `verifyHeadAnchor` then sees
+      // `highestChainedSeq < anchor.highest_sequence` and raises
+      // `tail_anchor_invalid`.
+      // What the early sample removes is only the FALSE verdict: reading the
+      // anchor after the listing (the pre-2026-08-05 order) let an append that
+      // landed mid-pass raise a floor the just-taken listing could not reach,
+      // reporting a healthy concurrent writer as tail truncation. Sampling
+      // EARLIER never weakens the guard, because an append after the sample only
+      // makes the anchor a lower floor, and an older floor is still a floor.
+      const headAnchor = await this.loadHeadAnchor(
+        findings,
+        splitBoundary.status === "valid"
+      );
       const storedEntriesRaw = await this.storage.list(AUDIT_NAMESPACE);
       // BLOCKER-1: with a valid boundary, prove from the LISTING that the sealed
       // region is complete (gap-free run ending at the tip). This catches
@@ -5076,12 +5345,12 @@ export class AuditLog {
           ? splitBoundary.boundary.sealed_tip_entry_hash
           : legacyAnchorHash);
       await this.verifyHeadAnchor(
+        headAnchor,
         highestChainedSeq,
         highestChainedHash,
         legacyRawEntries.length > 0,
         chainedEntries.length > 0,
         findings,
-        splitBoundary.status === "valid",
         effectiveSealedTip
       );
       this.nextSequence = highestChainedSeq + 1;
@@ -5153,7 +5422,7 @@ export class AuditLog {
     }
 
     const anchor = existing.at(-1)!;
-    this.verifyCheckpointRecordSignature(anchor, findings);
+    await this.verifyCheckpointRecordSignature(anchor, findings);
     if (
       anchor.checkpoint_sequence !== legacyCount ||
       anchor.root_hash !== legacyAnchorHash
@@ -5296,6 +5565,9 @@ export class AuditLog {
           hashes.push(entry.entry_hash);
         }
 
+        // Checkpoint root invariant: the persisted root is recomputed from the
+        // verified entry hashes on load, so a checkpoint cannot bless a changed
+        // span by carrying its own root_hash.
         const expectedRoot = computeAuditRoot(hashes);
         if (checkpoint.root_hash !== expectedRoot) {
           findings.push({
@@ -5308,16 +5580,16 @@ export class AuditLog {
         }
       }
 
-      this.verifyCheckpointRecordSignature(checkpoint, findings);
+      await this.verifyCheckpointRecordSignature(checkpoint, findings);
     }
 
     this.lastCheckpointSequence = highestCheckpoint;
   }
 
-  private verifyCheckpointRecordSignature(
+  private async verifyCheckpointRecordSignature(
     checkpoint: AuditCheckpointRecord,
     findings: AuditIntegrityFinding[]
-  ): void {
+  ): Promise<void> {
     if (checkpoint.unsigned) return;
     if (!checkpoint.signer_kid || !checkpoint.signature) {
       findings.push({
@@ -5328,22 +5600,55 @@ export class AuditLog {
       return;
     }
 
-    const publicKey =
-      this.checkpointPublicKeyResolver?.(checkpoint.signer_kid) ??
-      checkpoint.public_key;
-    if (!publicKey) {
-      findings.push({
-        kind: "checkpoint_signature_unverifiable",
-        sequence: checkpoint.checkpoint_sequence,
-        message: `checkpoint signer ${checkpoint.signer_kid} has no known public key`,
-      });
-      return;
+    let resolution: AuditCheckpointKeyResolution;
+    try {
+      resolution = await this.checkpointPublicKeyResolver(checkpoint.signer_kid);
+    } catch {
+      // A resolver failure reads as "signer unknown" and surfaces as a
+      // finding below; it must never read as verified, and must never crash
+      // the load pass that the rest of the chain verification rides on.
+      resolution = undefined;
+    }
+    const resolvedPublicKeys = (
+      Array.isArray(resolution) ? resolution : [resolution]
+    ).filter((key): key is string | Uint8Array => key !== undefined);
+    // Checkpoint trust-basis invariant: an embedded public key is part of the
+    // checkpoint being verified, so it is attacker-controlled unless the caller
+    // explicitly asks for an internal-consistency check instead of signer trust.
+    // When the resolver DID return authenticated keys, they are authoritative
+    // for this signer_kid: a signature that fails against them is a mismatch,
+    // never a reason to retry against the embedded copy.
+    if (resolvedPublicKeys.length === 0) {
+      const embeddedPublicKey = this.trustEmbeddedCheckpointPublicKeys
+        ? checkpoint.public_key
+        : undefined;
+      if (!embeddedPublicKey) {
+        if (checkpoint.public_key) {
+          findings.push({
+            kind: "checkpoint_signature_embedded_key_untrusted",
+            sequence: checkpoint.checkpoint_sequence,
+            message:
+              `checkpoint signer ${checkpoint.signer_kid} has only an embedded public key; ` +
+              "configure checkpointPublicKeyResolver with an authenticated key, or explicitly opt in to embedded-key self-checks",
+          });
+          return;
+        }
+        findings.push({
+          kind: "checkpoint_signature_unverifiable",
+          sequence: checkpoint.checkpoint_sequence,
+          message: `checkpoint signer ${checkpoint.signer_kid} has no known public key`,
+        });
+        return;
+      }
+      resolvedPublicKeys.push(embeddedPublicKey);
     }
 
-    const valid = verifyCheckpointSignature(
-      checkpointPayload(checkpoint),
-      checkpoint.signature,
-      publicKey
+    const valid = resolvedPublicKeys.some((publicKey) =>
+      verifyCheckpointSignature(
+        checkpointPayload(checkpoint),
+        checkpoint.signature!,
+        publicKey
+      )
     );
     if (!valid) {
       findings.push({
@@ -5485,6 +5790,9 @@ export class AuditLog {
           checkpoint_kind: "audit-checkpoint",
           checkpoint_sequence: checkpointSequence,
           from_sequence: fromSequence,
+          // Checkpoint write invariant: the root is derived from persisted entry
+          // hashes collected while the write lock is held, not from mutable
+          // in-memory payloads or caller-provided checkpoint material.
           root_hash: computeAuditRoot(hashes),
           previous_checkpoint_sequence: previousCheckpointSequence,
           signed_at: new Date().toISOString(),
@@ -5579,11 +5887,31 @@ export class AuditLog {
   ): Promise<void> {
     let signed: AuditCheckpointSignature | null;
     try {
-      signed = (await this.checkpointSigner?.(payload)) ?? null;
-    } catch {
+      signed = (await this.checkpointSigner(payload)) ?? null;
+    } catch (err) {
+      // A signer that THROWS is a failure (unreadable identity material, a
+      // failed signing op), not an identity-less fortress; say so on stderr
+      // so an operator can tell the two apart. This is a diagnostic only:
+      // the persisted record carries no failure claim, because any at-rest
+      // field here is attacker-writable and a "finding" an attacker can
+      // rewrite into the honest-absence shape would be a false assurance.
+      // Authenticated downgrade/failure EVIDENCE is deliberately deferred to
+      // a design-first follow-up (register id IC-05-DG).
+      // SAFETY: raw stderr is the contract here: this diagnostic must reach
+      // the operator console even when the audit log itself is the failing
+      // component, so it cannot route through any audit-backed logger.
+      console.error(
+        `[audit-log] checkpoint ${payload.checkpoint_sequence} written UNSIGNED because the signer FAILED (not identity absence): ${failureMessage(err)}`
+      );
       signed = null;
     }
 
+    // Production checkpoints are signed by the constructor-derived fortress
+    // identity binding (IC-05); a checkpoint may still be unsigned when the
+    // store holds no signable identity (fresh fortress before bootstrap, a
+    // store whose adapter cannot reach identity records). That honest bound
+    // is serialized as `unsigned` instead of fabricating signer evidence or
+    // silently trusting a fallback key.
     const record: AuditCheckpointRecord = {
       schema_version: AUDIT_CHECKPOINT_SCHEMA_VERSION,
       ...payload,

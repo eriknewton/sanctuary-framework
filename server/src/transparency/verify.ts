@@ -13,11 +13,15 @@
  *      checkpoint breaks the hash chain)
  *   5. Cross-record consistency (fortress_id, signing key)
  *
- * STANDALONE PROPERTY (mirrors cli/audit-chain-verify.ts): this module
- * imports only @noble/curves, @noble/hashes, and Node builtins. It does NOT
- * import any Sanctuary server module, so a third party can compile and run
- * it (or the published CLI) against a bundle with no fortress, no storage,
- * and no passphrase.
+ * STANDALONE PROPERTY: this module imports only @noble/curves, @noble/hashes,
+ * and Node builtins. It imports no Sanctuary module at all, so a third party
+ * can compile and run it (or the published CLI) against a bundle with no
+ * fortress, no storage, and no passphrase. Verified 2026-08-05: the import
+ * list below is exactly two noble packages.
+ *
+ * `cli/audit-chain-verify.ts` serves the same purpose for audit chains but is
+ * NOT literally import-free; read its header rather than assuming the two
+ * files hold an identical property.
  *
  * HONESTY DISCIPLINE: the report never says "best effort passed". Verdicts
  * are PASS or FAIL; everything the verifier could NOT check is listed under
@@ -68,12 +72,35 @@ function sha256Hex(input: string): string {
 }
 
 // ---- Format constants (duplicated from checkpoint.ts for standalone use) ---
-
+//
+// Each of these four must match the same-named export in
+// `server/src/transparency/checkpoint.ts` (there
+// `TRANSPARENCY_CHECKPOINT_DOMAIN_PREFIX` is spelled
+// `${TRANSPARENCY_CHECKPOINT_DOMAIN}\n`; the trailing newline is part of the
+// value). They are re-typed rather than imported for a concrete reason, not a
+// stylistic one: `checkpoint.ts` imports `core/encoding.ts` and
+// `core/identity.ts`, and identity pulls `core/encryption.ts` and the rest of
+// the crypto runtime, so importing the constants would put a fortress-shaped
+// dependency graph behind an offline verifier. Unlike the audit chain, whose
+// constants were moved to the zero-import `audit/checkpoint-shape.ts` in
+// 2026-08-05, the transparency module has no zero-import home to move them to;
+// creating one is a real option and is recorded as a follow-up rather than
+// asserted as impossible.
+//
+// Failure mode of a drifted copy: the verifier reports a signature or schema
+// FAILURE on a bundle the fortress considers valid, which an auditor reads as
+// tampering, not as a stale mirror.
+// Enforced by `server/test/structure/cross-file-contract-pins.test.ts`.
 const TRANSPARENCY_CHECKPOINT_SCHEMA_VERSION = 1;
 const TRANSPARENCY_CHECKPOINT_DOMAIN_PREFIX =
   "sanctuary.enforcement-checkpoint.v1\n";
 const TRANSPARENCY_CHECKPOINT_GENESIS = "GENESIS";
 const TRANSPARENCY_BUNDLE_FORMAT = "SANCTUARY_TRANSPARENCY_BUNDLE_V1";
+// Lowercase 64-char SHA-256 hex. NOT a cross-file contract: every module that
+// validates a hash digest declares its own copy of this shape (10 files, 14
+// occurrences in server/src as of 2026-08-05), and they are independent local
+// validators rather than mirrors of one canonical declaration. Deliberately
+// not hoisted; the same note is on the counterpart in `checkpoint.ts`.
 const HEX64 = /^[0-9a-f]{64}$/;
 
 /** Checkpoint record shape (structural mirror of checkpoint.ts). */
@@ -294,6 +321,15 @@ function verifyRecordSignature(
 ): boolean {
   try {
     const key = fromBase64url(publicKeyB64);
+    // 32 = RFC 8032 Ed25519 public key; 64 = RFC 8032 Ed25519 signature (R||S).
+    // Stated as literals on purpose: this file's STANDALONE PROPERTY (header)
+    // forbids importing any Sanctuary server module, so it cannot reference
+    // `ED25519_PUBLIC_KEY_BYTES` / `ED25519_SIGNATURE_BYTES` in
+    // `core/crypto-suite-registry.ts`. The property is this file plus
+    // `anchor-verify.ts` and `offline-cli.ts` ONLY; the rest of `transparency/`
+    // (`against-log.ts`, `checkpoint.ts`, `emitter.ts`, `signer.ts`) imports
+    // server modules freely. The values must match those constants;
+    // `test/structure/key-length-constants.test.ts` asserts that they do.
     if (key.length !== 32) return false;
     const sig = fromBase64url(record.signature);
     if (sig.length !== 64) return false;

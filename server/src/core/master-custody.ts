@@ -500,10 +500,15 @@ function custodyAad(type: CustodyWrapType, id: string): Uint8Array {
 }
 
 function newWrapId(): string {
+  // 16 = 128 random bits, taken from the 32-byte CSPRNG draw. A wrap id is an
+  // opaque collision-resistant label, not key material, so 128 bits of entropy
+  // is the whole requirement; the remaining 16 bytes are discarded.
   return toBase64url(generateRandomKey().subarray(0, 16));
 }
 
 function recoveryWrapKey(recoveryKeyBytes: Uint8Array): Uint8Array {
+  // 32 = the 256-bit recovery key minted by `generateRandomKey()`. Symmetric
+  // key material; the Ed25519 constants do not apply here.
   if (recoveryKeyBytes.length !== 32) {
     throw new CustodyUnlockError(
       "Sanctuary: recovery key has incorrect length. Use the exact recovery key captured at creation."
@@ -519,6 +524,8 @@ function recoveryWrapKey(recoveryKeyBytes: Uint8Array): Uint8Array {
 }
 
 function keychainWrapKey(custodyKeyBytes: Uint8Array): Uint8Array {
+  // 32 = the 256-bit keychain custody key; same symmetric size as the recovery
+  // key above, and the same reason it is not an Ed25519 constant.
   if (custodyKeyBytes.length !== 32) {
     throw new CustodyUnlockError(
       "Sanctuary: keychain custody key has incorrect length."
@@ -534,6 +541,9 @@ function keychainWrapKey(custodyKeyBytes: Uint8Array): Uint8Array {
 }
 
 function assertMaster(master: Uint8Array): void {
+  // 32 = the 256-bit fortress master key; must match the check in
+  // `core/key-derivation.ts` (deriveNamespaceKey / derivePurposeKey), which
+  // consumes the same value.
   if (master.length !== 32) {
     throw new Error("Master key must be 32 bytes");
   }
@@ -1128,6 +1138,9 @@ function decodeRecoveryKey(recoveryKey: string): Uint8Array {
         "Use the exact recovery key captured at creation."
     );
   }
+  // 32 = the 256-bit recovery key. The decoded value reaches `recoveryWrapKey`
+  // above, and on the legacy virgin-init path it IS the master key, so this
+  // width must satisfy `assertMaster` too.
   if (bytes.length !== 32) {
     throw new CustodyUnlockError(
       "Sanctuary: SANCTUARY_RECOVERY_KEY has incorrect length. " +
@@ -1499,21 +1512,59 @@ export async function mintRecoveryWrap(
   envelope: CustodyEnvelope,
   masterKey: Uint8Array
 ): Promise<{ envelope: CustodyEnvelope; recoveryKey: string }> {
-  const recoveryKeyBytes = generateRandomKey();
-  const recoveryKey = toBase64url(recoveryKeyBytes);
-  const wrap = wrapMasterWithRecoveryKey(masterKey, recoveryKeyBytes, {
-    verified: false,
-  });
-  recoveryKeyBytes.fill(0);
+  const prepared = prepareRecoveryWrap(envelope, masterKey);
   const updated = await writeCustodyEnvelope(
     storage,
-    {
-      ...envelope,
-      wraps: [...envelope.wraps, wrap],
-    },
+    prepared.envelope,
     masterKey
   );
-  return { envelope: updated, recoveryKey };
+  return { envelope: updated, recoveryKey: prepared.recoveryKey };
+}
+
+/**
+ * Prepare a recovery wrap without persisting it. Agent-guided custody uses
+ * this to create the exclusive handoff file before committing the wrap, so a
+ * destination race cannot persist a recovery credential whose plaintext was
+ * never handed off.
+ */
+export function prepareRecoveryWrap(
+  envelope: CustodyEnvelope,
+  masterKey: Uint8Array
+): { envelope: CustodyEnvelope; recoveryKey: string } {
+  const recoveryKeyBytes = generateRandomKey();
+  const recoveryKey = toBase64url(recoveryKeyBytes);
+  try {
+    return prepareRecoveryWrapWithKey(envelope, masterKey, recoveryKey);
+  } finally {
+    recoveryKeyBytes.fill(0);
+  }
+}
+
+/**
+ * Prepare a recovery wrap from a previously staged key. The agent-guided
+ * crash-resume path calls this only after authenticating the staging receipt
+ * against the pre-wrap envelope and current master.
+ */
+export function prepareRecoveryWrapWithKey(
+  envelope: CustodyEnvelope,
+  masterKey: Uint8Array,
+  recoveryKey: string,
+): { envelope: CustodyEnvelope; recoveryKey: string } {
+  const recoveryKeyBytes = fromBase64url(recoveryKey);
+  try {
+    const wrap = wrapMasterWithRecoveryKey(masterKey, recoveryKeyBytes, {
+      verified: false,
+    });
+    return {
+      envelope: {
+        ...envelope,
+        wraps: [...envelope.wraps, wrap],
+      },
+      recoveryKey,
+    };
+  } finally {
+    recoveryKeyBytes.fill(0);
+  }
 }
 
 // ── Castle-pin custody diagnostic ───────────────────────────────────

@@ -52,5 +52,5 @@ export async function writeLockdownStatus(
 export function lockdownBanner(status: LockdownStatus): string {
   if (!status.active) return "";
   const since = status.activated_at ?? "unknown";
-  return `Fortress is LOCKED (since ${since}). Reads permitted; writes blocked.\n`;
+  return `Fortress lockdown active since ${since}. Confined agents' network access was revoked; local reads and writes are not blocked by this marker.\n`;
 }

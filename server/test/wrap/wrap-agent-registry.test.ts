@@ -249,16 +249,6 @@ describe("buildV11Bindings rehydrates from local-agents.json", () => {
     await rm(tmpFortress, { recursive: true, force: true });
   });
 
-  it("seeds an empty registry when no storagePath is passed (legacy behavior)", () => {
-    const auditLog = new AuditLog(new MemoryStorage(), randomBytes(32));
-    const { hubService } = buildV11Bindings({
-      identityId: "id-1",
-      fortressId: fortressIdFromStoragePath(tmpFortress),
-      auditLog,
-    });
-    expect(hubService.listAgents()).toEqual([]);
-  });
-
   it("seeds an empty registry when storagePath has no persisted file (first boot)", () => {
     const auditLog = new AuditLog(new MemoryStorage(), randomBytes(32));
     const { hubService } = buildV11Bindings({
@@ -454,7 +444,42 @@ describe("runWrap persists a LocalAgentRecord (Finding Z)", () => {
     expect(persisted[0]!.status).toBe("active");
     expect(persisted[0]!.capabilities.can_unwrap).toBe(true);
     expect(persisted[0]!.capabilities.can_pause).toBe(false);
+    expect(persisted[0]!.capabilities.can_lockdown).toBe(false);
+    expect(persisted[0]!.capabilities.can_lockdown).toBe(
+      persisted[0]!.protection_subject !== undefined,
+    );
     await expectRecordedWorkloadRegistration(persisted[0]!);
+  });
+
+  it("derives can_lockdown from the auto-provisioned confinement subject", async () => {
+    await installFixture(".hermes/cli-config.json", "hermes.json");
+    await runWrap(
+      options({ claudeCode: false, hermes: true, noDashboard: true }),
+      {
+        ...deps(),
+        runAutoProvisionForWrap: async () => ({
+          ran: true,
+          outcome: {
+            kind: "armed",
+            uid: 503 as never,
+            liveness: {
+              kind: "cos_liveness_unverified",
+              reason: "no_channel_configured",
+            },
+          },
+        }),
+      },
+    );
+
+    const [persisted] = readPersistedLocalAgents(storagePath());
+    expect(persisted).toBeDefined();
+    expect(persisted!.protection_subject).toBe(
+      `${fortressIdFromStoragePath(storagePath())}/uid-503`,
+    );
+    expect(persisted!.capabilities.can_lockdown).toBe(true);
+    expect(persisted!.capabilities.can_lockdown).toBe(
+      persisted!.protection_subject !== undefined,
+    );
   });
 
   it("no-dashboard wrap records the harness as a declared workload in the audit chain", async () => {

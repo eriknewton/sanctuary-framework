@@ -135,6 +135,14 @@ export interface HubApprovalPendingItem extends HubInboxItemHeader {
     bundle_dir?: string;
     manifest_hash?: string;
     artifact_count?: number;
+    outcome?: "engaged" | "partial" | "failed" | "no_agents";
+    locked_count?: number;
+    failed_count?: number;
+    reason_code?: string;
+    agent_uid?: number;
+    revoked_rule_ids?: string[];
+    residual_allow_count?: number;
+    reload_confirmed?: boolean;
   };
 }
 

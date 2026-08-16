@@ -471,6 +471,22 @@ describe("getProtectionSnapshot", () => {
       }));
       expect(snap.layers.l3.vc_count).toBe(0);
     });
+
+    it("does NOT count reconcile-tagged reputation_record re-emissions (LD6 fix-round-2 F4 / R2-1): one credential retried N times stays vc_count 1", async () => {
+      // The tagged entry is the in-lock guard-hit re-audit an identical-args
+      // retry appends (see the `reconcile` field docs in bridge/tools.ts /
+      // reputation-store.ts) -- one durable record, many tagged entries.
+      // Without the filter this counted 3.
+      const snap = await getProtectionSnapshot(baseSources({
+        identityManager: stubIdentityManager(stubIdentity()),
+        auditLog: stubAuditLog([
+          { timestamp: today.toISOString(), layer: "l4", operation: "reputation_record", identity_id: "id-1", result: "success", details: { attestation_id: "att-1" } },
+          { timestamp: today.toISOString(), layer: "l4", operation: "reputation_record", identity_id: "id-1", result: "success", details: { attestation_id: "att-1", reconcile: true } },
+          { timestamp: today.toISOString(), layer: "l4", operation: "reputation_record", identity_id: "id-1", result: "success", details: { attestation_id: "att-1", reconcile: true } },
+        ]),
+      }));
+      expect(snap.layers.l3.vc_count).toBe(1);
+    });
   });
 
   describe("countProofsToday filter", () => {

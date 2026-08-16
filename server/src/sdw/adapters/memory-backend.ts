@@ -74,6 +74,16 @@ export interface MemoryListOptions {
   readonly after?: string;
 }
 
+/** Outcome of a non-throwing write-gate dry run for one passage. */
+export type MemoryPassageScreen =
+  | { readonly ok: true }
+  | {
+      readonly ok: false;
+      /** SdwValidationError category, e.g. "classifier_reject". */
+      readonly category: string;
+      readonly message: string;
+    };
+
 /**
  * The storage operations a memory engine needs from a sovereign backend.
  *
@@ -82,6 +92,9 @@ export interface MemoryListOptions {
  * deletable, zero network calls, fail closed on any integrity failure.
  */
 export interface MemoryBackendAdapter {
+  /** The engine instance / archive scope every passage here belongs to. */
+  readonly ownerRef: string;
+
   /**
    * Persist a passage. The caller asserts the persistable taint of the text
    * (typically "user_content" for conversation-derived passages or
@@ -89,6 +102,66 @@ export interface MemoryBackendAdapter {
    * classifier hits are rejected by the SDW write gate before encryption.
    */
   insertPassage(input: MemoryPassageInput, taint: PersistableTaint): Promise<MemoryPassage>;
+
+  /**
+   * Insert-or-replace a whole SET of passages as one verified unit.
+   *
+   * Every input MUST carry an explicit passage_id: replace semantics need a
+   * caller-stable id, and a generated one would make every run a fresh insert.
+   *
+   * A mirror that commits a prefix of its passages and then throws leaves a
+   * vault the operator cannot re-import (each committed id now collides) and
+   * cannot distinguish from a complete one. On success every input is durable.
+   * On non-transactional filesystem storage, replacement is owner-scope locked
+   * across processes because rollback verifies the raw owner-scope key listing.
+   * On a recoverable write failure, rollback is verified against that listing
+   * before the original error is surfaced. If rollback cannot be verified, the
+   * implementation MUST fail with a partial_scope category so the caller and
+   * audit trail do not report the run as a clean all-or-nothing failure.
+   */
+  putPassages(
+    inputs: readonly MemoryPassageInput[],
+    taint: PersistableTaint,
+  ): Promise<readonly MemoryPassage[]>;
+
+  /**
+   * Atomically create a whole SET only when every explicit passage id is
+   * absent. Returns null without writing when any target already exists.
+   *
+   * Security-sensitive callers use this instead of a separate absence check
+   * followed by putPassages: that check/write split permits two concurrent
+   * writers to both observe absence and then replace one another's signed
+   * records. Implementations MUST linearize the absence decision with the
+   * batch commit under the same transaction or owner-scope lock.
+   */
+  putPassagesIfAbsent(
+    inputs: readonly MemoryPassageInput[],
+    taint: PersistableTaint,
+  ): Promise<readonly MemoryPassage[] | null>;
+
+  /**
+   * Dry-run the write gate for one passage: the SAME validation, grammar, and
+   * secret classification the real write performs, with nothing persisted.
+   *
+   * A batch caller uses this to decide per input whether to include it, so one
+   * rejected input does not abort a whole mirror. It NEVER relaxes the gate:
+   * putPassages re-runs the real gate on everything it writes.
+   */
+  screenPassage(input: MemoryPassageInput, taint: PersistableTaint): MemoryPassageScreen;
+
+  /**
+   * Derive a stable passage id from a caller label, keyed to this fortress and
+   * owner scope.
+   *
+   * Passage ids appear in storage keys, and a filesystem backend turns a
+   * storage key into a directory entry name. A caller whose natural label is
+   * private (a memory-file topic name, a document title) must therefore NOT
+   * use it as the id: the encrypted body would be safe while the topic index
+   * was published in cleartext. This returns an opaque keyed digest instead,
+   * so the label survives only inside the encrypted record metadata, while
+   * re-deriving from the same label still lands on the same passage.
+   */
+  derivePassageId(domain: string, label: string): string;
 
   /** Fetch one passage by id, or null if absent. Fails closed on integrity errors. */
   getPassage(passageId: string): Promise<MemoryPassage | null>;

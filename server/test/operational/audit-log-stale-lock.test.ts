@@ -1,9 +1,10 @@
 // fail-before-exempt: pins pre-existing #944/#1056 lock-recovery + lock-createOwner
-// semantics that are already on main; this PR's only edit is a test-helper stub
-// (makeLog's namespaceDirLstat) decoupling the #1056 createOwner tests from the
-// host uid after PR #1084's F2 deep-walk added a directory precondition. No test
-// here should go red-against-main; the deep-walk itself is covered by
-// audit-log-namespace-dir-owner.test.ts (which is not exempt).
+// semantics that are already on main; this PR only extends makeLog's ownership
+// test seams, decoupling the #1056 createOwner tests from the host uid after PR
+// #1084's F2 deep-walk and this PR's three-namespace initialization. No test
+// here should go red-against-main; the deep-walk and namespace-chain handback
+// themselves are covered by audit-log-namespace-dir-owner.test.ts (which is
+// not exempt).
 import { mkdtemp, rm, writeFile, readFile, rename, mkdir, stat, utimes, readdir } from "node:fs/promises";
 import { tmpdir, uptime as osUptime } from "node:os";
 import type { Stats } from "node:fs";
@@ -370,9 +371,10 @@ describe("AuditLog write-lock robustness (#944 cluster)", () => {
     // assert the LOCK-FILE chown is applied. PR #1084's F2 deep-walk added a
     // real-lstat directory-ownership precondition that would refuse whenever the
     // host uid differs from the synthetic owner (passes on a 501/20 macOS box,
-    // fails on a Linux CI runner). Present the namespace dir as owner-matched so
-    // these lock-file tests stay decoupled from the host uid; the directory-walk
-    // behavior itself is covered by audit-log-namespace-dir-owner.test.ts.
+    // fails on a Linux CI runner). Present namespace dirs as owner-matched and
+    // stub their create-time handback so these lock-file tests stay decoupled
+    // from the host uid; both directory paths are covered by the dedicated
+    // audit-log-namespace-dir-owner.test.ts suite.
     const createOwner = (config as { createOwner?: { uid: number; gid: number } } | undefined)
       ?.createOwner;
     const log = new AuditLog(new FilesystemStorage(storagePath), generateRandomKey(), {
@@ -385,6 +387,7 @@ describe("AuditLog write-lock robustness (#944 cluster)", () => {
               isSymbolicLink: () => false,
               isDirectory: () => true,
             }),
+            createOwnerChownDirChain: async () => undefined,
           }
         : {}),
       ...config,

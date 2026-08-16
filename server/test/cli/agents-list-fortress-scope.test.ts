@@ -166,4 +166,46 @@ describe("sanctuary agents list --fortress", () => {
     expect(code).toBe(0);
     expect(out.text).toContain("--fortress");
   });
+
+  it("with --fortress=<path>, lists only the scoped tenant", async () => {
+    const out = new StringWritable();
+    const err = new StringWritable();
+    const code = await runAgentsCommand({
+      argv: ["list", `--fortress=${isolatedRoot}`, "--json"],
+      out,
+      err,
+      home,
+      probe: offlineProbe,
+    });
+    expect(code).toBe(0);
+    const rows = JSON.parse(out.text) as Array<{ name: string }>;
+    const names = rows.map((r) => r.name);
+    expect(names).toContain("isolated-tenant");
+    expect(names).not.toContain("tenant-a");
+    expect(names).not.toContain("tenant-b");
+  });
+
+  it("rejects empty and unknown fortress flags loudly", async () => {
+    const emptyErr = new StringWritable();
+    const emptyCode = await runAgentsCommand({
+      argv: ["list", "--fortress="],
+      out: new StringWritable(),
+      err: emptyErr,
+      home,
+      probe: offlineProbe,
+    });
+    expect(emptyCode).toBe(2);
+    expect(emptyErr.text).toContain("--fortress requires a value");
+
+    const unknownErr = new StringWritable();
+    const unknownCode = await runAgentsCommand({
+      argv: ["list", `--fortress-path=${isolatedRoot}`],
+      out: new StringWritable(),
+      err: unknownErr,
+      home,
+      probe: offlineProbe,
+    });
+    expect(unknownCode).toBe(2);
+    expect(unknownErr.text).toContain("unknown fortress flag --fortress-path");
+  });
 });

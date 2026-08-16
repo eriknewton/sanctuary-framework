@@ -1,3 +1,4 @@
+// fail-before-exempt: inherited supporting file-grant coverage still passes against pre-fix source; key-resolution fail-before coverage lives in state-envelope-integrity.test.ts and master-rotation.test.ts
 /**
  * Governed File-Grant source-inode ACL plus grant-tree read probe primitive.
  *
@@ -33,7 +34,7 @@ function baseParams() {
 
 describe("file-grant ACL/probe enforcement honesty", () => {
   it("returns met only when ACL application is applied and the same-operation probe confirms", async () => {
-    const { grantStore } = makeFileGrantTestStore();
+    const { grantStore } = await makeFileGrantTestStore();
     const fsOps = new FakeFsOps({
       agentUid: 502,
       sourceOwnerUid: 501,
@@ -62,7 +63,7 @@ describe("file-grant ACL/probe enforcement honesty", () => {
   });
 
   it("keeps a uid split unverified when source identity drifts before ACL apply", async () => {
-    const { grantStore } = makeFileGrantTestStore();
+    const { grantStore } = await makeFileGrantTestStore();
     const fsOps = new FakeFsOps({
       agentUid: 502,
       sourceOwnerUid: 501,
@@ -88,7 +89,7 @@ describe("file-grant ACL/probe enforcement honesty", () => {
   });
 
   it("keeps a uid split unverified when the probe reads a swapped inode", async () => {
-    const { grantStore } = makeFileGrantTestStore();
+    const { grantStore } = await makeFileGrantTestStore();
     const fsOps = new FakeFsOps({
       agentUid: 502,
       sourceOwnerUid: 501,
@@ -121,7 +122,7 @@ describe("file-grant ACL/probe enforcement honesty", () => {
   });
 
   it("keeps a uid split unverified when the ACL applies but the probe returns false", async () => {
-    const { grantStore } = makeFileGrantTestStore();
+    const { grantStore } = await makeFileGrantTestStore();
     const fsOps = new FakeFsOps({
       agentUid: 502,
       sourceOwnerUid: 501,
@@ -146,7 +147,7 @@ describe("file-grant ACL/probe enforcement honesty", () => {
   });
 
   it("keeps a uid split unverified when the probe throws", async () => {
-    const { grantStore } = makeFileGrantTestStore();
+    const { grantStore } = await makeFileGrantTestStore();
     const fsOps = new FakeFsOps({
       agentUid: 502,
       sourceOwnerUid: 501,
@@ -165,7 +166,7 @@ describe("file-grant ACL/probe enforcement honesty", () => {
   });
 
   it("keeps a uid split unverified when ACL application is not privileged", async () => {
-    const { grantStore } = makeFileGrantTestStore();
+    const { grantStore } = await makeFileGrantTestStore();
     const fsOps = new FakeFsOps({
       agentUid: 502,
       sourceOwnerUid: 501,
@@ -188,7 +189,7 @@ describe("file-grant ACL/probe enforcement honesty", () => {
   });
 
   it("keeps a uid split unverified on unsupported platforms", async () => {
-    const { grantStore } = makeFileGrantTestStore();
+    const { grantStore } = await makeFileGrantTestStore();
     const fsOps = new FakeFsOps({
       agentUid: 502,
       sourceOwnerUid: 501,
@@ -211,7 +212,7 @@ describe("file-grant ACL/probe enforcement honesty", () => {
   });
 
   it("keeps a same-owner grant unmet even if a probe would pass", async () => {
-    const { grantStore } = makeFileGrantTestStore();
+    const { grantStore } = await makeFileGrantTestStore();
     const fsOps = new FakeFsOps({
       agentUid: 502,
       sourceOwnerUid: 502,
@@ -231,7 +232,7 @@ describe("file-grant ACL/probe enforcement honesty", () => {
   });
 
   it("keeps a uid split unverified when an injected grant op throws", async () => {
-    const { grantStore } = makeFileGrantTestStore();
+    const { grantStore } = await makeFileGrantTestStore();
     const fsOps = new FakeFsOps({
       agentUid: 502,
       sourceOwnerUid: 501,

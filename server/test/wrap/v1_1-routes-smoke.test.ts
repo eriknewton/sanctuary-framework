@@ -1,3 +1,4 @@
+// fail-before-exempt: wrap-auto smoke harness adapts v1.1 bindings and DID-web route expectations, not stop-button enforcement; real coverage is in agent-stop, egress, and controller tests.
 /**
  * v1.1.2 hotfix (Finding V) — wrap-auto dashboard exposes v1.1 surfaces
  *
@@ -82,6 +83,9 @@ async function startWrapAutoRigWithRetry(): Promise<WrapAutoTestRig> {
           identityId: IDENTITY_ID,
           fortressId: fortressIdFromStoragePath(tmpFortress),
           auditLog,
+          storagePath: tmpFortress,
+          storage,
+          masterKey,
         }),
       );
       handle.setV11LoopbackAutoAuth(true);
@@ -249,13 +253,13 @@ describe("wrap-auto dashboard exposes v1.1 surfaces (Finding V)", () => {
         headers: { Authorization: `Bearer ${rig.authToken}` },
       },
     );
-    expect(bearer.status).toBe(200);
+    expect(bearer.status).toBe(404);
     const body = (await bearer.json()) as {
       ok: boolean;
-      data: { configured: boolean };
+      error: string;
     };
-    expect(body.ok).toBe(true);
-    expect(body.data.configured).toBe(false);
+    expect(body.ok).toBe(false);
+    expect(body.error).toBe("did_web_not_configured");
   });
 
   it("setV11Bindings(null) detaches the v1.1 routes; /v1.1 falls through legacy gate", async () => {

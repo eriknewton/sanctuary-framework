@@ -31,7 +31,7 @@ Deploy the agent. Sanctuary tools load automatically via MCP.
 
 ## Step 2: Verify Sanctuary Is Active
 
-Call `manifest` from your agent. You should see 68 Sanctuary tools listed.
+Call `manifest` from your agent. You should see 80+ Sanctuary tools listed.
 
 ## Step 3: Bind an Identity
 
@@ -63,7 +63,7 @@ Visit `https://verascore.ai/agent/{did}` to see the live profile.
 | Before Sanctuary | After Sanctuary |
 |-----------------|-----------------|
 | Implicit cloud identity | Explicit agent-owned Ed25519 keypair |
-| Default logging | Encrypted, tamper-proof audit trail |
+| Default logging | Encrypted, tamper-evident hash-chained audit trail; production audit checkpoints are currently unsigned until **IC-05** closes |
 | Platform-level policy (static) | Principal-level policy (dynamic, time-locked) |
 | All-or-nothing disclosure | Selective disclosure (ZK attestations) |
 | Opaque reputation | Verifiable Verascore profile |

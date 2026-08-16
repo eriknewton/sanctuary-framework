@@ -195,4 +195,25 @@ describe("Broker", () => {
     const audit = await auditLog.query({ operation_type: BROKER_OPS.BACKEND_UNLOCKED });
     expect(audit.entries).toHaveLength(1);
   });
+
+  it("getGrantsForCaller scopes the inventory; getGrants stays the full operator view (BROKER-GRANT-INVENTORY-CROSS-CALLER)", async () => {
+    const { broker } = await makeBroker();
+    broker.grant({ skill: "gmail-triage", secret: "gmail_oauth", scope: "read" });
+    broker.grant({ skill: "slack-bot", secret: "slack_token", scope: "read" });
+
+    const callerClaims = {
+      skill: "gmail-triage",
+      agent: "nsa",
+      identity_id: "did:sanctuary:principal",
+      tenant_id: "tenant-alpha",
+      fortress_id: "fortress-alpha",
+      audience: "sanctuary-broker",
+    };
+    const scoped = broker.getGrantsForCaller(callerClaims);
+    expect(scoped).toHaveLength(1);
+    expect(scoped[0]!.skill).toBe("gmail-triage");
+
+    // The operator-only view still sees both principals' grants.
+    expect(broker.getGrants()).toHaveLength(2);
+  });
 });

@@ -99,6 +99,12 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (args[0] === "install") {
+    const { runInstallCommand } = await import("./cli/install.js");
+    const code = await runInstallCommand({ argv: args.slice(1) });
+    return drainAndExit(code);
+  }
+
   if (args[0] === "protect" || args[0] === "wrap") {
     // Phase S1 supervisor handoff (codex R3-H1): when launched BY the
     // split-process supervisor, the transient master key arrives on an
@@ -166,6 +172,12 @@ async function main(): Promise<void> {
       },
     });
     return;
+  }
+
+  if (args[0] === "uninstall") {
+    const { runUninstallCommand } = await import("./cli/uninstall.js");
+    const code = await runUninstallCommand({ argv: args.slice(1) });
+    process.exit(code);
   }
 
   if (args[0] === "init") {
@@ -310,6 +322,42 @@ async function main(): Promise<void> {
   if (args[0] === "checkpoint") {
     const { runCheckpointCommand } = await import("./cli/checkpoint.js");
     const code = await runCheckpointCommand({ argv: args.slice(1) });
+    return drainAndExit(code);
+  }
+
+  if (args[0] === "memory_ingest") {
+    const { runMemoryIngestCommand } = await import("./cli/memory-file.js");
+    const code = await runMemoryIngestCommand({ argv: args.slice(1) });
+    return drainAndExit(code);
+  }
+
+  if (args[0] === "memory_emit") {
+    const { runMemoryEmitCommand } = await import("./cli/memory-file.js");
+    const code = await runMemoryEmitCommand({ argv: args.slice(1) });
+    return drainAndExit(code);
+  }
+
+  if (args[0] === "memory_transcode") {
+    const { runMemoryTranscodeCommand } = await import("./cli/memory-file.js");
+    const code = await runMemoryTranscodeCommand({ argv: args.slice(1) });
+    return drainAndExit(code);
+  }
+
+  if (args[0] === "memory_transcode_restore") {
+    const { runMemoryTranscodeRestoreCommand } = await import("./cli/memory-file.js");
+    const code = await runMemoryTranscodeRestoreCommand({ argv: args.slice(1) });
+    return drainAndExit(code);
+  }
+
+  if (args[0] === "memory_archive_export") {
+    const { runMemoryArchiveExportCommand } = await import("./cli/memory-archive.js");
+    const code = await runMemoryArchiveExportCommand({ argv: args.slice(1) });
+    return drainAndExit(code);
+  }
+
+  if (args[0] === "memory_archive_import") {
+    const { runMemoryArchiveImportCommand } = await import("./cli/memory-archive.js");
+    const code = await runMemoryArchiveImportCommand({ argv: args.slice(1) });
     return drainAndExit(code);
   }
 
@@ -489,14 +537,21 @@ Examples:
         // SAFETY: stderr / stdout is the operator-facing CLI channel; no logger module in scope.
         console.error(`sanctuary audit-chain verify. Verify an exported Sanctuary audit chain.
 
-Usage: sanctuary audit-chain verify --input <path> [--public-key <key>] [--no-strict]
+Usage: sanctuary audit-chain verify --input <path> [--public-key <key>] [--trust-embedded] [--no-strict]
 
 Options:
   --input <path>         JSONL file to verify (required)
   --public-key <key>     Ed25519 public key for signature check (base64url)
-  --no-strict            Continue on verification failures
+  --trust-embedded       Verify checkpoint signatures against embedded keys.
+                         Proves internal consistency only, not signer identity.
+  --no-strict            Report FAIL findings and exit 10 after verification
   --storage-path <path>  Override state directory
   --help, -h             Show this help
+
+Exit codes:
+  0  verification passed
+  1  strict verification found one or more findings
+ 10  --no-strict verification completed with one or more findings
 
 Examples:
   sanctuary audit-chain verify --input chain.jsonl
@@ -506,8 +561,7 @@ Examples:
       }
       const { parseVerifyArgs, runVerify } = await import("./cli/audit-chain-verify.js");
       const opts = parseVerifyArgs(subArgs, process.env);
-      await runVerify(opts);
-      process.exit(0);
+      return drainAndExit(await runVerify(opts));
     } else {
       // SAFETY: stderr / stdout is the operator-facing CLI channel; no logger module in scope.
       console.error(`Usage: sanctuary audit-chain <export|verify> [options]
@@ -737,6 +791,8 @@ async function runStandaloneDashboard(args: string[]): Promise<void> {
     const { startMultiDashboardServer } = await import(
       "./dashboard/multi-server.js"
     );
+    const { loadConfig } = await import("./config.js");
+    const config = await loadConfig();
     const envPort = process.env.SANCTUARY_MULTI_DASHBOARD_PORT;
     const resolvedPort =
       port ?? (envPort ? parseInt(envPort, 10) : undefined);
@@ -749,6 +805,8 @@ async function runStandaloneDashboard(args: string[]): Promise<void> {
       ...(resolvedPort !== undefined ? { port: resolvedPort } : {}),
       ...(host !== undefined ? { host } : {}),
       ...(authToken !== undefined ? { authToken } : {}),
+      allowPlaintextRemote:
+        allowPlaintextRemote || config.dashboard.allow_plaintext_remote,
     });
     // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error(
@@ -868,12 +926,20 @@ Usage:
   sanctuary completion <bash|zsh|fish>    # Emit shell completion
   sanctuary audit search [opts]           # Search local audit log
   sanctuary checkpoint <cmd> [opts]       # Local encrypted memory checkpoints
+  sanctuary memory_ingest [opts]          # Mirror harness memory into SDW
+  sanctuary memory_emit [opts]            # Emit harness memory from SDW
+  sanctuary memory_archive_export [opts]  # Export one SDW archive through Exit V2
+  sanctuary memory_archive_import [opts]  # Import one SDW archive through Exit V2
+  sanctuary memory_transcode [opts]       # Project memory into another harness format
+  sanctuary memory_transcode_restore [opts] # Restore an exact transcode source archive
   sanctuary transparency <cmd> [opts]     # Signed enforcement checkpoints
   sanctuary verify-transparency [opts]    # Verify a checkpoint chain offline
   sanctuary generate systemd [opts]       # Emit systemd service unit
   sanctuary deploy operator-cloud plan    # Emit operator-cloud deploy skeleton
+  sanctuary install [opts]                # Resumable agent-guided install plan
   sanctuary protect [opts]                 # Protect an agent in one command
   sanctuary wrap [opts]                   # (alias for protect)
+  sanctuary uninstall [opts]              # Remove installed enforcement footprint; preserve operator data
   sanctuary export-passphrase             # Print stored passphrase
 
 Options:
@@ -891,11 +957,21 @@ Subcommands:
                        isolated on one host.
                        Use "sanctuary init --help" for options.
 
+  install              Emit one observed-state next action for a shell-capable
+                       installing agent. Supports memory and full profiles;
+                       never emits recovery secrets.
+                       Use "sanctuary install --help" for options.
+
   protect              Protect an agent and start the dashboard in one command.
                        Auto-generates a passphrase, auto-opens the browser.
                        Use "sanctuary protect --help" for options.
 
   wrap                 (alias for protect)
+
+  uninstall            Remove Sanctuary's installed enforcement footprint
+                       while preserving fortress state and keys. Reports
+                       residue that needs sudo, host app action, or reboot.
+                       Use "sanctuary uninstall --help" for options.
 
   dashboard            Start the dashboard as a standalone HTTP server.
                        Reads from the same storage as the MCP server.
@@ -923,6 +999,33 @@ Subcommands:
   checkpoint           Create, list, show, prune, and restore local encrypted
                        memory checkpoints. Use "sanctuary checkpoint --help"
                        for options.
+
+  memory_ingest        Manually mirror Claude Code or Codex memory files into the
+                       encrypted SDW vault without touching the source dir.
+                       Use "sanctuary memory_ingest --help" for options.
+
+  memory_archive_export
+                       Export one completed SDW archive through Exit V2 after
+                       Tier-1 approval; a local OS dialog confirms key custody.
+                       Use "sanctuary memory_archive_export --help" for options.
+
+  memory_archive_import
+                       Import one Exit V2 SDW archive after Tier-1 approval;
+                       a local OS dialog reads hidden recovery material.
+                       Use "sanctuary memory_archive_import --help" for options.
+
+  memory_emit          Manually emit Claude Code or Codex memory files from the SDW
+                       vault into an output dir. Existing files are refused.
+                       Use "sanctuary memory_emit --help" for options.
+
+  memory_transcode     Manually create a plaintext cross-harness projection plus
+                       an encrypted exact-source recovery archive. This is not sync.
+                       Use "sanctuary memory_transcode --help" for options.
+
+  memory_transcode_restore
+                       Restore exact source files from a completed encrypted
+                       transcode archive. This is not sync.
+                       Use "sanctuary memory_transcode_restore --help" for options.
 
   distress             Emit a distress signal through the reserved habeas
                        lane (operator test verb; same path the agent uses).
@@ -1088,6 +1191,11 @@ async function handleHelpEarly(args: string[]): Promise<boolean> {
     case "dashboard":
       printDashboardHelp();
       return true;
+    case "install": {
+      const { runInstallCommand } = await import("./cli/install.js");
+      await runInstallCommand({ argv: ["--help"] });
+      return true;
+    }
     case "protect":
     case "wrap":
       printWrapHelpEarly();
@@ -1143,6 +1251,11 @@ async function handleHelpEarly(args: string[]): Promise<boolean> {
     case "castle-wall":
       printCastleWallHelp();
       return true;
+    case "uninstall": {
+      const { runUninstallCommand } = await import("./cli/uninstall.js");
+      await runUninstallCommand({ argv: args.slice(1).concat("--help") });
+      return true;
+    }
     default:
       return false;
   }
@@ -1162,7 +1275,12 @@ async function runCastleWallCommand(args: string[]): Promise<number> {
 
   if (command === "status") {
     const { runStatus } = await import("./cli/castle-wall.js");
-    return runStatus();
+    // O-07 (register): the trailing args (e.g. `--fortress <path>`) were
+    // dropped here entirely -- unlike every other castle-wall verb below,
+    // which forwards `args.slice(1)` -- so `castle-wall status --fortress
+    // <path>` silently reported the DEFAULT fortress instead of the one
+    // named. See runStatus's own doc for the fix.
+    return runStatus(args.slice(1));
   }
 
   if (command === "enable") {
@@ -1432,7 +1550,7 @@ function printCastleWallHelp(): void {
                      Mint the software-protected boot token (root-owned 0600; run with sudo). Anti-brick
                      credential only, NOT the fortress passphrase. install-boot auto-provisions it; --rotate replaces.
     install-boot     Install the daemon as a launchd safe-mode boot service (run with sudo, macOS).
-                     Options: --user <name> --fortress <path> --binary <path> --signer-client <path>
+                     Options: --user <name> --fortress <path> --signer-client <path>
     uninstall-boot   Remove the launchd boot service (run with sudo, macOS; requires --yes). Does NOT disarm the filter.
     repair-custody   Hand a root-owned fortress back to the operator (run with sudo, macOS).
                      Observe-first: writes a timestamped manifest of every entry's uid/gid/mode

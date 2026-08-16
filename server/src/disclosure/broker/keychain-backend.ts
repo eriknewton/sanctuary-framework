@@ -18,12 +18,12 @@
  * on stdout, not in argv).
  */
 
-import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { DEFAULT_STORAGE_DIR } from "../../paths.js";
+import { execKeychain } from "../../wrap/keychain-exec.js";
 import {
   type Backend,
   BackendLockedError,
@@ -67,37 +67,28 @@ interface SpawnResult {
 /**
  * Execute the `security` binary. `input` is written to stdin if provided
  * (used for interactive unlock so the passphrase never appears in argv).
+ *
+ * Routed through the single credential-CLI chokepoint so tests can never reach
+ * the operator's real keychain. See `src/wrap/keychain-exec.ts`. This was the
+ * last module holding its own `spawn`; the chokepoint's completeness claim is
+ * only true while it stays routed.
  */
 async function runSecurity(args: string[], input?: string): Promise<SpawnResult> {
-  return new Promise((resolve, reject) => {
-    const child = spawn(SECURITY_BIN, args, { stdio: ["pipe", "pipe", "pipe"] });
-    let stdout = "";
-    let stderr = "";
-    child.stdout.on("data", (chunk: Buffer) => {
-      stdout += chunk.toString("utf8");
-    });
-    child.stderr.on("data", (chunk: Buffer) => {
-      stderr += chunk.toString("utf8");
-    });
-    child.on("error", (err: Error & { code?: string }) => {
-      if (err.code === "ENOENT") {
-        reject(
-          new BackendUnavailableError(
-            `/usr/bin/security not found — KeychainBackend requires macOS`
-          )
-        );
-        return;
-      }
-      reject(err);
-    });
-    child.on("close", (code: number | null) => {
-      resolve({ stdout, stderr, code: code ?? -1 });
-    });
-    if (input !== undefined) {
-      child.stdin.write(input);
+  let result;
+  try {
+    result = await execKeychain(SECURITY_BIN, args, input);
+  } catch (err) {
+    if ((err as Error & { code?: string }).code === "ENOENT") {
+      // \u2014 is the em dash this message has always rendered. Kept as an
+      // escape so the raw byte stays out of the source; the displayed string is
+      // unchanged, and it is a user-visible string (reorg-surface-manifest.md).
+      throw new BackendUnavailableError(
+        `${SECURITY_BIN} not found \u2014 KeychainBackend requires macOS`
+      );
     }
-    child.stdin.end();
-  });
+    throw err;
+  }
+  return { stdout: result.stdout, stderr: result.stderr, code: result.code ?? -1 };
 }
 
 export class KeychainBackend implements Backend {
@@ -189,6 +180,7 @@ export class KeychainBackend implements Backend {
 
   async addSecret(name: string, value: string): Promise<void> {
     this.assertUnlocked();
+    // Secret names are validated before any security(1) call, so names cannot inject args or poison dump parsing.
     validateSecretName(name);
     const account = brokerAccountForSecret(name, this.accountNamespace);
     // Check existence first to preserve explicit "rotate required" semantics.
@@ -221,6 +213,7 @@ export class KeychainBackend implements Backend {
 
   async readSecret(name: string): Promise<string> {
     this.assertUnlocked();
+    // The unlock flag and name grammar are checked before reading, so a token cannot address arbitrary keychain items.
     validateSecretName(name);
     const value = await this.findGeneric(name, { returnValue: true });
     if (value === null) {
@@ -305,6 +298,7 @@ export class KeychainBackend implements Backend {
 
   private assertUnlocked(): void {
     if (!this.unlocked) {
+      // A missing in-process unlock is a hard refusal; the backend never tries a silent login-keychain fallback.
       throw new BackendLockedError();
     }
   }
@@ -423,6 +417,7 @@ function validateSecretName(name: string): void {
     throw new Error("Secret name must be 1..256 characters");
   }
   if (!/^[A-Za-z0-9._\-:/]+$/.test(name)) {
+    // The allowlist is deliberately narrower than keychain account syntax to keep CLI args and dump parsing unambiguous.
     throw new Error(
       `Secret name contains invalid characters: ${JSON.stringify(name)} (allowed: letters, digits, .-_/:)`
     );

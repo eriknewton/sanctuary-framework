@@ -98,13 +98,17 @@ export class HubConflictError extends HubError {
 }
 
 /**
- * Hub service was asked to invoke a harness capability the harness does not
- * advertise (e.g., pause on a harness whose `LocalAgentRecord.capabilities`
- * has `can_pause: false`). 422.
+ * Hub service was asked to invoke a capability this Sanctuary build cannot
+ * execute for the agent (for example, process control without a process
+ * handle, or unwrap while the dashboard implementation is still bounded).
+ * 422.
  */
 export class HubCapabilityError extends HubError {
+  readonly reasonCode: string;
+
   constructor(action: string) {
-    super(`capability not supported by harness: ${action}`, 422);
+    super(`capability not supported: ${action}`, 422);
+    this.reasonCode = action;
     Object.defineProperty(this, "name", {
       value: "HubCapabilityError",
       enumerable: false,

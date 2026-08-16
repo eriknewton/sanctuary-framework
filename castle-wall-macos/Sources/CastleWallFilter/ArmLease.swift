@@ -1,7 +1,15 @@
 import Foundation
 
 public final class ArmLease {
+    // AR-1: a stale dead-man lease used to fail OPEN for every origin. It now
+    // fails OPEN only for the OPERATOR (the anti-lockout recovery path during a
+    // daemon-down window); an AGENT origin fails CLOSED under this rule id.
     public static let failOpenRuleId = "fail_open_deadman"
+    // AR-1: a non-operator flow denied because the dead-man lease is stale. The
+    // operator keeps failOpenRuleId (recovery); agents get this fail-closed id so
+    // audit distinguishes "agent denied during dead-man window" from the
+    // missing-lease and normal-allowlist denials.
+    public static let failClosedDeadManRuleId = "fail_closed_deadman_agent"
     public static let missingLeaseRuleId = "fail_closed_missing_arm_lease"
 
     private let lock = NSLock()

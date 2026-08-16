@@ -1,3 +1,4 @@
+// fail-before-exempt: adaptation-only in this PR — the changes are pure test-double plumbing (add listFindingMetadata to the stub store so the suite runs against source that now calls the decrypt-bounded metadata listing instead of listFindings, extract a shared filtered() helper). No assertion changed (zero expect/it/describe edits in the diff), so it cannot fail against pre-fix source. The new Z-HNY-02 behavior (anomaly-trigger's self-inflicted decrypt path is metadata-bounded, not full-record) IS bound (fails against pre-fix source, gate-confirmed) by test/security/attacker-writable-collections-bounds.test.ts, which imports AnomalyTriggerWatcher, exercises listFindingMetadata, and carries an explicit mutation-proof target for the unbounded-metadata-scan property.
 /**
  * Sanctuary v1.3 WP-V1.3-1 Phi-5 Anomaly Trigger meta-sentinel regression suite.
  *
@@ -50,8 +51,29 @@ function fixedClock(now: Date): () => Date {
  * the same fields the real store supports. The real store is per-
  * fortress and AAD-bound to finding_ids; Phi-5 only reads it, so the
  * stub's filter shape is what matters for the regression suite.
+ *
+ * `listFindingMetadata` (fix-round-2, MUST-FIX 5 RECHECK) is the method
+ * Phi-5's `evaluate()` actually calls now — see anomaly-trigger.ts's doc
+ * for why a decrypt-bounded `listFindings({limit})` was the wrong shape
+ * for a rolling 8-day security baseline. `listFindings` is kept on the
+ * stub too (harmless, matches the real store's surface) even though this
+ * suite no longer exercises it through Phi-5.
  */
 function makeStubFindingStore(findings: SentinelFinding[]): SentinelFindingStore {
+  function filtered(opts?: {
+    since?: string;
+    severity?: SentinelSeverity;
+    sentinelId?: string;
+    agentId?: string;
+  }): SentinelFinding[] {
+    let out = findings.slice();
+    if (opts?.since) out = out.filter((f) => f.observed_at >= opts.since!);
+    if (opts?.severity) out = out.filter((f) => f.severity === opts.severity);
+    if (opts?.sentinelId) out = out.filter((f) => f.sentinel_id === opts.sentinelId);
+    if (opts?.agentId) out = out.filter((f) => f.agent_id === opts.agentId);
+    out.sort((a, b) => (a.observed_at < b.observed_at ? 1 : -1));
+    return out;
+  }
   return {
     async listFindings(opts?: {
       since?: string;
@@ -60,14 +82,23 @@ function makeStubFindingStore(findings: SentinelFinding[]): SentinelFindingStore
       agentId?: string;
       limit?: number;
     }): Promise<SentinelFinding[]> {
-      let out = findings.slice();
-      if (opts?.since) out = out.filter((f) => f.observed_at >= opts.since!);
-      if (opts?.severity) out = out.filter((f) => f.severity === opts.severity);
-      if (opts?.sentinelId) out = out.filter((f) => f.sentinel_id === opts.sentinelId);
-      if (opts?.agentId) out = out.filter((f) => f.agent_id === opts.agentId);
-      out.sort((a, b) => (a.observed_at < b.observed_at ? 1 : -1));
       const limit = opts?.limit ?? 100;
-      return out.slice(0, limit);
+      return filtered(opts).slice(0, limit);
+    },
+    async listFindingMetadata(opts?: {
+      since?: string;
+      severity?: SentinelSeverity;
+      sentinelId?: string;
+      agentId?: string;
+    }) {
+      return filtered(opts).map((f) => ({
+        finding_id: f.finding_id,
+        severity: f.severity,
+        sentinel_id: f.sentinel_id,
+        agent_id: f.agent_id,
+        observed_at: f.observed_at,
+        origin: f.agent_id ?? "unattributed",
+      }));
     },
   } as unknown as SentinelFindingStore;
 }
@@ -75,6 +106,9 @@ function makeStubFindingStore(findings: SentinelFinding[]): SentinelFindingStore
 function makeFailingFindingStore(): SentinelFindingStore {
   return {
     async listFindings(): Promise<SentinelFinding[]> {
+      throw new Error("finding-store io_failed");
+    },
+    async listFindingMetadata(): Promise<never> {
       throw new Error("finding-store io_failed");
     },
   } as unknown as SentinelFindingStore;

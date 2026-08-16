@@ -25,7 +25,10 @@ import type {
   NodeIdentityCertificate,
   PrincipalCertificate,
 } from "../../src/mesh/types.js";
-import { signOperatorPayload } from "../../src/v1/operator-signed.js";
+import {
+  addOperatorAuthorizationFields,
+  signOperatorPayload,
+} from "../../src/v1/operator-signed.js";
 import { toBase64url } from "../../src/core/encoding.js";
 import {
   buildFederationReissueNodeCertProofMessage,
@@ -61,9 +64,12 @@ afterEach(async () => {
 });
 
 function operatorSigned(action: string, payload: Record<string, unknown>) {
+  const signedPayload = addOperatorAuthorizationFields(payload);
   return {
-    ...payload,
-    operator_signature: toBase64url(signOperatorPayload(action, payload, OPERATOR.privateKey)),
+    ...signedPayload,
+    operator_signature: toBase64url(
+      signOperatorPayload(action, signedPayload, OPERATOR.privateKey),
+    ),
   };
 }
 

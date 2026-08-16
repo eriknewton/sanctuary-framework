@@ -1,29 +1,9 @@
 # Sanctuary npm Publish (manual dispatch)
 #
-# Copyright 2026 Erik Newton
-# SPDX-License-Identifier: Apache-2.0
-#
-# Publish intent is separate from tag intent. A git tag push is a
-# versioning operation (rc cut, audit point, rollback marker); it is
-# not a shipping decision. This workflow runs only when a maintainer
-# explicitly invokes "Run workflow" from the Actions tab and types
-# the version string being published. The input must match the
-# version in server/package.json at the checked-out SHA, or the job
-# refuses to publish.
-#
-# History: the earlier on-tag trigger fired twice in the v1.0 rc
-# cycle when the maintainer was not ready to ship. Both runs failed
-# only because NPM_TOKEN was absent at the time. Once NPM_TOKEN is
-# configured on the repo, an on-tag trigger would auto-publish on
-# any future tag push, including rc cuts the maintainer did not
-# intend to release. Requiring workflow_dispatch closes that gap.
-#
-# Authentication: npm Trusted Publishing (OIDC). No static NPM_TOKEN
-# secret required. The GitHub Actions OIDC token is exchanged for a
-# short-lived npm publish token at publish time. Configure the trusted
-# publisher link at npmjs.com/package/@sanctuary-framework/mcp-server/access.
-#
-# See .github/RELEASING.md for the full release procedure.
+# Publish intent is separate from tag intent. A tag push never publishes. A
+# maintainer must dispatch this workflow with the exact package version. Source
+# is always the matching immutable v-prefixed tag. The artifact is packed ONCE and its bytes cross every
+# trust zone unchanged: build -> sign -> stage -> npm publish -> finalize.
 
 name: Publish (manual)
 
@@ -31,132 +11,118 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Version being published. Must match server/package.json at HEAD (example 1.0.1 or 1.0.0-rc.2)."
+        description: "Numeric version to publish (for example 1.1.4 or 1.2.0-rc.1). Must match server/package.json."
         required: true
         type: string
-      ref:
-        description: "Git ref to publish from (tag, branch, or SHA). Defaults to the selected branch when blank."
-        required: false
-        type: string
-        default: ""
+
+env:
+  # User-controlled dispatch data crosses into shell contexts only through this
+  # env var, never through expression interpolation in a run script. After
+  # validate-intent, pinned actions also receive it in typed `with:` inputs.
+  RELEASE_VERSION: ${{ inputs.version }}
+  # This value must match PINNED_RELEASE_SIGNING_PUBLIC_KEY_B64URL in
+  # server/src/release-manifest.ts. The signer derives the public key from the
+  # secret seed and refuses to sign if they differ.
+  RELEASE_PUBLIC_KEY_B64URL: 61YBfiq_zlbTP5rl_r_msbPk40IXJL-_PuAxlpBVeF0
+
+concurrency:
+  group: sanctuary-npm-release
+  cancel-in-progress: false
 
 jobs:
-  publish:
-    name: publish
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      id-token: write
-
-    # Job-level env so the "Require release signing key" probe step below can
-    # test the SAME value the sign step's key is mapped from. Probing this env
-    # var is probing the secret's delivery into this job, not a proxy for it.
-    env:
-      RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
-
+  validate-intent:
+    name: validate maintainer release intent
+    runs-on: ubuntu-24.04
+    permissions: {}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v7
+      - name: Validate version shape without source code
+        run: |
+          set -euo pipefail
+          if ! [[ "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9]+(\.[A-Za-z0-9]+)*)?$ ]]; then
+            echo "::error::version must be numeric semver without a v prefix"
+            exit 1
+          fi
+
+  build-release:
+    name: build exact release artifact
+    needs: validate-intent
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      source_sha: ${{ steps.source.outputs.sha }}
+    steps:
+      - name: Checkout requested source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.ref != '' && inputs.ref || github.ref }}
+          ref: refs/tags/v${{ inputs.version }}
+          persist-credentials: false
+
+      # The tag contains the product source being released. The workflow
+      # definition that is actually executing can be newer, so inspect its
+      # action refs independently instead of trusting only the tag's history.
+      - name: Checkout executing workflow pin surface
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: trusted-workflow
+          persist-credentials: false
+          sparse-checkout: |
+            .github/actions
+            .github/workflows
+            scripts/check-release-action-pins.mjs
+          sparse-checkout-cone-mode: false
+
+      - name: Record immutable source commit
+        id: source
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Use Node.js 24
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 24
-          registry-url: "https://registry.npmjs.org"
+          node-version: 24.14.0
           cache: npm
           cache-dependency-path: server/package-lock.json
 
-      # Verify dispatch input matches server/package.json version.
-      #
-      # Convention (enforced below):
-      #   inputs.version  numeric semver, no `v` prefix (e.g. 1.1.4, 1.0.0-rc.2)
-      #   inputs.ref      git ref, conventionally a tag with `v` prefix
-      #                   (e.g. v1.1.4); blank defaults to the dispatched
-      #                   branch ref. Branch and SHA refs are accepted to
-      #                   support pre-release testing dispatches.
-      #
-      # The `version` vs `package.json` comparison is a strict bash string
-      # equality (`[[ "$a" != "$b" ]]`). It is intentionally not a regex,
-      # not a glob, and not a version-range comparator: a maintainer typing
-      # `v1.1.4` instead of `1.1.4` should hit a loud failure here, not
-      # silently publish under a coerced version. The explicit `v`-prefix
-      # rejection below produces a clearer error message than relying on
-      # the equality check alone.
-      - name: Verify dispatch input matches server/package.json version
-        id: verify-version
+      - name: Validate release metadata
         run: |
-          input_version="${{ inputs.version }}"
-          pkg_version=$(node -p "require('./server/package.json').version")
-          echo "Dispatch input version: ${input_version}"
-          echo "Package version:        ${pkg_version}"
-          if [[ -z "${input_version}" ]]; then
-            echo "::error::Dispatch input 'version' is empty. Refusing to publish."
+          set -euo pipefail
+          package_version=$(node -p "require('./server/package.json').version")
+          if [[ "$RELEASE_VERSION" != "$package_version" ]]; then
+            echo "::error::input version ($RELEASE_VERSION) does not match server/package.json ($package_version)"
             exit 1
           fi
-          # Reject `v` prefix explicitly so the maintainer gets a clear
-          # error message instead of a generic does-not-match comparison.
-          if [[ "${input_version}" == v* ]]; then
-            echo "::error::Dispatch input 'version' starts with 'v' (got '${input_version}'). The version input must be the numeric form (e.g. 1.1.4), without the 'v' prefix. The 'ref' input is where the 'v'-prefixed tag goes."
-            exit 1
-          fi
-          # Shape check: numeric semver with optional pre-release suffix.
-          # Accepts: 1.0.0, 1.1.4, 1.0.0-rc.2, 2.0.0-beta.1, 1.0.0-alpha.10.
-          # Rejects: latest, v1.0.0, 1.0, 1.0.0.0, anything with whitespace.
-          if ! [[ "${input_version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9]+(\.[0-9]+)?)?$ ]]; then
-            echo "::error::Dispatch input 'version' (${input_version}) is not a valid numeric semver. Expected forms: 1.1.4 or 1.0.0-rc.2. Refusing to publish."
-            exit 1
-          fi
-          if [[ "${input_version}" != "${pkg_version}" ]]; then
-            echo "::error::Dispatch input version (${input_version}) does not match server/package.json version (${pkg_version}) at the checked-out ref. Refusing to publish."
-            exit 1
-          fi
-          echo "version=${pkg_version}" >> "$GITHUB_OUTPUT"
 
-      # Probe the ACTUAL input the sign step consumes, and fail closed.
-      #
-      # This runs BEFORE the install/test/build/publish steps so that a
-      # missing key aborts the run in seconds — before the irreversible
-      # `npm publish` — rather than discovering the gap after the package is
-      # already live. The predicate probed here (job env RELEASE_SIGNING_KEY,
-      # mapped from the repository secret of the same name) is the same value
-      # the sign step's SANCTUARY_RELEASE_SIGNING_KEY_B64URL is mapped from,
-      # so a pass here means the key genuinely reaches the signing step; there
-      # is no separate proxy that can drift. Only presence is probed; the
-      # value is never printed (GitHub masks it regardless).
-      - name: Require release signing key (fail closed)
+      # These stdlib-only checks run before npm or pip lifecycle code can
+      # mutate the checkout. The inline comparison binds the currently
+      # executing workflow's key to the product source at the release tag.
+      - name: Release trust checks before dependency execution
         run: |
-          if [[ -z "${RELEASE_SIGNING_KEY}" ]]; then
-            echo "::error::The RELEASE_SIGNING_KEY repository secret is empty or is not reaching this job (checked the job-level env mapped from secrets.RELEASE_SIGNING_KEY). The release-signing key was activated 2026-07-01 and the shipped product pins its public half, so publishing WITHOUT a signed manifest would break the signed self-update path. Refusing to publish. Fix: restore the RELEASE_SIGNING_KEY secret (see .github/RELEASING.md) and re-run."
-            exit 1
-          fi
-          echo "RELEASE_SIGNING_KEY is present in the job environment; the sign step will receive it."
+          npm run check:release-dependency-pins
+          npm run check:release-action-pins
+          npm run check:release-key-parity
+          node trusted-workflow/scripts/check-release-action-pins.mjs --workflows-dir trusted-workflow/.github/workflows
+          node -e 'const s=require("fs").readFileSync("server/src/release-manifest.ts","utf8"); const matches=[...s.matchAll(/^export const PINNED_RELEASE_SIGNING_PUBLIC_KEY_B64URL\s*=\s*\n\s*"([A-Za-z0-9_-]+)";\s*$/gm)]; if(matches.length!==1 || matches[0][1]!==process.env.RELEASE_PUBLIC_KEY_B64URL) { console.error("executing workflow key differs from tagged product key or product declaration is ambiguous"); process.exit(1); }'
 
       - name: Install dependencies
         working-directory: server
         run: npm ci
 
-      - name: Release dependency pin check
-        run: npm run check:release-dependency-pins
-
       - name: Set up Python 3.12 for Concordia sidecar
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
 
       - name: Provision Concordia sidecar venv
         run: |
           python3 -m venv sidecars/concordia/.venv
-          sidecars/concordia/.venv/bin/pip install --upgrade pip
           sidecars/concordia/.venv/bin/pip install --require-hashes -r sidecars/concordia/requirements.txt
 
       - name: Type check
         working-directory: server
         run: npm run typecheck
 
-      - name: Install libsecret + Secret Service backend
-        if: runner.os == 'Linux'
+      - name: Install libsecret and Secret Service backend
         uses: ./.github/actions/setup-linux-secret-service
 
       - name: Run tests
@@ -167,63 +133,349 @@ jobs:
         working-directory: server
         run: npm run build
 
-      - name: Determine npm dist-tag
-        id: dist-tag
-        run: |
-          version="${{ steps.verify-version.outputs.version }}"
-          # Pre-release versions (anything with a hyphen, e.g. 1.0.0-rc.1)
-          # publish under the "next" dist-tag so `npx @sanctuary-framework/
-          # mcp-server` keeps resolving to the stable release.
-          if [[ "$version" == *-* ]]; then
-            echo "tag=next" >> "$GITHUB_OUTPUT"
-          else
-            echo "tag=latest" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Publish to npm
+      - name: Pack once
         working-directory: server
-        run: npm publish --access public --tag "${{ steps.dist-tag.outputs.tag }}"
-
-      # Sign the release manifest and attach it to the GitHub Release.
-      #
-      # Custody = Option B (ratified 2026-07-01): the Ed25519 signing seed is a
-      # GitHub Actions secret (RELEASE_SIGNING_KEY), base64url of the 32-byte
-      # seed. The sign script reads it via SANCTUARY_RELEASE_SIGNING_KEY_B64URL,
-      # never logs it, and zeroes it after signing.
-      #
-      # FAIL-CLOSED (2026-07-25): the release-signing key was ACTIVATED
-      # 2026-07-01 and the product pins its public half
-      # (PINNED_RELEASE_SIGNING_PUBLIC_KEY_B64URL in
-      # server/src/release-manifest.ts). From activation onward, a publish
-      # without a signed manifest is a DEFECT, so this step has no `if:` guard:
-      # if the RELEASE_SIGNING_KEY secret is empty or stops reaching the job
-      # (rotation, repo transfer, env-mapping regression), the sign script
-      # exits non-zero and the run goes RED instead of green-with-a-skip.
-      #
-      # History: the original pre-activation design skipped this step when the
-      # secret was empty, via a companion step NAMED "Signed manifest skipped
-      # (no signing key configured)". After activation that companion step was
-      # the one being skipped, so every healthy run's step list showed a
-      # skipped row whose name read as "the signing was skipped" — a false
-      # defect report generated by a step NAME asserting a condition it did not
-      # probe. Both the skip step and the conditional are gone; a structural
-      # test (server/test/structure/publish-workflow-signing-gate.test.ts)
-      # keeps them gone.
-      - name: Sign + attach release manifest
-        working-directory: server
-        env:
-          SANCTUARY_RELEASE_SIGNING_KEY_B64URL: ${{ secrets.RELEASE_SIGNING_KEY }}
-          GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ steps.verify-version.outputs.version }}
         run: |
           set -euo pipefail
-          npm run sign-release -- "$VERSION" --out release-manifest.json
-          # Determine the release tag. Prefer the v-prefixed tag matching the
-          # version; fall back to the checked-out ref if it is already a tag.
-          tag="v${VERSION}"
-          if ! gh release view "$tag" >/dev/null 2>&1; then
-            echo "Release $tag not found; creating it."
-            gh release create "$tag" --title "$tag" --notes "Automated release. Signed manifest attached." --target "$GITHUB_SHA"
+          npm pack --json --ignore-scripts > pack-result.json
+          expected="sanctuary-framework-mcp-server-${RELEASE_VERSION}.tgz"
+          node -e "const p=require('./pack-result.json'); if(p.length!==1 || p[0].filename!==process.argv[1]) process.exit(1)" "$expected"
+          test -f "$expected"
+
+      - name: Upload exact release artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: unsigned-release-${{ github.run_id }}
+          path: server/sanctuary-framework-mcp-server-${{ inputs.version }}.tgz
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 2
+
+  sign-release:
+    name: sign exact artifact in isolated job
+    needs: build-release
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      # This job never installs or executes package dependencies. It checks out
+      # the reviewed workflow commit only to obtain the two Node-stdlib scripts.
+      - name: Checkout trusted release scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+          sparse-checkout: |
+            scripts/release-artifact-lib.mjs
+            scripts/sign-release-artifact.mjs
+            scripts/verify-release-artifact.mjs
+          sparse-checkout-cone-mode: false
+
+      - name: Use pinned Node.js for isolated signing
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.14.0
+
+      - name: Download exact release artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: unsigned-release-${{ github.run_id }}
+          path: release
+
+      - name: Sign artifact and prove pinned-key custody
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          node scripts/sign-release-artifact.mjs \
+            --tarball "release/sanctuary-framework-mcp-server-${RELEASE_VERSION}.tgz" \
+            --version "$RELEASE_VERSION" \
+            --out release/release-manifest.json \
+            --expected-public-key "$RELEASE_PUBLIC_KEY_B64URL"
+
+      - name: Verify signed artifact before crossing trust zone
+        run: |
+          node scripts/verify-release-artifact.mjs \
+            --tarball "release/sanctuary-framework-mcp-server-${RELEASE_VERSION}.tgz" \
+            --manifest release/release-manifest.json \
+            --version "$RELEASE_VERSION" \
+            --expected-public-key "$RELEASE_PUBLIC_KEY_B64URL"
+
+      - name: Upload signed release set
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: signed-release-${{ github.run_id }}
+          path: release/
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 7
+
+  stage-release:
+    name: stage private GitHub release
+    needs: [build-release, sign-release]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      SOURCE_SHA: ${{ needs.build-release.outputs.source_sha }}
+      TAG: v${{ inputs.version }}
+    steps:
+      - name: Checkout trusted artifact verifier
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+          sparse-checkout: |
+            scripts/release-artifact-lib.mjs
+            scripts/verify-release-artifact.mjs
+          sparse-checkout-cone-mode: false
+
+      - name: Use pinned Node.js for staged artifact verification
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.14.0
+
+      - name: Download signed release set
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: signed-release-${{ github.run_id }}
+          path: release
+
+      - name: Verify tag still names the built commit
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          tag_object=$(gh api "repos/${GH_REPO}/git/ref/tags/${TAG}" --jq '.object.type + " " + .object.sha') || {
+            echo "::error::GitHub API failed to resolve $TAG"
+            exit 1
+          }
+          read -r object_type resolved <<< "$tag_object"
+          for _ in {1..16}; do
+            [[ "$object_type" == tag ]] || break
+            tag_object=$(gh api "repos/${GH_REPO}/git/tags/${resolved}" --jq '.object.type + " " + .object.sha') || {
+              echo "::error::GitHub API failed while peeling $TAG"
+              exit 1
+            }
+            read -r object_type resolved <<< "$tag_object"
+          done
+          [[ "$object_type" == commit && "$resolved" =~ ^[0-9a-f]{40}$ ]]
+          if [[ "$resolved" != "$SOURCE_SHA" ]]; then
+            echo "::error::$TAG moved after build (built $SOURCE_SHA, now $resolved)"
+            exit 1
           fi
-          gh release upload "$tag" release-manifest.json --clobber
-          echo "Attached signed release-manifest.json to release $tag."
+
+      - name: Verify exact artifact before staging
+        run: |
+          node scripts/verify-release-artifact.mjs \
+            --tarball "release/sanctuary-framework-mcp-server-${RELEASE_VERSION}.tgz" \
+            --manifest release/release-manifest.json \
+            --version "$RELEASE_VERSION" \
+            --expected-public-key "$RELEASE_PUBLIC_KEY_B64URL"
+
+      - name: Create or reuse draft release and upload signed set
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --json isDraft --jq .isDraft > draft-state 2>/dev/null; then
+            if [[ "$(cat draft-state)" != "true" ]]; then
+              echo "::error::release $TAG is already public; refusing to overwrite it"
+              exit 1
+            fi
+          else
+            if [[ "$RELEASE_VERSION" == *-* ]]; then
+              prerelease_flag=--prerelease
+            else
+              prerelease_flag=
+            fi
+            gh release create "$TAG" --draft $prerelease_flag --verify-tag --target "$SOURCE_SHA" --title "$TAG" --notes "Release staged by the hardened publish workflow."
+          fi
+          gh release upload "$TAG" \
+            release/release-manifest.json \
+            "release/sanctuary-framework-mcp-server-${RELEASE_VERSION}.tgz" \
+            --clobber
+          expected_assets="release-manifest.json,sanctuary-framework-mcp-server-${RELEASE_VERSION}.tgz"
+          actual_assets=$(gh release view "$TAG" --json assets --jq '[.assets[].name] | sort | join(",")')
+          if [[ "$actual_assets" != "$expected_assets" ]]; then
+            echo "::error::draft release assets are not the exact two-file signed release set (got: $actual_assets)"
+            exit 1
+          fi
+          if [[ "$(gh release view "$TAG" --json isDraft --jq .isDraft)" != "true" ]]; then
+            echo "::error::release $TAG became public while assets were being staged"
+            exit 1
+          fi
+          tag_object=$(gh api "repos/${GH_REPO}/git/ref/tags/${TAG}" --jq '.object.type + " " + .object.sha') || {
+            echo "::error::GitHub API failed to resolve $TAG after staging"
+            exit 1
+          }
+          read -r object_type post_stage_sha <<< "$tag_object"
+          for _ in {1..16}; do
+            [[ "$object_type" == tag ]] || break
+            tag_object=$(gh api "repos/${GH_REPO}/git/tags/${post_stage_sha}" --jq '.object.type + " " + .object.sha') || {
+              echo "::error::GitHub API failed while peeling $TAG after staging"
+              exit 1
+            }
+            read -r object_type post_stage_sha <<< "$tag_object"
+          done
+          [[ "$object_type" == commit && "$post_stage_sha" =~ ^[0-9a-f]{40}$ ]]
+          if [[ "$post_stage_sha" != "$SOURCE_SHA" ]]; then
+            echo "::error::$TAG moved while the draft release was being staged"
+            exit 1
+          fi
+
+  publish-release:
+    name: publish exact tarball to npm
+    needs: [build-release, sign-release, stage-release]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      # The only checked-out repository file is the reviewed, stdlib-only
+      # verifier from the immutable workflow commit. No package source or
+      # dependency is present in this OIDC-authorized job.
+      - name: Checkout trusted artifact verifier
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+          sparse-checkout: |
+            scripts/release-artifact-lib.mjs
+            scripts/verify-release-artifact.mjs
+          sparse-checkout-cone-mode: false
+
+      - name: Use pinned Node.js for artifact verification
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.14.0
+
+      - name: Download signed release set
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: signed-release-${{ github.run_id }}
+          path: release
+
+      - name: Verify exact artifact before npm publication
+        run: |
+          node scripts/verify-release-artifact.mjs \
+            --tarball "release/sanctuary-framework-mcp-server-${RELEASE_VERSION}.tgz" \
+            --manifest release/release-manifest.json \
+            --version "$RELEASE_VERSION" \
+            --expected-public-key "$RELEASE_PUBLIC_KEY_B64URL"
+
+      - name: Use Node.js 24 with npm Trusted Publishing
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.14.0
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Publish or verify already-published exact tarball
+        run: |
+          set -euo pipefail
+          tarball="release/sanctuary-framework-mcp-server-${RELEASE_VERSION}.tgz"
+          package="@sanctuary-framework/mcp-server@${RELEASE_VERSION}"
+          local_integrity=$(node -e "const fs=require('fs'),c=require('crypto'); process.stdout.write('sha512-'+c.createHash('sha512').update(fs.readFileSync(process.argv[1])).digest('base64'))" "$tarball")
+          existing_integrity=$(npm view "$package" dist.integrity 2>/dev/null || true)
+          if [[ -n "$existing_integrity" ]]; then
+            if [[ "$existing_integrity" != "$local_integrity" ]]; then
+              echo "::error::$package already exists but its registry integrity does not match the signed tarball"
+              exit 1
+            fi
+            echo "$package is already published with the exact signed integrity; continuing idempotently."
+          else
+            if [[ "$RELEASE_VERSION" == *-* ]]; then dist_tag=next; else dist_tag=latest; fi
+            npm publish "$tarball" --ignore-scripts --provenance --access public --tag "$dist_tag"
+          fi
+
+  finalize-release:
+    name: make signed GitHub release visible
+    needs: [build-release, publish-release]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      SOURCE_SHA: ${{ needs.build-release.outputs.source_sha }}
+      TAG: v${{ inputs.version }}
+    steps:
+      - name: Checkout trusted artifact verifier
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+          sparse-checkout: |
+            scripts/release-artifact-lib.mjs
+            scripts/verify-release-artifact.mjs
+          sparse-checkout-cone-mode: false
+
+      - name: Use pinned Node.js for final artifact verification
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.14.0
+
+      - name: Download and verify draft release bytes
+        run: |
+          set -euo pipefail
+          mkdir release-assets
+          gh release download "$TAG" \
+            --pattern release-manifest.json \
+            --pattern "sanctuary-framework-mcp-server-${RELEASE_VERSION}.tgz" \
+            --dir release-assets
+          node scripts/verify-release-artifact.mjs \
+            --tarball "release-assets/sanctuary-framework-mcp-server-${RELEASE_VERSION}.tgz" \
+            --manifest release-assets/release-manifest.json \
+            --version "$RELEASE_VERSION" \
+            --expected-public-key "$RELEASE_PUBLIC_KEY_B64URL"
+
+      - name: Verify tag still names the built commit
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          tag_object=$(gh api "repos/${GH_REPO}/git/ref/tags/${TAG}" --jq '.object.type + " " + .object.sha') || {
+            echo "::error::GitHub API failed to resolve $TAG before finalization"
+            exit 1
+          }
+          read -r object_type resolved <<< "$tag_object"
+          for _ in {1..16}; do
+            [[ "$object_type" == tag ]] || break
+            tag_object=$(gh api "repos/${GH_REPO}/git/tags/${resolved}" --jq '.object.type + " " + .object.sha') || {
+              echo "::error::GitHub API failed while peeling $TAG before finalization"
+              exit 1
+            }
+            read -r object_type resolved <<< "$tag_object"
+          done
+          [[ "$object_type" == commit && "$resolved" =~ ^[0-9a-f]{40}$ ]]
+          if [[ "$resolved" != "$SOURCE_SHA" ]]; then
+            echo "::error::$TAG moved after build (built $SOURCE_SHA, now $resolved)"
+            exit 1
+          fi
+
+      - name: Publish staged GitHub release
+        run: |
+          set -euo pipefail
+          [[ "$(gh release view "$TAG" --json isDraft --jq .isDraft)" == "true" ]]
+          expected_assets="release-manifest.json,sanctuary-framework-mcp-server-${RELEASE_VERSION}.tgz"
+          actual_assets=$(gh release view "$TAG" --json assets --jq '[.assets[].name] | sort | join(",")')
+          [[ "$actual_assets" == "$expected_assets" ]]
+          tag_object=$(gh api "repos/${GH_REPO}/git/ref/tags/${TAG}" --jq '.object.type + " " + .object.sha') || {
+            echo "::error::GitHub API failed to resolve $TAG immediately before publication"
+            exit 1
+          }
+          read -r object_type final_sha <<< "$tag_object"
+          for _ in {1..16}; do
+            [[ "$object_type" == tag ]] || break
+            tag_object=$(gh api "repos/${GH_REPO}/git/tags/${final_sha}" --jq '.object.type + " " + .object.sha') || {
+              echo "::error::GitHub API failed while peeling $TAG immediately before publication"
+              exit 1
+            }
+            read -r object_type final_sha <<< "$tag_object"
+          done
+          [[ "$object_type" == commit && "$final_sha" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$final_sha" == "$SOURCE_SHA" ]]
+          if [[ "$RELEASE_VERSION" != *-* ]]; then
+            gh release edit "$TAG" --draft=false --latest
+          else
+            gh release edit "$TAG" --draft=false
+          fi
+          [[ "$(gh release view "$TAG" --json isDraft --jq .isDraft)" == "false" ]]

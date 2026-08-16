@@ -2,8 +2,10 @@
 // Constants.swift
 //
 // Wire constants synchronized with `server/src/castle-wall/constants.ts` and
-// `castle-wall-daemon/src/lib.rs::constants`. Bumping any value here means a
-// wire incompatibility; the cross-language fixture suite will trip.
+// `castle-wall-daemon/src/lib.rs::constants`. Bumping any mirrored value here
+// means a wire incompatibility; the cross-file contract test parses these
+// declarations, and the IPC framing tests construct their Content-Length cases
+// through the shared constant.
 //
 
 import Foundation

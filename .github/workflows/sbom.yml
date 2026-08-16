@@ -36,8 +36,11 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # CSO-CICD-02 (supply-chain pin): this workflow runs on `release`, so
+      # every action below is pinned to an immutable commit SHA rather than a
+      # mutable tag; a hijacked upstream tag cannot inject into this job.
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # anchore/sbom-action wraps Syft and emits CycloneDX. Scanning the
       # checked-out tree captures the declared dependency manifests
@@ -51,7 +54,7 @@ jobs:
           output-file: sanctuary-sbom.cyclonedx.json
 
       - name: Upload SBOM artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: sanctuary-sbom
           path: sanctuary-sbom.cyclonedx.json

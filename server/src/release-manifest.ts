@@ -27,16 +27,15 @@
  */
 
 import { canonicalJson } from "./v1/operator-signed.js";
+import {
+  ED25519_PUBLIC_KEY_BYTES,
+  ED25519_SIGNATURE_BYTES,
+} from "./core/crypto-suite-registry.js";
 import { fromBase64urlStrict, stringToBytes } from "./core/encoding.js";
 import { verify } from "./core/identity.js";
 
 /** Domain separator for the release-manifest signature (versioned). */
 export const RELEASE_MANIFEST_DOMAIN = "sanctuary.release-manifest.v1";
-
-/** Ed25519 public key length in bytes. */
-const ED25519_PUBLIC_KEY_LENGTH = 32;
-/** Ed25519 signature length in bytes. */
-const ED25519_SIGNATURE_LENGTH = 64;
 
 /**
  * The PINNED Sanctuary release-signing public key, base64url-encoded.
@@ -173,7 +172,7 @@ export function verifyReleaseManifestWithKey(
   value: unknown,
   publicKey: Uint8Array,
 ): ManifestVerificationResult {
-  if (publicKey.length !== ED25519_PUBLIC_KEY_LENGTH) {
+  if (publicKey.length !== ED25519_PUBLIC_KEY_BYTES) {
     return { ok: false, reason: "bad_pinned_key" };
   }
   // Defense-in-depth: the all-zero public key is the curve identity point and
@@ -202,7 +201,7 @@ export function verifyReleaseManifestWithKey(
   } catch {
     return { ok: false, reason: "malformed" };
   }
-  if (signature.length !== ED25519_SIGNATURE_LENGTH) {
+  if (signature.length !== ED25519_SIGNATURE_BYTES) {
     return { ok: false, reason: "malformed" };
   }
   // Defense-in-depth: reject an all-zero signature. It is never a legitimate
@@ -238,7 +237,7 @@ export function loadPinnedReleaseKey(): Uint8Array | null {
     // strictly keeps a single decode discipline across all signature material
     // and would catch a future non-canonical edit to the constant.
     const key = fromBase64urlStrict(PINNED_RELEASE_SIGNING_PUBLIC_KEY_B64URL);
-    if (key.length !== ED25519_PUBLIC_KEY_LENGTH) return null;
+    if (key.length !== ED25519_PUBLIC_KEY_BYTES) return null;
     // CRITICAL: reject the all-zero placeholder. The all-zero key is the
     // Ed25519 identity point and accepts a zero signature for ANY message —
     // a universal forgery. Returning null here makes "fails closed until the

@@ -25,6 +25,27 @@ import { BROKER_OPS } from "../../operational/audit-log.js";
 export const DEFAULT_TOKEN_TTL_SECONDS = 15 * 60;
 export const MAX_TOKEN_TTL_SECONDS = 60 * 60; // 1 hour cap
 
+/**
+ * Global ceiling on live (unexpired) tokens across every skill and caller.
+ * Derivation: a generous fleet-scale headroom of ~40 concurrently-granted
+ * skills times ~50 live tokens each (a skill re-requesting well inside its
+ * own default TTL window) rounds up to 2000. This bounds the issuer's
+ * memory to a small, fixed footprint regardless of how many tokens have
+ * ever been requested (BROKER-TOKEN-STORE-UNBOUNDED) — issuance fails
+ * closed once the live map hits this size, it never grows past it.
+ */
+export const MAX_LIVE_TOKENS_GLOBAL = 2000;
+
+/**
+ * Per-caller (skill+agent) ceiling on live tokens. Derivation: a legitimate
+ * caller holds at most a handful of concurrent scoped tokens (read/rotate,
+ * a few distinct secrets, occasional retries) — realistic use stays in the
+ * single digits. 100 is far above that while still turning a runaway or
+ * malicious request_token loop from one caller into a small, fixed
+ * per-caller footprint instead of unbounded growth.
+ */
+export const MAX_LIVE_TOKENS_PER_CALLER = 100;
+
 export interface SkillSecretGrant {
   /** Name of the skill this grant applies to. */
   skill: string;
@@ -119,6 +140,10 @@ export interface TokenIssuerOptions {
   auditLog: AuditLog;
   /** Clock, injectable for testing. Defaults to Date.now. */
   now?: () => number;
+  /** Global live-token cap override. See MAX_LIVE_TOKENS_GLOBAL for the default and its derivation. */
+  maxLiveTokensGlobal?: number;
+  /** Per-caller live-token cap override. See MAX_LIVE_TOKENS_PER_CALLER for the default and its derivation. */
+  maxLiveTokensPerCaller?: number;
 }
 
 const SCOPE_RANK: Record<SecretScope, number> = { read: 1, rotate: 2 };
@@ -134,13 +159,26 @@ export class TokenIssuer {
   private readonly auditLog: AuditLog;
   private readonly defaultTtlSeconds: number;
   private readonly maxTtlSeconds: number;
+  private readonly maxLiveTokensGlobal: number;
+  private readonly maxLiveTokensPerCaller: number;
   private readonly now: () => number;
+  // Reservations held from a PASSED capacity check until the durable success
+  // audit completes and the token enters `tokens`. The set at issueToken's end
+  // is deliberately AFTER the success audit (provenance: no live token without
+  // a durable issuance record), so `tokens.size` alone lags an in-flight issue
+  // that is parked on its audit await. Without counting these, two concurrent
+  // issuances at cap-1 both pass the check and overshoot the cap (an async
+  // TOCTOU across the success-audit await). The caps below count size + these.
+  private inFlightIssuances = 0;
+  private readonly inFlightByCaller = new Map<string, number>();
 
   constructor(opts: TokenIssuerOptions) {
     this.backend = opts.backend;
     this.auditLog = opts.auditLog;
     this.defaultTtlSeconds = opts.defaultTtlSeconds ?? DEFAULT_TOKEN_TTL_SECONDS;
     this.maxTtlSeconds = opts.maxTtlSeconds ?? MAX_TOKEN_TTL_SECONDS;
+    this.maxLiveTokensGlobal = opts.maxLiveTokensGlobal ?? MAX_LIVE_TOKENS_GLOBAL;
+    this.maxLiveTokensPerCaller = opts.maxLiveTokensPerCaller ?? MAX_LIVE_TOKENS_PER_CALLER;
     this.now = opts.now ?? (() => Date.now());
     for (const g of opts.grants ?? []) this.setGrant(g);
   }
@@ -160,8 +198,31 @@ export class TokenIssuer {
     this.grants.delete(grantKey(skill, secret));
   }
 
+  /**
+   * OPERATOR-ONLY full inventory. Every grant regardless of principal — this
+   * is what the operator CLI (`sanctuary secrets list`) shows. An
+   * agent-facing surface MUST use {@link getGrantsForCaller} instead
+   * (BROKER-GRANT-INVENTORY-CROSS-CALLER): this method does not filter by
+   * caller identity at all.
+   */
   getGrants(): SkillSecretGrant[] {
     return Array.from(this.grants.values());
+  }
+
+  /**
+   * Grants visible to one verified caller: exactly the grants whose skill
+   * matches the caller's verified skill and whose optional
+   * agent/tenant/fortress/audience constraints (when present on the grant)
+   * match the caller's verified claims. Reuses `grantClaimMismatch`, the
+   * same check `issueToken` enforces, so "visible in list_grants" and
+   * "issuable via request_token" never diverge. `caller` must be the
+   * server-verified claims for this request, never anything sourced from
+   * MCP call arguments.
+   */
+  getGrantsForCaller(caller: VerifiedBrokerCallerClaims): SkillSecretGrant[] {
+    return this.getGrants().filter(
+      (g) => g.skill === caller.skill && grantClaimMismatch(g, caller) === null
+    );
   }
 
   /**
@@ -170,8 +231,15 @@ export class TokenIssuer {
    * denial is recorded in the audit log but not returned to the caller.
    */
   async issueToken(req: IssueTokenRequest): Promise<TokenBinding> {
+    // Prune BEFORE every issuance attempt (not just once at broker open, see
+    // openBroker) — a caller that requests tokens in a loop must not be able
+    // to outrun opportunistic pruning and accumulate unbounded expired
+    // entries in the live map (BROKER-TOKEN-STORE-UNBOUNDED).
+    this.pruneExpired();
+
     const requestedScope: SecretScope = req.requestedScope ?? "read";
     if (req.skill !== req.caller.skill) {
+      // Skill identity is taken from verified caller claims; an MCP argument cannot mint a token for another skill.
       await this.auditLog.appendCritical({
         layer: "l3",
         operation: BROKER_OPS.TOKEN_DENIED,
@@ -195,6 +263,7 @@ export class TokenIssuer {
     const grant = this.grants.get(grantKey(req.caller.skill, req.secret));
 
     if (!grant) {
+      // No grant means deny with an audit reason; absence of policy never widens broker access.
       await this.auditLog.appendCritical({
         layer: "l3",
         operation: BROKER_OPS.TOKEN_DENIED,
@@ -215,6 +284,7 @@ export class TokenIssuer {
     }
     const claimMismatch = grantClaimMismatch(grant, req.caller);
     if (claimMismatch) {
+      // Tenant, fortress, audience, and agent constraints are rechecked against verified claims before token issuance.
       await this.auditLog.appendCritical({
         layer: "l3",
         operation: BROKER_OPS.TOKEN_DENIED,
@@ -235,6 +305,7 @@ export class TokenIssuer {
       throw new BrokerDeniedError();
     }
     if (!scopeSatisfies(requestedScope, grant.scope)) {
+      // Requested scope must be no stronger than the grant, so callers cannot self-upgrade read into rotate.
       await this.auditLog.appendCritical({
         layer: "l3",
         operation: BROKER_OPS.TOKEN_DENIED,
@@ -255,44 +326,121 @@ export class TokenIssuer {
       throw new BrokerDeniedError();
     }
 
-    const ttl = clampTtl(
-      req.ttlSeconds ?? grant.ttlSeconds ?? this.defaultTtlSeconds,
-      this.maxTtlSeconds
+    // Fail-closed caps, checked only once the request is otherwise
+    // authorized so an unauthorized probe cannot use capacity denials as a
+    // side channel. Both caps are rechecked on every issuance (post-prune
+    // above), so an attacker cannot get ahead of them by issuing faster
+    // than any background sweep.
+    // Count in-flight reservations (issuances past their capacity check but
+    // not yet in `tokens`) so concurrent issuances cannot overshoot the cap
+    // across the success-audit await — see inFlightIssuances' doc.
+    const callerCountKey = `${req.caller.skill} ${req.caller.agent}`;
+    if (this.tokens.size + this.inFlightIssuances >= this.maxLiveTokensGlobal) {
+      await this.auditLog.appendCritical({
+        layer: "l3",
+        operation: BROKER_OPS.TOKEN_DENIED,
+        identity_id: req.caller.identity_id,
+        result: "failure",
+        details: {
+          skill: req.caller.skill,
+          secret: req.secret,
+          requested_scope: requestedScope,
+          reason: "token_store_at_capacity",
+          live_tokens: this.tokens.size + this.inFlightIssuances,
+          cap: this.maxLiveTokensGlobal,
+          agent: req.caller.agent,
+          tenant_id: req.caller.tenant_id,
+          fortress_id: req.caller.fortress_id,
+          audience: req.caller.audience,
+        },
+      });
+      throw new BrokerDeniedError();
+    }
+    const callerLiveCount =
+      this.countLiveTokensForCaller(req.caller.skill, req.caller.agent) +
+      (this.inFlightByCaller.get(callerCountKey) ?? 0);
+    if (callerLiveCount >= this.maxLiveTokensPerCaller) {
+      await this.auditLog.appendCritical({
+        layer: "l3",
+        operation: BROKER_OPS.TOKEN_DENIED,
+        identity_id: req.caller.identity_id,
+        result: "failure",
+        details: {
+          skill: req.caller.skill,
+          secret: req.secret,
+          requested_scope: requestedScope,
+          reason: "caller_token_quota_exceeded",
+          live_tokens_for_caller: callerLiveCount,
+          cap: this.maxLiveTokensPerCaller,
+          agent: req.caller.agent,
+          tenant_id: req.caller.tenant_id,
+          fortress_id: req.caller.fortress_id,
+          audience: req.caller.audience,
+        },
+      });
+      throw new BrokerDeniedError();
+    }
+
+    // RESERVE synchronously now that both caps passed, BEFORE the success-audit
+    // await below yields the event loop. This is what makes the capacity checks
+    // above race-safe: a concurrent issuance that arrives while this one is
+    // parked on its audit await counts this reservation and refuses at the cap,
+    // instead of both passing at cap-1 and overshooting (see inFlightIssuances'
+    // doc). Released in the `finally` on EVERY exit — success, audit failure,
+    // or throw — so a failed issuance never leaks a permanent reservation.
+    this.inFlightIssuances += 1;
+    this.inFlightByCaller.set(
+      callerCountKey,
+      (this.inFlightByCaller.get(callerCountKey) ?? 0) + 1
     );
-    const nowMs = this.now();
-    const token = randomBytes(32).toString("base64url");
-    const binding: TokenBinding = {
-      token,
-      skill: req.caller.skill,
-      secret: req.secret,
-      scope: requestedScope,
-      agent: req.caller.agent,
-      identity_id: req.caller.identity_id,
-      tenant_id: req.caller.tenant_id,
-      fortress_id: req.caller.fortress_id,
-      audience: req.caller.audience,
-      issued_at: new Date(nowMs).toISOString(),
-      expires_at: new Date(nowMs + ttl * 1000).toISOString(),
-    };
-    await this.auditLog.appendCritical({
-      layer: "l3",
-      operation: BROKER_OPS.TOKEN_ISSUED,
-      identity_id: req.caller.identity_id,
-      result: "success",
-      details: {
+    try {
+      const ttl = clampTtl(
+        req.ttlSeconds ?? grant.ttlSeconds ?? this.defaultTtlSeconds,
+        this.maxTtlSeconds
+      );
+      const nowMs = this.now();
+      const token = randomBytes(32).toString("base64url");
+      const binding: TokenBinding = {
+        token,
         skill: req.caller.skill,
         secret: req.secret,
         scope: requestedScope,
         agent: req.caller.agent,
+        identity_id: req.caller.identity_id,
         tenant_id: req.caller.tenant_id,
         fortress_id: req.caller.fortress_id,
         audience: req.caller.audience,
-        expires_at: binding.expires_at,
-        ttl_seconds: ttl,
-      },
-    });
-    this.tokens.set(token, binding);
-    return binding;
+        issued_at: new Date(nowMs).toISOString(),
+        expires_at: new Date(nowMs + ttl * 1000).toISOString(),
+      };
+      await this.auditLog.appendCritical({
+        layer: "l3",
+        operation: BROKER_OPS.TOKEN_ISSUED,
+        identity_id: req.caller.identity_id,
+        result: "success",
+        details: {
+          skill: req.caller.skill,
+          secret: req.secret,
+          scope: requestedScope,
+          agent: req.caller.agent,
+          tenant_id: req.caller.tenant_id,
+          fortress_id: req.caller.fortress_id,
+          audience: req.caller.audience,
+          expires_at: binding.expires_at,
+          ttl_seconds: ttl,
+        },
+      });
+      // The success audit is durable before the token enters the live map, so
+      // issued tokens have provenance. The reservation above covers the cap for
+      // the window between the check and this set, so the ordering is safe.
+      this.tokens.set(token, binding);
+      return binding;
+    } finally {
+      this.inFlightIssuances -= 1;
+      const remaining = (this.inFlightByCaller.get(callerCountKey) ?? 1) - 1;
+      if (remaining <= 0) this.inFlightByCaller.delete(callerCountKey);
+      else this.inFlightByCaller.set(callerCountKey, remaining);
+    }
   }
 
   /**
@@ -316,6 +464,7 @@ export class TokenIssuer {
     }
     const nowMs = this.now();
     if (nowMs >= Date.parse(binding.expires_at)) {
+      // Expiry is enforced again at read time, so pruning is only hygiene and never the security boundary.
       this.tokens.delete(token);
       await this.auditLog.appendCritical({
         layer: "l3",
@@ -336,7 +485,7 @@ export class TokenIssuer {
       throw new BrokerTokenExpiredError();
     }
 
-    // Re-check grant — it may have been revoked since issuance.
+    // Re-check the live grant on every read; a token cannot outlive a revoked or narrowed policy.
     const grant = this.grants.get(grantKey(binding.skill, binding.secret));
     if (!grant || !scopeSatisfies(binding.scope, grant.scope)) {
       this.tokens.delete(token);
@@ -359,7 +508,7 @@ export class TokenIssuer {
       throw new BrokerDeniedError();
     }
 
-    // Read from backend. Errors propagate; we audit but do not leak the value.
+    // Backend errors propagate after a redacted audit entry; the secret value is never logged or embedded in the error path.
     try {
       const value = await this.backend.readSecret(binding.secret);
       await this.auditLog.appendCritical({
@@ -393,7 +542,15 @@ export class TokenIssuer {
           fortress_id: binding.fortress_id,
           audience: binding.audience,
           reason: "backend_error",
+          // Full name AND message land ONLY in the operator-only audit
+          // trail (OperatorAuditSummary / queryAuditOperator); the agent-facing
+          // `broker/audit_query` tool redacts `details` away entirely
+          // (redactAuditEntryForAgent), and the MCP surface in
+          // broker-server.ts must never echo `err.message` into its response
+          // — it can carry the secret NAME, an absolute keychain path, or raw
+          // `security(1)` diagnostics (BROKER-BACKEND-DIAGNOSTIC-LEAK).
           error: errorName(err),
+          error_message: errorMessage(err),
         },
       });
       throw err;
@@ -411,8 +568,22 @@ export class TokenIssuer {
   }
 
   /**
-   * Drop expired tokens from the in-memory map. Called opportunistically;
-   * not required for correctness (readViaToken also validates expiry).
+   * Count of currently-live tokens issued to one (skill, agent) caller.
+   * Used to enforce {@link MAX_LIVE_TOKENS_PER_CALLER} at issuance time.
+   */
+  private countLiveTokensForCaller(skill: string, agent: string): number {
+    let count = 0;
+    for (const binding of this.tokens.values()) {
+      if (binding.skill === skill && binding.agent === agent) count++;
+    }
+    return count;
+  }
+
+  /**
+   * Drop expired tokens from the in-memory map. Called opportunistically —
+   * at broker open (see openBroker) and now at the top of every issueToken
+   * call — plus it is not required for correctness (readViaToken also
+   * validates expiry on every use).
    */
   pruneExpired(): number {
     const nowMs = this.now();
@@ -452,4 +623,13 @@ function clampTtl(requested: number, max: number): number {
 function errorName(err: unknown): string {
   if (err instanceof Error) return err.name;
   return "UnknownError";
+}
+
+/**
+ * Operator-audit-only. Never route this into an agent-facing response —
+ * see the invariant comment at the `backend_error` audit call site.
+ */
+function errorMessage(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  return String(err);
 }

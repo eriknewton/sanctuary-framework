@@ -41,6 +41,7 @@ import {
   buildOperatorAttestationMessage,
   type OperatorEd25519Attestation,
 } from "../v1/operator-attestation.js";
+import { ED25519_PUBLIC_KEY_BYTES } from "../core/crypto-suite-registry.js";
 
 /** Raised when no operator identity can be unlocked; mapped to a fail-closed exit. */
 export class OperatorSigningError extends Error {
@@ -191,7 +192,7 @@ export async function openOperatorSigner(
 function decodePublicKey(b64: string): Uint8Array | null {
   try {
     const key = fromBase64url(b64);
-    return key.length === 32 ? key : null;
+    return key.length === ED25519_PUBLIC_KEY_BYTES ? key : null;
   } catch {
     return null;
   }

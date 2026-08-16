@@ -19,6 +19,10 @@
 import { spawn } from "node:child_process";
 
 import { fromBase64url } from "../../core/encoding.js";
+import {
+  ED25519_PUBLIC_KEY_BYTES,
+  ED25519_SIGNATURE_BYTES,
+} from "../../core/crypto-suite-registry.js";
 
 /** Thrown on any failure to obtain a signature / public key from the helper. */
 export class HelperSignerError extends Error {
@@ -118,7 +122,7 @@ export class HelperSignerClient {
   /** Fetch the helper's 32-byte public key (generates the keypair on first call). */
   async getPublicKey(): Promise<Uint8Array> {
     const bytes = await this.run(["get-pubkey"], null);
-    if (bytes.length !== 32) {
+    if (bytes.length !== ED25519_PUBLIC_KEY_BYTES) {
       throw new HelperSignerError(
         `helper public key is ${bytes.length} bytes (expected 32)`,
       );
@@ -142,7 +146,7 @@ export class HelperSignerClient {
    */
   async installPin(): Promise<Uint8Array> {
     const bytes = await this.run(["re-pin"], null);
-    if (bytes.length !== 32) {
+    if (bytes.length !== ED25519_PUBLIC_KEY_BYTES) {
       throw new HelperSignerError(
         `helper pin is ${bytes.length} bytes (expected 32)`,
       );
@@ -158,7 +162,7 @@ export class HelperSignerClient {
       throw new HelperSignerError("refusing to sign empty payload");
     }
     const sig = await this.run([mode], payload);
-    if (sig.length !== 64) {
+    if (sig.length !== ED25519_SIGNATURE_BYTES) {
       throw new HelperSignerError(
         `helper signature is ${sig.length} bytes (expected 64)`,
       );

@@ -72,3 +72,8 @@ castle-wall-vmm/Package.resolved
 * [0-9].md
 
 .test-baseline-overrides.log
+
+# Marker written by the vitest globalSetup for the duration of a run; the
+# credential chokepoint reads it so a child spawned with a scrubbed env still
+# knows it belongs to the test run. See server/test/setup/test-run-marker.ts.
+server/.sanctuary-test-run

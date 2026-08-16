@@ -2,7 +2,12 @@ import type { CoverageReport, CoverageRow } from "./report.js";
 
 export type { CoverageReport } from "./report.js";
 
-export type ParityCoverageState = "covered" | "partial" | "no_fixture" | "documented_gap";
+export type ParityCoverageState =
+  | "not_implemented"
+  | "covered"
+  | "partial"
+  | "no_fixture"
+  | "documented_gap";
 
 export interface ParityReport {
   generated_at: string;

@@ -97,7 +97,7 @@ describe("sanctuary did-web key rotation CLI", () => {
       });
       expect(code).toBe(0);
       expect(out.text).toContain(
-        "Fortress is LOCKED (since 2026-05-19T12:00:00.000Z). Reads permitted; writes blocked.",
+        "Fortress lockdown active since 2026-05-19T12:00:00.000Z. Confined agents' network access was revoked; local reads and writes are not blocked by this marker.",
       );
       expect(out.text).toContain("did:web identifier registered");
     } finally {

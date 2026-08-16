@@ -30,17 +30,14 @@
 #
 4	.github/ISSUE_TEMPLATE/implementation-experience.yml
 6	.github/ISSUE_TEMPLATE/specification-feedback.yml
-1	CHANGELOG.md
 3	CODE_OF_CONDUCT.md
 1	GOVERNANCE.md
-51	SANCTUARY_ARCHITECTURE.md
 31	announcements/blog-post.md
 3	announcements/hackernews-submission.md
 9	announcements/linkedin-post.md
 8	announcements/x-twitter-thread.md
 4	castle-wall-vmm/README.md
 2	docs/DID_ENCODING.md
-4	docs/MIGRATION_v0.3_to_v0.4.md
 45	docs/OWASP_AGENTIC_AI.md
 23	docs/SHR_SPEC.md
 7	docs/assets/css/site.css
@@ -57,7 +54,6 @@
 10	docs/audit/commit-4ac95830-postmortem.md
 16	docs/audit/test-baseline-hardening-plan.md
 29	docs/compliance/eu_ai_act_bundle.md
-101	docs/compliance/eu_ai_act_coverage_matrix_v1.md
 7	docs/releases/v1.3.2.md
 42	docs/research/RESEARCH_ZK_UPGRADE_L3.md
 67	examples/eu_ai_act_bundle_example/01_annex_iv_technical_documentation.md
@@ -68,8 +64,6 @@
 6	examples/eu_ai_act_bundle_example/06_cryptographic_attestations.md
 6	examples/eu_ai_act_bundle_example/07_annex_iii_classification.md
 10	examples/eu_ai_act_bundle_example/README.md
-4	integrations/crewai/README.md
-7	integrations/langchain/README.md
 14	integrations/ping-identity/README.md
 4	quickstart/README.md
 40	rfcs/RFC-0001-sanctuary-mcp-server.md
@@ -81,7 +75,6 @@
 3	server/docs/federation-protocol-v0.1-spec.md
 9	server/docs/federation-v0.1-hard-gate-walkthrough.md
 13	server/docs/keychain-schema.md
-15	server/docs/multi-tenancy.md
 12	server/docs/query-anonymity-tiers.md
 8	server/docs/test-concurrency-discipline.md
 8	server/docs/test-port-discipline.md
@@ -96,7 +89,6 @@
 3	server/src/agent-contract/errors.ts
 1	server/src/agent-contract/lifecycle.ts
 3	server/src/agent-contract/schema.ts
-12	server/src/audit/analyzer.ts
 1	server/src/audit/tools.ts
 1	server/src/bridge/tools.ts
 1	server/src/broker-mcp/broker-server.ts
@@ -110,7 +102,6 @@
 3	server/src/cognitive/memory-attest.ts
 13	server/src/compliance/eu_ai_act/annex_iii.ts
 3	server/src/compliance/eu_ai_act/cli.ts
-28	server/src/compliance/eu_ai_act/coverage_matrix.ts
 9	server/src/compliance/eu_ai_act/generator.ts
 1	server/src/compliance/eu_ai_act/pdf.ts
 9	server/src/compliance/eu_ai_act/templates/01_annex_iv_technical_documentation.ts
@@ -128,13 +119,11 @@
 4	server/src/dashboard/aggregator.ts
 1	server/src/dashboard/html.ts
 5	server/src/dashboard/multi-html.ts
-1	server/src/disclosure/broker/keychain-backend.ts
 1	server/src/disclosure/tools.ts
 1	server/src/distress/local-secret.ts
 2	server/src/distress/tools.ts
-1	server/src/exit/cli.ts
 4	server/src/federation/registry.ts
-2	server/src/federation/tools.ts
+1	server/src/federation/tools.ts
 2	server/src/handshake/protocol.ts
 2	server/src/handshake/tools.ts
 5	server/src/index.ts
@@ -163,7 +152,6 @@
 3	server/src/sanctuary-tools.ts
 1	server/src/shr/decommission-verifier.ts
 12	server/src/shr/gateway-adapter.ts
-1	server/src/shr/generator.ts
 3	server/src/shr/verifier.ts
 2	server/src/substrate/verdict.ts
 8	server/src/system-prompt-generator.ts

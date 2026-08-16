@@ -27,6 +27,7 @@ import {
   NON_RELAXABLE_CASTLE_WALL_OBSERVE_TIER1_OPERATIONS,
   NON_RELAXABLE_ENFORCEMENT_EXPORT_TIER1_OPERATIONS,
   NON_RELAXABLE_MEMORY_INTEGRITY_TIER1_OPERATIONS,
+  NON_RELAXABLE_EXIT_V2_MEMORY_TIER1_OPERATIONS,
 } from "./loader.js";
 import type { AuditLog } from "../operational/audit-log.js";
 import { InjectionDetector, type DetectionResult } from "../security/injection-detector.js";
@@ -68,6 +69,7 @@ const FORCED_TIER1_OPERATIONS = [
   ...NON_RELAXABLE_CASTLE_WALL_OBSERVE_TIER1_OPERATIONS,
   ...NON_RELAXABLE_ENFORCEMENT_EXPORT_TIER1_OPERATIONS,
   ...NON_RELAXABLE_MEMORY_INTEGRITY_TIER1_OPERATIONS,
+  ...NON_RELAXABLE_EXIT_V2_MEMORY_TIER1_OPERATIONS,
 ] as const;
 
 /**
@@ -509,6 +511,13 @@ export class ApprovalGate {
       risk_tier: classification.tier,
     };
 
+    // Approval-proof invariant: a bearer approval_ref is not authority by
+    // itself. Rebuild the canonical envelope from THIS call before trusting it:
+    // hash equality binds the current args hash / tier / target / requester,
+    // "approved" rejects queued or denied records, absent plan_hash+step_id keeps
+    // compound-plan proofs out of the direct-tool path, expiry bounds capture
+    // replay, requester_fingerprint blocks cross-session proof theft, and nonce /
+    // target_resource / tool_name equality reject field-splice substitutions.
     const proofMatches =
       approvalEnvelopeHash(rebuilt) === record.envelope_hash &&
       record.decision === "approved" &&
@@ -524,6 +533,9 @@ export class ApprovalGate {
       return this.denyProof(toolName, args, classification.tier);
     }
 
+    // Single-use replay invariant: every check above is read-only; this consume
+    // is the linearization point. If another call already spent the same
+    // approval_ref, deny instead of reusing a once-valid human approval.
     const consumed = this.approvalProofStore.consumeIfUnconsumed(approvalRef);
     if (!consumed) {
       return this.denyProof(toolName, args, classification.tier);
@@ -749,6 +761,7 @@ export class ApprovalGate {
     // pending entry. Listener exceptions are swallowed (gate stays
     // load-bearing; aggregator is additive observation).
     const correlationId = `${requestTimestamp}:${operation}:${Math.random().toString(16).slice(2, 6)}`;
+    const approvalAuditId = `gate-approval-${randomBytes(16).toString("hex")}`;
     if (this.onApprovalEvent) {
       try {
         this.onApprovalEvent({
@@ -785,6 +798,8 @@ export class ApprovalGate {
           reason,
           decided_by: "channel_failure",
           channel_error: errMessage,
+          approval_audit_id: approvalAuditId,
+          ...(binding ? { normalized_args_hash: binding.argsHash } : {}),
         },
       });
       if (this.onApprovalEvent) {
@@ -821,6 +836,7 @@ export class ApprovalGate {
           decided_at: decidedAt,
           decided_by: "channel_failure",
         },
+        approval_audit_id: approvalAuditId,
       };
     }
 
@@ -834,6 +850,11 @@ export class ApprovalGate {
         tier,
         reason,
         decided_by: response.decided_by,
+        // This gate-minted id and the normalized argument hash make this exact
+        // durable decision, rather than a caller's correlation token, the
+        // approval provenance consumed by signed downstream artifacts.
+        approval_audit_id: approvalAuditId,
+        ...(binding ? { normalized_args_hash: binding.argsHash } : {}),
       },
     });
 
@@ -889,6 +910,7 @@ export class ApprovalGate {
         : AGENT_VISIBLE_DENY_REASONS.REQUIRES_APPROVAL,
       approval_required: true,
       approval_response: response,
+      approval_audit_id: approvalAuditId,
     };
   }
 

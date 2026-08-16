@@ -16,11 +16,13 @@ SWIFT_BUILD_CONFIG="${SWIFT_BUILD_CONFIG:-release}"
 BUILD_ROOT="${BUILD_ROOT:-${PKG_DIR}/build}"
 WRAPPED_APP_DIR="${WRAPPED_APP_DIR:-${BUILD_ROOT}/Sanctuary-CastleWall.app}"
 CASTLE_WALL_GIT_SHA="${CASTLE_WALL_GIT_SHA:-$(git -C "${REPO_DIR}" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)}"
+CASTLE_WALL_SOURCE_SHA="${CASTLE_WALL_SOURCE_SHA:-$(git -C "${REPO_DIR}" rev-parse HEAD 2>/dev/null || echo unknown)}"
+SANCTUARY_PACKAGE_VERSION="${SANCTUARY_PACKAGE_VERSION:-$(node -p "require('${REPO_DIR}/server/package.json').version")}"
 # Monotonic CFBundleVersion: macOS only replaces an activated system extension
 # when the version increases. A hardcoded version means rebuilt fixes never load
 # (root-caused on the 2026-06-11b W5 drill). git commit count is monotonic.
 CASTLE_WALL_BUNDLE_VERSION="${CASTLE_WALL_BUNDLE_VERSION:-$(git -C "${REPO_DIR}" rev-list --count HEAD 2>/dev/null || echo 10)}"
-CASTLE_WALL_HEADLESS_CONTRACT_VERSION="${CASTLE_WALL_HEADLESS_CONTRACT_VERSION:-2}"
+CASTLE_WALL_HEADLESS_CONTRACT_VERSION="${CASTLE_WALL_HEADLESS_CONTRACT_VERSION:-3}"
 
 HOST_TARGET="CastleWallHostApp"
 HOST_EXECUTABLE_NAME="CastleWallHostApp"
@@ -41,14 +43,31 @@ EXT_INFO_DST="${EXT_BUNDLE_DST}/Contents/Info.plist"
 
 # A2/B2 root signer helper + XPC shim + LaunchDaemon plist. The helper binary is
 # placed in Contents/MacOS with the on-disk name the plist BundleProgram expects.
-SIGNER_HELPER_TARGET="CastleWallSignerHelper"
 SIGNER_HELPER_EXE_NAME="CastleWallSignerHelper"
 SIGNER_HELPER_DST="${WRAPPED_APP_DIR}/Contents/MacOS/castle-wall-signer-helper"
-SIGNER_CLIENT_TARGET="CastleWallSignerClient"
 SIGNER_CLIENT_EXE_NAME="CastleWallSignerClient"
 SIGNER_CLIENT_DST="${WRAPPED_APP_DIR}/Contents/MacOS/castle-wall-signer-client"
 SIGNER_PLIST_SRC="${PKG_DIR}/Sources/CastleWallSignerHelper/ai.sanctuaryprotocol.macos.castle-wall.signer-helper.plist"
 SIGNER_PLIST_DST="${WRAPPED_APP_DIR}/Contents/Library/LaunchDaemons/ai.sanctuaryprotocol.macos.castle-wall.signer-helper.plist"
+
+# The root Castle Wall boot service snapshots these exact app-bundled assets
+# into root-owned custody. They must come from the same signed/notarized app as
+# the signer client, never from the operator's mutable Homebrew installation.
+BOOT_RUNTIME_DIR="${WRAPPED_APP_DIR}/Contents/Resources/boot-runtime"
+BOOT_RUNTIME_NODE_SRC="${SANCTUARY_BOOT_RUNTIME_NODE:-}"
+BOOT_RUNTIME_DAEMON_SRC="${SANCTUARY_BOOT_RUNTIME_DAEMON:-${REPO_DIR}/server/dist/boot-runtime/castle-wall-boot-daemon.js}"
+REQUIRE_BOOT_RUNTIME="${SANCTUARY_REQUIRE_BOOT_RUNTIME:-0}"
+# The signed app is also the clean-host CLI distribution. A factory Mac has no
+# Node/npm, so the agent-guided installer must be able to continue from bytes
+# already sealed by the app signature instead of inventing a package-manager
+# bootstrap outside the planner contract.
+CLI_RUNTIME_DIR="${WRAPPED_APP_DIR}/Contents/Resources/cli-runtime"
+CLI_RUNTIME_SRC="${SANCTUARY_CLI_RUNTIME_DIR:-${REPO_DIR}/server/dist}"
+CLI_RUNTIME_NODE_MODULES="${SANCTUARY_CLI_NODE_MODULES:-${REPO_DIR}/server/node_modules}"
+CLI_RUNTIME_PACKAGE_JSON="${SANCTUARY_CLI_PACKAGE_JSON:-${REPO_DIR}/server/package.json}"
+CLI_RUNTIME_MACH_O_SCANNER="${PKG_DIR}/scripts/list-cli-runtime-mach-o.mjs"
+SANCTUARY_LAUNCHER_EXE_NAME="SanctuaryLauncher"
+SANCTUARY_LAUNCHER_DST="${WRAPPED_APP_DIR}/Contents/MacOS/sanctuary"
 
 log() {
     echo "[build-wrapped] $*"
@@ -131,8 +150,10 @@ EXT_EXEC_SRC="${BIN_DIR}/${EXT_EXECUTABLE_NAME}"
 HOST_EXEC_SRC="${BIN_DIR}/${HOST_EXECUTABLE_NAME}"
 SIGNER_HELPER_SRC="${BIN_DIR}/${SIGNER_HELPER_EXE_NAME}"
 SIGNER_CLIENT_SRC="${BIN_DIR}/${SIGNER_CLIENT_EXE_NAME}"
+SANCTUARY_LAUNCHER_SRC="${BIN_DIR}/${SANCTUARY_LAUNCHER_EXE_NAME}"
 
 [ -x "${EXT_EXEC_SRC}" ] || fail "extension executable not found at ${EXT_EXEC_SRC}"
+[ -x "${SANCTUARY_LAUNCHER_SRC}" ] || fail "Sanctuary launcher not found at ${SANCTUARY_LAUNCHER_SRC}"
 
 log "step 2/5 - create wrapped bundle layout"
 rm -rf "${WRAPPED_APP_DIR}"
@@ -146,6 +167,8 @@ else
     cp "${EXT_EXEC_SRC}" "${HOST_EXEC_DST}"
 fi
 chmod +x "${HOST_EXEC_DST}" "${EXT_EXEC_DST}"
+cp "${SANCTUARY_LAUNCHER_SRC}" "${SANCTUARY_LAUNCHER_DST}"
+chmod 0555 "${SANCTUARY_LAUNCHER_DST}"
 
 # Bundle the A2/B2 signer helper + shim + LaunchDaemon plist when present.
 if [ -x "${SIGNER_HELPER_SRC}" ] && [ -x "${SIGNER_CLIENT_SRC}" ]; then
@@ -160,6 +183,37 @@ else
     log "signer helper/shim binaries not built; LaunchDaemon not bundled (pre-A2 layout)"
 fi
 
+if [ -n "${BOOT_RUNTIME_NODE_SRC}" ] && [ -x "${BOOT_RUNTIME_NODE_SRC}" ] && [ -f "${BOOT_RUNTIME_DAEMON_SRC}" ]; then
+    log "bundling sealed Castle Wall boot runtime"
+    mkdir -p "${BOOT_RUNTIME_DIR}"
+    cp "${BOOT_RUNTIME_NODE_SRC}" "${BOOT_RUNTIME_DIR}/node"
+    cp "${BOOT_RUNTIME_DAEMON_SRC}" "${BOOT_RUNTIME_DIR}/castle-wall-boot-daemon.js"
+    chmod 0555 "${BOOT_RUNTIME_DIR}/node"
+    chmod 0444 "${BOOT_RUNTIME_DIR}/castle-wall-boot-daemon.js"
+    if [ ! -f "${CLI_RUNTIME_SRC}/cli.js" ] \
+        || [ ! -d "${CLI_RUNTIME_SRC}/templates" ] \
+        || [ ! -d "${CLI_RUNTIME_SRC}/reference-plugin" ] \
+        || [ ! -d "${CLI_RUNTIME_NODE_MODULES}" ] \
+        || [ ! -f "${CLI_RUNTIME_PACKAGE_JSON}" ]; then
+        fail "signed build requires the built CLI runtime, templates, and reference plugins under ${CLI_RUNTIME_SRC}"
+    fi
+    log "bundling signed-app CLI runtime for factory hosts without Node/npm"
+    mkdir -p "${CLI_RUNTIME_DIR}/dist"
+    cp "${CLI_RUNTIME_SRC}/cli.js" "${CLI_RUNTIME_DIR}/dist/cli.js"
+    cp "${CLI_RUNTIME_PACKAGE_JSON}" "${CLI_RUNTIME_DIR}/package.json"
+    cp -R "${CLI_RUNTIME_SRC}/templates" "${CLI_RUNTIME_DIR}/templates"
+    cp -R "${CLI_RUNTIME_SRC}/reference-plugin" "${CLI_RUNTIME_DIR}/reference-plugin"
+    mkdir -p "${CLI_RUNTIME_DIR}/node_modules"
+    rsync -a --exclude='.bin' "${CLI_RUNTIME_NODE_MODULES}/" "${CLI_RUNTIME_DIR}/node_modules/"
+    if find "${CLI_RUNTIME_DIR}" -type l -print -quit | grep -q .; then
+        fail "CLI runtime must not contain symbolic links"
+    fi
+elif [ "${REQUIRE_BOOT_RUNTIME}" = "1" ]; then
+    fail "signed build requires SANCTUARY_BOOT_RUNTIME_NODE and built ${BOOT_RUNTIME_DAEMON_SRC}"
+else
+    log "boot runtime inputs absent; omitted from this non-release wrapped build"
+fi
+
 log "step 3/5 - install Info.plist files"
 if [ -f "${HOST_INFO_SRC}" ]; then
     cp "${HOST_INFO_SRC}" "${HOST_INFO_DST}"
@@ -172,6 +226,12 @@ cp "${EXT_INFO_SRC}" "${EXT_INFO_DST}"
 /usr/libexec/PlistBuddy -c "Set :CFBundleName Sanctuary-CastleWall" "${HOST_INFO_DST}" >/dev/null 2>&1 || true
 /usr/libexec/PlistBuddy -c "Set :SanctuaryCastleWallGitSHA ${CASTLE_WALL_GIT_SHA}" "${HOST_INFO_DST}" >/dev/null 2>&1 || \
     /usr/libexec/PlistBuddy -c "Add :SanctuaryCastleWallGitSHA string ${CASTLE_WALL_GIT_SHA}" "${HOST_INFO_DST}" >/dev/null
+/usr/libexec/PlistBuddy -c "Set :SanctuaryCastleWallSourceSHA ${CASTLE_WALL_SOURCE_SHA}" "${HOST_INFO_DST}" >/dev/null 2>&1 || \
+    /usr/libexec/PlistBuddy -c "Add :SanctuaryCastleWallSourceSHA string ${CASTLE_WALL_SOURCE_SHA}" "${HOST_INFO_DST}" >/dev/null
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${SANCTUARY_PACKAGE_VERSION}" "${HOST_INFO_DST}" >/dev/null 2>&1 || \
+    /usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string ${SANCTUARY_PACKAGE_VERSION}" "${HOST_INFO_DST}" >/dev/null
+/usr/libexec/PlistBuddy -c "Set :SanctuaryCliRuntimeVersion ${SANCTUARY_PACKAGE_VERSION}" "${HOST_INFO_DST}" >/dev/null 2>&1 || \
+    /usr/libexec/PlistBuddy -c "Add :SanctuaryCliRuntimeVersion string ${SANCTUARY_PACKAGE_VERSION}" "${HOST_INFO_DST}" >/dev/null
 /usr/libexec/PlistBuddy -c "Set :SanctuaryCastleWallHeadlessContractVersion ${CASTLE_WALL_HEADLESS_CONTRACT_VERSION}" "${HOST_INFO_DST}" >/dev/null 2>&1 || \
     /usr/libexec/PlistBuddy -c "Add :SanctuaryCastleWallHeadlessContractVersion string ${CASTLE_WALL_HEADLESS_CONTRACT_VERSION}" "${HOST_INFO_DST}" >/dev/null
 /usr/libexec/PlistBuddy -c "Set :CFBundleExecutable ${EXT_EXECUTABLE_NAME}" "${EXT_INFO_DST}" >/dev/null 2>&1
@@ -203,6 +263,17 @@ if [ -x "${SIGNER_HELPER_DST}" ] && [ -x "${SIGNER_CLIENT_DST}" ]; then
         --identifier ai.sanctuaryprotocol.macos.castle-wall.signer-client \
         "${SIGNER_CLIENT_DST}"
 fi
+codesign --force --sign - --timestamp=none \
+    --identifier ai.sanctuaryprotocol.macos.castle-wall.sanctuary-launcher \
+    "${SANCTUARY_LAUNCHER_DST}"
+if [ -d "${CLI_RUNTIME_DIR}/node_modules" ]; then
+    CLI_RUNTIME_MACH_O_COUNT=0
+    while IFS= read -r -d '' addon; do
+        codesign --force --sign - --timestamp=none "${addon}"
+        CLI_RUNTIME_MACH_O_COUNT=$((CLI_RUNTIME_MACH_O_COUNT + 1))
+    done < <(node "${CLI_RUNTIME_MACH_O_SCANNER}" "${CLI_RUNTIME_DIR}")
+    [ "${CLI_RUNTIME_MACH_O_COUNT}" -ge 2 ] || fail "expected at least two native Mach-O runtime files"
+fi
 codesign --force --sign - --timestamp=none "${WRAPPED_APP_DIR}"
 
 log "step 5/5 - verify structure and signatures"
@@ -212,6 +283,8 @@ file "${HOST_EXEC_DST}" | grep -q "Mach-O" || fail "host executable is not Mach-
 file "${EXT_EXEC_DST}" | grep -q "Mach-O" || fail "extension executable is not Mach-O: ${EXT_EXEC_DST}"
 codesign --verify --deep --strict "${WRAPPED_APP_DIR}"
 
-log "bundle tree:"
-find "${WRAPPED_APP_DIR}" -print
+log "bundle summary:"
+du -sh "${WRAPPED_APP_DIR}"
+find "${WRAPPED_APP_DIR}/Contents/MacOS" -type f -print
+find "${WRAPPED_APP_DIR}/Contents/Library/SystemExtensions" -type d -name '*.systemextension' -print
 log "DONE"

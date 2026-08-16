@@ -10,6 +10,12 @@ export type {
 } from "./schema.js";
 export { validateRule } from "./schema.js";
 
+export {
+  isAgentMatchableAllowRule,
+  isAgentMatchableAllowRuleFile,
+  listAgentMatchableAllowRuleFiles,
+} from "./agent-matchable.js";
+
 export type {
   AllowlistManifest,
   ManifestRuleEntry,

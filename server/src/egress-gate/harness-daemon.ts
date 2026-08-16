@@ -25,6 +25,17 @@
 
 import { isAbsolute, join } from "node:path";
 
+// The account-name contract is single-sourced: the safe charset and the
+// reserved privileged names this renderer refuses come from the zero-import
+// policy module every refusal site consumes, so this plist renderer stays
+// dependency-light (the module has zero dependency edges, test-enforced) while a stale local copy of
+// the list is impossible by construction. Enforced by
+// `server/test/structure/cross-file-contract-pins.test.ts`.
+import {
+  RESERVED_ACCOUNT_NAMES,
+  SAFE_SERVICE_ACCOUNT_RE,
+} from "../castle-wall/provision/account-name-policy.js";
+
 /** The LaunchDaemon label for the confined agent harness. */
 export const AGENT_HARNESS_DAEMON_LABEL = "ai.sanctuaryprotocol.agent-harness";
 
@@ -149,13 +160,6 @@ export function harnessLaunchSpec(input: {
   }) as HarnessLaunchSpec;
 }
 
-/**
- * POSIX-ish service-account name: lowercase start, then a conservative
- * charset. Deliberately rejects anything that could smuggle plist markup or
- * spaces, and `root`/`_root` style privileged names are checked separately.
- */
-const SAFE_ACCOUNT_RE = /^[a-z_][a-z0-9._-]{0,63}$/;
-
 function xmlEscape(value: string): string {
   return value
     .replace(/&/g, "&amp;")
@@ -243,12 +247,15 @@ export interface AgentHarnessDaemonPlistOptions {
  */
 export function renderAgentHarnessDaemonPlist(options: AgentHarnessDaemonPlistOptions): string {
   const account = options.agentAccount;
-  if (!SAFE_ACCOUNT_RE.test(account)) {
+  if (!SAFE_SERVICE_ACCOUNT_RE.test(account)) {
     throw new Error(`Agent account name is not a safe service-account name (got: ${JSON.stringify(account)}).`);
   }
-  if (account === "root" || account === "_root" || account === "daemon" || account === "wheel") {
-    // A privileged UserName would defeat the confinement this daemon exists
-    // to provide: the wall classifies by ruid, and root can rewrite policy.
+  // INVARIANT: a privileged UserName would defeat the confinement this daemon
+  // exists to provide. The wall classifies flows by ruid, so a shared
+  // privileged uid erases the per-agent attribution; and root -- or an `admin`
+  // account, which on macOS conventionally carries sudo -- can rewrite the
+  // policy that confines it, making the confinement self-revocable.
+  if (RESERVED_ACCOUNT_NAMES.has(account)) {
     throw new Error(`Refusing to render an agent-harness daemon running as "${account}".`);
   }
   if (options.programArguments.length === 0) {

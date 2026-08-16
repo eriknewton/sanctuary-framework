@@ -16,6 +16,7 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import type { AuditEntryInput } from "../operational/audit-log.js";
 import type { UpstreamServer } from "../sovereignty-profile.js";
+import { ASCII_LABEL_RE } from "../core/token-grammar.js";
 import { validateUpstreamSseUrl } from "./ssrf-validator.js";
 
 // ── Types ───────────────────────────────────────────────────────────────
@@ -162,11 +163,9 @@ export class ClientManager {
       throw new Error(`Maximum ${MAX_UPSTREAM_SERVERS} upstream servers allowed`);
     }
 
-    // SEC-047: Validate server names before processing
-    const SAFE_SERVER_NAME = /^[a-zA-Z0-9_-]+$/;
-
     const newNames = new Set(servers.filter(s => {
-      if (!SAFE_SERVER_NAME.test(s.name)) {
+      // SEC-047: Validate server names before processing.
+      if (!ASCII_LABEL_RE.test(s.name)) {
         return false; // Skip servers with unsafe names
       }
       return s.enabled;
@@ -182,7 +181,7 @@ export class ClientManager {
     // Connect new/updated servers
     for (const server of servers) {
       // SEC-047: Validate server name
-      if (!SAFE_SERVER_NAME.test(server.name)) {
+      if (!ASCII_LABEL_RE.test(server.name)) {
         continue; // Skip servers with unsafe names
       }
 

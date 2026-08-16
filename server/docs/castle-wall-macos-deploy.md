@@ -22,7 +22,7 @@ This doc originally staged large parts of the flow as unbuilt "Phase 2 /
 Alpha-3 / Alpha-4" scope. Those have since shipped. What is live today (traced to
 ASSURANCE_MATRIX row 18 "Egress enforcement: macOS"):
 
-- **The system extension enforces per-uid allow/deny that survives reboot** on a
+- **The system extension enforces per-uid allow/deny that survives attended reboot cycles** on a
   Developer-ID-signed + notarized + stapled binary, proven by the drills linked
   in ASSURANCE_MATRIX row 18. Do not claim beyond that row (in particular this is
   NOT tamper-evident per-flow audit).
@@ -120,6 +120,14 @@ SIGNING_IDENTITY="Developer ID Application: Your Name (TEAMID)" \
   ./castle-wall-macos/scripts/build-signed.sh
 ```
 
+### Build gotchas
+
+| Gotcha | Symptom | What to do |
+|---|---|---|
+| **Someone else's cert is the default** | The script's built-in `SIGNING_IDENTITY` is the maintainer's cert, so on any other machine the preflight refuses with `signing identity '<name>' not in keychain` and exits 1 before building anything | export `SIGNING_IDENTITY` with your own Developer ID Application common name; `security find-identity -v -p codesigning` prints the exact string |
+| **No partition-list grant on the login keychain** | The build **appears to hang.** It signs several bundles in sequence, and without the grant macOS pops a "codesign wants to use key" dialog for each one. Over SSH or from an automated thread there is nobody to click them, so the terminal simply stops with no error | run the one-time grant interactively: `security set-key-partition-list -S apple-tool:,apple:,codesign: -s ~/Library/Keychains/login.keychain-db`. For a session that must self-heal (a locked keychain after sleep re-introduces the prompts), export `SANCTUARY_KEYCHAIN_PW` and the script re-asserts the grant and unlocks before signing |
+| **Wrong keychain password when self-healing** | `keychain unlock failed (wrong SANCTUARY_KEYCHAIN_PW?)`, exit 1 | fix the value, or unset it and rely on the one-time grant |
+
 ## Verify the signed `.app`
 
 ```bash
@@ -142,6 +150,13 @@ codesign -d --entitlements - castle-wall-macos/build/CastleWallExtension.app
 #   com.apple.security.network.client
 ```
 
+Failure mode: `codesign -d` writes its report to **stderr**, not stdout. Piping it
+(`codesign -dvvv ... | grep Authority`) returns nothing at all, which reads as an
+unsigned bundle when the signature is fine. Redirect first (`2>&1 | grep ...`) before
+concluding anything from an empty result. Read these three commands as a set: the first
+two can pass on a bundle whose entitlements are missing, and an extension without
+`com.apple.developer.networking.networkextension` installs and then never filters.
+
 ## Notarize (operator step, optional)
 
 Notarization is required for distribution to other Macs. Submit to
@@ -157,6 +172,21 @@ xcrun stapler staple castle-wall-macos/build/CastleWallExtension.app
 
 Sanctuary itself does not perform this step; it is operator-controlled
 infrastructure.
+
+Failure mode: the two commands are one step, and skipping the second one fails later
+and elsewhere. `notarytool submit --wait` can report `Accepted` while the bundle on
+disk still carries no stapled ticket, so Gatekeeper has to reach Apple to verify it.
+The build machine, which is online and has already seen the ticket, launches it
+without complaint. The failure surfaces on the target Mac, offline or behind a
+restrictive network, as a refusal to launch that looks like a signing problem rather
+than a missing staple. Run `xcrun stapler validate <path>.app` on the artifact you
+are about to ship, not on the one you just submitted.
+
+Failure mode: `--wait` blocks until Apple answers, and the answer can be `Invalid`.
+Read the printed status line explicitly and pull the detail with `xcrun notarytool log
+<submission-id>` when it is anything other than `Accepted`. A rejected submission
+changes nothing on disk, so `build/` looks identical either way and a later `stapler
+staple` is the first thing that complains.
 
 ## Run Sanctuary main with the listener active
 
@@ -259,7 +289,7 @@ menubar notification fire within ~50ms of the block.
 
 ## Castle-walking acknowledgement
 
-This PR IS the load-bearing Castle Layer 1 enforcement piece on
+This PR IS the Castle Layer 1 enforcement piece that does the blocking on
 Apple silicon: the kernel-level decision sits inside
 `CastleWallFilterProvider.handleNewFlow` (a `NEFilterDataProvider`
 subclass), which sysextd loads as a kernel extension. Real

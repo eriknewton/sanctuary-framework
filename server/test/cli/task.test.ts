@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { runTaskCommand } from "../../src/cli/task.js";
 import type { Task } from "../../src/operational/task-coordination/index.js";
 import { writeLockdownStatus } from "../../src/lockdown/status.js";
+import { writeTenantRuntime } from "../../src/cli/agents/runtime.js";
 
 class StringWritable extends Writable {
   chunks: string[] = [];
@@ -206,6 +207,33 @@ describe("sanctuary task CLI", () => {
     );
   });
 
+  it("routes --fortress=<path> through that fortress runtime", async () => {
+    const scopedFortress = await mkdtemp(join(tmpdir(), "sanctuary-task-scoped-"));
+    try {
+      await writeTenantRuntime(scopedFortress, {
+        version: "test",
+        pid: process.pid,
+        started_at: new Date().toISOString(),
+        dashboard_host: "127.0.0.1",
+        dashboard_port: 3920,
+        mode: "standalone",
+      });
+      const fetchSpy = vi.fn(async (url: string | URL) => {
+        expect(String(url)).toBe("http://127.0.0.1:3920/api/hub/tasks");
+        return okJson({ ok: true, data: { tasks } });
+      });
+      globalThis.fetch = fetchSpy as unknown as typeof globalThis.fetch;
+
+      const { code, err } = await run(["list", "--json", `--fortress=${scopedFortress}`]);
+
+      expect(code).toBe(0);
+      expect(err.text).toBe("");
+      expect(fetchSpy).toHaveBeenCalledOnce();
+    } finally {
+      await rm(scopedFortress, { recursive: true, force: true });
+    }
+  });
+
   it("prints a lockdown banner for task list reads", async () => {
     installTaskFetch();
     await writeLockdownStatus(fortressPath, {
@@ -218,7 +246,7 @@ describe("sanctuary task CLI", () => {
 
     expect(listed.code).toBe(0);
     expect(listed.out.text).toContain(
-      "Fortress is LOCKED (since 2026-05-19T12:00:00.000Z). Reads permitted; writes blocked.",
+      "Fortress lockdown active since 2026-05-19T12:00:00.000Z. Confined agents' network access was revoked; local reads and writes are not blocked by this marker.",
     );
     expect(listed.out.text).toContain("task-1");
   });

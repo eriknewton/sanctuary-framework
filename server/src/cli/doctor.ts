@@ -32,6 +32,7 @@ import {
   verifyAuditChainRecords,
   type ExportRecord,
 } from "./audit-chain-verify.js";
+import { flagValue } from "./argv.js";
 
 // Canonical version source. A bare `require("../../package.json")` resolves to
 // the repo-root package.json (no `version`) when bundled to server/dist/; the
@@ -405,7 +406,24 @@ async function checkAuditChain(
     .map((line) => JSON.parse(line) as ExportRecord);
   const report = verifyAuditChainRecords(records);
   if (report.verdict === "PASS") {
+    if (report.signatures_verified === 0 && report.signatures_skipped > 0) {
+      return warn(
+        "audit chain",
+        "no checkpoint signature was verified",
+        "wire a production checkpoint signer before treating checkpoint signatures as evidence",
+      );
+    }
     return ok("audit chain", `${report.entries_verified} entries verified`, "none");
+  }
+  if (
+    report.findings.length > 0 &&
+    report.findings.every((finding) => finding.kind === "checkpoint_signature_missing_key")
+  ) {
+    return warn(
+      "audit chain",
+      "checkpoint signatures were not verified against a pinned public key",
+      "run 'sanctuary audit-chain verify --public-key <signer-public-key>' with the signer key obtained out-of-band",
+    );
   }
   return fail("audit chain", `${report.findings.length} integrity finding(s)`, "run sanctuary audit-chain export and verify for details");
 }
@@ -523,11 +541,4 @@ policy, audit-chain integrity, runtime versions, the Hermes config parser,
 and Castle Wall status.
 `,
   );
-}
-
-function flagValue(argv: string[], name: string): string | undefined {
-  const index = argv.indexOf(name);
-  if (index !== -1) return argv[index + 1];
-  const prefixed = argv.find((arg) => arg.startsWith(`${name}=`));
-  return prefixed?.slice(name.length + 1);
 }

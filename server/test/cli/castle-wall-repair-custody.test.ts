@@ -406,11 +406,27 @@ describe("castle-wall repair-custody", () => {
 
   it("parses its own args and rejects unknown ones", async () => {
     expect(parseRepairCustodyArgs(["--fortress", "/f"])).toEqual({ fortress: "/f" });
+    expect(parseRepairCustodyArgs(["--fortress=/scratch"])).toEqual({
+      fortress: "/scratch",
+    });
+    expect(parseRepairCustodyArgs(["--fortress"]).error).toBe(
+      "--fortress requires a value",
+    );
     expect(parseRepairCustodyArgs(["--rollback", "/m.json"])).toEqual({ rollback: "/m.json" });
     expect(parseRepairCustodyArgs(["--bogus"]).unknown).toBe("--bogus");
     const fake = rootOwnedFortress();
     const ctx = baseCtx(fake, "/unused");
     expect(await runRepairCustody(["--bogus"], ctx)).toBe(REPAIR_CUSTODY_EXIT_REFUSED);
+  });
+
+  it("refuses a trailing fortress flag before repairing the ambient fortress", async () => {
+    const fake = rootOwnedFortress();
+    const ctx = baseCtx(fake, "/unused");
+    const code = await runRepairCustody(["--fortress"], ctx);
+
+    expect(code).toBe(REPAIR_CUSTODY_EXIT_REFUSED);
+    expect(ctx.err.text()).toContain("--fortress requires a value");
+    expect(fake.nodes.get("/Users/mini2/.sanctuary")!.uid).toBe(0);
   });
 
   it("REFUSES a rollback manifest from outside the root-owned manifest directory (gate BLOCKER-2)", async () => {

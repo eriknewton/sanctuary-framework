@@ -58,6 +58,11 @@ import { ed25519 } from "@noble/curves/ed25519";
 import { fromBase64url, toBase64url, stringToBytes } from "../core/encoding.js";
 import { hashToString } from "../core/hashing.js";
 import { generateKeypair } from "../core/identity.js";
+import { isAsciiLabel } from "../core/token-grammar.js";
+import {
+  ED25519_PRIVATE_KEY_BYTES,
+  ED25519_PUBLIC_KEY_BYTES,
+} from "../core/crypto-suite-registry.js";
 
 // ── Public types ─────────────────────────────────────────────────────
 
@@ -289,8 +294,6 @@ const DEFAULT_RECOMMENDED_PERIODIC_DAYS = 365;
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
 
 const HOST_RE = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$/i;
-const FORTRESS_LABEL_RE = /^[a-zA-Z0-9_-]{1,64}$/;
-const AGENT_LABEL_RE = /^[a-zA-Z0-9_-]{1,64}$/;
 const METADATA_AUTHORITY_HOSTS = new Set([
   "metadata.google.internal",
   "metadata.goog",
@@ -306,17 +309,17 @@ export async function issueDidWeb(
       `did-web: authority_host '${opts.authority_host}' is not a valid DNS host`,
     );
   }
-  if (!FORTRESS_LABEL_RE.test(opts.fortress_id)) {
+  if (!isAsciiLabel(opts.fortress_id, { maxLength: 64 })) {
     throw new Error(
       `did-web: fortress_id '${opts.fortress_id}' is not a valid label`,
     );
   }
-  if (opts.agent_label !== undefined && !AGENT_LABEL_RE.test(opts.agent_label)) {
+  if (opts.agent_label !== undefined && !isAsciiLabel(opts.agent_label, { maxLength: 64 })) {
     throw new Error(
       `did-web: agent_label '${opts.agent_label}' is not a valid label`,
     );
   }
-  if (opts.public_key.length !== 32) {
+  if (opts.public_key.length !== ED25519_PUBLIC_KEY_BYTES) {
     throw new Error(
       `did-web: public_key must be exactly 32 bytes (Ed25519), got ${opts.public_key.length}`,
     );
@@ -400,7 +403,7 @@ export async function rotateDidWebKey(
   const generated = opts.new_public_key ? undefined : generateKeypair();
   const newPublicKey = opts.new_public_key ?? generated!.publicKey;
   generated?.privateKey.fill(0);
-  if (newPublicKey.length !== 32) {
+  if (newPublicKey.length !== ED25519_PUBLIC_KEY_BYTES) {
     throw new Error(
       `did-web: new public key must be exactly 32 bytes (Ed25519), got ${newPublicKey.length}`,
     );
@@ -499,6 +502,7 @@ export async function resolveDidWeb(
   const url = didToUrl(parsed);
   const unsafeHost = unsafeAuthorityHostReason(parsed.authority_host);
   if (unsafeHost !== undefined) {
+    // Authority hosts are refused before fetch; a did:web string cannot steer resolution to local or private infrastructure.
     return {
       ok: false,
       failure: "host_not_allowed",
@@ -508,6 +512,7 @@ export async function resolveDidWeb(
   }
 
   if (!opts.allowed_hosts.includes(parsed.authority_host)) {
+    // The operator allowlist is the network boundary; a syntactically valid DID never grants outbound fetch authority by itself.
     return {
       ok: false,
       failure: "host_not_allowed",
@@ -519,6 +524,7 @@ export async function resolveDidWeb(
   if (opts.fetcher === undefined) {
     const resolvedHostFailure = await resolvedHostNotPublicReason(parsed.authority_host);
     if (resolvedHostFailure !== undefined) {
+      // DNS is rechecked for the production fetcher so an allowed hostname cannot resolve into loopback or private space.
       return {
         ok: false,
         failure: "host_not_allowed",
@@ -594,6 +600,7 @@ export async function resolveDidWeb(
   }
 
   if (!isDidDocument(body, did)) {
+    // DID document binding is checked against the requested DID; an authority cannot answer with a document for another id.
     return {
       ok: false,
       failure: "invalid_json",
@@ -604,6 +611,7 @@ export async function resolveDidWeb(
 
   if (opts.expected_public_key !== undefined) {
     const expectedX = toBase64url(opts.expected_public_key);
+    // DID key binding is caller-pinned: a fetched document is trusted only if it carries the expected assertion key for this time.
     const selected = selectVerificationMethod(
       body,
       expectedX,
@@ -662,12 +670,12 @@ export function parseDidWeb(did: string): ParsedDidWeb {
   ) {
     const fortressId = segments[2]!;
     const agentLabel = segments[4]!;
-    if (!FORTRESS_LABEL_RE.test(fortressId)) {
+    if (!isAsciiLabel(fortressId, { maxLength: 64 })) {
       throw new Error(
         `did-web: fortress_id '${fortressId}' is not a valid label`,
       );
     }
-    if (!AGENT_LABEL_RE.test(agentLabel)) {
+    if (!isAsciiLabel(agentLabel, { maxLength: 64 })) {
       throw new Error(
         `did-web: agent_label '${agentLabel}' is not a valid label`,
       );
@@ -757,6 +765,7 @@ function selectVerificationMethod(
   );
   if (matches.length === 0) return undefined;
   const activeIds = new Set([...doc.authentication, ...doc.assertionMethod]);
+  // Historical-key acceptance is bounded by assertion_time plus the caller-pinned key, never by a remote document's claim alone.
   return (
     matches.find((vm) => activeIds.has(vm.id)) ??
     matches.find((vm) => vm.status === "previous" || vm.status === "revoked") ??
@@ -788,6 +797,7 @@ function canonicalSerializeDidDocument(doc: DidDocument): string {
 function isDidDocument(value: unknown, expectedDid: string): value is DidDocument {
   if (!value || typeof value !== "object") return false;
   const v = value as Record<string, unknown>;
+  // The fetched document's `id` must equal the requested DID before any verification method is considered authoritative.
   if (v["id"] !== expectedDid) return false;
   if (!Array.isArray(v["@context"])) return false;
   const vm = v["verificationMethod"];
@@ -1072,6 +1082,7 @@ export async function tryLoadFortressDidWebRecord(
 function isFortressDidWebRecord(value: unknown): value is FortressDidWebRecord {
   if (!value || typeof value !== "object") return false;
   const v = value as Record<string, unknown>;
+  // Local registry records must prove the v1 shape before they can become the fortress DID source of truth.
   if (v["version"] !== 1) return false;
   const id = v["identifier"] as Record<string, unknown> | undefined;
   if (!id || typeof id !== "object") return false;
@@ -1198,7 +1209,7 @@ export async function deriveDidWebFromPrivateKey(opts: {
   private_key: Uint8Array;
   now?: () => Date;
 }): Promise<DidWebIdentifier> {
-  if (opts.private_key.length !== 32) {
+  if (opts.private_key.length !== ED25519_PRIVATE_KEY_BYTES) {
     throw new Error("did-web: private_key must be 32-byte Ed25519 seed");
   }
   const publicKey = ed25519.getPublicKey(opts.private_key);

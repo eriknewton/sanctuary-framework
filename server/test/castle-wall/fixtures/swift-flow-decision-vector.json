@@ -1,0 +1,25 @@
+{
+  "_comment": "Producer-signature CROSS-LANGUAGE byte-compat vector for a macOS Swift flow_decision_recorded body (C2). The canonical body and signature were emitted by castle-wall-macos AuditProducerChain.buildSignedFlowDecision using CryptoKit Curve25519.Signing over AuditProducerSigningConstants.domainPrefix + canonical + captured_at_unix_ms + seq. TypeScript loads this fixture through audit-consumer-chain-basis.test.ts and must verify/chains over the exact Swift-emitted canonical string. The Swift test regenerates the same body from the deterministic seed and fails if its emitter drifts. The keypair is deterministic test material, not a production key.",
+  "seed_note": "Curve25519.Signing.PrivateKey raw seed = bytes 1..=32 (1,2,...,32).",
+  "pubkey_b64url": "ebVWLo_mVPlAeLES6KmLp5AfhTrmlb7X4OORC60ElmQ",
+  "canonical": "{\"details\":{\"agent_id\":\"fffffffff7010000f7010000f7010000f701000069020000ae86010066050000\",\"agent_template\":\"tpl\",\"decision\":\"drop\",\"dest_ip\":\"203.0.113.9\",\"dest_port\":443,\"dest_protocol\":\"tcp\",\"prior_sha256_hex\":null,\"rule_id\":null,\"seq\":0,\"source\":\"macos_extension\"},\"identity_id\":\"fffffffff7010000f7010000f7010000f701000069020000ae86010066050000\",\"layer\":\"l1\",\"operation\":\"egress_blocked\",\"result\":\"blocked\",\"timestamp\":\"2025-06-15T15:06:40.000Z\"}",
+  "canonical_sha256_hex": "5742d5e52fd44d018d799f779edea755d159ac5849763e49c38ef4b2fa547a20",
+  "captured_at_unix_ms": 1750000000000,
+  "seq": 0,
+  "prior_sha256_hex": null,
+  "key_id": "cw-audit-producer-v1",
+  "sig_b64url": "iP_sLU2iVqbNZkFF-X7k5-JeInuv0tSPVhbnxSnemS4pJVg5PqqJmuWDPxueTnZja9QCRo5eV58aS0tDzkxgCw",
+  "flow": {
+    "fortress_id": "f",
+    "event_type": "egress_blocked",
+    "agent_id": "fffffffff7010000f7010000f7010000f701000069020000ae86010066050000",
+    "agent_template": "tpl",
+    "dest_host": null,
+    "dest_ip": "203.0.113.9",
+    "dest_port": 443,
+    "dest_protocol": "tcp",
+    "decision": "drop",
+    "matched_rule_id": null,
+    "recorded_at": "2025-06-15T15:06:40.000Z"
+  }
+}

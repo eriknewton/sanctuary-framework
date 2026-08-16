@@ -1,3 +1,4 @@
+// fail-before-exempt: authenticated StateStore fixture wiring only; key-resolution fail-before coverage lives in state-envelope-integrity.test.ts and master-rotation.test.ts
 /**
  * Memory checkpoint restore tests.
  *
@@ -37,6 +38,7 @@ import {
   restoreCheckpoint,
   type CheckpointPoisonMap,
 } from "../../src/memory-checkpoint/index.js";
+import { persistStoredIdentity } from "../util/persist-stored-identity.js";
 
 type AuditAppend = Pick<AuditLog, "append">["append"];
 type AuditAppendCritical = Pick<AuditLog, "appendCritical">["appendCritical"];
@@ -87,6 +89,7 @@ async function makeFixture(now = "2026-08-03T12:00:00.000Z"): Promise<Fixture> {
   const stateStore = new RealStateStore(storage, masterKey);
   const identityEncKey = derivePurposeKey(masterKey, "identity-encryption");
   const identity = createIdentity("restore-test", identityEncKey, "recovery-key");
+  await persistStoredIdentity(storage, masterKey, identity.storedIdentity);
   const checkpointStore = new MemoryCheckpointStore({
     fortressPath,
     clock: { now: () => new Date(now) },

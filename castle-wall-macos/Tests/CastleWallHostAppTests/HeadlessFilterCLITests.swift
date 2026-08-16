@@ -10,8 +10,8 @@ final class HeadlessFilterCLITests: XCTestCase {
         XCTAssertNil(HeadlessFilterCLI.parse(["app", "-NSDocumentRevisionsDebugMode", "YES"]))
     }
 
-    func testParseEnableDisableStatus() {
-        for action in ["enable", "disable", "status"] {
+    func testParseAllActions() {
+        for action in ["enable", "disable", "status", "deactivate-system-extension"] {
             let result = HeadlessFilterCLI.parse(["app", "--headless", action])
             guard case let .invocation(invocation)? = result else {
                 XCTFail("expected invocation for \(action), got \(String(describing: result))")
@@ -59,7 +59,7 @@ final class HeadlessFilterCLITests: XCTestCase {
         guard case let .usageError(message)? = HeadlessFilterCLI.parse(["app", "--headless"]) else {
             return XCTFail("expected usageError")
         }
-        XCTAssertTrue(message.contains("enable|disable|status"))
+        XCTAssertTrue(message.contains("enable|disable|status|deactivate-system-extension"))
     }
 
     func testParseUnknownArgumentIsUsageError() {
@@ -166,7 +166,7 @@ final class HeadlessFilterCLITests: XCTestCase {
         XCTAssertFalse(encoded.contains("\n"))
         XCTAssertEqual(
             encoded,
-            #"{"action":"enable","build":{"git_sha":"abc1234","headless_contract_version":"2"},"ok":true,"state":"enabled"}"#
+            #"{"action":"enable","build":{"git_sha":"abc1234","headless_contract_version":"3"},"ok":true,"state":"enabled"}"#
         )
     }
 
@@ -178,7 +178,7 @@ final class HeadlessFilterCLITests: XCTestCase {
         let encoded = HeadlessFilterCLI.encode(report)
         XCTAssertTrue(encoded.contains(#""state":"needs_user_approval""#))
         XCTAssertTrue(encoded.contains(#""ok":false"#))
-        XCTAssertTrue(encoded.contains(#""headless_contract_version":"2""#))
+        XCTAssertTrue(encoded.contains(#""headless_contract_version":"3""#))
     }
 
     func testReportCarriesCurrentBuildIdentity() {
@@ -198,5 +198,31 @@ final class HeadlessFilterCLITests: XCTestCase {
         XCTAssertEqual(HeadlessFilterCLI.ExitCode.usage.rawValue, 2)
         XCTAssertEqual(HeadlessFilterCLI.ExitCode.needsUserApproval.rawValue, 3)
         XCTAssertEqual(HeadlessFilterCLI.ExitCode.timeout.rawValue, 4)
+    }
+
+    func testSystemExtensionDeactivationReportsKeepCompletedAndRebootDeferredDistinct() {
+        let completed = HeadlessFilterCLI.reportForSystemExtensionDeactivation(.deactivated)
+        XCTAssertEqual(completed.exitCode, .success)
+        XCTAssertTrue(completed.report.ok)
+        XCTAssertEqual(completed.report.state, "deactivated")
+
+        let deferred = HeadlessFilterCLI.reportForSystemExtensionDeactivation(.willCompleteAfterReboot)
+        XCTAssertEqual(deferred.exitCode, .success)
+        XCTAssertTrue(deferred.report.ok)
+        XCTAssertEqual(deferred.report.state, "will_complete_after_reboot")
+    }
+
+    func testSystemExtensionDeactivationFailureStatesStayNonSuccess() {
+        let approval = HeadlessFilterCLI.reportForSystemExtensionDeactivation(.needsUserApproval)
+        XCTAssertEqual(approval.exitCode, .needsUserApproval)
+        XCTAssertFalse(approval.report.ok)
+
+        let timeout = HeadlessFilterCLI.reportForSystemExtensionDeactivation(.timedOut)
+        XCTAssertEqual(timeout.exitCode, .timeout)
+        XCTAssertFalse(timeout.report.ok)
+
+        let failure = HeadlessFilterCLI.reportForSystemExtensionDeactivation(.failed("boom"))
+        XCTAssertEqual(failure.exitCode, .failure)
+        XCTAssertEqual(failure.report.error, "boom")
     }
 }

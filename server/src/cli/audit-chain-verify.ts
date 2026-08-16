@@ -17,21 +17,42 @@
  *      MAC (the export carries it for exactly that purpose). The report states
  *      this bound in `rotation_anchor_scope`.
  *
- * STANDALONE PROPERTY: This module imports only @noble/curves, @noble/hashes,
- * and Node builtins (node:fs, node:crypto). It does NOT import from any
- * Sanctuary server module (no storage backend, no AuditLog, no encryption
- * key required). A security reviewer can run it against an exported chain
- * without a running Sanctuary server.
+ * STANDALONE PROPERTY, stated precisely (corrected 2026-08-05; the previous
+ * wording claimed this module imports NO Sanctuary server module, which was
+ * already false when it was written). What is true, and what the property
+ * actually buys, is that NOTHING on this module's transitive import graph
+ * requires a running server, a fortress, storage, or key material:
+ *
+ *   - `@noble/curves`, `@noble/hashes`, and Node builtins.
+ *   - `../lockdown/status.js`, whose own imports are `node:fs/promises` and
+ *     `node:path` and nothing else.
+ *   - `../audit/checkpoint-shape.js`, which has ZERO imports of any kind and
+ *     exists specifically so this file and the raw exporter can share
+ *     definitions rather than hand-copy them.
+ *
+ * So: no storage backend, no AuditLog, no encryption key, no passphrase. A
+ * security reviewer can run it against an exported chain without a running
+ * Sanctuary server. The rule for future edits is the CAPABILITY bound above,
+ * not a literal no-server-imports rule: adding an import is fine only if it
+ * drags in nothing that needs a live fortress.
  *
  * Usage:
  *   sanctuary audit-chain verify --input chain.jsonl [--public-key <base64url>]
+ *   sanctuary audit-chain verify --input chain.jsonl --trust-embedded
  *   sanctuary audit-chain verify --input chain.jsonl --no-strict
+ *     # still reports FAIL findings, then exits 10 after completing verification
  */
 
 import { readFileSync } from "node:fs";
 import { ed25519 } from "@noble/curves/ed25519";
 import { sha256 } from "@noble/hashes/sha256";
 import { lockdownBanner, readLockdownStatus } from "../lockdown/status.js";
+import { flagValue } from "./argv.js";
+import {
+  AUDIT_CHAIN_GENESIS,
+  AUDIT_CHAIN_SCHEMA_VERSION,
+  AUDIT_CHECKPOINT_DOMAIN_PREFIX,
+} from "../audit/checkpoint-shape.js";
 
 // ---- Minimal canonical-JSON implementation (no server imports) ---------------
 
@@ -45,6 +66,11 @@ function canonicalJson(value: unknown): string {
   const record = value as Record<string, unknown>;
   return `{${Object.keys(record)
     .sort()
+    // Invariant: `undefined` means "field absent," never signable data. Without
+    // this filter the hand-built object path would emit `"key":undefined`,
+    // while JSON object serialization drops the same field entirely; the
+    // standalone verifier carries this exact rule and the structure gate keeps
+    // the two bodies byte-equivalent.
     .filter((key) => record[key] !== undefined)
     .map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
     .join(",")}}`;
@@ -70,6 +96,22 @@ function fromBase64url(s: string): Uint8Array {
   return out;
 }
 
+function toBase64url(bytes: Uint8Array): string {
+  const base64 = Buffer.from(bytes).toString("base64");
+  return base64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function fromBase64urlStrict(s: string): Uint8Array {
+  if (!/^[A-Za-z0-9\-_]*$/.test(s) || s.length % 4 === 1) {
+    throw new TypeError("non-canonical base64url");
+  }
+  const decoded = fromBase64url(s);
+  if (toBase64url(decoded) !== s) {
+    throw new TypeError("non-canonical base64url");
+  }
+  return decoded;
+}
+
 function toHex(bytes: Uint8Array): string {
   return Array.from(bytes)
     .map((b) => b.toString(16).padStart(2, "0"))
@@ -83,9 +125,17 @@ function sha256Hex(input: string): string {
   return toHex(sha256(bytes));
 }
 
-const AUDIT_CHAIN_GENESIS = "GENESIS";
-const AUDIT_CHAIN_SCHEMA_VERSION = 2;
-const AUDIT_CHECKPOINT_DOMAIN_PREFIX = "sanctuary.audit-checkpoint.v1\n";
+// These three are IMPORTED from `audit/checkpoint-shape.js` at the top of this
+// file, not re-typed, so they cannot drift. That module has ZERO imports (it
+// exists precisely so the raw exporter and this verifier can share definitions
+// without pulling the server runtime in), which is why importing it costs this
+// module nothing. `canonicalJson`, `computeAuditEntryHash`, `computeAuditRoot`,
+// and `checkpointSigningBytes` below are still hand-duplicated from
+// `audit/chain.ts`, because `checkpointSigningBytes` needs `stringToBytes` from
+// `core/encoding.ts` and cannot move to the zero-import module. A drifted copy
+// of THOSE compiles and runs; it just reports a signature FAILURE on a valid
+// chain, which reads as tampering rather than as drift.
+// Enforced by `server/test/structure/cross-file-contract-pins.test.ts`.
 
 interface AuditEntryHashInput {
   sequence: number;
@@ -124,8 +174,8 @@ function verifyEd25519(
   publicKeyB64: string
 ): boolean {
   try {
-    const sig = fromBase64url(signatureB64);
-    const pub = fromBase64url(publicKeyB64);
+    const sig = fromBase64urlStrict(signatureB64);
+    const pub = fromBase64urlStrict(publicKeyB64);
     return ed25519.verify(sig, message, pub);
   } catch {
     return false;
@@ -215,11 +265,18 @@ export interface RecordFinding {
 }
 
 export type VerifyVerdict = "PASS" | "FAIL";
+export type SignatureBasis = "pinned" | "embedded" | "none";
+export const AUDIT_CHAIN_VERIFY_EXIT_OK = 0;
+export const AUDIT_CHAIN_VERIFY_EXIT_STRICT_FINDINGS = 1;
+export const AUDIT_CHAIN_VERIFY_EXIT_RELAXED_FINDINGS = 10;
 
 export interface VerifyReport {
   verdict: VerifyVerdict;
   entries_verified: number;
   checkpoints_verified: number;
+  signature_basis: SignatureBasis;
+  signatures_verified: number;
+  signatures_skipped: number;
   legacy_anchors_verified: number;
   findings: RecordFinding[];
   /**
@@ -248,15 +305,24 @@ export const ROTATION_ANCHOR_SCOPE =
  *
  * @param records - Parsed records from the export file (entries + checkpoints in any order)
  * @param opts.publicKey - Optional base64url-encoded public key override for checkpoint verification.
- *   If omitted, each checkpoint's embedded public_key field is used.
- * @param opts.strict - If true (default), any finding results in FAIL verdict.
+ *   If omitted, signed checkpoints are not verified unless trustEmbedded is explicitly true.
+ * @param opts.trustEmbedded - Explicit opt-in to verify against checkpoint-embedded keys.
+ *   Embedded-key verification proves internal consistency, not signer identity.
+ * @param opts.strict - Backwards-compatible no-op. Exit strictness is applied
+ *   by the CLI layer after report generation, never by this verifier.
  */
 export function verifyAuditChainRecords(
   records: ExportRecord[],
-  opts: { publicKey?: string; strict?: boolean } = {}
+  opts: { publicKey?: string; strict?: boolean; trustEmbedded?: boolean } = {}
 ): VerifyReport {
-  const strict = opts.strict ?? true;
   const findings: RecordFinding[] = [];
+  let signaturesVerified = 0;
+  let signaturesSkipped = 0;
+  const signatureBasis: SignatureBasis = opts.publicKey
+    ? "pinned"
+    : opts.trustEmbedded
+      ? "embedded"
+      : "none";
 
   // Partition records
   const entries = records
@@ -282,8 +348,11 @@ export function verifyAuditChainRecords(
       verdict: "FAIL",
       entries_verified: 0,
       checkpoints_verified: 0,
+      signature_basis: "none",
+      signatures_verified: 0,
+      signatures_skipped: 0,
       legacy_anchors_verified: 0,
-    rotation_anchor_scope: ROTATION_ANCHOR_SCOPE,
+      rotation_anchor_scope: ROTATION_ANCHOR_SCOPE,
       findings: [
         {
           kind: "empty_input",
@@ -413,13 +482,19 @@ export function verifyAuditChainRecords(
     }
 
     // Signature verification
-    if (!cp.unsigned) {
-      const pubKey = opts.publicKey ?? cp.public_key;
+    if (cp.unsigned) {
+      signaturesSkipped += 1;
+    } else {
+      // Embedded checkpoint keys are attacker-controllable in an export; using
+      // them as verification evidence requires an explicit self-check opt-in.
+      const pubKey = opts.publicKey ?? (opts.trustEmbedded ? cp.public_key : undefined);
       if (!pubKey) {
         findings.push({
           kind: "checkpoint_signature_missing_key",
           seq: cp.checkpoint_sequence,
-          message: `Checkpoint at seq ${cp.checkpoint_sequence} has no public key for signature verification`,
+          message:
+            `Checkpoint at seq ${cp.checkpoint_sequence} was not verified against a trusted public key; ` +
+            "pass --public-key with an out-of-band signer key, or explicitly use --trust-embedded for an internal-consistency check only",
         });
       } else if (!cp.signature) {
         findings.push({
@@ -438,7 +513,9 @@ export function verifyAuditChainRecords(
         };
         const sigBytes = checkpointSigningBytes(payload);
         const valid = verifyEd25519(sigBytes, cp.signature, pubKey);
-        if (!valid) {
+        if (valid) {
+          signaturesVerified += 1;
+        } else {
           findings.push({
             kind: "checkpoint_signature_invalid",
             seq: cp.checkpoint_sequence,
@@ -464,13 +541,17 @@ export function verifyAuditChainRecords(
     }
   }
 
-  const verdict: VerifyVerdict =
-    strict && findings.length > 0 ? "FAIL" : findings.length === 0 ? "PASS" : "PASS";
+  const verdict: VerifyVerdict = findings.length > 0 ? "FAIL" : "PASS";
 
   return {
     verdict,
     entries_verified: entries.length,
     checkpoints_verified: checkpoints.length,
+    signature_basis: signatureBasis,
+    signatures_verified: signaturesVerified,
+    // These counters are positive evidence, not a partition: missing-key and
+    // marked-signed-without-signature checkpoints produce findings instead.
+    signatures_skipped: signaturesSkipped,
     legacy_anchors_verified: legacyAnchors.length,
     rotation_anchor_scope: ROTATION_ANCHOR_SCOPE,
     findings,
@@ -499,6 +580,9 @@ export function emptyInputReport(): VerifyReport {
     verdict: "FAIL",
     entries_verified: 0,
     checkpoints_verified: 0,
+    signature_basis: "none",
+    signatures_verified: 0,
+    signatures_skipped: 0,
     legacy_anchors_verified: 0,
     rotation_anchor_scope: ROTATION_ANCHOR_SCOPE,
     findings: [
@@ -516,6 +600,9 @@ export function malformedInputReport(err: unknown): VerifyReport {
     verdict: "FAIL",
     entries_verified: 0,
     checkpoints_verified: 0,
+    signature_basis: "none",
+    signatures_verified: 0,
+    signatures_skipped: 0,
     legacy_anchors_verified: 0,
     rotation_anchor_scope: ROTATION_ANCHOR_SCOPE,
     findings: [
@@ -529,7 +616,7 @@ export function malformedInputReport(err: unknown): VerifyReport {
 
 export function verifyAuditChainContent(
   content: string,
-  opts: { publicKey?: string; strict?: boolean } = {}
+  opts: { publicKey?: string; strict?: boolean; trustEmbedded?: boolean } = {}
 ): VerifyReport {
   if (content.length === 0) {
     return emptyInputReport();
@@ -545,12 +632,23 @@ export function verifyAuditChainContent(
   return verifyAuditChainRecords(records, opts);
 }
 
+export function auditChainVerifyExitCode(
+  report: VerifyReport,
+  strict: boolean,
+): number {
+  if (report.verdict === "PASS") return AUDIT_CHAIN_VERIFY_EXIT_OK;
+  return strict
+    ? AUDIT_CHAIN_VERIFY_EXIT_STRICT_FINDINGS
+    : AUDIT_CHAIN_VERIFY_EXIT_RELAXED_FINDINGS;
+}
+
 // ---- CLI entry point --------------------------------------------------------
 
 export interface VerifyArgs {
   input: string;
   strict: boolean;
   publicKey?: string;
+  trustEmbedded: boolean;
   storagePath?: string;
 }
 
@@ -558,17 +656,18 @@ export function parseVerifyArgs(argv: string[], env?: NodeJS.ProcessEnv): Verify
   const input = flagValue(argv, "--input") ?? flagValue(argv, "-i") ?? "";
   const strict = !argv.includes("--no-strict");
   const publicKey = flagValue(argv, "--public-key");
+  const trustEmbedded = argv.includes("--trust-embedded");
   const storagePath =
     flagValue(argv, "--storage-path") ??
     env?.SANCTUARY_STORAGE_PATH ??
     env?.SANCTUARY_FORTRESS_PATH;
-  return { input, strict, publicKey, storagePath };
+  return { input, strict, publicKey, trustEmbedded, storagePath };
 }
 
-export async function runVerify(args: VerifyArgs): Promise<void> {
+export async function runVerify(args: VerifyArgs): Promise<number> {
   if (!args.input) {
     process.stderr.write("Error: --input <path> is required\n");
-    process.exit(1);
+    return 1;
   }
 
   let content: string;
@@ -576,25 +675,18 @@ export async function runVerify(args: VerifyArgs): Promise<void> {
     content = readFileSync(args.input, "utf8");
   } catch (err) {
     process.stderr.write(`Error reading ${args.input}: ${String(err)}\n`);
-    process.exit(1);
+    return 1;
   }
 
   const report = verifyAuditChainContent(content, {
     publicKey: args.publicKey,
     strict: args.strict,
+    trustEmbedded: args.trustEmbedded,
   });
 
   const banner = lockdownBanner(await readLockdownStatus(args.storagePath));
   if (banner) process.stderr.write(banner);
   process.stdout.write(JSON.stringify(report, null, 2) + "\n");
 
-  if (args.strict && report.verdict === "FAIL") {
-    process.exit(1);
-  }
-}
-
-function flagValue(argv: string[], name: string): string | undefined {
-  const index = argv.indexOf(name);
-  if (index === -1) return undefined;
-  return argv[index + 1];
+  return auditChainVerifyExitCode(report, args.strict);
 }

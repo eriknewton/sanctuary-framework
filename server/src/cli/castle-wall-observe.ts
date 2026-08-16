@@ -107,6 +107,8 @@ import {
   type SourceReadOutcome,
   type VerifiedEmpty,
 } from "../claim-witness.js";
+import { ED25519_PUBLIC_KEY_BYTES } from "../core/crypto-suite-registry.js";
+import { flagValue, flagValues } from "./argv.js";
 
 /** Same on-disk filenames `runProvisionPin` (cli/castle-wall.ts) establishes under the fortress root. Re-declared here (that module keeps them private) rather than reused, since they are plain filename literals, not secret material. */
 const CASTLE_PINNED_PUBKEY = "castle-pinned-pubkey.bin";
@@ -130,22 +132,6 @@ export interface ObserveCommandContext {
 
 function write(stream: Writable, text: string): void {
   stream.write(text);
-}
-
-function flagValue(argv: string[], name: string): string | undefined {
-  const index = argv.indexOf(name);
-  if (index === -1) return undefined;
-  return argv[index + 1];
-}
-
-function flagValues(argv: string[], name: string): string[] {
-  const values: string[] = [];
-  for (let i = 0; i < argv.length; i++) {
-    if (argv[i] === name && argv[i + 1] !== undefined) {
-      values.push(argv[i + 1]!);
-    }
-  }
-  return values;
 }
 
 function hasFlag(argv: string[], name: string): boolean {
@@ -1254,7 +1240,7 @@ export async function readAllowlistForRefresh(fortressPath: string): Promise<Ref
   let pinnedPublicKey: Uint8Array;
   try {
     const pub = await readFile(join(fortressPath, CASTLE_PINNED_PUBKEY));
-    if (pub.length !== 32) {
+    if (pub.length !== ED25519_PUBLIC_KEY_BYTES) {
       return {
         status: "unverified",
         reason: `pinned public key must be 32 bytes (found ${pub.length})`,
@@ -1572,7 +1558,7 @@ async function loadPinnedPublicKey(fortressPath: string, err: Writable): Promise
   const pubPath = join(fortressPath, CASTLE_PINNED_PUBKEY);
   try {
     const pub = await readFile(pubPath);
-    if (pub.length !== 32) {
+    if (pub.length !== ED25519_PUBLIC_KEY_BYTES) {
       write(err, `Error: pinned public key at ${pubPath} must be 32 bytes (found ${pub.length}).\n`);
       return null;
     }

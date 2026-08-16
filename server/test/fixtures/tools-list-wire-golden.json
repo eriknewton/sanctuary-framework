@@ -1,5 +1,5 @@
 {
-  "tool_count": 97,
+  "tool_count": 101,
   "tools": [
     {
       "name": "identity_create",
@@ -447,6 +447,10 @@
           "identity_id": {
             "type": "string",
             "description": "Optional identity this policy is bound to"
+          },
+          "policy_id": {
+            "type": "string",
+            "description": "Optional: id of an existing policy created by THIS session to update in place (replaces its rules without minting a new id or consuming a new policy slot). Omit to create a new policy; an id belonging to a different session is refused."
           }
         },
         "required": [
@@ -641,7 +645,7 @@
           },
           "counterparty_attestation": {
             "type": "string",
-            "description": "Counterparty's signed attestation of the same interaction"
+            "description": "Optional raw counterparty attestation attachment. Presence alone is not treated as verified confirmation."
           },
           "identity_id": {
             "type": "string",
@@ -1827,6 +1831,116 @@
         },
         "required": [
           "passage_id"
+        ]
+      }
+    },
+    {
+      "name": "memory_ingest",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "harness": {
+            "type": "string",
+            "enum": [
+              "claude-code",
+              "codex"
+            ],
+            "description": "Harness memory-file format to ingest"
+          },
+          "dir": {
+            "type": "string",
+            "description": "Path to the harness memory directory to read"
+          }
+        },
+        "required": [
+          "harness",
+          "dir"
+        ]
+      }
+    },
+    {
+      "name": "memory_emit",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "harness": {
+            "type": "string",
+            "enum": [
+              "claude-code",
+              "codex"
+            ],
+            "description": "Harness memory-file format to emit"
+          },
+          "dir": {
+            "type": "string",
+            "description": "Output directory; existing memory files are never overwritten"
+          }
+        },
+        "required": [
+          "harness",
+          "dir"
+        ]
+      }
+    },
+    {
+      "name": "memory_transcode",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "from_harness": {
+            "type": "string",
+            "enum": [
+              "claude-code",
+              "codex"
+            ],
+            "description": "Harness format already mirrored into this owner-scoped vault"
+          },
+          "to_harness": {
+            "type": "string",
+            "enum": [
+              "claude-code",
+              "codex"
+            ],
+            "description": "Different harness format to project as plaintext"
+          },
+          "dir": {
+            "type": "string",
+            "description": "Empty output directory; existing files are never overwritten"
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "reversible"
+            ],
+            "description": "Frozen reversible archive plus native plaintext projection"
+          }
+        },
+        "required": [
+          "from_harness",
+          "to_harness",
+          "dir",
+          "mode"
+        ]
+      }
+    },
+    {
+      "name": "memory_transcode_restore",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "archive_id": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{32}$",
+            "description": "Opaque archive_id returned by memory_transcode"
+          },
+          "dir": {
+            "type": "string",
+            "description": "Empty output directory; existing files are never overwritten"
+          }
+        },
+        "required": [
+          "archive_id",
+          "dir"
         ]
       }
     },

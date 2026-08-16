@@ -27,6 +27,10 @@ import type {
   PeerId,
 } from "@libp2p/interface";
 import { fromBase64url } from "../../core/encoding.js";
+import {
+  ED25519_PRIVATE_KEY_BYTES,
+  ED25519_PUBLIC_KEY_BYTES,
+} from "../../core/crypto-suite-registry.js";
 
 /**
  * Cross-`@libp2p/interface`-major key bridges.
@@ -83,7 +87,7 @@ function asConsumerPublicKey<T extends { readonly type: string }>(
 export async function libp2pPrivateKeyFromSanctuarySeed(
   seed: Uint8Array
 ): Promise<Ed25519PrivateKey> {
-  if (seed.length !== 32) {
+  if (seed.length !== ED25519_PRIVATE_KEY_BYTES) {
     throw new Error(
       `libp2pPrivateKeyFromSanctuarySeed: expected 32-byte Ed25519 seed; got ${seed.length}`
     );
@@ -112,7 +116,7 @@ export async function peerIdFromSanctuarySeed(
  */
 export function peerIdFromSanctuaryPubkey(pubkeyBase64url: string): PeerId {
   const raw = fromBase64url(pubkeyBase64url);
-  if (raw.length !== 32) {
+  if (raw.length !== ED25519_PUBLIC_KEY_BYTES) {
     throw new Error(
       `peerIdFromSanctuaryPubkey: expected 32-byte Ed25519 pubkey; got ${raw.length}`
     );

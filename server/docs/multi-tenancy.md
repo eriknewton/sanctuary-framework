@@ -1,9 +1,9 @@
 # Running Multiple Sanctuary Agents on One Host
 
 Sanctuary v0.10.0 ships first-class multi-tenancy: you can wrap two or more
-agents on the same machine — each with its own encrypted state, its own
-dashboard, and its own approval webhook — without any code changes and
-without risk of cross-agent data leakage.
+agents on the same machine, each with its own encrypted state, dashboard, and
+approval webhook, without any code changes and without risk of cross-agent
+data leakage.
 
 This document explains how.
 
@@ -15,12 +15,12 @@ A single host often runs more than one autonomous agent: a development
 assistant, a research sub-agent, a cron-driven broadcaster. Giving every
 agent its own sovereignty layer means:
 
-- **Isolated state** — one agent's credentials, memory, and audit log are
+- **Isolated state:** one agent's credentials, memory, and audit log are
   encrypted under a per-tenant master key. A compromise of agent A cannot
   read agent B's data.
-- **Isolated identity** — each agent gets its own Ed25519 keypair and DID.
+- **Isolated identity:** each agent gets its own Ed25519 keypair and DID.
   Attestations are scoped and portable.
-- **Isolated approval surface** — a Tier 1 operation in agent A surfaces on
+- **Isolated approval surface:** a Tier 1 operation in agent A surfaces on
   agent A's dashboard, never on agent B's.
 
 ---
@@ -41,7 +41,7 @@ before invoking `sanctuary wrap` for each agent.
 
 **Rule of thumb:** the only variable you *must* set for multi-tenancy is
 `SANCTUARY_STORAGE_PATH`. Everything else isolates automatically once the
-storage path is distinct — dashboard port auto-fallback handles 3501→3510,
+storage path is distinct: dashboard port auto-fallback handles 3501 to 3510,
 and each tenant gets its own passphrase derived from its own Keychain item
 or fallback file under its own storage path.
 
@@ -85,8 +85,8 @@ npx @sanctuary-framework/mcp-server wrap --claude-code
 
 After both wraps, each dashboard runs independently:
 
-- Agent A — http://127.0.0.1:3501
-- Agent B — http://127.0.0.1:3502
+- Agent A: http://127.0.0.1:3501
+- Agent B: http://127.0.0.1:3502
 
 ### Verifying isolation
 
@@ -123,7 +123,7 @@ security find-generic-password -a sanctuary -s sanctuary-passphrase-<suffix> -w
 The encryption key each agent uses for its state, audit log, identities,
 and reputation is derived via Argon2id from its own passphrase, then split
 per namespace via HKDF-SHA256 domain separation. Agent A cannot decrypt
-Agent B's data even if an attacker gains access to B's storage path —
+Agent B's data even if an attacker gains access to B's storage path;
 they would still need B's passphrase.
 
 ---
@@ -158,6 +158,20 @@ Keychain item (macOS only), which is namespaced to the path.
 
 ## Common gotchas
 
+- **`--fortress` goes before the subcommand, and getting it wrong is usually silent.**
+  The top-level parser reads the flag only from the position ahead of the
+  subcommand. A subcommand that does not parse it itself ignores it and falls
+  back to `~/.sanctuary`, so `sanctuary <cmd> --fortress ~/.sanctuary/nsa`
+  reports on the default fortress and looks exactly like a correct answer.
+  Write it as `sanctuary --fortress ~/.sanctuary/nsa <cmd>`, or export
+  `SANCTUARY_STORAGE_PATH` for the whole shell as the recipe above does, which
+  is the harder shape to get wrong. `doctor`, `agents` and `intelligence` happen
+  to accept the flag in either position, which is what makes the habit easy to
+  form. `secrets` is the one command that refuses the trailing form (exit 2)
+  rather than ignoring it, because there the dropped flag wrote a credential
+  into the wrong fortress. Every other non-parsing command is still silent, so
+  do not read the `secrets` refusal as a guarantee that a missing refusal means
+  the flag was honored.
 - **Sharing `SANCTUARY_STORAGE_PATH` across two agents is unsupported.**
   Concurrent writes from two Sanctuary instances to the same storage root
   will race on audit log rotation and version metadata. Always set a
@@ -232,7 +246,7 @@ cd server && npm test -- --run test/integration/multi-instance-isolation.test.ts
 
 ## Operating multiple tenants
 
-### `sanctuary agents` — inventory CLI
+### `sanctuary agents`: inventory CLI
 
 Once you have two or more wrapped tenants on a host, `sanctuary agents`
 gives you a read-only inventory without needing any tenant's passphrase.
@@ -251,7 +265,7 @@ sanctuary agents list
 # Machine-readable output for scripts.
 sanctuary agents list --json
 
-# One-line summary per tenant — good for `watch`.
+# One-line summary per tenant, good for `watch`.
 sanctuary agents status
 
 # Details for a single tenant.
@@ -268,7 +282,7 @@ sanctuary agents show nsa
 ```
 
 Scope note: the CLI is read-only and never decrypts tenant state. There is
-no `sanctuary agents create` / `init` verb — tenant creation is still done
+no `sanctuary agents create` / `init` verb. Tenant creation is still done
 via `sanctuary wrap` with `SANCTUARY_STORAGE_PATH` set, exactly as above.
 Use `sanctuary agents` to audit what's on the host afterwards.
 
@@ -282,9 +296,9 @@ Two ways, both additive:
   ["/srv/sanctuary/a", "/srv/sanctuary/b"]
   ```
 
-### `sanctuary dashboard --multi` — multi-agent overview
+### `sanctuary dashboard --multi`: multi-agent overview
 
-The single-tenant dashboard still works exactly as before — nothing
+The single-tenant dashboard still works exactly as before; nothing
 changes for users with one wrapped agent. For hosts with more than one
 tenant, `sanctuary dashboard --multi` starts a lightweight HTTP portal
 (default port `3500`) that shows every tenant in a table and deep-links
@@ -294,9 +308,15 @@ into each one's per-tenant dashboard.
 # Start the overview on the default port (3500).
 sanctuary dashboard --multi
 
-# Or pick an explicit port / host.
-SANCTUARY_MULTI_DASHBOARD_PORT=4000 sanctuary dashboard --multi --host 0.0.0.0
+# Or pick an explicit local port.
+SANCTUARY_MULTI_DASHBOARD_PORT=4000 sanctuary dashboard --multi
 ```
+
+The multi-agent dashboard now refuses a non-loopback plaintext bind unless
+`dashboard.allow_plaintext_remote: true` is set for an already-encrypted
+network layer such as Tailscale or WireGuard. If a remote bind is allowed and
+no bearer token is configured, startup mints and prints an operator token so
+`--host 0.0.0.0` does not expose tenant metadata unauthenticated.
 
 The portal:
 
@@ -306,7 +326,7 @@ The portal:
   the dashboard port.
 - Probes each tenant's `/api/health` to show live running / stopped.
 - Does **not** aggregate tenant reputation, audit logs, or any decrypted
-  state — each tenant's encrypted data stays in that tenant's dashboard.
+  state. Each tenant's encrypted data stays in that tenant's dashboard.
 - Exposes `/api/agents` for machine consumption (same JSON shape as
   `sanctuary agents list --json`).
 

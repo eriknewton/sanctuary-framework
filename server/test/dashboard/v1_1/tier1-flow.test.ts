@@ -6,7 +6,7 @@
  * flip to engaged.
  *
  * The Tier 1 button copy table at status-mapping.ts is the source of truth
- * for state transitions: idle → pending → engaged. Cancellation:
+ * for state transitions: idle → pending → partial / engaged. Cancellation:
  * pending → idle on inbox deny.
  */
 
@@ -14,10 +14,11 @@ import { describe, expect, it } from "vitest";
 import { TIER1_BUTTON_COPY } from "../../../src/dashboard/v1_1/status-mapping.js";
 
 describe("v1.1 dashboard Tier 1 button copy", () => {
-  it("lockdown has three states: idle / pending / engaged", () => {
+  it("lockdown has four states: idle / pending / partial / engaged", () => {
     const c = TIER1_BUTTON_COPY.lockdown;
     expect(c.idle).toBe("Lockdown");
     expect(c.pending).toBe("Awaiting approval");
+    expect(c.partial).toBe("Lockdown partial");
     expect(c.engaged).toBe("Lockdown ON");
     expect(c.cancelled).toContain("not engaged");
   });
@@ -66,9 +67,42 @@ describe("v1.1 dashboard Tier 1 client logic", () => {
       "../../../src/dashboard/v1_1/client.js"
     );
     const src = getClientScript();
-    // Engaged transition lives in the inbox handler; gated by
-    // (action === "approve") ? "engaged" : "idle".
-    expect(src).toMatch(/action === "approve" \? "engaged" : "idle"/);
+    // Engaged transition lives in the inbox handler; approval alone is not
+    // enough unless the resolved item reports an engaged lockdown outcome.
+    expect(src).toContain('action === "approve" && payload.outcome === "engaged"');
+  });
+
+  it("client script renders partial lockdown as a distinct non-idle state", async () => {
+    const { getClientScript } = await import(
+      "../../../src/dashboard/v1_1/client.js"
+    );
+    const src = getClientScript();
+    expect(src).toContain('t1.state === "partial"');
+    expect(src).toContain('payload.outcome === "partial"');
+    expect(src).toContain("Lockdown partial");
+  });
+
+  it("client script does not render failed lockdown approvals as engaged", async () => {
+    const { getClientScript } = await import(
+      "../../../src/dashboard/v1_1/client.js"
+    );
+    const src = getClientScript();
+    const pattern = new RegExp(
+      [
+        "if \\(item && state\\.tier1\\.lockdown\\.inboxItemId === itemId\\)",
+        "[\\s\\S]+?renderTopbar\\(\\);",
+      ].join(""),
+    );
+    const lockdownApprovalBlock =
+      src.match(pattern)?.[0] ?? "";
+    expect(lockdownApprovalBlock).toContain('payload.outcome === "engaged"');
+    expect(lockdownApprovalBlock).toContain('payload.outcome === "partial"');
+    expect(lockdownApprovalBlock).toContain(
+      'state.tier1.lockdown.state = "idle";',
+    );
+    expect(lockdownApprovalBlock).not.toContain(
+      'payload.outcome === "failed"',
+    );
   });
 
   it("client script sends bearer and prompts for mutating 401 responses", async () => {

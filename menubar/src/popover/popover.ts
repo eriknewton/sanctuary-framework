@@ -162,6 +162,20 @@ export class PopoverView {
 
   private renderFooter(snapshot: FleetSnapshot): HTMLElement {
     const footer = document.createElement('div');
+    // The `status-` class is BUILT, not written out, so the two class names it
+    // can produce that carry styling -- `status-degraded` and
+    // `status-disconnected` -- appear nowhere in this file as literals. Their
+    // only literal spelling is the selector pair in
+    // `menubar/src/styles/popover.css` (`.status-degraded .status-dot`,
+    // `.status-disconnected .status-dot`), which must match the members of the
+    // `FleetSnapshot.connection_status` union in `menubar/src/api/client.ts`.
+    // `connected` deliberately has no rule: the base `.status-dot` colour IS
+    // the connected state.
+    //
+    // Failure mode: rename a union member and nothing breaks, throws, or fails
+    // to compile. The CSS selector simply stops matching and the dot silently
+    // renders in the connected colour, so a disconnected fortress looks
+    // healthy. A grep for the CSS class will not find this producer either.
     footer.className = `popover-footer status-${snapshot.connection_status}`;
     footer.innerHTML = `
       <div class="connection-info">

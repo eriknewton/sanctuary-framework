@@ -1964,7 +1964,12 @@ export const CLAIM_SITES: Record<ClaimSiteId, ClaimSiteDeclaration> = {
  * not a count.
  */
 export const CLAIM_LITERAL_COUNTS: Readonly<Record<string, number>> = {
+  // account-name-policy.ts (2026-08-15, G6): the shared zero-dependency
+  // account-name contract (charset regex + reserved set + the WIDEN decision
+  // record). Prose and constants only; no claim-shaped booleans.
+  [`${CW}/account-name-policy.ts`]: 0,
   [`${CW}/account.ts`]: 1,
+  [`${CW}/agent-stop.ts`]: 0,
   [`${CW}/detect.ts`]: 0,
   [`${CW}/egress.ts`]: 5,
   [`${CW}/exclusive-arm.ts`]: 3,

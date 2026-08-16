@@ -21,11 +21,15 @@ import { createDisclosureTools } from "./disclosure/tools.js";
 import { createReputationTools } from "./reputation/tools.js";
 import { loadPrincipalPolicy, MalformedPrincipalPolicyError } from "./principal-policy/loader.js";
 import type { IdentityManager } from "./cognitive/tools.js";
-import type { PrincipalPolicy } from "./principal-policy/types.js";
+import type {
+  ApprovalRequest,
+  ApprovalResponse,
+  PrincipalPolicy,
+} from "./principal-policy/types.js";
 import { BaselineTracker } from "./principal-policy/baseline.js";
-import { StderrApprovalChannel } from "./principal-policy/approval-channel.js";
+import type { ApprovalChannel } from "./principal-policy/approval-channel.js";
 import { DashboardApprovalChannel } from "./principal-policy/dashboard.js";
-import { WebhookApprovalChannel } from "./principal-policy/webhook.js";
+import { selectApprovalChannelByPolicy } from "./principal-policy/channel-selection.js";
 import { ApprovalGate } from "./principal-policy/gate.js";
 import {
   ApprovalAggregator,
@@ -103,6 +107,8 @@ import { createGovernorTools } from "./operational/governor-tools.js";
 import { createSanctuaryTools } from "./sanctuary-tools.js";
 import { createMemoryAttestTools } from "./cognitive/memory-attest.js";
 import { createSdwMemoryTools, memoryInsertApprovalArgs } from "./sdw/memory-tools.js";
+import { createSdwMemoryFileTools } from "./sdw/memory-file-tools.js";
+import { createMultiAgentIsolationGuard } from "./sdw/memory-isolation.js";
 import { createSdwMemoryProvenanceTool } from "./sdw/memory-provenance-tool.js";
 import { SdwMemoryBackendAdapter } from "./sdw/adapters/sdw-memory-backend.js";
 import { createComplianceTools } from "./compliance/eu_ai_act/generator.js";
@@ -139,6 +145,7 @@ import {
   buildV11Bindings,
   fortressIdFromStoragePath,
 } from "./dashboard/v1_1/wiring.js";
+import { OperatorAuthorizationSpentStore } from "./v1/operator-authorization-spent-store.js";
 import { SubstrateSelector } from "./intelligence/selector.js";
 import { installConsentGatedRedactor } from "./intelligence/privacy-tier2-redactor.js";
 // Agent-facing audit redaction (property #11, no-policy-inference). Single-sourced
@@ -174,6 +181,12 @@ export async function createSanctuaryServer(options?: {
   configPath?: string;
   passphrase?: string;
   storage?: StorageBackend;
+  /**
+   * Embedding-only implementation for approval_channel.type: callback. The MCP
+   * stdio server has no native callback transport, so callback policy selection
+   * without this hook is a startup error.
+   */
+  approvalCallback?: (request: ApprovalRequest) => Promise<ApprovalResponse>;
 }): Promise<SanctuaryServer> {
   // 1. Load configuration
   const config = await loadConfig(options?.configPath);
@@ -790,7 +803,7 @@ export async function createSanctuaryServer(options?: {
 
   // 12. Create Handshake tools (sovereignty handshake protocol)
   // Must be created before L4 so handshakeResults can feed tier resolution
-  const { tools: handshakeTools, handshakeResults } = createHandshakeTools(
+  const { tools: handshakeTools, handshakeResults, handshakeResultWriterOrigins } = createHandshakeTools(
     config,
     identityManager,
     masterKey,
@@ -829,15 +842,31 @@ export async function createSanctuaryServer(options?: {
   // 14b. Create Federation tools (MCP-to-MCP)
   const { tools: federationTools } = createFederationTools(
     auditLog,
-    handshakeResults
+    handshakeResults,
+    identityManager,
+    handshakeResultWriterOrigins
   );
 
-  // 14c. Create Bridge tools (Concordia integration)
+  // 14c. Create Bridge tools (Concordia integration). `reputationStore` is
+  // the SAME instance createReputationTools (step 13) constructed and
+  // returned — NOT a second `new ReputationStore(...)` (LD3 gate
+  // fix-round-2, MUST-FIX 2). Before this fix, createBridgeTools built its
+  // own ReputationStore internally, so this live server ran TWO independent
+  // in-memory admission locks and quota views over the SAME `_reputation`
+  // storage backend: a concurrent reputation_record (through step 13's
+  // store) and bridge_attest (through this factory's OWN, separate store)
+  // could each observe pre-write headroom on their own store's view and
+  // both write, overshooting MAX_REPUTATION_RECORDS(_PER_ORIGIN) together —
+  // a per-instance admission lock only serializes callers that share the
+  // SAME instance. Injecting the one store built at step 13 makes this the
+  // only ReputationStore construction reachable in the live server's
+  // composition graph.
   const { tools: bridgeTools } = createBridgeTools(
     storage,
     masterKey,
     identityManager,
     auditLog,
+    reputationStore,
     handshakeResults
   );
 
@@ -883,6 +912,39 @@ export async function createSanctuaryServer(options?: {
   // 14h. Create Sovereignty Profile tools
   const { tools: profileTools } = createSovereigntyProfileTools(profileStore, auditLog);
 
+  // 14i. Construct the per-fortress Sentinel/Anomaly finding store HERE,
+  // ahead of both the embedded-dashboard wiring below (which used to
+  // construct its OWN independent instance inside `buildV11Bindings`) and
+  // the sentinel-dispatch boot path further down (step "v1.3 WP-V1.3-1
+  // Phi-1"). MUST-FIX 5 (fix-round-2 RECHECK): those were previously TWO
+  // separate `SentinelFindingStore` objects reading/writing the SAME
+  // storage namespace for the SAME fortress, each with its own in-memory
+  // filter index (sentinel-finding-store.ts's `this.index`) — a write
+  // through one instance never updated the other's index, so a query
+  // against whichever instance did NOT receive the write (e.g. the
+  // dashboard's anomaly binding reading findings the boot-path sentinel
+  // dispatcher persisted, or vice versa) silently missed them. One shared
+  // instance closes this: every production consumer of this fortress's
+  // finding store now reads/writes the SAME index. `fortressIdFromStoragePath`
+  // is a pure function of `config.storage_path` (used identically at both
+  // this store's original construction site and in `buildV11Bindings`'s
+  // call below), so calling it here ahead of `fortressIdForAggregator`
+  // (declared later) is behavior-preserving — same value either way.
+  const sentinelFindingStore = new SentinelFindingStore({
+    storage,
+    masterKey,
+    fortressId: fortressIdFromStoragePath(config.storage_path),
+    auditLog,
+  });
+  // Register Z-HNY-02: fire-and-forget at construction, mirroring the
+  // conciergeMemory.pruneExpired() pattern in dashboard/v1_1/wiring.ts, so
+  // the fortress-unlock cycle drops expired findings before any honeypot or
+  // sentinel activity accumulates on top of them.
+  void sentinelFindingStore.pruneExpired().catch(() => {
+    // Best-effort: a transient storage hiccup should not block boot. The
+    // next unlock re-runs the prune.
+  });
+
   // 15. Load Principal Policy and create approval gate
   let policy: PrincipalPolicy;
   try {
@@ -898,8 +960,7 @@ export async function createSanctuaryServer(options?: {
   const baseline = new BaselineTracker(storage, masterKey);
   await baseline.load();
 
-  // Choose approval channel: dashboard (web UI), webhook (external), or stderr (auto-deny)
-  let approvalChannel: StderrApprovalChannel | DashboardApprovalChannel | WebhookApprovalChannel;
+  let approvalChannel: ApprovalChannel;
   let dashboard: DashboardApprovalChannel | undefined;
 
   // WP-V1.3-5 Pi-2: the Intelligence Substrate Selector is hoisted to
@@ -918,24 +979,16 @@ export async function createSanctuaryServer(options?: {
   // construct (the route then honestly reports inactive).
   let tierBPiiRedactorInstalled = false;
 
-  if (config.dashboard.enabled) {
-    // Resolve auth token: "auto" generates a random 32-byte hex token
-    let authToken = config.dashboard.auth_token;
-    if (authToken === "auto") {
-      const { randomBytes: rb } = await import("node:crypto");
-      authToken = rb(32).toString("hex");
-    }
-
-    dashboard = new DashboardApprovalChannel({
-      port: config.dashboard.port,
-      host: config.dashboard.host,
-      timeout_seconds: policy.approval_channel.timeout_seconds,
-      // SEC-002: auto_deny removed — timeout always denies
-      auth_token: authToken,
-      tls: config.dashboard.tls,
-      auto_open: config.dashboard.auto_open,
-      allow_plaintext_remote: config.dashboard.allow_plaintext_remote,
-    });
+  const selectedApprovalChannel = selectApprovalChannelByPolicy({
+    config,
+    policy,
+    ...(options?.approvalCallback
+      ? { approvalCallback: options.approvalCallback }
+      : {}),
+  });
+  switch (selectedApprovalChannel.type) {
+  case "dashboard": {
+    dashboard = selectedApprovalChannel.channel;
     dashboard.setDependencies({
       policy,
       baseline,
@@ -949,6 +1002,9 @@ export async function createSanctuaryServer(options?: {
       // local attestation-store reputation evidence (counts, never a score).
       storage,
     });
+    await dashboard.setOperatorAuthorizationSpentStore(
+      OperatorAuthorizationSpentStore.durableFromBoot(storage, masterKey),
+    );
     // v1.1.1 hotfix: bind the v1.1 dashboard at /v1.1 + hub API at
     // /api/hub/* on the embedded dashboard path so operators see the
     // v1.1 surface whether they boot via `sanctuary --dashboard` or
@@ -1011,6 +1067,12 @@ export async function createSanctuaryServer(options?: {
         reputationStore,
         policy,
         config,
+        // MUST-FIX 5 (fix-round-2): share the ONE SentinelFindingStore
+        // instance constructed above (step 14i) rather than letting
+        // `buildV11Bindings` construct its own — see that construction
+        // site's comment for why a second independent instance silently
+        // hides findings from whichever one did not receive a given write.
+        sentinelFindingStore,
         // Rho-2.5: the consent-gated Tier B redactor is installed on the
         // selector above, so the /api/query-anonymity/pii route reports
         // the truthful `effective_tier_b_enabled`.
@@ -1035,21 +1097,20 @@ export async function createSanctuaryServer(options?: {
     if (dashboardHostIsLoopback && loadResult.loaded > 0) {
       dashboard.setAutoAuthLocalhost(true);
     }
-    await dashboard.start();
+    await selectedApprovalChannel.start();
     approvalChannel = dashboard;
-  } else if (config.webhook.enabled && config.webhook.url && config.webhook.secret) {
-    const webhook = new WebhookApprovalChannel({
-      webhook_url: config.webhook.url,
-      webhook_secret: config.webhook.secret,
-      callback_port: config.webhook.callback_port,
-      callback_host: config.webhook.callback_host,
-      timeout_seconds: policy.approval_channel.timeout_seconds,
-      // SEC-002: auto_deny removed — timeout always denies
-    });
-    await webhook.start();
-    approvalChannel = webhook;
-  } else {
-    approvalChannel = new StderrApprovalChannel(policy.approval_channel);
+    break;
+  }
+  case "webhook":
+    await selectedApprovalChannel.start();
+    approvalChannel = selectedApprovalChannel.channel;
+    break;
+  case "callback":
+    approvalChannel = selectedApprovalChannel.channel;
+    break;
+  case "stderr":
+    approvalChannel = selectedApprovalChannel.channel;
+    break;
   }
 
   // 15b. Create injection detector
@@ -1220,17 +1281,15 @@ export async function createSanctuaryServer(options?: {
   }
 
   // v1.3 WP-V1.3-1 Phi-1: Sentinel Baseline Pack (Castle Layer 2 anchor).
-  // Construct the per-fortress dispatcher + finding store, register the
-  // Phi-1 catalog, and re-subscribe whatever the operator opted into on
-  // a prior boot. The dispatcher's auto-tick is enabled so subscribed
-  // sentinels run periodically; tick interval is fixed at the
-  // coordinator-CTO default until per-fortress override lands. No new
-  // outbound surface; sentinels read server-local audit data only.
-  const sentinelFindingStore = new SentinelFindingStore({
-    storage,
-    masterKey,
-    fortressId: fortressIdForAggregator,
-  });
+  // Construct the per-fortress dispatcher, register the Phi-1 catalog, and
+  // re-subscribe whatever the operator opted into on a prior boot. The
+  // dispatcher's auto-tick is enabled so subscribed sentinels run
+  // periodically; tick interval is fixed at the coordinator-CTO default
+  // until per-fortress override lands. No new outbound surface; sentinels
+  // read server-local audit data only. `sentinelFindingStore` itself is
+  // constructed earlier (step 14i, MUST-FIX 5 fix-round-2) and shared with
+  // the embedded dashboard's anomaly binding — do not construct a second
+  // instance here.
   const sentinelRegistry = new SentinelRegistry();
   for (const entry of PHI1_BASELINE_CATALOG) {
     sentinelRegistry.register(entry);
@@ -1440,17 +1499,25 @@ export async function createSanctuaryServer(options?: {
     fortressId: fortressIdFromStoragePath(config.storage_path),
     ownerRef: "fleet-self",
   });
+  // Fail-closed multi-agent isolation guard: the adapter above is bound to ONE
+  // shared `fleet-self` owner scope reused for every caller, so SDW memory has
+  // no per-agent custody isolation yet. Resolving the SAME caller identity the
+  // router uses (`SANCTUARY_AGENT_ID`) lets the guard pin the single identity
+  // the shared scope serves and REFUSE any second, distinct wrapped-agent
+  // identity until real per-agent isolation lands. For single-coordinator use
+  // this resolves a stable value (or stable undefined) and is a strict NO-OP.
+  //
+  // ONE guard instance is shared by every tool family that reaches this scope
+  // (read/write tools AND the memory-file transcode tools). A per-family guard
+  // pins each family's own first caller, so the agent refused by memory_get
+  // would be the FIRST caller of memory_emit and could dump the whole shared
+  // corpus as plaintext files.
+  const sdwMemoryIdentity = (): string | undefined => process.env.SANCTUARY_AGENT_ID;
+  const sdwMemoryIsolationGuard = createMultiAgentIsolationGuard(sdwMemoryIdentity);
   const sdwMemoryTools = createSdwMemoryTools({
     adapter: sdwMemoryAdapter,
     auditLog,
-    // Fail-closed multi-agent isolation guard: the adapter above is bound to ONE
-    // shared `fleet-self` owner scope reused for every caller, so SDW memory has
-    // no per-agent custody isolation yet. Resolving the SAME caller identity the
-    // router uses (`SANCTUARY_AGENT_ID`) lets the guard pin the single identity
-    // the shared scope serves and REFUSE any second, distinct wrapped-agent
-    // identity until real per-agent isolation lands. For single-coordinator use
-    // this resolves a stable value (or stable undefined) and is a strict NO-OP.
-    ownerIdentity: () => process.env.SANCTUARY_AGENT_ID,
+    isolationGuard: sdwMemoryIsolationGuard,
   }).map((tool) =>
     tool.name === "memory_insert"
       ? {
@@ -1467,6 +1534,16 @@ export async function createSanctuaryServer(options?: {
   const sdwMemoryProvenanceTool = createSdwMemoryProvenanceTool({
     adapter: sdwMemoryAdapter,
     auditLog,
+  });
+  const sdwMemoryFileTools = createSdwMemoryFileTools({
+    adapter: sdwMemoryAdapter,
+    auditLog,
+    // Same resolver AND the same guard instance as the read/write tools above:
+    // memory_emit materializes the entire shared corpus as plaintext, so it has
+    // to sit behind the identical pin, and the approval projection uses the
+    // resolver to tell the operator whose memory a dump moves.
+    ownerIdentity: sdwMemoryIdentity,
+    isolationGuard: sdwMemoryIsolationGuard,
   });
 
   // 16b2. Create EU AI Act compliance bundle tools (Tier 3 auto-allow —
@@ -1656,6 +1733,7 @@ export async function createSanctuaryServer(options?: {
     ...memoryAttestTools,
     ...sdwMemoryTools,
     sdwMemoryProvenanceTool,
+    ...sdwMemoryFileTools,
     ...complianceTools,
     ...erc8004Tools,
     ...erc8004ResolveTools,

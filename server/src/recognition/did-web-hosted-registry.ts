@@ -88,6 +88,7 @@ export class DidWebHostedRegistry {
       const envelope: EncryptedPayload = JSON.parse(bytesToString(raw));
       const plaintext = decrypt(envelope, this.encryptionKey, aad);
       const persisted = JSON.parse(bytesToString(plaintext)) as PersistedEntry;
+      // AAD and the inner fortress_id must both match, so a hosted DID record copied from another fortress reads as absent.
       if (persisted.version !== 1) return null;
       if (persisted.fortress_id !== this.fortressId) return null;
       return persisted.entry;
@@ -111,6 +112,7 @@ export class DidWebHostedRegistry {
       entry,
     };
     const aad = stringToBytes(this.fortressId);
+    // The fortress id is authenticated data, not plaintext metadata; moving the ciphertext across fortresses breaks decrypt.
     const plaintext = stringToBytes(JSON.stringify(persisted));
     const envelope = encrypt(plaintext, this.encryptionKey, aad);
     await this.storage.write(

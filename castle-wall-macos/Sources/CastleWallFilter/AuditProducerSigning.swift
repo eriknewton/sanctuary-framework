@@ -17,11 +17,152 @@ public enum AuditProducerSigningError: Error, Equatable {
     case canonicalizationFailed(String)
     case signerUnavailable(String)
     case emptySignature
+    case statePersistenceFailed(String)
+    case chainAdvancedBeforeSignReply
+    case signingQueueFull(maxQueued: Int, droppedCount: UInt64)
 }
 
 public enum AuditProducerSigningConstants {
     public static let keyId = "cw-audit-producer-v1"
     public static let domainPrefix = "sanctuary.castle-wall.audit-producer.v1\n"
+}
+
+public struct AuditProducerChainState: Codable, Equatable {
+    public let schemaVersion: Int
+    public let nextSeq: UInt64
+    public let priorSha256Hex: String?
+
+    public init(
+        schemaVersion: Int = 1,
+        nextSeq: UInt64,
+        priorSha256Hex: String?
+    ) {
+        self.schemaVersion = schemaVersion
+        self.nextSeq = nextSeq
+        self.priorSha256Hex = priorSha256Hex
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case schemaVersion = "schema_version"
+        case nextSeq = "next_seq"
+        case priorSha256Hex = "prior_sha256_hex"
+    }
+}
+
+public protocol AuditProducerChainStateStore {
+    func load() throws -> AuditProducerChainState?
+    func save(_ state: AuditProducerChainState) throws
+}
+
+public enum AuditProducerChainStateError: Error, Equatable, CustomStringConvertible {
+    case invalid(String)
+
+    public var description: String {
+        switch self {
+        case .invalid(let reason):
+            return reason
+        }
+    }
+}
+
+public final class FileAuditProducerChainStateStore: AuditProducerChainStateStore {
+    private let url: URL
+
+    public init(url: URL) {
+        self.url = url
+    }
+
+    public static func defaultURL() -> URL? {
+        guard let base = FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first else {
+            return nil
+        }
+        return base
+            .appendingPathComponent("Sanctuary", isDirectory: true)
+            .appendingPathComponent("CastleWall", isDirectory: true)
+            .appendingPathComponent("audit-producer-chain-state.json")
+    }
+
+    public static func defaultStore() -> AuditProducerChainStateStore {
+        guard let url = defaultURL() else {
+            return UnavailableAuditProducerChainStateStore(
+                reason: "application support directory unavailable"
+            )
+        }
+        return FileAuditProducerChainStateStore(url: url)
+    }
+
+    public func load() throws -> AuditProducerChainState? {
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            return nil
+        }
+        let data = try Data(contentsOf: url)
+        let state = try JSONDecoder().decode(AuditProducerChainState.self, from: data)
+        try Self.validate(state)
+        return state
+    }
+
+    public func save(_ state: AuditProducerChainState) throws {
+        try Self.validate(state)
+        let dir = url.deletingLastPathComponent()
+        try FileManager.default.createDirectory(
+            at: dir,
+            withIntermediateDirectories: true
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        let data = try encoder.encode(state)
+        try data.write(to: url, options: [.atomic])
+    }
+
+    public static func validate(_ state: AuditProducerChainState) throws {
+        guard state.schemaVersion == 1 else {
+            throw AuditProducerChainStateError.invalid("unsupported schema_version \(state.schemaVersion)")
+        }
+        if state.nextSeq == 0 {
+            guard state.priorSha256Hex == nil else {
+                throw AuditProducerChainStateError.invalid("genesis state must not carry prior_sha256_hex")
+            }
+            return
+        }
+        guard let prior = state.priorSha256Hex else {
+            throw AuditProducerChainStateError.invalid("non-genesis state must carry prior_sha256_hex")
+        }
+        guard prior.count == 64 && prior.allSatisfy({ $0.isHexDigit }) else {
+            throw AuditProducerChainStateError.invalid("prior_sha256_hex must be a 64-character hex digest")
+        }
+    }
+}
+
+public final class UnavailableAuditProducerChainStateStore: AuditProducerChainStateStore {
+    private let reason: String
+
+    public init(reason: String) {
+        self.reason = reason
+    }
+
+    public func load() throws -> AuditProducerChainState? {
+        throw AuditProducerChainStateError.invalid(reason)
+    }
+
+    public func save(_ state: AuditProducerChainState) throws {
+        throw AuditProducerChainStateError.invalid(reason)
+    }
+}
+
+/// Explicit test seam for flows that need the pre-existing in-memory behavior.
+/// Production uses `FileAuditProducerChainStateStore.defaultStore()`, which
+/// returns a failing store rather than silently losing durability.
+public final class VolatileAuditProducerChainStateStore: AuditProducerChainStateStore {
+    public init() {}
+
+    public func load() throws -> AuditProducerChainState? {
+        return nil
+    }
+
+    public func save(_ state: AuditProducerChainState) throws {}
 }
 
 public protocol AuditProducerSigning {
@@ -114,6 +255,12 @@ public final class XpcAuditProducerSigner: AuditProducerSigning {
 public final class AuditProducerChain {
     private var nextSeq: UInt64
     private var priorHashHex: String?
+    private let stateStore: AuditProducerChainStateStore
+    private var stateLoadError: Error?
+    private let maxQueuedSigningJobs: Int
+    private var signingInFlight = false
+    private var signingQueue: [SigningJob] = []
+    private var droppedSigningJobs: UInt64 = 0
     private let stateQueue = DispatchQueue(
         label: "ai.sanctuaryprotocol.castle-wall.audit-producer-chain"
     )
@@ -143,11 +290,29 @@ public final class AuditProducerChain {
     public init(
         nextSeq: UInt64 = 0,
         priorHashHex: String? = nil,
-        signTimeoutSeconds: TimeInterval = 5.0
+        signTimeoutSeconds: TimeInterval = 5.0,
+        maxQueuedSigningJobs: Int = 64,
+        stateStore: AuditProducerChainStateStore = FileAuditProducerChainStateStore.defaultStore()
     ) {
-        self.nextSeq = nextSeq
-        self.priorHashHex = priorHashHex
+        var initialNextSeq = nextSeq
+        var initialPriorHashHex = priorHashHex
+        var initialLoadError: Error?
+        if nextSeq == 0 && priorHashHex == nil {
+            do {
+                if let loaded = try stateStore.load() {
+                    initialNextSeq = loaded.nextSeq
+                    initialPriorHashHex = loaded.priorSha256Hex
+                }
+            } catch {
+                initialLoadError = error
+            }
+        }
+        self.nextSeq = initialNextSeq
+        self.priorHashHex = initialPriorHashHex
+        self.stateStore = stateStore
+        self.stateLoadError = initialLoadError
         self.signTimeoutSeconds = signTimeoutSeconds
+        self.maxQueuedSigningJobs = max(0, maxQueuedSigningJobs)
     }
 
     public func buildSignedFlowDecision(
@@ -158,101 +323,44 @@ public final class AuditProducerChain {
         signer: AuditProducerSigning,
         completion: @escaping (Result<IpcMessage, AuditProducerSigningError>) -> Void
     ) {
-        let pending: PendingDecision
-        do {
-            pending = try stateQueue.sync {
-                try buildPendingDecisionLocked(
-                    outcome: outcome,
-                    flow: flow,
-                    enforcement: enforcement,
-                    recordedAt: recordedAt
-                )
-            }
-        } catch let error as AuditProducerSigningError {
-            completion(.failure(error))
-            return
-        } catch {
-            completion(.failure(.canonicalizationFailed("\(error)")))
-            return
-        }
-
-        // Fire-EXACTLY-once guard shared by the real reply and the watchdog. On
-        // the WINNING success it advances the producer chain (seq/prior-hash);
-        // a lost/late reply is a no-op, so the chain never advances for a flow
-        // that was reported as dropped (the NEXT flow reuses the same seq, which
-        // is correct: nothing was sent for the dropped one).
-        // Fire-EXACTLY-once guard shared by the real reply and the watchdog. On
-        // the WINNING success it advances the producer chain (seq/prior-hash);
-        // a lost/late reply is a no-op, so the chain never advances for a flow
-        // that was reported as dropped (the NEXT flow reuses the same seq, which
-        // is correct: nothing was sent for the dropped one). The watchdog is a
-        // plain `asyncAfter` (not a cancellable work item): on a fast success it
-        // still fires at the deadline but is an immediate no-op via `didComplete`,
-        // so its only cost is holding this small closure for the bounded timeout
-        // (never a leak). A cancellable work item was rejected because cancelling
-        // it from `finish` would require `finish` to capture the item, forming a
-        // retain cycle that drains no earlier than the same deadline.
-        let completionLock = NSLock()
-        var didComplete = false
-        let finish: (Result<IpcMessage, AuditProducerSigningError>, (seq: UInt64, hash: String)?) -> Void = { [weak self] result, advance in
-            completionLock.lock()
-            if didComplete {
-                completionLock.unlock()
-                return
-            }
-            didComplete = true
-            completionLock.unlock()
-            if let advance, let self {
-                self.stateQueue.sync {
-                    if self.nextSeq == advance.seq {
-                        self.nextSeq = advance.seq + 1
-                        self.priorHashHex = advance.hash
+        enqueueSigningJob(
+            SigningJob(
+                signer: signer,
+                prepare: { chain in
+                    let pending = try chain.buildPendingDecisionLocked(
+                        outcome: outcome,
+                        flow: flow,
+                        enforcement: enforcement,
+                        recordedAt: recordedAt
+                    )
+                    return PreparedSigningJob(
+                        signingBytes: pending.signingBytes,
+                        seq: pending.seq,
+                        eventHashHex: pending.eventHashHex
+                    ) { signature in
+                        let producer = AuditProducerSignatureBody(
+                            eventCanonicalJson: pending.eventCanonicalJson,
+                            capturedAtUnixMs: pending.capturedAtUnixMs,
+                            seq: pending.seq,
+                            priorSha256Hex: pending.priorHashHex,
+                            signatureB64url: Base64URL.encode(signature),
+                            keyId: AuditProducerSigningConstants.keyId
+                        )
+                        let signedBody = FlowDecisionRecordedBody(
+                            decision: pending.body.decision,
+                            destination: pending.body.destination,
+                            agent: pending.body.agent,
+                            matchedRuleId: pending.body.matchedRuleId,
+                            recordedAt: pending.body.recordedAt,
+                            enforcement: pending.body.enforcement,
+                            producer: producer
+                        )
+                        return .flowDecisionRecorded(signedBody)
                     }
-                }
-            }
-            completion(result)
-        }
-
-        timeoutQueue.asyncAfter(deadline: .now() + signTimeoutSeconds) { [signTimeoutSeconds] in
-            finish(
-                .failure(.signerUnavailable(
-                    "audit-producer sign reply did not arrive within \(signTimeoutSeconds)s (helper unreachable or XPC reply dropped)"
-                )),
-                nil
+                },
+                completion: completion
             )
-        }
-
-        signer.signAuditProducerPayload(pending.signingBytes) { signature, error in
-            if let error {
-                finish(.failure(.signerUnavailable(error)), nil)
-                return
-            }
-            guard let signature, !signature.isEmpty else {
-                finish(.failure(.emptySignature), nil)
-                return
-            }
-            let producer = AuditProducerSignatureBody(
-                eventCanonicalJson: pending.eventCanonicalJson,
-                capturedAtUnixMs: pending.capturedAtUnixMs,
-                seq: pending.seq,
-                priorSha256Hex: pending.priorHashHex,
-                signatureB64url: Base64URL.encode(signature),
-                keyId: AuditProducerSigningConstants.keyId
-            )
-            let signedBody = FlowDecisionRecordedBody(
-                decision: pending.body.decision,
-                destination: pending.body.destination,
-                agent: pending.body.agent,
-                matchedRuleId: pending.body.matchedRuleId,
-                recordedAt: pending.body.recordedAt,
-                enforcement: pending.body.enforcement,
-                producer: producer
-            )
-            finish(
-                .success(.flowDecisionRecorded(signedBody)),
-                (pending.seq, pending.eventHashHex)
-            )
-        }
+        )
     }
 
     public func buildSignedAvailabilityReport(
@@ -262,26 +370,91 @@ public final class AuditProducerChain {
         signer: AuditProducerSigning,
         completion: @escaping (Result<IpcMessage, AuditProducerSigningError>) -> Void
     ) {
-        let pending: PendingAvailability
-        do {
-            pending = try stateQueue.sync {
-                try buildPendingAvailabilityLocked(
-                    enforcement: enforcement,
-                    fortressId: fortressId,
-                    reportedAt: reportedAt
-                )
+        enqueueSigningJob(
+            SigningJob(
+                signer: signer,
+                prepare: { chain in
+                    let pending = try chain.buildPendingAvailabilityLocked(
+                        enforcement: enforcement,
+                        fortressId: fortressId,
+                        reportedAt: reportedAt
+                    )
+                    return PreparedSigningJob(
+                        signingBytes: pending.signingBytes,
+                        seq: pending.seq,
+                        eventHashHex: pending.eventHashHex
+                    ) { signature in
+                        let producer = AuditProducerSignatureBody(
+                            eventCanonicalJson: pending.eventCanonicalJson,
+                            capturedAtUnixMs: pending.capturedAtUnixMs,
+                            seq: pending.seq,
+                            priorSha256Hex: pending.priorHashHex,
+                            signatureB64url: Base64URL.encode(signature),
+                            keyId: AuditProducerSigningConstants.keyId
+                        )
+                        let body = EnforcementAvailabilityReportBody(
+                            enforcement: pending.enforcement,
+                            producer: producer
+                        )
+                        return .enforcementAvailabilityReport(body)
+                    }
+                },
+                completion: completion
+            )
+        )
+    }
+
+    private func enqueueSigningJob(_ job: SigningJob) {
+        stateQueue.async {
+            guard self.signingInFlight else {
+                self.signingInFlight = true
+                self.startSigningJobLocked(job)
+                return
             }
+            guard self.signingQueue.count < self.maxQueuedSigningJobs else {
+                self.droppedSigningJobs += 1
+                let error = AuditProducerSigningError.signingQueueFull(
+                    maxQueued: self.maxQueuedSigningJobs,
+                    droppedCount: self.droppedSigningJobs
+                )
+                DispatchQueue.global(qos: .utility).async {
+                    job.completion(.failure(error))
+                }
+                return
+            }
+            self.signingQueue.append(job)
+        }
+    }
+
+    private func startSigningJobLocked(_ job: SigningJob) {
+        let preparedResult: Result<PreparedSigningJob, AuditProducerSigningError>
+        do {
+            preparedResult = .success(try job.prepare(self))
         } catch let error as AuditProducerSigningError {
-            completion(.failure(error))
-            return
+            preparedResult = .failure(error)
         } catch {
-            completion(.failure(.canonicalizationFailed("\(error)")))
-            return
+            preparedResult = .failure(.canonicalizationFailed("\(error)"))
         }
 
+        DispatchQueue.global(qos: .utility).async {
+            switch preparedResult {
+            case .success(let prepared):
+                self.runPreparedSigningJob(prepared, job: job)
+            case .failure(let error):
+                self.completeActiveSigningJob()
+                job.completion(.failure(error))
+            }
+        }
+    }
+
+    private func runPreparedSigningJob(_ prepared: PreparedSigningJob, job: SigningJob) {
         let completionLock = NSLock()
         var didComplete = false
-        let finish: (Result<IpcMessage, AuditProducerSigningError>, (seq: UInt64, hash: String)?) -> Void = { [weak self] result, advance in
+        let retention = SigningJobRetention(self)
+        // Fire-EXACTLY-once guard shared by the real reply and the watchdog. On
+        // the winning success it advances the producer chain; a timeout or late
+        // reply never advances and then releases the next queued signing job.
+        let finish: (Result<IpcMessage, AuditProducerSigningError>, (seq: UInt64, hash: String)?) -> Void = { result, advance in
             completionLock.lock()
             if didComplete {
                 completionLock.unlock()
@@ -289,15 +462,23 @@ public final class AuditProducerChain {
             }
             didComplete = true
             completionLock.unlock()
-            if let advance, let self {
-                self.stateQueue.sync {
-                    if self.nextSeq == advance.seq {
-                        self.nextSeq = advance.seq + 1
-                        self.priorHashHex = advance.hash
-                    }
+
+            guard let chain = retention.take() else {
+                job.completion(result)
+                return
+            }
+
+            var finalResult = result
+            if let advance {
+                if let error = chain.advanceAfterSignedResult(
+                    seq: advance.seq,
+                    hash: advance.hash
+                ) {
+                    finalResult = .failure(error)
                 }
             }
-            completion(result)
+            chain.completeActiveSigningJob()
+            job.completion(finalResult)
         }
 
         timeoutQueue.asyncAfter(deadline: .now() + signTimeoutSeconds) { [signTimeoutSeconds] in
@@ -309,7 +490,7 @@ public final class AuditProducerChain {
             )
         }
 
-        signer.signAuditProducerPayload(pending.signingBytes) { signature, error in
+        job.signer.signAuditProducerPayload(prepared.signingBytes) { signature, error in
             if let error {
                 finish(.failure(.signerUnavailable(error)), nil)
                 return
@@ -318,22 +499,21 @@ public final class AuditProducerChain {
                 finish(.failure(.emptySignature), nil)
                 return
             }
-            let producer = AuditProducerSignatureBody(
-                eventCanonicalJson: pending.eventCanonicalJson,
-                capturedAtUnixMs: pending.capturedAtUnixMs,
-                seq: pending.seq,
-                priorSha256Hex: pending.priorHashHex,
-                signatureB64url: Base64URL.encode(signature),
-                keyId: AuditProducerSigningConstants.keyId
-            )
-            let body = EnforcementAvailabilityReportBody(
-                enforcement: pending.enforcement,
-                producer: producer
-            )
             finish(
-                .success(.enforcementAvailabilityReport(body)),
-                (pending.seq, pending.eventHashHex)
+                .success(prepared.makeMessage(signature)),
+                (prepared.seq, prepared.eventHashHex)
             )
+        }
+    }
+
+    private func completeActiveSigningJob() {
+        stateQueue.async {
+            guard !self.signingQueue.isEmpty else {
+                self.signingInFlight = false
+                return
+            }
+            let nextJob = self.signingQueue.removeFirst()
+            self.startSigningJobLocked(nextJob)
         }
     }
 
@@ -343,6 +523,8 @@ public final class AuditProducerChain {
         enforcement: EnforcementAvailabilitySnapshotBody?,
         recordedAt: Date
     ) throws -> PendingDecision {
+        try assertStateLoadSucceededLocked()
+        try refreshFromDurableStateLocked()
         let decision: String
         let matchedRuleId: String?
         let operation: String
@@ -446,6 +628,8 @@ public final class AuditProducerChain {
         fortressId: String,
         reportedAt: Date
     ) throws -> PendingAvailability {
+        try assertStateLoadSucceededLocked()
+        try refreshFromDurableStateLocked()
         let seq = nextSeq
         let prior = priorHashHex
         let reportedAtString = enforcement.producerClaimedAt ?? IPCBridgeNotifications.iso8601(reportedAt)
@@ -515,6 +699,96 @@ public final class AuditProducerChain {
     private func sha256Hex(_ data: Data) -> String {
         let digest = SHA256.hash(data: data)
         return digest.map { String(format: "%02x", $0) }.joined()
+    }
+
+    private func assertStateLoadSucceededLocked() throws {
+        if let stateLoadError {
+            throw AuditProducerSigningError.statePersistenceFailed(
+                "audit producer chain state could not be loaded: \(stateLoadError)"
+            )
+        }
+    }
+
+    private func refreshFromDurableStateLocked() throws {
+        guard let loaded = try stateStore.load() else {
+            return
+        }
+        if loaded.nextSeq > nextSeq {
+            nextSeq = loaded.nextSeq
+            priorHashHex = loaded.priorSha256Hex
+            return
+        }
+        if loaded.nextSeq == nextSeq && loaded.priorSha256Hex != priorHashHex {
+            throw AuditProducerSigningError.statePersistenceFailed(
+                "audit producer chain state conflicts with in-memory cursor at next_seq \(nextSeq)"
+            )
+        }
+    }
+
+    private func advanceAfterSignedResult(seq: UInt64, hash: String) -> AuditProducerSigningError? {
+        return stateQueue.sync {
+            if let stateLoadError {
+                return .statePersistenceFailed(
+                    "audit producer chain state could not be loaded: \(stateLoadError)"
+                )
+            }
+            do {
+                try refreshFromDurableStateLocked()
+            } catch let error as AuditProducerSigningError {
+                return error
+            } catch {
+                return .statePersistenceFailed(
+                    "audit producer chain state could not be loaded: \(error)"
+                )
+            }
+            guard nextSeq == seq else {
+                return .chainAdvancedBeforeSignReply
+            }
+            let advancedState = AuditProducerChainState(
+                nextSeq: seq + 1,
+                priorSha256Hex: hash
+            )
+            do {
+                try stateStore.save(advancedState)
+            } catch {
+                return .statePersistenceFailed(
+                    "audit producer chain state could not be saved: \(error)"
+                )
+            }
+            nextSeq = advancedState.nextSeq
+            priorHashHex = advancedState.priorSha256Hex
+            return nil
+        }
+    }
+
+    private struct SigningJob {
+        let signer: AuditProducerSigning
+        let prepare: (AuditProducerChain) throws -> PreparedSigningJob
+        let completion: (Result<IpcMessage, AuditProducerSigningError>) -> Void
+    }
+
+    private struct PreparedSigningJob {
+        let signingBytes: Data
+        let seq: UInt64
+        let eventHashHex: String
+        let makeMessage: (Data) -> IpcMessage
+    }
+
+    private final class SigningJobRetention {
+        private let lock = NSLock()
+        private var chain: AuditProducerChain?
+
+        init(_ chain: AuditProducerChain) {
+            self.chain = chain
+        }
+
+        func take() -> AuditProducerChain? {
+            lock.lock()
+            defer { lock.unlock() }
+            let current = chain
+            chain = nil
+            return current
+        }
     }
 
     private struct PendingDecision {
