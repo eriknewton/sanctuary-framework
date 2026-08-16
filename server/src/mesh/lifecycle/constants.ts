@@ -127,6 +127,25 @@ export const REVOKE_DENIAL_AUDIT_GLOBAL_MAX = 256;
  */
 export const SYNC_REQUEST_ID_EXPIRY_MS = 10 * 60 * 1_000;
 
+// ═══════════════════════════════════════════════════════════════════════
+// C12-SYNC-ORDER-01 — sync-table poison-event audit-governor key (rule 7/8)
+// ═══════════════════════════════════════════════════════════════════════
+
+/**
+ * Governor key `applySync` uses for a poison policy_update/locator_update
+ * drop-audit when no AUTHENTICATED relaying peer is available (an
+ * initial-sync `applySync` call outside the `sync_response` receive path,
+ * or a direct/test call). NEVER key on the failed event's own claimed
+ * `emitter_node` — that field belongs to the event whose verification just
+ * FAILED, so it is by definition unauthenticated wire text, not a trust-
+ * bearing identity (rule 7). A fixed sentinel collapses every un-relayed
+ * poison event into ONE shared bucket, so an attacker rotating the claimed
+ * `emitter_node` per event cannot mint unbounded governor buckets (rule 8)
+ * the way a per-claimed-identity key would allow.
+ */
+export const SYNC_TABLE_AUDIT_UNKNOWN_RELAYING_PEER =
+  "unknown-relaying-peer" as const;
+
 /**
  * Bound on the outstanding-request set (self-inflicted growth only — ids are
  * minted solely by this node's own `sync_request`s, so an external peer can

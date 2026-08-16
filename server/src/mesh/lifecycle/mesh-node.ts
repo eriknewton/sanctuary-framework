@@ -101,6 +101,7 @@ import {
   REVOKE_DENIAL_AUDIT_WINDOW_MS,
   SYNC_REQUEST_ID_BYTES,
   SYNC_REQUEST_ID_EXPIRY_MS,
+  SYNC_TABLE_AUDIT_UNKNOWN_RELAYING_PEER,
 } from "./constants.js";
 import { DenialAuditGovernor } from "./denial-audit-governor.js";
 import {
@@ -214,6 +215,43 @@ export class MeshNode {
    * `auditMasterRotationDenied` and drained by `flushRevokeDenialSaturation`.
    */
   private readonly masterRotationDenialAuditGovernor = new DenialAuditGovernor(
+    REVOKE_DENIAL_AUDIT_PER_EMITTER_MAX,
+    REVOKE_DENIAL_AUDIT_GLOBAL_MAX,
+    REVOKE_DENIAL_AUDIT_WINDOW_MS
+  );
+  /**
+   * C12-SYNC-ORDER-01 (design §3.3): sibling governor for `applySync`'s
+   * per-table isolation drop-audit (a `policy_update`/`locator_update` that
+   * fails verification is dropped and audited instead of aborting the whole
+   * response). A poison table event is GUARANTEED to be dropped, the same
+   * always-refused shape the revoke-denial and uncorrelated-sync-response
+   * siblings already govern, so it gets its OWN budget rather than
+   * borrowing theirs — a peer that floods poison policy/locator events must
+   * not be able to exhaust the revoke-denial audit trail's headroom, or vice
+   * versa. Reuses the revoke-denial window/caps (same fleet-scale reasoning:
+   * per-authentic-emitter bucket + an above-it global ceiling), not because
+   * the paths share state. AUD-BP-01 (register): this governor bounds how
+   * many entries THIS path may WRITE per window; the shared `auditBuffer`
+   * those entries land in is itself an uncapped queue, which is the
+   * separately-tracked systemic audit-substrate debt, not something this
+   * call site closes.
+   *
+   * KEYING (rule 7 — corrected during review): `consider()` is called from
+   * the catch block of a FAILED `verifyOrThrow(evt)`, so the poison event's
+   * own claimed `emitter_node` is UNAUTHENTICATED wire text at that call
+   * site, never a verified identity — the opposite of the uncorrelated-
+   * sync-response sibling, which keys on `verified.emitter_node` AFTER the
+   * outer `sync_response` envelope's signature already checked out. This
+   * governor is therefore keyed at the call site on the AUTHENTICATED
+   * RELAYING PEER (the `sync_response` envelope's verified signer, threaded
+   * into `applySync` as `relayingPeer`), falling back to the fixed
+   * `SYNC_TABLE_AUDIT_UNKNOWN_RELAYING_PEER` sentinel only when no relaying
+   * peer exists (initial sync outside the receive path, direct/test calls)
+   * — never on the poison event's own claimed emitter_node, which an
+   * attacker can rotate per event to mint unbounded buckets otherwise
+   * (rule 8).
+   */
+  private readonly syncTableEventAuditGovernor = new DenialAuditGovernor(
     REVOKE_DENIAL_AUDIT_PER_EMITTER_MAX,
     REVOKE_DENIAL_AUDIT_GLOBAL_MAX,
     REVOKE_DENIAL_AUDIT_WINDOW_MS
@@ -1028,25 +1066,75 @@ export class MeshNode {
    * isolated: one malformed or refused event is dropped-and-audited and the loop
    * CONTINUES, so it never costs the legitimate revokes behind it in the same
    * response batch.
+   *
+   * C12-SYNC-ORDER-01 (design §3.3, register row): the policy_update and
+   * locator_update tables get the SAME per-event isolation as the lifecycle
+   * loop below, each in its own table so a poison event in one table never
+   * costs the other. Pre-fix this method verified those two tables with a
+   * plain throw-on-first-failure loop, which aborted the WHOLE response
+   * (lifecycle events included) after the sync-request correlation id was
+   * already consumed — silently, because handleIncomingUnicast's
+   * sync_response catch swallows the throw. A poison event is now dropped
+   * and audited (never silent — MUST-NEVER #5) and its table's loop
+   * continues; only VERIFIED events for a table are ever handed to
+   * `applySyncResponse`, so the "caller MUST have verified every signed
+   * event" contract on that function still holds.
+   *
+   * `relayingPeer` (rule 7): the AUTHENTICATED signer of the outer
+   * `sync_response` envelope — `handleIncomingUnicast` passes
+   * `verified.emitter_node` here, verified BEFORE `applySync` is ever
+   * called. Used only to key the drop-audit governor (never trusted as the
+   * poison event's own identity). Omitted for an initial-sync call outside
+   * the receive path or a direct/test call, in which case the governor
+   * falls back to a fixed sentinel — see `syncTableEventAuditGovernor`'s
+   * doc comment.
    */
   async applySync(
     payload: SyncResponsePayload,
-    now: Date = new Date()
+    now: Date = new Date(),
+    relayingPeer: string = SYNC_TABLE_AUDIT_UNKNOWN_RELAYING_PEER
   ): Promise<void> {
-    // Verify policy/locator events up front (they are applied by
-    // applySyncResponse). TRUTHFUL SCOPE: a throw here aborts the WHOLE
-    // response — the lifecycle loop below is never reached, so one poison
-    // policy_update or locator_update costs this response's lifecycle events
-    // too (and the correlation id was already consumed, so the initiator must
-    // retry with a fresh sync_request). The per-event isolation below governs
-    // only the lifecycle loop. Pre-existing shape; tracked as register row
-    // C12-SYNC-ORDER-01 (fix shape: per-table isolation or verify-after-
-    // lifecycle).
+    const verifiedPolicyUpdates: SignedEvent<PolicyUpdatePayload>[] = [];
     for (const evt of payload.policy_updates ?? []) {
-      this.verifyOrThrow(evt);
+      try {
+        this.verifyOrThrow(evt);
+        verifiedPolicyUpdates.push(evt);
+      } catch (e) {
+        const error = e instanceof Error ? e : new Error(String(e));
+        this.auditSyncTableEventDenied(
+          evt,
+          "policy_update",
+          error,
+          now,
+          relayingPeer
+        );
+        this.onEnvelopeRejected({
+          error,
+          event_type: evt.event_type,
+          emitter_node: evt.emitter_node,
+        });
+      }
     }
+    const verifiedLocatorUpdates: SignedEvent<LocatorUpdatePayload>[] = [];
     for (const evt of payload.locator_updates ?? []) {
-      this.verifyOrThrow(evt);
+      try {
+        this.verifyOrThrow(evt);
+        verifiedLocatorUpdates.push(evt);
+      } catch (e) {
+        const error = e instanceof Error ? e : new Error(String(e));
+        this.auditSyncTableEventDenied(
+          evt,
+          "locator_update",
+          error,
+          now,
+          relayingPeer
+        );
+        this.onEnvelopeRejected({
+          error,
+          event_type: evt.event_type,
+          emitter_node: evt.emitter_node,
+        });
+      }
     }
     for (const evt of payload.node_lifecycle_events ?? []) {
       try {
@@ -1109,8 +1197,18 @@ export class MeshNode {
     }
     // Policy + locator tables only — lifecycle events already appended above by
     // the SINGLE append site, so pass an empty lifecycle list (no double-append).
+    // C12-SYNC-ORDER-01: pass the VERIFIED-only arrays built above, never
+    // `payload.policy_updates`/`payload.locator_updates` directly — a poison
+    // event was already dropped-and-audited above, and `applySyncResponse`'s
+    // own contract ("caller MUST have verified every signed event") depends
+    // on nothing unverified reaching it here.
     const result = applySyncResponse(
-      { ...payload, node_lifecycle_events: [] },
+      {
+        ...payload,
+        policy_updates: verifiedPolicyUpdates,
+        locator_updates: verifiedLocatorUpdates,
+        node_lifecycle_events: [],
+      },
       {
         policy_bundle: this.policyBundle,
         locator_table: this.locatorTable,
@@ -1793,8 +1891,9 @@ export class MeshNode {
   }
 
   /**
-   * Flush any pending audit-governor saturation summaries (revoke denials AND
-   * uncorrelated sync_response refusals) without waiting for their windows to
+   * Flush any pending audit-governor saturation summaries (revoke denials,
+   * uncorrelated sync_response refusals, AND C12-SYNC-ORDER-01 poison
+   * policy/locator table-event drops) without waiting for their windows to
    * roll. Production wiring: `FailureModeDetector.tick()` calls this on every
    * periodic tick (MeshNode owns no timer of its own; the detector's interval
    * is the mesh's periodic tick). Tests may also call it directly.
@@ -1816,6 +1915,14 @@ export class MeshNode {
       this.masterRotationDenialAuditGovernor.flushSaturationSummary();
     if (rotationSummary) {
       this.pushMasterRotationDenialSaturationSummary(rotationSummary);
+    }
+    // Fourth governor (C12-SYNC-ORDER-01) drains through the same tick, for
+    // the same reason as the third: a flood-then-stop attacker must not be
+    // able to strand this path's suppressed-count until its next refusal.
+    const syncTableSummary =
+      this.syncTableEventAuditGovernor.flushSaturationSummary();
+    if (syncTableSummary) {
+      this.pushSyncTableEventSaturationSummary(syncTableSummary);
     }
   }
 
@@ -1989,6 +2096,95 @@ export class MeshNode {
     this.auditBuffer.push(entry);
   }
 
+  /**
+   * C12-SYNC-ORDER-01 (design §3.3, fix shape 1 — per-table isolation): audit
+   * a `policy_update`/`locator_update` event that failed verification inside
+   * `applySync`'s per-table loops. Same shape as `auditNodeRevokeDenied` /
+   * `auditUncorrelatedSyncResponse` — the accept/deny decision (drop the
+   * event, keep the loop going) is already made by the caller; this decides
+   * only whether the INDIVIDUAL sealed entry is written, governed by its own
+   * `syncTableEventAuditGovernor` sibling so this path's budget never
+   * conflates with the revoke-denial or uncorrelated-sync-response paths
+   * (rule 8: a guaranteed-refusal audit path is a zero-cost write amplifier
+   * for any in-roster peer without a cap).
+   *
+   * KEYING (rule 7): this method is called from the catch block of a FAILED
+   * `verifyOrThrow(evt)`, so `evt.emitter_node` is UNAUTHENTICATED wire text
+   * at this call site — the opposite of `auditUncorrelatedSyncResponse`,
+   * which keys on an already-envelope-verified signer. The governor is
+   * therefore keyed on `governorKey`, the caller-supplied AUTHENTICATED
+   * relaying peer (or the fixed unknown-peer sentinel), never on `evt`. The
+   * event's own claim is retained in the audit payload as
+   * `claimed_emitter_node` — forensic-only, explicitly labeled unverified,
+   * never a governor key or a trust decision input. AUD-BP-01: the governor
+   * bounds writes FROM this path; the shared `auditBuffer` sink itself is
+   * uncapped, tracked separately in the register.
+   */
+  private auditSyncTableEventDenied(
+    evt: SignedEvent,
+    table: "policy_update" | "locator_update",
+    error: Error,
+    now: Date,
+    governorKey: string
+  ): void {
+    if (!this.nodePrivateKey) return;
+    const decision = this.syncTableEventAuditGovernor.consider(
+      governorKey,
+      now.getTime()
+    );
+    if (decision.saturationSummary) {
+      this.pushSyncTableEventSaturationSummary(decision.saturationSummary);
+    }
+    if (!decision.writeIndividual) return;
+    const entry = sealAuditEntry({
+      emitter_node: this.config.node_id,
+      emitter_agent: "mesh",
+      emitter_principal: this.config.system_principal_id ?? "system",
+      policy_version: 0,
+      attestation_state: "peer_protocol_violation",
+      payload: {
+        operation: "sync_table_event_denied",
+        table,
+        event_type: evt.event_type,
+        relaying_peer: governorKey,
+        // UNVERIFIED claim (verification is exactly what failed): retained
+        // for forensics only, never trusted as attribution and never used
+        // to key the governor above — see the KEYING note on this method.
+        claimed_emitter_node: evt.emitter_node,
+        reason: error.message,
+      },
+      node_private_key: this.nodePrivateKey,
+    });
+    if (this.oldestPendingEntryAt === null) {
+      this.oldestPendingEntryAt = Date.now();
+    }
+    this.auditBuffer.push(entry);
+  }
+
+  private pushSyncTableEventSaturationSummary(summary: {
+    suppressed_count: number;
+    distinct_emitter_count: number;
+  }): void {
+    if (!this.nodePrivateKey) return;
+    const entry = sealAuditEntry({
+      emitter_node: this.config.node_id,
+      emitter_agent: "mesh",
+      emitter_principal: this.config.system_principal_id ?? "system",
+      policy_version: 0,
+      attestation_state: "peer_protocol_violation",
+      payload: {
+        operation: "sync_table_event_denied_saturation_summary",
+        suppressed_count: summary.suppressed_count,
+        distinct_emitter_count: summary.distinct_emitter_count,
+      },
+      node_private_key: this.nodePrivateKey,
+    });
+    if (this.oldestPendingEntryAt === null) {
+      this.oldestPendingEntryAt = Date.now();
+    }
+    this.auditBuffer.push(entry);
+  }
+
   // ── C12-REPLAY sync-request correlation (§3.3 point 7) ────────────────
 
   private mintSyncRequestId(): string {
@@ -2141,7 +2337,12 @@ export class MeshNode {
           });
           return;
         }
-        await this.applySync(respPayload);
+        // C12-SYNC-ORDER-01: pass the ALREADY-VERIFIED `verified.emitter_node`
+        // as the relaying peer, so a poison policy_update/locator_update's own
+        // unverified claim inside `respPayload` never keys the drop-audit
+        // governor — same "verify first, attribute after" discipline as the
+        // uncorrelated-response audit two lines above.
+        await this.applySync(respPayload, undefined, verified.emitter_node);
       } catch {
         // ignore
       }
