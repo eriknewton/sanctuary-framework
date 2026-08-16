@@ -31,6 +31,7 @@ import {
   AUDIT_CHECKPOINT_SCHEMA_VERSION,
   AUDIT_EPOCH_KEYS_KEY,
   AUDIT_HEAD_ANCHOR_KEY,
+  AUDIT_SIGNING_LATCH_KEY,
   AUDIT_ROTATION_ANCHOR_MARKER,
   isAuditRotationAnchorEnvelope,
   type AuditCheckpointRecord,
@@ -121,6 +122,14 @@ export type AuditIntegrityFindingKind =
   | "checkpoint_signature_mismatch"
   | "checkpoint_signature_unverifiable"
   | "checkpoint_signature_embedded_key_untrusted"
+  // checkpoint_signing_downgrade: this fortress provably wrote SIGNED
+  // checkpoints (the MAC'd signing latch, or a signed checkpoint still in the
+  // store), yet a checkpoint at or after that point reads `unsigned`. The
+  // `unsigned`/`unsigned_reason` fields are attacker-writable plaintext, so
+  // without this memory a stripped signature is indistinguishable from an
+  // honest pre-bootstrap store (MUST-NEVER #5, silent degrade). Also raised
+  // when the latch record itself is present but fails authentication.
+  | "checkpoint_signing_downgrade"
   // F2 Option A (writer-split) boundary findings. See the module doc comment
   // near AUDIT_SPLIT_BOUNDARY_DIRNAME.
   //  - split_boundary_invalid: a boundary record is PRESENT but fails MAC
@@ -409,6 +418,18 @@ const AUDIT_HEAD_ANCHOR_MARKER = "__sanctuary_audit_head_anchor_v1";
 // optional Ed25519 checkpoint signer, which may be null.
 const AUDIT_ROTATION_ANCHOR_MAC_DOMAIN = "sanctuary.audit-rotation-anchor.v1\n";
 const AUDIT_HEAD_ANCHOR_MAC_DOMAIN = "sanctuary.audit-head-anchor.v1\n";
+// Checkpoint-signing latch (IC-05 fix round): one-way, MAC-authenticated
+// fortress memory that a SIGNED audit-checkpoint was written. `unsigned` /
+// `unsigned_reason` on a checkpoint record are attacker-writable plaintext,
+// so without this memory, stripping a real signature and setting
+// `unsigned: true` reads exactly like an honest pre-bootstrap fortress.
+// Marker, MAC purpose ("audit-signing-latch"), and domain must match the
+// `__signing_latch` entry in `MAC_ANCHORS` in `core/master-rotation.ts`
+// (`convertAuditAnchors`), which restamps this record across a master
+// rotation; the storage key is `AUDIT_SIGNING_LATCH_KEY` from
+// `audit/checkpoint-shape.ts`.
+const AUDIT_SIGNING_LATCH_MARKER = "__sanctuary_audit_signing_latch_v1";
+const AUDIT_SIGNING_LATCH_MAC_DOMAIN = "sanctuary.audit-signing-latch.v1\n";
 
 // ── F2 Option A: fortress audit store split by writer ──────────────────────
 //
@@ -1792,6 +1813,9 @@ export class AuditLog {
   private encryptionKey: Uint8Array;
   private rotationAnchorMacKey: Uint8Array;
   private headAnchorMacKey: Uint8Array;
+  /** MAC key for the checkpoint-signing latch; derived up front so the raw
+   * master is never retained (same posture as every other purpose key here). */
+  private signingLatchMacKey: Uint8Array;
   private epochWrapKey: Uint8Array;
   private epochMacKey: Uint8Array;
   /** Lazily-loaded prior-epoch audit keys (master rotations); null = not yet loaded. */
@@ -1954,6 +1978,9 @@ export class AuditLog {
     // master key (mirrors how encryptionKey is derived here, per F1's pattern).
     this.rotationAnchorMacKey = derivePurposeKey(masterKey, "audit-rotation-anchor");
     this.headAnchorMacKey = derivePurposeKey(masterKey, "audit-head-anchor");
+    // Purpose label must match the `__signing_latch` restamp entry in
+    // core/master-rotation.ts (convertAuditAnchors).
+    this.signingLatchMacKey = derivePurposeKey(masterKey, "audit-signing-latch");
     // F7: keys for the custody-epoch record (pre-rotation entry decryption).
     // Derived up front so the raw master is never retained on the instance.
     const epochKeys = deriveAuditEpochKeys(masterKey);
@@ -3028,6 +3055,149 @@ export class AuditLog {
       this.headAnchorMacKey,
       stringToBytes(AUDIT_HEAD_ANCHOR_MAC_DOMAIN + canonicalJson(data))
     );
+  }
+
+  private signingLatchMacBytes(data: {
+    first_signed_sequence: number;
+    signer_kid: string;
+    signed_at: string;
+  }): Uint8Array {
+    return hmacSha256(
+      this.signingLatchMacKey,
+      stringToBytes(AUDIT_SIGNING_LATCH_MAC_DOMAIN + canonicalJson(data))
+    );
+  }
+
+  /**
+   * One-way write of the checkpoint-signing latch: called after the first
+   * SIGNED `audit-checkpoint` record is persisted. Records the sequence at
+   * which signing was first observed, MAC'd under master-derived material so
+   * it cannot be forged or edited by a storage-only attacker (deleting it is
+   * the residual, partially covered by the in-store signed-checkpoint signal
+   * in `verifyCheckpoints`). Never overwrites an existing record, whatever
+   * its content: a valid latch must keep its ORIGINAL first-signed floor, and
+   * an invalid one is tamper evidence the verify path must keep seeing, so
+   * re-stamping it here would erase exactly what the finding reports.
+   * Best-effort by design: a latch write failure must not fail the checkpoint
+   * append it rides on (availability), and only ever costs detection of a
+   * LATER downgrade, never a false finding.
+   */
+  private async ensureSigningLatchEstablished(
+    firstSignedSequence: number,
+    signerKid: string,
+    signedAt: string
+  ): Promise<void> {
+    try {
+      const existing = await this.storage.read(
+        AUDIT_CHECKPOINT_NAMESPACE,
+        AUDIT_SIGNING_LATCH_KEY
+      );
+      if (existing !== null) return;
+      const data = {
+        first_signed_sequence: firstSignedSequence,
+        signer_kid: signerKid,
+        signed_at: signedAt,
+      };
+      const envelope = {
+        [AUDIT_SIGNING_LATCH_MARKER]: true,
+        data,
+        mac: toBase64url(this.signingLatchMacBytes(data)),
+      };
+      const bytes = stringToBytes(JSON.stringify(envelope));
+      // Durable write where the backend supports it (same as the head
+      // anchor): a torn latch would read as "invalid", which is a LOUD
+      // downgrade finding, so a crash mid-write must not be able to plant
+      // permanent false tamper evidence.
+      if (this.filesystemCapabilities) {
+        await this.filesystemCapabilities.writeDurable(
+          AUDIT_CHECKPOINT_NAMESPACE,
+          AUDIT_SIGNING_LATCH_KEY,
+          bytes
+        );
+      } else {
+        await this.storage.write(
+          AUDIT_CHECKPOINT_NAMESPACE,
+          AUDIT_SIGNING_LATCH_KEY,
+          bytes
+        );
+      }
+    } catch {
+      // See doc comment: best-effort; never fail the checkpoint append.
+    }
+  }
+
+  /**
+   * Read + authenticate the checkpoint-signing latch.
+   *  - "absent": no latch record (fortress never signed, or an attacker
+   *    deleted it; the in-store signed-checkpoint signal partially covers the
+   *    deletion case).
+   *  - "valid": authenticates under THIS master; `first_signed_sequence` is
+   *    the authenticated floor from which checkpoints must be signed.
+   *  - "invalid": present but marker-stripped, malformed, or failing the MAC.
+   *    The caller reports this as `checkpoint_signing_downgrade` (fail loud):
+   *    a record that no longer authenticates proves edit or wrong-key
+   *    tampering, never an honest state.
+   */
+  private async readSigningLatch(): Promise<
+    | { status: "absent" }
+    | { status: "valid"; first_signed_sequence: number }
+    | { status: "invalid" }
+  > {
+    let raw: Uint8Array | null;
+    try {
+      raw = await this.storage.read(
+        AUDIT_CHECKPOINT_NAMESPACE,
+        AUDIT_SIGNING_LATCH_KEY
+      );
+    } catch {
+      // Cannot read it → cannot prove it absent → lean suspect, same posture
+      // as the head-anchor probe.
+      return { status: "invalid" };
+    }
+    if (raw === null) return { status: "absent" };
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(bytesToString(raw));
+    } catch {
+      return { status: "invalid" };
+    }
+    const record = parsed as Record<string, unknown>;
+    if (!record || typeof record !== "object" || record[AUDIT_SIGNING_LATCH_MARKER] !== true) {
+      return { status: "invalid" };
+    }
+    const data = record.data as
+      | { first_signed_sequence?: unknown; signer_kid?: unknown; signed_at?: unknown }
+      | undefined;
+    if (
+      !data ||
+      typeof data !== "object" ||
+      typeof data.first_signed_sequence !== "number" ||
+      !Number.isSafeInteger(data.first_signed_sequence) ||
+      typeof data.signer_kid !== "string" ||
+      typeof data.signed_at !== "string" ||
+      typeof record.mac !== "string"
+    ) {
+      return { status: "invalid" };
+    }
+    let providedMac: Uint8Array;
+    try {
+      providedMac = fromBase64url(record.mac);
+    } catch {
+      return { status: "invalid" };
+    }
+    if (
+      !constantTimeEqual(
+        providedMac,
+        this.signingLatchMacBytes({
+          first_signed_sequence: data.first_signed_sequence,
+          signer_kid: data.signer_kid,
+          signed_at: data.signed_at,
+        })
+      )
+    ) {
+      return { status: "invalid" };
+    }
+    return { status: "valid", first_signed_sequence: data.first_signed_sequence };
   }
 
   /**
@@ -5542,6 +5712,50 @@ export class AuditLog {
       await this.verifyCheckpointRecordSignature(checkpoint, findings);
     }
 
+    // Signing-downgrade invariant (IC-05 fix round): `unsigned` and
+    // `unsigned_reason` are attacker-writable plaintext inside the record, so
+    // an `unsigned: true` checkpoint is trusted as honest ONLY below the
+    // point at which this fortress provably started signing. Two independent
+    // memories establish that floor, OR'd so deleting one does not erase the
+    // detector (the head-anchor pattern):
+    //  (1) the MAC'd signing latch (authenticated first-signed sequence;
+    //      unforgeable, but deletable), and
+    //  (2) the lowest SIGNED checkpoint still in the store (co-deletable only
+    //      by also stripping every later signed record).
+    // Residual, stated honestly: an attacker who deletes the latch AND strips
+    // only a PREFIX of the signed checkpoints leaves a store shaped like the
+    // legitimate pre-bootstrap-then-signed migration, which must stay
+    // finding-free; that bound is part of the external-verifier drill's
+    // downgrade-probe acceptance criteria. A latch that is present but does
+    // not authenticate is itself a finding, never a silent skip.
+    const latch = await this.readSigningLatch();
+    if (latch.status === "invalid") {
+      findings.push({
+        kind: "checkpoint_signing_downgrade",
+        message:
+          "the checkpoint-signing latch is present but does not authenticate under this master (tampered or wrong-key edit)",
+      });
+    }
+    let signedFloor =
+      latch.status === "valid" ? latch.first_signed_sequence : Number.POSITIVE_INFINITY;
+    for (const checkpoint of checkpoints) {
+      if (!checkpoint.unsigned && checkpoint.checkpoint_sequence < signedFloor) {
+        signedFloor = checkpoint.checkpoint_sequence;
+      }
+    }
+    for (const checkpoint of checkpoints) {
+      if (checkpoint.unsigned && checkpoint.checkpoint_sequence >= signedFloor) {
+        findings.push({
+          kind: "checkpoint_signing_downgrade",
+          sequence: checkpoint.checkpoint_sequence,
+          message:
+            `checkpoint ${checkpoint.checkpoint_sequence} is unsigned, but this fortress ` +
+            `provably signed checkpoints from sequence ${signedFloor}; ` +
+            "an unsigned checkpoint after signing was established is a downgrade, not a pre-bootstrap state",
+        });
+      }
+    }
+
     this.lastCheckpointSequence = highestCheckpoint;
   }
 
@@ -5876,6 +6090,18 @@ export class AuditLog {
       key,
       stringToBytes(JSON.stringify(record))
     );
+    if (signed && payload.checkpoint_kind === "audit-checkpoint") {
+      // Downgrade latch: from this point the fortress has provably signed, so
+      // a later `unsigned` audit-checkpoint at or above this sequence is a
+      // finding, not a pre-bootstrap read. Scoped to the "audit-checkpoint"
+      // kind because the legacy anchor's `checkpoint_sequence` counts the
+      // LEGACY entry space and would poison the chained-sequence floor.
+      await this.ensureSigningLatchEstablished(
+        payload.checkpoint_sequence,
+        signed.signer_kid,
+        payload.signed_at
+      );
+    }
   }
 
   private async reportIntegrityFindingsIfAny(): Promise<void> {

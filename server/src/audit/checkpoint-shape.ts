@@ -70,6 +70,15 @@ export const AUDIT_HEAD_ANCHOR_KEY = "__head_anchor";
 export const AUDIT_EPOCH_KEYS_KEY = "__custody_epoch_keys";
 
 /**
+ * Fixed `_audit_checkpoints` storage key of the MAC-authenticated
+ * checkpoint-signing latch: one-way fortress memory that a SIGNED checkpoint
+ * was once written, so a later `unsigned` checkpoint reads as a downgrade
+ * finding instead of an honest pre-bootstrap store. A control record, never
+ * exported as a checkpoint.
+ */
+export const AUDIT_SIGNING_LATCH_KEY = "__signing_latch";
+
+/**
  * The CLOSED allowlist of legitimate NON-EXPORT control records that live in
  * the `_audit_checkpoints` namespace under fixed keys. A record under one of
  * these keys may be skipped by the chain exporter WITHOUT counting toward
@@ -85,6 +94,7 @@ export const AUDIT_EPOCH_KEYS_KEY = "__custody_epoch_keys";
 export const AUDIT_CHECKPOINT_NAMESPACE_CONTROL_KEYS: readonly string[] = [
   AUDIT_HEAD_ANCHOR_KEY,
   AUDIT_EPOCH_KEYS_KEY,
+  AUDIT_SIGNING_LATCH_KEY,
 ];
 
 /** The fields a checkpoint signature ranges over. */

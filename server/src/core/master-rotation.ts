@@ -1245,6 +1245,18 @@ async function convertAuditAnchors(ctx: Ctx, verifyOnly: boolean): Promise<numbe
       purpose: "audit-head-anchor",
       domain: "sanctuary.audit-head-anchor.v1\n",
     },
+    // Checkpoint-signing latch (IC-05 fix round). Marker/purpose/domain must
+    // match AUDIT_SIGNING_LATCH_MARKER / the "audit-signing-latch"
+    // derivePurposeKey label / AUDIT_SIGNING_LATCH_MAC_DOMAIN in
+    // operational/audit-log.ts; the key literal is AUDIT_SIGNING_LATCH_KEY in
+    // audit/checkpoint-shape.ts. Omitting this entry would make rotation
+    // ABORT on every fortress that ever signed a checkpoint (closed-set
+    // classifier below).
+    __signing_latch: {
+      marker: "__sanctuary_audit_signing_latch_v1",
+      purpose: "audit-signing-latch",
+      domain: "sanctuary.audit-signing-latch.v1\n",
+    },
   };
   for (const key of await listKeys(ctx.storage, "_audit_checkpoints")) {
     const anchor = MAC_ANCHORS[key];

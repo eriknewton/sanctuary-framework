@@ -247,6 +247,169 @@ describe("IC-05: bare production constructor signs and verifies checkpoints", ()
     } satisfies Partial<AuditIntegrityError>);
   });
 
+  it("silent-downgrade probe: stripping a signed checkpoint to unsigned:true raises checkpoint_signing_downgrade", async () => {
+    // The reviewer's empirical probe, kept as a regression test: before the
+    // signing latch existed, this exact mutation produced ZERO integrity
+    // findings on a strict production reader, indistinguishable from an
+    // honest pre-bootstrap fortress (MUST-NEVER #5, silent degrade).
+    const storage = new MemoryStorage();
+    const masterKey = generateRandomKey();
+    const { storedIdentity } = await seedStoredIdentity(storage, masterKey, "fortress");
+
+    const writer = new AuditLog(storage, masterKey, { checkpointInterval: 1 });
+    await appendCriticalEntries(writer, 1, storedIdentity.identity_id);
+
+    const metas = await storage.list(CHECKPOINT_NAMESPACE, CHECKPOINT_PREFIX);
+    const raw = await storage.read(CHECKPOINT_NAMESPACE, metas[0]!.key);
+    const checkpoint = JSON.parse(bytesToString(raw!)) as AuditCheckpointRecord;
+    expect(checkpoint.unsigned).toBe(false);
+    await storage.write(
+      CHECKPOINT_NAMESPACE,
+      metas[0]!.key,
+      stringToBytes(
+        JSON.stringify({
+          ...checkpoint,
+          signer_kid: null,
+          signature: null,
+          signature_algorithm: null,
+          unsigned: true,
+          unsigned_reason: "no signing identity available at checkpoint time",
+        })
+      )
+    );
+
+    const reader = new AuditLog(storage, masterKey);
+    await expect(reader.query({ limit: 100 })).rejects.toMatchObject({
+      name: "AuditIntegrityError",
+      findings: expect.arrayContaining([
+        expect.objectContaining({ kind: "checkpoint_signing_downgrade" }),
+      ]),
+    } satisfies Partial<AuditIntegrityError>);
+  });
+
+  it("forward downgrade: an unsigned checkpoint written after the identity vanished raises the finding", async () => {
+    const storage = new MemoryStorage();
+    const masterKey = generateRandomKey();
+    const { storedIdentity } = await seedStoredIdentity(storage, masterKey, "fortress");
+
+    const writer = new AuditLog(storage, masterKey, { checkpointInterval: 1 });
+    await appendCriticalEntries(writer, 1, storedIdentity.identity_id);
+
+    // Remove the signing identity (and the primary pointer to it), so the
+    // NEXT checkpoint honestly writes unsigned. The latch remembers signing
+    // was established, so that unsigned checkpoint is a downgrade finding,
+    // never a quiet return to the pre-bootstrap read.
+    await storage.delete("_identities", storedIdentity.identity_id);
+    await storage.delete("_meta", "primary_identity_id");
+    const writer2 = new AuditLog(storage, masterKey, {
+      checkpointInterval: 1,
+      integrityMode: "lenient",
+    });
+    await appendCriticalEntries(writer2, 1, "post-identity-loss");
+
+    const checkpoints = await readCheckpoints(storage);
+    expect(checkpoints.some((checkpoint) => checkpoint.unsigned === true)).toBe(true);
+
+    const reader = new AuditLog(storage, masterKey, { integrityMode: "lenient" });
+    const result = await reader.query({ limit: 100 });
+    expect(result.integrity_findings).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ kind: "checkpoint_signing_downgrade" }),
+      ])
+    );
+  });
+
+  it("migration stays clean: unsigned pre-bootstrap checkpoints below the signing floor raise nothing", async () => {
+    // The false-positive guard for every fortress upgraded across IC-05:
+    // historical unsigned checkpoints PRECEDE the first signed one and must
+    // stay finding-free forever, or the downgrade detector would brick every
+    // legitimately migrated store in strict mode.
+    const storage = new MemoryStorage();
+    const masterKey = generateRandomKey();
+
+    const preBootstrap = new AuditLog(storage, masterKey, { checkpointInterval: 1 });
+    await appendCriticalEntries(preBootstrap, 2, "pre-bootstrap");
+
+    const { storedIdentity } = await seedStoredIdentity(storage, masterKey, "fortress");
+    const signedWriter = new AuditLog(storage, masterKey, { checkpointInterval: 1 });
+    await appendCriticalEntries(signedWriter, 2, storedIdentity.identity_id);
+
+    const checkpoints = await readCheckpoints(storage);
+    expect(checkpoints.some((checkpoint) => checkpoint.unsigned === true)).toBe(true);
+    expect(checkpoints.some((checkpoint) => checkpoint.unsigned === false)).toBe(true);
+
+    const reader = new AuditLog(storage, masterKey);
+    const result = await reader.query({ limit: 100 });
+    expect(result.integrity_findings).toEqual([]);
+  });
+
+  it("a tampered signing latch is a loud finding, never a silent skip", async () => {
+    const storage = new MemoryStorage();
+    const masterKey = generateRandomKey();
+    const { storedIdentity } = await seedStoredIdentity(storage, masterKey, "fortress");
+
+    const writer = new AuditLog(storage, masterKey, { checkpointInterval: 1 });
+    await appendCriticalEntries(writer, 1, storedIdentity.identity_id);
+
+    const latchRaw = await storage.read(CHECKPOINT_NAMESPACE, "__signing_latch");
+    expect(latchRaw).not.toBeNull();
+    const latch = JSON.parse(bytesToString(latchRaw!)) as { mac: string };
+    latch.mac = `${latch.mac.slice(0, -2)}AA`;
+    await storage.write(
+      CHECKPOINT_NAMESPACE,
+      "__signing_latch",
+      stringToBytes(JSON.stringify(latch))
+    );
+
+    const reader = new AuditLog(storage, masterKey, { integrityMode: "lenient" });
+    const result = await reader.query({ limit: 100 });
+    expect(result.integrity_findings).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ kind: "checkpoint_signing_downgrade" }),
+      ])
+    );
+  });
+
+  it("latch deletion alone does not disarm the detector: a surviving signed checkpoint keeps the floor", async () => {
+    // Second, independent memory (the head-anchor OR pattern): with the latch
+    // deleted, an unsigned checkpoint AFTER a still-signed one must still read
+    // as a downgrade via the in-store signed-checkpoint floor.
+    const storage = new MemoryStorage();
+    const masterKey = generateRandomKey();
+    const { storedIdentity } = await seedStoredIdentity(storage, masterKey, "fortress");
+
+    const writer = new AuditLog(storage, masterKey, { checkpointInterval: 1 });
+    await appendCriticalEntries(writer, 2, storedIdentity.identity_id);
+
+    await storage.delete(CHECKPOINT_NAMESPACE, "__signing_latch");
+    const metas = await storage.list(CHECKPOINT_NAMESPACE, CHECKPOINT_PREFIX);
+    const lastKey = metas[metas.length - 1]!.key;
+    const raw = await storage.read(CHECKPOINT_NAMESPACE, lastKey);
+    const checkpoint = JSON.parse(bytesToString(raw!)) as AuditCheckpointRecord;
+    await storage.write(
+      CHECKPOINT_NAMESPACE,
+      lastKey,
+      stringToBytes(
+        JSON.stringify({
+          ...checkpoint,
+          signer_kid: null,
+          signature: null,
+          signature_algorithm: null,
+          unsigned: true,
+          unsigned_reason: "no signing identity available at checkpoint time",
+        })
+      )
+    );
+
+    const reader = new AuditLog(storage, masterKey, { integrityMode: "lenient" });
+    const result = await reader.query({ limit: 100 });
+    expect(result.integrity_findings).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ kind: "checkpoint_signing_downgrade" }),
+      ])
+    );
+  });
+
   it("refuses to let a checkpoint-supplied signer_kid shape a storage lookup", async () => {
     const storage = new MemoryStorage();
     const masterKey = generateRandomKey();
