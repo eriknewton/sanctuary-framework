@@ -314,7 +314,7 @@ export class LocatorTableStore {
  */
 export class NodeLifecycleEventLog {
   private events: SignedEvent<NodeLifecyclePayload>[] = [];
-  /** `${emitter_node} ${event_id}` for every retained NON-revoke event. */
+  /** `${emitter_node}\u0000${event_id}` for every retained NON-revoke event. */
   private readonly nonRevokeKeys = new Set<string>();
   /** authorization key -> the retained revoke event (identity for eviction). */
   private readonly revokeByAuth = new Map<
@@ -430,7 +430,7 @@ export class NodeLifecycleEventLog {
   }
 
   private nonRevokeKey(evt: SignedEvent<NodeLifecyclePayload>): string {
-    return `${evt.emitter_node} ${evt.event_id}`;
+    return `${evt.emitter_node}\u0000${evt.event_id}`;
   }
 
   /**
