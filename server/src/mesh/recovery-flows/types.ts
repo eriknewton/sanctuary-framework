@@ -21,6 +21,7 @@ import type {
   PrincipalCertificate,
 } from "../types.js";
 import type { GuardianQuorumSignature } from "../guardian/types.js";
+import type { GuardianRevokeQuorumContext } from "../guardian/revoke-quorum-input.js";
 import type { CeremonyId } from "./constants.js";
 
 /**
@@ -74,6 +75,15 @@ export interface DeviceRecoveryProposal {
    * same signing session as `guardian_signatures`.
    */
   revoke_guardian_signatures: GuardianQuorumSignature[];
+  /**
+   * C12-REPLAY v2 collection context (ceremony_id + initiated_at + expires_at),
+   * minted BEFORE any guardian signs. The SAME context is signed into both the
+   * recovery-intent input and the revoke input in one collection session
+   * (design §2.3); `propose` verifies freshness against it and adopts its
+   * ceremony_id. Required for v2 — a proposal without it carries the retired
+   * unbounded-lifetime shape and is refused.
+   */
+  quorum_context: GuardianRevokeQuorumContext;
   /** ISO8601 timestamp the ceremony was initiated at. */
   initiated_at?: string;
 }
@@ -95,6 +105,13 @@ export interface NodeRevokeProposal {
   reason: string;
   /** Guardian quorum signatures — required per Key 13 for revoke. */
   guardian_signatures: GuardianQuorumSignature[];
+  /**
+   * C12-REPLAY v2 collection context minted BEFORE the guardians sign the
+   * revoke input (design §2.3). `propose` builds the input from this context,
+   * checks freshness with its own clock, and adopts its ceremony_id as the
+   * ceremony's. Required for v2.
+   */
+  quorum_context: GuardianRevokeQuorumContext;
   /**
    * Optional: if the ceremony operator judges the compromise may have
    * exposed the fortress-master secret, flag this so the orchestrator chains

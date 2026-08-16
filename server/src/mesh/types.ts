@@ -417,6 +417,21 @@ export interface NodeRevokePayload {
   effective_at: string;
   /** Present for guardian-initiated revocation (§3.6.1). */
   quorum_signatures?: Array<{ guardian_pubkey: string; signature: string }>;
+  /**
+   * C12-REPLAY v2: echoes the freshness fields of the signed quorum input so a
+   * verifier can recompute the canonical bytes AND enforce the lifetime window.
+   * Present IFF `quorum_signatures` is (presence pairing enforced at the shared
+   * parser): signatures-without-context is the retired v1 shape and is refused
+   * under M1; context-without-signatures is an orphan and is rejected, never
+   * ignored. `input_schema` must match `GUARDIAN_REVOKE_QUORUM_SCHEMA_V2` in
+   * `mesh/guardian/revoke-quorum-input.ts` exactly.
+   */
+  quorum_context?: {
+    input_schema: "sanctuary.guardian-revoke-quorum.v2";
+    ceremony_id: string;
+    initiated_at: string;
+    expires_at: string;
+  };
 }
 
 export interface NodeAttestationRefreshPayload {

@@ -26,10 +26,13 @@
 
 import type { MeshNode } from "../lifecycle/mesh-node.js";
 import {
+  assertQuorumContextFresh,
+  buildGuardianRevokeQuorumInput,
+  parseGuardianRevokeQuorumContext,
+  toWireQuorumContext,
   verifyGuardianQuorum,
   type GuardianQuorumProof,
   type GuardianRoster,
-  type MasterRotationQuorumInput,
 } from "../guardian/index.js";
 import type {
   FortressMasterPublicKey,
@@ -100,25 +103,31 @@ export class NodeRevokeCeremony {
         "node_revoke proposal requires a non-empty reason"
       );
     }
-    // Verify the quorum NOW so a mis-assembled proposal is caught pre-confirm.
-    // The canonical quorum input for a revoke re-uses the master-rotation
-    // input shape but with the target_node bound in via the `rotated_at`-
-    // shaped context — in v0.1 we simply re-use the guardian roster's
-    // `verifyGuardianQuorum` primitive directly against a revoke-shaped
-    // quorum input. Producers and receivers MUST agree on the canonical
-    // bytes. v0.1 ships one agreement: (fortress_id, target_node_id, reason,
-    // initiated_at) form the quorum-signed input; we canonicalize those
-    // fields so both ceremony signer and verifier hash the same bytes.
-    //
-    // Using MasterRotationQuorumInput as the underlying shape keeps the
-    // producer side (signMasterRotationAsGuardian) re-usable. We bind the
-    // revoke intent into the free `rotated_at` slot with a prefix that
-    // matches the receiver's verifier. v0.1 receiver uses this same helper;
-    // v0.1.1 spec surface will define a `GuardianRevokeQuorumInput` shape.
-    const input = revokeQuorumInput(
-      params.proposal,
-      params.ctx.pinned_master.fortress_id
+    // C12-REPLAY v2: the collection context (ceremony_id + initiated_at +
+    // expires_at) was minted BEFORE the guardians signed (design §2.3), so the
+    // signatures bind the ceremony_id. Build the canonical bytes FROM the
+    // proposal's context via the ONE shared builder, verify freshness with this
+    // device's own clock (rule 10: the relying side hard-fails a stale window),
+    // then verify the quorum. `parse` re-validates the operator-supplied
+    // context element-by-element so a malformed field fails closed here.
+    const parsed = parseGuardianRevokeQuorumContext(
+      toWireQuorumContext(params.proposal.quorum_context)
     );
+    if (!parsed.ok) {
+      throw new CeremonyError(
+        `node_revoke proposal has a malformed quorum context: ${parsed.reason}`
+      );
+    }
+    assertQuorumContextFresh(parsed.context, {
+      mode: "strict",
+      now: new Date(),
+    });
+    const input = buildGuardianRevokeQuorumInput({
+      context: params.proposal.quorum_context,
+      target_node_id: params.proposal.target_node_id,
+      reason: params.proposal.reason,
+      fortress_id: params.ctx.pinned_master.fortress_id,
+    });
     const proof: GuardianQuorumProof = {
       roster_version: params.ctx.pinned_roster.version,
       signatures: params.proposal.guardian_signatures,
@@ -129,8 +138,10 @@ export class NodeRevokeCeremony {
       pinned_roster: params.ctx.pinned_roster,
     });
 
+    // One identifier end to end: the ceremony adopts the context's ceremony_id
+    // rather than minting a fresh one after signatures already exist.
     const ceremony = new NodeRevokeCeremony({
-      ceremony_id: generateCeremonyId(),
+      ceremony_id: params.proposal.quorum_context.ceremony_id,
       proposal: params.proposal,
       ctx: params.ctx,
     });
@@ -204,6 +215,9 @@ export class NodeRevokeCeremony {
       const revokeEvent = await this.ctx.node.revokePeer({
         target_node_id: this.proposal.target_node_id,
         reason: this.proposal.reason,
+        // C12-REPLAY: carry the freshness context onto the payload so every
+        // receiver re-verifies the window from the wire alone.
+        quorum_context: this.proposal.quorum_context,
         quorum_signatures: this.proposal.guardian_signatures.map((s) => {
           const guardian = this.ctx.pinned_roster.guardians.find(
             (g) => g.guardian_id === s.guardian_id
@@ -271,68 +285,11 @@ export class NodeRevokeCeremony {
   }
 }
 
-/**
- * Build the canonical quorum-input bytes for a revoke ceremony. v0.1 re-uses
- * `MasterRotationQuorumInput` shape; producers + verifiers agree on the
- * convention that the `rotated_at` field carries the concatenated revoke
- * intent with a fixed prefix. v0.1.1 spec will define a dedicated
- * `GuardianRevokeQuorumInput` shape.
- *
- * The "old_master_pubkey" is the target node id prefixed with `node:` so the
- * input binds to the revoke target. The "new_master_pubkey" FortressMaster
- * shape carries the reason in `public_key` (base64url of the reason string
- * as bytes) plus the fortress_id, and its `created_at`/`rotated_at` slots
- * hold the deterministic string `"revoke:" + target_node_id`, NOT a
- * timestamp. The input therefore carries no freshness: a harvested guardian
- * quorum signature over it authorizes revoking that target indefinitely.
- * Replaying a completed revocation is idempotent (the target is already
- * revoked); the replay window for an abandoned ceremony's signatures is a
- * known, registered residual (register id C12-REPLAY) pending a
- * freshness-bound quorum-input shape.
- *
- * This is explicitly an orchestration-layer convention; the receiver (inside
- * this ceremony, for verifyGuardianQuorum) uses the exact same builder.
- *
- * Must match `nodeRevokeQuorumInput` in `../lifecycle/mesh-node.ts`
- * byte-for-byte: MeshNode.revokePeer's pre-broadcast gate and every
- * receiving node recompute these bytes to verify the quorum signatures
- * produced against this builder.
- */
-export function revokeQuorumInput(
-  proposal: Pick<NodeRevokeProposal, "target_node_id" | "reason">,
-  fortressId: string
-): MasterRotationQuorumInput {
-  const initiatedAt = "revoke:" + proposal.target_node_id;
-  return {
-    old_master_pubkey: "node:" + proposal.target_node_id,
-    new_master_pubkey: {
-      public_key: toBase64UrlLocal(
-        new TextEncoder().encode("revoke|" + proposal.reason)
-      ),
-      fortress_id: fortressId,
-      created_at: initiatedAt,
-    },
-    rotated_at: initiatedAt,
-    fortress_id: fortressId,
-  };
-}
-
-function toBase64UrlLocal(bytes: Uint8Array): string {
-  let s = "";
-  for (const b of bytes) s += String.fromCharCode(b);
-  return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-}
-
-function generateCeremonyId(): string {
-  const bytes = new Uint8Array(16);
-  if (typeof globalThis.crypto?.getRandomValues === "function") {
-    globalThis.crypto.getRandomValues(bytes);
-  } else {
-    for (let i = 0; i < bytes.length; i++) {
-      bytes[i] = Math.floor(Math.random() * 256);
-    }
-  }
-  let hex = "";
-  for (const b of bytes) hex += b.toString(16).padStart(2, "0");
-  return hex;
-}
+// C12-REPLAY: the v1 `revokeQuorumInput` builder and the copy-pasted
+// `generateCeremonyId` (which silently degraded to a non-CSPRNG source) were
+// DELETED here. The canonical bytes now come from the single shared builder
+// `buildGuardianRevokeQuorumInput` in `mesh/guardian/revoke-quorum-input.ts`,
+// and the ceremony_id is minted CSPRNG-fail-closed by
+// `mintRevokeCollectionContext` in that same module. Deleting the hand-mirror
+// makes producer/verifier drift structurally impossible rather than
+// tripwire-enforced (design §3.1).

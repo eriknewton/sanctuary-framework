@@ -40,6 +40,89 @@ export const HKDF_NODE_KEY_WRAP_INFO_PREFIX =
 export const HKDF_AGENT_STATE_TRANSFER_INFO_PREFIX =
   "sanctuary-fed-v0.1-lifecycle-agent-state-transfer";
 
+// ═══════════════════════════════════════════════════════════════════════
+// C12-REPLAY / SYNC-APPEND-01 — lifecycle-log growth bounds (rule 8)
+// ═══════════════════════════════════════════════════════════════════════
+
+/**
+ * Hard cap on the in-memory `NodeLifecycleEventLog`. The log is fed from
+ * untrusted sync input, so per rule 8 it carries an explicit ceiling and an
+ * eviction rule. 10_000 is generous for a real fortress's join/leave/revoke
+ * history over its lifetime while bounding an attacker-appendable relay.
+ * Eviction prefers OLDEST NON-REVOKE events; a revoke event is evicted only
+ * when no non-revoke event remains, because the roster (not the log) is the
+ * authoritative revocation state, so even revoke eviction degrades to "a late
+ * joiner learns via a peer with a longer log," never to un-revoking.
+ */
+export const NODE_LIFECYCLE_LOG_MAX_EVENTS = 10_000;
+
+/**
+ * Per-`(fortress, target)` cap on RETAINED accepted-revoke authorizations
+ * (SYNC-APPEND-01 §3.3 point 5, re-gate RG3-2). Authorizations are scarce —
+ * each costs an M-guardian ceremony or a principal signature — so 8 loses no
+ * legitimate revoke/rejoin history for a single target while bounding even a
+ * multi-authorization flood. Saturation EVICTS OLDEST and never blocks the
+ * newest: the newest authorization carries the ordering witness a late joiner
+ * needs, so refusing it would recreate the RG3-1 divergence through the quota.
+ */
+export const MAX_RETAINED_REVOKE_AUTHORIZATIONS_PER_TARGET = 8;
+
+// ═══════════════════════════════════════════════════════════════════════
+// C12-REPLAY — denial-write ceiling (rule 8, §2.5 + review F-8a/NH-4)
+// ═══════════════════════════════════════════════════════════════════════
+
+/**
+ * Rolling window over which the revoke-denial audit budgets apply. 3_600_000 =
+ * 1 h. Once freshness enforcement exists every replay is a guaranteed denial,
+ * so the write amplification is capped in the same change that creates the
+ * incentive.
+ */
+export const REVOKE_DENIAL_AUDIT_WINDOW_MS = 60 * 60 * 1_000;
+
+/**
+ * Per-authentic-emitter denial-audit budget per window. `emitter_node` on the
+ * denial path is envelope-verified, so buckets cannot be spoofed; this bounds a
+ * single emitter's replay-spam audit amplification.
+ */
+export const REVOKE_DENIAL_AUDIT_PER_EMITTER_MAX = 32;
+
+/**
+ * Global per-node denial-audit ceiling ABOVE the per-emitter buckets (review
+ * F-8a): a sync response relays events from MANY authentic emitters, so the
+ * per-emitter budget totals M*perEmitter with M outside the defender's control.
+ * The global ceiling bounds the aggregate. Its saturation is itself audited
+ * once, as a sealed summary carrying {suppressed_count, distinct_emitter_count}
+ * — attribution granularity degrades, attempt/emitter counts are never lost.
+ */
+export const REVOKE_DENIAL_AUDIT_GLOBAL_MAX = 256;
+
+// ═══════════════════════════════════════════════════════════════════════
+// C12-REPLAY — sync-response request correlation (§3.3 point 7, re-gate NH-3)
+// ═══════════════════════════════════════════════════════════════════════
+
+/**
+ * Lifetime of an outstanding `sync_request` id. Derived GENEROUSLY against
+ * worst-case whole-snapshot transfer: `handleSyncRequest` serves the entire
+ * `lifecycle_log.snapshot()` on initial sync and the snapshot grows with
+ * fortress age (bounded by NODE_LIFECYCLE_LOG_MAX_EVENTS), so this must dominate
+ * a slow-link full-snapshot transfer — minutes, not seconds. 600_000 = 10 min.
+ * A too-small value looks like a late joiner on a slow link that never completes
+ * initial sync while every live path is healthy (permanent initial-sync
+ * starvation); the tell is repeated uncorrelated-`sync_response` audit entries
+ * on the joiner. Retry is owned by the INITIATOR with a FRESH id.
+ */
+export const SYNC_REQUEST_ID_EXPIRY_MS = 10 * 60 * 1_000;
+
+/**
+ * Bound on the outstanding-request set (self-inflicted growth only — ids are
+ * minted solely by this node's own `sync_request`s, so an external peer can
+ * neither insert nor evict). Evicts oldest when full.
+ */
+export const MAX_OUTSTANDING_SYNC_REQUESTS = 64;
+
+/** 16 bytes = 128 bits of CSPRNG for a sync-request correlation id. */
+export const SYNC_REQUEST_ID_BYTES = 16;
+
 /** MeshNode runtime states. Not serialized on the wire — internal orchestration. */
 export type MeshNodeState =
   | "unbooted"

@@ -42,10 +42,16 @@
 
 import type { MeshNode } from "../lifecycle/mesh-node.js";
 import {
+  assertQuorumContextFresh,
+  buildGuardianDeviceRecoveryQuorumInput,
+  buildGuardianRevokeQuorumInput,
+  parseGuardianRevokeQuorumContext,
+  toWireQuorumContext,
   verifyGuardianQuorum,
+  type GuardianDeviceRecoveryQuorumInput,
   type GuardianQuorumProof,
+  type GuardianRevokeQuorumInput,
   type GuardianRoster,
-  type MasterRotationQuorumInput,
 } from "../guardian/index.js";
 import {
   deriveNodeAuditChainKey,
@@ -65,7 +71,6 @@ import {
   CeremonyError,
   CeremonyNotConfirmedError,
 } from "./errors.js";
-import { revokeQuorumInput } from "./node-revoke.js";
 import {
   enforceDMswitchGraceWindow,
   type DMswitchGraceWindowInput,
@@ -135,7 +140,21 @@ export class DeviceRecoveryCeremony {
       params.ctx.pinned_master
     );
 
-    // 3. Verify the guardian quorum over the recovery intent.
+    // C12-REPLAY v2: the SAME collection context signs BOTH the recovery-intent
+    // input and the revoke input in one session (design §2.3, QI-SIBLING-01).
+    // Validate the operator-supplied context element-by-element, then hard-fail
+    // a stale window with this device's own clock before either quorum verify.
+    const parsed = parseGuardianRevokeQuorumContext(
+      toWireQuorumContext(params.proposal.quorum_context)
+    );
+    if (!parsed.ok) {
+      throw new CeremonyError(
+        `device_recovery proposal has a malformed quorum context: ${parsed.reason}`
+      );
+    }
+    assertQuorumContextFresh(parsed.context, { mode: "strict", now: new Date() });
+
+    // 3. Verify the guardian quorum over the recovery intent (fresh-bound v2).
     const input = deviceRecoveryQuorumInput(
       params.proposal,
       params.ctx.pinned_master.fortress_id
@@ -168,8 +187,9 @@ export class DeviceRecoveryCeremony {
       pinned_roster: params.ctx.pinned_roster,
     });
 
+    // One identifier end to end: adopt the collection context's ceremony_id.
     return new DeviceRecoveryCeremony({
-      ceremony_id: generateCeremonyId(),
+      ceremony_id: params.proposal.quorum_context.ceremony_id,
       proposal: params.proposal,
       ctx: params.ctx,
     });
@@ -226,11 +246,12 @@ export class DeviceRecoveryCeremony {
         });
       this.ctx.node.registerGuardianRoster(this.ctx.pinned_roster);
       await this.ctx.node.revokePeer({
-        // Must match deviceRecoveryRevokeQuorumInput below: target + reason
-        // are the payload fields the quorum input binds, so any drift here
-        // makes the pre-broadcast verification fail closed.
+        // Must match deviceRecoveryRevokeQuorumInput below: target + reason +
+        // the collection context are the fields the quorum input binds, so any
+        // drift here makes the pre-broadcast verification fail closed.
         target_node_id: this.proposal.lost_node_id,
         reason: DEVICE_RECOVERY_REVOKE_REASON,
+        quorum_context: this.proposal.quorum_context,
         quorum_signatures: quorumSignaturesForRevoke,
       });
 
@@ -296,37 +317,25 @@ export class DeviceRecoveryCeremony {
 }
 
 /**
- * Canonical quorum-input for device-recovery. Re-uses
- * `MasterRotationQuorumInput` shape. v0.1.1 spec will define a dedicated
- * `DeviceRecoveryQuorumInput` shape.
- *
- * Binding:
- *   - old_master_pubkey = `node:${lost_node_id}`
- *   - new_master_pubkey = holder of the replacement cert's node_pubkey
- *   - rotated_at = `device_recovery:${lost_node_id}->${replacement_node_id}`
+ * Canonical quorum-input for the device-recovery INTENT (lost -> replacement),
+ * C12-REPLAY v2 (QI-SIBLING-01, rides this build). Carries the SAME freshness
+ * fields as the revoke input; both are signed in one collection session, so a
+ * harvested recovery-intent quorum dies with its window exactly as a revoke
+ * quorum does. Verified only at `propose` (never rides the wire).
  */
 export function deviceRecoveryQuorumInput(
   proposal: Pick<
     DeviceRecoveryProposal,
-    "lost_node_id" | "replacement_node_cert"
+    "lost_node_id" | "replacement_node_cert" | "quorum_context"
   >,
   fortressId: string
-): MasterRotationQuorumInput {
-  const rotatedAt =
-    "device_recovery:" +
-    proposal.lost_node_id +
-    "->" +
-    proposal.replacement_node_cert.node_id;
-  return {
-    old_master_pubkey: "node:" + proposal.lost_node_id,
-    new_master_pubkey: {
-      public_key: proposal.replacement_node_cert.node_pubkey,
-      fortress_id: fortressId,
-      created_at: rotatedAt,
-    },
-    rotated_at: rotatedAt,
+): GuardianDeviceRecoveryQuorumInput {
+  return buildGuardianDeviceRecoveryQuorumInput({
+    context: proposal.quorum_context,
+    lost_node_id: proposal.lost_node_id,
+    replacement_node_pubkey: proposal.replacement_node_cert.node_pubkey,
     fortress_id: fortressId,
-  };
+  });
 }
 
 /**
@@ -340,7 +349,7 @@ export const DEVICE_RECOVERY_REVOKE_REASON = "device_loss_recovery";
 
 /**
  * Canonical quorum input for the REVOCATION a device-recovery ceremony
- * performs on the lost node. Delegates to `revokeQuorumInput` so the bytes
+ * performs on the lost node. Delegates to `buildGuardianRevokeQuorumInput` so the bytes
  * are identical to a direct compromised-node revoke of the same target with
  * `DEVICE_RECOVERY_REVOKE_REASON` — which is what `MeshNode.revokePeer`'s
  * pre-broadcast gate and every receiving node recompute and verify.
@@ -350,28 +359,21 @@ export const DEVICE_RECOVERY_REVOKE_REASON = "device_loss_recovery";
  * the revocation, and neither implies the other.
  */
 export function deviceRecoveryRevokeQuorumInput(
-  proposal: Pick<DeviceRecoveryProposal, "lost_node_id">,
+  proposal: Pick<DeviceRecoveryProposal, "lost_node_id" | "quorum_context">,
   fortressId: string
-): MasterRotationQuorumInput {
-  return revokeQuorumInput(
-    {
-      target_node_id: proposal.lost_node_id,
-      reason: DEVICE_RECOVERY_REVOKE_REASON,
-    },
-    fortressId
-  );
+): GuardianRevokeQuorumInput {
+  // Delegates to the ONE shared revoke builder so the bytes are byte-identical
+  // to a direct compromised-node revoke of the same target with
+  // DEVICE_RECOVERY_REVOKE_REASON and the same collection context — which is
+  // what MeshNode.revokePeer's pre-broadcast gate and every receiver recompute.
+  return buildGuardianRevokeQuorumInput({
+    context: proposal.quorum_context,
+    target_node_id: proposal.lost_node_id,
+    reason: DEVICE_RECOVERY_REVOKE_REASON,
+    fortress_id: fortressId,
+  });
 }
 
-function generateCeremonyId(): string {
-  const bytes = new Uint8Array(16);
-  if (typeof globalThis.crypto?.getRandomValues === "function") {
-    globalThis.crypto.getRandomValues(bytes);
-  } else {
-    for (let i = 0; i < bytes.length; i++) {
-      bytes[i] = Math.floor(Math.random() * 256);
-    }
-  }
-  let hex = "";
-  for (const b of bytes) hex += b.toString(16).padStart(2, "0");
-  return hex;
-}
+// C12-REPLAY: the copy-pasted `generateCeremonyId` (non-CSPRNG fallback) was
+// DELETED here. ceremony_id now comes from `mintRevokeCollectionContext` in
+// `mesh/guardian/revoke-quorum-input.ts` (CSPRNG, fail-closed, no fallback).
