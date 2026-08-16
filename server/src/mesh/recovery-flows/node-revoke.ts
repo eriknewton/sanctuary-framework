@@ -281,8 +281,14 @@ export class NodeRevokeCeremony {
  * The "old_master_pubkey" is the target node id prefixed with `node:` so the
  * input binds to the revoke target. The "new_master_pubkey" FortressMaster
  * shape carries the reason in `public_key` (base64url of the reason string
- * as bytes) and the fortress_id + a timestamp so the same roster cannot be
- * replayed against two revoke events with the same target.
+ * as bytes) plus the fortress_id, and its `created_at`/`rotated_at` slots
+ * hold the deterministic string `"revoke:" + target_node_id`, NOT a
+ * timestamp. The input therefore carries no freshness: a harvested guardian
+ * quorum signature over it authorizes revoking that target indefinitely.
+ * Replaying a completed revocation is idempotent (the target is already
+ * revoked); the replay window for an abandoned ceremony's signatures is a
+ * known, registered residual (register id C12-REPLAY) pending a
+ * freshness-bound quorum-input shape.
  *
  * This is explicitly an orchestration-layer convention; the receiver (inside
  * this ceremony, for verifyGuardianQuorum) uses the exact same builder.
