@@ -28,6 +28,7 @@ import { deriveMasterKey, derivePurposeKey } from "../../src/core/key-derivation
 import { createIdentity } from "../../src/core/identity.js";
 import { stringToBytes } from "../../src/core/encoding.js";
 import {
+  MacOsLocalHumanInteraction,
   runMemoryArchiveExportCommand,
   runMemoryArchiveImportCommand,
   type MemoryArchiveDialogRunner,
@@ -71,6 +72,16 @@ class Sink extends Writable {
   }
   text(): string {
     return this.chunks.join("");
+  }
+}
+
+// Fails synchronously on every write, unlike Sink. Used to force a failure at
+// the receipt-write step, which runs only after an import has already
+// committed the destination archive, to exercise the post-commit phase-aware
+// error message rather than the pre-commit authentication/validation one.
+class ThrowingSink extends Writable {
+  override write(): boolean {
+    throw new Error("synthetic post-commit sink failure");
   }
 }
 
@@ -497,6 +508,68 @@ describe("Exit V2 memory archive CLI", () => {
       expect(await adapter.countPassages()).toBe(0);
     }
   }, 60_000);
+
+  it("reports a distinct, retry-safe message when a post-commit step fails after the archive was already imported", async () => {
+    const source = await fortress("exit-v2-cli-postcommit-source", "owner-a", true);
+    const exported = await exportBundle(source);
+    const destination = await fortress("exit-v2-cli-postcommit-destination", "owner-a", false);
+    const terminal = new TestTerminal();
+    terminal.hiddenValue = Buffer.from(secretText(exported.terminal), "ascii");
+    const approval = new RecordingApprovalChannel();
+    const err = new Sink();
+    const code = await runMemoryArchiveImportCommand({
+      argv: [
+        "--in", exported.bundle,
+        "--owner-ref", "owner-a",
+        "--fortress", destination.path,
+        "--json",
+      ],
+      out: new ThrowingSink(),
+      err,
+      env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
+      interaction: terminal,
+      approvalChannel: approval,
+    });
+    expect(code).toBe(1);
+    // The old catch-all message misdiagnosed a completed irreversible
+    // operation as an authentication/validation failure; this asserts the
+    // phase-aware message instead, and that it says retry is safe.
+    expect(err.text()).toContain("failed after the archive was imported");
+    expect(err.text().toLowerCase()).toContain("safe");
+    expect(err.text()).not.toContain("archive authentication or validation failed");
+    // The import itself must have durably committed despite the later
+    // failure, proving this exercised the post-commit branch and not a
+    // pre-commit failure that happens to share the same exit code.
+    const adapter = new SdwMemoryBackendAdapter({
+      storage: destination.storage,
+      masterKey: destination.masterKey,
+      fortressId: fortressId(destination.path),
+      ownerRef: "owner-a",
+    });
+    expect(await adapter.countPassages()).toBeGreaterThan(0);
+  }, 60_000);
+
+  it("discloseAndConfirm refuses a non-base64url 43-byte value before any subprocess spawn", async () => {
+    let dialogCalls = 0;
+    const dialogRunner: MemoryArchiveDialogRunner = () => {
+      dialogCalls++;
+      throw new Error("the local OS dialog must never be invoked for a rejected splice value");
+    };
+    const interaction = new MacOsLocalHumanInteraction(dialogRunner);
+
+    // 43 valid base64url bytes with the final byte replaced by `"`, the
+    // character that would close the surrounding JXA string literal at the
+    // splice site if it reached osascript unchecked.
+    const almostValid = new Uint8Array(43).fill(65); // 'A', in-alphabet
+    almostValid[42] = 34; // '"'
+    await expect(interaction.discloseAndConfirm(almostValid)).resolves.toBe(false);
+
+    // A value built entirely from bytes outside the base64url alphabet.
+    const allInvalid = new Uint8Array(43).fill(92); // '\\'
+    await expect(interaction.discloseAndConfirm(allInvalid)).resolves.toBe(false);
+
+    expect(dialogCalls).toBe(0);
+  });
 
   it("refuses every argv transfer-key spelling without echoing its value", async () => {
     const secret = "argv-secret-must-never-be-accepted";

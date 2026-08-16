@@ -1004,8 +1004,14 @@ function padDots(label: string): string {
 }
 
 function padStatus(status: string): string {
+  // Status-column width = the length of the longest uppercased member of the
+  // layer status union in audit/types.ts ("active" | "partial" | "inactive"),
+  // spelled as that member so the derivation is visible: a bare 8 told a
+  // future editor nothing. If the union ever gains a longer member, this
+  // literal must change with it or the table misaligns on that value.
+  const totalWidth = "INACTIVE".length;
   const label = status.toUpperCase();
-  return label + " ".repeat(Math.max(0, 8 - label.length));
+  return label + " ".repeat(Math.max(0, totalWidth - label.length));
 }
 
 function padScore(score: number, max: number): string {
