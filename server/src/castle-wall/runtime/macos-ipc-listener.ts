@@ -362,10 +362,14 @@ export class MacOSFlowIpcListener {
    * `MacOSLeaseSigner` liveness contract) drains slower than the 5s heartbeat
    * cadence enqueues, so without coalescing the chain grows without limit and
    * every emission falls further behind the live arm state. Coalescing caps
-   * the heartbeat contribution at TWO links — one in-flight signing plus one
-   * pending slot that later heartbeats overwrite in place — so total depth is
-   * bounded by 2 + (discrete operator emissions) + (subscribe resends, one
-   * per connection, `maxConnections`-capped), each a bounded external event.
+   * the heartbeat contribution to TWO live links at a time — one in-flight
+   * signing plus one pending slot that later heartbeats overwrite in place —
+   * and each non-coalescible emission SEALS the pending slot, stranding at
+   * most one already-queued heartbeat link behind it. Total depth is
+   * therefore bounded by 2 + 2x(discrete operator emissions) + (subscribe
+   * resends, one per connection, `maxConnections`-capped): every term is a
+   * bounded external event, never the heartbeat enqueue rate (delta re-gate
+   * corrected the earlier arithmetic, which omitted the stranded-link term).
    */
   private leaseEmitChain: Promise<void> = Promise.resolve();
   /**
