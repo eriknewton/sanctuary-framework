@@ -658,10 +658,13 @@ export class MacOSFlowIpcListener {
       // SAFETY: a clamped value is a producer defect; surface it on daemon
       // stderr rather than silently normalizing (the emission still proceeds
       // with the safe value so a config error cannot starve the lease).
+      // JSON.stringify the RAW values: they arrive from the operator socket and
+      // may not be numbers at runtime; stringifying escapes newlines/quotes so
+      // a crafted value cannot forge daemon log lines (CodeQL log-injection).
       console.error(
         `[castle-wall] arm_lease numeric field out of range; clamped before signing ` +
-          `(heartbeat_interval_seconds ${body.heartbeat_interval_seconds} -> ${clampedInterval}, ` +
-          `ttl_seconds ${body.ttl_seconds ?? "null"} -> ${clampedTtl ?? "null"})`,
+          `(heartbeat_interval_seconds ${JSON.stringify(body.heartbeat_interval_seconds)} -> ${clampedInterval}, ` +
+          `ttl_seconds ${JSON.stringify(body.ttl_seconds ?? null)} -> ${clampedTtl ?? "null"})`,
       );
     }
     const stamped: ArmLeaseNotification = {
