@@ -43,6 +43,7 @@ import {
   sha256Hex,
   verifyCheckpointSignature,
 } from "../audit/chain.js";
+import { createFortressCheckpointIdentityBinding } from "../audit/checkpoint-identity.js";
 import type { PluginContribution } from "../substrate/attribution.js";
 
 export interface AuditEntry {
@@ -155,6 +156,19 @@ export interface AuditCreateOwner {
 
 type AuditLockFileHandle = Awaited<ReturnType<typeof open>>;
 
+/**
+ * What a checkpoint public-key resolver may hand back for one `signer_kid`:
+ * a single key, the signer's full authenticated key set (current key plus
+ * verified rotation-chain predecessors, so pre-rotation checkpoints keep
+ * verifying after a rotation), or `undefined`/an empty set for "this signer
+ * is unknown", which the verify path reports as an integrity finding.
+ */
+export type AuditCheckpointKeyResolution =
+  | string
+  | Uint8Array
+  | ReadonlyArray<string | Uint8Array>
+  | undefined;
+
 export interface AuditLogConfig {
   /** Maximum total size of stored audit entries in bytes. Default: 100 MB. */
   maxTotalSizeBytes?: number;
@@ -195,12 +209,28 @@ export interface AuditLogConfig {
   consultSplitBoundary?: boolean;
   /** Write a checkpoint after this many critical appends. Default: 100. */
   checkpointInterval?: number;
-  /** Optional typed identity signing bridge for checkpoint records. */
+  /**
+   * Typed identity signing bridge for checkpoint records. Optional in the
+   * CONFIG only as an injection seam (tests, embedders with their own key
+   * custody): when omitted, the constructor derives the production fortress
+   * signer from its own required arguments (IC-05), so no call site can
+   * silently opt out of checkpoint signing by forgetting a config field.
+   */
   checkpointSigner?: (
     payload: AuditCheckpointSigningPayload
   ) => Promise<AuditCheckpointSignature | null>;
-  /** Resolve a known checkpoint signing key by signer_kid. */
-  checkpointPublicKeyResolver?: (signerKid: string) => string | Uint8Array | undefined;
+  /**
+   * Resolve known checkpoint signing keys by signer_kid. May return a single
+   * key or the signer's full authenticated key set (current key plus
+   * rotation-chain predecessors), synchronously or as a promise. Same
+   * injection-seam contract as `checkpointSigner`: omitted means the
+   * constructor-derived fortress resolver, not "no resolution".
+   */
+  checkpointPublicKeyResolver?: (
+    signerKid: string
+  ) =>
+    | AuditCheckpointKeyResolution
+    | Promise<AuditCheckpointKeyResolution>;
   /**
    * Explicit self-check opt-in for checkpoint-embedded public keys.
    * Embedded keys prove record self-consistency only, not signer identity.
@@ -1806,12 +1836,14 @@ export class AuditLog {
   private readonly maxInMemoryEntries: number;
   private readonly integrityMode: "strict" | "lenient";
   private readonly checkpointInterval: number;
-  private readonly checkpointSigner?: (
+  private readonly checkpointSigner: (
     payload: AuditCheckpointSigningPayload
   ) => Promise<AuditCheckpointSignature | null>;
-  private readonly checkpointPublicKeyResolver?: (
+  private readonly checkpointPublicKeyResolver: (
     signerKid: string
-  ) => string | Uint8Array | undefined;
+  ) =>
+    | AuditCheckpointKeyResolution
+    | Promise<AuditCheckpointKeyResolution>;
   private readonly trustEmbeddedCheckpointPublicKeys: boolean;
   private readonly integrityAnomalySubscribers: AuditIntegrityAnomalySubscriber[];
   private readonly filesystemCapabilities?: FilesystemStorageCapabilities;
@@ -1942,8 +1974,28 @@ export class AuditLog {
     this.integrityMode = config?.integrityMode ?? "strict";
     this.checkpointInterval =
       config?.checkpointInterval ?? DEFAULT_CHECKPOINT_INTERVAL;
-    this.checkpointSigner = config?.checkpointSigner;
-    this.checkpointPublicKeyResolver = config?.checkpointPublicKeyResolver;
+    // IC-05 enforcement site (AGENTS.md assurance rule 3): the checkpoint
+    // signer/resolver pair used to be an optional dependency that every test
+    // supplied and every production call site omitted, so shipped fortresses
+    // wrote unsigned checkpoints and distrusted signed ones. Rule 3 offers
+    // "make it required" or "fail closed on absence"; this site takes the
+    // stronger third form: the production pair is DERIVED from the
+    // constructor's own required arguments (storage + master key), so no call
+    // site can omit it. Explicit config remains the injection seam and wins
+    // per field. Fail-closed-on-absence was rejected one level down instead
+    // of here: a fortress legitimately has zero identities until bootstrap,
+    // and refusing audit appends then would make audit availability depend on
+    // identity existence; that case degrades to the honest `unsigned`
+    // checkpoint record, never to a silently trusted fallback key.
+    const fortressCheckpointIdentity = createFortressCheckpointIdentityBinding(
+      storage,
+      derivePurposeKey(masterKey, "identity-encryption")
+    );
+    this.checkpointSigner =
+      config?.checkpointSigner ?? fortressCheckpointIdentity.checkpointSigner;
+    this.checkpointPublicKeyResolver =
+      config?.checkpointPublicKeyResolver ??
+      fortressCheckpointIdentity.checkpointPublicKeyResolver;
     this.trustEmbeddedCheckpointPublicKeys =
       config?.trustEmbeddedCheckpointPublicKeys ?? false;
     this.integrityAnomalySubscribers = config?.integrityAnomalySubscribers ?? [];
@@ -5329,7 +5381,7 @@ export class AuditLog {
     }
 
     const anchor = existing.at(-1)!;
-    this.verifyCheckpointRecordSignature(anchor, findings);
+    await this.verifyCheckpointRecordSignature(anchor, findings);
     if (
       anchor.checkpoint_sequence !== legacyCount ||
       anchor.root_hash !== legacyAnchorHash
@@ -5487,16 +5539,16 @@ export class AuditLog {
         }
       }
 
-      this.verifyCheckpointRecordSignature(checkpoint, findings);
+      await this.verifyCheckpointRecordSignature(checkpoint, findings);
     }
 
     this.lastCheckpointSequence = highestCheckpoint;
   }
 
-  private verifyCheckpointRecordSignature(
+  private async verifyCheckpointRecordSignature(
     checkpoint: AuditCheckpointRecord,
     findings: AuditIntegrityFinding[]
-  ): void {
+  ): Promise<void> {
     if (checkpoint.unsigned) return;
     if (!checkpoint.signer_kid || !checkpoint.signature) {
       findings.push({
@@ -5507,38 +5559,55 @@ export class AuditLog {
       return;
     }
 
-    const resolvedPublicKey = this.checkpointPublicKeyResolver?.(
-      checkpoint.signer_kid
-    );
+    let resolution: AuditCheckpointKeyResolution;
+    try {
+      resolution = await this.checkpointPublicKeyResolver(checkpoint.signer_kid);
+    } catch {
+      // A resolver failure reads as "signer unknown" and surfaces as a
+      // finding below; it must never read as verified, and must never crash
+      // the load pass that the rest of the chain verification rides on.
+      resolution = undefined;
+    }
+    const resolvedPublicKeys = (
+      Array.isArray(resolution) ? resolution : [resolution]
+    ).filter((key): key is string | Uint8Array => key !== undefined);
     // Checkpoint trust-basis invariant: an embedded public key is part of the
     // checkpoint being verified, so it is attacker-controlled unless the caller
     // explicitly asks for an internal-consistency check instead of signer trust.
-    const publicKey =
-      resolvedPublicKey ??
-      (this.trustEmbeddedCheckpointPublicKeys ? checkpoint.public_key : undefined);
-    if (!publicKey) {
-      if (checkpoint.public_key) {
+    // When the resolver DID return authenticated keys, they are authoritative
+    // for this signer_kid: a signature that fails against them is a mismatch,
+    // never a reason to retry against the embedded copy.
+    if (resolvedPublicKeys.length === 0) {
+      const embeddedPublicKey = this.trustEmbeddedCheckpointPublicKeys
+        ? checkpoint.public_key
+        : undefined;
+      if (!embeddedPublicKey) {
+        if (checkpoint.public_key) {
+          findings.push({
+            kind: "checkpoint_signature_embedded_key_untrusted",
+            sequence: checkpoint.checkpoint_sequence,
+            message:
+              `checkpoint signer ${checkpoint.signer_kid} has only an embedded public key; ` +
+              "configure checkpointPublicKeyResolver with an authenticated key, or explicitly opt in to embedded-key self-checks",
+          });
+          return;
+        }
         findings.push({
-          kind: "checkpoint_signature_embedded_key_untrusted",
+          kind: "checkpoint_signature_unverifiable",
           sequence: checkpoint.checkpoint_sequence,
-          message:
-            `checkpoint signer ${checkpoint.signer_kid} has only an embedded public key; ` +
-            "configure checkpointPublicKeyResolver with an authenticated key, or explicitly opt in to embedded-key self-checks",
+          message: `checkpoint signer ${checkpoint.signer_kid} has no known public key`,
         });
         return;
       }
-      findings.push({
-        kind: "checkpoint_signature_unverifiable",
-        sequence: checkpoint.checkpoint_sequence,
-        message: `checkpoint signer ${checkpoint.signer_kid} has no known public key`,
-      });
-      return;
+      resolvedPublicKeys.push(embeddedPublicKey);
     }
 
-    const valid = verifyCheckpointSignature(
-      checkpointPayload(checkpoint),
-      checkpoint.signature,
-      publicKey
+    const valid = resolvedPublicKeys.some((publicKey) =>
+      verifyCheckpointSignature(
+        checkpointPayload(checkpoint),
+        checkpoint.signature!,
+        publicKey
+      )
     );
     if (!valid) {
       findings.push({
@@ -5777,14 +5846,28 @@ export class AuditLog {
   ): Promise<void> {
     let signed: AuditCheckpointSignature | null;
     try {
-      signed = (await this.checkpointSigner?.(payload)) ?? null;
-    } catch {
+      signed = (await this.checkpointSigner(payload)) ?? null;
+    } catch (err) {
+      // A signer that THROWS is a failure (unreadable identity material, a
+      // failed signing op), not an identity-less fortress; say so on stderr
+      // so an operator can tell the two apart. This is a diagnostic only:
+      // the persisted record carries no failure claim, because any at-rest
+      // field here is attacker-writable and a "finding" an attacker can
+      // rewrite into the honest-absence shape would be a false assurance.
+      // Authenticated downgrade/failure EVIDENCE is deliberately deferred to
+      // a design-first follow-up (register id IC-05-DG).
+      console.error(
+        `[audit-log] checkpoint ${payload.checkpoint_sequence} written UNSIGNED because the signer FAILED (not identity absence): ${failureMessage(err)}`
+      );
       signed = null;
     }
 
-    // Production checkpoints may be unsigned today when no signer is wired; that
-    // honest bound is serialized as `unsigned` instead of fabricating signer
-    // evidence or silently trusting a fallback key.
+    // Production checkpoints are signed by the constructor-derived fortress
+    // identity binding (IC-05); a checkpoint may still be unsigned when the
+    // store holds no signable identity (fresh fortress before bootstrap, a
+    // store whose adapter cannot reach identity records). That honest bound
+    // is serialized as `unsigned` instead of fabricating signer evidence or
+    // silently trusting a fallback key.
     const record: AuditCheckpointRecord = {
       schema_version: AUDIT_CHECKPOINT_SCHEMA_VERSION,
       ...payload,
