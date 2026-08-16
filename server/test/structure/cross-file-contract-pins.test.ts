@@ -82,8 +82,15 @@ import { fileURLToPath } from "node:url";
 // reserved-name refusal sites are imported and CALLED, not scanned.
 import {
   RESERVED_ACCOUNT_NAMES,
+  SAFE_SERVICE_ACCOUNT_RE as ACCOUNT_SAFE_RE,
   planAccountCreate,
 } from "../../src/castle-wall/provision/account.js";
+// Imported under distinct names so the import-identity assertion below can
+// compare the re-exported surface against the declaring module's objects.
+import {
+  RESERVED_ACCOUNT_NAMES as POLICY_RESERVED_ACCOUNT_NAMES,
+  SAFE_SERVICE_ACCOUNT_RE as POLICY_SAFE_RE,
+} from "../../src/castle-wall/provision/account-name-policy.js";
 import { renderEgressGateDaemonPlist } from "../../src/egress-gate/gate-daemon.js";
 import { renderAgentHarnessDaemonPlist } from "../../src/egress-gate/harness-daemon.js";
 
@@ -512,33 +519,6 @@ describe("mirrored declarations hold equal values and name their counterpart", (
       ],
     },
     {
-      label: "service-account name charset and reserved names",
-      canonical: "server/src/castle-wall/provision/account.ts",
-      mirrors: [
-        "server/src/egress-gate/harness-daemon.ts",
-        "server/src/egress-gate/gate-daemon.ts",
-      ],
-      pairs: [
-        { canonicalName: "SAFE_SERVICE_ACCOUNT_RE", mirrorName: "SAFE_ACCOUNT_RE" },
-        {
-          // The charset regex was pinned here from the start; the reserved-NAME
-          // SET was not, and it drifted (2026-08-05 register G1): the two
-          // daemons refused only root/_root/daemon/wheel, so `admin` was a
-          // legal account for two daemons whose stated purpose is refusing
-          // privileged accounts. Erik ratified widening the daemons to the
-          // canonical five. This pair stops the DECLARATIONS forking again;
-          // the behavior suite at the bottom of this file is what proves each
-          // site enforces what it declares.
-          canonicalName: "RESERVED_ACCOUNT_NAMES",
-          mirrorName: "RESERVED_ACCOUNT_NAMES",
-          resolveCanonical: (source) =>
-            tsStringSetMembers(source, "RESERVED_ACCOUNT_NAMES"),
-          resolveMirror: (source) =>
-            tsStringSetMembers(source, "RESERVED_ACCOUNT_NAMES"),
-        },
-      ],
-    },
-    {
       label: "mesh v2 hybrid certificate versions",
       canonical: "server/src/mesh/trust-root-hybrid.ts",
       mirrors: ["server/src/mesh/types.ts"],
@@ -618,6 +598,78 @@ describe("mirrored declarations hold equal values and name their counterpart", (
       });
     });
   }
+});
+
+describe("the account-name contract is shared, not mirrored", () => {
+  /**
+   * G6 (2026-08-15): `SAFE_SERVICE_ACCOUNT_RE` and `RESERVED_ACCOUNT_NAMES`
+   * used to be re-declared at all three refusal sites, held in lockstep by a
+   * declared-value-equality group in this file. They now live in the
+   * zero-import module `castle-wall/provision/account-name-policy.ts` that
+   * every site imports, so drift is impossible by construction rather than
+   * merely watched. What this block asserts is the CONSTRUCTION: the shared
+   * module declares the values and imports nothing, every consumer imports
+   * the shared symbol, and no site keeps a local re-declaration for a future
+   * edit to quietly resurrect. The behavior suite below remains the proof
+   * that each site OBEYS the set it imports.
+   */
+  const POLICY = "server/src/castle-wall/provision/account-name-policy.ts";
+  const NAMES = ["SAFE_SERVICE_ACCOUNT_RE", "RESERVED_ACCOUNT_NAMES"];
+  const CONSUMERS = [
+    "server/src/castle-wall/provision/account.ts",
+    "server/src/egress-gate/gate-daemon.ts",
+    "server/src/egress-gate/harness-daemon.ts",
+  ];
+
+  it("the zero-import module declares both values", () => {
+    const policy = read(POLICY);
+    for (const name of NAMES) {
+      expect(
+        new RegExp(`export const ${name}(\\s*:\\s*[^=]+)?\\s*=`).test(policy),
+        name
+      ).toBe(true);
+    }
+  });
+
+  it("the zero-import module still has zero imports", () => {
+    // The whole hoist depends on this: the two daemon consumers render
+    // world-readable LaunchDaemon plists and are kept dependency-light on
+    // purpose, so anything this module ever imports, they silently inherit.
+    expect(/^\s*import\s[^\n]*from\s/m.test(read(POLICY))).toBe(false);
+  });
+
+  it("no consumer re-declares either value locally", () => {
+    // A local `const SAFE_ACCOUNT_RE = ...` beside the import is exactly the
+    // resurrection shape this block exists to refuse. `const NAME =` matches
+    // a declaration; an imported binding is never declared with `const`.
+    for (const file of CONSUMERS) {
+      const source = read(file);
+      for (const name of [...NAMES, "SAFE_ACCOUNT_RE"]) {
+        expect(
+          new RegExp(`const\\s+${name}(\\s*:\\s*[^=]+)?\\s*=`).test(source),
+          `${file} must import ${name} from account-name-policy.ts, not re-declare it`
+        ).toBe(false);
+      }
+    }
+  });
+
+  it("every consumer imports from the shared module", () => {
+    for (const file of CONSUMERS) {
+      expect(
+        read(file).includes("account-name-policy.js"),
+        `${file} must import the account-name contract from account-name-policy.js`
+      ).toBe(true);
+    }
+  });
+
+  it("account.ts re-exports the SAME runtime objects the policy module declares", () => {
+    // Import identity, not value equality: the barrel path consumers use
+    // (`provision/account.js`, re-exported through `provision/index.ts`) must
+    // hand out the very objects the policy module declares, or a future edit
+    // could fork the surface while both sides still LOOK equal.
+    expect(Object.is(RESERVED_ACCOUNT_NAMES, POLICY_RESERVED_ACCOUNT_NAMES)).toBe(true);
+    expect(Object.is(ACCOUNT_SAFE_RE, POLICY_SAFE_RE)).toBe(true);
+  });
 });
 
 describe("every reserved name is refused by the real function at all three sites", () => {
@@ -744,24 +796,34 @@ describe("no site keeps a second, hand-typed copy of the privileged-name list", 
    * second list built by concatenation or spelled with different members. Its
    * only job is to catch the literal shape the 2026-08-05 drift took: an
    * inline `["root", "_root", "daemon", "wheel"]` sitting beside a
-   * correctly-pinned declaration.
+   * correctly-pinned declaration. Since G6 single-sourced the set, the only
+   * legal quoted occurrence is the declaration in account-name-policy.ts;
+   * the three consuming sites must quote the sentinel ZERO times.
    *
    * `wheel` is the sentinel because it is meaningful in these files only as a
    * reserved account name. `root` cannot serve: account.ts legitimately
    * compares against it in the uid-0 census.
    */
-  const SITES = [
+  const DECLARING = "server/src/castle-wall/provision/account-name-policy.ts";
+  const CONSUMING_SITES = [
     "server/src/castle-wall/provision/account.ts",
     "server/src/egress-gate/gate-daemon.ts",
     "server/src/egress-gate/harness-daemon.ts",
   ];
 
-  it("each site quotes the sentinel privileged name exactly once", () => {
-    for (const file of SITES) {
+  it("the declaring module quotes the sentinel privileged name exactly once", () => {
+    expect(
+      countQuotedOccurrences(read(DECLARING), "wheel"),
+      `${DECLARING} should quote "wheel" exactly once, in the RESERVED_ACCOUNT_NAMES declaration`
+    ).toBe(1);
+  });
+
+  it("each consuming site quotes the sentinel privileged name zero times", () => {
+    for (const file of CONSUMING_SITES) {
       expect(
         countQuotedOccurrences(read(file), "wheel"),
-        `${file} should quote "wheel" exactly once, in the RESERVED_ACCOUNT_NAMES declaration`
-      ).toBe(1);
+        `${file} should not quote "wheel" at all; the list lives in account-name-policy.ts`
+      ).toBe(0);
     }
   });
 });

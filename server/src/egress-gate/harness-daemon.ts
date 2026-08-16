@@ -25,6 +25,17 @@
 
 import { isAbsolute, join } from "node:path";
 
+// The account-name contract is single-sourced: the safe charset and the
+// reserved privileged names this renderer refuses come from the zero-import
+// policy module every refusal site consumes, so this plist renderer stays
+// dependency-light (the module imports nothing) while a stale local copy of
+// the list is impossible by construction. Enforced by
+// `server/test/structure/cross-file-contract-pins.test.ts`.
+import {
+  RESERVED_ACCOUNT_NAMES,
+  SAFE_SERVICE_ACCOUNT_RE,
+} from "../castle-wall/provision/account-name-policy.js";
+
 /** The LaunchDaemon label for the confined agent harness. */
 export const AGENT_HARNESS_DAEMON_LABEL = "ai.sanctuaryprotocol.agent-harness";
 
@@ -149,41 +160,6 @@ export function harnessLaunchSpec(input: {
   }) as HarnessLaunchSpec;
 }
 
-/**
- * POSIX-ish service-account name: lowercase start, then a conservative
- * charset. Deliberately rejects anything that could smuggle plist markup or
- * spaces, and `root`/`_root` style privileged names are checked separately.
- *
- * Must match `SAFE_SERVICE_ACCOUNT_RE` in
- * `castle-wall/provision/account.ts` (the canonical declaration) and
- * `SAFE_ACCOUNT_RE` in `egress-gate/gate-daemon.ts`. Re-declared rather than
- * imported to keep this plist renderer free of a castle-wall dependency.
- * Failure mode of a drift: a name this file accepts but provisioning rejects
- * (or the reverse) fails at a DIFFERENT step of the same install, so the
- * operator sees a mid-flow refusal on a name an earlier step already blessed.
- * Enforced by `server/test/structure/cross-file-contract-pins.test.ts`.
- */
-const SAFE_ACCOUNT_RE = /^[a-z_][a-z0-9._-]{0,63}$/;
-
-/**
- * Privileged account names the confined agent harness must never run as.
- *
- * Must match `RESERVED_ACCOUNT_NAMES` in
- * `castle-wall/provision/account.ts` (the canonical declaration) and
- * `RESERVED_ACCOUNT_NAMES` in `egress-gate/gate-daemon.ts`. Re-declared
- * rather than imported for the same reason as the charset regex above.
- * Enforced by `server/test/structure/cross-file-contract-pins.test.ts`, which
- * compares the declared MEMBERS on every side AND calls
- * `renderAgentHarnessDaemonPlist` once per member to prove this file refuses
- * each of them, so a partial check here fails even with a correct set above.
- *
- * WIDENED 2026-08-05 (Erik-ratified) to add `admin`, which this file
- * previously accepted while provisioning refused it. Same failure mode as the
- * charset drift above: a name blessed at one step of an install and refused at
- * the next reads as a broken install rather than as a stale copy of a list.
- */
-const RESERVED_ACCOUNT_NAMES = new Set(["root", "_root", "daemon", "wheel", "admin"]);
-
 function xmlEscape(value: string): string {
   return value
     .replace(/&/g, "&amp;")
@@ -271,7 +247,7 @@ export interface AgentHarnessDaemonPlistOptions {
  */
 export function renderAgentHarnessDaemonPlist(options: AgentHarnessDaemonPlistOptions): string {
   const account = options.agentAccount;
-  if (!SAFE_ACCOUNT_RE.test(account)) {
+  if (!SAFE_SERVICE_ACCOUNT_RE.test(account)) {
     throw new Error(`Agent account name is not a safe service-account name (got: ${JSON.stringify(account)}).`);
   }
   // INVARIANT: a privileged UserName would defeat the confinement this daemon
