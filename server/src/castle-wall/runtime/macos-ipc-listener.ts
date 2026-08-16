@@ -658,15 +658,15 @@ export class MacOSFlowIpcListener {
       // SAFETY: a clamped value is a producer defect; surface it on daemon
       // stderr rather than silently normalizing (the emission still proceeds
       // with the safe value so a config error cannot starve the lease).
-      // Coerce the RAW values through Number() before logging: they arrive
-      // from the operator socket and may not be numbers at runtime, and a
-      // crafted string must not be able to forge daemon log lines. Number()
-      // yields a taint-free numeric (NaN still tells the operator the wire
-      // value was garbage, which is all the diagnostic needs).
+      // The RAW wire values never reach the log line: they arrive from the
+      // operator socket and may not be numbers at runtime, and a crafted
+      // value must not be able to forge daemon log lines. The runtime type
+      // tag plus the clamped results carry the whole diagnostic (which field
+      // was out of range and what it became).
       console.error(
         `[castle-wall] arm_lease numeric field out of range; clamped before signing ` +
-          `(heartbeat_interval_seconds ${Number(body.heartbeat_interval_seconds)} -> ${clampedInterval}, ` +
-          `ttl_seconds ${body.ttl_seconds == null ? "null" : Number(body.ttl_seconds)} -> ${clampedTtl ?? "null"})`,
+          `(heartbeat_interval_seconds<${typeof body.heartbeat_interval_seconds}> -> ${clampedInterval}, ` +
+          `ttl_seconds<${body.ttl_seconds === null ? "null" : typeof body.ttl_seconds}> -> ${clampedTtl ?? "null"})`,
       );
     }
     const stamped: ArmLeaseNotification = {
