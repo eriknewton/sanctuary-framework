@@ -78,7 +78,12 @@ import type { ToolDefinition } from "../../src/router.js";
  */
 const ADMISSION_DEADLINE_MS = ON_EVICT_AUDIT_TIMEOUT_MS + 10_000;
 
-async function flush(times = 40): Promise<void> {
+// 120 microtask turns: enough for the commit path to reach the held `_audit`
+// write. The audit load path grew a few awaits when the checkpoint-signing
+// control records landed (IC-05-DG: one latch read and one signing-head read
+// per full verify), which pushed the held write past the previous 40-turn
+// drain; the count is a harness budget, not a property under test.
+async function flush(times = 120): Promise<void> {
   for (let i = 0; i < times; i++) {
     await Promise.resolve();
   }

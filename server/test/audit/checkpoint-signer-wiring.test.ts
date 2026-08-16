@@ -323,4 +323,76 @@ describe("IC-05: real composition root (createSanctuaryServer)", () => {
     const result = await reader.query({ limit: 300 });
     expect(result.integrity_findings).toEqual([]);
   }, 60_000);
+
+  it("IC-05-DG §f-13: a strip on the booted server's own store surfaces checkpoint_signing_downgrade through the production graph and the integrity-anomaly subscriber", async () => {
+    // Arrange phase: NOTHING but the production composition root, the real
+    // identity_create MCP call, and one real checkpoint interval — no config
+    // injection anywhere.
+    const storage = new MemoryStorage();
+    const { server, auditLog, masterKey } = await createSanctuaryServer({
+      storage,
+      passphrase: TEST_PASSPHRASE,
+    });
+    const handler = (
+      server as unknown as { _requestHandlers: Map<string, Function> }
+    )._requestHandlers.get("tools/call");
+    if (!handler) throw new Error("tools/call handler not registered");
+    const created = await handler(
+      {
+        method: "tools/call" as const,
+        params: { name: "identity_create", arguments: { label: "ic05dg-wiring" } },
+      },
+      {}
+    );
+    const identity = JSON.parse(created.content[0]!.text);
+    await appendCriticalEntries(
+      auditLog,
+      PRODUCTION_CHECKPOINT_INTERVAL,
+      identity.identity_id
+    );
+
+    // The attack: strip the signed checkpoint ON DISK.
+    const metas = await storage.list(CHECKPOINT_NAMESPACE, CHECKPOINT_PREFIX);
+    let stripped = 0;
+    for (const meta of metas) {
+      const record = JSON.parse(
+        bytesToString((await storage.read(CHECKPOINT_NAMESPACE, meta.key))!)
+      ) as AuditCheckpointRecord;
+      if (record.unsigned) continue;
+      record.unsigned = true;
+      record.signer_kid = null;
+      record.signature = null;
+      record.signature_algorithm = null;
+      record.unsigned_reason = "no signing identity available at checkpoint time";
+      delete (record as { public_key?: string }).public_key;
+      await storage.write(
+        CHECKPOINT_NAMESPACE,
+        meta.key,
+        stringToBytes(JSON.stringify(record))
+      );
+      stripped++;
+    }
+    expect(stripped).toBeGreaterThan(0);
+
+    // A bare production reader fails strict-closed on the downgrade, and the
+    // finding reaches the programmatic channel doctor/dashboard consume (the
+    // integrity-anomaly subscriber).
+    const events: Array<{ findings: Array<{ kind: string }> }> = [];
+    const reader = new AuditLog(storage, masterKey, {
+      integrityAnomalySubscribers: [(event) => void events.push(event)],
+    });
+    await expect(reader.query({ limit: 300 })).rejects.toMatchObject({
+      name: "AuditIntegrityError",
+      findings: expect.arrayContaining([
+        expect.objectContaining({ kind: "checkpoint_signing_downgrade" }),
+      ]),
+    });
+    expect(
+      events.some((event) =>
+        event.findings.some(
+          (finding) => finding.kind === "checkpoint_signing_downgrade"
+        )
+      )
+    ).toBe(true);
+  }, 60_000);
 });

@@ -898,11 +898,16 @@ async function auditBootTokenEvent(
     safeModeAuditStoragePath(fortressPath, token),
     fortressCreateOwner !== undefined ? { owner: fortressCreateOwner } : {},
   );
-  const auditLog = new AuditLog(
-    storage,
-    auditKey,
-    fortressCreateOwner !== undefined ? { createOwner: fortressCreateOwner } : undefined,
-  );
+  const auditLog = new AuditLog(storage, auditKey, {
+    // IC-05-DG: the safe-mode boot store is structurally NOT a fortress load
+    // (its own isolated storage path, a token-derived key, no identities), so
+    // downgrade detection is declared off AT CONSTRUCTION (the #1249
+    // fail-soft roster). Never derived from storage (DELTA-4).
+    signingDetectionMode: "non-fortress",
+    ...(fortressCreateOwner !== undefined
+      ? { createOwner: fortressCreateOwner }
+      : {}),
+  });
   await auditLog.append(
     "l1",
     operation,
