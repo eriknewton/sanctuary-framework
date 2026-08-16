@@ -147,6 +147,10 @@ Concordia adds structured negotiation between agents with binding commitments an
 
 Concrete, scoped, on the engineering path. Each item has named decision artifacts, ratified scope, and a sequenced position in the build queue.
 
+#### Local audit-chain tamper-evidence hardening (CRITICAL)
+
+Today the standalone external verifier is the guarantee for detecting tampering with the audit chain, and the Assurance Matrix names the bound: on-host, standalone verification does not yet catch every class of chain tampering on its own. This work strengthens the local, on-host tamper-evidence of the audit chain so more of what the external verifier catches today is also caught locally, reducing the reliance on an off-host copy. It is sequenced after the current wave of remotely-runnable drills, then picked up. **Why it matters:** the audit chain is the evidence layer the whole trust story rests on, and the stronger its on-host tamper-evidence, the less an operator has to trust a second machine to know their record is intact.
+
 #### Per-flow, rule-attributed, signed audit for the wall (the named gap)
 
 Today the macOS wall enforces and a per-rule read-out exists, but the unforgeable, producer-signed, per-flow audit trail is not wired. This build converts "the wall blocked it" into "this rule blocked this flow, provably, in a tamper-evident record," which is what a security operations console needs to consume enforcement as evidence. **Why it matters:** it is the honest gap named on the Assurance Matrix row, and closing it upgrades every enforcement claim from demonstration to per-decision evidence.
