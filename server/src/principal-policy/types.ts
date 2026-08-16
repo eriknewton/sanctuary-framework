@@ -151,6 +151,12 @@ export interface GateResult {
   reason: string;
   approval_required: boolean;
   approval_response?: ApprovalResponse;
+  /**
+   * Gate-minted identifier persisted on the matching Tier-1/Tier-2 decision
+   * audit event. Callers bind this value into downstream signed artifacts;
+   * caller-supplied correlation values are never approval provenance.
+   */
+  approval_audit_id?: string;
 }
 
 /** Behavioral baseline for anomaly detection */

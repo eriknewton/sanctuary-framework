@@ -17,6 +17,8 @@
     "identity_rotate",
     "identity_sign",
     "lockdown",
+    "memory_archive_export",
+    "memory_archive_import",
     "memory_checkpoint_restore",
     "memory_delete",
     "memory_emit",

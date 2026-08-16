@@ -168,6 +168,17 @@ export const NON_RELAXABLE_MEMORY_INTEGRITY_TIER1_OPERATIONS = [
   "memory_checkpoint_restore",
 ] as const;
 
+/**
+ * Exit V2 SDW memory carriage is an explicit custody-boundary operation.
+ * Both verbs are force-pinned because exporting recovery material and
+ * importing operator-carried state must never become silently allowable via
+ * a hand-authored policy.
+ */
+export const NON_RELAXABLE_EXIT_V2_MEMORY_TIER1_OPERATIONS = [
+  "memory_archive_export",
+  "memory_archive_import",
+] as const;
+
 const FORCED_TIER1_OPERATIONS = [
   RAW_IDENTITY_SIGN_OPERATION,
   "principal_policy_view",
@@ -183,6 +194,7 @@ const FORCED_TIER1_OPERATIONS = [
   ...NON_RELAXABLE_CASTLE_WALL_OBSERVE_TIER1_OPERATIONS,
   ...NON_RELAXABLE_ENFORCEMENT_EXPORT_TIER1_OPERATIONS,
   ...NON_RELAXABLE_MEMORY_INTEGRITY_TIER1_OPERATIONS,
+  ...NON_RELAXABLE_EXIT_V2_MEMORY_TIER1_OPERATIONS,
 ] as const;
 
 /**
@@ -549,6 +561,8 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     "memory_emit",
     "memory_transcode",
     "memory_transcode_restore",
+    "memory_archive_export",
+    "memory_archive_import",
     // Castle Wall Observe / Learn Allow-List v1 (2026-07-07): promoting an
     // observed destination into a live allow rule is a wall-widening policy
     // mutation, the same class as file_grant / operator_cloud_provision

@@ -1087,6 +1087,7 @@ export class InjectionDetector {
       /\.id$/i,
       /\.uuid$/i,
       /\.hash$/i,
+      /(?:^|[._])sha256$/i,
       /\.signature$/i,
       /\.public_key$/i,
       /\.private_key$/i,

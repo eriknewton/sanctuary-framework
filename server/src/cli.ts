@@ -349,6 +349,18 @@ async function main(): Promise<void> {
     return drainAndExit(code);
   }
 
+  if (args[0] === "memory_archive_export") {
+    const { runMemoryArchiveExportCommand } = await import("./cli/memory-archive.js");
+    const code = await runMemoryArchiveExportCommand({ argv: args.slice(1) });
+    return drainAndExit(code);
+  }
+
+  if (args[0] === "memory_archive_import") {
+    const { runMemoryArchiveImportCommand } = await import("./cli/memory-archive.js");
+    const code = await runMemoryArchiveImportCommand({ argv: args.slice(1) });
+    return drainAndExit(code);
+  }
+
   if (args[0] === "license") {
     const { runLicenseCommand } = await import("./cli/license.js");
     const code = await runLicenseCommand({ argv: args.slice(1) });
@@ -916,6 +928,8 @@ Usage:
   sanctuary checkpoint <cmd> [opts]       # Local encrypted memory checkpoints
   sanctuary memory_ingest [opts]          # Mirror harness memory into SDW
   sanctuary memory_emit [opts]            # Emit harness memory from SDW
+  sanctuary memory_archive_export [opts]  # Export one SDW archive through Exit V2
+  sanctuary memory_archive_import [opts]  # Import one SDW archive through Exit V2
   sanctuary memory_transcode [opts]       # Project memory into another harness format
   sanctuary memory_transcode_restore [opts] # Restore an exact transcode source archive
   sanctuary transparency <cmd> [opts]     # Signed enforcement checkpoints
@@ -989,6 +1003,16 @@ Subcommands:
   memory_ingest        Manually mirror Claude Code or Codex memory files into the
                        encrypted SDW vault without touching the source dir.
                        Use "sanctuary memory_ingest --help" for options.
+
+  memory_archive_export
+                       Export one completed SDW archive through Exit V2 after
+                       Tier-1 approval; a local OS dialog confirms key custody.
+                       Use "sanctuary memory_archive_export --help" for options.
+
+  memory_archive_import
+                       Import one Exit V2 SDW archive after Tier-1 approval;
+                       a local OS dialog reads hidden recovery material.
+                       Use "sanctuary memory_archive_import --help" for options.
 
   memory_emit          Manually emit Claude Code or Codex memory files from the SDW
                        vault into an output dir. Existing files are refused.
