@@ -101,7 +101,7 @@ describe("MCP audit-integrity gate classification", () => {
     const blockedWrite = await client.callTool({ name: "test_write", arguments: {} });
     expect(blockedWrite.isError).toBe(true);
     expect(textPayload(blockedWrite)).toMatchObject({
-      remediation: "operator_recovery_required",
+      remediation: "none_available",
     });
     expect(writeCount).toBe(0);
 

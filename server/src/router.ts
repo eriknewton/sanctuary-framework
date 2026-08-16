@@ -288,7 +288,17 @@ export function createServer(
               text: JSON.stringify({
                 error: `${findings!.length} audit integrity findings detected`,
                 audit_integrity_findings: findings,
-                remediation: "operator_recovery_required",
+                // Honest value, not a hint: no remediation exists. There is
+                // no agent-usable path past this gate BY DESIGN, and no
+                // operator path that restores MCP write capability once
+                // findings are present is implemented in this tree either
+                // (see the block comment above). An earlier draft said
+                // `operator_recovery_required`, which named a recovery that
+                // does not exist — on a surface an agent reads to decide what
+                // to do next, that is a false promise, not a courtesy. Must
+                // stay consistent with the assertion in
+                // test/broker-mcp/audit-integrity-gate-classification.test.ts.
+                remediation: "none_available",
               }),
             },
           ],
