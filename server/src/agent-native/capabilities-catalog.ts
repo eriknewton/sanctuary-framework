@@ -21,10 +21,16 @@
  * block anything (that is the separate Castle Wall enforcement layer).
  */
 
+import {
+  CATALOG_COOPERATIVE_TOOL_NAMES,
+  COOPERATIVE_TOOL_NAMES,
+  type CatalogCooperativeToolName,
+} from "./tool-names.js";
+
 /** One cooperative tool's entry in the start-here catalog. */
 export interface CapabilityEntry {
   /** The exact MCP tool name (must match the registered tool). */
-  tool: string;
+  tool: CatalogCooperativeToolName;
   /** One line: what the tool does, agent-facing. */
   does: string;
   /** One line: when an agent should reach for it. */
@@ -39,51 +45,56 @@ export interface CapabilityEntry {
  */
 export const COOPERATIVE_CAPABILITIES: readonly CapabilityEntry[] = [
   {
-    tool: "sanctuary_help",
+    tool: COOPERATIVE_TOOL_NAMES.help,
     does: "Classifies a free-text intent and returns which Sanctuary tool to use, with a runnable example for ordinary requests.",
     when: "You are unsure which tool fits. Ask here first before acting.",
   },
   {
-    tool: "sanctuary_who_am_i",
+    tool: COOPERATIVE_TOOL_NAMES.whoAmI,
     does: "Returns the disclosable identity facts for this session (label, did, identity fingerprint, memory namespace handle). Never returns private keys.",
     when: "You need to confirm which sovereign identity you are operating as.",
   },
   {
-    tool: "sanctuary_active_protections",
+    tool: COOPERATIVE_TOOL_NAMES.activeProtections,
     does: "Lists the security guarantees currently in force (encrypted-at-rest state, approval-gate mediation, append-only audit, opaque memory handles).",
     when: "You need to tell a counterparty, or yourself, what protections apply right now.",
   },
   {
-    tool: "sanctuary_remember",
+    tool: COOPERATIVE_TOOL_NAMES.remember,
     does: "Stores a key/value into encrypted, identity-bound, audited memory. Prefer this over raw state_write for working memory you want auditable.",
     when: "You want to persist working memory that survives across turns.",
   },
   {
-    tool: "sanctuary_recall",
+    tool: COOPERATIVE_TOOL_NAMES.recall,
     does: "Reads a key back from encrypted memory, verifying integrity before returning it.",
     when: "You need to retrieve something you (or a prior turn) stored.",
   },
   {
-    tool: "sanctuary_hide",
+    tool: COOPERATIVE_TOOL_NAMES.hide,
     does: "Marks a stored key so sanctuary_recall stops returning it, without deleting the data.",
     when: "You want to suppress a memory from default reads but keep it recoverable.",
   },
   {
-    tool: "sanctuary_forget",
+    tool: COOPERATIVE_TOOL_NAMES.forget,
     does: "Permanently deletes a memory key. Operator-approved (Tier 1): pass an approval proof. At-rest confidentiality rests on encryption, not on overwrite.",
     when: "The operator has approved permanently removing a memory.",
   },
   {
-    tool: "sanctuary_events_open_cursor",
+    tool: COOPERATIVE_TOOL_NAMES.eventsOpenCursor,
     does: "Opens a paginated cursor over your own redacted audit events, optionally filtered by operation.",
     when: "You want to page through your recent activity. Read with sanctuary_events_read, then sanctuary_events_close.",
   },
   {
-    tool: "sanctuary_audit_search",
+    tool: COOPERATIVE_TOOL_NAMES.auditSearch,
     does: "Full-text searches your own audit history (own-signed scope only), verified against the audit chain.",
     when: "You need to find when a past operation ran and its result.",
   },
 ] as const;
+
+const catalogToolNames = COOPERATIVE_CAPABILITIES.map((entry) => entry.tool);
+if (catalogToolNames.join("\0") !== CATALOG_COOPERATIVE_TOOL_NAMES.join("\0")) {
+  throw new Error("cooperative capabilities catalog drifted from tool-name contract");
+}
 
 /**
  * Build the agent-facing MCP `instructions` string from the catalog.
@@ -99,8 +110,8 @@ export function buildServerInstructions(): string {
     "Route memory and identity work through these cooperative tools rather than ad-hoc state: they encrypt at rest, bind to your identity, and write an append-only audit trail you can query.",
     "",
     "Start here:",
-    "- Unsure which tool fits? Call sanctuary_help with a free-text intent.",
-    "- Want the full catalog again mid-session? Call sanctuary_capabilities.",
+    `- Unsure which tool fits? Call ${COOPERATIVE_TOOL_NAMES.help} with a free-text intent.`,
+    `- Want the full catalog again mid-session? Call ${COOPERATIVE_TOOL_NAMES.capabilities}.`,
     "",
     "Cooperative tools:",
   ];

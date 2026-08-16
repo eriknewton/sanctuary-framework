@@ -41,7 +41,9 @@ import {
   enforceDMswitchGraceWindow,
   wrapMasterRotationBundle,
   unwrapMasterRotationBundle,
+  DEVICE_RECOVERY_REVOKE_REASON,
   deviceRecoveryQuorumInput,
+  deviceRecoveryRevokeQuorumInput,
   revokeQuorumInput,
   canonicalAuditPromoteQuorumInput,
   createMasterRotationAckSubscription,
@@ -450,7 +452,6 @@ describe("quorum-input builders", () => {
       {
         lost_node_id: fx.nodeId,
         replacement_node_cert: replacementFx.nodeCert,
-        guardian_signatures: [],
       },
       fx.fortressId
     );
@@ -466,12 +467,32 @@ describe("quorum-input builders", () => {
       {
         target_node_id: "compromised-1",
         reason: "non-monotonic envelope",
-        guardian_signatures: [],
       },
       "fid-1"
     );
     expect(input.old_master_pubkey).toBe("node:compromised-1");
     expect(input.rotated_at).toContain("revoke:");
+  });
+
+  it("deviceRecoveryRevokeQuorumInput matches a direct revoke of the lost node with the canonical reason", () => {
+    // The device-recovery ceremony's revoke quorum must verify at the SAME
+    // enforcement site as a direct compromised-node revoke, so the builder
+    // must produce byte-identical input to revokeQuorumInput over
+    // (lost_node_id, DEVICE_RECOVERY_REVOKE_REASON).
+    const viaCeremony = deviceRecoveryRevokeQuorumInput(
+      { lost_node_id: "lost-node-1" },
+      "fid-3"
+    );
+    const direct = revokeQuorumInput(
+      {
+        target_node_id: "lost-node-1",
+        reason: DEVICE_RECOVERY_REVOKE_REASON,
+      },
+      "fid-3"
+    );
+    expect(viaCeremony).toEqual(direct);
+    expect(viaCeremony.old_master_pubkey).toBe("node:lost-node-1");
+    expect(viaCeremony.rotated_at).toBe("revoke:lost-node-1");
   });
 
   it("canonicalAuditPromoteQuorumInput binds current + new canonical ids", () => {
@@ -675,6 +696,7 @@ describe("DeviceRecoveryCeremony — propose/confirm Key 8 invariant", () => {
           lost_node_id: fx.nodeId,
           replacement_node_cert: replacementCert,
           guardian_signatures: [],
+          revoke_guardian_signatures: [],
         },
         ctx: {
           node: (null as unknown) as never,
@@ -706,7 +728,6 @@ describe("DeviceRecoveryCeremony — propose/confirm Key 8 invariant", () => {
         {
           lost_node_id: fx.nodeId,
           replacement_node_cert: replacementCert,
-          guardian_signatures: [],
         },
         fx.fortressId
       ),
@@ -725,6 +746,7 @@ describe("DeviceRecoveryCeremony — propose/confirm Key 8 invariant", () => {
           lost_node_id: fx.nodeId,
           replacement_node_cert: replacementCert,
           guardian_signatures: [oneSig],
+          revoke_guardian_signatures: [],
         },
         ctx: {
           node: (null as unknown) as never,
@@ -737,6 +759,133 @@ describe("DeviceRecoveryCeremony — propose/confirm Key 8 invariant", () => {
         },
       })
     ).toThrow(/quorum requires/);
+  });
+
+  it("propose() refuses revoke evidence signed over the recovery input (C12: a recovery quorum is not revoke authorization)", async () => {
+    const { fx, replacementCert } = buildPair();
+    const guardians = buildGuardians(5);
+    const roster = issueGuardianRoster({
+      m: 3,
+      n: 5,
+      guardians: guardians.map((g) => g.identity),
+      fortress_id: fx.fortressId,
+      version: 1,
+      master_private_key: fx.masterSecret,
+    });
+    const longAgo = new Date(
+      Date.now() - 200 * 24 * 60 * 60 * 1000
+    ).toISOString();
+    const recoveryInput = deviceRecoveryQuorumInput(
+      {
+        lost_node_id: fx.nodeId,
+        replacement_node_cert: replacementCert,
+      },
+      fx.fortressId
+    );
+    const recoverySigs = guardians
+      .slice(0, 3)
+      .map((g) =>
+        signMasterRotationAsGuardian({
+          input: recoveryInput,
+          guardian_id: g.identity.guardian_id,
+          guardian_private_key: g.sk,
+        })
+      );
+    const { DeviceRecoveryCeremony } = await import(
+      "../../src/mesh/recovery-flows/index.js"
+    );
+    // The pre-fix defect shape: the ceremony's recovery quorum was silently
+    // treated as authorization for the revocation. Presenting those same
+    // recovery-input signatures AS the revoke evidence must now fail signature
+    // verification, because they never covered the node_revoke quorum input.
+    expect(() =>
+      DeviceRecoveryCeremony.propose({
+        proposal: {
+          lost_node_id: fx.nodeId,
+          replacement_node_cert: replacementCert,
+          guardian_signatures: recoverySigs,
+          revoke_guardian_signatures: recoverySigs,
+        },
+        ctx: {
+          node: (null as unknown) as never,
+          root_principal_cert: fx.rootCert,
+          pinned_master: fx.masterPublic,
+          pinned_roster: roster,
+          emit_ctx: (null as unknown) as never,
+          fortress_master_secret: fx.masterSecret,
+          dmswitch_input: { last_operator_activity_at: longAgo },
+        },
+      })
+    ).toThrow(/does not verify/);
+  });
+
+  it("propose() refuses revoke evidence whose quorum covered a different target node", async () => {
+    const { fx, replacementCert } = buildPair();
+    const guardians = buildGuardians(5);
+    const roster = issueGuardianRoster({
+      m: 3,
+      n: 5,
+      guardians: guardians.map((g) => g.identity),
+      fortress_id: fx.fortressId,
+      version: 1,
+      master_private_key: fx.masterSecret,
+    });
+    const longAgo = new Date(
+      Date.now() - 200 * 24 * 60 * 60 * 1000
+    ).toISOString();
+    const recoveryInput = deviceRecoveryQuorumInput(
+      {
+        lost_node_id: fx.nodeId,
+        replacement_node_cert: replacementCert,
+      },
+      fx.fortressId
+    );
+    const recoverySigs = guardians
+      .slice(0, 3)
+      .map((g) =>
+        signMasterRotationAsGuardian({
+          input: recoveryInput,
+          guardian_id: g.identity.guardian_id,
+          guardian_private_key: g.sk,
+        })
+      );
+    // A real revoke quorum, but over some OTHER node's revocation: the
+    // ceremony must not accept it as covering lost_node_id.
+    const wrongTargetInput = deviceRecoveryRevokeQuorumInput(
+      { lost_node_id: "some-other-node" },
+      fx.fortressId
+    );
+    const wrongTargetSigs = guardians
+      .slice(0, 3)
+      .map((g) =>
+        signMasterRotationAsGuardian({
+          input: wrongTargetInput,
+          guardian_id: g.identity.guardian_id,
+          guardian_private_key: g.sk,
+        })
+      );
+    const { DeviceRecoveryCeremony } = await import(
+      "../../src/mesh/recovery-flows/index.js"
+    );
+    expect(() =>
+      DeviceRecoveryCeremony.propose({
+        proposal: {
+          lost_node_id: fx.nodeId,
+          replacement_node_cert: replacementCert,
+          guardian_signatures: recoverySigs,
+          revoke_guardian_signatures: wrongTargetSigs,
+        },
+        ctx: {
+          node: (null as unknown) as never,
+          root_principal_cert: fx.rootCert,
+          pinned_master: fx.masterPublic,
+          pinned_roster: roster,
+          emit_ctx: (null as unknown) as never,
+          fortress_master_secret: fx.masterSecret,
+          dmswitch_input: { last_operator_activity_at: longAgo },
+        },
+      })
+    ).toThrow(/does not verify/);
   });
 
   it("execute() throws CeremonyNotConfirmedError before confirm() is called", async () => {
@@ -757,7 +906,6 @@ describe("DeviceRecoveryCeremony — propose/confirm Key 8 invariant", () => {
       {
         lost_node_id: fx.nodeId,
         replacement_node_cert: replacementCert,
-        guardian_signatures: [],
       },
       fx.fortressId
     );
@@ -770,6 +918,19 @@ describe("DeviceRecoveryCeremony — propose/confirm Key 8 invariant", () => {
           guardian_private_key: g.sk,
         })
       );
+    const revokeInput = deviceRecoveryRevokeQuorumInput(
+      { lost_node_id: fx.nodeId },
+      fx.fortressId
+    );
+    const revokeSigs = guardians
+      .slice(0, 3)
+      .map((g) =>
+        signMasterRotationAsGuardian({
+          input: revokeInput,
+          guardian_id: g.identity.guardian_id,
+          guardian_private_key: g.sk,
+        })
+      );
     const { DeviceRecoveryCeremony } = await import(
       "../../src/mesh/recovery-flows/index.js"
     );
@@ -778,6 +939,7 @@ describe("DeviceRecoveryCeremony — propose/confirm Key 8 invariant", () => {
         lost_node_id: fx.nodeId,
         replacement_node_cert: replacementCert,
         guardian_signatures: sigs,
+        revoke_guardian_signatures: revokeSigs,
       },
       ctx: {
         node: (null as unknown) as never,
@@ -813,7 +975,6 @@ describe("DeviceRecoveryCeremony — propose/confirm Key 8 invariant", () => {
       {
         lost_node_id: fx.nodeId,
         replacement_node_cert: replacementCert,
-        guardian_signatures: [],
       },
       fx.fortressId
     );
@@ -826,6 +987,19 @@ describe("DeviceRecoveryCeremony — propose/confirm Key 8 invariant", () => {
           guardian_private_key: g.sk,
         })
       );
+    const revokeInput = deviceRecoveryRevokeQuorumInput(
+      { lost_node_id: fx.nodeId },
+      fx.fortressId
+    );
+    const revokeSigs = guardians
+      .slice(0, 3)
+      .map((g) =>
+        signMasterRotationAsGuardian({
+          input: revokeInput,
+          guardian_id: g.identity.guardian_id,
+          guardian_private_key: g.sk,
+        })
+      );
     const { DeviceRecoveryCeremony } = await import(
       "../../src/mesh/recovery-flows/index.js"
     );
@@ -834,6 +1008,7 @@ describe("DeviceRecoveryCeremony — propose/confirm Key 8 invariant", () => {
         lost_node_id: fx.nodeId,
         replacement_node_cert: replacementCert,
         guardian_signatures: sigs,
+        revoke_guardian_signatures: revokeSigs,
       },
       ctx: {
         node: (null as unknown) as never,

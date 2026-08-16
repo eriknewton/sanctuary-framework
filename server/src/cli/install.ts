@@ -627,7 +627,7 @@ async function probeWallStatus(
 ): Promise<Pick<InstallProbeResult, "contentFilter" | "enforcement">> {
   const chunks: string[] = [];
   try {
-    await runStatus({ out: captureWritable(chunks), env, platform: "darwin" });
+    await runStatus([], { out: captureWritable(chunks), env, platform: "darwin" });
   } catch {
     return { contentFilter: "unknown", enforcement: "undetermined" };
   }

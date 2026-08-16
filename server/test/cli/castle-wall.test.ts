@@ -235,7 +235,7 @@ describe("castle-wall CLI verbs", () => {
       mode: 0o600,
     });
     const out = new CaptureStream();
-    const code = await runStatus({
+    const code = await runStatus([], {
       out,
       env: { SANCTUARY_STORAGE_PATH: fortressPath },
       platform: "linux",
@@ -248,7 +248,7 @@ describe("castle-wall CLI verbs", () => {
   it("status without pinned key", async () => {
     const { fortressPath } = await makeFortress();
     const out = new CaptureStream();
-    const code = await runStatus({
+    const code = await runStatus([], {
       out,
       env: { SANCTUARY_STORAGE_PATH: fortressPath },
       platform: "linux",
@@ -263,7 +263,7 @@ describe("castle-wall CLI verbs", () => {
   it("status on non-macOS", async () => {
     const { fortressPath } = await makeFortress();
     const out = new CaptureStream();
-    const code = await runStatus({
+    const code = await runStatus([], {
       out,
       env: { SANCTUARY_STORAGE_PATH: fortressPath },
       platform: "linux",
@@ -280,7 +280,7 @@ describe("castle-wall CLI verbs", () => {
       mode: 0o600,
     });
     const out = new CaptureStream();
-    const code = await runStatus({
+    const code = await runStatus([], {
       out,
       env: { SANCTUARY_STORAGE_PATH: fortressPath },
       platform: "darwin",
@@ -331,7 +331,7 @@ describe("castle-wall CLI verbs", () => {
         exitCode: 0,
       });
 
-      const code = await runStatus({
+      const code = await runStatus([], {
         out,
         env: { SANCTUARY_STORAGE_PATH: fortressPath },
         platform: "darwin",
@@ -370,7 +370,7 @@ describe("castle-wall CLI verbs", () => {
         exitCode: 0,
       });
 
-      const code = await runStatus({
+      const code = await runStatus([], {
         out,
         env: { SANCTUARY_STORAGE_PATH: fortressPath },
         platform: "darwin",
@@ -398,7 +398,7 @@ describe("castle-wall CLI verbs", () => {
         exitCode: 0,
       });
 
-      const code = await runStatus({
+      const code = await runStatus([], {
         out,
         env: { SANCTUARY_STORAGE_PATH: fortressPath },
         platform: "darwin",
@@ -427,7 +427,7 @@ describe("castle-wall CLI verbs", () => {
         exitCode: 1,
       });
 
-      const code = await runStatus({
+      const code = await runStatus([], {
         out,
         env: { SANCTUARY_STORAGE_PATH: fortressPath },
         platform: "darwin",
@@ -450,7 +450,7 @@ describe("castle-wall CLI verbs", () => {
         exitCode: 4,
       });
 
-      const code = await runStatus({
+      const code = await runStatus([], {
         out,
         env: { SANCTUARY_STORAGE_PATH: fortressPath },
         platform: "darwin",
@@ -478,7 +478,7 @@ describe("castle-wall CLI verbs", () => {
         exitCode: 0,
       });
 
-      const code = await runStatus({
+      const code = await runStatus([], {
         out,
         env: { SANCTUARY_STORAGE_PATH: fortressPath },
         platform: "darwin",
@@ -500,7 +500,7 @@ describe("castle-wall CLI verbs", () => {
         throw new Error("spawn EACCES");
       };
 
-      const code = await runStatus({
+      const code = await runStatus([], {
         out,
         env: { SANCTUARY_STORAGE_PATH: fortressPath },
         platform: "darwin",
@@ -520,7 +520,7 @@ describe("castle-wall CLI verbs", () => {
         throw new Error("must not be invoked off-darwin");
       };
 
-      const code = await runStatus({
+      const code = await runStatus([], {
         out,
         env: { SANCTUARY_STORAGE_PATH: fortressPath },
         platform: "linux",
@@ -788,7 +788,7 @@ describe("castle-wall CLI verbs", () => {
     await runInit({ fortress: fortressPath, noConfirm: true });
 
     const out = new CaptureStream();
-    const code = await runStatus({
+    const code = await runStatus([], {
       out,
       platform: "linux",
       env: { SANCTUARY_STORAGE_PATH: fortressPath },
@@ -1590,7 +1590,7 @@ describe("castle-wall operability fixes (drill 2026-06-13: F1/F2a/F2b/F3)", () =
     const { fortressPath } = await makeFortress();
     const helper = makeMockHelper();
     const out = new CaptureStream();
-    const code = await runStatus({
+    const code = await runStatus([], {
       out,
       env: { SANCTUARY_STORAGE_PATH: fortressPath },
       platform: "darwin",
@@ -1614,7 +1614,7 @@ describe("castle-wall operability fixes (drill 2026-06-13: F1/F2a/F2b/F3)", () =
     const helper = makeMockHelper();
     const otherPin = ed25519.getPublicKey(ed25519.utils.randomPrivateKey());
     const out = new CaptureStream();
-    const code = await runStatus({
+    const code = await runStatus([], {
       out,
       env: { SANCTUARY_STORAGE_PATH: fortressPath },
       platform: "darwin",
@@ -1637,7 +1637,7 @@ describe("castle-wall operability fixes (drill 2026-06-13: F1/F2a/F2b/F3)", () =
     const { fortressPath } = await makeFortress();
     const out = new CaptureStream();
     const enoent = Object.assign(new Error("ENOENT"), { code: "ENOENT" });
-    const code = await runStatus({
+    const code = await runStatus([], {
       out,
       env: { SANCTUARY_STORAGE_PATH: fortressPath },
       platform: "darwin",
@@ -1658,7 +1658,7 @@ describe("castle-wall operability fixes (drill 2026-06-13: F1/F2a/F2b/F3)", () =
     const { fortressPath } = await makeFortress();
     const out = new CaptureStream();
     const eacces = Object.assign(new Error("EACCES"), { code: "EACCES" });
-    const code = await runStatus({
+    const code = await runStatus([], {
       out,
       env: { SANCTUARY_STORAGE_PATH: fortressPath },
       platform: "darwin",
@@ -1786,7 +1786,7 @@ describe("castle-wall operability fixes (drill 2026-06-13: F1/F2a/F2b/F3)", () =
     let code: number | undefined;
     await expect(
       (async () => {
-        code = await runStatus({
+        code = await runStatus([], {
           out,
           env: { SANCTUARY_STORAGE_PATH: fortressPath },
           platform: "darwin",
