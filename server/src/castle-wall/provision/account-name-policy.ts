@@ -8,9 +8,14 @@
  * boundary, and two of them (`egress-gate/gate-daemon.ts`,
  * `egress-gate/harness-daemon.ts`) render world-readable LaunchDaemon plists
  * and are kept dependency-light on purpose. They can consume this module
- * precisely because importing it drags in nothing: it must never gain an
- * import. `test/structure/cross-file-contract-pins.test.ts` enforces the
- * zero-import property and that no consumer re-declares these values.
+ * precisely because importing it drags in nothing: it must never gain a
+ * dependency edge of any kind -- not a static or bare side-effect import,
+ * not an `export ... from` re-export, and not a dynamic-import or CommonJS
+ * require CALL (the guard scans for those two call shapes anywhere in this
+ * file, comments included, which is why this sentence spells them without
+ * their parentheses). `test/structure/cross-file-contract-pins.test.ts`
+ * fails on any of those shapes and separately asserts that no consumer
+ * re-declares these values.
  *
  * HISTORY: until 2026-08-15 (G6) each of the three sites re-declared both
  * values locally, with pin comments and a structural equality test keeping

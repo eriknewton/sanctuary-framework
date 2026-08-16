@@ -28,7 +28,7 @@ import { isAbsolute, join } from "node:path";
 // The account-name contract is single-sourced: the safe charset and the
 // reserved privileged names this renderer refuses come from the zero-import
 // policy module every refusal site consumes, so this plist renderer stays
-// dependency-light (the module imports nothing) while a stale local copy of
+// dependency-light (the module has zero dependency edges, test-enforced) while a stale local copy of
 // the list is impossible by construction. Enforced by
 // `server/test/structure/cross-file-contract-pins.test.ts`.
 import {

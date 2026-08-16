@@ -148,6 +148,39 @@ function containsQuotedLiteral(source: string, literal: string): boolean {
   return countQuotedOccurrences(source, literal) > 0;
 }
 
+/**
+ * Every way a TypeScript module can acquire a dependency edge, for the
+ * zero-dependency-module guards below. The original guard here was
+ * `/^\s*import\s[^\n]*from\s/m`, and an adversarial review proved by
+ * mutation that it false-passed on a bare side-effect import
+ * (`import "./account.js";`) and on `export ... from` re-exports — a
+ * "zero-import" module could silently gain either shape and the suite stayed
+ * green. These patterns cover the full set: static imports with or without
+ * `from` (including `import type`; multi-line specifiers still start the
+ * line with `import`), `export ... from` re-exports in both `{...}` and `*`
+ * forms (multi-line tolerated via [\s\S]), dynamic `import()`, and CommonJS
+ * `require()`. The last two match anywhere, so a mention inside a comment
+ * WOULD fire; per this file's standing philosophy that false positive is the
+ * safe direction, and the fix is rewording the comment.
+ */
+const DEPENDENCY_EDGE_PATTERNS: ReadonlyArray<{ re: RegExp; what: string }> = [
+  { re: /^\s*import\b/m, what: "a static import declaration (with or without `from`)" },
+  { re: /^\s*export\s*\{[\s\S]*?\}\s*from\s*["']/m, what: "an `export {...} from` re-export" },
+  { re: /^\s*export\s*\*[^\n]*\bfrom\s*["']/m, what: "an `export * from` re-export" },
+  { re: /\bimport\s*\(/, what: "a dynamic import()" },
+  { re: /\brequire\s*\(/, what: "a require() call" },
+];
+
+/** Assert `file` (repo-root-relative) has NO dependency edge of any kind. */
+function expectZeroDependencyEdges(file: string): void {
+  const source = read(file);
+  for (const { re, what } of DEPENDENCY_EDGE_PATTERNS) {
+    expect(re.test(source), `${file} must stay dependency-free but contains ${what}`).toBe(
+      false,
+    );
+  }
+}
+
 /** Every .ts file under server/src, repo-root-relative. */
 function allServerSrcFiles(): string[] {
   const out: string[] = [];
@@ -396,10 +429,10 @@ describe("audit chain constants are shared, not mirrored", () => {
     }
   });
 
-  it("the zero-import module still has zero imports", () => {
-    // The whole hoist depends on this. If it ever imports anything, the
-    // standalone verifier silently inherits that dependency.
-    expect(/^\s*import\s[^\n]*from\s/m.test(read(SHAPE))).toBe(false);
+  it("the zero-import module still has zero dependency edges", () => {
+    // The whole hoist depends on this. If it ever gains a dependency edge of
+    // any kind, the standalone verifier silently inherits that dependency.
+    expectZeroDependencyEdges(SHAPE);
   });
 
   it("neither chain.ts nor the verifier re-declares them", () => {
@@ -608,10 +641,11 @@ describe("the account-name contract is shared, not mirrored", () => {
    * zero-import module `castle-wall/provision/account-name-policy.ts` that
    * every site imports, so drift is impossible by construction rather than
    * merely watched. What this block asserts is the CONSTRUCTION: the shared
-   * module declares the values and imports nothing, every consumer imports
-   * the shared symbol, and no site keeps a local re-declaration for a future
-   * edit to quietly resurrect. The behavior suite below remains the proof
-   * that each site OBEYS the set it imports.
+   * module declares the values and carries zero dependency edges (the full
+   * pattern set in DEPENDENCY_EDGE_PATTERNS, not just `import ... from`),
+   * every consumer imports the shared symbol, and no site keeps a local
+   * re-declaration for a future edit to quietly resurrect. The behavior
+   * suite below remains the proof that each site OBEYS the set it imports.
    */
   const POLICY = "server/src/castle-wall/provision/account-name-policy.ts";
   const NAMES = ["SAFE_SERVICE_ACCOUNT_RE", "RESERVED_ACCOUNT_NAMES"];
@@ -631,11 +665,16 @@ describe("the account-name contract is shared, not mirrored", () => {
     }
   });
 
-  it("the zero-import module still has zero imports", () => {
+  it("the zero-import module still has zero dependency edges", () => {
     // The whole hoist depends on this: the two daemon consumers render
     // world-readable LaunchDaemon plists and are kept dependency-light on
-    // purpose, so anything this module ever imports, they silently inherit.
-    expect(/^\s*import\s[^\n]*from\s/m.test(read(POLICY))).toBe(false);
+    // purpose, so anything this module ever depends on, they silently
+    // inherit. Checked against the full dependency-edge pattern set, not just
+    // `import ... from`: the reviewer's mutation probe proved a bare
+    // `import "./account.js";` (a real edge that executes account.ts and
+    // everything IT imports) kept the narrower guard green, as did an
+    // `export ... from` re-export.
+    expectZeroDependencyEdges(POLICY);
   });
 
   it("no consumer re-declares either value locally", () => {
