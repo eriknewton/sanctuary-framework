@@ -2265,19 +2265,48 @@ export class AuditLog {
     try {
       const normalized = this.normalizeEntry(entry);
       await this.reverifyCachedIntegrityFindingsBeforeAppend();
+      // C9 (availability, register): resolve the mandatory first-load
+      // read-consistency pass BEFORE requesting the cross-process write lock,
+      // not inside it. `ensureLoaded()` is a no-op once `this.loaded` is true
+      // (every append after this process's first), so this call is where the
+      // multi-pass decrypt+retry cost — up to 2x a full chain verify, see
+      // `loadPersistedEntriesWithReadConsistency` — actually lands: on the
+      // FIRST append only, and now with no write lock held while it runs,
+      // exactly mirroring how `reverifyCachedIntegrityFindingsBeforeAppend`
+      // above already takes its own fresh look lock-free. If it throws
+      // (strict mode, a store that never settled), the append never requests
+      // the lock at all, so a torn read on this process's first load can no
+      // longer hold other appenders in lock-contention for the retry's
+      // duration. The retry loop itself — deadline, store-stability
+      // discrimination — is UNCHANGED; only WHEN it runs relative to lock
+      // acquisition has moved. See the (retired) KNOWN LATENCY EXPOSURE note
+      // in `loadPersistedEntriesWithReadConsistency`. Not re-called inside
+      // the lock below: appends are strictly serialized per-process through
+      // `enqueueAppend`'s `appendQueue` chain (this is the only call site of
+      // `persistChainedEntry`), so by the time the lock callback below runs,
+      // `this.loaded` is already true (this call either set it or threw
+      // before the lock was ever requested) and a repeat call would be a
+      // guaranteed no-op purchased with real microtask-tick cost, not free
+      // defense in depth.
+      await this.ensureLoaded();
       const serialized = stringToBytes(JSON.stringify(normalized));
       const encrypted = encrypt(serialized, this.encryptionKey);
       const encryptedBytes = stringToBytes(JSON.stringify(encrypted));
       const encryptedPayloadBytes = toBase64url(encryptedBytes);
       await this.withAuditWriteLock(async (signal) => {
         this.assertAuditWriteLockActive(signal);
-        // LOCK-HOLD COST: on this process's FIRST append this is a full
-        // load-and-verify pass held inside the cross-process write lock, and the
-        // read-consistency retry can make it two. See the KNOWN LATENCY EXPOSURE
-        // note in `loadPersistedEntriesWithReadConsistency` for the measured
-        // bound and why it is accepted rather than mitigated here.
-        await this.ensureLoaded();
-        this.assertAuditWriteLockActive(signal);
+        // Incremental re-check of only the unstable tail (O(1) backward walk;
+        // see the Mini1-drill note on `readLatestPersistedChainState`), not a
+        // full re-verify. This is what protects correctness against a write
+        // that lands in the gap between the outside-lock `ensureLoaded()`
+        // above and this process actually acquiring the lock: it refreshes
+        // `nextSequence` / `lastEntryHash` to the true on-disk tip before they
+        // are used below, so a concurrent legitimate append is never lost or
+        // double-chained. It does not re-run the full decrypt+hash-chain
+        // verify, and does not need to: every append after the first already
+        // relies on this same freshen step today, never a per-append full
+        // reload, so this is the existing steady-state guarantee, not a
+        // weaker one.
         await this.freshenChainStateFromDisk();
         this.assertAuditWriteLockActive(signal);
         const sequence = this.nextSequence;
@@ -3953,40 +3982,52 @@ export class AuditLog {
       // the budget is 2s. Every transient tear on a large log therefore became
       // a hard tamper verdict on the first look, with no second look at all.
       //
-      // KNOWN LATENCY EXPOSURE (availability, not tamper weakening; accepted
-      // 2026-08-05, unmitigated on purpose). In the case this change is about —
-      // one pass outliving the 2s budget — making the retry mandatory costs
-      // exactly ONE extra full pass: the second pass establishes the baseline
-      // with the deadline already blown, so this check ends the loop. (Further
-      // passes remain possible in general, but only while the store is
-      // demonstrably mutating AND the whole loop is still inside the budget,
-      // i.e. only when passes are cheap.) But `persistChainedEntry`
-      // calls `ensureLoaded()` INSIDE `withAuditWriteLock`, so on an appending
-      // process's FIRST load that extra pass is paid while the cross-process
-      // write lock is held.
+      // LATENCY NOTE (availability, not tamper weakening). In the case this
+      // change is about — one pass outliving the 2s budget — making the retry
+      // mandatory costs exactly ONE extra full pass: the second pass
+      // establishes the baseline with the deadline already blown, so this
+      // check ends the loop. (Further passes remain possible in general, but
+      // only while the store is demonstrably mutating AND the whole loop is
+      // still inside the budget, i.e. only when passes are cheap.)
       //
-      // The size of that extra pass, measured rather than assumed. A cold full
-      // pass is LINEAR in entry count, not quadratic: timed on this branch
-      // (macOS, ~250-byte entries) at 250/500/1000/2000 entries the pass took
-      // 28/50/95/193ms, a flat ~0.1ms per entry. The per-entry constant, though,
-      // tracks PAYLOAD size, so it is not one number: the #714 profile (10k
-      // entries at ~40MB, so ~4KB each) measured 11-30s per pass, i.e. ~1.1-3ms
-      // per entry, ~10-30x the small-entry constant above. At the ~166k entries
+      // FORMERLY a KNOWN LATENCY EXPOSURE (accepted 2026-08-05, unmitigated
+      // on purpose): `persistChainedEntry` used to call `ensureLoaded()`
+      // INSIDE `withAuditWriteLock`, so on an appending process's FIRST load
+      // that extra pass was paid while the cross-process write lock was
+      // held. RESOLVED for C9 (register): `persistChainedEntry` now calls
+      // `ensureLoaded()` BEFORE requesting the write lock, so this retry loop
+      // (unchanged below) runs lock-free on the first load; the call inside
+      // the lock is a cheap already-loaded no-op, and the lock instead gets a
+      // narrow incremental re-check of just the tail (`freshenChainStateFromDisk`,
+      // O(1) backward walk) for the write that may have landed in the gap
+      // between the outside-lock load and the actual lock acquisition. This
+      // narrows the LOCK-HOLD window; it does not shrink or skip a single
+      // pass of the retry loop itself, so the read-consistency guarantee
+      // (store-stability discrimination, the same 2s deadline, the same
+      // fail-closed-on-a-static-store-with-findings behavior) is unchanged.
+      //
+      // The size of the extra pass this retry can still cost, measured rather
+      // than assumed. A cold full pass is LINEAR in entry count, not
+      // quadratic: timed on this branch (macOS, ~250-byte entries) at
+      // 250/500/1000/2000 entries the pass took 28/50/95/193ms, a flat
+      // ~0.1ms per entry. The per-entry constant, though, tracks PAYLOAD
+      // size, so it is not one number: the #714 profile (10k entries at
+      // ~40MB, so ~4KB each) measured 11-30s per pass, i.e. ~1.1-3ms per
+      // entry, ~10-30x the small-entry constant above. At the ~166k entries
       // the register-C6 production host carries, the extra pass is therefore
-      // ~16s of decrypt+verify with small entries and ~180-500s with #714-sized
-      // ones. The upper half of that range blows
-      // `DEFAULT_AUDIT_WRITE_LOCK_HOLD_DEADLINE_MS` (30s), which aborts the hold
-      // via the `signal` and runs lock recovery, while concurrent appenders
-      // waiting to acquire give up after `AUDIT_WRITE_LOCK_TIMEOUT_MS` (5s) with
-      // `AuditLockContentionError`. The
-      // trigger is narrow (a first load that both finds a transient tear and
-      // outruns the budget), and every cheap mitigation is worse than the
-      // exposure: skipping the retry when the caller holds the write lock
-      // reinstates exactly the first-look-is-final tamper verdict this change
-      // exists to remove, and scaling the budget by chain size only permits MORE
-      // passes. A real fix is an incremental/cheap re-verify so a second look is
-      // not a second full pass; that is its own design, tracked as follow-up, and
-      // deliberately NOT attempted here.
+      // ~16s of decrypt+verify with small entries and ~180-500s with
+      // #714-sized ones. Before the C9 fix, the upper half of that range blew
+      // `DEFAULT_AUDIT_WRITE_LOCK_HOLD_DEADLINE_MS` (30s) while the lock was
+      // held, aborting the hold via `signal` and running lock recovery, while
+      // concurrent appenders waiting to acquire gave up after
+      // `AUDIT_WRITE_LOCK_TIMEOUT_MS` (5s) with `AuditLockContentionError`.
+      // With the retry now running before lock acquisition, that same pass
+      // still costs the appending process the same wall-clock time, but no
+      // longer holds the lock (or blocks other appenders behind it) while it
+      // runs; a caller that never reaches a stable store still fails the
+      // append (strict-mode `AuditIntegrityError`, thrown before the lock is
+      // ever requested), which is the correct outcome for a store that is
+      // genuinely never becoming readable.
       if (hadBaseline && Date.now() >= deadline) {
         return; // bounded backstop; surfaced in strict mode by the caller
       }
