@@ -10,9 +10,13 @@
  * this test fails if a change INTRODUCES a new cycle, while tolerating the
  * pre-existing ones until they are paid down deliberately.
  *
- * It re-runs the detector's logic in-process (importing the script would run its
- * main()), so the gate stays zero-dependency and in lockstep with the committed
- * baseline file. The baseline is regenerated with `npm run check-import-cycles:baseline`.
+ * It runs the detector's ACTUAL logic in-process by importing the shared
+ * library (scripts/check-import-cycles.lib.ts) that the CLI runner also
+ * consumes — one parser, one resolver, one SCC pass (AGENTS.md rule 5), so
+ * this guard cannot drift from the tool that generates the committed baseline.
+ * (It previously carried an inline copy of that logic because importing the
+ * pre-split script would have run its main().) The baseline is regenerated
+ * with `npm run check-import-cycles:baseline`.
  *
  * SET-BASED, not count-based (the codex-backstop finding on #569): comparing
  * only the cycle COUNT is a hole — a reorg can introduce a brand-new cycle while
@@ -25,9 +29,15 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
-import { dirname, join, relative, resolve } from "node:path";
+import { readFileSync } from "node:fs";
+import { join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+
+import {
+  allTsFiles,
+  buildGraph,
+  stronglyConnectedComponents,
+} from "../../scripts/check-import-cycles.lib.js";
 
 const HERE = fileURLToPath(import.meta.url);
 const SERVER_DIR = resolve(HERE, "..", "..", "..");
@@ -38,56 +48,6 @@ const BASELINE_PATH = join(
   "fixtures",
   "import-cycle-baseline.txt",
 );
-
-function allTsFiles(dir: string): string[] {
-  if (!existsSync(dir)) return [];
-  const out: string[] = [];
-  const walk = (d: string): void => {
-    for (const entry of readdirSync(d, { withFileTypes: true })) {
-      const full = join(d, entry.name);
-      if (entry.isDirectory()) walk(full);
-      else if (entry.isFile() && entry.name.endsWith(".ts")) out.push(full);
-    }
-  };
-  walk(dir);
-  out.sort();
-  return out;
-}
-
-const FROM_RE = /\b(?:import|export)\b[^;]*?\bfrom\s*["'`]([^"'`]+)["'`]/g;
-const BARE_IMPORT_RE = /\bimport\s*["'`]([^"'`]+)["'`]/g;
-const DYNAMIC_RE = /\bimport\s*\(\s*["'`]([^"'`]+)["'`]\s*\)/g;
-
-function extractSpecifiers(source: string): string[] {
-  const specs = new Set<string>();
-  for (const re of [FROM_RE, BARE_IMPORT_RE, DYNAMIC_RE]) {
-    re.lastIndex = 0;
-    let m: RegExpExecArray | null;
-    while ((m = re.exec(source)) !== null) specs.add(m[1]!);
-  }
-  return [...specs];
-}
-
-function resolveSpecifier(fromFile: string, spec: string): string | null {
-  if (!spec.startsWith(".")) return null;
-  const base = resolve(dirname(fromFile), spec);
-  const candidates: string[] = [];
-  if (/\.js$/.test(spec)) {
-    candidates.push(base.replace(/\.js$/, ".ts"));
-    candidates.push(join(base.replace(/\.js$/, ""), "index.ts"));
-  } else if (/\.ts$/.test(spec)) {
-    candidates.push(base);
-  } else {
-    candidates.push(base + ".ts", join(base, "index.ts"));
-  }
-  for (const cand of candidates) {
-    if (existsSync(cand) && statSync(cand).isFile()) {
-      const rel = relative(SERVER_SRC, cand);
-      return rel.startsWith("..") ? null : cand;
-    }
-  }
-  return null;
-}
 
 /**
  * Canonical signature for one cycle: its member files (src-relative, POSIX
@@ -105,68 +65,17 @@ function sccSignature(memberRelPaths: string[]): string {
  * is caught.
  */
 function computeSccSignatures(files: string[]): Set<string> {
-  const index = new Map<string, number>();
-  files.forEach((f, i) => index.set(f, i));
-  const adj: number[][] = files.map(() => []);
-  for (const file of files) {
-    const from = index.get(file)!;
-    for (const spec of extractSpecifiers(readFileSync(file, "utf-8"))) {
-      const target = resolveSpecifier(file, spec);
-      if (target === null) continue;
-      const to = index.get(target);
-      if (to === undefined || to === from) continue;
-      if (!adj[from]!.includes(to)) adj[from]!.push(to);
-    }
-  }
-  const n = files.length;
-  const idx = new Int32Array(n).fill(-1);
-  const low = new Int32Array(n).fill(-1);
-  const onStack = new Uint8Array(n);
-  const stack: number[] = [];
-  let counter = 0;
+  // One shared graph build + Tarjan pass, imported from the detector's own
+  // library — the unit this guard compares against the committed baseline is
+  // exactly what `npm run check-import-cycles:baseline` writes.
+  const graph = buildGraph(files, SERVER_SRC);
   const signatures = new Set<string>();
-  for (let start = 0; start < n; start++) {
-    if (idx[start] !== -1) continue;
-    const call: Array<{ node: number; pos: number }> = [{ node: start, pos: 0 }];
-    idx[start] = low[start] = counter++;
-    stack.push(start);
-    onStack[start] = 1;
-    while (call.length > 0) {
-      const frame = call[call.length - 1]!;
-      const neighbors = adj[frame.node]!;
-      if (frame.pos < neighbors.length) {
-        const w = neighbors[frame.pos]!;
-        frame.pos++;
-        if (idx[w] === -1) {
-          idx[w] = low[w] = counter++;
-          stack.push(w);
-          onStack[w] = 1;
-          call.push({ node: w, pos: 0 });
-        } else if (onStack[w] === 1) {
-          low[frame.node] = Math.min(low[frame.node]!, idx[w]!);
-        }
-      } else {
-        if (low[frame.node] === idx[frame.node]) {
-          const comp: number[] = [];
-          for (;;) {
-            const w = stack.pop()!;
-            onStack[w] = 0;
-            comp.push(w);
-            if (w === frame.node) break;
-          }
-          if (comp.length > 1) {
-            const members = comp.map((i) =>
-              relative(SERVER_SRC, files[i]!).split("\\").join("/"),
-            );
-            signatures.add(sccSignature(members));
-          }
-        }
-        call.pop();
-        const parent = call[call.length - 1];
-        if (parent) {
-          low[parent.node] = Math.min(low[parent.node]!, low[frame.node]!);
-        }
-      }
+  for (const comp of stronglyConnectedComponents(graph)) {
+    if (comp.length > 1) {
+      const members = comp.map((i) =>
+        relative(SERVER_SRC, graph.nodes[i]!).split("\\").join("/"),
+      );
+      signatures.add(sccSignature(members));
     }
   }
   return signatures;
