@@ -86,10 +86,14 @@ public final class ExtensionDispatcher {
     private var armLeaseReceived = false
     /// Monotonic floor for arm-lease `updated_at` (O-02): a frame whose stamp
     /// is not strictly newer than this is a replay and is rejected. Reset
-    /// wherever `armLeaseReceived` resets (a fresh handshake starts a fresh
-    /// connection-scoped replay window; CROSS-connection replay is bounded by
-    /// the verifier's max-age window instead, because completing a new
-    /// handshake already requires the fortress key).
+    /// wherever `armLeaseReceived` resets, so each connection starts a fresh
+    /// connection-scoped replay window. CROSS-connection replay is bounded by
+    /// the verifier's 300s max-age window plus the daemon socket's 0o600
+    /// owner-only mode — NOT by the handshake: the handshake nonce is
+    /// daemon-self-signed (the extension issues no challenge), so reaching a
+    /// new connection does not itself prove fortress-key possession. The
+    /// daemon-impersonation replay residual inside that window is tracked in
+    /// the private defect register.
     private var lastAcceptedLeaseUpdatedAt: Date?
     private var providerUnboundAuditSent = false
     private var connectedFortressId: String?

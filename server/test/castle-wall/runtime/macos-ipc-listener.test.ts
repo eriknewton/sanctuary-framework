@@ -1150,6 +1150,217 @@ describe("MacOSFlowIpcListener", () => {
     ).toBe(false);
   });
 
+  // ---------- O-02 fix round: chain bounding + numeric clamps ----------
+
+  /** Heartbeat-shaped lease with a distinguishing ttl. */
+  function heartbeatLease(ttl: number): ArmLeaseNotification {
+    return {
+      type: "arm_lease",
+      armed: true,
+      ttl_seconds: ttl,
+      heartbeat_interval_seconds: 5,
+      updated_at: new Date().toISOString(),
+    };
+  }
+
+  /**
+   * Signer whose completions the test schedules explicitly (rule 12: the
+   * fault schedule — slow completion, late failure — is the test input).
+   * Each call stalls until the test releases it via `release(ok)`.
+   */
+  function makeScheduledSigner(): {
+    signer: MacOSLeaseSigner;
+    calls: () => number;
+    release: (ok?: boolean) => void;
+  } {
+    let count = 0;
+    const gates: Array<(ok: boolean) => void> = [];
+    const signer: MacOSLeaseSigner = {
+      signingKeyId: "lease-key-v1",
+      signLeaseBody: async (bytes) => {
+        count += 1;
+        const ok = await new Promise<boolean>((resolve) => {
+          gates.push(resolve);
+        });
+        if (!ok) throw new Error("shim timed out after 10000ms");
+        return ed25519.sign(bytes, LEASE_SEED);
+      },
+    };
+    return {
+      signer,
+      calls: () => count,
+      release: (ok = true) => {
+        const gate = gates.shift();
+        if (!gate) throw new Error("no in-flight sign call to release");
+        gate(ok);
+      },
+    };
+  }
+
+  it("coalesces heartbeats queued behind a slow signer; the chain stays bounded and the final emission is the latest state (rule 12; O-02 fix round)", async () => {
+    const scheduled = makeScheduledSigner();
+    const h = await newHarness([SAMPLE_RULE], { leaseSigner: scheduled.signer });
+    registerHarness(h);
+    const { buf } = await subscribedClient(h.socketPath);
+
+    // First heartbeat enters the signer and stalls there.
+    const first = h.listener.broadcastArmLease(heartbeatLease(90), {
+      coalesce: true,
+    });
+    await vi.waitFor(() => expect(scheduled.calls()).toBe(1));
+
+    // Eight more heartbeats enqueue while the signer is stalled. Only the
+    // latest may survive: each overwrites the single pending slot in place.
+    const rest: Array<Promise<number>> = [];
+    for (let ttl = 80; ttl >= 10; ttl -= 10) {
+      rest.push(
+        h.listener.broadcastArmLease(heartbeatLease(ttl), { coalesce: true }),
+      );
+    }
+
+    scheduled.release(); // in-flight sign completes (late)
+    await vi.waitFor(() => expect(scheduled.calls()).toBe(2));
+    scheduled.release(); // the one coalesced tail completes
+    // BOUND: 9 enqueued heartbeats produce exactly 2 signing jobs — one
+    // in-flight plus one coalesced tail. Without coalescing the chain holds
+    // 9 links and a THIRD signing job starts here, so this asserts (fast,
+    // before the drain) that the seven superseded heartbeats never sign.
+    await tick();
+    await tick();
+    expect(scheduled.calls()).toBe(2);
+    const counts = await Promise.all([first, ...rest]);
+    expect(scheduled.calls()).toBe(2);
+    // Every superseded caller settled (rides the coalesced emission).
+    expect(counts).toHaveLength(9);
+    const emitted1 = verifyLeaseFrame(await nextMessage(buf));
+    expect(emitted1.ttl_seconds).toBe(90);
+    // Final emitted lease is the LATEST enqueued state, not an intermediate.
+    const emitted2 = verifyLeaseFrame(await nextMessage(buf));
+    expect(emitted2.ttl_seconds).toBe(10);
+  });
+
+  it("a heartbeat whose signing times out late cannot block or reorder the coalesced successor (rule 12; O-02 fix round)", async () => {
+    const scheduled = makeScheduledSigner();
+    const h = await newHarness([SAMPLE_RULE], { leaseSigner: scheduled.signer });
+    registerHarness(h);
+    const { buf } = await subscribedClient(h.socketPath);
+
+    const first = h.listener.broadcastArmLease(heartbeatLease(90), {
+      coalesce: true,
+    });
+    await vi.waitFor(() => expect(scheduled.calls()).toBe(1));
+    const second = h.listener.broadcastArmLease(heartbeatLease(30), {
+      coalesce: true,
+    });
+
+    // The in-flight sign FAILS late (shim timeout), after the successor was
+    // already queued: the failed emission drops (never unsigned), the chain
+    // absorbs the rejection, and the successor still signs + emits.
+    scheduled.release(false);
+    await vi.waitFor(() => expect(scheduled.calls()).toBe(2));
+    scheduled.release();
+
+    expect(await first).toBe(0);
+    expect(await second).toBe(1);
+    // Exactly ONE lease reached the wire, carrying the latest state.
+    const emitted = verifyLeaseFrame(await nextMessage(buf));
+    expect(emitted.ttl_seconds).toBe(30);
+  });
+
+  it("operator emissions are never coalesced away and heartbeats cannot reorder around them (O-02 fix round)", async () => {
+    const scheduled = makeScheduledSigner();
+    const h = await newHarness([SAMPLE_RULE], { leaseSigner: scheduled.signer });
+    registerHarness(h);
+    const { buf } = await subscribedClient(h.socketPath);
+
+    // Schedule: heartbeat A in-flight, heartbeat B queued (pending slot),
+    // operator revoke (non-coalescible, seals the slot), heartbeat C (fresh
+    // slot AFTER the revoke).
+    const a = h.listener.broadcastArmLease(heartbeatLease(90), {
+      coalesce: true,
+    });
+    await vi.waitFor(() => expect(scheduled.calls()).toBe(1));
+    const b = h.listener.broadcastArmLease(heartbeatLease(80), {
+      coalesce: true,
+    });
+    const revoke = h.listener.broadcastArmLease({
+      type: "arm_lease",
+      armed: false,
+      revoked: true,
+      ttl_seconds: null,
+      heartbeat_interval_seconds: 5,
+      updated_at: new Date().toISOString(),
+    });
+    const c = h.listener.broadcastArmLease(heartbeatLease(70), {
+      coalesce: true,
+    });
+
+    for (let i = 0; i < 4; i += 1) {
+      await vi.waitFor(() => expect(scheduled.calls()).toBe(i + 1));
+      scheduled.release();
+    }
+    await Promise.all([a, b, revoke, c]);
+
+    // All four emissions signed (nothing coalesced across the revoke), in
+    // call order: A, B (its slot was sealed, payload kept), revoke, C. The
+    // post-revoke heartbeat C must NOT have overwritten B's pre-revoke slot,
+    // or the extension would observe post-revoke arm state before the revoke.
+    expect(scheduled.calls()).toBe(4);
+    expect(verifyLeaseFrame(await nextMessage(buf)).ttl_seconds).toBe(90);
+    expect(verifyLeaseFrame(await nextMessage(buf)).ttl_seconds).toBe(80);
+    const third = verifyLeaseFrame(await nextMessage(buf));
+    expect(third.revoked).toBe(true);
+    expect(verifyLeaseFrame(await nextMessage(buf)).ttl_seconds).toBe(70);
+  });
+
+  it("clamps out-of-range lease numerics at the signing chokepoint (Swift UInt32 guard; O-02 fix round)", async () => {
+    const h = await newHarness([SAMPLE_RULE], { leaseSigner: makeLeaseSigner() });
+    registerHarness(h);
+    const { buf } = await subscribedClient(h.socketPath);
+
+    // heartbeat_interval_seconds 3e9 would trap the extension's UInt32
+    // `interval * 2` dead-man math (trap point: interval >= 2^31);
+    // ttl_seconds 2^53 would fail its UInt32 frame decode outright and
+    // starve the lease. Both must be clamped BEFORE signing, so the
+    // signature (checked by verifyLeaseFrame) covers the clamped body.
+    await h.listener.broadcastArmLease({
+      type: "arm_lease",
+      armed: true,
+      ttl_seconds: 2 ** 53,
+      heartbeat_interval_seconds: 3_000_000_000,
+      updated_at: new Date().toISOString(),
+    });
+    const clamped = verifyLeaseFrame(await nextMessage(buf));
+    expect(clamped.heartbeat_interval_seconds).toBe(3600);
+    expect(clamped.ttl_seconds).toBe(31_536_000);
+
+    // Below-range + fractional: interval 0 (instant heartbeat_stopped) rises
+    // to the 1s floor; a negative fractional ttl clamps to 0; fractional
+    // interval floors to an integer (UInt32 decode rejects fractions).
+    await h.listener.broadcastArmLease({
+      type: "arm_lease",
+      armed: true,
+      ttl_seconds: -3.5,
+      heartbeat_interval_seconds: 0,
+      updated_at: new Date().toISOString(),
+    });
+    const raised = verifyLeaseFrame(await nextMessage(buf));
+    expect(raised.heartbeat_interval_seconds).toBe(1);
+    expect(raised.ttl_seconds).toBe(0);
+
+    // In-range values pass through untouched (null ttl stays null).
+    await h.listener.broadcastArmLease({
+      type: "arm_lease",
+      armed: true,
+      ttl_seconds: null,
+      heartbeat_interval_seconds: 5,
+      updated_at: new Date().toISOString(),
+    });
+    const untouched = verifyLeaseFrame(await nextMessage(buf));
+    expect(untouched.heartbeat_interval_seconds).toBe(5);
+    expect(untouched.ttl_seconds).toBeNull();
+  });
+
   it("emits unsigned frames unchanged when no lease signer is configured (legacy path)", async () => {
     const h = await newHarness([SAMPLE_RULE]);
     registerHarness(h);
