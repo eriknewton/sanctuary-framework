@@ -1,3 +1,8 @@
+// fail-before-exempt: this PR only widens the test harness flush budget here
+// (40 -> 120 microtask turns; a harness drain count, not a property under
+// test) because IC-05-DG adds a signing-head write to the checkpoint commit
+// path, lengthening the drain. No behavioral fix, so no pre-fix source these
+// tests could fail against.
 /**
  * LD6 BP-DEADLINE-03 -- durable mutation-proof oracle (AGENTS.md rule 8;
  * V2-6 of Admission_Completion_Design_Brief_2026-08-11.md).
