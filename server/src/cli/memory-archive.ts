@@ -267,9 +267,13 @@ export async function runMemoryArchiveExportCommand(
     );
     return 0;
   } catch {
-    if (committed && !disclosed) {
-      await rm(parsed.outputPath, { recursive: true, force: true }).catch(() => undefined);
-    }
+    // Reachable states only: (a) neither flag set, the failure happened
+    // before recovery-material disclosure; (b) disclosed only, the failure
+    // happened between disclosure and the rename that commits the bundle;
+    // (c) both set, the failure happened after commit (e.g. the post-commit
+    // audit-log append). `committed` is set only in the statement immediately
+    // after `disclosed = true`, so committed-without-disclosed can never
+    // occur and there is no separate cleanup branch for it.
     write(
       err,
       disclosed && committed
@@ -310,6 +314,12 @@ export async function runMemoryArchiveImportCommand(
   let boot: Bootstrapped | null = null;
   let hiddenBytes: Uint8Array | undefined;
   let transferKey: Uint8Array | undefined;
+  // Set true only once importExitV2SdwMemoryArchive itself has returned; the
+  // catch block below uses this to distinguish a failure that happened before
+  // the destination archive was written from one that happened after (e.g. a
+  // post-commit audit-log append), since those two cases need different,
+  // non-misdiagnosing operator guidance.
+  let committed = false;
   try {
     const bundle = await readBundle(parsed.inputPath);
 
@@ -384,6 +394,10 @@ export async function runMemoryArchiveImportCommand(
       artifactBytes: bundle.artifactBytes,
       transferKey,
     });
+    // The destination archive is durably written by the call above; anything
+    // that fails from this point on is a post-commit step, not an import
+    // failure, and must be reported as such (see the `committed` comment).
+    committed = true;
     // Import consumes and clears its caller-owned key buffer.
     transferKey = undefined;
     await boot.auditLog.appendCritical({
@@ -406,7 +420,21 @@ export async function runMemoryArchiveImportCommand(
     );
     return 0;
   } catch {
-    write(err, "memory_archive_import failed: archive authentication or validation failed\n");
+    // Pre-commit failures are genuinely authentication/validation failures
+    // (bad recovery material, a malformed bundle, a denied approval). A
+    // post-commit failure is a different situation entirely: the destination
+    // archive already exists, so reporting it as an authentication failure
+    // would misdiagnose a completed irreversible operation and could prompt
+    // an operator to needlessly re-authenticate or distrust a successful
+    // import. importExitV2SdwMemoryArchive treats a repeat of the same source
+    // lineage as a replay (see `replayed` in its result), so re-running this
+    // command with the same bundle is safe either way.
+    write(
+      err,
+      committed
+        ? "memory_archive_import failed after the archive was imported; a post-import step (audit logging or receipt output) failed. Re-running memory_archive_import with the same bundle is safe.\n"
+        : "memory_archive_import failed: archive authentication or validation failed\n",
+    );
     return 1;
   } finally {
     transferKey?.fill(0);
@@ -560,7 +588,11 @@ function resolveInteraction(
   return new MacOsLocalHumanInteraction(dialogRunner ?? runMacOsDialog);
 }
 
-class MacOsLocalHumanInteraction implements PrivateMemoryArchiveInteraction {
+// Exported so tests can exercise the splice-site alphabet guard in
+// discloseAndConfirm directly, with a dialogRunner that asserts it is never
+// invoked for a rejected value. Production callers still reach this class
+// only through resolveInteraction.
+export class MacOsLocalHumanInteraction implements PrivateMemoryArchiveInteraction {
   constructor(private readonly runDialog: MemoryArchiveDialogRunner) {}
 
   async requestApproval(request: ApprovalRequest): Promise<ApprovalResponse> {
@@ -593,6 +625,12 @@ class MacOsLocalHumanInteraction implements PrivateMemoryArchiveInteraction {
 
   async discloseAndConfirm(value: Uint8Array): Promise<boolean> {
     if (value.byteLength !== TRANSFER_KEY_TEXT_BYTES) return false;
+    // `value` is spliced verbatim into the JXA source string below rather than
+    // passed as a separate data argument, so any byte outside the base64url
+    // alphabet could close the quoted string literal and inject script into
+    // the osascript source. The length check above bounds size, not content;
+    // this assertion, at the splice site, bounds content before it is used.
+    if (!isBase64urlAlphabet(value)) return false;
     const script = joinBytes([
       textBytes(
         "const app = Application.currentApplication();\n" +
@@ -756,6 +794,13 @@ function decodeTransferKey(input: Uint8Array): Uint8Array {
     throw new Error("invalid key encoding");
   }
   return output;
+}
+
+function isBase64urlAlphabet(value: Uint8Array): boolean {
+  for (const byte of value) {
+    if (base64urlValue(byte) < 0) return false;
+  }
+  return true;
 }
 
 function base64urlValue(byte: number): number {
