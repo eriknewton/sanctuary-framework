@@ -1,3 +1,9 @@
+// fail-before-exempt: the changed test pins the ceremony-evidence refusal at the
+// enforcement site, but pre-fix source ALSO refused this shape (receivers always
+// re-verified and the bare bypass flag path could not authorize a broadcast the
+// quorum never covered locally either, just via a different failure). The
+// fail-before witnesses for #1246 are the three sibling changed files, which the
+// gate verified failed-as-required.
 /**
  * Sanctuary Federation Protocol v0.1 - Lifecycle Orchestrator Tests
  *
