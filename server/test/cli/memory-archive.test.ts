@@ -599,11 +599,47 @@ describe("Exit V2 memory archive CLI", () => {
     expect(`${out.text()}${err.text()}`).not.toContain(disclosedKey);
     expect(scriptRefs).toHaveLength(2);
     expect(scriptRefs.every((value) => value.every((byte) => byte === 0))).toBe(true);
-    expect(compileResults, compileResults.map((result) => result.stderr).join("\n")).toEqual([
-      { status: 0, stderr: "" },
-      { status: 0, stderr: "" },
-    ]);
+    // osacompile exists only on darwin, so the syntax check above only runs
+    // there; on other platforms the production dialog scripts are never
+    // spawned (resolveInteraction fails closed first) and no result is pushed.
+    const expectedCompileResults = process.platform === "darwin"
+      ? [
+          { status: 0, stderr: "" },
+          { status: 0, stderr: "" },
+        ]
+      : [];
+    expect(compileResults, compileResults.map((result) => result.stderr).join("\n")).toEqual(
+      expectedCompileResults,
+    );
   }, 60_000);
+
+  // Runs only where the reviewed macOS dialog boundary is absent: it witnesses
+  // the real resolveInteraction refusal with no injected seam, so Linux CI
+  // proves the platform fail-closed branch rather than trusting it.
+  it.skipIf(process.platform === "darwin")(
+    "fails closed on platforms without the local dialog boundary when no seam is injected",
+    async () => {
+      const parent = await tempDir("exit-v2-cli-nondarwin-parent");
+      const { out, err } = sinkPair();
+      const code = await runMemoryArchiveExportCommand({
+        argv: [
+          "--archive-id", "0123456789abcdef0123456789abcdef",
+          "--out", join(parent, "bundle"),
+          "--owner-ref", "owner-a",
+          "--fortress", join(parent, "missing-fortress"),
+        ],
+        out,
+        err,
+        env: {},
+      });
+      expect(code).toBe(1);
+      expect(err.text()).toContain(
+        "a local OS approval dialog is unavailable on this platform",
+      );
+      await expect(stat(join(parent, "bundle"))).rejects.toMatchObject({ code: "ENOENT" });
+    },
+    60_000,
+  );
 
   it("fails closed and removes the bundle when the local custody dialog is interrupted", async () => {
     const source = await fortress("exit-v2-cli-dialog-signal-source", "owner-a", true);
