@@ -23,6 +23,7 @@
 
 export * from "./types.js";
 export * from "./chain.js";
+export * from "./checkpoint-identity.js";
 export * from "./detector.js";
 export * from "./analyzer.js";
 export * from "./siem-formatter.js";

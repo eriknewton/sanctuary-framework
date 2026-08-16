@@ -1275,7 +1275,12 @@ async function runCastleWallCommand(args: string[]): Promise<number> {
 
   if (command === "status") {
     const { runStatus } = await import("./cli/castle-wall.js");
-    return runStatus();
+    // O-07 (register): the trailing args (e.g. `--fortress <path>`) were
+    // dropped here entirely -- unlike every other castle-wall verb below,
+    // which forwards `args.slice(1)` -- so `castle-wall status --fortress
+    // <path>` silently reported the DEFAULT fortress instead of the one
+    // named. See runStatus's own doc for the fix.
+    return runStatus(args.slice(1));
   }
 
   if (command === "enable") {
