@@ -1,0 +1,16 @@
+{
+  "arm_lease": {
+    "type": "arm_lease",
+    "armed": true,
+    "ttl_seconds": 90,
+    "heartbeat_interval_seconds": 5,
+    "updated_at": "2026-08-16T00:00:00.000Z",
+    "source": "castle-wall-cli",
+    "signing_key_id": "parity-test-key",
+    "lease_signature_b64url": "yAa1BP_m1wfddtb-AbzT0nGJVZb8Glp1WClGTrK7_4a_qTeZAc7qgM-CEz0HL8aUlom26D3V_6McBrCHp09EBw"
+  },
+  "expected_canonical_json_b64": "eyJhcm1lZCI6dHJ1ZSwiaGVhcnRiZWF0X2ludGVydmFsX3NlY29uZHMiOjUsInJldm9rZWQiOmZhbHNlLCJ0dGxfc2Vjb25kcyI6OTAsInR5cGUiOiJhcm1fbGVhc2UiLCJ1cGRhdGVkX2F0IjoiMjAyNi0wOC0xNlQwMDowMDowMC4wMDBaIn0=",
+  "expected_canonical_json_hex": "7b2261726d6564223a747275652c226865617274626561745f696e74657276616c5f7365636f6e6473223a352c227265766f6b6564223a66616c73652c2274746c5f7365636f6e6473223a39302c2274797065223a2261726d5f6c65617365222c22757064617465645f6174223a22323032362d30382d31365430303a30303a30302e3030305a227d",
+  "test_public_key_b64url": "IVL40Zt5HSRFMkLhXy6rbLfP-ntqXtMAl5YOBpiB2xI",
+  "test_signature_b64url": "yAa1BP_m1wfddtb-AbzT0nGJVZb8Glp1WClGTrK7_4a_qTeZAc7qgM-CEz0HL8aUlom26D3V_6McBrCHp09EBw"
+}

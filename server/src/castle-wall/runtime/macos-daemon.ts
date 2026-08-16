@@ -445,7 +445,15 @@ export interface MacOSCastleWallListenerHandle {
   stop(): Promise<void>;
   broadcastManifestUpdate(): Promise<number>;
   broadcastDecisionResponse(response: DecisionResponse): Promise<number>;
-  broadcastArmLease(lease: ArmLeaseNotification): Promise<number>;
+  /**
+   * `coalesce: true` marks a periodic-heartbeat emission the listener may
+   * replace with a newer one while queued behind a slow signer; operator
+   * arm/revoke and lifecycle emissions omit it and are never coalesced.
+   */
+  broadcastArmLease(
+    lease: ArmLeaseNotification,
+    opts?: { coalesce?: boolean },
+  ): Promise<number>;
   recycleConnection(subscriberId: string, reason: string): boolean;
 }
 
@@ -1131,6 +1139,18 @@ export async function startMacOSCastleWallDaemon(
         return signer.signNonce(nonce);
       },
     },
+    // O-02: authenticate the arm-lease frames with the SAME fortress key the
+    // extension already pins for the handshake + manifest. `signManifest` is
+    // the helper's opaque-canonical-bytes signing mode; domain confusion with
+    // a real manifest is structurally excluded because the lease's canonical
+    // signed body carries `"type":"arm_lease"` and neither side's manifest
+    // shape can decode/reconstruct to it (see `armLeaseSignedBody`).
+    leaseSigner: {
+      signingKeyId: signer.signingKeyId,
+      signLeaseBody(canonicalBytes) {
+        return signer.signManifest(canonicalBytes);
+      },
+    },
     adminHandler: {
       async reloadPolicy(request) {
         return reloadPolicy(request);
@@ -1296,11 +1316,15 @@ export async function startMacOSCastleWallDaemon(
       // liveness; remaining seconds count down toward the operator's arm+ttl
       // instant) and the Swift `ttl_expired` fail-open fires on schedule.
       const remaining = remainingLeaseSeconds();
+      // `coalesce: true`: this is the periodic heartbeat — if a previous
+      // heartbeat is still queued behind a slow root-helper signing round
+      // trip, only the LATEST arm state matters, so the listener replaces the
+      // queued payload instead of growing the emission chain (rule 12).
       await listener.broadcastArmLease(buildArmLease({
         armed: true,
         ttlSeconds: remaining,
         heartbeatIntervalSeconds,
-      })).catch(() => undefined);
+      }), { coalesce: true }).catch(() => undefined);
       // Once the deadline has passed, we have broadcast `ttl_seconds: 0` (an
       // immediate fail-open in the extension). Stop the lease heartbeat so we do
       // not keep spamming a 0-TTL renewal; the wall has intentionally degraded

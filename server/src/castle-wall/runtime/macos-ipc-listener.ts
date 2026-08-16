@@ -47,6 +47,7 @@ import { randomBytes } from "node:crypto";
 
 import { CASTLE_WALL_IPC_NAMESPACE } from "../constants.js";
 import { frame, parseFrame } from "../ipc/framing.js";
+import { canonicalize } from "../../mesh/canonical-json.js";
 import type {
   AuditEmitNotification,
   CastleWallMessage,
@@ -140,6 +141,14 @@ export interface MacOSFlowIpcListenerOptions {
   generateNonce?: () => Uint8Array;
   /** Signs the connection nonce so the extension can authenticate main. */
   handshakeSigner?: MacOSHandshakeSigner;
+  /**
+   * Signs every emitted `arm_lease` frame (O-02). When configured, an emitted
+   * lease ALWAYS carries a fortress-key signature and a fresh `updated_at`
+   * stamp; a signing failure DROPS the emission (never an unsigned fallback —
+   * MUST-NEVER #5). When absent (legacy/dev harnesses), frames go out unsigned
+   * and a current extension rejects them fail-closed on its side.
+   */
+  leaseSigner?: MacOSLeaseSigner;
   /** Optional local-admin command handler used by the CLI verbs. */
   adminHandler?: MacOSFlowIpcAdminHandler;
   /** Called before an inbound operator revoke is broadcast to subscribers. */
@@ -165,6 +174,95 @@ export interface MacOSHandshakeSigner {
    * inline (preserving prior timing for existing tests).
    */
   signNonce(nonce: Uint8Array): Uint8Array | Promise<Uint8Array>;
+}
+
+export interface MacOSLeaseSigner {
+  /** Recorded in the frame's `signing_key_id`; audit-facing, not authority. */
+  signingKeyId: string;
+  /**
+   * Sign the canonical arm-lease body bytes with the fortress Ed25519 key
+   * (the same key the extension pins for the handshake and the manifest).
+   * May be async (root-helper XPC path) or sync (local dev path).
+   *
+   * LIVENESS CONTRACT: the lease-emission chain (`leaseEmitChain`) applies no
+   * deadline of its own — every implementation MUST settle (resolve or reject)
+   * every call, or the chain wedges and the extension's dead-man fires. The
+   * production implementation satisfies this via the shim's per-invocation
+   * SIGKILL timeout (must match `DEFAULT_TIMEOUT_MS` in `helper-signer.ts`,
+   * 10s today); that timeout is the ONLY deadline bounding a chain link.
+   */
+  signLeaseBody(canonicalBytes: Uint8Array): Uint8Array | Promise<Uint8Array>;
+}
+
+/**
+ * Bounds applied to the numeric lease fields at the signing chokepoint
+ * (`signArmLease`). The extension decodes both fields as Swift `UInt32` and
+ * computes the dead-man deadline as `heartbeatIntervalSeconds * 2` IN UInt32
+ * (`ArmLease.swift`), so an out-of-range value either fails the whole-frame
+ * decode (lease starved, dead-man fires for a config error) or traps the
+ * extension process on overflow. Clamping here keeps the wall live under a
+ * bogus producer value while the stderr warning surfaces the defect; the
+ * signature is computed over the CLAMPED body, so wire and signature agree.
+ */
+/**
+ * 1: an interval of 0 would put the extension's heartbeat deadline at "now",
+ * i.e. an instant `heartbeat_stopped` degrade on every accepted lease.
+ */
+const HEARTBEAT_INTERVAL_MIN_SECONDS = 1;
+/**
+ * 3600: dead-man detection latency is 2x the interval (the extension's
+ * `interval * 2` deadline), so one hour already means a two-hour dead-man;
+ * anything longer defeats the dead-man's purpose. Also keeps the Swift UInt32
+ * multiply far from its trap point (3600 * 2 = 7200 << 2^32 - 1; the trap
+ * begins at interval >= 2^31).
+ */
+const HEARTBEAT_INTERVAL_MAX_SECONDS = 3600;
+/**
+ * 31_536_000 = 365 * 86_400 (one year). Must fit Swift's UInt32 decode
+ * (2^32 - 1 seconds is ~136 years; a larger wire value rejects the whole
+ * frame), and a year bounds an accidental or hostile decades-long arm window.
+ */
+const TTL_MAX_SECONDS = 31_536_000;
+
+/**
+ * Clamp to an integer in [min, max]. `Math.floor` because the Swift side
+ * decodes UInt32: a fractional wire value fails the frame decode (fail closed
+ * but lease-starving) and would also break canonical-body parity. The
+ * non-finite guard is defensive against a programmatic caller only — parsed
+ * JSON cannot carry NaN/Infinity.
+ */
+function clampLeaseInt(value: number, min: number, max: number): number {
+  if (!Number.isFinite(value)) return min;
+  return Math.min(max, Math.max(min, Math.floor(value)));
+}
+
+/**
+ * Canonical SIGNED BODY of an arm lease: exactly these six fields, always all
+ * present (`revoked` explicit even when false, `ttl_seconds` explicit null when
+ * absent), serialized via `canonicalize` (sorted keys, no whitespace). The
+ * normalization exists because the wire frame legitimately omits
+ * `revoked`/`ttl_seconds` and may carry extra diagnostic fields (the CLI's
+ * `source`); the signature must bind every field the extension CONSUMES and
+ * nothing whose presence varies by producer.
+ *
+ * Must match `canonicalSignedBody` in
+ * `castle-wall-macos/Sources/CastleWallFilter/SignedArmLeaseVerification.swift`
+ * byte-for-byte: a divergence surfaces as the extension rejecting every lease
+ * (fail closed, wall degrades to missing-lease posture), never as a silent
+ * acceptance.
+ */
+export function armLeaseSignedBody(lease: ArmLeaseNotification): Record<string, unknown> {
+  return {
+    // `type` doubles as a domain-separation tag: the fortress key also signs
+    // manifest bodies and handshake nonces, and no other signed payload can
+    // contain `"type":"arm_lease"` as a top-level canonical field.
+    type: "arm_lease",
+    armed: lease.armed,
+    revoked: lease.revoked === true,
+    ttl_seconds: lease.ttl_seconds ?? null,
+    heartbeat_interval_seconds: lease.heartbeat_interval_seconds,
+    updated_at: lease.updated_at,
+  };
 }
 
 export interface MacOSFlowIpcAdminHandler {
@@ -239,10 +337,55 @@ export class MacOSFlowIpcListener {
   private readonly maxConnections: number;
   private readonly generateNonce: () => Uint8Array;
   private readonly handshakeSigner: MacOSHandshakeSigner | null;
+  private readonly leaseSigner: MacOSLeaseSigner | null;
   private readonly adminHandler: MacOSFlowIpcAdminHandler | null;
   private readonly onArmLeaseRevoke: ((lease: ArmLeaseNotification) => void | Promise<void>) | null;
   private readonly onArmLease: ((lease: ArmLeaseNotification) => void | Promise<void>) | null;
   private currentArmLease: ArmLeaseNotification | null = null;
+  /**
+   * Last `updated_at` epoch-ms this listener stamped into a signed lease. The
+   * extension enforces STRICT monotonicity per connection, and
+   * `Date.now()` has only millisecond resolution, so two emissions inside the
+   * same millisecond (e.g. an operator arm relay immediately followed by a
+   * heartbeat) would otherwise produce an equal stamp the extension rejects
+   * as a replay. Bumping to last+1ms keeps every emitted stamp unique and
+   * ordered without waiting.
+   */
+  private lastLeaseStampMs = 0;
+  /**
+   * Tail of the serialized lease-emission chain (see `broadcastArmLease`).
+   * Always settles; rejections are absorbed so one failed emission cannot
+   * wedge every later one.
+   *
+   * BOUND (rule 12): the chain must not grow with heartbeat enqueue rate. A
+   * slow signer (worst case one shim SIGKILL timeout per link, see the
+   * `MacOSLeaseSigner` liveness contract) drains slower than the 5s heartbeat
+   * cadence enqueues, so without coalescing the chain grows without limit and
+   * every emission falls further behind the live arm state. Coalescing caps
+   * the heartbeat contribution to TWO live links at a time — one in-flight
+   * signing plus one pending slot that later heartbeats overwrite in place —
+   * and each non-coalescible emission SEALS the pending slot, stranding at
+   * most one already-queued heartbeat link behind it. Total depth is
+   * therefore bounded by 2 + 2x(discrete operator emissions) + (subscribe
+   * resends, one per connection, `maxConnections`-capped): every term is a
+   * bounded external event, never the heartbeat enqueue rate (delta re-gate
+   * corrected the earlier arithmetic, which omitted the stranded-link term).
+   */
+  private leaseEmitChain: Promise<void> = Promise.resolve();
+  /**
+   * The single pending coalescible-heartbeat slot. A queued-but-not-started
+   * heartbeat link reads `slot.lease` when it runs, so a newer heartbeat
+   * REPLACES the payload in place instead of appending a link (only the
+   * latest arm state matters; a superseded heartbeat is dead weight the
+   * extension would accept and immediately have overwritten). Cleared when
+   * the link starts running, and SEALED (nulled) by every non-coalescible
+   * emission so a heartbeat enqueued after an operator arm/revoke can never
+   * emit at a chain position before it (call order = emit order holds).
+   */
+  private pendingHeartbeatSlot: {
+    lease: ArmLeaseNotification;
+    run: Promise<number>;
+  } | null = null;
   private server: Server | null = null;
   private connections = new Map<string, ConnectionState>();
   private stats: MacOSFlowIpcListenerStats = {
@@ -262,6 +405,7 @@ export class MacOSFlowIpcListener {
     this.maxConnections = opts.maxConnections ?? 8;
     this.generateNonce = opts.generateNonce ?? defaultNonceBytes;
     this.handshakeSigner = opts.handshakeSigner ?? null;
+    this.leaseSigner = opts.leaseSigner ?? null;
     this.adminHandler = opts.adminHandler ?? null;
     this.onArmLeaseRevoke = opts.onArmLeaseRevoke ?? null;
     this.onArmLease = opts.onArmLease ?? null;
@@ -384,16 +528,185 @@ export class MacOSFlowIpcListener {
     return emitted;
   }
 
-  /** Fan the current arm lease heartbeat to active extension subscribers. */
-  async broadcastArmLease(lease: ArmLeaseNotification): Promise<number> {
-    this.currentArmLease = lease;
+  /**
+   * Fan the current arm lease heartbeat to active extension subscribers.
+   *
+   * O-02: every emission funnels through `signArmLease` — the daemon heartbeat,
+   * the CLI-relayed operator arm/revoke, and the subscribe-time resend all use
+   * this one chokepoint, so no path can emit a lease the extension would have
+   * to trust unauthenticated. If signing fails while a signer is configured,
+   * NOTHING is emitted and `currentArmLease` keeps the last signed frame
+   * (never an unsigned fallback; the extension's dead-man handles the gap).
+   */
+  async broadcastArmLease(
+    lease: ArmLeaseNotification,
+    opts: { coalesce?: boolean } = {},
+  ): Promise<number> {
+    // Serialize emissions: signing is async (root-helper round trip), and two
+    // concurrent broadcasts completing out of call order would let an OLDER
+    // arm state overwrite `currentArmLease` and reach subscribers after a
+    // newer one (e.g. a heartbeat racing an operator revoke). The chain keeps
+    // call order = emit order; a failed emission never breaks the chain.
+    //
+    // `coalesce: true` marks a periodic-heartbeat emission: only the LATEST
+    // heartbeat state matters, so a heartbeat still queued behind a slow
+    // signer is replaced in place by a newer one (chain-depth bound, see
+    // `leaseEmitChain`). Operator arm/revoke and lifecycle emissions use the
+    // default and are NEVER coalesced away: each is a discrete state change
+    // the extension must observe in order.
+    if (opts.coalesce === true) {
+      const existing = this.pendingHeartbeatSlot;
+      if (existing) {
+        // Supersede in place: the queued link will sign + emit THIS payload
+        // instead. The superseded caller resolves with the coalesced
+        // emission's result.
+        existing.lease = lease;
+        return await existing.run;
+      }
+      const slot = {
+        lease,
+        run: Promise.resolve(0),
+      };
+      slot.run = this.leaseEmitChain.then(() => {
+        // The slot closes when its link starts running: a heartbeat arriving
+        // while THIS payload is being signed reflects newer state and must
+        // queue a fresh link, not mutate an in-flight body.
+        if (this.pendingHeartbeatSlot === slot) {
+          this.pendingHeartbeatSlot = null;
+        }
+        return this.emitSignedArmLease(slot.lease);
+      });
+      this.pendingHeartbeatSlot = slot;
+      this.leaseEmitChain = slot.run.then(
+        () => undefined,
+        () => undefined,
+      );
+      return await slot.run;
+    }
+    // Non-coalescible emission: seal any pending heartbeat slot so a LATER
+    // heartbeat cannot overwrite a payload queued at a chain position BEFORE
+    // this emission (that would emit post-revoke heartbeat state ahead of the
+    // revoke, reordering what the extension observes). The sealed link still
+    // emits its already-captured payload at its original position.
+    this.pendingHeartbeatSlot = null;
+    const run = this.leaseEmitChain.then(() => this.emitSignedArmLease(lease));
+    this.leaseEmitChain = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return await run;
+  }
+
+  private async emitSignedArmLease(lease: ArmLeaseNotification): Promise<number> {
+    const signed = await this.signArmLease(lease);
+    if (signed === null) {
+      return 0;
+    }
+    this.currentArmLease = signed;
     let emitted = 0;
     for (const conn of this.connections.values()) {
       if (!conn.registered) continue;
-      this.writeMessage(conn, lease);
+      this.writeMessage(conn, signed);
       emitted += 1;
     }
     return emitted;
+  }
+
+  /**
+   * Stamp and sign one arm-lease frame. Returns the frame to emit, or `null`
+   * when a configured signer failed (the caller must then emit nothing).
+   *
+   * The `updated_at` re-stamp is deliberate: the stamp is the daemon's LIVE
+   * attestation ("this arm state holds as of now"), which is what lets the
+   * extension bound lease age and reject a captured old frame. Signing an
+   * inbound producer's original stamp would re-attest stale state. Unsigned
+   * legacy path (no signer configured) is left byte-identical to the previous
+   * behavior so existing dev harnesses see no change.
+   */
+  private async signArmLease(
+    lease: ArmLeaseNotification,
+  ): Promise<ArmLeaseNotification | null> {
+    if (!this.leaseSigner) {
+      return lease;
+    }
+    // Strip any inbound signature fields before re-signing: the daemon signs
+    // what IT attests, never relays another producer's signature envelope.
+    const {
+      signing_key_id: _inboundKeyId,
+      lease_signature_b64url: _inboundSig,
+      ...body
+    } = lease;
+    const stampMs = Math.max(Date.now(), this.lastLeaseStampMs + 1);
+    this.lastLeaseStampMs = stampMs;
+    // Range-clamp the numeric fields BEFORE signing so the signature covers
+    // exactly the bytes on the wire (constants + derivations above). An
+    // out-of-range value would either fail the extension's UInt32 frame
+    // decode (lease starved) or trap its `interval * 2` dead-man math.
+    const clampedInterval = clampLeaseInt(
+      body.heartbeat_interval_seconds,
+      HEARTBEAT_INTERVAL_MIN_SECONDS,
+      HEARTBEAT_INTERVAL_MAX_SECONDS,
+    );
+    const clampedTtl =
+      body.ttl_seconds === null || body.ttl_seconds === undefined
+        ? body.ttl_seconds
+        : clampLeaseInt(body.ttl_seconds, 0, TTL_MAX_SECONDS);
+    if (
+      clampedInterval !== body.heartbeat_interval_seconds ||
+      clampedTtl !== body.ttl_seconds
+    ) {
+      // SAFETY: a clamped value is a producer defect; surface it on daemon
+      // stderr rather than silently normalizing (the emission still proceeds
+      // with the safe value so a config error cannot starve the lease).
+      // NO operator-socket value reaches this log line: only the CLAMPED
+      // numeric results and which field(s) tripped the clamp are logged, so a
+      // crafted wire value cannot forge daemon log lines (CodeQL log-injection
+      // sink stays free of the tainted `body.*` fields entirely).
+      const clampedFields = [
+        clampedInterval !== body.heartbeat_interval_seconds
+          ? "heartbeat_interval_seconds"
+          : null,
+        clampedTtl !== body.ttl_seconds ? "ttl_seconds" : null,
+      ].filter((f): f is string => f !== null);
+      // SAFETY: daemon signing diagnostics are operator-facing stderr output;
+      // only clamped numerics and fixed field names are interpolated (no
+      // operator-socket value reaches the sink).
+      console.error(
+        `[castle-wall] arm_lease numeric field(s) out of range; clamped before ` +
+          `signing (fields=${clampedFields.join(",")}; ` +
+          `heartbeat_interval_seconds=${clampedInterval}, ` +
+          `ttl_seconds=${clampedTtl ?? "null"})`,
+      );
+    }
+    const stamped: ArmLeaseNotification = {
+      ...body,
+      type: "arm_lease",
+      heartbeat_interval_seconds: clampedInterval,
+      ...(body.ttl_seconds === undefined ? {} : { ttl_seconds: clampedTtl }),
+      updated_at: new Date(stampMs).toISOString(),
+    };
+    try {
+      const canonicalBytes = new TextEncoder().encode(
+        canonicalize(armLeaseSignedBody(stamped)),
+      );
+      const signature = await this.leaseSigner.signLeaseBody(canonicalBytes);
+      return {
+        ...stamped,
+        signing_key_id: this.leaseSigner.signingKeyId,
+        lease_signature_b64url: toBase64url(signature),
+      };
+    } catch (err) {
+      this.stats.framesRejected += 1;
+      const reason = sanitizeLogValue(
+        err instanceof Error ? err.message : String(err),
+      );
+      // SAFETY: a dropped lease emission must surface on daemon stderr — the
+      // visible symptom downstream is the extension's dead-man firing.
+      console.error(
+        `[castle-wall] arm_lease signing failed; emission dropped (fail closed, no unsigned fallback): ${reason}`,
+      );
+      return null;
+    }
   }
 
   /**
@@ -617,7 +930,26 @@ export class MacOSFlowIpcListener {
     this.ensureSubscriberRegistered(state);
     await this.consumer.handleManifestSubscribe(request, state.subscriberId);
     if (this.currentArmLease) {
-      this.writeMessage(state, this.currentArmLease);
+      // Re-stamp + re-sign rather than replaying the stored frame: the
+      // extension bounds lease age, so a late subscriber served the ORIGINAL
+      // stamp would reject it as stale. A fresh signature is the daemon's live
+      // re-attestation of the current arm state. On signing failure nothing is
+      // sent (the heartbeat delivers the next signed lease). Rides the same
+      // serialization chain as `broadcastArmLease` so the resend cannot
+      // interleave with a concurrent broadcast and emit out-of-order stamps.
+      const run = this.leaseEmitChain.then(async () => {
+        if (!this.currentArmLease) return;
+        const resigned = await this.signArmLease(this.currentArmLease);
+        if (resigned !== null) {
+          this.currentArmLease = resigned;
+          this.writeMessage(state, resigned);
+        }
+      });
+      this.leaseEmitChain = run.then(
+        () => undefined,
+        () => undefined,
+      );
+      await run;
     }
   }
 
