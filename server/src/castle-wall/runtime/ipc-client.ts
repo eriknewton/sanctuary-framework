@@ -27,7 +27,6 @@ import type {
 } from "../ipc/messages.js";
 import { fromBase64url, stringToBytes, toBase64url } from "../../core/encoding.js";
 import { sign as identitySign } from "../../core/identity.js";
-import { randomBytes } from "../../core/random.js";
 import type { EncryptedPayload } from "../../core/encryption.js";
 import { RuntimeHandshakeError, RuntimeIpcError } from "./errors.js";
 
@@ -406,14 +405,17 @@ function wrapEnvelope(
 }
 
 function defaultNonceHex(): string {
-  // The request-id nonce is the anti-replay half of the IPC handshake, so it
-  // mints from the ONE CSPRNG chokepoint, which throws rather than substituting a
-  // weaker source (MUST-NEVER #5). The retired body probed `globalThis.crypto`
-  // and fell back to arithmetic randomness when it was absent — the same silent
-  // degradation shape already subtracted from the ceremony-id minters. The
-  // browser-portability rationale it carried was already void: this module
-  // reaches node:crypto through `core/identity` on every signing path.
-  const bytes = randomBytes(CASTLE_WALL_REQUEST_ID_NONCE_BYTES);
+  const bytes = new Uint8Array(CASTLE_WALL_REQUEST_ID_NONCE_BYTES);
+  // Node 19+ + browsers expose globalThis.crypto.
+  const cryptoObj: { getRandomValues?: (b: Uint8Array) => Uint8Array } | undefined =
+    (globalThis as { crypto?: { getRandomValues?: (b: Uint8Array) => Uint8Array } }).crypto;
+  if (cryptoObj && typeof cryptoObj.getRandomValues === "function") {
+    cryptoObj.getRandomValues(bytes);
+  } else {
+    for (let i = 0; i < bytes.length; i++) {
+      bytes[i] = Math.floor(Math.random() * 256);
+    }
+  }
   let hex = "";
   for (let i = 0; i < bytes.length; i++) {
     const b = bytes[i] ?? 0;

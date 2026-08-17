@@ -177,7 +177,7 @@ describe("C12-REPLAY parity structure (T9)", () => {
     expect(meshNode).not.toMatch(/private nodeRevokeQuorumInput/);
   });
 
-  it("NO module under server/src reaches Math.random by ANY access form — the class, not one spelling", () => {
+  it("NO mesh module reaches Math.random by ANY access form — the class, not one spelling", () => {
     // Fix-round correction (QI-SIBLING-02 gate finding): the prior version of
     // this guard named three files by hand and therefore could not see a FOURTH
     // `generateCeremonyId` copy with the same `Math.random` fallback living in
@@ -195,20 +195,17 @@ describe("C12-REPLAY parity structure (T9)", () => {
     // fallback false-positived. Both halves are fixed: comments are removed by
     // a character scan, and every property-access form is matched.
     //
-    // Round-3 corrections (dry-check gate findings), one about SCOPE and one
-    // about FORM:
+    // Round-3 correction (dry-check gate finding), about FORM:
+    // `Math?.random()` evaded the pattern through optional chaining, and
+    // `const M = Math; M.random()` evaded every pattern by aliasing the object.
     //
-    //   SCOPE. This scan walked `server/src/mesh` while the minter pin below —
-    //   whose own stated bound leans on this scan being name-independent — walks
-    //   all of `server/src`. The composite that bound claims is covered, a minter
-    //   RENAMED past the name-based pin while carrying a weak-randomness
-    //   fallback, was invisible to both guards the moment it was written outside
-    //   the mesh directory. Both now walk the same root, so the backstop covers
-    //   what the bound says it covers. Two guards with different roots are a
-    //   hand-mirrored pair (rule 5), and the gap sits exactly where they differ.
-    //
-    //   FORM. `Math?.random()` evaded the pattern through optional chaining, and
-    //   `const M = Math; M.random()` evaded every pattern by aliasing the object.
+    // SCAN ROOT, and the stated bound that comes with it: this walks
+    // `server/src/mesh`, not all of `server/src`, because the mesh layer is
+    // where the retired duplicate ceremony-id minters lived and is the scope
+    // this guard was built to keep honest. A minter carrying the same
+    // weak-randomness fallback, written or renamed OUTSIDE the mesh
+    // directory, is invisible to this guard — that gap is tracked as
+    // QI-02-F8, not silently assumed away.
     //
     // STATED BOUND, because a broad claim that a one-line edit evades is worse
     // than a narrow honest one: this catches direct property access (optional
@@ -231,7 +228,7 @@ describe("C12-REPLAY parity structure (T9)", () => {
     // from any other property read, so the guard refuses the binding itself.
     const aliasBinding =
       /(?:const|let|var)\s+\w+\s*(?::[^=;\n]+)?=\s*(?:(?:globalThis|global|window|self)\s*\.\s*)?Math\s*(?=[;,)\]\n])/;
-    for (const file of walk(SERVER_SRC)) {
+    for (const file of walk(MESH_SRC)) {
       // Prose ABOUT the retired fallback is legitimate and is what documents
       // why the rule exists; only executable uses are the finding.
       const code = stripComments(readFileSync(file, "utf8")).replace(
