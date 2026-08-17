@@ -210,7 +210,7 @@ function findStorageBackendImplementationOffenders(source: string, path: string)
     /\basync\s+write\s*\([^)]*\)\s*(?::\s*Promise<void>)?/g,
   );
   for (const rawWrite of rawWriteBlocks) {
-    if (!storageWriteBlockUsesSdwGuard(rawWrite)) {
+    if (!storageWriteBlockUsesSdwGuard(rawWrite) && !writeBlockRefusesUnconditionally(rawWrite)) {
       offenders.push(`${path}: StorageBackend.write does not enforce the SDW raw-write gate`);
     }
   }
@@ -220,7 +220,10 @@ function findStorageBackendImplementationOffenders(source: string, path: string)
     /\basync\s+writeDurable\s*\([^)]*\)\s*(?::\s*Promise<void>)?/g,
   );
   for (const durableWrite of durableWriteBlocks) {
-    if (!storageWriteBlockUsesSdwGuard(durableWrite)) {
+    if (
+      !storageWriteBlockUsesSdwGuard(durableWrite) &&
+      !writeBlockRefusesUnconditionally(durableWrite)
+    ) {
       offenders.push(`${path}: writeDurable does not enforce the SDW raw-write gate`);
     }
   }
@@ -241,6 +244,27 @@ function findSdwNamespacePathExposureOffenders(source: string, path: string): st
     }
   }
   return offenders;
+}
+
+/**
+ * A write body that REFUSES every write, whatever the namespace, satisfies the
+ * property this gate protects (no raw SDW write escapes authorization) more
+ * strongly than calling the gate would: there is no write at all. Requiring the
+ * gate call there would mean running an authorization check in front of an
+ * unconditional refusal, which reads as though some write might proceed.
+ *
+ * Deliberately narrow, so it cannot launder a real write path. The body, with
+ * comments removed, must be exactly one `throw new X(...)` statement and
+ * nothing else; any assignment, call, or branch before the throw fails it.
+ */
+function writeBlockRefusesUnconditionally(block: string): boolean {
+  const body = block
+    .replace(/^\s*\{/, "")
+    .replace(/\}\s*$/, "")
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/\/\/[^\n]*/g, "")
+    .trim();
+  return /^throw\s+new\s+[A-Za-z_$][\w$]*\s*\([\s\S]*\)\s*;?$/.test(body);
 }
 
 function storageWriteBlockUsesSdwGuard(block: string): boolean {

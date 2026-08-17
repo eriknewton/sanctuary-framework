@@ -26,6 +26,7 @@
  * landed, and never downgraded to a warning.
  */
 
+import { isSdwNamespace } from "../sdw/write-gate.js";
 import type {
   FilesystemStorageCapabilities,
   StorageBackend,
@@ -176,6 +177,13 @@ export class ReadOnlyStorageGuard
    * only file contents.
    */
   namespacePath(namespace: string): string {
+    // Refused here as well as by the wrapped backend, not instead of it. A
+    // decorator that only forwarded would inherit whatever it happens to wrap,
+    // and holding a property regardless of what it wraps is this class's whole
+    // purpose. Must match the same refusal in `FilesystemStorage.namespacePath`.
+    if (isSdwNamespace(namespace)) {
+      throw new Error("Filesystem paths for SDW namespaces are not exposed");
+    }
     const fn = this.innerCapabilities.namespacePath;
     if (typeof fn !== "function") {
       throw new Error(
