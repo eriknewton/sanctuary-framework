@@ -13,14 +13,30 @@
  * read) and a contents-only hash would call that unchanged.
  */
 
-import { chmod, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
-import { createHash } from "node:crypto";
-import { tmpdir } from "node:os";
+import { chmod, mkdtemp, readFile, readdir, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { createHash, randomBytes } from "node:crypto";
+import { homedir, hostname, tmpdir, userInfo } from "node:os";
 import { join, relative } from "node:path";
+import { gcm } from "@noble/ciphers/aes.js";
+import { hkdf } from "@noble/hashes/hkdf";
+import { sha256 } from "@noble/hashes/sha256";
 import { Writable } from "node:stream";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { AuditLog } from "../../src/operational/audit-log.js";
+import { encrypt } from "../../src/core/encryption.js";
+import {
+  deriveMasterKey,
+  derivePurposeKey,
+} from "../../src/core/key-derivation.js";
+import { stringToBytes } from "../../src/core/encoding.js";
+import {
+  AUDIT_SIGNING_HEAD_KEY,
+  AUDIT_SIGNING_LATCH_V2_KEY,
+  CHECKPOINT_NAMESPACE,
+  appendCriticalEntries,
+  seedStoredIdentity,
+} from "../helpers/signing-fixture.js";
 import {
   AUDIT_DAEMON_NAMESPACE,
   createDaemonAuditLog,
@@ -338,6 +354,172 @@ describe("audit-chain repair-plan", () => {
     );
     // And nothing is lost by refusing it: the findings still reach the operator.
     expect(plan?.chain_state.findings.length).toBeGreaterThan(0);
+  });
+
+  it("does not rewrite a legacy-format fallback passphrase file it reads custody from", async () => {
+    // The one custody source every other test in this file bypasses (they all
+    // inject SANCTUARY_PASSPHRASE): a stored fallback file in the LEGACY
+    // format, whose read path normally performs an in-place format-upgrade
+    // rewrite with a fresh nonce. That rewrite goes through the filesystem,
+    // not the StorageBackend, so the read-only storage guard cannot see it;
+    // only `readStoredPassphrase`'s own read-only option stops it. This test
+    // runs the verb with NO env passphrase so custody MUST come from that
+    // file, and proves the file (and the whole fortress) stays byte-identical.
+    const fortressPath = await seededFortress();
+
+    // Mirror of `deriveMachineKey` — must match `deriveMachineKey` in
+    // `src/wrap/passphrase.ts` (hostname:uid:username:home, HKDF-SHA256,
+    // info "sanctuary-passphrase-v1", 32 bytes), or the planted file will not
+    // decrypt and the verb will fail for the wrong reason.
+    const info = userInfo();
+    const machineKey = hkdf(
+      sha256,
+      Buffer.from(`${hostname()}:${info.uid}:${info.username}:${homedir()}`, "utf-8"),
+      undefined,
+      "sanctuary-passphrase-v1",
+      32
+    );
+    // Legacy format: raw 12-byte nonce + GCM ciphertext, no JSON envelope, no
+    // AAD — the exact shape `readFromFallbackFile` classifies `legacy: true`.
+    const nonce = randomBytes(12);
+    const ciphertext = gcm(machineKey, nonce).encrypt(
+      Buffer.from(PASSPHRASE, "utf-8")
+    );
+    await writeFile(
+      join(fortressPath, "passphrase.enc"),
+      Buffer.concat([nonce, Buffer.from(ciphertext)]),
+      { mode: 0o600 }
+    );
+
+    const before = await fortressTreeHash(fortressPath);
+
+    const out = new CaptureStream();
+    const err = new CaptureStream();
+    // No SANCTUARY_PASSPHRASE: custody resolution must READ the planted file.
+    const code = await runAuditChainRepairPlan([], {
+      out,
+      err,
+      env: { SANCTUARY_STORAGE_PATH: fortressPath },
+    });
+
+    expect(code).toBe(REPAIR_PLAN_EXIT_CLEAN);
+    // The load-bearing assertion: reading custody upgraded nothing in place.
+    expect(await fortressTreeHash(fortressPath)).toBe(before);
+  });
+
+  it("suppresses the signing-state recovery writes on a store missing its latch and head, and says so truthfully", async () => {
+    // The tampered class this verb exists for: signed checkpoints survive but
+    // the latch and head control records are gone. A writer's load path would
+    // RECOVER here — a write batch whose preamble (namespace mkdir, stale
+    // acquire-temp sweep, lock create/unlink) is raw filesystem work the
+    // storage guard can never see. The read-only AuditLog configuration must
+    // suppress that entire path, and the findings it reports must describe a
+    // read-only run (no claim that a marker was latched or a floor re-armed).
+    const fortressPath = await seededFortress();
+    const storage = new FilesystemStorage(join(fortressPath, "state"));
+    const { masterKey } = await establishMaster({ storage, passphrase: PASSPHRASE });
+    const { storedIdentity } = await seedStoredIdentity(storage, masterKey);
+    const writer = new AuditLog(storage, masterKey, { checkpointInterval: 1 });
+    await appendCriticalEntries(writer, 3, storedIdentity.identity_id);
+    masterKey.fill(0);
+
+    // The tamper: delete both signing control records over surviving signed
+    // evidence — exactly the state that arms latch AND head recovery.
+    await storage.delete(CHECKPOINT_NAMESPACE, AUDIT_SIGNING_LATCH_V2_KEY);
+    await storage.delete(CHECKPOINT_NAMESPACE, AUDIT_SIGNING_HEAD_KEY);
+
+    // A canary for the sweep: an orphaned acquire-temp old enough that the
+    // recovery path's once-per-process sweep would unlink it. Its survival is
+    // direct evidence the lock preamble never ran.
+    const staleTemp = join(
+      fortressPath,
+      "state",
+      "_audit",
+      ".audit-write.lock.acquire.424242.tmp"
+    );
+    await writeFile(staleTemp, "orphaned-acquire-temp", "utf8");
+    await utimes(staleTemp, new Date("2000-01-01"), new Date("2000-01-01"));
+
+    const before = await fortressTreeHash(fortressPath);
+
+    const { code, plan } = await runPlan(fortressPath);
+
+    // The primary property first: nothing was recovered, swept, locked, or
+    // mkdir'd. The canary is asserted by name so a failure says "the sweep
+    // ran", not just "something changed".
+    expect(await fortressTreeHash(fortressPath)).toBe(before);
+    await expect(readFile(staleTemp, "utf8")).resolves.toBe("orphaned-acquire-temp");
+    expect(
+      await storage.read(CHECKPOINT_NAMESPACE, AUDIT_SIGNING_LATCH_V2_KEY)
+    ).toBeNull();
+    expect(
+      await storage.read(CHECKPOINT_NAMESPACE, AUDIT_SIGNING_HEAD_KEY)
+    ).toBeNull();
+
+    // The condition is still REPORTED (that is the verb's whole job) …
+    expect(code).toBe(REPAIR_PLAN_EXIT_PLAN_PRODUCED);
+    const kinds = plan?.chain_state.findings.map((finding) => finding.kind) ?? [];
+    expect(kinds).toContain("checkpoint_signing_floor_recovered");
+    expect(kinds).toContain("checkpoint_signing_head_recovered");
+    // … and reported TRUTHFULLY: a read-only run must not claim writes that
+    // were suppressed.
+    const recoveryMessages = (plan?.chain_state.findings ?? [])
+      .filter((finding) => String(finding.kind).endsWith("_recovered"))
+      .map((finding) => finding.message);
+    expect(recoveryMessages.length).toBeGreaterThan(0);
+    for (const message of recoveryMessages) {
+      expect(message).toContain("performs no recovery writes");
+      expect(message).not.toMatch(/latches|re-arms|re-creates/);
+    }
+  });
+
+  it("exits 1 without mutating when the guard refuses a custody migration on a legacy fortress", async () => {
+    // The `ReadOnlyStorageViolationError` exit path over an EXISTING fortress:
+    // a pure-legacy custody layout (key-params + evidence, no envelope) makes
+    // `establishMaster` attempt the in-place envelope migration, which the
+    // guard refuses. The verb must report the refusal as ITS OWN defect
+    // class, exit 1, and leave the fortress byte-identical — never render the
+    // refusal as a verdict about the chain.
+    const fortressPath = await mkdtemp(join(tmpdir(), "sanctuary-repair-plan-legacy-"));
+    tempDirs.push(fortressPath);
+    const storage = new FilesystemStorage(join(fortressPath, "state"));
+    const { key: legacyMaster, params } = await deriveMasterKey(PASSPHRASE);
+    await storage.write(
+      "_meta",
+      "key-params",
+      stringToBytes(JSON.stringify(params))
+    );
+    // One decryptable identity = the migration evidence that pushes
+    // establishMaster past its defer branch and INTO the envelope write.
+    const idKey = derivePurposeKey(legacyMaster, "identity-encryption");
+    await storage.write(
+      "_identities",
+      "seed",
+      stringToBytes(
+        JSON.stringify(encrypt(stringToBytes('{"identity_id":"seed"}'), idKey))
+      )
+    );
+    legacyMaster.fill(0);
+
+    const before = await fortressTreeHash(fortressPath);
+
+    const out = new CaptureStream();
+    const err = new CaptureStream();
+    const code = await runAuditChainRepairPlan([], {
+      out,
+      err,
+      env: ENV(fortressPath),
+    });
+
+    expect(code).toBe(REPAIR_PLAN_EXIT_STATE_UNREADABLE);
+    expect(out.text()).toBe("");
+    // The message blames the COMMAND, not the fortress, and states nothing
+    // changed — the operator holding a damaged fortress must not read this as
+    // one more damage verdict.
+    expect(err.text()).toContain("was refused");
+    expect(err.text()).toContain("nothing was changed");
+
+    expect(await fortressTreeHash(fortressPath)).toBe(before);
   });
 
   it("runs offline: no server is constructed and no port is opened", async () => {

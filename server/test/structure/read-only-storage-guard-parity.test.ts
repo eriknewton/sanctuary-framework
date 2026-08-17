@@ -40,7 +40,14 @@ const GUARDED_INTERFACES = ["StorageBackend", "FilesystemStorageCapabilities"];
  *
  * Deliberately source-text based, like the repo's other structural guards, so
  * it fails at authoring time. It reads the brace-balanced body of the named
- * interface and matches `name(` / `name?(` at a declaration position.
+ * interface and matches BOTH member spellings TypeScript allows for a
+ * function-shaped member at a declaration position: method style (`name(` /
+ * `name?(`) and property style (`name: (…) => …` / `name?: (…) => …`). A
+ * parser that saw only the method style would let a mutating member declared
+ * property-style join the interface unclassified — the exact drift this test
+ * exists to refuse — so the property branch requires the `(` right after the
+ * colon that marks a function type, keeping data members (`key: string`)
+ * unmatched.
  */
 function interfaceMethodNames(source: string, interfaceName: string): string[] {
   const header = new RegExp(`interface\\s+${interfaceName}\\s*{`).exec(source);
@@ -63,7 +70,13 @@ function interfaceMethodNames(source: string, interfaceName: string): string[] {
   if (end === -1) throw new Error(`unbalanced braces in ${interfaceName}`);
   const body = source.slice(start, end);
   const names = new Set<string>();
-  for (const match of body.matchAll(/(?:^|\n)\s*([A-Za-z_$][\w$]*)\??\s*\(/g)) {
+  // Two alternatives, one per member spelling: `name(` / `name?(` (method
+  // style) and `name: (` / `name?: (` (property style holding a function
+  // type). The `\(` after the colon is what keeps non-function properties
+  // out of the set.
+  for (const match of body.matchAll(
+    /(?:^|\n)\s*([A-Za-z_$][\w$]*)\??\s*(?::\s*)?\(/g
+  )) {
     names.add(match[1]!);
   }
   return [...names];

@@ -19,10 +19,16 @@
  *     state, not the OS keyring. This is enforced structurally: every storage
  *     call goes through a {@link ReadOnlyStorageGuard} whose write paths throw,
  *     and custody is read through `readStoredPassphrase` (which never mints a
- *     keyring item) rather than `getOrCreatePassphrase`. Convention alone would
- *     not hold here, because the machinery this verb reaches (the audit log's
- *     load path, the sealed-region walk, custody unwrap) writes on some of its
- *     paths and does not announce it at the call site.
+ *     keyring item) rather than `getOrCreatePassphrase`. Two reachable write
+ *     paths bypass the StorageBackend and are therefore refused by their own
+ *     read-only declarations rather than the guard: the audit log's
+ *     signing-state recovery batch (raw filesystem calls; suppressed by the
+ *     AuditLog `readOnly` config) and the legacy fallback-file format-upgrade
+ *     rewrite inside `readStoredPassphrase` (skipped under its `readOnly`
+ *     option). Convention alone would not hold here, because the machinery
+ *     this verb reaches (the audit log's load path, the sealed-region walk,
+ *     custody unwrap) writes on some of its paths and does not announce it at
+ *     the call site.
  *
  *     The guard is not decorative: loading a chain that HAS findings attempts
  *     one write of its own, appending to the operator-facing integrity-alert
@@ -260,14 +266,18 @@ export interface AuditChainRepairPlan {
  * verifier's `rotation_anchor_scope`: a fixed sentence in the output, so a
  * reader cannot mistake the digest for something it is not.
  */
+// Non-disclosure (MUST-NEVER #9): this string ships in public source and is
+// stamped into every operator report, so it states the generic capability
+// bound only (the same bound REPAIR_PLAN_BOUNDS carries) plus a bare register
+// id that resolves only in the private register. It must never describe a
+// mechanism by which a chain could be altered.
 export const REPAIR_PLAN_EVIDENCE_SCOPE =
   "The evidence commitment is a digest over the observed finding set and the " +
   "export this fortress would produce. It is not a signature, it is not an " +
-  "authorization, and it is not evidence that the chain is intact: a chain " +
-  "with no findings can still have had a suffix deleted and rebuilt locally " +
-  "(register id AUDIT-CHAIN-SUFFIX-REBUILD). It is reproducible, so two runs " +
-  "over an unchanged fortress agree, and a later run that disagrees proves " +
-  "the chain changed in between.";
+  "authorization, and it is not evidence that the chain is intact: absence " +
+  "of findings is not evidence of an untampered chain (register id " +
+  "ABC-EVID-01). It is reproducible, so two runs over an unchanged fortress " +
+  "agree, and a later run that disagrees proves the chain changed in between.";
 
 /**
  * Bounds every report carries. These are capability bounds (what is absent,
@@ -547,9 +557,15 @@ async function resolveMasterKeyReadOnly(opts: {
     return result.masterKey;
   }
 
+  // `readOnly` is part of this verb's no-mutation contract, not an
+  // optimization: without it, reading custody from a legacy-format fallback
+  // file performs an in-place format-upgrade rewrite of
+  // `<fortress>/passphrase.enc` — a write the storage guard cannot see
+  // because it goes through the filesystem, not the StorageBackend.
   const passphrase =
     env.SANCTUARY_PASSPHRASE ??
-    (await readStoredPassphrase({ storagePath: fortressPath }))?.value;
+    (await readStoredPassphrase({ storagePath: fortressPath, readOnly: true }))
+      ?.value;
   if (!passphrase) {
     throw new Error(
       "no stored fortress passphrase is readable here, and this command will " +
@@ -647,9 +663,14 @@ export async function runAuditChainRepairPlan(
     });
 
     // Lenient: findings must be SURFACED, not thrown. A strict log would throw
-    // on exactly the chains this verb exists to describe.
+    // on exactly the chains this verb exists to describe. `readOnly` closes
+    // the one write path the storage guard cannot: the load path's
+    // signing-state recovery batch reaches raw filesystem calls (namespace
+    // mkdir, stale-temp sweep, lock create/unlink) that bypass the
+    // StorageBackend entirely, so only the audit log itself can refuse them.
     const auditLog = new AuditLog(guardedStorage, masterKey, {
       integrityMode: "lenient",
+      readOnly: true,
     });
     const findings = await auditLog.getIntegrityFindings();
     const sealedRegion = await auditLog.verifySealedRegion();

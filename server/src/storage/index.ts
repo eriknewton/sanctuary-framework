@@ -17,6 +17,12 @@ export {
 export { FilesystemStorage } from "./filesystem.js";
 export { MemoryStorage } from "./memory.js";
 export {
+  READ_ONLY_STORAGE_DELEGATED_METHODS,
+  READ_ONLY_STORAGE_MUTATING_METHODS,
+  ReadOnlyStorageGuard,
+  ReadOnlyStorageViolationError,
+} from "./read-only-guard.js";
+export {
   withCrossProcessLock,
   CrossProcessLockError,
   CROSS_PROCESS_LOCK_TIMEOUT_MS,

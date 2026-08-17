@@ -254,6 +254,23 @@ export interface AuditLogConfig {
   /** Verify chain failures by throwing (strict) or surfacing findings (lenient). */
   integrityMode?: "strict" | "lenient";
   /**
+   * Declared-read-only instance (a diagnostic reader, never a writer). Two
+   * effects, both subtractions: (1) the signing-state recovery/self-heal
+   * write batch that the LOAD path can trigger on a damaged store is
+   * suppressed entirely — the recovery CONDITION is still surfaced as
+   * findings, worded so they never claim a write happened; (2)
+   * {@link withAuditWriteLock} REFUSES (throws) instead of running its
+   * raw-filesystem preamble (namespace mkdir, stale-temp sweep, lock
+   * create/unlink) — those writes go through the filesystem, not the
+   * StorageBackend, so a read-only storage decorator cannot see them, and a
+   * declared read-only load has no business on any write path at all
+   * (MUST-NEVER #5: refuse loudly, never proceed quietly). Production
+   * writers (the server, the daemon) never set this; recovery/self-heal
+   * behavior there is unchanged. Set by the offline audit-chain repair-plan
+   * verb, whose no-mutation contract covers the whole fortress directory.
+   */
+  readOnly?: boolean;
+  /**
    * F2 Option A (fortress audit store split by writer): whether this
    * instance's load path should consult the on-disk "split boundary" record
    * (see the module doc comment near {@link AUDIT_SPLIT_BOUNDARY_DIRNAME})
@@ -2100,6 +2117,8 @@ export class AuditLog {
    */
   private readonly maxInMemoryEntries: number;
   private readonly integrityMode: "strict" | "lenient";
+  /** See {@link AuditLogConfig.readOnly}. */
+  private readonly readOnly: boolean;
   private readonly checkpointInterval: number;
   private readonly checkpointSigner: (
     payload: AuditCheckpointSigningPayload
@@ -2250,6 +2269,10 @@ export class AuditLog {
       MIN_IN_MEMORY_ENTRY_FLOOR
     );
     this.integrityMode = config?.integrityMode ?? "strict";
+    // Absence yields the writer behavior (rule 3): only an explicit opt-in
+    // makes an instance read-only, so no production composition root can be
+    // silently demoted by a forgotten field.
+    this.readOnly = config?.readOnly ?? false;
     this.checkpointInterval =
       config?.checkpointInterval ?? DEFAULT_CHECKPOINT_INTERVAL;
     // IC-05 enforcement site (AGENTS.md assurance rule 3): the checkpoint
@@ -4541,6 +4564,21 @@ export class AuditLog {
   private async withAuditWriteLock<T>(
     operation: (signal: AuditWriteLockAbortSignal) => Promise<T>
   ): Promise<T> {
+    // A declared read-only instance refuses the whole write path here, BEFORE
+    // the raw-filesystem preamble below (namespace mkdir, stale-temp sweep,
+    // lock create/unlink). Those writes bypass the StorageBackend, so a
+    // read-only storage decorator can never catch them; this is the one site
+    // that can. Refusal, not a silent no-op (MUST-NEVER #5): a caller that
+    // reaches a write path on a read-only load is a defect in that caller,
+    // and running `operation` without the lock would let a writable backend
+    // mutate unserialized.
+    if (this.readOnly) {
+      throw new Error(
+        "audit-log: this instance was constructed read-only and refuses its " +
+          "cross-process write path; a declared read-only load must not " +
+          "reach any audit write"
+      );
+    }
     const signal: AuditWriteLockAbortSignal = { aborted: false };
     if (!this.auditWriteLockPath) return operation(signal);
 
@@ -6521,23 +6559,33 @@ export class AuditLog {
         this.signingRecoveryThisLoad = true;
         findings.push({
           kind: "checkpoint_signing_floor_recovered",
-          message:
-            "signed checkpoints exist but the signing latch is absent (a swallowed " +
-            "first write, or a deletion); this pass fails strict-closed, latches a " +
-            "permanent recovery marker, and " +
-            (coverageVeto
-              ? "does NOT re-arm (coverage findings veto stamping)"
-              : "re-arms at the observed floor"),
+          // The finding's message must describe what THIS instance actually
+          // does: a read-only load observes the condition and writes nothing,
+          // so it must not claim a marker was latched or a floor re-armed.
+          message: this.readOnly
+            ? "signed checkpoints exist but the signing latch is absent (a swallowed " +
+              "first write, or a deletion); this read-only load records the " +
+              "observation only and performs no recovery writes"
+            : "signed checkpoints exist but the signing latch is absent (a swallowed " +
+              "first write, or a deletion); this pass fails strict-closed, latches a " +
+              "permanent recovery marker, and " +
+              (coverageVeto
+                ? "does NOT re-arm (coverage findings veto stamping)"
+                : "re-arms at the observed floor"),
         });
       }
       if (headRecoveryDue) {
         this.signingRecoveryThisLoad = true;
         findings.push({
           kind: "checkpoint_signing_head_recovered",
-          message:
-            "the signing head is absent while signing evidence survives (deletion, or a " +
-            "loudly-diagnosed ensure failure); this pass fails strict-closed and " +
-            "re-creates the head with a permanent latched marker",
+          // Same truthfulness rule as the latch finding above.
+          message: this.readOnly
+            ? "the signing head is absent while signing evidence survives (deletion, or a " +
+              "loudly-diagnosed ensure failure); this read-only load records the " +
+              "observation only and performs no recovery writes"
+            : "the signing head is absent while signing evidence survives (deletion, or a " +
+              "loudly-diagnosed ensure failure); this pass fails strict-closed and " +
+              "re-creates the head with a permanent latched marker",
         });
       }
 
@@ -6553,7 +6601,12 @@ export class AuditLog {
           head.data.lowest_signed_checkpoint_sequence === null ||
           (earliestVerified !== null &&
             earliestVerified < head.data.lowest_signed_checkpoint_sequence));
-      if (latchRecoveryDue || headRecoveryDue || selfHealDue) {
+      // Read-only suppression: the recovery/self-heal batch is the ONE write
+      // path the LOAD itself can trigger, so a declared read-only reader must
+      // stop it here — before `withAuditWriteLock`'s raw-filesystem preamble,
+      // which no storage-level guard can see. The findings above still
+      // surface the condition; only the writes are subtracted.
+      if ((latchRecoveryDue || headRecoveryDue || selfHealDue) && !this.readOnly) {
         await this.performSigningRecoveryWrites({
           latchRecoveryDue,
           headRecoveryDue,

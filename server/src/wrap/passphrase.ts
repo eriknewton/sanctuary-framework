@@ -103,6 +103,18 @@ export interface PassphraseOptions {
    * host/user migration). Production callers leave this undefined.
    */
   deriveMachineKey?: (home: string) => Uint8Array;
+  /**
+   * Declared-read-only caller: perform NO writes of any kind while reading.
+   * Honored by {@link readStoredPassphrase}, whose one write path is the
+   * in-place upgrade of a legacy-format fallback file to the current
+   * envelope; under this flag that upgrade is skipped and the file is left
+   * byte-identical. Read-only diagnostics (the audit-chain repair-plan verb)
+   * MUST set this: their no-mutation contract covers the whole fortress
+   * directory, and `passphrase.enc` lives inside it. Meaningless to
+   * {@link getOrCreatePassphrase}, which exists to mint custody and never
+   * takes this flag.
+   */
+  readOnly?: boolean;
 }
 
 export type ExistingCustodyMaterialStatus = "present" | "absent" | "unknown";
@@ -372,7 +384,13 @@ export async function readStoredPassphrase(
   const fallback = fallbackFilePath(home, storagePath);
   const fromFile = await readFromFallbackFile(fallback, home, derive);
   if (fromFile.status === "ok") {
-    if (fromFile.legacy) {
+    // A legacy-format file is normally upgraded in place here (fresh nonce,
+    // current envelope). A caller that declared itself read-only must not
+    // trigger that rewrite: "read the stored passphrase" and "modernize the
+    // file holding it" are different authorities, and a diagnostic holds
+    // only the first. The value read is identical either way; only the
+    // at-rest format upgrade is deferred to the next non-read-only caller.
+    if (fromFile.legacy && !opts.readOnly) {
       await writeToFallbackFile(fallback, fromFile.value, home, derive);
     }
     return {
