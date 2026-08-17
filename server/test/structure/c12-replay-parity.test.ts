@@ -396,6 +396,62 @@ describe("C12-REPLAY parity structure (T9)", () => {
     expect(applySyncBody).toMatch(/mode:\s*"sync_anchored"/);
   });
 
+  it("TZ-WINDOW-01: every timestamp in the shared module goes through the ONE strict predicate", () => {
+    // The defect class this pins shut: a timestamp field validated with a bare
+    // `Date.parse` finiteness test accepts an offset-less date-time, which the
+    // ECMAScript parser resolves against the READER's local zone — so one signed
+    // window means a different absolute interval on every node. A per-field or
+    // per-ceremony copy of the strict check is the hand-mirror shape rule 5
+    // forbids, so the pin is "one call site", not "each site looks right".
+    const src = read("server/src/mesh/guardian/revoke-quorum-input.ts");
+    const predicateStart = src.indexOf(
+      "export function parseIsoInstantWithOffset"
+    );
+    expect(predicateStart).toBeGreaterThan(0);
+    // The predicate ends where the next top-level export begins.
+    const predicateEnd = src.indexOf("export ", predicateStart + 1);
+    expect(predicateEnd).toBeGreaterThan(predicateStart);
+
+    const parseCalls = [...src.matchAll(/Date\.parse\s*\(/g)].map(
+      (m) => m.index ?? -1
+    );
+    expect(
+      parseCalls.length,
+      `expected exactly one Date.parse in the shared module, found ${parseCalls.length}`
+    ).toBe(1);
+    expect(parseCalls[0]).toBeGreaterThan(predicateStart);
+    expect(parseCalls[0]).toBeLessThan(predicateEnd);
+
+    // Each of the four timestamp fields reaches the predicate by name. A bare
+    // occurrence COUNT asserts arity, not identity: a refactor that dropped the
+    // rotated_at call and added a second call on some other field would still
+    // count 5 and stay green, which is exactly the defect shape this PR exists
+    // to fix (a check that looks field-by-field but is actually a count). So
+    // this asserts the four call-site argument spellings are ALL present, not
+    // just that five calls exist.
+    const predicateCallMatches = [
+      ...src.matchAll(/parseIsoInstantWithOffset\s*\(/g),
+    ];
+    const predicateCallArgs = predicateCallMatches.map((m) => {
+      const openIndex = (m.index ?? 0) + m[0].length - 1;
+      return sliceBalancedCall(src, openIndex);
+    });
+    // 1 definition (`(value: string)`) + 4 call sites: initiated_at,
+    // expires_at, effective_at, rotated_at.
+    expect(predicateCallArgs.length).toBe(5);
+    for (const argSpelling of [
+      "initiatedAt",
+      "expiresAt",
+      "freshness.effective_at",
+      "params.rotated_at",
+    ]) {
+      expect(
+        predicateCallArgs.some((call) => call.includes(argSpelling)),
+        `no parseIsoInstantWithOffset call site passes ${argSpelling}`
+      ).toBe(true);
+    }
+  });
+
   it("no second freshness-assertion or ceremony-id generator exists under server/src", () => {
     const files = walk(SERVER_SRC);
     const sharedModule = join(MESH_SRC, "guardian", "revoke-quorum-input.ts");

@@ -2,8 +2,9 @@
  * C12-REPLAY — v2 guardian quorum-input freshness.
  *
  * This module is the SINGLE source of truth for the canonical bytes a guardian
- * quorum signs, plus the relying-side freshness enforcement (AGENTS.md rule 10)
- * and the element-level parser (rules 5/11). Despite the file name it is NOT
+ * quorum signs, plus the relying-side freshness enforcement (AGENTS.md rule 10),
+ * the element-level parser (rules 5/11), and the one strict timestamp predicate
+ * every window field is read through (TZ-WINDOW-01). Despite the file name it is NOT
  * revoke-only: the collection context and the freshness assertion are
  * input-agnostic by construction, and three ceremonies now share them — node
  * revoke (C12-REPLAY), device-recovery intent (QI-SIBLING-01), and master
@@ -129,6 +130,60 @@ const CEREMONY_ID_BYTES = 16;
 const CEREMONY_ID_HEX_CHARS = CEREMONY_ID_BYTES * 2;
 const CEREMONY_ID_HEX_RE = /^[0-9a-f]{32}$/;
 
+/**
+ * TZ-WINDOW-01 — the accepted form of EVERY timestamp field in this module:
+ * ISO-8601 extended date-time with a MANDATORY UTC designator (`Z`) or numeric
+ * offset (`±HH:MM`).
+ *
+ * WHY the offset is mandatory and not cosmetic: a date-time with no offset is
+ * resolved by the ECMAScript parser against the RECEIVER's local zone, so the
+ * same signed bytes denote a DIFFERENT absolute instant on every node in the
+ * fleet, and the absolute window slides by the width of the inhabited offset
+ * range. That hands the signer partial control over its own trust duration,
+ * which is the exact property the freshness machinery exists to remove
+ * (AGENTS.md rule 10). A relying party must read one absolute instant or refuse;
+ * refusing is the fail-closed half of MUST-NEVER #5.
+ *
+ * Accepts:  `2026-08-16T00:00:00Z`, `2026-08-16T00:00:00.000Z`,
+ *           `2026-08-16T00:00:00+05:30`, `2026-08-16T00:00:00.123456789-08:00`.
+ * Rejects:  an offset-less date-time (`2026-08-16T00:00:00`, the ambiguous
+ *           case), a bare year (`2026`), a date only (`2026-08-16`), a
+ *           human-readable date (`Aug 16 2026`), a space date/time separator,
+ *           a missing seconds field, and the BASIC-format offset `+0000`.
+ *
+ * Extended-format offsets only, deliberately: every producer of these fields in
+ * this tree mints them with `Date.prototype.toISOString`, which emits `Z`, so
+ * accepting more spellings widens the parse surface without serving any caller
+ * that exists. The non-offset rejections carry no ambiguity risk of their own;
+ * they are refused because a parser that shrugs at `2026` while its failure
+ * reason reads `*_not_iso` hides the real gap from the next reader.
+ *
+ * `\d{1,9}` fractional digits = one digit through nanosecond precision;
+ * `toISOString` emits exactly 3.
+ */
+const ISO_INSTANT_WITH_OFFSET_RE =
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/;
+
+/**
+ * Parse a timestamp field to epoch milliseconds, or `undefined` when it is not
+ * a strict ISO-8601 instant carrying an offset.
+ *
+ * The ONE predicate every timestamp in this module funnels through (rule 5):
+ * the parser's `initiated_at`/`expires_at`, the master-rotation `rotated_at`
+ * bound, and the sync-anchored `effective_at` all call this rather than
+ * re-testing the pattern locally, so a fourth timestamp field cannot acquire a
+ * looser rule by being written somewhere else. A per-ceremony copy of this check
+ * would be the hand-mirror shape rule 5 exists to forbid.
+ *
+ * The shape check does NOT subsume the range check: `2026-13-45T00:00:00Z`
+ * matches the pattern and still parses to `NaN`, so the finite test stays.
+ */
+export function parseIsoInstantWithOffset(value: string): number | undefined {
+  if (!ISO_INSTANT_WITH_OFFSET_RE.test(value)) return undefined;
+  const ms = Date.parse(value);
+  return Number.isFinite(ms) ? ms : undefined;
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // Types
 // ═══════════════════════════════════════════════════════════════════════
@@ -144,9 +199,17 @@ const CEREMONY_ID_HEX_RE = /^[0-9a-f]{32}$/;
 export interface GuardianRevokeQuorumContext {
   /** 32 lowercase hex chars (128-bit CSPRNG). */
   ceremony_id: string;
-  /** ISO 8601 UTC — set by the collection context when collection opens. */
+  /**
+   * Strict ISO-8601 with a MANDATORY `Z`/`±HH:MM` offset (TZ-WINDOW-01), set by
+   * the collection context when collection opens. Minted by `toISOString`, which
+   * always emits `Z`; the offset is required on the RELYING side because an
+   * offset-less stamp denotes a different instant on every node that reads it.
+   */
   initiated_at: string;
-  /** ISO 8601 UTC — initiated_at + requested lifetime, clamped signer-side. */
+  /**
+   * Strict ISO-8601 with a MANDATORY `Z`/`±HH:MM` offset (TZ-WINDOW-01):
+   * initiated_at + requested lifetime, clamped signer-side.
+   */
   expires_at: string;
 }
 
@@ -252,7 +315,17 @@ export type QuorumContextParseResult =
   | { ok: true; context: ParsedQuorumContext }
   | { ok: false; reason: QuorumContextParseFailure };
 
-/** Named failure classes — a typed reason, never a bare throw or boolean. */
+/**
+ * Named failure classes — a typed reason, never a bare throw or boolean.
+ *
+ * `initiated_at_not_iso` / `expires_at_not_iso` mean exactly what they say as of
+ * TZ-WINDOW-01: the field failed `parseIsoInstantWithOffset`. Before that fix
+ * the names described a check the code did not perform, which is why the gap was
+ * invisible to a reader. A malformed stamp is a PARSE failure reported here; an
+ * out-of-window one is a FRESHNESS failure thrown by `assertQuorumContextFresh`,
+ * and the two must stay distinguishable so an operator can tell a bad payload
+ * from a lapsed ceremony.
+ */
 export type QuorumContextParseFailure =
   | "context_absent"
   | "context_not_object"
@@ -507,16 +580,20 @@ function parseQuorumContextForSchema(
   if (typeof initiatedAt !== "string") {
     return { ok: false, reason: "initiated_at_not_iso" };
   }
-  const initiatedMs = Date.parse(initiatedAt);
-  if (!Number.isFinite(initiatedMs)) {
+  // TZ-WINDOW-01: strict predicate, never a bare `Date.parse` finiteness test.
+  // An offset-less stamp parses FINE and resolves against the reading node's
+  // local zone, so a lenient check here makes one signed window mean a
+  // different absolute interval on every node that evaluates it.
+  const initiatedMs = parseIsoInstantWithOffset(initiatedAt);
+  if (initiatedMs === undefined) {
     return { ok: false, reason: "initiated_at_not_iso" };
   }
   const expiresAt = raw.expires_at;
   if (typeof expiresAt !== "string") {
     return { ok: false, reason: "expires_at_not_iso" };
   }
-  const expiresMs = Date.parse(expiresAt);
-  if (!Number.isFinite(expiresMs)) {
+  const expiresMs = parseIsoInstantWithOffset(expiresAt);
+  if (expiresMs === undefined) {
     return { ok: false, reason: "expires_at_not_iso" };
   }
   if (expiresMs <= initiatedMs) {
@@ -606,10 +683,14 @@ export function assertQuorumContextFresh(
   }
 
   // sync_anchored
-  const effectiveMs = Date.parse(freshness.effective_at);
-  if (!Number.isFinite(effectiveMs)) {
+  // TZ-WINDOW-01: the SAME strict predicate as the window fields. `effective_at`
+  // arrives from a peer's payload and is compared against the signed window, so
+  // an offset-less stamp here would slide that comparison by the reader's local
+  // offset — the identical defect, one field over.
+  const effectiveMs = parseIsoInstantWithOffset(freshness.effective_at);
+  if (effectiveMs === undefined) {
     throw new QuorumFreshnessError(
-      `sync-anchored freshness for (${ceremony}) requires a parseable effective_at`
+      `sync-anchored freshness for (${ceremony}) requires an ISO-8601 effective_at with a UTC designator or offset`
     );
   }
   if (effectiveMs < context.initiated_at_ms - REVOKE_QUORUM_CLOCK_SKEW_MS) {
@@ -651,10 +732,13 @@ export function assertRotatedAtWithinContext(params: {
   context: ParsedQuorumContext;
   rotated_at: string;
 }): void {
-  const rotatedMs = Date.parse(params.rotated_at);
-  if (!Number.isFinite(rotatedMs)) {
+  // TZ-WINDOW-01: same predicate as the window it is being bounded against. A
+  // bound is only as absolute as the loosest of the two stamps it compares, so
+  // this side cannot be lenient while the window side is strict.
+  const rotatedMs = parseIsoInstantWithOffset(params.rotated_at);
+  if (rotatedMs === undefined) {
     throw new QuorumFreshnessError(
-      `master-rotation rotated_at is not a parseable ISO timestamp`
+      `master-rotation rotated_at is not an ISO-8601 timestamp with a UTC designator or offset`
     );
   }
   if (
