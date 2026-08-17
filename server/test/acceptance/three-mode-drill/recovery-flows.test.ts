@@ -61,6 +61,7 @@ import {
   type MasterRotationAckMessage,
 } from "../../../src/mesh/recovery-flows/index.js";
 import {
+  buildGuardianMasterRotationQuorumInput,
   buildGuardianRevokeQuorumInput,
   mintRevokeCollectionContext,
   GUARDIAN_REVOKE_QUORUM_SCHEMA_V2,
@@ -665,13 +666,16 @@ describe("WP-MVP-8 ceremony 4 — master rotation + broadcast orchestration with
       };
       const newRootPrincipalKp = generateKeypair();
 
+      // QI-SIBLING-02: window minted before signing; carried on the wire.
+      const rotationContext = mintRevokeCollectionContext();
       const rotatedAt = new Date().toISOString();
-      const input = {
+      const input = buildGuardianMasterRotationQuorumInput({
+        context: rotationContext,
         old_master_pubkey: drill.master_public.public_key,
         new_master_pubkey: newMasterPublic,
         rotated_at: rotatedAt,
         fortress_id: drill.master_public.fortress_id,
-      };
+      });
       const sigs = guardians
         .slice(0, 3)
         .map((g) =>
@@ -739,6 +743,7 @@ describe("WP-MVP-8 ceremony 4 — master rotation + broadcast orchestration with
           new_root_principal_private_key: newRootPrincipalKp.privateKey,
           new_root_principal_public_key: newRootPrincipalKp.publicKey,
           guardian_signatures: sigs,
+          quorum_context: rotationContext,
           rotated_at: rotatedAt,
           ack_timeout_ms: 15_000,
         },
@@ -799,13 +804,16 @@ describe("WP-MVP-8 ceremony 4 — master rotation + broadcast orchestration with
         created_at: new Date().toISOString(),
       };
       const newRootPrincipalKp = generateKeypair();
+      // QI-SIBLING-02: window minted before signing; carried on the wire.
+      const rotationContext = mintRevokeCollectionContext();
       const rotatedAt = new Date().toISOString();
-      const input = {
+      const input = buildGuardianMasterRotationQuorumInput({
+        context: rotationContext,
         old_master_pubkey: drill.master_public.public_key,
         new_master_pubkey: newMasterPublic,
         rotated_at: rotatedAt,
         fortress_id: drill.master_public.fortress_id,
-      };
+      });
       const sigs = guardians
         .slice(0, 3)
         .map((g) =>
@@ -862,6 +870,7 @@ describe("WP-MVP-8 ceremony 4 — master rotation + broadcast orchestration with
           new_root_principal_private_key: newRootPrincipalKp.privateKey,
           new_root_principal_public_key: newRootPrincipalKp.publicKey,
           guardian_signatures: sigs,
+          quorum_context: rotationContext,
           rotated_at: rotatedAt,
           ack_timeout_ms: 3_000,
         },

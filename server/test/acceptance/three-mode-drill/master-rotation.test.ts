@@ -38,12 +38,13 @@ import {
 } from "../../../src/mesh/trust-root.js";
 import {
   acceptMasterRotation,
+  buildGuardianMasterRotationQuorumInput,
   buildMasterRotationPayload,
+  mintRevokeCollectionContext,
   issueGuardianRoster,
   rekeyOnMasterRotation,
   signMasterRotationAsGuardian,
   type GuardianIdentity,
-  type MasterRotationQuorumInput,
 } from "../../../src/mesh/guardian/index.js";
 import type {
   AuditBatch,
@@ -127,12 +128,17 @@ describe("three-mode-drill §12.9 — master rotation preserves audit continuity
         fortress_id: drill.master_public.fortress_id,
         created_at: new Date().toISOString(),
       };
-      const rotationInput: MasterRotationQuorumInput = {
+      // QI-SIBLING-02: collection window minted before signing; every relying
+      // site re-checks it with its own clock.
+      const quorumContext = mintRevokeCollectionContext();
+      const rotatedAt = new Date().toISOString();
+      const rotationInput = buildGuardianMasterRotationQuorumInput({
+        context: quorumContext,
         old_master_pubkey: drill.master_public.public_key,
         new_master_pubkey: newMasterPublic,
-        rotated_at: new Date().toISOString(),
+        rotated_at: rotatedAt,
         fortress_id: drill.master_public.fortress_id,
-      };
+      });
       const quorumSigs = guardians.slice(0, 3).map((g) =>
         signMasterRotationAsGuardian({
           input: rotationInput,
@@ -141,7 +147,11 @@ describe("three-mode-drill §12.9 — master rotation preserves audit continuity
         })
       );
       const payload = buildMasterRotationPayload({
-        input: rotationInput,
+        quorum_context: quorumContext,
+        old_master_pubkey: drill.master_public.public_key,
+        new_master_pubkey: newMasterPublic,
+        rotated_at: rotatedAt,
+        fortress_id: drill.master_public.fortress_id,
         guardian_signatures: quorumSigs,
         pinned_roster: roster,
       });
@@ -151,6 +161,7 @@ describe("three-mode-drill §12.9 — master rotation preserves audit continuity
         payload,
         pinned_master: drill.master_public,
         pinned_roster: roster,
+        now: new Date(),
       });
 
       // ── 4. Cascade re-key: re-issue all three certs + new root principal

@@ -81,6 +81,9 @@ const FROZEN_SURFACES: ReadonlyArray<string> = [
   // breaks verification of every existing v2 revoke / device-recovery quorum.
   "sanctuary.guardian-revoke-quorum.v2",
   "sanctuary.guardian-device-recovery-quorum.v2",
+  // QI-SIBLING-02: same contract for the master-rotation quorum. It rides on
+  // MasterRotationPayload.quorum_context.input_schema.
+  "sanctuary.guardian-master-rotation-quorum.v2",
 
   // --- public TS export symbols (root index.ts surface) ---
   "L1Status",

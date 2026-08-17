@@ -6,11 +6,16 @@
  * Key 13 (recovery cascade).
  *
  * Flow (initiator side):
+ *   0. The ceremony device mints a collection context (`mintRevokeCollection
+ *      Context`) and the guardians sign the rotation input built from it. This
+ *      happens BEFORE `propose` — the window and its ceremony_id exist before
+ *      any signature does (QI-SIBLING-02).
  *   1. `propose` — caller supplies the NEW master public + private key, the
- *      NEW root-principal keypair, and M-of-N guardian signatures. Ceremony
- *      builds the `MasterRotationPayload` and runs the cascade (re-issues
- *      every peer cert + re-derives every peer's HKDF subkeys under the new
- *      master). No state is mutated yet.
+ *      NEW root-principal keypair, that collection context, and M-of-N guardian
+ *      signatures. Ceremony enforces the window with its own clock, builds the
+ *      `MasterRotationPayload` and runs the cascade (re-issues every peer cert +
+ *      re-derives every peer's HKDF subkeys under the new master). No state is
+ *      mutated yet.
  *   2. `confirm` — operator explicit confirmation step. Required by Key 8.
  *   3. `execute` — per-peer unicast of the encrypted secret bundle, broadcast
  *      of the signed `master_rotation` envelope, local install, ack
@@ -38,11 +43,13 @@ import type { MeshTransport } from "../in-memory-transport.js";
 import { MeshNode } from "../lifecycle/mesh-node.js";
 import {
   acceptMasterRotation,
+  assertQuorumContextFresh,
   buildMasterRotationPayload,
+  parseMasterRotationQuorumContext,
   rekeyOnMasterRotation,
   buildMasterRotationAuditPayload,
+  toWireMasterRotationQuorumContext,
   type GuardianRoster,
-  type MasterRotationQuorumInput,
 } from "../guardian/index.js";
 import { SIGNATURE_SCHEME_V1 } from "../constants.js";
 import type {
@@ -188,22 +195,40 @@ export class MasterRotationCeremony {
   }): MasterRotationCeremony {
     const rotatedAt = params.proposal.rotated_at ?? new Date().toISOString();
 
-    const input: MasterRotationQuorumInput = {
+    // QI-SIBLING-02: the collection context was minted BEFORE the guardians
+    // signed, so the signatures bind its ceremony_id. Re-validate the
+    // operator-supplied context element-by-element and refuse a lapsed window
+    // HERE, so the operator gets the feedback at propose time rather than one
+    // step later when the acceptance gate below would refuse anyway.
+    const parsedContext = parseMasterRotationQuorumContext(
+      toWireMasterRotationQuorumContext(params.proposal.quorum_context)
+    );
+    if (!parsedContext.ok) {
+      throw new CeremonyError(
+        `master_rotation proposal has a malformed quorum context: ${parsedContext.reason}`
+      );
+    }
+    assertQuorumContextFresh(parsedContext.context, {
+      mode: "strict",
+      now: new Date(),
+    });
+
+    const payload = buildMasterRotationPayload({
+      quorum_context: params.proposal.quorum_context,
       old_master_pubkey: params.ctx.pinned_old_master.public_key,
       new_master_pubkey: params.proposal.new_master_public,
       rotated_at: rotatedAt,
       fortress_id: params.ctx.pinned_old_master.fortress_id,
-    };
-    const payload = buildMasterRotationPayload({
-      input,
       guardian_signatures: params.proposal.guardian_signatures,
       pinned_roster: params.ctx.pinned_roster,
     });
-    // Catch a mis-assembled quorum BEFORE unlocking confirm().
+    // Catch a mis-assembled quorum BEFORE unlocking confirm(). Same relying-side
+    // gate a receiver runs, same clock discipline (each site uses its own).
     acceptMasterRotation({
       payload,
       pinned_master: params.ctx.pinned_old_master,
       pinned_roster: params.ctx.pinned_roster,
+      now: new Date(),
     });
 
     // Cascade: re-issue self + every peer cert under the new master.
@@ -264,7 +289,12 @@ export class MasterRotationCeremony {
     }
 
     return new MasterRotationCeremony({
-      ceremony_id: generateCeremonyId(),
+      // One identifier end to end (QI-SIBLING-02): adopt the context's
+      // CSPRNG-minted ceremony_id — the one the guardians actually signed —
+      // instead of minting a fresh id after the signatures already exist. This
+      // also retires the local `generateCeremonyId` copy, which silently
+      // degraded to a non-CSPRNG source when getRandomValues was absent.
+      ceremony_id: params.proposal.quorum_context.ceremony_id,
       prepared: {
         rotated_at: rotatedAt,
         new_master_public: params.proposal.new_master_public,
@@ -295,6 +325,20 @@ export class MasterRotationCeremony {
         "operator confirmation requires a non-empty note"
       );
     }
+    // QI-SIBLING-02 (C12 §8 Q4 precedent): an operator confirmation is not a
+    // freshness extension. A ceremony whose collection window lapsed between
+    // propose and confirm refuses here, so the operator learns at the click
+    // rather than mid-execute with bundles already unicast. Same shared
+    // assertion, this device's own clock.
+    const parsed = parseMasterRotationQuorumContext(
+      toWireMasterRotationQuorumContext(this.prepared.proposal.quorum_context)
+    );
+    if (!parsed.ok) {
+      throw new CeremonyError(
+        `master_rotation confirm: malformed quorum context (${parsed.reason})`
+      );
+    }
+    assertQuorumContextFresh(parsed.context, { mode: "strict", now: new Date() });
     this.state = "confirmed";
     this.confirmed_at = confirmation.at ?? new Date().toISOString();
   }
@@ -518,12 +562,33 @@ export class MasterRotationReceiver {
     const entry = this.pending.get(rotatedAt);
     if (!entry?.bundle || !entry.broadcast) return;
 
-    // Verify the guardian quorum against pinned state.
-    acceptMasterRotation({
-      payload: entry.broadcast,
-      pinned_master: this.opts.pinned_old_master(),
-      pinned_roster: this.opts.pinned_guardian_roster(),
-    });
+    // Verify the guardian quorum against pinned state, and the collection
+    // window against THIS receiver's clock (QI-SIBLING-02). Strict mode, not
+    // the sync-anchored variant: a rotation only installs when the live unicast
+    // bundle and the broadcast are both in hand, and that pairing is collected
+    // inside DEFAULT_BROADCAST_ACK_TIMEOUT_MS, so there is no legitimate
+    // late-joiner case that needs to outlive the collection window. A node that
+    // was offline for the ceremony recovers through device recovery, not
+    // through a replayed rotation.
+    try {
+      acceptMasterRotation({
+        payload: entry.broadcast,
+        pinned_master: this.opts.pinned_old_master(),
+        pinned_roster: this.opts.pinned_guardian_roster(),
+        now: new Date(),
+      });
+    } catch (e) {
+      // A refused broadcast must not stay retained (rule 8). Freshness
+      // enforcement makes refusal the guaranteed outcome for every replay, so
+      // the refusal path is now the cheap one; holding the rejected payload
+      // would let an authentic-but-replaying peer grow this map for free. The
+      // BUNDLE half is kept: unwrapping it required the old per-node transport
+      // key, so it is not attacker-mintable, and dropping it would turn a
+      // refused broadcast into a permanent inability to install a later valid
+      // one at the same rotated_at.
+      entry.broadcast = undefined;
+      throw e;
+    }
 
     if (
       entry.bundle.re_issued_self_cert.parent_chain.fortress_master_pubkey !==
@@ -753,19 +818,12 @@ async function emitMasterRotationBroadcast(
 // Misc
 // ═══════════════════════════════════════════════════════════════════════
 
-function generateCeremonyId(): string {
-  const bytes = new Uint8Array(16);
-  if (typeof globalThis.crypto?.getRandomValues === "function") {
-    globalThis.crypto.getRandomValues(bytes);
-  } else {
-    for (let i = 0; i < bytes.length; i++) {
-      bytes[i] = Math.floor(Math.random() * 256);
-    }
-  }
-  let hex = "";
-  for (const b of bytes) hex += b.toString(16).padStart(2, "0");
-  return hex;
-}
+// QI-SIBLING-02: the local `generateCeremonyId` copy was DELETED here. It
+// silently degraded to a non-CSPRNG source when `crypto.getRandomValues` was
+// absent (a MUST-NEVER #5 degradation) and it minted an id AFTER
+// the guardian signatures existed, so nothing could bind it. The ceremony now
+// adopts the CSPRNG-fail-closed ceremony_id from the collection context minted
+// by `mintRevokeCollectionContext` in `mesh/guardian/revoke-quorum-input.ts`.
 
 export { emitGateApproved, type EmittedAlert };
 

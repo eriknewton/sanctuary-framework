@@ -1,9 +1,16 @@
 /**
- * C12-REPLAY — v2 guardian-revoke quorum-input freshness.
+ * C12-REPLAY — v2 guardian quorum-input freshness.
  *
  * This module is the SINGLE source of truth for the canonical bytes a guardian
- * quorum signs to authorize a node revocation, plus the relying-side freshness
- * enforcement (AGENTS.md rule 10) and the element-level parser (rules 5/11).
+ * quorum signs, plus the relying-side freshness enforcement (AGENTS.md rule 10)
+ * and the element-level parser (rules 5/11). Despite the file name it is NOT
+ * revoke-only: the collection context and the freshness assertion are
+ * input-agnostic by construction, and three ceremonies now share them — node
+ * revoke (C12-REPLAY), device-recovery intent (QI-SIBLING-01), and master
+ * rotation (QI-SIBLING-02). The `Revoke`-flavored names below are kept
+ * deliberately: renaming them would churn every call site and both T9 structure
+ * pins without changing a single byte of behavior, and the pins are what keep
+ * the second implementation from appearing.
  *
  * Why it lives under `mesh/guardian/`: `lifecycle/mesh-node.ts` and
  * `recovery-flows/*` both already import `verifyGuardianQuorum` from here, so
@@ -25,6 +32,10 @@
 import { sha256 } from "@noble/hashes/sha256";
 import { randomBytes } from "../../core/random.js";
 import { GuardianQuorumError } from "./errors.js";
+// Type-only import: `mesh/types.ts` carries no runtime code, so this adds no
+// module edge that could reintroduce the recovery-flows -> lifecycle cycle this
+// module was placed below.
+import type { FortressMasterPublicKey } from "../types.js";
 
 // ═══════════════════════════════════════════════════════════════════════
 // Schema literals (frozen wire/at-rest contract — reorg-surface-manifest.md)
@@ -52,6 +63,21 @@ export const GUARDIAN_REVOKE_QUORUM_SCHEMA_V2 =
 export const GUARDIAN_DEVICE_RECOVERY_QUORUM_SCHEMA_V2 =
   "sanctuary.guardian-device-recovery-quorum.v2" as const;
 
+/**
+ * Domain separator for the v2 MASTER-ROTATION quorum input (QI-SIBLING-02).
+ * Distinct from the revoke and device-recovery separators so a quorum collected
+ * for one ceremony can never be spliced into another. It rides inside the signed
+ * bytes AND is echoed on the wire in `MasterRotationPayload.quorum_context`; a
+ * verifier compares it as an EXACT literal, never a prefix. Frozen once shipped;
+ * a byte change silently breaks verification of every existing v2 rotation.
+ *
+ * Must match the `input_schema` literal accepted by
+ * `parseMasterRotationQuorumContext` and the
+ * `MasterRotationPayload.quorum_context.input_schema` type in `mesh/types.ts`.
+ */
+export const GUARDIAN_MASTER_ROTATION_QUORUM_SCHEMA_V2 =
+  "sanctuary.guardian-master-rotation-quorum.v2" as const;
+
 // ═══════════════════════════════════════════════════════════════════════
 // Freshness constants (rule 10 — relying party constrains signer freshness)
 // ═══════════════════════════════════════════════════════════════════════
@@ -70,6 +96,15 @@ const MS_PER_FIVE_MINUTES = 5 * SECONDS_PER_MINUTE * MS_PER_SECOND;
  * abandoned-ceremony exposure to one day instead of the forever the v1 shape
  * allowed. 86_400_000 = 24 h. Enforced by EVERY relying site, not only the
  * generator, because an attacker crafting a payload IS the generator (rule 10).
+ *
+ * QI-SIBLING-02 reuses this cap for master rotation rather than minting a second
+ * constant, because the latency being bounded is identical: the window has to
+ * cover collection-opens -> guardians sign -> operator proposes -> operator
+ * confirms -> execute's local accept. Everything AFTER local accept (per-peer
+ * bundle unicast, broadcast, receiver install, ack collection) runs inside
+ * `DEFAULT_BROADCAST_ACK_TIMEOUT_MS` = 10 s, four orders of magnitude inside the
+ * cap, so a receiver never races the window a slow ceremony consumed. One
+ * constant also means one thing to change if real ceremony timing disagrees.
  */
 export const REVOKE_QUORUM_MAX_LIFETIME_MS = 24 * MS_PER_HOUR;
 
@@ -102,6 +137,9 @@ const CEREMONY_ID_HEX_RE = /^[0-9a-f]{32}$/;
  * The freshness fields a collection context mints once and every guardian
  * signs. Minted BEFORE any guardian signs (design §2.3) so the signatures bind
  * the ceremony_id — signatures cannot exist before the context that names them.
+ *
+ * Shared verbatim by all three ceremonies (revoke, device-recovery intent,
+ * master rotation); the `Revoke` in the name is history, not scope.
  */
 export interface GuardianRevokeQuorumContext {
   /** 32 lowercase hex chars (128-bit CSPRNG). */
@@ -145,12 +183,60 @@ export interface GuardianDeviceRecoveryQuorumInput {
 }
 
 /**
+ * The canonical bytes a guardian signs to authorize a MASTER ROTATION (v2,
+ * QI-SIBLING-02). Carries the SAME freshness fields as the revoke input (one
+ * collection context shape for every ceremony), so `assertQuorumContextFresh`
+ * applies unchanged.
+ *
+ * Distinct from the retired-for-this-path `MasterRotationQuorumInput` in
+ * `guardian/types.ts`, which has no `schema` and no window and now serves only
+ * the canonical-audit-promotion ceremony. The two field sets are disjoint and
+ * `canonicalizeToBytes` is field-name-bearing, so their bytes cannot collide.
+ */
+export interface GuardianMasterRotationQuorumInput {
+  schema: typeof GUARDIAN_MASTER_ROTATION_QUORUM_SCHEMA_V2;
+  fortress_id: string;
+  old_master_pubkey: string;
+  /**
+   * The WHOLE new-master object, not just its `public_key`. The v1 shape signed
+   * the object, and narrowing to the bare key would quietly drop `created_at`
+   * out of quorum coverage while it still rides the wire and still lands in the
+   * receiver's pinned master record.
+   */
+  new_master_pubkey: FortressMasterPublicKey;
+  /**
+   * The operator-visible "this rotation took effect at" stamp. Signed so it
+   * cannot be edited in flight, but it is NOT the freshness field: the relying
+   * side decides freshness from `initiated_at`/`expires_at` and separately
+   * constrains `rotated_at` to sit inside that window.
+   */
+  rotated_at: string;
+  ceremony_id: string;
+  initiated_at: string;
+  expires_at: string;
+}
+
+/**
  * The wire echo of the freshness fields, carried on `NodeRevokePayload`. Present
  * iff `quorum_signatures` is (design §2.1 presence pairing). `input_schema` is
  * checked as the EXACT literal.
  */
 export interface NodeRevokeQuorumContextWire {
   input_schema: typeof GUARDIAN_REVOKE_QUORUM_SCHEMA_V2;
+  ceremony_id: string;
+  initiated_at: string;
+  expires_at: string;
+}
+
+/**
+ * The wire echo carried on `MasterRotationPayload`. Same three freshness fields,
+ * different domain separator, so a harvested revoke context cannot be presented
+ * as a rotation context (and vice versa) even before signature verification.
+ *
+ * Must match `MasterRotationPayload.quorum_context` in `mesh/types.ts`.
+ */
+export interface MasterRotationQuorumContextWire {
+  input_schema: typeof GUARDIAN_MASTER_ROTATION_QUORUM_SCHEMA_V2;
   ceremony_id: string;
   initiated_at: string;
   expires_at: string;
@@ -176,9 +262,18 @@ export type QuorumContextParseFailure =
   | "expires_at_not_iso"
   | "expires_not_after_initiated";
 
+/**
+ * Every domain separator that can legally appear in a wire `quorum_context`.
+ * A parse always names ONE expected member; the union exists so the single
+ * parser can serve every ceremony without a hand-mirrored copy per ceremony.
+ */
+export type QuorumContextSchema =
+  | typeof GUARDIAN_REVOKE_QUORUM_SCHEMA_V2
+  | typeof GUARDIAN_MASTER_ROTATION_QUORUM_SCHEMA_V2;
+
 /** A context that passed element-level validation, with parsed ms cached. */
 export interface ParsedQuorumContext {
-  input_schema: typeof GUARDIAN_REVOKE_QUORUM_SCHEMA_V2;
+  input_schema: QuorumContextSchema;
   ceremony_id: string;
   initiated_at: string;
   expires_at: string;
@@ -296,12 +391,48 @@ export function buildGuardianDeviceRecoveryQuorumInput(params: {
   };
 }
 
+/**
+ * Build the v2 MASTER-ROTATION quorum input (QI-SIBLING-02). The ONLY
+ * constructor of these bytes; a T9 structure pin asserts no other file under
+ * `server/src` hand-builds the shape.
+ */
+export function buildGuardianMasterRotationQuorumInput(params: {
+  context: GuardianRevokeQuorumContext;
+  old_master_pubkey: string;
+  new_master_pubkey: FortressMasterPublicKey;
+  rotated_at: string;
+  fortress_id: string;
+}): GuardianMasterRotationQuorumInput {
+  return {
+    schema: GUARDIAN_MASTER_ROTATION_QUORUM_SCHEMA_V2,
+    fortress_id: params.fortress_id,
+    old_master_pubkey: params.old_master_pubkey,
+    new_master_pubkey: params.new_master_pubkey,
+    rotated_at: params.rotated_at,
+    ceremony_id: params.context.ceremony_id,
+    initiated_at: params.context.initiated_at,
+    expires_at: params.context.expires_at,
+  };
+}
+
 /** Project the wire echo from a full context (producer side). */
 export function toWireQuorumContext(
   context: GuardianRevokeQuorumContext
 ): NodeRevokeQuorumContextWire {
   return {
     input_schema: GUARDIAN_REVOKE_QUORUM_SCHEMA_V2,
+    ceremony_id: context.ceremony_id,
+    initiated_at: context.initiated_at,
+    expires_at: context.expires_at,
+  };
+}
+
+/** Project the master-rotation wire echo from a full context (producer side). */
+export function toWireMasterRotationQuorumContext(
+  context: GuardianRevokeQuorumContext
+): MasterRotationQuorumContextWire {
+  return {
+    input_schema: GUARDIAN_MASTER_ROTATION_QUORUM_SCHEMA_V2,
     ceremony_id: context.ceremony_id,
     initiated_at: context.initiated_at,
     expires_at: context.expires_at,
@@ -322,6 +453,33 @@ export function toWireQuorumContext(
 export function parseGuardianRevokeQuorumContext(
   value: unknown
 ): QuorumContextParseResult {
+  return parseQuorumContextForSchema(value, GUARDIAN_REVOKE_QUORUM_SCHEMA_V2);
+}
+
+/**
+ * The master-rotation entry point into the SAME parser (QI-SIBLING-02). Separate
+ * function, not a separate implementation: the only difference is which domain
+ * separator is demanded, and demanding the wrong one is what stops a harvested
+ * revoke context from being presented as a rotation context.
+ */
+export function parseMasterRotationQuorumContext(
+  value: unknown
+): QuorumContextParseResult {
+  return parseQuorumContextForSchema(
+    value,
+    GUARDIAN_MASTER_ROTATION_QUORUM_SCHEMA_V2
+  );
+}
+
+/**
+ * The one element-level parse. Every ceremony's entry point funnels here with
+ * its own expected separator, so a new ceremony adds a literal and an entry
+ * point, never a second validator that can drift from this one (rule 5).
+ */
+function parseQuorumContextForSchema(
+  value: unknown,
+  expectedSchema: QuorumContextSchema
+): QuorumContextParseResult {
   if (value === undefined || value === null) {
     return { ok: false, reason: "context_absent" };
   }
@@ -331,7 +489,7 @@ export function parseGuardianRevokeQuorumContext(
   const raw = value as Record<string, unknown>;
 
   // EXACT literal — never a prefix / startsWith (design §2.1, review F-10).
-  if (raw.input_schema !== GUARDIAN_REVOKE_QUORUM_SCHEMA_V2) {
+  if (raw.input_schema !== expectedSchema) {
     return { ok: false, reason: "schema_missing_or_wrong" };
   }
   const ceremonyId = raw.ceremony_id;
@@ -360,7 +518,7 @@ export function parseGuardianRevokeQuorumContext(
   return {
     ok: true,
     context: {
-      input_schema: GUARDIAN_REVOKE_QUORUM_SCHEMA_V2,
+      input_schema: expectedSchema,
       ceremony_id: ceremonyId,
       initiated_at: initiatedAt,
       expires_at: expiresAt,
@@ -449,6 +607,50 @@ export function assertQuorumContextFresh(
     // back-dated effective_at forged by the sync-channel attacker.
     throw new QuorumFreshnessError(
       `sync-anchored effective_at past expires_at (no grace)`
+    );
+  }
+}
+
+/**
+ * Constrain a master-rotation's operator-visible `rotated_at` to the collection
+ * window it was signed under (QI-SIBLING-02).
+ *
+ * Why this exists at all, given the window is already enforced: `rotated_at` is
+ * a signed field a CONSUMER treats as meaning "the rotation happened then" — it
+ * keys the receiver's pending/installed maps, correlates the install acks, and
+ * is written verbatim into the `master_rotation_boundary` audit entry. A valid
+ * signature over it proves who signed it, not that it describes a real moment
+ * (rule 7). Without this bound a legitimate quorum could stamp a rotation into
+ * the far past or future and the audit trail would faithfully record the lie.
+ *
+ * Bounds are directional because the two stamps come from two devices:
+ *   - lower: rotated_at >= initiated_at - SKEW (skew-tolerant; a strict lower
+ *     bound would refuse a legitimate ceremony whose initiator clock lagged the
+ *     ceremony device, which is a fail-CLOSED denial of a real rotation).
+ *   - upper: rotated_at <= expires_at (strict, no grace; grace would only widen
+ *     the forward-dating window an attacker can select).
+ */
+export function assertRotatedAtWithinContext(params: {
+  context: ParsedQuorumContext;
+  rotated_at: string;
+}): void {
+  const rotatedMs = Date.parse(params.rotated_at);
+  if (!Number.isFinite(rotatedMs)) {
+    throw new QuorumFreshnessError(
+      `master-rotation rotated_at is not a parseable ISO timestamp`
+    );
+  }
+  if (
+    rotatedMs <
+    params.context.initiated_at_ms - REVOKE_QUORUM_CLOCK_SKEW_MS
+  ) {
+    throw new QuorumFreshnessError(
+      `master-rotation rotated_at precedes initiated_at by more than ${REVOKE_QUORUM_CLOCK_SKEW_MS}ms skew`
+    );
+  }
+  if (rotatedMs > params.context.expires_at_ms) {
+    throw new QuorumFreshnessError(
+      `master-rotation rotated_at is past expires_at (no grace)`
     );
   }
 }

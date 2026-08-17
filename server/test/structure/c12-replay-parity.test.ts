@@ -46,6 +46,42 @@ describe("C12-REPLAY parity structure (T9)", () => {
     expect(read("server/src/mesh/recovery-flows/device-recovery.ts")).not.toMatch(
       /Math\.random/
     );
+    // QI-SIBLING-02 retired the third copy, in the master-rotation ceremony.
+    expect(
+      read("server/src/mesh/recovery-flows/master-rotation.ts")
+    ).not.toMatch(/Math\.random/);
+  });
+
+  it("the shared module is the ONLY constructor of the v2 MASTER-ROTATION input shape", () => {
+    // QI-SIBLING-02 mirror of the revoke pin. A hand-built input assigns the
+    // `schema` key (NOT the `input_schema` wire echo, which legitimately rides
+    // MasterRotationPayload) to the v2 master-rotation value.
+    const files = walk(SERVER_SRC);
+    const sharedModule = join(MESH_SRC, "guardian", "revoke-quorum-input.ts");
+    const handBuilt =
+      /(?<![\w])schema:\s*(?:"sanctuary\.guardian-master-rotation-quorum\.v2"|GUARDIAN_MASTER_ROTATION_QUORUM_SCHEMA_V2)/;
+    for (const file of files) {
+      if (file === sharedModule) continue;
+      const src = readFileSync(file, "utf8");
+      expect(
+        handBuilt.test(src),
+        `unexpected hand-built v2 master-rotation input in ${file}`
+      ).toBe(false);
+    }
+  });
+
+  it("every acceptMasterRotation call site supplies its OWN clock", () => {
+    // The `now` argument is required at the type level, so this pin is about the
+    // OTHER half of rule 10: a site that reused a timestamp lifted from the
+    // payload would typecheck and would enforce nothing. Each production call
+    // must read a fresh clock at its own moment of verification.
+    for (const file of walk(SERVER_SRC)) {
+      const src = readFileSync(file, "utf8");
+      for (const call of src.match(/acceptMasterRotation\(\{[^}]*\}/gs) ?? []) {
+        expect(call, `acceptMasterRotation without a fresh clock in ${file}`)
+          .toMatch(/now:\s*new Date\(\)/);
+      }
+    }
   });
 
   it("the shared module is the ONLY constructor of the v2 revoke input shape", () => {

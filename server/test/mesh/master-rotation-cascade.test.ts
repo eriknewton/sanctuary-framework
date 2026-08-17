@@ -24,12 +24,13 @@ import {
 } from "../../src/mesh/trust-root.js";
 import {
   acceptMasterRotation,
+  buildGuardianMasterRotationQuorumInput,
   buildMasterRotationPayload,
+  mintRevokeCollectionContext,
   rekeyOnMasterRotation,
   signMasterRotationAsGuardian,
   issueGuardianRoster,
   type GuardianIdentity,
-  type MasterRotationQuorumInput,
 } from "../../src/mesh/guardian/index.js";
 import {
   CanonicalAuditLog,
@@ -93,12 +94,17 @@ describe("MeshNode.installMasterRotation — end-to-end cascade", () => {
       fortress_id: oldMaster.fortress_id,
       created_at: new Date().toISOString(),
     };
-    const input: MasterRotationQuorumInput = {
+    // QI-SIBLING-02: the collection context is minted before the guardians
+    // sign, and the rotation input is built from it by the shared builder.
+    const quorumContext = mintRevokeCollectionContext();
+    const rotatedAt = new Date().toISOString();
+    const input = buildGuardianMasterRotationQuorumInput({
+      context: quorumContext,
       old_master_pubkey: oldMaster.public_key,
       new_master_pubkey: newMasterPublic,
-      rotated_at: new Date().toISOString(),
+      rotated_at: rotatedAt,
       fortress_id: oldMaster.fortress_id,
-    };
+    });
     const sigs = guardians.slice(0, 3).map((g) =>
       signMasterRotationAsGuardian({
         input,
@@ -107,7 +113,11 @@ describe("MeshNode.installMasterRotation — end-to-end cascade", () => {
       })
     );
     const payload = buildMasterRotationPayload({
-      input,
+      quorum_context: quorumContext,
+      old_master_pubkey: oldMaster.public_key,
+      new_master_pubkey: newMasterPublic,
+      rotated_at: rotatedAt,
+      fortress_id: oldMaster.fortress_id,
       guardian_signatures: sigs,
       pinned_roster: roster,
     });
@@ -117,6 +127,7 @@ describe("MeshNode.installMasterRotation — end-to-end cascade", () => {
       payload,
       pinned_master: oldMaster,
       pinned_roster: roster,
+      now: new Date(),
     });
     const newPrincipalKp = generateKeypair();
     const cascade = rekeyOnMasterRotation({
