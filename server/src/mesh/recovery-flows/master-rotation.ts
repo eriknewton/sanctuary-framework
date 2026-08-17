@@ -17,17 +17,22 @@
  *      re-derives every peer's HKDF subkeys under the new master). No state is
  *      mutated yet.
  *   2. `confirm` — operator explicit confirmation step. Required by Key 8.
- *   3. `execute` — per-peer unicast of the encrypted secret bundle, broadcast
- *      of the signed `master_rotation` envelope, local install, ack
+ *   3. `execute` — re-assert the collection window with this device's own clock
+ *      BEFORE any wire traffic (the confirm-to-execute gap is operator-paced and
+ *      unbounded), then per-peer unicast of the encrypted secret bundle,
+ *      broadcast of the signed `master_rotation` envelope, local install, ack
  *      collection, emit `gate_approved` audit event.
  *
  * Receiver side (`MasterRotationReceiver`):
  *   1. Unwrap the bundle using the OLD per-node transport key; cache the
- *      decrypted plaintext keyed by rotated_at.
+ *      decrypted plaintext in the BOUNDED pending map keyed by rotated_at.
  *   2. On `master_rotation` broadcast, look up the cached bundle, verify the
- *      quorum, call `installMasterRotation` locally, surface a signed ack
- *      via `onAckEmit` so the wiring layer can unicast it back to the
- *      initiator.
+ *      quorum and the window with this node's own clock, call
+ *      `installMasterRotation` locally, surface a signed ack via `onAckEmit`
+ *      so the wiring layer can unicast it back to the initiator.
+ *   3. A refused broadcast never throws and never acks: it drops the broadcast
+ *      half, writes a GOVERNED denial audit entry keyed on the authenticated
+ *      emitter, and fires `onEnvelopeRejected`.
  *
  * Non-dependency invariant: no Concordia, no Verascore imports.
  * §10 hard gate: the `master_rotation` wire event is an existing V01 event
@@ -63,8 +68,11 @@ import {
   type AlertEmitContext,
   type EmittedAlert,
 } from "../failure-modes/alerts.js";
+import { BoundedMap, type EvictionDecision } from "../../core/bounded-map.js";
 import {
   DEFAULT_BROADCAST_ACK_TIMEOUT_MS,
+  MAX_PENDING_ROTATIONS_ON_RECEIVER,
+  MAX_PENDING_ROTATIONS_PER_EMITTER,
   RECOVERY_UNICAST_KINDS,
 } from "./constants.js";
 import {
@@ -360,6 +368,36 @@ export class MasterRotationCeremony {
     const expectedAckers = [...this.prepared.peer_bundles.keys()];
 
     try {
+      // 0. PRE-BROADCAST FRESHNESS GATE (QI-SIBLING-02 fix round, state
+      //    `confirmed` -> `executing`). The confirm-to-execute gap is
+      //    operator-paced and unbounded: an operator can confirm at T+1min and
+      //    click execute hours later. Without this line the initiator unicasts
+      //    bundles, broadcasts, and installs the new master under a window that
+      //    has already lapsed, every peer refuses with QuorumFreshnessError, and
+      //    the fortress splits across two masters — a state that needs a fresh
+      //    guardian quorum to leave. `REVOKE_QUORUM_MAX_LIFETIME_MS`'s own
+      //    derivation says the window must cover "execute's local accept", so
+      //    this is the line that makes that comment true rather than aspirational.
+      //
+      //    Mirrors the C12 revoke path's emit-site gate (`mesh-node.ts`
+      //    `revokePeer`, "pre-broadcast guardian invariant"): master rotation
+      //    adopted C12's confirm gate but not its emit gate. Single-shot is
+      //    sufficient because the state machine forbids re-entering `execute`,
+      //    and this device's OWN clock is read here, never a timestamp lifted
+      //    from the payload.
+      const executeContext = parseMasterRotationQuorumContext(
+        toWireMasterRotationQuorumContext(this.prepared.proposal.quorum_context)
+      );
+      if (!executeContext.ok) {
+        throw new CeremonyError(
+          `master_rotation execute: malformed quorum context (${executeContext.reason})`
+        );
+      }
+      assertQuorumContextFresh(executeContext.context, {
+        mode: "strict",
+        now: new Date(),
+      });
+
       // 1. Per-peer unicast bundle delivery.
       for (const [peerId, envelope] of this.prepared.peer_bundles) {
         await this.ctx.transport.unicast(peerId, JSON.stringify(envelope));
@@ -483,6 +521,46 @@ export class MasterRotationCeremony {
 interface PendingRotationOnReceiver {
   bundle?: MasterRotationBundlePlaintext;
   broadcast?: MasterRotationPayload;
+  /**
+   * The AUTHENTICATED emitter of `broadcast` — the `emitter_node` of a
+   * SignedEvent that already passed the receive path's `verifyOrThrow`, never a
+   * string lifted from the payload. Present iff `broadcast` is. It is what the
+   * refusal audit is keyed on, so it must never become attacker-supplied: a
+   * per-origin budget keyed on a spoofable field lets one peer exhaust every
+   * other peer's bucket.
+   */
+  broadcast_emitter?: string;
+}
+
+/**
+ * Eviction policy for the receiver's `pending` map (QI-SIBLING-02 fix round).
+ *
+ * Preserve the BUNDLE half, evict the BROADCAST-only half. The two halves have
+ * very different provenance: unwrapping a bundle required the OLD per-node
+ * transport key (HKDF from the old fortress master), so a bundle is not
+ * attacker-mintable and dropping one turns a refused broadcast into a permanent
+ * inability to install a later valid rotation at the same `rotated_at`. A
+ * broadcast-only entry is the cheap, in-roster-peer-mintable half and has never
+ * been installed, so it is not trust-bearing and evicting it loses nothing an
+ * operator can observe. This mirrors `NodeLifecycleEventLog`'s revoke-preserving
+ * eviction: the class-level rule is "evict the cheap half, never the scarce one."
+ *
+ * If EVERY entry holds a bundle the insert is refused rather than evicting one,
+ * which is the fail-closed choice (`core/bounded-map.ts` never evicts on a
+ * refusal, so every existing entry is left untouched). Because `onEvict` is
+ * omitted deliberately: an evicted broadcast-only entry is not trust-bearing, so
+ * the durable-audit-before-delete contract that binds `handshakeResults` and the
+ * federation peer registry does not apply here.
+ */
+function selectPendingRotationEviction(
+  entries: ReadonlyMap<string, PendingRotationOnReceiver>
+): EvictionDecision<string> {
+  // Map iteration is insertion order, so the first bundle-less entry is the
+  // oldest one — evict-oldest among the cheap half.
+  for (const [key, entry] of entries) {
+    if (!entry.bundle) return { evict: key };
+  }
+  return { refuse: true };
 }
 
 export interface MasterRotationReceiverOptions {
@@ -499,7 +577,25 @@ export interface MasterRotationReceiverOptions {
 }
 
 export class MasterRotationReceiver {
-  private readonly pending = new Map<string, PendingRotationOnReceiver>();
+  /**
+   * In-flight rotations, keyed on the SENDER-CHOSEN `rotated_at` string, read
+   * before any validation runs (QI-SIBLING-02 fix round, AGENTS.md rule 8).
+   * Bounded through the shared `core/bounded-map.ts` chokepoint rather than a
+   * bespoke cap: it already owns the per-origin quota, the eviction-decision
+   * contract, and the admission serialization this shape needs, and eight other
+   * modules depend on that one implementation staying the only one.
+   *
+   * The origin is the AUTHENTICATED broadcast emitter (see
+   * `PendingRotationOnReceiver.broadcast_emitter`). The unicast BUNDLE path
+   * passes no origin on purpose: unwrapping a bundle already required the old
+   * per-node transport key, so that path is not attacker-drivable and does not
+   * need a per-peer bucket.
+   */
+  private readonly pending = new BoundedMap<string, PendingRotationOnReceiver>({
+    maxSize: MAX_PENDING_ROTATIONS_ON_RECEIVER,
+    maxPerOrigin: MAX_PENDING_ROTATIONS_PER_EMITTER,
+    selectEviction: (entries) => selectPendingRotationEviction(entries),
+  });
   private readonly installed = new Set<string>();
   private readonly opts: MasterRotationReceiverOptions;
   private readonly ackEmitListeners = new Set<
@@ -539,7 +635,22 @@ export class MasterRotationReceiver {
     });
     const entry = this.pending.get(envelope.rotated_at) ?? {};
     entry.bundle = plaintext;
-    this.pending.set(envelope.rotated_at, entry);
+    // No origin: this path required the OLD per-node transport key to reach,
+    // so it is not attacker-drivable and needs no per-peer bucket. A refusal
+    // here can only be the global cap saturated by bundle-bearing entries.
+    const admitted = await this.pending.set(envelope.rotated_at, entry);
+    if (!admitted.ok) {
+      // MUST-NEVER #5: never silently degrade. A dropped bundle is reported,
+      // not swallowed; there is no authenticated peer to attribute it to, so
+      // the local operator surface is the rejection hook.
+      this.opts.node.onEnvelopeRejected({
+        error: new Error(
+          `master_rotation bundle refused: pending-rotation map at capacity (${admitted.reason})`
+        ),
+        event_type: RECOVERY_UNICAST_KINDS.MASTER_ROTATION_BUNDLE,
+      });
+      return true;
+    }
     await this.maybeInstall(envelope.rotated_at);
     return true;
   }
@@ -547,13 +658,45 @@ export class MasterRotationReceiver {
   /**
    * Call from a `MeshNode.onLifecycleEvent` hook when a received
    * `master_rotation` event arrives.
+   *
+   * `emitter_node` MUST be the verified envelope's `emitter_node`. The receive
+   * path runs `verifyOrThrow` before dispatching to the router that fires
+   * `onLifecycleEvent(evt, "received")`, so at that hook the value is
+   * authenticated; passing anything read out of the payload instead would key
+   * this receiver's per-peer quota and refusal audit on an attacker-chosen
+   * string.
+   *
+   * NEVER THROWS (QI-SIBLING-02 fix round). QI-SIBLING-02 made refusal the
+   * GUARANTEED outcome for every stale or replayed broadcast, and the reference
+   * wiring invokes this as `void rec.handleIncomingMasterRotationBroadcast(...)`
+   * — under Node's default unhandled-rejection behavior a propagating refusal
+   * would let an authenticated peer crash the receiving node by replaying a
+   * stale rotation. Refusals are converted to a governed audit entry plus
+   * `onEnvelopeRejected`, exactly as the `node_revoke` router handler already
+   * does for the identical class.
    */
   async handleIncomingMasterRotationBroadcast(
-    payload: MasterRotationPayload
+    payload: MasterRotationPayload,
+    params: { emitter_node: string }
   ): Promise<void> {
     const entry = this.pending.get(payload.rotated_at) ?? {};
     entry.broadcast = payload;
-    this.pending.set(payload.rotated_at, entry);
+    entry.broadcast_emitter = params.emitter_node;
+    const admitted = await this.pending.set(
+      payload.rotated_at,
+      entry,
+      params.emitter_node
+    );
+    if (!admitted.ok) {
+      this.surfaceBroadcastRefusal(
+        params.emitter_node,
+        payload.rotated_at,
+        new Error(
+          `master_rotation broadcast refused: pending-rotation map admission denied (${admitted.reason})`
+        )
+      );
+      return;
+    }
     await this.maybeInstall(payload.rotated_at);
   }
 
@@ -586,8 +729,24 @@ export class MasterRotationReceiver {
       // key, so it is not attacker-mintable, and dropping it would turn a
       // refused broadcast into a permanent inability to install a later valid
       // one at the same rotated_at.
+      //
+      // Retention note: dropping the broadcast half is a hygiene measure, NOT
+      // the map's bound. The bound is the BoundedMap cap + per-emitter quota on
+      // `pending` itself, because the attacker-reachable path (a broadcast
+      // arriving with no bundle) returns above without ever reaching this line.
+      const refusedEmitter = entry.broadcast_emitter;
       entry.broadcast = undefined;
-      throw e;
+      entry.broadcast_emitter = undefined;
+      // An entry holding neither half is pure residue from a refused replay;
+      // reclaim its slot so a stream of distinct rotated_at values cannot park
+      // empty keys against the cap.
+      if (!entry.bundle) this.pending.delete(rotatedAt);
+      this.surfaceBroadcastRefusal(
+        refusedEmitter,
+        rotatedAt,
+        e instanceof Error ? e : new Error(String(e))
+      );
+      return;
     }
 
     if (
@@ -652,6 +811,59 @@ export class MasterRotationReceiver {
     for (const l of this.ackEmitListeners) l(ack);
   }
 
+  /**
+   * The ONE receiver-side refusal surface (QI-SIBLING-02 fix round, fixes the
+   * "a refusing node looks identical to one that never received the broadcast"
+   * gap). Two effects, both operator-facing and neither decisional:
+   *
+   *   1. A GOVERNED audit entry via `MeshNode.auditMasterRotationDenied`, keyed
+   *      on the AUTHENTICATED emitter. Governed because refusal is the
+   *      guaranteed outcome for every replay, so an ungoverned entry per
+   *      refusal would be a zero-cost audit-write amplifier for any in-roster
+   *      peer (rule 8) — the same reason the revoke-denial and
+   *      uncorrelated-sync paths are governed.
+   *   2. `onEnvelopeRejected`, the hook the `node_revoke` router handler
+   *      already uses for this class, which the failure-mode detector consumes.
+   *
+   * Deliberately NO error ack. An ack is a freshly SIGNED message unicast to
+   * the initiator, so emitting one per refused replay would hand an
+   * authenticated peer a signing-and-reflection amplifier aimed at the
+   * initiator — trading a fixed local defect for an attacker-driven remote one.
+   * The audit entry is the durable operator record and it reaches the canonical
+   * audit node on the normal batch flush, which is where a fleet operator reads
+   * "this node refused" from.
+   *
+   * A missing `emitterNode` can only happen if a refusal is reached with no
+   * broadcast half in hand, which `maybeInstall`'s early return forecloses; the
+   * fallback attributes the write to an explicit unknown-peer bucket rather
+   * than silently skipping the audit.
+   */
+  private surfaceBroadcastRefusal(
+    emitterNode: string | undefined,
+    rotatedAt: string,
+    error: Error
+  ): void {
+    const peer = emitterNode ?? "unknown_peer";
+    // Audit-write availability must never change the refusal or the operator
+    // signal (the governor's forensic-only invariant), so a failed audit write
+    // is contained here and `onEnvelopeRejected` still fires below.
+    try {
+      this.opts.node.auditMasterRotationDenied({
+        emitter_node: peer,
+        rotated_at: rotatedAt,
+        error,
+      });
+    } catch {
+      // An unkeyed or mid-rotation node cannot seal an entry; the rejection
+      // hook below is still the operator's signal.
+    }
+    this.opts.node.onEnvelopeRejected({
+      error,
+      event_type: "master_rotation",
+      emitter_node: emitterNode,
+    });
+  }
+
   private surfaceAckError(
     rotatedAt: string,
     broadcast: MasterRotationPayload,
@@ -680,6 +892,20 @@ export class MasterRotationReceiver {
       signature_scheme: SIGNATURE_SCHEME_V1,
     };
     for (const l of this.ackEmitListeners) l(ack);
+  }
+
+  /**
+   * How many in-flight rotations this receiver is currently retaining.
+   *
+   * Read-only introspection over the rule-8 bound, mirroring
+   * `MeshNode.peekPendingAuditEntries()`. It exists so an adversarial-retention
+   * test can assert the CAP rather than assert that a mitigation line is
+   * present — a test that cannot observe the bounded quantity cannot fail when
+   * the bound is removed, which is the failure mode that made the previous
+   * retention test read as coverage while proving nothing.
+   */
+  pendingRotationCount(): number {
+    return this.pending.size;
   }
 
   /**

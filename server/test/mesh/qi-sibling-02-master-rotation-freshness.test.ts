@@ -1,20 +1,24 @@
 /**
- * QI-SIBLING-02 — master-rotation quorum-input freshness.
+ * QI-SIBLING-02 — master-rotation quorum-input freshness (register row
+ * QI-SIBLING-02; details resolve only in the private defect register).
  *
- * REPRODUCTION (this file's first describe block was written and run FIRST,
- * against unmodified main at 0004bd98, where all three cases FAILED): the
- * master-rotation quorum input carried a signer-chosen `rotated_at` consumed as
- * data with no relying-side window, so a harvested/abandoned rotation quorum
- * authorized a master swap forever against any node still pinned to the old
- * master. Same rule-10 class as C12-REPLAY, worse consequence: the accepted
- * artifact replaces the fortress master, which is a master ROLLBACK primitive.
+ * CAPABILITY UNDER TEST: the relying side of a master rotation enforces the
+ * collection window the guardians signed, with its OWN clock, at every site that
+ * consumes the quorum. A guardian quorum is a bearer capability, and a signature
+ * over a signer-chosen timestamp proves who signed it, not that the posture it
+ * asserts is still current (AGENTS.md rule 10). Without a relying-side window an
+ * abandoned ceremony's quorum stays a master-swap capability for as long as a
+ * node remains pinned to the old master, which is the same class as C12-REPLAY
+ * with a heavier consequence, since the accepted artifact replaces the fortress
+ * master.
  *
- * The fix adopts the C12 collection context + `assertQuorumContextFresh`
+ * The capability adopts the C12 collection context + `assertQuorumContextFresh`
  * unchanged (the struct is input-agnostic by design) under its own domain
- * separator.
+ * separator, and every guard below plants its divergence and asserts the
+ * refusal rather than asserting the happy path alone.
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { toBase64url } from "../../src/core/encoding.js";
 import { generateKeypair } from "../../src/core/identity.js";
 import {
@@ -41,22 +45,37 @@ import {
   generateFortressMaster,
 } from "../../src/mesh/trust-root.js";
 import {
+  InMemoryCounterStore,
   InMemoryNodeKeyStore,
   MeshNode,
   createAutoApproveJoinApprover,
 } from "../../src/mesh/lifecycle/index.js";
 import { InMemoryTransport } from "../../src/mesh/in-memory-transport.js";
 import {
+  MasterRotationCeremony,
   MasterRotationReceiver,
+  MAX_PENDING_ROTATIONS_ON_RECEIVER,
+  MAX_PENDING_ROTATIONS_PER_EMITTER,
+  createMasterRotationAckSubscription,
   wrapMasterRotationBundle,
 } from "../../src/mesh/recovery-flows/index.js";
+import type { MeshTransport } from "../../src/mesh/in-memory-transport.js";
 import type {
   FortressMasterPublicKey,
   MasterRotationPayload,
   PrincipalCertificate,
+  SignedEvent,
 } from "../../src/mesh/types.js";
 
 const HOUR_MS = 60 * 60 * 1000;
+
+/**
+ * The AUTHENTICATED emitter every receiver-side test attributes its broadcast
+ * to. In production this is `evt.emitter_node` off an envelope that already
+ * passed `verifyOrThrow`; a per-peer quota keyed on anything the payload
+ * carries would be attacker-selectable and therefore no quota at all.
+ */
+const PEER = "peer-initiator";
 
 interface GuardianKp {
   identity: GuardianIdentity;
@@ -155,10 +174,11 @@ function contextOpenedAgo(agoMs: number): GuardianRevokeQuorumContext {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Reproduction — these three FAILED against unmodified main (0004bd98)
+// The core requirement — the relying side refuses a lapsed or signer-selected
+// window, on artifacts whose signatures are all genuine
 // ═══════════════════════════════════════════════════════════════════════
 
-describe("QI-SIBLING-02 reproduction — relying side refuses a stale rotation quorum", () => {
+describe("QI-SIBLING-02 — relying side refuses a stale rotation quorum", () => {
   it("REFUSES a rotation quorum whose collection window closed five years ago", () => {
     const fiveYears = 5 * 365 * 24 * HOUR_MS;
     const { payload, pinned_master, pinned_roster } = signRotation({
@@ -626,48 +646,322 @@ describe("QI-SIBLING-02 wired consumer — MasterRotationReceiver enforces the w
       node_private_key: result.bootstrap.node_private_key,
     });
     receiver.onAckEmit((ack) => acks.push(ack));
+    // The refusal surface the wiring layer consumes. Captured here because the
+    // whole point of the fix is that a refusing node is DISTINGUISHABLE from one
+    // that never received the broadcast.
+    const rejections: Array<{ error: Error; event_type: string; emitter_node?: string }> =
+      [];
+    result.node.onEnvelopeRejected = (info) => rejections.push(info);
     await receiver.handleIncomingUnicast("node-1", JSON.stringify(envelope));
 
-    return { node: result.node, receiver, payload, acks, oldMaster, newMasterPublic };
+    return {
+      node: result.node,
+      receiver,
+      payload,
+      acks,
+      rejections,
+      oldMaster,
+      newMasterPublic,
+    };
+  }
+
+  /** Denial entries this node has sealed but not yet flushed. */
+  function denialEntries(node: MeshNode): unknown[] {
+    return node
+      .peekPendingAuditEntries()
+      .filter(
+        (e) =>
+          (e.payload as { operation?: string } | undefined)?.operation ===
+          "master_rotation_denied"
+      );
   }
 
   it("installs a rotation whose window is open", async () => {
     const s = await bootReceiverScenario(mintRevokeCollectionContext());
-    await s.receiver.handleIncomingMasterRotationBroadcast(s.payload);
+    await s.receiver.handleIncomingMasterRotationBroadcast(s.payload, {
+      emitter_node: PEER,
+    });
+    expect(s.node.getPinnedMaster().public_key).toBe(
+      s.newMasterPublic.public_key
+    );
+    expect(s.acks).toHaveLength(1);
+    expect(s.rejections).toHaveLength(0);
+  });
+
+  it("REFUSES a rotation whose window closed, leaves the pinned master untouched, and SURFACES the refusal", async () => {
+    // Failure-mode note: a receiver that merely logged and continued here would
+    // look identical in the ack stream to one that never got the broadcast. The
+    // assertion that matters is the pinned master, plus a refusal an operator
+    // can actually see.
+    const s = await bootReceiverScenario(
+      contextOpenedAgo(REVOKE_QUORUM_MAX_LIFETIME_MS + HOUR_MS)
+    );
+    // Never throws: the reference wiring calls this as `void ...`, so a
+    // propagating refusal would be an unhandled rejection an authenticated peer
+    // can trigger at will.
+    await expect(
+      s.receiver.handleIncomingMasterRotationBroadcast(s.payload, {
+        emitter_node: PEER,
+      })
+    ).resolves.toBeUndefined();
+    expect(s.node.getPinnedMaster().public_key).toBe(s.oldMaster.public_key);
+    expect(s.acks).toHaveLength(0);
+    expect(s.rejections).toHaveLength(1);
+    expect(s.rejections[0]!.event_type).toBe("master_rotation");
+    expect(s.rejections[0]!.emitter_node).toBe(PEER);
+    expect(s.rejections[0]!.error).toBeInstanceOf(QuorumFreshnessError);
+    // The message names the ceremony it is actually refusing — it used to say
+    // "revoke quorum context" for a master rotation, which told the operator
+    // the wrong ceremony had failed.
+    expect(s.rejections[0]!.error.message).toContain(
+      GUARDIAN_MASTER_ROTATION_QUORUM_SCHEMA_V2
+    );
+    expect(s.rejections[0]!.error.message).not.toContain(
+      GUARDIAN_REVOKE_QUORUM_SCHEMA_V2
+    );
+    // And it is durably recorded, keyed on the authenticated emitter.
+    expect(denialEntries(s.node)).toHaveLength(1);
+  });
+
+  it("BOUNDS the pending map against a flood of attacker-chosen rotated_at keys (rule 8)", async () => {
+    // MUTATION-PROOF TARGET: this assertion fails if the BoundedMap cap or its
+    // per-emitter quota is removed from `MasterRotationReceiver.pending`. The
+    // attacker-reachable path is a broadcast arriving with NO bundle: it returns
+    // from maybeInstall before any freshness check, so the drop-on-refusal line
+    // is never reached and cannot bound anything. The map key IS the
+    // sender-chosen `rotated_at`, read before any validation, so both the key
+    // count and the key length are attacker-selected. Driver: any in-roster peer.
+    const s = await bootReceiverScenario(mintRevokeCollectionContext());
+    const FLOOD = 200;
+    for (let i = 0; i < FLOOD; i++) {
+      await s.receiver.handleIncomingMasterRotationBroadcast(
+        // Distinct key per replay, everything else identical. Signatures do not
+        // even have to verify: admission happens before verification, which is
+        // exactly why the cap has to sit at admission.
+        { ...s.payload, rotated_at: `2026-04-0${1}T00:00:00.${String(i).padStart(3, "0")}Z` },
+        { emitter_node: PEER }
+      );
+    }
+    // The retained set is bounded by the global cap no matter how many distinct
+    // keys the peer invents. Pre-fix this was exactly FLOOD.
+    expect(s.receiver.pendingRotationCount()).toBeLessThanOrEqual(
+      MAX_PENDING_ROTATIONS_ON_RECEIVER
+    );
+    // And the flooding emitter's OWN contribution is bounded by its quota. The
+    // one extra entry is the legitimate bundle admitted by the scenario's
+    // unicast, which carries no origin because it required the old per-node
+    // transport key to produce.
+    expect(s.receiver.pendingRotationCount()).toBeLessThanOrEqual(
+      MAX_PENDING_ROTATIONS_PER_EMITTER + 1
+    );
+    // Every refusal is surfaced, so the flood is visible rather than silent.
+    expect(s.rejections.length).toBeGreaterThan(0);
+    // ...but the AUDIT writes it drives are governed, so a guaranteed-refusal
+    // path is not a zero-cost audit-write amplifier (rule 8 on the fix's own
+    // state). Individual denial entries are capped per emitter per window.
+    expect(denialEntries(s.node).length).toBeLessThan(FLOOD);
+  });
+
+  it("a flood from one peer never crowds out ANOTHER peer's legitimate rotation", async () => {
+    // Per-origin quota, not just a global cap: a global-only ceiling lets one
+    // flooding peer consume the whole map and lock every other peer out, which
+    // is the finding that put `maxPerOrigin` into core/bounded-map.ts.
+    const s = await bootReceiverScenario(mintRevokeCollectionContext());
+    for (let i = 0; i < 200; i++) {
+      await s.receiver.handleIncomingMasterRotationBroadcast(
+        { ...s.payload, rotated_at: `2026-04-02T00:00:00.${String(i).padStart(3, "0")}Z` },
+        { emitter_node: "flooding-peer" }
+      );
+    }
+    // The real initiator's broadcast, matching the bundle already unwrapped
+    // above, still installs.
+    await s.receiver.handleIncomingMasterRotationBroadcast(s.payload, {
+      emitter_node: PEER,
+    });
     expect(s.node.getPinnedMaster().public_key).toBe(
       s.newMasterPublic.public_key
     );
     expect(s.acks).toHaveLength(1);
   });
+});
 
-  it("REFUSES a rotation whose window closed, and leaves the pinned master untouched", async () => {
-    // Failure-mode note: a receiver that merely logged and continued here would
-    // look identical in the ack stream to one that never got the broadcast. The
-    // assertion that matters is the pinned master, not the absence of an ack.
-    const s = await bootReceiverScenario(
-      contextOpenedAgo(REVOKE_QUORUM_MAX_LIFETIME_MS + HOUR_MS)
+// ═══════════════════════════════════════════════════════════════════════
+// Initiator-side pre-broadcast gate — the confirm-to-execute gap is
+// operator-paced and unbounded, so confirm() alone enforces nothing about
+// the moment the fortress actually swaps masters.
+// ═══════════════════════════════════════════════════════════════════════
+
+describe("QI-SIBLING-02 — execute() re-asserts the window before any wire traffic", () => {
+  /**
+   * Boot one node, a guardian roster, and a fully signed rotation whose
+   * collection window is open NOW. The caller then moves the clock and calls
+   * execute.
+   */
+  async function bootCeremonyScenario() {
+    const transport = new InMemoryTransport();
+    const handle = transport.attach("node-1");
+    // A second attached peer is the broadcast OBSERVER: InMemoryTransport never
+    // delivers a broadcast back to its emitter, so counting here is the only way
+    // to see whether the rotation actually left the node.
+    const observer = transport.attach("observer");
+    const broadcasts: SignedEvent[] = [];
+    observer.subscribe((evt) => {
+      if (evt.event_type === "master_rotation") broadcasts.push(evt);
+    });
+
+    const placeholder = createAutoApproveJoinApprover({
+      pinned_master_pubkey: {} as FortressMasterPublicKey,
+      issuing_principal_cert: {} as PrincipalCertificate,
+      issuing_principal_private_key: new Uint8Array(32),
+    });
+    const result = await MeshNode.bootstrapFirstNode({
+      node_id: "node-1",
+      node_mode: "local",
+      transport: handle,
+      approver: placeholder,
+      key_store: new InMemoryNodeKeyStore(),
+    });
+    const oldMaster = result.bootstrap.master_public;
+    const guardians = ["g1", "g2", "g3", "g4", "g5"].map(makeGuardian);
+    const roster = issueGuardianRoster({
+      m: DEFAULT_GUARDIAN_M,
+      n: DEFAULT_GUARDIAN_N,
+      guardians: guardians.map((g) => g.identity),
+      fortress_id: oldMaster.fortress_id,
+      version: 1,
+      master_private_key: result.bootstrap.master_private_key,
+    });
+
+    const newMasterKp = generateKeypair();
+    const newMasterPublic: FortressMasterPublicKey = {
+      public_key: toBase64url(newMasterKp.publicKey),
+      fortress_id: oldMaster.fortress_id,
+      created_at: new Date().toISOString(),
+    };
+    const newRootPrincipalKp = generateKeypair();
+    const quorumContext = mintRevokeCollectionContext();
+    const rotatedAt = new Date().toISOString();
+    const input = buildGuardianMasterRotationQuorumInput({
+      context: quorumContext,
+      old_master_pubkey: oldMaster.public_key,
+      new_master_pubkey: newMasterPublic,
+      rotated_at: rotatedAt,
+      fortress_id: oldMaster.fortress_id,
+    });
+    const sigs = guardians.slice(0, 3).map((g) =>
+      signMasterRotationAsGuardian({
+        input,
+        guardian_id: g.identity.guardian_id,
+        guardian_private_key: g.private_key,
+      })
     );
-    await expect(
-      s.receiver.handleIncomingMasterRotationBroadcast(s.payload)
-    ).rejects.toThrow(QuorumFreshnessError);
+
+    // Counting transport wrapper: a unicast that escapes the gate is a peer
+    // holding the new master secret while the initiator is refusing to install.
+    let unicasts = 0;
+    const countingTransport: MeshTransport = {
+      broadcast: (evt) => handle.broadcast(evt),
+      unicast: (to, message) => {
+        unicasts += 1;
+        return handle.unicast(to, message);
+      },
+      subscribe: (h) => handle.subscribe(h),
+      subscribeUnicast: (h) => handle.subscribeUnicast(h),
+    };
+
+    const ceremony = MasterRotationCeremony.propose({
+      proposal: {
+        new_master_public: newMasterPublic,
+        new_master_secret: newMasterKp.privateKey,
+        new_root_principal_private_key: newRootPrincipalKp.privateKey,
+        new_root_principal_public_key: newRootPrincipalKp.publicKey,
+        guardian_signatures: sigs,
+        quorum_context: quorumContext,
+        rotated_at: rotatedAt,
+        ack_timeout_ms: 50,
+      },
+      ctx: {
+        node: result.node,
+        transport: countingTransport,
+        old_fortress_master_secret: result.bootstrap.master_private_key,
+        old_root_principal_cert: result.bootstrap.root_principal_certificate,
+        peers: [],
+        pinned_roster: roster,
+        pinned_old_master: oldMaster,
+        emit_ctx: {
+          emitter_node: "node-1",
+          emitter_principal:
+            result.bootstrap.root_principal_certificate.principal_id,
+          fortress_id: oldMaster.fortress_id,
+          node_private_key: result.bootstrap.node_private_key,
+          counters: new InMemoryCounterStore(),
+        },
+        self_node_cert: result.bootstrap.node_certificate,
+      },
+    });
+
+    const ackSub = createMasterRotationAckSubscription({
+      fortress_id: oldMaster.fortress_id,
+      lookup_pre_rotation_pubkey: () => undefined,
+    });
+
+    return {
+      node: result.node,
+      ceremony,
+      ackSub,
+      oldMaster,
+      newMasterPublic,
+      quorumContext,
+      broadcasts,
+      unicastCount: () => unicasts,
+    };
+  }
+
+  it("confirms inside the window, then REFUSES to execute outside it — nothing broadcast, nothing installed", async () => {
+    // MUTATION-PROOF TARGET: delete the step-0 gate in
+    // MasterRotationCeremony.execute and this test fails on all four
+    // assertions — the rotation broadcasts, the initiator installs the new
+    // master, and the raised error becomes an ack-timeout instead of a
+    // freshness refusal.
+    const s = await bootCeremonyScenario();
+    s.ceremony.confirm({ note: "operator confirms while the window is open" });
+    expect(s.ceremony.state).toBe("confirmed");
+
+    // The operator walks away and clicks execute after the collection window
+    // has closed. Fake timers move only the clock; execute throws before any
+    // timer is ever scheduled.
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(
+        new Date(Date.parse(s.quorumContext.expires_at) + HOUR_MS)
+      );
+      await expect(
+        s.ceremony.execute({ ack_subscription: s.ackSub })
+      ).rejects.toThrow(QuorumFreshnessError);
+    } finally {
+      vi.useRealTimers();
+    }
+
+    // The whole point: a fortress that installs a new master while every peer
+    // refuses the same rotation is split across two masters, and leaving that
+    // state needs a fresh guardian quorum.
     expect(s.node.getPinnedMaster().public_key).toBe(s.oldMaster.public_key);
-    expect(s.acks).toHaveLength(0);
+    expect(s.broadcasts).toHaveLength(0);
+    expect(s.unicastCount()).toBe(0);
+    expect(s.ceremony.state).toBe("failed");
+
+    s.ackSub.close();
   });
 
-  it("drops a REFUSED broadcast so repeated replays cannot grow receiver state", async () => {
-    // Rule 8: freshness enforcement makes refusal the guaranteed outcome for a
-    // replay, so the refusal path became the cheap one in this very change.
-    const s = await bootReceiverScenario(
-      contextOpenedAgo(REVOKE_QUORUM_MAX_LIFETIME_MS + HOUR_MS)
+  it("executes normally when the window is still open (the gate is not a blanket refusal)", async () => {
+    const s = await bootCeremonyScenario();
+    s.ceremony.confirm({ note: "operator confirms and executes promptly" });
+    const result = await s.ceremony.execute({ ack_subscription: s.ackSub });
+    expect(result.new_master_pubkey).toBe(s.newMasterPublic.public_key);
+    expect(s.node.getPinnedMaster().public_key).toBe(
+      s.newMasterPublic.public_key
     );
-    // Every replay must refuse identically; a retained rejected payload would
-    // short-circuit the second call on the cached entry instead.
-    for (let i = 0; i < 5; i++) {
-      await expect(
-        s.receiver.handleIncomingMasterRotationBroadcast(s.payload)
-      ).rejects.toThrow(QuorumFreshnessError);
-    }
-    expect(s.node.getPinnedMaster().public_key).toBe(s.oldMaster.public_key);
-    expect(s.acks).toHaveLength(0);
+    expect(s.broadcasts).toHaveLength(1);
+    s.ackSub.close();
   });
 });

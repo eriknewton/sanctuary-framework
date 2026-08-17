@@ -63,6 +63,7 @@ export {
   REVOKE_QUORUM_DEFAULT_LIFETIME_MS,
   REVOKE_QUORUM_CLOCK_SKEW_MS,
   mintRevokeCollectionContext,
+  mintCeremonyId,
   buildGuardianRevokeQuorumInput,
   buildGuardianDeviceRecoveryQuorumInput,
   buildGuardianMasterRotationQuorumInput,

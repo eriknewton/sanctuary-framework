@@ -203,6 +203,21 @@ export class MeshNode {
     REVOKE_DENIAL_AUDIT_GLOBAL_MAX,
     REVOKE_DENIAL_AUDIT_WINDOW_MS
   );
+  /**
+   * Third sibling governor, for the master-rotation broadcast refusal path
+   * (QI-SIBLING-02 fix round). QI-SIBLING-02 made refusal the GUARANTEED
+   * outcome for every stale or replayed rotation broadcast, which is precisely
+   * the rule-8 incentive shape the first two governors exist for: without a
+   * ceiling, an in-roster peer converts harvested-but-expired rotation quorums
+   * into zero-cost audit writes. Separate instance so the three paths' budgets
+   * and saturation summaries never conflate. Fed by
+   * `auditMasterRotationDenied` and drained by `flushRevokeDenialSaturation`.
+   */
+  private readonly masterRotationDenialAuditGovernor = new DenialAuditGovernor(
+    REVOKE_DENIAL_AUDIT_PER_EMITTER_MAX,
+    REVOKE_DENIAL_AUDIT_GLOBAL_MAX,
+    REVOKE_DENIAL_AUDIT_WINDOW_MS
+  );
 
   /**
    * Callback hooks - Follow-up #3 (failure-mode operator surfaces) wires these.
@@ -1792,6 +1807,16 @@ export class MeshNode {
     if (syncSummary) {
       this.pushUncorrelatedSyncSaturationSummary(syncSummary);
     }
+    // Third governor drains through the SAME production tick as its two
+    // siblings (QI-SIBLING-02 fix round). A governor whose summary only lands
+    // on the next `consider()` call would let an attacker who floods and then
+    // STOPS strand the suppressed-count until the next refusal, which is the
+    // "saturation never blinds forensics" invariant failing quietly.
+    const rotationSummary =
+      this.masterRotationDenialAuditGovernor.flushSaturationSummary();
+    if (rotationSummary) {
+      this.pushMasterRotationDenialSaturationSummary(rotationSummary);
+    }
   }
 
   private pushDenialSaturationSummary(summary: {
@@ -1807,6 +1832,85 @@ export class MeshNode {
       attestation_state: "peer_protocol_violation",
       payload: {
         operation: "node_revoke_denied_saturation_summary",
+        suppressed_count: summary.suppressed_count,
+        distinct_emitter_count: summary.distinct_emitter_count,
+      },
+      node_private_key: this.nodePrivateKey,
+    });
+    if (this.oldestPendingEntryAt === null) {
+      this.oldestPendingEntryAt = Date.now();
+    }
+    this.auditBuffer.push(entry);
+  }
+
+  /**
+   * Record a REFUSED `master_rotation` broadcast (QI-SIBLING-02 fix round).
+   *
+   * Called by `MasterRotationReceiver` when the relying-side window, the
+   * quorum, or the receiver's own bounded pending map refuses a broadcast, so
+   * an operator can tell a node that REFUSED a rotation from one that never
+   * received the broadcast. Before this existed the refusal path was silent
+   * except for a thrown promise the reference wiring discarded with `void`.
+   *
+   * `emitter_node` MUST be the AUTHENTICATED emitter — the `emitter_node` of a
+   * SignedEvent that already passed `verifyOrThrow` on the receive path, never
+   * a string lifted from the payload. Keying a per-origin budget on an
+   * attacker-supplied field would let one peer exhaust every other peer's
+   * bucket, which is the live defect class this repo already carries a rule for.
+   *
+   * Write-governed (rule 8) for the same reason as its two siblings: the
+   * refusal DECISION happened in the caller and is unaffected by suppression;
+   * this governs only whether the individual entry is written.
+   */
+  auditMasterRotationDenied(params: {
+    emitter_node: string;
+    rotated_at: string;
+    error: Error;
+    now?: Date;
+  }): void {
+    if (!this.nodePrivateKey) return;
+    const decision = this.masterRotationDenialAuditGovernor.consider(
+      params.emitter_node,
+      (params.now ?? new Date()).getTime()
+    );
+    if (decision.saturationSummary) {
+      this.pushMasterRotationDenialSaturationSummary(decision.saturationSummary);
+    }
+    if (!decision.writeIndividual) return;
+    const entry = sealAuditEntry({
+      emitter_node: this.config.node_id,
+      emitter_agent: "mesh",
+      emitter_principal: this.config.system_principal_id ?? "system",
+      policy_version: 0,
+      attestation_state: "peer_protocol_violation",
+      payload: {
+        operation: "master_rotation_denied",
+        event_type: "master_rotation",
+        peer_node: params.emitter_node,
+        rotated_at: params.rotated_at,
+        reason: params.error.message,
+      },
+      node_private_key: this.nodePrivateKey,
+    });
+    if (this.oldestPendingEntryAt === null) {
+      this.oldestPendingEntryAt = Date.now();
+    }
+    this.auditBuffer.push(entry);
+  }
+
+  private pushMasterRotationDenialSaturationSummary(summary: {
+    suppressed_count: number;
+    distinct_emitter_count: number;
+  }): void {
+    if (!this.nodePrivateKey) return;
+    const entry = sealAuditEntry({
+      emitter_node: this.config.node_id,
+      emitter_agent: "mesh",
+      emitter_principal: this.config.system_principal_id ?? "system",
+      policy_version: 0,
+      attestation_state: "peer_protocol_violation",
+      payload: {
+        operation: "master_rotation_denied_saturation_summary",
         suppressed_count: summary.suppressed_count,
         distinct_emitter_count: summary.distinct_emitter_count,
       },

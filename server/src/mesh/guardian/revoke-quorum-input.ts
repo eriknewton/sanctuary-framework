@@ -335,7 +335,14 @@ export function mintRevokeCollectionContext(params: {
   };
 }
 
-function mintCeremonyId(): string {
+/**
+ * The ONE ceremony-id minter under `server/src` (QI-SIBLING-02 fix round). Every
+ * ceremony that needs a 128-bit forensic nonce calls this rather than keeping a
+ * local copy: the four hand-written copies that existed before all shared the
+ * same `Math.random` fallback, and a structure scan (not a hand-listed file set)
+ * now pins that no second copy can reappear.
+ */
+export function mintCeremonyId(): string {
   // randomBytes throws if the platform CSPRNG is unavailable; we never fall
   // back to a weaker source (rule 5: no silent degradation of a security
   // primitive). A predictable ceremony_id would not break the signature
@@ -566,10 +573,20 @@ export function assertQuorumContextFresh(
   context: ParsedQuorumContext,
   freshness: FreshnessMode
 ): void {
+  // Refusal-diagnosability invariant (QI-SIBLING-02 fix round): the message
+  // names the ceremony it is ACTUALLY refusing, derived from the parsed
+  // context's own domain separator rather than a hand-written label. Three
+  // ceremonies share this assertion, so a hardcoded "revoke quorum context"
+  // string told a master-rotation operator the wrong ceremony had failed, which
+  // is the opposite of the "tell version skew from clock skew" property the
+  // clean break exists to give them. Deriving it means a fourth ceremony's
+  // messages are correct the day it adopts this function, with nothing to
+  // remember.
+  const ceremony = context.input_schema;
   const lifetimeMs = context.expires_at_ms - context.initiated_at_ms;
   if (lifetimeMs > REVOKE_QUORUM_MAX_LIFETIME_MS) {
     throw new QuorumFreshnessError(
-      `revoke quorum context lifetime ${lifetimeMs}ms exceeds max ${REVOKE_QUORUM_MAX_LIFETIME_MS}ms`
+      `quorum context (${ceremony}) lifetime ${lifetimeMs}ms exceeds max ${REVOKE_QUORUM_MAX_LIFETIME_MS}ms`
     );
   }
 
@@ -577,12 +594,12 @@ export function assertQuorumContextFresh(
     const nowMs = freshness.now.getTime();
     if (context.initiated_at_ms > nowMs + REVOKE_QUORUM_CLOCK_SKEW_MS) {
       throw new QuorumFreshnessError(
-        `revoke quorum context is future-dated beyond ${REVOKE_QUORUM_CLOCK_SKEW_MS}ms skew (initiated_at ahead of now)`
+        `quorum context (${ceremony}) is future-dated beyond ${REVOKE_QUORUM_CLOCK_SKEW_MS}ms skew (initiated_at ahead of now)`
       );
     }
     if (nowMs > context.expires_at_ms) {
       throw new QuorumFreshnessError(
-        `revoke quorum context expired (now past expires_at; no skew grace on expiry)`
+        `quorum context (${ceremony}) expired (now past expires_at; no skew grace on expiry)`
       );
     }
     return;
@@ -592,21 +609,21 @@ export function assertQuorumContextFresh(
   const effectiveMs = Date.parse(freshness.effective_at);
   if (!Number.isFinite(effectiveMs)) {
     throw new QuorumFreshnessError(
-      `sync-anchored freshness requires a parseable effective_at`
+      `sync-anchored freshness for (${ceremony}) requires a parseable effective_at`
     );
   }
   if (effectiveMs < context.initiated_at_ms - REVOKE_QUORUM_CLOCK_SKEW_MS) {
     // Skew-tolerant lower bound: a strict lower bound here would be permanent
     // fail-open trust of a revoked node whenever the emitter clock lagged.
     throw new QuorumFreshnessError(
-      `sync-anchored effective_at precedes initiated_at by more than ${REVOKE_QUORUM_CLOCK_SKEW_MS}ms skew`
+      `sync-anchored effective_at for (${ceremony}) precedes initiated_at by more than ${REVOKE_QUORUM_CLOCK_SKEW_MS}ms skew`
     );
   }
   if (effectiveMs > context.expires_at_ms) {
     // Strict upper bound, no grace: grace would only widen the window for a
     // back-dated effective_at forged by the sync-channel attacker.
     throw new QuorumFreshnessError(
-      `sync-anchored effective_at past expires_at (no grace)`
+      `sync-anchored effective_at for (${ceremony}) is past expires_at (no grace)`
     );
   }
 }

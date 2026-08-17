@@ -23,6 +23,25 @@ function read(rel: string): string {
   return readFileSync(join(REPO_ROOT, rel), "utf8");
 }
 
+/**
+ * Return the full parenthesised argument list that starts at `openIndex`,
+ * matching parentheses so a nested call or object literal cannot truncate it.
+ * A `[^}]*` regex stops at the FIRST closing brace, which is what let the old
+ * pin read a partial call and reach the wrong conclusion.
+ */
+function sliceBalancedCall(source: string, openIndex: number): string {
+  let depth = 0;
+  for (let i = openIndex; i < source.length; i++) {
+    const ch = source[i];
+    if (ch === "(") depth += 1;
+    else if (ch === ")") {
+      depth -= 1;
+      if (depth === 0) return source.slice(openIndex, i + 1);
+    }
+  }
+  return source.slice(openIndex);
+}
+
 function walk(dir: string): string[] {
   const out: string[] = [];
   for (const name of readdirSync(dir)) {
@@ -41,15 +60,48 @@ describe("C12-REPLAY parity structure (T9)", () => {
     expect(nodeRevoke).not.toMatch(/export function revokeQuorumInput/);
     // The hand-mirror method is deleted.
     expect(meshNode).not.toMatch(/private nodeRevokeQuorumInput/);
-    // Neither v1 Math.random ceremony-id generator survives.
-    expect(nodeRevoke).not.toMatch(/Math\.random/);
-    expect(read("server/src/mesh/recovery-flows/device-recovery.ts")).not.toMatch(
-      /Math\.random/
-    );
-    // QI-SIBLING-02 retired the third copy, in the master-rotation ceremony.
-    expect(
-      read("server/src/mesh/recovery-flows/master-rotation.ts")
-    ).not.toMatch(/Math\.random/);
+  });
+
+  it("NO mesh module degrades randomness to Math.random — SCAN, not a hand-listed file set", () => {
+    // Fix-round correction (QI-SIBLING-02 gate finding): the prior version of
+    // this guard named three files by hand and therefore could not see a FOURTH
+    // `generateCeremonyId` copy with the same `Math.random` fallback living in
+    // recovery-flows/canonical-audit-promotion.ts. A guard that enumerates its
+    // targets has the same blind spot as a hand-mirrored registry (AGENTS.md
+    // rule 5: assert over the full set, never over the entries someone
+    // remembered). Every ceremony under mesh/ mints its nonces through
+    // `core/random`, which throws rather than degrading (MUST-NEVER #5).
+    for (const file of walk(MESH_SRC)) {
+      const src = readFileSync(file, "utf8");
+      // Prose ABOUT the retired fallback is legitimate and is what documents
+      // why the rule exists; only executable uses are the finding.
+      const code = src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+      expect(
+        /Math\.random/.test(code),
+        `Math.random randomness fallback in ${file}`
+      ).toBe(false);
+    }
+  });
+
+  it("the CSPRNG ceremony-id minter has exactly ONE definition — SCAN over all of server/src", () => {
+    // Companion to the scan above: deleting a `Math.random` fallback is not the
+    // same as retiring the duplicate that carried it. A second hand-written
+    // 128-bit-hex minter would pass the scan above while still being the
+    // second implementation rule 5 forbids, so pin the DEFINITION count too.
+    const definition = /function\s+(?:mint|generate)CeremonyId\s*\(/g;
+    const sharedModule = join(MESH_SRC, "guardian", "revoke-quorum-input.ts");
+    let definitionSites = 0;
+    for (const file of walk(SERVER_SRC)) {
+      const matches = readFileSync(file, "utf8").match(definition) ?? [];
+      if (matches.length > 0) {
+        expect(
+          file,
+          `ceremony-id minter defined outside the shared module: ${file}`
+        ).toBe(sharedModule);
+        definitionSites += matches.length;
+      }
+    }
+    expect(definitionSites).toBe(1);
   });
 
   it("the shared module is the ONLY constructor of the v2 MASTER-ROTATION input shape", () => {
@@ -75,11 +127,30 @@ describe("C12-REPLAY parity structure (T9)", () => {
     // OTHER half of rule 10: a site that reused a timestamp lifted from the
     // payload would typecheck and would enforce nothing. Each production call
     // must read a fresh clock at its own moment of verification.
+    //
+    // Fix-round correction (QI-SIBLING-02 gate finding): the prior matcher was
+    // `acceptMasterRotation\(\{`, so a future call site passing a PRE-BUILT
+    // object — `acceptMasterRotation(p)` — matched nothing and the pin passed
+    // silently. Match EVERY invocation, then assert on the argument form, so a
+    // shape this pin cannot reason about fails loudly instead of being absent
+    // by omission (rule 11: the next instance is silently absent by omission).
     for (const file of walk(SERVER_SRC)) {
       const src = readFileSync(file, "utf8");
-      for (const call of src.match(/acceptMasterRotation\(\{[^}]*\}/gs) ?? []) {
-        expect(call, `acceptMasterRotation without a fresh clock in ${file}`)
-          .toMatch(/now:\s*new Date\(\)/);
+      // Definitions, re-exports and import statements are not call sites.
+      const code = src
+        .replace(/^import[\s\S]*?from\s+"[^"]*";$/gm, "")
+        .replace(/export function acceptMasterRotation/g, "");
+      const invocations = [...code.matchAll(/\bacceptMasterRotation\s*\(/g)];
+      for (const match of invocations) {
+        const call = sliceBalancedCall(code, match.index + match[0].length - 1);
+        expect(
+          call,
+          `acceptMasterRotation called with a pre-built object (the clock cannot be verified here) in ${file}: ${call}`
+        ).toMatch(/^\(\s*\{/);
+        expect(
+          call,
+          `acceptMasterRotation without a fresh clock in ${file}`
+        ).toMatch(/now:\s*new Date\(\)/);
       }
     }
   });

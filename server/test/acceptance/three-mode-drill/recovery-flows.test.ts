@@ -728,8 +728,14 @@ describe("WP-MVP-8 ceremony 4 — master rotation + broadcast orchestration with
         node.onLifecycleEvent = (evt, kind) => {
           existingHandler(evt, kind);
           if (evt.event_type === "master_rotation" && kind === "received") {
+            // `evt.emitter_node` is AUTHENTICATED here: the receive path runs
+            // verifyOrThrow before the router fires this hook with
+            // kind === "received". The `void` call is deliberate and now safe —
+            // the receiver converts refusals to an audit entry plus
+            // onEnvelopeRejected instead of rejecting the promise.
             void rec.handleIncomingMasterRotationBroadcast(
-              evt.payload as import("../../../src/mesh/types.js").MasterRotationPayload
+              evt.payload as import("../../../src/mesh/types.js").MasterRotationPayload,
+              { emitter_node: evt.emitter_node }
             );
           }
         };
@@ -858,7 +864,8 @@ describe("WP-MVP-8 ceremony 4 — master rotation + broadcast orchestration with
         prevLifecycleB(evt, kind);
         if (evt.event_type === "master_rotation" && kind === "received") {
           void recB.handleIncomingMasterRotationBroadcast(
-            evt.payload as import("../../../src/mesh/types.js").MasterRotationPayload
+            evt.payload as import("../../../src/mesh/types.js").MasterRotationPayload,
+            { emitter_node: evt.emitter_node }
           );
         }
       };
