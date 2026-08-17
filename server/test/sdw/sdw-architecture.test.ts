@@ -1,3 +1,10 @@
+// fail-before-exempt: this file is the SDW architecture GATE, not a test of a
+// behavior change. Widening it to recognize an additional compliant shape
+// cannot fail against the base ref, because the base's source already passes
+// the narrower rule; "fails before the fix" has no meaning for a gate
+// widening. The widening is given its own teeth instead: the recognizer has
+// direct unit tests below covering both directions, including the exact
+// laundering case (a real write slipped in ahead of the refusal).
 import { readFile, readdir } from "node:fs/promises";
 import { relative, join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -95,6 +102,52 @@ describe("SDW architecture write gate", () => {
     await expect(
       storage.write(prepared.namespace, prepared.storageKey, prepared.data),
     ).rejects.toBeInstanceOf(SdwValidationError);
+  });
+
+  describe("unconditional-refusal recognizer", () => {
+    // The gate accepts a write body that refuses EVERY write as satisfying the
+    // no-unauthorized-SDW-write property, since there is no write to authorize.
+    // That concession is only sound while the recognizer is strict, so it is
+    // tested in both directions here rather than trusted from its own source.
+    it("accepts a body that is nothing but a throw", () => {
+      expect(
+        writeBlockRefusesUnconditionally(
+          '{\n  throw new ReadOnlyStorageViolationError("write", namespace, key);\n}',
+        ),
+      ).toBe(true);
+    });
+
+    it("accepts a throw-only body carrying comments", () => {
+      expect(
+        writeBlockRefusesUnconditionally(
+          '{\n  // refuses every write, whatever the namespace\n  /* see the guard header */\n  throw new Error("no");\n}',
+        ),
+      ).toBe(true);
+    });
+
+    it("rejects a body that writes before it throws", () => {
+      // The laundering case: a real write, then a refusal that makes the method
+      // still look read-only from its last line.
+      expect(
+        writeBlockRefusesUnconditionally(
+          '{\n  await this.inner.write(namespace, key, data);\n  throw new Error("no");\n}',
+        ),
+      ).toBe(false);
+    });
+
+    it("rejects a conditional refusal", () => {
+      expect(
+        writeBlockRefusesUnconditionally(
+          '{\n  if (isSdwNamespace(namespace)) throw new Error("no");\n  await this.inner.write(namespace, key, data);\n}',
+        ),
+      ).toBe(false);
+    });
+
+    it("rejects an empty body", () => {
+      // A silent no-op is the shape MUST-NEVER #5 forbids: the caller believes
+      // the write landed. It must never read as a compliant refusal.
+      expect(writeBlockRefusesUnconditionally("{\n}")).toBe(false);
+    });
   });
 });
 
