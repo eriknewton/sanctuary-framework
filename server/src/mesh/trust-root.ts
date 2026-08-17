@@ -42,6 +42,10 @@ import {
   MeshChainError,
   MeshReservedCapabilityBitError,
 } from "./errors.js";
+import {
+  NO_AUTHENTICATED_PEER,
+  isReservedNodeId,
+} from "./lifecycle/envelope-rejection.js";
 import type {
   FederationRootRotationCertificate,
   FortressMasterPublicKey,
@@ -169,6 +173,19 @@ export function issueNodeIdentityCertificate(params: {
   if (params.node_mode !== "sovereign_tee" && params.tee_attestation_hash !== undefined) {
     throw new MeshChainError(
       "TEE attestation hash is only accepted for sovereign_tee node certificates"
+    );
+  }
+  // CHOKEPOINT (rule 5). A reserved node id is refused at ISSUANCE so no
+  // downstream consumer has to defend against one: an id that never reaches a
+  // certificate never reaches a roster, an envelope, or an alert subject. The
+  // failure mode this forecloses, from the outside: a peer admitted under the
+  // un-attributable sentinel's literal name shares the bucket that stands for
+  // "nobody was authenticated," so its refusals and every unauthenticated
+  // sender's are indistinguishable to an operator. Predicate lives in
+  // `lifecycle/envelope-rejection.ts`; see its cross-file pin.
+  if (isReservedNodeId(params.node_id)) {
+    throw new MeshChainError(
+      `node cert node_id is reserved and cannot be issued (empty, or the ${NO_AUTHENTICATED_PEER} sentinel)`
     );
   }
 

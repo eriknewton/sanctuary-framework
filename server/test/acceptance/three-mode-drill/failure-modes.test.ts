@@ -22,6 +22,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 
 import { InMemoryCounterStore } from "../../../src/mesh/lifecycle/index.js";
+import { authenticatedPeer } from "../../../src/mesh/lifecycle/envelope-rejection.js";
 import {
   FAILURE_MODE,
   FailureModeDashboardBridge,
@@ -205,7 +206,10 @@ describe("three-mode-drill §12.8 - five §8 failure modes end-to-end", () => {
       // test-harness helper to drive a non-monotonic signal without
       // modifying the sealed emit path. Spec §8.2 second bullet.
       drill.nodeA.onHeartbeatReceived({
-        emitter_node: drill.nodeIdB,
+        // The heartbeat hook fires only after envelope verification, so its
+        // `emitter_node` is branded; the harness mints it the same way the
+        // production router does.
+        emitter_node: authenticatedPeer(drill.nodeIdB),
         monotonic_seq: 500,
         policy_version_vector: {},
         audit_seq: 0,
@@ -213,7 +217,10 @@ describe("three-mode-drill §12.8 - five §8 failure modes end-to-end", () => {
       });
       // Now drive a non-monotonic follow-up - strictly lower than the baseline.
       drill.nodeA.onHeartbeatReceived({
-        emitter_node: drill.nodeIdB,
+        // The heartbeat hook fires only after envelope verification, so its
+        // `emitter_node` is branded; the harness mints it the same way the
+        // production router does.
+        emitter_node: authenticatedPeer(drill.nodeIdB),
         monotonic_seq: 200,
         policy_version_vector: {},
         audit_seq: 0,

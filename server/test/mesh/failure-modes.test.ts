@@ -53,6 +53,11 @@ import {
   applySyncResponse,
   createAutoApproveJoinApprover,
 } from "../../src/mesh/lifecycle/index.js";
+import {
+  NO_AUTHENTICATED_PEER,
+  REJECTION_REASON_CLASS,
+  authenticatedPeer,
+} from "../../src/mesh/lifecycle/envelope-rejection.js";
 import { packSignedEvent } from "../../src/mesh/envelope.js";
 import { encodePolicyBlob } from "../../src/policy-engine/canonical-policy.js";
 import type { CompiledPolicy } from "../../src/policy-engine/types.js";
@@ -220,7 +225,9 @@ describe("§8.2 compromised detection", () => {
     const f = await makeFixture();
     // First heartbeat - establish baseline.
     f.node.onHeartbeatReceived({
-      emitter_node: "node-2",
+      // UEK-02: the heartbeat hook only ever fires post-verification, so the
+      // fixture mints the brand the same way the production router does.
+      emitter_node: authenticatedPeer("node-2"),
       monotonic_seq: 5,
       policy_version_vector: {},
       audit_seq: 0,
@@ -228,7 +235,9 @@ describe("§8.2 compromised detection", () => {
     });
     // Second heartbeat with seq <= prior - rollback canary.
     f.node.onHeartbeatReceived({
-      emitter_node: "node-2",
+      // UEK-02: the heartbeat hook only ever fires post-verification, so the
+      // fixture mints the brand the same way the production router does.
+      emitter_node: authenticatedPeer("node-2"),
       monotonic_seq: 3,
       policy_version_vector: {},
       audit_seq: 0,
@@ -533,7 +542,9 @@ describe("FailureModeDashboardBridge - Mesh Health via existing SSE channel", ()
     f.node.onEnvelopeRejected({
       error: new MeshSignatureError("test"),
       event_type: "policy_update",
-      emitter_node: "node-2",
+      rejection_origin: NO_AUTHENTICATED_PEER,
+      claimed_emitter_node: "node-2",
+      reason_class: REJECTION_REASON_CLASS.ENVELOPE_UNVERIFIED,
     });
     // Trigger a snapshot push via tick.
     f.detector.tick(Date.now());

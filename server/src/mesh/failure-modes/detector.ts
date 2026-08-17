@@ -29,6 +29,11 @@ import {
 } from "../errors.js";
 import { MeshNode } from "../lifecycle/mesh-node.js";
 import type { NodePresenceState } from "../lifecycle/constants.js";
+import {
+  NO_AUTHENTICATED_PEER,
+  isCompromiseSignal,
+  type RejectionOrigin,
+} from "../lifecycle/envelope-rejection.js";
 import type {
   AuditBatch,
   LocatorUpdatePayload,
@@ -119,7 +124,37 @@ export class FailureModeDetector {
   private readonly node: MeshNode;
   private readonly emit: AlertEmitContext;
   private readonly opts: Required<FailureModeDetectorOptions>;
+  /**
+   * Retained alerts. STATED BOUND (rule 8), open rather than closed: nothing in
+   * this class deletes from this map, and `snapshot()` walks it on every tick,
+   * so its size and the per-tick work both track the number of detections. A
+   * cap alone is not the fix — an admission-only cap over a map nothing removes
+   * from becomes a permanent refusal whose symptom is silence, and evicting
+   * open alerts discards pending operator decisions. Closing it needs a
+   * lifetime rule, which is a design. Bare id UEK-02; it resolves only in the
+   * private register.
+   */
   private readonly alerts = new Map<string, FailureModeAlert>();
+  /**
+   * Per-origin aggregate compromise signals.
+   *
+   * INVARIANT — WHOSE CREDIBILITY THE KEY CARRIES (rule 7), per ARM, because
+   * the two writers differ and the difference is the point:
+   *   - from `onEnvelopeRejected` the key is a `RejectionOrigin`: either an
+   *     identity THIS node authenticated by verifying a signature against a
+   *     roster-resident certificate chained to the pinned fortress master key,
+   *     or the single shared `NO_AUTHENTICATED_PEER` sentinel standing for
+   *     "the transport that delivered this authenticated nobody." It is never
+   *     an `emitter_node` read out of an event whose verification failed;
+   *   - from `onAuditBatchRejected` the key is the batch's own `emitter_node`,
+   *     which `ingestAuditBatch` authenticated before the rollback and
+   *     continuity checks but NOT before the signature check. That arm's
+   *     residual is bare id UEK-02, which resolves only in the private
+   *     register.
+   *
+   * The key type is therefore `string` and not the branded union: it states
+   * what is true of the whole map rather than what is true of one writer.
+   */
   private readonly compromised = new Map<string, CompromisedSignalState>();
   private readonly splitBrainConflicts = new Map<string, SplitBrainConflict>();
   private timer: ReturnType<typeof setInterval> | null = null;
@@ -277,6 +312,15 @@ export class FailureModeDetector {
     // §8.3 rollback / chain discontinuity - surfaces from canonical-audit
     // batch ingestion path (caught + observable via onAuditBatchRejected).
     this.node.onAuditBatchRejected = (info) => {
+      // ATTRIBUTION ON THIS ARM (rule 7), stated because its sibling below
+      // reaches the opposite conclusion. `ingestAuditBatch` verifies the batch
+      // signature against the roster-resident certificate BEFORE the
+      // chain-proof, monotonicity and continuity checks, so for a rollback or
+      // continuity refusal this emitter IS authenticated and naming it is what
+      // gives the operator's `revoke_compromised` decision a subject. The
+      // signature-failure arm below is the case where it is not, and telling
+      // the two apart needs `ingestAuditBatch` to report which stage failed:
+      // bare id UEK-02, which resolves only in the private register.
       const target = info.emitter_node ?? "<unknown>";
       const isRollback = info.error instanceof MeshRollbackDetectedError;
       const isChainDiscontinuity =
@@ -316,20 +360,49 @@ export class FailureModeDetector {
       }
     };
 
-    // Envelope rejections - `key_attestation` failure / signature mismatch
-    // surfaces here when a peer's signed event fails verification.
+    // Envelope rejections — a peer's signed event failed verification, OR a
+    // verified peer's event was refused on admission.
+    //
+    // UEK-02 / QI-02-F12, the two invariants this handler enforces:
+    //
+    //   ATTRIBUTION. `target_node` is `info.rejection_origin`, which the type
+    //   system guarantees is an identity this node authenticated or the shared
+    //   un-attributable sentinel. `info.claimed_emitter_node` — on the
+    //   `envelope_unverified` path, a string chosen by whoever sent bytes that
+    //   failed verification, about whoever they wanted blamed — is recorded in
+    //   `detail` under an explicitly unverified key and is NEVER the target,
+    //   never the map key, and never interpolated as the subject of a
+    //   sentence. Those three prohibitions are the invariant; a reviewer
+    //   checking this handler is checking exactly them.
+    //
+    //   SEVERITY. Only a compromise-class reason produces a COMPROMISED alert
+    //   and increments the attestation-failure tally. A freshness or capacity
+    //   refusal produces PEER_REFUSED, which `computeRollup` renders as
+    //   `degraded`, because those refusals describe this node's clock or its
+    //   own local bounds rather than any evidence about the peer.
     this.node.onEnvelopeRejected = (info) => {
-      const target = info.emitter_node ?? "<unknown>";
-      const state = this.getOrInitCompromised(target);
-      state.attestation_failures += 1;
+      const target = info.rejection_origin;
+      const compromiseClass = isCompromiseSignal(info.reason_class);
+      if (compromiseClass) {
+        // Tally only compromise-class refusals: counting clock skew toward a
+        // compromise score is how a benign drift accumulates into a false
+        // accusation over time.
+        this.getOrInitCompromised(target).attestation_failures += 1;
+      }
       const alert = this.makeAlert({
-        mode: FAILURE_MODE.COMPROMISED,
+        mode: compromiseClass
+          ? FAILURE_MODE.COMPROMISED
+          : FAILURE_MODE.PEER_REFUSED,
         target,
-        message: `Envelope verification failed for event_type=${info.event_type} from ${target}: ${info.error.message}.`,
+        message: compromiseClass
+          ? `An event of type ${info.event_type} received ${describeOrigin(target)} was refused (${info.reason_class}): ${info.error.message}.`
+          : `An event of type ${info.event_type} received ${describeOrigin(target)} was refused by this node (${info.reason_class}): ${info.error.message}. This describes a timing or capacity condition on this node, not evidence that the peer is compromised. Check clock synchronisation before treating it as an incident.`,
         detail: {
-          signal: "envelope_verification_failure",
+          signal: "envelope_rejected",
           event_type: info.event_type,
+          reason_class: info.reason_class,
           error_name: info.error.name,
+          ...claimedEmitterDetail(info.claimed_emitter_node),
         },
       });
       this.publishAlert(alert);
@@ -437,17 +510,32 @@ export class FailureModeDetector {
   // Detection helpers
   // ─────────────────────────────────────────────────────────────────────
 
-  private getOrInitCompromised(nodeId: string): CompromisedSignalState {
-    let state = this.compromised.get(nodeId);
-    if (!state) {
-      state = {
-        last_monotonic_seq: 0,
-        attestation_failures: 0,
-        audit_chain_discontinuities: 0,
-        rollback_detected: false,
-      };
-      this.compromised.set(nodeId, state);
-    }
+  /**
+   * Aggregate signal state for `origin`, creating it on first sight.
+   *
+   * STATED BOUND (rule 8), open rather than closed: entries are never removed,
+   * so the map's size tracks the number of distinct origins seen. It is not
+   * capped here, because an admission-only cap over a map nothing removes from
+   * becomes a permanent refusal whose symptom is silence — the degradation
+   * MUST-NEVER #5 forbids. Closing it needs a lifetime rule (roster membership
+   * is the natural one), which is a design. Bare id UEK-02; it resolves only in
+   * the private register.
+   *
+   * What DID change and is closed: the key population. See the `compromised`
+   * field's per-arm invariant — the envelope-rejection arm can no longer key
+   * this map on an unverified claim, so the arm that used to grow with an
+   * inbound stream's chosen strings now grows only with authenticated peers.
+   */
+  private getOrInitCompromised(origin: string): CompromisedSignalState {
+    let state = this.compromised.get(origin);
+    if (state) return state;
+    state = {
+      last_monotonic_seq: 0,
+      attestation_failures: 0,
+      audit_chain_discontinuities: 0,
+      rollback_detected: false,
+    };
+    this.compromised.set(origin, state);
     return state;
   }
 
@@ -841,6 +929,17 @@ export class FailureModeDetector {
     return [...this.splitBrainConflicts.values()];
   }
 
+  /**
+   * Read-only access to the origins this detector holds aggregate compromise
+   * signals for (UEK-02). Exists so a reader — an operator surface, or a
+   * regression test — can observe the map's key population DIRECTLY rather
+   * than infer it from alert volume. Key provenance differs per writing arm;
+   * see the `compromised` field's invariant.
+   */
+  listCompromisedOrigins(): string[] {
+    return [...this.compromised.keys()];
+  }
+
   /** Read-only - has the dmswitch fired (and unlocked guardian-revocation)? */
   isDmswitchUnlocked(): boolean {
     return this.dmswitchUnlockedFor;
@@ -892,10 +991,87 @@ export class FailureModeDetector {
     if (presence === "expired") return "expired";
     if (presence === "revoked") return "compromised";
     if (presence === "unreachable") return "unreachable";
-    if (flags.includes(FAILURE_MODE.COMPROMISED)) return "compromised";
+    // Severity comes from the per-mode table, never from a catch-all — see
+    // MODE_ROLLUP. `some` rather than `includes(COMPROMISED)`: the escalating
+    // set is the table's business, not this function's.
+    if (flags.some((mode) => MODE_ROLLUP[mode] === "compromised")) {
+      return "compromised";
+    }
     if (flags.length > 0) return "degraded";
     return "ok";
   }
+}
+
+/**
+ * Mesh Health severity for each failure mode, as a TOTAL table.
+ *
+ * WHY A TABLE AND NOT A FALLTHROUGH (QI-02-F12; AGENTS.md rule 11). This
+ * replaced `flags.includes(COMPROMISED) ? "compromised" : "degraded"`, which
+ * is exhaustive only over the one mode its author enumerated: every other
+ * mode, present and future, inherited `degraded` by omission. That is fine
+ * until a mode is added whose correct severity is `compromised`, at which
+ * point the fallthrough silently under-reports it, and no test over the
+ * catch-all can see the difference because the catch-all has no per-mode
+ * behaviour to assert.
+ *
+ * `Record<FailureMode, ...>` makes the table total AT THE TYPE LEVEL: adding a
+ * value to `FAILURE_MODE` without deciding its severity here is a compile
+ * error. That compile error IS the guard — it forces the decision to be made
+ * by someone, in the same change, rather than defaulted by a fallthrough.
+ *
+ * FAILURE MODE FROM THE OUTSIDE if a row is set wrong: the Mesh Health panel
+ * reads `compromised` for a node whose only flag describes THIS observer's
+ * clock or its own local ceilings, which is the false accusation
+ * `peer_refused` exists to prevent. Its row is `degraded` deliberately, and a
+ * regression test pins that exact pair.
+ *
+ * CROSS-FILE PIN: must cover every key of `FAILURE_MODE` in `./constants.ts`.
+ */
+const MODE_ROLLUP: Record<FailureMode, "compromised" | "degraded"> = {
+  [FAILURE_MODE.OFFLINE]: "degraded",
+  [FAILURE_MODE.COMPROMISED]: "compromised",
+  [FAILURE_MODE.ROLLBACK]: "degraded",
+  [FAILURE_MODE.SPLIT_BRAIN]: "degraded",
+  [FAILURE_MODE.CANONICAL_AUDIT_LOSS]: "degraded",
+  // QI-02-F12. A refusal caused by this node's own clock, correlation table,
+  // or local ceilings is NOT evidence about the peer, so it must never
+  // escalate. Changing this to "compromised" reinstates the accusation.
+  [FAILURE_MODE.PEER_REFUSED]: "degraded",
+};
+
+/**
+ * Render a `RejectionOrigin` for an operator-facing sentence.
+ *
+ * The sentinel must never read as a node name. `NO_AUTHENTICATED_PEER`'s
+ * literal value is a wire/audit key, not English, and interpolating it raw
+ * produced sentences of the form "Node unknown-relaying-peer has rolled back"
+ * — which an operator can reasonably read as a node actually called that. The
+ * replacement says what is true: the delivering transport authenticated
+ * nobody, so this refusal cannot be attributed to any peer.
+ */
+function describeOrigin(origin: RejectionOrigin): string {
+  return origin === NO_AUTHENTICATED_PEER
+    ? "from an unauthenticated sender (no verified peer identity on this transport)"
+    : `from node ${origin}`;
+}
+
+/**
+ * Attach the unverified claimed emitter to an alert's `detail`, under a key
+ * whose NAME states that it is a claim (rule 7: a trust-bearing field names
+ * what consuming it means; this field's meaning is "do not trust this"). A
+ * consumer reading `claimed_emitter_node_unverified` cannot mistake it for the
+ * attribution — that is `target_node`, always.
+ *
+ * Returns an empty object when there is no claim, so the key is absent rather
+ * than present-and-null: an absent key cannot be rendered as an identity by a
+ * downstream template, and a null one can.
+ */
+function claimedEmitterDetail(
+  claimed: string | undefined
+): Record<string, unknown> {
+  return claimed === undefined
+    ? {}
+    : { claimed_emitter_node_unverified: claimed };
 }
 
 function generateId(): string {

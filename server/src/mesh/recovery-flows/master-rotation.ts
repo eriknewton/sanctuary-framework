@@ -48,6 +48,10 @@ import { fromBase64url, toBase64url } from "../../core/encoding.js";
 import type { MeshTransport } from "../in-memory-transport.js";
 import { MeshNode } from "../lifecycle/mesh-node.js";
 import {
+  classifyAdmissionRefusal,
+  type AuthenticatedPeer,
+} from "../lifecycle/envelope-rejection.js";
+import {
   acceptMasterRotation,
   assertQuorumContextFresh,
   buildMasterRotationPayload,
@@ -536,10 +540,16 @@ interface PendingRotationOnReceiver {
    * on another. Pairing them structurally is what lets `surfaceBroadcastRefusal`
    * require a non-optional emitter, so no refusal can be recorded against an
    * unknown origin by omission.
+   *
+   * UEK-02: the field is now typed `AuthenticatedPeer`, so the paragraph above
+   * is enforced rather than requested. A caller holding only an unverified
+   * `string` cannot construct this object at all, and the one place that
+   * asserts "this was verified" is `authenticatedPeer()` at the receive path's
+   * mint site.
    */
   broadcast?: {
     payload: MasterRotationPayload;
-    emitter_node: string;
+    emitter_node: AuthenticatedPeer;
   };
 }
 
@@ -665,7 +675,7 @@ export class MasterRotationReceiver {
    */
   async handleIncomingMasterRotationBroadcast(
     payload: MasterRotationPayload,
-    params: { emitter_node: string }
+    params: { emitter_node: AuthenticatedPeer }
   ): Promise<void> {
     const entry = this.pending.get(payload.rotated_at) ?? {};
     entry.broadcast = { payload, emitter_node: params.emitter_node };
@@ -806,9 +816,13 @@ export class MasterRotationReceiver {
    * emitter that caused it. A refusal attributed to "unknown" is a forensic dead
    * end and an unkeyed governor bucket every peer would share, so the type
    * forecloses it instead of a runtime fallback papering over it.
+   *
+   * UEK-02: `emitterNode` is now `AuthenticatedPeer` rather than `string`, so
+   * "required" is joined by "provably verified upstream" — a required
+   * parameter still accepts an unverified value, a branded one does not.
    */
   private surfaceBroadcastRefusal(
-    emitterNode: string,
+    emitterNode: AuthenticatedPeer,
     rotatedAt: string,
     error: Error
   ): void {
@@ -835,21 +849,36 @@ export class MasterRotationReceiver {
     // BEFORE this line, so a broken operator hook loses its own delivery and
     // never the evidence.
     //
-    // STATED BOUND (rule 8), accepted rather than closed. The audit write above
-    // is GOVERNED per authenticated emitter; THIS hook is not. It fires once per
-    // refusal, and freshness enforcement makes refusal the guaranteed outcome for
-    // every replay, so the work one refusal causes downstream of this line is
-    // unbounded in the NUMBER of refusals an in-roster peer can drive — the
-    // governed audit entry is not the whole per-refusal cost. It is not bounded
-    // here because the consumer is a shared boundary with its own already-owned
-    // gap: bounding it means changing that boundary for every caller, which is a
-    // design rather than a fix round. Bare ids UEK-02 and QI-02-F12; they resolve
-    // only in the private register. Nothing on this path bounds it today.
+    // STATED BOUND (rule 8), PARTIALLY closed and still live. Bare ids UEK-02
+    // and QI-02-F12; they resolve only in the private register.
+    //
+    // WHAT CLOSED: the identity this refusal is attributed to. The consumer of
+    // `onEnvelopeRejected` now keys per-origin state on an AUTHENTICATED
+    // origin, so a refusal can no longer open a bucket under a name the sender
+    // chose. That closed at the shared boundary, which is where every caller
+    // gets it at once.
+    //
+    // WHAT DID NOT: the per-refusal WORK, which is what the bound stated here
+    // was always about, and it is unchanged. The audit write above is GOVERNED
+    // per authenticated emitter; this hook is not. It fires once per refusal,
+    // costing a signature each time, and freshness enforcement makes refusal
+    // the guaranteed outcome for every replay — so the work an in-roster peer
+    // can drive downstream of this line still scales with the NUMBER of
+    // refusals it chooses to cause. Bounding retained state is not bounding
+    // invocations. Nothing on this path bounds that today.
+    //
+    // QI-02-F12: `acceptMasterRotation` refuses for two very different
+    // reasons, and the class decides which one an operator is told. A lapsed
+    // collection window or a skewed receiver clock (`QuorumFreshnessError`) is
+    // a timing relationship between two nodes and must NOT be rendered as a
+    // compromise accusation against the rotation initiator; a bad or missing
+    // guardian quorum is an authority violation and must.
     try {
       this.opts.node.onEnvelopeRejected({
         error,
         event_type: "master_rotation",
-        emitter_node: emitterNode,
+        rejection_origin: emitterNode,
+        reason_class: classifyAdmissionRefusal(error),
       });
     } catch {
       // Nothing further to escalate to: the audit entry is already sealed.

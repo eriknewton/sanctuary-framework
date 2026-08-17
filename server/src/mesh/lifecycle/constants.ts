@@ -8,6 +8,8 @@
  * Spec: Federation_Protocol_V0.1_Spec_2026-04-21.md §3 (node lifecycle).
  */
 
+import { NO_AUTHENTICATED_PEER } from "./envelope-rejection.js";
+
 /**
  * HKDF info-string prefix for deriving the per-node at-rest wrapping key.
  *
@@ -142,9 +144,20 @@ export const SYNC_REQUEST_ID_EXPIRY_MS = 10 * 60 * 1_000;
  * poison event into ONE shared bucket, so an attacker rotating the claimed
  * `emitter_node` per event cannot mint unbounded governor buckets (rule 8)
  * the way a per-claimed-identity key would allow.
+ *
+ * CROSS-FILE PIN (UEK-02, rule 5): this is now an ALIAS of
+ * `NO_AUTHENTICATED_PEER` in `envelope-rejection.ts`, not a second literal —
+ * must match that constant's "VALUE PINNED, NOT CHOSEN" note. The same
+ * sentinel keys this governor, the failure-mode detector's per-origin
+ * compromise-signal buckets, and every other consumer of an un-attributable
+ * refusal; two hand-mirrored copies of one sentinel is the drift shape rule 5
+ * exists to stop, and here a drift would silently split what must be ONE
+ * shared bucket into two. The alias is retained (rather than replacing every
+ * use) because this name states WHICH un-attributable case the sync path is
+ * in, at the site that reads it.
  */
-export const SYNC_TABLE_AUDIT_UNKNOWN_RELAYING_PEER =
-  "unknown-relaying-peer" as const;
+export const SYNC_TABLE_AUDIT_UNKNOWN_RELAYING_PEER: typeof NO_AUTHENTICATED_PEER =
+  NO_AUTHENTICATED_PEER;
 
 /**
  * Bound on the outstanding-request set (self-inflicted growth only — ids are

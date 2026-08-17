@@ -29,6 +29,10 @@ import {
   MeshChainError,
   MeshReservedCapabilityBitError,
 } from "./errors.js";
+import {
+  NO_AUTHENTICATED_PEER,
+  isReservedNodeId,
+} from "./lifecycle/envelope-rejection.js";
 import { generateFortressId, verifyCertChain } from "./trust-root.js";
 import type {
   FortressMasterPublicKey,
@@ -258,6 +262,15 @@ export async function issueNodeIdentityCertificateV2Hybrid(params: {
   if (params.capabilities === 0) {
     throw new MeshChainError(
       "v2 hybrid node cert MUST set at least CAP_STANDARD_FORTRESS_NODE (bit 0)"
+    );
+  }
+  // CHOKEPOINT (rule 5) — the v2 hybrid sibling of the same guard in
+  // `trust-root.ts::issueNodeIdentityCertificate`. Both issuers apply it,
+  // because a reserved id refused on one suite and accepted on the other is
+  // exactly the hand-mirrored-registry drift rule 5 exists to stop.
+  if (isReservedNodeId(params.node_id)) {
+    throw new MeshChainError(
+      `node cert node_id is reserved and cannot be issued (empty, or the ${NO_AUTHENTICATED_PEER} sentinel)`
     );
   }
   assertHybridPublicKeys("node_public_keys", params.node_public_keys);

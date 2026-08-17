@@ -17,6 +17,7 @@
  */
 
 import { afterEach, describe, expect, it } from "vitest";
+import { authenticatedPeer } from "../../../src/mesh/lifecycle/envelope-rejection.js";
 
 import { generateKeypair } from "../../../src/core/identity.js";
 import { toBase64url } from "../../../src/core/encoding.js";
@@ -740,7 +741,7 @@ describe("WP-MVP-8 ceremony 4 — master rotation + broadcast orchestration with
             // onEnvelopeRejected instead of rejecting the promise.
             void rec.handleIncomingMasterRotationBroadcast(
               evt.payload as import("../../../src/mesh/types.js").MasterRotationPayload,
-              { emitter_node: evt.emitter_node }
+              { emitter_node: authenticatedPeer(evt.emitter_node) }
             );
           }
         };
@@ -870,7 +871,7 @@ describe("WP-MVP-8 ceremony 4 — master rotation + broadcast orchestration with
         if (evt.event_type === "master_rotation" && kind === "received") {
           void recB.handleIncomingMasterRotationBroadcast(
             evt.payload as import("../../../src/mesh/types.js").MasterRotationPayload,
-            { emitter_node: evt.emitter_node }
+            { emitter_node: authenticatedPeer(evt.emitter_node) }
           );
         }
       };
