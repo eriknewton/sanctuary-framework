@@ -9,8 +9,14 @@
  * `c12-replay-parity.test.ts` ("TZ-WINDOW-01" case — must match the import it
  * asserts from `core/time.js`); this file carries the halves a module-scoped
  * pin cannot: single definition, the consumers outside that module, and a
- * server-wide freeze on the bare `Date.parse` idiom so new timestamp parsing
- * routes through the predicate instead of re-testing locally.
+ * server-wide freeze on the bare `Date.parse` idiom so a NEW bare `Date.parse`
+ * site cannot land silently.
+ *
+ * SCOPE BOUND of the freeze (the scope is part of the claim): it is lexical
+ * over the `Date.parse` spelling only. It does not see the `new Date(<string>)`
+ * idiom (register id TZ-SIB-04) or an aliased reference to `Date.parse` —
+ * distinguishing string arguments needs type information, which is a separate
+ * guard, not a wider regex. Zero aliasing sites exist today.
  *
  * WHY by-name and not by count: a bare occurrence count stays green when a
  * call is swapped onto a different field — that exact defect shape has shipped
