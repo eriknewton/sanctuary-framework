@@ -17,22 +17,45 @@
 # edit history, so the undo is incomplete. A gate that corrects after the fact
 # is worth nothing on this rule. It has to refuse before the text ships.
 #
-# WHAT THIS CAN AND CANNOT DO (stated bound, and it is deliberately narrow).
-# This is a TEXT scan over a body of prose. It catches the three shapes that
-# actually recur: an anchor (a path, a path plus a line number), a claim of
-# presence ("this is live on main"), and the operating manual (a reproduction,
-# an invocation, an attacker sentence). It also catches the hardest of the three
-# real instances — a sentence naming NO file that still localizes a defect by
-# pairing a defect CLASS with a scope this repository already exposes — by
-# requiring both halves to co-occur inside one paragraph (rule D8).
+# WHAT THIS CAN AND CANNOT DO (stated bound; read it before trusting a green).
+# This is a TEXT scan over a body of prose. It catches an anchor (a path, a
+# directory in a source tree, a path plus a line number), a claim of presence
+# ("this is live on main"), the operating manual (a reproduction, an invocation,
+# an attacker sentence), a severity ranking, a defect CLASS paired with a scope
+# this repository already exposes (D8), and a piece of state described as
+# unbounded (D10).
 #
-# It CANNOT catch a description that uses none of this repository's vocabulary
-# and none of the defect-class phrasings: a wholly original paraphrase, an
-# analogy, a screenshot, a link to an external write-up, or a defect described
-# purely in terms invented for the occasion. No text scan can, and claiming
-# otherwise would be the same overclaim this repository already has a rule
-# against. Treat a green result as "the known shapes are absent", never as "this
-# body is safe to publish". A human still reads it.
+# THE BOUND, STATED SHARPLY, BECAUSE AN EARLIER VERSION OF THIS COMMENT WAS
+# WRONG. It first claimed the only escape was "a description using none of this
+# repository's vocabulary". That was an overclaim, and it was disproved the same
+# day: two real scrubs from the triggering wave BOTH used this repository's
+# vocabulary and BOTH passed. The accurate statement is narrower and less
+# comfortable:
+#
+#   D8's class half, and D10, are ENUMERATED PHRASE LISTS. They are not a model
+#   of meaning. A defect described in a phrasing that is not on those lists
+#   passes, even when it names a scope, even when every word is ordinary
+#   in-house vocabulary. Growing the lists is how this file improves; each
+#   addition is one shape, not a class of shapes.
+#
+# Known gaps, named so the claim never exceeds the reach:
+#   - A defect class in a phrasing absent from DEFECT_CLASS_RE. The residual and
+#     resource families were added only after real text slipped through; assume
+#     more families exist and are unlisted.
+#   - D8 needs a scope locator. A class description carrying no scope, no path,
+#     and no D10 mechanism shape passes.
+#   - A protection-negation outside the resource family (see MECHANISM_NEG). The
+#     family is bounded on purpose so capability-absence phrasing keeps passing,
+#     and that boundary is a gap by construction, not an oversight.
+#   - An image, a link to an external write-up, or an analogy carrying the
+#     meaning outside the words.
+#   - Under `--extract header`, only a file's leading comment block. A comment
+#     further down the file is not seen.
+#   - Outside a git checkout, D8 falls back to a short static scope list, which
+#     is a materially weaker scan. It says so in its own report.
+#
+# So: a clean result means "none of the enumerated shapes is present". It does
+# not mean the text is safe to publish, and it never substitutes for a reader.
 #
 # WHAT IT DOES NOT PRINT: the offending text. Ever. The report gives a rule id,
 # a line number, and the correction. Echoing the matched sentence would relocate
@@ -224,11 +247,55 @@ NAMED_SCOPE_RE="(^|[^A-Za-z0-9_-])(${SCOPE_NAMES})([^A-Za-z0-9_-]|$)"
 # ---------------------------------------------------------------------------
 DEFECT_NOUN='(bug|defect|vulnerabilit(y|ies)|vuln|flaw|exploit|weakness|security hole|attack|regression|misbehaviou?r)'
 
-DEFECT_CLASS_RE='(fails? open|failed open|fail-open|silently (accept|allow|pass|ignor|degrad|downgrad|skip)|accepts? (a |an |the )?(forged|replayed|stale|expired|unsigned|unverified|attacker|spoofed|tampered)|(can|could|may) be (forged|replayed|bypassed|spoofed|tampered|reused|downgraded|defeated|subverted|escalated)|(is|was|are|were) (never|not) (verified|checked|validated|authenticated|bounded|capped|enforced)|without (verifying|checking|validating|authenticating|a signature|authentication)|(missing|absent) (a )?(signature|bounds|input|auth|authentication|validation|verification)|no (signature|bounds|input|authentication) check|unbounded (growth|retention|memory|writes)|wrong-allow|allows? an unauthenticated|grants? [a-z ]{0,24}without (a |any )?(check|approval|verification|authentication)|trusts? (the )?(caller|client|attacker|payload)[- ]supplied|bypass(es|ed|ing) the)'
+DEFECT_CLASS_RE='(fails? open|failed open|fail-open|silently (accept|allow|pass|ignor|degrad|downgrad|skip)|accepts? (a |an |the )?(forged|replayed|stale|expired|unsigned|unverified|attacker|spoofed|tampered)|(can|could|may) be (forged|replayed|bypassed|spoofed|tampered|reused|downgraded|defeated|subverted|escalated)|(is|was|are|were) (never|not) (verified|checked|validated|authenticated|bounded|capped|enforced)|(is|are|was|were|remains?|stays?) (still )?(unverified|unchecked|unvalidated|unauthenticated|unsigned|uncapped|unbounded|ungoverned)|without (verifying|checking|validating|authenticating|a signature|authentication)|(missing|absent) (a )?(signature|bounds|input|auth|authentication|validation|verification)|no (signature|bounds|input|authentication) check|unbounded (growth|retention|memory|writes)|wrong-allow|allows? an unauthenticated|grants? [a-z ]{0,24}without (a |any )?(check|approval|verification|authentication)|trusts? (the )?(caller|client|attacker|payload)[- ]supplied|bypass(es|ed|ing) the|(further|another|additional|remaining|other|second|third) (instance|occurrence|case|call ?site|site|variant|sibling|cop(y|ies))s? of|(instance|occurrence|case|variant|sibling)s? of (the |this |that )?same|(exists?|remains?|persists?|survives?) (outside|beyond|elsewhere))'
+# The last three alternatives are the RESIDUAL-EXISTENCE shape, added
+# 2026-08-16 after a real scrub passed the first version of this file. A
+# sentence saying that a further instance of the same class exists somewhere
+# else is a defect description: it tells a reader the class recurs and roughly
+# where, which is all a search needs. It carries no defect noun and no
+# behavioural verb, so nothing above it matched.
+#
+# WHAT WAS DELIBERATELY NOT ADDED, and why. The obvious-looking fix was to match
+# the nominalised forms `silent-degradation` / `silent-downgrade`, since the
+# verb forms are already covered. That reds a real merged commit subject,
+# "silent-downgrade detection for checkpoint signing", which is an honest
+# capability name. The separator is not the phrase, it is what the sentence
+# PREDICATES: naming a class you now DETECT is the capability; saying an
+# instance of it EXISTS is the disclosure. Matching the noun would have made
+# this guard red the honest half, and a guard that reds honest bodies is
+# switched off within a week.
+
+# Resource-exhaustion mechanism, matched WITHOUT needing a scope locator (rule
+# D10). Added 2026-08-16 for a real scrub that named no path and no subsystem,
+# only mechanism: a protection-negation adjective attached to a piece of state.
+#
+# The adjective list is the RESOURCE-BOUND family only. Deliberately excluded:
+# `unproven`, `unimplemented`, `untested`, `unsupported`, `undocumented`. Those
+# describe the ABSENCE OF A CAPABILITY, which MUST-NEVER #9 requires be stated
+# plainly and never softened. Protection-absence is the disclosure;
+# capability-absence is the honesty obligation. Failure mode if that line moves:
+# the guard starts refusing "this capability is unproven on Linux", which is the
+# one sentence the rule most wants written.
+#
+# Attributive use after a rejection verb ("rejects an unsigned checkpoint") is
+# NOT matched, because that describes what the change now refuses rather than
+# what the system currently lacks; only the predicate and state-noun forms are.
+MECHANISM_NEG='(uncapped|unbounded|ungoverned|unlimited|unthrottled|unmetered)'
+MECHANISM_STATE='(collection|map|list|queue|buffer|history|table|store|cache|set|array|growth|retention|writes?|appends?|loop|log|ledger|roster|registry)'
+MECHANISM_RE="(is|are|was|were|remains?|stays?|sits?|lands?|left|goes|go) ([a-z-]+ ){0,3}${MECHANISM_NEG}|${MECHANISM_NEG} ([a-z-]+ ){0,2}${MECHANISM_STATE}|(call|calls|called|writ(e|es|ing)|append(s|ing)?|push(es|ing)?|enqueue(s|ing)?|invoke(s|d)?) [^.]{0,40}${MECHANISM_NEG}"
 
 DEFECT_CONTEXT_RE="(${DEFECT_NOUN}|${DEFECT_CLASS_RE})"
 
 CODE_PATH_RE='(^|[^A-Za-z0-9_.-])[A-Za-z0-9_-][A-Za-z0-9_./-]*\.(ts|tsx|js|jsx|mjs|cjs|rs|swift|py|go|java|kt|rb|c|h|cc|cpp)([^A-Za-z0-9]|$)'
+# A path into a SOURCE TREE with no filename on the end (server/src,
+# server/src/mesh, castle-wall-daemon/src/enforce). It is an anchor for the same
+# reason a filename is, one directory coarser, and a real scrub used exactly
+# this form. Rule D8 also treats it as a locator; this is the second,
+# independent net, because D8's other half is an enumerated phrase list and the
+# enumeration is the fragile part. Scoped to a `/src` segment on purpose:
+# naming scripts/ or .github/ locates nothing, and reddening those would red
+# honest bodies.
+SRC_DIR_PATH_RE='(^|[^A-Za-z0-9_./-])[a-z][a-z0-9_-]*/src(/[a-z0-9_.-]+)*([^A-Za-z0-9_/-]|$)'
 CONFIG_PATH_RE='(^|[^A-Za-z0-9_.-])[A-Za-z0-9_-][A-Za-z0-9_./-]*\.(yml|yaml|json|toml|sh|md|txt|cfg|conf|plist|entitlements|sql)([^A-Za-z0-9]|$)'
 LINE_ANCHOR_RE='[A-Za-z0-9_][A-Za-z0-9_./-]*\.[A-Za-z]{1,6}:[0-9]+'
 INVOCATION_RE='(^|[[:space:]])(\$ |sudo |npx |npm |node |curl |wget |bash |sh |python3? |\./|printf |echo )'
@@ -259,7 +326,7 @@ SEVERITY_RE='severity[[:space:]]*[:=][[:space:]]*(critical|high|medium|low)'
 # paragraph that matches nothing else. The must-fail corpus in
 # server/test/structure/disclosure-guard.test.ts is what catches that, since
 # every corpus entry has to still red.
-UNION_RE="${LINE_ANCHOR_RE}|${CODE_PATH_RE}|${CONFIG_PATH_RE}|${PRESENT_RE}|${REPRO_RE}|${REPRO_CS_RE}|${EXPLOIT_RE}|${SEVERITY_CS_RE}|${SEVERITY_RE}|${DEFECT_CONTEXT_RE}"
+UNION_RE="${LINE_ANCHOR_RE}|${CODE_PATH_RE}|${SRC_DIR_PATH_RE}|${CONFIG_PATH_RE}|${PRESENT_RE}|${REPRO_RE}|${REPRO_CS_RE}|${EXPLOIT_RE}|${SEVERITY_CS_RE}|${SEVERITY_RE}|${MECHANISM_RE}|${DEFECT_CONTEXT_RE}"
 
 # ---------------------------------------------------------------------------
 # Reporting. A hit prints the rule id, the line, why the rule exists, and the
@@ -321,11 +388,11 @@ check_paragraph() { # check_paragraph <text> <first-line-number>
   # D2-CODEPATH — a path to a source file. Band depends on the surface (see
   # SURFACES in the header): refused outright in a pull-request description,
   # proximity-only in a test header, whose job is to name the module under test.
-  if matches_cs "$text" "$CODE_PATH_RE"; then
+  if matches_cs "$text" "$CODE_PATH_RE" || matches_cs "$text" "$SRC_DIR_PATH_RE"; then
     if [ "$SURFACE" = "pr-body" ] || [ "$has_defect" -eq 1 ]; then
-      hit "D2-CODEPATH" "$line" "a source-file path" \
-        "a path into implementation code narrows a reader to the defect without naming it." \
-        "describe the capability ('adds relying-side freshness checks'), not the file it lives in."
+      hit "D2-CODEPATH" "$line" "a path into a source tree" \
+        "a path into implementation code narrows a reader to the defect without naming it, and a directory does it one level coarser." \
+        "name the layer in prose ('bounded to the mesh layer'), not the path."
     fi
   fi
 
@@ -393,6 +460,20 @@ check_paragraph() { # check_paragraph <text> <first-line-number>
   # precisely the shape that survived a careful hand-scrub and still reached a
   # public surface. BOTH halves are required: a subsystem name alone is a normal
   # commit subject, a class phrase alone is a general statement about software.
+  # D10-MECHANISM — a protection-negation attached to a piece of state, with NO
+  # scope required. This is the one rule that stands alone without a locator,
+  # because the shape it catches names no path and no subsystem: it describes
+  # the mechanism instead ("the shared collection those entries land in is
+  # uncapped"). A reader does not need the location when the mechanism is that
+  # specific. It is bounded to the resource family (see MECHANISM_NEG) so that
+  # capability-absence phrasing, which the rule REQUIRES be stated plainly,
+  # keeps passing.
+  if matches "$text" "$MECHANISM_RE"; then
+    hit "D10-MECHANISM" "$line" "a piece of state described as unbounded" \
+      "naming what a component lacks is a defect description even with no path and no subsystem in the sentence." \
+      "state the protection this change adds ('adds a per-origin quota and an eviction rule'); the residual belongs in the private register under a bare id."
+  fi
+
   if matches "$text" "$DEFECT_CLASS_RE"; then
     if matches "$text" "$NAMED_SCOPE_RE" || matches_cs "$text" "$PATH_SCOPE_RE"; then
       hit "D8-LOCALIZED" "$line" "a defect class beside a scope in this repository" \
@@ -552,9 +633,13 @@ if [ "$TOTAL" -eq 0 ]; then
     printf 'list instead of the tree-derived one. This scan was WEAKER than a scan\n'
     printf 'run inside the repository.\n'
   fi
-  printf 'BOUND: a text scan cannot see an original paraphrase, an analogy, an\n'
-  printf 'image, or a link to an external write-up. Clean means "the known shapes\n'
-  printf 'are absent", not "safe to publish". A human still reads it.\n'
+  printf 'BOUND: the class rules (D8, D10) are ENUMERATED PHRASE LISTS, not a model\n'
+  printf 'of meaning. A defect described in a phrasing that is not on those lists\n'
+  printf 'passes, even when it names a scope and uses ordinary in-house words: two\n'
+  printf 'real scrubs did exactly that. Also unseen: an image, an external link, an\n'
+  printf 'analogy, and (under --extract header) anything below the leading comment.\n'
+  printf 'Clean means "none of the enumerated shapes is present", NOT "safe to\n'
+  printf 'publish". A human still reads it. Full gap list: top of this script.\n'
   exit 0
 fi
 

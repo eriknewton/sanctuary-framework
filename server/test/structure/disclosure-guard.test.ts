@@ -99,6 +99,24 @@ function runChecker(
  * MUST FAIL. Each entry is labelled with the shape it stands for, so a future
  * editor can tell which class an entry is defending and does not delete the
  * only witness for one.
+ *
+ * THE FOUR ENTRIES MARKED `wave analogue` ARE THE REAL CORPUS, ONE STEP REMOVED.
+ * They come from the four texts that actually reached a surface during the
+ * triggering wave, and the first version of this checker refused only two of
+ * them. Each analogue preserves every token the matcher keys on and the exact
+ * grammar of the original; only the referents are swapped, so the sentence no
+ * longer describes anything real in this repository.
+ *
+ * That substitution is not squeamishness, it is the rule applying to itself.
+ * Committing the originals would publish four defect descriptions permanently,
+ * in-tree, which is the thing MUST-NEVER #9 forbids and the thing this file
+ * exists to prevent. A guard whose own fixtures violate it would be worthless.
+ * The originals were run against the checker at build time and each is refused;
+ * they live only in the private register, addressed by bare id.
+ *
+ * The consequence to be honest about: an analogue proves the SHAPE is caught,
+ * not that the original is. Those two claims come apart if a future edit keys a
+ * rule on a referent rather than a shape. Do not do that.
  */
 const MUST_FAIL: ReadonlyArray<{ shape: string; body: string }> = [
   {
@@ -183,6 +201,41 @@ const MUST_FAIL: ReadonlyArray<{ shape: string; body: string }> = [
     shape: "path beside defect language, config extension",
     body: "The regression sits in the policy loaded from principal-policy.yaml.",
   },
+  // ---- the four wave analogues ----
+  {
+    shape: "wave analogue 1: reproduction plus a file-and-line anchor",
+    body: [
+      "Reproduction: start the listener with the default profile and replay the",
+      "frame. The mishandling is in server/src/router.ts:270.",
+    ].join("\n"),
+  },
+  {
+    shape: "wave analogue 2: first scrub, still naming a file outside the layer",
+    body: "The same handling is wrong in server/src/recovery/escrow.ts, outside this layer.",
+  },
+  {
+    // The second scrub. Named no file, and the first version of this checker
+    // passed it. Two rules refuse it now: the source-tree directory (D2) and the
+    // residual-existence class beside a scope (D8). Both were added for it.
+    shape: "wave analogue 3: residual instance of a class, plus a source-tree directory",
+    body: [
+      "A further instance of the same silent-degradation randomness class exists",
+      "outside the recovery layer. It is tracked in the private register and is out",
+      "of scope for this row; the new scan here is bounded to `server/src/recovery`,",
+      "and widening it is part of that separate change.",
+    ].join("\n"),
+  },
+  {
+    // Named no path and no subsystem at all, only mechanism. Refused by D10,
+    // which is the one rule that stands alone without a locator.
+    shape: "wave analogue 4: mechanism only, no path and no subsystem",
+    body: [
+      "Not fully bounded: the governor bounds how many entries this path may write",
+      "per window. The shared roster those entries land in is uncapped, and the new",
+      "drop paths also call the rejection hook ungoverned into a shared unbounded",
+      "roster.",
+    ].join("\n"),
+  },
 ];
 
 /**
@@ -259,6 +312,31 @@ const MUST_PASS: ReadonlyArray<{ shape: string; body: string }> = [
   {
     shape: "reproducible builds, which are a wanted property",
     body: "The release tarball is now byte-for-byte reproducible across hosts.",
+  },
+  // ---- the separators D10 and the residual class must not cross ----
+  // Each of these sits one word away from a must-fail entry. They are the
+  // evidence that closing wave analogues 3 and 4 did not cost the honest half;
+  // without them, a later widening of MECHANISM_NEG or the residual family
+  // would look free.
+  {
+    shape: "protection-negation attributive, after a rejection verb",
+    body: "Rejects an unsigned checkpoint and refuses an unauthenticated bind.",
+  },
+  {
+    shape: "protection-negation attributive, on the object of a verification",
+    body: "Verification now rejects unverified input at the boundary.",
+  },
+  {
+    shape: "the positive form of what D10 refuses",
+    body: "Adds a per-origin quota and an eviction rule to the retention map.",
+  },
+  {
+    shape: "a cap stated as a capability",
+    body: "The queue is now capped at a fixed number of entries.",
+  },
+  {
+    shape: "an ordinal that is not a residual-instance claim",
+    body: "Adds a second guard to the sync path.",
   },
 ];
 
@@ -349,6 +427,55 @@ describe("disclosure guard — checker behaviour", () => {
     const body =
       "Covers server/src/audit/index.ts, where the regression was introduced.";
     expect(runChecker(body, "test-header").status).toBe(1);
+  });
+
+  it("treats a source-tree directory as an anchor, not only a path with a filename", () => {
+    // The second scrub of the triggering wave carried a directory and no
+    // filename, and the first version of this checker read that as clean.
+    const run = runChecker("The new scan here is bounded to server/src/mesh.");
+    expect(run.status).toBe(1);
+    expect(run.stdout).toContain("D2-CODEPATH");
+    // Naming a directory that is not a source tree still passes: reddening
+    // scripts/ or .github/ would locate nothing and would red honest bodies.
+    expect(runChecker("Adds the job under .github/workflows.").status).toBe(0);
+  });
+
+  it("refuses a residual-instance claim beside a scope, with no file named", () => {
+    const run = runChecker(
+      "A further instance of the same class exists outside the mesh layer.",
+    );
+    expect(run.status).toBe(1);
+    expect(run.stdout).toContain("D8-LOCALIZED");
+  });
+
+  it("refuses a piece of state described as unbounded, with no locator at all", () => {
+    // D10 is the only rule that stands alone without a scope. The shape it
+    // catches names no path and no subsystem, only mechanism.
+    const run = runChecker("The shared collection those entries land in is uncapped.");
+    expect(run.status).toBe(1);
+    expect(run.stdout).toContain("D10-MECHANISM");
+    expect(runChecker("The drop path writes into a shared unbounded collection.").status).toBe(1);
+  });
+
+  it("separates protection-absence from capability-absence", () => {
+    // The load-bearing distinction inside MUST-NEVER #9. Saying a component
+    // LACKS A PROTECTION is a defect description. Saying a CAPABILITY IS ABSENT
+    // OR UNPROVEN is an honesty obligation that must never be softened, so it
+    // must never be refused. If a future widening of MECHANISM_NEG breaks this,
+    // the guard has started punishing the honest half of the rule it enforces.
+    for (const honest of [
+      "This capability is unproven on Linux.",
+      "Linux egress enforcement is not implemented.",
+      "The wrapping path is untested on this platform and the row stays partial.",
+    ]) {
+      expect(runChecker(honest).status, `refused an honest bound: ${honest}`).toBe(0);
+    }
+    for (const disclosure of [
+      "The retention map is uncapped.",
+      "Entries are appended ungoverned.",
+    ]) {
+      expect(runChecker(disclosure).status, `passed a disclosure: ${disclosure}`).toBe(1);
+    }
   });
 });
 
