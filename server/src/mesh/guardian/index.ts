@@ -64,6 +64,7 @@ export {
   REVOKE_QUORUM_CLOCK_SKEW_MS,
   mintRevokeCollectionContext,
   mintCeremonyId,
+  parseIsoInstantWithOffset,
   buildGuardianRevokeQuorumInput,
   buildGuardianDeviceRecoveryQuorumInput,
   buildGuardianMasterRotationQuorumInput,
