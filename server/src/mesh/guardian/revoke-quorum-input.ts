@@ -146,7 +146,7 @@ const CEREMONY_ID_HEX_RE = /^[0-9a-f]{32}$/;
  *
  * Accepts:  `2026-08-16T00:00:00Z`, `2026-08-16T00:00:00.000Z`,
  *           `2026-08-16T00:00:00+05:30`, `2026-08-16T00:00:00.123456789-08:00`.
- * Rejects:  an offset-less date-time (`2026-08-16T00:00:00`, the exploitable
+ * Rejects:  an offset-less date-time (`2026-08-16T00:00:00`, the ambiguous
  *           case), a bare year (`2026`), a date only (`2026-08-16`), a
  *           human-readable date (`Aug 16 2026`), a space date/time separator,
  *           a missing seconds field, and the BASIC-format offset `+0000`.
@@ -154,9 +154,9 @@ const CEREMONY_ID_HEX_RE = /^[0-9a-f]{32}$/;
  * Extended-format offsets only, deliberately: every producer of these fields in
  * this tree mints them with `Date.prototype.toISOString`, which emits `Z`, so
  * accepting more spellings widens the parse surface without serving any caller
- * that exists. The non-offset rejections are not exploitable on their own; they
- * are refused because a parser that shrugs at `2026` while its failure reason
- * reads `*_not_iso` hides the real gap from the next reader.
+ * that exists. The non-offset rejections carry no ambiguity risk of their own;
+ * they are refused because a parser that shrugs at `2026` while its failure
+ * reason reads `*_not_iso` hides the real gap from the next reader.
  *
  * `\d{1,9}` fractional digits = one digit through nanosecond precision;
  * `toISOString` emits exactly 3.

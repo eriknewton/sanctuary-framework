@@ -422,15 +422,34 @@ describe("C12-REPLAY parity structure (T9)", () => {
     expect(parseCalls[0]).toBeGreaterThan(predicateStart);
     expect(parseCalls[0]).toBeLessThan(predicateEnd);
 
-    // Each of the four timestamp fields reaches the predicate by name. A field
-    // that stopped calling it would still typecheck (it would just parse
-    // leniently again), so the names are asserted, not inferred.
-    const predicateCalls = [
+    // Each of the four timestamp fields reaches the predicate by name. A bare
+    // occurrence COUNT asserts arity, not identity: a refactor that dropped the
+    // rotated_at call and added a second call on some other field would still
+    // count 5 and stay green, which is exactly the defect shape this PR exists
+    // to fix (a check that looks field-by-field but is actually a count). So
+    // this asserts the four call-site argument spellings are ALL present, not
+    // just that five calls exist.
+    const predicateCallMatches = [
       ...src.matchAll(/parseIsoInstantWithOffset\s*\(/g),
-    ].length;
-    // 1 definition + 4 call sites: initiated_at, expires_at, effective_at,
-    // rotated_at.
-    expect(predicateCalls).toBe(5);
+    ];
+    const predicateCallArgs = predicateCallMatches.map((m) => {
+      const openIndex = (m.index ?? 0) + m[0].length - 1;
+      return sliceBalancedCall(src, openIndex);
+    });
+    // 1 definition (`(value: string)`) + 4 call sites: initiated_at,
+    // expires_at, effective_at, rotated_at.
+    expect(predicateCallArgs.length).toBe(5);
+    for (const argSpelling of [
+      "initiatedAt",
+      "expiresAt",
+      "freshness.effective_at",
+      "params.rotated_at",
+    ]) {
+      expect(
+        predicateCallArgs.some((call) => call.includes(argSpelling)),
+        `no parseIsoInstantWithOffset call site passes ${argSpelling}`
+      ).toBe(true);
+    }
   });
 
   it("no second freshness-assertion or ceremony-id generator exists under server/src", () => {
