@@ -21,6 +21,23 @@
 import { isReservedEventType, isV01EventType } from "./constants.js";
 import type { SignedEvent } from "./types.js";
 
+/**
+ * A registered handler for one v0.1 event type.
+ *
+ * MAY BE ASYNC, AND THAT IS THE WHOLE REASON THE CONTAINMENT BELOW EXISTS.
+ * This signature admits `Promise<void>`, so a handler can fail in two
+ * structurally different ways — a synchronous `throw`, and a rejected promise
+ * the caller never sees — and a guard that catches only the first is scoped to
+ * whichever handlers happen to be synchronous on the day it was written.
+ * Adding the single word `async` to a registered handler is typecheck-clean
+ * and would silently move it from the guarded shape to the unguarded one.
+ *
+ * CROSS-FILE PIN: must match the containment note at `dispatch` below, and the
+ * one at `MeshNode.handleIncomingBroadcast`'s `router.dispatch` call in
+ * `lifecycle/mesh-node.ts`. All three describe one invariant: NO handler fault
+ * of EITHER shape reaches the `void` the transport subscription invokes the
+ * receive path with. Change one, change all three.
+ */
 export type V01Handler<Payload = unknown> = (
   evt: SignedEvent<Payload>
 ) => void | Promise<void>;
@@ -58,8 +75,33 @@ export class MeshRouter {
       this.counters.dropped_unknown++;
       return false;
     }
-    void h(evt);
+    // COUNTED BEFORE INVOCATION, DELIBERATELY. These three counters record the
+    // ROUTING DECISION this method made — reserved, unknown, or handed to a
+    // handler — not whether the handler then succeeded. Incrementing after the
+    // call made the number mean "dispatched AND returned synchronously without
+    // throwing", which is a fourth thing nobody asked for and which an async
+    // handler cannot report anyway: its outcome is not known when this method
+    // returns. So the sync and async shapes now agree, and a contained fault
+    // does not silently vanish from the routing counters. `stats()` is
+    // observability, never a trust input; no accept/deny decision reads it.
     this.counters.dispatched++;
+    // CONTAINMENT (must match the note on `V01Handler` above, and the one at
+    // `MeshNode.handleIncomingBroadcast`'s call site). A SYNC throw from
+    // `h(evt)` happens before this line's `Promise.resolve` and propagates out
+    // of `dispatch` unchanged — that is deliberate, the caller contains it and
+    // this method must not start swallowing what the caller already handles.
+    // An ASYNC rejection has no such caller: the receive path has already
+    // returned by the time it settles, so nothing is left to catch it and
+    // Node's default for an unhandled rejection is to terminate the process.
+    // Attaching the handler here is what makes the guarantee hold for BOTH
+    // shapes rather than for whichever handlers are synchronous today.
+    //
+    // The `.catch` is a no-op with the same rationale as the sync side: the
+    // envelope was verified and the receive recorded before dispatch, so a
+    // contained fault loses that handler's own delivery and nothing else, and
+    // there is no surface left to escalate to — the operator surfaces ARE the
+    // hooks a handler reaches.
+    void Promise.resolve(h(evt)).catch(() => {});
     return true;
   }
 

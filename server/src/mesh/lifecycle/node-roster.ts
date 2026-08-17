@@ -17,7 +17,11 @@
  */
 
 import { DEFAULTS, hasReservedCapabilityBits } from "../constants.js";
-import { MeshReservedCapabilityBitError } from "../errors.js";
+import { MeshChainError, MeshReservedCapabilityBitError } from "../errors.js";
+import {
+  NO_AUTHENTICATED_PEER,
+  isReservedNodeId,
+} from "./envelope-rejection.js";
 import type { NodeIdentityCertificate } from "../types.js";
 import type { NodePresenceState } from "./constants.js";
 import type { DropoutEvent, RosterEntry } from "./types.js";
@@ -68,6 +72,22 @@ export class NodeRoster {
     // where a caller bypasses or forgets the chain verification step.
     if (hasReservedCapabilityBits(certificate.capabilities)) {
       throw new MeshReservedCapabilityBitError(certificate.capabilities);
+    }
+    // CHOKEPOINT (rule 5). The roster is what makes a node id AUTHENTICATABLE
+    // — `lookupNodeCert` / `lookupActiveNodeCert` are how envelope
+    // verification resolves an emitter — so refusing a reserved id here is
+    // what establishes, for every downstream consumer, that a verified
+    // `emitter_node` is never empty and never the un-attributable sentinel's
+    // literal value. Issuance refuses the same ids, and this is the relying
+    // side of that pair: a certificate this node did not issue still has to
+    // pass here. FAILURE MODE FROM THE OUTSIDE, if this guard is removed: the
+    // join is accepted and looks healthy, and the damage shows up much later
+    // as an alert whose subject is a peer that shares the "nobody was
+    // authenticated" bucket. Predicate: `envelope-rejection.ts`.
+    if (isReservedNodeId(certificate.node_id)) {
+      throw new MeshChainError(
+        `roster refuses a reserved node_id (empty, or the ${NO_AUTHENTICATED_PEER} sentinel)`
+      );
     }
     const existing = this.entries.get(certificate.node_id);
     if (existing) {

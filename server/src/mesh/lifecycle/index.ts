@@ -22,6 +22,16 @@
 export * from "./constants.js";
 export * from "./types.js";
 export {
+  NO_AUTHENTICATED_PEER,
+  REJECTION_REASON_CLASS,
+  authenticatedPeer,
+  classifyAdmissionRefusal,
+  isCompromiseSignal,
+  type AuthenticatedPeer,
+  type RejectionOrigin,
+  type RejectionReasonClass,
+} from "./envelope-rejection.js";
+export {
   InMemoryCounterStore,
 } from "./counters.js";
 export {

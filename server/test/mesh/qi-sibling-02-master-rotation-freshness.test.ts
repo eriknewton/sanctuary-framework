@@ -19,6 +19,12 @@
  */
 
 import { describe, it, expect, vi } from "vitest";
+import {
+  REJECTION_REASON_CLASS,
+  authenticatedPeer,
+  type RejectionOrigin,
+  type RejectionReasonClass,
+} from "../../src/mesh/lifecycle/envelope-rejection.js";
 import { toBase64url } from "../../src/core/encoding.js";
 import { generateKeypair } from "../../src/core/identity.js";
 import {
@@ -73,7 +79,10 @@ const HOUR_MS = 60 * 60 * 1000;
  * passed `verifyOrThrow`; a per-peer quota keyed on anything the payload
  * carries would be attacker-selectable and therefore no quota at all.
  */
-const PEER = "peer-initiator";
+// UEK-02: the reference wiring mints the brand from the receive path's
+// already-verified `evt.emitter_node`; the fixture does the same so it
+// exercises the production shape rather than a widened one.
+const PEER = authenticatedPeer("peer-initiator");
 
 interface GuardianKp {
   identity: GuardianIdentity;
@@ -680,8 +689,12 @@ describe("QI-SIBLING-02 wired consumer — MasterRotationReceiver enforces the w
     // The refusal surface the wiring layer consumes. Captured here because the
     // whole point of the fix is that a refusing node is DISTINGUISHABLE from one
     // that never received the broadcast.
-    const rejections: Array<{ error: Error; event_type: string; emitter_node?: string }> =
-      [];
+    const rejections: Array<{
+      error: Error;
+      event_type: string;
+      rejection_origin: RejectionOrigin;
+      reason_class: RejectionReasonClass;
+    }> = [];
     result.node.onEnvelopeRejected = (info) => {
       rejections.push(info);
       // In production this hook reaches signing and counter I/O, so it CAN
@@ -755,8 +768,15 @@ describe("QI-SIBLING-02 wired consumer — MasterRotationReceiver enforces the w
     expect(s.acks).toHaveLength(0);
     expect(s.rejections).toHaveLength(1);
     expect(s.rejections[0]!.event_type).toBe("master_rotation");
-    expect(s.rejections[0]!.emitter_node).toBe(PEER);
+    expect(s.rejections[0]!.rejection_origin).toBe(PEER);
     expect(s.rejections[0]!.error).toBeInstanceOf(QuorumFreshnessError);
+    // QI-02-F12: a lapsed collection window is a TIMING fact about two clocks,
+    // so the boundary must classify it as a freshness refusal. The detector
+    // renders that as PEER_REFUSED/degraded rather than accusing this
+    // authentic initiator of compromise.
+    expect(s.rejections[0]!.reason_class).toBe(
+      REJECTION_REASON_CLASS.FRESHNESS_REFUSED
+    );
     // The message names the ceremony it is actually refusing — it used to say
     // "revoke quorum context" for a master rotation, which told the operator
     // the wrong ceremony had failed.
@@ -817,7 +837,7 @@ describe("QI-SIBLING-02 wired consumer — MasterRotationReceiver enforces the w
     // a broken hook loses its own delivery and nothing else.
     expect(s.node.getPinnedMaster().public_key).toBe(s.oldMaster.public_key);
     expect(s.rejections).toHaveLength(1);
-    expect(s.rejections[0]!.emitter_node).toBe(PEER);
+    expect(s.rejections[0]!.rejection_origin).toBe(PEER);
     expect(denialEntries(s.node)).toHaveLength(1);
   });
 

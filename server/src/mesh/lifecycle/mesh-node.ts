@@ -103,6 +103,15 @@ import {
   SYNC_REQUEST_ID_EXPIRY_MS,
   SYNC_TABLE_AUDIT_UNKNOWN_RELAYING_PEER,
 } from "./constants.js";
+import {
+  NO_AUTHENTICATED_PEER,
+  REJECTION_REASON_CLASS,
+  authenticatedPeer,
+  classifyAdmissionRefusal,
+  type AuthenticatedPeer,
+  type RejectionOrigin,
+  type RejectionReasonClass,
+} from "./envelope-rejection.js";
 import { DenialAuditGovernor } from "./denial-audit-governor.js";
 import {
   applySyncResponse,
@@ -286,24 +295,69 @@ export class MeshNode {
   }) => void = () => {};
   /** Follow-up #3: surfaces rollback / chain-discontinuity / signature failures
    *  that the canonical audit node would otherwise silently drop. The detector
-   *  module subscribes here to fire `sentinel_alert` to operators. */
+   *  module subscribes here to fire `sentinel_alert` to operators.
+   *
+   *  DELIBERATELY NOT SPLIT the way `onEnvelopeRejected` below is, and the
+   *  reason is a property of `ingestAuditBatch` rather than of this hook: it
+   *  verifies the batch signature against the roster-resident certificate
+   *  BEFORE the chain-proof, monotonicity and continuity checks, so on a
+   *  rollback or continuity throw the emitter HAS been authenticated and
+   *  naming it is correct attribution, not a claim. Collapsing every arm to
+   *  the un-attributable sentinel would cost an operator the subject of a
+   *  `revoke_compromised` decision on exactly the arm where the subject is
+   *  known. Splitting the arms means teaching `ingestAuditBatch` to report
+   *  WHICH stage failed, which is a change to a verification path; bare id
+   *  UEK-02, which resolves only in the private register. */
   onAuditBatchRejected: (info: {
     error: Error;
     emitter_node?: string;
   }) => void = () => {};
-  /** Follow-up #3: surfaces envelope verification failures (signature mismatch,
-   *  unknown emitter, cross-operator isolation violation). Same purpose as
-   *  onAuditBatchRejected - convert silent drop to observable alarm. */
+  /**
+   * Follow-up #3: surfaces envelope verification failures (signature mismatch,
+   * unknown emitter, cross-operator isolation violation) AND post-verification
+   * admission refusals. Same purpose as onAuditBatchRejected — convert a silent
+   * drop into an observable alarm.
+   *
+   * ATTRIBUTION SPLIT (UEK-02, AGENTS.md rule 7). The two identity fields are
+   * DIFFERENTLY TYPED and must never be collapsed:
+   *
+   *   - `rejection_origin` is REQUIRED and is an authenticated identity (or
+   *     the explicit {@link NO_AUTHENTICATED_PEER} sentinel). It is the ONLY
+   *     field a consumer may key per-origin state on or name as the subject of
+   *     an operator-facing alert. Its type forbids a bare `string`, so a call
+   *     site cannot reach this hook by handing over an unverified value.
+   *   - `claimed_emitter_node` is OPTIONAL, is plain `string`, and — on the
+   *     `envelope_unverified` path — is a claim made by whoever sent bytes
+   *     that failed verification, about whoever they chose to name. Retained
+   *     for forensics, rendered as a labelled claim, never trusted.
+   *
+   * `reason_class` is REQUIRED (QI-02-F12): a freshness or capacity refusal
+   * must not reach an operator as a compromise accusation. See
+   * `REJECTION_REASON_CLASS` and `isCompromiseSignal` in
+   * `envelope-rejection.ts` — that module owns the class-to-severity mapping,
+   * and this boundary only reports which class occurred.
+   */
   onEnvelopeRejected: (info: {
     error: Error;
     event_type: string;
-    emitter_node?: string;
+    /** AUTHENTICATED. Keys per-origin state and attributes alerts. */
+    rejection_origin: RejectionOrigin;
+    /** UNVERIFIED wire text. Display-only forensics. Never a key. */
+    claimed_emitter_node?: string;
+    /** WHY it was refused — decides whether this reads as a compromise. */
+    reason_class: RejectionReasonClass;
   }) => void = () => {};
   /** Follow-up #3: surfaces every received heartbeat after envelope verification
    *  succeeds. The compromised-node aggregator inspects monotonic_seq +
-   *  policy-version vector skew here without re-implementing receive plumbing. */
+   *  policy-version vector skew here without re-implementing receive plumbing.
+   *
+   *  `emitter_node` is an `AuthenticatedPeer`: this hook fires only from the
+   *  router, which `handleIncomingBroadcast` reaches only AFTER `verifyOrThrow`
+   *  succeeded. Typing it with the brand rather than `string` is what lets the
+   *  detector use ONE per-origin map for heartbeat and rejection signals
+   *  without a plain `string` sneaking in through the heartbeat arm. */
   onHeartbeatReceived: (info: {
-    emitter_node: string;
+    emitter_node: AuthenticatedPeer;
     monotonic_seq: number;
     policy_version_vector: Record<string, number>;
     audit_seq: number;
@@ -1095,16 +1149,24 @@ export class MeshNode {
    * `relayingPeer` (rule 7): the AUTHENTICATED signer of the outer
    * `sync_response` envelope — `handleIncomingUnicast` passes
    * `verified.emitter_node` here, verified BEFORE `applySync` is ever
-   * called. Used only to key the drop-audit governor (never trusted as the
-   * poison event's own identity). Omitted for an initial-sync call outside
-   * the receive path or a direct/test call, in which case the governor
-   * falls back to a fixed sentinel — see `syncTableEventAuditGovernor`'s
-   * doc comment.
+   * called. Used only to key the drop-audit governor and the failure-mode
+   * detector's per-origin buckets (never trusted as the poison event's own
+   * identity). Omitted for an initial-sync call outside the receive path or a
+   * direct/test call, in which case it falls back to the fixed
+   * un-attributable sentinel — see `syncTableEventAuditGovernor`'s doc.
+   *
+   * UEK-02: the parameter's TYPE is `RejectionOrigin`, not `string`, so the
+   * default is the only way to reach the sentinel and a caller cannot hand
+   * over an unverified id at all. The default is safe here specifically
+   * because it fails toward the SHARED un-attributable bucket (less
+   * attribution, one bucket) rather than toward a caller-chosen identity — a
+   * `string` default would be the rule-3 optional-security-dependency shape,
+   * this one cannot be.
    */
   async applySync(
     payload: SyncResponsePayload,
     now: Date = new Date(),
-    relayingPeer: string = SYNC_TABLE_AUDIT_UNKNOWN_RELAYING_PEER
+    relayingPeer: RejectionOrigin = SYNC_TABLE_AUDIT_UNKNOWN_RELAYING_PEER
   ): Promise<void> {
     const verifiedPolicyUpdates: SignedEvent<PolicyUpdatePayload>[] = [];
     for (const evt of payload.policy_updates ?? []) {
@@ -1120,10 +1182,16 @@ export class MeshNode {
           now,
           relayingPeer
         );
+        // UEK-02: attribute to the AUTHENTICATED relaying peer that handed us
+        // this table entry. `evt.emitter_node` is the claim of an event whose
+        // verification is exactly what failed above, so it is carried as a
+        // labelled claim and never as the alert's subject.
         this.onEnvelopeRejected({
           error,
           event_type: evt.event_type,
-          emitter_node: evt.emitter_node,
+          rejection_origin: relayingPeer,
+          claimed_emitter_node: evt.emitter_node,
+          reason_class: REJECTION_REASON_CLASS.ENVELOPE_UNVERIFIED,
         });
       }
     }
@@ -1141,23 +1209,43 @@ export class MeshNode {
           now,
           relayingPeer
         );
+        // UEK-02: same attribution split as the policy_update loop above.
         this.onEnvelopeRejected({
           error,
           event_type: evt.event_type,
-          emitter_node: evt.emitter_node,
+          rejection_origin: relayingPeer,
+          claimed_emitter_node: evt.emitter_node,
+          reason_class: REJECTION_REASON_CLASS.ENVELOPE_UNVERIFIED,
         });
       }
     }
     for (const evt of payload.node_lifecycle_events ?? []) {
+      /**
+       * UEK-03. This `try` spans BOTH envelope verification and the
+       * post-verification admission, so the catch below cannot tell the two
+       * apart from the error alone — and the difference decides whether
+       * `evt.emitter_node` is an authenticated identity or attacker-authored
+       * wire text. Set to the branded value at the exact statement after which
+       * this node has verified the envelope itself; left null on every path
+       * where verification is what threw.
+       *
+       * Declared per-EVENT (inside the loop), never hoisted: a variable shared
+       * across iterations would let one verified event's authentication leak
+       * onto the next event's failure, which is the same wrong-principal
+       * attribution in a subtler shape.
+       */
+      let verifiedEmitter: AuthenticatedPeer | null = null;
       try {
         if (evt.event_type === "node_join") {
           const join = this.verifyNodeJoinBeforeRosterMutation(
             evt as SignedEvent<NodeJoinPayload>
           );
+          verifiedEmitter = authenticatedPeer(join.emitter_node);
           this.roster.add(join.payload.certificate);
           this.lifecycleLog.append(evt);
         } else if (evt.event_type === "node_revoke") {
           this.verifyOrThrow(evt);
+          verifiedEmitter = authenticatedPeer(evt.emitter_node);
           // sync_anchored is the ONLY place this mode is passed (T9 pins it):
           // a committed revoke must outlive its collection window for a late
           // joiner, so freshness anchors to the emitter-stamped effective_at.
@@ -1180,29 +1268,51 @@ export class MeshNode {
           }
         } else if (evt.event_type === "node_leave") {
           this.verifyOrThrow(evt);
+          verifiedEmitter = authenticatedPeer(evt.emitter_node);
           this.lifecycleLog.append(evt);
           this.roster.markLeft(
             (evt as SignedEvent<NodeLeavePayload>).payload.node_id
           );
         } else {
           this.verifyOrThrow(evt);
+          verifiedEmitter = authenticatedPeer(evt.emitter_node);
           this.lifecycleLog.append(evt);
         }
       } catch (e) {
         // Per-event isolation (§3.3 point 6): drop and audit, never abort the
         // batch. A refused event is NOT appended, so it is never re-served.
         const error = e instanceof Error ? e : new Error(String(e));
+        // UEK-02 / UEK-03: ONE derivation of both the origin and the reason,
+        // read by the audit write and the operator hook alike, so the sealed
+        // record and the alert can never disagree about who is responsible.
+        //
+        //   - verification threw  -> nothing in `evt` is authenticated, so the
+        //     origin is the AUTHENTICATED relaying peer that delivered the
+        //     batch (or the shared un-attributable sentinel), and the class is
+        //     `envelope_unverified`;
+        //   - admission threw     -> `verifiedEmitter` is set, so the peer
+        //     itself is the origin, and the class distinguishes a stale
+        //     freshness window (this node's clock relative to the emitter's,
+        //     QI-02-F12) from a genuine authority violation.
+        const origin: RejectionOrigin = verifiedEmitter ?? relayingPeer;
+        const reasonClass =
+          verifiedEmitter === null
+            ? REJECTION_REASON_CLASS.ENVELOPE_UNVERIFIED
+            : classifyAdmissionRefusal(error);
         if (evt.event_type === "node_revoke") {
           this.auditNodeRevokeDenied(
             evt as SignedEvent<NodeRevokePayload>,
             error,
+            origin,
             now
           );
         }
         this.onEnvelopeRejected({
           error,
           event_type: evt.event_type,
-          emitter_node: evt.emitter_node,
+          rejection_origin: origin,
+          claimed_emitter_node: evt.emitter_node,
+          reason_class: reasonClass,
         });
         continue;
       }
@@ -1638,7 +1748,12 @@ export class MeshNode {
         advertised_state: payload.node_state,
       });
       this.onHeartbeatReceived({
-        emitter_node: evt.emitter_node,
+        // AUTHENTICATED: the router is reached only from
+        // `handleIncomingBroadcast`, and only AFTER `verifyOrThrow(evt)`
+        // succeeded there — `router.dispatch` has exactly one call site, which
+        // is what makes this mint sound. A second dispatch site added upstream
+        // of verification would invalidate every mint in this method.
+        emitter_node: authenticatedPeer(evt.emitter_node),
         monotonic_seq: evt.monotonic_seq,
         policy_version_vector: payload.policy_version_vector,
         audit_seq: payload.audit_seq,
@@ -1678,11 +1793,25 @@ export class MeshNode {
         this.admitRevoke(rev, { mode: "strict", now: new Date() });
       } catch (e) {
         const error = e instanceof Error ? e : new Error(String(e));
-        this.auditNodeRevokeDenied(rev, error);
+        // UEK-03 TRACE, this site: `rev.emitter_node` IS authenticated here.
+        // The router is reached only through `handleIncomingBroadcast`, which
+        // runs `verifyOrThrow` first, so the only thing that can throw inside
+        // this handler is `admitRevoke` — an AUTHORIZATION and FRESHNESS
+        // check, never envelope verification. (`assertNodeRevokeAuthorized` is
+        // an authority check and proves nothing about the envelope; the
+        // envelope proof is the upstream `verifyOrThrow`.)
+        //
+        // QI-02-F12, this site: a lapsed or skewed quorum window is the
+        // dominant cause of a refusal here, and rendering it as COMPROMISED is
+        // what let a receiver with clock drift accuse a legitimate revoke
+        // initiator. The class is derived, not assumed.
+        const origin = authenticatedPeer(rev.emitter_node);
+        this.auditNodeRevokeDenied(rev, error, origin);
         this.onEnvelopeRejected({
           error,
           event_type: rev.event_type,
-          emitter_node: rev.emitter_node,
+          rejection_origin: origin,
+          reason_class: classifyAdmissionRefusal(error),
         });
         return;
       }
@@ -1729,10 +1858,21 @@ export class MeshNode {
         event_type: evt.event_type,
         emitter_node: evt.emitter_node,
       });
+      // UEK-02: the broadcast transport carries NO authenticated peer — it
+      // hands over an event and nothing else, and envelope verification is
+      // exactly what just failed, so there is no authenticated identity
+      // anywhere in this frame. That is a STATED property of this transport,
+      // recorded by passing the shared un-attributable sentinel, not a value
+      // this site failed to find. Every broadcast-verification failure
+      // therefore collapses into ONE bucket, which is what stops an attacker
+      // who rotates `evt.emitter_node` per event from minting per-claim state
+      // downstream (rule 8) or naming an innocent node in an alert (rule 7).
       this.onEnvelopeRejected({
         error: e instanceof Error ? e : new Error(String(e)),
         event_type: evt.event_type,
-        emitter_node: evt.emitter_node,
+        rejection_origin: NO_AUTHENTICATED_PEER,
+        claimed_emitter_node: evt.emitter_node,
+        reason_class: REJECTION_REASON_CLASS.ENVELOPE_UNVERIFIED,
       });
       return;
     }
@@ -1744,7 +1884,38 @@ export class MeshNode {
       event_id: evt.event_id,
       at: Date.now(),
     });
-    this.router.dispatch(evt);
+    // CONTAINMENT AT THE VOID BOUNDARY. This method is invoked as
+    // `void this.handleIncomingBroadcast(evt)` by the transport subscription,
+    // so anything that escapes it becomes an unhandled promise rejection —
+    // which terminates the process under Node's default behaviour, i.e. one
+    // frame from one peer takes down every receiving node. Several registered
+    // handlers reach caller-supplied hooks (`onHeartbeatReceived`,
+    // `onLifecycleEvent`, `onEnvelopeRejected`) whose faults are not this
+    // node's to predict. Same guarantee, and the same reasoning, as
+    // `MasterRotationReceiver.handleIncomingMasterRotationBroadcast`: every
+    // attacker-reachable failure on a receive path is contained rather than
+    // propagated.
+    //
+    // TWO HALVES, ONE INVARIANT — CROSS-FILE PIN: must match the containment
+    // notes on `V01Handler` and `dispatch` in `mesh/router.ts`. A handler may
+    // be sync or async, and the two fail differently. This `try` catches the
+    // SYNCHRONOUS throw; the ASYNC rejection cannot reach here at all, because
+    // this frame has returned by the time the promise settles, so `dispatch`
+    // attaches its own handler to the returned promise. Catching only here
+    // would leave the guard scoped to whichever handlers are synchronous
+    // today, and `async` is one typecheck-clean word away.
+    //
+    // The evidence is already durable before this line — the envelope was
+    // verified, the receive was recorded in `receivedLog`, and any refusal
+    // audit was sealed upstream — so a contained handler fault loses that
+    // handler's own delivery and nothing else. There is nothing further to
+    // escalate to from inside the transport callback: the operator surfaces
+    // ARE the hooks that just faulted.
+    try {
+      this.router.dispatch(evt);
+    } catch {
+      // Deliberate: see above. A handler fault must not reach the void.
+    }
   }
 
   private enforceReceivedMonotonicSeq(evt: SignedEvent): void {
@@ -1857,9 +2028,31 @@ export class MeshNode {
     });
   }
 
+  /**
+   * UEK-03. `governorKey` is REQUIRED and typed `RejectionOrigin`, so this
+   * method cannot be called without the caller stating whose identity it
+   * authenticated — the fix's whole point, and the reason it is not a
+   * defaulted parameter.
+   *
+   * WHY THE KEY CANNOT COME FROM `evt`. The live router call site verifies the
+   * envelope upstream, so there `evt.emitter_node` is authenticated; the
+   * `applySync` call site's catch also covers a `verifyOrThrow` failure, so
+   * there it is not. One derivation cannot serve both, and reading the key off
+   * the event would mean the governor's per-emitter write budget (rule 8) and
+   * the sealed entry's `peer_node` (rule 7) both take their subject from a
+   * value only one of the two callers has verified. The caller states it
+   * instead. `auditSyncTableEventDenied` takes the same relaying-peer key for
+   * the policy and locator tables — one shared discipline across all three
+   * sync tables rather than a per-table decision (rule 5).
+   *
+   * `peer_node` in the sealed payload is the AUTHENTICATED origin, and the
+   * event's own self-declaration is recorded beside it, labelled, and only
+   * when the two differ.
+   */
   private auditNodeRevokeDenied(
     evt: SignedEvent<NodeRevokePayload>,
     error: Error,
+    governorKey: RejectionOrigin,
     now: Date = new Date()
   ): void {
     if (!this.nodePrivateKey) {
@@ -1869,7 +2062,7 @@ export class MeshNode {
     // made and applied by the caller; this only decides whether to WRITE the
     // individual denial entry, and never affects accept/deny (invariant, §2.5).
     const decision = this.denialAuditGovernor.consider(
-      evt.emitter_node,
+      governorKey,
       now.getTime()
     );
     if (decision.saturationSummary) {
@@ -1890,8 +2083,18 @@ export class MeshNode {
       payload: {
         operation: "node_revoke_denied",
         event_type: evt.event_type,
-        peer_node: evt.emitter_node,
+        // AUTHENTICATED attribution — the identity this node verified, or the
+        // shared sentinel when the delivering transport authenticated nobody.
+        peer_node: governorKey,
         target_node: evt.payload.node_id,
+        // UNVERIFIED claim, retained for forensics only and only when it
+        // DIFFERS from the authenticated origin, so a reader can see what the
+        // sender wanted this denial attributed to. Omitted when they agree,
+        // because a duplicated field invites a consumer to read whichever one
+        // it happens to find first.
+        ...(evt.emitter_node === governorKey
+          ? {}
+          : { claimed_emitter_node: evt.emitter_node }),
         reason: error.message,
       },
       node_private_key: this.nodePrivateKey,
@@ -2137,7 +2340,13 @@ export class MeshNode {
     table: "policy_update" | "locator_update",
     error: Error,
     now: Date,
-    governorKey: string
+    // UEK-02: typed `RejectionOrigin`, not `string`, so the KEYING rule the
+    // doc comment above asserts is enforced by the compiler rather than
+    // requested of the caller — a bare `string` is assignable to neither arm
+    // of the union. Same brand its `auditNodeRevokeDenied` sibling takes; a
+    // widened parameter on one of two sibling audit writers is the drift shape
+    // rule 5 exists to stop.
+    governorKey: RejectionOrigin
   ): void {
     if (!this.nodePrivateKey) return;
     const decision = this.syncTableEventAuditGovernor.consider(
@@ -2340,12 +2549,19 @@ export class MeshNode {
         // during a sync this node itself initiated).
         if (!this.consumeOutstandingSyncRequest(respPayload.request_id)) {
           this.auditUncorrelatedSyncResponse(verified.emitter_node);
+          // QI-02-F12: the envelope VERIFIED — this refusal is about THIS
+          // node's own outstanding-request table (no correlating entry, or one
+          // that expired), so it is a capacity-class refusal, not evidence
+          // about the peer. Reporting it as COMPROMISED would accuse an
+          // authentic peer of compromise for a race this node's own
+          // `SYNC_REQUEST_ID_EXPIRY_MS` window produced.
           this.onEnvelopeRejected({
             error: new MeshError(
               "sync_response refused: no matching outstanding sync_request (uncorrelated, expired, or replayed)"
             ),
             event_type: "sync_response",
-            emitter_node: verified.emitter_node,
+            rejection_origin: authenticatedPeer(verified.emitter_node),
+            reason_class: REJECTION_REASON_CLASS.CAPACITY_REFUSED,
           });
           return;
         }
@@ -2354,7 +2570,11 @@ export class MeshNode {
         // unverified claim inside `respPayload` never keys the drop-audit
         // governor — same "verify first, attribute after" discipline as the
         // uncorrelated-response audit two lines above.
-        await this.applySync(respPayload, undefined, verified.emitter_node);
+        await this.applySync(
+          respPayload,
+          undefined,
+          authenticatedPeer(verified.emitter_node)
+        );
       } catch {
         // ignore
       }

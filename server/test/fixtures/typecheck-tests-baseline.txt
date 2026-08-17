@@ -4,7 +4,7 @@
 # Count: 981
 scripts/drill/broker-liveness-process-drill.ts(69,47): error TS2345: Argument of type '{ auditLog: AuditLog; originMachine: string; now: number; brokerPinnedProducerKeyB64url: string; }' is not assignable to parameter of type 'BuildFeatureHealthInput'.
 scripts/three-mode-drill/node.ts(157,32): error TS2345: Argument of type '{ v: number; alg: string; iv: string; ct: string; ts: string; }' is not assignable to parameter of type 'EncryptedPayload'.
-test/acceptance/three-mode-drill/recovery-flows.test.ts(597,9): error TS2345: Argument of type '{ readonly current_canonical_node_id: string; readonly new_canonical_node_id: string; readonly guardian_signatures: readonly []; }' is not assignable to parameter of type 'CanonicalAuditPromotionProposal'.
+test/acceptance/three-mode-drill/recovery-flows.test.ts(598,9): error TS2345: Argument of type '{ readonly current_canonical_node_id: string; readonly new_canonical_node_id: string; readonly guardian_signatures: readonly []; }' is not assignable to parameter of type 'CanonicalAuditPromotionProposal'.
 test/anomaly-detection/credential-sequence-and-peer-deviation.test.ts(580,7): error TS2353: Object literal may only specify known properties, and 'minSamplesForPrediction' does not exist in type 'PsiClassifierOptions'.
 test/anomaly-detection/cross-agent-timing-and-sequence.test.ts(371,7): error TS2353: Object literal may only specify known properties, and 'minSamplesForPrediction' does not exist in type 'PsiClassifierOptions'.
 test/anomaly-detection/time-of-day-activity.test.ts(417,7): error TS2353: Object literal may only specify known properties, and 'minSamplesForPrediction' does not exist in type 'PsiClassifierOptions'.
