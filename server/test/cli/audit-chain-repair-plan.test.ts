@@ -13,7 +13,7 @@
  * read) and a contents-only hash would call that unchanged.
  */
 
-import { chmod, mkdtemp, readFile, readdir, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdtemp, open, readFile, readdir, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { createHash, randomBytes } from "node:crypto";
 import { homedir, hostname, tmpdir, userInfo } from "node:os";
 import { join, relative } from "node:path";
@@ -82,6 +82,11 @@ const PASSPHRASE = "test-audit-chain-repair-plan-passphrase";
  * Failure mode to know: hashing contents alone would miss a created empty
  * directory, and hashing names alone would miss an in-place content edit of the
  * same length. Both are covered here on purpose.
+ *
+ * A file's mode and content are read through ONE open descriptor rather than a
+ * path-based stat followed by a path-based read: two path lookups can resolve to
+ * different inodes, so the pair would attribute one file's mode to another
+ * file's bytes and the digest would describe a tree that never existed.
  */
 async function fortressTreeHash(root: string): Promise<string> {
   const parts: string[] = [];
@@ -91,18 +96,24 @@ async function fortressTreeHash(root: string): Promise<string> {
     for (const entry of entries) {
       const full = join(dir, entry.name);
       const rel = relative(root, full);
-      const info = await stat(full);
-      const mode = (info.mode & 0o7777).toString(8);
       if (entry.isDirectory()) {
-        parts.push(`dir ${rel} ${mode}`);
+        const info = await stat(full);
+        parts.push(`dir ${rel} ${(info.mode & 0o7777).toString(8)}`);
         await walk(full);
       } else if (entry.isFile()) {
-        const content = await readFile(full);
-        parts.push(
-          `file ${rel} ${mode} ${createHash("sha256").update(content).digest("hex")}`
-        );
+        const handle = await open(full, "r");
+        try {
+          const info = await handle.stat();
+          const content = await handle.readFile();
+          parts.push(
+            `file ${rel} ${(info.mode & 0o7777).toString(8)} ${createHash("sha256").update(content).digest("hex")}`
+          );
+        } finally {
+          await handle.close();
+        }
       } else {
-        parts.push(`other ${rel} ${mode}`);
+        const info = await lstat(full);
+        parts.push(`other ${rel} ${(info.mode & 0o7777).toString(8)}`);
       }
     }
   }
