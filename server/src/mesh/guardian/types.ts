@@ -82,12 +82,20 @@ export interface GuardianQuorumProof {
 }
 
 /**
- * Master-rotation payload body the guardians sign over.
+ * DISTINCT FROM the master-rotation quorum input, despite the name.
  *
- * Unlike the wire `MasterRotationPayload` from mesh/types.ts, this is the
- * canonical-quorum-input form — what every guardian computes the same hash of.
- * The wire form embeds `quorum_signatures`; the quorum-input form does NOT
- * (signing one's own signature would be circular).
+ * QI-SIBLING-02 moved master rotation onto `GuardianMasterRotationQuorumInput`
+ * in `guardian/revoke-quorum-input.ts`, which carries a domain separator and a
+ * collection window. This v1 shape has neither and now serves exactly ONE
+ * remaining consumer: `canonicalAuditPromoteQuorumInput` in
+ * `recovery-flows/canonical-audit-promotion.ts`, which reuses the field slots to
+ * carry `canonical_audit:<id>` strings rather than timestamps and keys. The name
+ * is kept because that consumer's own v2 shape is a separate change; do NOT
+ * reach for this type for a new ceremony.
+ *
+ * Its field set is disjoint from the v2 shape's (no `schema`, no window), and
+ * `canonicalizeToBytes` is field-name-bearing, so bytes signed under one can
+ * never verify as the other.
  */
 export interface MasterRotationQuorumInput {
   old_master_pubkey: string;

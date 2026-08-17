@@ -1,3 +1,4 @@
+// fail-before-exempt: QI-SIBLING-02 changed one ANCHOR string here, not an assertion. buildMasterRotationPayload now also calls verifyGuardianQuorum, so the old anchor matched two sites and silently read the wrong one; the longer anchor re-pins it to the acceptance path. The three invariant assertions are unchanged and hold on both sides of the fix, so this file cannot fail before it by construction. The behavior guards for this change are in test/mesh/qi-sibling-02-master-rotation-freshness.test.ts and test/structure/c12-replay-parity.test.ts, both of which do fail before.
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -53,7 +54,10 @@ describe("Guardian master-rotation invariant comments", () => {
   it("keeps the receiver canonical-input invariant before quorum verification", () => {
     const source = read("server/src/mesh/guardian/master-rotation.ts");
 
-    expectNear(source, "verifyGuardianQuorum({\n    input,", [
+    // Anchored on the ACCEPTANCE-path call specifically: `buildMasterRotation
+    // Payload` also calls verifyGuardianQuorum, and it passes a pre-built
+    // `proof` rather than an inline object, so this longer anchor stays unique.
+    expectNear(source, "verifyGuardianQuorum({\n    input,\n    proof: {", [
       "Receiver canonical-input invariant",
       "receiver's pinned fortress_id",
       "roster_version, distinct ids, threshold",

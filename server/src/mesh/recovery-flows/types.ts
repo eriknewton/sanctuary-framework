@@ -160,7 +160,20 @@ export interface MasterRotationProposal {
   new_root_principal_public_key: Uint8Array;
   /** Guardian quorum signatures over the canonical rotation input. */
   guardian_signatures: GuardianQuorumSignature[];
-  /** ISO8601 timestamp embedded in the rotation payload. Defaults to now. */
+  /**
+   * QI-SIBLING-02 v2 collection context minted BEFORE the guardians sign the
+   * rotation input. `propose` builds the canonical bytes from this context,
+   * checks freshness with its own clock, and echoes it onto the wire payload so
+   * every receiver re-checks the window independently. Required for v2 — a
+   * rotation proposal without one cannot produce an acceptable payload.
+   */
+  quorum_context: GuardianRevokeQuorumContext;
+  /**
+   * ISO8601 timestamp embedded in the rotation payload. Defaults to now.
+   * Must fall inside the `quorum_context` window (skew-tolerant lower bound):
+   * it is signed and lands verbatim in the audit boundary entry, so it is not
+   * free-form operator text.
+   */
   rotated_at?: string;
   /**
    * Optional ack-timeout override. Default `DEFAULT_BROADCAST_ACK_TIMEOUT_MS`.
