@@ -524,7 +524,11 @@ export async function verifySealedLegacyPrefix(
  * and {@link verifyFortressAuditFullPicture} do).
  */
 export async function probeDaemonChainAccess(
-  storage: FilesystemStorage
+  // Widened from the `FilesystemStorage` class to the capability it actually
+  // uses (`namespacePath`), so a read-only decorator over a filesystem backend
+  // can be probed without a cast. Behavior is unchanged for every existing
+  // caller: `FilesystemStorage` satisfies this type.
+  storage: FilesystemStorageCapabilities
 ): Promise<"absent" | "accessible" | "present_unreadable"> {
   const dirPath = storage.namespacePath(AUDIT_DAEMON_NAMESPACE);
   let stats;

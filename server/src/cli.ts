@@ -562,13 +562,49 @@ Examples:
       const { parseVerifyArgs, runVerify } = await import("./cli/audit-chain-verify.js");
       const opts = parseVerifyArgs(subArgs, process.env);
       return drainAndExit(await runVerify(opts));
+    } else if (verb === "repair-plan") {
+      if (wantsHelp) {
+        // SAFETY: stderr / stdout is the operator-facing CLI channel; no logger module in scope.
+        console.error(`sanctuary audit-chain repair-plan. Describe a fortress's audit-chain state and what a repair would do.
+
+Read-only. Changes nothing, decides nothing, and needs no authority. Runs
+offline against the fortress directory, so it still works on a fortress whose
+audit chain prevents the server from starting.
+
+Usage: sanctuary audit-chain repair-plan [--fortress <path>] [--storage-path <path>]
+
+Options:
+  --fortress <path>      Fortress path (default: SANCTUARY_STORAGE_PATH, then
+                         SANCTUARY_FORTRESS_PATH, then the home fortress)
+  --storage-path <path>  Override the state directory
+  --help, -h             Show this help
+
+Exit codes:
+  0  the chain verifies clean at this privilege; no repair applies
+  1  the fortress state could not be read; NO verdict was produced
+  2  usage error
+  3  findings are present and fully readable here; a plan is printed
+  4  part of the evidence was unreadable at this privilege, so the chain has
+     NOT been shown to be damaged; re-read with more privilege
+
+Examples:
+  sanctuary audit-chain repair-plan
+  sanctuary audit-chain repair-plan --fortress ~/.sanctuary-work
+`);
+        process.exit(0);
+      }
+      const { runAuditChainRepairPlan } = await import(
+        "./cli/audit-chain-repair-plan.js"
+      );
+      return drainAndExit(await runAuditChainRepairPlan(subArgs));
     } else {
       // SAFETY: stderr / stdout is the operator-facing CLI channel; no logger module in scope.
-      console.error(`Usage: sanctuary audit-chain <export|verify> [options]
+      console.error(`Usage: sanctuary audit-chain <export|verify|repair-plan> [options]
 
 Commands:
-  export   Dump audit chain to JSONL (--output <path>, --storage-path <path>)
-  verify   Verify a JSONL export  (--input <path>, --public-key <key>, --no-strict)
+  export       Dump audit chain to JSONL (--output <path>, --storage-path <path>)
+  verify       Verify a JSONL export  (--input <path>, --public-key <key>, --no-strict)
+  repair-plan  Describe the chain's state and what a repair would do (read-only)
 `);
       process.exit(wantsHelp ? 0 : 1);
     }
