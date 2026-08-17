@@ -11,13 +11,19 @@
  * is dismissible, but re-surfaced on every master rotation.
  */
 
+import { parseIsoInstantWithOffset } from "../../core/time.js";
+
 export interface BrokerCredentialPromptItem {
   secret_name: string;
   rotation_cta: "rotate_now" | "skip_for_this_rotation";
 }
 
 export interface PostRecoveryPromptState {
-  /** ISO8601 timestamp of the master rotation that triggered this prompt. */
+  /**
+   * Strict ISO-8601 timestamp (mandatory `Z`/numeric offset — TZ-SIB-02) of
+   * the master rotation that triggered this prompt; the value the guardian
+   * quorum signed over, already validated by the quorum parser (TZ-WINDOW-01).
+   */
   rotated_at: string;
   /** Old master pubkey for operator identification. */
   old_master_pubkey: string;
@@ -106,11 +112,20 @@ export class PostRecoveryPromptStore {
 
   /** Most-recent rotation prompt, undefined if never rotated. */
   latest(): PostRecoveryPromptState | undefined {
+    // TZ-SIB-02: the ordering reads each stamp through the strict
+    // offset-requiring predicate so "most recent" names the same rotation on
+    // every node; a stamp the predicate refuses sorts EARLIEST
+    // (NEGATIVE_INFINITY), so an ambiguous stamp can never win "latest". In
+    // practice every `rotated_at` here already passed the guardian quorum
+    // parser's strict check (TZ-WINDOW-01) before a prompt was built.
     let latest: PostRecoveryPromptState | undefined;
     for (const state of this.byRotation.values()) {
       if (
         !latest ||
-        Date.parse(state.rotated_at) > Date.parse(latest.rotated_at)
+        (parseIsoInstantWithOffset(state.rotated_at) ??
+          Number.NEGATIVE_INFINITY) >
+          (parseIsoInstantWithOffset(latest.rotated_at) ??
+            Number.NEGATIVE_INFINITY)
       ) {
         latest = state;
       }

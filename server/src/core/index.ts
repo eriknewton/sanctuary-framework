@@ -13,3 +13,4 @@ export * from "./random.js";
 export * from "./encoding.js";
 export * from "./crypto-suite-registry.js";
 export * from "./bounded-map.js";
+export * from "./time.js";
