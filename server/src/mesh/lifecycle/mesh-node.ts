@@ -1022,6 +1022,18 @@ export class MeshNode {
       kind: params.kind,
       request_id: requestId,
       since_policy_versions: this.policyBundle.versionVector(),
+      // C12-SYNC-ORDER-01: the per-agent vector is the baseline that matters.
+      // `applySync` below can drop one poison locator_update while a
+      // higher-versioned sibling in the same batch applies; a scalar baseline
+      // would then advance past the dropped entry and no responder's
+      // strictly-greater-than delta could ever re-serve it, leaving a
+      // permanent hole under a watermark that reports fully-synced. The
+      // vector carries no cross-agent claim, so the dropped agent keeps its
+      // old baseline and is re-served until it applies.
+      since_locator_versions: this.locatorTable.versionVector(),
+      // Legacy scalar, still sent so a pre-C12-SYNC-ORDER-01 responder (which
+      // reads only this field) can still serve us during a mixed-version
+      // rollout. A current responder ignores it in favor of the vector.
       since_locator_version: this.locatorTable.highest(),
       since_audit_seqs: {},
     };

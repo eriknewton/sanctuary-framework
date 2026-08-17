@@ -270,6 +270,65 @@ export class LocatorTableStore {
     return this.highestVersion;
   }
 
+  /**
+   * Per-agent locator-version baseline, the requester's side of the delta
+   * contract. Mirrors `PolicyBundleStore.versionVector()` deliberately:
+   * C12-SYNC-ORDER-01 gave both tables per-event isolation, so both must
+   * express their sync baseline the same way.
+   *
+   * WHY A VECTOR AND NOT `highest()` (the invariant this method exists to
+   * hold): a scalar baseline asserts "I hold every entry at or below N",
+   * which per-event isolation can no longer guarantee — a single dropped
+   * entry beneath a higher-versioned sibling that DID apply falsifies it
+   * permanently, and a strictly-greater-than delta can then never re-serve
+   * the dropped entry to this node again. A per-agent baseline carries no
+   * such cross-agent claim: an agent whose entry was dropped simply keeps
+   * its old (or absent) baseline, so the responder re-serves that agent on
+   * every later round until it actually applies, and stops re-serving it the
+   * moment it does.
+   *
+   * Derived solely from THIS node's own applied table, never from wire
+   * input (rule 7): a refused event's claimed version must not be able to
+   * steer the baseline we ask from. TRUTHFUL SCOPE on size: the vector is
+   * one entry per agent already APPLIED here, so it inherits this table's
+   * agent cardinality exactly as `PolicyBundleStore.versionVector()` does
+   * for its own — this method neither adds nor tightens a bound on how many
+   * agents either table may hold.
+   */
+  versionVector(): Record<string, number> {
+    const out: Record<string, number> = {};
+    for (const [k, v] of this.byAgent) out[k] = v.payload.locator_version;
+    return out;
+  }
+
+  /**
+   * Per-agent delta query — every entry whose `locator_version` is strictly
+   * greater than the requester's baseline for THAT agent. Agents the
+   * requester has never seen (no entry in the baseline) are included whole,
+   * matching `PolicyBundleStore.delta`.
+   *
+   * Must stay in agreement with `versionVector()` above: the vector is the
+   * requester's side of exactly this predicate.
+   */
+  deltaByAgent(
+    sinceLocatorVersions: Record<string, number>
+  ): SignedEvent<LocatorUpdatePayload>[] {
+    const out: SignedEvent<LocatorUpdatePayload>[] = [];
+    for (const [agentId, evt] of this.byAgent) {
+      const baseline = sinceLocatorVersions[agentId] ?? 0;
+      if (evt.payload.locator_version > baseline) out.push(evt);
+    }
+    return out;
+  }
+
+  /**
+   * Legacy scalar delta. Retained ONLY to serve a requester that sent the
+   * older `since_locator_version` scalar and no `since_locator_versions`
+   * vector (a peer on a pre-C12-SYNC-ORDER-01 build). Do not use it for
+   * newly-written requester code — see the gap `versionVector()` documents.
+   * Contract pin: consumed by `buildSyncResponse` in ./sync.ts, only on the
+   * legacy branch.
+   */
   delta(
     sinceLocatorVersion: number
   ): SignedEvent<LocatorUpdatePayload>[] {

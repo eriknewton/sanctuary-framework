@@ -29,14 +29,24 @@ import {
 import { InMemoryTransport } from "../../src/mesh/in-memory-transport.js";
 import {
   InMemoryNodeKeyStore,
+  LocatorTableStore,
   MeshNode,
+  NodeLifecycleEventLog,
+  PolicyBundleStore,
   REVOKE_DENIAL_AUDIT_PER_EMITTER_MAX,
+  buildSyncResponse,
   createAutoApproveJoinApprover,
 } from "../../src/mesh/lifecycle/index.js";
 import type {
+  SyncRequestPayload,
+  SyncResponsePayload,
+} from "../../src/mesh/lifecycle/types.js";
+import type {
   FortressMasterPublicKey,
+  LocatorUpdatePayload,
   NodeLeavePayload,
   PrincipalCertificate,
+  SignedEvent,
 } from "../../src/mesh/types.js";
 import type { CompiledPolicy } from "../../src/policy-engine/types.js";
 
@@ -139,6 +149,23 @@ async function bootstrapFirstNode(opts: {
     })
   );
   return result;
+}
+
+/**
+ * `handleIncomingUnicast` is dispatched with `void` from the transport
+ * subscription (fire-and-forget), so a test driving the real receive path has
+ * to wait for the handler to settle rather than for `unicast()` to resolve.
+ * Bounded poll — never an unconditional sleep, so a genuine failure surfaces
+ * as the caller's own assertion rather than as a timeout.
+ */
+async function settleUnicastHandlers(
+  until: () => boolean,
+  maxTicks = 50
+): Promise<void> {
+  for (let i = 0; i < maxTicks; i++) {
+    if (until()) return;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -323,5 +350,225 @@ describe("lifecycle/sync - applySync per-table isolation (C12-SYNC-ORDER-01)", (
       expect(payload.relaying_peer).toBeDefined();
       expect(payload.claimed_emitter_node).toMatch(/^spoofed-node-\d+$/);
     }
+  });
+
+  it("C12-SYNC-ORDER-01: a locator_update dropped beneath a higher-versioned sibling is still re-served on the next sync round", async () => {
+    const hub = new InMemoryTransport();
+    const first = await bootstrapFirstNode({ transport: hub });
+    const nodeId = first.bootstrap.node_certificate.node_id;
+    const fortressId = first.bootstrap.master_public.fortress_id;
+    const rootPrincipalId =
+      first.bootstrap.root_principal_certificate.principal_id;
+
+    const locatorEvent = (agentId: string, version: number, seq: number) =>
+      packSignedEvent<LocatorUpdatePayload>({
+        event_type: "locator_update",
+        emitter_node: nodeId,
+        emitter_principal: rootPrincipalId,
+        fortress_id: fortressId,
+        payload: {
+          agent_id: agentId,
+          canonical_node: nodeId,
+          locator_version: version,
+          last_migration_at: "2026-06-01T00:00:00.000Z",
+          hosting_principal: rootPrincipalId,
+        },
+        monotonic_seq: seq,
+        node_private_key: first.bootstrap.node_private_key,
+      });
+
+    const goodA5 = locatorEvent("agent-a", 5, 1);
+    const goodB9 = locatorEvent("agent-b", 9, 2);
+
+    // The peer that will serve the NEXT round holds both entries intact.
+    const responderLocator = new LocatorTableStore();
+    responderLocator.upsert(goodA5);
+    responderLocator.upsert(goodB9);
+    const respond = (request: SyncRequestPayload): SyncResponsePayload =>
+      buildSyncResponse(request, {
+        policy_bundle: new PolicyBundleStore(),
+        locator_table: responderLocator,
+        lifecycle_log: new NodeLifecycleEventLog(),
+      });
+
+    // The copy of A@v5 that reaches THIS node has a corrupted envelope
+    // signature — the ordinary benign relay/rotation cause, not an exploit:
+    // the relaying peer serves what verifies for IT, and this node refuses it.
+    const poisonA5 = JSON.parse(JSON.stringify(goodA5)) as typeof goodA5;
+    poisonA5.node_signature = toBase64url(
+      ed25519.sign(stringToBytes("poison"), first.bootstrap.node_private_key)
+    );
+
+    await first.node.applySync({
+      kind: "delta_sync",
+      locator_updates: [poisonA5, goodB9],
+    });
+
+    // Per-table isolation did its job: A dropped, its higher-versioned
+    // sibling B applied. This is the state the re-request must repair.
+    expect(first.node.getLocatorTable().get("agent-a")).toBeUndefined();
+    expect(
+      first.node.getLocatorTable().get("agent-b")?.payload.locator_version
+    ).toBe(9);
+    // And the SCALAR watermark now reads 9 — i.e. it claims this node holds
+    // everything at or below 9, which is exactly the false claim that made a
+    // scalar baseline unable to recover the dropped entry.
+    expect(first.node.getLocatorTable().highest()).toBe(9);
+
+    // Drive the REAL request path so the baseline under test is the one
+    // production sends, not one the test composes.
+    const responderTransport = hub.attach("peer-responder");
+    const captured: string[] = [];
+    responderTransport.subscribeUnicast((_to, message) =>
+      captured.push(message)
+    );
+    const capturedRequest = (): SyncRequestPayload => {
+      expect(captured).toHaveLength(1);
+      const wire = JSON.parse(captured[0]) as {
+        evt: SignedEvent<SyncRequestPayload>;
+      };
+      return wire.evt.payload;
+    };
+
+    await first.node.requestSyncFromPeer({
+      peer_node_id: "peer-responder",
+      kind: "delta_sync",
+    });
+    const response = respond(capturedRequest());
+
+    // THE GAP ASSERTION. Under a single scalar baseline of 9 the responder's
+    // strictly-greater-than delta excludes A@v5 forever and this node ends
+    // with no locator entry for agent-a while reporting fully-synced. The
+    // per-agent baseline carries no claim about agent-a, so A@v5 comes back.
+    const reserved = response.locator_updates?.find(
+      (e) => e.payload.agent_id === "agent-a"
+    );
+    expect(reserved).toBeDefined();
+    expect(reserved!.payload.locator_version).toBe(5);
+
+    // The gap actually closes when the re-served entry is applied...
+    await first.node.applySync(response);
+    expect(
+      first.node.getLocatorTable().get("agent-a")?.payload.locator_version
+    ).toBe(5);
+
+    // ...and the repair HEALS rather than becoming a permanent re-serve tax:
+    // once agent-a is applied its baseline advances and the responder stops
+    // re-sending it. A never-cleared scalar clamp would keep re-serving here.
+    captured.length = 0;
+    await first.node.requestSyncFromPeer({
+      peer_node_id: "peer-responder",
+      kind: "delta_sync",
+    });
+    expect(respond(capturedRequest()).locator_updates).toHaveLength(0);
+  });
+
+  it("C12-SYNC-ORDER-01: a poison table event no longer loses the whole response SILENTLY through the swallowing sync_response receive path", async () => {
+    const hub = new InMemoryTransport();
+    const first = await bootstrapFirstNode({ transport: hub });
+    const nodeId = first.bootstrap.node_certificate.node_id;
+    const fortressId = first.bootstrap.master_public.fortress_id;
+    const rootPrincipalId =
+      first.bootstrap.root_principal_certificate.principal_id;
+
+    // This test deliberately goes through `handleIncomingUnicast`, NOT a
+    // direct `applySync` call, because that handler's bare `catch {}` is
+    // where the SILENCE comes from: pre-fix, one poison table event threw out
+    // of applySync, the catch swallowed it, and the round's remaining events
+    // were lost with no throw, no audit entry, and no operator hook — after
+    // the correlation id had already been consumed. A direct applySync test
+    // can observe the loss but never the silence.
+    const relay = hub.attach("relay-peer");
+
+    // Capture the outstanding request_id from a real sync_request, so the
+    // response below correlates the way a genuine peer's would.
+    const captured: string[] = [];
+    relay.subscribeUnicast((_to, message) => captured.push(message));
+    await first.node.requestSyncFromPeer({
+      peer_node_id: "relay-peer",
+      kind: "delta_sync",
+    });
+    const requestId = (
+      JSON.parse(captured[0]) as { evt: SignedEvent<SyncRequestPayload> }
+    ).evt.payload.request_id;
+    expect(requestId).toBeDefined();
+
+    const poisonLocator = packSignedEvent<LocatorUpdatePayload>({
+      event_type: "locator_update",
+      emitter_node: nodeId,
+      emitter_principal: rootPrincipalId,
+      fortress_id: fortressId,
+      payload: {
+        agent_id: "agent-poison",
+        canonical_node: nodeId,
+        locator_version: 3,
+        last_migration_at: "2026-06-01T00:00:00.000Z",
+        hosting_principal: rootPrincipalId,
+      },
+      monotonic_seq: 10,
+      node_private_key: first.bootstrap.node_private_key,
+    });
+    poisonLocator.node_signature = toBase64url(
+      ed25519.sign(stringToBytes("poison"), first.bootstrap.node_private_key)
+    );
+
+    // A legitimate lifecycle event riding the SAME response, in a DIFFERENT
+    // table. Pre-fix this is what was silently lost.
+    const legitLeave = packSignedEvent<NodeLeavePayload>({
+      event_type: "node_leave",
+      emitter_node: nodeId,
+      emitter_principal: rootPrincipalId,
+      fortress_id: fortressId,
+      payload: { node_id: nodeId, reason: "graceful" },
+      monotonic_seq: 11,
+      node_private_key: first.bootstrap.node_private_key,
+    });
+
+    const responseEvt = packSignedEvent<SyncResponsePayload>({
+      event_type: "sync_response",
+      emitter_node: nodeId,
+      emitter_principal: rootPrincipalId,
+      fortress_id: fortressId,
+      payload: {
+        kind: "delta_sync",
+        request_id: requestId,
+        locator_updates: [poisonLocator],
+        node_lifecycle_events: [legitLeave],
+      },
+      monotonic_seq: 12,
+      node_private_key: first.bootstrap.node_private_key,
+    });
+
+    const rejected: string[] = [];
+    first.node.onEnvelopeRejected = ({ event_type }) =>
+      rejected.push(event_type ?? "unknown");
+
+    const auditedDrop = () =>
+      first.node
+        .peekPendingAuditEntries()
+        .some(
+          (e) =>
+            (e.payload as { operation?: string }).operation ===
+            "sync_table_event_denied"
+        );
+
+    // Delivered through the transport, so the production subscription and the
+    // swallowing catch are both in the path.
+    await relay.unicast(
+      nodeId,
+      JSON.stringify({ kind: "sync_response", evt: responseEvt })
+    );
+    await settleUnicastHandlers(auditedDrop);
+
+    // NOT SILENT (MUST-NEVER #5): the refusal produced a sealed audit entry
+    // and fired the operator-visible hook, rather than vanishing into the
+    // handler's catch.
+    expect(auditedDrop()).toBe(true);
+    expect(rejected).toContain("locator_update");
+    // And the legitimate event in the other table survived the round, so the
+    // consumed correlation id was not spent for nothing.
+    expect(first.node.getRoster().presenceOf(nodeId)).toBe("left");
+    // The poison entry itself never reached the table.
+    expect(first.node.getLocatorTable().get("agent-poison")).toBeUndefined();
   });
 });
