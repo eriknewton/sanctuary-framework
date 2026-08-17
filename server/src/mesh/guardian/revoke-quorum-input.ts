@@ -2,9 +2,10 @@
  * C12-REPLAY — v2 guardian quorum-input freshness.
  *
  * This module is the SINGLE source of truth for the canonical bytes a guardian
- * quorum signs, plus the relying-side freshness enforcement (AGENTS.md rule 10),
- * the element-level parser (rules 5/11), and the one strict timestamp predicate
- * every window field is read through (TZ-WINDOW-01). Despite the file name it is NOT
+ * quorum signs, plus the relying-side freshness enforcement (AGENTS.md rule 10)
+ * and the element-level parser (rules 5/11). Every window field is read through
+ * the one strict timestamp predicate (TZ-WINDOW-01), which now lives in
+ * `core/time.ts` and is re-exported here. Despite the file name it is NOT
  * revoke-only: the collection context and the freshness assertion are
  * input-agnostic by construction, and three ceremonies now share them — node
  * revoke (C12-REPLAY), device-recovery intent (QI-SIBLING-01), and master
@@ -32,6 +33,7 @@
 
 import { sha256 } from "@noble/hashes/sha256";
 import { randomBytes } from "../../core/random.js";
+import { parseIsoInstantWithOffset } from "../../core/time.js";
 import { GuardianQuorumError } from "./errors.js";
 // Type-only import: `mesh/types.ts` carries no runtime code, so this adds no
 // module edge that could reintroduce the recovery-flows -> lifecycle cycle this
@@ -133,56 +135,18 @@ const CEREMONY_ID_HEX_RE = /^[0-9a-f]{32}$/;
 /**
  * TZ-WINDOW-01 — the accepted form of EVERY timestamp field in this module:
  * ISO-8601 extended date-time with a MANDATORY UTC designator (`Z`) or numeric
- * offset (`±HH:MM`).
+ * offset, parsed by the ONE strict predicate `parseIsoInstantWithOffset`.
  *
- * WHY the offset is mandatory and not cosmetic: a date-time with no offset is
- * resolved by the ECMAScript parser against the RECEIVER's local zone, so the
- * same signed bytes denote a DIFFERENT absolute instant on every node in the
- * fleet, and the absolute window slides by the width of the inhabited offset
- * range. That hands the signer partial control over its own trust duration,
- * which is the exact property the freshness machinery exists to remove
- * (AGENTS.md rule 10). A relying party must read one absolute instant or refuse;
- * refusing is the fail-closed half of MUST-NEVER #5.
- *
- * Accepts:  `2026-08-16T00:00:00Z`, `2026-08-16T00:00:00.000Z`,
- *           `2026-08-16T00:00:00+05:30`, `2026-08-16T00:00:00.123456789-08:00`.
- * Rejects:  an offset-less date-time (`2026-08-16T00:00:00`, the ambiguous
- *           case), a bare year (`2026`), a date only (`2026-08-16`), a
- *           human-readable date (`Aug 16 2026`), a space date/time separator,
- *           a missing seconds field, and the BASIC-format offset `+0000`.
- *
- * Extended-format offsets only, deliberately: every producer of these fields in
- * this tree mints them with `Date.prototype.toISOString`, which emits `Z`, so
- * accepting more spellings widens the parse surface without serving any caller
- * that exists. The non-offset rejections carry no ambiguity risk of their own;
- * they are refused because a parser that shrugs at `2026` while its failure
- * reason reads `*_not_iso` hides the real gap from the next reader.
- *
- * `\d{1,9}` fractional digits = one digit through nanosecond precision;
- * `toISOString` emits exactly 3.
+ * The predicate is defined in `core/time.ts` (promoted there for TZ-SIB-01/
+ * TZ-SIB-02 so consumers outside this module share the same rule and a single
+ * server-wide structure pin covers them all); it is re-exported here so the
+ * guardian barrel surface is unchanged. The parser's `initiated_at`/
+ * `expires_at`, the master-rotation `rotated_at` bound, and the sync-anchored
+ * `effective_at` all call it rather than re-testing the pattern locally, so a
+ * fourth timestamp field cannot acquire a looser rule by being written
+ * somewhere else (rule 5).
  */
-const ISO_INSTANT_WITH_OFFSET_RE =
-  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/;
-
-/**
- * Parse a timestamp field to epoch milliseconds, or `undefined` when it is not
- * a strict ISO-8601 instant carrying an offset.
- *
- * The ONE predicate every timestamp in this module funnels through (rule 5):
- * the parser's `initiated_at`/`expires_at`, the master-rotation `rotated_at`
- * bound, and the sync-anchored `effective_at` all call this rather than
- * re-testing the pattern locally, so a fourth timestamp field cannot acquire a
- * looser rule by being written somewhere else. A per-ceremony copy of this check
- * would be the hand-mirror shape rule 5 exists to forbid.
- *
- * The shape check does NOT subsume the range check: `2026-13-45T00:00:00Z`
- * matches the pattern and still parses to `NaN`, so the finite test stays.
- */
-export function parseIsoInstantWithOffset(value: string): number | undefined {
-  if (!ISO_INSTANT_WITH_OFFSET_RE.test(value)) return undefined;
-  const ms = Date.parse(value);
-  return Number.isFinite(ms) ? ms : undefined;
-}
+export { parseIsoInstantWithOffset };
 
 // ═══════════════════════════════════════════════════════════════════════
 // Types

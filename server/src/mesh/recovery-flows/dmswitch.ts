@@ -14,6 +14,7 @@
  * the ceremony proceeds.
  */
 
+import { parseIsoInstantWithOffset } from "../../core/time.js";
 import {
   DEFAULT_DMSWITCH_ABSENCE_MS,
   DEFAULT_DMSWITCH_GRACE_MS,
@@ -21,7 +22,13 @@ import {
 import { DMswitchGraceWindowActive } from "./errors.js";
 
 export interface DMswitchGraceWindowInput {
-  /** ISO8601 timestamp of last operator activity. */
+  /**
+   * Strict ISO-8601 timestamp of last operator activity, carrying a MANDATORY
+   * `Z` designator or numeric offset (TZ-SIB-01). The offset is required
+   * because this stamp is the base of the absence + grace window arithmetic
+   * that gates the guardian-revocation path; it must denote ONE absolute
+   * instant on every node that evaluates it.
+   */
   last_operator_activity_at: string;
   /** Current time — defaults to Date.now(). */
   now_ms?: number;
@@ -57,10 +64,17 @@ export function evaluateDMswitchGraceWindow(
   const nowMs = params.now_ms ?? Date.now();
   const absenceMs = params.absence_ms ?? DEFAULT_DMSWITCH_ABSENCE_MS;
   const graceMs = params.grace_ms ?? DEFAULT_DMSWITCH_GRACE_MS;
-  const lastActivityMs = Date.parse(params.last_operator_activity_at);
-  if (!Number.isFinite(lastActivityMs)) {
+  // TZ-SIB-01: timestamps entering trust arithmetic carry a mandatory offset;
+  // an offset-less stamp is refused (throw, fail-closed — MUST-NEVER #5),
+  // never resolved against the reading node's local zone. This window gates
+  // the guardian-revocation path, so the stamp must mean one absolute instant
+  // fleet-wide.
+  const lastActivityMs = parseIsoInstantWithOffset(
+    params.last_operator_activity_at
+  );
+  if (lastActivityMs === undefined) {
     throw new Error(
-      `evaluateDMswitchGraceWindow: last_operator_activity_at is not a parseable ISO8601 timestamp: ${params.last_operator_activity_at}`
+      `evaluateDMswitchGraceWindow: last_operator_activity_at is not a strict ISO-8601 timestamp with a Z designator or numeric offset: ${params.last_operator_activity_at}`
     );
   }
   const available = lastActivityMs + absenceMs + graceMs;
