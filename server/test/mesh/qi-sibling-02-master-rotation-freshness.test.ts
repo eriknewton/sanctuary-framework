@@ -75,15 +75,6 @@ const HOUR_MS = 60 * 60 * 1000;
  */
 const PEER = "peer-initiator";
 
-/**
- * The receiver's `pending` map is deliberately UNBOUNDED on this branch (see the
- * declaration's own comment and the register row it cites), so there is no
- * capacity or flood test here. That is a stated gap, not an untested claim: two
- * admission bounds were attempted and both failed a gate, and a test asserting a
- * bound that does not exist would be the same decorative-coverage shape the
- * subtraction is meant to end.
- */
-
 interface GuardianKp {
   identity: GuardianIdentity;
   private_key: Uint8Array;
@@ -556,6 +547,13 @@ describe("QI-SIBLING-02 — planted divergences are refused", () => {
 // shipped, whatever its own tests say.
 // ═══════════════════════════════════════════════════════════════════════
 
+// The receiver's `pending` map is deliberately UNBOUNDED on this branch (see the
+// declaration's own comment and the register row it cites), so this suite has no
+// capacity or flood test. That is a stated gap, not an untested claim: two
+// admission bounds were attempted and both failed a gate, and a test asserting a
+// bound that does not exist would be the same decorative-coverage shape the
+// subtraction exists to end. The regression test below guards the opposite
+// direction — that no future admission-only cap can silence this receiver.
 describe("QI-SIBLING-02 wired consumer — MasterRotationReceiver enforces the window", () => {
   async function bootReceiverScenario(
     rotationContext: GuardianRevokeQuorumContext,
