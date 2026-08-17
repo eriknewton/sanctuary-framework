@@ -19,8 +19,17 @@ const MESH_SRC = join(REPO_ROOT, "server/src/mesh");
 // single-file substring pins).
 const SERVER_SRC = join(REPO_ROOT, "server/src");
 
+/**
+ * Read a source file as EXECUTABLE code — comments removed (see stripComments).
+ *
+ * Every scan in this file goes through this or through `stripComments` directly,
+ * with no raw reads left, because the round-3 gate reproduced the same
+ * false-positive twice: a scan that reads raw source treats prose about a retired
+ * construct as a use of it. Prose describing a rule is what documents why the
+ * rule exists, so making it trip the rule punishes the documentation.
+ */
 function read(rel: string): string {
-  return readFileSync(join(REPO_ROOT, rel), "utf8");
+  return stripComments(readFileSync(join(REPO_ROOT, rel), "utf8"));
 }
 
 /**
@@ -80,8 +89,20 @@ function stripComments(source: string): string {
   let i = 0;
   // A `/` starts a regex literal only where a VALUE may begin. Tracking the last
   // significant character is the standard disambiguation from division.
+  //
+  // A NEWLINE is deliberately NOT such a position, and that is the round-3
+  // correction. The previous version listed `\n` here, so a division whose
+  // operator OPENS a continuation line — `const r = a` then `  / b; // ...` — was
+  // read as the start of a regex literal; the phantom regex ran to the first `/`
+  // of the trailing comment and closed there, and the comment's remaining text was
+  // then emitted as CODE. Prose about a retired construct therefore reddened the
+  // very scans this function exists to keep honest, which is the failure it was
+  // written to prevent, reintroduced from the other direction. ASI never inserts a
+  // semicolon before a line that opens with `/`, so a line-leading `/` continues
+  // the previous expression and is division whenever the previous significant
+  // character could end one.
   const regexCanStart = (prev: string): boolean =>
-    prev === "" || "=(,:[!&|?{};+-*%~^<>\n".includes(prev);
+    prev === "" || "=(,:[!&|?{};+-*%~^<>".includes(prev);
   let lastSignificant = "";
   while (i < source.length) {
     const ch = source[i]!;
@@ -137,7 +158,10 @@ function stripComments(source: string): string {
       continue;
     }
     out += ch;
-    if (!/\s/.test(ch) || ch === "\n") lastSignificant = ch;
+    // Whitespace of EVERY kind, newlines included, is insignificant for the
+    // regex-vs-division decision — must match `regexCanStart` above, which no
+    // longer treats a line break as a value position.
+    if (!/\s/.test(ch)) lastSignificant = ch;
     i++;
   }
   return out;
@@ -153,7 +177,7 @@ describe("C12-REPLAY parity structure (T9)", () => {
     expect(meshNode).not.toMatch(/private nodeRevokeQuorumInput/);
   });
 
-  it("NO mesh module reaches Math.random by ANY access form — the class, not one spelling", () => {
+  it("NO module under server/src reaches Math.random by ANY access form — the class, not one spelling", () => {
     // Fix-round correction (QI-SIBLING-02 gate finding): the prior version of
     // this guard named three files by hand and therefore could not see a FOURTH
     // `generateCeremonyId` copy with the same `Math.random` fallback living in
@@ -170,14 +194,54 @@ describe("C12-REPLAY parity structure (T9)", () => {
     // it used mishandled trailing `//` comments so prose about the retired
     // fallback false-positived. Both halves are fixed: comments are removed by
     // a character scan, and every property-access form is matched.
-    const propertyAccess = /\bMath\s*(?:\.\s*random\b|\[\s*(['"`])random\1\s*\])/;
+    //
+    // Round-3 corrections (dry-check gate findings), one about SCOPE and one
+    // about FORM:
+    //
+    //   SCOPE. This scan walked `server/src/mesh` while the minter pin below —
+    //   whose own stated bound leans on this scan being name-independent — walks
+    //   all of `server/src`. The composite that bound claims is covered, a minter
+    //   RENAMED past the name-based pin while carrying a weak-randomness
+    //   fallback, was invisible to both guards the moment it was written outside
+    //   the mesh directory. Both now walk the same root, so the backstop covers
+    //   what the bound says it covers. Two guards with different roots are a
+    //   hand-mirrored pair (rule 5), and the gap sits exactly where they differ.
+    //
+    //   FORM. `Math?.random()` evaded the pattern through optional chaining, and
+    //   `const M = Math; M.random()` evaded every pattern by aliasing the object.
+    //
+    // STATED BOUND, because a broad claim that a one-line edit evades is worse
+    // than a narrow honest one: this catches direct property access (optional
+    // chaining included), computed access, destructuring, and a DIRECT alias
+    // binding of the bare `Math` object. It cannot catch an alias laundered
+    // through a value a source scan cannot follow — a returned object, a property
+    // read, a computed global lookup — and no textual scan can. The mechanism
+    // that actually forecloses the degradation is `core/random`, which throws
+    // rather than falling back (MUST-NEVER #5); this is a tripwire on the shape
+    // that has twice been hand-written in this tree, never a proof of absence.
+    //
+    // Optional chaining is an ACCESS FORM, not a different object, so it is
+    // normalized away once rather than doubling every pattern below: two patterns
+    // that have to stay in step are the drift shape rule 5 forbids.
+    const propertyAccess =
+      /\bMath\s*(?:\.\s*random\b|\.?\s*\[\s*(['"`])random\1\s*\])/;
     const destructured = /\{[^{}]*\brandom\b[^{}]*\}\s*=\s*Math\b/;
-    for (const file of walk(MESH_SRC)) {
+    // `const M = Math;` — the alias BINDING is the only part of the aliasing form
+    // a source scan can see. The later `M.random()` is textually indistinguishable
+    // from any other property read, so the guard refuses the binding itself.
+    const aliasBinding =
+      /(?:const|let|var)\s+\w+\s*(?::[^=;\n]+)?=\s*(?:(?:globalThis|global|window|self)\s*\.\s*)?Math\s*(?=[;,)\]\n])/;
+    for (const file of walk(SERVER_SRC)) {
       // Prose ABOUT the retired fallback is legitimate and is what documents
       // why the rule exists; only executable uses are the finding.
-      const code = stripComments(readFileSync(file, "utf8"));
+      const code = stripComments(readFileSync(file, "utf8")).replace(
+        /\?\./g,
+        "."
+      );
       expect(
-        propertyAccess.test(code) || destructured.test(code),
+        propertyAccess.test(code) ||
+          destructured.test(code) ||
+          aliasBinding.test(code),
         `Math.random randomness fallback in ${file}`
       ).toBe(false);
     }
@@ -240,7 +304,7 @@ describe("C12-REPLAY parity structure (T9)", () => {
       /(?<![\w])schema:\s*(?:"sanctuary\.guardian-master-rotation-quorum\.v2"|GUARDIAN_MASTER_ROTATION_QUORUM_SCHEMA_V2)/;
     for (const file of files) {
       if (file === sharedModule) continue;
-      const src = readFileSync(file, "utf8");
+      const src = stripComments(readFileSync(file, "utf8"));
       expect(
         handBuilt.test(src),
         `unexpected hand-built v2 master-rotation input in ${file}`
@@ -260,8 +324,14 @@ describe("C12-REPLAY parity structure (T9)", () => {
     // silently. Match EVERY invocation, then assert on the argument form, so a
     // shape this pin cannot reason about fails loudly instead of being absent
     // by omission (rule 11: the next instance is silently absent by omission).
+    //
+    // Round-3 correction (dry-check gate finding): this pin read RAW source, so a
+    // doc comment naming `acceptMasterRotation(` was sliced as though it were a
+    // call, its "argument list" was prose, and the pin reddened on a comment. Every
+    // scan in this file now consumes `stripComments` output — comments are prose
+    // ABOUT the contract, and only executable call sites are call sites.
     for (const file of walk(SERVER_SRC)) {
-      const src = readFileSync(file, "utf8");
+      const src = stripComments(readFileSync(file, "utf8"));
       // Definitions, re-exports and import statements are not call sites.
       const code = src
         .replace(/^import[\s\S]*?from\s+"[^"]*";$/gm, "")
@@ -291,7 +361,7 @@ describe("C12-REPLAY parity structure (T9)", () => {
     const handBuilt = /(?<![\w])schema:\s*(?:"sanctuary\.guardian-revoke-quorum\.v2"|GUARDIAN_REVOKE_QUORUM_SCHEMA_V2)/;
     for (const file of files) {
       if (file === sharedModule) continue;
-      const src = readFileSync(file, "utf8");
+      const src = stripComments(readFileSync(file, "utf8"));
       expect(
         handBuilt.test(src),
         `unexpected hand-built v2 input in ${file}`
@@ -307,7 +377,8 @@ describe("C12-REPLAY parity structure (T9)", () => {
     const meshNodePath = join(MESH_SRC, "lifecycle", "mesh-node.ts");
     let totalCallSites = 0;
     for (const file of walk(SERVER_SRC)) {
-      const matches = readFileSync(file, "utf8").match(callSite) ?? [];
+      const matches =
+        stripComments(readFileSync(file, "utf8")).match(callSite) ?? [];
       if (matches.length > 0) {
         expect(
           file,
@@ -333,7 +404,7 @@ describe("C12-REPLAY parity structure (T9)", () => {
     const sharedModule = join(MESH_SRC, "guardian", "revoke-quorum-input.ts");
     for (const file of files) {
       if (file === sharedModule) continue;
-      const src = readFileSync(file, "utf8");
+      const src = stripComments(readFileSync(file, "utf8"));
       // The relying-side freshness logic is defined once.
       expect(
         src.includes("export function assertQuorumContextFresh"),

@@ -760,7 +760,12 @@ export class ApprovalGate {
     // round-trip. The correlation_id pins the resolution to the same
     // pending entry. Listener exceptions are swallowed (gate stays
     // load-bearing; aggregator is additive observation).
-    const correlationId = `${requestTimestamp}:${operation}:${Math.random().toString(16).slice(2, 6)}`;
+    // The disambiguating suffix comes from the CSPRNG, never `Math.random`. Two
+    // same-ms same-operation requests are told apart by this suffix alone, so a
+    // predictable or short-cycling source is a correlation collision, and this
+    // file is the shipping enforcement layer's approval path. 4 = the hex width
+    // of 2 bytes, the same width the retired arithmetic produced at its longest.
+    const correlationId = `${requestTimestamp}:${operation}:${randomBytes(2).toString("hex")}`;
     const approvalAuditId = `gate-approval-${randomBytes(16).toString("hex")}`;
     if (this.onApprovalEvent) {
       try {

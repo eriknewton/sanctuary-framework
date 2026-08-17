@@ -1009,6 +1009,60 @@ describe("QI-SIBLING-02 — execute() re-asserts the window before any wire traf
     s.ackSub.close();
   });
 
+  it("gates on the bytes it is ABOUT TO EMIT: a diverged payload context refuses even while the proposal is fresh", async () => {
+    // MUTATION-PROOF TARGET for the round-2 emit-site correction, which had a
+    // 12-line rationale and no test: repoint execute's step-0 parse from
+    // `prepared.payload.quorum_context` back to `prepared.proposal.quorum_context`
+    // and this test fails while the whole rest of the suite stays green. That is
+    // the same shape as the round-0 bound whose test stayed green when its
+    // mitigation was deleted, and it is what this test exists to end.
+    //
+    // The two representations agree today, because `propose` projects one from
+    // the other, so the ONLY way to observe which one the gate reads is to make
+    // them disagree. That divergence is planted here rather than discovered,
+    // which is exactly what the invariant protects against: an emit-site gate
+    // must assert over the bytes it is about to put on the wire, or a later
+    // divergence between the two representations passes the initiator and fails
+    // at every receiver — the split-master state, arrived at through a gate that
+    // reported success.
+    const s = await bootCeremonyScenario();
+    s.ceremony.confirm({ note: "operator confirms while the window is open" });
+
+    // Reach past the private field deliberately: no public surface can diverge
+    // them, which is the point. `prepared.proposal` is left untouched.
+    const internals = s.ceremony as unknown as {
+      prepared: {
+        payload: MasterRotationPayload;
+        proposal: { quorum_context: GuardianRevokeQuorumContext };
+      };
+    };
+    const wire = internals.prepared.payload.quorum_context;
+    expect(wire).toBeDefined();
+    const lapsedInitiated = new Date(Date.now() - 2 * HOUR_MS).toISOString();
+    const lapsedExpires = new Date(Date.now() - HOUR_MS).toISOString();
+    wire!.initiated_at = lapsedInitiated;
+    wire!.expires_at = lapsedExpires;
+
+    // The in-memory proposal context is STILL FRESH. A gate reading it sees an
+    // open window and proceeds; only a gate reading the emitted payload refuses.
+    expect(
+      Date.parse(internals.prepared.proposal.quorum_context.expires_at)
+    ).toBeGreaterThan(Date.now());
+
+    await expect(
+      s.ceremony.execute({ ack_subscription: s.ackSub })
+    ).rejects.toThrow(QuorumFreshnessError);
+
+    // Same four consequences as the clock-drift case: nothing left the node and
+    // the node did not swap its own master.
+    expect(s.node.getPinnedMaster().public_key).toBe(s.oldMaster.public_key);
+    expect(s.broadcasts).toHaveLength(0);
+    expect(s.unicastCount()).toBe(0);
+    expect(s.ceremony.state).toBe("failed");
+
+    s.ackSub.close();
+  });
+
   it("executes normally when the window is still open (the gate is not a blanket refusal)", async () => {
     const s = await bootCeremonyScenario();
     s.ceremony.confirm({ note: "operator confirms and executes promptly" });

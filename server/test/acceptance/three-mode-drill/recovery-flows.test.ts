@@ -719,9 +719,14 @@ describe("WP-MVP-8 ceremony 4 — master rotation + broadcast orchestration with
           try {
             await rec.handleIncomingUnicast(to, message);
           } catch {
-            // Bundle unwrap failures are surfaced through the ack error path
-            // inside the receiver; rethrow here would mask the ceremony
-            // execute() assertions.
+            // A bundle unwrap failure throws out of handleIncomingUnicast BEFORE
+            // any pending entry exists, so it reaches no ack path and no
+            // rejection hook — this catch is the only thing standing between it
+            // and the transport, and swallowing it here keeps it from masking the
+            // ceremony execute() assertions below. (The earlier claim that these
+            // failures surface through the ack error path was wrong: the unwrap
+            // throws before there is an entry to ack about. See the bundle-path
+            // note on MasterRotationReceiver.handleIncomingUnicast.)
           }
         });
         const existingHandler = node.onLifecycleEvent;

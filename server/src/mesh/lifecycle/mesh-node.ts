@@ -1846,11 +1846,15 @@ export class MeshNode {
   /**
    * Record a REFUSED `master_rotation` broadcast (QI-SIBLING-02 fix round).
    *
-   * Called by `MasterRotationReceiver` when the relying-side window, the
-   * quorum, or the receiver's own bounded pending map refuses a broadcast, so
-   * an operator can tell a node that REFUSED a rotation from one that never
-   * received the broadcast. Before this existed the refusal path was silent
-   * except for a thrown promise the reference wiring discarded with `void`.
+   * Called by `MasterRotationReceiver` when the acceptance gate refuses a
+   * broadcast — a lapsed or malformed relying-side window, a quorum that does
+   * not verify against the pinned roster, or a payload bound to a different
+   * pinned master. Those are the only conditions: the receiver's pending map is
+   * UNBOUNDED and refuses nothing, so no refusal recorded here can originate
+   * from receiver capacity. The entry lets an operator tell a node that REFUSED
+   * a rotation from one that never received the broadcast. Before this existed
+   * the refusal path was silent except for a thrown promise the reference
+   * wiring discarded with `void`.
    *
    * `emitter_node` MUST be the AUTHENTICATED emitter — the `emitter_node` of a
    * SignedEvent that already passed `verifyOrThrow` on the receive path, never

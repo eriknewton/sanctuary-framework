@@ -592,6 +592,17 @@ export class MasterRotationReceiver {
    * Consume a unicast from `transport.subscribeUnicast`. Returns true if the
    * message was a `master_rotation_bundle` (so the caller knows not to pass
    * it to MeshNode's regular dispatcher).
+   *
+   * STATED CONSEQUENCE of the round-2 subtraction, written down rather than left
+   * to be discovered: removing the capacity-refusal branch removed the ONLY
+   * `onEnvelopeRejected` call on this bundle path, so a failure here — a bundle
+   * that will not unwrap under the old per-node transport key — now has NO
+   * operator surface at all. It throws to the caller, and the reference wiring
+   * discards it. That is defensible: unwrapping requires a key an attacker does
+   * not hold, so this is a local or misdelivered-bundle fault rather than an
+   * attacker-driven one, and the broadcast half still refuses loudly. It is also
+   * a real gap in what an operator can see, so whoever gives this path a signal
+   * is ADDING one, not restoring one.
    */
   async handleIncomingUnicast(
     to: string,
@@ -823,6 +834,17 @@ export class MasterRotationReceiver {
     // happened and is unaffected, and the governed audit entry above is sealed
     // BEFORE this line, so a broken operator hook loses its own delivery and
     // never the evidence.
+    //
+    // STATED BOUND (rule 8), accepted rather than closed. The audit write above
+    // is GOVERNED per authenticated emitter; THIS hook is not. It fires once per
+    // refusal, and freshness enforcement makes refusal the guaranteed outcome for
+    // every replay, so the work one refusal causes downstream of this line is
+    // unbounded in the NUMBER of refusals an in-roster peer can drive — the
+    // governed audit entry is not the whole per-refusal cost. It is not bounded
+    // here because the consumer is a shared boundary with its own already-owned
+    // gap: bounding it means changing that boundary for every caller, which is a
+    // design rather than a fix round. Bare ids UEK-02 and QI-02-F12; they resolve
+    // only in the private register. Nothing on this path bounds it today.
     try {
       this.opts.node.onEnvelopeRejected({
         error,
@@ -843,14 +865,29 @@ export class MasterRotationReceiver {
    * rejection, or (b) starve the listeners registered after it. Both sites that
    * emit an ack funnel here, so the isolation cannot be present on one and
    * absent on the other (rule 5: one implementation, never two that drift).
+   *
+   * What the containment COSTS differs by call site, and both are stated below
+   * rather than described from the success path alone.
    */
   private emitAck(ack: MasterRotationAckMessage): void {
     for (const l of this.ackEmitListeners) {
       try {
         l(ack);
       } catch {
-        // Delivery to one subscriber failed; the install decision is already
-        // made and recorded, and the remaining subscribers still get the ack.
+        // Containment, priced per CALL SITE.
+        //
+        // SUCCESS ack: the install decision is already made and recorded, so a
+        // lost delivery costs this subscriber's copy and nothing else.
+        //
+        // ERROR ack: the install FAILED. Nothing is audited on that path, the
+        // rejection hook does not fire, and this ack is the ONLY signal that
+        // exists — so a swallowed throw makes a failed install locally silent
+        // and, at the initiator, indistinguishable from a node that was simply
+        // offline for the ceremony. That is the deliberate round-2 trade and not
+        // an oversight: a rejected promise under the `void`-calling wiring is an
+        // attacker-reachable crash, a lost operator signal is not, and a crash
+        // loses the signal too. The remaining subscribers still get the ack in
+        // both cases.
       }
     }
   }
