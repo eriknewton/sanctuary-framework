@@ -6,6 +6,14 @@
  *
  * The storage backend deals in raw bytes — encryption/decryption happens
  * in the StateStore layer above.
+ *
+ * Every method declared on `StorageBackend` and `FilesystemStorageCapabilities`
+ * must be classified as mutating-or-delegated in `read-only-guard.ts` (must
+ * match `READ_ONLY_STORAGE_MUTATING_METHODS` /
+ * `READ_ONLY_STORAGE_DELEGATED_METHODS` there); full-set parity is enforced by
+ * `test/structure/read-only-storage-guard-parity.test.ts`. A method added here
+ * without a classification there is exactly the drift that lets a "read-only"
+ * caller mutate through a method nobody refused.
  */
 
 /** Metadata about a stored entry */

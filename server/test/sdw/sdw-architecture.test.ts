@@ -1,3 +1,10 @@
+// fail-before-exempt: this file is the SDW architecture GATE, not a test of a
+// behavior change. Widening it to recognize an additional compliant shape
+// cannot fail against the base ref, because the base's source already passes
+// the narrower rule; "fails before the fix" has no meaning for a gate
+// widening. The widening is given its own teeth instead: the recognizer has
+// direct unit tests below covering both directions, including the exact
+// laundering case (a real write slipped in ahead of the refusal).
 import { readFile, readdir } from "node:fs/promises";
 import { relative, join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -95,6 +102,74 @@ describe("SDW architecture write gate", () => {
     await expect(
       storage.write(prepared.namespace, prepared.storageKey, prepared.data),
     ).rejects.toBeInstanceOf(SdwValidationError);
+  });
+
+  describe("unconditional-refusal recognizer", () => {
+    // The gate accepts a write body that refuses EVERY write as satisfying the
+    // no-unauthorized-SDW-write property, since there is no write to authorize.
+    // That concession is only sound while the recognizer is strict, so it is
+    // tested in both directions here rather than trusted from its own source.
+    it("accepts a body that is nothing but a throw", () => {
+      expect(
+        writeBlockRefusesUnconditionally(
+          '{\n  throw new ReadOnlyStorageViolationError("write", namespace, key);\n}',
+        ),
+      ).toBe(true);
+    });
+
+    it("accepts a throw-only body carrying comments", () => {
+      expect(
+        writeBlockRefusesUnconditionally(
+          '{\n  // refuses every write, whatever the namespace\n  /* see the guard header */\n  throw new Error("no");\n}',
+        ),
+      ).toBe(true);
+    });
+
+    it("rejects a body that writes before it throws", () => {
+      // The laundering case: a real write, then a refusal that makes the method
+      // still look read-only from its last line.
+      expect(
+        writeBlockRefusesUnconditionally(
+          '{\n  await this.inner.write(namespace, key, data);\n  throw new Error("no");\n}',
+        ),
+      ).toBe(false);
+    });
+
+    it("rejects a conditional refusal", () => {
+      expect(
+        writeBlockRefusesUnconditionally(
+          '{\n  if (isSdwNamespace(namespace)) throw new Error("no");\n  await this.inner.write(namespace, key, data);\n}',
+        ),
+      ).toBe(false);
+    });
+
+    it("rejects an empty body", () => {
+      // A silent no-op is the shape MUST-NEVER #5 forbids: the caller believes
+      // the write landed. It must never read as a compliant refusal.
+      expect(writeBlockRefusesUnconditionally("{\n}")).toBe(false);
+    });
+
+    it("rejects a throw whose ARGUMENT LIST nests the write (laundering inside the throw expression)", () => {
+      // The one-statement rule alone does not close this: the body IS exactly
+      // one throw statement, but the write executes while the constructor's
+      // arguments are evaluated, before anything is thrown. Both mutating
+      // spellings and a bare await are must-fail shapes.
+      expect(
+        writeBlockRefusesUnconditionally(
+          '{\n  throw new Error(String(await this.inner.write(namespace, key, data)));\n}',
+        ),
+      ).toBe(false);
+      expect(
+        writeBlockRefusesUnconditionally(
+          '{\n  throw new Error(String(await this.inner.writeDurable(namespace, key, data)));\n}',
+        ),
+      ).toBe(false);
+      expect(
+        writeBlockRefusesUnconditionally(
+          '{\n  throw new Error(String(this.inner.delete(namespace, key)));\n}',
+        ),
+      ).toBe(false);
+    });
   });
 });
 
@@ -210,7 +285,7 @@ function findStorageBackendImplementationOffenders(source: string, path: string)
     /\basync\s+write\s*\([^)]*\)\s*(?::\s*Promise<void>)?/g,
   );
   for (const rawWrite of rawWriteBlocks) {
-    if (!storageWriteBlockUsesSdwGuard(rawWrite)) {
+    if (!storageWriteBlockUsesSdwGuard(rawWrite) && !writeBlockRefusesUnconditionally(rawWrite)) {
       offenders.push(`${path}: StorageBackend.write does not enforce the SDW raw-write gate`);
     }
   }
@@ -220,7 +295,10 @@ function findStorageBackendImplementationOffenders(source: string, path: string)
     /\basync\s+writeDurable\s*\([^)]*\)\s*(?::\s*Promise<void>)?/g,
   );
   for (const durableWrite of durableWriteBlocks) {
-    if (!storageWriteBlockUsesSdwGuard(durableWrite)) {
+    if (
+      !storageWriteBlockUsesSdwGuard(durableWrite) &&
+      !writeBlockRefusesUnconditionally(durableWrite)
+    ) {
       offenders.push(`${path}: writeDurable does not enforce the SDW raw-write gate`);
     }
   }
@@ -241,6 +319,43 @@ function findSdwNamespacePathExposureOffenders(source: string, path: string): st
     }
   }
   return offenders;
+}
+
+/**
+ * A write body that REFUSES every write, whatever the namespace, satisfies the
+ * property this gate protects (no raw SDW write escapes authorization) more
+ * strongly than calling the gate would: there is no write at all. Requiring the
+ * gate call there would mean running an authorization check in front of an
+ * unconditional refusal, which reads as though some write might proceed.
+ *
+ * Deliberately narrow, so it cannot launder a real write path. The body, with
+ * comments removed, must be exactly one `throw new X(...)` statement and
+ * nothing else; any assignment, call, or branch before the throw fails it.
+ *
+ * The one-statement rule is not sufficient on its own: the constructor's
+ * ARGUMENT LIST is evaluated before the throw, so a write nested inside it
+ * (`throw new E(String(await this.inner.write(…)))`) executes and still reads
+ * as "exactly one throw statement". The argument text is therefore also
+ * refused if it contains an `await` or a call to any of the storage
+ * interface's mutating members — must match
+ * `READ_ONLY_STORAGE_MUTATING_METHODS` in `src/storage/read-only-guard.ts`
+ * (`write`/`writeDurable`/`delete`), the same full set the parity test pins.
+ */
+function writeBlockRefusesUnconditionally(block: string): boolean {
+  const body = block
+    .replace(/^\s*\{/, "")
+    .replace(/\}\s*$/, "")
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/\/\/[^\n]*/g, "")
+    .trim();
+  const throwOnly = /^throw\s+new\s+[A-Za-z_$][\w$]*\s*\(([\s\S]*)\)\s*;?$/.exec(
+    body
+  );
+  if (throwOnly === null) return false;
+  const argumentText = throwOnly[1]!;
+  return !/(\bawait\b|\.\s*write\s*\(|\.\s*writeDurable\s*\(|\.\s*delete\s*\()/.test(
+    argumentText
+  );
 }
 
 function storageWriteBlockUsesSdwGuard(block: string): boolean {
